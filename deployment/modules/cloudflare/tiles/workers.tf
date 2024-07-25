@@ -6,6 +6,7 @@ resource "cloudflare_worker_script" "tiles" {
   account_id = var.cloudflare_account_id
   name       = "tiles"
   content    = file("${path.module}/dist/tiles.js")
+  module     = true
 
   plain_text_binding {
     name = "CACHE_CONTROL"
