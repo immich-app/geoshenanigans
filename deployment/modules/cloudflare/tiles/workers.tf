@@ -10,7 +10,7 @@ resource "cloudflare_worker_script" "tiles" {
 
   plain_text_binding {
     name = "CACHE_CONTROL"
-    text = "2678400" // 31 days - cloudflare cdn maximum
+    text = "public, max-age=2678400" // 31 days - cloudflare cdn maximum
   }
 
   plain_text_binding {
