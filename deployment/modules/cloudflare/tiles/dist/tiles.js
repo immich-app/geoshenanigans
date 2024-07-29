@@ -902,7 +902,9 @@ var FetchSource = class {
     }
     if (resp.status === 416 || etag && newEtag && newEtag !== etag) {
       this.mustReload = true;
-      throw new EtagMismatch(etag);
+      throw new EtagMismatch(
+        `Server returned non-matching ETag ${etag} after one retry. Check browser extensions and servers for issues that may affect correct ETag headers.`
+      );
     }
     if (resp.status >= 300) {
       throw Error(`Bad response code: ${resp.status}`);
@@ -992,22 +994,6 @@ function deserializeIndex(buffer) {
   }
   return entries;
 }
-function detectVersion(a) {
-  const v = new DataView(a);
-  if (v.getUint16(2, true) === 2) {
-    console.warn(
-      "PMTiles spec version 2 has been deprecated; please see github.com/protomaps/PMTiles for tools to upgrade"
-    );
-    return 2;
-  }
-  if (v.getUint16(2, true) === 1) {
-    console.warn(
-      "PMTiles spec version 1 has been deprecated; please see github.com/protomaps/PMTiles for tools to upgrade"
-    );
-    return 1;
-  }
-  return 3;
-}
 var EtagMismatch = class extends Error {
 };
 async function getHeaderAndRoot(source, decompress) {
@@ -1015,9 +1001,6 @@ async function getHeaderAndRoot(source, decompress) {
   const v = new DataView(resp.data);
   if (v.getUint16(0, true) !== 19792) {
     throw new Error("Wrong magic number for PMTiles archive");
-  }
-  if (detectVersion(resp.data) < 3) {
-    return [await v2_default.getHeader(source)];
   }
   const headerData = resp.data.slice(0, HEADER_SIZE_BYTES);
   const header = bytesToHeader(headerData, resp.etag);
@@ -1040,47 +1023,65 @@ async function getDirectory(source, decompress, offset, length, header) {
   }
   return directory;
 }
-var ResolvedValueCache = class {
+var CloudflareKVCache = class {
   cache;
-  maxCacheEntries;
-  counter;
   decompress;
-  constructor(maxCacheEntries = 100, prefetch = true, decompress = defaultDecompress) {
-    this.cache = /* @__PURE__ */ new Map();
-    this.maxCacheEntries = maxCacheEntries;
-    this.counter = 1;
+  ctx;
+  memCache;
+  constructor(cache, decompress, ctx, headerCache2) {
+    this.cache = cache;
     this.decompress = decompress;
+    this.ctx = ctx;
+    this.memCache = headerCache2;
   }
   async getHeader(source) {
     const cacheKey = source.getKey();
-    const cacheValue = this.cache.get(cacheKey);
+    const cacheValue = this.memCache.get(cacheKey);
     if (cacheValue) {
-      cacheValue.lastUsed = this.counter++;
-      const data = cacheValue.data;
-      return data;
+      console.log(`get header memcache`);
+      return cacheValue;
     }
+    const getHeaderCacheStart = performance.now();
+    const cacheValueKV = await this.cache.get(cacheKey);
+    if (cacheValueKV) {
+      console.log(`get header KV cache`, performance.now() - getHeaderCacheStart);
+      const header = JSON.parse(cacheValueKV);
+      this.memCache.set(cacheKey, header);
+      return header;
+    }
+    console.log(`get header KV cache miss`, performance.now() - getHeaderCacheStart);
+    const headerAndRootStart = performance.now();
     const res = await getHeaderAndRoot(source, this.decompress);
+    console.log("get header and root R2", performance.now() - headerAndRootStart);
     if (res[1]) {
-      this.cache.set(res[1][0], {
-        lastUsed: this.counter++,
-        data: res[1][2]
-      });
+      this.memCache.set(res[1][0], res[1][2]);
+      this.ctx.waitUntil(this.cache.put(res[1][0], JSON.stringify(res[1][2])));
     }
-    this.cache.set(cacheKey, {
-      lastUsed: this.counter++,
-      data: res[0]
-    });
+    this.memCache.set(cacheKey, res[0]);
+    this.ctx.waitUntil(this.cache.put(cacheKey, JSON.stringify(res[0])));
     this.prune();
     return res[0];
   }
   async getDirectory(source, offset, length, header) {
     const cacheKey = `${source.getKey()}|${header.etag || ""}|${offset}|${length}`;
-    const cacheValue = this.cache.get(cacheKey);
-    if (cacheValue) {
-      cacheValue.lastUsed = this.counter++;
-      const data = cacheValue.data;
-      return data;
+    const getDirectoryCacheStart = performance.now();
+    const memCache = this.memCache.get(cacheKey);
+    const isRootDirectory = offset === header.rootDirectoryOffset && length === header.rootDirectoryLength;
+    if (memCache) {
+      console.log(`get directory memcache ${offset} ${length}`, performance.now() - getDirectoryCacheStart);
+      return memCache;
     }
+    const cacheValue = await this.cache.get(cacheKey);
+    if (cacheValue) {
+      console.log(`get directory KV cache ${offset} ${length}`, performance.now() - getDirectoryCacheStart);
+      const directory2 = JSON.parse(cacheValue);
+      if (isRootDirectory) {
+        this.memCache.set(cacheKey, directory2);
+      }
+      return directory2;
+    }
+    console.log(`get directory KV cache miss ${offset} ${length}`, performance.now() - getDirectoryCacheStart);
+    const getDirectoryR2Start = performance.now();
     const directory = await getDirectory(
       source,
       this.decompress,
@@ -1088,44 +1089,15 @@ var ResolvedValueCache = class {
       length,
       header
     );
-    this.cache.set(cacheKey, {
-      lastUsed: this.counter++,
-      data: directory
-    });
-    this.prune();
+    console.log("get directory R2", performance.now() - getDirectoryR2Start);
+    this.ctx.waitUntil(this.cache.put(cacheKey, JSON.stringify(directory)));
     return directory;
   }
   // for v2 backwards compatibility
   async getArrayBuffer(source, offset, length, header) {
-    const cacheKey = `${source.getKey()}|${header.etag || ""}|${offset}|${length}`;
-    const cacheValue = this.cache.get(cacheKey);
-    if (cacheValue) {
-      cacheValue.lastUsed = this.counter++;
-      const data = await cacheValue.data;
-      return data;
-    }
-    const resp = await source.getBytes(offset, length, void 0, header.etag);
-    this.cache.set(cacheKey, {
-      lastUsed: this.counter++,
-      data: resp.data
-    });
-    this.prune();
-    return resp.data;
+    throw new Error("V2 not supported for Cloudflare KV");
   }
   prune() {
-    if (this.cache.size > this.maxCacheEntries) {
-      let minUsed = Infinity;
-      let minKey = void 0;
-      this.cache.forEach((cacheValue, key) => {
-        if (cacheValue.lastUsed < minUsed) {
-          minUsed = cacheValue.lastUsed;
-          minKey = key;
-        }
-      });
-      if (minKey) {
-        this.cache.delete(minKey);
-      }
-    }
   }
   async invalidate(source) {
     this.cache.delete(source.getKey());
@@ -1292,12 +1264,14 @@ var PMTiles = class {
       const entry = findTile(directory, tileId);
       if (entry) {
         if (entry.runLength > 0) {
+          const getTileStart = performance.now();
           const resp = await this.source.getBytes(
             header.tileDataOffset + entry.offset,
             entry.length,
             signal,
             header.etag
           );
+          console.log("get tile R2", performance.now() - getTileStart);
           return {
             data: await this.decompress(resp.data, header.tileCompression),
             cacheControl: resp.cacheControl,
@@ -1425,7 +1399,6 @@ async function nativeDecompress(buf, compression) {
   }
   throw Error("Compression method not supported");
 }
-var CACHE = new ResolvedValueCache(25, void 0, nativeDecompress);
 var R2Source = class {
   env;
   archiveName;
@@ -1460,8 +1433,10 @@ var R2Source = class {
     };
   }
 };
+var headerCache = /* @__PURE__ */ new Map();
 var src_default = {
   async fetch(request, env, ctx) {
+    const CACHE = new CloudflareKVCache(env.KV, nativeDecompress, ctx, headerCache);
     if (request.method.toUpperCase() === "POST")
       return new Response(void 0, { status: 405 });
     const url = new URL(request.url);

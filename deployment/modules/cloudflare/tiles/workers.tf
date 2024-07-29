@@ -22,6 +22,11 @@ resource "cloudflare_worker_script" "tiles" {
     name        = "BUCKET"
     bucket_name = cloudflare_r2_bucket.tiles.name
   }
+
+  kv_namespace_binding {
+    name         = "KV"
+    namespace_id = cloudflare_workers_kv_namespace.tiles.id
+  }
 }
 
 resource "cloudflare_worker_domain" "tiles" {
