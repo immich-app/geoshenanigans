@@ -1,4 +1,5 @@
 import { createExecutionContext, env, SELF, waitOnExecutionContext } from 'cloudflare:test';
+import { inject } from 'vitest';
 import worker, { parseUrl } from '../src';
 
 // For now, you'll need to do something like this to get a correctly-typed
@@ -6,19 +7,36 @@ import worker, { parseUrl } from '../src';
 const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
 
 describe('integration tests', () => {
-  beforeAll(async () => {
-    // await env.BUCKET.put('v1.pmtiles', fs.readFileSync('pmtiles'));
-    // (await env.BUCKET.list()).objects.forEach((key) => {
-    //   console.log(key);
-    // });
-  });
-  it('responds with Hello World! (integration style)', async () => {
-    const response = await SELF.fetch('https://example.com');
-    expect(await response.text()).toMatchInlineSnapshot(`"Hello World!"`);
+  describe('success - zoom1', () => {
+    beforeAll(async () => {
+      const file = await fetch(`http://localhost:${inject('port')}/zoom1.pmtiles`);
+      if (!file.body) throw new Error('File body is undefined');
+      const body = file.body as ReadableStream;
+      await env.BUCKET.put(env.PMTILES_FILE_NAME, body);
+      console.log('File uploaded');
+    }, 30000);
+    it('responds with correct json file', async () => {
+      const response = await SELF.fetch('https://example.com/v1');
+      expect(JSON.stringify(await response.json(), null, 2)).toMatchFileSnapshot('./__snapshots__/v1.json');
+    });
+    it('responds with correct tile', async () => {
+      const response = await SELF.fetch('https://example.com/v1/0/0/0.mvt');
+      expect(response.status).toBe(200);
+      expect(Buffer.from(await response.arrayBuffer()).toString()).toMatchFileSnapshot('./__snapshots__/v1-0-0-0.mvt');
+    });
+    it('responds with correct tile 2', async () => {
+      const response = await SELF.fetch('https://example.com/v1/1/0/1.mvt');
+      expect(response.status).toBe(200);
+      expect(Buffer.from(await response.arrayBuffer()).toString()).toMatchFileSnapshot('./__snapshots__/v1-1-0-1.mvt');
+    });
+    it('responds with error when tile out of bounds', async () => {
+      const response = await SELF.fetch('https://example.com/v1/0/0/1.mvt');
+      expect(response.status).toBe(500);
+    });
   });
 });
 
-describe('Hello World worker', () => {
+describe.skip('Hello World worker', () => {
   it('responds with Hello World! (unit style)', async () => {
     const request = new IncomingRequest('http://example.com');
     // Create an empty context to pass to `worker.fetch()`.

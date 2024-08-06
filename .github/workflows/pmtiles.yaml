@@ -1,0 +1,9 @@
+name: 'R2'
+on:
+  schedule:
+    - cron: "* 14 * 1 *"
+
+jobs:
+  tile-build-and-upload:
+    runs-on: mich
+
