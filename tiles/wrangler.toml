@@ -1,0 +1,23 @@
+#:schema node_modules/wrangler/config-schema.json
+name = "tiles-dev"
+main = "src/index.ts"
+compatibility_date = "2024-07-29"
+compatibility_flags = ["nodejs_compat"]
+
+# Bind a KV Namespace. Use KV as persistent storage for small key-value pairs.
+# Docs: https://developers.cloudflare.com/workers/wrangler/configuration/#kv-namespaces
+[[kv_namespaces]]
+binding = "KV"
+id = "5a4b82694e8b490db8b8904cdaea4f00"
+
+# Bind an R2 Bucket. Use R2 to store arbitrarily large blobs of data, such as files.
+# Docs: https://developers.cloudflare.com/workers/wrangler/configuration/#r2-buckets
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "tiles"
+preview_bucket_name = "tiles"
+
+# Define environment variables for your Workers script
+[vars]
+PMTILES_FILE_NAME = "v1.pmtiles"
+PMTILES_FILE_HASH = "example-dev-hash"
