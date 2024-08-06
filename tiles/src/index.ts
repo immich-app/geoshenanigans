@@ -97,20 +97,26 @@ export default {
 
     const pmTilesParams = parseUrl(request);
 
-    if (pmTilesParams.requestType === 'tile') {
-      const { z, x, y } = pmTilesParams as PMTilesTileParams;
-      const tile = await pmTiles.getTile(+z, +x, +y);
-      if (!tile) return new Response('Tile not found', { status: 404 });
-      respHeaders.set('Content-Type', 'application/x-protobuf');
-      respHeaders.set('content-encoding', 'gzip');
-      return cacheResponse(new Response(tile.data, { headers: respHeaders, status: 200, encodeBody: 'manual' }));
-    } else if (pmTilesParams.requestType === 'json') {
-      const { version, url } = pmTilesParams as PMTilesJsonParams;
-      const header = await pmTiles.getHeader();
-      const metadata = await pmTiles.getMetadata();
-      respHeaders.set('Content-Type', 'application/json');
-      const tileJson = tileJSON({ header, metadata, hostname: url.hostname, version });
-      return cacheResponse(new Response(JSON.stringify(tileJson), { headers: respHeaders, status: 200 }));
+    try {
+      if (pmTilesParams.requestType === 'tile') {
+        const { z, x, y } = pmTilesParams as PMTilesTileParams;
+        console.log(z, x, y);
+        const tile = await pmTiles.getTile(+z, +x, +y);
+        if (!tile) return new Response('Tile not found', { status: 404 });
+        respHeaders.set('Content-Type', 'application/x-protobuf');
+        respHeaders.set('content-encoding', 'gzip');
+        return cacheResponse(new Response(tile.data, { headers: respHeaders, status: 200, encodeBody: 'manual' }));
+      } else if (pmTilesParams.requestType === 'json') {
+        const { version, url } = pmTilesParams as PMTilesJsonParams;
+        const header = await pmTiles.getHeader();
+        const metadata = await pmTiles.getMetadata();
+        respHeaders.set('Content-Type', 'application/json');
+        const tileJson = tileJSON({ header, metadata, hostname: url.hostname, version });
+        return cacheResponse(new Response(JSON.stringify(tileJson), { headers: respHeaders, status: 200 }));
+      }
+    } catch (e) {
+      console.error(e);
+      return new Response('Internal Server Error', { status: 500 });
     }
 
     return cacheResponse(new Response('Invalid URL', { status: 404 }));

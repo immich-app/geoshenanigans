@@ -39,7 +39,7 @@ export class PMTiles {
     return p;
   }
 
-  async getHeader(): Promise<Header> {
+  getHeader(): Header {
     const key = this.source.getKey();
     const memCached = this.memCache.get(key);
     if (!memCached) {
@@ -48,7 +48,7 @@ export class PMTiles {
     return memCached as Header;
   }
 
-  async getRootDirectory(header: Header): Promise<Directory> {
+  getRootDirectory(header: Header): Directory {
     const key = `${this.source.getKey()}|${header.rootDirectoryOffset}|${header.rootDirectoryLength}`;
     const root = this.memCache.get(key);
     if (!root) {
@@ -101,31 +101,31 @@ export class PMTiles {
 
   async getTile(z: number, x: number, y: number): Promise<RangeResponse | undefined> {
     const tileId = zxyToTileId(z, x, y);
-    const header = await this.getHeader();
-    const rootDirectory = await this.getRootDirectory(header);
+    const header = this.getHeader();
+    const rootDirectory = this.getRootDirectory(header);
 
     if (z < header.minZoom || z > header.maxZoom) {
       return;
     }
 
-    const leafDirectoryEntry = findTile(rootDirectory.entries, tileId);
-    if (!leafDirectoryEntry) {
-      return;
-    }
-    const directoryOffset = header.leafDirectoryOffset + leafDirectoryEntry?.offset;
-    const directoryLength = leafDirectoryEntry.length;
-    const leafDirectory = await monitorAsyncFunction('get-leaf-directory', this.getDirectory, { thisArg: this })(
-      directoryOffset,
-      directoryLength,
-      header,
-    );
-    const tileEntry = findTile(leafDirectory.entries, tileId);
-    if (!tileEntry || tileEntry.runLength === 0) {
-      return;
+    let offset = header.rootDirectoryOffset;
+    let length = header.rootDirectoryLength;
+    let entry = findTile(rootDirectory.entries, tileId);
+    for (let i = 0; i < 2; ++i) {
+      if (!entry) return;
+      offset = entry.offset;
+      length = entry.length;
+      if (entry.runLength !== 0) break; // Run length of 0 is a directory, anything else is a tile
+      const leafDirectory = await monitorAsyncFunction('get-leaf-directory', this.getDirectory, { thisArg: this })(
+        header.leafDirectoryOffset + offset,
+        length,
+        header,
+      );
+      entry = findTile(leafDirectory.entries, tileId);
     }
     const tile = await this.source.getBytesFromArchive({
-      offset: header.tileDataOffset + tileEntry.offset,
-      length: tileEntry.length,
+      offset: header.tileDataOffset + offset,
+      length,
     });
     return tile;
   }
