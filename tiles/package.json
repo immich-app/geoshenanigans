@@ -25,5 +25,8 @@
     "vite-node": "1.5.0",
     "vite-plugin-node-polyfills": "^0.22.0",
     "wrangler": "^3.60.3"
+  },
+  "dependencies": {
+    "@influxdata/influxdb3-client": "^0.9.0"
   }
 }
