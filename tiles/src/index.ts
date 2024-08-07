@@ -66,7 +66,7 @@ async function handleRequest(request: Request<unknown, IncomingRequestCfProperti
     return cacheResponse(new Response(tile.data, { headers: respHeaders, status: 200, encodeBody: 'manual' }));
   };
 
-  async function handleJsonRequest() {
+  async function handleJsonRequest(respHeaders: Headers) {
     const { version, url } = pmTilesParams as PMTilesJsonParams;
     const header = pmTiles.getHeader();
     const metadata = await pmTiles.getMetadata();
@@ -117,7 +117,10 @@ async function handleRequest(request: Request<unknown, IncomingRequestCfProperti
       )(z, x, y, pmTiles, respHeaders);
     } else if (pmTilesParams.requestType === 'json') {
       const { version } = pmTilesParams as PMTilesJsonParams;
-      return await metrics.monitorAsyncFunction({ name: 'json_request', extraTags: { version } }, handleJsonRequest)();
+      return await metrics.monitorAsyncFunction(
+        { name: 'json_request', extraTags: { version } },
+        handleJsonRequest,
+      )(respHeaders);
     }
   } catch (e) {
     console.error(e);
