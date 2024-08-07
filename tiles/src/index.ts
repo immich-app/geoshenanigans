@@ -49,8 +49,17 @@ export function parseUrl(request: Request): PMTilesParams {
   return { requestType: undefined, url };
 }
 
+// export let context: ExecutionContext | undefined;
+// export let defaultTags: { [key: string]: string };
+
 export default {
   async fetch(request, env, ctx): Promise<Response> {
+    // defaultTags = {
+    //   colo: request.cf?.colo ?? '',
+    //   rayId: request.headers.get('cf-ray') ?? '',
+    //   asOrg: request.cf?.asOrganization ?? '',
+    // };
+    // context = ctx;
     if (!globalThis.source) {
       globalThis.source = new R2Source(env);
     }
@@ -108,7 +117,7 @@ export default {
         return cacheResponse(new Response(tile.data, { headers: respHeaders, status: 200, encodeBody: 'manual' }));
       } else if (pmTilesParams.requestType === 'json') {
         const { version, url } = pmTilesParams as PMTilesJsonParams;
-        const header = await pmTiles.getHeader();
+        const header = pmTiles.getHeader();
         const metadata = await pmTiles.getMetadata();
         respHeaders.set('Content-Type', 'application/json');
         const tileJson = tileJSON({ header, metadata, hostname: url.hostname, version });
