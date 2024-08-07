@@ -1,4 +1,4 @@
-import { monitorAsyncFunction } from '../monitor';
+import { Metrics } from '../monitor';
 import { R2Source, RangeResponse } from '../r2';
 import { Directory, Header, Metadata } from './types';
 import { bytesToHeader, decompress, deserializeIndex, findTile, zxyToTileId } from './utils';
@@ -116,11 +116,10 @@ export class PMTiles {
       offset = entry.offset;
       length = entry.length;
       if (entry.runLength !== 0) break; // Run length of 0 is a directory, anything else is a tile
-      const leafDirectory = await monitorAsyncFunction('get-leaf-directory', this.getDirectory, { thisArg: this })(
-        header.leafDirectoryOffset + offset,
-        length,
-        header,
-      );
+      const leafDirectory = await Metrics.getMetrics().monitorAsyncFunction(
+        { name: 'get_leaf_directory' },
+        (offset, length, header) => this.getDirectory(offset, length, header),
+      )(header.leafDirectoryOffset + offset, length, header);
       entry = findTile(leafDirectory.entries, tileId);
     }
     const tile = await this.source.getBytesFromArchive({
@@ -131,7 +130,7 @@ export class PMTiles {
   }
 
   async getMetadata(): Promise<Metadata> {
-    const header = await this.getHeader();
+    const header = this.getHeader();
 
     const resp = await this.source.getBytesFromArchive({
       offset: header.jsonMetadataOffset,
