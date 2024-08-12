@@ -14,22 +14,12 @@ import {
 const HEADER_SIZE_BYTES = 127;
 
 export class PMTiles {
-  source: IStorageRepository;
-  memCache: IMemCacheRepository;
-  kvCache: IKeyValueRepository;
-  ctx: ExecutionContext;
-
   private constructor(
-    source: IStorageRepository,
-    memCache: IMemCacheRepository,
-    kvCache: IKeyValueRepository,
-    ctx: ExecutionContext,
-  ) {
-    this.source = source;
-    this.memCache = memCache;
-    this.kvCache = kvCache;
-    this.ctx = ctx;
-  }
+    private source: IStorageRepository,
+    private memCache: IMemCacheRepository,
+    private kvCache: IKeyValueRepository,
+    private ctx: ExecutionContext,
+  ) {}
 
   static async init(
     source: IStorageRepository,

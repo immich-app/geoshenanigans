@@ -2,10 +2,7 @@ import { IKeyValueRepository, IMemCacheRepository, IStorageRepository } from './
 import { Metrics } from './monitor';
 
 export class CloudflareKVRepository implements IKeyValueRepository {
-  private KV: KVNamespace;
-  constructor(KV: KVNamespace) {
-    this.KV = KV;
-  }
+  constructor(private KV: KVNamespace) {}
 
   async put(key: string, value: string): Promise<void> {
     await Metrics.getMetrics().monitorAsyncFunction({ name: 'kv-put-value', extraTags: { key } }, this.KV.put)(
@@ -34,32 +31,30 @@ export class CloudflareKVRepository implements IKeyValueRepository {
 
 /* eslint-disable no-var */
 declare global {
-  var headerCache: Map<string, unknown>;
+  var memCache: Map<string, unknown>;
 }
 /* eslint-enable no-var */
 
-if (!globalThis.headerCache) {
-  globalThis.headerCache = new Map<string, unknown>();
+if (!globalThis.memCache) {
+  globalThis.memCache = new Map<string, unknown>();
 }
 
 export class MemCacheRepository implements IMemCacheRepository {
+  constructor(private globalCache: Map<string, unknown>) {}
   set<T>(key: string, value: T): void {
-    headerCache.set(key, value);
+    this.globalCache.set(key, value);
   }
 
   get<T>(key: string): T | undefined {
-    return headerCache.get(key) as T;
+    return this.globalCache.get(key) as T;
   }
 }
 
 export class R2StorageRepository implements IStorageRepository {
-  private bucket: R2Bucket;
-  private readonly fileName: string;
-
-  constructor(bucket: R2Bucket, filename: string) {
-    this.fileName = filename;
-    this.bucket = bucket;
-  }
+  constructor(
+    private bucket: R2Bucket,
+    private fileName: string,
+  ) {}
 
   getFileName(): string {
     return this.fileName;
@@ -76,6 +71,6 @@ export class R2StorageRepository implements IStorageRepository {
 
     const o = resp as R2ObjectBody;
 
-    return await o.arrayBuffer();
+    return o.arrayBuffer();
   }
 }

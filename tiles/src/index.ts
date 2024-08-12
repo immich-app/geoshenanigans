@@ -85,7 +85,7 @@ async function handleRequest(
     });
   }
 
-  const memCacheRepository = new MemCacheRepository();
+  const memCacheRepository = new MemCacheRepository(globalThis.memCache);
   const kvRepository = new CloudflareKVRepository(env.KV);
   const storageRepository = new R2StorageRepository(env.BUCKET, env.PMTILES_FILE_NAME);
 
