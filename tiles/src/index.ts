@@ -1,6 +1,5 @@
 import { Metrics } from './monitor';
-import { PMTiles } from './pmtiles/pmtiles';
-import { tileJSON } from './pmtiles/utils';
+import { PMTilesService } from './pmtiles/pmtiles';
 import { CloudflareKVRepository, MemCacheRepository, R2StorageRepository } from './repository';
 
 const URL_MATCHER = /^\/v(?<VERSION>[0-9]+)((?=)|(?<JSON>\.json)|\/(?<Z>\d+)\/(?<X>\d+)\/(?<Y>\d+).mvt)$/;
@@ -50,7 +49,7 @@ async function handleRequest(
     return new Response(responseBody, response);
   };
 
-  const handleTileRequest = async (z: string, x: string, y: string, pmTiles: PMTiles, respHeaders: Headers) => {
+  const handleTileRequest = async (z: string, x: string, y: string, pmTiles: PMTilesService, respHeaders: Headers) => {
     const tile = await pmTiles.getTile(+z, +x, +y);
     if (!tile) return new Response('Tile not found', { status: 404 });
     respHeaders.set('Content-Type', 'application/x-protobuf');
@@ -60,10 +59,8 @@ async function handleRequest(
 
   async function handleJsonRequest(respHeaders: Headers) {
     const { version, url } = pmTilesParams as PMTilesJsonParams;
-    const header = pmTiles.getHeader();
-    const metadata = await pmTiles.getMetadata();
+    const tileJson = await pmTilesService.getJsonResponse(version, url);
     respHeaders.set('Content-Type', 'application/json');
-    const tileJson = tileJSON({ header, metadata, hostname: url.hostname, version });
     return cacheResponse(new Response(JSON.stringify(tileJson), { headers: respHeaders, status: 200 }));
   }
 
@@ -75,7 +72,7 @@ async function handleRequest(
   const cached = await metrics.monitorAsyncFunction({ name: 'match_request_from_cdn' }, (url) => cache.match(url))(
     request.url,
   );
-  if (cached) {
+  if (cached && cached.headers.get('PMTiles-File-Identifier') === env.PMTILES_FILE_HASH) {
     const cacheHeaders = new Headers(cached.headers);
     const encodeBody = cacheHeaders.has('content-encoding') ? 'manual' : 'automatic';
     return new Response(cached.body, {
@@ -88,8 +85,7 @@ async function handleRequest(
   const memCacheRepository = new MemCacheRepository(globalThis.memCache);
   const kvRepository = new CloudflareKVRepository(env.KV);
   const storageRepository = new R2StorageRepository(env.BUCKET, env.PMTILES_FILE_NAME);
-
-  const pmTiles = await metrics.monitorAsyncFunction({ name: 'pmtiles_init' }, PMTiles.init)(
+  const pmTilesService = await metrics.monitorAsyncFunction({ name: 'pmtiles_init' }, PMTilesService.init)(
     storageRepository,
     memCacheRepository,
     kvRepository,
@@ -110,8 +106,10 @@ async function handleRequest(
       return await metrics.monitorAsyncFunction(
         { name: 'tile_request', extraTags: { z, x, y, version } },
         handleTileRequest,
-      )(z, x, y, pmTiles, respHeaders);
-    } else if (pmTilesParams.requestType === 'json') {
+      )(z, x, y, pmTilesService, respHeaders);
+    }
+
+    if (pmTilesParams.requestType === 'json') {
       const { version } = pmTilesParams as PMTilesJsonParams;
       return await metrics.monitorAsyncFunction(
         { name: 'json_request', extraTags: { version } },
@@ -123,7 +121,7 @@ async function handleRequest(
     return new Response('Internal Server Error', { status: 500 });
   }
 
-  return cacheResponse(new Response('Invalid URL', { status: 404 }));
+  return cacheResponse(new Response('Invalid URL', { headers: respHeaders, status: 404 }));
 }
 
 export default {

@@ -8,12 +8,13 @@ import {
   findTile,
   getDirectoryCacheKey,
   getHeaderCacheKey,
+  tileJSON,
   zxyToTileId,
 } from './utils';
 
 const HEADER_SIZE_BYTES = 127;
 
-export class PMTiles {
+export class PMTilesService {
   private constructor(
     private source: IStorageRepository,
     private memCache: IMemCacheRepository,
@@ -26,8 +27,8 @@ export class PMTiles {
     memCache: IMemCacheRepository,
     kvCache: IKeyValueRepository,
     ctx: ExecutionContext,
-  ): Promise<PMTiles> {
-    const p = new PMTiles(source, memCache, kvCache, ctx);
+  ): Promise<PMTilesService> {
+    const p = new PMTilesService(source, memCache, kvCache, ctx);
     const headerCacheKey = getHeaderCacheKey(source.getFileName());
     if (memCache.get(headerCacheKey)) {
       return p;
@@ -44,7 +45,7 @@ export class PMTiles {
     return p;
   }
 
-  getHeader(): Header {
+  private getHeader(): Header {
     const key = getHeaderCacheKey(this.source.getFileName());
     const memCached = this.memCache.get<Header>(key);
     if (!memCached) {
@@ -53,7 +54,7 @@ export class PMTiles {
     return memCached;
   }
 
-  getRootDirectory(header: Header): Directory {
+  private getRootDirectory(header: Header): Directory {
     const key = getDirectoryCacheKey(this.source.getFileName(), {
       offset: header.rootDirectoryOffset,
       length: header.rootDirectoryLength,
@@ -86,7 +87,7 @@ export class PMTiles {
     return [header, rootDir];
   }
 
-  async getDirectory(offset: number, length: number, header: Header): Promise<Directory> {
+  private async getDirectory(offset: number, length: number, header: Header): Promise<Directory> {
     const cacheKey = getDirectoryCacheKey(this.source.getFileName(), { offset, length });
     const kvValue = await this.kvCache.get(cacheKey);
     if (kvValue) {
@@ -102,6 +103,12 @@ export class PMTiles {
     const directory: Directory = { offsetStart: entries[0].offset, tileIdStart: entries[0].tileId, entries };
     this.ctx.waitUntil(this.kvCache.put(cacheKey, JSON.stringify(directory)));
     return directory;
+  }
+
+  async getJsonResponse(version: string, url: URL) {
+    const header = this.getHeader();
+    const metadata = await this.getMetadata();
+    return tileJSON({ header, metadata, hostname: url.hostname, version });
   }
 
   async getTile(z: number, x: number, y: number): Promise<ArrayBuffer | undefined> {
@@ -134,7 +141,7 @@ export class PMTiles {
     return tile;
   }
 
-  async getMetadata(): Promise<Metadata> {
+  private async getMetadata(): Promise<Metadata> {
     const header = this.getHeader();
 
     const resp = await this.source.get({
