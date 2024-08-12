@@ -96,7 +96,7 @@ export class Metrics {
                 method: 'POST',
                 body: influxLineProtocol,
                 headers: {
-                  Authorization: `Token `,
+                  Authorization: `Token ${this.env.VMETRICS_API_TOKEN}`,
                 },
               }),
             );
