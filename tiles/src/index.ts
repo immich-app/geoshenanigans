@@ -29,10 +29,11 @@ type PMTilesJsonParams = PMTilesParams & {
 
 export function parseUrl(request: Request): PMTilesParams {
   const url = new URL(request.url);
-  const version = URL_MATCHER.exec(url.pathname)?.groups?.VERSION;
-  const z = URL_MATCHER.exec(url.pathname)?.groups?.Z;
-  const x = URL_MATCHER.exec(url.pathname)?.groups?.X;
-  const y = URL_MATCHER.exec(url.pathname)?.groups?.Y;
+  const matches = URL_MATCHER.exec(url.pathname);
+  const version = matches?.groups?.VERSION;
+  const z = matches?.groups?.Z;
+  const x = matches?.groups?.X;
+  const y = matches?.groups?.Y;
   if (version && z && x && y) {
     return { requestType: 'tile', version, z, x, y, url } as PMTilesTileParams;
   } else if (version) {
