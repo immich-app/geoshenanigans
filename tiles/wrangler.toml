@@ -24,4 +24,9 @@ binding = "CF_VERSION_METADATA"
 [vars]
 PMTILES_FILE_NAME = "v1.pmtiles"
 PMTILES_FILE_HASH = "example-dev-hash"
-ENVIRONMENT = "dev"
+ENVIRONMENT = "development"
+
+[env.prod]
+name = "tiles"
+[vars]
+ENVIRONMENT = "production"
