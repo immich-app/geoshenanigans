@@ -1,8 +1,7 @@
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-
 import { Point } from '@influxdata/influxdb-client';
 import { IDeferredRepository } from './interface';
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AsyncFn = (...args: any[]) => Promise<any>;
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -14,10 +13,10 @@ type Options = Partial<{
 }>;
 
 const startTimer = () => {
-  const startTime = Date.now();
+  const startTime = performance.now();
   return {
     elapsedMs: (): number => {
-      return Date.now() - startTime;
+      return performance.now() - startTime;
     },
   };
 };
