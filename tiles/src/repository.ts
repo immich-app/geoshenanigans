@@ -63,7 +63,7 @@ export class R2StorageRepository implements IStorageRepository {
   private async getR2Object(range: { offset: number; length: number }) {
     const { offset, length } = range;
     const resp = await this.bucket.get(this.fileName, {
-      range: { offset: offset, length: length },
+      range: { offset, length },
     });
     if (!resp) {
       throw new Error('Archive not found');

@@ -1,12 +1,12 @@
 import express from 'express';
 import { AddressInfo } from 'node:net';
-import * as Path from 'node:path';
+import * as path from 'node:path';
 import type { GlobalSetupContext } from 'vitest/node';
 
 export default function setup({ provide }: GlobalSetupContext) {
   const app = express();
-  console.log(Path.join(__dirname, '/assets'));
-  app.use(express.static(Path.join(__dirname, '/assets')));
+  console.log(path.join(__dirname, '/assets'));
+  app.use(express.static(path.join(__dirname, '/assets')));
   const listener = app.listen(0, () => {
     const addressInfo = listener.address() as AddressInfo;
     const port = addressInfo.port;
