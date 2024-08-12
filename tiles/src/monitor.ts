@@ -1,6 +1,7 @@
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 
 import { Point } from '@influxdata/influxdb-client';
+import { IDeferredRepository } from './interface';
 
 type AsyncFn = (...args: any[]) => Promise<any>;
 
@@ -23,7 +24,7 @@ const startTimer = () => {
 
 export class Metrics {
   private static _instance: Metrics;
-  private readonly ctx: ExecutionContext;
+  private readonly deferredRepository: IDeferredRepository;
   private readonly request: Request;
   private readonly env: WorkerEnv;
   private readonly defaultTags: { [key: string]: string };
@@ -32,11 +33,11 @@ export class Metrics {
   private constructor(
     operationPrefix: string,
     request: Request<unknown, IncomingRequestCfProperties>,
-    ctx: ExecutionContext,
-    env: Env,
+    deferredRepository: IDeferredRepository,
+    env: WorkerEnv,
   ) {
     this.request = request;
-    this.ctx = ctx;
+    this.deferredRepository = deferredRepository;
     this.env = env;
     this.defaultTags = {
       colo: request.cf?.colo ?? '',
@@ -51,10 +52,10 @@ export class Metrics {
   public static initialiseMetrics(
     operationPrefix: string,
     request: Request<unknown, IncomingRequestCfProperties>,
-    ctx: ExecutionContext,
-    env: Env,
+    deferredRepository: IDeferredRepository,
+    env: WorkerEnv,
   ) {
-    this._instance = new Metrics(operationPrefix, request, ctx, env);
+    this._instance = new Metrics(operationPrefix, request, deferredRepository, env);
     return this._instance;
   }
 
@@ -91,7 +92,7 @@ export class Metrics {
           point.intField('duration', timer.elapsedMs());
           const influxLineProtocol = point.toLineProtocol()?.toString();
           if (this.env.ENVIRONMENT === 'production') {
-            this.ctx.waitUntil(
+            this.deferredRepository.defer(
               fetch('https://cf-workers.monitoring.immich.cloud/write', {
                 method: 'POST',
                 body: influxLineProtocol,

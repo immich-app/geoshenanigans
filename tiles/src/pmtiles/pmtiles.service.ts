@@ -1,4 +1,4 @@
-import { IKeyValueRepository, IMemCacheRepository, IStorageRepository } from '../interface';
+import { IDeferredRepository, IKeyValueRepository, IMemCacheRepository, IStorageRepository } from '../interface';
 import { Metrics } from '../monitor';
 import { Directory, Header, Metadata } from './types';
 import {
@@ -19,16 +19,16 @@ export class PMTilesService {
     private source: IStorageRepository,
     private memCache: IMemCacheRepository,
     private kvCache: IKeyValueRepository,
-    private ctx: ExecutionContext,
+    private deferredRepository: IDeferredRepository,
   ) {}
 
   static async init(
     source: IStorageRepository,
     memCache: IMemCacheRepository,
     kvCache: IKeyValueRepository,
-    ctx: ExecutionContext,
+    deferredRepository: IDeferredRepository,
   ): Promise<PMTilesService> {
-    const p = new PMTilesService(source, memCache, kvCache, ctx);
+    const p = new PMTilesService(source, memCache, kvCache, deferredRepository);
     const headerCacheKey = getHeaderCacheKey(source.getFileName());
     if (memCache.get(headerCacheKey)) {
       return p;
@@ -101,7 +101,7 @@ export class PMTilesService {
       throw new Error('Empty directory is invalid');
     }
     const directory: Directory = { offsetStart: entries[0].offset, tileIdStart: entries[0].tileId, entries };
-    this.ctx.waitUntil(this.kvCache.put(cacheKey, JSON.stringify(directory)));
+    this.deferredRepository.defer(this.kvCache.put(cacheKey, JSON.stringify(directory)));
     return directory;
   }
 

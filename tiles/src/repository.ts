@@ -1,4 +1,4 @@
-import { IKeyValueRepository, IMemCacheRepository, IStorageRepository } from './interface';
+import { IDeferredRepository, IKeyValueRepository, IMemCacheRepository, IStorageRepository } from './interface';
 import { Metrics } from './monitor';
 
 export class CloudflareKVRepository implements IKeyValueRepository {
@@ -77,5 +77,12 @@ export class R2StorageRepository implements IStorageRepository {
 
   async getAsStream(range: { offset: number; length: number }): Promise<ReadableStream> {
     return (await this.getR2Object(range)).body;
+  }
+}
+
+export class CloudflareDeferredRepository implements IDeferredRepository {
+  constructor(private ctx: ExecutionContext) {}
+  defer(promise: Promise<unknown>): void {
+    this.ctx.waitUntil(promise);
   }
 }

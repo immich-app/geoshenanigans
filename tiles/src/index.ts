@@ -1,6 +1,11 @@
 import { Metrics } from './monitor';
 import { PMTilesService } from './pmtiles/pmtiles.service';
-import { CloudflareKVRepository, MemCacheRepository, R2StorageRepository } from './repository';
+import {
+  CloudflareDeferredRepository,
+  CloudflareKVRepository,
+  MemCacheRepository,
+  R2StorageRepository,
+} from './repository';
 
 const URL_MATCHER = /^\/v(?<VERSION>[0-9]+)((?=)|(?<JSON>\.json)|\/(?<Z>\d+)\/(?<X>\d+)\/(?<Y>\d+).mvt)$/;
 
@@ -39,13 +44,13 @@ export function parseUrl(request: Request): PMTilesParams {
 async function handleRequest(
   request: Request<unknown, IncomingRequestCfProperties>,
   env: WorkerEnv,
-  ctx: ExecutionContext,
+  deferredRepository: CloudflareDeferredRepository,
 ) {
   const metrics = Metrics.getMetrics();
   const cacheResponse = async (response: Response): Promise<Response> => {
     if (!response.body) throw new Error('Response body is undefined');
     const responseBody = await response.arrayBuffer();
-    ctx.waitUntil(cache.put(request.url, new Response(responseBody, response)));
+    deferredRepository.defer(cache.put(request.url, new Response(responseBody, response)));
     return new Response(responseBody, response);
   };
 
@@ -89,7 +94,7 @@ async function handleRequest(
     storageRepository,
     memCacheRepository,
     kvRepository,
-    ctx,
+    deferredRepository,
   );
 
   const respHeaders = new Headers();
@@ -126,8 +131,14 @@ async function handleRequest(
 
 export default {
   async fetch(request, env, ctx): Promise<Response> {
-    const metrics = Metrics.initialiseMetrics('tiles', request, ctx, env);
+    const deferredRepository = new CloudflareDeferredRepository(ctx);
+    const workerEnv = env as WorkerEnv;
+    const metrics = Metrics.initialiseMetrics('tiles', request, deferredRepository, workerEnv);
 
-    return metrics.monitorAsyncFunction({ name: 'handle_request' }, handleRequest)(request, env, ctx);
+    return metrics.monitorAsyncFunction({ name: 'handle_request' }, handleRequest)(
+      request,
+      workerEnv,
+      deferredRepository,
+    );
   },
 } satisfies ExportedHandler<Env>;

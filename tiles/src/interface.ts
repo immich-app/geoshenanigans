@@ -14,3 +14,7 @@ export interface IStorageRepository {
   getAsStream(range: { length: number; offset: number }): Promise<ReadableStream>;
   getFileName(): string;
 }
+
+export interface IDeferredRepository {
+  defer(promise: Promise<any>): void;
+}
