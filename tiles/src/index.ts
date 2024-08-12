@@ -1,21 +1,9 @@
 import { Metrics } from './monitor';
 import { PMTiles } from './pmtiles/pmtiles';
-import { Header } from './pmtiles/types';
 import { tileJSON } from './pmtiles/utils';
-import { R2Source } from './r2';
+import { CloudflareKVRepository, MemCacheRepository, R2StorageRepository } from './repository';
 
 const URL_MATCHER = /^\/v(?<VERSION>[0-9]+)((?=)|(?<JSON>\.json)|\/(?<Z>\d+)\/(?<X>\d+)\/(?<Y>\d+).mvt)$/;
-
-/* eslint-disable no-var */
-declare global {
-  var headerCache: Map<string, Header>;
-  var source: R2Source;
-}
-/* eslint-enable no-var */
-
-if (!globalThis.headerCache) {
-  globalThis.headerCache = new Map<string, Header>();
-}
 
 type PMTilesParams = {
   requestType: 'tile' | 'json' | undefined;
@@ -49,7 +37,11 @@ export function parseUrl(request: Request): PMTilesParams {
   return { requestType: undefined, url };
 }
 
-async function handleRequest(request: Request<unknown, IncomingRequestCfProperties>, env: Env, ctx: ExecutionContext) {
+async function handleRequest(
+  request: Request<unknown, IncomingRequestCfProperties>,
+  env: WorkerEnv,
+  ctx: ExecutionContext,
+) {
   const metrics = Metrics.getMetrics();
   const cacheResponse = async (response: Response): Promise<Response> => {
     if (!response.body) throw new Error('Response body is undefined');
@@ -63,7 +55,7 @@ async function handleRequest(request: Request<unknown, IncomingRequestCfProperti
     if (!tile) return new Response('Tile not found', { status: 404 });
     respHeaders.set('Content-Type', 'application/x-protobuf');
     respHeaders.set('content-encoding', 'gzip');
-    return cacheResponse(new Response(tile.data, { headers: respHeaders, status: 200, encodeBody: 'manual' }));
+    return cacheResponse(new Response(tile, { headers: respHeaders, status: 200, encodeBody: 'manual' }));
   };
 
   async function handleJsonRequest(respHeaders: Headers) {
@@ -93,10 +85,14 @@ async function handleRequest(request: Request<unknown, IncomingRequestCfProperti
     });
   }
 
+  const memCacheRepository = new MemCacheRepository();
+  const kvRepository = new CloudflareKVRepository(env.KV);
+  const storageRepository = new R2StorageRepository(env.BUCKET, env.PMTILES_FILE_NAME);
+
   const pmTiles = await metrics.monitorAsyncFunction({ name: 'pmtiles_init' }, PMTiles.init)(
-    source,
-    globalThis.headerCache,
-    env.KV,
+    storageRepository,
+    memCacheRepository,
+    kvRepository,
     ctx,
   );
 
@@ -133,9 +129,6 @@ async function handleRequest(request: Request<unknown, IncomingRequestCfProperti
 export default {
   async fetch(request, env, ctx): Promise<Response> {
     const metrics = Metrics.initialiseMetrics('tiles', request, ctx, env);
-    if (!globalThis.source) {
-      globalThis.source = new R2Source(env);
-    }
 
     return metrics.monitorAsyncFunction({ name: 'handle_request' }, handleRequest)(request, env, ctx);
   },

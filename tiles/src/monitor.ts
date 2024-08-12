@@ -25,7 +25,7 @@ export class Metrics {
   private static _instance: Metrics;
   private readonly ctx: ExecutionContext;
   private readonly request: Request;
-  private readonly env: Env;
+  private readonly env: WorkerEnv;
   private readonly defaultTags: { [key: string]: string };
   private readonly operationPrefix: string;
 
@@ -76,31 +76,33 @@ export class Metrics {
     }
     return async (...args: Parameters<T>) => {
       if (monitorInvocations) {
-        console.log(`${operationName}_invocation`);
         point.intField('invocation', 1);
       }
       const timer = startTimer();
       return call(...args)
         .catch((e) => {
           if (!acceptedErrors || !acceptedErrors.some((acceptedError) => e instanceof acceptedError)) {
-            console.log(`${operationName}_errors`);
+            console.error(e, `${operationName}_errors`);
             point.intField('errors', 1);
           }
           throw e;
         })
         .finally(() => {
-          console.log(`${operationName}_duration`, timer.elapsedMs());
           point.intField('duration', timer.elapsedMs());
-          console.log(point.toLineProtocol()?.toString());
-          this.ctx.waitUntil(
-            fetch('https://cf-workers.monitoring.immich.cloud/write', {
-              method: 'POST',
-              body: point.toLineProtocol()?.toString(),
-              headers: {
-                Authorization: `Token `,
-              },
-            }),
-          );
+          const influxLineProtocol = point.toLineProtocol()?.toString();
+          if (this.env.ENVIRONMENT === 'production') {
+            this.ctx.waitUntil(
+              fetch('https://cf-workers.monitoring.immich.cloud/write', {
+                method: 'POST',
+                body: influxLineProtocol,
+                headers: {
+                  Authorization: `Token `,
+                },
+              }),
+            );
+          } else {
+            console.log(influxLineProtocol);
+          }
         });
     };
   }

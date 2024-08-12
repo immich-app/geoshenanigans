@@ -1,5 +1,5 @@
 #:schema node_modules/wrangler/config-schema.json
-name = "tiles-dev"
+name = "tiles"
 main = "src/index.ts"
 compatibility_date = "2024-07-29"
 compatibility_flags = ["nodejs_compat"]
@@ -24,3 +24,4 @@ binding = "CF_VERSION_METADATA"
 [vars]
 PMTILES_FILE_NAME = "v1.pmtiles"
 PMTILES_FILE_HASH = "example-dev-hash"
+ENVIRONMENT = "dev"

@@ -236,3 +236,11 @@ export async function decompress(buf: ArrayBuffer, compression: Compression): Pr
   }
   throw Error('Compression method not supported');
 }
+
+export function getHeaderCacheKey(archiveName: string): string {
+  return archiveName;
+}
+
+export function getDirectoryCacheKey(filename: string, range: { offset: number; length: number }): string {
+  return `${filename}|${range.offset}|${range.length}`;
+}
