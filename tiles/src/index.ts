@@ -1,5 +1,5 @@
 import { Metrics } from './monitor';
-import { PMTilesService } from './pmtiles/pmtiles';
+import { PMTilesService } from './pmtiles/pmtiles.service';
 import { CloudflareKVRepository, MemCacheRepository, R2StorageRepository } from './repository';
 
 const URL_MATCHER = /^\/v(?<VERSION>[0-9]+)((?=)|(?<JSON>\.json)|\/(?<Z>\d+)\/(?<X>\d+)\/(?<Y>\d+).mvt)$/;

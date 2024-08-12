@@ -25,8 +25,4 @@ binding = "CF_VERSION_METADATA"
 PMTILES_FILE_NAME = "v1.pmtiles"
 PMTILES_FILE_HASH = "example-dev-hash"
 ENVIRONMENT = "development"
-
-[env.prod]
-name = "tiles"
-[vars]
-ENVIRONMENT = "production"
+VMMETRICS_API_TOKEN = "token"
