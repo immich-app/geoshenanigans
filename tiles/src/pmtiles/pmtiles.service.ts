@@ -111,7 +111,7 @@ export class PMTilesService {
     return tileJSON({ header, metadata, hostname: url.hostname, version });
   }
 
-  async getTile(z: number, x: number, y: number): Promise<ArrayBuffer | undefined> {
+  async getTile(z: number, x: number, y: number): Promise<ReadableStream | undefined> {
     const tileId = zxyToTileId(z, x, y);
     const header = this.getHeader();
     const rootDirectory = this.getRootDirectory(header);
@@ -134,7 +134,7 @@ export class PMTilesService {
       )(header.leafDirectoryOffset + offset, length, header);
       entry = findTile(leafDirectory.entries, tileId);
     }
-    const tile = await this.source.get({
+    const tile = await this.source.getAsStream({
       offset: header.tileDataOffset + offset,
       length,
     });

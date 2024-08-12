@@ -60,7 +60,7 @@ export class R2StorageRepository implements IStorageRepository {
     return this.fileName;
   }
 
-  async get(range: { offset: number; length: number }): Promise<ArrayBuffer> {
+  private async getR2Object(range: { offset: number; length: number }) {
     const { offset, length } = range;
     const resp = await this.bucket.get(this.fileName, {
       range: { offset: offset, length: length },
@@ -68,9 +68,14 @@ export class R2StorageRepository implements IStorageRepository {
     if (!resp) {
       throw new Error('Archive not found');
     }
+    return resp;
+  }
 
-    const o = resp as R2ObjectBody;
+  async get(range: { offset: number; length: number }): Promise<ArrayBuffer> {
+    return (await this.getR2Object(range)).arrayBuffer();
+  }
 
-    return o.arrayBuffer();
+  async getAsStream(range: { offset: number; length: number }): Promise<ReadableStream> {
+    return (await this.getR2Object(range)).body;
   }
 }
