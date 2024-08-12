@@ -29,16 +29,6 @@ export class CloudflareKVRepository implements IKeyValueRepository {
   }
 }
 
-/* eslint-disable no-var */
-declare global {
-  var memCache: Map<string, unknown>;
-}
-/* eslint-enable no-var */
-
-if (!globalThis.memCache) {
-  globalThis.memCache = new Map<string, unknown>();
-}
-
 export class MemCacheRepository implements IMemCacheRepository {
   constructor(private globalCache: Map<string, unknown>) {}
   set<T>(key: string, value: T): void {

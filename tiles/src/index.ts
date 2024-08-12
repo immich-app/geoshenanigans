@@ -7,6 +7,12 @@ import {
   R2StorageRepository,
 } from './repository';
 
+/* eslint-disable no-var */
+declare global {
+  var memCache: Map<string, unknown>;
+}
+/* eslint-enable no-var */
+
 const URL_MATCHER = /^\/v(?<VERSION>[0-9]+)((?=)|(?<JSON>\.json)|\/(?<Z>\d+)\/(?<X>\d+)\/(?<Y>\d+).mvt)$/;
 
 type PMTilesParams = {
@@ -86,6 +92,10 @@ async function handleRequest(
       status: cached.status,
       encodeBody,
     });
+  }
+
+  if (!globalThis.memCache) {
+    globalThis.memCache = new Map<string, unknown>();
   }
 
   const memCacheRepository = new MemCacheRepository(globalThis.memCache);
