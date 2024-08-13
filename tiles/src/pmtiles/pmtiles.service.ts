@@ -124,10 +124,15 @@ export class PMTilesService {
     let length = header.rootDirectoryLength;
     let entry = findTile(rootDirectory.entries, tileId);
     for (let i = 0; i < 2; ++i) {
-      if (!entry) return;
+      if (!entry) {
+        return;
+      }
       offset = entry.offset;
       length = entry.length;
-      if (entry.runLength !== 0) break; // Run length of 0 is a directory, anything else is a tile
+      // Run length of 0 is a directory, anything else is a tile
+      if (entry.runLength !== 0) {
+        break;
+      }
       const leafDirectory = await Metrics.getMetrics().monitorAsyncFunction(
         { name: 'get_leaf_directory' },
         (offset, length, header) => this.getDirectory(offset, length, header),

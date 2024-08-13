@@ -8,6 +8,7 @@ module.exports = {
   },
   plugins: ['@typescript-eslint', 'eslint-plugin-import'],
   rules: {
+    'curly': 2,
     '@typescript-eslint/no-floating-promises': 'error',
     '@typescript-eslint/no-explicit-any': 'off',
   },

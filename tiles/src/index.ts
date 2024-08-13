@@ -55,7 +55,9 @@ async function handleRequest(
 ) {
   const metrics = Metrics.getMetrics();
   const cacheResponse = async (response: Response): Promise<Response> => {
-    if (!response.body) throw new Error('Response body is undefined');
+    if (!response.body) {
+      throw new Error('Response body is undefined');
+    }
     const responseBody = await response.arrayBuffer();
     deferredRepository.defer(cache.put(request.url, new Response(responseBody, response)));
     return new Response(responseBody, response);
@@ -63,7 +65,9 @@ async function handleRequest(
 
   const handleTileRequest = async (z: string, x: string, y: string, pmTiles: PMTilesService, respHeaders: Headers) => {
     const tile = await pmTiles.getTile(+z, +x, +y);
-    if (!tile) return new Response('Tile not found', { status: 404 });
+    if (!tile) {
+      return new Response('Tile not found', { status: 404 });
+    }
     respHeaders.set('Content-Type', 'application/x-protobuf');
     respHeaders.set('content-encoding', 'gzip');
     return cacheResponse(new Response(tile, { headers: respHeaders, status: 200, encodeBody: 'manual' }));
