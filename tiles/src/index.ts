@@ -33,6 +33,15 @@ type PMTilesJsonParams = PMTilesParams & {
   version: string;
 };
 
+enum Header {
+  PMTILES_FILE_IDENTIFIER = 'PMTiles-File-Identifier',
+  CACHE_CONTROL = 'Cache-Control',
+  ACCESS_CONTROL_ALLOW_ORIGIN = 'Access-Control-Allow-Origin',
+  VARY = 'Vary',
+  CONTENT_TYPE = 'Content-Type',
+  CONTENT_ENCODING = 'Content-Encoding',
+}
+
 export function parseUrl(request: Request): PMTilesParams {
   const url = new URL(request.url);
   const matches = URL_MATCHER.exec(url.pathname);
@@ -68,15 +77,15 @@ async function handleRequest(
     if (!tile) {
       return new Response('Tile not found', { status: 404 });
     }
-    respHeaders.set('Content-Type', 'application/x-protobuf');
-    respHeaders.set('content-encoding', 'gzip');
+    respHeaders.set(Header.CONTENT_TYPE, 'application/x-protobuf');
+    respHeaders.set(Header.CONTENT_ENCODING, 'gzip');
     return cacheResponse(new Response(tile, { headers: respHeaders, status: 200, encodeBody: 'manual' }));
   };
 
   async function handleJsonRequest(respHeaders: Headers) {
     const { version, url } = pmTilesParams as PMTilesJsonParams;
     const tileJson = await pmTilesService.getJsonResponse(version, url);
-    respHeaders.set('Content-Type', 'application/json');
+    respHeaders.set(Header.CONTENT_TYPE, 'application/json');
     return cacheResponse(new Response(JSON.stringify(tileJson), { headers: respHeaders, status: 200 }));
   }
 
@@ -88,7 +97,7 @@ async function handleRequest(
   const cached = await metrics.monitorAsyncFunction({ name: 'match_request_from_cdn' }, (url) => cache.match(url))(
     request.url,
   );
-  if (cached && cached.headers.get('PMTiles-File-Identifier') === env.PMTILES_FILE_HASH) {
+  if (cached && cached.headers.get(Header.PMTILES_FILE_IDENTIFIER) === env.PMTILES_FILE_HASH) {
     const cacheHeaders = new Headers(cached.headers);
     const encodeBody = cacheHeaders.has('content-encoding') ? 'manual' : 'automatic';
     return new Response(cached.body, {
@@ -113,10 +122,10 @@ async function handleRequest(
   );
 
   const respHeaders = new Headers();
-  respHeaders.set('Cache-Control', `public, max-age=${60 * 60 * 24 * 31}`);
-  respHeaders.set('Access-Control-Allow-Origin', '*');
-  respHeaders.set('Vary', 'Origin');
-  respHeaders.set('PMTiles-File-Identifier', env.PMTILES_FILE_HASH);
+  respHeaders.set(Header.CACHE_CONTROL, `public, max-age=${60 * 60 * 24 * 31}`);
+  respHeaders.set(Header.ACCESS_CONTROL_ALLOW_ORIGIN, '*');
+  respHeaders.set(Header.VARY, 'Origin');
+  respHeaders.set(Header.PMTILES_FILE_IDENTIFIER, env.PMTILES_FILE_HASH);
 
   const pmTilesParams = parseUrl(request);
 
