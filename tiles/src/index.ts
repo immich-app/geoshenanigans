@@ -97,15 +97,15 @@ async function handleRequest(
   const cached = await metrics.monitorAsyncFunction({ name: 'match_request_from_cdn' }, (url) => cache.match(url))(
     request.url,
   );
-  if (cached && cached.headers.get(Header.PMTILES_FILE_IDENTIFIER) === env.PMTILES_FILE_HASH) {
-    const cacheHeaders = new Headers(cached.headers);
-    const encodeBody = cacheHeaders.has('content-encoding') ? 'manual' : 'automatic';
-    return new Response(cached.body, {
-      headers: cacheHeaders,
-      status: cached.status,
-      encodeBody,
-    });
-  }
+  // if (cached && cached.headers.get(Header.PMTILES_FILE_IDENTIFIER) === env.PMTILES_FILE_HASH) {
+  //   const cacheHeaders = new Headers(cached.headers);
+  //   const encodeBody = cacheHeaders.has('content-encoding') ? 'manual' : 'automatic';
+  //   return new Response(cached.body, {
+  //     headers: cacheHeaders,
+  //     status: cached.status,
+  //     encodeBody,
+  //   });
+  // }
 
   if (!globalThis.memCache) {
     globalThis.memCache = new Map<string, unknown>();
@@ -113,7 +113,7 @@ async function handleRequest(
 
   const memCacheRepository = new MemCacheRepository(globalThis.memCache);
   const kvRepository = new CloudflareKVRepository(env.KV);
-  const storageRepository = new R2StorageRepository(env.BUCKET, env.PMTILES_FILE_NAME);
+  const storageRepository = new R2StorageRepository(env.BUCKET, env.PMTILES_FILE_NAME, env.PMTILES_FILE_HASH);
   const pmTilesService = await metrics.monitorAsyncFunction({ name: 'pmtiles_init' }, PMTilesService.init)(
     storageRepository,
     memCacheRepository,
@@ -155,14 +155,20 @@ async function handleRequest(
 
 export default {
   async fetch(request, env, ctx): Promise<Response> {
+    console.log('got here');
     const deferredRepository = new CloudflareDeferredRepository(ctx);
     const workerEnv = env as WorkerEnv;
     const metrics = Metrics.initialiseMetrics('tiles', request, deferredRepository, workerEnv);
 
-    return metrics.monitorAsyncFunction({ name: 'handle_request' }, handleRequest)(
-      request,
-      workerEnv,
-      deferredRepository,
-    );
+    try {
+      return metrics.monitorAsyncFunction({ name: 'handle_request' }, handleRequest)(
+        request,
+        workerEnv,
+        deferredRepository,
+      );
+    } catch (e) {
+      console.error(e);
+      return new Response('Internal Server Error', { status: 500 });
+    }
   },
 } satisfies ExportedHandler<Env>;

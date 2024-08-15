@@ -5,10 +5,16 @@ export class CloudflareKVRepository implements IKeyValueRepository {
   constructor(private KV: KVNamespace) {}
 
   async put(key: string, value: string): Promise<void> {
-    await Metrics.getMetrics().monitorAsyncFunction({ name: 'kv-put-value', extraTags: { key } }, this.KV.put)(
+    return Metrics.getMetrics().monitorAsyncFunction({ name: 'kv_put_value', extraTags: { key } }, this.KV.put)(
       key,
       value,
     );
+  }
+
+  async putStream(key: string, value: ReadableStream): Promise<void> {
+    return Metrics.getMetrics().monitorAsyncFunction({ name: 'kv_put_stream', extraTags: { key } }, (key, value) =>
+      this.KV.put(key, value),
+    )(key, value);
   }
 
   async get(key: string): Promise<string | undefined> {
@@ -44,7 +50,12 @@ export class R2StorageRepository implements IStorageRepository {
   constructor(
     private bucket: R2Bucket,
     private fileName: string,
+    private fileHash: string,
   ) {}
+
+  getFileHash(): string {
+    return this.fileHash;
+  }
 
   getFileName(): string {
     return this.fileName;
@@ -52,6 +63,7 @@ export class R2StorageRepository implements IStorageRepository {
 
   private async getR2Object(range: { offset: number; length: number }) {
     const { offset, length } = range;
+    console.log(this.fileName);
     const resp = await this.bucket.get(this.fileName, {
       range: { offset, length },
     });
