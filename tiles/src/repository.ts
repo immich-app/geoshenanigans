@@ -153,6 +153,7 @@ export class CloudflareMetricsRepository implements IMetricsRepository {
     call: T,
     options: Options = {},
   ): (...args: Parameters<T>) => Promise<Awaited<ReturnType<T>>> {
+    operation = { ...operation, tags: { ...operation.tags, ...this.defaultTags } };
     const callback = (point: Point) => {
       const influxLineProtocol = point.toLineProtocol()?.toString();
       if (this.env.ENVIRONMENT === 'production') {
