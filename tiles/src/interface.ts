@@ -16,7 +16,8 @@ export interface IStorageRepository {
 }
 
 export interface IDeferredRepository {
-  defer(promise: Promise<any>): void;
+  defer(promise: AsyncFn): void;
+  runDeferred(): void;
 }
 
 export type AsyncFn = (...args: any[]) => Promise<any>;

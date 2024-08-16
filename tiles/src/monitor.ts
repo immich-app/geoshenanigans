@@ -1,5 +1,5 @@
 import { Point } from '@influxdata/influxdb-client';
-import { AsyncFn, IDeferredRepository, Operation, Options } from './interface';
+import { AsyncFn, Operation, Options } from './interface';
 
 const startTimer = () => {
   const startTime = performance.now();

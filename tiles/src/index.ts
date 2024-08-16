@@ -69,7 +69,7 @@ async function handleRequest(
       throw new Error('Response body is undefined');
     }
     const responseBody = await response.arrayBuffer();
-    deferredRepository.defer(cache.put(request.url, new Response(responseBody, response)));
+    deferredRepository.defer(() => cache.put(request.url, new Response(responseBody, response)));
     return new Response(responseBody, response);
   };
 
@@ -162,12 +162,13 @@ export default {
     const metrics = new CloudflareMetricsRepository('tiles', request, deferredRepository, workerEnv);
 
     try {
-      const response = metrics.monitorAsyncFunction({ name: 'handle_request' }, handleRequest)(
+      const response = await metrics.monitorAsyncFunction({ name: 'handle_request' }, handleRequest)(
         request,
         workerEnv,
         deferredRepository,
         metrics,
       );
+      deferredRepository.runDeferred();
       return response;
     } catch (e) {
       console.error(e);

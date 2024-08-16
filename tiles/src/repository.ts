@@ -116,10 +116,17 @@ export class S3StorageRepository implements IStorageRepository {
 }
 
 export class CloudflareDeferredRepository implements IDeferredRepository {
+  deferred: AsyncFn[] = [];
   constructor(private ctx: ExecutionContext) {}
 
-  defer(promise: Promise<unknown>): void {
-    this.ctx.waitUntil(promise);
+  defer(call: AsyncFn): void {
+    this.deferred.push(call);
+  }
+
+  runDeferred() {
+    for (const call of this.deferred) {
+      this.ctx.waitUntil(call());
+    }
   }
 }
 
@@ -149,8 +156,8 @@ export class CloudflareMetricsRepository implements IMetricsRepository {
     const callback = (point: Point) => {
       const influxLineProtocol = point.toLineProtocol()?.toString();
       if (this.env.ENVIRONMENT === 'production') {
-        this.deferredRepository.defer(
-          fetch('https://cf-workers.monitoring.immich.cloud/write', {
+        this.deferredRepository.defer(async () => {
+          const response = await fetch('https://cf-workers.monitoring.immich.cloud/write', {
             method: 'POST',
             body: influxLineProtocol,
             headers: {

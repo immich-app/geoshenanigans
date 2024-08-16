@@ -29,8 +29,12 @@ class FakeKVRepository implements IKeyValueRepository {
 class FakeDeferredRepository implements IDeferredRepository {
   constructor() {}
 
-  defer(promise: Promise<any>): void {
-    promise
+  runDeferred(): void {
+    return;
+  }
+
+  defer(call: AsyncFn): void {
+    call()
       .then(() => {})
       .catch((e) => {
         console.error(e, 'Error');
