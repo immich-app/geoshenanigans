@@ -1,5 +1,5 @@
 #:schema node_modules/wrangler/config-schema.json
-name = "tiles-dev"
+name = "tiles"
 main = "src/index.ts"
 compatibility_date = "2024-07-29"
 compatibility_flags = ["nodejs_compat"]
@@ -9,6 +9,7 @@ compatibility_flags = ["nodejs_compat"]
 [[kv_namespaces]]
 binding = "KV"
 id = "5a4b82694e8b490db8b8904cdaea4f00"
+preview_id = "5a4b82694e8b490db8b8904cdaea4f00"
 
 # Bind an R2 Bucket. Use R2 to store arbitrarily large blobs of data, such as files.
 # Docs: https://developers.cloudflare.com/workers/wrangler/configuration/#r2-buckets
@@ -23,5 +24,5 @@ binding = "CF_VERSION_METADATA"
 # Define environment variables for your Workers script
 [vars]
 PMTILES_FILE_NAME = "v1.pmtiles"
-PMTILES_FILE_HASH = "example-dev-hash"
-ENVIRONMENT = "development"
+PMTILES_FILE_HASH = "prodv1"
+ENVIRONMENT = "production"
