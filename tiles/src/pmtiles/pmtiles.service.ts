@@ -1,5 +1,10 @@
-import { IDeferredRepository, IKeyValueRepository, IMemCacheRepository, IStorageRepository } from '../interface';
-import { Metrics } from '../monitor';
+import {
+  IDeferredRepository,
+  IKeyValueRepository,
+  IMemCacheRepository,
+  IMetricsRepository,
+  IStorageRepository,
+} from '../interface';
 import { Directory, Entry, Header, Metadata } from './types';
 import {
   bytesToHeader,
@@ -14,21 +19,26 @@ import {
 
 const HEADER_SIZE_BYTES = 127;
 
-class DirectoryStream {
+export class DirectoryStream {
   constructor(readonly stream: ReadableStream) {}
   static fromDirectory(directory: Directory): DirectoryStream {
+    let index = 0;
+    const encoder = new TextEncoder();
     const stream = new ReadableStream({
       start(controller) {
-        const encoder = new TextEncoder();
         controller.enqueue(encoder.encode(`${directory.tileIdStart}|${directory.offsetStart}:`));
-        directory.entries.forEach((entry) => {
-          controller.enqueue(
-            encoder.encode(
-              `${entry.tileId - directory.tileIdStart}|${entry.offset - directory.offsetStart}|${entry.length}|${entry.runLength}:`,
-            ),
-          );
-        });
-        controller.close();
+      },
+      pull(controller) {
+        const entry = directory.entries[index];
+        controller.enqueue(
+          encoder.encode(
+            `${entry.tileId - directory.tileIdStart}|${entry.offset - directory.offsetStart}|${entry.length}|${entry.runLength}:`,
+          ),
+        );
+        if (index === directory.entries.length - 1) {
+          controller.close();
+        }
+        index++;
       },
     });
     return new DirectoryStream(stream);
@@ -100,6 +110,7 @@ export class PMTilesService {
     private memCache: IMemCacheRepository,
     private kvCache: IKeyValueRepository,
     private deferredRepository: IDeferredRepository,
+    private metrics: IMetricsRepository,
   ) {}
 
   static async init(
@@ -107,8 +118,9 @@ export class PMTilesService {
     memCache: IMemCacheRepository,
     kvCache: IKeyValueRepository,
     deferredRepository: IDeferredRepository,
+    metrics: IMetricsRepository,
   ): Promise<PMTilesService> {
-    const p = new PMTilesService(source, memCache, kvCache, deferredRepository);
+    const p = new PMTilesService(source, memCache, kvCache, deferredRepository, metrics);
     const headerCacheKey = getHeaderCacheKey(source.getFileName());
     if (memCache.get(headerCacheKey)) {
       return p;
@@ -146,7 +158,7 @@ export class PMTilesService {
     return root as Directory;
   }
 
-  private async getHeaderAndRootFromSource(): Promise<[Header, Directory]> {
+  async getHeaderAndRootFromSource(): Promise<[Header, Directory]> {
     const resp = await this.source.get({ offset: 0, length: 16384 });
     const v = new DataView(resp);
     if (v.getUint16(0, true) !== 0x4d50) {
@@ -167,28 +179,14 @@ export class PMTilesService {
     return [header, rootDir];
   }
 
-  private async getDirectory(offset: number, length: number, header: Header): Promise<DirectoryStream> {
-    let timer = performance.now();
+  private async getDirectory(offset: number, length: number): Promise<DirectoryStream> {
     const cacheKey = getDirectoryCacheKey(this.source.getFileName(), this.source.getFileHash(), { offset, length });
+    console.log(cacheKey);
     const kvValueStream = await this.kvCache.getAsStream(cacheKey);
     if (kvValueStream) {
-      console.log('time to get directory from kv', performance.now() - timer);
       return new DirectoryStream(kvValueStream);
     }
-    console.log('time to check directory from kv', performance.now() - timer);
-    timer = performance.now();
-    const resp = await this.source.get({ offset, length });
-    console.log('time to get directory from source', performance.now() - timer);
-    const data = await decompress(resp, header.internalCompression);
-    const entries = deserializeIndex(data);
-    if (entries.length === 0) {
-      throw new Error('Empty directory is invalid');
-    }
-    console.log('time to get directory from source and decompress and deserialise', performance.now() - timer);
-    const directory: Directory = { offsetStart: entries[0].offset, tileIdStart: entries[0].tileId, entries };
-    this.deferredRepository.defer(this.kvCache.putStream(cacheKey, DirectoryStream.fromDirectory(directory).stream));
-    const dirStream = DirectoryStream.fromDirectory(directory);
-    return dirStream;
+    throw new Error('Directory not found in KV');
   }
 
   async getJsonResponse(version: string, url: URL) {
@@ -220,11 +218,10 @@ export class PMTilesService {
       if (entry.runLength !== 0) {
         break;
       }
-      const leafDirectory = await Metrics.getMetrics().monitorAsyncFunction(
-        { name: 'get_leaf_directory' },
-        (offset, length, header) => this.getDirectory(offset, length, header),
-      )(header.leafDirectoryOffset + offset, length, header);
-      entry = await Metrics.getMetrics().monitorAsyncFunction({ name: 'find_tile_leaf_directory' }, (tileId) =>
+      const leafDirectory = await this.metrics.monitorAsyncFunction({ name: 'get_leaf_directory' }, (offset, length) =>
+        this.getDirectory(offset, length),
+      )(header.leafDirectoryOffset + offset, length);
+      entry = await this.metrics.monitorAsyncFunction({ name: 'find_tile_leaf_directory' }, (tileId) =>
         leafDirectory.findTile(tileId),
       )(tileId);
     }

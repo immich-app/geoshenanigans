@@ -1,6 +1,4 @@
 export interface IKeyValueRepository {
-  put(key: string, value: string): Promise<void>;
-  putStream(key: string, value: ReadableStream): Promise<void>;
   get(key: string): Promise<string | undefined>;
   getAsStream(key: string): Promise<ReadableStream | undefined>;
 }
@@ -19,4 +17,17 @@ export interface IStorageRepository {
 
 export interface IDeferredRepository {
   defer(promise: Promise<any>): void;
+}
+
+export type AsyncFn = (...args: any[]) => Promise<any>;
+export type Class = { new (...args: any[]): any };
+export type Operation = { name: string; tags?: { [key: string]: string } };
+export type Options = { monitorInvocations?: boolean; acceptedErrors?: Class[] };
+
+export interface IMetricsRepository {
+  monitorAsyncFunction<T extends AsyncFn>(
+    operation: Operation,
+    call: T,
+    options?: Options,
+  ): (...args: Parameters<T>) => Promise<Awaited<ReturnType<T>>>;
 }

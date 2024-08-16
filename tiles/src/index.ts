@@ -1,8 +1,9 @@
-import { Metrics } from './monitor';
+import { IMetricsRepository } from './interface';
 import { PMTilesService } from './pmtiles/pmtiles.service';
 import {
   CloudflareDeferredRepository,
   CloudflareKVRepository,
+  CloudflareMetricsRepository,
   MemCacheRepository,
   R2StorageRepository,
 } from './repository';
@@ -61,8 +62,8 @@ async function handleRequest(
   request: Request<unknown, IncomingRequestCfProperties>,
   env: WorkerEnv,
   deferredRepository: CloudflareDeferredRepository,
+  metrics: IMetricsRepository,
 ) {
-  const metrics = Metrics.getMetrics();
   const cacheResponse = async (response: Response): Promise<Response> => {
     if (!response.body) {
       throw new Error('Response body is undefined');
@@ -97,15 +98,15 @@ async function handleRequest(
   const cached = await metrics.monitorAsyncFunction({ name: 'match_request_from_cdn' }, (url) => cache.match(url))(
     request.url,
   );
-  // if (cached && cached.headers.get(Header.PMTILES_FILE_IDENTIFIER) === env.PMTILES_FILE_HASH) {
-  //   const cacheHeaders = new Headers(cached.headers);
-  //   const encodeBody = cacheHeaders.has('content-encoding') ? 'manual' : 'automatic';
-  //   return new Response(cached.body, {
-  //     headers: cacheHeaders,
-  //     status: cached.status,
-  //     encodeBody,
-  //   });
-  // }
+  if (cached && cached.headers.get(Header.PMTILES_FILE_IDENTIFIER) === env.PMTILES_FILE_HASH) {
+    const cacheHeaders = new Headers(cached.headers);
+    const encodeBody = cacheHeaders.has('content-encoding') ? 'manual' : 'automatic';
+    return new Response(cached.body, {
+      headers: cacheHeaders,
+      status: cached.status,
+      encodeBody,
+    });
+  }
 
   if (!globalThis.memCache) {
     globalThis.memCache = new Map<string, unknown>();
@@ -119,6 +120,7 @@ async function handleRequest(
     memCacheRepository,
     kvRepository,
     deferredRepository,
+    metrics,
   );
 
   const respHeaders = new Headers();
@@ -133,7 +135,7 @@ async function handleRequest(
     if (pmTilesParams.requestType === 'tile') {
       const { z, x, y, version } = pmTilesParams as PMTilesTileParams;
       return await metrics.monitorAsyncFunction(
-        { name: 'tile_request', extraTags: { z, x, y, version } },
+        { name: 'tile_request', tags: { z, x, y, version } },
         handleTileRequest,
       )(z, x, y, pmTilesService, respHeaders);
     }
@@ -141,7 +143,7 @@ async function handleRequest(
     if (pmTilesParams.requestType === 'json') {
       const { version } = pmTilesParams as PMTilesJsonParams;
       return await metrics.monitorAsyncFunction(
-        { name: 'json_request', extraTags: { version } },
+        { name: 'json_request', tags: { version } },
         handleJsonRequest,
       )(respHeaders);
     }
@@ -155,17 +157,18 @@ async function handleRequest(
 
 export default {
   async fetch(request, env, ctx): Promise<Response> {
-    console.log('got here');
     const deferredRepository = new CloudflareDeferredRepository(ctx);
     const workerEnv = env as WorkerEnv;
-    const metrics = Metrics.initialiseMetrics('tiles', request, deferredRepository, workerEnv);
+    const metrics = new CloudflareMetricsRepository('tiles', request, deferredRepository, workerEnv);
 
     try {
-      return metrics.monitorAsyncFunction({ name: 'handle_request' }, handleRequest)(
+      const response = metrics.monitorAsyncFunction({ name: 'handle_request' }, handleRequest)(
         request,
         workerEnv,
         deferredRepository,
+        metrics,
       );
+      return response;
     } catch (e) {
       console.error(e);
       return new Response('Internal Server Error', { status: 500 });
