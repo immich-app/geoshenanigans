@@ -30,6 +30,6 @@
   "dependencies": {
     "@influxdata/influxdb-client": "^1.34.0",
     "fflate": "^0.8.2",
-    "p-limit": "^6.1.0",
+    "p-limit": "^6.1.0"
   }
 }
