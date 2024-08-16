@@ -164,8 +164,9 @@ export class CloudflareMetricsRepository implements IMetricsRepository {
             headers: {
               Authorization: `Token ${this.env.VMETRICS_API_TOKEN}`,
             },
-          }),
-        );
+          });
+          await response.body?.cancel();
+        });
       } else {
         console.log(influxLineProtocol);
       }
