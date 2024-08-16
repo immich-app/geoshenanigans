@@ -55,7 +55,6 @@ export class R2StorageRepository implements IStorageRepository {
 
   private async getR2Object(range: { offset: number; length: number }) {
     const { offset, length } = range;
-    console.log(this.fileName);
     const resp = await this.bucket.get(this.fileName, {
       range: { offset, length },
     });
