@@ -204,7 +204,7 @@ export function findTile(entries: Entry[], tileId: number): Entry | undefined {
       return entries[n];
     }
   }
-  return undefined;
+  return;
 }
 
 export function getUint64(v: DataView, offset: number): number {
