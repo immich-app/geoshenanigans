@@ -4,6 +4,8 @@ import {
   CloudflareDeferredRepository,
   CloudflareKVRepository,
   CloudflareMetricsRepository,
+  HeaderMetricsProvider,
+  InfluxMetricsProvider,
   MemCacheRepository,
   R2StorageRepository,
 } from './repository';
@@ -41,6 +43,7 @@ enum Header {
   VARY = 'Vary',
   CONTENT_TYPE = 'Content-Type',
   CONTENT_ENCODING = 'Content-Encoding',
+  SERVER_TIMING = 'Server-Timing',
 }
 
 export function parseUrl(request: Request): PMTilesParams {
@@ -119,7 +122,6 @@ async function handleRequest(
     storageRepository,
     memCacheRepository,
     kvRepository,
-    deferredRepository,
     metrics,
   );
 
@@ -157,9 +159,15 @@ async function handleRequest(
 
 export default {
   async fetch(request, env, ctx): Promise<Response> {
-    const deferredRepository = new CloudflareDeferredRepository(ctx);
     const workerEnv = env as WorkerEnv;
-    const metrics = new CloudflareMetricsRepository('tiles', request, deferredRepository, workerEnv);
+    const deferredRepository = new CloudflareDeferredRepository(ctx);
+    const headerProvider = new HeaderMetricsProvider();
+    const influxProvider = new InfluxMetricsProvider(workerEnv.VMETRICS_API_TOKEN, env.ENVIRONMENT);
+    deferredRepository.defer(() => influxProvider.flush());
+    const metrics = new CloudflareMetricsRepository('tiles', request, deferredRepository, workerEnv, [
+      influxProvider,
+      headerProvider,
+    ]);
 
     try {
       const response = await metrics.monitorAsyncFunction({ name: 'handle_request' }, handleRequest)(
@@ -168,6 +176,7 @@ export default {
         deferredRepository,
         metrics,
       );
+      response.headers.set(Header.SERVER_TIMING, headerProvider.getTimingHeader());
       deferredRepository.runDeferred();
       return response;
     } catch (e) {

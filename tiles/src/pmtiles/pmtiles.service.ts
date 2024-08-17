@@ -1,10 +1,4 @@
-import {
-  IDeferredRepository,
-  IKeyValueRepository,
-  IMemCacheRepository,
-  IMetricsRepository,
-  IStorageRepository,
-} from '../interface';
+import { IKeyValueRepository, IMemCacheRepository, IMetricsRepository, IStorageRepository } from '../interface';
 import { Directory, Entry, Header, Metadata } from './types';
 import {
   bytesToHeader,
@@ -20,7 +14,10 @@ import {
 const HEADER_SIZE_BYTES = 127;
 
 export class DirectoryStream {
-  constructor(readonly stream: ReadableStream) {}
+  private stream: ReadableStream<string>;
+  constructor(stream: ReadableStream) {
+    this.stream = stream.pipeThrough(new TextDecoderStream());
+  }
   static fromDirectory(directory: Directory): DirectoryStream {
     let index = 0;
     const encoder = new TextEncoder();
@@ -49,11 +46,9 @@ export class DirectoryStream {
     let offsetStart: number | undefined;
     let tileIdStart: number | undefined;
 
-    const decoder = new TextDecoder();
-
     try {
       for await (const chunk of this.stream) {
-        buffer += decoder.decode(chunk);
+        buffer += chunk;
         // console.log(buffer);
         const lines = buffer.split(':');
         // Last line is always incomplete or empty, save it for next time
@@ -109,7 +104,6 @@ export class PMTilesService {
     private source: IStorageRepository,
     private memCache: IMemCacheRepository,
     private kvCache: IKeyValueRepository,
-    private deferredRepository: IDeferredRepository,
     private metrics: IMetricsRepository,
   ) {}
 
@@ -117,10 +111,9 @@ export class PMTilesService {
     source: IStorageRepository,
     memCache: IMemCacheRepository,
     kvCache: IKeyValueRepository,
-    deferredRepository: IDeferredRepository,
     metrics: IMetricsRepository,
   ): Promise<PMTilesService> {
-    const p = new PMTilesService(source, memCache, kvCache, deferredRepository, metrics);
+    const p = new PMTilesService(source, memCache, kvCache, metrics);
     const headerCacheKey = getHeaderCacheKey(source.getFileName());
     if (memCache.get(headerCacheKey)) {
       return p;
@@ -225,10 +218,9 @@ export class PMTilesService {
         leafDirectory.findTile(tileId),
       )(tileId);
     }
-    const tile = await this.source.getAsStream({
-      offset: header.tileDataOffset + offset,
-      length,
-    });
+    const tile = await this.metrics.monitorAsyncFunction({ name: 'get_tile' }, (offset, length) =>
+      this.source.getAsStream({ offset, length }),
+    )(header.tileDataOffset + offset, length);
     return tile;
   }
 
