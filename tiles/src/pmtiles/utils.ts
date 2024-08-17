@@ -54,22 +54,34 @@ function readVarintRemainder(lowBits: number, bufferPosition: BufferPosition): n
   const buffer = bufferPosition.buf;
   let byte = buffer[bufferPosition.pos++];
   let highBits = (byte & 0x70) >> 4;
-  if (byte < 0x80) return toNum(lowBits, highBits);
+  if (byte < 0x80) {
+    return toNum(lowBits, highBits);
+  }
   byte = buffer[bufferPosition.pos++];
   highBits |= (byte & 0x7f) << 3;
-  if (byte < 0x80) return toNum(lowBits, highBits);
+  if (byte < 0x80) {
+    return toNum(lowBits, highBits);
+  }
   byte = buffer[bufferPosition.pos++];
   highBits |= (byte & 0x7f) << 10;
-  if (byte < 0x80) return toNum(lowBits, highBits);
+  if (byte < 0x80) {
+    return toNum(lowBits, highBits);
+  }
   byte = buffer[bufferPosition.pos++];
   highBits |= (byte & 0x7f) << 17;
-  if (byte < 0x80) return toNum(lowBits, highBits);
+  if (byte < 0x80) {
+    return toNum(lowBits, highBits);
+  }
   byte = buffer[bufferPosition.pos++];
   highBits |= (byte & 0x7f) << 24;
-  if (byte < 0x80) return toNum(lowBits, highBits);
+  if (byte < 0x80) {
+    return toNum(lowBits, highBits);
+  }
   byte = buffer[bufferPosition.pos++];
   highBits |= (byte & 0x01) << 31;
-  if (byte < 0x80) return toNum(lowBits, highBits);
+  if (byte < 0x80) {
+    return toNum(lowBits, highBits);
+  }
   throw new Error('Expected varint not more than 10 bytes');
 }
 
@@ -83,28 +95,43 @@ export function readVarint(bufferPosition: BufferPosition): number {
   const buffer = bufferPosition.buf;
   let byte = buffer[bufferPosition.pos++];
   let val = byte & 0x7f;
-  if (byte < 0x80) return val;
+  if (byte < 0x80) {
+    return val;
+  }
   byte = buffer[bufferPosition.pos++];
   val |= (byte & 0x7f) << 7;
-  if (byte < 0x80) return val;
+  if (byte < 0x80) {
+    return val;
+  }
   byte = buffer[bufferPosition.pos++];
   val |= (byte & 0x7f) << 14;
-  if (byte < 0x80) return val;
+  if (byte < 0x80) {
+    return val;
+  }
   byte = buffer[bufferPosition.pos++];
   val |= (byte & 0x7f) << 21;
-  if (byte < 0x80) return val;
+  if (byte < 0x80) {
+    return val;
+  }
   byte = buffer[bufferPosition.pos];
   val |= (byte & 0x0f) << 28;
 
   return readVarintRemainder(val, bufferPosition);
 }
 
-export const tileJSON = (args: { header: Header; metadata: Metadata; hostname: string; version: string }) => {
-  const { header, metadata, hostname, version } = args;
+export const tileJSON = (args: { header: Header; metadata: Metadata; url: URL; version: string }) => {
+  const { header, metadata, url, version } = args;
   return {
     tilejson: '3.0.0',
     scheme: 'xyz',
-    tiles: ['https://' + hostname + '/' + `v${version}` + '/{z}/{x}/{y}' + '.mvt'],
+    tiles: [
+      `${url.protocol}//` +
+        url.hostname +
+        `${url.port ? `:${url.port}` : ''}` +
+        `/v${version}` +
+        '/{z}/{x}/{y}' +
+        '.mvt',
+    ],
     vector_layers: metadata.vector_layers,
     attribution: metadata.attribution,
     description: metadata.description,
@@ -153,7 +180,7 @@ export function deserializeIndex(buffer: ArrayBuffer): Entry[] {
 /**
  * Low-level function for looking up a TileID or leaf directory inside a directory.
  */
-export function findTile(entries: Entry[], tileId: number): Entry | null {
+export function findTile(entries: Entry[], tileId: number): Entry | undefined {
   let m = 0;
   let n = entries.length - 1;
   while (m <= n) {
@@ -177,7 +204,7 @@ export function findTile(entries: Entry[], tileId: number): Entry | null {
       return entries[n];
     }
   }
-  return null;
+  return;
 }
 
 export function getUint64(v: DataView, offset: number): number {
@@ -241,6 +268,10 @@ export function getHeaderCacheKey(archiveName: string): string {
   return archiveName;
 }
 
-export function getDirectoryCacheKey(filename: string, range: { offset: number; length: number }): string {
-  return `${filename}|${range.offset}|${range.length}`;
+export function getDirectoryCacheKey(
+  fileName: string,
+  fileHash: string,
+  range: { offset: number; length: number },
+): string {
+  return `${fileName}|${fileHash}|${range.offset}|${range.length}`;
 }

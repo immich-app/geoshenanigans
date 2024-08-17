@@ -1,8 +1,9 @@
-import { Metrics } from './monitor';
+import { IMetricsRepository } from './interface';
 import { PMTilesService } from './pmtiles/pmtiles.service';
 import {
   CloudflareDeferredRepository,
   CloudflareKVRepository,
+  CloudflareMetricsRepository,
   MemCacheRepository,
   R2StorageRepository,
 } from './repository';
@@ -61,14 +62,14 @@ async function handleRequest(
   request: Request<unknown, IncomingRequestCfProperties>,
   env: WorkerEnv,
   deferredRepository: CloudflareDeferredRepository,
+  metrics: IMetricsRepository,
 ) {
-  const metrics = Metrics.getMetrics();
   const cacheResponse = async (response: Response): Promise<Response> => {
     if (!response.body) {
       throw new Error('Response body is undefined');
     }
     const responseBody = await response.arrayBuffer();
-    deferredRepository.defer(cache.put(request.url, new Response(responseBody, response)));
+    deferredRepository.defer(() => cache.put(request.url, new Response(responseBody, response)));
     return new Response(responseBody, response);
   };
 
@@ -113,12 +114,13 @@ async function handleRequest(
 
   const memCacheRepository = new MemCacheRepository(globalThis.memCache);
   const kvRepository = new CloudflareKVRepository(env.KV);
-  const storageRepository = new R2StorageRepository(env.BUCKET, env.PMTILES_FILE_NAME);
+  const storageRepository = new R2StorageRepository(env.BUCKET, env.PMTILES_FILE_NAME, env.PMTILES_FILE_HASH);
   const pmTilesService = await metrics.monitorAsyncFunction({ name: 'pmtiles_init' }, PMTilesService.init)(
     storageRepository,
     memCacheRepository,
     kvRepository,
     deferredRepository,
+    metrics,
   );
 
   const respHeaders = new Headers();
@@ -133,7 +135,7 @@ async function handleRequest(
     if (pmTilesParams.requestType === 'tile') {
       const { z, x, y, version } = pmTilesParams as PMTilesTileParams;
       return await metrics.monitorAsyncFunction(
-        { name: 'tile_request', extraTags: { z, x, y, version } },
+        { name: 'tile_request', tags: { z, x, y, version } },
         handleTileRequest,
       )(z, x, y, pmTilesService, respHeaders);
     }
@@ -141,7 +143,7 @@ async function handleRequest(
     if (pmTilesParams.requestType === 'json') {
       const { version } = pmTilesParams as PMTilesJsonParams;
       return await metrics.monitorAsyncFunction(
-        { name: 'json_request', extraTags: { version } },
+        { name: 'json_request', tags: { version } },
         handleJsonRequest,
       )(respHeaders);
     }
@@ -157,12 +159,20 @@ export default {
   async fetch(request, env, ctx): Promise<Response> {
     const deferredRepository = new CloudflareDeferredRepository(ctx);
     const workerEnv = env as WorkerEnv;
-    const metrics = Metrics.initialiseMetrics('tiles', request, deferredRepository, workerEnv);
+    const metrics = new CloudflareMetricsRepository('tiles', request, deferredRepository, workerEnv);
 
-    return metrics.monitorAsyncFunction({ name: 'handle_request' }, handleRequest)(
-      request,
-      workerEnv,
-      deferredRepository,
-    );
+    try {
+      const response = await metrics.monitorAsyncFunction({ name: 'handle_request' }, handleRequest)(
+        request,
+        workerEnv,
+        deferredRepository,
+        metrics,
+      );
+      deferredRepository.runDeferred();
+      return response;
+    } catch (e) {
+      console.error(e);
+      return new Response('Internal Server Error', { status: 500 });
+    }
   },
 } satisfies ExportedHandler<Env>;
