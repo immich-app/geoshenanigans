@@ -1,3 +1,5 @@
+import { Metric } from './repository';
+
 export interface IKeyValueRepository {
   get(key: string): Promise<string | undefined>;
   getAsStream(key: string): Promise<ReadableStream | undefined>;
@@ -31,4 +33,9 @@ export interface IMetricsRepository {
     call: T,
     options?: Options,
   ): (...args: Parameters<T>) => Promise<Awaited<ReturnType<T>>>;
+}
+
+export interface IMetricsProviderRepository {
+  pushMetric(metric: Metric): void;
+  flush(): void;
 }
