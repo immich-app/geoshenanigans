@@ -1,0 +1,47 @@
+name: Build
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tiles-build:
+    name: Tiles
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./tiles
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: './tiles/.nvmrc'
+
+      - name: Run npm install
+        run: npm ci
+
+      - name: Run tsc
+        run: npm run check
+        if: ${{ !cancelled() }}
+
+      - name: Wrangler build
+        run: npm run build
+        if: ${{ !cancelled() }}
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiles-build-output
+          path: tiles/dist
+          retention-days: 14
+        if: ${{ !cancelled() }}
+
