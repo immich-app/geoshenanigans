@@ -164,10 +164,7 @@ export default {
     const headerProvider = new HeaderMetricsProvider();
     const influxProvider = new InfluxMetricsProvider(workerEnv.VMETRICS_API_TOKEN, env.ENVIRONMENT);
     deferredRepository.defer(() => influxProvider.flush());
-    const metrics = new CloudflareMetricsRepository('tiles', request, deferredRepository, workerEnv, [
-      influxProvider,
-      headerProvider,
-    ]);
+    const metrics = new CloudflareMetricsRepository('tiles', request, [influxProvider, headerProvider]);
 
     try {
       const response = await metrics.monitorAsyncFunction({ name: 'handle_request' }, handleRequest)(

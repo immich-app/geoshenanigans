@@ -251,16 +251,12 @@ export class CloudflareMetricsRepository implements IMetricsRepository {
   constructor(
     private operationPrefix: string,
     request: Request<unknown, IncomingRequestCfProperties>,
-    private deferredRepository: IDeferredRepository,
-    private env: WorkerEnv,
     private metricsProviders: IMetricsProviderRepository[],
   ) {
     this.defaultTags = {
       continent: request.cf?.continent ?? '',
       colo: request.cf?.colo ?? '',
       asOrg: request.cf?.asOrganization ?? '',
-      scriptTag: env.CF_VERSION_METADATA.tag,
-      scriptId: env.CF_VERSION_METADATA.id,
     };
   }
 
