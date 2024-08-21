@@ -24,7 +24,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version-file: './server/.nvmrc'
+          node-version-file: './tiles/.nvmrc'
 
       - name: Run npm install
         run: npm ci
