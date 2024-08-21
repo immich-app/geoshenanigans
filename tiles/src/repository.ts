@@ -135,7 +135,7 @@ export class HeaderMetricsProvider implements IMetricsProviderRepository {
   constructor() {}
 
   pushMetric(metric: Metric) {
-    for (const [_, { value, type }] of metric.fields) {
+    for (const [, { value, type }] of metric.fields) {
       if (type === 'duration') {
         this._metrics.push(`${metric.name};dur=${value}`);
       }

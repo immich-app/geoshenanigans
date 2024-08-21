@@ -41,6 +41,14 @@ export class DirectoryStream {
     return new DirectoryStream(stream);
   }
 
+  async toString(): Promise<string> {
+    let buffer = '';
+    for await (const chunk of this.stream) {
+      buffer += chunk;
+    }
+    return buffer;
+  }
+
   async findTile(searchedTileId: number): Promise<Entry | undefined> {
     let buffer = '';
     let offsetStart: number | undefined;

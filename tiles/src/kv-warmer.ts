@@ -26,22 +26,6 @@ class FakeKVRepository implements IKeyValueRepository {
   }
 }
 
-class FakeDeferredRepository implements IDeferredRepository {
-  constructor() {}
-
-  runDeferred(): void {
-    return;
-  }
-
-  defer(call: AsyncFn): void {
-    call()
-      .then(() => {})
-      .catch((e) => {
-        console.error(e, 'Error');
-      });
-  }
-}
-
 class FakeMetricsRepository implements IMetricsRepository {
   constructor() {}
 
@@ -110,13 +94,11 @@ const handler = async () => {
   const storageRepository = new S3StorageRepository(client, BUCKET_KEY, FILE_NAME, FILE_HASH);
   const memCacheRepository = new MemCacheRepository(new Map());
   const kvRepository = new FakeKVRepository();
-  const deferredRepository = new FakeDeferredRepository();
   const metricsRepository = new FakeMetricsRepository();
   const pmTilesService = await PMTilesService.init(
     storageRepository,
     memCacheRepository,
     kvRepository,
-    deferredRepository,
     metricsRepository,
   );
 
@@ -173,7 +155,7 @@ const handler = async () => {
         length: entry.length,
       });
 
-      toPushToKV.push({ key: cacheKey, value: await new Response(stream.stream).text() });
+      toPushToKV.push({ key: cacheKey, value: await stream.toString() });
       countR2++;
       console.log('R2 Progress: ' + countR2 + '/' + total);
       kvPromises.push(kvLimit(bulkKVPush));
