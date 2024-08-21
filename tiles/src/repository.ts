@@ -43,12 +43,7 @@ export class R2StorageRepository implements IStorageRepository {
   constructor(
     private bucket: R2Bucket,
     private fileName: string,
-    private fileHash: string,
   ) {}
-
-  getFileHash(): string {
-    return this.fileHash;
-  }
 
   getFileName(): string {
     return this.fileName;
@@ -79,7 +74,6 @@ export class S3StorageRepository implements IStorageRepository {
     private client: S3Client,
     private bucketKey: string,
     private fileName: string,
-    private fileHash: string,
   ) {}
 
   private async getS3Object(range: { offset: number; length: number }) {
@@ -108,10 +102,6 @@ export class S3StorageRepository implements IStorageRepository {
 
   getFileName(): string {
     return this.fileName;
-  }
-
-  getFileHash(): string {
-    return this.fileHash;
   }
 }
 

@@ -59,7 +59,6 @@ const handler = async () => {
     KV_NAMESPACE_ID,
     BUCKET_KEY,
     FILE_NAME,
-    FILE_HASH,
   } = process.env;
   if (
     !S3_ACCESS_KEY ||
@@ -69,8 +68,7 @@ const handler = async () => {
     !CLOUDFLARE_ACCOUNT_ID ||
     !KV_NAMESPACE_ID ||
     !BUCKET_KEY ||
-    !FILE_NAME ||
-    !FILE_HASH
+    !FILE_NAME
   ) {
     throw new Error('Missing environment variables');
   }
@@ -84,7 +82,7 @@ const handler = async () => {
     },
   });
 
-  const storageRepository = new S3StorageRepository(client, BUCKET_KEY, FILE_NAME, FILE_HASH);
+  const storageRepository = new S3StorageRepository(client, BUCKET_KEY, FILE_NAME);
   const memCacheRepository = new MemCacheRepository(new Map());
   const kvRepository = new FakeKVRepository();
   const metricsRepository = new FakeMetricsRepository();
@@ -143,7 +141,7 @@ const handler = async () => {
         header,
       );
       const stream = DirectoryStream.fromDirectory(directory);
-      const cacheKey = getDirectoryCacheKey('v1.pmtiles', 'prodv1', {
+      const cacheKey = getDirectoryCacheKey(FILE_NAME, {
         offset: entry.offset + header.leafDirectoryOffset,
         length: entry.length,
       });

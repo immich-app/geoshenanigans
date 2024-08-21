@@ -268,10 +268,6 @@ export function getHeaderCacheKey(archiveName: string): string {
   return archiveName;
 }
 
-export function getDirectoryCacheKey(
-  fileName: string,
-  fileHash: string,
-  range: { offset: number; length: number },
-): string {
-  return `${fileName}|${fileHash}|${range.offset}|${range.length}`;
+export function getDirectoryCacheKey(fileName: string, range: { offset: number; length: number }): string {
+  return `${fileName}|${range.offset}|${range.length}`;
 }

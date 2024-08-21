@@ -129,7 +129,7 @@ export class PMTilesService {
     const [header, root] = await p.getHeaderAndRootFromSource();
     memCache.set(headerCacheKey, header);
     memCache.set(
-      getDirectoryCacheKey(source.getFileName(), source.getFileHash(), {
+      getDirectoryCacheKey(source.getFileName(), {
         offset: header.rootDirectoryOffset,
         length: header.rootDirectoryLength,
       }),
@@ -148,7 +148,7 @@ export class PMTilesService {
   }
 
   private getRootDirectory(header: Header): Directory {
-    const key = getDirectoryCacheKey(this.source.getFileName(), this.source.getFileHash(), {
+    const key = getDirectoryCacheKey(this.source.getFileName(), {
       offset: header.rootDirectoryOffset,
       length: header.rootDirectoryLength,
     });
@@ -181,7 +181,7 @@ export class PMTilesService {
   }
 
   private async getDirectory(offset: number, length: number): Promise<DirectoryStream> {
-    const cacheKey = getDirectoryCacheKey(this.source.getFileName(), this.source.getFileHash(), { offset, length });
+    const cacheKey = getDirectoryCacheKey(this.source.getFileName(), { offset, length });
     console.log(cacheKey);
     const kvValueStream = await this.kvCache.getAsStream(cacheKey);
     if (kvValueStream) {
