@@ -1,14 +1,7 @@
 import { S3Client } from '@aws-sdk/client-s3';
 import { gunzipSync } from 'fflate';
 import pLimit from 'p-limit';
-import {
-  AsyncFn,
-  IDeferredRepository,
-  IKeyValueRepository,
-  IMetricsRepository,
-  IStorageRepository,
-  Operation,
-} from './interface';
+import { AsyncFn, IKeyValueRepository, IMetricsRepository, IStorageRepository, Operation } from './interface';
 import { DirectoryStream, PMTilesService } from './pmtiles/pmtiles.service';
 import { Compression, Directory, Header } from './pmtiles/types';
 import { deserializeIndex, getDirectoryCacheKey } from './pmtiles/utils';

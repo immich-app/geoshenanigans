@@ -10,24 +10,30 @@ describe('integration tests', () => {
   describe('success - zoom1', () => {
     beforeAll(async () => {
       const file = await fetch(`http://localhost:${inject('port')}/zoom1.pmtiles`);
-      if (!file.body) throw new Error('File body is undefined');
+      if (!file.body) {
+        throw new Error('File body is undefined');
+      }
       const body = file.body as ReadableStream;
       await env.BUCKET.put(env.PMTILES_FILE_NAME, body);
       console.log('File uploaded');
     }, 30000);
     it('responds with correct json file', async () => {
       const response = await SELF.fetch('https://example.com/v1');
-      expect(JSON.stringify(await response.json(), null, 2)).toMatchFileSnapshot('./__snapshots__/v1.json');
+      await expect(JSON.stringify(await response.json(), null, 2)).toMatchFileSnapshot('./__snapshots__/v1.json');
     });
     it('responds with correct tile', async () => {
       const response = await SELF.fetch('https://example.com/v1/0/0/0.mvt');
       expect(response.status).toBe(200);
-      expect(Buffer.from(await response.arrayBuffer()).toString()).toMatchFileSnapshot('./__snapshots__/v1-0-0-0.mvt');
+      await expect(Buffer.from(await response.arrayBuffer()).toString()).toMatchFileSnapshot(
+        './__snapshots__/v1-0-0-0.mvt',
+      );
     });
     it('responds with correct tile 2', async () => {
       const response = await SELF.fetch('https://example.com/v1/1/0/1.mvt');
       expect(response.status).toBe(200);
-      expect(Buffer.from(await response.arrayBuffer()).toString()).toMatchFileSnapshot('./__snapshots__/v1-1-0-1.mvt');
+      await expect(Buffer.from(await response.arrayBuffer()).toString()).toMatchFileSnapshot(
+        './__snapshots__/v1-1-0-1.mvt',
+      );
     });
     it('responds with error when tile out of bounds', async () => {
       const response = await SELF.fetch('https://example.com/v1/0/0/1.mvt');
@@ -56,7 +62,7 @@ describe('parseUrl', () => {
     ${'http://example.com/v1.json'} | ${'1'}
     ${'http://example.com/v2.json'} | ${'2'}
   `('json endpoint $url returns version $version', ({ url, version }) => {
-    let result = parseUrl(new Request(url));
+    const result = parseUrl(new Request(url));
     expect(result).toStrictEqual({
       requestType: 'json',
       version,
@@ -69,7 +75,7 @@ describe('parseUrl', () => {
     ${'http://example.com/v1/0/0/0.mvt'} | ${'1'}  | ${'0'} | ${'0'} | ${'0'}
     ${'http://example.com/v2/1/2/3.mvt'} | ${'2'}  | ${'1'} | ${'2'} | ${'3'}
   `('tile endpoint $url returns tile $z/$x/$y with version $version', ({ url, version, z, x, y }) => {
-    let result = parseUrl(new Request(url));
+    const result = parseUrl(new Request(url));
     expect(result).toStrictEqual({
       requestType: 'tile',
       version,
@@ -86,8 +92,8 @@ describe('parseUrl', () => {
     ${'http://example.com/v2/1/2/3'}
     ${'http://example.com/v2/1/2/3.mvt/extra'}
     ${'http://example.com/v1/1/2.mvt'}
-  `('url $url returns undefined request type', ({ url, version, z, x, y }) => {
-    let result = parseUrl(new Request(url));
+  `('url $url returns undefined request type', ({ url }) => {
+    const result = parseUrl(new Request(url));
     expect(result).toStrictEqual({
       requestType: undefined,
       url: new URL(url),
