@@ -11,18 +11,10 @@ concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: true
 
-env:
-  tofu_version: '1.7.1'
-  tg_version: '0.58.12'
-  working_dir: 'deployment'
-
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: 'Checkout'
-        uses: actions/checkout@main
-
       - name: Find latest pmtiles build
         id: latest_build
         run: |
@@ -48,3 +40,19 @@ jobs:
 
       - name: Copy latest tiles to R2
         run: rclone --progress copyto pmtiles:/${{ steps.latest_build.outputs.KEY }} r2:/tiles/${{ steps.latest_build.outputs.KEY }} --s3-no-check-bucket --s3-chunk-size=64M --multi-thread-streams=50 --checkers=512
+
+      - name: 'Checkout'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Update deployment file name
+        run: |
+          sed -i -E 's/"pmtiles_file_name": "(.*)"/"pmtiles_file_name": "${{ steps.latest_build.outputs.KEY }}"/' deployment/modules/cloudflare/tiles/tiles.tfvars.json
+
+      - name: Push updated wrangler.toml to repo
+        uses: test-room-7/action-update-file@v1
+        with:
+          file-path: deployment/modules/cloudflare/tiles/tiles.tfvars.json
+          commit-msg: Update tile server file to ${{ steps.latest_build.outputs.KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
