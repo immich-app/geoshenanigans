@@ -1,0 +1,50 @@
+name: 'Deploy Tiles'
+on:
+  workflow_dispatch:
+  pull_request:
+      branches: [ "main" ]
+      paths:
+        - "deployment/**"
+        - ".github/workflows/deploy-tiles.yml"
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+env:
+  tofu_version: '1.7.1'
+  tg_version: '0.58.12'
+  working_dir: 'deployment'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@main
+
+      - name: Find latest pmtiles build
+        id: latest_build
+        run: |
+          latest_build=$(curl -s https://build-metadata.protomaps.dev/builds.json | jq -r 'map(.key) | sort | last')
+          echo "KEY=$latest_build"
+          echo "KEY=$latest_build" >> $GITHUB_OUTPUT
+
+      - name: Setup Rclone
+        uses: AnimMouse/setup-rclone@v1
+        with:
+          disable_base64: true
+          rclone_config: |
+            [r2]
+            type = s3
+            provider = Cloudflare
+            region = auto
+            endpoint = https://601adaaa1eab190cdfe2945f9a6c89d0.r2.cloudflarestorage.com
+            access_key_id = ${{ secrets.CLOUDFLARE_TILES_R2_KV_TOKEN_ID }}
+            secret_access_key = ${{ secrets.CLOUDFLARE_TILES_R2_KV_TOKEN_HASHED_VALUE }}
+            [pmtiles]
+            type = http
+            url = https://build.protomaps.com/
+
+      - name: Copy latest tiles to R2
+        run: rclone --progress copyto pmtiles:/${{ steps.latest_build.outputs.KEY }} r2:/tiles/${{ steps.latest_build.outputs.KEY }} --s3-no-check-bucket --s3-chunk-size=64M --multi-thread-streams=50 --checkers=512
