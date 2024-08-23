@@ -73,9 +73,10 @@ const handler = async () => {
     throw new Error('Missing environment variables');
   }
 
+  console.log('Starting S3');
   const client = new S3Client({
     region: 'auto',
-    endpoint: S3_ACCESS_KEY,
+    endpoint: S3_ENDPOINT,
     credentials: {
       accessKeyId: S3_ACCESS_KEY,
       secretAccessKey: S3_SECRET_KEY,
@@ -93,6 +94,35 @@ const handler = async () => {
     metricsRepository,
   );
 
+  console.log('Checking if already warmed');
+  const kvCheckKey = encodeURIComponent(`${FILE_NAME}|kv-warmed`);
+  console.log(kvCheckKey);
+  console.log(
+    'url',
+    `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/storage/kv/namespaces/${KV_NAMESPACE_ID}/values/${kvCheckKey}`,
+  );
+  const kvCheckResponse = await fetch(
+    `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/storage/kv/namespaces/${KV_NAMESPACE_ID}/values/${kvCheckKey}`,
+    {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${KV_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+    },
+  );
+  if (kvCheckResponse.status === 200) {
+    console.log('Already warmed');
+    return;
+  }
+
+  if (kvCheckResponse.status !== 404) {
+    console.error('KV Check Failed');
+    throw new Error('KV Check Failed, status code ' + kvCheckResponse.status);
+  }
+
+  console.log('Not warmed', kvCheckResponse.status);
+
   const [header, root] = await pmTilesService.getHeaderAndRootFromSource();
   let countR2 = 0;
   let total = 0;
@@ -104,10 +134,10 @@ const handler = async () => {
   const kvLimit = pLimit(30);
 
   const bulkKVPush = async (toPushOverride?: object[]) => {
-    if (toPushToKV.length < 10 && !toPushOverride) {
+    if (toPushToKV.length < 1 && !toPushOverride) {
       return;
     }
-    const toPush = toPushOverride ?? toPushToKV.splice(0, 10);
+    const toPush = toPushOverride ?? toPushToKV.splice(0, 1);
     const kvResponse = await fetch(
       `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/storage/kv/namespaces/${KV_NAMESPACE_ID}/bulk`,
       {
@@ -119,8 +149,12 @@ const handler = async () => {
         body: JSON.stringify(toPush),
       },
     );
+    if (!kvResponse.ok) {
+      console.error('KV Put Failed', kvResponse);
+      throw new Error('KV Put Failed with non-200 status code');
+    }
     const kvResponseBody = (await kvResponse.json()) as { success: boolean };
-    if (!kvResponseBody.success || kvResponse.status !== 200) {
+    if (!kvResponseBody.success) {
       console.error('KV Put Failed', kvResponseBody);
       throw new Error('KV Put Failed');
     }
@@ -164,7 +198,28 @@ const handler = async () => {
   }
   await Promise.all(kvPromises);
   console.log('Done');
+  const kvResponse = await fetch(
+    `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/storage/kv/namespaces/${KV_NAMESPACE_ID}/values/${kvCheckKey}`,
+    {
+      method: 'PUT',
+      headers: {
+        Authorization: `Bearer ${KV_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ value: 'warmed' }),
+    },
+  );
+  if (!kvResponse.ok) {
+    console.error('Write KV Success Failed');
+    throw new Error('Write KV Success Failed');
+  }
 };
+
+process.on('uncaughtException', (e) => {
+  console.error('UNCAUGHT EXCEPTION');
+  console.error('stack', e);
+  process.exit(1);
+});
 
 handler()
   .then(() => console.log('Done'))

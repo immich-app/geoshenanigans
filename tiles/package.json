@@ -14,7 +14,8 @@
     "lint:fix": "npm run lint -- --fix",
     "format": "prettier --check .",
     "format:fix": "prettier --write .",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "kv:warm": "node --import=tsx src/kv-warmer.ts"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.4.5",
