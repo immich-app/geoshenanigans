@@ -134,10 +134,10 @@ const handler = async () => {
   const kvLimit = pLimit(30);
 
   const bulkKVPush = async (toPushOverride?: object[]) => {
-    if (toPushToKV.length < 1 && !toPushOverride) {
+    if (toPushToKV.length < 10 && !toPushOverride) {
       return;
     }
-    const toPush = toPushOverride ?? toPushToKV.splice(0, 1);
+    const toPush = toPushOverride ?? toPushToKV.splice(0, 10);
     const kvResponse = await fetch(
       `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/storage/kv/namespaces/${KV_NAMESPACE_ID}/bulk`,
       {
