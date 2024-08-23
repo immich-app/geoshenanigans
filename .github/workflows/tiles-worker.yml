@@ -1,0 +1,197 @@
+name: Tiles Worker
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+env:
+  tofu_version: '1.7.1'
+  tg_version: '0.58.12'
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./tiles
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: './tiles/.nvmrc'
+
+      - name: Run npm install
+        run: npm ci
+
+      - name: Run linter
+        run: npm run lint
+        if: ${{ !cancelled() }}
+
+      - name: Run formatter
+        run: npm run format
+        if: ${{ !cancelled() }}
+
+      - name: Run tsc
+        run: npm run check
+        if: ${{ !cancelled() }}
+
+      - name: Run unit tests & coverage
+        run: npm run test:cov
+        if: ${{ !cancelled() }}
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./tiles
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: './tiles/.nvmrc'
+
+      - name: Run npm install
+        run: npm ci
+
+      - name: Run tsc
+        run: npm run check
+        if: ${{ !cancelled() }}
+
+      - name: Wrangler build
+        run: npm run build
+        if: ${{ !cancelled() }}
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiles-build-output
+          path: tiles/dist
+          retention-days: 14
+        if: ${{ !cancelled() }}
+
+  check-terragrunt:
+    name: Check Terragrunt
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./deployment/cloudflare/tiles
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@main
+
+      - name: Check Formatting
+        uses: gruntwork-io/terragrunt-action@v2
+        with:
+          tofu_version: ${{ env.tofu_version }}
+          tg_version: ${{ env.tg_version }}
+          tg_dir: ${{ env.working_dir }}
+          tg_command: 'hclfmt --terragrunt-check --terragrunt-diff'
+
+      - name: Check terraform fmt
+        uses: gruntwork-io/terragrunt-action@v2
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TILES_BUILD_DIR: dist
+          VMETRICS_API_TOKEN: ${{ secrets.VMETRICS_API_TOKEN }}
+          TF_STATE_POSTGRES_CONN_STR: ${{ secrets.TF_STATE_POSTGRES_CONN_STR }}
+        with:
+          tofu_version: ${{ env.tofu_version }}
+          tg_version: ${{ env.tg_version }}
+          tg_dir: ${{ env.working_dir }}
+          tg_command: 'run-all fmt -diff -check'
+  plan-terragrunt:
+    needs: build
+    name: Plan Terragrunt
+    runs-on: ubuntu-latest
+    if: github.ref != 'refs/heads/main'
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@main
+
+      - name: Install Terragrunt
+        uses: eLco/setup-terragrunt@v1
+        with:
+          terragrunt_version: ${{ env.tg_version }}
+
+      - name: 'Install OpenTofu'
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ env.tofu_version }}
+          tofu_wrapper: false
+
+      - name: 'Get build artifact'
+        uses: actions/download-artifact@v4
+        with:
+          name: tiles-build-output
+          path: "${{ github.workspace }}/dist"
+
+      - name: Plan All
+        working-directory: ${{ env.working_dir }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VMETRICS_API_TOKEN: ${{ secrets.VMETRICS_API_TOKEN }}
+          TILES_BUILD_DIR: ${{ github.workspace }}/dist
+          TF_STATE_POSTGRES_CONN_STR: ${{ secrets.TF_STATE_POSTGRES_CONN_STR }}
+        run: terragrunt run-all plan -no-color 2>&1 | tee "${{github.workspace}}/plan_output.txt" && exit ${PIPESTATUS[0]};
+
+  #      - name: 'List files'
+  #        run: 'ls -la ${{ github.workspace }}'
+
+  #      - name: Comment Terraform Plan on PR
+  #        uses: blinqas/tf-plan-pr-comment@v1
+  #        with:
+  #          output_file: "${{ github.workspace }}/plan_output.txt"
+  #        env:
+  #          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  deploy-terragrunt:
+    needs: [build, test]
+    name: Deploy Terragrunt
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@main
+
+      - name: Install Terragrunt
+        uses: eLco/setup-terragrunt@v1
+        with:
+          terragrunt_version: ${{ env.tg_version }}
+
+      - name: 'Install OpenTofu'
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ env.tofu_version }}
+          tofu_wrapper: false
+
+      - name: 'Get build artifact'
+        uses: actions/download-artifact@v4
+        with:
+          name: tiles-build-output
+          path: "${{ github.workspace }}/dist"
+      - name: Deploy All
+        working-directory: ${{ env.working_dir }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VMETRICS_API_TOKEN: ${{ secrets.VMETRICS_API_TOKEN }}
+          TILES_BUILD_DIR: "${{ github.workspace }}/dist"
+          TF_STATE_POSTGRES_CONN_STR: ${{ secrets.TF_STATE_POSTGRES_CONN_STR }}
+        run: terragrunt run-all apply --terragrunt-non-interactive
