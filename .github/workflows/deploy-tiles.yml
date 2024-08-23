@@ -45,13 +45,13 @@ jobs:
         id: generate-token
         uses: actions/create-github-app-token@v1
         with:
-          app-id: ${{ secrets.TF_APP_ID }}
-          private-key: ${{ secrets.TF_APP_PEM_FILE }}
+          app-id: ${{ secrets.PUSH_O_MATIC_APP_ID }}
+          private-key: ${{ secrets.PUSH_O_MATIC_APP_KEY }}
 
       - name: 'Checkout'
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ github.event.pull_request.head.ref }}
 
       - name: Update deployment file name
         run: |
@@ -62,5 +62,4 @@ jobs:
         with:
           add: deployment/modules/cloudflare/tiles/tiles.tfvars.json
           message: Update tile server file to ${{ steps.latest_build.outputs.KEY }}
-          ref: ${{ github.event.pull_request.head.ref }}
           github-token: ${{ steps.generate-token.outputs.token }}
