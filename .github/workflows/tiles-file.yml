@@ -1,0 +1,64 @@
+name: 'Deploy Tiles'
+on:
+  workflow_dispatch:
+  pull_request:
+      branches: [ "main" ]
+      paths:
+        - ".github/workflows/deploy-tiles.yml"
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Find latest pmtiles build
+        id: latest_build
+        run: |
+          latest_build=$(curl -s https://build-metadata.protomaps.dev/builds.json | jq -r 'map(.key) | sort | last')
+          echo "KEY=$latest_build"
+          echo "KEY=$latest_build" >> $GITHUB_OUTPUT
+
+      - name: Setup Rclone
+        uses: AnimMouse/setup-rclone@v1
+        with:
+          disable_base64: true
+          rclone_config: |
+            [r2]
+            type = s3
+            provider = Cloudflare
+            region = auto
+            endpoint = https://601adaaa1eab190cdfe2945f9a6c89d0.r2.cloudflarestorage.com
+            access_key_id = ${{ secrets.CLOUDFLARE_TILES_R2_KV_TOKEN_ID }}
+            secret_access_key = ${{ secrets.CLOUDFLARE_TILES_R2_KV_TOKEN_HASHED_VALUE }}
+            [pmtiles]
+            type = http
+            url = https://build.protomaps.com/
+
+      - name: Copy latest tiles to R2
+        run: rclone --progress copyto pmtiles:/${{ steps.latest_build.outputs.KEY }} r2:/tiles/${{ steps.latest_build.outputs.KEY }} --s3-no-check-bucket --s3-chunk-size=64M --multi-thread-streams=50 --checkers=512
+
+      - name: Generate a token
+        id: generate-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.PUSH_O_MATIC_APP_ID }}
+          private-key: ${{ secrets.PUSH_O_MATIC_APP_KEY }}
+
+      - name: 'Checkout'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: Update deployment file name
+        run: |
+          sed -i -E 's/"pmtiles_file_name": "(.*)"/"pmtiles_file_name": "${{ steps.latest_build.outputs.KEY }}"/' deployment/modules/cloudflare/tiles/tiles.tfvars.json
+
+      - name: Push updated wrangler.toml to repo
+        uses: EndBug/add-and-commit@v9
+        with:
+          add: deployment/modules/cloudflare/tiles/tiles.tfvars.json
+          message: Update tile server file to ${{ steps.latest_build.outputs.KEY }}
+          github-token: ${{ steps.generate-token.outputs.token }}

@@ -101,7 +101,7 @@ async function handleRequest(
   const cached = await metrics.monitorAsyncFunction({ name: 'match_request_from_cdn' }, (url) => cache.match(url))(
     request.url,
   );
-  if (cached && cached.headers.get(Header.PMTILES_FILE_IDENTIFIER) === env.PMTILES_FILE_HASH) {
+  if (cached && cached.headers.get(Header.PMTILES_FILE_IDENTIFIER) === env.PMTILES_FILE_NAME) {
     const cacheHeaders = new Headers(cached.headers);
     const encodeBody = cacheHeaders.has('content-encoding') ? 'manual' : 'automatic';
     return new Response(cached.body, {
@@ -117,7 +117,7 @@ async function handleRequest(
 
   const memCacheRepository = new MemCacheRepository(globalThis.memCache);
   const kvRepository = new CloudflareKVRepository(env.KV);
-  const storageRepository = new R2StorageRepository(env.BUCKET, env.PMTILES_FILE_NAME, env.PMTILES_FILE_HASH);
+  const storageRepository = new R2StorageRepository(env.BUCKET, env.PMTILES_FILE_NAME);
   const pmTilesService = await metrics.monitorAsyncFunction({ name: 'pmtiles_init' }, PMTilesService.init)(
     storageRepository,
     memCacheRepository,
@@ -129,7 +129,7 @@ async function handleRequest(
   respHeaders.set(Header.CACHE_CONTROL, `public, max-age=${60 * 60 * 24 * 31}`);
   respHeaders.set(Header.ACCESS_CONTROL_ALLOW_ORIGIN, '*');
   respHeaders.set(Header.VARY, 'Origin');
-  respHeaders.set(Header.PMTILES_FILE_IDENTIFIER, env.PMTILES_FILE_HASH);
+  respHeaders.set(Header.PMTILES_FILE_IDENTIFIER, env.PMTILES_FILE_NAME);
 
   const pmTilesParams = parseUrl(request);
 
@@ -164,10 +164,7 @@ export default {
     const headerProvider = new HeaderMetricsProvider();
     const influxProvider = new InfluxMetricsProvider(workerEnv.VMETRICS_API_TOKEN, env.ENVIRONMENT);
     deferredRepository.defer(() => influxProvider.flush());
-    const metrics = new CloudflareMetricsRepository('tiles', request, deferredRepository, workerEnv, [
-      influxProvider,
-      headerProvider,
-    ]);
+    const metrics = new CloudflareMetricsRepository('tiles', request, [influxProvider, headerProvider]);
 
     try {
       const response = await metrics.monitorAsyncFunction({ name: 'handle_request' }, handleRequest)(
