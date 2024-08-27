@@ -32,6 +32,9 @@ resource "cloudflare_workers_script" "tiles" {
     name         = "KV"
     namespace_id = cloudflare_workers_kv_namespace.tiles.id
   }
+
+  compatibility_date  = "2024-07-29"
+  compatibility_flags = ["nodejs_compat"]
 }
 
 resource "cloudflare_workers_domain" "tiles" {
