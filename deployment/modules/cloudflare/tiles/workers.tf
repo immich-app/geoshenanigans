@@ -14,7 +14,7 @@ resource "cloudflare_workers_script" "tiles" {
   }
 
   plain_text_binding {
-    name = "ENVINRONMENT"
+    name = "ENVIRONMENT"
     text = "production"
   }
 
