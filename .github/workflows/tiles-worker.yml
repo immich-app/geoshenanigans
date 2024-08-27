@@ -189,7 +189,7 @@ jobs:
         run: npm run kv:warm
 
   deploy-terragrunt:
-    needs: [build, test]
+    needs: [build, test, kv-warming]
     name: Deploy Terragrunt
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
