@@ -40,13 +40,3 @@ resource "cloudflare_workers_domain" "tiles" {
   service    = cloudflare_workers_script.tiles.id
   zone_id    = data.cloudflare_zone.immich_cloud.zone_id
 }
-
-import {
-  to = cloudflare_workers_script.tiles
-  id = "${var.cloudflare_account_id}/tiles"
-}
-
-import {
-  to = cloudflare_workers_domain.tiles
-  id = "${var.cloudflare_account_id}/17b3213004b9d5f077563e3c4ea3171ef9d0c5fc"
-}

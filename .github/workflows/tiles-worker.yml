@@ -115,6 +115,7 @@ jobs:
           tg_version: ${{ env.tg_version }}
           tg_dir: ${{ env.working_dir }}
           tg_command: 'run-all fmt -diff -check'
+
   plan-terragrunt:
     needs: build
     name: Plan Terragrunt
@@ -212,6 +213,7 @@ jobs:
         with:
           name: tiles-build-output
           path: "${{ github.workspace }}/dist"
+
       - name: Deploy All
         working-directory: ${{ env.working_dir }}
         env:
