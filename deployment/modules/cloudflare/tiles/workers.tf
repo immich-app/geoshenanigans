@@ -4,7 +4,7 @@ data "cloudflare_zone" "immich_cloud" {
 
 resource "cloudflare_workers_script" "tiles" {
   account_id = var.cloudflare_account_id
-  name       = "tiles"
+  name       = "tiles-prod"
   content    = file("${var.tiles_build_dir}/index.js")
   module     = true
 
