@@ -1,4 +1,4 @@
-name: 'Deploy Tiles'
+name: 'Tiles File'
 on:
   workflow_dispatch:
     inputs:
@@ -15,8 +15,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  deploy-tiles:
+  deploy_tiles:
+    name: Deploy Tiles
+    strategy:
+      matrix:
+        bucket_region: [ "wnam", "enam", "weur", "eeur", "apac" ]
     runs-on: ubuntu-latest
+    outputs:
+      KEY: ${{ steps.latest_build.outputs.KEY }}
     steps:
       - name: Find latest pmtiles build
         id: latest_build
@@ -48,15 +54,18 @@ jobs:
             url = https://build.protomaps.com/
 
       - name: Copy latest tiles to R2
-        run: rclone --progress copyto pmtiles:/${{ steps.latest_build.outputs.KEY }} r2:/tiles/${{ steps.latest_build.outputs.KEY }} --s3-no-check-bucket --s3-chunk-size=64M --multi-thread-streams=50 --checkers=512
-
+        run: rclone --progress copyto pmtiles:/${{ steps.latest_build.outputs.KEY }} r2:/tiles-${{ matrix.bucket_region }}/${{ steps.latest_build.outputs.KEY }} --s3-no-check-bucket --s3-chunk-size=64M --multi-thread-streams=50 --checkers=512
+  update_tile_ref:
+    name: Update tile server file reference
+    needs: [deploy_tiles]
+    runs-on: ubuntu-latest
+    steps:
       - name: Generate a token
         id: generate-token
         uses: actions/create-github-app-token@v1
         with:
           app-id: ${{ secrets.PUSH_O_MATIC_APP_ID }}
           private-key: ${{ secrets.PUSH_O_MATIC_APP_KEY }}
-
       - name: 'Checkout'
         uses: actions/checkout@v4
         with:
@@ -64,11 +73,11 @@ jobs:
 
       - name: Update deployment file name
         run: |
-          sed -i -E 's/"pmtiles_file_name": "(.*)"/"pmtiles_file_name": "${{ steps.latest_build.outputs.KEY }}"/' deployment/modules/cloudflare/tiles/tiles.tfvars.json
+          sed -i -E 's/"pmtiles_file_name": "(.*)"/"pmtiles_file_name": "${{ needs.deploy_tiles.outputs.KEY }}"/' deployment/modules/cloudflare/tiles/tiles.tfvars.json
 
       - name: Push updated wrangler.toml to repo
         uses: EndBug/add-and-commit@v9
         with:
           add: deployment/modules/cloudflare/tiles/tiles.tfvars.json
-          message: Update tile server file to ${{ steps.latest_build.outputs.KEY }}
           github-token: ${{ steps.generate-token.outputs.token }}
+          message: Update tile server file to ${{ needs.deploy_tiles.outputs.KEY }}
