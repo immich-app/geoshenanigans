@@ -1,25 +1,35 @@
 name: 'Deploy Tiles'
 on:
   workflow_dispatch:
+    inputs:
+      file_name:
+        description: 'The name of the file to deploy, defaults to newest file'
+        required: false
   pull_request:
-      branches: [ "main" ]
-      paths:
-        - ".github/workflows/deploy-tiles.yml"
+    branches: [ "main" ]
+    paths:
+      - ".github/workflows/tiles-file.yml"
 
 concurrency:
   group: ${{ github.workflow }}
   cancel-in-progress: true
 
 jobs:
-  deploy:
+  deploy-tiles:
     runs-on: ubuntu-latest
     steps:
       - name: Find latest pmtiles build
         id: latest_build
+        env:
+          FILE_NAME: ${{ github.event.inputs.file_name }}
         run: |
-          latest_build=$(curl -s https://build-metadata.protomaps.dev/builds.json | jq -r 'map(.key) | sort | last')
-          echo "KEY=$latest_build"
-          echo "KEY=$latest_build" >> $GITHUB_OUTPUT
+          if [ -z "$FILE_NAME" ]; then
+            build=$(curl -s https://build-metadata.protomaps.dev/builds.json | jq -r 'map(.key) | sort | last')
+          else
+            build=$FILE_NAME
+          fi
+          echo "KEY=$build"
+          echo "KEY=$build" >> $GITHUB_OUTPUT
 
       - name: Setup Rclone
         uses: AnimMouse/setup-rclone@v1
