@@ -184,7 +184,7 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           # Figure out how to extract this from terraform at some point or get it into github vars
           KV_NAMESPACE_ID: 5a4b82694e8b490db8b8904cdaea4f00
-          BUCKET_KEY: tiles
+          BUCKET_KEY: tiles-weur
           FILE_NAME: ${{ fromJson(env.TILES_JSON).pmtiles_file_name }}
         run: npm run kv:warm
 
