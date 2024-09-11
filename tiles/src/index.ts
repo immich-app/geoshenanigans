@@ -126,6 +126,7 @@ async function handleRequest(
       weur: env.BUCKET_WEUR,
     },
     env.PMTILES_FILE_NAME,
+    metrics,
   );
   const pmTilesService = await metrics.monitorAsyncFunction({ name: 'pmtiles_init' }, PMTilesService.init)(
     storageRepository,

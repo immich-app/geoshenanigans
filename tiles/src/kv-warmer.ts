@@ -31,6 +31,7 @@ class FakeMetricsRepository implements IMetricsRepository {
   ): (...args: Parameters<T>) => Promise<Awaited<ReturnType<T>>> {
     return call;
   }
+  push(): void {}
 }
 
 export function decompress(buf: ArrayBuffer, compression: Compression): ArrayBuffer {

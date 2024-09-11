@@ -32,6 +32,7 @@ export interface IMetricsRepository {
     call: T,
     options?: Options,
   ): (...args: Parameters<T>) => Promise<Awaited<ReturnType<T>>>;
+  push(metric: Metric): void;
 }
 
 export interface IMetricsProviderRepository {
