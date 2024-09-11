@@ -41,7 +41,7 @@ export class MemCacheRepository implements IMemCacheRepository {
 
 export class R2StorageRepository implements IStorageRepository {
   constructor(
-    private bucket: R2Bucket,
+    private buckets: { [key: string]: R2Bucket },
     private fileName: string,
   ) {}
 
@@ -51,9 +51,17 @@ export class R2StorageRepository implements IStorageRepository {
 
   private async getR2Object(range: { offset: number; length: number }) {
     const { offset, length } = range;
-    const resp = await this.bucket.get(this.fileName, {
-      range: { offset, length },
-    });
+    const { key: bucketKey, resp } = await Promise.race(
+      Object.entries(this.buckets).map(async ([key, bucket]) => {
+        const resp = await bucket.get(this.fileName, {
+          range: { offset, length },
+        });
+        return { key, resp };
+      }),
+    );
+
+    console.log(`Bucket key: ${bucketKey}`);
+
     if (!resp) {
       throw new Error('Archive not found');
     }
