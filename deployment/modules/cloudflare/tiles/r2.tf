@@ -18,3 +18,7 @@ import {
   to = cloudflare_r2_bucket.tiles
   id = "${var.cloudflare_account_id}/tiles"
 }
+
+output "r2_regional_buckets" {
+  value = { for region, bucket in cloudflare_r2_bucket.regional_tiles : region => bucket.id }
+}

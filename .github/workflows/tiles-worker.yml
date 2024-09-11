@@ -110,6 +110,7 @@ jobs:
           TILES_BUILD_DIR: dist
           VMETRICS_API_TOKEN: ${{ secrets.VMETRICS_API_TOKEN }}
           TF_STATE_POSTGRES_CONN_STR: ${{ secrets.TF_STATE_POSTGRES_CONN_STR }}
+          ENVIRONMENT: dev
         with:
           tofu_version: ${{ env.tofu_version }}
           tg_version: ${{ env.tg_version }}
@@ -120,7 +121,11 @@ jobs:
     needs: build
     name: Plan Terragrunt
     runs-on: ubuntu-latest
-    if: github.ref != 'refs/heads/main'
+    strategy:
+      max-parallel: 1
+      matrix:
+        environment: [dev, prod]
+    if: github.ref != 'refs/heads/main' && github.event_name != 'workflow_dispatch'
     steps:
       - name: 'Checkout'
         uses: actions/checkout@main
@@ -150,13 +155,14 @@ jobs:
           VMETRICS_API_TOKEN: ${{ secrets.VMETRICS_API_TOKEN }}
           TILES_BUILD_DIR: ${{ github.workspace }}/dist
           TF_STATE_POSTGRES_CONN_STR: ${{ secrets.TF_STATE_POSTGRES_CONN_STR }}
+          ENVIRONMENT: ${{ matrix.environment }}
         run: terragrunt run-all plan -no-color 2>&1 | tee "${{github.workspace}}/plan_output.txt" && exit ${PIPESTATUS[0]};
 
   kv-warming:
     needs: [build, test]
     name: KV Warming
     runs-on: mich
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
     defaults:
       run:
         working-directory: ./tiles
@@ -173,7 +179,7 @@ jobs:
         run: npm ci
 
       - name: Get tiles.json
-        run: echo "TILES_JSON=$(jq -c . < ${{ github.workspace }}/deployment/modules/cloudflare/tiles/tiles.tfvars.json)" >> $GITHUB_ENV
+        run: echo "TILES_JSON=$(jq -c . < ${{ github.workspace }}/deployment/modules/cloudflare/tiles-worker/tiles.tfvars.json)" >> $GITHUB_ENV
 
       - name: Run kv warming
         env:
@@ -192,7 +198,9 @@ jobs:
     needs: [build, test, kv-warming]
     name: Deploy Terragrunt
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    env:
+      ENVIRONMENT: ${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}
     steps:
       - name: 'Checkout'
         uses: actions/checkout@main
