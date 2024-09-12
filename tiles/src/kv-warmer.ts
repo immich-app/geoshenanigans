@@ -1,4 +1,5 @@
 import { S3Client } from '@aws-sdk/client-s3';
+import fetch_retry from 'fetch-retry';
 import { gunzipSync } from 'fflate';
 import pLimit from 'p-limit';
 import { AsyncFn, IKeyValueRepository, IMetricsRepository, IStorageRepository, Operation } from './interface';
@@ -6,6 +7,8 @@ import { DirectoryStream, PMTilesService } from './pmtiles/pmtiles.service';
 import { Compression, Directory, Header } from './pmtiles/types';
 import { deserializeIndex, getDirectoryCacheKey } from './pmtiles/utils';
 import { MemCacheRepository, S3StorageRepository } from './repository';
+
+const fetch = fetch_retry(global.fetch);
 
 class FakeKVRepository implements IKeyValueRepository {
   constructor() {}
@@ -28,6 +31,7 @@ class FakeMetricsRepository implements IMetricsRepository {
   ): (...args: Parameters<T>) => Promise<Awaited<ReturnType<T>>> {
     return call;
   }
+  push(): void {}
 }
 
 export function decompress(buf: ArrayBuffer, compression: Compression): ArrayBuffer {
@@ -141,6 +145,16 @@ const handler = async () => {
     const kvResponse = await fetch(
       `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/storage/kv/namespaces/${KV_NAMESPACE_ID}/bulk`,
       {
+        retries: 5,
+        retryDelay: 2000,
+        retryOn: function (attempt, error, response) {
+          // retry on any network error, or 4xx or 5xx status codes
+          if (error !== null || (!!response && response.status >= 400)) {
+            console.log(`retrying, attempt number ${attempt + 1}`);
+            return true;
+          }
+          return false;
+        },
         method: 'PUT',
         headers: {
           Authorization: `Bearer ${KV_API_KEY}`,

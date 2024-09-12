@@ -117,7 +117,17 @@ async function handleRequest(
 
   const memCacheRepository = new MemCacheRepository(globalThis.memCache);
   const kvRepository = new CloudflareKVRepository(env.KV);
-  const storageRepository = new R2StorageRepository(env.BUCKET, env.PMTILES_FILE_NAME);
+  const storageRepository = new R2StorageRepository(
+    {
+      apac: env.BUCKET_APAC,
+      eeur: env.BUCKET_EEUR,
+      enam: env.BUCKET_ENAM,
+      wnam: env.BUCKET_WNAM,
+      weur: env.BUCKET_WEUR,
+    },
+    env.PMTILES_FILE_NAME,
+    metrics,
+  );
   const pmTilesService = await metrics.monitorAsyncFunction({ name: 'pmtiles_init' }, PMTilesService.init)(
     storageRepository,
     memCacheRepository,

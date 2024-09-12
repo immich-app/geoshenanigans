@@ -41,8 +41,9 @@ export class MemCacheRepository implements IMemCacheRepository {
 
 export class R2StorageRepository implements IStorageRepository {
   constructor(
-    private bucket: R2Bucket,
+    private buckets: { [key: string]: R2Bucket },
     private fileName: string,
+    private metrics: IMetricsRepository,
   ) {}
 
   getFileName(): string {
@@ -50,10 +51,21 @@ export class R2StorageRepository implements IStorageRepository {
   }
 
   private async getR2Object(range: { offset: number; length: number }) {
+    const metric = Metric.create('r2_storage_get');
     const { offset, length } = range;
-    const resp = await this.bucket.get(this.fileName, {
-      range: { offset, length },
-    });
+    const { key: bucketKey, resp } = await Promise.race(
+      Object.entries(this.buckets).map(async ([key, bucket]) => {
+        const resp = await bucket.get(this.fileName, {
+          range: { offset, length },
+        });
+        return { key, resp };
+      }),
+    );
+    metric.durationField(`${bucketKey}_duration`);
+    metric.addTag('bucket_key', bucketKey);
+    metric.intField('count', 1);
+    this.metrics.push(metric);
+
     if (!resp) {
       throw new Error('Archive not found');
     }
@@ -125,9 +137,10 @@ export class HeaderMetricsProvider implements IMetricsProviderRepository {
   constructor() {}
 
   pushMetric(metric: Metric) {
-    for (const [, { value, type }] of metric.fields) {
+    for (const [label, { value, type }] of metric.fields) {
       if (type === 'duration') {
-        this._metrics.push(`${metric.name};dur=${value}`);
+        const suffix = label === 'duration' ? '' : `_${label.replace('_duration', '')}`;
+        this._metrics.push(`${metric.name}${suffix};dur=${value}`);
       }
     }
   }
@@ -263,5 +276,12 @@ export class CloudflareMetricsRepository implements IMetricsRepository {
     };
 
     return monitorAsyncFunction(this.operationPrefix, operation, call, callback, options);
+  }
+
+  push(metric: Metric) {
+    metric.addTags(this.defaultTags);
+    for (const provider of this.metricsProviders) {
+      provider.pushMetric(metric);
+    }
   }
 }

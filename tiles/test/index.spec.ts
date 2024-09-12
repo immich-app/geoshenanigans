@@ -9,13 +9,16 @@ const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
 describe('integration tests', () => {
   describe('success - zoom1', () => {
     beforeAll(async () => {
-      const file = await fetch(`http://localhost:${inject('port')}/zoom1.pmtiles`);
-      if (!file.body) {
-        throw new Error('File body is undefined');
+      const buckets = [env.BUCKET_WEUR, env.BUCKET_WNAM, env.BUCKET_EEUR, env.BUCKET_APAC, env.BUCKET_ENAM];
+      for (const bucket of buckets) {
+        const file = await fetch(`http://localhost:${inject('port')}/zoom1.pmtiles`);
+        if (!file.body) {
+          throw new Error('File body is undefined');
+        }
+        const body = file.body as ReadableStream;
+        await bucket.put(env.PMTILES_FILE_NAME, body);
+        console.log('File uploaded');
       }
-      const body = file.body as ReadableStream;
-      await env.BUCKET.put(env.PMTILES_FILE_NAME, body);
-      console.log('File uploaded');
     }, 30000);
     it('responds with correct json file', async () => {
       const response = await SELF.fetch('https://example.com/v1');
