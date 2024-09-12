@@ -76,8 +76,9 @@ jobs:
         run: |
           sed -i -E 's/"pmtiles_file_name": "(.*)"/"pmtiles_file_name": "${{ needs.deploy_tiles.outputs.KEY }}"/' deployment/modules/cloudflare/tiles-worker/tiles.tfvars.json
 
-      - name: Push updated wrangler.toml to repo
+      - name: Push updated tiles.tfvars to repo
         uses: EndBug/add-and-commit@v9
         with:
           add: deployment/modules/cloudflare/tiles-worker/tiles.tfvars.json
           message: Update tile server file to ${{ needs.deploy_tiles.outputs.KEY }}
+          push: ${{ github.event_name == 'workflow_dispatch' }}
