@@ -4,7 +4,7 @@
 interface Env {
 	KV: KVNamespace;
 	PMTILES_FILE_NAME: "v1.pmtiles";
-	ENVIRONMENT: "production";
+	ENVIRONMENT: "prod";
 	BUCKET_WNAM: R2Bucket;
 	BUCKET_ENAM: R2Bucket;
 	BUCKET_WEUR: R2Bucket;
