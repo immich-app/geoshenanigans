@@ -47,12 +47,12 @@ resource "cloudflare_workers_domain" "tiles" {
   zone_id    = data.cloudflare_zone.immich_cloud.zone_id
 }
 
-resource "cloudflare_record" "tiles_cname" {
-  count   = var.env == "prod" ? 1 : 0
-  type    = "CNAME"
-  name    = "tiles"
-  content = cloudflare_workers_domain.tiles.hostname
-  zone_id = data.cloudflare_zone.immich_cloud.zone_id
+resource "cloudflare_workers_domain" "tiles_prod" {
+  count      = var.env == "prod" ? 1 : 0
+  account_id = var.cloudflare_account_id
+  hostname   = "tiles.immich.cloud"
+  service    = cloudflare_workers_script.tiles.id
+  zone_id    = data.cloudflare_zone.immich_cloud.zone_id
 }
 
 import {
