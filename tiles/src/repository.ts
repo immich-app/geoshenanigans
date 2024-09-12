@@ -184,7 +184,7 @@ export class InfluxMetricsProvider implements IMetricsProviderRepository {
       return;
     }
     const metrics = this.metrics.join('\n');
-    if (this.environment === 'production') {
+    if (this.environment === 'prod') {
       const response = await fetch('https://cf-workers.monitoring.immich.cloud/write', {
         method: 'POST',
         body: this.metrics.join('\n'),
