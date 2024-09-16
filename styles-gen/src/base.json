@@ -1,0 +1,13 @@
+{
+  "version": 9,
+  "name": "Immich Map",
+  "id": "immich-map",
+  "sources": {
+    "tiles": {
+      "type": "vector",
+      "url": "https://tiles.immich.cloud/v1.json"
+    }
+  },
+  "sprite": "https://static.immich.cloud/tiles/sprites/v1/light",
+  "glyphs": "https://static.immich.cloud/tiles/fonts/{fontstack}/{range}.pbf"
+}

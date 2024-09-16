@@ -1,0 +1,3 @@
+[submodule "submodules/basemaps"]
+	path = submodules/basemaps
+	url = https://github.com/protomaps/basemaps.git
