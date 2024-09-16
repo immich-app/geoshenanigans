@@ -99,7 +99,7 @@ const handler = async () => {
   );
 
   console.log('Checking if already warmed');
-  const kvCheckKey = encodeURIComponent(`${DEPLOYMENT_KEY}.pmtiles|kv-warmed`);
+  const kvCheckKey = encodeURIComponent(`${DEPLOYMENT_KEY}|kv-warmed`);
   console.log(kvCheckKey);
   console.log(
     'url',
