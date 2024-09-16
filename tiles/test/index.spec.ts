@@ -10,19 +10,26 @@ describe('integration tests', () => {
   describe('success - zoom1', () => {
     beforeAll(async () => {
       const buckets = [env.BUCKET_WEUR, env.BUCKET_WNAM, env.BUCKET_EEUR, env.BUCKET_APAC, env.BUCKET_ENAM];
+      const files = ['tiles.pmtiles', 'styles/dark.json', 'styles/light.json'];
       for (const bucket of buckets) {
-        const file = await fetch(`http://localhost:${inject('port')}/zoom1.pmtiles`);
-        if (!file.body) {
-          throw new Error('File body is undefined');
+        for (const fileName of files) {
+          const file = await fetch(`http://localhost:${inject('port')}/${fileName}`);
+          if (!file.body) {
+            throw new Error('File body is undefined');
+          }
+          const body = file.body as ReadableStream;
+          await bucket.put(`${env.DEPLOYMENT_KEY}/${fileName}`, body);
+          console.log('File uploaded');
         }
-        const body = file.body as ReadableStream;
-        await bucket.put(`${env.DEPLOYMENT_KEY}/tiles.pmtiles`, body);
-        console.log('File uploaded');
       }
     }, 30000);
     it('responds with correct json file', async () => {
       const response = await SELF.fetch('https://example.com/v1');
       await expect(JSON.stringify(await response.json(), null, 2)).toMatchFileSnapshot('./__snapshots__/v1.json');
+    });
+    it('response with correct style', async () => {
+      const response = await SELF.fetch('https://example.com/v1/style/dark');
+      await expect(JSON.stringify(await response.json(), null, 2)).toMatchFileSnapshot('./assets/styles/dark.json');
     });
     it('responds with correct tile', async () => {
       const response = await SELF.fetch('https://example.com/v1/0/0/0.mvt');
@@ -69,6 +76,21 @@ describe('parseUrl', () => {
     expect(result).toStrictEqual({
       requestType: 'json',
       version,
+      url: new URL(url),
+    });
+  });
+
+  it.each`
+    url                                         | style      | version
+    ${'http://example.com/v1/style/dark'}       | ${'dark'}  | ${'1'}
+    ${'http://example.com/v2/style/light'}      | ${'light'} | ${'2'}
+    ${'http://example.com/v2/style/dark.json'}  | ${'dark'}  | ${'2'}
+    ${'http://example.com/v1/style/light.json'} | ${'light'} | ${'1'}
+  `('style endpoint $url returns style $style', ({ url, style }) => {
+    const result = parseUrl(new Request(url));
+    expect(result).toStrictEqual({
+      requestType: 'style',
+      style,
       url: new URL(url),
     });
   });

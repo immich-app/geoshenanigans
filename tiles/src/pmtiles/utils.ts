@@ -269,5 +269,5 @@ export function getHeaderCacheKey(archiveName: string): string {
 }
 
 export function getDirectoryCacheKey(fileName: string, range: { offset: number; length: number }): string {
-  return `${fileName}|prodv1|${range.offset}|${range.length}`;
+  return `${fileName}.pmtiles|prodv1|${range.offset}|${range.length}`;
 }

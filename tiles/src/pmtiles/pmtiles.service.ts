@@ -122,14 +122,14 @@ export class PMTilesService {
     metrics: IMetricsRepository,
   ): Promise<PMTilesService> {
     const p = new PMTilesService(source, memCache, kvCache, metrics);
-    const headerCacheKey = getHeaderCacheKey(source.getFileName());
+    const headerCacheKey = getHeaderCacheKey(source.getDeploymentKey());
     if (memCache.get(headerCacheKey)) {
       return p;
     }
     const [header, root] = await p.getHeaderAndRootFromSource();
     memCache.set(headerCacheKey, header);
     memCache.set(
-      getDirectoryCacheKey(source.getFileName(), {
+      getDirectoryCacheKey(source.getDeploymentKey(), {
         offset: header.rootDirectoryOffset,
         length: header.rootDirectoryLength,
       }),
@@ -139,7 +139,7 @@ export class PMTilesService {
   }
 
   private getHeader(): Header {
-    const key = getHeaderCacheKey(this.source.getFileName());
+    const key = getHeaderCacheKey(this.source.getDeploymentKey());
     const memCached = this.memCache.get<Header>(key);
     if (!memCached) {
       throw new Error('Header not found in cache');
@@ -148,7 +148,7 @@ export class PMTilesService {
   }
 
   private getRootDirectory(header: Header): Directory {
-    const key = getDirectoryCacheKey(this.source.getFileName(), {
+    const key = getDirectoryCacheKey(this.source.getDeploymentKey(), {
       offset: header.rootDirectoryOffset,
       length: header.rootDirectoryLength,
     });
@@ -160,7 +160,7 @@ export class PMTilesService {
   }
 
   async getHeaderAndRootFromSource(): Promise<[Header, Directory]> {
-    const resp = await this.source.get({ offset: 0, length: 16384 });
+    const resp = await this.source.getRange({ offset: 0, length: 16384 });
     const v = new DataView(resp);
     if (v.getUint16(0, true) !== 0x4d50) {
       throw new Error('Wrong magic number for PMTiles archive');
@@ -181,7 +181,7 @@ export class PMTilesService {
   }
 
   private async getDirectory(offset: number, length: number): Promise<DirectoryStream> {
-    const cacheKey = getDirectoryCacheKey(this.source.getFileName(), { offset, length });
+    const cacheKey = getDirectoryCacheKey(this.source.getDeploymentKey(), { offset, length });
     console.log(cacheKey);
     const kvValueStream = await this.kvCache.getAsStream(cacheKey);
     if (kvValueStream) {
@@ -227,7 +227,7 @@ export class PMTilesService {
       )(tileId);
     }
     const tile = await this.metrics.monitorAsyncFunction({ name: 'get_tile' }, (offset, length) =>
-      this.source.getAsStream({ offset, length }),
+      this.source.getRangeAsStream({ offset, length }),
     )(header.tileDataOffset + offset, length);
     return tile;
   }
@@ -235,7 +235,7 @@ export class PMTilesService {
   private async getMetadata(): Promise<Metadata> {
     const header = this.getHeader();
 
-    const resp = await this.source.get({
+    const resp = await this.source.getRange({
       offset: header.jsonMetadataOffset,
       length: header.jsonMetadataLength,
     });

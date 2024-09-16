@@ -17,11 +17,18 @@ declare global {
 }
 /* eslint-enable no-var */
 
-const URL_MATCHER = /^\/v(?<VERSION>[0-9]+)((?=)|(?<JSON>\.json)|\/(?<Z>\d+)\/(?<X>\d+)\/(?<Y>\d+).mvt)$/;
+const URL_MATCHER =
+  /^\/v(?<VERSION>[0-9]+)((?=)|\/style\/(?<STYLE>\w+)(?:\.json)?|(?<JSON>\.json)|\/(?<Z>\d+)\/(?<X>\d+)\/(?<Y>\d+).mvt)$/;
 
 type PMTilesParams = {
-  requestType: 'tile' | 'json' | undefined;
+  requestType: 'tile' | 'json' | 'style' | undefined;
   url: URL;
+};
+
+type PMTilesStyleParams = PMTilesParams & {
+  requestType: 'style';
+  version: string;
+  style: string;
 };
 
 type PMTilesTileParams = PMTilesParams & {
@@ -51,11 +58,14 @@ export function parseUrl(request: Request): PMTilesParams {
   const url = new URL(request.url);
   const matches = URL_MATCHER.exec(url.pathname);
   const version = matches?.groups?.VERSION;
+  const style = matches?.groups?.STYLE;
   const z = matches?.groups?.Z;
   const x = matches?.groups?.X;
   const y = matches?.groups?.Y;
   if (version && z && x && y) {
     return { requestType: 'tile', version, z, x, y, url } as PMTilesTileParams;
+  } else if (style) {
+    return { requestType: 'style', style, url } as PMTilesStyleParams;
   } else if (version) {
     return { requestType: 'json', version, url } as PMTilesJsonParams;
   }
@@ -92,6 +102,16 @@ async function handleRequest(
     const tileJson = await pmTilesService.getJsonResponse(version, url);
     respHeaders.set(Header.CONTENT_TYPE, 'application/json');
     return cacheResponse(new Response(JSON.stringify(tileJson), { headers: respHeaders, status: 200 }));
+  }
+
+  async function handleStyleRequest(respHeaders: Headers) {
+    const { style } = pmTilesParams as PMTilesStyleParams;
+    const styleJson = await storageRepository.getAsStream('styles/' + style + '.json');
+    if (!styleJson) {
+      return cacheResponse(new Response('Style not found', { status: 404 }));
+    }
+    respHeaders.set(Header.CONTENT_TYPE, 'application/json');
+    return cacheResponse(new Response(styleJson, { headers: respHeaders, status: 200 }));
   }
 
   if (request.method.toUpperCase() !== 'GET') {
@@ -162,6 +182,15 @@ async function handleRequest(
       return await metrics.monitorAsyncFunction(
         { name: 'json_request', tags: { version } },
         handleJsonRequest,
+      )(respHeaders);
+    }
+
+    if (pmTilesParams.requestType === 'style') {
+      const { style } = pmTilesParams as PMTilesStyleParams;
+      console.log('style');
+      return await metrics.monitorAsyncFunction(
+        { name: 'style_request', tags: { style } },
+        handleStyleRequest,
       )(respHeaders);
     }
   } catch (e) {
