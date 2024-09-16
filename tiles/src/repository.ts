@@ -42,12 +42,12 @@ export class MemCacheRepository implements IMemCacheRepository {
 export class R2StorageRepository implements IStorageRepository {
   constructor(
     private buckets: { [key: string]: R2Bucket },
-    private fileName: string,
+    private deploymentKey: string,
     private metrics: IMetricsRepository,
   ) {}
 
   getFileName(): string {
-    return this.fileName;
+    return this.deploymentKey;
   }
 
   private async getR2Object(range: { offset: number; length: number }) {
@@ -55,7 +55,7 @@ export class R2StorageRepository implements IStorageRepository {
     const { offset, length } = range;
     const { key: bucketKey, resp } = await Promise.race(
       Object.entries(this.buckets).map(async ([key, bucket]) => {
-        const resp = await bucket.get(this.fileName, {
+        const resp = await bucket.get(`${this.deploymentKey}/tiles.pmtiles`, {
           range: { offset, length },
         });
         return { key, resp };

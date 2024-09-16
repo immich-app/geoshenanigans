@@ -16,7 +16,7 @@ describe('integration tests', () => {
           throw new Error('File body is undefined');
         }
         const body = file.body as ReadableStream;
-        await bucket.put(env.PMTILES_FILE_NAME, body);
+        await bucket.put(`${env.DEPLOYMENT_KEY}/tiles.pmtiles`, body);
         console.log('File uploaded');
       }
     }, 30000);

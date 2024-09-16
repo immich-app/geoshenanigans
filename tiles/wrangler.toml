@@ -40,5 +40,5 @@ preview_bucket_name = "tiles-apac"
 
 # Define environment variables for your Workers script
 [vars]
-PMTILES_FILE_NAME = "v1.pmtiles"
+DEPLOYMENT_KEY = "20240812"
 ENVIRONMENT = "production"

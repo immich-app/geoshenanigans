@@ -38,7 +38,7 @@ type PMTilesJsonParams = PMTilesParams & {
 };
 
 enum Header {
-  PMTILES_FILE_IDENTIFIER = 'PMTiles-File-Identifier',
+  PMTILES_DEPLOYMENT_KEY = 'PMTiles-Deployment-Key',
   CACHE_CONTROL = 'Cache-Control',
   ACCESS_CONTROL_ALLOW_ORIGIN = 'Access-Control-Allow-Origin',
   VARY = 'Vary',
@@ -102,7 +102,7 @@ async function handleRequest(
   const cached = await metrics.monitorAsyncFunction({ name: 'match_request_from_cdn' }, (url) => cache.match(url))(
     request.url,
   );
-  if (cached && cached.headers.get(Header.PMTILES_FILE_IDENTIFIER) === env.PMTILES_FILE_NAME) {
+  if (cached && cached.headers.get(Header.PMTILES_DEPLOYMENT_KEY) === env.DEPLOYMENT_KEY) {
     const cacheHeaders = new Headers(cached.headers);
     const encodeBody = cacheHeaders.has('content-encoding') ? 'manual' : 'automatic';
     return new Response(cached.body, {
@@ -132,7 +132,7 @@ async function handleRequest(
     Object.entries(bucketMap).filter(([key]) => buckets.includes(key as R2BucketRegion)),
   );
 
-  const storageRepository = new R2StorageRepository(filteredBucketMap, env.PMTILES_FILE_NAME, metrics);
+  const storageRepository = new R2StorageRepository(filteredBucketMap, env.DEPLOYMENT_KEY, metrics);
   const pmTilesService = await metrics.monitorAsyncFunction({ name: 'pmtiles_init' }, PMTilesService.init)(
     storageRepository,
     memCacheRepository,
@@ -144,7 +144,7 @@ async function handleRequest(
   respHeaders.set(Header.CACHE_CONTROL, `public, max-age=${60 * 60 * 24 * 31}`);
   respHeaders.set(Header.ACCESS_CONTROL_ALLOW_ORIGIN, '*');
   respHeaders.set(Header.VARY, 'Origin');
-  respHeaders.set(Header.PMTILES_FILE_IDENTIFIER, env.PMTILES_FILE_NAME);
+  respHeaders.set(Header.PMTILES_DEPLOYMENT_KEY, env.DEPLOYMENT_KEY);
 
   const pmTilesParams = parseUrl(request);
 
