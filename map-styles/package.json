@@ -1,5 +1,5 @@
 {
-  "name": "styles-gen",
+  "name": "immich-map-styles",
   "description": "Generate immich style variations from the protomaps styles",
   "main": "index.ts",
   "scripts": {

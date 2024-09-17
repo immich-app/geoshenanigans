@@ -9,7 +9,7 @@ on:
     branches: [ "main" ]
     paths:
       - ".github/workflows/tiles-file.yml"
-      - "styles-gen/**"
+      - "map-styles/**"
 
 concurrency:
   group: ${{ github.workflow }}
@@ -23,7 +23,7 @@ jobs:
         bucket_region: [ "wnam", "enam", "weur", "eeur", "apac" ]
     defaults:
       run:
-        working-directory: 'styles-gen'
+        working-directory: 'map-styles'
     runs-on: ubuntu-latest
     outputs:
       KEY: ${{ steps.latest_build.outputs.KEY }}
@@ -36,7 +36,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version-file: 'styles-gen/.nvmrc'
+          node-version-file: 'map-styles/.nvmrc'
 
       - name: Install dependencies
         run: npm ci
