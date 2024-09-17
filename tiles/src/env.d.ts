@@ -1,5 +1,5 @@
-interface WorkerEnv extends Omit<Env, 'ENVIRONMENT' | 'PMTILES_FILE_NAME'> {
+interface WorkerEnv extends Omit<Env, 'ENVIRONMENT' | 'DEPLOYMENT_KEY'> {
   ENVIRONMENT: string;
-  PMTILES_FILE_NAME: string;
+  DEPLOYMENT_KEY: string;
   VMETRICS_API_TOKEN: string;
 }

@@ -42,42 +42,53 @@ export class MemCacheRepository implements IMemCacheRepository {
 export class R2StorageRepository implements IStorageRepository {
   constructor(
     private buckets: { [key: string]: R2Bucket },
-    private fileName: string,
+    private deploymentKey: string,
     private metrics: IMetricsRepository,
   ) {}
 
-  getFileName(): string {
-    return this.fileName;
+  getDeploymentKey(): string {
+    return this.deploymentKey;
   }
 
-  private async getR2Object(range: { offset: number; length: number }) {
+  private async getR2Object(args: { key?: string; range?: { offset: number; length: number } }) {
+    const { key, range } = args;
+    const fileName = key ?? 'tiles.pmtiles';
+    const filePath = `${this.deploymentKey}/${fileName}`;
     const metric = Metric.create('r2_storage_get');
-    const { offset, length } = range;
     const { key: bucketKey, resp } = await Promise.race(
       Object.entries(this.buckets).map(async ([key, bucket]) => {
-        const resp = await bucket.get(this.fileName, {
-          range: { offset, length },
+        const resp = await bucket.get(filePath, {
+          range,
         });
         return { key, resp };
       }),
     );
     metric.durationField(`${bucketKey}_duration`);
     metric.addTag('bucket_key', bucketKey);
+    metric.addTag('file_name', fileName);
     metric.intField('count', 1);
     this.metrics.push(metric);
 
     if (!resp) {
-      throw new Error('Archive not found');
+      throw new Error(`Key not found ${filePath}`);
     }
     return resp;
   }
 
-  async get(range: { offset: number; length: number }): Promise<ArrayBuffer> {
-    return (await this.getR2Object(range)).arrayBuffer();
+  async getRange(range: { offset: number; length: number }): Promise<ArrayBuffer> {
+    return (await this.getR2Object({ range })).arrayBuffer();
   }
 
-  async getAsStream(range: { offset: number; length: number }): Promise<ReadableStream> {
-    return (await this.getR2Object(range)).body;
+  async getRangeAsStream(range: { offset: number; length: number }): Promise<ReadableStream> {
+    return (await this.getR2Object({ range })).body;
+  }
+
+  async get(key: string): Promise<ArrayBuffer> {
+    return (await this.getR2Object({ key })).arrayBuffer();
+  }
+
+  async getAsStream(key: string): Promise<ReadableStream> {
+    return (await this.getR2Object({ key })).body;
   }
 }
 
@@ -85,14 +96,15 @@ export class S3StorageRepository implements IStorageRepository {
   constructor(
     private client: S3Client,
     private bucketKey: string,
-    private fileName: string,
+    private deploymentKey: string,
   ) {}
 
-  private async getS3Object(range: { offset: number; length: number }) {
+  private async getS3Object(args: { key?: string; range?: { offset: number; length: number } }) {
+    const { range } = args;
     const command = new GetObjectCommand({
       Bucket: this.bucketKey,
-      Key: this.fileName,
-      Range: `bytes=${range.offset}-${range.offset + range.length - 1}`,
+      Key: this.deploymentKey + '/' + (args.key ?? 'tiles.pmtiles'),
+      Range: range ? `bytes=${range.offset}-${range.offset + range.length - 1}` : undefined,
     });
     const response = await this.client.send(command);
     const data = response.Body;
@@ -102,18 +114,28 @@ export class S3StorageRepository implements IStorageRepository {
     return data;
   }
 
-  async get(range: { length: number; offset: number }): Promise<ArrayBuffer> {
-    const data = await this.getS3Object(range);
+  async getRange(range: { length: number; offset: number }): Promise<ArrayBuffer> {
+    const data = await this.getS3Object({ range });
     return (await data.transformToByteArray()).buffer;
   }
 
-  async getAsStream(range: { length: number; offset: number }): Promise<ReadableStream> {
-    const data = await this.getS3Object(range);
+  async getRangeAsStream(range: { length: number; offset: number }): Promise<ReadableStream> {
+    const data = await this.getS3Object({ range });
     return data.transformToWebStream();
   }
 
-  getFileName(): string {
-    return this.fileName;
+  async get(key: string): Promise<ArrayBuffer> {
+    const data = await this.getS3Object({ key });
+    return (await data.transformToByteArray()).buffer;
+  }
+
+  async getAsStream(key: string): Promise<ReadableStream> {
+    const data = await this.getS3Object({ key });
+    return data.transformToWebStream();
+  }
+
+  getDeploymentKey(): string {
+    return this.deploymentKey;
   }
 }
 

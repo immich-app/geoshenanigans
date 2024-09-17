@@ -1,0 +1,15 @@
+{
+  "name": "immich-map-styles",
+  "description": "Generate immich style variations from the protomaps styles",
+  "main": "index.ts",
+  "scripts": {
+    "generate": "tsx src/index.ts"
+  },
+  "author": "The Protomaps Authors",
+  "license": "BSD-3-Clause",
+  "homepage": "https://github.com/protomaps/basemaps",
+  "devDependencies": {
+    "tsx": "^4.7.2",
+    "@types/node": "^20.16.5"
+  }
+}

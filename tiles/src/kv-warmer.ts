@@ -43,7 +43,7 @@ export function decompress(buf: ArrayBuffer, compression: Compression): ArrayBuf
 }
 
 const getDirectory = async (length: number, offset: number, source: IStorageRepository, header: Header) => {
-  const resp = await source.get({ offset, length });
+  const resp = await source.getRange({ offset, length });
   const data = decompress(resp, header.internalCompression);
   const entries = deserializeIndex(await new Response(data).arrayBuffer());
   if (entries.length === 0) {
@@ -62,7 +62,7 @@ const handler = async () => {
     CLOUDFLARE_ACCOUNT_ID,
     KV_NAMESPACE_ID,
     BUCKET_KEY,
-    FILE_NAME,
+    DEPLOYMENT_KEY,
   } = process.env;
   if (
     !S3_ACCESS_KEY ||
@@ -72,7 +72,7 @@ const handler = async () => {
     !CLOUDFLARE_ACCOUNT_ID ||
     !KV_NAMESPACE_ID ||
     !BUCKET_KEY ||
-    !FILE_NAME
+    !DEPLOYMENT_KEY
   ) {
     throw new Error('Missing environment variables');
   }
@@ -87,7 +87,7 @@ const handler = async () => {
     },
   });
 
-  const storageRepository = new S3StorageRepository(client, BUCKET_KEY, FILE_NAME);
+  const storageRepository = new S3StorageRepository(client, BUCKET_KEY, DEPLOYMENT_KEY);
   const memCacheRepository = new MemCacheRepository(new Map());
   const kvRepository = new FakeKVRepository();
   const metricsRepository = new FakeMetricsRepository();
@@ -99,7 +99,7 @@ const handler = async () => {
   );
 
   console.log('Checking if already warmed');
-  const kvCheckKey = encodeURIComponent(`${FILE_NAME}|kv-warmed`);
+  const kvCheckKey = encodeURIComponent(`${DEPLOYMENT_KEY}|kv-warmed`);
   console.log(kvCheckKey);
   console.log(
     'url',
@@ -189,7 +189,7 @@ const handler = async () => {
         header,
       );
       const stream = DirectoryStream.fromDirectory(directory);
-      const cacheKey = getDirectoryCacheKey(FILE_NAME, {
+      const cacheKey = getDirectoryCacheKey(DEPLOYMENT_KEY, {
         offset: entry.offset + header.leafDirectoryOffset,
         length: entry.length,
       });
@@ -237,4 +237,7 @@ process.on('uncaughtException', (e) => {
 
 handler()
   .then(() => console.log('Done'))
-  .catch((e) => console.error(e));
+  .catch((e) => {
+    console.error('Error', e);
+    throw e;
+  });

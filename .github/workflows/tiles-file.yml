@@ -9,6 +9,7 @@ on:
     branches: [ "main" ]
     paths:
       - ".github/workflows/tiles-file.yml"
+      - "map-styles/**"
 
 concurrency:
   group: ${{ github.workflow }}
@@ -16,14 +17,33 @@ concurrency:
 
 jobs:
   deploy_tiles:
-    name: Deploy Tiles
+    name: Deploy Tiles & Styles
     strategy:
       matrix:
         bucket_region: [ "wnam", "enam", "weur", "eeur", "apac" ]
+    defaults:
+      run:
+        working-directory: 'map-styles'
     runs-on: ubuntu-latest
     outputs:
       KEY: ${{ steps.latest_build.outputs.KEY }}
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: 'map-styles/.nvmrc'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate styles
+        run: npm run generate
+
       - name: Find latest pmtiles build
         id: latest_build
         env:
@@ -34,6 +54,7 @@ jobs:
           else
             build=$FILE_NAME
           fi
+          export build=${build%.pmtiles}
           echo "KEY=$build"
           echo "KEY=$build" >> $GITHUB_OUTPUT
 
@@ -53,8 +74,11 @@ jobs:
             type = http
             url = https://build.protomaps.com/
 
+      - name: Copy latest styles to R2
+        run: rclone --progress copy ./dist/ r2:/tiles-${{ matrix.bucket_region }}/${{ steps.latest_build.outputs.KEY }}/styles/ --s3-no-check-bucket --s3-chunk-size=64M --multi-thread-streams=50 --checkers=512
+
       - name: Copy latest tiles to R2
-        run: rclone --progress copyto pmtiles:/${{ steps.latest_build.outputs.KEY }} r2:/tiles-${{ matrix.bucket_region }}/${{ steps.latest_build.outputs.KEY }} --s3-no-check-bucket --s3-chunk-size=64M --multi-thread-streams=50 --checkers=512
+        run: rclone --progress copyto pmtiles:/${{ steps.latest_build.outputs.KEY }}.pmtiles r2:/tiles-${{ matrix.bucket_region }}/${{ steps.latest_build.outputs.KEY }}/tiles.pmtiles --s3-no-check-bucket --s3-chunk-size=64M --multi-thread-streams=50 --checkers=512
   update_tile_ref:
     name: Update tile server file reference
     needs: [deploy_tiles]
@@ -74,7 +98,7 @@ jobs:
 
       - name: Update deployment file name
         run: |
-          sed -i -E 's/"pmtiles_file_name": "(.*)"/"pmtiles_file_name": "${{ needs.deploy_tiles.outputs.KEY }}"/' deployment/modules/cloudflare/tiles-worker/tiles.tfvars.json
+          sed -i -E 's/"pmtiles_deployment_key": "(.*)"/"pmtiles_deployment_key": "${{ needs.deploy_tiles.outputs.KEY }}"/' deployment/modules/cloudflare/tiles-worker/tiles.tfvars.json
 
       - name: Push updated tiles.tfvars to repo
         uses: EndBug/add-and-commit@v9

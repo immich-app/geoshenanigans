@@ -9,8 +9,8 @@ resource "cloudflare_workers_script" "tiles" {
   module     = true
 
   plain_text_binding {
-    name = "PMTILES_FILE_NAME"
-    text = var.pmtiles_file_name
+    name = "DEPLOYMENT_KEY"
+    text = var.pmtiles_deployment_key
   }
 
   plain_text_binding {

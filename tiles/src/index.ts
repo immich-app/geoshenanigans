@@ -17,11 +17,18 @@ declare global {
 }
 /* eslint-enable no-var */
 
-const URL_MATCHER = /^\/v(?<VERSION>[0-9]+)((?=)|(?<JSON>\.json)|\/(?<Z>\d+)\/(?<X>\d+)\/(?<Y>\d+).mvt)$/;
+const URL_MATCHER =
+  /^\/v(?<VERSION>[0-9]+)((?=)|\/style\/(?<STYLE>\w+)(?:\.json)?|(?<JSON>\.json)|\/(?<Z>\d+)\/(?<X>\d+)\/(?<Y>\d+).mvt)$/;
 
 type PMTilesParams = {
-  requestType: 'tile' | 'json' | undefined;
+  requestType: 'tile' | 'json' | 'style' | undefined;
   url: URL;
+};
+
+type PMTilesStyleParams = PMTilesParams & {
+  requestType: 'style';
+  version: string;
+  style: string;
 };
 
 type PMTilesTileParams = PMTilesParams & {
@@ -38,7 +45,7 @@ type PMTilesJsonParams = PMTilesParams & {
 };
 
 enum Header {
-  PMTILES_FILE_IDENTIFIER = 'PMTiles-File-Identifier',
+  PMTILES_DEPLOYMENT_KEY = 'PMTiles-Deployment-Key',
   CACHE_CONTROL = 'Cache-Control',
   ACCESS_CONTROL_ALLOW_ORIGIN = 'Access-Control-Allow-Origin',
   VARY = 'Vary',
@@ -51,11 +58,14 @@ export function parseUrl(request: Request): PMTilesParams {
   const url = new URL(request.url);
   const matches = URL_MATCHER.exec(url.pathname);
   const version = matches?.groups?.VERSION;
+  const style = matches?.groups?.STYLE;
   const z = matches?.groups?.Z;
   const x = matches?.groups?.X;
   const y = matches?.groups?.Y;
   if (version && z && x && y) {
     return { requestType: 'tile', version, z, x, y, url } as PMTilesTileParams;
+  } else if (style) {
+    return { requestType: 'style', style, url } as PMTilesStyleParams;
   } else if (version) {
     return { requestType: 'json', version, url } as PMTilesJsonParams;
   }
@@ -94,6 +104,16 @@ async function handleRequest(
     return cacheResponse(new Response(JSON.stringify(tileJson), { headers: respHeaders, status: 200 }));
   }
 
+  async function handleStyleRequest(respHeaders: Headers) {
+    const { style } = pmTilesParams as PMTilesStyleParams;
+    const styleJson = await storageRepository.getAsStream('styles/' + style + '.json');
+    if (!styleJson) {
+      return cacheResponse(new Response('Style not found', { status: 404 }));
+    }
+    respHeaders.set(Header.CONTENT_TYPE, 'application/json');
+    return cacheResponse(new Response(styleJson, { headers: respHeaders, status: 200 }));
+  }
+
   if (request.method.toUpperCase() !== 'GET') {
     return new Response(undefined, { status: 405 });
   }
@@ -102,7 +122,7 @@ async function handleRequest(
   const cached = await metrics.monitorAsyncFunction({ name: 'match_request_from_cdn' }, (url) => cache.match(url))(
     request.url,
   );
-  if (cached && cached.headers.get(Header.PMTILES_FILE_IDENTIFIER) === env.PMTILES_FILE_NAME) {
+  if (cached && cached.headers.get(Header.PMTILES_DEPLOYMENT_KEY) === env.DEPLOYMENT_KEY) {
     const cacheHeaders = new Headers(cached.headers);
     const encodeBody = cacheHeaders.has('content-encoding') ? 'manual' : 'automatic';
     return new Response(cached.body, {
@@ -132,7 +152,7 @@ async function handleRequest(
     Object.entries(bucketMap).filter(([key]) => buckets.includes(key as R2BucketRegion)),
   );
 
-  const storageRepository = new R2StorageRepository(filteredBucketMap, env.PMTILES_FILE_NAME, metrics);
+  const storageRepository = new R2StorageRepository(filteredBucketMap, env.DEPLOYMENT_KEY, metrics);
   const pmTilesService = await metrics.monitorAsyncFunction({ name: 'pmtiles_init' }, PMTilesService.init)(
     storageRepository,
     memCacheRepository,
@@ -144,7 +164,7 @@ async function handleRequest(
   respHeaders.set(Header.CACHE_CONTROL, `public, max-age=${60 * 60 * 24 * 31}`);
   respHeaders.set(Header.ACCESS_CONTROL_ALLOW_ORIGIN, '*');
   respHeaders.set(Header.VARY, 'Origin');
-  respHeaders.set(Header.PMTILES_FILE_IDENTIFIER, env.PMTILES_FILE_NAME);
+  respHeaders.set(Header.PMTILES_DEPLOYMENT_KEY, env.DEPLOYMENT_KEY);
 
   const pmTilesParams = parseUrl(request);
 
@@ -162,6 +182,15 @@ async function handleRequest(
       return await metrics.monitorAsyncFunction(
         { name: 'json_request', tags: { version } },
         handleJsonRequest,
+      )(respHeaders);
+    }
+
+    if (pmTilesParams.requestType === 'style') {
+      const { style } = pmTilesParams as PMTilesStyleParams;
+      console.log('style');
+      return await metrics.monitorAsyncFunction(
+        { name: 'style_request', tags: { style } },
+        handleStyleRequest,
       )(respHeaders);
     }
   } catch (e) {

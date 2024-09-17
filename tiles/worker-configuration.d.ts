@@ -3,7 +3,7 @@
 
 interface Env {
 	KV: KVNamespace;
-	PMTILES_FILE_NAME: "v1.pmtiles";
+	DEPLOYMENT_KEY: "20240812";
 	ENVIRONMENT: "prod";
 	BUCKET_WNAM: R2Bucket;
 	BUCKET_ENAM: R2Bucket;
