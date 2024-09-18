@@ -18,7 +18,7 @@
     "kv:warm": "node --import=tsx src/kv-warmer.ts"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.4.5",
+    "@cloudflare/vitest-pool-workers": "^0.5.0",
     "@cloudflare/workers-types": "^4.20240729.0",
     "@types/express": "^4.17.21",
     "@typescript-eslint/eslint-plugin": "^7.0.0",
