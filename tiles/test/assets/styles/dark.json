@@ -3,7 +3,7 @@
   "name": "Immich Map",
   "id": "immich-map-dark",
   "sources": {
-    "protomaps": {
+    "vector": {
       "type": "vector",
       "url": "https://tiles.immich.cloud/v1.json"
     }
@@ -19,7 +19,7 @@
     {
       "id": "earth",
       "type": "fill",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "earth",
       "paint": {
         "fill-color": "#141414"
@@ -28,7 +28,7 @@
     {
       "id": "landuse_park",
       "type": "fill",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "landuse",
       "filter": [
         "any",
@@ -63,7 +63,7 @@
     {
       "id": "landuse_urban_green",
       "type": "fill",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "landuse",
       "filter": [
         "any",
@@ -83,7 +83,7 @@
     {
       "id": "landuse_hospital",
       "type": "fill",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "landuse",
       "filter": [
         "any",
@@ -100,7 +100,7 @@
     {
       "id": "landuse_industrial",
       "type": "fill",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "landuse",
       "filter": [
         "any",
@@ -117,7 +117,7 @@
     {
       "id": "landuse_school",
       "type": "fill",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "landuse",
       "filter": [
         "any",
@@ -136,7 +136,7 @@
     {
       "id": "landuse_beach",
       "type": "fill",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "landuse",
       "filter": [
         "any",
@@ -153,7 +153,7 @@
     {
       "id": "landuse_zoo",
       "type": "fill",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "landuse",
       "filter": [
         "any",
@@ -170,7 +170,7 @@
     {
       "id": "landuse_military",
       "type": "fill",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "landuse",
       "filter": [
         "any",
@@ -189,7 +189,7 @@
     {
       "id": "natural_wood",
       "type": "fill",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "natural",
       "filter": [
         "any",
@@ -220,7 +220,7 @@
     {
       "id": "natural_scrub",
       "type": "fill",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "natural",
       "filter": [
         "in",
@@ -248,7 +248,7 @@
     {
       "id": "natural_glacier",
       "type": "fill",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "natural",
       "filter": [
         "==",
@@ -262,7 +262,7 @@
     {
       "id": "natural_sand",
       "type": "fill",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "natural",
       "filter": [
         "==",
@@ -276,7 +276,7 @@
     {
       "id": "landuse_aerodrome",
       "type": "fill",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "landuse",
       "filter": [
         "any",
@@ -293,7 +293,7 @@
     {
       "id": "transit_runway",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "transit",
       "filter": [
         "any",
@@ -326,7 +326,7 @@
     {
       "id": "transit_taxiway",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "transit",
       "minzoom": 13,
       "filter": [
@@ -360,7 +360,7 @@
     {
       "id": "water",
       "type": "fill",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "water",
       "paint": {
         "fill-color": "#333333"
@@ -369,7 +369,7 @@
     {
       "id": "physical_line_stream",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "physical_line",
       "minzoom": 14,
       "filter": [
@@ -388,7 +388,7 @@
     {
       "id": "physical_line_river",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "physical_line",
       "minzoom": 9,
       "filter": [
@@ -422,7 +422,7 @@
     {
       "id": "landuse_pedestrian",
       "type": "fill",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "landuse",
       "filter": [
         "any",
@@ -439,7 +439,7 @@
     {
       "id": "landuse_pier",
       "type": "fill",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "landuse",
       "filter": [
         "any",
@@ -456,7 +456,7 @@
     {
       "id": "roads_tunnels_other_casing",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "filter": [
         "all",
@@ -493,7 +493,7 @@
     {
       "id": "roads_tunnels_minor_casing",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "filter": [
         "all",
@@ -551,7 +551,7 @@
     {
       "id": "roads_tunnels_link_casing",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "filter": [
         "all",
@@ -607,7 +607,7 @@
     {
       "id": "roads_tunnels_medium_casing",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "filter": [
         "all",
@@ -663,7 +663,7 @@
     {
       "id": "roads_tunnels_major_casing",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "filter": [
         "all",
@@ -719,7 +719,7 @@
     {
       "id": "roads_tunnels_highway_casing",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "filter": [
         "all",
@@ -782,7 +782,7 @@
     {
       "id": "roads_tunnels_other",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "filter": [
         "all",
@@ -823,7 +823,7 @@
     {
       "id": "roads_tunnels_minor",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "filter": [
         "all",
@@ -863,7 +863,7 @@
     {
       "id": "roads_tunnels_link",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "filter": [
         "all",
@@ -901,7 +901,7 @@
     {
       "id": "roads_tunnels_medium",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "filter": [
         "all",
@@ -941,7 +941,7 @@
     {
       "id": "roads_tunnels_major",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "filter": [
         "all",
@@ -981,7 +981,7 @@
     {
       "id": "roads_tunnels_highway",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "filter": [
         "all",
@@ -1028,7 +1028,7 @@
     {
       "id": "buildings",
       "type": "fill",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "buildings",
       "paint": {
         "fill-color": "#0a0a0a",
@@ -1038,7 +1038,7 @@
     {
       "id": "transit_pier",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "transit",
       "filter": [
         "any",
@@ -1071,7 +1071,7 @@
     {
       "id": "roads_minor_service_casing",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "minzoom": 13,
       "filter": [
@@ -1127,7 +1127,7 @@
     {
       "id": "roads_minor_casing",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "filter": [
         "all",
@@ -1186,7 +1186,7 @@
     {
       "id": "roads_link_casing",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "minzoom": 13,
       "filter": [
@@ -1234,7 +1234,7 @@
     {
       "id": "roads_medium_casing",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "filter": [
         "all",
@@ -1288,7 +1288,7 @@
     {
       "id": "roads_major_casing_late",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "minzoom": 12,
       "filter": [
@@ -1343,7 +1343,7 @@
     {
       "id": "roads_highway_casing_late",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "minzoom": 12,
       "filter": [
@@ -1403,7 +1403,7 @@
     {
       "id": "roads_other",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "filter": [
         "all",
@@ -1444,7 +1444,7 @@
     {
       "id": "roads_link",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "filter": [
         "all",
@@ -1477,7 +1477,7 @@
     {
       "id": "roads_minor_service",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "filter": [
         "all",
@@ -1518,7 +1518,7 @@
     {
       "id": "roads_minor",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "filter": [
         "all",
@@ -1576,7 +1576,7 @@
     {
       "id": "roads_medium",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "filter": [
         "all",
@@ -1616,7 +1616,7 @@
     {
       "id": "roads_major_casing_early",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "maxzoom": 12,
       "filter": [
@@ -1669,7 +1669,7 @@
     {
       "id": "roads_major",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "filter": [
         "all",
@@ -1709,7 +1709,7 @@
     {
       "id": "roads_highway_casing_early",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "maxzoom": 12,
       "filter": [
@@ -1767,7 +1767,7 @@
     {
       "id": "roads_highway",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "filter": [
         "all",
@@ -1814,7 +1814,7 @@
     {
       "id": "transit_railway",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "transit",
       "filter": [
         "all",
@@ -1852,7 +1852,7 @@
     {
       "id": "boundaries_country",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "boundaries",
       "filter": [
         "<=",
@@ -1871,7 +1871,7 @@
     {
       "id": "boundaries",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "boundaries",
       "filter": [
         ">",
@@ -1890,7 +1890,7 @@
     {
       "id": "roads_bridges_other_casing",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "minzoom": 12,
       "filter": [
@@ -1928,7 +1928,7 @@
     {
       "id": "roads_bridges_link_casing",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "minzoom": 12,
       "filter": [
@@ -1981,7 +1981,7 @@
     {
       "id": "roads_bridges_minor_casing",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "minzoom": 12,
       "filter": [
@@ -2036,7 +2036,7 @@
     {
       "id": "roads_bridges_medium_casing",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "minzoom": 12,
       "filter": [
@@ -2091,7 +2091,7 @@
     {
       "id": "roads_bridges_major_casing",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "minzoom": 12,
       "filter": [
@@ -2144,7 +2144,7 @@
     {
       "id": "roads_bridges_other",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "minzoom": 12,
       "filter": [
@@ -2186,7 +2186,7 @@
     {
       "id": "roads_bridges_minor",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "minzoom": 12,
       "filter": [
@@ -2227,7 +2227,7 @@
     {
       "id": "roads_bridges_link",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "minzoom": 12,
       "filter": [
@@ -2266,7 +2266,7 @@
     {
       "id": "roads_bridges_medium",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "minzoom": 12,
       "filter": [
@@ -2307,7 +2307,7 @@
     {
       "id": "roads_bridges_major",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "minzoom": 12,
       "filter": [
@@ -2348,7 +2348,7 @@
     {
       "id": "roads_bridges_highway_casing",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "minzoom": 12,
       "filter": [
@@ -2408,7 +2408,7 @@
     {
       "id": "roads_bridges_highway",
       "type": "line",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "filter": [
         "all",
@@ -2455,7 +2455,7 @@
     {
       "id": "physical_line_waterway_label",
       "type": "symbol",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "physical_line",
       "minzoom": 13,
       "filter": [
@@ -2486,7 +2486,7 @@
     {
       "id": "physical_point_peak",
       "type": "symbol",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "physical_point",
       "filter": [
         "any",
@@ -2528,7 +2528,7 @@
     {
       "id": "roads_labels_minor",
       "type": "symbol",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "minzoom": 15,
       "filter": [
@@ -2565,7 +2565,7 @@
     {
       "id": "physical_point_ocean",
       "type": "symbol",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "physical_point",
       "filter": [
         "any",
@@ -2613,7 +2613,7 @@
     {
       "id": "physical_point_lakes",
       "type": "symbol",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "physical_point",
       "filter": [
         "any",
@@ -2657,7 +2657,7 @@
     {
       "id": "roads_labels_major",
       "type": "symbol",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "roads",
       "minzoom": 11,
       "filter": [
@@ -2694,7 +2694,7 @@
     {
       "id": "places_subplace",
       "type": "symbol",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "places",
       "filter": [
         "==",
@@ -2756,7 +2756,7 @@
     {
       "id": "places_locality",
       "type": "symbol",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "places",
       "filter": [
         "==",
@@ -2999,7 +2999,7 @@
     {
       "id": "places_region",
       "type": "symbol",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "places",
       "filter": [
         "==",
@@ -3055,7 +3055,7 @@
     {
       "id": "places_country",
       "type": "symbol",
-      "source": "protomaps",
+      "source": "vector",
       "source-layer": "places",
       "filter": [
         "==",

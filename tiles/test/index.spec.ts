@@ -27,9 +27,11 @@ describe('integration tests', () => {
       const response = await SELF.fetch('https://example.com/v1');
       await expect(JSON.stringify(await response.json(), null, 2)).toMatchFileSnapshot('./__snapshots__/v1.json');
     });
-    it('response with correct style', async () => {
+    it('responds with correct style json amended with current URL', async () => {
       const response = await SELF.fetch('https://example.com/v1/style/dark');
-      await expect(JSON.stringify(await response.json(), null, 2)).toMatchFileSnapshot('./assets/styles/dark.json');
+      await expect(JSON.stringify(await response.json(), null, 2)).toMatchFileSnapshot(
+        './__snapshots__/styles/dark.json',
+      );
     });
     it('responds with correct tile', async () => {
       const response = await SELF.fetch('https://example.com/v1/0/0/0.mvt');
@@ -86,12 +88,13 @@ describe('parseUrl', () => {
     ${'http://example.com/v2/style/light'}      | ${'light'} | ${'2'}
     ${'http://example.com/v2/style/dark.json'}  | ${'dark'}  | ${'2'}
     ${'http://example.com/v1/style/light.json'} | ${'light'} | ${'1'}
-  `('style endpoint $url returns style $style', ({ url, style }) => {
+  `('style endpoint $url returns style $style', ({ url, style, version }) => {
     const result = parseUrl(new Request(url));
     expect(result).toStrictEqual({
       requestType: 'style',
       style,
       url: new URL(url),
+      version,
     });
   });
 
