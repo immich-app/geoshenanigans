@@ -4,7 +4,7 @@ import path from 'path';
 import { layersWithCustomTheme } from '../../submodules/basemaps/styles/src';
 
 const generateLayers = (themeName: string) => {
-  const sourceName = 'protomaps'
+  const sourceName = 'vector'
   const theme = themes[themeName];
   const layers = layersWithCustomTheme(sourceName, theme);
   const style = {

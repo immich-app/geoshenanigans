@@ -44,6 +44,16 @@ type PMTilesJsonParams = PMTilesParams & {
   version: string;
 };
 
+type StyleJson = {
+  version: number;
+  name: string;
+  id: string;
+  sources: Record<string, { type: string; url: string }>;
+  layers: unknown[];
+  sprite: string;
+  glyphs: string;
+};
+
 enum Header {
   PMTILES_DEPLOYMENT_KEY = 'PMTiles-Deployment-Key',
   CACHE_CONTROL = 'Cache-Control',
@@ -65,7 +75,7 @@ export function parseUrl(request: Request): PMTilesParams {
   if (version && z && x && y) {
     return { requestType: 'tile', version, z, x, y, url } as PMTilesTileParams;
   } else if (style) {
-    return { requestType: 'style', style, url } as PMTilesStyleParams;
+    return { requestType: 'style', style, url, version } as PMTilesStyleParams;
   } else if (version) {
     return { requestType: 'json', version, url } as PMTilesJsonParams;
   }
@@ -105,8 +115,17 @@ async function handleRequest(
   }
 
   async function handleStyleRequest(respHeaders: Headers) {
-    const { style } = pmTilesParams as PMTilesStyleParams;
-    const styleJson = await storageRepository.getAsStream('styles/' + style + '.json');
+    const { style, url, version } = pmTilesParams as PMTilesStyleParams;
+    let styleJson;
+    if (env.ENVIRONMENT !== 'prod') {
+      styleJson = (await new Response(
+        await storageRepository.getAsStream('styles/' + style + '.json'),
+      ).json()) as StyleJson;
+      styleJson.sources.vector.url = `${url.origin}/v${version}`;
+      styleJson = new Response(JSON.stringify(styleJson)).body;
+    } else {
+      styleJson = await storageRepository.getAsStream('styles/' + style + '.json');
+    }
     if (!styleJson) {
       return cacheResponse(new Response('Style not found', { status: 404 }));
     }
