@@ -6,7 +6,7 @@ import { layersWithCustomTheme } from '../../submodules/basemaps/styles/src';
 const generateLayers = (themeName: string) => {
   const sourceName = 'vector'
   const theme = themes[themeName];
-  const layers = layersWithCustomTheme(sourceName, theme);
+  const layers = layersWithCustomTheme(sourceName, theme, "en");
   const style = {
     version: 8,
     "name": "Immich Map",
