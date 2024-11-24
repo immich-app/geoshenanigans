@@ -38,6 +38,11 @@ binding = "BUCKET_APAC"
 bucket_name = "tiles-apac"
 preview_bucket_name = "tiles-apac"
 
+[[r2_buckets]]
+binding = "BUCKET_OC"
+bucket_name = "tiles-oc"
+preview_bucket_name = "tiles-oc"
+
 # Define environment variables for your Workers script
 [vars]
 DEPLOYMENT_KEY = "20240812"

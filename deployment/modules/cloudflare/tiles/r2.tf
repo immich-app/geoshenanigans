@@ -1,5 +1,5 @@
 locals {
-  r2_regions = ["WNAM", "ENAM", "WEUR", "EEUR", "APAC"]
+  r2_regions = ["WNAM", "ENAM", "WEUR", "EEUR", "APAC", "OC"]
 }
 
 resource "cloudflare_r2_bucket" "tiles" {
