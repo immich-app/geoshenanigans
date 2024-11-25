@@ -6,17 +6,13 @@ terraform {
   }
 }
 
-include "cloudflare" {
-  path = find_in_parent_folders("cloudflare.hcl")
-}
-
 include "root" {
   path = find_in_parent_folders("root.hcl")
 }
 
 locals {
-  tiles_build_dir    = get_env("TILES_BUILD_DIR")
-  vmetrics_api_token = get_env("VMETRICS_API_TOKEN")
+  tiles_build_dir    = get_env("TF_VAR_tiles_build_dir")
+  vmetrics_api_token = get_env("TF_VAR_vmetrics_api_token")
 }
 
 inputs = {

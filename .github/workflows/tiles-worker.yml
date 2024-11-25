@@ -89,33 +89,34 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: ./deployment/cloudflare/tiles
+        working-directory: deployment
     steps:
       - name: 'Checkout'
         uses: actions/checkout@main
 
-      - name: Check Formatting
-        uses: gruntwork-io/terragrunt-action@v2
-        with:
-          tofu_version: ${{ env.tofu_version }}
-          tg_version: ${{ env.tg_version }}
-          tg_dir: ${{ env.working_dir }}
-          tg_command: 'hclfmt --terragrunt-check --terragrunt-diff'
+      - name: Install 1Password CLI
+        uses: 1password/install-cli-action@v1
 
-      - name: Check terraform fmt
-        uses: gruntwork-io/terragrunt-action@v2
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          TILES_BUILD_DIR: dist
-          VMETRICS_API_TOKEN: ${{ secrets.VMETRICS_API_TOKEN }}
-          TF_STATE_POSTGRES_CONN_STR: ${{ secrets.TF_STATE_POSTGRES_CONN_STR }}
-          ENVIRONMENT: dev
+      - name: Install Terragrunt
+        uses: eLco/setup-terragrunt@v1
+        with:
+          terragrunt_version: ${{ env.tg_version }}
+
+      - name: 'Install OpenTofu'
+        uses: opentofu/setup-opentofu@v1
         with:
           tofu_version: ${{ env.tofu_version }}
-          tg_version: ${{ env.tg_version }}
-          tg_dir: ${{ env.working_dir }}
-          tg_command: 'run-all fmt -diff -check'
+          tofu_wrapper: false
+
+      - name: Check Formatting
+        run: terragrunt hclfmt --terragrunt-check --terragrunt-diff
+
+      - name: Check TF fmt
+        env:
+          ENVIRONMENT: dev
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ matrix.environment == 'prod' && secrets.OP_TF_PROD_ENV || secrets.OP_TF_DEV_ENV }}
+          TF_VAR_tiles_build_dir: "${{ github.workspace }}/dist"
+        run: op run --env-file=".env" -- terragrunt run-all fmt -diff -check
 
   plan-terragrunt:
     needs: build
@@ -135,6 +136,9 @@ jobs:
         with:
           terragrunt_version: ${{ env.tg_version }}
 
+      - name: Install 1Password CLI
+        uses: 1password/install-cli-action@v1
+
       - name: 'Install OpenTofu'
         uses: opentofu/setup-opentofu@v1
         with:
@@ -148,15 +152,12 @@ jobs:
           path: "${{ github.workspace }}/dist"
 
       - name: Plan All
-        working-directory: ${{ env.working_dir }}
+        working-directory: ${{ github.workspace }}/deployment
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          VMETRICS_API_TOKEN: ${{ secrets.VMETRICS_API_TOKEN }}
-          TILES_BUILD_DIR: ${{ github.workspace }}/dist
-          TF_STATE_POSTGRES_CONN_STR: ${{ secrets.TF_STATE_POSTGRES_CONN_STR }}
           ENVIRONMENT: ${{ matrix.environment }}
-        run: terragrunt run-all plan -no-color 2>&1 | tee "${{github.workspace}}/plan_output.txt" && exit ${PIPESTATUS[0]};
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ matrix.environment == 'prod' && secrets.OP_TF_PROD_ENV || secrets.OP_TF_DEV_ENV }}
+          TF_VAR_tiles_build_dir: "${{ github.workspace }}/dist"
+        run: op run --env-file=".env" -- terragrunt run-all plan -no-color 2>&1 | tee "${{github.workspace}}/plan_output.txt" && exit ${PIPESTATUS[0]};
 
   kv-warming:
     needs: [build, test]
@@ -205,6 +206,9 @@ jobs:
       - name: 'Checkout'
         uses: actions/checkout@main
 
+      - name: Install 1Password CLI
+        uses: 1password/install-cli-action@v1
+
       - name: Install Terragrunt
         uses: eLco/setup-terragrunt@v1
         with:
@@ -223,11 +227,8 @@ jobs:
           path: "${{ github.workspace }}/dist"
 
       - name: Deploy All
-        working-directory: ${{ env.working_dir }}
+        working-directory: ${{ github.workspace }}/deployment
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          VMETRICS_API_TOKEN: ${{ secrets.VMETRICS_API_TOKEN }}
-          TILES_BUILD_DIR: "${{ github.workspace }}/dist"
-          TF_STATE_POSTGRES_CONN_STR: ${{ secrets.TF_STATE_POSTGRES_CONN_STR }}
-        run: terragrunt run-all apply --terragrunt-non-interactive
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ github.ref == 'refs/heads/main' && secrets.OP_TF_PROD_ENV || secrets.OP_TF_DEV_ENV }}
+          TF_VAR_tiles_build_dir: "${{ github.workspace }}/dist"
+        run: op run --env-file=".env" -- terragrunt run-all apply --terragrunt-non-interactive
