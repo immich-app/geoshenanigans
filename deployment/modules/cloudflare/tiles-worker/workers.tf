@@ -36,6 +36,14 @@ resource "cloudflare_workers_script" "tiles" {
     namespace_id = data.terraform_remote_state.tiles_state.outputs.kv_namespace_id
   }
 
+  dynamic "d1_database_binding" {
+    for_each = data.terraform_remote_state.tiles_state.outputs.d1_regional_databases
+    content {
+      name        = "D1_${d1_database_binding.key}"
+      database_id = d1_database_binding.value
+    }
+  }
+
   compatibility_date  = "2024-07-29"
   compatibility_flags = ["nodejs_compat"]
 }

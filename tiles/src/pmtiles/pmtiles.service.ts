@@ -1,108 +1,61 @@
-import { IKeyValueRepository, IMemCacheRepository, IMetricsRepository, IStorageRepository } from '../interface';
+import { IDatabaseRepository, IMemCacheRepository, IMetricsRepository, IStorageRepository } from '../interface';
 import { Directory, Entry, Header, Metadata } from './types';
 import {
   bytesToHeader,
   decompress,
   deserializeIndex,
-  findTile,
+  fromRadix64,
   getDirectoryCacheKey,
   getHeaderCacheKey,
   tileJSON,
+  toRadix64,
   zxyToTileId,
 } from './utils';
 
 const HEADER_SIZE_BYTES = 127;
 
-export class DirectoryStream {
-  private stream: ReadableStream<string>;
-  constructor(stream: ReadableStream) {
-    this.stream = stream.pipeThrough(new TextDecoderStream());
-  }
-  static fromDirectory(directory: Directory): DirectoryStream {
-    let index = 0;
-    const encoder = new TextEncoder();
-    const stream = new ReadableStream({
-      start(controller) {
-        controller.enqueue(encoder.encode(`${directory.tileIdStart}|${directory.offsetStart}:`));
-      },
-      pull(controller) {
-        const entry = directory.entries[index];
-        controller.enqueue(
-          encoder.encode(
-            `${entry.tileId - directory.tileIdStart}|${entry.offset - directory.offsetStart}|${entry.length}|${entry.runLength}:`,
-          ),
-        );
-        if (index === directory.entries.length - 1) {
-          controller.close();
-        }
-        index++;
-      },
-    });
-    return new DirectoryStream(stream);
+export class DirectoryString {
+  constructor(private entry: string) {}
+
+  static fromDirectory(directory: Directory): DirectoryString {
+    let entryString = `${toRadix64(directory.tileIdStart)}|${toRadix64(directory.offsetStart)}:`;
+    for (const entry of directory.entries) {
+      entryString += `${toRadix64(entry.tileId - directory.tileIdStart)}|${toRadix64(entry.offset - directory.offsetStart)}|${toRadix64(entry.length)}|${toRadix64(entry.runLength)}:`;
+    }
+    return new DirectoryString(entryString);
   }
 
-  async toString(): Promise<string> {
-    let buffer = '';
-    for await (const chunk of this.stream) {
-      buffer += chunk;
-    }
-    return buffer;
+  toString(): string {
+    return this.entry;
   }
 
   async findTile(searchedTileId: number): Promise<Entry | undefined> {
-    let buffer = '';
     let offsetStart: number | undefined;
     let tileIdStart: number | undefined;
 
-    try {
-      for await (const chunk of this.stream) {
-        buffer += chunk;
-        // console.log(buffer);
-        const lines = buffer.split(':');
-        // Last line is always incomplete or empty, save it for next time
-        buffer = lines.pop() ?? '';
-        for (const line of lines) {
-          const parts = line.split('|');
-          if (parts.length === 2) {
-            tileIdStart = parseInt(parts[0], 10);
-            offsetStart = parseInt(parts[1], 10);
-            continue;
-          }
-          if (tileIdStart === undefined || offsetStart === undefined) {
-            throw new Error('Invalid stream, we have no tileIdStart or offsetStart');
-          }
-          const tileId = parseInt(parts[0], 10) + tileIdStart;
-          const runLength = parseInt(parts[3], 10);
-
-          // Handle directories
-          if (runLength === 0) {
-            // As tileIds are always sequential, if we're in a directory and we pass the tileId, we can stop searching
-            if (searchedTileId > tileId) {
-              return {
-                tileId,
-                offset: parseInt(parts[1], 10) + offsetStart,
-                length: parseInt(parts[2], 10),
-                runLength,
-              };
-            }
-          }
-
-          // If these conditions pass, we have found the correct tile
-          if (tileId === searchedTileId || (tileId < searchedTileId && tileId + runLength > searchedTileId)) {
-            return {
-              tileId,
-              offset: parseInt(parts[1], 10) + offsetStart,
-              length: parseInt(parts[2], 10),
-              runLength,
-            };
-          }
-        }
+    const lines = this.entry.split(':');
+    for (const line of lines) {
+      const parts = line.split('|');
+      if (parts.length === 2) {
+        tileIdStart = fromRadix64(parts[0]);
+        offsetStart = fromRadix64(parts[1]);
+        continue;
       }
-    } finally {
-      this.stream
-        .cancel()
-        .then(() => console.log('stream cancelled'))
-        .catch((e) => console.error(e));
+      if (tileIdStart === undefined || offsetStart === undefined) {
+        throw new Error('Invalid entry, we have no tileIdStart or offsetStart');
+      }
+      const tileId = fromRadix64(parts[0]) + tileIdStart;
+      const runLength = fromRadix64(parts[3]);
+
+      // If these conditions pass, we have found the correct tile
+      if (tileId === searchedTileId || (tileId < searchedTileId && tileId + runLength > searchedTileId)) {
+        return {
+          tileId,
+          offset: fromRadix64(parts[1]) + offsetStart,
+          length: fromRadix64(parts[2]),
+          runLength,
+        };
+      }
     }
   }
 }
@@ -111,17 +64,17 @@ export class PMTilesService {
   private constructor(
     private source: IStorageRepository,
     private memCache: IMemCacheRepository,
-    private kvCache: IKeyValueRepository,
     private metrics: IMetricsRepository,
+    private db: IDatabaseRepository,
   ) {}
 
   static async init(
     source: IStorageRepository,
     memCache: IMemCacheRepository,
-    kvCache: IKeyValueRepository,
     metrics: IMetricsRepository,
+    db: IDatabaseRepository,
   ): Promise<PMTilesService> {
-    const p = new PMTilesService(source, memCache, kvCache, metrics);
+    const p = new PMTilesService(source, memCache, metrics, db);
     const headerCacheKey = getHeaderCacheKey(source.getDeploymentKey());
     if (memCache.get(headerCacheKey)) {
       return p;
@@ -147,18 +100,6 @@ export class PMTilesService {
     return memCached;
   }
 
-  private getRootDirectory(header: Header): Directory {
-    const key = getDirectoryCacheKey(this.source.getDeploymentKey(), {
-      offset: header.rootDirectoryOffset,
-      length: header.rootDirectoryLength,
-    });
-    const root = this.memCache.get<Directory>(key);
-    if (!root) {
-      throw new Error('Root directory not found in cache');
-    }
-    return root as Directory;
-  }
-
   async getHeaderAndRootFromSource(): Promise<[Header, Directory]> {
     const resp = await this.source.getRange({ offset: 0, length: 16384 });
     const v = new DataView(resp);
@@ -180,16 +121,6 @@ export class PMTilesService {
     return [header, rootDir];
   }
 
-  private async getDirectory(offset: number, length: number): Promise<DirectoryStream> {
-    const cacheKey = getDirectoryCacheKey(this.source.getDeploymentKey(), { offset, length });
-    console.log(cacheKey);
-    const kvValueStream = await this.kvCache.getAsStream(cacheKey);
-    if (kvValueStream) {
-      return new DirectoryStream(kvValueStream);
-    }
-    throw new Error('Directory not found in KV');
-  }
-
   async getJsonResponse(version: string, url: URL) {
     const header = this.getHeader();
     const metadata = await this.getMetadata();
@@ -200,35 +131,42 @@ export class PMTilesService {
     console.log('getTile', z, x, y);
     const tileId = zxyToTileId(z, x, y);
     const header = this.getHeader();
-    const rootDirectory = this.getRootDirectory(header);
 
     if (z < header.minZoom || z > header.maxZoom) {
       return;
     }
 
-    let offset = header.rootDirectoryOffset;
-    let length = header.rootDirectoryLength;
-    let entry = findTile(rootDirectory.entries, tileId);
-    for (let i = 0; i < 2; ++i) {
-      if (!entry) {
-        return;
-      }
-      offset = entry.offset;
-      length = entry.length;
-      // Run length of 0 is a directory, anything else is a tile
-      if (entry.runLength !== 0) {
-        break;
-      }
-      const leafDirectory = await this.metrics.monitorAsyncFunction({ name: 'get_leaf_directory' }, (offset, length) =>
-        this.getDirectory(offset, length),
-      )(header.leafDirectoryOffset + offset, length);
-      entry = await this.metrics.monitorAsyncFunction({ name: 'find_tile_leaf_directory' }, (tileId) =>
-        leafDirectory.findTile(tileId),
-      )(tileId);
+    const dbLookup = await this.metrics.monitorAsyncFunction({ name: 'd1_lookup' }, (tileId) =>
+      this.db.query(
+        `SELECT * FROM cache_entries_${this.source.getDeploymentKey()} WHERE startTileId <= ? ORDER BY startTileId DESC LIMIT 1`,
+        tileId,
+      ),
+    )(tileId);
+
+    if (dbLookup.error) {
+      throw new Error('Error while looking up tile location');
     }
+
+    if (!dbLookup.success || dbLookup.results.length === 0) {
+      return;
+    }
+
+    const leafDirectory = new DirectoryString(dbLookup.results[0].entry as string);
+
+    const entry = await this.metrics.monitorAsyncFunction({ name: 'find_tile_leaf_directory' }, (tileId) =>
+      leafDirectory.findTile(tileId),
+    )(tileId);
+
+    if (!entry) {
+      return;
+    }
+
+    const tileOffset = entry.offset;
+    const tileLength = entry.length;
+
     const tile = await this.metrics.monitorAsyncFunction({ name: 'get_tile' }, (offset, length) =>
       this.source.getRangeAsStream({ offset, length }),
-    )(header.tileDataOffset + offset, length);
+    )(header.tileDataOffset + tileOffset, tileLength);
     return tile;
   }
 

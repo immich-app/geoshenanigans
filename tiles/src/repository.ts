@@ -2,8 +2,8 @@ import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { Point } from '@influxdata/influxdb-client';
 import {
   AsyncFn,
+  IDatabaseRepository,
   IDeferredRepository,
-  IKeyValueRepository,
   IMemCacheRepository,
   IMetricsProviderRepository,
   IMetricsRepository,
@@ -13,17 +13,35 @@ import {
 } from './interface';
 import { monitorAsyncFunction } from './monitor';
 
-export class CloudflareKVRepository implements IKeyValueRepository {
-  constructor(private KV: KVNamespace) {}
+export class CloudflareD1Repository implements IDatabaseRepository {
+  constructor(
+    private databases: { [key: string]: D1Database },
+    private metrics: IMetricsRepository,
+  ) {}
 
-  async get(key: string): Promise<string | undefined> {
-    const value = await this.KV.get(key, { type: 'text', cacheTtl: 2678400 });
-    return value ?? undefined;
-  }
+  async query(query: string, ...values: unknown[]) {
+    const metric = Metric.create('d1_query');
+    const { key: databaseKey, resp } = await Promise.race(
+      Object.entries(this.databases).map(async ([key, database]) => {
+        const resp = await database
+          .prepare(query)
+          .bind(...values)
+          .run();
+        return { key, resp };
+      }),
+    );
+    console.log('resp_meta', resp.meta);
+    metric
+      .durationField('duration')
+      .addTag('database_key', databaseKey)
+      .addTag('served_by_region', resp.meta.served_by as string)
+      .addTag('served_by_primary', (resp.meta.served_by_primary as boolean).toString())
+      .intField('rows_read', resp.meta.rows_read)
+      .intField('sql_duration', resp.meta.duration)
+      .intField('count', 1);
+    this.metrics.push(metric);
 
-  async getAsStream(key: string): Promise<ReadableStream | undefined> {
-    const stream = await this.KV.get(key, { type: 'stream', cacheTtl: 2678400 });
-    return stream ?? undefined;
+    return resp;
   }
 }
 
