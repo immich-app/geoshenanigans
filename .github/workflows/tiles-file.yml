@@ -20,7 +20,7 @@ jobs:
     name: Deploy Tiles & Styles
     strategy:
       matrix:
-        bucket_region: [ "wnam", "enam", "weur", "eeur", "apac" ]
+        bucket_region: [ "wnam", "enam", "weur", "eeur", "apac", "oc" ]
     defaults:
       run:
         working-directory: 'map-styles'

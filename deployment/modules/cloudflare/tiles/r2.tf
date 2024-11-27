@@ -1,10 +1,5 @@
 locals {
-  r2_regions = ["WNAM", "ENAM", "WEUR", "EEUR", "APAC"]
-}
-
-resource "cloudflare_r2_bucket" "tiles" {
-  account_id = var.cloudflare_account_id
-  name       = "tiles"
+  r2_regions = ["WNAM", "ENAM", "WEUR", "EEUR", "APAC", "OC"]
 }
 
 resource "cloudflare_r2_bucket" "regional_tiles" {
@@ -12,11 +7,6 @@ resource "cloudflare_r2_bucket" "regional_tiles" {
   account_id = var.cloudflare_account_id
   name       = "tiles-${lower(each.value)}"
   location   = each.value
-}
-
-import {
-  to = cloudflare_r2_bucket.tiles
-  id = "${var.cloudflare_account_id}/tiles"
 }
 
 output "r2_regional_buckets" {

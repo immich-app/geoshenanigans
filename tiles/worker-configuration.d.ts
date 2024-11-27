@@ -2,12 +2,13 @@
 // by running `wrangler types`
 
 interface Env {
-	KV: KVNamespace;
-	DEPLOYMENT_KEY: "20240812";
-	ENVIRONMENT: "prod";
-	BUCKET_WNAM: R2Bucket;
-	BUCKET_ENAM: R2Bucket;
-	BUCKET_WEUR: R2Bucket;
-	BUCKET_EEUR: R2Bucket;
-	BUCKET_APAC: R2Bucket;
+  KV: KVNamespace;
+  DEPLOYMENT_KEY: "20240812";
+  ENVIRONMENT: "prod";
+  BUCKET_WNAM: R2Bucket;
+  BUCKET_ENAM: R2Bucket;
+  BUCKET_WEUR: R2Bucket;
+  BUCKET_EEUR: R2Bucket;
+  BUCKET_APAC: R2Bucket;
+  BUCKET_OC: R2Bucket;
 }

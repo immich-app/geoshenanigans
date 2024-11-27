@@ -163,6 +163,7 @@ async function handleRequest(
     enam: env.BUCKET_ENAM,
     wnam: env.BUCKET_WNAM,
     weur: env.BUCKET_WEUR,
+    oc: env.BUCKET_OC,
   };
   const colo = request.cf?.colo || '';
   const buckets: R2BucketRegion[] = preferredBuckets[colo] || ['weur', 'eeur', 'enam', 'wnam', 'apac'];
