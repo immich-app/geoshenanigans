@@ -159,44 +159,8 @@ jobs:
           TF_VAR_tiles_build_dir: "${{ github.workspace }}/dist"
         run: op run --env-file=".env" -- terragrunt run-all plan -no-color 2>&1 | tee "${{github.workspace}}/plan_output.txt" && exit ${PIPESTATUS[0]};
 
-  kv-warming:
-    needs: [build, test]
-    name: KV Warming
-    runs-on: mich
-    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
-    defaults:
-      run:
-        working-directory: ./tiles
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version-file: './tiles/.nvmrc'
-
-      - name: Run npm install
-        run: npm ci
-
-      - name: Get tiles.json
-        run: echo "TILES_JSON=$(jq -c . < ${{ github.workspace }}/deployment/modules/cloudflare/tiles-worker/tiles.tfvars.json)" >> $GITHUB_ENV
-
-      - name: Run kv warming
-        env:
-          S3_ACCESS_KEY: ${{ secrets.CLOUDFLARE_TILES_R2_KV_TOKEN_ID }}
-          S3_SECRET_KEY: ${{ secrets.CLOUDFLARE_TILES_R2_KV_TOKEN_HASHED_VALUE }}
-          S3_ENDPOINT: https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
-          KV_API_KEY: ${{ secrets.CLOUDFLARE_TILES_R2_KV_TOKEN_VALUE }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          # Figure out how to extract this from terraform at some point or get it into github vars
-          KV_NAMESPACE_ID: 5a4b82694e8b490db8b8904cdaea4f00
-          BUCKET_KEY: tiles-weur
-          DEPLOYMENT_KEY: ${{ fromJson(env.TILES_JSON).pmtiles_deployment_key }}
-        run: npm run kv:warm
-
   deploy-terragrunt:
-    needs: [build, test, kv-warming]
+    needs: [build, test]
     name: Deploy Terragrunt
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'

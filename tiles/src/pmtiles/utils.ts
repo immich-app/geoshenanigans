@@ -271,3 +271,25 @@ export function getHeaderCacheKey(archiveName: string): string {
 export function getDirectoryCacheKey(fileName: string, range: { offset: number; length: number }): string {
   return `${fileName}|${range.offset}|${range.length}`;
 }
+
+const BASE64_CHARS = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz/.';
+
+export function toRadix64(num: number): string {
+  if (num === 0) {
+    return '0';
+  }
+  let base64 = '';
+  while (num > 0) {
+    base64 = BASE64_CHARS[num % 64] + base64;
+    num = Math.floor(num / 64);
+  }
+  return base64;
+}
+
+export function fromRadix64(radix64: string): number {
+  let num = 0;
+  for (let i = 0; i < radix64.length; i++) {
+    num = num * 64 + BASE64_CHARS.indexOf(radix64[i]);
+  }
+  return num;
+}
