@@ -2,8 +2,8 @@ import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { Point } from '@influxdata/influxdb-client';
 import {
   AsyncFn,
+  IDatabaseRepository,
   IDeferredRepository,
-  IKeyValueRepository,
   IMemCacheRepository,
   IMetricsProviderRepository,
   IMetricsRepository,
@@ -13,17 +13,13 @@ import {
 } from './interface';
 import { monitorAsyncFunction } from './monitor';
 
-export class CloudflareKVRepository implements IKeyValueRepository {
-  constructor(private KV: KVNamespace) {}
+export class CloudflareD1Repository implements IDatabaseRepository {
+  constructor(private D1: D1Database) {}
 
-  async get(key: string): Promise<string | undefined> {
-    const value = await this.KV.get(key, { type: 'text', cacheTtl: 2678400 });
-    return value ?? undefined;
-  }
-
-  async getAsStream(key: string): Promise<ReadableStream | undefined> {
-    const stream = await this.KV.get(key, { type: 'stream', cacheTtl: 2678400 });
-    return stream ?? undefined;
+  async query(query: string, ...values: unknown[]): Promise<D1Result<Record<string, unknown>>> {
+    return this.D1.prepare(query)
+      .bind(...values)
+      .run();
   }
 }
 
