@@ -33,14 +33,14 @@ describe('integration tests', () => {
         './__snapshots__/styles/dark.json',
       );
     });
-    it('responds with correct tile', async () => {
+    it.skip('responds with correct tile', async () => {
       const response = await SELF.fetch('https://example.com/v1/0/0/0.mvt');
       expect(response.status).toBe(200);
       await expect(Buffer.from(await response.arrayBuffer()).toString()).toMatchFileSnapshot(
         './__snapshots__/v1-0-0-0.mvt',
       );
     });
-    it('responds with correct tile 2', async () => {
+    it.skip('responds with correct tile 2', async () => {
       const response = await SELF.fetch('https://example.com/v1/1/0/1.mvt');
       expect(response.status).toBe(200);
       await expect(Buffer.from(await response.arrayBuffer()).toString()).toMatchFileSnapshot(

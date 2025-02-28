@@ -11,6 +11,11 @@ binding = "KV"
 id = "5a4b82694e8b490db8b8904cdaea4f00"
 preview_id = "5a4b82694e8b490db8b8904cdaea4f00"
 
+[[d1_databases]]
+binding = "D1_TILE_LOOKUP"
+database_name = "tiles-lookup"
+database_id = "d498d485-7709-410a-9e16-143c8ff4f016"
+
 # Bind an R2 Bucket. Use R2 to store arbitrarily large blobs of data, such as files.
 # Docs: https://developers.cloudflare.com/workers/wrangler/configuration/#r2-buckets
 [[r2_buckets]]
