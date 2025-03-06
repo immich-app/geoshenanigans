@@ -1,8 +1,7 @@
 import { Metric } from './repository';
 
-export interface IKeyValueRepository {
-  get(key: string): Promise<string | undefined>;
-  getAsStream(key: string): Promise<ReadableStream | undefined>;
+export interface IDatabaseRepository {
+  query(query: string, ...values: unknown[]): Promise<D1Result<Record<string, unknown>>>;
 }
 
 export interface IMemCacheRepository {

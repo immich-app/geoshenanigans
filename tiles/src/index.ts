@@ -2,8 +2,8 @@ import { preferredBuckets, R2BucketRegion } from './buckets';
 import { IMetricsRepository } from './interface';
 import { PMTilesService } from './pmtiles/pmtiles.service';
 import {
+  CloudflareD1Repository,
   CloudflareDeferredRepository,
-  CloudflareKVRepository,
   CloudflareMetricsRepository,
   HeaderMetricsProvider,
   InfluxMetricsProvider,
@@ -156,7 +156,7 @@ async function handleRequest(
   }
 
   const memCacheRepository = new MemCacheRepository(globalThis.memCache);
-  const kvRepository = new CloudflareKVRepository(env.KV);
+  const d1Repository = new CloudflareD1Repository(env.D1_TILE_LOOKUP);
   const bucketMap: Record<R2BucketRegion, R2Bucket> = {
     apac: env.BUCKET_APAC,
     eeur: env.BUCKET_EEUR,
@@ -176,8 +176,8 @@ async function handleRequest(
   const pmTilesService = await metrics.monitorAsyncFunction({ name: 'pmtiles_init' }, PMTilesService.init)(
     storageRepository,
     memCacheRepository,
-    kvRepository,
     metrics,
+    d1Repository,
   );
 
   const respHeaders = new Headers();

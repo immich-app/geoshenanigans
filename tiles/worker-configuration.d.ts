@@ -5,6 +5,7 @@ interface Env {
   KV: KVNamespace;
   DEPLOYMENT_KEY: "20240812";
   ENVIRONMENT: "prod";
+  D1_TILE_LOOKUP: D1Database;
   BUCKET_WNAM: R2Bucket;
   BUCKET_ENAM: R2Bucket;
   BUCKET_WEUR: R2Bucket;
