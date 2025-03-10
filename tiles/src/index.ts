@@ -145,11 +145,15 @@ async function handleRequest(
     request.url,
   );
   if (cached && cached.headers.get(Header.PMTILES_DEPLOYMENT_KEY) === env.DEPLOYMENT_KEY) {
-    metrics.push(
-      Metric.create('cdn_hit')
-        .addTag('deployment_key', env.DEPLOYMENT_KEY)
-        .addTag('request_type', pmTilesParams.requestType ?? 'unknown'),
-    );
+    const metric = Metric.create('cdn_hit')
+      .addTag('deployment_key', env.DEPLOYMENT_KEY)
+      .addTag('request_type', pmTilesParams.requestType ?? 'unknown');
+    if (pmTilesParams.requestType === 'tile') {
+      metric.addTag('z', (pmTilesParams as PMTilesTileParams).z);
+    } else if (pmTilesParams.requestType === 'style') {
+      metric.addTag('style', (pmTilesParams as PMTilesStyleParams).style);
+    }
+    metrics.push(metric);
     const cacheHeaders = new Headers(cached.headers);
     const encodeBody = cacheHeaders.has('content-encoding') ? 'manual' : 'automatic';
     return new Response(cached.body, {
