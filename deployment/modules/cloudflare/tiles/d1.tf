@@ -11,6 +11,14 @@ resource "cloudflare_d1_database" "regional_tiles" {
   }
 }
 
+resource "cloudflare_d1_database" "tiles" {
+  account_id = var.cloudflare_account_id
+  name       = "tiles"
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
 output "d1_regional_databases" {
   value = { for region, database in cloudflare_d1_database.regional_tiles : region => database.id }
 }

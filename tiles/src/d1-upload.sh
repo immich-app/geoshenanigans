@@ -4,8 +4,7 @@
 SQL_DIR="./"
 
 # Set the list of databases
-DATABASES=("tiles-weur" "tiles-eeur" "tiles-wnam" "tiles-enam" "tiles-apac" "tiles-oc")
-
+DATABASES=("tiles-weur" "tiles-eeur" "tiles-wnam" "tiles-enam" "tiles-apac" "tiles-oc" "tiles")
 MAX_RETRIES=10
 
 # Function to upload a single .sql file to a single database
