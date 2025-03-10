@@ -197,10 +197,13 @@ async function handleRequest(
   try {
     if (pmTilesParams.requestType === 'tile') {
       const { z, x, y, version } = pmTilesParams as PMTilesTileParams;
-      return await metrics.monitorAsyncFunction(
-        { name: 'tile_request', tags: { z, x, y, version } },
-        handleTileRequest,
-      )(z, x, y, pmTilesService, respHeaders);
+      return await metrics.monitorAsyncFunction({ name: 'tile_request', tags: { z, version } }, handleTileRequest)(
+        z,
+        x,
+        y,
+        pmTilesService,
+        respHeaders,
+      );
     }
 
     if (pmTilesParams.requestType === 'json') {
