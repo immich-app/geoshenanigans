@@ -8,6 +8,7 @@ import {
   HeaderMetricsProvider,
   InfluxMetricsProvider,
   MemCacheRepository,
+  Metric,
   R2StorageRepository,
 } from './repository';
 
@@ -137,11 +138,18 @@ async function handleRequest(
     return new Response(undefined, { status: 405 });
   }
 
+  const pmTilesParams = parseUrl(request);
+
   const cache = caches.default;
   const cached = await metrics.monitorAsyncFunction({ name: 'match_request_from_cdn' }, (url) => cache.match(url))(
     request.url,
   );
   if (cached && cached.headers.get(Header.PMTILES_DEPLOYMENT_KEY) === env.DEPLOYMENT_KEY) {
+    metrics.push(
+      Metric.create('cdn_hit')
+        .addTag('deployment_key', env.DEPLOYMENT_KEY)
+        .addTag('request_type', pmTilesParams.requestType ?? 'unknown'),
+    );
     const cacheHeaders = new Headers(cached.headers);
     const encodeBody = cacheHeaders.has('content-encoding') ? 'manual' : 'automatic';
     return new Response(cached.body, {
@@ -185,8 +193,6 @@ async function handleRequest(
   respHeaders.set(Header.ACCESS_CONTROL_ALLOW_ORIGIN, '*');
   respHeaders.set(Header.VARY, 'Origin');
   respHeaders.set(Header.PMTILES_DEPLOYMENT_KEY, env.DEPLOYMENT_KEY);
-
-  const pmTilesParams = parseUrl(request);
 
   try {
     if (pmTilesParams.requestType === 'tile') {
