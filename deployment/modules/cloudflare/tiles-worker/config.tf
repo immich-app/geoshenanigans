@@ -1,6 +1,6 @@
 terraform {
   backend "pg" {}
-  required_version = "~> 1.7"
+  required_version = "~> 1.9"
 
   required_providers {
     cloudflare = {
