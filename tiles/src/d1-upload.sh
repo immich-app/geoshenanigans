@@ -35,7 +35,7 @@ upload_sql() {
 cd "$SQL_DIR" || exit
 
 # Get the list of .sql files
-SQL_FILES=(*.sql)
+SQL_FILES=(sql/*.sql)
 
 # Upload files to each database in parallel, but only one file at a time for each server
 for sql_file in "${SQL_FILES[@]}"; do

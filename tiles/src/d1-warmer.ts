@@ -1,6 +1,6 @@
 import { S3Client } from '@aws-sdk/client-s3';
 import { gunzipSync } from 'fflate';
-import { appendFileSync, writeFileSync } from 'fs';
+import { appendFileSync, writeFileSync, mkdirSync } from 'fs';
 import pLimit from 'p-limit';
 import { AsyncFn, IMetricsRepository, IStorageRepository, Operation } from './interface';
 import { DirectoryString, PMTilesService } from './pmtiles/pmtiles.service';
@@ -78,7 +78,8 @@ const handler = async () => {
     entry TEXT NOT NULL
   ) STRICT;`;
 
-  writeFileSync('cache_entries.0.sql', createTableStatement);
+  mkdirSync('sql');
+  writeFileSync('sql/cache_entries.0.sql', createTableStatement);
 
   for (const entry of root.entries) {
     const call = async () => {
@@ -105,10 +106,10 @@ const handler = async () => {
         const startTileId = chunkEntries[0].tileId;
 
         const stream = DirectoryString.fromDirectory(directoryChunk);
-        const entryValue = await stream.toString();
+        const entryValue = stream.toString();
 
         const insertStatement = `\nINSERT INTO cache_entries_${DEPLOYMENT_KEY} (startTileId, entry) VALUES (${startTileId}, '${entryValue}');`;
-        appendFileSync(`cache_entries.${Math.floor(countR2 / 50) + 1}.sql`, insertStatement);
+        appendFileSync(`sql/cache_entries.${Math.floor(countR2 / 50) + 1}.sql`, insertStatement);
         entryCount++;
       }
 
