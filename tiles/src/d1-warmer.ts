@@ -1,6 +1,7 @@
 import { S3Client } from '@aws-sdk/client-s3';
 import { gunzipSync } from 'fflate';
-import { appendFileSync, writeFileSync, mkdirSync } from 'fs';
+import { appendFileSync, writeFileSync, mkdirSync, readdirSync, rmSync } from 'fs';
+import { join } from 'path';
 import pLimit from 'p-limit';
 import { AsyncFn, IMetricsRepository, IStorageRepository, Operation } from './interface';
 import { DirectoryString, PMTilesService } from './pmtiles/pmtiles.service';
@@ -71,15 +72,21 @@ const handler = async () => {
   const promises: Promise<void>[] = [];
   const limit = pLimit(5);
 
-  let entryCount = 0;
+  const dropTableStatement = `DROP TABLE IF EXISTS cache_entries_${DEPLOYMENT_KEY}_tmp;\n`;
 
-  const createTableStatement = `CREATE TABLE IF NOT EXISTS cache_entries_${DEPLOYMENT_KEY} (
+  const createTableStatement = `CREATE TABLE IF NOT EXISTS cache_entries_${DEPLOYMENT_KEY}_tmp (
     startTileId INTEGER NOT NULL PRIMARY KEY,
     entry TEXT NOT NULL
   ) STRICT;`;
 
-  mkdirSync('sql');
-  writeFileSync('sql/cache_entries.0.sql', createTableStatement);
+  mkdirSync('sql', { recursive: true });
+  const files = readdirSync('sql');
+  for (const file of files) {
+    rmSync(join('sql', file));
+  }
+
+  writeFileSync('sql/cache_entries.0.sql', dropTableStatement);
+  appendFileSync('sql/cache_entries.0.sql', createTableStatement);
 
   for (const entry of root.entries) {
     const call = async () => {
@@ -89,10 +96,6 @@ const handler = async () => {
         storageRepository,
         header,
       );
-
-      entryCount += directory.entries.length;
-
-      console.log('Entry Progress: ' + entryCount);
 
       const totalChunks = Math.ceil(directory.entries.length / 50);
       for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
@@ -108,19 +111,22 @@ const handler = async () => {
         const stream = DirectoryString.fromDirectory(directoryChunk);
         const entryValue = stream.toString();
 
-        const insertStatement = `\nINSERT INTO cache_entries_${DEPLOYMENT_KEY} (startTileId, entry) VALUES (${startTileId}, '${entryValue}');`;
+        const insertStatement = `\nINSERT INTO cache_entries_${DEPLOYMENT_KEY}_tmp (startTileId, entry) VALUES (${startTileId}, '${entryValue}');`;
         appendFileSync(`sql/cache_entries.${Math.floor(countR2 / 50) + 1}.sql`, insertStatement);
-        entryCount++;
       }
 
       countR2++;
       console.log('R2 Progress: ' + countR2 + '/' + total);
     };
+
     promises.push(limit(call));
     total++;
   }
 
   await Promise.all(promises);
+  appendFileSync(`sql/cache_entries.${Math.floor(countR2 / 50) + 2}.sql`, `ALTER TABLE IF EXISTS cache_entries_${DEPLOYMENT_KEY} RENAME TO cache_entries_${DEPLOYMENT_KEY}_old;\n`);
+  appendFileSync(`sql/cache_entries.${Math.floor(countR2 / 50) + 2}.sql`, `ALTER TABLE cache_entries_${DEPLOYMENT_KEY}_tmp RENAME TO cache_entries_${DEPLOYMENT_KEY}\n;`);
+  appendFileSync(`sql/cache_entries.${Math.floor(countR2 / 50) + 2}.sql`, `DROP TABLE IF EXISTS cache_entries_${DEPLOYMENT_KEY}_old;\n`);
 };
 
 process.on('uncaughtException', (e) => {
