@@ -1,6 +1,7 @@
 import { createExecutionContext, env, SELF, waitOnExecutionContext } from 'cloudflare:test';
 import { inject } from 'vitest';
 import worker, { parseUrl } from '../src';
+import {fromRadix64, toRadix64} from "../src/pmtiles/utils";
 
 // For now, you'll need to do something like this to get a correctly-typed
 // `Request` to pass to `worker.fetch()`.
@@ -129,3 +130,19 @@ describe('parseUrl', () => {
     });
   });
 });
+
+describe('radix64', () => {
+  it.each`
+    number
+    ${ 1 }
+    ${ 0 }
+    ${ -1 }
+    ${ 100 }
+    ${ 1769420107 }
+    ${ 663668044 }
+    ${ -1105752063 }
+    `('converts $number to radix64 and back correctly', ({ number }) => {
+    const radix64 = toRadix64(number);
+    expect(fromRadix64(radix64)).toEqual(number);
+  });
+})
