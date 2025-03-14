@@ -249,6 +249,16 @@ async function handleRequest(
 export default {
   async fetch(request, env, ctx): Promise<Response> {
     const workerEnv = env as WorkerEnv;
+    if (workerEnv.WORKER_TYPE === 'D1_PROXY') {
+      // const metrics = new CloudflareMetricsRepository('tiles', request, []);
+      // const body = await request.json() as { sql: string, db: string };
+      // const d1Repository = new CloudflareD1Repository({d1: workerEnv[`D1_${body.db}` as unknown as keyof WorkerEnv] as D1Database }, metrics);
+      // console.log('D1 Proxy', body.sql);
+      // const response = await d1Repository.query(body.sql);
+      // console.log('D1 Response', response)
+      // return new Response(JSON.stringify(response));
+      return new Response('get out of here');
+    }
     const deferredRepository = new CloudflareDeferredRepository(ctx);
     const headerProvider = new HeaderMetricsProvider();
     const influxProvider = new InfluxMetricsProvider(workerEnv.VMETRICS_API_TOKEN, env.ENVIRONMENT);

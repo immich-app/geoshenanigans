@@ -276,20 +276,23 @@ const BASE64_CHARS = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuv
 
 export function toRadix64(num: number): string {
   if (num === 0) {
-    return '0';
+    return '';
   }
+  const isNegative = num < 0;
+  num = Math.abs(num);
   let base64 = '';
   while (num > 0) {
     base64 = BASE64_CHARS[num % 64] + base64;
     num = Math.floor(num / 64);
   }
-  return base64;
+  return isNegative ? '-' + base64 : base64;
 }
 
 export function fromRadix64(radix64: string): number {
   let num = 0;
-  for (let i = 0; i < radix64.length; i++) {
+  const isNegative = radix64.charAt(0) === '-';
+  for (let i = isNegative ? 1 : 0; i < radix64.length; i++) {
     num = num * 64 + BASE64_CHARS.indexOf(radix64[i]);
   }
-  return num;
+  return isNegative ? -num : num;
 }

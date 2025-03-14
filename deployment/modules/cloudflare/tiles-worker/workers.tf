@@ -44,6 +44,11 @@ resource "cloudflare_workers_script" "tiles" {
     }
   }
 
+  d1_database_binding {
+    database_id = data.terraform_remote_state.tiles_state.outputs.d1_global_database
+    name        = "D1_GLOBAL"
+  }
+
   compatibility_date  = "2024-07-29"
   compatibility_flags = ["nodejs_compat"]
 }
