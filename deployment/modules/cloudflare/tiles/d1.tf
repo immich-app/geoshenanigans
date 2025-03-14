@@ -19,8 +19,16 @@ resource "cloudflare_d1_database" "tiles" {
   }
 }
 
+locals {
+  d1_regional_databases = { for region, database in cloudflare_d1_database.regional_tiles : region => database.id }
+}
+
 output "d1_regional_databases" {
-  value = { for region, database in cloudflare_d1_database.regional_tiles : region => database.id }
+  value = local.d1_regional_databases
+}
+
+output "d1_global_database" {
+  value = cloudflare_d1_database.tiles.id
 }
 
 import {

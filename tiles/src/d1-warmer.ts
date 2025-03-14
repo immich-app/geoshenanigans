@@ -1,8 +1,9 @@
 import { S3Client } from '@aws-sdk/client-s3';
 import { gunzipSync } from 'fflate';
-import { appendFileSync, writeFileSync, mkdirSync, readdirSync, rmSync } from 'fs';
-import { join } from 'path';
+import { mkdirSync, readdirSync, rmSync } from 'fs';
 import pLimit from 'p-limit';
+import { join } from 'path';
+import { setTimeout } from 'timers/promises';
 import { AsyncFn, IMetricsRepository, IStorageRepository, Operation } from './interface';
 import { DirectoryString, PMTilesService } from './pmtiles/pmtiles.service';
 import { Compression, Directory, Header } from './pmtiles/types';
@@ -40,6 +41,16 @@ const getDirectory = async (length: number, offset: number, source: IStorageRepo
   return directory;
 };
 
+enum DBS {
+  ENAM = 'ENAM',
+  WNAM = 'WNAM',
+  WEUR = 'WEUR',
+  APAC = 'APAC',
+  EEUR = 'EEUR',
+  OC = 'OC',
+  GLOBAL = 'GLOBAL',
+}
+
 const handler = async () => {
   const { S3_ACCESS_KEY, S3_SECRET_KEY, S3_ENDPOINT, CLOUDFLARE_ACCOUNT_ID, BUCKET_KEY, DEPLOYMENT_KEY } = process.env;
   if (!S3_ACCESS_KEY || !S3_SECRET_KEY || !S3_ENDPOINT || !CLOUDFLARE_ACCOUNT_ID || !BUCKET_KEY || !DEPLOYMENT_KEY) {
@@ -66,15 +77,64 @@ const handler = async () => {
     null as unknown as CloudflareD1Repository,
   );
 
+  const runD1Query = async (sql: string, db: DBS) => {
+    const body = JSON.stringify({ sql, db });
+    const resp = await fetch(`https://tiles-d1-proxy.immich.cloud`, {
+      headers: {
+        Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}`,
+        ContentType: 'application/json',
+      },
+      body,
+      method: 'POST',
+    });
+
+    if (!resp.ok) {
+      console.log(body);
+      throw Error('Query failed with status ' + resp.status + (await resp.text()));
+    }
+
+    const response = (await resp.json()) as {
+      success: boolean;
+      errors?: any[];
+      meta: { duration: number };
+      results: [];
+    };
+
+    if (response.errors && response.errors.length > 0) {
+      throw Error('Query failed with errors ' + JSON.stringify(response.errors));
+    }
+
+    if (!response!.success) {
+      throw Error('Query failed with success false');
+    }
+
+    // console.log(`Query success in ${response.meta.duration}ms`)
+    return response;
+  };
+
+  const runD1QueryAllDBs = async (sql: string) => {
+    const promises: Promise<unknown>[] = [];
+
+    for (const db of Object.values(DBS)) {
+      promises.push(runD1Query(sql, db));
+    }
+
+    await Promise.all(promises);
+  };
+
   const [header, root] = await pmTilesService.getHeaderAndRootFromSource();
   let countR2 = 0;
+  let totalD1 = 0;
   let total = 0;
-  const promises: Promise<void>[] = [];
-  const limit = pLimit(5);
+  let countD1 = 0;
+  const promises: Promise<unknown>[] = [];
+  const d1Promises: Promise<unknown>[] = [];
+  const s3Limit = pLimit(5);
+  const d1Limit = pLimit(20);
 
-  const dropTableStatement = `DROP TABLE IF EXISTS cache_entries_${DEPLOYMENT_KEY}_tmp;\n`;
+  const dropTableStatement = `DROP TABLE IF EXISTS tmp`;
 
-  const createTableStatement = `CREATE TABLE IF NOT EXISTS cache_entries_${DEPLOYMENT_KEY}_tmp (
+  const createTableStatement = `CREATE TABLE IF NOT EXISTS tmp (
     startTileId INTEGER NOT NULL PRIMARY KEY,
     entry TEXT NOT NULL
   ) STRICT;`;
@@ -85,11 +145,17 @@ const handler = async () => {
     rmSync(join('sql', file));
   }
 
-  writeFileSync('sql/cache_entries.0.sql', dropTableStatement);
-  appendFileSync('sql/cache_entries.0.sql', createTableStatement);
+  await runD1QueryAllDBs(dropTableStatement);
+  await runD1QueryAllDBs(createTableStatement);
+
+  let queryString = '';
+  let d1Queue = 0;
 
   for (const entry of root.entries) {
     const call = async () => {
+      while (d1Queue > 1000) {
+        await setTimeout(1000);
+      }
       const directory = await getDirectory(
         entry.length,
         entry.offset + header.leafDirectoryOffset,
@@ -111,22 +177,62 @@ const handler = async () => {
         const stream = DirectoryString.fromDirectory(directoryChunk);
         const entryValue = stream.toString();
 
-        const insertStatement = `\nINSERT INTO cache_entries_${DEPLOYMENT_KEY}_tmp (startTileId, entry) VALUES (${startTileId}, '${entryValue}');`;
-        appendFileSync(`sql/cache_entries.${Math.floor(countR2 / 50) + 1}.sql`, insertStatement);
+        queryString += `INSERT INTO tmp (startTileId, entry) VALUES (${startTileId}, '${entryValue}');`;
+
+        if (queryString.length > 90000) {
+          ++totalD1;
+          const query = queryString;
+          ++d1Queue;
+          const d1Call = async () => {
+            await runD1QueryAllDBs(query);
+            ++countD1;
+            --d1Queue;
+            if (countD1 % 100 === 0) {
+              console.log('D1 Progress: ' + countD1 + '/' + totalD1);
+            }
+          };
+          d1Promises.push(d1Limit(d1Call));
+          queryString = '';
+        }
       }
 
       countR2++;
       console.log('R2 Progress: ' + countR2 + '/' + total);
     };
 
-    promises.push(limit(call));
+    promises.push(s3Limit(call));
     total++;
   }
 
   await Promise.all(promises);
-  appendFileSync(`sql/cache_entries.${Math.floor(countR2 / 50) + 2}.sql`, `ALTER TABLE IF EXISTS cache_entries_${DEPLOYMENT_KEY} RENAME TO cache_entries_${DEPLOYMENT_KEY}_old;\n`);
-  appendFileSync(`sql/cache_entries.${Math.floor(countR2 / 50) + 2}.sql`, `ALTER TABLE cache_entries_${DEPLOYMENT_KEY}_tmp RENAME TO cache_entries_${DEPLOYMENT_KEY}\n;`);
-  appendFileSync(`sql/cache_entries.${Math.floor(countR2 / 50) + 2}.sql`, `DROP TABLE IF EXISTS cache_entries_${DEPLOYMENT_KEY}_old;\n`);
+  await Promise.all(d1Promises);
+
+  for (const db of Object.values(DBS)) {
+    const call = async () => {
+      const tables = await runD1Query(`PRAGMA table_list`, db);
+      const tableExists = tables.results.some(
+        (table: { name: string }) => table.name === `cache_entries_${DEPLOYMENT_KEY}`,
+      );
+      if (tableExists) {
+        await runD1Query(
+          `ALTER TABLE cache_entries_${DEPLOYMENT_KEY} RENAME TO cache_entries_${DEPLOYMENT_KEY}_old;`,
+          db,
+        );
+      }
+      await runD1Query(`ALTER TABLE tmp RENAME TO cache_entries_${DEPLOYMENT_KEY};`, db);
+      console.log('Tables switched', db);
+      if (tableExists) {
+        console.log('Waiting 10 seconds before dropping old table', db);
+        await setTimeout(10000);
+        console.log('Dropping old table', db);
+        await runD1Query(`DROP TABLE cache_entries_${DEPLOYMENT_KEY}_old;`, db);
+        console.log('Dropped old table', db);
+      }
+    };
+    promises.push(call());
+  }
+
+  await Promise.all(promises);
 };
 
 process.on('uncaughtException', (e) => {
