@@ -129,7 +129,8 @@ const handler = async () => {
   let countD1 = 0;
   const promises: Promise<unknown>[] = [];
   const d1Promises: Promise<unknown>[] = [];
-  const s3Limit = pLimit(5);
+  const s3IndexLimit = pLimit(5);
+  const s3ChunkLimit = pLimit(5);
   const d1Limit = pLimit(20);
 
   const dropTableStatement = `DROP TABLE IF EXISTS tmp`;
@@ -151,6 +152,27 @@ const handler = async () => {
   let queryString = '';
   let d1Queue = 0;
 
+
+  /** TODO: Remaining tasks for tile data splitting
+   - Store index in D1, probably a seperate table
+   - Cache index on tile worker startup, maybe even as env or directly in the bundle depending on size limits?
+   - Use D1 to understand current state of S3 and D1 cache_entries (another table?)
+   - Pull the pmtiles file as part of the warming process and do processing on disk
+   - Push chunks to S3
+   - Alter worker code to have concept of chunking when retrieving the tile data.
+     - Needs to pull from correct index and understand different offset
+   - Would D1 be smaller if tile offsets were always max 25_000_000 but included their chunk index? Probably?
+     - Would remove offset for the chunk, and instead just have every tile offset from the index of the data chunk it is in
+  **/
+  const tileDataOffset = header.tileDataOffset
+  const tileDataLength = header.tileDataLength
+  const tileDataChunks: { [chunkId: number]: { startByte: number } } = {}
+  const tileDataChunkSize = 25_000_000;
+
+  if(!tileDataLength) {
+    throw new Error('Tile data length undefined from header')
+  }
+
   for (const entry of root.entries) {
     const call = async () => {
       while (d1Queue > 1000) {
@@ -162,6 +184,17 @@ const handler = async () => {
         storageRepository,
         header,
       );
+
+      for(const dirEntry of directory.entries) {
+        const tileOffset = dirEntry.offset + directory.offsetStart
+
+        const tileChunkId = Math.floor(tileOffset / tileDataChunkSize);
+        if(tileDataChunks[tileChunkId]?.startByte <= tileOffset) {
+          continue;
+        }
+        tileDataChunks[tileChunkId] = { startByte: tileOffset }
+        console.log('New chunk', tileChunkId, tileDataChunks[tileChunkId])
+      }
 
       const totalChunks = Math.ceil(directory.entries.length / 50);
       for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
@@ -200,9 +233,9 @@ const handler = async () => {
       console.log('R2 Progress: ' + countR2 + '/' + total);
     };
 
-    promises.push(s3Limit(call));
+    promises.push(s3IndexLimit(call));
     total++;
-  }
+  }}
 
   await Promise.all(promises);
   await Promise.all(d1Promises);
