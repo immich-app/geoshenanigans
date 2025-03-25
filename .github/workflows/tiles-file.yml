@@ -29,12 +29,12 @@ jobs:
       KEY: ${{ steps.latest_build.outputs.KEY }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
           submodules: 'recursive'
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@cdca7365b2dadb8aad0a33bc7601856ffabcc48e # v4
         with:
           node-version-file: 'map-styles/.nvmrc'
 
@@ -59,7 +59,7 @@ jobs:
           echo "KEY=$build" >> $GITHUB_OUTPUT
 
       - name: Setup Rclone
-        uses: AnimMouse/setup-rclone@v1
+        uses: AnimMouse/setup-rclone@e4c62ff5f942e489edceaffb563832d970253322 # v1
         with:
           disable_base64: true
           rclone_config: |
@@ -86,12 +86,12 @@ jobs:
     steps:
       - name: Generate a token
         id: generate-token
-        uses: actions/create-github-app-token@v1
+        uses: actions/create-github-app-token@af35edadc00be37caa72ed9f3e6d5f7801bfdf09 # v1
         with:
           app-id: ${{ secrets.PUSH_O_MATIC_APP_ID }}
           private-key: ${{ secrets.PUSH_O_MATIC_APP_KEY }}
       - name: 'Checkout'
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
           ref: ${{ github.event.pull_request.head.ref }}
           token: ${{ steps.generate-token.outputs.token }}
@@ -101,7 +101,7 @@ jobs:
           sed -i -E 's/"pmtiles_deployment_key": "(.*)"/"pmtiles_deployment_key": "${{ needs.deploy_tiles.outputs.KEY }}"/' deployment/modules/cloudflare/tiles-worker/tiles.tfvars.json
 
       - name: Push updated tiles.tfvars to repo
-        uses: EndBug/add-and-commit@v9
+        uses: EndBug/add-and-commit@a94899bca583c204427a224a7af87c02f9b325d5 # v9
         with:
           add: deployment/modules/cloudflare/tiles-worker/tiles.tfvars.json
           message: Update tile server file to ${{ needs.deploy_tiles.outputs.KEY }}
