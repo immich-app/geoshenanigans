@@ -20,7 +20,7 @@ export class DirectoryString {
   static fromDirectory(directory: Directory): DirectoryString {
     let entryString = `${toRadix64(directory.tileIdStart)}|${toRadix64(directory.offsetStart)}:`;
     for (const entry of directory.entries) {
-      entryString += `${toRadix64(entry.tileId - directory.tileIdStart)}|${toRadix64(entry.offset - directory.offsetStart)}|${toRadix64(entry.length)}|${toRadix64(entry.runLength)}:`;
+      entryString += `${toRadix64(entry.tileId - directory.tileIdStart)}|${toRadix64(entry.offset - directory.offsetStart)}|${toRadix64(entry.length)}|${toRadix64(entry.runLength)}|${toRadix64(entry.chunkId)}:`;
     }
     return new DirectoryString(entryString);
   }
@@ -53,6 +53,7 @@ export class DirectoryString {
           tileId,
           offset: fromRadix64(parts[1]) + offsetStart,
           length: fromRadix64(parts[2]),
+          chunkId: fromRadix64(parts[4]),
           runLength,
         };
       }

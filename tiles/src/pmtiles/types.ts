@@ -5,6 +5,7 @@ export interface Entry {
   tileId: number;
   offset: number;
   length: number;
+  chunkId: number;
   runLength: number;
 }
 
