@@ -1,6 +1,6 @@
-import { BLACK, LIGHT, Theme } from '../../submodules/basemaps/styles/src/themes';
+import { BLACK, Flavor, LIGHT } from '@protomaps/basemaps';
 
-export interface ImmichTheme extends Theme {
+export interface ImmichTheme extends Flavor {
   iconStyle: 'dark' | 'light';
 }
 
