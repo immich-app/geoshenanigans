@@ -1,4 +1,5 @@
 import { S3Client } from '@aws-sdk/client-s3';
+import fetchBuilder from 'fetch-retry';
 import { gunzipSync } from 'fflate';
 import { mkdirSync, readdirSync, rmSync } from 'fs';
 import pLimit from 'p-limit';
@@ -79,13 +80,24 @@ const handler = async () => {
 
   const runD1Query = async (sql: string, db: DBS) => {
     const body = JSON.stringify({ sql, db });
-    const resp = await fetch(`https://tiles-d1-proxy.immich.cloud`, {
+    //TODO: Handle failures due to previously failed request that still wrote to the database (primary key conflict)
+    const fetchRetry = fetchBuilder(fetch);
+    const resp = await fetchRetry(`https://tiles-d1-proxy.immich.cloud`, {
       headers: {
         Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}`,
         ContentType: 'application/json',
       },
       body,
       method: 'POST',
+      retryDelay: 1000,
+      retries: 5,
+      retryOn: (attempt, error, response) => {
+        if (!response?.ok && attempt < 5) {
+          console.log('Retrying query', attempt, error, response);
+          return true;
+        }
+        return false;
+      },
     });
 
     if (!resp.ok) {
@@ -130,7 +142,7 @@ const handler = async () => {
   const promises: Promise<unknown>[] = [];
   const d1Promises: Promise<unknown>[] = [];
   const s3Limit = pLimit(5);
-  const d1Limit = pLimit(20);
+  const d1Limit = pLimit(50);
 
   const dropTableStatement = `DROP TABLE IF EXISTS tmp`;
 
