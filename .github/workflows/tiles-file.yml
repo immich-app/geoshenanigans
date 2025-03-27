@@ -45,7 +45,7 @@ jobs:
         run: npm ci
 
       - name: Generate styles
-        run: npm run generate
+        run: npm run build
 
       - name: Find latest pmtiles build
         id: latest_build

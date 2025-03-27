@@ -1,16 +1,23 @@
 {
   "name": "immich-map-styles",
-  "description": "Generate immich style variations from the protomaps styles",
-  "main": "index.ts",
-  "scripts": {
-    "generate": "tsx src/index.ts"
-  },
-  "author": "The Protomaps Authors",
+  "version": "3.1.0",
   "license": "BSD-3-Clause",
-  "homepage": "https://github.com/protomaps/basemaps",
+  "scripts": {
+    "build": "tsx src/index.ts",
+    "watch": "tsx watch src/index.ts",
+    "serve": "http-server dist -p 3000 --cors",
+    "tunnel": "lt --port 3000 --subdomain immich-map-styles",
+    "serve:tunnel": "concurrently \"npm run serve\" \"npm run tunnel\"",
+    "dev": "concurrently \"npm run watch\" \"npm run serve\"",
+    "dev:tunnel": "concurrently \"npm run watch\" \"npm run serve:tunnel\""
+  },
   "devDependencies": {
     "@protomaps/basemaps": "^5.0.2",
     "@types/node": "^22.13.10",
+    "concurrently": "^8.2.2",
+    "http-server": "^14.1.1",
+    "localtunnel": "^2.0.2",
+    "nodemon": "^3.1.9",
     "tsx": "^4.7.2"
   }
 }
