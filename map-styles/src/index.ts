@@ -1,12 +1,11 @@
-import themes, { ImmichTheme } from './themes';
+import themes from './themes';
 import fs from 'fs';
 import path from 'path';
-import { layersWithCustomTheme } from '../../submodules/basemaps/styles/src';
+import { layers } from '@protomaps/basemaps';
 
 const generateLayers = (themeName: string) => {
   const sourceName = 'vector'
   const theme = themes[themeName];
-  const layers = layersWithCustomTheme(sourceName, theme, "en");
   const style = {
     version: 8,
     "name": "Immich Map",
@@ -17,8 +16,8 @@ const generateLayers = (themeName: string) => {
         url: 'https://tiles.immich.cloud/v1.json',
       },
     },
-    layers: layers,
-    sprite: `https://static.immich.cloud/tiles/sprites/v1/${theme.iconStyle}`,
+    layers: layers(sourceName, theme, { lang:"en" }),
+    sprite: `https://static.immich.cloud/tiles/sprites/v2/${theme.iconStyle}`,
     glyphs: "https://static.immich.cloud/tiles/fonts/{fontstack}/{range}.pbf",
   };
 

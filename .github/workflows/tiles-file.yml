@@ -28,6 +28,9 @@ jobs:
     outputs:
       KEY: ${{ steps.latest_build.outputs.KEY }}
     steps:
+      - name: Tune GitHub-hosted runner network
+        uses: smorimoto/tune-github-hosted-runner-network@v1
+
       - name: Checkout code
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
@@ -42,7 +45,7 @@ jobs:
         run: npm ci
 
       - name: Generate styles
-        run: npm run generate
+        run: npm run build
 
       - name: Find latest pmtiles build
         id: latest_build
@@ -78,7 +81,7 @@ jobs:
         run: rclone --progress copy ./dist/ r2:/tiles-${{ matrix.bucket_region }}/${{ steps.latest_build.outputs.KEY }}/styles/ --s3-no-check-bucket --s3-chunk-size=64M --multi-thread-streams=50 --checkers=512
 
       - name: Copy latest tiles to R2
-        run: rclone --progress copyto pmtiles:/${{ steps.latest_build.outputs.KEY }}.pmtiles r2:/tiles-${{ matrix.bucket_region }}/${{ steps.latest_build.outputs.KEY }}/tiles.pmtiles --s3-no-check-bucket --s3-chunk-size=64M --multi-thread-streams=50 --checkers=512
+        run: rclone --progress --http-no-head copyurl "https://build.protomaps.com/${{ steps.latest_build.outputs.KEY }}.pmtiles" r2:/tiles-${{ matrix.bucket_region }}/${{ steps.latest_build.outputs.KEY }}/tiles.pmtiles --s3-no-check-bucket --s3-upload-concurrency 32 --s3-chunk-size=512M --multi-thread-streams=100 --checkers=1024
   update_tile_ref:
     name: Update tile server file reference
     needs: [deploy_tiles]
