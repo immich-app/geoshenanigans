@@ -31,11 +31,6 @@ resource "cloudflare_workers_script" "tiles" {
     }
   }
 
-  kv_namespace_binding {
-    name         = "KV"
-    namespace_id = data.terraform_remote_state.tiles_state.outputs.kv_namespace_id
-  }
-
   dynamic "d1_database_binding" {
     for_each = data.terraform_remote_state.tiles_state.outputs.d1_regional_databases
     content {
