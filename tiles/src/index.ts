@@ -145,9 +145,10 @@ async function handleRequest(
     request.url,
   );
   if (cached && cached.headers.get(Header.PMTILES_DEPLOYMENT_KEY) === env.DEPLOYMENT_KEY) {
-    const metric = Metric.create('cdn_hit')
+    const metric = Metric.create('tiles_cdn_hit')
       .addTag('deployment_key', env.DEPLOYMENT_KEY)
-      .addTag('request_type', pmTilesParams.requestType ?? 'unknown');
+      .addTag('request_type', pmTilesParams.requestType ?? 'unknown')
+      .intField('count', 1);
     if (pmTilesParams.requestType === 'tile') {
       metric.addTag('z', (pmTilesParams as PMTilesTileParams).z);
     } else if (pmTilesParams.requestType === 'style') {
