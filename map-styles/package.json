@@ -14,7 +14,7 @@
   "devDependencies": {
     "@protomaps/basemaps": "^5.0.2",
     "@types/node": "^22.13.10",
-    "concurrently": "^8.2.2",
+    "concurrently": "^9.0.0",
     "http-server": "^14.1.1",
     "localtunnel": "^2.0.2",
     "nodemon": "^3.1.9",
