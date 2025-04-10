@@ -15,25 +15,21 @@ import { monitorAsyncFunction } from './monitor';
 
 export class CloudflareD1Repository implements IDatabaseRepository {
   constructor(
-    private databases: { [key: string]: D1Database },
+    private database: D1Database,
     private metrics: IMetricsRepository,
   ) {}
 
   async query(query: string, ...values: unknown[]) {
     const metric = Metric.create('d1_query');
-    const { key: databaseKey, resp } = await Promise.race(
-      Object.entries(this.databases).map(async ([key, database]) => {
-        const resp = await database
-          .prepare(query)
-          .bind(...values)
-          .run();
-        return { key, resp };
-      }),
-    );
+    const resp = await this.database
+      .withSession('first-unconstrained')
+      .prepare(query)
+      .bind(...values)
+      .run();
+
     console.log('resp_meta', resp.meta);
     metric
       .durationField('duration')
-      .addTag('database_key', databaseKey)
       .addTag('served_by_region', resp.meta.served_by as string)
       .addTag('served_by_primary', (resp.meta.served_by_primary as boolean).toString())
       .intField('rows_read', resp.meta.rows_read)
