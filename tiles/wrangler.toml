@@ -12,34 +12,9 @@ id = "5a4b82694e8b490db8b8904cdaea4f00"
 preview_id = "5a4b82694e8b490db8b8904cdaea4f00"
 
 [[d1_databases]]
-binding = "D1_WNAM"
-database_name = "tiles-wnam"
-database_id = "837aa5e4-f404-4613-b30c-34f3b8bca150"
-
-[[d1_databases]]
-binding = "D1_ENAM"
-database_name = "tiles-enam"
-database_id = "f63d8430-3e5b-42bd-a6a6-45fd3f552a9a"
-
-[[d1_databases]]
-binding = "D1_WEUR"
-database_name = "tiles-weur"
-database_id = "ce5b6777-c533-4ff1-91a4-d6b5e94293da"
-
-[[d1_databases]]
-binding = "D1_EEUR"
-database_name = "tiles-eeur"
-database_id = "538b5ef8-9a73-4bd8-a088-3a43c992cfd0"
-
-[[d1_databases]]
-binding = "D1_APAC"
-database_name = "tiles-apac"
-database_id = "d8501ddc-adea-48b4-a577-074640b56493"
-
-[[d1_databases]]
-binding = "D1_OC"
-database_name = "tiles-oc"
-database_id = "403f37a6-ebe8-4d05-9ffb-088aa73fa014"
+binding = "D1_GLOBAL"
+database_name = "tiles"
+database_id = "c60521e7-59bd-4186-81e7-9a676edf9b75"
 
 # Bind an R2 Bucket. Use R2 to store arbitrarily large blobs of data, such as files.
 # Docs: https://developers.cloudflare.com/workers/wrangler/configuration/#r2-buckets
