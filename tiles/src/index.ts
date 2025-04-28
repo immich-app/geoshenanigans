@@ -89,6 +89,8 @@ async function handleRequest(
   deferredRepository: CloudflareDeferredRepository,
   metrics: IMetricsRepository,
 ) {
+  const d1Repository = new CloudflareD1Repository(env.D1_GLOBAL, metrics);
+  void d1Repository.query('SELECT 1');
   const cacheResponse = async (response: Response): Promise<Response> => {
     if (!response.body) {
       throw new Error('Response body is undefined');
@@ -183,7 +185,6 @@ async function handleRequest(
   const filteredBucketMap = Object.fromEntries(
     Object.entries(bucketMap).filter(([key]) => buckets.includes(key as R2BucketRegion)),
   );
-  const d1Repository = new CloudflareD1Repository(env.D1_GLOBAL, metrics);
 
   const storageRepository = new R2StorageRepository(filteredBucketMap, env.DEPLOYMENT_KEY, metrics);
   const pmTilesService = await metrics.monitorAsyncFunction({ name: 'pmtiles_init' }, PMTilesService.init)(
