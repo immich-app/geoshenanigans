@@ -28,9 +28,6 @@ jobs:
     outputs:
       KEY: ${{ steps.latest_build.outputs.KEY }}
     steps:
-      - name: Tune GitHub-hosted runner network
-        uses: smorimoto/tune-github-hosted-runner-network@bb252dcb5c8609a31087e7993daa086f5a1c0069 # v1
-
       - name: Checkout code
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
