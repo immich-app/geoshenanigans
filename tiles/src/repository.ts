@@ -30,6 +30,7 @@ export class CloudflareD1Repository implements IDatabaseRepository {
     console.log('resp_meta', resp.meta);
     metric
       .durationField('duration')
+      .addTag('query', query)
       .addTag('served_by_region', resp.meta.served_by_region as string)
       .addTag('served_by_primary', (resp.meta.served_by_primary as boolean).toString())
       .intField('rows_read', resp.meta.rows_read)
