@@ -58,6 +58,9 @@ jobs:
           echo "KEY=$build"
           echo "KEY=$build" >> $GITHUB_OUTPUT
 
+      - name: Install GH CLI
+        uses: dev-hanz-ops/install-gh-cli-action@v0.2.1
+
       - name: Setup Rclone
         uses: AnimMouse/setup-rclone@0d99fa3878a334d3e307c1a8372ad55550fdaea7 # v1
         with:
