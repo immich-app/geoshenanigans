@@ -18,19 +18,13 @@ concurrency:
 jobs:
   deploy_tiles:
     name: Deploy Tiles & Styles
-    strategy:
-      matrix:
-        bucket_region: [ "wnam", "enam", "weur", "eeur", "apac", "oc" ]
     defaults:
       run:
         working-directory: 'map-styles'
-    runs-on: ubuntu-latest
+    runs-on: mich
     outputs:
       KEY: ${{ steps.latest_build.outputs.KEY }}
     steps:
-      - name: Tune GitHub-hosted runner network
-        uses: smorimoto/tune-github-hosted-runner-network@bb252dcb5c8609a31087e7993daa086f5a1c0069 # v1
-
       - name: Checkout code
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
@@ -61,6 +55,9 @@ jobs:
           echo "KEY=$build"
           echo "KEY=$build" >> $GITHUB_OUTPUT
 
+      - name: Install GH CLI
+        uses: dev-hanz-ops/install-gh-cli-action@v0.2.1
+
       - name: Setup Rclone
         uses: AnimMouse/setup-rclone@0d99fa3878a334d3e307c1a8372ad55550fdaea7 # v1
         with:
@@ -77,11 +74,37 @@ jobs:
             type = http
             url = https://build.protomaps.com/
 
-      - name: Copy latest styles to R2
-        run: rclone --progress copy ./dist/ r2:/tiles-${{ matrix.bucket_region }}/${{ steps.latest_build.outputs.KEY }}/styles/ --s3-no-check-bucket --s3-chunk-size=64M --multi-thread-streams=50 --checkers=512
+      - name: Download latest tiles from build server
+        run: |
+          sudo apt-get update
+          sudo apt-get install aria2 -y
+          aria2c --continue=true -s16 -x16 -j16 --summary-interval=10 --remote-time=true --file-allocation=none https://build.protomaps.com/${{ steps.latest_build.outputs.KEY }}.pmtiles -d ./dist/ -o tiles.pmtiles
 
       - name: Copy latest tiles to R2
-        run: rclone --progress --http-no-head copyurl "https://build.protomaps.com/${{ steps.latest_build.outputs.KEY }}.pmtiles" r2:/tiles-${{ matrix.bucket_region }}/${{ steps.latest_build.outputs.KEY }}/tiles.pmtiles --s3-no-check-bucket --s3-upload-concurrency 32 --s3-chunk-size=512M --multi-thread-streams=100 --checkers=1024
+        run: |
+          regions="wnam oc weur apac eeur enam"
+          key="${{ steps.latest_build.outputs.KEY }}"
+          source_folder="./dist/"
+
+          for region in $regions; do
+            dest="r2:/tiles-${region}/${key}/"
+            echo "--- Starting parallel upload to $dest ---"
+            (
+              rclone --progress copyto "$source_folder" "$dest" \
+                --s3-no-check-bucket \
+                --ignore-checksum \
+                --s3-disable-checksum \
+                --s3-upload-cutoff=100M \
+                --transfers 1 \
+                --s3-upload-concurrency 25 \
+                --s3-chunk-size=100M \
+                --multi-thread-streams=25 \
+                --checkers=64 2>&1 | sed "s/^/[${region}] /"
+            ) &
+          done
+
+          wait # Wait for all background rclone processes to finish
+          echo "--- All parallel uploads completed. ---"
   update_tile_ref:
     name: Update tile server file reference
     needs: [deploy_tiles]
