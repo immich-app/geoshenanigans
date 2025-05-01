@@ -11,23 +11,25 @@ export function monitorAsyncFunction<T extends AsyncFn>(
   const { name: operationName, tags = {} } = operation;
   const { monitorInvocations = true, acceptedErrors = [] } = options;
 
-  const metric = Metric.create(`${operationPrefix}_${operationName}`);
-  metric.addTags(tags);
   return async (...args: Parameters<T>) => {
+    const metric = Metric.create(`${operationPrefix}_${operationName}`);
+    metric.addTags(tags);
+
     if (monitorInvocations) {
       metric.intField('invocation', 1);
     }
-    return call(...args)
-      .catch((e) => {
-        if (!acceptedErrors || !acceptedErrors.some((acceptedError) => e instanceof acceptedError)) {
-          console.error(e, `${operationName}_errors`);
-          metric.intField('errors', 1);
-        }
-        throw e;
-      })
-      .finally(() => {
-        metric.durationField('duration');
-        metricsWriteCallback(metric);
-      });
+
+    try {
+      return await call(...args);
+    } catch (e) {
+      if (!acceptedErrors || !acceptedErrors.some((acceptedError) => e instanceof acceptedError)) {
+        console.error(e, `${operationName}_errors`);
+        metric.intField('errors', 1);
+      }
+      throw e;
+    } finally {
+      metric.durationField('duration');
+      metricsWriteCallback(metric);
+    }
   };
 }
