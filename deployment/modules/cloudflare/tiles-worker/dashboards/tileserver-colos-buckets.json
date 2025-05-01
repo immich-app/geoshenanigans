@@ -1,0 +1,1141 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": 31,
+  "links": [],
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "panels": [],
+      "repeat": "colo",
+      "repeatDirection": "h",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 1,
+        "x": 0,
+        "y": 1
+      },
+      "id": 2,
+      "options": {
+        "code": {
+          "language": "plaintext",
+          "showLineNumbers": false,
+          "showMiniMap": false
+        },
+        "content": "# $colo",
+        "mode": "markdown"
+      },
+      "pluginVersion": "10.4.3",
+      "type": "text"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "scheme",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": 3600000,
+            "lineInterpolation": "linear",
+            "lineStyle": {
+              "fill": "solid"
+            },
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 10
+              },
+              {
+                "color": "yellow",
+                "value": 500
+              },
+              {
+                "color": "orange",
+                "value": 1000
+              },
+              {
+                "color": "red",
+                "value": 1300
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": [
+          {
+            "__systemRef": "hideSeriesFrom",
+            "matcher": {
+              "id": "byNames",
+              "options": {
+                "mode": "exclude",
+                "names": [
+                  "p95"
+                ],
+                "prefix": "All except:",
+                "readOnly": true
+              }
+            },
+            "properties": [
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": true
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 1,
+        "y": 1
+      },
+      "id": 5,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "avg(tiles_get_tile_duration{colo=~\"$colo\"}[10m])",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "1m",
+          "legendFormat": "Average",
+          "range": true,
+          "refId": "A",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "quantile(0.95, tiles_get_tile_duration{colo=~\"$colo\"}[10m])",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "1m",
+          "legendFormat": "p95",
+          "range": true,
+          "refId": "B",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "quantile(0.99, tiles_get_tile_duration{colo=~\"$colo\"}[10m])",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "1m",
+          "legendFormat": "p99",
+          "range": true,
+          "refId": "C",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "quantile(0.80, tiles_get_tile_duration{colo=~\"$colo\"}[10m])",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "1m",
+          "legendFormat": "p80",
+          "range": true,
+          "refId": "D",
+          "useBackend": false
+        }
+      ],
+      "title": "Tile Duration",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic",
+            "seriesBy": "last"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 32,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": 3600000,
+            "lineInterpolation": "smooth",
+            "lineStyle": {
+              "fill": "solid"
+            },
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "fieldMinMax": false,
+          "mappings": [],
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 5,
+        "y": 1
+      },
+      "id": 476,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "builder",
+          "expr": "sort(sum by(bucket_key) (sum_over_time(r2_storage_get_count{colo=~\"$colo\"}[1h])))",
+          "fullMetaSearch": false,
+          "hide": true,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "1m",
+          "legendFormat": "{{bucket_key}}",
+          "range": true,
+          "refId": "region",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "builder",
+          "expr": "sum(sum_over_time(r2_storage_get_count{colo=\"$colo\"}[1h]))",
+          "fullMetaSearch": false,
+          "hide": true,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "10m",
+          "legendFormat": "total",
+          "range": true,
+          "refId": "total",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "name": "Expression",
+            "type": "__expr__",
+            "uid": "__expr__"
+          },
+          "expression": "$region/$total",
+          "hide": false,
+          "refId": "%",
+          "type": "math"
+        }
+      ],
+      "title": "Requests served by each regional bucket",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic",
+            "seriesBy": "last"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "bars",
+            "fillOpacity": 32,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": 3600000,
+            "lineInterpolation": "smooth",
+            "lineStyle": {
+              "fill": "solid"
+            },
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "fieldMinMax": false,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 9,
+        "y": 1
+      },
+      "id": 501,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "quantile(0.95, r2_storage_get_weur_duration{colo=\"$colo\"}[10m])",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "10m",
+          "legendFormat": "weur",
+          "range": true,
+          "refId": "weur",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "quantile(0.95, r2_storage_get_eeur_duration{colo=\"$colo\"}[10m])",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "10m",
+          "legendFormat": "eeur",
+          "range": true,
+          "refId": "eeur",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "quantile(0.95, r2_storage_get_apac_duration{colo=\"$colo\"}[10m])",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "10m",
+          "legendFormat": "apac",
+          "range": true,
+          "refId": "apac",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "quantile(0.95, r2_storage_get_enam_duration{colo=\"$colo\"}[10m])",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "10m",
+          "legendFormat": "enam",
+          "range": true,
+          "refId": "enam",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "quantile(0.95, r2_storage_get_wnam_duration{colo=\"$colo\"}[10m])",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "10m",
+          "legendFormat": "wnam",
+          "range": true,
+          "refId": "wnam",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "quantile(0.95, r2_storage_get_oc_duration{colo=\"$colo\"}[10m])",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "10m",
+          "legendFormat": "oc",
+          "range": true,
+          "refId": "oc",
+          "useBackend": false
+        }
+      ],
+      "title": "Requests served by each regional bucket",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic",
+            "seriesBy": "last"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "bars",
+            "fillOpacity": 32,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": 3600000,
+            "lineInterpolation": "smooth",
+            "lineStyle": {
+              "fill": "solid"
+            },
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "fieldMinMax": false,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 13,
+        "y": 1
+      },
+      "id": 1132,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "avg(r2_storage_get_weur_duration{colo=\"$colo\"}[24h])",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "24h",
+          "legendFormat": "weur",
+          "range": true,
+          "refId": "weur",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "avg(r2_storage_get_eeur_duration{colo=\"$colo\"}[24h])",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "24h",
+          "legendFormat": "eeur",
+          "range": true,
+          "refId": "eeur",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "avg(r2_storage_get_apac_duration{colo=\"$colo\"}[24h])",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "24h",
+          "legendFormat": "apac",
+          "range": true,
+          "refId": "apac",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "avg(r2_storage_get_enam_duration{colo=\"$colo\"}[24h])",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "24h",
+          "legendFormat": "enam",
+          "range": true,
+          "refId": "enam",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "avg(r2_storage_get_wnam_duration{colo=\"$colo\"}[24h])",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "24h",
+          "legendFormat": "wnam",
+          "range": true,
+          "refId": "wnam",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "avg(r2_storage_get_oc_duration{colo=\"$colo\"}[24h])",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "24h",
+          "legendFormat": "oc",
+          "range": true,
+          "refId": "oc",
+          "useBackend": false
+        }
+      ],
+      "timeFrom": "now-7d",
+      "title": "Requests served by each regional bucket",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": 3600000,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 4,
+        "x": 17,
+        "y": 1
+      },
+      "id": 18,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "sum(count_over_time(tiles_handle_request_invocation{colo=\"$colo\"}[1d]))",
+          "fullMetaSearch": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "1h",
+          "legendFormat": "__auto",
+          "range": true,
+          "refId": "A",
+          "useBackend": false
+        }
+      ],
+      "title": "Requests per hour",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 2,
+        "x": 21,
+        "y": 1
+      },
+      "id": 35,
+      "interval": "1m",
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "10.4.3",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "quantile(0.99, tiles_handle_request_duration{colo=~\"$colo\"}[1h])",
+          "fullMetaSearch": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "1h",
+          "legendFormat": "__auto",
+          "range": true,
+          "refId": "A",
+          "useBackend": false
+        }
+      ],
+      "timeFrom": "1h",
+      "title": "99th Duration",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "dark-red",
+                "value": null
+              },
+              {
+                "color": "#EAB839",
+                "value": 50
+              },
+              {
+                "color": "green",
+                "value": 500
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 2,
+        "x": 21,
+        "y": 5
+      },
+      "id": 2861,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "10.4.3",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "sum(sum_over_time(tiles_handle_request_invocation{colo=~\"$colo\"}[7d]))",
+          "fullMetaSearch": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "1h",
+          "legendFormat": "__auto",
+          "range": true,
+          "refId": "A",
+          "useBackend": false
+        }
+      ],
+      "timeFrom": "now-7d",
+      "title": "Total Requests",
+      "type": "stat"
+    }
+  ],
+  "refresh": "",
+  "schemaVersion": 39,
+  "tags": [],
+  "templating": {
+    "list": [
+      {
+        "current": {
+          "selected": true,
+          "text": [
+            "AMS",
+            "ATL",
+            "BRU",
+            "CDG",
+            "CPH",
+            "DEN",
+            "DFW",
+            "DUS",
+            "EWR",
+            "FRA",
+            "HAM",
+            "HKG",
+            "IAD",
+            "LAX",
+            "LHR",
+            "MAD",
+            "MAN",
+            "MIA",
+            "MRS",
+            "MUC",
+            "MXP",
+            "NRT",
+            "ORD",
+            "SEA",
+            "SIN",
+            "SJC",
+            "SYD",
+            "VIE",
+            "WAW",
+            "YYZ"
+          ],
+          "value": [
+            "AMS",
+            "ATL",
+            "BRU",
+            "CDG",
+            "CPH",
+            "DEN",
+            "DFW",
+            "DUS",
+            "EWR",
+            "FRA",
+            "HAM",
+            "HKG",
+            "IAD",
+            "LAX",
+            "LHR",
+            "MAD",
+            "MAN",
+            "MIA",
+            "MRS",
+            "MUC",
+            "MXP",
+            "NRT",
+            "ORD",
+            "SEA",
+            "SIN",
+            "SJC",
+            "SYD",
+            "VIE",
+            "WAW",
+            "YYZ"
+          ]
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+        },
+        "definition": "label_values(colo)",
+        "hide": 0,
+        "includeAll": true,
+        "multi": true,
+        "name": "colo",
+        "options": [],
+        "query": {
+          "qryType": 1,
+          "query": "label_values(colo)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-30d",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Tileserver Colos (Bucket Response Times)",
+  "uid": "bdu4spg5psdfke",
+  "version": 12,
+  "weekStart": ""
+}
