@@ -170,7 +170,7 @@ export class PMTilesService {
     return tile;
   }
 
-  private async getMetadata(): Promise<Metadata> {
+  async getMetadata(): Promise<Metadata> {
     const header = this.getHeader();
 
     const resp = await this.source.getRange({

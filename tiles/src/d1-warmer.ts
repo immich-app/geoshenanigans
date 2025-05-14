@@ -1,7 +1,7 @@
 import { S3Client } from '@aws-sdk/client-s3';
 import fetchBuilder from 'fetch-retry';
 import { gunzipSync } from 'fflate';
-import { mkdirSync, readdirSync, rmSync } from 'fs';
+import { mkdirSync, readdirSync, rmSync, writeFileSync } from 'fs';
 import pLimit from 'p-limit';
 import { join } from 'path';
 import { setTimeout } from 'timers/promises';
@@ -43,12 +43,12 @@ const getDirectory = async (length: number, offset: number, source: IStorageRepo
 };
 
 enum DBS {
-  ENAM = 'ENAM',
-  WNAM = 'WNAM',
-  WEUR = 'WEUR',
-  APAC = 'APAC',
-  EEUR = 'EEUR',
-  OC = 'OC',
+  // ENAM = 'ENAM',
+  // WNAM = 'WNAM',
+  // WEUR = 'WEUR',
+  // APAC = 'APAC',
+  // EEUR = 'EEUR',
+  // OC = 'OC',
   GLOBAL = 'GLOBAL',
 }
 
@@ -135,6 +135,9 @@ const handler = async () => {
   };
 
   const [header, root] = await pmTilesService.getHeaderAndRootFromSource();
+  const metadata = await pmTilesService.getMetadata();
+  writeFileSync("./cache.json", JSON.stringify({header, root, metadata}));
+
   let countR2 = 0;
   let totalD1 = 0;
   let total = 0;
