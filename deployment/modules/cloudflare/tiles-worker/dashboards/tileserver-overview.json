@@ -11,6 +11,12 @@
         "hide": true,
         "iconColor": "rgba(0, 211, 255, 1)",
         "name": "Annotations & Alerts",
+        "target": {
+          "limit": 100,
+          "matchAny": false,
+          "tags": [],
+          "type": "dashboard"
+        },
         "type": "dashboard"
       }
     ]
@@ -1087,7 +1093,8 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green"
+                "color": "green",
+                "value": null
               },
               {
                 "color": "red",
@@ -1156,30 +1163,19 @@
             "axisColorMode": "text",
             "axisLabel": "",
             "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 0,
+            "fillOpacity": 80,
             "gradientMode": "none",
             "hideFrom": {
               "legend": false,
               "tooltip": false,
               "viz": false
             },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
             "lineWidth": 1,
-            "pointSize": 5,
             "scaleDistribution": {
               "type": "linear"
             },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
             "thresholdsStyle": {
-              "mode": "off"
+              "mode": "line"
             }
           },
           "mappings": [],
@@ -1187,11 +1183,8 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green"
-              },
-              {
-                "color": "red",
-                "value": 80
+                "color": "green",
+                "value": null
               }
             ]
           }
@@ -1207,16 +1200,25 @@
       "id": 6,
       "maxDataPoints": 10,
       "options": {
+        "barRadius": 0,
+        "barWidth": 0.97,
+        "fullHighlight": false,
+        "groupWidth": 0.7,
         "legend": {
           "calcs": [],
           "displayMode": "list",
           "placement": "bottom",
           "showLegend": true
         },
+        "orientation": "auto",
+        "showValue": "auto",
+        "stacking": "none",
         "tooltip": {
           "mode": "single",
           "sort": "none"
-        }
+        },
+        "xTickLabelRotation": 0,
+        "xTickLabelSpacing": 0
       },
       "pluginVersion": "10.4.3",
       "targets": [
@@ -1227,12 +1229,12 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "(count by(z) (count_over_time(tiles_tile_request_invocation[1h])) or 0) + (count by(z) (count_over_time(tiles_cdn_hit_count{request_type=\"tile\"}[1h])))",
+          "expr": "(sum by(z) (count_over_time(tiles_tile_request_invocation[1h])) or 0) + (sum by(z) (count_over_time(tiles_cdn_hit_count{request_type=\"tile\"}[1h])))",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "instant": false,
           "interval": "1m",
-          "legendFormat": "__auto",
+          "legendFormat": "z={{z}}",
           "range": true,
           "refId": "A",
           "useBackend": false
@@ -1244,7 +1246,7 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "(count(count_over_time(tiles_style_request_invocation[1h])) or 0) + count(count_over_time(tiles_cdn_hit_count{request_type=\"style\"}[1h]))",
+          "expr": "(sum(count_over_time(tiles_style_request_invocation[1h])) or 0) + sum(count_over_time(tiles_cdn_hit_count{request_type=\"style\"}[1h]))",
           "fullMetaSearch": false,
           "hide": false,
           "includeNullMetadata": true,
@@ -1273,7 +1275,7 @@
         }
       ],
       "title": "Request Count / Zoom Level",
-      "type": "timeseries"
+      "type": "barchart"
     },
     {
       "datasource": {
@@ -1301,18 +1303,14 @@
               "viz": false
             },
             "insertNulls": false,
-            "lineInterpolation": "smooth",
-            "lineStyle": {
-              "fill": "solid"
-            },
-            "lineWidth": 2,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
             "pointSize": 5,
             "scaleDistribution": {
-              "linearThreshold": 0,
               "type": "linear"
             },
             "showPoints": "auto",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "group": "A",
               "mode": "none"
@@ -1366,7 +1364,7 @@
           },
           "disableTextWrap": false,
           "editorMode": "builder",
-          "expr": "count by(z) (tiles_tile_request_invocation)",
+          "expr": "sum by(z) (count_over_time(tiles_tile_request_invocation[1h]))",
           "fullMetaSearch": false,
           "hide": true,
           "includeNullMetadata": true,
@@ -1384,7 +1382,7 @@
           },
           "disableTextWrap": false,
           "editorMode": "builder",
-          "expr": "count(tiles_tile_request_invocation)",
+          "expr": "sum(count_over_time(tiles_tile_request_invocation[1h]))",
           "fullMetaSearch": false,
           "hide": true,
           "includeNullMetadata": true,
@@ -1434,7 +1432,7 @@
       "type": "timeseries"
     }
   ],
-  "refresh": "",
+  "refresh": "5s",
   "schemaVersion": 39,
   "tags": [],
   "templating": {
@@ -1448,6 +1446,6 @@
   "timezone": "browser",
   "title": "Tileserver",
   "uid": "ddu4e1545csg0a",
-  "version": 32,
+  "version": 36,
   "weekStart": ""
 }
