@@ -296,10 +296,16 @@ export class CloudflareMetricsRepository implements IMetricsRepository {
     request: Request<unknown, IncomingRequestCfProperties>,
     private metricsProviders: IMetricsProviderRepository[],
   ) {
+    const url = new URL(request.headers.get('origin') ?? 'http://missing.url');
+    const apexDomain = url.hostname.split('.').splice(-2).join('.');
+    const protocol = url.protocol;
+
     this.defaultTags = {
       continent: request.cf?.continent ?? '',
       colo: request.cf?.colo ?? '',
       asOrg: request.cf?.asOrganization ?? '',
+      apexDomain,
+      protocol,
     };
   }
 
