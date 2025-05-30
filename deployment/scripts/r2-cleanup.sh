@@ -13,7 +13,7 @@ fi
 regions=("apac" "eeur" "enam" "wnam" "weur" "oc")
 
 # Define the path to the JSON file
-json_file="../modules/cloudflare/tiles-worker/tiles.tfvars.json"
+json_file="$(dirname "$0")/../modules/cloudflare/tiles-worker/tiles.tfvars.json"
 
 # Extract the value of pmtiles_deployment_key using jq
 pmtiles_deployment_key=$(cat "$json_file" | jq -r '.pmtiles_deployment_key')
