@@ -1,5 +1,14 @@
 #!/bin/bash
 
+# Get the current git branch
+current_branch=$(git rev-parse --abbrev-ref HEAD)
+
+# Check if the current branch is main
+if [ "$current_branch" != "main" ]; then
+  echo "Not on main branch. Current branch is $current_branch. Exiting."
+  exit 0
+fi
+
 # Define an array of strings
 regions=("apac" "eeur" "enam" "wnam" "weur" "oc")
 
