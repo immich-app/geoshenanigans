@@ -1,3 +1,4 @@
+name: 'Tiles Cleanup'
 on:
   workflow_dispatch:
   schedule:
@@ -9,19 +10,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  deploy_tiles:
-    name: Deploy Tiles & Styles
+  cleanup_tiles:
+    name: Cleanup Tiles & Styles
     defaults:
       run:
         working-directory: 'deployment'
-    runs-on: mich
+    runs-on: ubuntu-latest
     outputs:
       KEY: ${{ steps.latest_build.outputs.KEY }}
     steps:
       - name: Checkout code
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
-        with:
-          submodules: 'recursive'
 
       - name: Setup Rclone
         uses: AnimMouse/setup-rclone@0d99fa3878a334d3e307c1a8372ad55550fdaea7 # v1
