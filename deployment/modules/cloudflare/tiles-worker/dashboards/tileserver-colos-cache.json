@@ -18,7 +18,7 @@
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 0,
-  "id": 11,
+  "id": 43,
   "links": [],
   "panels": [
     {
@@ -1637,8 +1637,8 @@
             "uid": "36979063-5384-4eb9-8679-565a727cbc13"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
-          "expr": "avg(avg_over_time(tiles_get_leaf_directory_duration{colo=\"$colo\"}[1m]))",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.80, sum by (vmrange) (histogram_over_time(tiles_get_leaf_directory_duration{colo=\"$colo\"}[1m])))",
           "fullMetaSearch": false,
           "hide": false,
           "includeNullMetadata": true,
@@ -1655,8 +1655,8 @@
             "uid": "36979063-5384-4eb9-8679-565a727cbc13"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
-          "expr": "avg(avg_over_time(tiles_find_tile_leaf_directory_duration{colo=\"$colo\"}[1m]))",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.80, sum by (vmrange) (histogram_over_time(tiles_find_tile_leaf_directory_duration{colo=\"$colo\"}[1m])))",
           "fullMetaSearch": false,
           "hide": false,
           "includeNullMetadata": true,
@@ -1673,8 +1673,8 @@
             "uid": "36979063-5384-4eb9-8679-565a727cbc13"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
-          "expr": "max(max_over_time(tiles_d1_lookup_duration{colo=\"$colo\"}[1m]))",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.80, sum by (vmrange) (histogram_over_time(tiles_d1_lookup_duration{colo=\"$colo\"}[1m])))",
           "fullMetaSearch": false,
           "hide": false,
           "includeNullMetadata": true,
@@ -2609,6 +2609,6 @@
   "timezone": "browser",
   "title": "Tileserver Colos",
   "uid": "bdu4spg5psdfkd",
-  "version": 84,
+  "version": 2,
   "weekStart": ""
 }
