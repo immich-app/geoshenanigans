@@ -54,18 +54,18 @@ resource "grafana_rule_group" "rule_group_0000" {
       ref_id = "A"
 
       relative_time_range {
-        from = 43200
+        from = 300
         to   = 0
       }
 
       datasource_uid = "36979063-5384-4eb9-8679-565a727cbc13"
-      model          = "{\"datasource\":{\"type\":\"prometheus\",\"uid\":\"36979063-5384-4eb9-8679-565a727cbc13\"},\"disableTextWrap\":false,\"editorMode\":\"code\",\"expr\":\"((sum by(apexDomain) (count_over_time(tiles_tile_request_invocation{protocol='https:'}[1h])) or 0) + (sum by(apexDomain) (count_over_time(tiles_cdn_hit_count{request_type=\\\"tile\\\", protocol='https:'}[1h])))) / 60 / 60 \\u003e 0.5\",\"fullMetaSearch\":false,\"includeNullMetadata\":true,\"instant\":false,\"interval\":\"1h\",\"intervalMs\":3600000,\"legendFormat\":\"{{origin}}\",\"maxDataPoints\":10,\"range\":true,\"refId\":\"A\",\"useBackend\":false}"
+      model          = "{\"datasource\":{\"type\":\"prometheus\",\"uid\":\"36979063-5384-4eb9-8679-565a727cbc13\"},\"disableTextWrap\":false,\"editorMode\":\"code\",\"expr\":\"((sum by(apexDomain) (count_over_time(tiles_tile_request_invocation{protocol='https:'}[1h])) or 0) + (sum by(apexDomain) (count_over_time(tiles_cdn_hit_count{request_type=\\\"tile\\\", protocol='https:'}[1h])))) / 60 / 60 \\u003e 0.3\",\"fullMetaSearch\":false,\"includeNullMetadata\":true,\"instant\":false,\"interval\":\"1h\",\"intervalMs\":60000,\"legendFormat\":\"{{origin}}\",\"maxDataPoints\":43200,\"range\":true,\"refId\":\"A\",\"useBackend\":false}"
     }
     data {
       ref_id = "C"
 
       relative_time_range {
-        from = 43200
+        from = 300
         to   = 0
       }
 
@@ -76,7 +76,7 @@ resource "grafana_rule_group" "rule_group_0000" {
       ref_id = "B"
 
       relative_time_range {
-        from = 43200
+        from = 300
         to   = 0
       }
 
