@@ -296,7 +296,7 @@
               "options": {
                 "mode": "exclude",
                 "names": [
-                  "99th Percentile"
+                  "95th Percentile"
                 ],
                 "prefix": "All except:",
                 "readOnly": true
@@ -1009,6 +1009,7 @@
               "options": {
                 "mode": "exclude",
                 "names": [
+                  "Last Week",
                   "Today",
                   "Last Month"
                 ],
@@ -1179,7 +1180,8 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green"
+                "color": "green",
+                "value": null
               },
               {
                 "color": "red",
@@ -1268,7 +1270,8 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green"
+                "color": "green",
+                "value": null
               }
             ]
           }
@@ -1408,7 +1411,8 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green"
+                "color": "green",
+                "value": null
               }
             ]
           }
@@ -1422,7 +1426,6 @@
         "y": 40
       },
       "id": 12,
-      "maxDataPoints": 10,
       "options": {
         "legend": {
           "calcs": [],
@@ -1444,11 +1447,11 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "(sum by(apexDomain) (count_over_time(tiles_tile_request_invocation{protocol='https:'}[1h])) or 0) + (sum by(apexDomain) (count_over_time(tiles_cdn_hit_count{request_type=\"tile\", protocol='https:'}[1h]))) > 1000",
+          "expr": "((sum by(apexDomain) (count_over_time(tiles_tile_request_invocation{protocol='https:'}[1h])) or 0) + (sum by(apexDomain) (count_over_time(tiles_cdn_hit_count{request_type=\"tile\", protocol='https:'}[1h])))) / 60 / 60 > 0.3",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "instant": false,
-          "interval": "1h",
+          "interval": "1m",
           "legendFormat": "{{origin}}",
           "range": true,
           "refId": "A",
@@ -1506,7 +1509,8 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green"
+                "color": "green",
+                "value": null
               },
               {
                 "color": "red",
@@ -1627,6 +1631,6 @@
   "timezone": "browser",
   "title": "Tileserver",
   "uid": "ddu4e1545csg0a",
-  "version": 7,
+  "version": 11,
   "weekStart": ""
 }
