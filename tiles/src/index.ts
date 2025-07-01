@@ -89,6 +89,8 @@ async function handleRequest(
   deferredRepository: CloudflareDeferredRepository,
   metrics: IMetricsRepository,
 ) {
+  const d1Repository = new CloudflareD1Repository(env.D1_GLOBAL, metrics);
+  void d1Repository.query('SELECT 1');
   const cacheResponse = async (response: Response): Promise<Response> => {
     if (!response.body) {
       throw new Error('Response body is undefined');
@@ -177,24 +179,12 @@ async function handleRequest(
     weur: env.BUCKET_WEUR,
     oc: env.BUCKET_OC,
   };
-  const d1Map: Record<R2BucketRegion, D1Database> = {
-    apac: env.D1_APAC,
-    eeur: env.D1_EEUR,
-    enam: env.D1_ENAM,
-    wnam: env.D1_WNAM,
-    weur: env.D1_WEUR,
-    oc: env.D1_OC,
-  };
   const colo = request.cf?.colo || '';
   const buckets: R2BucketRegion[] = preferredBuckets[colo] || ['weur', 'eeur', 'enam', 'wnam', 'apac', 'oc'];
   console.log('Buckets', buckets);
   const filteredBucketMap = Object.fromEntries(
     Object.entries(bucketMap).filter(([key]) => buckets.includes(key as R2BucketRegion)),
   );
-  const filteredD1Map = Object.fromEntries(
-    Object.entries(d1Map).filter(([key]) => buckets.includes(key as R2BucketRegion)),
-  );
-  const d1Repository = new CloudflareD1Repository(filteredD1Map, metrics);
 
   const storageRepository = new R2StorageRepository(filteredBucketMap, env.DEPLOYMENT_KEY, metrics);
   const pmTilesService = await metrics.monitorAsyncFunction({ name: 'pmtiles_init' }, PMTilesService.init)(
