@@ -31,14 +31,6 @@ resource "cloudflare_workers_script" "tiles" {
     }
   }
 
-  dynamic "d1_database_binding" {
-    for_each = data.terraform_remote_state.tiles_state.outputs.d1_regional_databases
-    content {
-      name        = "D1_${d1_database_binding.key}"
-      database_id = d1_database_binding.value
-    }
-  }
-
   d1_database_binding {
     database_id = data.terraform_remote_state.tiles_state.outputs.d1_global_database
     name        = "D1_GLOBAL"
@@ -61,16 +53,4 @@ resource "cloudflare_workers_domain" "tiles_prod" {
   hostname   = "tiles.immich.cloud"
   service    = cloudflare_workers_script.tiles.id
   zone_id    = data.cloudflare_zone.immich_cloud.zone_id
-}
-
-import {
-  for_each = var.env == "prod" ? { import : cloudflare_workers_script.tiles } : {}
-  to       = cloudflare_workers_script.tiles
-  id       = "${var.cloudflare_account_id}/tiles-prod"
-}
-
-import {
-  for_each = var.env == "prod" ? { import : cloudflare_workers_domain.tiles } : {}
-  to       = cloudflare_workers_domain.tiles
-  id       = "${var.cloudflare_account_id}/17b3213004b9d5f077563e3c4ea3171ef9d0c5fc"
 }
