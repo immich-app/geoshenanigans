@@ -1,0 +1,10 @@
+name = "metrics-collector"
+main = "src/index.ts"
+compatibility_date = "2024-05-30" # Consider updating to a more recent date if needed
+
+[vars]
+ACCOUNT_ID = "601adaaa1eab190cdfe2945f9a6c89d0" # TODO: Replace with your Cloudflare Account ID
+API_TOKEN = "QdtKEfIeHvtPtOTM7aoyD699bIh0kZqYt_up64Vn" # TODO: Replace with your Cloudflare API Token with Analytics:Read scope
+
+[triggers]
+crons = ["*/5 * * * *"] # Run every 5 minutes
