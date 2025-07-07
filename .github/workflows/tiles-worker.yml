@@ -10,8 +10,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  tofu_version: '1.9.0'
-  tg_version: '0.75.0'
+  tofu_version: '1.10.2'
+  tg_version: '0.83.0'
 
 jobs:
   test:
@@ -116,14 +116,13 @@ jobs:
           ENVIRONMENT: dev
           OP_SERVICE_ACCOUNT_TOKEN: ${{ matrix.environment == 'prod' && secrets.OP_TF_PROD_ENV || secrets.OP_TF_DEV_ENV }}
           TF_VAR_tiles_build_dir: "${{ github.workspace }}/dist"
-        run: op run --env-file=".env" -- terragrunt run-all fmt -diff -check
+        run: op run --env-file=".env" -- terragrunt run --all fmt -- -diff -check
 
   plan-terragrunt:
     needs: build
     name: Plan Terragrunt
     runs-on: ubuntu-latest
     strategy:
-      max-parallel: 1
       matrix:
         environment: [dev, prod]
     if: github.ref != 'refs/heads/main' && github.event_name != 'workflow_dispatch'
@@ -157,7 +156,7 @@ jobs:
           ENVIRONMENT: ${{ matrix.environment }}
           OP_SERVICE_ACCOUNT_TOKEN: ${{ matrix.environment == 'prod' && secrets.OP_TF_PROD_ENV || secrets.OP_TF_DEV_ENV }}
           TF_VAR_tiles_build_dir: "${{ github.workspace }}/dist"
-        run: op run --env-file=".env" -- terragrunt run-all plan -no-color 2>&1 | tee "${{github.workspace}}/plan_output.txt" && exit ${PIPESTATUS[0]};
+        run: op run --env-file=".env" -- terragrunt run --all plan
 
   deploy-terragrunt:
     needs: [build, test]
@@ -195,4 +194,4 @@ jobs:
         env:
           OP_SERVICE_ACCOUNT_TOKEN: ${{ github.ref == 'refs/heads/main' && secrets.OP_TF_PROD_ENV || secrets.OP_TF_DEV_ENV }}
           TF_VAR_tiles_build_dir: "${{ github.workspace }}/dist"
-        run: op run --env-file=".env" -- terragrunt run-all apply --terragrunt-non-interactive
+        run: op run --env-file=".env" -- terragrunt run --all apply --non-interactive
