@@ -13,14 +13,6 @@ resource "cloudflare_workers_script" "tiles_d1_proxy" {
     text = "D1_PROXY"
   }
 
-  dynamic "d1_database_binding" {
-    for_each = local.d1_regional_databases
-    content {
-      name        = "D1_${d1_database_binding.key}"
-      database_id = d1_database_binding.value
-    }
-  }
-
   d1_database_binding {
     database_id = cloudflare_d1_database.tiles.id
     name        = "D1_GLOBAL"
