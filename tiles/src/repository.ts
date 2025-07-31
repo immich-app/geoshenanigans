@@ -229,6 +229,9 @@ export class InfluxMetricsProvider implements IMetricsProviderRepository {
           Authorization: `Token ${this.influxApiToken}`,
         },
       });
+      if (!response.ok) {
+        console.error('Failed to push metrics', response.status, response.statusText);
+      }
       await response.body?.cancel();
     } else {
       console.log(metrics);
