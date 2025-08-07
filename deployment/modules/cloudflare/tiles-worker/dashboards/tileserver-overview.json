@@ -557,14 +557,14 @@
               "viz": false
             },
             "insertNulls": false,
-            "lineInterpolation": "smooth",
-            "lineWidth": 2,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
             "pointSize": 5,
             "scaleDistribution": {
               "type": "linear"
             },
             "showPoints": "auto",
-            "spanNulls": true,
+            "spanNulls": false,
             "stacking": {
               "group": "A",
               "mode": "none"
@@ -597,7 +597,8 @@
         "x": 0,
         "y": 16
       },
-      "id": 13,
+      "id": 14,
+      "interval": "1s",
       "options": {
         "legend": {
           "calcs": [],
@@ -618,14 +619,16 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "histogram_quantile(0.80, sum by (vmrange) (histogram_over_time(tiles_handle_request_duration[24h])))",
+          "exemplar": false,
+          "expr": "histogram_quantile(0.90, sum by (vmrange) (histogram_over_time(r2_storage_get_weur_duration[1h])))",
           "fullMetaSearch": false,
+          "hide": false,
           "includeNullMetadata": true,
           "instant": false,
-          "interval": "1h",
-          "legendFormat": "80th Percentile",
+          "interval": "1m",
+          "legendFormat": "weur",
           "range": true,
-          "refId": "80th Percentile",
+          "refId": "A",
           "useBackend": false
         },
         {
@@ -635,15 +638,16 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (vmrange) (histogram_over_time(tiles_handle_request_duration[24h])))",
+          "exemplar": false,
+          "expr": "histogram_quantile(0.90, sum by (vmrange) (histogram_over_time(r2_storage_get_eeur_duration[1h])))",
           "fullMetaSearch": false,
           "hide": false,
           "includeNullMetadata": true,
           "instant": false,
-          "interval": "1h",
-          "legendFormat": "p50",
+          "interval": "1m",
+          "legendFormat": "eeur",
           "range": true,
-          "refId": "p50",
+          "refId": "B",
           "useBackend": false
         },
         {
@@ -653,15 +657,16 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (vmrange) (histogram_over_time(tiles_handle_request_duration[24h])))",
+          "exemplar": false,
+          "expr": "histogram_quantile(0.90, sum by (vmrange) (histogram_over_time(r2_storage_get_wnam_duration[1h])))",
           "fullMetaSearch": false,
           "hide": false,
           "includeNullMetadata": true,
           "instant": false,
-          "interval": "1h",
-          "legendFormat": "95th Percentile",
+          "interval": "1m",
+          "legendFormat": "wnam",
           "range": true,
-          "refId": "95th Percentile",
+          "refId": "C",
           "useBackend": false
         },
         {
@@ -671,19 +676,58 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (vmrange) (histogram_over_time(tiles_handle_request_duration[24h])))",
+          "exemplar": false,
+          "expr": "histogram_quantile(0.90, sum by (vmrange) (histogram_over_time(r2_storage_get_enam_duration[1h])))",
           "fullMetaSearch": false,
           "hide": false,
           "includeNullMetadata": true,
           "instant": false,
-          "interval": "1h",
-          "legendFormat": "99th Percentile",
+          "interval": "1m",
+          "legendFormat": "enam",
           "range": true,
-          "refId": "99th Percentile",
+          "refId": "D",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "histogram_quantile(0.90, sum by (vmrange) (histogram_over_time(r2_storage_get_oc_duration[1h])))",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "1m",
+          "legendFormat": "oc",
+          "range": true,
+          "refId": "E",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "histogram_quantile(0.90, sum by (vmrange) (histogram_over_time(r2_storage_get_apac_duration[1h])))",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "1m",
+          "legendFormat": "apac",
+          "range": true,
+          "refId": "F",
           "useBackend": false
         }
       ],
-      "title": "Percentile Request Duration (24 hour average)",
+      "title": "R2 p90 Duration / Region",
       "type": "timeseries"
     },
     {
@@ -825,8 +869,8 @@
             "axisLabel": "",
             "axisPlacement": "auto",
             "barAlignment": 0,
-            "drawStyle": "points",
-            "fillOpacity": 34,
+            "drawStyle": "line",
+            "fillOpacity": 0,
             "gradientMode": "none",
             "hideFrom": {
               "legend": false,
@@ -834,8 +878,8 @@
               "viz": false
             },
             "insertNulls": false,
-            "lineInterpolation": "stepBefore",
-            "lineWidth": 0,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
             "pointSize": 5,
             "scaleDistribution": {
               "type": "linear"
@@ -864,7 +908,7 @@
               }
             ]
           },
-          "unit": "none"
+          "unit": "ms"
         },
         "overrides": []
       },
@@ -874,7 +918,7 @@
         "x": 0,
         "y": 24
       },
-      "id": 1,
+      "id": 13,
       "options": {
         "legend": {
           "calcs": [],
@@ -894,19 +938,73 @@
             "uid": "36979063-5384-4eb9-8679-565a727cbc13"
           },
           "disableTextWrap": false,
-          "editorMode": "builder",
-          "expr": "count by(colo) (tiles_tile_request_duration > 2100)",
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.80, sum by (vmrange) (histogram_over_time(tiles_handle_request_duration[24h])))",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "instant": false,
-          "interval": "1m",
-          "legendFormat": "__auto",
+          "interval": "1h",
+          "legendFormat": "80th Percentile",
           "range": true,
-          "refId": "A",
+          "refId": "80th Percentile",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (vmrange) (histogram_over_time(tiles_handle_request_duration[24h])))",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "1h",
+          "legendFormat": "p50",
+          "range": true,
+          "refId": "p50",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (vmrange) (histogram_over_time(tiles_handle_request_duration[24h])))",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "1h",
+          "legendFormat": "95th Percentile",
+          "range": true,
+          "refId": "95th Percentile",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (vmrange) (histogram_over_time(tiles_handle_request_duration[24h])))",
+          "fullMetaSearch": false,
+          "hide": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "1h",
+          "legendFormat": "99th Percentile",
+          "range": true,
+          "refId": "99th Percentile",
           "useBackend": false
         }
       ],
-      "title": "Request Duration > 2s / Colo (Count)",
+      "title": "Percentile Request Duration (24 hour average)",
       "type": "timeseries"
     },
     {
@@ -1115,8 +1213,8 @@
             "axisLabel": "",
             "axisPlacement": "auto",
             "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 0,
+            "drawStyle": "points",
+            "fillOpacity": 34,
             "gradientMode": "none",
             "hideFrom": {
               "legend": false,
@@ -1124,8 +1222,8 @@
               "viz": false
             },
             "insertNulls": false,
-            "lineInterpolation": "smooth",
-            "lineWidth": 1,
+            "lineInterpolation": "stepBefore",
+            "lineWidth": 0,
             "pointSize": 5,
             "scaleDistribution": {
               "type": "linear"
@@ -1154,7 +1252,7 @@
               }
             ]
           },
-          "unit": "percentunit"
+          "unit": "none"
         },
         "overrides": []
       },
@@ -1164,7 +1262,7 @@
         "x": 0,
         "y": 32
       },
-      "id": 8,
+      "id": 1,
       "options": {
         "legend": {
           "calcs": [],
@@ -1184,108 +1282,19 @@
             "uid": "36979063-5384-4eb9-8679-565a727cbc13"
           },
           "disableTextWrap": false,
-          "editorMode": "code",
-          "exemplar": false,
-          "expr": "count(count_over_time(tiles_tile_request_duration[$__interval] >= 1000))",
+          "editorMode": "builder",
+          "expr": "count by(colo) (tiles_tile_request_duration > 2100)",
           "fullMetaSearch": false,
-          "hide": true,
           "includeNullMetadata": true,
           "instant": false,
-          "interval": "30m",
+          "interval": "1m",
           "legendFormat": "__auto",
           "range": true,
-          "refId": "1second",
+          "refId": "A",
           "useBackend": false
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
-          },
-          "disableTextWrap": false,
-          "editorMode": "code",
-          "expr": "count(count_over_time(tiles_tile_request_invocation[$__interval]))",
-          "fullMetaSearch": false,
-          "hide": true,
-          "includeNullMetadata": true,
-          "instant": false,
-          "interval": "30m",
-          "legendFormat": "__auto",
-          "range": true,
-          "refId": "total",
-          "useBackend": false
-        },
-        {
-          "datasource": {
-            "name": "Expression",
-            "type": "__expr__",
-            "uid": "__expr__"
-          },
-          "expression": "$1second/$total",
-          "hide": false,
-          "refId": ">1s",
-          "type": "math"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
-          },
-          "disableTextWrap": false,
-          "editorMode": "code",
-          "expr": "count(count_over_time(tiles_tile_request_duration[$__interval] >= 2000))",
-          "fullMetaSearch": false,
-          "hide": true,
-          "includeNullMetadata": true,
-          "instant": false,
-          "interval": "30m",
-          "legendFormat": "__auto",
-          "range": true,
-          "refId": "2second",
-          "useBackend": false
-        },
-        {
-          "datasource": {
-            "name": "Expression",
-            "type": "__expr__",
-            "uid": "__expr__"
-          },
-          "expression": "$2second/$total",
-          "hide": false,
-          "refId": ">2s",
-          "type": "math"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
-          },
-          "disableTextWrap": false,
-          "editorMode": "code",
-          "expr": "count(count_over_time(tiles_tile_request_duration[$__interval] >= 500))",
-          "fullMetaSearch": false,
-          "hide": true,
-          "includeNullMetadata": true,
-          "instant": false,
-          "interval": "30m",
-          "legendFormat": "__auto",
-          "range": true,
-          "refId": "500ms",
-          "useBackend": false
-        },
-        {
-          "datasource": {
-            "name": "Expression",
-            "type": "__expr__",
-            "uid": "__expr__"
-          },
-          "expression": "$500ms/$total",
-          "hide": false,
-          "refId": ">500ms",
-          "type": "math"
         }
       ],
-      "title": "%requests > x seconds",
+      "title": "Request Duration > 2s / Colo (Count)",
       "type": "timeseries"
     },
     {
@@ -1445,7 +1454,7 @@
             },
             "insertNulls": false,
             "lineInterpolation": "smooth",
-            "lineWidth": 2,
+            "lineWidth": 1,
             "pointSize": 5,
             "scaleDistribution": {
               "type": "linear"
@@ -1474,7 +1483,7 @@
               }
             ]
           },
-          "unit": "ms"
+          "unit": "percentunit"
         },
         "overrides": []
       },
@@ -1484,7 +1493,7 @@
         "x": 0,
         "y": 40
       },
-      "id": 5,
+      "id": 8,
       "options": {
         "legend": {
           "calcs": [],
@@ -1505,18 +1514,107 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "sum(sum_over_time(tiles_tile_request_duration[1m])) by (z) / sum(count_over_time(tiles_tile_request_duration[1m])) by (z)",
+          "exemplar": false,
+          "expr": "count(count_over_time(tiles_tile_request_duration[$__interval] >= 1000))",
           "fullMetaSearch": false,
+          "hide": true,
           "includeNullMetadata": true,
           "instant": false,
-          "interval": "1m",
+          "interval": "30m",
           "legendFormat": "__auto",
           "range": true,
-          "refId": "A",
+          "refId": "1second",
           "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "count(count_over_time(tiles_tile_request_invocation[$__interval]))",
+          "fullMetaSearch": false,
+          "hide": true,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "30m",
+          "legendFormat": "__auto",
+          "range": true,
+          "refId": "total",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "name": "Expression",
+            "type": "__expr__",
+            "uid": "__expr__"
+          },
+          "expression": "$1second/$total",
+          "hide": false,
+          "refId": ">1s",
+          "type": "math"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "count(count_over_time(tiles_tile_request_duration[$__interval] >= 2000))",
+          "fullMetaSearch": false,
+          "hide": true,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "30m",
+          "legendFormat": "__auto",
+          "range": true,
+          "refId": "2second",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "name": "Expression",
+            "type": "__expr__",
+            "uid": "__expr__"
+          },
+          "expression": "$2second/$total",
+          "hide": false,
+          "refId": ">2s",
+          "type": "math"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "count(count_over_time(tiles_tile_request_duration[$__interval] >= 500))",
+          "fullMetaSearch": false,
+          "hide": true,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "30m",
+          "legendFormat": "__auto",
+          "range": true,
+          "refId": "500ms",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "name": "Expression",
+            "type": "__expr__",
+            "uid": "__expr__"
+          },
+          "expression": "$500ms/$total",
+          "hide": false,
+          "refId": ">500ms",
+          "type": "math"
         }
       ],
-      "title": "Average Request Duration / Zoom Level",
+      "title": "%requests > x seconds",
       "type": "timeseries"
     },
     {
@@ -1700,6 +1798,107 @@
               "viz": false
             },
             "insertNulls": false,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 48
+      },
+      "id": 5,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "sum(sum_over_time(tiles_tile_request_duration[1m])) by (z) / sum(count_over_time(tiles_tile_request_duration[1m])) by (z)",
+          "fullMetaSearch": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "interval": "1m",
+          "legendFormat": "__auto",
+          "range": true,
+          "refId": "A",
+          "useBackend": false
+        }
+      ],
+      "title": "Average Request Duration / Zoom Level",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "36979063-5384-4eb9-8679-565a727cbc13"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
             "lineInterpolation": "linear",
             "lineWidth": 1,
             "pointSize": 5,
@@ -1732,7 +1931,7 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
+        "x": 12,
         "y": 48
       },
       "id": 12,
@@ -1786,6 +1985,6 @@
   "timezone": "browser",
   "title": "Tileserver",
   "uid": "ddu4e1545csg0a",
-  "version": 14,
+  "version": 17,
   "weekStart": ""
 }
