@@ -1,12 +1,11 @@
 import { IDatabaseRepository, IMemCacheRepository, IMetricsRepository, IStorageRepository } from '../interface';
-import { Directory, Entry, Header, Metadata } from './types';
+import { Directory, Entry, Header, JsonResponse, Metadata } from './types';
 import {
   bytesToHeader,
   decompress,
   deserializeIndex,
   fromRadix64,
-  getDirectoryCacheKey,
-  getHeaderCacheKey,
+  getJsonCacheKey,
   toRadix64,
   zxyToTileId,
 } from './utils';
@@ -75,29 +74,12 @@ export class PMTilesService {
     db: IDatabaseRepository,
   ): Promise<PMTilesService> {
     const p = new PMTilesService(source, memCache, metrics, db);
-    const headerCacheKey = getHeaderCacheKey(source.getDeploymentKey());
-    if (memCache.get(headerCacheKey)) {
+    const jsonCacheKey = getJsonCacheKey(source.getDeploymentKey());
+    if (memCache.get(jsonCacheKey)) {
       return p;
     }
-    const [header, root] = await p.getHeaderAndRootFromSource();
-    memCache.set(headerCacheKey, header);
-    memCache.set(
-      getDirectoryCacheKey(source.getDeploymentKey(), {
-        offset: header.rootDirectoryOffset,
-        length: header.rootDirectoryLength,
-      }),
-      root,
-    );
+    memCache.set(jsonCacheKey, await p.getJson());
     return p;
-  }
-
-  private getHeader(): Header {
-    const key = getHeaderCacheKey(this.source.getDeploymentKey());
-    const memCached = this.memCache.get<Header>(key);
-    if (!memCached) {
-      throw new Error('Header not found in cache');
-    }
-    return memCached;
   }
 
   async getHeaderAndRootFromSource(): Promise<[Header, Directory]> {
@@ -121,7 +103,12 @@ export class PMTilesService {
     return [header, rootDir];
   }
 
-  async getJsonResponse(version: string, url: URL) {
+  private async getJson(): Promise<JsonResponse> {
+    const cacheKey = getJsonCacheKey(this.source.getDeploymentKey());
+    const cache = this.memCache.get<JsonResponse>(cacheKey);
+    if (cache) {
+      return cache;
+    }
     const query = await this.db.query(
       `SELECT * FROM cache_entries_${this.source.getDeploymentKey()} WHERE startTileId = -1 LIMIT 1`,
     );
@@ -130,7 +117,11 @@ export class PMTilesService {
       throw new Error('Error while looking up tile location');
     }
 
-    const json = JSON.parse(query.results[0].entry as string);
+    return JSON.parse(query.results[0].entry as string);
+  }
+
+  async getJsonResponse(version: string, url: URL): Promise<JsonResponse> {
+    const json = await this.getJson();
     json.tiles = [
       `${url.protocol}//` +
         url.hostname +
@@ -145,9 +136,9 @@ export class PMTilesService {
   async getTile(z: number, x: number, y: number): Promise<ReadableStream | undefined> {
     console.log('getTile', z, x, y);
     const tileId = zxyToTileId(z, x, y);
-    const header = this.getHeader();
+    const json = await this.getJson();
 
-    if (z < header.minZoom || z > header.maxZoom) {
+    if (z < json.minzoom || z > json.maxzoom) {
       return;
     }
 
@@ -185,9 +176,7 @@ export class PMTilesService {
     return tile;
   }
 
-  async getMetadata(): Promise<Metadata> {
-    const header = this.getHeader();
-
+  async getMetadata(header: Header): Promise<Metadata> {
     const resp = await this.source.getRange({
       offset: header.jsonMetadataOffset,
       length: header.jsonMetadataLength,

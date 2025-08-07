@@ -257,7 +257,7 @@ export async function decompress(buf: ArrayBuffer, compression: Compression): Pr
   throw Error('Compression method not supported');
 }
 
-export function getHeaderCacheKey(archiveName: string): string {
+export function getJsonCacheKey(archiveName: string): string {
   return archiveName;
 }
 

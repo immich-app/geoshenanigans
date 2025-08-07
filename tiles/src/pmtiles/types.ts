@@ -44,6 +44,21 @@ export enum TileType {
   Avif = 5,
 }
 
+export interface JsonResponse {
+  tilejson: string;
+  scheme: string;
+  tiles: string[];
+  vector_layers: unknown;
+  attribution: string;
+  description: string;
+  name: string;
+  version: string;
+  bounds: [number, number, number, number];
+  center: [number, number, number];
+  minzoom: number;
+  maxzoom: number;
+}
+
 export interface Metadata {
   vector_layers: any[];
   attribution: string;
