@@ -1,3 +1,6 @@
+import { S3Client } from '@aws-sdk/client-s3';
+import { Upload } from '@aws-sdk/lib-storage';
+import fetchBuilder from 'fetch-retry';
 import { gunzipSync } from 'fflate';
 import { createReadStream as createFileReadStream, mkdirSync, readdirSync, rmSync } from 'fs';
 import pLimit from 'p-limit';
@@ -90,10 +93,38 @@ enum DBS {
 }
 
 const handler = async () => {
-  const { CLOUDFLARE_ACCOUNT_ID, DEPLOYMENT_KEY, PMTILES_FILE_PATH } = process.env;
-  if (!CLOUDFLARE_ACCOUNT_ID || !DEPLOYMENT_KEY || !PMTILES_FILE_PATH) {
+  const {
+    S3_ACCESS_KEY,
+    S3_SECRET_KEY,
+    S3_ENDPOINT,
+    CLOUDFLARE_ACCOUNT_ID,
+    BUCKET_KEY,
+    DEPLOYMENT_KEY,
+    PMTILES_FILE_PATH,
+  } = process.env;
+  if (
+    !S3_ACCESS_KEY ||
+    !S3_SECRET_KEY ||
+    !S3_ENDPOINT ||
+    !CLOUDFLARE_ACCOUNT_ID ||
+    !BUCKET_KEY ||
+    !DEPLOYMENT_KEY ||
+    !PMTILES_FILE_PATH
+  ) {
     throw new Error('Missing environment variables');
   }
+
+  console.log('Starting S3');
+  const client = new S3Client({
+    region: 'auto',
+    endpoint: S3_ENDPOINT,
+    forcePathStyle: true,
+    requestStreamBufferSize: 32 * 1024,
+    credentials: {
+      accessKeyId: S3_ACCESS_KEY,
+      secretAccessKey: S3_SECRET_KEY,
+    },
+  });
 
   const storageRepository = new LocalStorageRepository(PMTILES_FILE_PATH);
   const memCacheRepository = new MemCacheRepository(new Map());
@@ -161,18 +192,50 @@ const handler = async () => {
     await Promise.all(promises);
   };
 
+  const uploadToS3 = async (chunk: TileDataChunk) => {
+
+    const s3Call = async () => {
+      const chunkData = await storageRepository.getRangeAsStream({
+        length: chunk.endByte - chunk.startByte,
+        offset: tileDataOffset + chunk.startByte,
+      });
+      const fileName = `chunk_${chunk.chunkId}.pmtiles`;
+      const filePath = `${DEPLOYMENT_KEY}/${fileName}`;
+      try {
+        const parallelUploads = new Upload({
+          client: client,
+          params: {
+            Bucket: BUCKET_KEY,
+            Key: filePath,
+            Body: chunkData,
+          },
+          queueSize: 1, // Concurrently upload 1 part
+          partSize: 1024 * 1024 * 5, // Set part size to 256KB
+        });
+
+        await parallelUploads.done();
+
+        if(chunk.chunkId % 100 === 0) {
+          console.log(`S3 Progress: ${chunk.chunkId}/${Object.keys(tileDataChunks).length}`);
+        }
+      } catch (e) {
+        console.error(`Failed to upload chunk ${chunk.chunkId} to S3`, e);
+        throw e;
+      }
+    };
+    promises.push(s3ChunkPushLimit(s3Call));
+  }
+
   const [header, root] = await pmTilesService.getHeaderAndRootFromSource();
-  const metadata = await pmTilesService.getMetadata();
+  const metadata = await pmTilesService.getMetadata(header);
   const json = tileJSON({ header, metadata, version: 'v1' });
-  let countR2 = 0;
+  let loadingCount = 0;
   let totalD1 = 0;
-  let total = 0;
   let countD1 = 0;
   const promises: Promise<unknown>[] = [];
   const d1Promises: Promise<unknown>[] = [];
-  const s3IndexLimit = pLimit(5);
-  const s3ChunkLimit = pLimit(5);
-  const d1Limit = pLimit(50);
+  const s3ChunkPushLimit = pLimit(50);
+  const d1Limit = pLimit(3);
 
   const dropTableStatement = `DROP TABLE IF EXISTS tmp`;
 
@@ -181,14 +244,19 @@ const handler = async () => {
     entry TEXT NOT NULL
   ) STRICT;`;
 
+  const addJsonStatement = `INSERT INTO tmp (startTileId, entry) VALUES (-1, '${JSON.stringify(json)}');`;
+
   mkdirSync('sql', { recursive: true });
   const files = readdirSync('sql');
   for (const file of files) {
     rmSync(join('sql', file));
   }
 
+  console.log('Preparing D1 database');
   await runD1QueryAllDBs(dropTableStatement);
   await runD1QueryAllDBs(createTableStatement);
+  await runD1QueryAllDBs(addJsonStatement);
+  console.log('D1 database prepared');
 
   let queryString = '';
   let d1Queue = 0;
@@ -204,139 +272,145 @@ const handler = async () => {
      - Would remove offset for the chunk, and instead just have every tile offset from the index of the data chunk it is in
    - Should setup D1 to create a new database for each deployment, requires some terraform magic?
    - Race tigris alongside R2 with metrics to see which is faster for tile retrieval, only TTFB possible?
+   - Automate warming process in github actions
   **/
+
+  type TileDataChunk = { chunkId: number; startByte: number; endByte: number }
+
   const tileDataOffset = header.tileDataOffset;
   const tileDataLength = header.tileDataLength;
-  const tileDataChunks: { [chunkId: number]: { startByte: number; endByte: number } } = {};
-  const tileDataChunkSize = 25_000_000;
+  const tileDataChunks: { [chunkId: number]: TileDataChunk } = {};
+  const tileDataChunkSize = 1_000_000;
 
   if (!tileDataLength) {
     throw new Error('Tile data length undefined from header');
   }
 
+  let currentChunk: TileDataChunk | undefined;
+
   for (const entry of root.entries) {
-    const call = async () => {
-      while (d1Queue > 1000) {
-        await setTimeout(1000);
+    while (d1Queue > 1000) {
+      await setTimeout(1000);
+    }
+
+    const directory = await getDirectory(
+      entry.length,
+      entry.offset + header.leafDirectoryOffset,
+      storageRepository,
+      header,
+    );
+
+    const maxChunk = 0;
+
+    for (const dirEntry of directory.entries) {
+      const tileStartByte = dirEntry.offset;
+      const tileEndByte = tileStartByte + dirEntry.length;
+      const tileChunkId = Math.floor(tileStartByte / tileDataChunkSize);
+      if(currentChunk && tileChunkId < currentChunk.chunkId) {
+        continue;
       }
-      const directory = await getDirectory(
-        entry.length,
-        entry.offset + header.leafDirectoryOffset,
-        storageRepository,
-        header,
-      );
 
-      for (const dirEntry of directory.entries) {
-        const tileStartByte = dirEntry.offset + directory.offsetStart;
-        const tileEndByte = tileStartByte + dirEntry.length;
-        const tileChunkId = Math.floor(tileStartByte / tileDataChunkSize);
-        const chunkRecord = tileDataChunks[tileChunkId];
-        let modified = false;
+      if(tileChunkId != currentChunk?.chunkId) {
 
-        if (!chunkRecord) {
+        if(currentChunk) {
+          await uploadToS3(currentChunk);
+        }
+
+        if(!tileDataChunks[tileChunkId]) {
           tileDataChunks[tileChunkId] = {
+            chunkId: tileChunkId,
             startByte: tileStartByte,
             endByte: tileEndByte,
           };
-          console.log('New chunk', tileChunkId, tileDataChunks[tileChunkId]);
-          continue;
         }
-
-        if (tileStartByte <= chunkRecord.startByte) {
-          chunkRecord.startByte = tileStartByte;
-          modified = true;
-          console.log('New start', tileChunkId, tileDataChunks[tileChunkId]);
-        }
-        if (tileEndByte > chunkRecord.endByte) {
-          chunkRecord.endByte = tileEndByte;
-          modified = true;
-          console.log('New end  ', tileChunkId, tileDataChunks[tileChunkId]);
-        }
-
-        if (modified) {
-          tileDataChunks[tileChunkId] = chunkRecord;
-        }
+        currentChunk = tileDataChunks[tileChunkId];
       }
 
-      const totalChunks = Math.ceil(directory.entries.length / 50);
-      for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
-        const chunkEntries = directory.entries.slice(chunkIndex * 50, (chunkIndex + 1) * 50);
-        const newChunkEntries = chunkEntries.map((entry) => ({
+      if (tileStartByte < currentChunk.startByte) {
+        throw new Error('Tile start byte is less than current chunk start byte');
+      }
+      if (tileEndByte > currentChunk.endByte) {
+        if(tileChunkId < maxChunk) {
+          console.log('Chunk end byte is greater than current chunk end byte, this should not happen', tileChunkId, tileStartByte, tileEndByte, currentChunk);
+        }
+        currentChunk.endByte = tileEndByte;
+      }
+    }
+
+    const totalChunks = Math.ceil(directory.entries.length / 50);
+    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+      const chunkEntries = directory.entries.slice(chunkIndex * 50, (chunkIndex + 1) * 50);
+      const newChunkEntries = chunkEntries.map((entry) => {
+        const chunkId = Math.floor((entry.offset) / tileDataChunkSize);
+        return {
           tileId: entry.tileId,
-          offset: (entry.offset + directory.offsetStart) % tileDataLength,
-          chunkId: Math.floor((entry.offset + directory.offsetStart) / tileDataChunkSize),
+          offset: entry.offset - tileDataChunks[chunkId].startByte,
+          chunkId,
           length: entry.length,
           runLength: entry.runLength,
-        }));
-        const directoryChunk = {
-          offsetStart: newChunkEntries[0].offset,
-          tileIdStart: newChunkEntries[0].tileId,
-          entries: newChunkEntries,
+        }});
+      const directoryChunk = {
+        offsetStart: newChunkEntries[0].offset,
+        tileIdStart: newChunkEntries[0].tileId,
+        entries: newChunkEntries,
+      };
+
+      const startTileId = chunkEntries[0].tileId;
+
+      const entryValue = DirectoryString.fromDirectory(directoryChunk).toString();
+
+      queryString += `INSERT INTO tmp (startTileId, entry) VALUES (${startTileId}, '${entryValue}');`;
+
+      if (queryString.length > 90000) {
+        ++totalD1;
+        const query = queryString;
+        ++d1Queue;
+        const d1Call = async () => {
+          await runD1QueryAllDBs(query);
+          ++countD1;
+          --d1Queue;
+          if (countD1 % 100 === 0) {
+            console.log('D1 Progress: ' + countD1 + '/' + totalD1);
+          }
         };
-
-        const startTileId = chunkEntries[0].tileId;
-
-        const stream = DirectoryString.fromDirectory(directoryChunk);
-        const entryValue = stream.toString();
-
-        queryString += `INSERT INTO tmp (startTileId, entry) VALUES (${startTileId}, '${entryValue}');`;
-
-        if (queryString.length > 90000) {
-          ++totalD1;
-          const query = queryString;
-          ++d1Queue;
-          const d1Call = async () => {
-            await runD1QueryAllDBs(query);
-            ++countD1;
-            --d1Queue;
-            if (countD1 % 100 === 0) {
-              console.log('D1 Progress: ' + countD1 + '/' + totalD1);
-            }
-          };
-          d1Promises.push(d1Limit(d1Call));
-          queryString = '';
-        }
+        d1Promises.push(d1Limit(d1Call));
+        queryString = '';
       }
+    }
 
-      countR2++;
-      console.log('R2 Progress: ' + countR2 + '/' + total);
-    };
-
-    promises.push(s3IndexLimit(call));
-    total++;
+    loadingCount++;
+    console.log('Loading Progress: ' + loadingCount + '/' + root.entries.length);
   }
 
   await Promise.all(promises);
   await Promise.all(d1Promises);
 
-  console.log(tileDataChunks);
+  for (const db of Object.values(DBS)) {
+    const call = async () => {
+      const tables = await runD1Query(`PRAGMA table_list`, db);
+      const tableExists = tables.results.some(
+        (table: { name: string }) => table.name === `cache_entries_${DEPLOYMENT_KEY}`,
+      );
+      if (tableExists) {
+        await runD1Query(
+          `ALTER TABLE cache_entries_${DEPLOYMENT_KEY} RENAME TO cache_entries_${DEPLOYMENT_KEY}_old;`,
+          db,
+        );
+      }
+      await runD1Query(`ALTER TABLE tmp RENAME TO cache_entries_${DEPLOYMENT_KEY};`, db);
+      console.log('Tables switched', db);
+      if (tableExists) {
+        console.log('Waiting 10 seconds before dropping old table', db);
+        await setTimeout(10000);
+        console.log('Dropping old table', db);
+        await runD1Query(`DROP TABLE cache_entries_${DEPLOYMENT_KEY}_old;`, db);
+        console.log('Dropped old table', db);
+      }
+    };
+    promises.push(call());
+  }
 
-  // for (const db of Object.values(DBS)) {
-  //   const call = async () => {
-  //     const tables = await runD1Query(`PRAGMA table_list`, db);
-  //     const tableExists = tables.results.some(
-  //       (table: { name: string }) => table.name === `cache_entries_${DEPLOYMENT_KEY}`,
-  //     );
-  //     if (tableExists) {
-  //       await runD1Query(
-  //         `ALTER TABLE cache_entries_${DEPLOYMENT_KEY} RENAME TO cache_entries_${DEPLOYMENT_KEY}_old;`,
-  //         db,
-  //       );
-  //     }
-  //     await runD1Query(`ALTER TABLE tmp RENAME TO cache_entries_${DEPLOYMENT_KEY};`, db);
-  //     console.log('Tables switched', db);
-  //     if (tableExists) {
-  //       console.log('Waiting 10 seconds before dropping old table', db);
-  //       await setTimeout(10000);
-  //       console.log('Dropping old table', db);
-  //       await runD1Query(`DROP TABLE cache_entries_${DEPLOYMENT_KEY}_old;`, db);
-  //       console.log('Dropped old table', db);
-  //     }
-  //   };
-  //   promises.push(call());
-  // }
-  //
-  // await Promise.all(promises);
+  await Promise.all(promises);
 };
 
 process.on('uncaughtException', (e) => {
