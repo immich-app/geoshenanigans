@@ -1,6 +1,5 @@
 import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { Point } from '@influxdata/influxdb-client';
-import { createReadStream as createFileReadStream } from 'fs';
 import {
   AsyncFn,
   IDatabaseRepository,
@@ -152,51 +151,6 @@ export class S3StorageRepository implements IStorageRepository {
 
   getDeploymentKey(): string {
     return this.deploymentKey;
-  }
-}
-
-export class LocalStorageRepository implements IStorageRepository {
-  constructor(private filePath: string) {}
-
-  async getRange(range: { length: number; offset: number }): Promise<ArrayBuffer> {
-    const stream = await this.getRangeAsStream(range);
-    return new Response(stream).arrayBuffer();
-  }
-
-  async getRangeAsStream(range: { length: number; offset: number }): Promise<ReadableStream> {
-    const fileStream = createFileReadStream(this.filePath, {
-      start: range.offset,
-      end: range.offset + range.length - 1,
-    });
-
-    return new ReadableStream({
-      start(controller) {
-        fileStream.on('data', (chunk) => {
-          controller.enqueue(chunk);
-        });
-        fileStream.on('end', () => {
-          controller.close();
-        });
-        fileStream.on('error', (error) => {
-          controller.error(error);
-        });
-      },
-      cancel() {
-        fileStream.destroy();
-      },
-    });
-  }
-
-  async get(key: string): Promise<ArrayBuffer> {
-    throw Error(`get(${key}) is not implemented for LocalStorageRepository`);
-  }
-
-  async getAsStream(key: string): Promise<ReadableStream> {
-    throw Error(`getAsStream(${key}) is not implemented for LocalStorageRepository`);
-  }
-
-  getDeploymentKey(): string {
-    return 'local_deployment_key';
   }
 }
 

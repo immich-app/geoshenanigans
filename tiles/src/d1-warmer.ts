@@ -1,5 +1,5 @@
 import { gunzipSync } from 'fflate';
-import { mkdirSync, readdirSync, rmSync } from 'fs';
+import { createReadStream as createFileReadStream, mkdirSync, readdirSync, rmSync } from 'fs';
 import pLimit from 'p-limit';
 import { join } from 'path';
 import { setTimeout } from 'timers/promises';
@@ -7,7 +7,52 @@ import { AsyncFn, IMetricsRepository, IStorageRepository, Operation } from './in
 import { DirectoryString, PMTilesService } from './pmtiles/pmtiles.service';
 import { Compression, Directory, Header } from './pmtiles/types';
 import { deserializeIndex, tileJSON } from './pmtiles/utils';
-import { CloudflareD1Repository, LocalStorageRepository, MemCacheRepository } from './repository';
+import { CloudflareD1Repository, MemCacheRepository } from './repository';
+
+export class LocalStorageRepository implements IStorageRepository {
+  constructor(private filePath: string) {}
+
+  async getRange(range: { length: number; offset: number }): Promise<ArrayBuffer> {
+    const stream = await this.getRangeAsStream(range);
+    return new Response(stream).arrayBuffer();
+  }
+
+  async getRangeAsStream(range: { length: number; offset: number }): Promise<ReadableStream> {
+    const fileStream = createFileReadStream(this.filePath, {
+      start: range.offset,
+      end: range.offset + range.length - 1,
+    });
+
+    return new ReadableStream({
+      start(controller) {
+        fileStream.on('data', (chunk) => {
+          controller.enqueue(chunk);
+        });
+        fileStream.on('end', () => {
+          controller.close();
+        });
+        fileStream.on('error', (error) => {
+          controller.error(error);
+        });
+      },
+      cancel() {
+        fileStream.destroy();
+      },
+    });
+  }
+
+  async get(key: string): Promise<ArrayBuffer> {
+    throw Error(`get(${key}) is not implemented for LocalStorageRepository`);
+  }
+
+  async getAsStream(key: string): Promise<ReadableStream> {
+    throw Error(`getAsStream(${key}) is not implemented for LocalStorageRepository`);
+  }
+
+  getDeploymentKey(): string {
+    return 'local_deployment_key';
+  }
+}
 
 class FakeMetricsRepository implements IMetricsRepository {
   constructor() {}
