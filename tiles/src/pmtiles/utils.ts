@@ -119,19 +119,12 @@ export function readVarint(bufferPosition: BufferPosition): number {
   return readVarintRemainder(val, bufferPosition);
 }
 
-export const tileJSON = (args: { header: Header; metadata: Metadata; url: URL; version: string }) => {
-  const { header, metadata, url, version } = args;
+export const tileJSON = (args: { header: Header; metadata: Metadata; version: string }) => {
+  const { header, metadata } = args;
   return {
     tilejson: '3.0.0',
     scheme: 'xyz',
-    tiles: [
-      `${url.protocol}//` +
-        url.hostname +
-        `${url.port ? `:${url.port}` : ''}` +
-        `/v${version}` +
-        '/{z}/{x}/{y}' +
-        '.mvt',
-    ],
+    tiles: ['https://tiles.immich.cloud/v1/{z}/{x}/{y}.mvt'],
     vector_layers: metadata.vector_layers,
     attribution: metadata.attribution,
     description: metadata.description,
@@ -153,7 +146,7 @@ export function deserializeIndex(buffer: ArrayBuffer): Entry[] {
   let lastId = 0;
   for (let i = 0; i < numEntries; i++) {
     const v = readVarint(p);
-    entries.push({ tileId: lastId + v, offset: 0, length: 0, runLength: 1 });
+    entries.push({ tileId: lastId + v, offset: 0, length: 0, chunkId: 0, runLength: 1 });
     lastId += v;
   }
 

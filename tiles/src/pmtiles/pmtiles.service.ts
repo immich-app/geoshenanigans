@@ -7,7 +7,6 @@ import {
   fromRadix64,
   getDirectoryCacheKey,
   getHeaderCacheKey,
-  tileJSON,
   toRadix64,
   zxyToTileId,
 } from './utils';
@@ -123,9 +122,24 @@ export class PMTilesService {
   }
 
   async getJsonResponse(version: string, url: URL) {
-    const header = this.getHeader();
-    const metadata = await this.getMetadata();
-    return tileJSON({ header, metadata, url, version });
+    const query = await this.db.query(
+      `SELECT * FROM cache_entries_${this.source.getDeploymentKey()} WHERE startTileId = -1 LIMIT 1`,
+    );
+
+    if (query.error || !query.success || query.results.length === 0) {
+      throw new Error('Error while looking up tile location');
+    }
+
+    const json = JSON.parse(query.results[0].entry as string);
+    json.tiles = [
+      `${url.protocol}//` +
+        url.hostname +
+        `${url.port ? `:${url.port}` : ''}` +
+        `/v${version}` +
+        '/{z}/{x}/{y}' +
+        '.mvt',
+    ];
+    return json;
   }
 
   async getTile(z: number, x: number, y: number): Promise<ReadableStream | undefined> {
@@ -171,7 +185,7 @@ export class PMTilesService {
     return tile;
   }
 
-  private async getMetadata(): Promise<Metadata> {
+  async getMetadata(): Promise<Metadata> {
     const header = this.getHeader();
 
     const resp = await this.source.getRange({

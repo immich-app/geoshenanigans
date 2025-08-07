@@ -6,7 +6,7 @@ import { setTimeout } from 'timers/promises';
 import { AsyncFn, IMetricsRepository, IStorageRepository, Operation } from './interface';
 import { DirectoryString, PMTilesService } from './pmtiles/pmtiles.service';
 import { Compression, Directory, Header } from './pmtiles/types';
-import { deserializeIndex } from './pmtiles/utils';
+import { deserializeIndex, tileJSON } from './pmtiles/utils';
 import { CloudflareD1Repository, LocalStorageRepository, MemCacheRepository } from './repository';
 
 class FakeMetricsRepository implements IMetricsRepository {
@@ -117,6 +117,8 @@ const handler = async () => {
   };
 
   const [header, root] = await pmTilesService.getHeaderAndRootFromSource();
+  const metadata = await pmTilesService.getMetadata();
+  const json = tileJSON({ header, metadata, version: 'v1' });
   let countR2 = 0;
   let totalD1 = 0;
   let total = 0;
@@ -264,7 +266,32 @@ const handler = async () => {
 
   console.log(tileDataChunks);
 
-  await Promise.all(promises);
+  // for (const db of Object.values(DBS)) {
+  //   const call = async () => {
+  //     const tables = await runD1Query(`PRAGMA table_list`, db);
+  //     const tableExists = tables.results.some(
+  //       (table: { name: string }) => table.name === `cache_entries_${DEPLOYMENT_KEY}`,
+  //     );
+  //     if (tableExists) {
+  //       await runD1Query(
+  //         `ALTER TABLE cache_entries_${DEPLOYMENT_KEY} RENAME TO cache_entries_${DEPLOYMENT_KEY}_old;`,
+  //         db,
+  //       );
+  //     }
+  //     await runD1Query(`ALTER TABLE tmp RENAME TO cache_entries_${DEPLOYMENT_KEY};`, db);
+  //     console.log('Tables switched', db);
+  //     if (tableExists) {
+  //       console.log('Waiting 10 seconds before dropping old table', db);
+  //       await setTimeout(10000);
+  //       console.log('Dropping old table', db);
+  //       await runD1Query(`DROP TABLE cache_entries_${DEPLOYMENT_KEY}_old;`, db);
+  //       console.log('Dropped old table', db);
+  //     }
+  //   };
+  //   promises.push(call());
+  // }
+  //
+  // await Promise.all(promises);
 };
 
 process.on('uncaughtException', (e) => {
