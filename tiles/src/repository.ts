@@ -162,6 +162,10 @@ export class CloudflareDeferredRepository implements IDeferredRepository {
     this.deferred.push(call);
   }
 
+  runImmediately(promise: Promise<unknown>): void {
+    this.ctx.waitUntil(promise);
+  }
+
   runDeferred() {
     for (const call of this.deferred) {
       this.ctx.waitUntil(call());
