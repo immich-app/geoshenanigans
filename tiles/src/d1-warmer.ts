@@ -3,7 +3,7 @@ import { Upload } from '@aws-sdk/lib-storage';
 import fetchBuilder from 'fetch-retry';
 import { gunzipSync } from 'fflate';
 import { createReadStream as createFileReadStream, mkdirSync, readdirSync, rmSync } from 'fs';
-import pLimit from 'p-limit';
+import pLimit, {LimitFunction} from 'p-limit';
 import { join } from 'path';
 import { setTimeout } from 'timers/promises';
 import { AsyncFn, IMetricsRepository, IStorageRepository, Operation } from './interface';
@@ -91,6 +91,15 @@ const getDirectory = async (length: number, offset: number, source: IStorageRepo
 enum DBS {
   GLOBAL = 'GLOBAL',
 }
+
+const R2_BUCKETS = [
+  "tiles-wnam",
+  "tiles-enam",
+  "tiles-weur",
+  "tiles-eeur",
+  "tiles-apac",
+  "tiles-oc"
+]
 
 const handler = async () => {
   const {
@@ -192,38 +201,46 @@ const handler = async () => {
     await Promise.all(promises);
   };
 
+  const r2Promises: {[key: string]: Promise<unknown>[]} = {}
+  const r2Limits: { [key: string]: LimitFunction } = {};
+  for(const bucketKey of R2_BUCKETS) {
+    r2Limits[bucketKey] = pLimit(50);
+    r2Promises[bucketKey] = [];
+  }
+
   const uploadToS3 = async (chunk: TileDataChunk) => {
-
-    const s3Call = async () => {
-      const chunkData = await storageRepository.getRangeAsStream({
-        length: chunk.endByte - chunk.startByte,
-        offset: tileDataOffset + chunk.startByte,
-      });
-      const fileName = `chunk_${chunk.chunkId}.pmtiles`;
-      const filePath = `${DEPLOYMENT_KEY}/${fileName}`;
-      try {
-        const parallelUploads = new Upload({
-          client: client,
-          params: {
-            Bucket: BUCKET_KEY,
-            Key: filePath,
-            Body: chunkData,
-          },
-          queueSize: 1, // Concurrently upload 1 part
-          partSize: 1024 * 1024 * 5, // Set part size to 256KB
+    for(const bucketKey of R2_BUCKETS) {
+      const s3Call = async () => {
+        const chunkData = await storageRepository.getRangeAsStream({
+          length: chunk.endByte - chunk.startByte,
+          offset: tileDataOffset + chunk.startByte,
         });
+        const fileName = `chunk_${chunk.chunkId}.pmtiles`;
+        const filePath = `${DEPLOYMENT_KEY}/${fileName}`;
+        try {
+          const parallelUploads = new Upload({
+            client: client,
+            params: {
+              Bucket: bucketKey,
+              Key: filePath,
+              Body: chunkData,
+            },
+            queueSize: 1, // Concurrently upload 1 part
+            partSize: 1024 * 1024 * 5, // Set part size to 256KB
+          });
 
-        await parallelUploads.done();
+          await parallelUploads.done();
 
-        if(chunk.chunkId % 100 === 0) {
-          console.log(`S3 Progress: ${chunk.chunkId}/${Object.keys(tileDataChunks).length}`);
+          if (chunk.chunkId % 100 === 0) {
+            console.log(`S3 Progress (${bucketKey}): ${chunk.chunkId}/${Object.keys(tileDataChunks).length}`);
+          }
+        } catch (e) {
+          console.error(`Failed to upload chunk ${chunk.chunkId} to S3`, e);
+          throw e;
         }
-      } catch (e) {
-        console.error(`Failed to upload chunk ${chunk.chunkId} to S3`, e);
-        throw e;
       }
-    };
-    promises.push(s3ChunkPushLimit(s3Call));
+      r2Promises[bucketKey].push(r2Limits[bucketKey](s3Call));
+    }
   }
 
   const [header, root] = await pmTilesService.getHeaderAndRootFromSource();
@@ -232,9 +249,7 @@ const handler = async () => {
   let loadingCount = 0;
   let totalD1 = 0;
   let countD1 = 0;
-  const promises: Promise<unknown>[] = [];
   const d1Promises: Promise<unknown>[] = [];
-  const s3ChunkPushLimit = pLimit(50);
   const d1Limit = pLimit(3);
 
   const dropTableStatement = `DROP TABLE IF EXISTS tmp`;
@@ -382,7 +397,9 @@ const handler = async () => {
     console.log('Loading Progress: ' + loadingCount + '/' + root.entries.length);
   }
 
-  await Promise.all(promises);
+  for(const promises of Object.values(r2Promises)) {
+    await Promise.all(promises);
+  }
   await Promise.all(d1Promises);
 
   for (const db of Object.values(DBS)) {
@@ -407,10 +424,10 @@ const handler = async () => {
         console.log('Dropped old table', db);
       }
     };
-    promises.push(call());
+    d1Promises.push(call());
   }
 
-  await Promise.all(promises);
+  await Promise.all(d1Promises);
 };
 
 process.on('uncaughtException', (e) => {
