@@ -258,7 +258,7 @@ const handler = async () => {
   let totalD1 = 0;
   let countD1 = 0;
   const d1Promises: Promise<unknown>[] = [];
-  const d1Limit = pLimit(3);
+  const d1Limit = pLimit(25);
 
   const dropTableStatement = `DROP TABLE IF EXISTS tmp`;
 
