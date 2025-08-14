@@ -78,7 +78,7 @@ export class PMTilesService {
     if (memCache.get(jsonCacheKey)) {
       return p;
     }
-    memCache.set(jsonCacheKey, await p.getJson());
+    // memCache.set(jsonCacheKey, await p.getJson());
     return p;
   }
 
