@@ -392,7 +392,7 @@ const handler = async () => {
           await runD1QueryAllDBs(query);
           ++countD1;
           --d1Queue;
-          if (countD1 % 100 === 0) {
+          if (countD1 % 25 === 0) {
             console.log('D1 Progress: ' + countD1 + '/' + totalD1);
           }
         };
