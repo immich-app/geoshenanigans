@@ -89,7 +89,7 @@ const getDirectory = async (length: number, offset: number, source: IStorageRepo
 };
 
 enum DBS {
-  GLOBAL = 'GLOBAL',
+  DEV = 'DEV',
 }
 
 const R2_BUCKETS = [
