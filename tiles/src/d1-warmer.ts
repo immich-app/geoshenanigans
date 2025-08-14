@@ -130,9 +130,10 @@ const handler = async () => {
     forcePathStyle: true,
     requestStreamBufferSize: 32 * 1024,
     requestHandler: {
-      requestTimeout: 30_000,
-      httpsAgent: { maxSockets: 500 },
+      httpsAgent: { maxSockets: 1000 },
     },
+    retryMode: 'adaptive',
+    maxAttempts: 10,
     credentials: {
       accessKeyId: S3_ACCESS_KEY,
       secretAccessKey: S3_SECRET_KEY,
@@ -160,10 +161,13 @@ const handler = async () => {
       },
       body,
       method: 'POST',
-      retryDelay: 1000,
-      retries: 5,
+      retryDelay: (attempt, error, response) => {
+        console.log('Server error, retrying query', attempt, error, response);
+        return 1000 * Math.pow(1.5, attempt); // Exponential backoff
+      },
+      retries: 10,
       retryOn: (attempt, error, response) => {
-        if (!response?.ok && attempt < 5) {
+        if (!response?.ok && attempt < 10) {
           console.log('Retrying query', attempt, error, response);
           return true;
         }
