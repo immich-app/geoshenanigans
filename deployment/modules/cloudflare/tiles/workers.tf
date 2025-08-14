@@ -18,6 +18,11 @@ resource "cloudflare_workers_script" "tiles_d1_proxy" {
     name        = "D1_GLOBAL"
   }
 
+  d1_database_binding {
+    database_id = cloudflare_d1_database.tiles_dev.id
+    name        = "D1_DEV"
+  }
+
   compatibility_date  = "2024-07-29"
   compatibility_flags = ["nodejs_compat"]
 }
