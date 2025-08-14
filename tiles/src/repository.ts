@@ -90,12 +90,12 @@ export class R2StorageRepository implements IStorageRepository {
     return resp;
   }
 
-  async getRange(range: { offset: number; length: number }): Promise<ArrayBuffer> {
-    return (await this.getR2Object({ range })).arrayBuffer();
+  async getRange(range: { offset: number; length: number }, filename?: string): Promise<ArrayBuffer> {
+    return (await this.getR2Object({key: filename, range })).arrayBuffer();
   }
 
-  async getRangeAsStream(range: { offset: number; length: number }): Promise<ReadableStream> {
-    return (await this.getR2Object({ range })).body;
+  async getRangeAsStream(range: { offset: number; length: number }, filename?: string): Promise<ReadableStream> {
+    return (await this.getR2Object({ key: filename, range })).body;
   }
 
   async get(key: string): Promise<ArrayBuffer> {

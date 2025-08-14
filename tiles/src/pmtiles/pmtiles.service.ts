@@ -78,7 +78,7 @@ export class PMTilesService {
     if (memCache.get(jsonCacheKey)) {
       return p;
     }
-    // memCache.set(jsonCacheKey, await p.getJson());
+    memCache.set(jsonCacheKey, await p.getJson());
     return p;
   }
 
@@ -171,9 +171,8 @@ export class PMTilesService {
     const tileLength = entry.length;
     const chunkId = entry.chunkId;
 
-    //TODO: Fix to handle chunked tile data, storage repository needs support for range requests to a specified file
     const tile = await this.metrics.monitorAsyncFunction({ name: 'get_tile' }, (offset, length) =>
-      this.source.getRangeAsStream({ offset, length }),
+      this.source.getRangeAsStream({ offset, length }, `chunk_${chunkId}.pmtiles`),
     )(tileOffset, tileLength);
     return tile;
   }
