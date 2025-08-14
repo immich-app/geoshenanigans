@@ -129,6 +129,10 @@ const handler = async () => {
     endpoint: S3_ENDPOINT,
     forcePathStyle: true,
     requestStreamBufferSize: 32 * 1024,
+    requestHandler: {
+      requestTimeout: 30_000,
+      httpsAgent: { maxSockets: 500 },
+    },
     credentials: {
       accessKeyId: S3_ACCESS_KEY,
       secretAccessKey: S3_SECRET_KEY,
@@ -204,7 +208,7 @@ const handler = async () => {
   const r2Promises: {[key: string]: Promise<unknown>[]} = {}
   const r2Limits: { [key: string]: LimitFunction } = {};
   for(const bucketKey of R2_BUCKETS) {
-    r2Limits[bucketKey] = pLimit(50);
+    r2Limits[bucketKey] = pLimit(100);
     r2Promises[bucketKey] = [];
   }
 
