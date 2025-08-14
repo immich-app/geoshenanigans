@@ -170,36 +170,6 @@ export function deserializeIndex(buffer: ArrayBuffer): Entry[] {
   return entries;
 }
 
-/**
- * Low-level function for looking up a TileID or leaf directory inside a directory.
- */
-export function findTile(entries: Entry[], tileId: number): Entry | undefined {
-  let m = 0;
-  let n = entries.length - 1;
-  while (m <= n) {
-    const k = (n + m) >> 1;
-    const cmp = tileId - entries[k].tileId;
-    if (cmp > 0) {
-      m = k + 1;
-    } else if (cmp < 0) {
-      n = k - 1;
-    } else {
-      return entries[k];
-    }
-  }
-
-  // at this point, m > n
-  if (n >= 0) {
-    if (entries[n].runLength === 0) {
-      return entries[n];
-    }
-    if (tileId - entries[n].tileId < entries[n].runLength) {
-      return entries[n];
-    }
-  }
-  return;
-}
-
 export function getUint64(v: DataView, offset: number): number {
   const wh = v.getUint32(offset + 4, true);
   const wl = v.getUint32(offset + 0, true);
@@ -259,10 +229,6 @@ export async function decompress(buf: ArrayBuffer, compression: Compression): Pr
 
 export function getJsonCacheKey(archiveName: string): string {
   return archiveName;
-}
-
-export function getDirectoryCacheKey(fileName: string, range: { offset: number; length: number }): string {
-  return `${fileName}|${range.offset}|${range.length}`;
 }
 
 const BASE64_CHARS = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz/.';

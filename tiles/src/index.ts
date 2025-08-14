@@ -1,6 +1,6 @@
 import { preferredBuckets, R2BucketRegion } from './buckets';
 import { IMetricsRepository } from './interface';
-import { PMTilesService } from './pmtiles/pmtiles.service';
+import { PMTilesService } from './pmtiles.service';
 import {
   CloudflareD1Repository,
   CloudflareDeferredRepository,

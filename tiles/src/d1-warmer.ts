@@ -7,7 +7,7 @@ import pLimit from 'p-limit';
 import { join } from 'path';
 import { setTimeout } from 'timers/promises';
 import { AsyncFn, IMetricsRepository, IStorageRepository, Operation } from './interface';
-import { DirectoryString, PMTilesService } from './pmtiles/pmtiles.service';
+import { DirectoryString, PMTilesService } from './pmtiles.service';
 import { Compression, Directory, Header } from './pmtiles/types';
 import { deserializeIndex, tileJSON } from './pmtiles/utils';
 import { CloudflareD1Repository, MemCacheRepository } from './repository';

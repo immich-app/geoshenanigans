@@ -1,5 +1,5 @@
-import { IDatabaseRepository, IMemCacheRepository, IMetricsRepository, IStorageRepository } from '../interface';
-import { Directory, Entry, Header, JsonResponse, Metadata } from './types';
+import { IDatabaseRepository, IMemCacheRepository, IMetricsRepository, IStorageRepository } from './interface';
+import { Directory, Entry, Header, JsonResponse, Metadata } from './pmtiles/types';
 import {
   bytesToHeader,
   decompress,
@@ -8,7 +8,7 @@ import {
   getJsonCacheKey,
   toRadix64,
   zxyToTileId,
-} from './utils';
+} from './pmtiles/utils';
 
 const HEADER_SIZE_BYTES = 127;
 
