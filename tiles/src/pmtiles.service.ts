@@ -1,16 +1,6 @@
 import { IDatabaseRepository, IMemCacheRepository, IMetricsRepository, IStorageRepository } from './interface';
-import { Directory, Entry, Header, JsonResponse, Metadata } from './pmtiles/types';
-import {
-  bytesToHeader,
-  decompress,
-  deserializeIndex,
-  fromRadix64,
-  getJsonCacheKey,
-  toRadix64,
-  zxyToTileId,
-} from './pmtiles/utils';
-
-const HEADER_SIZE_BYTES = 127;
+import { Directory, Entry, JsonResponse } from './pmtiles/types';
+import { fromRadix64, getJsonCacheKey, toRadix64, zxyToTileId } from './pmtiles/utils';
 
 export class DirectoryString {
   constructor(private entry: string) {}
@@ -78,29 +68,8 @@ export class PMTilesService {
     if (memCache.get(jsonCacheKey)) {
       return p;
     }
-    // memCache.set(jsonCacheKey, await p.getJson());
+    memCache.set(jsonCacheKey, await p.getJson());
     return p;
-  }
-
-  async getHeaderAndRootFromSource(): Promise<[Header, Directory]> {
-    const resp = await this.source.getRange({ offset: 0, length: 16384 });
-    const v = new DataView(resp);
-    if (v.getUint16(0, true) !== 0x4d50) {
-      throw new Error('Wrong magic number for PMTiles archive');
-    }
-
-    const headerData = resp.slice(0, HEADER_SIZE_BYTES);
-    const header = await bytesToHeader(headerData);
-    const rootDirData = resp.slice(header.rootDirectoryOffset, header.rootDirectoryOffset + header.rootDirectoryLength);
-    const rootDirEntries = deserializeIndex(
-      await new Response(await decompress(rootDirData, header.internalCompression)).arrayBuffer(),
-    );
-    const rootDir: Directory = {
-      offsetStart: rootDirEntries[0].offset,
-      tileIdStart: rootDirEntries[0].tileId,
-      entries: rootDirEntries,
-    };
-    return [header, rootDir];
   }
 
   private async getJson(): Promise<JsonResponse> {
@@ -175,15 +144,5 @@ export class PMTilesService {
       this.source.getRangeAsStream({ offset, length }, `chunk_${chunkId}.pmtiles`),
     )(tileOffset, tileLength);
     return tile;
-  }
-
-  async getMetadata(header: Header): Promise<Metadata> {
-    const resp = await this.source.getRange({
-      offset: header.jsonMetadataOffset,
-      length: header.jsonMetadataLength,
-    });
-    const decompressed = await decompress(resp, header.internalCompression);
-    const dec = new TextDecoder('utf-8');
-    return JSON.parse(dec.decode(decompressed));
   }
 }

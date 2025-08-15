@@ -1,4 +1,4 @@
-import { Compression, Entry, Header, Metadata } from './types';
+import { Compression, Entry, Header, JsonResponse, Metadata } from './types';
 
 const tileZoomValues: number[] = [
   0, 1, 5, 21, 85, 341, 1365, 5461, 21845, 87381, 349525, 1398101, 5592405, 22369621, 89478485, 357913941, 1431655765,
@@ -119,7 +119,7 @@ export function readVarint(bufferPosition: BufferPosition): number {
   return readVarintRemainder(val, bufferPosition);
 }
 
-export const tileJSON = (args: { header: Header; metadata: Metadata; version: string }) => {
+export const tileJSON = (args: { header: Header; metadata: Metadata; version: string }): JsonResponse => {
   const { header, metadata } = args;
   return {
     tilejson: '3.0.0',
