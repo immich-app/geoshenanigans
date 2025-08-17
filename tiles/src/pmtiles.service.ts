@@ -76,8 +76,10 @@ export class PMTilesService {
     const cacheKey = getJsonCacheKey(this.source.getDeploymentKey());
     const cache = this.memCache.get<JsonResponse>(cacheKey);
     if (cache) {
+      console.log('Cache hit for JSON metadata');
       return cache;
     }
+    console.log('Cache miss for JSON metadata, fetching from source');
     const query = await this.db.query(
       `SELECT * FROM cache_entries_${this.source.getDeploymentKey()} WHERE startTileId = -1 LIMIT 1`,
     );

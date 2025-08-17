@@ -12,6 +12,7 @@ import { bytesToHeader, decompress, deserializeIndex, tileJSON } from './pmtiles
    - Should setup D1 to create a new database for each deployment, requires some terraform magic?
    - Race tigris alongside R2 with metrics to see which is faster for tile retrieval, only TTFB possible?
    - Automate warming process in github actions
+   - Fix double D1 call
   **/
 
 const db = 'DEV';

@@ -17,7 +17,13 @@ export class CloudflareD1Repository implements IDatabaseRepository {
   constructor(
     private database: D1Database,
     private metrics: IMetricsRepository,
-  ) {}
+  ) {
+    void database
+      .withSession('first-unconstrained')
+      .prepare('SELECT 1')
+      .run()
+    ;
+  }
 
   async query(query: string, ...values: unknown[]) {
     const metric = Metric.create('d1_query');

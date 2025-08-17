@@ -90,7 +90,6 @@ async function handleRequest(
   metrics: IMetricsRepository,
 ) {
   const d1Repository = new CloudflareD1Repository(env.D1_GLOBAL, metrics);
-  void d1Repository.query('SELECT 1');
   const cacheResponse = async (response: Response): Promise<Response> => {
     if (!response.body) {
       throw new Error('Response body is undefined');
