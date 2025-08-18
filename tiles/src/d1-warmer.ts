@@ -1,23 +1,14 @@
 import { S3Client } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
 import fetchBuilder from 'fetch-retry';
-import { createReadStream as createFileReadStream, mkdirSync, readdirSync, rmSync } from 'fs';
+import { createReadStream as createFileReadStream } from 'fs';
 import pLimit, { LimitFunction } from 'p-limit';
-import { join } from 'path';
 import { setTimeout } from 'timers/promises';
 import { DirectoryString } from './pmtiles.service';
 import { Compression, Header, JsonResponse, Metadata } from './pmtiles/types';
 import { bytesToHeader, decompress, deserializeIndex, tileJSON } from './pmtiles/utils';
 
 /** TODO: Remaining tasks for tile data splitting
-   - Store v1.json data in D1 for quick access, cache on startup
-   - Current header and root memcache can be removed
-   - Pull the pmtiles file as part of the warming process and do processing on disk
-   - Push chunks to S3, add header.tileDataOffset to the startByte and endByte for each chunk
-   - Alter worker code to have concept of chunking when retrieving the tile data.
-     - Needs to pull from correct index and understand different offset
-   - Would D1 be smaller if tile offsets were always max 25_000_000 but included their chunk index? Probably?
-     - Would remove offset for the chunk, and instead just have every tile offset from the index of the data chunk it is in
    - Should setup D1 to create a new database for each deployment, requires some terraform magic?
    - Race tigris alongside R2 with metrics to see which is faster for tile retrieval, only TTFB possible?
    - Automate warming process in github actions
@@ -29,14 +20,34 @@ type Chunk = { chunkId: number; startByte: number; endByte: number };
 
 const HEADER_SIZE_BYTES = 127;
 const MAX_CHUNK_FILE_SIZE_BYTES = 1_000_000;
-const R2_BUCKETS = ['tiles-wnam', 'tiles-enam', 'tiles-weur', 'tiles-eeur', 'tiles-apac', 'tiles-oc'];
+const BUCKETS = [
+  { key: 'tiles-wnam', client: 'r2' },
+  { key: 'tiles-enam', client: 'r2' },
+  { key: 'tiles-weur', client: 'r2' },
+  { key: 'tiles-eeur', client: 'r2' },
+  { key: 'tiles-apac', client: 'r2' },
+  { key: 'tiles-oc', client: 'r2' },
+  { key: 'geo', client: 'tigris' },
+];
 
-const { S3_ACCESS_KEY, S3_SECRET_KEY, S3_ENDPOINT, CLOUDFLARE_ACCOUNT_ID, DEPLOYMENT_KEY, PMTILES_FILE_PATH } =
-  process.env;
+const {
+  S3_ACCESS_KEY,
+  S3_SECRET_KEY,
+  S3_ENDPOINT,
+  TIGRIS_KEY_ID,
+  TIGRIS_ACCESS_KEY,
+  TIGRIS_ENDPOINT,
+  CLOUDFLARE_ACCOUNT_ID,
+  DEPLOYMENT_KEY,
+  PMTILES_FILE_PATH,
+} = process.env;
 if (
   !S3_ACCESS_KEY ||
   !S3_SECRET_KEY ||
   !S3_ENDPOINT ||
+  !TIGRIS_KEY_ID ||
+  !TIGRIS_ACCESS_KEY ||
+  !TIGRIS_ENDPOINT ||
   !CLOUDFLARE_ACCOUNT_ID ||
   !DEPLOYMENT_KEY ||
   !PMTILES_FILE_PATH
@@ -44,7 +55,7 @@ if (
   throw new Error('Missing environment variables');
 }
 
-const client = new S3Client({
+const r2Client = new S3Client({
   region: 'auto',
   endpoint: S3_ENDPOINT,
   forcePathStyle: true,
@@ -57,6 +68,21 @@ const client = new S3Client({
   credentials: {
     accessKeyId: S3_ACCESS_KEY,
     secretAccessKey: S3_SECRET_KEY,
+  },
+});
+
+const tigrisClient = new S3Client({
+  region: 'auto',
+  endpoint: TIGRIS_ENDPOINT,
+  forcePathStyle: false,
+  requestHandler: {
+    httpsAgent: { maxSockets: 1000 },
+  },
+  retryMode: 'adaptive',
+  maxAttempts: 10,
+  credentials: {
+    accessKeyId: TIGRIS_KEY_ID,
+    secretAccessKey: TIGRIS_ACCESS_KEY,
   },
 });
 
@@ -192,18 +218,18 @@ const finalizeDatabase = async () => {
 };
 
 const uploadToS3 = async (chunk: Chunk, header: Header, chunkMap: object) => {
-  for (const bucketKey of R2_BUCKETS) {
+  for (const bucket of BUCKETS) {
     const s3Call = async () => {
-      const bytes = await getRangeAsStream({
+      const bytes = getRangeAsStream({
         offset: header.tileDataOffset + chunk.startByte,
         length: chunk.endByte - chunk.startByte,
       });
 
       try {
         const parallelUploads = new Upload({
-          client,
+          client: bucket.client === 'r2' ? r2Client : tigrisClient,
           params: {
-            Bucket: bucketKey,
+            Bucket: bucket.key,
             Key: `${DEPLOYMENT_KEY}/chunk_${chunk.chunkId}.pmtiles`,
             Body: bytes,
           },
@@ -214,7 +240,7 @@ const uploadToS3 = async (chunk: Chunk, header: Header, chunkMap: object) => {
         await parallelUploads.done();
 
         if (chunk.chunkId % 100 === 0) {
-          console.log(`S3 Progress (${bucketKey}): ${chunk.chunkId}/${Object.keys(chunkMap).length}`);
+          console.log(`S3 Progress (${bucket.key}): ${chunk.chunkId}/${Object.keys(chunkMap).length}`);
         }
       } catch (e) {
         console.error(`Failed to upload chunk ${chunk.chunkId} to S3`, e);
@@ -222,14 +248,14 @@ const uploadToS3 = async (chunk: Chunk, header: Header, chunkMap: object) => {
       }
     };
 
-    r2Promises[bucketKey].push(r2Limits[bucketKey](s3Call));
+    r2Promises[bucket.key].push(r2Limits[bucket.key](s3Call));
   }
 };
 
 const handler = async () => {
-  for (const bucketKey of R2_BUCKETS) {
-    r2Limits[bucketKey] = pLimit(100);
-    r2Promises[bucketKey] = [];
+  for (const bucket of BUCKETS) {
+    r2Limits[bucket.key] = pLimit(bucket.client === 'r2' ? 100 : 1000);
+    r2Promises[bucket.key] = [];
   }
 
   const headerBytes = await getRange({ offset: 0, length: HEADER_SIZE_BYTES });
