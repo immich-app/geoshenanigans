@@ -21,12 +21,12 @@ type Chunk = { chunkId: number; startByte: number; endByte: number };
 const HEADER_SIZE_BYTES = 127;
 const MAX_CHUNK_FILE_SIZE_BYTES = 1_000_000;
 const BUCKETS = [
-  { key: 'tiles-wnam', client: 'r2' },
-  { key: 'tiles-enam', client: 'r2' },
-  { key: 'tiles-weur', client: 'r2' },
-  { key: 'tiles-eeur', client: 'r2' },
-  { key: 'tiles-apac', client: 'r2' },
-  { key: 'tiles-oc', client: 'r2' },
+  // { key: 'tiles-wnam', client: 'r2' },
+  // { key: 'tiles-enam', client: 'r2' },
+  // { key: 'tiles-weur', client: 'r2' },
+  // { key: 'tiles-eeur', client: 'r2' },
+  // { key: 'tiles-apac', client: 'r2' },
+  // { key: 'tiles-oc', client: 'r2' },
   { key: 'geo', client: 'tigris' },
 ];
 
