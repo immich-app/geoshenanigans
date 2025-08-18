@@ -18,11 +18,7 @@ export class CloudflareD1Repository implements IDatabaseRepository {
     private database: D1Database,
     private metrics: IMetricsRepository,
   ) {
-    void database
-      .withSession('first-unconstrained')
-      .prepare('SELECT 1')
-      .run()
-    ;
+    void database.withSession('first-unconstrained').prepare('SELECT 1').run();
   }
 
   async query(query: string, ...values: unknown[]) {
@@ -33,7 +29,6 @@ export class CloudflareD1Repository implements IDatabaseRepository {
       .bind(...values)
       .run();
 
-    console.log('resp_meta', resp.meta);
     metric
       .durationField('duration')
       .addTag('query', query)
@@ -60,74 +55,38 @@ export class MemCacheRepository implements IMemCacheRepository {
   }
 }
 
-export class R2StorageRepository implements IStorageRepository {
+export class TigrisStorageRepository implements IStorageRepository {
+  private client: S3Client;
   constructor(
-    private buckets: { [key: string]: R2Bucket },
-    private deploymentKey: string,
-    private metrics: IMetricsRepository,
-  ) {}
-
-  getDeploymentKey(): string {
-    return this.deploymentKey;
-  }
-
-  private async getR2Object(args: { key?: string; range?: { offset: number; length: number } }) {
-    const { key, range } = args;
-    const fileName = key ?? 'tiles.pmtiles';
-    const filePath = `${this.deploymentKey}/${fileName}`;
-    const metric = Metric.create('r2_storage_get');
-    const { key: bucketKey, resp } = await Promise.race(
-      Object.entries(this.buckets).map(async ([key, bucket]) => {
-        const resp = await bucket.get(filePath, {
-          range,
-        });
-        return { key, resp };
-      }),
-    );
-    metric.durationField(`${bucketKey}_duration`);
-    metric.addTag('bucket_key', bucketKey);
-    metric.addTag('file_name', fileName);
-    metric.intField('count', 1);
-    this.metrics.push(metric);
-
-    if (!resp) {
-      throw new Error(`Key not found ${filePath}`);
-    }
-    return resp;
-  }
-
-  async getRange(range: { offset: number; length: number }, filename?: string): Promise<ArrayBuffer> {
-    return (await this.getR2Object({key: filename, range })).arrayBuffer();
-  }
-
-  async getRangeAsStream(range: { offset: number; length: number }, filename?: string): Promise<ReadableStream> {
-    return (await this.getR2Object({ key: filename, range })).body;
-  }
-
-  async get(key: string): Promise<ArrayBuffer> {
-    return (await this.getR2Object({ key })).arrayBuffer();
-  }
-
-  async getAsStream(key: string): Promise<ReadableStream> {
-    return (await this.getR2Object({ key })).body;
-  }
-}
-
-export class S3StorageRepository implements IStorageRepository {
-  constructor(
-    private client: S3Client,
+    keyId: string,
+    accessKey: string,
     private bucketKey: string,
     private deploymentKey: string,
-  ) {}
+    private metrics: IMetricsRepository,
+  ) {
+    this.client = new S3Client({
+      region: 'auto',
+      credentials: {
+        accessKeyId: keyId,
+        secretAccessKey: accessKey,
+      },
+      endpoint: 'https://fly.storage.tigris.dev',
+      forcePathStyle: false,
+    });
+  }
 
   private async getS3Object(args: { key?: string; range?: { offset: number; length: number } }) {
     const { range } = args;
+    const metric = Metric.create('tigris_storage_get');
     const command = new GetObjectCommand({
       Bucket: this.bucketKey,
-      Key: this.deploymentKey + '/' + (args.key ?? 'tiles.pmtiles'),
+      Key: this.deploymentKey + '/' + args.key,
       Range: range ? `bytes=${range.offset}-${range.offset + range.length - 1}` : undefined,
     });
     const response = await this.client.send(command);
+    metric.durationField(`duration`);
+    metric.intField('count', 1);
+    this.metrics.push(metric);
     const data = response.Body;
     if (!data) {
       throw new Error('Data not found for range ' + JSON.stringify(range));
@@ -140,8 +99,8 @@ export class S3StorageRepository implements IStorageRepository {
     return (await data.transformToByteArray()).buffer;
   }
 
-  async getRangeAsStream(range: { length: number; offset: number }): Promise<ReadableStream> {
-    const data = await this.getS3Object({ range });
+  async getRangeAsStream(range: { length: number; offset: number }, key?: string): Promise<ReadableStream> {
+    const data = await this.getS3Object({ range, key });
     return data.transformToWebStream();
   }
 

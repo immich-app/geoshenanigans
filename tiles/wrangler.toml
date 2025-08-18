@@ -4,51 +4,12 @@ main = "src/index.ts"
 compatibility_date = "2024-07-29"
 compatibility_flags = ["nodejs_compat"]
 
-# Bind a KV Namespace. Use KV as persistent storage for small key-value pairs.
-# Docs: https://developers.cloudflare.com/workers/wrangler/configuration/#kv-namespaces
-[[kv_namespaces]]
-binding = "KV"
-id = "5a4b82694e8b490db8b8904cdaea4f00"
-preview_id = "5a4b82694e8b490db8b8904cdaea4f00"
-
 [[d1_databases]]
 binding = "D1_GLOBAL"
 database_name = "tiles"
 database_id = "c60521e7-59bd-4186-81e7-9a676edf9b75"
 
-# Bind an R2 Bucket. Use R2 to store arbitrarily large blobs of data, such as files.
-# Docs: https://developers.cloudflare.com/workers/wrangler/configuration/#r2-buckets
-[[r2_buckets]]
-binding = "BUCKET_WNAM"
-bucket_name = "tiles-wnam"
-preview_bucket_name = "tiles-wnam"
-
-[[r2_buckets]]
-binding = "BUCKET_ENAM"
-bucket_name = "tiles-enam"
-preview_bucket_name = "tiles-enam"
-
-[[r2_buckets]]
-binding = "BUCKET_WEUR"
-bucket_name = "tiles-weur"
-preview_bucket_name = "tiles-weur"
-
-[[r2_buckets]]
-binding = "BUCKET_EEUR"
-bucket_name = "tiles-eeur"
-preview_bucket_name = "tiles-eeur"
-
-[[r2_buckets]]
-binding = "BUCKET_APAC"
-bucket_name = "tiles-apac"
-preview_bucket_name = "tiles-apac"
-
-[[r2_buckets]]
-binding = "BUCKET_OC"
-bucket_name = "tiles-oc"
-preview_bucket_name = "tiles-oc"
-
 # Define environment variables for your Workers script
 [vars]
-DEPLOYMENT_KEY = "20240812"
+DEPLOYMENT_KEY = "20250818"
 ENVIRONMENT = "production"

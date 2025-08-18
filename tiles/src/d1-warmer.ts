@@ -10,42 +10,21 @@ import { bytesToHeader, decompress, deserializeIndex, tileJSON } from './pmtiles
 
 /** TODO: Remaining tasks for tile data splitting
    - Should setup D1 to create a new database for each deployment, requires some terraform magic?
-   - Race tigris alongside R2 with metrics to see which is faster for tile retrieval, only TTFB possible?
    - Automate warming process in github actions
-   - Fix double D1 call
+   - Need to handle generating styles still and uploading those to R2
   **/
 
-const db = 'DEV';
+const db = 'GLOBAL';
 
 type Chunk = { chunkId: number; startByte: number; endByte: number };
 
 const HEADER_SIZE_BYTES = 127;
 const MAX_CHUNK_FILE_SIZE_BYTES = 1_000_000;
-const BUCKETS = [
-  { key: 'tiles-wnam', client: 'r2' },
-  { key: 'tiles-enam', client: 'r2' },
-  { key: 'tiles-weur', client: 'r2' },
-  { key: 'tiles-eeur', client: 'r2' },
-  { key: 'tiles-apac', client: 'r2' },
-  { key: 'tiles-oc', client: 'r2' },
-  // { key: 'geo', client: 'tigris' },
-];
+const BUCKETS = [{ key: 'tiles-geo' }];
 
-const {
-  S3_ACCESS_KEY,
-  S3_SECRET_KEY,
-  S3_ENDPOINT,
-  TIGRIS_KEY_ID,
-  TIGRIS_ACCESS_KEY,
-  TIGRIS_ENDPOINT,
-  CLOUDFLARE_ACCOUNT_ID,
-  DEPLOYMENT_KEY,
-  PMTILES_FILE_PATH,
-} = process.env;
+const { TIGRIS_KEY_ID, TIGRIS_ACCESS_KEY, TIGRIS_ENDPOINT, CLOUDFLARE_ACCOUNT_ID, DEPLOYMENT_KEY, PMTILES_FILE_PATH } =
+  process.env;
 if (
-  !S3_ACCESS_KEY ||
-  !S3_SECRET_KEY ||
-  !S3_ENDPOINT ||
   !TIGRIS_KEY_ID ||
   !TIGRIS_ACCESS_KEY ||
   !TIGRIS_ENDPOINT ||
@@ -55,22 +34,6 @@ if (
 ) {
   throw new Error('Missing environment variables');
 }
-
-const r2Client = new S3Client({
-  region: 'auto',
-  endpoint: S3_ENDPOINT,
-  forcePathStyle: true,
-  requestStreamBufferSize: 32 * 1024,
-  requestHandler: {
-    httpsAgent: { maxSockets: 7500 },
-  },
-  retryMode: 'adaptive',
-  maxAttempts: 10,
-  credentials: {
-    accessKeyId: S3_ACCESS_KEY,
-    secretAccessKey: S3_SECRET_KEY,
-  },
-});
 
 const tigrisClient = new S3Client({
   region: 'auto',
@@ -228,7 +191,7 @@ const uploadToS3 = async (chunk: Chunk, header: Header, chunkMap: object) => {
 
       try {
         const parallelUploads = new Upload({
-          client: bucket.client === 'r2' ? r2Client : tigrisClient,
+          client: tigrisClient,
           params: {
             Bucket: bucket.key,
             Key: `${DEPLOYMENT_KEY}/chunk_${chunk.chunkId}.pmtiles`,

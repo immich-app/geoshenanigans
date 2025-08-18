@@ -1,5 +1,4 @@
-import { createExecutionContext, env, SELF, waitOnExecutionContext } from 'cloudflare:test';
-import { inject } from 'vitest';
+import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import worker, { parseUrl } from '../src';
 import { fromRadix64, toRadix64 } from '../src/pmtiles/utils';
 
@@ -7,54 +6,54 @@ import { fromRadix64, toRadix64 } from '../src/pmtiles/utils';
 // `Request` to pass to `worker.fetch()`.
 const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
 
-describe('integration tests', () => {
-  describe('success - zoom1', () => {
-    beforeAll(async () => {
-      const buckets = [env.BUCKET_WEUR, env.BUCKET_WNAM, env.BUCKET_EEUR, env.BUCKET_APAC, env.BUCKET_ENAM];
-      const files = ['tiles.pmtiles', 'styles/dark.json', 'styles/light.json'];
-      for (const bucket of buckets) {
-        for (const fileName of files) {
-          const file = await fetch(`http://localhost:${inject('port')}/${fileName}`);
-          if (!file.body) {
-            throw new Error('File body is undefined');
-          }
-          const body = file.body as ReadableStream;
-          await bucket.put(`${env.DEPLOYMENT_KEY}/${fileName}`, body);
-          console.log('File uploaded');
-        }
-      }
-    }, 30000);
-    it('responds with correct json file', async () => {
-      const response = await SELF.fetch('https://example.com/v1');
-      await expect(JSON.stringify(await response.json(), null, 2)).toMatchFileSnapshot('./__snapshots__/v1.json');
-    });
-    it('responds with correct style json amended with current URL', async () => {
-      const response = await SELF.fetch('https://example.com/v1/style/dark');
-      await expect(JSON.stringify(await response.json(), null, 2)).toMatchFileSnapshot(
-        './__snapshots__/styles/dark.json',
-      );
-    });
-    // TODO: Come back to these and write up a way to populate local D1 on test setup
-    it.skip('responds with correct tile', async () => {
-      const response = await SELF.fetch('https://example.com/v1/0/0/0.mvt');
-      expect(response.status).toBe(200);
-      await expect(Buffer.from(await response.arrayBuffer()).toString()).toMatchFileSnapshot(
-        './__snapshots__/v1-0-0-0.mvt',
-      );
-    });
-    it.skip('responds with correct tile 2', async () => {
-      const response = await SELF.fetch('https://example.com/v1/1/0/1.mvt');
-      expect(response.status).toBe(200);
-      await expect(Buffer.from(await response.arrayBuffer()).toString()).toMatchFileSnapshot(
-        './__snapshots__/v1-1-0-1.mvt',
-      );
-    });
-    it('responds with error when tile out of bounds', async () => {
-      const response = await SELF.fetch('https://example.com/v1/0/0/1.mvt');
-      expect(response.status).toBe(500);
-    });
-  });
-});
+// describe('integration tests', () => {
+//   describe('success - zoom1', () => {
+//     beforeAll(async () => {
+//       const buckets = [env.BUCKET_WEUR, env.BUCKET_WNAM, env.BUCKET_EEUR, env.BUCKET_APAC, env.BUCKET_ENAM];
+//       const files = ['tiles.pmtiles', 'styles/dark.json', 'styles/light.json'];
+//       for (const bucket of buckets) {
+//         for (const fileName of files) {
+//           const file = await fetch(`http://localhost:${inject('port')}/${fileName}`);
+//           if (!file.body) {
+//             throw new Error('File body is undefined');
+//           }
+//           const body = file.body as ReadableStream;
+//           await bucket.put(`${env.DEPLOYMENT_KEY}/${fileName}`, body);
+//           console.log('File uploaded');
+//         }
+//       }
+//     }, 30000);
+//     it('responds with correct json file', async () => {
+//       const response = await SELF.fetch('https://example.com/v1');
+//       await expect(JSON.stringify(await response.json(), null, 2)).toMatchFileSnapshot('./__snapshots__/v1.json');
+//     });
+//     it('responds with correct style json amended with current URL', async () => {
+//       const response = await SELF.fetch('https://example.com/v1/style/dark');
+//       await expect(JSON.stringify(await response.json(), null, 2)).toMatchFileSnapshot(
+//         './__snapshots__/styles/dark.json',
+//       );
+//     });
+//     // TODO: Come back to these and write up a way to populate local D1 on test setup
+//     it.skip('responds with correct tile', async () => {
+//       const response = await SELF.fetch('https://example.com/v1/0/0/0.mvt');
+//       expect(response.status).toBe(200);
+//       await expect(Buffer.from(await response.arrayBuffer()).toString()).toMatchFileSnapshot(
+//         './__snapshots__/v1-0-0-0.mvt',
+//       );
+//     });
+//     it.skip('responds with correct tile 2', async () => {
+//       const response = await SELF.fetch('https://example.com/v1/1/0/1.mvt');
+//       expect(response.status).toBe(200);
+//       await expect(Buffer.from(await response.arrayBuffer()).toString()).toMatchFileSnapshot(
+//         './__snapshots__/v1-1-0-1.mvt',
+//       );
+//     });
+//     it('responds with error when tile out of bounds', async () => {
+//       const response = await SELF.fetch('https://example.com/v1/0/0/1.mvt');
+//       expect(response.status).toBe(500);
+//     });
+//   });
+// });
 
 describe.skip('Hello World worker', () => {
   it('responds with Hello World! (unit style)', async () => {

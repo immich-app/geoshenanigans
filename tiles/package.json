@@ -20,7 +20,6 @@
   "devDependencies": {
     "@aws-sdk/lib-storage": "^3.862.0",
     "@cloudflare/vitest-pool-workers": "^0.8.0",
-    "@cloudflare/workers-types": "^4.20240729.0",
     "@types/express": "^5.0.0",
     "@typescript-eslint/eslint-plugin": "^8.0.0",
     "@typescript-eslint/parser": "^8.0.0",

@@ -1,4 +1,3 @@
-import { preferredBuckets, R2BucketRegion } from './buckets';
 import { IMetricsRepository } from './interface';
 import { PMTilesService } from './pmtiles.service';
 import {
@@ -9,7 +8,7 @@ import {
   InfluxMetricsProvider,
   MemCacheRepository,
   Metric,
-  R2StorageRepository,
+  TigrisStorageRepository,
 } from './repository';
 
 /* eslint-disable no-var */
@@ -120,12 +119,12 @@ async function handleRequest(
     let styleJson;
     if (env.ENVIRONMENT !== 'prod') {
       styleJson = (await new Response(
-        await storageRepository.getAsStream('styles/' + style + '.json'),
+        await tigrisStorageRepository.getAsStream('styles/' + style + '.json'),
       ).json()) as StyleJson;
       styleJson.sources.vector.url = `${url.origin}/v${version}`;
       styleJson = new Response(JSON.stringify(styleJson)).body;
     } else {
-      styleJson = await storageRepository.getAsStream('styles/' + style + '.json');
+      styleJson = await tigrisStorageRepository.getAsStream('styles/' + style + '.json');
     }
     if (!styleJson) {
       return cacheResponse(new Response('Style not found', { status: 404 }));
@@ -169,24 +168,16 @@ async function handleRequest(
   }
 
   const memCacheRepository = new MemCacheRepository(globalThis.memCache);
-  const bucketMap: Record<R2BucketRegion, R2Bucket> = {
-    apac: env.BUCKET_APAC,
-    eeur: env.BUCKET_EEUR,
-    enam: env.BUCKET_ENAM,
-    wnam: env.BUCKET_WNAM,
-    weur: env.BUCKET_WEUR,
-    oc: env.BUCKET_OC,
-  };
-  const colo = request.cf?.colo || '';
-  const buckets: R2BucketRegion[] = preferredBuckets[colo] || ['weur', 'eeur', 'enam', 'wnam', 'apac', 'oc'];
-  console.log('Buckets', buckets);
-  const filteredBucketMap = Object.fromEntries(
-    Object.entries(bucketMap).filter(([key]) => buckets.includes(key as R2BucketRegion)),
-  );
 
-  const storageRepository = new R2StorageRepository(filteredBucketMap, env.DEPLOYMENT_KEY, metrics);
+  const tigrisStorageRepository = new TigrisStorageRepository(
+    env.TIGRIS_KEY_ID,
+    env.TIGRIS_ACCESS_KEY,
+    'tiles-geo',
+    env.DEPLOYMENT_KEY,
+    metrics,
+  );
   const pmTilesService = await metrics.monitorAsyncFunction({ name: 'pmtiles_init' }, PMTilesService.init)(
-    storageRepository,
+    tigrisStorageRepository,
     memCacheRepository,
     metrics,
     d1Repository,
