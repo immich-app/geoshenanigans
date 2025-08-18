@@ -21,13 +21,13 @@ type Chunk = { chunkId: number; startByte: number; endByte: number };
 const HEADER_SIZE_BYTES = 127;
 const MAX_CHUNK_FILE_SIZE_BYTES = 1_000_000;
 const BUCKETS = [
-  // { key: 'tiles-wnam', client: 'r2' },
-  // { key: 'tiles-enam', client: 'r2' },
-  // { key: 'tiles-weur', client: 'r2' },
-  // { key: 'tiles-eeur', client: 'r2' },
-  // { key: 'tiles-apac', client: 'r2' },
-  // { key: 'tiles-oc', client: 'r2' },
-  { key: 'geo', client: 'tigris' },
+  { key: 'tiles-wnam', client: 'r2' },
+  { key: 'tiles-enam', client: 'r2' },
+  { key: 'tiles-weur', client: 'r2' },
+  { key: 'tiles-eeur', client: 'r2' },
+  { key: 'tiles-apac', client: 'r2' },
+  { key: 'tiles-oc', client: 'r2' },
+  // { key: 'geo', client: 'tigris' },
 ];
 
 const {
@@ -61,7 +61,7 @@ const r2Client = new S3Client({
   forcePathStyle: true,
   requestStreamBufferSize: 32 * 1024,
   requestHandler: {
-    httpsAgent: { maxSockets: 1000 },
+    httpsAgent: { maxSockets: 7500 },
   },
   retryMode: 'adaptive',
   maxAttempts: 10,
@@ -254,7 +254,7 @@ const uploadToS3 = async (chunk: Chunk, header: Header, chunkMap: object) => {
 
 const handler = async () => {
   for (const bucket of BUCKETS) {
-    r2Limits[bucket.key] = pLimit(bucket.client === 'r2' ? 100 : 1000);
+    r2Limits[bucket.key] = pLimit(250);
     r2Promises[bucket.key] = [];
   }
 
