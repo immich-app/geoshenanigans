@@ -8,7 +8,7 @@ resource "cloudflare_d1_database" "tiles" {
 
 resource "cloudflare_d1_database" "tiles_dev" {
   account_id = var.cloudflare_account_id
-  name = "tiles-dev"
+  name       = "tiles-dev"
   lifecycle {
     prevent_destroy = true
   }
