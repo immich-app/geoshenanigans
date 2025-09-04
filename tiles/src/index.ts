@@ -116,15 +116,11 @@ async function handleRequest(
 
   async function handleStyleRequest(respHeaders: Headers) {
     const { style, url, version } = pmTilesParams as PMTilesStyleParams;
-    let styleJson;
+    let styleJson = await tigrisStorageRepository.getAsStream('styles/' + style + '.json');
     if (env.ENVIRONMENT !== 'prod') {
-      styleJson = (await new Response(
-        await tigrisStorageRepository.getAsStream('styles/' + style + '.json'),
-      ).json()) as StyleJson;
-      styleJson.sources.vector.url = `${url.origin}/v${version}`;
-      styleJson = new Response(JSON.stringify(styleJson)).body;
-    } else {
-      styleJson = await tigrisStorageRepository.getAsStream('styles/' + style + '.json');
+      const style = (await new Response(styleJson).json()) as StyleJson;
+      style.sources.vector.url = `${url.origin}/v${version}`;
+      styleJson = new Response(JSON.stringify(style)).body!;
     }
     if (!styleJson) {
       return cacheResponse(new Response('Style not found', { status: 404 }));
