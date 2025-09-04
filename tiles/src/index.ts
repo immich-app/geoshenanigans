@@ -93,8 +93,9 @@ async function handleRequest(
     if (!response.body) {
       throw new Error('Response body is undefined');
     }
-    deferredRepository.runImmediately(cache.put(request.url, response.clone()));
-    return response;
+    const responseBody = await response.arrayBuffer();
+    deferredRepository.defer(() => cache.put(request.url, new Response(responseBody, response)));
+    return new Response(responseBody, response);
   };
 
   const handleTileRequest = async (z: string, x: string, y: string, pmTiles: PMTilesService, respHeaders: Headers) => {
