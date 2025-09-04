@@ -7,3 +7,6 @@ variable "env" {}
 
 variable "grafana_url" {}
 variable "grafana_token" {}
+
+variable "tigris_read_key_id" {}
+variable "tigris_read_access_key" {}

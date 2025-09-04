@@ -1,6 +1,5 @@
-import { preferredBuckets, R2BucketRegion } from './buckets';
 import { IMetricsRepository } from './interface';
-import { PMTilesService } from './pmtiles/pmtiles.service';
+import { PMTilesService } from './pmtiles.service';
 import {
   CloudflareD1Repository,
   CloudflareDeferredRepository,
@@ -9,7 +8,7 @@ import {
   InfluxMetricsProvider,
   MemCacheRepository,
   Metric,
-  R2StorageRepository,
+  TigrisStorageRepository,
 } from './repository';
 
 /* eslint-disable no-var */
@@ -90,14 +89,12 @@ async function handleRequest(
   metrics: IMetricsRepository,
 ) {
   const d1Repository = new CloudflareD1Repository(env.D1_GLOBAL, metrics);
-  void d1Repository.query('SELECT 1');
   const cacheResponse = async (response: Response): Promise<Response> => {
     if (!response.body) {
       throw new Error('Response body is undefined');
     }
-    const responseBody = await response.arrayBuffer();
-    deferredRepository.defer(() => cache.put(request.url, new Response(responseBody, response)));
-    return new Response(responseBody, response);
+    deferredRepository.runImmediately(cache.put(request.url, response.clone()));
+    return response;
   };
 
   const handleTileRequest = async (z: string, x: string, y: string, pmTiles: PMTilesService, respHeaders: Headers) => {
@@ -119,15 +116,11 @@ async function handleRequest(
 
   async function handleStyleRequest(respHeaders: Headers) {
     const { style, url, version } = pmTilesParams as PMTilesStyleParams;
-    let styleJson;
+    let styleJson = await tigrisStorageRepository.getAsStream('styles/' + style + '.json');
     if (env.ENVIRONMENT !== 'prod') {
-      styleJson = (await new Response(
-        await storageRepository.getAsStream('styles/' + style + '.json'),
-      ).json()) as StyleJson;
-      styleJson.sources.vector.url = `${url.origin}/v${version}`;
-      styleJson = new Response(JSON.stringify(styleJson)).body;
-    } else {
-      styleJson = await storageRepository.getAsStream('styles/' + style + '.json');
+      const style = (await new Response(styleJson).json()) as StyleJson;
+      style.sources.vector.url = `${url.origin}/v${version}`;
+      styleJson = new Response(JSON.stringify(style)).body!;
     }
     if (!styleJson) {
       return cacheResponse(new Response('Style not found', { status: 404 }));
@@ -171,24 +164,16 @@ async function handleRequest(
   }
 
   const memCacheRepository = new MemCacheRepository(globalThis.memCache);
-  const bucketMap: Record<R2BucketRegion, R2Bucket> = {
-    apac: env.BUCKET_APAC,
-    eeur: env.BUCKET_EEUR,
-    enam: env.BUCKET_ENAM,
-    wnam: env.BUCKET_WNAM,
-    weur: env.BUCKET_WEUR,
-    oc: env.BUCKET_OC,
-  };
-  const colo = request.cf?.colo || '';
-  const buckets: R2BucketRegion[] = preferredBuckets[colo] || ['weur', 'eeur', 'enam', 'wnam', 'apac', 'oc'];
-  console.log('Buckets', buckets);
-  const filteredBucketMap = Object.fromEntries(
-    Object.entries(bucketMap).filter(([key]) => buckets.includes(key as R2BucketRegion)),
-  );
 
-  const storageRepository = new R2StorageRepository(filteredBucketMap, env.DEPLOYMENT_KEY, metrics);
+  const tigrisStorageRepository = new TigrisStorageRepository(
+    env.TIGRIS_KEY_ID,
+    env.TIGRIS_ACCESS_KEY,
+    'tiles-geo',
+    env.DEPLOYMENT_KEY,
+    metrics,
+  );
   const pmTilesService = await metrics.monitorAsyncFunction({ name: 'pmtiles_init' }, PMTilesService.init)(
-    storageRepository,
+    tigrisStorageRepository,
     memCacheRepository,
     metrics,
     d1Repository,
@@ -242,11 +227,14 @@ export default {
     const workerEnv = env as WorkerEnv;
     if (workerEnv.WORKER_TYPE === 'D1_PROXY') {
       // const metrics = new CloudflareMetricsRepository('tiles', request, []);
-      // const body = await request.json() as { sql: string, db: string };
-      // const d1Repository = new CloudflareD1Repository({d1: workerEnv[`D1_${body.db}` as unknown as keyof WorkerEnv] as D1Database }, metrics);
+      // const body = (await request.json()) as { sql: string; db: string };
+      // const d1Repository = new CloudflareD1Repository(
+      //   workerEnv[`D1_${body.db}` as unknown as keyof WorkerEnv] as D1Database,
+      //   metrics,
+      // );
       // console.log('D1 Proxy', body.sql);
       // const response = await d1Repository.query(body.sql);
-      // console.log('D1 Response', response)
+      // console.log('D1 Response', response);
       // return new Response(JSON.stringify(response));
       return new Response('get out of here');
     }

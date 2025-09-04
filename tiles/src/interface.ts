@@ -10,8 +10,8 @@ export interface IMemCacheRepository {
 }
 
 export interface IStorageRepository {
-  getRange(range: { length: number; offset: number }): Promise<ArrayBuffer>;
-  getRangeAsStream(range: { length: number; offset: number }): Promise<ReadableStream>;
+  getRange(range: { length: number; offset: number }, key?: string): Promise<ArrayBuffer>;
+  getRangeAsStream(range: { length: number; offset: number }, key?: string): Promise<ReadableStream>;
   get(key: string): Promise<ArrayBuffer>;
   getAsStream(key: string): Promise<ReadableStream>;
   getDeploymentKey(): string;
@@ -19,6 +19,7 @@ export interface IStorageRepository {
 
 export interface IDeferredRepository {
   defer(promise: AsyncFn): void;
+  runImmediately(promise: Promise<unknown>): void;
   runDeferred(): void;
 }
 

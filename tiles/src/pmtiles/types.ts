@@ -5,6 +5,7 @@ export interface Entry {
   tileId: number;
   offset: number;
   length: number;
+  chunkId: number;
   runLength: number;
 }
 
@@ -41,6 +42,21 @@ export enum TileType {
   Jpeg = 3,
   Webp = 4,
   Avif = 5,
+}
+
+export interface JsonResponse {
+  tilejson: string;
+  scheme: string;
+  tiles: string[];
+  vector_layers: unknown;
+  attribution: string;
+  description: string;
+  name: string;
+  version: string;
+  bounds: [number, number, number, number];
+  center: [number, number, number];
+  minzoom: number;
+  maxzoom: number;
 }
 
 export interface Metadata {

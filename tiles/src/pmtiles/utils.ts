@@ -1,4 +1,4 @@
-import { Compression, Entry, Header, Metadata } from './types';
+import { Compression, Entry, Header, JsonResponse, Metadata } from './types';
 
 const tileZoomValues: number[] = [
   0, 1, 5, 21, 85, 341, 1365, 5461, 21845, 87381, 349525, 1398101, 5592405, 22369621, 89478485, 357913941, 1431655765,
@@ -119,19 +119,12 @@ export function readVarint(bufferPosition: BufferPosition): number {
   return readVarintRemainder(val, bufferPosition);
 }
 
-export const tileJSON = (args: { header: Header; metadata: Metadata; url: URL; version: string }) => {
-  const { header, metadata, url, version } = args;
+export const tileJSON = (args: { header: Header; metadata: Metadata; version: string }): JsonResponse => {
+  const { header, metadata } = args;
   return {
     tilejson: '3.0.0',
     scheme: 'xyz',
-    tiles: [
-      `${url.protocol}//` +
-        url.hostname +
-        `${url.port ? `:${url.port}` : ''}` +
-        `/v${version}` +
-        '/{z}/{x}/{y}' +
-        '.mvt',
-    ],
+    tiles: ['https://tiles.immich.cloud/v1/{z}/{x}/{y}.mvt'],
     vector_layers: metadata.vector_layers,
     attribution: metadata.attribution,
     description: metadata.description,
@@ -153,7 +146,7 @@ export function deserializeIndex(buffer: ArrayBuffer): Entry[] {
   let lastId = 0;
   for (let i = 0; i < numEntries; i++) {
     const v = readVarint(p);
-    entries.push({ tileId: lastId + v, offset: 0, length: 0, runLength: 1 });
+    entries.push({ tileId: lastId + v, offset: 0, length: 0, chunkId: 0, runLength: 1 });
     lastId += v;
   }
 
@@ -175,36 +168,6 @@ export function deserializeIndex(buffer: ArrayBuffer): Entry[] {
   }
 
   return entries;
-}
-
-/**
- * Low-level function for looking up a TileID or leaf directory inside a directory.
- */
-export function findTile(entries: Entry[], tileId: number): Entry | undefined {
-  let m = 0;
-  let n = entries.length - 1;
-  while (m <= n) {
-    const k = (n + m) >> 1;
-    const cmp = tileId - entries[k].tileId;
-    if (cmp > 0) {
-      m = k + 1;
-    } else if (cmp < 0) {
-      n = k - 1;
-    } else {
-      return entries[k];
-    }
-  }
-
-  // at this point, m > n
-  if (n >= 0) {
-    if (entries[n].runLength === 0) {
-      return entries[n];
-    }
-    if (tileId - entries[n].tileId < entries[n].runLength) {
-      return entries[n];
-    }
-  }
-  return;
 }
 
 export function getUint64(v: DataView, offset: number): number {
@@ -264,12 +227,8 @@ export async function decompress(buf: ArrayBuffer, compression: Compression): Pr
   throw Error('Compression method not supported');
 }
 
-export function getHeaderCacheKey(archiveName: string): string {
+export function getJsonCacheKey(archiveName: string): string {
   return archiveName;
-}
-
-export function getDirectoryCacheKey(fileName: string, range: { offset: number; length: number }): string {
-  return `${fileName}|${range.offset}|${range.length}`;
 }
 
 const BASE64_CHARS = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz/.';

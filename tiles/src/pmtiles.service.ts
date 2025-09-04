@@ -1,18 +1,6 @@
-import { IDatabaseRepository, IMemCacheRepository, IMetricsRepository, IStorageRepository } from '../interface';
-import { Directory, Entry, Header, Metadata } from './types';
-import {
-  bytesToHeader,
-  decompress,
-  deserializeIndex,
-  fromRadix64,
-  getDirectoryCacheKey,
-  getHeaderCacheKey,
-  tileJSON,
-  toRadix64,
-  zxyToTileId,
-} from './utils';
-
-const HEADER_SIZE_BYTES = 127;
+import { IDatabaseRepository, IMemCacheRepository, IMetricsRepository, IStorageRepository } from './interface';
+import { Directory, Entry, JsonResponse } from './pmtiles/types';
+import { fromRadix64, getJsonCacheKey, toRadix64, zxyToTileId } from './pmtiles/utils';
 
 export class DirectoryString {
   constructor(private entry: string) {}
@@ -20,7 +8,7 @@ export class DirectoryString {
   static fromDirectory(directory: Directory): DirectoryString {
     let entryString = `${toRadix64(directory.tileIdStart)}|${toRadix64(directory.offsetStart)}:`;
     for (const entry of directory.entries) {
-      entryString += `${toRadix64(entry.tileId - directory.tileIdStart)}|${toRadix64(entry.offset - directory.offsetStart)}|${toRadix64(entry.length)}|${toRadix64(entry.runLength)}:`;
+      entryString += `${toRadix64(entry.tileId - directory.tileIdStart)}|${toRadix64(entry.offset - directory.offsetStart)}|${toRadix64(entry.length)}|${toRadix64(entry.runLength)}|${toRadix64(entry.chunkId)}:`;
     }
     return new DirectoryString(entryString);
   }
@@ -53,6 +41,7 @@ export class DirectoryString {
           tileId,
           offset: fromRadix64(parts[1]) + offsetStart,
           length: fromRadix64(parts[2]),
+          chunkId: fromRadix64(parts[4]),
           runLength,
         };
       }
@@ -75,64 +64,52 @@ export class PMTilesService {
     db: IDatabaseRepository,
   ): Promise<PMTilesService> {
     const p = new PMTilesService(source, memCache, metrics, db);
-    const headerCacheKey = getHeaderCacheKey(source.getDeploymentKey());
-    if (memCache.get(headerCacheKey)) {
+    const jsonCacheKey = getJsonCacheKey(source.getDeploymentKey());
+    if (memCache.get(jsonCacheKey)) {
       return p;
     }
-    const [header, root] = await p.getHeaderAndRootFromSource();
-    memCache.set(headerCacheKey, header);
-    memCache.set(
-      getDirectoryCacheKey(source.getDeploymentKey(), {
-        offset: header.rootDirectoryOffset,
-        length: header.rootDirectoryLength,
-      }),
-      root,
-    );
+    memCache.set(jsonCacheKey, await p.getJson());
     return p;
   }
 
-  private getHeader(): Header {
-    const key = getHeaderCacheKey(this.source.getDeploymentKey());
-    const memCached = this.memCache.get<Header>(key);
-    if (!memCached) {
-      throw new Error('Header not found in cache');
+  private async getJson(): Promise<JsonResponse> {
+    const cacheKey = getJsonCacheKey(this.source.getDeploymentKey());
+    const cache = this.memCache.get<JsonResponse>(cacheKey);
+    if (cache) {
+      console.log('Cache hit for JSON metadata');
+      return cache;
     }
-    return memCached;
-  }
-
-  async getHeaderAndRootFromSource(): Promise<[Header, Directory]> {
-    const resp = await this.source.getRange({ offset: 0, length: 16384 });
-    const v = new DataView(resp);
-    if (v.getUint16(0, true) !== 0x4d50) {
-      throw new Error('Wrong magic number for PMTiles archive');
-    }
-
-    const headerData = resp.slice(0, HEADER_SIZE_BYTES);
-    const header = await bytesToHeader(headerData);
-    const rootDirData = resp.slice(header.rootDirectoryOffset, header.rootDirectoryOffset + header.rootDirectoryLength);
-    const rootDirEntries = deserializeIndex(
-      await new Response(await decompress(rootDirData, header.internalCompression)).arrayBuffer(),
+    console.log('Cache miss for JSON metadata, fetching from source');
+    const query = await this.db.query(
+      `SELECT * FROM cache_entries_${this.source.getDeploymentKey()} WHERE startTileId = -1 LIMIT 1`,
     );
-    const rootDir: Directory = {
-      offsetStart: rootDirEntries[0].offset,
-      tileIdStart: rootDirEntries[0].tileId,
-      entries: rootDirEntries,
-    };
-    return [header, rootDir];
+
+    if (query.error || !query.success || query.results.length === 0) {
+      throw new Error('Error while looking up tile location');
+    }
+
+    return JSON.parse(query.results[0].entry as string);
   }
 
-  async getJsonResponse(version: string, url: URL) {
-    const header = this.getHeader();
-    const metadata = await this.getMetadata();
-    return tileJSON({ header, metadata, url, version });
+  async getJsonResponse(version: string, url: URL): Promise<JsonResponse> {
+    const json = await this.getJson();
+    json.tiles = [
+      `${url.protocol}//` +
+        url.hostname +
+        `${url.port ? `:${url.port}` : ''}` +
+        `/v${version}` +
+        '/{z}/{x}/{y}' +
+        '.mvt',
+    ];
+    return json;
   }
 
   async getTile(z: number, x: number, y: number): Promise<ReadableStream | undefined> {
     console.log('getTile', z, x, y);
     const tileId = zxyToTileId(z, x, y);
-    const header = this.getHeader();
+    const json = await this.getJson();
 
-    if (z < header.minZoom || z > header.maxZoom) {
+    if (z < json.minzoom || z > json.maxzoom) {
       return;
     }
 
@@ -163,22 +140,11 @@ export class PMTilesService {
 
     const tileOffset = entry.offset;
     const tileLength = entry.length;
+    const chunkId = entry.chunkId;
 
     const tile = await this.metrics.monitorAsyncFunction({ name: 'get_tile' }, (offset, length) =>
-      this.source.getRangeAsStream({ offset, length }),
-    )(header.tileDataOffset + tileOffset, tileLength);
+      this.source.getRangeAsStream({ offset, length }, `chunk_${chunkId}.pmtiles`),
+    )(tileOffset, tileLength);
     return tile;
-  }
-
-  private async getMetadata(): Promise<Metadata> {
-    const header = this.getHeader();
-
-    const resp = await this.source.getRange({
-      offset: header.jsonMetadataOffset,
-      length: header.jsonMetadataLength,
-    });
-    const decompressed = await decompress(resp, header.internalCompression);
-    const dec = new TextDecoder('utf-8');
-    return JSON.parse(dec.decode(decompressed));
   }
 }

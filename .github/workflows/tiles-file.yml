@@ -5,11 +5,11 @@ on:
       file_name:
         description: 'The name of the file to deploy, defaults to newest file'
         required: false
-  pull_request:
-    branches: [ "main" ]
-    paths:
-      - ".github/workflows/tiles-file.yml"
-      - "map-styles/**"
+#  pull_request:
+#    branches: [ "main" ]
+#    paths:
+#      - ".github/workflows/tiles-file.yml"
+#      - "map-styles/**"
 
 concurrency:
   group: ${{ github.workflow }}
