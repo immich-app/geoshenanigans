@@ -619,33 +619,12 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "exemplar": false,
-          "expr": "histogram_quantile(0.90, sum by (vmrange) (histogram_over_time(r2_storage_get_weur_duration[1h])))",
+          "expr": "histogram_quantile(0.99, \n  sum by (vmrange, continent) (\n    histogram_over_time({__name__=~\"r2_storage_get_.*_duration\"}[1h])\n  )\n)",
           "fullMetaSearch": false,
           "hide": false,
           "includeNullMetadata": true,
           "instant": false,
-          "interval": "1m",
-          "legendFormat": "weur",
-          "range": true,
-          "refId": "A",
-          "useBackend": false
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
-          },
-          "disableTextWrap": false,
-          "editorMode": "code",
-          "exemplar": false,
-          "expr": "histogram_quantile(0.90, sum by (vmrange) (histogram_over_time(r2_storage_get_eeur_duration[1h])))",
-          "fullMetaSearch": false,
-          "hide": false,
-          "includeNullMetadata": true,
-          "instant": false,
-          "interval": "1m",
-          "legendFormat": "eeur",
+          "legendFormat": "__auto",
           "range": true,
           "refId": "B",
           "useBackend": false
@@ -655,79 +634,16 @@
             "type": "prometheus",
             "uid": "36979063-5384-4eb9-8679-565a727cbc13"
           },
-          "disableTextWrap": false,
           "editorMode": "code",
-          "exemplar": false,
-          "expr": "histogram_quantile(0.90, sum by (vmrange) (histogram_over_time(r2_storage_get_wnam_duration[1h])))",
-          "fullMetaSearch": false,
+          "expr": "histogram_quantile(0.99, \n  sum by (vmrange, continent) (\n    histogram_over_time(tigris_storage_get_duration[1h])\n  )\n)",
           "hide": false,
-          "includeNullMetadata": true,
           "instant": false,
-          "interval": "1m",
-          "legendFormat": "wnam",
+          "legendFormat": "__auto",
           "range": true,
-          "refId": "C",
-          "useBackend": false
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
-          },
-          "disableTextWrap": false,
-          "editorMode": "code",
-          "exemplar": false,
-          "expr": "histogram_quantile(0.90, sum by (vmrange) (histogram_over_time(r2_storage_get_enam_duration[1h])))",
-          "fullMetaSearch": false,
-          "hide": false,
-          "includeNullMetadata": true,
-          "instant": false,
-          "interval": "1m",
-          "legendFormat": "enam",
-          "range": true,
-          "refId": "D",
-          "useBackend": false
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
-          },
-          "disableTextWrap": false,
-          "editorMode": "code",
-          "exemplar": false,
-          "expr": "histogram_quantile(0.90, sum by (vmrange) (histogram_over_time(r2_storage_get_oc_duration[1h])))",
-          "fullMetaSearch": false,
-          "hide": false,
-          "includeNullMetadata": true,
-          "instant": false,
-          "interval": "1m",
-          "legendFormat": "oc",
-          "range": true,
-          "refId": "E",
-          "useBackend": false
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "36979063-5384-4eb9-8679-565a727cbc13"
-          },
-          "disableTextWrap": false,
-          "editorMode": "code",
-          "exemplar": false,
-          "expr": "histogram_quantile(0.90, sum by (vmrange) (histogram_over_time(r2_storage_get_apac_duration[1h])))",
-          "fullMetaSearch": false,
-          "hide": false,
-          "includeNullMetadata": true,
-          "instant": false,
-          "interval": "1m",
-          "legendFormat": "apac",
-          "range": true,
-          "refId": "F",
-          "useBackend": false
+          "refId": "A"
         }
       ],
-      "title": "R2 p90 Duration / Region",
+      "title": "D1 p99 Duration / Region",
       "type": "timeseries"
     },
     {
@@ -1978,13 +1894,13 @@
     "list": []
   },
   "time": {
-    "from": "now-12h",
+    "from": "now-24h",
     "to": "now"
   },
   "timepicker": {},
   "timezone": "browser",
   "title": "Tileserver",
   "uid": "ddu4e1545csg0a",
-  "version": 17,
+  "version": 20,
   "weekStart": ""
 }
