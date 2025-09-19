@@ -103,7 +103,7 @@ jobs:
           terragrunt_version: ${{ env.tg_version }}
 
       - name: 'Install OpenTofu'
-        uses: opentofu/setup-opentofu@592200bd4b9bbf4772ace78f887668b1aee8f716 # v1
+        uses: opentofu/setup-opentofu@000eeb8522f0572907c393e8151076c205fdba1b # v1
         with:
           tofu_version: ${{ env.tofu_version }}
           tofu_wrapper: false
@@ -139,7 +139,7 @@ jobs:
         uses: 1password/install-cli-action@f5d505685ccf986ef535da41cd180792c8ac3a36 # v2
 
       - name: 'Install OpenTofu'
-        uses: opentofu/setup-opentofu@592200bd4b9bbf4772ace78f887668b1aee8f716 # v1
+        uses: opentofu/setup-opentofu@000eeb8522f0572907c393e8151076c205fdba1b # v1
         with:
           tofu_version: ${{ env.tofu_version }}
           tofu_wrapper: false
@@ -178,7 +178,7 @@ jobs:
           terragrunt_version: ${{ env.tg_version }}
 
       - name: 'Install OpenTofu'
-        uses: opentofu/setup-opentofu@592200bd4b9bbf4772ace78f887668b1aee8f716 # v1
+        uses: opentofu/setup-opentofu@000eeb8522f0572907c393e8151076c205fdba1b # v1
         with:
           tofu_version: ${{ env.tofu_version }}
           tofu_wrapper: false
