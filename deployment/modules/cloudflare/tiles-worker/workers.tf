@@ -33,14 +33,6 @@ resource "cloudflare_workers_script" "tiles" {
     text = var.tigris_read_access_key
   }
 
-  dynamic "r2_bucket_binding" {
-    for_each = data.terraform_remote_state.tiles_state.outputs.r2_regional_buckets
-    content {
-      name        = "BUCKET_${r2_bucket_binding.key}"
-      bucket_name = r2_bucket_binding.value
-    }
-  }
-
   d1_database_binding {
     database_id = var.env != "prod" ? data.terraform_remote_state.tiles_state.outputs.d1_dev_database : data.terraform_remote_state.tiles_state.outputs.d1_global_database
     name        = "D1_GLOBAL"
