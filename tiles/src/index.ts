@@ -11,11 +11,9 @@ import {
   TigrisStorageRepository,
 } from './repository';
 
-/* eslint-disable no-var */
 declare global {
   var memCache: Map<string, unknown>;
 }
-/* eslint-enable no-var */
 
 const URL_MATCHER =
   /^\/v(?<VERSION>[0-9]+)((?=)|\/style\/(?<STYLE>\w+)(?:\.json)?|(?<JSON>\.json)|\/(?<Z>\d+)\/(?<X>\d+)\/(?<Y>\d+).mvt)$/;
