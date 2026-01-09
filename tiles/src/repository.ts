@@ -96,7 +96,7 @@ export class TigrisStorageRepository implements IStorageRepository {
 
   async getRange(range: { length: number; offset: number }): Promise<ArrayBuffer> {
     const data = await this.getS3Object({ range });
-    return (await data.transformToByteArray()).buffer;
+    return (await data.transformToByteArray()).buffer as ArrayBuffer;
   }
 
   async getRangeAsStream(range: { length: number; offset: number }, key?: string): Promise<ReadableStream> {
@@ -106,7 +106,7 @@ export class TigrisStorageRepository implements IStorageRepository {
 
   async get(key: string): Promise<ArrayBuffer> {
     const data = await this.getS3Object({ key });
-    return (await data.transformToByteArray()).buffer;
+    return (await data.transformToByteArray()).buffer as ArrayBuffer;
   }
 
   async getAsStream(key: string): Promise<ReadableStream> {
