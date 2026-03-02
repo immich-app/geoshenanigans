@@ -41,7 +41,8 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.862.0",
     "@influxdata/influxdb-client": "^1.34.0",
-    "p-limit": "^7.0.0"
+    "p-limit": "^7.0.0",
+    "tldts": "^7.0.24"
   },
   "volta": {
     "node": "24.13.1"

@@ -1,5 +1,6 @@
 import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { Point } from '@influxdata/influxdb-client';
+import { parse as parseDomain } from 'tldts';
 import {
   AsyncFn,
   IDatabaseRepository,
@@ -266,7 +267,7 @@ export class CloudflareMetricsRepository implements IMetricsRepository {
     private metricsProviders: IMetricsProviderRepository[],
   ) {
     const url = new URL(request.headers.get('origin') ?? 'http://missing.url');
-    const apexDomain = url.hostname.split('.').splice(-2).join('.');
+    const apexDomain = parseDomain(url.hostname).domain ?? url.hostname;
     const protocol = url.protocol;
 
     this.defaultTags = {
