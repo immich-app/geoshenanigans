@@ -67,49 +67,46 @@ jobs:
           curl -sL -o /tmp/monaco.osm.pbf \
             "https://download.geofabrik.de/europe/monaco-latest.osm.pbf"
 
-      - name: Test build + diff + patch cycle
+      - name: Test determinism + diff + patch
         run: |
           cd geocoder/builder/build
+          RUNS=5
 
-          # Build twice from same PBF
-          echo "=== Build A ==="
-          ./build-index /tmp/build-A/ /tmp/monaco.osm.pbf --simplify-epsilon --epsilon-scale 1 2>&1 | tail -3
-          echo "=== Build B ==="
-          ./build-index /tmp/build-B/ /tmp/monaco.osm.pbf --simplify-epsilon --epsilon-scale 1 2>&1 | tail -3
+          # Build N times from same PBF
+          for i in $(seq 1 $RUNS); do
+            echo "=== Build $i/$RUNS ==="
+            ./build-index "/tmp/build-$i/" /tmp/monaco.osm.pbf --simplify-epsilon --epsilon-scale 1 2>&1 | tail -1
+          done
 
-          # Verify determinism with checksums
-          echo "=== Determinism check ==="
+          # Cross-compare all builds against build 1
+          echo ""
+          echo "=== Determinism check ($RUNS builds) ==="
           FAIL=0
-          for f in /tmp/build-A/*.bin; do
+          for i in $(seq 2 $RUNS); do
+            for f in /tmp/build-1/*.bin; do
+              b=$(basename "$f")
+              if ! cmp -s "/tmp/build-1/$b" "/tmp/build-$i/$b"; then
+                echo "::error::Build $i differs from build 1: $b"
+                FAIL=1
+              fi
+            done
+          done
+          [ $FAIL -eq 0 ] && echo "Determinism: PASS ($RUNS identical builds)" || exit 1
+
+          # Test diff + patch round-trip (build 1 → build 1, should be identity)
+          echo ""
+          echo "=== Diff + Patch round-trip ==="
+          ./geocoder-diff /tmp/build-1/ /tmp/build-1/ -o /tmp/test.gcpatch 2>&1 | tail -1
+          ./geocoder-patch /tmp/build-1/ /tmp/test.gcpatch -o /tmp/patched/ 2>&1 | tail -1
+
+          for f in /tmp/build-1/*.bin; do
             b=$(basename "$f")
-            h1=$(md5sum "/tmp/build-A/$b" | awk '{print $1}')
-            h2=$(md5sum "/tmp/build-B/$b" | awk '{print $1}')
-            if [ "$h1" = "$h2" ]; then
-              echo "  $b: MATCH ($h1)"
-            else
-              echo "  $b: MISMATCH (A=$h1 B=$h2, sizes: $(stat -c%s /tmp/build-A/$b) vs $(stat -c%s /tmp/build-B/$b))"
+            if ! cmp -s "/tmp/patched/$b" "/tmp/build-1/$b"; then
+              echo "::error::Patch round-trip MISMATCH: $b"
               FAIL=1
             fi
           done
-          if [ $FAIL -ne 0 ]; then
-            echo "::error::Determinism check failed"
-            exit 1
-          fi
-          echo "Determinism: PASS"
-
-          # Test diff + patch round-trip
-          echo "=== Diff + Patch ==="
-          ./geocoder-diff /tmp/build-A/ /tmp/build-B/ -o /tmp/test.gcpatch 2>&1 | tail -3
-          ./geocoder-patch /tmp/build-A/ /tmp/test.gcpatch -o /tmp/patched/ 2>&1 | tail -3
-
-          for f in /tmp/build-B/*.bin; do
-            b=$(basename "$f")
-            if ! cmp -s "/tmp/patched/$b" "/tmp/build-B/$b"; then
-              echo "::error::Patch MISMATCH: $b"
-              FAIL=1
-            fi
-          done
-          [ $FAIL -eq 0 ] && echo "Patch cycle: PASS" || exit 1
+          [ $FAIL -eq 0 ] && echo "Patch round-trip: PASS" || exit 1
 
   # --- Production build: full planet + S3 upload ---
   build:
