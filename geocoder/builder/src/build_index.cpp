@@ -1419,19 +1419,44 @@ int main(int argc, char* argv[]) {
                 }
                 return false;
             });
-            std::vector<uint32_t> old_to_new(n);
-            for (uint32_t i = 0; i < n; i++) old_to_new[order[i]] = i;
-            std::vector<WayHeader> new_ways(n);
+            // Reorder ways + nodes by sort order, dedup identical consecutive ways
+            std::vector<WayHeader> new_ways;
             std::vector<NodeCoord> new_nodes;
+            new_ways.reserve(n);
             new_nodes.reserve(data.street_nodes.size());
+            std::vector<uint32_t> old_to_new(n);
+
             for (uint32_t i = 0; i < n; i++) {
                 auto w = data.ways[order[i]];
                 uint32_t old_off = w.node_offset;
-                w.node_offset = static_cast<uint32_t>(new_nodes.size());
-                for (uint8_t j = 0; j < w.node_count; j++)
-                    new_nodes.push_back(data.street_nodes[old_off + j]);
-                new_ways[i] = w;
+                uint8_t nc = w.node_count;
+
+                // Check if this way is identical to the previous one (dedup)
+                bool is_dup = false;
+                if (!new_ways.empty()) {
+                    auto& prev = new_ways.back();
+                    if (prev.name_id == w.name_id && prev.node_count == nc) {
+                        is_dup = true;
+                        for (uint8_t j = 0; j < nc && is_dup; j++) {
+                            auto& pn = data.street_nodes[old_off + j];
+                            auto& qn = new_nodes[prev.node_offset + j];
+                            if (memcmp(&pn, &qn, sizeof(NodeCoord)) != 0) is_dup = false;
+                        }
+                    }
+                }
+
+                if (is_dup) {
+                    // Map to the previous (kept) way
+                    old_to_new[order[i]] = static_cast<uint32_t>(new_ways.size() - 1);
+                } else {
+                    old_to_new[order[i]] = static_cast<uint32_t>(new_ways.size());
+                    w.node_offset = static_cast<uint32_t>(new_nodes.size());
+                    for (uint8_t j = 0; j < nc; j++)
+                        new_nodes.push_back(data.street_nodes[old_off + j]);
+                    new_ways.push_back(w);
+                }
             }
+            size_t deduped = n - new_ways.size();
             data.ways = std::move(new_ways);
             data.street_nodes = std::move(new_nodes);
             for (auto& p : data.sorted_way_cells) p.item_id = old_to_new[p.item_id];
@@ -1440,7 +1465,7 @@ int main(int argc, char* argv[]) {
             };
             std::sort(data.sorted_way_cells.begin(), data.sorted_way_cells.end(), cmp);
             data.cell_to_ways.clear();
-            std::cerr << "  Ways sorted: " << n << std::endl;
+            std::cerr << "  Ways sorted: " << n << " (" << deduped << " duplicates removed)" << std::endl;
         }
         log_phase("  Sort ways", _st, _sc);
 
