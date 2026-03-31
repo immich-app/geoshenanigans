@@ -36,8 +36,8 @@ on:
         default: 'self-hosted'
 
 env:
-  S3_BUCKET: ${{ secrets.GEOCODER_R2_BUCKET }}
-  S3_ENDPOINT: ${{ secrets.GEOCODER_R2_ENDPOINT }}
+  S3_BUCKET: ${{ secrets.GEOCODER_S3_BUCKET }}
+  S3_ENDPOINT: ${{ secrets.GEOCODER_S3_ENDPOINT }}
   S3_PREFIX: geocoder
   REGIONS: "planet africa asia europe north-america south-america oceania central-america antarctica"
 
@@ -274,15 +274,15 @@ jobs:
             || python3 -m pip install --user --break-system-packages osmium
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Configure R2 credentials
+      - name: Configure S3 credentials
         run: |
-          echo "AWS_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" >> "$GITHUB_ENV"
-          echo "AWS_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" >> "$GITHUB_ENV"
+          echo "AWS_ACCESS_KEY_ID=$S3_ACCESS_KEY_ID" >> "$GITHUB_ENV"
+          echo "AWS_SECRET_ACCESS_KEY=$S3_SECRET_ACCESS_KEY" >> "$GITHUB_ENV"
           echo "AWS_DEFAULT_REGION=auto" >> "$GITHUB_ENV"
           echo "AWS_ENDPOINT_URL=$S3_ENDPOINT" >> "$GITHUB_ENV"
         env:
-          R2_ACCESS_KEY_ID: ${{ secrets.GEOCODER_R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.GEOCODER_R2_SECRET_ACCESS_KEY }}
+          S3_ACCESS_KEY_ID: ${{ secrets.GEOCODER_S3_ACCESS_KEY_ID }}
+          S3_SECRET_ACCESS_KEY: ${{ secrets.GEOCODER_S3_SECRET_ACCESS_KEY }}
 
       - name: Build tools
         run: |
