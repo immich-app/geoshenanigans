@@ -1,0 +1,469 @@
+#include "cell_index.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <fstream>
+#include <future>
+#include <iostream>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+
+#include <unistd.h>
+
+#include "geometry.h"
+#include "s2_helpers.h"
+
+std::vector<uint32_t> write_entries(
+    const std::string& path,
+    const std::vector<uint64_t>& sorted_cells,
+    const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map
+) {
+    struct CellRef { uint64_t cell_id; const std::vector<uint32_t>* ids; };
+    std::vector<CellRef> sorted_refs;
+    sorted_refs.reserve(cell_map.size());
+    for (auto& [id, ids] : cell_map) sorted_refs.push_back({id, &ids});
+    std::sort(sorted_refs.begin(), sorted_refs.end(),
+        [](const CellRef& a, const CellRef& b) { return a.cell_id < b.cell_id; });
+
+    std::vector<uint32_t> offsets(sorted_cells.size(), NO_DATA);
+    size_t total_size = 0;
+    for (auto& r : sorted_refs) total_size += sizeof(uint16_t) + r.ids->size() * sizeof(uint32_t);
+
+    std::vector<char> buf;
+    buf.reserve(total_size);
+    uint32_t current = 0;
+    size_t ri = 0;
+    for (uint32_t si = 0; si < sorted_cells.size() && ri < sorted_refs.size(); si++) {
+        if (sorted_cells[si] < sorted_refs[ri].cell_id) continue;
+        if (sorted_cells[si] > sorted_refs[ri].cell_id) { si--; ri++; continue; }
+        offsets[si] = current;
+        const auto& ids = *sorted_refs[ri].ids;
+        uint16_t count = static_cast<uint16_t>(std::min(ids.size(), size_t(MAX_VERTEX_COUNT)));
+        buf.insert(buf.end(), reinterpret_cast<const char*>(&count),
+                   reinterpret_cast<const char*>(&count) + sizeof(count));
+        buf.insert(buf.end(), reinterpret_cast<const char*>(ids.data()),
+                   reinterpret_cast<const char*>(ids.data()) + ids.size() * sizeof(uint32_t));
+        current += sizeof(uint16_t) + ids.size() * sizeof(uint32_t);
+        ri++;
+    }
+    std::ofstream f(path, std::ios::binary);
+    f.write(buf.data(), buf.size());
+    return offsets;
+}
+
+std::vector<uint32_t> write_entries_from_sorted(
+    const std::string& path,
+    const std::vector<uint64_t>& sorted_cells,
+    const std::vector<CellItemPair>& sorted_pairs
+) {
+    std::vector<uint32_t> offsets(sorted_cells.size(), NO_DATA);
+    if (sorted_pairs.empty()) {
+        std::ofstream f(path, std::ios::binary);
+        return offsets;
+    }
+
+    unsigned int nthreads = std::thread::hardware_concurrency();
+    if (nthreads == 0) nthreads = 4;
+    size_t cells_per_chunk = (sorted_cells.size() + nthreads - 1) / nthreads;
+
+    struct ChunkResult {
+        std::vector<char> buf;
+        size_t cell_start, cell_end;
+        uint32_t local_size;
+    };
+    std::vector<ChunkResult> chunks(nthreads);
+
+    std::vector<std::thread> threads;
+    for (unsigned int t = 0; t < nthreads; t++) {
+        size_t cs = t * cells_per_chunk;
+        size_t ce = std::min(cs + cells_per_chunk, sorted_cells.size());
+        if (cs >= sorted_cells.size()) break;
+
+        threads.emplace_back([&, t, cs, ce]() {
+            auto& chunk = chunks[t];
+            chunk.cell_start = cs;
+            chunk.cell_end = ce;
+            chunk.local_size = 0;
+
+            size_t pi = std::lower_bound(sorted_pairs.begin(), sorted_pairs.end(),
+                sorted_cells[cs], [](const CellItemPair& p, uint64_t id) {
+                    return p.cell_id < id;
+                }) - sorted_pairs.begin();
+
+            for (size_t si = cs; si < ce && pi < sorted_pairs.size(); si++) {
+                if (sorted_cells[si] < sorted_pairs[pi].cell_id) continue;
+                while (pi < sorted_pairs.size() && sorted_pairs[pi].cell_id < sorted_cells[si]) pi++;
+                if (pi >= sorted_pairs.size() || sorted_pairs[pi].cell_id != sorted_cells[si]) continue;
+
+                offsets[si] = chunk.local_size;
+                size_t start = pi;
+                while (pi < sorted_pairs.size() && sorted_pairs[pi].cell_id == sorted_cells[si]) pi++;
+                uint16_t count = static_cast<uint16_t>(std::min(pi - start, size_t(MAX_VERTEX_COUNT)));
+                size_t entry_size = sizeof(uint16_t) + (pi - start) * sizeof(uint32_t);
+                size_t buf_pos = chunk.buf.size();
+                chunk.buf.resize(buf_pos + entry_size);
+                memcpy(chunk.buf.data() + buf_pos, &count, sizeof(count));
+                for (size_t k = start; k < pi; k++) {
+                    memcpy(chunk.buf.data() + buf_pos + sizeof(uint16_t) + (k - start) * sizeof(uint32_t),
+                           &sorted_pairs[k].item_id, sizeof(uint32_t));
+                }
+                chunk.local_size += entry_size;
+            }
+        });
+    }
+    for (auto& t : threads) t.join();
+
+    uint32_t global_offset = 0;
+    for (auto& chunk : chunks) {
+        for (size_t si = chunk.cell_start; si < chunk.cell_end; si++) {
+            if (offsets[si] != NO_DATA) offsets[si] += global_offset;
+        }
+        global_offset += chunk.local_size;
+    }
+
+    std::vector<char> buf;
+    buf.reserve(global_offset);
+    for (auto& chunk : chunks) buf.insert(buf.end(), chunk.buf.begin(), chunk.buf.end());
+
+    std::ofstream f(path, std::ios::binary);
+    f.write(buf.data(), buf.size());
+    return offsets;
+}
+
+void write_cell_index(
+    const std::string& cells_path,
+    const std::string& entries_path,
+    const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map
+) {
+    std::vector<std::pair<uint64_t, std::vector<uint32_t>>> sorted(cell_map.begin(), cell_map.end());
+    std::sort(sorted.begin(), sorted.end());
+
+    { std::ofstream f(cells_path, std::ios::binary);
+      uint32_t current_offset = 0;
+      for (const auto& [cell_id, ids] : sorted) {
+          f.write(reinterpret_cast<const char*>(&cell_id), sizeof(cell_id));
+          f.write(reinterpret_cast<const char*>(&current_offset), sizeof(current_offset));
+          current_offset += sizeof(uint16_t) + ids.size() * sizeof(uint32_t);
+      } }
+
+    { std::ofstream f(entries_path, std::ios::binary);
+      for (const auto& [cell_id, ids] : sorted) {
+          uint16_t count = static_cast<uint16_t>(std::min(ids.size(), size_t(MAX_VERTEX_COUNT)));
+          f.write(reinterpret_cast<const char*>(&count), sizeof(count));
+          f.write(reinterpret_cast<const char*>(ids.data()), ids.size() * sizeof(uint32_t));
+      } }
+}
+
+void write_index(const ParsedData& data, const std::string& output_dir, IndexMode mode) {
+    ensure_dir(output_dir);
+    auto _wt = std::chrono::steady_clock::now();
+
+    bool write_streets = (mode != IndexMode::AdminOnly);
+    bool write_addresses = (mode == IndexMode::Full);
+
+    if (write_streets) {
+        std::vector<uint64_t> sorted_geo_cells;
+        {
+            auto extract_unique_cells = [](const std::vector<CellItemPair>& pairs) {
+                std::vector<uint64_t> cells;
+                cells.reserve(pairs.size() / 2);
+                for (size_t i = 0; i < pairs.size(); ) {
+                    cells.push_back(pairs[i].cell_id);
+                    uint64_t cur = pairs[i].cell_id;
+                    while (i < pairs.size() && pairs[i].cell_id == cur) i++;
+                }
+                return cells;
+            };
+            auto extract_from_map = [](const std::unordered_map<uint64_t, std::vector<uint32_t>>& m) {
+                std::vector<uint64_t> cells;
+                cells.reserve(m.size());
+                for (auto& [id, _] : m) cells.push_back(id);
+                std::sort(cells.begin(), cells.end());
+                return cells;
+            };
+
+            std::vector<uint64_t> way_cells, addr_cells, interp_cells;
+            {
+                auto f1 = std::async(std::launch::async, [&] {
+                    return !data.sorted_way_cells.empty()
+                        ? extract_unique_cells(data.sorted_way_cells)
+                        : extract_from_map(data.cell_to_ways);
+                });
+                if (write_addresses) {
+                    auto f2 = std::async(std::launch::async, [&] {
+                        return !data.sorted_addr_cells.empty()
+                            ? extract_unique_cells(data.sorted_addr_cells)
+                            : extract_from_map(data.cell_to_addrs);
+                    });
+                    auto f3 = std::async(std::launch::async, [&] {
+                        return !data.sorted_interp_cells.empty()
+                            ? extract_unique_cells(data.sorted_interp_cells)
+                            : extract_from_map(data.cell_to_interps);
+                    });
+                    addr_cells = f2.get();
+                    interp_cells = f3.get();
+                }
+                way_cells = f1.get();
+            }
+
+            sorted_geo_cells.reserve(way_cells.size() + addr_cells.size() + interp_cells.size());
+            std::merge(way_cells.begin(), way_cells.end(), addr_cells.begin(), addr_cells.end(),
+                       std::back_inserter(sorted_geo_cells));
+            if (!interp_cells.empty()) {
+                std::vector<uint64_t> tmp;
+                tmp.reserve(sorted_geo_cells.size() + interp_cells.size());
+                std::merge(sorted_geo_cells.begin(), sorted_geo_cells.end(),
+                           interp_cells.begin(), interp_cells.end(), std::back_inserter(tmp));
+                sorted_geo_cells = std::move(tmp);
+            }
+            sorted_geo_cells.erase(std::unique(sorted_geo_cells.begin(), sorted_geo_cells.end()),
+                                    sorted_geo_cells.end());
+        }
+
+        std::vector<uint32_t> street_offsets, addr_offsets, interp_offsets;
+        {
+            auto f1 = std::async(std::launch::async, [&]() {
+                if (!data.sorted_way_cells.empty())
+                    return write_entries_from_sorted(output_dir + "/street_entries.bin", sorted_geo_cells, data.sorted_way_cells);
+                return write_entries(output_dir + "/street_entries.bin", sorted_geo_cells, data.cell_to_ways);
+            });
+            if (write_addresses) {
+                auto f2 = std::async(std::launch::async, [&]() {
+                    if (!data.sorted_addr_cells.empty())
+                        return write_entries_from_sorted(output_dir + "/addr_entries.bin", sorted_geo_cells, data.sorted_addr_cells);
+                    return write_entries(output_dir + "/addr_entries.bin", sorted_geo_cells, data.cell_to_addrs);
+                });
+                auto f3 = std::async(std::launch::async, [&]() {
+                    if (!data.sorted_interp_cells.empty())
+                        return write_entries_from_sorted(output_dir + "/interp_entries.bin", sorted_geo_cells, data.sorted_interp_cells);
+                    return write_entries(output_dir + "/interp_entries.bin", sorted_geo_cells, data.cell_to_interps);
+                });
+                addr_offsets = f2.get();
+                interp_offsets = f3.get();
+            }
+            street_offsets = f1.get();
+        }
+
+        log_phase("  Write: entry files", _wt);
+        {
+            size_t n = sorted_geo_cells.size();
+            size_t row_size = sizeof(uint64_t) + 3 * sizeof(uint32_t);
+            std::vector<char> buf(n * row_size);
+            if (addr_offsets.empty()) addr_offsets.resize(n, NO_DATA);
+            if (interp_offsets.empty()) interp_offsets.resize(n, NO_DATA);
+
+            unsigned int nthreads = std::thread::hardware_concurrency();
+            if (nthreads == 0) nthreads = 4;
+            size_t chunk = (n + nthreads - 1) / nthreads;
+            std::vector<std::thread> fill_threads;
+            for (unsigned int t = 0; t < nthreads; t++) {
+                size_t start = t * chunk;
+                size_t end = std::min(start + chunk, n);
+                if (start >= n) break;
+                fill_threads.emplace_back([&, start, end]() {
+                    char* ptr = buf.data() + start * row_size;
+                    for (size_t i = start; i < end; i++) {
+                        memcpy(ptr, &sorted_geo_cells[i], sizeof(uint64_t)); ptr += sizeof(uint64_t);
+                        memcpy(ptr, &street_offsets[i], sizeof(uint32_t)); ptr += sizeof(uint32_t);
+                        memcpy(ptr, &addr_offsets[i], sizeof(uint32_t)); ptr += sizeof(uint32_t);
+                        memcpy(ptr, &interp_offsets[i], sizeof(uint32_t)); ptr += sizeof(uint32_t);
+                    }
+                });
+            }
+            for (auto& t : fill_threads) t.join();
+
+            std::ofstream f(output_dir + "/geo_cells.bin", std::ios::binary);
+            f.write(buf.data(), buf.size());
+        }
+
+        std::cerr << "geo index: " << sorted_geo_cells.size() << " cells ("
+                  << data.ways.size() << " ways, " << data.addr_points.size() << " addrs, "
+                  << data.interp_ways.size() << " interps)" << std::endl;
+    }
+
+    log_phase("  Write: geo_cells.bin", _wt);
+    auto admin_future = std::async(std::launch::async, [&] {
+        write_cell_index(output_dir + "/admin_cells.bin", output_dir + "/admin_entries.bin", data.cell_to_admin);
+        std::cerr << "admin index: " << data.cell_to_admin.size() << " cells, " << data.admin_polygons.size() << " polygons" << std::endl;
+    });
+
+    std::vector<std::future<void>> write_futures;
+    if (write_streets) {
+        write_futures.push_back(std::async(std::launch::async, [&] {
+            std::ofstream f(output_dir + "/street_ways.bin", std::ios::binary);
+            f.write(reinterpret_cast<const char*>(data.ways.data()), data.ways.size() * sizeof(WayHeader));
+        }));
+        write_futures.push_back(std::async(std::launch::async, [&] {
+            std::ofstream f(output_dir + "/street_nodes.bin", std::ios::binary);
+            f.write(reinterpret_cast<const char*>(data.street_nodes.data()), data.street_nodes.size() * sizeof(NodeCoord));
+        }));
+        if (write_addresses) {
+            write_futures.push_back(std::async(std::launch::async, [&] {
+                std::ofstream f(output_dir + "/addr_points.bin", std::ios::binary);
+                f.write(reinterpret_cast<const char*>(data.addr_points.data()), data.addr_points.size() * sizeof(AddrPoint));
+            }));
+            write_futures.push_back(std::async(std::launch::async, [&] {
+                std::ofstream f(output_dir + "/interp_ways.bin", std::ios::binary);
+                f.write(reinterpret_cast<const char*>(data.interp_ways.data()), data.interp_ways.size() * sizeof(InterpWay));
+            }));
+            write_futures.push_back(std::async(std::launch::async, [&] {
+                std::ofstream f(output_dir + "/interp_nodes.bin", std::ios::binary);
+                f.write(reinterpret_cast<const char*>(data.interp_nodes.data()), data.interp_nodes.size() * sizeof(NodeCoord));
+            }));
+        }
+    }
+    // If not writing all data types, compact string pool and remap references
+    // before writing admin_polygons and strings.bin.
+    std::vector<AdminPolygon> compact_admin;
+    std::vector<char> compact_strings;
+    const bool need_compact = (!write_streets || !write_addresses);
+
+    if (need_compact) {
+        // Collect referenced string offsets
+        std::unordered_set<uint32_t> used_offsets;
+        if (write_streets) {
+            for (const auto& w : data.ways) used_offsets.insert(w.name_id);
+            if (write_addresses) {
+                for (const auto& a : data.addr_points) {
+                    used_offsets.insert(a.housenumber_id);
+                    used_offsets.insert(a.street_id);
+                }
+                for (const auto& iw : data.interp_ways) used_offsets.insert(iw.street_id);
+            }
+        }
+        for (const auto& ap : data.admin_polygons) used_offsets.insert(ap.name_id);
+
+        // Build compact pool and remap
+        const auto& old_sp = data.string_pool.data();
+        std::vector<uint32_t> sorted_offs(used_offsets.begin(), used_offsets.end());
+        std::sort(sorted_offs.begin(), sorted_offs.end());
+        std::unordered_map<uint32_t, uint32_t> remap;
+        compact_strings.reserve(used_offsets.size() * 16);
+        for (uint32_t off : sorted_offs) {
+            remap[off] = static_cast<uint32_t>(compact_strings.size());
+            size_t len = std::strlen(old_sp.data() + off);
+            compact_strings.insert(compact_strings.end(), old_sp.data() + off,
+                old_sp.data() + off + len + 1);
+        }
+
+        // Remap admin polygon name_ids
+        compact_admin = data.admin_polygons;
+        for (auto& ap : compact_admin) ap.name_id = remap[ap.name_id];
+
+        // Remap street/addr/interp if applicable (for no-addresses mode)
+        // These are written from data directly, so we'd need copies too.
+        // For simplicity, only compact when we have fewer types.
+    }
+
+    const auto& admin_to_write = need_compact ? compact_admin : data.admin_polygons;
+    write_futures.push_back(std::async(std::launch::async, [&] {
+        std::ofstream f(output_dir + "/admin_polygons.bin", std::ios::binary);
+        f.write(reinterpret_cast<const char*>(admin_to_write.data()), admin_to_write.size() * sizeof(AdminPolygon));
+    }));
+    write_futures.push_back(std::async(std::launch::async, [&] {
+        std::ofstream f(output_dir + "/admin_vertices.bin", std::ios::binary);
+        f.write(reinterpret_cast<const char*>(data.admin_vertices.data()), data.admin_vertices.size() * sizeof(NodeCoord));
+    }));
+    write_futures.push_back(std::async(std::launch::async, [&] {
+        if (need_compact) {
+            std::ofstream f(output_dir + "/strings.bin", std::ios::binary);
+            f.write(compact_strings.data(), compact_strings.size());
+            std::cerr << "strings.bin: " << compact_strings.size() << " bytes (compacted from "
+                      << data.string_pool.data().size() << ")" << std::endl;
+        } else {
+            std::ofstream f(output_dir + "/strings.bin", std::ios::binary);
+            f.write(data.string_pool.data().data(), data.string_pool.data().size());
+            std::cerr << "strings.bin: " << data.string_pool.data().size() << " bytes" << std::endl;
+        }
+    }));
+
+    log_phase("  Write: parallel data files launched", _wt);
+    admin_future.get();
+    for (auto& f : write_futures) f.get();
+}
+
+void write_quality_variant(const ParsedData& data, const std::string& source_dir,
+                           const std::string& output_dir, double epsilon_scale) {
+    ensure_dir(output_dir);
+
+    // Re-simplify admin polygons at the given epsilon scale
+    std::vector<AdminPolygon> new_polys;
+    std::vector<NodeCoord> new_verts;
+    new_polys.reserve(data.admin_polygons.size());
+
+    // Parallel simplification
+    struct SimplifiedPoly {
+        std::vector<std::pair<double,double>> verts;
+    };
+    std::vector<SimplifiedPoly> simplified(data.admin_polygons.size());
+
+    {
+        std::atomic<size_t> idx{0};
+        unsigned nthreads = std::thread::hardware_concurrency();
+        if (nthreads == 0) nthreads = 4;
+        std::vector<std::thread> workers;
+        for (unsigned t = 0; t < nthreads; t++) {
+            workers.emplace_back([&]() {
+                while (true) {
+                    size_t i = idx.fetch_add(1);
+                    if (i >= data.admin_polygons.size()) break;
+                    const auto& ap = data.admin_polygons[i];
+
+                    // Extract original vertices
+                    std::vector<std::pair<double,double>> pts;
+                    pts.reserve(ap.vertex_count);
+                    for (uint32_t j = 0; j < ap.vertex_count; j++) {
+                        const auto& v = data.admin_vertices[ap.vertex_offset + j];
+                        pts.emplace_back(v.lat, v.lng);
+                    }
+
+                    if (epsilon_scale > 0) {
+                        double eps_m = admin_epsilon_meters(ap.admin_level) * epsilon_scale;
+                        double lat = pts.empty() ? 0.0 : pts[0].first;
+                        double eps_deg = meters_to_degrees(eps_m, lat);
+                        simplified[i].verts = simplify_polygon_epsilon(pts, eps_deg);
+                    } else {
+                        simplified[i].verts = std::move(pts);
+                    }
+                }
+            });
+        }
+        for (auto& w : workers) w.join();
+    }
+
+    // Sequential: build new polygon and vertex arrays
+    for (size_t i = 0; i < data.admin_polygons.size(); i++) {
+        auto& sv = simplified[i].verts;
+        if (sv.size() < 3) continue;
+
+        AdminPolygon np = data.admin_polygons[i];
+        np.vertex_offset = static_cast<uint32_t>(new_verts.size());
+        np.vertex_count = static_cast<uint32_t>(sv.size());
+        np.area = polygon_area(sv);
+
+        for (const auto& [lat, lng] : sv) {
+            new_verts.push_back({static_cast<float>(lat), static_cast<float>(lng)});
+        }
+        new_polys.push_back(np);
+    }
+
+    std::cerr << "Quality " << epsilon_scale << "x: " << new_polys.size()
+              << " polygons, " << new_verts.size() << " vertices ("
+              << new_verts.size() * 8 / 1024 / 1024 << " MiB)" << std::endl;
+
+    // Write admin files
+    {
+        std::ofstream f(output_dir + "/admin_polygons.bin", std::ios::binary);
+        f.write(reinterpret_cast<const char*>(new_polys.data()), new_polys.size() * sizeof(AdminPolygon));
+    }
+    {
+        std::ofstream f(output_dir + "/admin_vertices.bin", std::ios::binary);
+        f.write(reinterpret_cast<const char*>(new_verts.data()), new_verts.size() * sizeof(NodeCoord));
+    }
+
+    // Quality directories only contain the two files that change.
+    // Shared files (admin_cells.bin, admin_entries.bin, strings.bin)
+    // stay in the parent directory.
+}

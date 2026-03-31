@@ -1,0 +1,348 @@
+name: Build Geocoder Index
+
+on:
+  schedule:
+    # Daily at 06:00 UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      pbf_url:
+        description: 'Override PBF URL (leave empty to use replication diffs)'
+        required: false
+        type: string
+      force_fresh_download:
+        description: 'Force fresh planet PBF download (skip replication diffs)'
+        required: false
+        type: boolean
+        default: false
+      skip_patch:
+        description: 'Skip patch generation'
+        required: false
+        type: boolean
+        default: false
+      runner:
+        description: 'Runner label'
+        required: false
+        type: string
+        default: 'self-hosted'
+
+env:
+  S3_BUCKET: ${{ secrets.GEOCODER_S3_BUCKET }}
+  S3_REGION: ${{ secrets.GEOCODER_S3_REGION }}
+  S3_PREFIX: geocoder
+  # All regions produced by --continents (must match build output)
+  REGIONS: "planet africa asia europe north-america south-america oceania central-america antarctica"
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner || 'self-hosted' }}
+    timeout-minutes: 240
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake g++ libz-dev libzstd-dev aria2 jq
+          pip install --break-system-packages osmium 2>/dev/null \
+            || pip install --user osmium 2>/dev/null \
+            || python3 -m pip install --user --break-system-packages osmium
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.GEOCODER_S3_REGION }}
+
+      - name: Build tools
+        run: |
+          cd geocoder/builder && mkdir -p build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          make -j$(nproc) build-index geocoder-diff geocoder-patch
+          echo "$PWD" >> "$GITHUB_PATH"
+
+      - name: Determine build date
+        id: meta
+        run: |
+          BUILD_DATE=$(date -u +%Y-%m-%d)
+          echo "date=$BUILD_DATE" >> "$GITHUB_OUTPUT"
+
+          EXISTS=$(aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$BUILD_DATE/planet/" 2>/dev/null | wc -l)
+          if [ "$EXISTS" -gt 0 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Build for $BUILD_DATE already exists"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Obtain PBF
+        if: steps.meta.outputs.skip != 'true'
+        id: pbf
+        run: |
+          WORKDIR="${{ runner.temp }}/geocoder-build"
+          mkdir -p "$WORKDIR"
+          echo "workdir=$WORKDIR" >> "$GITHUB_OUTPUT"
+
+          if [ -n "${{ inputs.pbf_url }}" ]; then
+            echo "Downloading from override URL..."
+            aria2c -x 8 -s 8 --max-tries=3 -d "$WORKDIR" -o planet.osm.pbf "${{ inputs.pbf_url }}"
+            echo "method=download" >> "$GITHUB_OUTPUT"
+
+          elif [ "${{ inputs.force_fresh_download }}" = "true" ]; then
+            echo "Downloading fresh planet PBF..."
+            PBF_URL=$(curl -sI "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
+              | grep -i '^location:' | awk '{print $2}' | tr -d '\r')
+            aria2c -x 8 -s 8 --max-tries=3 -d "$WORKDIR" -o planet.osm.pbf "$PBF_URL"
+            echo "method=download" >> "$GITHUB_OUTPUT"
+
+          else
+            STORED_PBF="s3://$S3_BUCKET/$S3_PREFIX/pbf/planet-current.osm.pbf"
+            if aws s3 ls "$STORED_PBF" 2>/dev/null | grep -q 'planet-current'; then
+              echo "Downloading stored PBF and applying replication diffs..."
+              aws s3 cp "$STORED_PBF" "$WORKDIR/planet.osm.pbf" --no-progress --only-show-errors
+              pyosmium-up-to-date -v \
+                --server https://planet.openstreetmap.org/replication/day \
+                -s 2000 "$WORKDIR/planet.osm.pbf" 2>&1
+              echo "method=diff" >> "$GITHUB_OUTPUT"
+            else
+              echo "No stored PBF — downloading fresh planet..."
+              PBF_URL=$(curl -sI "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
+                | grep -i '^location:' | awk '{print $2}' | tr -d '\r')
+              aria2c -x 8 -s 8 --max-tries=3 -d "$WORKDIR" -o planet.osm.pbf "$PBF_URL"
+              echo "method=download" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+          ls -lh "$WORKDIR/planet.osm.pbf"
+
+      - name: Build index with all variants
+        if: steps.meta.outputs.skip != 'true'
+        run: |
+          WORKDIR="${{ steps.pbf.outputs.workdir }}"
+          echo "Building geocoder index (continents + modes + quality variants)..."
+          time build-index "$WORKDIR/output/" "$WORKDIR/planet.osm.pbf" \
+            --simplify-epsilon --epsilon-scale 1 \
+            --continents --multi-output --multi-quality 2>&1 | tail -10
+          echo ""
+          echo "Build output:"
+          find "$WORKDIR/output" -name "*.bin" | wc -l
+          echo "bin files across all variants"
+
+      - name: Upload PBF to S3
+        if: steps.meta.outputs.skip != 'true'
+        run: |
+          WORKDIR="${{ steps.pbf.outputs.workdir }}"
+          aws s3 cp "$WORKDIR/planet.osm.pbf" \
+            "s3://$S3_BUCKET/$S3_PREFIX/pbf/planet-current.osm.pbf" \
+            --no-progress --only-show-errors
+          rm -f "$WORKDIR/planet.osm.pbf"
+
+      - name: Upload builds to S3
+        if: steps.meta.outputs.skip != 'true'
+        run: |
+          WORKDIR="${{ steps.pbf.outputs.workdir }}"
+          BUILD_DATE="${{ steps.meta.outputs.date }}"
+          S3_BUILDS="s3://$S3_BUCKET/$S3_PREFIX/builds/$BUILD_DATE"
+
+          # Upload entire output tree (preserves directory structure)
+          echo "Uploading all variants..."
+          aws s3 sync "$WORKDIR/output/" "$S3_BUILDS/" \
+            --no-progress --only-show-errors
+
+          echo "$BUILD_DATE" | aws s3 cp - \
+            "s3://$S3_BUCKET/$S3_PREFIX/builds/latest.txt" \
+            --content-type text/plain
+
+          echo "Upload complete"
+
+      - name: Find previous build
+        if: steps.meta.outputs.skip != 'true' && inputs.skip_patch != true
+        id: prev
+        run: |
+          CURRENT="${{ steps.meta.outputs.date }}"
+          PREV=$(aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/" \
+            | grep 'PRE' | awk '{print $2}' | tr -d '/' \
+            | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \
+            | sort | grep -B1 "^$CURRENT$" | head -1)
+
+          if [ -n "$PREV" ] && [ "$PREV" != "$CURRENT" ]; then
+            echo "date=$PREV" >> "$GITHUB_OUTPUT"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "Previous build: $PREV"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No previous build found"
+          fi
+
+      - name: Generate and verify patches for all variants
+        if: steps.prev.outputs.found == 'true'
+        run: |
+          WORKDIR="${{ steps.pbf.outputs.workdir }}"
+          PREV="${{ steps.prev.outputs.date }}"
+          CURRENT="${{ steps.meta.outputs.date }}"
+          S3_PREV_BASE="s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV"
+
+          echo "## Patch Generation ($PREV → $CURRENT)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Variant | Files | Patch Size | Verified |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---------|-------|-----------|----------|" >> "$GITHUB_STEP_SUMMARY"
+
+          PASS=0; FAIL=0; SKIP=0
+
+          # Find all directories containing .bin files in the new build
+          VARIANTS=$(cd "$WORKDIR/output" && find . -name "*.bin" -exec dirname {} \; | sort -u | sed 's|^\./||')
+
+          for variant in $VARIANTS; do
+            NEW_DIR="$WORKDIR/output/$variant"
+            N_NEW=$(ls "$NEW_DIR"/*.bin 2>/dev/null | wc -l)
+            [ "$N_NEW" -lt 2 ] && continue
+
+            # Download matching previous variant from S3
+            PREV_DIR="$WORKDIR/prev-variant"
+            rm -rf "$PREV_DIR"; mkdir -p "$PREV_DIR"
+            aws s3 sync "$S3_PREV_BASE/$variant/" "$PREV_DIR/" \
+              --no-progress --only-show-errors 2>/dev/null
+
+            N_PREV=$(ls "$PREV_DIR"/*.bin 2>/dev/null | wc -l)
+            if [ "$N_PREV" -ne "$N_NEW" ]; then
+              echo "  $variant: skipped (prev=$N_PREV new=$N_NEW files)"
+              SKIP=$((SKIP + 1))
+              continue
+            fi
+
+            # Generate patch
+            PATCH_FILE="$WORKDIR/current-patch.gcpatch"
+            geocoder-diff "$PREV_DIR" "$NEW_DIR" -o "$PATCH_FILE" 2>/dev/null
+            PATCH_SIZE=$(stat -c%s "$PATCH_FILE" 2>/dev/null || echo 0)
+            PATCH_KB=$((PATCH_SIZE / 1024))
+
+            # Verify with md5sums
+            VERIFY_DIR="$WORKDIR/verify-variant"
+            rm -rf "$VERIFY_DIR"; mkdir -p "$VERIFY_DIR"
+            geocoder-patch "$PREV_DIR" "$PATCH_FILE" -o "$VERIFY_DIR" 2>/dev/null
+
+            MATCH=0
+            for f in "$NEW_DIR"/*.bin; do
+              b=$(basename "$f")
+              h1=$(md5sum "$VERIFY_DIR/$b" 2>/dev/null | awk '{print $1}')
+              h2=$(md5sum "$NEW_DIR/$b" | awk '{print $1}')
+              [ "$h1" = "$h2" ] && MATCH=$((MATCH + 1))
+            done
+
+            if [ $MATCH -eq $N_NEW ]; then
+              echo "  $variant: PASS ($MATCH/$N_NEW, ${PATCH_KB} KiB)"
+              echo "| $variant | $N_NEW | ${PATCH_KB} KiB | PASS |" >> "$GITHUB_STEP_SUMMARY"
+              PASS=$((PASS + 1))
+
+              # Upload verified patch
+              mkdir -p "$(dirname "$WORKDIR/patches/$variant/x")"
+              aws s3 cp "$PATCH_FILE" \
+                "s3://$S3_BUCKET/$S3_PREFIX/patches/$variant/${PREV}-to-${CURRENT}.gcpatch" \
+                --no-progress --only-show-errors
+            else
+              echo "::error::$variant: FAIL ($MATCH/$N_NEW match)"
+              echo "| $variant | $N_NEW | ${PATCH_KB} KiB | **FAIL** |" >> "$GITHUB_STEP_SUMMARY"
+              FAIL=$((FAIL + 1))
+            fi
+
+            rm -f "$PATCH_FILE"
+            rm -rf "$VERIFY_DIR" "$PREV_DIR"
+          done
+
+          echo ""
+          echo "Results: $PASS pass, $FAIL fail, $SKIP skip"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Total: $PASS pass, $FAIL fail, $SKIP skip**" >> "$GITHUB_STEP_SUMMARY"
+
+          [ $FAIL -gt 0 ] && exit 1 || true
+
+      - name: Clean up old builds (keep last 2)
+        if: steps.meta.outputs.skip != 'true'
+        run: |
+          BUILDS=$(aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/" \
+            | grep 'PRE' | awk '{print $2}' | tr -d '/' \
+            | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \
+            | sort -r)
+
+          COUNT=0
+          while IFS= read -r build; do
+            COUNT=$((COUNT + 1))
+            if [ $COUNT -gt 2 ]; then
+              echo "Deleting old build: $build"
+              aws s3 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$build/" --recursive \
+                --no-progress --only-show-errors
+            fi
+          done <<< "$BUILDS"
+
+      - name: Update index.json
+        if: steps.meta.outputs.skip != 'true'
+        run: |
+          BUILD_DATE="${{ steps.meta.outputs.date }}"
+
+          # Collect builds
+          BUILDS_JSON=$(aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/" \
+            | grep 'PRE' | awk '{print $2}' | tr -d '/' \
+            | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \
+            | sort -r \
+            | while read -r b; do
+                # List regions in this build
+                REGIONS_LIST=$(aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$b/" \
+                  | grep 'PRE' | awk '{print $2}' | tr -d '/' \
+                  | jq -R . | jq -s .)
+                echo "{\"date\":\"$b\",\"regions\":$REGIONS_LIST}"
+              done | jq -s .)
+
+          # Collect patches grouped by region
+          PATCHES_JSON=$(for region in $REGIONS; do
+            REGION_PATCHES=$(aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/patches/$region/" 2>/dev/null \
+              | awk '{print $4}' | grep '\.gcpatch$' | sort -r \
+              | while read -r p; do
+                  SIZE=$(aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/patches/$region/$p" | awk '{print $3}')
+                  FROM=$(echo "$p" | sed 's/\(.*\)-to-.*/\1/')
+                  TO=$(echo "$p" | sed 's/.*-to-\(.*\)\.gcpatch/\1/')
+                  echo "{\"from\":\"$FROM\",\"to\":\"$TO\",\"file\":\"patches/$region/$p\",\"bytes\":${SIZE:-0}}"
+                done | jq -s .)
+            [ "$REGION_PATCHES" = "null" ] && REGION_PATCHES="[]"
+            echo "{\"region\":\"$region\",\"patches\":$REGION_PATCHES}"
+          done | jq -s .)
+
+          # Build index.json
+          jq -n \
+            --arg updated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg latest "$BUILD_DATE" \
+            --argjson builds "$BUILDS_JSON" \
+            --argjson patches "$PATCHES_JSON" \
+            '{
+              updated: $updated,
+              latest_build: $latest,
+              builds: $builds,
+              patches: $patches
+            }' > /tmp/index.json
+
+          cat /tmp/index.json
+
+          aws s3 cp /tmp/index.json \
+            "s3://$S3_BUCKET/$S3_PREFIX/index.json" \
+            --content-type application/json \
+            --no-progress --only-show-errors
+
+      - name: Summary
+        if: always()
+        run: |
+          BUILD_DATE="${{ steps.meta.outputs.date }}"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Build Info" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| | |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Date** | $BUILD_DATE |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **PBF method** | ${{ steps.pbf.outputs.method || 'skipped' }} |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.meta.outputs.skip }}" = "true" ]; then
+            echo "| **Status** | Skipped (already exists) |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| **Status** | Built and uploaded |" >> "$GITHUB_STEP_SUMMARY"
+          fi
