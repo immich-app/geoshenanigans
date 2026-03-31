@@ -1,5 +1,9 @@
 name: Build Geocoder Index
 
+concurrency:
+  group: geocoder-build-${{ github.event_name == 'pull_request' && github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 on:
   schedule:
     # Daily at 06:00 UTC
