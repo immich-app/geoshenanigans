@@ -46,12 +46,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq cmake g++ libz-dev libzstd-dev
+          sudo apt-get install -y -qq cmake g++ libz-dev libzstd-dev \
+            libbz2-dev libexpat1-dev libs2-dev libosmium2-dev
 
       - name: Build tools
         run: |
@@ -104,19 +105,20 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq cmake g++ libz-dev libzstd-dev aria2 jq
+          sudo apt-get install -y -qq cmake g++ libz-dev libzstd-dev \
+            libbz2-dev libexpat1-dev libs2-dev libosmium2-dev aria2 jq python3-pip
           pip install --break-system-packages osmium 2>/dev/null \
             || pip install --user osmium 2>/dev/null \
             || python3 -m pip install --user --break-system-packages osmium
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Configure AWS
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -149,8 +151,9 @@ jobs:
         env:
           INPUT_PBF_URL: ${{ inputs.pbf_url }}
           INPUT_FORCE_FRESH: ${{ inputs.force_fresh_download }}
+          RUNNER_TEMP: ${{ runner.temp }}
         run: |
-          WORKDIR="${{ runner.temp }}/geocoder-build"
+          WORKDIR="$RUNNER_TEMP/geocoder-build"
           mkdir -p "$WORKDIR"
           echo "workdir=$WORKDIR" >> "$GITHUB_OUTPUT"
 
@@ -201,8 +204,9 @@ jobs:
 
       - name: Upload PBF to S3
         if: steps.meta.outputs.skip != 'true'
+        env:
+          WORKDIR: ${{ steps.pbf.outputs.workdir }}
         run: |
-          WORKDIR="${{ steps.pbf.outputs.workdir }}"
           aws s3 cp "$WORKDIR/planet.osm.pbf" \
             "s3://$S3_BUCKET/$S3_PREFIX/pbf/planet-current.osm.pbf" \
             --no-progress --only-show-errors
@@ -210,9 +214,10 @@ jobs:
 
       - name: Upload builds to S3
         if: steps.meta.outputs.skip != 'true'
+        env:
+          WORKDIR: ${{ steps.pbf.outputs.workdir }}
+          BUILD_DATE: ${{ steps.meta.outputs.date }}
         run: |
-          WORKDIR="${{ steps.pbf.outputs.workdir }}"
-          BUILD_DATE="${{ steps.meta.outputs.date }}"
           S3_BUILDS="s3://$S3_BUCKET/$S3_PREFIX/builds/$BUILD_DATE"
 
           aws s3 sync "$WORKDIR/output/" "$S3_BUILDS/" \
@@ -225,8 +230,9 @@ jobs:
       - name: Find previous build
         if: steps.meta.outputs.skip != 'true' && inputs.skip_patch != true
         id: prev
+        env:
+          CURRENT: ${{ steps.meta.outputs.date }}
         run: |
-          CURRENT="${{ steps.meta.outputs.date }}"
           PREV=$(aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/" \
             | grep 'PRE' | awk '{print $2}' | tr -d '/' \
             | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \
@@ -243,10 +249,11 @@ jobs:
 
       - name: Generate and verify patches for all variants
         if: steps.prev.outputs.found == 'true'
+        env:
+          WORKDIR: ${{ steps.pbf.outputs.workdir }}
+          PREV: ${{ steps.prev.outputs.date }}
+          CURRENT: ${{ steps.meta.outputs.date }}
         run: |
-          WORKDIR="${{ steps.pbf.outputs.workdir }}"
-          PREV="${{ steps.prev.outputs.date }}"
-          CURRENT="${{ steps.meta.outputs.date }}"
           S3_PREV_BASE="s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV"
 
           echo "## Patch Generation ($PREV → $CURRENT)" >> "$GITHUB_STEP_SUMMARY"
@@ -336,8 +343,9 @@ jobs:
 
       - name: Update index.json
         if: steps.meta.outputs.skip != 'true'
+        env:
+          BUILD_DATE: ${{ steps.meta.outputs.date }}
         run: |
-          BUILD_DATE="${{ steps.meta.outputs.date }}"
 
           BUILDS_JSON=$(aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/" \
             | grep 'PRE' | awk '{print $2}' | tr -d '/' \
@@ -382,16 +390,19 @@ jobs:
 
       - name: Summary
         if: always()
+        env:
+          BUILD_DATE: ${{ steps.meta.outputs.date }}
+          PBF_METHOD: ${{ steps.pbf.outputs.method || 'skipped' }}
+          WAS_SKIPPED: ${{ steps.meta.outputs.skip }}
         run: |
-          BUILD_DATE="${{ steps.meta.outputs.date }}"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "## Build Info" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| | |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
           echo "| **Date** | $BUILD_DATE |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **PBF method** | ${{ steps.pbf.outputs.method || 'skipped' }} |" >> "$GITHUB_STEP_SUMMARY"
-          if [ "${{ steps.meta.outputs.skip }}" = "true" ]; then
+          echo "| **PBF method** | $PBF_METHOD |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$WAS_SKIPPED" = "true" ]; then
             echo "| **Status** | Skipped (already exists) |" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "| **Status** | Built and uploaded |" >> "$GITHUB_STEP_SUMMARY"
