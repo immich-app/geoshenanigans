@@ -109,11 +109,11 @@ jobs:
           done
           [ $FAIL -eq 0 ] && echo "Patch round-trip: PASS" || exit 1
 
-  # --- PR planet test: full build + patching without S3 (triggered by label) ---
+  # --- PR planet test: full build + validation without S3 (triggered by label) ---
   planet-test:
     if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'planet-test')
     runs-on: pokedex-giant
-    timeout-minutes: 240
+    timeout-minutes: 360
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -134,6 +134,7 @@ jobs:
           echo "$PWD" >> "$GITHUB_PATH"
 
       - name: Download planet PBF
+        id: pbf
         env:
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
@@ -146,9 +147,8 @@ jobs:
           echo "Downloading $PBF_URL..."
           aria2c -x 8 -s 8 --max-tries=3 -d "$WORKDIR" -o planet.osm.pbf "$PBF_URL"
           ls -lh "$WORKDIR/planet.osm.pbf"
-        id: pbf
 
-      - name: Build index (all variants)
+      - name: Build index (first build)
         env:
           WORKDIR: ${{ steps.pbf.outputs.workdir }}
         run: |
@@ -159,19 +159,21 @@ jobs:
           find "$WORKDIR/output" -name "*.bin" | wc -l
           echo "bin files produced"
 
+      - name: Build index (second build for validation)
+        env:
+          WORKDIR: ${{ steps.pbf.outputs.workdir }}
+        run: |
+          echo "Building again to validate determinism + patch pipeline..."
+          time build-index "$WORKDIR/output2/" "$WORKDIR/planet.osm.pbf" \
+            --simplify-epsilon --epsilon-scale 1 \
+            --continents --multi-output --multi-quality 2>&1 | tail -5
+          rm -f "$WORKDIR/planet.osm.pbf"
+
       - name: Verify determinism
         env:
           WORKDIR: ${{ steps.pbf.outputs.workdir }}
         run: |
-          echo "Building again to verify determinism..."
-          time build-index "$WORKDIR/output2/" "$WORKDIR/planet.osm.pbf" \
-            --simplify-epsilon --epsilon-scale 1 \
-            --continents --multi-output --multi-quality 2>&1 | tail -5
-
-          # Free PBF
-          rm -f "$WORKDIR/planet.osm.pbf"
-
-          echo "Comparing all files..."
+          echo "Comparing all files between build 1 and build 2..."
           FAIL=0
           while IFS= read -r f; do
             rel="${f#$WORKDIR/output/}"
@@ -180,52 +182,67 @@ jobs:
               FAIL=1
             fi
           done < <(find "$WORKDIR/output" -name "*.bin")
-          rm -rf "$WORKDIR/output2"
 
-          [ $FAIL -eq 0 ] && echo "Determinism: PASS (all files identical)" || exit 1
+          if [ $FAIL -ne 0 ]; then
+            echo "::error::Determinism check FAILED"
+            exit 1
+          fi
+          echo "Determinism: PASS (all files identical)"
 
-      - name: Test diff + patch for all variants
+      - name: Generate and verify patches for all variants
         env:
           WORKDIR: ${{ steps.pbf.outputs.workdir }}
         run: |
           echo "## Planet Test Results" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Variant | Files | Patch Size | Verified |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---------|-------|-----------|----------|" >> "$GITHUB_STEP_SUMMARY"
 
-          # Build A is in output/. Diff each variant against itself (identity patch).
-          # This validates the full diff→patch pipeline on planet data.
           PASS=0; FAIL=0
           VARIANTS=$(cd "$WORKDIR/output" && find . -name "*.bin" -exec dirname {} \; | sort -u | sed 's|^\./||')
 
           for variant in $VARIANTS; do
-            DIR="$WORKDIR/output/$variant"
-            N=$(ls "$DIR"/*.bin 2>/dev/null | wc -l)
-            [ "$N" -lt 2 ] && continue
+            NEW_DIR="$WORKDIR/output/$variant"
+            PREV_DIR="$WORKDIR/output2/$variant"
+            N_NEW=$(ls "$NEW_DIR"/*.bin 2>/dev/null | wc -l)
+            N_PREV=$(ls "$PREV_DIR"/*.bin 2>/dev/null | wc -l)
+            [ "$N_NEW" -lt 2 ] && continue
+            [ "$N_PREV" -ne "$N_NEW" ] && continue
 
-            geocoder-diff "$DIR" "$DIR" -o "$WORKDIR/test.gcpatch" 2>/dev/null
-            PATCH_SIZE=$(stat -c%s "$WORKDIR/test.gcpatch" 2>/dev/null || echo 0)
-            rm -rf "$WORKDIR/verify"; mkdir -p "$WORKDIR/verify"
-            geocoder-patch "$DIR" "$WORKDIR/test.gcpatch" -o "$WORKDIR/verify/" 2>/dev/null
+            PATCH_FILE="$WORKDIR/test.gcpatch"
+            geocoder-diff "$PREV_DIR" "$NEW_DIR" -o "$PATCH_FILE" 2>/dev/null
+            PATCH_SIZE=$(stat -c%s "$PATCH_FILE" 2>/dev/null || echo 0)
+            PATCH_KB=$((PATCH_SIZE / 1024))
+
+            VERIFY_DIR="$WORKDIR/verify"
+            rm -rf "$VERIFY_DIR"; mkdir -p "$VERIFY_DIR"
+            geocoder-patch "$PREV_DIR" "$PATCH_FILE" -o "$VERIFY_DIR/" 2>/dev/null
 
             MATCH=0
-            for f in "$DIR"/*.bin; do
+            for f in "$NEW_DIR"/*.bin; do
               b=$(basename "$f")
-              cmp -s "$WORKDIR/verify/$b" "$DIR/$b" && MATCH=$((MATCH + 1))
+              h1=$(md5sum "$VERIFY_DIR/$b" 2>/dev/null | awk '{print $1}')
+              h2=$(md5sum "$NEW_DIR/$b" | awk '{print $1}')
+              [ "$h1" = "$h2" ] && MATCH=$((MATCH + 1))
             done
 
-            if [ $MATCH -eq $N ]; then
+            if [ $MATCH -eq $N_NEW ]; then
+              echo "  $variant: PASS ($MATCH/$N_NEW, ${PATCH_KB} KiB)"
+              echo "| $variant | $N_NEW | ${PATCH_KB} KiB | PASS |" >> "$GITHUB_STEP_SUMMARY"
               PASS=$((PASS + 1))
             else
-              echo "::error::$variant: FAIL ($MATCH/$N)"
+              echo "::error::$variant: FAIL ($MATCH/$N_NEW match)"
+              echo "| $variant | $N_NEW | ${PATCH_KB} KiB | **FAIL** |" >> "$GITHUB_STEP_SUMMARY"
               FAIL=$((FAIL + 1))
             fi
-            rm -f "$WORKDIR/test.gcpatch"
+            rm -f "$PATCH_FILE"
+            rm -rf "$VERIFY_DIR"
           done
 
-          echo "| | |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Variants tested** | $((PASS + FAIL)) |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Pass** | $PASS |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Fail** | $FAIL |" >> "$GITHUB_STEP_SUMMARY"
+          rm -rf "$WORKDIR/output2"
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Total: $PASS pass, $FAIL fail**" >> "$GITHUB_STEP_SUMMARY"
 
           echo "Results: $PASS pass, $FAIL fail"
           [ $FAIL -gt 0 ] && exit 1 || true
@@ -380,7 +397,61 @@ jobs:
             echo "Previous build: $PREV"
           else
             echo "found=false" >> "$GITHUB_OUTPUT"
-            echo "No previous build found"
+            echo "No previous build found — will verify via second build"
+          fi
+
+      - name: Bootstrap validation (no previous build)
+        if: steps.prev.outputs.found != 'true' && steps.meta.outputs.skip != 'true' && inputs.skip_patch != true
+        env:
+          WORKDIR: ${{ steps.pbf.outputs.workdir }}
+        run: |
+          echo "No previous build — building again to validate determinism + patch pipeline"
+          echo "Downloading today's PBF again..."
+
+          # Re-download the PBF we already uploaded
+          aws s3 cp "s3://$S3_BUCKET/$S3_PREFIX/pbf/planet-current.osm.pbf" \
+            "$WORKDIR/planet-verify.osm.pbf" --no-progress --only-show-errors
+
+          time build-index "$WORKDIR/output2/" "$WORKDIR/planet-verify.osm.pbf" \
+            --simplify-epsilon --epsilon-scale 1 \
+            --continents --multi-output --multi-quality 2>&1 | tail -5
+          rm -f "$WORKDIR/planet-verify.osm.pbf"
+
+          echo ""
+          echo "=== Comparing builds ==="
+          FAIL=0
+          while IFS= read -r f; do
+            rel="${f#$WORKDIR/output/}"
+            if ! cmp -s "$f" "$WORKDIR/output2/$rel"; then
+              echo "::error::Bootstrap MISMATCH: $rel"
+              FAIL=1
+            fi
+          done < <(find "$WORKDIR/output" -name "*.bin")
+          rm -rf "$WORKDIR/output2"
+
+          if [ $FAIL -ne 0 ]; then
+            echo "::error::Bootstrap determinism check FAILED"
+            exit 1
+          fi
+          echo "Bootstrap determinism: PASS (two identical builds)"
+
+          # Also verify identity patch round-trip on planet variant
+          echo ""
+          echo "=== Verifying patch pipeline (identity) ==="
+          DIR="$WORKDIR/output/planet"
+          if [ -d "$DIR" ]; then
+            geocoder-diff "$DIR" "$DIR" -o "$WORKDIR/test.gcpatch" 2>/dev/null
+            mkdir -p "$WORKDIR/verify"
+            geocoder-patch "$DIR" "$WORKDIR/test.gcpatch" -o "$WORKDIR/verify/" 2>/dev/null
+            for f in "$DIR"/*.bin; do
+              b=$(basename "$f")
+              if ! cmp -s "$WORKDIR/verify/$b" "$DIR/$b"; then
+                echo "::error::Identity patch MISMATCH: $b"
+                FAIL=1
+              fi
+            done
+            rm -rf "$WORKDIR/verify" "$WORKDIR/test.gcpatch"
+            [ $FAIL -eq 0 ] && echo "Identity patch: PASS" || exit 1
           fi
 
       - name: Generate and verify patches for all variants
