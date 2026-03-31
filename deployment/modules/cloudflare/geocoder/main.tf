@@ -4,21 +4,42 @@ resource "cloudflare_r2_bucket" "geocoder" {
   location   = "ENAM"
 }
 
-output "r2_bucket_name" {
-  value = cloudflare_r2_bucket.geocoder.name
+data "cloudflare_api_token_permission_groups" "all" {}
+
+resource "cloudflare_api_token" "geocoder_r2" {
+  name = "geocoder-ci-r2"
+
+  policy {
+    permission_groups = [
+      data.cloudflare_api_token_permission_groups.all.r2["Workers R2 Storage Bucket Item Write"],
+      data.cloudflare_api_token_permission_groups.all.r2["Workers R2 Storage Bucket Item Read"],
+    ]
+    resources = {
+      "com.cloudflare.edge.r2.bucket.${var.cloudflare_account_id}_default_${cloudflare_r2_bucket.geocoder.id}" = "*"
+    }
+  }
 }
 
-output "r2_s3_endpoint" {
-  value = "https://${var.cloudflare_account_id}.r2.cloudflarestorage.com"
+resource "github_actions_secret" "r2_bucket" {
+  repository      = "geoshenanigans"
+  secret_name     = "GEOCODER_R2_BUCKET"
+  plaintext_value = cloudflare_r2_bucket.geocoder.name
 }
 
-# R2 S3 API credentials must be created manually in the Cloudflare dashboard:
-#   R2 > Manage R2 API Tokens > Create API Token
-#   Permissions: Object Read & Write
-#   Scope: Apply to specific bucket only > geocoder
-#
-# Then set these GitHub Actions secrets on immich-app/geoshenanigans:
-#   GEOCODER_R2_BUCKET         = "geocoder"
-#   GEOCODER_R2_ENDPOINT       = output.r2_s3_endpoint
-#   GEOCODER_R2_ACCESS_KEY_ID  = <from dashboard>
-#   GEOCODER_R2_SECRET_ACCESS_KEY = <from dashboard>
+resource "github_actions_secret" "r2_endpoint" {
+  repository      = "geoshenanigans"
+  secret_name     = "GEOCODER_R2_ENDPOINT"
+  plaintext_value = "https://${var.cloudflare_account_id}.r2.cloudflarestorage.com"
+}
+
+resource "github_actions_secret" "r2_access_key_id" {
+  repository      = "geoshenanigans"
+  secret_name     = "GEOCODER_R2_ACCESS_KEY_ID"
+  plaintext_value = cloudflare_api_token.geocoder_r2.id
+}
+
+resource "github_actions_secret" "r2_secret_access_key" {
+  repository      = "geoshenanigans"
+  secret_name     = "GEOCODER_R2_SECRET_ACCESS_KEY"
+  plaintext_value = cloudflare_api_token.geocoder_r2.value
+}
