@@ -32,8 +32,8 @@ on:
         default: 'self-hosted'
 
 env:
-  S3_BUCKET: ${{ secrets.GEOCODER_S3_BUCKET }}
-  S3_REGION: ${{ secrets.GEOCODER_S3_REGION }}
+  S3_BUCKET: ${{ secrets.GEOCODER_R2_BUCKET }}
+  S3_ENDPOINT: ${{ secrets.GEOCODER_R2_ENDPOINT }}
   S3_PREFIX: geocoder
   REGIONS: "planet africa asia europe north-america south-america oceania central-america antarctica"
 
@@ -264,18 +264,21 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq cmake g++ libz-dev libzstd-dev \
-            libbz2-dev libexpat1-dev libs2-dev libosmium2-dev aria2 jq python3-pip
+            libbz2-dev libexpat1-dev libs2-dev libosmium2-dev aria2 jq python3-pip awscli
           pip install --break-system-packages osmium 2>/dev/null \
             || pip install --user osmium 2>/dev/null \
             || python3 -m pip install --user --break-system-packages osmium
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Configure AWS
-        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.GEOCODER_S3_REGION }}
+      - name: Configure R2 credentials
+        run: |
+          echo "AWS_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" >> "$GITHUB_ENV"
+          echo "AWS_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" >> "$GITHUB_ENV"
+          echo "AWS_DEFAULT_REGION=auto" >> "$GITHUB_ENV"
+          echo "AWS_ENDPOINT_URL=$S3_ENDPOINT" >> "$GITHUB_ENV"
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.GEOCODER_R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.GEOCODER_R2_SECRET_ACCESS_KEY }}
 
       - name: Build tools
         run: |
