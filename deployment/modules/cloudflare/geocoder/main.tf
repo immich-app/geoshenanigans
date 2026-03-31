@@ -4,15 +4,28 @@ resource "cloudflare_r2_bucket" "geocoder" {
   location   = "ENAM"
 }
 
-data "cloudflare_api_token_permission_groups" "all" {}
+data "cloudflare_api_token_permission_groups" "all" {
+  provider = cloudflare.api_keys
+}
 
 resource "cloudflare_api_token" "geocoder_r2" {
-  name = "geocoder-ci-r2"
+  provider = cloudflare.api_keys
+  name     = "geocoder-ci-r2"
 
   policy {
     permission_groups = [
-      data.cloudflare_api_token_permission_groups.all.r2["Workers R2 Storage Bucket Item Write"],
+      data.cloudflare_api_token_permission_groups.all.r2["Workers R2 Storage Read"],
+      data.cloudflare_api_token_permission_groups.all.r2["Workers R2 Storage Write"],
+    ]
+    resources = {
+      "com.cloudflare.api.account.*" = "*"
+    }
+  }
+
+  policy {
+    permission_groups = [
       data.cloudflare_api_token_permission_groups.all.r2["Workers R2 Storage Bucket Item Read"],
+      data.cloudflare_api_token_permission_groups.all.r2["Workers R2 Storage Bucket Item Write"],
     ]
     resources = {
       "com.cloudflare.edge.r2.bucket.${var.cloudflare_account_id}_default_${cloudflare_r2_bucket.geocoder.id}" = "*"
