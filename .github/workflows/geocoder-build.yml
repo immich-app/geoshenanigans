@@ -146,17 +146,20 @@ jobs:
       - name: Obtain PBF
         if: steps.meta.outputs.skip != 'true'
         id: pbf
+        env:
+          INPUT_PBF_URL: ${{ inputs.pbf_url }}
+          INPUT_FORCE_FRESH: ${{ inputs.force_fresh_download }}
         run: |
           WORKDIR="${{ runner.temp }}/geocoder-build"
           mkdir -p "$WORKDIR"
           echo "workdir=$WORKDIR" >> "$GITHUB_OUTPUT"
 
-          if [ -n "${{ inputs.pbf_url }}" ]; then
+          if [ -n "$INPUT_PBF_URL" ]; then
             echo "Downloading from override URL..."
-            aria2c -x 8 -s 8 --max-tries=3 -d "$WORKDIR" -o planet.osm.pbf "${{ inputs.pbf_url }}"
+            aria2c -x 8 -s 8 --max-tries=3 -d "$WORKDIR" -o planet.osm.pbf "$INPUT_PBF_URL"
             echo "method=download" >> "$GITHUB_OUTPUT"
 
-          elif [ "${{ inputs.force_fresh_download }}" = "true" ]; then
+          elif [ "$INPUT_FORCE_FRESH" = "true" ]; then
             echo "Downloading fresh planet PBF..."
             PBF_URL=$(curl -sI "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
               | grep -i '^location:' | awk '{print $2}' | tr -d '\r')
@@ -185,8 +188,9 @@ jobs:
 
       - name: Build index with all variants
         if: steps.meta.outputs.skip != 'true'
+        env:
+          WORKDIR: ${{ steps.pbf.outputs.workdir }}
         run: |
-          WORKDIR="${{ steps.pbf.outputs.workdir }}"
           echo "Building geocoder index (continents + modes + quality variants)..."
           time build-index "$WORKDIR/output/" "$WORKDIR/planet.osm.pbf" \
             --simplify-epsilon --epsilon-scale 1 \
