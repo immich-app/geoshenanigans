@@ -127,7 +127,7 @@ jobs:
           sed -i -E 's/"pmtiles_deployment_key": "(.*)"/"pmtiles_deployment_key": "${{ needs.deploy_tiles.outputs.KEY }}"/' deployment/modules/cloudflare/tiles-worker/tiles.tfvars.json
 
       - name: Push updated tiles.tfvars to repo
-        uses: EndBug/add-and-commit@a94899bca583c204427a224a7af87c02f9b325d5 # v9.1.4
+        uses: EndBug/add-and-commit@290ea2c423ad77ca9c62ae0f5b224379612c0321 # v10.0.0
         with:
           add: deployment/modules/cloudflare/tiles-worker/tiles.tfvars.json
           message: Update tile server file to ${{ needs.deploy_tiles.outputs.KEY }}
