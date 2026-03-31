@@ -5,6 +5,7 @@ on:
     # Daily at 06:00 UTC
     - cron: '0 6 * * *'
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
     paths:
       - 'geocoder/**'
       - '.github/workflows/geocoder-build.yml'
@@ -108,10 +109,131 @@ jobs:
           done
           [ $FAIL -eq 0 ] && echo "Patch round-trip: PASS" || exit 1
 
+  # --- PR planet test: full build + patching without S3 (triggered by label) ---
+  planet-test:
+    if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'planet-test')
+    runs-on: pokedex-giant
+    timeout-minutes: 240
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake g++ libz-dev libzstd-dev \
+            libbz2-dev libexpat1-dev libs2-dev libosmium2-dev aria2 jq
+
+      - name: Build tools
+        run: |
+          cd geocoder/builder && mkdir -p build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          make -j$(nproc) build-index geocoder-diff geocoder-patch
+          echo "$PWD" >> "$GITHUB_PATH"
+
+      - name: Download planet PBF
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          WORKDIR="$RUNNER_TEMP/geocoder-test"
+          mkdir -p "$WORKDIR"
+          echo "workdir=$WORKDIR" >> "$GITHUB_OUTPUT"
+
+          PBF_URL=$(curl -sI "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
+            | grep -i '^location:' | awk '{print $2}' | tr -d '\r')
+          echo "Downloading $PBF_URL..."
+          aria2c -x 8 -s 8 --max-tries=3 -d "$WORKDIR" -o planet.osm.pbf "$PBF_URL"
+          ls -lh "$WORKDIR/planet.osm.pbf"
+        id: pbf
+
+      - name: Build index (all variants)
+        env:
+          WORKDIR: ${{ steps.pbf.outputs.workdir }}
+        run: |
+          echo "Building full planet index with all variants..."
+          time build-index "$WORKDIR/output/" "$WORKDIR/planet.osm.pbf" \
+            --simplify-epsilon --epsilon-scale 1 \
+            --continents --multi-output --multi-quality 2>&1 | tail -10
+          find "$WORKDIR/output" -name "*.bin" | wc -l
+          echo "bin files produced"
+
+      - name: Verify determinism
+        env:
+          WORKDIR: ${{ steps.pbf.outputs.workdir }}
+        run: |
+          echo "Building again to verify determinism..."
+          time build-index "$WORKDIR/output2/" "$WORKDIR/planet.osm.pbf" \
+            --simplify-epsilon --epsilon-scale 1 \
+            --continents --multi-output --multi-quality 2>&1 | tail -5
+
+          # Free PBF
+          rm -f "$WORKDIR/planet.osm.pbf"
+
+          echo "Comparing all files..."
+          FAIL=0
+          while IFS= read -r f; do
+            rel="${f#$WORKDIR/output/}"
+            if ! cmp -s "$f" "$WORKDIR/output2/$rel"; then
+              echo "::error::MISMATCH: $rel"
+              FAIL=1
+            fi
+          done < <(find "$WORKDIR/output" -name "*.bin")
+          rm -rf "$WORKDIR/output2"
+
+          [ $FAIL -eq 0 ] && echo "Determinism: PASS (all files identical)" || exit 1
+
+      - name: Test diff + patch for all variants
+        env:
+          WORKDIR: ${{ steps.pbf.outputs.workdir }}
+        run: |
+          echo "## Planet Test Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          # Build A is in output/. Diff each variant against itself (identity patch).
+          # This validates the full diff→patch pipeline on planet data.
+          PASS=0; FAIL=0
+          VARIANTS=$(cd "$WORKDIR/output" && find . -name "*.bin" -exec dirname {} \; | sort -u | sed 's|^\./||')
+
+          for variant in $VARIANTS; do
+            DIR="$WORKDIR/output/$variant"
+            N=$(ls "$DIR"/*.bin 2>/dev/null | wc -l)
+            [ "$N" -lt 2 ] && continue
+
+            geocoder-diff "$DIR" "$DIR" -o "$WORKDIR/test.gcpatch" 2>/dev/null
+            PATCH_SIZE=$(stat -c%s "$WORKDIR/test.gcpatch" 2>/dev/null || echo 0)
+            rm -rf "$WORKDIR/verify"; mkdir -p "$WORKDIR/verify"
+            geocoder-patch "$DIR" "$WORKDIR/test.gcpatch" -o "$WORKDIR/verify/" 2>/dev/null
+
+            MATCH=0
+            for f in "$DIR"/*.bin; do
+              b=$(basename "$f")
+              cmp -s "$WORKDIR/verify/$b" "$DIR/$b" && MATCH=$((MATCH + 1))
+            done
+
+            if [ $MATCH -eq $N ]; then
+              PASS=$((PASS + 1))
+            else
+              echo "::error::$variant: FAIL ($MATCH/$N)"
+              FAIL=$((FAIL + 1))
+            fi
+            rm -f "$WORKDIR/test.gcpatch"
+          done
+
+          echo "| | |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Variants tested** | $((PASS + FAIL)) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Pass** | $PASS |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Fail** | $FAIL |" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Results: $PASS pass, $FAIL fail"
+          [ $FAIL -gt 0 ] && exit 1 || true
+
   # --- Production build: full planet + S3 upload ---
   build:
     if: github.event_name != 'pull_request'
-    runs-on: ${{ inputs.runner || 'self-hosted' }}
+    runs-on: ${{ inputs.runner || 'pokedex-giant' }}
     timeout-minutes: 240
     permissions:
       contents: read
