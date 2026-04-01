@@ -16,7 +16,7 @@ permissions:
 jobs:
   test-s3:
     runs-on: pokedex-giant
-    timeout-minutes: 5
+    timeout-minutes: 30
     steps:
       - name: Install s5cmd
         run: |
@@ -25,7 +25,7 @@ jobs:
           sudo tar xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd
           s5cmd version
 
-      - name: Test s5cmd upload + download
+      - name: Test upload concurrency levels
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
@@ -34,29 +34,42 @@ jobs:
         run: |
           # Generate a 5GB test file
           dd if=/dev/urandom of=/tmp/test-5g.bin bs=1M count=5120 2>/dev/null
-          ls -lh /tmp/test-5g.bin
+          echo "Test file: 5 GiB"
 
-          echo "=== s5cmd upload (5GB, concurrency 32, part-size 256MB) ==="
-          START=$(date +%s)
-          s5cmd --endpoint-url "$S3_ENDPOINT_URL" --stat \
-            cp --concurrency 32 --part-size 256 \
-            /tmp/test-5g.bin "s3://$S3_BUCKET/geocoder/test/test-5g.bin"
-          END=$(date +%s)
-          ELAPSED=$((END - START))
-          echo "Upload: ${ELAPSED}s ($(echo "scale=1; 5120/$ELAPSED" | bc) MB/s)"
+          for CONC in 1 2 4 8 16 32; do
+            echo ""
+            echo "=== s5cmd concurrency=$CONC part-size=64MB ==="
+            START=$(date +%s)
+            s5cmd --endpoint-url "$S3_ENDPOINT_URL" --stat \
+              cp --concurrency $CONC --part-size 64 \
+              /tmp/test-5g.bin "s3://$S3_BUCKET/geocoder/test/conc-test.bin"
+            END=$(date +%s)
+            ELAPSED=$((END - START))
+            MBPS=$(echo "scale=1; 5120/$ELAPSED" | bc)
+            echo "  Upload: ${ELAPSED}s (${MBPS} MB/s)"
 
-          echo "=== s5cmd download (5GB) ==="
-          START=$(date +%s)
-          s5cmd --endpoint-url "$S3_ENDPOINT_URL" --stat \
-            cp "s3://$S3_BUCKET/geocoder/test/test-5g.bin" /tmp/test-download.bin
-          END=$(date +%s)
-          ELAPSED=$((END - START))
-          echo "Download: ${ELAPSED}s ($(echo "scale=1; 5120/$ELAPSED" | bc) MB/s)"
+            s5cmd --endpoint-url "$S3_ENDPOINT_URL" \
+              rm "s3://$S3_BUCKET/geocoder/test/conc-test.bin"
+          done
 
-          echo "=== Verify ==="
-          md5sum /tmp/test-5g.bin /tmp/test-download.bin
+          echo ""
+          echo "=== Part size sweep (concurrency=4) ==="
+          for PART in 16 64 128 256; do
+            echo ""
+            echo "=== s5cmd concurrency=4 part-size=${PART}MB ==="
+            START=$(date +%s)
+            s5cmd --endpoint-url "$S3_ENDPOINT_URL" --stat \
+              cp --concurrency 4 --part-size $PART \
+              /tmp/test-5g.bin "s3://$S3_BUCKET/geocoder/test/conc-test.bin"
+            END=$(date +%s)
+            ELAPSED=$((END - START))
+            MBPS=$(echo "scale=1; 5120/$ELAPSED" | bc)
+            echo "  Upload: ${ELAPSED}s (${MBPS} MB/s)"
 
-          echo "=== Cleanup ==="
-          s5cmd --endpoint-url "$S3_ENDPOINT_URL" \
-            rm "s3://$S3_BUCKET/geocoder/test/test-5g.bin"
-          echo "Done"
+            s5cmd --endpoint-url "$S3_ENDPOINT_URL" \
+              rm "s3://$S3_BUCKET/geocoder/test/conc-test.bin"
+          done
+
+          rm -f /tmp/test-5g.bin
+          echo ""
+          echo "=== DONE ==="
