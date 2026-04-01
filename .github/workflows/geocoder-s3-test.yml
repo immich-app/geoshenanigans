@@ -37,20 +37,26 @@ jobs:
       - name: Test upload + download + list
         run: |
           echo "test-$(date -u +%Y%m%d%H%M%S)" > /tmp/test.txt
+          S3="aws s3 --endpoint-url $S3_ENDPOINT"
+
+          echo "=== Debug ==="
+          aws --version
+          echo "Endpoint: $S3_ENDPOINT"
+          echo "Bucket: $S3_BUCKET"
 
           echo "=== Upload ==="
-          aws s3 cp /tmp/test.txt "s3://$S3_BUCKET/$S3_PREFIX/test.txt" --no-progress
+          $S3 cp /tmp/test.txt "s3://$S3_BUCKET/$S3_PREFIX/test.txt" --no-progress
           echo "Upload: OK"
 
           echo "=== List ==="
-          aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/"
+          $S3 ls "s3://$S3_BUCKET/$S3_PREFIX/"
           echo "List: OK"
 
           echo "=== Download ==="
-          aws s3 cp "s3://$S3_BUCKET/$S3_PREFIX/test.txt" /tmp/test-download.txt --no-progress
+          $S3 cp "s3://$S3_BUCKET/$S3_PREFIX/test.txt" /tmp/test-download.txt --no-progress
           diff /tmp/test.txt /tmp/test-download.txt
           echo "Download + verify: OK"
 
           echo "=== Cleanup ==="
-          aws s3 rm "s3://$S3_BUCKET/$S3_PREFIX/test.txt"
+          $S3 rm "s3://$S3_BUCKET/$S3_PREFIX/test.txt"
           echo "Cleanup: OK"
