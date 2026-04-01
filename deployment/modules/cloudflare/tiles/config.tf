@@ -9,5 +9,8 @@ terraform {
       source  = "cloudflare/cloudflare"
       version = "4.52.5"
     }
+    tigris = {
+      source = "tigrisdata/tigris"
+    }
   }
 }
