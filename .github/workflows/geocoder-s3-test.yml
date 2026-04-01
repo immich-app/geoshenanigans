@@ -1,0 +1,55 @@
+name: Test S3 Upload Speed
+
+on:
+  push:
+    paths:
+      - '.github/workflows/geocoder-s3-test.yml'
+  workflow_dispatch:
+
+env:
+  S3_BUCKET: geoshenanigans-reverse-geocoding
+  S3_ENDPOINT: https://fly.storage.tigris.dev
+
+permissions:
+  contents: read
+
+jobs:
+  test-s3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Install s5cmd
+        run: |
+          curl -sL "https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-64bit.tar.gz" \
+            -o /tmp/s5cmd.tar.gz
+          tar xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd
+          s5cmd version
+
+      - name: Test s5cmd upload + download
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          S3_ENDPOINT_URL: ${{ env.S3_ENDPOINT }}
+        run: |
+          # Generate a 100MB test file
+          dd if=/dev/urandom of=/tmp/test-100m.bin bs=1M count=100 2>/dev/null
+
+          echo "=== s5cmd upload (100MB, concurrency 32) ==="
+          time s5cmd --endpoint-url "$S3_ENDPOINT_URL" \
+            cp --concurrency 32 --part-size 25 \
+            /tmp/test-100m.bin "s3://$S3_BUCKET/geocoder/test/test-100m.bin"
+          echo "Upload OK"
+
+          echo "=== s5cmd download ==="
+          time s5cmd --endpoint-url "$S3_ENDPOINT_URL" \
+            cp "s3://$S3_BUCKET/geocoder/test/test-100m.bin" /tmp/test-download.bin
+          echo "Download OK"
+
+          echo "=== Verify ==="
+          md5sum /tmp/test-100m.bin /tmp/test-download.bin
+
+          echo "=== Cleanup ==="
+          s5cmd --endpoint-url "$S3_ENDPOINT_URL" \
+            rm "s3://$S3_BUCKET/geocoder/test/test-100m.bin"
+          echo "Done"
