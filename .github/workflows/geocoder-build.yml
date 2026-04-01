@@ -167,8 +167,7 @@ jobs:
             -d "$WORKDIR" -o planet.osm.pbf \
             "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
             "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
-            "https://ftp.spline.de/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
-            "https://planet.osm-hr.org/pbf/planet-latest.osm.pbf"
+            "https://ftp.spline.de/pub/openstreetmap/pbf/planet-latest.osm.pbf"
           ls -lh "$WORKDIR/planet.osm.pbf"
 
       - name: Build "old" index from downloaded PBF
