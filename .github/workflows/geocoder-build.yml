@@ -224,7 +224,7 @@ jobs:
                 -s 2000 "$WORKDIR/planet.osm.pbf" 2>&1 || RC=$?
               PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
               echo "PBF now at: $PBF_DATE"
-              if [ "$PBF_DATE" \>= "$YESTERDAY" ] || [ $RC -eq 0 ]; then
+              if [ ! "$PBF_DATE" \< "$YESTERDAY" ] || [ $RC -eq 0 ]; then
                 break
               elif [ $RC -eq 1 ]; then
                 echo "More diffs to apply..."
