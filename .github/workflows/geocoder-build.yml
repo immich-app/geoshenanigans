@@ -160,8 +160,8 @@ jobs:
           make -j$(nproc) build-index geocoder-diff geocoder-patch
           echo "$PWD" >> "$GITHUB_PATH"
 
-      - name: Check for existing data
-        id: check
+      - name: Setup workdir
+        id: setup
         env:
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
@@ -169,23 +169,9 @@ jobs:
           mkdir -p "$WORKDIR"
           echo "workdir=$WORKDIR" >> "$GITHUB_OUTPUT"
 
-          YESTERDAY=$(date -u -d "yesterday" +%Y-%m-%d)
-          echo "yesterday=$YESTERDAY" >> "$GITHUB_OUTPUT"
-
-          # Check if yesterday's build exists in Tigris
-          if rclone ls "tigris:$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/planet/" 2>/dev/null | grep -q '.bin'; then
-            echo "bootstrap=false" >> "$GITHUB_OUTPUT"
-            echo "Yesterday's build ($YESTERDAY) exists in Tigris — skipping bootstrap"
-          else
-            echo "bootstrap=true" >> "$GITHUB_OUTPUT"
-            echo "No build for $YESTERDAY — will bootstrap"
-          fi
-
-      # --- Bootstrap: build yesterday's index (only if not already in Tigris) ---
-      - name: "Bootstrap: obtain PBF"
-        if: steps.check.outputs.bootstrap == 'true'
+      - name: Obtain PBF
         env:
-          WORKDIR: ${{ steps.check.outputs.workdir }}
+          WORKDIR: ${{ steps.setup.outputs.workdir }}
         run: |
           if rclone ls "tigris:$S3_BUCKET/$S3_PREFIX/pbf/" 2>/dev/null | grep -q 'planet-current'; then
             echo "Downloading stored PBF from Tigris..."
@@ -202,61 +188,23 @@ jobs:
           fi
           ls -lh "$WORKDIR/planet.osm.pbf"
 
-      - name: "Bootstrap: build old index"
-        if: steps.check.outputs.bootstrap == 'true'
-        id: old_build
+      - name: Apply replication diffs
         env:
-          WORKDIR: ${{ steps.check.outputs.workdir }}
+          WORKDIR: ${{ steps.setup.outputs.workdir }}
         run: |
-          OLD_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
-          echo "date=$OLD_DATE" >> "$GITHUB_OUTPUT"
-          echo "Building 'old' index ($OLD_DATE)..."
-          time build-index "$WORKDIR/old-output/" "$WORKDIR/planet.osm.pbf" \
-            --continents --multi-output --multi-quality 2>&1 | tail -10
-          find "$WORKDIR/old-output" -name "*.bin" | wc -l
-          echo "bin files produced"
-
-      - name: "Bootstrap: upload old build + PBF to S3"
-        if: steps.check.outputs.bootstrap == 'true'
-        env:
-          WORKDIR: ${{ steps.check.outputs.workdir }}
-          OLD_DATE: ${{ steps.old_build.outputs.date }}
-        run: |
-          echo "Uploading old build as $OLD_DATE..."
-          rclone sync "$WORKDIR/old-output/" \
-            "tigris:$S3_BUCKET/$S3_PREFIX/builds/$OLD_DATE/" \
-            --progress --transfers 32 --retries 5 --low-level-retries 10 \
-            --s3-upload-concurrency 16 --s3-chunk-size 64M --checkers 32
-
-          echo "Uploading PBF (yesterday) to S3..."
-          rclone copyto "$WORKDIR/planet.osm.pbf" \
-            "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-current.osm.pbf" \
-            --progress --retries 5 --low-level-retries 10 \
-            --s3-upload-concurrency 16 --s3-chunk-size 64M
-
-          echo "$OLD_DATE" | rclone rcat "tigris:$S3_BUCKET/$S3_PREFIX/builds/latest.txt"
-
-      # --- Production simulation: download PBF from Tigris, apply today's diff ---
-      - name: Download PBF from Tigris
-        env:
-          WORKDIR: ${{ steps.check.outputs.workdir }}
-        run: |
-          rm -rf "$WORKDIR/old-output" "$WORKDIR/planet.osm.pbf"
-          echo "Downloading PBF from Tigris (simulating production start)..."
-          rclone copyto "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-current.osm.pbf" \
-            "$WORKDIR/planet.osm.pbf" --progress --retries 5 --low-level-retries 10
-          ls -lh "$WORKDIR/planet.osm.pbf"
-
-      - name: Bring PBF to today
-        env:
-          WORKDIR: ${{ steps.check.outputs.workdir }}
-        run: |
-          echo "Applying remaining diffs to bring PBF to today..."
+          PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
+          echo "PBF starting date: $PBF_DATE"
+          echo "Applying replication diffs to bring PBF up to date..."
+          ITER=0
           while true; do
+            ITER=$((ITER + 1))
+            echo "--- Diff batch $ITER (PBF at $PBF_DATE) ---"
             RC=0
             pyosmium-up-to-date -v \
               --server https://planet.openstreetmap.org/replication/day \
               -s 2000 "$WORKDIR/planet.osm.pbf" 2>&1 || RC=$?
+            PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
+            echo "After batch $ITER: RC=$RC, PBF at $PBF_DATE"
             if [ $RC -eq 0 ]; then
               echo "PBF is up to date"
               break
@@ -269,7 +217,6 @@ jobs:
           done
 
           TODAY=$(date -u +%Y-%m-%d)
-          PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
           echo "PBF replication date: $PBF_DATE (expected: $TODAY)"
           if [ "$PBF_DATE" != "$TODAY" ]; then
             YESTERDAY=$(date -u -d "yesterday" +%Y-%m-%d)
@@ -281,47 +228,54 @@ jobs:
             fi
           fi
 
-      - name: Build "new" index (today)
+      - name: Build index
         id: new_build
         env:
-          WORKDIR: ${{ steps.check.outputs.workdir }}
+          WORKDIR: ${{ steps.setup.outputs.workdir }}
         run: |
           NEW_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
           echo "date=$NEW_DATE" >> "$GITHUB_OUTPUT"
-          echo "Building 'new' index ($NEW_DATE)..."
+          echo "Building index ($NEW_DATE)..."
           time build-index "$WORKDIR/output/" "$WORKDIR/planet.osm.pbf" \
             --continents --multi-output --multi-quality 2>&1 | tail -10
           find "$WORKDIR/output" -name "*.bin" | wc -l
           echo "bin files produced"
 
-      - name: Upload PBF to S3
-        env:
-          WORKDIR: ${{ steps.check.outputs.workdir }}
+      - name: Find previous build
+        id: prev
         run: |
-          echo "Uploading updated PBF to S3..."
-          rclone copyto "$WORKDIR/planet.osm.pbf" \
-            "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-current.osm.pbf" \
-            --progress --retries 5 --low-level-retries 10 \
-            --s3-upload-concurrency 16 --s3-chunk-size 64M
-          rm -f "$WORKDIR/planet.osm.pbf"
+          PREV=$(rclone lsd "tigris:$S3_BUCKET/$S3_PREFIX/builds/" 2>/dev/null \
+            | awk '{print $NF}' \
+            | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \
+            | sort | tail -1)
+          if [ -n "$PREV" ]; then
+            echo "date=$PREV" >> "$GITHUB_OUTPUT"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "Previous build: $PREV"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No previous build found — skipping patch verification"
+          fi
 
-      - name: Download old build from S3
+      - name: Download previous build from S3
+        if: steps.prev.outputs.found == 'true'
         env:
-          WORKDIR: ${{ steps.check.outputs.workdir }}
-          OLD_DATE: ${{ steps.old_build.outputs.date || steps.check.outputs.yesterday }}
+          WORKDIR: ${{ steps.setup.outputs.workdir }}
+          PREV_DATE: ${{ steps.prev.outputs.date }}
         run: |
-          echo "Downloading old build ($OLD_DATE) from S3 for patch verification..."
-          rclone sync "tigris:$S3_BUCKET/$S3_PREFIX/builds/$OLD_DATE/" \
+          echo "Downloading previous build ($PREV_DATE) from S3..."
+          rclone sync "tigris:$S3_BUCKET/$S3_PREFIX/builds/$PREV_DATE/" \
             "$WORKDIR/prev-build/" \
             --progress --transfers 16 --retries 5 --low-level-retries 10
 
       - name: Generate and verify patches for all variants
+        if: steps.prev.outputs.found == 'true'
         env:
-          WORKDIR: ${{ steps.check.outputs.workdir }}
-          OLD_DATE: ${{ steps.old_build.outputs.date || steps.check.outputs.yesterday }}
+          WORKDIR: ${{ steps.setup.outputs.workdir }}
+          PREV_DATE: ${{ steps.prev.outputs.date }}
           NEW_DATE: ${{ steps.new_build.outputs.date }}
         run: |
-          echo "## Planet Test Results ($OLD_DATE → $NEW_DATE)" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Planet Test Results ($PREV_DATE → $NEW_DATE)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Variant | Files | Patch Size | Verified |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---------|-------|-----------|----------|" >> "$GITHUB_STEP_SUMMARY"
@@ -418,7 +372,7 @@ jobs:
 
       - name: Upload new build to S3
         env:
-          WORKDIR: ${{ steps.check.outputs.workdir }}
+          WORKDIR: ${{ steps.setup.outputs.workdir }}
           NEW_DATE: ${{ steps.new_build.outputs.date }}
         run: |
           echo "Uploading new build as $NEW_DATE..."
@@ -427,7 +381,18 @@ jobs:
             --progress --transfers 32 --retries 5 --low-level-retries 10 \
             --s3-upload-concurrency 16 --s3-chunk-size 64M --checkers 32
           echo "$NEW_DATE" | rclone rcat "tigris:$S3_BUCKET/$S3_PREFIX/builds/latest.txt"
-          echo "Upload complete"
+          echo "Build upload complete"
+
+      - name: Upload PBF to S3
+        env:
+          WORKDIR: ${{ steps.setup.outputs.workdir }}
+        run: |
+          echo "Uploading updated PBF to S3..."
+          rclone copyto "$WORKDIR/planet.osm.pbf" \
+            "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-current.osm.pbf" \
+            --progress --retries 5 --low-level-retries 10 \
+            --s3-upload-concurrency 16 --s3-chunk-size 64M
+          echo "PBF upload complete"
 
   # --- Production build: full planet + S3 upload ---
   build:
@@ -560,7 +525,7 @@ jobs:
         if: steps.meta.outputs.skip != 'true'
         id: pbf_date
         env:
-          WORKDIR: ${{ steps.check.outputs.workdir }}
+          WORKDIR: ${{ steps.setup.outputs.workdir }}
         run: |
           TODAY=$(date -u +%Y-%m-%d)
           PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
@@ -579,7 +544,7 @@ jobs:
       - name: Build index with all variants
         if: steps.meta.outputs.skip != 'true'
         env:
-          WORKDIR: ${{ steps.check.outputs.workdir }}
+          WORKDIR: ${{ steps.setup.outputs.workdir }}
         run: |
           echo "Building geocoder index (continents + modes + quality variants)..."
           time build-index "$WORKDIR/output/" "$WORKDIR/planet.osm.pbf" \
@@ -591,7 +556,7 @@ jobs:
       - name: Upload PBF to S3
         if: steps.meta.outputs.skip != 'true'
         env:
-          WORKDIR: ${{ steps.check.outputs.workdir }}
+          WORKDIR: ${{ steps.setup.outputs.workdir }}
         run: |
           rclone copyto "$WORKDIR/planet.osm.pbf" \
             "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-current.osm.pbf" \
@@ -602,7 +567,7 @@ jobs:
       - name: Upload builds to S3
         if: steps.meta.outputs.skip != 'true'
         env:
-          WORKDIR: ${{ steps.check.outputs.workdir }}
+          WORKDIR: ${{ steps.setup.outputs.workdir }}
           BUILD_DATE: ${{ steps.pbf_date.outputs.date || steps.meta.outputs.date }}
         run: |
           rclone sync "$WORKDIR/output/" \
@@ -635,7 +600,7 @@ jobs:
       - name: Bootstrap validation (no previous build)
         if: steps.prev.outputs.found != 'true' && steps.meta.outputs.skip != 'true' && inputs.skip_patch != true
         env:
-          WORKDIR: ${{ steps.check.outputs.workdir }}
+          WORKDIR: ${{ steps.setup.outputs.workdir }}
         run: |
           echo "No previous build — building again to validate determinism + patch pipeline"
           echo "Downloading today's PBF again..."
@@ -688,7 +653,7 @@ jobs:
       - name: Download previous build from S3
         if: steps.prev.outputs.found == 'true'
         env:
-          WORKDIR: ${{ steps.check.outputs.workdir }}
+          WORKDIR: ${{ steps.setup.outputs.workdir }}
           PREV: ${{ steps.prev.outputs.date }}
         run: |
           echo "Downloading previous build ($PREV) from S3..."
@@ -699,7 +664,7 @@ jobs:
       - name: Generate and verify patches for all variants
         if: steps.prev.outputs.found == 'true'
         env:
-          WORKDIR: ${{ steps.check.outputs.workdir }}
+          WORKDIR: ${{ steps.setup.outputs.workdir }}
           PREV: ${{ steps.prev.outputs.date }}
           CURRENT: ${{ steps.pbf_date.outputs.date || steps.meta.outputs.date }}
         run: |
