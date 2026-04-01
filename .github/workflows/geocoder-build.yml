@@ -208,9 +208,21 @@ jobs:
           WORKDIR: ${{ steps.pbf.outputs.workdir }}
         run: |
           echo "Applying replication diffs to bring PBF up to date..."
-          pyosmium-up-to-date -v \
-            --server https://planet.openstreetmap.org/replication/day \
-            -s 2000 "$WORKDIR/planet.osm.pbf" 2>&1
+          while true; do
+            pyosmium-up-to-date -v \
+              --server https://planet.openstreetmap.org/replication/day \
+              -s 2000 "$WORKDIR/planet.osm.pbf" 2>&1
+            RC=$?
+            if [ $RC -eq 0 ]; then
+              echo "PBF is up to date"
+              break
+            elif [ $RC -eq 1 ]; then
+              echo "More diffs to apply, continuing..."
+            else
+              echo "pyosmium-up-to-date failed with exit code $RC"
+              exit $RC
+            fi
+          done
 
       - name: Build "new" index from updated PBF
         id: new_build
@@ -401,9 +413,16 @@ jobs:
               echo "Downloading stored PBF and applying replication diffs..."
               rclone copyto "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-current.osm.pbf" \
                 "$WORKDIR/planet.osm.pbf" --progress --retries 5 --low-level-retries 10
-              pyosmium-up-to-date -v \
-                --server https://planet.openstreetmap.org/replication/day \
-                -s 2000 "$WORKDIR/planet.osm.pbf" 2>&1
+              while true; do
+                pyosmium-up-to-date -v \
+                  --server https://planet.openstreetmap.org/replication/day \
+                  -s 2000 "$WORKDIR/planet.osm.pbf" 2>&1
+                RC=$?
+                if [ $RC -eq 0 ]; then break
+                elif [ $RC -eq 1 ]; then echo "More diffs to apply..."
+                else exit $RC
+                fi
+              done
               echo "method=diff" >> "$GITHUB_OUTPUT"
             else
               echo "No stored PBF — downloading fresh planet from multiple mirrors..."
