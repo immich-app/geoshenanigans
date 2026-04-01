@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   test-s3:
-    runs-on: ubuntu-latest
+    runs-on: pokedex-giant
     timeout-minutes: 5
     steps:
       - name: Install s5cmd
