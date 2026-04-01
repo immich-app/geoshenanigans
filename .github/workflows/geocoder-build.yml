@@ -127,7 +127,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq cmake g++ libz-dev libzstd-dev \
-            libbz2-dev libexpat1-dev libs2-dev libosmium2-dev aria2 jq python3-pip
+            libbz2-dev libexpat1-dev libs2-dev libosmium2-dev aria2 jq python3-pip osmium-tool
           pip install --break-system-packages osmium 2>/dev/null \
             || pip install --user osmium 2>/dev/null \
             || python3 -m pip install --user --break-system-packages osmium
@@ -228,12 +228,27 @@ jobs:
             fi
           done
 
+          # Verify PBF replication date matches today
+          TODAY=$(date -u +%Y-%m-%d)
+          PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
+          echo "PBF replication date: $PBF_DATE (expected: $TODAY)"
+          if [ "$PBF_DATE" != "$TODAY" ]; then
+            # Allow yesterday if today's diff isn't published yet (usually available by ~02:00 UTC)
+            YESTERDAY=$(date -u -d "yesterday" +%Y-%m-%d)
+            if [ "$PBF_DATE" = "$YESTERDAY" ]; then
+              echo "::warning::PBF is from yesterday ($PBF_DATE), today's diff not yet available"
+            else
+              echo "::error::PBF replication date $PBF_DATE is too old (expected $TODAY or $YESTERDAY)"
+              exit 1
+            fi
+          fi
+
       - name: Build "new" index from updated PBF
         id: new_build
         env:
           WORKDIR: ${{ steps.pbf.outputs.workdir }}
         run: |
-          NEW_DATE=$(date -u +%Y-%m-%d)
+          NEW_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
           echo "date=$NEW_DATE" >> "$GITHUB_OUTPUT"
           echo "Building 'new' index ($NEW_DATE) from updated PBF..."
           time build-index "$WORKDIR/output/" "$WORKDIR/planet.osm.pbf" \
@@ -337,7 +352,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq cmake g++ libz-dev libzstd-dev \
-            libbz2-dev libexpat1-dev libs2-dev libosmium2-dev aria2 jq python3-pip unzip
+            libbz2-dev libexpat1-dev libs2-dev libosmium2-dev aria2 jq python3-pip osmium-tool
           pip install --break-system-packages osmium 2>/dev/null \
             || pip install --user osmium 2>/dev/null \
             || python3 -m pip install --user --break-system-packages osmium
@@ -447,6 +462,26 @@ jobs:
 
           ls -lh "$WORKDIR/planet.osm.pbf"
 
+      - name: Verify PBF date
+        if: steps.meta.outputs.skip != 'true'
+        id: pbf_date
+        env:
+          WORKDIR: ${{ steps.pbf.outputs.workdir }}
+        run: |
+          TODAY=$(date -u +%Y-%m-%d)
+          PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
+          echo "date=$PBF_DATE" >> "$GITHUB_OUTPUT"
+          echo "PBF replication date: $PBF_DATE (expected: $TODAY)"
+          if [ "$PBF_DATE" != "$TODAY" ]; then
+            YESTERDAY=$(date -u -d "yesterday" +%Y-%m-%d)
+            if [ "$PBF_DATE" = "$YESTERDAY" ]; then
+              echo "::warning::PBF is from yesterday ($PBF_DATE), today's diff not yet available"
+            else
+              echo "::error::PBF replication date $PBF_DATE is too old (expected $TODAY or $YESTERDAY)"
+              exit 1
+            fi
+          fi
+
       - name: Build index with all variants
         if: steps.meta.outputs.skip != 'true'
         env:
@@ -474,7 +509,7 @@ jobs:
         if: steps.meta.outputs.skip != 'true'
         env:
           WORKDIR: ${{ steps.pbf.outputs.workdir }}
-          BUILD_DATE: ${{ steps.meta.outputs.date }}
+          BUILD_DATE: ${{ steps.pbf_date.outputs.date || steps.meta.outputs.date }}
         run: |
           rclone sync "$WORKDIR/output/" \
             "tigris:$S3_BUCKET/$S3_PREFIX/builds/$BUILD_DATE/" \
@@ -487,7 +522,7 @@ jobs:
         if: steps.meta.outputs.skip != 'true' && inputs.skip_patch != true
         id: prev
         env:
-          CURRENT: ${{ steps.meta.outputs.date }}
+          CURRENT: ${{ steps.pbf_date.outputs.date || steps.meta.outputs.date }}
         run: |
           PREV=$(rclone lsd "tigris:$S3_BUCKET/$S3_PREFIX/builds/" 2>/dev/null \
             | awk '{print $NF}' \
@@ -561,7 +596,7 @@ jobs:
         env:
           WORKDIR: ${{ steps.pbf.outputs.workdir }}
           PREV: ${{ steps.prev.outputs.date }}
-          CURRENT: ${{ steps.meta.outputs.date }}
+          CURRENT: ${{ steps.pbf_date.outputs.date || steps.meta.outputs.date }}
         run: |
           S3_PREV_BASE="s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV"
 
@@ -654,7 +689,7 @@ jobs:
       - name: Update index.json
         if: steps.meta.outputs.skip != 'true'
         env:
-          BUILD_DATE: ${{ steps.meta.outputs.date }}
+          BUILD_DATE: ${{ steps.pbf_date.outputs.date || steps.meta.outputs.date }}
         run: |
           BUILDS_JSON=$(rclone lsd "tigris:$S3_BUCKET/$S3_PREFIX/builds/" 2>/dev/null \
             | awk '{print $NF}' \
@@ -700,7 +735,7 @@ jobs:
       - name: Summary
         if: always()
         env:
-          BUILD_DATE: ${{ steps.meta.outputs.date }}
+          BUILD_DATE: ${{ steps.pbf_date.outputs.date || steps.meta.outputs.date }}
           PBF_METHOD: ${{ steps.pbf.outputs.method || 'skipped' }}
           WAS_SKIPPED: ${{ steps.meta.outputs.skip }}
         run: |
