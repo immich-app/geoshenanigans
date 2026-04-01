@@ -169,26 +169,46 @@ jobs:
           mkdir -p "$WORKDIR"
           echo "workdir=$WORKDIR" >> "$GITHUB_OUTPUT"
 
-          # Try to use stored PBF + replication diffs (same as production)
+          # Try to use stored PBF from Tigris, otherwise download from mirrors
           if rclone ls "tigris:$S3_BUCKET/$S3_PREFIX/pbf/" 2>/dev/null | grep -q 'planet-current'; then
-            echo "Downloading stored PBF and applying replication diffs..."
+            echo "Downloading stored PBF from Tigris..."
             rclone copyto "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-current.osm.pbf" \
               "$WORKDIR/planet.osm.pbf" --progress --retries 5 --low-level-retries 10
-            echo "method=diff" >> "$GITHUB_OUTPUT"
           else
-            echo "No stored PBF — downloading fresh planet from multiple mirrors..."
-            PBF_FILE=$(curl -sI "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
-              | grep -i '^location:' | awk '{print $2}' | tr -d '\r' | xargs basename)
-            echo "Latest PBF: $PBF_FILE"
+            echo "No stored PBF — downloading from mirrors..."
             aria2c -x 16 -s 16 -j 16 --max-tries=3 \
               -d "$WORKDIR" -o planet.osm.pbf \
-              "https://planet.openstreetmap.org/pbf/$PBF_FILE" \
-              "https://ftpmirror.your.org/pub/openstreetmap/pbf/$PBF_FILE" \
-              "https://ftp.osuosl.org/pub/openstreetmap/pbf/$PBF_FILE" \
-              "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/$PBF_FILE"
-            echo "method=download" >> "$GITHUB_OUTPUT"
+              "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
+              "https://ftpmirror.your.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
+              "https://ftp.osuosl.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
+              "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/planet-latest.osm.pbf"
           fi
           ls -lh "$WORKDIR/planet.osm.pbf"
+
+      - name: Build "old" index from current PBF
+        id: old_build
+        env:
+          WORKDIR: ${{ steps.pbf.outputs.workdir }}
+        run: |
+          OLD_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
+          echo "date=$OLD_DATE" >> "$GITHUB_OUTPUT"
+          echo "Building 'old' index ($OLD_DATE) from current PBF..."
+          time build-index "$WORKDIR/old-output/" "$WORKDIR/planet.osm.pbf" \
+            --continents --multi-output --multi-quality 2>&1 | tail -10
+          find "$WORKDIR/old-output" -name "*.bin" | wc -l
+          echo "bin files produced"
+
+      - name: Upload old build to S3
+        env:
+          WORKDIR: ${{ steps.pbf.outputs.workdir }}
+          OLD_DATE: ${{ steps.old_build.outputs.date }}
+        run: |
+          echo "Uploading old build as $OLD_DATE..."
+          rclone sync "$WORKDIR/old-output/" \
+            "tigris:$S3_BUCKET/$S3_PREFIX/builds/$OLD_DATE/" \
+            --progress --transfers 32 --retries 5 --low-level-retries 10 \
+            --s3-upload-concurrency 16 --s3-chunk-size 64M --checkers 32
+          rm -rf "$WORKDIR/old-output"
 
       - name: Apply replication diffs to PBF
         env:
@@ -211,7 +231,7 @@ jobs:
             fi
           done
 
-          # Verify PBF replication date matches today
+          # Verify PBF replication date is recent
           TODAY=$(date -u +%Y-%m-%d)
           PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
           echo "PBF replication date: $PBF_DATE (expected: $TODAY)"
@@ -224,57 +244,6 @@ jobs:
               exit 1
             fi
           fi
-
-      - name: Find previous build
-        id: prev
-        run: |
-          PREV=$(rclone lsd "tigris:$S3_BUCKET/$S3_PREFIX/builds/" 2>/dev/null \
-            | awk '{print $NF}' \
-            | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \
-            | sort | tail -1)
-          if [ -n "$PREV" ]; then
-            echo "date=$PREV" >> "$GITHUB_OUTPUT"
-            echo "found=true" >> "$GITHUB_OUTPUT"
-            echo "Previous build: $PREV"
-          else
-            echo "found=false" >> "$GITHUB_OUTPUT"
-            echo "No previous build found"
-          fi
-
-      - name: Build "old" index (bootstrap, no previous build)
-        if: steps.prev.outputs.found != 'true'
-        id: old_build
-        env:
-          WORKDIR: ${{ steps.pbf.outputs.workdir }}
-        run: |
-          # No previous build exists — build from the pre-diff PBF snapshot
-          # Download fresh PBF since we already applied diffs to the local one
-          echo "No previous build — downloading base PBF to build 'old' index..."
-          PBF_FILE=$(curl -sI "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
-            | grep -i '^location:' | awk '{print $2}' | tr -d '\r' | xargs basename)
-          aria2c -x 16 -s 16 -j 16 --max-tries=3 \
-            -d "$WORKDIR" -o old-planet.osm.pbf \
-            "https://planet.openstreetmap.org/pbf/$PBF_FILE" \
-            "https://ftpmirror.your.org/pub/openstreetmap/pbf/$PBF_FILE" \
-            "https://ftp.osuosl.org/pub/openstreetmap/pbf/$PBF_FILE" \
-            "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/$PBF_FILE"
-
-          OLD_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/old-planet.osm.pbf" | cut -dT -f1)
-          echo "date=$OLD_DATE" >> "$GITHUB_OUTPUT"
-          echo "Building 'old' index ($OLD_DATE) from base PBF..."
-          time build-index "$WORKDIR/old-output/" "$WORKDIR/old-planet.osm.pbf" \
-            --continents --multi-output --multi-quality 2>&1 | tail -10
-          rm -f "$WORKDIR/old-planet.osm.pbf"
-
-          echo "Uploading old build as $OLD_DATE..."
-          rclone sync "$WORKDIR/old-output/" \
-            "tigris:$S3_BUCKET/$S3_PREFIX/builds/$OLD_DATE/" \
-            --progress --transfers 16 --retries 5 --low-level-retries 10 \
-            --s3-upload-concurrency 16 --s3-chunk-size 64M
-          rm -rf "$WORKDIR/old-output"
-
-          find "$WORKDIR/old-output" -name "*.bin" 2>/dev/null | wc -l
-          echo "bin files produced"
 
       - name: Build "new" index from updated PBF
         id: new_build
@@ -300,23 +269,23 @@ jobs:
             --s3-upload-concurrency 16 --s3-chunk-size 64M
           rm -f "$WORKDIR/planet.osm.pbf"
 
-      - name: Download previous build from S3
+      - name: Download old build from S3
         env:
           WORKDIR: ${{ steps.pbf.outputs.workdir }}
-          PREV_DATE: ${{ steps.prev.outputs.date || steps.old_build.outputs.date }}
+          OLD_DATE: ${{ steps.old_build.outputs.date }}
         run: |
-          echo "Downloading previous build ($PREV_DATE) from S3..."
-          rclone sync "tigris:$S3_BUCKET/$S3_PREFIX/builds/$PREV_DATE/" \
+          echo "Downloading old build ($OLD_DATE) from S3 for patch verification..."
+          rclone sync "tigris:$S3_BUCKET/$S3_PREFIX/builds/$OLD_DATE/" \
             "$WORKDIR/prev-build/" \
             --progress --transfers 16 --retries 5 --low-level-retries 10
 
       - name: Generate and verify patches for all variants
         env:
           WORKDIR: ${{ steps.pbf.outputs.workdir }}
-          PREV_DATE: ${{ steps.prev.outputs.date || steps.old_build.outputs.date }}
+          OLD_DATE: ${{ steps.old_build.outputs.date }}
           NEW_DATE: ${{ steps.new_build.outputs.date }}
         run: |
-          echo "## Planet Test Results ($PREV_DATE → $NEW_DATE)" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Planet Test Results ($OLD_DATE → $NEW_DATE)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Variant | Files | Patch Size | Verified |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---------|-------|-----------|----------|" >> "$GITHUB_STEP_SUMMARY"
