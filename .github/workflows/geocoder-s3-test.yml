@@ -22,7 +22,7 @@ jobs:
         run: |
           curl -sL "https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-64bit.tar.gz" \
             -o /tmp/s5cmd.tar.gz
-          tar xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd
+          sudo tar xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd
           s5cmd version
 
       - name: Test s5cmd upload + download
@@ -36,13 +36,13 @@ jobs:
           dd if=/dev/urandom of=/tmp/test-100m.bin bs=1M count=100 2>/dev/null
 
           echo "=== s5cmd upload (100MB, concurrency 32) ==="
-          time s5cmd --endpoint-url "$S3_ENDPOINT_URL" \
+          time s5cmd --endpoint-url "$S3_ENDPOINT_URL" --log debug --stat \
             cp --concurrency 32 --part-size 25 \
             /tmp/test-100m.bin "s3://$S3_BUCKET/geocoder/test/test-100m.bin"
           echo "Upload OK"
 
           echo "=== s5cmd download ==="
-          time s5cmd --endpoint-url "$S3_ENDPOINT_URL" \
+          time s5cmd --endpoint-url "$S3_ENDPOINT_URL" --log debug --stat \
             cp "s3://$S3_BUCKET/geocoder/test/test-100m.bin" /tmp/test-download.bin
           echo "Download OK"
 
