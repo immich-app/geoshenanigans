@@ -185,20 +185,52 @@ jobs:
           fi
           ls -lh "$WORKDIR/planet.osm.pbf"
 
-      - name: Build "old" index from current PBF
+      - name: Bring PBF to yesterday
+        env:
+          WORKDIR: ${{ steps.pbf.outputs.workdir }}
+        run: |
+          YESTERDAY=$(date -u -d "yesterday" +%Y-%m-%d)
+          PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
+          echo "PBF date: $PBF_DATE, target: $YESTERDAY"
+
+          if [ "$PBF_DATE" = "$YESTERDAY" ]; then
+            echo "PBF is already at yesterday's date"
+          elif [ "$PBF_DATE" \> "$YESTERDAY" ]; then
+            echo "PBF is already past yesterday ($PBF_DATE) — using as-is"
+          else
+            echo "Applying diffs to reach $YESTERDAY..."
+            while true; do
+              RC=0
+              pyosmium-up-to-date -v \
+                --server https://planet.openstreetmap.org/replication/day \
+                -s 2000 "$WORKDIR/planet.osm.pbf" 2>&1 || RC=$?
+              PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
+              echo "PBF now at: $PBF_DATE"
+              if [ "$PBF_DATE" \>= "$YESTERDAY" ] || [ $RC -eq 0 ]; then
+                break
+              elif [ $RC -eq 1 ]; then
+                echo "More diffs to apply..."
+              else
+                echo "pyosmium-up-to-date failed with exit code $RC"
+                exit $RC
+              fi
+            done
+          fi
+
+      - name: Build "old" index (yesterday)
         id: old_build
         env:
           WORKDIR: ${{ steps.pbf.outputs.workdir }}
         run: |
           OLD_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
           echo "date=$OLD_DATE" >> "$GITHUB_OUTPUT"
-          echo "Building 'old' index ($OLD_DATE) from current PBF..."
+          echo "Building 'old' index ($OLD_DATE)..."
           time build-index "$WORKDIR/old-output/" "$WORKDIR/planet.osm.pbf" \
             --continents --multi-output --multi-quality 2>&1 | tail -10
           find "$WORKDIR/old-output" -name "*.bin" | wc -l
           echo "bin files produced"
 
-      - name: Upload old build to S3
+      - name: Upload old build + PBF to S3
         env:
           WORKDIR: ${{ steps.pbf.outputs.workdir }}
           OLD_DATE: ${{ steps.old_build.outputs.date }}
@@ -208,13 +240,32 @@ jobs:
             "tigris:$S3_BUCKET/$S3_PREFIX/builds/$OLD_DATE/" \
             --progress --transfers 32 --retries 5 --low-level-retries 10 \
             --s3-upload-concurrency 16 --s3-chunk-size 64M --checkers 32
-          rm -rf "$WORKDIR/old-output"
 
-      - name: Apply replication diffs to PBF
+          echo "Uploading PBF (yesterday) to S3..."
+          rclone copyto "$WORKDIR/planet.osm.pbf" \
+            "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-current.osm.pbf" \
+            --progress --retries 5 --low-level-retries 10 \
+            --s3-upload-concurrency 16 --s3-chunk-size 64M
+
+          echo "$OLD_DATE" | rclone rcat "tigris:$S3_BUCKET/$S3_PREFIX/builds/latest.txt"
+
+      - name: Wipe local data and re-download from Tigris
         env:
           WORKDIR: ${{ steps.pbf.outputs.workdir }}
         run: |
-          echo "Applying replication diffs to bring PBF up to date..."
+          echo "Wiping local data to simulate production start..."
+          rm -rf "$WORKDIR/old-output" "$WORKDIR/planet.osm.pbf"
+
+          echo "Re-downloading PBF from Tigris..."
+          rclone copyto "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-current.osm.pbf" \
+            "$WORKDIR/planet.osm.pbf" --progress --retries 5 --low-level-retries 10
+          ls -lh "$WORKDIR/planet.osm.pbf"
+
+      - name: Bring PBF to today
+        env:
+          WORKDIR: ${{ steps.pbf.outputs.workdir }}
+        run: |
+          echo "Applying remaining diffs to bring PBF to today..."
           while true; do
             RC=0
             pyosmium-up-to-date -v \
@@ -224,14 +275,13 @@ jobs:
               echo "PBF is up to date"
               break
             elif [ $RC -eq 1 ]; then
-              echo "More diffs to apply, continuing..."
+              echo "More diffs to apply..."
             else
               echo "pyosmium-up-to-date failed with exit code $RC"
               exit $RC
             fi
           done
 
-          # Verify PBF replication date is recent
           TODAY=$(date -u +%Y-%m-%d)
           PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
           echo "PBF replication date: $PBF_DATE (expected: $TODAY)"
@@ -245,14 +295,14 @@ jobs:
             fi
           fi
 
-      - name: Build "new" index from updated PBF
+      - name: Build "new" index (today)
         id: new_build
         env:
           WORKDIR: ${{ steps.pbf.outputs.workdir }}
         run: |
           NEW_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
           echo "date=$NEW_DATE" >> "$GITHUB_OUTPUT"
-          echo "Building 'new' index ($NEW_DATE) from updated PBF..."
+          echo "Building 'new' index ($NEW_DATE)..."
           time build-index "$WORKDIR/output/" "$WORKDIR/planet.osm.pbf" \
             --continents --multi-output --multi-quality 2>&1 | tail -10
           find "$WORKDIR/output" -name "*.bin" | wc -l
