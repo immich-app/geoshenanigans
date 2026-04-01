@@ -169,13 +169,17 @@ jobs:
           mkdir -p "$WORKDIR"
           echo "workdir=$WORKDIR" >> "$GITHUB_OUTPUT"
 
-          echo "Downloading planet PBF from multiple mirrors..."
+          # Resolve the latest dated filename from OSM's redirect
+          PBF_FILE=$(curl -sI "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
+            | grep -i '^location:' | awk '{print $2}' | tr -d '\r' | xargs basename)
+          echo "Latest PBF: $PBF_FILE"
+          echo "Downloading from multiple mirrors..."
           aria2c -x 16 -s 16 -j 16 --max-tries=3 \
             -d "$WORKDIR" -o planet.osm.pbf \
-            "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
-            "https://ftpmirror.your.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
-            "https://ftp.osuosl.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
-            "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/planet-latest.osm.pbf"
+            "https://planet.openstreetmap.org/pbf/$PBF_FILE" \
+            "https://ftpmirror.your.org/pub/openstreetmap/pbf/$PBF_FILE" \
+            "https://ftp.osuosl.org/pub/openstreetmap/pbf/$PBF_FILE" \
+            "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/$PBF_FILE"
           ls -lh "$WORKDIR/planet.osm.pbf"
 
       - name: Build "old" index from downloaded PBF
@@ -398,13 +402,15 @@ jobs:
             echo "method=download" >> "$GITHUB_OUTPUT"
 
           elif [ "$INPUT_FORCE_FRESH" = "true" ]; then
-            echo "Downloading fresh planet PBF from multiple mirrors..."
+            PBF_FILE=$(curl -sI "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
+              | grep -i '^location:' | awk '{print $2}' | tr -d '\r' | xargs basename)
+            echo "Downloading $PBF_FILE from multiple mirrors..."
             aria2c -x 16 -s 16 -j 16 --max-tries=3 \
               -d "$WORKDIR" -o planet.osm.pbf \
-              "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
-              "https://ftpmirror.your.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
-              "https://ftp.osuosl.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
-              "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/planet-latest.osm.pbf"
+              "https://planet.openstreetmap.org/pbf/$PBF_FILE" \
+              "https://ftpmirror.your.org/pub/openstreetmap/pbf/$PBF_FILE" \
+              "https://ftp.osuosl.org/pub/openstreetmap/pbf/$PBF_FILE" \
+              "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/$PBF_FILE"
             echo "method=download" >> "$GITHUB_OUTPUT"
 
           else
@@ -426,12 +432,15 @@ jobs:
               echo "method=diff" >> "$GITHUB_OUTPUT"
             else
               echo "No stored PBF — downloading fresh planet from multiple mirrors..."
+              PBF_FILE=$(curl -sI "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
+                | grep -i '^location:' | awk '{print $2}' | tr -d '\r' | xargs basename)
+              echo "Latest PBF: $PBF_FILE"
               aria2c -x 16 -s 16 -j 16 --max-tries=3 \
                 -d "$WORKDIR" -o planet.osm.pbf \
-                "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
-                "https://ftpmirror.your.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
-                "https://ftp.osuosl.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
-                "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/planet-latest.osm.pbf"
+                "https://planet.openstreetmap.org/pbf/$PBF_FILE" \
+                "https://ftpmirror.your.org/pub/openstreetmap/pbf/$PBF_FILE" \
+                "https://ftp.osuosl.org/pub/openstreetmap/pbf/$PBF_FILE" \
+                "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/$PBF_FILE"
               echo "method=download" >> "$GITHUB_OUTPUT"
             fi
           fi
