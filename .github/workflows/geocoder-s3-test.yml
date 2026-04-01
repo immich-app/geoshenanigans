@@ -6,7 +6,7 @@ on:
 
 env:
   S3_BUCKET: geoshenanigans-reverse-geocoding
-  S3_ENDPOINT: https://t3.storage.dev
+  S3_ENDPOINT: https://fly.storage.tigris.dev
   S3_PREFIX: geocoder
 
 permissions:
@@ -17,41 +17,36 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Setup Rclone
-        uses: AnimMouse/setup-rclone@26ef2133e09fd383329a1d4c1fbe6a71db1976c9 # v1.12.0
-        with:
-          disable_base64: true
-          rclone_config: |
-            [tigris]
-            type = s3
-            provider = Other
-            region = auto
-            endpoint = ${{ env.S3_ENDPOINT }}
-            env_auth = true
+      - name: Configure S3 credentials
+        run: |
+          echo "AWS_ACCESS_KEY_ID=$S3_ACCESS_KEY_ID" >> "$GITHUB_ENV"
+          echo "AWS_SECRET_ACCESS_KEY=$S3_SECRET_ACCESS_KEY" >> "$GITHUB_ENV"
+          echo "AWS_DEFAULT_REGION=auto" >> "$GITHUB_ENV"
+          echo "AWS_ENDPOINT_URL=$S3_ENDPOINT" >> "$GITHUB_ENV"
+        env:
+          S3_ACCESS_KEY_ID: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
+          S3_SECRET_ACCESS_KEY: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
 
       - name: Test upload + download + list
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
         run: |
-          echo "=== List all buckets ==="
-          rclone lsd tigris: || echo "List buckets failed"
-          echo ""
-          echo "test-$(date -u +%Y%m%d%H%M%S)-v2" > /tmp/test.txt
+          echo "test-$(date -u +%Y%m%d%H%M%S)" > /tmp/test.txt
+
+          echo "=== List buckets ==="
+          aws s3 ls
 
           echo "=== Upload ==="
-          rclone copyto /tmp/test.txt "tigris:$S3_BUCKET/$S3_PREFIX/test.txt"
+          aws s3 cp /tmp/test.txt "s3://$S3_BUCKET/$S3_PREFIX/test.txt" --no-progress
           echo "Upload: OK"
 
           echo "=== List ==="
-          rclone ls "tigris:$S3_BUCKET/$S3_PREFIX/"
+          aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/"
           echo "List: OK"
 
           echo "=== Download ==="
-          rclone copyto "tigris:$S3_BUCKET/$S3_PREFIX/test.txt" /tmp/test-download.txt
+          aws s3 cp "s3://$S3_BUCKET/$S3_PREFIX/test.txt" /tmp/test-download.txt --no-progress
           diff /tmp/test.txt /tmp/test-download.txt
           echo "Download + verify: OK"
 
           echo "=== Cleanup ==="
-          rclone delete "tigris:$S3_BUCKET/$S3_PREFIX/test.txt"
+          aws s3 rm "s3://$S3_BUCKET/$S3_PREFIX/test.txt"
           echo "Cleanup: OK"
