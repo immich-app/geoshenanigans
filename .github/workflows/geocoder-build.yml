@@ -265,13 +265,13 @@ jobs:
           rclone copyto "$WORKDIR/planet.osm.pbf" \
             "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-${BOOT_DATE}.osm.pbf" \
             --progress --retries 5 --low-level-retries 10 --multi-thread-streams 16 \
-            --s3-upload-concurrency 32 --s3-chunk-size 256M --s3-no-check-bucket
+            --s3-upload-concurrency 8 --s3-chunk-size 64M --s3-no-check-bucket
 
           echo "Uploading bootstrap build as $BOOT_DATE..."
           rclone sync "$WORKDIR/bootstrap-output/" \
             "tigris:$S3_BUCKET/$S3_PREFIX/builds/$BOOT_DATE/" \
             --progress --transfers 32 --retries 5 --low-level-retries 10 \
-            --s3-upload-concurrency 32 --s3-chunk-size 256M --s3-no-check-bucket --checkers 32
+            --s3-upload-concurrency 8 --s3-chunk-size 64M --s3-no-check-bucket --checkers 32
           rm -rf "$WORKDIR/bootstrap-output"
 
           echo "$BOOT_DATE" | rclone rcat "tigris:$S3_BUCKET/$S3_PREFIX/builds/latest.txt"
@@ -320,7 +320,7 @@ jobs:
           rclone copyto "$WORKDIR/planet.osm.pbf" \
             "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-${PBF_DATE}.osm.pbf" \
             --progress --retries 5 --low-level-retries 10 --multi-thread-streams 16 \
-            --s3-upload-concurrency 32 --s3-chunk-size 256M --s3-no-check-bucket
+            --s3-upload-concurrency 8 --s3-chunk-size 64M --s3-no-check-bucket
 
           TODAY=$(date -u +%Y-%m-%d)
           echo "PBF replication date: $PBF_DATE (expected: $TODAY)"
@@ -467,7 +467,7 @@ jobs:
           rclone sync "$WORKDIR/output/" \
             "tigris:$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/" \
             --progress --transfers 32 --retries 5 --low-level-retries 10 \
-            --s3-upload-concurrency 32 --s3-chunk-size 256M --s3-no-check-bucket --checkers 32
+            --s3-upload-concurrency 8 --s3-chunk-size 64M --s3-no-check-bucket --checkers 32
           echo "$NEW_DATE" | rclone rcat "tigris:$S3_BUCKET/$S3_PREFIX/builds/latest.txt"
           echo "Build upload complete"
 
@@ -649,7 +649,7 @@ jobs:
           rclone copyto "$WORKDIR/planet.osm.pbf" \
             "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-${BUILD_DATE}.osm.pbf" \
             --progress --retries 5 --low-level-retries 10 --multi-thread-streams 16 \
-            --s3-upload-concurrency 32 --s3-chunk-size 256M --s3-no-check-bucket
+            --s3-upload-concurrency 8 --s3-chunk-size 64M --s3-no-check-bucket
           rm -f "$WORKDIR/planet.osm.pbf"
 
       - name: Upload builds to S3
@@ -661,7 +661,7 @@ jobs:
           rclone sync "$WORKDIR/output/" \
             "tigris:$S3_BUCKET/$S3_PREFIX/builds/$BUILD_DATE/" \
             --progress --transfers 32 --retries 5 --low-level-retries 10 \
-            --s3-upload-concurrency 32 --s3-chunk-size 256M --s3-no-check-bucket --checkers 32
+            --s3-upload-concurrency 8 --s3-chunk-size 64M --s3-no-check-bucket --checkers 32
 
           echo "$BUILD_DATE" | rclone rcat "tigris:$S3_BUCKET/$S3_PREFIX/builds/latest.txt"
 
