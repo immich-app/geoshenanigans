@@ -169,38 +169,47 @@ jobs:
           mkdir -p "$WORKDIR"
           echo "workdir=$WORKDIR" >> "$GITHUB_OUTPUT"
 
-      - name: Check for previous build
+      - name: Check for yesterday's build
         id: prev
         run: |
-          PREV=$(rclone lsd "tigris:$S3_BUCKET/$S3_PREFIX/builds/" 2>/dev/null \
-            | awk '{print $NF}' \
-            | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \
-            | sort | tail -1)
-          if [ -n "$PREV" ]; then
-            echo "date=$PREV" >> "$GITHUB_OUTPUT"
+          YESTERDAY=$(date -u -d "yesterday" +%Y-%m-%d)
+          echo "yesterday=$YESTERDAY" >> "$GITHUB_OUTPUT"
+          if rclone ls "tigris:$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/planet/" 2>/dev/null | grep -q '.bin'; then
+            echo "date=$YESTERDAY" >> "$GITHUB_OUTPUT"
             echo "found=true" >> "$GITHUB_OUTPUT"
-            echo "Previous build: $PREV"
+            echo "Yesterday's build ($YESTERDAY) exists in Tigris"
           else
             echo "found=false" >> "$GITHUB_OUTPUT"
-            echo "No previous build found"
+            echo "No build for $YESTERDAY — will bootstrap"
           fi
 
       - name: Obtain PBF
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
+          YESTERDAY: ${{ steps.prev.outputs.yesterday }}
         run: |
-          if rclone ls "tigris:$S3_BUCKET/$S3_PREFIX/pbf/" 2>/dev/null | grep -q 'planet-current'; then
-            echo "Downloading stored PBF from Tigris..."
-            rclone copyto "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-current.osm.pbf" \
-              "$WORKDIR/planet.osm.pbf" --progress --retries 5 --low-level-retries 10
+          # Try yesterday's PBF from Tigris, then any recent PBF, then mirrors
+          if rclone ls "tigris:$S3_BUCKET/$S3_PREFIX/pbf/" 2>/dev/null | grep -q "planet-${YESTERDAY}"; then
+            echo "Downloading yesterday's PBF ($YESTERDAY) from Tigris..."
+            rclone copyto "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-${YESTERDAY}.osm.pbf" \
+              "$WORKDIR/planet.osm.pbf" --progress --retries 5 --low-level-retries 10 --multi-thread-streams 16
           else
-            echo "No stored PBF — downloading from mirrors..."
-            aria2c -x 16 -s 16 -j 16 --max-tries=3 \
-              -d "$WORKDIR" -o planet.osm.pbf \
-              "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
-              "https://ftpmirror.your.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
-              "https://ftp.osuosl.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
-              "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/planet-latest.osm.pbf"
+            # Find the most recent PBF in Tigris
+            LATEST_PBF=$(rclone ls "tigris:$S3_BUCKET/$S3_PREFIX/pbf/" 2>/dev/null \
+              | grep -oP 'planet-\d{4}-\d{2}-\d{2}\.osm\.pbf' | sort | tail -1)
+            if [ -n "$LATEST_PBF" ]; then
+              echo "Downloading $LATEST_PBF from Tigris..."
+              rclone copyto "tigris:$S3_BUCKET/$S3_PREFIX/pbf/$LATEST_PBF" \
+                "$WORKDIR/planet.osm.pbf" --progress --retries 5 --low-level-retries 10 --multi-thread-streams 16
+            else
+              echo "No stored PBF — downloading from mirrors..."
+              aria2c -x 16 -s 16 -j 16 --max-tries=3 \
+                -d "$WORKDIR" -o planet.osm.pbf \
+                "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
+                "https://ftpmirror.your.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
+                "https://ftp.osuosl.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
+                "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/planet-latest.osm.pbf"
+            fi
           fi
           ls -lh "$WORKDIR/planet.osm.pbf"
 
@@ -225,10 +234,10 @@ jobs:
             --s3-upload-concurrency 32 --s3-chunk-size 256M --s3-no-check-bucket --checkers 32
           rm -rf "$WORKDIR/bootstrap-output"
 
-          echo "Uploading PBF to S3..."
+          echo "Uploading PBF as planet-${BOOT_DATE}.osm.pbf..."
           rclone copyto "$WORKDIR/planet.osm.pbf" \
-            "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-current.osm.pbf" \
-            --progress --retries 5 --low-level-retries 10 \
+            "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-${BOOT_DATE}.osm.pbf" \
+            --progress --retries 5 --low-level-retries 10 --multi-thread-streams 16 \
             --s3-upload-concurrency 32 --s3-chunk-size 256M --s3-no-check-bucket
 
           echo "$BOOT_DATE" | rclone rcat "tigris:$S3_BUCKET/$S3_PREFIX/builds/latest.txt"
@@ -263,10 +272,10 @@ jobs:
           done
 
           # Upload PBF to S3 immediately so next run can use it even if build fails
-          echo "Uploading updated PBF to S3..."
+          echo "Uploading PBF as planet-${PBF_DATE}.osm.pbf..."
           rclone copyto "$WORKDIR/planet.osm.pbf" \
-            "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-current.osm.pbf" \
-            --progress --retries 5 --low-level-retries 10 \
+            "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-${PBF_DATE}.osm.pbf" \
+            --progress --retries 5 --low-level-retries 10 --multi-thread-streams 16 \
             --s3-upload-concurrency 32 --s3-chunk-size 256M --s3-no-check-bucket
 
           TODAY=$(date -u +%Y-%m-%d)
@@ -512,11 +521,13 @@ jobs:
             echo "method=download" >> "$GITHUB_OUTPUT"
 
           else
-            STORED_PBF="s3://$S3_BUCKET/$S3_PREFIX/pbf/planet-current.osm.pbf"
-            if rclone ls "tigris:$S3_BUCKET/$S3_PREFIX/pbf/" 2>/dev/null | grep -q 'planet-current'; then
-              echo "Downloading stored PBF and applying replication diffs..."
-              rclone copyto "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-current.osm.pbf" \
-                "$WORKDIR/planet.osm.pbf" --progress --retries 5 --low-level-retries 10
+            # Find the most recent PBF in Tigris
+            LATEST_PBF=$(rclone ls "tigris:$S3_BUCKET/$S3_PREFIX/pbf/" 2>/dev/null \
+              | grep -oP 'planet-\d{4}-\d{2}-\d{2}\.osm\.pbf' | sort | tail -1)
+            if [ -n "$LATEST_PBF" ]; then
+              echo "Downloading $LATEST_PBF from Tigris and applying replication diffs..."
+              rclone copyto "tigris:$S3_BUCKET/$S3_PREFIX/pbf/$LATEST_PBF" \
+                "$WORKDIR/planet.osm.pbf" --progress --retries 5 --low-level-retries 10 --multi-thread-streams 16
               while true; do
                 RC=0
                 pyosmium-up-to-date -v \
@@ -581,10 +592,12 @@ jobs:
         if: steps.meta.outputs.skip != 'true'
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
+          BUILD_DATE: ${{ steps.pbf_date.outputs.date || steps.meta.outputs.date }}
         run: |
+          echo "Uploading PBF as planet-${BUILD_DATE}.osm.pbf..."
           rclone copyto "$WORKDIR/planet.osm.pbf" \
-            "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-current.osm.pbf" \
-            --progress --retries 5 --low-level-retries 10 \
+            "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-${BUILD_DATE}.osm.pbf" \
+            --progress --retries 5 --low-level-retries 10 --multi-thread-streams 16 \
             --s3-upload-concurrency 32 --s3-chunk-size 256M --s3-no-check-bucket
           rm -f "$WORKDIR/planet.osm.pbf"
 
@@ -630,8 +643,9 @@ jobs:
           echo "Downloading today's PBF again..."
 
           # Re-download the PBF we already uploaded
-          rclone copyto "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-current.osm.pbf" \
-            "$WORKDIR/planet-verify.osm.pbf" --progress --retries 5 --low-level-retries 10
+          BUILD_DATE="${{ steps.pbf_date.outputs.date || steps.meta.outputs.date }}"
+          rclone copyto "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-${BUILD_DATE}.osm.pbf" \
+            "$WORKDIR/planet-verify.osm.pbf" --progress --retries 5 --low-level-retries 10 --multi-thread-streams 16
 
           time build-index "$WORKDIR/output2/" "$WORKDIR/planet-verify.osm.pbf" \
             --continents --multi-output --multi-quality 2>&1 | tail -5
