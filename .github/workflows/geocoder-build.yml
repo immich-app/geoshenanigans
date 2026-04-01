@@ -191,6 +191,7 @@ jobs:
           aws s3 sync "$WORKDIR/old-output/" \
             "s3://$S3_BUCKET/$S3_PREFIX/builds/$OLD_DATE/" \
             --no-progress --only-show-errors
+          rm -rf "$WORKDIR/old-output"
 
       - name: Apply replication diffs to PBF
         env:
@@ -230,14 +231,20 @@ jobs:
           PASS=0; FAIL=0; SKIP=0
           VARIANTS=$(cd "$WORKDIR/output" && find . -name "*.bin" -exec dirname {} \; | sort -u | sed 's|^\./||')
 
+          S3_OLD="s3://$S3_BUCKET/$S3_PREFIX/builds/$OLD_DATE"
+
           for variant in $VARIANTS; do
             NEW_DIR="$WORKDIR/output/$variant"
-            OLD_DIR="$WORKDIR/old-output/$variant"
+            OLD_DIR="$WORKDIR/prev-variant"
+            rm -rf "$OLD_DIR"; mkdir -p "$OLD_DIR"
+            aws s3 sync "$S3_OLD/$variant/" "$OLD_DIR/" \
+              --no-progress --only-show-errors 2>/dev/null
             N_NEW=$(ls "$NEW_DIR"/*.bin 2>/dev/null | wc -l)
             N_OLD=$(ls "$OLD_DIR"/*.bin 2>/dev/null | wc -l)
             [ "$N_NEW" -lt 2 ] && continue
             if [ "$N_OLD" -ne "$N_NEW" ]; then
               SKIP=$((SKIP + 1))
+              rm -rf "$OLD_DIR"
               continue
             fi
 
@@ -268,10 +275,8 @@ jobs:
               FAIL=$((FAIL + 1))
             fi
             rm -f "$PATCH_FILE"
-            rm -rf "$VERIFY_DIR"
+            rm -rf "$VERIFY_DIR" "$OLD_DIR"
           done
-
-          rm -rf "$WORKDIR/old-output"
 
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "**Total: $PASS pass, $FAIL fail, $SKIP skip**" >> "$GITHUB_STEP_SUMMARY"
