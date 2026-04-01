@@ -27,10 +27,12 @@ jobs:
             provider = Other
             region = auto
             endpoint = ${{ env.S3_ENDPOINT }}
-            access_key_id = ${{ secrets.TIGRIS_WRITE_KEY_ID }}
-            secret_access_key = ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
+            env_auth = true
 
       - name: Test upload + download + list
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
         run: |
           echo "test-$(date -u +%Y%m%d%H%M%S)-v2" > /tmp/test.txt
 
