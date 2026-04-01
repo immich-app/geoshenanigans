@@ -127,11 +127,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq cmake g++ libz-dev libzstd-dev \
-            libbz2-dev libexpat1-dev libs2-dev libosmium2-dev aria2 jq python3-pip osmium-tool
-          pip install --break-system-packages osmium 2>/dev/null \
-            || pip install --user osmium 2>/dev/null \
-            || python3 -m pip install --user --break-system-packages osmium
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+            libbz2-dev libexpat1-dev libs2-dev libosmium2-dev aria2 jq osmium-tool
 
       - name: Configure S3 credentials
         run: |
@@ -204,53 +200,62 @@ jobs:
           fi
           ls -lh "$WORKDIR/planet.osm.pbf"
 
-      # --- Bootstrap: patch PBF to yesterday, build + upload yesterday's index ---
-      - name: "Bootstrap: bring PBF to yesterday"
-        if: steps.prev.outputs.found != 'true'
-        env:
-          WORKDIR: ${{ steps.setup.outputs.workdir }}
-          YESTERDAY: ${{ steps.prev.outputs.yesterday }}
-        run: |
-          PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
-          echo "PBF date: $PBF_DATE, target: $YESTERDAY"
-
-          if [ ! "$PBF_DATE" \< "$YESTERDAY" ]; then
-            echo "PBF is already at or past yesterday — using as-is"
-          else
-            echo "Applying diffs to reach $YESTERDAY..."
-            ITER=0
-            while true; do
-              ITER=$((ITER + 1))
-              echo "--- Diff batch $ITER (PBF at $PBF_DATE) ---"
-              RC=0
-              pyosmium-up-to-date -v \
-                --server https://planet.openstreetmap.org/replication/day \
-                -s 2000 "$WORKDIR/planet.osm.pbf" 2>&1 || RC=$?
-              PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
-              echo "After batch $ITER: RC=$RC, PBF at $PBF_DATE"
-              if [ ! "$PBF_DATE" \< "$YESTERDAY" ]; then
-                echo "Reached $PBF_DATE (target: $YESTERDAY)"
-                break
-              elif [ $RC -eq 0 ]; then
-                echo "Fully caught up at $PBF_DATE"
-                break
-              elif [ $RC -eq 1 ]; then
-                echo "More diffs to apply..."
-              else
-                echo "pyosmium-up-to-date failed with exit code $RC"
-                exit $RC
-              fi
-            done
-          fi
-
-      - name: "Bootstrap: build + upload yesterday's index"
+      # Helper: apply N days of OSM diffs using osmium apply-changes (single pass)
+      # Usage: apply_diffs <input.pbf> <output.pbf> <start_seq> <end_seq>
+      - name: "Bootstrap: bring PBF to yesterday, build + upload"
         if: steps.prev.outputs.found != 'true'
         id: bootstrap
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
+          YESTERDAY: ${{ steps.prev.outputs.yesterday }}
         run: |
+          SERVER="https://planet.openstreetmap.org/replication/day"
+
+          # Get current sequence from the replication server state
+          CURRENT_SEQ=$(curl -sL "$SERVER/state.txt" | grep sequenceNumber | cut -d= -f2)
+          CURRENT_DATE=$(curl -sL "$SERVER/state.txt" | grep timestamp | cut -d= -f2 | tr '\\' ' ' | cut -dT -f1 | tr -d ' ')
+          echo "Replication server: seq=$CURRENT_SEQ date=$CURRENT_DATE"
+
+          # Get PBF's sequence by computing offset from current
+          PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
+          DAYS_BEHIND=$(( ($(date -u -d "$CURRENT_DATE" +%s) - $(date -u -d "$PBF_DATE" +%s)) / 86400 ))
+          PBF_SEQ=$((CURRENT_SEQ - DAYS_BEHIND))
+          echo "PBF: date=$PBF_DATE seq=$PBF_SEQ ($DAYS_BEHIND days behind)"
+
+          # Calculate how many diffs to reach yesterday
+          DAYS_TO_YESTERDAY=$(( ($(date -u -d "$YESTERDAY" +%s) - $(date -u -d "$PBF_DATE" +%s)) / 86400 ))
+          TARGET_SEQ=$((PBF_SEQ + DAYS_TO_YESTERDAY))
+          echo "Target: $YESTERDAY (seq $TARGET_SEQ, $DAYS_TO_YESTERDAY diffs to apply)"
+
+          if [ $DAYS_TO_YESTERDAY -le 0 ]; then
+            echo "PBF is already at or past $YESTERDAY — no diffs needed"
+          else
+            # Download all needed diffs
+            echo "Downloading $DAYS_TO_YESTERDAY daily diffs..."
+            DIFFS=""
+            for S in $(seq $((PBF_SEQ + 1)) $TARGET_SEQ); do
+              DIR1=$(printf "%03d" $((S / 1000000)))
+              DIR2=$(printf "%03d" $(((S / 1000) % 1000)))
+              FILE=$(printf "%03d" $((S % 1000)))
+              URL="$SERVER/$DIR1/$DIR2/${FILE}.osc.gz"
+              echo "  seq $S: $URL"
+              curl -sL -o "$WORKDIR/diff-${S}.osc.gz" "$URL"
+              DIFFS="$DIFFS $WORKDIR/diff-${S}.osc.gz"
+            done
+
+            # Apply all diffs in one pass (no compression for speed)
+            echo "Applying $DAYS_TO_YESTERDAY diffs in one pass..."
+            time osmium apply-changes "$WORKDIR/planet.osm.pbf" $DIFFS \
+              -o "$WORKDIR/planet-updated.osm.pbf" \
+              -f pbf,pbf_compression=none --overwrite
+            mv "$WORKDIR/planet-updated.osm.pbf" "$WORKDIR/planet.osm.pbf"
+            rm -f $WORKDIR/diff-*.osc.gz
+          fi
+
           BOOT_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
           echo "date=$BOOT_DATE" >> "$GITHUB_OUTPUT"
+          echo "PBF now at: $BOOT_DATE"
+
           echo "Building yesterday's index ($BOOT_DATE)..."
           time build-index "$WORKDIR/bootstrap-output/" "$WORKDIR/planet.osm.pbf" \
             --continents --multi-output --multi-quality 2>&1 | tail -10
@@ -272,35 +277,45 @@ jobs:
           echo "$BOOT_DATE" | rclone rcat "tigris:$S3_BUCKET/$S3_PREFIX/builds/latest.txt"
           echo "Bootstrap complete — yesterday's build + PBF uploaded"
 
-      - name: Apply replication diffs
+      - name: Apply today's diff
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
         run: |
-          PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
-          echo "PBF starting date: $PBF_DATE"
-          echo "Applying replication diffs to bring PBF up to date..."
-          ITER=0
-          while true; do
-            ITER=$((ITER + 1))
-            echo "--- Diff batch $ITER (PBF at $PBF_DATE) ---"
-            RC=0
-            pyosmium-up-to-date -v \
-              --server https://planet.openstreetmap.org/replication/day \
-              -s 2000 "$WORKDIR/planet.osm.pbf" 2>&1 || RC=$?
-            PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
-            echo "After batch $ITER: RC=$RC, PBF at $PBF_DATE"
-            if [ $RC -eq 0 ]; then
-              echo "PBF is up to date"
-              break
-            elif [ $RC -eq 1 ]; then
-              echo "More diffs to apply..."
-            else
-              echo "pyosmium-up-to-date failed with exit code $RC"
-              exit $RC
-            fi
-          done
+          SERVER="https://planet.openstreetmap.org/replication/day"
+          CURRENT_SEQ=$(curl -sL "$SERVER/state.txt" | grep sequenceNumber | cut -d= -f2)
+          CURRENT_DATE=$(curl -sL "$SERVER/state.txt" | grep timestamp | cut -d= -f2 | tr '\\' ' ' | cut -dT -f1 | tr -d ' ')
 
-          # Upload PBF to S3 immediately so next run can use it even if build fails
+          PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
+          DAYS_BEHIND=$(( ($(date -u -d "$CURRENT_DATE" +%s) - $(date -u -d "$PBF_DATE" +%s)) / 86400 ))
+          PBF_SEQ=$((CURRENT_SEQ - DAYS_BEHIND))
+          echo "PBF: date=$PBF_DATE seq=$PBF_SEQ, server: date=$CURRENT_DATE seq=$CURRENT_SEQ"
+
+          if [ $DAYS_BEHIND -le 0 ]; then
+            echo "PBF is already up to date"
+          else
+            echo "Downloading $DAYS_BEHIND diffs..."
+            DIFFS=""
+            for S in $(seq $((PBF_SEQ + 1)) $CURRENT_SEQ); do
+              DIR1=$(printf "%03d" $((S / 1000000)))
+              DIR2=$(printf "%03d" $(((S / 1000) % 1000)))
+              FILE=$(printf "%03d" $((S % 1000)))
+              curl -sL -o "$WORKDIR/diff-${S}.osc.gz" "$SERVER/$DIR1/$DIR2/${FILE}.osc.gz"
+              echo "  Downloaded seq $S"
+              DIFFS="$DIFFS $WORKDIR/diff-${S}.osc.gz"
+            done
+
+            echo "Applying $DAYS_BEHIND diffs in one pass..."
+            time osmium apply-changes "$WORKDIR/planet.osm.pbf" $DIFFS \
+              -o "$WORKDIR/planet-updated.osm.pbf" \
+              -f pbf,pbf_compression=none --overwrite
+            mv "$WORKDIR/planet-updated.osm.pbf" "$WORKDIR/planet.osm.pbf"
+            rm -f $WORKDIR/diff-*.osc.gz
+          fi
+
+          PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
+          echo "PBF now at: $PBF_DATE"
+
+          # Upload PBF immediately so next run can use it even if build fails
           echo "Uploading PBF as planet-${PBF_DATE}.osm.pbf..."
           rclone copyto "$WORKDIR/planet.osm.pbf" \
             "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-${PBF_DATE}.osm.pbf" \
@@ -473,11 +488,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq cmake g++ libz-dev libzstd-dev \
-            libbz2-dev libexpat1-dev libs2-dev libosmium2-dev aria2 jq python3-pip osmium-tool
-          pip install --break-system-packages osmium 2>/dev/null \
-            || pip install --user osmium 2>/dev/null \
-            || python3 -m pip install --user --break-system-packages osmium
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+            libbz2-dev libexpat1-dev libs2-dev libosmium2-dev aria2 jq osmium-tool
 
       - name: Configure S3 credentials
         run: |
@@ -552,19 +563,35 @@ jobs:
           else
             YESTERDAY=$(date -u -d "yesterday" +%Y-%m-%d)
             if rclone ls "tigris:$S3_BUCKET/$S3_PREFIX/pbf/" 2>/dev/null | grep -q "planet-${YESTERDAY}"; then
-              echo "Downloading yesterday's PBF ($YESTERDAY) from Tigris and applying replication diffs..."
+              echo "Downloading yesterday's PBF ($YESTERDAY) from Tigris..."
               rclone copyto "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-${YESTERDAY}.osm.pbf" \
                 "$WORKDIR/planet.osm.pbf" --progress --retries 5 --low-level-retries 10 --multi-thread-streams 16
-              while true; do
-                RC=0
-                pyosmium-up-to-date -v \
-                  --server https://planet.openstreetmap.org/replication/day \
-                  -s 2000 "$WORKDIR/planet.osm.pbf" 2>&1 || RC=$?
-                if [ $RC -eq 0 ]; then break
-                elif [ $RC -eq 1 ]; then echo "More diffs to apply..."
-                else exit $RC
-                fi
-              done
+
+              SERVER="https://planet.openstreetmap.org/replication/day"
+              CURRENT_SEQ=$(curl -sL "$SERVER/state.txt" | grep sequenceNumber | cut -d= -f2)
+              CURRENT_DATE=$(curl -sL "$SERVER/state.txt" | grep timestamp | cut -d= -f2 | tr '\\' ' ' | cut -dT -f1 | tr -d ' ')
+              PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
+              DAYS_BEHIND=$(( ($(date -u -d "$CURRENT_DATE" +%s) - $(date -u -d "$PBF_DATE" +%s)) / 86400 ))
+              PBF_SEQ=$((CURRENT_SEQ - DAYS_BEHIND))
+              echo "PBF: date=$PBF_DATE seq=$PBF_SEQ, server: seq=$CURRENT_SEQ"
+
+              if [ $DAYS_BEHIND -gt 0 ]; then
+                DIFFS=""
+                for S in $(seq $((PBF_SEQ + 1)) $CURRENT_SEQ); do
+                  DIR1=$(printf "%03d" $((S / 1000000)))
+                  DIR2=$(printf "%03d" $(((S / 1000) % 1000)))
+                  FILE=$(printf "%03d" $((S % 1000)))
+                  curl -sL -o "$WORKDIR/diff-${S}.osc.gz" "$SERVER/$DIR1/$DIR2/${FILE}.osc.gz"
+                  echo "  Downloaded seq $S"
+                  DIFFS="$DIFFS $WORKDIR/diff-${S}.osc.gz"
+                done
+                echo "Applying $DAYS_BEHIND diffs in one pass..."
+                time osmium apply-changes "$WORKDIR/planet.osm.pbf" $DIFFS \
+                  -o "$WORKDIR/planet-updated.osm.pbf" \
+                  -f pbf,pbf_compression=none --overwrite
+                mv "$WORKDIR/planet-updated.osm.pbf" "$WORKDIR/planet.osm.pbf"
+                rm -f $WORKDIR/diff-*.osc.gz
+              fi
               echo "method=diff" >> "$GITHUB_OUTPUT"
             else
               echo "No PBF for $YESTERDAY in Tigris — downloading from mirrors..."
