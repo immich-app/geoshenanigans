@@ -188,28 +188,19 @@ jobs:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
           YESTERDAY: ${{ steps.prev.outputs.yesterday }}
         run: |
-          # Try yesterday's PBF from Tigris, then any recent PBF, then mirrors
+          # Try yesterday's PBF from Tigris, otherwise download from mirrors
           if rclone ls "tigris:$S3_BUCKET/$S3_PREFIX/pbf/" 2>/dev/null | grep -q "planet-${YESTERDAY}"; then
             echo "Downloading yesterday's PBF ($YESTERDAY) from Tigris..."
             rclone copyto "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-${YESTERDAY}.osm.pbf" \
               "$WORKDIR/planet.osm.pbf" --progress --retries 5 --low-level-retries 10 --multi-thread-streams 16
           else
-            # Find the most recent PBF in Tigris
-            LATEST_PBF=$(rclone ls "tigris:$S3_BUCKET/$S3_PREFIX/pbf/" 2>/dev/null \
-              | grep -oP 'planet-\d{4}-\d{2}-\d{2}\.osm\.pbf' | sort | tail -1)
-            if [ -n "$LATEST_PBF" ]; then
-              echo "Downloading $LATEST_PBF from Tigris..."
-              rclone copyto "tigris:$S3_BUCKET/$S3_PREFIX/pbf/$LATEST_PBF" \
-                "$WORKDIR/planet.osm.pbf" --progress --retries 5 --low-level-retries 10 --multi-thread-streams 16
-            else
-              echo "No stored PBF — downloading from mirrors..."
-              aria2c -x 16 -s 16 -j 16 --max-tries=3 \
-                -d "$WORKDIR" -o planet.osm.pbf \
-                "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
-                "https://ftpmirror.your.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
-                "https://ftp.osuosl.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
-                "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/planet-latest.osm.pbf"
-            fi
+            echo "No PBF for $YESTERDAY in Tigris — downloading from mirrors..."
+            aria2c -x 16 -s 16 -j 16 --max-tries=3 \
+              -d "$WORKDIR" -o planet.osm.pbf \
+              "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
+              "https://ftpmirror.your.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
+              "https://ftp.osuosl.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
+              "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/planet-latest.osm.pbf"
           fi
           ls -lh "$WORKDIR/planet.osm.pbf"
 
