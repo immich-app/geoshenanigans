@@ -167,7 +167,7 @@ jobs:
             | grep -i '^location:' | awk '{print $2}' | tr -d '\r')
           PBF_FILE=$(basename "$PBF_URL")
           echo "Downloading $PBF_FILE from multiple mirrors..."
-          aria2c -x 4 -s 16 -j 4 --max-tries=3 \
+          aria2c -x 16 -s 16 -j 16 --max-tries=3 \
             -d "$WORKDIR" -o planet.osm.pbf \
             "$PBF_URL" \
             "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/$PBF_FILE" \
@@ -383,7 +383,7 @@ jobs:
             PBF_URL=$(curl -sI "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
               | grep -i '^location:' | awk '{print $2}' | tr -d '\r')
             PBF_FILE=$(basename "$PBF_URL")
-            aria2c -x 4 -s 16 -j 4 --max-tries=3 \
+            aria2c -x 16 -s 16 -j 16 --max-tries=3 \
               -d "$WORKDIR" -o planet.osm.pbf \
               "$PBF_URL" \
               "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/$PBF_FILE" \
@@ -405,7 +405,7 @@ jobs:
               PBF_URL=$(curl -sI "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
                 | grep -i '^location:' | awk '{print $2}' | tr -d '\r')
               PBF_FILE=$(basename "$PBF_URL")
-              aria2c -x 4 -s 16 -j 4 --max-tries=3 \
+              aria2c -x 16 -s 16 -j 16 --max-tries=3 \
                 -d "$WORKDIR" -o planet.osm.pbf \
                 "$PBF_URL" \
                 "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/$PBF_FILE" \
