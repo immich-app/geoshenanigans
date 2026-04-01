@@ -32,7 +32,7 @@ jobs:
 
       - name: Test upload + download + list
         run: |
-          echo "test-$(date -u +%Y%m%d%H%M%S)" > /tmp/test.txt
+          echo "test-$(date -u +%Y%m%d%H%M%S)-v2" > /tmp/test.txt
 
           echo "=== Upload ==="
           rclone copyto /tmp/test.txt "tigris:$S3_BUCKET/$S3_PREFIX/test.txt"
