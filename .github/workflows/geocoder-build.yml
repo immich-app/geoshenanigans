@@ -300,6 +300,16 @@ jobs:
             --s3-upload-concurrency 16 --s3-chunk-size 64M
           rm -f "$WORKDIR/planet.osm.pbf"
 
+      - name: Download previous build from S3
+        env:
+          WORKDIR: ${{ steps.pbf.outputs.workdir }}
+          PREV_DATE: ${{ steps.prev.outputs.date || steps.old_build.outputs.date }}
+        run: |
+          echo "Downloading previous build ($PREV_DATE) from S3..."
+          rclone sync "tigris:$S3_BUCKET/$S3_PREFIX/builds/$PREV_DATE/" \
+            "$WORKDIR/prev-build/" \
+            --progress --transfers 16 --retries 5 --low-level-retries 10
+
       - name: Generate and verify patches for all variants
         env:
           WORKDIR: ${{ steps.pbf.outputs.workdir }}
@@ -311,53 +321,89 @@ jobs:
           echo "| Variant | Files | Patch Size | Verified |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---------|-------|-----------|----------|" >> "$GITHUB_STEP_SUMMARY"
 
-          PASS=0; FAIL=0; SKIP=0
+          RESULTS_DIR="$WORKDIR/results"
+          mkdir -p "$RESULTS_DIR"
           VARIANTS=$(cd "$WORKDIR/output" && find . -name "*.bin" -exec dirname {} \; | sort -u | sed 's|^\./||')
 
+          # Process variants in parallel (up to nproc jobs)
+          JOBS=0
+          MAX_JOBS=$(nproc)
           for variant in $VARIANTS; do
-            NEW_DIR="$WORKDIR/output/$variant"
-            OLD_DIR="$WORKDIR/prev-variant"
-            rm -rf "$OLD_DIR"; mkdir -p "$OLD_DIR"
-            rclone sync "tigris:$S3_BUCKET/$S3_PREFIX/builds/$PREV_DATE/$variant/" "$OLD_DIR/" \
-              --retries 5 --low-level-retries 10 2>/dev/null
-            N_NEW=$(ls "$NEW_DIR"/*.bin 2>/dev/null | wc -l)
-            N_OLD=$(ls "$OLD_DIR"/*.bin 2>/dev/null | wc -l)
-            [ "$N_NEW" -lt 2 ] && continue
-            if [ "$N_OLD" -ne "$N_NEW" ]; then
-              SKIP=$((SKIP + 1))
-              rm -rf "$OLD_DIR"
-              continue
+            (
+              NEW_DIR="$WORKDIR/output/$variant"
+              OLD_DIR="$WORKDIR/prev-build/$variant"
+              N_NEW=$(ls "$NEW_DIR"/*.bin 2>/dev/null | wc -l)
+              N_OLD=$(ls "$OLD_DIR"/*.bin 2>/dev/null | wc -l)
+              SAFE_NAME=$(echo "$variant" | tr '/' '_')
+
+              if [ "$N_NEW" -lt 2 ]; then exit 0; fi
+              if [ "$N_OLD" -ne "$N_NEW" ]; then
+                echo "SKIP" > "$RESULTS_DIR/$SAFE_NAME"
+                exit 0
+              fi
+
+              PATCH_FILE="$WORKDIR/patch-$SAFE_NAME.gcpatch"
+              geocoder-diff "$OLD_DIR" "$NEW_DIR" -o "$PATCH_FILE" 2>/dev/null
+              PATCH_SIZE=$(stat -c%s "$PATCH_FILE" 2>/dev/null || echo 0)
+              PATCH_KB=$((PATCH_SIZE / 1024))
+
+              VERIFY_DIR="$WORKDIR/verify-$SAFE_NAME"
+              mkdir -p "$VERIFY_DIR"
+              geocoder-patch "$OLD_DIR" "$PATCH_FILE" -o "$VERIFY_DIR/" 2>/dev/null
+
+              MATCH=0
+              for f in "$NEW_DIR"/*.bin; do
+                b=$(basename "$f")
+                h1=$(md5sum "$VERIFY_DIR/$b" 2>/dev/null | awk '{print $1}')
+                h2=$(md5sum "$NEW_DIR/$b" | awk '{print $1}')
+                [ "$h1" = "$h2" ] && MATCH=$((MATCH + 1))
+              done
+
+              if [ $MATCH -eq $N_NEW ]; then
+                echo "PASS $N_NEW $PATCH_KB" > "$RESULTS_DIR/$SAFE_NAME"
+              else
+                echo "FAIL $MATCH $N_NEW $PATCH_KB" > "$RESULTS_DIR/$SAFE_NAME"
+              fi
+              rm -f "$PATCH_FILE"
+              rm -rf "$VERIFY_DIR"
+            ) &
+
+            JOBS=$((JOBS + 1))
+            if [ $JOBS -ge $MAX_JOBS ]; then
+              wait -n 2>/dev/null || true
+              JOBS=$((JOBS - 1))
             fi
+          done
+          wait
 
-            PATCH_FILE="$WORKDIR/test.gcpatch"
-            geocoder-diff "$OLD_DIR" "$NEW_DIR" -o "$PATCH_FILE" 2>/dev/null
-            PATCH_SIZE=$(stat -c%s "$PATCH_FILE" 2>/dev/null || echo 0)
-            PATCH_KB=$((PATCH_SIZE / 1024))
+          rm -rf "$WORKDIR/prev-build"
 
-            VERIFY_DIR="$WORKDIR/verify"
-            rm -rf "$VERIFY_DIR"; mkdir -p "$VERIFY_DIR"
-            geocoder-patch "$OLD_DIR" "$PATCH_FILE" -o "$VERIFY_DIR/" 2>/dev/null
+          # Collect results
+          PASS=0; FAIL=0; SKIP=0
+          for variant in $VARIANTS; do
+            SAFE_NAME=$(echo "$variant" | tr '/' '_')
+            RESULT_FILE="$RESULTS_DIR/$SAFE_NAME"
+            [ ! -f "$RESULT_FILE" ] && continue
+            RESULT=$(cat "$RESULT_FILE")
 
-            MATCH=0
-            for f in "$NEW_DIR"/*.bin; do
-              b=$(basename "$f")
-              h1=$(md5sum "$VERIFY_DIR/$b" 2>/dev/null | awk '{print $1}')
-              h2=$(md5sum "$NEW_DIR/$b" | awk '{print $1}')
-              [ "$h1" = "$h2" ] && MATCH=$((MATCH + 1))
-            done
-
-            if [ $MATCH -eq $N_NEW ]; then
-              echo "  $variant: PASS ($MATCH/$N_NEW, ${PATCH_KB} KiB)"
+            if [ "$RESULT" = "SKIP" ]; then
+              SKIP=$((SKIP + 1))
+            elif echo "$RESULT" | grep -q "^PASS"; then
+              N_NEW=$(echo "$RESULT" | awk '{print $2}')
+              PATCH_KB=$(echo "$RESULT" | awk '{print $3}')
+              echo "  $variant: PASS ($N_NEW/$N_NEW, ${PATCH_KB} KiB)"
               echo "| $variant | $N_NEW | ${PATCH_KB} KiB | PASS |" >> "$GITHUB_STEP_SUMMARY"
               PASS=$((PASS + 1))
             else
+              MATCH=$(echo "$RESULT" | awk '{print $2}')
+              N_NEW=$(echo "$RESULT" | awk '{print $3}')
+              PATCH_KB=$(echo "$RESULT" | awk '{print $4}')
               echo "::error::$variant: FAIL ($MATCH/$N_NEW match)"
               echo "| $variant | $N_NEW | ${PATCH_KB} KiB | **FAIL** |" >> "$GITHUB_STEP_SUMMARY"
               FAIL=$((FAIL + 1))
             fi
-            rm -f "$PATCH_FILE"
-            rm -rf "$VERIFY_DIR" "$OLD_DIR"
           done
+          rm -rf "$RESULTS_DIR"
 
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "**Total: $PASS pass, $FAIL fail, $SKIP skip**" >> "$GITHUB_STEP_SUMMARY"
@@ -373,8 +419,8 @@ jobs:
           echo "Uploading new build as $NEW_DATE..."
           rclone sync "$WORKDIR/output/" \
             "tigris:$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/" \
-            --progress --transfers 16 --retries 5 --low-level-retries 10 \
-            --s3-upload-concurrency 16 --s3-chunk-size 64M
+            --progress --transfers 32 --retries 5 --low-level-retries 10 \
+            --s3-upload-concurrency 16 --s3-chunk-size 64M --checkers 32
           echo "$NEW_DATE" | rclone rcat "tigris:$S3_BUCKET/$S3_PREFIX/builds/latest.txt"
           echo "Upload complete"
 
@@ -556,8 +602,8 @@ jobs:
         run: |
           rclone sync "$WORKDIR/output/" \
             "tigris:$S3_BUCKET/$S3_PREFIX/builds/$BUILD_DATE/" \
-            --progress --transfers 16 --retries 5 --low-level-retries 10 \
-            --s3-upload-concurrency 16 --s3-chunk-size 64M
+            --progress --transfers 32 --retries 5 --low-level-retries 10 \
+            --s3-upload-concurrency 16 --s3-chunk-size 64M --checkers 32
 
           echo "$BUILD_DATE" | rclone rcat "tigris:$S3_BUCKET/$S3_PREFIX/builds/latest.txt"
 
@@ -634,6 +680,17 @@ jobs:
             [ $FAIL -eq 0 ] && echo "Identity patch: PASS" || exit 1
           fi
 
+      - name: Download previous build from S3
+        if: steps.prev.outputs.found == 'true'
+        env:
+          WORKDIR: ${{ steps.pbf.outputs.workdir }}
+          PREV: ${{ steps.prev.outputs.date }}
+        run: |
+          echo "Downloading previous build ($PREV) from S3..."
+          rclone sync "tigris:$S3_BUCKET/$S3_PREFIX/builds/$PREV/" \
+            "$WORKDIR/prev-build/" \
+            --progress --transfers 16 --retries 5 --low-level-retries 10
+
       - name: Generate and verify patches for all variants
         if: steps.prev.outputs.found == 'true'
         env:
@@ -641,67 +698,105 @@ jobs:
           PREV: ${{ steps.prev.outputs.date }}
           CURRENT: ${{ steps.pbf_date.outputs.date || steps.meta.outputs.date }}
         run: |
-          S3_PREV_BASE="s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV"
-
           echo "## Patch Generation ($PREV → $CURRENT)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Variant | Files | Patch Size | Verified |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---------|-------|-----------|----------|" >> "$GITHUB_STEP_SUMMARY"
 
-          PASS=0; FAIL=0; SKIP=0
-
+          RESULTS_DIR="$WORKDIR/results"
+          PATCHES_DIR="$WORKDIR/patches-out"
+          mkdir -p "$RESULTS_DIR" "$PATCHES_DIR"
           VARIANTS=$(cd "$WORKDIR/output" && find . -name "*.bin" -exec dirname {} \; | sort -u | sed 's|^\./||')
 
+          # Process variants in parallel
+          JOBS=0
+          MAX_JOBS=$(nproc)
           for variant in $VARIANTS; do
-            NEW_DIR="$WORKDIR/output/$variant"
-            N_NEW=$(ls "$NEW_DIR"/*.bin 2>/dev/null | wc -l)
-            [ "$N_NEW" -lt 2 ] && continue
+            (
+              NEW_DIR="$WORKDIR/output/$variant"
+              PREV_DIR="$WORKDIR/prev-build/$variant"
+              N_NEW=$(ls "$NEW_DIR"/*.bin 2>/dev/null | wc -l)
+              N_PREV=$(ls "$PREV_DIR"/*.bin 2>/dev/null | wc -l)
+              SAFE_NAME=$(echo "$variant" | tr '/' '_')
 
-            PREV_DIR="$WORKDIR/prev-variant"
-            rm -rf "$PREV_DIR"; mkdir -p "$PREV_DIR"
-            rclone sync "tigris:${S3_BUCKET}/${S3_PREFIX}/builds/${PREV}/$variant/" "$PREV_DIR/" \
-              --retries 5 --low-level-retries 10 2>/dev/null
+              if [ "$N_NEW" -lt 2 ]; then exit 0; fi
+              if [ "$N_PREV" -ne "$N_NEW" ]; then
+                echo "SKIP" > "$RESULTS_DIR/$SAFE_NAME"
+                exit 0
+              fi
 
-            N_PREV=$(ls "$PREV_DIR"/*.bin 2>/dev/null | wc -l)
-            if [ "$N_PREV" -ne "$N_NEW" ]; then
-              SKIP=$((SKIP + 1))
-              continue
+              PATCH_FILE="$PATCHES_DIR/$SAFE_NAME.gcpatch"
+              geocoder-diff "$PREV_DIR" "$NEW_DIR" -o "$PATCH_FILE" 2>/dev/null
+              PATCH_SIZE=$(stat -c%s "$PATCH_FILE" 2>/dev/null || echo 0)
+              PATCH_KB=$((PATCH_SIZE / 1024))
+
+              VERIFY_DIR="$WORKDIR/verify-$SAFE_NAME"
+              mkdir -p "$VERIFY_DIR"
+              geocoder-patch "$PREV_DIR" "$PATCH_FILE" -o "$VERIFY_DIR/" 2>/dev/null
+
+              MATCH=0
+              for f in "$NEW_DIR"/*.bin; do
+                b=$(basename "$f")
+                h1=$(md5sum "$VERIFY_DIR/$b" 2>/dev/null | awk '{print $1}')
+                h2=$(md5sum "$NEW_DIR/$b" | awk '{print $1}')
+                [ "$h1" = "$h2" ] && MATCH=$((MATCH + 1))
+              done
+
+              if [ $MATCH -eq $N_NEW ]; then
+                echo "PASS $N_NEW $PATCH_KB $variant" > "$RESULTS_DIR/$SAFE_NAME"
+              else
+                echo "FAIL $MATCH $N_NEW $PATCH_KB $variant" > "$RESULTS_DIR/$SAFE_NAME"
+              fi
+              rm -rf "$VERIFY_DIR"
+            ) &
+
+            JOBS=$((JOBS + 1))
+            if [ $JOBS -ge $MAX_JOBS ]; then
+              wait -n 2>/dev/null || true
+              JOBS=$((JOBS - 1))
             fi
+          done
+          wait
 
-            PATCH_FILE="$WORKDIR/current-patch.gcpatch"
-            geocoder-diff "$PREV_DIR" "$NEW_DIR" -o "$PATCH_FILE" 2>/dev/null
-            PATCH_SIZE=$(stat -c%s "$PATCH_FILE" 2>/dev/null || echo 0)
-            PATCH_KB=$((PATCH_SIZE / 1024))
+          rm -rf "$WORKDIR/prev-build"
 
-            VERIFY_DIR="$WORKDIR/verify-variant"
-            rm -rf "$VERIFY_DIR"; mkdir -p "$VERIFY_DIR"
-            geocoder-patch "$PREV_DIR" "$PATCH_FILE" -o "$VERIFY_DIR" 2>/dev/null
+          # Collect results and upload verified patches
+          PASS=0; FAIL=0; SKIP=0
+          for variant in $VARIANTS; do
+            SAFE_NAME=$(echo "$variant" | tr '/' '_')
+            RESULT_FILE="$RESULTS_DIR/$SAFE_NAME"
+            [ ! -f "$RESULT_FILE" ] && continue
+            RESULT=$(cat "$RESULT_FILE")
 
-            MATCH=0
-            for f in "$NEW_DIR"/*.bin; do
-              b=$(basename "$f")
-              h1=$(md5sum "$VERIFY_DIR/$b" 2>/dev/null | awk '{print $1}')
-              h2=$(md5sum "$NEW_DIR/$b" | awk '{print $1}')
-              [ "$h1" = "$h2" ] && MATCH=$((MATCH + 1))
-            done
-
-            if [ $MATCH -eq $N_NEW ]; then
-              echo "  $variant: PASS ($MATCH/$N_NEW, ${PATCH_KB} KiB)"
+            if [ "$RESULT" = "SKIP" ]; then
+              SKIP=$((SKIP + 1))
+            elif echo "$RESULT" | grep -q "^PASS"; then
+              N_NEW=$(echo "$RESULT" | awk '{print $2}')
+              PATCH_KB=$(echo "$RESULT" | awk '{print $3}')
+              echo "  $variant: PASS ($N_NEW/$N_NEW, ${PATCH_KB} KiB)"
               echo "| $variant | $N_NEW | ${PATCH_KB} KiB | PASS |" >> "$GITHUB_STEP_SUMMARY"
               PASS=$((PASS + 1))
 
-              rclone copyto "$PATCH_FILE" \
+              rclone copyto "$PATCHES_DIR/$SAFE_NAME.gcpatch" \
                 "tigris:$S3_BUCKET/$S3_PREFIX/patches/$variant/${PREV}-to-${CURRENT}.gcpatch" \
-                --retries 5 --low-level-retries 10
+                --retries 5 --low-level-retries 10 &
             else
+              MATCH=$(echo "$RESULT" | awk '{print $2}')
+              N_NEW=$(echo "$RESULT" | awk '{print $3}')
+              PATCH_KB=$(echo "$RESULT" | awk '{print $4}')
               echo "::error::$variant: FAIL ($MATCH/$N_NEW match)"
               echo "| $variant | $N_NEW | ${PATCH_KB} KiB | **FAIL** |" >> "$GITHUB_STEP_SUMMARY"
               FAIL=$((FAIL + 1))
             fi
-
-            rm -f "$PATCH_FILE"
-            rm -rf "$VERIFY_DIR" "$PREV_DIR"
           done
+          wait
+          rm -rf "$RESULTS_DIR" "$PATCHES_DIR"
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Total: $PASS pass, $FAIL fail, $SKIP skip**" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Results: $PASS pass, $FAIL fail, $SKIP skip"
+          [ $FAIL -gt 0 ] && exit 1 || true
 
           echo ""
           echo "Results: $PASS pass, $FAIL fail, $SKIP skip"
