@@ -1,6 +1,7 @@
 name: Test S3/Tigris Upload
 
 on:
+  push:
   workflow_dispatch:
 
 env:
