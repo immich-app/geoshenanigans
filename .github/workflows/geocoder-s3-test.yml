@@ -1,0 +1,53 @@
+name: Test S3/Tigris Upload
+
+on:
+  workflow_dispatch:
+
+env:
+  S3_BUCKET: geoshenanigans-reverse-geocoding
+  S3_ENDPOINT: https://fly.storage.tigris.dev
+  S3_PREFIX: geocoder
+
+permissions:
+  contents: read
+
+jobs:
+  test-s3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Install AWS CLI
+        run: |
+          curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+          unzip -q /tmp/awscliv2.zip -d /tmp && sudo /tmp/aws/install
+
+      - name: Configure S3 credentials
+        run: |
+          echo "AWS_ACCESS_KEY_ID=$S3_ACCESS_KEY_ID" >> "$GITHUB_ENV"
+          echo "AWS_SECRET_ACCESS_KEY=$S3_SECRET_ACCESS_KEY" >> "$GITHUB_ENV"
+          echo "AWS_DEFAULT_REGION=auto" >> "$GITHUB_ENV"
+          echo "AWS_ENDPOINT_URL=$S3_ENDPOINT" >> "$GITHUB_ENV"
+        env:
+          S3_ACCESS_KEY_ID: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
+          S3_SECRET_ACCESS_KEY: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
+
+      - name: Test upload + download + list
+        run: |
+          echo "test-$(date -u +%Y%m%d%H%M%S)" > /tmp/test.txt
+
+          echo "=== Upload ==="
+          aws s3 cp /tmp/test.txt "s3://$S3_BUCKET/$S3_PREFIX/test.txt" --no-progress
+          echo "Upload: OK"
+
+          echo "=== List ==="
+          aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/"
+          echo "List: OK"
+
+          echo "=== Download ==="
+          aws s3 cp "s3://$S3_BUCKET/$S3_PREFIX/test.txt" /tmp/test-download.txt --no-progress
+          diff /tmp/test.txt /tmp/test-download.txt
+          echo "Download + verify: OK"
+
+          echo "=== Cleanup ==="
+          aws s3 rm "s3://$S3_BUCKET/$S3_PREFIX/test.txt"
+          echo "Cleanup: OK"
