@@ -209,10 +209,10 @@ jobs:
         run: |
           echo "Applying replication diffs to bring PBF up to date..."
           while true; do
+            RC=0
             pyosmium-up-to-date -v \
               --server https://planet.openstreetmap.org/replication/day \
-              -s 2000 "$WORKDIR/planet.osm.pbf" 2>&1
-            RC=$?
+              -s 2000 "$WORKDIR/planet.osm.pbf" 2>&1 || RC=$?
             if [ $RC -eq 0 ]; then
               echo "PBF is up to date"
               break
@@ -414,10 +414,10 @@ jobs:
               rclone copyto "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-current.osm.pbf" \
                 "$WORKDIR/planet.osm.pbf" --progress --retries 5 --low-level-retries 10
               while true; do
+                RC=0
                 pyosmium-up-to-date -v \
                   --server https://planet.openstreetmap.org/replication/day \
-                  -s 2000 "$WORKDIR/planet.osm.pbf" 2>&1
-                RC=$?
+                  -s 2000 "$WORKDIR/planet.osm.pbf" 2>&1 || RC=$?
                 if [ $RC -eq 0 ]; then break
                 elif [ $RC -eq 1 ]; then echo "More diffs to apply..."
                 else exit $RC
