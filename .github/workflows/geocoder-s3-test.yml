@@ -32,24 +32,31 @@ jobs:
           AWS_DEFAULT_REGION: auto
           S3_ENDPOINT_URL: ${{ env.S3_ENDPOINT }}
         run: |
-          # Generate a 100MB test file
-          dd if=/dev/urandom of=/tmp/test-100m.bin bs=1M count=100 2>/dev/null
+          # Generate a 5GB test file
+          dd if=/dev/urandom of=/tmp/test-5g.bin bs=1M count=5120 2>/dev/null
+          ls -lh /tmp/test-5g.bin
 
-          echo "=== s5cmd upload (100MB, concurrency 32) ==="
-          time s5cmd --endpoint-url "$S3_ENDPOINT_URL" --log debug --stat \
-            cp --concurrency 32 --part-size 25 \
-            /tmp/test-100m.bin "s3://$S3_BUCKET/geocoder/test/test-100m.bin"
-          echo "Upload OK"
+          echo "=== s5cmd upload (5GB, concurrency 32, part-size 256MB) ==="
+          START=$(date +%s)
+          s5cmd --endpoint-url "$S3_ENDPOINT_URL" --stat \
+            cp --concurrency 32 --part-size 256 \
+            /tmp/test-5g.bin "s3://$S3_BUCKET/geocoder/test/test-5g.bin"
+          END=$(date +%s)
+          ELAPSED=$((END - START))
+          echo "Upload: ${ELAPSED}s ($(echo "scale=1; 5120/$ELAPSED" | bc) MB/s)"
 
-          echo "=== s5cmd download ==="
-          time s5cmd --endpoint-url "$S3_ENDPOINT_URL" --log debug --stat \
-            cp "s3://$S3_BUCKET/geocoder/test/test-100m.bin" /tmp/test-download.bin
-          echo "Download OK"
+          echo "=== s5cmd download (5GB) ==="
+          START=$(date +%s)
+          s5cmd --endpoint-url "$S3_ENDPOINT_URL" --stat \
+            cp "s3://$S3_BUCKET/geocoder/test/test-5g.bin" /tmp/test-download.bin
+          END=$(date +%s)
+          ELAPSED=$((END - START))
+          echo "Download: ${ELAPSED}s ($(echo "scale=1; 5120/$ELAPSED" | bc) MB/s)"
 
           echo "=== Verify ==="
-          md5sum /tmp/test-100m.bin /tmp/test-download.bin
+          md5sum /tmp/test-5g.bin /tmp/test-download.bin
 
           echo "=== Cleanup ==="
           s5cmd --endpoint-url "$S3_ENDPOINT_URL" \
-            rm "s3://$S3_BUCKET/geocoder/test/test-100m.bin"
+            rm "s3://$S3_BUCKET/geocoder/test/test-5g.bin"
           echo "Done"
