@@ -253,9 +253,19 @@ jobs:
           echo "Building 'new' index ($NEW_DATE) from updated PBF..."
           time build-index "$WORKDIR/output/" "$WORKDIR/planet.osm.pbf" \
             --continents --multi-output --multi-quality 2>&1 | tail -10
-          rm -f "$WORKDIR/planet.osm.pbf"
           find "$WORKDIR/output" -name "*.bin" | wc -l
           echo "bin files produced"
+
+      - name: Upload PBF to S3
+        env:
+          WORKDIR: ${{ steps.pbf.outputs.workdir }}
+        run: |
+          echo "Uploading updated PBF to S3..."
+          rclone copyto "$WORKDIR/planet.osm.pbf" \
+            "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-current.osm.pbf" \
+            --progress --retries 5 --low-level-retries 10 \
+            --s3-upload-concurrency 16 --s3-chunk-size 64M
+          rm -f "$WORKDIR/planet.osm.pbf"
 
       - name: Generate and verify patches for all variants
         env:
