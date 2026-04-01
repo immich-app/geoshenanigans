@@ -512,12 +512,10 @@ jobs:
             echo "method=download" >> "$GITHUB_OUTPUT"
 
           else
-            # Find the most recent PBF in Tigris
-            LATEST_PBF=$(rclone ls "tigris:$S3_BUCKET/$S3_PREFIX/pbf/" 2>/dev/null \
-              | grep -oP 'planet-\d{4}-\d{2}-\d{2}\.osm\.pbf' | sort | tail -1)
-            if [ -n "$LATEST_PBF" ]; then
-              echo "Downloading $LATEST_PBF from Tigris and applying replication diffs..."
-              rclone copyto "tigris:$S3_BUCKET/$S3_PREFIX/pbf/$LATEST_PBF" \
+            YESTERDAY=$(date -u -d "yesterday" +%Y-%m-%d)
+            if rclone ls "tigris:$S3_BUCKET/$S3_PREFIX/pbf/" 2>/dev/null | grep -q "planet-${YESTERDAY}"; then
+              echo "Downloading yesterday's PBF ($YESTERDAY) from Tigris and applying replication diffs..."
+              rclone copyto "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-${YESTERDAY}.osm.pbf" \
                 "$WORKDIR/planet.osm.pbf" --progress --retries 5 --low-level-retries 10 --multi-thread-streams 16
               while true; do
                 RC=0
@@ -531,16 +529,13 @@ jobs:
               done
               echo "method=diff" >> "$GITHUB_OUTPUT"
             else
-              echo "No stored PBF — downloading fresh planet from multiple mirrors..."
-              PBF_FILE=$(curl -sI "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
-                | grep -i '^location:' | awk '{print $2}' | tr -d '\r' | xargs basename)
-              echo "Latest PBF: $PBF_FILE"
+              echo "No PBF for $YESTERDAY in Tigris — downloading from mirrors..."
               aria2c -x 16 -s 16 -j 16 --max-tries=3 \
                 -d "$WORKDIR" -o planet.osm.pbf \
-                "https://planet.openstreetmap.org/pbf/$PBF_FILE" \
-                "https://ftpmirror.your.org/pub/openstreetmap/pbf/$PBF_FILE" \
-                "https://ftp.osuosl.org/pub/openstreetmap/pbf/$PBF_FILE" \
-                "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/$PBF_FILE"
+                "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
+                "https://ftpmirror.your.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
+                "https://ftp.osuosl.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
+                "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/planet-latest.osm.pbf"
               echo "method=download" >> "$GITHUB_OUTPUT"
             fi
           fi
