@@ -36,7 +36,7 @@ on:
         default: 'self-hosted'
 
 env:
-  S3_BUCKET: ${{ secrets.GEOCODER_S3_BUCKET }}
+  S3_BUCKET: geoshenanigans-reverse-geocoding
   S3_ENDPOINT: https://fly.storage.tigris.dev
   S3_PREFIX: geocoder
   REGIONS: "planet africa asia europe north-america south-america oceania central-america antarctica"
@@ -281,8 +281,8 @@ jobs:
           echo "AWS_DEFAULT_REGION=auto" >> "$GITHUB_ENV"
           echo "AWS_ENDPOINT_URL=$S3_ENDPOINT" >> "$GITHUB_ENV"
         env:
-          S3_ACCESS_KEY_ID: ${{ secrets.TIGRIS_GEOCODER_KEY_ID }}
-          S3_SECRET_ACCESS_KEY: ${{ secrets.TIGRIS_GEOCODER_ACCESS_KEY }}
+          S3_ACCESS_KEY_ID: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
+          S3_SECRET_ACCESS_KEY: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
 
       - name: Build tools
         run: |
