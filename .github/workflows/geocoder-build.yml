@@ -204,8 +204,46 @@ jobs:
           fi
           ls -lh "$WORKDIR/planet.osm.pbf"
 
-      # --- Bootstrap: build + upload "yesterday's" index from current PBF ---
-      - name: "Bootstrap: build + upload index from current PBF"
+      # --- Bootstrap: patch PBF to yesterday, build + upload yesterday's index ---
+      - name: "Bootstrap: bring PBF to yesterday"
+        if: steps.prev.outputs.found != 'true'
+        env:
+          WORKDIR: ${{ steps.setup.outputs.workdir }}
+          YESTERDAY: ${{ steps.prev.outputs.yesterday }}
+        run: |
+          PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
+          echo "PBF date: $PBF_DATE, target: $YESTERDAY"
+
+          if [ ! "$PBF_DATE" \< "$YESTERDAY" ]; then
+            echo "PBF is already at or past yesterday — using as-is"
+          else
+            echo "Applying diffs to reach $YESTERDAY..."
+            ITER=0
+            while true; do
+              ITER=$((ITER + 1))
+              echo "--- Diff batch $ITER (PBF at $PBF_DATE) ---"
+              RC=0
+              pyosmium-up-to-date -v \
+                --server https://planet.openstreetmap.org/replication/day \
+                -s 2000 "$WORKDIR/planet.osm.pbf" 2>&1 || RC=$?
+              PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
+              echo "After batch $ITER: RC=$RC, PBF at $PBF_DATE"
+              if [ ! "$PBF_DATE" \< "$YESTERDAY" ]; then
+                echo "Reached $PBF_DATE (target: $YESTERDAY)"
+                break
+              elif [ $RC -eq 0 ]; then
+                echo "Fully caught up at $PBF_DATE"
+                break
+              elif [ $RC -eq 1 ]; then
+                echo "More diffs to apply..."
+              else
+                echo "pyosmium-up-to-date failed with exit code $RC"
+                exit $RC
+              fi
+            done
+          fi
+
+      - name: "Bootstrap: build + upload yesterday's index"
         if: steps.prev.outputs.found != 'true'
         id: bootstrap
         env:
@@ -213,10 +251,16 @@ jobs:
         run: |
           BOOT_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
           echo "date=$BOOT_DATE" >> "$GITHUB_OUTPUT"
-          echo "No previous build — building index ($BOOT_DATE) from current PBF..."
+          echo "Building yesterday's index ($BOOT_DATE)..."
           time build-index "$WORKDIR/bootstrap-output/" "$WORKDIR/planet.osm.pbf" \
             --continents --multi-output --multi-quality 2>&1 | tail -10
           echo "$(find "$WORKDIR/bootstrap-output" -name "*.bin" | wc -l) bin files produced"
+
+          echo "Uploading PBF as planet-${BOOT_DATE}.osm.pbf..."
+          rclone copyto "$WORKDIR/planet.osm.pbf" \
+            "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-${BOOT_DATE}.osm.pbf" \
+            --progress --retries 5 --low-level-retries 10 --multi-thread-streams 16 \
+            --s3-upload-concurrency 32 --s3-chunk-size 256M --s3-no-check-bucket
 
           echo "Uploading bootstrap build as $BOOT_DATE..."
           rclone sync "$WORKDIR/bootstrap-output/" \
@@ -225,14 +269,8 @@ jobs:
             --s3-upload-concurrency 32 --s3-chunk-size 256M --s3-no-check-bucket --checkers 32
           rm -rf "$WORKDIR/bootstrap-output"
 
-          echo "Uploading PBF as planet-${BOOT_DATE}.osm.pbf..."
-          rclone copyto "$WORKDIR/planet.osm.pbf" \
-            "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-${BOOT_DATE}.osm.pbf" \
-            --progress --retries 5 --low-level-retries 10 --multi-thread-streams 16 \
-            --s3-upload-concurrency 32 --s3-chunk-size 256M --s3-no-check-bucket
-
           echo "$BOOT_DATE" | rclone rcat "tigris:$S3_BUCKET/$S3_PREFIX/builds/latest.txt"
-          echo "Bootstrap complete — Tigris seeded with build + PBF"
+          echo "Bootstrap complete — yesterday's build + PBF uploaded"
 
       - name: Apply replication diffs
         env:
