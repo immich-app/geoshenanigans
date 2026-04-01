@@ -6,7 +6,7 @@ on:
 
 env:
   S3_BUCKET: geoshenanigans-reverse-geocoding
-  S3_ENDPOINT: https://fly.storage.tigris.dev
+  S3_ENDPOINT: https://t3.storage.dev
   S3_PREFIX: geocoder
 
 permissions:
