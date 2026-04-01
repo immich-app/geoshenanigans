@@ -128,7 +128,17 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq cmake g++ libz-dev libzstd-dev \
-            libbz2-dev libexpat1-dev libs2-dev libosmium2-dev aria2 jq
+            libbz2-dev libexpat1-dev libs2-dev libosmium2-dev aria2 jq awscli
+
+      - name: Configure S3 credentials
+        run: |
+          echo "AWS_ACCESS_KEY_ID=$S3_ACCESS_KEY_ID" >> "$GITHUB_ENV"
+          echo "AWS_SECRET_ACCESS_KEY=$S3_SECRET_ACCESS_KEY" >> "$GITHUB_ENV"
+          echo "AWS_DEFAULT_REGION=auto" >> "$GITHUB_ENV"
+          echo "AWS_ENDPOINT_URL=$S3_ENDPOINT" >> "$GITHUB_ENV"
+        env:
+          S3_ACCESS_KEY_ID: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
+          S3_SECRET_ACCESS_KEY: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
 
       - name: Build tools
         run: |
@@ -250,6 +260,20 @@ jobs:
 
           echo "Results: $PASS pass, $FAIL fail"
           [ $FAIL -gt 0 ] && exit 1 || true
+
+      - name: Upload builds to S3 (test)
+        env:
+          WORKDIR: ${{ steps.pbf.outputs.workdir }}
+        run: |
+          BUILD_DATE=$(date -u +%Y-%m-%d)
+          echo "Uploading to s3://$S3_BUCKET/$S3_PREFIX/builds/$BUILD_DATE/"
+          aws s3 sync "$WORKDIR/output/" \
+            "s3://$S3_BUCKET/$S3_PREFIX/builds/$BUILD_DATE/" \
+            --no-progress --only-show-errors
+          echo "$BUILD_DATE" | aws s3 cp - \
+            "s3://$S3_BUCKET/$S3_PREFIX/builds/latest.txt" \
+            --content-type text/plain
+          echo "Upload complete: $BUILD_DATE"
 
   # --- Production build: full planet + S3 upload ---
   build:
