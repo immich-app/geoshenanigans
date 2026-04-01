@@ -129,8 +129,10 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq cmake g++ libz-dev libzstd-dev \
             libbz2-dev libexpat1-dev libs2-dev libosmium2-dev aria2 jq unzip python3-pip
-          curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
-          unzip -q /tmp/awscliv2.zip -d /tmp && sudo /tmp/aws/install
+          if ! command -v aws &>/dev/null; then
+            curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+            unzip -q /tmp/awscliv2.zip -d /tmp && sudo /tmp/aws/install
+          fi
           pip install --break-system-packages osmium 2>/dev/null \
             || pip install --user osmium 2>/dev/null \
             || python3 -m pip install --user --break-system-packages osmium
@@ -319,8 +321,10 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq cmake g++ libz-dev libzstd-dev \
             libbz2-dev libexpat1-dev libs2-dev libosmium2-dev aria2 jq python3-pip unzip
-          curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
-          unzip -q /tmp/awscliv2.zip -d /tmp && sudo /tmp/aws/install
+          if ! command -v aws &>/dev/null; then
+            curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+            unzip -q /tmp/awscliv2.zip -d /tmp && sudo /tmp/aws/install
+          fi
           pip install --break-system-packages osmium 2>/dev/null \
             || pip install --user osmium 2>/dev/null \
             || python3 -m pip install --user --break-system-packages osmium
