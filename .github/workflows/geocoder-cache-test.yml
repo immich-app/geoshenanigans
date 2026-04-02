@@ -62,4 +62,4 @@ jobs:
 
           echo "=== Cleanup ==="
           s5cmd --endpoint-url "$ENDPOINT" rm "s3://$BUCKET_NAME/geocoder-cache/test.txt"
-          echo "Done"
+          echo "All tests passed"
