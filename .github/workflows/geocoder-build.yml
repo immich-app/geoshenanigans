@@ -19,11 +19,6 @@ on:
         description: 'Override PBF URL (leave empty to use replication diffs)'
         required: false
         type: string
-      force_fresh_download:
-        description: 'Force fresh planet PBF download (skip replication diffs)'
-        required: false
-        type: boolean
-        default: false
       skip_patch:
         description: 'Skip patch generation'
         required: false
@@ -165,119 +160,20 @@ jobs:
           mkdir -p "$WORKDIR"
           echo "workdir=$WORKDIR" >> "$GITHUB_OUTPUT"
 
-      - name: Check for yesterday's build
-        id: prev
-        run: |
-          YESTERDAY=$(date -u -d "yesterday" +%Y-%m-%d)
-          echo "yesterday=$YESTERDAY" >> "$GITHUB_OUTPUT"
-          if rclone ls "tigris:$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/planet/" 2>/dev/null | grep -q '.bin'; then
-            echo "date=$YESTERDAY" >> "$GITHUB_OUTPUT"
-            echo "found=true" >> "$GITHUB_OUTPUT"
-            echo "Yesterday's build ($YESTERDAY) exists in Tigris"
-          else
-            echo "found=false" >> "$GITHUB_OUTPUT"
-            echo "No build for $YESTERDAY — will bootstrap"
-          fi
-
-      - name: Obtain PBF
+      - name: Download PBF
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
-          YESTERDAY: ${{ steps.prev.outputs.yesterday }}
         run: |
-          # Try yesterday's PBF from Tigris, otherwise download from mirrors
-          if rclone ls "tigris:$S3_BUCKET/$S3_PREFIX/pbf/" 2>/dev/null | grep -q "planet-${YESTERDAY}"; then
-            echo "Downloading yesterday's PBF ($YESTERDAY) from Tigris..."
-            rclone copyto "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-${YESTERDAY}.osm.pbf" \
-              "$WORKDIR/planet.osm.pbf" --progress --retries 5 --low-level-retries 10 --multi-thread-streams 16
-          else
-            echo "No PBF for $YESTERDAY in Tigris — downloading from mirrors..."
-            aria2c -x 16 -s 16 -j 16 --max-tries=3 \
-              -d "$WORKDIR" -o planet.osm.pbf \
-              "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
-              "https://ftpmirror.your.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
-              "https://ftp.osuosl.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
-              "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/planet-latest.osm.pbf"
-          fi
+          echo "Downloading planet PBF from mirrors..."
+          aria2c -x 16 -s 16 -j 16 --max-tries=3 \
+            -d "$WORKDIR" -o planet.osm.pbf \
+            "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
+            "https://ftpmirror.your.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
+            "https://ftp.osuosl.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
+            "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/planet-latest.osm.pbf"
           ls -lh "$WORKDIR/planet.osm.pbf"
 
-      # Helper: apply N days of OSM diffs using osmium apply-changes (single pass)
-      # Usage: apply_diffs <input.pbf> <output.pbf> <start_seq> <end_seq>
-      - name: "Bootstrap: bring PBF to yesterday, build + upload"
-        if: steps.prev.outputs.found != 'true'
-        id: bootstrap
-        env:
-          WORKDIR: ${{ steps.setup.outputs.workdir }}
-          YESTERDAY: ${{ steps.prev.outputs.yesterday }}
-        run: |
-          SERVER="https://planet.openstreetmap.org/replication/day"
-
-          # Get current sequence from the replication server state
-          CURRENT_SEQ=$(curl -sL "$SERVER/state.txt" | grep sequenceNumber | cut -d= -f2)
-          CURRENT_DATE=$(curl -sL "$SERVER/state.txt" | grep timestamp | cut -d= -f2 | tr '\\' ' ' | cut -dT -f1 | tr -d ' ')
-          echo "Replication server: seq=$CURRENT_SEQ date=$CURRENT_DATE"
-
-          # Get PBF's sequence by computing offset from current
-          PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
-          DAYS_BEHIND=$(( ($(date -u -d "$CURRENT_DATE" +%s) - $(date -u -d "$PBF_DATE" +%s)) / 86400 ))
-          PBF_SEQ=$((CURRENT_SEQ - DAYS_BEHIND))
-          echo "PBF: date=$PBF_DATE seq=$PBF_SEQ ($DAYS_BEHIND days behind)"
-
-          # Calculate how many diffs to reach yesterday
-          DAYS_TO_YESTERDAY=$(( ($(date -u -d "$YESTERDAY" +%s) - $(date -u -d "$PBF_DATE" +%s)) / 86400 ))
-          TARGET_SEQ=$((PBF_SEQ + DAYS_TO_YESTERDAY))
-          echo "Target: $YESTERDAY (seq $TARGET_SEQ, $DAYS_TO_YESTERDAY diffs to apply)"
-
-          if [ $DAYS_TO_YESTERDAY -le 0 ]; then
-            echo "PBF is already at or past $YESTERDAY — no diffs needed"
-          else
-            # Download all needed diffs
-            echo "Downloading $DAYS_TO_YESTERDAY daily diffs..."
-            DIFFS=""
-            for S in $(seq $((PBF_SEQ + 1)) $TARGET_SEQ); do
-              DIR1=$(printf "%03d" $((S / 1000000)))
-              DIR2=$(printf "%03d" $(((S / 1000) % 1000)))
-              FILE=$(printf "%03d" $((S % 1000)))
-              URL="$SERVER/$DIR1/$DIR2/${FILE}.osc.gz"
-              echo "  seq $S: $URL"
-              curl -sL -o "$WORKDIR/diff-${S}.osc.gz" "$URL"
-              DIFFS="$DIFFS $WORKDIR/diff-${S}.osc.gz"
-            done
-
-            # Apply all diffs in one pass (no compression for speed)
-            echo "Applying $DAYS_TO_YESTERDAY diffs in one pass..."
-            time osmium apply-changes "$WORKDIR/planet.osm.pbf" $DIFFS \
-              -o "$WORKDIR/planet-updated.osm.pbf" \
-              -f pbf,pbf_compression=none --overwrite
-            mv "$WORKDIR/planet-updated.osm.pbf" "$WORKDIR/planet.osm.pbf"
-            rm -f $WORKDIR/diff-*.osc.gz
-          fi
-
-          BOOT_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
-          echo "date=$BOOT_DATE" >> "$GITHUB_OUTPUT"
-          echo "PBF now at: $BOOT_DATE"
-
-          echo "Building yesterday's index ($BOOT_DATE)..."
-          time build-index "$WORKDIR/bootstrap-output/" "$WORKDIR/planet.osm.pbf" \
-            --continents --multi-output --multi-quality 2>&1 | tail -10
-          echo "$(find "$WORKDIR/bootstrap-output" -name "*.bin" | wc -l) bin files produced"
-
-          echo "Uploading PBF as planet-${BOOT_DATE}.osm.pbf..."
-          rclone copyto "$WORKDIR/planet.osm.pbf" \
-            "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-${BOOT_DATE}.osm.pbf" \
-            --progress --retries 5 --low-level-retries 10 --multi-thread-streams 16 \
-            --s3-upload-concurrency 8 --s3-chunk-size 64M --s3-no-check-bucket
-
-          echo "Uploading bootstrap build as $BOOT_DATE..."
-          rclone sync "$WORKDIR/bootstrap-output/" \
-            "tigris:$S3_BUCKET/$S3_PREFIX/builds/$BOOT_DATE/" \
-            --progress --transfers 32 --retries 5 --low-level-retries 10 \
-            --s3-upload-concurrency 8 --s3-chunk-size 64M --s3-no-check-bucket --checkers 32
-          rm -rf "$WORKDIR/bootstrap-output"
-
-          echo "$BOOT_DATE" | rclone rcat "tigris:$S3_BUCKET/$S3_PREFIX/builds/latest.txt"
-          echo "Bootstrap complete — yesterday's build + PBF uploaded"
-
-      - name: Apply today's diff
+      - name: Apply replication diffs
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
         run: |
@@ -288,7 +184,7 @@ jobs:
           PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
           DAYS_BEHIND=$(( ($(date -u -d "$CURRENT_DATE" +%s) - $(date -u -d "$PBF_DATE" +%s)) / 86400 ))
           PBF_SEQ=$((CURRENT_SEQ - DAYS_BEHIND))
-          echo "PBF: date=$PBF_DATE seq=$PBF_SEQ, server: date=$CURRENT_DATE seq=$CURRENT_SEQ"
+          echo "PBF: date=$PBF_DATE seq=$PBF_SEQ, server: date=$CURRENT_DATE seq=$CURRENT_SEQ ($DAYS_BEHIND days behind)"
 
           if [ $DAYS_BEHIND -le 0 ]; then
             echo "PBF is already up to date"
@@ -306,8 +202,7 @@ jobs:
 
             echo "Applying $DAYS_BEHIND diffs in one pass..."
             time osmium apply-changes "$WORKDIR/planet.osm.pbf" $DIFFS \
-              -o "$WORKDIR/planet-updated.osm.pbf" \
-              -f pbf,pbf_compression=none --overwrite
+              -o "$WORKDIR/planet-updated.osm.pbf" --overwrite
             mv "$WORKDIR/planet-updated.osm.pbf" "$WORKDIR/planet.osm.pbf"
             rm -f $WORKDIR/diff-*.osc.gz
           fi
@@ -315,15 +210,7 @@ jobs:
           PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
           echo "PBF now at: $PBF_DATE"
 
-          # Upload PBF immediately so next run can use it even if build fails
-          echo "Uploading PBF as planet-${PBF_DATE}.osm.pbf..."
-          rclone copyto "$WORKDIR/planet.osm.pbf" \
-            "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-${PBF_DATE}.osm.pbf" \
-            --progress --retries 5 --low-level-retries 10 --multi-thread-streams 16 \
-            --s3-upload-concurrency 8 --s3-chunk-size 64M --s3-no-check-bucket
-
           TODAY=$(date -u +%Y-%m-%d)
-          echo "PBF replication date: $PBF_DATE (expected: $TODAY)"
           if [ "$PBF_DATE" != "$TODAY" ]; then
             YESTERDAY=$(date -u -d "yesterday" +%Y-%m-%d)
             if [ "$PBF_DATE" = "$YESTERDAY" ]; then
@@ -347,118 +234,7 @@ jobs:
           find "$WORKDIR/output" -name "*.bin" | wc -l
           echo "bin files produced"
 
-      - name: Download previous build from S3
-        env:
-          WORKDIR: ${{ steps.setup.outputs.workdir }}
-          PREV_DATE: ${{ steps.prev.outputs.date || steps.bootstrap.outputs.date }}
-        run: |
-          echo "Downloading previous build ($PREV_DATE) from S3..."
-          rclone sync "tigris:$S3_BUCKET/$S3_PREFIX/builds/$PREV_DATE/" \
-            "$WORKDIR/prev-build/" \
-            --progress --transfers 16 --retries 5 --low-level-retries 10
-
-      - name: Generate and verify patches for all variants
-        env:
-          WORKDIR: ${{ steps.setup.outputs.workdir }}
-          PREV_DATE: ${{ steps.prev.outputs.date || steps.bootstrap.outputs.date }}
-          NEW_DATE: ${{ steps.new_build.outputs.date }}
-        run: |
-          echo "## Planet Test Results ($PREV_DATE → $NEW_DATE)" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Variant | Files | Patch Size | Verified |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---------|-------|-----------|----------|" >> "$GITHUB_STEP_SUMMARY"
-
-          RESULTS_DIR="$WORKDIR/results"
-          mkdir -p "$RESULTS_DIR"
-          VARIANTS=$(cd "$WORKDIR/output" && find . -name "*.bin" -exec dirname {} \; | sort -u | sed 's|^\./||')
-
-          # Process variants in parallel (up to nproc jobs)
-          JOBS=0
-          MAX_JOBS=$(nproc)
-          for variant in $VARIANTS; do
-            (
-              NEW_DIR="$WORKDIR/output/$variant"
-              OLD_DIR="$WORKDIR/prev-build/$variant"
-              N_NEW=$(ls "$NEW_DIR"/*.bin 2>/dev/null | wc -l)
-              N_OLD=$(ls "$OLD_DIR"/*.bin 2>/dev/null | wc -l)
-              SAFE_NAME=$(echo "$variant" | tr '/' '_')
-
-              if [ "$N_NEW" -lt 2 ]; then exit 0; fi
-              if [ "$N_OLD" -ne "$N_NEW" ]; then
-                echo "SKIP" > "$RESULTS_DIR/$SAFE_NAME"
-                exit 0
-              fi
-
-              PATCH_FILE="$WORKDIR/patch-$SAFE_NAME.gcpatch"
-              geocoder-diff "$OLD_DIR" "$NEW_DIR" -o "$PATCH_FILE" 2>/dev/null
-              PATCH_SIZE=$(stat -c%s "$PATCH_FILE" 2>/dev/null || echo 0)
-              PATCH_KB=$((PATCH_SIZE / 1024))
-
-              VERIFY_DIR="$WORKDIR/verify-$SAFE_NAME"
-              mkdir -p "$VERIFY_DIR"
-              geocoder-patch "$OLD_DIR" "$PATCH_FILE" -o "$VERIFY_DIR/" 2>/dev/null
-
-              MATCH=0
-              for f in "$NEW_DIR"/*.bin; do
-                b=$(basename "$f")
-                h1=$(md5sum "$VERIFY_DIR/$b" 2>/dev/null | awk '{print $1}')
-                h2=$(md5sum "$NEW_DIR/$b" | awk '{print $1}')
-                [ "$h1" = "$h2" ] && MATCH=$((MATCH + 1))
-              done
-
-              if [ $MATCH -eq $N_NEW ]; then
-                echo "PASS $N_NEW $PATCH_KB" > "$RESULTS_DIR/$SAFE_NAME"
-              else
-                echo "FAIL $MATCH $N_NEW $PATCH_KB" > "$RESULTS_DIR/$SAFE_NAME"
-              fi
-              rm -f "$PATCH_FILE"
-              rm -rf "$VERIFY_DIR"
-            ) &
-
-            JOBS=$((JOBS + 1))
-            if [ $JOBS -ge $MAX_JOBS ]; then
-              wait -n 2>/dev/null || true
-              JOBS=$((JOBS - 1))
-            fi
-          done
-          wait
-
-          rm -rf "$WORKDIR/prev-build"
-
-          # Collect results
-          PASS=0; FAIL=0; SKIP=0
-          for variant in $VARIANTS; do
-            SAFE_NAME=$(echo "$variant" | tr '/' '_')
-            RESULT_FILE="$RESULTS_DIR/$SAFE_NAME"
-            [ ! -f "$RESULT_FILE" ] && continue
-            RESULT=$(cat "$RESULT_FILE")
-
-            if [ "$RESULT" = "SKIP" ]; then
-              SKIP=$((SKIP + 1))
-            elif echo "$RESULT" | grep -q "^PASS"; then
-              N_NEW=$(echo "$RESULT" | awk '{print $2}')
-              PATCH_KB=$(echo "$RESULT" | awk '{print $3}')
-              echo "  $variant: PASS ($N_NEW/$N_NEW, ${PATCH_KB} KiB)"
-              echo "| $variant | $N_NEW | ${PATCH_KB} KiB | PASS |" >> "$GITHUB_STEP_SUMMARY"
-              PASS=$((PASS + 1))
-            else
-              MATCH=$(echo "$RESULT" | awk '{print $2}')
-              N_NEW=$(echo "$RESULT" | awk '{print $3}')
-              PATCH_KB=$(echo "$RESULT" | awk '{print $4}')
-              echo "::error::$variant: FAIL ($MATCH/$N_NEW match)"
-              echo "| $variant | $N_NEW | ${PATCH_KB} KiB | **FAIL** |" >> "$GITHUB_STEP_SUMMARY"
-              FAIL=$((FAIL + 1))
-            fi
-          done
-          rm -rf "$RESULTS_DIR"
-
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Total: $PASS pass, $FAIL fail, $SKIP skip**" >> "$GITHUB_STEP_SUMMARY"
-
-          echo "Results: $PASS pass, $FAIL fail, $SKIP skip"
-          [ $FAIL -gt 0 ] && exit 1 || true
-
-      - name: Upload new build to S3
+      - name: Upload build to S3
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
           NEW_DATE: ${{ steps.new_build.outputs.date }}
@@ -488,7 +264,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq cmake g++ libz-dev libzstd-dev \
-            libbz2-dev libexpat1-dev libs2-dev libosmium2-dev aria2 jq osmium-tool
+            libbz2-dev libexpat1-dev libs2-dev libosmium2-dev aria2 jq
 
       - name: Configure S3 credentials
         run: |
@@ -536,7 +312,6 @@ jobs:
         id: pbf
         env:
           INPUT_PBF_URL: ${{ inputs.pbf_url }}
-          INPUT_FORCE_FRESH: ${{ inputs.force_fresh_download }}
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
           WORKDIR="$RUNNER_TEMP/geocoder-build"
@@ -546,86 +321,17 @@ jobs:
           if [ -n "$INPUT_PBF_URL" ]; then
             echo "Downloading from override URL..."
             aria2c -x 8 -s 8 --max-tries=3 -d "$WORKDIR" -o planet.osm.pbf "$INPUT_PBF_URL"
-            echo "method=download" >> "$GITHUB_OUTPUT"
-
-          elif [ "$INPUT_FORCE_FRESH" = "true" ]; then
-            PBF_FILE=$(curl -sI "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
-              | grep -i '^location:' | awk '{print $2}' | tr -d '\r' | xargs basename)
-            echo "Downloading $PBF_FILE from multiple mirrors..."
+          else
+            echo "Downloading planet PBF from mirrors..."
             aria2c -x 16 -s 16 -j 16 --max-tries=3 \
               -d "$WORKDIR" -o planet.osm.pbf \
-              "https://planet.openstreetmap.org/pbf/$PBF_FILE" \
-              "https://ftpmirror.your.org/pub/openstreetmap/pbf/$PBF_FILE" \
-              "https://ftp.osuosl.org/pub/openstreetmap/pbf/$PBF_FILE" \
-              "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/$PBF_FILE"
-            echo "method=download" >> "$GITHUB_OUTPUT"
-
-          else
-            YESTERDAY=$(date -u -d "yesterday" +%Y-%m-%d)
-            if rclone ls "tigris:$S3_BUCKET/$S3_PREFIX/pbf/" 2>/dev/null | grep -q "planet-${YESTERDAY}"; then
-              echo "Downloading yesterday's PBF ($YESTERDAY) from Tigris..."
-              rclone copyto "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-${YESTERDAY}.osm.pbf" \
-                "$WORKDIR/planet.osm.pbf" --progress --retries 5 --low-level-retries 10 --multi-thread-streams 16
-
-              SERVER="https://planet.openstreetmap.org/replication/day"
-              CURRENT_SEQ=$(curl -sL "$SERVER/state.txt" | grep sequenceNumber | cut -d= -f2)
-              CURRENT_DATE=$(curl -sL "$SERVER/state.txt" | grep timestamp | cut -d= -f2 | tr '\\' ' ' | cut -dT -f1 | tr -d ' ')
-              PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
-              DAYS_BEHIND=$(( ($(date -u -d "$CURRENT_DATE" +%s) - $(date -u -d "$PBF_DATE" +%s)) / 86400 ))
-              PBF_SEQ=$((CURRENT_SEQ - DAYS_BEHIND))
-              echo "PBF: date=$PBF_DATE seq=$PBF_SEQ, server: seq=$CURRENT_SEQ"
-
-              if [ $DAYS_BEHIND -gt 0 ]; then
-                DIFFS=""
-                for S in $(seq $((PBF_SEQ + 1)) $CURRENT_SEQ); do
-                  DIR1=$(printf "%03d" $((S / 1000000)))
-                  DIR2=$(printf "%03d" $(((S / 1000) % 1000)))
-                  FILE=$(printf "%03d" $((S % 1000)))
-                  curl -sL -o "$WORKDIR/diff-${S}.osc.gz" "$SERVER/$DIR1/$DIR2/${FILE}.osc.gz"
-                  echo "  Downloaded seq $S"
-                  DIFFS="$DIFFS $WORKDIR/diff-${S}.osc.gz"
-                done
-                echo "Applying $DAYS_BEHIND diffs in one pass..."
-                time osmium apply-changes "$WORKDIR/planet.osm.pbf" $DIFFS \
-                  -o "$WORKDIR/planet-updated.osm.pbf" \
-                  -f pbf,pbf_compression=none --overwrite
-                mv "$WORKDIR/planet-updated.osm.pbf" "$WORKDIR/planet.osm.pbf"
-                rm -f $WORKDIR/diff-*.osc.gz
-              fi
-              echo "method=diff" >> "$GITHUB_OUTPUT"
-            else
-              echo "No PBF for $YESTERDAY in Tigris — downloading from mirrors..."
-              aria2c -x 16 -s 16 -j 16 --max-tries=3 \
-                -d "$WORKDIR" -o planet.osm.pbf \
-                "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
-                "https://ftpmirror.your.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
-                "https://ftp.osuosl.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
-                "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/planet-latest.osm.pbf"
-              echo "method=download" >> "$GITHUB_OUTPUT"
-            fi
+              "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
+              "https://ftpmirror.your.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
+              "https://ftp.osuosl.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
+              "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/planet-latest.osm.pbf"
           fi
 
           ls -lh "$WORKDIR/planet.osm.pbf"
-
-      - name: Verify PBF date
-        if: steps.meta.outputs.skip != 'true'
-        id: pbf_date
-        env:
-          WORKDIR: ${{ steps.setup.outputs.workdir }}
-        run: |
-          TODAY=$(date -u +%Y-%m-%d)
-          PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
-          echo "date=$PBF_DATE" >> "$GITHUB_OUTPUT"
-          echo "PBF replication date: $PBF_DATE (expected: $TODAY)"
-          if [ "$PBF_DATE" != "$TODAY" ]; then
-            YESTERDAY=$(date -u -d "yesterday" +%Y-%m-%d)
-            if [ "$PBF_DATE" = "$YESTERDAY" ]; then
-              echo "::warning::PBF is from yesterday ($PBF_DATE), today's diff not yet available"
-            else
-              echo "::error::PBF replication date $PBF_DATE is too old (expected $TODAY or $YESTERDAY)"
-              exit 1
-            fi
-          fi
 
       - name: Build index with all variants
         if: steps.meta.outputs.skip != 'true'
@@ -639,24 +345,11 @@ jobs:
           find "$WORKDIR/output" -name "*.bin" | wc -l
           echo "bin files across all variants"
 
-      - name: Upload PBF to S3
-        if: steps.meta.outputs.skip != 'true'
-        env:
-          WORKDIR: ${{ steps.setup.outputs.workdir }}
-          BUILD_DATE: ${{ steps.pbf_date.outputs.date || steps.meta.outputs.date }}
-        run: |
-          echo "Uploading PBF as planet-${BUILD_DATE}.osm.pbf..."
-          rclone copyto "$WORKDIR/planet.osm.pbf" \
-            "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-${BUILD_DATE}.osm.pbf" \
-            --progress --retries 5 --low-level-retries 10 --multi-thread-streams 16 \
-            --s3-upload-concurrency 8 --s3-chunk-size 64M --s3-no-check-bucket
-          rm -f "$WORKDIR/planet.osm.pbf"
-
       - name: Upload builds to S3
         if: steps.meta.outputs.skip != 'true'
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
-          BUILD_DATE: ${{ steps.pbf_date.outputs.date || steps.meta.outputs.date }}
+          BUILD_DATE: ${{ steps.meta.outputs.date }}
         run: |
           rclone sync "$WORKDIR/output/" \
             "tigris:$S3_BUCKET/$S3_PREFIX/builds/$BUILD_DATE/" \
@@ -669,7 +362,7 @@ jobs:
         if: steps.meta.outputs.skip != 'true' && inputs.skip_patch != true
         id: prev
         env:
-          CURRENT: ${{ steps.pbf_date.outputs.date || steps.meta.outputs.date }}
+          CURRENT: ${{ steps.meta.outputs.date }}
         run: |
           PREV=$(rclone lsd "tigris:$S3_BUCKET/$S3_PREFIX/builds/" 2>/dev/null \
             | awk '{print $NF}' \
@@ -683,60 +376,6 @@ jobs:
           else
             echo "found=false" >> "$GITHUB_OUTPUT"
             echo "No previous build found — will verify via second build"
-          fi
-
-      - name: Bootstrap validation (no previous build)
-        if: steps.prev.outputs.found != 'true' && steps.meta.outputs.skip != 'true' && inputs.skip_patch != true
-        env:
-          WORKDIR: ${{ steps.setup.outputs.workdir }}
-        run: |
-          echo "No previous build — building again to validate determinism + patch pipeline"
-          echo "Downloading today's PBF again..."
-
-          # Re-download the PBF we already uploaded
-          BUILD_DATE="${{ steps.pbf_date.outputs.date || steps.meta.outputs.date }}"
-          rclone copyto "tigris:$S3_BUCKET/$S3_PREFIX/pbf/planet-${BUILD_DATE}.osm.pbf" \
-            "$WORKDIR/planet-verify.osm.pbf" --progress --retries 5 --low-level-retries 10 --multi-thread-streams 16
-
-          time build-index "$WORKDIR/output2/" "$WORKDIR/planet-verify.osm.pbf" \
-            --continents --multi-output --multi-quality 2>&1 | tail -5
-          rm -f "$WORKDIR/planet-verify.osm.pbf"
-
-          echo ""
-          echo "=== Comparing builds ==="
-          FAIL=0
-          while IFS= read -r f; do
-            rel="${f#$WORKDIR/output/}"
-            if ! cmp -s "$f" "$WORKDIR/output2/$rel"; then
-              echo "::error::Bootstrap MISMATCH: $rel"
-              FAIL=1
-            fi
-          done < <(find "$WORKDIR/output" -name "*.bin")
-          rm -rf "$WORKDIR/output2"
-
-          if [ $FAIL -ne 0 ]; then
-            echo "::error::Bootstrap determinism check FAILED"
-            exit 1
-          fi
-          echo "Bootstrap determinism: PASS (two identical builds)"
-
-          # Also verify identity patch round-trip on planet variant
-          echo ""
-          echo "=== Verifying patch pipeline (identity) ==="
-          DIR="$WORKDIR/output/planet"
-          if [ -d "$DIR" ]; then
-            geocoder-diff "$DIR" "$DIR" -o "$WORKDIR/test.gcpatch" 2>/dev/null
-            mkdir -p "$WORKDIR/verify"
-            geocoder-patch "$DIR" "$WORKDIR/test.gcpatch" -o "$WORKDIR/verify/" 2>/dev/null
-            for f in "$DIR"/*.bin; do
-              b=$(basename "$f")
-              if ! cmp -s "$WORKDIR/verify/$b" "$DIR/$b"; then
-                echo "::error::Identity patch MISMATCH: $b"
-                FAIL=1
-              fi
-            done
-            rm -rf "$WORKDIR/verify" "$WORKDIR/test.gcpatch"
-            [ $FAIL -eq 0 ] && echo "Identity patch: PASS" || exit 1
           fi
 
       - name: Download previous build from S3
@@ -755,7 +394,7 @@ jobs:
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
           PREV: ${{ steps.prev.outputs.date }}
-          CURRENT: ${{ steps.pbf_date.outputs.date || steps.meta.outputs.date }}
+          CURRENT: ${{ steps.meta.outputs.date }}
         run: |
           echo "## Patch Generation ($PREV → $CURRENT)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -886,7 +525,7 @@ jobs:
       - name: Update index.json
         if: steps.meta.outputs.skip != 'true'
         env:
-          BUILD_DATE: ${{ steps.pbf_date.outputs.date || steps.meta.outputs.date }}
+          BUILD_DATE: ${{ steps.meta.outputs.date }}
         run: |
           BUILDS_JSON=$(rclone lsd "tigris:$S3_BUCKET/$S3_PREFIX/builds/" 2>/dev/null \
             | awk '{print $NF}' \
@@ -932,7 +571,7 @@ jobs:
       - name: Summary
         if: always()
         env:
-          BUILD_DATE: ${{ steps.pbf_date.outputs.date || steps.meta.outputs.date }}
+          BUILD_DATE: ${{ steps.meta.outputs.date }}
           PBF_METHOD: ${{ steps.pbf.outputs.method || 'skipped' }}
           WAS_SKIPPED: ${{ steps.meta.outputs.skip }}
         run: |
