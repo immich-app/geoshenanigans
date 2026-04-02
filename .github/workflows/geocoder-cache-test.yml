@@ -1,5 +1,9 @@
 name: Test Local S3 Cache
 
+concurrency:
+  group: geocoder-cache-test
+  cancel-in-progress: true
+
 on:
   push:
     paths:
