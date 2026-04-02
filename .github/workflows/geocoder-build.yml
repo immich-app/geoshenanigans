@@ -237,11 +237,29 @@ jobs:
                 DIFFS="$DIFFS $WORKDIR/diff-${S}.osc.gz"
               done
 
-              echo "Applying $DAYS_TO_YESTERDAY diffs in one pass..."
-              time osmium apply-changes "$WORKDIR/planet.osm.pbf" $DIFFS \
-                -o "$WORKDIR/planet-tmp.osm.pbf" --overwrite
-              mv "$WORKDIR/planet-tmp.osm.pbf" "$WORKDIR/planet.osm.pbf"
-              rm -f $DIFFS
+              echo "Applying $DAYS_TO_YESTERDAY diffs in batches of 3..."
+              BATCH=""
+              COUNT=0
+              for D in $DIFFS; do
+                BATCH="$BATCH $D"
+                COUNT=$((COUNT + 1))
+                if [ $COUNT -ge 3 ]; then
+                  echo "  Applying batch ($COUNT diffs)..."
+                  osmium apply-changes "$WORKDIR/planet.osm.pbf" $BATCH \
+                    -o "$WORKDIR/planet-tmp.osm.pbf" --overwrite
+                  mv "$WORKDIR/planet-tmp.osm.pbf" "$WORKDIR/planet.osm.pbf"
+                  rm -f $BATCH
+                  BATCH=""
+                  COUNT=0
+                fi
+              done
+              if [ -n "$BATCH" ]; then
+                echo "  Applying final batch ($COUNT diffs)..."
+                osmium apply-changes "$WORKDIR/planet.osm.pbf" $BATCH \
+                  -o "$WORKDIR/planet-tmp.osm.pbf" --overwrite
+                mv "$WORKDIR/planet-tmp.osm.pbf" "$WORKDIR/planet.osm.pbf"
+                rm -f $BATCH
+              fi
             fi
 
             # Cache yesterday's PBF
