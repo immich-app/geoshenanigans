@@ -5,6 +5,14 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 on:
+  schedule:
+    # Daily at 06:00 UTC
+    - cron: '0 6 * * *'
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - 'geocoder/**'
+      - '.github/workflows/geocoder-build.yml'
   workflow_dispatch:
     inputs:
       pbf_url:
