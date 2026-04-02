@@ -24,13 +24,16 @@ jobs:
       - name: Debug env
         run: |
           echo "BUCKET_HOST=${BUCKET_HOST:-NOT SET}"
+          echo "BUCKET_PORT=${BUCKET_PORT:-NOT SET}"
           echo "BUCKET_NAME=${BUCKET_NAME:-NOT SET}"
           echo "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:+SET}"
           echo "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:+SET}"
+          echo "Testing connectivity..."
+          curl -sv --max-time 5 "http://${BUCKET_HOST}:${BUCKET_PORT}/" 2>&1 | head -20 || echo "curl failed"
 
       - name: Test cache operations
         run: |
-          ENDPOINT="http://${BUCKET_HOST}:80"
+          ENDPOINT="http://${BUCKET_HOST}:${BUCKET_PORT}"
           echo "Endpoint: $ENDPOINT"
           echo "Bucket: $BUCKET_NAME"
 
