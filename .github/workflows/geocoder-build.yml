@@ -206,44 +206,14 @@ jobs:
             done
           fi
 
-      - name: Apply diffs to yesterday + build
-        id: old_build
+      - name: Apply diffs to yesterday
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
           PBF_SEQ: ${{ steps.diffs.outputs.pbf_seq }}
           YESTERDAY_SEQ: ${{ steps.diffs.outputs.yesterday_seq }}
         run: |
-          # Apply diffs one at a time to limit memory usage
-          cp "$WORKDIR/planet.osm.pbf" "$WORKDIR/planet-yesterday.osm.pbf"
+          # Apply diffs one at a time, in-place, no copies
           for S in $(seq $((PBF_SEQ + 1)) $YESTERDAY_SEQ); do
-            F="$WORKDIR/diff-${S}.osc.gz"
-            if [ -f "$F" ]; then
-              echo "Applying seq $S..."
-              osmium apply-changes "$WORKDIR/planet-yesterday.osm.pbf" "$F" \
-                -o "$WORKDIR/planet-tmp.osm.pbf" --overwrite
-              mv "$WORKDIR/planet-tmp.osm.pbf" "$WORKDIR/planet-yesterday.osm.pbf"
-            fi
-          done
-
-          OLD_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet-yesterday.osm.pbf" | cut -dT -f1)
-          echo "date=$OLD_DATE" >> "$GITHUB_OUTPUT"
-          echo "Yesterday's PBF at: $OLD_DATE"
-
-          echo "Building yesterday's index ($OLD_DATE)..."
-          time build-index "$WORKDIR/old-output/" "$WORKDIR/planet-yesterday.osm.pbf" \
-            --continents --multi-output --multi-quality 2>&1 | tail -10
-          rm -f "$WORKDIR/planet-yesterday.osm.pbf"
-          echo "$(find "$WORKDIR/old-output" -name "*.bin" | wc -l) bin files produced"
-
-      - name: Apply diffs to today + build
-        id: new_build
-        env:
-          WORKDIR: ${{ steps.setup.outputs.workdir }}
-          PBF_SEQ: ${{ steps.diffs.outputs.pbf_seq }}
-          TODAY_SEQ: ${{ steps.diffs.outputs.today_seq }}
-        run: |
-          # Apply all diffs one at a time
-          for S in $(seq $((PBF_SEQ + 1)) $TODAY_SEQ); do
             F="$WORKDIR/diff-${S}.osc.gz"
             if [ -f "$F" ]; then
               echo "Applying seq $S..."
@@ -253,11 +223,45 @@ jobs:
               rm -f "$F"
             fi
           done
+          PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
+          echo "PBF now at: $PBF_DATE"
 
+      - name: Build yesterday's index
+        id: old_build
+        env:
+          WORKDIR: ${{ steps.setup.outputs.workdir }}
+        run: |
+          OLD_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
+          echo "date=$OLD_DATE" >> "$GITHUB_OUTPUT"
+          echo "Building yesterday's index ($OLD_DATE)..."
+          time build-index "$WORKDIR/old-output/" "$WORKDIR/planet.osm.pbf" \
+            --continents --multi-output --multi-quality 2>&1 | tail -10
+          echo "$(find "$WORKDIR/old-output" -name "*.bin" | wc -l) bin files produced"
+
+      - name: Apply today's diff
+        env:
+          WORKDIR: ${{ steps.setup.outputs.workdir }}
+          YESTERDAY_SEQ: ${{ steps.diffs.outputs.yesterday_seq }}
+          TODAY_SEQ: ${{ steps.diffs.outputs.today_seq }}
+        run: |
+          F="$WORKDIR/diff-${TODAY_SEQ}.osc.gz"
+          if [ -f "$F" ]; then
+            echo "Applying today's diff (seq $TODAY_SEQ)..."
+            osmium apply-changes "$WORKDIR/planet.osm.pbf" "$F" \
+              -o "$WORKDIR/planet-tmp.osm.pbf" --overwrite
+            mv "$WORKDIR/planet-tmp.osm.pbf" "$WORKDIR/planet.osm.pbf"
+            rm -f "$F"
+          fi
+          PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
+          echo "PBF now at: $PBF_DATE"
+
+      - name: Build today's index
+        id: new_build
+        env:
+          WORKDIR: ${{ steps.setup.outputs.workdir }}
+        run: |
           NEW_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" | cut -dT -f1)
           echo "date=$NEW_DATE" >> "$GITHUB_OUTPUT"
-          echo "Today's PBF at: $NEW_DATE"
-
           echo "Building today's index ($NEW_DATE)..."
           time build-index "$WORKDIR/output/" "$WORKDIR/planet.osm.pbf" \
             --continents --multi-output --multi-quality 2>&1 | tail -10
