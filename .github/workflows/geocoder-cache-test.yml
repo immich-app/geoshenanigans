@@ -14,48 +14,48 @@ jobs:
     runs-on: pokedex-giant
     timeout-minutes: 5
     steps:
-      - name: Setup rclone
-        uses: AnimMouse/setup-rclone@26ef2133e09fd383329a1d4c1fbe6a71db1976c9 # v1.12.0
-        with:
-          disable_base64: true
-          rclone_config: |
-            [cache]
-            type = s3
-            provider = Other
-            region = auto
-            endpoint = http://${{ env.BUCKET_HOST }}:80
-            access_key_id = ${{ env.AWS_ACCESS_KEY_ID }}
-            secret_access_key = ${{ env.AWS_SECRET_KEY_ID }}
+      - name: Install s5cmd
+        run: |
+          curl -sL "https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-64bit.tar.gz" \
+            -o /tmp/s5cmd.tar.gz
+          sudo tar xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd
+          s5cmd version
 
       - name: Debug env
         run: |
           echo "BUCKET_HOST=${BUCKET_HOST:-NOT SET}"
           echo "BUCKET_NAME=${BUCKET_NAME:-NOT SET}"
-          echo "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:+SET (hidden)}"
-          echo "AWS_SECRET_KEY_ID=${AWS_SECRET_KEY_ID:+SET (hidden)}"
+          echo "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:+SET}"
+          echo "AWS_SECRET_KEY_ID=${AWS_SECRET_KEY_ID:+SET}"
 
       - name: Test cache operations
         run: |
+          ENDPOINT="http://${BUCKET_HOST}:80"
+          echo "Endpoint: $ENDPOINT"
+          echo "Bucket: $BUCKET_NAME"
+
+          # s5cmd uses AWS_ACCESS_KEY_ID by default
+          # Set AWS_SECRET_ACCESS_KEY from the container's env var name
+          export AWS_SECRET_ACCESS_KEY="$AWS_SECRET_KEY_ID"
+
           echo "test-$(date -u +%Y%m%d%H%M%S)" > /tmp/test.txt
 
           echo "=== List bucket ==="
-          rclone lsd "cache:$BUCKET_NAME/" || echo "List failed (bucket may be empty)"
+          s5cmd --endpoint-url "$ENDPOINT" ls "s3://$BUCKET_NAME/" || echo "Bucket empty or list failed"
 
           echo "=== Upload ==="
-          rclone copyto /tmp/test.txt "cache:$BUCKET_NAME/geocoder-cache/test.txt" \
-            --retries 3
+          s5cmd --endpoint-url "$ENDPOINT" cp /tmp/test.txt "s3://$BUCKET_NAME/geocoder-cache/test.txt"
           echo "Upload OK"
 
           echo "=== List ==="
-          rclone ls "cache:$BUCKET_NAME/geocoder-cache/"
+          s5cmd --endpoint-url "$ENDPOINT" ls "s3://$BUCKET_NAME/geocoder-cache/"
           echo "List OK"
 
           echo "=== Download ==="
-          rclone copyto "cache:$BUCKET_NAME/geocoder-cache/test.txt" /tmp/test-dl.txt \
-            --retries 3
+          s5cmd --endpoint-url "$ENDPOINT" cp "s3://$BUCKET_NAME/geocoder-cache/test.txt" /tmp/test-dl.txt
           diff /tmp/test.txt /tmp/test-dl.txt
           echo "Download + verify OK"
 
           echo "=== Cleanup ==="
-          rclone delete "cache:$BUCKET_NAME/geocoder-cache/test.txt"
+          s5cmd --endpoint-url "$ENDPOINT" rm "s3://$BUCKET_NAME/geocoder-cache/test.txt"
           echo "Done"
