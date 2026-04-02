@@ -127,14 +127,6 @@ jobs:
             -o /tmp/s5cmd.tar.gz
           sudo tar xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd
 
-      - name: Configure Tigris credentials
-        run: |
-          echo "TIGRIS_ACCESS_KEY_ID=$S3_ACCESS_KEY_ID" >> "$GITHUB_ENV"
-          echo "TIGRIS_SECRET_ACCESS_KEY=$S3_SECRET_ACCESS_KEY" >> "$GITHUB_ENV"
-        env:
-          S3_ACCESS_KEY_ID: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
-          S3_SECRET_ACCESS_KEY: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
-
       - name: Setup rclone
         uses: AnimMouse/setup-rclone@26ef2133e09fd383329a1d4c1fbe6a71db1976c9 # v1.12.0
         with:
@@ -193,28 +185,13 @@ jobs:
           YESTERDAY_SEQ: ${{ steps.dates.outputs.yesterday_seq }}
           TODAY_SEQ: ${{ steps.dates.outputs.today_seq }}
         run: |
-          echo "Cache endpoint: $CACHE_ENDPOINT"
-          echo "Cache bucket: $CACHE_BUCKET"
-          echo "AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:+SET (${#AWS_ACCESS_KEY_ID} chars)}"
-          echo "AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:+SET (${#AWS_SECRET_ACCESS_KEY} chars)}"
-          echo "AWS_SECRET_KEY_ID: ${AWS_SECRET_KEY_ID:+SET (${#AWS_SECRET_KEY_ID} chars)}"
-
-          # Map container env var if needed
-          if [ -z "$AWS_SECRET_ACCESS_KEY" ] && [ -n "$AWS_SECRET_KEY_ID" ]; then
-            echo "Mapping AWS_SECRET_KEY_ID → AWS_SECRET_ACCESS_KEY"
-            export AWS_SECRET_ACCESS_KEY="$AWS_SECRET_KEY_ID"
-          fi
-
           CACHE="s5cmd --endpoint-url $CACHE_ENDPOINT"
           CACHE_PBF="s3://$CACHE_BUCKET/geocoder-cache/planet-${YESTERDAY}.osm.pbf"
+          echo "Cache: $CACHE_ENDPOINT / $CACHE_BUCKET"
           echo "Looking for: $CACHE_PBF"
 
-          # Quick test: list bucket root
-          echo "Testing cache connectivity..."
-          $CACHE ls "s3://$CACHE_BUCKET/" 2>&1 | head -3 || echo "ls failed"
-
           # Check cache for yesterday's PBF
-          if $CACHE ls "$CACHE_PBF" 2>&1 | grep -q "planet-"; then
+          if $CACHE ls "$CACHE_PBF" 2>/dev/null | grep -q "planet-"; then
             echo "Cache HIT: yesterday's PBF ($YESTERDAY)"
             START=$(date +%s)
             $CACHE cp "$CACHE_PBF" "$WORKDIR/planet.osm.pbf"
@@ -494,14 +471,6 @@ jobs:
           sudo apt-get install -y -qq cmake g++ libz-dev libzstd-dev \
             libbz2-dev libexpat1-dev libs2-dev libosmium2-dev aria2 jq
 
-      - name: Configure S3 credentials
-        run: |
-          echo "AWS_ACCESS_KEY_ID=$S3_ACCESS_KEY_ID" >> "$GITHUB_ENV"
-          echo "AWS_SECRET_ACCESS_KEY=$S3_SECRET_ACCESS_KEY" >> "$GITHUB_ENV"
-        env:
-          S3_ACCESS_KEY_ID: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
-          S3_SECRET_ACCESS_KEY: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
-
       - name: Setup rclone
         uses: AnimMouse/setup-rclone@26ef2133e09fd383329a1d4c1fbe6a71db1976c9 # v1.12.0
         with:
@@ -512,7 +481,9 @@ jobs:
             provider = Other
             region = auto
             endpoint = https://fly.storage.tigris.dev
-            env_auth = true
+            env_auth = false
+            access_key_id = ${{ secrets.TIGRIS_WRITE_KEY_ID }}
+            secret_access_key = ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
 
       - name: Build tools
         run: |
