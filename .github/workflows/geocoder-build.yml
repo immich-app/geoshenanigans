@@ -193,14 +193,28 @@ jobs:
           YESTERDAY_SEQ: ${{ steps.dates.outputs.yesterday_seq }}
           TODAY_SEQ: ${{ steps.dates.outputs.today_seq }}
         run: |
-          CACHE="s5cmd --endpoint-url $CACHE_ENDPOINT"
-          CACHE_PBF="s3://$CACHE_BUCKET/geocoder-cache/planet-${YESTERDAY}.osm.pbf"
           echo "Cache endpoint: $CACHE_ENDPOINT"
           echo "Cache bucket: $CACHE_BUCKET"
+          echo "AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:+SET (${#AWS_ACCESS_KEY_ID} chars)}"
+          echo "AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:+SET (${#AWS_SECRET_ACCESS_KEY} chars)}"
+          echo "AWS_SECRET_KEY_ID: ${AWS_SECRET_KEY_ID:+SET (${#AWS_SECRET_KEY_ID} chars)}"
+
+          # Map container env var if needed
+          if [ -z "$AWS_SECRET_ACCESS_KEY" ] && [ -n "$AWS_SECRET_KEY_ID" ]; then
+            echo "Mapping AWS_SECRET_KEY_ID → AWS_SECRET_ACCESS_KEY"
+            export AWS_SECRET_ACCESS_KEY="$AWS_SECRET_KEY_ID"
+          fi
+
+          CACHE="s5cmd --endpoint-url $CACHE_ENDPOINT"
+          CACHE_PBF="s3://$CACHE_BUCKET/geocoder-cache/planet-${YESTERDAY}.osm.pbf"
           echo "Looking for: $CACHE_PBF"
 
+          # Quick test: list bucket root
+          echo "Testing cache connectivity..."
+          $CACHE ls "s3://$CACHE_BUCKET/" 2>&1 | head -3 || echo "ls failed"
+
           # Check cache for yesterday's PBF
-          if timeout 15 $CACHE ls "$CACHE_PBF" 2>/dev/null | grep -q "planet-"; then
+          if $CACHE ls "$CACHE_PBF" 2>&1 | grep -q "planet-"; then
             echo "Cache HIT: yesterday's PBF ($YESTERDAY)"
             START=$(date +%s)
             $CACHE cp "$CACHE_PBF" "$WORKDIR/planet.osm.pbf"
