@@ -200,7 +200,7 @@ jobs:
           echo "Looking for: $CACHE_PBF"
 
           # Check cache for yesterday's PBF
-          if $CACHE ls "$CACHE_PBF" 2>/dev/null | grep -q "planet-"; then
+          if timeout 15 $CACHE ls "$CACHE_PBF" 2>/dev/null | grep -q "planet-"; then
             echo "Cache HIT: yesterday's PBF ($YESTERDAY)"
             START=$(date +%s)
             $CACHE cp "$CACHE_PBF" "$WORKDIR/planet.osm.pbf"
@@ -300,7 +300,7 @@ jobs:
           CACHE="s5cmd --endpoint-url $CACHE_ENDPOINT"
           CACHE_PBF="s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf"
 
-          if $CACHE ls "$CACHE_PBF" 2>/dev/null | grep -q "planet-"; then
+          if timeout 15 $CACHE ls "$CACHE_PBF" 2>/dev/null | grep -q "planet-"; then
             echo "Cache HIT: today's PBF ($TODAY)"
             START=$(date +%s)
             $CACHE cp "$CACHE_PBF" "$WORKDIR/planet.osm.pbf"
