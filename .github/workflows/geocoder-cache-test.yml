@@ -25,13 +25,22 @@ jobs:
           sudo tar xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd
           s5cmd version
 
-      - name: Debug env
+      - name: Debug env + connectivity
         run: |
           echo "BUCKET_HOST=${BUCKET_HOST:-NOT SET}"
           echo "BUCKET_PORT=${BUCKET_PORT:-NOT SET}"
           echo "BUCKET_NAME=${BUCKET_NAME:-NOT SET}"
           echo "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:+SET (${#AWS_ACCESS_KEY_ID} chars)}"
           echo "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:+SET (${#AWS_SECRET_ACCESS_KEY} chars)}"
+          echo ""
+          echo "=== DNS resolve ==="
+          getent hosts "$BUCKET_HOST" || echo "DNS failed"
+          echo ""
+          echo "=== TCP connect ==="
+          timeout 5 bash -c "echo > /dev/tcp/$BUCKET_HOST/$BUCKET_PORT" 2>&1 && echo "TCP OK" || echo "TCP FAILED"
+          echo ""
+          echo "=== HTTP check ==="
+          curl -sv --max-time 5 "http://${BUCKET_HOST}:${BUCKET_PORT}/" 2>&1 | head -15
 
       - name: Test cache operations
         run: |
