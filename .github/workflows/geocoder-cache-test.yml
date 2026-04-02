@@ -26,17 +26,13 @@ jobs:
           echo "BUCKET_HOST=${BUCKET_HOST:-NOT SET}"
           echo "BUCKET_NAME=${BUCKET_NAME:-NOT SET}"
           echo "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:+SET}"
-          echo "AWS_SECRET_KEY_ID=${AWS_SECRET_KEY_ID:+SET}"
+          echo "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:+SET}"
 
       - name: Test cache operations
         run: |
           ENDPOINT="http://${BUCKET_HOST}:80"
           echo "Endpoint: $ENDPOINT"
           echo "Bucket: $BUCKET_NAME"
-
-          # s5cmd uses AWS_ACCESS_KEY_ID by default
-          # Set AWS_SECRET_ACCESS_KEY from the container's env var name
-          export AWS_SECRET_ACCESS_KEY="$AWS_SECRET_KEY_ID"
 
           echo "test-$(date -u +%Y%m%d%H%M%S)" > /tmp/test.txt
 
