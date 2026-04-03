@@ -1,0 +1,129 @@
+name: S3 Benchmark
+
+concurrency:
+  group: s3-bench
+  cancel-in-progress: true
+
+on:
+  push:
+    paths:
+      - '.github/workflows/geocoder-s3-bench.yml'
+  workflow_dispatch:
+
+env:
+  S3_BUCKET: geoshenanigans-reverse-geocoding
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: pokedex-giant
+    timeout-minutes: 30
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq bc
+          curl -sL "https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-64bit.tar.gz" \
+            -o /tmp/s5cmd.tar.gz
+          sudo tar xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd
+
+      - name: Setup credentials
+        run: |
+          echo "TIGRIS_KEY_ID=$KEY_ID" >> "$GITHUB_ENV"
+          echo "TIGRIS_SECRET=$SECRET" >> "$GITHUB_ENV"
+        env:
+          KEY_ID: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
+          SECRET: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
+
+      - name: Generate test files
+        run: |
+          mkdir -p /tmp/bench-data/odd /tmp/bench-data/even
+          echo "Generating 30 x 100MB files..."
+          for i in $(seq -w 1 30); do
+            dd if=/dev/urandom of="/tmp/bench-data/file-${i}.bin" bs=1M count=100 2>/dev/null
+            N=$((10#$i))
+            if [ $((N % 2)) -eq 1 ]; then
+              ln "/tmp/bench-data/file-${i}.bin" "/tmp/bench-data/odd/file-${i}.bin"
+            else
+              ln "/tmp/bench-data/file-${i}.bin" "/tmp/bench-data/even/file-${i}.bin"
+            fi
+          done
+          echo "Total: $(du -sh /tmp/bench-data/*.bin | tail -1)"
+
+      - name: Benchmark
+        run: |
+          RUNS=5
+          TOTAL_MB=3000
+          FLY="https://fly.storage.tigris.dev"
+          T3="https://t3.storage.dev"
+          PREFIX="s3://$S3_BUCKET/bench-test"
+
+          export AWS_ACCESS_KEY_ID="$TIGRIS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$TIGRIS_SECRET"
+
+          s5() { s5cmd --endpoint-url "$1" "${@:2}"; }
+          cleanup() { s5 "$FLY" rm "${PREFIX}/*" 2>/dev/null || true; }
+
+          echo "## S3 Dual Endpoint Benchmark ($RUNS runs, 30 x 100MB = 3GB)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Test | Direction | Avg MB/s | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|------|-----------|----------|-------|-------|-------|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+
+          run_test() {
+            local LABEL=$1 UP_CMD=$2 DL_CMD=$3
+            local UP_TIMES="" DL_TIMES=""
+
+            echo ""
+            echo "=== $LABEL ==="
+            for RUN in $(seq 1 $RUNS); do
+              cleanup
+
+              START=$(date +%s)
+              eval "$UP_CMD"
+              END=$(date +%s)
+              UP_T=$((END - START))
+              echo "  Run $RUN upload: ${UP_T}s ($(echo "scale=1; $TOTAL_MB/$UP_T" | bc) MB/s)"
+              UP_TIMES="$UP_TIMES $UP_T"
+
+              rm -rf /tmp/bench-dl && mkdir -p /tmp/bench-dl
+              START=$(date +%s)
+              eval "$DL_CMD"
+              END=$(date +%s)
+              DL_T=$((END - START))
+              echo "  Run $RUN download: ${DL_T}s ($(echo "scale=1; $TOTAL_MB/$DL_T" | bc) MB/s)"
+              DL_TIMES="$DL_TIMES $DL_T"
+              rm -rf /tmp/bench-dl
+            done
+            cleanup
+
+            local UP_AVG=$(echo $UP_TIMES | tr ' ' '\n' | awk '{s+=$1} END {printf "%.0f", s/NR}')
+            local DL_AVG=$(echo $DL_TIMES | tr ' ' '\n' | awk '{s+=$1} END {printf "%.0f", s/NR}')
+            echo "$LABEL upload: avg ${UP_AVG}s ($(echo "scale=1; $TOTAL_MB/$UP_AVG" | bc) MB/s)"
+            echo "$LABEL download: avg ${DL_AVG}s ($(echo "scale=1; $TOTAL_MB/$DL_AVG" | bc) MB/s)"
+
+            echo "| $LABEL | upload | **$(echo "scale=1; $TOTAL_MB/$UP_AVG" | bc)** |$(for T in $UP_TIMES; do printf " %s |" "$(echo "scale=1; $TOTAL_MB/$T" | bc)"; done)" >> "$GITHUB_STEP_SUMMARY"
+            echo "| $LABEL | download | **$(echo "scale=1; $TOTAL_MB/$DL_AVG" | bc)** |$(for T in $DL_TIMES; do printf " %s |" "$(echo "scale=1; $TOTAL_MB/$T" | bc)"; done)" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          # Single endpoint: fly
+          run_test "s5cmd fly only" \
+            "s5 $FLY sync /tmp/bench-data/*.bin ${PREFIX}/" \
+            "s5 $FLY sync ${PREFIX}/'*' /tmp/bench-dl/"
+
+          # Single endpoint: t3
+          run_test "s5cmd t3 only" \
+            "s5 $T3 sync /tmp/bench-data/*.bin ${PREFIX}/" \
+            "s5 $T3 sync ${PREFIX}/'*' /tmp/bench-dl/"
+
+          # Dual endpoint: split odd/even across fly and t3
+          run_test "s5cmd dual (fly+t3)" \
+            "s5 $FLY sync /tmp/bench-data/odd/ ${PREFIX}/ & s5 $T3 sync /tmp/bench-data/even/ ${PREFIX}/ & wait" \
+            "s5 $FLY sync ${PREFIX}/'*' /tmp/bench-dl/ & s5 $T3 sync ${PREFIX}/'*' /tmp/bench-dl/ & wait"
+
+          # Best combo: upload via t3, download via fly
+          run_test "s5cmd t3 up / fly down" \
+            "s5 $T3 sync /tmp/bench-data/*.bin ${PREFIX}/" \
+            "s5 $FLY sync ${PREFIX}/'*' /tmp/bench-dl/"
+
+          rm -rf /tmp/bench-data
