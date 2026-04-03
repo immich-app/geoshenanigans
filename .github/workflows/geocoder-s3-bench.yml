@@ -1,0 +1,123 @@
+name: S3 Benchmark
+
+concurrency:
+  group: s3-bench
+  cancel-in-progress: true
+
+on:
+  push:
+    paths:
+      - '.github/workflows/geocoder-s3-bench.yml'
+  workflow_dispatch:
+
+env:
+  S3_BUCKET: geoshenanigans-reverse-geocoding
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: pokedex-giant
+    timeout-minutes: 30
+    steps:
+      - name: Setup rclone
+        uses: AnimMouse/setup-rclone@26ef2133e09fd383329a1d4c1fbe6a71db1976c9 # v1.12.0
+        with:
+          disable_base64: true
+          rclone_config: |
+            [tigris-fly]
+            type = s3
+            provider = Other
+            region = auto
+            endpoint = https://fly.storage.tigris.dev
+            env_auth = false
+            access_key_id = ${{ secrets.TIGRIS_WRITE_KEY_ID }}
+            secret_access_key = ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
+            [tigris-t3]
+            type = s3
+            provider = Other
+            region = auto
+            endpoint = https://t3.storage.dev
+            env_auth = false
+            access_key_id = ${{ secrets.TIGRIS_WRITE_KEY_ID }}
+            secret_access_key = ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
+
+      - name: Generate test files
+        run: |
+          mkdir -p /tmp/bench-data
+          echo "Generating 30 x 100MB files..."
+          for i in $(seq -w 1 30); do
+            dd if=/dev/urandom of="/tmp/bench-data/file-${i}.bin" bs=1M count=100 2>/dev/null
+          done
+          echo "Total: $(du -sh /tmp/bench-data | awk '{print $1}')"
+
+      - name: Benchmark fly.storage.tigris.dev
+        run: |
+          echo "=== fly.storage.tigris.dev ==="
+          REMOTE="tigris-fly:$S3_BUCKET/bench-test"
+
+          echo "--- Upload (30 x 100MB, parallel) ---"
+          START=$(date +%s)
+          rclone sync /tmp/bench-data/ "$REMOTE/" \
+            --transfers 30 --checkers 30 \
+            --s3-upload-concurrency 8 --s3-chunk-size 64M --s3-no-check-bucket
+          END=$(date +%s)
+          ELAPSED=$((END - START))
+          echo "Upload: ${ELAPSED}s ($(echo "scale=1; 3000/$ELAPSED" | bc) MB/s)"
+
+          echo "--- Download (30 x 100MB, parallel) ---"
+          START=$(date +%s)
+          rclone sync "$REMOTE/" /tmp/bench-dl-fly/ \
+            --transfers 30 --checkers 30
+          END=$(date +%s)
+          ELAPSED=$((END - START))
+          echo "Download: ${ELAPSED}s ($(echo "scale=1; 3000/$ELAPSED" | bc) MB/s)"
+
+          echo "--- Verify ---"
+          for i in $(seq -w 1 30); do
+            if ! cmp -s "/tmp/bench-data/file-${i}.bin" "/tmp/bench-dl-fly/file-${i}.bin"; then
+              echo "MISMATCH: file-${i}.bin"
+              exit 1
+            fi
+          done
+          echo "All files verified"
+
+          echo "--- Cleanup ---"
+          rclone purge "$REMOTE/"
+          rm -rf /tmp/bench-dl-fly
+
+      - name: Benchmark t3.storage.dev
+        run: |
+          echo "=== t3.storage.dev ==="
+          REMOTE="tigris-t3:$S3_BUCKET/bench-test"
+
+          echo "--- Upload (30 x 100MB, parallel) ---"
+          START=$(date +%s)
+          rclone sync /tmp/bench-data/ "$REMOTE/" \
+            --transfers 30 --checkers 30 \
+            --s3-upload-concurrency 8 --s3-chunk-size 64M --s3-no-check-bucket
+          END=$(date +%s)
+          ELAPSED=$((END - START))
+          echo "Upload: ${ELAPSED}s ($(echo "scale=1; 3000/$ELAPSED" | bc) MB/s)"
+
+          echo "--- Download (30 x 100MB, parallel) ---"
+          START=$(date +%s)
+          rclone sync "$REMOTE/" /tmp/bench-dl-t3/ \
+            --transfers 30 --checkers 30
+          END=$(date +%s)
+          ELAPSED=$((END - START))
+          echo "Download: ${ELAPSED}s ($(echo "scale=1; 3000/$ELAPSED" | bc) MB/s)"
+
+          echo "--- Verify ---"
+          for i in $(seq -w 1 30); do
+            if ! cmp -s "/tmp/bench-data/file-${i}.bin" "/tmp/bench-dl-t3/file-${i}.bin"; then
+              echo "MISMATCH: file-${i}.bin"
+              exit 1
+            fi
+          done
+          echo "All files verified"
+
+          echo "--- Cleanup ---"
+          rclone purge "$REMOTE/"
+          rm -rf /tmp/bench-dl-t3 /tmp/bench-data
