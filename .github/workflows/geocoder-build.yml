@@ -5,9 +5,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 on:
-  schedule:
-    # Daily at 06:00 UTC (disabled until cache is validated)
-    # - cron: '0 6 * * *'
+  # schedule:
+  #   - cron: '0 6 * * *'
   pull_request:
     types: [opened, synchronize, reopened, labeled]
     paths:
