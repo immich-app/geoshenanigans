@@ -19,7 +19,7 @@ permissions:
 jobs:
   bench:
     runs-on: pokedex-giant
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Install tools
         run: |
@@ -28,7 +28,29 @@ jobs:
             -o /tmp/s5cmd.tar.gz
           sudo tar xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd
 
-      - name: Setup credentials
+      - name: Setup credentials + rclone
+        uses: AnimMouse/setup-rclone@26ef2133e09fd383329a1d4c1fbe6a71db1976c9 # v1.12.0
+        with:
+          disable_base64: true
+          rclone_config: |
+            [tigris-fly]
+            type = s3
+            provider = Other
+            region = auto
+            endpoint = https://fly.storage.tigris.dev
+            env_auth = false
+            access_key_id = ${{ secrets.TIGRIS_WRITE_KEY_ID }}
+            secret_access_key = ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
+            [tigris-t3]
+            type = s3
+            provider = Other
+            region = auto
+            endpoint = https://t3.storage.dev
+            env_auth = false
+            access_key_id = ${{ secrets.TIGRIS_WRITE_KEY_ID }}
+            secret_access_key = ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
+
+      - name: Setup s5cmd credentials
         run: |
           echo "TIGRIS_KEY_ID=$KEY_ID" >> "$GITHUB_ENV"
           echo "TIGRIS_SECRET=$SECRET" >> "$GITHUB_ENV"
@@ -49,9 +71,9 @@ jobs:
               ln "/tmp/bench-data/file-${i}.bin" "/tmp/bench-data/even/file-${i}.bin"
             fi
           done
-          echo "Total: $(du -sh /tmp/bench-data/*.bin | tail -1)"
+          echo "Total: 3 GiB"
 
-      - name: Benchmark
+      - name: "Phase 1: Endpoint comparison"
         run: |
           RUNS=5
           TOTAL_MB=3000
@@ -62,68 +84,155 @@ jobs:
           export AWS_ACCESS_KEY_ID="$TIGRIS_KEY_ID"
           export AWS_SECRET_ACCESS_KEY="$TIGRIS_SECRET"
 
-          s5() { s5cmd --endpoint-url "$1" "${@:2}"; }
-          cleanup() { s5 "$FLY" rm "${PREFIX}/*" 2>/dev/null || true; }
-
-          echo "## S3 Dual Endpoint Benchmark ($RUNS runs, 30 x 100MB = 3GB)" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Test | Direction | Avg MB/s | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|------|-----------|----------|-------|-------|-------|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          cleanup() { s5cmd --endpoint-url "$FLY" rm "${PREFIX}/*" 2>/dev/null || true; }
 
           run_test() {
             local LABEL=$1 UP_CMD=$2 DL_CMD=$3
             local UP_TIMES="" DL_TIMES=""
 
-            echo ""
-            echo "=== $LABEL ==="
             for RUN in $(seq 1 $RUNS); do
               cleanup
-
-              START=$(date +%s)
-              eval "$UP_CMD"
-              END=$(date +%s)
+              START=$(date +%s); eval "$UP_CMD"; END=$(date +%s)
               UP_T=$((END - START))
-              echo "  Run $RUN upload: ${UP_T}s ($(echo "scale=1; $TOTAL_MB/$UP_T" | bc) MB/s)"
+              echo "  $LABEL run $RUN upload: ${UP_T}s ($(echo "scale=1; $TOTAL_MB/$UP_T" | bc) MB/s)"
               UP_TIMES="$UP_TIMES $UP_T"
 
               rm -rf /tmp/bench-dl && mkdir -p /tmp/bench-dl
-              START=$(date +%s)
-              eval "$DL_CMD"
-              END=$(date +%s)
+              START=$(date +%s); eval "$DL_CMD"; END=$(date +%s)
               DL_T=$((END - START))
-              echo "  Run $RUN download: ${DL_T}s ($(echo "scale=1; $TOTAL_MB/$DL_T" | bc) MB/s)"
+              echo "  $LABEL run $RUN download: ${DL_T}s ($(echo "scale=1; $TOTAL_MB/$DL_T" | bc) MB/s)"
               DL_TIMES="$DL_TIMES $DL_T"
               rm -rf /tmp/bench-dl
             done
             cleanup
 
-            local UP_AVG=$(echo $UP_TIMES | tr ' ' '\n' | awk '{s+=$1} END {printf "%.0f", s/NR}')
-            local DL_AVG=$(echo $DL_TIMES | tr ' ' '\n' | awk '{s+=$1} END {printf "%.0f", s/NR}')
-            echo "$LABEL upload: avg ${UP_AVG}s ($(echo "scale=1; $TOTAL_MB/$UP_AVG" | bc) MB/s)"
-            echo "$LABEL download: avg ${DL_AVG}s ($(echo "scale=1; $TOTAL_MB/$DL_AVG" | bc) MB/s)"
+            UP_AVG=$(echo $UP_TIMES | tr ' ' '\n' | awk '{s+=$1} END {printf "%.0f", s/NR}')
+            DL_AVG=$(echo $DL_TIMES | tr ' ' '\n' | awk '{s+=$1} END {printf "%.0f", s/NR}')
+            echo "$LABEL: upload avg $(echo "scale=1; $TOTAL_MB/$UP_AVG" | bc) MB/s | download avg $(echo "scale=1; $TOTAL_MB/$DL_AVG" | bc) MB/s"
 
             echo "| $LABEL | upload | **$(echo "scale=1; $TOTAL_MB/$UP_AVG" | bc)** |$(for T in $UP_TIMES; do printf " %s |" "$(echo "scale=1; $TOTAL_MB/$T" | bc)"; done)" >> "$GITHUB_STEP_SUMMARY"
             echo "| $LABEL | download | **$(echo "scale=1; $TOTAL_MB/$DL_AVG" | bc)** |$(for T in $DL_TIMES; do printf " %s |" "$(echo "scale=1; $TOTAL_MB/$T" | bc)"; done)" >> "$GITHUB_STEP_SUMMARY"
           }
 
-          # Single endpoint: fly
-          run_test "s5cmd fly only" \
-            "s5 $FLY sync /tmp/bench-data/*.bin ${PREFIX}/" \
-            "s5 $FLY sync ${PREFIX}/'*' /tmp/bench-dl/"
+          echo "## Phase 1: Endpoint Comparison ($RUNS runs, 3GB)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Config | Direction | Avg MB/s | R1 | R2 | R3 | R4 | R5 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-----------|----------|----|----|----|----|---- |" >> "$GITHUB_STEP_SUMMARY"
 
-          # Single endpoint: t3
-          run_test "s5cmd t3 only" \
-            "s5 $T3 sync /tmp/bench-data/*.bin ${PREFIX}/" \
-            "s5 $T3 sync ${PREFIX}/'*' /tmp/bench-dl/"
+          S="s5cmd --endpoint-url"
 
-          # Dual endpoint: split odd/even across fly and t3
-          run_test "s5cmd dual (fly+t3)" \
-            "s5 $FLY sync /tmp/bench-data/odd/ ${PREFIX}/ & s5 $T3 sync /tmp/bench-data/even/ ${PREFIX}/ & wait" \
-            "s5 $FLY sync ${PREFIX}/'*' /tmp/bench-dl/ & s5 $T3 sync ${PREFIX}/'*' /tmp/bench-dl/ & wait"
+          run_test "fly" \
+            "$S $FLY sync /tmp/bench-data/*.bin ${PREFIX}/" \
+            "$S $FLY sync ${PREFIX}/'*' /tmp/bench-dl/"
 
-          # Best combo: upload via t3, download via fly
-          run_test "s5cmd t3 up / fly down" \
-            "s5 $T3 sync /tmp/bench-data/*.bin ${PREFIX}/" \
-            "s5 $FLY sync ${PREFIX}/'*' /tmp/bench-dl/"
+          run_test "t3" \
+            "$S $T3 sync /tmp/bench-data/*.bin ${PREFIX}/" \
+            "$S $T3 sync ${PREFIX}/'*' /tmp/bench-dl/"
 
+          run_test "dual (fly+t3)" \
+            "$S $FLY sync /tmp/bench-data/odd/ ${PREFIX}/ & $S $T3 sync /tmp/bench-data/even/ ${PREFIX}/ & wait" \
+            "$S $FLY sync ${PREFIX}/'*' /tmp/bench-dl/ & $S $T3 sync ${PREFIX}/'*' /tmp/bench-dl/ & wait"
+
+          run_test "t3 up / fly down" \
+            "$S $T3 sync /tmp/bench-data/*.bin ${PREFIX}/" \
+            "$S $FLY sync ${PREFIX}/'*' /tmp/bench-dl/"
+
+      - name: "Phase 2: Parameter tuning (best upload endpoint)"
+        run: |
+          TOTAL_MB=3000
+          T3="https://t3.storage.dev"
+          FLY="https://fly.storage.tigris.dev"
+          PREFIX="s3://$S3_BUCKET/bench-test"
+
+          export AWS_ACCESS_KEY_ID="$TIGRIS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$TIGRIS_SECRET"
+
+          cleanup() { s5cmd --endpoint-url "$FLY" rm "${PREFIX}/*" 2>/dev/null || true; }
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Phase 2: s5cmd Upload Parameter Tuning (t3, 3 runs each)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Workers | Concurrency | Avg MB/s | R1 | R2 | R3 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---------|-------------|----------|----|----|-----|" >> "$GITHUB_STEP_SUMMARY"
+
+          for WORKERS in 5 15 30 60; do
+            for CONC in 1 4 8 16; do
+              TIMES=""
+              for RUN in 1 2 3; do
+                cleanup
+                START=$(date +%s)
+                s5cmd --endpoint-url "$T3" --numworkers $WORKERS \
+                  cp --concurrency $CONC /tmp/bench-data/*.bin "${PREFIX}/"
+                END=$(date +%s)
+                TIMES="$TIMES $((END - START))"
+              done
+              cleanup
+              AVG=$(echo $TIMES | tr ' ' '\n' | awk '{s+=$1} END {printf "%.0f", s/NR}')
+              echo "workers=$WORKERS conc=$CONC: avg $(echo "scale=1; $TOTAL_MB/$AVG" | bc) MB/s — $TIMES"
+              echo "| $WORKERS | $CONC | **$(echo "scale=1; $TOTAL_MB/$AVG" | bc)** |$(for T in $TIMES; do printf " %s |" "$(echo "scale=1; $TOTAL_MB/$T" | bc)"; done)" >> "$GITHUB_STEP_SUMMARY"
+            done
+          done
+
+      - name: "Phase 3: Download parameter tuning (best download endpoint)"
+        run: |
+          TOTAL_MB=3000
+          FLY="https://fly.storage.tigris.dev"
+          T3="https://t3.storage.dev"
+          PREFIX="s3://$S3_BUCKET/bench-test"
+
+          export AWS_ACCESS_KEY_ID="$TIGRIS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$TIGRIS_SECRET"
+
+          # Upload test data once
+          s5cmd --endpoint-url "$T3" sync /tmp/bench-data/*.bin "${PREFIX}/"
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Phase 3: s5cmd Download Parameter Tuning (fly, 3 runs each)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Workers | Concurrency | Avg MB/s | R1 | R2 | R3 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---------|-------------|----------|----|----|-----|" >> "$GITHUB_STEP_SUMMARY"
+
+          for WORKERS in 5 15 30 60; do
+            for CONC in 1 4 8 16; do
+              TIMES=""
+              for RUN in 1 2 3; do
+                rm -rf /tmp/bench-dl && mkdir -p /tmp/bench-dl
+                START=$(date +%s)
+                s5cmd --endpoint-url "$FLY" --numworkers $WORKERS \
+                  cp --concurrency $CONC "${PREFIX}/*" /tmp/bench-dl/
+                END=$(date +%s)
+                TIMES="$TIMES $((END - START))"
+                rm -rf /tmp/bench-dl
+              done
+              AVG=$(echo $TIMES | tr ' ' '\n' | awk '{s+=$1} END {printf "%.0f", s/NR}')
+              echo "workers=$WORKERS conc=$CONC: avg $(echo "scale=1; $TOTAL_MB/$AVG" | bc) MB/s — $TIMES"
+              echo "| $WORKERS | $CONC | **$(echo "scale=1; $TOTAL_MB/$AVG" | bc)** |$(for T in $TIMES; do printf " %s |" "$(echo "scale=1; $TOTAL_MB/$T" | bc)"; done)" >> "$GITHUB_STEP_SUMMARY"
+            done
+          done
+
+          # Also test rclone downloads with different transfer counts
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Phase 3b: rclone Download Parameter Tuning (fly, 3 runs each)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Transfers | Checkers | Avg MB/s | R1 | R2 | R3 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----------|----------|----------|----|----|-----|" >> "$GITHUB_STEP_SUMMARY"
+
+          for XFERS in 8 16 32 64; do
+            TIMES=""
+            for RUN in 1 2 3; do
+              rm -rf /tmp/bench-dl && mkdir -p /tmp/bench-dl
+              START=$(date +%s)
+              rclone sync "tigris-fly:$S3_BUCKET/bench-test/" /tmp/bench-dl/ \
+                --transfers $XFERS --checkers $XFERS
+              END=$(date +%s)
+              TIMES="$TIMES $((END - START))"
+              rm -rf /tmp/bench-dl
+            done
+            AVG=$(echo $TIMES | tr ' ' '\n' | awk '{s+=$1} END {printf "%.0f", s/NR}')
+            echo "rclone transfers=$XFERS: avg $(echo "scale=1; $TOTAL_MB/$AVG" | bc) MB/s — $TIMES"
+            echo "| $XFERS | $XFERS | **$(echo "scale=1; $TOTAL_MB/$AVG" | bc)** |$(for T in $TIMES; do printf " %s |" "$(echo "scale=1; $TOTAL_MB/$T" | bc)"; done)" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          # Cleanup
+          s5cmd --endpoint-url "$FLY" rm "${PREFIX}/*" 2>/dev/null || true
           rm -rf /tmp/bench-data
