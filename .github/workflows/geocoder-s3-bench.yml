@@ -19,38 +19,16 @@ permissions:
 jobs:
   bench:
     runs-on: pokedex-giant
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - name: Install tools
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq bc
+          sudo apt-get update -qq && sudo apt-get install -y -qq bc aria2
           curl -sL "https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-64bit.tar.gz" \
             -o /tmp/s5cmd.tar.gz
           sudo tar xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd
 
-      - name: Setup credentials + rclone
-        uses: AnimMouse/setup-rclone@26ef2133e09fd383329a1d4c1fbe6a71db1976c9 # v1.12.0
-        with:
-          disable_base64: true
-          rclone_config: |
-            [tigris-fly]
-            type = s3
-            provider = Other
-            region = auto
-            endpoint = https://fly.storage.tigris.dev
-            env_auth = false
-            access_key_id = ${{ secrets.TIGRIS_WRITE_KEY_ID }}
-            secret_access_key = ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
-            [tigris-t3]
-            type = s3
-            provider = Other
-            region = auto
-            endpoint = https://t3.storage.dev
-            env_auth = false
-            access_key_id = ${{ secrets.TIGRIS_WRITE_KEY_ID }}
-            secret_access_key = ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
-
-      - name: Setup s5cmd credentials
+      - name: Setup credentials
         run: |
           echo "TIGRIS_KEY_ID=$KEY_ID" >> "$GITHUB_ENV"
           echo "TIGRIS_SECRET=$SECRET" >> "$GITHUB_ENV"
@@ -58,182 +36,82 @@ jobs:
           KEY_ID: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
           SECRET: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
 
-      - name: Generate test files
+      - name: Generate + upload test files
         run: |
-          mkdir -p /tmp/bench-data/odd /tmp/bench-data/even
+          export AWS_ACCESS_KEY_ID="$TIGRIS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$TIGRIS_SECRET"
+          PREFIX="s3://$S3_BUCKET/bench-test"
+
+          mkdir -p /tmp/bench-data
           echo "Generating 30 x 100MB files..."
           for i in $(seq -w 1 30); do
             dd if=/dev/urandom of="/tmp/bench-data/file-${i}.bin" bs=1M count=100 2>/dev/null
-            N=$((10#$i))
-            if [ $((N % 2)) -eq 1 ]; then
-              ln "/tmp/bench-data/file-${i}.bin" "/tmp/bench-data/odd/file-${i}.bin"
-            else
-              ln "/tmp/bench-data/file-${i}.bin" "/tmp/bench-data/even/file-${i}.bin"
-            fi
           done
-          echo "Total: 3 GiB"
 
-      - name: "Phase 1: Endpoint comparison (SKIPPED — results already collected)"
-        if: false
+          echo "Uploading to Tigris (t3)..."
+          START=$(date +%s)
+          s5cmd --endpoint-url "https://t3.storage.dev" --numworkers 30 \
+            cp --concurrency 4 '/tmp/bench-data/*.bin' "$PREFIX/"
+          END=$(date +%s)
+          echo "Uploaded 3GB in $((END-START))s"
+
+      - name: Benchmark downloads
         run: |
+          export AWS_ACCESS_KEY_ID="$TIGRIS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$TIGRIS_SECRET"
+          TOTAL_MB=3000
+          PREFIX="s3://$S3_BUCKET/bench-test"
+          HTTP_BASE="https://geoshenanigans-reverse-geocoding.t3.tigrisfiles.io/bench-test"
           RUNS=5
-          TOTAL_MB=3000
-          FLY="https://fly.storage.tigris.dev"
-          T3="https://t3.storage.dev"
-          PREFIX="s3://$S3_BUCKET/bench-test"
 
-          export AWS_ACCESS_KEY_ID="$TIGRIS_KEY_ID"
-          export AWS_SECRET_ACCESS_KEY="$TIGRIS_SECRET"
+          echo "## Download Benchmark ($RUNS runs, 30 x 100MB = 3GB)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Method | Avg MB/s | R1 | R2 | R3 | R4 | R5 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|----------|----|----|----|----|-----|" >> "$GITHUB_STEP_SUMMARY"
 
-          cleanup() { s5cmd --endpoint-url "$FLY" rm "${PREFIX}/*" 2>/dev/null || true; }
-
-          run_test() {
-            local LABEL=$1 UP_CMD=$2 DL_CMD=$3
-            local UP_TIMES="" DL_TIMES=""
-
+          run_dl_test() {
+            local LABEL=$1 CMD=$2
+            local TIMES=""
             for RUN in $(seq 1 $RUNS); do
-              cleanup
-              START=$(date +%s); eval "$UP_CMD"; END=$(date +%s)
-              UP_T=$((END - START))
-              echo "  $LABEL run $RUN upload: ${UP_T}s ($(echo "scale=1; $TOTAL_MB/$UP_T" | bc) MB/s)"
-              UP_TIMES="$UP_TIMES $UP_T"
-
-              rm -rf /tmp/bench-dl && mkdir -p /tmp/bench-dl
-              START=$(date +%s); eval "$DL_CMD"; END=$(date +%s)
-              DL_T=$((END - START))
-              echo "  $LABEL run $RUN download: ${DL_T}s ($(echo "scale=1; $TOTAL_MB/$DL_T" | bc) MB/s)"
-              DL_TIMES="$DL_TIMES $DL_T"
-              rm -rf /tmp/bench-dl
-            done
-            cleanup
-
-            UP_AVG=$(echo $UP_TIMES | tr ' ' '\n' | awk '{s+=$1} END {printf "%.0f", s/NR}')
-            DL_AVG=$(echo $DL_TIMES | tr ' ' '\n' | awk '{s+=$1} END {printf "%.0f", s/NR}')
-            echo "$LABEL: upload avg $(echo "scale=1; $TOTAL_MB/$UP_AVG" | bc) MB/s | download avg $(echo "scale=1; $TOTAL_MB/$DL_AVG" | bc) MB/s"
-
-            echo "| $LABEL | upload | **$(echo "scale=1; $TOTAL_MB/$UP_AVG" | bc)** |$(for T in $UP_TIMES; do printf " %s |" "$(echo "scale=1; $TOTAL_MB/$T" | bc)"; done)" >> "$GITHUB_STEP_SUMMARY"
-            echo "| $LABEL | download | **$(echo "scale=1; $TOTAL_MB/$DL_AVG" | bc)** |$(for T in $DL_TIMES; do printf " %s |" "$(echo "scale=1; $TOTAL_MB/$T" | bc)"; done)" >> "$GITHUB_STEP_SUMMARY"
-          }
-
-          echo "## Phase 1: Endpoint Comparison ($RUNS runs, 3GB)" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Config | Direction | Avg MB/s | R1 | R2 | R3 | R4 | R5 |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|--------|-----------|----------|----|----|----|----|---- |" >> "$GITHUB_STEP_SUMMARY"
-
-          S="s5cmd --endpoint-url"
-
-          run_test "fly" \
-            "$S $FLY cp '/tmp/bench-data/*.bin' ${PREFIX}/" \
-            "$S $FLY cp ${PREFIX}/'*' /tmp/bench-dl/"
-
-          run_test "t3" \
-            "$S $T3 cp '/tmp/bench-data/*.bin' ${PREFIX}/" \
-            "$S $T3 cp ${PREFIX}/'*' /tmp/bench-dl/"
-
-          run_test "dual (fly+t3)" \
-            "$S $FLY cp '/tmp/bench-data/odd/*' ${PREFIX}/ & $S $T3 cp '/tmp/bench-data/even/*' ${PREFIX}/ & wait" \
-            "$S $FLY cp ${PREFIX}/'*' /tmp/bench-dl/ & $S $T3 cp ${PREFIX}/'*' /tmp/bench-dl/ & wait"
-
-          run_test "t3 up / fly down" \
-            "$S $T3 cp '/tmp/bench-data/*.bin' ${PREFIX}/" \
-            "$S $FLY cp ${PREFIX}/'*' /tmp/bench-dl/"
-
-      - name: "Phase 2: Parameter tuning (best upload endpoint)"
-        run: |
-          TOTAL_MB=3000
-          T3="https://t3.storage.dev"
-          FLY="https://fly.storage.tigris.dev"
-          PREFIX="s3://$S3_BUCKET/bench-test"
-
-          export AWS_ACCESS_KEY_ID="$TIGRIS_KEY_ID"
-          export AWS_SECRET_ACCESS_KEY="$TIGRIS_SECRET"
-
-          cleanup() { s5cmd --endpoint-url "$FLY" rm "${PREFIX}/*" 2>/dev/null || true; }
-
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "## Phase 2: s5cmd Upload Parameter Tuning (t3, 3 runs each)" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Workers | Concurrency | Avg MB/s | R1 | R2 | R3 |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---------|-------------|----------|----|----|-----|" >> "$GITHUB_STEP_SUMMARY"
-
-          for WORKERS in 5 15 30 60; do
-            for CONC in 1 4 8 16; do
-              TIMES=""
-              for RUN in 1 2 3; do
-                cleanup
-                START=$(date +%s)
-                s5cmd --endpoint-url "$T3" --numworkers $WORKERS \
-                  cp --concurrency $CONC '/tmp/bench-data/*.bin' "${PREFIX}/"
-                END=$(date +%s)
-                TIMES="$TIMES $((END - START))"
-              done
-              cleanup
-              AVG=$(echo $TIMES | tr ' ' '\n' | awk '{s+=$1} END {printf "%.0f", s/NR}')
-              echo "workers=$WORKERS conc=$CONC: avg $(echo "scale=1; $TOTAL_MB/$AVG" | bc) MB/s — $TIMES"
-              echo "| $WORKERS | $CONC | **$(echo "scale=1; $TOTAL_MB/$AVG" | bc)** |$(for T in $TIMES; do printf " %s |" "$(echo "scale=1; $TOTAL_MB/$T" | bc)"; done)" >> "$GITHUB_STEP_SUMMARY"
-            done
-          done
-
-      - name: "Phase 3: Download parameter tuning (best download endpoint)"
-        run: |
-          TOTAL_MB=3000
-          FLY="https://fly.storage.tigris.dev"
-          T3="https://t3.storage.dev"
-          PREFIX="s3://$S3_BUCKET/bench-test"
-
-          export AWS_ACCESS_KEY_ID="$TIGRIS_KEY_ID"
-          export AWS_SECRET_ACCESS_KEY="$TIGRIS_SECRET"
-
-          # Upload test data once
-          s5cmd --endpoint-url "$T3" cp '/tmp/bench-data/*.bin' "${PREFIX}/"
-
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "## Phase 3: s5cmd Download Parameter Tuning (fly, 3 runs each)" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Workers | Concurrency | Avg MB/s | R1 | R2 | R3 |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---------|-------------|----------|----|----|-----|" >> "$GITHUB_STEP_SUMMARY"
-
-          for WORKERS in 5 15 30 60; do
-            for CONC in 1 4 8 16; do
-              TIMES=""
-              for RUN in 1 2 3; do
-                rm -rf /tmp/bench-dl && mkdir -p /tmp/bench-dl
-                START=$(date +%s)
-                s5cmd --endpoint-url "$FLY" --numworkers $WORKERS \
-                  cp --concurrency $CONC "${PREFIX}/*" /tmp/bench-dl/
-                END=$(date +%s)
-                TIMES="$TIMES $((END - START))"
-                rm -rf /tmp/bench-dl
-              done
-              AVG=$(echo $TIMES | tr ' ' '\n' | awk '{s+=$1} END {printf "%.0f", s/NR}')
-              echo "workers=$WORKERS conc=$CONC: avg $(echo "scale=1; $TOTAL_MB/$AVG" | bc) MB/s — $TIMES"
-              echo "| $WORKERS | $CONC | **$(echo "scale=1; $TOTAL_MB/$AVG" | bc)** |$(for T in $TIMES; do printf " %s |" "$(echo "scale=1; $TOTAL_MB/$T" | bc)"; done)" >> "$GITHUB_STEP_SUMMARY"
-            done
-          done
-
-          # Also test rclone downloads with different transfer counts
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "## Phase 3b: rclone Download Parameter Tuning (fly, 3 runs each)" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Transfers | Checkers | Avg MB/s | R1 | R2 | R3 |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|-----------|----------|----------|----|----|-----|" >> "$GITHUB_STEP_SUMMARY"
-
-          for XFERS in 8 16 32 64; do
-            TIMES=""
-            for RUN in 1 2 3; do
               rm -rf /tmp/bench-dl && mkdir -p /tmp/bench-dl
               START=$(date +%s)
-              rclone sync "tigris-fly:$S3_BUCKET/bench-test/" /tmp/bench-dl/ \
-                --transfers $XFERS --checkers $XFERS
+              eval "$CMD"
               END=$(date +%s)
               TIMES="$TIMES $((END - START))"
               rm -rf /tmp/bench-dl
             done
-            AVG=$(echo $TIMES | tr ' ' '\n' | awk '{s+=$1} END {printf "%.0f", s/NR}')
-            echo "rclone transfers=$XFERS: avg $(echo "scale=1; $TOTAL_MB/$AVG" | bc) MB/s — $TIMES"
-            echo "| $XFERS | $XFERS | **$(echo "scale=1; $TOTAL_MB/$AVG" | bc)** |$(for T in $TIMES; do printf " %s |" "$(echo "scale=1; $TOTAL_MB/$T" | bc)"; done)" >> "$GITHUB_STEP_SUMMARY"
-          done
+            local AVG=$(echo $TIMES | tr ' ' '\n' | awk '{s+=$1} END {printf "%.0f", s/NR}')
+            echo "$LABEL: avg $(echo "scale=1; $TOTAL_MB/$AVG" | bc) MB/s — runs:$TIMES"
+            echo "| $LABEL | **$(echo "scale=1; $TOTAL_MB/$AVG" | bc)** |$(for T in $TIMES; do printf " %s |" "$(echo "scale=1; $TOTAL_MB/$T" | bc)"; done)" >> "$GITHUB_STEP_SUMMARY"
+          }
 
-          # Cleanup
-          s5cmd --endpoint-url "$FLY" rm "${PREFIX}/*" 2>/dev/null || true
-          rm -rf /tmp/bench-data
+          # s5cmd via fly (best S3 download from Phase 1)
+          run_dl_test "s5cmd fly (w15 c8)" \
+            "s5cmd --endpoint-url https://fly.storage.tigris.dev --numworkers 15 cp --concurrency 8 '${PREFIX}/*' /tmp/bench-dl/"
+
+          # s5cmd via t3
+          run_dl_test "s5cmd t3 (w15 c8)" \
+            "s5cmd --endpoint-url https://t3.storage.dev --numworkers 15 cp --concurrency 8 '${PREFIX}/*' /tmp/bench-dl/"
+
+          # aria2 via public HTTP — sequential files
+          run_dl_test "aria2 HTTP (x16 per file, j30)" \
+            "cd /tmp/bench-dl && for i in \$(seq -w 1 30); do echo \"$HTTP_BASE/file-\${i}.bin\"; done | aria2c -x 16 -s 16 -j 30 --max-tries=1 -d /tmp/bench-dl -i - 2>/dev/null"
+
+          # aria2 via public HTTP — fewer parallel, more connections per file
+          run_dl_test "aria2 HTTP (x16 per file, j10)" \
+            "cd /tmp/bench-dl && for i in \$(seq -w 1 30); do echo \"$HTTP_BASE/file-\${i}.bin\"; done | aria2c -x 16 -s 16 -j 10 --max-tries=1 -d /tmp/bench-dl -i - 2>/dev/null"
+
+          # aria2 via public HTTP — max connections
+          run_dl_test "aria2 HTTP (x1 per file, j30)" \
+            "cd /tmp/bench-dl && for i in \$(seq -w 1 30); do echo \"$HTTP_BASE/file-\${i}.bin\"; done | aria2c -x 1 -s 1 -j 30 --max-tries=1 -d /tmp/bench-dl -i - 2>/dev/null"
+
+          # wget parallel for baseline
+          run_dl_test "wget parallel (30 jobs)" \
+            "for i in \$(seq -w 1 30); do wget -q -P /tmp/bench-dl \"$HTTP_BASE/file-\${i}.bin\" & done; wait"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          export AWS_ACCESS_KEY_ID="$TIGRIS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$TIGRIS_SECRET"
+          s5cmd --endpoint-url "https://fly.storage.tigris.dev" rm "s3://$S3_BUCKET/bench-test/*" 2>/dev/null || true
