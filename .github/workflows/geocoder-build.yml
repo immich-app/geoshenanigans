@@ -4,8 +4,14 @@ concurrency:
   group: geocoder-build-${{ github.event_name == 'pull_request' && github.head_ref || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# Triggers disabled while running S3 benchmarks
 on:
+  schedule:
+    - cron: '0 6 * * *'
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - 'geocoder/**'
+      - '.github/workflows/geocoder-build.yml'
   workflow_dispatch:
     inputs:
       pbf_url:
@@ -26,6 +32,7 @@ on:
 env:
   S3_BUCKET: geoshenanigans-reverse-geocoding
   S3_PREFIX: geocoder
+  S3_ENDPOINT: https://t3.storage.dev
   REGIONS: "planet africa asia europe north-america south-america oceania central-america antarctica"
 
 permissions:
@@ -120,27 +127,17 @@ jobs:
             -o /tmp/s5cmd.tar.gz
           sudo tar xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd
 
-      - name: Setup rclone
-        uses: AnimMouse/setup-rclone@26ef2133e09fd383329a1d4c1fbe6a71db1976c9 # v1.12.0
-        with:
-          disable_base64: true
-          rclone_config: |
-            [tigris]
-            type = s3
-            provider = Other
-            region = auto
-            endpoint = https://t3.storage.dev
-            env_auth = false
-            access_key_id = ${{ secrets.TIGRIS_WRITE_KEY_ID }}
-            secret_access_key = ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
-            [tigris-dl]
-            type = s3
-            provider = Other
-            region = auto
-            endpoint = https://fly.storage.tigris.dev
-            env_auth = false
-            access_key_id = ${{ secrets.TIGRIS_WRITE_KEY_ID }}
-            secret_access_key = ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
+      - name: Configure Tigris credentials
+        run: |
+          # Save container's cache credentials
+          echo "CACHE_AWS_KEY=$AWS_ACCESS_KEY_ID" >> "$GITHUB_ENV"
+          echo "CACHE_AWS_SECRET=$AWS_SECRET_ACCESS_KEY" >> "$GITHUB_ENV"
+          # Set Tigris credentials as default for s5cmd
+          echo "AWS_ACCESS_KEY_ID=$KEY" >> "$GITHUB_ENV"
+          echo "AWS_SECRET_ACCESS_KEY=$SECRET" >> "$GITHUB_ENV"
+        env:
+          KEY: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
+          SECRET: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
 
       - name: Build tools
         run: |
@@ -179,7 +176,7 @@ jobs:
         env:
           YESTERDAY: ${{ steps.dates.outputs.yesterday }}
         run: |
-          if rclone lsf "tigris-dl:$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/" 2>/dev/null | head -1 | grep -q .; then
+          if s5cmd --endpoint-url $S3_ENDPOINT ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/" 2>/dev/null | head -1 | grep -q .; then
             echo "found=true" >> "$GITHUB_OUTPUT"
             echo "Yesterday's build ($YESTERDAY) exists on Tigris"
           else
@@ -198,7 +195,7 @@ jobs:
           TODAY: ${{ steps.dates.outputs.today }}
           TODAY_SEQ: ${{ steps.dates.outputs.today_seq }}
         run: |
-          CACHE="s5cmd --endpoint-url $CACHE_ENDPOINT"
+          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT"
 
           # Download yesterday's indexes from Tigris and today's PBF from cache in parallel
           echo "Starting parallel downloads..."
@@ -207,7 +204,7 @@ jobs:
           (
             echo "[Tigris] Downloading yesterday's indexes ($YESTERDAY)..."
             START=$(date +%s)
-            rclone sync "tigris-dl:$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/" \
+            s5cmd --endpoint-url $S3_ENDPOINT --numworkers 15 cp --concurrency 8 "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/" \
               "$WORKDIR/old-output/" \
               --transfers 32 --retries 5 --low-level-retries 10 --checkers 32
             END=$(date +%s)
@@ -277,7 +274,7 @@ jobs:
           YESTERDAY: ${{ steps.dates.outputs.yesterday }}
           YESTERDAY_SEQ: ${{ steps.dates.outputs.yesterday_seq }}
         run: |
-          CACHE="s5cmd --endpoint-url $CACHE_ENDPOINT"
+          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT"
 
           if $CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/planet-${YESTERDAY}.osm.pbf" 2>/dev/null | grep -q "planet-"; then
             echo "Cache HIT: yesterday's PBF ($YESTERDAY)"
@@ -346,7 +343,7 @@ jobs:
           TODAY: ${{ steps.dates.outputs.today }}
           TODAY_SEQ: ${{ steps.dates.outputs.today_seq }}
         run: |
-          CACHE="s5cmd --endpoint-url $CACHE_ENDPOINT"
+          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT"
 
           echo "Applying today's diff (seq $TODAY_SEQ)..."
           DIR1=$(printf "%03d" $((TODAY_SEQ / 1000000)))
@@ -380,17 +377,13 @@ jobs:
         run: |
           # Start uploading today's indexes to Tigris immediately (read-only during diff/patch)
           echo "Starting background upload of today's indexes ($NEW_DATE) to Tigris..."
-          rclone sync "$WORKDIR/output/" \
-            "tigris:$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/" \
-            --transfers 32 --retries 5 --low-level-retries 10 \
-            --s3-upload-concurrency 8 --s3-chunk-size 64M --s3-no-check-bucket --checkers 32 &
+          s5cmd --endpoint-url $S3_ENDPOINT --numworkers 30 \
+            cp --concurrency 4 "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/" &
           UPLOAD_IDX_PID=$!
 
           # Upload yesterday's build if needed
-          rclone sync "$WORKDIR/old-output/" \
-            "tigris:$S3_BUCKET/$S3_PREFIX/builds/$OLD_DATE/" \
-            --transfers 32 --retries 5 --low-level-retries 10 \
-            --s3-upload-concurrency 8 --s3-chunk-size 64M --s3-no-check-bucket --checkers 32 &
+          s5cmd --endpoint-url $S3_ENDPOINT --numworkers 30 \
+            cp --concurrency 4 "$WORKDIR/old-output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$OLD_DATE/" &
           UPLOAD_OLD_PID=$!
 
           echo "## Planet Test Results ($OLD_DATE → $NEW_DATE)" >> "$GITHUB_STEP_SUMMARY"
@@ -427,9 +420,8 @@ jobs:
               PATCH_KB=$((PATCH_SIZE / 1024))
 
               # Upload patch to Tigris in background
-              rclone copyto "$PATCH_FILE" \
-                "tigris:$S3_BUCKET/$S3_PREFIX/patches/$variant/${OLD_DATE}-to-${NEW_DATE}.gcpatch" \
-                --retries 5 --low-level-retries 10 &
+              s5cmd --endpoint-url $S3_ENDPOINT \
+                cp "$PATCH_FILE" "s3://$S3_BUCKET/$S3_PREFIX/patches/$variant/${OLD_DATE}-to-${NEW_DATE}.gcpatch" &
 
               # Verify patch
               VERIFY_DIR="$WORKDIR/verify-$SAFE_NAME"
@@ -509,7 +501,7 @@ jobs:
             --argjson skip "$SKIP" \
             --arg validated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             '{date: $date, previous: $prev, patches: {pass: $pass, fail: $fail, skip: $skip}, validated_at: $validated_at}' \
-            | rclone rcat "tigris:$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/validated.json"
+            | s5cmd --endpoint-url $S3_ENDPOINT pipe "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/validated.json"
           echo "Validation file uploaded for $NEW_DATE"
 
           # Update top-level manifest
@@ -518,7 +510,7 @@ jobs:
             --arg previous "$OLD_DATE" \
             --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             '{latest_build: $latest, previous_build: $previous, updated_at: $updated_at}' \
-            | rclone rcat "tigris:$S3_BUCKET/$S3_PREFIX/latest.json"
+            | s5cmd --endpoint-url $S3_ENDPOINT pipe "s3://$S3_BUCKET/$S3_PREFIX/latest.json"
           echo "Manifest updated"
 
   # --- Production build: full planet + S3 upload ---
@@ -540,27 +532,17 @@ jobs:
           sudo apt-get install -y -qq cmake g++ libz-dev libzstd-dev \
             libbz2-dev libexpat1-dev libs2-dev libosmium2-dev aria2 jq
 
-      - name: Setup rclone
-        uses: AnimMouse/setup-rclone@26ef2133e09fd383329a1d4c1fbe6a71db1976c9 # v1.12.0
-        with:
-          disable_base64: true
-          rclone_config: |
-            [tigris]
-            type = s3
-            provider = Other
-            region = auto
-            endpoint = https://t3.storage.dev
-            env_auth = false
-            access_key_id = ${{ secrets.TIGRIS_WRITE_KEY_ID }}
-            secret_access_key = ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
-            [tigris-dl]
-            type = s3
-            provider = Other
-            region = auto
-            endpoint = https://fly.storage.tigris.dev
-            env_auth = false
-            access_key_id = ${{ secrets.TIGRIS_WRITE_KEY_ID }}
-            secret_access_key = ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
+      - name: Configure Tigris credentials
+        run: |
+          # Save container's cache credentials
+          echo "CACHE_AWS_KEY=$AWS_ACCESS_KEY_ID" >> "$GITHUB_ENV"
+          echo "CACHE_AWS_SECRET=$AWS_SECRET_ACCESS_KEY" >> "$GITHUB_ENV"
+          # Set Tigris credentials as default for s5cmd
+          echo "AWS_ACCESS_KEY_ID=$KEY" >> "$GITHUB_ENV"
+          echo "AWS_SECRET_ACCESS_KEY=$SECRET" >> "$GITHUB_ENV"
+        env:
+          KEY: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
+          SECRET: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
 
       - name: Build tools
         run: |
@@ -575,7 +557,7 @@ jobs:
           BUILD_DATE=$(date -u +%Y-%m-%d)
           echo "date=$BUILD_DATE" >> "$GITHUB_OUTPUT"
 
-          EXISTS=$(rclone ls "tigris-dl:$S3_BUCKET/$S3_PREFIX/builds/$BUILD_DATE/planet/" 2>/dev/null | wc -l)
+          EXISTS=$(s5cmd --endpoint-url $S3_ENDPOINT ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$BUILD_DATE/" 2>/dev/null | wc -l)
           if [ "$EXISTS" -gt 0 ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "Build for $BUILD_DATE already exists"
@@ -627,16 +609,14 @@ jobs:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
           BUILD_DATE: ${{ steps.meta.outputs.date }}
         run: |
-          rclone sync "$WORKDIR/output/" \
-            "tigris:$S3_BUCKET/$S3_PREFIX/builds/$BUILD_DATE/" \
-            --progress --transfers 32 --retries 5 --low-level-retries 10 \
-            --s3-upload-concurrency 8 --s3-chunk-size 64M --s3-no-check-bucket --checkers 32
+          s5cmd --endpoint-url $S3_ENDPOINT --numworkers 30 \
+            cp --concurrency 4 "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$BUILD_DATE/"
 
           jq -n \
             --arg latest "$BUILD_DATE" \
             --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             '{latest_build: $latest, updated_at: $updated_at}' \
-            | rclone rcat "tigris:$S3_BUCKET/$S3_PREFIX/latest.json"
+            | s5cmd --endpoint-url $S3_ENDPOINT pipe "s3://$S3_BUCKET/$S3_PREFIX/latest.json"
 
       - name: Find previous build
         if: steps.meta.outputs.skip != 'true' && inputs.skip_patch != true
@@ -644,8 +624,8 @@ jobs:
         env:
           CURRENT: ${{ steps.meta.outputs.date }}
         run: |
-          PREV=$(rclone lsd "tigris-dl:$S3_BUCKET/$S3_PREFIX/builds/" 2>/dev/null \
-            | awk '{print $NF}' \
+          PREV=$(s5cmd --endpoint-url $S3_ENDPOINT ls "s3://$S3_BUCKET/$S3_PREFIX/builds/*" 2>/dev/null \
+            | awk '{print $NF}' | grep -oP 'builds/\K[0-9]{4}-[0-9]{2}-[0-9]{2}' | sort -u \
             | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \
             | sort | grep -B1 "^$CURRENT$" | head -1)
 
@@ -665,7 +645,7 @@ jobs:
           PREV: ${{ steps.prev.outputs.date }}
         run: |
           echo "Downloading previous build ($PREV) from S3..."
-          rclone sync "tigris-dl:$S3_BUCKET/$S3_PREFIX/builds/$PREV/" \
+          s5cmd --endpoint-url $S3_ENDPOINT --numworkers 15 cp --concurrency 8 "s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV/" \
             "$WORKDIR/prev-build/" \
             --progress --transfers 16 --retries 5 --low-level-retries 10
 
@@ -755,9 +735,8 @@ jobs:
               echo "| $variant | $N_NEW | ${PATCH_KB} KiB | PASS |" >> "$GITHUB_STEP_SUMMARY"
               PASS=$((PASS + 1))
 
-              rclone copyto "$PATCHES_DIR/$SAFE_NAME.gcpatch" \
-                "tigris:$S3_BUCKET/$S3_PREFIX/patches/$variant/${PREV}-to-${CURRENT}.gcpatch" \
-                --retries 5 --low-level-retries 10 &
+              s5cmd --endpoint-url $S3_ENDPOINT \
+                cp "$PATCHES_DIR/$SAFE_NAME.gcpatch" "s3://$S3_BUCKET/$S3_PREFIX/patches/$variant/${PREV}-to-${CURRENT}.gcpatch" &
             else
               MATCH=$(echo "$RESULT" | awk '{print $2}')
               N_NEW=$(echo "$RESULT" | awk '{print $3}')
@@ -786,8 +765,8 @@ jobs:
       - name: Clean up old builds (keep last 2)
         if: steps.meta.outputs.skip != 'true'
         run: |
-          BUILDS=$(rclone lsd "tigris-dl:$S3_BUCKET/$S3_PREFIX/builds/" 2>/dev/null \
-            | awk '{print $NF}' \
+          BUILDS=$(s5cmd --endpoint-url $S3_ENDPOINT ls "s3://$S3_BUCKET/$S3_PREFIX/builds/*" 2>/dev/null \
+            | awk '{print $NF}' | grep -oP 'builds/\K[0-9]{4}-[0-9]{2}-[0-9]{2}' | sort -u \
             | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \
             | sort -r)
 
@@ -797,7 +776,7 @@ jobs:
             COUNT=$((COUNT + 1))
             if [ $COUNT -gt 2 ]; then
               echo "Deleting old build: $build"
-              rclone purge "tigris:$S3_BUCKET/$S3_PREFIX/builds/$build/" \
+              s5cmd --endpoint-url $S3_ENDPOINT rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$build/*" \
                 --retries 3
             fi
           done <<< "$BUILDS"
@@ -807,19 +786,19 @@ jobs:
         env:
           BUILD_DATE: ${{ steps.meta.outputs.date }}
         run: |
-          BUILDS_JSON=$(rclone lsd "tigris-dl:$S3_BUCKET/$S3_PREFIX/builds/" 2>/dev/null \
-            | awk '{print $NF}' \
+          BUILDS_JSON=$(s5cmd --endpoint-url $S3_ENDPOINT ls "s3://$S3_BUCKET/$S3_PREFIX/builds/*" 2>/dev/null \
+            | awk '{print $NF}' | grep -oP 'builds/\K[0-9]{4}-[0-9]{2}-[0-9]{2}' | sort -u \
             | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \
             | sort -r \
             | while read -r b; do
-                REGIONS_LIST=$(rclone lsd "tigris-dl:$S3_BUCKET/$S3_PREFIX/builds/$b/" 2>/dev/null \
-                  | awk '{print $NF}' \
+                REGIONS_LIST=$(s5cmd --endpoint-url $S3_ENDPOINT ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$b/*" 2>/dev/null \
+                  | awk '{print $NF}' | grep -oP "builds/$b/\\K[^/]+" | sort -u \
                   | jq -R . | jq -s .)
                 echo "{\"date\":\"$b\",\"regions\":$REGIONS_LIST}"
               done | jq -s .)
 
           PATCHES_JSON=$(for region in $REGIONS; do
-            REGION_PATCHES=$(rclone ls "tigris-dl:$S3_BUCKET/$S3_PREFIX/patches/$region/" 2>/dev/null \
+            REGION_PATCHES=$(s5cmd --endpoint-url $S3_ENDPOINT ls "s3://$S3_BUCKET/$S3_PREFIX/patches/$region/*" 2>/dev/null \
               | grep '\.gcpatch$' \
               | while read -r SIZE NAME; do
                   p=$(basename "$NAME")
@@ -844,9 +823,8 @@ jobs:
               patches: $patches
             }' > /tmp/index.json
 
-          rclone copyto /tmp/index.json \
-            "tigris:$S3_BUCKET/$S3_PREFIX/index.json" \
-            --retries 5
+          s5cmd --endpoint-url $S3_ENDPOINT \
+            cp /tmp/index.json "s3://$S3_BUCKET/$S3_PREFIX/index.json"
 
       - name: Summary
         if: always()
