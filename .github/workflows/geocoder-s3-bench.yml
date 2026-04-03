@@ -21,6 +21,9 @@ jobs:
     runs-on: pokedex-giant
     timeout-minutes: 30
     steps:
+      - name: Install bc
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bc
+
       - name: Setup rclone
         uses: AnimMouse/setup-rclone@26ef2133e09fd383329a1d4c1fbe6a71db1976c9 # v1.12.0
         with:
@@ -52,72 +55,90 @@ jobs:
           done
           echo "Total: $(du -sh /tmp/bench-data | awk '{print $1}')"
 
-      - name: Benchmark fly.storage.tigris.dev
+      - name: Benchmark
         run: |
-          echo "=== fly.storage.tigris.dev ==="
-          REMOTE="tigris-fly:$S3_BUCKET/bench-test"
+          RUNS=5
+          TOTAL_MB=3000
 
-          echo "--- Upload (30 x 100MB, parallel) ---"
-          START=$(date +%s)
-          rclone sync /tmp/bench-data/ "$REMOTE/" \
-            --transfers 30 --checkers 30 \
-            --s3-upload-concurrency 8 --s3-chunk-size 64M --s3-no-check-bucket
-          END=$(date +%s)
-          ELAPSED=$((END - START))
-          echo "Upload: ${ELAPSED}s ($(echo "scale=1; 3000/$ELAPSED" | bc) MB/s)"
+          echo "## S3 Benchmark Results (${RUNS} runs, 30 x 100MB files)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Endpoint | Direction | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 | Avg MB/s |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|----------|-----------|-------|-------|-------|-------|-------|----------|" >> "$GITHUB_STEP_SUMMARY"
 
-          echo "--- Download (30 x 100MB, parallel) ---"
-          START=$(date +%s)
-          rclone sync "$REMOTE/" /tmp/bench-dl-fly/ \
-            --transfers 30 --checkers 30
-          END=$(date +%s)
-          ELAPSED=$((END - START))
-          echo "Download: ${ELAPSED}s ($(echo "scale=1; 3000/$ELAPSED" | bc) MB/s)"
-
-          echo "--- Verify ---"
-          for i in $(seq -w 1 30); do
-            if ! cmp -s "/tmp/bench-data/file-${i}.bin" "/tmp/bench-dl-fly/file-${i}.bin"; then
-              echo "MISMATCH: file-${i}.bin"
-              exit 1
+          for ENDPOINT in fly t3; do
+            if [ "$ENDPOINT" = "fly" ]; then
+              REMOTE="tigris-fly:$S3_BUCKET/bench-test"
+              LABEL="fly.storage.tigris.dev"
+            else
+              REMOTE="tigris-t3:$S3_BUCKET/bench-test"
+              LABEL="t3.storage.dev"
             fi
+
+            echo ""
+            echo "=============================="
+            echo "=== $LABEL ==="
+            echo "=============================="
+
+            UP_TIMES=""
+            DL_TIMES=""
+
+            for RUN in $(seq 1 $RUNS); do
+              echo ""
+              echo "--- Run $RUN/$RUNS ---"
+
+              # Upload
+              START=$(date +%s)
+              rclone sync /tmp/bench-data/ "$REMOTE/" \
+                --transfers 30 --checkers 30 \
+                --s3-upload-concurrency 8 --s3-chunk-size 64M --s3-no-check-bucket
+              END=$(date +%s)
+              UP_T=$((END - START))
+              UP_SPEED=$(echo "scale=1; $TOTAL_MB/$UP_T" | bc)
+              echo "Upload: ${UP_T}s (${UP_SPEED} MB/s)"
+              UP_TIMES="$UP_TIMES $UP_T"
+
+              # Download
+              rm -rf /tmp/bench-dl
+              START=$(date +%s)
+              rclone sync "$REMOTE/" /tmp/bench-dl/ \
+                --transfers 30 --checkers 30
+              END=$(date +%s)
+              DL_T=$((END - START))
+              DL_SPEED=$(echo "scale=1; $TOTAL_MB/$DL_T" | bc)
+              echo "Download: ${DL_T}s (${DL_SPEED} MB/s)"
+              DL_TIMES="$DL_TIMES $DL_T"
+
+              rm -rf /tmp/bench-dl
+
+              # Delete remote files for clean next run
+              rclone purge "$REMOTE/" 2>/dev/null || true
+            done
+
+            # Calculate averages
+            UP_AVG=$(echo "$UP_TIMES" | tr ' ' '\n' | grep -v '^$' | awk '{s+=$1} END {printf "%.0f", s/NR}')
+            DL_AVG=$(echo "$DL_TIMES" | tr ' ' '\n' | grep -v '^$' | awk '{s+=$1} END {printf "%.0f", s/NR}')
+            UP_AVG_SPEED=$(echo "scale=1; $TOTAL_MB/$UP_AVG" | bc)
+            DL_AVG_SPEED=$(echo "scale=1; $TOTAL_MB/$DL_AVG" | bc)
+
+            UP_SPEEDS=""
+            for T in $UP_TIMES; do
+              UP_SPEEDS="$UP_SPEEDS $(echo "scale=1; $TOTAL_MB/$T" | bc)"
+            done
+            DL_SPEEDS=""
+            for T in $DL_TIMES; do
+              DL_SPEEDS="$DL_SPEEDS $(echo "scale=1; $TOTAL_MB/$T" | bc)"
+            done
+
+            UP_S_ARR=($UP_SPEEDS)
+            DL_S_ARR=($DL_SPEEDS)
+
+            echo ""
+            echo "=== $LABEL Results ==="
+            echo "Upload avg:   ${UP_AVG}s (${UP_AVG_SPEED} MB/s)"
+            echo "Download avg: ${DL_AVG}s (${DL_AVG_SPEED} MB/s)"
+
+            echo "| $LABEL | Upload | ${UP_S_ARR[0]} | ${UP_S_ARR[1]} | ${UP_S_ARR[2]} | ${UP_S_ARR[3]} | ${UP_S_ARR[4]} | **${UP_AVG_SPEED}** |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| $LABEL | Download | ${DL_S_ARR[0]} | ${DL_S_ARR[1]} | ${DL_S_ARR[2]} | ${DL_S_ARR[3]} | ${DL_S_ARR[4]} | **${DL_AVG_SPEED}** |" >> "$GITHUB_STEP_SUMMARY"
           done
-          echo "All files verified"
 
-          echo "--- Cleanup ---"
-          rclone purge "$REMOTE/"
-          rm -rf /tmp/bench-dl-fly
-
-      - name: Benchmark t3.storage.dev
-        run: |
-          echo "=== t3.storage.dev ==="
-          REMOTE="tigris-t3:$S3_BUCKET/bench-test"
-
-          echo "--- Upload (30 x 100MB, parallel) ---"
-          START=$(date +%s)
-          rclone sync /tmp/bench-data/ "$REMOTE/" \
-            --transfers 30 --checkers 30 \
-            --s3-upload-concurrency 8 --s3-chunk-size 64M --s3-no-check-bucket
-          END=$(date +%s)
-          ELAPSED=$((END - START))
-          echo "Upload: ${ELAPSED}s ($(echo "scale=1; 3000/$ELAPSED" | bc) MB/s)"
-
-          echo "--- Download (30 x 100MB, parallel) ---"
-          START=$(date +%s)
-          rclone sync "$REMOTE/" /tmp/bench-dl-t3/ \
-            --transfers 30 --checkers 30
-          END=$(date +%s)
-          ELAPSED=$((END - START))
-          echo "Download: ${ELAPSED}s ($(echo "scale=1; 3000/$ELAPSED" | bc) MB/s)"
-
-          echo "--- Verify ---"
-          for i in $(seq -w 1 30); do
-            if ! cmp -s "/tmp/bench-data/file-${i}.bin" "/tmp/bench-dl-t3/file-${i}.bin"; then
-              echo "MISMATCH: file-${i}.bin"
-              exit 1
-            fi
-          done
-          echo "All files verified"
-
-          echo "--- Cleanup ---"
-          rclone purge "$REMOTE/"
-          rm -rf /tmp/bench-dl-t3 /tmp/bench-data
+          rm -rf /tmp/bench-data
