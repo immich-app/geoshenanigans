@@ -19,10 +19,15 @@ permissions:
 jobs:
   bench:
     runs-on: pokedex-giant
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
-      - name: Install bc
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq bc
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq bc
+          curl -sL "https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-64bit.tar.gz" \
+            -o /tmp/s5cmd.tar.gz
+          sudo tar xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd
+          s5cmd version
 
       - name: Setup rclone
         uses: AnimMouse/setup-rclone@26ef2133e09fd383329a1d4c1fbe6a71db1976c9 # v1.12.0
@@ -46,6 +51,14 @@ jobs:
             access_key_id = ${{ secrets.TIGRIS_WRITE_KEY_ID }}
             secret_access_key = ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
 
+      - name: Setup S3 credentials
+        run: |
+          echo "TIGRIS_KEY_ID=$KEY_ID" >> "$GITHUB_ENV"
+          echo "TIGRIS_SECRET=$SECRET" >> "$GITHUB_ENV"
+        env:
+          KEY_ID: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
+          SECRET: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
+
       - name: Generate test files
         run: |
           mkdir -p /tmp/bench-data
@@ -60,85 +73,164 @@ jobs:
           RUNS=5
           TOTAL_MB=3000
 
-          echo "## S3 Benchmark Results (${RUNS} runs, 30 x 100MB files)" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Endpoint | Direction | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 | Avg MB/s |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|----------|-----------|-------|-------|-------|-------|-------|----------|" >> "$GITHUB_STEP_SUMMARY"
-
-          for ENDPOINT in fly t3; do
-            if [ "$ENDPOINT" = "fly" ]; then
-              REMOTE="tigris-fly:$S3_BUCKET/bench-test"
-              LABEL="fly.storage.tigris.dev"
-            else
-              REMOTE="tigris-t3:$S3_BUCKET/bench-test"
-              LABEL="t3.storage.dev"
-            fi
-
-            echo ""
-            echo "=============================="
-            echo "=== $LABEL ==="
-            echo "=============================="
-
-            UP_TIMES=""
-            DL_TIMES=""
+          run_rclone_test() {
+            local REMOTE=$1 LABEL=$2
+            local UP_TIMES="" DL_TIMES=""
 
             for RUN in $(seq 1 $RUNS); do
-              echo ""
-              echo "--- Run $RUN/$RUNS ---"
-
-              # Upload
               START=$(date +%s)
               rclone sync /tmp/bench-data/ "$REMOTE/" \
                 --transfers 30 --checkers 30 \
                 --s3-upload-concurrency 8 --s3-chunk-size 64M --s3-no-check-bucket
               END=$(date +%s)
-              UP_T=$((END - START))
-              UP_SPEED=$(echo "scale=1; $TOTAL_MB/$UP_T" | bc)
-              echo "Upload: ${UP_T}s (${UP_SPEED} MB/s)"
-              UP_TIMES="$UP_TIMES $UP_T"
+              UP_TIMES="$UP_TIMES $((END-START))"
 
-              # Download
               rm -rf /tmp/bench-dl
               START=$(date +%s)
-              rclone sync "$REMOTE/" /tmp/bench-dl/ \
-                --transfers 30 --checkers 30
+              rclone sync "$REMOTE/" /tmp/bench-dl/ --transfers 30 --checkers 30
               END=$(date +%s)
-              DL_T=$((END - START))
-              DL_SPEED=$(echo "scale=1; $TOTAL_MB/$DL_T" | bc)
-              echo "Download: ${DL_T}s (${DL_SPEED} MB/s)"
-              DL_TIMES="$DL_TIMES $DL_T"
-
+              DL_TIMES="$DL_TIMES $((END-START))"
               rm -rf /tmp/bench-dl
-
-              # Delete remote files for clean next run
               rclone purge "$REMOTE/" 2>/dev/null || true
             done
 
-            # Calculate averages
-            UP_AVG=$(echo "$UP_TIMES" | tr ' ' '\n' | grep -v '^$' | awk '{s+=$1} END {printf "%.0f", s/NR}')
-            DL_AVG=$(echo "$DL_TIMES" | tr ' ' '\n' | grep -v '^$' | awk '{s+=$1} END {printf "%.0f", s/NR}')
-            UP_AVG_SPEED=$(echo "scale=1; $TOTAL_MB/$UP_AVG" | bc)
-            DL_AVG_SPEED=$(echo "scale=1; $TOTAL_MB/$DL_AVG" | bc)
+            local UP_AVG=$(echo $UP_TIMES | tr ' ' '\n' | awk '{s+=$1} END {printf "%.0f", s/NR}')
+            local DL_AVG=$(echo $DL_TIMES | tr ' ' '\n' | awk '{s+=$1} END {printf "%.0f", s/NR}')
+            echo "$LABEL upload: avg ${UP_AVG}s ($(echo "scale=1; $TOTAL_MB/$UP_AVG" | bc) MB/s) — runs: $UP_TIMES"
+            echo "$LABEL download: avg ${DL_AVG}s ($(echo "scale=1; $TOTAL_MB/$DL_AVG" | bc) MB/s) — runs: $DL_TIMES"
 
-            UP_SPEEDS=""
-            for T in $UP_TIMES; do
-              UP_SPEEDS="$UP_SPEEDS $(echo "scale=1; $TOTAL_MB/$T" | bc)"
+            echo "| rclone | $LABEL | upload | $(echo "scale=1; $TOTAL_MB/$UP_AVG" | bc) |$(for T in $UP_TIMES; do printf " %s |" "$(echo "scale=1; $TOTAL_MB/$T" | bc)"; done)" >> "$GITHUB_STEP_SUMMARY"
+            echo "| rclone | $LABEL | download | $(echo "scale=1; $TOTAL_MB/$DL_AVG" | bc) |$(for T in $DL_TIMES; do printf " %s |" "$(echo "scale=1; $TOTAL_MB/$T" | bc)"; done)" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          run_s5cmd_test() {
+            local ENDPOINT=$1 LABEL=$2
+            local UP_TIMES="" DL_TIMES=""
+
+            export AWS_ACCESS_KEY_ID="$TIGRIS_KEY_ID"
+            export AWS_SECRET_ACCESS_KEY="$TIGRIS_SECRET"
+
+            for RUN in $(seq 1 $RUNS); do
+              START=$(date +%s)
+              s5cmd --endpoint-url "$ENDPOINT" \
+                sync /tmp/bench-data/ "s3://$S3_BUCKET/bench-test/"
+              END=$(date +%s)
+              UP_TIMES="$UP_TIMES $((END-START))"
+
+              rm -rf /tmp/bench-dl
+              mkdir -p /tmp/bench-dl
+              START=$(date +%s)
+              s5cmd --endpoint-url "$ENDPOINT" \
+                sync "s3://$S3_BUCKET/bench-test/*" /tmp/bench-dl/
+              END=$(date +%s)
+              DL_TIMES="$DL_TIMES $((END-START))"
+              rm -rf /tmp/bench-dl
+
+              s5cmd --endpoint-url "$ENDPOINT" \
+                rm "s3://$S3_BUCKET/bench-test/*" 2>/dev/null || true
             done
-            DL_SPEEDS=""
-            for T in $DL_TIMES; do
-              DL_SPEEDS="$DL_SPEEDS $(echo "scale=1; $TOTAL_MB/$T" | bc)"
+
+            local UP_AVG=$(echo $UP_TIMES | tr ' ' '\n' | awk '{s+=$1} END {printf "%.0f", s/NR}')
+            local DL_AVG=$(echo $DL_TIMES | tr ' ' '\n' | awk '{s+=$1} END {printf "%.0f", s/NR}')
+            echo "$LABEL upload: avg ${UP_AVG}s ($(echo "scale=1; $TOTAL_MB/$UP_AVG" | bc) MB/s) — runs: $UP_TIMES"
+            echo "$LABEL download: avg ${DL_AVG}s ($(echo "scale=1; $TOTAL_MB/$DL_AVG" | bc) MB/s) — runs: $DL_TIMES"
+
+            echo "| s5cmd | $LABEL | upload | $(echo "scale=1; $TOTAL_MB/$UP_AVG" | bc) |$(for T in $UP_TIMES; do printf " %s |" "$(echo "scale=1; $TOTAL_MB/$T" | bc)"; done)" >> "$GITHUB_STEP_SUMMARY"
+            echo "| s5cmd | $LABEL | download | $(echo "scale=1; $TOTAL_MB/$DL_AVG" | bc) |$(for T in $DL_TIMES; do printf " %s |" "$(echo "scale=1; $TOTAL_MB/$T" | bc)"; done)" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          run_dual_test() {
+            local UP_TIMES="" DL_TIMES=""
+
+            export AWS_ACCESS_KEY_ID="$TIGRIS_KEY_ID"
+            export AWS_SECRET_ACCESS_KEY="$TIGRIS_SECRET"
+
+            # Split files: odd to fly, even to t3
+            mkdir -p /tmp/bench-odd /tmp/bench-even
+            for i in $(seq -w 1 30); do
+              N=$((10#$i))
+              if [ $((N % 2)) -eq 1 ]; then
+                ln "/tmp/bench-data/file-${i}.bin" "/tmp/bench-odd/file-${i}.bin"
+              else
+                ln "/tmp/bench-data/file-${i}.bin" "/tmp/bench-even/file-${i}.bin"
+              fi
             done
 
-            UP_S_ARR=($UP_SPEEDS)
-            DL_S_ARR=($DL_SPEEDS)
+            for RUN in $(seq 1 $RUNS); do
+              START=$(date +%s)
+              s5cmd --endpoint-url "https://fly.storage.tigris.dev" \
+                sync /tmp/bench-odd/ "s3://$S3_BUCKET/bench-test/" &
+              PID1=$!
+              s5cmd --endpoint-url "https://t3.storage.dev" \
+                sync /tmp/bench-even/ "s3://$S3_BUCKET/bench-test/" &
+              PID2=$!
+              wait $PID1 $PID2
+              END=$(date +%s)
+              UP_TIMES="$UP_TIMES $((END-START))"
 
-            echo ""
-            echo "=== $LABEL Results ==="
-            echo "Upload avg:   ${UP_AVG}s (${UP_AVG_SPEED} MB/s)"
-            echo "Download avg: ${DL_AVG}s (${DL_AVG_SPEED} MB/s)"
+              rm -rf /tmp/bench-dl
+              mkdir -p /tmp/bench-dl
+              START=$(date +%s)
+              s5cmd --endpoint-url "https://fly.storage.tigris.dev" \
+                cp "s3://$S3_BUCKET/bench-test/file-0{1,3,5,7,9}.bin" /tmp/bench-dl/ &
+              PID1=$!
+              s5cmd --endpoint-url "https://fly.storage.tigris.dev" \
+                cp "s3://$S3_BUCKET/bench-test/file-{11,13,15,17,19}.bin" /tmp/bench-dl/ &
+              PID2=$!
+              s5cmd --endpoint-url "https://t3.storage.dev" \
+                cp "s3://$S3_BUCKET/bench-test/file-0{2,4,6,8}.bin" /tmp/bench-dl/ &
+              PID3=$!
+              s5cmd --endpoint-url "https://t3.storage.dev" \
+                cp "s3://$S3_BUCKET/bench-test/file-{10,12,14,16,18,20}.bin" /tmp/bench-dl/ &
+              PID4=$!
+              s5cmd --endpoint-url "https://fly.storage.tigris.dev" \
+                cp "s3://$S3_BUCKET/bench-test/file-{21,23,25,27,29}.bin" /tmp/bench-dl/ &
+              PID5=$!
+              s5cmd --endpoint-url "https://t3.storage.dev" \
+                cp "s3://$S3_BUCKET/bench-test/file-{22,24,26,28,30}.bin" /tmp/bench-dl/ &
+              PID6=$!
+              wait $PID1 $PID2 $PID3 $PID4 $PID5 $PID6
+              END=$(date +%s)
+              DL_TIMES="$DL_TIMES $((END-START))"
+              rm -rf /tmp/bench-dl
 
-            echo "| $LABEL | Upload | ${UP_S_ARR[0]} | ${UP_S_ARR[1]} | ${UP_S_ARR[2]} | ${UP_S_ARR[3]} | ${UP_S_ARR[4]} | **${UP_AVG_SPEED}** |" >> "$GITHUB_STEP_SUMMARY"
-            echo "| $LABEL | Download | ${DL_S_ARR[0]} | ${DL_S_ARR[1]} | ${DL_S_ARR[2]} | ${DL_S_ARR[3]} | ${DL_S_ARR[4]} | **${DL_AVG_SPEED}** |" >> "$GITHUB_STEP_SUMMARY"
-          done
+              s5cmd --endpoint-url "https://fly.storage.tigris.dev" \
+                rm "s3://$S3_BUCKET/bench-test/*" 2>/dev/null || true
+            done
+
+            rm -rf /tmp/bench-odd /tmp/bench-even
+
+            local UP_AVG=$(echo $UP_TIMES | tr ' ' '\n' | awk '{s+=$1} END {printf "%.0f", s/NR}')
+            local DL_AVG=$(echo $DL_TIMES | tr ' ' '\n' | awk '{s+=$1} END {printf "%.0f", s/NR}')
+            echo "Dual endpoint upload: avg ${UP_AVG}s ($(echo "scale=1; $TOTAL_MB/$UP_AVG" | bc) MB/s) — runs: $UP_TIMES"
+            echo "Dual endpoint download: avg ${DL_AVG}s ($(echo "scale=1; $TOTAL_MB/$DL_AVG" | bc) MB/s) — runs: $DL_TIMES"
+
+            echo "| s5cmd | **dual endpoint** | upload | $(echo "scale=1; $TOTAL_MB/$UP_AVG" | bc) |$(for T in $UP_TIMES; do printf " %s |" "$(echo "scale=1; $TOTAL_MB/$T" | bc)"; done)" >> "$GITHUB_STEP_SUMMARY"
+            echo "| s5cmd | **dual endpoint** | download | $(echo "scale=1; $TOTAL_MB/$DL_AVG" | bc) |$(for T in $DL_TIMES; do printf " %s |" "$(echo "scale=1; $TOTAL_MB/$T" | bc)"; done)" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          echo "## S3 Benchmark (${RUNS} runs, 30 x 100MB = 3GB)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Tool | Endpoint | Direction | Avg MB/s | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|------|----------|-----------|----------|-------|-------|-------|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "=== rclone: fly.storage.tigris.dev ==="
+          run_rclone_test "tigris-fly:$S3_BUCKET/bench-test" "fly"
+
+          echo ""
+          echo "=== rclone: t3.storage.dev ==="
+          run_rclone_test "tigris-t3:$S3_BUCKET/bench-test" "t3"
+
+          echo ""
+          echo "=== s5cmd: fly.storage.tigris.dev ==="
+          run_s5cmd_test "https://fly.storage.tigris.dev" "fly"
+
+          echo ""
+          echo "=== s5cmd: t3.storage.dev ==="
+          run_s5cmd_test "https://t3.storage.dev" "t3"
+
+          echo ""
+          echo "=== s5cmd: dual endpoint (fly + t3 in parallel) ==="
+          run_dual_test
 
           rm -rf /tmp/bench-data
