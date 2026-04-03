@@ -122,20 +122,20 @@ jobs:
           S="s5cmd --endpoint-url"
 
           run_test "fly" \
-            "$S $FLY sync /tmp/bench-data/*.bin ${PREFIX}/" \
-            "$S $FLY sync ${PREFIX}/'*' /tmp/bench-dl/"
+            "$S $FLY cp /tmp/bench-data/*.bin ${PREFIX}/" \
+            "$S $FLY cp ${PREFIX}/'*' /tmp/bench-dl/"
 
           run_test "t3" \
-            "$S $T3 sync /tmp/bench-data/*.bin ${PREFIX}/" \
-            "$S $T3 sync ${PREFIX}/'*' /tmp/bench-dl/"
+            "$S $T3 cp /tmp/bench-data/*.bin ${PREFIX}/" \
+            "$S $T3 cp ${PREFIX}/'*' /tmp/bench-dl/"
 
           run_test "dual (fly+t3)" \
-            "$S $FLY sync /tmp/bench-data/odd/ ${PREFIX}/ & $S $T3 sync /tmp/bench-data/even/ ${PREFIX}/ & wait" \
-            "$S $FLY sync ${PREFIX}/'*' /tmp/bench-dl/ & $S $T3 sync ${PREFIX}/'*' /tmp/bench-dl/ & wait"
+            "$S $FLY cp /tmp/bench-data/odd/* ${PREFIX}/ & $S $T3 cp /tmp/bench-data/even/* ${PREFIX}/ & wait" \
+            "$S $FLY cp ${PREFIX}/'*' /tmp/bench-dl/ & $S $T3 cp ${PREFIX}/'*' /tmp/bench-dl/ & wait"
 
           run_test "t3 up / fly down" \
-            "$S $T3 sync /tmp/bench-data/*.bin ${PREFIX}/" \
-            "$S $FLY sync ${PREFIX}/'*' /tmp/bench-dl/"
+            "$S $T3 cp /tmp/bench-data/*.bin ${PREFIX}/" \
+            "$S $FLY cp ${PREFIX}/'*' /tmp/bench-dl/"
 
       - name: "Phase 2: Parameter tuning (best upload endpoint)"
         run: |
@@ -184,7 +184,7 @@ jobs:
           export AWS_SECRET_ACCESS_KEY="$TIGRIS_SECRET"
 
           # Upload test data once
-          s5cmd --endpoint-url "$T3" sync /tmp/bench-data/*.bin "${PREFIX}/"
+          s5cmd --endpoint-url "$T3" cp /tmp/bench-data/*.bin "${PREFIX}/"
 
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "## Phase 3: s5cmd Download Parameter Tuning (fly, 3 runs each)" >> "$GITHUB_STEP_SUMMARY"
