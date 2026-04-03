@@ -177,7 +177,7 @@ jobs:
         env:
           YESTERDAY: ${{ steps.dates.outputs.yesterday }}
         run: |
-          if rclone ls "tigris:$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/planet/" 2>/dev/null | grep -q '.bin'; then
+          if rclone lsf "tigris:$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/" 2>/dev/null | head -1 | grep -q .; then
             echo "found=true" >> "$GITHUB_OUTPUT"
             echo "Yesterday's build ($YESTERDAY) exists on Tigris"
           else
