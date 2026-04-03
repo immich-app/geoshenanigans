@@ -370,12 +370,20 @@ jobs:
           rm -f "$WORKDIR/planet.osm.pbf"
           echo "$(find "$WORKDIR/output" -name "*.bin" | wc -l) bin files produced"
 
-      - name: Generate and verify patches
+      - name: Verify patches + upload to Tigris
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
           OLD_DATE: ${{ steps.dates.outputs.yesterday }}
           NEW_DATE: ${{ steps.dates.outputs.today }}
         run: |
+          # Start uploading today's indexes to Tigris in background while we verify patches
+          echo "Starting background upload of today's build ($NEW_DATE) to Tigris..."
+          rclone sync "$WORKDIR/output/" \
+            "tigris:$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/" \
+            --transfers 32 --retries 5 --low-level-retries 10 \
+            --s3-upload-concurrency 8 --s3-chunk-size 64M --s3-no-check-bucket --checkers 32 &
+          UPLOAD_PID=$!
+
           echo "## Planet Test Results ($OLD_DATE → $NEW_DATE)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Variant | Files | Patch Size | Verified |" >> "$GITHUB_STEP_SUMMARY"
@@ -433,10 +441,13 @@ jobs:
               JOBS=$((JOBS - 1))
             fi
           done
-          wait
 
-          # old-output kept for upload step
+          # Wait for all patch jobs (but not the upload)
+          for job in $(jobs -p | grep -v $UPLOAD_PID); do
+            wait $job 2>/dev/null || true
+          done
 
+          # Collect results
           PASS=0; FAIL=0; SKIP=0
           for variant in $VARIANTS; do
             SAFE_NAME=$(echo "$variant" | tr '/' '_')
@@ -466,28 +477,23 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "**Total: $PASS pass, $FAIL fail, $SKIP skip**" >> "$GITHUB_STEP_SUMMARY"
           echo "Results: $PASS pass, $FAIL fail, $SKIP skip"
-          [ $FAIL -gt 0 ] && exit 1 || true
 
-      - name: Upload builds to S3
-        env:
-          WORKDIR: ${{ steps.setup.outputs.workdir }}
-          OLD_DATE: ${{ steps.dates.outputs.yesterday }}
-          NEW_DATE: ${{ steps.dates.outputs.today }}
-        run: |
-          echo "Uploading yesterday's build ($OLD_DATE)..."
+          # Upload yesterday's build if not already on Tigris
           rclone sync "$WORKDIR/old-output/" \
             "tigris:$S3_BUCKET/$S3_PREFIX/builds/$OLD_DATE/" \
-            --progress --transfers 32 --retries 5 --low-level-retries 10 \
-            --s3-upload-concurrency 8 --s3-chunk-size 64M --s3-no-check-bucket --checkers 32
+            --transfers 32 --retries 5 --low-level-retries 10 \
+            --s3-upload-concurrency 8 --s3-chunk-size 64M --s3-no-check-bucket --checkers 32 &
+          UPLOAD_OLD_PID=$!
 
-          echo "Uploading today's build ($NEW_DATE)..."
-          rclone sync "$WORKDIR/output/" \
-            "tigris:$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/" \
-            --progress --transfers 32 --retries 5 --low-level-retries 10 \
-            --s3-upload-concurrency 8 --s3-chunk-size 64M --s3-no-check-bucket --checkers 32
+          # Wait for both uploads
+          echo "Waiting for Tigris uploads to complete..."
+          wait $UPLOAD_PID && echo "Today's upload complete" || echo "::warning::Today's upload had errors"
+          wait $UPLOAD_OLD_PID && echo "Yesterday's upload complete" || echo "::warning::Yesterday's upload had errors"
 
           echo "$NEW_DATE" | rclone rcat "tigris:$S3_BUCKET/$S3_PREFIX/builds/latest.txt"
-          echo "Upload complete"
+          echo "All uploads complete"
+
+          [ $FAIL -gt 0 ] && exit 1 || true
 
   # --- Production build: full planet + S3 upload ---
   build:
