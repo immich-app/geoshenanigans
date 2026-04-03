@@ -496,10 +496,28 @@ jobs:
           wait $UPLOAD_IDX_PID && echo "Today's index upload complete" || echo "::warning::Today's index upload had errors"
           wait $UPLOAD_OLD_PID && echo "Yesterday's index upload complete" || echo "::warning::Yesterday's index upload had errors"
 
-          echo "$NEW_DATE" | rclone rcat "tigris:$S3_BUCKET/$S3_PREFIX/builds/latest.txt"
-          echo "All complete"
-
           [ $FAIL -gt 0 ] && exit 1 || true
+
+          # Write validation file for today's build
+          jq -n \
+            --arg date "$NEW_DATE" \
+            --arg prev "$OLD_DATE" \
+            --argjson pass "$PASS" \
+            --argjson fail "$FAIL" \
+            --argjson skip "$SKIP" \
+            --arg validated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{date: $date, previous: $prev, patches: {pass: $pass, fail: $fail, skip: $skip}, validated_at: $validated_at}' \
+            | rclone rcat "tigris:$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/validated.json"
+          echo "Validation file uploaded for $NEW_DATE"
+
+          # Update top-level manifest
+          jq -n \
+            --arg latest "$NEW_DATE" \
+            --arg previous "$OLD_DATE" \
+            --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{latest_build: $latest, previous_build: $previous, updated_at: $updated_at}' \
+            | rclone rcat "tigris:$S3_BUCKET/$S3_PREFIX/latest.json"
+          echo "Manifest updated"
 
   # --- Production build: full planet + S3 upload ---
   build:
@@ -604,7 +622,11 @@ jobs:
             --progress --transfers 32 --retries 5 --low-level-retries 10 \
             --s3-upload-concurrency 8 --s3-chunk-size 64M --s3-no-check-bucket --checkers 32
 
-          echo "$BUILD_DATE" | rclone rcat "tigris:$S3_BUCKET/$S3_PREFIX/builds/latest.txt"
+          jq -n \
+            --arg latest "$BUILD_DATE" \
+            --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{latest_build: $latest, updated_at: $updated_at}' \
+            | rclone rcat "tigris:$S3_BUCKET/$S3_PREFIX/latest.json"
 
       - name: Find previous build
         if: steps.meta.outputs.skip != 'true' && inputs.skip_patch != true
