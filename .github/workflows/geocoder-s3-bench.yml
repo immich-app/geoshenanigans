@@ -122,19 +122,19 @@ jobs:
           S="s5cmd --endpoint-url"
 
           run_test "fly" \
-            "$S $FLY cp /tmp/bench-data/*.bin ${PREFIX}/" \
+            "$S $FLY cp '/tmp/bench-data/*.bin' ${PREFIX}/" \
             "$S $FLY cp ${PREFIX}/'*' /tmp/bench-dl/"
 
           run_test "t3" \
-            "$S $T3 cp /tmp/bench-data/*.bin ${PREFIX}/" \
+            "$S $T3 cp '/tmp/bench-data/*.bin' ${PREFIX}/" \
             "$S $T3 cp ${PREFIX}/'*' /tmp/bench-dl/"
 
           run_test "dual (fly+t3)" \
-            "$S $FLY cp /tmp/bench-data/odd/* ${PREFIX}/ & $S $T3 cp /tmp/bench-data/even/* ${PREFIX}/ & wait" \
+            "$S $FLY cp '/tmp/bench-data/odd/*' ${PREFIX}/ & $S $T3 cp '/tmp/bench-data/even/*' ${PREFIX}/ & wait" \
             "$S $FLY cp ${PREFIX}/'*' /tmp/bench-dl/ & $S $T3 cp ${PREFIX}/'*' /tmp/bench-dl/ & wait"
 
           run_test "t3 up / fly down" \
-            "$S $T3 cp /tmp/bench-data/*.bin ${PREFIX}/" \
+            "$S $T3 cp '/tmp/bench-data/*.bin' ${PREFIX}/" \
             "$S $FLY cp ${PREFIX}/'*' /tmp/bench-dl/"
 
       - name: "Phase 2: Parameter tuning (best upload endpoint)"
