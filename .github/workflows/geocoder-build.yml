@@ -204,9 +204,8 @@ jobs:
           (
             echo "[Tigris] Downloading yesterday's indexes ($YESTERDAY)..."
             START=$(date +%s)
-            s5cmd --endpoint-url $S3_ENDPOINT --numworkers 15 cp --concurrency 8 "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/" \
-              "$WORKDIR/old-output/" \
-              --transfers 32 --retries 5 --low-level-retries 10 --checkers 32
+            s5cmd --endpoint-url $S3_ENDPOINT --numworkers 15 \
+              cp --concurrency 8 "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/*" "$WORKDIR/old-output/"
             END=$(date +%s)
             echo "[Tigris] Downloaded in $((END-START))s — $(find "$WORKDIR/old-output" -name "*.bin" | wc -l) bin files"
           ) &
@@ -645,9 +644,8 @@ jobs:
           PREV: ${{ steps.prev.outputs.date }}
         run: |
           echo "Downloading previous build ($PREV) from S3..."
-          s5cmd --endpoint-url $S3_ENDPOINT --numworkers 15 cp --concurrency 8 "s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV/" \
-            "$WORKDIR/prev-build/" \
-            --progress --transfers 16 --retries 5 --low-level-retries 10
+          s5cmd --endpoint-url $S3_ENDPOINT --numworkers 15 \
+            cp --concurrency 8 "s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV/*" "$WORKDIR/prev-build/"
 
       - name: Generate and verify patches for all variants
         if: steps.prev.outputs.found == 'true'
@@ -776,8 +774,7 @@ jobs:
             COUNT=$((COUNT + 1))
             if [ $COUNT -gt 2 ]; then
               echo "Deleting old build: $build"
-              s5cmd --endpoint-url $S3_ENDPOINT rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$build/*" \
-                --retries 3
+              s5cmd --endpoint-url $S3_ENDPOINT rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$build/*"
             fi
           done <<< "$BUILDS"
 
