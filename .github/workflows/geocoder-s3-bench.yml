@@ -162,7 +162,7 @@ jobs:
                 cleanup
                 START=$(date +%s)
                 s5cmd --endpoint-url "$T3" --numworkers $WORKERS \
-                  cp --concurrency $CONC /tmp/bench-data/*.bin "${PREFIX}/"
+                  cp --concurrency $CONC '/tmp/bench-data/*.bin' "${PREFIX}/"
                 END=$(date +%s)
                 TIMES="$TIMES $((END - START))"
               done
@@ -184,7 +184,7 @@ jobs:
           export AWS_SECRET_ACCESS_KEY="$TIGRIS_SECRET"
 
           # Upload test data once
-          s5cmd --endpoint-url "$T3" cp /tmp/bench-data/*.bin "${PREFIX}/"
+          s5cmd --endpoint-url "$T3" cp '/tmp/bench-data/*.bin' "${PREFIX}/"
 
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "## Phase 3: s5cmd Download Parameter Tuning (fly, 3 runs each)" >> "$GITHUB_STEP_SUMMARY"
