@@ -73,7 +73,8 @@ jobs:
           done
           echo "Total: 3 GiB"
 
-      - name: "Phase 1: Endpoint comparison"
+      - name: "Phase 1: Endpoint comparison (SKIPPED — results already collected)"
+        if: false
         run: |
           RUNS=5
           TOTAL_MB=3000
