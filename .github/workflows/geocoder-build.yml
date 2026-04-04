@@ -204,16 +204,14 @@ jobs:
             BASE_URL="$S3_PUBLIC_URL/$S3_PREFIX/builds/$YESTERDAY"
             # List files via s5cmd, download via aria2 from public HTTP
             s5cmd --endpoint-url "$S3_ENDPOINT" ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/*" 2>/dev/null \
-              | awk '{print $NF}' | grep -v '/$' \
-              | while IFS= read -r KEY; do
-                  # KEY is the full S3 path like s3://bucket/geocoder/builds/2026-04-03/full/file.bin
-                  REL="${KEY#*builds/$YESTERDAY/}"
+              | awk '{print $NF}' | grep '\.bin$\|\.json$' \
+              | while IFS= read -r REL; do
                   DIR="$WORKDIR/old-output/$(dirname "$REL")"
                   mkdir -p "$DIR"
                   echo "$BASE_URL/$REL"
                   echo "  dir=$DIR"
                 done > /tmp/aria2-indexes.txt
-            URLS=$(grep -c '^http' /tmp/aria2-indexes.txt 2>/dev/null || echo 0)
+            URLS=$(grep -c '^http' /tmp/aria2-indexes.txt || true)
             echo "Found $URLS files to download"
             if [ "$URLS" -gt 0 ]; then
               aria2c -x 16 -j 30 --max-tries=3 --auto-file-renaming=false \
