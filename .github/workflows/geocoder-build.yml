@@ -374,16 +374,7 @@ jobs:
           OLD_DATE: ${{ steps.dates.outputs.yesterday }}
           NEW_DATE: ${{ steps.dates.outputs.today }}
         run: |
-          # Start uploading today's indexes to Tigris immediately (read-only during diff/patch)
-          echo "Starting background upload of today's indexes ($NEW_DATE) to Tigris..."
-          s5cmd --endpoint-url $S3_ENDPOINT --numworkers 30 \
-            cp --concurrency 4 "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/" &
-          UPLOAD_IDX_PID=$!
-
-          # Upload yesterday's build if needed
-          s5cmd --endpoint-url $S3_ENDPOINT --numworkers 30 \
-            cp --concurrency 4 "$WORKDIR/old-output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$OLD_DATE/" &
-          UPLOAD_OLD_PID=$!
+          S5="s5cmd --endpoint-url $S3_ENDPOINT"
 
           echo "## Planet Test Results ($OLD_DATE → $NEW_DATE)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -417,10 +408,6 @@ jobs:
               geocoder-diff "$OLD_DIR" "$NEW_DIR" -o "$PATCH_FILE" 2>/dev/null
               PATCH_SIZE=$(stat -c%s "$PATCH_FILE" 2>/dev/null || echo 0)
               PATCH_KB=$((PATCH_SIZE / 1024))
-
-              # Upload patch to Tigris in background
-              s5cmd --endpoint-url $S3_ENDPOINT \
-                cp "$PATCH_FILE" "s3://$S3_BUCKET/$S3_PREFIX/patches/$variant/${OLD_DATE}-to-${NEW_DATE}.gcpatch" &
 
               # Verify patch
               VERIFY_DIR="$WORKDIR/verify-$SAFE_NAME"
@@ -484,14 +471,45 @@ jobs:
           echo "**Total: $PASS pass, $FAIL fail, $SKIP skip**" >> "$GITHUB_STEP_SUMMARY"
           echo "Results: $PASS pass, $FAIL fail, $SKIP skip"
 
-          # Wait for index uploads
-          echo "Waiting for Tigris index uploads..."
-          wait $UPLOAD_IDX_PID && echo "Today's index upload complete" || echo "::warning::Today's index upload had errors"
-          wait $UPLOAD_OLD_PID && echo "Yesterday's index upload complete" || echo "::warning::Yesterday's index upload had errors"
-
           [ $FAIL -gt 0 ] && exit 1 || true
 
-          # Write validation file for today's build
+          # Upload indexes to Tigris
+          echo "Uploading today's indexes ($NEW_DATE)..."
+          $S5 --numworkers 30 cp --concurrency 4 "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/"
+          echo "Uploading yesterday's indexes ($OLD_DATE)..."
+          $S5 --numworkers 30 cp --concurrency 4 "$WORKDIR/old-output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$OLD_DATE/"
+
+          # Verify uploads by comparing file counts
+          LOCAL_NEW=$(find "$WORKDIR/output" -type f | wc -l)
+          LOCAL_OLD=$(find "$WORKDIR/old-output" -type f | wc -l)
+          REMOTE_NEW=$($S5 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null | wc -l)
+          REMOTE_OLD=$($S5 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$OLD_DATE/*" 2>/dev/null | wc -l)
+          echo "Today:     local=$LOCAL_NEW remote=$REMOTE_NEW"
+          echo "Yesterday: local=$LOCAL_OLD remote=$REMOTE_OLD"
+
+          if [ "$REMOTE_NEW" -lt "$LOCAL_NEW" ]; then
+            echo "::error::Today's upload incomplete: $REMOTE_NEW/$LOCAL_NEW files on Tigris"
+            exit 1
+          fi
+          if [ "$REMOTE_OLD" -lt "$LOCAL_OLD" ]; then
+            echo "::error::Yesterday's upload incomplete: $REMOTE_OLD/$LOCAL_OLD files on Tigris"
+            exit 1
+          fi
+          echo "Upload verification: PASS"
+
+          # Upload patches
+          if [ -d "$PATCHES_DIR" ]; then
+            echo "Uploading patches..."
+            for P in "$PATCHES_DIR"/*.gcpatch; do
+              [ -f "$P" ] || continue
+              SAFE_NAME=$(basename "$P" .gcpatch)
+              VARIANT=$(echo "$SAFE_NAME" | tr '_' '/')
+              $S5 cp "$P" "s3://$S3_BUCKET/$S3_PREFIX/patches/$VARIANT/${OLD_DATE}-to-${NEW_DATE}.gcpatch"
+            done
+          fi
+          rm -rf "$PATCHES_DIR" "$WORKDIR/old-output"
+
+          # Only write manifests after all uploads verified
           jq -n \
             --arg date "$NEW_DATE" \
             --arg prev "$OLD_DATE" \
@@ -500,16 +518,15 @@ jobs:
             --argjson skip "$SKIP" \
             --arg validated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             '{date: $date, previous: $prev, patches: {pass: $pass, fail: $fail, skip: $skip}, validated_at: $validated_at}' \
-            | s5cmd --endpoint-url $S3_ENDPOINT pipe "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/validated.json"
+            | $S5 pipe "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/validated.json"
           echo "Validation file uploaded for $NEW_DATE"
 
-          # Update top-level manifest
           jq -n \
             --arg latest "$NEW_DATE" \
             --arg previous "$OLD_DATE" \
             --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             '{latest_build: $latest, previous_build: $previous, updated_at: $updated_at}' \
-            | s5cmd --endpoint-url $S3_ENDPOINT pipe "s3://$S3_BUCKET/$S3_PREFIX/latest.json"
+            | $S5 pipe "s3://$S3_BUCKET/$S3_PREFIX/latest.json"
           echo "Manifest updated"
 
   # --- Production build: full planet + S3 upload ---
