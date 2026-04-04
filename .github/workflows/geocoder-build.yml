@@ -129,7 +129,9 @@ jobs:
 
       - name: Configure Tigris credentials
         run: |
-          # Save container's cache credentials
+          # Mask and save container's cache credentials
+          echo "::add-mask::$AWS_ACCESS_KEY_ID"
+          echo "::add-mask::$AWS_SECRET_ACCESS_KEY"
           echo "CACHE_AWS_KEY=$AWS_ACCESS_KEY_ID" >> "$GITHUB_ENV"
           echo "CACHE_AWS_SECRET=$AWS_SECRET_ACCESS_KEY" >> "$GITHUB_ENV"
           # Set Tigris credentials as default for s5cmd
@@ -556,7 +558,9 @@ jobs:
 
       - name: Configure Tigris credentials
         run: |
-          # Save container's cache credentials
+          # Mask and save container's cache credentials
+          echo "::add-mask::$AWS_ACCESS_KEY_ID"
+          echo "::add-mask::$AWS_SECRET_ACCESS_KEY"
           echo "CACHE_AWS_KEY=$AWS_ACCESS_KEY_ID" >> "$GITHUB_ENV"
           echo "CACHE_AWS_SECRET=$AWS_SECRET_ACCESS_KEY" >> "$GITHUB_ENV"
           # Set Tigris credentials as default for s5cmd
