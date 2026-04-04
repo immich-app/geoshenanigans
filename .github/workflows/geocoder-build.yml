@@ -197,12 +197,14 @@ jobs:
           # Download yesterday's indexes from Tigris and today's PBF from cache in parallel
           echo "Starting parallel downloads..."
 
-          # Background: download yesterday's indexes from Tigris
+          # Background: download yesterday's indexes via public HTTP with directory crawl
           (
-            echo "[Tigris] Downloading yesterday's indexes ($YESTERDAY)..."
+            echo "[Tigris] Downloading yesterday's indexes ($YESTERDAY) via HTTP..."
             START=$(date +%s)
-            s5cmd --endpoint-url "$S3_ENDPOINT" --numworkers 15 \
-              cp --concurrency 8 "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/*" "$WORKDIR/old-output/"
+            BASE_URL="$S3_PUBLIC_URL/$S3_PREFIX/builds/$YESTERDAY"
+            # wget recursive crawl of the directory listing, strip URL prefix to get local paths
+            wget -r -np -nH --cut-dirs=3 -P "$WORKDIR/old-output" -q -e robots=off \
+              --reject "index.html*" "$BASE_URL/"
             END=$(date +%s)
             echo "[Tigris] Downloaded in $((END-START))s — $(find "$WORKDIR/old-output" -type f | wc -l) files"
           ) &
