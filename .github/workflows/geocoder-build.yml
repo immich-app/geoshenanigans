@@ -377,6 +377,26 @@ jobs:
           NEW_DATE: ${{ steps.dates.outputs.today }}
         run: |
           S5="s5cmd --endpoint-url $S3_ENDPOINT"
+          UPLOAD_LOG="$WORKDIR/upload.log"
+
+          # Start uploading today's indexes in background (read-only during patching)
+          echo "Starting background upload of today's indexes ($NEW_DATE)..."
+          $S5 --numworkers 30 cp --concurrency 4 \
+            "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/" \
+            > "$UPLOAD_LOG" 2>&1 &
+          UPLOAD_IDX_PID=$!
+
+          # Upload yesterday's indexes in background if built locally
+          UPLOAD_OLD_PID=""
+          if [ -d "$WORKDIR/old-output" ]; then
+            echo "Starting background upload of yesterday's indexes ($OLD_DATE)..."
+            $S5 --numworkers 30 cp --concurrency 4 \
+              "$WORKDIR/old-output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$OLD_DATE/" \
+              >> "$UPLOAD_LOG" 2>&1 &
+            UPLOAD_OLD_PID=$!
+          else
+            echo "Yesterday's indexes already on Tigris (fast path)"
+          fi
 
           echo "## Planet Test Results ($OLD_DATE → $NEW_DATE)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -388,7 +408,7 @@ jobs:
           mkdir -p "$RESULTS_DIR" "$PATCHES_DIR"
           VARIANTS=$(cd "$WORKDIR/output" && find . -name "*.bin" -exec dirname {} \; | sort -u | sed 's|^\./||')
 
-          # Generate patches, upload each immediately, then verify
+          # Generate patches, start uploading each, then verify — all in parallel
           JOBS=0
           MAX_JOBS=$(nproc)
           for variant in $VARIANTS; do
@@ -411,6 +431,12 @@ jobs:
               PATCH_SIZE=$(stat -c%s "$PATCH_FILE" 2>/dev/null || echo 0)
               PATCH_KB=$((PATCH_SIZE / 1024))
 
+              # Upload patch in background while we verify
+              $S5 cp "$PATCH_FILE" \
+                "s3://$S3_BUCKET/$S3_PREFIX/patches/$variant/${OLD_DATE}-to-${NEW_DATE}.gcpatch" \
+                >> "$UPLOAD_LOG" 2>&1 &
+              PATCH_UPLOAD_PID=$!
+
               # Verify patch
               VERIFY_DIR="$WORKDIR/verify-$SAFE_NAME"
               mkdir -p "$VERIFY_DIR"
@@ -423,6 +449,9 @@ jobs:
                 h2=$(md5sum "$NEW_DIR/$b" | awk '{print $1}')
                 [ "$h1" = "$h2" ] && MATCH=$((MATCH + 1))
               done
+
+              # Wait for this patch's upload before reporting
+              wait $PATCH_UPLOAD_PID
 
               if [ $MATCH -eq $N_NEW ]; then
                 echo "PASS $N_NEW $PATCH_KB" > "$RESULTS_DIR/$SAFE_NAME"
@@ -440,7 +469,7 @@ jobs:
           done
           wait
 
-          rm -rf "$PATCHES_DIR" "$WORKDIR/old-output"
+          rm -rf "$WORKDIR/old-output"
 
           # Collect results
           PASS=0; FAIL=0; SKIP=0
@@ -467,7 +496,7 @@ jobs:
               FAIL=$((FAIL + 1))
             fi
           done
-          rm -rf "$RESULTS_DIR"
+          rm -rf "$RESULTS_DIR" "$PATCHES_DIR"
 
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "**Total: $PASS pass, $FAIL fail, $SKIP skip**" >> "$GITHUB_STEP_SUMMARY"
@@ -475,28 +504,23 @@ jobs:
 
           [ $FAIL -gt 0 ] && exit 1 || true
 
-          # Upload indexes to Tigris
-          echo "Uploading today's indexes ($NEW_DATE)..."
-          $S5 --numworkers 30 cp --concurrency 4 "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/"
-          # Upload yesterday's indexes only if they were built locally (bootstrap path)
-          if [ -d "$WORKDIR/old-output" ]; then
-            echo "Uploading yesterday's indexes ($OLD_DATE)..."
-            $S5 --numworkers 30 cp --concurrency 4 "$WORKDIR/old-output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$OLD_DATE/"
-          else
-            echo "Yesterday's indexes already on Tigris (fast path)"
+          # Check upload log for errors
+          if grep -qi "error" "$UPLOAD_LOG" 2>/dev/null; then
+            echo "::warning::Upload log contains errors:"
+            grep -i "error" "$UPLOAD_LOG"
           fi
 
-          # Verify uploads by comparing file counts
+          # Verify file counts on Tigris
           LOCAL_NEW=$(find "$WORKDIR/output" -type f | wc -l)
           REMOTE_NEW=$($S5 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null | wc -l)
           echo "Today: local=$LOCAL_NEW remote=$REMOTE_NEW"
 
           if [ "$REMOTE_NEW" -lt "$LOCAL_NEW" ]; then
             echo "::error::Today's upload incomplete: $REMOTE_NEW/$LOCAL_NEW files on Tigris"
+            cat "$UPLOAD_LOG"
             exit 1
           fi
 
-          # Verify yesterday's build exists on Tigris
           REMOTE_OLD=$($S5 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$OLD_DATE/*" 2>/dev/null | wc -l)
           echo "Yesterday: remote=$REMOTE_OLD files on Tigris"
           if [ "$REMOTE_OLD" -eq 0 ]; then
