@@ -476,23 +476,29 @@ jobs:
           # Upload indexes to Tigris
           echo "Uploading today's indexes ($NEW_DATE)..."
           $S5 --numworkers 30 cp --concurrency 4 "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/"
-          echo "Uploading yesterday's indexes ($OLD_DATE)..."
-          $S5 --numworkers 30 cp --concurrency 4 "$WORKDIR/old-output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$OLD_DATE/"
+          # Upload yesterday's indexes only if they were built locally (bootstrap path)
+          if [ -d "$WORKDIR/old-output" ]; then
+            echo "Uploading yesterday's indexes ($OLD_DATE)..."
+            $S5 --numworkers 30 cp --concurrency 4 "$WORKDIR/old-output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$OLD_DATE/"
+          else
+            echo "Yesterday's indexes already on Tigris (fast path)"
+          fi
 
           # Verify uploads by comparing file counts
           LOCAL_NEW=$(find "$WORKDIR/output" -type f | wc -l)
-          LOCAL_OLD=$(find "$WORKDIR/old-output" -type f | wc -l)
           REMOTE_NEW=$($S5 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null | wc -l)
-          REMOTE_OLD=$($S5 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$OLD_DATE/*" 2>/dev/null | wc -l)
-          echo "Today:     local=$LOCAL_NEW remote=$REMOTE_NEW"
-          echo "Yesterday: local=$LOCAL_OLD remote=$REMOTE_OLD"
+          echo "Today: local=$LOCAL_NEW remote=$REMOTE_NEW"
 
           if [ "$REMOTE_NEW" -lt "$LOCAL_NEW" ]; then
             echo "::error::Today's upload incomplete: $REMOTE_NEW/$LOCAL_NEW files on Tigris"
             exit 1
           fi
-          if [ "$REMOTE_OLD" -lt "$LOCAL_OLD" ]; then
-            echo "::error::Yesterday's upload incomplete: $REMOTE_OLD/$LOCAL_OLD files on Tigris"
+
+          # Verify yesterday's build exists on Tigris
+          REMOTE_OLD=$($S5 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$OLD_DATE/*" 2>/dev/null | wc -l)
+          echo "Yesterday: remote=$REMOTE_OLD files on Tigris"
+          if [ "$REMOTE_OLD" -eq 0 ]; then
+            echo "::error::Yesterday's build ($OLD_DATE) missing from Tigris"
             exit 1
           fi
           echo "Upload verification: PASS"
