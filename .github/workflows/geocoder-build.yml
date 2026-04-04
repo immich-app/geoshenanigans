@@ -202,14 +202,24 @@ jobs:
           # Download yesterday's indexes from Tigris and today's PBF from cache in parallel
           echo "Starting parallel downloads..."
 
-          # Background: download yesterday's indexes from Tigris
+          # Background: download yesterday's indexes via public HTTP (faster than S3 API)
           (
-            echo "[Tigris] Downloading yesterday's indexes ($YESTERDAY)..."
+            echo "[Tigris] Downloading yesterday's indexes ($YESTERDAY) via HTTP..."
             START=$(date +%s)
-            s5cmd --endpoint-url $S3_ENDPOINT --numworkers 15 \
-              cp --concurrency 8 "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/*" "$WORKDIR/old-output/"
+            # List files via S3 API, download via aria2 from public HTTP
+            $S5 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/**" 2>/dev/null \
+              | awk '{print $NF}' | grep -v '/$' \
+              | while IFS= read -r KEY; do
+                  REL="${KEY#*/builds/$YESTERDAY/}"
+                  DIR="$WORKDIR/old-output/$(dirname "$REL")"
+                  mkdir -p "$DIR"
+                  echo "$S3_PUBLIC_URL/$S3_PREFIX/builds/$YESTERDAY/$REL"
+                  echo "  dir=$DIR"
+                done > /tmp/aria2-indexes.txt
+            aria2c -x 16 -j 30 --max-tries=3 --auto-file-renaming=false \
+              -i /tmp/aria2-indexes.txt 2>/dev/null
             END=$(date +%s)
-            echo "[Tigris] Downloaded in $((END-START))s — $(find "$WORKDIR/old-output" -name "*.bin" | wc -l) bin files"
+            echo "[Tigris] Downloaded in $((END-START))s — $(find "$WORKDIR/old-output" -type f | wc -l) files"
           ) &
           TIGRIS_PID=$!
 
@@ -694,9 +704,19 @@ jobs:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
           PREV: ${{ steps.prev.outputs.date }}
         run: |
-          echo "Downloading previous build ($PREV) from S3..."
-          s5cmd --endpoint-url $S3_ENDPOINT --numworkers 15 \
-            cp --concurrency 8 "s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV/*" "$WORKDIR/prev-build/"
+          echo "Downloading previous build ($PREV) via HTTP..."
+          S5="s5cmd --endpoint-url $S3_ENDPOINT"
+          $S5 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV/**" 2>/dev/null \
+            | awk '{print $NF}' | grep -v '/$' \
+            | while IFS= read -r KEY; do
+                REL="${KEY#*/builds/$PREV/}"
+                DIR="$WORKDIR/prev-build/$(dirname "$REL")"
+                mkdir -p "$DIR"
+                echo "$S3_PUBLIC_URL/$S3_PREFIX/builds/$PREV/$REL"
+                echo "  dir=$DIR"
+              done > /tmp/aria2-prev.txt
+          aria2c -x 16 -j 30 --max-tries=3 --auto-file-renaming=false \
+            -i /tmp/aria2-prev.txt 2>/dev/null
 
       - name: Generate and verify patches for all variants
         if: steps.prev.outputs.found == 'true'
