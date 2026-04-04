@@ -197,14 +197,26 @@ jobs:
           # Download yesterday's indexes from Tigris and today's PBF from cache in parallel
           echo "Starting parallel downloads..."
 
-          # Background: download yesterday's indexes via public HTTP with directory crawl
+          # Background: download yesterday's indexes via public HTTP
           (
             echo "[Tigris] Downloading yesterday's indexes ($YESTERDAY) via HTTP..."
             START=$(date +%s)
             BASE_URL="$S3_PUBLIC_URL/$S3_PREFIX/builds/$YESTERDAY"
-            # wget recursive crawl of the directory listing, strip URL prefix to get local paths
-            wget -r -np -nH --cut-dirs=3 -P "$WORKDIR/old-output" -q -e robots=off \
-              --reject "index.html*" "$BASE_URL/"
+            # Crawl directory listing to get file URLs, then download with aria2
+            wget -q -r -np -nH --spider --cut-dirs=3 -e robots=off \
+              --reject "index.html*" "$BASE_URL/" 2>&1 \
+              | grep -oP "https?://[^ ]+" | grep -v '/$\|index' \
+              | while IFS= read -r URL; do
+                  REL="${URL#$BASE_URL/}"
+                  DIR="$WORKDIR/old-output/$(dirname "$REL")"
+                  mkdir -p "$DIR"
+                  echo "$URL"
+                  echo "  dir=$DIR"
+                done > /tmp/aria2-indexes.txt
+            URLS=$(wc -l < /tmp/aria2-indexes.txt)
+            echo "Found $((URLS / 2)) files to download"
+            aria2c -x 16 -j 30 --max-tries=3 --auto-file-renaming=false \
+              -i /tmp/aria2-indexes.txt 2>/dev/null
             END=$(date +%s)
             echo "[Tigris] Downloaded in $((END-START))s — $(find "$WORKDIR/old-output" -type f | wc -l) files"
           ) &
