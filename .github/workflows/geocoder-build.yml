@@ -202,8 +202,12 @@ jobs:
             echo "[Tigris] Downloading yesterday's indexes ($YESTERDAY) via HTTP..."
             START=$(date +%s)
             BASE_URL="$S3_PUBLIC_URL/$S3_PREFIX/builds/$YESTERDAY"
-            # List files via s5cmd, download via aria2 from public HTTP
-            s5cmd --endpoint-url "$S3_ENDPOINT" ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/*" 2>/dev/null \
+
+            # Debug: check credentials are available in subshell
+            echo "[Tigris] AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:+SET (${#AWS_ACCESS_KEY_ID} chars)}"
+
+            # List files via s5cmd, then download via aria2 from public HTTP
+            s5cmd --endpoint-url "$S3_ENDPOINT" ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/*" \
               | awk '{print $NF}' | grep '\.bin$\|\.json$' \
               | while IFS= read -r REL; do
                   DIR="$WORKDIR/old-output/$(dirname "$REL")"
@@ -211,14 +215,24 @@ jobs:
                   echo "$BASE_URL/$REL"
                   echo "  dir=$DIR"
                 done > /tmp/aria2-indexes.txt
-            URLS=$(grep -c '^http' /tmp/aria2-indexes.txt || true)
-            echo "Found $URLS files to download"
-            if [ "$URLS" -gt 0 ]; then
-              aria2c -x 16 -j 30 --max-tries=3 --auto-file-renaming=false \
-                -i /tmp/aria2-indexes.txt 2>/dev/null
+            URLS=$(grep -c '^http' /tmp/aria2-indexes.txt || echo 0)
+            echo "[Tigris] Found $URLS files to download"
+            if [ "$URLS" -eq 0 ]; then
+              echo "::error::[Tigris] No files found for $YESTERDAY — listing failed"
+              # Try without glob as fallback debug
+              echo "[Tigris] Debug: listing without glob..."
+              s5cmd --endpoint-url "$S3_ENDPOINT" ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/" 2>&1 | head -5
+              exit 1
             fi
+            aria2c -x 16 -j 30 --max-tries=3 --auto-file-renaming=false \
+              -i /tmp/aria2-indexes.txt 2>/dev/null
             END=$(date +%s)
-            echo "[Tigris] Downloaded in $((END-START))s — $(find "$WORKDIR/old-output" -type f | wc -l) files"
+            COUNT=$(find "$WORKDIR/old-output" -type f | wc -l)
+            echo "[Tigris] Downloaded $COUNT files in $((END-START))s"
+            if [ "$COUNT" -eq 0 ]; then
+              echo "::error::[Tigris] Download produced 0 files"
+              exit 1
+            fi
           ) &
           TIGRIS_PID=$!
 
