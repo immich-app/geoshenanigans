@@ -28,6 +28,7 @@ env:
   S3_BUCKET: geoshenanigans-reverse-geocoding
   S3_PREFIX: geocoder
   S3_ENDPOINT: https://t3.storage.dev
+  S3_PUBLIC_URL: https://geoshenanigans-reverse-geocoding.t3.tigrisfiles.io
   REGIONS: "planet africa asia europe north-america south-america oceania central-america antarctica"
 
 permissions:
