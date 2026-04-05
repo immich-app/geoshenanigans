@@ -18,6 +18,7 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <malloc.h>
 #include <mutex>
 #include <string>
 #include <sys/mman.h>
@@ -823,17 +824,19 @@ int main(int argc, char* argv[]) {
     { std::unordered_map<uint32_t,uint32_t>().swap(str_remap); }
     std::cerr << "  RSS after merge phase: " << get_rss_mb() << " MiB" << std::endl;
 
-    // Serialize merge results to patch in canonical order, then free heavy data
+    // Serialize merge results to patch in canonical order, freeing as we go
     serialize_merge(patch, res_addr);
     serialize_merge(patch, res_ways);
     serialize_merge(patch, res_nodes);
-    { std::vector<char>().swap(res_nodes.seq.data); } // free ~264 MiB node merge sequence
+    { std::vector<char>().swap(res_nodes.seq.data); }
     serialize_merge(patch, res_interp_w);
     serialize_merge(patch, res_interp_n);
     { std::vector<char>().swap(res_interp_n.seq.data); }
     serialize_merge(patch, res_admin_p);
     serialize_merge(patch, res_admin_v);
     { std::vector<char>().swap(res_admin_v.seq.data); }
+    malloc_trim(0); // return freed heap to OS
+    std::cerr << "  RSS after serialize: " << get_rss_mb() << " MiB" << std::endl;
     double t0 = now_ms();
 
     // ID remaps were pre-computed in the parallel merge groups.
@@ -907,6 +910,7 @@ int main(int argc, char* argv[]) {
       std::vector<uint32_t>().swap(i_rm_v); }
     { std::vector<char>().swap(old_se); std::vector<char>().swap(old_ae);
       std::vector<char>().swap(old_ie); }
+    malloc_trim(0);
     log_time("Geo entry rebuild", t1);
     std::cerr << "  RSS after rebuild: " << get_rss_mb() << " MiB" << std::endl;
 
@@ -1015,6 +1019,7 @@ int main(int argc, char* argv[]) {
     patch.insert(patch.end(), corr_ie.begin(), corr_ie.end()); { std::vector<char>().swap(corr_ie); }
     derived = RebuiltGeo{}; new_cell_idx.clear(); d_set.clear();
     unmap_file(new_se_m); unmap_file(new_ae_m); unmap_file(new_ie_m);
+    malloc_trim(0);
     // Keep new_geo_m for flag corrections below
     std::cerr << "  RSS after geo corrections: " << get_rss_mb() << " MiB" << std::endl;
 
