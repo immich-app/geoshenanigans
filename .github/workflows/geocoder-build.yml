@@ -366,6 +366,8 @@ jobs:
       - name: Generate patches, verify, and upload
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
+          CACHE_ENDPOINT: ${{ steps.setup.outputs.cache_endpoint }}
+          CACHE_BUCKET: ${{ steps.setup.outputs.cache_bucket }}
           OLD_DATE: ${{ steps.dates.outputs.yesterday }}
           NEW_DATE: ${{ steps.dates.outputs.today }}
           IS_PRODUCTION: ${{ github.event_name != 'pull_request' }}
