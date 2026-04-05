@@ -22,6 +22,11 @@ jobs:
     runs-on: pokedex-giant
     timeout-minutes: 5
     steps:
+      - name: Install s5cmd
+        run: |
+          curl -sL "https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-64bit.tar.gz" \
+            -o /tmp/s5cmd.tar.gz
+          sudo tar xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd
       - name: Debug cache
         run: |
           echo "=== Environment ==="
