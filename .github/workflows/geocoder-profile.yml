@@ -91,7 +91,11 @@ jobs:
           echo "Cgroup mem: $(cat /sys/fs/cgroup/memory.max 2>/dev/null | numfmt --to=iec 2>/dev/null || echo unknown)"
           echo ""
 
-          VARIANTS=$(cd "$NEW" && find . -name "*.bin" -exec dirname {} \; | sort -u | sed 's|^\./||')
+          # Sort variants: full and no-addresses first (biggest, most interesting for memory profiling)
+          ALL_VARIANTS=$(cd "$NEW" && find . -name "*.bin" -exec dirname {} \; | sort -u | sed 's|^\./||')
+          PRIORITY="full no-addresses"
+          REST=$(echo "$ALL_VARIANTS" | grep -v -x -E "full|no-addresses" || true)
+          VARIANTS="$PRIORITY $REST"
 
           # Header
           echo "## Patch Profile Results (mmap optimized)" >> "$GITHUB_STEP_SUMMARY"
