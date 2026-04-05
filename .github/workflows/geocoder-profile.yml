@@ -130,18 +130,20 @@ jobs:
 
             TOTAL_START=$(date +%s)
 
-            # Diff — tee stderr so output streams live (visible even if runner crashes)
-            echo "=== $variant: starting diff ==="
-            /usr/bin/time -v geocoder-diff "$OLD/$variant/" "$NEW/$variant/" -o "$PATCH" 2> >(tee "$WORKDIR/t-diff" >&2)
+            # Diff
+            echo "::group::$variant diff"
+            /usr/bin/time -v geocoder-diff "$OLD/$variant/" "$NEW/$variant/" -o "$PATCH" 2>&1 | tee "$WORKDIR/t-diff"
+            echo "::endgroup::"
             DIFF_END=$(date +%s)
             DIFF_S=$((DIFF_END - TOTAL_START))
             DIFF_MEM=$(grep "Maximum resident" "$WORKDIR/t-diff" | awk '{print int($NF/1024)}')
             PATCH_KB=$(( $(stat -c%s "$PATCH" 2>/dev/null || echo 0) / 1024 ))
 
             # Patch
-            echo "=== $variant: starting patch ==="
+            echo "::group::$variant patch"
             PATCH_START=$(date +%s)
-            /usr/bin/time -v geocoder-patch "$OLD/$variant/" "$PATCH" -o "$VERIFY/" 2> >(tee "$WORKDIR/t-patch" >&2)
+            /usr/bin/time -v geocoder-patch "$OLD/$variant/" "$PATCH" -o "$VERIFY/" 2>&1 | tee "$WORKDIR/t-patch"
+            echo "::endgroup::"
             PATCH_END=$(date +%s)
             PATCH_S=$((PATCH_END - PATCH_START))
             PATCH_MEM=$(grep "Maximum resident" "$WORKDIR/t-patch" | awk '{print int($NF/1024)}')
