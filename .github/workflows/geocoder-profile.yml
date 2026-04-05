@@ -57,14 +57,14 @@ jobs:
       - name: Download two builds from Tigris
         run: |
           S5="s5cmd --endpoint-url $S3_ENDPOINT"
-          echo "Downloading 2026-04-04 build..."
+          echo "Downloading 2026-04-03 build..."
           START=$(date +%s)
-          $S5 cp "s3://$S3_BUCKET/geocoder/builds/2026-04-04/*" /tmp/build-old/
+          $S5 cp "s3://$S3_BUCKET/geocoder/builds/2026-04-03/*" /tmp/build-old/
           echo "Old: $(find /tmp/build-old -type f | wc -l) files in $(($(date +%s)-START))s"
 
-          echo "Downloading 2026-04-05 build..."
+          echo "Downloading 2026-04-04 build..."
           START=$(date +%s)
-          $S5 cp "s3://$S3_BUCKET/geocoder/builds/2026-04-05/*" /tmp/build-new/
+          $S5 cp "s3://$S3_BUCKET/geocoder/builds/2026-04-04/*" /tmp/build-new/
           echo "New: $(find /tmp/build-new -type f | wc -l) files in $(($(date +%s)-START))s"
 
       - name: Profile each variant
