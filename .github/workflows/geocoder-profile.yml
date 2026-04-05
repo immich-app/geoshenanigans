@@ -49,6 +49,7 @@ jobs:
           s5cmd --endpoint-url "$CACHE_ENDPOINT" ls "s3://$BUCKET_NAME/geocoder-cache/builds/2026-04-04/" 2>&1 | head -20
 
   profile:
+    if: false  # Disabled while debugging cache
     runs-on: pokedex-giant
     timeout-minutes: 120
     steps:
