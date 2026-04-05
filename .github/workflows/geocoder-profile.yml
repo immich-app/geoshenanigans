@@ -18,6 +18,36 @@ permissions:
   contents: read
 
 jobs:
+  debug-cache:
+    runs-on: pokedex-giant
+    timeout-minutes: 5
+    steps:
+      - name: Debug cache
+        run: |
+          echo "=== Environment ==="
+          echo "BUCKET_HOST=$BUCKET_HOST"
+          echo "BUCKET_PORT=$BUCKET_PORT"
+          echo "BUCKET_NAME=$BUCKET_NAME"
+          echo "AWS_ACCESS_KEY_ID is set: $([ -n "$AWS_ACCESS_KEY_ID" ] && echo yes || echo no)"
+          echo ""
+          CACHE_ENDPOINT="http://${BUCKET_HOST}:${BUCKET_PORT}"
+          echo "Cache endpoint: $CACHE_ENDPOINT"
+          echo ""
+          echo "=== s5cmd ls bucket root ==="
+          s5cmd --endpoint-url "$CACHE_ENDPOINT" ls "s3://$BUCKET_NAME/" 2>&1 | head -20
+          echo ""
+          echo "=== s5cmd ls geocoder-cache/ ==="
+          s5cmd --endpoint-url "$CACHE_ENDPOINT" ls "s3://$BUCKET_NAME/geocoder-cache/" 2>&1 | head -20
+          echo ""
+          echo "=== s5cmd ls geocoder-cache/builds/ ==="
+          s5cmd --endpoint-url "$CACHE_ENDPOINT" ls "s3://$BUCKET_NAME/geocoder-cache/builds/" 2>&1 | head -20
+          echo ""
+          echo "=== s5cmd ls geocoder-cache/builds/2026-04-03/ ==="
+          s5cmd --endpoint-url "$CACHE_ENDPOINT" ls "s3://$BUCKET_NAME/geocoder-cache/builds/2026-04-03/" 2>&1 | head -20
+          echo ""
+          echo "=== s5cmd ls geocoder-cache/builds/2026-04-04/ ==="
+          s5cmd --endpoint-url "$CACHE_ENDPOINT" ls "s3://$BUCKET_NAME/geocoder-cache/builds/2026-04-04/" 2>&1 | head -20
+
   profile:
     runs-on: pokedex-giant
     timeout-minutes: 120
