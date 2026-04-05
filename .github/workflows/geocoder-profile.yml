@@ -105,11 +105,11 @@ jobs:
           echo "Cgroup mem: $(cat /sys/fs/cgroup/memory.max 2>/dev/null | numfmt --to=iec 2>/dev/null || echo unknown)"
           echo ""
 
-          # Sort variants: full and no-addresses first (biggest, most interesting for memory profiling)
+          # Run small variants first to verify correctness, then the big ones
           ALL_VARIANTS=$(cd "$NEW" && find . -name "*.bin" -exec dirname {} \; | sort -u | sed 's|^\./||')
-          PRIORITY="full no-addresses"
-          REST=$(echo "$ALL_VARIANTS" | grep -v -x -E "full|no-addresses" || true)
-          VARIANTS="$PRIORITY $REST"
+          # Skip full/no-addresses initially, run europe first as a mid-size test
+          SMALL=$(echo "$ALL_VARIANTS" | grep -v -x -E "full|no-addresses" || true)
+          VARIANTS="$SMALL no-addresses full"
 
           # Header
           echo "## Patch Profile Results (mmap optimized)" >> "$GITHUB_STEP_SUMMARY"
@@ -130,19 +130,18 @@ jobs:
 
             TOTAL_START=$(date +%s)
 
-            # Diff — capture stderr (has RSS reports) and time -v output
-            /usr/bin/time -v geocoder-diff "$OLD/$variant/" "$NEW/$variant/" -o "$PATCH" 2>"$WORKDIR/t-diff"
+            # Diff — tee stderr so output streams live (visible even if runner crashes)
+            echo "=== $variant: starting diff ==="
+            /usr/bin/time -v geocoder-diff "$OLD/$variant/" "$NEW/$variant/" -o "$PATCH" 2> >(tee "$WORKDIR/t-diff" >&2)
             DIFF_END=$(date +%s)
             DIFF_S=$((DIFF_END - TOTAL_START))
             DIFF_MEM=$(grep "Maximum resident" "$WORKDIR/t-diff" | awk '{print int($NF/1024)}')
             PATCH_KB=$(( $(stat -c%s "$PATCH" 2>/dev/null || echo 0) / 1024 ))
-            # Show diff stderr for RSS debugging
-            echo "=== $variant diff stderr ==="
-            cat "$WORKDIR/t-diff"
 
             # Patch
+            echo "=== $variant: starting patch ==="
             PATCH_START=$(date +%s)
-            /usr/bin/time -v geocoder-patch "$OLD/$variant/" "$PATCH" -o "$VERIFY/" 2>"$WORKDIR/t-patch"
+            /usr/bin/time -v geocoder-patch "$OLD/$variant/" "$PATCH" -o "$VERIFY/" 2> >(tee "$WORKDIR/t-patch" >&2)
             PATCH_END=$(date +%s)
             PATCH_S=$((PATCH_END - PATCH_START))
             PATCH_MEM=$(grep "Maximum resident" "$WORKDIR/t-patch" | awk '{print int($NF/1024)}')
