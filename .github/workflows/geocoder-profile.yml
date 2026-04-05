@@ -66,8 +66,7 @@ jobs:
             local DATE=$1 DEST=$2
             echo "Downloading $DATE build..."
             START=$(date +%s)
-            # Use recursive glob to check for .bin files in subdirectories
-            if eval $CACHE ls "'s3://$CACHE_BUCKET/geocoder-cache/builds/$DATE/*.bin'" 2>/dev/null | grep -q ".bin"; then
+            if eval $CACHE ls "'s3://$CACHE_BUCKET/geocoder-cache/builds/$DATE/'" 2>/dev/null | head -1 | grep -q .; then
               echo "  Source: local cache"
               eval $CACHE cp "'s3://$CACHE_BUCKET/geocoder-cache/builds/$DATE/*'" "$DEST/"
             else
