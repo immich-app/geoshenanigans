@@ -5,11 +5,64 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <fcntl.h>
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <unordered_set>
 #include <vector>
+
+// --- Memory-mapped file helpers ---
+
+struct MappedFile { const char* data; size_t size; };
+
+// mmap a file read-only (PROT_READ, MAP_PRIVATE). Pages paged in on demand.
+inline MappedFile mmap_file(const std::string& path) {
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) return {nullptr, 0};
+    struct stat st; fstat(fd, &st);
+    size_t sz = st.st_size;
+    if (sz == 0) { close(fd); return {nullptr, 0}; }
+    void* p = mmap(nullptr, sz, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (p == MAP_FAILED) return {nullptr, 0};
+    return {static_cast<const char*>(p), sz};
+}
+
+// mmap a file with copy-on-write (PROT_READ|PROT_WRITE, MAP_PRIVATE).
+// Writes create private copies of modified pages; unmodified pages share physical memory.
+struct MappedFileRW { char* data; size_t size; };
+inline MappedFileRW mmap_file_rw(const std::string& path) {
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) return {nullptr, 0};
+    struct stat st; fstat(fd, &st);
+    size_t sz = st.st_size;
+    if (sz == 0) { close(fd); return {nullptr, 0}; }
+    void* p = mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (p == MAP_FAILED) return {nullptr, 0};
+    return {static_cast<char*>(p), sz};
+}
+
+inline void unmap_file(MappedFile& f) {
+    if (f.data) { munmap(const_cast<char*>(f.data), f.size); f.data = nullptr; f.size = 0; }
+}
+inline void unmap_file(MappedFileRW& f) {
+    if (f.data) { munmap(f.data, f.size); f.data = nullptr; f.size = 0; }
+}
+
+// Detect stride from file size (avoids loading entire file)
+inline size_t detect_stride_from_file(const std::string& path, std::initializer_list<size_t> candidates) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return *candidates.begin();
+    size_t sz = st.st_size;
+    for (size_t s : candidates)
+        if (sz % s == 0 && sz / s > 0) return s;
+    return *candidates.begin();
+}
 
 // --- Binary record structs (must match types.h and server) ---
 

@@ -30,7 +30,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq cmake g++ libz-dev libzstd-dev \
-            libbz2-dev libexpat1-dev libosmium2-dev jq time bc
+            libbz2-dev libexpat1-dev libosmium2-dev jq time
           curl -sL "https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-64bit.tar.gz" \
             -o /tmp/s5cmd.tar.gz
           sudo tar xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd
@@ -82,10 +82,10 @@ jobs:
           VARIANTS=$(cd "$NEW" && find . -name "*.bin" -exec dirname {} \; | sort -u | sed 's|^\./||')
 
           # Header
-          echo "## Patch Profile Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Patch Profile Results (mmap optimized)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Variant | Files | Diff (s) | Diff Mem (MB) | Patch Size (KB) | Patch (s) | Patch Mem (MB) | Verify (s) | Total (s) |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---------|-------|----------|---------------|-----------------|-----------|----------------|------------|-----------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Variant | Files | Diff (s) | Diff Mem (MB) | Patch Size (KB) | Patch (s) | Patch Mem (MB) | Verify | Total (s) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---------|-------|----------|---------------|-----------------|-----------|----------------|--------|-----------|" >> "$GITHUB_STEP_SUMMARY"
 
           for variant in $VARIANTS; do
             N_NEW=$(ls "$NEW/$variant/"*.bin 2>/dev/null | wc -l)
@@ -98,97 +98,43 @@ jobs:
             VERIFY="$WORKDIR/verify-${SAFE}"
             mkdir -p "$VERIFY"
 
-            TOTAL_START=$(date +%s%N)
+            TOTAL_START=$(date +%s)
 
-            # Diff
-            DIFF_START=$(date +%s%N)
-            /usr/bin/time -v geocoder-diff "$OLD/$variant/" "$NEW/$variant/" -o "$PATCH" 2>"$WORKDIR/t-diff" >/dev/null
-            DIFF_END=$(date +%s%N)
-            DIFF_S=$(echo "scale=1; ($DIFF_END - $DIFF_START) / 1000000000" | bc)
+            # Diff — capture stderr (has RSS reports) and time -v output
+            /usr/bin/time -v geocoder-diff "$OLD/$variant/" "$NEW/$variant/" -o "$PATCH" 2>"$WORKDIR/t-diff"
+            DIFF_END=$(date +%s)
+            DIFF_S=$((DIFF_END - TOTAL_START))
             DIFF_MEM=$(grep "Maximum resident" "$WORKDIR/t-diff" | awk '{print int($NF/1024)}')
             PATCH_KB=$(( $(stat -c%s "$PATCH" 2>/dev/null || echo 0) / 1024 ))
+            # Show diff stderr for RSS debugging
+            echo "=== $variant diff stderr ==="
+            cat "$WORKDIR/t-diff"
 
             # Patch
-            PATCH_START=$(date +%s%N)
-            /usr/bin/time -v geocoder-patch "$OLD/$variant/" "$PATCH" -o "$VERIFY/" 2>"$WORKDIR/t-patch" >/dev/null
-            PATCH_END=$(date +%s%N)
-            PATCH_S=$(echo "scale=1; ($PATCH_END - $PATCH_START) / 1000000000" | bc)
+            PATCH_START=$(date +%s)
+            /usr/bin/time -v geocoder-patch "$OLD/$variant/" "$PATCH" -o "$VERIFY/" 2>"$WORKDIR/t-patch"
+            PATCH_END=$(date +%s)
+            PATCH_S=$((PATCH_END - PATCH_START))
             PATCH_MEM=$(grep "Maximum resident" "$WORKDIR/t-patch" | awk '{print int($NF/1024)}')
 
             # Verify
-            VERIFY_START=$(date +%s%N)
             MATCH=0
             for f in "$NEW/$variant/"*.bin; do
               b=$(basename "$f")
               cmp -s "$VERIFY/$b" "$NEW/$variant/$b" && MATCH=$((MATCH + 1))
             done
-            VERIFY_END=$(date +%s%N)
-            VERIFY_S=$(echo "scale=1; ($VERIFY_END - $VERIFY_START) / 1000000000" | bc)
 
-            TOTAL_END=$(date +%s%N)
-            TOTAL_S=$(echo "scale=1; ($TOTAL_END - $TOTAL_START) / 1000000000" | bc)
+            TOTAL_END=$(date +%s)
+            TOTAL_S=$((TOTAL_END - TOTAL_START))
 
-            STATUS="✓"
-            [ "$MATCH" -ne "$N_NEW" ] && STATUS="✗"
+            STATUS="$MATCH/$N_NEW"
+            [ "$MATCH" -ne "$N_NEW" ] && STATUS="FAIL:$MATCH/$N_NEW"
 
-            echo "$variant: diff=${DIFF_S}s(${DIFF_MEM}MB) patch=${PATCH_S}s(${PATCH_MEM}MB) verify=${VERIFY_S}s total=${TOTAL_S}s ${STATUS}"
-            echo "| $variant | $N_NEW | $DIFF_S | $DIFF_MEM | $PATCH_KB | $PATCH_S | $PATCH_MEM | $VERIFY_S | $TOTAL_S |" >> "$GITHUB_STEP_SUMMARY"
+            echo "$variant: diff=${DIFF_S}s(${DIFF_MEM}MB) patch=${PATCH_S}s(${PATCH_MEM}MB) total=${TOTAL_S}s ${STATUS}"
+            echo "| $variant | $N_NEW | $DIFF_S | $DIFF_MEM | $PATCH_KB | $PATCH_S | $PATCH_MEM | $STATUS | $TOTAL_S |" >> "$GITHUB_STEP_SUMMARY"
 
             rm -f "$PATCH"
             rm -rf "$VERIFY"
           done
 
           echo "" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Profile parallel runs
-        run: |
-          OLD="/tmp/build-old"
-          NEW="/tmp/build-new"
-          WORKDIR="/tmp/profile-parallel"
-
-          VARIANTS=$(cd "$NEW" && find . -name "*.bin" -exec dirname {} \; | sort -u | sed 's|^\./||')
-
-          echo "## Parallel Profile" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-
-          for PARALLEL in 1 4 8 16 32 64; do
-            rm -rf "$WORKDIR" && mkdir -p "$WORKDIR"
-            echo "Testing $PARALLEL parallel jobs..."
-            START=$(date +%s)
-            PEAK_MEM=0
-            JOBS=0
-
-            for variant in $VARIANTS; do
-              N_NEW=$(ls "$NEW/$variant/"*.bin 2>/dev/null | wc -l)
-              N_OLD=$(ls "$OLD/$variant/"*.bin 2>/dev/null | wc -l)
-              [ "$N_NEW" -lt 2 ] && continue
-              [ "$N_OLD" -ne "$N_NEW" ] && continue
-
-              (
-                SAFE=$(echo "$variant" | tr '/' '_')
-                PATCH="$WORKDIR/${SAFE}.gcpatch"
-                VERIFY="$WORKDIR/verify-${SAFE}"
-                mkdir -p "$VERIFY"
-                geocoder-diff "$OLD/$variant/" "$NEW/$variant/" -o "$PATCH" 2>/dev/null
-                geocoder-patch "$OLD/$variant/" "$PATCH" -o "$VERIFY/" 2>/dev/null
-                MATCH=0
-                for f in "$NEW/$variant/"*.bin; do
-                  b=$(basename "$f")
-                  cmp -s "$VERIFY/$b" "$NEW/$variant/$b" && MATCH=$((MATCH + 1))
-                done
-                rm -f "$PATCH"
-                rm -rf "$VERIFY"
-              ) &
-
-              JOBS=$((JOBS + 1))
-              if [ $JOBS -ge $PARALLEL ]; then
-                wait -n 2>/dev/null || true
-                JOBS=$((JOBS - 1))
-              fi
-            done
-            wait
-            END=$(date +%s)
-            ELAPSED=$((END - START))
-            echo "  parallel=$PARALLEL: ${ELAPSED}s"
-            echo "| $PARALLEL parallel | ${ELAPSED}s |" >> "$GITHUB_STEP_SUMMARY"
-          done

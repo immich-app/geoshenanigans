@@ -43,22 +43,7 @@ static void log_phase(const char* label, double start) {
               << "s, " << get_rss_mb() << " MiB] " << label << std::endl;
 }
 
-// mmap a file read-only. Returns {pointer, size}. Caller must munmap.
-struct MappedFile { const char* data; size_t size; };
-static MappedFile mmap_file(const std::string& path) {
-    int fd = open(path.c_str(), O_RDONLY);
-    if (fd < 0) return {nullptr, 0};
-    struct stat st; fstat(fd, &st);
-    size_t sz = st.st_size;
-    if (sz == 0) { close(fd); return {nullptr, 0}; }
-    void* p = mmap(nullptr, sz, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (p == MAP_FAILED) return {nullptr, 0};
-    return {static_cast<const char*>(p), sz};
-}
-static void unmap_file(MappedFile& f) {
-    if (f.data) { munmap(const_cast<char*>(f.data), f.size); f.data = nullptr; f.size = 0; }
-}
+// MappedFile + mmap_file + unmap_file are now in patch_format.h
 
 // Detect stride from file size
 static size_t detect_stride(const std::string& path, std::initializer_list<size_t> candidates) {
