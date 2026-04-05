@@ -78,11 +78,11 @@ jobs:
             local DATE=$1 DEST=$2
             echo "Downloading $DATE build..."
             START=$(date +%s)
-            if eval $CACHE ls "'s3://$CACHE_BUCKET/geocoder-cache/builds/$DATE/'" 2>/dev/null | head -1 | grep -q .; then
+            echo "  Trying cache: s3://$CACHE_BUCKET/geocoder-cache/builds/$DATE/"
+            if eval $CACHE cp "'s3://$CACHE_BUCKET/geocoder-cache/builds/$DATE/*'" "$DEST/" 2>/dev/null; then
               echo "  Source: local cache"
-              eval $CACHE cp "'s3://$CACHE_BUCKET/geocoder-cache/builds/$DATE/*'" "$DEST/"
             else
-              echo "  Source: Tigris (cache miss)"
+              echo "  Cache failed, falling back to Tigris"
               $S5 cp "s3://$S3_BUCKET/geocoder/builds/$DATE/*" "$DEST/"
             fi
             echo "  $(find "$DEST" -type f | wc -l) files in $(($(date +%s)-START))s"
