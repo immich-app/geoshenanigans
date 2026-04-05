@@ -1,4 +1,4 @@
-name: Profile Patch Pipeline
+name: Profile Patch Pipeline  # v2: sequential + malloc_trim
 
 concurrency:
   group: geocoder-profile
