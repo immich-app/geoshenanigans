@@ -18,43 +18,7 @@ permissions:
   contents: read
 
 jobs:
-  debug-cache:
-    runs-on: pokedex-giant
-    timeout-minutes: 5
-    steps:
-      - name: Install s5cmd
-        run: |
-          curl -sL "https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-64bit.tar.gz" \
-            -o /tmp/s5cmd.tar.gz
-          sudo tar xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd
-      - name: Debug cache
-        run: |
-          echo "=== Environment ==="
-          echo "BUCKET_HOST=$BUCKET_HOST"
-          echo "BUCKET_PORT=$BUCKET_PORT"
-          echo "BUCKET_NAME=$BUCKET_NAME"
-          echo "AWS_ACCESS_KEY_ID is set: $([ -n "$AWS_ACCESS_KEY_ID" ] && echo yes || echo no)"
-          echo ""
-          CACHE_ENDPOINT="http://${BUCKET_HOST}:${BUCKET_PORT}"
-          echo "Cache endpoint: $CACHE_ENDPOINT"
-          echo ""
-          echo "=== s5cmd ls bucket root ==="
-          s5cmd --endpoint-url "$CACHE_ENDPOINT" ls "s3://$BUCKET_NAME/" 2>&1 | head -20
-          echo ""
-          echo "=== s5cmd ls geocoder-cache/ ==="
-          s5cmd --endpoint-url "$CACHE_ENDPOINT" ls "s3://$BUCKET_NAME/geocoder-cache/" 2>&1 | head -20
-          echo ""
-          echo "=== s5cmd ls geocoder-cache/builds/ ==="
-          s5cmd --endpoint-url "$CACHE_ENDPOINT" ls "s3://$BUCKET_NAME/geocoder-cache/builds/" 2>&1 | head -20
-          echo ""
-          echo "=== s5cmd ls geocoder-cache/builds/2026-04-03/ ==="
-          s5cmd --endpoint-url "$CACHE_ENDPOINT" ls "s3://$BUCKET_NAME/geocoder-cache/builds/2026-04-03/" 2>&1 | head -20
-          echo ""
-          echo "=== s5cmd ls geocoder-cache/builds/2026-04-04/ ==="
-          s5cmd --endpoint-url "$CACHE_ENDPOINT" ls "s3://$BUCKET_NAME/geocoder-cache/builds/2026-04-04/" 2>&1 | head -20
-
   profile:
-    if: false  # Disabled while debugging cache
     runs-on: pokedex-giant
     timeout-minutes: 120
     steps:
@@ -126,8 +90,8 @@ jobs:
             echo "  $(find "$DEST" -type f | wc -l) files in $(($(date +%s)-START))s"
           }
 
-          download_build "2026-04-03" /tmp/build-old
-          download_build "2026-04-04" /tmp/build-new
+          download_build "2026-04-04" /tmp/build-old
+          download_build "2026-04-05" /tmp/build-new
 
       - name: Profile each variant
         run: |
