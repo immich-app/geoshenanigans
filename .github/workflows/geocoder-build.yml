@@ -169,11 +169,16 @@ jobs:
           fi
           PREV_DATE=$(date -u -d "$TARGET_DATE - 1 day" +%Y-%m-%d)
 
+          # Adjust sequence number if building for a past date
+          # Each day = 1 sequence number
+          DAYS_OFFSET=$(( ($(date -u -d "$CURRENT_DATE" +%s) - $(date -u -d "$TARGET_DATE" +%s)) / 86400 ))
+          TARGET_SEQ=$((CURRENT_SEQ - DAYS_OFFSET))
+
           echo "today=$TARGET_DATE" >> "$GITHUB_OUTPUT"
           echo "yesterday=$PREV_DATE" >> "$GITHUB_OUTPUT"
-          echo "today_seq=$CURRENT_SEQ" >> "$GITHUB_OUTPUT"
-          echo "yesterday_seq=$((CURRENT_SEQ - 1))" >> "$GITHUB_OUTPUT"
-          echo "Target: $TARGET_DATE, Previous: $PREV_DATE (server: date=$CURRENT_DATE seq=$CURRENT_SEQ)"
+          echo "today_seq=$TARGET_SEQ" >> "$GITHUB_OUTPUT"
+          echo "yesterday_seq=$((TARGET_SEQ - 1))" >> "$GITHUB_OUTPUT"
+          echo "Target: $TARGET_DATE (seq $TARGET_SEQ), Previous: $PREV_DATE (server: $CURRENT_DATE seq $CURRENT_SEQ, offset: -${DAYS_OFFSET}d)"
 
       - name: Check for yesterday's build on Tigris
         id: prev
