@@ -220,7 +220,8 @@ jobs:
               $CACHE cp "$CACHE_BUILD/*" "$WORKDIR/old-output/"
               END=$(date +%s)
               COUNT=$(find "$WORKDIR/old-output" -type f | wc -l)
-              echo "[Cache] Downloaded $COUNT files in $((END-START))s"
+              SIZE=$(du -sb "$WORKDIR/old-output" | cut -f1)
+              echo "[Cache] Downloaded $COUNT files ($((SIZE/1024/1024)) MiB) in $((END-START))s ($((SIZE/1024/1024/(END-START+1))) MB/s)"
             else
               echo "[Tigris] Cache miss — downloading via HTTP..."
               BASE_URL="$S3_PUBLIC_URL/$S3_PREFIX/builds/$YESTERDAY"
@@ -242,7 +243,8 @@ jobs:
                 -i /tmp/aria2-indexes.txt 2>/dev/null
               END=$(date +%s)
               COUNT=$(find "$WORKDIR/old-output" -type f | wc -l)
-              echo "[Tigris] Downloaded $COUNT files in $((END-START))s"
+              SIZE=$(du -sb "$WORKDIR/old-output" | cut -f1)
+              echo "[Tigris] Downloaded $COUNT files ($((SIZE/1024/1024)) MiB) in $((END-START))s ($((SIZE/1024/1024/(END-START+1))) MB/s)"
 
               # Backfill cache for next time
               echo "[Cache] Backfilling local cache with yesterday's indexes..."
@@ -283,12 +285,8 @@ jobs:
             mv "$WORKDIR/planet-tmp.osm.pbf" "$WORKDIR/planet.osm.pbf"
             rm -f "$WORKDIR/diff-today.osc.gz"
 
-            echo "[Cache] Caching today's PBF as planet-${TODAY}.osm.pbf..."
-            START=$(date +%s)
-            $CACHE cp "$WORKDIR/planet.osm.pbf" "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf"
-            END=$(date +%s)
-            SIZE=$(stat -c%s "$WORKDIR/planet.osm.pbf")
-            echo "[Cache] Cached: $((SIZE/1024/1024)) MiB in $((END-START))s ($((SIZE/1024/1024/(END-START+1))) MB/s)"
+            echo "[Cache] Caching today's PBF in background..."
+            $CACHE cp "$WORKDIR/planet.osm.pbf" "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" &
           fi
 
           # Wait for Tigris download to complete
@@ -305,6 +303,9 @@ jobs:
           echo "Building today's index ($TODAY)..."
           time build-index "$WORKDIR/output/" "$WORKDIR/planet.osm.pbf" \
             --continents --multi-output --multi-quality 2>&1 | tail -10
+          # Wait for background PBF cache upload before deleting
+          echo "Waiting for background jobs (PBF cache upload)..."
+          wait
           rm -f "$WORKDIR/planet.osm.pbf"
           echo "$(find "$WORKDIR/output" -name "*.bin" | wc -l) bin files produced"
 
