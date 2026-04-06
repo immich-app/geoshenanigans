@@ -92,7 +92,7 @@ jobs:
           echo "Total disk: $(du -sh "$BUILD_DIR" | cut -f1)"
           echo "Memory free: $(free -h | awk '/Mem:/{print $4}')"
 
-      - name: Profile small variants
+      - name: Profile all variants
         run: |
           OLD="$BUILD_DIR/old"
           NEW="$BUILD_DIR/new"
@@ -103,136 +103,61 @@ jobs:
           echo "Memory: $(free -h | awk '/Mem:/{print $2}')"
           echo "Cgroup mem: $(cat /sys/fs/cgroup/memory.max 2>/dev/null | numfmt --to=iec 2>/dev/null || echo unknown)"
 
-          echo "## Patch Profile Results (mmap+sequential)" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Patch Profile Results (parallel + streaming)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Variant | Files | Diff (s) | Diff Mem (MB) | Patch KB | Patch (s) | Patch Mem (MB) | Verify | Total (s) |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---------|-------|----------|---------------|----------|-----------|----------------|--------|-----------|" >> "$GITHUB_STEP_SUMMARY"
 
-          # Helper function
-          profile_variant() {
-            local variant=$1
-            local N_NEW=$(ls "$NEW/$variant/"*.bin 2>/dev/null | wc -l)
-            local N_OLD=$(ls "$OLD/$variant/"*.bin 2>/dev/null | wc -l)
-            [ "$N_NEW" -lt 2 ] && return 0
-            [ "$N_OLD" -ne "$N_NEW" ] && return 0
+          VARIANTS=$(cd "$NEW" && find . -name "*.bin" -exec dirname {} \; | sort -u | sed 's|^\./||')
 
-            local SAFE=$(echo "$variant" | tr '/' '_')
-            local PATCH="$WORKDIR/${SAFE}.gcpatch"
-            local VERIFY="$WORKDIR/verify-${SAFE}"
-            mkdir -p "$VERIFY"
-
-            local TOTAL_START=$(date +%s)
-
-            /usr/bin/time -v geocoder-diff "$OLD/$variant/" "$NEW/$variant/" -o "$PATCH" 2>"$WORKDIR/t-diff"
-            local DIFF_S=$(( $(date +%s) - TOTAL_START ))
-            local DIFF_MEM=$(grep "Maximum resident" "$WORKDIR/t-diff" | awk '{print int($NF/1024)}')
-            local PATCH_KB=$(( $(stat -c%s "$PATCH" 2>/dev/null || echo 0) / 1024 ))
-
-            /usr/bin/time -v geocoder-patch "$OLD/$variant/" "$PATCH" -o "$VERIFY/" 2>"$WORKDIR/t-patch"
-            local PATCH_S=$(( $(date +%s) - TOTAL_START - DIFF_S ))
-            local PATCH_MEM=$(grep "Maximum resident" "$WORKDIR/t-patch" | awk '{print int($NF/1024)}')
-
-            local MATCH=0
-            for f in "$NEW/$variant/"*.bin; do
-              local b=$(basename "$f")
-              cmp -s "$VERIFY/$b" "$NEW/$variant/$b" && MATCH=$((MATCH + 1))
-            done
-
-            local TOTAL_S=$(( $(date +%s) - TOTAL_START ))
-            local STATUS="$MATCH/$N_NEW"
-            [ "$MATCH" -ne "$N_NEW" ] && STATUS="FAIL:$MATCH/$N_NEW"
-
-            echo "$variant: diff=${DIFF_S}s(${DIFF_MEM}MB) patch=${PATCH_S}s(${PATCH_MEM}MB) total=${TOTAL_S}s ${STATUS}"
-            echo "| $variant | $N_NEW | $DIFF_S | $DIFF_MEM | $PATCH_KB | $PATCH_S | $PATCH_MEM | $STATUS | $TOTAL_S |" >> "$GITHUB_STEP_SUMMARY"
-
-            rm -f "$PATCH"
-            rm -rf "$VERIFY"
-          }
-
-          # Export function for use in subsequent steps
-          declare -f profile_variant > /tmp/profile_fn.sh
-          echo "export OLD NEW WORKDIR" >> /tmp/profile_fn.sh
-
-          VARIANTS=$(cd "$NEW" && find . -name "*.bin" -exec dirname {} \; | sort -u | sed 's|^\./||' | grep -v -x -E "full|no-addresses")
+          # Run ALL variants in parallel (diff + patch + verify per variant)
+          TOTAL_START=$(date +%s)
+          JOBS=0
           for variant in $VARIANTS; do
-            profile_variant "$variant"
+            N_NEW=$(ls "$NEW/$variant/"*.bin 2>/dev/null | wc -l)
+            N_OLD=$(ls "$OLD/$variant/"*.bin 2>/dev/null | wc -l)
+            [ "$N_NEW" -lt 2 ] && continue
+            [ "$N_OLD" -ne "$N_NEW" ] && continue
+
+            (
+              SAFE=$(echo "$variant" | tr '/' '_')
+              PATCH="$WORKDIR/${SAFE}.gcpatch"
+              VERIFY="$WORKDIR/verify-${SAFE}"
+              mkdir -p "$VERIFY"
+
+              VS=$(date +%s)
+              /usr/bin/time -v geocoder-diff "$OLD/$variant/" "$NEW/$variant/" -o "$PATCH" 2>"$WORKDIR/t-diff-${SAFE}"
+              DIFF_S=$(( $(date +%s) - VS ))
+              DIFF_MEM=$(grep "Maximum resident" "$WORKDIR/t-diff-${SAFE}" | awk '{print int($NF/1024)}')
+              PATCH_KB=$(( $(stat -c%s "$PATCH" 2>/dev/null || echo 0) / 1024 ))
+
+              PS=$(date +%s)
+              /usr/bin/time -v geocoder-patch "$OLD/$variant/" "$PATCH" -o "$VERIFY/" 2>"$WORKDIR/t-patch-${SAFE}"
+              PATCH_S=$(( $(date +%s) - PS ))
+              PATCH_MEM=$(grep "Maximum resident" "$WORKDIR/t-patch-${SAFE}" | awk '{print int($NF/1024)}')
+
+              MATCH=0
+              for f in "$NEW/$variant/"*.bin; do
+                b=$(basename "$f")
+                cmp -s "$VERIFY/$b" "$NEW/$variant/$b" && MATCH=$((MATCH + 1))
+              done
+
+              TOTAL_S=$(( $(date +%s) - VS ))
+              STATUS="$MATCH/$N_NEW"
+              [ "$MATCH" -ne "$N_NEW" ] && STATUS="FAIL:$MATCH/$N_NEW"
+
+              echo "$variant: diff=${DIFF_S}s(${DIFF_MEM}MB) patch=${PATCH_S}s(${PATCH_MEM}MB) total=${TOTAL_S}s ${STATUS}"
+              echo "| $variant | $N_NEW | $DIFF_S | $DIFF_MEM | $PATCH_KB | $PATCH_S | $PATCH_MEM | $STATUS | $TOTAL_S |" >> "$GITHUB_STEP_SUMMARY"
+
+              rm -f "$PATCH"
+              rm -rf "$VERIFY"
+            ) &
+            JOBS=$((JOBS + 1))
           done
-
-      - name: Profile no-addresses
-        if: always()
-        run: |
-          OLD="$BUILD_DIR/old"
-          NEW="$BUILD_DIR/new"
-          WORKDIR="/tmp/profile"
-          mkdir -p "$WORKDIR"
-
-          variant="no-addresses"
-          N_NEW=$(ls "$NEW/$variant/"*.bin 2>/dev/null | wc -l)
-          N_OLD=$(ls "$OLD/$variant/"*.bin 2>/dev/null | wc -l)
-          [ "$N_NEW" -lt 2 ] && { echo "Skipping $variant"; exit 0; }
-          [ "$N_OLD" -ne "$N_NEW" ] && { echo "Skipping $variant (file count mismatch)"; exit 0; }
-
-          PATCH="$WORKDIR/no-addresses.gcpatch"
-          VERIFY="$WORKDIR/verify-no-addresses"
-          mkdir -p "$VERIFY"
-
-          echo "=== Diff ==="
-          TOTAL_START=$(date +%s)
-          /usr/bin/time -v geocoder-diff "$OLD/$variant/" "$NEW/$variant/" -o "$PATCH" 2>&1
-          DIFF_S=$(( $(date +%s) - TOTAL_START ))
-          DIFF_MEM=$(/usr/bin/time -v true 2>&1 | head -1; grep "Maximum resident" "$WORKDIR/t-diff" 2>/dev/null | awk '{print int($NF/1024)}' || echo 0)
-
-          echo "=== Patch ==="
-          PATCH_START=$(date +%s)
-          /usr/bin/time -v geocoder-patch "$OLD/$variant/" "$PATCH" -o "$VERIFY/" 2>&1
-          PATCH_S=$(( $(date +%s) - PATCH_START ))
-
-          echo "=== Verify ==="
-          MATCH=0
-          for f in "$NEW/$variant/"*.bin; do
-            b=$(basename "$f")
-            cmp -s "$VERIFY/$b" "$NEW/$variant/$b" && MATCH=$((MATCH + 1))
-          done
-          TOTAL_S=$(( $(date +%s) - TOTAL_START ))
-          echo "no-addresses: diff=${DIFF_S}s patch=${PATCH_S}s total=${TOTAL_S}s verify=$MATCH/$N_NEW"
-
-          rm -f "$PATCH"; rm -rf "$VERIFY"
-
-      - name: Profile full
-        if: always()
-        run: |
-          OLD="$BUILD_DIR/old"
-          NEW="$BUILD_DIR/new"
-          WORKDIR="/tmp/profile"
-          mkdir -p "$WORKDIR"
-
-          variant="full"
-          N_NEW=$(ls "$NEW/$variant/"*.bin 2>/dev/null | wc -l)
-          N_OLD=$(ls "$OLD/$variant/"*.bin 2>/dev/null | wc -l)
-          [ "$N_NEW" -lt 2 ] && { echo "Skipping $variant"; exit 0; }
-          [ "$N_OLD" -ne "$N_NEW" ] && { echo "Skipping $variant (file count mismatch)"; exit 0; }
-
-          PATCH="$WORKDIR/full.gcpatch"
-          VERIFY="$WORKDIR/verify-full"
-          mkdir -p "$VERIFY"
-
-          echo "=== Diff ==="
-          TOTAL_START=$(date +%s)
-          /usr/bin/time -v geocoder-diff "$OLD/$variant/" "$NEW/$variant/" -o "$PATCH" 2>&1
-          DIFF_S=$(( $(date +%s) - TOTAL_START ))
-
-          echo "=== Patch ==="
-          PATCH_START=$(date +%s)
-          /usr/bin/time -v geocoder-patch "$OLD/$variant/" "$PATCH" -o "$VERIFY/" 2>&1
-          PATCH_S=$(( $(date +%s) - PATCH_START ))
-
-          echo "=== Verify ==="
-          MATCH=0
-          for f in "$NEW/$variant/"*.bin; do
-            b=$(basename "$f")
-            cmp -s "$VERIFY/$b" "$NEW/$variant/$b" && MATCH=$((MATCH + 1))
-          done
-          TOTAL_S=$(( $(date +%s) - TOTAL_START ))
-          echo "full: diff=${DIFF_S}s patch=${PATCH_S}s total=${TOTAL_S}s verify=$MATCH/$N_NEW"
-
-          rm -f "$PATCH"; rm -rf "$VERIFY"
+          echo "Waiting for $JOBS parallel variant jobs..."
+          wait
+          WALL=$(( $(date +%s) - TOTAL_START ))
+          echo ""
+          echo "All $JOBS variants completed in ${WALL}s wall time"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Total wall time** | | | | | | | | **${WALL}** |" >> "$GITHUB_STEP_SUMMARY"
