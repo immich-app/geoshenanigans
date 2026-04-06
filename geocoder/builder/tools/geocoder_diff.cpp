@@ -625,10 +625,10 @@ int main(int argc, char* argv[]) {
     };
 
     double merge_start = now_ms();
-    std::cerr << "Building merge sequences (sequential to limit memory)..." << std::endl;
+    std::cerr << "Building merge sequences (parallel)..." << std::endl;
 
     // Group 1: addr_points (old=COW mmap for string remap, new=read-only mmap)
-    {
+    std::thread t_addr([&]() {
         double gs = now_ms();
         auto old_m = mmap_file_rw(old_dir + "/addr_points.bin");
         remap_addr_points(old_m.data, old_m.size, str_remap);
@@ -648,12 +648,12 @@ int main(int argc, char* argv[]) {
         unmap_file(old_m); unmap_file(new_m);
         log_time("  group:addr_points", gs);
         std::cerr << "  RSS after addr_points: " << get_rss_mb() << " MiB" << std::endl;
-    }
+    });
 
     // Group 2: street_ways → street_nodes
     // old_w = COW mmap (needs string remap + offset fixup), new_w = read-only mmap
     // nodes = read-only mmap (huge files, never modified — biggest memory win)
-    {
+    std::thread t_street([&]() {
         double gs = now_ms();
         auto old_w = mmap_file_rw(old_dir + "/street_ways.bin");
         remap_field(old_w.data, old_w.size, way_stride, way_stride == 12 ? 8 : 5, str_remap);
@@ -696,10 +696,10 @@ int main(int argc, char* argv[]) {
         unmap_file(old_w); unmap_file(new_w); unmap_file(old_n); unmap_file(new_n);
         log_time("  group:streets", gs);
         std::cerr << "  RSS after streets: " << get_rss_mb() << " MiB" << std::endl;
-    }
+    });
 
     // Group 3: interp_ways → interp_nodes
-    {
+    std::thread t_interp([&]() {
         double gs = now_ms();
         auto old_data = mmap_file_rw(old_dir + "/interp_ways.bin");
         auto new_data = mmap_file_rw(new_dir + "/interp_ways.bin");  // COW: need to zero padding
@@ -745,10 +745,10 @@ int main(int argc, char* argv[]) {
         unmap_file(old_data); unmap_file(new_data); unmap_file(old_n); unmap_file(new_n);
         log_time("  group:interp", gs);
         std::cerr << "  RSS after interp: " << get_rss_mb() << " MiB" << std::endl;
-    }
+    });
 
     // Group 4: admin_polygons → admin_vertices
-    {
+    std::thread t_admin([&]() {
         double gs = now_ms();
         auto old_data = mmap_file_rw(old_dir + "/admin_polygons.bin");
         auto new_data = mmap_file_rw(new_dir + "/admin_polygons.bin"); // COW: need to zero padding
@@ -793,12 +793,12 @@ int main(int argc, char* argv[]) {
         unmap_file(old_data); unmap_file(new_data); unmap_file(old_v); unmap_file(new_v);
         log_time("  group:admin", gs);
         std::cerr << "  RSS after admin: " << get_rss_mb() << " MiB" << std::endl;
-    }
+    });
 
     // Group 5: cell changes
     // Uses sorted vectors + set_difference instead of unordered_sets — much faster for 15M cells
     std::vector<uint64_t> g_added, g_removed, a_added, a_removed;
-    {
+    std::thread t_cells([&]() {
         double gs = now_ms();
         auto diff_cells = [](const std::string& old_path, const std::string& new_path,
                              size_t stride, std::vector<uint64_t>& added, std::vector<uint64_t>& removed) {
@@ -816,8 +816,9 @@ int main(int argc, char* argv[]) {
         diff_cells(old_dir + "/geo_cells.bin", new_dir + "/geo_cells.bin", 20, g_added, g_removed);
         diff_cells(old_dir + "/admin_cells.bin", new_dir + "/admin_cells.bin", 12, a_added, a_removed);
         log_time("  group:cell_changes", gs);
-    }
+    });
 
+    t_addr.join(); t_street.join(); t_interp.join(); t_admin.join(); t_cells.join();
     log_time("All merge sequences + cell changes built", merge_start);
     // Free string pools + remap (no longer needed after all merges complete)
     unmap_file(old_str_map); unmap_file(new_str_map);

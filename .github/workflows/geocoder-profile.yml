@@ -1,4 +1,4 @@
-name: Profile Patch Pipeline  # v5: streaming entry corrections
+name: Profile Patch Pipeline  # v6: parallel groups
 
 concurrency:
   group: geocoder-profile
