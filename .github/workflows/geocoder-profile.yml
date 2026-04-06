@@ -60,7 +60,7 @@ jobs:
           make -j$(nproc) geocoder-diff geocoder-patch
           echo "$PWD" >> "$GITHUB_PATH"
 
-      - name: Download builds (selected variants only)
+      - name: Download two builds
         env:
           CACHE_ENDPOINT: ${{ steps.setup.outputs.cache_endpoint }}
           CACHE_BUCKET: ${{ steps.setup.outputs.cache_bucket }}
@@ -68,37 +68,34 @@ jobs:
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT"
           S5="s5cmd --endpoint-url $S3_ENDPOINT"
 
-          # Only download variants we'll profile (full + no-addresses + europe/full for mid-size test)
-          # This avoids filling tmpfs with 60-80GB of data for all variants
-          VARIANTS_TO_DOWNLOAD="full no-addresses europe/full"
+          # Use workspace dir (disk-backed) not /tmp (tmpfs/RAM) to avoid eating cgroup memory
+          BUILD_DIR="${GITHUB_WORKSPACE}/builds"
+          mkdir -p "$BUILD_DIR"
+          echo "BUILD_DIR=$BUILD_DIR" >> "$GITHUB_ENV"
 
-          download_variant() {
-            local DATE=$1 DEST=$2 VARIANT=$3
-            local CACHE_PATH="s3://$CACHE_BUCKET/geocoder-cache/builds/$DATE/$VARIANT"
-            mkdir -p "$DEST/$VARIANT"
-            if $CACHE ls "$CACHE_PATH/" 2>/dev/null | head -1 | grep -q .; then
-              $CACHE cp "$CACHE_PATH/*" "$DEST/$VARIANT/"
-            else
-              $S5 cp "s3://$S3_BUCKET/geocoder/builds/$DATE/$VARIANT/*" "$DEST/$VARIANT/"
-            fi
-          }
-
-          for v in $VARIANTS_TO_DOWNLOAD; do
-            echo "Downloading $v..."
+          download_build() {
+            local DATE=$1 DEST=$2
+            local CACHE_PATH="s3://$CACHE_BUCKET/geocoder-cache/builds/$DATE"
+            echo "Downloading $DATE build..."
             START=$(date +%s)
-            download_variant "2026-04-04" /tmp/build-old "$v" &
-            download_variant "2026-04-05" /tmp/build-new "$v" &
-            wait
-            echo "  $v done in $(($(date +%s)-START))s"
-          done
-
-          echo "Old: $(find /tmp/build-old -type f | wc -l) files, $(du -sh /tmp/build-old | cut -f1)"
-          echo "New: $(find /tmp/build-new -type f | wc -l) files, $(du -sh /tmp/build-new | cut -f1)"
+            if $CACHE ls "$CACHE_PATH/" 2>/dev/null | head -1 | grep -q .; then
+              echo "  Source: local cache"
+              $CACHE cp "$CACHE_PATH/*" "$DEST/"
+            else
+              echo "  Cache miss, falling back to Tigris"
+              $S5 cp "s3://$S3_BUCKET/geocoder/builds/$DATE/*" "$DEST/"
+            fi
+            echo "  $(find "$DEST" -type f | wc -l) files in $(($(date +%s)-START))s"
+          }
+          download_build "2026-04-04" "$BUILD_DIR/old"
+          download_build "2026-04-05" "$BUILD_DIR/new"
+          echo "Total disk: $(du -sh "$BUILD_DIR" | cut -f1)"
+          echo "Memory free: $(free -h | awk '/Mem:/{print $4}')"
 
       - name: Profile small variants
         run: |
-          OLD="/tmp/build-old"
-          NEW="/tmp/build-new"
+          OLD="$BUILD_DIR/old"
+          NEW="$BUILD_DIR/new"
           WORKDIR="/tmp/profile"
           mkdir -p "$WORKDIR"
 
@@ -156,14 +153,16 @@ jobs:
           declare -f profile_variant > /tmp/profile_fn.sh
           echo "export OLD NEW WORKDIR" >> /tmp/profile_fn.sh
 
-          # Profile europe/full as a mid-size correctness test
-          profile_variant "europe/full"
+          VARIANTS=$(cd "$NEW" && find . -name "*.bin" -exec dirname {} \; | sort -u | sed 's|^\./||' | grep -v -x -E "full|no-addresses")
+          for variant in $VARIANTS; do
+            profile_variant "$variant"
+          done
 
       - name: Profile no-addresses
         if: always()
         run: |
-          OLD="/tmp/build-old"
-          NEW="/tmp/build-new"
+          OLD="$BUILD_DIR/old"
+          NEW="$BUILD_DIR/new"
           WORKDIR="/tmp/profile"
           mkdir -p "$WORKDIR"
 
@@ -202,8 +201,8 @@ jobs:
       - name: Profile full
         if: always()
         run: |
-          OLD="/tmp/build-old"
-          NEW="/tmp/build-new"
+          OLD="$BUILD_DIR/old"
+          NEW="$BUILD_DIR/new"
           WORKDIR="/tmp/profile"
           mkdir -p "$WORKDIR"
 
