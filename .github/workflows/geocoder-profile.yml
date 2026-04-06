@@ -78,7 +78,7 @@ jobs:
             local CACHE_PATH="s3://$CACHE_BUCKET/geocoder-cache/builds/$DATE"
             echo "Downloading $DATE build..."
             START=$(date +%s)
-            if $CACHE ls "$CACHE_PATH/" 2>/dev/null | head -1 | grep -q .; then
+            if $CACHE ls "$CACHE_PATH/.cache-complete" 2>/dev/null | grep -q ".cache-complete"; then
               echo "  Source: local cache"
               $CACHE cp "$CACHE_PATH/*" "$DEST/"
             else

@@ -214,8 +214,8 @@ jobs:
             START=$(date +%s)
             CACHE_BUILD="s3://$CACHE_BUCKET/geocoder-cache/builds/$YESTERDAY"
 
-            # Try local S3 cache first (much faster)
-            if $CACHE ls "$CACHE_BUILD/" 2>/dev/null | head -1 | grep -q .; then
+            # Try local S3 cache first (much faster) — only if sentinel exists (complete upload)
+            if $CACHE ls "$CACHE_BUILD/.cache-complete" 2>/dev/null | grep -q ".cache-complete"; then
               echo "[Cache] Downloading yesterday's indexes ($YESTERDAY) from local cache..."
               $CACHE cp "$CACHE_BUILD/*" "$WORKDIR/old-output/"
               END=$(date +%s)
@@ -518,18 +518,21 @@ jobs:
           echo "Waiting for cache upload..."
           wait $CACHE_IDX_PID 2>/dev/null || true
 
-          # Verify cache has all files — retry missing ones
           LOCAL_COUNT=$(find "$WORKDIR/output" -type f | wc -l)
           CACHE_COUNT=$($CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/*" 2>/dev/null | wc -l)
           echo "Cache verification: local=$LOCAL_COUNT cache=$CACHE_COUNT"
           if [ "$CACHE_COUNT" -lt "$LOCAL_COUNT" ]; then
-            echo "Cache incomplete — retrying upload..."
+            echo "Cache incomplete ($CACHE_COUNT/$LOCAL_COUNT) — retrying..."
             $CACHE cp "$WORKDIR/output/*" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/" 2>&1 || true
             CACHE_COUNT=$($CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/*" 2>/dev/null | wc -l)
-            echo "Cache after retry: $CACHE_COUNT/$LOCAL_COUNT"
-            if [ "$CACHE_COUNT" -lt "$LOCAL_COUNT" ]; then
-              echo "::warning::Cache still incomplete after retry: $CACHE_COUNT/$LOCAL_COUNT files"
-            fi
+          fi
+          if [ "$CACHE_COUNT" -ge "$LOCAL_COUNT" ]; then
+            # Write sentinel — next run checks for this before trusting the cache
+            echo "{\"date\":\"$NEW_DATE\",\"files\":$LOCAL_COUNT,\"cached_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" \
+              | $CACHE pipe "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/.cache-complete"
+            echo "Cache complete: $CACHE_COUNT files, sentinel written"
+          else
+            echo "::warning::Cache incomplete after retry ($CACHE_COUNT/$LOCAL_COUNT) — no sentinel written"
           fi
 
           if [ "$IS_PRODUCTION" = "true" ]; then
