@@ -154,17 +154,26 @@ jobs:
 
       - name: Determine dates and sequences
         id: dates
+        env:
+          BUILD_DATE: ${{ inputs.build_date }}
         run: |
           SERVER="https://planet.openstreetmap.org/replication/day"
           CURRENT_SEQ=$(curl -sL "$SERVER/state.txt" | grep sequenceNumber | cut -d= -f2)
           CURRENT_DATE=$(curl -sL "$SERVER/state.txt" | grep timestamp | cut -d= -f2 | tr '\\' ' ' | cut -dT -f1 | tr -d ' ')
-          YESTERDAY=$(date -u -d "yesterday" +%Y-%m-%d)
 
-          echo "today=$CURRENT_DATE" >> "$GITHUB_OUTPUT"
-          echo "yesterday=$YESTERDAY" >> "$GITHUB_OUTPUT"
+          # Use build_date input if provided, otherwise use replication server date
+          if [ -n "$BUILD_DATE" ]; then
+            TARGET_DATE="$BUILD_DATE"
+          else
+            TARGET_DATE="$CURRENT_DATE"
+          fi
+          PREV_DATE=$(date -u -d "$TARGET_DATE - 1 day" +%Y-%m-%d)
+
+          echo "today=$TARGET_DATE" >> "$GITHUB_OUTPUT"
+          echo "yesterday=$PREV_DATE" >> "$GITHUB_OUTPUT"
           echo "today_seq=$CURRENT_SEQ" >> "$GITHUB_OUTPUT"
           echo "yesterday_seq=$((CURRENT_SEQ - 1))" >> "$GITHUB_OUTPUT"
-          echo "Server: date=$CURRENT_DATE seq=$CURRENT_SEQ"
+          echo "Target: $TARGET_DATE, Previous: $PREV_DATE (server: date=$CURRENT_DATE seq=$CURRENT_SEQ)"
 
       - name: Check for yesterday's build on Tigris
         id: prev
