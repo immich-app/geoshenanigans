@@ -1,4 +1,4 @@
-name: Profile Patch Pipeline  # v3: separate steps per size class
+name: Profile Patch Pipeline  # v4: merge-walk corrections
 
 concurrency:
   group: geocoder-profile

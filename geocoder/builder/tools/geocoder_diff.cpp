@@ -857,8 +857,8 @@ int main(int argc, char* argv[]) {
     }
     log_time("Admin remap", t0);
 
+    // mmap old geo_cells for rebuild, then copy to vector (rebuild_geo_from_remap_vec needs vector)
     auto old_geo_map = mmap_file(old_dir + "/geo_cells.bin");
-    // Wrap in vector for rebuild_geo_from_remap_vec (entries are much smaller than data files)
     std::vector<char> old_geo(old_geo_map.data, old_geo_map.data + old_geo_map.size);
     unmap_file(old_geo_map);
 
@@ -909,12 +909,14 @@ int main(int argc, char* argv[]) {
     { std::vector<uint32_t>().swap(w_rm_v); std::vector<uint32_t>().swap(a_rm_v);
       std::vector<uint32_t>().swap(i_rm_v); }
     { std::vector<char>().swap(old_se); std::vector<char>().swap(old_ae);
-      std::vector<char>().swap(old_ie); }
+      std::vector<char>().swap(old_ie); std::vector<char>().swap(old_geo); }
     malloc_trim(0);
     log_time("Geo entry rebuild", t1);
     std::cerr << "  RSS after rebuild: " << get_rss_mb() << " MiB" << std::endl;
 
-    // Compare derived entries with new entries using mmap (no new_cell_map hash table)
+    // Compare derived entries with new entries using sorted merge-walk.
+    // Both derived.geo_cells_data and new geo_cells are sorted by cell_id.
+    // No hash tables needed — O(n) scan with O(1) extra memory per cell.
     double t2 = now_ms();
     auto new_geo_m = mmap_file(new_dir + "/geo_cells.bin");
     auto new_se_m = mmap_file(new_dir + "/street_entries.bin");
@@ -940,84 +942,79 @@ int main(int argc, char* argv[]) {
 
     size_t d_nc = derived.geo_cells_data.size() / 20;
     size_t n_nc = new_geo_m.size / 20;
+    std::cerr << "  Entry corrections: " << d_nc << " derived cells, " << n_nc << " new cells" << std::endl;
+    std::cerr << "  RSS before corrections: " << get_rss_mb() << " MiB" << std::endl;
 
-    // Build cell_id → index map for new cells (just indices, not entry data)
-    std::unordered_map<uint64_t, uint32_t> new_cell_idx;
-    new_cell_idx.reserve(n_nc);
-    for (size_t i = 0; i < n_nc; i++) {
-        uint64_t cid; memcpy(&cid, new_geo_m.data + i * 20, 8);
-        new_cell_idx[cid] = static_cast<uint32_t>(i);
-    }
-
-    // Build derived cell set
-    std::unordered_set<uint64_t> d_set;
-    d_set.reserve(d_nc);
-    for (size_t i = 0; i < d_nc; i++) {
-        uint64_t cid; memcpy(&cid, derived.geo_cells_data.data() + i * 20, 8);
-        d_set.insert(cid);
-    }
-    log_time("Pre-parse cell indices", t2);
-    std::cerr << "  RSS after pre-parse: " << get_rss_mb() << " MiB" << std::endl;
-
-    // Compute corrections by looking up entries on-the-fly from mmap'd files
-    auto compute_geo_correction = [&](PatchFileId fid, const std::string& fname,
+    // Sorted merge-walk: compare derived vs new geo_cells entry-by-entry.
+    // Emit corrections for cells where entries differ.
+    // Process all 3 entry types (street, addr, interp) in a single pass.
+    auto merge_walk_corrections = [&](PatchFileId fid, const std::string& fname,
                                        const std::vector<char>& d_entries,
-                                       size_t d_off_pos,
-                                       const MappedFile& new_entries, size_t new_geo_off_pos) -> std::vector<char> {
+                                       size_t d_off_pos,  // offset within derived geo_cells record
+                                       const MappedFile& new_entries, size_t n_off_pos  // offset within new geo_cells record
+                                       ) -> std::vector<char> {
         std::vector<char> buf; buf.resize(12, 0); uint32_t dc = 0;
-        for (size_t i = 0; i < d_nc; i++) {
-            uint64_t cid; memcpy(&cid, derived.geo_cells_data.data() + i * 20, 8);
-            uint32_t off; memcpy(&off, derived.geo_cells_data.data() + i * 20 + d_off_pos, 4);
-            auto d_ids = parse_ids(d_entries, off);
-            // Look up new cell entries via mmap
-            std::vector<uint32_t> n_ids;
-            auto nit = new_cell_idx.find(cid);
-            if (nit != new_cell_idx.end()) {
-                uint32_t new_off; memcpy(&new_off, new_geo_m.data + nit->second * 20 + new_geo_off_pos, 4);
-                n_ids = parse_ids_raw(new_entries.data, new_entries.size, new_off);
-            }
-            bool differs = n_ids.empty() ? !d_ids.empty() : (d_ids.size() != n_ids.size()) ||
-                          (!d_ids.empty() && memcmp(d_ids.data(), n_ids.data(), d_ids.size() * 4) != 0);
-            if (differs) {
-                wval(buf, &cid, 8); uint16_t c = n_ids.size(); wval(buf, &c, 2);
-                if (!n_ids.empty()) buf.insert(buf.end(), (const char*)n_ids.data(), (const char*)n_ids.data() + n_ids.size() * 4);
-                dc++;
-            }
-        }
-        // Check for new cells not in derived set
-        for (auto& [cid, idx] : new_cell_idx) {
-            if (!d_set.count(cid)) {
-                uint32_t new_off; memcpy(&new_off, new_geo_m.data + idx * 20 + new_geo_off_pos, 4);
-                auto ids = parse_ids_raw(new_entries.data, new_entries.size, new_off);
-                if (!ids.empty()) {
-                    wval(buf, &cid, 8); uint16_t c = ids.size(); wval(buf, &c, 2);
-                    buf.insert(buf.end(), (const char*)ids.data(), (const char*)ids.data() + ids.size() * 4);
+        size_t di = 0, ni = 0;
+        while (di < d_nc || ni < n_nc) {
+            uint64_t d_cid = UINT64_MAX, n_cid = UINT64_MAX;
+            if (di < d_nc) memcpy(&d_cid, derived.geo_cells_data.data() + di * 20, 8);
+            if (ni < n_nc) memcpy(&n_cid, new_geo_m.data + ni * 20, 8);
+
+            if (d_cid == n_cid) {
+                // Cell exists in both — compare entries
+                uint32_t d_off; memcpy(&d_off, derived.geo_cells_data.data() + di * 20 + d_off_pos, 4);
+                uint32_t n_off; memcpy(&n_off, new_geo_m.data + ni * 20 + n_off_pos, 4);
+                auto d_ids = parse_ids(d_entries, d_off);
+                auto n_ids = parse_ids_raw(new_entries.data, new_entries.size, n_off);
+                bool differs = (d_ids.size() != n_ids.size()) ||
+                    (!d_ids.empty() && memcmp(d_ids.data(), n_ids.data(), d_ids.size() * 4) != 0);
+                if (differs) {
+                    wval(buf, &d_cid, 8); uint16_t c = n_ids.size(); wval(buf, &c, 2);
+                    if (!n_ids.empty()) buf.insert(buf.end(), (const char*)n_ids.data(), (const char*)n_ids.data() + n_ids.size() * 4);
                     dc++;
                 }
+                di++; ni++;
+            } else if (d_cid < n_cid) {
+                // Cell only in derived (was removed or has no new entries) — correct to empty
+                uint32_t d_off; memcpy(&d_off, derived.geo_cells_data.data() + di * 20 + d_off_pos, 4);
+                auto d_ids = parse_ids(d_entries, d_off);
+                if (!d_ids.empty()) {
+                    wval(buf, &d_cid, 8); uint16_t c = 0; wval(buf, &c, 2);
+                    dc++;
+                }
+                di++;
+            } else {
+                // Cell only in new — emit new entries as correction
+                uint32_t n_off; memcpy(&n_off, new_geo_m.data + ni * 20 + n_off_pos, 4);
+                auto n_ids = parse_ids_raw(new_entries.data, new_entries.size, n_off);
+                if (!n_ids.empty()) {
+                    wval(buf, &n_cid, 8); uint16_t c = n_ids.size(); wval(buf, &c, 2);
+                    buf.insert(buf.end(), (const char*)n_ids.data(), (const char*)n_ids.data() + n_ids.size() * 4);
+                    dc++;
+                }
+                ni++;
             }
         }
         uint32_t marker = ENTRY_CORRECTION_MARKER, file = static_cast<uint32_t>(fid);
         memcpy(buf.data(), &marker, 4); memcpy(buf.data() + 4, &file, 4); memcpy(buf.data() + 8, &dc, 4);
-        { std::lock_guard<std::mutex> lock(log_mutex);
-          std::cerr << "  " << fname << ": " << dc << " cell corrections (" << buf.size() - 12 << " bytes)" << std::endl; }
+        std::cerr << "  " << fname << ": " << dc << " cell corrections (" << buf.size() - 12 << " bytes)" << std::endl;
         return buf;
     };
 
-    std::vector<char> corr_se, corr_ae, corr_ie;
-    {
-        // geo_cells offsets: street_entries=8, addr_entries=12, interp_entries=16
-        std::thread tc1([&]() { corr_se = compute_geo_correction(PatchFileId::STREET_ENTRIES, "street_entries.bin",
-            derived.street_entries_data, 8, new_se_m, 8); });
-        std::thread tc2([&]() { corr_ae = compute_geo_correction(PatchFileId::ADDR_ENTRIES, "addr_entries.bin",
-            derived.addr_entries_data, 12, new_ae_m, 12); });
-        std::thread tc3([&]() { corr_ie = compute_geo_correction(PatchFileId::INTERP_ENTRIES, "interp_entries.bin",
-            derived.interp_entries_data, 16, new_ie_m, 16); });
-        tc1.join(); tc2.join(); tc3.join();
-    }
+    // Run sequentially (each reads derived + mmap'd new entries, low memory)
+    auto corr_se = merge_walk_corrections(PatchFileId::STREET_ENTRIES, "street_entries.bin",
+        derived.street_entries_data, 8, new_se_m, 8);
     patch.insert(patch.end(), corr_se.begin(), corr_se.end()); { std::vector<char>().swap(corr_se); }
+
+    auto corr_ae = merge_walk_corrections(PatchFileId::ADDR_ENTRIES, "addr_entries.bin",
+        derived.addr_entries_data, 12, new_ae_m, 12);
     patch.insert(patch.end(), corr_ae.begin(), corr_ae.end()); { std::vector<char>().swap(corr_ae); }
+
+    auto corr_ie = merge_walk_corrections(PatchFileId::INTERP_ENTRIES, "interp_entries.bin",
+        derived.interp_entries_data, 16, new_ie_m, 16);
     patch.insert(patch.end(), corr_ie.begin(), corr_ie.end()); { std::vector<char>().swap(corr_ie); }
-    derived = RebuiltGeo{}; new_cell_idx.clear(); d_set.clear();
+
+    derived = RebuiltGeo{};
     unmap_file(new_se_m); unmap_file(new_ae_m); unmap_file(new_ie_m);
     malloc_trim(0);
     // Keep new_geo_m for flag corrections below
@@ -1058,15 +1055,17 @@ int main(int argc, char* argv[]) {
     }
     log_time("Entry corrections", t2);
 
-    // Cell flag corrections (reuse already-mmap'd new_geo_m)
+    // Cell flag corrections (mmap old geo_cells fresh — previously freed to save memory)
     {
+        auto old_geo_f = mmap_file(old_dir + "/geo_cells.bin");
         std::unordered_map<uint64_t, uint8_t> old_cell_flags;
-        for (size_t i = 0; i < old_geo.size() / 20; i++) {
-            uint64_t cid; memcpy(&cid, old_geo.data()+i*20, 8);
-            uint32_t s, a, ip; memcpy(&s, old_geo.data()+i*20+8, 4);
-            memcpy(&a, old_geo.data()+i*20+12, 4); memcpy(&ip, old_geo.data()+i*20+16, 4);
+        for (size_t i = 0; i < old_geo_f.size / 20; i++) {
+            uint64_t cid; memcpy(&cid, old_geo_f.data+i*20, 8);
+            uint32_t s, a, ip; memcpy(&s, old_geo_f.data+i*20+8, 4);
+            memcpy(&a, old_geo_f.data+i*20+12, 4); memcpy(&ip, old_geo_f.data+i*20+16, 4);
             old_cell_flags[cid] = (s != 0xFFFFFFFF ? 1 : 0) | (a != 0xFFFFFFFF ? 2 : 0) | (ip != 0xFFFFFFFF ? 4 : 0);
         }
+        unmap_file(old_geo_f);
         std::vector<std::pair<uint64_t, uint8_t>> flag_corrections;
         size_t ngc = new_geo_m.size / 20;
         for (size_t i = 0; i < ngc; i++) {
@@ -1084,7 +1083,6 @@ int main(int argc, char* argv[]) {
         std::cerr << "  Cell flag corrections: " << fc << " cells" << std::endl;
     }
     unmap_file(new_geo_m);
-    { std::vector<char>().swap(old_geo); } // free old_geo vector
 
     // End marker
     uint32_t end_marker = 0xFFFFFFFF;
