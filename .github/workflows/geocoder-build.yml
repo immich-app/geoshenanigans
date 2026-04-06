@@ -204,7 +204,7 @@ jobs:
           TODAY: ${{ steps.dates.outputs.today }}
           TODAY_SEQ: ${{ steps.dates.outputs.today_seq }}
         run: |
-          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT"
+          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5"
 
           # Download yesterday's indexes from Tigris and today's PBF from cache in parallel
           echo "Starting parallel downloads..."
@@ -319,7 +319,7 @@ jobs:
           TODAY: ${{ steps.dates.outputs.today }}
           TODAY_SEQ: ${{ steps.dates.outputs.today_seq }}
         run: |
-          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT"
+          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5"
 
           # Check cache for today's PBF
           if $CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" 2>/dev/null | grep -q "planet-"; then
@@ -388,7 +388,7 @@ jobs:
           UPLOAD_LOG="$WORKDIR/upload.log"
           touch "$UPLOAD_LOG"
 
-          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT"
+          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5"
 
           # Upload today's indexes to local cache (always, for next run)
           echo "Caching today's indexes ($NEW_DATE) to local S3..."
