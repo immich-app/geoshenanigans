@@ -1,4 +1,4 @@
-name: Profile Patch Pipeline  # v4: merge-walk corrections
+name: Profile Patch Pipeline  # v5: streaming entry corrections
 
 concurrency:
   group: geocoder-profile
