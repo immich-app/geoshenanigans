@@ -514,9 +514,23 @@ jobs:
 
           rm -rf "$PATCHES_DIR" "$WORKDIR/old-output"
 
-          # Wait for cache upload
+          # Wait for cache upload and verify completeness
           echo "Waiting for cache upload..."
           wait $CACHE_IDX_PID 2>/dev/null || true
+
+          # Verify cache has all files — retry missing ones
+          LOCAL_COUNT=$(find "$WORKDIR/output" -type f | wc -l)
+          CACHE_COUNT=$($CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/*" 2>/dev/null | wc -l)
+          echo "Cache verification: local=$LOCAL_COUNT cache=$CACHE_COUNT"
+          if [ "$CACHE_COUNT" -lt "$LOCAL_COUNT" ]; then
+            echo "Cache incomplete — retrying upload..."
+            $CACHE cp "$WORKDIR/output/*" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/" 2>&1 || true
+            CACHE_COUNT=$($CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/*" 2>/dev/null | wc -l)
+            echo "Cache after retry: $CACHE_COUNT/$LOCAL_COUNT"
+            if [ "$CACHE_COUNT" -lt "$LOCAL_COUNT" ]; then
+              echo "::warning::Cache still incomplete after retry: $CACHE_COUNT/$LOCAL_COUNT files"
+            fi
+          fi
 
           if [ "$IS_PRODUCTION" = "true" ]; then
             # Wait for Tigris upload
