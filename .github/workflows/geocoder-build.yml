@@ -4,8 +4,11 @@ concurrency:
   group: geocoder-build-${{ github.event_name == 'pull_request' && github.head_ref || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# Temporarily disabled for profiling
 on:
+  pull_request:
+    types: [labeled, synchronize, opened]
+  schedule:
+    - cron: '0 2 * * *'
   workflow_dispatch:
     inputs:
       build_date:
