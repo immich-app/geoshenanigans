@@ -19,7 +19,7 @@
   },
   "devDependencies": {
     "@aws-sdk/lib-storage": "^3.862.0",
-    "@cloudflare/vitest-pool-workers": "^0.13.4",
+    "@cloudflare/vitest-pool-workers": "^0.14.0",
     "@eslint/compat": "^2.0.0",
     "@eslint/eslintrc": "^3.3.3",
     "@eslint/js": "^9.39.2",
@@ -35,7 +35,7 @@
     "tsx": "^4.17.0",
     "typescript": "^5.5.2",
     "vite-node": "^6.0.0",
-    "vite-plugin-node-polyfills": "^0.25.0",
+    "vite-plugin-node-polyfills": "^0.26.0",
     "wrangler": "^4.0.0"
   },
   "dependencies": {
