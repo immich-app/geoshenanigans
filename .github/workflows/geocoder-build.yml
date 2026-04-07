@@ -157,13 +157,13 @@ jobs:
 
               if $CACHE ls "$CACHE_BUILD/.cache-complete" 2>/dev/null | grep -q ".cache-complete"; then
                 echo "[indexes] Downloading $YESTERDAY from local cache..."
-                $CACHE cp --concurrency 16"$CACHE_BUILD/*" "$WORKDIR/old-output/"
+                $CACHE cp --concurrency 16 "$CACHE_BUILD/*" "$WORKDIR/old-output/"
               else
                 echo "[indexes] Cache miss — downloading $YESTERDAY via Tigris S3..."
                 $S5 cp --concurrency 8 "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/*" "$WORKDIR/old-output/"
 
                 echo "[indexes] Backfilling local cache..."
-                $CACHE cp --concurrency 16"$WORKDIR/old-output/*" "$CACHE_BUILD/" 2>/dev/null || true
+                $CACHE cp --concurrency 16 "$WORKDIR/old-output/*" "$CACHE_BUILD/" 2>/dev/null || true
               fi
 
               COUNT=$(find "$WORKDIR/old-output" -type f | wc -l)
@@ -179,7 +179,7 @@ jobs:
           if $CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" 2>/dev/null | grep -q "planet-"; then
             echo "[pbf] Cache HIT — downloading today's PBF ($TODAY)..."
             START=$(date +%s)
-            $CACHE cp --concurrency 16"s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" "$WORKDIR/planet.osm.pbf"
+            $CACHE cp --concurrency 16 "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" "$WORKDIR/planet.osm.pbf"
             SIZE=$(stat -c%s "$WORKDIR/planet.osm.pbf")
             ELAPSED=$(($(date +%s) - START))
             echo "[pbf] Done: $((SIZE/1024/1024)) MiB in ${ELAPSED}s ($((SIZE/1024/1024/(ELAPSED+1))) MB/s)"
@@ -188,7 +188,7 @@ jobs:
 
             echo "[pbf] Downloading yesterday's PBF ($YESTERDAY) from cache..."
             START=$(date +%s)
-            $CACHE cp --concurrency 16"s3://$CACHE_BUCKET/geocoder-cache/planet-${YESTERDAY}.osm.pbf" "$WORKDIR/planet.osm.pbf"
+            $CACHE cp --concurrency 16 "s3://$CACHE_BUCKET/geocoder-cache/planet-${YESTERDAY}.osm.pbf" "$WORKDIR/planet.osm.pbf"
             SIZE=$(stat -c%s "$WORKDIR/planet.osm.pbf")
             ELAPSED=$(($(date +%s) - START))
             echo "[pbf] Downloaded: $((SIZE/1024/1024)) MiB in ${ELAPSED}s ($((SIZE/1024/1024/(ELAPSED+1))) MB/s)"
@@ -211,7 +211,7 @@ jobs:
             rm -f "$WORKDIR/diff-today.osc.gz"
 
             echo "[pbf] Caching today's PBF in background..."
-            $CACHE cp --concurrency 16"$WORKDIR/planet.osm.pbf" "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" &
+            $CACHE cp --concurrency 16 "$WORKDIR/planet.osm.pbf" "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" &
           else
             echo "[pbf] No cached PBF — downloading from mirrors + applying diffs"
             aria2c -x 16 -s 16 -j 16 --max-tries=3 \
@@ -242,7 +242,7 @@ jobs:
             fi
 
             echo "[pbf] Caching PBF in background..."
-            $CACHE cp --concurrency 16"$WORKDIR/planet.osm.pbf" "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" &
+            $CACHE cp --concurrency 16 "$WORKDIR/planet.osm.pbf" "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" &
           fi
 
           # Wait for index download
@@ -406,7 +406,7 @@ jobs:
           TIGRIS_PID=$!
 
           echo "Caching to local S3..."
-          $CACHE cp --concurrency 16"$WORKDIR/output/*" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/" &
+          $CACHE cp --concurrency 16 "$WORKDIR/output/*" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/" &
           CACHE_PID=$!
 
           # ── Wait for Tigris ──
@@ -433,7 +433,7 @@ jobs:
           echo "Cache: $CACHE_COUNT/$LOCAL_COUNT files"
           if [ "$CACHE_COUNT" -lt "$LOCAL_COUNT" ]; then
             echo "Cache incomplete — retrying..."
-            $CACHE cp --concurrency 16"$WORKDIR/output/*" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/" 2>&1 || true
+            $CACHE cp --concurrency 16 "$WORKDIR/output/*" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/" 2>&1 || true
             CACHE_COUNT=$($CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/*" 2>/dev/null | wc -l)
           fi
           if [ "$CACHE_COUNT" -ge "$LOCAL_COUNT" ]; then
