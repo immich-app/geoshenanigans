@@ -115,6 +115,25 @@ jobs:
             echo "No previous build ($PREV_DATE) — building fresh"
           fi
 
+      # ── One-time cleanup: wipe old index data ─────────────────────
+      - name: Clean stale index data
+        env:
+          CACHE_ENDPOINT: ${{ steps.setup.outputs.cache_endpoint }}
+          CACHE_BUCKET: ${{ steps.setup.outputs.cache_bucket }}
+        run: |
+          S5="s5cmd --endpoint-url $S3_ENDPOINT --numworkers 32"
+          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15 --concurrency 16"
+
+          echo "Cleaning Tigris builds..."
+          $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/*" 2>/dev/null || true
+          $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/patches/*" 2>/dev/null || true
+          $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/latest.json" 2>/dev/null || true
+          echo "Tigris cleaned"
+
+          echo "Cleaning cache builds..."
+          $CACHE rm "s3://$CACHE_BUCKET/geocoder-cache/builds/*" 2>/dev/null || true
+          echo "Cache cleaned (PBFs kept)"
+
       # ── Obtain PBF + previous indexes (parallel) ──────────────────
       - name: Download previous indexes + obtain PBF
         env:
