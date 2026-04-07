@@ -1531,8 +1531,9 @@ int main(int argc, char* argv[]) {
                 if (pa.admin_level != pb.admin_level) return pa.admin_level < pb.admin_level;
                 if (pa.country_code != pb.country_code) return pa.country_code < pb.country_code;
                 if (pa.vertex_count != pb.vertex_count) return pa.vertex_count < pb.vertex_count;
-                // Compare all vertices for tiebreaking
-                uint32_t nc = pa.vertex_count; // counts are equal at this point
+                // Compare first few vertices for tiebreaking
+                uint32_t nc = std::min(pa.vertex_count, pb.vertex_count);
+                nc = std::min(nc, 20u); // limit comparison depth
                 for (uint32_t j = 0; j < nc; j++) {
                     uint32_t la = float_bits(data.admin_vertices[pa.vertex_offset + j].lat);
                     uint32_t lb = float_bits(data.admin_vertices[pb.vertex_offset + j].lat);
@@ -1544,42 +1545,17 @@ int main(int argc, char* argv[]) {
                 return false;
             });
             std::vector<uint32_t> old_to_new(n);
-            std::vector<AdminPolygon> new_polys;
-            new_polys.reserve(n);
+            for (uint32_t i = 0; i < n; i++) old_to_new[order[i]] = i;
+            std::vector<AdminPolygon> new_polys(n);
             std::vector<NodeCoord> new_verts;
             new_verts.reserve(data.admin_vertices.size());
-            uint32_t deduped = 0;
             for (uint32_t i = 0; i < n; i++) {
                 auto p = data.admin_polygons[order[i]];
                 uint32_t old_off = p.vertex_offset;
-                uint32_t vc = p.vertex_count;
-                // Dedup: check if identical to previous polygon
-                bool is_dup = false;
-                if (!new_polys.empty()) {
-                    auto& prev = new_polys.back();
-                    if (prev.name_id == p.name_id &&
-                        prev.admin_level == p.admin_level &&
-                        prev.country_code == p.country_code &&
-                        prev.vertex_count == vc) {
-                        is_dup = true;
-                        for (uint32_t j = 0; j < vc && is_dup; j++) {
-                            if (memcmp(&data.admin_vertices[old_off + j],
-                                       &new_verts[prev.vertex_offset + j],
-                                       sizeof(NodeCoord)) != 0)
-                                is_dup = false;
-                        }
-                    }
-                }
-                if (is_dup) {
-                    old_to_new[order[i]] = static_cast<uint32_t>(new_polys.size() - 1);
-                    deduped++;
-                } else {
-                    old_to_new[order[i]] = static_cast<uint32_t>(new_polys.size());
-                    p.vertex_offset = static_cast<uint32_t>(new_verts.size());
-                    for (uint32_t j = 0; j < vc; j++)
-                        new_verts.push_back(data.admin_vertices[old_off + j]);
-                    new_polys.push_back(p);
-                }
+                p.vertex_offset = static_cast<uint32_t>(new_verts.size());
+                for (uint32_t j = 0; j < p.vertex_count; j++)
+                    new_verts.push_back(data.admin_vertices[old_off + j]);
+                new_polys[i] = p;
             }
             data.admin_polygons = std::move(new_polys);
             data.admin_vertices = std::move(new_verts);
@@ -1593,9 +1569,7 @@ int main(int argc, char* argv[]) {
                 }
                 std::sort(ids.begin(), ids.end());
             }
-            std::cerr << "  Admin polygons sorted: " << data.admin_polygons.size();
-            if (deduped > 0) std::cerr << " (" << deduped << " duplicates removed)";
-            std::cerr << std::endl;
+            std::cerr << "  Admin polygons sorted: " << n << std::endl;
         }
         log_phase("  Sort admin", _st, _sc);
     }
@@ -1662,7 +1636,7 @@ int main(int argc, char* argv[]) {
 
     // Write planet (async — overlaps with continent filtering start)
     auto planet_future = std::async(std::launch::async, [&]() {
-        write_region(data, output_dir);
+        write_region(data, output_dir + "/planet");
     });
 
     // Process continents with bounded concurrency, largest first.
@@ -1816,7 +1790,7 @@ int main(int argc, char* argv[]) {
 
         // Build list of regions
         std::vector<std::pair<std::string, std::string>> regions; // (name, path)
-        regions.push_back({"planet", output_dir});
+        regions.push_back({"planet", output_dir + "/planet"});
         if (generate_continents) {
             for (size_t ci = 0; ci < kContinentCount; ci++) {
                 regions.push_back({kContinents[ci].name,
