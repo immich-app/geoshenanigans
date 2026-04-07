@@ -179,8 +179,8 @@ jobs:
             SIZE=$(stat -c%s "$WORKDIR/planet.osm.pbf")
             ELAPSED=$(($(date +%s) - START))
             echo "[pbf] Done: $((SIZE/1024/1024)) MiB in ${ELAPSED}s ($((SIZE/1024/1024/(ELAPSED+1))) MB/s)"
-          else
-            echo "[pbf] Cache MISS — building today's PBF from yesterday's + 1 diff"
+          elif $CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/planet-${YESTERDAY}.osm.pbf" 2>/dev/null | grep -q "planet-"; then
+            echo "[pbf] Cache MISS for today — downloading yesterday's PBF + applying 1 diff"
 
             echo "[pbf] Downloading yesterday's PBF ($YESTERDAY) from cache..."
             START=$(date +%s)
@@ -207,6 +207,39 @@ jobs:
             rm -f "$WORKDIR/diff-today.osc.gz"
 
             echo "[pbf] Caching today's PBF in background..."
+            $CACHE cp "$WORKDIR/planet.osm.pbf" "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" &
+          else
+            echo "[pbf] No cached PBF — downloading from mirrors + applying diffs"
+            aria2c -x 16 -s 16 -j 16 --max-tries=3 \
+              -d "$WORKDIR" -o planet.osm.pbf \
+              "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
+              "https://ftpmirror.your.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
+              "https://ftp.osuosl.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
+              "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/planet-latest.osm.pbf"
+
+            SERVER="https://planet.openstreetmap.org/replication/day"
+            PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" 2>/dev/null | cut -dT -f1)
+            DAYS_NEEDED=$(( ($(date -u -d "$TODAY" +%s) - $(date -u -d "$PBF_DATE" +%s)) / 86400 ))
+            PBF_SEQ=$((TODAY_SEQ - DAYS_NEEDED))
+            echo "[pbf] PBF: date=$PBF_DATE seq=$PBF_SEQ, need $DAYS_NEEDED diffs"
+
+            if [ $DAYS_NEEDED -gt 0 ]; then
+              DIFFS=""
+              for S in $(seq $((PBF_SEQ + 1)) $TODAY_SEQ); do
+                DIR1=$(printf "%03d" $((S / 1000000)))
+                DIR2=$(printf "%03d" $(((S / 1000) % 1000)))
+                FILE=$(printf "%03d" $((S % 1000)))
+                curl -sL -o "$WORKDIR/diff-${S}.osc.gz" "$SERVER/$DIR1/$DIR2/${FILE}.osc.gz"
+                DIFFS="$DIFFS $WORKDIR/diff-${S}.osc.gz"
+              done
+              echo "[pbf] Applying $DAYS_NEEDED diffs..."
+              osmium apply-changes "$WORKDIR/planet.osm.pbf" $DIFFS \
+                -o "$WORKDIR/planet-tmp.osm.pbf" --overwrite
+              mv "$WORKDIR/planet-tmp.osm.pbf" "$WORKDIR/planet.osm.pbf"
+              rm -f $DIFFS
+            fi
+
+            echo "[pbf] Caching PBF in background..."
             $CACHE cp "$WORKDIR/planet.osm.pbf" "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" &
           fi
 
