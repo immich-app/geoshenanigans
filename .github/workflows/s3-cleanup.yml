@@ -1,6 +1,10 @@
 name: S3 Cleanup
 
 on:
+  push:
+    branches: [feat/geocoder]
+    paths:
+      - '.github/workflows/s3-cleanup.yml'
   workflow_dispatch:
 
 permissions:
