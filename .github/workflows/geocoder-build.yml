@@ -194,48 +194,7 @@ jobs:
           fi
 
       # --- Fast path: yesterday's build exists on Tigris ---
-      - name: "Fast: download previous indexes"
-        if: steps.prev.outputs.found == 'true'
-        env:
-          WORKDIR: ${{ steps.setup.outputs.workdir }}
-          CACHE_ENDPOINT: ${{ steps.setup.outputs.cache_endpoint }}
-          CACHE_BUCKET: ${{ steps.setup.outputs.cache_bucket }}
-          YESTERDAY: ${{ steps.dates.outputs.yesterday }}
-        run: |
-          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5"
-          START=$(date +%s)
-          CACHE_BUILD="s3://$CACHE_BUCKET/geocoder-cache/builds/$YESTERDAY"
-
-          if $CACHE ls "$CACHE_BUILD/.cache-complete" 2>/dev/null | grep -q ".cache-complete"; then
-            echo "Downloading $YESTERDAY indexes from local cache..."
-            $CACHE cp "$CACHE_BUILD/*" "$WORKDIR/old-output/"
-          else
-            echo "Cache miss — downloading $YESTERDAY indexes via Tigris HTTP..."
-            BASE_URL="$S3_PUBLIC_URL/$S3_PREFIX/builds/$YESTERDAY"
-            s5cmd --endpoint-url "$S3_ENDPOINT" ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/*" \
-              | awk '{print $NF}' | grep '\.bin$\|\.json$' \
-              | while IFS= read -r REL; do
-                  DIR="$WORKDIR/old-output/$(dirname "$REL")"
-                  mkdir -p "$DIR"
-                  echo "$BASE_URL/$REL"
-                  echo "  dir=$DIR"
-                done > /tmp/aria2-indexes.txt
-            URLS=$(grep -c '^http' /tmp/aria2-indexes.txt || echo 0)
-            echo "Found $URLS files to download"
-            [ "$URLS" -eq 0 ] && { echo "::error::No index files found for $YESTERDAY"; exit 1; }
-            aria2c -x 16 -j 30 --max-tries=3 --auto-file-renaming=false \
-              -i /tmp/aria2-indexes.txt 2>/dev/null
-
-            echo "Backfilling local cache..."
-            $CACHE cp "$WORKDIR/old-output/*" "$CACHE_BUILD/" 2>/dev/null || true
-          fi
-
-          COUNT=$(find "$WORKDIR/old-output" -type f | wc -l)
-          SIZE=$(du -sb "$WORKDIR/old-output" | cut -f1)
-          echo "Downloaded $COUNT files ($((SIZE/1024/1024)) MiB) in $(($(date +%s)-START))s ($((SIZE/1024/1024/($(date +%s)-START+1))) MB/s)"
-          [ "$COUNT" -eq 0 ] && { echo "::error::Download produced 0 files"; exit 1; }
-
-      - name: "Fast: obtain today's PBF"
+      - name: "Fast: download indexes + obtain PBF (parallel)"
         if: steps.prev.outputs.found == 'true'
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
@@ -246,42 +205,85 @@ jobs:
           TODAY_SEQ: ${{ steps.dates.outputs.today_seq }}
         run: |
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5"
+          STEP_START=$(date +%s)
 
+          # --- Background task: download yesterday's indexes ---
+          (
+            START=$(date +%s)
+            CACHE_BUILD="s3://$CACHE_BUCKET/geocoder-cache/builds/$YESTERDAY"
+
+            if $CACHE ls "$CACHE_BUILD/.cache-complete" 2>/dev/null | grep -q ".cache-complete"; then
+              echo "[indexes] Downloading $YESTERDAY from local cache..."
+              $CACHE cp "$CACHE_BUILD/*" "$WORKDIR/old-output/"
+            else
+              echo "[indexes] Cache miss — downloading via Tigris HTTP..."
+              BASE_URL="$S3_PUBLIC_URL/$S3_PREFIX/builds/$YESTERDAY"
+              s5cmd --endpoint-url "$S3_ENDPOINT" ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/*" \
+                | awk '{print $NF}' | grep '\.bin$\|\.json$' \
+                | while IFS= read -r REL; do
+                    DIR="$WORKDIR/old-output/$(dirname "$REL")"
+                    mkdir -p "$DIR"
+                    echo "$BASE_URL/$REL"
+                    echo "  dir=$DIR"
+                  done > /tmp/aria2-indexes.txt
+              URLS=$(grep -c '^http' /tmp/aria2-indexes.txt || echo 0)
+              echo "[indexes] Found $URLS files"
+              [ "$URLS" -eq 0 ] && { echo "::error::No index files found for $YESTERDAY"; exit 1; }
+              aria2c -x 16 -j 30 --max-tries=3 --auto-file-renaming=false \
+                -i /tmp/aria2-indexes.txt 2>/dev/null
+
+              echo "[indexes] Backfilling local cache..."
+              $CACHE cp "$WORKDIR/old-output/*" "$CACHE_BUILD/" 2>/dev/null || true
+            fi
+
+            COUNT=$(find "$WORKDIR/old-output" -type f | wc -l)
+            SIZE=$(du -sb "$WORKDIR/old-output" | cut -f1)
+            echo "[indexes] Done: $COUNT files ($((SIZE/1024/1024)) MiB) in $(($(date +%s)-START))s ($((SIZE/1024/1024/($(date +%s)-START+1))) MB/s)"
+            [ "$COUNT" -eq 0 ] && { echo "::error::Download produced 0 files"; exit 1; }
+          ) &
+          IDX_PID=$!
+
+          # --- Foreground task: obtain today's PBF ---
           if $CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" 2>/dev/null | grep -q "planet-"; then
-            echo "Cache HIT: downloading today's PBF ($TODAY)..."
+            echo "[pbf] Cache HIT: downloading today's PBF ($TODAY)..."
             START=$(date +%s)
             $CACHE cp "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" "$WORKDIR/planet.osm.pbf"
             SIZE=$(stat -c%s "$WORKDIR/planet.osm.pbf")
-            echo "Downloaded $((SIZE/1024/1024)) MiB in $(($(date +%s)-START))s ($((SIZE/1024/1024/($(date +%s)-START+1))) MB/s)"
+            echo "[pbf] Done: $((SIZE/1024/1024)) MiB in $(($(date +%s)-START))s ($((SIZE/1024/1024/($(date +%s)-START+1))) MB/s)"
           else
-            echo "Cache MISS for today's PBF — downloading yesterday's + applying 1 diff"
+            echo "[pbf] Cache MISS — downloading yesterday's PBF + applying 1 diff"
 
-            echo "Step 1/4: Downloading yesterday's PBF ($YESTERDAY) from cache..."
+            echo "[pbf] Downloading yesterday's PBF ($YESTERDAY) from cache..."
             START=$(date +%s)
             $CACHE cp "s3://$CACHE_BUCKET/geocoder-cache/planet-${YESTERDAY}.osm.pbf" "$WORKDIR/planet.osm.pbf"
             SIZE=$(stat -c%s "$WORKDIR/planet.osm.pbf")
-            echo "Step 1/4: Done — $((SIZE/1024/1024)) MiB in $(($(date +%s)-START))s ($((SIZE/1024/1024/($(date +%s)-START+1))) MB/s)"
+            echo "[pbf] Downloaded: $((SIZE/1024/1024)) MiB in $(($(date +%s)-START))s ($((SIZE/1024/1024/($(date +%s)-START+1))) MB/s)"
 
             DIR1=$(printf "%03d" $((TODAY_SEQ / 1000000)))
             DIR2=$(printf "%03d" $(((TODAY_SEQ / 1000) % 1000)))
             FILE=$(printf "%03d" $((TODAY_SEQ % 1000)))
-            echo "Step 2/4: Downloading replication diff (seq $TODAY_SEQ)..."
+            echo "[pbf] Downloading replication diff (seq $TODAY_SEQ)..."
             curl -sL -o "$WORKDIR/diff-today.osc.gz" \
               "https://planet.openstreetmap.org/replication/day/$DIR1/$DIR2/${FILE}.osc.gz"
             DIFF_SIZE=$(stat -c%s "$WORKDIR/diff-today.osc.gz")
-            echo "Step 2/4: Done — $((DIFF_SIZE/1024/1024)) MiB"
+            echo "[pbf] Diff downloaded: $((DIFF_SIZE/1024/1024)) MiB"
 
-            echo "Step 3/4: Applying diff with osmium apply-changes..."
+            echo "[pbf] Applying diff with osmium apply-changes..."
             START=$(date +%s)
             osmium apply-changes "$WORKDIR/planet.osm.pbf" "$WORKDIR/diff-today.osc.gz" \
               -o "$WORKDIR/planet-tmp.osm.pbf" --overwrite
-            echo "Step 3/4: Done in $(($(date +%s)-START))s"
+            echo "[pbf] Diff applied in $(($(date +%s)-START))s"
             mv "$WORKDIR/planet-tmp.osm.pbf" "$WORKDIR/planet.osm.pbf"
             rm -f "$WORKDIR/diff-today.osc.gz"
 
-            echo "Step 4/4: Caching today's PBF in background..."
+            echo "[pbf] Caching today's PBF in background..."
             $CACHE cp "$WORKDIR/planet.osm.pbf" "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" &
           fi
+
+          # Wait for index download
+          echo "Waiting for index download to complete..."
+          wait $IDX_PID
+          echo "All downloads complete in $(($(date +%s)-STEP_START))s"
 
       - name: "Fast: build today's index"
         if: steps.prev.outputs.found == 'true'
