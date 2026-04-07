@@ -1,0 +1,165 @@
+name: S3 Speed Test
+
+on:
+  workflow_dispatch:
+
+env:
+  S3_BUCKET: geoshenanigans-reverse-geocoding
+  S3_PREFIX: geocoder
+  S3_ENDPOINT: https://t3.storage.dev
+  S3_PUBLIC_URL: https://geoshenanigans-reverse-geocoding.t3.tigrisfiles.io
+
+permissions:
+  contents: read
+
+jobs:
+  speed-test:
+    runs-on: pokedex-giant
+    timeout-minutes: 60
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2
+          curl -sL "https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-64bit.tar.gz" \
+            -o /tmp/s5cmd.tar.gz
+          sudo tar xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd
+
+      - name: Configure credentials
+        run: |
+          echo "::add-mask::$AWS_ACCESS_KEY_ID"
+          echo "::add-mask::$AWS_SECRET_ACCESS_KEY"
+          echo "AWS_ACCESS_KEY_ID=$KEY" >> "$GITHUB_ENV"
+          echo "AWS_SECRET_ACCESS_KEY=$SECRET" >> "$GITHUB_ENV"
+        env:
+          KEY: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
+          SECRET: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
+
+      - name: System info
+        run: |
+          echo "CPUs: $(nproc)"
+          echo "Memory: $(free -h | awk '/Mem:/{print $2}')"
+          echo "Network interfaces:"
+          ip -br addr | grep -v lo
+          echo ""
+
+      - name: Test downloads from Tigris
+        run: |
+          S5="s5cmd --endpoint-url $S3_ENDPOINT"
+          WORKDIR="/tmp/speed-test"
+          TEST_PATH="$S3_PREFIX/builds/2026-04-05"
+
+          # Get a list of all files + total size
+          echo "=== Listing files ==="
+          FILE_COUNT=$($S5 ls "s3://$S3_BUCKET/$TEST_PATH/*" 2>/dev/null | wc -l)
+          echo "Files: $FILE_COUNT"
+          echo ""
+
+          echo "## S3 Download Speed Test (10G WAN)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Method | Parameters | Files | Size (MiB) | Time (s) | Speed (MB/s) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-----------|-------|-----------|---------|-------------|" >> "$GITHUB_STEP_SUMMARY"
+
+          run_test() {
+            local LABEL=$1 PARAMS=$2 DEST=$3
+            rm -rf "$DEST" && mkdir -p "$DEST"
+            START=$(date +%s%N)
+            eval "$PARAMS" 2>/dev/null || true
+            END=$(date +%s%N)
+            MS=$(( (END - START) / 1000000 ))
+            SEC=$((MS / 1000))
+            COUNT=$(find "$DEST" -type f 2>/dev/null | wc -l)
+            SIZE=$(du -sb "$DEST" 2>/dev/null | cut -f1)
+            SIZE_MIB=$((SIZE / 1024 / 1024))
+            if [ "$SEC" -gt 0 ]; then
+              SPEED=$((SIZE_MIB / SEC))
+            else
+              SPEED=$SIZE_MIB
+            fi
+            echo "$LABEL: $COUNT files, $SIZE_MIB MiB in ${SEC}s ($SPEED MB/s)"
+            echo "| $LABEL | | $COUNT | $SIZE_MIB | $SEC | $SPEED |" >> "$GITHUB_STEP_SUMMARY"
+            rm -rf "$DEST"
+          }
+
+          # ── s5cmd with different worker/concurrency settings ──
+          echo "=== s5cmd downloads (S3 API) ==="
+          for W in 16 32 64 128 256; do
+            for C in 4 8 16; do
+              LABEL="s5cmd w=${W} c=${C}"
+              run_test "$LABEL" \
+                "$S5 --numworkers $W cp --concurrency $C 's3://$S3_BUCKET/$TEST_PATH/*' '$WORKDIR/dl/'" \
+                "$WORKDIR/dl"
+            done
+          done
+
+          # ── aria2 with different settings (HTTP public endpoint) ──
+          echo ""
+          echo "=== aria2 downloads (HTTP public) ==="
+
+          # Build URL list
+          $S5 ls "s3://$S3_BUCKET/$TEST_PATH/*" | awk '{print $NF}' \
+            | while IFS= read -r REL; do
+                DIR="$WORKDIR/dl/$(dirname "$REL")"
+                echo "$S3_PUBLIC_URL/$TEST_PATH/$REL"
+                echo "  dir=$DIR"
+              done > /tmp/aria2-urls.txt
+          URL_COUNT=$(grep -c '^http' /tmp/aria2-urls.txt)
+          echo "URL count: $URL_COUNT"
+
+          for X in 1 4 8 16 32; do
+            for J in 16 32 64; do
+              LABEL="aria2 x=${X} j=${J}"
+              rm -rf "$WORKDIR/dl" && mkdir -p "$WORKDIR/dl"
+              START=$(date +%s%N)
+              aria2c -x $X -j $J -s $X --max-tries=2 --auto-file-renaming=false \
+                -i /tmp/aria2-urls.txt -d "$WORKDIR/dl" 2>/dev/null || true
+              END=$(date +%s%N)
+              MS=$(( (END - START) / 1000000 ))
+              SEC=$((MS / 1000))
+              COUNT=$(find "$WORKDIR/dl" -type f 2>/dev/null | wc -l)
+              SIZE=$(du -sb "$WORKDIR/dl" 2>/dev/null | cut -f1)
+              SIZE_MIB=$((SIZE / 1024 / 1024))
+              [ "$SEC" -gt 0 ] && SPEED=$((SIZE_MIB / SEC)) || SPEED=$SIZE_MIB
+              echo "$LABEL: $COUNT files, $SIZE_MIB MiB in ${SEC}s ($SPEED MB/s)"
+              echo "| $LABEL | x=$X j=$J | $COUNT | $SIZE_MIB | $SEC | $SPEED |" >> "$GITHUB_STEP_SUMMARY"
+              rm -rf "$WORKDIR/dl"
+            done
+          done
+
+      - name: Test uploads to Tigris
+        run: |
+          S5="s5cmd --endpoint-url $S3_ENDPOINT"
+          WORKDIR="/tmp/speed-test"
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## S3 Upload Speed Test" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Method | Parameters | Size (MiB) | Time (s) | Speed (MB/s) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-----------|-----------|---------|-------------|" >> "$GITHUB_STEP_SUMMARY"
+
+          # Download test data once
+          echo "Downloading test data..."
+          mkdir -p "$WORKDIR/upload-src"
+          $S5 cp "s3://$S3_BUCKET/$S3_PREFIX/builds/2026-04-05/full/*" "$WORKDIR/upload-src/" 2>/dev/null
+          SIZE=$(du -sb "$WORKDIR/upload-src" | cut -f1)
+          SIZE_MIB=$((SIZE / 1024 / 1024))
+          echo "Test data: $SIZE_MIB MiB"
+
+          echo ""
+          echo "=== s5cmd uploads ==="
+          for W in 16 30 64 128; do
+            for C in 4 8 16; do
+              LABEL="s5cmd w=${W} c=${C}"
+              START=$(date +%s)
+              $S5 --numworkers $W cp --concurrency $C \
+                "$WORKDIR/upload-src/*" "s3://$S3_BUCKET/$S3_PREFIX/speed-test/" 2>/dev/null || true
+              SEC=$(($(date +%s) - START))
+              [ "$SEC" -gt 0 ] && SPEED=$((SIZE_MIB / SEC)) || SPEED=$SIZE_MIB
+              echo "$LABEL: $SIZE_MIB MiB in ${SEC}s ($SPEED MB/s)"
+              echo "| $LABEL | w=$W c=$C | $SIZE_MIB | $SEC | $SPEED |" >> "$GITHUB_STEP_SUMMARY"
+              # Clean up
+              $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/speed-test/*" 2>/dev/null || true
+            done
+          done
+
+          rm -rf "$WORKDIR"
