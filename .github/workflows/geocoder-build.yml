@@ -122,7 +122,7 @@ jobs:
           CACHE_BUCKET: ${{ steps.setup.outputs.cache_bucket }}
         run: |
           S5="s5cmd --endpoint-url $S3_ENDPOINT --numworkers 32"
-          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15 --concurrency 16"
+          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
 
           echo "Cleaning Tigris builds..."
           $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/*" 2>/dev/null || true
@@ -145,7 +145,7 @@ jobs:
           TODAY_SEQ: ${{ steps.setup.outputs.today_seq }}
           HAS_PREVIOUS: ${{ steps.setup.outputs.has_previous }}
         run: |
-          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15 --concurrency 16"
+          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
           S5="s5cmd --endpoint-url $S3_ENDPOINT --numworkers 32"
           STEP_START=$(date +%s)
 
@@ -157,13 +157,13 @@ jobs:
 
               if $CACHE ls "$CACHE_BUILD/.cache-complete" 2>/dev/null | grep -q ".cache-complete"; then
                 echo "[indexes] Downloading $YESTERDAY from local cache..."
-                $CACHE cp "$CACHE_BUILD/*" "$WORKDIR/old-output/"
+                $CACHE cp --concurrency 16"$CACHE_BUILD/*" "$WORKDIR/old-output/"
               else
                 echo "[indexes] Cache miss — downloading $YESTERDAY via Tigris S3..."
                 $S5 cp --concurrency 8 "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/*" "$WORKDIR/old-output/"
 
                 echo "[indexes] Backfilling local cache..."
-                $CACHE cp "$WORKDIR/old-output/*" "$CACHE_BUILD/" 2>/dev/null || true
+                $CACHE cp --concurrency 16"$WORKDIR/old-output/*" "$CACHE_BUILD/" 2>/dev/null || true
               fi
 
               COUNT=$(find "$WORKDIR/old-output" -type f | wc -l)
@@ -179,7 +179,7 @@ jobs:
           if $CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" 2>/dev/null | grep -q "planet-"; then
             echo "[pbf] Cache HIT — downloading today's PBF ($TODAY)..."
             START=$(date +%s)
-            $CACHE cp "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" "$WORKDIR/planet.osm.pbf"
+            $CACHE cp --concurrency 16"s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" "$WORKDIR/planet.osm.pbf"
             SIZE=$(stat -c%s "$WORKDIR/planet.osm.pbf")
             ELAPSED=$(($(date +%s) - START))
             echo "[pbf] Done: $((SIZE/1024/1024)) MiB in ${ELAPSED}s ($((SIZE/1024/1024/(ELAPSED+1))) MB/s)"
@@ -188,7 +188,7 @@ jobs:
 
             echo "[pbf] Downloading yesterday's PBF ($YESTERDAY) from cache..."
             START=$(date +%s)
-            $CACHE cp "s3://$CACHE_BUCKET/geocoder-cache/planet-${YESTERDAY}.osm.pbf" "$WORKDIR/planet.osm.pbf"
+            $CACHE cp --concurrency 16"s3://$CACHE_BUCKET/geocoder-cache/planet-${YESTERDAY}.osm.pbf" "$WORKDIR/planet.osm.pbf"
             SIZE=$(stat -c%s "$WORKDIR/planet.osm.pbf")
             ELAPSED=$(($(date +%s) - START))
             echo "[pbf] Downloaded: $((SIZE/1024/1024)) MiB in ${ELAPSED}s ($((SIZE/1024/1024/(ELAPSED+1))) MB/s)"
@@ -211,15 +211,12 @@ jobs:
             rm -f "$WORKDIR/diff-today.osc.gz"
 
             echo "[pbf] Caching today's PBF in background..."
-            $CACHE cp "$WORKDIR/planet.osm.pbf" "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" &
+            $CACHE cp --concurrency 16"$WORKDIR/planet.osm.pbf" "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" &
           else
             echo "[pbf] No cached PBF — downloading from mirrors + applying diffs"
             aria2c -x 16 -s 16 -j 16 --max-tries=3 \
               -d "$WORKDIR" -o planet.osm.pbf \
               "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
-              "https://ftpmirror.your.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
-              "https://ftp.osuosl.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
-              "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
               || true
 
             SERVER="https://planet.openstreetmap.org/replication/day"
@@ -245,7 +242,7 @@ jobs:
             fi
 
             echo "[pbf] Caching PBF in background..."
-            $CACHE cp "$WORKDIR/planet.osm.pbf" "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" &
+            $CACHE cp --concurrency 16"$WORKDIR/planet.osm.pbf" "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" &
           fi
 
           # Wait for index download
@@ -383,7 +380,7 @@ jobs:
           HAS_PREVIOUS: ${{ steps.setup.outputs.has_previous }}
         run: |
           S5="s5cmd --endpoint-url $S3_ENDPOINT --numworkers 32"
-          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15 --concurrency 16"
+          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
 
           # ── Augment build tool's manifest.json with date/previous info ──
           PREV_VAL="$( [ "$HAS_PREVIOUS" = "true" ] && echo "$OLD_DATE" || echo "null" )"
@@ -409,7 +406,7 @@ jobs:
           TIGRIS_PID=$!
 
           echo "Caching to local S3..."
-          $CACHE cp "$WORKDIR/output/*" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/" &
+          $CACHE cp --concurrency 16"$WORKDIR/output/*" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/" &
           CACHE_PID=$!
 
           # ── Wait for Tigris ──
@@ -436,7 +433,7 @@ jobs:
           echo "Cache: $CACHE_COUNT/$LOCAL_COUNT files"
           if [ "$CACHE_COUNT" -lt "$LOCAL_COUNT" ]; then
             echo "Cache incomplete — retrying..."
-            $CACHE cp "$WORKDIR/output/*" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/" 2>&1 || true
+            $CACHE cp --concurrency 16"$WORKDIR/output/*" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/" 2>&1 || true
             CACHE_COUNT=$($CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/*" 2>/dev/null | wc -l)
           fi
           if [ "$CACHE_COUNT" -ge "$LOCAL_COUNT" ]; then
