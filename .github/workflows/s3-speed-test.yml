@@ -1,6 +1,10 @@
 name: S3 Speed Test
 
 on:
+  push:
+    branches: [feat/geocoder]
+    paths:
+      - '.github/workflows/s3-speed-test.yml'
   workflow_dispatch:
 
 env:
