@@ -1,12 +1,15 @@
 name: Build Geocoder Index
 
 concurrency:
-  group: geocoder-build-${{ github.event_name == 'pull_request' && github.head_ref || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: geocoder-build
+  cancel-in-progress: false
 
 on:
-  pull_request:
-    types: [labeled, synchronize, opened]
+  push:
+    branches: [feat/geocoder]
+    paths:
+      - 'geocoder/**'
+      - '.github/workflows/geocoder-build.yml'
   schedule:
     - cron: '0 2 * * *'
   workflow_dispatch:
@@ -26,83 +29,12 @@ env:
   S3_PREFIX: geocoder
   S3_ENDPOINT: https://t3.storage.dev
   S3_PUBLIC_URL: https://geoshenanigans-reverse-geocoding.t3.tigrisfiles.io
-  REGIONS: "planet africa asia europe north-america south-america oceania central-america antarctica"
 
 permissions:
   contents: read
 
 jobs:
-  # --- PR validation: build tools + small test build ---
-  validate:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        with:
-          persist-credentials: false
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq cmake g++ libz-dev libzstd-dev \
-            libbz2-dev libexpat1-dev libs2-dev libosmium2-dev
-
-      - name: Build tools
-        run: |
-          cd geocoder/builder && mkdir -p build && cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release
-          make -j$(nproc) build-index geocoder-diff geocoder-patch
-
-      - name: Download Monaco PBF
-        run: |
-          curl -sL -o /tmp/monaco.osm.pbf \
-            "https://download.geofabrik.de/europe/monaco-latest.osm.pbf"
-
-      - name: Test determinism + diff + patch
-        run: |
-          cd geocoder/builder/build
-          RUNS=5
-
-          # Build N times from same PBF
-          for i in $(seq 1 $RUNS); do
-            echo "=== Build $i/$RUNS ==="
-            ./build-index "/tmp/build-$i/" /tmp/monaco.osm.pbf --simplify-epsilon --epsilon-scale 1 2>&1 | tail -1
-          done
-
-          # Cross-compare all builds against build 1
-          echo ""
-          echo "=== Determinism check ($RUNS builds) ==="
-          FAIL=0
-          for i in $(seq 2 $RUNS); do
-            for f in /tmp/build-1/*.bin; do
-              b=$(basename "$f")
-              if ! cmp -s "/tmp/build-1/$b" "/tmp/build-$i/$b"; then
-                echo "::error::Build $i differs from build 1: $b"
-                FAIL=1
-              fi
-            done
-          done
-          [ $FAIL -eq 0 ] && echo "Determinism: PASS ($RUNS identical builds)" || exit 1
-
-          # Test diff + patch round-trip (build 1 → build 1, should be identity)
-          echo ""
-          echo "=== Diff + Patch round-trip ==="
-          ./geocoder-diff /tmp/build-1/ /tmp/build-1/ -o /tmp/test.gcpatch 2>&1 | tail -1
-          ./geocoder-patch /tmp/build-1/ /tmp/test.gcpatch -o /tmp/patched/ 2>&1 | tail -1
-
-          for f in /tmp/build-1/*.bin; do
-            b=$(basename "$f")
-            if ! cmp -s "/tmp/patched/$b" "/tmp/build-1/$b"; then
-              echo "::error::Patch round-trip MISMATCH: $b"
-              FAIL=1
-            fi
-          done
-          [ $FAIL -eq 0 ] && echo "Patch round-trip: PASS" || exit 1
-
-  # --- Full planet build + patch verification ---
   build:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'planet-test')
     runs-on: ${{ inputs.runner || 'pokedex-giant' }}
     timeout-minutes: 360
 
@@ -111,6 +43,7 @@ jobs:
         with:
           persist-credentials: false
 
+      # ── Setup ──────────────────────────────────────────────────────
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
@@ -120,14 +53,12 @@ jobs:
             -o /tmp/s5cmd.tar.gz
           sudo tar xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd
 
-      - name: Configure Tigris credentials
+      - name: Configure credentials
         run: |
-          # Mask and save container's cache credentials
           echo "::add-mask::$AWS_ACCESS_KEY_ID"
           echo "::add-mask::$AWS_SECRET_ACCESS_KEY"
           echo "CACHE_AWS_KEY=$AWS_ACCESS_KEY_ID" >> "$GITHUB_ENV"
           echo "CACHE_AWS_SECRET=$AWS_SECRET_ACCESS_KEY" >> "$GITHUB_ENV"
-          # Set Tigris credentials as default for s5cmd
           echo "AWS_ACCESS_KEY_ID=$KEY" >> "$GITHUB_ENV"
           echo "AWS_SECRET_ACCESS_KEY=$SECRET" >> "$GITHUB_ENV"
         env:
@@ -141,123 +72,117 @@ jobs:
           make -j$(nproc) build-index geocoder-diff geocoder-patch
           echo "$PWD" >> "$GITHUB_PATH"
 
-      - name: Setup workdir
+      - name: Setup
         id: setup
         env:
+          BUILD_DATE: ${{ inputs.build_date }}
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
-          WORKDIR="$RUNNER_TEMP/geocoder-test"
+          # Workdir + cache config
+          WORKDIR="$RUNNER_TEMP/geocoder"
           mkdir -p "$WORKDIR"
           echo "workdir=$WORKDIR" >> "$GITHUB_OUTPUT"
           echo "cache_endpoint=http://${BUCKET_HOST}:${BUCKET_PORT}" >> "$GITHUB_OUTPUT"
           echo "cache_bucket=$BUCKET_NAME" >> "$GITHUB_OUTPUT"
 
-      - name: Determine dates and sequences
-        id: dates
-        env:
-          BUILD_DATE: ${{ inputs.build_date }}
-        run: |
+          # Determine target date + sequence
           SERVER="https://planet.openstreetmap.org/replication/day"
           CURRENT_SEQ=$(curl -sL "$SERVER/state.txt" | grep sequenceNumber | cut -d= -f2)
           CURRENT_DATE=$(curl -sL "$SERVER/state.txt" | grep timestamp | cut -d= -f2 | tr '\\' ' ' | cut -dT -f1 | tr -d ' ')
 
-          # Use build_date input if provided, otherwise use replication server date
-          if [ -n "$BUILD_DATE" ]; then
-            TARGET_DATE="$BUILD_DATE"
-          else
-            TARGET_DATE="$CURRENT_DATE"
-          fi
+          TARGET_DATE="${BUILD_DATE:-$CURRENT_DATE}"
           PREV_DATE=$(date -u -d "$TARGET_DATE - 1 day" +%Y-%m-%d)
-
-          # Adjust sequence number if building for a past date
-          # Each day = 1 sequence number
           DAYS_OFFSET=$(( ($(date -u -d "$CURRENT_DATE" +%s) - $(date -u -d "$TARGET_DATE" +%s)) / 86400 ))
           TARGET_SEQ=$((CURRENT_SEQ - DAYS_OFFSET))
 
           echo "today=$TARGET_DATE" >> "$GITHUB_OUTPUT"
           echo "yesterday=$PREV_DATE" >> "$GITHUB_OUTPUT"
           echo "today_seq=$TARGET_SEQ" >> "$GITHUB_OUTPUT"
-          echo "yesterday_seq=$((TARGET_SEQ - 1))" >> "$GITHUB_OUTPUT"
-          echo "Target: $TARGET_DATE (seq $TARGET_SEQ), Previous: $PREV_DATE (server: $CURRENT_DATE seq $CURRENT_SEQ, offset: -${DAYS_OFFSET}d)"
 
-      - name: Check for yesterday's build on Tigris
-        id: prev
-        env:
-          YESTERDAY: ${{ steps.dates.outputs.yesterday }}
-        run: |
-          if s5cmd --endpoint-url $S3_ENDPOINT ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/" 2>/dev/null | head -1 | grep -q .; then
-            echo "found=true" >> "$GITHUB_OUTPUT"
-            echo "Yesterday's build ($YESTERDAY) exists on Tigris"
+          echo "Build date: $TARGET_DATE (seq $TARGET_SEQ)"
+          echo "Previous:   $PREV_DATE"
+          echo "Server:     $CURRENT_DATE (seq $CURRENT_SEQ, offset: -${DAYS_OFFSET}d)"
+
+          # Check if previous build exists on Tigris
+          if s5cmd --endpoint-url $S3_ENDPOINT ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV_DATE/" 2>/dev/null | head -1 | grep -q .; then
+            echo "has_previous=true" >> "$GITHUB_OUTPUT"
+            echo "Previous build ($PREV_DATE) found on Tigris"
           else
-            echo "found=false" >> "$GITHUB_OUTPUT"
-            echo "No build for $YESTERDAY on Tigris — will build from scratch"
+            echo "has_previous=false" >> "$GITHUB_OUTPUT"
+            echo "No previous build — will build from scratch"
           fi
 
-      # --- Fast path: yesterday's build exists on Tigris ---
-      - name: "Fast: download indexes + obtain PBF (parallel)"
-        if: steps.prev.outputs.found == 'true'
+      # ── Obtain PBF + previous indexes (parallel) ──────────────────
+      - name: Download previous indexes + obtain PBF
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
           CACHE_ENDPOINT: ${{ steps.setup.outputs.cache_endpoint }}
           CACHE_BUCKET: ${{ steps.setup.outputs.cache_bucket }}
-          YESTERDAY: ${{ steps.dates.outputs.yesterday }}
-          TODAY: ${{ steps.dates.outputs.today }}
-          TODAY_SEQ: ${{ steps.dates.outputs.today_seq }}
+          YESTERDAY: ${{ steps.setup.outputs.yesterday }}
+          TODAY: ${{ steps.setup.outputs.today }}
+          TODAY_SEQ: ${{ steps.setup.outputs.today_seq }}
+          HAS_PREVIOUS: ${{ steps.setup.outputs.has_previous }}
         run: |
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5"
+          S5="s5cmd --endpoint-url $S3_ENDPOINT"
           STEP_START=$(date +%s)
 
-          # --- Background task: download yesterday's indexes ---
-          (
-            START=$(date +%s)
-            CACHE_BUILD="s3://$CACHE_BUCKET/geocoder-cache/builds/$YESTERDAY"
+          # ── Background: download previous indexes ──
+          if [ "$HAS_PREVIOUS" = "true" ]; then
+            (
+              START=$(date +%s)
+              CACHE_BUILD="s3://$CACHE_BUCKET/geocoder-cache/builds/$YESTERDAY"
 
-            if $CACHE ls "$CACHE_BUILD/.cache-complete" 2>/dev/null | grep -q ".cache-complete"; then
-              echo "[indexes] Downloading $YESTERDAY from local cache..."
-              $CACHE cp "$CACHE_BUILD/*" "$WORKDIR/old-output/"
-            else
-              echo "[indexes] Cache miss — downloading via Tigris HTTP..."
-              BASE_URL="$S3_PUBLIC_URL/$S3_PREFIX/builds/$YESTERDAY"
-              s5cmd --endpoint-url "$S3_ENDPOINT" ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/*" \
-                | awk '{print $NF}' | grep '\.bin$\|\.json$' \
-                | while IFS= read -r REL; do
-                    DIR="$WORKDIR/old-output/$(dirname "$REL")"
-                    mkdir -p "$DIR"
-                    echo "$BASE_URL/$REL"
-                    echo "  dir=$DIR"
-                  done > /tmp/aria2-indexes.txt
-              URLS=$(grep -c '^http' /tmp/aria2-indexes.txt || echo 0)
-              echo "[indexes] Found $URLS files"
-              [ "$URLS" -eq 0 ] && { echo "::error::No index files found for $YESTERDAY"; exit 1; }
-              aria2c -x 16 -j 30 --max-tries=3 --auto-file-renaming=false \
-                -i /tmp/aria2-indexes.txt 2>/dev/null
+              if $CACHE ls "$CACHE_BUILD/.cache-complete" 2>/dev/null | grep -q ".cache-complete"; then
+                echo "[indexes] Downloading $YESTERDAY from local cache..."
+                $CACHE cp "$CACHE_BUILD/*" "$WORKDIR/old-output/"
+              else
+                echo "[indexes] Cache miss — downloading $YESTERDAY via Tigris HTTP..."
+                BASE_URL="$S3_PUBLIC_URL/$S3_PREFIX/builds/$YESTERDAY"
+                $S5 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/*" \
+                  | awk '{print $NF}' | grep '\.bin$\|\.json$' \
+                  | while IFS= read -r REL; do
+                      DIR="$WORKDIR/old-output/$(dirname "$REL")"
+                      mkdir -p "$DIR"
+                      echo "$BASE_URL/$REL"
+                      echo "  dir=$DIR"
+                    done > /tmp/aria2-indexes.txt
+                URLS=$(grep -c '^http' /tmp/aria2-indexes.txt || echo 0)
+                echo "[indexes] Downloading $URLS files..."
+                [ "$URLS" -eq 0 ] && { echo "::error::No index files found for $YESTERDAY"; exit 1; }
+                aria2c -x 16 -j 30 --max-tries=3 --auto-file-renaming=false \
+                  -i /tmp/aria2-indexes.txt 2>/dev/null
 
-              echo "[indexes] Backfilling local cache..."
-              $CACHE cp "$WORKDIR/old-output/*" "$CACHE_BUILD/" 2>/dev/null || true
-            fi
+                echo "[indexes] Backfilling local cache..."
+                $CACHE cp "$WORKDIR/old-output/*" "$CACHE_BUILD/" 2>/dev/null || true
+              fi
 
-            COUNT=$(find "$WORKDIR/old-output" -type f | wc -l)
-            SIZE=$(du -sb "$WORKDIR/old-output" | cut -f1)
-            echo "[indexes] Done: $COUNT files ($((SIZE/1024/1024)) MiB) in $(($(date +%s)-START))s ($((SIZE/1024/1024/($(date +%s)-START+1))) MB/s)"
-            [ "$COUNT" -eq 0 ] && { echo "::error::Download produced 0 files"; exit 1; }
-          ) &
-          IDX_PID=$!
+              COUNT=$(find "$WORKDIR/old-output" -type f | wc -l)
+              SIZE=$(du -sb "$WORKDIR/old-output" | cut -f1)
+              ELAPSED=$(($(date +%s) - START))
+              echo "[indexes] Done: $COUNT files ($((SIZE/1024/1024)) MiB) in ${ELAPSED}s ($((SIZE/1024/1024/(ELAPSED+1))) MB/s)"
+              [ "$COUNT" -eq 0 ] && { echo "::error::Download produced 0 files"; exit 1; }
+            ) &
+            IDX_PID=$!
+          fi
 
-          # --- Foreground task: obtain today's PBF ---
+          # ── Foreground: obtain today's PBF ──
           if $CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" 2>/dev/null | grep -q "planet-"; then
-            echo "[pbf] Cache HIT: downloading today's PBF ($TODAY)..."
+            echo "[pbf] Cache HIT — downloading today's PBF ($TODAY)..."
             START=$(date +%s)
             $CACHE cp "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" "$WORKDIR/planet.osm.pbf"
             SIZE=$(stat -c%s "$WORKDIR/planet.osm.pbf")
-            echo "[pbf] Done: $((SIZE/1024/1024)) MiB in $(($(date +%s)-START))s ($((SIZE/1024/1024/($(date +%s)-START+1))) MB/s)"
+            ELAPSED=$(($(date +%s) - START))
+            echo "[pbf] Done: $((SIZE/1024/1024)) MiB in ${ELAPSED}s ($((SIZE/1024/1024/(ELAPSED+1))) MB/s)"
           else
-            echo "[pbf] Cache MISS — downloading yesterday's PBF + applying 1 diff"
+            echo "[pbf] Cache MISS — building today's PBF from yesterday's + 1 diff"
 
             echo "[pbf] Downloading yesterday's PBF ($YESTERDAY) from cache..."
             START=$(date +%s)
             $CACHE cp "s3://$CACHE_BUCKET/geocoder-cache/planet-${YESTERDAY}.osm.pbf" "$WORKDIR/planet.osm.pbf"
             SIZE=$(stat -c%s "$WORKDIR/planet.osm.pbf")
-            echo "[pbf] Downloaded: $((SIZE/1024/1024)) MiB in $(($(date +%s)-START))s ($((SIZE/1024/1024/($(date +%s)-START+1))) MB/s)"
+            ELAPSED=$(($(date +%s) - START))
+            echo "[pbf] Downloaded: $((SIZE/1024/1024)) MiB in ${ELAPSED}s ($((SIZE/1024/1024/(ELAPSED+1))) MB/s)"
 
             DIR1=$(printf "%03d" $((TODAY_SEQ / 1000000)))
             DIR2=$(printf "%03d" $(((TODAY_SEQ / 1000) % 1000)))
@@ -266,13 +191,13 @@ jobs:
             curl -sL -o "$WORKDIR/diff-today.osc.gz" \
               "https://planet.openstreetmap.org/replication/day/$DIR1/$DIR2/${FILE}.osc.gz"
             DIFF_SIZE=$(stat -c%s "$WORKDIR/diff-today.osc.gz")
-            echo "[pbf] Diff downloaded: $((DIFF_SIZE/1024/1024)) MiB"
+            echo "[pbf] Diff: $((DIFF_SIZE/1024/1024)) MiB"
 
             echo "[pbf] Applying diff with osmium apply-changes..."
             START=$(date +%s)
             osmium apply-changes "$WORKDIR/planet.osm.pbf" "$WORKDIR/diff-today.osc.gz" \
               -o "$WORKDIR/planet-tmp.osm.pbf" --overwrite
-            echo "[pbf] Diff applied in $(($(date +%s)-START))s"
+            echo "[pbf] Applied in $(($(date +%s) - START))s"
             mv "$WORKDIR/planet-tmp.osm.pbf" "$WORKDIR/planet.osm.pbf"
             rm -f "$WORKDIR/diff-today.osc.gz"
 
@@ -281,131 +206,50 @@ jobs:
           fi
 
           # Wait for index download
-          echo "Waiting for index download to complete..."
-          wait $IDX_PID
-          echo "All downloads complete in $(($(date +%s)-STEP_START))s"
+          if [ "$HAS_PREVIOUS" = "true" ]; then
+            echo "Waiting for index download..."
+            wait $IDX_PID
+          fi
+          echo "All downloads complete in $(($(date +%s) - STEP_START))s"
 
-      - name: "Fast: build today's index"
-        if: steps.prev.outputs.found == 'true'
+      # ── Build index ────────────────────────────────────────────────
+      - name: Build geocoder index
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
-          TODAY: ${{ steps.dates.outputs.today }}
+          TODAY: ${{ steps.setup.outputs.today }}
         run: |
-          echo "Building today's index ($TODAY)..."
-          time build-index "$WORKDIR/output/" "$WORKDIR/planet.osm.pbf" \
+          echo "Building geocoder index for $TODAY..."
+          START=$(date +%s)
+          build-index "$WORKDIR/output/" "$WORKDIR/planet.osm.pbf" \
             --continents --multi-output --multi-quality 2>&1 | tail -10
-          # Wait for background PBF cache upload before deleting
-          echo "Waiting for background jobs (PBF cache upload)..."
+          echo "Build completed in $(($(date +%s) - START))s"
+          echo "$(find "$WORKDIR/output" -name "*.bin" | wc -l) bin files produced"
+
+          # Wait for background PBF cache upload, then free disk
           wait
           rm -f "$WORKDIR/planet.osm.pbf"
-          echo "$(find "$WORKDIR/output" -name "*.bin" | wc -l) bin files produced"
 
-      # --- No previous build: just build today, no patching ---
-      - name: "No previous: obtain today's PBF and build"
-        if: steps.prev.outputs.found != 'true'
+      # ── Generate patches + verify ─────────────────────────────────
+      - name: Generate patches and verify
+        if: steps.setup.outputs.has_previous == 'true'
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
-          CACHE_ENDPOINT: ${{ steps.setup.outputs.cache_endpoint }}
-          CACHE_BUCKET: ${{ steps.setup.outputs.cache_bucket }}
-          TODAY: ${{ steps.dates.outputs.today }}
-          TODAY_SEQ: ${{ steps.dates.outputs.today_seq }}
+          OLD_DATE: ${{ steps.setup.outputs.yesterday }}
+          NEW_DATE: ${{ steps.setup.outputs.today }}
         run: |
-          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5"
+          echo "Generating patches ($OLD_DATE → $NEW_DATE)..."
+          START=$(date +%s)
 
-          # Check cache for today's PBF
-          if $CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" 2>/dev/null | grep -q "planet-"; then
-            echo "Cache HIT: today's PBF ($TODAY)"
-            START=$(date +%s)
-            $CACHE cp "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" "$WORKDIR/planet.osm.pbf"
-            END=$(date +%s)
-            SIZE=$(stat -c%s "$WORKDIR/planet.osm.pbf")
-            echo "Downloaded from cache: $((SIZE/1024/1024)) MiB in $((END-START))s ($((SIZE/1024/1024/(END-START+1))) MB/s)"
-          else
-            echo "Cache MISS — downloading from mirrors + applying diffs"
-            aria2c -x 16 -s 16 -j 16 --max-tries=3 \
-              -d "$WORKDIR" -o planet.osm.pbf \
-              "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
-              "https://ftpmirror.your.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
-              "https://ftp.osuosl.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
-              "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/planet-latest.osm.pbf"
-
-            SERVER="https://planet.openstreetmap.org/replication/day"
-            PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" 2>/dev/null | cut -dT -f1)
-            DAYS_NEEDED=$(( ($(date -u -d "$TODAY" +%s) - $(date -u -d "$PBF_DATE" +%s)) / 86400 ))
-            PBF_SEQ=$((TODAY_SEQ - DAYS_NEEDED))
-            echo "PBF: date=$PBF_DATE seq=$PBF_SEQ, need $DAYS_NEEDED diffs"
-
-            if [ $DAYS_NEEDED -gt 0 ]; then
-              DIFFS=""
-              for S in $(seq $((PBF_SEQ + 1)) $TODAY_SEQ); do
-                DIR1=$(printf "%03d" $((S / 1000000)))
-                DIR2=$(printf "%03d" $(((S / 1000) % 1000)))
-                FILE=$(printf "%03d" $((S % 1000)))
-                curl -sL -o "$WORKDIR/diff-${S}.osc.gz" "$SERVER/$DIR1/$DIR2/${FILE}.osc.gz"
-                echo "  Downloaded seq $S"
-                DIFFS="$DIFFS $WORKDIR/diff-${S}.osc.gz"
-              done
-              echo "Applying $DAYS_NEEDED diffs in one pass..."
-              time osmium apply-changes "$WORKDIR/planet.osm.pbf" $DIFFS \
-                -o "$WORKDIR/planet-tmp.osm.pbf" --overwrite
-              mv "$WORKDIR/planet-tmp.osm.pbf" "$WORKDIR/planet.osm.pbf"
-              rm -f $DIFFS
-            fi
-
-            echo "Caching PBF as planet-${TODAY}.osm.pbf..."
-            START=$(date +%s)
-            $CACHE cp "$WORKDIR/planet.osm.pbf" "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf"
-            END=$(date +%s)
-            SIZE=$(stat -c%s "$WORKDIR/planet.osm.pbf")
-            echo "Cached: $((SIZE/1024/1024)) MiB in $((END-START))s ($((SIZE/1024/1024/(END-START+1))) MB/s)"
-          fi
-
-          echo "Building today's index ($TODAY)..."
-          time build-index "$WORKDIR/output/" "$WORKDIR/planet.osm.pbf" \
-            --continents --multi-output --multi-quality 2>&1 | tail -10
-          rm -f "$WORKDIR/planet.osm.pbf"
-          echo "$(find "$WORKDIR/output" -name "*.bin" | wc -l) bin files produced"
-
-      - name: Generate patches, verify, and upload
-        env:
-          WORKDIR: ${{ steps.setup.outputs.workdir }}
-          CACHE_ENDPOINT: ${{ steps.setup.outputs.cache_endpoint }}
-          CACHE_BUCKET: ${{ steps.setup.outputs.cache_bucket }}
-          OLD_DATE: ${{ steps.dates.outputs.yesterday }}
-          NEW_DATE: ${{ steps.dates.outputs.today }}
-          IS_PRODUCTION: ${{ github.event_name != 'pull_request' }}
-        run: |
-          S5="s5cmd --endpoint-url $S3_ENDPOINT"
-          UPLOAD_LOG="$WORKDIR/upload.log"
-          touch "$UPLOAD_LOG"
-
-          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5"
-
-          # Upload today's indexes to local cache (always, for next run)
-          echo "Caching today's indexes ($NEW_DATE) to local S3..."
-          $CACHE cp "$WORKDIR/output/*" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/" &
-          CACHE_IDX_PID=$!
-
-          if [ "$IS_PRODUCTION" = "true" ]; then
-            # Start uploading today's indexes to Tigris in background
-            echo "Uploading today's indexes ($NEW_DATE) to Tigris..."
-            $S5 --numworkers 30 cp --concurrency 4 \
-              "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/" \
-              > "$UPLOAD_LOG" 2>&1 &
-            UPLOAD_IDX_PID=$!
-          fi
-
-          echo "## Planet Test Results ($OLD_DATE → $NEW_DATE)" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Patch Results ($OLD_DATE → $NEW_DATE)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Variant | Files | Patch Size | Verified |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---------|-------|-----------|----------|" >> "$GITHUB_STEP_SUMMARY"
 
           RESULTS_DIR="$WORKDIR/results"
-          PATCHES_DIR="$WORKDIR/patches-out"
+          PATCHES_DIR="$WORKDIR/patches"
           mkdir -p "$RESULTS_DIR" "$PATCHES_DIR"
           VARIANTS=$(cd "$WORKDIR/output" && find . -name "*.bin" -exec dirname {} \; | sort -u | sed 's|^\./||')
 
-          # Generate patches, start uploading each, then verify — all in parallel
           JOBS=0
           MAX_JOBS=$(nproc)
           for variant in $VARIANTS; do
@@ -414,51 +258,34 @@ jobs:
               OLD_DIR="$WORKDIR/old-output/$variant"
               N_NEW=$(ls "$NEW_DIR"/*.bin 2>/dev/null | wc -l)
               N_OLD=$(ls "$OLD_DIR"/*.bin 2>/dev/null | wc -l)
-              SAFE_NAME=$(echo "$variant" | tr '/' '_')
+              SAFE=$(echo "$variant" | tr '/' '_')
 
-              if [ "$N_NEW" -lt 2 ]; then exit 0; fi
+              [ "$N_NEW" -lt 2 ] && exit 0
               if [ "$N_OLD" -ne "$N_NEW" ]; then
-                echo "SKIP" > "$RESULTS_DIR/$SAFE_NAME"
+                echo "SKIP" > "$RESULTS_DIR/$SAFE"
                 exit 0
               fi
 
-              # Generate patch
-              PATCH_FILE="$PATCHES_DIR/$SAFE_NAME.gcpatch"
+              PATCH_FILE="$PATCHES_DIR/$SAFE.gcpatch"
               geocoder-diff "$OLD_DIR" "$NEW_DIR" -o "$PATCH_FILE" 2>/dev/null
-              PATCH_SIZE=$(stat -c%s "$PATCH_FILE" 2>/dev/null || echo 0)
-              PATCH_KB=$((PATCH_SIZE / 1024))
+              PATCH_KB=$(( $(stat -c%s "$PATCH_FILE" 2>/dev/null || echo 0) / 1024 ))
 
-              # Upload patch in background while we verify (production only)
-              PATCH_UPLOAD_PID=""
-              if [ "$IS_PRODUCTION" = "true" ]; then
-                $S5 cp "$PATCH_FILE" \
-                  "s3://$S3_BUCKET/$S3_PREFIX/patches/$variant/${OLD_DATE}-to-${NEW_DATE}.gcpatch" \
-                  >> "$UPLOAD_LOG" 2>&1 &
-                PATCH_UPLOAD_PID=$!
-              fi
-
-              # Verify patch
-              VERIFY_DIR="$WORKDIR/verify-$SAFE_NAME"
+              VERIFY_DIR="$WORKDIR/verify-$SAFE"
               mkdir -p "$VERIFY_DIR"
               geocoder-patch "$OLD_DIR" "$PATCH_FILE" -o "$VERIFY_DIR/" 2>/dev/null
 
               MATCH=0
               for f in "$NEW_DIR"/*.bin; do
                 b=$(basename "$f")
-                h1=$(md5sum "$VERIFY_DIR/$b" 2>/dev/null | awk '{print $1}')
-                h2=$(md5sum "$NEW_DIR/$b" | awk '{print $1}')
-                [ "$h1" = "$h2" ] && MATCH=$((MATCH + 1))
+                cmp -s "$VERIFY_DIR/$b" "$NEW_DIR/$b" && MATCH=$((MATCH + 1))
               done
-
-              # Wait for this patch's upload before reporting
-              [ -n "$PATCH_UPLOAD_PID" ] && wait $PATCH_UPLOAD_PID
+              rm -rf "$VERIFY_DIR"
 
               if [ $MATCH -eq $N_NEW ]; then
-                echo "PASS $N_NEW $PATCH_KB" > "$RESULTS_DIR/$SAFE_NAME"
+                echo "PASS $N_NEW $PATCH_KB" > "$RESULTS_DIR/$SAFE"
               else
-                echo "FAIL $MATCH $N_NEW $PATCH_KB" > "$RESULTS_DIR/$SAFE_NAME"
+                echo "FAIL $MATCH $N_NEW $PATCH_KB" > "$RESULTS_DIR/$SAFE"
               fi
-              rm -rf "$VERIFY_DIR"
             ) &
 
             JOBS=$((JOBS + 1))
@@ -468,133 +295,126 @@ jobs:
             fi
           done
           wait
-
-          rm -rf "$WORKDIR/old-output"
+          echo "Patch generation + verification completed in $(($(date +%s) - START))s"
 
           # Collect results
           PASS=0; FAIL=0; SKIP=0
           for variant in $VARIANTS; do
-            SAFE_NAME=$(echo "$variant" | tr '/' '_')
-            RESULT_FILE="$RESULTS_DIR/$SAFE_NAME"
-            [ ! -f "$RESULT_FILE" ] && continue
-            RESULT=$(cat "$RESULT_FILE")
+            SAFE=$(echo "$variant" | tr '/' '_')
+            [ ! -f "$RESULTS_DIR/$SAFE" ] && continue
+            RESULT=$(cat "$RESULTS_DIR/$SAFE")
 
             if [ "$RESULT" = "SKIP" ]; then
               SKIP=$((SKIP + 1))
             elif echo "$RESULT" | grep -q "^PASS"; then
-              N_NEW=$(echo "$RESULT" | awk '{print $2}')
-              PATCH_KB=$(echo "$RESULT" | awk '{print $3}')
-              echo "  $variant: PASS ($N_NEW/$N_NEW, ${PATCH_KB} KiB)"
-              echo "| $variant | $N_NEW | ${PATCH_KB} KiB | PASS |" >> "$GITHUB_STEP_SUMMARY"
+              N=$(echo "$RESULT" | awk '{print $2}')
+              KB=$(echo "$RESULT" | awk '{print $3}')
+              echo "  $variant: PASS ($N/$N, ${KB} KiB)"
+              echo "| $variant | $N | ${KB} KiB | PASS |" >> "$GITHUB_STEP_SUMMARY"
               PASS=$((PASS + 1))
             else
-              MATCH=$(echo "$RESULT" | awk '{print $2}')
-              N_NEW=$(echo "$RESULT" | awk '{print $3}')
-              PATCH_KB=$(echo "$RESULT" | awk '{print $4}')
-              echo "::error::$variant: FAIL ($MATCH/$N_NEW match)"
-              echo "| $variant | $N_NEW | ${PATCH_KB} KiB | **FAIL** |" >> "$GITHUB_STEP_SUMMARY"
+              M=$(echo "$RESULT" | awk '{print $2}')
+              N=$(echo "$RESULT" | awk '{print $3}')
+              KB=$(echo "$RESULT" | awk '{print $4}')
+              echo "::error::$variant: FAIL ($M/$N)"
+              echo "| $variant | $N | ${KB} KiB | **FAIL** |" >> "$GITHUB_STEP_SUMMARY"
               FAIL=$((FAIL + 1))
             fi
           done
-          rm -rf "$RESULTS_DIR" "$PATCHES_DIR"
 
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "**Total: $PASS pass, $FAIL fail, $SKIP skip**" >> "$GITHUB_STEP_SUMMARY"
           echo "Results: $PASS pass, $FAIL fail, $SKIP skip"
-
           [ $FAIL -gt 0 ] && exit 1 || true
 
-          rm -rf "$PATCHES_DIR" "$WORKDIR/old-output"
+      # ── Upload to Tigris + cache ───────────────────────────────────
+      - name: Upload to Tigris and cache
+        env:
+          WORKDIR: ${{ steps.setup.outputs.workdir }}
+          CACHE_ENDPOINT: ${{ steps.setup.outputs.cache_endpoint }}
+          CACHE_BUCKET: ${{ steps.setup.outputs.cache_bucket }}
+          NEW_DATE: ${{ steps.setup.outputs.today }}
+          OLD_DATE: ${{ steps.setup.outputs.yesterday }}
+          HAS_PREVIOUS: ${{ steps.setup.outputs.has_previous }}
+        run: |
+          S5="s5cmd --endpoint-url $S3_ENDPOINT"
+          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5"
 
-          # Wait for cache upload and verify completeness
-          echo "Waiting for cache upload..."
-          wait $CACHE_IDX_PID 2>/dev/null || true
+          # ── Upload indexes to Tigris ──
+          echo "Uploading indexes ($NEW_DATE) to Tigris..."
+          START=$(date +%s)
+          UPLOAD_LOG="$WORKDIR/upload.log"
+          $S5 --numworkers 30 cp --concurrency 4 \
+            "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/" \
+            > "$UPLOAD_LOG" 2>&1 &
+          TIGRIS_PID=$!
+
+          # ── Upload patches to Tigris (if generated) ──
+          if [ "$HAS_PREVIOUS" = "true" ] && [ -d "$WORKDIR/patches" ]; then
+            echo "Uploading patches to Tigris..."
+            for f in "$WORKDIR/patches"/*.gcpatch; do
+              [ ! -f "$f" ] && continue
+              SAFE=$(basename "$f" .gcpatch)
+              VARIANT=$(echo "$SAFE" | tr '_' '/')
+              $S5 cp "$f" "s3://$S3_BUCKET/$S3_PREFIX/patches/$VARIANT/${OLD_DATE}-to-${NEW_DATE}.gcpatch" \
+                >> "$UPLOAD_LOG" 2>&1 &
+            done
+          fi
+
+          # ── Upload indexes to cache ──
+          echo "Caching indexes to local S3..."
+          $CACHE cp "$WORKDIR/output/*" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/" &
+          CACHE_PID=$!
+
+          # ── Wait for Tigris ──
+          echo "Waiting for Tigris upload..."
+          wait $TIGRIS_PID
+          if grep -qi "error" "$UPLOAD_LOG" 2>/dev/null; then
+            echo "::warning::Tigris upload had errors:"
+            grep -i "error" "$UPLOAD_LOG"
+          fi
 
           LOCAL_COUNT=$(find "$WORKDIR/output" -type f | wc -l)
+          REMOTE_COUNT=$($S5 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null | wc -l)
+          echo "Tigris: $REMOTE_COUNT/$LOCAL_COUNT files in $(($(date +%s) - START))s"
+          if [ "$REMOTE_COUNT" -lt "$LOCAL_COUNT" ]; then
+            echo "::error::Tigris upload incomplete: $REMOTE_COUNT/$LOCAL_COUNT"
+            exit 1
+          fi
+
+          # ── Wait for cache + verify ──
+          echo "Waiting for cache upload..."
+          wait $CACHE_PID 2>/dev/null || true
+          wait 2>/dev/null || true  # wait for any remaining patch uploads
+
           CACHE_COUNT=$($CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/*" 2>/dev/null | wc -l)
-          echo "Cache verification: local=$LOCAL_COUNT cache=$CACHE_COUNT"
+          echo "Cache: $CACHE_COUNT/$LOCAL_COUNT files"
           if [ "$CACHE_COUNT" -lt "$LOCAL_COUNT" ]; then
-            echo "Cache incomplete ($CACHE_COUNT/$LOCAL_COUNT) — retrying..."
+            echo "Cache incomplete — retrying..."
             $CACHE cp "$WORKDIR/output/*" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/" 2>&1 || true
             CACHE_COUNT=$($CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/*" 2>/dev/null | wc -l)
           fi
           if [ "$CACHE_COUNT" -ge "$LOCAL_COUNT" ]; then
-            # Write sentinel — next run checks for this before trusting the cache
             echo "{\"date\":\"$NEW_DATE\",\"files\":$LOCAL_COUNT,\"cached_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" \
               | $CACHE pipe "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/.cache-complete"
-            echo "Cache complete: $CACHE_COUNT files, sentinel written"
+            echo "Cache sentinel written"
           else
-            echo "::warning::Cache incomplete after retry ($CACHE_COUNT/$LOCAL_COUNT) — no sentinel written"
+            echo "::warning::Cache incomplete ($CACHE_COUNT/$LOCAL_COUNT) — no sentinel"
           fi
 
-          if [ "$IS_PRODUCTION" = "true" ]; then
-            # Wait for Tigris upload
-            echo "Waiting for Tigris upload..."
-            wait $UPLOAD_IDX_PID || true
-
-            # Check upload log for errors
-            if grep -qi "error" "$UPLOAD_LOG" 2>/dev/null; then
-              echo "::warning::Upload log contains errors:"
-              grep -i "error" "$UPLOAD_LOG"
-            fi
-
-            # Verify file counts on Tigris
-            LOCAL_NEW=$(find "$WORKDIR/output" -type f | wc -l)
-            REMOTE_NEW=$($S5 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null | wc -l)
-            echo "Today: local=$LOCAL_NEW remote=$REMOTE_NEW"
-            if [ "$REMOTE_NEW" -lt "$LOCAL_NEW" ]; then
-              echo "::error::Upload incomplete: $REMOTE_NEW/$LOCAL_NEW files on Tigris"
-              cat "$UPLOAD_LOG"
-              exit 1
-            fi
-            echo "Upload verification: PASS"
-
-            # Write manifests
-            jq -n \
-              --arg date "$NEW_DATE" \
-              --arg prev "$OLD_DATE" \
-              --argjson pass "$PASS" \
-              --argjson fail "$FAIL" \
-              --argjson skip "$SKIP" \
-              --arg validated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-              '{date: $date, previous: $prev, patches: {pass: $pass, fail: $fail, skip: $skip}, validated_at: $validated_at}' \
-              | $S5 pipe "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/validated.json"
-            echo "Validation file uploaded for $NEW_DATE"
-
-            jq -n \
-              --arg latest "$NEW_DATE" \
-              --arg previous "$OLD_DATE" \
-              --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-              '{latest_build: $latest, previous_build: $previous, updated_at: $updated_at}' \
-              | $S5 pipe "s3://$S3_BUCKET/$S3_PREFIX/latest.json"
-            echo "Manifest updated"
-          else
-            echo "PR run — skipping S3 uploads"
-          fi
-
-      - name: Upload indexes (no previous build, production only)
-        if: steps.prev.outputs.found != 'true' && github.event_name != 'pull_request'
-        env:
-          WORKDIR: ${{ steps.setup.outputs.workdir }}
-          BUILD_DATE: ${{ steps.dates.outputs.today }}
-        run: |
-          S5="s5cmd --endpoint-url $S3_ENDPOINT"
-          echo "No previous build — uploading indexes only..."
-          $S5 --numworkers 30 cp --concurrency 4 \
-            "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$BUILD_DATE/"
-
-          LOCAL=$(find "$WORKDIR/output" -type f | wc -l)
-          REMOTE=$($S5 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$BUILD_DATE/*" 2>/dev/null | wc -l)
-          echo "Upload: local=$LOCAL remote=$REMOTE"
-          if [ "$REMOTE" -lt "$LOCAL" ]; then
-            echo "::error::Upload incomplete: $REMOTE/$LOCAL"
-            exit 1
-          fi
+          # ── Write manifests ──
+          jq -n \
+            --arg date "$NEW_DATE" \
+            --arg prev "$OLD_DATE" \
+            --arg validated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{date: $date, previous: $prev, validated_at: $validated_at}' \
+            | $S5 pipe "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/validated.json"
 
           jq -n \
-            --arg latest "$BUILD_DATE" \
+            --arg latest "$NEW_DATE" \
+            --arg previous "$OLD_DATE" \
             --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '{latest_build: $latest, updated_at: $updated_at}' \
+            '{latest_build: $latest, previous_build: $previous, updated_at: $updated_at}' \
             | $S5 pipe "s3://$S3_BUCKET/$S3_PREFIX/latest.json"
-          echo "Manifest updated"
 
+          echo "Manifests updated. Upload complete."
