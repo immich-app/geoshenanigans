@@ -129,7 +129,7 @@ jobs:
           HAS_PREVIOUS: ${{ steps.setup.outputs.has_previous }}
         run: |
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15 --concurrency 16"
-          S5="s5cmd --endpoint-url $S3_ENDPOINT"
+          S5="s5cmd --endpoint-url $S3_ENDPOINT --numworkers 32 --concurrency 8"
           STEP_START=$(date +%s)
 
           # ── Background: download previous indexes ──
@@ -344,7 +344,7 @@ jobs:
           OLD_DATE: ${{ steps.setup.outputs.yesterday }}
           HAS_PREVIOUS: ${{ steps.setup.outputs.has_previous }}
         run: |
-          S5="s5cmd --endpoint-url $S3_ENDPOINT"
+          S5="s5cmd --endpoint-url $S3_ENDPOINT --numworkers 32 --concurrency 8"
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15 --concurrency 16"
 
           # ── Augment build tool's manifest.json with date/previous info ──
@@ -362,7 +362,8 @@ jobs:
           echo "Uploading to Tigris..."
           START=$(date +%s)
           UPLOAD_LOG="$WORKDIR/upload.log"
-          $S5 --numworkers 30 cp --concurrency 4 \
+          S5_UPLOAD="s5cmd --endpoint-url $S3_ENDPOINT --numworkers 8 --concurrency 16"
+          $S5_UPLOAD cp \
             "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/" \
             > "$UPLOAD_LOG" 2>&1 &
           TIGRIS_PID=$!
