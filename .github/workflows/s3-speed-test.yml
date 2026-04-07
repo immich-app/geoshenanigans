@@ -26,6 +26,14 @@ jobs:
             -o /tmp/s5cmd.tar.gz
           sudo tar xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd
 
+      - name: Network speed test
+        run: |
+          curl -sL https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz \
+            -o /tmp/speedtest.tgz
+          tar xzf /tmp/speedtest.tgz -C /usr/local/bin speedtest
+          echo "=== Speedtest CLI ==="
+          speedtest --accept-license --accept-gdpr 2>&1 || echo "(speedtest failed)"
+
       - name: Configure credentials
         run: |
           echo "::add-mask::$AWS_ACCESS_KEY_ID"
