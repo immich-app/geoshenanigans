@@ -14,124 +14,156 @@ on:
         required: false
         type: number
         default: 3
+      attempt_number:
+        description: 'Current attempt (set by self-retry, do not modify)'
+        required: false
+        type: number
+        default: 1
 
 permissions:
   contents: read
-  actions: write    # needed to trigger workflows + read run status
+  actions: write
 
 jobs:
   orchestrate:
     runs-on: ubuntu-latest
-    timeout-minutes: 350   # just under 6h GitHub-hosted limit
+    timeout-minutes: 350
     steps:
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3
+        with:
+          app-id: ${{ secrets.PUSH_O_MATIC_APP_ID }}
+          private-key: ${{ secrets.PUSH_O_MATIC_APP_KEY }}
+
       - name: Trigger and monitor build
         env:
           GH_TOKEN: ${{ github.token }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
           BUILD_DATE: ${{ inputs.build_date || '' }}
           MAX_ATTEMPTS: ${{ inputs.max_attempts || 3 }}
+          ATTEMPT_NUMBER: ${{ inputs.attempt_number || 1 }}
         run: |
           REPO="${GITHUB_REPOSITORY}"
           WORKFLOW="geocoder-build.yml"
+          NIGHTLY_WORKFLOW="geocoder-nightly.yml"
           REF="${GITHUB_REF_NAME}"
-          ATTEMPT=0
-          SUCCESS=false
+          ATTEMPT=${ATTEMPT_NUMBER}
           JOB_START=$(date +%s)
-          TIMEOUT_SECONDS=$((340 * 60))  # 340 min — leave 10 min buffer before 350 min job timeout
-          RUN_ID=""
+          TIMEOUT_SECONDS=$((340 * 60))
 
           # Build the dispatch args
-          ARGS=""
-          [ -n "$BUILD_DATE" ] && ARGS="-f build_date=$BUILD_DATE"
+          BUILD_ARGS=""
+          [ -n "$BUILD_DATE" ] && BUILD_ARGS="-f build_date=$BUILD_DATE"
 
-          check_timeout() {
-            ELAPSED=$(( $(date +%s) - JOB_START ))
-            REMAINING=$(( TIMEOUT_SECONDS - ELAPSED ))
-            if [ $REMAINING -lt 300 ]; then  # less than 5 min remaining
-              echo ""
-              echo "::error::Orchestrator timeout imminent (${ELAPSED}s elapsed, ${REMAINING}s remaining)"
-              echo "::error::Nightly build did not complete after $ATTEMPT attempts"
-              [ -n "$RUN_ID" ] && echo "::error::Last run: https://github.com/$REPO/actions/runs/$RUN_ID"
-              echo ""
-              echo "## Nightly Build Timeout" >> "$GITHUB_STEP_SUMMARY"
-              echo "Build did not complete after $ATTEMPT attempt(s)." >> "$GITHUB_STEP_SUMMARY"
-              echo "Orchestrator ran for $((ELAPSED / 60)) minutes before timing out." >> "$GITHUB_STEP_SUMMARY"
-              [ -n "$RUN_ID" ] && echo "Last run: https://github.com/$REPO/actions/runs/$RUN_ID" >> "$GITHUB_STEP_SUMMARY"
-              exit 1
-            fi
-          }
+          echo "Attempt $ATTEMPT/$MAX_ATTEMPTS"
+          echo "Build date: ${BUILD_DATE:-today}"
+          echo ""
 
-          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-            check_timeout
-            ATTEMPT=$((ATTEMPT + 1))
-            echo ""
-            echo "════════════════════════════════════════════════"
-            echo "  Attempt $ATTEMPT/$MAX_ATTEMPTS ($(( ($(date +%s) - JOB_START) / 60 ))min elapsed)"
-            echo "════════════════════════════════════════════════"
+          # ── Trigger the build ──
+          echo "Triggering build workflow..."
+          BEFORE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          gh workflow run "$WORKFLOW" --repo "$REPO" --ref "$REF" $BUILD_ARGS
+          sleep 10
 
-            # Trigger the build workflow
-            echo "Triggering build workflow..."
-            BEFORE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-            gh workflow run "$WORKFLOW" --repo "$REPO" --ref "$REF" $ARGS
-            sleep 10
+          # Find the triggered run
+          RUN_ID=$(gh run list --repo "$REPO" --workflow "$WORKFLOW" \
+            --json databaseId,createdAt,event \
+            --jq "[.[] | select(.event == \"workflow_dispatch\" and .createdAt >= \"$BEFORE\")] | sort_by(.createdAt) | last | .databaseId")
 
-            # Find the run that was just triggered
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "Could not find run, waiting 30s..."
+            sleep 30
             RUN_ID=$(gh run list --repo "$REPO" --workflow "$WORKFLOW" \
               --json databaseId,createdAt,event \
               --jq "[.[] | select(.event == \"workflow_dispatch\" and .createdAt >= \"$BEFORE\")] | sort_by(.createdAt) | last | .databaseId")
+          fi
 
-            if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
-              echo "::warning::Could not find triggered run, retrying in 30s..."
-              sleep 30
-              RUN_ID=$(gh run list --repo "$REPO" --workflow "$WORKFLOW" \
-                --json databaseId,createdAt,event \
-                --jq "[.[] | select(.event == \"workflow_dispatch\" and .createdAt >= \"$BEFORE\")] | sort_by(.createdAt) | last | .databaseId")
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "::error::Could not find triggered build run"
+            exit 1
+          fi
+
+          echo "Run: https://github.com/$REPO/actions/runs/$RUN_ID"
+
+          # ── Poll until complete ──
+          while true; do
+            sleep 60
+
+            # Check if we're running out of time
+            ELAPSED=$(( $(date +%s) - JOB_START ))
+            REMAINING=$(( TIMEOUT_SECONDS - ELAPSED ))
+            ELAPSED_MIN=$((ELAPSED / 60))
+
+            if [ $REMAINING -lt 300 ]; then
+              echo ""
+              echo "::warning::Orchestrator approaching timeout (${ELAPSED_MIN}min elapsed)"
+
+              if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+                echo "Re-invoking orchestrator for attempt $((ATTEMPT + 1))..."
+                NEXT=$((ATTEMPT + 1))
+                RETRY_ARGS="-f max_attempts=$MAX_ATTEMPTS -f attempt_number=$NEXT"
+                [ -n "$BUILD_DATE" ] && RETRY_ARGS="$RETRY_ARGS -f build_date=$BUILD_DATE"
+                GH_TOKEN="$APP_TOKEN" gh workflow run "$NIGHTLY_WORKFLOW" \
+                  --repo "$REPO" --ref "$REF" $RETRY_ARGS
+                echo "Continuation triggered. This run will exit."
+                echo "" >> "$GITHUB_STEP_SUMMARY"
+                echo "## Nightly Build — Timeout Continuation" >> "$GITHUB_STEP_SUMMARY"
+                echo "Attempt $ATTEMPT timed out. Triggered attempt $NEXT." >> "$GITHUB_STEP_SUMMARY"
+                echo "Build run: https://github.com/$REPO/actions/runs/$RUN_ID" >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              else
+                echo "::error::All $MAX_ATTEMPTS attempts exhausted"
+                echo "" >> "$GITHUB_STEP_SUMMARY"
+                echo "## Nightly Build Failed — Timeout" >> "$GITHUB_STEP_SUMMARY"
+                echo "All $MAX_ATTEMPTS attempts timed out." >> "$GITHUB_STEP_SUMMARY"
+                echo "Last run: https://github.com/$REPO/actions/runs/$RUN_ID" >> "$GITHUB_STEP_SUMMARY"
+                exit 1
+              fi
             fi
 
-            echo "Run ID: $RUN_ID"
-            echo "https://github.com/$REPO/actions/runs/$RUN_ID"
+            STATUS=$(gh run view "$RUN_ID" --repo "$REPO" --json status,conclusion \
+              --jq '"\(.status) \(.conclusion)"')
+            STAT=$(echo "$STATUS" | awk '{print $1}')
+            CONC=$(echo "$STATUS" | awk '{print $2}')
 
-            # Poll until complete or timeout
-            while true; do
-              sleep 60
-              check_timeout
-
-              STATUS=$(gh run view "$RUN_ID" --repo "$REPO" --json status,conclusion \
-                --jq '"\(.status) \(.conclusion)"')
-              STAT=$(echo "$STATUS" | awk '{print $1}')
-              CONC=$(echo "$STATUS" | awk '{print $2}')
-
-              ELAPSED=$(( ($(date +%s) - JOB_START) / 60 ))
-              if [ "$STAT" = "completed" ]; then
-                echo "  Run completed: $CONC (${ELAPSED}min elapsed)"
-                break
-              fi
-              echo "  $(date -u +%H:%M:%S) status=$STAT (${ELAPSED}min elapsed)"
-            done
-
-            if [ "$CONC" = "success" ]; then
-              SUCCESS=true
-              echo ""
-              echo "Build succeeded on attempt $ATTEMPT"
+            if [ "$STAT" = "completed" ]; then
+              echo "Build completed: $CONC (${ELAPSED_MIN}min elapsed)"
               break
             fi
-
-            FAILED_STEP=$(gh run view "$RUN_ID" --repo "$REPO" --json jobs \
-              --jq '.jobs[0].steps[] | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "") | .name' | head -1)
-            echo "Failed step: ${FAILED_STEP:-unknown}"
-
-            if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
-              echo "Retrying immediately..."
-            fi
+            echo "  $(date -u +%H:%M:%S) status=$STAT (${ELAPSED_MIN}min)"
           done
 
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          if [ "$SUCCESS" = "true" ]; then
+          # ── Handle result ──
+          if [ "$CONC" = "success" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "## Nightly Build Success" >> "$GITHUB_STEP_SUMMARY"
             echo "Completed on attempt $ATTEMPT/$MAX_ATTEMPTS." >> "$GITHUB_STEP_SUMMARY"
             echo "Run: https://github.com/$REPO/actions/runs/$RUN_ID" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Build failed
+          FAILED_STEP=$(gh run view "$RUN_ID" --repo "$REPO" --json jobs \
+            --jq '.jobs[0].steps[] | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "") | .name' | head -1)
+          echo "Build failed at step: ${FAILED_STEP:-unknown}"
+
+          if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+            echo "Triggering retry (attempt $((ATTEMPT + 1)))..."
+            NEXT=$((ATTEMPT + 1))
+            RETRY_ARGS="-f max_attempts=$MAX_ATTEMPTS -f attempt_number=$NEXT"
+            [ -n "$BUILD_DATE" ] && RETRY_ARGS="$RETRY_ARGS -f build_date=$BUILD_DATE"
+            GH_TOKEN="$APP_TOKEN" gh workflow run "$NIGHTLY_WORKFLOW" \
+              --repo "$REPO" --ref "$REF" $RETRY_ARGS
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "## Nightly Build — Retry" >> "$GITHUB_STEP_SUMMARY"
+            echo "Attempt $ATTEMPT failed (${FAILED_STEP:-unknown}). Triggered attempt $NEXT." >> "$GITHUB_STEP_SUMMARY"
+            echo "Failed run: https://github.com/$REPO/actions/runs/$RUN_ID" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           else
+            echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "## Nightly Build Failed" >> "$GITHUB_STEP_SUMMARY"
-            echo "Failed after $MAX_ATTEMPTS attempts." >> "$GITHUB_STEP_SUMMARY"
+            echo "All $MAX_ATTEMPTS attempts failed." >> "$GITHUB_STEP_SUMMARY"
             echo "Last run: https://github.com/$REPO/actions/runs/$RUN_ID" >> "$GITHUB_STEP_SUMMARY"
             echo ""
             echo "::error::Nightly build failed after $MAX_ATTEMPTS attempts. Last run: https://github.com/$REPO/actions/runs/$RUN_ID"
