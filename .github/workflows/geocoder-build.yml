@@ -98,13 +98,23 @@ jobs:
           echo "Previous:   $PREV_DATE"
           echo "Server:     $CURRENT_DATE (seq $CURRENT_SEQ, offset: -${DAYS_OFFSET}d)"
 
-          # Check if previous build exists on Tigris
-          if s5cmd --endpoint-url $S3_ENDPOINT ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV_DATE/" 2>/dev/null | head -1 | grep -q .; then
-            echo "has_previous=true" >> "$GITHUB_OUTPUT"
-            echo "Previous build ($PREV_DATE) found on Tigris"
+          # Check if previous build exists on Tigris with compatible build_version
+          EXPECTED_BUILD_VERSION=2
+          PREV_BUILD="s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV_DATE"
+          if s5cmd --endpoint-url $S3_ENDPOINT ls "$PREV_BUILD/" 2>/dev/null | head -1 | grep -q .; then
+            # Check build_version in previous manifest
+            PREV_VERSION=$(s5cmd --endpoint-url $S3_ENDPOINT cat "$PREV_BUILD/manifest.json" 2>/dev/null \
+              | jq -r '.build_version // 0' 2>/dev/null || echo 0)
+            if [ "$PREV_VERSION" = "$EXPECTED_BUILD_VERSION" ]; then
+              echo "has_previous=true" >> "$GITHUB_OUTPUT"
+              echo "Previous build ($PREV_DATE) found, build_version=$PREV_VERSION — compatible"
+            else
+              echo "has_previous=false" >> "$GITHUB_OUTPUT"
+              echo "Previous build ($PREV_DATE) found but build_version=$PREV_VERSION (expected $EXPECTED_BUILD_VERSION) — incompatible, building fresh"
+            fi
           else
             echo "has_previous=false" >> "$GITHUB_OUTPUT"
-            echo "No previous build — will build from scratch"
+            echo "No previous build ($PREV_DATE) — building fresh"
           fi
 
       # ── Obtain PBF + previous indexes (parallel) ──────────────────
@@ -337,16 +347,14 @@ jobs:
           S5="s5cmd --endpoint-url $S3_ENDPOINT"
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15 --concurrency 16"
 
-          # ── Write manifest.json into output dir (uploaded with everything else) ──
-          VARIANTS=$(cd "$WORKDIR/output" && find . -name "*.bin" -exec dirname {} \; | sort -u | sed 's|^\./||')
-          VARIANT_JSON=$(echo "$VARIANTS" | jq -R . | jq -s .)
-          jq -n \
-            --arg date "$NEW_DATE" \
-            --arg previous "$( [ "$HAS_PREVIOUS" = "true" ] && echo "$OLD_DATE" || echo "" )" \
-            --argjson variants "$VARIANT_JSON" \
-            --arg built_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '{date: $date, previous: ($previous | if . == "" then null else . end), variants: $variants, built_at: $built_at}' \
-            > "$WORKDIR/output/manifest.json"
+          # ── Augment build tool's manifest.json with date/previous info ──
+          PREV_VAL="$( [ "$HAS_PREVIOUS" = "true" ] && echo "$OLD_DATE" || echo "null" )"
+          jq --arg date "$NEW_DATE" \
+             --arg previous "$PREV_VAL" \
+             --arg built_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+             '. + {date: $date, previous: (if $previous == "null" then null else $previous end), built_at: $built_at}' \
+             "$WORKDIR/output/manifest.json" > "$WORKDIR/output/manifest.tmp" \
+             && mv "$WORKDIR/output/manifest.tmp" "$WORKDIR/output/manifest.json"
           echo "Manifest: $(cat "$WORKDIR/output/manifest.json")"
 
           # ── Upload everything to Tigris + cache in parallel ──
@@ -399,11 +407,14 @@ jobs:
           fi
 
           # ── Update latest.json ──
+          PREV_VAL="$( [ "$HAS_PREVIOUS" = "true" ] && echo "$OLD_DATE" || echo "null" )"
           jq -n \
+            --argjson build_version 2 \
+            --argjson patch_version 1 \
             --arg latest "$NEW_DATE" \
-            --arg previous "$( [ "$HAS_PREVIOUS" = "true" ] && echo "$OLD_DATE" || echo "" )" \
+            --arg previous "$PREV_VAL" \
             --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '{latest: $latest, previous: ($previous | if . == "" then null else . end), updated_at: $updated_at}' \
+            '{build_version: $build_version, patch_version: $patch_version, latest: $latest, previous: (if $previous == "null" then null else $previous end), updated_at: $updated_at}' \
             | $S5 pipe "s3://$S3_BUCKET/$S3_PREFIX/builds/latest.json"
 
           echo "Upload complete."

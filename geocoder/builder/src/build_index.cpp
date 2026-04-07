@@ -1807,7 +1807,8 @@ int main(int argc, char* argv[]) {
 
         std::ofstream mf(output_dir + "/manifest.json");
         mf << "{\n";
-        mf << "  \"version\": 1,\n";
+        mf << "  \"build_version\": 2,\n";
+        mf << "  \"patch_version\": 1,\n";
         mf << "  \"regions\": {\n";
 
         for (size_t ri = 0; ri < regions.size(); ri++) {
