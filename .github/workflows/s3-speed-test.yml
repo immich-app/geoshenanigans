@@ -48,11 +48,11 @@ jobs:
           echo "| Workers | Concurrency | Size (MiB) | Time (s) | Speed (MB/s) |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---------|-------------|-----------|---------|-------------|" >> "$GITHUB_STEP_SUMMARY"
 
-          # Download test data once (full variant ~7GB)
+          # Download all test data (~63GB, all variants)
           echo "Downloading test data..."
           mkdir -p "$WORKDIR/src"
           $S5 --numworkers 32 cp --concurrency 8 \
-            "s3://$S3_BUCKET/$TEST_SRC/full/*" "$WORKDIR/src/" 2>/dev/null
+            "s3://$S3_BUCKET/$TEST_SRC/*" "$WORKDIR/src/" 2>/dev/null
           SIZE=$(du -sb "$WORKDIR/src" | cut -f1)
           SIZE_MIB=$((SIZE / 1024 / 1024))
           COUNT=$(find "$WORKDIR/src" -type f | wc -l)
