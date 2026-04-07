@@ -1,0 +1,119 @@
+name: Geocoder Nightly
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      build_date:
+        description: 'Build date (YYYY-MM-DD). Leave empty for today.'
+        required: false
+        type: string
+      max_attempts:
+        description: 'Max retry attempts'
+        required: false
+        type: number
+        default: 3
+
+permissions:
+  contents: read
+  actions: write    # needed to trigger workflows + read run status
+
+jobs:
+  orchestrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 480   # 8 hours max (including retries)
+    steps:
+      - name: Trigger and monitor build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_DATE: ${{ inputs.build_date || '' }}
+          MAX_ATTEMPTS: ${{ inputs.max_attempts || 3 }}
+        run: |
+          REPO="${GITHUB_REPOSITORY}"
+          WORKFLOW="geocoder-build.yml"
+          REF="${GITHUB_REF_NAME}"
+          ATTEMPT=0
+          SUCCESS=false
+
+          # Build the dispatch args
+          ARGS=""
+          [ -n "$BUILD_DATE" ] && ARGS="-f build_date=$BUILD_DATE"
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            echo ""
+            echo "════════════════════════════════════════════════"
+            echo "  Attempt $ATTEMPT/$MAX_ATTEMPTS"
+            echo "════════════════════════════════════════════════"
+
+            # Trigger the build workflow
+            echo "Triggering build workflow..."
+            BEFORE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            gh workflow run "$WORKFLOW" --repo "$REPO" --ref "$REF" $ARGS
+            sleep 10
+
+            # Find the run that was just triggered
+            RUN_ID=$(gh run list --repo "$REPO" --workflow "$WORKFLOW" \
+              --json databaseId,createdAt,event \
+              --jq "[.[] | select(.event == \"workflow_dispatch\" and .createdAt >= \"$BEFORE\")] | sort_by(.createdAt) | last | .databaseId")
+
+            if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+              echo "::warning::Could not find triggered run, retrying in 30s..."
+              sleep 30
+              RUN_ID=$(gh run list --repo "$REPO" --workflow "$WORKFLOW" \
+                --json databaseId,createdAt,event \
+                --jq "[.[] | select(.event == \"workflow_dispatch\" and .createdAt >= \"$BEFORE\")] | sort_by(.createdAt) | last | .databaseId")
+            fi
+
+            echo "Run ID: $RUN_ID"
+            echo "https://github.com/$REPO/actions/runs/$RUN_ID"
+
+            # Poll until complete
+            while true; do
+              sleep 60
+              STATUS=$(gh run view "$RUN_ID" --repo "$REPO" --json status,conclusion \
+                --jq '"\(.status) \(.conclusion)"')
+              STAT=$(echo "$STATUS" | awk '{print $1}')
+              CONC=$(echo "$STATUS" | awk '{print $2}')
+
+              if [ "$STAT" = "completed" ]; then
+                echo "Run completed: $CONC"
+                break
+              fi
+              echo "  $(date -u +%H:%M:%S) status=$STAT"
+            done
+
+            if [ "$CONC" = "success" ]; then
+              SUCCESS=true
+              echo ""
+              echo "Build succeeded on attempt $ATTEMPT"
+              break
+            fi
+
+            # Check if it was a runner crash vs a real failure
+            ANNOTATION=$(gh run view "$RUN_ID" --repo "$REPO" --json jobs \
+              --jq '.jobs[0].steps[] | select(.conclusion != "success" and .conclusion != "skipped") | .name' | head -1)
+            CRASH=$(gh api "repos/$REPO/actions/runs/$RUN_ID" \
+              --jq '.run_attempt' 2>/dev/null || echo "")
+
+            echo "Failed step: $ANNOTATION"
+            echo ""
+
+            if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+              WAIT=$((60 * ATTEMPT))  # backoff: 60s, 120s, 180s
+              echo "Retrying in ${WAIT}s..."
+              sleep $WAIT
+            fi
+          done
+
+          if [ "$SUCCESS" = "true" ]; then
+            echo ""
+            echo "Nightly build completed successfully (attempt $ATTEMPT/$MAX_ATTEMPTS)"
+          else
+            echo ""
+            echo "::error::Nightly build failed after $MAX_ATTEMPTS attempts"
+            echo ""
+            echo "Last run: https://github.com/$REPO/actions/runs/$RUN_ID"
+            exit 1
+          fi
