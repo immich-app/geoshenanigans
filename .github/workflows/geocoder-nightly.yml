@@ -22,7 +22,7 @@ permissions:
 jobs:
   orchestrate:
     runs-on: ubuntu-latest
-    timeout-minutes: 480   # 8 hours max (including retries)
+    timeout-minutes: 350   # just under 6h GitHub-hosted limit
     steps:
       - name: Trigger and monitor build
         env:
