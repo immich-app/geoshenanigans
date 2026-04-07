@@ -1,0 +1,91 @@
+name: S3 Cleanup
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    runs-on: pokedex-giant
+    timeout-minutes: 30
+    steps:
+      - name: Install s5cmd
+        run: |
+          curl -sL "https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-64bit.tar.gz" \
+            -o /tmp/s5cmd.tar.gz
+          sudo tar xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd
+
+      - name: Configure credentials
+        run: |
+          echo "::add-mask::$AWS_ACCESS_KEY_ID"
+          echo "::add-mask::$AWS_SECRET_ACCESS_KEY"
+          echo "CACHE_AWS_KEY=$AWS_ACCESS_KEY_ID" >> "$GITHUB_ENV"
+          echo "CACHE_AWS_SECRET=$AWS_SECRET_ACCESS_KEY" >> "$GITHUB_ENV"
+          echo "CACHE_ENDPOINT=http://${BUCKET_HOST}:${BUCKET_PORT}" >> "$GITHUB_ENV"
+          echo "CACHE_BUCKET=$BUCKET_NAME" >> "$GITHUB_ENV"
+          echo "AWS_ACCESS_KEY_ID=$KEY" >> "$GITHUB_ENV"
+          echo "AWS_SECRET_ACCESS_KEY=$SECRET" >> "$GITHUB_ENV"
+        env:
+          KEY: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
+          SECRET: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
+
+      - name: List current state
+        run: |
+          S5="s5cmd --endpoint-url https://t3.storage.dev"
+          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT"
+
+          echo "=== Tigris builds ==="
+          $S5 ls "s3://geoshenanigans-reverse-geocoding/geocoder/builds/" 2>&1
+          echo ""
+          echo "=== Tigris patches ==="
+          $S5 ls "s3://geoshenanigans-reverse-geocoding/geocoder/patches/" 2>&1 | head -20
+          echo ""
+          echo "=== Tigris latest.json ==="
+          $S5 cat "s3://geoshenanigans-reverse-geocoding/geocoder/latest.json" 2>&1 || echo "(not found)"
+          echo ""
+          echo "=== Cache builds ==="
+          $CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/builds/" 2>&1
+          echo ""
+          echo "=== Cache PBFs ==="
+          $CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/" 2>&1 | grep planet
+
+      - name: Clear old builds from Tigris
+        run: |
+          S5="s5cmd --endpoint-url https://t3.storage.dev"
+          BUCKET="geoshenanigans-reverse-geocoding"
+
+          echo "Removing old builds..."
+          $S5 rm "s3://$BUCKET/geocoder/builds/*" 2>&1 || true
+
+          echo "Removing old patches..."
+          $S5 rm "s3://$BUCKET/geocoder/patches/*" 2>&1 || true
+
+          echo "Removing old latest.json..."
+          $S5 rm "s3://$BUCKET/geocoder/latest.json" 2>&1 || true
+
+          echo "Tigris cleaned."
+
+      - name: Clear old builds from cache
+        run: |
+          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT"
+
+          echo "Removing cached builds..."
+          $CACHE rm "s3://$CACHE_BUCKET/geocoder-cache/builds/*" 2>&1 || true
+
+          echo "Cache cleaned. (PBFs kept)"
+
+      - name: Verify clean
+        run: |
+          S5="s5cmd --endpoint-url https://t3.storage.dev"
+          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT"
+
+          echo "=== Tigris (should be empty) ==="
+          $S5 ls "s3://geoshenanigans-reverse-geocoding/geocoder/builds/" 2>&1 || echo "(empty)"
+          echo ""
+          echo "=== Cache builds (should be empty) ==="
+          $CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/builds/" 2>&1 || echo "(empty)"
+          echo ""
+          echo "=== Cache PBFs (should remain) ==="
+          $CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/" 2>&1 | grep planet
