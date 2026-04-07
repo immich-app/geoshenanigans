@@ -143,10 +143,10 @@ jobs:
               --argjson build_version "$BUILD_VER" \
               --argjson patch_version "$PATCH_VER" \
               --arg latest "$LATEST" \
-              --arg oldest_full "${OLDEST_FULL:-$LATEST}" \
+              --arg oldest_indexes "${OLDEST_FULL:-$LATEST}" \
               --arg oldest_patches "${OLDEST_PATCHES:-$LATEST}" \
               --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-              '{build_version: $build_version, patch_version: $patch_version, latest: $latest, oldest_full: $oldest_full, oldest_patches: $oldest_patches, updated_at: $updated_at}' \
+              '{build_version: $build_version, patch_version: $patch_version, latest: $latest, oldest_indexes: $oldest_indexes, oldest_patches: $oldest_patches, updated_at: $updated_at}' \
               | $S5 pipe "s3://$S3_BUCKET/$S3_PREFIX/builds/latest.json"
 
             echo "latest.json updated:"
