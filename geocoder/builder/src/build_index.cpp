@@ -1626,11 +1626,11 @@ int main(int argc, char* argv[]) {
             write_index(d, base_dir, mode);
         }
 
-        // Write quality variants under admin/ (or base_dir if not multi_output)
+        // Write quality variants (each gets admin_polygons + admin_vertices)
         if (multi_quality) {
-            std::string admin_dir = multi_output ? base_dir + "/admin" : base_dir;
+            std::string quality_dir = multi_output ? base_dir + "/quality" : base_dir;
             std::cerr << "  Writing quality variants for " << base_dir << "..." << std::endl;
-            write_qualities(d, admin_dir);
+            write_qualities(d, quality_dir);
         }
     };
 
@@ -1814,31 +1814,29 @@ int main(int argc, char* argv[]) {
             const auto& [rname, rpath] = regions[ri];
             mf << "    \"" << rname << "\": {\n";
 
-            // Modes
+            // Modes (no admin_polygons/vertices — those are in quality/)
             mf << "      \"modes\": {\n";
             if (multi_output) {
                 std::string full_dir = rpath + "/full";
                 int64_t full_sz = dir_size(full_dir, geo_files) +
                     dir_size(full_dir, street_files) +
                     dir_size(full_dir, address_files) +
-                    dir_size(full_dir, admin_base_files) +
-                    dir_size(full_dir, admin_quality_files);
+                    dir_size(full_dir, admin_base_files);
                 mf << "        \"full\": {\"size\": " << full_sz << "},\n";
 
                 std::string na_dir = rpath + "/no-addresses";
                 int64_t na_sz = dir_size(na_dir, geo_files) +
                     dir_size(na_dir, street_files) +
-                    dir_size(na_dir, admin_base_files) +
-                    dir_size(na_dir, admin_quality_files);
+                    dir_size(na_dir, admin_base_files);
                 mf << "        \"no-addresses\": {\"size\": " << na_sz << "},\n";
 
                 std::string admin_dir = rpath + "/admin";
-                int64_t admin_base_sz = dir_size(admin_dir, admin_base_files);
-                mf << "        \"admin\": {\"base_size\": " << admin_base_sz << "}\n";
+                int64_t admin_sz = dir_size(admin_dir, admin_base_files);
+                mf << "        \"admin\": {\"size\": " << admin_sz << "}\n";
             } else {
                 int64_t sz = 0;
                 for (const auto& lists : {geo_files, street_files, address_files,
-                                          admin_base_files, admin_quality_files}) {
+                                          admin_base_files}) {
                     sz += dir_size(rpath, lists);
                 }
                 mf << "        \"" << (mode == IndexMode::Full ? "full" :
@@ -1846,14 +1844,14 @@ int main(int argc, char* argv[]) {
             }
             mf << "      },\n";
 
-            // Quality variants
+            // Quality variants (each has admin_polygons + admin_vertices)
             if (multi_quality) {
-                std::string admin_dir = multi_output ? rpath + "/admin" : rpath;
+                std::string quality_dir = multi_output ? rpath + "/quality" : rpath;
                 mf << "      \"qualities\": {\n";
                 for (size_t qi = 0; qi < quality_scales.size(); qi++) {
                     double scale = quality_scales[qi];
                     std::string qname = quality_dir_name(scale);
-                    std::string qdir = admin_dir + "/" + qname;
+                    std::string qdir = quality_dir + "/" + qname;
                     int64_t qsz = dir_size(qdir, admin_quality_files);
 
                     double eps_l2 = (scale == 0) ? 0 : 500.0 * scale * kEpsilonScale;
