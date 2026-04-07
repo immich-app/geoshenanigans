@@ -35,16 +35,37 @@ jobs:
           REF="${GITHUB_REF_NAME}"
           ATTEMPT=0
           SUCCESS=false
+          JOB_START=$(date +%s)
+          TIMEOUT_SECONDS=$((340 * 60))  # 340 min — leave 10 min buffer before 350 min job timeout
+          RUN_ID=""
 
           # Build the dispatch args
           ARGS=""
           [ -n "$BUILD_DATE" ] && ARGS="-f build_date=$BUILD_DATE"
 
+          check_timeout() {
+            ELAPSED=$(( $(date +%s) - JOB_START ))
+            REMAINING=$(( TIMEOUT_SECONDS - ELAPSED ))
+            if [ $REMAINING -lt 300 ]; then  # less than 5 min remaining
+              echo ""
+              echo "::error::Orchestrator timeout imminent (${ELAPSED}s elapsed, ${REMAINING}s remaining)"
+              echo "::error::Nightly build did not complete after $ATTEMPT attempts"
+              [ -n "$RUN_ID" ] && echo "::error::Last run: https://github.com/$REPO/actions/runs/$RUN_ID"
+              echo ""
+              echo "## Nightly Build Timeout" >> "$GITHUB_STEP_SUMMARY"
+              echo "Build did not complete after $ATTEMPT attempt(s)." >> "$GITHUB_STEP_SUMMARY"
+              echo "Orchestrator ran for $((ELAPSED / 60)) minutes before timing out." >> "$GITHUB_STEP_SUMMARY"
+              [ -n "$RUN_ID" ] && echo "Last run: https://github.com/$REPO/actions/runs/$RUN_ID" >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+          }
+
           while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            check_timeout
             ATTEMPT=$((ATTEMPT + 1))
             echo ""
             echo "════════════════════════════════════════════════"
-            echo "  Attempt $ATTEMPT/$MAX_ATTEMPTS"
+            echo "  Attempt $ATTEMPT/$MAX_ATTEMPTS ($(( ($(date +%s) - JOB_START) / 60 ))min elapsed)"
             echo "════════════════════════════════════════════════"
 
             # Trigger the build workflow
@@ -69,19 +90,22 @@ jobs:
             echo "Run ID: $RUN_ID"
             echo "https://github.com/$REPO/actions/runs/$RUN_ID"
 
-            # Poll until complete
+            # Poll until complete or timeout
             while true; do
               sleep 60
+              check_timeout
+
               STATUS=$(gh run view "$RUN_ID" --repo "$REPO" --json status,conclusion \
                 --jq '"\(.status) \(.conclusion)"')
               STAT=$(echo "$STATUS" | awk '{print $1}')
               CONC=$(echo "$STATUS" | awk '{print $2}')
 
+              ELAPSED=$(( ($(date +%s) - JOB_START) / 60 ))
               if [ "$STAT" = "completed" ]; then
-                echo "Run completed: $CONC"
+                echo "  Run completed: $CONC (${ELAPSED}min elapsed)"
                 break
               fi
-              echo "  $(date -u +%H:%M:%S) status=$STAT"
+              echo "  $(date -u +%H:%M:%S) status=$STAT (${ELAPSED}min elapsed)"
             done
 
             if [ "$CONC" = "success" ]; then
@@ -91,29 +115,25 @@ jobs:
               break
             fi
 
-            # Check if it was a runner crash vs a real failure
-            ANNOTATION=$(gh run view "$RUN_ID" --repo "$REPO" --json jobs \
-              --jq '.jobs[0].steps[] | select(.conclusion != "success" and .conclusion != "skipped") | .name' | head -1)
-            CRASH=$(gh api "repos/$REPO/actions/runs/$RUN_ID" \
-              --jq '.run_attempt' 2>/dev/null || echo "")
-
-            echo "Failed step: $ANNOTATION"
-            echo ""
+            FAILED_STEP=$(gh run view "$RUN_ID" --repo "$REPO" --json jobs \
+              --jq '.jobs[0].steps[] | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "") | .name' | head -1)
+            echo "Failed step: ${FAILED_STEP:-unknown}"
 
             if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
-              WAIT=$((60 * ATTEMPT))  # backoff: 60s, 120s, 180s
-              echo "Retrying in ${WAIT}s..."
-              sleep $WAIT
+              echo "Retrying immediately..."
             fi
           done
 
+          echo "" >> "$GITHUB_STEP_SUMMARY"
           if [ "$SUCCESS" = "true" ]; then
-            echo ""
-            echo "Nightly build completed successfully (attempt $ATTEMPT/$MAX_ATTEMPTS)"
+            echo "## Nightly Build Success" >> "$GITHUB_STEP_SUMMARY"
+            echo "Completed on attempt $ATTEMPT/$MAX_ATTEMPTS." >> "$GITHUB_STEP_SUMMARY"
+            echo "Run: https://github.com/$REPO/actions/runs/$RUN_ID" >> "$GITHUB_STEP_SUMMARY"
           else
+            echo "## Nightly Build Failed" >> "$GITHUB_STEP_SUMMARY"
+            echo "Failed after $MAX_ATTEMPTS attempts." >> "$GITHUB_STEP_SUMMARY"
+            echo "Last run: https://github.com/$REPO/actions/runs/$RUN_ID" >> "$GITHUB_STEP_SUMMARY"
             echo ""
-            echo "::error::Nightly build failed after $MAX_ATTEMPTS attempts"
-            echo ""
-            echo "Last run: https://github.com/$REPO/actions/runs/$RUN_ID"
+            echo "::error::Nightly build failed after $MAX_ATTEMPTS attempts. Last run: https://github.com/$REPO/actions/runs/$RUN_ID"
             exit 1
           fi
