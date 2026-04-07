@@ -118,7 +118,7 @@ jobs:
           TODAY_SEQ: ${{ steps.setup.outputs.today_seq }}
           HAS_PREVIOUS: ${{ steps.setup.outputs.has_previous }}
         run: |
-          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15 --concurrency 4"
+          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15 --concurrency 16"
           S5="s5cmd --endpoint-url $S3_ENDPOINT"
           STEP_START=$(date +%s)
 
@@ -333,7 +333,7 @@ jobs:
           HAS_PREVIOUS: ${{ steps.setup.outputs.has_previous }}
         run: |
           S5="s5cmd --endpoint-url $S3_ENDPOINT"
-          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15 --concurrency 4"
+          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15 --concurrency 16"
 
           # ── Upload indexes to Tigris ──
           echo "Uploading indexes ($NEW_DATE) to Tigris..."
