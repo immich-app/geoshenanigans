@@ -1808,17 +1808,15 @@ int main(int argc, char* argv[]) {
         std::ofstream mf(output_dir + "/manifest.json");
         mf << "{\n";
         mf << "  \"version\": 1,\n";
-        mf << "  \"regions\": [\n";
+        mf << "  \"regions\": {\n";
 
         for (size_t ri = 0; ri < regions.size(); ri++) {
             const auto& [rname, rpath] = regions[ri];
-            mf << "    {\n";
-            mf << "      \"name\": \"" << rname << "\",\n";
+            mf << "    \"" << rname << "\": {\n";
 
             // Modes
             mf << "      \"modes\": {\n";
             if (multi_output) {
-                // Full
                 std::string full_dir = rpath + "/full";
                 int64_t full_sz = dir_size(full_dir, geo_files) +
                     dir_size(full_dir, street_files) +
@@ -1827,7 +1825,6 @@ int main(int argc, char* argv[]) {
                     dir_size(full_dir, admin_quality_files);
                 mf << "        \"full\": {\"size\": " << full_sz << "},\n";
 
-                // Streets (no addresses)
                 std::string na_dir = rpath + "/no-addresses";
                 int64_t na_sz = dir_size(na_dir, geo_files) +
                     dir_size(na_dir, street_files) +
@@ -1835,7 +1832,6 @@ int main(int argc, char* argv[]) {
                     dir_size(na_dir, admin_quality_files);
                 mf << "        \"no-addresses\": {\"size\": " << na_sz << "},\n";
 
-                // Admin base (shared files)
                 std::string admin_dir = rpath + "/admin";
                 int64_t admin_base_sz = dir_size(admin_dir, admin_base_files);
                 mf << "        \"admin\": {\"base_size\": " << admin_base_sz << "}\n";
@@ -1853,18 +1849,17 @@ int main(int argc, char* argv[]) {
             // Quality variants
             if (multi_quality) {
                 std::string admin_dir = multi_output ? rpath + "/admin" : rpath;
-                mf << "      \"qualities\": [\n";
+                mf << "      \"qualities\": {\n";
                 for (size_t qi = 0; qi < quality_scales.size(); qi++) {
                     double scale = quality_scales[qi];
                     std::string qname = quality_dir_name(scale);
                     std::string qdir = admin_dir + "/" + qname;
                     int64_t qsz = dir_size(qdir, admin_quality_files);
 
-                    // Compute epsilon values for this scale
                     double eps_l2 = (scale == 0) ? 0 : 500.0 * scale * kEpsilonScale;
                     double eps_l8 = (scale == 0) ? 0 : 15.0 * scale * kEpsilonScale;
 
-                    mf << "        {\"name\": \"" << qname << "\", \"scale\": " << scale
+                    mf << "        \"" << qname << "\": {\"scale\": " << scale
                        << ", \"size\": " << qsz
                        << ", \"epsilon_l2_m\": " << eps_l2
                        << ", \"epsilon_l8_m\": " << eps_l8
@@ -1872,9 +1867,9 @@ int main(int argc, char* argv[]) {
                     if (qi + 1 < quality_scales.size()) mf << ",";
                     mf << "\n";
                 }
-                mf << "      ]\n";
+                mf << "      }\n";
             } else {
-                mf << "      \"qualities\": []\n";
+                mf << "      \"qualities\": {}\n";
             }
 
             mf << "    }";
@@ -1882,7 +1877,7 @@ int main(int argc, char* argv[]) {
             mf << "\n";
         }
 
-        mf << "  ]\n";
+        mf << "  }\n";
         mf << "}\n";
 
         std::cerr << "Wrote " << output_dir << "/manifest.json" << std::endl;
