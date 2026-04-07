@@ -241,10 +241,10 @@ jobs:
           echo "|---------|-------|-----------|----------|" >> "$GITHUB_STEP_SUMMARY"
 
           RESULTS_DIR="$WORKDIR/results"
-          PATCHES_DIR="$WORKDIR/patches"
-          mkdir -p "$RESULTS_DIR" "$PATCHES_DIR"
+          mkdir -p "$RESULTS_DIR"
           VARIANTS=$(cd "$WORKDIR/output" && find . -name "*.bin" -exec dirname {} \; | sort -u | sed 's|^\./||')
 
+          # Generate patch, verify, and place patch.gcpatch alongside the .bin files
           JOBS=0
           MAX_JOBS=$(nproc)
           for variant in $VARIANTS; do
@@ -261,10 +261,12 @@ jobs:
                 exit 0
               fi
 
-              PATCH_FILE="$PATCHES_DIR/$SAFE.gcpatch"
+              # Generate patch into the output directory (colocated with .bin files)
+              PATCH_FILE="$NEW_DIR/patch.gcpatch"
               geocoder-diff "$OLD_DIR" "$NEW_DIR" -o "$PATCH_FILE" 2>/dev/null
               PATCH_KB=$(( $(stat -c%s "$PATCH_FILE" 2>/dev/null || echo 0) / 1024 ))
 
+              # Verify
               VERIFY_DIR="$WORKDIR/verify-$SAFE"
               mkdir -p "$VERIFY_DIR"
               geocoder-patch "$OLD_DIR" "$PATCH_FILE" -o "$VERIFY_DIR/" 2>/dev/null
@@ -322,7 +324,7 @@ jobs:
           echo "Results: $PASS pass, $FAIL fail, $SKIP skip"
           [ $FAIL -gt 0 ] && exit 1 || true
 
-      # ── Upload to Tigris + cache ───────────────────────────────────
+      # ── Write manifest + upload ────────────────────────────────────
       - name: Upload to Tigris and cache
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
@@ -335,8 +337,21 @@ jobs:
           S5="s5cmd --endpoint-url $S3_ENDPOINT"
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15 --concurrency 16"
 
-          # ── Upload indexes to Tigris ──
-          echo "Uploading indexes ($NEW_DATE) to Tigris..."
+          # ── Write manifest.json into output dir (uploaded with everything else) ──
+          VARIANTS=$(cd "$WORKDIR/output" && find . -name "*.bin" -exec dirname {} \; | sort -u | sed 's|^\./||')
+          VARIANT_JSON=$(echo "$VARIANTS" | jq -R . | jq -s .)
+          jq -n \
+            --arg date "$NEW_DATE" \
+            --arg previous "$( [ "$HAS_PREVIOUS" = "true" ] && echo "$OLD_DATE" || echo "" )" \
+            --argjson variants "$VARIANT_JSON" \
+            --arg built_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{date: $date, previous: ($previous | if . == "" then null else . end), variants: $variants, built_at: $built_at}' \
+            > "$WORKDIR/output/manifest.json"
+          echo "Manifest: $(cat "$WORKDIR/output/manifest.json")"
+
+          # ── Upload everything to Tigris + cache in parallel ──
+          # output/ now contains: *.bin + patch.gcpatch + manifest.json per variant
+          echo "Uploading to Tigris..."
           START=$(date +%s)
           UPLOAD_LOG="$WORKDIR/upload.log"
           $S5 --numworkers 30 cp --concurrency 4 \
@@ -344,20 +359,7 @@ jobs:
             > "$UPLOAD_LOG" 2>&1 &
           TIGRIS_PID=$!
 
-          # ── Upload patches to Tigris (if generated) ──
-          if [ "$HAS_PREVIOUS" = "true" ] && [ -d "$WORKDIR/patches" ]; then
-            echo "Uploading patches to Tigris..."
-            for f in "$WORKDIR/patches"/*.gcpatch; do
-              [ ! -f "$f" ] && continue
-              SAFE=$(basename "$f" .gcpatch)
-              VARIANT=$(echo "$SAFE" | tr '_' '/')
-              $S5 cp "$f" "s3://$S3_BUCKET/$S3_PREFIX/patches/$VARIANT/${OLD_DATE}-to-${NEW_DATE}.gcpatch" \
-                >> "$UPLOAD_LOG" 2>&1 &
-            done
-          fi
-
-          # ── Upload indexes to cache ──
-          echo "Caching indexes to local S3..."
+          echo "Caching to local S3..."
           $CACHE cp "$WORKDIR/output/*" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/" &
           CACHE_PID=$!
 
@@ -380,7 +382,6 @@ jobs:
           # ── Wait for cache + verify ──
           echo "Waiting for cache upload..."
           wait $CACHE_PID 2>/dev/null || true
-          wait 2>/dev/null || true  # wait for any remaining patch uploads
 
           CACHE_COUNT=$($CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/*" 2>/dev/null | wc -l)
           echo "Cache: $CACHE_COUNT/$LOCAL_COUNT files"
@@ -397,19 +398,12 @@ jobs:
             echo "::warning::Cache incomplete ($CACHE_COUNT/$LOCAL_COUNT) — no sentinel"
           fi
 
-          # ── Write manifests ──
-          jq -n \
-            --arg date "$NEW_DATE" \
-            --arg prev "$OLD_DATE" \
-            --arg validated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '{date: $date, previous: $prev, validated_at: $validated_at}' \
-            | $S5 pipe "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/validated.json"
-
+          # ── Update latest.json ──
           jq -n \
             --arg latest "$NEW_DATE" \
-            --arg previous "$OLD_DATE" \
+            --arg previous "$( [ "$HAS_PREVIOUS" = "true" ] && echo "$OLD_DATE" || echo "" )" \
             --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '{latest_build: $latest, previous_build: $previous, updated_at: $updated_at}' \
-            | $S5 pipe "s3://$S3_BUCKET/$S3_PREFIX/latest.json"
+            '{latest: $latest, previous: ($previous | if . == "" then null else . end), updated_at: $updated_at}' \
+            | $S5 pipe "s3://$S3_BUCKET/$S3_PREFIX/builds/latest.json"
 
-          echo "Manifests updated. Upload complete."
+          echo "Upload complete."
