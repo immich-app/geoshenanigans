@@ -59,9 +59,9 @@ jobs:
           echo "Test data: $COUNT files, $SIZE_MIB MiB"
           echo ""
 
-          echo "=== s5cmd uploads ==="
-          for W in 8 16 30 64 128; do
-            for C in 2 4 8 16 32; do
+          echo "=== s5cmd uploads (remaining from previous run) ==="
+          for W in 128; do
+            for C in 8 16 32; do
               LABEL="s5cmd w=${W} c=${C}"
               START=$(date +%s)
               $S5 --numworkers $W cp --concurrency $C \
