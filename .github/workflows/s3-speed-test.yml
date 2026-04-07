@@ -11,7 +11,6 @@ env:
   S3_BUCKET: geoshenanigans-reverse-geocoding
   S3_PREFIX: geocoder
   S3_ENDPOINT: https://t3.storage.dev
-  S3_PUBLIC_URL: https://geoshenanigans-reverse-geocoding.t3.tigrisfiles.io
 
 permissions:
   contents: read
@@ -23,8 +22,6 @@ jobs:
     steps:
       - name: Install tools
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq aria2
           curl -sL "https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-64bit.tar.gz" \
             -o /tmp/s5cmd.tar.gz
           sudo tar xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd
@@ -39,92 +36,45 @@ jobs:
           KEY: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
           SECRET: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
 
-      - name: System info
-        run: |
-          echo "CPUs: $(nproc)"
-          echo "Memory: $(free -h | awk '/Mem:/{print $2}')"
-
-      - name: Test aria2 downloads from Tigris
-        run: |
-          S5="s5cmd --endpoint-url $S3_ENDPOINT"
-          WORKDIR="/tmp/speed-test"
-          TEST_PATH="$S3_PREFIX/builds/2026-04-05"
-
-          echo "## aria2 Download Speed Test (10G WAN)" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Connections (-x) | Parallel (-j) | Splits (-s) | Files | Size (MiB) | Time (s) | Speed (MB/s) |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|-----------------|--------------|------------|-------|-----------|---------|-------------|" >> "$GITHUB_STEP_SUMMARY"
-
-          # Build URL list from S3 listing
-          $S5 ls "s3://$S3_BUCKET/$TEST_PATH/*" | awk '{print $NF}' \
-            | while IFS= read -r REL; do
-                DIR="$WORKDIR/dl/$(dirname "$REL")"
-                echo "$S3_PUBLIC_URL/$TEST_PATH/$REL"
-                echo "  dir=$DIR"
-              done > /tmp/aria2-urls.txt
-          URL_COUNT=$(grep -c '^http' /tmp/aria2-urls.txt)
-          echo "URL count: $URL_COUNT"
-          echo "Reference: s5cmd best was 417 MB/s (w=32 c=8)"
-          echo ""
-
-          for X in 1 4 8 16 32 64; do
-            for J in 16 32 64 128; do
-              for S in $X 16; do
-                # Skip redundant combos
-                [ "$S" -eq "$X" ] || [ "$X" -eq 1 ] || continue
-
-                LABEL="aria2 x=${X} j=${J} s=${S}"
-                rm -rf "$WORKDIR/dl" && mkdir -p "$WORKDIR/dl"
-                START=$(date +%s)
-                aria2c -x $X -j $J -s $S --max-tries=2 --auto-file-renaming=false \
-                  --file-allocation=none --summary-interval=0 \
-                  -i /tmp/aria2-urls.txt 2>/dev/null || true
-                SEC=$(($(date +%s) - START))
-                COUNT=$(find "$WORKDIR/dl" -type f 2>/dev/null | wc -l)
-                SIZE=$(du -sb "$WORKDIR/dl" 2>/dev/null | cut -f1)
-                SIZE_MIB=$((SIZE / 1024 / 1024))
-                [ "$SEC" -gt 0 ] && SPEED=$((SIZE_MIB / SEC)) || SPEED=$SIZE_MIB
-                echo "$LABEL: $COUNT files, $SIZE_MIB MiB in ${SEC}s ($SPEED MB/s)"
-                echo "| $X | $J | $S | $COUNT | $SIZE_MIB | $SEC | $SPEED |" >> "$GITHUB_STEP_SUMMARY"
-                rm -rf "$WORKDIR/dl"
-              done
-            done
-          done
-
       - name: Test uploads to Tigris
         run: |
           S5="s5cmd --endpoint-url $S3_ENDPOINT"
           WORKDIR="/tmp/speed-test"
+          TEST_SRC="$S3_PREFIX/builds/2026-04-05"
+          UPLOAD_DEST="$S3_PREFIX/speed-test"
 
+          echo "## S3 Upload Speed Test (10G WAN)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "## S3 Upload Speed Test" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Method | Parameters | Size (MiB) | Time (s) | Speed (MB/s) |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|--------|-----------|-----------|---------|-------------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Workers | Concurrency | Size (MiB) | Time (s) | Speed (MB/s) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---------|-------------|-----------|---------|-------------|" >> "$GITHUB_STEP_SUMMARY"
 
-          # Download test data once
+          # Download test data once (full variant ~7GB)
           echo "Downloading test data..."
-          mkdir -p "$WORKDIR/upload-src"
-          $S5 cp "s3://$S3_BUCKET/$S3_PREFIX/builds/2026-04-05/full/*" "$WORKDIR/upload-src/" 2>/dev/null
-          SIZE=$(du -sb "$WORKDIR/upload-src" | cut -f1)
+          mkdir -p "$WORKDIR/src"
+          $S5 --numworkers 32 cp --concurrency 8 \
+            "s3://$S3_BUCKET/$TEST_SRC/full/*" "$WORKDIR/src/" 2>/dev/null
+          SIZE=$(du -sb "$WORKDIR/src" | cut -f1)
           SIZE_MIB=$((SIZE / 1024 / 1024))
-          echo "Test data: $SIZE_MIB MiB"
-
+          COUNT=$(find "$WORKDIR/src" -type f | wc -l)
+          echo "Test data: $COUNT files, $SIZE_MIB MiB"
           echo ""
+
           echo "=== s5cmd uploads ==="
-          for W in 16 30 64 128; do
-            for C in 4 8 16; do
+          for W in 8 16 30 64 128; do
+            for C in 2 4 8 16 32; do
               LABEL="s5cmd w=${W} c=${C}"
               START=$(date +%s)
               $S5 --numworkers $W cp --concurrency $C \
-                "$WORKDIR/upload-src/*" "s3://$S3_BUCKET/$S3_PREFIX/speed-test/" 2>/dev/null || true
+                "$WORKDIR/src/*" "s3://$S3_BUCKET/$UPLOAD_DEST/" 2>/dev/null || true
               SEC=$(($(date +%s) - START))
               [ "$SEC" -gt 0 ] && SPEED=$((SIZE_MIB / SEC)) || SPEED=$SIZE_MIB
               echo "$LABEL: $SIZE_MIB MiB in ${SEC}s ($SPEED MB/s)"
-              echo "| $LABEL | w=$W c=$C | $SIZE_MIB | $SEC | $SPEED |" >> "$GITHUB_STEP_SUMMARY"
-              # Clean up
-              $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/speed-test/*" 2>/dev/null || true
+              echo "| $W | $C | $SIZE_MIB | $SEC | $SPEED |" >> "$GITHUB_STEP_SUMMARY"
+              # Clean up uploaded files
+              $S5 rm "s3://$S3_BUCKET/$UPLOAD_DEST/*" 2>/dev/null || true
             done
           done
 
           rm -rf "$WORKDIR"
+          echo ""
+          echo "Reference: download best was s5cmd w=32 c=8 at 417 MB/s"
