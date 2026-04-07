@@ -154,7 +154,7 @@ jobs:
                 echo "[indexes] Downloading $URLS files..."
                 [ "$URLS" -eq 0 ] && { echo "::error::No index files found for $YESTERDAY"; exit 1; }
                 aria2c -x 16 -j 30 --max-tries=3 --auto-file-renaming=false \
-                  -i /tmp/aria2-indexes.txt 2>/dev/null
+                  -i /tmp/aria2-indexes.txt 2>/dev/null || true
 
                 echo "[indexes] Backfilling local cache..."
                 $CACHE cp "$WORKDIR/old-output/*" "$CACHE_BUILD/" 2>/dev/null || true
@@ -213,7 +213,8 @@ jobs:
               "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
               "https://ftpmirror.your.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
               "https://ftp.osuosl.org/pub/openstreetmap/pbf/planet-latest.osm.pbf" \
-              "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/planet-latest.osm.pbf"
+              "https://ftp5.gwdg.de/pub/misc/openstreetmap/planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
+              || true
 
             SERVER="https://planet.openstreetmap.org/replication/day"
             PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" 2>/dev/null | cut -dT -f1)
