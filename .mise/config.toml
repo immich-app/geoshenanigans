@@ -1,6 +1,6 @@
 [tools]
 opentofu = "1.11.5"
-terragrunt = "0.99.5"
+terragrunt = "1.0.0"
 
 [tasks.tg]
 run = "op run '--env-file={{config_root}}/deployment/.env' -- terragrunt"
