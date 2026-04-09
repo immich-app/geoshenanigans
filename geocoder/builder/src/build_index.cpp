@@ -599,6 +599,9 @@ int main(int argc, char* argv[]) {
                     std::vector<std::string> poi_names;
                     std::vector<float> poi_elevations;
                     uint64_t poi_count = 0;
+                    // Place node data
+                    std::vector<PlaceNode> place_nodes;
+                    std::vector<std::string> place_names;
                 };
                 // Use thread_local for streaming callback (no thread index available)
                 static thread_local NodeThreadLocal* tl_node_data = nullptr;
@@ -708,6 +711,27 @@ int main(int argc, char* argv[]) {
                                 tl_node_data->poi_count++;
                             }
                         }
+
+                        // Place nodes (settlements)
+                        if (n_place && n_name) {
+                            PlaceType pt = PlaceType::UNKNOWN;
+                            if (std::strcmp(n_place, "city") == 0) pt = PlaceType::CITY;
+                            else if (std::strcmp(n_place, "town") == 0) pt = PlaceType::TOWN;
+                            else if (std::strcmp(n_place, "village") == 0) pt = PlaceType::VILLAGE;
+                            else if (std::strcmp(n_place, "suburb") == 0) pt = PlaceType::SUBURB;
+                            else if (std::strcmp(n_place, "hamlet") == 0) pt = PlaceType::HAMLET;
+                            else if (std::strcmp(n_place, "neighbourhood") == 0) pt = PlaceType::NEIGHBOURHOOD;
+                            else if (std::strcmp(n_place, "quarter") == 0) pt = PlaceType::QUARTER;
+
+                            if (pt != PlaceType::UNKNOWN) {
+                                PlaceNode pn{};
+                                pn.lat = static_cast<float>(lat);
+                                pn.lng = static_cast<float>(lng);
+                                pn.place_type = static_cast<uint8_t>(pt);
+                                tl_node_data->place_nodes.push_back(pn);
+                                tl_node_data->place_names.push_back(n_name);
+                            }
+                        }
                     }
                 });
 
@@ -737,9 +761,18 @@ int main(int argc, char* argv[]) {
                         local.poi_elevations.begin(), local.poi_elevations.end());
                     total_poi_nodes += local.poi_count;
                 }
+                // Merge place nodes
+                for (auto& local : ntld) {
+                    for (size_t j = 0; j < local.place_nodes.size(); j++) {
+                        auto pn = local.place_nodes[j];
+                        pn.name_id = data.string_pool.intern(local.place_names[j]);
+                        data.place_nodes.push_back(pn);
+                    }
+                }
                 std::cerr << "  Node processing complete: " << total_addrs
                           << " address points, " << total_poi_nodes
-                          << " POI nodes collected." << std::endl;
+                          << " POI nodes, " << data.place_nodes.size()
+                          << " place nodes collected." << std::endl;
             }
             log_phase("Pass 2: node processing", _pt, _cpu);
             pbf.release_pages(); // free PBF mmap pages, will re-fault for way pass
@@ -1536,6 +1569,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "  " << data.admin_polygons.size() << " admin polygon rings" << std::endl;
         std::cerr << "  " << data.poi_records.size() << " POI records ("
                   << data.poi_vertices.size() << " polygon vertices)" << std::endl;
+        std::cerr << "  " << data.place_nodes.size() << " place nodes" << std::endl;
 
         // Drain admin polygon thread pool (may still be processing)
         std::cerr << "Waiting for admin polygon S2 covering to complete..." << std::endl;
@@ -1816,6 +1850,35 @@ int main(int argc, char* argv[]) {
                 log_phase("  S2: POI sort + group", _s2t, _s2cpu);
             }
 
+            // Place node S2 cells
+            if (!data.place_nodes.empty()) {
+                std::cerr << "  Computing S2 cells for " << data.place_nodes.size() << " place nodes..." << std::endl;
+                std::vector<std::vector<CellItem>> place_pairs(num_threads);
+                {
+                    std::atomic<size_t> place_idx{0};
+                    std::vector<std::thread> threads;
+                    for (unsigned int t = 0; t < num_threads; t++) {
+                        threads.emplace_back([&, t]() {
+                            auto& local = place_pairs[t];
+                            while (true) {
+                                size_t i = place_idx.fetch_add(1);
+                                if (i >= data.place_nodes.size()) break;
+                                const auto& pn = data.place_nodes[i];
+                                S2CellId cell = S2CellId(S2LatLng::FromDegrees(pn.lat, pn.lng))
+                                    .parent(kStreetCellLevel);
+                                local.push_back({cell.id(), static_cast<uint32_t>(i)});
+                            }
+                        });
+                    }
+                    for (auto& t : threads) t.join();
+                }
+                std::unordered_map<uint64_t, std::vector<uint32_t>> dummy_map;
+                parallel_sort_and_build(place_pairs, dummy_map, data.sorted_place_cells);
+                std::cerr << "  Place nodes: " << data.place_nodes.size() << " nodes, "
+                          << data.sorted_place_cells.size() << " cell pairs" << std::endl;
+                log_phase("  S2: place nodes", _s2t, _s2cpu);
+            }
+
             std::cerr << "S2 cell computation complete." << std::endl;
         }
 
@@ -1997,6 +2060,7 @@ int main(int argc, char* argv[]) {
                 for (auto& iw : data.interp_ways) iw.street_id = rm.at(iw.street_id);
                 for (auto& ap : data.admin_polygons) ap.name_id = rm.at(ap.name_id);
                 for (auto& pr : data.poi_records) pr.name_id = rm.at(pr.name_id);
+                for (auto& pn : data.place_nodes) pn.name_id = rm.at(pn.name_id);
                 std::cerr << "  String pool sorted: " << strings.size() << " strings" << std::endl;
             }
         }
@@ -2366,6 +2430,34 @@ int main(int argc, char* argv[]) {
             }
         }
         log_phase("  Sort POIs", _st, _sc);
+
+        // 7. Sort place nodes by (place_type, name_id, lat_bits, lng_bits)
+        if (!data.place_nodes.empty()) {
+            size_t n = data.place_nodes.size();
+            std::vector<uint32_t> order(n);
+            std::iota(order.begin(), order.end(), 0);
+            std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+                const auto& pa = data.place_nodes[a];
+                const auto& pb = data.place_nodes[b];
+                if (pa.place_type != pb.place_type) return pa.place_type < pb.place_type;
+                if (pa.name_id != pb.name_id) return pa.name_id < pb.name_id;
+                uint32_t la = float_bits(pa.lat), lb = float_bits(pb.lat);
+                if (la != lb) return la < lb;
+                return float_bits(pa.lng) < float_bits(pb.lng);
+            });
+            std::vector<uint32_t> old_to_new(n);
+            for (uint32_t i = 0; i < n; i++) old_to_new[order[i]] = i;
+            std::vector<PlaceNode> sorted(n);
+            for (uint32_t i = 0; i < n; i++) sorted[i] = data.place_nodes[order[i]];
+            data.place_nodes = std::move(sorted);
+            for (auto& p : data.sorted_place_cells) p.item_id = old_to_new[p.item_id];
+            auto cmp = [](const CellItemPair& a, const CellItemPair& b) {
+                return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
+            };
+            std::sort(data.sorted_place_cells.begin(), data.sorted_place_cells.end(), cmp);
+            std::cerr << "  Place nodes sorted: " << n << std::endl;
+        }
+        log_phase("  Sort place nodes", _st, _sc);
     }
 
     // --- Write index files ---
@@ -2425,6 +2517,25 @@ int main(int argc, char* argv[]) {
             std::string quality_dir = multi_output ? base_dir + "/quality" : base_dir;
             std::cerr << "  Writing quality variants for " << base_dir << "..." << std::endl;
             write_qualities(d, quality_dir);
+        }
+
+        // Write place node files
+        if (!d.place_nodes.empty()) {
+            std::string place_dir = base_dir;
+            ensure_dir(place_dir);
+            {
+                std::ofstream f(place_dir + "/place_nodes.bin", std::ios::binary);
+                f.write(reinterpret_cast<const char*>(d.place_nodes.data()),
+                        d.place_nodes.size() * sizeof(PlaceNode));
+            }
+            // Build cell map from sorted pairs for write_cell_index
+            std::unordered_map<uint64_t, std::vector<uint32_t>> place_cell_map;
+            for (const auto& p : d.sorted_place_cells) {
+                place_cell_map[p.cell_id].push_back(p.item_id);
+            }
+            write_cell_index(place_dir + "/place_cells.bin", place_dir + "/place_entries.bin", place_cell_map);
+            std::cerr << "  Place nodes: " << d.place_nodes.size() << " nodes, "
+                      << place_cell_map.size() << " cells written to " << place_dir << std::endl;
         }
 
         // Write POI tier variants

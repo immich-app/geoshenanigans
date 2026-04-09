@@ -99,6 +99,23 @@ struct CollectedRelation {
     std::vector<std::pair<int64_t, std::string>> members; // (way_id, role)
 };
 
+// --- Place nodes (settlements: city, town, village, suburb, etc.) ---
+
+enum class PlaceType : uint8_t {
+    CITY = 0, TOWN = 1, VILLAGE = 2, SUBURB = 3,
+    HAMLET = 4, NEIGHBOURHOOD = 5, QUARTER = 6,
+    UNKNOWN = 255
+};
+
+struct PlaceNode {
+    float lat;
+    float lng;
+    uint32_t name_id;       // into strings.bin
+    uint8_t place_type;     // PlaceType
+    uint8_t _pad1 = 0;
+    uint16_t _pad2 = 0;
+};  // 16 bytes
+
 // --- POI (Points of Interest) ---
 
 enum class PoiCategory : uint8_t {

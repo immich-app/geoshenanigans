@@ -95,6 +95,17 @@ struct PoiRecord {
 const POI_FLAG_WIKIPEDIA: u8 = 0x01;
 const POI_FLAG_WIKIDATA: u8 = 0x02;
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PlaceNode {
+    lat: f32,
+    lng: f32,
+    name_id: u32,
+    place_type: u8,
+    _pad1: u8,
+    _pad2: u16,
+}
+
 // POI category metadata — loaded from poi_meta.json (written by builder)
 struct PoiMeta {
     categories: std::collections::HashMap<u8, PoiCategoryMeta>,
@@ -225,6 +236,9 @@ struct Index {
     poi_records: Option<Mmap>,
     poi_vertices: Option<Mmap>,
     poi_meta: PoiMeta,
+    place_nodes: Option<Mmap>,
+    place_cells: Option<Mmap>,
+    place_entries: Option<Mmap>,
     admin_config: AdminLevelConfig,
     strings: Mmap,
     street_cell_level: u64,
@@ -286,6 +300,9 @@ impl Index {
             poi_records: mmap_file_optional(&format!("{}/poi_records.bin", dir)),
             poi_vertices: mmap_file_optional(&format!("{}/poi_vertices.bin", dir)),
             poi_meta: PoiMeta::load(dir),
+            place_nodes: mmap_file_optional(&format!("{}/place_nodes.bin", dir)),
+            place_cells: mmap_file_optional(&format!("{}/place_cells.bin", dir)),
+            place_entries: mmap_file_optional(&format!("{}/place_entries.bin", dir)),
             admin_config: AdminLevelConfig::load(),
             strings: mmap_file(&format!("{}/strings.bin", dir))?,
             street_cell_level,
@@ -742,6 +759,98 @@ impl Index {
         result
     }
 
+    // --- Place node lookup (nearest city/town/village/suburb) ---
+
+    fn find_places(&self, lat: f64, lng: f64) -> PlaceResult<'_> {
+        let place_cells = match &self.place_cells {
+            Some(c) => c,
+            None => return PlaceResult::default(),
+        };
+        let place_entries = match &self.place_entries {
+            Some(e) => e,
+            None => return PlaceResult::default(),
+        };
+        let place_nodes_mmap = match &self.place_nodes {
+            Some(n) => n,
+            None => return PlaceResult::default(),
+        };
+
+        let all_places: &[PlaceNode] = unsafe {
+            std::slice::from_raw_parts(
+                place_nodes_mmap.as_ptr() as *const PlaceNode,
+                place_nodes_mmap.len() / std::mem::size_of::<PlaceNode>(),
+            )
+        };
+
+        // Use street-level cells for fine-grained lookup
+        let cell = cell_id_at_level(lat, lng, self.street_cell_level);
+        let neighbors = cell_neighbors_at_level(cell, self.street_cell_level);
+
+        // For each place type, find the nearest node
+        // 0=city, 1=town, 2=village, 3=suburb, 4=hamlet, 5=neighbourhood, 6=quarter
+        let mut best: [Option<(f64, &PlaceNode)>; 7] = [None; 7];
+        let cos_lat = lat.to_radians().cos();
+
+        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+            // Place nodes use geo_cells format (same 12-byte cell index as admin)
+            Self::for_each_entry(place_entries, Self::lookup_admin_cell(place_cells, c), |id| {
+                let place_id = id as usize;
+                if place_id >= all_places.len() { return; }
+                let pn = &all_places[place_id];
+                let pt = pn.place_type as usize;
+                if pt >= 7 { return; }
+
+                let dlat = (lat - pn.lat as f64).to_radians();
+                let dlng = (lng - pn.lng as f64).to_radians();
+                let dist_sq = dlat * dlat + dlng * dlng * cos_lat * cos_lat;
+
+                if let Some((best_dist, _)) = best[pt] {
+                    if dist_sq >= best_dist { return; }
+                }
+                best[pt] = Some((dist_sq, pn));
+            });
+        }
+
+        // Convert to result — find best city-like place (city > town > village)
+        let mut result = PlaceResult::default();
+
+        // Max distance thresholds (squared radians) for each place type
+        let max_city = (50000.0_f64 / 111320.0).powi(2);    // 50km for cities
+        let max_town = (15000.0_f64 / 111320.0).powi(2);    // 15km for towns
+        let max_village = (5000.0_f64 / 111320.0).powi(2);   // 5km for villages
+        let max_suburb = (3000.0_f64 / 111320.0).powi(2);    // 3km for suburbs
+        let max_neighbourhood = (1500.0_f64 / 111320.0).powi(2); // 1.5km
+
+        // City: prefer city > town > village
+        for (pt, max_dist) in [(0, max_city), (1, max_town), (2, max_village)] {
+            if let Some((dist_sq, pn)) = best[pt] {
+                if dist_sq <= max_dist {
+                    result.city = Some(self.get_string(pn.name_id));
+                    break;
+                }
+            }
+        }
+
+        // Suburb: prefer suburb > quarter > hamlet
+        for (pt, max_dist) in [(3, max_suburb), (6, max_suburb), (4, max_suburb)] {
+            if let Some((dist_sq, pn)) = best[pt] {
+                if dist_sq <= max_dist {
+                    result.suburb = Some(self.get_string(pn.name_id));
+                    break;
+                }
+            }
+        }
+
+        // Neighbourhood
+        if let Some((dist_sq, pn)) = best[5] {
+            if dist_sq <= max_neighbourhood {
+                result.neighbourhood = Some(self.get_string(pn.name_id));
+            }
+        }
+
+        result
+    }
+
     // --- POI lookup ---
 
     fn find_pois(&self, lat: f64, lng: f64) -> Vec<PoiMatch<'_>> {
@@ -873,6 +982,7 @@ impl Index {
         let max_dist = self.max_distance_sq;
 
         let admin = self.find_admin(lat, lng);
+        let place = self.find_places(lat, lng);
         let (addr, interp, street) = self.query_geo(lat, lng);
 
         // Determine house_number and road from best geo match (priority: address > interpolation > street)
@@ -912,14 +1022,15 @@ impl Index {
             distance_m: (p.distance_m * 10.0).round() / 10.0,
         }).collect();
 
+        // Merge admin + place results (admin authoritative, place as fallback)
         let address = AddressDetails {
             house_number,
             road,
-            city: admin.city,
+            city: admin.city.or(place.city),
             state: admin.state,
             county: admin.county,
-            suburb: admin.suburb,
-            neighbourhood: admin.neighbourhood,
+            suburb: admin.suburb.or(place.suburb),
+            neighbourhood: admin.neighbourhood.or(place.neighbourhood),
             postcode: admin.postcode,
             country: admin.country,
             country_code: admin.country_code.map(|c| String::from_utf8_lossy(&c).into_owned()),
@@ -996,6 +1107,13 @@ struct PoiMatch<'a> {
     distance_m: f64,
     contained: bool,
     score: f64,
+}
+
+#[derive(Default)]
+struct PlaceResult<'a> {
+    city: Option<&'a str>,
+    suburb: Option<&'a str>,
+    neighbourhood: Option<&'a str>,
 }
 
 #[derive(Default)]
@@ -1200,6 +1318,12 @@ async fn main() {
     eprintln!("Loading index from {}...", data_dir);
     let index = match Index::load(data_dir, street_cell_level, admin_cell_level, search_distance) {
         Ok(idx) => {
+            let place_status = if idx.place_nodes.is_some() {
+                let count = idx.place_nodes.as_ref().unwrap().len() / std::mem::size_of::<PlaceNode>();
+                format!(" + {} place nodes", count)
+            } else {
+                String::new()
+            };
             let poi_status = if idx.poi_records.is_some() {
                 let count = idx.poi_records.as_ref().unwrap().len() / std::mem::size_of::<PoiRecord>();
                 format!(" + {} POIs ({} categories)", count, idx.poi_meta.categories.len())
@@ -1208,7 +1332,7 @@ async fn main() {
             };
             if idx.geo_cells.is_some() {
                 if idx.addr_points.is_some() {
-                    eprintln!("Loaded full index (admin + geo + addresses{})", poi_status);
+                    eprintln!("Loaded full index (admin + geo + addresses{}{})", place_status, poi_status);
                 } else {
                     eprintln!("Loaded streets index (admin + geo, no addresses{})", poi_status);
                 }

@@ -122,6 +122,10 @@ struct ParsedData {
     };
     std::unordered_map<int64_t, WayGeometry> way_geometries;
 
+    // Place nodes (settlements)
+    std::vector<PlaceNode> place_nodes;
+    std::vector<CellItemPair> sorted_place_cells;
+
     // POI data
     std::vector<PoiRecord> poi_records;
     std::vector<NodeCoord> poi_vertices;
