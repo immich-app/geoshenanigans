@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reverse Geocoder Test Portal</title>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5/dist/maplibre-gl.css" />
+<script src="https://unpkg.com/maplibre-gl@5/dist/maplibre-gl.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/exifr@7/dist/full.umd.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #1a1a2e;
+    --surface: #222240;
+    --surface2: #2a2a4a;
+    --border: #3a3a5c;
+    --text: #e0e0e8;
+    --text-dim: #8888a0;
+    --accent: #6c8cff;
+    --green: #4caf80;
+    --blue: #4a90d9;
+    --red: #d94a4a;
+    --orange: #d9944a;
+  }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  .layout {
+    display: flex;
+    height: 100vh;
+  }
+
+  .map-panel {
+    flex: 0 0 60%;
+    position: relative;
+  }
+
+  .side-panel {
+    flex: 0 0 40%;
+    display: flex;
+    flex-direction: column;
+    border-left: 1px solid var(--border);
+    overflow: hidden;
+  }
+
+  #map { height: 100%; width: 100%; }
+
+  /* MapLibre dark overrides */
+  .maplibregl-ctrl-attrib {
+    background: rgba(26, 26, 46, 0.8) !important;
+    color: var(--text-dim) !important;
+  }
+  .maplibregl-ctrl-attrib a { color: var(--accent) !important; }
+
+  section {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  section h3 {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    margin-bottom: 8px;
+  }
+
+  .coord-row {
+    display: flex;
+    gap: 8px;
+  }
+
+  .coord-row textarea {
+    flex: 1;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    padding: 8px;
+    font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+    font-size: 13px;
+    resize: vertical;
+    min-height: 36px;
+    height: 36px;
+  }
+
+  .coord-row textarea:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+
+  button {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    padding: 8px 16px;
+    font-size: 13px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  button:hover { filter: brightness(1.1); }
+  button:disabled { opacity: 0.5; cursor: default; }
+
+  .drop-zone {
+    border: 2px dashed var(--border);
+    border-radius: 6px;
+    padding: 20px;
+    text-align: center;
+    color: var(--text-dim);
+    font-size: 13px;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .drop-zone.dragover {
+    border-color: var(--accent);
+    background: rgba(108, 140, 255, 0.05);
+  }
+  .drop-zone input { display: none; }
+
+  .photo-list {
+    margin-top: 8px;
+    max-height: 100px;
+    overflow-y: auto;
+    font-size: 12px;
+  }
+  .photo-item {
+    display: flex;
+    justify-content: space-between;
+    padding: 3px 0;
+    color: var(--text-dim);
+  }
+  .photo-item .coords { font-family: monospace; color: var(--text); }
+  .photo-item .no-gps { color: var(--red); }
+
+  .results-section {
+    flex: 1;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .results-section h3 {
+    padding: 12px 16px 8px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+  }
+
+  .results-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 0 8px 8px;
+  }
+
+  .result-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-bottom: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    transition: border-color 0.15s;
+  }
+  .result-card:hover { border-color: var(--accent); }
+  .result-card.selected { border-color: var(--accent); background: var(--surface2); }
+  .result-card.loading { opacity: 0.6; }
+  .result-card.error { border-color: var(--red); }
+
+  .result-coords {
+    font-family: monospace;
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-bottom: 4px;
+  }
+
+  .result-name { font-weight: 500; }
+
+  .result-places {
+    margin-top: 4px;
+    font-size: 12px;
+    color: var(--green);
+  }
+
+  .result-error {
+    color: var(--red);
+    font-size: 12px;
+    margin-top: 2px;
+  }
+
+  .result-source {
+    font-size: 10px;
+    color: var(--text-dim);
+    margin-top: 2px;
+  }
+
+  .detail-panel {
+    border-top: 1px solid var(--border);
+    max-height: 40%;
+    overflow-y: auto;
+    padding: 12px 16px;
+    display: none;
+  }
+  .detail-panel.visible { display: block; }
+
+  .detail-panel h3 {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    margin-bottom: 8px;
+  }
+
+  .detail-address {
+    margin-bottom: 10px;
+  }
+  .detail-address .field {
+    display: flex;
+    gap: 8px;
+    font-size: 12px;
+    padding: 2px 0;
+  }
+  .detail-address .label {
+    color: var(--text-dim);
+    min-width: 90px;
+  }
+
+  .detail-places {
+    margin-bottom: 10px;
+  }
+  .detail-places table {
+    width: 100%;
+    font-size: 12px;
+    border-collapse: collapse;
+  }
+  .detail-places th {
+    text-align: left;
+    color: var(--text-dim);
+    font-weight: 500;
+    padding: 3px 8px 3px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .detail-places td {
+    padding: 3px 8px 3px 0;
+  }
+
+  .json-block {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 10px;
+    font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+
+  .json-key { color: #8cb4ff; }
+  .json-string { color: #a8d8a8; }
+  .json-number { color: #d9a44a; }
+  .json-bool { color: #d98a8a; }
+  .json-null { color: var(--text-dim); }
+
+  .loading-spinner {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.6s linear infinite;
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  @media (max-width: 800px) {
+    .layout { flex-direction: column; }
+    .map-panel { flex: 0 0 45vh; }
+    .side-panel { flex: 1; border-left: none; border-top: 1px solid var(--border); }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+  <div class="map-panel">
+    <div id="map"></div>
+  </div>
+  <div class="side-panel">
+    <section>
+      <h3>Coordinates</h3>
+      <div class="coord-row">
+        <textarea id="coordInput" placeholder="lat, lng (one per line for batch)" rows="1"></textarea>
+        <button id="lookupBtn" onclick="lookupCoords()">Lookup</button>
+      </div>
+    </section>
+
+    <section>
+      <h3>Photo Upload</h3>
+      <div class="drop-zone" id="dropZone">
+        <div>Drop images here or click to browse</div>
+        <div style="font-size:11px; margin-top:4px; color:var(--text-dim)">JPG, HEIC, PNG, TIFF</div>
+        <input type="file" id="fileInput" accept="image/jpeg,image/heic,image/png,image/tiff,.heic,.heif" multiple />
+      </div>
+      <div class="photo-list" id="photoList"></div>
+    </section>
+
+    <div class="results-section">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+        <h3>Results <span id="resultCount"></span></h3>
+        <button onclick="clearResults()" style="padding:4px 12px;font-size:12px;background:var(--red);color:#fff;border:none;border-radius:4px;cursor:pointer;">Clear</button>
+      </div>
+      <div class="results-list" id="resultsList"></div>
+    </div>
+
+    <div class="detail-panel" id="detailPanel">
+      <h3>Detail</h3>
+      <div id="detailContent"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+// -- Map setup --
+const map = new maplibregl.Map({
+  container: 'map',
+  style: 'https://tiles.immich.cloud/v1/style/dark.json',
+  center: [0, 40],
+  zoom: 3
+});
+
+const markers = new Map(); // id -> {marker, popup}
+const results = [];        // {id, lat, lng, data, error, loading, source}
+let selectedId = null;
+
+// -- LocalStorage persistence --
+const STORAGE_KEY = 'geocoder_test_results';
+
+function saveResults() {
+  const serializable = results.filter(r => !r.loading).map(r => ({
+    id: r.id, lat: r.lat, lng: r.lng, data: r.data, error: r.error, source: r.source
+  }));
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(serializable)); } catch(e) {}
+}
+
+function loadResults() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+    for (const r of stored) {
+      r.loading = false;
+      results.push(r);
+      const hasPlaces = r.data && r.data.places && r.data.places.length > 0;
+      const color = r.error ? MARKER_COLORS.red : (hasPlaces ? MARKER_COLORS.green : MARKER_COLORS.blue);
+      const marker = new maplibregl.Marker({ color })
+        .setLngLat([r.lng, r.lat])
+        .addTo(map);
+      if (r.data) {
+        const label = r.data.display_name || `${r.lat.toFixed(4)}, ${r.lng.toFixed(4)}`;
+        marker.setPopup(new maplibregl.Popup({ offset: 25 }).setHTML(
+          `<b>${label}</b>${hasPlaces ? '<br>' + r.data.places.length + ' place(s)' : ''}`
+        ));
+      }
+      marker.getElement().addEventListener('click', (e) => {
+        e.stopPropagation();
+        selectResult(r.id);
+      });
+      markers.set(r.id, { marker, popup: null });
+    }
+    renderResults();
+  } catch(e) {}
+}
+
+function clearResults() {
+  results.length = 0;
+  selectedId = null;
+  markers.forEach(m => m.marker.remove());
+  markers.clear();
+  localStorage.removeItem(STORAGE_KEY);
+  renderResults();
+  document.getElementById('detailPanel').classList.remove('visible');
+}
+
+// Marker color map
+const MARKER_COLORS = {
+  gray: '#888888',
+  green: '#4caf80',
+  blue: '#4a90d9',
+  red: '#d94a4a'
+};
+
+// -- Click map to geocode --
+map.on('click', function(e) {
+  reverseGeocode(e.lngLat.lat, e.lngLat.lng, 'map click');
+});
+map.on('load', function() { loadResults(); });
+
+// -- Coordinate lookup --
+function lookupCoords() {
+  const text = document.getElementById('coordInput').value.trim();
+  if (!text) return;
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  for (const line of lines) {
+    const parts = line.split(/[\s,]+/).map(Number);
+    if (parts.length >= 2 && isFinite(parts[0]) && isFinite(parts[1])) {
+      reverseGeocode(parts[0], parts[1], 'manual');
+    }
+  }
+  document.getElementById('coordInput').value = '';
+}
+
+document.getElementById('coordInput').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    lookupCoords();
+  }
+});
+
+// -- Photo upload --
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+
+dropZone.addEventListener('click', () => fileInput.click());
+dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+dropZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropZone.classList.remove('dragover');
+  handleFiles(e.dataTransfer.files);
+});
+fileInput.addEventListener('change', () => handleFiles(fileInput.files));
+
+async function handleFiles(files) {
+  const photoList = document.getElementById('photoList');
+  for (const file of files) {
+    const item = document.createElement('div');
+    item.className = 'photo-item';
+    item.innerHTML = `<span>${file.name}</span><span>extracting...</span>`;
+    photoList.appendChild(item);
+
+    try {
+      const exif = await exifr.gps(file);
+      if (exif && isFinite(exif.latitude) && isFinite(exif.longitude)) {
+        item.innerHTML = `<span>${file.name}</span><span class="coords">${exif.latitude.toFixed(5)}, ${exif.longitude.toFixed(5)}</span>`;
+        reverseGeocode(exif.latitude, exif.longitude, file.name);
+      } else {
+        item.innerHTML = `<span>${file.name}</span><span class="no-gps">No GPS data</span>`;
+      }
+    } catch (err) {
+      item.innerHTML = `<span>${file.name}</span><span class="no-gps">EXIF error</span>`;
+    }
+  }
+  photoList.scrollTop = photoList.scrollHeight;
+}
+
+// -- Reverse geocode with throttling --
+let activeRequests = 0;
+const queue = [];
+
+function reverseGeocode(lat, lng, source) {
+  const id = Date.now() + Math.random();
+  const entry = { id, lat, lng, data: null, error: null, loading: true, source };
+  results.unshift(entry);
+
+  // Add a gray marker immediately
+  const marker = new maplibregl.Marker({ color: MARKER_COLORS.gray })
+    .setLngLat([lng, lat])
+    .addTo(map);
+  marker.getElement().addEventListener('click', (e) => {
+    e.stopPropagation();
+    selectResult(id);
+  });
+  markers.set(id, { marker, popup: null });
+
+  renderResults();
+
+  const doFetch = () => {
+    activeRequests++;
+    fetch(`/reverse?lat=${lat}&lon=${lng}&key=test`)
+      .then(r => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then(data => {
+        entry.data = data;
+        entry.loading = false;
+        const hasPlaces = data.places && data.places.length > 0;
+        // Replace marker with new color (MapLibre markers don't support color change)
+        const m = markers.get(id);
+        m.marker.remove();
+        const newMarker = new maplibregl.Marker({ color: hasPlaces ? MARKER_COLORS.green : MARKER_COLORS.blue })
+          .setLngLat([lng, lat])
+          .addTo(map);
+        const label = data.display_name || `${lat.toFixed(4)}, ${lng.toFixed(4)}`;
+        const popup = new maplibregl.Popup({ offset: 25 })
+          .setHTML(`<b>${label}</b>${hasPlaces ? '<br>' + data.places.length + ' place(s)' : ''}`);
+        newMarker.setPopup(popup);
+        newMarker.getElement().addEventListener('click', (e) => {
+          e.stopPropagation();
+          selectResult(id);
+        });
+        m.marker = newMarker;
+        m.popup = popup;
+      })
+      .catch(err => {
+        entry.error = err.message;
+        entry.loading = false;
+        const m = markers.get(id);
+        m.marker.remove();
+        const newMarker = new maplibregl.Marker({ color: MARKER_COLORS.red })
+          .setLngLat([lng, lat])
+          .addTo(map);
+        newMarker.getElement().addEventListener('click', (e) => {
+          e.stopPropagation();
+          selectResult(id);
+        });
+        m.marker = newMarker;
+      })
+      .finally(() => {
+        activeRequests--;
+        renderResults();
+        saveResults();
+        if (selectedId === id) showDetail(id);
+        if (queue.length > 0) queue.shift()();
+      });
+  };
+
+  if (activeRequests < 5) {
+    doFetch();
+  } else {
+    queue.push(doFetch);
+  }
+}
+
+// -- Render results list --
+function renderResults() {
+  const list = document.getElementById('resultsList');
+  const countEl = document.getElementById('resultCount');
+  countEl.textContent = `(${results.length})`;
+
+  list.innerHTML = '';
+  for (const r of results) {
+    const card = document.createElement('div');
+    card.className = 'result-card' +
+      (r.loading ? ' loading' : '') +
+      (r.error ? ' error' : '') +
+      (r.id === selectedId ? ' selected' : '');
+
+    let inner = `<div class="result-coords">${r.lat.toFixed(5)}, ${r.lng.toFixed(5)}</div>`;
+
+    if (r.loading) {
+      inner += `<div class="result-name"><span class="loading-spinner"></span>Loading...</div>`;
+    } else if (r.error) {
+      inner += `<div class="result-error">${r.error}</div>`;
+    } else {
+      const name = r.data.display_name || 'Unknown location';
+      inner += `<div class="result-name">${escHtml(name)}</div>`;
+      if (r.data.places && r.data.places.length > 0) {
+        const names = r.data.places.slice(0, 3).map(p => p.name).join(', ');
+        const extra = r.data.places.length > 3 ? ` +${r.data.places.length - 3} more` : '';
+        inner += `<div class="result-places">${escHtml(names)}${extra}</div>`;
+      }
+    }
+    if (r.source) {
+      inner += `<div class="result-source">${escHtml(r.source)}</div>`;
+    }
+
+    card.innerHTML = inner;
+    card.addEventListener('click', () => {
+      selectResult(r.id);
+      map.flyTo({ center: [r.lng, r.lat], zoom: Math.max(map.getZoom(), 13) });
+    });
+    list.appendChild(card);
+  }
+}
+
+function selectResult(id) {
+  selectedId = id;
+  renderResults();
+  showDetail(id);
+}
+
+// -- Detail panel --
+function showDetail(id) {
+  const panel = document.getElementById('detailPanel');
+  const content = document.getElementById('detailContent');
+  const r = results.find(x => x.id === id);
+  if (!r || r.loading) { panel.classList.remove('visible'); return; }
+
+  panel.classList.add('visible');
+
+  if (r.error) {
+    content.innerHTML = `<div style="color:var(--red)">Error: ${escHtml(r.error)}</div>`;
+    return;
+  }
+
+  const d = r.data;
+  let html = '';
+
+  // Address breakdown
+  if (d.address) {
+    html += '<div class="detail-address"><h3 style="margin-bottom:6px">Address</h3>';
+    const fields = ['house_number', 'road', 'city', 'county', 'state', 'postcode', 'country', 'country_code'];
+    for (const f of fields) {
+      if (d.address[f]) {
+        html += `<div class="field"><span class="label">${f}</span><span>${escHtml(d.address[f])}</span></div>`;
+      }
+    }
+    html += '</div>';
+  }
+
+  // Places
+  if (d.places && d.places.length > 0) {
+    html += '<div class="detail-places"><h3 style="margin-bottom:6px">Places</h3><table><tr><th>Name</th><th>Category</th><th>Distance</th></tr>';
+    for (const p of d.places) {
+      html += `<tr><td>${escHtml(p.name)}</td><td>${escHtml(p.category)}</td><td>${p.distance_m}m</td></tr>`;
+    }
+    html += '</table></div>';
+  }
+
+  // Raw JSON
+  html += '<h3 style="margin: 10px 0 6px">Response</h3>';
+  html += `<div class="json-block">${syntaxHighlight(d)}</div>`;
+
+  content.innerHTML = html;
+}
+
+// -- Helpers --
+function escHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function syntaxHighlight(obj) {
+  const json = JSON.stringify(obj, null, 2);
+  return json.replace(/("(\\u[\da-fA-F]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g,
+    function(match) {
+      let cls = 'json-number';
+      if (/^"/.test(match)) {
+        cls = /:$/.test(match) ? 'json-key' : 'json-string';
+      } else if (/true|false/.test(match)) {
+        cls = 'json-bool';
+      } else if (/null/.test(match)) {
+        cls = 'json-null';
+      }
+      return `<span class="${cls}">${match}</span>`;
+    }
+  );
+}
+</script>
+</body>
+</html>

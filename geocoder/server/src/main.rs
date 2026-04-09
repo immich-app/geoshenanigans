@@ -981,6 +981,13 @@ async fn reverse_geocode(
     ([(axum::http::header::CONTENT_TYPE, "application/json")], json).into_response()
 }
 
+async fn test_portal() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("../../test-portal/index.html"),
+    )
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -1027,6 +1034,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/reverse", get(reverse_geocode))
+        .route("/test", get(test_portal))
         .merge(auth::router())
         .layer(axum::Extension(index))
         .layer(axum::Extension(limiter))

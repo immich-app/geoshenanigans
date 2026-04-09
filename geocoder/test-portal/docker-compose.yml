@@ -1,0 +1,12 @@
+services:
+  geocoder:
+    build:
+      context: ..
+      dockerfile: test-portal/Dockerfile
+    ports:
+      - "3000:3000"
+    volumes:
+      - geocoder-data:/data
+
+volumes:
+  geocoder-data:
