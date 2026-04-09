@@ -524,31 +524,33 @@ impl Index {
             )
         };
 
-        // For each admin level, find the smallest-area polygon containing the point
-        let mut best_by_level: [Option<(f32, &AdminPolygon)>; 12] = [None; 12];
-
+        // For each admin level, find the smallest-area polygon containing the point.
+        // Always run point-in-polygon test — interior flags are unreliable at borders
+        // (e.g., NJ interior flag set for cells overlapping Manhattan).
         const INTERIOR_FLAG: u32 = 0x80000000;
         const ID_MASK: u32 = 0x7FFFFFFF;
 
+        let mut best_by_level: [Option<(f32, &AdminPolygon)>; 12] = [None; 12];
+
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
             Self::for_each_entry(&self.admin_entries, Self::lookup_admin_cell(&self.admin_cells, c), |id| {
-                let is_interior = (id & INTERIOR_FLAG) != 0;
                 let poly_id = (id & ID_MASK) as usize;
+                if poly_id >= all_polygons.len() { return; }
                 let poly = &all_polygons[poly_id];
                 let level = poly.admin_level as usize;
                 if level >= 12 { return; }
+                if poly.area <= 0.0 { return; }
 
                 // Skip if we already have a smaller polygon at this level
                 if let Some((best_area, _)) = best_by_level[level] {
                     if poly.area >= best_area { return; }
                 }
 
-                // Interior cells skip point-in-polygon test
-                if is_interior || point_in_polygon(lat as f32, lng as f32, {
-                    let offset = poly.vertex_offset as usize;
-                    let count = poly.vertex_count as usize;
-                    &all_vertices[offset..offset + count]
-                }) {
+                let offset = poly.vertex_offset as usize;
+                let count = poly.vertex_count as usize;
+                if offset + count > all_vertices.len() { return; }
+
+                if point_in_polygon(lat as f32, lng as f32, &all_vertices[offset..offset + count]) {
                     best_by_level[level] = Some((poly.area, poly));
                 }
             });
