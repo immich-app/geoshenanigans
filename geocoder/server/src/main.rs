@@ -524,40 +524,87 @@ impl Index {
             )
         };
 
-        // For each admin level, find the smallest-area polygon containing the point
-        let mut best_by_level: [Option<(f32, &AdminPolygon)>; 12] = [None; 12];
-
+        // For each admin level, find the smallest-area polygon actually containing
+        // the point. Interior flags are used as a fast path for uncontested cells,
+        // but PIP is always run when a polygon would win the smallest-area contest
+        // (interior flags can be wrong at polygon borders, e.g. NJ/NY).
         const INTERIOR_FLAG: u32 = 0x80000000;
         const ID_MASK: u32 = 0x7FFFFFFF;
+
+        let mut best_by_level: [Option<(f32, &AdminPolygon, bool)>; 12] = [None; 12]; // (area, poly, pip_verified)
 
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
             Self::for_each_entry(&self.admin_entries, Self::lookup_admin_cell(&self.admin_cells, c), |id| {
                 let is_interior = (id & INTERIOR_FLAG) != 0;
                 let poly_id = (id & ID_MASK) as usize;
+                if poly_id >= all_polygons.len() { return; }
                 let poly = &all_polygons[poly_id];
                 let level = poly.admin_level as usize;
                 if level >= 12 { return; }
+                if poly.area <= 0.0 { return; }
 
-                // Skip if we already have a smaller polygon at this level
-                if let Some((best_area, _)) = best_by_level[level] {
-                    if poly.area >= best_area { return; }
-                }
+                let offset = poly.vertex_offset as usize;
+                let count = poly.vertex_count as usize;
+                if offset + count > all_vertices.len() { return; }
+                let verts = &all_vertices[offset..offset + count];
 
-                // Interior cells skip point-in-polygon test
-                if is_interior || point_in_polygon(lat as f32, lng as f32, {
-                    let offset = poly.vertex_offset as usize;
-                    let count = poly.vertex_count as usize;
-                    &all_vertices[offset..offset + count]
-                }) {
-                    best_by_level[level] = Some((poly.area, poly));
+                if let Some((best_area, _, best_verified)) = best_by_level[level] {
+                    if poly.area >= best_area {
+                        // Larger than current best — skip unless current best is unverified
+                        // and this one can be verified
+                        if !best_verified {
+                            // Current best only passed via interior flag — verify it now
+                            let (_, best_poly, _) = best_by_level[level].unwrap();
+                            let boff = best_poly.vertex_offset as usize;
+                            let bcnt = best_poly.vertex_count as usize;
+                            if point_in_polygon(lat as f32, lng as f32, &all_vertices[boff..boff + bcnt]) {
+                                best_by_level[level] = Some((best_area, best_poly, true));
+                            } else {
+                                // Best was wrong — try this polygon instead
+                                let pip = point_in_polygon(lat as f32, lng as f32, verts);
+                                if is_interior || pip {
+                                    best_by_level[level] = Some((poly.area, poly, pip));
+                                } else {
+                                    best_by_level[level] = None;
+                                }
+                            }
+                        }
+                        return;
+                    }
+                    // This polygon is smaller — must verify with PIP
+                    let pip = point_in_polygon(lat as f32, lng as f32, verts);
+                    if pip {
+                        best_by_level[level] = Some((poly.area, poly, true));
+                    }
+                    // If PIP fails, keep existing best
+                } else {
+                    // No existing candidate — accept with interior flag, verify later if contested
+                    if is_interior {
+                        best_by_level[level] = Some((poly.area, poly, false));
+                    } else if point_in_polygon(lat as f32, lng as f32, verts) {
+                        best_by_level[level] = Some((poly.area, poly, true));
+                    }
                 }
             });
+        }
+
+        // Verify any uncontested winners that only passed via interior flag
+        for level in 0..12 {
+            if let Some((area, poly, false)) = best_by_level[level] {
+                let offset = poly.vertex_offset as usize;
+                let count = poly.vertex_count as usize;
+                if point_in_polygon(lat as f32, lng as f32, &all_vertices[offset..offset + count]) {
+                    best_by_level[level] = Some((area, poly, true));
+                } else {
+                    best_by_level[level] = None;
+                }
+            }
         }
 
         let mut result = AdminResult::default();
 
         for level in 0..12 {
-            if let Some((_, poly)) = best_by_level[level] {
+            if let Some((_, poly, _)) = best_by_level[level] {
                 let name = self.get_string(poly.name_id);
                 match poly.admin_level {
                     2 => {
