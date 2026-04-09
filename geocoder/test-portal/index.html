@@ -346,7 +346,7 @@ const STORAGE_KEY = 'geocoder_test_results';
 
 function saveResults() {
   const serializable = results.filter(r => !r.loading).map(r => ({
-    id: r.id, lat: r.lat, lng: r.lng, data: r.data, error: r.error, source: r.source
+    id: r.id, lat: r.lat, lng: r.lng, data: r.data, nominatim: r.nominatim || null, error: r.error, source: r.source
   }));
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(serializable)); } catch(e) {}
 }
@@ -486,16 +486,19 @@ function reverseGeocode(lat, lng, source) {
 
   const doFetch = () => {
     activeRequests++;
-    fetch(`/reverse?lat=${lat}&lon=${lng}&key=test`)
-      .then(r => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        return r.json();
-      })
-      .then(data => {
+
+    // Fetch from our API + Nominatim in parallel
+    const ourFetch = fetch(`/reverse?lat=${lat}&lon=${lng}&key=test`)
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
+    const nomFetch = fetch(`https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=jsonv2`, {headers: {'User-Agent': 'geoshenanigans-test'}})
+      .then(r => r.ok ? r.json() : null).catch(() => null);
+
+    Promise.all([ourFetch, nomFetch])
+      .then(([data, nom]) => {
         entry.data = data;
+        entry.nominatim = nom;
         entry.loading = false;
         const hasPlaces = data.places && data.places.length > 0;
-        // Replace marker with new color (MapLibre markers don't support color change)
         const m = markers.get(id);
         m.marker.remove();
         const newMarker = new maplibregl.Marker({ color: hasPlaces ? MARKER_COLORS.green : MARKER_COLORS.blue })
@@ -605,32 +608,59 @@ function showDetail(id) {
   }
 
   const d = r.data;
+  const nom = r.nominatim;
   let html = '';
 
-  // Address breakdown
-  if (d.address) {
-    html += '<div class="detail-address"><h3 style="margin-bottom:6px">Address</h3>';
-    const fields = ['house_number', 'road', 'city', 'county', 'state', 'postcode', 'country', 'country_code'];
-    for (const f of fields) {
-      if (d.address[f]) {
-        html += `<div class="field"><span class="label">${f}</span><span>${escHtml(d.address[f])}</span></div>`;
-      }
-    }
-    html += '</div>';
+  // Display names
+  html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:12px">';
+  html += `<div><div style="font-size:11px;text-transform:uppercase;color:var(--accent);margin-bottom:4px">Ours</div><div style="font-size:13px;color:var(--text-dim)">${d.display_name ? escHtml(d.display_name) : '—'}</div></div>`;
+  html += `<div><div style="font-size:11px;text-transform:uppercase;color:var(--green);margin-bottom:4px">Nominatim</div><div style="font-size:13px;color:var(--text-dim)">${nom && nom.display_name ? escHtml(nom.display_name) : '—'}</div></div>`;
+  html += '</div>';
+
+  // Aligned field comparison table
+  const allFields = ['house_number', 'road', 'neighbourhood', 'suburb', 'city', 'county', 'state', 'postcode', 'country', 'country_code'];
+  const ourAddr = d.address || {};
+  const nomAddr = (nom && nom.address) || {};
+
+  html += '<table style="width:100%;border-collapse:collapse;font-size:13px">';
+  html += '<tr style="border-bottom:1px solid var(--border)"><th style="text-align:left;padding:4px 8px;color:var(--text-dim);width:140px">Field</th><th style="text-align:left;padding:4px 8px;color:var(--accent)">Ours</th><th style="text-align:left;padding:4px 8px;color:var(--green)">Nominatim</th></tr>';
+  for (const f of allFields) {
+    const ours = ourAddr[f] || '';
+    const theirs = nomAddr[f] || '';
+    if (!ours && !theirs) continue;
+    const match = ours && theirs && ours === theirs;
+    const mismatch = ours && theirs && ours !== theirs;
+    const weMiss = !ours && theirs;
+    const theyMiss = ours && !theirs;
+    const ourStyle = mismatch ? 'color:var(--red)' : (theyMiss ? '' : '');
+    const nomStyle = mismatch ? 'color:var(--red)' : (weMiss ? 'color:var(--orange)' : '');
+    const rowBg = (mismatch || weMiss) ? 'background:rgba(217,74,74,0.08)' : '';
+    html += `<tr style="border-bottom:1px solid var(--border);${rowBg}">`;
+    html += `<td style="padding:4px 8px;color:var(--text-dim)">${f}</td>`;
+    html += `<td style="padding:4px 8px;${ourStyle}">${ours ? escHtml(ours) : '<span style="color:var(--orange)">—</span>'}</td>`;
+    html += `<td style="padding:4px 8px;${nomStyle}">${theirs ? escHtml(theirs) : '<span style="color:var(--text-dim)">—</span>'}</td>`;
+    html += '</tr>';
   }
+  html += '</table>';
 
   // Places
   if (d.places && d.places.length > 0) {
-    html += '<div class="detail-places"><h3 style="margin-bottom:6px">Places</h3><table><tr><th>Name</th><th>Category</th><th>Distance</th></tr>';
+    html += '<div class="detail-places"><h3 style="margin:10px 0 6px">Places</h3><table><tr><th>Name</th><th>Category</th><th>Distance</th></tr>';
     for (const p of d.places) {
       html += `<tr><td>${escHtml(p.name)}</td><td>${escHtml(p.category)}</td><td>${p.distance_m}m</td></tr>`;
     }
     html += '</table></div>';
   }
 
-  // Raw JSON
-  html += '<h3 style="margin: 10px 0 6px">Response</h3>';
+  // Raw JSON (both, collapsible)
+  html += '<details style="margin-top:10px"><summary style="cursor:pointer;color:var(--accent)">Our response JSON</summary>';
   html += `<div class="json-block">${syntaxHighlight(d)}</div>`;
+  html += '</details>';
+  if (nom) {
+    html += '<details style="margin-top:6px"><summary style="cursor:pointer;color:var(--green)">Nominatim response JSON</summary>';
+    html += `<div class="json-block">${syntaxHighlight(nom)}</div>`;
+    html += '</details>';
+  }
 
   content.innerHTML = html;
 }
