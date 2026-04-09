@@ -200,7 +200,7 @@ int main(int argc, char* argv[]) {
     // --- Phase 3: Merge replays (streaming output) ---
     // ID remaps: file_id → vector<uint32_t> where remap[old_idx] = new_idx
     std::unordered_map<uint32_t, std::vector<uint32_t>> id_remaps;
-    std::vector<uint64_t> geo_added, geo_removed, admin_added, admin_removed;
+    std::vector<uint64_t> geo_added, geo_removed, admin_added, admin_removed, poi_added, poi_removed;
     std::unordered_map<uint64_t, uint8_t> flag_corrections;
     struct CellCorr { uint64_t cell_id; std::vector<uint32_t> ids; };
     std::unordered_map<uint32_t, std::vector<CellCorr>> entry_corrections;
@@ -267,6 +267,14 @@ int main(int argc, char* argv[]) {
             for (uint32_t i = 0; i < na; i++) { memcpy(&admin_added[i], P+pos, 8); pos += 8; }
             for (uint32_t i = 0; i < nr; i++) { memcpy(&admin_removed[i], P+pos, 8); pos += 8; }
             std::cerr << "  Admin cells: +" << na << " -" << nr << std::endl;
+            continue;
+        }
+        if (file_id == CELL_CHANGES_POI_MARKER) {
+            uint32_t na = ru32(), nr = ru32();
+            poi_added.resize(na); poi_removed.resize(nr);
+            for (uint32_t i = 0; i < na; i++) { memcpy(&poi_added[i], P+pos, 8); pos += 8; }
+            for (uint32_t i = 0; i < nr; i++) { memcpy(&poi_removed[i], P+pos, 8); pos += 8; }
+            std::cerr << "  POI cells: +" << na << " -" << nr << std::endl;
             continue;
         }
         if (file_id == CELL_FLAGS_MARKER) {
@@ -343,7 +351,8 @@ int main(int argc, char* argv[]) {
         bool needs_remap = (file_id == (uint32_t)PatchFileId::ADDR_POINTS ||
                             file_id == (uint32_t)PatchFileId::STREET_WAYS ||
                             file_id == (uint32_t)PatchFileId::INTERP_WAYS ||
-                            file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS);
+                            file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS ||
+                            file_id == (uint32_t)PatchFileId::POI_RECORDS);
         bool needs_padding = (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS && actual_stride == 24) ||
                              (file_id == (uint32_t)PatchFileId::INTERP_WAYS && actual_stride == 24);
 
@@ -388,6 +397,7 @@ int main(int argc, char* argv[]) {
             else if (file_id == (uint32_t)PatchFileId::STREET_WAYS) remap_offs = {(actual_stride == 12) ? 8ul : 5ul};
             else if (file_id == (uint32_t)PatchFileId::INTERP_WAYS) remap_offs = {(actual_stride >= 20) ? 8ul : 5ul};
             else if (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS) remap_offs = {8};
+            else if (file_id == (uint32_t)PatchFileId::POI_RECORDS) remap_offs = {16};
         }
 
         // mmap old file read-only (zero allocation)
@@ -451,9 +461,11 @@ int main(int argc, char* argv[]) {
                             uint32_t nv = str_remap_lookup(v);
                             if (nv != v) memcpy(rec_buf.data() + off, &nv, 4);
                         }
-                        // Apply fixup (node_offset/vertex_offset at byte 0)
-                        if (has_fixup)
-                            memcpy(rec_buf.data(), &fixup_val, 4);
+                        // Apply fixup (node_offset/vertex_offset — at byte 0 for most types, byte 8 for POI records)
+                        if (has_fixup) {
+                            size_t fixup_off = (file_id == (uint32_t)PatchFileId::POI_RECORDS) ? 8 : 0;
+                            memcpy(rec_buf.data() + fixup_off, &fixup_val, 4);
+                        }
                         fwrite(rec_buf.data(), 1, actual_stride, outf);
                     } else {
                         // No modification needed — write directly from mmap
@@ -491,6 +503,22 @@ int main(int argc, char* argv[]) {
         malloc_trim(0);
     }
     log_phase("Merge replays", t_start);
+
+    // Copy POI data files from old if not present in patch (POI sections are optional)
+    for (auto fid : {PatchFileId::POI_RECORDS, PatchFileId::POI_VERTICES}) {
+        std::string fname2 = patch_file_names[(uint32_t)fid];
+        std::string out_path = out_dir + "/" + fname2;
+        struct stat st;
+        if (stat(out_path.c_str(), &st) != 0) {
+            // Not written by patch — copy from old if it exists
+            std::string old_path = cur_dir + "/" + fname2;
+            auto data = read_file(old_path);
+            if (!data.empty()) {
+                write_file(out_path, data);
+                std::cerr << "  " << fname2 << ": copied from old (" << data.size() << " bytes)" << std::endl;
+            }
+        }
+    }
 
     // Free string remap + release all processed patch pages
     { std::vector<std::pair<uint32_t,uint32_t>>().swap(str_remap_vec); }
@@ -723,6 +751,123 @@ int main(int argc, char* argv[]) {
                 write_file(out_dir + "/admin_entries.bin", admin.admin_entries_data);
             }
             log_phase("  Admin", t_entry);
+        }
+
+        // POI: same pattern as admin — rebuild from remap + corrections
+        {
+            uint32_t no_data = 0xFFFFFFFF;
+            std::unordered_map<uint32_t,uint32_t> poi_rm;
+            MappedFile m_poi_rm = mmap_remap(PatchFileId::POI_RECORDS);
+            if (m_poi_rm.data) {
+                const uint32_t* poi_vec = (const uint32_t*)m_poi_rm.data;
+                size_t poi_count = m_poi_rm.size / 4;
+                for (uint32_t i = 0; i < poi_count; i++)
+                    if (poi_vec[i] != 0) poi_rm[i] = poi_vec[i] - 1; // decode +1 encoding
+                unmap_file(m_poi_rm);
+            }
+            auto old_pc = read_file(cur_dir + "/poi_cells.bin");
+            auto old_pe = read_file(cur_dir + "/poi_entries.bin");
+
+            if (!old_pc.empty() || !poi_added.empty() || !poi_removed.empty() || !poi_rm.empty()) {
+                // Rebuild POI cells/entries using same logic as admin
+                // POI cells: 12 bytes each (u64 cell_id + u32 entry_offset)
+                // POI entries: variable (u16 count + u32[] ids), no flag masking needed
+                size_t n_poi_cells = old_pc.size() / 12;
+                struct PoiCellData { uint64_t cell_id; std::vector<uint32_t> ids; };
+                std::vector<PoiCellData> poi_cells(n_poi_cells);
+                for (size_t i = 0; i < n_poi_cells; i++) {
+                    memcpy(&poi_cells[i].cell_id, old_pc.data() + i * 12, 8);
+                    uint32_t off; memcpy(&off, old_pc.data() + i * 12 + 8, 4);
+                    if (off != no_data && off + 2 <= old_pe.size()) {
+                        uint16_t count; memcpy(&count, old_pe.data() + off, 2);
+                        if (off + 2 + count * 4 <= old_pe.size()) {
+                            poi_cells[i].ids.resize(count);
+                            memcpy(poi_cells[i].ids.data(), old_pe.data() + off + 2, count * 4);
+                            for (auto& id : poi_cells[i].ids) {
+                                auto it = poi_rm.find(id);
+                                if (it != poi_rm.end()) id = it->second;
+                            }
+                            std::sort(poi_cells[i].ids.begin(), poi_cells[i].ids.end());
+                        }
+                    }
+                }
+                // Apply cell changes
+                if (!poi_removed.empty()) {
+                    std::unordered_set<uint64_t> removed_set(poi_removed.begin(), poi_removed.end());
+                    poi_cells.erase(std::remove_if(poi_cells.begin(), poi_cells.end(),
+                        [&](const PoiCellData& c) { return removed_set.count(c.cell_id); }), poi_cells.end());
+                }
+                if (!poi_added.empty()) {
+                    for (uint64_t cid : poi_added) {
+                        PoiCellData cd; cd.cell_id = cid;
+                        poi_cells.push_back(cd);
+                    }
+                    std::sort(poi_cells.begin(), poi_cells.end(),
+                        [](const PoiCellData& a, const PoiCellData& b) { return a.cell_id < b.cell_id; });
+                }
+
+                // Apply entry corrections
+                auto ecit = entry_corrections.find((uint32_t)PatchFileId::POI_ENTRIES);
+                if (ecit != entry_corrections.end()) {
+                    std::unordered_map<uint64_t, const std::vector<uint32_t>*> pc_corr;
+                    for (auto& c : ecit->second) pc_corr[c.cell_id] = &c.ids;
+                    FILE* fpc = fopen((out_dir + "/poi_cells.bin").c_str(), "wb");
+                    FILE* fpe = fopen((out_dir + "/poi_entries.bin").c_str(), "wb");
+                    uint32_t pe_wpos = 0;
+                    for (size_t i = 0; i < poi_cells.size(); i++) {
+                        uint64_t cid = poi_cells[i].cell_id;
+                        fwrite(&cid, 8, 1, fpc);
+                        auto cit = pc_corr.find(cid);
+                        if (cit != pc_corr.end()) {
+                            uint32_t off = cit->second->empty() ? no_data : pe_wpos;
+                            fwrite(&off, 4, 1, fpc);
+                            if (!cit->second->empty()) {
+                                uint16_t c = cit->second->size();
+                                fwrite(&c, 2, 1, fpe); fwrite(cit->second->data(), 4, c, fpe);
+                                pe_wpos += 2 + c*4;
+                            }
+                        } else {
+                            if (!poi_cells[i].ids.empty()) {
+                                uint32_t new_off = pe_wpos; fwrite(&new_off, 4, 1, fpc);
+                                uint16_t c = poi_cells[i].ids.size();
+                                fwrite(&c, 2, 1, fpe); fwrite(poi_cells[i].ids.data(), 4, c, fpe);
+                                pe_wpos += 2 + c*4;
+                            } else {
+                                fwrite(&no_data, 4, 1, fpc);
+                            }
+                        }
+                    }
+                    fclose(fpc); fclose(fpe);
+                    std::cerr << "  POI: " << poi_cells.size() << " cells, " << pc_corr.size() << " corrections" << std::endl;
+                } else {
+                    // No corrections — write rebuilt data directly
+                    std::vector<char> pc_data, pe_data;
+                    std::unordered_map<uint64_t, uint32_t> offsets;
+                    for (auto& c : poi_cells) {
+                        if (c.ids.empty()) continue;
+                        offsets[c.cell_id] = static_cast<uint32_t>(pe_data.size());
+                        uint16_t count = static_cast<uint16_t>(c.ids.size());
+                        pe_data.insert(pe_data.end(), (const char*)&count, (const char*)&count + 2);
+                        pe_data.insert(pe_data.end(), (const char*)c.ids.data(), (const char*)c.ids.data() + c.ids.size() * 4);
+                    }
+                    for (auto& c : poi_cells) {
+                        pc_data.insert(pc_data.end(), (const char*)&c.cell_id, (const char*)&c.cell_id + 8);
+                        auto it = offsets.find(c.cell_id);
+                        uint32_t off = it != offsets.end() ? it->second : no_data;
+                        pc_data.insert(pc_data.end(), (const char*)&off, (const char*)&off + 4);
+                    }
+                    write_file(out_dir + "/poi_cells.bin", pc_data);
+                    write_file(out_dir + "/poi_entries.bin", pe_data);
+                    std::cerr << "  POI: " << poi_cells.size() << " cells rebuilt" << std::endl;
+                }
+            } else {
+                // No POI data in old or patch — copy old files if they exist (graceful)
+                auto pc = read_file(cur_dir + "/poi_cells.bin");
+                auto pe = read_file(cur_dir + "/poi_entries.bin");
+                if (!pc.empty()) write_file(out_dir + "/poi_cells.bin", pc);
+                if (!pe.empty()) write_file(out_dir + "/poi_entries.bin", pe);
+            }
+            log_phase("  POI", t_entry);
         }
     }
 

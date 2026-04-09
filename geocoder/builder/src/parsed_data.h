@@ -121,6 +121,14 @@ struct ParsedData {
         int64_t last_node_id;
     };
     std::unordered_map<int64_t, WayGeometry> way_geometries;
+
+    // POI data
+    std::vector<PoiRecord> poi_records;
+    std::vector<NodeCoord> poi_vertices;
+    std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_pois;
+    std::vector<CellItemPair> sorted_poi_cells;
+    std::vector<DeferredPoi> deferred_pois;
+    std::vector<CollectedPoiRelation> collected_poi_relations;
 };
 
 // --- Deduplicate IDs per cell ---

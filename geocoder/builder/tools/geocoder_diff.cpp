@@ -310,6 +310,56 @@ static void fixup_admin_offsets(char* old_polys, size_t old_polys_size,
     }
 }
 
+// Same for POI records (vertex_offset at byte 8, vertex_count at byte 12)
+// POI record layout: lat(f32:0), lng(f32:4), vertex_offset(u32:8), vertex_count(u32:12),
+//                    name_id(u32:16), category(u8:20), tier(u8:21), flags(u8:22), pad(u8:23)
+static void fixup_poi_offsets(char* old_pois, size_t old_pois_size,
+                                const char* old_verts, size_t old_verts_size,
+                                const char* new_pois, size_t new_pois_size,
+                                const char* new_verts, size_t new_verts_size,
+                                size_t stride) {
+    size_t old_n = old_pois_size / stride, new_n = new_pois_size / stride;
+    size_t old_vc = old_verts_size / 8, new_vc = new_verts_size / 8;
+
+    auto poi_hash = [&](const char* p, const char* verts, size_t max_v) -> uint64_t {
+        uint32_t vert_offset, vert_count, name_id;
+        memcpy(&vert_offset, p + 8, 4); memcpy(&vert_count, p + 12, 4); memcpy(&name_id, p + 16, 4);
+        uint8_t category = (uint8_t)p[20];
+        uint64_t h = 14695981039346656037ULL;
+        h = fnv_mix(h, name_id); h = fnv_mix(h, category); h = fnv_mix(h, vert_count);
+        if (vert_count == 0) {
+            // Point POI — use lat/lng
+            float lat, lng;
+            memcpy(&lat, p, 4); memcpy(&lng, p + 4, 4);
+            h = fnv_mix(h, to_grid(lat)); h = fnv_mix(h, to_grid(lng));
+        } else {
+            // Polygon POI — use first vertices
+            for (uint32_t j = 0; j < std::min(vert_count, 10u) && (vert_offset + j) < max_v; j++) {
+                float lat, lng;
+                memcpy(&lat, verts + (vert_offset + j) * 8, 4); memcpy(&lng, verts + (vert_offset + j) * 8 + 4, 4);
+                h = fnv_mix(h, to_grid(lat)); h = fnv_mix(h, to_grid(lng));
+            }
+        }
+        return h;
+    };
+
+    std::unordered_multimap<uint64_t, uint32_t> new_map;
+    new_map.reserve(new_n);
+    for (uint32_t i = 0; i < new_n; i++)
+        new_map.emplace(poi_hash(new_pois + i * stride, new_verts, new_vc), i);
+
+    for (uint32_t i = 0; i < old_n; i++) {
+        uint64_t h = poi_hash(old_pois + i * stride, old_verts, old_vc);
+        auto it = new_map.find(h);
+        if (it != new_map.end()) {
+            uint32_t new_vert_off;
+            memcpy(&new_vert_off, new_pois + it->second * stride + 8, 4);
+            memcpy(old_pois + i * stride + 8, &new_vert_off, 4);
+            new_map.erase(it);
+        }
+    }
+}
+
 // Same for interp ways
 static void fixup_interp_offsets(char* old_data, size_t old_size,
                                    const char* old_nodes, size_t old_nodes_size,
@@ -509,6 +559,7 @@ int main(int argc, char* argv[]) {
     size_t way_stride = detect(old_dir + "/street_ways.bin", {12, 9});
     size_t interp_stride = detect(old_dir + "/interp_ways.bin", {24, 20, 18});
     size_t admin_stride = detect(old_dir + "/admin_polygons.bin", {24, 20, 19});
+    size_t poi_stride = 24; // POI records are always 24 bytes
 
     // Build patch data (uncompressed, will be zstd-compressed at the end)
     std::vector<char> patch;
@@ -559,21 +610,29 @@ int main(int argc, char* argv[]) {
     // Group 2: street_ways → street_nodes (sequential within group)
     // Group 3: interp_ways → interp_nodes (sequential within group)
     // Group 4: admin_polygons → admin_vertices (sequential within group)
-    FileMergeResult res_addr, res_ways, res_nodes, res_interp_w, res_interp_n, res_admin_p, res_admin_v;
+    FileMergeResult res_addr, res_ways, res_nodes, res_interp_w, res_interp_n, res_admin_p, res_admin_v, res_poi_r, res_poi_v;
 
     // Helper to build parent-aware node merge from a parent way merge
     // count_u32: true for admin_polygons (vertex_count is uint32_t at offset 4)
     //            false for street_ways/interp_ways (node_count is uint8_t at offset 4)
+    // count_u32: true for admin_polygons/poi_records (vertex_count is uint32_t)
+    //            false for street_ways/interp_ways (node_count is uint8_t at offset 4)
+    // off_field_pos: byte offset of the offset field (0 for ways/admin, 8 for POI records)
+    // count_field_pos: byte offset of the count field (4 for all current types)
     auto build_child_merge = [](const MergeSequence& parent_seq,
                                  const char* old_parent, size_t old_parent_size,
                                  const char* new_parent, size_t new_parent_size,
                                  const char* old_child, size_t old_child_size,
                                  const char* new_child, size_t new_child_size,
-                                 size_t parent_stride, bool count_u32) -> MergeSequence {
+                                 size_t parent_stride, bool count_u32,
+                                 size_t off_field_pos = 0, size_t count_field_pos = 4) -> MergeSequence {
         MergeSequence seq;
         auto read_count = [&](const char* rec) -> uint32_t {
-            if (count_u32) { uint32_t v; memcpy(&v, rec + 4, 4); return v; }
-            return static_cast<uint32_t>(static_cast<uint8_t>(rec[4]));
+            if (count_u32) { uint32_t v; memcpy(&v, rec + count_field_pos, 4); return v; }
+            return static_cast<uint32_t>(static_cast<uint8_t>(rec[count_field_pos]));
+        };
+        auto read_off = [&](const char* rec) -> uint32_t {
+            uint32_t v; memcpy(&v, rec + off_field_pos, 4); return v;
         };
         size_t p_oi = 0, p_ni = 0, ppos = 0;
         while (ppos < parent_seq.data.size()) {
@@ -581,9 +640,9 @@ int main(int argc, char* argv[]) {
             uint32_t count; memcpy(&count, parent_seq.data.data() + ppos, 4); ppos += 4;
             if (op == OP_MATCH_RUN) {
                 for (uint32_t k = 0; k < count; k++) {
-                    uint32_t old_off; memcpy(&old_off, old_parent + (p_oi+k)*parent_stride, 4);
+                    uint32_t old_off = read_off(old_parent + (p_oi+k)*parent_stride);
                     uint32_t vc = read_count(old_parent + (p_oi+k)*parent_stride);
-                    uint32_t new_off; memcpy(&new_off, new_parent + (p_ni+k)*parent_stride, 4);
+                    uint32_t new_off = read_off(new_parent + (p_ni+k)*parent_stride);
                     if (vc > 0) {
                         bool match = (old_off + vc) * 8 <= old_child_size &&
                                     (new_off + vc) * 8 <= new_child_size &&
@@ -596,7 +655,7 @@ int main(int argc, char* argv[]) {
             } else if (op == OP_INSERT_RUN) {
                 for (uint32_t k = 0; k < count; k++) {
                     const char* rec = parent_seq.data.data() + ppos + k * parent_stride;
-                    uint32_t off; memcpy(&off, rec, 4);
+                    uint32_t off = read_off(rec);
                     uint32_t vc = read_count(rec);
                     if (vc > 0 && (off + vc) * 8 <= new_child_size)
                         seq.add_insert(new_child + off*8, vc, 8);
@@ -795,9 +854,70 @@ int main(int argc, char* argv[]) {
         std::cerr << "  RSS after admin: " << get_rss_mb() << " MiB" << std::endl;
     });
 
-    // Group 5: cell changes
+    // Group 5: poi_records → poi_vertices (may not exist in old builds)
+    std::thread t_poi([&]() {
+        double gs = now_ms();
+        auto old_data = mmap_file_rw(old_dir + "/poi_records.bin");
+        auto new_data = mmap_file(new_dir + "/poi_records.bin");
+        // Handle missing POI files gracefully (new feature, old builds may not have them)
+        if (new_data.size == 0 && old_data.size == 0) {
+            res_poi_r = {PatchFileId::POI_RECORDS, "poi_records.bin", poi_stride, 0, 0, MergeSequence{}, {}};
+            res_poi_v = {PatchFileId::POI_VERTICES, "poi_vertices.bin", 8, 0, 0, MergeSequence{}, {}};
+            if (old_data.data) unmap_file(old_data);
+            if (new_data.data) unmap_file(new_data);
+            log_time("  group:poi (empty)", gs);
+            return;
+        }
+        // String remap on name_id field (offset 16 in 24-byte stride)
+        if (old_data.size > 0)
+            remap_field(old_data.data, old_data.size, poi_stride, 16, str_remap);
+        auto old_v = mmap_file(old_dir + "/poi_vertices.bin");
+        auto new_v = mmap_file(new_dir + "/poi_vertices.bin");
+        if (old_v.data) madvise(const_cast<char*>(old_v.data), old_v.size, MADV_SEQUENTIAL);
+        if (new_v.data) madvise(const_cast<char*>(new_v.data), new_v.size, MADV_SEQUENTIAL);
+        size_t n = old_data.size / poi_stride;
+        std::vector<uint32_t> old_offsets(n);
+        for (size_t i = 0; i < n; i++) memcpy(&old_offsets[i], old_data.data + i * poi_stride + 8, 4);
+        if (old_data.size > 0 && new_data.size > 0)
+            fixup_poi_offsets(old_data.data, old_data.size, old_v.data, old_v.size,
+                              new_data.data, new_data.size, new_v.data, new_v.size, poi_stride);
+        std::vector<std::pair<uint32_t,uint32_t>> fixups;
+        for (size_t i = 0; i < n; i++) {
+            uint32_t new_off; memcpy(&new_off, old_data.data + i * poi_stride + 8, 4);
+            if (new_off != old_offsets[i]) fixups.push_back({static_cast<uint32_t>(i), new_off});
+        }
+        auto pr_seq = build_merge_seq(old_data.data, old_data.size,
+                                       new_data.data, new_data.size, poi_stride);
+        auto soft = secondary_match_from_merge(pr_seq, old_data.data, old_data.size,
+            new_data.data, new_data.size, poi_stride,
+            [](const char* rec) -> uint64_t {
+                uint32_t name_id; memcpy(&name_id, rec + 16, 4);
+                uint8_t category = static_cast<uint8_t>(rec[20]);
+                return ((uint64_t)name_id << 8) | category;
+            });
+        res_poi_r = {PatchFileId::POI_RECORDS, "poi_records.bin", poi_stride,
+                     old_data.size, new_data.size, pr_seq, std::move(fixups), std::move(soft), {}};
+        log_merge(res_poi_r);
+        // Restore original vertex_offsets for child merge
+        for (size_t i = 0; i < n; i++) memcpy(old_data.data + i * poi_stride + 8, &old_offsets[i], 4);
+        auto pv_seq = build_child_merge(pr_seq, old_data.data, old_data.size,
+                                         new_data.data, new_data.size,
+                                         old_v.data, old_v.size, new_v.data, new_v.size,
+                                         poi_stride, true, 8, 12);
+        res_poi_v = {PatchFileId::POI_VERTICES, "poi_vertices.bin", 8,
+                     old_v.size, new_v.size, std::move(pv_seq), {}};
+        log_merge(res_poi_v);
+        if (old_data.data) unmap_file(old_data);
+        unmap_file(new_data);
+        if (old_v.data) unmap_file(old_v);
+        if (new_v.data) unmap_file(new_v);
+        log_time("  group:poi", gs);
+        std::cerr << "  RSS after poi: " << get_rss_mb() << " MiB" << std::endl;
+    });
+
+    // Group 6: cell changes
     // Uses sorted vectors + set_difference instead of unordered_sets — much faster for 15M cells
-    std::vector<uint64_t> g_added, g_removed, a_added, a_removed;
+    std::vector<uint64_t> g_added, g_removed, a_added, a_removed, p_added, p_removed;
     std::thread t_cells([&]() {
         double gs = now_ms();
         auto diff_cells = [](const std::string& old_path, const std::string& new_path,
@@ -815,10 +935,11 @@ int main(int argc, char* argv[]) {
         };
         diff_cells(old_dir + "/geo_cells.bin", new_dir + "/geo_cells.bin", 20, g_added, g_removed);
         diff_cells(old_dir + "/admin_cells.bin", new_dir + "/admin_cells.bin", 12, a_added, a_removed);
+        diff_cells(old_dir + "/poi_cells.bin", new_dir + "/poi_cells.bin", 12, p_added, p_removed);
         log_time("  group:cell_changes", gs);
     });
 
-    t_addr.join(); t_street.join(); t_interp.join(); t_admin.join(); t_cells.join();
+    t_addr.join(); t_street.join(); t_interp.join(); t_admin.join(); t_poi.join(); t_cells.join();
     log_time("All merge sequences + cell changes built", merge_start);
     // Free string pools + remap (no longer needed after all merges complete)
     unmap_file(old_str_map); unmap_file(new_str_map);
@@ -836,6 +957,9 @@ int main(int argc, char* argv[]) {
     serialize_merge(patch, res_admin_p);
     serialize_merge(patch, res_admin_v);
     { std::vector<char>().swap(res_admin_v.seq.data); }
+    serialize_merge(patch, res_poi_r);
+    serialize_merge(patch, res_poi_v);
+    { std::vector<char>().swap(res_poi_v.seq.data); }
     malloc_trim(0); // return freed heap to OS
     std::cerr << "  RSS after serialize: " << get_rss_mb() << " MiB" << std::endl;
     double t0 = now_ms();
@@ -856,7 +980,17 @@ int main(int argc, char* argv[]) {
             if (vec[i] != 0xFFFFFFFF) ad_rm_d[i] = vec[i];
         for (auto& [o,n] : res_admin_p.secondary_matches) ad_rm_d[o] = n;
     }
-    log_time("Admin remap", t0);
+    std::unordered_map<uint32_t,uint32_t> poi_rm_d;
+    if (res_poi_r.old_size > 0 || res_poi_r.new_size > 0) {
+        auto vec = derive_id_remap_from_merge(
+            res_poi_r.seq,
+            res_poi_r.old_size / poi_stride, poi_stride);
+        poi_rm_d.reserve(vec.size());
+        for (uint32_t i = 0; i < vec.size(); i++)
+            if (vec[i] != 0xFFFFFFFF) poi_rm_d[i] = vec[i];
+        for (auto& [o,n] : res_poi_r.secondary_matches) poi_rm_d[o] = n;
+    }
+    log_time("Admin+POI remap", t0);
 
     // old_geo no longer needed as a vector — streaming corrections use mmap directly
 
@@ -869,23 +1003,29 @@ int main(int argc, char* argv[]) {
       wval(patch, &marker, 4); wval(patch, &na, 4); wval(patch, &nr, 4);
       for (auto c : a_added) wval(patch, &c, 8); for (auto c : a_removed) wval(patch, &c, 8);
       std::cerr << "  Admin cell changes: +" << na << " -" << nr << std::endl; }
+    { uint32_t marker = CELL_CHANGES_POI_MARKER, na = p_added.size(), nr = p_removed.size();
+      wval(patch, &marker, 4); wval(patch, &na, 4); wval(patch, &nr, 4);
+      for (auto c : p_added) wval(patch, &c, 8); for (auto c : p_removed) wval(patch, &c, 8);
+      std::cerr << "  POI cell changes: +" << na << " -" << nr << std::endl; }
 
     // Emit secondary remap section (from merge results, no re-reads)
     std::cerr << "  Secondary matches: ways=" << res_ways.secondary_matches.size()
               << " addr=" << res_addr.secondary_matches.size()
               << " interp=" << res_interp_w.secondary_matches.size()
-              << " admin=" << res_admin_p.secondary_matches.size() << std::endl;
+              << " admin=" << res_admin_p.secondary_matches.size()
+              << " poi=" << res_poi_r.secondary_matches.size() << std::endl;
     { uint32_t marker = SECONDARY_REMAP_MARKER; wval(patch, &marker, 4);
       auto emit_remap = [&](PatchFileId fid, const std::unordered_map<uint32_t,uint32_t>& rm) {
           uint32_t file = static_cast<uint32_t>(fid), count = rm.size();
           wval(patch, &file, 4); wval(patch, &count, 4);
           for (auto& [o,n] : rm) { wval(patch, &o, 4); wval(patch, &n, 4); }
       };
-      uint32_t n_files = 4; wval(patch, &n_files, 4);
+      uint32_t n_files = 5; wval(patch, &n_files, 4);
       emit_remap(PatchFileId::STREET_WAYS, res_ways.secondary_matches);
       emit_remap(PatchFileId::ADDR_POINTS, res_addr.secondary_matches);
       emit_remap(PatchFileId::INTERP_WAYS, res_interp_w.secondary_matches);
       emit_remap(PatchFileId::ADMIN_POLYGONS, res_admin_p.secondary_matches);
+      emit_remap(PatchFileId::POI_RECORDS, res_poi_r.secondary_matches);
     }
 
     // --- Streaming entry corrections ---
@@ -898,7 +1038,8 @@ int main(int argc, char* argv[]) {
     { std::vector<char>().swap(res_addr.seq.data); std::vector<char>().swap(res_ways.seq.data);
       std::vector<char>().swap(res_interp_w.seq.data); std::vector<char>().swap(res_admin_p.seq.data);
       std::vector<char>().swap(res_nodes.seq.data); std::vector<char>().swap(res_interp_n.seq.data);
-      std::vector<char>().swap(res_admin_v.seq.data); }
+      std::vector<char>().swap(res_admin_v.seq.data);
+      std::vector<char>().swap(res_poi_r.seq.data); std::vector<char>().swap(res_poi_v.seq.data); }
 
     // mmap all geo/entry files (old + new)
     auto old_geo_m = mmap_file(old_dir + "/geo_cells.bin");
@@ -1141,6 +1282,49 @@ int main(int argc, char* argv[]) {
         patch.insert(patch.end(), buf.begin(), buf.end());
         std::cerr << "  admin_entries.bin: " << dc << " cell corrections (" << buf.size()-12 << " bytes)" << std::endl;
     }
+
+    // POI corrections (same pattern as admin corrections)
+    if (res_poi_r.old_size > 0 || res_poi_r.new_size > 0) {
+        auto old_poic = read_file(old_dir + "/poi_cells.bin");
+        auto old_poie = read_file(old_dir + "/poi_entries.bin");
+        auto poi_derived = rebuild_poi_from_remap(old_poic, old_poie, poi_rm_d, p_added, p_removed);
+        auto new_poic = read_file(new_dir + "/poi_cells.bin");
+        auto new_poie = read_file(new_dir + "/poi_entries.bin");
+        auto parse_ids_v = [](const std::vector<char>& data, uint32_t off) -> std::vector<uint32_t> {
+            if (off == 0xFFFFFFFF || off + 2 > data.size()) return {};
+            uint16_t count; memcpy(&count, data.data() + off, 2);
+            if (off + 2 + count * 4 > data.size()) return {};
+            std::vector<uint32_t> ids(count);
+            memcpy(ids.data(), data.data() + off + 2, count * 4);
+            return ids;
+        };
+        auto parse_poi = [&](const std::vector<char>& cells, const std::vector<char>& entries)
+            -> std::unordered_map<uint64_t, std::vector<uint32_t>> {
+            std::unordered_map<uint64_t, std::vector<uint32_t>> m;
+            for (size_t i = 0; i < cells.size() / 12; i++) {
+                uint64_t cid; memcpy(&cid, cells.data()+i*12, 8);
+                uint32_t off; memcpy(&off, cells.data()+i*12+8, 4);
+                m[cid] = parse_ids_v(entries, off);
+            }
+            return m;
+        };
+        auto dm = parse_poi(poi_derived.poi_cells_data, poi_derived.poi_entries_data);
+        auto nm = parse_poi(new_poic, new_poie);
+        std::vector<char> buf; buf.resize(12, 0); uint32_t dc = 0;
+        for (auto& [cid, nids] : nm) {
+            auto it = dm.find(cid); auto* dids = it != dm.end() ? &it->second : nullptr;
+            bool differs = !dids ? !nids.empty() : (dids->size() != nids.size()) ||
+                          (!dids->empty() && memcmp(dids->data(), nids.data(), dids->size()*4) != 0);
+            if (differs) { wval(buf, &cid, 8); uint16_t c = nids.size(); wval(buf, &c, 2);
+                if (!nids.empty()) buf.insert(buf.end(), (const char*)nids.data(), (const char*)nids.data()+nids.size()*4); dc++; }
+        }
+        for (auto& [cid, dids] : dm) { if (!nm.count(cid) && !dids.empty()) { wval(buf, &cid, 8); uint16_t c = 0; wval(buf, &c, 2); dc++; } }
+        uint32_t marker = ENTRY_CORRECTION_MARKER, file = static_cast<uint32_t>(PatchFileId::POI_ENTRIES);
+        memcpy(buf.data(), &marker, 4); memcpy(buf.data()+4, &file, 4); memcpy(buf.data()+8, &dc, 4);
+        patch.insert(patch.end(), buf.begin(), buf.end());
+        std::cerr << "  poi_entries.bin: " << dc << " cell corrections (" << buf.size()-12 << " bytes)" << std::endl;
+    }
+
     log_time("Entry corrections", t1);
 
     // Cell flag corrections (reuse old_geo_m and new_geo_m from streaming corrections)

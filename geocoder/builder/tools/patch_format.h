@@ -110,6 +110,17 @@ struct PatchAdminPolygon {
     uint16_t country_code;
 };
 
+struct PatchPoiRecord {
+    float lat;
+    float lng;
+    uint32_t vertex_offset;
+    uint32_t vertex_count;
+    uint32_t name_id;
+    uint8_t category;
+    uint8_t tier;
+    uint8_t flags;
+};
+
 // --- File I/O helpers ---
 
 inline std::vector<char> read_file(const std::string& path) {
@@ -233,6 +244,27 @@ inline std::vector<PatchAdminPolygon> read_admin_polygons(const std::string& pat
     return result;
 }
 
+// Read PoiRecord with field-by-field parsing
+inline std::vector<PatchPoiRecord> read_poi_records(const std::string& path) {
+    auto data = read_file(path);
+    size_t stride = 24;
+    if (data.size() % stride != 0) return {};
+    size_t count = data.size() / stride;
+    std::vector<PatchPoiRecord> result(count);
+    for (size_t i = 0; i < count; i++) {
+        const char* p = data.data() + i * stride;
+        memcpy(&result[i].lat, p, 4); p += 4;
+        memcpy(&result[i].lng, p, 4); p += 4;
+        memcpy(&result[i].vertex_offset, p, 4); p += 4;
+        memcpy(&result[i].vertex_count, p, 4); p += 4;
+        memcpy(&result[i].name_id, p, 4); p += 4;
+        result[i].category = *reinterpret_cast<const uint8_t*>(p); p += 1;
+        result[i].tier = *reinterpret_cast<const uint8_t*>(p); p += 1;
+        result[i].flags = *reinterpret_cast<const uint8_t*>(p);
+    }
+    return result;
+}
+
 // --- Patch file format ---
 
 static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
@@ -253,14 +285,19 @@ enum class PatchFileId : uint32_t {
     INTERP_ENTRIES = 11,
     ADMIN_CELLS = 12,
     ADMIN_ENTRIES = 13,
-    COUNT = 14
+    POI_RECORDS = 14,
+    POI_VERTICES = 15,
+    POI_CELLS = 16,
+    POI_ENTRIES = 17,
+    COUNT = 18
 };
 
 static const char* patch_file_names[] = {
     "strings.bin", "street_ways.bin", "street_nodes.bin", "addr_points.bin",
     "interp_ways.bin", "interp_nodes.bin", "admin_polygons.bin", "admin_vertices.bin",
     "geo_cells.bin", "street_entries.bin", "addr_entries.bin", "interp_entries.bin",
-    "admin_cells.bin", "admin_entries.bin"
+    "admin_cells.bin", "admin_entries.bin",
+    "poi_records.bin", "poi_vertices.bin", "poi_cells.bin", "poi_entries.bin"
 };
 
 // Encoding types for each section
@@ -305,6 +342,7 @@ static constexpr uint32_t FIXUP_MARKER = 0xFFFFFFFD;
 // For both geo and admin cell sets.
 static constexpr uint32_t CELL_CHANGES_GEO_MARKER = 0xFFFFFFFB;
 static constexpr uint32_t CELL_CHANGES_ADMIN_MARKER = 0xFFFFFFFA;
+static constexpr uint32_t CELL_CHANGES_POI_MARKER = 0xFFFFFFF5;
 
 // Entry correction marker: 0xFFFFFFF8
 // Cell-level diff of entries: lists cells whose entries differ between derived and new.
@@ -577,6 +615,69 @@ inline RebuiltAdmin rebuild_admin_from_remap(
         auto it = offsets.find(c.cell_id);
         uint32_t off = it != offsets.end() ? it->second : no_data;
         result.admin_cells_data.insert(result.admin_cells_data.end(), (const char*)&off, (const char*)&off + 4);
+    }
+    return result;
+}
+
+// POI cell index rebuild (same structure as admin: 12-byte stride, cell_id(u64) + entry_offset(u32))
+struct RebuiltPoi {
+    std::vector<char> poi_cells_data;
+    std::vector<char> poi_entries_data;
+};
+
+inline RebuiltPoi rebuild_poi_from_remap(
+    const std::vector<char>& old_pc, const std::vector<char>& old_pe,
+    const std::unordered_map<uint32_t,uint32_t>& poi_rm,
+    const std::vector<uint64_t>& added_cells = {},
+    const std::vector<uint64_t>& removed_cells = {})
+{
+    size_t n_cells = old_pc.size() / 12;
+
+    struct CellData { uint64_t cell_id; std::vector<uint32_t> ids; };
+    std::vector<CellData> cells(n_cells);
+    for (size_t i = 0; i < n_cells; i++) {
+        memcpy(&cells[i].cell_id, old_pc.data() + i * 12, 8);
+        uint32_t off; memcpy(&off, old_pc.data() + i * 12 + 8, 4);
+        if (off != 0xFFFFFFFF && off + 2 <= old_pe.size()) {
+            uint16_t count; memcpy(&count, old_pe.data() + off, 2);
+            if (off + 2 + count * 4 <= old_pe.size()) {
+                cells[i].ids.resize(count);
+                memcpy(cells[i].ids.data(), old_pe.data() + off + 2, count * 4);
+                for (auto& id : cells[i].ids) {
+                    auto it = poi_rm.find(id);
+                    if (it != poi_rm.end()) id = it->second;
+                }
+                std::sort(cells[i].ids.begin(), cells[i].ids.end());
+            }
+        }
+    }
+
+    if (!removed_cells.empty()) {
+        std::unordered_set<uint64_t> removed_set(removed_cells.begin(), removed_cells.end());
+        cells.erase(std::remove_if(cells.begin(), cells.end(),
+            [&](const CellData& c) { return removed_set.count(c.cell_id); }), cells.end());
+    }
+    if (!added_cells.empty()) {
+        for (uint64_t cid : added_cells) { CellData cd; cd.cell_id = cid; cells.push_back(cd); }
+        std::sort(cells.begin(), cells.end(),
+            [](const CellData& a, const CellData& b) { return a.cell_id < b.cell_id; });
+    }
+
+    RebuiltPoi result;
+    uint32_t no_data = 0xFFFFFFFF;
+    std::unordered_map<uint64_t, uint32_t> offsets;
+    for (auto& c : cells) {
+        if (c.ids.empty()) continue;
+        offsets[c.cell_id] = static_cast<uint32_t>(result.poi_entries_data.size());
+        uint16_t count = static_cast<uint16_t>(c.ids.size());
+        result.poi_entries_data.insert(result.poi_entries_data.end(), (const char*)&count, (const char*)&count + 2);
+        result.poi_entries_data.insert(result.poi_entries_data.end(), (const char*)c.ids.data(), (const char*)c.ids.data() + c.ids.size() * 4);
+    }
+    for (auto& c : cells) {
+        result.poi_cells_data.insert(result.poi_cells_data.end(), (const char*)&c.cell_id, (const char*)&c.cell_id + 8);
+        auto it = offsets.find(c.cell_id);
+        uint32_t off = it != offsets.end() ? it->second : no_data;
+        result.poi_cells_data.insert(result.poi_cells_data.end(), (const char*)&off, (const char*)&off + 4);
     }
     return result;
 }

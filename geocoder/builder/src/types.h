@@ -98,3 +98,174 @@ struct CollectedRelation {
     bool is_postal;
     std::vector<std::pair<int64_t, std::string>> members; // (way_id, role)
 };
+
+// --- POI (Points of Interest) ---
+
+enum class PoiCategory : uint8_t {
+    // tourism
+    MUSEUM = 0, ATTRACTION = 1, VIEWPOINT = 2, THEME_PARK = 3, ZOO = 4,
+    GALLERY = 5, ARTWORK = 6, ALPINE_HUT = 7, AQUARIUM = 8, CAMP_SITE = 9,
+    PICNIC_SITE = 10, RESORT = 11,
+    // historic
+    CASTLE = 20, MONUMENT = 21, RUINS = 22, ARCHAEOLOGICAL_SITE = 23,
+    MEMORIAL = 24, BATTLEFIELD = 25, FORT = 26, SHIP = 27,
+    // amenity
+    PLACE_OF_WORSHIP = 40, UNIVERSITY = 41, COLLEGE = 42, HOSPITAL = 43,
+    THEATRE = 44, CINEMA = 45, LIBRARY = 46, MARKETPLACE = 47, EMBASSY = 48,
+    FOUNTAIN = 49, CASINO = 50, CEMETERY = 51, FERRY_TERMINAL = 52,
+    PLANETARIUM = 53, PRISON = 54,
+    // leisure
+    PARK = 60, NATURE_RESERVE = 61, STADIUM = 62, GARDEN = 63,
+    WATER_PARK = 64, GOLF_COURSE = 65, MARINA = 66,
+    // natural
+    PEAK = 80, VOLCANO = 81, BEACH = 82, CAVE_ENTRANCE = 83, SPRING = 84,
+    WATERFALL = 85, GLACIER = 86, CLIFF = 87, ARCH = 88, HOT_SPRING = 89,
+    GEYSER = 90, BAY = 91, CAPE = 92, ISLAND = 93,
+    // aeroway
+    AERODROME = 100,
+    // railway
+    STATION = 105,
+    // man_made
+    TOWER = 110, LIGHTHOUSE = 111, WINDMILL = 112, BRIDGE = 113, PIER = 114,
+    DAM = 115, OBSERVATORY = 116,
+    // building
+    CATHEDRAL = 120, PALACE = 121,
+    // boundary
+    NATIONAL_PARK = 130, PROTECTED_AREA = 131,
+    // craft
+    WINERY = 140, BREWERY = 141,
+    // power
+    POWER_PLANT = 150,
+
+    UNKNOWN = 255
+};
+
+// POI tier: 1=major, 2=notable, 3=everything. Returns 0 for unknown categories.
+inline uint8_t poi_get_default_tier(PoiCategory cat) {
+    switch (cat) {
+        // tier 1 (major)
+        case PoiCategory::VOLCANO: case PoiCategory::GLACIER: case PoiCategory::ISLAND:
+        case PoiCategory::AERODROME: case PoiCategory::STATION:
+        case PoiCategory::CATHEDRAL: case PoiCategory::PALACE:
+        case PoiCategory::NATIONAL_PARK: case PoiCategory::PROTECTED_AREA:
+            return 1;
+        // tier 2 (notable)
+        case PoiCategory::MUSEUM: case PoiCategory::ATTRACTION: case PoiCategory::VIEWPOINT:
+        case PoiCategory::THEME_PARK: case PoiCategory::ZOO: case PoiCategory::AQUARIUM:
+        case PoiCategory::RESORT:
+        case PoiCategory::CASTLE: case PoiCategory::MONUMENT: case PoiCategory::RUINS:
+        case PoiCategory::ARCHAEOLOGICAL_SITE: case PoiCategory::FORT: case PoiCategory::SHIP:
+        case PoiCategory::UNIVERSITY: case PoiCategory::HOSPITAL: case PoiCategory::CASINO:
+        case PoiCategory::PARK: case PoiCategory::NATURE_RESERVE: case PoiCategory::STADIUM:
+        case PoiCategory::WATER_PARK:
+        case PoiCategory::BEACH: case PoiCategory::WATERFALL: case PoiCategory::GEYSER:
+        case PoiCategory::BAY: case PoiCategory::CAPE:
+        case PoiCategory::LIGHTHOUSE: case PoiCategory::DAM: case PoiCategory::OBSERVATORY:
+        case PoiCategory::POWER_PLANT:
+            return 2;
+        // tier 3 (everything)
+        case PoiCategory::GALLERY: case PoiCategory::ARTWORK: case PoiCategory::ALPINE_HUT:
+        case PoiCategory::CAMP_SITE: case PoiCategory::PICNIC_SITE:
+        case PoiCategory::MEMORIAL: case PoiCategory::BATTLEFIELD:
+        case PoiCategory::PLACE_OF_WORSHIP: case PoiCategory::COLLEGE: case PoiCategory::THEATRE:
+        case PoiCategory::CINEMA: case PoiCategory::LIBRARY: case PoiCategory::MARKETPLACE:
+        case PoiCategory::EMBASSY: case PoiCategory::FOUNTAIN: case PoiCategory::CEMETERY:
+        case PoiCategory::FERRY_TERMINAL: case PoiCategory::PLANETARIUM: case PoiCategory::PRISON:
+        case PoiCategory::GARDEN: case PoiCategory::GOLF_COURSE: case PoiCategory::MARINA:
+        case PoiCategory::PEAK: case PoiCategory::CAVE_ENTRANCE: case PoiCategory::SPRING:
+        case PoiCategory::CLIFF: case PoiCategory::ARCH: case PoiCategory::HOT_SPRING:
+        case PoiCategory::TOWER: case PoiCategory::WINDMILL: case PoiCategory::BRIDGE:
+        case PoiCategory::PIER:
+        case PoiCategory::WINERY: case PoiCategory::BREWERY:
+            return 3;
+        default: return 0;
+    }
+}
+
+// Proximity radius in meters (0 = polygon containment only)
+inline uint16_t poi_get_proximity_meters(PoiCategory cat) {
+    switch (cat) {
+        // polygon containment (0m)
+        case PoiCategory::THEME_PARK: case PoiCategory::ZOO: case PoiCategory::CAMP_SITE:
+        case PoiCategory::RESORT: case PoiCategory::BATTLEFIELD:
+        case PoiCategory::UNIVERSITY: case PoiCategory::COLLEGE: case PoiCategory::HOSPITAL:
+        case PoiCategory::MARKETPLACE: case PoiCategory::CEMETERY: case PoiCategory::PRISON:
+        case PoiCategory::PARK: case PoiCategory::NATURE_RESERVE: case PoiCategory::STADIUM:
+        case PoiCategory::GARDEN: case PoiCategory::WATER_PARK: case PoiCategory::GOLF_COURSE:
+        case PoiCategory::BAY: case PoiCategory::ISLAND:
+        case PoiCategory::AERODROME:
+        case PoiCategory::NATIONAL_PARK: case PoiCategory::PROTECTED_AREA:
+        case PoiCategory::POWER_PLANT:
+            return 0;
+        // tiny (50m)
+        case PoiCategory::MONUMENT: case PoiCategory::MEMORIAL: case PoiCategory::FOUNTAIN:
+        case PoiCategory::ARTWORK: case PoiCategory::GEYSER: case PoiCategory::PICNIC_SITE:
+            return 50;
+        // small (100m)
+        case PoiCategory::MUSEUM: case PoiCategory::ATTRACTION: case PoiCategory::GALLERY:
+        case PoiCategory::AQUARIUM: case PoiCategory::CASTLE: case PoiCategory::SHIP:
+        case PoiCategory::PLACE_OF_WORSHIP: case PoiCategory::THEATRE: case PoiCategory::CINEMA:
+        case PoiCategory::LIBRARY: case PoiCategory::EMBASSY: case PoiCategory::CASINO:
+        case PoiCategory::PLANETARIUM:
+        case PoiCategory::CATHEDRAL: case PoiCategory::PALACE:
+            return 100;
+        // medium (200m)
+        case PoiCategory::ALPINE_HUT: case PoiCategory::RUINS: case PoiCategory::ARCHAEOLOGICAL_SITE:
+        case PoiCategory::FORT: case PoiCategory::FERRY_TERMINAL: case PoiCategory::MARINA:
+        case PoiCategory::SPRING: case PoiCategory::HOT_SPRING:
+        case PoiCategory::STATION: case PoiCategory::WINDMILL: case PoiCategory::BRIDGE:
+        case PoiCategory::PIER: case PoiCategory::WINERY: case PoiCategory::BREWERY:
+            return 200;
+        // medium-large (300m)
+        case PoiCategory::VIEWPOINT: case PoiCategory::TOWER: case PoiCategory::DAM:
+        case PoiCategory::OBSERVATORY:
+            return 300;
+        // large (500m)
+        case PoiCategory::BEACH: case PoiCategory::CAVE_ENTRANCE: case PoiCategory::WATERFALL:
+        case PoiCategory::CLIFF: case PoiCategory::ARCH: case PoiCategory::LIGHTHOUSE:
+            return 500;
+        // very large (1000m+)
+        case PoiCategory::PEAK:    return 2000;
+        case PoiCategory::VOLCANO: return 3000;
+        case PoiCategory::GLACIER: return 1000;
+        case PoiCategory::CAPE:    return 1000;
+        default: return 100;
+    }
+}
+
+static constexpr uint8_t POI_FLAG_WIKIPEDIA = 0x01;
+static constexpr uint8_t POI_FLAG_WIKIDATA  = 0x02;
+
+struct PoiClassification {
+    PoiCategory category;
+    uint8_t tier;
+    uint8_t flags;
+};
+
+struct PoiRecord {
+    float lat;                  // exact coord for points, centroid for polygons
+    float lng;
+    uint32_t vertex_offset;     // into poi_vertices.bin (NO_DATA for point POIs)
+    uint32_t vertex_count;      // 0 for points, >0 for polygons
+    uint32_t name_id;           // offset into strings.bin
+    uint8_t category;           // PoiCategory
+    uint8_t tier;               // 1=major, 2=notable, 3=everything
+    uint8_t flags;              // POI_FLAG_WIKIPEDIA, POI_FLAG_WIKIDATA
+    uint8_t _pad = 0;
+};
+
+// Collected POI relation data for parallel polygon assembly
+struct CollectedPoiRelation {
+    int64_t id;
+    PoiCategory category;
+    uint8_t tier;
+    uint8_t flags;
+    std::string name;
+    std::vector<std::pair<int64_t, std::string>> members; // (way_id, role)
+};
+
+struct DeferredPoi {
+    uint32_t poi_id;
+    uint32_t vertex_offset;
+    uint32_t vertex_count;
+};

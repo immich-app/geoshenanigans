@@ -15,17 +15,22 @@ builds/
         uncapped/      admin_polygons.bin + admin_vertices.bin + patch.gcpatch
         q0.5/          admin_polygons.bin + admin_vertices.bin + patch.gcpatch
         q1/            ...
+      poi/
+        major/         poi_records.bin + poi_vertices.bin + poi_cells.bin + poi_entries.bin + patch.gcpatch
+        notable/       ...
+        all/           ...
     europe/
       full/            ...
       no-addresses/    ...
       admin/           ...
       quality/         ...
+      poi/             ...
     africa/            ...
 ```
 
 ## Files Overview
 
-A complete geocoder index for a given region and configuration consists of files from **two directories**:
+A complete geocoder index for a given region and configuration consists of files from **up to three directories**:
 
 ### Mode directory (pick one)
 
@@ -48,6 +53,16 @@ A complete geocoder index for a given region and configuration consists of files
 
 Higher quality numbers = more simplification = smaller files = less accurate boundaries.
 
+### POI directory (optional, pick one)
+
+| Tier | Files | Description |
+|------|-------|-------------|
+| `poi/major/` | 4 files | Major POIs only (airports, national parks, cathedrals, volcanoes, etc.) |
+| `poi/notable/` | 4 files | Major + notable POIs (museums, castles, stadiums, beaches, etc.) |
+| `poi/all/` | 4 files | All POIs including minor ones (picnic sites, small galleries, etc.) |
+
+POI files: `poi_records.bin`, `poi_vertices.bin`, `poi_cells.bin`, `poi_entries.bin`. POIs with Wikipedia/Wikidata tags are promoted one tier.
+
 ## latest.json
 
 The entry point for all clients:
@@ -55,7 +70,7 @@ The entry point for all clients:
 ```json
 {
   "build_version": 2,
-  "patch_version": 1,
+  "patch_version": 2,
   "latest": "2026-04-10",
   "oldest_indexes": "2026-04-08",
   "oldest_patches": "2026-03-25",
@@ -111,10 +126,11 @@ After cleanup (indexes older than 3 days are removed), `indexes_available` is se
 1. GET builds/latest.json
 2. Choose a date >= oldest_indexes (typically use latest)
 3. GET builds/{date}/manifest.json
-4. Choose region (e.g. europe) and mode (e.g. full) and quality (e.g. q1)
+4. Choose region (e.g. europe), mode (e.g. full), quality (e.g. q1), and POI tier (e.g. notable)
 5. Download:
-   - builds/{date}/europe/full/*.bin         (12 files)
-   - builds/{date}/europe/quality/q1/*.bin   (2 files)
+   - builds/{date}/europe/full/*.bin             (12 files)
+   - builds/{date}/europe/quality/q1/*.bin       (2 files)
+   - builds/{date}/europe/poi/notable/*.bin      (4 files, optional)
 6. Store build_version, patch_version, and date locally
 ```
 
@@ -134,6 +150,7 @@ After cleanup (indexes older than 3 days are removed), `indexes_available` is se
    For each date in the chain:
    - Download builds/{date}/europe/full/patch.gcpatch → apply to mode files
    - Download builds/{date}/europe/quality/q1/patch.gcpatch → apply to quality files
+   - Download builds/{date}/europe/poi/notable/patch.gcpatch → apply to POI files (if using POIs)
 7. Update local date to latest
 ```
 

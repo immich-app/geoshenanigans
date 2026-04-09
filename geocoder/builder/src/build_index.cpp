@@ -9,6 +9,8 @@
 #include <iostream>
 #include <mutex>
 #include <numeric>
+#include <optional>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -311,10 +313,93 @@ int main(int argc, char* argv[]) {
                             data.collected_relations.push_back(std::move(cr));
                         }
                     }
+                    // --- POI relation scanning (same pass) ---
+                    for (auto& rel : block.relations) {
+                        const char* r_boundary = rel.tag("boundary");
+                        const char* r_leisure  = rel.tag("leisure");
+                        const char* r_tourism  = rel.tag("tourism");
+                        const char* r_natural  = rel.tag("natural");
+                        const char* r_aeroway  = rel.tag("aeroway");
+                        const char* r_place    = rel.tag("place");
+
+                        PoiCategory poi_cat = PoiCategory::UNKNOWN;
+                        // boundary
+                        if (r_boundary) {
+                            if (std::strcmp(r_boundary, "national_park") == 0) poi_cat = PoiCategory::NATIONAL_PARK;
+                            else if (std::strcmp(r_boundary, "protected_area") == 0) poi_cat = PoiCategory::PROTECTED_AREA;
+                        }
+                        // leisure
+                        if (poi_cat == PoiCategory::UNKNOWN && r_leisure) {
+                            if (std::strcmp(r_leisure, "park") == 0) poi_cat = PoiCategory::PARK;
+                            else if (std::strcmp(r_leisure, "nature_reserve") == 0) poi_cat = PoiCategory::NATURE_RESERVE;
+                            else if (std::strcmp(r_leisure, "stadium") == 0) poi_cat = PoiCategory::STADIUM;
+                            else if (std::strcmp(r_leisure, "water_park") == 0) poi_cat = PoiCategory::WATER_PARK;
+                            else if (std::strcmp(r_leisure, "golf_course") == 0) poi_cat = PoiCategory::GOLF_COURSE;
+                            else if (std::strcmp(r_leisure, "garden") == 0) poi_cat = PoiCategory::GARDEN;
+                            else if (std::strcmp(r_leisure, "marina") == 0) poi_cat = PoiCategory::MARINA;
+                        }
+                        // tourism
+                        if (poi_cat == PoiCategory::UNKNOWN && r_tourism) {
+                            if (std::strcmp(r_tourism, "theme_park") == 0) poi_cat = PoiCategory::THEME_PARK;
+                            else if (std::strcmp(r_tourism, "zoo") == 0) poi_cat = PoiCategory::ZOO;
+                            else if (std::strcmp(r_tourism, "museum") == 0) poi_cat = PoiCategory::MUSEUM;
+                            else if (std::strcmp(r_tourism, "attraction") == 0) poi_cat = PoiCategory::ATTRACTION;
+                            else if (std::strcmp(r_tourism, "aquarium") == 0) poi_cat = PoiCategory::AQUARIUM;
+                            else if (std::strcmp(r_tourism, "resort") == 0) poi_cat = PoiCategory::RESORT;
+                        }
+                        // natural
+                        if (poi_cat == PoiCategory::UNKNOWN && r_natural) {
+                            if (std::strcmp(r_natural, "bay") == 0) poi_cat = PoiCategory::BAY;
+                            else if (std::strcmp(r_natural, "island") == 0) poi_cat = PoiCategory::ISLAND;
+                            else if (std::strcmp(r_natural, "beach") == 0) poi_cat = PoiCategory::BEACH;
+                            else if (std::strcmp(r_natural, "glacier") == 0) poi_cat = PoiCategory::GLACIER;
+                            else if (std::strcmp(r_natural, "volcano") == 0) poi_cat = PoiCategory::VOLCANO;
+                        }
+                        // aeroway
+                        if (poi_cat == PoiCategory::UNKNOWN && r_aeroway) {
+                            if (std::strcmp(r_aeroway, "aerodrome") == 0) poi_cat = PoiCategory::AERODROME;
+                        }
+                        // place
+                        if (poi_cat == PoiCategory::UNKNOWN && r_place) {
+                            if (std::strcmp(r_place, "island") == 0 || std::strcmp(r_place, "islet") == 0)
+                                poi_cat = PoiCategory::ISLAND;
+                        }
+
+                        if (poi_cat != PoiCategory::UNKNOWN) {
+                            const char* poi_name = rel.tag("name");
+                            if (poi_name) {
+                                uint8_t flags = 0;
+                                if (rel.tag("wikipedia")) flags |= POI_FLAG_WIKIPEDIA;
+                                if (rel.tag("wikidata"))  flags |= POI_FLAG_WIKIDATA;
+                                uint8_t tier = poi_get_default_tier(poi_cat);
+                                if ((flags & (POI_FLAG_WIKIPEDIA | POI_FLAG_WIKIDATA)) && tier > 1) tier--;
+
+                                CollectedPoiRelation cpr;
+                                cpr.id = rel.id;
+                                cpr.category = poi_cat;
+                                cpr.tier = tier;
+                                cpr.flags = flags;
+                                cpr.name = poi_name;
+
+                                for (size_t mi = 0; mi < rel.members.size(); mi++) {
+                                    if (rel.members[mi].type == 'w') {
+                                        cpr.members.emplace_back(rel.members[mi].ref, rel.member_role(mi));
+                                    }
+                                }
+
+                                if (!cpr.members.empty()) {
+                                    std::lock_guard<std::mutex> lock(rel_mutex);
+                                    data.collected_poi_relations.push_back(std::move(cpr));
+                                }
+                            }
+                        }
+                    }
                 }, "r");
             }
             std::cerr << "  Collected " << data.collected_relations.size()
                       << " admin/postal relations for parallel assembly." << std::endl;
+            std::cerr << "  Collected " << data.collected_poi_relations.size()
+                      << " POI relations for parallel assembly." << std::endl;
             log_phase("Pass 1: relation scanning", _pt, _cpu);
 
             // Build admin_way_ids as a bitset for O(1) lookup
@@ -336,13 +421,179 @@ int main(int argc, char* argv[]) {
             };
             std::cerr << "  Admin assembly needs " << admin_way_count << " way geometries." << std::endl;
 
+            // Build poi_way_bits for POI relation member ways
+            std::vector<uint8_t> poi_way_bits(MAX_WAY_ID / 8 + 1, 0);
+            size_t poi_way_count = 0;
+            for (const auto& rel : data.collected_poi_relations) {
+                for (const auto& [way_id, role] : rel.members) {
+                    if (way_id > 0 && static_cast<size_t>(way_id) < MAX_WAY_ID) {
+                        poi_way_bits[way_id / 8] |= (1 << (way_id % 8));
+                        poi_way_count++;
+                    }
+                }
+            }
+            auto is_poi_way = [&](int64_t id) -> bool {
+                if (id <= 0 || static_cast<size_t>(id) >= MAX_WAY_ID) return false;
+                return poi_way_bits[id / 8] & (1 << (id % 8));
+            };
+            std::cerr << "  POI assembly needs " << poi_way_count << " way geometries." << std::endl;
+
             // --- Pass 2: Node processing (streaming — no PbfNode objects) ---
+            // POI classification helper
+            struct PoiClassification {
+                PoiCategory category;
+                uint8_t tier;
+                uint8_t flags;
+            };
+            auto classify_poi = [](const char* t_tourism, const char* t_historic,
+                                   const char* t_boundary, const char* t_amenity,
+                                   const char* t_leisure, const char* t_natural,
+                                   const char* t_railway, const char* t_aeroway,
+                                   const char* t_man_made, const char* t_building,
+                                   const char* t_craft, const char* t_power,
+                                   const char* t_place, const char* t_waterway,
+                                   const char* t_wikipedia, const char* t_wikidata)
+                -> std::optional<PoiClassification> {
+                PoiCategory cat = PoiCategory::UNKNOWN;
+
+                // tourism (highest priority)
+                if (t_tourism) {
+                    if (std::strcmp(t_tourism, "museum") == 0) cat = PoiCategory::MUSEUM;
+                    else if (std::strcmp(t_tourism, "attraction") == 0) cat = PoiCategory::ATTRACTION;
+                    else if (std::strcmp(t_tourism, "viewpoint") == 0) cat = PoiCategory::VIEWPOINT;
+                    else if (std::strcmp(t_tourism, "theme_park") == 0) cat = PoiCategory::THEME_PARK;
+                    else if (std::strcmp(t_tourism, "zoo") == 0) cat = PoiCategory::ZOO;
+                    else if (std::strcmp(t_tourism, "gallery") == 0) cat = PoiCategory::GALLERY;
+                    else if (std::strcmp(t_tourism, "artwork") == 0) cat = PoiCategory::ARTWORK;
+                    else if (std::strcmp(t_tourism, "alpine_hut") == 0) cat = PoiCategory::ALPINE_HUT;
+                    else if (std::strcmp(t_tourism, "aquarium") == 0) cat = PoiCategory::AQUARIUM;
+                    else if (std::strcmp(t_tourism, "camp_site") == 0) cat = PoiCategory::CAMP_SITE;
+                    else if (std::strcmp(t_tourism, "picnic_site") == 0) cat = PoiCategory::PICNIC_SITE;
+                    else if (std::strcmp(t_tourism, "resort") == 0) cat = PoiCategory::RESORT;
+                }
+                // historic
+                if (cat == PoiCategory::UNKNOWN && t_historic) {
+                    if (std::strcmp(t_historic, "castle") == 0) cat = PoiCategory::CASTLE;
+                    else if (std::strcmp(t_historic, "monument") == 0) cat = PoiCategory::MONUMENT;
+                    else if (std::strcmp(t_historic, "ruins") == 0) cat = PoiCategory::RUINS;
+                    else if (std::strcmp(t_historic, "archaeological_site") == 0) cat = PoiCategory::ARCHAEOLOGICAL_SITE;
+                    else if (std::strcmp(t_historic, "memorial") == 0) cat = PoiCategory::MEMORIAL;
+                    else if (std::strcmp(t_historic, "battlefield") == 0) cat = PoiCategory::BATTLEFIELD;
+                    else if (std::strcmp(t_historic, "fort") == 0) cat = PoiCategory::FORT;
+                    else if (std::strcmp(t_historic, "ship") == 0) cat = PoiCategory::SHIP;
+                }
+                // boundary
+                if (cat == PoiCategory::UNKNOWN && t_boundary) {
+                    if (std::strcmp(t_boundary, "national_park") == 0) cat = PoiCategory::NATIONAL_PARK;
+                    else if (std::strcmp(t_boundary, "protected_area") == 0) cat = PoiCategory::PROTECTED_AREA;
+                }
+                // amenity
+                if (cat == PoiCategory::UNKNOWN && t_amenity) {
+                    if (std::strcmp(t_amenity, "place_of_worship") == 0) cat = PoiCategory::PLACE_OF_WORSHIP;
+                    else if (std::strcmp(t_amenity, "university") == 0) cat = PoiCategory::UNIVERSITY;
+                    else if (std::strcmp(t_amenity, "college") == 0) cat = PoiCategory::COLLEGE;
+                    else if (std::strcmp(t_amenity, "hospital") == 0) cat = PoiCategory::HOSPITAL;
+                    else if (std::strcmp(t_amenity, "theatre") == 0) cat = PoiCategory::THEATRE;
+                    else if (std::strcmp(t_amenity, "cinema") == 0) cat = PoiCategory::CINEMA;
+                    else if (std::strcmp(t_amenity, "library") == 0) cat = PoiCategory::LIBRARY;
+                    else if (std::strcmp(t_amenity, "marketplace") == 0) cat = PoiCategory::MARKETPLACE;
+                    else if (std::strcmp(t_amenity, "embassy") == 0) cat = PoiCategory::EMBASSY;
+                    else if (std::strcmp(t_amenity, "fountain") == 0) cat = PoiCategory::FOUNTAIN;
+                    else if (std::strcmp(t_amenity, "casino") == 0) cat = PoiCategory::CASINO;
+                    else if (std::strcmp(t_amenity, "cemetery") == 0) cat = PoiCategory::CEMETERY;
+                    else if (std::strcmp(t_amenity, "ferry_terminal") == 0) cat = PoiCategory::FERRY_TERMINAL;
+                    else if (std::strcmp(t_amenity, "planetarium") == 0) cat = PoiCategory::PLANETARIUM;
+                    else if (std::strcmp(t_amenity, "prison") == 0) cat = PoiCategory::PRISON;
+                }
+                // leisure
+                if (cat == PoiCategory::UNKNOWN && t_leisure) {
+                    if (std::strcmp(t_leisure, "park") == 0) cat = PoiCategory::PARK;
+                    else if (std::strcmp(t_leisure, "nature_reserve") == 0) cat = PoiCategory::NATURE_RESERVE;
+                    else if (std::strcmp(t_leisure, "stadium") == 0) cat = PoiCategory::STADIUM;
+                    else if (std::strcmp(t_leisure, "garden") == 0) cat = PoiCategory::GARDEN;
+                    else if (std::strcmp(t_leisure, "water_park") == 0) cat = PoiCategory::WATER_PARK;
+                    else if (std::strcmp(t_leisure, "golf_course") == 0) cat = PoiCategory::GOLF_COURSE;
+                    else if (std::strcmp(t_leisure, "marina") == 0) cat = PoiCategory::MARINA;
+                }
+                // natural
+                if (cat == PoiCategory::UNKNOWN && t_natural) {
+                    if (std::strcmp(t_natural, "peak") == 0) cat = PoiCategory::PEAK;
+                    else if (std::strcmp(t_natural, "volcano") == 0) cat = PoiCategory::VOLCANO;
+                    else if (std::strcmp(t_natural, "beach") == 0) cat = PoiCategory::BEACH;
+                    else if (std::strcmp(t_natural, "cave_entrance") == 0) cat = PoiCategory::CAVE_ENTRANCE;
+                    else if (std::strcmp(t_natural, "spring") == 0) cat = PoiCategory::SPRING;
+                    else if (std::strcmp(t_natural, "cliff") == 0) cat = PoiCategory::CLIFF;
+                    else if (std::strcmp(t_natural, "arch") == 0) cat = PoiCategory::ARCH;
+                    else if (std::strcmp(t_natural, "hot_spring") == 0) cat = PoiCategory::HOT_SPRING;
+                    else if (std::strcmp(t_natural, "geyser") == 0) cat = PoiCategory::GEYSER;
+                    else if (std::strcmp(t_natural, "bay") == 0) cat = PoiCategory::BAY;
+                    else if (std::strcmp(t_natural, "cape") == 0) cat = PoiCategory::CAPE;
+                    else if (std::strcmp(t_natural, "island") == 0) cat = PoiCategory::ISLAND;
+                    else if (std::strcmp(t_natural, "glacier") == 0) cat = PoiCategory::GLACIER;
+                }
+                // railway
+                if (cat == PoiCategory::UNKNOWN && t_railway) {
+                    if (std::strcmp(t_railway, "station") == 0) cat = PoiCategory::STATION;
+                }
+                // aeroway
+                if (cat == PoiCategory::UNKNOWN && t_aeroway) {
+                    if (std::strcmp(t_aeroway, "aerodrome") == 0) cat = PoiCategory::AERODROME;
+                }
+                // man_made
+                if (cat == PoiCategory::UNKNOWN && t_man_made) {
+                    if (std::strcmp(t_man_made, "tower") == 0) cat = PoiCategory::TOWER;
+                    else if (std::strcmp(t_man_made, "lighthouse") == 0) cat = PoiCategory::LIGHTHOUSE;
+                    else if (std::strcmp(t_man_made, "windmill") == 0) cat = PoiCategory::WINDMILL;
+                    else if (std::strcmp(t_man_made, "bridge") == 0) cat = PoiCategory::BRIDGE;
+                    else if (std::strcmp(t_man_made, "pier") == 0) cat = PoiCategory::PIER;
+                    else if (std::strcmp(t_man_made, "dam") == 0) cat = PoiCategory::DAM;
+                    else if (std::strcmp(t_man_made, "observatory") == 0) cat = PoiCategory::OBSERVATORY;
+                }
+                // building
+                if (cat == PoiCategory::UNKNOWN && t_building) {
+                    if (std::strcmp(t_building, "cathedral") == 0) cat = PoiCategory::CATHEDRAL;
+                    else if (std::strcmp(t_building, "palace") == 0) cat = PoiCategory::PALACE;
+                }
+                // craft
+                if (cat == PoiCategory::UNKNOWN && t_craft) {
+                    if (std::strcmp(t_craft, "winery") == 0) cat = PoiCategory::WINERY;
+                    else if (std::strcmp(t_craft, "brewery") == 0) cat = PoiCategory::BREWERY;
+                }
+                // power
+                if (cat == PoiCategory::UNKNOWN && t_power) {
+                    if (std::strcmp(t_power, "plant") == 0) cat = PoiCategory::POWER_PLANT;
+                }
+                // place
+                if (cat == PoiCategory::UNKNOWN && t_place) {
+                    if (std::strcmp(t_place, "island") == 0 || std::strcmp(t_place, "islet") == 0)
+                        cat = PoiCategory::ISLAND;
+                }
+                // waterway
+                if (cat == PoiCategory::UNKNOWN && t_waterway) {
+                    if (std::strcmp(t_waterway, "waterfall") == 0) cat = PoiCategory::WATERFALL;
+                }
+
+                if (cat == PoiCategory::UNKNOWN) return std::optional<PoiClassification>{};
+
+                uint8_t tier = poi_get_default_tier(cat);
+                uint8_t flags = 0;
+                if (t_wikipedia) flags |= POI_FLAG_WIKIPEDIA;
+                if (t_wikidata)  flags |= POI_FLAG_WIKIDATA;
+                if ((flags & (POI_FLAG_WIKIPEDIA | POI_FLAG_WIKIDATA)) && tier > 1) tier--;
+
+                return PoiClassification{cat, tier, flags};
+            };
+
             std::cerr << "  Pass 2: processing nodes with " << num_threads << " threads..." << std::endl;
             {
                 struct NodeThreadLocal {
                     std::vector<std::pair<double,double>> addr_coords;
                     std::vector<std::pair<std::string,std::string>> addr_strings;
                     uint64_t count = 0;
+                    // POI node data
+                    std::vector<PoiRecord> poi_records;
+                    std::vector<std::string> poi_names;
+                    uint64_t poi_count = 0;
                 };
                 // Use thread_local for streaming callback (no thread index available)
                 static thread_local NodeThreadLocal* tl_node_data = nullptr;
@@ -363,22 +614,89 @@ int main(int argc, char* argv[]) {
                         index.set(static_cast<uint64_t>(id), lat, lng);
                     }
 
-                    // Check for address tags (fast — no string copies for tagless nodes)
+                    // Check for address + POI tags (fast — no string copies for tagless nodes)
                     if (ntags > 0) {
                         const char* housenumber = nullptr;
                         const char* street = nullptr;
+                        const char* n_tourism = nullptr;
+                        const char* n_historic = nullptr;
+                        const char* n_amenity = nullptr;
+                        const char* n_leisure = nullptr;
+                        const char* n_natural = nullptr;
+                        const char* n_aeroway = nullptr;
+                        const char* n_railway = nullptr;
+                        const char* n_man_made = nullptr;
+                        const char* n_building = nullptr;
+                        const char* n_craft = nullptr;
+                        const char* n_power = nullptr;
+                        const char* n_place = nullptr;
+                        const char* n_waterway = nullptr;
+                        const char* n_boundary = nullptr;
+                        const char* n_name = nullptr;
+                        const char* n_wikipedia = nullptr;
+                        const char* n_wikidata = nullptr;
                         for (size_t i = 0; i < ntags; i++) {
-                            if (tag_keys[i] < st.size()) {
-                                if (st[tag_keys[i]] == "addr:housenumber")
-                                    housenumber = tag_vals[i] < st.size() ? st[tag_vals[i]].c_str() : nullptr;
-                                else if (st[tag_keys[i]] == "addr:street")
-                                    street = tag_vals[i] < st.size() ? st[tag_vals[i]].c_str() : nullptr;
+                            if (tag_keys[i] >= st.size()) continue;
+                            const auto& k = st[tag_keys[i]];
+                            const char* v = tag_vals[i] < st.size() ? st[tag_vals[i]].c_str() : nullptr;
+                            switch (k.size() > 0 ? k[0] : 0) {
+                                case 'a':
+                                    if (k == "addr:housenumber") housenumber = v;
+                                    else if (k == "addr:street") street = v;
+                                    else if (k == "amenity") n_amenity = v;
+                                    else if (k == "aeroway") n_aeroway = v;
+                                    break;
+                                case 'b':
+                                    if (k == "building") n_building = v;
+                                    else if (k == "boundary") n_boundary = v;
+                                    break;
+                                case 'c': if (k == "craft") n_craft = v; break;
+                                case 'h': if (k == "historic") n_historic = v; break;
+                                case 'l': if (k == "leisure") n_leisure = v; break;
+                                case 'm': if (k == "man_made") n_man_made = v; break;
+                                case 'n':
+                                    if (k == "name") n_name = v;
+                                    else if (k == "natural") n_natural = v;
+                                    break;
+                                case 'p':
+                                    if (k == "place") n_place = v;
+                                    else if (k == "power") n_power = v;
+                                    break;
+                                case 'r': if (k == "railway") n_railway = v; break;
+                                case 't': if (k == "tourism") n_tourism = v; break;
+                                case 'w':
+                                    if (k == "waterway") n_waterway = v;
+                                    else if (k == "wikipedia") n_wikipedia = v;
+                                    else if (k == "wikidata") n_wikidata = v;
+                                    break;
                             }
                         }
                         if (housenumber && street) {
                             tl_node_data->addr_coords.push_back({lat, lng});
                             tl_node_data->addr_strings.push_back({housenumber, street});
                             tl_node_data->count++;
+                        }
+
+                        // POI node extraction
+                        if (n_name) {
+                            auto cls = classify_poi(n_tourism, n_historic, n_boundary,
+                                n_amenity, n_leisure, n_natural, n_railway, n_aeroway,
+                                n_man_made, n_building, n_craft, n_power, n_place, n_waterway,
+                                n_wikipedia, n_wikidata);
+                            if (cls) {
+                                PoiRecord pr{};
+                                pr.lat = static_cast<float>(lat);
+                                pr.lng = static_cast<float>(lng);
+                                pr.vertex_offset = NO_DATA;
+                                pr.vertex_count = 0;
+                                pr.name_id = 0; // will be set during merge
+                                pr.category = static_cast<uint8_t>(cls->category);
+                                pr.tier = cls->tier;
+                                pr.flags = cls->flags;
+                                tl_node_data->poi_records.push_back(pr);
+                                tl_node_data->poi_names.push_back(n_name);
+                                tl_node_data->poi_count++;
+                            }
                         }
                     }
                 });
@@ -397,8 +715,19 @@ int main(int argc, char* argv[]) {
                     }
                     total_addrs += local.count;
                 }
+                // Merge POI node records
+                uint64_t total_poi_nodes = 0;
+                for (auto& local : ntld) {
+                    for (size_t j = 0; j < local.poi_records.size(); j++) {
+                        auto pr = local.poi_records[j];
+                        pr.name_id = data.string_pool.intern(local.poi_names[j]);
+                        data.poi_records.push_back(pr);
+                    }
+                    total_poi_nodes += local.poi_count;
+                }
                 std::cerr << "  Node processing complete: " << total_addrs
-                          << " address points collected." << std::endl;
+                          << " address points, " << total_poi_nodes
+                          << " POI nodes collected." << std::endl;
             }
             log_phase("Pass 2: node processing", _pt, _cpu);
             pbf.release_pages(); // free PBF mmap pages, will re-fault for way pass
@@ -438,6 +767,21 @@ int main(int argc, char* argv[]) {
                         std::string country_code;
                     };
                     std::vector<ClosedWayAdmin> closed_way_admins;
+                    // POI way data
+                    struct PoiWayEntry {
+                        PoiRecord record;
+                        std::string name;
+                        std::vector<NodeCoord> vertices;
+                    };
+                    std::vector<PoiWayEntry> poi_ways;
+                    // POI way geometries for relation assembly
+                    struct PoiWayGeomEntry {
+                        int64_t way_id;
+                        std::vector<std::pair<double,double>> coords;
+                        int64_t first_node_id;
+                        int64_t last_node_id;
+                    };
+                    std::vector<PoiWayGeomEntry> poi_way_geoms;
                 };
 
                 static thread_local ThreadLocalData* tl_way_data = nullptr;
@@ -465,31 +809,81 @@ int main(int argc, char* argv[]) {
                     const char* t_admin_level = nullptr;
                     const char* t_postal_code = nullptr;
                     const char* t_iso = nullptr;
+                    // POI tags
+                    const char* t_tourism = nullptr;
+                    const char* t_historic = nullptr;
+                    const char* t_amenity = nullptr;
+                    const char* t_leisure = nullptr;
+                    const char* t_natural = nullptr;
+                    const char* t_aeroway = nullptr;
+                    const char* t_railway = nullptr;
+                    const char* t_man_made = nullptr;
+                    const char* t_building = nullptr;
+                    const char* t_craft = nullptr;
+                    const char* t_power = nullptr;
+                    const char* t_place = nullptr;
+                    const char* t_waterway = nullptr;
+                    const char* t_wikipedia = nullptr;
+                    const char* t_wikidata = nullptr;
                     for (size_t i = 0; i < ntags; i++) {
                         if (tag_keys[i] >= st.size()) continue;
                         const auto& k = st[tag_keys[i]];
                         const char* v = tag_vals[i] < st.size() ? st[tag_vals[i]].c_str() : nullptr;
-                        // Fast dispatch by first character to avoid 9 string comparisons
+                        // Fast dispatch by first character
                         switch (k.size() > 0 ? k[0] : 0) {
                             case 'a':
                                 if (k == "addr:interpolation") t_interpolation = v;
                                 else if (k == "addr:housenumber") t_housenumber = v;
                                 else if (k == "addr:street") t_street = v;
                                 else if (k == "admin_level") t_admin_level = v;
+                                else if (k == "amenity") t_amenity = v;
+                                else if (k == "aeroway") t_aeroway = v;
                                 break;
-                            case 'h': if (k == "highway") t_highway = v; break;
-                            case 'n': if (k == "name") t_name = v; break;
-                            case 'b': if (k == "boundary") t_boundary = v; break;
-                            case 'p': if (k == "postal_code") t_postal_code = v; break;
+                            case 'b':
+                                if (k == "boundary") t_boundary = v;
+                                else if (k == "building") t_building = v;
+                                break;
+                            case 'c': if (k == "craft") t_craft = v; break;
+                            case 'h':
+                                if (k == "highway") t_highway = v;
+                                else if (k == "historic") t_historic = v;
+                                break;
+                            case 'l': if (k == "leisure") t_leisure = v; break;
+                            case 'm': if (k == "man_made") t_man_made = v; break;
+                            case 'n':
+                                if (k == "name") t_name = v;
+                                else if (k == "natural") t_natural = v;
+                                break;
+                            case 'p':
+                                if (k == "postal_code") t_postal_code = v;
+                                else if (k == "place") t_place = v;
+                                else if (k == "power") t_power = v;
+                                break;
+                            case 'r': if (k == "railway") t_railway = v; break;
+                            case 't': if (k == "tourism") t_tourism = v; break;
                             case 'I': if (k == "ISO3166-1:alpha2") t_iso = v; break;
+                            case 'w':
+                                if (k == "waterway") t_waterway = v;
+                                else if (k == "wikipedia") t_wikipedia = v;
+                                else if (k == "wikidata") t_wikidata = v;
+                                break;
                         }
                     }
+
+                    // Check if this way has POI-qualifying tags
+                    bool has_poi_tags = t_tourism || t_historic || t_amenity || t_leisure ||
+                        t_natural || t_aeroway || t_railway || t_man_made || t_building ||
+                        t_craft || t_power || t_place || t_waterway ||
+                        (t_boundary && (std::strcmp(t_boundary, "national_park") == 0 ||
+                                        std::strcmp(t_boundary, "protected_area") == 0));
 
                     // Early exit: if no relevant tags, skip expensive node resolution
                     bool need_nodes = t_interpolation || t_housenumber ||
                         (t_highway && is_included_highway(t_highway) && t_name) ||
                         t_boundary ||
-                        (refs_size > 0 && is_admin_way(way_id));
+                        (refs_size > 0 && is_admin_way(way_id)) ||
+                        (has_poi_tags && t_name) ||
+                        (refs_size > 0 && is_poi_way(way_id));
                     if (!need_nodes) return;
 
                     // Pre-resolve all node locations
@@ -568,6 +962,62 @@ int main(int argc, char* argv[]) {
                             if (loc.valid()) geom.push_back({loc.lat(), loc.lon()});
                         if (!geom.empty())
                             local.way_geoms.push_back({way_id, std::move(geom), refs_data[0], refs_data[refs_size-1]});
+                    }
+
+                    // POI way geometries for relation assembly
+                    if (refs_size > 0 && is_poi_way(way_id)) {
+                        std::vector<std::pair<double,double>> geom;
+                        for (const auto& loc : resolved_locs)
+                            if (loc.valid()) geom.push_back({loc.lat(), loc.lon()});
+                        if (!geom.empty())
+                            local.poi_way_geoms.push_back({way_id, std::move(geom), refs_data[0], refs_data[refs_size-1]});
+                    }
+
+                    // Closed way POI polygons
+                    if (has_poi_tags && t_name && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1] && all_valid) {
+                        auto cls = classify_poi(t_tourism, t_historic, t_boundary,
+                            t_amenity, t_leisure, t_natural, t_railway, t_aeroway,
+                            t_man_made, t_building, t_craft, t_power, t_place, t_waterway,
+                            t_wikipedia, t_wikidata);
+                        if (cls) {
+                            // Compute centroid
+                            double sum_lat = 0, sum_lng = 0;
+                            for (const auto& loc : resolved_locs) {
+                                sum_lat += loc.lat(); sum_lng += loc.lon();
+                            }
+                            float clat = static_cast<float>(sum_lat / refs_size);
+                            float clng = static_cast<float>(sum_lng / refs_size);
+
+                            // Build polygon vertices
+                            std::vector<std::pair<double,double>> poly_pts;
+                            poly_pts.reserve(refs_size);
+                            for (const auto& loc : resolved_locs)
+                                poly_pts.push_back({loc.lat(), loc.lon()});
+
+                            // Simplify large polygons with ~50m epsilon
+                            if (poly_pts.size() > MAX_POLYGON_VERTICES) {
+                                double lat0 = poly_pts.empty() ? 0.0 : poly_pts[0].first;
+                                double eps_deg = meters_to_degrees(50.0, lat0);
+                                poly_pts = simplify_polygon_epsilon(poly_pts, eps_deg);
+                            }
+
+                            std::vector<NodeCoord> verts;
+                            verts.reserve(poly_pts.size());
+                            for (const auto& [plat, plng] : poly_pts)
+                                verts.push_back({static_cast<float>(plat), static_cast<float>(plng)});
+
+                            PoiRecord pr{};
+                            pr.lat = clat;
+                            pr.lng = clng;
+                            pr.vertex_offset = 0; // set during merge
+                            pr.vertex_count = static_cast<uint32_t>(verts.size());
+                            pr.name_id = 0; // set during merge
+                            pr.category = static_cast<uint8_t>(cls->category);
+                            pr.tier = cls->tier;
+                            pr.flags = cls->flags;
+
+                            local.poi_ways.push_back({pr, t_name, std::move(verts)});
+                        }
                     }
 
                     // Closed way admin boundaries
@@ -668,6 +1118,31 @@ int main(int argc, char* argv[]) {
                         local.way_geoms.clear();
                         local.way_geoms.shrink_to_fit();
                     }
+
+                    // Merge POI way geometries for relation assembly
+                    for (auto& wg : local.poi_way_geoms) {
+                        // Store in way_geometries (shared with admin — no conflict since IDs differ)
+                        if (data.way_geometries.find(wg.way_id) == data.way_geometries.end()) {
+                            ParsedData::WayGeometry g;
+                            g.coords = std::move(wg.coords);
+                            g.first_node_id = wg.first_node_id;
+                            g.last_node_id = wg.last_node_id;
+                            data.way_geometries[wg.way_id] = std::move(g);
+                        }
+                    }
+                    local.poi_way_geoms.clear();
+                    local.poi_way_geoms.shrink_to_fit();
+
+                    // Merge POI ways (closed way polygons)
+                    for (auto& pw : local.poi_ways) {
+                        uint32_t vertex_offset = static_cast<uint32_t>(data.poi_vertices.size());
+                        data.poi_vertices.insert(data.poi_vertices.end(),
+                            pw.vertices.begin(), pw.vertices.end());
+                        pw.record.vertex_offset = vertex_offset;
+                        pw.record.name_id = data.string_pool.intern(pw.name);
+                        data.poi_records.push_back(pw.record);
+                    }
+                    local.poi_ways.clear();
                 }
                 std::cerr << "  Merged: " << total_ways << " ways, "
                           << total_building_addrs << " building addrs, "
@@ -902,9 +1377,133 @@ int main(int argc, char* argv[]) {
                               << data.collected_relations.size() << " relations." << std::endl;
                     log_phase("    Admin: append + submit S2", _pt, _cpu);
 
-                    // Free collected data
+                    // Free collected admin data
                     data.collected_relations.clear();
                     data.collected_relations.shrink_to_fit();
+
+                    // --- Parallel POI relation assembly ---
+                    if (!data.collected_poi_relations.empty()) {
+                        std::cerr << "  Assembling POI polygons in parallel ("
+                                  << data.collected_poi_relations.size() << " relations)..." << std::endl;
+
+                        struct PoiResult {
+                            std::vector<std::pair<double,double>> vertices;
+                            std::string name;
+                            PoiCategory category;
+                            uint8_t tier;
+                            uint8_t flags;
+                        };
+
+                        std::vector<std::vector<PoiResult>> thread_poi_results(num_threads);
+                        std::atomic<size_t> poi_rel_idx{0};
+                        std::atomic<uint64_t> poi_assembled_count{0};
+
+                        std::vector<std::thread> poi_workers;
+                        for (unsigned int t = 0; t < num_threads; t++) {
+                            poi_workers.emplace_back([&, t]() {
+                                auto& local_results = thread_poi_results[t];
+                                while (true) {
+                                    size_t i = poi_rel_idx.fetch_add(1);
+                                    if (i >= data.collected_poi_relations.size()) break;
+
+                                    const auto& rel = data.collected_poi_relations[i];
+
+                                    // Skip relations with missing member ways
+                                    bool has_missing = false;
+                                    for (const auto& [way_id, role] : rel.members) {
+                                        if (data.way_geometries.find(way_id) == data.way_geometries.end()) {
+                                            has_missing = true;
+                                            break;
+                                        }
+                                    }
+                                    if (has_missing) {
+                                        poi_assembled_count.fetch_add(1);
+                                        continue;
+                                    }
+
+                                    auto rings = assemble_outer_rings(rel.members, data.way_geometries);
+                                    if (rings.empty()) {
+                                        auto retry = assemble_outer_rings(rel.members, data.way_geometries, true);
+                                        for (auto& ring : retry) {
+                                            if (!ring_has_duplicate_coords(ring))
+                                                rings.push_back(std::move(ring));
+                                        }
+                                    }
+
+                                    for (auto& ring : rings) {
+                                        if (ring.size() >= 3) {
+                                            // Normalize ring rotation
+                                            if (ring.size() >= 4 &&
+                                                std::fabs(ring.front().first - ring.back().first) < 1e-7 &&
+                                                std::fabs(ring.front().second - ring.back().second) < 1e-7) {
+                                                ring.pop_back();
+                                                auto min_it = std::min_element(ring.begin(), ring.end());
+                                                std::rotate(ring.begin(), min_it, ring.end());
+                                                ring.push_back(ring.front());
+                                            }
+
+                                            // Simplify with ~50m epsilon
+                                            double lat0 = ring.empty() ? 0.0 : ring[0].first;
+                                            double eps_deg = meters_to_degrees(50.0, lat0);
+                                            ring = simplify_polygon_epsilon(ring, eps_deg);
+
+                                            if (ring.size() >= 3) {
+                                                PoiResult pr;
+                                                pr.vertices = std::move(ring);
+                                                pr.name = rel.name;
+                                                pr.category = rel.category;
+                                                pr.tier = rel.tier;
+                                                pr.flags = rel.flags;
+                                                local_results.push_back(std::move(pr));
+                                            }
+                                        }
+                                    }
+
+                                    poi_assembled_count.fetch_add(1);
+                                }
+                            });
+                        }
+                        for (auto& w : poi_workers) w.join();
+                        log_phase("    POI: ring assembly", _pt, _cpu);
+
+                        // Merge POI relation results
+                        uint64_t total_poi_rings = 0;
+                        for (auto& local_results : thread_poi_results) {
+                            for (auto& pr : local_results) {
+                                // Compute centroid
+                                double sum_lat = 0, sum_lng = 0;
+                                for (const auto& [lat, lng] : pr.vertices) {
+                                    sum_lat += lat; sum_lng += lng;
+                                }
+                                float clat = static_cast<float>(sum_lat / pr.vertices.size());
+                                float clng = static_cast<float>(sum_lng / pr.vertices.size());
+
+                                uint32_t vertex_offset = static_cast<uint32_t>(data.poi_vertices.size());
+                                for (const auto& [lat, lng] : pr.vertices)
+                                    data.poi_vertices.push_back({static_cast<float>(lat), static_cast<float>(lng)});
+
+                                PoiRecord rec{};
+                                rec.lat = clat;
+                                rec.lng = clng;
+                                rec.vertex_offset = vertex_offset;
+                                rec.vertex_count = static_cast<uint32_t>(pr.vertices.size());
+                                rec.name_id = data.string_pool.intern(pr.name);
+                                rec.category = static_cast<uint8_t>(pr.category);
+                                rec.tier = pr.tier;
+                                rec.flags = pr.flags;
+                                data.poi_records.push_back(rec);
+                                total_poi_rings++;
+                            }
+                            local_results.clear();
+                        }
+                        std::cerr << "  POI relation assembly complete: "
+                                  << total_poi_rings << " polygon rings from "
+                                  << data.collected_poi_relations.size() << " relations." << std::endl;
+                        log_phase("    POI: merge results", _pt, _cpu);
+                    }
+                    data.collected_poi_relations.clear();
+                    data.collected_poi_relations.shrink_to_fit();
+
                     data.way_geometries.clear();
                     std::unordered_map<int64_t, ParsedData::WayGeometry>().swap(data.way_geometries);
                 }
@@ -916,6 +1515,8 @@ int main(int argc, char* argv[]) {
         std::cerr << "  " << data.addr_points.size() << " address points" << std::endl;
         std::cerr << "  " << data.interp_ways.size() << " interpolation ways" << std::endl;
         std::cerr << "  " << data.admin_polygons.size() << " admin polygon rings" << std::endl;
+        std::cerr << "  " << data.poi_records.size() << " POI records ("
+                  << data.poi_vertices.size() << " polygon vertices)" << std::endl;
 
         // Drain admin polygon thread pool (may still be processing)
         std::cerr << "Waiting for admin polygon S2 covering to complete..." << std::endl;
@@ -1151,6 +1752,51 @@ int main(int argc, char* argv[]) {
             data.deferred_interps.clear();
             data.deferred_interps.shrink_to_fit();
 
+            // --- POI S2 cell computation ---
+            if (!data.poi_records.empty()) {
+                std::cerr << "  Computing S2 cells for " << data.poi_records.size() << " POIs..." << std::endl;
+                std::vector<std::vector<CellItem>> poi_pairs(num_threads);
+                {
+                    std::atomic<size_t> poi_idx{0};
+                    std::vector<std::thread> threads;
+                    for (unsigned int t = 0; t < num_threads; t++) {
+                        threads.emplace_back([&, t]() {
+                            auto& local = poi_pairs[t];
+                            local.reserve(data.poi_records.size() / num_threads * 2);
+                            while (true) {
+                                size_t i = poi_idx.fetch_add(1);
+                                if (i >= data.poi_records.size()) break;
+                                const auto& pr = data.poi_records[i];
+
+                                if (pr.vertex_count == 0) {
+                                    // Point POI
+                                    S2CellId cell = S2CellId(S2LatLng::FromDegrees(pr.lat, pr.lng))
+                                        .parent(kAdminCellLevel);
+                                    local.push_back({cell.id(), static_cast<uint32_t>(i)});
+                                } else {
+                                    // Polygon POI — cover with S2 cells
+                                    std::vector<std::pair<double,double>> verts;
+                                    verts.reserve(pr.vertex_count);
+                                    for (uint32_t j = 0; j < pr.vertex_count; j++) {
+                                        const auto& v = data.poi_vertices[pr.vertex_offset + j];
+                                        verts.emplace_back(v.lat, v.lng);
+                                    }
+                                    auto cells = cover_polygon(verts);
+                                    for (const auto& [cell_id, is_interior] : cells) {
+                                        local.push_back({cell_id.id(), static_cast<uint32_t>(i)});
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    for (auto& t : threads) t.join();
+                }
+                log_phase("  S2: POI cells (parallel)", _s2t, _s2cpu);
+
+                parallel_sort_and_build(poi_pairs, data.cell_to_pois, data.sorted_poi_cells);
+                log_phase("  S2: POI sort + group", _s2t, _s2cpu);
+            }
+
             std::cerr << "S2 cell computation complete." << std::endl;
         }
 
@@ -1331,6 +1977,7 @@ int main(int argc, char* argv[]) {
                 }
                 for (auto& iw : data.interp_ways) iw.street_id = rm.at(iw.street_id);
                 for (auto& ap : data.admin_polygons) ap.name_id = rm.at(ap.name_id);
+                for (auto& pr : data.poi_records) pr.name_id = rm.at(pr.name_id);
                 std::cerr << "  String pool sorted: " << strings.size() << " strings" << std::endl;
             }
         }
@@ -1572,6 +2219,83 @@ int main(int argc, char* argv[]) {
             std::cerr << "  Admin polygons sorted: " << n << std::endl;
         }
         log_phase("  Sort admin", _st, _sc);
+
+        // 6. Sort POI records by (category, tier, name_id, lat_bits, lng_bits) + reorder vertices
+        if (!data.poi_records.empty()) {
+            size_t n = data.poi_records.size();
+            std::vector<uint32_t> order(n);
+            std::iota(order.begin(), order.end(), 0);
+            std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+                const auto& pa = data.poi_records[a];
+                const auto& pb = data.poi_records[b];
+                if (pa.category != pb.category) return pa.category < pb.category;
+                if (pa.tier != pb.tier) return pa.tier < pb.tier;
+                if (pa.name_id != pb.name_id) return pa.name_id < pb.name_id;
+                uint32_t la = float_bits(pa.lat), lb = float_bits(pb.lat);
+                if (la != lb) return la < lb;
+                uint32_t ga = float_bits(pa.lng), gb = float_bits(pb.lng);
+                if (ga != gb) return ga < gb;
+                return a < b; // stable tiebreaker
+            });
+
+            // Build old→new mapping
+            std::vector<uint32_t> old_to_new(n);
+            for (uint32_t i = 0; i < n; i++) old_to_new[order[i]] = i;
+
+            // Reorder records + vertices, dedup
+            std::vector<PoiRecord> new_pois;
+            std::vector<NodeCoord> new_poi_verts;
+            new_pois.reserve(n);
+            new_poi_verts.reserve(data.poi_vertices.size());
+            std::vector<uint32_t> dedup_remap(n);
+            size_t write_pos = 0;
+
+            for (uint32_t i = 0; i < n; i++) {
+                auto p = data.poi_records[order[i]];
+                uint32_t old_voff = p.vertex_offset;
+                uint32_t vc = p.vertex_count;
+
+                // Check for duplicate vs previous
+                bool is_dup = false;
+                if (write_pos > 0) {
+                    auto& prev = new_pois[write_pos - 1];
+                    if (prev.category == p.category && prev.tier == p.tier &&
+                        prev.name_id == p.name_id &&
+                        prev.lat == p.lat && prev.lng == p.lng &&
+                        prev.vertex_count == p.vertex_count && prev.flags == p.flags) {
+                        is_dup = true;
+                    }
+                }
+
+                if (is_dup) {
+                    dedup_remap[i] = static_cast<uint32_t>(write_pos - 1);
+                } else {
+                    dedup_remap[i] = static_cast<uint32_t>(write_pos);
+                    p.vertex_offset = static_cast<uint32_t>(new_poi_verts.size());
+                    if (vc > 0 && old_voff != NO_DATA) {
+                        for (uint32_t j = 0; j < vc; j++)
+                            new_poi_verts.push_back(data.poi_vertices[old_voff + j]);
+                    }
+                    new_pois.push_back(p);
+                    write_pos++;
+                }
+            }
+
+            size_t deduped = n - new_pois.size();
+            data.poi_records = std::move(new_pois);
+            data.poi_vertices = std::move(new_poi_verts);
+
+            // Remap sorted_poi_cells IDs
+            for (auto& p : data.sorted_poi_cells)
+                p.item_id = dedup_remap[old_to_new[p.item_id]];
+            auto cmp = [](const CellItemPair& a, const CellItemPair& b) {
+                return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
+            };
+            std::sort(data.sorted_poi_cells.begin(), data.sorted_poi_cells.end(), cmp);
+            data.cell_to_pois.clear();
+            std::cerr << "  POI records sorted: " << n << " (" << deduped << " duplicates removed)" << std::endl;
+        }
+        log_phase("  Sort POIs", _st, _sc);
     }
 
     // --- Write index files ---
@@ -1631,6 +2355,77 @@ int main(int argc, char* argv[]) {
             std::string quality_dir = multi_output ? base_dir + "/quality" : base_dir;
             std::cerr << "  Writing quality variants for " << base_dir << "..." << std::endl;
             write_qualities(d, quality_dir);
+        }
+
+        // Write POI tier variants
+        if (!d.poi_records.empty()) {
+            struct PoiTierVariant {
+                const char* name;
+                uint8_t max_tier;
+            };
+            PoiTierVariant poi_tiers[] = {
+                {"poi/major",   1},
+                {"poi/notable", 2},
+                {"poi/all",     3},
+            };
+
+            for (const auto& tier_var : poi_tiers) {
+                std::string poi_dir = base_dir + "/" + tier_var.name;
+                ensure_dir(poi_dir);
+
+                // Filter records by tier
+                std::vector<PoiRecord> filtered_records;
+                std::vector<NodeCoord> filtered_vertices;
+                // Build old→new ID mapping for filtering
+                std::vector<uint32_t> id_remap(d.poi_records.size(), NO_DATA);
+
+                for (size_t i = 0; i < d.poi_records.size(); i++) {
+                    if (d.poi_records[i].tier <= tier_var.max_tier) {
+                        id_remap[i] = static_cast<uint32_t>(filtered_records.size());
+                        auto pr = d.poi_records[i];
+                        uint32_t old_voff = pr.vertex_offset;
+                        uint32_t vc = pr.vertex_count;
+                        pr.vertex_offset = static_cast<uint32_t>(filtered_vertices.size());
+                        if (vc > 0 && old_voff != NO_DATA) {
+                            for (uint32_t j = 0; j < vc; j++)
+                                filtered_vertices.push_back(d.poi_vertices[old_voff + j]);
+                        }
+                        filtered_records.push_back(pr);
+                    }
+                }
+
+                // Build filtered cell index
+                std::unordered_map<uint64_t, std::vector<uint32_t>> filtered_cell_map;
+                for (const auto& p : d.sorted_poi_cells) {
+                    if (p.item_id < id_remap.size() && id_remap[p.item_id] != NO_DATA) {
+                        filtered_cell_map[p.cell_id].push_back(id_remap[p.item_id]);
+                    }
+                }
+                // Dedup cell entries
+                for (auto& [cell_id, ids] : filtered_cell_map) {
+                    std::sort(ids.begin(), ids.end());
+                    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+                }
+
+                // Write files
+                {
+                    std::ofstream f(poi_dir + "/poi_records.bin", std::ios::binary);
+                    f.write(reinterpret_cast<const char*>(filtered_records.data()),
+                            filtered_records.size() * sizeof(PoiRecord));
+                }
+                {
+                    std::ofstream f(poi_dir + "/poi_vertices.bin", std::ios::binary);
+                    f.write(reinterpret_cast<const char*>(filtered_vertices.data()),
+                            filtered_vertices.size() * sizeof(NodeCoord));
+                }
+                write_cell_index(poi_dir + "/poi_cells.bin", poi_dir + "/poi_entries.bin",
+                                 filtered_cell_map);
+
+                std::cerr << "  POI " << tier_var.name << ": "
+                          << filtered_records.size() << " records, "
+                          << filtered_vertices.size() << " vertices, "
+                          << filtered_cell_map.size() << " cells" << std::endl;
+            }
         }
     };
 
@@ -1808,7 +2603,7 @@ int main(int argc, char* argv[]) {
         std::ofstream mf(output_dir + "/manifest.json");
         mf << "{\n";
         mf << "  \"build_version\": 2,\n";
-        mf << "  \"patch_version\": 1,\n";
+        mf << "  \"patch_version\": 2,\n";
         mf << "  \"regions\": {\n";
 
         for (size_t ri = 0; ri < regions.size(); ri++) {
@@ -1866,9 +2661,26 @@ int main(int argc, char* argv[]) {
                     if (qi + 1 < quality_scales.size()) mf << ",";
                     mf << "\n";
                 }
-                mf << "      }\n";
+                mf << "      },\n";
             } else {
-                mf << "      \"qualities\": {}\n";
+                mf << "      \"qualities\": {},\n";
+            }
+
+            // POI tier info
+            {
+                std::vector<std::string> poi_files = {
+                    "poi_records.bin", "poi_vertices.bin", "poi_cells.bin", "poi_entries.bin"
+                };
+                mf << "      \"poi\": {\n";
+                const char* poi_tier_names[] = {"major", "notable", "all"};
+                for (int ti = 0; ti < 3; ti++) {
+                    std::string pdir = rpath + "/poi/" + poi_tier_names[ti];
+                    int64_t psz = dir_size(pdir, poi_files);
+                    mf << "        \"" << poi_tier_names[ti] << "\": {\"size\": " << psz << "}";
+                    if (ti < 2) mf << ",";
+                    mf << "\n";
+                }
+                mf << "      }\n";
             }
 
             mf << "    }";
