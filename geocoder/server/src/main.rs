@@ -88,14 +88,13 @@ struct PoiRecord {
     category: u8,
     tier: u8,
     flags: u8,
-    _pad: u8,
+    importance: u8,
 }
 
 const POI_FLAG_WIKIPEDIA: u8 = 0x01;
 const POI_FLAG_WIKIDATA: u8 = 0x02;
 
 // POI category metadata — loaded from poi_meta.json (written by builder)
-// Maps category ID → (name, proximity_meters)
 struct PoiMeta {
     categories: std::collections::HashMap<u8, PoiCategoryMeta>,
 }
@@ -103,8 +102,19 @@ struct PoiMeta {
 #[derive(Deserialize)]
 struct PoiCategoryMeta {
     name: String,
+    #[serde(default = "default_ref_dist")]
+    reference_distance: f64,
+    #[serde(default)]
+    max_distance: f64,
+    #[serde(default = "default_importance")]
+    default_importance: f64,
+    // legacy field, ignored
+    #[serde(default)]
     proximity: f64,
 }
+
+fn default_ref_dist() -> f64 { 100.0 }
+fn default_importance() -> f64 { 5.0 }
 
 impl PoiMeta {
     fn load(dir: &str) -> Self {
@@ -124,14 +134,16 @@ impl PoiMeta {
         self.categories.get(&id).map(|c| c.name.as_str()).unwrap_or("unknown")
     }
 
-    fn proximity_meters(&self, id: u8, flags: u8) -> f64 {
-        let base = self.categories.get(&id).map(|c| c.proximity).unwrap_or(100.0);
-        let has_wiki = (flags & (POI_FLAG_WIKIPEDIA | POI_FLAG_WIKIDATA)) != 0;
-        if has_wiki {
-            if base > 0.0 { base * 2.0 } else { 200.0 }
-        } else {
-            base
-        }
+    fn reference_distance(&self, id: u8) -> f64 {
+        self.categories.get(&id).map(|c| c.reference_distance).unwrap_or(100.0)
+    }
+
+    fn max_distance(&self, id: u8) -> f64 {
+        self.categories.get(&id).map(|c| c.max_distance).unwrap_or(500.0)
+    }
+
+    fn default_importance(&self, id: u8) -> f64 {
+        self.categories.get(&id).map(|c| c.default_importance).unwrap_or(5.0)
     }
 }
 
@@ -618,13 +630,17 @@ impl Index {
                 let name = self.get_string(poi.name_id);
                 if name.is_empty() { return; }
 
-                let prox_m = self.poi_meta.proximity_meters(poi.category, poi.flags);
+                let ref_dist = self.poi_meta.reference_distance(poi.category);
+                let importance = if poi.importance > 0 {
+                    poi.importance as f64
+                } else {
+                    self.poi_meta.default_importance(poi.category)
+                };
+                let base_max = self.poi_meta.max_distance(poi.category);
+                let cos_lat = lat.to_radians().cos();
 
-                // Check relevance: polygon containment or distance within proximity
                 let dist_m;
                 let contained;
-
-                let cos_lat = lat.to_radians().cos();
 
                 if poi.vertex_count > 0 && (poi.vertex_offset as usize) < all_poi_vertices.len() {
                     let offset = poi.vertex_offset as usize;
@@ -635,7 +651,6 @@ impl Index {
                     if contained {
                         dist_m = 0.0;
                     } else {
-                        // Distance to nearest polygon edge (not centroid)
                         let mut min_dist_sq = f64::MAX;
                         for i in 0..count {
                             let j = if i + 1 < count { i + 1 } else { 0 };
@@ -656,25 +671,35 @@ impl Index {
                     dist_m = (dlat * dlat + dlng * dlng * cos_lat * cos_lat).sqrt() * 6_371_000.0;
                 }
 
-                let relevant = contained || dist_m <= prox_m;
-                if !relevant { return; }
+                // Hard max distance cutoff (importance-scaled)
+                if !contained {
+                    if base_max == 0.0 { return; }
+                    let effective_max = base_max * (1.0 + importance / 50.0);
+                    if dist_m > effective_max { return; }
+                }
+
+                // Score with squared distance decay
+                let proximity_weight = if contained {
+                    1.0
+                } else {
+                    let r = dist_m / ref_dist;
+                    1.0 / (1.0 + r * r)
+                };
+                let score = importance * proximity_weight;
+                if score < 0.5 { return; }
 
                 results.push(PoiMatch {
                     name,
                     category: self.poi_meta.category_name(poi.category),
-                    tier: poi.tier,
                     distance_m: if contained { 0.0 } else { dist_m },
                     contained,
+                    score,
                 });
             });
         }
 
-        // Sort by: contained first, then tier (lower=more important), then distance
-        results.sort_by(|a, b| {
-            b.contained.cmp(&a.contained)
-                .then(a.tier.cmp(&b.tier))
-                .then(a.distance_m.partial_cmp(&b.distance_m).unwrap())
-        });
+        // Sort by score descending
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
         let mut seen = std::collections::HashSet::new();
         results.retain(|r| seen.insert(r.name));
         results.truncate(5);
@@ -805,9 +830,9 @@ fn point_in_polygon(lat: f32, lng: f32, vertices: &[NodeCoord]) -> bool {
 struct PoiMatch<'a> {
     name: &'a str,
     category: &'a str,
-    tier: u8,
     distance_m: f64,
     contained: bool,
+    score: f64,
 }
 
 #[derive(Default)]

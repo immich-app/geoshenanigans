@@ -119,6 +119,7 @@ struct PatchPoiRecord {
     uint8_t category;
     uint8_t tier;
     uint8_t flags;
+    uint8_t importance;
 };
 
 // --- File I/O helpers ---
@@ -260,7 +261,8 @@ inline std::vector<PatchPoiRecord> read_poi_records(const std::string& path) {
         memcpy(&result[i].name_id, p, 4); p += 4;
         result[i].category = *reinterpret_cast<const uint8_t*>(p); p += 1;
         result[i].tier = *reinterpret_cast<const uint8_t*>(p); p += 1;
-        result[i].flags = *reinterpret_cast<const uint8_t*>(p);
+        result[i].flags = *reinterpret_cast<const uint8_t*>(p); p += 1;
+        result[i].importance = *reinterpret_cast<const uint8_t*>(p);
     }
     return result;
 }

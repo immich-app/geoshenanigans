@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -180,6 +181,8 @@ int main(int argc, char* argv[]) {
     ParsedData data;
     auto _pt = std::chrono::steady_clock::now();
     auto _cpu = CpuTicks::now();
+
+    std::vector<float> poi_elevations; // build-time only, not in ParsedData
 
     if (!load_cache_path.empty()) {
         // Load from cache
@@ -594,6 +597,7 @@ int main(int argc, char* argv[]) {
                     // POI node data
                     std::vector<PoiRecord> poi_records;
                     std::vector<std::string> poi_names;
+                    std::vector<float> poi_elevations;
                     uint64_t poi_count = 0;
                 };
                 // Use thread_local for streaming callback (no thread index available)
@@ -636,6 +640,7 @@ int main(int argc, char* argv[]) {
                         const char* n_name = nullptr;
                         const char* n_wikipedia = nullptr;
                         const char* n_wikidata = nullptr;
+                        const char* n_ele = nullptr;
                         for (size_t i = 0; i < ntags; i++) {
                             if (tag_keys[i] >= st.size()) continue;
                             const auto& k = st[tag_keys[i]];
@@ -652,6 +657,7 @@ int main(int argc, char* argv[]) {
                                     else if (k == "boundary") n_boundary = v;
                                     break;
                                 case 'c': if (k == "craft") n_craft = v; break;
+                                case 'e': if (k == "ele") n_ele = v; break;
                                 case 'h': if (k == "historic") n_historic = v; break;
                                 case 'l': if (k == "leisure") n_leisure = v; break;
                                 case 'm': if (k == "man_made") n_man_made = v; break;
@@ -696,6 +702,9 @@ int main(int argc, char* argv[]) {
                                 pr.flags = cls->flags;
                                 tl_node_data->poi_records.push_back(pr);
                                 tl_node_data->poi_names.push_back(n_name);
+                                float ele_val = 0;
+                                if (n_ele) { char* end; ele_val = std::strtof(n_ele, &end); if (end == n_ele) ele_val = 0; }
+                                tl_node_data->poi_elevations.push_back(ele_val);
                                 tl_node_data->poi_count++;
                             }
                         }
@@ -724,6 +733,8 @@ int main(int argc, char* argv[]) {
                         pr.name_id = data.string_pool.intern(local.poi_names[j]);
                         data.poi_records.push_back(pr);
                     }
+                    poi_elevations.insert(poi_elevations.end(),
+                        local.poi_elevations.begin(), local.poi_elevations.end());
                     total_poi_nodes += local.poi_count;
                 }
                 std::cerr << "  Node processing complete: " << total_addrs
@@ -773,6 +784,7 @@ int main(int argc, char* argv[]) {
                         PoiRecord record;
                         std::string name;
                         std::vector<NodeCoord> vertices;
+                        float elevation;
                     };
                     std::vector<PoiWayEntry> poi_ways;
                     // POI way geometries for relation assembly
@@ -826,6 +838,7 @@ int main(int argc, char* argv[]) {
                     const char* t_waterway = nullptr;
                     const char* t_wikipedia = nullptr;
                     const char* t_wikidata = nullptr;
+                    const char* t_ele = nullptr;
                     for (size_t i = 0; i < ntags; i++) {
                         if (tag_keys[i] >= st.size()) continue;
                         const auto& k = st[tag_keys[i]];
@@ -845,6 +858,7 @@ int main(int argc, char* argv[]) {
                                 else if (k == "building") t_building = v;
                                 break;
                             case 'c': if (k == "craft") t_craft = v; break;
+                            case 'e': if (k == "ele") t_ele = v; break;
                             case 'h':
                                 if (k == "highway") t_highway = v;
                                 else if (k == "historic") t_historic = v;
@@ -1017,7 +1031,9 @@ int main(int argc, char* argv[]) {
                             pr.tier = cls->tier;
                             pr.flags = cls->flags;
 
-                            local.poi_ways.push_back({pr, t_name, std::move(verts)});
+                            float way_ele = 0;
+                            if (t_ele) { char* end; way_ele = std::strtof(t_ele, &end); if (end == t_ele) way_ele = 0; }
+                            local.poi_ways.push_back({pr, t_name, std::move(verts), way_ele});
                         }
                     }
 
@@ -1142,6 +1158,7 @@ int main(int argc, char* argv[]) {
                         pw.record.vertex_offset = vertex_offset;
                         pw.record.name_id = data.string_pool.intern(pw.name);
                         data.poi_records.push_back(pw.record);
+                        poi_elevations.push_back(pw.elevation);
                     }
                     local.poi_ways.clear();
                 }
@@ -1493,6 +1510,7 @@ int main(int argc, char* argv[]) {
                                 rec.tier = pr.tier;
                                 rec.flags = pr.flags;
                                 data.poi_records.push_back(rec);
+                                poi_elevations.push_back(0); // relations don't have ele
                                 total_poi_rings++;
                             }
                             local_results.clear();
@@ -2243,11 +2261,14 @@ int main(int argc, char* argv[]) {
             std::vector<uint32_t> old_to_new(n);
             for (uint32_t i = 0; i < n; i++) old_to_new[order[i]] = i;
 
-            // Reorder records + vertices, dedup
+            // Reorder records + vertices + elevations, dedup
+            bool have_elevations = (poi_elevations.size() == n);
             std::vector<PoiRecord> new_pois;
             std::vector<NodeCoord> new_poi_verts;
+            std::vector<float> new_poi_elevations;
             new_pois.reserve(n);
             new_poi_verts.reserve(data.poi_vertices.size());
+            if (have_elevations) new_poi_elevations.reserve(n);
             std::vector<uint32_t> dedup_remap(n);
             size_t write_pos = 0;
 
@@ -2278,6 +2299,7 @@ int main(int argc, char* argv[]) {
                             new_poi_verts.push_back(data.poi_vertices[old_voff + j]);
                     }
                     new_pois.push_back(p);
+                    if (have_elevations) new_poi_elevations.push_back(poi_elevations[order[i]]);
                     write_pos++;
                 }
             }
@@ -2285,6 +2307,7 @@ int main(int argc, char* argv[]) {
             size_t deduped = n - new_pois.size();
             data.poi_records = std::move(new_pois);
             data.poi_vertices = std::move(new_poi_verts);
+            if (have_elevations) poi_elevations = std::move(new_poi_elevations);
 
             // Remap sorted_poi_cells IDs
             for (auto& p : data.sorted_poi_cells)
@@ -2295,6 +2318,52 @@ int main(int argc, char* argv[]) {
             std::sort(data.sorted_poi_cells.begin(), data.sorted_poi_cells.end(), cmp);
             data.cell_to_pois.clear();
             std::cerr << "  POI records sorted: " << n << " (" << deduped << " duplicates removed)" << std::endl;
+
+            // Compute importance
+            {
+                for (size_t i = 0; i < data.poi_records.size(); i++) {
+                    auto& pr = data.poi_records[i];
+                    PoiCategory cat = static_cast<PoiCategory>(pr.category);
+                    double base = category_base_importance(cat);
+
+                    // Wiki multiplier
+                    bool has_wp = (pr.flags & POI_FLAG_WIKIPEDIA) != 0;
+                    bool has_wd = (pr.flags & POI_FLAG_WIKIDATA) != 0;
+                    double wiki_mult = 1.0;
+                    if (has_wp && has_wd) wiki_mult = 3.0;
+                    else if (has_wp) wiki_mult = 2.5;
+                    else if (has_wd) wiki_mult = 1.5;
+
+                    double raw = base * wiki_mult;
+
+                    // Peak/volcano elevation scaling
+                    if ((cat == PoiCategory::PEAK || cat == PoiCategory::VOLCANO) && i < poi_elevations.size()) {
+                        float ele = poi_elevations[i];
+                        if (ele > 0) raw *= std::min((double)ele / 2000.0, 3.0);
+                        else raw *= 0.5;
+                    }
+
+                    // Polygon area scaling
+                    if (pr.vertex_count > 0 && pr.vertex_offset != NO_DATA) {
+                        // Approximate area in km² using shoelace formula
+                        double area_deg2 = 0;
+                        for (uint32_t j = 0; j < pr.vertex_count; j++) {
+                            uint32_t k = (j + 1) % pr.vertex_count;
+                            const auto& a = data.poi_vertices[pr.vertex_offset + j];
+                            const auto& b = data.poi_vertices[pr.vertex_offset + k];
+                            area_deg2 += (double)a.lng * b.lat - (double)b.lng * a.lat;
+                        }
+                        area_deg2 = std::abs(area_deg2) / 2.0;
+                        double lat_mid = std::abs((double)pr.lat);
+                        double deg_to_km = 111.32 * std::cos(lat_mid * M_PI / 180.0);
+                        double area_km2 = area_deg2 * 111.32 * deg_to_km;
+                        if (area_km2 > 0) raw *= std::min(1.0 + std::log2(1.0 + area_km2) / 4.0, 2.0);
+                    }
+
+                    pr.importance = static_cast<uint8_t>(std::max(1.0, std::min(255.0, raw)));
+                }
+                std::cerr << "  POI importance computed" << std::endl;
+            }
         }
         log_phase("  Sort POIs", _st, _sc);
     }
@@ -2435,8 +2504,10 @@ int main(int argc, char* argv[]) {
                         first = false;
                         PoiCategory pc = static_cast<PoiCategory>(cat);
                         mf << "  \"" << (int)cat << "\": {\"name\": \""
-                           << poi_category_label(pc) << "\", \"proximity\": "
-                           << poi_get_proximity_meters(pc) << "}";
+                           << poi_category_label(pc) << "\", \"reference_distance\": "
+                           << category_reference_distance(pc) << ", \"max_distance\": "
+                           << category_max_distance(pc) << ", \"default_importance\": "
+                           << (int)category_base_importance(pc) << "}";
                     }
                     mf << "\n}\n";
                 }

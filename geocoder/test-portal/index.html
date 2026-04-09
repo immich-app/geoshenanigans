@@ -469,6 +469,9 @@ function reverseGeocode(lat, lng, source) {
   const entry = { id, lat, lng, data: null, error: null, loading: true, source };
   results.unshift(entry);
 
+  // Fly to the location
+  map.flyTo({ center: [lng, lat], zoom: Math.max(map.getZoom(), 10) });
+
   // Add a gray marker immediately
   const marker = new maplibregl.Marker({ color: MARKER_COLORS.gray })
     .setLngLat([lng, lat])

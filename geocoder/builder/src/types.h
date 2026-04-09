@@ -280,6 +280,135 @@ inline const char* poi_category_label(PoiCategory cat) {
     }
 }
 
+inline uint8_t category_base_importance(PoiCategory cat) {
+    switch (cat) {
+        case PoiCategory::VOLCANO: case PoiCategory::GLACIER:
+            return 40;
+        case PoiCategory::AERODROME: case PoiCategory::NATIONAL_PARK:
+        case PoiCategory::CATHEDRAL: case PoiCategory::PALACE:
+        case PoiCategory::ISLAND:
+            return 30;
+        case PoiCategory::MUSEUM: case PoiCategory::ATTRACTION:
+        case PoiCategory::CASTLE: case PoiCategory::STADIUM:
+        case PoiCategory::UNIVERSITY: case PoiCategory::STATION:
+        case PoiCategory::LIGHTHOUSE: case PoiCategory::WATERFALL:
+            return 20;
+        case PoiCategory::PARK: case PoiCategory::NATURE_RESERVE:
+        case PoiCategory::BEACH: case PoiCategory::RUINS:
+        case PoiCategory::FORT: case PoiCategory::MONUMENT:
+        case PoiCategory::VIEWPOINT: case PoiCategory::DAM:
+        case PoiCategory::OBSERVATORY: case PoiCategory::PROTECTED_AREA:
+            return 15;
+        case PoiCategory::PLACE_OF_WORSHIP: case PoiCategory::HOSPITAL:
+        case PoiCategory::THEATRE: case PoiCategory::CAVE_ENTRANCE:
+        case PoiCategory::BRIDGE: case PoiCategory::TOWER:
+        case PoiCategory::PEAK:
+            return 10;
+        case PoiCategory::LIBRARY: case PoiCategory::CINEMA:
+        case PoiCategory::MEMORIAL: case PoiCategory::GALLERY:
+        case PoiCategory::GARDEN: case PoiCategory::MARINA:
+        case PoiCategory::PIER: case PoiCategory::SPRING:
+        case PoiCategory::CAMP_SITE: case PoiCategory::BREWERY:
+        case PoiCategory::WINERY:
+            return 5;
+        case PoiCategory::ARTWORK: case PoiCategory::PICNIC_SITE:
+        case PoiCategory::FOUNTAIN: case PoiCategory::HOT_SPRING:
+        case PoiCategory::CLIFF: case PoiCategory::ARCH:
+        case PoiCategory::EMBASSY: case PoiCategory::CEMETERY:
+            return 2;
+        default: return 5;
+    }
+}
+
+// Half-life distance: score decays to 50% at this distance
+inline uint16_t category_reference_distance(PoiCategory cat) {
+    switch (cat) {
+        // Containment categories — ref_dist used for padding around polygon
+        case PoiCategory::THEME_PARK: case PoiCategory::ZOO: case PoiCategory::CAMP_SITE:
+        case PoiCategory::RESORT: case PoiCategory::BATTLEFIELD:
+        case PoiCategory::UNIVERSITY: case PoiCategory::COLLEGE: case PoiCategory::HOSPITAL:
+        case PoiCategory::MARKETPLACE: case PoiCategory::CEMETERY: case PoiCategory::PRISON:
+        case PoiCategory::PARK: case PoiCategory::NATURE_RESERVE: case PoiCategory::STADIUM:
+        case PoiCategory::GARDEN: case PoiCategory::WATER_PARK: case PoiCategory::GOLF_COURSE:
+        case PoiCategory::BAY: case PoiCategory::ISLAND:
+        case PoiCategory::AERODROME: case PoiCategory::NATIONAL_PARK:
+        case PoiCategory::PROTECTED_AREA: case PoiCategory::POWER_PLANT:
+            return 100;
+        case PoiCategory::MONUMENT: case PoiCategory::MEMORIAL: case PoiCategory::FOUNTAIN:
+        case PoiCategory::ARTWORK: case PoiCategory::GEYSER: case PoiCategory::PICNIC_SITE:
+        case PoiCategory::EMBASSY:
+            return 50;
+        case PoiCategory::MUSEUM: case PoiCategory::ATTRACTION: case PoiCategory::GALLERY:
+        case PoiCategory::AQUARIUM: case PoiCategory::CASTLE: case PoiCategory::SHIP:
+        case PoiCategory::PLACE_OF_WORSHIP: case PoiCategory::THEATRE: case PoiCategory::CINEMA:
+        case PoiCategory::LIBRARY: case PoiCategory::CASINO: case PoiCategory::PLANETARIUM:
+        case PoiCategory::CATHEDRAL: case PoiCategory::PALACE:
+            return 100;
+        case PoiCategory::ALPINE_HUT: case PoiCategory::RUINS: case PoiCategory::ARCHAEOLOGICAL_SITE:
+        case PoiCategory::FORT: case PoiCategory::FERRY_TERMINAL: case PoiCategory::MARINA:
+        case PoiCategory::SPRING: case PoiCategory::HOT_SPRING:
+        case PoiCategory::STATION: case PoiCategory::WINDMILL: case PoiCategory::BRIDGE:
+        case PoiCategory::PIER: case PoiCategory::WINERY: case PoiCategory::BREWERY:
+            return 200;
+        case PoiCategory::VIEWPOINT: case PoiCategory::TOWER: case PoiCategory::DAM:
+        case PoiCategory::OBSERVATORY:
+            return 300;
+        case PoiCategory::BEACH: case PoiCategory::CAVE_ENTRANCE: case PoiCategory::WATERFALL:
+        case PoiCategory::CLIFF: case PoiCategory::ARCH: case PoiCategory::LIGHTHOUSE:
+            return 500;
+        case PoiCategory::PEAK:    return 1000;
+        case PoiCategory::VOLCANO: case PoiCategory::GLACIER: case PoiCategory::CAPE:
+            return 1500;
+        default: return 100;
+    }
+}
+
+// Hard max distance before importance scaling (0 = containment only)
+inline uint16_t category_max_distance(PoiCategory cat) {
+    switch (cat) {
+        // Containment only
+        case PoiCategory::THEME_PARK: case PoiCategory::ZOO: case PoiCategory::CAMP_SITE:
+        case PoiCategory::RESORT: case PoiCategory::BATTLEFIELD:
+        case PoiCategory::UNIVERSITY: case PoiCategory::COLLEGE: case PoiCategory::HOSPITAL:
+        case PoiCategory::MARKETPLACE: case PoiCategory::CEMETERY: case PoiCategory::PRISON:
+        case PoiCategory::PARK: case PoiCategory::NATURE_RESERVE: case PoiCategory::STADIUM:
+        case PoiCategory::GARDEN: case PoiCategory::WATER_PARK: case PoiCategory::GOLF_COURSE:
+        case PoiCategory::BAY: case PoiCategory::ISLAND:
+        case PoiCategory::AERODROME: case PoiCategory::NATIONAL_PARK:
+        case PoiCategory::PROTECTED_AREA: case PoiCategory::POWER_PLANT:
+            return 0;
+        // Tiny
+        case PoiCategory::ARTWORK: case PoiCategory::FOUNTAIN: case PoiCategory::MEMORIAL:
+        case PoiCategory::PICNIC_SITE: case PoiCategory::GEYSER: case PoiCategory::MONUMENT:
+        case PoiCategory::EMBASSY:
+            return 200;
+        // Small
+        case PoiCategory::MUSEUM: case PoiCategory::ATTRACTION: case PoiCategory::CASTLE:
+        case PoiCategory::CATHEDRAL: case PoiCategory::PALACE: case PoiCategory::THEATRE:
+        case PoiCategory::CINEMA: case PoiCategory::LIBRARY: case PoiCategory::GALLERY:
+        case PoiCategory::AQUARIUM: case PoiCategory::CASINO: case PoiCategory::PLANETARIUM:
+        case PoiCategory::SHIP: case PoiCategory::PLACE_OF_WORSHIP:
+        case PoiCategory::ALPINE_HUT: case PoiCategory::RUINS:
+        case PoiCategory::ARCHAEOLOGICAL_SITE: case PoiCategory::STATION:
+        case PoiCategory::FERRY_TERMINAL: case PoiCategory::MARINA:
+        case PoiCategory::WINDMILL: case PoiCategory::WINERY: case PoiCategory::BREWERY:
+        case PoiCategory::FORT: case PoiCategory::SPRING: case PoiCategory::HOT_SPRING:
+        case PoiCategory::BRIDGE: case PoiCategory::PIER:
+            return 500;
+        // Medium
+        case PoiCategory::VIEWPOINT: case PoiCategory::TOWER: case PoiCategory::DAM:
+        case PoiCategory::OBSERVATORY: case PoiCategory::BEACH: case PoiCategory::CAVE_ENTRANCE:
+        case PoiCategory::WATERFALL: case PoiCategory::CLIFF: case PoiCategory::ARCH:
+        case PoiCategory::LIGHTHOUSE:
+            return 1000;
+        // Large
+        case PoiCategory::PEAK: case PoiCategory::VOLCANO: case PoiCategory::GLACIER:
+        case PoiCategory::CAPE:
+            return 3000;
+        default: return 500;
+    }
+}
+
 struct PoiClassification {
     PoiCategory category;
     uint8_t tier;
@@ -295,7 +424,7 @@ struct PoiRecord {
     uint8_t category;           // PoiCategory
     uint8_t tier;               // 1=major, 2=notable, 3=everything
     uint8_t flags;              // POI_FLAG_WIKIPEDIA, POI_FLAG_WIKIDATA
-    uint8_t _pad = 0;
+    uint8_t importance = 0;   // 0-255, computed at build time
 };
 
 // Collected POI relation data for parallel polygon assembly
