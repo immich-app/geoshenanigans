@@ -29,15 +29,27 @@ struct InterpWay {
     uint8_t _pad4 = 0, _pad5 = 0, _pad6 = 0; // explicit padding
 };
 
+// Place type override for admin polygons (from linked_place/border_type/place tags)
+enum class AdminPlaceType : uint8_t {
+    NONE = 0,       // use admin_level mapping
+    CITY = 1,
+    TOWN = 2,
+    VILLAGE = 3,
+    SUBURB = 4,     // includes borough
+    NEIGHBOURHOOD = 5,
+    QUARTER = 6,
+};
+
 struct AdminPolygon {
     uint32_t vertex_offset;
     uint32_t vertex_count;
     uint32_t name_id;
     uint8_t admin_level;
-    uint8_t _pad1 = 0, _pad2 = 0, _pad3 = 0; // explicit padding (zeroed)
+    uint8_t place_type_override = 0; // AdminPlaceType — overrides admin_level for field mapping
+    uint8_t _pad2 = 0, _pad3 = 0;
     float area;
     uint16_t country_code;
-    uint16_t _pad4 = 0; // explicit padding
+    uint16_t _pad4 = 0;
 };
 
 struct NodeCoord {
@@ -93,6 +105,7 @@ struct DeferredInterp {
 struct CollectedRelation {
     int64_t id;
     uint8_t admin_level;
+    uint8_t place_type_override = 0;  // AdminPlaceType
     std::string name;
     std::string country_code;
     bool is_postal;

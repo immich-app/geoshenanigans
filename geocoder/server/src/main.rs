@@ -67,8 +67,12 @@ struct AdminPolygon {
     vertex_count: u32,
     name_id: u32,
     admin_level: u8,
+    place_type_override: u8,  // 0=none, 1=city, 2=town, 3=village, 4=suburb, 5=neighbourhood, 6=quarter
+    _pad2: u8,
+    _pad3: u8,
     area: f32,
     country_code: u16,
+    _pad4: u16,
 }
 
 #[repr(C)]
@@ -200,6 +204,16 @@ impl AdminLevelConfig {
             }
         }
         self.default.get(&admin_level).copied().unwrap_or(0)
+    }
+}
+
+fn place_type_to_field(pt: u8) -> Option<&'static str> {
+    match pt {
+        1 | 2 | 3 => Some("city"),     // city, town, village
+        4 => Some("suburb"),            // suburb/borough
+        5 => Some("neighbourhood"),
+        6 => Some("suburb"),            // quarter → suburb
+        _ => None,
     }
 }
 
@@ -713,10 +727,16 @@ impl Index {
 
         for level in 0..12 {
             if let Some((_, poly, _)) = best_by_level[level] {
-                let rank = self.admin_config.to_rank(&country_code_str, poly.admin_level);
-                if rank == 0 { continue; }
+                // Determine output field: place_type_override takes priority over admin_level mapping
+                let field = if poly.place_type_override > 0 {
+                    place_type_to_field(poly.place_type_override)
+                } else {
+                    let rank = self.admin_config.to_rank(&country_code_str, poly.admin_level);
+                    if rank == 0 { continue; }
+                    rank_to_field(rank)
+                };
 
-                if let Some(field) = rank_to_field(rank) {
+                if let Some(field) = field {
                     if let Some(idx) = field_index(field) {
                         let name = self.get_string(poly.name_id);
                         if let Some(ref existing) = best_by_field[idx] {

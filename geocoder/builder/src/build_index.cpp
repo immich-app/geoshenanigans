@@ -39,6 +39,22 @@
 #include "cell_index.h"
 
 
+// --- Place type override classification ---
+
+static AdminPlaceType classify_place_override(const char* linked_place, const char* border_type, const char* place_tag) {
+    // Priority: linked_place > border_type > place (for boundary=place)
+    const char* val = linked_place ? linked_place : (border_type ? border_type : place_tag);
+    if (!val) return AdminPlaceType::NONE;
+    if (std::strcmp(val, "city") == 0) return AdminPlaceType::CITY;
+    if (std::strcmp(val, "town") == 0) return AdminPlaceType::TOWN;
+    if (std::strcmp(val, "village") == 0) return AdminPlaceType::VILLAGE;
+    if (std::strcmp(val, "borough") == 0) return AdminPlaceType::SUBURB;
+    if (std::strcmp(val, "suburb") == 0) return AdminPlaceType::SUBURB;
+    if (std::strcmp(val, "neighbourhood") == 0) return AdminPlaceType::NEIGHBOURHOOD;
+    if (std::strcmp(val, "quarter") == 0) return AdminPlaceType::QUARTER;
+    return AdminPlaceType::NONE;
+}
+
 // --- Main ---
 
 int main(int argc, char* argv[]) {
@@ -267,7 +283,37 @@ int main(int argc, char* argv[]) {
 
                         bool is_admin = (std::strcmp(boundary, "administrative") == 0);
                         bool is_postal = (std::strcmp(boundary, "postal_code") == 0);
-                        if (!is_admin && !is_postal) continue;
+                        bool is_place_boundary = (std::strcmp(boundary, "place") == 0);
+                        if (!is_admin && !is_postal && !is_place_boundary) continue;
+
+                        // Handle boundary=place relations (e.g., Washington DC)
+                        if (is_place_boundary) {
+                            const char* place_tag = rel.tag("place");
+                            if (place_tag) {
+                                AdminPlaceType pt = classify_place_override(nullptr, nullptr, place_tag);
+                                if (pt != AdminPlaceType::NONE) {
+                                    const char* name = rel.tag("name");
+                                    if (name) {
+                                        CollectedRelation cr;
+                                        cr.id = rel.id;
+                                        cr.admin_level = 15;  // special marker for boundary=place
+                                        cr.name = name;
+                                        cr.is_postal = false;
+                                        cr.place_type_override = static_cast<uint8_t>(pt);
+                                        for (size_t mi = 0; mi < rel.members.size(); mi++) {
+                                            if (rel.members[mi].type == 'w') {
+                                                cr.members.emplace_back(rel.members[mi].ref, rel.member_role(mi));
+                                            }
+                                        }
+                                        if (!cr.members.empty()) {
+                                            std::lock_guard<std::mutex> lock(rel_mutex);
+                                            data.collected_relations.push_back(std::move(cr));
+                                        }
+                                    }
+                                }
+                            }
+                            continue;
+                        }
 
                         uint8_t admin_level = 0;
                         if (is_admin) {
@@ -299,12 +345,16 @@ int main(int argc, char* argv[]) {
                             if (cc) country_code = cc;
                         }
 
+                        const char* linked_place = rel.tag("linked_place");
+                        const char* border_type_tag = rel.tag("border_type");
+
                         CollectedRelation cr;
                         cr.id = rel.id;
                         cr.admin_level = admin_level;
                         cr.name = std::move(name_str);
                         cr.country_code = std::move(country_code);
                         cr.is_postal = is_postal;
+                        cr.place_type_override = static_cast<uint8_t>(classify_place_override(linked_place, border_type_tag, nullptr));
 
                         for (size_t mi = 0; mi < rel.members.size(); mi++) {
                             if (rel.members[mi].type == 'w') {
@@ -810,6 +860,7 @@ int main(int argc, char* argv[]) {
                         std::string name;
                         uint8_t admin_level;
                         std::string country_code;
+                        uint8_t place_type_override;
                     };
                     std::vector<ClosedWayAdmin> closed_way_admins;
                     // POI way data
@@ -855,6 +906,8 @@ int main(int argc, char* argv[]) {
                     const char* t_admin_level = nullptr;
                     const char* t_postal_code = nullptr;
                     const char* t_iso = nullptr;
+                    const char* t_linked_place = nullptr;
+                    const char* t_border_type = nullptr;
                     // POI tags
                     const char* t_tourism = nullptr;
                     const char* t_historic = nullptr;
@@ -889,6 +942,7 @@ int main(int argc, char* argv[]) {
                             case 'b':
                                 if (k == "boundary") t_boundary = v;
                                 else if (k == "building") t_building = v;
+                                else if (k == "border_type") t_border_type = v;
                                 break;
                             case 'c': if (k == "craft") t_craft = v; break;
                             case 'e': if (k == "ele") t_ele = v; break;
@@ -896,7 +950,10 @@ int main(int argc, char* argv[]) {
                                 if (k == "highway") t_highway = v;
                                 else if (k == "historic") t_historic = v;
                                 break;
-                            case 'l': if (k == "leisure") t_leisure = v; break;
+                            case 'l':
+                                if (k == "leisure") t_leisure = v;
+                                else if (k == "linked_place") t_linked_place = v;
+                                break;
                             case 'm': if (k == "man_made") t_man_made = v; break;
                             case 'n':
                                 if (k == "name") t_name = v;
@@ -1075,6 +1132,7 @@ int main(int argc, char* argv[]) {
                     if (boundary) {
                         bool is_admin = (std::strcmp(boundary, "administrative") == 0);
                         bool is_postal = (std::strcmp(boundary, "postal_code") == 0);
+                        bool is_place_boundary = (std::strcmp(boundary, "place") == 0);
                         if ((is_admin || is_postal) && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1]) {
                             uint8_t al = 0;
                             if (is_admin) { const char* ls = t_admin_level; if (ls) al = static_cast<uint8_t>(std::atoi(ls)); }
@@ -1090,8 +1148,21 @@ int main(int argc, char* argv[]) {
                                         std::vector<std::pair<double,double>> verts;
                                         for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});
                                         std::string cc; if (al == 2) { const char* iso = t_iso; if (iso) cc = iso; }
-                                        local.closed_way_admins.push_back({std::move(verts), std::move(name_str), al, std::move(cc)});
+                                        auto pto = static_cast<uint8_t>(classify_place_override(t_linked_place, t_border_type, nullptr));
+                                        local.closed_way_admins.push_back({std::move(verts), std::move(name_str), al, std::move(cc), pto});
                                     }
+                                }
+                            }
+                        }
+                        // Closed way boundary=place (e.g., Washington DC)
+                        if (is_place_boundary && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1]) {
+                            const char* aname = t_name;
+                            if (aname && t_place) {
+                                AdminPlaceType pt = classify_place_override(nullptr, nullptr, t_place);
+                                if (pt != AdminPlaceType::NONE && all_valid && resolved_locs.size() >= 3) {
+                                    std::vector<std::pair<double,double>> verts;
+                                    for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});
+                                    local.closed_way_admins.push_back({std::move(verts), std::string(aname), uint8_t(15), std::string(), static_cast<uint8_t>(pt)});
                                 }
                             }
                         }
@@ -1206,7 +1277,7 @@ int main(int argc, char* argv[]) {
                         for (auto& cwa : local.closed_way_admins) {
                             const char* cc = cwa.country_code.empty() ? nullptr : cwa.country_code.c_str();
                             add_admin_polygon(data, cwa.vertices, cwa.name.c_str(),
-                                              cwa.admin_level, cc, &admin_pool);
+                                              cwa.admin_level, cc, &admin_pool, cwa.place_type_override);
                             closed_way_admin_count++;
                         }
                         local.closed_way_admins.clear();
@@ -1231,6 +1302,7 @@ int main(int argc, char* argv[]) {
                         std::string name;
                         uint8_t admin_level;
                         std::string country_code;
+                        uint8_t place_type_override;
                     };
 
                     std::vector<std::vector<AdminResult>> thread_admin_results(num_threads);
@@ -1326,6 +1398,7 @@ int main(int argc, char* argv[]) {
                                         ar.name = rel.name;
                                         ar.admin_level = rel.admin_level;
                                         ar.country_code = rel.country_code;
+                                        ar.place_type_override = rel.place_type_override;
                                         local_results.push_back(std::move(ar));
                                     }
                                 }
@@ -1359,6 +1432,7 @@ int main(int argc, char* argv[]) {
                         uint8_t admin_level;
                         std::string country_code;
                         float area;
+                        uint8_t place_type_override;
                     };
                     std::vector<PreparedPolygon> prepared(total_admin_rings);
                     {
@@ -1390,6 +1464,7 @@ int main(int argc, char* argv[]) {
                                     pp.name = std::move(ar.name);
                                     pp.admin_level = ar.admin_level;
                                     pp.country_code = std::move(ar.country_code);
+                                    pp.place_type_override = ar.place_type_override;
                                 }
                             });
                         }
@@ -1414,6 +1489,7 @@ int main(int argc, char* argv[]) {
                         poly.vertex_count = static_cast<uint32_t>(pp.simplified.size());
                         poly.name_id = data.string_pool.intern(pp.name);
                         poly.admin_level = pp.admin_level;
+                        poly.place_type_override = pp.place_type_override;
                         poly.area = pp.area;
                         const char* cc = pp.country_code.empty() ? nullptr : pp.country_code.c_str();
                         poly.country_code = (cc && cc[0] && cc[1])

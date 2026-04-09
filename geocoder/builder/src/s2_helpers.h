@@ -95,4 +95,5 @@ void add_admin_polygon(ParsedData& data,
                        const std::vector<std::pair<double,double>>& vertices_in,
                        const char* name, uint8_t admin_level,
                        const char* country_code,
-                       AdminCoverPool* admin_pool = nullptr);
+                       AdminCoverPool* admin_pool = nullptr,
+                       uint8_t place_type_override = 0);

@@ -252,7 +252,8 @@ void add_admin_polygon(ParsedData& data,
                        const std::vector<std::pair<double,double>>& vertices_in,
                        const char* name, uint8_t admin_level,
                        const char* country_code,
-                       AdminCoverPool* admin_pool) {
+                       AdminCoverPool* admin_pool,
+                       uint8_t place_type_override) {
     auto vertices = vertices_in;
     if (vertices.size() >= 4 &&
         std::fabs(vertices.front().first - vertices.back().first) < 1e-7 &&
@@ -279,6 +280,7 @@ void add_admin_polygon(ParsedData& data,
     poly.vertex_count = static_cast<uint32_t>(simplified.size());
     poly.name_id = data.string_pool.intern(name);
     poly.admin_level = admin_level;
+    poly.place_type_override = place_type_override;
     poly.area = polygon_area(simplified);
     poly.country_code = (country_code && country_code[0] && country_code[1])
         ? static_cast<uint16_t>((country_code[0] << 8) | country_code[1])
