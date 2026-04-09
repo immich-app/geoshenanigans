@@ -10,6 +10,7 @@ use s2::cellid::CellID;
 use s2::latlng::LatLng;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fs::File;
 use std::sync::{Arc, RwLock};
 
@@ -147,6 +148,62 @@ impl PoiMeta {
     }
 }
 
+// --- Admin level → address rank mapping (Nominatim approach) ---
+
+struct AdminLevelConfig {
+    default: HashMap<u8, u8>,
+    countries: HashMap<String, HashMap<u8, u8>>,
+}
+
+impl AdminLevelConfig {
+    fn load() -> Self {
+        let json: serde_json::Value = serde_json::from_str(
+            include_str!("../admin_levels.json")
+        ).expect("Failed to parse admin_levels.json");
+
+        let mut default = HashMap::new();
+        let mut countries = HashMap::new();
+
+        if let Some(obj) = json.as_object() {
+            for (key, val) in obj {
+                let map: HashMap<u8, u8> = val.as_object().unwrap_or(&serde_json::Map::new())
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        Some((k.parse::<u8>().ok()?, v.as_u64()? as u8))
+                    })
+                    .collect();
+                if key == "default" {
+                    default = map;
+                } else {
+                    countries.insert(key.to_uppercase(), map);
+                }
+            }
+        }
+        AdminLevelConfig { default, countries }
+    }
+
+    fn to_rank(&self, country_code: &str, admin_level: u8) -> u8 {
+        if let Some(overrides) = self.countries.get(country_code) {
+            if let Some(&rank) = overrides.get(&admin_level) {
+                return rank;
+            }
+        }
+        self.default.get(&admin_level).copied().unwrap_or(0)
+    }
+}
+
+fn rank_to_field(rank: u8) -> Option<&'static str> {
+    match rank {
+        4..=5 => Some("country"),
+        6..=9 => Some("state"),
+        10..=13 => Some("county"),
+        14..=17 => Some("city"),
+        18..=21 => Some("suburb"),
+        22..=25 => Some("neighbourhood"),
+        _ => None,
+    }
+}
+
 // --- Index data ---
 
 struct Index {
@@ -168,6 +225,7 @@ struct Index {
     poi_records: Option<Mmap>,
     poi_vertices: Option<Mmap>,
     poi_meta: PoiMeta,
+    admin_config: AdminLevelConfig,
     strings: Mmap,
     street_cell_level: u64,
     admin_cell_level: u64,
@@ -228,6 +286,7 @@ impl Index {
             poi_records: mmap_file_optional(&format!("{}/poi_records.bin", dir)),
             poi_vertices: mmap_file_optional(&format!("{}/poi_vertices.bin", dir)),
             poi_meta: PoiMeta::load(dir),
+            admin_config: AdminLevelConfig::load(),
             strings: mmap_file(&format!("{}/strings.bin", dir))?,
             street_cell_level,
             admin_cell_level,
@@ -603,27 +662,82 @@ impl Index {
 
         let mut result = AdminResult::default();
 
+        // Get country code from level 2 polygon
+        let country_code_str: String = best_by_level[2]
+            .and_then(|(_, poly, _)| {
+                if poly.country_code != 0 {
+                    Some(format!("{}{}",
+                        (poly.country_code >> 8) as u8 as char,
+                        (poly.country_code & 0xFF) as u8 as char
+                    ).to_uppercase())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+
+        // Map admin levels to address fields using country-specific config
+        // Track best (smallest area) polygon per output field
+        struct FieldCandidate<'b> {
+            area: f32,
+            name: &'b str,
+            country_code: u16,
+        }
+        let mut best_by_field: [Option<FieldCandidate<'_>>; 6] = Default::default();
+        // 0=country, 1=state, 2=county, 3=city, 4=suburb, 5=neighbourhood
+
+        let field_index = |field: &str| -> Option<usize> {
+            match field {
+                "country" => Some(0), "state" => Some(1), "county" => Some(2),
+                "city" => Some(3), "suburb" => Some(4), "neighbourhood" => Some(5),
+                _ => None,
+            }
+        };
+
         for level in 0..12 {
             if let Some((_, poly, _)) = best_by_level[level] {
-                let name = self.get_string(poly.name_id);
-                match poly.admin_level {
-                    2 => {
-                        result.country = Some(name);
-                        if poly.country_code != 0 {
-                            result.country_code = Some([
-                                (poly.country_code >> 8) as u8,
-                                (poly.country_code & 0xFF) as u8,
-                            ]);
+                let rank = self.admin_config.to_rank(&country_code_str, poly.admin_level);
+                if rank == 0 { continue; }
+
+                if let Some(field) = rank_to_field(rank) {
+                    if let Some(idx) = field_index(field) {
+                        let name = self.get_string(poly.name_id);
+                        if let Some(ref existing) = best_by_field[idx] {
+                            if poly.area >= existing.area { continue; }
                         }
+                        best_by_field[idx] = Some(FieldCandidate {
+                            area: poly.area, name, country_code: poly.country_code
+                        });
                     }
-                    4 => result.state = Some(name),
-                    6 => result.county = Some(name),
-                    8 => result.city = Some(name),
-                    11 => result.postcode = Some(name),
-                    _ => {}
                 }
             }
         }
+
+        // Also handle postcode (level 11 postal boundaries kept as before)
+        for level in 0..12 {
+            if let Some((_, poly, _)) = best_by_level[level] {
+                if poly.admin_level == 11 {
+                    result.postcode = Some(self.get_string(poly.name_id));
+                    break;
+                }
+            }
+        }
+
+        // Fill result
+        if let Some(ref c) = best_by_field[0] {
+            result.country = Some(c.name);
+            if c.country_code != 0 {
+                result.country_code = Some([
+                    (c.country_code >> 8) as u8,
+                    (c.country_code & 0xFF) as u8,
+                ]);
+            }
+        }
+        result.state = best_by_field[1].as_ref().map(|c| c.name);
+        result.county = best_by_field[2].as_ref().map(|c| c.name);
+        result.city = best_by_field[3].as_ref().map(|c| c.name);
+        result.suburb = best_by_field[4].as_ref().map(|c| c.name);
+        result.neighbourhood = best_by_field[5].as_ref().map(|c| c.name);
 
         result
     }
@@ -804,6 +918,8 @@ impl Index {
             city: admin.city,
             state: admin.state,
             county: admin.county,
+            suburb: admin.suburb,
+            neighbourhood: admin.neighbourhood,
             postcode: admin.postcode,
             country: admin.country,
             country_code: admin.country_code.map(|c| String::from_utf8_lossy(&c).into_owned()),
@@ -889,6 +1005,8 @@ struct AdminResult<'a> {
     state: Option<&'a str>,
     county: Option<&'a str>,
     city: Option<&'a str>,
+    suburb: Option<&'a str>,
+    neighbourhood: Option<&'a str>,
     postcode: Option<&'a str>,
 }
 
@@ -904,6 +1022,10 @@ struct AddressDetails<'a> {
     state: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     county: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suburb: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    neighbourhood: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     postcode: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
