@@ -11,6 +11,7 @@
 #include <numeric>
 #include <optional>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -2420,6 +2421,25 @@ int main(int argc, char* argv[]) {
                 }
                 write_cell_index(poi_dir + "/poi_cells.bin", poi_dir + "/poi_entries.bin",
                                  filtered_cell_map);
+
+                // Write poi_meta.json (category metadata for the server)
+                {
+                    std::ofstream mf(poi_dir + "/poi_meta.json");
+                    mf << "{\n";
+                    bool first = true;
+                    // Collect categories present in this tier
+                    std::set<uint8_t> cats;
+                    for (const auto& r : filtered_records) cats.insert(r.category);
+                    for (uint8_t cat : cats) {
+                        if (!first) mf << ",\n";
+                        first = false;
+                        PoiCategory pc = static_cast<PoiCategory>(cat);
+                        mf << "  \"" << (int)cat << "\": {\"name\": \""
+                           << poi_category_label(pc) << "\", \"proximity\": "
+                           << poi_get_proximity_meters(pc) << "}";
+                    }
+                    mf << "\n}\n";
+                }
 
                 std::cerr << "  POI " << tier_var.name << ": "
                           << filtered_records.size() << " records, "

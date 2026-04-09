@@ -236,6 +236,50 @@ inline uint16_t poi_get_proximity_meters(PoiCategory cat) {
 static constexpr uint8_t POI_FLAG_WIKIPEDIA = 0x01;
 static constexpr uint8_t POI_FLAG_WIKIDATA  = 0x02;
 
+inline const char* poi_category_label(PoiCategory cat) {
+    switch (cat) {
+        case PoiCategory::MUSEUM: return "museum"; case PoiCategory::ATTRACTION: return "attraction";
+        case PoiCategory::VIEWPOINT: return "viewpoint"; case PoiCategory::THEME_PARK: return "theme_park";
+        case PoiCategory::ZOO: return "zoo"; case PoiCategory::GALLERY: return "gallery";
+        case PoiCategory::ARTWORK: return "artwork"; case PoiCategory::ALPINE_HUT: return "alpine_hut";
+        case PoiCategory::AQUARIUM: return "aquarium"; case PoiCategory::CAMP_SITE: return "camp_site";
+        case PoiCategory::PICNIC_SITE: return "picnic_site"; case PoiCategory::RESORT: return "resort";
+        case PoiCategory::CASTLE: return "castle"; case PoiCategory::MONUMENT: return "monument";
+        case PoiCategory::RUINS: return "ruins"; case PoiCategory::ARCHAEOLOGICAL_SITE: return "archaeological_site";
+        case PoiCategory::MEMORIAL: return "memorial"; case PoiCategory::BATTLEFIELD: return "battlefield";
+        case PoiCategory::FORT: return "fort"; case PoiCategory::SHIP: return "ship";
+        case PoiCategory::PLACE_OF_WORSHIP: return "place_of_worship"; case PoiCategory::UNIVERSITY: return "university";
+        case PoiCategory::COLLEGE: return "college"; case PoiCategory::HOSPITAL: return "hospital";
+        case PoiCategory::THEATRE: return "theatre"; case PoiCategory::CINEMA: return "cinema";
+        case PoiCategory::LIBRARY: return "library"; case PoiCategory::MARKETPLACE: return "marketplace";
+        case PoiCategory::EMBASSY: return "embassy"; case PoiCategory::FOUNTAIN: return "fountain";
+        case PoiCategory::CASINO: return "casino"; case PoiCategory::CEMETERY: return "cemetery";
+        case PoiCategory::FERRY_TERMINAL: return "ferry_terminal"; case PoiCategory::PLANETARIUM: return "planetarium";
+        case PoiCategory::PRISON: return "prison";
+        case PoiCategory::PARK: return "park"; case PoiCategory::NATURE_RESERVE: return "nature_reserve";
+        case PoiCategory::STADIUM: return "stadium"; case PoiCategory::GARDEN: return "garden";
+        case PoiCategory::WATER_PARK: return "water_park"; case PoiCategory::GOLF_COURSE: return "golf_course";
+        case PoiCategory::MARINA: return "marina";
+        case PoiCategory::PEAK: return "peak"; case PoiCategory::VOLCANO: return "volcano";
+        case PoiCategory::BEACH: return "beach"; case PoiCategory::CAVE_ENTRANCE: return "cave_entrance";
+        case PoiCategory::SPRING: return "spring"; case PoiCategory::WATERFALL: return "waterfall";
+        case PoiCategory::GLACIER: return "glacier"; case PoiCategory::CLIFF: return "cliff";
+        case PoiCategory::ARCH: return "arch"; case PoiCategory::HOT_SPRING: return "hot_spring";
+        case PoiCategory::GEYSER: return "geyser"; case PoiCategory::BAY: return "bay";
+        case PoiCategory::CAPE: return "cape"; case PoiCategory::ISLAND: return "island";
+        case PoiCategory::AERODROME: return "aerodrome"; case PoiCategory::STATION: return "station";
+        case PoiCategory::TOWER: return "tower"; case PoiCategory::LIGHTHOUSE: return "lighthouse";
+        case PoiCategory::WINDMILL: return "windmill"; case PoiCategory::BRIDGE: return "bridge";
+        case PoiCategory::PIER: return "pier"; case PoiCategory::DAM: return "dam";
+        case PoiCategory::OBSERVATORY: return "observatory";
+        case PoiCategory::CATHEDRAL: return "cathedral"; case PoiCategory::PALACE: return "palace";
+        case PoiCategory::NATIONAL_PARK: return "national_park"; case PoiCategory::PROTECTED_AREA: return "protected_area";
+        case PoiCategory::WINERY: return "winery"; case PoiCategory::BREWERY: return "brewery";
+        case PoiCategory::POWER_PLANT: return "power_plant";
+        default: return "unknown";
+    }
+}
+
 struct PoiClassification {
     PoiCategory category;
     uint8_t tier;

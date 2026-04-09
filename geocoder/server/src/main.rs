@@ -77,6 +77,64 @@ struct NodeCoord {
     lng: f32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PoiRecord {
+    lat: f32,
+    lng: f32,
+    vertex_offset: u32,
+    vertex_count: u32,
+    name_id: u32,
+    category: u8,
+    tier: u8,
+    flags: u8,
+    _pad: u8,
+}
+
+const POI_FLAG_WIKIPEDIA: u8 = 0x01;
+const POI_FLAG_WIKIDATA: u8 = 0x02;
+
+// POI category metadata — loaded from poi_meta.json (written by builder)
+// Maps category ID → (name, proximity_meters)
+struct PoiMeta {
+    categories: std::collections::HashMap<u8, PoiCategoryMeta>,
+}
+
+#[derive(Deserialize)]
+struct PoiCategoryMeta {
+    name: String,
+    proximity: f64,
+}
+
+impl PoiMeta {
+    fn load(dir: &str) -> Self {
+        let path = format!("{}/poi_meta.json", dir);
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(raw) = serde_json::from_str::<std::collections::HashMap<String, PoiCategoryMeta>>(&data) {
+                let categories = raw.into_iter()
+                    .filter_map(|(k, v)| k.parse::<u8>().ok().map(|id| (id, v)))
+                    .collect();
+                return PoiMeta { categories };
+            }
+        }
+        PoiMeta { categories: std::collections::HashMap::new() }
+    }
+
+    fn category_name(&self, id: u8) -> &str {
+        self.categories.get(&id).map(|c| c.name.as_str()).unwrap_or("unknown")
+    }
+
+    fn proximity_meters(&self, id: u8, flags: u8) -> f64 {
+        let base = self.categories.get(&id).map(|c| c.proximity).unwrap_or(100.0);
+        let has_wiki = (flags & (POI_FLAG_WIKIPEDIA | POI_FLAG_WIKIDATA)) != 0;
+        if has_wiki {
+            if base > 0.0 { base * 2.0 } else { 200.0 }
+        } else {
+            base
+        }
+    }
+}
+
 // --- Index data ---
 
 struct Index {
@@ -93,6 +151,11 @@ struct Index {
     admin_entries: Mmap,
     admin_polygons: Mmap,
     admin_vertices: Mmap,
+    poi_cells: Option<Mmap>,
+    poi_entries: Option<Mmap>,
+    poi_records: Option<Mmap>,
+    poi_vertices: Option<Mmap>,
+    poi_meta: PoiMeta,
     strings: Mmap,
     street_cell_level: u64,
     admin_cell_level: u64,
@@ -148,6 +211,11 @@ impl Index {
             admin_entries: mmap_file(&format!("{}/admin_entries.bin", dir))?,
             admin_polygons: mmap_file(&format!("{}/admin_polygons.bin", dir))?,
             admin_vertices: mmap_file(&format!("{}/admin_vertices.bin", dir))?,
+            poi_cells: mmap_file_optional(&format!("{}/poi_cells.bin", dir)),
+            poi_entries: mmap_file_optional(&format!("{}/poi_entries.bin", dir)),
+            poi_records: mmap_file_optional(&format!("{}/poi_records.bin", dir)),
+            poi_vertices: mmap_file_optional(&format!("{}/poi_vertices.bin", dir)),
+            poi_meta: PoiMeta::load(dir),
             strings: mmap_file(&format!("{}/strings.bin", dir))?,
             street_cell_level,
             admin_cell_level,
@@ -501,6 +569,118 @@ impl Index {
         result
     }
 
+    // --- POI lookup ---
+
+    fn find_pois(&self, lat: f64, lng: f64) -> Vec<PoiMatch<'_>> {
+        let poi_cells = match &self.poi_cells {
+            Some(c) => c,
+            None => return vec![],
+        };
+        let poi_entries = match &self.poi_entries {
+            Some(e) => e,
+            None => return vec![],
+        };
+        let poi_records_mmap = match &self.poi_records {
+            Some(r) => r,
+            None => return vec![],
+        };
+
+        let all_pois: &[PoiRecord] = unsafe {
+            std::slice::from_raw_parts(
+                poi_records_mmap.as_ptr() as *const PoiRecord,
+                poi_records_mmap.len() / std::mem::size_of::<PoiRecord>(),
+            )
+        };
+        let all_poi_vertices: &[NodeCoord] = match &self.poi_vertices {
+            Some(v) => unsafe {
+                std::slice::from_raw_parts(
+                    v.as_ptr() as *const NodeCoord,
+                    v.len() / std::mem::size_of::<NodeCoord>(),
+                )
+            },
+            None => &[],
+        };
+
+        let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
+        let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
+
+        const INTERIOR_FLAG: u32 = 0x80000000;
+        const ID_MASK: u32 = 0x7FFFFFFF;
+
+        let mut results: Vec<PoiMatch<'_>> = Vec::new();
+
+        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+            Self::for_each_entry(poi_entries, Self::lookup_admin_cell(poi_cells, c), |id| {
+                let is_interior = (id & INTERIOR_FLAG) != 0;
+                let poi_id = (id & ID_MASK) as usize;
+                if poi_id >= all_pois.len() { return; }
+                let poi = &all_pois[poi_id];
+                let name = self.get_string(poi.name_id);
+                if name.is_empty() { return; }
+
+                let prox_m = self.poi_meta.proximity_meters(poi.category, poi.flags);
+
+                // Check relevance: polygon containment or distance within proximity
+                let dist_m;
+                let contained;
+
+                let cos_lat = lat.to_radians().cos();
+
+                if poi.vertex_count > 0 && (poi.vertex_offset as usize) < all_poi_vertices.len() {
+                    let offset = poi.vertex_offset as usize;
+                    let count = poi.vertex_count as usize;
+                    let verts = &all_poi_vertices[offset..offset + count];
+                    contained = is_interior || point_in_polygon(lat as f32, lng as f32, verts);
+
+                    if contained {
+                        dist_m = 0.0;
+                    } else {
+                        // Distance to nearest polygon edge (not centroid)
+                        let mut min_dist_sq = f64::MAX;
+                        for i in 0..count {
+                            let j = if i + 1 < count { i + 1 } else { 0 };
+                            let d = point_to_segment_distance(
+                                lat, lng,
+                                verts[i].lat as f64, verts[i].lng as f64,
+                                verts[j].lat as f64, verts[j].lng as f64,
+                                cos_lat,
+                            );
+                            if d < min_dist_sq { min_dist_sq = d; }
+                        }
+                        dist_m = min_dist_sq.sqrt() * 6_371_000.0;
+                    }
+                } else {
+                    contained = false;
+                    let dlat = (lat - poi.lat as f64).to_radians();
+                    let dlng = (lng - poi.lng as f64).to_radians();
+                    dist_m = (dlat * dlat + dlng * dlng * cos_lat * cos_lat).sqrt() * 6_371_000.0;
+                }
+
+                let relevant = contained || dist_m <= prox_m;
+                if !relevant { return; }
+
+                results.push(PoiMatch {
+                    name,
+                    category: self.poi_meta.category_name(poi.category),
+                    tier: poi.tier,
+                    distance_m: if contained { 0.0 } else { dist_m },
+                    contained,
+                });
+            });
+        }
+
+        // Sort by: contained first, then tier (lower=more important), then distance
+        results.sort_by(|a, b| {
+            b.contained.cmp(&a.contained)
+                .then(a.tier.cmp(&b.tier))
+                .then(a.distance_m.partial_cmp(&b.distance_m).unwrap())
+        });
+        let mut seen = std::collections::HashSet::new();
+        results.retain(|r| seen.insert(r.name));
+        results.truncate(5);
+        results
+    }
+
     // --- Combined query ---
 
     fn query(&self, lat: f64, lng: f64) -> Address<'_> {
@@ -539,6 +719,13 @@ impl Index {
             return Address::default();
         }
 
+        let pois = self.find_pois(lat, lng);
+        let places: Vec<PoiDetail> = pois.into_iter().map(|p| PoiDetail {
+            name: p.name.to_string(),
+            category: p.category.to_string(),
+            distance_m: (p.distance_m * 10.0).round() / 10.0,
+        }).collect();
+
         let address = AddressDetails {
             house_number,
             road,
@@ -550,7 +737,7 @@ impl Index {
             country_code: admin.country_code.map(|c| String::from_utf8_lossy(&c).into_owned()),
         };
         let display_name = format_address(&address);
-        Address { display_name, address }
+        Address { display_name, address, places }
     }
 }
 
@@ -615,6 +802,14 @@ fn point_in_polygon(lat: f32, lng: f32, vertices: &[NodeCoord]) -> bool {
 
 // --- API types ---
 
+struct PoiMatch<'a> {
+    name: &'a str,
+    category: &'a str,
+    tier: u8,
+    distance_m: f64,
+    contained: bool,
+}
+
 #[derive(Default)]
 struct AdminResult<'a> {
     country: Option<&'a str>,
@@ -645,11 +840,20 @@ struct AddressDetails<'a> {
     country_code: Option<String>,
 }
 
+#[derive(Serialize)]
+struct PoiDetail {
+    name: String,
+    category: String,
+    distance_m: f64,
+}
+
 #[derive(Serialize, Default)]
 struct Address<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     display_name: Option<String>,
     address: AddressDetails<'a>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    places: Vec<PoiDetail>,
 }
 
 // Address formatting patterns by country code
@@ -795,14 +999,20 @@ async fn main() {
     eprintln!("Loading index from {}...", data_dir);
     let index = match Index::load(data_dir, street_cell_level, admin_cell_level, search_distance) {
         Ok(idx) => {
+            let poi_status = if idx.poi_records.is_some() {
+                let count = idx.poi_records.as_ref().unwrap().len() / std::mem::size_of::<PoiRecord>();
+                format!(" + {} POIs ({} categories)", count, idx.poi_meta.categories.len())
+            } else {
+                String::new()
+            };
             if idx.geo_cells.is_some() {
                 if idx.addr_points.is_some() {
-                    eprintln!("Loaded full index (admin + geo + addresses)");
+                    eprintln!("Loaded full index (admin + geo + addresses{})", poi_status);
                 } else {
-                    eprintln!("Loaded streets index (admin + geo, no addresses)");
+                    eprintln!("Loaded streets index (admin + geo, no addresses{})", poi_status);
                 }
             } else {
-                eprintln!("Loaded admin-only index (geo files not found)");
+                eprintln!("Loaded admin-only index (geo files not found{})", poi_status);
             }
             Arc::new(idx)
         }
