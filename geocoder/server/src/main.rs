@@ -886,37 +886,44 @@ impl Index {
         // Convert to result — find best city-like place (city > town > village)
         let mut result = PlaceResult::default();
 
-        // Max distance thresholds (squared radians) for each place type
-        // Max search radii from Nominatim's reverse_place_diameter() / 2
-        let max_city = (9000.0_f64 / 111320.0).powi(2);             // 9km (rank<=17: 0.16deg diameter)
-        let max_town = (9000.0_f64 / 111320.0).powi(2);             // 9km (same rank range)
-        let max_village = (9000.0_f64 / 111320.0).powi(2);          // 9km (same rank range)
-        let max_suburb = (2200.0_f64 / 111320.0).powi(2);           // 2.2km (rank<=19: 0.04deg diameter)
-        let max_neighbourhood = (1100.0_f64 / 111320.0).powi(2);    // 1.1km (rank>19: 0.02deg diameter)
+        // Max search radii from Nominatim's reverse_place_diameter(), by rank
+        // rank<=17 (city/town/village): 0.16deg diameter → 0.08deg radius
+        // rank<=18: 0.08deg diameter → 0.04deg radius
+        // rank<=19 (suburb): 0.04deg diameter → 0.02deg radius
+        // rank>19 (neighbourhood+): 0.02deg diameter → 0.01deg radius
+        let max_rank17 = (0.08_f64).to_radians().powi(2); // city/town/village
+        let max_rank19 = (0.02_f64).to_radians().powi(2); // suburb
+        let max_rank20 = (0.01_f64).to_radians().powi(2); // neighbourhood/hamlet/quarter
 
-        // City: prefer city > town > village
-        for (pt, max_dist) in [(0, max_city), (1, max_town), (2, max_village)] {
+        // Place types: 0=city, 1=town, 2=village, 3=suburb, 4=hamlet, 5=neighbourhood, 6=quarter
+        // City field: prefer city > town > village (all rank 16, same threshold)
+        for pt in [0, 1, 2] {
             if let Some((dist_sq, pn)) = best[pt] {
-                if dist_sq <= max_dist {
-                    result.city = Some(self.get_string(pn.name_id));
+                if dist_sq <= max_rank17 {
+                    let name = self.get_string(pn.name_id);
+                    match pt {
+                        0 => result.city = Some(name),
+                        1 => result.town = Some(name),
+                        _ => result.village = Some(name),
+                    }
                     break;
                 }
             }
         }
 
-        // Suburb: prefer suburb > quarter > hamlet
-        for (pt, max_dist) in [(3, max_suburb), (6, max_suburb), (4, max_suburb)] {
+        // Suburb: prefer suburb > quarter > hamlet (all rank 19-20)
+        for pt in [3, 6, 4] {
             if let Some((dist_sq, pn)) = best[pt] {
-                if dist_sq <= max_dist {
+                if dist_sq <= max_rank19 {
                     result.suburb = Some(self.get_string(pn.name_id));
                     break;
                 }
             }
         }
 
-        // Neighbourhood
+        // Neighbourhood (rank 24)
         if let Some((dist_sq, pn)) = best[5] {
-            if dist_sq <= max_neighbourhood {
+            if dist_sq <= max_rank20 {
                 result.neighbourhood = Some(self.get_string(pn.name_id));
             }
         }
@@ -1100,6 +1107,8 @@ impl Index {
             house_number,
             road,
             city: admin.city.or(place.city),
+            town: place.town,
+            village: place.village,
             municipality: admin.municipality,
             state: admin.state,
             county: admin.county,
@@ -1186,6 +1195,8 @@ struct PoiMatch<'a> {
 #[derive(Default)]
 struct PlaceResult<'a> {
     city: Option<&'a str>,
+    town: Option<&'a str>,
+    village: Option<&'a str>,
     suburb: Option<&'a str>,
     neighbourhood: Option<&'a str>,
 }
@@ -1211,6 +1222,10 @@ struct AddressDetails<'a> {
     road: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     city: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    town: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    village: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     municipality: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
