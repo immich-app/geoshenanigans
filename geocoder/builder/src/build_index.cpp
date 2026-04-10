@@ -191,6 +191,62 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
               << csv_files.size() << " files" << std::endl;
     std::cerr << "  Interp ways now: " << data.interp_ways.size()
               << " (" << loaded_rows << " from TIGER)" << std::endl;
+
+    // Create place nodes from TIGER city names (postal city coverage)
+    // For each unique city name, compute centroid from all TIGER entries with that name
+    struct CityAccum { double sum_lat = 0, sum_lng = 0; uint64_t count = 0; };
+    std::unordered_map<std::string, CityAccum> city_centroids;
+
+    // Re-read CSV files to collect city centroids (lightweight pass)
+    for (const auto& csv_file : csv_files) {
+        std::ifstream f(csv_file);
+        if (!f) continue;
+        std::string header_line;
+        std::getline(f, header_line);
+        std::string line;
+        while (std::getline(f, line)) {
+            std::vector<std::string> fields;
+            size_t pos = 0;
+            while (pos < line.size()) {
+                size_t next = line.find(';', pos);
+                if (next == std::string::npos) next = line.size();
+                fields.push_back(line.substr(pos, next - pos));
+                pos = next + 1;
+            }
+            if (fields.size() < 8) continue;
+            const std::string& city = fields[4];
+            const std::string& geometry = fields[7];
+            if (city.empty() || geometry.find("LINESTRING") == std::string::npos) continue;
+
+            // Get first coordinate as a rough centroid
+            size_t paren = geometry.find('(');
+            if (paren == std::string::npos) continue;
+            char* end;
+            double lng = std::strtod(geometry.c_str() + paren + 1, &end);
+            double lat = std::strtod(end, &end);
+            if (lat == 0 && lng == 0) continue;
+
+            auto& acc = city_centroids[city];
+            acc.sum_lat += lat;
+            acc.sum_lng += lng;
+            acc.count++;
+        }
+    }
+
+    // Create place=town nodes for each TIGER city
+    uint64_t tiger_places = 0;
+    for (const auto& [city_name, acc] : city_centroids) {
+        if (acc.count < 5) continue; // skip very sparse cities
+        PlaceNode pn{};
+        pn.lat = static_cast<float>(acc.sum_lat / acc.count);
+        pn.lng = static_cast<float>(acc.sum_lng / acc.count);
+        pn.name_id = data.string_pool.intern(city_name);
+        pn.place_type = static_cast<uint8_t>(PlaceType::TOWN); // TIGER cities as towns
+        data.place_nodes.push_back(pn);
+        tiger_places++;
+    }
+    std::cerr << "  TIGER: created " << tiger_places << " place nodes from "
+              << city_centroids.size() << " unique city names" << std::endl;
 }
 
 // --- Main ---
