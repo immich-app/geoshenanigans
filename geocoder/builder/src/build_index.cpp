@@ -517,6 +517,7 @@ int main(int argc, char* argv[]) {
             PbfFile pbf(input_file, num_threads);
 
             std::vector<std::string> rel_wikidata; // parallel to data.collected_relations
+            std::unordered_set<int64_t> wanted_label_nodes; // node IDs referenced as role=label
             {
                 std::mutex rel_mutex;
                 pbf.read_blocks([&](PbfBlock& block, unsigned) {
@@ -529,6 +530,15 @@ int main(int argc, char* argv[]) {
                         bool is_place_boundary = (std::strcmp(boundary, "place") == 0);
                         if (!is_admin && !is_postal && !is_place_boundary) continue;
 
+                        // Capture label member node (Nominatim's primary place-link lookup)
+                        int64_t label_node_id = -1;
+                        for (size_t mi = 0; mi < rel.members.size(); mi++) {
+                            if (rel.members[mi].type == 'n' && rel.member_role(mi) == "label") {
+                                label_node_id = rel.members[mi].ref;
+                                break;
+                            }
+                        }
+
                         // Handle boundary=place relations (e.g., Washington DC)
                         if (is_place_boundary) {
                             const char* place_tag = rel.tag("place");
@@ -539,6 +549,7 @@ int main(int argc, char* argv[]) {
                                     if (name) {
                                         CollectedRelation cr;
                                         cr.id = rel.id;
+                                        cr.label_node_id = label_node_id;
                                         cr.admin_level = 15;  // special marker for boundary=place
                                         cr.name = name;
                                         cr.is_postal = false;
@@ -552,6 +563,7 @@ int main(int argc, char* argv[]) {
                                             std::lock_guard<std::mutex> lock(rel_mutex);
                                             data.collected_relations.push_back(std::move(cr));
                                             rel_wikidata.emplace_back(); // already has override, no wikidata needed
+                                            if (label_node_id >= 0) wanted_label_nodes.insert(label_node_id);
                                         }
                                     }
                                 }
@@ -595,6 +607,7 @@ int main(int argc, char* argv[]) {
 
                         CollectedRelation cr;
                         cr.id = rel.id;
+                        cr.label_node_id = label_node_id;
                         cr.admin_level = admin_level;
                         cr.name = std::move(name_str);
                         cr.country_code = std::move(country_code);
@@ -616,6 +629,7 @@ int main(int argc, char* argv[]) {
                             std::lock_guard<std::mutex> lock(rel_mutex);
                             data.collected_relations.push_back(std::move(cr));
                             rel_wikidata.push_back(std::move(wd_str));
+                            if (label_node_id >= 0) wanted_label_nodes.insert(label_node_id);
                         }
                     }
                     // --- POI relation scanning (same pass) ---
@@ -896,12 +910,14 @@ int main(int argc, char* argv[]) {
 
             std::cerr << "  Pass 2: processing nodes with " << num_threads << " threads..." << std::endl;
             std::unordered_map<std::string, uint8_t> wikidata_to_place_type;
+            std::unordered_map<int64_t, uint8_t> label_node_to_place_type; // node_id → PlaceType
             {
                 struct NodeThreadLocal {
                     std::vector<std::pair<double,double>> addr_coords;
                     std::vector<std::pair<std::string,std::string>> addr_strings;
                     std::vector<std::string> addr_postcodes; // parallel to addr_strings
                     uint64_t count = 0;
+                    std::vector<std::pair<int64_t, uint8_t>> label_hits; // (node_id, PlaceType)
                     // POI node data
                     std::vector<PoiRecord> poi_records;
                     std::vector<std::string> poi_names;
@@ -1052,6 +1068,10 @@ int main(int argc, char* argv[]) {
                                 if (n_wikidata) {
                                     tl_node_data->place_wikidata.push_back({n_wikidata, static_cast<uint8_t>(pt)});
                                 }
+                                // Capture label-role linking (Nominatim's primary method)
+                                if (wanted_label_nodes.count(id)) {
+                                    tl_node_data->label_hits.push_back({id, static_cast<uint8_t>(pt)});
+                                }
                             }
                         }
                     }
@@ -1101,9 +1121,20 @@ int main(int argc, char* argv[]) {
                     }
                     local.place_wikidata.clear();
                 }
+                // Build label-node → place type map (Nominatim's primary link method)
+                for (auto& local : ntld) {
+                    for (auto& [nid, pt] : local.label_hits) {
+                        label_node_to_place_type[nid] = pt;
+                    }
+                    local.label_hits.clear();
+                }
                 if (!wikidata_to_place_type.empty()) {
                     std::cerr << "  Built wikidata→place_type map: "
                               << wikidata_to_place_type.size() << " entries." << std::endl;
+                }
+                if (!label_node_to_place_type.empty()) {
+                    std::cerr << "  Built label-node→place_type map: "
+                              << label_node_to_place_type.size() << " entries." << std::endl;
                 }
                 std::cerr << "  Node processing complete: " << total_addrs
                           << " address points, " << total_poi_nodes
@@ -1710,8 +1741,15 @@ int main(int argc, char* argv[]) {
                                               << found << " found, " << missing << " missing)" << std::endl;
                                 }
 
-                                // Wikidata-based place linking
+                                // Place linking (Nominatim order): label role > wikidata > already-set tag
                                 uint8_t pto = rel.place_type_override;
+                                if (pto == 0 && rel.label_node_id >= 0) {
+                                    auto it = label_node_to_place_type.find(rel.label_node_id);
+                                    if (it != label_node_to_place_type.end()) {
+                                        pto = place_type_to_admin_override(it->second);
+                                        if (pto != 0) wikidata_linked_count.fetch_add(1);
+                                    }
+                                }
                                 if (pto == 0 && !rel_wikidata[i].empty()) {
                                     auto it = wikidata_to_place_type.find(rel_wikidata[i]);
                                     if (it != wikidata_to_place_type.end()) {

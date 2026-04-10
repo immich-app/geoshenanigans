@@ -105,6 +105,7 @@ struct DeferredInterp {
 // Collected relation data for parallel admin assembly
 struct CollectedRelation {
     int64_t id;
+    int64_t label_node_id = -1;  // role=label place node (Nominatim's primary link target)
     uint8_t admin_level;
     uint8_t place_type_override = 0;  // AdminPlaceType
     std::string name;
