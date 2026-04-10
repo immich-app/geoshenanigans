@@ -250,7 +250,7 @@ fn rank_to_field(rank: u8) -> Option<&'static str> {
         18..=19 => Some("city_district"),
         20..=21 => Some("suburb"),
         22..=23 => Some("neighbourhood"),
-        24..=25 => Some("neighbourhood"), // city_block → neighbourhood
+        24..=25 => Some("city_block"),
         _ => None,
     }
 }
@@ -785,6 +785,7 @@ impl Index {
         // 5 county 6 district 7 municipality
         // 8 city 9 town 10 village 11 hamlet
         // 12 city_district 13 borough 14 suburb 15 quarter 16 neighbourhood
+        // 17 city_block
 
         let field_index = |field: &str| -> Option<usize> {
             match field {
@@ -805,13 +806,18 @@ impl Index {
                 "suburb" => Some(14),
                 "quarter" => Some(15),
                 "neighbourhood" => Some(16),
+                "city_block" => Some(17),
                 _ => None,
             }
         };
 
         // Collect polygons at this point with their effective rank_address.
-        // (level, rank_address, override, name, area, country_code)
+        // Process in admin_level order (ascending) so that each polygon's
+        // parent is the previously-processed polygon with the highest
+        // admin_level strictly less than self — matching Nominatim's
+        // placex_triggers.sql nested-boundary rank adjustment.
         struct RankedPoly<'b> {
+            admin_level: u8,
             rank_address: u8,
             place_type_override: u8,
             name: &'b str,
@@ -823,15 +829,12 @@ impl Index {
             if let Some((_, poly, _)) = best_by_level[level] {
                 if poly.admin_level == 11 { continue; } // postal code, handled separately
 
-                let rank = if poly.place_type_override > 0 {
-                    place_type_to_rank(poly.place_type_override)
-                } else {
-                    self.admin_config.to_rank(&country_code_str, poly.admin_level)
-                };
-                if rank == 0 { continue; }
+                let initial_rank = self.admin_config.to_rank(&country_code_str, poly.admin_level);
+                if initial_rank == 0 && poly.place_type_override == 0 { continue; }
 
                 ranked.push(RankedPoly {
-                    rank_address: rank,
+                    admin_level: poly.admin_level,
+                    rank_address: initial_rank,
                     place_type_override: poly.place_type_override,
                     name: self.get_string(poly.name_id),
                     area: poly.area,
@@ -840,24 +843,37 @@ impl Index {
             }
         }
 
-        // Nominatim's nested-boundary rank adjustment (placex_triggers.sql):
-        // if a child boundary has rank_address ≤ its parent's, bump it by 2.
-        // We sort by rank_address ascending (coarsest first), tie-breaking by
-        // larger area (the presumed parent). Then for each polygon, if its
-        // rank is ≤ the previous one's rank, bump it past its parent.
-        // Plain area-descending sort is unreliable: Metropolitan France L3
-        // has a slightly larger area than France L2 in the simplified index
-        // because France includes overseas territories with tiny geometry,
-        // so a pure area sort flips the hierarchy.
+        // Sort by admin_level ascending. Ties (same admin_level) broken by
+        // area descending (the larger polygon is assumed to be the parent).
         ranked.sort_by(|a, b| {
-            a.rank_address.cmp(&b.rank_address)
+            a.admin_level.cmp(&b.admin_level)
                 .then(b.area.partial_cmp(&a.area).unwrap_or(std::cmp::Ordering::Equal))
         });
-        for i in 1..ranked.len() {
-            let parent_rank = ranked[i - 1].rank_address;
-            if ranked[i].rank_address <= parent_rank {
-                ranked[i].rank_address = parent_rank + 2;
+
+        // Nominatim's nested-boundary rank adjustment followed by linked
+        // place override (placex_triggers.sql lines 910-1175):
+        //   1. If parent_rank >= self_rank, push self to parent_rank + 2.
+        //   2. If linked_place rank > parent_rank, replace self rank with it.
+        // Both rules preserve the invariant that each nested child gets a
+        // strictly higher rank than its parent. Processing in admin_level
+        // order guarantees parent has been fully resolved first.
+        let mut parent_rank: u8 = 0;
+        for r in ranked.iter_mut() {
+            // Step 1: nested adjustment against the most recent parent.
+            if r.rank_address <= parent_rank {
+                r.rank_address = parent_rank + 2;
             }
+            // Step 2: linked-place / place-tag rank override. Nominatim only
+            // applies it when the linked rank is strictly greater than the
+            // parent rank, so a `linked_place=suburb` on a boundary already
+            // nested past that rank does not override downwards.
+            if r.place_type_override > 0 {
+                let linked_rank = place_type_to_rank(r.place_type_override);
+                if linked_rank > parent_rank && linked_rank > r.rank_address {
+                    r.rank_address = linked_rank;
+                }
+            }
+            parent_rank = r.rank_address;
         }
 
         // Now assign each polygon to its field slot. Each rank yields one
@@ -920,23 +936,7 @@ impl Index {
         result.suburb         = best_by_field[14].as_ref().map(|c| c.name);
         result.quarter        = best_by_field[15].as_ref().map(|c| c.name);
         result.neighbourhood  = best_by_field[16].as_ref().map(|c| c.name);
-
-        // Deduplicate: if a more specific field has the same name as a less
-        // specific one, clear the less specific one. This handles the Polish
-        // case where the same boundary appears at multiple admin levels
-        // (e.g., Warszawa as city, municipality, and county).
-        if let Some(city) = result.city {
-            if result.municipality == Some(city) { result.municipality = None; }
-            if result.county == Some(city) { result.county = None; }
-            if result.city_district == Some(city) { result.city_district = None; }
-        }
-        if let Some(municipality) = result.municipality {
-            if result.county == Some(municipality) { result.county = None; }
-        }
-        if let Some(suburb) = result.suburb {
-            if result.city_district == Some(suburb) { result.city_district = None; }
-            if result.neighbourhood == Some(suburb) { result.neighbourhood = None; }
-        }
+        result.city_block     = best_by_field[17].as_ref().map(|c| c.name);
 
         result
     }
@@ -1027,15 +1027,23 @@ impl Index {
         if let Some((dist_sq, pn)) = best[3] {
             if dist_sq <= max_rank19 { result.suburb = Some(self.get_string(pn.name_id)); }
         }
-        if let Some((dist_sq, pn)) = best[6] {
-            if dist_sq <= max_rank20 { result.quarter = Some(self.get_string(pn.name_id)); }
-        }
         if let Some((dist_sq, pn)) = best[4] {
             if dist_sq <= max_rank19 { result.hamlet = Some(self.get_string(pn.name_id)); }
         }
-        if let Some((dist_sq, pn)) = best[5] {
-            if dist_sq <= max_rank20 { result.neighbourhood = Some(self.get_string(pn.name_id)); }
+        if let Some((dist_sq, pn)) = best[6] {
+            if dist_sq <= max_rank20 { result.quarter = Some(self.get_string(pn.name_id)); }
         }
+        // Neighbourhood place_node fallback intentionally disabled: nearest-
+        // place lookup without a proper addressline relation picks up
+        // adjacent-but-wrong neighbourhoods too often (Nikolaiviertel beside
+        // Spandauer Vorstadt, Koreatown beside the Empire State, etc.).
+        // Nominatim's addressline joins make this distinction at indexing
+        // time via ST_Contains; we don't have that, so fall back only to
+        // admin boundary data here.
+        //
+        // if let Some((dist_sq, pn)) = best[5] {
+        //     if dist_sq <= max_rank20 { result.neighbourhood = Some(self.get_string(pn.name_id)); }
+        // }
 
         result
     }
@@ -1224,8 +1232,12 @@ impl Index {
             distance_m: (p.distance_m * 10.0).round() / 10.0,
         }).collect();
 
-        // Merge admin + place results (admin authoritative, place as fallback)
-        let mut address = AddressDetails {
+        // Merge admin + place results (admin authoritative, place as fallback).
+        // No post-hoc dedup: Nominatim's rank-based address-row build lets
+        // the same name appear in multiple fields (e.g. Paris city + Paris
+        // city_district), and the find_admin rank pipeline already enforces
+        // first-label-wins for same-rank collisions.
+        let address = AddressDetails {
             house_number,
             road,
             city: admin.city.or(place.city),
@@ -1244,29 +1256,11 @@ impl Index {
             quarter: admin.quarter.or(place.quarter),
             city_district: admin.city_district,
             neighbourhood: admin.neighbourhood.or(place.neighbourhood),
+            city_block: admin.city_block,
             postcode: admin.postcode.or(addr_postcode),
             country: admin.country,
             country_code: admin.country_code.map(|c| String::from_utf8_lossy(&c).into_owned()),
         };
-
-        // Final cross-source dedup: admin and place-node lookups populate
-        // fields independently, so the same name can land in both suburb
-        // (from admin) and city_district (from a different admin row), or
-        // in city (from place node) and suburb (from admin). Clear the
-        // less-specific field when names collide.
-        if let Some(city) = address.city {
-            if address.municipality == Some(city) { address.municipality = None; }
-            if address.county == Some(city) { address.county = None; }
-            if address.city_district == Some(city) { address.city_district = None; }
-            if address.suburb == Some(city) { address.suburb = None; }
-        }
-        if let Some(municipality) = address.municipality {
-            if address.county == Some(municipality) { address.county = None; }
-        }
-        if let Some(suburb) = address.suburb {
-            if address.city_district == Some(suburb) { address.city_district = None; }
-            if address.neighbourhood == Some(suburb) { address.neighbourhood = None; }
-        }
         let display_name = format_address(&address);
         Address { display_name, address, places }
     }
@@ -1372,6 +1366,7 @@ struct AdminResult<'a> {
     suburb: Option<&'a str>,
     quarter: Option<&'a str>,
     neighbourhood: Option<&'a str>,
+    city_block: Option<&'a str>,
     postcode: Option<&'a str>,
 }
 
@@ -1413,6 +1408,8 @@ struct AddressDetails<'a> {
     city_district: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     neighbourhood: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    city_block: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     postcode: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
