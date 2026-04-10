@@ -200,7 +200,7 @@ int main(int argc, char* argv[]) {
     // --- Phase 3: Merge replays (streaming output) ---
     // ID remaps: file_id → vector<uint32_t> where remap[old_idx] = new_idx
     std::unordered_map<uint32_t, std::vector<uint32_t>> id_remaps;
-    std::vector<uint64_t> geo_added, geo_removed, admin_added, admin_removed, poi_added, poi_removed;
+    std::vector<uint64_t> geo_added, geo_removed, admin_added, admin_removed, poi_added, poi_removed, place_added, place_removed;
     std::unordered_map<uint64_t, uint8_t> flag_corrections;
     struct CellCorr { uint64_t cell_id; std::vector<uint32_t> ids; };
     std::unordered_map<uint32_t, std::vector<CellCorr>> entry_corrections;
@@ -275,6 +275,14 @@ int main(int argc, char* argv[]) {
             for (uint32_t i = 0; i < na; i++) { memcpy(&poi_added[i], P+pos, 8); pos += 8; }
             for (uint32_t i = 0; i < nr; i++) { memcpy(&poi_removed[i], P+pos, 8); pos += 8; }
             std::cerr << "  POI cells: +" << na << " -" << nr << std::endl;
+            continue;
+        }
+        if (file_id == CELL_CHANGES_PLACE_MARKER) {
+            uint32_t na = ru32(), nr = ru32();
+            place_added.resize(na); place_removed.resize(nr);
+            for (uint32_t i = 0; i < na; i++) { memcpy(&place_added[i], P+pos, 8); pos += 8; }
+            for (uint32_t i = 0; i < nr; i++) { memcpy(&place_removed[i], P+pos, 8); pos += 8; }
+            std::cerr << "  Place cells: +" << na << " -" << nr << std::endl;
             continue;
         }
         if (file_id == CELL_FLAGS_MARKER) {
@@ -352,7 +360,8 @@ int main(int argc, char* argv[]) {
                             file_id == (uint32_t)PatchFileId::STREET_WAYS ||
                             file_id == (uint32_t)PatchFileId::INTERP_WAYS ||
                             file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS ||
-                            file_id == (uint32_t)PatchFileId::POI_RECORDS);
+                            file_id == (uint32_t)PatchFileId::POI_RECORDS ||
+                            file_id == (uint32_t)PatchFileId::PLACE_NODES);
         bool needs_padding = (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS && actual_stride == 24) ||
                              (file_id == (uint32_t)PatchFileId::INTERP_WAYS && actual_stride == 24);
 
@@ -398,6 +407,7 @@ int main(int argc, char* argv[]) {
             else if (file_id == (uint32_t)PatchFileId::INTERP_WAYS) remap_offs = {(actual_stride >= 20) ? 8ul : 5ul};
             else if (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS) remap_offs = {8};
             else if (file_id == (uint32_t)PatchFileId::POI_RECORDS) remap_offs = {16};
+            else if (file_id == (uint32_t)PatchFileId::PLACE_NODES) remap_offs = {8};
         }
 
         // mmap old file read-only (zero allocation)
@@ -504,8 +514,8 @@ int main(int argc, char* argv[]) {
     }
     log_phase("Merge replays", t_start);
 
-    // Copy POI data files from old if not present in patch (POI sections are optional)
-    for (auto fid : {PatchFileId::POI_RECORDS, PatchFileId::POI_VERTICES}) {
+    // Copy POI/place data files from old if not present in patch (these sections are optional)
+    for (auto fid : {PatchFileId::POI_RECORDS, PatchFileId::POI_VERTICES, PatchFileId::PLACE_NODES}) {
         std::string fname2 = patch_file_names[(uint32_t)fid];
         std::string out_path = out_dir + "/" + fname2;
         struct stat st;
@@ -868,6 +878,123 @@ int main(int argc, char* argv[]) {
                 if (!pe.empty()) write_file(out_dir + "/poi_entries.bin", pe);
             }
             log_phase("  POI", t_entry);
+        }
+
+        // Place: same pattern as POI — rebuild from remap + corrections
+        {
+            uint32_t no_data = 0xFFFFFFFF;
+            std::unordered_map<uint32_t,uint32_t> place_rm;
+            MappedFile m_place_rm = mmap_remap(PatchFileId::PLACE_NODES);
+            if (m_place_rm.data) {
+                const uint32_t* place_vec = (const uint32_t*)m_place_rm.data;
+                size_t place_count = m_place_rm.size / 4;
+                for (uint32_t i = 0; i < place_count; i++)
+                    if (place_vec[i] != 0) place_rm[i] = place_vec[i] - 1; // decode +1 encoding
+                unmap_file(m_place_rm);
+            }
+            auto old_plc = read_file(cur_dir + "/place_cells.bin");
+            auto old_ple = read_file(cur_dir + "/place_entries.bin");
+
+            if (!old_plc.empty() || !place_added.empty() || !place_removed.empty() || !place_rm.empty()) {
+                // Rebuild place cells/entries using same logic as POI
+                // Place cells: 12 bytes each (u64 cell_id + u32 entry_offset)
+                // Place entries: variable (u16 count + u32[] ids)
+                size_t n_place_cells = old_plc.size() / 12;
+                struct PlaceCellData { uint64_t cell_id; std::vector<uint32_t> ids; };
+                std::vector<PlaceCellData> place_cells(n_place_cells);
+                for (size_t i = 0; i < n_place_cells; i++) {
+                    memcpy(&place_cells[i].cell_id, old_plc.data() + i * 12, 8);
+                    uint32_t off; memcpy(&off, old_plc.data() + i * 12 + 8, 4);
+                    if (off != no_data && off + 2 <= old_ple.size()) {
+                        uint16_t count; memcpy(&count, old_ple.data() + off, 2);
+                        if (off + 2 + count * 4 <= old_ple.size()) {
+                            place_cells[i].ids.resize(count);
+                            memcpy(place_cells[i].ids.data(), old_ple.data() + off + 2, count * 4);
+                            for (auto& id : place_cells[i].ids) {
+                                auto it = place_rm.find(id);
+                                if (it != place_rm.end()) id = it->second;
+                            }
+                            std::sort(place_cells[i].ids.begin(), place_cells[i].ids.end());
+                        }
+                    }
+                }
+                // Apply cell changes
+                if (!place_removed.empty()) {
+                    std::unordered_set<uint64_t> removed_set(place_removed.begin(), place_removed.end());
+                    place_cells.erase(std::remove_if(place_cells.begin(), place_cells.end(),
+                        [&](const PlaceCellData& c) { return removed_set.count(c.cell_id); }), place_cells.end());
+                }
+                if (!place_added.empty()) {
+                    for (uint64_t cid : place_added) {
+                        PlaceCellData cd; cd.cell_id = cid;
+                        place_cells.push_back(cd);
+                    }
+                    std::sort(place_cells.begin(), place_cells.end(),
+                        [](const PlaceCellData& a, const PlaceCellData& b) { return a.cell_id < b.cell_id; });
+                }
+
+                // Apply entry corrections
+                auto ecit = entry_corrections.find((uint32_t)PatchFileId::PLACE_ENTRIES);
+                if (ecit != entry_corrections.end()) {
+                    std::unordered_map<uint64_t, const std::vector<uint32_t>*> plc_corr;
+                    for (auto& c : ecit->second) plc_corr[c.cell_id] = &c.ids;
+                    FILE* fplc = fopen((out_dir + "/place_cells.bin").c_str(), "wb");
+                    FILE* fple = fopen((out_dir + "/place_entries.bin").c_str(), "wb");
+                    uint32_t ple_wpos = 0;
+                    for (size_t i = 0; i < place_cells.size(); i++) {
+                        uint64_t cid = place_cells[i].cell_id;
+                        fwrite(&cid, 8, 1, fplc);
+                        auto cit = plc_corr.find(cid);
+                        if (cit != plc_corr.end()) {
+                            uint32_t off = cit->second->empty() ? no_data : ple_wpos;
+                            fwrite(&off, 4, 1, fplc);
+                            if (!cit->second->empty()) {
+                                uint16_t c = cit->second->size();
+                                fwrite(&c, 2, 1, fple); fwrite(cit->second->data(), 4, c, fple);
+                                ple_wpos += 2 + c*4;
+                            }
+                        } else {
+                            if (!place_cells[i].ids.empty()) {
+                                uint32_t new_off = ple_wpos; fwrite(&new_off, 4, 1, fplc);
+                                uint16_t c = place_cells[i].ids.size();
+                                fwrite(&c, 2, 1, fple); fwrite(place_cells[i].ids.data(), 4, c, fple);
+                                ple_wpos += 2 + c*4;
+                            } else {
+                                fwrite(&no_data, 4, 1, fplc);
+                            }
+                        }
+                    }
+                    fclose(fplc); fclose(fple);
+                    std::cerr << "  Place: " << place_cells.size() << " cells, " << plc_corr.size() << " corrections" << std::endl;
+                } else {
+                    // No corrections — write rebuilt data directly
+                    std::vector<char> plc_data, ple_data;
+                    std::unordered_map<uint64_t, uint32_t> offsets;
+                    for (auto& c : place_cells) {
+                        if (c.ids.empty()) continue;
+                        offsets[c.cell_id] = static_cast<uint32_t>(ple_data.size());
+                        uint16_t count = static_cast<uint16_t>(c.ids.size());
+                        ple_data.insert(ple_data.end(), (const char*)&count, (const char*)&count + 2);
+                        ple_data.insert(ple_data.end(), (const char*)c.ids.data(), (const char*)c.ids.data() + c.ids.size() * 4);
+                    }
+                    for (auto& c : place_cells) {
+                        plc_data.insert(plc_data.end(), (const char*)&c.cell_id, (const char*)&c.cell_id + 8);
+                        auto it = offsets.find(c.cell_id);
+                        uint32_t off = it != offsets.end() ? it->second : no_data;
+                        plc_data.insert(plc_data.end(), (const char*)&off, (const char*)&off + 4);
+                    }
+                    write_file(out_dir + "/place_cells.bin", plc_data);
+                    write_file(out_dir + "/place_entries.bin", ple_data);
+                    std::cerr << "  Place: " << place_cells.size() << " cells rebuilt" << std::endl;
+                }
+            } else {
+                // No place data in old or patch — copy old files if they exist (graceful)
+                auto plc = read_file(cur_dir + "/place_cells.bin");
+                auto ple = read_file(cur_dir + "/place_entries.bin");
+                if (!plc.empty()) write_file(out_dir + "/place_cells.bin", plc);
+                if (!ple.empty()) write_file(out_dir + "/place_entries.bin", ple);
+            }
+            log_phase("  Place", t_entry);
         }
     }
 

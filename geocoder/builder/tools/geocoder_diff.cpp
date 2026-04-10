@@ -560,6 +560,7 @@ int main(int argc, char* argv[]) {
     size_t interp_stride = detect(old_dir + "/interp_ways.bin", {24, 20, 18});
     size_t admin_stride = detect(old_dir + "/admin_polygons.bin", {24, 20, 19});
     size_t poi_stride = 24; // POI records are always 24 bytes
+    size_t place_stride = 16; // Place nodes are always 16 bytes
 
     // Build patch data (uncompressed, will be zstd-compressed at the end)
     std::vector<char> patch;
@@ -610,7 +611,7 @@ int main(int argc, char* argv[]) {
     // Group 2: street_ways → street_nodes (sequential within group)
     // Group 3: interp_ways → interp_nodes (sequential within group)
     // Group 4: admin_polygons → admin_vertices (sequential within group)
-    FileMergeResult res_addr, res_ways, res_nodes, res_interp_w, res_interp_n, res_admin_p, res_admin_v, res_poi_r, res_poi_v;
+    FileMergeResult res_addr, res_ways, res_nodes, res_interp_w, res_interp_n, res_admin_p, res_admin_v, res_poi_r, res_poi_v, res_place_n;
 
     // Helper to build parent-aware node merge from a parent way merge
     // count_u32: true for admin_polygons (vertex_count is uint32_t at offset 4)
@@ -918,7 +919,7 @@ int main(int argc, char* argv[]) {
 
     // Group 6: cell changes
     // Uses sorted vectors + set_difference instead of unordered_sets — much faster for 15M cells
-    std::vector<uint64_t> g_added, g_removed, a_added, a_removed, p_added, p_removed;
+    std::vector<uint64_t> g_added, g_removed, a_added, a_removed, p_added, p_removed, pl_added, pl_removed;
     std::thread t_cells([&]() {
         double gs = now_ms();
         auto diff_cells = [](const std::string& old_path, const std::string& new_path,
@@ -937,10 +938,56 @@ int main(int argc, char* argv[]) {
         diff_cells(old_dir + "/geo_cells.bin", new_dir + "/geo_cells.bin", 20, g_added, g_removed);
         diff_cells(old_dir + "/admin_cells.bin", new_dir + "/admin_cells.bin", 12, a_added, a_removed);
         diff_cells(old_dir + "/poi_cells.bin", new_dir + "/poi_cells.bin", 12, p_added, p_removed);
+        diff_cells(old_dir + "/place_cells.bin", new_dir + "/place_cells.bin", 12, pl_added, pl_removed);
         log_time("  group:cell_changes", gs);
     });
 
-    t_addr.join(); t_street.join(); t_interp.join(); t_admin.join(); t_poi.join(); t_cells.join();
+    // Group 7: place_nodes (no child files, simple fixed-stride merge)
+    std::thread t_place([&]() {
+        double gs = now_ms();
+        auto old_data = mmap_file_rw(old_dir + "/place_nodes.bin");
+        auto new_data = mmap_file(new_dir + "/place_nodes.bin");
+        // Handle missing place files gracefully (new feature, old builds may not have them)
+        if (new_data.size == 0 && old_data.size == 0) {
+            res_place_n = {PatchFileId::PLACE_NODES, "place_nodes.bin", place_stride, 0, 0, MergeSequence{}, {}};
+            if (old_data.data) unmap_file(old_data);
+            if (new_data.data) unmap_file(new_data);
+            log_time("  group:place (empty)", gs);
+            return;
+        }
+        // String remap on name_id field (offset 8 in 16-byte stride)
+        if (old_data.size > 0)
+            remap_field(old_data.data, old_data.size, place_stride, 8, str_remap);
+        // Sort-based merge: match by (place_type, name_id, lat_bits, lng_bits)
+        auto pn_seq = build_merge_seq_sorted(
+            old_data.data, old_data.size, new_data.data, new_data.size, place_stride,
+            [](const char* a, const char* b) -> int {
+                // Compare by place_type (byte 12), then name_id (offset 8), then lat/lng (bytes 0-7)
+                uint8_t pt_a = static_cast<uint8_t>(a[12]), pt_b = static_cast<uint8_t>(b[12]);
+                if (pt_a != pt_b) return pt_a < pt_b ? -1 : 1;
+                uint32_t na, nb; memcpy(&na, a + 8, 4); memcpy(&nb, b + 8, 4);
+                if (na != nb) return na < nb ? -1 : 1;
+                return memcmp(a, b, 8); // lat + lng
+            });
+        auto soft = secondary_match_from_merge(pn_seq, old_data.data, old_data.size,
+            new_data.data, new_data.size, place_stride,
+            [](const char* rec) -> uint64_t {
+                uint32_t name_id; memcpy(&name_id, rec + 8, 4);
+                uint8_t place_type = static_cast<uint8_t>(rec[12]);
+                return ((uint64_t)name_id << 8) | place_type;
+            });
+        auto id_rm = derive_id_remap_from_merge(pn_seq, old_data.size / place_stride, place_stride);
+        for (auto& [o,n] : soft) if (o < id_rm.size()) id_rm[o] = n;
+        res_place_n = {PatchFileId::PLACE_NODES, "place_nodes.bin", place_stride,
+                       old_data.size, new_data.size, pn_seq, {}, std::move(soft), std::move(id_rm)};
+        log_merge(res_place_n);
+        if (old_data.data) unmap_file(old_data);
+        if (new_data.data) unmap_file(new_data);
+        log_time("  group:place", gs);
+        std::cerr << "  RSS after place: " << get_rss_mb() << " MiB" << std::endl;
+    });
+
+    t_addr.join(); t_street.join(); t_interp.join(); t_admin.join(); t_poi.join(); t_place.join(); t_cells.join();
     log_time("All merge sequences + cell changes built", merge_start);
     // Free string pools + remap (no longer needed after all merges complete)
     unmap_file(old_str_map); unmap_file(new_str_map);
@@ -961,6 +1008,7 @@ int main(int argc, char* argv[]) {
     serialize_merge(patch, res_poi_r);
     serialize_merge(patch, res_poi_v);
     { std::vector<char>().swap(res_poi_v.seq.data); }
+    serialize_merge(patch, res_place_n);
     malloc_trim(0); // return freed heap to OS
     std::cerr << "  RSS after serialize: " << get_rss_mb() << " MiB" << std::endl;
     double t0 = now_ms();
@@ -991,7 +1039,17 @@ int main(int argc, char* argv[]) {
             if (vec[i] != 0xFFFFFFFF) poi_rm_d[i] = vec[i];
         for (auto& [o,n] : res_poi_r.secondary_matches) poi_rm_d[o] = n;
     }
-    log_time("Admin+POI remap", t0);
+    std::unordered_map<uint32_t,uint32_t> place_rm_d;
+    if (res_place_n.old_size > 0 || res_place_n.new_size > 0) {
+        auto vec = derive_id_remap_from_merge(
+            res_place_n.seq,
+            res_place_n.old_size / place_stride, place_stride);
+        place_rm_d.reserve(vec.size());
+        for (uint32_t i = 0; i < vec.size(); i++)
+            if (vec[i] != 0xFFFFFFFF) place_rm_d[i] = vec[i];
+        for (auto& [o,n] : res_place_n.secondary_matches) place_rm_d[o] = n;
+    }
+    log_time("Admin+POI+Place remap", t0);
 
     // old_geo no longer needed as a vector — streaming corrections use mmap directly
 
@@ -1008,25 +1066,31 @@ int main(int argc, char* argv[]) {
       wval(patch, &marker, 4); wval(patch, &na, 4); wval(patch, &nr, 4);
       for (auto c : p_added) wval(patch, &c, 8); for (auto c : p_removed) wval(patch, &c, 8);
       std::cerr << "  POI cell changes: +" << na << " -" << nr << std::endl; }
+    { uint32_t marker = CELL_CHANGES_PLACE_MARKER, na = pl_added.size(), nr = pl_removed.size();
+      wval(patch, &marker, 4); wval(patch, &na, 4); wval(patch, &nr, 4);
+      for (auto c : pl_added) wval(patch, &c, 8); for (auto c : pl_removed) wval(patch, &c, 8);
+      std::cerr << "  Place cell changes: +" << na << " -" << nr << std::endl; }
 
     // Emit secondary remap section (from merge results, no re-reads)
     std::cerr << "  Secondary matches: ways=" << res_ways.secondary_matches.size()
               << " addr=" << res_addr.secondary_matches.size()
               << " interp=" << res_interp_w.secondary_matches.size()
               << " admin=" << res_admin_p.secondary_matches.size()
-              << " poi=" << res_poi_r.secondary_matches.size() << std::endl;
+              << " poi=" << res_poi_r.secondary_matches.size()
+              << " place=" << res_place_n.secondary_matches.size() << std::endl;
     { uint32_t marker = SECONDARY_REMAP_MARKER; wval(patch, &marker, 4);
       auto emit_remap = [&](PatchFileId fid, const std::unordered_map<uint32_t,uint32_t>& rm) {
           uint32_t file = static_cast<uint32_t>(fid), count = rm.size();
           wval(patch, &file, 4); wval(patch, &count, 4);
           for (auto& [o,n] : rm) { wval(patch, &o, 4); wval(patch, &n, 4); }
       };
-      uint32_t n_files = 5; wval(patch, &n_files, 4);
+      uint32_t n_files = 6; wval(patch, &n_files, 4);
       emit_remap(PatchFileId::STREET_WAYS, res_ways.secondary_matches);
       emit_remap(PatchFileId::ADDR_POINTS, res_addr.secondary_matches);
       emit_remap(PatchFileId::INTERP_WAYS, res_interp_w.secondary_matches);
       emit_remap(PatchFileId::ADMIN_POLYGONS, res_admin_p.secondary_matches);
       emit_remap(PatchFileId::POI_RECORDS, res_poi_r.secondary_matches);
+      emit_remap(PatchFileId::PLACE_NODES, res_place_n.secondary_matches);
     }
 
     // --- Streaming entry corrections ---
@@ -1040,7 +1104,8 @@ int main(int argc, char* argv[]) {
       std::vector<char>().swap(res_interp_w.seq.data); std::vector<char>().swap(res_admin_p.seq.data);
       std::vector<char>().swap(res_nodes.seq.data); std::vector<char>().swap(res_interp_n.seq.data);
       std::vector<char>().swap(res_admin_v.seq.data);
-      std::vector<char>().swap(res_poi_r.seq.data); std::vector<char>().swap(res_poi_v.seq.data); }
+      std::vector<char>().swap(res_poi_r.seq.data); std::vector<char>().swap(res_poi_v.seq.data);
+      std::vector<char>().swap(res_place_n.seq.data); }
 
     // mmap all geo/entry files (old + new)
     auto old_geo_m = mmap_file(old_dir + "/geo_cells.bin");
@@ -1324,6 +1389,48 @@ int main(int argc, char* argv[]) {
         memcpy(buf.data(), &marker, 4); memcpy(buf.data()+4, &file, 4); memcpy(buf.data()+8, &dc, 4);
         patch.insert(patch.end(), buf.begin(), buf.end());
         std::cerr << "  poi_entries.bin: " << dc << " cell corrections (" << buf.size()-12 << " bytes)" << std::endl;
+    }
+
+    // Place corrections (same pattern as POI corrections)
+    if (res_place_n.old_size > 0 || res_place_n.new_size > 0) {
+        auto old_plc = read_file(old_dir + "/place_cells.bin");
+        auto old_ple = read_file(old_dir + "/place_entries.bin");
+        auto place_derived = rebuild_place_from_remap(old_plc, old_ple, place_rm_d, pl_added, pl_removed);
+        auto new_plc = read_file(new_dir + "/place_cells.bin");
+        auto new_ple = read_file(new_dir + "/place_entries.bin");
+        auto parse_ids_v = [](const std::vector<char>& data, uint32_t off) -> std::vector<uint32_t> {
+            if (off == 0xFFFFFFFF || off + 2 > data.size()) return {};
+            uint16_t count; memcpy(&count, data.data() + off, 2);
+            if (off + 2 + count * 4 > data.size()) return {};
+            std::vector<uint32_t> ids(count);
+            memcpy(ids.data(), data.data() + off + 2, count * 4);
+            return ids;
+        };
+        auto parse_place = [&](const std::vector<char>& cells, const std::vector<char>& entries)
+            -> std::unordered_map<uint64_t, std::vector<uint32_t>> {
+            std::unordered_map<uint64_t, std::vector<uint32_t>> m;
+            for (size_t i = 0; i < cells.size() / 12; i++) {
+                uint64_t cid; memcpy(&cid, cells.data()+i*12, 8);
+                uint32_t off; memcpy(&off, cells.data()+i*12+8, 4);
+                m[cid] = parse_ids_v(entries, off);
+            }
+            return m;
+        };
+        auto dm = parse_place(place_derived.place_cells_data, place_derived.place_entries_data);
+        auto nm = parse_place(new_plc, new_ple);
+        std::vector<char> buf; buf.resize(12, 0); uint32_t dc = 0;
+        for (auto& [cid, nids] : nm) {
+            auto it = dm.find(cid); auto* dids = it != dm.end() ? &it->second : nullptr;
+            bool differs = !dids ? !nids.empty() : (dids->size() != nids.size()) ||
+                          (!dids->empty() && memcmp(dids->data(), nids.data(), dids->size()*4) != 0);
+            if (differs) { wval(buf, &cid, 8); uint16_t c = nids.size(); wval(buf, &c, 2);
+                if (!nids.empty()) buf.insert(buf.end(), (const char*)nids.data(), (const char*)nids.data()+nids.size()*4); dc++; }
+        }
+        for (auto& [cid, dids] : dm) { if (!nm.count(cid) && !dids.empty()) { wval(buf, &cid, 8); uint16_t c = 0; wval(buf, &c, 2); dc++; } }
+        uint32_t marker = ENTRY_CORRECTION_MARKER, file = static_cast<uint32_t>(PatchFileId::PLACE_ENTRIES);
+        memcpy(buf.data(), &marker, 4); memcpy(buf.data()+4, &file, 4); memcpy(buf.data()+8, &dc, 4);
+        patch.insert(patch.end(), buf.begin(), buf.end());
+        std::cerr << "  place_entries.bin: " << dc << " cell corrections (" << buf.size()-12 << " bytes)" << std::endl;
     }
 
     log_time("Entry corrections", t1);

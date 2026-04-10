@@ -2595,23 +2595,32 @@ int main(int argc, char* argv[]) {
             write_qualities(d, quality_dir);
         }
 
-        // Write place node files
+        // Write place node files into each mode directory (so diff/patch can find them)
         if (!d.place_nodes.empty()) {
-            std::string place_dir = base_dir;
-            ensure_dir(place_dir);
-            {
-                std::ofstream f(place_dir + "/place_nodes.bin", std::ios::binary);
-                f.write(reinterpret_cast<const char*>(d.place_nodes.data()),
-                        d.place_nodes.size() * sizeof(PlaceNode));
-            }
-            // Build cell map from sorted pairs for write_cell_index
             std::unordered_map<uint64_t, std::vector<uint32_t>> place_cell_map;
             for (const auto& p : d.sorted_place_cells) {
                 place_cell_map[p.cell_id].push_back(p.item_id);
             }
-            write_cell_index(place_dir + "/place_cells.bin", place_dir + "/place_entries.bin", place_cell_map);
+
+            auto write_place_files = [&](const std::string& dir) {
+                ensure_dir(dir);
+                {
+                    std::ofstream f(dir + "/place_nodes.bin", std::ios::binary);
+                    f.write(reinterpret_cast<const char*>(d.place_nodes.data()),
+                            d.place_nodes.size() * sizeof(PlaceNode));
+                }
+                write_cell_index(dir + "/place_cells.bin", dir + "/place_entries.bin", place_cell_map);
+            };
+
+            if (multi_output) {
+                write_place_files(base_dir + "/full");
+                write_place_files(base_dir + "/no-addresses");
+                write_place_files(base_dir + "/admin");
+            } else {
+                write_place_files(base_dir);
+            }
             std::cerr << "  Place nodes: " << d.place_nodes.size() << " nodes, "
-                      << place_cell_map.size() << " cells written to " << place_dir << std::endl;
+                      << place_cell_map.size() << " cells" << std::endl;
         }
 
         // Write POI tier variants
