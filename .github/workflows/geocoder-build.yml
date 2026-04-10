@@ -255,8 +255,8 @@ jobs:
 
           # Download TIGER data (if available)
           echo "[tiger] Checking for TIGER address data..."
-          TIGER_LATEST=$(curl -sL "$S3_PUBLIC_URL/geocoder/tiger/latest.json" 2>/dev/null)
-          TIGER_YEAR=$(echo "$TIGER_LATEST" | jq -r '.year // ""' 2>/dev/null)
+          TIGER_LATEST=$(curl -sL --fail "$S3_PUBLIC_URL/geocoder/tiger/latest.json" 2>/dev/null || echo '{}')
+          TIGER_YEAR=$(echo "$TIGER_LATEST" | jq -r '.year // ""' 2>/dev/null || echo "")
           if [ -n "$TIGER_YEAR" ]; then
             echo "[tiger] Found TIGER $TIGER_YEAR data, downloading..."
             curl -sL -o "$WORKDIR/tiger-data.tar.gz" \
