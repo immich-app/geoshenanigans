@@ -109,6 +109,14 @@ struct PlaceNode {
     place_type: u8,
     _pad1: u8,
     _pad2: u16,
+    /// Smallest admin polygon (by area) that contains this place node
+    /// centroid, computed at build time. Used to gate nearest-place
+    /// fallback: a quarter/neighbourhood candidate is only returned if
+    /// the query point is inside the polygon referenced here. Mirrors
+    /// Nominatim's insert_addresslines containment check at indexing.
+    /// 0xFFFFFFFF means "no containing admin polygon found" — fall back
+    /// to radius-only matching.
+    parent_poly_id: u32,
 }
 
 // POI category metadata — loaded from poi_meta.json (written by builder)
@@ -1182,23 +1190,51 @@ impl Index {
         let mut result = PlaceResult::default();
 
         // Max search radii from Nominatim's reverse_place_diameter(), by rank
-        // rank<=17 (city/town/village): 0.16deg diameter → 0.08deg radius
-        // rank<=18: 0.08deg diameter → 0.04deg radius
-        // rank<=19 (suburb): 0.04deg diameter → 0.02deg radius
-        // rank>19 (neighbourhood+): 0.02deg diameter → 0.01deg radius
         let max_rank17 = (0.08_f64).to_radians().powi(2); // city/town/village
         let max_rank19 = (0.02_f64).to_radians().powi(2); // suburb / hamlet
-        // Quarter / neighbourhood use a tighter threshold than Nominatim's
-        // reverse_place_diameter because we're doing nearest-neighbour
-        // rather than addressline lookup — a distant place node is almost
-        // always the wrong one. Empirically, 550m keeps Berlin's
-        // Spandauer Vorstadt (~250m) and Nikolaiviertel (~410m) while
-        // dropping Paris/Athens/NYC false positives where the nearest
-        // neighbourhood-class place node belongs to an adjacent district.
-        let max_quarter = (0.005_f64).to_radians().powi(2);
+        let max_rank20 = (0.01_f64).to_radians().powi(2); // neighbourhood/quarter
 
-        // Place types: 0=city, 1=town, 2=village, 3=suburb, 4=hamlet, 5=neighbourhood, 6=quarter
-        // City field: prefer city > town > village (all rank 16, same threshold)
+        // Containment gate: for suburb and deeper (pt ≥ 3), only accept a
+        // place-node candidate if it's inside its pre-computed parent
+        // admin polygon AND the query point is also inside that same
+        // polygon. Mirrors Nominatim's insert_addresslines ST_Contains
+        // behaviour — the node is attached to the address chain only if
+        // both the road and the node sit in the same containing polygon.
+        //
+        // The builder stores parent_poly_id per place node (smallest
+        // admin polygon by area containing the node centroid). Fall back
+        // to radius-only when parent_poly_id is unset (legacy data or
+        // unmatched node).
+        let all_polygons: &[AdminPolygon] = unsafe {
+            std::slice::from_raw_parts(
+                self.admin_polygons.as_ptr() as *const AdminPolygon,
+                self.admin_polygons.len() / std::mem::size_of::<AdminPolygon>(),
+            )
+        };
+        let all_vertices: &[NodeCoord] = unsafe {
+            std::slice::from_raw_parts(
+                self.admin_vertices.as_ptr() as *const NodeCoord,
+                self.admin_vertices.len() / std::mem::size_of::<NodeCoord>(),
+            )
+        };
+        let parent_contains_query = |pn: &PlaceNode| -> bool {
+            if pn.parent_poly_id == u32::MAX {
+                return true; // no parent info, fall through to radius-only
+            }
+            let pid = pn.parent_poly_id as usize;
+            if pid >= all_polygons.len() { return true; }
+            let poly = &all_polygons[pid];
+            let off = poly.vertex_offset as usize;
+            let cnt = poly.vertex_count as usize;
+            if off + cnt > all_vertices.len() { return true; }
+            let verts = &all_vertices[off..off + cnt];
+            point_in_polygon(lat as f32, lng as f32, verts)
+        };
+
+        // City / town / village: no containment gate — the query may
+        // sit inside the city's area while the place=city node itself
+        // is at the city centre, potentially outside any L9/L10 polygon
+        // our builder would pick as a parent.
         for pt in [0, 1, 2] {
             if let Some((dist_sq, pn)) = best[pt] {
                 if dist_sq <= max_rank17 {
@@ -1213,26 +1249,25 @@ impl Index {
             }
         }
 
-        // Each place type goes to its own field so the server doesn't
-        // collapse distinct Nominatim slots (Berlin's place=quarter node
-        // should feed the 'quarter' field, not 'suburb').
         if let Some((dist_sq, pn)) = best[3] {
-            if dist_sq <= max_rank19 { result.suburb = Some(self.get_string(pn.name_id)); }
+            if dist_sq <= max_rank19 && parent_contains_query(pn) {
+                result.suburb = Some(self.get_string(pn.name_id));
+            }
         }
         if let Some((dist_sq, pn)) = best[4] {
-            if dist_sq <= max_rank19 { result.hamlet = Some(self.get_string(pn.name_id)); }
+            if dist_sq <= max_rank19 && parent_contains_query(pn) {
+                result.hamlet = Some(self.get_string(pn.name_id));
+            }
         }
         if let Some((dist_sq, pn)) = best[6] {
-            if dist_sq <= max_quarter { result.quarter = Some(self.get_string(pn.name_id)); }
+            if dist_sq <= max_rank20 && parent_contains_query(pn) {
+                result.quarter = Some(self.get_string(pn.name_id));
+            }
         }
-        // Neighbourhood place_node fallback uses the same tight radius.
-        // Nominatim's addressline joins catch e.g. Berlin's Nikolaiviertel
-        // via ST_Contains at indexing time; without that, we use a ~300m
-        // cutoff so we keep true-positives (Nikolaiviertel 410m away) but
-        // drop cases where the closest neighbourhood node is in an
-        // adjacent district.
         if let Some((dist_sq, pn)) = best[5] {
-            if dist_sq <= max_quarter { result.neighbourhood = Some(self.get_string(pn.name_id)); }
+            if dist_sq <= max_rank20 && parent_contains_query(pn) {
+                result.neighbourhood = Some(self.get_string(pn.name_id));
+            }
         }
 
         result

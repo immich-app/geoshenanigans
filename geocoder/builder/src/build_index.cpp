@@ -2189,6 +2189,91 @@ int main(int argc, char* argv[]) {
             std::cerr << "Sorted admin polygons largest-first (" << n << " polygons)." << std::endl;
         }
 
+        // --- Place-node addressline containment ---
+        //
+        // For each place node, find the smallest-area admin polygon that
+        // geometrically contains its centroid, and record that polygon's
+        // id on the node. At query time the server uses this to gate the
+        // nearest-place fallback so adjacent-but-wrong place nodes (Paris
+        // Beaubourg beside Saint-Merri, Moscow Kitay-gorod beside
+        // Ilinka, etc.) no longer bleed into the response. This mirrors
+        // the effect of Nominatim's insert_addresslines containment check
+        // (ST_Contains at indexing time).
+        //
+        // We iterate place nodes in parallel, looking up candidate admin
+        // polygons via the existing cell_to_admin S2 index (fast nearest-
+        // candidate filter), then running point-in-polygon on each
+        // candidate in ascending-area order. The first hit is the
+        // smallest containing polygon.
+        if (!data.place_nodes.empty() && !data.admin_polygons.empty()) {
+            auto _pn_t = std::chrono::steady_clock::now();
+            std::cerr << "Computing place-node parent admin polygons ("
+                      << data.place_nodes.size() << " nodes)..." << std::endl;
+
+            // Precompute candidate sets sorted by ascending area so we can
+            // pick the smallest containing polygon with a single PIP pass.
+            // The cell_to_admin map has (INTERIOR_FLAG | poly_id) values —
+            // strip the flag before indexing.
+            std::atomic<size_t> pn_idx{0};
+            std::atomic<uint64_t> contained_count{0};
+            std::vector<std::thread> pn_workers;
+            for (unsigned int t = 0; t < num_threads; t++) {
+                pn_workers.emplace_back([&]() {
+                    std::vector<uint32_t> cand;
+                    while (true) {
+                        size_t i = pn_idx.fetch_add(1);
+                        if (i >= data.place_nodes.size()) break;
+                        auto& pn = data.place_nodes[i];
+                        pn.parent_poly_id = 0xFFFFFFFFu;
+                        // Compute the node's S2 cell at the admin level
+                        // and fetch candidate polygons covering it.
+                        S2CellId cell = S2CellId(
+                            S2LatLng::FromDegrees(pn.lat, pn.lng))
+                            .parent(kAdminCellLevel);
+                        auto it = data.cell_to_admin.find(cell.id());
+                        if (it == data.cell_to_admin.end()) continue;
+                        cand.clear();
+                        cand.reserve(it->second.size());
+                        for (uint32_t id : it->second) {
+                            cand.push_back(id & 0x7FFFFFFFu);
+                        }
+                        // Sort candidates by ascending area so the first
+                        // PIP hit is the smallest containing polygon.
+                        std::sort(cand.begin(), cand.end(),
+                                  [&](uint32_t a, uint32_t b) {
+                            return data.admin_polygons[a].area <
+                                   data.admin_polygons[b].area;
+                        });
+                        for (uint32_t poly_id : cand) {
+                            const auto& p = data.admin_polygons[poly_id];
+                            // Skip country / postcode markers; we want
+                            // only meaningful address-chain parents.
+                            if (p.admin_level < 3 || p.admin_level > 11) continue;
+                            if (p.admin_level == 11) continue;
+                            const NodeCoord* verts =
+                                &data.admin_vertices[p.vertex_offset];
+                            if (point_in_polygon_nc(pn.lat, pn.lng,
+                                                    verts, p.vertex_count)) {
+                                pn.parent_poly_id = poly_id;
+                                contained_count.fetch_add(1);
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+            for (auto& w : pn_workers) w.join();
+
+            double _pn_elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - _pn_t).count();
+            std::cerr << "Place-node containment: "
+                      << contained_count.load() << "/"
+                      << data.place_nodes.size() << " nodes linked to a "
+                      << "parent admin polygon in " << _pn_elapsed << "s"
+                      << std::endl;
+            log_phase("Place-node containment", _pt, _cpu);
+        }
+
         // Load TIGER address data
         if (!tiger_data_path.empty()) {
             load_tiger_data(data, tiger_data_path);
@@ -2863,6 +2948,13 @@ int main(int argc, char* argv[]) {
             }
             data.admin_polygons = std::move(new_polys);
             data.admin_vertices = std::move(new_verts);
+            // Remap place-node parent_poly_id references
+            for (auto& pn : data.place_nodes) {
+                if (pn.parent_poly_id != 0xFFFFFFFFu &&
+                    pn.parent_poly_id < old_to_new.size()) {
+                    pn.parent_poly_id = old_to_new[pn.parent_poly_id];
+                }
+            }
             // Remap admin cell entries
             for (auto& [cell_id, ids] : data.cell_to_admin) {
                 for (auto& id : ids) {
@@ -3412,8 +3504,8 @@ int main(int argc, char* argv[]) {
 
         std::ofstream mf(output_dir + "/manifest.json");
         mf << "{\n";
-        mf << "  \"build_version\": 3,\n";
-        mf << "  \"patch_version\": 3,\n";
+        mf << "  \"build_version\": 4,\n";
+        mf << "  \"patch_version\": 4,\n";
         mf << "  \"regions\": {\n";
 
         for (size_t ri = 0; ri < regions.size(); ri++) {

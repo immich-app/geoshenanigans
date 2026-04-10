@@ -154,7 +154,14 @@ struct PlaceNode {
     uint8_t place_type;     // PlaceType
     uint8_t _pad1 = 0;
     uint16_t _pad2 = 0;
-};  // 16 bytes
+    // Smallest admin polygon (by area) that contains this place node's
+    // centroid. Used to gate nearest-place fallback lookups at query
+    // time: a quarter/neighbourhood candidate is only returned if the
+    // query point is inside the polygon referenced here. Mirrors
+    // Nominatim's insert_addresslines containment check at indexing.
+    // 0xFFFFFFFF means "unknown / no containing admin polygon".
+    uint32_t parent_poly_id = 0xFFFFFFFF;
+};  // 20 bytes
 
 // --- POI (Points of Interest) ---
 
