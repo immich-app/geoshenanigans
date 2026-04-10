@@ -1081,8 +1081,14 @@ impl Index {
         // rank<=19 (suburb): 0.04deg diameter → 0.02deg radius
         // rank>19 (neighbourhood+): 0.02deg diameter → 0.01deg radius
         let max_rank17 = (0.08_f64).to_radians().powi(2); // city/town/village
-        let max_rank19 = (0.02_f64).to_radians().powi(2); // suburb
-        let max_rank20 = (0.01_f64).to_radians().powi(2); // neighbourhood/hamlet/quarter
+        let max_rank19 = (0.02_f64).to_radians().powi(2); // suburb / hamlet
+        // Quarter requires a much tighter threshold than the Nominatim
+        // reverse_place_diameter value because we're doing nearest-neighbour
+        // rather than address-chain lookup — a distant place=quarter node
+        // at 900m is almost always the wrong one. Empirically, 300m keeps
+        // Berlin's Spandauer Vorstadt correctly while dropping Paris Les
+        // Halles / Athens Εξάρχεια / NYC Midtown false-positives.
+        let max_quarter = (0.003_f64).to_radians().powi(2);
 
         // Place types: 0=city, 1=town, 2=village, 3=suburb, 4=hamlet, 5=neighbourhood, 6=quarter
         // City field: prefer city > town > village (all rank 16, same threshold)
@@ -1110,7 +1116,7 @@ impl Index {
             if dist_sq <= max_rank19 { result.hamlet = Some(self.get_string(pn.name_id)); }
         }
         if let Some((dist_sq, pn)) = best[6] {
-            if dist_sq <= max_rank20 { result.quarter = Some(self.get_string(pn.name_id)); }
+            if dist_sq <= max_quarter { result.quarter = Some(self.get_string(pn.name_id)); }
         }
         // Neighbourhood place_node fallback intentionally disabled: nearest-
         // place lookup without a proper addressline relation picks up
