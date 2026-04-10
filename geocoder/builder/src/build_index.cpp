@@ -1986,7 +1986,9 @@ int main(int argc, char* argv[]) {
                                     }
                                     auto cells = cover_polygon(verts);
                                     for (const auto& [cell_id, is_interior] : cells) {
-                                        local.push_back({cell_id.id(), static_cast<uint32_t>(i)});
+                                        uint32_t id = static_cast<uint32_t>(i);
+                                        if (is_interior) id |= INTERIOR_FLAG;
+                                        local.push_back({cell_id.id(), id});
                                     }
                                 }
                             }
@@ -2525,9 +2527,12 @@ int main(int argc, char* argv[]) {
             data.poi_vertices = std::move(new_poi_verts);
             if (have_elevations) poi_elevations = std::move(new_poi_elevations);
 
-            // Remap sorted_poi_cells IDs
-            for (auto& p : data.sorted_poi_cells)
-                p.item_id = dedup_remap[old_to_new[p.item_id]];
+            // Remap sorted_poi_cells IDs (preserving INTERIOR_FLAG)
+            for (auto& p : data.sorted_poi_cells) {
+                uint32_t flags = p.item_id & INTERIOR_FLAG;
+                uint32_t old_id = p.item_id & ID_MASK;
+                p.item_id = dedup_remap[old_to_new[old_id]] | flags;
+            }
             auto cmp = [](const CellItemPair& a, const CellItemPair& b) {
                 return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
             };
@@ -2736,11 +2741,13 @@ int main(int argc, char* argv[]) {
                     }
                 }
 
-                // Build filtered cell index
+                // Build filtered cell index (preserving INTERIOR_FLAG)
                 std::unordered_map<uint64_t, std::vector<uint32_t>> filtered_cell_map;
                 for (const auto& p : d.sorted_poi_cells) {
-                    if (p.item_id < id_remap.size() && id_remap[p.item_id] != NO_DATA) {
-                        filtered_cell_map[p.cell_id].push_back(id_remap[p.item_id]);
+                    uint32_t flags = p.item_id & INTERIOR_FLAG;
+                    uint32_t raw_id = p.item_id & ID_MASK;
+                    if (raw_id < id_remap.size() && id_remap[raw_id] != NO_DATA) {
+                        filtered_cell_map[p.cell_id].push_back(id_remap[raw_id] | flags);
                     }
                 }
                 // Dedup cell entries
