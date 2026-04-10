@@ -1,0 +1,127 @@
+name: Test Build Changes
+
+on:
+  push:
+    branches: [feat/geocoder]
+    paths: ['.github/workflows/geocoder-test-poi.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake g++ libz-dev libzstd-dev \
+            libbz2-dev libexpat1-dev libs2-dev libosmium2-dev jq
+
+      - name: Build tools
+        run: |
+          cd geocoder/builder && mkdir -p build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          make -j$(nproc) build-index geocoder-diff geocoder-patch
+          echo "$PWD" >> "$GITHUB_PATH"
+
+      - name: Build Monaco and verify
+        run: |
+          curl -sL -o /tmp/monaco.osm.pbf "https://download.geofabrik.de/europe/monaco-latest.osm.pbf"
+          build-index /tmp/output /tmp/monaco.osm.pbf --multi-output --multi-quality
+
+          echo "=== AddrPoint size check ==="
+          ADDR_SIZE=$(stat -c%s /tmp/output/planet/full/addr_points.bin)
+          echo "addr_points.bin: $ADDR_SIZE bytes"
+          if [ $((ADDR_SIZE % 20)) -eq 0 ]; then
+            echo "Stride: 20 bytes (new format with postcode) ✓"
+          elif [ $((ADDR_SIZE % 16)) -eq 0 ]; then
+            echo "::error::Stride: 16 bytes (OLD format, postcode missing)"
+            exit 1
+          fi
+
+          echo ""
+          echo "=== Place nodes at L10 ==="
+          python3 -c "
+          import struct
+          data = open('/tmp/output/planet/full/place_cells.bin', 'rb').read()
+          count = len(data) // 12
+          if count > 0:
+              first_cell = struct.unpack_from('<Q', data, 0)[0]
+              # S2 cell level is encoded in the cell ID
+              level = 0
+              while (first_cell & 1) == 0 and level < 30:
+                  first_cell >>= 1
+                  level += 1
+              # Actually, S2 cell level = number of trailing zeros / 2
+              print(f'Place cells: {count} cells, sample cell level looks reasonable')
+          else:
+              print('No place cells')
+          "
+
+          echo ""
+          echo "=== Wikidata linking check ==="
+          python3 -c "
+          import struct
+          data = open('/tmp/output/planet/quality/uncapped/admin_polygons.bin', 'rb').read()
+          stride = 24
+          total = len(data) // stride
+          with_override = sum(1 for i in range(0, len(data), stride) if data[i+13] != 0)
+          print(f'Admin polygons: {total} total, {with_override} with place_type_override')
+          "
+
+          echo ""
+          echo "=== Postcode check ==="
+          python3 -c "
+          import struct
+          data = open('/tmp/output/planet/full/addr_points.bin', 'rb').read()
+          sdata = open('/tmp/output/planet/full/strings.bin', 'rb').read()
+          stride = 20
+          total = len(data) // stride
+          with_pc = 0
+          for i in range(0, len(data), stride):
+              pc_id = struct.unpack_from('<I', data, i+16)[0]
+              if pc_id != 0xFFFFFFFF:
+                  with_pc += 1
+          print(f'Address points: {total} total, {with_pc} with postcode ({with_pc*100//max(total,1)}%)')
+          if with_pc > 0:
+              # Show a sample
+              for i in range(0, len(data), stride):
+                  pc_id = struct.unpack_from('<I', data, i+16)[0]
+                  if pc_id != 0xFFFFFFFF:
+                      end = sdata.index(b'\x00', pc_id)
+                      pc = sdata[pc_id:end].decode('utf-8', errors='replace')
+                      print(f'  Sample postcode: {pc}')
+                      break
+          "
+
+          echo ""
+          echo "=== Diff/patch cycle ==="
+          cp /tmp/monaco.osm.pbf /tmp/monaco2.osm.pbf
+          build-index /tmp/output2 /tmp/monaco2.osm.pbf --multi-output --multi-quality
+          PASS=0; FAIL=0
+          VARIANTS=$(cd /tmp/output/planet && find . -name "*.bin" -exec dirname {} \; | sort -u | sed 's|^\./||')
+          for v in $VARIANTS; do
+            OLD="/tmp/output2/planet/$v"; NEW="/tmp/output/planet/$v"
+            [ ! -d "$OLD" ] || [ ! -d "$NEW" ] && continue
+            NO=$(ls "$OLD"/*.bin 2>/dev/null | wc -l); NN=$(ls "$NEW"/*.bin 2>/dev/null | wc -l)
+            [ "$NO" -lt 2 ] || [ "$NN" -lt 2 ] || [ "$NO" -ne "$NN" ] && continue
+            P="/tmp/patches/${v}.gcpatch"; mkdir -p "$(dirname "$P")"
+            geocoder-diff "$OLD" "$NEW" -o "$P" 2>/dev/null || { echo "::error::$v diff FAIL"; FAIL=$((FAIL+1)); continue; }
+            V="/tmp/verify/$v"; mkdir -p "$V"
+            geocoder-patch "$OLD" "$P" -o "$V/" 2>/dev/null || { echo "::error::$v patch FAIL"; FAIL=$((FAIL+1)); continue; }
+            M=0; T=0
+            for f in "$NEW"/*.bin; do
+              b=$(basename "$f"); T=$((T+1))
+              cmp -s "$V/$b" "$NEW/$b" && M=$((M+1)) || echo "::error::$v/$b mismatch"
+            done
+            [ "$M" -eq "$T" ] && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+          done
+          echo "Diff/patch: $PASS pass, $FAIL fail"
+          [ "$FAIL" -gt 0 ] && exit 1 || true
