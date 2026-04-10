@@ -540,13 +540,17 @@ jobs:
 
           # Fresh-build fallback: when patch step was skipped (no previous build),
           # the background upload never ran. Upload index files now.
+          # Tigris sometimes fails multipart uploads with "NoSuchUpload" on large files
+          # under concurrency — tolerate and fall through to the verify loop, which
+          # re-uploads any files that didn't make it.
           if [ "$HAS_PREVIOUS" != "true" ]; then
             echo "Fresh build: clearing stale files and uploading all index files..."
             $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
-            s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 8 cp --concurrency 16 \
+            s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 4 cp --concurrency 8 \
               --exclude "*.gcpatch" \
-              "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/"
-            echo "Fresh-build Tigris upload complete"
+              "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/" || \
+              echo "::warning::Some files failed on first pass — verify loop will retry"
+            echo "Fresh-build Tigris upload first pass complete"
             $CACHE cp --concurrency 16 --exclude "*.gcpatch" \
               "$WORKDIR/output/*" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/" 2>/dev/null || true
           fi
@@ -574,19 +578,50 @@ jobs:
           $S5 cp "$WORKDIR/output/checksums.sha256" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/checksums.sha256"
           $CACHE cp "$WORKDIR/output/manifest.json" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/manifest.json" 2>/dev/null || true
 
-          # Verify upload completeness — all files on Tigris must be from THIS build
+          # Verify upload completeness — walk local files and re-upload any that
+          # failed to land on Tigris. Use serial single-file uploads for the retry
+          # so a concurrency race doesn't re-trigger the multipart issue.
           LOCAL_COUNT=$(find "$WORKDIR/output" -type f | wc -l)
           REMOTE_COUNT=$($S5 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null | wc -l)
           echo "Tigris: $REMOTE_COUNT/$LOCAL_COUNT files"
-          if [ "$REMOTE_COUNT" != "$LOCAL_COUNT" ]; then
-            echo "::warning::Tigris count mismatch ($REMOTE_COUNT/$LOCAL_COUNT) — forcing full re-upload..."
-            $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
-            s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 8 cp --concurrency 16 \
-              "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/"
+
+          # Build list of remote objects (as relative paths under NEW_DATE/)
+          $S5 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null \
+            | awk '{print $NF}' \
+            | sed "s|^s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/||" \
+            | sort > /tmp/remote.txt
+
+          # List local files, strip the workdir prefix
+          (cd "$WORKDIR/output" && find . -type f -name "*.bin" -o -name "*.json" -o -name "*.sha256") \
+            | sed 's|^\./||' | sort > /tmp/local.txt
+
+          missing=$(comm -23 /tmp/local.txt /tmp/remote.txt)
+          if [ -n "$missing" ]; then
+            echo "::warning::Missing files — uploading individually:"
+            echo "$missing"
+            fail_count=0
+            echo "$missing" | while IFS= read -r rel; do
+              [ -z "$rel" ] && continue
+              for attempt in 1 2 3 4 5; do
+                if $S5 cp "$WORKDIR/output/$rel" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/$rel" 2>&1; then
+                  break
+                fi
+                echo "  retry $attempt for $rel"
+                sleep 5
+              done
+            done
+
             REMOTE_COUNT=$($S5 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null | wc -l)
             echo "Tigris after retry: $REMOTE_COUNT/$LOCAL_COUNT files"
             if [ "$REMOTE_COUNT" -lt "$LOCAL_COUNT" ]; then
               echo "::error::Tigris upload still incomplete: $REMOTE_COUNT/$LOCAL_COUNT"
+              # Print which files are still missing so next run can diagnose
+              $S5 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null \
+                | awk '{print $NF}' \
+                | sed "s|^s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/||" \
+                | sort > /tmp/remote2.txt
+              echo "Still missing:"
+              comm -23 /tmp/local.txt /tmp/remote2.txt
               exit 1
             fi
           fi
