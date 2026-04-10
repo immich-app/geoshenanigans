@@ -213,12 +213,12 @@ fn place_type_to_field(pt: u8) -> Option<&'static str> {
         1 | 2 | 3 => Some("city"),     // city, town, village
         4 => Some("suburb"),            // suburb/borough
         5 => Some("neighbourhood"),
-        6 => Some("suburb"),            // quarter → suburb
+        6 => Some("city_district"),     // quarter
         _ => None,
     }
 }
 
-// Matches Nominatim's ADMIN_LABELS (rank//2 → label)
+// Matches Nominatim's ADMIN_LABELS (rank_address → label)
 fn rank_to_field(rank: u8) -> Option<&'static str> {
     match rank {
         4..=5 => Some("country"),
@@ -227,7 +227,7 @@ fn rank_to_field(rank: u8) -> Option<&'static str> {
         14..=15 => Some("municipality"),
         16..=17 => Some("city"),
         18..=19 => Some("suburb"),
-        20..=21 => Some("suburb"),       // city_district → suburb
+        20..=21 => Some("city_district"),
         22..=23 => Some("neighbourhood"),
         24..=25 => Some("neighbourhood"), // city_block → neighbourhood
         _ => None,
@@ -721,14 +721,14 @@ impl Index {
             name: &'b str,
             country_code: u16,
         }
-        let mut best_by_field: [Option<FieldCandidate<'_>>; 7] = Default::default();
-        // 0=country, 1=state, 2=county, 3=municipality, 4=city, 5=suburb, 6=neighbourhood
+        let mut best_by_field: [Option<FieldCandidate<'_>>; 8] = Default::default();
+        // 0=country, 1=state, 2=county, 3=municipality, 4=city, 5=suburb, 6=city_district, 7=neighbourhood
 
         let field_index = |field: &str| -> Option<usize> {
             match field {
                 "country" => Some(0), "state" => Some(1), "county" => Some(2),
                 "municipality" => Some(3), "city" => Some(4),
-                "suburb" => Some(5), "neighbourhood" => Some(6),
+                "suburb" => Some(5), "city_district" => Some(6), "neighbourhood" => Some(7),
                 _ => None,
             }
         };
@@ -787,7 +787,8 @@ impl Index {
         result.municipality = best_by_field[3].as_ref().map(|c| c.name);
         result.city = best_by_field[4].as_ref().map(|c| c.name);
         result.suburb = best_by_field[5].as_ref().map(|c| c.name);
-        result.neighbourhood = best_by_field[6].as_ref().map(|c| c.name);
+        result.city_district = best_by_field[6].as_ref().map(|c| c.name);
+        result.neighbourhood = best_by_field[7].as_ref().map(|c| c.name);
 
         // Deduplicate: if a more specific field has the same name as a less
         // specific one, clear the less specific one. This handles the Polish
@@ -796,9 +797,14 @@ impl Index {
         if let Some(city) = result.city {
             if result.municipality == Some(city) { result.municipality = None; }
             if result.county == Some(city) { result.county = None; }
+            if result.city_district == Some(city) { result.city_district = None; }
         }
         if let Some(municipality) = result.municipality {
             if result.county == Some(municipality) { result.county = None; }
+        }
+        if let Some(suburb) = result.suburb {
+            if result.city_district == Some(suburb) { result.city_district = None; }
+            if result.neighbourhood == Some(suburb) { result.neighbourhood = None; }
         }
 
         result
@@ -1090,6 +1096,7 @@ impl Index {
             state: admin.state,
             county: admin.county,
             suburb: admin.suburb.or(place.suburb),
+            city_district: admin.city_district,
             neighbourhood: admin.neighbourhood.or(place.neighbourhood),
             postcode: admin.postcode.or(addr_postcode),
             country: admin.country,
@@ -1187,6 +1194,7 @@ struct AdminResult<'a> {
     municipality: Option<&'a str>,
     city: Option<&'a str>,
     suburb: Option<&'a str>,
+    city_district: Option<&'a str>,
     neighbourhood: Option<&'a str>,
     postcode: Option<&'a str>,
 }
@@ -1211,6 +1219,8 @@ struct AddressDetails<'a> {
     county: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     suburb: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    city_district: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     neighbourhood: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
