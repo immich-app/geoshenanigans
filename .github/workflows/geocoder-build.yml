@@ -375,7 +375,7 @@ jobs:
           wait
           rm -f "$WORKDIR/planet.osm.pbf"
 
-      # ── Generate patches + verify (with parallel index upload) ────
+      # ── Generate patches + verify ─────────────────────────────────
       - name: Generate patches and verify
         if: steps.setup.outputs.has_previous == 'true'
         env:
@@ -388,10 +388,10 @@ jobs:
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
 
-          # Start uploading index files (.bin + .json) to Tigris + cache in background
-          # Patches (.gcpatch) are uploaded separately after verification
-          echo "Starting index upload to Tigris in background..."
+          # Clear stale files at this date (e.g. from earlier failed builds or prior runs)
+          # and upload index files in background while we generate patches.
           $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
+          echo "Starting index upload to Tigris in background..."
           (
             s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 8 cp --concurrency 16 \
               --exclude "*.gcpatch" \
@@ -529,6 +529,19 @@ jobs:
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
 
+          # Fresh-build fallback: when patch step was skipped (no previous build),
+          # the background upload never ran. Upload index files now.
+          if [ "$HAS_PREVIOUS" != "true" ]; then
+            echo "Fresh build: clearing stale files and uploading all index files..."
+            $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
+            s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 8 cp --concurrency 16 \
+              --exclude "*.gcpatch" \
+              "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/"
+            echo "Fresh-build Tigris upload complete"
+            $CACHE cp --concurrency 16 --exclude "*.gcpatch" \
+              "$WORKDIR/output/*" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/" 2>/dev/null || true
+          fi
+
           # ── Augment build tool's manifest.json with date/previous info ──
           PREV_VAL="$( [ "$HAS_PREVIOUS" = "true" ] && echo "$OLD_DATE" || echo "null" )"
           jq --arg date "$NEW_DATE" \
@@ -547,19 +560,20 @@ jobs:
           done) > "$WORKDIR/output/checksums.sha256"
           echo "$(wc -l < "$WORKDIR/output/checksums.sha256") file checksums generated"
 
-          # Upload manifest + checksums (index files + patches already uploaded during patch step)
+          # Upload manifest + checksums (index files + patches already uploaded)
           $S5 cp "$WORKDIR/output/manifest.json" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/manifest.json"
           $S5 cp "$WORKDIR/output/checksums.sha256" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/checksums.sha256"
           $CACHE cp "$WORKDIR/output/manifest.json" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/manifest.json" 2>/dev/null || true
 
-          # Verify upload completeness
+          # Verify upload completeness — all files on Tigris must be from THIS build
           LOCAL_COUNT=$(find "$WORKDIR/output" -type f | wc -l)
           REMOTE_COUNT=$($S5 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null | wc -l)
           echo "Tigris: $REMOTE_COUNT/$LOCAL_COUNT files"
-          if [ "$REMOTE_COUNT" -lt "$LOCAL_COUNT" ]; then
-            echo "::warning::Tigris incomplete ($REMOTE_COUNT/$LOCAL_COUNT) — uploading remaining files..."
+          if [ "$REMOTE_COUNT" != "$LOCAL_COUNT" ]; then
+            echo "::warning::Tigris count mismatch ($REMOTE_COUNT/$LOCAL_COUNT) — forcing full re-upload..."
+            $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
             s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 8 cp --concurrency 16 \
-              "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/" 2>/dev/null || true
+              "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/"
             REMOTE_COUNT=$($S5 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null | wc -l)
             echo "Tigris after retry: $REMOTE_COUNT/$LOCAL_COUNT files"
             if [ "$REMOTE_COUNT" -lt "$LOCAL_COUNT" ]; then
