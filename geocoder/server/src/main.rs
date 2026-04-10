@@ -1082,13 +1082,14 @@ impl Index {
         // rank>19 (neighbourhood+): 0.02deg diameter → 0.01deg radius
         let max_rank17 = (0.08_f64).to_radians().powi(2); // city/town/village
         let max_rank19 = (0.02_f64).to_radians().powi(2); // suburb / hamlet
-        // Quarter requires a much tighter threshold than the Nominatim
-        // reverse_place_diameter value because we're doing nearest-neighbour
-        // rather than address-chain lookup — a distant place=quarter node
-        // at 900m is almost always the wrong one. Empirically, 300m keeps
-        // Berlin's Spandauer Vorstadt correctly while dropping Paris Les
-        // Halles / Athens Εξάρχεια / NYC Midtown false-positives.
-        let max_quarter = (0.003_f64).to_radians().powi(2);
+        // Quarter / neighbourhood use a tighter threshold than Nominatim's
+        // reverse_place_diameter because we're doing nearest-neighbour
+        // rather than addressline lookup — a distant place node is almost
+        // always the wrong one. Empirically, 550m keeps Berlin's
+        // Spandauer Vorstadt (~250m) and Nikolaiviertel (~410m) while
+        // dropping Paris/Athens/NYC false positives where the nearest
+        // neighbourhood-class place node belongs to an adjacent district.
+        let max_quarter = (0.005_f64).to_radians().powi(2);
 
         // Place types: 0=city, 1=town, 2=village, 3=suburb, 4=hamlet, 5=neighbourhood, 6=quarter
         // City field: prefer city > town > village (all rank 16, same threshold)
@@ -1118,17 +1119,15 @@ impl Index {
         if let Some((dist_sq, pn)) = best[6] {
             if dist_sq <= max_quarter { result.quarter = Some(self.get_string(pn.name_id)); }
         }
-        // Neighbourhood place_node fallback intentionally disabled: nearest-
-        // place lookup without a proper addressline relation picks up
-        // adjacent-but-wrong neighbourhoods too often (Nikolaiviertel beside
-        // Spandauer Vorstadt, Koreatown beside the Empire State, etc.).
-        // Nominatim's addressline joins make this distinction at indexing
-        // time via ST_Contains; we don't have that, so fall back only to
-        // admin boundary data here.
-        //
-        // if let Some((dist_sq, pn)) = best[5] {
-        //     if dist_sq <= max_rank20 { result.neighbourhood = Some(self.get_string(pn.name_id)); }
-        // }
+        // Neighbourhood place_node fallback uses the same tight radius.
+        // Nominatim's addressline joins catch e.g. Berlin's Nikolaiviertel
+        // via ST_Contains at indexing time; without that, we use a ~300m
+        // cutoff so we keep true-positives (Nikolaiviertel 410m away) but
+        // drop cases where the closest neighbourhood node is in an
+        // adjacent district.
+        if let Some((dist_sq, pn)) = best[5] {
+            if dist_sq <= max_quarter { result.neighbourhood = Some(self.get_string(pn.name_id)); }
+        }
 
         result
     }
