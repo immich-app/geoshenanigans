@@ -545,7 +545,8 @@ int main(int argc, char* argv[]) {
                             if (place_tag) {
                                 AdminPlaceType pt = classify_place_override(nullptr, nullptr, place_tag);
                                 if (pt != AdminPlaceType::NONE) {
-                                    const char* name = rel.tag("name");
+                                    const char* name = rel.tag("name:en");
+                                    if (!name) name = rel.tag("name");
                                     if (name) {
                                         CollectedRelation cr;
                                         cr.id = rel.id;
@@ -582,17 +583,19 @@ int main(int argc, char* argv[]) {
                         }
                         if (kMaxAdminLevel > 0 && admin_level > kMaxAdminLevel) continue;
 
+                        const char* name_en = rel.tag("name:en");
                         const char* name = rel.tag("name");
-                        if (!name && is_admin) continue;
+                        if (!name_en) name_en = name;
+                        if (!name_en && is_admin) continue;
 
                         std::string name_str;
                         if (is_postal) {
                             const char* postal_code = rel.tag("postal_code");
-                            if (!postal_code) postal_code = name;
+                            if (!postal_code) postal_code = name_en;
                             if (!postal_code) continue;
                             name_str = postal_code;
                         } else {
-                            name_str = name;
+                            name_str = name_en;
                         }
 
                         std::string country_code;
@@ -690,7 +693,8 @@ int main(int argc, char* argv[]) {
                         }
 
                         if (poi_cat != PoiCategory::UNKNOWN) {
-                            const char* poi_name = rel.tag("name");
+                            const char* poi_name = rel.tag("name:en");
+                            if (!poi_name) poi_name = rel.tag("name");
                             if (poi_name) {
                                 uint8_t flags = 0;
                                 if (rel.tag("wikipedia")) flags |= POI_FLAG_WIKIPEDIA;
@@ -973,6 +977,7 @@ int main(int argc, char* argv[]) {
                         const char* n_waterway = nullptr;
                         const char* n_boundary = nullptr;
                         const char* n_name = nullptr;
+                        const char* n_name_en = nullptr;
                         const char* n_wikipedia = nullptr;
                         const char* n_wikidata = nullptr;
                         const char* n_ele = nullptr;
@@ -999,6 +1004,7 @@ int main(int argc, char* argv[]) {
                                 case 'm': if (k == "man_made") n_man_made = v; break;
                                 case 'n':
                                     if (k == "name") n_name = v;
+                                    else if (k == "name:en") n_name_en = v;
                                     else if (k == "natural") n_natural = v;
                                     break;
                                 case 'p':
@@ -1021,8 +1027,11 @@ int main(int argc, char* argv[]) {
                             tl_node_data->count++;
                         }
 
+                        // Prefer name:en when present (user-facing English-only mode)
+                        const char* best_name = (n_name_en && n_name_en[0]) ? n_name_en : n_name;
+
                         // POI node extraction
-                        if (n_name) {
+                        if (best_name) {
                             auto cls = classify_poi(n_tourism, n_historic, n_boundary,
                                 n_amenity, n_leisure, n_natural, n_railway, n_aeroway,
                                 n_man_made, n_building, n_craft, n_power, n_place, n_waterway,
@@ -1038,7 +1047,7 @@ int main(int argc, char* argv[]) {
                                 pr.tier = cls->tier;
                                 pr.flags = cls->flags;
                                 tl_node_data->poi_records.push_back(pr);
-                                tl_node_data->poi_names.push_back(n_name);
+                                tl_node_data->poi_names.push_back(best_name);
                                 float ele_val = 0;
                                 if (n_ele) { char* end; ele_val = std::strtof(n_ele, &end); if (end == n_ele) ele_val = 0; }
                                 tl_node_data->poi_elevations.push_back(ele_val);
@@ -1052,7 +1061,7 @@ int main(int argc, char* argv[]) {
                         }
 
                         // Place nodes (settlements)
-                        if (n_place && n_name) {
+                        if (n_place && best_name) {
                             PlaceType pt = PlaceType::UNKNOWN;
                             if (std::strcmp(n_place, "city") == 0) pt = PlaceType::CITY;
                             else if (std::strcmp(n_place, "town") == 0) pt = PlaceType::TOWN;
@@ -1068,7 +1077,7 @@ int main(int argc, char* argv[]) {
                                 pn.lng = static_cast<float>(lng);
                                 pn.place_type = static_cast<uint8_t>(pt);
                                 tl_node_data->place_nodes.push_back(pn);
-                                tl_node_data->place_names.push_back(n_name);
+                                tl_node_data->place_names.push_back(best_name);
                                 // Capture wikidata for place→admin linking
                                 if (n_wikidata) {
                                     tl_node_data->place_wikidata.push_back({n_wikidata, static_cast<uint8_t>(pt)});
@@ -1228,6 +1237,7 @@ int main(int argc, char* argv[]) {
                     const char* t_postcode = nullptr;
                     const char* t_highway = nullptr;
                     const char* t_name = nullptr;
+                    const char* t_name_en = nullptr;
                     const char* t_boundary = nullptr;
                     const char* t_admin_level = nullptr;
                     const char* t_postal_code = nullptr;
@@ -1284,6 +1294,7 @@ int main(int argc, char* argv[]) {
                             case 'm': if (k == "man_made") t_man_made = v; break;
                             case 'n':
                                 if (k == "name") t_name = v;
+                                else if (k == "name:en") t_name_en = v;
                                 else if (k == "natural") t_natural = v;
                                 break;
                             case 'p':
@@ -1301,6 +1312,9 @@ int main(int argc, char* argv[]) {
                                 break;
                         }
                     }
+
+                    // Prefer name:en where present (English-only mode)
+                    const char* t_best_name = (t_name_en && t_name_en[0]) ? t_name_en : t_name;
 
                     // Check if this way has POI-qualifying tags
                     bool has_poi_tags = t_tourism || t_historic || t_amenity || t_leisure ||
@@ -1374,7 +1388,7 @@ int main(int argc, char* argv[]) {
 
                     // Highway ways
                     if (t_highway && is_included_highway(t_highway)) {
-                        if (t_name && refs_size >= 2 && all_valid) {
+                        if (t_best_name && refs_size >= 2 && all_valid) {
                             uint32_t wid = static_cast<uint32_t>(local.ways.size());
                             uint32_t noff = static_cast<uint32_t>(local.street_nodes.size());
                             for (const auto& loc : resolved_locs)
@@ -1382,7 +1396,7 @@ int main(int argc, char* argv[]) {
                             WayHeader header{}; header.node_offset = noff;
                             header.node_count = static_cast<uint8_t>(std::min(refs_size, size_t(255)));
                             local.ways.push_back(header);
-                            local.way_strings.push_back(t_name);
+                            local.way_strings.push_back(t_best_name);
                             local.deferred_ways.push_back({wid, noff, header.node_count});
                             local.way_count++;
                         }
@@ -1407,7 +1421,7 @@ int main(int argc, char* argv[]) {
                     }
 
                     // Closed way POI polygons
-                    if (has_poi_tags && t_name && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1] && all_valid) {
+                    if (has_poi_tags && t_best_name && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1] && all_valid) {
                         auto cls = classify_poi(t_tourism, t_historic, t_boundary,
                             t_amenity, t_leisure, t_natural, t_railway, t_aeroway,
                             t_man_made, t_building, t_craft, t_power, t_place, t_waterway,
@@ -1455,7 +1469,7 @@ int main(int argc, char* argv[]) {
                             if (t_wikidata && t_wikidata[0] == 'Q') {
                                 way_qid = static_cast<uint32_t>(std::strtoul(t_wikidata + 1, nullptr, 10));
                             }
-                            local.poi_ways.push_back({pr, t_name, std::move(verts), way_ele, way_qid});
+                            local.poi_ways.push_back({pr, t_best_name, std::move(verts), way_ele, way_qid});
                         }
                     }
 
@@ -1471,7 +1485,7 @@ int main(int argc, char* argv[]) {
                             else al = 11;
                             int max_al = is_postal ? 11 : 10;
                             if (al >= 2 && al <= max_al && (kMaxAdminLevel == 0 || al <= kMaxAdminLevel)) {
-                                const char* aname = t_name;
+                                const char* aname = t_best_name;
                                 if (aname || !is_admin) {
                                     std::string name_str;
                                     if (is_postal) { const char* pc = t_postal_code; if (!pc) pc = aname; if (pc) name_str = pc; }
@@ -1490,7 +1504,7 @@ int main(int argc, char* argv[]) {
                         }
                         // Closed way boundary=place (e.g., Washington DC)
                         if (is_place_boundary && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1]) {
-                            const char* aname = t_name;
+                            const char* aname = t_best_name;
                             if (aname && t_place) {
                                 AdminPlaceType pt = classify_place_override(nullptr, nullptr, t_place);
                                 if (pt != AdminPlaceType::NONE && all_valid && resolved_locs.size() >= 3) {
