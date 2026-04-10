@@ -55,6 +55,23 @@ static AdminPlaceType classify_place_override(const char* linked_place, const ch
     return AdminPlaceType::NONE;
 }
 
+// PlaceType (0=CITY, 1=TOWN, ...) → AdminPlaceType (0=NONE, 1=CITY, 2=TOWN, ...)
+// Used when wikidata-linking an admin boundary to a place node. Without this
+// conversion the enums disagree on zero (PlaceType::CITY=0 vs NONE=0) and any
+// place=city-linked boundary silently becomes unlinked.
+static uint8_t place_type_to_admin_override(uint8_t pt) {
+    switch (static_cast<PlaceType>(pt)) {
+        case PlaceType::CITY:          return static_cast<uint8_t>(AdminPlaceType::CITY);
+        case PlaceType::TOWN:          return static_cast<uint8_t>(AdminPlaceType::TOWN);
+        case PlaceType::VILLAGE:       return static_cast<uint8_t>(AdminPlaceType::VILLAGE);
+        case PlaceType::SUBURB:        return static_cast<uint8_t>(AdminPlaceType::SUBURB);
+        case PlaceType::HAMLET:        return static_cast<uint8_t>(AdminPlaceType::VILLAGE); // Nominatim: hamlet → village rank
+        case PlaceType::NEIGHBOURHOOD: return static_cast<uint8_t>(AdminPlaceType::NEIGHBOURHOOD);
+        case PlaceType::QUARTER:       return static_cast<uint8_t>(AdminPlaceType::QUARTER);
+        default:                        return static_cast<uint8_t>(AdminPlaceType::NONE);
+    }
+}
+
 // --- TIGER address data loading ---
 
 static void load_tiger_data(ParsedData& data, const std::string& path) {
@@ -1564,7 +1581,7 @@ int main(int argc, char* argv[]) {
                             if (pto == 0 && !cwa.wikidata.empty()) {
                                 auto it = wikidata_to_place_type.find(cwa.wikidata);
                                 if (it != wikidata_to_place_type.end()) {
-                                    pto = it->second;
+                                    pto = place_type_to_admin_override(it->second);
                                     cwa_wikidata_linked++;
                                 }
                             }
@@ -1698,8 +1715,8 @@ int main(int argc, char* argv[]) {
                                 if (pto == 0 && !rel_wikidata[i].empty()) {
                                     auto it = wikidata_to_place_type.find(rel_wikidata[i]);
                                     if (it != wikidata_to_place_type.end()) {
-                                        pto = it->second;
-                                        wikidata_linked_count.fetch_add(1);
+                                        pto = place_type_to_admin_override(it->second);
+                                        if (pto != 0) wikidata_linked_count.fetch_add(1);
                                     }
                                 }
 

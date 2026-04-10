@@ -735,6 +735,10 @@ impl Index {
 
         for level in 0..12 {
             if let Some((_, poly, _)) = best_by_level[level] {
+                // admin_level 11 is our marker for postal_code boundaries —
+                // they provide postcode only, never an address field.
+                if poly.admin_level == 11 { continue; }
+
                 // Determine output field: place_type_override takes priority over admin_level mapping
                 let field = if poly.place_type_override > 0 {
                     place_type_to_field(poly.place_type_override)
