@@ -47,6 +47,7 @@ struct AddrPoint {
     lng: f32,
     housenumber_id: u32,
     street_id: u32,
+    postcode_id: u32,
 }
 
 #[repr(C)]
@@ -1022,11 +1023,15 @@ impl Index {
         // Determine house_number and road from best geo match (priority: address > interpolation > street)
         let mut house_number: Option<Cow<'_, str>> = None;
         let mut road: Option<&str> = None;
+        let mut addr_postcode: Option<&str> = None;
 
         if let Some((dist, point)) = addr {
             if dist < max_dist {
                 house_number = Some(Cow::Borrowed(self.get_string(point.housenumber_id)));
                 road = Some(self.get_string(point.street_id));
+                if point.postcode_id != NO_DATA {
+                    addr_postcode = Some(self.get_string(point.postcode_id));
+                }
             }
         }
         if road.is_none() {
@@ -1068,7 +1073,7 @@ impl Index {
             county: admin.county,
             suburb: admin.suburb.or(place.suburb),
             neighbourhood: admin.neighbourhood.or(place.neighbourhood),
-            postcode: admin.postcode,
+            postcode: admin.postcode.or(addr_postcode),
             country: admin.country,
             country_code: admin.country_code.map(|c| String::from_utf8_lossy(&c).into_owned()),
         };

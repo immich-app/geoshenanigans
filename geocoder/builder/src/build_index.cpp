@@ -653,6 +653,7 @@ int main(int argc, char* argv[]) {
                 struct NodeThreadLocal {
                     std::vector<std::pair<double,double>> addr_coords;
                     std::vector<std::pair<std::string,std::string>> addr_strings;
+                    std::vector<std::string> addr_postcodes; // parallel to addr_strings
                     uint64_t count = 0;
                     // POI node data
                     std::vector<PoiRecord> poi_records;
@@ -687,6 +688,7 @@ int main(int argc, char* argv[]) {
                     if (ntags > 0) {
                         const char* housenumber = nullptr;
                         const char* street = nullptr;
+                        const char* postcode = nullptr;
                         const char* n_tourism = nullptr;
                         const char* n_historic = nullptr;
                         const char* n_amenity = nullptr;
@@ -713,6 +715,7 @@ int main(int argc, char* argv[]) {
                                 case 'a':
                                     if (k == "addr:housenumber") housenumber = v;
                                     else if (k == "addr:street") street = v;
+                                    else if (k == "addr:postcode") postcode = v;
                                     else if (k == "amenity") n_amenity = v;
                                     else if (k == "aeroway") n_aeroway = v;
                                     break;
@@ -745,6 +748,7 @@ int main(int argc, char* argv[]) {
                         if (housenumber && street) {
                             tl_node_data->addr_coords.push_back({lat, lng});
                             tl_node_data->addr_strings.push_back({housenumber, street});
+                            tl_node_data->addr_postcodes.push_back(postcode ? postcode : "");
                             tl_node_data->count++;
                         }
 
@@ -808,9 +812,10 @@ int main(int argc, char* argv[]) {
                 for (auto& local : ntld) {
                     for (size_t j = 0; j < local.addr_coords.size(); j++) {
                         uint64_t dummy = 0;
+                        const char* pc = local.addr_postcodes[j].empty() ? nullptr : local.addr_postcodes[j].c_str();
                         add_addr_point(data, local.addr_coords[j].first, local.addr_coords[j].second,
                                        local.addr_strings[j].first.c_str(),
-                                       local.addr_strings[j].second.c_str(), dummy);
+                                       local.addr_strings[j].second.c_str(), pc, dummy);
                     }
                     total_addrs += local.count;
                 }
@@ -868,6 +873,7 @@ int main(int argc, char* argv[]) {
                     std::vector<std::pair<double, double>> building_addr_coords; // lat,lng for S2 cell
                     std::vector<std::string> way_strings;      // way name strings
                     std::vector<std::pair<std::string,std::string>> addr_strings; // building addr {hn, street}
+                    std::vector<std::string> addr_postcodes; // parallel to addr_strings
                     std::vector<std::string> interp_strings;   // interp street name strings
                     uint64_t way_count = 0;
                     uint64_t building_addr_count = 0;
@@ -927,6 +933,7 @@ int main(int argc, char* argv[]) {
                     const char* t_interpolation = nullptr;
                     const char* t_housenumber = nullptr;
                     const char* t_street = nullptr;
+                    const char* t_postcode = nullptr;
                     const char* t_highway = nullptr;
                     const char* t_name = nullptr;
                     const char* t_boundary = nullptr;
@@ -962,6 +969,7 @@ int main(int argc, char* argv[]) {
                                 if (k == "addr:interpolation") t_interpolation = v;
                                 else if (k == "addr:housenumber") t_housenumber = v;
                                 else if (k == "addr:street") t_street = v;
+                                else if (k == "addr:postcode") t_postcode = v;
                                 else if (k == "admin_level") t_admin_level = v;
                                 else if (k == "amenity") t_amenity = v;
                                 else if (k == "aeroway") t_aeroway = v;
@@ -1064,8 +1072,9 @@ int main(int argc, char* argv[]) {
                             }
                             if (valid > 0) {
                                 local.building_addr_coords.push_back({sum_lat/valid, sum_lng/valid});
-                                local.building_addrs.push_back({static_cast<float>(sum_lat/valid), static_cast<float>(sum_lng/valid), 0, 0});
+                                local.building_addrs.push_back({static_cast<float>(sum_lat/valid), static_cast<float>(sum_lng/valid), 0, 0, 0});
                                 local.addr_strings.push_back({housenumber, street});
+                                local.addr_postcodes.push_back(t_postcode ? t_postcode : "");
                                 local.building_addr_count++;
                             }
                         }
@@ -1230,9 +1239,10 @@ int main(int argc, char* argv[]) {
                     // Merge building addresses
                     for (size_t i = 0; i < local.building_addrs.size(); i++) {
                         uint64_t dummy = 0;
+                        const char* pc = local.addr_postcodes[i].empty() ? nullptr : local.addr_postcodes[i].c_str();
                         add_addr_point(data, local.building_addrs[i].lat, local.building_addrs[i].lng,
                                        local.addr_strings[i].first.c_str(),
-                                       local.addr_strings[i].second.c_str(), dummy);
+                                       local.addr_strings[i].second.c_str(), pc, dummy);
                     }
 
                     // Merge interpolation ways
@@ -2196,6 +2206,7 @@ int main(int argc, char* argv[]) {
                 for (auto& a : data.addr_points) {
                     a.housenumber_id = rm.at(a.housenumber_id);
                     a.street_id = rm.at(a.street_id);
+                    if (a.postcode_id != NO_DATA) a.postcode_id = rm.at(a.postcode_id);
                 }
                 for (auto& iw : data.interp_ways) iw.street_id = rm.at(iw.street_id);
                 for (auto& ap : data.admin_polygons) ap.name_id = rm.at(ap.name_id);
@@ -2225,6 +2236,7 @@ int main(int argc, char* argv[]) {
                 const auto& pa = data.addr_points[a];
                 const auto& pb = data.addr_points[b];
                 if (pa.street_id != pb.street_id) return pa.street_id < pb.street_id;
+                if (pa.postcode_id != pb.postcode_id) return pa.postcode_id < pb.postcode_id;
                 if (pa.housenumber_id != pb.housenumber_id) return pa.housenumber_id < pb.housenumber_id;
                 uint32_t la = float_bits(pa.lat), lb = float_bits(pb.lat);
                 if (la != lb) return la < lb;
@@ -2953,8 +2965,8 @@ int main(int argc, char* argv[]) {
 
         std::ofstream mf(output_dir + "/manifest.json");
         mf << "{\n";
-        mf << "  \"build_version\": 2,\n";
-        mf << "  \"patch_version\": 2,\n";
+        mf << "  \"build_version\": 3,\n";
+        mf << "  \"patch_version\": 3,\n";
         mf << "  \"regions\": {\n";
 
         for (size_t ri = 0; ri < regions.size(); ri++) {

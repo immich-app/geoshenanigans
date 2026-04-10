@@ -79,8 +79,9 @@ struct PatchAddrPoint {
     float lng;
     uint32_t housenumber_id;
     uint32_t street_id;
+    uint32_t postcode_id;
 };
-static_assert(sizeof(PatchAddrPoint) == 16, "AddrPoint must be 16 bytes");
+static_assert(sizeof(PatchAddrPoint) == 20, "AddrPoint must be 20 bytes");
 
 struct PatchNodeCoord {
     float lat;

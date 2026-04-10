@@ -213,11 +213,21 @@ static std::unordered_map<uint32_t, uint32_t> build_string_remap(
 // --- Remap + fixup helpers ---
 
 static void remap_addr_points(char* data, size_t size, const std::unordered_map<uint32_t,uint32_t>& rm) {
-    for (size_t i = 0; i + 16 <= size; i += 16)
+    // AddrPoint: 20 bytes (lat:4 + lng:4 + housenumber_id:4 + street_id:4 + postcode_id:4)
+    // String fields at offsets 8, 12, 16
+    size_t stride = (size % 20 == 0 && size / 20 > 0) ? 20 : 16; // backwards compat
+    for (size_t i = 0; i + stride <= size; i += stride) {
         for (size_t off : {8, 12}) {
             uint32_t v; memcpy(&v, data + i + off, 4);
             auto it = rm.find(v); if (it != rm.end()) memcpy(data + i + off, &it->second, 4);
         }
+        if (stride >= 20) {
+            uint32_t v; memcpy(&v, data + i + 16, 4);
+            if (v != 0xFFFFFFFF) { // NO_DATA = no postcode
+                auto it = rm.find(v); if (it != rm.end()) memcpy(data + i + 16, &it->second, 4);
+            }
+        }
+    }
 }
 static void remap_field(char* data, size_t size, size_t stride, size_t field_off,
                          const std::unordered_map<uint32_t,uint32_t>& rm) {
@@ -702,7 +712,8 @@ int main(int argc, char* argv[]) {
             });
         auto id_rm = derive_id_remap_from_merge(seq, old_m.size / 16, 16);
         for (auto& [o,n] : soft) if (o < id_rm.size()) id_rm[o] = n;
-        res_addr = {PatchFileId::ADDR_POINTS, "addr_points.bin", 16,
+        size_t addr_stride = (old_m.size % 20 == 0 && old_m.size / 20 > 0) ? 20 : 16;
+        res_addr = {PatchFileId::ADDR_POINTS, "addr_points.bin", addr_stride,
                     old_m.size, new_m.size, std::move(seq), {}, std::move(soft), std::move(id_rm)};
         log_merge(res_addr);
         unmap_file(old_m); unmap_file(new_m);

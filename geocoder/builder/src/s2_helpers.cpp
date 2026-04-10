@@ -228,13 +228,15 @@ void AdminCoverPool::worker_loop() {
 
 void add_addr_point(ParsedData& data, double lat, double lng,
                     const char* housenumber, const char* street,
+                    const char* postcode,
                     uint64_t& addr_count_total) {
     uint32_t addr_id = static_cast<uint32_t>(data.addr_points.size());
     data.addr_points.push_back({
         static_cast<float>(lat),
         static_cast<float>(lng),
         data.string_pool.intern(housenumber),
-        data.string_pool.intern(street)
+        data.string_pool.intern(street),
+        (postcode && postcode[0]) ? data.string_pool.intern(postcode) : NO_DATA
     });
 
     S2CellId cell = point_to_cell(lat, lng);
