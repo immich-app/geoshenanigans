@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/zack/Source/immich/geoshenanigans/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
