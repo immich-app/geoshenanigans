@@ -228,19 +228,44 @@ fn place_type_to_field(pt: u8) -> Option<&'static str> {
     }
 }
 
-// Matches Nominatim's ADMIN_LABELS (rank_address → label)
+// Matches Nominatim's ADMIN_LABELS (rank_address → label).
+// ADMIN_LABELS in classtypes.py keys on rank//2:
+//   1 Continent, 2 Country, 3 Region, 4 State, 5 State District,
+//   6 County, 7 Municipality, 8 City, 9 City District, 10 Suburb,
+//   11 Neighbourhood, 12 City Block.
 fn rank_to_field(rank: u8) -> Option<&'static str> {
     match rank {
         4..=5 => Some("country"),
-        6..=9 => Some("state"),
-        10..=13 => Some("county"),
+        6..=7 => Some("region"),
+        8..=9 => Some("state"),
+        10..=11 => Some("state_district"),
+        12..=13 => Some("county"),
         14..=15 => Some("municipality"),
         16..=17 => Some("city"),
-        18..=19 => Some("suburb"),
-        20..=21 => Some("city_district"),
+        18..=19 => Some("city_district"),
+        20..=21 => Some("suburb"),
         22..=23 => Some("neighbourhood"),
         24..=25 => Some("neighbourhood"), // city_block → neighbourhood
         _ => None,
+    }
+}
+
+// Map an AdminPlaceType override to its Nominatim rank_address equivalent.
+// Used for the nested-boundary rank adjustment so e.g. Manhattan (border_type=
+// borough → SUBURB → rank 20) properly sits in the same rank hierarchy as
+// admin_level-based polygons.
+fn place_type_to_rank(pt: u8) -> u8 {
+    match pt {
+        1 | 2 | 3 => 16, // city/town/village
+        4 => 20,          // suburb/borough
+        5 => 22,          // neighbourhood
+        6 => 22,          // quarter (address-levels.json: [20, 22] → rank_address 22)
+        7 => 8,           // state
+        8 => 8,           // province
+        9 => 10,          // region — rank_address 10 from default mapping
+        10 => 12,         // county
+        11 => 18,         // district → city_district rank
+        _ => 0,
     }
 }
 
@@ -751,31 +776,77 @@ impl Index {
             }
         };
 
+        // Collect polygons at this point with their effective rank_address.
+        // (level, rank_address, override, name, area, country_code)
+        struct RankedPoly<'b> {
+            rank_address: u8,
+            place_type_override: u8,
+            name: &'b str,
+            area: f32,
+            country_code: u16,
+        }
+        let mut ranked: Vec<RankedPoly<'_>> = Vec::new();
         for level in 0..12 {
             if let Some((_, poly, _)) = best_by_level[level] {
-                // admin_level 11 is our marker for postal_code boundaries —
-                // they provide postcode only, never an address field.
-                if poly.admin_level == 11 { continue; }
+                if poly.admin_level == 11 { continue; } // postal code, handled separately
 
-                // Determine output field: place_type_override takes priority over admin_level mapping
-                let field = if poly.place_type_override > 0 {
-                    place_type_to_field(poly.place_type_override)
+                let rank = if poly.place_type_override > 0 {
+                    place_type_to_rank(poly.place_type_override)
                 } else {
-                    let rank = self.admin_config.to_rank(&country_code_str, poly.admin_level);
-                    if rank == 0 { continue; }
-                    rank_to_field(rank)
+                    self.admin_config.to_rank(&country_code_str, poly.admin_level)
                 };
+                if rank == 0 { continue; }
 
-                if let Some(field) = field {
-                    if let Some(idx) = field_index(field) {
-                        let name = self.get_string(poly.name_id);
-                        if let Some(ref existing) = best_by_field[idx] {
-                            if poly.area >= existing.area { continue; }
-                        }
-                        best_by_field[idx] = Some(FieldCandidate {
-                            area: poly.area, name, country_code: poly.country_code
-                        });
+                ranked.push(RankedPoly {
+                    rank_address: rank,
+                    place_type_override: poly.place_type_override,
+                    name: self.get_string(poly.name_id),
+                    area: poly.area,
+                    country_code: poly.country_code,
+                });
+            }
+        }
+
+        // Nominatim's nested-boundary rank adjustment (placex_triggers.sql):
+        // if a child boundary has rank_address ≤ its parent's, bump it by 2.
+        // We sort by rank_address ascending (coarsest first), tie-breaking by
+        // larger area (the presumed parent). Then for each polygon, if its
+        // rank is ≤ the previous one's rank, bump it past its parent.
+        // Plain area-descending sort is unreliable: Metropolitan France L3
+        // has a slightly larger area than France L2 in the simplified index
+        // because France includes overseas territories with tiny geometry,
+        // so a pure area sort flips the hierarchy.
+        ranked.sort_by(|a, b| {
+            a.rank_address.cmp(&b.rank_address)
+                .then(b.area.partial_cmp(&a.area).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        for i in 1..ranked.len() {
+            let parent_rank = ranked[i - 1].rank_address;
+            if ranked[i].rank_address <= parent_rank {
+                ranked[i].rank_address = parent_rank + 2;
+            }
+        }
+
+        // Now assign each polygon to its field slot. Each rank yields one
+        // field label (via place_type_override → fixed field, or
+        // rank_to_field). Smaller polygon (later in list after sort) wins
+        // ties, matching the deepest-ancestor-per-rank behaviour.
+        for r in &ranked {
+            let field = if r.place_type_override > 0 {
+                // For settlement/quarter/etc., the label is the place type
+                // verbatim (mirrors Nominatim's get_label_tag fallthrough).
+                place_type_to_field(r.place_type_override)
+            } else {
+                rank_to_field(r.rank_address)
+            };
+            if let Some(field) = field {
+                if let Some(idx) = field_index(field) {
+                    if let Some(ref existing) = best_by_field[idx] {
+                        if r.area >= existing.area { continue; }
                     }
+                    best_by_field[idx] = Some(FieldCandidate {
+                        area: r.area, name: r.name, country_code: r.country_code
+                    });
                 }
             }
         }
