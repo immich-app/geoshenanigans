@@ -274,14 +274,18 @@ inline uint32_t parse_house_number(const char* s) {
 }
 
 // Highway types excluded from street indexing
+// Matches Nominatim's default MAIN_TAGS_STREETS preset
+// (lib-lua/themes/nominatim/presets.lua). Always-include: motorway,
+// trunk, primary, secondary, tertiary, unclassified, residential,
+// road, living_street, pedestrian. "Named only" types (service,
+// cycleway, path, footway, steps, track, bridleway, construction) are
+// still included here because our caller already gates on a non-empty
+// name when it's required. Pedestrian inclusion matters for Nominatim
+// parity: Paris "City Hall Plaza" is highway=pedestrian, and dropping
+// it means we can't reach Nominatim's primary-feature road name.
 inline bool is_included_highway(const char* value) {
-    // Fast rejection by first character — avoids 8 strcmp calls for most values
     switch (value[0]) {
-        case 'f': return std::strcmp(value, "footway") != 0;
-        case 'p': return std::strcmp(value, "path") != 0 && std::strcmp(value, "pedestrian") != 0;
-        case 't': return std::strcmp(value, "track") != 0;
-        case 's': return std::strcmp(value, "steps") != 0 && std::strcmp(value, "service") != 0;
-        case 'c': return std::strcmp(value, "cycleway") != 0 && std::strcmp(value, "construction") != 0;
+        case 'c': return std::strcmp(value, "construction") != 0;
         case 'b': return std::strcmp(value, "bridleway") != 0;
         default: return true;
     }
