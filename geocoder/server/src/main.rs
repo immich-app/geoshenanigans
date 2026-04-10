@@ -1019,21 +1019,20 @@ impl Index {
             }
         }
 
-        // Suburb: prefer suburb > quarter > hamlet (all rank 19-20)
-        for pt in [3, 6, 4] {
-            if let Some((dist_sq, pn)) = best[pt] {
-                if dist_sq <= max_rank19 {
-                    result.suburb = Some(self.get_string(pn.name_id));
-                    break;
-                }
-            }
+        // Each place type goes to its own field so the server doesn't
+        // collapse distinct Nominatim slots (Berlin's place=quarter node
+        // should feed the 'quarter' field, not 'suburb').
+        if let Some((dist_sq, pn)) = best[3] {
+            if dist_sq <= max_rank19 { result.suburb = Some(self.get_string(pn.name_id)); }
         }
-
-        // Neighbourhood (rank 24)
+        if let Some((dist_sq, pn)) = best[6] {
+            if dist_sq <= max_rank20 { result.quarter = Some(self.get_string(pn.name_id)); }
+        }
+        if let Some((dist_sq, pn)) = best[4] {
+            if dist_sq <= max_rank19 { result.hamlet = Some(self.get_string(pn.name_id)); }
+        }
         if let Some((dist_sq, pn)) = best[5] {
-            if dist_sq <= max_rank20 {
-                result.neighbourhood = Some(self.get_string(pn.name_id));
-            }
+            if dist_sq <= max_rank20 { result.neighbourhood = Some(self.get_string(pn.name_id)); }
         }
 
         result
@@ -1230,7 +1229,7 @@ impl Index {
             city: admin.city.or(place.city),
             town: admin.town.or(place.town),
             village: admin.village.or(place.village),
-            hamlet: admin.hamlet,
+            hamlet: admin.hamlet.or(place.hamlet),
             municipality: admin.municipality,
             state: admin.state,
             province: admin.province,
@@ -1240,7 +1239,7 @@ impl Index {
             district: admin.district,
             borough: admin.borough,
             suburb: admin.suburb.or(place.suburb),
-            quarter: admin.quarter,
+            quarter: admin.quarter.or(place.quarter),
             city_district: admin.city_district,
             neighbourhood: admin.neighbourhood.or(place.neighbourhood),
             postcode: admin.postcode.or(addr_postcode),
@@ -1345,7 +1344,9 @@ struct PlaceResult<'a> {
     city: Option<&'a str>,
     town: Option<&'a str>,
     village: Option<&'a str>,
+    hamlet: Option<&'a str>,
     suburb: Option<&'a str>,
+    quarter: Option<&'a str>,
     neighbourhood: Option<&'a str>,
 }
 
