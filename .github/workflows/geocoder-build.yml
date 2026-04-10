@@ -487,8 +487,16 @@ jobs:
              && mv "$WORKDIR/output/manifest.tmp" "$WORKDIR/output/manifest.json"
           echo "Manifest: $(cat "$WORKDIR/output/manifest.json")"
 
-          # Upload manifest (index files + patches already uploaded during patch step)
+          # Generate checksums for all output files
+          echo "Generating checksums..."
+          (cd "$WORKDIR/output" && find . -type f -name "*.bin" -o -name "*.gcpatch" -o -name "*.json" | sort | while read -r f; do
+            sha256sum "$f"
+          done) > "$WORKDIR/output/checksums.sha256"
+          echo "$(wc -l < "$WORKDIR/output/checksums.sha256") file checksums generated"
+
+          # Upload manifest + checksums (index files + patches already uploaded during patch step)
           $S5 cp "$WORKDIR/output/manifest.json" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/manifest.json"
+          $S5 cp "$WORKDIR/output/checksums.sha256" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/checksums.sha256"
           $CACHE cp "$WORKDIR/output/manifest.json" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/manifest.json" 2>/dev/null || true
 
           # Verify upload completeness
