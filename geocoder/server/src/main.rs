@@ -490,7 +490,9 @@ impl Index {
             // Addresses
             if let Some(ref addr_entries) = self.addr_entries {
                 Self::for_each_entry(addr_entries, offsets.addr, |id| {
-                    let point = &all_points[id as usize];
+                    let idx = id as usize;
+                    if idx >= all_points.len() { return; }
+                    let point = &all_points[idx];
                     let dlat = (point.lat as f64 - lat).to_radians();
                     let dlng = (point.lng as f64 - lng).to_radians();
                     let dist = dist_sq(dlat, dlng, cos_lat);
