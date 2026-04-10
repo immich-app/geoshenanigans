@@ -604,6 +604,11 @@ int main(int argc, char* argv[]) {
                         const char* linked_place = rel.tag("linked_place");
                         const char* border_type_tag = rel.tag("border_type");
                         const char* wikidata_tag = rel.tag("wikidata");
+                        // place=* tag on boundary=administrative relations (e.g. Tokyo
+                        // has place=province, Suginami has place=city). Nominatim's
+                        // get_label_tag prefers extratags['place'] over the admin_level
+                        // → rank label, so we honour it as a place_type_override.
+                        const char* place_tag_on_admin = rel.tag("place");
 
                         CollectedRelation cr;
                         cr.id = rel.id;
@@ -612,7 +617,7 @@ int main(int argc, char* argv[]) {
                         cr.name = std::move(name_str);
                         cr.country_code = std::move(country_code);
                         cr.is_postal = is_postal;
-                        cr.place_type_override = static_cast<uint8_t>(classify_place_override(linked_place, border_type_tag, nullptr));
+                        cr.place_type_override = static_cast<uint8_t>(classify_place_override(linked_place, border_type_tag, place_tag_on_admin));
 
                         for (size_t mi = 0; mi < rel.members.size(); mi++) {
                             if (rel.members[mi].type == 'w') {
