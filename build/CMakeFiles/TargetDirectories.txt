@@ -1,6 +1,0 @@
-/home/zack/Source/immich/geoshenanigans/build/CMakeFiles/build-index.dir
-/home/zack/Source/immich/geoshenanigans/build/CMakeFiles/geocoder-canonicalize.dir
-/home/zack/Source/immich/geoshenanigans/build/CMakeFiles/geocoder-diff.dir
-/home/zack/Source/immich/geoshenanigans/build/CMakeFiles/geocoder-patch.dir
-/home/zack/Source/immich/geoshenanigans/build/CMakeFiles/edit_cache.dir
-/home/zack/Source/immich/geoshenanigans/build/CMakeFiles/rebuild_cache.dir

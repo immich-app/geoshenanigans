@@ -1,1 +1,0 @@
-/usr/sbin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/geocoder-canonicalize.dir/link.d "CMakeFiles/geocoder-canonicalize.dir/tools/geocoder_canonicalize.cpp.o" -o geocoder-canonicalize

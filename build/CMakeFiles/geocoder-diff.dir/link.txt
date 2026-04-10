@@ -1,1 +1,0 @@
-/usr/sbin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/geocoder-diff.dir/link.d "CMakeFiles/geocoder-diff.dir/tools/geocoder_diff.cpp.o" -o geocoder-diff
