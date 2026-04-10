@@ -850,30 +850,109 @@ impl Index {
                 .then(b.area.partial_cmp(&a.area).unwrap_or(std::cmp::Ordering::Equal))
         });
 
-        // Nominatim's nested-boundary rank adjustment followed by linked
-        // place override (placex_triggers.sql lines 910-1175):
-        //   1. If parent_rank >= self_rank, push self to parent_rank + 2.
-        //   2. If linked_place rank > parent_rank, replace self rank with it.
-        // Both rules preserve the invariant that each nested child gets a
-        // strictly higher rank than its parent. Processing in admin_level
-        // order guarantees parent has been fully resolved first.
-        let mut parent_rank: u8 = 0;
-        for r in ranked.iter_mut() {
-            // Step 1: nested adjustment against the most recent parent.
-            if r.rank_address <= parent_rank {
-                r.rank_address = parent_rank + 2;
-            }
-            // Step 2: linked-place / place-tag rank override. Nominatim only
-            // applies it when the linked rank is strictly greater than the
-            // parent rank, so a `linked_place=suburb` on a boundary already
-            // nested past that rank does not override downwards.
-            if r.place_type_override > 0 {
-                let linked_rank = place_type_to_rank(r.place_type_override);
-                if linked_rank > parent_rank && linked_rank > r.rank_address {
-                    r.rank_address = linked_rank;
+        // Nominatim's nested-boundary rank adjustment (placex_triggers.sql
+        // lines 910-1175) applies two independent promotions in order:
+        //
+        //   1. Admin nested: if a parent admin boundary (admin_level > 3
+        //      AND admin_level < self) has rank_address >= self, push
+        //      self to parent_rank + 2.
+        //   2. Linked place override: if the linked place's rank >
+        //      parent_address_level (the same "parent" computed above),
+        //      replace self rank with the linked place rank.
+        //   3. Place area containment: if a class='place' area (e.g.
+        //      R9185096 "Nairobi" with place=city) with rank >= self
+        //      contains self, push self to place_area_rank + 2.
+        //
+        // We approximate class='place' polygons as any polygon with a
+        // non-zero place_type_override — that's the set the builder
+        // populates from place=X and linked_place=X tags. Because every
+        // polygon in best_by_level contains the query point, we use
+        // (area > self.area) as a proxy for "contains self".
+        //
+        // Order matters: admin nested must run before the place-area
+        // promotion for the ranks to stabilise. We iterate twice to let
+        // rank changes cascade (Starehe L6 getting bumped to 18 then
+        // promoting CBD division L7 from 14 to 20).
+        // Combined rank adjustment. Applies Nominatim's three rules in
+        // sequence on each polygon, iterating 3 times so the cascade can
+        // propagate through admin and place parents alike:
+        //   1. Admin nested: push to parent_rank + 2 if parent admin's
+        //      rank >= self (parent = latest earlier polygon with
+        //      admin_level in (3, self.admin_level)).
+        //   2. Linked place override: if self has a place_type tag, use
+        //      its rank_address (only if > admin_parent_rank and > self).
+        //   3. Place area containment: push to place_rank + 2 if any
+        //      larger polygon with a place_type_override (a "place area"
+        //      class='place' in Nominatim terms) has rank >= self.
+        //
+        // Only polygons without their own place_type_override are eligible
+        // for place-area promotion (rule 3) — a Paris L6 boundary with
+        // linked_place=city should stay at rank 16 even though it's
+        // nested inside a larger polygon with an override.
+        for _ in 0..3 {
+            for i in 0..ranked.len() {
+                let self_al = ranked[i].admin_level;
+                let self_area = ranked[i].area;
+                let self_override = ranked[i].place_type_override;
+
+                // Step 1: admin nested.
+                let mut admin_parent_rank: u8 = 0;
+                if self_al > 4 {
+                    for j in (0..i).rev() {
+                        let al = ranked[j].admin_level;
+                        if al > 3 && al < self_al {
+                            admin_parent_rank = ranked[j].rank_address;
+                            break;
+                        }
+                    }
+                }
+                if ranked[i].rank_address <= admin_parent_rank {
+                    ranked[i].rank_address = admin_parent_rank + 2;
+                }
+
+                // Step 2: linked place override.
+                if self_override > 0 {
+                    let linked_rank = place_type_to_rank(self_override);
+                    if linked_rank > admin_parent_rank && linked_rank > ranked[i].rank_address {
+                        ranked[i].rank_address = linked_rank;
+                    }
+                }
+
+                // Step 3: place area containment, only for polygons
+                // without their own place_type_override. We only consider
+                // polygons that override to settlement-level ranks (city /
+                // town / village / suburb / hamlet / neighbourhood /
+                // quarter / borough) as "place areas" — state / province /
+                // region overrides describe the same geographic hierarchy
+                // as admin boundaries and shouldn't push inner admin
+                // polygons to higher ranks.
+                if self_override == 0 {
+                    let mut place_parent_rank: u8 = 0;
+                    for j in 0..ranked.len() {
+                        if j == i { continue; }
+                        let jo = ranked[j].place_type_override;
+                        if jo == 0 { continue; }
+                        // Only settlement-level place types count as
+                        // "place area" promoters (city/town/village/
+                        // suburb/neighbourhood/quarter/hamlet/borough/
+                        // municipality). State / province / region / county
+                        // / district overrides represent higher-level
+                        // administrative hierarchy, not the rank-16+
+                        // place-containment rule.
+                        if !matches!(jo, 1 | 2 | 3 | 4 | 5 | 6 | 12 | 13 | 14) {
+                            continue;
+                        }
+                        if ranked[j].area <= self_area { continue; }
+                        if ranked[j].rank_address < ranked[i].rank_address { continue; }
+                        if ranked[j].rank_address > place_parent_rank {
+                            place_parent_rank = ranked[j].rank_address;
+                        }
+                    }
+                    if place_parent_rank > 0 && place_parent_rank >= ranked[i].rank_address {
+                        ranked[i].rank_address = place_parent_rank + 2;
+                    }
                 }
             }
-            parent_rank = r.rank_address;
         }
 
         // Now assign each polygon to its field slot. Each rank yields one
