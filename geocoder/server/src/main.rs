@@ -457,10 +457,12 @@ impl Index {
 
     // --- Geo lookup (streets, addresses, interpolation from merged index) ---
 
-    fn query_geo(&self, lat: f64, lng: f64) -> (Option<(f64, &AddrPoint)>, Option<(f64, &str, u32)>, Option<(f64, &WayHeader)>) {
+    fn query_geo(&self, lat: f64, lng: f64)
+        -> (Option<(f64, &AddrPoint)>, Option<(f64, &str, u32)>, Option<(f64, &WayHeader)>, Option<&AddrPoint>)
+    {
         let geo_cells = match &self.geo_cells {
             Some(gc) => gc,
-            None => return (None, None, None),
+            None => return (None, None, None, None),
         };
         let street_entries = self.street_entries.as_ref().unwrap();
         let street_ways_mmap = self.street_ways.as_ref().unwrap();
@@ -518,6 +520,13 @@ impl Index {
 
         let mut best_addr_dist = f64::MAX;
         let mut best_addr: Option<&AddrPoint> = None;
+        // Track the nearest address that has a postcode, used as a fallback
+        // when the chosen address point lacks addr:postcode itself. Matches
+        // Nominatim's `get_postcode_matching_boundary` behaviour of walking
+        // neighbouring address rows to find one with a postcode when the
+        // immediate candidate has none.
+        let mut best_addr_with_postcode_dist = f64::MAX;
+        let mut best_addr_with_postcode: Option<&AddrPoint> = None;
         let mut best_street_dist = f64::MAX;
         let mut best_street: Option<&WayHeader> = None;
         let mut best_interp_dist = f64::MAX;
@@ -542,6 +551,10 @@ impl Index {
                     if dist < best_addr_dist {
                         best_addr_dist = dist;
                         best_addr = Some(point);
+                    }
+                    if point.postcode_id != NO_DATA && dist < best_addr_with_postcode_dist {
+                        best_addr_with_postcode_dist = dist;
+                        best_addr_with_postcode = Some(point);
                     }
                 });
             }
@@ -621,6 +634,7 @@ impl Index {
 
         let addr_result = best_addr.map(|p| (best_addr_dist, p));
         let street_result = best_street.map(|w| (best_street_dist, w));
+        let addr_with_postcode = best_addr_with_postcode;
         let interp_result = best_interp.map(|iw| {
             let start = iw.start_number as f64;
             let end = iw.end_number as f64;
@@ -642,7 +656,7 @@ impl Index {
             (best_interp_dist, self.get_string(iw.street_id), number)
         });
 
-        (addr_result, interp_result, street_result)
+        (addr_result, interp_result, street_result, addr_with_postcode)
     }
 
     // --- Admin boundary lookup (point-in-polygon) ---
@@ -1157,7 +1171,7 @@ impl Index {
 
         let admin = self.find_admin(lat, lng);
         let place = self.find_places(lat, lng);
-        let (addr, interp, street) = self.query_geo(lat, lng);
+        let (addr, interp, street, nearest_with_postcode) = self.query_geo(lat, lng);
 
         // Determine house_number and road from best geo match (priority: address > interpolation > street)
         let mut house_number: Option<Cow<'_, str>> = None;
@@ -1170,6 +1184,15 @@ impl Index {
                 road = Some(self.get_string(point.street_id));
                 if point.postcode_id != NO_DATA {
                     addr_postcode = Some(self.get_string(point.postcode_id));
+                }
+            }
+        }
+        // Nominatim fallback: if the closest address lacks a postcode, use
+        // the nearest address in the search region that has one.
+        if addr_postcode.is_none() {
+            if let Some(p) = nearest_with_postcode {
+                if p.postcode_id != NO_DATA {
+                    addr_postcode = Some(self.get_string(p.postcode_id));
                 }
             }
         }
