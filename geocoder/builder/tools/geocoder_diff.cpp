@@ -701,18 +701,30 @@ int main(int argc, char* argv[]) {
     std::thread t_addr([&]() {
         double gs = now_ms();
         auto old_m = mmap_file_rw(old_dir + "/addr_points.bin");
-        remap_addr_points(old_m.data, old_m.size, str_remap);
         auto new_m = mmap_file(new_dir + "/addr_points.bin");
-        auto seq = build_merge_seq(old_m.data, old_m.size, new_m.data, new_m.size, 16);
-        auto soft = secondary_match_from_merge(seq, old_m.data, old_m.size, new_m.data, new_m.size, 16,
+        // Stride must be detected per-file: old may be 16 (pre-postcode) or 20 (post-postcode).
+        // We can only run the merge if old and new have the same stride.
+        auto detect_addr_stride = [](size_t sz) -> size_t {
+            return (sz % 20 == 0 && sz / 20 > 0) ? 20 : 16;
+        };
+        size_t old_stride = detect_addr_stride(old_m.size);
+        size_t new_stride = detect_addr_stride(new_m.size);
+        if (old_stride != new_stride) {
+            std::cerr << "  addr_points: stride mismatch (old=" << old_stride
+                      << ", new=" << new_stride << ") — cannot patch" << std::endl;
+            std::exit(2);
+        }
+        size_t addr_stride = new_stride;
+        remap_addr_points(old_m.data, old_m.size, str_remap);
+        auto seq = build_merge_seq(old_m.data, old_m.size, new_m.data, new_m.size, addr_stride);
+        auto soft = secondary_match_from_merge(seq, old_m.data, old_m.size, new_m.data, new_m.size, addr_stride,
             [](const char* rec) -> uint64_t {
                 uint32_t hn_id, st_id;
                 memcpy(&hn_id, rec + 8, 4); memcpy(&st_id, rec + 12, 4);
                 return ((uint64_t)st_id << 32) | hn_id;
             });
-        auto id_rm = derive_id_remap_from_merge(seq, old_m.size / 16, 16);
+        auto id_rm = derive_id_remap_from_merge(seq, old_m.size / addr_stride, addr_stride);
         for (auto& [o,n] : soft) if (o < id_rm.size()) id_rm[o] = n;
-        size_t addr_stride = (old_m.size % 20 == 0 && old_m.size / 20 > 0) ? 20 : 16;
         res_addr = {PatchFileId::ADDR_POINTS, "addr_points.bin", addr_stride,
                     old_m.size, new_m.size, std::move(seq), {}, std::move(soft), std::move(id_rm)};
         log_merge(res_addr);
