@@ -1,9 +1,6 @@
 name: Update Wikidata Sitelinks
 
 on:
-  push:
-    branches: [feat/geocoder]
-    paths: ['.github/workflows/geocoder-wikidata.yml']
   schedule:
     - cron: '17 3 * * 0'  # Weekly on Sunday at 3:17 UTC
   workflow_dispatch:
