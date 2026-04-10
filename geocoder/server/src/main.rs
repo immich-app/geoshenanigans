@@ -217,14 +217,18 @@ fn place_type_to_field(pt: u8) -> Option<&'static str> {
     }
 }
 
+// Matches Nominatim's ADMIN_LABELS (rank//2 → label)
 fn rank_to_field(rank: u8) -> Option<&'static str> {
     match rank {
         4..=5 => Some("country"),
         6..=9 => Some("state"),
         10..=13 => Some("county"),
-        14..=17 => Some("city"),
-        18..=21 => Some("suburb"),
-        22..=25 => Some("neighbourhood"),
+        14..=15 => Some("municipality"),
+        16..=17 => Some("city"),
+        18..=19 => Some("suburb"),
+        20..=21 => Some("suburb"),       // city_district → suburb
+        22..=23 => Some("neighbourhood"),
+        24..=25 => Some("neighbourhood"), // city_block → neighbourhood
         _ => None,
     }
 }
@@ -714,13 +718,14 @@ impl Index {
             name: &'b str,
             country_code: u16,
         }
-        let mut best_by_field: [Option<FieldCandidate<'_>>; 6] = Default::default();
-        // 0=country, 1=state, 2=county, 3=city, 4=suburb, 5=neighbourhood
+        let mut best_by_field: [Option<FieldCandidate<'_>>; 7] = Default::default();
+        // 0=country, 1=state, 2=county, 3=municipality, 4=city, 5=suburb, 6=neighbourhood
 
         let field_index = |field: &str| -> Option<usize> {
             match field {
                 "country" => Some(0), "state" => Some(1), "county" => Some(2),
-                "city" => Some(3), "suburb" => Some(4), "neighbourhood" => Some(5),
+                "municipality" => Some(3), "city" => Some(4),
+                "suburb" => Some(5), "neighbourhood" => Some(6),
                 _ => None,
             }
         };
@@ -772,9 +777,10 @@ impl Index {
         }
         result.state = best_by_field[1].as_ref().map(|c| c.name);
         result.county = best_by_field[2].as_ref().map(|c| c.name);
-        result.city = best_by_field[3].as_ref().map(|c| c.name);
-        result.suburb = best_by_field[4].as_ref().map(|c| c.name);
-        result.neighbourhood = best_by_field[5].as_ref().map(|c| c.name);
+        result.municipality = best_by_field[3].as_ref().map(|c| c.name);
+        result.city = best_by_field[4].as_ref().map(|c| c.name);
+        result.suburb = best_by_field[5].as_ref().map(|c| c.name);
+        result.neighbourhood = best_by_field[6].as_ref().map(|c| c.name);
 
         result
     }
@@ -1047,6 +1053,7 @@ impl Index {
             house_number,
             road,
             city: admin.city.or(place.city),
+            municipality: admin.municipality,
             state: admin.state,
             county: admin.county,
             suburb: admin.suburb.or(place.suburb),
@@ -1142,6 +1149,7 @@ struct AdminResult<'a> {
     country_code: Option<[u8; 2]>,
     state: Option<&'a str>,
     county: Option<&'a str>,
+    municipality: Option<&'a str>,
     city: Option<&'a str>,
     suburb: Option<&'a str>,
     neighbourhood: Option<&'a str>,
@@ -1156,6 +1164,8 @@ struct AddressDetails<'a> {
     road: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     city: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    municipality: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
