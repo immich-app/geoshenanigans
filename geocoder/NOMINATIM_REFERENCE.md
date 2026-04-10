@@ -161,6 +161,7 @@ For most cases, our smallest-area-wins approach produces the same result. Edge c
 | Suburb/neighbourhood rank adjustment | Not implemented — we use smallest-area-wins per field | ⚠️ Nominatim bumps child ranks to be > parent at index time. Could produce different suburb/neighbourhood assignments in edge cases with nested same-rank boundaries. |
 | TIGER address interpolation | Not implemented | ❌ Deferred — US TIGER data encodes address ranges in `tiger:*` tags on road ways (e.g., `tiger:zip_left`, `tiger:zip_right`). Nominatim interpolates house numbers from these. Affects rural/suburban US where addr:housenumber tags are sparse. Builder would need to extract TIGER ranges and store as interpolation data. |
 | Postal city names | Not implemented | ❌ Deferred — in the US, USPS assigns city names to ZIP codes that may differ from the actual municipal jurisdiction (e.g., "Cumming, GA" for unincorporated Forsyth County). Neither we nor Nominatim handle this — would require external USPS data or addr:city extraction. |
+| Name localisation | Not implemented — we always use the `name` tag | ❌ Deferred — Nominatim supports `accept-language` header to return locale-specific names (e.g., `name:en=Borough of Luton` instead of `name=Luton`). Builder would need to store `name:en`, `name:fr`, etc. in the string pool (or a separate name table), and server would need to select based on client language preference. |
 
 ## Postcode handling in Nominatim (traced from source)
 
