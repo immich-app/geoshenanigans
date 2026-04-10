@@ -1,6 +1,9 @@
 name: Update Wikidata Sitelinks
 
 on:
+  push:
+    branches: [feat/geocoder]
+    paths: ['.github/workflows/geocoder-wikidata.yml']
   schedule:
     - cron: '17 3 * * 0'  # Weekly on Sunday at 3:17 UTC
   workflow_dispatch:
@@ -40,9 +43,23 @@ jobs:
       - name: Find latest Wikidata dump
         id: dump
         run: |
-          # Find the latest available dump date
-          DATES=$(curl -sL "https://dumps.wikimedia.org/wikidatawiki/entities/" | grep -oP 'href="(\d{8})/"' | grep -oP '\d{8}' | sort -r)
-          LATEST=$(echo "$DATES" | head -1)
+          # Find the latest available dump date that has the wb_items_per_site file
+          DATES=$(curl -sL "https://dumps.wikimedia.org/wikidatawiki/" | grep -oP 'href="(\d{8})/"' | grep -oP '\d{8}' | sort -r)
+          LATEST=""
+          for DATE in $DATES; do
+            URL="https://dumps.wikimedia.org/wikidatawiki/$DATE/wikidatawiki-${DATE}-wb_items_per_site.sql.gz"
+            STATUS=$(curl -sI "$URL" 2>/dev/null | head -1 | awk '{print $2}')
+            if [ "$STATUS" = "200" ]; then
+              LATEST="$DATE"
+              echo "Found available dump: $DATE"
+              break
+            fi
+            echo "Dump $DATE: file not ready (HTTP $STATUS)"
+          done
+          if [ -z "$LATEST" ]; then
+            echo "::error::No available wb_items_per_site dump found"
+            exit 1
+          fi
           echo "Latest dump: $LATEST"
           echo "date=$LATEST" >> "$GITHUB_OUTPUT"
 
