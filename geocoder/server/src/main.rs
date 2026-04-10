@@ -869,8 +869,8 @@ impl Index {
                 if place_id >= all_places.len() { return; }
                 let pn = &all_places[place_id];
                 let pt = pn.place_type as usize;
-                // Only wider types — skip neighbourhood/hamlet/quarter (already found above)
-                if pt >= 4 { return; } // only city=0, town=1, village=2, suburb=3
+                // Skip hamlet=4 and quarter=6 (very local, narrow search sufficient)
+                if pt == 4 || pt == 6 { return; } // city=0, town=1, village=2, suburb=3, neighbourhood=5
 
                 let dlat = (lat - pn.lat as f64).to_radians();
                 let dlng = (lng - pn.lng as f64).to_radians();
@@ -887,11 +887,12 @@ impl Index {
         let mut result = PlaceResult::default();
 
         // Max distance thresholds (squared radians) for each place type
-        let max_city = (50000.0_f64 / 111320.0).powi(2);    // 50km for cities
-        let max_town = (15000.0_f64 / 111320.0).powi(2);    // 15km for towns
-        let max_village = (5000.0_f64 / 111320.0).powi(2);   // 5km for villages
-        let max_suburb = (3000.0_f64 / 111320.0).powi(2);    // 3km for suburbs
-        let max_neighbourhood = (1500.0_f64 / 111320.0).powi(2); // 1.5km
+        // Max search radii from Nominatim's reverse_place_diameter() / 2
+        let max_city = (9000.0_f64 / 111320.0).powi(2);             // 9km (rank<=17: 0.16deg diameter)
+        let max_town = (9000.0_f64 / 111320.0).powi(2);             // 9km (same rank range)
+        let max_village = (9000.0_f64 / 111320.0).powi(2);          // 9km (same rank range)
+        let max_suburb = (2200.0_f64 / 111320.0).powi(2);           // 2.2km (rank<=19: 0.04deg diameter)
+        let max_neighbourhood = (1100.0_f64 / 111320.0).powi(2);    // 1.1km (rank>19: 0.02deg diameter)
 
         // City: prefer city > town > village
         for (pt, max_dist) in [(0, max_city), (1, max_town), (2, max_village)] {
