@@ -663,7 +663,6 @@ int main(int argc, char* argv[]) {
                         cr.country_code = std::move(country_code);
                         cr.is_postal = is_postal;
                         cr.place_type_override = static_cast<uint8_t>(po.type);
-                        cr.place_tag_blocks_wikidata = po.tag_present;
 
                         for (size_t mi = 0; mi < rel.members.size(); mi++) {
                             if (rel.members[mi].type == 'w') {
@@ -672,11 +671,15 @@ int main(int argc, char* argv[]) {
                         }
 
                         if (!cr.members.empty()) {
-                            // Store wikidata ID only when no tag-based override and no
-                            // place tag blocks the wikidata fallback (Nominatim's
-                            // find_linked_place returns NULL if extratags['place'] is set).
+                            // Always store wikidata for relations without a
+                            // tag-based override. Nominatim's find_linked_place
+                            // (placex_triggers.sql) goes: label role → wikidata →
+                            // place type match → name match. A place=* tag on the
+                            // boundary does NOT short-circuit the wikidata step —
+                            // it's used as the 3rd fallback for type matching,
+                            // not as a blocker.
                             std::string wd_str;
-                            if (wikidata_tag && cr.place_type_override == 0 && !cr.place_tag_blocks_wikidata) {
+                            if (wikidata_tag && cr.place_type_override == 0) {
                                 wd_str = wikidata_tag;
                             }
                             std::lock_guard<std::mutex> lock(rel_mutex);
