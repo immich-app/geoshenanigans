@@ -151,7 +151,7 @@ For most cases, our smallest-area-wins approach produces the same result. Edge c
 | find_linked_place() node linking | Not implemented — we use tags on the boundary directly | ⚠️ Different mechanism, same result for tagged boundaries. Untagged boundaries that link to place nodes by name/wikidata won't get overrides. **Future fix**: at build time, match admin boundary wikidata tags against place node wikidata tags to set place_type_override. Name-based fallback is expensive (geometric containment test). |
 | Rank adjustment for nested boundaries | Not implemented — we use smallest-area-wins per field | ⚠️ Different mechanism, similar result for most cases |
 | boundary=place entities (e.g., Washington DC) | Extracted in builder with admin_level=15 + place_type_override | ✅ Implemented |
-| Place node fallback (nearest city/town/village) | place_nodes.bin + find_places() at street cell level | ✅ Implemented |
+| Place node fallback (nearest city/town/village) | place_nodes.bin + find_places() with wide search | ✅ Implemented — uses L14→L17 child enumeration for city/suburb (~1.2km), L17 neighbors for neighbourhood. **TODO**: index at L10 in builder for better performance and coverage. |
 | place_addressline pre-computed relationships | Not applicable — we do spatial lookup at query time | N/A — different architecture |
 | Postcodes from addr:postcode | Not implemented — only boundary-based postcodes | ❌ Deferred — see "Postcode handling" section below |
 | border_type tag | Extracted but Nominatim doesn't actually use this tag | ⚠️ We use it as a fallback after linked_place; harmless but unnecessary |
