@@ -808,69 +808,23 @@ impl Index {
             )
         };
 
-        // Search at street level (L17) for fine-grained neighbourhood/hamlet lookup,
-        // plus a wider area for city/town/suburb by going up to L14 parent and
-        // enumerating its L17 children + neighbors
-        let cell = cell_id_at_level(lat, lng, self.street_cell_level);
-        let neighbors = cell_neighbors_at_level(cell, self.street_cell_level);
-
-        // Wider search: go up to L14 (covers ~1.2km) and enumerate L17 children
-        let wide_level = 14u64;
-        let wide_cell = CellID(cell).parent(wide_level);
-        let wide_neighbors = wide_cell.all_neighbors(wide_level);
-        let mut wide_cells: Vec<u64> = Vec::new();
-        for wc in std::iter::once(wide_cell).chain(wide_neighbors.into_iter()) {
-            // Each L14 cell has 8 L17 children (4^(17-14) would be 64, but
-            // children() only gives direct children — need to recurse 3 levels)
-            let mut stack = vec![wc];
-            while let Some(c) = stack.pop() {
-                if c.level() == self.street_cell_level {
-                    wide_cells.push(c.0);
-                } else if c.level() < self.street_cell_level {
-                    for child in c.children().iter() {
-                        stack.push(*child);
-                    }
-                }
-            }
-        }
-        wide_cells.sort();
-        wide_cells.dedup();
+        // Place nodes are indexed at admin cell level (L10, ~10km cells).
+        // Cell + 8 neighbors covers ~30km — sufficient for all place types.
+        let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
+        let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
 
         // For each place type, find the nearest node
         // 0=city, 1=town, 2=village, 3=suburb, 4=hamlet, 5=neighbourhood, 6=quarter
         let mut best: [Option<(f64, &PlaceNode)>; 7] = [None; 7];
         let cos_lat = lat.to_radians().cos();
 
-        // First pass: immediate neighbors (fast, for neighbourhood/hamlet)
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            // Place nodes use geo_cells format (same 12-byte cell index as admin)
             Self::for_each_entry(place_entries, Self::lookup_admin_cell(place_cells, c), |id| {
                 let place_id = id as usize;
                 if place_id >= all_places.len() { return; }
                 let pn = &all_places[place_id];
                 let pt = pn.place_type as usize;
                 if pt >= 7 { return; }
-
-                let dlat = (lat - pn.lat as f64).to_radians();
-                let dlng = (lng - pn.lng as f64).to_radians();
-                let dist_sq = dlat * dlat + dlng * dlng * cos_lat * cos_lat;
-
-                if let Some((best_dist, _)) = best[pt] {
-                    if dist_sq >= best_dist { return; }
-                }
-                best[pt] = Some((dist_sq, pn));
-            });
-        }
-
-        // Second pass: wide search for city/town/suburb (checks ~1.2km radius)
-        for c in wide_cells.iter() {
-            Self::for_each_entry(place_entries, Self::lookup_admin_cell(place_cells, *c), |id| {
-                let place_id = id as usize;
-                if place_id >= all_places.len() { return; }
-                let pn = &all_places[place_id];
-                let pt = pn.place_type as usize;
-                // Skip hamlet=4 and quarter=6 (very local, narrow search sufficient)
-                if pt == 4 || pt == 6 { return; } // city=0, town=1, village=2, suburb=3, neighbourhood=5
 
                 let dlat = (lat - pn.lat as f64).to_radians();
                 let dlng = (lng - pn.lng as f64).to_radians();

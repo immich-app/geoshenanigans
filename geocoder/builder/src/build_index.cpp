@@ -2005,7 +2005,7 @@ int main(int argc, char* argv[]) {
                                 if (i >= data.place_nodes.size()) break;
                                 const auto& pn = data.place_nodes[i];
                                 S2CellId cell = S2CellId(S2LatLng::FromDegrees(pn.lat, pn.lng))
-                                    .parent(kStreetCellLevel);
+                                    .parent(kAdminCellLevel);
                                 local.push_back({cell.id(), static_cast<uint32_t>(i)});
                             }
                         });
