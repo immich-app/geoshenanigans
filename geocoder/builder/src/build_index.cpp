@@ -41,18 +41,28 @@
 
 // --- Place type override classification ---
 
-static AdminPlaceType classify_place_override(const char* linked_place, const char* border_type, const char* place_tag) {
+struct PlaceOverride {
+    AdminPlaceType type;
+    bool tag_present;   // true when any relevant tag (linked_place/border_type/place) was set;
+                        // used to block wikidata linking for boundaries that Nominatim
+                        // treats as having an authoritative place tag (even if the place
+                        // value is state/country/... which we don't translate to an override).
+};
+
+static PlaceOverride classify_place_override(const char* linked_place, const char* border_type, const char* place_tag) {
     // Priority: linked_place > border_type > place (for boundary=place)
     const char* val = linked_place ? linked_place : (border_type ? border_type : place_tag);
-    if (!val) return AdminPlaceType::NONE;
-    if (std::strcmp(val, "city") == 0) return AdminPlaceType::CITY;
-    if (std::strcmp(val, "town") == 0) return AdminPlaceType::TOWN;
-    if (std::strcmp(val, "village") == 0) return AdminPlaceType::VILLAGE;
-    if (std::strcmp(val, "borough") == 0) return AdminPlaceType::SUBURB;
-    if (std::strcmp(val, "suburb") == 0) return AdminPlaceType::SUBURB;
-    if (std::strcmp(val, "neighbourhood") == 0) return AdminPlaceType::NEIGHBOURHOOD;
-    if (std::strcmp(val, "quarter") == 0) return AdminPlaceType::QUARTER;
-    return AdminPlaceType::NONE;
+    bool present = (val != nullptr && val[0] != '\0');
+    if (!present) return {AdminPlaceType::NONE, false};
+    AdminPlaceType t = AdminPlaceType::NONE;
+    if (std::strcmp(val, "city") == 0) t = AdminPlaceType::CITY;
+    else if (std::strcmp(val, "town") == 0) t = AdminPlaceType::TOWN;
+    else if (std::strcmp(val, "village") == 0) t = AdminPlaceType::VILLAGE;
+    else if (std::strcmp(val, "borough") == 0) t = AdminPlaceType::SUBURB;
+    else if (std::strcmp(val, "suburb") == 0) t = AdminPlaceType::SUBURB;
+    else if (std::strcmp(val, "neighbourhood") == 0) t = AdminPlaceType::NEIGHBOURHOOD;
+    else if (std::strcmp(val, "quarter") == 0) t = AdminPlaceType::QUARTER;
+    return {t, true};
 }
 
 // PlaceType (0=CITY, 1=TOWN, ...) → AdminPlaceType (0=NONE, 1=CITY, 2=TOWN, ...)
@@ -533,7 +543,7 @@ int main(int argc, char* argv[]) {
                         bool is_multipolygon_place =
                             !boundary && rel_type && rel_place &&
                             std::strcmp(rel_type, "multipolygon") == 0 &&
-                            classify_place_override(nullptr, nullptr, rel_place) != AdminPlaceType::NONE;
+                            classify_place_override(nullptr, nullptr, rel_place).type != AdminPlaceType::NONE;
 
                         if (!boundary && !is_multipolygon_place) continue;
 
@@ -556,7 +566,7 @@ int main(int argc, char* argv[]) {
                         if (is_place_boundary || is_multipolygon_place) {
                             const char* place_tag = rel_place;
                             if (place_tag) {
-                                AdminPlaceType pt = classify_place_override(nullptr, nullptr, place_tag);
+                                AdminPlaceType pt = classify_place_override(nullptr, nullptr, place_tag).type;
                                 if (pt != AdminPlaceType::NONE) {
                                     const char* name = rel.tag("name:en");
                                     if (!name) name = rel.tag("name");
@@ -626,6 +636,7 @@ int main(int argc, char* argv[]) {
                         // → rank label, so we honour it as a place_type_override.
                         const char* place_tag_on_admin = rel.tag("place");
 
+                        auto po = classify_place_override(linked_place, border_type_tag, place_tag_on_admin);
                         CollectedRelation cr;
                         cr.id = rel.id;
                         cr.label_node_id = label_node_id;
@@ -633,7 +644,8 @@ int main(int argc, char* argv[]) {
                         cr.name = std::move(name_str);
                         cr.country_code = std::move(country_code);
                         cr.is_postal = is_postal;
-                        cr.place_type_override = static_cast<uint8_t>(classify_place_override(linked_place, border_type_tag, place_tag_on_admin));
+                        cr.place_type_override = static_cast<uint8_t>(po.type);
+                        cr.place_tag_blocks_wikidata = po.tag_present;
 
                         for (size_t mi = 0; mi < rel.members.size(); mi++) {
                             if (rel.members[mi].type == 'w') {
@@ -642,9 +654,11 @@ int main(int argc, char* argv[]) {
                         }
 
                         if (!cr.members.empty()) {
-                            // Store wikidata ID for relations that don't already have a place_type_override
+                            // Store wikidata ID only when no tag-based override and no
+                            // place tag blocks the wikidata fallback (Nominatim's
+                            // find_linked_place returns NULL if extratags['place'] is set).
                             std::string wd_str;
-                            if (wikidata_tag && cr.place_type_override == 0) {
+                            if (wikidata_tag && cr.place_type_override == 0 && !cr.place_tag_blocks_wikidata) {
                                 wd_str = wikidata_tag;
                             }
                             std::lock_guard<std::mutex> lock(rel_mutex);
@@ -1513,9 +1527,10 @@ int main(int argc, char* argv[]) {
                                         std::vector<std::pair<double,double>> verts;
                                         for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});
                                         std::string cc; if (al == 2) { const char* iso = t_iso; if (iso) cc = iso; }
-                                        auto pto = static_cast<uint8_t>(classify_place_override(t_linked_place, t_border_type, nullptr));
+                                        auto po = classify_place_override(t_linked_place, t_border_type, t_place);
+                                        auto pto = static_cast<uint8_t>(po.type);
                                         std::string wd_str;
-                                        if (t_wikidata && pto == 0) wd_str = t_wikidata;
+                                        if (t_wikidata && pto == 0 && !po.tag_present) wd_str = t_wikidata;
                                         local.closed_way_admins.push_back({std::move(verts), std::move(name_str), al, std::move(cc), pto, std::move(wd_str)});
                                     }
                                 }
@@ -1525,7 +1540,7 @@ int main(int argc, char* argv[]) {
                         if (is_place_boundary && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1]) {
                             const char* aname = t_best_name;
                             if (aname && t_place) {
-                                AdminPlaceType pt = classify_place_override(nullptr, nullptr, t_place);
+                                AdminPlaceType pt = classify_place_override(nullptr, nullptr, t_place).type;
                                 if (pt != AdminPlaceType::NONE && all_valid && resolved_locs.size() >= 3) {
                                     std::vector<std::pair<double,double>> verts;
                                     for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});

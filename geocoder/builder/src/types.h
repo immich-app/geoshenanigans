@@ -108,6 +108,11 @@ struct CollectedRelation {
     int64_t label_node_id = -1;  // role=label place node (Nominatim's primary link target)
     uint8_t admin_level;
     uint8_t place_type_override = 0;  // AdminPlaceType
+    bool place_tag_blocks_wikidata = false; // set when any tag-based override tag is
+                                            // present on the boundary (even if the
+                                            // value doesn't map to a settlement — e.g.
+                                            // place=state); mirrors Nominatim's
+                                            // find_linked_place early-return behaviour
     std::string name;
     std::string country_code;
     bool is_postal;
