@@ -55,6 +55,144 @@ static AdminPlaceType classify_place_override(const char* linked_place, const ch
     return AdminPlaceType::NONE;
 }
 
+// --- TIGER address data loading ---
+
+static void load_tiger_data(ParsedData& data, const std::string& path) {
+    std::cerr << "Loading TIGER address data from " << path << "..." << std::endl;
+
+    // Collect all CSV files
+    std::vector<std::string> csv_files;
+    if (path.find(".tar.gz") != std::string::npos || path.find(".tgz") != std::string::npos) {
+        // Extract tar.gz to a temp directory
+        std::string tmpdir = "/tmp/tiger-extract-" + std::to_string(getpid());
+        std::string cmd = "mkdir -p " + tmpdir + " && tar xzf " + path + " -C " + tmpdir;
+        system(cmd.c_str());
+        DIR* dir = opendir(tmpdir.c_str());
+        if (dir) {
+            struct dirent* ent;
+            while ((ent = readdir(dir)) != nullptr) {
+                std::string fname = ent->d_name;
+                if (fname.size() > 4 && fname.substr(fname.size()-4) == ".csv") {
+                    csv_files.push_back(tmpdir + "/" + fname);
+                }
+            }
+            closedir(dir);
+        }
+    } else {
+        // Directory of CSVs
+        DIR* dir = opendir(path.c_str());
+        if (dir) {
+            struct dirent* ent;
+            while ((ent = readdir(dir)) != nullptr) {
+                std::string fname = ent->d_name;
+                if (fname.size() > 4 && fname.substr(fname.size()-4) == ".csv") {
+                    csv_files.push_back(path + "/" + fname);
+                }
+            }
+            closedir(dir);
+        }
+    }
+
+    std::sort(csv_files.begin(), csv_files.end());
+    std::cerr << "  Found " << csv_files.size() << " TIGER CSV files" << std::endl;
+
+    uint64_t total_rows = 0;
+    uint64_t loaded_rows = 0;
+
+    for (const auto& csv_file : csv_files) {
+        std::ifstream f(csv_file);
+        if (!f) continue;
+
+        std::string header_line;
+        std::getline(f, header_line); // skip header
+
+        std::string line;
+        while (std::getline(f, line)) {
+            total_rows++;
+
+            // Parse semicolon-delimited: from;to;interpolation;street;city;state;postcode;geometry
+            std::vector<std::string> fields;
+            size_t pos = 0;
+            while (pos < line.size()) {
+                size_t next = line.find(';', pos);
+                if (next == std::string::npos) next = line.size();
+                fields.push_back(line.substr(pos, next - pos));
+                pos = next + 1;
+            }
+
+            if (fields.size() < 8) continue;
+
+            int from_num = std::atoi(fields[0].c_str());
+            int to_num = std::atoi(fields[1].c_str());
+            const std::string& interp_type = fields[2];
+            const std::string& street = fields[3];
+            // fields[4] = city, fields[5] = state, fields[6] = postcode
+            const std::string& geometry = fields[7];
+
+            if (from_num <= 0 || to_num <= 0 || street.empty()) continue;
+            if (geometry.find("LINESTRING") == std::string::npos) continue;
+
+            // Parse WKT LINESTRING(lng lat, lng lat, ...)
+            // Note: WKT uses lng lat order — we swap to our lat/lng convention
+            size_t paren_start = geometry.find('(');
+            size_t paren_end = geometry.rfind(')');
+            if (paren_start == std::string::npos || paren_end == std::string::npos) continue;
+
+            std::string coords_str = geometry.substr(paren_start + 1, paren_end - paren_start - 1);
+            std::vector<NodeCoord> nodes;
+
+            size_t cpos = 0;
+            while (cpos < coords_str.size()) {
+                // Skip whitespace and commas
+                while (cpos < coords_str.size() && (coords_str[cpos] == ' ' || coords_str[cpos] == ','))
+                    cpos++;
+                if (cpos >= coords_str.size()) break;
+
+                char* end;
+                double lng = std::strtod(coords_str.c_str() + cpos, &end);
+                cpos = end - coords_str.c_str();
+                while (cpos < coords_str.size() && coords_str[cpos] == ' ') cpos++;
+                double lat = std::strtod(coords_str.c_str() + cpos, &end);
+                cpos = end - coords_str.c_str();
+
+                if (lat != 0 || lng != 0) {
+                    nodes.push_back({static_cast<float>(lat), static_cast<float>(lng)});
+                }
+            }
+
+            if (nodes.size() < 2 || nodes.size() > 255) continue;
+
+            // Create InterpWay
+            uint32_t node_offset = static_cast<uint32_t>(data.interp_nodes.size());
+            for (const auto& n : nodes) data.interp_nodes.push_back(n);
+
+            uint8_t itype = 0; // all
+            if (interp_type == "even") itype = 1;
+            else if (interp_type == "odd") itype = 2;
+
+            InterpWay iw{};
+            iw.node_offset = node_offset;
+            iw.node_count = static_cast<uint8_t>(nodes.size());
+            iw.street_id = data.string_pool.intern(street);
+            iw.start_number = static_cast<uint32_t>(std::min(from_num, to_num));
+            iw.end_number = static_cast<uint32_t>(std::max(from_num, to_num));
+            iw.interpolation = itype;
+
+            // Defer S2 computation
+            uint32_t interp_id = static_cast<uint32_t>(data.interp_ways.size());
+            data.interp_ways.push_back(iw);
+            data.deferred_interps.push_back({interp_id, node_offset, iw.node_count});
+
+            loaded_rows++;
+        }
+    }
+
+    std::cerr << "  TIGER: loaded " << loaded_rows << "/" << total_rows << " address ranges from "
+              << csv_files.size() << " files" << std::endl;
+    std::cerr << "  Interp ways now: " << data.interp_ways.size()
+              << " (" << loaded_rows << " from TIGER)" << std::endl;
+}
+
 // --- Main ---
 
 int main(int argc, char* argv[]) {
@@ -78,6 +216,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "  --epsilon-scale F      Multiply all per-level epsilons by F (e.g. 2.0 = 2x coarser)" << std::endl;
         std::cerr << "  --epsilon-levels L2,L3,...,L8  Set epsilon in meters per level (7 values)" << std::endl;
         std::cerr << "  --multi-quality [S,S,...]  Write quality variants at given scales (default: 0,0.2,0.5,1,1.5,2,2.5)" << std::endl;
+        std::cerr << "  --tiger-data <path>          Load TIGER address data (tar.gz or directory of CSVs)" << std::endl;
         std::cerr << "  --wikidata-sitelinks <path>  Load QID→sitelinks binary for POI importance" << std::endl;
         return 1;
     }
@@ -87,6 +226,7 @@ int main(int argc, char* argv[]) {
     std::string save_cache_path;
     std::string load_cache_path;
     std::string wikidata_sitelinks_path;
+    std::string tiger_data_path;
     bool multi_output = false;
     bool generate_continents = false;
     IndexMode mode = IndexMode::Full;
@@ -178,6 +318,8 @@ int main(int argc, char* argv[]) {
             }
         } else if (arg == "--wikidata-sitelinks" && i + 1 < argc) {
             wikidata_sitelinks_path = argv[++i];
+        } else if (arg == "--tiger-data" && i + 1 < argc) {
+            tiger_data_path = argv[++i];
         } else {
             input_files.push_back(arg);
         }
@@ -1742,6 +1884,7 @@ int main(int argc, char* argv[]) {
                                 rec.flags = pr.flags;
                                 data.poi_records.push_back(rec);
                                 poi_elevations.push_back(0); // relations don't have ele
+                                poi_qids.push_back(pr.qid);
                                 total_poi_rings++;
                             }
                             local_results.clear();
@@ -1820,6 +1963,11 @@ int main(int argc, char* argv[]) {
                 }
             }
             std::cerr << "Sorted admin polygons largest-first (" << n << " polygons)." << std::endl;
+        }
+
+        // Load TIGER address data
+        if (!tiger_data_path.empty()) {
+            load_tiger_data(data, tiger_data_path);
         }
 
         // --- Parallel S2 cell computation for ways and interpolation ---
@@ -2527,14 +2675,17 @@ int main(int argc, char* argv[]) {
             std::vector<uint32_t> old_to_new(n);
             for (uint32_t i = 0; i < n; i++) old_to_new[order[i]] = i;
 
-            // Reorder records + vertices + elevations, dedup
+            // Reorder records + vertices + elevations + qids, dedup
             bool have_elevations = (poi_elevations.size() == n);
+            bool have_qids = (poi_qids.size() == n);
             std::vector<PoiRecord> new_pois;
             std::vector<NodeCoord> new_poi_verts;
             std::vector<float> new_poi_elevations;
+            std::vector<uint32_t> new_poi_qids;
             new_pois.reserve(n);
             new_poi_verts.reserve(data.poi_vertices.size());
             if (have_elevations) new_poi_elevations.reserve(n);
+            if (have_qids) new_poi_qids.reserve(n);
             std::vector<uint32_t> dedup_remap(n);
             size_t write_pos = 0;
 
@@ -2566,6 +2717,7 @@ int main(int argc, char* argv[]) {
                     }
                     new_pois.push_back(p);
                     if (have_elevations) new_poi_elevations.push_back(poi_elevations[order[i]]);
+                    if (have_qids) new_poi_qids.push_back(poi_qids[order[i]]);
                     write_pos++;
                 }
             }
@@ -2574,6 +2726,7 @@ int main(int argc, char* argv[]) {
             data.poi_records = std::move(new_pois);
             data.poi_vertices = std::move(new_poi_verts);
             if (have_elevations) poi_elevations = std::move(new_poi_elevations);
+            if (have_qids) poi_qids = std::move(new_poi_qids);
 
             // Remap sorted_poi_cells IDs (preserving INTERIOR_FLAG)
             for (auto& p : data.sorted_poi_cells) {
@@ -2599,9 +2752,24 @@ int main(int argc, char* argv[]) {
                     bool has_wp = (pr.flags & POI_FLAG_WIKIPEDIA) != 0;
                     bool has_wd = (pr.flags & POI_FLAG_WIKIDATA) != 0;
                     double wiki_mult = 1.0;
-                    if (has_wp && has_wd) wiki_mult = 3.0;
-                    else if (has_wp) wiki_mult = 2.5;
-                    else if (has_wd) wiki_mult = 1.5;
+                    if (!sitelinks_data.empty() && i < poi_qids.size() && poi_qids[i] > 0) {
+                        uint16_t sl = lookup_sitelinks(poi_qids[i]);
+                        if (sl > 0) {
+                            // Smooth curve: 1 sitelink=1.2x, 10=1.8x, 50=2.9x, 200=3.6x
+                            wiki_mult = 1.0 + std::log2(1.0 + sl) / 3.0;
+                        } else if (has_wp && has_wd) {
+                            wiki_mult = 3.0;  // fallback to binary flags
+                        } else if (has_wp) {
+                            wiki_mult = 2.5;
+                        } else if (has_wd) {
+                            wiki_mult = 1.5;
+                        }
+                    } else {
+                        // No sitelinks data — use binary flags
+                        if (has_wp && has_wd) wiki_mult = 3.0;
+                        else if (has_wp) wiki_mult = 2.5;
+                        else if (has_wd) wiki_mult = 1.5;
+                    }
 
                     double raw = base * wiki_mult;
 

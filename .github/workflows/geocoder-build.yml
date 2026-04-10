@@ -253,6 +253,25 @@ jobs:
             echo "[wikidata] No sitelinks data available"
           fi
 
+          # Download TIGER data (if available)
+          echo "[tiger] Checking for TIGER address data..."
+          TIGER_LATEST=$(curl -sL "$S3_PUBLIC_URL/geocoder/tiger/latest.json" 2>/dev/null)
+          TIGER_YEAR=$(echo "$TIGER_LATEST" | jq -r '.year // ""' 2>/dev/null)
+          if [ -n "$TIGER_YEAR" ]; then
+            echo "[tiger] Found TIGER $TIGER_YEAR data, downloading..."
+            curl -sL -o "$WORKDIR/tiger-data.tar.gz" \
+              "$S3_PUBLIC_URL/geocoder/tiger/$TIGER_YEAR/tiger-nominatim-preprocessed.csv.tar.gz" || true
+            if [ -f "$WORKDIR/tiger-data.tar.gz" ] && [ "$(stat -c%s "$WORKDIR/tiger-data.tar.gz")" -gt 1000 ]; then
+              echo "[tiger] Downloaded: $(( $(stat -c%s "$WORKDIR/tiger-data.tar.gz") / 1024 / 1024 )) MiB"
+              echo "tiger_data=$WORKDIR/tiger-data.tar.gz" >> "$GITHUB_OUTPUT"
+            else
+              echo "[tiger] Download failed or empty, skipping"
+              rm -f "$WORKDIR/tiger-data.tar.gz"
+            fi
+          else
+            echo "[tiger] No TIGER data available"
+          fi
+
           # Wait for index download
           if [ "$HAS_PREVIOUS" = "true" ]; then
             echo "Waiting for index download..."
@@ -338,6 +357,11 @@ jobs:
           if [ -n "$WIKIDATA_FILE" ] && [ -f "$WIKIDATA_FILE" ]; then
             BUILD_ARGS="$BUILD_ARGS --wikidata-sitelinks $WIKIDATA_FILE"
             echo "Using wikidata sitelinks from ${{ steps.download.outputs.wikidata_date }}"
+          fi
+          TIGER_FILE="${{ steps.download.outputs.tiger_data }}"
+          if [ -n "$TIGER_FILE" ] && [ -f "$TIGER_FILE" ]; then
+            BUILD_ARGS="$BUILD_ARGS --tiger-data $TIGER_FILE"
+            echo "Using TIGER address data"
           fi
 
           echo "Building geocoder index for $TODAY..."
