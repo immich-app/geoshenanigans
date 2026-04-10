@@ -210,17 +210,19 @@ impl AdminLevelConfig {
 
 // AdminPlaceType → output field name.
 // Must stay in sync with builder/src/types.h AdminPlaceType enum.
+// These mirror Nominatim's get_label_tag() fallthrough to
+// extratags['linked_place']: the key in the JSON address dict is the
+// place type verbatim.
 fn place_type_to_field(pt: u8) -> Option<&'static str> {
     match pt {
         1 | 2 | 3 => Some("city"),     // city, town, village
         4 => Some("suburb"),            // suburb/borough
         5 => Some("neighbourhood"),
         6 => Some("city_district"),     // quarter
-        // Higher-level overrides from label-role linking, matching
-        // Nominatim's get_label_tag() fallthrough to extratags['linked_place'].
-        7 | 8 => Some("state"),         // state, province
-        9 => Some("state"),              // region → state (e.g. Greek Attica L5)
-        10 => Some("county"),            // county
+        7 => Some("state"),             // state
+        8 => Some("province"),          // province (distinct from state in Nom output)
+        9 => Some("region"),            // region
+        10 => Some("county"),           // county
         11 => Some("city_district"),    // district
         _ => None,
     }
@@ -729,14 +731,22 @@ impl Index {
             name: &'b str,
             country_code: u16,
         }
-        let mut best_by_field: [Option<FieldCandidate<'_>>; 8] = Default::default();
-        // 0=country, 1=state, 2=county, 3=municipality, 4=city, 5=suburb, 6=city_district, 7=neighbourhood
+        let mut best_by_field: [Option<FieldCandidate<'_>>; 10] = Default::default();
+        // 0=country 1=state 2=province 3=region 4=county 5=municipality
+        // 6=city 7=suburb 8=city_district 9=neighbourhood
 
         let field_index = |field: &str| -> Option<usize> {
             match field {
-                "country" => Some(0), "state" => Some(1), "county" => Some(2),
-                "municipality" => Some(3), "city" => Some(4),
-                "suburb" => Some(5), "city_district" => Some(6), "neighbourhood" => Some(7),
+                "country" => Some(0),
+                "state" => Some(1),
+                "province" => Some(2),
+                "region" => Some(3),
+                "county" => Some(4),
+                "municipality" => Some(5),
+                "city" => Some(6),
+                "suburb" => Some(7),
+                "city_district" => Some(8),
+                "neighbourhood" => Some(9),
                 _ => None,
             }
         };
@@ -791,12 +801,14 @@ impl Index {
             }
         }
         result.state = best_by_field[1].as_ref().map(|c| c.name);
-        result.county = best_by_field[2].as_ref().map(|c| c.name);
-        result.municipality = best_by_field[3].as_ref().map(|c| c.name);
-        result.city = best_by_field[4].as_ref().map(|c| c.name);
-        result.suburb = best_by_field[5].as_ref().map(|c| c.name);
-        result.city_district = best_by_field[6].as_ref().map(|c| c.name);
-        result.neighbourhood = best_by_field[7].as_ref().map(|c| c.name);
+        result.province = best_by_field[2].as_ref().map(|c| c.name);
+        result.region = best_by_field[3].as_ref().map(|c| c.name);
+        result.county = best_by_field[4].as_ref().map(|c| c.name);
+        result.municipality = best_by_field[5].as_ref().map(|c| c.name);
+        result.city = best_by_field[6].as_ref().map(|c| c.name);
+        result.suburb = best_by_field[7].as_ref().map(|c| c.name);
+        result.city_district = best_by_field[8].as_ref().map(|c| c.name);
+        result.neighbourhood = best_by_field[9].as_ref().map(|c| c.name);
 
         // Deduplicate: if a more specific field has the same name as a less
         // specific one, clear the less specific one. This handles the Polish
@@ -1102,6 +1114,8 @@ impl Index {
             village: place.village,
             municipality: admin.municipality,
             state: admin.state,
+            province: admin.province,
+            region: admin.region,
             county: admin.county,
             suburb: admin.suburb.or(place.suburb),
             city_district: admin.city_district,
@@ -1217,6 +1231,8 @@ struct AdminResult<'a> {
     country: Option<&'a str>,
     country_code: Option<[u8; 2]>,
     state: Option<&'a str>,
+    province: Option<&'a str>,
+    region: Option<&'a str>,
     county: Option<&'a str>,
     municipality: Option<&'a str>,
     city: Option<&'a str>,
@@ -1242,6 +1258,10 @@ struct AddressDetails<'a> {
     municipality: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    province: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    region: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     county: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]

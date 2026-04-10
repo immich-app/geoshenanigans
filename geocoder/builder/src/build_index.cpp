@@ -1112,6 +1112,8 @@ int main(int argc, char* argv[]) {
                             else if (std::strcmp(n_place, "neighbourhood") == 0) settlement_pt = PlaceType::NEIGHBOURHOOD;
                             else if (std::strcmp(n_place, "quarter") == 0) settlement_pt = PlaceType::QUARTER;
 
+                            bool is_label_member = wanted_label_nodes.count(id) > 0;
+
                             if (settlement_pt != PlaceType::UNKNOWN) {
                                 PlaceNode pn{};
                                 pn.lat = static_cast<float>(lat);
@@ -1119,8 +1121,14 @@ int main(int argc, char* argv[]) {
                                 pn.place_type = static_cast<uint8_t>(settlement_pt);
                                 tl_node_data->place_nodes.push_back(pn);
                                 tl_node_data->place_names.push_back(best_name);
-                                // Capture wikidata for place→admin linking
-                                if (n_wikidata) {
+                                // Capture wikidata for place→admin linking, but only if
+                                // this node is NOT already a label member of some
+                                // boundary. Nominatim's find_linked_place claims a
+                                // place node via label-role match and then other
+                                // boundaries can't pick the same node via the
+                                // wikidata fallback. Skipping label-member nodes in
+                                // our wikidata map reproduces that.
+                                if (n_wikidata && !is_label_member) {
                                     tl_node_data->place_wikidata.push_back({n_wikidata, static_cast<uint8_t>(settlement_pt)});
                                 }
                             }
@@ -1139,7 +1147,7 @@ int main(int argc, char* argv[]) {
                                 else if (std::strcmp(n_place, "county") == 0) label_pt = PlaceType::COUNTY;
                                 else if (std::strcmp(n_place, "district") == 0) label_pt = PlaceType::DISTRICT;
                             }
-                            if (wanted_label_nodes.count(id)) {
+                            if (is_label_member) {
                                 tl_node_data->label_hits.push_back({id, static_cast<uint8_t>(label_pt)});
                             }
                         }
