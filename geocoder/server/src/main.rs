@@ -260,21 +260,28 @@ fn rank_to_field(rank: u8) -> Option<&'static str> {
 // boundaries sit in the same rank hierarchy as admin_level-based ones.
 // Ranks come from settings/address-levels.json default section.
 fn place_type_to_rank(pt: u8) -> u8 {
+    // Values come from Nominatim's settings/address-levels.json —
+    // specifically the rank_address (second element of [rank_search,
+    // rank_address] pairs). place=state / province / region / country are
+    // explicitly 0 (not in address chain) — applying them as "place area
+    // parents" would otherwise promote valid countries to suburb rank
+    // via the second-check containment loop (see "Mashriq" place=region
+    // multipolygon covering Egypt in our test data).
     match pt {
-        1 => 16,  // city  [rank 16]
+        1 => 16,  // city  [16]
         2 => 16,  // town  [18, 16]
         3 => 16,  // village [19, 16]
         4 => 20,  // suburb [19, 20]
         5 => 24,  // neighbourhood [24]
         6 => 22,  // quarter [20, 22]
-        7 => 8,   // state  [8, 0] → keep 8 for hierarchy ordering
-        8 => 8,   // province [8, 0]
-        9 => 18,  // region [18]
+        7 => 0,   // state  [8, 0] → not in address chain
+        8 => 0,   // province [8, 0]
+        9 => 0,   // region [18, 0]
         10 => 12, // county
-        11 => 12, // district [12]
-        12 => 18, // borough [18]
-        13 => 20, // hamlet  [20]
-        14 => 14, // municipality [14]
+        11 => 12, // district
+        12 => 18, // borough
+        13 => 20, // hamlet
+        14 => 14, // municipality
         _ => 0,
     }
 }
@@ -663,6 +670,85 @@ impl Index {
 
     // --- Admin boundary lookup (point-in-polygon) ---
 
+    fn debug_admin(&self, lat: f64, lng: f64) -> serde_json::Value {
+        let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
+        let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
+
+        let all_polygons: &[AdminPolygon] = unsafe {
+            std::slice::from_raw_parts(
+                self.admin_polygons.as_ptr() as *const AdminPolygon,
+                self.admin_polygons.len() / std::mem::size_of::<AdminPolygon>(),
+            )
+        };
+        let all_vertices: &[NodeCoord] = unsafe {
+            std::slice::from_raw_parts(
+                self.admin_vertices.as_ptr() as *const NodeCoord,
+                self.admin_vertices.len() / std::mem::size_of::<NodeCoord>(),
+            )
+        };
+
+        const INTERIOR_FLAG: u32 = 0x80000000;
+        const ID_MASK: u32 = 0x7FFFFFFF;
+
+        // Mirror find_admin's best_by_level logic with full logging.
+        let mut best_by_level: [Option<(f32, &AdminPolygon, bool)>; 12] = [None; 12];
+        let mut seen_in_level: [Vec<serde_json::Value>; 12] = Default::default();
+
+        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+            Self::for_each_entry(&self.admin_entries, Self::lookup_admin_cell(&self.admin_cells, c), |id| {
+                let is_interior = (id & INTERIOR_FLAG) != 0;
+                let poly_id = (id & ID_MASK) as usize;
+                if poly_id >= all_polygons.len() { return; }
+                let poly = &all_polygons[poly_id];
+                let level = poly.admin_level as usize;
+                if level >= 12 { return; }
+                if poly.area <= 0.0 { return; }
+
+                let offset = poly.vertex_offset as usize;
+                let count = poly.vertex_count as usize;
+                if offset + count > all_vertices.len() { return; }
+                let verts = &all_vertices[offset..offset + count];
+                let pip = point_in_polygon(lat as f32, lng as f32, verts);
+
+                seen_in_level[level].push(serde_json::json!({
+                    "name": self.get_string(poly.name_id),
+                    "area": poly.area,
+                    "pip": pip,
+                    "is_interior": is_interior,
+                    "override": poly.place_type_override,
+                    "poly_id": poly_id,
+                }));
+
+                if pip {
+                    if let Some((best_area, _, _)) = best_by_level[level] {
+                        if poly.area < best_area {
+                            best_by_level[level] = Some((poly.area, poly, true));
+                        }
+                    } else {
+                        best_by_level[level] = Some((poly.area, poly, true));
+                    }
+                }
+            });
+        }
+
+        let mut picked: Vec<serde_json::Value> = Vec::new();
+        for level in 0..12 {
+            if let Some((_, poly, _)) = best_by_level[level] {
+                picked.push(serde_json::json!({
+                    "admin_level": level,
+                    "name": self.get_string(poly.name_id),
+                    "area": poly.area,
+                    "override": poly.place_type_override,
+                }));
+            }
+        }
+
+        serde_json::json!({
+            "picked_per_level": picked,
+            "seen_per_level": seen_in_level,
+        })
+    }
+
     fn find_admin(&self, lat: f64, lng: f64) -> AdminResult<'_> {
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
@@ -688,6 +774,15 @@ impl Index {
         const ID_MASK: u32 = 0x7FFFFFFF;
 
         let mut best_by_level: [Option<(f32, &AdminPolygon, bool)>; 12] = [None; 12]; // (area, poly, pip_verified)
+        // Class='place' polygons (stored by our builder at admin_level=15 as a
+        // marker). These are boundary=place / multipolygon+place=* entries —
+        // Nominatim's second-check nested adjustment (placex_triggers.sql
+        // lines 944-963) uses only these, NOT admin boundaries with
+        // linked_place tags. Tracked separately so we can apply rule #3
+        // only for genuine class='place' polygons — see Buenos Aires
+        // Comuna 1 where L8 Buenos Aires (boundary + linked_place=city)
+        // would otherwise incorrectly promote L5 Comuna 1 to rank 18.
+        let mut place_area_polygons: Vec<&AdminPolygon> = Vec::new();
 
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
             Self::for_each_entry(&self.admin_entries, Self::lookup_admin_cell(&self.admin_cells, c), |id| {
@@ -755,6 +850,30 @@ impl Index {
                     best_by_level[level] = None;
                 }
             }
+        }
+
+        // Second pass: collect class='place' polygons (admin_level=15 in our
+        // builder's schema) that cover the query point. These drive the
+        // second-nested-check rule (placex_triggers.sql lines 944-963) —
+        // Nominatim uses only these, not admin boundaries with linked_place
+        // tags. Kept in a separate vec so we don't disturb best_by_level[].
+        let neighbors2 = cell_neighbors_at_level(cell, self.admin_cell_level);
+        for c in std::iter::once(cell).chain(neighbors2.into_iter()) {
+            Self::for_each_entry(&self.admin_entries, Self::lookup_admin_cell(&self.admin_cells, c), |id| {
+                let poly_id = (id & ID_MASK) as usize;
+                if poly_id >= all_polygons.len() { return; }
+                let poly = &all_polygons[poly_id];
+                if poly.admin_level != 15 { return; }
+                if poly.area <= 0.0 { return; }
+                let offset = poly.vertex_offset as usize;
+                let count = poly.vertex_count as usize;
+                if offset + count > all_vertices.len() { return; }
+                let verts = &all_vertices[offset..offset + count];
+                if !point_in_polygon(lat as f32, lng as f32, verts) { return; }
+                if !place_area_polygons.iter().any(|p| std::ptr::eq(*p, poly)) {
+                    place_area_polygons.push(poly);
+                }
+            });
         }
 
         let mut result = AdminResult::default();
@@ -918,34 +1037,21 @@ impl Index {
                     }
                 }
 
-                // Step 3: place area containment, only for polygons
-                // without their own place_type_override. We only consider
-                // polygons that override to settlement-level ranks (city /
-                // town / village / suburb / hamlet / neighbourhood /
-                // quarter / borough) as "place areas" — state / province /
-                // region overrides describe the same geographic hierarchy
-                // as admin boundaries and shouldn't push inner admin
-                // polygons to higher ranks.
+                // Step 3: place area containment — only for polygons
+                // without their own place_type_override. Uses the genuine
+                // class='place' polygons collected above. Admin boundaries
+                // with linked_place tags (Nairobi L3, BA L8, Paris L6)
+                // are NOT used here — Nominatim's SQL explicitly
+                // restricts this loop to class='place'.
                 if self_override == 0 {
                     let mut place_parent_rank: u8 = 0;
-                    for j in 0..ranked.len() {
-                        if j == i { continue; }
-                        let jo = ranked[j].place_type_override;
-                        if jo == 0 { continue; }
-                        // Only settlement-level place types count as
-                        // "place area" promoters (city/town/village/
-                        // suburb/neighbourhood/quarter/hamlet/borough/
-                        // municipality). State / province / region / county
-                        // / district overrides represent higher-level
-                        // administrative hierarchy, not the rank-16+
-                        // place-containment rule.
-                        if !matches!(jo, 1 | 2 | 3 | 4 | 5 | 6 | 12 | 13 | 14) {
-                            continue;
-                        }
-                        if ranked[j].area <= self_area { continue; }
-                        if ranked[j].rank_address < ranked[i].rank_address { continue; }
-                        if ranked[j].rank_address > place_parent_rank {
-                            place_parent_rank = ranked[j].rank_address;
+                    for pa in &place_area_polygons {
+                        if pa.place_type_override == 0 { continue; }
+                        if pa.area <= self_area { continue; }
+                        let pa_rank = place_type_to_rank(pa.place_type_override);
+                        if pa_rank < ranked[i].rank_address { continue; }
+                        if pa_rank > place_parent_rank {
+                            place_parent_rank = pa_rank;
                         }
                     }
                     if place_parent_rank > 0 && place_parent_rank >= ranked[i].rank_address {
@@ -1609,6 +1715,7 @@ struct QueryParams {
     lat: f64,
     lon: f64,
     key: Option<String>,
+    debug: Option<String>,
 }
 
 async fn reverse_geocode(
@@ -1636,6 +1743,12 @@ async fn reverse_geocode(
 
     if let Err(msg) = auth::check_rate(&limiter, &rate_key, rps, rpd) {
         return (StatusCode::TOO_MANY_REQUESTS, msg).into_response();
+    }
+
+    if params.debug.is_some() {
+        let debug = index.debug_admin(params.lat, params.lon);
+        let json = serde_json::to_string_pretty(&debug).unwrap_or_default();
+        return ([(axum::http::header::CONTENT_TYPE, "application/json")], json).into_response();
     }
 
     let address = index.query(params.lat, params.lon);
