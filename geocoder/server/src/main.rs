@@ -783,6 +783,18 @@ impl Index {
         result.suburb = best_by_field[5].as_ref().map(|c| c.name);
         result.neighbourhood = best_by_field[6].as_ref().map(|c| c.name);
 
+        // Deduplicate: if a more specific field has the same name as a less
+        // specific one, clear the less specific one. This handles the Polish
+        // case where the same boundary appears at multiple admin levels
+        // (e.g., Warszawa as city, municipality, and county).
+        if let Some(city) = result.city {
+            if result.municipality == Some(city) { result.municipality = None; }
+            if result.county == Some(city) { result.county = None; }
+        }
+        if let Some(municipality) = result.municipality {
+            if result.county == Some(municipality) { result.county = None; }
+        }
+
         result
     }
 
