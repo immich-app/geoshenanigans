@@ -211,19 +211,23 @@ impl AdminLevelConfig {
 // AdminPlaceType → output field name.
 // Must stay in sync with builder/src/types.h AdminPlaceType enum.
 // These mirror Nominatim's get_label_tag() fallthrough to
-// extratags['linked_place']: the key in the JSON address dict is the
-// place type verbatim.
+// extratags['place'] / extratags['linked_place']: the key in the JSON
+// address dict is the place type verbatim.
 fn place_type_to_field(pt: u8) -> Option<&'static str> {
     match pt {
-        1 | 2 | 3 => Some("city"),     // city, town, village
-        4 => Some("suburb"),            // suburb/borough
+        1 => Some("city"),
+        2 => Some("town"),
+        3 => Some("village"),
+        4 => Some("suburb"),
         5 => Some("neighbourhood"),
-        6 => Some("city_district"),     // quarter
-        7 => Some("state"),             // state
-        8 => Some("province"),          // province (distinct from state in Nom output)
-        9 => Some("region"),            // region
-        10 => Some("county"),           // county
-        11 => Some("city_district"),    // district
+        6 => Some("quarter"),
+        7 => Some("state"),
+        8 => Some("province"),
+        9 => Some("region"),
+        10 => Some("county"),
+        11 => Some("district"),
+        12 => Some("borough"),
+        13 => Some("hamlet"),
         _ => None,
     }
 }
@@ -251,20 +255,24 @@ fn rank_to_field(rank: u8) -> Option<&'static str> {
 }
 
 // Map an AdminPlaceType override to its Nominatim rank_address equivalent.
-// Used for the nested-boundary rank adjustment so e.g. Manhattan (border_type=
-// borough → SUBURB → rank 20) properly sits in the same rank hierarchy as
-// admin_level-based polygons.
+// Drives the nested-boundary rank adjustment so linked / place=tagged
+// boundaries sit in the same rank hierarchy as admin_level-based ones.
+// Ranks come from settings/address-levels.json default section.
 fn place_type_to_rank(pt: u8) -> u8 {
     match pt {
-        1 | 2 | 3 => 16, // city/town/village
-        4 => 20,          // suburb/borough
-        5 => 22,          // neighbourhood
-        6 => 22,          // quarter (address-levels.json: [20, 22] → rank_address 22)
-        7 => 8,           // state
-        8 => 8,           // province
-        9 => 10,          // region — rank_address 10 from default mapping
-        10 => 12,         // county
-        11 => 18,         // district → city_district rank
+        1 => 16,  // city  [rank 16]
+        2 => 16,  // town  [18, 16]
+        3 => 16,  // village [19, 16]
+        4 => 20,  // suburb [19, 20]
+        5 => 24,  // neighbourhood [24]
+        6 => 22,  // quarter [20, 22]
+        7 => 8,   // state  [8, 0] → keep 8 for hierarchy ordering
+        8 => 8,   // province [8, 0]
+        9 => 18,  // region [18]
+        10 => 12, // county
+        11 => 12, // district [12]
+        12 => 18, // borough [18]
+        13 => 20, // hamlet  [20]
         _ => 0,
     }
 }
@@ -756,9 +764,11 @@ impl Index {
             name: &'b str,
             country_code: u16,
         }
-        let mut best_by_field: [Option<FieldCandidate<'_>>; 10] = Default::default();
-        // 0=country 1=state 2=province 3=region 4=county 5=municipality
-        // 6=city 7=suburb 8=city_district 9=neighbourhood
+        let mut best_by_field: [Option<FieldCandidate<'_>>; 19] = Default::default();
+        // 0 country 1 state 2 province 3 region 4 state_district
+        // 5 county 6 district 7 municipality
+        // 8 city 9 town 10 village 11 hamlet
+        // 12 city_district 13 borough 14 suburb 15 quarter 16 neighbourhood
 
         let field_index = |field: &str| -> Option<usize> {
             match field {
@@ -766,12 +776,19 @@ impl Index {
                 "state" => Some(1),
                 "province" => Some(2),
                 "region" => Some(3),
-                "county" => Some(4),
-                "municipality" => Some(5),
-                "city" => Some(6),
-                "suburb" => Some(7),
-                "city_district" => Some(8),
-                "neighbourhood" => Some(9),
+                "state_district" => Some(4),
+                "county" => Some(5),
+                "district" => Some(6),
+                "municipality" => Some(7),
+                "city" => Some(8),
+                "town" => Some(9),
+                "village" => Some(10),
+                "hamlet" => Some(11),
+                "city_district" => Some(12),
+                "borough" => Some(13),
+                "suburb" => Some(14),
+                "quarter" => Some(15),
+                "neighbourhood" => Some(16),
                 _ => None,
             }
         };
@@ -871,15 +888,22 @@ impl Index {
                 ]);
             }
         }
-        result.state = best_by_field[1].as_ref().map(|c| c.name);
-        result.province = best_by_field[2].as_ref().map(|c| c.name);
-        result.region = best_by_field[3].as_ref().map(|c| c.name);
-        result.county = best_by_field[4].as_ref().map(|c| c.name);
-        result.municipality = best_by_field[5].as_ref().map(|c| c.name);
-        result.city = best_by_field[6].as_ref().map(|c| c.name);
-        result.suburb = best_by_field[7].as_ref().map(|c| c.name);
-        result.city_district = best_by_field[8].as_ref().map(|c| c.name);
-        result.neighbourhood = best_by_field[9].as_ref().map(|c| c.name);
+        result.state          = best_by_field[1].as_ref().map(|c| c.name);
+        result.province       = best_by_field[2].as_ref().map(|c| c.name);
+        result.region         = best_by_field[3].as_ref().map(|c| c.name);
+        result.state_district = best_by_field[4].as_ref().map(|c| c.name);
+        result.county         = best_by_field[5].as_ref().map(|c| c.name);
+        result.district       = best_by_field[6].as_ref().map(|c| c.name);
+        result.municipality   = best_by_field[7].as_ref().map(|c| c.name);
+        result.city           = best_by_field[8].as_ref().map(|c| c.name);
+        result.town           = best_by_field[9].as_ref().map(|c| c.name);
+        result.village        = best_by_field[10].as_ref().map(|c| c.name);
+        result.hamlet         = best_by_field[11].as_ref().map(|c| c.name);
+        result.city_district  = best_by_field[12].as_ref().map(|c| c.name);
+        result.borough        = best_by_field[13].as_ref().map(|c| c.name);
+        result.suburb         = best_by_field[14].as_ref().map(|c| c.name);
+        result.quarter        = best_by_field[15].as_ref().map(|c| c.name);
+        result.neighbourhood  = best_by_field[16].as_ref().map(|c| c.name);
 
         // Deduplicate: if a more specific field has the same name as a less
         // specific one, clear the less specific one. This handles the Polish
@@ -1181,14 +1205,19 @@ impl Index {
             house_number,
             road,
             city: admin.city.or(place.city),
-            town: place.town,
-            village: place.village,
+            town: admin.town.or(place.town),
+            village: admin.village.or(place.village),
+            hamlet: admin.hamlet,
             municipality: admin.municipality,
             state: admin.state,
             province: admin.province,
             region: admin.region,
+            state_district: admin.state_district,
             county: admin.county,
+            district: admin.district,
+            borough: admin.borough,
             suburb: admin.suburb.or(place.suburb),
+            quarter: admin.quarter,
             city_district: admin.city_district,
             neighbourhood: admin.neighbourhood.or(place.neighbourhood),
             postcode: admin.postcode.or(addr_postcode),
@@ -1304,11 +1333,18 @@ struct AdminResult<'a> {
     state: Option<&'a str>,
     province: Option<&'a str>,
     region: Option<&'a str>,
+    state_district: Option<&'a str>,
     county: Option<&'a str>,
+    district: Option<&'a str>,
     municipality: Option<&'a str>,
     city: Option<&'a str>,
-    suburb: Option<&'a str>,
+    town: Option<&'a str>,
+    village: Option<&'a str>,
+    hamlet: Option<&'a str>,
     city_district: Option<&'a str>,
+    borough: Option<&'a str>,
+    suburb: Option<&'a str>,
+    quarter: Option<&'a str>,
     neighbourhood: Option<&'a str>,
     postcode: Option<&'a str>,
 }
@@ -1326,6 +1362,8 @@ struct AddressDetails<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     village: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    hamlet: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     municipality: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<&'a str>,
@@ -1334,9 +1372,17 @@ struct AddressDetails<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     region: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    state_district: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     county: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    district: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    borough: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     suburb: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quarter: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     city_district: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]

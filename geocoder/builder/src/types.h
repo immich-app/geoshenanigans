@@ -30,27 +30,28 @@ struct InterpWay {
     uint8_t _pad4 = 0, _pad5 = 0, _pad6 = 0; // explicit padding
 };
 
-// Place type override for admin polygons (from linked_place/border_type/place tags
-// or a label-role member place node). Must stay in sync with
-// geocoder/server/src/main.rs place_type_to_field.
+// Place type override for admin polygons, derived from either a place/
+// linked_place tag on the boundary itself, or the place type of a
+// label-role member node (Nominatim's find_linked_place flow).
+// Must stay in sync with geocoder/server/src/main.rs place_type_to_field.
+// Nominatim's get_label_tag (classtypes.py) returns extratags['place']
+// or extratags['linked_place'] verbatim as the JSON field key, so each
+// value here maps 1:1 to a distinct Nominatim field name.
 enum class AdminPlaceType : uint8_t {
     NONE = 0,       // use admin_level mapping
     CITY = 1,
     TOWN = 2,
     VILLAGE = 3,
-    SUBURB = 4,     // includes borough
+    SUBURB = 4,     // place=suburb
     NEIGHBOURHOOD = 5,
     QUARTER = 6,
-    // Higher-level overrides used for relations that link to a non-settlement
-    // place node. Nominatim's get_label_tag() returns extratags['linked_place']
-    // directly as the label, so place=state should produce "state" even when
-    // the admin_level default rank would map to something else (e.g. Greek
-    // Region at L5 default to state_district → lifted to state).
     STATE = 7,
-    PROVINCE = 8,   // place=province (rendered as 'state' in ADMIN_LABELS fallback)
-    REGION = 9,     // place=region
-    COUNTY = 10,    // place=county
-    DISTRICT = 11,  // place=district → city_district
+    PROVINCE = 8,
+    REGION = 9,
+    COUNTY = 10,
+    DISTRICT = 11,
+    BOROUGH = 12,   // place=borough (distinct field from suburb in Nominatim)
+    HAMLET = 13,
 };
 
 struct AdminPolygon {
@@ -141,6 +142,7 @@ enum class PlaceType : uint8_t {
     // place=state/province/region/etc. lets us honour Nominatim's
     // get_label_tag() fallthrough to extratags['linked_place'].
     STATE = 7, PROVINCE = 8, REGION = 9, COUNTY = 10, DISTRICT = 11,
+    BOROUGH = 12,
     UNKNOWN = 255
 };
 

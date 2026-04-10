@@ -62,8 +62,8 @@ static PlaceOverride classify_place_override(const char* linked_place, const cha
     if (std::strcmp(val, "city") == 0) t = AdminPlaceType::CITY;
     else if (std::strcmp(val, "town") == 0) t = AdminPlaceType::TOWN;
     else if (std::strcmp(val, "village") == 0) t = AdminPlaceType::VILLAGE;
-    else if (std::strcmp(val, "hamlet") == 0) t = AdminPlaceType::VILLAGE; // Nominatim: hamlet rank-wise close to village
-    else if (std::strcmp(val, "borough") == 0) t = AdminPlaceType::SUBURB;
+    else if (std::strcmp(val, "hamlet") == 0) t = AdminPlaceType::HAMLET;
+    else if (std::strcmp(val, "borough") == 0) t = AdminPlaceType::BOROUGH;
     else if (std::strcmp(val, "suburb") == 0) t = AdminPlaceType::SUBURB;
     else if (std::strcmp(val, "neighbourhood") == 0) t = AdminPlaceType::NEIGHBOURHOOD;
     else if (std::strcmp(val, "quarter") == 0) t = AdminPlaceType::QUARTER;
@@ -85,9 +85,10 @@ static uint8_t place_type_to_admin_override(uint8_t pt) {
         case PlaceType::TOWN:          return static_cast<uint8_t>(AdminPlaceType::TOWN);
         case PlaceType::VILLAGE:       return static_cast<uint8_t>(AdminPlaceType::VILLAGE);
         case PlaceType::SUBURB:        return static_cast<uint8_t>(AdminPlaceType::SUBURB);
-        case PlaceType::HAMLET:        return static_cast<uint8_t>(AdminPlaceType::VILLAGE); // Nominatim: hamlet → village rank
+        case PlaceType::HAMLET:        return static_cast<uint8_t>(AdminPlaceType::HAMLET);
         case PlaceType::NEIGHBOURHOOD: return static_cast<uint8_t>(AdminPlaceType::NEIGHBOURHOOD);
         case PlaceType::QUARTER:       return static_cast<uint8_t>(AdminPlaceType::QUARTER);
+        case PlaceType::BOROUGH:       return static_cast<uint8_t>(AdminPlaceType::BOROUGH);
         // Non-settlement label-role targets. These match Nominatim's
         // get_label_tag() which returns extratags['linked_place'] directly.
         case PlaceType::STATE:         return static_cast<uint8_t>(AdminPlaceType::STATE);
@@ -1150,6 +1151,7 @@ int main(int argc, char* argv[]) {
                                 else if (std::strcmp(n_place, "region") == 0) label_pt = PlaceType::REGION;
                                 else if (std::strcmp(n_place, "county") == 0) label_pt = PlaceType::COUNTY;
                                 else if (std::strcmp(n_place, "district") == 0) label_pt = PlaceType::DISTRICT;
+                                else if (std::strcmp(n_place, "borough") == 0) label_pt = PlaceType::BOROUGH;
                             }
                             if (is_label_member) {
                                 tl_node_data->label_hits.push_back({id, static_cast<uint8_t>(label_pt)});
