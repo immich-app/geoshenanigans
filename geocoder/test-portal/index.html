@@ -314,8 +314,9 @@
     </section>
 
     <div class="results-section">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
-        <h3>Results <span id="resultCount"></span></h3>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;gap:6px;">
+        <h3 style="margin:0;flex:1">Results <span id="resultCount"></span></h3>
+        <button id="retestBtn" onclick="retestAllResults()" style="padding:4px 12px;font-size:12px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer;">Re-test</button>
         <button onclick="clearResults()" style="padding:4px 12px;font-size:12px;background:var(--red);color:#fff;border:none;border-radius:4px;cursor:pointer;">Clear</button>
       </div>
       <div class="results-list" id="resultsList"></div>
@@ -386,6 +387,116 @@ function clearResults() {
   localStorage.removeItem(STORAGE_KEY);
   renderResults();
   document.getElementById('detailPanel').classList.remove('visible');
+}
+
+// Re-run every stored result against OUR reverse geocoder (Nominatim's
+// results won't have changed between server rebuilds, so we keep the
+// cached Nominatim comparison in place and only refresh our own data).
+// Useful after rebuilding the server to re-check saved test cases.
+function retestAllResults() {
+  if (results.length === 0) return;
+  const btn = document.getElementById('retestBtn');
+  const originalLabel = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = `Re-testing… 0/${results.length}`;
+
+  // Take a snapshot before iterating: reverseGeocode() adds new entries
+  // to the front, which would clobber the counter and re-test order.
+  const toRetest = results.slice();
+  let completed = 0;
+
+  // Reset existing markers to loading state. Preserve the cached
+  // Nominatim response so we can still render the diff after re-test.
+  for (const r of toRetest) {
+    r.loading = true;
+    r.data = null;
+    r.error = null;
+    const m = markers.get(r.id);
+    if (m) {
+      m.marker.remove();
+      const newMarker = new maplibregl.Marker({ color: MARKER_COLORS.gray })
+        .setLngLat([r.lng, r.lat])
+        .addTo(map);
+      newMarker.getElement().addEventListener('click', (e) => {
+        e.stopPropagation();
+        selectResult(r.id);
+      });
+      m.marker = newMarker;
+      m.popup = null;
+    }
+  }
+  renderResults();
+
+  const runOne = (entry) => new Promise((resolve) => {
+    fetch(`/reverse?lat=${entry.lat}&lon=${entry.lng}&key=test`)
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+      .then(data => {
+        entry.data = data;
+        // Keep entry.nominatim from the original fetch — Nominatim's
+        // answer doesn't change between our server rebuilds and
+        // re-querying it would just waste requests against the public
+        // instance.
+        entry.loading = false;
+        const hasPlaces = data.places && data.places.length > 0;
+        const m = markers.get(entry.id);
+        if (m) {
+          m.marker.remove();
+          const newMarker = new maplibregl.Marker({ color: hasPlaces ? MARKER_COLORS.green : MARKER_COLORS.blue })
+            .setLngLat([entry.lng, entry.lat])
+            .addTo(map);
+          const label = data.display_name || `${entry.lat.toFixed(4)}, ${entry.lng.toFixed(4)}`;
+          const popup = new maplibregl.Popup({ offset: 25 })
+            .setHTML(`<b>${label}</b>${hasPlaces ? '<br>' + data.places.length + ' place(s)' : ''}`);
+          newMarker.setPopup(popup);
+          newMarker.getElement().addEventListener('click', (e) => {
+            e.stopPropagation();
+            selectResult(entry.id);
+          });
+          m.marker = newMarker;
+          m.popup = popup;
+        }
+      })
+      .catch(err => {
+        entry.error = err.message;
+        entry.loading = false;
+        const m = markers.get(entry.id);
+        if (m) {
+          m.marker.remove();
+          const newMarker = new maplibregl.Marker({ color: MARKER_COLORS.red })
+            .setLngLat([entry.lng, entry.lat])
+            .addTo(map);
+          newMarker.getElement().addEventListener('click', (e) => {
+            e.stopPropagation();
+            selectResult(entry.id);
+          });
+          m.marker = newMarker;
+        }
+      })
+      .finally(() => {
+        completed++;
+        btn.textContent = `Re-testing… ${completed}/${toRetest.length}`;
+        renderResults();
+        saveResults();
+        if (selectedId === entry.id) showDetail(entry.id);
+        resolve();
+      });
+  });
+
+  // Run up to 5 in flight at once, matching reverseGeocode()'s rate limit.
+  const CONCURRENCY = 5;
+  let idx = 0;
+  const workers = Array.from({length: Math.min(CONCURRENCY, toRetest.length)}, () => {
+    return (async function loop() {
+      while (idx < toRetest.length) {
+        const my = idx++;
+        await runOne(toRetest[my]);
+      }
+    })();
+  });
+  Promise.all(workers).then(() => {
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+  });
 }
 
 // Marker color map
