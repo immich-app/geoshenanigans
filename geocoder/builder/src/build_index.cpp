@@ -595,7 +595,7 @@ int main(int argc, char* argv[]) {
                                         cr.admin_level = 15;  // special marker for boundary=place / place multipolygon
                                         cr.name = name;
                                         cr.is_postal = false;
-                                        cr.place_type_override = static_cast<uint8_t>(pt);
+                                        cr.fallback_place_type = static_cast<uint8_t>(pt);
                                         for (size_t mi = 0; mi < rel.members.size(); mi++) {
                                             if (rel.members[mi].type == 'w') {
                                                 cr.members.emplace_back(rel.members[mi].ref, rel.member_role(mi));
@@ -662,7 +662,7 @@ int main(int argc, char* argv[]) {
                         cr.name = std::move(name_str);
                         cr.country_code = std::move(country_code);
                         cr.is_postal = is_postal;
-                        cr.place_type_override = static_cast<uint8_t>(po.type);
+                        cr.fallback_place_type = static_cast<uint8_t>(po.type);
 
                         for (size_t mi = 0; mi < rel.members.size(); mi++) {
                             if (rel.members[mi].type == 'w') {
@@ -671,17 +671,15 @@ int main(int argc, char* argv[]) {
                         }
 
                         if (!cr.members.empty()) {
-                            // Always store wikidata for relations without a
-                            // tag-based override. Nominatim's find_linked_place
-                            // (placex_triggers.sql) goes: label role → wikidata →
-                            // place type match → name match. A place=* tag on the
-                            // boundary does NOT short-circuit the wikidata step —
-                            // it's used as the 3rd fallback for type matching,
-                            // not as a blocker.
-                            std::string wd_str;
-                            if (wikidata_tag && cr.place_type_override == 0) {
-                                wd_str = wikidata_tag;
-                            }
+                            // Always store wikidata for relations. Nominatim's
+                            // find_linked_place (placex_triggers.sql) goes:
+                            // label role → wikidata → place type match → name
+                            // match. The wikidata step runs regardless of the
+                            // place=* tag on the boundary, and this is what
+                            // lets Tokyo (place=province + wikidata=Q1490) link
+                            // to its place=city admin_centre node and drop out
+                            // of the address hierarchy after Suginami wins.
+                            std::string wd_str = wikidata_tag ? wikidata_tag : "";
                             std::lock_guard<std::mutex> lock(rel_mutex);
                             data.collected_relations.push_back(std::move(cr));
                             rel_wikidata.push_back(std::move(wd_str));
@@ -1264,7 +1262,7 @@ int main(int argc, char* argv[]) {
                         std::string name;
                         uint8_t admin_level;
                         std::string country_code;
-                        uint8_t place_type_override;
+                        uint8_t fallback_place_type;  // from own place tag, used last
                         std::string wikidata; // for place linking
                     };
                     std::vector<ClosedWayAdmin> closed_way_admins;
@@ -1567,10 +1565,9 @@ int main(int argc, char* argv[]) {
                                         for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});
                                         std::string cc; if (al == 2) { const char* iso = t_iso; if (iso) cc = iso; }
                                         auto po = classify_place_override(t_linked_place, t_border_type, t_place);
-                                        auto pto = static_cast<uint8_t>(po.type);
-                                        std::string wd_str;
-                                        if (t_wikidata && pto == 0 && !po.tag_present) wd_str = t_wikidata;
-                                        local.closed_way_admins.push_back({std::move(verts), std::move(name_str), al, std::move(cc), pto, std::move(wd_str)});
+                                        uint8_t fallback = static_cast<uint8_t>(po.type);
+                                        std::string wd_str = t_wikidata ? t_wikidata : "";
+                                        local.closed_way_admins.push_back({std::move(verts), std::move(name_str), al, std::move(cc), fallback, std::move(wd_str)});
                                     }
                                 }
                             }
@@ -1583,7 +1580,8 @@ int main(int argc, char* argv[]) {
                                 if (pt != AdminPlaceType::NONE && all_valid && resolved_locs.size() >= 3) {
                                     std::vector<std::pair<double,double>> verts;
                                     for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});
-                                    local.closed_way_admins.push_back({std::move(verts), std::string(aname), uint8_t(15), std::string(), static_cast<uint8_t>(pt), std::string()});
+                                    std::string wd_str = t_wikidata ? t_wikidata : "";
+                                    local.closed_way_admins.push_back({std::move(verts), std::string(aname), uint8_t(15), std::string(), static_cast<uint8_t>(pt), std::move(wd_str)});
                                 }
                             }
                         }
@@ -1699,15 +1697,17 @@ int main(int argc, char* argv[]) {
                     size_t cwa_wikidata_linked = 0;
                     for (auto& local : tld) {
                         for (auto& cwa : local.closed_way_admins) {
-                            // Wikidata-based place linking for closed-way admins
-                            uint8_t pto = cwa.place_type_override;
-                            if (pto == 0 && !cwa.wikidata.empty()) {
+                            // wikidata step first (Nominatim priority), then
+                            // fall back to the way's own place tag.
+                            uint8_t pto = 0;
+                            if (!cwa.wikidata.empty()) {
                                 auto it = wikidata_to_place_type.find(cwa.wikidata);
                                 if (it != wikidata_to_place_type.end()) {
                                     pto = place_type_to_admin_override(it->second);
-                                    cwa_wikidata_linked++;
+                                    if (pto != 0) cwa_wikidata_linked++;
                                 }
                             }
+                            if (pto == 0) pto = cwa.fallback_place_type;
                             const char* cc = cwa.country_code.empty() ? nullptr : cwa.country_code.c_str();
                             add_admin_polygon(data, cwa.vertices, cwa.name.c_str(),
                                               cwa.admin_level, cc, &admin_pool, pto);
@@ -1833,16 +1833,22 @@ int main(int argc, char* argv[]) {
                                               << found << " found, " << missing << " missing)" << std::endl;
                                 }
 
-                                // Place linking (Nominatim order): label role > wikidata > already-set tag
-                                // find_linked_place() in Nominatim looks for a member
-                                // with role='label' of class='place' FIRST; if one is
-                                // found (whatever its place type), linking is
-                                // authoritative — we don't fall through to wikidata.
-                                // A non-settlement label (state/province/country) means
-                                // the boundary stays at its rank-based mapping.
-                                uint8_t pto = rel.place_type_override;
+                                // Place linking, matching Nominatim's find_linked_place
+                                // priority order (placex_triggers.sql):
+                                //   1. label role (member with role=label, class=place)
+                                //   2. wikidata (place node with matching wikidata, inside
+                                //      the boundary, not already linked elsewhere)
+                                //   3. place type (boundary's own place=X tag with a
+                                //      matching-name place node — approximated here by
+                                //      the boundary's own place tag as a last resort)
+                                //   4. name match (not implemented)
+                                // An authoritative label-role match stops us falling
+                                // through — even if the label is a non-settlement
+                                // (state/province/country) Nominatim inherits its
+                                // rank_address from that node rather than trying wikidata.
+                                uint8_t pto = 0;
                                 bool label_checked = false;
-                                if (pto == 0 && rel.label_node_id >= 0) {
+                                if (rel.label_node_id >= 0) {
                                     auto it = label_node_to_place_type.find(rel.label_node_id);
                                     if (it != label_node_to_place_type.end()) {
                                         label_checked = true;
@@ -1858,6 +1864,10 @@ int main(int argc, char* argv[]) {
                                         pto = place_type_to_admin_override(it->second);
                                         if (pto != 0) wikidata_linked_count.fetch_add(1);
                                     }
+                                }
+                                // Fallback: place tag on the boundary itself
+                                if (pto == 0 && rel.fallback_place_type != 0) {
+                                    pto = rel.fallback_place_type;
                                 }
 
                                 for (auto& ring : rings) {

@@ -120,7 +120,12 @@ struct CollectedRelation {
     int64_t id;
     int64_t label_node_id = -1;  // role=label place node (Nominatim's primary link target)
     uint8_t admin_level;
-    uint8_t place_type_override = 0;  // AdminPlaceType
+    // Fallback place-type override from the boundary's own tags
+    // (linked_place / place). Nominatim's find_linked_place tries label
+    // role → wikidata → place-type match → name match; the boundary's
+    // own place tag is only step 3, so we store it as a *fallback*
+    // applied after label / wikidata have been checked.
+    uint8_t fallback_place_type = 0;  // AdminPlaceType
     std::string name;
     std::string country_code;
     bool is_postal;
