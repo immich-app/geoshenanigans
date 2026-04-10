@@ -274,6 +274,7 @@ int main(int argc, char* argv[]) {
             std::cerr << "  Pass 1: scanning relations..." << std::endl;
             PbfFile pbf(input_file, num_threads);
 
+            std::vector<std::string> rel_wikidata; // parallel to data.collected_relations
             {
                 std::mutex rel_mutex;
                 pbf.read_blocks([&](PbfBlock& block, unsigned) {
@@ -308,6 +309,7 @@ int main(int argc, char* argv[]) {
                                         if (!cr.members.empty()) {
                                             std::lock_guard<std::mutex> lock(rel_mutex);
                                             data.collected_relations.push_back(std::move(cr));
+                                            rel_wikidata.emplace_back(); // already has override, no wikidata needed
                                         }
                                     }
                                 }
@@ -347,6 +349,7 @@ int main(int argc, char* argv[]) {
 
                         const char* linked_place = rel.tag("linked_place");
                         const char* border_type_tag = rel.tag("border_type");
+                        const char* wikidata_tag = rel.tag("wikidata");
 
                         CollectedRelation cr;
                         cr.id = rel.id;
@@ -363,8 +366,14 @@ int main(int argc, char* argv[]) {
                         }
 
                         if (!cr.members.empty()) {
+                            // Store wikidata ID for relations that don't already have a place_type_override
+                            std::string wd_str;
+                            if (wikidata_tag && cr.place_type_override == 0) {
+                                wd_str = wikidata_tag;
+                            }
                             std::lock_guard<std::mutex> lock(rel_mutex);
                             data.collected_relations.push_back(std::move(cr));
+                            rel_wikidata.push_back(std::move(wd_str));
                         }
                     }
                     // --- POI relation scanning (same pass) ---
@@ -639,6 +648,7 @@ int main(int argc, char* argv[]) {
             };
 
             std::cerr << "  Pass 2: processing nodes with " << num_threads << " threads..." << std::endl;
+            std::unordered_map<std::string, uint8_t> wikidata_to_place_type;
             {
                 struct NodeThreadLocal {
                     std::vector<std::pair<double,double>> addr_coords;
@@ -652,6 +662,7 @@ int main(int argc, char* argv[]) {
                     // Place node data
                     std::vector<PlaceNode> place_nodes;
                     std::vector<std::string> place_names;
+                    std::vector<std::pair<std::string, uint8_t>> place_wikidata; // (wikidata_id, PlaceType)
                 };
                 // Use thread_local for streaming callback (no thread index available)
                 static thread_local NodeThreadLocal* tl_node_data = nullptr;
@@ -780,6 +791,10 @@ int main(int argc, char* argv[]) {
                                 pn.place_type = static_cast<uint8_t>(pt);
                                 tl_node_data->place_nodes.push_back(pn);
                                 tl_node_data->place_names.push_back(n_name);
+                                // Capture wikidata for place→admin linking
+                                if (n_wikidata) {
+                                    tl_node_data->place_wikidata.push_back({n_wikidata, static_cast<uint8_t>(pt)});
+                                }
                             }
                         }
                     }
@@ -818,6 +833,17 @@ int main(int argc, char* argv[]) {
                         pn.name_id = data.string_pool.intern(local.place_names[j]);
                         data.place_nodes.push_back(pn);
                     }
+                }
+                // Build wikidata → place type map for admin boundary linking
+                for (auto& local : ntld) {
+                    for (auto& [wd, pt] : local.place_wikidata) {
+                        wikidata_to_place_type[wd] = pt;
+                    }
+                    local.place_wikidata.clear();
+                }
+                if (!wikidata_to_place_type.empty()) {
+                    std::cerr << "  Built wikidata→place_type map: "
+                              << wikidata_to_place_type.size() << " entries." << std::endl;
                 }
                 std::cerr << "  Node processing complete: " << total_addrs
                           << " address points, " << total_poi_nodes
@@ -861,6 +887,7 @@ int main(int argc, char* argv[]) {
                         uint8_t admin_level;
                         std::string country_code;
                         uint8_t place_type_override;
+                        std::string wikidata; // for place linking
                     };
                     std::vector<ClosedWayAdmin> closed_way_admins;
                     // POI way data
@@ -1149,7 +1176,9 @@ int main(int argc, char* argv[]) {
                                         for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});
                                         std::string cc; if (al == 2) { const char* iso = t_iso; if (iso) cc = iso; }
                                         auto pto = static_cast<uint8_t>(classify_place_override(t_linked_place, t_border_type, nullptr));
-                                        local.closed_way_admins.push_back({std::move(verts), std::move(name_str), al, std::move(cc), pto});
+                                        std::string wd_str;
+                                        if (t_wikidata && pto == 0) wd_str = t_wikidata;
+                                        local.closed_way_admins.push_back({std::move(verts), std::move(name_str), al, std::move(cc), pto, std::move(wd_str)});
                                     }
                                 }
                             }
@@ -1162,7 +1191,7 @@ int main(int argc, char* argv[]) {
                                 if (pt != AdminPlaceType::NONE && all_valid && resolved_locs.size() >= 3) {
                                     std::vector<std::pair<double,double>> verts;
                                     for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});
-                                    local.closed_way_admins.push_back({std::move(verts), std::string(aname), uint8_t(15), std::string(), static_cast<uint8_t>(pt)});
+                                    local.closed_way_admins.push_back({std::move(verts), std::string(aname), uint8_t(15), std::string(), static_cast<uint8_t>(pt), std::string()});
                                 }
                             }
                         }
@@ -1273,18 +1302,31 @@ int main(int argc, char* argv[]) {
                 // --- Merge closed-way admin polygons ---
                 {
                     uint64_t closed_way_admin_count = 0;
+                    size_t cwa_wikidata_linked = 0;
                     for (auto& local : tld) {
                         for (auto& cwa : local.closed_way_admins) {
+                            // Wikidata-based place linking for closed-way admins
+                            uint8_t pto = cwa.place_type_override;
+                            if (pto == 0 && !cwa.wikidata.empty()) {
+                                auto it = wikidata_to_place_type.find(cwa.wikidata);
+                                if (it != wikidata_to_place_type.end()) {
+                                    pto = it->second;
+                                    cwa_wikidata_linked++;
+                                }
+                            }
                             const char* cc = cwa.country_code.empty() ? nullptr : cwa.country_code.c_str();
                             add_admin_polygon(data, cwa.vertices, cwa.name.c_str(),
-                                              cwa.admin_level, cc, &admin_pool, cwa.place_type_override);
+                                              cwa.admin_level, cc, &admin_pool, pto);
                             closed_way_admin_count++;
                         }
                         local.closed_way_admins.clear();
                     }
                     if (closed_way_admin_count > 0) {
                         std::cerr << "  Added " << closed_way_admin_count
-                                  << " admin polygons from closed ways." << std::endl;
+                                  << " admin polygons from closed ways";
+                        if (cwa_wikidata_linked > 0)
+                            std::cerr << " (" << cwa_wikidata_linked << " wikidata-linked)";
+                        std::cerr << "." << std::endl;
                     }
                 }
 
@@ -1308,6 +1350,12 @@ int main(int argc, char* argv[]) {
                     std::vector<std::vector<AdminResult>> thread_admin_results(num_threads);
                     std::atomic<size_t> rel_idx{0};
                     std::atomic<uint64_t> assembled_count{0};
+                    std::atomic<uint64_t> wikidata_linked_count{0};
+
+                    if (!wikidata_to_place_type.empty()) {
+                        std::cerr << "  Wikidata place linking: " << wikidata_to_place_type.size()
+                                  << " place nodes available for matching." << std::endl;
+                    }
 
                     std::vector<std::thread> admin_workers;
                     for (unsigned int t = 0; t < num_threads; t++) {
@@ -1391,6 +1439,16 @@ int main(int argc, char* argv[]) {
                                               << found << " found, " << missing << " missing)" << std::endl;
                                 }
 
+                                // Wikidata-based place linking
+                                uint8_t pto = rel.place_type_override;
+                                if (pto == 0 && !rel_wikidata[i].empty()) {
+                                    auto it = wikidata_to_place_type.find(rel_wikidata[i]);
+                                    if (it != wikidata_to_place_type.end()) {
+                                        pto = it->second;
+                                        wikidata_linked_count.fetch_add(1);
+                                    }
+                                }
+
                                 for (auto& ring : rings) {
                                     if (ring.size() >= 3) {
                                         AdminResult ar;
@@ -1398,7 +1456,7 @@ int main(int argc, char* argv[]) {
                                         ar.name = rel.name;
                                         ar.admin_level = rel.admin_level;
                                         ar.country_code = rel.country_code;
-                                        ar.place_type_override = rel.place_type_override;
+                                        ar.place_type_override = pto;
                                         local_results.push_back(std::move(ar));
                                     }
                                 }
@@ -1412,6 +1470,12 @@ int main(int argc, char* argv[]) {
                         });
                     }
                     for (auto& w : admin_workers) w.join();
+                    if (wikidata_linked_count > 0) {
+                        std::cerr << "  Wikidata place linking: " << wikidata_linked_count
+                                  << " admin relations linked to place types." << std::endl;
+                    }
+                    rel_wikidata.clear();
+                    rel_wikidata.shrink_to_fit();
                     log_phase("    Admin: ring assembly", _pt, _cpu);
 
                     // Flatten all admin results into a single vector for parallel processing
