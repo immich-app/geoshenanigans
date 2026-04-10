@@ -323,14 +323,34 @@ jobs:
           wait
           rm -f "$WORKDIR/planet.osm.pbf"
 
-      # ── Generate patches + verify ─────────────────────────────────
+      # ── Generate patches + verify (with parallel index upload) ────
       - name: Generate patches and verify
         if: steps.setup.outputs.has_previous == 'true'
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
+          CACHE_ENDPOINT: ${{ steps.setup.outputs.cache_endpoint }}
+          CACHE_BUCKET: ${{ steps.setup.outputs.cache_bucket }}
           OLD_DATE: ${{ steps.setup.outputs.yesterday }}
           NEW_DATE: ${{ steps.setup.outputs.today }}
         run: |
+          S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
+          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
+
+          # Start uploading index files (.bin + .json) to Tigris + cache in background
+          # Patches (.gcpatch) are uploaded separately after verification
+          echo "Starting index upload to Tigris in background..."
+          $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
+          (
+            s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 8 cp --concurrency 16 \
+              --exclude "*.gcpatch" \
+              "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/"
+            echo "[upload] Tigris index upload complete"
+            $CACHE cp --concurrency 16 --exclude "*.gcpatch" \
+              "$WORKDIR/output/*" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/" 2>/dev/null || true
+            echo "[upload] Cache upload complete"
+          ) &
+          UPLOAD_PID=$!
+
           echo "Generating patches ($OLD_DATE → $NEW_DATE)..."
           START=$(date +%s)
 
@@ -421,10 +441,31 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "**Total: $PASS pass, $FAIL fail, $SKIP skip**" >> "$GITHUB_STEP_SUMMARY"
           echo "Results: $PASS pass, $FAIL fail, $SKIP skip"
+
+          # Wait for background index upload to finish
+          echo "Waiting for background index upload..."
+          wait $UPLOAD_PID || echo "::warning::Background upload had issues"
+
+          # Upload verified patches
+          echo "Uploading patches to Tigris..."
+          PATCH_START=$(date +%s)
+          find "$WORKDIR/output" -name "*.gcpatch" -type f | while read -r f; do
+            REL="${f#$WORKDIR/output/}"
+            s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 cp "$f" \
+              "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/$REL" 2>/dev/null
+          done
+          echo "Patch upload completed in $(($(date +%s) - PATCH_START))s"
+
+          # Also cache patches
+          find "$WORKDIR/output" -name "*.gcpatch" -type f | while read -r f; do
+            REL="${f#$WORKDIR/output/}"
+            $CACHE cp "$f" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/$REL" 2>/dev/null || true
+          done
+
           [ $FAIL -gt 0 ] && exit 1 || true
 
-      # ── Write manifest + upload ────────────────────────────────────
-      - name: Upload to Tigris and cache
+      # ── Finalize upload + manifest ──────────────────────────────────
+      - name: Finalize upload and manifest
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
           CACHE_ENDPOINT: ${{ steps.setup.outputs.cache_endpoint }}
@@ -446,51 +487,28 @@ jobs:
              && mv "$WORKDIR/output/manifest.tmp" "$WORKDIR/output/manifest.json"
           echo "Manifest: $(cat "$WORKDIR/output/manifest.json")"
 
-          # ── Upload everything to Tigris + cache in parallel ──
-          # output/ now contains: *.bin + patch.gcpatch + manifest.json per variant
-          # Clean stale files from previous structure before uploading
-          echo "Cleaning old files on Tigris for $NEW_DATE..."
-          $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
-          echo "Uploading to Tigris..."
-          START=$(date +%s)
-          UPLOAD_LOG="$WORKDIR/upload.log"
-          s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 8 cp --concurrency 16 \
-            "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/" \
-            > "$UPLOAD_LOG" 2>&1 &
-          TIGRIS_PID=$!
+          # Upload manifest (index files + patches already uploaded during patch step)
+          $S5 cp "$WORKDIR/output/manifest.json" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/manifest.json"
+          $CACHE cp "$WORKDIR/output/manifest.json" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/manifest.json" 2>/dev/null || true
 
-          echo "Caching to local S3..."
-          $CACHE cp --concurrency 16 "$WORKDIR/output/*" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/" &
-          CACHE_PID=$!
-
-          # ── Wait for Tigris ──
-          echo "Waiting for Tigris upload..."
-          TIGRIS_OK=true
-          wait $TIGRIS_PID || TIGRIS_OK=false
-          if [ "$TIGRIS_OK" = "false" ] || grep -qi "error" "$UPLOAD_LOG" 2>/dev/null; then
-            echo "::warning::Tigris upload had errors:"
-            cat "$UPLOAD_LOG"
-          fi
-
+          # Verify upload completeness
           LOCAL_COUNT=$(find "$WORKDIR/output" -type f | wc -l)
           REMOTE_COUNT=$($S5 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null | wc -l)
-          echo "Tigris: $REMOTE_COUNT/$LOCAL_COUNT files in $(($(date +%s) - START))s"
+          echo "Tigris: $REMOTE_COUNT/$LOCAL_COUNT files"
           if [ "$REMOTE_COUNT" -lt "$LOCAL_COUNT" ]; then
-            echo "::error::Tigris upload incomplete: $REMOTE_COUNT/$LOCAL_COUNT"
-            exit 1
+            echo "::warning::Tigris incomplete ($REMOTE_COUNT/$LOCAL_COUNT) — uploading remaining files..."
+            s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 8 cp --concurrency 16 \
+              "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/" 2>/dev/null || true
+            REMOTE_COUNT=$($S5 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null | wc -l)
+            echo "Tigris after retry: $REMOTE_COUNT/$LOCAL_COUNT files"
+            if [ "$REMOTE_COUNT" -lt "$LOCAL_COUNT" ]; then
+              echo "::error::Tigris upload still incomplete: $REMOTE_COUNT/$LOCAL_COUNT"
+              exit 1
+            fi
           fi
 
-          # ── Wait for cache + verify ──
-          echo "Waiting for cache upload..."
-          wait $CACHE_PID 2>/dev/null || true
-
+          # Cache sentinel
           CACHE_COUNT=$($CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/*" 2>/dev/null | wc -l)
-          echo "Cache: $CACHE_COUNT/$LOCAL_COUNT files"
-          if [ "$CACHE_COUNT" -lt "$LOCAL_COUNT" ]; then
-            echo "Cache incomplete — retrying..."
-            $CACHE cp --concurrency 16 "$WORKDIR/output/*" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/" 2>&1 || true
-            CACHE_COUNT=$($CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/*" 2>/dev/null | wc -l)
-          fi
           if [ "$CACHE_COUNT" -ge "$LOCAL_COUNT" ]; then
             echo "{\"date\":\"$NEW_DATE\",\"files\":$LOCAL_COUNT,\"cached_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" \
               | $CACHE pipe "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/.cache-complete"
