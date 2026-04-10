@@ -523,12 +523,24 @@ int main(int argc, char* argv[]) {
                 pbf.read_blocks([&](PbfBlock& block, unsigned) {
                     for (auto& rel : block.relations) {
                         const char* boundary = rel.tag("boundary");
-                        if (!boundary) continue;
+                        const char* rel_type = rel.tag("type");
+                        const char* rel_place = rel.tag("place");
 
-                        bool is_admin = (std::strcmp(boundary, "administrative") == 0);
-                        bool is_postal = (std::strcmp(boundary, "postal_code") == 0);
-                        bool is_place_boundary = (std::strcmp(boundary, "place") == 0);
-                        if (!is_admin && !is_postal && !is_place_boundary) continue;
+                        // type=multipolygon + place=city/town/… relations (e.g. Moscow
+                        // R2555133) are distinct placex rows in Nominatim at the
+                        // place type's rank. They exist alongside any matching
+                        // boundary=administrative relation at a different rank.
+                        bool is_multipolygon_place =
+                            !boundary && rel_type && rel_place &&
+                            std::strcmp(rel_type, "multipolygon") == 0 &&
+                            classify_place_override(nullptr, nullptr, rel_place) != AdminPlaceType::NONE;
+
+                        if (!boundary && !is_multipolygon_place) continue;
+
+                        bool is_admin = boundary && std::strcmp(boundary, "administrative") == 0;
+                        bool is_postal = boundary && std::strcmp(boundary, "postal_code") == 0;
+                        bool is_place_boundary = boundary && std::strcmp(boundary, "place") == 0;
+                        if (!is_admin && !is_postal && !is_place_boundary && !is_multipolygon_place) continue;
 
                         // Capture label member node (Nominatim's primary place-link lookup)
                         int64_t label_node_id = -1;
@@ -539,9 +551,10 @@ int main(int argc, char* argv[]) {
                             }
                         }
 
-                        // Handle boundary=place relations (e.g., Washington DC)
-                        if (is_place_boundary) {
-                            const char* place_tag = rel.tag("place");
+                        // Handle boundary=place (e.g., Washington DC) and
+                        // type=multipolygon+place=* (e.g., Moscow R2555133).
+                        if (is_place_boundary || is_multipolygon_place) {
+                            const char* place_tag = rel_place;
                             if (place_tag) {
                                 AdminPlaceType pt = classify_place_override(nullptr, nullptr, place_tag);
                                 if (pt != AdminPlaceType::NONE) {
@@ -551,7 +564,7 @@ int main(int argc, char* argv[]) {
                                         CollectedRelation cr;
                                         cr.id = rel.id;
                                         cr.label_node_id = label_node_id;
-                                        cr.admin_level = 15;  // special marker for boundary=place
+                                        cr.admin_level = 15;  // special marker for boundary=place / place multipolygon
                                         cr.name = name;
                                         cr.is_postal = false;
                                         cr.place_type_override = static_cast<uint8_t>(pt);
@@ -1082,10 +1095,16 @@ int main(int argc, char* argv[]) {
                                 if (n_wikidata) {
                                     tl_node_data->place_wikidata.push_back({n_wikidata, static_cast<uint8_t>(pt)});
                                 }
-                                // Capture label-role linking (Nominatim's primary method)
-                                if (wanted_label_nodes.count(id)) {
-                                    tl_node_data->label_hits.push_back({id, static_cast<uint8_t>(pt)});
-                                }
+                            }
+                            // Always record label-role hit for any place=* node
+                            // (even non-settlements like state/province/country).
+                            // The admin-assembly check treats non-settlement
+                            // labels as authoritative "don't promote this boundary
+                            // to a city rank", which matches Nominatim's behaviour
+                            // where linking to a state-level place leaves the
+                            // boundary's rank_address unchanged.
+                            if (wanted_label_nodes.count(id)) {
+                                tl_node_data->label_hits.push_back({id, static_cast<uint8_t>(pt)});
                             }
                         }
                     }
@@ -1761,15 +1780,25 @@ int main(int argc, char* argv[]) {
                                 }
 
                                 // Place linking (Nominatim order): label role > wikidata > already-set tag
+                                // find_linked_place() in Nominatim looks for a member
+                                // with role='label' of class='place' FIRST; if one is
+                                // found (whatever its place type), linking is
+                                // authoritative — we don't fall through to wikidata.
+                                // A non-settlement label (state/province/country) means
+                                // the boundary stays at its rank-based mapping.
                                 uint8_t pto = rel.place_type_override;
+                                bool label_checked = false;
                                 if (pto == 0 && rel.label_node_id >= 0) {
                                     auto it = label_node_to_place_type.find(rel.label_node_id);
                                     if (it != label_node_to_place_type.end()) {
-                                        pto = place_type_to_admin_override(it->second);
-                                        if (pto != 0) wikidata_linked_count.fetch_add(1);
+                                        label_checked = true;
+                                        if (it->second != static_cast<uint8_t>(PlaceType::UNKNOWN)) {
+                                            pto = place_type_to_admin_override(it->second);
+                                            if (pto != 0) wikidata_linked_count.fetch_add(1);
+                                        }
                                     }
                                 }
-                                if (pto == 0 && !rel_wikidata[i].empty()) {
+                                if (pto == 0 && !label_checked && !rel_wikidata[i].empty()) {
                                     auto it = wikidata_to_place_type.find(rel_wikidata[i]);
                                     if (it != wikidata_to_place_type.end()) {
                                         pto = place_type_to_admin_override(it->second);
