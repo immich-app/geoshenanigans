@@ -16,6 +16,11 @@ on:
         required: false
         type: string
         default: 'pokedex-giant'
+      force_fresh:
+        description: 'Ignore previous build and build fresh (no patch)'
+        required: false
+        type: boolean
+        default: false
 
 env:
   S3_BUCKET: geoshenanigans-reverse-geocoding
@@ -69,6 +74,7 @@ jobs:
         id: setup
         env:
           BUILD_DATE: ${{ inputs.build_date }}
+          FORCE_FRESH: ${{ inputs.force_fresh }}
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
           # Workdir + cache config
@@ -99,7 +105,10 @@ jobs:
           # Check if previous build exists on Tigris with compatible build_version
           EXPECTED_BUILD_VERSION=3
           PREV_BUILD="s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV_DATE"
-          if s5cmd --endpoint-url $S3_ENDPOINT ls "$PREV_BUILD/" 2>/dev/null | head -1 | grep -q .; then
+          if [ "$FORCE_FRESH" = "true" ]; then
+            echo "has_previous=false" >> "$GITHUB_OUTPUT"
+            echo "force_fresh=true requested — building fresh (ignoring $PREV_DATE)"
+          elif s5cmd --endpoint-url $S3_ENDPOINT ls "$PREV_BUILD/" 2>/dev/null | head -1 | grep -q .; then
             # Check build_version in previous manifest
             PREV_VERSION=$(s5cmd --endpoint-url $S3_ENDPOINT cat "$PREV_BUILD/manifest.json" 2>/dev/null \
               | jq -r '.build_version // 0' 2>/dev/null || echo 0)
