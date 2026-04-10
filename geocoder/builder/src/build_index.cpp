@@ -58,15 +58,21 @@ static PlaceOverride classify_place_override(const char* linked_place, const cha
     if (std::strcmp(val, "city") == 0) t = AdminPlaceType::CITY;
     else if (std::strcmp(val, "town") == 0) t = AdminPlaceType::TOWN;
     else if (std::strcmp(val, "village") == 0) t = AdminPlaceType::VILLAGE;
+    else if (std::strcmp(val, "hamlet") == 0) t = AdminPlaceType::VILLAGE; // Nominatim: hamlet rank-wise close to village
     else if (std::strcmp(val, "borough") == 0) t = AdminPlaceType::SUBURB;
     else if (std::strcmp(val, "suburb") == 0) t = AdminPlaceType::SUBURB;
     else if (std::strcmp(val, "neighbourhood") == 0) t = AdminPlaceType::NEIGHBOURHOOD;
     else if (std::strcmp(val, "quarter") == 0) t = AdminPlaceType::QUARTER;
+    else if (std::strcmp(val, "state") == 0) t = AdminPlaceType::STATE;
+    else if (std::strcmp(val, "province") == 0) t = AdminPlaceType::PROVINCE;
+    else if (std::strcmp(val, "region") == 0) t = AdminPlaceType::REGION;
+    else if (std::strcmp(val, "county") == 0) t = AdminPlaceType::COUNTY;
+    else if (std::strcmp(val, "district") == 0) t = AdminPlaceType::DISTRICT;
     return {t, true};
 }
 
 // PlaceType (0=CITY, 1=TOWN, ...) → AdminPlaceType (0=NONE, 1=CITY, 2=TOWN, ...)
-// Used when wikidata-linking an admin boundary to a place node. Without this
+// Used when linking an admin boundary to a label-role place node. Without this
 // conversion the enums disagree on zero (PlaceType::CITY=0 vs NONE=0) and any
 // place=city-linked boundary silently becomes unlinked.
 static uint8_t place_type_to_admin_override(uint8_t pt) {
@@ -78,6 +84,13 @@ static uint8_t place_type_to_admin_override(uint8_t pt) {
         case PlaceType::HAMLET:        return static_cast<uint8_t>(AdminPlaceType::VILLAGE); // Nominatim: hamlet → village rank
         case PlaceType::NEIGHBOURHOOD: return static_cast<uint8_t>(AdminPlaceType::NEIGHBOURHOOD);
         case PlaceType::QUARTER:       return static_cast<uint8_t>(AdminPlaceType::QUARTER);
+        // Non-settlement label-role targets. These match Nominatim's
+        // get_label_tag() which returns extratags['linked_place'] directly.
+        case PlaceType::STATE:         return static_cast<uint8_t>(AdminPlaceType::STATE);
+        case PlaceType::PROVINCE:      return static_cast<uint8_t>(AdminPlaceType::PROVINCE);
+        case PlaceType::REGION:        return static_cast<uint8_t>(AdminPlaceType::REGION);
+        case PlaceType::COUNTY:        return static_cast<uint8_t>(AdminPlaceType::COUNTY);
+        case PlaceType::DISTRICT:      return static_cast<uint8_t>(AdminPlaceType::DISTRICT);
         default:                        return static_cast<uint8_t>(AdminPlaceType::NONE);
     }
 }
@@ -1087,38 +1100,47 @@ int main(int argc, char* argv[]) {
                             }
                         }
 
-                        // Place nodes (settlements)
+                        // Place nodes (settlements) + label-role higher-level place types
                         if (n_place && best_name) {
-                            PlaceType pt = PlaceType::UNKNOWN;
-                            if (std::strcmp(n_place, "city") == 0) pt = PlaceType::CITY;
-                            else if (std::strcmp(n_place, "town") == 0) pt = PlaceType::TOWN;
-                            else if (std::strcmp(n_place, "village") == 0) pt = PlaceType::VILLAGE;
-                            else if (std::strcmp(n_place, "suburb") == 0) pt = PlaceType::SUBURB;
-                            else if (std::strcmp(n_place, "hamlet") == 0) pt = PlaceType::HAMLET;
-                            else if (std::strcmp(n_place, "neighbourhood") == 0) pt = PlaceType::NEIGHBOURHOOD;
-                            else if (std::strcmp(n_place, "quarter") == 0) pt = PlaceType::QUARTER;
+                            // Settlement types that we store as searchable place_nodes
+                            PlaceType settlement_pt = PlaceType::UNKNOWN;
+                            if (std::strcmp(n_place, "city") == 0) settlement_pt = PlaceType::CITY;
+                            else if (std::strcmp(n_place, "town") == 0) settlement_pt = PlaceType::TOWN;
+                            else if (std::strcmp(n_place, "village") == 0) settlement_pt = PlaceType::VILLAGE;
+                            else if (std::strcmp(n_place, "suburb") == 0) settlement_pt = PlaceType::SUBURB;
+                            else if (std::strcmp(n_place, "hamlet") == 0) settlement_pt = PlaceType::HAMLET;
+                            else if (std::strcmp(n_place, "neighbourhood") == 0) settlement_pt = PlaceType::NEIGHBOURHOOD;
+                            else if (std::strcmp(n_place, "quarter") == 0) settlement_pt = PlaceType::QUARTER;
 
-                            if (pt != PlaceType::UNKNOWN) {
+                            if (settlement_pt != PlaceType::UNKNOWN) {
                                 PlaceNode pn{};
                                 pn.lat = static_cast<float>(lat);
                                 pn.lng = static_cast<float>(lng);
-                                pn.place_type = static_cast<uint8_t>(pt);
+                                pn.place_type = static_cast<uint8_t>(settlement_pt);
                                 tl_node_data->place_nodes.push_back(pn);
                                 tl_node_data->place_names.push_back(best_name);
                                 // Capture wikidata for place→admin linking
                                 if (n_wikidata) {
-                                    tl_node_data->place_wikidata.push_back({n_wikidata, static_cast<uint8_t>(pt)});
+                                    tl_node_data->place_wikidata.push_back({n_wikidata, static_cast<uint8_t>(settlement_pt)});
                                 }
                             }
-                            // Always record label-role hit for any place=* node
-                            // (even non-settlements like state/province/country).
-                            // The admin-assembly check treats non-settlement
-                            // labels as authoritative "don't promote this boundary
-                            // to a city rank", which matches Nominatim's behaviour
-                            // where linking to a state-level place leaves the
-                            // boundary's rank_address unchanged.
+
+                            // For the label-role lookup, also recognise higher-level
+                            // place types. Nominatim's find_linked_place() matches
+                            // class='place' (any type), and get_label_tag() then uses
+                            // extratags['linked_place'] (which is the place type) as
+                            // the label. So an admin L5 Region linked to a place=state
+                            // label node should be labelled "state" in the address.
+                            PlaceType label_pt = settlement_pt;
+                            if (label_pt == PlaceType::UNKNOWN) {
+                                if (std::strcmp(n_place, "state") == 0) label_pt = PlaceType::STATE;
+                                else if (std::strcmp(n_place, "province") == 0) label_pt = PlaceType::PROVINCE;
+                                else if (std::strcmp(n_place, "region") == 0) label_pt = PlaceType::REGION;
+                                else if (std::strcmp(n_place, "county") == 0) label_pt = PlaceType::COUNTY;
+                                else if (std::strcmp(n_place, "district") == 0) label_pt = PlaceType::DISTRICT;
+                            }
                             if (wanted_label_nodes.count(id)) {
-                                tl_node_data->label_hits.push_back({id, static_cast<uint8_t>(pt)});
+                                tl_node_data->label_hits.push_back({id, static_cast<uint8_t>(label_pt)});
                             }
                         }
                     }

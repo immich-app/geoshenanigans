@@ -30,7 +30,9 @@ struct InterpWay {
     uint8_t _pad4 = 0, _pad5 = 0, _pad6 = 0; // explicit padding
 };
 
-// Place type override for admin polygons (from linked_place/border_type/place tags)
+// Place type override for admin polygons (from linked_place/border_type/place tags
+// or a label-role member place node). Must stay in sync with
+// geocoder/server/src/main.rs place_type_to_field.
 enum class AdminPlaceType : uint8_t {
     NONE = 0,       // use admin_level mapping
     CITY = 1,
@@ -39,6 +41,16 @@ enum class AdminPlaceType : uint8_t {
     SUBURB = 4,     // includes borough
     NEIGHBOURHOOD = 5,
     QUARTER = 6,
+    // Higher-level overrides used for relations that link to a non-settlement
+    // place node. Nominatim's get_label_tag() returns extratags['linked_place']
+    // directly as the label, so place=state should produce "state" even when
+    // the admin_level default rank would map to something else (e.g. Greek
+    // Region at L5 default to state_district → lifted to state).
+    STATE = 7,
+    PROVINCE = 8,   // place=province (rendered as 'state' in ADMIN_LABELS fallback)
+    REGION = 9,     // place=region
+    COUNTY = 10,    // place=county
+    DISTRICT = 11,  // place=district → city_district
 };
 
 struct AdminPolygon {
@@ -124,6 +136,11 @@ struct CollectedRelation {
 enum class PlaceType : uint8_t {
     CITY = 0, TOWN = 1, VILLAGE = 2, SUBURB = 3,
     HAMLET = 4, NEIGHBOURHOOD = 5, QUARTER = 6,
+    // These are only used for the label-role lookup on admin boundaries —
+    // they never end up in place_nodes.bin itself. A label member with
+    // place=state/province/region/etc. lets us honour Nominatim's
+    // get_label_tag() fallthrough to extratags['linked_place'].
+    STATE = 7, PROVINCE = 8, REGION = 9, COUNTY = 10, DISTRICT = 11,
     UNKNOWN = 255
 };
 

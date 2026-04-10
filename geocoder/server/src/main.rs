@@ -208,12 +208,20 @@ impl AdminLevelConfig {
     }
 }
 
+// AdminPlaceType → output field name.
+// Must stay in sync with builder/src/types.h AdminPlaceType enum.
 fn place_type_to_field(pt: u8) -> Option<&'static str> {
     match pt {
         1 | 2 | 3 => Some("city"),     // city, town, village
         4 => Some("suburb"),            // suburb/borough
         5 => Some("neighbourhood"),
         6 => Some("city_district"),     // quarter
+        // Higher-level overrides from label-role linking, matching
+        // Nominatim's get_label_tag() fallthrough to extratags['linked_place'].
+        7 | 8 => Some("state"),         // state, province
+        9 => Some("state"),              // region → state (e.g. Greek Attica L5)
+        10 => Some("county"),            // county
+        11 => Some("city_district"),    // district
         _ => None,
     }
 }
