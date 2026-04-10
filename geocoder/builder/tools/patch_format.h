@@ -106,6 +106,7 @@ struct PatchAdminPolygon {
     uint32_t vertex_count;
     uint32_t name_id;
     uint8_t admin_level;
+    uint8_t place_type_override;
     float area;
     uint16_t country_code;
 };
@@ -234,9 +235,10 @@ inline std::vector<PatchAdminPolygon> read_admin_polygons(const std::string& pat
         memcpy(&result[i].vertex_count, p, 4); p += 4;
         memcpy(&result[i].name_id, p, 4); p += 4;
         result[i].admin_level = *reinterpret_cast<const uint8_t*>(p); p += 1;
-        // padding for area alignment
+        result[i].place_type_override = *reinterpret_cast<const uint8_t*>(p); p += 1;
+        // remaining padding for area alignment
         if (stride >= 20) {
-            size_t skip = (stride == 24) ? 3 : (stride == 20 ? 3 : 0);
+            size_t skip = (stride == 24) ? 2 : (stride == 20 ? 2 : 0);
             p += skip;
         }
         memcpy(&result[i].area, p, 4); p += 4;

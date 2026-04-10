@@ -153,7 +153,7 @@ For most cases, our smallest-area-wins approach produces the same result. Edge c
 | boundary=place entities (e.g., Washington DC) | Extracted in builder with admin_level=15 + place_type_override | ✅ Implemented |
 | Place node fallback (nearest city/town/village) | place_nodes.bin + find_places() at street cell level | ✅ Implemented |
 | place_addressline pre-computed relationships | Not applicable — we do spatial lookup at query time | N/A — different architecture |
-| Postcodes from addr:postcode | Not implemented — only boundary-based postcodes | ❌ Deferred — builder needs to extract addr:postcode from street/address nodes |
+| Postcodes from addr:postcode | Not implemented — only boundary-based postcodes | ❌ Deferred — see "Postcode handling" section below |
 | border_type tag | Extracted but Nominatim doesn't actually use this tag | ⚠️ We use it as a fallback after linked_place; harmless but unnecessary |
 | Wikidata-based place linking | Not implemented | ❌ Deferred — builder needs to match boundary wikidata tags against place node wikidata tags to set place_type_override. Name-based fallback requires geometric containment test. |
 | Display name formatting | Ours is a clean formatted address; Nominatim dumps all address rows comma-separated | ℹ️ Ours is arguably better for end users. Nominatim's is more of a debug breadcrumb. Could add suburb fallback when city is missing. |
@@ -161,3 +161,41 @@ For most cases, our smallest-area-wins approach produces the same result. Edge c
 | Suburb/neighbourhood rank adjustment | Not implemented — we use smallest-area-wins per field | ⚠️ Nominatim bumps child ranks to be > parent at index time. Could produce different suburb/neighbourhood assignments in edge cases with nested same-rank boundaries. |
 | TIGER address interpolation | Not implemented | ❌ Deferred — US TIGER data encodes address ranges in `tiger:*` tags on road ways (e.g., `tiger:zip_left`, `tiger:zip_right`). Nominatim interpolates house numbers from these. Affects rural/suburban US where addr:housenumber tags are sparse. Builder would need to extract TIGER ranges and store as interpolation data. |
 | Postal city names | Not implemented | ❌ Deferred — in the US, USPS assigns city names to ZIP codes that may differ from the actual municipal jurisdiction (e.g., "Cumming, GA" for unincorporated Forsyth County). Neither we nor Nominatim handle this — would require external USPS data or addr:city extraction. |
+
+## Postcode handling in Nominatim (traced from source)
+
+Nominatim has THREE sources for postcodes, combined into the `location_postcodes` table:
+
+### Source 1: Postcode boundary polygons (`place_postcode` table)
+- OSM `boundary=postal_code` relations with admin_level=11
+- These have actual polygon geometry
+- Stored with `osm_id IS NOT NULL` in location_postcodes
+- **We implement this** — our only current postcode source
+
+### Source 2: addr:postcode tags on places (`placex` table)
+- Any OSM object with an `address->'postcode'` hstore entry
+- Nominatim collects `(country_code, postcode, centroid)` from ALL objects in placex that have addr:postcode
+- These create **artificial postcode centroids** — computed as the average position of all objects sharing that postcode
+- Stored with `osm_id IS NULL` in location_postcodes
+- Only used for areas NOT already covered by postcode boundary polygons (line 342: `NOT EXISTS(SELECT * FROM _global_postcode_area ...)`)
+- **We don't implement this** — would require extracting addr:postcode from streets/buildings during PBF parsing and computing centroids
+
+### Source 3: External postcode CSV files
+- Per-country CSV files (`{country}_postcodes.csv`) placed in the project directory
+- Format: `postcode,lat,lon`
+- Added to fill gaps where neither boundary polygons nor addr:postcode data exists
+- **We don't implement this** — would require downloading/maintaining external data
+
+### How postcodes are resolved at query time
+
+`get_nearest_postcode()` in `utils.sql`:
+1. For polygon results: find postcode whose centroid is inside the polygon (must be exactly 1)
+2. For point results: find postcode whose coverage area contains the point, ordered by distance to centroid
+
+The postcode is also populated from the `place_addressline` chain — if a street/building has addr:postcode, it appears in the address rows directly.
+
+### What we'd need to implement
+
+**Minimum (covers most cases)**: During PBF parsing, capture `addr:postcode` from address points and street ways. Store the postcode alongside the address/street data. At query time, when the closest street/address has a postcode, include it in the result.
+
+**Full (matching Nominatim)**: Additionally compute artificial postcode centroids from all addr:postcode occurrences and create a postcode spatial index. This is more complex but handles the case where you're near a road without addr:postcode but within a postcode area.

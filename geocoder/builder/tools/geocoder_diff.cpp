@@ -812,10 +812,11 @@ int main(int argc, char* argv[]) {
         auto old_data = mmap_file_rw(old_dir + "/admin_polygons.bin");
         auto new_data = mmap_file_rw(new_dir + "/admin_polygons.bin"); // COW: need to zero padding
         if (admin_stride == 24) {
+            // Zero only actual padding bytes (14-15), preserve place_type_override at byte 13
             for (size_t i = 0; i + admin_stride <= old_data.size; i += admin_stride)
-                memset(old_data.data + i + 13, 0, 3);
+                memset(old_data.data + i + 14, 0, 2);
             for (size_t i = 0; i + admin_stride <= new_data.size; i += admin_stride)
-                memset(new_data.data + i + 13, 0, 3);
+                memset(new_data.data + i + 14, 0, 2);
         }
         remap_field(old_data.data, old_data.size, admin_stride, 8, str_remap);
         auto old_v = mmap_file(old_dir + "/admin_vertices.bin");

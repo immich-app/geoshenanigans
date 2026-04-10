@@ -450,7 +450,7 @@ int main(int argc, char* argv[]) {
                         memcpy(rec_buf.data(), old_mmap.data + rec_off, actual_stride);
                         // Apply padding zeroing
                         if (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS && actual_stride == 24)
-                            memset(rec_buf.data() + 13, 0, 3);
+                            memset(rec_buf.data() + 14, 0, 2); // preserve place_type_override at byte 13
                         if (file_id == (uint32_t)PatchFileId::INTERP_WAYS && actual_stride == 24) {
                             memset(rec_buf.data() + 5, 0, 3);
                             memset(rec_buf.data() + 21, 0, 3);
