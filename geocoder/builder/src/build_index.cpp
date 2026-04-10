@@ -78,6 +78,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "  --epsilon-scale F      Multiply all per-level epsilons by F (e.g. 2.0 = 2x coarser)" << std::endl;
         std::cerr << "  --epsilon-levels L2,L3,...,L8  Set epsilon in meters per level (7 values)" << std::endl;
         std::cerr << "  --multi-quality [S,S,...]  Write quality variants at given scales (default: 0,0.2,0.5,1,1.5,2,2.5)" << std::endl;
+        std::cerr << "  --wikidata-sitelinks <path>  Load QID→sitelinks binary for POI importance" << std::endl;
         return 1;
     }
 
@@ -85,6 +86,7 @@ int main(int argc, char* argv[]) {
     std::vector<std::string> input_files;
     std::string save_cache_path;
     std::string load_cache_path;
+    std::string wikidata_sitelinks_path;
     bool multi_output = false;
     bool generate_continents = false;
     IndexMode mode = IndexMode::Full;
@@ -174,6 +176,8 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Error: unknown mode '" << mode_str << "'" << std::endl;
                 return 1;
             }
+        } else if (arg == "--wikidata-sitelinks" && i + 1 < argc) {
+            wikidata_sitelinks_path = argv[++i];
         } else {
             input_files.push_back(arg);
         }
@@ -199,6 +203,29 @@ int main(int argc, char* argv[]) {
     auto _cpu = CpuTicks::now();
 
     std::vector<float> poi_elevations; // build-time only, not in ParsedData
+    std::vector<uint32_t> poi_qids; // build-time only: wikidata QID numbers
+
+    // Load wikidata sitelinks data (QID → sitelinks count)
+    struct QidSitelinks { uint32_t qid; uint16_t count; };
+    std::vector<QidSitelinks> sitelinks_data;
+    if (!wikidata_sitelinks_path.empty()) {
+        std::ifstream sf(wikidata_sitelinks_path, std::ios::binary | std::ios::ate);
+        if (sf) {
+            size_t sz = sf.tellg();
+            sf.seekg(0);
+            sitelinks_data.resize(sz / sizeof(QidSitelinks));
+            sf.read(reinterpret_cast<char*>(sitelinks_data.data()), sz);
+            std::cerr << "Loaded " << sitelinks_data.size() << " wikidata sitelinks entries." << std::endl;
+        }
+    }
+
+    // Helper to look up sitelinks count by QID (binary search since data is sorted)
+    auto lookup_sitelinks = [&sitelinks_data](uint32_t qid) -> uint16_t {
+        auto it = std::lower_bound(sitelinks_data.begin(), sitelinks_data.end(), qid,
+            [](const QidSitelinks& entry, uint32_t q) { return entry.qid < q; });
+        if (it != sitelinks_data.end() && it->qid == qid) return it->count;
+        return 0;
+    };
 
     if (!load_cache_path.empty()) {
         // Load from cache
@@ -442,6 +469,11 @@ int main(int argc, char* argv[]) {
                                 cpr.category = poi_cat;
                                 cpr.tier = tier;
                                 cpr.flags = flags;
+                                cpr.qid = 0;
+                                const char* r_wd = rel.tag("wikidata");
+                                if (r_wd && r_wd[0] == 'Q') {
+                                    cpr.qid = static_cast<uint32_t>(std::strtoul(r_wd + 1, nullptr, 10));
+                                }
                                 cpr.name = poi_name;
 
                                 for (size_t mi = 0; mi < rel.members.size(); mi++) {
@@ -659,6 +691,7 @@ int main(int argc, char* argv[]) {
                     std::vector<PoiRecord> poi_records;
                     std::vector<std::string> poi_names;
                     std::vector<float> poi_elevations;
+                    std::vector<uint32_t> poi_qids;
                     uint64_t poi_count = 0;
                     // Place node data
                     std::vector<PlaceNode> place_nodes;
@@ -773,6 +806,11 @@ int main(int argc, char* argv[]) {
                                 float ele_val = 0;
                                 if (n_ele) { char* end; ele_val = std::strtof(n_ele, &end); if (end == n_ele) ele_val = 0; }
                                 tl_node_data->poi_elevations.push_back(ele_val);
+                                uint32_t qid = 0;
+                                if (n_wikidata && n_wikidata[0] == 'Q') {
+                                    qid = static_cast<uint32_t>(std::strtoul(n_wikidata + 1, nullptr, 10));
+                                }
+                                tl_node_data->poi_qids.push_back(qid);
                                 tl_node_data->poi_count++;
                             }
                         }
@@ -829,6 +867,8 @@ int main(int argc, char* argv[]) {
                     }
                     poi_elevations.insert(poi_elevations.end(),
                         local.poi_elevations.begin(), local.poi_elevations.end());
+                    poi_qids.insert(poi_qids.end(),
+                        local.poi_qids.begin(), local.poi_qids.end());
                     total_poi_nodes += local.poi_count;
                 }
                 // Merge place nodes
@@ -902,6 +942,7 @@ int main(int argc, char* argv[]) {
                         std::string name;
                         std::vector<NodeCoord> vertices;
                         float elevation;
+                        uint32_t qid;
                     };
                     std::vector<PoiWayEntry> poi_ways;
                     // POI way geometries for relation assembly
@@ -1159,7 +1200,11 @@ int main(int argc, char* argv[]) {
 
                             float way_ele = 0;
                             if (t_ele) { char* end; way_ele = std::strtof(t_ele, &end); if (end == t_ele) way_ele = 0; }
-                            local.poi_ways.push_back({pr, t_name, std::move(verts), way_ele});
+                            uint32_t way_qid = 0;
+                            if (t_wikidata && t_wikidata[0] == 'Q') {
+                                way_qid = static_cast<uint32_t>(std::strtoul(t_wikidata + 1, nullptr, 10));
+                            }
+                            local.poi_ways.push_back({pr, t_name, std::move(verts), way_ele, way_qid});
                         }
                     }
 
@@ -1302,6 +1347,7 @@ int main(int argc, char* argv[]) {
                         pw.record.name_id = data.string_pool.intern(pw.name);
                         data.poi_records.push_back(pw.record);
                         poi_elevations.push_back(pw.elevation);
+                        poi_qids.push_back(pw.qid);
                     }
                     local.poi_ways.clear();
                 }
@@ -1593,6 +1639,7 @@ int main(int argc, char* argv[]) {
                             PoiCategory category;
                             uint8_t tier;
                             uint8_t flags;
+                            uint32_t qid;
                         };
 
                         std::vector<std::vector<PoiResult>> thread_poi_results(num_threads);
@@ -1655,6 +1702,7 @@ int main(int argc, char* argv[]) {
                                                 pr.category = rel.category;
                                                 pr.tier = rel.tier;
                                                 pr.flags = rel.flags;
+                                                pr.qid = rel.qid;
                                                 local_results.push_back(std::move(pr));
                                             }
                                         }

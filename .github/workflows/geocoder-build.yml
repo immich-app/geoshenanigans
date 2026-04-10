@@ -233,6 +233,26 @@ jobs:
             echo "pbf_source=mirror" >> "$GITHUB_OUTPUT"
           fi
 
+          # Download wikidata sitelinks (if available)
+          echo "[wikidata] Checking for sitelinks data..."
+          WIKIDATA_LATEST=$(curl -sL "$S3_PUBLIC_URL/geocoder/wikidata/latest.json" 2>/dev/null)
+          WD_DATE=$(echo "$WIKIDATA_LATEST" | jq -r '.dump_date // ""' 2>/dev/null)
+          if [ -n "$WD_DATE" ]; then
+            echo "[wikidata] Found sitelinks from $WD_DATE, downloading..."
+            curl -sL -o "$WORKDIR/qid_sitelinks.bin" \
+              "$S3_PUBLIC_URL/geocoder/wikidata/$WD_DATE/qid_sitelinks.bin" || true
+            if [ -f "$WORKDIR/qid_sitelinks.bin" ] && [ "$(stat -c%s "$WORKDIR/qid_sitelinks.bin")" -gt 1000 ]; then
+              echo "[wikidata] Downloaded: $(( $(stat -c%s "$WORKDIR/qid_sitelinks.bin") / 6 )) entries"
+              echo "wikidata_sitelinks=$WORKDIR/qid_sitelinks.bin" >> "$GITHUB_OUTPUT"
+              echo "wikidata_date=$WD_DATE" >> "$GITHUB_OUTPUT"
+            else
+              echo "[wikidata] Download failed or empty, skipping"
+              rm -f "$WORKDIR/qid_sitelinks.bin"
+            fi
+          else
+            echo "[wikidata] No sitelinks data available"
+          fi
+
           # Wait for index download
           if [ "$HAS_PREVIOUS" = "true" ]; then
             echo "Waiting for index download..."
@@ -312,10 +332,18 @@ jobs:
               "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" &
           fi
 
+          # Build args
+          BUILD_ARGS="--continents --multi-output --multi-quality"
+          WIKIDATA_FILE="${{ steps.download.outputs.wikidata_sitelinks }}"
+          if [ -n "$WIKIDATA_FILE" ] && [ -f "$WIKIDATA_FILE" ]; then
+            BUILD_ARGS="$BUILD_ARGS --wikidata-sitelinks $WIKIDATA_FILE"
+            echo "Using wikidata sitelinks from ${{ steps.download.outputs.wikidata_date }}"
+          fi
+
           echo "Building geocoder index for $TODAY..."
           START=$(date +%s)
           build-index "$WORKDIR/output/" "$WORKDIR/planet.osm.pbf" \
-            --continents --multi-output --multi-quality 2>&1 | tail -10
+            $BUILD_ARGS 2>&1 | tail -10
           echo "Build completed in $(($(date +%s) - START))s"
           echo "$(find "$WORKDIR/output" -name "*.bin" | wc -l) bin files produced"
 
@@ -482,7 +510,8 @@ jobs:
           jq --arg date "$NEW_DATE" \
              --arg previous "$PREV_VAL" \
              --arg built_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-             '. + {date: $date, previous: (if $previous == "null" then null else $previous end), built_at: $built_at}' \
+             --arg wikidata_date "${{ steps.download.outputs.wikidata_date || 'null' }}" \
+             '. + {date: $date, previous: (if $previous == "null" then null else $previous end), built_at: $built_at, wikidata_date: (if $wikidata_date == "null" then null else $wikidata_date end)}' \
              "$WORKDIR/output/manifest.json" > "$WORKDIR/output/manifest.tmp" \
              && mv "$WORKDIR/output/manifest.tmp" "$WORKDIR/output/manifest.json"
           echo "Manifest: $(cat "$WORKDIR/output/manifest.json")"

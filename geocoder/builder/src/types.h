@@ -464,6 +464,7 @@ struct CollectedPoiRelation {
     PoiCategory category;
     uint8_t tier;
     uint8_t flags;
+    uint32_t qid;
     std::string name;
     std::vector<std::pair<int64_t, std::string>> members; // (way_id, role)
 };
