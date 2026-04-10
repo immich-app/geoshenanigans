@@ -228,6 +228,7 @@ fn place_type_to_field(pt: u8) -> Option<&'static str> {
         11 => Some("district"),
         12 => Some("borough"),
         13 => Some("hamlet"),
+        14 => Some("municipality"),
         _ => None,
     }
 }
@@ -273,6 +274,7 @@ fn place_type_to_rank(pt: u8) -> u8 {
         11 => 12, // district [12]
         12 => 18, // borough [18]
         13 => 20, // hamlet  [20]
+        14 => 14, // municipality [14]
         _ => 0,
     }
 }

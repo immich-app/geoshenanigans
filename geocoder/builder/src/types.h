@@ -52,6 +52,7 @@ enum class AdminPlaceType : uint8_t {
     DISTRICT = 11,
     BOROUGH = 12,   // place=borough (distinct field from suburb in Nominatim)
     HAMLET = 13,
+    MUNICIPALITY = 14,  // place=municipality (e.g. Sydney Council L6)
 };
 
 struct AdminPolygon {

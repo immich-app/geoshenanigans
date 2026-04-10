@@ -72,6 +72,7 @@ static PlaceOverride classify_place_override(const char* linked_place, const cha
     else if (std::strcmp(val, "region") == 0) t = AdminPlaceType::REGION;
     else if (std::strcmp(val, "county") == 0) t = AdminPlaceType::COUNTY;
     else if (std::strcmp(val, "district") == 0) t = AdminPlaceType::DISTRICT;
+    else if (std::strcmp(val, "municipality") == 0) t = AdminPlaceType::MUNICIPALITY;
     return {t, true};
 }
 
