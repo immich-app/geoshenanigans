@@ -1086,7 +1086,7 @@ impl Index {
         }).collect();
 
         // Merge admin + place results (admin authoritative, place as fallback)
-        let address = AddressDetails {
+        let mut address = AddressDetails {
             house_number,
             road,
             city: admin.city.or(place.city),
@@ -1102,6 +1102,25 @@ impl Index {
             country: admin.country,
             country_code: admin.country_code.map(|c| String::from_utf8_lossy(&c).into_owned()),
         };
+
+        // Final cross-source dedup: admin and place-node lookups populate
+        // fields independently, so the same name can land in both suburb
+        // (from admin) and city_district (from a different admin row), or
+        // in city (from place node) and suburb (from admin). Clear the
+        // less-specific field when names collide.
+        if let Some(city) = address.city {
+            if address.municipality == Some(city) { address.municipality = None; }
+            if address.county == Some(city) { address.county = None; }
+            if address.city_district == Some(city) { address.city_district = None; }
+            if address.suburb == Some(city) { address.suburb = None; }
+        }
+        if let Some(municipality) = address.municipality {
+            if address.county == Some(municipality) { address.county = None; }
+        }
+        if let Some(suburb) = address.suburb {
+            if address.city_district == Some(suburb) { address.city_district = None; }
+            if address.neighbourhood == Some(suburb) { address.neighbourhood = None; }
+        }
         let display_name = format_address(&address);
         Address { display_name, address, places }
     }
