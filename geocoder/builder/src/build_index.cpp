@@ -49,9 +49,13 @@ struct PlaceOverride {
                         // value is state/country/... which we don't translate to an override).
 };
 
-static PlaceOverride classify_place_override(const char* linked_place, const char* border_type, const char* place_tag) {
-    // Priority: linked_place > border_type > place (for boundary=place)
-    const char* val = linked_place ? linked_place : (border_type ? border_type : place_tag);
+static PlaceOverride classify_place_override(const char* linked_place, const char* /*border_type_unused*/, const char* place_tag) {
+    // Nominatim's get_label_tag (classtypes.py) only checks
+    //   extratags['place']  and  extratags['linked_place']
+    // to short-circuit ADMIN_LABELS; `border_type` is kept in extratags
+    // but NOT read by the labeller. So for Nominatim-parity we only honour
+    // `linked_place` and a direct `place` tag on the boundary.
+    const char* val = linked_place ? linked_place : place_tag;
     bool present = (val != nullptr && val[0] != '\0');
     if (!present) return {AdminPlaceType::NONE, false};
     AdminPlaceType t = AdminPlaceType::NONE;
