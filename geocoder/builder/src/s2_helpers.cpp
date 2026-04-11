@@ -231,11 +231,18 @@ void add_addr_point(ParsedData& data, double lat, double lng,
                     const char* postcode,
                     uint64_t& addr_count_total) {
     uint32_t addr_id = static_cast<uint32_t>(data.addr_points.size());
+    // Store NO_DATA as the street_id sentinel when addr:street is
+    // missing — the post-way parent-street backfill replaces these
+    // with the nearest named way's name_id (mirrors Nominatim's
+    // parent_place_id resolution).
+    uint32_t street_id = (street && street[0])
+        ? data.string_pool.intern(street)
+        : NO_DATA;
     data.addr_points.push_back({
         static_cast<float>(lat),
         static_cast<float>(lng),
         data.string_pool.intern(housenumber),
-        data.string_pool.intern(street),
+        street_id,
         (postcode && postcode[0]) ? data.string_pool.intern(postcode) : NO_DATA
     });
 

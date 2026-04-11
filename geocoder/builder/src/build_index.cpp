@@ -1067,9 +1067,17 @@ int main(int argc, char* argv[]) {
                                     break;
                             }
                         }
-                        if (housenumber && street) {
+                        if (housenumber) {
+                            // Nominatim's IsAddressPoint accepts any
+                            // rank-30 row with a housenumber, even
+                            // without addr:street — it resolves the
+                            // street via parent_place_id. We index
+                            // the node regardless of addr:street and
+                            // backfill the street later via a
+                            // nearest-named-street sweep. Empty
+                            // street sentinel = "needs backfill".
                             tl_node_data->addr_coords.push_back({lat, lng});
-                            tl_node_data->addr_strings.push_back({housenumber, street});
+                            tl_node_data->addr_strings.push_back({housenumber, street ? street : ""});
                             tl_node_data->addr_postcodes.push_back(postcode ? postcode : "");
                             tl_node_data->count++;
                         }
@@ -1440,22 +1448,24 @@ int main(int argc, char* argv[]) {
                         return;
                     }
 
-                    // Building addresses
+                    // Building addresses — index regardless of whether
+                    // addr:street is present. Missing streets are
+                    // backfilled via the nearest-named-street sweep
+                    // after way indexing, matching Nominatim's
+                    // parent_place_id resolution behaviour.
                     const char* housenumber = t_housenumber;
-                    if (housenumber) {
+                    if (housenumber && refs_size > 0) {
                         const char* street = t_street;
-                        if (street && refs_size > 0) {
-                            double sum_lat = 0, sum_lng = 0; int valid = 0;
-                            for (const auto& loc : resolved_locs) {
-                                if (loc.valid()) { sum_lat += loc.lat(); sum_lng += loc.lon(); valid++; }
-                            }
-                            if (valid > 0) {
-                                local.building_addr_coords.push_back({sum_lat/valid, sum_lng/valid});
-                                local.building_addrs.push_back({static_cast<float>(sum_lat/valid), static_cast<float>(sum_lng/valid), 0, 0, 0});
-                                local.addr_strings.push_back({housenumber, street});
-                                local.addr_postcodes.push_back(t_postcode ? t_postcode : "");
-                                local.building_addr_count++;
-                            }
+                        double sum_lat = 0, sum_lng = 0; int valid = 0;
+                        for (const auto& loc : resolved_locs) {
+                            if (loc.valid()) { sum_lat += loc.lat(); sum_lng += loc.lon(); valid++; }
+                        }
+                        if (valid > 0) {
+                            local.building_addr_coords.push_back({sum_lat/valid, sum_lng/valid});
+                            local.building_addrs.push_back({static_cast<float>(sum_lat/valid), static_cast<float>(sum_lng/valid), 0, 0, 0});
+                            local.addr_strings.push_back({housenumber, street ? street : ""});
+                            local.addr_postcodes.push_back(t_postcode ? t_postcode : "");
+                            local.building_addr_count++;
                         }
                     }
 
@@ -2599,6 +2609,134 @@ int main(int argc, char* argv[]) {
                           << " POIs linked to a named street in "
                           << _elapsed << "s" << std::endl;
                 log_phase("  POI: parent-street linking", _s2t, _s2cpu);
+            }
+
+            // --- Address-point parent-street backfill ---
+            //
+            // Nominatim indexes any rank-30 row with addr:housenumber
+            // as an address point and resolves its street via
+            // parent_place_id at import time. Our node/way extraction
+            // now accepts housenumber without addr:street — those
+            // rows are stored with street_id == NO_DATA and need to
+            // be backfilled with the name_id of the nearest named
+            // street. We iterate addr_points in parallel, looking up
+            // candidate ways via sorted_way_cells at L17 (same as the
+            // POI sweep above) and assign the closest named-way's
+            // name_id.
+            if (!data.addr_points.empty() && !data.ways.empty()) {
+                auto _as_t = std::chrono::steady_clock::now();
+                auto _as_cpu = CpuTicks::now();
+                std::atomic<uint64_t> backfill_candidates{0};
+                for (const auto& p : data.addr_points) {
+                    if (p.street_id == NO_DATA) backfill_candidates.fetch_add(1);
+                }
+                std::cerr << "Backfilling addr_point parent streets ("
+                          << backfill_candidates.load() << "/"
+                          << data.addr_points.size() << " need it)..."
+                          << std::endl;
+
+                std::atomic<size_t> ap_idx{0};
+                std::atomic<uint64_t> ap_linked{0};
+                std::vector<std::thread> ap_workers;
+                for (unsigned int t = 0; t < num_threads; t++) {
+                    ap_workers.emplace_back([&]() {
+                        std::vector<uint64_t> cells_to_check;
+                        while (true) {
+                            size_t i = ap_idx.fetch_add(1);
+                            if (i >= data.addr_points.size()) break;
+                            auto& ap = data.addr_points[i];
+                            if (ap.street_id != NO_DATA) continue;
+
+                            float plat = ap.lat;
+                            float plng = ap.lng;
+                            S2CellId center = S2CellId(
+                                S2LatLng::FromDegrees(plat, plng))
+                                .parent(kStreetCellLevel);
+                            cells_to_check.clear();
+                            cells_to_check.push_back(center.id());
+                            std::vector<S2CellId> ring1;
+                            center.AppendAllNeighbors(kStreetCellLevel, &ring1);
+                            for (const auto& n : ring1) {
+                                cells_to_check.push_back(n.id());
+                                std::vector<S2CellId> ring2;
+                                n.AppendAllNeighbors(kStreetCellLevel, &ring2);
+                                for (const auto& n2 : ring2) {
+                                    cells_to_check.push_back(n2.id());
+                                }
+                            }
+                            std::sort(cells_to_check.begin(), cells_to_check.end());
+                            cells_to_check.erase(
+                                std::unique(cells_to_check.begin(), cells_to_check.end()),
+                                cells_to_check.end());
+
+                            double best_d2 = 1e18;
+                            uint32_t best_name = NO_DATA;
+                            const double cos_lat = std::cos(
+                                plat * M_PI / 180.0);
+                            for (uint64_t cid : cells_to_check) {
+                                CellItemPair probe{cid, 0};
+                                auto lo = std::lower_bound(
+                                    data.sorted_way_cells.begin(),
+                                    data.sorted_way_cells.end(), probe,
+                                    [](const CellItemPair& a, const CellItemPair& b) {
+                                        return a.cell_id < b.cell_id ||
+                                               (a.cell_id == b.cell_id && a.item_id < b.item_id);
+                                    });
+                                for (auto p = lo;
+                                     p != data.sorted_way_cells.end() && p->cell_id == cid;
+                                     ++p) {
+                                    uint32_t way_id = p->item_id;
+                                    if (way_id >= data.ways.size()) continue;
+                                    const auto& w = data.ways[way_id];
+                                    if (w.name_id == NO_DATA) continue;
+                                    uint32_t off = w.node_offset;
+                                    uint8_t cnt = w.node_count;
+                                    if (cnt < 2) continue;
+                                    if (static_cast<size_t>(off) + cnt > data.street_nodes.size()) continue;
+                                    for (uint8_t k = 0; k + 1 < cnt; k++) {
+                                        const auto& a = data.street_nodes[off + k];
+                                        const auto& b = data.street_nodes[off + k + 1];
+                                        double ax = (a.lng - plng) * cos_lat;
+                                        double ay = (a.lat - plat);
+                                        double bx = (b.lng - plng) * cos_lat;
+                                        double by = (b.lat - plat);
+                                        double dx = bx - ax;
+                                        double dy = by - ay;
+                                        double seg_len2 = dx * dx + dy * dy;
+                                        double d2;
+                                        if (seg_len2 < 1e-18) {
+                                            d2 = ax * ax + ay * ay;
+                                        } else {
+                                            double tt = -(ax * dx + ay * dy) / seg_len2;
+                                            if (tt < 0.0) tt = 0.0;
+                                            else if (tt > 1.0) tt = 1.0;
+                                            double qx = ax + tt * dx;
+                                            double qy = ay + tt * dy;
+                                            d2 = qx * qx + qy * qy;
+                                        }
+                                        if (d2 < best_d2) {
+                                            best_d2 = d2;
+                                            best_name = w.name_id;
+                                        }
+                                    }
+                                }
+                            }
+                            if (best_name != NO_DATA) {
+                                ap.street_id = best_name;
+                                ap_linked.fetch_add(1);
+                            }
+                        }
+                    });
+                }
+                for (auto& w : ap_workers) w.join();
+                double _ap_elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - _as_t).count();
+                std::cerr << "Addr parent-street backfill: "
+                          << ap_linked.load() << "/"
+                          << backfill_candidates.load()
+                          << " addr_points linked in "
+                          << _ap_elapsed << "s" << std::endl;
+                log_phase("  Addr: parent-street backfill", _as_t, _as_cpu);
             }
 
             // Free deferred work items
