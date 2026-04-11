@@ -2491,19 +2491,34 @@ int main(int argc, char* argv[]) {
                             float plat = pr.lat;
                             float plng = pr.lng;
 
-                            // Query cell + 8 neighbours (S2 L10 = ~10km,
-                            // so 3x3 grid covers ~30km).
+                            // cell_to_ways is indexed at kStreetCellLevel
+                            // (L17, ~300m per cell). We walk the centre
+                            // plus a 5×5 ring of neighbours = ~1.5km
+                            // coverage — enough for any POI to find its
+                            // nearest named street but tight enough to
+                            // avoid quadratic blow-up.
                             S2CellId center = S2CellId(
                                 S2LatLng::FromDegrees(plat, plng))
-                                .parent(kAdminCellLevel);
+                                .parent(kStreetCellLevel);
                             cells_to_check.clear();
                             cells_to_check.push_back(center.id());
-                            std::vector<S2CellId> neighbours;
+                            std::vector<S2CellId> ring1;
                             center.AppendAllNeighbors(
-                                kAdminCellLevel, &neighbours);
-                            for (const auto& n : neighbours) {
+                                kStreetCellLevel, &ring1);
+                            for (const auto& n : ring1) {
                                 cells_to_check.push_back(n.id());
+                                std::vector<S2CellId> ring2;
+                                n.AppendAllNeighbors(
+                                    kStreetCellLevel, &ring2);
+                                for (const auto& n2 : ring2) {
+                                    cells_to_check.push_back(n2.id());
+                                }
                             }
+                            // De-duplicate expansion.
+                            std::sort(cells_to_check.begin(), cells_to_check.end());
+                            cells_to_check.erase(
+                                std::unique(cells_to_check.begin(), cells_to_check.end()),
+                                cells_to_check.end());
 
                             double best_d2 = 1e18;
                             uint32_t best_name = 0xFFFFFFFFu;
