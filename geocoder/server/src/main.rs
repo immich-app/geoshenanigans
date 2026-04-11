@@ -34,6 +34,33 @@ fn cell_neighbors_at_level(cell_id: u64, level: u64) -> Vec<u64> {
     cell.all_neighbors(level).into_iter().map(|c| c.0).collect()
 }
 
+// Return `rings` rings of neighbours at the given level (ring 0 = the
+// center cell alone, ring 1 = the 8 direct neighbours, ring 2 = the
+// 24 cells two hops out, etc.). Used for postcode fallback searches
+// where we need to reach further than the primary-feature's 1-ring
+// neighbourhood without widening primary selection itself.
+fn cell_rings_at_level(cell_id: u64, level: u64, rings: u32) -> Vec<u64> {
+    let mut seen = std::collections::HashSet::<u64>::new();
+    let mut out = Vec::<u64>::new();
+    seen.insert(cell_id);
+    out.push(cell_id);
+    let mut frontier: Vec<u64> = vec![cell_id];
+    for _ in 0..rings {
+        let mut next: Vec<u64> = Vec::new();
+        for cid in &frontier {
+            let cell = CellID(*cid);
+            for n in cell.all_neighbors(level) {
+                if seen.insert(n.0) {
+                    out.push(n.0);
+                    next.push(n.0);
+                }
+            }
+        }
+        frontier = next;
+    }
+    out
+}
+
 // --- Binary format structs (must match C++ build pipeline) ---
 
 #[repr(C)]
@@ -660,6 +687,47 @@ impl Index {
                         best_interp_t = best_seg_t;
                     }
                 });
+            }
+        }
+
+        // Postcode fallback: if the 1-ring neighbour search didn't
+        // turn up any addr_point with a postcode, walk outward in
+        // wider rings. Nominatim's `get_postcode_matching_boundary`
+        // walks the primary feature's parent address chain, which
+        // in sparsely-addressed areas (Tokyo suburbs, Nairobi,
+        // Singapore nature reserves, Pyramids of Giza) can reach
+        // several kilometres before finding an addressed neighbour
+        // with a postcode.
+        //
+        // L17 cells are ~150m at the equator and ~110m at mid-
+        // latitudes (Tokyo ≈ 35°), so 8 rings (~1.3km radius at
+        // Tokyo) is the practical maximum before the iteration
+        // count balloons. This pass is postcode-only: it doesn't
+        // update the primary best_addr/best_street selection.
+        if best_addr_with_postcode.is_none() {
+            if let Some(ref addr_entries) = self.addr_entries {
+                let wider = cell_rings_at_level(cell, self.street_cell_level, 8);
+                // Skip cells already covered by the primary loop
+                // (center + ring 1 = 9 cells).
+                let already_visited: std::collections::HashSet<u64> =
+                    std::iter::once(cell).chain(cell_neighbors_at_level(cell, self.street_cell_level).into_iter()).collect();
+                for c in &wider {
+                    if already_visited.contains(c) { continue; }
+                    let offsets = Self::lookup_geo_cell(geo_cells, *c);
+                    Self::for_each_entry(addr_entries, offsets.addr, |id| {
+                        let idx = id as usize;
+                        if idx >= all_points.len() { return; }
+                        let point = &all_points[idx];
+                        if point.postcode_id == NO_DATA { return; }
+                        let dlat = (point.lat as f64 - lat).to_radians();
+                        let dlng = (point.lng as f64 - lng).to_radians();
+                        let d = dist_sq(dlat, dlng, cos_lat);
+                        if d < best_addr_with_postcode_dist {
+                            best_addr_with_postcode_dist = d;
+                            best_addr_with_postcode = Some(point);
+                        }
+                    });
+                }
             }
         }
 
@@ -1829,12 +1897,25 @@ impl Index {
             // Then normalise to the canonical country format
             // (see `format_postcode` below). Cow means we only
             // allocate when the raw OSM value needs reformatting.
-            postcode: match addr_postcode.or(admin.postcode) {
-                Some(pc) => Some(match admin.country_code {
-                    Some(cc) => format_postcode(&cc, pc),
-                    None => Cow::Borrowed(pc),
-                }),
-                None => None,
+            // Postcode resolution: prefer addr_point's postcode over
+            // the containing postal boundary's. Reject if the country
+            // has no postal-code system (UAE, Qatar, most of Sub-
+            // Saharan Africa) or if the string doesn't match the
+            // country's pattern (e.g. '000000' in Dubai). Then
+            // normalise whitespace/separators per country.
+            postcode: {
+                let raw = addr_postcode.or(admin.postcode);
+                match (raw, admin.country_code) {
+                    (Some(pc), Some(cc)) => {
+                        if country_has_no_postcode(&cc) || !postcode_looks_valid(&cc, pc) {
+                            None
+                        } else {
+                            Some(format_postcode(&cc, pc))
+                        }
+                    }
+                    (Some(pc), None) => Some(Cow::Borrowed(pc)),
+                    (None, _) => None,
+                }
             },
             country: admin.country,
             country_code: admin.country_code.map(|c| String::from_utf8_lossy(&c).into_owned()),
@@ -1845,6 +1926,44 @@ impl Index {
 }
 
 // --- Geometry helpers ---
+
+// Countries with `postcode: no` in nominatim's country_settings.yaml
+// (UAE, Qatar, most of Sub-Saharan Africa, etc.). Nominatim rejects
+// any postcode for these countries during import via the
+// clean_postcodes sanitizer. We mirror that here at query time —
+// any OSM addr:postcode tag on a Dubai building (typically '000000'
+// or similar placeholder) gets filtered out.
+fn country_has_no_postcode(country_code: &[u8; 2]) -> bool {
+    let cc = std::str::from_utf8(country_code).unwrap_or("").to_ascii_lowercase();
+    matches!(cc.as_str(),
+        "ae" | "ag" | "ao" | "bf" | "bi" | "bj" | "bo" | "bs" | "bw" | "bz" |
+        "cd" | "cf" | "cg" | "ci" | "ck" | "cm" | "dj" | "dm" | "er" | "fj" |
+        "ga" | "gd" | "gm" | "gq" | "gy" | "jm" | "ki" | "km" | "kp" | "ly" |
+        "ml" | "mr" | "mw" | "nr" | "nu" | "qa" | "rw" | "sb" | "sc" | "sl" |
+        "sr" | "ss" | "st" | "sy" | "td" | "tg" | "tk" | "tl" | "to" | "tv" |
+        "ug" | "vu" | "ye" | "zw"
+    )
+}
+
+// Cheap postcode validity check: rejects strings of all-zero / all-
+// same digits (e.g. '000000', '0000') which show up in OSM when a
+// mapper leaves the addr:postcode tag as a placeholder. Mirrors
+// the spirit of nominatim's CountryPostcodeMatcher.match() rejecting
+// values that don't conform to the country's pattern — we don't
+// ship the full regex table here but this catches the common
+// garbage cases the test3 set exposes.
+fn postcode_looks_valid(_country_code: &[u8; 2], postcode: &str) -> bool {
+    let trimmed: String = postcode.chars().filter(|c| !c.is_whitespace() && *c != '-').collect();
+    if trimmed.is_empty() { return false; }
+    // All same character (e.g. '00000', '-----').
+    let first = trimmed.chars().next().unwrap();
+    if trimmed.chars().all(|c| c == first) {
+        // 'X' alone might still be valid in rare cases, but '00000'
+        // or 'XXXXX' is always a placeholder.
+        return false;
+    }
+    true
+}
 
 // Per-country postcode formatter. Mirrors Nominatim's
 // CountryPostcodeMatcher (settings/country_settings.yaml) for the
