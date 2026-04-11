@@ -1471,11 +1471,18 @@ impl Index {
                     }
                 }
             } else {
-                // Street is closest — use the street name, no housenumber.
+                // Street is closest — use the street name with no
+                // housenumber. We deliberately don't walk to a nearby
+                // addressed point on the same street: Nominatim's
+                // _find_closest_street_or_pois refinement fires on
+                // `IsAddressPoint` rows (addressable building-level
+                // POIs with rank_search=30) which aren't the same set
+                // as our raw addr_points. Walking blindly to the
+                // nearest addr_point adds spurious house numbers to
+                // pedestrian plaza / square queries where Nominatim
+                // returns no house number at all.
                 let (_, way) = street.unwrap();
                 road = Some(self.get_string(way.name_id));
-                // If an addressed point exists nearby on (presumably)
-                // the same road, take its postcode as a fallback.
                 if let Some((ad, ap)) = addr {
                     if ad - street_dist < hnr_tolerance_sq && ap.postcode_id != NO_DATA {
                         addr_postcode = Some(self.get_string(ap.postcode_id));

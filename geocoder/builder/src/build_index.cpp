@@ -1307,6 +1307,7 @@ int main(int argc, char* argv[]) {
                     const char* t_street = nullptr;
                     const char* t_postcode = nullptr;
                     const char* t_highway = nullptr;
+                    const char* t_footway = nullptr;
                     const char* t_name = nullptr;
                     const char* t_name_en = nullptr;
                     const char* t_boundary = nullptr;
@@ -1354,6 +1355,7 @@ int main(int argc, char* argv[]) {
                                 break;
                             case 'c': if (k == "craft") t_craft = v; break;
                             case 'e': if (k == "ele") t_ele = v; break;
+                            case 'f': if (k == "footway") t_footway = v; break;
                             case 'h':
                                 if (k == "highway") t_highway = v;
                                 else if (k == "historic") t_historic = v;
@@ -1396,7 +1398,7 @@ int main(int argc, char* argv[]) {
 
                     // Early exit: if no relevant tags, skip expensive node resolution
                     bool need_nodes = t_interpolation || t_housenumber ||
-                        (t_highway && is_included_highway(t_highway) && t_name) ||
+                        (t_highway && is_included_highway_full(t_highway, t_footway) && t_name) ||
                         t_boundary ||
                         (refs_size > 0 && is_admin_way(way_id)) ||
                         (has_poi_tags && t_name) ||
@@ -1458,7 +1460,7 @@ int main(int argc, char* argv[]) {
                     }
 
                     // Highway ways
-                    if (t_highway && is_included_highway(t_highway)) {
+                    if (t_highway && is_included_highway_full(t_highway, t_footway)) {
                         if (t_best_name && refs_size >= 2 && all_valid) {
                             uint32_t wid = static_cast<uint32_t>(local.ways.size());
                             uint32_t noff = static_cast<uint32_t>(local.street_nodes.size());

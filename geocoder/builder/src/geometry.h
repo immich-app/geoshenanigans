@@ -281,15 +281,40 @@ inline uint32_t parse_house_number(const char* s) {
 // too because the caller already gates on a non-empty name. Only
 // construction and bridleway are excluded.
 //
-// Pedestrian inclusion pairs with the closest-feature primary
-// selection in the server (query.rs): when a query sits on a
-// pedestrianised plaza Nominatim hits, we now also pick the plaza's
-// named highway=pedestrian way instead of the nearest addressed
-// residential street.
+// footway subtype filter is handled by is_included_footway_subtype
+// below — Nominatim's filter_footways excludes sidewalk / crossing /
+// link / traffic_aisle even when the footway has a name, because
+// those are structural subdivisions of a parent road rather than
+// addressable features in their own right.
 inline bool is_included_highway(const char* value) {
     switch (value[0]) {
         case 'c': return std::strcmp(value, "construction") != 0;
         case 'b': return std::strcmp(value, "bridleway") != 0;
         default: return true;
     }
+}
+
+// Mirrors lua/themes/nominatim/presets.lua filter_footways: excludes
+// footway=sidewalk / crossing / link / traffic_aisle even on named
+// ways. Called when highway==footway; other highway types ignore the
+// footway tag.
+inline bool is_included_footway_subtype(const char* footway) {
+    if (footway == nullptr) return true; // named footway with no subtype
+    switch (footway[0]) {
+        case 's': return std::strcmp(footway, "sidewalk") != 0;
+        case 'c': return std::strcmp(footway, "crossing") != 0;
+        case 'l': return std::strcmp(footway, "link") != 0;
+        case 't': return std::strcmp(footway, "traffic_aisle") != 0;
+        default: return true;
+    }
+}
+
+// Convenience: full highway acceptance check including footway
+// subtype filter for highway=footway ways.
+inline bool is_included_highway_full(const char* highway, const char* footway) {
+    if (!is_included_highway(highway)) return false;
+    if (std::strcmp(highway, "footway") == 0) {
+        return is_included_footway_subtype(footway);
+    }
+    return true;
 }
