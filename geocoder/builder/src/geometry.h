@@ -273,22 +273,23 @@ inline uint32_t parse_house_number(const char* s) {
     return n;
 }
 
-// Highway types excluded from street indexing. Matches Nominatim's
-// rank-26..29 MAIN_TAGS_STREETS preset (includes pedestrian, footway,
-// path, track, service). These were previously excluded because
-// without POI-as-primary-feature matching we picked sidewalks and
-// service tunnels over the intended main road; with the addr_point
-// and POI primary-feature paths now in place, the guarded types are
-// necessary to match Nominatim on pedestrianised squares / plazas
-// (Mexico City Zócalo, Paris City Hall Plaza, Red Square, Singapore
-// MacRitchie Nature Trail, Sydney Northern Broadwalk, Giza Causeway).
-// Still excluded: steps (stairs, not addresses), cycleway (dedicated
-// bike paths, rarely match a Nominatim primary), construction,
-// bridleway.
+// Highway types excluded from street indexing. Includes pedestrian,
+// footway, path, track — the named pedestrianised plazas and trails
+// that Nominatim picks on squares like Mexico City's Zócalo, Paris
+// City Hall Plaza, Moscow Red Square, Singapore MacRitchie Nature
+// Trail, Sydney Northern Broadwalk, Giza Causeway.
+//
+// Still excluded:
+//   - service: service tunnels / alleys that run closer to the query
+//     than the actual named road (Treasury Annex Tunnel steals
+//     primary from 1600 Pennsylvania Ave otherwise).
+//   - steps: stairs, not address features.
+//   - cycleway, construction, bridleway: rarely match a nominatim
+//     primary and introduce more noise than signal.
 inline bool is_included_highway(const char* value) {
     // Fast rejection by first character — avoids many strcmp calls.
     switch (value[0]) {
-        case 's': return std::strcmp(value, "steps") != 0;
+        case 's': return std::strcmp(value, "steps") != 0 && std::strcmp(value, "service") != 0;
         case 'c': return std::strcmp(value, "cycleway") != 0 && std::strcmp(value, "construction") != 0;
         case 'b': return std::strcmp(value, "bridleway") != 0;
         default: return true;
