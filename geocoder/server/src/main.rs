@@ -1411,41 +1411,84 @@ impl Index {
         let place = self.find_places(lat, lng);
         let (addr, interp, street, nearest_with_postcode) = self.query_geo(lat, lng);
 
-        // Determine house_number and road from best geo match (priority: address > interpolation > street)
+        // Primary-feature selection: match Nominatim's reverse flow —
+        // pick the closest rank-26+ feature (road OR addressable POI),
+        // then refine with a house number if one sits on the selected
+        // road within a small radius.
+        //
+        // Nominatim runs one query (`_find_closest_street_or_pois`) that
+        // returns the closest named feature at rank 26+. If that feature
+        // is a road (`rank_address <= 27`), it does a second query for
+        // house numbers on the same road within ~100m and uses that as
+        // the final match. We approximate this by comparing distances
+        // between the nearest address point, interpolation segment, and
+        // raw street way — whichever is closest becomes the primary.
+        //
+        // Prior behaviour (addr always wins) was too strong: it picked
+        // `120 South Main Street` even when the Nominatim-equivalent
+        // closest feature was a nearby pedestrian plaza with no
+        // addressed point. This left us with a wrong road name + a
+        // spurious house number on test points that sit on non-
+        // residential ways.
         let mut house_number: Option<Cow<'_, str>> = None;
         let mut road: Option<&str> = None;
         let mut addr_postcode: Option<&str> = None;
 
-        if let Some((dist, point)) = addr {
-            if dist < max_dist {
+        let addr_dist = addr.as_ref().map(|(d, _)| *d).unwrap_or(f64::MAX);
+        let interp_dist = interp.as_ref().map(|(d, _, _)| *d).unwrap_or(f64::MAX);
+        let street_dist = street.as_ref().map(|(d, _)| *d).unwrap_or(f64::MAX);
+
+        // Nominatim's housenumber refinement radius is 0.001 deg ≈ 100m
+        // (hnr_distance tolerance in `_find_closest_street_or_pois`).
+        let hnr_tolerance_sq = (0.001_f64).to_radians().powi(2);
+
+        let closest_feature_dist = addr_dist.min(interp_dist).min(street_dist);
+        if closest_feature_dist < max_dist {
+            // Whichever feature class has the smallest distance wins —
+            // but if the closest was an address and the nearest street
+            // is further by more than the housenumber tolerance, use
+            // the street instead. This mirrors Nominatim's "road first,
+            // housenumber refine" flow for points that sit on a road
+            // with no nearby addressed building.
+            if addr_dist <= interp_dist && addr_dist <= street_dist {
+                // Address is closest — use it with its housenumber.
+                let (_, point) = addr.unwrap();
                 house_number = Some(Cow::Borrowed(self.get_string(point.housenumber_id)));
                 road = Some(self.get_string(point.street_id));
                 if point.postcode_id != NO_DATA {
                     addr_postcode = Some(self.get_string(point.postcode_id));
                 }
+            } else if interp_dist <= addr_dist && interp_dist <= street_dist {
+                // Interpolation segment is closest.
+                let (_, street_name, number) = interp.unwrap();
+                house_number = Some(Cow::Owned(number.to_string()));
+                road = Some(street_name);
+                // If an address is close enough to the interpolation,
+                // prefer its postcode.
+                if let Some((ad, ap)) = addr {
+                    if ad - interp_dist < hnr_tolerance_sq && ap.postcode_id != NO_DATA {
+                        addr_postcode = Some(self.get_string(ap.postcode_id));
+                    }
+                }
+            } else {
+                // Street is closest — use the street name, no housenumber.
+                let (_, way) = street.unwrap();
+                road = Some(self.get_string(way.name_id));
+                // If an addressed point exists nearby on (presumably)
+                // the same road, take its postcode as a fallback.
+                if let Some((ad, ap)) = addr {
+                    if ad - street_dist < hnr_tolerance_sq && ap.postcode_id != NO_DATA {
+                        addr_postcode = Some(self.get_string(ap.postcode_id));
+                    }
+                }
             }
         }
-        // Nominatim fallback: if the closest address lacks a postcode, use
-        // the nearest address in the search region that has one.
+        // Nominatim fallback: if no postcode yet, walk to the nearest
+        // address point that has one.
         if addr_postcode.is_none() {
             if let Some(p) = nearest_with_postcode {
                 if p.postcode_id != NO_DATA {
                     addr_postcode = Some(self.get_string(p.postcode_id));
-                }
-            }
-        }
-        if road.is_none() {
-            if let Some((dist, street_name, number)) = interp {
-                if dist < max_dist {
-                    house_number = Some(Cow::Owned(number.to_string()));
-                    road = Some(street_name);
-                }
-            }
-        }
-        if road.is_none() {
-            if let Some((dist, way)) = street {
-                if dist < max_dist {
-                    road = Some(self.get_string(way.name_id));
                 }
             }
         }
