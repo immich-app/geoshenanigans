@@ -18,7 +18,11 @@ use std::sync::{Arc, RwLock};
 
 const DEFAULT_STREET_CELL_LEVEL: u64 = 17;
 const DEFAULT_ADMIN_CELL_LEVEL: u64 = 10;
-const DEFAULT_SEARCH_DISTANCE: f64 = 75.0;
+// Default primary-feature search radius. Matches Nominatim's
+// lookup_street_poi default of 0.006 degrees ≈ 660m. This is the
+// radius inside which we'll accept a street/addr/interp/POI as the
+// primary feature for the reverse result.
+const DEFAULT_SEARCH_DISTANCE: f64 = 660.0;
 
 fn cell_id_at_level(lat: f64, lng: f64, level: u64) -> u64 {
     let ll = LatLng::from_degrees(lat, lng);
@@ -351,8 +355,12 @@ fn mmap_file_optional(path: &str) -> Option<Mmap> {
 
 impl Index {
     fn load(dir: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Self, String> {
-        let meters_to_rad = search_distance / 111_320.0;
-        let max_distance_sq = meters_to_rad * meters_to_rad;
+        // Distance budget used by the primary-feature selection. The
+        // internal distances are stored in radians² (via `to_radians()`
+        // before squaring), so convert metres → radians → radians².
+        // Earth radius is 6 371 000 m.
+        let radians = search_distance / 6_371_000.0;
+        let max_distance_sq = radians * radians;
 
         let geo_cells = mmap_file_optional(&format!("{}/geo_cells.bin", dir));
         let has_geo = geo_cells.is_some();
@@ -1609,7 +1617,22 @@ impl Index {
         // We look up the nearest POI with a pre-computed parent_street_id
         // and treat it as a 4th candidate alongside address / interp /
         // street.
-        let poi_primary = self.find_nearest_poi_with_parent(lat, lng);
+        //
+        // Gated to ~100m: we don't index unnamed residential ways, so
+        // without a radius cap the nearest named POI wins on queries
+        // that fall on an unnamed road (Tokyo suburban residentials),
+        // injecting a wrong road name into results where Nominatim
+        // returns none. Nominatim's `_find_closest_street_or_pois`
+        // uses 0.006 deg (~660m) but its set also contains unnamed
+        // streets (rank_search=26, name=''), which win at 0m and
+        // suppress far POIs — we approximate that by capping the
+        // POI contribution to 100m.
+        let poi_primary_raw = self.find_nearest_poi_with_parent(lat, lng);
+        let poi_max_sq = {
+            let r = 100.0_f64 / 6_371_000.0;
+            r * r
+        };
+        let poi_primary = poi_primary_raw.filter(|(d, _)| *d <= poi_max_sq);
 
         let addr_dist = addr.as_ref().map(|(d, _)| *d).unwrap_or(f64::MAX);
         // Nominatim's `_find_closest_street_or_pois` queries the placex
