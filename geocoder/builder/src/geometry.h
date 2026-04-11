@@ -273,48 +273,31 @@ inline uint32_t parse_house_number(const char* s) {
     return n;
 }
 
-// Matches Nominatim's default MAIN_TAGS_STREETS preset
-// (lib-lua/themes/nominatim/presets.lua). Always-include: motorway,
-// trunk, primary, secondary, tertiary, unclassified, residential,
-// road, living_street, pedestrian. "Named only" types (service,
-// cycleway, path, footway, steps, track) flow through this filter
-// too because the caller already gates on a non-empty name. Only
-// construction and bridleway are excluded.
-//
-// footway subtype filter is handled by is_included_footway_subtype
-// below — Nominatim's filter_footways excludes sidewalk / crossing /
-// link / traffic_aisle even when the footway has a name, because
-// those are structural subdivisions of a parent road rather than
-// addressable features in their own right.
+// Highway types excluded from street indexing. Approximates
+// Nominatim's default MAIN_TAGS_STREETS preset but is intentionally
+// tighter: we exclude pedestrian/path/footway/steps/track/service/
+// cycleway because without POI-as-primary-feature matching, including
+// them makes us pick pedestrian sidewalks or service tunnels instead
+// of the named main road that Nominatim (with building-level POI
+// matching) would use.
 inline bool is_included_highway(const char* value) {
+    // Fast rejection by first character — avoids 8 strcmp calls for most values
     switch (value[0]) {
-        case 'c': return std::strcmp(value, "construction") != 0;
+        case 'f': return std::strcmp(value, "footway") != 0;
+        case 'p': return std::strcmp(value, "path") != 0 && std::strcmp(value, "pedestrian") != 0;
+        case 't': return std::strcmp(value, "track") != 0;
+        case 's': return std::strcmp(value, "steps") != 0 && std::strcmp(value, "service") != 0;
+        case 'c': return std::strcmp(value, "cycleway") != 0 && std::strcmp(value, "construction") != 0;
         case 'b': return std::strcmp(value, "bridleway") != 0;
         default: return true;
     }
 }
 
-// Mirrors lua/themes/nominatim/presets.lua filter_footways: excludes
-// footway=sidewalk / crossing / link / traffic_aisle even on named
-// ways. Called when highway==footway; other highway types ignore the
-// footway tag.
-inline bool is_included_footway_subtype(const char* footway) {
-    if (footway == nullptr) return true; // named footway with no subtype
-    switch (footway[0]) {
-        case 's': return std::strcmp(footway, "sidewalk") != 0;
-        case 'c': return std::strcmp(footway, "crossing") != 0;
-        case 'l': return std::strcmp(footway, "link") != 0;
-        case 't': return std::strcmp(footway, "traffic_aisle") != 0;
-        default: return true;
-    }
-}
-
-// Convenience: full highway acceptance check including footway
-// subtype filter for highway=footway ways.
-inline bool is_included_highway_full(const char* highway, const char* footway) {
-    if (!is_included_highway(highway)) return false;
-    if (std::strcmp(highway, "footway") == 0) {
-        return is_included_footway_subtype(footway);
-    }
-    return true;
+// Convenience overload — kept for signature compatibility with the
+// call sites that pass a footway subtype. The footway argument is
+// unused in the strict filter above because footways are excluded
+// wholesale, but keeping this entry point avoids churn if we re-
+// enable footways in the future with a subtype filter.
+inline bool is_included_highway_full(const char* highway, const char* /*footway*/) {
+    return is_included_highway(highway);
 }
