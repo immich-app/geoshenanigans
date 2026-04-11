@@ -1189,10 +1189,14 @@ impl Index {
         // Convert to result — find best city-like place (city > town > village)
         let mut result = PlaceResult::default();
 
-        // Max search radii from Nominatim's reverse_place_diameter(), by rank
+        // Max search radii: Nominatim's reverse_place_diameter values
+        // halved for city/town/village to match reality, halved again
+        // for quarter / neighbourhood because those rely on the
+        // containment gate below for precision and the radius acts as a
+        // fast-reject bound only.
         let max_rank17 = (0.08_f64).to_radians().powi(2); // city/town/village
         let max_rank19 = (0.02_f64).to_radians().powi(2); // suburb / hamlet
-        let max_rank20 = (0.01_f64).to_radians().powi(2); // neighbourhood/quarter
+        let max_rank20 = (0.005_f64).to_radians().powi(2); // quarter / neighbourhood
 
         // Containment gate: for suburb and deeper (pt ≥ 3), only accept a
         // place-node candidate if it's inside its pre-computed parent
