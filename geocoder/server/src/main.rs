@@ -1612,7 +1612,19 @@ impl Index {
         let poi_primary = self.find_nearest_poi_with_parent(lat, lng);
 
         let addr_dist = addr.as_ref().map(|(d, _)| *d).unwrap_or(f64::MAX);
-        let interp_dist = interp.as_ref().map(|(d, _, _)| *d).unwrap_or(f64::MAX);
+        // Nominatim's `_find_closest_street_or_pois` queries the placex
+        // table (streets + rank-30 POIs / addr points). Interpolation
+        // rows live in the separate `osmline` table and are looked up
+        // only AFTER a street wins, via `_find_interpolation_for_street`
+        // with a parent_place_id filter (reverse.py:253). Treating
+        // interpolation as a primary candidate in its own right picks
+        // abbreviated TIGER names ("W 1st St") over the actual OSM
+        // street ("West 1st Street") when the TIGER segment happens
+        // to sit closer to the query than the raw way — a non-
+        // Nominatim behaviour. We keep interp only for housenumber
+        // refinement below.
+        let interp_dist = f64::MAX;
+        let _ = interp.as_ref();
         let street_dist = street.as_ref().map(|(d, _)| *d).unwrap_or(f64::MAX);
         let poi_dist = poi_primary.as_ref().map(|(d, _)| *d).unwrap_or(f64::MAX);
 
