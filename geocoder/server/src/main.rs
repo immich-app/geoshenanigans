@@ -1762,7 +1762,18 @@ impl Index {
             city_district: admin.city_district,
             neighbourhood: admin.neighbourhood.or(place.neighbourhood),
             city_block: admin.city_block,
-            postcode: admin.postcode.or(addr_postcode),
+            // Normalise postcode to the canonical country format (e.g.
+            // Greek "10431" → "104 31", Canadian "K1A0B1" → "K1A 0B1").
+            // Mirrors nominatim's CountryPostcodeMatcher normalisation
+            // driven by settings/country_settings.yaml. Cow means we
+            // only allocate when the raw OSM value needs reformatting.
+            postcode: match admin.postcode.or(addr_postcode) {
+                Some(pc) => Some(match admin.country_code {
+                    Some(cc) => format_postcode(&cc, pc),
+                    None => Cow::Borrowed(pc),
+                }),
+                None => None,
+            },
             country: admin.country,
             country_code: admin.country_code.map(|c| String::from_utf8_lossy(&c).into_owned()),
         };
@@ -1772,6 +1783,66 @@ impl Index {
 }
 
 // --- Geometry helpers ---
+
+// Per-country postcode formatter. Mirrors Nominatim's
+// CountryPostcodeMatcher (settings/country_settings.yaml) for the
+// countries where OSM frequently stores postcodes in an unspaced
+// form but Nominatim emits the canonical spaced form — Sweden
+// (ddd dd), Greece (ddd dd), Netherlands (dddd AA), UK (partial),
+// Canada (ldl dld), Brazil (ddddd-ddd), Japan (ddd-dddd).
+//
+// Strategy: strip existing spaces / dashes, match the country's
+// digit-pattern, reinsert the canonical separator. On no match
+// returns the original string borrowed.
+fn format_postcode<'a>(country_code: &[u8; 2], postcode: &'a str) -> Cow<'a, str> {
+    let cc = std::str::from_utf8(country_code).unwrap_or("").to_ascii_lowercase();
+    // Upper-case buffer with spaces/dashes stripped.
+    let bare: String = postcode
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .flat_map(|c| c.to_uppercase())
+        .collect();
+
+    // Helper — split at index `at`, joined by `sep`.
+    let split_at = |at: usize, sep: char| -> Option<String> {
+        if bare.len() < at + 1 { return None; }
+        let (a, b) = bare.split_at(at);
+        Some(format!("{}{}{}", a, sep, b))
+    };
+
+    let matches_digits = |len: usize| -> bool {
+        bare.len() == len && bare.chars().all(|c| c.is_ascii_digit())
+    };
+
+    let result = match cc.as_str() {
+        // ddd dd — Sweden, Greece, Norway (partial), Slovakia, Czechia
+        "se" | "gr" | "sk" | "cz" if matches_digits(5) => split_at(3, ' '),
+        // dddd AA — Netherlands, Argentina (optional)
+        "nl" if bare.len() == 6
+            && bare[..4].chars().all(|c| c.is_ascii_digit())
+            && bare[4..].chars().all(|c| c.is_ascii_alphabetic()) => {
+            split_at(4, ' ')
+        }
+        // ldl dld — Canada
+        "ca" if bare.len() == 6 => {
+            let c: Vec<char> = bare.chars().collect();
+            if c[0].is_ascii_alphabetic() && c[1].is_ascii_digit() && c[2].is_ascii_alphabetic()
+                && c[3].is_ascii_digit() && c[4].is_ascii_alphabetic() && c[5].is_ascii_digit() {
+                split_at(3, ' ')
+            } else { None }
+        }
+        // ddd-dddd — Japan
+        "jp" if matches_digits(7) => split_at(3, '-'),
+        // ddddd-ddd — Brazil
+        "br" if matches_digits(8) => split_at(5, '-'),
+        _ => None,
+    };
+
+    match result {
+        Some(s) => Cow::Owned(s),
+        None => Cow::Borrowed(postcode),
+    }
+}
 
 fn dist_sq(dlat: f64, dlng: f64, cos_lat: f64) -> f64 {
     dlat * dlat + dlng * dlng * cos_lat * cos_lat
@@ -1916,7 +1987,7 @@ struct AddressDetails<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     city_block: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    postcode: Option<&'a str>,
+    postcode: Option<Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     country: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1981,7 +2052,7 @@ fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
     // City + postcode + state
     if postcode_before_city {
         let mut city_part = String::new();
-        if let Some(pc) = addr.postcode {
+        if let Some(ref pc) = addr.postcode {
             city_part.push_str(pc);
             city_part.push(' ');
         }
@@ -2008,7 +2079,7 @@ fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
                 city_part.push_str(state);
             }
         }
-        if let Some(pc) = addr.postcode {
+        if let Some(ref pc) = addr.postcode {
             if !city_part.is_empty() { city_part.push(' '); }
             city_part.push_str(pc);
         }
