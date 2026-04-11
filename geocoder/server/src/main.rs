@@ -1233,10 +1233,14 @@ impl Index {
         let mut result = PlaceResult::default();
 
         // Max search radii: Nominatim's reverse_place_diameter values
-        // halved for city/town/village to match reality, halved again
-        // for quarter / neighbourhood because those rely on the
-        // containment gate below for precision and the radius acts as a
-        // fast-reject bound only.
+        // (lib-sql/functions/ranking.sql) are used verbatim for rank
+        // 13-18 (city/town), halved for suburb/hamlet because those
+        // are smaller in practice than the trigger's generic bound,
+        // and quartered for quarter/neighbourhood which are tiny.
+        // A wider radius picks up distant place=quarter/neighbourhood
+        // nodes whose names Nominatim's parent_place_id chain walker
+        // never actually reaches, producing EXTRA fields in the
+        // reverse response.
         let max_rank17 = (0.08_f64).to_radians().powi(2); // city/town/village
         let max_rank19 = (0.02_f64).to_radians().powi(2); // suburb / hamlet
         let max_rank20 = (0.005_f64).to_radians().powi(2); // quarter / neighbourhood
@@ -1774,6 +1778,25 @@ impl Index {
         // the same name appear in multiple fields (e.g. Paris city + Paris
         // city_district), and the find_admin rank pipeline already enforces
         // first-label-wins for same-rank collisions.
+        //
+        // Nominatim's reverse response does NOT inject place-node neighbourhoods
+        // when the admin chain already covers the sub-city range densely.
+        // Specifically, `complete_address_details` walks `addressline` which
+        // comes from `placex_triggers.sql` — the chain links each feature to
+        // parents by parent_place_id, not by spatial containment. If the
+        // admin chain jumps from suburb (rank 20) straight to city_block
+        // (rank 24) the intermediate rank 22 stays empty; Nominatim does NOT
+        // fill it from a place=neighbourhood node that happens to contain
+        // the query point. Approximate this: when admin has BOTH a suburb
+        // and a city_block (so the chain is dense at the sub-city range),
+        // suppress the place-node neighbourhood/quarter overrides. Paris
+        // 4th Arrondissement has suburb=4th Arrondissement + city_block=
+        // Quartier Saint-Merri and Nominatim emits no neighbourhood —
+        // before this rule we'd inject `neighbourhood=Beaubourg` from a
+        // nearby place node.
+        let admin_chain_dense = admin.suburb.is_some() && admin.city_block.is_some();
+        let allow_place_quarter = !admin_chain_dense;
+        let allow_place_neighbourhood = !admin_chain_dense;
         let address = AddressDetails {
             house_number,
             road,
@@ -1790,9 +1813,9 @@ impl Index {
             district: admin.district,
             borough: admin.borough,
             suburb: admin.suburb.or(place.suburb),
-            quarter: admin.quarter.or(place.quarter),
+            quarter: admin.quarter.or(if allow_place_quarter { place.quarter } else { None }),
             city_district: admin.city_district,
-            neighbourhood: admin.neighbourhood.or(place.neighbourhood),
+            neighbourhood: admin.neighbourhood.or(if allow_place_neighbourhood { place.neighbourhood } else { None }),
             city_block: admin.city_block,
             // Postcode resolution order matches Nominatim's
             // `get_postcode_matching_boundary`: the primary feature's
