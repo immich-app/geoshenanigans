@@ -1680,12 +1680,21 @@ impl Index {
         if closest_feature_dist < max_dist {
             // Whichever feature class has the smallest distance wins.
             if effective_poi_dist <= addr_dist && effective_poi_dist <= interp_dist && effective_poi_dist <= street_dist {
-                // POI is closest — use its pre-computed parent street
-                // as the road. No housenumber (POIs represent whole
-                // buildings / monuments / squares without a specific
-                // addr:housenumber of their own).
+                // POI is closest. For polygon POIs (vertex_count > 0)
+                // that the query is inside, use the POI's own name
+                // as the road: nominatim picks highway=pedestrian
+                // relations like "Constitution Square" (Mexico City
+                // Zócalo) directly via its rank-26 street query, and
+                // we don't index those as streets so they land in
+                // the POI index with the correct name:en. For point
+                // POIs (statues, plaques, shrines) that happen to sit
+                // on top of the query, stick with parent_street —
+                // their own name is a landmark label, not a road.
                 let (_, poi) = poi_primary.unwrap();
-                if poi.parent_street_id != NO_DATA {
+                let use_poi_name = poi.vertex_count > 0 && poi_dist == 0.0;
+                if use_poi_name && poi.name_id != NO_DATA {
+                    road = Some(self.get_string(poi.name_id));
+                } else if poi.parent_street_id != NO_DATA {
                     road = Some(self.get_string(poi.parent_street_id));
                 }
                 // Inherit postcode from a nearby addressed point if
