@@ -1670,7 +1670,15 @@ impl Index {
                 // Address is closest — use it with its housenumber.
                 let (_, point) = addr.unwrap();
                 house_number = Some(Cow::Borrowed(self.get_string(point.housenumber_id)));
-                road = Some(self.get_string(point.street_id));
+                // street_id == NO_DATA means the builder's parent-
+                // street backfill didn't find a named way nearby; in
+                // that case fall back to the closest-street result
+                // instead of the missing addr:street.
+                if point.street_id != NO_DATA {
+                    road = Some(self.get_string(point.street_id));
+                } else if let Some((_, way)) = street {
+                    road = Some(self.get_string(way.name_id));
+                }
                 if point.postcode_id != NO_DATA {
                     addr_postcode = Some(self.get_string(point.postcode_id));
                 }
