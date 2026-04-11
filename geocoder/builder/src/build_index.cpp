@@ -1136,16 +1136,6 @@ int main(int argc, char* argv[]) {
                                 pn.place_type = static_cast<uint8_t>(settlement_pt);
                                 tl_node_data->place_nodes.push_back(pn);
                                 tl_node_data->place_names.push_back(best_name);
-                                // Capture wikidata for place→admin linking, but only if
-                                // this node is NOT already a label member of some
-                                // boundary. Nominatim's find_linked_place claims a
-                                // place node via label-role match and then other
-                                // boundaries can't pick the same node via the
-                                // wikidata fallback. Skipping label-member nodes in
-                                // our wikidata map reproduces that.
-                                if (n_wikidata && !is_label_member) {
-                                    tl_node_data->place_wikidata.push_back({n_wikidata, static_cast<uint8_t>(settlement_pt)});
-                                }
                             }
 
                             // For the label-role lookup, also recognise higher-level
@@ -1162,6 +1152,26 @@ int main(int argc, char* argv[]) {
                                 else if (std::strcmp(n_place, "county") == 0) label_pt = PlaceType::COUNTY;
                                 else if (std::strcmp(n_place, "district") == 0) label_pt = PlaceType::DISTRICT;
                                 else if (std::strcmp(n_place, "borough") == 0) label_pt = PlaceType::BOROUGH;
+                            }
+                            // Capture wikidata → place type for the
+                            // admin-boundary wikidata link step in
+                            // Nominatim's find_linked_place() chain.
+                            // This must include *all* place types —
+                            // not just settlements — because e.g.
+                            // Mexico City's Cuauhtémoc borough
+                            // relation links via wikidata (Q645293)
+                            // to an admin_centre node tagged
+                            // place=borough, and without that the
+                            // boundary falls through to the default
+                            // admin_level=6 → county mapping instead
+                            // of picking up rank_address=18 (borough).
+                            //
+                            // Skip label-role members: nominatim's
+                            // find_linked_place claims a place node
+                            // via label role first, so wikidata
+                            // linking only considers non-label nodes.
+                            if (n_wikidata && !is_label_member && label_pt != PlaceType::UNKNOWN) {
+                                tl_node_data->place_wikidata.push_back({n_wikidata, static_cast<uint8_t>(label_pt)});
                             }
                             if (is_label_member) {
                                 tl_node_data->label_hits.push_back({id, static_cast<uint8_t>(label_pt)});
