@@ -23,13 +23,18 @@ void resolve_interpolation_endpoints(ParsedData& data) {
         return sp.data() + off;
     };
 
-    // Deterministic ordering: compare housenumber first, then street name
+    // Deterministic ordering: compare housenumber first, then street name.
+    // Guards against street_id == NO_DATA (sentinel for addr_points with
+    // no addr:street, pending parent-street backfill) — dereferencing a
+    // NO_DATA string offset would read out of bounds.
     auto addr_less = [&](uint32_t a, uint32_t b) -> bool {
         int cmp = strcmp(get_str(data.addr_points[a].housenumber_id),
                          get_str(data.addr_points[b].housenumber_id));
         if (cmp != 0) return cmp < 0;
-        return strcmp(get_str(data.addr_points[a].street_id),
-                      get_str(data.addr_points[b].street_id)) < 0;
+        uint32_t sa = data.addr_points[a].street_id;
+        uint32_t sb = data.addr_points[b].street_id;
+        if (sa == NO_DATA || sb == NO_DATA) return sa < sb;
+        return strcmp(get_str(sa), get_str(sb)) < 0;
     };
 
     std::unordered_map<CoordKey, uint32_t, CoordHash> addr_by_coord;

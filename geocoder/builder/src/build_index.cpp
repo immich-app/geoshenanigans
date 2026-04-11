@@ -2997,7 +2997,9 @@ int main(int argc, char* argv[]) {
                 for (auto& w : data.ways) w.name_id = rm.at(w.name_id);
                 for (auto& a : data.addr_points) {
                     a.housenumber_id = rm.at(a.housenumber_id);
-                    a.street_id = rm.at(a.street_id);
+                    // street_id may be NO_DATA if the parent-street
+                    // backfill sweep didn't find a nearby named way.
+                    if (a.street_id != NO_DATA) a.street_id = rm.at(a.street_id);
                     if (a.postcode_id != NO_DATA) a.postcode_id = rm.at(a.postcode_id);
                 }
                 for (auto& iw : data.interp_ways) iw.street_id = rm.at(iw.street_id);

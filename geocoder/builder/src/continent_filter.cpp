@@ -393,12 +393,15 @@ ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bbox) {
     }
     log_phase("      filter: cell map remap", _ft, _fc);
 
-    // Rebuild compact string pool
+    // Rebuild compact string pool. Skip NO_DATA sentinels — addr_points
+    // with unresolved parent streets keep NO_DATA rather than a string
+    // offset, and must not be inserted into the pool.
     std::unordered_set<uint32_t> used_offsets;
-    for (const auto& w : out.ways) used_offsets.insert(w.name_id);
-    for (const auto& a : out.addr_points) { used_offsets.insert(a.housenumber_id); used_offsets.insert(a.street_id); }
-    for (const auto& iw : out.interp_ways) used_offsets.insert(iw.street_id);
-    for (const auto& ap : out.admin_polygons) used_offsets.insert(ap.name_id);
+    auto add_used = [&](uint32_t off) { if (off != NO_DATA) used_offsets.insert(off); };
+    for (const auto& w : out.ways) add_used(w.name_id);
+    for (const auto& a : out.addr_points) { add_used(a.housenumber_id); add_used(a.street_id); }
+    for (const auto& iw : out.interp_ways) add_used(iw.street_id);
+    for (const auto& ap : out.admin_polygons) add_used(ap.name_id);
 
     const auto& old_sp = full.string_pool.data();
     std::unordered_map<uint32_t, uint32_t> string_remap;
@@ -414,11 +417,16 @@ ParsedData filter_by_bbox(const ParsedData& full, const ContinentBBox& bbox) {
         size_t len = std::strlen(str);
         new_sp.insert(new_sp.end(), str, str + len + 1);
     }
+    // NO_DATA maps to itself so addr_points without a resolved street
+    // keep the sentinel after remapping.
+    auto remap_or_sentinel = [&](uint32_t off) -> uint32_t {
+        return off == NO_DATA ? NO_DATA : string_remap[off];
+    };
 
-    for (auto& w : out.ways) w.name_id = string_remap[w.name_id];
-    for (auto& a : out.addr_points) { a.housenumber_id = string_remap[a.housenumber_id]; a.street_id = string_remap[a.street_id]; }
-    for (auto& iw : out.interp_ways) iw.street_id = string_remap[iw.street_id];
-    for (auto& ap : out.admin_polygons) ap.name_id = string_remap[ap.name_id];
+    for (auto& w : out.ways) w.name_id = remap_or_sentinel(w.name_id);
+    for (auto& a : out.addr_points) { a.housenumber_id = remap_or_sentinel(a.housenumber_id); a.street_id = remap_or_sentinel(a.street_id); }
+    for (auto& iw : out.interp_ways) iw.street_id = remap_or_sentinel(iw.street_id);
+    for (auto& ap : out.admin_polygons) ap.name_id = remap_or_sentinel(ap.name_id);
     log_phase("      filter: string pool rebuild", _ft, _fc);
 
     return out;
@@ -651,12 +659,14 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     }
     log_phase("      filter: cell map remap (masked)", _ft, _fc);
 
-    // Rebuild compact string pool (same as original)
+    // Rebuild compact string pool. Skip NO_DATA sentinels (see unmasked
+    // filter_by_bbox above for the same logic + rationale).
     std::unordered_set<uint32_t> used_offsets;
-    for (const auto& w : out.ways) used_offsets.insert(w.name_id);
-    for (const auto& a : out.addr_points) { used_offsets.insert(a.housenumber_id); used_offsets.insert(a.street_id); }
-    for (const auto& iw : out.interp_ways) used_offsets.insert(iw.street_id);
-    for (const auto& ap : out.admin_polygons) used_offsets.insert(ap.name_id);
+    auto add_used_m = [&](uint32_t off) { if (off != NO_DATA) used_offsets.insert(off); };
+    for (const auto& w : out.ways) add_used_m(w.name_id);
+    for (const auto& a : out.addr_points) { add_used_m(a.housenumber_id); add_used_m(a.street_id); }
+    for (const auto& iw : out.interp_ways) add_used_m(iw.street_id);
+    for (const auto& ap : out.admin_polygons) add_used_m(ap.name_id);
 
     const auto& old_sp = full.string_pool.data();
     std::unordered_map<uint32_t, uint32_t> string_remap;
@@ -671,10 +681,13 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         size_t len = std::strlen(str);
         new_sp.insert(new_sp.end(), str, str + len + 1);
     }
-    for (auto& w : out.ways) w.name_id = string_remap[w.name_id];
-    for (auto& a : out.addr_points) { a.housenumber_id = string_remap[a.housenumber_id]; a.street_id = string_remap[a.street_id]; }
-    for (auto& iw : out.interp_ways) iw.street_id = string_remap[iw.street_id];
-    for (auto& ap : out.admin_polygons) ap.name_id = string_remap[ap.name_id];
+    auto remap_or_sentinel_m = [&](uint32_t off) -> uint32_t {
+        return off == NO_DATA ? NO_DATA : string_remap[off];
+    };
+    for (auto& w : out.ways) w.name_id = remap_or_sentinel_m(w.name_id);
+    for (auto& a : out.addr_points) { a.housenumber_id = remap_or_sentinel_m(a.housenumber_id); a.street_id = remap_or_sentinel_m(a.street_id); }
+    for (auto& iw : out.interp_ways) iw.street_id = remap_or_sentinel_m(iw.street_id);
+    for (auto& ap : out.admin_polygons) ap.name_id = remap_or_sentinel_m(ap.name_id);
     log_phase("      filter: string pool rebuild (masked)", _ft, _fc);
 
     return out;
