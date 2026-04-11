@@ -682,6 +682,35 @@ impl Index {
         (addr_result, interp_result, street_result, addr_with_postcode)
     }
 
+    // Debug helper — returns primary feature distances + names.
+    fn debug_primary(&self, lat: f64, lng: f64) -> serde_json::Value {
+        let (addr, interp, street, _) = self.query_geo(lat, lng);
+        let poi_primary = self.find_nearest_poi_with_parent(lat, lng);
+        let to_m = |d2: f64| (d2.sqrt() * 6_371_000.0) as f64;
+        serde_json::json!({
+            "addr": addr.map(|(d, p)| serde_json::json!({
+                "dist_m": to_m(d),
+                "house_number": self.get_string(p.housenumber_id),
+                "street": self.get_string(p.street_id),
+                "lat": p.lat, "lng": p.lng,
+            })),
+            "street": street.map(|(d, w)| serde_json::json!({
+                "dist_m": to_m(d),
+                "name": self.get_string(w.name_id),
+            })),
+            "interp": interp.map(|(d, s, n)| serde_json::json!({
+                "dist_m": to_m(d),
+                "street": s,
+                "number": n,
+            })),
+            "poi": poi_primary.map(|(d, p)| serde_json::json!({
+                "dist_m": to_m(d),
+                "name": self.get_string(p.name_id),
+                "parent_street": if p.parent_street_id != NO_DATA { self.get_string(p.parent_street_id) } else { "" },
+            })),
+        })
+    }
+
     // --- Admin boundary lookup (point-in-polygon) ---
 
     fn debug_admin(&self, lat: f64, lng: f64) -> serde_json::Value {
@@ -1283,6 +1312,31 @@ impl Index {
         result
     }
 
+    // Categories that are km-scale area labels rather than
+    // addressable building-level features. Matches Nominatim's
+    // exclusion of class_ IN ('place', 'building') from the
+    // rank-30 POI branch in _find_closest_street_or_pois.
+    //
+    // See builder/src/types.h for the numeric category enum.
+    fn is_area_label_category(cat: u8) -> bool {
+        matches!(cat,
+            // natural: large polygons
+            80 | 81 | 82 | 86 | 91 | 92 | 93 | // peak, volcano, beach, glacier, bay, cape, island
+            // boundary/leisure: parks, reserves
+            60 | 61 | 62 | 63 | 64 | 65 | // park, nature_reserve, stadium, garden, water_park, golf_course
+            130 | 131 | // national_park, protected_area
+            // amenity: campus-scale
+            41 | 42 | 43 | 47 | 51 | 54 | // university, college, hospital, marketplace, cemetery, prison
+            // tourism: resorts / theme parks
+            3 | 4 | 9 | 11 | // theme_park, zoo, camp_site, resort
+            // historic: battlefields
+            25 | // battlefield
+            // aeroway / transport / industrial
+            100 | // aerodrome
+            150   // power_plant
+        )
+    }
+
     // --- POI primary-feature lookup ---
     //
     // Returns the nearest POI with a valid parent_street_id to the
@@ -1335,6 +1389,18 @@ impl Index {
                 // street (for the `road` field). Without parent, we
                 // can't populate a road name if this POI wins.
                 if poi.name_id == NO_DATA || poi.parent_street_id == NO_DATA {
+                    return;
+                }
+                // Nominatim's _find_closest_street_or_pois filter
+                // excludes `class_ IN ('place', 'building')` from the
+                // POI rank-30 branch. Our large "containment only"
+                // categories (islands, bays, capes, airports, parks,
+                // universities, cemeteries, etc.) would otherwise win
+                // at distance 0 every time the query is inside one,
+                // e.g. "Manhattan Island" covering all of Manhattan.
+                // Skip categories that are typically km-scale and act
+                // as area labels rather than addressable features.
+                if Self::is_area_label_category(poi.category) {
                     return;
                 }
 
@@ -1554,10 +1620,25 @@ impl Index {
         // (hnr_distance tolerance in `_find_closest_street_or_pois`).
         let hnr_tolerance_sq = (0.001_f64).to_radians().powi(2);
 
-        let closest_feature_dist = addr_dist.min(interp_dist).min(street_dist).min(poi_dist);
+        // Nominatim's reverse.py lines 218-226: when the closest feature
+        // is an area at distance 0 (query is inside the polygon) AND
+        // there is an addressable rank-30 node within ~11m (0.0001 deg),
+        // prefer the node. This is how Nominatim picks "Sushi teria,
+        // 350, 5th Avenue" instead of "Empire State Building" when the
+        // query falls inside the building polygon. Our POI primary
+        // candidates are area-like (polygon centroids), so the same
+        // rule applies: a nearby addr_point trumps an enclosing POI.
+        let inside_node_threshold_sq = (0.0001_f64).to_radians().powi(2);
+        let mut effective_poi_dist = poi_dist;
+        if poi_dist == 0.0 && addr_dist < inside_node_threshold_sq {
+            // Demote POI so addr wins the comparison below.
+            effective_poi_dist = f64::MAX;
+        }
+
+        let closest_feature_dist = addr_dist.min(interp_dist).min(street_dist).min(effective_poi_dist);
         if closest_feature_dist < max_dist {
             // Whichever feature class has the smallest distance wins.
-            if poi_dist <= addr_dist && poi_dist <= interp_dist && poi_dist <= street_dist {
+            if effective_poi_dist <= addr_dist && effective_poi_dist <= interp_dist && effective_poi_dist <= street_dist {
                 // POI is closest — use its pre-computed parent street
                 // as the road. No housenumber (POIs represent whole
                 // buildings / monuments / squares without a specific
@@ -1573,7 +1654,7 @@ impl Index {
                         addr_postcode = Some(self.get_string(ap.postcode_id));
                     }
                 }
-            } else if addr_dist <= interp_dist && addr_dist <= street_dist {
+            } else if addr_dist <= interp_dist && addr_dist <= street_dist && addr_dist <= effective_poi_dist {
                 // Address is closest — use it with its housenumber.
                 let (_, point) = addr.unwrap();
                 house_number = Some(Cow::Borrowed(self.get_string(point.housenumber_id)));
@@ -1581,7 +1662,7 @@ impl Index {
                 if point.postcode_id != NO_DATA {
                     addr_postcode = Some(self.get_string(point.postcode_id));
                 }
-            } else if interp_dist <= addr_dist && interp_dist <= street_dist {
+            } else if interp_dist <= addr_dist && interp_dist <= street_dist && interp_dist <= effective_poi_dist {
                 // Interpolation segment is closest.
                 let (_, street_name, number) = interp.unwrap();
                 house_number = Some(Cow::Owned(number.to_string()));
@@ -1593,15 +1674,13 @@ impl Index {
                 }
             } else {
                 // Street is closest — use the street name with no
-                // housenumber. We deliberately don't walk to a nearby
-                // addressed point on the same street: Nominatim's
-                // _find_closest_street_or_pois refinement fires on
-                // `IsAddressPoint` rows (addressable building-level
-                // POIs with rank_search=30) which aren't the same set
-                // as our raw addr_points. Walking blindly to the
-                // nearest addr_point adds spurious house numbers to
-                // pedestrian plaza / square queries where Nominatim
-                // returns no house number at all.
+                // housenumber. Nominatim runs a second lookup
+                // (`_find_housenumber_for_street`) that joins by the
+                // street's place_id, but our name-based matching
+                // produces too many false positives due to OSM name
+                // inconsistencies ("Canal St" vs "Canal Street") and
+                // cross-neighbourhood duplicate street names, so we
+                // leave housenumber off when street is the primary.
                 let (_, way) = street.unwrap();
                 road = Some(self.get_string(way.name_id));
                 if let Some((ad, ap)) = addr {
@@ -1955,8 +2034,12 @@ async fn reverse_geocode(
         return (StatusCode::TOO_MANY_REQUESTS, msg).into_response();
     }
 
-    if params.debug.is_some() {
-        let debug = index.debug_admin(params.lat, params.lon);
+    if let Some(ref mode) = params.debug {
+        let debug = if mode == "primary" {
+            index.debug_primary(params.lat, params.lon)
+        } else {
+            index.debug_admin(params.lat, params.lon)
+        };
         let json = serde_json::to_string_pretty(&debug).unwrap_or_default();
         return ([(axum::http::header::CONTENT_TYPE, "application/json")], json).into_response();
     }
