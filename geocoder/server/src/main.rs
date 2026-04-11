@@ -1762,12 +1762,19 @@ impl Index {
             city_district: admin.city_district,
             neighbourhood: admin.neighbourhood.or(place.neighbourhood),
             city_block: admin.city_block,
-            // Normalise postcode to the canonical country format (e.g.
-            // Greek "10431" → "104 31", Canadian "K1A0B1" → "K1A 0B1").
-            // Mirrors nominatim's CountryPostcodeMatcher normalisation
-            // driven by settings/country_settings.yaml. Cow means we
-            // only allocate when the raw OSM value needs reformatting.
-            postcode: match admin.postcode.or(addr_postcode) {
+            // Postcode resolution order matches Nominatim's
+            // `get_postcode_matching_boundary`: the primary feature's
+            // addr:postcode wins, and we only fall back to the
+            // containing postal boundary when the address point has
+            // no postcode of its own. Our previous order (boundary
+            // first) picked the smallest nested postal polygon
+            // (Mexico City's 06060) even when the closest building
+            // carried the broader delivery postcode (06000).
+            //
+            // Then normalise to the canonical country format
+            // (see `format_postcode` below). Cow means we only
+            // allocate when the raw OSM value needs reformatting.
+            postcode: match addr_postcode.or(admin.postcode) {
                 Some(pc) => Some(match admin.country_code {
                     Some(cc) => format_postcode(&cc, pc),
                     None => Cow::Borrowed(pc),
