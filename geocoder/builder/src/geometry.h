@@ -273,31 +273,38 @@ inline uint32_t parse_house_number(const char* s) {
     return n;
 }
 
-// Highway types excluded from street indexing. Approximates
-// Nominatim's default MAIN_TAGS_STREETS preset but is intentionally
-// tighter: we exclude pedestrian/path/footway/steps/track/service/
-// cycleway because without POI-as-primary-feature matching, including
-// them makes us pick pedestrian sidewalks or service tunnels instead
-// of the named main road that Nominatim (with building-level POI
-// matching) would use.
+// Highway types excluded from street indexing. Matches Nominatim's
+// rank-26..29 MAIN_TAGS_STREETS preset (includes pedestrian, footway,
+// path, track, service). These were previously excluded because
+// without POI-as-primary-feature matching we picked sidewalks and
+// service tunnels over the intended main road; with the addr_point
+// and POI primary-feature paths now in place, the guarded types are
+// necessary to match Nominatim on pedestrianised squares / plazas
+// (Mexico City Zócalo, Paris City Hall Plaza, Red Square, Singapore
+// MacRitchie Nature Trail, Sydney Northern Broadwalk, Giza Causeway).
+// Still excluded: steps (stairs, not addresses), cycleway (dedicated
+// bike paths, rarely match a Nominatim primary), construction,
+// bridleway.
 inline bool is_included_highway(const char* value) {
-    // Fast rejection by first character — avoids 8 strcmp calls for most values
+    // Fast rejection by first character — avoids many strcmp calls.
     switch (value[0]) {
-        case 'f': return std::strcmp(value, "footway") != 0;
-        case 'p': return std::strcmp(value, "path") != 0 && std::strcmp(value, "pedestrian") != 0;
-        case 't': return std::strcmp(value, "track") != 0;
-        case 's': return std::strcmp(value, "steps") != 0 && std::strcmp(value, "service") != 0;
+        case 's': return std::strcmp(value, "steps") != 0;
         case 'c': return std::strcmp(value, "cycleway") != 0 && std::strcmp(value, "construction") != 0;
         case 'b': return std::strcmp(value, "bridleway") != 0;
         default: return true;
     }
 }
 
-// Convenience overload — kept for signature compatibility with the
-// call sites that pass a footway subtype. The footway argument is
-// unused in the strict filter above because footways are excluded
-// wholesale, but keeping this entry point avoids churn if we re-
-// enable footways in the future with a subtype filter.
-inline bool is_included_highway_full(const char* highway, const char* /*footway*/) {
-    return is_included_highway(highway);
+// Footway sub-type filter — `footway=sidewalk` and `footway=crossing`
+// are nearly always unnamed adjuncts of a parent road (sidewalks, zebra
+// crossings) rather than standalone named ways. Include footway=*
+// generally but drop those two sub-types to avoid picking a sidewalk
+// segment as the primary feature.
+inline bool is_included_highway_full(const char* highway, const char* footway) {
+    if (!is_included_highway(highway)) return false;
+    if (highway[0] == 'f' && std::strcmp(highway, "footway") == 0 && footway) {
+        if (std::strcmp(footway, "sidewalk") == 0) return false;
+        if (std::strcmp(footway, "crossing") == 0) return false;
+    }
+    return true;
 }
