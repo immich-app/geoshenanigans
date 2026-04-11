@@ -2524,10 +2524,24 @@ int main(int argc, char* argv[]) {
                             uint32_t best_name = 0xFFFFFFFFu;
                             const double cos_lat = std::cos(
                                 plat * M_PI / 180.0);
+                            // cell_to_ways is empty at this point
+                            // (parallel_sort_and_build skips building
+                            // the hash map). Binary-search the sorted
+                            // vector instead and walk forward while
+                            // cell_id matches.
                             for (uint64_t cid : cells_to_check) {
-                                auto it = data.cell_to_ways.find(cid);
-                                if (it == data.cell_to_ways.end()) continue;
-                                for (uint32_t way_id : it->second) {
+                                CellItemPair probe{cid, 0};
+                                auto lo = std::lower_bound(
+                                    data.sorted_way_cells.begin(),
+                                    data.sorted_way_cells.end(), probe,
+                                    [](const CellItemPair& a, const CellItemPair& b) {
+                                        return a.cell_id < b.cell_id ||
+                                               (a.cell_id == b.cell_id && a.item_id < b.item_id);
+                                    });
+                                for (auto p = lo;
+                                     p != data.sorted_way_cells.end() && p->cell_id == cid;
+                                     ++p) {
+                                    uint32_t way_id = p->item_id;
                                     if (way_id >= data.ways.size()) continue;
                                     const auto& w = data.ways[way_id];
                                     // Only named streets matter for the
