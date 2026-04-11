@@ -1634,13 +1634,19 @@ impl Index {
 
         // Nominatim's reverse.py lines 218-226: when the closest feature
         // is an area at distance 0 (query is inside the polygon) AND
-        // there is an addressable rank-30 node within ~11m (0.0001 deg),
-        // prefer the node. This is how Nominatim picks "Sushi teria,
-        // 350, 5th Avenue" instead of "Empire State Building" when the
-        // query falls inside the building polygon. Our POI primary
-        // candidates are area-like (polygon centroids), so the same
-        // rule applies: a nearby addr_point trumps an enclosing POI.
-        let inside_node_threshold_sq = (0.0001_f64).to_radians().powi(2);
+        // there is an addressable rank-30 node nearby, prefer the node.
+        // Nominatim's exact threshold is `distance < 0.0001` deg (~11m)
+        // for the second-row fallback, but Nominatim also *excludes*
+        // building-class polygons from the candidate set entirely,
+        // which we don't (Hôtel de Ville, Empire State Building etc.
+        // are in our POI index). As an approximation, widen the
+        // addr-point preference radius to ~30m so that a nearby
+        // addressed rank-30 node beats an enclosing building POI.
+        //
+        // This is how we pick "Sushi teria, 350, 5th Avenue" for NYC
+        // Empire State and "6, City Hall Plaza" for Paris Hôtel de
+        // Ville instead of the containing building.
+        let inside_node_threshold_sq = (0.00027_f64).to_radians().powi(2);
         let mut effective_poi_dist = poi_dist;
         if poi_dist == 0.0 && addr_dist < inside_node_threshold_sq {
             // Demote POI so addr wins the comparison below.
