@@ -488,7 +488,14 @@ struct PoiRecord {
     uint8_t category;           // PoiCategory
     uint8_t tier;               // 1=major, 2=notable, 3=everything
     uint8_t flags;              // POI_FLAG_WIKIPEDIA, POI_FLAG_WIKIDATA
-    uint8_t importance = 0;   // 0-255, computed at build time
+    uint8_t importance = 0;     // 0-255, computed at build time
+    // Name offset of the nearest named street to this POI, pre-
+    // computed at build time. Used by the server's query_geo to
+    // populate the `road` field when the POI wins primary-feature
+    // selection. Mirrors Nominatim's parent_place_id chain from a
+    // rank-30 POI back to its rank-26 road. NO_DATA (0xFFFFFFFF)
+    // if no named street was found in the POI's search radius.
+    uint32_t parent_street_id = 0xFFFFFFFF;
 };
 
 // Collected POI relation data for parallel polygon assembly

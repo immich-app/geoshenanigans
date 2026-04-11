@@ -2456,6 +2456,122 @@ int main(int argc, char* argv[]) {
             f_interps.get();
             log_phase("  S2: sort + group into cell maps", _s2t, _s2cpu);
 
+            // --- POI parent-street precomputation ---
+            //
+            // For each POI, find the nearest named street and store its
+            // name_id as parent_street_id. At query time the server
+            // uses this to populate the `road` field when a POI wins
+            // primary-feature selection, mirroring Nominatim's
+            // parent_place_id chain from a rank-30 POI back to its
+            // rank-26 road.
+            //
+            // We iterate POIs in parallel, looking up candidate ways
+            // via cell_to_ways (cell + 8 neighbours, ~30km at L10),
+            // then compute point-to-segment distance for each candidate
+            // and keep the closest named way.
+            if (!data.poi_records.empty() && !data.ways.empty()) {
+                auto _ps_t = std::chrono::steady_clock::now();
+                std::cerr << "Computing POI parent-street links ("
+                          << data.poi_records.size() << " POIs)..." << std::endl;
+
+                std::atomic<size_t> poi_idx{0};
+                std::atomic<uint64_t> linked_count{0};
+                std::vector<std::thread> workers;
+                for (unsigned int t = 0; t < num_threads; t++) {
+                    workers.emplace_back([&]() {
+                        std::vector<uint64_t> cells_to_check;
+                        while (true) {
+                            size_t i = poi_idx.fetch_add(1);
+                            if (i >= data.poi_records.size()) break;
+                            auto& pr = data.poi_records[i];
+                            pr.parent_street_id = 0xFFFFFFFFu;
+
+                            // POI centroid: use lat/lng for points,
+                            // already-stored lat/lng for polygon centroid.
+                            float plat = pr.lat;
+                            float plng = pr.lng;
+
+                            // Query cell + 8 neighbours (S2 L10 = ~10km,
+                            // so 3x3 grid covers ~30km).
+                            S2CellId center = S2CellId(
+                                S2LatLng::FromDegrees(plat, plng))
+                                .parent(kAdminCellLevel);
+                            cells_to_check.clear();
+                            cells_to_check.push_back(center.id());
+                            std::vector<S2CellId> neighbours;
+                            center.AppendAllNeighbors(
+                                kAdminCellLevel, &neighbours);
+                            for (const auto& n : neighbours) {
+                                cells_to_check.push_back(n.id());
+                            }
+
+                            double best_d2 = 1e18;
+                            uint32_t best_name = 0xFFFFFFFFu;
+                            const double cos_lat = std::cos(
+                                plat * M_PI / 180.0);
+                            for (uint64_t cid : cells_to_check) {
+                                auto it = data.cell_to_ways.find(cid);
+                                if (it == data.cell_to_ways.end()) continue;
+                                for (uint32_t way_id : it->second) {
+                                    if (way_id >= data.ways.size()) continue;
+                                    const auto& w = data.ways[way_id];
+                                    // Only named streets matter for the
+                                    // parent-road field.
+                                    if (w.name_id == 0xFFFFFFFFu) continue;
+                                    uint32_t off = w.node_offset;
+                                    uint8_t cnt = w.node_count;
+                                    if (cnt < 2) continue;
+                                    if (static_cast<size_t>(off) + cnt > data.street_nodes.size()) continue;
+                                    // Point-to-segment distance in
+                                    // local-flat approximation (good
+                                    // enough for nearest-street ranking).
+                                    for (uint8_t k = 0; k + 1 < cnt; k++) {
+                                        const auto& a = data.street_nodes[off + k];
+                                        const auto& b = data.street_nodes[off + k + 1];
+                                        double ax = (a.lng - plng) * cos_lat;
+                                        double ay = (a.lat - plat);
+                                        double bx = (b.lng - plng) * cos_lat;
+                                        double by = (b.lat - plat);
+                                        double dx = bx - ax;
+                                        double dy = by - ay;
+                                        double seg_len2 = dx * dx + dy * dy;
+                                        double d2;
+                                        if (seg_len2 < 1e-18) {
+                                            d2 = ax * ax + ay * ay;
+                                        } else {
+                                            double tt = -(ax * dx + ay * dy) / seg_len2;
+                                            if (tt < 0.0) tt = 0.0;
+                                            else if (tt > 1.0) tt = 1.0;
+                                            double qx = ax + tt * dx;
+                                            double qy = ay + tt * dy;
+                                            d2 = qx * qx + qy * qy;
+                                        }
+                                        if (d2 < best_d2) {
+                                            best_d2 = d2;
+                                            best_name = w.name_id;
+                                        }
+                                    }
+                                }
+                            }
+                            if (best_name != 0xFFFFFFFFu) {
+                                pr.parent_street_id = best_name;
+                                linked_count.fetch_add(1);
+                            }
+                        }
+                    });
+                }
+                for (auto& w : workers) w.join();
+
+                double _elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - _ps_t).count();
+                std::cerr << "POI parent-street linking: "
+                          << linked_count.load() << "/"
+                          << data.poi_records.size()
+                          << " POIs linked to a named street in "
+                          << _elapsed << "s" << std::endl;
+                log_phase("  POI: parent-street linking", _s2t, _s2cpu);
+            }
+
             // Free deferred work items
             data.deferred_ways.clear();
             data.deferred_ways.shrink_to_fit();
@@ -2719,7 +2835,17 @@ int main(int argc, char* argv[]) {
                 }
                 for (auto& iw : data.interp_ways) iw.street_id = rm.at(iw.street_id);
                 for (auto& ap : data.admin_polygons) ap.name_id = rm.at(ap.name_id);
-                for (auto& pr : data.poi_records) pr.name_id = rm.at(pr.name_id);
+                for (auto& pr : data.poi_records) {
+                    pr.name_id = rm.at(pr.name_id);
+                    if (pr.parent_street_id != 0xFFFFFFFFu) {
+                        auto psit = rm.find(pr.parent_street_id);
+                        if (psit != rm.end()) {
+                            pr.parent_street_id = psit->second;
+                        } else {
+                            pr.parent_street_id = 0xFFFFFFFFu;
+                        }
+                    }
+                }
                 for (auto& pn : data.place_nodes) pn.name_id = rm.at(pn.name_id);
                 std::cerr << "  String pool sorted: " << strings.size() << " strings" << std::endl;
             }

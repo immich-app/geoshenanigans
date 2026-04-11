@@ -569,8 +569,13 @@ int main(int argc, char* argv[]) {
     size_t way_stride = detect(old_dir + "/street_ways.bin", {12, 9});
     size_t interp_stride = detect(old_dir + "/interp_ways.bin", {24, 20, 18});
     size_t admin_stride = detect(old_dir + "/admin_polygons.bin", {24, 20, 19});
-    size_t poi_stride = 24; // POI records are always 24 bytes
-    size_t place_stride = 16; // Place nodes are always 16 bytes
+    // PoiRecord: 24B (build_version<=3) or 28B (build_version>=4,
+    // added parent_street_id). Detect from file stride so old caches
+    // still work for diff generation.
+    size_t poi_stride = detect(old_dir + "/poi_records.bin", {28, 24});
+    // PlaceNode: 16B (build_version<=3) or 20B (build_version>=4,
+    // added parent_poly_id).
+    size_t place_stride = detect(old_dir + "/place_nodes.bin", {20, 16});
 
     // Build patch data (uncompressed, will be zstd-compressed at the end)
     std::vector<char> patch;

@@ -95,6 +95,12 @@ struct PoiRecord {
     tier: u8,
     flags: u8,
     importance: u8,
+    /// Name offset of the nearest named street to this POI, pre-
+    /// computed at build time. Used to populate the `road` field
+    /// when this POI wins query_geo primary-feature selection.
+    /// Mirrors Nominatim's parent_place_id chain from a rank-30
+    /// POI back to its rank-26 road. `NO_DATA` if unset.
+    parent_street_id: u32,
 }
 
 const POI_FLAG_WIKIPEDIA: u8 = 0x01;
@@ -1277,6 +1283,102 @@ impl Index {
         result
     }
 
+    // --- POI primary-feature lookup ---
+    //
+    // Returns the nearest POI with a valid parent_street_id to the
+    // query point. Used by query() as an additional primary-feature
+    // candidate alongside the raw address / interpolation / street
+    // lookups — mirrors Nominatim's _find_closest_street_or_pois
+    // which returns the closest rank-26+ feature regardless of
+    // whether it's a road or an addressable POI.
+    //
+    // For polygon POIs, returns distance 0 if the query is inside
+    // the polygon, otherwise the distance to the nearest edge.
+    fn find_nearest_poi_with_parent(&self, lat: f64, lng: f64) -> Option<(f64, &PoiRecord)> {
+        let poi_cells = self.poi_cells.as_ref()?;
+        let poi_entries = self.poi_entries.as_ref()?;
+        let poi_records_mmap = self.poi_records.as_ref()?;
+
+        let all_pois: &[PoiRecord] = unsafe {
+            std::slice::from_raw_parts(
+                poi_records_mmap.as_ptr() as *const PoiRecord,
+                poi_records_mmap.len() / std::mem::size_of::<PoiRecord>(),
+            )
+        };
+        let all_poi_vertices: &[NodeCoord] = match &self.poi_vertices {
+            Some(v) => unsafe {
+                std::slice::from_raw_parts(
+                    v.as_ptr() as *const NodeCoord,
+                    v.len() / std::mem::size_of::<NodeCoord>(),
+                )
+            },
+            None => &[],
+        };
+
+        let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
+        let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
+
+        const INTERIOR_FLAG: u32 = 0x80000000;
+        const ID_MASK: u32 = 0x7FFFFFFF;
+
+        let cos_lat = lat.to_radians().cos();
+        let mut best_dist_sq = f64::MAX;
+        let mut best_idx: Option<usize> = None;
+
+        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+            Self::for_each_entry(poi_entries, Self::lookup_admin_cell(poi_cells, c), |id| {
+                let is_interior = (id & INTERIOR_FLAG) != 0;
+                let poi_id = (id & ID_MASK) as usize;
+                if poi_id >= all_pois.len() { return; }
+                let poi = &all_pois[poi_id];
+                // Must have a name (for display) and a linked parent
+                // street (for the `road` field). Without parent, we
+                // can't populate a road name if this POI wins.
+                if poi.name_id == NO_DATA || poi.parent_street_id == NO_DATA {
+                    return;
+                }
+
+                // Compute distance²: inside the polygon → 0;
+                // otherwise min distance to any edge; for point POIs,
+                // direct point-to-point distance.
+                let dist_sq_val;
+                if poi.vertex_count > 0 && (poi.vertex_offset as usize) < all_poi_vertices.len() {
+                    let offset = poi.vertex_offset as usize;
+                    let count = poi.vertex_count as usize;
+                    if offset + count > all_poi_vertices.len() { return; }
+                    let verts = &all_poi_vertices[offset..offset + count];
+                    if is_interior || point_in_polygon(lat as f32, lng as f32, verts) {
+                        dist_sq_val = 0.0;
+                    } else {
+                        let mut mind = f64::MAX;
+                        for i in 0..count {
+                            let j = if i + 1 < count { i + 1 } else { 0 };
+                            let d = point_to_segment_distance(
+                                lat, lng,
+                                verts[i].lat as f64, verts[i].lng as f64,
+                                verts[j].lat as f64, verts[j].lng as f64,
+                                cos_lat,
+                            );
+                            if d < mind { mind = d; }
+                        }
+                        dist_sq_val = mind;
+                    }
+                } else {
+                    let dlat = (lat - poi.lat as f64).to_radians();
+                    let dlng = (lng - poi.lng as f64).to_radians();
+                    dist_sq_val = dlat * dlat + dlng * dlng * cos_lat * cos_lat;
+                }
+
+                if dist_sq_val < best_dist_sq {
+                    best_dist_sq = dist_sq_val;
+                    best_idx = Some(poi_id);
+                }
+            });
+        }
+
+        best_idx.map(|i| (best_dist_sq, &all_pois[i]))
+    }
+
     // --- POI lookup ---
 
     fn find_pois(&self, lat: f64, lng: f64) -> Vec<PoiMatch<'_>> {
@@ -1434,23 +1536,44 @@ impl Index {
         let mut road: Option<&str> = None;
         let mut addr_postcode: Option<&str> = None;
 
+        // POI primary-feature candidate: Nominatim's
+        // _find_closest_street_or_pois returns the closest rank-26+
+        // feature, which may be an addressable POI (amenity / shop /
+        // tourism / historic / building / craft) in addition to roads.
+        // We look up the nearest POI with a pre-computed parent_street_id
+        // and treat it as a 4th candidate alongside address / interp /
+        // street.
+        let poi_primary = self.find_nearest_poi_with_parent(lat, lng);
+
         let addr_dist = addr.as_ref().map(|(d, _)| *d).unwrap_or(f64::MAX);
         let interp_dist = interp.as_ref().map(|(d, _, _)| *d).unwrap_or(f64::MAX);
         let street_dist = street.as_ref().map(|(d, _)| *d).unwrap_or(f64::MAX);
+        let poi_dist = poi_primary.as_ref().map(|(d, _)| *d).unwrap_or(f64::MAX);
 
         // Nominatim's housenumber refinement radius is 0.001 deg ≈ 100m
         // (hnr_distance tolerance in `_find_closest_street_or_pois`).
         let hnr_tolerance_sq = (0.001_f64).to_radians().powi(2);
 
-        let closest_feature_dist = addr_dist.min(interp_dist).min(street_dist);
+        let closest_feature_dist = addr_dist.min(interp_dist).min(street_dist).min(poi_dist);
         if closest_feature_dist < max_dist {
-            // Whichever feature class has the smallest distance wins —
-            // but if the closest was an address and the nearest street
-            // is further by more than the housenumber tolerance, use
-            // the street instead. This mirrors Nominatim's "road first,
-            // housenumber refine" flow for points that sit on a road
-            // with no nearby addressed building.
-            if addr_dist <= interp_dist && addr_dist <= street_dist {
+            // Whichever feature class has the smallest distance wins.
+            if poi_dist <= addr_dist && poi_dist <= interp_dist && poi_dist <= street_dist {
+                // POI is closest — use its pre-computed parent street
+                // as the road. No housenumber (POIs represent whole
+                // buildings / monuments / squares without a specific
+                // addr:housenumber of their own).
+                let (_, poi) = poi_primary.unwrap();
+                if poi.parent_street_id != NO_DATA {
+                    road = Some(self.get_string(poi.parent_street_id));
+                }
+                // Inherit postcode from a nearby addressed point if
+                // there's one within the refinement radius.
+                if let Some((ad, ap)) = addr {
+                    if ad - poi_dist < hnr_tolerance_sq && ap.postcode_id != NO_DATA {
+                        addr_postcode = Some(self.get_string(ap.postcode_id));
+                    }
+                }
+            } else if addr_dist <= interp_dist && addr_dist <= street_dist {
                 // Address is closest — use it with its housenumber.
                 let (_, point) = addr.unwrap();
                 house_number = Some(Cow::Borrowed(self.get_string(point.housenumber_id)));
@@ -1463,8 +1586,6 @@ impl Index {
                 let (_, street_name, number) = interp.unwrap();
                 house_number = Some(Cow::Owned(number.to_string()));
                 road = Some(street_name);
-                // If an address is close enough to the interpolation,
-                // prefer its postcode.
                 if let Some((ad, ap)) = addr {
                     if ad - interp_dist < hnr_tolerance_sq && ap.postcode_id != NO_DATA {
                         addr_postcode = Some(self.get_string(ap.postcode_id));
