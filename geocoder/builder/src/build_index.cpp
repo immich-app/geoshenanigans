@@ -3267,6 +3267,14 @@ int main(int argc, char* argv[]) {
                     }
                 }
                 for (auto& pn : data.place_nodes) pn.name_id = rm.at(pn.name_id);
+                // Remap way_postcode_ids (string offsets into pool)
+                for (auto& pc : data.way_postcode_ids) {
+                    if (pc != NO_DATA) {
+                        auto it = rm.find(pc);
+                        if (it != rm.end()) pc = it->second;
+                        else pc = NO_DATA;
+                    }
+                }
                 std::cerr << "  String pool sorted: " << strings.size() << " strings" << std::endl;
             }
         }

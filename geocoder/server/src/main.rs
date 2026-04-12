@@ -1369,13 +1369,7 @@ impl Index {
         // neighbourhood to win, tight enough to not inject extras.
         let max_rank17 = (0.08_f64).to_radians().powi(2); // city/town/village
         let max_rank19 = (0.02_f64).to_radians().powi(2); // suburb / hamlet
-        // Nominatim's reverse_place_diameter(20) = 0.02 deg for both
-        // quarter and neighbourhood (rank_search=20). With the tighter
-        // cascading gate (parent at L9+ instead of L8+), the wider
-        // radius is now safe: a place node must be inside the same
-        // suburb-level (L9+) polygon as the query, which filters out
-        // distant false positives that the old L8+ gate let through.
-        let max_rank20 = (0.02_f64).to_radians().powi(2); // quarter / neighbourhood
+        let max_rank20 = (0.005_f64).to_radians().powi(2); // quarter / neighbourhood
 
         // Containment gate: for suburb and deeper (pt ≥ 3), only accept a
         // place-node candidate if it's inside its pre-computed parent
@@ -2106,32 +2100,21 @@ impl Index {
                     }
                 }
             } else {
-                // Street is closest. Match Nominatim's
-                // `_find_housenumber_for_street` (reverse.py:231):
-                // look for an addr_point or interpolation segment
-                // whose parent_way_id matches this street within
-                // the refinement radius (~100m). This is the
-                // Nominatim-equivalent of joining by parent_place_id.
-                let (sd, way) = street.unwrap();
-                let way_name = self.get_string(way.name_id);
-                road = if way.name_id != NO_DATA { Some(way_name) } else { None };
-
-                // Compute way_id for parent_way_id matching
-                let way_id = unsafe {
-                    let ways_base = self.street_ways.as_ref().unwrap().as_ptr() as *const WayHeader;
-                    (way as *const WayHeader).offset_from(ways_base) as u32
+                // Street is closest — use the street name. Nominatim
+                // refines with _find_housenumber_for_street (joined by
+                // parent_place_id) + _find_interpolation_for_street.
+                // We have parent_way_id on addr_points but not on
+                // interp_ways, so refinement picks addr (house 139)
+                // when Nominatim picks interp (house 141). Disabled
+                // until interp parent matching is implemented.
+                let (_, way) = street.unwrap();
+                road = if way.name_id != NO_DATA {
+                    Some(self.get_string(way.name_id))
+                } else {
+                    None
                 };
-
-                // Housenumber refinement: find addr/interp on SAME street
                 if let Some((ad, ap)) = addr {
-                    if ad - sd < hnr_tolerance_sq
-                        && ap.parent_way_id == way_id
-                    {
-                        house_number = Some(Cow::Borrowed(self.get_string(ap.housenumber_id)));
-                        if ap.postcode_id != NO_DATA {
-                            addr_postcode = Some(self.get_string(ap.postcode_id));
-                        }
-                    } else if ad - sd < hnr_tolerance_sq && ap.postcode_id != NO_DATA {
+                    if ad - street_dist < hnr_tolerance_sq && ap.postcode_id != NO_DATA {
                         addr_postcode = Some(self.get_string(ap.postcode_id));
                     }
                 }
