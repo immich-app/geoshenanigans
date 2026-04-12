@@ -1081,6 +1081,35 @@ impl Index {
             }
         }
 
+        // Add class='place' polygons (our admin_level=15 marker) to
+        // the ranked list. These come from closed ways / relations
+        // tagged `place=neighbourhood / quarter / suburb / borough`
+        // (the closed-way extraction path in the builder) — Nominatim
+        // indexes them as rank_address 20-22 and they fill the
+        // neighbourhood / quarter / suburb fields. Fixes cairo
+        // qasr al doubara (place=neighbourhood closed way).
+        //
+        // Pick the smallest polygon per name to avoid duplicates
+        // when multiple overlapping place areas share a name.
+        for poly in &place_area_polygons {
+            if poly.place_type_override == 0 { continue; }
+            let r = place_type_to_rank(poly.place_type_override);
+            if r == 0 { continue; }
+            // Skip if a smaller polygon with the same name already exists.
+            let name = self.get_string(poly.name_id);
+            if ranked.iter().any(|p| p.name == name && p.area <= poly.area) {
+                continue;
+            }
+            ranked.push(RankedPoly {
+                admin_level: 15,
+                rank_address: r,
+                place_type_override: poly.place_type_override,
+                name,
+                area: poly.area,
+                country_code: poly.country_code,
+            });
+        }
+
         // Sort by admin_level ascending. Ties (same admin_level) broken by
         // area descending (the larger polygon is assumed to be the parent).
         ranked.sort_by(|a, b| {
@@ -1300,15 +1329,13 @@ impl Index {
         // Convert to result — find best city-like place (city > town > village)
         let mut result = PlaceResult::default();
 
-        // Max search radii: Nominatim's reverse_place_diameter values
-        // (lib-sql/functions/ranking.sql) are used verbatim for rank
-        // 13-18 (city/town), halved for suburb/hamlet because those
-        // are smaller in practice than the trigger's generic bound,
-        // and quartered for quarter/neighbourhood which are tiny.
-        // A wider radius picks up distant place=quarter/neighbourhood
-        // nodes whose names Nominatim's parent_place_id chain walker
-        // never actually reaches, producing EXTRA fields in the
-        // reverse response.
+        // Max search radii. Nominatim's `reverse_place_diameter`
+        // (lib-sql/functions/ranking.sql) is an import-time bound
+        // for the addressline trigger. At query time it filters by
+        // parent_place_id chain membership, which is much stricter
+        // than the bare radius. We can't emulate that so we use
+        // tighter radii — wide enough for the correct quarter/
+        // neighbourhood to win, tight enough to not inject extras.
         let max_rank17 = (0.08_f64).to_radians().powi(2); // city/town/village
         let max_rank19 = (0.02_f64).to_radians().powi(2); // suburb / hamlet
         let max_rank20 = (0.005_f64).to_radians().powi(2); // quarter / neighbourhood
