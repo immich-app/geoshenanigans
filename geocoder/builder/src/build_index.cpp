@@ -2315,12 +2315,25 @@ int main(int argc, char* argv[]) {
                             return data.admin_polygons[a].area <
                                    data.admin_polygons[b].area;
                         });
+                        // Pick the smallest containing admin polygon at
+                        // a rank level matching this place node's type.
+                        // Mirrors Nominatim's `current_boundary` cascading
+                        // gate: a place=neighbourhood node must be inside
+                        // the suburb-level boundary (admin_level >= 8),
+                        // not just inside the country. This prevents a
+                        // neighbourhood node 800m from the query (but
+                        // in the same country/state) from being accepted
+                        // when the query is in a different suburb.
+                        //
+                        // For city/town/village (pt 0-2): parent at L3+
+                        // For suburb/hamlet (pt 3-4): parent at L6+
+                        // For neighbourhood/quarter (pt 5-6): parent at L8+
+                        uint8_t pt = pn.place_type;
+                        uint8_t min_parent_al = (pt <= 2) ? 3 : (pt <= 4) ? 6 : 8;
                         for (uint32_t poly_id : cand) {
                             const auto& p = data.admin_polygons[poly_id];
-                            // Skip country / postcode markers; we want
-                            // only meaningful address-chain parents.
-                            if (p.admin_level < 3 || p.admin_level > 11) continue;
-                            if (p.admin_level == 11) continue;
+                            if (p.admin_level < min_parent_al) continue;
+                            if (p.admin_level > 10) continue; // skip postcode/place markers
                             const NodeCoord* verts =
                                 &data.admin_vertices[p.vertex_offset];
                             if (point_in_polygon_nc(pn.lat, pn.lng,
