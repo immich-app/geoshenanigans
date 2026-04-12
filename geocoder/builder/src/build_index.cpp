@@ -2345,6 +2345,147 @@ int main(int argc, char* argv[]) {
             log_phase("Place-node containment", _pt, _cpu);
         }
 
+        // --- Admin polygon parent chain ---
+        // For each admin polygon, find the smallest containing polygon
+        // with a lower admin_level. This lets the server walk up the
+        // chain (way → suburb → city → state → country) without PIP.
+        {
+            auto _ap_t = std::chrono::steady_clock::now();
+            data.admin_parent_ids.assign(data.admin_polygons.size(), NO_DATA);
+            std::atomic<size_t> ap_idx{0};
+            std::vector<std::thread> workers;
+            for (unsigned int t = 0; t < num_threads; t++) {
+                workers.emplace_back([&]() {
+                    while (true) {
+                        size_t i = ap_idx.fetch_add(1);
+                        if (i >= data.admin_polygons.size()) break;
+                        const auto& self = data.admin_polygons[i];
+                        if (self.vertex_count == 0 || self.admin_level <= 2) continue;
+                        // Compute centroid
+                        float sum_lat = 0, sum_lng = 0;
+                        for (uint32_t v = 0; v < self.vertex_count; v++) {
+                            sum_lat += data.admin_vertices[self.vertex_offset + v].lat;
+                            sum_lng += data.admin_vertices[self.vertex_offset + v].lng;
+                        }
+                        float clat = sum_lat / self.vertex_count;
+                        float clng = sum_lng / self.vertex_count;
+                        S2CellId cell = S2CellId(S2LatLng::FromDegrees(clat, clng)).parent(kAdminCellLevel);
+                        std::vector<S2CellId> nbrs;
+                        cell.AppendAllNeighbors(kAdminCellLevel, &nbrs);
+
+                        float best_area = 1e18f;
+                        uint32_t best_id = NO_DATA;
+                        auto check_cell = [&](uint64_t cid) {
+                            auto it = data.cell_to_admin.find(cid);
+                            if (it == data.cell_to_admin.end()) return;
+                            for (uint32_t raw_id : it->second) {
+                                uint32_t pid = raw_id & 0x7FFFFFFF;
+                                if (pid == i || pid >= data.admin_polygons.size()) continue;
+                                const auto& cand = data.admin_polygons[pid];
+                                if (cand.admin_level >= self.admin_level) continue;
+                                if (cand.area >= best_area) continue;
+                                // PIP check
+                                uint32_t off = cand.vertex_offset;
+                                uint32_t cnt = cand.vertex_count;
+                                if (off + cnt > data.admin_vertices.size()) continue;
+                                const auto* verts = &data.admin_vertices[off];
+                                bool inside = false;
+                                for (uint32_t a = 0, b = cnt - 1; a < cnt; b = a++) {
+                                    if (((verts[a].lng > clng) != (verts[b].lng > clng)) &&
+                                        (clat < (verts[b].lat - verts[a].lat) * (clng - verts[a].lng) / (verts[b].lng - verts[a].lng) + verts[a].lat))
+                                        inside = !inside;
+                                }
+                                if (inside) {
+                                    best_area = cand.area;
+                                    best_id = pid;
+                                }
+                            }
+                        };
+                        check_cell(cell.id());
+                        for (const auto& n : nbrs) check_cell(n.id());
+                        data.admin_parent_ids[i] = best_id;
+                    }
+                });
+            }
+            for (auto& w : workers) w.join();
+            double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - _ap_t).count();
+            uint32_t linked = 0;
+            for (auto id : data.admin_parent_ids) if (id != NO_DATA) linked++;
+            std::cerr << "Admin parent chain: " << linked << "/" << data.admin_polygons.size()
+                      << " polygons linked in " << el << "s" << std::endl;
+        }
+
+        // --- Way parent polygon ---
+        // For each street way, find the smallest admin polygon containing
+        // its centroid. The server uses this to walk the admin chain from
+        // the primary street without PIP.
+        {
+            auto _wp_t = std::chrono::steady_clock::now();
+            data.way_parent_ids.assign(data.ways.size(), NO_DATA);
+            std::atomic<size_t> way_idx{0};
+            std::atomic<uint64_t> way_linked{0};
+            std::vector<std::thread> workers;
+            for (unsigned int t = 0; t < num_threads; t++) {
+                workers.emplace_back([&]() {
+                    while (true) {
+                        size_t i = way_idx.fetch_add(1);
+                        if (i >= data.ways.size()) break;
+                        const auto& w = data.ways[i];
+                        if (w.node_count < 1) continue;
+                        // Compute way centroid
+                        float sum_lat = 0, sum_lng = 0;
+                        uint8_t cnt = w.node_count;
+                        for (uint8_t k = 0; k < cnt; k++) {
+                            sum_lat += data.street_nodes[w.node_offset + k].lat;
+                            sum_lng += data.street_nodes[w.node_offset + k].lng;
+                        }
+                        float clat = sum_lat / cnt;
+                        float clng = sum_lng / cnt;
+                        S2CellId cell = S2CellId(S2LatLng::FromDegrees(clat, clng)).parent(kAdminCellLevel);
+                        std::vector<S2CellId> nbrs;
+                        cell.AppendAllNeighbors(kAdminCellLevel, &nbrs);
+
+                        float best_area = 1e18f;
+                        uint32_t best_id = NO_DATA;
+                        auto check_cell = [&](uint64_t cid) {
+                            auto it = data.cell_to_admin.find(cid);
+                            if (it == data.cell_to_admin.end()) return;
+                            for (uint32_t raw_id : it->second) {
+                                uint32_t pid = raw_id & 0x7FFFFFFF;
+                                if (pid >= data.admin_polygons.size()) continue;
+                                const auto& cand = data.admin_polygons[pid];
+                                if (cand.area >= best_area) continue;
+                                uint32_t off = cand.vertex_offset;
+                                uint32_t cnt2 = cand.vertex_count;
+                                if (off + cnt2 > data.admin_vertices.size()) continue;
+                                const auto* verts = &data.admin_vertices[off];
+                                bool inside = false;
+                                for (uint32_t a = 0, b = cnt2 - 1; a < cnt2; b = a++) {
+                                    if (((verts[a].lng > clng) != (verts[b].lng > clng)) &&
+                                        (clat < (verts[b].lat - verts[a].lat) * (clng - verts[a].lng) / (verts[b].lng - verts[a].lng) + verts[a].lat))
+                                        inside = !inside;
+                                }
+                                if (inside) {
+                                    best_area = cand.area;
+                                    best_id = pid;
+                                }
+                            }
+                        };
+                        check_cell(cell.id());
+                        for (const auto& n : nbrs) check_cell(n.id());
+                        if (best_id != NO_DATA) {
+                            data.way_parent_ids[i] = best_id;
+                            way_linked.fetch_add(1);
+                        }
+                    }
+                });
+            }
+            for (auto& w : workers) w.join();
+            double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - _wp_t).count();
+            std::cerr << "Way parent polygon: " << way_linked.load() << "/" << data.ways.size()
+                      << " ways linked in " << el << "s" << std::endl;
+        }
+
         // Load TIGER address data
         if (!tiger_data_path.empty()) {
             load_tiger_data(data, tiger_data_path);
@@ -3210,6 +3351,20 @@ int main(int argc, char* argv[]) {
             };
             std::sort(data.sorted_way_cells.begin(), data.sorted_way_cells.end(), cmp);
             data.cell_to_ways.clear();
+            // Remap way_parent_ids: reorder + dedup
+            if (data.way_parent_ids.size() == n) {
+                std::vector<uint32_t> new_wp(data.ways.size());
+                for (uint32_t i = 0; i < n; i++) {
+                    uint32_t new_idx = old_to_new[i];
+                    // For deduped ways, the first occurrence wins
+                    if (new_idx < new_wp.size()) {
+                        uint32_t val = data.way_parent_ids[i];
+                        if (new_wp[new_idx] == 0 || val != NO_DATA)
+                            new_wp[new_idx] = val;
+                    }
+                }
+                data.way_parent_ids = std::move(new_wp);
+            }
             std::cerr << "  Ways sorted: " << n << " (" << deduped << " duplicates removed)" << std::endl;
         }
         log_phase("  Sort ways", _st, _sc);
@@ -3310,6 +3465,20 @@ int main(int argc, char* argv[]) {
                     pn.parent_poly_id < old_to_new.size()) {
                     pn.parent_poly_id = old_to_new[pn.parent_poly_id];
                 }
+            }
+            // Remap admin_parent_ids (both indices and values)
+            if (data.admin_parent_ids.size() == n) {
+                std::vector<uint32_t> new_ap(n);
+                for (uint32_t i = 0; i < n; i++) {
+                    uint32_t old_parent = data.admin_parent_ids[order[i]];
+                    new_ap[i] = (old_parent != NO_DATA && old_parent < n)
+                        ? old_to_new[old_parent] : NO_DATA;
+                }
+                data.admin_parent_ids = std::move(new_ap);
+            }
+            // Remap way_parent_ids (values only — way order hasn't changed yet)
+            for (auto& pid : data.way_parent_ids) {
+                if (pid != NO_DATA && pid < n) pid = old_to_new[pid];
             }
             // Remap admin cell entries
             for (auto& [cell_id, ids] : data.cell_to_admin) {

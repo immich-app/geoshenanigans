@@ -299,6 +299,22 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             std::ofstream f(output_dir + "/street_nodes.bin", std::ios::binary);
             f.write(reinterpret_cast<const char*>(data.street_nodes.data()), data.street_nodes.size() * sizeof(NodeCoord));
         }));
+        // Way parent chain (parallel array indexed by way_id)
+        if (!data.way_parent_ids.empty()) {
+            write_futures.push_back(std::async(std::launch::async, [&] {
+                std::ofstream f(output_dir + "/way_parents.bin", std::ios::binary);
+                f.write(reinterpret_cast<const char*>(data.way_parent_ids.data()),
+                        data.way_parent_ids.size() * sizeof(uint32_t));
+            }));
+        }
+        // Admin parent chain (parallel array indexed by polygon_id)
+        if (!data.admin_parent_ids.empty()) {
+            write_futures.push_back(std::async(std::launch::async, [&] {
+                std::ofstream f(output_dir + "/admin_parents.bin", std::ios::binary);
+                f.write(reinterpret_cast<const char*>(data.admin_parent_ids.data()),
+                        data.admin_parent_ids.size() * sizeof(uint32_t));
+            }));
+        }
         if (write_addresses) {
             write_futures.push_back(std::async(std::launch::async, [&] {
                 std::ofstream f(output_dir + "/addr_points.bin", std::ios::binary);

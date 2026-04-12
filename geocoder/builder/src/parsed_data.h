@@ -133,6 +133,12 @@ struct ParsedData {
     std::vector<CellItemPair> sorted_poi_cells;
     std::vector<DeferredPoi> deferred_pois;
     std::vector<CollectedPoiRelation> collected_poi_relations;
+
+    // Parent chain: per-way and per-polygon parent IDs for the
+    // Nominatim-style address walk. Parallel arrays indexed by
+    // way_id / polygon_id respectively.
+    std::vector<uint32_t> way_parent_ids;    // way → smallest containing admin poly
+    std::vector<uint32_t> admin_parent_ids;  // poly → next-larger containing admin poly
 };
 
 // --- Deduplicate IDs per cell ---

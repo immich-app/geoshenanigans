@@ -355,6 +355,9 @@ struct Index {
     place_nodes: Option<Mmap>,
     place_cells: Option<Mmap>,
     place_entries: Option<Mmap>,
+    // Parent chain files (Nominatim-style address walk)
+    way_parents: Option<Mmap>,    // u32 per way → smallest containing admin poly
+    admin_parents: Option<Mmap>,  // u32 per poly → next-larger containing admin poly
     admin_config: AdminLevelConfig,
     strings: Mmap,
     street_cell_level: u64,
@@ -423,6 +426,8 @@ impl Index {
             place_nodes: mmap_file_optional(&format!("{}/place_nodes.bin", dir)),
             place_cells: mmap_file_optional(&format!("{}/place_cells.bin", dir)),
             place_entries: mmap_file_optional(&format!("{}/place_entries.bin", dir)),
+            way_parents: mmap_file_optional(&format!("{}/way_parents.bin", dir)),
+            admin_parents: mmap_file_optional(&format!("{}/admin_parents.bin", dir)),
             admin_config: AdminLevelConfig::load(),
             strings: mmap_file(&format!("{}/strings.bin", dir))?,
             street_cell_level,
@@ -1677,14 +1682,264 @@ impl Index {
         results
     }
 
+    // --- Chain-based admin walk ---
+    //
+    // Given a starting polygon ID (the smallest admin polygon
+    // containing the primary street's centroid), walk up the
+    // admin_parents chain collecting every polygon into the
+    // ranked list. Then apply the same rank adjustment cascade
+    // as find_admin(). This mirrors Nominatim's addressline
+    // parent_place_id walk — only polygons in the chain appear
+    // in the result, avoiding the false-positive EXTRAs from
+    // the pure PIP approach.
+    fn find_admin_from_chain(&self, start_poly_id: u32, lat: f64, lng: f64) -> AdminResult<'_> {
+        let admin_parents = match &self.admin_parents {
+            Some(m) => unsafe {
+                std::slice::from_raw_parts(
+                    m.as_ptr() as *const u32,
+                    m.len() / 4,
+                )
+            },
+            None => return self.find_admin(lat, lng),
+        };
+        let all_polygons: &[AdminPolygon] = unsafe {
+            std::slice::from_raw_parts(
+                self.admin_polygons.as_ptr() as *const AdminPolygon,
+                self.admin_polygons.len() / std::mem::size_of::<AdminPolygon>(),
+            )
+        };
+
+        // Collect chain: walk start → parent → parent → ...
+        let mut chain_ids: Vec<u32> = Vec::with_capacity(12);
+        let mut current = start_poly_id;
+        for _ in 0..15 { // safety bound
+            if current == NO_DATA || current as usize >= all_polygons.len() { break; }
+            chain_ids.push(current);
+            if current as usize >= admin_parents.len() { break; }
+            current = admin_parents[current as usize];
+        }
+
+        // Also collect class='place' polygons (admin_level=15) via
+        // PIP from the query point — these aren't in the parent chain
+        // but provide place-area rank promotions.
+        let all_vertices: &[NodeCoord] = unsafe {
+            std::slice::from_raw_parts(
+                self.admin_vertices.as_ptr() as *const NodeCoord,
+                self.admin_vertices.len() / std::mem::size_of::<NodeCoord>(),
+            )
+        };
+        let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
+        let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
+        let mut place_area_polygons: Vec<&AdminPolygon> = Vec::new();
+        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+            Self::for_each_entry(&self.admin_entries, Self::lookup_admin_cell(&self.admin_cells, c), |id| {
+                let poly_id = (id & 0x7FFFFFFF) as usize;
+                if poly_id >= all_polygons.len() { return; }
+                let poly = &all_polygons[poly_id];
+                if poly.admin_level != 15 { return; }
+                if poly.area <= 0.0 { return; }
+                let offset = poly.vertex_offset as usize;
+                let count = poly.vertex_count as usize;
+                if offset + count > all_vertices.len() { return; }
+                let verts = &all_vertices[offset..offset + count];
+                if !point_in_polygon(lat as f32, lng as f32, verts) { return; }
+                place_area_polygons.push(poly);
+            });
+        }
+
+        // Now build the same ranked structure as find_admin
+        let mut result = AdminResult::default();
+
+        let country_code_str: String = chain_ids.iter()
+            .find_map(|&pid| {
+                let poly = &all_polygons[pid as usize];
+                if poly.admin_level == 2 && poly.country_code != 0 {
+                    Some(format!("{}{}",
+                        (poly.country_code >> 8) as u8 as char,
+                        (poly.country_code & 0xFF) as u8 as char
+                    ).to_uppercase())
+                } else { None }
+            })
+            .unwrap_or_default();
+
+        struct RankedPoly2<'b> {
+            admin_level: u8,
+            rank_address: u8,
+            place_type_override: u8,
+            name: &'b str,
+            area: f32,
+            country_code: u16,
+        }
+        let mut ranked: Vec<RankedPoly2<'_>> = Vec::new();
+        for &pid in &chain_ids {
+            let poly = &all_polygons[pid as usize];
+            if poly.admin_level == 11 { continue; } // postal
+            let initial_rank = self.admin_config.to_rank(&country_code_str, poly.admin_level);
+            if initial_rank == 0 && poly.place_type_override == 0 { continue; }
+            ranked.push(RankedPoly2 {
+                admin_level: poly.admin_level,
+                rank_address: initial_rank,
+                place_type_override: poly.place_type_override,
+                name: self.get_string(poly.name_id),
+                area: poly.area,
+                country_code: poly.country_code,
+            });
+        }
+        // Add place-area polygons
+        for poly in &place_area_polygons {
+            if poly.place_type_override == 0 { continue; }
+            let r = place_type_to_rank(poly.place_type_override);
+            if r == 0 { continue; }
+            ranked.push(RankedPoly2 {
+                admin_level: 15,
+                rank_address: r,
+                place_type_override: poly.place_type_override,
+                name: self.get_string(poly.name_id),
+                area: poly.area,
+                country_code: poly.country_code,
+            });
+        }
+
+        ranked.sort_by(|a, b| {
+            a.admin_level.cmp(&b.admin_level)
+                .then(b.area.partial_cmp(&a.area).unwrap_or(std::cmp::Ordering::Equal))
+        });
+
+        // Rank adjustment cascade (same as find_admin)
+        for _ in 0..3 {
+            for i in 0..ranked.len() {
+                let self_al = ranked[i].admin_level;
+                let self_override = ranked[i].place_type_override;
+                let self_area = ranked[i].area;
+
+                let mut admin_parent_rank: u8 = 0;
+                if self_al > 4 {
+                    for j in (0..i).rev() {
+                        let al = ranked[j].admin_level;
+                        if al > 3 && al < self_al {
+                            admin_parent_rank = ranked[j].rank_address;
+                            break;
+                        }
+                    }
+                }
+                if ranked[i].rank_address <= admin_parent_rank {
+                    ranked[i].rank_address = admin_parent_rank + 2;
+                }
+                if self_override > 0 {
+                    let linked_rank = place_type_to_rank(self_override);
+                    if linked_rank > admin_parent_rank && linked_rank > ranked[i].rank_address {
+                        ranked[i].rank_address = linked_rank;
+                    }
+                }
+                if self_override == 0 {
+                    for pa in &place_area_polygons {
+                        if pa.place_type_override == 0 { continue; }
+                        if pa.area <= self_area { continue; }
+                        let pa_rank = place_type_to_rank(pa.place_type_override);
+                        if pa_rank >= ranked[i].rank_address {
+                            ranked[i].rank_address = pa_rank + 2;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Map to fields
+        struct FC<'b> { area: f32, name: &'b str, country_code: u16 }
+        let mut best_by_field: [Option<FC<'_>>; 19] = Default::default();
+        let field_index = |field: &str| -> Option<usize> {
+            match field {
+                "country" => Some(0), "state" => Some(1), "province" => Some(2),
+                "region" => Some(3), "state_district" => Some(4), "county" => Some(5),
+                "district" => Some(6), "municipality" => Some(7), "city" => Some(8),
+                "town" => Some(9), "village" => Some(10), "hamlet" => Some(11),
+                "city_district" => Some(12), "borough" => Some(13), "suburb" => Some(14),
+                "quarter" => Some(15), "neighbourhood" => Some(16), "city_block" => Some(17),
+                _ => None,
+            }
+        };
+
+        for r in &ranked {
+            if let Some(field) = if r.place_type_override > 0 {
+                place_type_to_field(r.place_type_override)
+            } else {
+                rank_to_field(r.rank_address)
+            } {
+                if let Some(idx) = field_index(field) {
+                    if let Some(ref existing) = best_by_field[idx] {
+                        if r.area >= existing.area { continue; }
+                    }
+                    best_by_field[idx] = Some(FC { area: r.area, name: r.name, country_code: r.country_code });
+                }
+            }
+        }
+
+        // Also handle postcode from L11 in chain
+        for &pid in &chain_ids {
+            let poly = &all_polygons[pid as usize];
+            if poly.admin_level == 11 {
+                result.postcode = Some(self.get_string(poly.name_id));
+                break;
+            }
+        }
+
+        if let Some(ref c) = best_by_field[0] {
+            result.country = Some(c.name);
+            if c.country_code != 0 {
+                result.country_code = Some([
+                    (c.country_code >> 8) as u8,
+                    (c.country_code & 0xFF) as u8,
+                ]);
+            }
+        }
+        result.state          = best_by_field[1].as_ref().map(|c| c.name);
+        result.province       = best_by_field[2].as_ref().map(|c| c.name);
+        result.region         = best_by_field[3].as_ref().map(|c| c.name);
+        result.state_district = best_by_field[4].as_ref().map(|c| c.name);
+        result.county         = best_by_field[5].as_ref().map(|c| c.name);
+        result.district       = best_by_field[6].as_ref().map(|c| c.name);
+        result.municipality   = best_by_field[7].as_ref().map(|c| c.name);
+        result.city           = best_by_field[8].as_ref().map(|c| c.name);
+        result.town           = best_by_field[9].as_ref().map(|c| c.name);
+        result.village        = best_by_field[10].as_ref().map(|c| c.name);
+        result.hamlet         = best_by_field[11].as_ref().map(|c| c.name);
+        result.city_district  = best_by_field[12].as_ref().map(|c| c.name);
+        result.borough        = best_by_field[13].as_ref().map(|c| c.name);
+        result.suburb         = best_by_field[14].as_ref().map(|c| c.name);
+        result.quarter        = best_by_field[15].as_ref().map(|c| c.name);
+        result.neighbourhood  = best_by_field[16].as_ref().map(|c| c.name);
+        result.city_block     = best_by_field[17].as_ref().map(|c| c.name);
+
+        result
+    }
+
     // --- Combined query ---
 
     fn query(&self, lat: f64, lng: f64) -> Address<'_> {
         let max_dist = self.max_distance_sq;
 
-        let admin = self.find_admin(lat, lng);
+        // Run geo lookups first so we know the primary street
         let place = self.find_places(lat, lng);
         let (addr, interp, street, nearest_with_postcode) = self.query_geo(lat, lng);
+
+        // Prefer chain-based admin walk when way_parents is available
+        // and we found a primary street. Falls back to full PIP walk.
+        let admin = if let (Some(ref wp), Some((_, way))) = (&self.way_parents, &street) {
+            let way_id = unsafe {
+                let ways_base = self.street_ways.as_ref().unwrap().as_ptr() as *const WayHeader;
+                (*way as *const WayHeader).offset_from(ways_base) as usize
+            };
+            let all_parents: &[u32] = unsafe {
+                std::slice::from_raw_parts(wp.as_ptr() as *const u32, wp.len() / 4)
+            };
+            if way_id < all_parents.len() && all_parents[way_id] != NO_DATA {
+                self.find_admin_from_chain(all_parents[way_id], lat, lng)
+            } else {
+                self.find_admin(lat, lng)
+            }
+        } else {
+            self.find_admin(lat, lng)
+        };
 
         // Primary-feature selection: match Nominatim's reverse flow —
         // pick the closest rank-26+ feature (road OR addressable POI),
