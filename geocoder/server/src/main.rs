@@ -1217,11 +1217,16 @@ impl Index {
         // Now assign each polygon to its field slot. Each rank yields one
         // field label (via place_type_override → fixed field, or
         // rank_to_field). Smaller polygon (later in list after sort) wins
-        // ties, matching the deepest-ancestor-per-rank behaviour.
+        // Two-pass field assignment: admin boundaries (al < 15) have
+        // priority over place-area polygons (al=15). This prevents a
+        // small place=suburb closed way (e.g. Le Marais, Paris) from
+        // overriding the admin boundary (4th Arrondissement) that
+        // Nominatim uses for the same field. Nominatim's addressline
+        // walk prioritizes admin boundaries via `fromarea DESC` in the
+        // ORDER BY clause.
         for r in &ranked {
+            if r.admin_level == 15 { continue; } // skip place-area in first pass
             let field = if r.place_type_override > 0 {
-                // For settlement/quarter/etc., the label is the place type
-                // verbatim (mirrors Nominatim's get_label_tag fallthrough).
                 place_type_to_field(r.place_type_override)
             } else {
                 rank_to_field(r.rank_address)
@@ -1234,6 +1239,24 @@ impl Index {
                     best_by_field[idx] = Some(FieldCandidate {
                         area: r.area, name: r.name, country_code: r.country_code
                     });
+                }
+            }
+        }
+        // Second pass: place-area polygons fill only empty fields.
+        for r in &ranked {
+            if r.admin_level != 15 { continue; }
+            let field = if r.place_type_override > 0 {
+                place_type_to_field(r.place_type_override)
+            } else {
+                rank_to_field(r.rank_address)
+            };
+            if let Some(field) = field {
+                if let Some(idx) = field_index(field) {
+                    if best_by_field[idx].is_none() {
+                        best_by_field[idx] = Some(FieldCandidate {
+                            area: r.area, name: r.name, country_code: r.country_code
+                        });
+                    }
                 }
             }
         }
@@ -1922,24 +1945,13 @@ impl Index {
         let place = self.find_places(lat, lng);
         let (addr, interp, street, nearest_with_postcode) = self.query_geo(lat, lng);
 
-        // Prefer chain-based admin walk when way_parents is available
-        // and we found a primary street. Falls back to full PIP walk.
-        let admin = if let (Some(ref wp), Some((_, way))) = (&self.way_parents, &street) {
-            let way_id = unsafe {
-                let ways_base = self.street_ways.as_ref().unwrap().as_ptr() as *const WayHeader;
-                (*way as *const WayHeader).offset_from(ways_base) as usize
-            };
-            let all_parents: &[u32] = unsafe {
-                std::slice::from_raw_parts(wp.as_ptr() as *const u32, wp.len() / 4)
-            };
-            if way_id < all_parents.len() && all_parents[way_id] != NO_DATA {
-                self.find_admin_from_chain(all_parents[way_id], lat, lng)
-            } else {
-                self.find_admin(lat, lng)
-            }
-        } else {
-            self.find_admin(lat, lng)
-        };
+        // Use the standard PIP-based admin walk. The chain-based walk
+        // (way_parents.bin + admin_parents.bin) is available but causes
+        // regressions for fine-grained levels where a street's centroid
+        // drifts across suburb/neighbourhood boundaries. A future
+        // improvement could use the chain for coarse levels (country →
+        // city) while keeping PIP for sub-city levels.
+        let admin = self.find_admin(lat, lng);
 
         // Primary-feature selection: match Nominatim's reverse flow —
         // pick the closest rank-26+ feature (road OR addressable POI),
