@@ -1025,6 +1025,7 @@ int main(int argc, char* argv[]) {
                         const char* n_boundary = nullptr;
                         const char* n_name = nullptr;
                         const char* n_name_en = nullptr;
+                        const char* n_ref = nullptr;
                         const char* n_wikipedia = nullptr;
                         const char* n_wikidata = nullptr;
                         const char* n_ele = nullptr;
@@ -1058,7 +1059,10 @@ int main(int argc, char* argv[]) {
                                     if (k == "place") n_place = v;
                                     else if (k == "power") n_power = v;
                                     break;
-                                case 'r': if (k == "railway") n_railway = v; break;
+                                case 'r':
+                                    if (k == "railway") n_railway = v;
+                                    else if (k == "ref") n_ref = v;
+                                    break;
                                 case 't': if (k == "tourism") n_tourism = v; break;
                                 case 'w':
                                     if (k == "waterway") n_waterway = v;
@@ -1115,8 +1119,16 @@ int main(int argc, char* argv[]) {
                             }
                         }
 
-                        // Place nodes (settlements) + label-role higher-level place types
-                        if (n_place && best_name) {
+                        // Place nodes (settlements) + label-role higher-level place types.
+                        // Nominatim uses `ref` as the display name when
+                        // `name` is missing (see name_keys handling in
+                        // icu_tokenizer output builders) — most commonly
+                        // on numeric-ref quarter nodes like Moscow's
+                        // place=quarter ref=18 node. Fall back to ref
+                        // so these show up in the address walk.
+                        const char* place_name = best_name;
+                        if (!place_name && n_ref && n_ref[0]) place_name = n_ref;
+                        if (n_place && place_name) {
                             // Settlement types that we store as searchable place_nodes
                             PlaceType settlement_pt = PlaceType::UNKNOWN;
                             if (std::strcmp(n_place, "city") == 0) settlement_pt = PlaceType::CITY;
@@ -1135,7 +1147,7 @@ int main(int argc, char* argv[]) {
                                 pn.lng = static_cast<float>(lng);
                                 pn.place_type = static_cast<uint8_t>(settlement_pt);
                                 tl_node_data->place_nodes.push_back(pn);
-                                tl_node_data->place_names.push_back(best_name);
+                                tl_node_data->place_names.push_back(place_name);
                             }
 
                             // For the label-role lookup, also recognise higher-level
@@ -1607,6 +1619,43 @@ int main(int argc, char* argv[]) {
                                     local.closed_way_admins.push_back({std::move(verts), std::string(aname), uint8_t(15), std::string(), static_cast<uint8_t>(pt), std::move(wd_str)});
                                 }
                             }
+                        }
+                    }
+
+                    // Plain place=* closed ways (no boundary tag). OSM
+                    // commonly tags neighbourhoods, quarters, and
+                    // suburbs as closed ways with `place=*` + `name`
+                    // rather than as `boundary=place` + `place=*`.
+                    // nominatim indexes both forms via placex (class
+                    // = 'place' at import). we miss them if we gate
+                    // only on boundary=place. example: qasr al
+                    // doubara in cairo is a landuse=residential way
+                    // with place=neighbourhood + name:en, and nominatim
+                    // returns it as neighbourhood for queries inside
+                    // the polygon.
+                    if (!boundary && t_place && t_best_name
+                            && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1]) {
+                        AdminPlaceType pt = classify_place_override(nullptr, nullptr, t_place).type;
+                        // Only the rank-20+ place types (neighbourhood,
+                        // quarter, suburb, borough) — higher-level place
+                        // types on closed ways are rare and adding them
+                        // risks promoting a landuse polygon into the
+                        // city / state chain.
+                        bool want = (pt == AdminPlaceType::NEIGHBOURHOOD
+                                  || pt == AdminPlaceType::QUARTER
+                                  || pt == AdminPlaceType::SUBURB
+                                  || pt == AdminPlaceType::BOROUGH);
+                        if (want && all_valid && resolved_locs.size() >= 3) {
+                            std::vector<std::pair<double,double>> verts;
+                            for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});
+                            std::string wd_str = t_wikidata ? t_wikidata : "";
+                            local.closed_way_admins.push_back({
+                                std::move(verts),
+                                std::string(t_best_name),
+                                uint8_t(15),
+                                std::string(),
+                                static_cast<uint8_t>(pt),
+                                std::move(wd_str)});
                         }
                     }
                 });
