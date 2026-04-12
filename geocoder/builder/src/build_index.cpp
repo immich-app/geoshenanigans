@@ -2373,6 +2373,11 @@ int main(int argc, char* argv[]) {
                         std::vector<S2CellId> nbrs;
                         cell.AppendAllNeighbors(kAdminCellLevel, &nbrs);
 
+                        // Pick the closest parent: highest admin_level
+                        // (most immediate), with smallest area as tiebreaker.
+                        // This matches Nominatim's parent_place_id = closest
+                        // containing by rank_address.
+                        uint8_t best_al = 0;
                         float best_area = 1e18f;
                         uint32_t best_id = NO_DATA;
                         auto check_cell = [&](uint64_t cid) {
@@ -2383,7 +2388,9 @@ int main(int argc, char* argv[]) {
                                 if (pid == i || pid >= data.admin_polygons.size()) continue;
                                 const auto& cand = data.admin_polygons[pid];
                                 if (cand.admin_level >= self.admin_level) continue;
-                                if (cand.area >= best_area) continue;
+                                // Prefer highest admin_level (closest parent)
+                                if (cand.admin_level < best_al) continue;
+                                if (cand.admin_level == best_al && cand.area >= best_area) continue;
                                 // PIP check
                                 uint32_t off = cand.vertex_offset;
                                 uint32_t cnt = cand.vertex_count;
@@ -2396,6 +2403,7 @@ int main(int argc, char* argv[]) {
                                         inside = !inside;
                                 }
                                 if (inside) {
+                                    best_al = cand.admin_level;
                                     best_area = cand.area;
                                     best_id = pid;
                                 }
@@ -2445,6 +2453,9 @@ int main(int argc, char* argv[]) {
                         std::vector<S2CellId> nbrs;
                         cell.AppendAllNeighbors(kAdminCellLevel, &nbrs);
 
+                        // Pick the most specific containing polygon:
+                        // highest admin_level, then smallest area.
+                        uint8_t best_al = 0;
                         float best_area = 1e18f;
                         uint32_t best_id = NO_DATA;
                         auto check_cell = [&](uint64_t cid) {
@@ -2454,7 +2465,8 @@ int main(int argc, char* argv[]) {
                                 uint32_t pid = raw_id & 0x7FFFFFFF;
                                 if (pid >= data.admin_polygons.size()) continue;
                                 const auto& cand = data.admin_polygons[pid];
-                                if (cand.area >= best_area) continue;
+                                if (cand.admin_level < best_al) continue;
+                                if (cand.admin_level == best_al && cand.area >= best_area) continue;
                                 uint32_t off = cand.vertex_offset;
                                 uint32_t cnt2 = cand.vertex_count;
                                 if (off + cnt2 > data.admin_vertices.size()) continue;
@@ -2466,6 +2478,7 @@ int main(int argc, char* argv[]) {
                                         inside = !inside;
                                 }
                                 if (inside) {
+                                    best_al = cand.admin_level;
                                     best_area = cand.area;
                                     best_id = pid;
                                 }
