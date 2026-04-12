@@ -2121,9 +2121,21 @@ impl Index {
             }
         }
 
-        // Per-way postcode: if we found a primary street and it has
-        // a postcode from a containing postal boundary, use it.
-        // Matches Nominatim's `calculated_postcode` per placex row.
+        // Postcode fallback chain (matches Nominatim priority):
+        // 1. addr:postcode from the primary feature (already set above)
+        // 2. nearest addr_point with a postcode (wider walk)
+        // 3. per-way postcode from containing postal boundary
+        // 4. admin.postcode from PIP postal boundary (set in find_admin)
+        //
+        // #2 before #3: a building's addr:postcode (06000) is more
+        // specific than the street way's postal boundary (06060).
+        if addr_postcode.is_none() {
+            if let Some(p) = nearest_with_postcode {
+                if p.postcode_id != NO_DATA {
+                    addr_postcode = Some(self.get_string(p.postcode_id));
+                }
+            }
+        }
         if addr_postcode.is_none() {
             if let (Some(ref wpc), Some((_, way))) = (&self.way_postcodes, &street) {
                 let way_id = unsafe {
@@ -2135,16 +2147,6 @@ impl Index {
                 };
                 if way_id < all_postcodes.len() && all_postcodes[way_id] != NO_DATA {
                     addr_postcode = Some(self.get_string(all_postcodes[way_id]));
-                }
-            }
-        }
-
-        // Nominatim fallback: if no postcode yet, walk to the nearest
-        // address point that has one.
-        if addr_postcode.is_none() {
-            if let Some(p) = nearest_with_postcode {
-                if p.postcode_id != NO_DATA {
-                    addr_postcode = Some(self.get_string(p.postcode_id));
                 }
             }
         }
