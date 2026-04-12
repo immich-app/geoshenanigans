@@ -315,6 +315,14 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                         data.admin_parent_ids.size() * sizeof(uint32_t));
             }));
         }
+        // Per-way postcode (parallel array indexed by way_id)
+        if (!data.way_postcode_ids.empty()) {
+            write_futures.push_back(std::async(std::launch::async, [&] {
+                std::ofstream f(output_dir + "/way_postcodes.bin", std::ios::binary);
+                f.write(reinterpret_cast<const char*>(data.way_postcode_ids.data()),
+                        data.way_postcode_ids.size() * sizeof(uint32_t));
+            }));
+        }
         if (write_addresses) {
             write_futures.push_back(std::async(std::launch::async, [&] {
                 std::ofstream f(output_dir + "/addr_points.bin", std::ios::binary);

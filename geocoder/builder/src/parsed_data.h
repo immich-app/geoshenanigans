@@ -139,6 +139,7 @@ struct ParsedData {
     // way_id / polygon_id respectively.
     std::vector<uint32_t> way_parent_ids;    // way → smallest containing admin poly
     std::vector<uint32_t> admin_parent_ids;  // poly → next-larger containing admin poly
+    std::vector<uint32_t> way_postcode_ids;  // way → postcode string from containing postal boundary
 };
 
 // --- Deduplicate IDs per cell ---

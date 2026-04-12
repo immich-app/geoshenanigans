@@ -17,6 +17,7 @@ struct AddrPoint {
     uint32_t housenumber_id;
     uint32_t street_id;
     uint32_t postcode_id;  // offset into strings.bin (NO_DATA if none)
+    uint32_t parent_way_id; // nearest street way index (for housenumber refinement)
 };
 
 struct InterpWay {

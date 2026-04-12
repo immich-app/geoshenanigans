@@ -2327,9 +2327,9 @@ int main(int argc, char* argv[]) {
                         //
                         // For city/town/village (pt 0-2): parent at L3+
                         // For suburb/hamlet (pt 3-4): parent at L6+
-                        // For neighbourhood/quarter (pt 5-6): parent at L8+
+                        // For neighbourhood/quarter (pt 5-6): parent at L9+
                         uint8_t pt = pn.place_type;
-                        uint8_t min_parent_al = (pt <= 2) ? 3 : (pt <= 4) ? 6 : 8;
+                        uint8_t min_parent_al = (pt <= 2) ? 3 : (pt <= 4) ? 6 : 9;
                         for (uint32_t poly_id : cand) {
                             const auto& p = data.admin_polygons[poly_id];
                             if (p.admin_level < min_parent_al) continue;
@@ -2443,6 +2443,7 @@ int main(int argc, char* argv[]) {
         {
             auto _wp_t = std::chrono::steady_clock::now();
             data.way_parent_ids.assign(data.ways.size(), NO_DATA);
+            data.way_postcode_ids.assign(data.ways.size(), NO_DATA);
             std::atomic<size_t> way_idx{0};
             std::atomic<uint64_t> way_linked{0};
             std::vector<std::thread> workers;
@@ -2468,9 +2469,13 @@ int main(int argc, char* argv[]) {
 
                         // Pick the most specific containing polygon:
                         // highest admin_level, then smallest area.
+                        // Skip admin_level > 10 (postal boundaries) for parent chain.
                         uint8_t best_al = 0;
                         float best_area = 1e18f;
                         uint32_t best_id = NO_DATA;
+                        // Also find containing postal boundary for postcode
+                        float best_postal_area = 1e18f;
+                        uint32_t best_postal_id = NO_DATA;
                         auto check_cell = [&](uint64_t cid) {
                             auto it = data.cell_to_admin.find(cid);
                             if (it == data.cell_to_admin.end()) return;
@@ -2478,8 +2483,11 @@ int main(int argc, char* argv[]) {
                                 uint32_t pid = raw_id & 0x7FFFFFFF;
                                 if (pid >= data.admin_polygons.size()) continue;
                                 const auto& cand = data.admin_polygons[pid];
-                                if (cand.admin_level < best_al) continue;
-                                if (cand.admin_level == best_al && cand.area >= best_area) continue;
+                                bool dominated_parent = (cand.admin_level < best_al) ||
+                                    (cand.admin_level == best_al && cand.area >= best_area);
+                                bool dominated_postal = (cand.admin_level != 11) ||
+                                    (cand.area >= best_postal_area);
+                                if (dominated_parent && dominated_postal) continue;
                                 uint32_t off = cand.vertex_offset;
                                 uint32_t cnt2 = cand.vertex_count;
                                 if (off + cnt2 > data.admin_vertices.size()) continue;
@@ -2491,9 +2499,18 @@ int main(int argc, char* argv[]) {
                                         inside = !inside;
                                 }
                                 if (inside) {
-                                    best_al = cand.admin_level;
-                                    best_area = cand.area;
-                                    best_id = pid;
+                                    if (cand.admin_level <= 10) {
+                                        if (cand.admin_level > best_al ||
+                                            (cand.admin_level == best_al && cand.area < best_area)) {
+                                            best_al = cand.admin_level;
+                                            best_area = cand.area;
+                                            best_id = pid;
+                                        }
+                                    }
+                                    if (cand.admin_level == 11 && cand.area < best_postal_area) {
+                                        best_postal_area = cand.area;
+                                        best_postal_id = pid;
+                                    }
                                 }
                             }
                         };
@@ -2502,6 +2519,9 @@ int main(int argc, char* argv[]) {
                         if (best_id != NO_DATA) {
                             data.way_parent_ids[i] = best_id;
                             way_linked.fetch_add(1);
+                        }
+                        if (best_postal_id != NO_DATA) {
+                            data.way_postcode_ids[i] = data.admin_polygons[best_postal_id].name_id;
                         }
                     }
                 });
@@ -2871,7 +2891,7 @@ int main(int argc, char* argv[]) {
                             size_t i = ap_idx.fetch_add(1);
                             if (i >= data.addr_points.size()) break;
                             auto& ap = data.addr_points[i];
-                            if (ap.street_id != NO_DATA) continue;
+                            ap.parent_way_id = NO_DATA;
 
                             float plat = ap.lat;
                             float plng = ap.lng;
@@ -2897,6 +2917,7 @@ int main(int argc, char* argv[]) {
 
                             double best_d2 = 1e18;
                             uint32_t best_name = NO_DATA;
+                            uint32_t best_way_idx = NO_DATA;
                             const double cos_lat = std::cos(
                                 plat * M_PI / 180.0);
                             for (uint64_t cid : cells_to_check) {
@@ -2943,12 +2964,16 @@ int main(int argc, char* argv[]) {
                                         if (d2 < best_d2) {
                                             best_d2 = d2;
                                             best_name = w.name_id;
+                                            best_way_idx = way_id;
                                         }
                                     }
                                 }
                             }
-                            if (best_name != NO_DATA) {
-                                ap.street_id = best_name;
+                            if (best_way_idx != NO_DATA) {
+                                ap.parent_way_id = best_way_idx;
+                                if (ap.street_id == NO_DATA) {
+                                    ap.street_id = best_name;
+                                }
                                 ap_linked.fetch_add(1);
                             }
                         }
@@ -3377,19 +3402,27 @@ int main(int argc, char* argv[]) {
             };
             std::sort(data.sorted_way_cells.begin(), data.sorted_way_cells.end(), cmp);
             data.cell_to_ways.clear();
-            // Remap way_parent_ids: reorder + dedup
-            if (data.way_parent_ids.size() == n) {
-                std::vector<uint32_t> new_wp(data.ways.size());
+            // Remap way_parent_ids + way_postcode_ids: reorder + dedup
+            auto remap_way_vec = [&](std::vector<uint32_t>& vec) {
+                if (vec.size() != n) return;
+                std::vector<uint32_t> nv(data.ways.size(), NO_DATA);
                 for (uint32_t i = 0; i < n; i++) {
                     uint32_t new_idx = old_to_new[i];
-                    // For deduped ways, the first occurrence wins
-                    if (new_idx < new_wp.size()) {
-                        uint32_t val = data.way_parent_ids[i];
-                        if (new_wp[new_idx] == 0 || val != NO_DATA)
-                            new_wp[new_idx] = val;
+                    if (new_idx < nv.size()) {
+                        uint32_t val = vec[i];
+                        if (nv[new_idx] == NO_DATA || val != NO_DATA)
+                            nv[new_idx] = val;
                     }
                 }
-                data.way_parent_ids = std::move(new_wp);
+                vec = std::move(nv);
+            };
+            remap_way_vec(data.way_parent_ids);
+            remap_way_vec(data.way_postcode_ids);
+            // Remap addr_point parent_way_id references through way old_to_new
+            for (auto& a : data.addr_points) {
+                if (a.parent_way_id != NO_DATA && a.parent_way_id < n) {
+                    a.parent_way_id = old_to_new[a.parent_way_id];
+                }
             }
             std::cerr << "  Ways sorted: " << n << " (" << deduped << " duplicates removed)" << std::endl;
         }
@@ -4055,7 +4088,7 @@ int main(int argc, char* argv[]) {
 
         std::ofstream mf(output_dir + "/manifest.json");
         mf << "{\n";
-        mf << "  \"build_version\": 5,\n";
+        mf << "  \"build_version\": 6,\n";
         mf << "  \"patch_version\": 4,\n";
         mf << "  \"regions\": {\n";
 
