@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "geometry.h"
+#include "postcode_validation.h"
 #include "s2_helpers.h"
 
 #include <s2/s2latlng.h>
@@ -394,20 +395,61 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
     }));
 
     // Write postcode centroid index (optional files)
+    // Validate each centroid's postcode against the country's pattern
+    // (matching Nominatim's clean_postcodes sanitizer).
     if (!data.postcode_accum.empty()) {
         write_futures.push_back(std::async(std::launch::async, [&] {
-            // Build centroid vector from accumulated data
+            // Build centroid vector with per-country validation
+            const auto& sp = data.string_pool.data();
+            auto get_str = [&](uint32_t off) -> const char* {
+                return sp.data() + off;
+            };
+            // Find country code for each centroid by looking up the
+            // containing L2 admin polygon via cell_to_admin.
             std::vector<PostcodeCentroid> centroids;
             centroids.reserve(data.postcode_accum.size());
+            uint32_t rejected = 0;
             for (const auto& [pc_id, acc] : data.postcode_accum) {
                 if (acc.count == 0) continue;
+                float clat = static_cast<float>(acc.sum_lat / acc.count);
+                float clng = static_cast<float>(acc.sum_lng / acc.count);
+                // Look up country from admin polygons
+                S2CellId cell = S2CellId(S2LatLng::FromDegrees(clat, clng)).parent(kAdminCellLevel);
+                uint16_t country_code = 0;
+                auto it = data.cell_to_admin.find(cell.id());
+                if (it != data.cell_to_admin.end()) {
+                    for (uint32_t raw_id : it->second) {
+                        uint32_t pid = raw_id & 0x7FFFFFFF;
+                        if (pid >= data.admin_polygons.size()) continue;
+                        const auto& poly = data.admin_polygons[pid];
+                        if (poly.admin_level == 2 && poly.country_code != 0) {
+                            country_code = poly.country_code;
+                            break;
+                        }
+                    }
+                }
+                // Validate postcode against country pattern
+                const char* pc_str = get_str(pc_id);
+                if (country_code != 0) {
+                    char cc[3] = {
+                        static_cast<char>(std::tolower(country_code >> 8)),
+                        static_cast<char>(std::tolower(country_code & 0xFF)),
+                        0
+                    };
+                    if (!validate_postcode_for_country(cc, pc_str)) {
+                        rejected++;
+                        continue;
+                    }
+                }
                 PostcodeCentroid c{};
-                c.lat = static_cast<float>(acc.sum_lat / acc.count);
-                c.lng = static_cast<float>(acc.sum_lng / acc.count);
+                c.lat = clat;
+                c.lng = clng;
                 c.postcode_id = pc_id;
-                c.country_code = acc.country_code;
+                c.country_code = country_code;
                 centroids.push_back(c);
             }
+            std::cerr << "Postcode centroids: " << centroids.size() << " valid, "
+                      << rejected << " rejected by country pattern" << std::endl;
             // Sort by postcode_id for determinism
             std::sort(centroids.begin(), centroids.end(),
                 [](const PostcodeCentroid& a, const PostcodeCentroid& b) {

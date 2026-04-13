@@ -1222,7 +1222,9 @@ int main(int argc, char* argv[]) {
                         add_addr_point(data, local.addr_coords[j].first, local.addr_coords[j].second,
                                        local.addr_strings[j].first.c_str(),
                                        local.addr_strings[j].second.c_str(), pc_ptr, dummy);
-                        // Accumulate postcode centroids (validated)
+                        // Accumulate postcode centroids (basic validation;
+                        // per-country pattern validation happens later when
+                        // building the centroid index).
                         const auto& pc = local.addr_postcodes[j];
                         if (!pc.empty() && is_valid_postcode(pc.c_str())) {
                             uint32_t pc_id = data.string_pool.intern(pc.c_str());
