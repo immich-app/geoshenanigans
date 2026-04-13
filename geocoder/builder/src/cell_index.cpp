@@ -483,7 +483,9 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
         for (auto& w : workers) w.join();
     }
 
-    // Sequential: build new polygon and vertex arrays, separating postal (admin_level=11)
+    // Sequential: build new polygon/vertex arrays. Postal boundaries
+    // (admin_level=11) are kept in the main arrays (cell index references
+    // them by ID) AND also written to separate optional files.
     std::vector<AdminPolygon> postal_polys;
     std::vector<NodeCoord> postal_verts;
 
@@ -492,19 +494,26 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
         if (sv.size() < 3) continue;
 
         AdminPolygon np = data.admin_polygons[i];
-        bool is_postal = (np.admin_level == 11);
 
-        auto& target_polys = is_postal ? postal_polys : new_polys;
-        auto& target_verts = is_postal ? postal_verts : new_verts;
-
-        np.vertex_offset = static_cast<uint32_t>(target_verts.size());
+        // All polys go into the main arrays (preserving cell index IDs)
+        np.vertex_offset = static_cast<uint32_t>(new_verts.size());
         np.vertex_count = static_cast<uint32_t>(sv.size());
         np.area = polygon_area(sv);
 
         for (const auto& [lat, lng] : sv) {
-            target_verts.push_back({static_cast<float>(lat), static_cast<float>(lng)});
+            new_verts.push_back({static_cast<float>(lat), static_cast<float>(lng)});
         }
-        target_polys.push_back(np);
+        new_polys.push_back(np);
+
+        // Postal also go into separate files (for optional loading)
+        if (np.admin_level == 11) {
+            AdminPolygon pp = np;
+            pp.vertex_offset = static_cast<uint32_t>(postal_verts.size());
+            for (const auto& [lat, lng] : sv) {
+                postal_verts.push_back({static_cast<float>(lat), static_cast<float>(lng)});
+            }
+            postal_polys.push_back(pp);
+        }
     }
 
     std::cerr << "Quality " << epsilon_scale << "x: " << new_polys.size()
