@@ -1307,7 +1307,54 @@ impl Index {
 
     // --- Place node lookup (nearest city/town/village/suburb) ---
 
-    fn find_places(&self, lat: f64, lng: f64) -> PlaceResult<'_> {
+    // Find the smallest admin polygon at admin_level >= 8 (city/suburb
+    // level) that contains the query point. This is Nominatim's
+    // `current_boundary` used in the cascading containment gate for
+    // place nodes (placex_triggers.sql lines 597-600, 627-635).
+    fn find_current_boundary(&self, lat: f64, lng: f64) -> Option<&AdminPolygon> {
+        let all_polygons: &[AdminPolygon] = unsafe {
+            std::slice::from_raw_parts(
+                self.admin_polygons.as_ptr() as *const AdminPolygon,
+                self.admin_polygons.len() / std::mem::size_of::<AdminPolygon>(),
+            )
+        };
+        let all_vertices: &[NodeCoord] = unsafe {
+            std::slice::from_raw_parts(
+                self.admin_vertices.as_ptr() as *const NodeCoord,
+                self.admin_vertices.len() / std::mem::size_of::<NodeCoord>(),
+            )
+        };
+        let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
+        let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
+
+        const ID_MASK: u32 = 0x7FFFFFFF;
+        let mut best: Option<&AdminPolygon> = None;
+        let mut best_area: f32 = f32::MAX;
+
+        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+            Self::for_each_entry(&self.admin_entries, Self::lookup_admin_cell(&self.admin_cells, c), |id| {
+                let poly_id = (id & ID_MASK) as usize;
+                if poly_id >= all_polygons.len() { return; }
+                let poly = &all_polygons[poly_id];
+                // Only city/suburb level and deeper (admin_level >= 8)
+                // Matches Nominatim's current_boundary which gets
+                // updated for rank_address != 11 AND rank_address != 5
+                if poly.admin_level < 8 || poly.admin_level > 10 { return; }
+                if poly.area >= best_area { return; }
+                let offset = poly.vertex_offset as usize;
+                let count = poly.vertex_count as usize;
+                if offset + count > all_vertices.len() { return; }
+                let verts = &all_vertices[offset..offset + count];
+                if point_in_polygon(lat as f32, lng as f32, verts) {
+                    best_area = poly.area;
+                    best = Some(poly);
+                }
+            });
+        }
+        best
+    }
+
+    fn find_places(&self, lat: f64, lng: f64, current_boundary: Option<&AdminPolygon>) -> PlaceResult<'_> {
         let place_cells = match &self.place_cells {
             Some(c) => c,
             None => return PlaceResult::default(),
@@ -1367,45 +1414,44 @@ impl Index {
         // than the bare radius. We can't emulate that so we use
         // tighter radii — wide enough for the correct quarter/
         // neighbourhood to win, tight enough to not inject extras.
-        let max_rank17 = (0.08_f64).to_radians().powi(2); // city/town/village
-        let max_rank19 = (0.02_f64).to_radians().powi(2); // suburb / hamlet
-        let max_rank20 = (0.005_f64).to_radians().powi(2); // quarter / neighbourhood
+        // Per-rank search radii matching Nominatim's
+        // reverse_place_diameter (lib-sql/functions/ranking.sql):
+        //   rank_search ≤ 17 (city):  0.16 deg
+        //   rank_search = 18 (town):  0.08 deg
+        //   rank_search = 19 (village): 0.04 deg
+        //   rank_search ≥ 20 (suburb/hamlet/quarter/neighbourhood): 0.02 deg
+        let max_city = (0.16_f64).to_radians().powi(2);
+        let max_town = (0.08_f64).to_radians().powi(2);
+        let max_village = (0.04_f64).to_radians().powi(2);
+        let max_rank20 = (0.02_f64).to_radians().powi(2);
 
-        // Containment gate: for suburb and deeper (pt ≥ 3), only accept a
-        // place-node candidate if it's inside its pre-computed parent
-        // admin polygon AND the query point is also inside that same
-        // polygon. Mirrors Nominatim's insert_addresslines ST_Contains
-        // behaviour — the node is attached to the address chain only if
-        // both the road and the node sit in the same containing polygon.
+        // Nominatim's cascading containment gate (placex_triggers.sql
+        // lines 597-600): place nodes (isguess=true) are rejected if
+        // their centroid is NOT inside `current_boundary` — the
+        // geometry of the last accepted non-guess admin boundary.
         //
-        // The builder stores parent_poly_id per place node (smallest
-        // admin polygon by area containing the node centroid). Fall back
-        // to radius-only when parent_poly_id is unset (legacy data or
-        // unmatched node).
-        let all_polygons: &[AdminPolygon] = unsafe {
-            std::slice::from_raw_parts(
-                self.admin_polygons.as_ptr() as *const AdminPolygon,
-                self.admin_polygons.len() / std::mem::size_of::<AdminPolygon>(),
-            )
-        };
+        // We implement this by PIP-testing the PLACE NODE's lat/lng
+        // against `current_boundary` (the smallest accepted admin
+        // polygon from find_admin). This is the correct Nominatim
+        // check: the NODE must be inside the boundary, not the query.
         let all_vertices: &[NodeCoord] = unsafe {
             std::slice::from_raw_parts(
                 self.admin_vertices.as_ptr() as *const NodeCoord,
                 self.admin_vertices.len() / std::mem::size_of::<NodeCoord>(),
             )
         };
-        let parent_contains_query = |pn: &PlaceNode| -> bool {
-            if pn.parent_poly_id == u32::MAX {
-                return true; // no parent info, fall through to radius-only
+        let node_inside_boundary = |pn: &PlaceNode| -> bool {
+            match current_boundary {
+                None => true, // no admin boundary found — accept all
+                Some(poly) => {
+                    let off = poly.vertex_offset as usize;
+                    let cnt = poly.vertex_count as usize;
+                    if off + cnt > all_vertices.len() { return true; }
+                    let verts = &all_vertices[off..off + cnt];
+                    // PIP test the PLACE NODE's centroid, not the query point
+                    point_in_polygon(pn.lat, pn.lng, verts)
+                }
             }
-            let pid = pn.parent_poly_id as usize;
-            if pid >= all_polygons.len() { return true; }
-            let poly = &all_polygons[pid];
-            let off = poly.vertex_offset as usize;
-            let cnt = poly.vertex_count as usize;
-            if off + cnt > all_vertices.len() { return true; }
-            let verts = &all_vertices[off..off + cnt];
-            point_in_polygon(lat as f32, lng as f32, verts)
         };
 
         // City / town / village: no containment gate — the query may
@@ -1414,7 +1460,12 @@ impl Index {
         // our builder would pick as a parent.
         for pt in [0, 1, 2] {
             if let Some((dist_sq, pn)) = best[pt] {
-                if dist_sq <= max_rank17 {
+                let threshold = match pt {
+                    0 => max_city,    // city: 0.16 deg
+                    1 => max_town,    // town: 0.08 deg
+                    _ => max_village, // village: 0.04 deg
+                };
+                if dist_sq <= threshold {
                     let name = self.get_string(pn.name_id);
                     match pt {
                         0 => result.city = Some(name),
@@ -1426,25 +1477,41 @@ impl Index {
             }
         }
 
-        if let Some((dist_sq, pn)) = best[3] {
-            if dist_sq <= max_rank19 && parent_contains_query(pn) {
-                result.suburb = Some(self.get_string(pn.name_id));
+        // Nominatim's address_havelevel dedup: only ONE entry per
+        // rank_address. suburb(rank 20) and hamlet(rank 20) share the
+        // same rank — pick the closer one. Same for quarter(rank 22)
+        // and neighbourhood(rank 22). This matches insert_addresslines
+        // line 603: `location_isaddress := not address_havelevel[rank]`.
+        let suburb_valid = best[3].filter(|(d, pn)| *d <= max_rank20 && node_inside_boundary(pn));
+        let hamlet_valid = best[4].filter(|(d, pn)| *d <= max_rank20 && node_inside_boundary(pn));
+        // rank 20: closest of suburb/hamlet wins
+        match (suburb_valid, hamlet_valid) {
+            (Some((sd, sp)), Some((hd, hp))) => {
+                if sd <= hd {
+                    result.suburb = Some(self.get_string(sp.name_id));
+                } else {
+                    result.hamlet = Some(self.get_string(hp.name_id));
+                }
             }
+            (Some((_, pn)), None) => result.suburb = Some(self.get_string(pn.name_id)),
+            (None, Some((_, pn))) => result.hamlet = Some(self.get_string(pn.name_id)),
+            (None, None) => {}
         }
-        if let Some((dist_sq, pn)) = best[4] {
-            if dist_sq <= max_rank19 && parent_contains_query(pn) {
-                result.hamlet = Some(self.get_string(pn.name_id));
+
+        let quarter_valid = best[6].filter(|(d, pn)| *d <= max_rank20 && node_inside_boundary(pn));
+        let neigh_valid = best[5].filter(|(d, pn)| *d <= max_rank20 && node_inside_boundary(pn));
+        // rank 22: closest of quarter/neighbourhood wins
+        match (quarter_valid, neigh_valid) {
+            (Some((qd, qp)), Some((nd, np))) => {
+                if qd <= nd {
+                    result.quarter = Some(self.get_string(qp.name_id));
+                } else {
+                    result.neighbourhood = Some(self.get_string(np.name_id));
+                }
             }
-        }
-        if let Some((dist_sq, pn)) = best[6] {
-            if dist_sq <= max_rank20 && parent_contains_query(pn) {
-                result.quarter = Some(self.get_string(pn.name_id));
-            }
-        }
-        if let Some((dist_sq, pn)) = best[5] {
-            if dist_sq <= max_rank20 && parent_contains_query(pn) {
-                result.neighbourhood = Some(self.get_string(pn.name_id));
-            }
+            (Some((_, pn)), None) => result.quarter = Some(self.get_string(pn.name_id)),
+            (None, Some((_, pn))) => result.neighbourhood = Some(self.get_string(pn.name_id)),
+            (None, None) => {}
         }
 
         result
@@ -1945,7 +2012,12 @@ impl Index {
         let max_dist = self.max_distance_sq;
 
         // Run geo lookups first so we know the primary street
-        let place = self.find_places(lat, lng);
+        // Find the smallest admin polygon containing the query at
+        // admin_level >= 8 (city/suburb level). This is Nominatim's
+        // `current_boundary` — the geometry that place nodes must
+        // sit inside to be accepted in the address walk.
+        let current_boundary = self.find_current_boundary(lat, lng);
+        let place = self.find_places(lat, lng, current_boundary);
         let (addr, interp, street, nearest_with_postcode) = self.query_geo(lat, lng);
 
         // Use the standard PIP-based admin walk. The chain-based walk
