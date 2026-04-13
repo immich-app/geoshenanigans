@@ -15,6 +15,8 @@
 #include "geometry.h"
 #include "s2_helpers.h"
 
+#include <s2/s2latlng.h>
+
 std::vector<uint32_t> write_entries(
     const std::string& path,
     const std::vector<uint64_t>& sorted_cells,
@@ -383,6 +385,50 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
         }
     }));
 
+    // Write postcode centroid index (optional files)
+    if (!data.postcode_accum.empty()) {
+        write_futures.push_back(std::async(std::launch::async, [&] {
+            // Build centroid vector from accumulated data
+            std::vector<PostcodeCentroid> centroids;
+            centroids.reserve(data.postcode_accum.size());
+            for (const auto& [pc_id, acc] : data.postcode_accum) {
+                if (acc.count == 0) continue;
+                PostcodeCentroid c{};
+                c.lat = static_cast<float>(acc.sum_lat / acc.count);
+                c.lng = static_cast<float>(acc.sum_lng / acc.count);
+                c.postcode_id = pc_id;
+                c.country_code = acc.country_code;
+                centroids.push_back(c);
+            }
+            // Sort by postcode_id for determinism
+            std::sort(centroids.begin(), centroids.end(),
+                [](const PostcodeCentroid& a, const PostcodeCentroid& b) {
+                    return a.postcode_id < b.postcode_id;
+                });
+
+            // Write flat centroid array
+            {
+                std::ofstream f(output_dir + "/postcode_centroids.bin", std::ios::binary);
+                f.write(reinterpret_cast<const char*>(centroids.data()),
+                        centroids.size() * sizeof(PostcodeCentroid));
+            }
+
+            // Build S2 cell index for spatial lookup
+            std::unordered_map<uint64_t, std::vector<uint32_t>> centroid_cells;
+            for (uint32_t i = 0; i < centroids.size(); i++) {
+                S2CellId cell = S2CellId(S2LatLng::FromDegrees(
+                    centroids[i].lat, centroids[i].lng)).parent(kAdminCellLevel);
+                centroid_cells[cell.id()].push_back(i);
+            }
+            write_cell_index(output_dir + "/postcode_centroid_cells.bin",
+                             output_dir + "/postcode_centroid_entries.bin",
+                             centroid_cells);
+
+            std::cerr << "postcode centroids: " << centroids.size() << " entries, "
+                      << centroid_cells.size() << " cells" << std::endl;
+        }));
+    }
+
     log_phase("  Write: parallel data files launched", _wt);
     admin_future.get();
     for (auto& f : write_futures) f.get();
@@ -437,27 +483,36 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
         for (auto& w : workers) w.join();
     }
 
-    // Sequential: build new polygon and vertex arrays
+    // Sequential: build new polygon and vertex arrays, separating postal (admin_level=11)
+    std::vector<AdminPolygon> postal_polys;
+    std::vector<NodeCoord> postal_verts;
+
     for (size_t i = 0; i < data.admin_polygons.size(); i++) {
         auto& sv = simplified[i].verts;
         if (sv.size() < 3) continue;
 
         AdminPolygon np = data.admin_polygons[i];
-        np.vertex_offset = static_cast<uint32_t>(new_verts.size());
+        bool is_postal = (np.admin_level == 11);
+
+        auto& target_polys = is_postal ? postal_polys : new_polys;
+        auto& target_verts = is_postal ? postal_verts : new_verts;
+
+        np.vertex_offset = static_cast<uint32_t>(target_verts.size());
         np.vertex_count = static_cast<uint32_t>(sv.size());
         np.area = polygon_area(sv);
 
         for (const auto& [lat, lng] : sv) {
-            new_verts.push_back({static_cast<float>(lat), static_cast<float>(lng)});
+            target_verts.push_back({static_cast<float>(lat), static_cast<float>(lng)});
         }
-        new_polys.push_back(np);
+        target_polys.push_back(np);
     }
 
     std::cerr << "Quality " << epsilon_scale << "x: " << new_polys.size()
-              << " polygons, " << new_verts.size() << " vertices ("
-              << new_verts.size() * 8 / 1024 / 1024 << " MiB)" << std::endl;
+              << " admin polygons, " << new_verts.size() << " vertices ("
+              << new_verts.size() * 8 / 1024 / 1024 << " MiB)"
+              << ", " << postal_polys.size() << " postal polygons" << std::endl;
 
-    // Write admin files
+    // Write admin files (excluding postal)
     {
         std::ofstream f(output_dir + "/admin_polygons.bin", std::ios::binary);
         f.write(reinterpret_cast<const char*>(new_polys.data()), new_polys.size() * sizeof(AdminPolygon));
@@ -467,7 +522,19 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
         f.write(reinterpret_cast<const char*>(new_verts.data()), new_verts.size() * sizeof(NodeCoord));
     }
 
-    // Quality directories only contain the two files that change.
+    // Write postal boundary files (optional, admin_level=11 only)
+    if (!postal_polys.empty()) {
+        {
+            std::ofstream f(output_dir + "/postal_polygons.bin", std::ios::binary);
+            f.write(reinterpret_cast<const char*>(postal_polys.data()), postal_polys.size() * sizeof(AdminPolygon));
+        }
+        {
+            std::ofstream f(output_dir + "/postal_vertices.bin", std::ios::binary);
+            f.write(reinterpret_cast<const char*>(postal_verts.data()), postal_verts.size() * sizeof(NodeCoord));
+        }
+    }
+
+    // Quality directories only contain the files that change.
     // Shared files (admin_cells.bin, admin_entries.bin, strings.bin)
     // stay in the parent directory.
 }

@@ -213,19 +213,13 @@ static std::unordered_map<uint32_t, uint32_t> build_string_remap(
 // --- Remap + fixup helpers ---
 
 static void remap_addr_points(char* data, size_t size, const std::unordered_map<uint32_t,uint32_t>& rm) {
-    // AddrPoint: 20 bytes (lat:4 + lng:4 + housenumber_id:4 + street_id:4 + postcode_id:4)
-    // String fields at offsets 8, 12, 16
-    size_t stride = (size % 20 == 0 && size / 20 > 0) ? 20 : 16; // backwards compat
+    // AddrPoint: 20 bytes (lat:4 + lng:4 + housenumber_id:4 + street_id:4 + parent_way_id:4)
+    // String fields at offsets 8, 12 (parent_way_id at 16 is not a string offset)
+    constexpr size_t stride = 20;
     for (size_t i = 0; i + stride <= size; i += stride) {
         for (size_t off : {8, 12}) {
             uint32_t v; memcpy(&v, data + i + off, 4);
             auto it = rm.find(v); if (it != rm.end()) memcpy(data + i + off, &it->second, 4);
-        }
-        if (stride >= 20) {
-            uint32_t v; memcpy(&v, data + i + 16, 4);
-            if (v != 0xFFFFFFFF) { // NO_DATA = no postcode
-                auto it = rm.find(v); if (it != rm.end()) memcpy(data + i + 16, &it->second, 4);
-            }
         }
     }
 }

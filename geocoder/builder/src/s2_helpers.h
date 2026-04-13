@@ -89,7 +89,6 @@ inline std::vector<std::pair<double,double>> simplify_admin_polygon(
 
 void add_addr_point(ParsedData& data, double lat, double lng,
                     const char* housenumber, const char* street,
-                    const char* postcode,
                     uint64_t& addr_count_total);
 
 void add_admin_polygon(ParsedData& data,

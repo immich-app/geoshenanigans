@@ -228,7 +228,6 @@ void AdminCoverPool::worker_loop() {
 
 void add_addr_point(ParsedData& data, double lat, double lng,
                     const char* housenumber, const char* street,
-                    const char* postcode,
                     uint64_t& addr_count_total) {
     uint32_t addr_id = static_cast<uint32_t>(data.addr_points.size());
     // Store NO_DATA as the street_id sentinel when addr:street is
@@ -243,7 +242,7 @@ void add_addr_point(ParsedData& data, double lat, double lng,
         static_cast<float>(lng),
         data.string_pool.intern(housenumber),
         street_id,
-        (postcode && postcode[0]) ? data.string_pool.intern(postcode) : NO_DATA
+        NO_DATA  // parent_way_id — filled in during nearest-street sweep
     });
 
     S2CellId cell = point_to_cell(lat, lng);

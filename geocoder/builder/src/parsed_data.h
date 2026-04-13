@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -140,6 +141,12 @@ struct ParsedData {
     std::vector<uint32_t> way_parent_ids;    // way → smallest containing admin poly
     std::vector<uint32_t> admin_parent_ids;  // poly → next-larger containing admin poly
     std::vector<uint32_t> way_postcode_ids;  // way → postcode string from containing postal boundary
+
+    // Postcode centroid collector: (postcode_string_id → sum_lat, sum_lng, count)
+    // Built during addr_point extraction, converted to PostcodeCentroid[] at write time.
+    struct PostcodeAccum { double sum_lat = 0; double sum_lng = 0; uint64_t count = 0; uint16_t country_code = 0; };
+    std::unordered_map<uint32_t, PostcodeAccum> postcode_accum;
+    std::mutex postcode_mutex;
 };
 
 // --- Deduplicate IDs per cell ---

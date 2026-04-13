@@ -16,8 +16,17 @@ struct AddrPoint {
     float lng;
     uint32_t housenumber_id;
     uint32_t street_id;
-    uint32_t postcode_id;  // offset into strings.bin (NO_DATA if none)
     uint32_t parent_way_id; // nearest street way index (for housenumber refinement)
+};
+
+// Postcode centroid: one per unique postcode string, stored in
+// postcode_centroids.bin. Matches Nominatim's location_postcode table.
+struct PostcodeCentroid {
+    float lat;
+    float lng;
+    uint32_t postcode_id;  // offset into strings.bin
+    uint16_t country_code;
+    uint16_t _pad = 0;
 };
 
 struct InterpWay {

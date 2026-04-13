@@ -1200,10 +1200,18 @@ int main(int argc, char* argv[]) {
                 for (auto& local : ntld) {
                     for (size_t j = 0; j < local.addr_coords.size(); j++) {
                         uint64_t dummy = 0;
-                        const char* pc = local.addr_postcodes[j].empty() ? nullptr : local.addr_postcodes[j].c_str();
                         add_addr_point(data, local.addr_coords[j].first, local.addr_coords[j].second,
                                        local.addr_strings[j].first.c_str(),
-                                       local.addr_strings[j].second.c_str(), pc, dummy);
+                                       local.addr_strings[j].second.c_str(), dummy);
+                        // Accumulate postcode centroids
+                        const auto& pc = local.addr_postcodes[j];
+                        if (!pc.empty()) {
+                            uint32_t pc_id = data.string_pool.intern(pc.c_str());
+                            auto& acc = data.postcode_accum[pc_id];
+                            acc.sum_lat += local.addr_coords[j].first;
+                            acc.sum_lng += local.addr_coords[j].second;
+                            acc.count++;
+                        }
                     }
                     total_addrs += local.count;
                 }
@@ -1692,10 +1700,18 @@ int main(int argc, char* argv[]) {
                     // Merge building addresses
                     for (size_t i = 0; i < local.building_addrs.size(); i++) {
                         uint64_t dummy = 0;
-                        const char* pc = local.addr_postcodes[i].empty() ? nullptr : local.addr_postcodes[i].c_str();
                         add_addr_point(data, local.building_addrs[i].lat, local.building_addrs[i].lng,
                                        local.addr_strings[i].first.c_str(),
-                                       local.addr_strings[i].second.c_str(), pc, dummy);
+                                       local.addr_strings[i].second.c_str(), dummy);
+                        // Accumulate postcode centroids
+                        const auto& pc = local.addr_postcodes[i];
+                        if (!pc.empty()) {
+                            uint32_t pc_id = data.string_pool.intern(pc.c_str());
+                            auto& acc = data.postcode_accum[pc_id];
+                            acc.sum_lat += local.building_addrs[i].lat;
+                            acc.sum_lng += local.building_addrs[i].lng;
+                            acc.count++;
+                        }
                     }
 
                     // Merge interpolation ways
@@ -3251,7 +3267,6 @@ int main(int argc, char* argv[]) {
                     // street_id may be NO_DATA if the parent-street
                     // backfill sweep didn't find a nearby named way.
                     if (a.street_id != NO_DATA) a.street_id = rm.at(a.street_id);
-                    if (a.postcode_id != NO_DATA) a.postcode_id = rm.at(a.postcode_id);
                 }
                 for (auto& iw : data.interp_ways) iw.street_id = rm.at(iw.street_id);
                 for (auto& ap : data.admin_polygons) ap.name_id = rm.at(ap.name_id);
@@ -3275,6 +3290,19 @@ int main(int argc, char* argv[]) {
                         else pc = NO_DATA;
                     }
                 }
+                // Remap postcode_accum keys and build centroid vector
+                {
+                    std::unordered_map<uint32_t, ParsedData::PostcodeAccum> remapped;
+                    remapped.reserve(data.postcode_accum.size());
+                    for (auto& [old_id, acc] : data.postcode_accum) {
+                        auto it = rm.find(old_id);
+                        if (it != rm.end()) {
+                            remapped[it->second] = acc;
+                        }
+                    }
+                    data.postcode_accum = std::move(remapped);
+                }
+
                 std::cerr << "  String pool sorted: " << strings.size() << " strings" << std::endl;
             }
         }
@@ -3299,7 +3327,6 @@ int main(int argc, char* argv[]) {
                 const auto& pa = data.addr_points[a];
                 const auto& pb = data.addr_points[b];
                 if (pa.street_id != pb.street_id) return pa.street_id < pb.street_id;
-                if (pa.postcode_id != pb.postcode_id) return pa.postcode_id < pb.postcode_id;
                 if (pa.housenumber_id != pb.housenumber_id) return pa.housenumber_id < pb.housenumber_id;
                 uint32_t la = float_bits(pa.lat), lb = float_bits(pb.lat);
                 if (la != lb) return la < lb;
@@ -4096,7 +4123,7 @@ int main(int argc, char* argv[]) {
 
         std::ofstream mf(output_dir + "/manifest.json");
         mf << "{\n";
-        mf << "  \"build_version\": 6,\n";
+        mf << "  \"build_version\": 7,\n";
         mf << "  \"patch_version\": 4,\n";
         mf << "  \"regions\": {\n";
 

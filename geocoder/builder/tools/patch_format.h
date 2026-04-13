@@ -79,7 +79,7 @@ struct PatchAddrPoint {
     float lng;
     uint32_t housenumber_id;
     uint32_t street_id;
-    uint32_t postcode_id;
+    uint32_t parent_way_id;
 };
 static_assert(sizeof(PatchAddrPoint) == 20, "AddrPoint must be 20 bytes");
 

@@ -34,33 +34,6 @@ fn cell_neighbors_at_level(cell_id: u64, level: u64) -> Vec<u64> {
     cell.all_neighbors(level).into_iter().map(|c| c.0).collect()
 }
 
-// Return `rings` rings of neighbours at the given level (ring 0 = the
-// center cell alone, ring 1 = the 8 direct neighbours, ring 2 = the
-// 24 cells two hops out, etc.). Used for postcode fallback searches
-// where we need to reach further than the primary-feature's 1-ring
-// neighbourhood without widening primary selection itself.
-fn cell_rings_at_level(cell_id: u64, level: u64, rings: u32) -> Vec<u64> {
-    let mut seen = std::collections::HashSet::<u64>::new();
-    let mut out = Vec::<u64>::new();
-    seen.insert(cell_id);
-    out.push(cell_id);
-    let mut frontier: Vec<u64> = vec![cell_id];
-    for _ in 0..rings {
-        let mut next: Vec<u64> = Vec::new();
-        for cid in &frontier {
-            let cell = CellID(*cid);
-            for n in cell.all_neighbors(level) {
-                if seen.insert(n.0) {
-                    out.push(n.0);
-                    next.push(n.0);
-                }
-            }
-        }
-        frontier = next;
-    }
-    out
-}
-
 // --- Binary format structs (must match C++ build pipeline) ---
 
 #[repr(C)]
@@ -78,7 +51,6 @@ struct AddrPoint {
     lng: f32,
     housenumber_id: u32,
     street_id: u32,
-    postcode_id: u32,
     parent_way_id: u32,
 }
 
@@ -137,6 +109,16 @@ struct PoiRecord {
 
 const POI_FLAG_WIKIPEDIA: u8 = 0x01;
 const POI_FLAG_WIKIDATA: u8 = 0x02;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PostcodeCentroid {
+    lat: f32,
+    lng: f32,
+    postcode_id: u32,
+    country_code: u16,
+    _pad: u16,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -360,6 +342,12 @@ struct Index {
     way_parents: Option<Mmap>,    // u32 per way → smallest containing admin poly
     admin_parents: Option<Mmap>,  // u32 per poly → next-larger containing admin poly
     way_postcodes: Option<Mmap>,  // u32 per way → postcode string from postal boundary
+    // Separate postcode files (optional — postcodes omitted when absent)
+    postal_polygons: Option<Mmap>,
+    postal_vertices: Option<Mmap>,
+    postcode_centroids: Option<Mmap>,
+    postcode_centroid_cells: Option<Mmap>,
+    postcode_centroid_entries: Option<Mmap>,
     admin_config: AdminLevelConfig,
     strings: Mmap,
     street_cell_level: u64,
@@ -431,6 +419,11 @@ impl Index {
             way_parents: mmap_file_optional(&format!("{}/way_parents.bin", dir)),
             admin_parents: mmap_file_optional(&format!("{}/admin_parents.bin", dir)),
             way_postcodes: mmap_file_optional(&format!("{}/way_postcodes.bin", dir)),
+            postal_polygons: mmap_file_optional(&format!("{}/postal_polygons.bin", dir)),
+            postal_vertices: mmap_file_optional(&format!("{}/postal_vertices.bin", dir)),
+            postcode_centroids: mmap_file_optional(&format!("{}/postcode_centroids.bin", dir)),
+            postcode_centroid_cells: mmap_file_optional(&format!("{}/postcode_centroid_cells.bin", dir)),
+            postcode_centroid_entries: mmap_file_optional(&format!("{}/postcode_centroid_entries.bin", dir)),
             admin_config: AdminLevelConfig::load(),
             strings: mmap_file(&format!("{}/strings.bin", dir))?,
             street_cell_level,
@@ -524,11 +517,11 @@ impl Index {
     // --- Geo lookup (streets, addresses, interpolation from merged index) ---
 
     fn query_geo(&self, lat: f64, lng: f64)
-        -> (Option<(f64, &AddrPoint)>, Option<(f64, &str, u32)>, Option<(f64, &WayHeader)>, Option<&AddrPoint>)
+        -> (Option<(f64, &AddrPoint)>, Option<(f64, &str, u32)>, Option<(f64, &WayHeader)>)
     {
         let geo_cells = match &self.geo_cells {
             Some(gc) => gc,
-            None => return (None, None, None, None),
+            None => return (None, None, None),
         };
         let street_entries = self.street_entries.as_ref().unwrap();
         let street_ways_mmap = self.street_ways.as_ref().unwrap();
@@ -586,13 +579,6 @@ impl Index {
 
         let mut best_addr_dist = f64::MAX;
         let mut best_addr: Option<&AddrPoint> = None;
-        // Track the nearest address that has a postcode, used as a fallback
-        // when the chosen address point lacks addr:postcode itself. Matches
-        // Nominatim's `get_postcode_matching_boundary` behaviour of walking
-        // neighbouring address rows to find one with a postcode when the
-        // immediate candidate has none.
-        let mut best_addr_with_postcode_dist = f64::MAX;
-        let mut best_addr_with_postcode: Option<&AddrPoint> = None;
         let mut best_street_dist = f64::MAX;
         let mut best_street: Option<&WayHeader> = None;
         let mut best_interp_dist = f64::MAX;
@@ -617,10 +603,6 @@ impl Index {
                     if dist < best_addr_dist {
                         best_addr_dist = dist;
                         best_addr = Some(point);
-                    }
-                    if point.postcode_id != NO_DATA && dist < best_addr_with_postcode_dist {
-                        best_addr_with_postcode_dist = dist;
-                        best_addr_with_postcode = Some(point);
                     }
                 });
             }
@@ -698,50 +680,8 @@ impl Index {
             }
         }
 
-        // Postcode fallback: if the 1-ring neighbour search didn't
-        // turn up any addr_point with a postcode, walk outward in
-        // wider rings. Nominatim's `get_postcode_matching_boundary`
-        // walks the primary feature's parent address chain, which
-        // in sparsely-addressed areas (Tokyo suburbs, Nairobi,
-        // Singapore nature reserves, Pyramids of Giza) can reach
-        // several kilometres before finding an addressed neighbour
-        // with a postcode.
-        //
-        // L17 cells are ~150m at the equator and ~110m at mid-
-        // latitudes (Tokyo ≈ 35°), so 8 rings (~1.3km radius at
-        // Tokyo) is the practical maximum before the iteration
-        // count balloons. This pass is postcode-only: it doesn't
-        // update the primary best_addr/best_street selection.
-        if best_addr_with_postcode.is_none() {
-            if let Some(ref addr_entries) = self.addr_entries {
-                let wider = cell_rings_at_level(cell, self.street_cell_level, 8);
-                // Skip cells already covered by the primary loop
-                // (center + ring 1 = 9 cells).
-                let already_visited: std::collections::HashSet<u64> =
-                    std::iter::once(cell).chain(cell_neighbors_at_level(cell, self.street_cell_level).into_iter()).collect();
-                for c in &wider {
-                    if already_visited.contains(c) { continue; }
-                    let offsets = Self::lookup_geo_cell(geo_cells, *c);
-                    Self::for_each_entry(addr_entries, offsets.addr, |id| {
-                        let idx = id as usize;
-                        if idx >= all_points.len() { return; }
-                        let point = &all_points[idx];
-                        if point.postcode_id == NO_DATA { return; }
-                        let dlat = (point.lat as f64 - lat).to_radians();
-                        let dlng = (point.lng as f64 - lng).to_radians();
-                        let d = dist_sq(dlat, dlng, cos_lat);
-                        if d < best_addr_with_postcode_dist {
-                            best_addr_with_postcode_dist = d;
-                            best_addr_with_postcode = Some(point);
-                        }
-                    });
-                }
-            }
-        }
-
         let addr_result = best_addr.map(|p| (best_addr_dist, p));
         let street_result = best_street.map(|w| (best_street_dist, w));
-        let addr_with_postcode = best_addr_with_postcode;
         let interp_result = best_interp.map(|iw| {
             let start = iw.start_number as f64;
             let end = iw.end_number as f64;
@@ -763,12 +703,12 @@ impl Index {
             (best_interp_dist, self.get_string(iw.street_id), number)
         });
 
-        (addr_result, interp_result, street_result, addr_with_postcode)
+        (addr_result, interp_result, street_result)
     }
 
     // Debug helper — returns primary feature distances + names.
     fn debug_primary(&self, lat: f64, lng: f64) -> serde_json::Value {
-        let (addr, interp, street, _) = self.query_geo(lat, lng);
+        let (addr, interp, street) = self.query_geo(lat, lng);
         let poi_primary = self.find_nearest_poi_with_parent(lat, lng);
         let to_m = |d2: f64| (d2.sqrt() * 6_371_000.0) as f64;
         serde_json::json!({
@@ -1260,16 +1200,6 @@ impl Index {
                             area: r.area, name: r.name, country_code: r.country_code
                         });
                     }
-                }
-            }
-        }
-
-        // Also handle postcode (level 11 postal boundaries kept as before)
-        for level in 0..12 {
-            if let Some((_, poly, _)) = best_by_level[level] {
-                if poly.admin_level == 11 {
-                    result.postcode = Some(self.get_string(poly.name_id));
-                    break;
                 }
             }
         }
@@ -1967,15 +1897,6 @@ impl Index {
             }
         }
 
-        // Also handle postcode from L11 in chain
-        for &pid in &chain_ids {
-            let poly = &all_polygons[pid as usize];
-            if poly.admin_level == 11 {
-                result.postcode = Some(self.get_string(poly.name_id));
-                break;
-            }
-        }
-
         if let Some(ref c) = best_by_field[0] {
             result.country = Some(c.name);
             if c.country_code != 0 {
@@ -2006,6 +1927,97 @@ impl Index {
         result
     }
 
+    // --- Postcode resolution ---
+    //
+    // Three-tier postcode lookup matching Nominatim's chain:
+    //   1. way_postcodes[street.way_id] — street's computed postcode
+    //   2. Postal boundary PIP (postal_polygons + postal_vertices)
+    //   3. Nearest postcode centroid (Nominatim's get_nearest_postcode)
+    fn resolve_postcode(&self, lat: f64, lng: f64, street: Option<&WayHeader>) -> Option<&str> {
+        // 1. way_postcodes[street.way_id] — street's computed postcode
+        if let (Some(ref wpc), Some(way)) = (&self.way_postcodes, street) {
+            let way_id = unsafe {
+                let ways_base = self.street_ways.as_ref().unwrap().as_ptr() as *const WayHeader;
+                (way as *const WayHeader).offset_from(ways_base) as usize
+            };
+            let all_postcodes: &[u32] = unsafe {
+                std::slice::from_raw_parts(wpc.as_ptr() as *const u32, wpc.len() / 4)
+            };
+            if way_id < all_postcodes.len() && all_postcodes[way_id] != NO_DATA {
+                return Some(self.get_string(all_postcodes[way_id]));
+            }
+        }
+
+        // 2. Postal boundary PIP (postal_polygons + postal_vertices)
+        if let (Some(ref pp), Some(ref pv)) = (&self.postal_polygons, &self.postal_vertices) {
+            let all_postal: &[AdminPolygon] = unsafe {
+                std::slice::from_raw_parts(pp.as_ptr() as *const AdminPolygon, pp.len() / std::mem::size_of::<AdminPolygon>())
+            };
+            let all_pverts: &[NodeCoord] = unsafe {
+                std::slice::from_raw_parts(pv.as_ptr() as *const NodeCoord, pv.len() / std::mem::size_of::<NodeCoord>())
+            };
+            let mut best_area = f32::MAX;
+            let mut best_postcode: Option<&str> = None;
+            for poly in all_postal {
+                if poly.area >= best_area { continue; }
+                let off = poly.vertex_offset as usize;
+                let cnt = poly.vertex_count as usize;
+                if off + cnt > all_pverts.len() { continue; }
+                let verts = &all_pverts[off..off+cnt];
+                if point_in_polygon(lat as f32, lng as f32, verts) {
+                    best_area = poly.area;
+                    best_postcode = Some(self.get_string(poly.name_id));
+                }
+            }
+            if best_postcode.is_some() { return best_postcode; }
+        }
+
+        // 3. Nearest postcode centroid (Nominatim's get_nearest_postcode)
+        if let Some(ref pc_mmap) = self.postcode_centroids {
+            let all_centroids: &[PostcodeCentroid] = unsafe {
+                std::slice::from_raw_parts(pc_mmap.as_ptr() as *const PostcodeCentroid, pc_mmap.len() / std::mem::size_of::<PostcodeCentroid>())
+            };
+            // 0.05 deg ~ 5.5km, matches Nominatim's get_nearest_postcode
+            let max_dist_sq = (0.05_f64).to_radians().powi(2);
+            let cos_lat = lat.to_radians().cos();
+            let mut best_dist = f64::MAX;
+            let mut best_pc: Option<&str> = None;
+
+            if let (Some(ref cells), Some(ref entries)) = (&self.postcode_centroid_cells, &self.postcode_centroid_entries) {
+                let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
+                let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
+                for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+                    Self::for_each_entry(entries, Self::lookup_admin_cell(cells, c), |id| {
+                        let idx = id as usize;
+                        if idx >= all_centroids.len() { return; }
+                        let pc = &all_centroids[idx];
+                        let dlat = (lat - pc.lat as f64).to_radians();
+                        let dlng = (lng - pc.lng as f64).to_radians();
+                        let d = dlat * dlat + dlng * dlng * cos_lat * cos_lat;
+                        if d < best_dist && d < max_dist_sq {
+                            best_dist = d;
+                            best_pc = Some(self.get_string(pc.postcode_id));
+                        }
+                    });
+                }
+            } else {
+                // Brute-force fallback (slow but correct)
+                for pc in all_centroids {
+                    let dlat = (lat - pc.lat as f64).to_radians();
+                    let dlng = (lng - pc.lng as f64).to_radians();
+                    let d = dlat * dlat + dlng * dlng * cos_lat * cos_lat;
+                    if d < best_dist && d < max_dist_sq {
+                        best_dist = d;
+                        best_pc = Some(self.get_string(pc.postcode_id));
+                    }
+                }
+            }
+            return best_pc;
+        }
+
+        None
+    }
+
     // --- Combined query ---
 
     fn query(&self, lat: f64, lng: f64) -> Address<'_> {
@@ -2018,7 +2030,7 @@ impl Index {
         // sit inside to be accepted in the address walk.
         let current_boundary = self.find_current_boundary(lat, lng);
         let place = self.find_places(lat, lng, current_boundary);
-        let (addr, interp, street, nearest_with_postcode) = self.query_geo(lat, lng);
+        let (addr, interp, street) = self.query_geo(lat, lng);
 
         // Use the standard PIP-based admin walk. The chain-based walk
         // (way_parents.bin + admin_parents.bin) is available but causes
@@ -2049,7 +2061,6 @@ impl Index {
         // residential ways.
         let mut house_number: Option<Cow<'_, str>> = None;
         let mut road: Option<&str> = None;
-        let mut addr_postcode: Option<&str> = None;
 
         // POI primary-feature candidate: Nominatim's
         // _find_closest_street_or_pois returns the closest rank-26+
@@ -2091,10 +2102,6 @@ impl Index {
         let _ = interp.as_ref();
         let street_dist = street.as_ref().map(|(d, _)| *d).unwrap_or(f64::MAX);
         let poi_dist = poi_primary.as_ref().map(|(d, _)| *d).unwrap_or(f64::MAX);
-
-        // Nominatim's housenumber refinement radius is 0.001 deg ≈ 100m
-        // (hnr_distance tolerance in `_find_closest_street_or_pois`).
-        let hnr_tolerance_sq = (0.001_f64).to_radians().powi(2);
 
         // Nominatim's reverse.py lines 218-226: when the closest feature
         // is an area at distance 0 (query is inside the polygon) AND
@@ -2138,13 +2145,6 @@ impl Index {
                 } else if poi.parent_street_id != NO_DATA {
                     road = Some(self.get_string(poi.parent_street_id));
                 }
-                // Inherit postcode from a nearby addressed point if
-                // there's one within the refinement radius.
-                if let Some((ad, ap)) = addr {
-                    if ad - poi_dist < hnr_tolerance_sq && ap.postcode_id != NO_DATA {
-                        addr_postcode = Some(self.get_string(ap.postcode_id));
-                    }
-                }
             } else if addr_dist <= interp_dist && addr_dist <= street_dist && addr_dist <= effective_poi_dist {
                 // Address is closest — use it with its housenumber.
                 let (_, point) = addr.unwrap();
@@ -2158,19 +2158,11 @@ impl Index {
                 } else if let Some((_, way)) = street {
                     road = Some(self.get_string(way.name_id));
                 }
-                if point.postcode_id != NO_DATA {
-                    addr_postcode = Some(self.get_string(point.postcode_id));
-                }
             } else if interp_dist <= addr_dist && interp_dist <= street_dist && interp_dist <= effective_poi_dist {
                 // Interpolation segment is closest.
                 let (_, street_name, number) = interp.unwrap();
                 house_number = Some(Cow::Owned(number.to_string()));
                 road = Some(street_name);
-                if let Some((ad, ap)) = addr {
-                    if ad - interp_dist < hnr_tolerance_sq && ap.postcode_id != NO_DATA {
-                        addr_postcode = Some(self.get_string(ap.postcode_id));
-                    }
-                }
             } else {
                 // Street is closest — use the street name. Nominatim
                 // refines with _find_housenumber_for_street (joined by
@@ -2185,43 +2177,14 @@ impl Index {
                 } else {
                     None
                 };
-                if let Some((ad, ap)) = addr {
-                    if ad - street_dist < hnr_tolerance_sq && ap.postcode_id != NO_DATA {
-                        addr_postcode = Some(self.get_string(ap.postcode_id));
-                    }
-                }
             }
         }
 
-        // Postcode fallback chain (matches Nominatim priority):
-        // 1. addr:postcode from the primary feature (already set above)
-        // 2. nearest addr_point with a postcode (wider walk)
-        // 3. per-way postcode from containing postal boundary
-        // 4. admin.postcode from PIP postal boundary (set in find_admin)
-        //
-        // #2 before #3: a building's addr:postcode (06000) is more
-        // specific than the street way's postal boundary (06060).
-        if addr_postcode.is_none() {
-            if let Some(p) = nearest_with_postcode {
-                if p.postcode_id != NO_DATA {
-                    addr_postcode = Some(self.get_string(p.postcode_id));
-                }
-            }
-        }
-        if addr_postcode.is_none() {
-            if let (Some(ref wpc), Some((_, way))) = (&self.way_postcodes, &street) {
-                let way_id = unsafe {
-                    let ways_base = self.street_ways.as_ref().unwrap().as_ptr() as *const WayHeader;
-                    (*way as *const WayHeader).offset_from(ways_base) as usize
-                };
-                let all_postcodes: &[u32] = unsafe {
-                    std::slice::from_raw_parts(wpc.as_ptr() as *const u32, wpc.len() / 4)
-                };
-                if way_id < all_postcodes.len() && all_postcodes[way_id] != NO_DATA {
-                    addr_postcode = Some(self.get_string(all_postcodes[way_id]));
-                }
-            }
-        }
+        // Resolve postcode via the new 3-tier chain:
+        // 1. way_postcodes[street.way_id] — street's computed postcode
+        // 2. Postal boundary PIP (postal_polygons + postal_vertices)
+        // 3. Nearest postcode centroid (Nominatim's get_nearest_postcode)
+        let resolved_postcode = self.resolve_postcode(lat, lng, street.as_ref().map(|(_, w)| *w));
 
         if road.is_none() && admin.country.is_none() && admin.city.is_none() && admin.state.is_none() {
             return Address::default();
@@ -2278,37 +2241,23 @@ impl Index {
             city_district: admin.city_district,
             neighbourhood: admin.neighbourhood.or(if allow_place_neighbourhood { place.neighbourhood } else { None }),
             city_block: admin.city_block,
-            // Postcode resolution order matches Nominatim's
-            // `get_postcode_matching_boundary`: the primary feature's
-            // addr:postcode wins, and we only fall back to the
-            // containing postal boundary when the address point has
-            // no postcode of its own. Our previous order (boundary
-            // first) picked the smallest nested postal polygon
-            // (Mexico City's 06060) even when the closest building
-            // carried the broader delivery postcode (06000).
-            //
-            // Then normalise to the canonical country format
-            // (see `format_postcode` below). Cow means we only
-            // allocate when the raw OSM value needs reformatting.
-            // Postcode resolution: prefer addr_point's postcode over
-            // the containing postal boundary's. Reject if the country
-            // has no postal-code system (UAE, Qatar, most of Sub-
-            // Saharan Africa) or if the string doesn't match the
-            // country's pattern (e.g. '000000' in Dubai). Then
+            // Postcode from resolve_postcode(): 3-tier chain
+            // (way_postcodes → postal boundary PIP → nearest centroid).
+            // Reject if the country has no postal-code system or if
+            // the string doesn't match the country's pattern, then
             // normalise whitespace/separators per country.
-            postcode: {
-                let raw = addr_postcode.or(admin.postcode);
-                match (raw, admin.country_code) {
-                    (Some(pc), Some(cc)) => {
+            postcode: match resolved_postcode {
+                Some(pc) => match admin.country_code {
+                    Some(cc) => {
                         if country_has_no_postcode(&cc) || !postcode_looks_valid(&cc, pc) {
                             None
                         } else {
                             Some(format_postcode(&cc, pc))
                         }
                     }
-                    (Some(pc), None) => Some(Cow::Borrowed(pc)),
-                    (None, _) => None,
-                }
+                    None => Some(Cow::Borrowed(pc)),
+                },
+                None => None,
             },
             country: admin.country,
             country_code: admin.country_code.map(|c| String::from_utf8_lossy(&c).into_owned()),
@@ -2517,7 +2466,6 @@ struct AdminResult<'a> {
     quarter: Option<&'a str>,
     neighbourhood: Option<&'a str>,
     city_block: Option<&'a str>,
-    postcode: Option<&'a str>,
 }
 
 #[derive(Serialize, Default)]
