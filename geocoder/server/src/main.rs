@@ -1973,6 +1973,12 @@ impl Index {
         }
 
         // 3. Nearest postcode centroid (Nominatim's get_nearest_postcode)
+        // The centroid index is built from raw OSM addr:postcode tags
+        // which may contain garbage (PO boxes, zip+4, semicolons).
+        // Filter candidates at query time by rejecting strings that
+        // contain semicolons, "PO Box", or are longer than 10 chars
+        // (matching Nominatim's clean_postcodes rejection of non-
+        // conforming values).
         if let Some(ref pc_mmap) = self.postcode_centroids {
             let all_centroids: &[PostcodeCentroid] = unsafe {
                 std::slice::from_raw_parts(pc_mmap.as_ptr() as *const PostcodeCentroid, pc_mmap.len() / std::mem::size_of::<PostcodeCentroid>())
@@ -1995,20 +2001,25 @@ impl Index {
                         let dlng = (lng - pc.lng as f64).to_radians();
                         let d = dlat * dlat + dlng * dlng * cos_lat * cos_lat;
                         if d < best_dist && d < max_dist_sq {
-                            best_dist = d;
-                            best_pc = Some(self.get_string(pc.postcode_id));
+                            let s = self.get_string(pc.postcode_id);
+                            if centroid_postcode_ok(s) {
+                                best_dist = d;
+                                best_pc = Some(s);
+                            }
                         }
                     });
                 }
             } else {
-                // Brute-force fallback (slow but correct)
                 for pc in all_centroids {
                     let dlat = (lat - pc.lat as f64).to_radians();
                     let dlng = (lng - pc.lng as f64).to_radians();
                     let d = dlat * dlat + dlng * dlng * cos_lat * cos_lat;
                     if d < best_dist && d < max_dist_sq {
-                        best_dist = d;
-                        best_pc = Some(self.get_string(pc.postcode_id));
+                        let s = self.get_string(pc.postcode_id);
+                        if centroid_postcode_ok(s) {
+                            best_dist = d;
+                            best_pc = Some(s);
+                        }
                     }
                 }
             }
@@ -2302,6 +2313,21 @@ fn postcode_looks_valid(_country_code: &[u8; 2], postcode: &str) -> bool {
     if trimmed.chars().all(|c| c == first) {
         // 'X' alone might still be valid in rare cases, but '00000'
         // or 'XXXXX' is always a placeholder.
+        return false;
+    }
+    true
+}
+
+// Quick validation for postcode centroid candidates. Rejects
+// strings that are clearly not standalone postcodes — matches
+// the spirit of Nominatim's clean_postcodes sanitizer which
+// validates against per-country regex patterns at import.
+fn centroid_postcode_ok(s: &str) -> bool {
+    if s.len() > 10 { return false; }  // postcodes are short
+    if s.contains(';') { return false; } // multiple values
+    if s.contains("PO") || s.contains("Box") { return false; }
+    // Reject US zip+4 (5+4 digit format like "10001-2062")
+    if s.len() == 10 && s.as_bytes().get(5) == Some(&b'-') {
         return false;
     }
     true
