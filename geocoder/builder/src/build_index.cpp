@@ -2480,6 +2480,22 @@ int main(int argc, char* argv[]) {
             auto _wp_t = std::chrono::steady_clock::now();
             data.way_parent_ids.assign(data.ways.size(), NO_DATA);
             data.way_postcode_ids.assign(data.ways.size(), NO_DATA);
+
+            // Build a temporary S2 cell index of postcode centroids for
+            // the get_nearest_postcode fallback. Each cell maps to a list
+            // of (postcode_string_id, centroid_lat, centroid_lng).
+            struct PcEntry { uint32_t pc_id; float lat; float lng; };
+            std::unordered_map<uint64_t, std::vector<PcEntry>> pc_cell_index;
+            for (const auto& [pc_id, acc] : data.postcode_accum) {
+                if (acc.count == 0) continue;
+                float plat = static_cast<float>(acc.sum_lat / acc.count);
+                float plng = static_cast<float>(acc.sum_lng / acc.count);
+                S2CellId pcell = S2CellId(S2LatLng::FromDegrees(plat, plng)).parent(kAdminCellLevel);
+                pc_cell_index[pcell.id()].push_back({pc_id, plat, plng});
+            }
+            std::cerr << "Postcode centroid cell index: " << pc_cell_index.size()
+                      << " cells, " << data.postcode_accum.size() << " centroids" << std::endl;
+
             std::atomic<size_t> way_idx{0};
             std::atomic<uint64_t> way_linked{0};
             std::vector<std::thread> workers;
@@ -2558,6 +2574,36 @@ int main(int argc, char* argv[]) {
                         }
                         if (best_postal_id != NO_DATA) {
                             data.way_postcode_ids[i] = data.admin_polygons[best_postal_id].name_id;
+                        }
+
+                        // Nominatim fallback (placex_triggers.sql line 1323):
+                        // if no postal boundary contains the way, find the
+                        // nearest postcode centroid via the pre-built
+                        // pc_cell_index. Matches get_nearest_postcode
+                        // with ST_DWithin 0.05 deg.
+                        if (data.way_postcode_ids[i] == NO_DATA && !pc_cell_index.empty()) {
+                            double best_pc_d2 = 0.05 * 0.05; // ~5.5km
+                            uint32_t best_pc_id = NO_DATA;
+                            double cos_lat2 = std::cos(clat * M_PI / 180.0);
+                            // Check cell + neighbours at admin level
+                            auto check_pc_cell = [&](uint64_t cid) {
+                                auto it2 = pc_cell_index.find(cid);
+                                if (it2 == pc_cell_index.end()) return;
+                                for (const auto& [pid, plat, plng] : it2->second) {
+                                    double dlat2 = plat - clat;
+                                    double dlng2 = (plng - clng) * cos_lat2;
+                                    double d2 = dlat2 * dlat2 + dlng2 * dlng2;
+                                    if (d2 < best_pc_d2) {
+                                        best_pc_d2 = d2;
+                                        best_pc_id = pid;
+                                    }
+                                }
+                            };
+                            check_pc_cell(cell.id());
+                            for (const auto& n : nbrs) check_pc_cell(n.id());
+                            if (best_pc_id != NO_DATA) {
+                                data.way_postcode_ids[i] = best_pc_id;
+                            }
                         }
                     }
                 });
