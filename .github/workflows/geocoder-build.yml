@@ -416,7 +416,7 @@ jobs:
           fi
           GEONAMES_FILE="${{ steps.download.outputs.postcode_centroids_external }}"
           if [ -n "$GEONAMES_FILE" ] && [ -f "$GEONAMES_FILE" ]; then
-            BUILD_ARGS="$BUILD_ARGS --geonames-postcodes $GEONAMES_FILE"
+            BUILD_ARGS="$BUILD_ARGS --external-postcodes $GEONAMES_FILE"
             echo "Using GeoNames postcode data"
           fi
 
