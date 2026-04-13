@@ -399,23 +399,43 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
     // (matching Nominatim's clean_postcodes sanitizer).
     if (!data.postcode_accum.empty()) {
         write_futures.push_back(std::async(std::launch::async, [&] {
-            // Build centroid vector with per-country validation
+            // Nominatim's _PostcodeCollector accumulates per-country:
+            // the same postcode string in different countries produces
+            // separate centroids. This prevents a "90012" tagged on a
+            // building in Sicily from shifting the US 90012 centroid.
+            //
+            // Re-accumulate from raw postcode_accum, splitting by the
+            // country of each individual addr_point contribution.
+            // Since postcode_accum only stores aggregate (sum_lat,
+            // sum_lng, count), we need to re-scan addr_points.
             const auto& sp = data.string_pool.data();
             auto get_str = [&](uint32_t off) -> const char* {
                 return sp.data() + off;
             };
-            // Find country code for each centroid by looking up the
-            // containing L2 admin polygon via cell_to_admin.
-            std::vector<PostcodeCentroid> centroids;
-            centroids.reserve(data.postcode_accum.size());
-            uint32_t rejected = 0;
-            for (const auto& [pc_id, acc] : data.postcode_accum) {
-                if (acc.count == 0) continue;
-                float clat = static_cast<float>(acc.sum_lat / acc.count);
-                float clng = static_cast<float>(acc.sum_lng / acc.count);
-                // Look up country from admin polygons
-                S2CellId cell = S2CellId(S2LatLng::FromDegrees(clat, clng)).parent(kAdminCellLevel);
-                uint16_t country_code = 0;
+
+            // Per-country accumulator: (country_code, postcode_id) → centroid
+            struct CountryPcKey {
+                uint16_t cc;
+                uint32_t pc_id;
+                bool operator==(const CountryPcKey& o) const { return cc == o.cc && pc_id == o.pc_id; }
+            };
+            struct CountryPcHash {
+                size_t operator()(const CountryPcKey& k) const {
+                    return std::hash<uint64_t>()(((uint64_t)k.cc << 32) | k.pc_id);
+                }
+            };
+            struct PcAccum { double sum_lat = 0, sum_lng = 0; uint64_t count = 0; };
+            std::unordered_map<CountryPcKey, PcAccum, CountryPcHash> country_accum;
+
+            // Re-scan addr_points + addr_postcodes to split by country
+            for (uint32_t i = 0; i < data.addr_points.size(); i++) {
+                if (i >= data.addr_postcode_ids.size()) break;
+                uint32_t pc_id = data.addr_postcode_ids[i];
+                if (pc_id == NO_DATA) continue;
+                const auto& ap = data.addr_points[i];
+                // Look up country for this addr_point
+                S2CellId cell = S2CellId(S2LatLng::FromDegrees(ap.lat, ap.lng)).parent(kAdminCellLevel);
+                uint16_t cc = 0;
                 auto it = data.cell_to_admin.find(cell.id());
                 if (it != data.cell_to_admin.end()) {
                     for (uint32_t raw_id : it->second) {
@@ -423,33 +443,63 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                         if (pid >= data.admin_polygons.size()) continue;
                         const auto& poly = data.admin_polygons[pid];
                         if (poly.admin_level == 2 && poly.country_code != 0) {
-                            country_code = poly.country_code;
+                            cc = poly.country_code;
                             break;
                         }
                     }
                 }
-                // Validate postcode against country pattern
+                if (cc == 0) continue; // skip if no country found
+                auto& acc = country_accum[{cc, pc_id}];
+                acc.sum_lat += ap.lat;
+                acc.sum_lng += ap.lng;
+                acc.count++;
+            }
+
+            // Also re-scan postcode_accum for TIGER entries (which
+            // don't have addr_points). TIGER is US-only.
+            uint16_t us_cc = ('U' << 8) | 'S';
+            for (const auto& [pc_id, acc] : data.postcode_accum) {
+                if (acc.count == 0) continue;
+                // Check if this postcode already has US entries
+                auto key = CountryPcKey{us_cc, pc_id};
+                if (country_accum.count(key) > 0) continue;
+                // Check if it looks like a US postcode
                 const char* pc_str = get_str(pc_id);
-                if (country_code != 0) {
-                    char cc[3] = {
-                        static_cast<char>(std::tolower(country_code >> 8)),
-                        static_cast<char>(std::tolower(country_code & 0xFF)),
-                        0
-                    };
-                    if (!validate_postcode_for_country(cc, pc_str)) {
-                        rejected++;
-                        continue;
+                if (validate_postcode_for_country("us", pc_str)) {
+                    // Estimate: if centroid is in North America, assign to US
+                    float clat = static_cast<float>(acc.sum_lat / acc.count);
+                    if (clat > 24.0 && clat < 50.0) {
+                        country_accum[key] = {acc.sum_lat, acc.sum_lng, acc.count};
                     }
                 }
+            }
+
+            // Build centroid vector with validation
+            std::vector<PostcodeCentroid> centroids;
+            centroids.reserve(country_accum.size());
+            uint32_t rejected = 0;
+            for (const auto& [key, acc] : country_accum) {
+                if (acc.count == 0) continue;
+                char cc_str[3] = {
+                    static_cast<char>(std::tolower(key.cc >> 8)),
+                    static_cast<char>(std::tolower(key.cc & 0xFF)),
+                    0
+                };
+                const char* pc_str = get_str(key.pc_id);
+                if (!validate_postcode_for_country(cc_str, pc_str)) {
+                    rejected++;
+                    continue;
+                }
                 PostcodeCentroid c{};
-                c.lat = clat;
-                c.lng = clng;
-                c.postcode_id = pc_id;
-                c.country_code = country_code;
+                c.lat = static_cast<float>(acc.sum_lat / acc.count);
+                c.lng = static_cast<float>(acc.sum_lng / acc.count);
+                c.postcode_id = key.pc_id;
+                c.country_code = key.cc;
                 centroids.push_back(c);
             }
             std::cerr << "Postcode centroids: " << centroids.size() << " valid, "
-                      << rejected << " rejected by country pattern" << std::endl;
+                      << rejected << " rejected by country pattern"
+                      << " (from " << country_accum.size() << " country+postcode pairs)" << std::endl;
             // Sort by postcode_id for determinism
             std::sort(centroids.begin(), centroids.end(),
                 [](const PostcodeCentroid& a, const PostcodeCentroid& b) {
