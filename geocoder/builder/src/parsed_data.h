@@ -146,7 +146,7 @@ struct ParsedData {
     // Built during addr_point extraction, converted to PostcodeCentroid[] at write time.
     struct PostcodeAccum { double sum_lat = 0; double sum_lng = 0; uint64_t count = 0; uint16_t country_code = 0; };
     std::unordered_map<uint32_t, PostcodeAccum> postcode_accum;
-    std::mutex postcode_mutex;
+    std::unique_ptr<std::mutex> postcode_mutex = std::make_unique<std::mutex>();
 };
 
 // --- Deduplicate IDs per cell ---
