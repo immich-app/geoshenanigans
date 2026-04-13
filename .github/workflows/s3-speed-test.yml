@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   speed-test:
-    runs-on: pokedex-giant
+    runs-on: pokedex-general
     timeout-minutes: 120
     steps:
       - name: Install tools
