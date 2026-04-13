@@ -1203,9 +1203,9 @@ int main(int argc, char* argv[]) {
                         add_addr_point(data, local.addr_coords[j].first, local.addr_coords[j].second,
                                        local.addr_strings[j].first.c_str(),
                                        local.addr_strings[j].second.c_str(), dummy);
-                        // Accumulate postcode centroids
+                        // Accumulate postcode centroids (validated)
                         const auto& pc = local.addr_postcodes[j];
-                        if (!pc.empty()) {
+                        if (!pc.empty() && is_valid_postcode(pc.c_str())) {
                             uint32_t pc_id = data.string_pool.intern(pc.c_str());
                             auto& acc = data.postcode_accum[pc_id];
                             acc.sum_lat += local.addr_coords[j].first;
@@ -1703,9 +1703,9 @@ int main(int argc, char* argv[]) {
                         add_addr_point(data, local.building_addrs[i].lat, local.building_addrs[i].lng,
                                        local.addr_strings[i].first.c_str(),
                                        local.addr_strings[i].second.c_str(), dummy);
-                        // Accumulate postcode centroids
+                        // Accumulate postcode centroids (validated)
                         const auto& pc = local.addr_postcodes[i];
-                        if (!pc.empty()) {
+                        if (!pc.empty() && is_valid_postcode(pc.c_str())) {
                             uint32_t pc_id = data.string_pool.intern(pc.c_str());
                             auto& acc = data.postcode_accum[pc_id];
                             acc.sum_lat += local.building_addrs[i].lat;

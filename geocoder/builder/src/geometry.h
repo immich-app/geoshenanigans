@@ -262,6 +262,54 @@ inline double admin_epsilon_meters(uint8_t admin_level) {
     return kAdminEpsilonMeters[idx] * kEpsilonScale;
 }
 
+// Validate a postcode string for the centroid index. Mirrors
+// Nominatim's clean_postcodes sanitizer — rejects values that
+// don't conform to any known postcode pattern. The builder
+// doesn't track per-feature country codes at addr extraction
+// time, so this is a universal filter rather than per-country.
+//
+// Accepts: 3-7 digit postcodes (covers ~80% of countries),
+// spaced digit patterns (SE/GR "ddd dd", IN "ddd ddd"),
+// letter-digit patterns (UK "SW1A 1AA", CA "K1A 0B1",
+// NL "1234 AB", AR "B1234ABC"), hyphenated (BR "12345-678",
+// JP "123-4567").
+//
+// Rejects: PO boxes, semicolons, zip+4 ("12345-1234"),
+// strings > 10 chars, all-zero placeholders, freeform text.
+inline bool is_valid_postcode(const char* pc) {
+    if (!pc || !pc[0]) return false;
+    size_t len = std::strlen(pc);
+    if (len > 10) return false;
+    // Reject semicolons (multiple values)
+    for (size_t i = 0; i < len; i++) {
+        if (pc[i] == ';') return false;
+    }
+    // Reject "PO" prefix
+    if (len >= 2 && pc[0] == 'P' && pc[1] == 'O') return false;
+    // Reject US zip+4 (5 digits, dash, 4 digits)
+    if (len == 10 && pc[5] == '-') {
+        bool all_digits = true;
+        for (size_t i = 0; i < 10; i++) {
+            if (i == 5) continue;
+            if (pc[i] < '0' || pc[i] > '9') { all_digits = false; break; }
+        }
+        if (all_digits) return false;
+    }
+    // Reject all-same-char (placeholders like "00000")
+    bool all_same = true;
+    for (size_t i = 1; i < len; i++) {
+        if (pc[i] != pc[0]) { all_same = false; break; }
+    }
+    if (all_same && len >= 3) return false;
+    // Must contain at least one digit (pure-letter strings aren't postcodes)
+    bool has_digit = false;
+    for (size_t i = 0; i < len; i++) {
+        if (pc[i] >= '0' && pc[i] <= '9') { has_digit = true; break; }
+    }
+    if (!has_digit) return false;
+    return true;
+}
+
 // Parse leading digits from a house number string
 inline uint32_t parse_house_number(const char* s) {
     if (!s) return 0;

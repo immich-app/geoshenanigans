@@ -1972,13 +1972,11 @@ impl Index {
             if best_postcode.is_some() { return best_postcode; }
         }
 
-        // 3. Nearest postcode centroid (Nominatim's get_nearest_postcode)
-        // The centroid index is built from raw OSM addr:postcode tags
-        // which may contain garbage (PO boxes, zip+4, semicolons).
-        // Filter candidates at query time by rejecting strings that
-        // contain semicolons, "PO Box", or are longer than 10 chars
-        // (matching Nominatim's clean_postcodes rejection of non-
-        // conforming values).
+        // 3. Nearest postcode centroid (Nominatim's get_nearest_postcode).
+        // The builder validates postcodes via is_valid_postcode()
+        // before accumulating centroids (matching Nominatim's
+        // clean_postcodes sanitizer), so query-time filtering is
+        // applied as a safety net only.
         if let Some(ref pc_mmap) = self.postcode_centroids {
             let all_centroids: &[PostcodeCentroid] = unsafe {
                 std::slice::from_raw_parts(pc_mmap.as_ptr() as *const PostcodeCentroid, pc_mmap.len() / std::mem::size_of::<PostcodeCentroid>())
