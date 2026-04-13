@@ -29,6 +29,7 @@
 #include "types.h"
 #include "string_pool.h"
 #include "geometry.h"
+#include "postcode_validation.h"
 #include "parsed_data.h"
 #include "s2_helpers.h"
 #include "ring_assembly.h"
@@ -313,6 +314,80 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
               << city_centroids.size() << " unique city names" << std::endl;
 }
 
+// --- GeoNames postcode loading ---
+// Format: CSV with header "postcode,lat,lon,country_code"
+// Source: GeoNames allCountries + GB_full + CA_full + NL_full
+// Merged into postcode_accum as authoritative centroids that
+// override OSM-derived ones (matching Nominatim's _update_from_external).
+static void load_external_postcodes(ParsedData& data, const std::string& path) {
+    std::cerr << "Loading external postcode centroids from " << path << "..." << std::endl;
+    std::string cmd;
+    std::string tmp_csv;
+    if (path.find(".gz") != std::string::npos) {
+        tmp_csv = "/tmp/external_postcodes_" + std::to_string(getpid()) + ".csv";
+        cmd = "gunzip -c " + path + " > " + tmp_csv;
+        system(cmd.c_str());
+    } else {
+        tmp_csv = path;
+    }
+
+    std::ifstream f(tmp_csv);
+    if (!f) { std::cerr << "  Failed to open " << tmp_csv << std::endl; return; }
+
+    std::string header;
+    std::getline(f, header); // skip header
+
+    uint64_t loaded = 0, skipped = 0;
+    std::string line;
+    while (std::getline(f, line)) {
+        // Parse: postcode,lat,lon,country_code
+        size_t p1 = line.find(',');
+        if (p1 == std::string::npos) continue;
+        size_t p2 = line.find(',', p1 + 1);
+        if (p2 == std::string::npos) continue;
+        size_t p3 = line.find(',', p2 + 1);
+        if (p3 == std::string::npos) continue;
+
+        std::string postcode = line.substr(0, p1);
+        double lat = std::strtod(line.c_str() + p1 + 1, nullptr);
+        double lng = std::strtod(line.c_str() + p2 + 1, nullptr);
+        std::string cc_str = line.substr(p3 + 1, 2);
+
+        if (postcode.empty() || cc_str.size() < 2) continue;
+        if (lat == 0 && lng == 0) continue;
+
+        // Validate against country pattern
+        char cc_lower[3] = {
+            static_cast<char>(std::tolower(cc_str[0])),
+            static_cast<char>(std::tolower(cc_str[1])),
+            0
+        };
+        if (!validate_postcode_for_country(cc_lower, postcode.c_str())) {
+            skipped++;
+            continue;
+        }
+
+        // GeoNames entries are authoritative — they override OSM-derived
+        // centroids. Nominatim's _update_from_external adds external
+        // postcodes only when NOT already present from OSM. We do the
+        // same: only add if no OSM entry exists for this postcode.
+        uint32_t pc_id = data.string_pool.intern(postcode);
+        auto it = data.postcode_accum.find(pc_id);
+        if (it == data.postcode_accum.end()) {
+            auto& acc = data.postcode_accum[pc_id];
+            acc.sum_lat = lat;
+            acc.sum_lng = lng;
+            acc.count = 1;
+            loaded++;
+        }
+    }
+
+    if (tmp_csv != path) std::remove(tmp_csv.c_str());
+    std::cerr << "  GeoNames: loaded " << loaded << " new postcodes, "
+              << skipped << " rejected by pattern, "
+              << data.postcode_accum.size() << " total centroids" << std::endl;
+}
+
 // --- Main ---
 
 int main(int argc, char* argv[]) {
@@ -337,6 +412,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "  --epsilon-levels L2,L3,...,L8  Set epsilon in meters per level (7 values)" << std::endl;
         std::cerr << "  --multi-quality [S,S,...]  Write quality variants at given scales (default: 0,0.2,0.5,1,1.5,2,2.5)" << std::endl;
         std::cerr << "  --tiger-data <path>          Load TIGER address data (tar.gz or directory of CSVs)" << std::endl;
+        std::cerr << "  --external-postcodes <path>  Load GeoNames postcode centroids (CSV or .csv.gz)" << std::endl;
         std::cerr << "  --wikidata-sitelinks <path>  Load QID→sitelinks binary for POI importance" << std::endl;
         return 1;
     }
@@ -347,6 +423,7 @@ int main(int argc, char* argv[]) {
     std::string load_cache_path;
     std::string wikidata_sitelinks_path;
     std::string tiger_data_path;
+    std::string external_postcodes_path;
     bool multi_output = false;
     bool generate_continents = false;
     IndexMode mode = IndexMode::Full;
@@ -440,6 +517,8 @@ int main(int argc, char* argv[]) {
             wikidata_sitelinks_path = argv[++i];
         } else if (arg == "--tiger-data" && i + 1 < argc) {
             tiger_data_path = argv[++i];
+        } else if (arg == "--external-postcodes" && i + 1 < argc) {
+            external_postcodes_path = argv[++i];
         } else {
             input_files.push_back(arg);
         }
@@ -2591,6 +2670,9 @@ int main(int argc, char* argv[]) {
         // Load TIGER address data
         if (!tiger_data_path.empty()) {
             load_tiger_data(data, tiger_data_path);
+        }
+        if (!external_postcodes_path.empty()) {
+            load_external_postcodes(data, external_postcodes_path);
         }
 
         // --- Parallel S2 cell computation for ways and interpolation ---

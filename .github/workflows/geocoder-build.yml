@@ -262,6 +262,48 @@ jobs:
             echo "[wikidata] No sitelinks data available"
           fi
 
+          # Download GeoNames postcode data (4.3M postcodes from ~100 countries)
+          echo "[geonames] Downloading GeoNames postcode data..."
+          GEONAMES_FILE="$WORKDIR/postcode_centroids_external.csv.gz"
+          python3 -c "
+          import zipfile, io, gzip, urllib.request, os, tempfile
+          entries = {}
+          tmpdir = tempfile.mkdtemp()
+          for url, cc_filter in [
+              ('https://download.geonames.org/export/zip/allCountries.zip', None),
+              ('https://download.geonames.org/export/zip/GB_full.csv.zip', 'GB'),
+              ('https://download.geonames.org/export/zip/CA_full.csv.zip', 'CA'),
+              ('https://download.geonames.org/export/zip/NL_full.csv.zip', 'NL'),
+          ]:
+              zpath = os.path.join(tmpdir, os.path.basename(url))
+              try:
+                  urllib.request.urlretrieve(url, zpath)
+                  with zipfile.ZipFile(zpath) as z:
+                      with z.open(z.namelist()[0]) as f:
+                          for line in io.TextIOWrapper(f, encoding='utf-8', errors='replace'):
+                              parts = line.strip().split('\t')
+                              if len(parts) < 11: continue
+                              cc, pc, lat, lng = parts[0], parts[1], parts[9], parts[10]
+                              if cc_filter and cc != cc_filter: continue
+                              try:
+                                  lat_f, lng_f = float(lat), float(lng)
+                                  if lat_f == 0 and lng_f == 0: continue
+                                  entries[(cc, pc)] = (lat_f, lng_f)
+                              except: pass
+              except Exception as e:
+                  print(f'  Warning: {url}: {e}')
+          with gzip.open('$GEONAMES_FILE', 'wt') as f:
+              f.write('postcode,lat,lon,country_code\n')
+              for (cc, pc), (lat, lng) in sorted(entries.items()):
+                  f.write(f'{pc},{lat},{lng},{cc}\n')
+          print(f'[geonames] {len(entries)} postcodes, {os.path.getsize(\"$GEONAMES_FILE\")//1024//1024} MiB')
+          " 2>&1
+          if [ -f "$GEONAMES_FILE" ] && [ "$(stat -c%s "$GEONAMES_FILE")" -gt 1000 ]; then
+            echo "postcode_centroids_external=$GEONAMES_FILE" >> "$GITHUB_OUTPUT"
+          else
+            echo "[geonames] Download failed, skipping"
+          fi
+
           # Download TIGER data (if available)
           echo "[tiger] Checking for TIGER address data..."
           TIGER_LATEST=$(curl -sL --fail "$S3_PUBLIC_URL/geocoder/tiger/latest.json" 2>/dev/null || echo '{}')
@@ -371,6 +413,11 @@ jobs:
           if [ -n "$TIGER_FILE" ] && [ -f "$TIGER_FILE" ]; then
             BUILD_ARGS="$BUILD_ARGS --tiger-data $TIGER_FILE"
             echo "Using TIGER address data"
+          fi
+          GEONAMES_FILE="${{ steps.download.outputs.postcode_centroids_external }}"
+          if [ -n "$GEONAMES_FILE" ] && [ -f "$GEONAMES_FILE" ]; then
+            BUILD_ARGS="$BUILD_ARGS --geonames-postcodes $GEONAMES_FILE"
+            echo "Using GeoNames postcode data"
           fi
 
           echo "Building geocoder index for $TODAY..."
