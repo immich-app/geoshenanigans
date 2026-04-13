@@ -229,6 +229,24 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
             data.interp_ways.push_back(iw);
             data.deferred_interps.push_back({interp_id, node_offset, iw.node_count});
 
+            // Accumulate TIGER postcode centroids — TIGER has excellent
+            // US zip code coverage that OSM addr:postcode mostly lacks.
+            // Nominatim imports TIGER the same way and postcodes feed
+            // into location_postcode.
+            const std::string& postcode = fields[6];
+            if (!postcode.empty() && is_valid_postcode(postcode.c_str())) {
+                uint32_t pc_id = data.string_pool.intern(postcode);
+                // Use the midpoint of the interpolation segment as the
+                // postcode location (centroid of the segment).
+                double mid_lat = 0, mid_lng = 0;
+                for (const auto& n : nodes) { mid_lat += n.lat; mid_lng += n.lng; }
+                mid_lat /= nodes.size(); mid_lng /= nodes.size();
+                auto& acc = data.postcode_accum[pc_id];
+                acc.sum_lat += mid_lat;
+                acc.sum_lng += mid_lng;
+                acc.count++;
+            }
+
             loaded_rows++;
         }
     }
