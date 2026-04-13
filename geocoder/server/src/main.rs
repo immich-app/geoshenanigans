@@ -341,6 +341,7 @@ struct Index {
     // Parent chain files (Nominatim-style address walk)
     way_parents: Option<Mmap>,    // u32 per way → smallest containing admin poly
     admin_parents: Option<Mmap>,  // u32 per poly → next-larger containing admin poly
+    addr_postcodes: Option<Mmap>, // u32 per addr_point → postcode string (optional)
     way_postcodes: Option<Mmap>,  // u32 per way → postcode string from postal boundary
     // Separate postcode files (optional — postcodes omitted when absent)
     postal_polygons: Option<Mmap>,
@@ -418,6 +419,7 @@ impl Index {
             place_entries: mmap_file_optional(&format!("{}/place_entries.bin", dir)),
             way_parents: mmap_file_optional(&format!("{}/way_parents.bin", dir)),
             admin_parents: mmap_file_optional(&format!("{}/admin_parents.bin", dir)),
+            addr_postcodes: mmap_file_optional(&format!("{}/addr_postcodes.bin", dir)),
             way_postcodes: mmap_file_optional(&format!("{}/way_postcodes.bin", dir)),
             postal_polygons: mmap_file_optional(&format!("{}/postal_polygons.bin", dir)),
             postal_vertices: mmap_file_optional(&format!("{}/postal_vertices.bin", dir)),
@@ -1933,7 +1935,28 @@ impl Index {
     //   1. way_postcodes[street.way_id] — street's computed postcode
     //   2. Postal boundary PIP (postal_polygons + postal_vertices)
     //   3. Nearest postcode centroid (Nominatim's get_nearest_postcode)
-    fn resolve_postcode(&self, lat: f64, lng: f64, street: Option<&WayHeader>) -> Option<&str> {
+    fn resolve_postcode(&self, lat: f64, lng: f64, street: Option<&WayHeader>, addr: Option<&AddrPoint>) -> Option<&str> {
+        // 0. Nearest addr_point's own postcode (from addr_postcodes.bin)
+        // Matches Nominatim's token_get_postcode — the feature's own
+        // addr:postcode tag is the highest-priority source.
+        if let (Some(ref apc), Some(ap)) = (&self.addr_postcodes, addr) {
+            let all_points: &[AddrPoint] = unsafe {
+                std::slice::from_raw_parts(
+                    self.addr_points.as_ref().unwrap().as_ptr() as *const AddrPoint,
+                    self.addr_points.as_ref().unwrap().len() / std::mem::size_of::<AddrPoint>(),
+                )
+            };
+            let addr_id = unsafe {
+                (ap as *const AddrPoint).offset_from(all_points.as_ptr()) as usize
+            };
+            let all_addr_pc: &[u32] = unsafe {
+                std::slice::from_raw_parts(apc.as_ptr() as *const u32, apc.len() / 4)
+            };
+            if addr_id < all_addr_pc.len() && all_addr_pc[addr_id] != NO_DATA {
+                return Some(self.get_string(all_addr_pc[addr_id]));
+            }
+        }
+
         // 1. way_postcodes[street.way_id] — street's computed postcode
         if let (Some(ref wpc), Some(way)) = (&self.way_postcodes, street) {
             let way_id = unsafe {
@@ -2189,11 +2212,16 @@ impl Index {
             }
         }
 
-        // Resolve postcode via the new 3-tier chain:
+        // Resolve postcode via the 4-tier chain matching Nominatim:
+        // 0. Nearest addr_point's own addr:postcode (from addr_postcodes.bin)
         // 1. way_postcodes[street.way_id] — street's computed postcode
         // 2. Postal boundary PIP (postal_polygons + postal_vertices)
         // 3. Nearest postcode centroid (Nominatim's get_nearest_postcode)
-        let resolved_postcode = self.resolve_postcode(lat, lng, street.as_ref().map(|(_, w)| *w));
+        let resolved_postcode = self.resolve_postcode(
+            lat, lng,
+            street.as_ref().map(|(_, w)| *w),
+            addr.as_ref().map(|(_, a)| *a),
+        );
 
         if road.is_none() && admin.country.is_none() && admin.city.is_none() && admin.state.is_none() {
             return Address::default();

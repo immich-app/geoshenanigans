@@ -141,6 +141,7 @@ struct ParsedData {
     std::vector<uint32_t> way_parent_ids;    // way → smallest containing admin poly
     std::vector<uint32_t> admin_parent_ids;  // poly → next-larger containing admin poly
     std::vector<uint32_t> way_postcode_ids;  // way → postcode string from containing postal boundary
+    std::vector<uint32_t> addr_postcode_ids; // per-addr_point postcode (optional separate file)
 
     // Postcode centroid collector: (postcode_string_id → sum_lat, sum_lng, count)
     // Built during addr_point extraction, converted to PostcodeCentroid[] at write time.

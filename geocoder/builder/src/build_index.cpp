@@ -1218,9 +1218,10 @@ int main(int argc, char* argv[]) {
                 for (auto& local : ntld) {
                     for (size_t j = 0; j < local.addr_coords.size(); j++) {
                         uint64_t dummy = 0;
+                        const char* pc_ptr = local.addr_postcodes[j].empty() ? nullptr : local.addr_postcodes[j].c_str();
                         add_addr_point(data, local.addr_coords[j].first, local.addr_coords[j].second,
                                        local.addr_strings[j].first.c_str(),
-                                       local.addr_strings[j].second.c_str(), dummy);
+                                       local.addr_strings[j].second.c_str(), pc_ptr, dummy);
                         // Accumulate postcode centroids (validated)
                         const auto& pc = local.addr_postcodes[j];
                         if (!pc.empty() && is_valid_postcode(pc.c_str())) {
@@ -1718,9 +1719,10 @@ int main(int argc, char* argv[]) {
                     // Merge building addresses
                     for (size_t i = 0; i < local.building_addrs.size(); i++) {
                         uint64_t dummy = 0;
+                        const char* bpc_ptr = local.addr_postcodes[i].empty() ? nullptr : local.addr_postcodes[i].c_str();
                         add_addr_point(data, local.building_addrs[i].lat, local.building_addrs[i].lng,
                                        local.addr_strings[i].first.c_str(),
-                                       local.addr_strings[i].second.c_str(), dummy);
+                                       local.addr_strings[i].second.c_str(), bpc_ptr, dummy);
                         // Accumulate postcode centroids (validated)
                         const auto& pc = local.addr_postcodes[i];
                         if (!pc.empty() && is_valid_postcode(pc.c_str())) {
@@ -3300,14 +3302,18 @@ int main(int argc, char* argv[]) {
                     }
                 }
                 for (auto& pn : data.place_nodes) pn.name_id = rm.at(pn.name_id);
-                // Remap way_postcode_ids (string offsets into pool)
-                for (auto& pc : data.way_postcode_ids) {
-                    if (pc != NO_DATA) {
-                        auto it = rm.find(pc);
-                        if (it != rm.end()) pc = it->second;
-                        else pc = NO_DATA;
+                // Remap way_postcode_ids and addr_postcode_ids (string offsets)
+                auto remap_pc_vec = [&](std::vector<uint32_t>& v) {
+                    for (auto& pc : v) {
+                        if (pc != NO_DATA) {
+                            auto it = rm.find(pc);
+                            if (it != rm.end()) pc = it->second;
+                            else pc = NO_DATA;
+                        }
                     }
-                }
+                };
+                remap_pc_vec(data.way_postcode_ids);
+                remap_pc_vec(data.addr_postcode_ids);
                 // Remap postcode_accum keys and build centroid vector
                 {
                     std::unordered_map<uint32_t, ParsedData::PostcodeAccum> remapped;
@@ -3371,6 +3377,18 @@ int main(int argc, char* argv[]) {
             }
             sorted.resize(write_pos);
             data.addr_points = std::move(sorted);
+            // Reorder + dedup addr_postcode_ids in parallel
+            if (data.addr_postcode_ids.size() == n) {
+                std::vector<uint32_t> sorted_pc(n);
+                for (uint32_t i = 0; i < n; i++) sorted_pc[i] = data.addr_postcode_ids[order[i]];
+                // Dedup: keep the first occurrence's postcode
+                std::vector<uint32_t> deduped_pc(write_pos, NO_DATA);
+                for (size_t i = 0; i < n; i++) {
+                    uint32_t new_idx = dedup_remap[i];
+                    if (deduped_pc[new_idx] == NO_DATA) deduped_pc[new_idx] = sorted_pc[i];
+                }
+                data.addr_postcode_ids = std::move(deduped_pc);
+            }
             if (write_pos < n)
                 std::cerr << "  Deduped addr_points: " << n << " → " << write_pos
                           << " (-" << (n - write_pos) << ")" << std::endl;
