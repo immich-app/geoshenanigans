@@ -58,6 +58,24 @@ build_index() {
     echo "Index built."
 }
 
+decompress_index() {
+    local dir="$1"
+    [ -d "$dir" ] || return 0
+    local count
+    count=$(find "$dir" -maxdepth 1 -name "*.bin.zst" 2>/dev/null | wc -l)
+    [ "$count" -eq 0 ] && return 0
+    echo "Decompressing $count .bin.zst files in $dir..."
+    find "$dir" -maxdepth 1 -name "*.bin.zst" -print0 \
+        | xargs -0 -n1 -P4 sh -c '
+            raw="${1%.zst}"
+            if [ -f "$raw" ]; then
+                rm -f "$1"
+            else
+                zstd -d -T0 --rm --quiet "$1"
+            fi
+        ' _
+}
+
 serve() {
     # Determine which index dir to serve
     index_dir="$DATA_DIR/index"
@@ -65,6 +83,11 @@ serve() {
         # Default to full when multi-output was used
         index_dir="$DATA_DIR/index/${SERVE_MODE:-full}"
     fi
+
+    # Decompress any .bin.zst that shipped in the data dir. Idempotent —
+    # if a raw .bin already exists alongside, the compressed variant is
+    # dropped. Server mmaps raw bytes so only .bin is needed at runtime.
+    decompress_index "$index_dir"
 
     args="$index_dir"
     if [ -n "$DOMAIN" ]; then

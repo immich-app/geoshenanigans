@@ -4195,13 +4195,18 @@ int main(int argc, char* argv[]) {
             return masks;
         };
 
-        // Precompute for all three sorted pair arrays
+        // Precompute masks for every sorted-pair array we'll filter through
+        // filter_by_bbox_masked: ways, addrs, interps, POIs, and place nodes.
         auto way_masks = std::async(std::launch::async, [&]{ return precompute_masks(data.sorted_way_cells); });
         auto addr_masks = std::async(std::launch::async, [&]{ return precompute_masks(data.sorted_addr_cells); });
         auto interp_masks = std::async(std::launch::async, [&]{ return precompute_masks(data.sorted_interp_cells); });
+        auto poi_masks = std::async(std::launch::async, [&]{ return precompute_masks(data.sorted_poi_cells); });
+        auto place_masks = std::async(std::launch::async, [&]{ return precompute_masks(data.sorted_place_cells); });
         auto way_continent_masks = way_masks.get();
         auto addr_continent_masks = addr_masks.get();
         auto interp_continent_masks = interp_masks.get();
+        auto poi_continent_masks = poi_masks.get();
+        auto place_continent_masks = place_masks.get();
 
         log_phase("Pre-compute continent masks", _pct, _pcc);
 
@@ -4241,7 +4246,8 @@ int main(int argc, char* argv[]) {
                 const auto* poly = (continent_order[i] < continent_polys.size() && !continent_polys[continent_order[i]].vertices.empty())
                     ? &continent_polys[continent_order[i]].vertices : nullptr;
                 auto subset = filter_by_bbox_masked(data, continent, cbit,
-                    way_continent_masks, addr_continent_masks, interp_continent_masks, poly);
+                    way_continent_masks, addr_continent_masks, interp_continent_masks,
+                    poi_continent_masks, place_continent_masks, poly);
                 log_phase(("  " + std::string(continent.name) + ": filter").c_str(), _ct, _cc);
                 write_region(subset, output_dir + "/" + continent.name);
                 log_phase(("  " + std::string(continent.name) + ": total").c_str(), _ct, _cc);
@@ -4308,7 +4314,7 @@ int main(int argc, char* argv[]) {
 
         std::ofstream mf(output_dir + "/manifest.json");
         mf << "{\n";
-        mf << "  \"build_version\": 7,\n";
+        mf << "  \"build_version\": 8,\n";
         mf << "  \"patch_version\": 4,\n";
         mf << "  \"regions\": {\n";
 

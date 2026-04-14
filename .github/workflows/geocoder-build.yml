@@ -103,7 +103,7 @@ jobs:
           echo "Server:     $CURRENT_DATE (seq $CURRENT_SEQ, offset: -${DAYS_OFFSET}d)"
 
           # Check if previous build exists on Tigris with compatible build_version
-          EXPECTED_BUILD_VERSION=3
+          EXPECTED_BUILD_VERSION=8
           PREV_BUILD="s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV_DATE"
           if [ "$FORCE_FRESH" = "true" ]; then
             echo "has_previous=false" >> "$GITHUB_OUTPUT"
@@ -190,6 +190,17 @@ jobs:
               ELAPSED=$(($(date +%s) - START))
               echo "[indexes] Done: $COUNT files ($((SIZE/1024/1024)) MiB) in ${ELAPSED}s ($((SIZE/1024/1024/(ELAPSED+1))) MB/s)"
               if [ "$COUNT" -eq 0 ]; then echo "::error::Download produced 0 files"; exit 1; fi
+
+              # Decompress .bin.zst files in place — geocoder-diff operates on raw bytes.
+              # Uses all cores with one file at a time (zstd -T0).
+              DECOMP_START=$(date +%s)
+              ZST_COUNT=$(find "$WORKDIR/old-output" -name "*.bin.zst" | wc -l)
+              if [ "$ZST_COUNT" -gt 0 ]; then
+                echo "[indexes] Decompressing $ZST_COUNT .bin.zst files..."
+                find "$WORKDIR/old-output" -name "*.bin.zst" -print0 \
+                  | xargs -0 -n1 -P4 zstd -d -T0 --rm --quiet
+                echo "[indexes] Decompressed in $(($(date +%s) - DECOMP_START))s"
+              fi
             ) &
             IDX_PID=$!
           fi
@@ -422,9 +433,12 @@ jobs:
 
           echo "Building geocoder index for $TODAY..."
           START=$(date +%s)
+          # Tee the full log to a file so continent warnings etc. aren't lost,
+          # while still streaming the tail to the step output for quick glance.
           build-index "$WORKDIR/output/" "$WORKDIR/planet.osm.pbf" \
-            $BUILD_ARGS 2>&1 | tail -10
+            $BUILD_ARGS 2>&1 | tee "$WORKDIR/build.log" | tail -30
           echo "Build completed in $(($(date +%s) - START))s"
+          echo "Build log kept at $WORKDIR/build.log ($(wc -l < "$WORKDIR/build.log") lines)"
           echo "$(find "$WORKDIR/output" -name "*.bin" | wc -l) bin files produced"
 
           # Wait for background PBF cache upload, then free disk
@@ -444,21 +458,9 @@ jobs:
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
 
-          # Clear stale files at this date (e.g. from earlier failed builds or prior runs)
-          # and upload index files in background while we generate patches.
-          $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
-          echo "Starting index upload to Tigris in background..."
-          (
-            s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 8 cp --concurrency 16 \
-              --exclude "*.gcpatch" \
-              "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/"
-            echo "[upload] Tigris index upload complete"
-            $CACHE cp --concurrency 16 --exclude "*.gcpatch" \
-              "$WORKDIR/output/*" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/" 2>/dev/null || true
-            echo "[upload] Cache upload complete"
-          ) &
-          UPLOAD_PID=$!
-
+          # Patch generation runs against uncompressed .bin files (old was
+          # decompressed during download, new was just built). Compression
+          # happens in the next step, before the finalize upload.
           echo "Generating patches ($OLD_DATE → $NEW_DATE)..."
           START=$(date +%s)
 
@@ -550,27 +552,74 @@ jobs:
           echo "**Total: $PASS pass, $FAIL fail, $SKIP skip**" >> "$GITHUB_STEP_SUMMARY"
           echo "Results: $PASS pass, $FAIL fail, $SKIP skip"
 
-          # Wait for background index upload to finish
-          echo "Waiting for background index upload..."
-          wait $UPLOAD_PID || echo "::warning::Background upload had issues"
-
-          # Upload verified patches
-          echo "Uploading patches to Tigris..."
-          PATCH_START=$(date +%s)
-          find "$WORKDIR/output" -name "*.gcpatch" -type f | while read -r f; do
-            REL="${f#$WORKDIR/output/}"
-            s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 cp "$f" \
-              "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/$REL" 2>/dev/null
-          done
-          echo "Patch upload completed in $(($(date +%s) - PATCH_START))s"
-
-          # Also cache patches
-          find "$WORKDIR/output" -name "*.gcpatch" -type f | while read -r f; do
-            REL="${f#$WORKDIR/output/}"
-            $CACHE cp "$f" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/$REL" 2>/dev/null || true
-          done
+          # Patches stay in $WORKDIR/output/*.gcpatch — uploaded alongside
+          # compressed .bin.zst files in the Finalize step below.
 
           [ $FAIL -gt 0 ] && exit 1 || true
+
+      # ── Compress .bin files + rewrite manifest with per-file sizes ─
+      - name: Compress index files
+        env:
+          WORKDIR: ${{ steps.setup.outputs.workdir }}
+        run: |
+          COMPRESS_START=$(date +%s)
+          BIN_COUNT=$(find "$WORKDIR/output" -name "*.bin" | wc -l)
+          echo "Compressing $BIN_COUNT .bin files with zstd -19 -T0..."
+
+          python3 - <<'PY'
+          import json, os, subprocess, hashlib
+          out = os.environ["WORKDIR"] + "/output"
+          mpath = f"{out}/manifest.json"
+          with open(mpath) as f:
+              m = json.load(f)
+
+          bin_files = []
+          for root, _, fs in os.walk(out):
+              for name in fs:
+                  if name.endswith(".bin"):
+                      bin_files.append(os.path.join(root, name))
+          bin_files.sort()
+
+          files = []
+          total_raw = 0
+          total_comp = 0
+          for full in bin_files:
+              rel = os.path.relpath(full, out)
+              # sha256 of raw content (server mmaps raw, so the hash clients
+              # verify after decompression is this one).
+              h = hashlib.sha256()
+              with open(full, "rb") as f:
+                  for chunk in iter(lambda: f.read(1 << 20), b""):
+                      h.update(chunk)
+              raw_size = os.path.getsize(full)
+              subprocess.run(["zstd", "-19", "-T0", "--quiet", full], check=True)
+              zst = full + ".zst"
+              comp_size = os.path.getsize(zst)
+              os.remove(full)
+              files.append({
+                  "path": rel,
+                  "raw_size": raw_size,
+                  "compressed_size": comp_size,
+                  "sha256": h.hexdigest(),
+              })
+              total_raw += raw_size
+              total_comp += comp_size
+              pct = 100 * comp_size / raw_size if raw_size else 0
+              print(f"  {rel}: {raw_size/1e6:.0f} → {comp_size/1e6:.0f} MiB ({pct:.0f}%)")
+
+          files.sort(key=lambda x: x["path"])
+          m["files"] = files
+          with open(mpath, "w") as f:
+              json.dump(m, f, indent=2)
+
+          if total_raw:
+              ratio = 100 * total_comp / total_raw
+              print(f"Total: {total_raw/1e9:.2f} GB raw → {total_comp/1e9:.2f} GB compressed ({ratio:.0f}%)")
+          PY
+
+          echo "Compression done in $(($(date +%s) - COMPRESS_START))s"
+          ZST_COUNT=$(find "$WORKDIR/output" -name "*.bin.zst" | wc -l)
+          echo "$ZST_COUNT .bin.zst files produced"
 
       # ── Finalize upload + manifest ──────────────────────────────────
       - name: Finalize upload and manifest
@@ -585,22 +634,21 @@ jobs:
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
 
-          # Fresh-build fallback: when patch step was skipped (no previous build),
-          # the background upload never ran. Upload index files now.
-          # Tigris sometimes fails multipart uploads with "NoSuchUpload" on large files
-          # under concurrency — tolerate and fall through to the verify loop, which
-          # re-uploads any files that didn't make it.
-          if [ "$HAS_PREVIOUS" != "true" ]; then
-            echo "Fresh build: clearing stale files and uploading all index files..."
-            $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
-            s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 4 cp --concurrency 8 \
-              --exclude "*.gcpatch" \
-              "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/" || \
-              echo "::warning::Some files failed on first pass — verify loop will retry"
-            echo "Fresh-build Tigris upload first pass complete"
-            $CACHE cp --concurrency 16 --exclude "*.gcpatch" \
-              "$WORKDIR/output/*" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/" 2>/dev/null || true
-          fi
+          # Clear stale files from prior builds at this date, then upload
+          # compressed .bin.zst + patches + json in one shot. Tigris
+          # occasionally fails multipart uploads under concurrency — the
+          # verify loop below re-uploads anything missing.
+          echo "Clearing stale files at s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/..."
+          $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
+
+          echo "Uploading .bin.zst + patches to Tigris..."
+          UPLOAD_START=$(date +%s)
+          s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 4 cp --concurrency 8 \
+            "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/" || \
+            echo "::warning::Some files failed on first pass — verify loop will retry"
+          echo "Tigris upload first pass complete in $(($(date +%s) - UPLOAD_START))s"
+          $CACHE cp --concurrency 16 \
+            "$WORKDIR/output/*" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/" 2>/dev/null || true
 
           # ── Augment build tool's manifest.json with date/previous info ──
           PREV_VAL="$( [ "$HAS_PREVIOUS" = "true" ] && echo "$OLD_DATE" || echo "null" )"
@@ -611,16 +659,19 @@ jobs:
              '. + {date: $date, previous: (if $previous == "null" then null else $previous end), built_at: $built_at, wikidata_date: (if $wikidata_date == "null" then null else $wikidata_date end)}' \
              "$WORKDIR/output/manifest.json" > "$WORKDIR/output/manifest.tmp" \
              && mv "$WORKDIR/output/manifest.tmp" "$WORKDIR/output/manifest.json"
-          echo "Manifest: $(cat "$WORKDIR/output/manifest.json")"
+          echo "Manifest size: $(stat -c%s "$WORKDIR/output/manifest.json") bytes"
 
-          # Generate checksums for all output files
+          # Generate checksums — .bin.zst + .gcpatch + .json. Note that the
+          # manifest.files[].sha256 field holds the RAW (pre-compression)
+          # hashes for server-side verification after decompression, while
+          # this checksums.sha256 holds the on-wire hashes (compressed).
           echo "Generating checksums..."
-          (cd "$WORKDIR/output" && find . -type f -name "*.bin" -o -name "*.gcpatch" -o -name "*.json" | sort | while read -r f; do
+          (cd "$WORKDIR/output" && find . -type f \( -name "*.bin.zst" -o -name "*.gcpatch" -o -name "*.json" \) | sort | while read -r f; do
             sha256sum "$f"
           done) > "$WORKDIR/output/checksums.sha256"
           echo "$(wc -l < "$WORKDIR/output/checksums.sha256") file checksums generated"
 
-          # Upload manifest + checksums (index files + patches already uploaded)
+          # Upload manifest + checksums (index files + patches already uploaded above)
           $S5 cp "$WORKDIR/output/manifest.json" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/manifest.json"
           $S5 cp "$WORKDIR/output/checksums.sha256" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/checksums.sha256"
           $CACHE cp "$WORKDIR/output/manifest.json" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/manifest.json" 2>/dev/null || true
@@ -639,7 +690,7 @@ jobs:
             | sort > /tmp/remote.txt
 
           # List local files, strip the workdir prefix
-          (cd "$WORKDIR/output" && find . -type f -name "*.bin" -o -name "*.json" -o -name "*.sha256") \
+          (cd "$WORKDIR/output" && find . -type f \( -name "*.bin.zst" -o -name "*.gcpatch" -o -name "*.json" -o -name "*.sha256" \)) \
             | sed 's|^\./||' | sort > /tmp/local.txt
 
           missing=$(comm -23 /tmp/local.txt /tmp/remote.txt)
@@ -686,8 +737,8 @@ jobs:
           # ── Update latest.json ──
           PREV_VAL="$( [ "$HAS_PREVIOUS" = "true" ] && echo "$OLD_DATE" || echo "null" )"
           jq -n \
-            --argjson build_version 3 \
-            --argjson patch_version 3 \
+            --argjson build_version 8 \
+            --argjson patch_version 4 \
             --arg latest "$NEW_DATE" \
             --arg previous "$PREV_VAL" \
             --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -695,3 +746,12 @@ jobs:
             | $S5 pipe "s3://$S3_BUCKET/$S3_PREFIX/builds/latest.json"
 
           echo "Upload complete."
+
+      - name: Upload build log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ${{ steps.setup.outputs.workdir }}/build.log
+          if-no-files-found: ignore
+          retention-days: 7

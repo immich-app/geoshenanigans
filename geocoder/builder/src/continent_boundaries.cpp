@@ -1,48 +1,34 @@
 #include "continent_boundaries.h"
+#include "embedded_polys.h"
 
-#include <cstdlib>
-#include <fstream>
+#include <cstring>
 #include <iostream>
 #include <sstream>
+#include <string_view>
 
-// Parse a Geofabrik .poly file into a ContinentPolygon.
+// Parse a Geofabrik .poly file from an in-memory buffer.
 // Format: name\nring_name\n  lng lat\n  ...\nEND\nEND\n
 // Note: longitude comes first in .poly files.
-static ContinentPolygon parse_poly_file(const std::string& path, const std::string& name) {
+static ContinentPolygon parse_poly_data(std::string_view data, const std::string& name) {
     ContinentPolygon poly;
     poly.name = name;
 
-    std::ifstream f(path);
-    if (!f) {
-        std::cerr << "Warning: cannot open poly file: " << path << std::endl;
-        return poly;
-    }
-
+    std::istringstream f{std::string(data)};
     std::string line;
-    // Skip header lines until we get to coordinates
-    bool in_ring = false;
     while (std::getline(f, line)) {
-        // Trim whitespace
         size_t start = line.find_first_not_of(" \t\r\n");
         if (start == std::string::npos) continue;
         std::string trimmed = line.substr(start);
 
-        if (trimmed == "END") {
-            in_ring = false;
-            continue;
-        }
+        if (trimmed == "END") continue;
 
-        // Try to parse as "lng lat"
         double lng, lat;
         std::istringstream iss(trimmed);
         if (iss >> lng >> lat) {
-            poly.vertices.push_back({lat, lng}); // store as (lat, lng)
-            in_ring = true;
+            poly.vertices.push_back({lat, lng});
         }
-        // Otherwise it's a name/ring_name line — skip
     }
 
-    // Close polygon if not already closed
     if (!poly.vertices.empty() && poly.vertices.front() != poly.vertices.back()) {
         poly.vertices.push_back(poly.vertices.front());
     }
@@ -51,48 +37,42 @@ static ContinentPolygon parse_poly_file(const std::string& path, const std::stri
 }
 
 std::vector<ContinentPolygon> get_continent_polygons() {
-    // Try multiple search paths for poly files
-    std::vector<std::string> search_paths = {
-        "data/",                    // relative to working dir
-        "../data/",                 // from build dir
-        "/root/traccar-geocoder/builder/data/",  // absolute
+    // Our internal continent name → filename stem embedded by CMake.
+    // Order must match kContinents[] in continent_filter.cpp.
+    struct Def { const char* our_name; const char* embedded_name; };
+    static const Def defs[] = {
+        {"africa",          "africa"},
+        {"asia",            "asia"},
+        {"europe",          "europe"},
+        {"north-america",   "north-america"},
+        {"south-america",   "south-america"},
+        {"oceania",         "australia-oceania"},
+        {"central-america", "central-america"},
+        {"antarctica",      "antarctica"},
     };
 
-    // Continent names matching kContinents[] order in continent_filter.cpp
-    struct PolyDef {
-        const char* name;       // our continent name
-        const char* filename;   // geofabrik filename
-    };
-    PolyDef defs[] = {
-        {"africa", "africa.poly"},
-        {"asia", "asia.poly"},
-        {"europe", "europe.poly"},
-        {"north-america", "north-america.poly"},
-        {"south-america", "south-america.poly"},
-        {"oceania", "australia-oceania.poly"},
-        {"central-america", "central-america.poly"},
-        {"antarctica", "antarctica.poly"},
-    };
-
+    const embedded_polys::Entry* entries = embedded_polys::entries();
     std::vector<ContinentPolygon> polys;
 
     for (const auto& def : defs) {
-        ContinentPolygon poly;
-        bool found = false;
-        for (const auto& prefix : search_paths) {
-            poly = parse_poly_file(prefix + def.filename, def.name);
-            if (!poly.vertices.empty()) {
-                found = true;
+        const embedded_polys::Entry* hit = nullptr;
+        for (size_t i = 0; i < embedded_polys::kCount; i++) {
+            if (std::strcmp(entries[i].name, def.embedded_name) == 0) {
+                hit = &entries[i];
                 break;
             }
         }
-        if (!found) {
-            std::cerr << "Warning: no poly file found for " << def.name
-                      << " — continent will have no data" << std::endl;
-        } else {
-            std::cerr << "  Loaded " << def.name << " boundary: "
-                      << poly.vertices.size() << " vertices" << std::endl;
+        if (!hit) {
+            std::cerr << "Warning: embedded poly missing for " << def.our_name
+                      << " (" << def.embedded_name << ")" << std::endl;
+            polys.push_back({def.our_name, {}});
+            continue;
         }
+        auto poly = parse_poly_data(
+            std::string_view(reinterpret_cast<const char*>(hit->data), hit->size),
+            def.our_name);
+        std::cerr << "  Loaded " << def.our_name << " boundary: "
+                  << poly.vertices.size() << " vertices" << std::endl;
         polys.push_back(std::move(poly));
     }
 
