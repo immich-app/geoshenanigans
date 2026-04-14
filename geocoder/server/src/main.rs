@@ -2196,19 +2196,31 @@ impl Index {
                 house_number = Some(Cow::Owned(number.to_string()));
                 road = Some(street_name);
             } else {
-                // Street is closest — use the street name. Nominatim
-                // refines with _find_housenumber_for_street (joined by
-                // parent_place_id) + _find_interpolation_for_street.
-                // We have parent_way_id on addr_points but not on
-                // interp_ways, so refinement picks addr (house 139)
-                // when Nominatim picks interp (house 141). Disabled
-                // until interp parent matching is implemented.
+                // Street is closest. Match Nominatim's
+                // `_find_housenumber_for_street` (reverse.py:231):
+                // find an IsAddressPoint (addr_point with housenumber)
+                // whose parent_way_id matches the winning street,
+                // within 0.001 deg (~100m).
                 let (_, way) = street.unwrap();
                 road = if way.name_id != NO_DATA {
                     Some(self.get_string(way.name_id))
                 } else {
                     None
                 };
+
+                // Compute way_id for parent_way_id matching
+                let way_id = unsafe {
+                    let ways_base = self.street_ways.as_ref().unwrap().as_ptr() as *const WayHeader;
+                    (way as *const WayHeader).offset_from(ways_base) as u32
+                };
+
+                // Housenumber refinement disabled: parent_way_id
+                // matching picks the nearest addr on the same way
+                // segment, but when our primary street differs from
+                // Nominatim's (different nearest-feature selection),
+                // the housenumber is wrong (53≠314, 2≠19). Wrong
+                // house numbers are worse than missing ones.
+                // Needs per-segment parent matching to work correctly.
             }
         }
 
