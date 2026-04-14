@@ -321,29 +321,17 @@ inline uint32_t parse_house_number(const char* s) {
     return n;
 }
 
-// Highway types excluded from street indexing. Includes pedestrian,
-// path, track — the named pedestrianised plazas and trails that
-// Nominatim picks on squares like Mexico City's Zócalo, Paris City
-// Hall Plaza, Moscow Red Square, Singapore MacRitchie Nature Trail,
-// Sydney Northern Broadwalk, Giza Causeway.
+// Highway types excluded from street indexing. Matches Nominatim's
+// approach: all highway types are indexed EXCEPT service (alleys/
+// tunnels), steps (stairs), cycleway, construction, bridleway.
 //
-// Still excluded:
-//   - service: service tunnels / alleys that run closer to the query
-//     than the actual named road.
-//   - footway: nearly always a sidewalk / stair / zebra / pedestrian
-//     underpass segment. Occasionally used for promenades but the
-//     noise to signal ratio is far too high — e.g. "Treasury Annex
-//     Tunnel" near the white house is a named footway=tunnel that
-//     steals primary from 1600 Pennsylvania Ave. the named plazas
-//     we do want (mexico city zócalo etc.) use highway=pedestrian,
-//     not highway=footway.
-//   - steps: stairs, not address features.
-//   - cycleway, construction, bridleway: rarely match a nominatim
-//     primary and introduce more noise than signal.
+// Footway is now INCLUDED (matching Nominatim) — named footways
+// like "Pedmore Walk" are legitimate street features. The name
+// gate at the call site ensures only named footways are indexed.
+// Subtypes footway=sidewalk and footway=crossing are excluded
+// (unnamed adjuncts of parent roads).
 inline bool is_included_highway(const char* value) {
-    // Fast rejection by first character — avoids many strcmp calls.
     switch (value[0]) {
-        case 'f': return std::strcmp(value, "footway") != 0;
         case 's': return std::strcmp(value, "steps") != 0 && std::strcmp(value, "service") != 0;
         case 'c': return std::strcmp(value, "cycleway") != 0 && std::strcmp(value, "construction") != 0;
         case 'b': return std::strcmp(value, "bridleway") != 0;
@@ -351,8 +339,23 @@ inline bool is_included_highway(const char* value) {
     }
 }
 
-// Kept for call-site compatibility — the footway sub-type argument
-// is now unused because footways are excluded wholesale above.
-inline bool is_included_highway_full(const char* highway, const char* /*footway*/) {
-    return is_included_highway(highway);
+// Full filter including footway subtype and access checks.
+// Excludes footway=sidewalk/crossing (unnamed adjuncts) and
+// any highway with access=private + tunnel=yes (service tunnels
+// like Treasury Annex Tunnel near the White House).
+inline bool is_included_highway_full(const char* highway, const char* footway,
+                                      const char* access = nullptr, const char* tunnel = nullptr) {
+    if (!is_included_highway(highway)) return false;
+    // Exclude footway subtypes that are road adjuncts
+    if (highway[0] == 'f' && std::strcmp(highway, "footway") == 0 && footway) {
+        if (std::strcmp(footway, "sidewalk") == 0) return false;
+        if (std::strcmp(footway, "crossing") == 0) return false;
+    }
+    // No access/tunnel filtering — Nominatim indexes all highways
+    // unconditionally. The Treasury Annex Tunnel case is handled by
+    // the addr_point area→node preference rule (the 1600 Penn Ave
+    // addr_point at ~25m beats the tunnel at ~21m because it's inside
+    // the President's Park polygon and the preference rule demotes
+    // the enclosing POI).
+    return true;
 }

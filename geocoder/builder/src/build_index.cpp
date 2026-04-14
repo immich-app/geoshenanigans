@@ -1446,6 +1446,8 @@ int main(int argc, char* argv[]) {
                     const char* t_postcode = nullptr;
                     const char* t_highway = nullptr;
                     const char* t_footway = nullptr;
+                    const char* t_access = nullptr;
+                    const char* t_tunnel = nullptr;
                     const char* t_name = nullptr;
                     const char* t_name_en = nullptr;
                     const char* t_boundary = nullptr;
@@ -1485,6 +1487,7 @@ int main(int argc, char* argv[]) {
                                 else if (k == "admin_level") t_admin_level = v;
                                 else if (k == "amenity") t_amenity = v;
                                 else if (k == "aeroway") t_aeroway = v;
+                                else if (k == "access") t_access = v;
                                 break;
                             case 'b':
                                 if (k == "boundary") t_boundary = v;
@@ -1514,7 +1517,10 @@ int main(int argc, char* argv[]) {
                                 else if (k == "power") t_power = v;
                                 break;
                             case 'r': if (k == "railway") t_railway = v; break;
-                            case 't': if (k == "tourism") t_tourism = v; break;
+                            case 't':
+                                if (k == "tourism") t_tourism = v;
+                                else if (k == "tunnel") t_tunnel = v;
+                                break;
                             case 'I': if (k == "ISO3166-1:alpha2") t_iso = v; break;
                             case 'w':
                                 if (k == "waterway") t_waterway = v;
@@ -1536,7 +1542,7 @@ int main(int argc, char* argv[]) {
 
                     // Early exit: if no relevant tags, skip expensive node resolution
                     bool need_nodes = t_interpolation || t_housenumber ||
-                        (t_highway && is_included_highway_full(t_highway, t_footway) && t_name) ||
+                        (t_highway && is_included_highway_full(t_highway, t_footway, t_access, t_tunnel) && t_name) ||
                         t_boundary ||
                         (refs_size > 0 && is_admin_way(way_id)) ||
                         (has_poi_tags && t_name) ||
@@ -1600,7 +1606,7 @@ int main(int argc, char* argv[]) {
                     }
 
                     // Highway ways
-                    if (t_highway && is_included_highway_full(t_highway, t_footway)) {
+                    if (t_highway && is_included_highway_full(t_highway, t_footway, t_access, t_tunnel)) {
                         if (t_best_name && refs_size >= 2 && all_valid) {
                             uint32_t wid = static_cast<uint32_t>(local.ways.size());
                             uint32_t noff = static_cast<uint32_t>(local.street_nodes.size());
@@ -3109,7 +3115,15 @@ int main(int argc, char* argv[]) {
                             }
                             if (best_way_idx != NO_DATA) {
                                 ap.parent_way_id = best_way_idx;
-                                if (ap.street_id == NO_DATA) {
+                                // Always use the nearest way's name_id as
+                                // street_id, replacing the raw addr:street
+                                // text. This resolves addr:street to the
+                                // way's name:en (matching Nominatim's
+                                // tokenizer resolution). E.g. an addr
+                                // with addr:street="Place de l'Hôtel de
+                                // Ville" near a way with name:en="City
+                                // Hall Plaza" will use the way's name.
+                                if (best_name != NO_DATA) {
                                     ap.street_id = best_name;
                                 }
                                 ap_linked.fetch_add(1);
