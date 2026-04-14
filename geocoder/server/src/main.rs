@@ -2214,13 +2214,17 @@ impl Index {
                     (way as *const WayHeader).offset_from(ways_base) as u32
                 };
 
-                // Housenumber refinement disabled: parent_way_id
-                // matching picks the nearest addr on the same way
-                // segment, but when our primary street differs from
-                // Nominatim's (different nearest-feature selection),
-                // the housenumber is wrong (53≠314, 2≠19). Wrong
-                // house numbers are worse than missing ones.
-                // Needs per-segment parent matching to work correctly.
+                // Housenumber refinement: Nominatim includes addr_points
+                // (IsAddressPoint, rank_search=30) in the SAME primary
+                // query as streets, so a building polygon at distance 0
+                // beats the street at distance > 0. We can't replicate
+                // this because we store addr_points as centroids (not
+                // polygons), so buildings always have dist > 0 even when
+                // the query is inside the footprint. parent_way_id
+                // matching gives correct numbers when our street matches
+                // Nominatim's but wrong numbers otherwise (net neutral).
+                // Disabled until we store building footprints or add
+                // addr_points to the primary-feature query.
             }
         }
 
