@@ -565,9 +565,17 @@ jobs:
           COMPRESS_START=$(date +%s)
           BIN_COUNT=$(find "$WORKDIR/output" -name "*.bin" | wc -l)
           NPROC=$(nproc)
-          echo "Compressing $BIN_COUNT .bin files with zstd --ultra -22 --long=27 (-T1 per file, $NPROC parallel workers)..."
+          # Strategy: zstd --ultra -22 --long=27 -T0 per file (uses all cores
+          # for the single file being compressed), with a small number of
+          # parallel workers to absorb the tail of small files and cover
+          # zstd's diminishing returns past ~16 threads. On 80-thread runners
+          # this gives 4 concurrent workers × ~20 effective threads each.
+          WORKERS=$(( NPROC / 16 ))
+          [ "$WORKERS" -lt 1 ] && WORKERS=1
+          [ "$WORKERS" -gt 6 ] && WORKERS=6
+          echo "Compressing $BIN_COUNT .bin files with zstd --ultra -22 --long=27 -T0 ($WORKERS parallel workers, $NPROC-thread runner)..."
 
-          python3 - <<'PY'
+          WORKERS=$WORKERS python3 - <<'PY'
           import json, os, subprocess, hashlib
           from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -581,9 +589,7 @@ jobs:
               for name in fs:
                   if name.endswith(".bin"):
                       bin_files.append(os.path.join(root, name))
-          # Largest-first scheduling minimizes tail latency: the biggest file
-          # starts immediately and its single-threaded zstd run overlaps with
-          # many smaller files finishing on other workers.
+          # Largest-first scheduling minimizes tail latency.
           bin_files.sort(key=lambda p: -os.path.getsize(p))
 
           def process(full):
@@ -592,15 +598,16 @@ jobs:
                   for chunk in iter(lambda: f.read(1 << 20), b""):
                       h.update(chunk)
               raw_size = os.path.getsize(full)
-              # Maximum compression settings:
-              #   --ultra -22      level 22 (the highest zstd offers)
-              #   --long=27        128 MB long-range window (better ratio for
-              #                    repetitive structured binary data)
-              #   -T1              single-threaded per file so the outer
-              #                    ProcessPoolExecutor parallelism can saturate
-              #                    every core with a different file
+              # Maximum compression:
+              #   --ultra -22   level 22 (max zstd offers)
+              #   --long=27     128 MB long-range window (better ratio for
+              #                 repetitive structured binary data)
+              #   -T0           use every core in the system for this file —
+              #                 zstd's internal multithreading. Combined with
+              #                 a small number of parallel workers, this fills
+              #                 80-thread runners without oversubscribing.
               subprocess.run(
-                  ["zstd", "--ultra", "-22", "--long=27", "-T1", "--quiet", full],
+                  ["zstd", "--ultra", "-22", "--long=27", "-T0", "--quiet", full],
                   check=True,
               )
               zst = full + ".zst"
@@ -616,8 +623,8 @@ jobs:
           files = []
           total_raw = 0
           total_comp = 0
-          nproc = os.cpu_count() or 4
-          with ProcessPoolExecutor(max_workers=nproc) as ex:
+          workers = int(os.environ.get("WORKERS", "1"))
+          with ProcessPoolExecutor(max_workers=workers) as ex:
               futures = {ex.submit(process, f): f for f in bin_files}
               for fut in as_completed(futures):
                   entry = fut.result()
