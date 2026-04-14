@@ -138,6 +138,7 @@ struct ParsedData {
     // Parent chain: per-way and per-polygon parent IDs for the
     // Nominatim-style address walk. Parallel arrays indexed by
     // way_id / polygon_id respectively.
+    std::vector<uint32_t> way_orig_name_ids;  // way → original name (before name:en pref), build-time only
     std::vector<uint32_t> way_parent_ids;    // way → smallest containing admin poly
     std::vector<uint32_t> admin_parent_ids;  // poly → next-larger containing admin poly
     std::vector<uint32_t> way_postcode_ids;  // way → postcode string from containing postal boundary

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -308,6 +309,109 @@ inline bool is_valid_postcode(const char* pc) {
     }
     if (!has_digit) return false;
     return true;
+}
+
+// Approximate ICU transliteration for street name matching.
+// Lowercase, strip common Latin accents, collapse whitespace,
+// remove apostrophes/hyphens. Good enough for matching
+// "Place de l'Hôtel de Ville" against "Place de l'Hotel de Ville".
+inline std::string normalise_for_matching(const char* s) {
+    if (!s) return "";
+    std::string out;
+    out.reserve(std::strlen(s));
+    bool last_space = true; // trim leading
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(s);
+    while (*p) {
+        unsigned char c = *p;
+        // Handle 2-byte UTF-8 sequences for common accented chars
+        if (c >= 0xC0 && c < 0xE0 && p[1] >= 0x80) {
+            uint16_t cp = ((c & 0x1F) << 6) | (p[1] & 0x3F);
+            char replacement = 0;
+            // Latin accented → base letter
+            if (cp >= 0xC0 && cp <= 0xC5) replacement = 'a';
+            else if (cp == 0xC6) replacement = 'a'; // Æ→a
+            else if (cp == 0xC7) replacement = 'c'; // Ç
+            else if (cp >= 0xC8 && cp <= 0xCB) replacement = 'e';
+            else if (cp >= 0xCC && cp <= 0xCF) replacement = 'i';
+            else if (cp == 0xD1) replacement = 'n';
+            else if (cp >= 0xD2 && cp <= 0xD6) replacement = 'o';
+            else if (cp == 0xD8) replacement = 'o';
+            else if (cp >= 0xD9 && cp <= 0xDC) replacement = 'u';
+            else if (cp == 0xDD) replacement = 'y';
+            else if (cp >= 0xE0 && cp <= 0xE5) replacement = 'a';
+            else if (cp == 0xE6) replacement = 'a';
+            else if (cp == 0xE7) replacement = 'c';
+            else if (cp >= 0xE8 && cp <= 0xEB) replacement = 'e';
+            else if (cp >= 0xEC && cp <= 0xEF) replacement = 'i';
+            else if (cp == 0xF1) replacement = 'n';
+            else if (cp >= 0xF2 && cp <= 0xF6) replacement = 'o';
+            else if (cp == 0xF8) replacement = 'o';
+            else if (cp >= 0xF9 && cp <= 0xFC) replacement = 'u';
+            else if (cp == 0xFD || cp == 0xFF) replacement = 'y';
+            if (replacement) {
+                out += replacement;
+                last_space = false;
+            }
+            p += 2;
+            continue;
+        }
+        // Skip 3+ byte UTF-8 sequences
+        if (c >= 0xE0) {
+            int skip = (c < 0xF0) ? 3 : 4;
+            p += skip;
+            continue;
+        }
+        // ASCII range
+        if (c == '\'' || c == '\x60' || c == '\xB4') { p++; continue; } // apostrophes
+        if (c == '-') { p++; continue; } // hyphens
+        if (c == ' ' || c == '\t' || c == '\n') {
+            if (!last_space && out.size() > 0) out += ' ';
+            last_space = true;
+            p++;
+            continue;
+        }
+        if (c >= 'A' && c <= 'Z') c = c + 32; // lowercase
+        out += static_cast<char>(c);
+        last_space = false;
+        p++;
+    }
+    // Trim trailing space
+    if (!out.empty() && out.back() == ' ') out.pop_back();
+    return out;
+}
+
+// Check if any normalised word token from string A appears in string B.
+// Matches Nominatim's token_matches_street which uses PostgreSQL's
+// array overlap operator (&&) on tokenised name vectors.
+inline bool tokens_overlap(const char* a, const char* b) {
+    if (!a || !b || !a[0] || !b[0]) return false;
+    std::string na = normalise_for_matching(a);
+    std::string nb = normalise_for_matching(b);
+    if (na.empty() || nb.empty()) return false;
+    // Split A into tokens, check each against B's tokens
+    // For efficiency with typical street names (2-5 words),
+    // collect B's tokens into a set then check A's tokens.
+    std::unordered_set<std::string> b_tokens;
+    {
+        size_t pos = 0;
+        while (pos < nb.size()) {
+            size_t next = nb.find(' ', pos);
+            if (next == std::string::npos) next = nb.size();
+            std::string tok = nb.substr(pos, next - pos);
+            if (tok.size() >= 2) b_tokens.insert(std::move(tok)); // skip tiny words
+            pos = next + 1;
+        }
+    }
+    // Check A's tokens
+    size_t pos = 0;
+    while (pos < na.size()) {
+        size_t next = na.find(' ', pos);
+        if (next == std::string::npos) next = na.size();
+        std::string tok = na.substr(pos, next - pos);
+        if (tok.size() >= 2 && b_tokens.count(tok)) return true;
+        pos = next + 1;
+    }
+    return false;
 }
 
 // Parse leading digits from a house number string

@@ -1380,7 +1380,8 @@ int main(int argc, char* argv[]) {
                     std::vector<DeferredInterp> deferred_interps;
                     std::vector<AddrPoint> building_addrs;
                     std::vector<std::pair<double, double>> building_addr_coords; // lat,lng for S2 cell
-                    std::vector<std::string> way_strings;      // way name strings
+                    std::vector<std::string> way_strings;      // way name (name:en ?: name)
+                    std::vector<std::string> way_orig_names;   // way original name (always name tag)
                     std::vector<std::pair<std::string,std::string>> addr_strings; // building addr {hn, street}
                     std::vector<std::string> addr_postcodes; // parallel to addr_strings
                     std::vector<std::string> interp_strings;   // interp street name strings
@@ -1616,6 +1617,7 @@ int main(int argc, char* argv[]) {
                             header.node_count = static_cast<uint8_t>(std::min(refs_size, size_t(255)));
                             local.ways.push_back(header);
                             local.way_strings.push_back(t_best_name);
+                            local.way_orig_names.push_back(t_name ? t_name : (t_best_name ? t_best_name : ""));
                             local.deferred_ways.push_back({wid, noff, header.node_count});
                             local.way_count++;
                         }
@@ -1792,6 +1794,12 @@ int main(int argc, char* argv[]) {
                         h.node_offset += node_base;
                         h.name_id = data.string_pool.intern(local.way_strings[i]);
                         data.ways.push_back(h);
+                        // Store original name for token matching
+                        uint32_t orig_id = NO_DATA;
+                        if (i < local.way_orig_names.size() && !local.way_orig_names[i].empty()) {
+                            orig_id = data.string_pool.intern(local.way_orig_names[i]);
+                        }
+                        data.way_orig_name_ids.push_back(orig_id);
                     }
                     data.street_nodes.insert(data.street_nodes.end(),
                         local.street_nodes.begin(), local.street_nodes.end());
@@ -3027,6 +3035,7 @@ int main(int argc, char* argv[]) {
 
                 std::atomic<size_t> ap_idx{0};
                 std::atomic<uint64_t> ap_linked{0};
+                const auto& pool_data = data.string_pool.data();
                 std::vector<std::thread> ap_workers;
                 for (unsigned int t = 0; t < num_threads; t++) {
                     ap_workers.emplace_back([&]() {
@@ -3062,6 +3071,15 @@ int main(int argc, char* argv[]) {
                             double best_d2 = 1e18;
                             uint32_t best_name = NO_DATA;
                             uint32_t best_way_idx = NO_DATA;
+                            // Token-matched resolution: track nearest
+                            // way whose original name matches addr:street
+                            double best_match_d2 = 1e18;
+                            uint32_t best_match_name = NO_DATA;
+                            uint32_t best_match_way = NO_DATA;
+                            const char* addr_street_str = nullptr;
+                            if (ap.street_id != NO_DATA) {
+                                addr_street_str = pool_data.data() + ap.street_id;
+                            }
                             const double cos_lat = std::cos(
                                 plat * M_PI / 180.0);
                             for (uint64_t cid : cells_to_check) {
@@ -3110,22 +3128,36 @@ int main(int argc, char* argv[]) {
                                             best_name = w.name_id;
                                             best_way_idx = way_id;
                                         }
+                                        // Token-matched: check if way's
+                                        // original name matches addr:street
+                                        if (d2 < best_match_d2 && addr_street_str
+                                            && way_id < data.way_orig_name_ids.size()) {
+                                            uint32_t orig_id = data.way_orig_name_ids[way_id];
+                                            if (orig_id != NO_DATA) {
+                                                const char* orig_str = pool_data.data() + orig_id;
+                                                if (tokens_overlap(addr_street_str, orig_str)) {
+                                                    best_match_d2 = d2;
+                                                    best_match_name = w.name_id;
+                                                    best_match_way = way_id;
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
                             if (best_way_idx != NO_DATA) {
-                                ap.parent_way_id = best_way_idx;
-                                // Only fill street_id when it's missing
-                                // (no addr:street tag). We cannot blindly
-                                // replace addr:street with the nearest
-                                // way's name because the nearest way
-                                // might be a different street (e.g.
-                                // "350 5th Avenue" is nearest to
-                                // "West 33rd Street" not "5th Avenue").
-                                // Nominatim resolves addr:street via
-                                // token matching, not pure distance.
-                                if (ap.street_id == NO_DATA && best_name != NO_DATA) {
-                                    ap.street_id = best_name;
+                                // Prefer token-matched way (matches
+                                // Nominatim's getNearestNamedRoadPlaceId
+                                // which finds the closest street whose
+                                // name tokens overlap with addr:street).
+                                if (best_match_way != NO_DATA) {
+                                    ap.parent_way_id = best_match_way;
+                                    ap.street_id = best_match_name;
+                                } else {
+                                    ap.parent_way_id = best_way_idx;
+                                    if (ap.street_id == NO_DATA && best_name != NO_DATA) {
+                                        ap.street_id = best_name;
+                                    }
                                 }
                                 ap_linked.fetch_add(1);
                             }
