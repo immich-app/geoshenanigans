@@ -2766,6 +2766,105 @@ async fn test_portal() -> impl IntoResponse {
     )
 }
 
+async fn polygons_geojson(
+    Query(params): Query<QueryParams>,
+    state: axum::extract::State<Arc<RwLock<auth::Db>>>,
+    index: axum::extract::Extension<Arc<Index>>,
+) -> Response {
+    let key = match params.key {
+        Some(k) => k,
+        None => return (StatusCode::UNAUTHORIZED, "Missing API key").into_response(),
+    };
+    if state.read().unwrap().validate_token(&key).is_none() {
+        return (StatusCode::UNAUTHORIZED, "Invalid API key").into_response();
+    }
+
+    let lat = params.lat;
+    let lng = params.lon;
+    let idx = &**index;
+
+    let all_polygons: &[AdminPolygon] = unsafe {
+        std::slice::from_raw_parts(
+            idx.admin_polygons.as_ptr() as *const AdminPolygon,
+            idx.admin_polygons.len() / std::mem::size_of::<AdminPolygon>(),
+        )
+    };
+    let all_vertices: &[NodeCoord] = unsafe {
+        std::slice::from_raw_parts(
+            idx.admin_vertices.as_ptr() as *const NodeCoord,
+            idx.admin_vertices.len() / std::mem::size_of::<NodeCoord>(),
+        )
+    };
+
+    const ID_MASK: u32 = 0x7FFFFFFF;
+
+    let mut features: Vec<serde_json::Value> = Vec::new();
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
+    let cell = cell_id_at_level(lat, lng, idx.admin_cell_level);
+    let neighbors = cell_neighbors_at_level(cell, idx.admin_cell_level);
+
+    for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+        Index::for_each_entry(&idx.admin_entries, Index::lookup_admin_cell(&idx.admin_cells, c), |id| {
+            let poly_id = id & ID_MASK;
+            if !seen.insert(poly_id) { return; }
+            let pid = poly_id as usize;
+            if pid >= all_polygons.len() { return; }
+            let poly = &all_polygons[pid];
+            let offset = poly.vertex_offset as usize;
+            let count = poly.vertex_count as usize;
+            if offset + count > all_vertices.len() { return; }
+            let verts = &all_vertices[offset..offset + count];
+            if !point_in_polygon(lat as f32, lng as f32, verts) { return; }
+            let coords: Vec<[f64; 2]> = verts.iter().map(|v| [v.lng as f64, v.lat as f64]).collect();
+            features.push(serde_json::json!({
+                "type": "Feature",
+                "geometry": { "type": "Polygon", "coordinates": [coords] },
+                "properties": {
+                    "name": idx.get_string(poly.name_id),
+                    "admin_level": poly.admin_level,
+                    "area": poly.area,
+                    "kind": "admin",
+                }
+            }));
+        });
+    }
+
+    if let (Some(ref pp), Some(ref pv)) = (&idx.postal_polygons, &idx.postal_vertices) {
+        let all_postal: &[AdminPolygon] = unsafe {
+            std::slice::from_raw_parts(pp.as_ptr() as *const AdminPolygon, pp.len() / std::mem::size_of::<AdminPolygon>())
+        };
+        let all_pverts: &[NodeCoord] = unsafe {
+            std::slice::from_raw_parts(pv.as_ptr() as *const NodeCoord, pv.len() / std::mem::size_of::<NodeCoord>())
+        };
+        for poly in all_postal {
+            let off = poly.vertex_offset as usize;
+            let cnt = poly.vertex_count as usize;
+            if off + cnt > all_pverts.len() { continue; }
+            let verts = &all_pverts[off..off + cnt];
+            if !point_in_polygon(lat as f32, lng as f32, verts) { continue; }
+            let coords: Vec<[f64; 2]> = verts.iter().map(|v| [v.lng as f64, v.lat as f64]).collect();
+            features.push(serde_json::json!({
+                "type": "Feature",
+                "geometry": { "type": "Polygon", "coordinates": [coords] },
+                "properties": {
+                    "name": idx.get_string(poly.name_id),
+                    "admin_level": 99,
+                    "area": poly.area,
+                    "kind": "postal",
+                }
+            }));
+        }
+    }
+
+    let fc = serde_json::json!({
+        "type": "FeatureCollection",
+        "features": features,
+    });
+    let body = serde_json::to_string(&fc).unwrap_or_default();
+    ([(axum::http::header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -2818,6 +2917,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/reverse", get(reverse_geocode))
+        .route("/polygons", get(polygons_geojson))
         .route("/test", get(test_portal))
         .merge(auth::router())
         .layer(axum::Extension(index))

@@ -316,6 +316,7 @@
     <div class="results-section">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;gap:6px;">
         <h3 style="margin:0;flex:1">Results <span id="resultCount"></span></h3>
+        <button id="polygonsBtn" onclick="togglePolygons()" style="padding:4px 12px;font-size:12px;background:var(--surface2);color:#fff;border:1px solid var(--border);border-radius:4px;cursor:pointer;">Polygons</button>
         <button id="retestBtn" onclick="retestAllResults()" style="padding:4px 12px;font-size:12px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer;">Re-test</button>
         <button onclick="clearResults()" style="padding:4px 12px;font-size:12px;background:var(--red);color:#fff;border:none;border-radius:4px;cursor:pointer;">Clear</button>
       </div>
@@ -511,7 +512,15 @@ const MARKER_COLORS = {
 map.on('click', function(e) {
   reverseGeocode(e.lngLat.lat, e.lngLat.lng, 'map click');
 });
-map.on('load', function() { loadResults(); });
+map.on('load', function() {
+  loadResults();
+  const btn = document.getElementById('polygonsBtn');
+  if (polygonsEnabled) {
+    btn.style.background = 'var(--accent)';
+    ensurePolygonLayer();
+    if (selectedId !== null) updatePolygonLayer(selectedId);
+  }
+});
 
 // -- Coordinate lookup --
 function lookupCoords() {
@@ -593,7 +602,7 @@ function reverseGeocode(lat, lng, source) {
   });
   markers.set(id, { marker, popup: null });
 
-  renderResults();
+  selectResult(id);
 
   const doFetch = () => {
     activeRequests++;
@@ -702,6 +711,139 @@ function selectResult(id) {
   selectedId = id;
   renderResults();
   showDetail(id);
+  if (polygonsEnabled) updatePolygonLayer(id);
+}
+
+// -- Polygon overlay --
+const POLY_SOURCE = 'debug-polygons';
+const POLY_LABEL_SOURCE = 'debug-polygon-labels';
+const POLY_FILL = 'debug-polygons-fill';
+const POLY_LINE = 'debug-polygons-line';
+const POLY_LABELS = 'debug-polygons-labels';
+let polygonsEnabled = localStorage.getItem('polygons_enabled') === '1';
+
+// Shoelace-weighted centroid of a closed lng/lat ring
+function polygonCentroid(ring) {
+  let cx = 0, cy = 0, area = 0;
+  const n = ring.length - 1; // last vertex == first for closed rings
+  for (let i = 0; i < n; i++) {
+    const [x1, y1] = ring[i];
+    const [x2, y2] = ring[i + 1];
+    const cross = x1 * y2 - x2 * y1;
+    area += cross;
+    cx += (x1 + x2) * cross;
+    cy += (y1 + y2) * cross;
+  }
+  area /= 2;
+  if (Math.abs(area) < 1e-12) return ring[0];
+  return [cx / (6 * area), cy / (6 * area)];
+}
+
+function ensurePolygonLayer() {
+  if (!map.isStyleLoaded()) { map.once('idle', ensurePolygonLayer); return; }
+  if (map.getSource(POLY_SOURCE)) return;
+  map.addSource(POLY_SOURCE, { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+  map.addSource(POLY_LABEL_SOURCE, { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+  // Color ramp by admin_level: coarser = warmer, finer = cooler, postal = magenta
+  const colorExpr = ['match', ['get', 'admin_level'],
+    2, '#ff4444',  // country
+    3, '#ff7744',
+    4, '#ffaa44',  // state
+    5, '#ffdd44',
+    6, '#aadd44',  // county
+    7, '#44dd88',
+    8, '#44ddcc',  // city
+    9, '#44aadd',
+    10, '#4488dd', // suburb
+    11, '#4466dd',
+    15, '#8844dd', // class=place marker
+    99, '#dd44bb', // postal
+    '#888888'
+  ];
+  map.addLayer({
+    id: POLY_FILL,
+    type: 'fill',
+    source: POLY_SOURCE,
+    paint: { 'fill-color': colorExpr, 'fill-opacity': 0.12 }
+  });
+  map.addLayer({
+    id: POLY_LINE,
+    type: 'line',
+    source: POLY_SOURCE,
+    paint: { 'line-color': colorExpr, 'line-width': 2, 'line-opacity': 0.9 }
+  });
+  map.addLayer({
+    id: POLY_LABELS,
+    type: 'symbol',
+    source: POLY_LABEL_SOURCE,
+    layout: {
+      'text-field': ['concat', ['to-string', ['get', 'admin_level']], ': ', ['get', 'name']],
+      'text-size': 12,
+      'symbol-placement': 'point',
+      'text-allow-overlap': true,
+      'text-ignore-placement': true,
+      'text-anchor': 'center',
+    },
+    paint: { 'text-color': '#ffffff', 'text-halo-color': '#000000', 'text-halo-width': 1.5 }
+  });
+  // Click a polygon to see its properties in the console + popup
+  map.on('click', POLY_FILL, (e) => {
+    if (!e.features || !e.features[0]) return;
+    const p = e.features[0].properties;
+    new maplibregl.Popup({ closeButton: true })
+      .setLngLat(e.lngLat)
+      .setHTML(`<b>${escHtml(p.name)}</b><br>admin_level ${p.admin_level}<br>kind: ${p.kind}<br>area: ${Number(p.area).toExponential(2)}`)
+      .addTo(map);
+  });
+}
+
+function clearPolygonLayer() {
+  const src = map.getSource(POLY_SOURCE);
+  if (src) src.setData({ type: 'FeatureCollection', features: [] });
+  const lsrc = map.getSource(POLY_LABEL_SOURCE);
+  if (lsrc) lsrc.setData({ type: 'FeatureCollection', features: [] });
+}
+
+function updatePolygonLayer(id) {
+  if (!polygonsEnabled) return;
+  ensurePolygonLayer();
+  const r = results.find(x => x.id === id);
+  if (!r) { clearPolygonLayer(); return; }
+  fetch(`/polygons?lat=${r.lat}&lon=${r.lng}&key=test`)
+    .then(res => { if (!res.ok) throw new Error(`HTTP ${res.status}`); return res.json(); })
+    .then(fc => {
+      // Sort largest-first so smaller polygons render on top
+      if (fc.features) {
+        fc.features.sort((a, b) => (b.properties.area || 0) - (a.properties.area || 0));
+      }
+      const src = map.getSource(POLY_SOURCE);
+      if (src) src.setData(fc);
+      // Build a parallel point FeatureCollection for label placement at centroids
+      const labelFc = {
+        type: 'FeatureCollection',
+        features: (fc.features || []).map(f => ({
+          type: 'Feature',
+          geometry: { type: 'Point', coordinates: polygonCentroid(f.geometry.coordinates[0]) },
+          properties: f.properties,
+        })),
+      };
+      const lsrc = map.getSource(POLY_LABEL_SOURCE);
+      if (lsrc) lsrc.setData(labelFc);
+    })
+    .catch(err => console.warn('polygons fetch failed:', err));
+}
+
+function togglePolygons() {
+  polygonsEnabled = !polygonsEnabled;
+  localStorage.setItem('polygons_enabled', polygonsEnabled ? '1' : '0');
+  const btn = document.getElementById('polygonsBtn');
+  btn.style.background = polygonsEnabled ? 'var(--accent)' : 'var(--surface2)';
+  if (polygonsEnabled) {
+    ensurePolygonLayer();
+    if (selectedId !== null) updatePolygonLayer(selectedId);
+  } else {
+    clearPolygonLayer();
+  }
 }
 
 // -- Detail panel --
