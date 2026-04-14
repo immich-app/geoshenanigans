@@ -3115,15 +3115,16 @@ int main(int argc, char* argv[]) {
                             }
                             if (best_way_idx != NO_DATA) {
                                 ap.parent_way_id = best_way_idx;
-                                // Always use the nearest way's name_id as
-                                // street_id, replacing the raw addr:street
-                                // text. This resolves addr:street to the
-                                // way's name:en (matching Nominatim's
-                                // tokenizer resolution). E.g. an addr
-                                // with addr:street="Place de l'Hôtel de
-                                // Ville" near a way with name:en="City
-                                // Hall Plaza" will use the way's name.
-                                if (best_name != NO_DATA) {
+                                // Only fill street_id when it's missing
+                                // (no addr:street tag). We cannot blindly
+                                // replace addr:street with the nearest
+                                // way's name because the nearest way
+                                // might be a different street (e.g.
+                                // "350 5th Avenue" is nearest to
+                                // "West 33rd Street" not "5th Avenue").
+                                // Nominatim resolves addr:street via
+                                // token matching, not pure distance.
+                                if (ap.street_id == NO_DATA && best_name != NO_DATA) {
                                     ap.street_id = best_name;
                                 }
                                 ap_linked.fetch_add(1);
