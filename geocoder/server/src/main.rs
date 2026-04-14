@@ -2118,7 +2118,30 @@ impl Index {
         };
         let poi_primary = poi_primary_raw.filter(|(d, _)| *d <= poi_max_sq);
 
-        let addr_dist = addr.as_ref().map(|(d, _)| *d).unwrap_or(f64::MAX);
+        let addr_dist_raw = addr.as_ref().map(|(d, _)| *d).unwrap_or(f64::MAX);
+        // Nominatim includes addr_points (IsAddressPoint, rank_search=30)
+        // in the SAME primary query as streets and computes distance to
+        // the building's POLYGON geometry — 0 when the query is inside
+        // the footprint. We store centroids only, so our distance is
+        // always centroid-to-query (~5-15m even when inside the building).
+        //
+        // Approximate Nominatim's polygon distance by subtracting an
+        // estimated building radius (~10m) from the centroid distance,
+        // floored at 0. This lets a building at centroid distance 10m
+        // compete with a street at 1.6m, matching how Nominatim's
+        // polygon distance = 0 beats the street.
+        let building_radius_sq = {
+            let r = 10.0_f64 / 6_371_000.0;
+            r * r
+        };
+        let addr_dist = if addr_dist_raw <= building_radius_sq {
+            0.0
+        } else {
+            let raw_m = addr_dist_raw.sqrt() * 6_371_000.0;
+            let adj_m = (raw_m - 10.0).max(0.0);
+            let adj_rad = adj_m / 6_371_000.0;
+            adj_rad * adj_rad
+        };
         // Nominatim's `_find_closest_street_or_pois` queries the placex
         // table (streets + rank-30 POIs / addr points). Interpolation
         // rows live in the separate `osmline` table and are looked up
