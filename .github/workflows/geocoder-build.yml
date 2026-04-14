@@ -564,10 +564,13 @@ jobs:
         run: |
           COMPRESS_START=$(date +%s)
           BIN_COUNT=$(find "$WORKDIR/output" -name "*.bin" | wc -l)
-          echo "Compressing $BIN_COUNT .bin files with zstd -19 -T0..."
+          NPROC=$(nproc)
+          echo "Compressing $BIN_COUNT .bin files with zstd --ultra -22 --long=27 (-T1 per file, $NPROC parallel workers)..."
 
           python3 - <<'PY'
           import json, os, subprocess, hashlib
+          from concurrent.futures import ProcessPoolExecutor, as_completed
+
           out = os.environ["WORKDIR"] + "/output"
           mpath = f"{out}/manifest.json"
           with open(mpath) as f:
@@ -578,34 +581,51 @@ jobs:
               for name in fs:
                   if name.endswith(".bin"):
                       bin_files.append(os.path.join(root, name))
-          bin_files.sort()
+          # Largest-first scheduling minimizes tail latency: the biggest file
+          # starts immediately and its single-threaded zstd run overlaps with
+          # many smaller files finishing on other workers.
+          bin_files.sort(key=lambda p: -os.path.getsize(p))
 
-          files = []
-          total_raw = 0
-          total_comp = 0
-          for full in bin_files:
-              rel = os.path.relpath(full, out)
-              # sha256 of raw content (server mmaps raw, so the hash clients
-              # verify after decompression is this one).
+          def process(full):
               h = hashlib.sha256()
               with open(full, "rb") as f:
                   for chunk in iter(lambda: f.read(1 << 20), b""):
                       h.update(chunk)
               raw_size = os.path.getsize(full)
-              subprocess.run(["zstd", "-19", "-T0", "--quiet", full], check=True)
+              # Maximum compression settings:
+              #   --ultra -22      level 22 (the highest zstd offers)
+              #   --long=27        128 MB long-range window (better ratio for
+              #                    repetitive structured binary data)
+              #   -T1              single-threaded per file so the outer
+              #                    ProcessPoolExecutor parallelism can saturate
+              #                    every core with a different file
+              subprocess.run(
+                  ["zstd", "--ultra", "-22", "--long=27", "-T1", "--quiet", full],
+                  check=True,
+              )
               zst = full + ".zst"
               comp_size = os.path.getsize(zst)
               os.remove(full)
-              files.append({
-                  "path": rel,
+              return {
+                  "path": os.path.relpath(full, out),
                   "raw_size": raw_size,
                   "compressed_size": comp_size,
                   "sha256": h.hexdigest(),
-              })
-              total_raw += raw_size
-              total_comp += comp_size
-              pct = 100 * comp_size / raw_size if raw_size else 0
-              print(f"  {rel}: {raw_size/1e6:.0f} → {comp_size/1e6:.0f} MiB ({pct:.0f}%)")
+              }
+
+          files = []
+          total_raw = 0
+          total_comp = 0
+          nproc = os.cpu_count() or 4
+          with ProcessPoolExecutor(max_workers=nproc) as ex:
+              futures = {ex.submit(process, f): f for f in bin_files}
+              for fut in as_completed(futures):
+                  entry = fut.result()
+                  files.append(entry)
+                  total_raw += entry["raw_size"]
+                  total_comp += entry["compressed_size"]
+                  pct = 100 * entry["compressed_size"] / entry["raw_size"] if entry["raw_size"] else 0
+                  print(f"  {entry['path']}: {entry['raw_size']/1e6:.0f} → {entry['compressed_size']/1e6:.0f} MiB ({pct:.0f}%)", flush=True)
 
           files.sort(key=lambda x: x["path"])
           m["files"] = files
