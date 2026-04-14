@@ -455,23 +455,33 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                 acc.count++;
             }
 
-            // Also re-scan postcode_accum for TIGER entries (which
-            // don't have addr_points). TIGER is US-only.
-            uint16_t us_cc = ('U' << 8) | 'S';
+            // Also add entries from postcode_accum that aren't already
+            // in country_accum (TIGER entries, GeoNames external data).
+            // These don't have addr_points so the per-addr re-scan above
+            // misses them. Look up country from the centroid location.
             for (const auto& [pc_id, acc] : data.postcode_accum) {
                 if (acc.count == 0) continue;
-                // Check if this postcode already has US entries
-                auto key = CountryPcKey{us_cc, pc_id};
-                if (country_accum.count(key) > 0) continue;
-                // Check if it looks like a US postcode
-                const char* pc_str = get_str(pc_id);
-                if (validate_postcode_for_country("us", pc_str)) {
-                    // Estimate: if centroid is in North America, assign to US
-                    float clat = static_cast<float>(acc.sum_lat / acc.count);
-                    if (clat > 24.0 && clat < 50.0) {
-                        country_accum[key] = {acc.sum_lat, acc.sum_lng, acc.count};
+                float clat = static_cast<float>(acc.sum_lat / acc.count);
+                float clng = static_cast<float>(acc.sum_lng / acc.count);
+                // Look up country for this centroid
+                S2CellId pcell = S2CellId(S2LatLng::FromDegrees(clat, clng)).parent(kAdminCellLevel);
+                uint16_t cc = 0;
+                auto pit = data.cell_to_admin.find(pcell.id());
+                if (pit != data.cell_to_admin.end()) {
+                    for (uint32_t raw_id : pit->second) {
+                        uint32_t pid2 = raw_id & 0x7FFFFFFF;
+                        if (pid2 >= data.admin_polygons.size()) continue;
+                        const auto& poly = data.admin_polygons[pid2];
+                        if (poly.admin_level == 2 && poly.country_code != 0) {
+                            cc = poly.country_code;
+                            break;
+                        }
                     }
                 }
+                if (cc == 0) continue;
+                auto key = CountryPcKey{cc, pc_id};
+                if (country_accum.count(key) > 0) continue; // OSM data takes priority
+                country_accum[key] = {acc.sum_lat, acc.sum_lng, acc.count};
             }
 
             // Build centroid vector with validation
