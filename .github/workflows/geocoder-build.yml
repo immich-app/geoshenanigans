@@ -565,24 +565,25 @@ jobs:
           COMPRESS_START=$(date +%s)
           BIN_COUNT=$(find "$WORKDIR/output" -name "*.bin" | wc -l)
           NPROC=$(nproc)
-          # Strategy: many parallel zstd processes, each effectively
-          # single-threaded for small files (zstd's internal ZSTDMT only
-          # splits files larger than its window — 128 MB at level 22 —
-          # so small files always run on 1 core regardless of -T0).
-          # With most of our 769 output files under 128 MB, we need
-          # ~NPROC parallel processes to saturate all cores. The few
-          # large files (geo_cells.bin, addr_points.bin) still benefit
-          # from zstd's internal MT via -T0, because the outer worker
-          # pool gets scheduled by the OS alongside them.
+          # Strategy: one zstd subprocess per core, each explicitly
+          # single-threaded (-T1). With ~769 output files, running
+          # NPROC (80) files in parallel saturates every core regardless
+          # of per-file ZSTDMT limitations.
           #
-          # Largest-first scheduling (in the python below) ensures the
-          # biggest files start immediately and overlap with many small
-          # files finishing on other workers. Cap at a reasonable max so
-          # we don't thrash on smaller runners.
-          WORKERS=$(( NPROC / 2 ))
-          [ "$WORKERS" -lt 1 ] && WORKERS=1
-          [ "$WORKERS" -gt 48 ] && WORKERS=48
-          echo "Compressing $BIN_COUNT .bin files with zstd --ultra -22 --long=27 -T0 ($WORKERS parallel workers, $NPROC-thread runner)..."
+          # At level 22, zstd's btultra2 strategy prevents ZSTDMT from
+          # parallelising individual files in most size ranges — using
+          # -T0 gets only 1-3 cores per process. Outer parallelism via
+          # Python's ProcessPoolExecutor is simpler, more predictable,
+          # and doesn't depend on file-size heuristics inside zstd.
+          #
+          # Drop --long=27 because windowLog=27 is already the default
+          # at -22 (empirically verified: identical output).
+          #
+          # Largest-first scheduling (below) bounds tail latency to
+          # single-thread time of the biggest file (~12 min for the 7 GB
+          # geo_cells.bin), with smaller files overlapping fully.
+          WORKERS=$NPROC
+          echo "Compressing $BIN_COUNT .bin files with zstd --ultra -22 -T1 ($WORKERS parallel workers, $NPROC-thread runner)..."
 
           WORKERS=$WORKERS python3 - <<'PY'
           import json, os, subprocess, hashlib
@@ -607,16 +608,13 @@ jobs:
                   for chunk in iter(lambda: f.read(1 << 20), b""):
                       h.update(chunk)
               raw_size = os.path.getsize(full)
-              # Maximum compression:
-              #   --ultra -22   level 22 (max zstd offers)
-              #   --long=27     128 MB long-range window (better ratio for
-              #                 repetitive structured binary data)
-              #   -T0           use every core in the system for this file —
-              #                 zstd's internal multithreading. Combined with
-              #                 a small number of parallel workers, this fills
-              #                 80-thread runners without oversubscribing.
+              # --ultra -22 -T1: max compression, explicitly single-
+              # threaded per process. Parallelism comes from outer
+              # ProcessPoolExecutor running NPROC files at a time —
+              # this is more predictable than zstd's internal ZSTDMT,
+              # which is heavily restricted at level 22.
               subprocess.run(
-                  ["zstd", "--ultra", "-22", "--long=27", "-T0", "--quiet", full],
+                  ["zstd", "--ultra", "-22", "-T1", "--quiet", full],
                   check=True,
               )
               zst = full + ".zst"
