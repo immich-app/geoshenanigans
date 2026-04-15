@@ -1497,12 +1497,14 @@ int main(int argc, char* argv[]) {
         std::string new_path = new_dir + "/" + fname;
         std::string old_path = old_dir + "/" + fname;
         struct stat nst;
-        if (stat(new_path.c_str(), &nst) != 0 || nst.st_size == 0) return; // skip missing/empty
-        auto new_m = mmap_file(new_path);
-        if (!new_m.data) return;
+        // Skip only if the new file doesn't exist on disk. Empty files
+        // (size 0) still need an entry so the patch tool creates an
+        // empty file in the verify dir — otherwise cmp sees a missing
+        // verify file vs an empty new file and reports a mismatch.
+        if (stat(new_path.c_str(), &nst) != 0) return;
+        uint64_t new_size = (uint64_t)nst.st_size;
         struct stat ost;
         uint64_t old_size = (stat(old_path.c_str(), &ost) == 0) ? (uint64_t)ost.st_size : 0;
-        uint64_t new_size = (uint64_t)nst.st_size;
 
         uint32_t fid_u = static_cast<uint32_t>(fid);
         uint32_t stride = 0;  // sentinel: full replacement
@@ -1515,8 +1517,13 @@ int main(int argc, char* argv[]) {
         wval(patch, &new_size, 8);
         wval(patch, &nfix, 4);
         wval(patch, &ds, 8);
-        patch.insert(patch.end(), new_m.data, new_m.data + new_size);
-        unmap_file(new_m);
+        if (new_size > 0) {
+            auto new_m = mmap_file(new_path);
+            if (new_m.data) {
+                patch.insert(patch.end(), new_m.data, new_m.data + new_size);
+                unmap_file(new_m);
+            }
+        }
         std::cerr << "  " << fname << ": full replace " << new_size << " bytes" << std::endl;
     };
     emit_raw(PatchFileId::ADDR_POSTCODES, "addr_postcodes.bin");
