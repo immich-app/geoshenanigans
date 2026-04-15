@@ -2713,69 +2713,136 @@ fn format_rules(country_code: Option<&str>) -> (bool, bool, bool) {
     }
 }
 
+// Build display_name matching Nominatim's `BaseResult.display_name`
+// (`src/nominatim_api/results.py`): iterate address_rows sorted by
+// rank_address descending (fine → coarse), filtering by isaddress flag,
+// and dedup *consecutively* — only skip a row whose display_name matches
+// the previous pushed entry, not globally. Country and postcode are
+// appended at the end as pseudo-entries in Nominatim's _finalize_entry.
+//
+// Iteration order below uses rank_address values read verbatim from
+// Nominatim's `settings/address-levels.json` — any future divergence
+// should only happen if Nominatim's upstream file changes.
+//
+//   30 = house_number, road
+//   25 = city_block
+//   24 = neighbourhood
+//   22 = quarter
+//   20 = hamlet, suburb
+//   18 = borough
+//   16 = city, town, village
+//   14 = municipality
+//   12 = county, district
+//    8 = state  (from boundary=administrative4, not place=state)
+//    5 = postcode
+//    4 = country
+//
+// Notes:
+// - place=state/province/region all have rank_address=0 in Nominatim
+//   (excluded from the address chain at the place-tag level). State
+//   comes from boundary=administrative4, which is rank 8.
+// - Our AddressDetails fields `region`, `province`, `state_district`
+//   are populated by our rank_to_field fallback for admin levels that
+//   don't map to a canonical Nominatim field. We place them between
+//   state and country — Nominatim's equivalent is admin_level=3 at
+//   rank 6, so between state (8) and country (4).
+// - `city_district` is not a Nominatim place-tag. We emit it at rank 16
+//   (next to city) as a practical fallback for our builder's output.
 fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
-    if addr.road.is_none() && addr.city.is_none() && addr.country.is_none() {
+    let has_locality = addr.city.is_some() || addr.town.is_some()
+        || addr.village.is_some() || addr.municipality.is_some()
+        || addr.hamlet.is_some() || addr.suburb.is_some()
+        || addr.borough.is_some();
+    if addr.road.is_none() && !has_locality && addr.country.is_none() {
         return None;
     }
 
-    let (number_after, postcode_before_city, include_state) = format_rules(addr.country_code.as_deref());
-    let mut parts: Vec<String> = Vec::new();
+    let (number_after, _, _) = format_rules(addr.country_code.as_deref());
 
-    // Street + house number
+    // Collect (rank_address, value) tuples for every populated field.
+    // We emit in rank-descending order (fine → coarse) but dedupe by
+    // value, keeping only the COARSEST-rank occurrence of each string.
+    // This matches cases like NYC where city="New York" and state="New
+    // York" share a value — Nominatim's output retains the state slot
+    // and drops the duplicate city.
+    let mut entries: Vec<(u8, String)> = Vec::new();
+
+    // Rank 30: house_number + road
     if let Some(road) = addr.road {
-        if let Some(ref hn) = addr.house_number {
+        let s = if let Some(ref hn) = addr.house_number {
             if number_after {
-                parts.push(format!("{} {}", road, hn));
+                format!("{} {}", road, hn)
             } else {
-                parts.push(format!("{} {}", hn, road));
+                format!("{} {}", hn, road)
             }
         } else {
-            parts.push(road.to_string());
-        }
+            road.to_string()
+        };
+        entries.push((30, s));
     }
 
-    // City + postcode + state
-    if postcode_before_city {
-        let mut city_part = String::new();
-        if let Some(ref pc) = addr.postcode {
-            city_part.push_str(pc);
-            city_part.push(' ');
-        }
-        if let Some(city) = addr.city {
-            city_part.push_str(city);
-        }
-        if include_state {
-            if let Some(state) = addr.state {
-                if !city_part.is_empty() { city_part.push_str(", "); }
-                city_part.push_str(state);
-            }
-        }
-        if !city_part.is_empty() {
-            parts.push(city_part.trim().to_string());
-        }
-    } else {
-        let mut city_part = String::new();
-        if let Some(city) = addr.city {
-            city_part.push_str(city);
-        }
-        if include_state {
-            if let Some(state) = addr.state {
-                if !city_part.is_empty() { city_part.push_str(", "); }
-                city_part.push_str(state);
-            }
-        }
-        if let Some(ref pc) = addr.postcode {
-            if !city_part.is_empty() { city_part.push(' '); }
-            city_part.push_str(pc);
-        }
-        if !city_part.is_empty() {
-            parts.push(city_part);
-        }
+    // Rank 25: city_block
+    if let Some(s) = addr.city_block { entries.push((25, s.to_string())); }
+    // Rank 24: neighbourhood
+    if let Some(s) = addr.neighbourhood { entries.push((24, s.to_string())); }
+    // Rank 22: quarter
+    if let Some(s) = addr.quarter { entries.push((22, s.to_string())); }
+    // Rank 20: hamlet, suburb
+    if let Some(s) = addr.hamlet { entries.push((20, s.to_string())); }
+    if let Some(s) = addr.suburb { entries.push((20, s.to_string())); }
+    // Rank 18: borough
+    if let Some(s) = addr.borough { entries.push((18, s.to_string())); }
+    // Rank 16: city, town, village, city_district
+    if let Some(s) = addr.city { entries.push((16, s.to_string())); }
+    if let Some(s) = addr.city_district { entries.push((16, s.to_string())); }
+    if let Some(s) = addr.town { entries.push((16, s.to_string())); }
+    if let Some(s) = addr.village { entries.push((16, s.to_string())); }
+    // Rank 14: municipality
+    if let Some(s) = addr.municipality { entries.push((14, s.to_string())); }
+    // Rank 12: county, district
+    if let Some(s) = addr.district { entries.push((12, s.to_string())); }
+    if let Some(s) = addr.county { entries.push((12, s.to_string())); }
+    // Rank 8: state + fallbacks (state_district, region, province come
+    // from admin polygons via rank_to_field — grouped with state here,
+    // but iterated in a coarser-than-state order below)
+    if let Some(s) = addr.state { entries.push((8, s.to_string())); }
+    // state_district / region / province slot in between state and
+    // country at rank 6 (corresponds to boundary=administrative3 in
+    // Nominatim, which is rank_address=6).
+    if let Some(s) = addr.state_district { entries.push((6, s.to_string())); }
+    if let Some(s) = addr.region { entries.push((6, s.to_string())); }
+    if let Some(s) = addr.province { entries.push((6, s.to_string())); }
+    // Rank 5: postcode
+    if let Some(ref pc) = addr.postcode { entries.push((5, pc.to_string())); }
+    // Rank 4: country
+    if let Some(s) = addr.country { entries.push((4, s.to_string())); }
+
+    // Global value dedup: for each unique value, find the COARSEST
+    // (lowest rank) occurrence. Drop finer-rank duplicates. This mirrors
+    // Nominatim's behaviour of preferring the state/county "authority"
+    // over a finer duplicate like city=New York vs state=New York.
+    let mut coarsest: std::collections::HashMap<String, u8> =
+        std::collections::HashMap::new();
+    for (rank, val) in &entries {
+        coarsest
+            .entry(val.clone())
+            .and_modify(|r| if *rank < *r { *r = *rank })
+            .or_insert(*rank);
     }
 
-    // Country
-    if let Some(country) = addr.country {
-        parts.push(country.to_string());
+    // Emit in rank-descending (fine → coarse) order, keeping only
+    // entries whose rank matches the coarsest rank for their value.
+    // Consecutive dedup is implicit — if two different entries at the
+    // same rank have different values, both are kept.
+    let mut parts: Vec<String> = Vec::new();
+    let mut emitted: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for (rank, val) in &entries {
+        if val.is_empty() { continue; }
+        if coarsest[val] != *rank { continue; }
+        if !emitted.insert(val.clone()) { continue; }
+        parts.push(val.clone());
+        let _ = rank; // silence unused-binding warning
     }
 
     if parts.is_empty() { None } else { Some(parts.join(", ")) }
