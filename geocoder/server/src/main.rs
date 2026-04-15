@@ -1286,7 +1286,64 @@ impl Index {
         best
     }
 
-    fn find_places(&self, lat: f64, lng: f64, current_boundary: Option<&AdminPolygon>) -> PlaceResult<'_> {
+    // Smallest containing admin polygon at "municipality rank" — the
+    // rank_address=16 equivalent for the query's country. Used as a
+    // containment gate for city/town/village place-node fallback in
+    // find_places; a candidate must sit inside the query's municipality
+    // boundary to be accepted, matching Nominatim's parent_place_id
+    // ancestry at rank_address=16.
+    //
+    // admin_level ∈ {7, 8} covers the common cases:
+    // - L8 = township/city in most US states, commune in most of Europe
+    // - L7 = town in New York State, some city variants
+    //
+    // We deliberately exclude L9/L10 (too narrow — NYC's place=city
+    // node is in Manhattan, one of five boroughs, while a Queens query
+    // is in a different L9/L10 but the same L8) and L6 (too coarse in
+    // most countries: it's county/district, not municipality). If no
+    // L7/L8 contains the query (rural / unincorporated), returns None
+    // and the gate in find_places falls back to radius-only behaviour.
+    fn find_municipality_boundary(&self, lat: f64, lng: f64) -> Option<&AdminPolygon> {
+        let all_polygons: &[AdminPolygon] = unsafe {
+            std::slice::from_raw_parts(
+                self.admin_polygons.as_ptr() as *const AdminPolygon,
+                self.admin_polygons.len() / std::mem::size_of::<AdminPolygon>(),
+            )
+        };
+        let all_vertices: &[NodeCoord] = unsafe {
+            std::slice::from_raw_parts(
+                self.admin_vertices.as_ptr() as *const NodeCoord,
+                self.admin_vertices.len() / std::mem::size_of::<NodeCoord>(),
+            )
+        };
+        let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
+        let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
+
+        const ID_MASK: u32 = 0x7FFFFFFF;
+        let mut best: Option<&AdminPolygon> = None;
+        let mut best_area: f32 = f32::MAX;
+
+        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+            Self::for_each_entry(&self.admin_entries, Self::lookup_admin_cell(&self.admin_cells, c), |id| {
+                let poly_id = (id & ID_MASK) as usize;
+                if poly_id >= all_polygons.len() { return; }
+                let poly = &all_polygons[poly_id];
+                if poly.admin_level < 7 || poly.admin_level > 8 { return; }
+                if poly.area >= best_area { return; }
+                let offset = poly.vertex_offset as usize;
+                let count = poly.vertex_count as usize;
+                if offset + count > all_vertices.len() { return; }
+                let verts = &all_vertices[offset..offset + count];
+                if point_in_polygon(lat as f32, lng as f32, verts) {
+                    best_area = poly.area;
+                    best = Some(poly);
+                }
+            });
+        }
+        best
+    }
+
+    fn find_places(&self, lat: f64, lng: f64, current_boundary: Option<&AdminPolygon>, municipality_boundary: Option<&AdminPolygon>) -> PlaceResult<'_> {
         let place_cells = match &self.place_cells {
             Some(c) => c,
             None => return PlaceResult::default(),
@@ -1386,10 +1443,24 @@ impl Index {
             }
         };
 
-        // City / town / village: no containment gate — the query may
-        // sit inside the city's area while the place=city node itself
-        // is at the city centre, potentially outside any L9/L10 polygon
-        // our builder would pick as a parent.
+        // Rank-16 city/town/village gate: the candidate place-node must
+        // sit inside the query's containing municipality polygon
+        // (admin_level 7 or 8). Matches Nominatim's parent_place_id
+        // ancestry — only ancestors of the query count, not arbitrary
+        // nearby places. If the query has no municipality parent
+        // (rural / unincorporated), the gate degrades to radius-only.
+        let node_inside_municipality = |pn: &PlaceNode| -> bool {
+            match municipality_boundary {
+                None => true,
+                Some(poly) => {
+                    let off = poly.vertex_offset as usize;
+                    let cnt = poly.vertex_count as usize;
+                    if off + cnt > all_vertices.len() { return true; }
+                    let verts = &all_vertices[off..off + cnt];
+                    point_in_polygon(pn.lat, pn.lng, verts)
+                }
+            }
+        };
         for pt in [0, 1, 2] {
             if let Some((dist_sq, pn)) = best[pt] {
                 let threshold = match pt {
@@ -1397,7 +1468,7 @@ impl Index {
                     1 => max_town,    // town: 0.08 deg
                     _ => max_village, // village: 0.04 deg
                 };
-                if dist_sq <= threshold {
+                if dist_sq <= threshold && node_inside_municipality(pn) {
                     let name = self.get_string(pn.name_id);
                     match pt {
                         0 => result.city = Some(name),
@@ -2061,7 +2132,8 @@ impl Index {
         // `current_boundary` — the geometry that place nodes must
         // sit inside to be accepted in the address walk.
         let current_boundary = self.find_current_boundary(lat, lng);
-        let place = self.find_places(lat, lng, current_boundary);
+        let municipality_boundary = self.find_municipality_boundary(lat, lng);
+        let place = self.find_places(lat, lng, current_boundary, municipality_boundary);
         let (addr, interp, street) = self.query_geo(lat, lng);
 
         // Use the standard PIP-based admin walk. The chain-based walk
