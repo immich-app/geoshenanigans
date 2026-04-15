@@ -339,13 +339,9 @@ jobs:
           echo "All downloads complete in $(($(date +%s) - STEP_START))s"
 
       # ── Apply replication diffs ───────────────────────────────────
-      # Skipped when:
-      # - pbf_source = 'today' (PBF already current, no diffs needed)
-      # - force_fresh = 'true' (accept slightly-stale yesterday data,
-      #   used as a workaround for a silent osmium apply-changes
-      #   runner crash we're investigating separately)
+      # Skipped when PBF source is already today's data.
       - name: Apply replication diffs
-        if: ${{ steps.download.outputs.pbf_source != 'today' && inputs.force_fresh != true }}
+        if: ${{ steps.download.outputs.pbf_source != 'today' }}
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
           TODAY: ${{ steps.setup.outputs.today }}
@@ -596,25 +592,17 @@ jobs:
           COMPRESS_START=$(date +%s)
           BIN_COUNT=$(find "$WORKDIR/output" -name "*.bin" | wc -l)
           NPROC=$(nproc)
-          # Strategy: one zstd subprocess per core, each explicitly
-          # single-threaded (-T1). With ~769 output files, running
-          # NPROC (80) files in parallel saturates every core regardless
-          # of per-file ZSTDMT limitations.
-          #
-          # At level 22, zstd's btultra2 strategy prevents ZSTDMT from
-          # parallelising individual files in most size ranges — using
-          # -T0 gets only 1-3 cores per process. Outer parallelism via
-          # Python's ProcessPoolExecutor is simpler, more predictable,
-          # and doesn't depend on file-size heuristics inside zstd.
-          #
-          # Drop --long=27 because windowLog=27 is already the default
-          # at -22 (empirically verified: identical output).
-          #
-          # Largest-first scheduling (below) bounds tail latency to
-          # single-thread time of the biggest file (~12 min for the 7 GB
-          # geo_cells.bin), with smaller files overlapping fully.
-          WORKERS=$NPROC
-          echo "Compressing $BIN_COUNT .bin files with zstd --ultra -22 -T1 ($WORKERS parallel workers, $NPROC-thread runner)..."
+          # Strategy: a small number of parallel workers, each running
+          # zstd --ultra -22 -T0 so zstd uses its internal MT to absorb
+          # the big files. Level 22 (btultra2) is memory-bandwidth bound:
+          # empirically, 80 concurrent -T1 workers contend for DRAM and
+          # ran ~28% slower than 5 workers × -T0 on the 80-thread runner.
+          # 5 workers × ~16 effective threads each fills the box without
+          # thrashing the memory bus.
+          WORKERS=$(( NPROC / 16 ))
+          [ "$WORKERS" -lt 1 ] && WORKERS=1
+          [ "$WORKERS" -gt 6 ] && WORKERS=6
+          echo "Compressing $BIN_COUNT .bin files with zstd --ultra -22 -T0 ($WORKERS parallel workers, $NPROC-thread runner)..."
 
           WORKERS=$WORKERS python3 - <<'PY'
           import json, os, subprocess, hashlib
@@ -639,13 +627,11 @@ jobs:
                   for chunk in iter(lambda: f.read(1 << 20), b""):
                       h.update(chunk)
               raw_size = os.path.getsize(full)
-              # --ultra -22 -T1: max compression, explicitly single-
-              # threaded per process. Parallelism comes from outer
-              # ProcessPoolExecutor running NPROC files at a time —
-              # this is more predictable than zstd's internal ZSTDMT,
-              # which is heavily restricted at level 22.
+              # --ultra -22 -T0: max compression, zstd internal MT. Each
+              # process gets all cores on its file; outer worker count is
+              # kept small (~5) to avoid memory-bandwidth contention.
               subprocess.run(
-                  ["zstd", "--ultra", "-22", "-T1", "--quiet", full],
+                  ["zstd", "--ultra", "-22", "-T0", "--quiet", full],
                   check=True,
               )
               zst = full + ".zst"
