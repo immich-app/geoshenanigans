@@ -1484,6 +1484,51 @@ int main(int argc, char* argv[]) {
     }
     unmap_file(old_geo_m); unmap_file(new_geo_m);
 
+    // --- Full-replacement sections for secondary files ---
+    // Files without record-level diff logic (parallel postcode/parent
+    // arrays, postal boundary index, postcode centroids). The patch
+    // tool's stride==0 path writes them byte-for-byte from the patch
+    // stream. Old-build size is looked up so the `old_size` header
+    // field is correct; missing old files (first-time addition) show
+    // 0. The whole patch is zstd-compressed at the end of the diff
+    // tool, so embedding raw file bytes here does not inflate the
+    // final .gcpatch much.
+    auto emit_raw = [&](PatchFileId fid, const std::string& fname) {
+        std::string new_path = new_dir + "/" + fname;
+        std::string old_path = old_dir + "/" + fname;
+        struct stat nst;
+        if (stat(new_path.c_str(), &nst) != 0 || nst.st_size == 0) return; // skip missing/empty
+        auto new_m = mmap_file(new_path);
+        if (!new_m.data) return;
+        struct stat ost;
+        uint64_t old_size = (stat(old_path.c_str(), &ost) == 0) ? (uint64_t)ost.st_size : 0;
+        uint64_t new_size = (uint64_t)nst.st_size;
+
+        uint32_t fid_u = static_cast<uint32_t>(fid);
+        uint32_t stride = 0;  // sentinel: full replacement
+        uint32_t nfix = 0;
+        uint64_t ds = new_size;
+
+        wval(patch, &fid_u, 4);
+        wval(patch, &stride, 4);
+        wval(patch, &old_size, 8);
+        wval(patch, &new_size, 8);
+        wval(patch, &nfix, 4);
+        wval(patch, &ds, 8);
+        patch.insert(patch.end(), new_m.data, new_m.data + new_size);
+        unmap_file(new_m);
+        std::cerr << "  " << fname << ": full replace " << new_size << " bytes" << std::endl;
+    };
+    emit_raw(PatchFileId::ADDR_POSTCODES, "addr_postcodes.bin");
+    emit_raw(PatchFileId::ADMIN_PARENTS, "admin_parents.bin");
+    emit_raw(PatchFileId::WAY_PARENTS, "way_parents.bin");
+    emit_raw(PatchFileId::WAY_POSTCODES, "way_postcodes.bin");
+    emit_raw(PatchFileId::POSTCODE_CENTROIDS, "postcode_centroids.bin");
+    emit_raw(PatchFileId::POSTCODE_CENTROID_CELLS, "postcode_centroid_cells.bin");
+    emit_raw(PatchFileId::POSTCODE_CENTROID_ENTRIES, "postcode_centroid_entries.bin");
+    emit_raw(PatchFileId::POSTAL_POLYGONS, "postal_polygons.bin");
+    emit_raw(PatchFileId::POSTAL_VERTICES, "postal_vertices.bin");
+
     // End marker
     uint32_t end_marker = 0xFFFFFFFF;
     wval(patch, &end_marker, 4);

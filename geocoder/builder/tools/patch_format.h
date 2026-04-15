@@ -297,7 +297,20 @@ enum class PatchFileId : uint32_t {
     PLACE_NODES = 18,
     PLACE_CELLS = 19,
     PLACE_ENTRIES = 20,
-    COUNT = 21
+    // Secondary parallel arrays + postcode/postal indexes. These don't
+    // have record-level diff logic yet — the diff tool emits them as
+    // full-replacement sections (stride=0) which the patch tool writes
+    // verbatim. Patch cost is only the size of the changed files.
+    ADDR_POSTCODES = 21,
+    ADMIN_PARENTS = 22,
+    WAY_PARENTS = 23,
+    WAY_POSTCODES = 24,
+    POSTCODE_CENTROIDS = 25,
+    POSTCODE_CENTROID_CELLS = 26,
+    POSTCODE_CENTROID_ENTRIES = 27,
+    POSTAL_POLYGONS = 28,
+    POSTAL_VERTICES = 29,
+    COUNT = 30
 };
 
 static const char* patch_file_names[] = {
@@ -306,7 +319,10 @@ static const char* patch_file_names[] = {
     "geo_cells.bin", "street_entries.bin", "addr_entries.bin", "interp_entries.bin",
     "admin_cells.bin", "admin_entries.bin",
     "poi_records.bin", "poi_vertices.bin", "poi_cells.bin", "poi_entries.bin",
-    "place_nodes.bin", "place_cells.bin", "place_entries.bin"
+    "place_nodes.bin", "place_cells.bin", "place_entries.bin",
+    "addr_postcodes.bin", "admin_parents.bin", "way_parents.bin", "way_postcodes.bin",
+    "postcode_centroids.bin", "postcode_centroid_cells.bin", "postcode_centroid_entries.bin",
+    "postal_polygons.bin", "postal_vertices.bin"
 };
 
 // Encoding types for each section

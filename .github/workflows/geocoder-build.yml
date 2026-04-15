@@ -813,7 +813,7 @@ jobs:
             PREV_VAL="$( [ "$HAS_PREVIOUS" = "true" ] && echo "$OLD_DATE" || echo "null" )"
             jq -n \
               --argjson build_version 8 \
-              --argjson patch_version 4 \
+              --argjson patch_version 5 \
               --arg latest "$NEW_DATE" \
               --arg previous "$PREV_VAL" \
               --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \

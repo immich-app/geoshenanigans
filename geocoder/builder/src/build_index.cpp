@@ -4526,7 +4526,7 @@ int main(int argc, char* argv[]) {
         std::ofstream mf(output_dir + "/manifest.json");
         mf << "{\n";
         mf << "  \"build_version\": 8,\n";
-        mf << "  \"patch_version\": 4,\n";
+        mf << "  \"patch_version\": 5,\n";
         mf << "  \"regions\": {\n";
 
         for (size_t ri = 0; ri < regions.size(); ri++) {
