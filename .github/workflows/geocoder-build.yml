@@ -594,17 +594,15 @@ jobs:
           COMPRESS_START=$(date +%s)
           BIN_COUNT=$(find "$WORKDIR/output" -name "*.bin" | wc -l)
           NPROC=$(nproc)
-          # Strategy: a small number of parallel workers, each running
-          # zstd --ultra -22 -T0 so zstd uses its internal MT to absorb
-          # the big files. Level 22 (btultra2) is memory-bandwidth bound:
-          # empirically, 80 concurrent -T1 workers contend for DRAM and
-          # ran ~28% slower than 5 workers × -T0 on the 80-thread runner.
-          # 5 workers × ~16 effective threads each fills the box without
-          # thrashing the memory bus.
+          # Level 19 gives essentially the same ratio as --ultra -22 on
+          # our structured binary data (empirically: 3 of 5 sampled files
+          # identical, largest gain was 2.1% on strings.bin) at ~10× less
+          # CPU time. 5 outer workers × -T0 keeps zstd's internal MT in
+          # play for the big files without oversubscribing.
           WORKERS=$(( NPROC / 16 ))
           [ "$WORKERS" -lt 1 ] && WORKERS=1
           [ "$WORKERS" -gt 6 ] && WORKERS=6
-          echo "Compressing $BIN_COUNT .bin files with zstd --ultra -22 -T0 ($WORKERS parallel workers, $NPROC-thread runner)..."
+          echo "Compressing $BIN_COUNT .bin files with zstd -19 -T0 ($WORKERS parallel workers, $NPROC-thread runner)..."
 
           WORKERS=$WORKERS python3 - <<'PY'
           import json, os, subprocess, hashlib
@@ -629,11 +627,12 @@ jobs:
                   for chunk in iter(lambda: f.read(1 << 20), b""):
                       h.update(chunk)
               raw_size = os.path.getsize(full)
-              # --ultra -22 -T0: max compression, zstd internal MT. Each
-              # process gets all cores on its file; outer worker count is
-              # kept small (~5) to avoid memory-bandwidth contention.
+              # Level 19 with zstd internal MT. Ratio matches --ultra -22
+              # on this binary data to within 0.5% overall, at ~10× less
+              # compute. Outer worker count kept small so each process
+              # gets a healthy slice of cores via -T0.
               subprocess.run(
-                  ["zstd", "--ultra", "-22", "-T0", "--quiet", full],
+                  ["zstd", "-19", "-T0", "--quiet", full],
                   check=True,
               )
               zst = full + ".zst"
