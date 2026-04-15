@@ -170,16 +170,22 @@ jobs:
               START=$(date +%s)
               CACHE_BUILD="s3://$CACHE_BUCKET/geocoder-cache/builds/$YESTERDAY"
 
+              # Download only the compressed .bin.zst files — the patch step
+              # decompresses them locally. Excluding uncompressed .bin files
+              # is critical because older cache entries (backfilled before
+              # zstd compression was added) may still contain orphan .bin
+              # siblings that double the download size and can blow past
+              # the runner's disk quota during build-index.
               if cache_exists "$CACHE_BUILD/.cache-complete" ".cache-complete"; then
                 echo "[indexes] Downloading $YESTERDAY from local cache..."
-                if ! retry 3 $CACHE cp --concurrency 16 "$CACHE_BUILD/*" "$WORKDIR/old-output/"; then
+                if ! retry 3 $CACHE cp --concurrency 16 --exclude "*.bin" "$CACHE_BUILD/*" "$WORKDIR/old-output/"; then
                   echo "[indexes] Cache download failed — falling back to Tigris..."
                   rm -rf "$WORKDIR/old-output"
-                  $S5 cp --concurrency 8 "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/*" "$WORKDIR/old-output/"
+                  $S5 cp --concurrency 8 --exclude "*.bin" "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/*" "$WORKDIR/old-output/"
                 fi
               else
                 echo "[indexes] Cache miss — downloading $YESTERDAY via Tigris S3..."
-                $S5 cp --concurrency 8 "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/*" "$WORKDIR/old-output/"
+                $S5 cp --concurrency 8 --exclude "*.bin" "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/*" "$WORKDIR/old-output/"
 
                 echo "[indexes] Backfilling local cache..."
                 $CACHE cp --concurrency 16 "$WORKDIR/old-output/*" "$CACHE_BUILD/" 2>/dev/null || true
