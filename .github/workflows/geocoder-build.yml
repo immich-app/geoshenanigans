@@ -191,27 +191,13 @@ jobs:
               echo "[indexes] Done: $COUNT files ($((SIZE/1024/1024)) MiB) in ${ELAPSED}s ($((SIZE/1024/1024/(ELAPSED+1))) MB/s)"
               if [ "$COUNT" -eq 0 ]; then echo "::error::Download produced 0 files"; exit 1; fi
 
-              # Decompress .bin.zst files in place — geocoder-diff operates on raw bytes.
-              # Uses all cores with one file at a time (zstd -T0).
-              #
-              # The cache bucket can contain both old uncompressed .bin and
-              # new .bin.zst from different historical build runs. Remove
-              # any .bin that has a .bin.zst sibling before decompressing so
-              # zstd doesn't fail with "already exists; not overwritten".
-              DECOMP_START=$(date +%s)
-              ZST_COUNT=$(find "$WORKDIR/old-output" -name "*.bin.zst" | wc -l)
-              if [ "$ZST_COUNT" -gt 0 ]; then
-                echo "[indexes] Removing stale .bin files that have .bin.zst siblings..."
-                find "$WORKDIR/old-output" -name "*.bin.zst" -print0 \
-                  | while IFS= read -r -d '' zst; do
-                      raw="${zst%.zst}"
-                      [ -f "$raw" ] && rm -f "$raw"
-                    done
-                echo "[indexes] Decompressing $ZST_COUNT .bin.zst files..."
-                find "$WORKDIR/old-output" -name "*.bin.zst" -print0 \
-                  | xargs -0 -n1 -P8 zstd -d -T0 -f --rm --quiet
-                echo "[indexes] Decompressed in $(($(date +%s) - DECOMP_START))s"
-              fi
+              # NOTE: old-output files are left COMPRESSED here. Decompression
+              # happens later, just before the patch step, because during the
+              # apply-replication-diffs step osmium writes a second copy of
+              # the 92 GB planet.osm.pbf which pushes peak disk usage to
+              # ~380+ GB when combined with decompressed old-output (~200 GB).
+              # By keeping old-output compressed (~89 GB) until after the PBF
+              # work is done, peak disk stays under ~280 GB.
             ) &
             IDX_PID=$!
           fi
@@ -361,6 +347,9 @@ jobs:
           TODAY_SEQ: ${{ steps.setup.outputs.today_seq }}
           PBF_SOURCE: ${{ steps.download.outputs.pbf_source }}
         run: |
+          echo "Disk at start of apply-diffs:"
+          df -h "$WORKDIR"
+
           SERVER="https://planet.openstreetmap.org/replication/day"
 
           if [ "$PBF_SOURCE" = "yesterday" ]; then
@@ -380,6 +369,8 @@ jobs:
             echo "Applied in $(($(date +%s) - START))s"
             mv "$WORKDIR/planet-tmp.osm.pbf" "$WORKDIR/planet.osm.pbf"
             rm -f "$WORKDIR/diff-today.osc.gz"
+            echo "Disk after apply-diffs:"
+            df -h "$WORKDIR"
           else
             # Mirror path — PBF may be a few days behind
             PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" 2>/dev/null | cut -dT -f1)
@@ -455,6 +446,7 @@ jobs:
           # Wait for background PBF cache upload, then free disk
           wait
           rm -f "$WORKDIR/planet.osm.pbf"
+          df -h "$WORKDIR" | tee -a "$GITHUB_STEP_SUMMARY"
 
       # ── Generate patches + verify ─────────────────────────────────
       - name: Generate patches and verify
@@ -469,8 +461,31 @@ jobs:
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
 
+          echo "Disk at start of patch step:"
+          df -h "$WORKDIR"
+
+          # Decompress old-output .bin.zst files now — deferred from the
+          # download step to avoid peak disk usage during apply-changes.
+          # At this point, PBF has been freed (end of build step) so we
+          # have plenty of headroom.
+          DECOMP_START=$(date +%s)
+          ZST_COUNT=$(find "$WORKDIR/old-output" -name "*.bin.zst" | wc -l)
+          if [ "$ZST_COUNT" -gt 0 ]; then
+            echo "[old-output] Removing stale .bin files that have .bin.zst siblings..."
+            find "$WORKDIR/old-output" -name "*.bin.zst" -print0 \
+              | while IFS= read -r -d '' zst; do
+                  raw="${zst%.zst}"
+                  [ -f "$raw" ] && rm -f "$raw"
+                done
+            echo "[old-output] Decompressing $ZST_COUNT .bin.zst files..."
+            find "$WORKDIR/old-output" -name "*.bin.zst" -print0 \
+              | xargs -0 -n1 -P8 zstd -d -T0 -f --rm --quiet
+            echo "[old-output] Decompressed in $(($(date +%s) - DECOMP_START))s"
+            df -h "$WORKDIR"
+          fi
+
           # Patch generation runs against uncompressed .bin files (old was
-          # decompressed during download, new was just built). Compression
+          # decompressed just above, new was just built). Compression
           # happens in the next step, before the finalize upload.
           echo "Generating patches ($OLD_DATE → $NEW_DATE)..."
           START=$(date +%s)
