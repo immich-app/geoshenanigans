@@ -339,8 +339,13 @@ jobs:
           echo "All downloads complete in $(($(date +%s) - STEP_START))s"
 
       # ── Apply replication diffs ───────────────────────────────────
+      # Skipped when:
+      # - pbf_source = 'today' (PBF already current, no diffs needed)
+      # - force_fresh = 'true' (accept slightly-stale yesterday data,
+      #   used as a workaround for a silent osmium apply-changes
+      #   runner crash we're investigating separately)
       - name: Apply replication diffs
-        if: steps.download.outputs.pbf_source != 'today'
+        if: ${{ steps.download.outputs.pbf_source != 'today' && inputs.force_fresh != true }}
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
           TODAY: ${{ steps.setup.outputs.today }}
