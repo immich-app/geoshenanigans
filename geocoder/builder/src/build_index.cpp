@@ -661,6 +661,39 @@ int main(int argc, char* argv[]) {
                             std::strcmp(rel_type, "multipolygon") == 0 &&
                             classify_place_override(nullptr, nullptr, rel_place).type != AdminPlaceType::NONE;
 
+                        // boundary=census / boundary=census_district relations
+                        // carrying a postal_code tag — captured for build-time
+                        // postcode inheritance (mirrors Nominatim's
+                        // calculated_postcode propagation). These do NOT become
+                        // admin polygons; they're a transient helper discarded
+                        // after the inheritance pass.
+                        const char* census_postcode = nullptr;
+                        bool is_census_with_postcode = false;
+                        if (boundary && (std::strcmp(boundary, "census") == 0 ||
+                                         std::strcmp(boundary, "census_district") == 0)) {
+                            census_postcode = rel.tag("postal_code");
+                            if (!census_postcode) census_postcode = rel.tag("addr:postcode");
+                            if (census_postcode && *census_postcode) {
+                                is_census_with_postcode = true;
+                            }
+                        }
+
+                        if (is_census_with_postcode) {
+                            CdpPostcodeRelation cpr;
+                            cpr.id = rel.id;
+                            cpr.postcode = census_postcode;
+                            for (size_t mi = 0; mi < rel.members.size(); mi++) {
+                                if (rel.members[mi].type == 'w') {
+                                    cpr.members.emplace_back(rel.members[mi].ref, rel.member_role(mi));
+                                }
+                            }
+                            if (!cpr.members.empty()) {
+                                std::lock_guard<std::mutex> lock(rel_mutex);
+                                data.cdp_postcode_relations.push_back(std::move(cpr));
+                            }
+                            continue;
+                        }
+
                         if (!boundary && !is_multipolygon_place) continue;
 
                         bool is_admin = boundary && std::strcmp(boundary, "administrative") == 0;
@@ -2679,6 +2712,184 @@ int main(int argc, char* argv[]) {
             double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - _wp_t).count();
             std::cerr << "Way parent polygon: " << way_linked.load() << "/" << data.ways.size()
                       << " ways linked in " << el << "s" << std::endl;
+        }
+
+        // --- CDP postcode inheritance ---
+        // Mirrors Nominatim's calculated_postcode propagation: for each
+        // addr_point or way without a postcode, inherit from a containing
+        // boundary=census relation that has a postal_code tag. CDPs are
+        // build-time only and are NOT written to any output file.
+        if (!data.cdp_postcode_relations.empty()) {
+            auto _cdp_t = std::chrono::steady_clock::now();
+            std::cerr << "Assembling " << data.cdp_postcode_relations.size()
+                      << " boundary=census polygons..." << std::endl;
+
+            size_t skipped_no_geom = 0;
+            for (auto& cr : data.cdp_postcode_relations) {
+                bool has_missing = false;
+                for (const auto& [way_id, role] : cr.members) {
+                    if (data.way_geometries.find(way_id) == data.way_geometries.end()) {
+                        has_missing = true;
+                        break;
+                    }
+                }
+                if (has_missing) { skipped_no_geom++; continue; }
+
+                auto rings = assemble_outer_rings(cr.members, data.way_geometries);
+                if (rings.empty()) {
+                    auto retry = assemble_outer_rings(cr.members, data.way_geometries, true);
+                    for (auto& r : retry) rings.push_back(std::move(r));
+                }
+                if (rings.empty()) { skipped_no_geom++; continue; }
+
+                for (auto& ring : rings) {
+                    if (ring.size() < 3) continue;
+                    CdpPostcodePoly p;
+                    p.postcode = cr.postcode;
+                    p.min_lat = ring[0].first;
+                    p.max_lat = ring[0].first;
+                    p.min_lng = ring[0].second;
+                    p.max_lng = ring[0].second;
+                    for (const auto& [la, ln] : ring) {
+                        if (la < p.min_lat) p.min_lat = la;
+                        if (la > p.max_lat) p.max_lat = la;
+                        if (ln < p.min_lng) p.min_lng = ln;
+                        if (ln > p.max_lng) p.max_lng = ln;
+                    }
+                    p.vertices = std::move(ring);
+                    data.cdp_postcode_polys.push_back(std::move(p));
+                }
+            }
+            data.cdp_postcode_relations.clear();
+            data.cdp_postcode_relations.shrink_to_fit();
+
+            double cdp_el = std::chrono::duration<double>(std::chrono::steady_clock::now() - _cdp_t).count();
+            std::cerr << "CDP assembly: " << data.cdp_postcode_polys.size()
+                      << " polys built in " << cdp_el << "s ("
+                      << skipped_no_geom << " skipped for missing geometry)" << std::endl;
+        }
+
+        if (!data.cdp_postcode_polys.empty()) {
+            auto _inh_t = std::chrono::steady_clock::now();
+
+            // Pre-intern postcode strings (one entry per unique postcode)
+            std::unordered_map<std::string, uint32_t> pc_to_id;
+            std::vector<uint32_t> cdp_offsets(data.cdp_postcode_polys.size());
+            for (size_t i = 0; i < data.cdp_postcode_polys.size(); i++) {
+                const auto& pc = data.cdp_postcode_polys[i].postcode;
+                auto it = pc_to_id.find(pc);
+                if (it == pc_to_id.end()) {
+                    uint32_t off = data.string_pool.intern(pc);
+                    pc_to_id[pc] = off;
+                    cdp_offsets[i] = off;
+                } else {
+                    cdp_offsets[i] = it->second;
+                }
+            }
+
+            // Cell-indexed lookup: register each CDP in every admin-level
+            // cell that any of its vertices fall into, plus the 8 immediate
+            // neighbours of each such cell. For typical US CDPs (small
+            // enough that vertex cells + neighbours cover the interior)
+            // this captures every query that could be inside the CDP.
+            std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_cdp;
+            for (uint32_t ci = 0; ci < data.cdp_postcode_polys.size(); ci++) {
+                const auto& cdp = data.cdp_postcode_polys[ci];
+                std::unordered_set<uint64_t> cells;
+                for (const auto& [la, ln] : cdp.vertices) {
+                    S2CellId c = S2CellId(S2LatLng::FromDegrees(la, ln)).parent(kAdminCellLevel);
+                    cells.insert(c.id());
+                    std::vector<S2CellId> nbrs;
+                    c.AppendAllNeighbors(kAdminCellLevel, &nbrs);
+                    for (const auto& n : nbrs) cells.insert(n.id());
+                }
+                for (uint64_t cid : cells) cell_to_cdp[cid].push_back(ci);
+            }
+            std::cerr << "CDP cell index: " << cell_to_cdp.size() << " cells" << std::endl;
+
+            std::atomic<size_t> inherited_addr{0};
+            std::atomic<size_t> inherited_way{0};
+
+            // Parallel scan over addr_points
+            std::atomic<size_t> addr_idx{0};
+            std::vector<std::thread> addr_workers;
+            for (unsigned int t = 0; t < num_threads; t++) {
+                addr_workers.emplace_back([&]() {
+                    while (true) {
+                        size_t start = addr_idx.fetch_add(4096);
+                        if (start >= data.addr_points.size()) break;
+                        size_t end = std::min(start + 4096, data.addr_points.size());
+                        for (size_t j = start; j < end; j++) {
+                            if (j >= data.addr_postcode_ids.size()) break;
+                            if (data.addr_postcode_ids[j] != NO_DATA) continue;
+                            const auto& ap = data.addr_points[j];
+                            S2CellId cell = S2CellId(S2LatLng::FromDegrees(ap.lat, ap.lng)).parent(kAdminCellLevel);
+                            auto it = cell_to_cdp.find(cell.id());
+                            if (it == cell_to_cdp.end()) continue;
+                            for (uint32_t ci : it->second) {
+                                const auto& cdp = data.cdp_postcode_polys[ci];
+                                if ((double)ap.lat < cdp.min_lat || (double)ap.lat > cdp.max_lat) continue;
+                                if ((double)ap.lng < cdp.min_lng || (double)ap.lng > cdp.max_lng) continue;
+                                if (point_in_polygon((double)ap.lat, (double)ap.lng, cdp.vertices)) {
+                                    data.addr_postcode_ids[j] = cdp_offsets[ci];
+                                    inherited_addr.fetch_add(1);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            for (auto& w : addr_workers) w.join();
+
+            // Parallel scan over ways (use centroid as PIP point)
+            std::atomic<size_t> way_pc_idx{0};
+            std::vector<std::thread> way_pc_workers;
+            for (unsigned int t = 0; t < num_threads; t++) {
+                way_pc_workers.emplace_back([&]() {
+                    while (true) {
+                        size_t start = way_pc_idx.fetch_add(4096);
+                        if (start >= data.ways.size()) break;
+                        size_t end = std::min(start + 4096, data.ways.size());
+                        for (size_t j = start; j < end; j++) {
+                            if (j >= data.way_postcode_ids.size()) break;
+                            if (data.way_postcode_ids[j] != NO_DATA) continue;
+                            const auto& w = data.ways[j];
+                            if (w.node_count == 0) continue;
+                            float sum_lat = 0, sum_lng = 0;
+                            for (uint8_t k = 0; k < w.node_count; k++) {
+                                sum_lat += data.street_nodes[w.node_offset + k].lat;
+                                sum_lng += data.street_nodes[w.node_offset + k].lng;
+                            }
+                            double clat = sum_lat / w.node_count;
+                            double clng = sum_lng / w.node_count;
+                            S2CellId cell = S2CellId(S2LatLng::FromDegrees(clat, clng)).parent(kAdminCellLevel);
+                            auto it = cell_to_cdp.find(cell.id());
+                            if (it == cell_to_cdp.end()) continue;
+                            for (uint32_t ci : it->second) {
+                                const auto& cdp = data.cdp_postcode_polys[ci];
+                                if (clat < cdp.min_lat || clat > cdp.max_lat) continue;
+                                if (clng < cdp.min_lng || clng > cdp.max_lng) continue;
+                                if (point_in_polygon(clat, clng, cdp.vertices)) {
+                                    data.way_postcode_ids[j] = cdp_offsets[ci];
+                                    inherited_way.fetch_add(1);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            for (auto& w : way_pc_workers) w.join();
+
+            double inh_el = std::chrono::duration<double>(std::chrono::steady_clock::now() - _inh_t).count();
+            std::cerr << "CDP postcode inheritance: " << inherited_addr.load()
+                      << " addrs + " << inherited_way.load() << " ways inherited from "
+                      << data.cdp_postcode_polys.size() << " CDPs in " << inh_el << "s" << std::endl;
+
+            // Discard CDP polys — they are build-time only
+            data.cdp_postcode_polys.clear();
+            data.cdp_postcode_polys.shrink_to_fit();
         }
 
         // Load TIGER address data

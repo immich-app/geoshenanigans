@@ -149,6 +149,11 @@ struct ParsedData {
     struct PostcodeAccum { double sum_lat = 0; double sum_lng = 0; uint64_t count = 0; uint16_t country_code = 0; };
     std::unordered_map<uint32_t, PostcodeAccum> postcode_accum;
     std::unique_ptr<std::mutex> postcode_mutex = std::make_unique<std::mutex>();
+
+    // boundary=census relations with postal_code tags — build-time only,
+    // used for postcode inheritance then discarded. Not written to disk.
+    std::vector<CdpPostcodeRelation> cdp_postcode_relations;
+    std::vector<CdpPostcodePoly> cdp_postcode_polys;
 };
 
 // --- Deduplicate IDs per cell ---

@@ -143,6 +143,24 @@ struct CollectedRelation {
     std::vector<std::pair<int64_t, std::string>> members; // (way_id, role)
 };
 
+// boundary=census / boundary=census_district relations carrying a
+// postal_code tag. Used at build time to inherit postcodes to
+// addr_points and ways inside the CDP — mirroring Nominatim's
+// calculated_postcode propagation through parent_place_id. These
+// polygons are discarded after the inheritance pass; they never
+// appear in admin_polygons.bin / postal_polygons.bin.
+struct CdpPostcodeRelation {
+    int64_t id;
+    std::string postcode;
+    std::vector<std::pair<int64_t, std::string>> members; // (way_id, role)
+};
+
+struct CdpPostcodePoly {
+    std::vector<std::pair<double,double>> vertices;  // outer ring, (lat, lng)
+    std::string postcode;
+    double min_lat, max_lat, min_lng, max_lng;       // axis-aligned bbox
+};
+
 // --- Place nodes (settlements: city, town, village, suburb, etc.) ---
 
 enum class PlaceType : uint8_t {
