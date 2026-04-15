@@ -193,12 +193,23 @@ jobs:
 
               # Decompress .bin.zst files in place — geocoder-diff operates on raw bytes.
               # Uses all cores with one file at a time (zstd -T0).
+              #
+              # The cache bucket can contain both old uncompressed .bin and
+              # new .bin.zst from different historical build runs. Remove
+              # any .bin that has a .bin.zst sibling before decompressing so
+              # zstd doesn't fail with "already exists; not overwritten".
               DECOMP_START=$(date +%s)
               ZST_COUNT=$(find "$WORKDIR/old-output" -name "*.bin.zst" | wc -l)
               if [ "$ZST_COUNT" -gt 0 ]; then
+                echo "[indexes] Removing stale .bin files that have .bin.zst siblings..."
+                find "$WORKDIR/old-output" -name "*.bin.zst" -print0 \
+                  | while IFS= read -r -d '' zst; do
+                      raw="${zst%.zst}"
+                      [ -f "$raw" ] && rm -f "$raw"
+                    done
                 echo "[indexes] Decompressing $ZST_COUNT .bin.zst files..."
                 find "$WORKDIR/old-output" -name "*.bin.zst" -print0 \
-                  | xargs -0 -n1 -P4 zstd -d -T0 --rm --quiet
+                  | xargs -0 -n1 -P8 zstd -d -T0 -f --rm --quiet
                 echo "[indexes] Decompressed in $(($(date +%s) - DECOMP_START))s"
               fi
             ) &
