@@ -402,7 +402,14 @@ int main(int argc, char* argv[]) {
         // Get string remap field offsets for this file type
         std::vector<size_t> remap_offs;
         if (!str_remap_vec.empty() && needs_remap) {
-            if (file_id == (uint32_t)PatchFileId::ADDR_POINTS) remap_offs = (actual_stride >= 20) ? std::vector<size_t>{8, 12, 16} : std::vector<size_t>{8, 12};
+            // AddrPoint string fields live at {8, 12} (housenumber_id,
+            // street_id). Offset 16 is parent_way_id, which is a WAY id
+            // — not a string pool offset — so it must NOT be rewritten
+            // by the string remap. The previous {8, 12, 16} mapping
+            // corrupted parent_way_id for every record that sat in a
+            // MATCH run, producing the "first_diff=17" (first byte of
+            // parent_way_id) mismatches we saw in patch verify.
+            if (file_id == (uint32_t)PatchFileId::ADDR_POINTS) remap_offs = {8, 12};
             else if (file_id == (uint32_t)PatchFileId::STREET_WAYS) remap_offs = {(actual_stride == 12) ? 8ul : 5ul};
             else if (file_id == (uint32_t)PatchFileId::INTERP_WAYS) remap_offs = {(actual_stride >= 20) ? 8ul : 5ul};
             else if (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS) remap_offs = {8};

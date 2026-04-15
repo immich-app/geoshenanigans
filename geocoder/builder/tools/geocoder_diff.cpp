@@ -654,11 +654,19 @@ int main(int argc, char* argv[]) {
                     uint32_t vc = read_count(old_parent + (p_oi+k)*parent_stride);
                     uint32_t new_off = read_off(new_parent + (p_ni+k)*parent_stride);
                     if (vc > 0) {
-                        bool match = (old_off + vc) * 8 <= old_child_size &&
-                                    (new_off + vc) * 8 <= new_child_size &&
-                                    memcmp(old_child + old_off*8, new_child + new_off*8, vc*8) == 0;
+                        // Cast to size_t before multiplying by 8 — 32-bit
+                        // multiplication overflows for files >512 M records
+                        // (street_nodes is ~570 M records on planet), which
+                        // produces wildly wrong memcmp offsets and emits
+                        // bogus INSERT/DELETE pairs deep in the file.
+                        size_t old_byte_off = (size_t)old_off * 8;
+                        size_t new_byte_off = (size_t)new_off * 8;
+                        size_t vc_bytes = (size_t)vc * 8;
+                        bool match = old_byte_off + vc_bytes <= old_child_size &&
+                                    new_byte_off + vc_bytes <= new_child_size &&
+                                    memcmp(old_child + old_byte_off, new_child + new_byte_off, vc_bytes) == 0;
                         if (match) seq.add_match(vc);
-                        else { seq.add_delete(vc); seq.add_insert(new_child + new_off*8, vc, 8); }
+                        else { seq.add_delete(vc); seq.add_insert(new_child + new_byte_off, vc, 8); }
                     }
                 }
                 p_oi += count; p_ni += count;
@@ -667,8 +675,10 @@ int main(int argc, char* argv[]) {
                     const char* rec = parent_seq.data.data() + ppos + k * parent_stride;
                     uint32_t off = read_off(rec);
                     uint32_t vc = read_count(rec);
-                    if (vc > 0 && (off + vc) * 8 <= new_child_size)
-                        seq.add_insert(new_child + off*8, vc, 8);
+                    size_t byte_off = (size_t)off * 8;
+                    size_t vc_bytes = (size_t)vc * 8;
+                    if (vc > 0 && byte_off + vc_bytes <= new_child_size)
+                        seq.add_insert(new_child + byte_off, vc, 8);
                 }
                 ppos += count * parent_stride;
                 p_ni += count;
