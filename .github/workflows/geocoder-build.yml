@@ -565,14 +565,23 @@ jobs:
           COMPRESS_START=$(date +%s)
           BIN_COUNT=$(find "$WORKDIR/output" -name "*.bin" | wc -l)
           NPROC=$(nproc)
-          # Strategy: zstd --ultra -22 --long=27 -T0 per file (uses all cores
-          # for the single file being compressed), with a small number of
-          # parallel workers to absorb the tail of small files and cover
-          # zstd's diminishing returns past ~16 threads. On 80-thread runners
-          # this gives 4 concurrent workers × ~20 effective threads each.
-          WORKERS=$(( NPROC / 16 ))
+          # Strategy: many parallel zstd processes, each effectively
+          # single-threaded for small files (zstd's internal ZSTDMT only
+          # splits files larger than its window — 128 MB at level 22 —
+          # so small files always run on 1 core regardless of -T0).
+          # With most of our 769 output files under 128 MB, we need
+          # ~NPROC parallel processes to saturate all cores. The few
+          # large files (geo_cells.bin, addr_points.bin) still benefit
+          # from zstd's internal MT via -T0, because the outer worker
+          # pool gets scheduled by the OS alongside them.
+          #
+          # Largest-first scheduling (in the python below) ensures the
+          # biggest files start immediately and overlap with many small
+          # files finishing on other workers. Cap at a reasonable max so
+          # we don't thrash on smaller runners.
+          WORKERS=$(( NPROC / 2 ))
           [ "$WORKERS" -lt 1 ] && WORKERS=1
-          [ "$WORKERS" -gt 6 ] && WORKERS=6
+          [ "$WORKERS" -gt 48 ] && WORKERS=48
           echo "Compressing $BIN_COUNT .bin files with zstd --ultra -22 --long=27 -T0 ($WORKERS parallel workers, $NPROC-thread runner)..."
 
           WORKERS=$WORKERS python3 - <<'PY'
