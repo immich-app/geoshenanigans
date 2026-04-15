@@ -141,7 +141,17 @@ void write_cell_index(
     const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map
 ) {
     std::vector<std::pair<uint64_t, std::vector<uint32_t>>> sorted(cell_map.begin(), cell_map.end());
-    std::sort(sorted.begin(), sorted.end());
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    // Determinism safety net: sort each cell's inner entry vector by
+    // value. Callers that build the map from parallel workers can push
+    // entries in thread-scheduling order, which leaks non-determinism
+    // into the on-disk layout and breaks incremental patching. Sorting
+    // here is cheap compared to the rest of the index write.
+    for (auto& [cell_id, ids] : sorted) {
+        std::sort(ids.begin(), ids.end());
+    }
 
     { std::ofstream f(cells_path, std::ios::binary);
       uint32_t current_offset = 0;
@@ -510,10 +520,22 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             std::cerr << "Postcode centroids: " << centroids.size() << " valid, "
                       << rejected << " rejected by country pattern"
                       << " (from " << country_accum.size() << " country+postcode pairs)" << std::endl;
-            // Sort by postcode_id for determinism
+            // Determinism: iterate-then-sort over `country_accum` (an
+            // unordered_map) produces a run-dependent insertion order.
+            // Sorting on postcode_id alone leaves collisions (same pc_id
+            // in different countries, e.g. "90012" in US and FR) in an
+            // undefined relative order — their lat/lng bits end up
+            // run-dependent. Tiebreak by country_code then by lat/lng
+            // for a total order.
             std::sort(centroids.begin(), centroids.end(),
                 [](const PostcodeCentroid& a, const PostcodeCentroid& b) {
-                    return a.postcode_id < b.postcode_id;
+                    if (a.postcode_id != b.postcode_id) return a.postcode_id < b.postcode_id;
+                    if (a.country_code != b.country_code) return a.country_code < b.country_code;
+                    uint32_t la, lb, ga, gb;
+                    std::memcpy(&la, &a.lat, 4); std::memcpy(&lb, &b.lat, 4);
+                    if (la != lb) return la < lb;
+                    std::memcpy(&ga, &a.lng, 4); std::memcpy(&gb, &b.lng, 4);
+                    return ga < gb;
                 });
 
             // Write flat centroid array

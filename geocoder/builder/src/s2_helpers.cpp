@@ -187,6 +187,17 @@ std::unordered_map<uint64_t, std::vector<uint32_t>> AdminCoverPool::drain() {
             target.insert(target.end(), ids.begin(), ids.end());
         }
     }
+    // Determinism: the order in which worker threads pick items off the
+    // queue is thread-scheduling dependent, so each cell's merged vector
+    // can end up in a different order across runs. Downstream code that
+    // iterates these vectors (e.g. the "first admin_level=2 polygon"
+    // country lookup in the postcode centroid writer) must see a stable
+    // ordering or its output becomes non-deterministic and breaks
+    // incremental patching. Sort each vector by its entry value (which
+    // includes the INTERIOR_FLAG bit + poly_id).
+    for (auto& [cell_id, ids] : merged) {
+        std::sort(ids.begin(), ids.end());
+    }
     return merged;
 }
 
