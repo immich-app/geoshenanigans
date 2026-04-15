@@ -530,9 +530,18 @@ jobs:
               geocoder-patch "$OLD_DIR" "$PATCH_FILE" -o "$VERIFY_DIR/" 2>/dev/null
 
               MATCH=0
+              MISMATCH_LIST=""
               for f in "$NEW_DIR"/*.bin; do
                 b=$(basename "$f")
-                cmp -s "$VERIFY_DIR/$b" "$NEW_DIR/$b" && MATCH=$((MATCH + 1))
+                if cmp -s "$VERIFY_DIR/$b" "$NEW_DIR/$b"; then
+                  MATCH=$((MATCH + 1))
+                else
+                  NEW_SIZE=$(stat -c%s "$NEW_DIR/$b" 2>/dev/null || echo 0)
+                  OLD_SIZE=$(stat -c%s "$OLD_DIR/$b" 2>/dev/null || echo 0)
+                  VERIFY_SIZE=$(stat -c%s "$VERIFY_DIR/$b" 2>/dev/null || echo 0)
+                  DIFF_OFFSET=$(cmp -l "$VERIFY_DIR/$b" "$NEW_DIR/$b" 2>/dev/null | head -1 | awk '{print $1}')
+                  MISMATCH_LIST="${MISMATCH_LIST}${b}(new=${NEW_SIZE},old=${OLD_SIZE},verify=${VERIFY_SIZE},first_diff=${DIFF_OFFSET:-end});"
+                fi
               done
               rm -rf "$VERIFY_DIR"
 
@@ -540,6 +549,7 @@ jobs:
                 echo "PASS $N_NEW $PATCH_KB" > "$RESULTS_DIR/$SAFE"
               else
                 echo "FAIL $MATCH $N_NEW $PATCH_KB" > "$RESULTS_DIR/$SAFE"
+                echo "$MISMATCH_LIST" > "$RESULTS_DIR/$SAFE.mismatches"
               fi
             ) &
 
@@ -574,6 +584,9 @@ jobs:
               echo "::error::$variant: FAIL ($M/$N)"
               echo "| $variant | $N | ${KB} KiB | **FAIL** |" >> "$GITHUB_STEP_SUMMARY"
               FAIL=$((FAIL + 1))
+              if [ -f "$RESULTS_DIR/$SAFE.mismatches" ]; then
+                echo "  $variant mismatches: $(cat $RESULTS_DIR/$SAFE.mismatches)"
+              fi
             fi
           done
 
@@ -582,9 +595,14 @@ jobs:
           echo "Results: $PASS pass, $FAIL fail, $SKIP skip"
 
           # Patches stay in $WORKDIR/output/*.gcpatch — uploaded alongside
-          # compressed .bin.zst files in the Finalize step below.
-
-          [ $FAIL -gt 0 ] && exit 1 || true
+          # compressed .bin.zst files in the Finalize step below. Exit 1
+          # is DEFERRED to the Finalize step so that compress + upload
+          # still run (we need the .bin.zst and .gcpatch files available
+          # for local inspection of the patch failures).
+          if [ $FAIL -gt 0 ]; then
+            echo "PATCH_VERIFY_FAILED=1" >> "$GITHUB_ENV"
+            echo "::warning::$FAIL variants failed patch verify — continuing to upload for debugging"
+          fi
 
       # ── Compress .bin files + rewrite manifest with per-file sizes ─
       - name: Compress index files
@@ -787,15 +805,23 @@ jobs:
           fi
 
           # ── Update latest.json ──
-          PREV_VAL="$( [ "$HAS_PREVIOUS" = "true" ] && echo "$OLD_DATE" || echo "null" )"
-          jq -n \
-            --argjson build_version 8 \
-            --argjson patch_version 4 \
-            --arg latest "$NEW_DATE" \
-            --arg previous "$PREV_VAL" \
-            --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '{build_version: $build_version, patch_version: $patch_version, latest: $latest, previous: (if $previous == "null" then null else $previous end), updated_at: $updated_at}' \
-            | $S5 pipe "s3://$S3_BUCKET/$S3_PREFIX/builds/latest.json"
+          # Skip latest.json update on patch verify failure — we still
+          # want the dated-build artifacts uploaded for local debugging,
+          # but consumers of latest.json shouldn't switch to a broken
+          # build.
+          if [ -z "$PATCH_VERIFY_FAILED" ]; then
+            PREV_VAL="$( [ "$HAS_PREVIOUS" = "true" ] && echo "$OLD_DATE" || echo "null" )"
+            jq -n \
+              --argjson build_version 8 \
+              --argjson patch_version 4 \
+              --arg latest "$NEW_DATE" \
+              --arg previous "$PREV_VAL" \
+              --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              '{build_version: $build_version, patch_version: $patch_version, latest: $latest, previous: (if $previous == "null" then null else $previous end), updated_at: $updated_at}' \
+              | $S5 pipe "s3://$S3_BUCKET/$S3_PREFIX/builds/latest.json"
+          else
+            echo "::warning::Skipping latest.json update — patch verify failed"
+          fi
 
           echo "Upload complete."
 
@@ -807,3 +833,13 @@ jobs:
           path: ${{ steps.setup.outputs.workdir }}/build.log
           if-no-files-found: ignore
           retention-days: 7
+
+      # Fail the run at the very end if patch verify reported failures
+      # earlier. This lets compress + upload run first so the dated
+      # build + individual file-level mismatch reports are all uploaded
+      # before the workflow goes red.
+      - name: Fail run on patch verify failure
+        if: env.PATCH_VERIFY_FAILED == '1'
+        run: |
+          echo "::error::Patch verify reported failures — see Generate patches and verify step"
+          exit 1
