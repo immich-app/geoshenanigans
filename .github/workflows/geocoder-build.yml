@@ -474,16 +474,12 @@ jobs:
           # Decompress old-output .bin.zst files now — deferred from the
           # download step to avoid peak disk usage during apply-changes.
           # At this point, PBF has been freed (end of build step) so we
-          # have plenty of headroom.
+          # have plenty of headroom. `-f` overwrites any pre-existing .bin
+          # from a stale cache, `--rm` removes the .zst source after
+          # successful decompression.
           DECOMP_START=$(date +%s)
           ZST_COUNT=$(find "$WORKDIR/old-output" -name "*.bin.zst" | wc -l)
           if [ "$ZST_COUNT" -gt 0 ]; then
-            echo "[old-output] Removing stale .bin files that have .bin.zst siblings..."
-            find "$WORKDIR/old-output" -name "*.bin.zst" -print0 \
-              | while IFS= read -r -d '' zst; do
-                  raw="${zst%.zst}"
-                  [ -f "$raw" ] && rm -f "$raw"
-                done
             echo "[old-output] Decompressing $ZST_COUNT .bin.zst files..."
             find "$WORKDIR/old-output" -name "*.bin.zst" -print0 \
               | xargs -0 -n1 -P8 zstd -d -T0 -f --rm --quiet
