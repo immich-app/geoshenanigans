@@ -708,6 +708,51 @@ impl Index {
         (addr_result, interp_result, street_result)
     }
 
+    // Find nearest addr_point whose parent_way_id matches `way_id`, within
+    // ~110m. Used to refine house numbers when the winning primary feature
+    // is a street (mirrors Nominatim's `_find_housenumber_for_street`,
+    // reverse.py:241, which filters by `parent_place_id == parent_street`
+    // within 0.001 deg).
+    fn find_addr_point_for_way(&self, lat: f64, lng: f64, way_id: u32) -> Option<(f64, &AddrPoint)> {
+        let geo_cells = self.geo_cells.as_ref()?;
+        let addr_entries = self.addr_entries.as_ref()?;
+        let addr_points_mmap = self.addr_points.as_ref()?;
+        let all_points: &[AddrPoint] = unsafe {
+            std::slice::from_raw_parts(
+                addr_points_mmap.as_ptr() as *const AddrPoint,
+                addr_points_mmap.len() / std::mem::size_of::<AddrPoint>(),
+            )
+        };
+
+        let cell = cell_id_at_level(lat, lng, self.street_cell_level);
+        let neighbors = cell_neighbors_at_level(cell, self.street_cell_level);
+        let cos_lat = lat.to_radians().cos();
+        let max_dist_sq = {
+            let r = 110.0_f64 / 6_371_000.0;
+            r * r
+        };
+
+        let mut best_dist = f64::MAX;
+        let mut best: Option<&AddrPoint> = None;
+        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+            let offsets = Self::lookup_geo_cell(geo_cells, c);
+            Self::for_each_entry(addr_entries, offsets.addr, |id| {
+                let idx = id as usize;
+                if idx >= all_points.len() { return; }
+                let point = &all_points[idx];
+                if point.parent_way_id != way_id { return; }
+                let dlat = (point.lat as f64 - lat).to_radians();
+                let dlng = (point.lng as f64 - lng).to_radians();
+                let dist = dist_sq(dlat, dlng, cos_lat);
+                if dist < best_dist && dist <= max_dist_sq {
+                    best_dist = dist;
+                    best = Some(point);
+                }
+            });
+        }
+        best.map(|p| (best_dist, p))
+    }
+
     // Debug helper — returns primary feature distances + names.
     fn debug_primary(&self, lat: f64, lng: f64) -> serde_json::Value {
         let (addr, interp, street) = self.query_geo(lat, lng);
@@ -2321,16 +2366,24 @@ impl Index {
         let street_dist = street.as_ref().map(|(d, _)| *d).unwrap_or(f64::MAX);
         let poi_dist = poi_primary.as_ref().map(|(d, _)| *d).unwrap_or(f64::MAX);
 
-        // Nominatim's reverse.py lines 218-226: when the closest feature
-        // is an area at distance 0 (query is inside the polygon) AND
-        // there is an addressable rank-30 node nearby, prefer the node.
-        // Nominatim's exact threshold is `distance < 0.0001` deg (~11m)
-        // for the second-row fallback, but Nominatim also *excludes*
-        // building-class polygons from the candidate set entirely,
-        // which we don't (Hôtel de Ville, Empire State Building etc.
-        // are in our POI index). As an approximation, widen the
-        // addr-point preference radius to ~30m so that a nearby
-        // addressed rank-30 node beats an enclosing building POI.
+        // Nominatim's reverse.py lines 219-235 and 355-360: when the
+        // closest result is an area (osm_type != 'N', rank_search > 27)
+        // at distance 0 (query inside polygon), Nominatim prefers any
+        // rank-30 node whose centroid is geometrically inside that
+        // polygon (ST_CoveredBy on _best_geometry). The fuzziness window
+        // gating which rows are considered is 0.001 deg (~110m).
+        //
+        // We can't replicate polygon containment because we store
+        // POI/building centroids, not geometries. Approximate
+        // "inside the same polygon" as "addr_point within 30m of
+        // query" — tight enough to avoid picking an addr_point from
+        // a different building across the street, loose enough to
+        // catch typical urban buildings. This is how we pick
+        // "Sushi teria, 350, 5th Avenue" for Empire State and
+        // "6, City Hall Plaza" for Paris Hôtel de Ville instead of
+        // the containing building POI. A wider threshold (~110m,
+        // matching Nominatim's fuzziness) would introduce false
+        // positives from neighbouring buildings.
         //
         // This is how we pick "Sushi teria, 350, 5th Avenue" for NYC
         // Empire State and "6, City Hall Plaza" for Paris Hôtel de
@@ -2400,17 +2453,15 @@ impl Index {
                     (way as *const WayHeader).offset_from(ways_base) as u32
                 };
 
-                // Housenumber refinement: Nominatim includes addr_points
-                // (IsAddressPoint, rank_search=30) in the SAME primary
-                // query as streets, so a building polygon at distance 0
-                // beats the street at distance > 0. We can't replicate
-                // this because we store addr_points as centroids (not
-                // polygons), so buildings always have dist > 0 even when
-                // the query is inside the footprint. parent_way_id
-                // matching gives correct numbers when our street matches
-                // Nominatim's but wrong numbers otherwise (net neutral).
-                // Disabled until we store building footprints or add
-                // addr_points to the primary-feature query.
+                // Housenumber refinement: mirror Nominatim's
+                // `_find_housenumber_for_street` (reverse.py:241) — when
+                // a street is the primary feature, look up the nearest
+                // IsAddressPoint whose parent_place_id matches, within
+                // 0.001 deg (~110m). Our parent_way_id serves the same
+                // role as Nominatim's parent_place_id for addr_points.
+                if let Some((_, point)) = self.find_addr_point_for_way(lat, lng, way_id) {
+                    house_number = Some(Cow::Borrowed(self.get_string(point.housenumber_id)));
+                }
             }
         }
 
