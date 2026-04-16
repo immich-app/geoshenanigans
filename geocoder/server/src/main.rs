@@ -708,51 +708,6 @@ impl Index {
         (addr_result, interp_result, street_result)
     }
 
-    // Find nearest addr_point whose parent_way_id matches `way_id`, within
-    // ~110m. Used to refine house numbers when the winning primary feature
-    // is a street (mirrors Nominatim's `_find_housenumber_for_street`,
-    // reverse.py:241, which filters by `parent_place_id == parent_street`
-    // within 0.001 deg).
-    fn find_addr_point_for_way(&self, lat: f64, lng: f64, way_id: u32) -> Option<(f64, &AddrPoint)> {
-        let geo_cells = self.geo_cells.as_ref()?;
-        let addr_entries = self.addr_entries.as_ref()?;
-        let addr_points_mmap = self.addr_points.as_ref()?;
-        let all_points: &[AddrPoint] = unsafe {
-            std::slice::from_raw_parts(
-                addr_points_mmap.as_ptr() as *const AddrPoint,
-                addr_points_mmap.len() / std::mem::size_of::<AddrPoint>(),
-            )
-        };
-
-        let cell = cell_id_at_level(lat, lng, self.street_cell_level);
-        let neighbors = cell_neighbors_at_level(cell, self.street_cell_level);
-        let cos_lat = lat.to_radians().cos();
-        let max_dist_sq = {
-            let r = 110.0_f64 / 6_371_000.0;
-            r * r
-        };
-
-        let mut best_dist = f64::MAX;
-        let mut best: Option<&AddrPoint> = None;
-        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            let offsets = Self::lookup_geo_cell(geo_cells, c);
-            Self::for_each_entry(addr_entries, offsets.addr, |id| {
-                let idx = id as usize;
-                if idx >= all_points.len() { return; }
-                let point = &all_points[idx];
-                if point.parent_way_id != way_id { return; }
-                let dlat = (point.lat as f64 - lat).to_radians();
-                let dlng = (point.lng as f64 - lng).to_radians();
-                let dist = dist_sq(dlat, dlng, cos_lat);
-                if dist < best_dist && dist <= max_dist_sq {
-                    best_dist = dist;
-                    best = Some(point);
-                }
-            });
-        }
-        best.map(|p| (best_dist, p))
-    }
-
     // Debug helper — returns primary feature distances + names.
     fn debug_primary(&self, lat: f64, lng: f64) -> serde_json::Value {
         let (addr, interp, street) = self.query_geo(lat, lng);
@@ -2435,33 +2390,13 @@ impl Index {
                 house_number = Some(Cow::Owned(number.to_string()));
                 road = Some(street_name);
             } else {
-                // Street is closest. Match Nominatim's
-                // `_find_housenumber_for_street` (reverse.py:231):
-                // find an IsAddressPoint (addr_point with housenumber)
-                // whose parent_way_id matches the winning street,
-                // within 0.001 deg (~100m).
+                // Street is closest — use its name, no house number.
                 let (_, way) = street.unwrap();
                 road = if way.name_id != NO_DATA {
                     Some(self.get_string(way.name_id))
                 } else {
                     None
                 };
-
-                // Compute way_id for parent_way_id matching
-                let way_id = unsafe {
-                    let ways_base = self.street_ways.as_ref().unwrap().as_ptr() as *const WayHeader;
-                    (way as *const WayHeader).offset_from(ways_base) as u32
-                };
-
-                // Housenumber refinement: mirror Nominatim's
-                // `_find_housenumber_for_street` (reverse.py:241) — when
-                // a street is the primary feature, look up the nearest
-                // IsAddressPoint whose parent_place_id matches, within
-                // 0.001 deg (~110m). Our parent_way_id serves the same
-                // role as Nominatim's parent_place_id for addr_points.
-                if let Some((_, point)) = self.find_addr_point_for_way(lat, lng, way_id) {
-                    house_number = Some(Cow::Borrowed(self.get_string(point.housenumber_id)));
-                }
             }
         }
 
