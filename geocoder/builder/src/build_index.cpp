@@ -2539,12 +2539,17 @@ int main(int argc, char* argv[]) {
         if (!data.admin_polygons.empty() && !data.place_nodes.empty()) {
             auto _nl_t = std::chrono::steady_clock::now();
 
-            // Token → place-node index. Each place node contributes one
-            // entry per normalised ≥2-char token, mirroring the
-            // tokenisation in tokens_overlap() so candidate gathering
-            // and final name-match use the same tokens.
-            std::unordered_map<std::string, std::vector<uint32_t>> token_to_places;
-            token_to_places.reserve(data.place_nodes.size() * 2);
+            // Normalised-name → place-node index for exact-match lookup.
+            // Nominatim's find_linked_place step 4 requires an exact name
+            // overlap via hstore `&&` (same language key, same value) —
+            // effectively a full-name identity match on at least one
+            // name:* tag. Our data only carries a single `name`, so we
+            // approximate by matching on the normalised primary name.
+            // Using exact-match avoids spurious token-overlap links like
+            // "1st District of Athens" → "Athens" or "Manhattan Community
+            // Board 3" → any "Manhattan" place node.
+            std::unordered_map<std::string, std::vector<uint32_t>> name_to_places;
+            name_to_places.reserve(data.place_nodes.size());
             const auto& pool_data = data.string_pool.data();
             for (uint32_t i = 0; i < data.place_nodes.size(); i++) {
                 const auto& pn = data.place_nodes[i];
@@ -2553,15 +2558,7 @@ int main(int argc, char* argv[]) {
                 if (!nm[0]) continue;
                 std::string nn = normalise_for_matching(nm);
                 if (nn.empty()) continue;
-                size_t pos = 0;
-                while (pos < nn.size()) {
-                    size_t next = nn.find(' ', pos);
-                    if (next == std::string::npos) next = nn.size();
-                    if (next - pos >= 2) {
-                        token_to_places[nn.substr(pos, next - pos)].push_back(i);
-                    }
-                    pos = next + 1;
-                }
+                name_to_places[std::move(nn)].push_back(i);
             }
 
             // PlaceType → rank_search. Matches Nominatim's
@@ -2622,38 +2619,22 @@ int main(int argc, char* argv[]) {
 
                         uint32_t best_idx = NO_DATA;
                         double best_dist_sq = max_dist_sq;
-                        std::unordered_set<uint32_t> seen;
 
-                        size_t pos = 0;
-                        while (pos < nb.size()) {
-                            size_t next = nb.find(' ', pos);
-                            if (next == std::string::npos) next = nb.size();
-                            if (next - pos >= 2) {
-                                std::string tok = nb.substr(pos, next - pos);
-                                auto it = token_to_places.find(tok);
-                                if (it != token_to_places.end()) {
-                                    for (uint32_t pidx : it->second) {
-                                        if (!seen.insert(pidx).second) continue;
-                                        const auto& pn = data.place_nodes[pidx];
-                                        uint8_t pr = place_rank(pn.place_type);
-                                        if (pr == 255) continue;
-                                        int drank = (int)pr - (int)bnd_rank;
-                                        if (drank < -2 || drank > 2) continue;
-                                        double dlat = (double)pn.lat - clat;
-                                        double dlng = (double)pn.lng - clng;
-                                        double d2 = dlat * dlat + dlng * dlng;
-                                        if (d2 >= best_dist_sq) continue;
-                                        // Confirm full token overlap, not just
-                                        // single-token hit — "Park" alone
-                                        // would match thousands of nodes.
-                                        const char* pn_name = pool_data.data() + pn.name_id;
-                                        if (!tokens_overlap(bnd_name, pn_name)) continue;
-                                        best_dist_sq = d2;
-                                        best_idx = pidx;
-                                    }
-                                }
+                        auto it = name_to_places.find(nb);
+                        if (it != name_to_places.end()) {
+                            for (uint32_t pidx : it->second) {
+                                const auto& pn = data.place_nodes[pidx];
+                                uint8_t pr = place_rank(pn.place_type);
+                                if (pr == 255) continue;
+                                int drank = (int)pr - (int)bnd_rank;
+                                if (drank < -2 || drank > 2) continue;
+                                double dlat = (double)pn.lat - clat;
+                                double dlng = (double)pn.lng - clng;
+                                double d2 = dlat * dlat + dlng * dlng;
+                                if (d2 >= best_dist_sq) continue;
+                                best_dist_sq = d2;
+                                best_idx = pidx;
                             }
-                            pos = next + 1;
                         }
 
                         if (best_idx != NO_DATA) {
