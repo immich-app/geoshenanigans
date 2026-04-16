@@ -2522,6 +2522,162 @@ int main(int argc, char* argv[]) {
             log_phase("Place-node containment", _pt, _cpu);
         }
 
+        // --- find_linked_place step 4: name-based linking ---
+        //
+        // Nominatim's find_linked_place (placex_triggers.sql) falls back
+        // to a name-match search when label-role / wikidata / own-place-tag
+        // linking all fail: it picks the nearest place=X node within
+        // ~50 km whose rank_search is within ±2 of the boundary's
+        // rank_address and whose name overlaps the boundary's name.
+        // The matched place node's type becomes the boundary's
+        // place_type_override.
+        //
+        // This catches settlement-rank links Nominatim makes but we
+        // previously missed — e.g. a borough L6 whose name=Cuauhtémoc
+        // matches a nearby place=borough node when neither has a
+        // wikidata tag and no label member is set.
+        if (!data.admin_polygons.empty() && !data.place_nodes.empty()) {
+            auto _nl_t = std::chrono::steady_clock::now();
+
+            // Token → place-node index. Each place node contributes one
+            // entry per normalised ≥2-char token, mirroring the
+            // tokenisation in tokens_overlap() so candidate gathering
+            // and final name-match use the same tokens.
+            std::unordered_map<std::string, std::vector<uint32_t>> token_to_places;
+            token_to_places.reserve(data.place_nodes.size() * 2);
+            const auto& pool_data = data.string_pool.data();
+            for (uint32_t i = 0; i < data.place_nodes.size(); i++) {
+                const auto& pn = data.place_nodes[i];
+                if (pn.name_id == NO_DATA) continue;
+                const char* nm = pool_data.data() + pn.name_id;
+                if (!nm[0]) continue;
+                std::string nn = normalise_for_matching(nm);
+                if (nn.empty()) continue;
+                size_t pos = 0;
+                while (pos < nn.size()) {
+                    size_t next = nn.find(' ', pos);
+                    if (next == std::string::npos) next = nn.size();
+                    if (next - pos >= 2) {
+                        token_to_places[nn.substr(pos, next - pos)].push_back(i);
+                    }
+                    pos = next + 1;
+                }
+            }
+
+            // PlaceType → rank_search. Matches Nominatim's
+            // address_levels.json defaults: place=city 16, town 18,
+            // village 19, suburb/hamlet 20, neighbourhood/quarter 22.
+            auto place_rank = [](uint8_t pt) -> uint8_t {
+                switch (static_cast<PlaceType>(pt)) {
+                    case PlaceType::CITY:          return 16;
+                    case PlaceType::TOWN:          return 18;
+                    case PlaceType::BOROUGH:       return 18;
+                    case PlaceType::VILLAGE:       return 19;
+                    case PlaceType::SUBURB:        return 20;
+                    case PlaceType::HAMLET:        return 20;
+                    case PlaceType::NEIGHBOURHOOD: return 22;
+                    case PlaceType::QUARTER:       return 22;
+                    default:                        return 255;
+                }
+            };
+
+            // Nominatim gates step 4 to boundaries with
+            // rank_address 16-23 (admin_level 8-11 under the default
+            // rank mapping al*2). Coarser boundaries never fall through
+            // to step 4 because steps 1-3 almost always catch them
+            // (country/state wikidata coverage is near-total).
+            std::atomic<size_t> pol_idx{0};
+            std::atomic<uint64_t> linked{0};
+            std::atomic<uint64_t> considered{0};
+            std::vector<std::thread> nl_workers;
+            const double max_dist_deg = 0.5;
+            const double max_dist_sq = max_dist_deg * max_dist_deg;
+
+            for (unsigned int t = 0; t < num_threads; t++) {
+                nl_workers.emplace_back([&]() {
+                    while (true) {
+                        size_t i = pol_idx.fetch_add(1);
+                        if (i >= data.admin_polygons.size()) break;
+                        auto& poly = data.admin_polygons[i];
+                        if (poly.place_type_override != 0) continue;
+                        if (poly.admin_level < 8 || poly.admin_level > 11) continue;
+                        if (poly.vertex_count == 0) continue;
+                        if (poly.name_id == NO_DATA) continue;
+                        const char* bnd_name = pool_data.data() + poly.name_id;
+                        if (!bnd_name[0]) continue;
+                        considered.fetch_add(1);
+
+                        uint8_t bnd_rank = poly.admin_level * 2;
+
+                        double sum_lat = 0.0, sum_lng = 0.0;
+                        for (uint32_t v = 0; v < poly.vertex_count; v++) {
+                            sum_lat += data.admin_vertices[poly.vertex_offset + v].lat;
+                            sum_lng += data.admin_vertices[poly.vertex_offset + v].lng;
+                        }
+                        double clat = sum_lat / poly.vertex_count;
+                        double clng = sum_lng / poly.vertex_count;
+
+                        std::string nb = normalise_for_matching(bnd_name);
+                        if (nb.empty()) continue;
+
+                        uint32_t best_idx = NO_DATA;
+                        double best_dist_sq = max_dist_sq;
+                        std::unordered_set<uint32_t> seen;
+
+                        size_t pos = 0;
+                        while (pos < nb.size()) {
+                            size_t next = nb.find(' ', pos);
+                            if (next == std::string::npos) next = nb.size();
+                            if (next - pos >= 2) {
+                                std::string tok = nb.substr(pos, next - pos);
+                                auto it = token_to_places.find(tok);
+                                if (it != token_to_places.end()) {
+                                    for (uint32_t pidx : it->second) {
+                                        if (!seen.insert(pidx).second) continue;
+                                        const auto& pn = data.place_nodes[pidx];
+                                        uint8_t pr = place_rank(pn.place_type);
+                                        if (pr == 255) continue;
+                                        int drank = (int)pr - (int)bnd_rank;
+                                        if (drank < -2 || drank > 2) continue;
+                                        double dlat = (double)pn.lat - clat;
+                                        double dlng = (double)pn.lng - clng;
+                                        double d2 = dlat * dlat + dlng * dlng;
+                                        if (d2 >= best_dist_sq) continue;
+                                        // Confirm full token overlap, not just
+                                        // single-token hit — "Park" alone
+                                        // would match thousands of nodes.
+                                        const char* pn_name = pool_data.data() + pn.name_id;
+                                        if (!tokens_overlap(bnd_name, pn_name)) continue;
+                                        best_dist_sq = d2;
+                                        best_idx = pidx;
+                                    }
+                                }
+                            }
+                            pos = next + 1;
+                        }
+
+                        if (best_idx != NO_DATA) {
+                            const auto& pn = data.place_nodes[best_idx];
+                            uint8_t pto = place_type_to_admin_override(pn.place_type);
+                            if (pto != 0) {
+                                poly.place_type_override = pto;
+                                linked.fetch_add(1);
+                            }
+                        }
+                    }
+                });
+            }
+            for (auto& w : nl_workers) w.join();
+
+            double _nl_elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - _nl_t).count();
+            std::cerr << "find_linked_place step 4 (name match): "
+                      << linked.load() << "/" << considered.load()
+                      << " unlinked AL8-11 boundaries linked in "
+                      << _nl_elapsed << "s" << std::endl;
+            log_phase("find_linked_place step 4", _pt, _cpu);
+        }
+
         // --- Admin polygon parent chain ---
         // For each admin polygon, find the smallest containing polygon
         // with a lower admin_level. This lets the server walk up the
