@@ -2083,7 +2083,7 @@ impl Index {
     //   1. way_postcodes[street.way_id] — street's computed postcode
     //   2. Postal boundary PIP (postal_polygons + postal_vertices)
     //   3. Nearest postcode centroid (Nominatim's get_nearest_postcode)
-    fn resolve_postcode(&self, lat: f64, lng: f64, street: Option<&WayHeader>, addr: Option<&AddrPoint>) -> Option<&str> {
+    fn resolve_postcode(&self, lat: f64, lng: f64, street: Option<&WayHeader>, addr: Option<&AddrPoint>, country_code: Option<[u8; 2]>) -> Option<&str> {
         // 0. Nearest addr_point's own postcode (from addr_postcodes.bin)
         // Matches Nominatim's token_get_postcode — the feature's own
         // addr:postcode tag is the highest-priority source.
@@ -2144,10 +2144,18 @@ impl Index {
         }
 
         // 3. Nearest postcode centroid (Nominatim's get_nearest_postcode).
-        // The builder validates postcodes via is_valid_postcode()
-        // before accumulating centroids (matching Nominatim's
-        // clean_postcodes sanitizer), so query-time filtering is
-        // applied as a safety net only.
+        // Nominatim's get_nearest_postcode filters by country_code
+        // (reverse.py `_find_nearest_postcode` joins location_postcode
+        // on the query's resolved country). Without this filter, a
+        // French "90012" can win over a US "90012" near the Maine/
+        // Quebec border or vice-versa — and the same digits often
+        // collide across countries. We use the country resolved by
+        // find_admin as the gate; if no country is known (ocean,
+        // Antarctica), fall back to unfiltered lookup so we still
+        // return something.
+        let country_gate: Option<u16> = country_code.map(|cc| {
+            (cc[0] as u16) << 8 | (cc[1] as u16)
+        });
         if let Some(ref pc_mmap) = self.postcode_centroids {
             let all_centroids: &[PostcodeCentroid] = unsafe {
                 std::slice::from_raw_parts(pc_mmap.as_ptr() as *const PostcodeCentroid, pc_mmap.len() / std::mem::size_of::<PostcodeCentroid>())
@@ -2166,6 +2174,9 @@ impl Index {
                         let idx = id as usize;
                         if idx >= all_centroids.len() { return; }
                         let pc = &all_centroids[idx];
+                        if let Some(cc) = country_gate {
+                            if pc.country_code != 0 && pc.country_code != cc { return; }
+                        }
                         let dlat = (lat - pc.lat as f64).to_radians();
                         let dlng = (lng - pc.lng as f64).to_radians();
                         let d = dlat * dlat + dlng * dlng * cos_lat * cos_lat;
@@ -2180,6 +2191,9 @@ impl Index {
                 }
             } else {
                 for pc in all_centroids {
+                    if let Some(cc) = country_gate {
+                        if pc.country_code != 0 && pc.country_code != cc { continue; }
+                    }
                     let dlat = (lat - pc.lat as f64).to_radians();
                     let dlng = (lng - pc.lng as f64).to_radians();
                     let d = dlat * dlat + dlng * dlng * cos_lat * cos_lat;
@@ -2409,6 +2423,7 @@ impl Index {
             lat, lng,
             street.as_ref().map(|(_, w)| *w),
             addr.as_ref().map(|(_, a)| *a),
+            admin.country_code,
         );
 
         if road.is_none() && admin.country.is_none() && admin.city.is_none() && admin.state.is_none() {
