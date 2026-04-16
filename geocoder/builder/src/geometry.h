@@ -425,21 +425,63 @@ inline uint32_t parse_house_number(const char* s) {
     return n;
 }
 
-// Highway types excluded from street indexing. Matches Nominatim's
-// approach: all highway types are indexed EXCEPT service (alleys/
-// tunnels), steps (stairs), cycleway, construction, bridleway.
+// Allow-list of highway=* values that count as "streets" for reverse
+// geocoding. Mirrors Nominatim's `MAIN_TAGS_STREETS.default` from
+// lib-lua/themes/nominatim/presets.lua, which is the definitive
+// source for the planet-wide import style.
 //
-// Footway is now INCLUDED (matching Nominatim) — named footways
-// like "Pedmore Walk" are legitimate street features. The name
-// gate at the call site ensures only named footways are indexed.
-// Subtypes footway=sidewalk and footway=crossing are excluded
-// (unnamed adjuncts of parent roads).
+// Everything NOT in this list is rejected — critically this excludes
+// highway=platform (tram/bus stops with their own name), bus_stop,
+// raceway, proposed, razed, construction, services, rest_area, etc.
+// A live bug in Dresden had our "highway=platform name=Postplatz"
+// tram-stop ways beating the real "highway=service name=Wallstraße"
+// road at every query that landed on the platform geometry, because
+// the old deny-list let `platform` through.
+//
+// Named-vs-always distinction (Nominatim: service/cycleway/path/
+// steps/bridleway/track/*_link are 'named' — indexed only when they
+// carry a name tag) is enforced at the call site by the `&& t_name`
+// guard before is_included_highway_full() is ever reached, so it's
+// already implicit.
 inline bool is_included_highway(const char* value) {
+    if (!value) return false;
+    // Dispatch on first char to cut strcmp cost. The lists below are
+    // kept in sync with Nominatim's presets.lua MAIN_TAGS_STREETS.default.
     switch (value[0]) {
-        case 's': return std::strcmp(value, "steps") != 0 && std::strcmp(value, "service") != 0;
-        case 'c': return std::strcmp(value, "cycleway") != 0 && std::strcmp(value, "construction") != 0;
-        case 'b': return std::strcmp(value, "bridleway") != 0;
-        default: return true;
+        case 'b':
+            return std::strcmp(value, "bridleway") == 0;
+        case 'c':
+            return std::strcmp(value, "cycleway") == 0;
+        case 'f':
+            return std::strcmp(value, "footway") == 0;
+        case 'l':
+            return std::strcmp(value, "living_street") == 0;
+        case 'm':
+            return std::strcmp(value, "motorway") == 0 ||
+                   std::strcmp(value, "motorway_link") == 0;
+        case 'p':
+            return std::strcmp(value, "primary") == 0 ||
+                   std::strcmp(value, "primary_link") == 0 ||
+                   std::strcmp(value, "pedestrian") == 0 ||
+                   std::strcmp(value, "path") == 0;
+        case 'r':
+            return std::strcmp(value, "road") == 0 ||
+                   std::strcmp(value, "residential") == 0;
+        case 's':
+            return std::strcmp(value, "secondary") == 0 ||
+                   std::strcmp(value, "secondary_link") == 0 ||
+                   std::strcmp(value, "service") == 0 ||
+                   std::strcmp(value, "steps") == 0;
+        case 't':
+            return std::strcmp(value, "tertiary") == 0 ||
+                   std::strcmp(value, "tertiary_link") == 0 ||
+                   std::strcmp(value, "trunk") == 0 ||
+                   std::strcmp(value, "trunk_link") == 0 ||
+                   std::strcmp(value, "track") == 0;
+        case 'u':
+            return std::strcmp(value, "unclassified") == 0;
+        default:
+            return false;
     }
 }
 
