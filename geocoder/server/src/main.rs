@@ -737,6 +737,75 @@ impl Index {
         })
     }
 
+    fn debug_places(&self, lat: f64, lng: f64) -> serde_json::Value {
+        let current_boundary = self.find_current_boundary(lat, lng);
+        let municipality_boundary = self.find_municipality_boundary(lat, lng);
+        let place = self.find_places(lat, lng, current_boundary, municipality_boundary);
+
+        let place_cells = match &self.place_cells {
+            Some(c) => c,
+            None => return serde_json::json!({"error": "no place index"}),
+        };
+        let place_entries = match &self.place_entries {
+            Some(e) => e,
+            None => return serde_json::json!({"error": "no place index"}),
+        };
+        let place_nodes_mmap = match &self.place_nodes {
+            Some(n) => n,
+            None => return serde_json::json!({"error": "no place index"}),
+        };
+        let all_places: &[PlaceNode] = unsafe {
+            std::slice::from_raw_parts(
+                place_nodes_mmap.as_ptr() as *const PlaceNode,
+                place_nodes_mmap.len() / std::mem::size_of::<PlaceNode>(),
+            )
+        };
+        let to_m = |d2: f64| (d2.sqrt() * 6_371_000.0) as f64;
+        let cos_lat = lat.to_radians().cos();
+        let type_names = ["city", "town", "village", "suburb", "hamlet", "neighbourhood", "quarter"];
+
+        let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
+        let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
+
+        let mut nearby: Vec<serde_json::Value> = Vec::new();
+        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+            Self::for_each_entry(place_entries, Self::lookup_admin_cell(place_cells, c), |id| {
+                let place_id = id as usize;
+                if place_id >= all_places.len() { return; }
+                let pn = &all_places[place_id];
+                let pt = pn.place_type as usize;
+                if pt >= 7 { return; }
+                let dlat = (lat - pn.lat as f64).to_radians();
+                let dlng = (lng - pn.lng as f64).to_radians();
+                let dist_sq = dlat * dlat + dlng * dlng * cos_lat * cos_lat;
+                let dist_m = to_m(dist_sq);
+                if dist_m > 20000.0 { return; }
+                nearby.push(serde_json::json!({
+                    "type": type_names[pt],
+                    "name": self.get_string(pn.name_id),
+                    "dist_m": (dist_m * 10.0).round() / 10.0,
+                    "lat": pn.lat, "lng": pn.lng,
+                }));
+            });
+        }
+        nearby.sort_by(|a, b| {
+            a["dist_m"].as_f64().unwrap_or(f64::MAX)
+                .partial_cmp(&b["dist_m"].as_f64().unwrap_or(f64::MAX))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        serde_json::json!({
+            "result": {
+                "city": place.city, "town": place.town, "village": place.village,
+                "suburb": place.suburb, "hamlet": place.hamlet,
+                "neighbourhood": place.neighbourhood, "quarter": place.quarter,
+            },
+            "municipality_boundary": municipality_boundary.map(|p| self.get_string(p.name_id)),
+            "current_boundary": current_boundary.map(|p| self.get_string(p.name_id)),
+            "nearby_nodes": nearby,
+        })
+    }
+
     // --- Admin boundary lookup (point-in-polygon) ---
 
     fn debug_admin(&self, lat: f64, lng: f64) -> serde_json::Value {
@@ -1169,14 +1238,27 @@ impl Index {
         // Nominatim uses for the same field. Nominatim's addressline
         // walk prioritizes admin boundaries via `fromarea DESC` in the
         // ORDER BY clause.
-        for r in &ranked {
-            if r.admin_level == 15 { continue; } // skip place-area in first pass
-            let field = if r.place_type_override > 0 {
+        // Field assignment helper: determines which address field (if any)
+        // a polygon should claim. For sub-city ranks (>= 20), only polygons
+        // with an explicit place_type_override (i.e. tagged place=suburb /
+        // neighbourhood / quarter in OSM) get a named field. Pure admin
+        // boundaries at admin_level 9-11 (e.g. NYC community boards,
+        // Paris arrondissements-level sub-divisions) are administrative
+        // containers — Nominatim puts them in display_name as anonymous
+        // address rows but doesn't let them claim "neighbourhood" or
+        // "suburb" in the address dict, so they don't suppress the actual
+        // place=neighbourhood nodes found by find_places.
+        let field_for = |r: &RankedPoly| -> Option<&'static str> {
+            if r.place_type_override > 0 {
                 place_type_to_field(r.place_type_override)
             } else {
                 rank_to_field(r.rank_address)
-            };
-            if let Some(field) = field {
+            }
+        };
+
+        for r in &ranked {
+            if r.admin_level == 15 { continue; } // skip place-area in first pass
+            if let Some(field) = field_for(r) {
                 if let Some(idx) = field_index(field) {
                     if let Some(ref existing) = best_by_field[idx] {
                         if r.area >= existing.area { continue; }
@@ -1190,12 +1272,7 @@ impl Index {
         // Second pass: place-area polygons fill only empty fields.
         for r in &ranked {
             if r.admin_level != 15 { continue; }
-            let field = if r.place_type_override > 0 {
-                place_type_to_field(r.place_type_override)
-            } else {
-                rank_to_field(r.rank_address)
-            };
-            if let Some(field) = field {
+            if let Some(field) = field_for(r) {
                 if let Some(idx) = field_index(field) {
                     if best_by_field[idx].is_none() {
                         best_by_field[idx] = Some(FieldCandidate {
@@ -2384,10 +2461,19 @@ impl Index {
             county: admin.county,
             district: admin.district,
             borough: admin.borough,
-            suburb: admin.suburb.or(place.suburb),
-            quarter: admin.quarter.or(if allow_place_quarter { place.quarter } else { None }),
+            // Sub-city fields: place nodes take priority over admin
+            // polygons. Admin boundaries at admin_level 9-11 (e.g. NYC
+            // community boards) get rank 20-24 and claim "suburb" /
+            // "neighbourhood" via rank_to_field. When a place=neighbourhood
+            // or place=suburb node also exists, it's the more specific
+            // label — Nominatim assigns the field from the place node and
+            // puts the admin boundary as an anonymous display_name row.
+            // We approximate this by reversing the merge priority: place
+            // node first, admin polygon as fallback.
+            suburb: if let Some(ps) = place.suburb { Some(ps) } else { admin.suburb },
+            quarter: if allow_place_quarter { place.quarter.or(admin.quarter) } else { admin.quarter },
             city_district: admin.city_district,
-            neighbourhood: admin.neighbourhood.or(if allow_place_neighbourhood { place.neighbourhood } else { None }),
+            neighbourhood: if allow_place_neighbourhood { place.neighbourhood.or(admin.neighbourhood) } else { admin.neighbourhood },
             city_block: admin.city_block,
             // Postcode from resolve_postcode(): 3-tier chain
             // (way_postcodes → postal boundary PIP → nearest centroid).
@@ -2884,8 +2970,26 @@ async fn reverse_geocode(
     }
 
     if let Some(ref mode) = params.debug {
+        if mode == "all" {
+            let address = index.query(params.lat, params.lon);
+            let admin_debug = index.debug_admin(params.lat, params.lon);
+            let primary_debug = index.debug_primary(params.lat, params.lon);
+            let places_debug = index.debug_places(params.lat, params.lon);
+            let combined = serde_json::json!({
+                "result": serde_json::from_str::<serde_json::Value>(
+                    &serde_json::to_string(&address).unwrap_or_default()
+                ).unwrap_or_default(),
+                "admin_polygons": admin_debug,
+                "primary_features": primary_debug,
+                "place_nodes": places_debug,
+            });
+            let json = serde_json::to_string_pretty(&combined).unwrap_or_default();
+            return ([(axum::http::header::CONTENT_TYPE, "application/json")], json).into_response();
+        }
         let debug = if mode == "primary" {
             index.debug_primary(params.lat, params.lon)
+        } else if mode == "places" {
+            index.debug_places(params.lat, params.lon)
         } else {
             index.debug_admin(params.lat, params.lon)
         };
