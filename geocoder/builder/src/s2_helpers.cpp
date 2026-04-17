@@ -240,17 +240,29 @@ void AdminCoverPool::worker_loop() {
 void add_addr_point(ParsedData& data, double lat, double lng,
                     const char* housenumber, const char* street,
                     const char* postcode,
-                    uint64_t& addr_count_total) {
+                    uint64_t& addr_count_total,
+                    const std::vector<std::pair<double,double>>* polygon_vertices) {
     uint32_t addr_id = static_cast<uint32_t>(data.addr_points.size());
     uint32_t street_id = (street && street[0])
         ? data.string_pool.intern(street)
         : NO_DATA;
+    uint32_t vertex_offset = NO_DATA;
+    uint32_t vertex_count = 0;
+    if (polygon_vertices && !polygon_vertices->empty()) {
+        vertex_offset = static_cast<uint32_t>(data.addr_vertices.size());
+        vertex_count = static_cast<uint32_t>(polygon_vertices->size());
+        for (const auto& [plat, plng] : *polygon_vertices) {
+            data.addr_vertices.push_back({static_cast<float>(plat), static_cast<float>(plng)});
+        }
+    }
     data.addr_points.push_back({
         static_cast<float>(lat),
         static_cast<float>(lng),
         data.string_pool.intern(housenumber),
         street_id,
-        NO_DATA  // parent_way_id — filled in during nearest-street sweep
+        NO_DATA,  // parent_way_id — filled in during nearest-street sweep
+        vertex_offset,
+        vertex_count
     });
     // Store postcode in separate parallel vector (optional file)
     uint32_t pc_id = (postcode && postcode[0])

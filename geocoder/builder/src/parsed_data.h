@@ -97,6 +97,7 @@ struct ParsedData {
     std::vector<NodeCoord> street_nodes;
     std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_ways;
     std::vector<AddrPoint> addr_points;
+    std::vector<NodeCoord> addr_vertices;  // polygon vertices for building addr_points
     std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_addrs;
     std::vector<InterpWay> interp_ways;
     std::vector<NodeCoord> interp_nodes;

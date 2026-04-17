@@ -52,6 +52,8 @@ struct AddrPoint {
     housenumber_id: u32,
     street_id: u32,
     parent_way_id: u32,
+    vertex_offset: u32,  // NO_DATA for node-sourced points
+    vertex_count: u32,   // 0 for nodes, >0 for building polygons
 }
 
 #[repr(C)]
@@ -323,6 +325,7 @@ struct Index {
     street_nodes: Option<Mmap>,
     addr_entries: Option<Mmap>,
     addr_points: Option<Mmap>,
+    addr_vertices: Option<Mmap>,
     interp_entries: Option<Mmap>,
     interp_ways: Option<Mmap>,
     interp_nodes: Option<Mmap>,
@@ -402,6 +405,7 @@ impl Index {
             street_nodes: required_geo("street_nodes.bin")?,
             addr_entries: mmap_file_optional(&format!("{}/addr_entries.bin", dir)),
             addr_points: mmap_file_optional(&format!("{}/addr_points.bin", dir)),
+            addr_vertices: mmap_file_optional(&format!("{}/addr_vertices.bin", dir)),
             interp_entries: mmap_file_optional(&format!("{}/interp_entries.bin", dir)),
             interp_ways: mmap_file_optional(&format!("{}/interp_ways.bin", dir)),
             interp_nodes: mmap_file_optional(&format!("{}/interp_nodes.bin", dir)),
@@ -576,6 +580,17 @@ impl Index {
         } else {
             empty_interp_nodes
         };
+        let empty_addr_verts: &[NodeCoord] = &[];
+        let all_addr_vertices: &[NodeCoord] = if let Some(ref m) = self.addr_vertices {
+            unsafe {
+                std::slice::from_raw_parts(
+                    m.as_ptr() as *const NodeCoord,
+                    m.len() / std::mem::size_of::<NodeCoord>(),
+                )
+            }
+        } else {
+            empty_addr_verts
+        };
 
         let cos_lat = lat.to_radians().cos();
 
@@ -593,7 +608,10 @@ impl Index {
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
             let offsets = Self::lookup_geo_cell(geo_cells, c);
 
-            // Addresses
+            // Addresses. For building-sourced addr_points (vertex_count
+            // > 0), use distance-to-polygon instead of centroid distance
+            // — matches Nominatim's ST_Distance(query, placex.geometry),
+            // which is 0 when the query lies inside the footprint.
             if let Some(ref addr_entries) = self.addr_entries {
                 Self::for_each_entry(addr_entries, offsets.addr, |id| {
                     let idx = id as usize;
@@ -601,7 +619,15 @@ impl Index {
                     let point = &all_points[idx];
                     let dlat = (point.lat as f64 - lat).to_radians();
                     let dlng = (point.lng as f64 - lng).to_radians();
-                    let dist = dist_sq(dlat, dlng, cos_lat);
+                    let mut dist = dist_sq(dlat, dlng, cos_lat);
+                    if point.vertex_count > 0 && point.vertex_offset != NO_DATA {
+                        let off = point.vertex_offset as usize;
+                        let cnt = point.vertex_count as usize;
+                        if off + cnt <= all_addr_vertices.len() {
+                            let verts = &all_addr_vertices[off..off + cnt];
+                            dist = polygon_distance_sq(lat, lng, verts, cos_lat);
+                        }
+                    }
                     if dist < best_addr_dist {
                         best_addr_dist = dist;
                         best_addr = Some(point);
@@ -2281,30 +2307,12 @@ impl Index {
         };
         let poi_primary = poi_primary_raw.filter(|(d, _)| *d <= poi_max_sq);
 
-        let addr_dist_raw = addr.as_ref().map(|(d, _)| *d).unwrap_or(f64::MAX);
-        // Nominatim includes addr_points (IsAddressPoint, rank_search=30)
-        // in the SAME primary query as streets and computes distance to
-        // the building's POLYGON geometry — 0 when the query is inside
-        // the footprint. We store centroids only, so our distance is
-        // always centroid-to-query (~5-15m even when inside the building).
-        //
-        // Approximate Nominatim's polygon distance by subtracting an
-        // estimated building radius (~10m) from the centroid distance,
-        // floored at 0. This lets a building at centroid distance 10m
-        // compete with a street at 1.6m, matching how Nominatim's
-        // polygon distance = 0 beats the street.
-        let building_radius_sq = {
-            let r = 10.0_f64 / 6_371_000.0;
-            r * r
-        };
-        let addr_dist = if addr_dist_raw <= building_radius_sq {
-            0.0
-        } else {
-            let raw_m = addr_dist_raw.sqrt() * 6_371_000.0;
-            let adj_m = (raw_m - 10.0).max(0.0);
-            let adj_rad = adj_m / 6_371_000.0;
-            adj_rad * adj_rad
-        };
+        // addr_dist already reflects real distance-to-polygon for
+        // building-sourced addr_points (computed in the cell sweep via
+        // polygon_distance_sq). For node-sourced addr_points, it's
+        // centroid distance, matching Nominatim's ST_Distance to a
+        // point geometry.
+        let addr_dist = addr.as_ref().map(|(d, _)| *d).unwrap_or(f64::MAX);
         // Nominatim's `_find_closest_street_or_pois` queries the placex
         // table (streets + rank-30 POIs / addr points). Interpolation
         // rows live in the separate `osmline` table and are looked up
@@ -2324,30 +2332,40 @@ impl Index {
         // Nominatim's reverse.py lines 219-235 and 355-360: when the
         // closest result is an area (osm_type != 'N', rank_search > 27)
         // at distance 0 (query inside polygon), Nominatim prefers any
-        // rank-30 node whose centroid is geometrically inside that
-        // polygon (ST_CoveredBy on _best_geometry). The fuzziness window
-        // gating which rows are considered is 0.001 deg (~110m).
+        // rank-30 NODE whose geometry is inside that polygon
+        // (ST_CoveredBy on _best_geometry). This is how Nominatim
+        // returns "Sushi teria, 350, 5th Avenue" for Empire State or
+        // "6, City Hall Plaza" for Paris Hôtel de Ville instead of the
+        // containing building/POI.
         //
-        // We can't replicate polygon containment because we store
-        // POI/building centroids, not geometries. Approximate
-        // "inside the same polygon" as "addr_point within 30m of
-        // query" — tight enough to avoid picking an addr_point from
-        // a different building across the street, loose enough to
-        // catch typical urban buildings. This is how we pick
-        // "Sushi teria, 350, 5th Avenue" for Empire State and
-        // "6, City Hall Plaza" for Paris Hôtel de Ville instead of
-        // the containing building POI. A wider threshold (~110m,
-        // matching Nominatim's fuzziness) would introduce false
-        // positives from neighbouring buildings.
-        //
-        // This is how we pick "Sushi teria, 350, 5th Avenue" for NYC
-        // Empire State and "6, City Hall Plaza" for Paris Hôtel de
-        // Ville instead of the containing building.
-        let inside_node_threshold_sq = (0.00027_f64).to_radians().powi(2);
+        // We implement the real containment check: if the nearest
+        // containing POI has a polygon and the nearest addr_point is a
+        // node (vertex_count == 0) that point_in_polygon reports as
+        // inside, demote the POI so the node wins.
         let mut effective_poi_dist = poi_dist;
-        if poi_dist == 0.0 && addr_dist < inside_node_threshold_sq {
-            // Demote POI so addr wins the comparison below.
-            effective_poi_dist = f64::MAX;
+        if poi_dist == 0.0 {
+            if let (Some((_, addr_pt)), Some((_, poi))) = (addr.as_ref(), poi_primary.as_ref()) {
+                if addr_pt.vertex_count == 0 && poi.vertex_count > 0
+                    && poi.vertex_offset != NO_DATA {
+                    let all_poi_vertices: &[NodeCoord] = match &self.poi_vertices {
+                        Some(v) => unsafe {
+                            std::slice::from_raw_parts(
+                                v.as_ptr() as *const NodeCoord,
+                                v.len() / std::mem::size_of::<NodeCoord>(),
+                            )
+                        },
+                        None => &[],
+                    };
+                    let off = poi.vertex_offset as usize;
+                    let cnt = poi.vertex_count as usize;
+                    if off + cnt <= all_poi_vertices.len() {
+                        let verts = &all_poi_vertices[off..off + cnt];
+                        if point_in_polygon(addr_pt.lat, addr_pt.lng, verts) {
+                            effective_poi_dist = f64::MAX;
+                        }
+                    }
+                }
+            }
         }
 
         let closest_feature_dist = addr_dist.min(interp_dist).min(street_dist).min(effective_poi_dist);
@@ -2651,6 +2669,26 @@ fn point_to_segment_distance(
     cos_lat: f64,
 ) -> f64 {
     point_to_segment_with_t(px, py, ax, ay, bx, by, cos_lat).0
+}
+
+// Squared distance (radians²) from query point to nearest polygon edge,
+// or 0 if the point is inside. Matches Nominatim's ST_Distance(query,
+// polygon_geom) = 0 when the query lies inside the footprint.
+fn polygon_distance_sq(lat: f64, lng: f64, vertices: &[NodeCoord], cos_lat: f64) -> f64 {
+    if vertices.is_empty() { return f64::MAX; }
+    if point_in_polygon(lat as f32, lng as f32, vertices) { return 0.0; }
+    let mut best = f64::MAX;
+    for i in 0..vertices.len() {
+        let j = (i + 1) % vertices.len();
+        let d = point_to_segment_distance(
+            lat, lng,
+            vertices[i].lat as f64, vertices[i].lng as f64,
+            vertices[j].lat as f64, vertices[j].lng as f64,
+            cos_lat,
+        );
+        if d < best { best = d; }
+    }
+    best
 }
 
 // Ray casting point-in-polygon test

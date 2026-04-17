@@ -213,9 +213,10 @@ static std::unordered_map<uint32_t, uint32_t> build_string_remap(
 // --- Remap + fixup helpers ---
 
 static void remap_addr_points(char* data, size_t size, const std::unordered_map<uint32_t,uint32_t>& rm) {
-    // AddrPoint: 20 bytes (lat:4 + lng:4 + housenumber_id:4 + street_id:4 + parent_way_id:4)
-    // String fields at offsets 8, 12 (parent_way_id at 16 is not a string offset)
-    constexpr size_t stride = 20;
+    // AddrPoint: 28 bytes (lat:4 + lng:4 + housenumber_id:4 + street_id:4 +
+    //                      parent_way_id:4 + vertex_offset:4 + vertex_count:4)
+    // String fields at offsets 8, 12 only; parent_way_id/vertex fields are not strings.
+    constexpr size_t stride = 28;
     for (size_t i = 0; i + stride <= size; i += stride) {
         for (size_t off : {8, 12}) {
             uint32_t v; memcpy(&v, data + i + off, 4);
@@ -711,10 +712,15 @@ int main(int argc, char* argv[]) {
         double gs = now_ms();
         auto old_m = mmap_file_rw(old_dir + "/addr_points.bin");
         auto new_m = mmap_file(new_dir + "/addr_points.bin");
-        // Stride must be detected per-file: old may be 16 (pre-postcode) or 20 (post-postcode).
-        // We can only run the merge if old and new have the same stride.
+        // Stride must be detected per-file. Known sizes: 16 (pre-postcode),
+        // 20 (+parent_way_id), 28 (+vertex_offset/count). We can only run
+        // the merge if old and new have the same stride; cross-stride
+        // patches are not supported (the manifest's build_version bump
+        // forces clients to fresh-install instead).
         auto detect_addr_stride = [](size_t sz) -> size_t {
-            return (sz % 20 == 0 && sz / 20 > 0) ? 20 : 16;
+            if (sz % 28 == 0 && sz > 0) return 28;
+            if (sz % 20 == 0 && sz > 0) return 20;
+            return 16;
         };
         size_t old_stride = detect_addr_stride(old_m.size);
         size_t new_stride = detect_addr_stride(new_m.size);

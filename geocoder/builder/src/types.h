@@ -16,7 +16,9 @@ struct AddrPoint {
     float lng;
     uint32_t housenumber_id;
     uint32_t street_id;
-    uint32_t parent_way_id; // nearest street way index (for housenumber refinement)
+    uint32_t parent_way_id;   // nearest street way index (for housenumber refinement)
+    uint32_t vertex_offset;   // into addr_vertices.bin (NO_DATA for node-sourced points)
+    uint32_t vertex_count;    // 0 for nodes, >0 for building polygons
 };
 
 // Postcode centroid: one per unique postcode string, stored in

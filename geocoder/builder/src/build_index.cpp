@@ -1413,6 +1413,9 @@ int main(int argc, char* argv[]) {
                     std::vector<DeferredInterp> deferred_interps;
                     std::vector<AddrPoint> building_addrs;
                     std::vector<std::pair<double, double>> building_addr_coords; // lat,lng for S2 cell
+                    // Parallel to building_addrs: polygon vertices for each building-sourced addr.
+                    // Empty vector = no polygon (shouldn't happen for building path, but treated as point).
+                    std::vector<std::vector<std::pair<double,double>>> building_addr_polys;
                     std::vector<std::string> way_strings;      // way name (name:en ?: name)
                     std::vector<std::string> way_orig_names;   // way original name (always name tag)
                     std::vector<std::pair<std::string,std::string>> addr_strings; // building addr {hn, street}
@@ -1631,10 +1634,27 @@ int main(int argc, char* argv[]) {
                             if (loc.valid()) { sum_lat += loc.lat(); sum_lng += loc.lon(); valid++; }
                         }
                         if (valid > 0) {
-                            local.building_addr_coords.push_back({sum_lat/valid, sum_lng/valid});
-                            local.building_addrs.push_back({static_cast<float>(sum_lat/valid), static_cast<float>(sum_lng/valid), 0, 0, 0});
+                            double clat = sum_lat/valid, clng = sum_lng/valid;
+                            local.building_addr_coords.push_back({clat, clng});
+                            local.building_addrs.push_back({static_cast<float>(clat), static_cast<float>(clng), 0, 0, 0, NO_DATA, 0});
                             local.addr_strings.push_back({housenumber, street ? street : ""});
                             local.addr_postcodes.push_back(t_postcode ? t_postcode : "");
+                            // Polygon vertices for closed ways (buildings).
+                            // Lets the server compute exact distance-to-
+                            // polygon for Nominatim parity instead of the
+                            // centroid-minus-10m approximation.
+                            std::vector<std::pair<double,double>> poly_pts;
+                            if (refs_size >= 4 && refs_data[0] == refs_data[refs_size-1] && all_valid) {
+                                poly_pts.reserve(refs_size);
+                                for (const auto& loc : resolved_locs)
+                                    poly_pts.push_back({loc.lat(), loc.lon()});
+                                if (poly_pts.size() > MAX_POLYGON_VERTICES) {
+                                    double lat0 = poly_pts[0].first;
+                                    double eps_deg = meters_to_degrees(50.0, lat0);
+                                    poly_pts = simplify_polygon_epsilon(poly_pts, eps_deg);
+                                }
+                            }
+                            local.building_addr_polys.push_back(std::move(poly_pts));
                             local.building_addr_count++;
                         }
                     }
@@ -1848,9 +1868,12 @@ int main(int argc, char* argv[]) {
                     for (size_t i = 0; i < local.building_addrs.size(); i++) {
                         uint64_t dummy = 0;
                         const char* bpc_ptr = local.addr_postcodes[i].empty() ? nullptr : local.addr_postcodes[i].c_str();
+                        const auto* poly_ptr = local.building_addr_polys[i].empty()
+                            ? nullptr : &local.building_addr_polys[i];
                         add_addr_point(data, local.building_addrs[i].lat, local.building_addrs[i].lng,
                                        local.addr_strings[i].first.c_str(),
-                                       local.addr_strings[i].second.c_str(), bpc_ptr, dummy);
+                                       local.addr_strings[i].second.c_str(), bpc_ptr, dummy,
+                                       poly_ptr);
                         // Accumulate postcode centroids (validated)
                         const auto& pc = local.addr_postcodes[i];
                         if (!pc.empty() && is_valid_postcode(pc.c_str())) {
@@ -3859,12 +3882,34 @@ int main(int argc, char* argv[]) {
             for (uint32_t i = 0; i < n; i++) old_to_new[order[i]] = i;
             std::vector<AddrPoint> sorted(n);
             for (uint32_t i = 0; i < n; i++) sorted[i] = data.addr_points[order[i]];
-            // Dedup consecutive identical records (planet has ~4M duplicates)
-            // Map duplicate old IDs to the first occurrence's new ID
+            // Reorder vertex buffer alongside addr_points. Copy each
+            // record's polygon vertices into a new buffer and update
+            // vertex_offset in the sorted array.
+            std::vector<NodeCoord> new_addr_vertices;
+            new_addr_vertices.reserve(data.addr_vertices.size());
+            for (auto& a : sorted) {
+                if (a.vertex_count > 0 && a.vertex_offset != NO_DATA) {
+                    uint32_t old_off = a.vertex_offset;
+                    a.vertex_offset = static_cast<uint32_t>(new_addr_vertices.size());
+                    for (uint32_t j = 0; j < a.vertex_count; j++)
+                        new_addr_vertices.push_back(data.addr_vertices[old_off + j]);
+                }
+            }
+            data.addr_vertices = std::move(new_addr_vertices);
+            // Dedup consecutive identical records (planet has ~4M duplicates).
+            // Compare everything except vertex_offset — same polygon content
+            // stored at different offsets should still dedup.
+            auto addr_equal = [](const AddrPoint& a, const AddrPoint& b) {
+                return a.lat == b.lat && a.lng == b.lng &&
+                       a.housenumber_id == b.housenumber_id &&
+                       a.street_id == b.street_id &&
+                       a.parent_way_id == b.parent_way_id &&
+                       a.vertex_count == b.vertex_count;
+            };
             std::vector<uint32_t> dedup_remap(n);
             size_t write_pos = 0;
             for (size_t i = 0; i < n; i++) {
-                if (write_pos == 0 || memcmp(&sorted[i], &sorted[write_pos - 1], sizeof(AddrPoint)) != 0) {
+                if (write_pos == 0 || !addr_equal(sorted[i], sorted[write_pos - 1])) {
                     sorted[write_pos] = sorted[i];
                     dedup_remap[i] = static_cast<uint32_t>(write_pos);
                     write_pos++;
@@ -4638,7 +4683,7 @@ int main(int argc, char* argv[]) {
             "street_ways.bin", "street_nodes.bin", "street_entries.bin"
         };
         std::vector<std::string> address_files = {
-            "addr_points.bin", "addr_entries.bin",
+            "addr_points.bin", "addr_vertices.bin", "addr_entries.bin",
             "interp_ways.bin", "interp_nodes.bin", "interp_entries.bin"
         };
         std::vector<std::string> geo_files = {"geo_cells.bin"};
@@ -4662,7 +4707,7 @@ int main(int argc, char* argv[]) {
 
         std::ofstream mf(output_dir + "/manifest.json");
         mf << "{\n";
-        mf << "  \"build_version\": 8,\n";
+        mf << "  \"build_version\": 9,\n";
         mf << "  \"patch_version\": 5,\n";
         mf << "  \"regions\": {\n";
 

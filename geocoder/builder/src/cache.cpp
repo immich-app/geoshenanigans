@@ -8,11 +8,12 @@ enum class SectionType : uint32_t {
     STRING_POOL = 0, WAYS = 1, STREET_NODES = 2, CELL_TO_WAYS = 3,
     ADDR_POINTS = 4, CELL_TO_ADDRS = 5, INTERP_WAYS = 6, INTERP_NODES = 7,
     CELL_TO_INTERPS = 8, ADMIN_POLYGONS = 9, ADMIN_VERTICES = 10, CELL_TO_ADMIN = 11,
+    ADDR_VERTICES = 12,
 };
 
 static const char CACHE_MAGIC[8] = {'T','G','C','A','C','H','E','\0'};
-static const uint32_t CACHE_VERSION = 1;
-static const uint32_t CACHE_SECTION_COUNT = 12;
+static const uint32_t CACHE_VERSION = 2;
+static const uint32_t CACHE_SECTION_COUNT = 13;
 
 template<typename T>
 static std::vector<char> serialize_vector(const std::vector<T>& vec) {
@@ -98,6 +99,7 @@ void serialize_cache(const ParsedData& data, const std::string& path) {
     write_section(SectionType::STREET_NODES, serialize_vector(data.street_nodes));
     write_section(SectionType::CELL_TO_WAYS, serialize_cell_map(data.cell_to_ways));
     write_section(SectionType::ADDR_POINTS, serialize_vector(data.addr_points));
+    write_section(SectionType::ADDR_VERTICES, serialize_vector(data.addr_vertices));
     write_section(SectionType::CELL_TO_ADDRS, serialize_cell_map(data.cell_to_addrs));
     write_section(SectionType::INTERP_WAYS, serialize_vector(data.interp_ways));
     write_section(SectionType::INTERP_NODES, serialize_vector(data.interp_nodes));
@@ -133,6 +135,7 @@ bool deserialize_cache(ParsedData& data, const std::string& path) {
         case SectionType::STREET_NODES: if (!deserialize_vector(blob.data(), length, data.street_nodes)) return false; break;
         case SectionType::CELL_TO_WAYS: if (!deserialize_cell_map(blob.data(), length, data.cell_to_ways)) return false; break;
         case SectionType::ADDR_POINTS: if (!deserialize_vector(blob.data(), length, data.addr_points)) return false; break;
+        case SectionType::ADDR_VERTICES: if (!deserialize_vector(blob.data(), length, data.addr_vertices)) return false; break;
         case SectionType::CELL_TO_ADDRS: if (!deserialize_cell_map(blob.data(), length, data.cell_to_addrs)) return false; break;
         case SectionType::INTERP_WAYS: if (!deserialize_vector(blob.data(), length, data.interp_ways)) return false; break;
         case SectionType::INTERP_NODES: if (!deserialize_vector(blob.data(), length, data.interp_nodes)) return false; break;

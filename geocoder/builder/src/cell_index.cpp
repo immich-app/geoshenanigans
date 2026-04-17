@@ -341,6 +341,11 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                 std::ofstream f(output_dir + "/addr_points.bin", std::ios::binary);
                 f.write(reinterpret_cast<const char*>(data.addr_points.data()), data.addr_points.size() * sizeof(AddrPoint));
             }));
+            write_futures.push_back(std::async(std::launch::async, [&] {
+                std::ofstream f(output_dir + "/addr_vertices.bin", std::ios::binary);
+                f.write(reinterpret_cast<const char*>(data.addr_vertices.data()),
+                        data.addr_vertices.size() * sizeof(NodeCoord));
+            }));
             // Per-addr postcode (optional separate file, parallel to addr_points)
             if (!data.addr_postcode_ids.empty()) {
                 write_futures.push_back(std::async(std::launch::async, [&] {
