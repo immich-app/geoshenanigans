@@ -2617,6 +2617,17 @@ impl Index {
         let admin_chain_dense = admin.suburb.is_some() && admin.city_block.is_some();
         let allow_place_quarter = !admin_chain_dense;
         let allow_place_neighbourhood = !admin_chain_dense;
+        // Nominatim's insert_addresslines orders candidates by
+        // `rank_address, isguess asc, distance` (placex_triggers.sql
+        // :590). `isguess asc` puts admin boundaries (isguess=false)
+        // ahead of place nodes (isguess=true) at the same rank, so
+        // admin wins the address slot within a rank tie. Mirror that
+        // here for suburb / quarter / neighbourhood — earlier we did
+        // place-first, which surfaced "Tverskoy" (place=suburb node)
+        // instead of "Tverskoy District" (AL8 boundary), and similar
+        // for Beijing "Donghuamen" vs "Donghuamen Subdistrict".
+        // NYC still resolves as before because admin.suburb=Manhattan
+        // and place.suburb=Manhattan carry the same name.
         let address = AddressDetails {
             house_number,
             road,
@@ -2632,19 +2643,10 @@ impl Index {
             county: admin.county,
             district: admin.district,
             borough: admin.borough,
-            // Sub-city fields: place nodes take priority over admin
-            // polygons. Admin boundaries at admin_level 9-11 (e.g. NYC
-            // community boards) get rank 20-24 and claim "suburb" /
-            // "neighbourhood" via rank_to_field. When a place=neighbourhood
-            // or place=suburb node also exists, it's the more specific
-            // label — Nominatim assigns the field from the place node and
-            // puts the admin boundary as an anonymous display_name row.
-            // We approximate this by reversing the merge priority: place
-            // node first, admin polygon as fallback.
-            suburb: if let Some(ps) = place.suburb { Some(ps) } else { admin.suburb },
-            quarter: if allow_place_quarter { place.quarter.or(admin.quarter) } else { admin.quarter },
+            suburb: admin.suburb.or(place.suburb),
+            quarter: if allow_place_quarter { admin.quarter.or(place.quarter) } else { admin.quarter },
             city_district: admin.city_district,
-            neighbourhood: if allow_place_neighbourhood { place.neighbourhood.or(admin.neighbourhood) } else { admin.neighbourhood },
+            neighbourhood: if allow_place_neighbourhood { admin.neighbourhood.or(place.neighbourhood) } else { admin.neighbourhood },
             city_block: admin.city_block,
             // Postcode from resolve_postcode(): 3-tier chain
             // (way_postcodes → postal boundary PIP → nearest centroid).
