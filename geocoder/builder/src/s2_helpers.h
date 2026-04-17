@@ -91,7 +91,8 @@ void add_addr_point(ParsedData& data, double lat, double lng,
                     const char* housenumber, const char* street,
                     const char* postcode,
                     uint64_t& addr_count_total,
-                    const std::vector<std::pair<double,double>>* polygon_vertices = nullptr);
+                    const NodeCoord* polygon_vertices = nullptr,
+                    uint32_t polygon_vertex_count = 0);
 
 void add_admin_polygon(ParsedData& data,
                        const std::vector<std::pair<double,double>>& vertices_in,

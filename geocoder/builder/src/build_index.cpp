@@ -1413,9 +1413,15 @@ int main(int argc, char* argv[]) {
                     std::vector<DeferredInterp> deferred_interps;
                     std::vector<AddrPoint> building_addrs;
                     std::vector<std::pair<double, double>> building_addr_coords; // lat,lng for S2 cell
-                    // Parallel to building_addrs: polygon vertices for each building-sourced addr.
-                    // Empty vector = no polygon (shouldn't happen for building path, but treated as point).
-                    std::vector<std::vector<std::pair<double,double>>> building_addr_polys;
+                    // Flat polygon storage, parallel to building_addrs via
+                    // (offset, count) into building_addr_poly_verts. Stored as
+                    // NodeCoord (2× float = 8 bytes/vertex) instead of
+                    // pair<double,double> (16 bytes/vertex), and flat rather
+                    // than vector<vector<...>>, to keep thread-local peak
+                    // memory bounded during parallel way parsing.
+                    std::vector<NodeCoord> building_addr_poly_verts;
+                    std::vector<uint32_t> building_addr_poly_off;   // NO_DATA = no polygon
+                    std::vector<uint32_t> building_addr_poly_cnt;   // 0 = no polygon
                     std::vector<std::string> way_strings;      // way name (name:en ?: name)
                     std::vector<std::string> way_orig_names;   // way original name (always name tag)
                     std::vector<std::pair<std::string,std::string>> addr_strings; // building addr {hn, street}
@@ -1642,19 +1648,28 @@ int main(int argc, char* argv[]) {
                             // Polygon vertices for closed ways (buildings).
                             // Lets the server compute exact distance-to-
                             // polygon for Nominatim parity instead of the
-                            // centroid-minus-10m approximation.
-                            std::vector<std::pair<double,double>> poly_pts;
+                            // centroid-minus-10m approximation. Cap at 20
+                            // vertices — addr-point distance only needs a
+                            // coarse shape, and tight caps bound thread-
+                            // local memory during parallel parse.
+                            uint32_t poly_off = NO_DATA;
+                            uint32_t poly_cnt = 0;
                             if (refs_size >= 4 && refs_data[0] == refs_data[refs_size-1] && all_valid) {
+                                std::vector<std::pair<double,double>> poly_pts;
                                 poly_pts.reserve(refs_size);
                                 for (const auto& loc : resolved_locs)
                                     poly_pts.push_back({loc.lat(), loc.lon()});
-                                if (poly_pts.size() > MAX_POLYGON_VERTICES) {
-                                    double lat0 = poly_pts[0].first;
-                                    double eps_deg = meters_to_degrees(50.0, lat0);
-                                    poly_pts = simplify_polygon_epsilon(poly_pts, eps_deg);
+                                constexpr size_t MAX_ADDR_POLY_VERTS = 20;
+                                if (poly_pts.size() > MAX_ADDR_POLY_VERTS) {
+                                    poly_pts = simplify_polygon(poly_pts, MAX_ADDR_POLY_VERTS);
                                 }
+                                poly_off = static_cast<uint32_t>(local.building_addr_poly_verts.size());
+                                poly_cnt = static_cast<uint32_t>(poly_pts.size());
+                                for (const auto& p : poly_pts)
+                                    local.building_addr_poly_verts.push_back({static_cast<float>(p.first), static_cast<float>(p.second)});
                             }
-                            local.building_addr_polys.push_back(std::move(poly_pts));
+                            local.building_addr_poly_off.push_back(poly_off);
+                            local.building_addr_poly_cnt.push_back(poly_cnt);
                             local.building_addr_count++;
                         }
                     }
@@ -1868,12 +1883,15 @@ int main(int argc, char* argv[]) {
                     for (size_t i = 0; i < local.building_addrs.size(); i++) {
                         uint64_t dummy = 0;
                         const char* bpc_ptr = local.addr_postcodes[i].empty() ? nullptr : local.addr_postcodes[i].c_str();
-                        const auto* poly_ptr = local.building_addr_polys[i].empty()
-                            ? nullptr : &local.building_addr_polys[i];
+                        uint32_t poly_off = local.building_addr_poly_off[i];
+                        uint32_t poly_cnt = local.building_addr_poly_cnt[i];
+                        const NodeCoord* poly_verts = (poly_cnt > 0 && poly_off != NO_DATA)
+                            ? &local.building_addr_poly_verts[poly_off]
+                            : nullptr;
                         add_addr_point(data, local.building_addrs[i].lat, local.building_addrs[i].lng,
                                        local.addr_strings[i].first.c_str(),
                                        local.addr_strings[i].second.c_str(), bpc_ptr, dummy,
-                                       poly_ptr);
+                                       poly_verts, poly_cnt);
                         // Accumulate postcode centroids (validated)
                         const auto& pc = local.addr_postcodes[i];
                         if (!pc.empty() && is_valid_postcode(pc.c_str())) {
