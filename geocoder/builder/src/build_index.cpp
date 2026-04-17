@@ -3398,6 +3398,97 @@ int main(int argc, char* argv[]) {
                 log_phase("  POI: parent-street linking", _s2t, _s2cpu);
             }
 
+            // --- POI parent-postcode PIP ---
+            //
+            // Mirrors Nominatim's placex.postcode chain for rank-30
+            // POI rows that have no addr:postcode of their own: the
+            // postcode is inherited via parent_place_id, which walks
+            // up through the admin chain to the nearest postal
+            // boundary. We approximate this by PIP'ing each POI
+            // centroid into the smallest containing boundary=postal_code
+            // polygon (admin_level==11 in our schema) and storing the
+            // resulting postcode string offset on the POI. The server
+            // uses this field as the primary-feature postcode tier
+            // when the POI wins selection (e.g. Paris Hôtel de Ville
+            // POI → 75004 from the 4th arrondissement postal boundary).
+            if (!data.poi_records.empty() && !data.admin_polygons.empty()) {
+                auto _pp_t = std::chrono::steady_clock::now();
+                std::cerr << "Computing POI parent-postcode links ("
+                          << data.poi_records.size() << " POIs)..."
+                          << std::endl;
+
+                std::atomic<size_t> pp_idx{0};
+                std::atomic<uint64_t> pp_linked{0};
+                std::vector<std::thread> pp_workers;
+                for (unsigned int t = 0; t < num_threads; t++) {
+                    pp_workers.emplace_back([&]() {
+                        while (true) {
+                            size_t i = pp_idx.fetch_add(1);
+                            if (i >= data.poi_records.size()) break;
+                            auto& pr = data.poi_records[i];
+                            // parent_postcode_id has default NO_DATA,
+                            // set explicitly here to match the
+                            // parent_street_id pattern above.
+                            pr.parent_postcode_id = 0xFFFFFFFFu;
+
+                            float plat = pr.lat;
+                            float plng = pr.lng;
+                            S2CellId cell = S2CellId(
+                                S2LatLng::FromDegrees(plat, plng))
+                                .parent(kAdminCellLevel);
+                            std::vector<S2CellId> nbrs;
+                            cell.AppendAllNeighbors(kAdminCellLevel, &nbrs);
+
+                            float best_area = 1e18f;
+                            uint32_t best_pid = NO_DATA;
+                            auto check_cell = [&](uint64_t cid) {
+                                auto it = data.cell_to_admin.find(cid);
+                                if (it == data.cell_to_admin.end()) return;
+                                for (uint32_t raw_id : it->second) {
+                                    uint32_t pid = raw_id & 0x7FFFFFFF;
+                                    if (pid >= data.admin_polygons.size()) continue;
+                                    const auto& cand = data.admin_polygons[pid];
+                                    if (cand.admin_level != 11) continue;
+                                    if (cand.area >= best_area) continue;
+                                    uint32_t off = cand.vertex_offset;
+                                    uint32_t cnt2 = cand.vertex_count;
+                                    if (off + cnt2 > data.admin_vertices.size()) continue;
+                                    const auto* verts = &data.admin_vertices[off];
+                                    bool inside = false;
+                                    for (uint32_t a = 0, b = cnt2 - 1; a < cnt2; b = a++) {
+                                        if (((verts[a].lng > plng) != (verts[b].lng > plng)) &&
+                                            (plat < (verts[b].lat - verts[a].lat) * (plng - verts[a].lng) / (verts[b].lng - verts[a].lng) + verts[a].lat))
+                                            inside = !inside;
+                                    }
+                                    if (inside) {
+                                        best_area = cand.area;
+                                        best_pid = pid;
+                                    }
+                                }
+                            };
+                            check_cell(cell.id());
+                            for (const auto& n : nbrs) check_cell(n.id());
+
+                            if (best_pid != NO_DATA) {
+                                pr.parent_postcode_id =
+                                    data.admin_polygons[best_pid].name_id;
+                                pp_linked.fetch_add(1);
+                            }
+                        }
+                    });
+                }
+                for (auto& w : pp_workers) w.join();
+
+                double _pp_el = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - _pp_t).count();
+                std::cerr << "POI parent-postcode linking: "
+                          << pp_linked.load() << "/"
+                          << data.poi_records.size()
+                          << " POIs linked to a postal boundary in "
+                          << _pp_el << "s" << std::endl;
+                log_phase("  POI: parent-postcode linking", _s2t, _s2cpu);
+            }
+
             // --- Address-point parent-street backfill ---
             //
             // Nominatim indexes any rank-30 row with addr:housenumber
@@ -3836,6 +3927,14 @@ int main(int argc, char* argv[]) {
                             pr.parent_street_id = psit->second;
                         } else {
                             pr.parent_street_id = 0xFFFFFFFFu;
+                        }
+                    }
+                    if (pr.parent_postcode_id != 0xFFFFFFFFu) {
+                        auto ppit = rm.find(pr.parent_postcode_id);
+                        if (ppit != rm.end()) {
+                            pr.parent_postcode_id = ppit->second;
+                        } else {
+                            pr.parent_postcode_id = 0xFFFFFFFFu;
                         }
                     }
                 }
@@ -4725,7 +4824,7 @@ int main(int argc, char* argv[]) {
 
         std::ofstream mf(output_dir + "/manifest.json");
         mf << "{\n";
-        mf << "  \"build_version\": 9,\n";
+        mf << "  \"build_version\": 10,\n";
         mf << "  \"patch_version\": 5,\n";
         mf << "  \"regions\": {\n";
 

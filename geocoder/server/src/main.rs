@@ -107,6 +107,13 @@ struct PoiRecord {
     /// Mirrors Nominatim's parent_place_id chain from a rank-30
     /// POI back to its rank-26 road. `NO_DATA` if unset.
     parent_street_id: u32,
+    /// String offset of the POI's calculated postcode, inherited
+    /// from the smallest containing boundary=postal_code polygon
+    /// at build time. Mirrors Nominatim's placex.postcode chain
+    /// for rank-30 POI rows whose postcode comes via their
+    /// parent_place_id. `NO_DATA` if no postal boundary contains
+    /// this POI.
+    parent_postcode_id: u32,
 }
 
 const POI_FLAG_WIKIPEDIA: u8 = 0x01;
@@ -2110,8 +2117,10 @@ impl Index {
     // Mirrors Nominatim's stored `placex.postcode` chain, all of which is
     // resolved at build time by placex_triggers.sql:
     //   0. addr:postcode on the primary feature itself (token_get_postcode)
-    //   1. Street's calculated_postcode (inherited from containing
-    //      boundary=postal_code at build time, lives in way_postcodes.bin)
+    //   1. Primary feature's calculated_postcode (inherited from containing
+    //      boundary=postal_code at build time):
+    //        - street → way_postcodes.bin
+    //        - POI    → poi.parent_postcode_id (in-PoiRecord field)
     //   2. Nearest postcode centroid (get_nearest_postcode, 0.05°, country
     //      scoped). Mirrors the `get_nearest_postcode(...)` fallback in
     //      placex_triggers.sql rows 1052 + 1256.
@@ -2119,8 +2128,9 @@ impl Index {
     // No query-time PIP on postal boundaries — Nominatim's postcode field
     // comes straight from placex.postcode, which is populated via triggers
     // at index time. `postal_polygons.bin` is consumed at BUILD time only
-    // (for way_postcodes.bin inheritance); it is not consulted here.
-    fn resolve_postcode(&self, lat: f64, lng: f64, street: Option<&WayHeader>, addr: Option<&AddrPoint>, country_code: Option<[u8; 2]>) -> Option<&str> {
+    // (for way_postcodes.bin / PoiRecord.parent_postcode_id inheritance);
+    // it is not consulted here.
+    fn resolve_postcode(&self, lat: f64, lng: f64, street: Option<&WayHeader>, addr: Option<&AddrPoint>, poi: Option<&PoiRecord>, country_code: Option<[u8; 2]>) -> Option<&str> {
         // 0. Nearest addr_point's own postcode (from addr_postcodes.bin)
         // Matches Nominatim's token_get_postcode — the feature's own
         // addr:postcode tag is the highest-priority source.
@@ -2153,6 +2163,16 @@ impl Index {
             };
             if way_id < all_postcodes.len() && all_postcodes[way_id] != NO_DATA {
                 return Some(self.get_string(all_postcodes[way_id]));
+            }
+        }
+
+        // 1b. POI's calculated_postcode — build-time PIP into the smallest
+        // containing boundary=postal_code polygon. Stored on PoiRecord
+        // itself as `parent_postcode_id` so it rides the POI record's
+        // memory locality.
+        if let Some(p) = poi {
+            if p.parent_postcode_id != NO_DATA {
+                return Some(self.get_string(p.parent_postcode_id));
             }
         }
 
@@ -2415,13 +2435,13 @@ impl Index {
         }
 
         // Resolve postcode: mirror Nominatim's stored placex.postcode chain
-        // (Tier 0 addr / Tier 1 street.calculated_postcode / Tier 2 nearest
-        // centroid). Build-time postal-boundary inheritance feeds Tier 1;
-        // no query-time postal-boundary PIP. Tier 0 and Tier 1 are both
-        // primary-feature-driven — when the matched row is neither a street
-        // nor an addr_point (e.g. POI polygon "Constitution Square" at
-        // Mexico City Zócalo), both tiers are skipped and we fall through
-        // to nearest-centroid.
+        // (Tier 0 addr / Tier 1 primary feature's calculated_postcode /
+        // Tier 2 nearest centroid). Build-time postal-boundary inheritance
+        // feeds Tier 1 (way_postcodes.bin for streets, parent_postcode_id
+        // for POIs); no query-time postal-boundary PIP. Tier 0 and Tier 1
+        // are primary-feature-driven — only the winning feature's
+        // inherited postcode is consulted, so a POI win no longer leaks
+        // the street's inherited ZIP (Mexico City Zócalo 06060 leak).
         let poi_won_primary = closest_feature_dist < max_dist
             && effective_poi_dist <= addr_dist
             && effective_poi_dist <= interp_dist
@@ -2430,6 +2450,7 @@ impl Index {
             lat, lng,
             if poi_won_primary { None } else { street.as_ref().map(|(_, w)| *w) },
             if addr_won_primary { addr.as_ref().map(|(_, a)| *a) } else { None },
+            if poi_won_primary { poi_primary.as_ref().map(|(_, p)| *p) } else { None },
             admin.country_code,
         );
 

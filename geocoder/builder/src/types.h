@@ -526,6 +526,15 @@ struct PoiRecord {
     // rank-30 POI back to its rank-26 road. NO_DATA (0xFFFFFFFF)
     // if no named street was found in the POI's search radius.
     uint32_t parent_street_id = 0xFFFFFFFF;
+    // String offset of the POI's calculated postcode, inherited
+    // from the smallest containing boundary=postal_code polygon
+    // at build time. Mirrors Nominatim's placex.postcode chain
+    // for rank-30 POI rows whose postcode comes via their
+    // parent_place_id. Used by the server's resolve_postcode as
+    // a primary-feature tier when the POI wins selection.
+    // NO_DATA (0xFFFFFFFF) if the POI isn't inside any postal
+    // boundary.
+    uint32_t parent_postcode_id = 0xFFFFFFFF;
 };
 
 // Collected POI relation data for parallel polygon assembly

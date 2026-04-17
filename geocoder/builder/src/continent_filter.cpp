@@ -404,7 +404,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     for (const auto& iw : out.interp_ways) add_used(iw.street_id);
     for (const auto& ap : out.admin_polygons) add_used(ap.name_id);
     for (const auto& pn : out.place_nodes) add_used(pn.name_id);
-    for (const auto& pr : out.poi_records) { add_used(pr.name_id); add_used(pr.parent_street_id); }
+    for (const auto& pr : out.poi_records) { add_used(pr.name_id); add_used(pr.parent_street_id); add_used(pr.parent_postcode_id); }
     for (uint32_t off : out.way_postcode_ids) add_used(off);
     for (uint32_t off : out.addr_postcode_ids) add_used(off);
     for (const auto& [pc_id, _acc] : out.postcode_accum) add_used(pc_id);
@@ -439,6 +439,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     for (auto& pr : out.poi_records) {
         pr.name_id = remap_or_sentinel(pr.name_id);
         pr.parent_street_id = remap_or_sentinel(pr.parent_street_id);
+        pr.parent_postcode_id = remap_or_sentinel(pr.parent_postcode_id);
     }
     for (auto& off : out.way_postcode_ids) off = remap_or_sentinel(off);
     for (auto& off : out.addr_postcode_ids) off = remap_or_sentinel(off);
