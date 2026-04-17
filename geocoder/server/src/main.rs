@@ -2390,13 +2390,67 @@ impl Index {
         let place = self.find_places(lat, lng, current_boundary, municipality_boundary);
         let (addr, interp, street) = self.query_geo(lat, lng);
 
-        // Use the standard PIP-based admin walk. The chain-based walk
-        // (way_parents.bin + admin_parents.bin) is available but causes
-        // regressions for fine-grained levels where a street's centroid
-        // drifts across suburb/neighbourhood boundaries. A future
-        // improvement could use the chain for coarse levels (country →
-        // city) while keeping PIP for sub-city levels.
-        let admin = self.find_admin(lat, lng);
+        // Hybrid admin resolution: when the primary is a street with a
+        // pre-computed parent polygon, walk its admin_parents chain for
+        // coarse ranks (country → city) and use PIP for finer ranks
+        // (city_district / suburb / quarter / neighbourhood / block).
+        // Chain walk mirrors Nominatim's parent_place_id chain and
+        // filters out PIP false positives at coarse levels (e.g. a
+        // query inside an overlapping province that isn't in the
+        // street's addressline). Fine ranks stay on PIP because the
+        // street's centroid often sits in a different suburb polygon
+        // than the query point — chain walk would then pick the
+        // centroid-containing suburb rather than the query's suburb.
+        let admin_pip = self.find_admin(lat, lng);
+        let admin_chain = (|| -> Option<AdminResult<'_>> {
+            let wp = self.way_parents.as_ref()?;
+            let sw = self.street_ways.as_ref()?;
+            let (_, way, _) = street.as_ref()?;
+            let ways_base = sw.as_ptr() as *const WayHeader;
+            let way_ptr = *way as *const WayHeader;
+            let way_id = unsafe { way_ptr.offset_from(ways_base) as usize };
+            let all_parents: &[u32] = unsafe {
+                std::slice::from_raw_parts(wp.as_ptr() as *const u32, wp.len() / 4)
+            };
+            if way_id >= all_parents.len() { return None; }
+            let start = all_parents[way_id];
+            if start == NO_DATA { return None; }
+            Some(self.find_admin_from_chain(start, lat, lng))
+        })();
+        let admin = match admin_chain {
+            Some(chain) => AdminResult {
+                // Only country/state/region/province replace PIP from
+                // chain — at those ranks PIP false-positives are rare
+                // and chain walk rarely drifts vs query. For finer
+                // ranks (state_district / county / municipality / city
+                // and below) chain walk picks the centroid-containing
+                // admin, which regresses when the street's centroid
+                // sits in a different fine-grain polygon than the
+                // query (Buenos Aires Comuna 14 vs Comuna 1, Chicago
+                // 'West Chicago Township' leaking as municipality).
+                country: chain.country.or(admin_pip.country),
+                country_code: chain.country_code.or(admin_pip.country_code),
+                state: chain.state.or(admin_pip.state),
+                province: chain.province.or(admin_pip.province),
+                region: chain.region.or(admin_pip.region),
+                // Everything else: PIP is authoritative.
+                state_district: admin_pip.state_district,
+                county: admin_pip.county,
+                district: admin_pip.district,
+                municipality: admin_pip.municipality,
+                city: admin_pip.city,
+                town: admin_pip.town,
+                village: admin_pip.village,
+                hamlet: admin_pip.hamlet,
+                city_district: admin_pip.city_district,
+                borough: admin_pip.borough,
+                suburb: admin_pip.suburb,
+                quarter: admin_pip.quarter,
+                neighbourhood: admin_pip.neighbourhood,
+                city_block: admin_pip.city_block,
+            },
+            None => admin_pip,
+        };
 
         // Primary-feature selection: match Nominatim's reverse flow —
         // pick the closest rank-26+ feature (road OR addressable POI),
