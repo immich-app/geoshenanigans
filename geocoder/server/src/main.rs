@@ -2665,6 +2665,22 @@ impl Index {
             distance_m: (p.distance_m * 10.0).round() / 10.0,
         }).collect();
 
+        // Note on name-suffix normalisation (previously considered as
+        // Option 6): Nominatim does not normalise the localname it
+        // surfaces in the reverse response — `classtypes.get_label_tag`
+        // (v1/classtypes.py:18) emits the raw name verbatim and
+        // `icu_tokenizer.yaml` only touches the search-side token
+        // pipeline, not the display label. Cases we previously flagged
+        // as "suffix variants" ("Izumi 2-chome"↔"Izumi 2", "Colonia
+        // Centro"↔"Centro", "The Loop"↔"Loop", "Tverskoy"↔"Tverskoy
+        // District") were in fact pick-divergences between the admin
+        // relation and the place node — both carry distinct OSM names
+        // that each become the label verbatim. The admin-first priority
+        // flip covers every suffix case we had in the 25-city test,
+        // matching Nominatim's isguess-asc ordering. Adding a suffix
+        // stripper on our side would diverge from Nominatim without
+        // improving parity, so Option 6 is a no-op by design.
+        //
         // Merge admin + place results (admin authoritative, place as fallback).
         // No post-hoc dedup: Nominatim's rank-based address-row build lets
         // the same name appear in multiple fields (e.g. Paris city + Paris
