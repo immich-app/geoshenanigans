@@ -2107,10 +2107,19 @@ impl Index {
 
     // --- Postcode resolution ---
     //
-    // Three-tier postcode lookup matching Nominatim's chain:
-    //   1. way_postcodes[street.way_id] — street's computed postcode
-    //   2. Postal boundary PIP (postal_polygons + postal_vertices)
-    //   3. Nearest postcode centroid (Nominatim's get_nearest_postcode)
+    // Mirrors Nominatim's stored `placex.postcode` chain, all of which is
+    // resolved at build time by placex_triggers.sql:
+    //   0. addr:postcode on the primary feature itself (token_get_postcode)
+    //   1. Street's calculated_postcode (inherited from containing
+    //      boundary=postal_code at build time, lives in way_postcodes.bin)
+    //   2. Nearest postcode centroid (get_nearest_postcode, 0.05°, country
+    //      scoped). Mirrors the `get_nearest_postcode(...)` fallback in
+    //      placex_triggers.sql rows 1052 + 1256.
+    //
+    // No query-time PIP on postal boundaries — Nominatim's postcode field
+    // comes straight from placex.postcode, which is populated via triggers
+    // at index time. `postal_polygons.bin` is consumed at BUILD time only
+    // (for way_postcodes.bin inheritance); it is not consulted here.
     fn resolve_postcode(&self, lat: f64, lng: f64, street: Option<&WayHeader>, addr: Option<&AddrPoint>, country_code: Option<[u8; 2]>) -> Option<&str> {
         // 0. Nearest addr_point's own postcode (from addr_postcodes.bin)
         // Matches Nominatim's token_get_postcode — the feature's own
@@ -2147,31 +2156,7 @@ impl Index {
             }
         }
 
-        // 2. Postal boundary PIP (postal_polygons + postal_vertices)
-        if let (Some(ref pp), Some(ref pv)) = (&self.postal_polygons, &self.postal_vertices) {
-            let all_postal: &[AdminPolygon] = unsafe {
-                std::slice::from_raw_parts(pp.as_ptr() as *const AdminPolygon, pp.len() / std::mem::size_of::<AdminPolygon>())
-            };
-            let all_pverts: &[NodeCoord] = unsafe {
-                std::slice::from_raw_parts(pv.as_ptr() as *const NodeCoord, pv.len() / std::mem::size_of::<NodeCoord>())
-            };
-            let mut best_area = f32::MAX;
-            let mut best_postcode: Option<&str> = None;
-            for poly in all_postal {
-                if poly.area >= best_area { continue; }
-                let off = poly.vertex_offset as usize;
-                let cnt = poly.vertex_count as usize;
-                if off + cnt > all_pverts.len() { continue; }
-                let verts = &all_pverts[off..off+cnt];
-                if point_in_polygon(lat as f32, lng as f32, verts) {
-                    best_area = poly.area;
-                    best_postcode = Some(self.get_string(poly.name_id));
-                }
-            }
-            if best_postcode.is_some() { return best_postcode; }
-        }
-
-        // 3. Nearest postcode centroid (Nominatim's get_nearest_postcode).
+        // 2. Nearest postcode centroid (Nominatim's get_nearest_postcode).
         // Nominatim's get_nearest_postcode filters by country_code
         // (reverse.py `_find_nearest_postcode` joins location_postcode
         // on the query's resolved country). Without this filter, a
@@ -2429,20 +2414,14 @@ impl Index {
             }
         }
 
-        // Resolve postcode via the 4-tier chain matching Nominatim:
-        // 0. Nearest addr_point's own addr:postcode (from addr_postcodes.bin)
-        // 1. way_postcodes[street.way_id] — street's computed postcode
-        // 2. Postal boundary PIP (postal_polygons + postal_vertices)
-        // 3. Nearest postcode centroid (Nominatim's get_nearest_postcode)
-        // Tier 0 (addr's postcode) and Tier 1 (street's computed postcode)
-        // are both primary-feature-driven — Nominatim's postcode chain
-        // starts from the matched placex row's own `postcode` or from its
-        // parent `calculated_postcode`. When the matched row is neither a
-        // street nor an addr_point (e.g. POI polygon "Constitution Square"
-        // at Mexico City Zócalo), both of those tiers should be skipped
-        // and we fall through to postal-boundary PIP / nearest centroid —
-        // otherwise a street's inherited postal-boundary ZIP (06060) can
-        // win over the correct nearest-centroid ZIP (06000).
+        // Resolve postcode: mirror Nominatim's stored placex.postcode chain
+        // (Tier 0 addr / Tier 1 street.calculated_postcode / Tier 2 nearest
+        // centroid). Build-time postal-boundary inheritance feeds Tier 1;
+        // no query-time postal-boundary PIP. Tier 0 and Tier 1 are both
+        // primary-feature-driven — when the matched row is neither a street
+        // nor an addr_point (e.g. POI polygon "Constitution Square" at
+        // Mexico City Zócalo), both tiers are skipped and we fall through
+        // to nearest-centroid.
         let poi_won_primary = closest_feature_dist < max_dist
             && effective_poi_dist <= addr_dist
             && effective_poi_dist <= interp_dist
