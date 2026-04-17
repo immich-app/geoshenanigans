@@ -230,6 +230,8 @@ enum class PoiCategory : uint8_t {
     WINERY = 140, BREWERY = 141,
     // power
     POWER_PLANT = 150,
+    // office
+    GOVERNMENT = 160,
 
     UNKNOWN = 255
 };
@@ -255,7 +257,7 @@ inline uint8_t poi_get_default_tier(PoiCategory cat) {
         case PoiCategory::BEACH: case PoiCategory::WATERFALL: case PoiCategory::GEYSER:
         case PoiCategory::BAY: case PoiCategory::CAPE:
         case PoiCategory::LIGHTHOUSE: case PoiCategory::DAM: case PoiCategory::OBSERVATORY:
-        case PoiCategory::POWER_PLANT:
+        case PoiCategory::POWER_PLANT: case PoiCategory::GOVERNMENT:
             return 2;
         // tier 3 (everything)
         case PoiCategory::GALLERY: case PoiCategory::ARTWORK: case PoiCategory::ALPINE_HUT:
@@ -302,6 +304,7 @@ inline uint16_t poi_get_proximity_meters(PoiCategory cat) {
         case PoiCategory::LIBRARY: case PoiCategory::EMBASSY: case PoiCategory::CASINO:
         case PoiCategory::PLANETARIUM:
         case PoiCategory::CATHEDRAL: case PoiCategory::PALACE:
+        case PoiCategory::GOVERNMENT:
             return 100;
         // medium (200m)
         case PoiCategory::ALPINE_HUT: case PoiCategory::RUINS: case PoiCategory::ARCHAEOLOGICAL_SITE:
@@ -370,6 +373,7 @@ inline const char* poi_category_label(PoiCategory cat) {
         case PoiCategory::NATIONAL_PARK: return "national_park"; case PoiCategory::PROTECTED_AREA: return "protected_area";
         case PoiCategory::WINERY: return "winery"; case PoiCategory::BREWERY: return "brewery";
         case PoiCategory::POWER_PLANT: return "power_plant";
+        case PoiCategory::GOVERNMENT: return "government";
         default: return "unknown";
     }
 }
@@ -396,7 +400,7 @@ inline uint8_t category_base_importance(PoiCategory cat) {
         case PoiCategory::PLACE_OF_WORSHIP: case PoiCategory::HOSPITAL:
         case PoiCategory::THEATRE: case PoiCategory::CAVE_ENTRANCE:
         case PoiCategory::BRIDGE: case PoiCategory::TOWER:
-        case PoiCategory::PEAK:
+        case PoiCategory::PEAK: case PoiCategory::GOVERNMENT:
             return 10;
         case PoiCategory::LIBRARY: case PoiCategory::CINEMA:
         case PoiCategory::MEMORIAL: case PoiCategory::GALLERY:
@@ -437,6 +441,7 @@ inline uint16_t category_reference_distance(PoiCategory cat) {
         case PoiCategory::PLACE_OF_WORSHIP: case PoiCategory::THEATRE: case PoiCategory::CINEMA:
         case PoiCategory::LIBRARY: case PoiCategory::CASINO: case PoiCategory::PLANETARIUM:
         case PoiCategory::CATHEDRAL: case PoiCategory::PALACE:
+        case PoiCategory::GOVERNMENT:
             return 100;
         case PoiCategory::ALPINE_HUT: case PoiCategory::RUINS: case PoiCategory::ARCHAEOLOGICAL_SITE:
         case PoiCategory::FORT: case PoiCategory::FERRY_TERMINAL: case PoiCategory::MARINA:
@@ -487,7 +492,7 @@ inline uint16_t category_max_distance(PoiCategory cat) {
         case PoiCategory::FERRY_TERMINAL: case PoiCategory::MARINA:
         case PoiCategory::WINDMILL: case PoiCategory::WINERY: case PoiCategory::BREWERY:
         case PoiCategory::FORT: case PoiCategory::SPRING: case PoiCategory::HOT_SPRING:
-        case PoiCategory::BRIDGE: case PoiCategory::PIER:
+        case PoiCategory::BRIDGE: case PoiCategory::PIER: case PoiCategory::GOVERNMENT:
             return 500;
         // Medium
         case PoiCategory::VIEWPOINT: case PoiCategory::TOWER: case PoiCategory::DAM:
@@ -545,6 +550,15 @@ struct CollectedPoiRelation {
     uint8_t flags;
     uint32_t qid;
     std::string name;
+    // Relation-level addr tags. When set, the polygon-assembly pass
+    // also emits an AddrPoint with the polygon geometry so that the
+    // relation's addr:street / addr:housenumber / addr:postcode win
+    // as the primary feature's road/house_number/postcode fields.
+    // Mirrors Nominatim's rank-30 row creation for relations with
+    // addr:housenumber (e.g. White House R19761182).
+    std::string addr_housenumber;
+    std::string addr_street;
+    std::string addr_postcode;
     std::vector<std::pair<int64_t, std::string>> members; // (way_id, role)
 };
 

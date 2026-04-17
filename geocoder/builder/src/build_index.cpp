@@ -825,6 +825,7 @@ int main(int argc, char* argv[]) {
                         const char* r_natural  = rel.tag("natural");
                         const char* r_aeroway  = rel.tag("aeroway");
                         const char* r_place    = rel.tag("place");
+                        const char* r_office   = rel.tag("office");
 
                         PoiCategory poi_cat = PoiCategory::UNKNOWN;
                         // boundary
@@ -868,6 +869,10 @@ int main(int argc, char* argv[]) {
                             if (std::strcmp(r_place, "island") == 0 || std::strcmp(r_place, "islet") == 0)
                                 poi_cat = PoiCategory::ISLAND;
                         }
+                        // office
+                        if (poi_cat == PoiCategory::UNKNOWN && r_office) {
+                            if (std::strcmp(r_office, "government") == 0) poi_cat = PoiCategory::GOVERNMENT;
+                        }
 
                         if (poi_cat != PoiCategory::UNKNOWN) {
                             const char* poi_name = rel.tag("name:en");
@@ -890,6 +895,17 @@ int main(int argc, char* argv[]) {
                                     cpr.qid = static_cast<uint32_t>(std::strtoul(r_wd + 1, nullptr, 10));
                                 }
                                 cpr.name = poi_name;
+                                // Relation-level addr tags (see CollectedPoiRelation
+                                // header for rationale — rank-30 rows with
+                                // addr:housenumber become AddrPoints too).
+                                const char* r_hn = rel.tag("addr:housenumber");
+                                if (r_hn) {
+                                    cpr.addr_housenumber = r_hn;
+                                    const char* r_st = rel.tag("addr:street");
+                                    if (r_st) cpr.addr_street = r_st;
+                                    const char* r_pc = rel.tag("addr:postcode");
+                                    if (r_pc) cpr.addr_postcode = r_pc;
+                                }
 
                                 for (size_t mi = 0; mi < rel.members.size(); mi++) {
                                     if (rel.members[mi].type == 'w') {
@@ -962,6 +978,7 @@ int main(int argc, char* argv[]) {
                                    const char* t_man_made, const char* t_building,
                                    const char* t_craft, const char* t_power,
                                    const char* t_place, const char* t_waterway,
+                                   const char* t_office,
                                    const char* t_wikipedia, const char* t_wikidata)
                 -> std::optional<PoiClassification> {
                 PoiCategory cat = PoiCategory::UNKNOWN;
@@ -1082,6 +1099,10 @@ int main(int argc, char* argv[]) {
                 if (cat == PoiCategory::UNKNOWN && t_waterway) {
                     if (std::strcmp(t_waterway, "waterfall") == 0) cat = PoiCategory::WATERFALL;
                 }
+                // office
+                if (cat == PoiCategory::UNKNOWN && t_office) {
+                    if (std::strcmp(t_office, "government") == 0) cat = PoiCategory::GOVERNMENT;
+                }
 
                 if (cat == PoiCategory::UNKNOWN) return std::optional<PoiClassification>{};
 
@@ -1153,6 +1174,7 @@ int main(int argc, char* argv[]) {
                         const char* n_place = nullptr;
                         const char* n_waterway = nullptr;
                         const char* n_boundary = nullptr;
+                        const char* n_office = nullptr;
                         const char* n_name = nullptr;
                         const char* n_name_en = nullptr;
                         const char* n_ref = nullptr;
@@ -1184,6 +1206,9 @@ int main(int argc, char* argv[]) {
                                     if (k == "name") n_name = v;
                                     else if (k == "name:en") n_name_en = v;
                                     else if (k == "natural") n_natural = v;
+                                    break;
+                                case 'o':
+                                    if (k == "office") n_office = v;
                                     break;
                                 case 'p':
                                     if (k == "place") n_place = v;
@@ -1224,6 +1249,7 @@ int main(int argc, char* argv[]) {
                             auto cls = classify_poi(n_tourism, n_historic, n_boundary,
                                 n_amenity, n_leisure, n_natural, n_railway, n_aeroway,
                                 n_man_made, n_building, n_craft, n_power, n_place, n_waterway,
+                                n_office,
                                 n_wikipedia, n_wikidata);
                             if (cls) {
                                 PoiRecord pr{};
@@ -1513,6 +1539,7 @@ int main(int argc, char* argv[]) {
                     const char* t_power = nullptr;
                     const char* t_place = nullptr;
                     const char* t_waterway = nullptr;
+                    const char* t_office = nullptr;
                     const char* t_wikipedia = nullptr;
                     const char* t_wikidata = nullptr;
                     const char* t_ele = nullptr;
@@ -1554,6 +1581,9 @@ int main(int argc, char* argv[]) {
                                 else if (k == "name:en") t_name_en = v;
                                 else if (k == "natural") t_natural = v;
                                 break;
+                            case 'o':
+                                if (k == "office") t_office = v;
+                                break;
                             case 'p':
                                 if (k == "postal_code") t_postal_code = v;
                                 else if (k == "place") t_place = v;
@@ -1579,7 +1609,7 @@ int main(int argc, char* argv[]) {
                     // Check if this way has POI-qualifying tags
                     bool has_poi_tags = t_tourism || t_historic || t_amenity || t_leisure ||
                         t_natural || t_aeroway || t_railway || t_man_made || t_building ||
-                        t_craft || t_power || t_place || t_waterway ||
+                        t_craft || t_power || t_place || t_waterway || t_office ||
                         (t_boundary && (std::strcmp(t_boundary, "national_park") == 0 ||
                                         std::strcmp(t_boundary, "protected_area") == 0));
 
@@ -1714,6 +1744,7 @@ int main(int argc, char* argv[]) {
                         auto cls = classify_poi(t_tourism, t_historic, t_boundary,
                             t_amenity, t_leisure, t_natural, t_railway, t_aeroway,
                             t_man_made, t_building, t_craft, t_power, t_place, t_waterway,
+                            t_office,
                             t_wikipedia, t_wikidata);
                         if (cls) {
                             // Compute centroid
@@ -2282,6 +2313,11 @@ int main(int argc, char* argv[]) {
                             uint8_t tier;
                             uint8_t flags;
                             uint32_t qid;
+                            // Relation-level addr tags carried through for
+                            // AddrPoint emission alongside the POI record.
+                            std::string addr_housenumber;
+                            std::string addr_street;
+                            std::string addr_postcode;
                         };
 
                         std::vector<std::vector<PoiResult>> thread_poi_results(num_threads);
@@ -2345,6 +2381,9 @@ int main(int argc, char* argv[]) {
                                                 pr.tier = rel.tier;
                                                 pr.flags = rel.flags;
                                                 pr.qid = rel.qid;
+                                                pr.addr_housenumber = rel.addr_housenumber;
+                                                pr.addr_street = rel.addr_street;
+                                                pr.addr_postcode = rel.addr_postcode;
                                                 local_results.push_back(std::move(pr));
                                             }
                                         }
@@ -2386,6 +2425,34 @@ int main(int argc, char* argv[]) {
                                 poi_elevations.push_back(0); // relations don't have ele
                                 poi_qids.push_back(pr.qid);
                                 total_poi_rings++;
+
+                                // Relation-level AddrPoint. Mirrors Nominatim's rank-30
+                                // placex row for relations carrying addr:housenumber
+                                // (e.g. White House R19761182). Without this, even though
+                                // the POI wins as primary the road/house_number fields
+                                // would reflect the POI name, not the addr:street tag.
+                                if (!pr.addr_housenumber.empty()) {
+                                    uint64_t dummy = 0;
+                                    const char* bpc_ptr = pr.addr_postcode.empty() ? nullptr : pr.addr_postcode.c_str();
+                                    std::vector<NodeCoord> poly_verts;
+                                    poly_verts.reserve(pr.vertices.size());
+                                    for (const auto& [vlat, vlng] : pr.vertices) {
+                                        poly_verts.push_back({static_cast<float>(vlat), static_cast<float>(vlng)});
+                                    }
+                                    add_addr_point(data, clat, clng,
+                                                   pr.addr_housenumber.c_str(),
+                                                   pr.addr_street.c_str(),
+                                                   bpc_ptr, dummy,
+                                                   poly_verts.data(),
+                                                   static_cast<uint32_t>(poly_verts.size()));
+                                    if (!pr.addr_postcode.empty() && is_valid_postcode(pr.addr_postcode.c_str())) {
+                                        uint32_t pc_id = data.string_pool.intern(pr.addr_postcode.c_str());
+                                        auto& acc = data.postcode_accum[pc_id];
+                                        acc.sum_lat += clat;
+                                        acc.sum_lng += clng;
+                                        acc.count++;
+                                    }
+                                }
                             }
                             local_results.clear();
                         }
