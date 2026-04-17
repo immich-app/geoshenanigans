@@ -2716,10 +2716,39 @@ impl Index {
         // for Beijing "Donghuamen" vs "Donghuamen Subdistrict".
         // NYC still resolves as before because admin.suburb=Manhattan
         // and place.suburb=Manhattan carry the same name.
+        // City-state fallback: when the country itself is a single
+        // city (Singapore, Monaco, Vatican, San Marino, Nauru, Tuvalu,
+        // Liechtenstein), Nominatim surfaces the country name in the
+        // `city` field via a separate `place=city` OSM relation that
+        // covers the whole country (Singapore r17140517 is one such).
+        // Our indexer doesn't ingest place=city relations directly, so
+        // we replicate the observable behaviour by copying the country
+        // name into `city` when no other city candidate exists AND the
+        // country matches the known city-state set. Matches the raw
+        // nominatim API response for these countries rather than
+        // introducing a generic "use country as city" heuristic.
+        let city_state_city = match admin.country_code {
+            Some(cc) => {
+                let cc_upper = [cc[0].to_ascii_uppercase(), cc[1].to_ascii_uppercase()];
+                matches!(&cc_upper,
+                    b"SG" | b"MC" | b"VA" | b"SM" | b"NR" | b"TV" | b"LI")
+            }
+            None => false,
+        };
+        let fallback_city = if city_state_city
+            && admin.city.is_none()
+            && admin.town.is_none()
+            && admin.village.is_none()
+            && place.city.is_none()
+        {
+            admin.country
+        } else {
+            None
+        };
         let address = AddressDetails {
             house_number,
             road,
-            city: admin.city.or(place.city),
+            city: admin.city.or(place.city).or(fallback_city),
             town: admin.town.or(place.town),
             village: admin.village.or(place.village),
             hamlet: admin.hamlet.or(place.hamlet),
