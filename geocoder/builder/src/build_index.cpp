@@ -2923,9 +2923,53 @@ int main(int argc, char* argv[]) {
                         uint8_t best_al = 0;
                         float best_area = 1e18f;
                         uint32_t best_id = NO_DATA;
-                        // Also find containing postal boundary for postcode
-                        float best_postal_area = 1e18f;
-                        uint32_t best_postal_id = NO_DATA;
+                        // Nominatim's `getNearFeatures`
+                        // (lib-sql/functions/partition-functions.sql:42)
+                        // returns every postal polygon that intersects
+                        // the street's LineString, ordered by
+                        //   `min(ST_Distance(way_centroid, poly_geom))
+                        //    + 0.00001 * ST_Distance(way, poly_centroid)`.
+                        // The dominant term picks polygons containing
+                        // the way's centroid; when multiple polygons
+                        // overlap the way but only one contains its
+                        // centroid, that one wins. For a long street
+                        // crossing several postal polygons (Delhi's
+                        // Kartavya Path traverses 110001 / 110004 /
+                        // 110098), which polygon owns the centroid
+                        // depends on the street's shape — centroid PIP
+                        // alone can pick a polygon that covers only a
+                        // small fraction of the way. We tally a per-
+                        // polygon vertex-containment vote and pick the
+                        // polygon that covers the most way vertices;
+                        // ties break by smallest area. That matches the
+                        // spirit of `ST_Distance(way, poly_centroid)`
+                        // closer than pure centroid containment.
+                        struct PostalVote { uint32_t pid; uint32_t votes; float area; };
+                        std::vector<PostalVote> postal_votes;
+                        postal_votes.reserve(4);
+                        auto tally_postal = [&](uint32_t pid, float poly_area) {
+                            for (auto& v : postal_votes) {
+                                if (v.pid == pid) { v.votes++; return; }
+                            }
+                            postal_votes.push_back({pid, 1u, poly_area});
+                        };
+                        auto poly_contains = [&](uint32_t pid, float plat, float plng) -> bool {
+                            const auto& cand = data.admin_polygons[pid];
+                            uint32_t off = cand.vertex_offset;
+                            uint32_t cnt2 = cand.vertex_count;
+                            if (off + cnt2 > data.admin_vertices.size()) return false;
+                            const auto* verts = &data.admin_vertices[off];
+                            bool inside = false;
+                            for (uint32_t a = 0, b = cnt2 - 1; a < cnt2; b = a++) {
+                                if (((verts[a].lng > plng) != (verts[b].lng > plng)) &&
+                                    (plat < (verts[b].lat - verts[a].lat) * (plng - verts[a].lng) / (verts[b].lng - verts[a].lng) + verts[a].lat))
+                                    inside = !inside;
+                            }
+                            return inside;
+                        };
+                        // Parent-chain pick still uses centroid PIP —
+                        // admin hierarchy is fine-grained enough that
+                        // centroid containment gives a stable result.
                         auto check_cell = [&](uint64_t cid) {
                             auto it = data.cell_to_admin.find(cid);
                             if (it == data.cell_to_admin.end()) return;
@@ -2933,23 +2977,12 @@ int main(int argc, char* argv[]) {
                                 uint32_t pid = raw_id & 0x7FFFFFFF;
                                 if (pid >= data.admin_polygons.size()) continue;
                                 const auto& cand = data.admin_polygons[pid];
-                                bool dominated_parent = (cand.admin_level < best_al) ||
-                                    (cand.admin_level == best_al && cand.area >= best_area);
-                                bool dominated_postal = (cand.admin_level != 11) ||
-                                    (cand.area >= best_postal_area);
-                                if (dominated_parent && dominated_postal) continue;
-                                uint32_t off = cand.vertex_offset;
-                                uint32_t cnt2 = cand.vertex_count;
-                                if (off + cnt2 > data.admin_vertices.size()) continue;
-                                const auto* verts = &data.admin_vertices[off];
-                                bool inside = false;
-                                for (uint32_t a = 0, b = cnt2 - 1; a < cnt2; b = a++) {
-                                    if (((verts[a].lng > clng) != (verts[b].lng > clng)) &&
-                                        (clat < (verts[b].lat - verts[a].lat) * (clng - verts[a].lng) / (verts[b].lng - verts[a].lng) + verts[a].lat))
-                                        inside = !inside;
-                                }
-                                if (inside) {
-                                    if (cand.admin_level <= 10) {
+                                if (cand.admin_level > 11) continue;
+                                if (cand.admin_level <= 10) {
+                                    bool dominated = (cand.admin_level < best_al) ||
+                                        (cand.admin_level == best_al && cand.area >= best_area);
+                                    if (dominated) continue;
+                                    if (poly_contains(pid, clat, clng)) {
                                         if (cand.admin_level > best_al ||
                                             (cand.admin_level == best_al && cand.area < best_area)) {
                                             best_al = cand.admin_level;
@@ -2957,9 +2990,22 @@ int main(int argc, char* argv[]) {
                                             best_id = pid;
                                         }
                                     }
-                                    if (cand.admin_level == 11 && cand.area < best_postal_area) {
-                                        best_postal_area = cand.area;
-                                        best_postal_id = pid;
+                                } else if (cand.admin_level == 11) {
+                                    // Per-vertex vote: if any way vertex
+                                    // is inside this postal polygon, it
+                                    // gets credit proportional to how
+                                    // many vertices it covers. Capped at
+                                    // 16 vertices to bound work on huge
+                                    // ways (interpolations aren't in
+                                    // this loop since they're separate).
+                                    uint8_t samples = cnt < 16 ? cnt : 16;
+                                    uint8_t step = cnt > samples ? cnt / samples : 1;
+                                    for (uint8_t k = 0; k < cnt; k += step) {
+                                        const auto& nd = data.street_nodes[w.node_offset + k];
+                                        if (poly_contains(pid, nd.lat, nd.lng)) {
+                                            tally_postal(pid, cand.area);
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -2970,8 +3016,30 @@ int main(int argc, char* argv[]) {
                             data.way_parent_ids[i] = best_id;
                             way_linked.fetch_add(1);
                         }
-                        if (best_postal_id != NO_DATA) {
-                            data.way_postcode_ids[i] = data.admin_polygons[best_postal_id].name_id;
+                        // Re-run vertex vote across all candidate postal
+                        // polygons: for each polygon that contains at
+                        // least one vertex, count how many vertices it
+                        // covers.
+                        if (!postal_votes.empty()) {
+                            for (auto& pv : postal_votes) {
+                                pv.votes = 0;
+                                uint8_t samples = cnt < 16 ? cnt : 16;
+                                uint8_t step = cnt > samples ? cnt / samples : 1;
+                                for (uint8_t k = 0; k < cnt; k += step) {
+                                    const auto& nd = data.street_nodes[w.node_offset + k];
+                                    if (poly_contains(pv.pid, nd.lat, nd.lng)) pv.votes++;
+                                }
+                            }
+                            // Sort: highest votes first, tiebreak by
+                            // smaller area (more specific).
+                            std::sort(postal_votes.begin(), postal_votes.end(),
+                                [](const PostalVote& a, const PostalVote& b) {
+                                    if (a.votes != b.votes) return a.votes > b.votes;
+                                    return a.area < b.area;
+                                });
+                            if (postal_votes[0].votes > 0) {
+                                data.way_postcode_ids[i] = data.admin_polygons[postal_votes[0].pid].name_id;
+                            }
                         }
 
                         // Centroid fallback removed from way sweep — now
