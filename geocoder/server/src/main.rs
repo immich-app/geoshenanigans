@@ -1633,6 +1633,49 @@ impl Index {
                 }
             }
         };
+
+        // Nominatim's `place_node_fuzzy_area` (lib-sql/functions/utils.sql
+        // :279): after a place node (isguess=true) is accepted into the
+        // address chain, subsequent place nodes must sit inside the
+        // ST_Envelope of that node projected outward by a rank-based
+        // radius. Without this cascading gate, spurious sub-city place
+        // nodes (White House "The West End", SF "Hayes Valley" etc.)
+        // leak into the response even when Nominatim's chain rejects
+        // them. Radii mirror utils.sql:285-293:
+        //   rank_search ≤ 16 (city):   15000 m
+        //   rank_search ≤ 18 (town):    4000 m
+        //   rank_search ≤ 19 (village): 2000 m  (place=suburb default too)
+        //   rank_search ≤ 20 (hamlet):  1000 m  (neighbourhood / quarter)
+        //   default:                     500 m
+        // The envelope is a bbox over two geodesic points at 45° / 225°
+        // from the centre, so the half-side = radius/√2.
+        let fuzzy_half_side_m = |pt: u8| -> f64 {
+            let r = match pt {
+                0 => 15000.0,              // city
+                1 => 4000.0,               // town
+                2 | 3 => 2000.0,           // village / suburb (rank_search ≤ 19)
+                4 | 5 | 6 => 1000.0,       // hamlet / neighbourhood / quarter
+                _ => 500.0,
+            };
+            r / std::f64::consts::SQRT_2
+        };
+        // Currently-accepted place node centroid + fuzzy half-side
+        // (metres). Updated after each successful pick. `None` means
+        // no prior place node, so the next pick is unconstrained by
+        // fuzzy area (admin-boundary gate still applies).
+        let mut fuzzy_centre: Option<(f64, f64, f64)> = None; // lat, lng, half_side_m
+        let inside_fuzzy = |pn: &PlaceNode, fc: Option<(f64, f64, f64)>| -> bool {
+            match fc {
+                None => true,
+                Some((lat0, lng0, half_m)) => {
+                    let dlat_m = ((pn.lat as f64 - lat0) * 111320.0).abs();
+                    let cl = lat0.to_radians().cos();
+                    let dlng_m = ((pn.lng as f64 - lng0) * 111320.0 * cl).abs();
+                    dlat_m <= half_m && dlng_m <= half_m
+                }
+            }
+        };
+
         for pt in [0, 1, 2] {
             if let Some((dist_sq, pn)) = best[pt] {
                 let threshold = match pt {
@@ -1647,6 +1690,7 @@ impl Index {
                         1 => result.town = Some(name),
                         _ => result.village = Some(name),
                     }
+                    fuzzy_centre = Some((pn.lat as f64, pn.lng as f64, fuzzy_half_side_m(pt as u8)));
                     break;
                 }
             }
@@ -1657,24 +1701,32 @@ impl Index {
         // same rank — pick the closer one. Same for quarter(rank 22)
         // and neighbourhood(rank 22). This matches insert_addresslines
         // line 603: `location_isaddress := not address_havelevel[rank]`.
-        let suburb_valid = best[3].filter(|(d, pn)| *d <= max_rank20 && node_inside_boundary(pn));
-        let hamlet_valid = best[4].filter(|(d, pn)| *d <= max_rank20 && node_inside_boundary(pn));
+        let suburb_valid = best[3].filter(|(d, pn)| *d <= max_rank20 && node_inside_boundary(pn) && inside_fuzzy(pn, fuzzy_centre));
+        let hamlet_valid = best[4].filter(|(d, pn)| *d <= max_rank20 && node_inside_boundary(pn) && inside_fuzzy(pn, fuzzy_centre));
         // rank 20: closest of suburb/hamlet wins
         match (suburb_valid, hamlet_valid) {
             (Some((sd, sp)), Some((hd, hp))) => {
                 if sd <= hd {
                     result.suburb = Some(self.get_string(sp.name_id));
+                    fuzzy_centre = Some((sp.lat as f64, sp.lng as f64, fuzzy_half_side_m(3)));
                 } else {
                     result.hamlet = Some(self.get_string(hp.name_id));
+                    fuzzy_centre = Some((hp.lat as f64, hp.lng as f64, fuzzy_half_side_m(4)));
                 }
             }
-            (Some((_, pn)), None) => result.suburb = Some(self.get_string(pn.name_id)),
-            (None, Some((_, pn))) => result.hamlet = Some(self.get_string(pn.name_id)),
+            (Some((_, pn)), None) => {
+                result.suburb = Some(self.get_string(pn.name_id));
+                fuzzy_centre = Some((pn.lat as f64, pn.lng as f64, fuzzy_half_side_m(3)));
+            }
+            (None, Some((_, pn))) => {
+                result.hamlet = Some(self.get_string(pn.name_id));
+                fuzzy_centre = Some((pn.lat as f64, pn.lng as f64, fuzzy_half_side_m(4)));
+            }
             (None, None) => {}
         }
 
-        let quarter_valid = best[6].filter(|(d, pn)| *d <= max_rank20 && node_inside_boundary(pn));
-        let neigh_valid = best[5].filter(|(d, pn)| *d <= max_rank20 && node_inside_boundary(pn));
+        let quarter_valid = best[6].filter(|(d, pn)| *d <= max_rank20 && node_inside_boundary(pn) && inside_fuzzy(pn, fuzzy_centre));
+        let neigh_valid = best[5].filter(|(d, pn)| *d <= max_rank20 && node_inside_boundary(pn) && inside_fuzzy(pn, fuzzy_centre));
         // rank 22: closest of quarter/neighbourhood wins
         match (quarter_valid, neigh_valid) {
             (Some((qd, qp)), Some((nd, np))) => {
