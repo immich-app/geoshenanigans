@@ -24,6 +24,11 @@ const DEFAULT_ADMIN_CELL_LEVEL: u64 = 10;
 // primary feature for the reverse result.
 const DEFAULT_SEARCH_DISTANCE: f64 = 660.0;
 
+// Matches PoiCategory::UNNAMED_RANK30 in builder/src/types.h — the
+// generic rank-30 amenity/tourism/etc. node emitted for unnamed
+// features that Nominatim still treats as primary-feature candidates.
+const POI_CAT_UNNAMED_RANK30: u8 = 170;
+
 fn cell_id_at_level(lat: f64, lng: f64, level: u64) -> u64 {
     let ll = LatLng::from_degrees(lat, lng);
     CellID::from(ll).parent(level).0
@@ -1817,10 +1822,23 @@ impl Index {
                 let poi_id = (id & ID_MASK) as usize;
                 if poi_id >= all_pois.len() { return; }
                 let poi = &all_pois[poi_id];
-                // Must have a name (for display) and a linked parent
-                // street (for the `road` field). Without parent, we
-                // can't populate a road name if this POI wins.
-                if poi.name_id == NO_DATA || poi.parent_street_id == NO_DATA {
+                // Need a linked parent street (for the `road` field)
+                // when this POI wins — without it we have nothing to
+                // surface as the road name. Nominatim's `_find_closest_
+                // street_or_pois` (reverse.py:201-204) does NOT filter
+                // by name: it returns every rank-30 node with class not
+                // in ('place', 'building') that qualifies — including
+                // unnamed amenity=vending_machine / waste_basket / clock
+                // / toilets. We index those as UNNAMED_RANK30 and let
+                // them compete; when one wins, the POI's parent_street
+                // fills the road field (the POI has no name of its own).
+                if poi.parent_street_id == NO_DATA {
+                    return;
+                }
+                if poi.name_id == NO_DATA && poi.category != POI_CAT_UNNAMED_RANK30 {
+                    // Named categories without a name are truly nameless
+                    // (e.g. unnamed MUSEUM / MONUMENT) — those carry no
+                    // useful display data, so keep skipping them.
                     return;
                 }
                 // Nominatim's _find_closest_street_or_pois filter

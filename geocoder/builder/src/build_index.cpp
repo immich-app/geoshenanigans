@@ -1104,6 +1104,22 @@ int main(int argc, char* argv[]) {
                     if (std::strcmp(t_office, "government") == 0) cat = PoiCategory::GOVERNMENT;
                 }
 
+                // Fallback: any rank-30 addressable feature that didn't
+                // hit a specific PoiCategory above. Mirrors Nominatim's
+                // reverse.py DataLayer.POI filter (class_ NOT IN
+                // ('place', 'building'), rank_search==30) which drives
+                // the Moscow vending_machine / SF waste_basket / Sydney
+                // toilets / Paris clock primary selections. UNNAMED_RANK30
+                // entries carry no name_id but still have a parent_street
+                // that surfaces as `road` when they win primary contest.
+                if (cat == PoiCategory::UNKNOWN) {
+                    if (t_amenity || t_tourism || t_historic || t_leisure ||
+                        t_man_made || t_craft || t_office || t_waterway ||
+                        t_natural || t_aeroway || t_railway || t_power) {
+                        cat = PoiCategory::UNNAMED_RANK30;
+                    }
+                }
+
                 if (cat == PoiCategory::UNKNOWN) return std::optional<PoiClassification>{};
 
                 uint8_t tier = poi_get_default_tier(cat);
@@ -1244,14 +1260,25 @@ int main(int argc, char* argv[]) {
                         // Prefer name:en when present (user-facing English-only mode)
                         const char* best_name = (n_name_en && n_name_en[0]) ? n_name_en : n_name;
 
-                        // POI node extraction
-                        if (best_name) {
+                        // POI node extraction. Nominatim's rank-30 POI
+                        // set (reverse.py _find_closest_street_or_pois)
+                        // includes unnamed amenity/shop/tourism/etc.
+                        // nodes — we emit those as UNNAMED_RANK30 so
+                        // they compete for the primary contest.
+                        {
                             auto cls = classify_poi(n_tourism, n_historic, n_boundary,
                                 n_amenity, n_leisure, n_natural, n_railway, n_aeroway,
                                 n_man_made, n_building, n_craft, n_power, n_place, n_waterway,
                                 n_office,
                                 n_wikipedia, n_wikidata);
-                            if (cls) {
+                            // Unnamed specific-category POIs are still
+                            // noise in the display path (e.g. unnamed
+                            // ATTRACTION / MONUMENT — no useful road to
+                            // surface). Only index unnamed rows when the
+                            // fallback UNNAMED_RANK30 is what hit, since
+                            // those are exactly the Nominatim-style
+                            // "unclassified rank-30" contenders.
+                            if (cls && (best_name || cls->category == PoiCategory::UNNAMED_RANK30)) {
                                 PoiRecord pr{};
                                 pr.lat = static_cast<float>(lat);
                                 pr.lng = static_cast<float>(lng);
@@ -1262,7 +1289,7 @@ int main(int argc, char* argv[]) {
                                 pr.tier = cls->tier;
                                 pr.flags = cls->flags;
                                 tl_node_data->poi_records.push_back(pr);
-                                tl_node_data->poi_names.push_back(best_name);
+                                tl_node_data->poi_names.push_back(best_name ? std::string(best_name) : std::string());
                                 float ele_val = 0;
                                 if (n_ele) { char* end; ele_val = std::strtof(n_ele, &end); if (end == n_ele) ele_val = 0; }
                                 tl_node_data->poi_elevations.push_back(ele_val);
@@ -1379,7 +1406,13 @@ int main(int argc, char* argv[]) {
                 for (auto& local : ntld) {
                     for (size_t j = 0; j < local.poi_records.size(); j++) {
                         auto pr = local.poi_records[j];
-                        pr.name_id = data.string_pool.intern(local.poi_names[j]);
+                        // Empty name → NO_DATA sentinel. UNNAMED_RANK30
+                        // POIs come in nameless; the server reads name_id
+                        // == NO_DATA to surface parent_street as `road`
+                        // instead of the POI's (missing) own name.
+                        pr.name_id = local.poi_names[j].empty()
+                            ? NO_DATA
+                            : data.string_pool.intern(local.poi_names[j]);
                         data.poi_records.push_back(pr);
                     }
                     poi_elevations.insert(poi_elevations.end(),
