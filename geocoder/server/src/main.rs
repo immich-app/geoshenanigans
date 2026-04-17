@@ -742,9 +742,10 @@ impl Index {
         serde_json::json!({
             "addr": addr.map(|(d, p)| serde_json::json!({
                 "dist_m": to_m(d),
-                "house_number": self.get_string(p.housenumber_id),
-                "street": self.get_string(p.street_id),
+                "house_number": if p.housenumber_id != NO_DATA { self.get_string(p.housenumber_id) } else { "" },
+                "street": if p.street_id != NO_DATA { self.get_string(p.street_id) } else { "" },
                 "lat": p.lat, "lng": p.lng,
+                "vertex_count": p.vertex_count,
             })),
             "street": street.map(|(d, w)| serde_json::json!({
                 "dist_m": to_m(d),
@@ -759,6 +760,7 @@ impl Index {
                 "dist_m": to_m(d),
                 "name": self.get_string(p.name_id),
                 "parent_street": if p.parent_street_id != NO_DATA { self.get_string(p.parent_street_id) } else { "" },
+                "vertex_count": p.vertex_count,
             })),
         })
     }
@@ -2345,7 +2347,14 @@ impl Index {
         let mut effective_poi_dist = poi_dist;
         if poi_dist == 0.0 {
             if let (Some((_, addr_pt)), Some((_, poi))) = (addr.as_ref(), poi_primary.as_ref()) {
-                if addr_pt.vertex_count == 0 && poi.vertex_count > 0
+                // Case 1: addr polygon also contains the query (v9 building
+                // addr_points with footprint geometry). Both records describe
+                // the same underlying OSM way — Nominatim has a single placex
+                // row carrying name + addr:* tags, so the addr-side fields
+                // (housenumber, street) drive the result.
+                if addr_dist == 0.0 {
+                    effective_poi_dist = f64::MAX;
+                } else if addr_pt.vertex_count == 0 && poi.vertex_count > 0
                     && poi.vertex_offset != NO_DATA {
                     let all_poi_vertices: &[NodeCoord] = match &self.poi_vertices {
                         Some(v) => unsafe {
@@ -2369,6 +2378,7 @@ impl Index {
         }
 
         let closest_feature_dist = addr_dist.min(interp_dist).min(street_dist).min(effective_poi_dist);
+        let mut addr_won_primary = false;
         if closest_feature_dist < max_dist {
             // Whichever feature class has the smallest distance wins.
             if effective_poi_dist <= addr_dist && effective_poi_dist <= interp_dist && effective_poi_dist <= street_dist {
@@ -2391,6 +2401,7 @@ impl Index {
                 }
             } else if addr_dist <= interp_dist && addr_dist <= street_dist && addr_dist <= effective_poi_dist {
                 // Address is closest — use it with its housenumber.
+                addr_won_primary = true;
                 let (_, point) = addr.unwrap();
                 house_number = Some(Cow::Borrowed(self.get_string(point.housenumber_id)));
                 // street_id == NO_DATA means the builder's parent-
@@ -2423,10 +2434,23 @@ impl Index {
         // 1. way_postcodes[street.way_id] — street's computed postcode
         // 2. Postal boundary PIP (postal_polygons + postal_vertices)
         // 3. Nearest postcode centroid (Nominatim's get_nearest_postcode)
+        // Tier 0 (addr's postcode) and Tier 1 (street's computed postcode)
+        // are both primary-feature-driven — Nominatim's postcode chain
+        // starts from the matched placex row's own `postcode` or from its
+        // parent `calculated_postcode`. When the matched row is neither a
+        // street nor an addr_point (e.g. POI polygon "Constitution Square"
+        // at Mexico City Zócalo), both of those tiers should be skipped
+        // and we fall through to postal-boundary PIP / nearest centroid —
+        // otherwise a street's inherited postal-boundary ZIP (06060) can
+        // win over the correct nearest-centroid ZIP (06000).
+        let poi_won_primary = closest_feature_dist < max_dist
+            && effective_poi_dist <= addr_dist
+            && effective_poi_dist <= interp_dist
+            && effective_poi_dist <= street_dist;
         let resolved_postcode = self.resolve_postcode(
             lat, lng,
-            street.as_ref().map(|(_, w)| *w),
-            addr.as_ref().map(|(_, a)| *a),
+            if poi_won_primary { None } else { street.as_ref().map(|(_, w)| *w) },
+            if addr_won_primary { addr.as_ref().map(|(_, a)| *a) } else { None },
             admin.country_code,
         );
 
