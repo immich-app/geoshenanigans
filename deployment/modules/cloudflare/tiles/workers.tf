@@ -2,6 +2,16 @@ data "cloudflare_zone" "immich_cloud" {
   name = "immich.cloud"
 }
 
+resource "random_password" "d1_proxy_token" {
+  length  = 64
+  special = false
+}
+
+output "d1_proxy_token" {
+  value     = random_password.d1_proxy_token.result
+  sensitive = true
+}
+
 resource "cloudflare_workers_script" "tiles_d1_proxy" {
   account_id = var.cloudflare_account_id
   name       = "tiles-d1-proxy"
@@ -11,6 +21,11 @@ resource "cloudflare_workers_script" "tiles_d1_proxy" {
   plain_text_binding {
     name = "WORKER_TYPE"
     text = "D1_PROXY"
+  }
+
+  secret_text_binding {
+    name = "D1_PROXY_TOKEN"
+    text = random_password.d1_proxy_token.result
   }
 
   d1_database_binding {
