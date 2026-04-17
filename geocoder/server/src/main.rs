@@ -530,7 +530,7 @@ impl Index {
     // --- Geo lookup (streets, addresses, interpolation from merged index) ---
 
     fn query_geo(&self, lat: f64, lng: f64)
-        -> (Option<(f64, &AddrPoint)>, Option<(f64, &str, u32)>, Option<(f64, &WayHeader)>)
+        -> (Option<(f64, &AddrPoint)>, Option<(f64, &str, u32)>, Option<(f64, &WayHeader, u32)>)
     {
         let geo_cells = match &self.geo_cells {
             Some(gc) => gc,
@@ -605,6 +605,7 @@ impl Index {
         let mut best_addr: Option<&AddrPoint> = None;
         let mut best_street_dist = f64::MAX;
         let mut best_street: Option<&WayHeader> = None;
+        let mut best_street_idx: u32 = NO_DATA;
         let mut best_interp_dist = f64::MAX;
         let mut best_interp: Option<&InterpWay> = None;
         let mut best_interp_t: f64 = 0.0;
@@ -663,6 +664,7 @@ impl Index {
                     if dist < best_street_dist {
                         best_street_dist = dist;
                         best_street = Some(way);
+                        best_street_idx = id;
                     }
                 }
             });
@@ -716,7 +718,7 @@ impl Index {
         }
 
         let addr_result = best_addr.map(|p| (best_addr_dist, p));
-        let street_result = best_street.map(|w| (best_street_dist, w));
+        let street_result = best_street.map(|w| (best_street_dist, w, best_street_idx));
         let interp_result = best_interp.map(|iw| {
             let start = iw.start_number as f64;
             let end = iw.end_number as f64;
@@ -741,6 +743,64 @@ impl Index {
         (addr_result, interp_result, street_result)
     }
 
+    // Nominatim's `_find_housenumber_for_street` (reverse.py:231):
+    // given a street that has just won primary selection, look up the
+    // nearest AddrPoint whose parent_way_id matches that street's
+    // index, gated by `ST_DWithin(query, 0.001)` (~100m). Returns the
+    // addr_point whose housenumber should refine the result.
+    fn find_addr_on_way(&self, lat: f64, lng: f64, parent_way_idx: u32, max_dist_sq: f64)
+        -> Option<&AddrPoint>
+    {
+        let geo_cells = self.geo_cells.as_ref()?;
+        let addr_entries = self.addr_entries.as_ref()?;
+        let all_points: &[AddrPoint] = self.addr_points.as_ref().map(|m| unsafe {
+            std::slice::from_raw_parts(
+                m.as_ptr() as *const AddrPoint,
+                m.len() / std::mem::size_of::<AddrPoint>(),
+            )
+        })?;
+        let all_addr_vertices: &[NodeCoord] = self.addr_vertices.as_ref()
+            .map(|m| unsafe {
+                std::slice::from_raw_parts(
+                    m.as_ptr() as *const NodeCoord,
+                    m.len() / std::mem::size_of::<NodeCoord>(),
+                )
+            })
+            .unwrap_or(&[]);
+
+        let cell = cell_id_at_level(lat, lng, self.street_cell_level);
+        let neighbors = cell_neighbors_at_level(cell, self.street_cell_level);
+        let cos_lat = lat.to_radians().cos();
+
+        let mut best_dist = max_dist_sq;
+        let mut best: Option<&AddrPoint> = None;
+        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+            let offsets = Self::lookup_geo_cell(geo_cells, c);
+            Self::for_each_entry(addr_entries, offsets.addr, |id| {
+                let idx = id as usize;
+                if idx >= all_points.len() { return; }
+                let point = &all_points[idx];
+                if point.parent_way_id != parent_way_idx { return; }
+                let dlat = (point.lat as f64 - lat).to_radians();
+                let dlng = (point.lng as f64 - lng).to_radians();
+                let mut dist = dist_sq(dlat, dlng, cos_lat);
+                if point.vertex_count > 0 && point.vertex_offset != NO_DATA {
+                    let off = point.vertex_offset as usize;
+                    let cnt = point.vertex_count as usize;
+                    if off + cnt <= all_addr_vertices.len() {
+                        let verts = &all_addr_vertices[off..off + cnt];
+                        dist = polygon_distance_sq(lat, lng, verts, cos_lat);
+                    }
+                }
+                if dist < best_dist {
+                    best_dist = dist;
+                    best = Some(point);
+                }
+            });
+        }
+        best
+    }
+
     // Debug helper — returns primary feature distances + names.
     fn debug_primary(&self, lat: f64, lng: f64) -> serde_json::Value {
         let (addr, interp, street) = self.query_geo(lat, lng);
@@ -754,7 +814,7 @@ impl Index {
                 "lat": p.lat, "lng": p.lng,
                 "vertex_count": p.vertex_count,
             })),
-            "street": street.map(|(d, w)| serde_json::json!({
+            "street": street.map(|(d, w, _idx)| serde_json::json!({
                 "dist_m": to_m(d),
                 "name": self.get_string(w.name_id),
             })),
@@ -2333,7 +2393,7 @@ impl Index {
         // refinement below.
         let interp_dist = f64::MAX;
         let _ = interp.as_ref();
-        let street_dist = street.as_ref().map(|(d, _)| *d).unwrap_or(f64::MAX);
+        let street_dist = street.as_ref().map(|(d, _, _)| *d).unwrap_or(f64::MAX);
         let poi_dist = poi_primary.as_ref().map(|(d, _)| *d).unwrap_or(f64::MAX);
 
         // Nominatim's reverse.py lines 219-235 and 355-360: when the
@@ -2415,7 +2475,7 @@ impl Index {
                 // instead of the missing addr:street.
                 if point.street_id != NO_DATA {
                     road = Some(self.get_string(point.street_id));
-                } else if let Some((_, way)) = street {
+                } else if let Some((_, way, _)) = street {
                     road = Some(self.get_string(way.name_id));
                 }
             } else if interp_dist <= addr_dist && interp_dist <= street_dist && interp_dist <= effective_poi_dist {
@@ -2424,13 +2484,29 @@ impl Index {
                 house_number = Some(Cow::Owned(number.to_string()));
                 road = Some(street_name);
             } else {
-                // Street is closest — use its name, no house number.
-                let (_, way) = street.unwrap();
+                // Street is closest — use its name, then refine with a
+                // housenumber if an AddrPoint whose parent_way_id matches
+                // this street sits within ~100m of the query. Mirrors
+                // Nominatim's `_find_housenumber_for_street` (reverse.py
+                // :231): after the closest street wins, a second query
+                // looks for the nearest rank-30 address point whose
+                // parent_place_id matches the street's place_id, gated
+                // by ST_DWithin(query, 0.001) (~100m).
+                let (_, way, way_idx) = street.unwrap();
                 road = if way.name_id != NO_DATA {
                     Some(self.get_string(way.name_id))
                 } else {
                     None
                 };
+                let refine_max_sq = {
+                    let r = 100.0_f64 / 6_371_000.0;
+                    r * r
+                };
+                if let Some(addr_pt) = self.find_addr_on_way(lat, lng, way_idx, refine_max_sq) {
+                    if addr_pt.housenumber_id != NO_DATA {
+                        house_number = Some(Cow::Borrowed(self.get_string(addr_pt.housenumber_id)));
+                    }
+                }
             }
         }
 
@@ -2448,7 +2524,7 @@ impl Index {
             && effective_poi_dist <= street_dist;
         let resolved_postcode = self.resolve_postcode(
             lat, lng,
-            if poi_won_primary { None } else { street.as_ref().map(|(_, w)| *w) },
+            if poi_won_primary { None } else { street.as_ref().map(|(_, w, _)| *w) },
             if addr_won_primary { addr.as_ref().map(|(_, a)| *a) } else { None },
             if poi_won_primary { poi_primary.as_ref().map(|(_, p)| *p) } else { None },
             admin.country_code,
