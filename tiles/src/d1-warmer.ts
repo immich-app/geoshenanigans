@@ -8,29 +8,29 @@ import { DirectoryString } from './pmtiles.service';
 import { Compression, Header, JsonResponse, Metadata } from './pmtiles/types';
 import { bytesToHeader, decompress, deserializeIndex, tileJSON } from './pmtiles/utils';
 
-/** TODO: Remaining tasks for tile data splitting
-   - Should setup D1 to create a new database for each deployment, requires some terraform magic?
-   - Automate warming process in github actions
-   - Need to handle generating styles still and uploading those to R2
-  **/
-
-const db = 'GLOBAL';
-
 type Chunk = { chunkId: number; startByte: number; endByte: number };
 
 const HEADER_SIZE_BYTES = 127;
 const MAX_CHUNK_FILE_SIZE_BYTES = 1_000_000;
-const BUCKETS = [{ key: 'tiles-geo' }];
 
-const { TIGRIS_KEY_ID, TIGRIS_ACCESS_KEY, TIGRIS_ENDPOINT, CLOUDFLARE_ACCOUNT_ID, DEPLOYMENT_KEY, PMTILES_FILE_PATH } =
-  process.env;
+const {
+  TIGRIS_KEY_ID,
+  TIGRIS_ACCESS_KEY,
+  TIGRIS_ENDPOINT,
+  TIGRIS_BUCKET = 'tiles-geo',
+  DEPLOYMENT_KEY,
+  PMTILES_FILE_PATH,
+  D1_PROXY_URL = 'https://tiles-d1-proxy.immich.cloud',
+  D1_PROXY_TOKEN,
+  DB_NAME = 'GLOBAL',
+} = process.env;
 if (
   !TIGRIS_KEY_ID ||
   !TIGRIS_ACCESS_KEY ||
   !TIGRIS_ENDPOINT ||
-  !CLOUDFLARE_ACCOUNT_ID ||
   !DEPLOYMENT_KEY ||
-  !PMTILES_FILE_PATH
+  !PMTILES_FILE_PATH ||
+  !D1_PROXY_TOKEN
 ) {
   throw new Error('Missing environment variables');
 }
@@ -52,8 +52,8 @@ const tigrisClient = new S3Client({
 
 const d1Promises: Promise<unknown>[] = [];
 const d1Limit = pLimit(25);
-const r2Promises: { [key: string]: Promise<unknown>[] } = {};
-const r2Limits: { [key: string]: LimitFunction } = {};
+const tigrisPromises: Promise<unknown>[] = [];
+const tigrisLimit: LimitFunction = pLimit(250);
 
 const getRangeAsStream = (range: { length: number; offset: number }): ReadableStream => {
   const fileStream = createFileReadStream(PMTILES_FILE_PATH, {
@@ -102,25 +102,28 @@ const getEntriesFromRange = async (offset: number, length: number, compression: 
   return entries;
 };
 
-const runD1Query = async (sql: string) => {
-  const body = JSON.stringify({ sql, db });
-  //TODO: Handle failures due to previously failed request that still wrote to the database (primary key conflict)
+const runD1Query = async (sql: string, opts: { ignoreErrorSubstrings?: string[] } = {}) => {
+  const body = JSON.stringify({ sql, db: DB_NAME });
   const fetchRetry = fetchBuilder(fetch);
-  const response = await fetchRetry(`https://tiles-d1-proxy.immich.cloud`, {
+  const response = await fetchRetry(D1_PROXY_URL, {
     headers: {
-      Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}`,
-      ContentType: 'application/json',
+      Authorization: `Bearer ${D1_PROXY_TOKEN}`,
+      'Content-Type': 'application/json',
     },
     body,
     method: 'POST',
-    retryDelay: (attempt, error, response) => {
-      console.log('Server error, retrying query', attempt, error, response);
-      return 1000 * Math.pow(1.5, attempt); // Exponential backoff
-    },
+    retryDelay: (attempt) => 1000 * Math.pow(1.5, attempt),
     retries: 10,
     retryOn: (attempt, error, response) => {
-      if (!response?.ok && attempt < 10) {
-        console.log('Retrying query', attempt, error, response);
+      if (attempt >= 10) {
+        return false;
+      }
+      if (error) {
+        console.log('Network error, retrying query', attempt, error);
+        return true;
+      }
+      if (response && response.status >= 500) {
+        console.log('Server error, retrying query', attempt, response.status);
         return true;
       }
       return false;
@@ -134,20 +137,27 @@ const runD1Query = async (sql: string) => {
 
   const responseBody = (await response.json()) as {
     success: boolean;
-    errors?: any[];
-    meta: { duration: number };
+    errors?: { message: string }[];
+    meta?: { duration: number };
     results: [];
   };
 
   if (responseBody.errors && responseBody.errors.length > 0) {
+    const ignore = opts.ignoreErrorSubstrings ?? [];
+    const allIgnored = responseBody.errors.every((e) =>
+      ignore.some((substr) => e.message?.toLowerCase().includes(substr.toLowerCase())),
+    );
+    if (allIgnored) {
+      console.log('Ignoring expected error on retry:', JSON.stringify(responseBody.errors));
+      return { success: true, errors: [], results: [] as unknown as [] };
+    }
     throw Error('Query failed with errors ' + JSON.stringify(responseBody.errors));
   }
 
-  if (!responseBody!.success) {
+  if (!responseBody.success) {
     throw Error('Query failed with success false');
   }
 
-  // console.log(`Query success in ${response.meta.duration}ms`)
   return responseBody;
 };
 
@@ -158,70 +168,74 @@ const prepareDatabase = async (json: JsonResponse) => {
       startTileId INTEGER NOT NULL PRIMARY KEY,
       entry TEXT NOT NULL
     ) STRICT;`);
-  await runD1Query(`INSERT INTO tmp (startTileId, entry) VALUES (-1, '${JSON.stringify(json)}');`);
+  await runD1Query(`INSERT OR REPLACE INTO tmp (startTileId, entry) VALUES (-1, '${JSON.stringify(json)}');`);
+};
+
+const listTables = async (): Promise<Set<string>> => {
+  const tables = await runD1Query(`PRAGMA table_list`);
+  return new Set(tables.results.map((t: { name: string }) => t.name));
 };
 
 const finalizeDatabase = async () => {
   const tableName = `cache_entries_${DEPLOYMENT_KEY}`;
-  const tables = await runD1Query(`PRAGMA table_list`);
-  const tableExists = tables.results.some((table: { name: string }) => table.name === tableName);
-  if (tableExists) {
-    await runD1Query(`ALTER TABLE ${tableName} RENAME TO ${tableName}_old;`);
+  const oldTableName = `${tableName}_old`;
+  const initial = await listTables();
+  const previousCacheExisted = initial.has(tableName);
+
+  if (previousCacheExisted) {
+    await runD1Query(`ALTER TABLE ${tableName} RENAME TO ${oldTableName};`, {
+      ignoreErrorSubstrings: ['no such table'],
+    });
   }
 
-  await runD1Query(`ALTER TABLE tmp RENAME TO ${tableName};`);
+  await runD1Query(`ALTER TABLE tmp RENAME TO ${tableName};`, {
+    ignoreErrorSubstrings: ['no such table', 'already exists'],
+  });
   console.log('Tables switched');
 
-  if (tableExists) {
+  if (previousCacheExisted) {
     console.log('Waiting 10 seconds before dropping old table');
     await setTimeout(10000);
     console.log('Dropping old table');
-    await runD1Query(`DROP TABLE ${tableName}_old;`);
+    await runD1Query(`DROP TABLE IF EXISTS ${oldTableName};`);
     console.log('Dropped old table');
   }
 };
 
-const uploadToS3 = async (chunk: Chunk, header: Header, chunkMap: object) => {
-  for (const bucket of BUCKETS) {
-    const s3Call = async () => {
-      const bytes = getRangeAsStream({
-        offset: header.tileDataOffset + chunk.startByte,
-        length: chunk.endByte - chunk.startByte,
+const uploadToTigris = async (chunk: Chunk, header: Header) => {
+  const tigrisCall = async () => {
+    const bytes = getRangeAsStream({
+      offset: header.tileDataOffset + chunk.startByte,
+      length: chunk.endByte - chunk.startByte,
+    });
+
+    try {
+      const parallelUploads = new Upload({
+        client: tigrisClient,
+        params: {
+          Bucket: TIGRIS_BUCKET,
+          Key: `${DEPLOYMENT_KEY}/chunk_${chunk.chunkId}.pmtiles`,
+          Body: bytes,
+        },
+        queueSize: 1,
+        partSize: 1024 * 1024 * 5,
       });
 
-      try {
-        const parallelUploads = new Upload({
-          client: tigrisClient,
-          params: {
-            Bucket: bucket.key,
-            Key: `${DEPLOYMENT_KEY}/chunk_${chunk.chunkId}.pmtiles`,
-            Body: bytes,
-          },
-          queueSize: 1,
-          partSize: 1024 * 1024 * 5,
-        });
+      await parallelUploads.done();
 
-        await parallelUploads.done();
-
-        if (chunk.chunkId % 100 === 0) {
-          console.log(`S3 Progress (${bucket.key}): ${chunk.chunkId}/${Object.keys(chunkMap).length}`);
-        }
-      } catch (e) {
-        console.error(`Failed to upload chunk ${chunk.chunkId} to S3`, e);
-        throw e;
+      if (chunk.chunkId % 100 === 0) {
+        console.log(`Tigris progress: uploaded chunk ${chunk.chunkId}`);
       }
-    };
+    } catch (e) {
+      console.error(`Failed to upload chunk ${chunk.chunkId} to Tigris`, e);
+      throw e;
+    }
+  };
 
-    r2Promises[bucket.key].push(r2Limits[bucket.key](s3Call));
-  }
+  tigrisPromises.push(tigrisLimit(tigrisCall));
 };
 
 const handler = async () => {
-  for (const bucket of BUCKETS) {
-    r2Limits[bucket.key] = pLimit(250);
-    r2Promises[bucket.key] = [];
-  }
-
   const headerBytes = await getRange({ offset: 0, length: HEADER_SIZE_BYTES });
   if (new DataView(headerBytes).getUint16(0, true) !== 0x4d50) {
     throw new Error('Wrong magic number for PMTiles archive');
@@ -279,7 +293,7 @@ const handler = async () => {
         }
 
         if (currentChunk) {
-          await uploadToS3(currentChunk, header, chunkMap);
+          await uploadToTigris(currentChunk, header);
         }
 
         currentChunk = chunkMap[chunkId];
@@ -294,7 +308,7 @@ const handler = async () => {
       }
     }
 
-    await uploadToS3(currentChunk!, header, chunkMap);
+    await uploadToTigris(currentChunk!, header);
 
     const totalChunks = Math.ceil(entries.length / 50);
     for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
@@ -320,7 +334,7 @@ const handler = async () => {
 
       const entryValue = DirectoryString.fromDirectory(directoryChunk).toString();
 
-      queryString += `INSERT INTO tmp (startTileId, entry) VALUES (${startTileId}, '${entryValue}');`;
+      queryString += `INSERT OR IGNORE INTO tmp (startTileId, entry) VALUES (${startTileId}, '${entryValue}');`;
 
       if (queryString.length > 90000) {
         ++totalD1;
@@ -343,10 +357,19 @@ const handler = async () => {
     console.log('Loading Progress: ' + loadingCount + '/' + rootEntries.length);
   }
 
-  for (const promises of Object.values(r2Promises)) {
-    await Promise.all(promises);
+  if (queryString.length > 0) {
+    ++totalD1;
+    const query = queryString;
+    const d1Call = async () => {
+      await runD1Query(query);
+      ++countD1;
+      console.log('D1 Progress: ' + countD1 + '/' + totalD1);
+    };
+    d1Promises.push(d1Limit(d1Call));
+    queryString = '';
   }
 
+  await Promise.all(tigrisPromises);
   await Promise.all(d1Promises);
 
   await finalizeDatabase();
