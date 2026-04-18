@@ -3,9 +3,6 @@ terraform {
 
   extra_arguments custom_vars {
     commands = get_terraform_commands_that_need_vars()
-    arguments = [
-      "-var-file=tiles.${local.env}.tfvars.json",
-    ]
   }
 
   extra_arguments "retry_lock" {
@@ -18,19 +15,11 @@ include "root" {
   path = find_in_parent_folders("root.hcl")
 }
 
-locals {
-  env = get_env("TF_VAR_env")
-}
-
 remote_state {
   backend = "pg"
 
   config = {
     conn_str    = get_env("TF_VAR_tf_state_postgres_conn_str")
-    schema_name = "${local.env}_cloudflare_tiles_worker"
+    schema_name = "cloudflare_reverse_geocoding"
   }
-}
-
-dependencies {
-  paths = ["../tiles"]
 }

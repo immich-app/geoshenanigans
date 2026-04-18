@@ -14,7 +14,7 @@ output "d1_proxy_token" {
 
 resource "cloudflare_workers_script" "tiles_d1_proxy" {
   account_id = var.cloudflare_account_id
-  name       = "tiles-d1-proxy"
+  name       = var.env == "prod" ? "tiles-d1-proxy" : "tiles-d1-proxy-${var.env}"
   content    = file("${var.tiles_build_dir}/index.js")
   module     = true
 
@@ -33,18 +33,17 @@ resource "cloudflare_workers_script" "tiles_d1_proxy" {
     name        = "D1_GLOBAL"
   }
 
-  d1_database_binding {
-    database_id = cloudflare_d1_database.tiles_dev.id
-    name        = "D1_DEV"
-  }
-
   compatibility_date  = "2024-07-29"
   compatibility_flags = ["nodejs_compat"]
 }
 
 resource "cloudflare_workers_domain" "tiles" {
   account_id = var.cloudflare_account_id
-  hostname   = "tiles-d1-proxy.immich.cloud"
+  hostname   = var.env == "prod" ? "tiles-d1-proxy.immich.cloud" : "tiles-d1-proxy.${var.env}.immich.cloud"
   service    = cloudflare_workers_script.tiles_d1_proxy.id
   zone_id    = data.cloudflare_zone.immich_cloud.zone_id
+}
+
+output "d1_proxy_url" {
+  value = "https://${cloudflare_workers_domain.tiles.hostname}"
 }
