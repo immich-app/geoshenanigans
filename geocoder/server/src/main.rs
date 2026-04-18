@@ -830,7 +830,7 @@ impl Index {
             })),
             "poi": poi_primary.map(|(d, p)| serde_json::json!({
                 "dist_m": to_m(d),
-                "name": self.get_string(p.name_id),
+                "name": if p.name_id != NO_DATA { self.get_string(p.name_id) } else { "" },
                 "parent_street": if p.parent_street_id != NO_DATA { self.get_string(p.parent_street_id) } else { "" },
                 "vertex_count": p.vertex_count,
             })),
@@ -1941,6 +1941,7 @@ impl Index {
                 let poi_id = (id & ID_MASK) as usize;
                 if poi_id >= all_pois.len() { return; }
                 let poi = &all_pois[poi_id];
+                if poi.name_id == NO_DATA { return; }
                 let name = self.get_string(poi.name_id);
                 if name.is_empty() { return; }
 
