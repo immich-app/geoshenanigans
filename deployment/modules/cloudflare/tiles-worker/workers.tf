@@ -18,6 +18,11 @@ resource "cloudflare_workers_script" "tiles" {
     text = var.env
   }
 
+  plain_text_binding {
+    name = "TIGRIS_BUCKET"
+    text = data.terraform_remote_state.tiles_state.outputs.tigris_bucket_name
+  }
+
   secret_text_binding {
     name = "VMETRICS_API_TOKEN"
     text = var.vmetrics_api_token
@@ -34,7 +39,7 @@ resource "cloudflare_workers_script" "tiles" {
   }
 
   d1_database_binding {
-    database_id = var.env != "prod" ? data.terraform_remote_state.tiles_state.outputs.d1_dev_database : data.terraform_remote_state.tiles_state.outputs.d1_global_database
+    database_id = data.terraform_remote_state.tiles_state.outputs.d1_database_id
     name        = "D1_GLOBAL"
   }
 

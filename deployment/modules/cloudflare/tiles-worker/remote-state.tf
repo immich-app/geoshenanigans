@@ -12,6 +12,6 @@ data "terraform_remote_state" "tiles_state" {
 
   config = {
     conn_str    = var.tf_state_postgres_conn_str
-    schema_name = "prod_cloudflare_tiles"
+    schema_name = "${var.env}_cloudflare_tiles"
   }
 }
