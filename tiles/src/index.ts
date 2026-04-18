@@ -167,7 +167,7 @@ async function handleRequest(
   const tigrisStorageRepository = new TigrisStorageRepository(
     env.TIGRIS_KEY_ID,
     env.TIGRIS_ACCESS_KEY,
-    'tiles-geo',
+    env.TIGRIS_BUCKET,
     env.DEPLOYMENT_KEY,
     metrics,
   );
@@ -232,13 +232,9 @@ export default {
       if (request.method.toUpperCase() !== 'POST') {
         return new Response('Method Not Allowed', { status: 405 });
       }
-      const body = (await request.json()) as { sql: string; db: string };
-      const binding = workerEnv[`D1_${body.db}` as keyof WorkerEnv] as D1Database | undefined;
-      if (!binding) {
-        return new Response(`Unknown database: ${body.db}`, { status: 400 });
-      }
+      const body = (await request.json()) as { sql: string };
       const metrics = new CloudflareMetricsRepository('tiles', request, []);
-      const d1Repository = new CloudflareD1Repository(binding, metrics);
+      const d1Repository = new CloudflareD1Repository(workerEnv.D1_GLOBAL, metrics);
       try {
         const response = await d1Repository.query(body.sql);
         return new Response(JSON.stringify(response), {

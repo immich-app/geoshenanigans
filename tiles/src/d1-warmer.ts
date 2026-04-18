@@ -17,19 +17,20 @@ const {
   TIGRIS_KEY_ID,
   TIGRIS_ACCESS_KEY,
   TIGRIS_ENDPOINT,
-  TIGRIS_BUCKET = 'tiles-geo',
+  TIGRIS_BUCKET,
   DEPLOYMENT_KEY,
   PMTILES_FILE_PATH,
-  D1_PROXY_URL = 'https://tiles-d1-proxy.immich.cloud',
+  D1_PROXY_URL,
   D1_PROXY_TOKEN,
-  DB_NAME = 'GLOBAL',
 } = process.env;
 if (
   !TIGRIS_KEY_ID ||
   !TIGRIS_ACCESS_KEY ||
   !TIGRIS_ENDPOINT ||
+  !TIGRIS_BUCKET ||
   !DEPLOYMENT_KEY ||
   !PMTILES_FILE_PATH ||
+  !D1_PROXY_URL ||
   !D1_PROXY_TOKEN
 ) {
   throw new Error('Missing environment variables');
@@ -103,7 +104,7 @@ const getEntriesFromRange = async (offset: number, length: number, compression: 
 };
 
 const runD1Query = async (sql: string, opts: { ignoreErrorSubstrings?: string[] } = {}) => {
-  const body = JSON.stringify({ sql, db: DB_NAME });
+  const body = JSON.stringify({ sql });
   const fetchRetry = fetchBuilder(fetch);
   const response = await fetchRetry(D1_PROXY_URL, {
     headers: {
