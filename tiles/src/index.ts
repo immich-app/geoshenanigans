@@ -167,7 +167,7 @@ async function handleRequest(
   const tigrisStorageRepository = new TigrisStorageRepository(
     env.TIGRIS_KEY_ID,
     env.TIGRIS_ACCESS_KEY,
-    'tiles-geo',
+    env.TIGRIS_BUCKET,
     env.DEPLOYMENT_KEY,
     metrics,
   );
@@ -225,17 +225,27 @@ export default {
   async fetch(request, env, ctx): Promise<Response> {
     const workerEnv = env as WorkerEnv;
     if (workerEnv.WORKER_TYPE === 'D1_PROXY') {
-      // const metrics = new CloudflareMetricsRepository('tiles', request, []);
-      // const body = (await request.json()) as { sql: string; db: string };
-      // const d1Repository = new CloudflareD1Repository(
-      //   workerEnv[`D1_${body.db}` as unknown as keyof WorkerEnv] as D1Database,
-      //   metrics,
-      // );
-      // console.log('D1 Proxy', body.sql);
-      // const response = await d1Repository.query(body.sql);
-      // console.log('D1 Response', response);
-      // return new Response(JSON.stringify(response));
-      return new Response('get out of here');
+      const auth = request.headers.get('Authorization');
+      if (!workerEnv.D1_PROXY_TOKEN || auth !== `Bearer ${workerEnv.D1_PROXY_TOKEN}`) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+      if (request.method.toUpperCase() !== 'POST') {
+        return new Response('Method Not Allowed', { status: 405 });
+      }
+      const body = (await request.json()) as { sql: string };
+      const metrics = new CloudflareMetricsRepository('tiles', request, []);
+      const d1Repository = new CloudflareD1Repository(workerEnv.D1_GLOBAL, metrics);
+      try {
+        const response = await d1Repository.query(body.sql);
+        return new Response(JSON.stringify(response), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      } catch (e: any) {
+        return new Response(
+          JSON.stringify({ success: false, errors: [{ message: e?.message ?? String(e) }], results: [] }),
+          { headers: { 'Content-Type': 'application/json' }, status: 200 },
+        );
+      }
     }
     const deferredRepository = new CloudflareDeferredRepository(ctx);
     const headerProvider = new HeaderMetricsProvider();

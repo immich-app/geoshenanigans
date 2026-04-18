@@ -1,0 +1,183 @@
+name: 'Tiles Deploy'
+on:
+  workflow_dispatch:
+    inputs:
+      file_name:
+        description: 'The name of the file to deploy, defaults to newest file'
+        required: false
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: prod
+        type: choice
+        options:
+          - dev
+          - prod
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.inputs.environment }}
+  cancel-in-progress: false
+
+env:
+  tofu_version: '1.11.6'
+  tg_version: '1.0.0'
+
+jobs:
+  deploy:
+    name: Deploy Tiles, Data & Worker
+    runs-on: mich
+    env:
+      ENVIRONMENT: ${{ github.event.inputs.environment }}
+      OP_SERVICE_ACCOUNT_TOKEN: ${{ github.event.inputs.environment == 'prod' && secrets.OP_TF_PROD_ENV || secrets.OP_TF_DEV_ENV }}
+    outputs:
+      KEY: ${{ steps.latest_build.outputs.KEY }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: 'recursive'
+
+      - name: Setup Node (tiles)
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version-file: './tiles/.nvmrc'
+
+      - name: Install tiles dependencies
+        working-directory: ./tiles
+        run: npm ci
+
+      - name: Build tiles worker
+        working-directory: ./tiles
+        run: npm run build
+
+      - name: Install map-styles dependencies
+        working-directory: ./map-styles
+        run: npm ci
+
+      - name: Build map styles
+        working-directory: ./map-styles
+        run: npm run build
+
+      - name: Install 1Password CLI
+        uses: 1password/install-cli-action@8d006a0d0a4fd505af7f7ce589e7f768385ff5e4 # v3.0.0
+
+      - name: Install Terragrunt
+        uses: eLco/setup-terragrunt@2c5116f8979bb261072ef57c97ac026cd9c27434 # v1.0.3
+        with:
+          terragrunt_version: ${{ env.tg_version }}
+
+      - name: Install OpenTofu
+        uses: opentofu/setup-opentofu@fc711fa910b93cba0f3fbecaafc9f42fd0c411cb # v2
+        with:
+          tofu_version: ${{ env.tofu_version }}
+          tofu_wrapper: false
+
+      - name: Apply tiles module (D1, Tigris, D1 proxy)
+        working-directory: deployment/modules/cloudflare/tiles
+        env:
+          TF_VAR_tiles_build_dir: "${{ github.workspace }}/tiles/dist"
+        run: op run --env-file="${{ github.workspace }}/deployment/.env" -- terragrunt apply --non-interactive
+
+      - name: Read tiles module outputs
+        working-directory: deployment/modules/cloudflare/tiles
+        run: |
+          d1_proxy_token=$(op run --env-file="${{ github.workspace }}/deployment/.env" -- terragrunt output -raw d1_proxy_token)
+          d1_proxy_url=$(op run --env-file="${{ github.workspace }}/deployment/.env" -- terragrunt output -raw d1_proxy_url)
+          tigris_bucket=$(op run --env-file="${{ github.workspace }}/deployment/.env" -- terragrunt output -raw tigris_bucket_name)
+          echo "::add-mask::$d1_proxy_token"
+          {
+            echo "D1_PROXY_TOKEN=$d1_proxy_token"
+            echo "D1_PROXY_URL=$d1_proxy_url"
+            echo "TIGRIS_BUCKET=$tigris_bucket"
+          } >> "$GITHUB_ENV"
+
+      - name: Install aria2
+        run: sudo apt-get update && sudo apt-get install aria2 -y
+
+      - name: Resolve latest pmtiles build key
+        id: latest_build
+        env:
+          FILE_NAME: ${{ github.event.inputs.file_name }}
+        run: |
+          if [ -z "$FILE_NAME" ]; then
+            build=$(curl -s https://build-metadata.protomaps.dev/builds.json | jq -r 'map(.key) | sort | last')
+          else
+            build=$FILE_NAME
+          fi
+          build=${build%.pmtiles}
+          echo "KEY=$build"
+          echo "KEY=$build" >> "$GITHUB_OUTPUT"
+
+      - name: Download latest pmtiles
+        run: |
+          aria2c --continue=true -s16 -x16 -j16 --summary-interval=10 \
+            --remote-time=true --file-allocation=none \
+            "https://build.protomaps.com/${{ steps.latest_build.outputs.KEY }}.pmtiles" \
+            -d "${{ github.workspace }}/tiles-data" -o tiles.pmtiles
+
+      - name: Resolve Tigris credentials
+        run: |
+          tigris_key_id=$(op read 'op://tf/TIGRIS_ADMIN_KEY_ID/password')
+          tigris_access_key=$(op read 'op://tf/TIGRIS_ADMIN_ACCESS_KEY/password')
+          echo "::add-mask::$tigris_key_id"
+          echo "::add-mask::$tigris_access_key"
+          {
+            echo "TIGRIS_KEY_ID=$tigris_key_id"
+            echo "TIGRIS_ACCESS_KEY=$tigris_access_key"
+          } >> "$GITHUB_ENV"
+
+      - name: Setup Rclone (Tigris)
+        uses: AnimMouse/setup-rclone@26ef2133e09fd383329a1d4c1fbe6a71db1976c9 # v1.12.0
+        with:
+          disable_base64: true
+          rclone_config: |
+            [tigris]
+            type = s3
+            provider = Other
+            region = auto
+            endpoint = https://fly.storage.tigris.dev
+            access_key_id = ${{ env.TIGRIS_KEY_ID }}
+            secret_access_key = ${{ env.TIGRIS_ACCESS_KEY }}
+
+      - name: Upload styles to Tigris
+        run: |
+          rclone copy ./map-styles/dist/ \
+            "tigris:${{ env.TIGRIS_BUCKET }}/${{ steps.latest_build.outputs.KEY }}/styles/" \
+            --s3-no-check-bucket \
+            --include "*.json"
+
+      - name: Warm D1 and upload tile chunks to Tigris
+        working-directory: ./tiles
+        env:
+          PMTILES_FILE_PATH: "${{ github.workspace }}/tiles-data/tiles.pmtiles"
+          DEPLOYMENT_KEY: ${{ steps.latest_build.outputs.KEY }}
+          TIGRIS_ENDPOINT: https://fly.storage.tigris.dev
+        run: npm run d1:warm
+
+      - name: Bump pmtiles_deployment_key
+        env:
+          TFVARS_FILE: "deployment/modules/cloudflare/tiles-worker/tiles.${{ env.ENVIRONMENT }}.tfvars.json"
+        run: |
+          sed -i -E 's/"pmtiles_deployment_key": "(.*)"/"pmtiles_deployment_key": "${{ steps.latest_build.outputs.KEY }}"/' \
+            "$TFVARS_FILE"
+
+      - name: Apply tiles-worker module (flip worker DEPLOYMENT_KEY)
+        working-directory: deployment/modules/cloudflare/tiles-worker
+        env:
+          TF_VAR_tiles_build_dir: "${{ github.workspace }}/tiles/dist"
+        run: op run --env-file="${{ github.workspace }}/deployment/.env" -- terragrunt apply --non-interactive
+
+      - name: Generate commit token
+        id: generate-token
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3
+        with:
+          app-id: ${{ secrets.PUSH_O_MATIC_APP_ID }}
+          private-key: ${{ secrets.PUSH_O_MATIC_APP_KEY }}
+
+      - name: Commit updated deployment key
+        uses: EndBug/add-and-commit@290ea2c423ad77ca9c62ae0f5b224379612c0321 # v10.0.0
+        with:
+          add: deployment/modules/cloudflare/tiles-worker/tiles.${{ env.ENVIRONMENT }}.tfvars.json
+          message: "chore: bump ${{ env.ENVIRONMENT }} tiles deployment key to ${{ steps.latest_build.outputs.KEY }}"
+          push: true
+          github_token: ${{ steps.generate-token.outputs.token }}

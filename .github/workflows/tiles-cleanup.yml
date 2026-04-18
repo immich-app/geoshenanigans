@@ -16,24 +16,42 @@ jobs:
       run:
         working-directory: 'deployment'
     runs-on: ubuntu-latest
-    outputs:
-      KEY: ${{ steps.latest_build.outputs.KEY }}
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [dev, prod]
+    env:
+      OP_SERVICE_ACCOUNT_TOKEN: ${{ matrix.environment == 'prod' && secrets.OP_TF_PROD_ENV || secrets.OP_TF_DEV_ENV }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Setup Rclone
+      - name: Install 1Password CLI
+        uses: 1password/install-cli-action@8d006a0d0a4fd505af7f7ce589e7f768385ff5e4 # v3.0.0
+
+      - name: Resolve Tigris credentials
+        run: |
+          tigris_key_id=$(op read 'op://tf/TIGRIS_ADMIN_KEY_ID/password')
+          tigris_access_key=$(op read 'op://tf/TIGRIS_ADMIN_ACCESS_KEY/password')
+          echo "::add-mask::$tigris_key_id"
+          echo "::add-mask::$tigris_access_key"
+          {
+            echo "TIGRIS_KEY_ID=$tigris_key_id"
+            echo "TIGRIS_ACCESS_KEY=$tigris_access_key"
+          } >> "$GITHUB_ENV"
+
+      - name: Setup Rclone (Tigris)
         uses: AnimMouse/setup-rclone@26ef2133e09fd383329a1d4c1fbe6a71db1976c9 # v1.12.0
         with:
           disable_base64: true
           rclone_config: |
-            [r2]
+            [tigris]
             type = s3
-            provider = Cloudflare
+            provider = Other
             region = auto
-            endpoint = https://601adaaa1eab190cdfe2945f9a6c89d0.r2.cloudflarestorage.com
-            access_key_id = ${{ secrets.CLOUDFLARE_TILES_R2_KV_TOKEN_ID }}
-            secret_access_key = ${{ secrets.CLOUDFLARE_TILES_R2_KV_TOKEN_HASHED_VALUE }}
+            endpoint = https://fly.storage.tigris.dev
+            access_key_id = ${{ env.TIGRIS_KEY_ID }}
+            secret_access_key = ${{ env.TIGRIS_ACCESS_KEY }}
 
-      - name: Cleanup all non-latest tiles
-        run: ./scripts/r2-cleanup.sh
+      - name: Cleanup non-current Tigris prefixes
+        run: ./scripts/tigris-cleanup.sh ${{ matrix.environment }}

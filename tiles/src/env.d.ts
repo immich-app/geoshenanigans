@@ -5,4 +5,6 @@ interface WorkerEnv extends Omit<Env, 'ENVIRONMENT' | 'DEPLOYMENT_KEY'> {
   WORKER_TYPE: string | undefined;
   TIGRIS_KEY_ID: string;
   TIGRIS_ACCESS_KEY: string;
+  TIGRIS_BUCKET: string;
+  D1_PROXY_TOKEN: string;
 }
