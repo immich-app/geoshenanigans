@@ -16,8 +16,12 @@ jobs:
       run:
         working-directory: 'deployment'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [dev, prod]
     env:
-      OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
+      OP_SERVICE_ACCOUNT_TOKEN: ${{ matrix.environment == 'prod' && secrets.OP_TF_PROD_ENV || secrets.OP_TF_DEV_ENV }}
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -50,4 +54,4 @@ jobs:
             secret_access_key = ${{ env.TIGRIS_ACCESS_KEY }}
 
       - name: Cleanup non-current Tigris prefixes
-        run: ./scripts/tigris-cleanup.sh
+        run: ./scripts/tigris-cleanup.sh ${{ matrix.environment }}
