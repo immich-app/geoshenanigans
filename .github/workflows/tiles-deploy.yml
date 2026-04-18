@@ -78,12 +78,18 @@ jobs:
           TF_VAR_tiles_build_dir: "${{ github.workspace }}/tiles/dist"
         run: op run --env-file="${{ github.workspace }}/deployment/.env" -- terragrunt apply --non-interactive
 
-      - name: Read D1 proxy token from tf state
+      - name: Read tiles module outputs
         working-directory: deployment/modules/cloudflare/tiles
         run: |
           d1_proxy_token=$(op run --env-file="${{ github.workspace }}/deployment/.env" -- terragrunt output -raw d1_proxy_token)
+          d1_proxy_url=$(op run --env-file="${{ github.workspace }}/deployment/.env" -- terragrunt output -raw d1_proxy_url)
+          tigris_bucket=$(op run --env-file="${{ github.workspace }}/deployment/.env" -- terragrunt output -raw tigris_bucket_name)
           echo "::add-mask::$d1_proxy_token"
-          echo "D1_PROXY_TOKEN=$d1_proxy_token" >> "$GITHUB_ENV"
+          {
+            echo "D1_PROXY_TOKEN=$d1_proxy_token"
+            echo "D1_PROXY_URL=$d1_proxy_url"
+            echo "TIGRIS_BUCKET=$tigris_bucket"
+          } >> "$GITHUB_ENV"
 
       - name: Install aria2
         run: sudo apt-get update && sudo apt-get install aria2 -y
@@ -136,7 +142,7 @@ jobs:
       - name: Upload styles to Tigris
         run: |
           rclone copy ./map-styles/dist/ \
-            "tigris:tiles-geo/${{ steps.latest_build.outputs.KEY }}/styles/" \
+            "tigris:${{ env.TIGRIS_BUCKET }}/${{ steps.latest_build.outputs.KEY }}/styles/" \
             --s3-no-check-bucket \
             --include "*.json"
 
@@ -146,15 +152,14 @@ jobs:
           PMTILES_FILE_PATH: "${{ github.workspace }}/tiles-data/tiles.pmtiles"
           DEPLOYMENT_KEY: ${{ steps.latest_build.outputs.KEY }}
           TIGRIS_ENDPOINT: https://fly.storage.tigris.dev
-          TIGRIS_BUCKET: tiles-geo
-          D1_PROXY_URL: https://tiles-d1-proxy.immich.cloud
-          DB_NAME: ${{ github.event.inputs.environment == 'prod' && 'GLOBAL' || 'DEV' }}
         run: npm run d1:warm
 
       - name: Bump pmtiles_deployment_key
+        env:
+          TFVARS_FILE: "deployment/modules/cloudflare/tiles-worker/tiles.${{ env.ENVIRONMENT }}.tfvars.json"
         run: |
           sed -i -E 's/"pmtiles_deployment_key": "(.*)"/"pmtiles_deployment_key": "${{ steps.latest_build.outputs.KEY }}"/' \
-            deployment/modules/cloudflare/tiles-worker/tiles.tfvars.json
+            "$TFVARS_FILE"
 
       - name: Apply tiles-worker module (flip worker DEPLOYMENT_KEY)
         working-directory: deployment/modules/cloudflare/tiles-worker
@@ -172,7 +177,7 @@ jobs:
       - name: Commit updated deployment key
         uses: EndBug/add-and-commit@290ea2c423ad77ca9c62ae0f5b224379612c0321 # v10.0.0
         with:
-          add: deployment/modules/cloudflare/tiles-worker/tiles.tfvars.json
-          message: "chore: bump tiles deployment key to ${{ steps.latest_build.outputs.KEY }}"
+          add: deployment/modules/cloudflare/tiles-worker/tiles.${{ env.ENVIRONMENT }}.tfvars.json
+          message: "chore: bump ${{ env.ENVIRONMENT }} tiles deployment key to ${{ steps.latest_build.outputs.KEY }}"
           push: true
           github_token: ${{ steps.generate-token.outputs.token }}
