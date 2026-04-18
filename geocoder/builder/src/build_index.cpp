@@ -4088,7 +4088,8 @@ int main(int argc, char* argv[]) {
                 for (auto& iw : data.interp_ways) iw.street_id = rm.at(iw.street_id);
                 for (auto& ap : data.admin_polygons) ap.name_id = rm.at(ap.name_id);
                 for (auto& pr : data.poi_records) {
-                    pr.name_id = rm.at(pr.name_id);
+                    if (pr.name_id != NO_DATA) pr.name_id = rm.at(pr.name_id);
+                    else { /* UNNAMED_RANK30: no name → stays NO_DATA */ }
                     if (pr.parent_street_id != 0xFFFFFFFFu) {
                         auto psit = rm.find(pr.parent_street_id);
                         if (psit != rm.end()) {
