@@ -348,6 +348,16 @@ inline uint16_t poi_get_proximity_meters(PoiCategory cat) {
 
 static constexpr uint8_t POI_FLAG_WIKIPEDIA = 0x01;
 static constexpr uint8_t POI_FLAG_WIKIDATA  = 0x02;
+// Feature is a highway-class polygon (highway=pedestrian, footway, square,
+// service yard). Nominatim assigns these rank_search=26 (road rank) rather
+// than the default rank_search=30 for POIs, so the feature's own name is
+// surfaced as the `road` field when it wins the reverse primary. Without
+// the flag we can't tell Mexico City's "Constitution Square" (a
+// highway=pedestrian relation with tourism=attraction, rank 26 in
+// nominatim) apart from Buenos Aires's Obelisco (historic=monument with
+// tourism=attraction, rank 30 in nominatim) — both land in our POI index
+// as PoiCategory::ATTRACTION.
+static constexpr uint8_t POI_FLAG_HIGHWAY   = 0x04;
 
 inline const char* poi_category_label(PoiCategory cat) {
     switch (cat) {

@@ -881,6 +881,23 @@ int main(int argc, char* argv[]) {
                                 uint8_t flags = 0;
                                 if (rel.tag("wikipedia")) flags |= POI_FLAG_WIKIPEDIA;
                                 if (rel.tag("wikidata"))  flags |= POI_FLAG_WIKIDATA;
+                                // highway=pedestrian/footway/etc. relations
+                                // like Mexico City's "Constitution Square"
+                                // (r19430125, tourism=attraction AND
+                                // highway=pedestrian) land here because of
+                                // the tourism tag but are rank-26 in
+                                // nominatim. Flag so the server surfaces
+                                // the relation's own name as `road`.
+                                const char* r_highway = rel.tag("highway");
+                                if (r_highway && (
+                                        std::strcmp(r_highway, "pedestrian") == 0 ||
+                                        std::strcmp(r_highway, "footway") == 0 ||
+                                        std::strcmp(r_highway, "living_street") == 0 ||
+                                        std::strcmp(r_highway, "path") == 0 ||
+                                        std::strcmp(r_highway, "cycleway") == 0 ||
+                                        std::strcmp(r_highway, "service") == 0)) {
+                                    flags |= POI_FLAG_HIGHWAY;
+                                }
                                 uint8_t tier = poi_get_default_tier(poi_cat);
                                 if ((flags & (POI_FLAG_WIKIPEDIA | POI_FLAG_WIKIDATA)) && tier > 1) tier--;
 
@@ -979,7 +996,8 @@ int main(int argc, char* argv[]) {
                                    const char* t_craft, const char* t_power,
                                    const char* t_place, const char* t_waterway,
                                    const char* t_office,
-                                   const char* t_wikipedia, const char* t_wikidata)
+                                   const char* t_wikipedia, const char* t_wikidata,
+                                   const char* t_highway)
                 -> std::optional<PoiClassification> {
                 PoiCategory cat = PoiCategory::UNKNOWN;
 
@@ -1126,6 +1144,19 @@ int main(int argc, char* argv[]) {
                 uint8_t flags = 0;
                 if (t_wikipedia) flags |= POI_FLAG_WIKIPEDIA;
                 if (t_wikidata)  flags |= POI_FLAG_WIKIDATA;
+                // Nominatim treats highway=pedestrian/footway/living_street/
+                // path/service areas as rank_search=26 (road rank) rather
+                // than rank_search=30. Mark so the server can surface the
+                // feature's own name as `road` rather than its parent street.
+                if (t_highway && (
+                        std::strcmp(t_highway, "pedestrian") == 0 ||
+                        std::strcmp(t_highway, "footway") == 0 ||
+                        std::strcmp(t_highway, "living_street") == 0 ||
+                        std::strcmp(t_highway, "path") == 0 ||
+                        std::strcmp(t_highway, "cycleway") == 0 ||
+                        std::strcmp(t_highway, "service") == 0)) {
+                    flags |= POI_FLAG_HIGHWAY;
+                }
                 if ((flags & (POI_FLAG_WIKIPEDIA | POI_FLAG_WIKIDATA)) && tier > 1) tier--;
 
                 return PoiClassification{cat, tier, flags};
@@ -1197,6 +1228,7 @@ int main(int argc, char* argv[]) {
                         const char* n_wikipedia = nullptr;
                         const char* n_wikidata = nullptr;
                         const char* n_ele = nullptr;
+                        const char* n_highway = nullptr;
                         for (size_t i = 0; i < ntags; i++) {
                             if (tag_keys[i] >= st.size()) continue;
                             const auto& k = st[tag_keys[i]];
@@ -1215,7 +1247,10 @@ int main(int argc, char* argv[]) {
                                     break;
                                 case 'c': if (k == "craft") n_craft = v; break;
                                 case 'e': if (k == "ele") n_ele = v; break;
-                                case 'h': if (k == "historic") n_historic = v; break;
+                                case 'h':
+                                    if (k == "historic") n_historic = v;
+                                    else if (k == "highway") n_highway = v;
+                                    break;
                                 case 'l': if (k == "leisure") n_leisure = v; break;
                                 case 'm': if (k == "man_made") n_man_made = v; break;
                                 case 'n':
@@ -1270,7 +1305,8 @@ int main(int argc, char* argv[]) {
                                 n_amenity, n_leisure, n_natural, n_railway, n_aeroway,
                                 n_man_made, n_building, n_craft, n_power, n_place, n_waterway,
                                 n_office,
-                                n_wikipedia, n_wikidata);
+                                n_wikipedia, n_wikidata,
+                                n_highway);
                             // Unnamed specific-category POIs are still
                             // noise in the display path (e.g. unnamed
                             // ATTRACTION / MONUMENT — no useful road to
@@ -1778,7 +1814,8 @@ int main(int argc, char* argv[]) {
                             t_amenity, t_leisure, t_natural, t_railway, t_aeroway,
                             t_man_made, t_building, t_craft, t_power, t_place, t_waterway,
                             t_office,
-                            t_wikipedia, t_wikidata);
+                            t_wikipedia, t_wikidata,
+                            t_highway);
                         if (cls) {
                             // Compute centroid
                             double sum_lat = 0, sum_lng = 0;

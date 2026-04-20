@@ -29,6 +29,13 @@ const DEFAULT_SEARCH_DISTANCE: f64 = 660.0;
 // features that Nominatim still treats as primary-feature candidates.
 const POI_CAT_UNNAMED_RANK30: u8 = 170;
 
+// Matches POI_FLAG_HIGHWAY in builder/src/types.h — feature is a
+// highway-class polygon (highway=pedestrian/footway/etc.). Nominatim
+// ranks these as rank_search=26 (road) rather than the POI default
+// rank_search=30, so their own name becomes the `road` field rather
+// than falling through to `parent_street`.
+const POI_FLAG_HIGHWAY: u8 = 0x04;
+
 fn cell_id_at_level(lat: f64, lng: f64, level: u64) -> u64 {
     let ll = LatLng::from_degrees(lat, lng);
     CellID::from(ll).parent(level).0
@@ -833,6 +840,8 @@ impl Index {
                 "name": if p.name_id != NO_DATA { self.get_string(p.name_id) } else { "" },
                 "parent_street": if p.parent_street_id != NO_DATA { self.get_string(p.parent_street_id) } else { "" },
                 "vertex_count": p.vertex_count,
+                "category": p.category,
+                "category_name": self.poi_meta.category_name(p.category),
             })),
         })
     }
@@ -2572,18 +2581,23 @@ impl Index {
         if closest_feature_dist < max_dist {
             // Whichever feature class has the smallest distance wins.
             if effective_poi_dist <= addr_dist && effective_poi_dist <= interp_dist && effective_poi_dist <= street_dist {
-                // POI is closest. For polygon POIs (vertex_count > 0)
-                // that the query is inside, use the POI's own name
-                // as the road: nominatim picks highway=pedestrian
-                // relations like "Constitution Square" (Mexico City
-                // Zócalo) directly via its rank-26 street query, and
-                // we don't index those as streets so they land in
-                // the POI index with the correct name:en. For point
-                // POIs (statues, plaques, shrines) that happen to sit
-                // on top of the query, stick with parent_street —
-                // their own name is a landmark label, not a road.
+                // POI is closest. Nominatim splits "POI with polygon
+                // at dist=0" into two cases depending on rank_search:
+                //  - rank 26 (highway=pedestrian/footway/etc. polygons
+                //    like Mexico City's "Constitution Square") — the
+                //    feature IS a road, so its own name is the `road`.
+                //  - rank 30 (historic=monument, tourism=attraction,
+                //    amenity=* polygons like Buenos Aires's Obelisco
+                //    or the White House) — the feature is NOT a road,
+                //    so `road` comes from its parent_place_id chain
+                //    (parent_street in our indexer).
+                // POI_FLAG_HIGHWAY is set by the builder for highway-
+                // class polygons; without the flag we default to
+                // parent_street even when the polygon contains the
+                // query, matching nominatim's rank-30 chain walk.
                 let (_, poi) = poi_primary.unwrap();
-                let use_poi_name = poi.vertex_count > 0 && poi_dist == 0.0;
+                let is_highway_poi = (poi.flags & POI_FLAG_HIGHWAY) != 0;
+                let use_poi_name = is_highway_poi && poi.vertex_count > 0 && poi_dist == 0.0;
                 if use_poi_name && poi.name_id != NO_DATA {
                     road = Some(self.get_string(poi.name_id));
                 } else if poi.parent_street_id != NO_DATA {
