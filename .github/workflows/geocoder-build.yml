@@ -741,10 +741,15 @@ jobs:
           done) > "$WORKDIR/output/checksums.sha256"
           echo "$(wc -l < "$WORKDIR/output/checksums.sha256") file checksums generated"
 
-          # Upload manifest + checksums (index files + patches already uploaded above)
+          # Upload manifest + checksums (index files + patches already uploaded above).
+          # Note: checksums.sha256 is generated AFTER the bulk cache cp at the
+          # top of this step, so we re-upload it (and manifest) to cache here
+          # so the sentinel check sees the full file set — otherwise every
+          # build warns "Cache incomplete (N-1/N) — no sentinel".
           $S5 cp "$WORKDIR/output/manifest.json" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/manifest.json"
           $S5 cp "$WORKDIR/output/checksums.sha256" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/checksums.sha256"
           $CACHE cp "$WORKDIR/output/manifest.json" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/manifest.json" 2>/dev/null || true
+          $CACHE cp "$WORKDIR/output/checksums.sha256" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/checksums.sha256" 2>/dev/null || true
 
           # Verify upload completeness — walk local files and re-upload any that
           # failed to land on Tigris. Use serial single-file uploads for the retry
