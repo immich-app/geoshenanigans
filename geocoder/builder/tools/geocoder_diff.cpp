@@ -1552,6 +1552,7 @@ int main(int argc, char* argv[]) {
     emit_raw(PatchFileId::POSTCODE_CENTROID_ENTRIES, "postcode_centroid_entries.bin");
     emit_raw(PatchFileId::POSTAL_POLYGONS, "postal_polygons.bin");
     emit_raw(PatchFileId::POSTAL_VERTICES, "postal_vertices.bin");
+    emit_raw(PatchFileId::ADDR_VERTICES, "addr_vertices.bin");
 
     // End marker
     uint32_t end_marker = 0xFFFFFFFF;

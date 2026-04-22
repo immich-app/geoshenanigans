@@ -310,7 +310,12 @@ enum class PatchFileId : uint32_t {
     POSTCODE_CENTROID_ENTRIES = 27,
     POSTAL_POLYGONS = 28,
     POSTAL_VERTICES = 29,
-    COUNT = 30
+    // addr_points polygon footprints introduced by commit aaf050b
+    // (build_version bump 8→9). Emitted as a full-replacement section
+    // like the other secondary files — the diff tool doesn't yet have
+    // record-level logic for this file.
+    ADDR_VERTICES = 30,
+    COUNT = 31
 };
 
 static const char* patch_file_names[] = {
@@ -322,7 +327,8 @@ static const char* patch_file_names[] = {
     "place_nodes.bin", "place_cells.bin", "place_entries.bin",
     "addr_postcodes.bin", "admin_parents.bin", "way_parents.bin", "way_postcodes.bin",
     "postcode_centroids.bin", "postcode_centroid_cells.bin", "postcode_centroid_entries.bin",
-    "postal_polygons.bin", "postal_vertices.bin"
+    "postal_polygons.bin", "postal_vertices.bin",
+    "addr_vertices.bin"
 };
 
 // Encoding types for each section
