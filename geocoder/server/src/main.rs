@@ -1824,6 +1824,13 @@ impl Index {
         let cos_lat = lat.to_radians().cos();
         let mut best_dist_sq = f64::MAX;
         let mut best_idx: Option<usize> = None;
+        // Fallback tier: the closest area-label POI (national park,
+        // island, bay, campus). Only wins primary if no specific
+        // POI qualifies — so "middle of Yosemite with no roads" can
+        // surface the park, while urban queries never get "Manhattan
+        // Island" as the primary feature.
+        let mut fallback_dist_sq = f64::MAX;
+        let mut fallback_idx: Option<usize> = None;
 
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
             Self::for_each_entry(poi_entries, Self::lookup_admin_cell(poi_cells, c), |id| {
@@ -1833,33 +1840,23 @@ impl Index {
                 let poi = &all_pois[poi_id];
                 // Need a linked parent street (for the `road` field)
                 // when this POI wins — without it we have nothing to
-                // surface as the road name. Nominatim's `_find_closest_
-                // street_or_pois` (reverse.py:201-204) does NOT filter
-                // by name: it returns every rank-30 node with class not
-                // in ('place', 'building') that qualifies — including
-                // unnamed amenity=vending_machine / waste_basket / clock
-                // / toilets. We index those as UNNAMED_RANK30 and let
-                // them compete; when one wins, the POI's parent_street
-                // fills the road field (the POI has no name of its own).
+                // surface as the road name.
                 if poi.parent_street_id == NO_DATA {
                     return;
                 }
-                if poi.name_id == NO_DATA && poi.category != POI_CAT_UNNAMED_RANK30 {
-                    // Named categories without a name are truly nameless
-                    // (e.g. unnamed MUSEUM / MONUMENT) — those carry no
-                    // useful display data, so keep skipping them.
-                    return;
-                }
-                // Nominatim's _find_closest_street_or_pois filter
-                // excludes `class_ IN ('place', 'building')` from the
-                // POI rank-30 branch. Our large "containment only"
-                // categories (islands, bays, capes, airports, parks,
-                // universities, cemeteries, etc.) would otherwise win
-                // at distance 0 every time the query is inside one,
-                // e.g. "Manhattan Island" covering all of Manhattan.
-                // Skip categories that are typically km-scale and act
-                // as area labels rather than addressable features.
-                if Self::is_area_label_category(poi.category) {
+                // Always require a name on the winning POI. Unnamed
+                // POIs (UNNAMED_RANK30 and name-less specific-category
+                // rows) would only surface their parent_street as the
+                // road — which drifts the result away from the user's
+                // actual nearest street. SF query (37.7749,-122.4194):
+                // a waste_basket at dist=0 currently shifts `road`
+                // from Market Street (the real nearest) to South Van
+                // Ness via the bin's parent_street. Dropping unnamed
+                // candidates keeps the primary selection aligned with
+                // human-recognisable features. (We still index them
+                // for the `places[]` layer because they can provide
+                // landmark context in rural areas.)
+                if poi.name_id == NO_DATA {
                     return;
                 }
 
@@ -1894,6 +1891,20 @@ impl Index {
                     dist_sq_val = dlat * dlat + dlng * dlng * cos_lat * cos_lat;
                 }
 
+                if Self::is_area_label_category(poi.category) {
+                    // Split lane: area labels (islands, parks, bays,
+                    // campuses) only win primary when nothing more
+                    // specific competes. Track them separately so a
+                    // "middle-of-nowhere in Yosemite" query still has
+                    // a useful primary, without letting Manhattan
+                    // Island claim every NYC query.
+                    if dist_sq_val < fallback_dist_sq {
+                        fallback_dist_sq = dist_sq_val;
+                        fallback_idx = Some(poi_id);
+                    }
+                    return;
+                }
+
                 if dist_sq_val < best_dist_sq {
                     best_dist_sq = dist_sq_val;
                     best_idx = Some(poi_id);
@@ -1901,7 +1912,16 @@ impl Index {
             });
         }
 
-        best_idx.map(|i| (best_dist_sq, &all_pois[i]))
+        // Only fall back to the area-label candidate when no specific
+        // POI was found at all within the search radius. If a
+        // specific POI exists anywhere in the cell neighbourhood we
+        // prefer it, no matter how far — the primary-selection outer
+        // loop still applies the DEFAULT_SEARCH_DISTANCE cutoff.
+        if let Some(i) = best_idx {
+            Some((best_dist_sq, &all_pois[i]))
+        } else {
+            fallback_idx.map(|i| (fallback_dist_sq, &all_pois[i]))
+        }
     }
 
     // --- POI lookup ---
@@ -2566,21 +2586,71 @@ impl Index {
                     };
                     let off = poi.vertex_offset as usize;
                     let cnt = poi.vertex_count as usize;
+                    let mut inside = false;
                     if off + cnt <= all_poi_vertices.len() {
                         let verts = &all_poi_vertices[off..off + cnt];
-                        if point_in_polygon(addr_pt.lat, addr_pt.lng, verts) {
-                            effective_poi_dist = f64::MAX;
-                        }
+                        inside = point_in_polygon(addr_pt.lat, addr_pt.lng, verts);
+                    }
+                    // Fallback proximity gate: POI polygons go through the
+                    // continent-filter simplifier (reduced vertex count),
+                    // so an addr_point that is geographically inside the
+                    // real OSM footprint may fall outside the simplified
+                    // polygon used for point-in-polygon tests. If the
+                    // addr_point is close enough to the query to be
+                    // plausibly part of the same building (< 50 m AND
+                    // closer than the nearest street), treat it as
+                    // inside. Paris Hôtel de Ville: the simplified 5-
+                    // vertex polygon rejects the addr-node at 17 m, yet
+                    // the node carries housenumber=6 and street="Place
+                    // de l'Hôtel de Ville" — exactly the primary
+                    // Nominatim surfaces.
+                    if !inside
+                        && addr_dist.sqrt() * 6_371_000.0 < 50.0
+                        && addr_dist < street_dist {
+                        inside = true;
+                    }
+                    if inside {
+                        effective_poi_dist = f64::MAX;
                     }
                 }
             }
         }
 
-        let closest_feature_dist = addr_dist.min(interp_dist).min(street_dist).min(effective_poi_dist);
+        // Tier-1 POI boost: a major, well-known landmark (wikidata-
+        // annotated attraction, castle, monument, national park, top-
+        // category building etc.) within a reasonable radius should
+        // win the primary slot over a slightly-closer nameless street.
+        // Without this boost, clicking near the Eiffel Tower returns
+        // "Rue de la Fédération" instead of "Eiffel Tower". The boost
+        // is applied only to the comparison distance — the hard
+        // max_dist cutoff below still uses the real distance, so we
+        // don't drag in a landmark from kilometres away.
+        //
+        // Boost: 50 m subtracted from the comparison distance for
+        // tier-1 POIs. Keeps the boost tight enough that random
+        // side-street queries don't flip to a nearby landmark (LA
+        // Civic Center, Cairo El Tahrir), while still letting a
+        // landmark-adjacent query (Eiffel Tower, Statue of Liberty)
+        // beat a marginally-closer side road.
+        let tier1_bonus_sq: f64 = {
+            let r = 50.0_f64 / 6_371_000.0_f64;
+            r * r
+        };
+        let compare_poi_dist = match poi_primary.as_ref() {
+            Some((_, poi)) if poi.tier == 1 && effective_poi_dist < max_dist => {
+                if effective_poi_dist > tier1_bonus_sq {
+                    effective_poi_dist - tier1_bonus_sq
+                } else {
+                    0.0
+                }
+            }
+            _ => effective_poi_dist,
+        };
+        let closest_feature_dist = addr_dist.min(interp_dist).min(street_dist).min(compare_poi_dist);
         let mut addr_won_primary = false;
         if closest_feature_dist < max_dist {
             // Whichever feature class has the smallest distance wins.
-            if effective_poi_dist <= addr_dist && effective_poi_dist <= interp_dist && effective_poi_dist <= street_dist {
+            if compare_poi_dist <= addr_dist && compare_poi_dist <= interp_dist && compare_poi_dist <= street_dist {
                 // POI is closest. Nominatim splits "POI with polygon
                 // at dist=0" into two cases depending on rank_search:
                 //  - rank 26 (highway=pedestrian/footway/etc. polygons
@@ -2674,11 +2744,26 @@ impl Index {
         }
 
         let pois = self.find_pois(lat, lng);
-        let places: Vec<PoiDetail> = pois.into_iter().map(|p| PoiDetail {
-            name: p.name.to_string(),
-            category: p.category.to_string(),
-            distance_m: (p.distance_m * 10.0).round() / 10.0,
-        }).collect();
+        // De-dupe by name, keep nearest instance. Chain outlets in
+        // dense cities (Starbucks / McDonald's / 7-Eleven) often
+        // cluster several branches inside a single query radius — a
+        // user browsing nearby landmarks wants a diverse list, not
+        // three copies of the same brand. Pure-name dedup is safe in
+        // practice because distinct venues with the same name are
+        // rare at rank-30; where they legitimately exist (e.g. two
+        // "Central Park" instances) the nearest one is still the one
+        // the user most likely means.
+        let mut places: Vec<PoiDetail> = Vec::with_capacity(pois.len());
+        let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::with_capacity(pois.len());
+        for p in pois.into_iter() {
+            if seen_names.insert(p.name.to_string()) {
+                places.push(PoiDetail {
+                    name: p.name.to_string(),
+                    category: p.category.to_string(),
+                    distance_m: (p.distance_m * 10.0).round() / 10.0,
+                });
+            }
+        }
 
         // Note on name-suffix normalisation (previously considered as
         // Option 6): Nominatim does not normalise the localname it
