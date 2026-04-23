@@ -326,8 +326,8 @@ fn poi_category_to_osm_class(cat: u8) -> Option<&'static str> {
         // transport / commerce root (73 bus_stop, 75 fuel, 76 shop)
         73 | 75 | 76 => Some("amenity"),
         // natural — skip large area-label values (bay=91, cape=92,
-        // island=93). Everything else in 80..=90 is small enough.
-        80..=90 => Some("natural"),
+        // island=93). Everything else in 80..=99 is small enough.
+        80..=90 | 94..=99 => Some("natural"),
         // aeroway, railway
         100 => Some("aeroway"),
         105 => Some("railway"),
@@ -335,6 +335,18 @@ fn poi_category_to_osm_class(cat: u8) -> Option<&'static str> {
         110..=119 => Some("man_made"),
         // building (cathedral, palace)
         120..=121 => Some("building"),
+        // boundary — national_park, protected_area can legitimately
+        // be named landmarks (Sherwood Forest NNR, Yosemite). Our
+        // 'contained polygon, smallest area wins' sort makes sure a
+        // huge NP doesn't outrank a specific feature anyway.
+        130..=131 => Some("boundary"),
+        // Extra natural (valley, ridge, saddle, gorge, bare_rock)
+        132..=136 => Some("natural"),
+        // craft (winery, brewery) — also named landmarks
+        140..=141 => Some("craft"),
+        // landuse (meadow, orchard, vineyard, farmland, allotments,
+        // quarry, reservoir, recreation_ground, military, religious)
+        142..=152 => Some("landuse"),
         // office=government
         160 => Some("office"),
         // Small-amenity sub-categories (171..=179) — toilets, clock…
@@ -346,10 +358,8 @@ fn poi_category_to_osm_class(cat: u8) -> Option<&'static str> {
         235..=240 => Some("leisure"),
         // Shop sub-categories (241..=253)
         241..=253 => Some("shop"),
-        // Excluded: national_park=130, protected_area=131 (too large
-        // for a display name); winery=140, brewery=141, power_plant
-        // =150 (specialised). UNNAMED_RANK30=170 never surfaces as a
-        // landmark (by definition generic).
+        // Excluded: POWER_PLANT=150 (specialised, rarely a landmark).
+        // UNNAMED_RANK30=170 never surfaces (by definition generic).
         _ => None,
     }
 }
@@ -2173,6 +2183,7 @@ impl Index {
                     category_id: poi.category,
                     distance_m: if contained { 0.0 } else { dist_m },
                     contained,
+                    is_point: poi.vertex_count == 0,
                     score,
                     area: area_sq_deg,
                 });
@@ -2205,17 +2216,18 @@ impl Index {
         //   - always drop duplicate NAMES regardless of containment
         //     (a user clicking once shouldn't see two "Starbucks" even
         //     if they're in different polygons)
-        //   - for non-contained POIs, also drop duplicate CATEGORIES
-        //     so the nearest "cafe" / "restaurant" / "bar" wins and
-        //     others of the same kind aren't listed. contained=true
-        //     (physically inside the polygon) is exempt — a user at
-        //     the Louvre should still see both "Louvre" (museum) and
-        //     a museum inside it if both contain the query.
+        //   - for non-contained CENTROID-ONLY point POIs, also drop
+        //     duplicate categories so the nearest cafe / restaurant
+        //     / bar wins and others of the same kind don't flood the
+        //     list. Polygon POIs are exempt — two nearby polygons of
+        //     the same category are distinct landmarks (Big Ben +
+        //     Palace of Westminster, both attractions, are both
+        //     worth keeping).
         let mut seen_names = std::collections::HashSet::new();
         let mut seen_point_cats = std::collections::HashSet::new();
         results.retain(|r| {
             if !seen_names.insert(r.name) { return false; }
-            if !r.contained && !seen_point_cats.insert(r.category) { return false; }
+            if !r.contained && r.is_point && !seen_point_cats.insert(r.category) { return false; }
             true
         });
         results.truncate(5);
@@ -3296,6 +3308,13 @@ struct PoiMatch<'a> {
     category_id: u8,
     distance_m: f64,
     contained: bool,
+    // Point POIs (no polygon geometry) are centroid-only hits —
+    // multiple of them in the same category look like chain-outlet
+    // clutter (three "cafe" within 500 m). Polygon POIs have
+    // distinct footprints and two nearby polygons of the same
+    // category are usually genuinely distinct landmarks (Big Ben
+    // vs Palace of Westminster, both attractions).
+    is_point: bool,
     score: f64,
     // Polygon area in (squared-degree-ish shoelace units). Used to
     // tie-break between POIs that all contain the query — the
