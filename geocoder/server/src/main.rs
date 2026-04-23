@@ -2201,8 +2201,23 @@ impl Index {
                 (false, false) => b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal),
             }
         });
-        let mut seen = std::collections::HashSet::new();
-        results.retain(|r| seen.insert(r.name));
+        // Dedup rules:
+        //   - always drop duplicate NAMES regardless of containment
+        //     (a user clicking once shouldn't see two "Starbucks" even
+        //     if they're in different polygons)
+        //   - for non-contained POIs, also drop duplicate CATEGORIES
+        //     so the nearest "cafe" / "restaurant" / "bar" wins and
+        //     others of the same kind aren't listed. contained=true
+        //     (physically inside the polygon) is exempt — a user at
+        //     the Louvre should still see both "Louvre" (museum) and
+        //     a museum inside it if both contain the query.
+        let mut seen_names = std::collections::HashSet::new();
+        let mut seen_point_cats = std::collections::HashSet::new();
+        results.retain(|r| {
+            if !seen_names.insert(r.name) { return false; }
+            if !r.contained && !seen_point_cats.insert(r.category) { return false; }
+            true
+        });
         results.truncate(5);
         results
     }

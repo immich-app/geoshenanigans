@@ -1083,10 +1083,10 @@ int main(int argc, char* argv[]) {
                     else if (std::strcmp(t_landuse, "military") == 0) cat = PoiCategory::MILITARY;
                     else if (std::strcmp(t_landuse, "religious") == 0) cat = PoiCategory::RELIGIOUS_LANDUSE;
                     else if (std::strcmp(t_landuse, "cemetery") == 0) cat = PoiCategory::CEMETERY;
-                    else if (std::strcmp(t_landuse, "residential") == 0) cat = PoiCategory::RESIDENTIAL;
-                    else if (std::strcmp(t_landuse, "industrial") == 0) cat = PoiCategory::INDUSTRIAL;
-                    else if (std::strcmp(t_landuse, "commercial") == 0) cat = PoiCategory::COMMERCIAL;
-                    else if (std::strcmp(t_landuse, "retail") == 0) cat = PoiCategory::RETAIL;
+                    // residential / industrial / commercial / retail
+                    // landuse zones intentionally skipped — they're
+                    // admin-hierarchy concepts already covered by the
+                    // address chain (suburb / borough / city_district).
                 }
                 // amenity
                 if (cat == PoiCategory::UNKNOWN && t_amenity) {

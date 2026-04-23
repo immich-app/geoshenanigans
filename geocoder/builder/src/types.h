@@ -285,8 +285,10 @@ enum class PoiCategory : uint8_t {
     ALLOTMENTS = 146, QUARRY = 147, RESERVOIR = 148,
     RECREATION_GROUND = 149,
     MILITARY = 151, RELIGIOUS_LANDUSE = 152,
-    RESIDENTIAL = 153, INDUSTRIAL = 154,
-    COMMERCIAL = 155, RETAIL = 156,
+    // residential / industrial / commercial / retail landuse zones
+    // are admin-hierarchy concepts, not user-facing landmarks — the
+    // normal address chain (suburb / borough / city_district) already
+    // covers them. Left out of the enum on purpose.
     // aeroway
     AERODROME = 100,
     // railway
@@ -431,8 +433,6 @@ inline uint8_t poi_get_default_tier(PoiCategory cat) {
         case PoiCategory::ALLOTMENTS: case PoiCategory::QUARRY:
         case PoiCategory::RESERVOIR: case PoiCategory::RECREATION_GROUND:
         case PoiCategory::MILITARY: case PoiCategory::RELIGIOUS_LANDUSE:
-        case PoiCategory::RESIDENTIAL: case PoiCategory::INDUSTRIAL:
-        case PoiCategory::COMMERCIAL: case PoiCategory::RETAIL:
             return 3;
         // Generic rank-30 unnamed node — lowest priority for display/
         // ranking but eligible as a primary-feature candidate.
@@ -571,10 +571,6 @@ inline const char* poi_category_label(PoiCategory cat) {
         case PoiCategory::RECREATION_GROUND: return "recreation_ground";
         case PoiCategory::MILITARY: return "military";
         case PoiCategory::RELIGIOUS_LANDUSE: return "religious";
-        case PoiCategory::RESIDENTIAL: return "residential";
-        case PoiCategory::INDUSTRIAL: return "industrial";
-        case PoiCategory::COMMERCIAL: return "commercial";
-        case PoiCategory::RETAIL: return "retail";
         case PoiCategory::AERODROME: return "aerodrome"; case PoiCategory::STATION: return "station";
         case PoiCategory::TOWER: return "tower"; case PoiCategory::LIGHTHOUSE: return "lighthouse";
         case PoiCategory::WINDMILL: return "windmill"; case PoiCategory::BRIDGE: return "bridge";
