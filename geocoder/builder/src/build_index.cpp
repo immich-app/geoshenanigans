@@ -838,6 +838,7 @@ int main(int argc, char* argv[]) {
                             if (std::strcmp(r_leisure, "park") == 0) poi_cat = PoiCategory::PARK;
                             else if (std::strcmp(r_leisure, "nature_reserve") == 0) poi_cat = PoiCategory::NATURE_RESERVE;
                             else if (std::strcmp(r_leisure, "stadium") == 0) poi_cat = PoiCategory::STADIUM;
+                            else if (std::strcmp(r_leisure, "sports_centre") == 0) poi_cat = PoiCategory::STADIUM;
                             else if (std::strcmp(r_leisure, "water_park") == 0) poi_cat = PoiCategory::WATER_PARK;
                             else if (std::strcmp(r_leisure, "golf_course") == 0) poi_cat = PoiCategory::GOLF_COURSE;
                             else if (std::strcmp(r_leisure, "garden") == 0) poi_cat = PoiCategory::GARDEN;
@@ -997,7 +998,8 @@ int main(int argc, char* argv[]) {
                                    const char* t_place, const char* t_waterway,
                                    const char* t_office,
                                    const char* t_wikipedia, const char* t_wikidata,
-                                   const char* t_highway)
+                                   const char* t_highway,
+                                   const char* t_shop)
                 -> std::optional<PoiClassification> {
                 PoiCategory cat = PoiCategory::UNKNOWN;
 
@@ -1015,6 +1017,18 @@ int main(int argc, char* argv[]) {
                     else if (std::strcmp(t_tourism, "camp_site") == 0) cat = PoiCategory::CAMP_SITE;
                     else if (std::strcmp(t_tourism, "picnic_site") == 0) cat = PoiCategory::PICNIC_SITE;
                     else if (std::strcmp(t_tourism, "resort") == 0) cat = PoiCategory::RESORT;
+                    // Lodging — all variants fold into HOTEL so a hostel / apartment
+                    // / guesthouse shows as "hotel" class rather than "feature".
+                    else if (std::strcmp(t_tourism, "hotel") == 0) cat = PoiCategory::HOTEL;
+                    else if (std::strcmp(t_tourism, "motel") == 0) cat = PoiCategory::HOTEL;
+                    else if (std::strcmp(t_tourism, "guest_house") == 0) cat = PoiCategory::HOTEL;
+                    else if (std::strcmp(t_tourism, "hostel") == 0) cat = PoiCategory::HOTEL;
+                    else if (std::strcmp(t_tourism, "apartment") == 0) cat = PoiCategory::HOTEL;
+                    else if (std::strcmp(t_tourism, "chalet") == 0) cat = PoiCategory::HOTEL;
+                    else if (std::strcmp(t_tourism, "caravan_site") == 0) cat = PoiCategory::CAMP_SITE;
+                    else if (std::strcmp(t_tourism, "wilderness_hut") == 0) cat = PoiCategory::ALPINE_HUT;
+                    // Information / visitor-services
+                    else if (std::strcmp(t_tourism, "information") == 0) cat = PoiCategory::INFORMATION;
                 }
                 // historic
                 if (cat == PoiCategory::UNKNOWN && t_historic) {
@@ -1026,6 +1040,18 @@ int main(int argc, char* argv[]) {
                     else if (std::strcmp(t_historic, "battlefield") == 0) cat = PoiCategory::BATTLEFIELD;
                     else if (std::strcmp(t_historic, "fort") == 0) cat = PoiCategory::FORT;
                     else if (std::strcmp(t_historic, "ship") == 0) cat = PoiCategory::SHIP;
+                    else if (std::strcmp(t_historic, "wayside_cross") == 0) cat = PoiCategory::WAYSIDE_CROSS;
+                    else if (std::strcmp(t_historic, "wayside_shrine") == 0) cat = PoiCategory::WAYSIDE_SHRINE;
+                    else if (std::strcmp(t_historic, "city_gate") == 0) cat = PoiCategory::CITY_GATE;
+                    else if (std::strcmp(t_historic, "citywalls") == 0) cat = PoiCategory::CITYWALLS;
+                    else if (std::strcmp(t_historic, "boundary_stone") == 0) cat = PoiCategory::BOUNDARY_STONE;
+                    else if (std::strcmp(t_historic, "milestone") == 0) cat = PoiCategory::MILESTONE;
+                    else if (std::strcmp(t_historic, "mine") == 0) cat = PoiCategory::HISTORIC_MINE;
+                    else if (std::strcmp(t_historic, "aircraft") == 0) cat = PoiCategory::HISTORIC_AIRCRAFT;
+                    else if (std::strcmp(t_historic, "locomotive") == 0) cat = PoiCategory::LOCOMOTIVE;
+                    else if (std::strcmp(t_historic, "cannon") == 0) cat = PoiCategory::CANNON;
+                    else if (std::strcmp(t_historic, "tomb") == 0) cat = PoiCategory::TOMB;
+                    else if (std::strcmp(t_historic, "manor") == 0) cat = PoiCategory::MANOR;
                 }
                 // boundary
                 if (cat == PoiCategory::UNKNOWN && t_boundary) {
@@ -1049,16 +1075,104 @@ int main(int argc, char* argv[]) {
                     else if (std::strcmp(t_amenity, "ferry_terminal") == 0) cat = PoiCategory::FERRY_TERMINAL;
                     else if (std::strcmp(t_amenity, "planetarium") == 0) cat = PoiCategory::PLANETARIUM;
                     else if (std::strcmp(t_amenity, "prison") == 0) cat = PoiCategory::PRISON;
+                    // Food & drink (each OSM value → distinct category)
+                    else if (std::strcmp(t_amenity, "restaurant") == 0) cat = PoiCategory::RESTAURANT;
+                    else if (std::strcmp(t_amenity, "cafe") == 0) cat = PoiCategory::CAFE;
+                    else if (std::strcmp(t_amenity, "bar") == 0) cat = PoiCategory::BAR;
+                    else if (std::strcmp(t_amenity, "pub") == 0) cat = PoiCategory::PUB;
+                    else if (std::strcmp(t_amenity, "fast_food") == 0) cat = PoiCategory::FAST_FOOD;
+                    else if (std::strcmp(t_amenity, "biergarten") == 0) cat = PoiCategory::BIERGARTEN;
+                    else if (std::strcmp(t_amenity, "food_court") == 0) cat = PoiCategory::FOOD_COURT;
+                    else if (std::strcmp(t_amenity, "ice_cream") == 0) cat = PoiCategory::ICE_CREAM;
+                    else if (std::strcmp(t_amenity, "nightclub") == 0) cat = PoiCategory::NIGHTCLUB;
+                    // Education
+                    else if (std::strcmp(t_amenity, "school") == 0) cat = PoiCategory::SCHOOL;
+                    else if (std::strcmp(t_amenity, "kindergarten") == 0) cat = PoiCategory::KINDERGARTEN;
+                    else if (std::strcmp(t_amenity, "driving_school") == 0) cat = PoiCategory::DRIVING_SCHOOL;
+                    else if (std::strcmp(t_amenity, "music_school") == 0) cat = PoiCategory::MUSIC_SCHOOL;
+                    // Health / care
+                    else if (std::strcmp(t_amenity, "pharmacy") == 0) cat = PoiCategory::PHARMACY;
+                    else if (std::strcmp(t_amenity, "doctors") == 0) cat = PoiCategory::DOCTORS;
+                    else if (std::strcmp(t_amenity, "dentist") == 0) cat = PoiCategory::DENTIST;
+                    else if (std::strcmp(t_amenity, "clinic") == 0) cat = PoiCategory::CLINIC;
+                    else if (std::strcmp(t_amenity, "veterinary") == 0) cat = PoiCategory::VETERINARY;
+                    // Finance
+                    else if (std::strcmp(t_amenity, "bank") == 0) cat = PoiCategory::BANK;
+                    else if (std::strcmp(t_amenity, "atm") == 0) cat = PoiCategory::ATM;
+                    else if (std::strcmp(t_amenity, "bureau_de_change") == 0) cat = PoiCategory::BUREAU_DE_CHANGE;
+                    // Mail / parcel
+                    else if (std::strcmp(t_amenity, "post_office") == 0) cat = PoiCategory::POST_OFFICE;
+                    else if (std::strcmp(t_amenity, "post_box") == 0) cat = PoiCategory::POST_BOX;
+                    else if (std::strcmp(t_amenity, "parcel_locker") == 0) cat = PoiCategory::PARCEL_LOCKER;
+                    // Emergency services
+                    else if (std::strcmp(t_amenity, "police") == 0) cat = PoiCategory::POLICE;
+                    else if (std::strcmp(t_amenity, "fire_station") == 0) cat = PoiCategory::FIRE_STATION;
+                    // Civic
+                    else if (std::strcmp(t_amenity, "townhall") == 0) cat = PoiCategory::TOWNHALL;
+                    else if (std::strcmp(t_amenity, "courthouse") == 0) cat = PoiCategory::COURTHOUSE;
+                    else if (std::strcmp(t_amenity, "community_centre") == 0) cat = PoiCategory::COMMUNITY_CENTRE;
+                    else if (std::strcmp(t_amenity, "social_centre") == 0) cat = PoiCategory::SOCIAL_CENTRE;
+                    // Transport
+                    else if (std::strcmp(t_amenity, "bus_station") == 0) cat = PoiCategory::BUS_STATION;
+                    else if (std::strcmp(t_amenity, "taxi") == 0) cat = PoiCategory::TAXI;
+                    else if (std::strcmp(t_amenity, "parking") == 0) cat = PoiCategory::PARKING;
+                    else if (std::strcmp(t_amenity, "bicycle_parking") == 0) cat = PoiCategory::BICYCLE_PARKING;
+                    else if (std::strcmp(t_amenity, "motorcycle_parking") == 0) cat = PoiCategory::MOTORCYCLE_PARKING;
+                    else if (std::strcmp(t_amenity, "fuel") == 0) cat = PoiCategory::FUEL;
+                    else if (std::strcmp(t_amenity, "charging_station") == 0) cat = PoiCategory::CHARGING_STATION;
+                    // Shelter-class
+                    else if (std::strcmp(t_amenity, "shelter") == 0) cat = PoiCategory::SHELTER;
+                    // Small named amenities
+                    else if (std::strcmp(t_amenity, "toilets") == 0) cat = PoiCategory::TOILETS;
+                    else if (std::strcmp(t_amenity, "drinking_water") == 0) cat = PoiCategory::DRINKING_WATER;
+                    else if (std::strcmp(t_amenity, "bench") == 0) cat = PoiCategory::BENCH;
+                    else if (std::strcmp(t_amenity, "vending_machine") == 0) cat = PoiCategory::VENDING_MACHINE;
+                    else if (std::strcmp(t_amenity, "waste_basket") == 0) cat = PoiCategory::WASTE_BASKET;
+                    else if (std::strcmp(t_amenity, "recycling") == 0) cat = PoiCategory::RECYCLING;
+                    else if (std::strcmp(t_amenity, "clock") == 0) cat = PoiCategory::CLOCK;
+                    else if (std::strcmp(t_amenity, "telephone") == 0) cat = PoiCategory::TELEPHONE;
+                    else if (std::strcmp(t_amenity, "bbq") == 0) cat = PoiCategory::BBQ;
+                    // Arts / culture / studio
+                    else if (std::strcmp(t_amenity, "arts_centre") == 0) cat = PoiCategory::ARTS_CENTRE;
+                    else if (std::strcmp(t_amenity, "studio") == 0) cat = PoiCategory::STUDIO;
+                    // Education extras
+                    else if (std::strcmp(t_amenity, "language_school") == 0) cat = PoiCategory::LANGUAGE_SCHOOL;
+                    else if (std::strcmp(t_amenity, "training") == 0) cat = PoiCategory::TRAINING;
+                    // Health extras
+                    else if (std::strcmp(t_amenity, "nursing_home") == 0) cat = PoiCategory::NURSING_HOME;
+                    else if (std::strcmp(t_amenity, "ambulance_station") == 0) cat = PoiCategory::AMBULANCE_STATION;
+                    else if (std::strcmp(t_amenity, "hospice") == 0) cat = PoiCategory::HOSPICE;
+                    // Religious extra / grave
+                    else if (std::strcmp(t_amenity, "monastery") == 0) cat = PoiCategory::MONASTERY;
+                    else if (std::strcmp(t_amenity, "grave_yard") == 0) cat = PoiCategory::GRAVE_YARD;
+                    // Vehicle services
+                    else if (std::strcmp(t_amenity, "car_wash") == 0) cat = PoiCategory::CAR_WASH;
+                    else if (std::strcmp(t_amenity, "car_rental") == 0) cat = PoiCategory::CAR_RENTAL;
+                    else if (std::strcmp(t_amenity, "bicycle_rental") == 0) cat = PoiCategory::BICYCLE_RENTAL;
+                    else if (std::strcmp(t_amenity, "bicycle_repair_station") == 0) cat = PoiCategory::BICYCLE_REPAIR_STATION;
+                    else if (std::strcmp(t_amenity, "vehicle_inspection") == 0) cat = PoiCategory::VEHICLE_INSPECTION;
                 }
                 // leisure
                 if (cat == PoiCategory::UNKNOWN && t_leisure) {
                     if (std::strcmp(t_leisure, "park") == 0) cat = PoiCategory::PARK;
                     else if (std::strcmp(t_leisure, "nature_reserve") == 0) cat = PoiCategory::NATURE_RESERVE;
                     else if (std::strcmp(t_leisure, "stadium") == 0) cat = PoiCategory::STADIUM;
+                    // Each OSM leisure value → distinct category.
+                    else if (std::strcmp(t_leisure, "sports_centre") == 0) cat = PoiCategory::SPORTS_CENTRE;
                     else if (std::strcmp(t_leisure, "garden") == 0) cat = PoiCategory::GARDEN;
                     else if (std::strcmp(t_leisure, "water_park") == 0) cat = PoiCategory::WATER_PARK;
                     else if (std::strcmp(t_leisure, "golf_course") == 0) cat = PoiCategory::GOLF_COURSE;
                     else if (std::strcmp(t_leisure, "marina") == 0) cat = PoiCategory::MARINA;
+                    else if (std::strcmp(t_leisure, "playground") == 0) cat = PoiCategory::PLAYGROUND;
+                    else if (std::strcmp(t_leisure, "fitness_station") == 0) cat = PoiCategory::FITNESS_STATION;
+                    else if (std::strcmp(t_leisure, "fitness_centre") == 0) cat = PoiCategory::FITNESS_CENTRE;
+                    else if (std::strcmp(t_leisure, "pitch") == 0) cat = PoiCategory::PITCH;
+                    else if (std::strcmp(t_leisure, "track") == 0) cat = PoiCategory::TRACK;
+                    else if (std::strcmp(t_leisure, "sports_hall") == 0) cat = PoiCategory::SPORTS_HALL;
+                    else if (std::strcmp(t_leisure, "sauna") == 0) cat = PoiCategory::SAUNA;
+                    else if (std::strcmp(t_leisure, "horse_riding") == 0) cat = PoiCategory::HORSE_RIDING;
+                    else if (std::strcmp(t_leisure, "bird_hide") == 0) cat = PoiCategory::BIRD_HIDE;
+                    else if (std::strcmp(t_leisure, "miniature_golf") == 0) cat = PoiCategory::MINIATURE_GOLF;
                 }
                 // natural
                 if (cat == PoiCategory::UNKNOWN && t_natural) {
@@ -1093,6 +1207,9 @@ int main(int argc, char* argv[]) {
                     else if (std::strcmp(t_man_made, "pier") == 0) cat = PoiCategory::PIER;
                     else if (std::strcmp(t_man_made, "dam") == 0) cat = PoiCategory::DAM;
                     else if (std::strcmp(t_man_made, "observatory") == 0) cat = PoiCategory::OBSERVATORY;
+                    else if (std::strcmp(t_man_made, "silo") == 0) cat = PoiCategory::SILO;
+                    else if (std::strcmp(t_man_made, "chimney") == 0) cat = PoiCategory::CHIMNEY;
+                    else if (std::strcmp(t_man_made, "watermill") == 0) cat = PoiCategory::WATERMILL;
                 }
                 // building
                 if (cat == PoiCategory::UNKNOWN && t_building) {
@@ -1121,6 +1238,24 @@ int main(int argc, char* argv[]) {
                 if (cat == PoiCategory::UNKNOWN && t_office) {
                     if (std::strcmp(t_office, "government") == 0) cat = PoiCategory::GOVERNMENT;
                 }
+                // shop — split common values, fall back to generic SHOP.
+                if (cat == PoiCategory::UNKNOWN && t_shop) {
+                    if (std::strcmp(t_shop, "supermarket") == 0) cat = PoiCategory::SHOP_SUPERMARKET;
+                    else if (std::strcmp(t_shop, "convenience") == 0) cat = PoiCategory::SHOP_CONVENIENCE;
+                    else if (std::strcmp(t_shop, "clothes") == 0) cat = PoiCategory::SHOP_CLOTHES;
+                    else if (std::strcmp(t_shop, "mall") == 0) cat = PoiCategory::SHOP_MALL;
+                    else if (std::strcmp(t_shop, "department_store") == 0) cat = PoiCategory::SHOP_DEPARTMENT_STORE;
+                    else if (std::strcmp(t_shop, "bakery") == 0) cat = PoiCategory::SHOP_BAKERY;
+                    else if (std::strcmp(t_shop, "butcher") == 0) cat = PoiCategory::SHOP_BUTCHER;
+                    else if (std::strcmp(t_shop, "hardware") == 0) cat = PoiCategory::SHOP_HARDWARE;
+                    else if (std::strcmp(t_shop, "doityourself") == 0) cat = PoiCategory::SHOP_HARDWARE;
+                    else if (std::strcmp(t_shop, "electronics") == 0) cat = PoiCategory::SHOP_ELECTRONICS;
+                    else if (std::strcmp(t_shop, "furniture") == 0) cat = PoiCategory::SHOP_FURNITURE;
+                    else if (std::strcmp(t_shop, "jewelry") == 0) cat = PoiCategory::SHOP_JEWELRY;
+                    else if (std::strcmp(t_shop, "books") == 0) cat = PoiCategory::SHOP_BOOKS;
+                    else if (std::strcmp(t_shop, "pet") == 0) cat = PoiCategory::SHOP_PET;
+                    else cat = PoiCategory::SHOP; // generic fallback
+                }
 
                 // Fallback: any rank-30 addressable feature that didn't
                 // hit a specific PoiCategory above. Mirrors Nominatim's
@@ -1133,7 +1268,8 @@ int main(int argc, char* argv[]) {
                 if (cat == PoiCategory::UNKNOWN) {
                     if (t_amenity || t_tourism || t_historic || t_leisure ||
                         t_man_made || t_craft || t_office || t_waterway ||
-                        t_natural || t_aeroway || t_railway || t_power) {
+                        t_natural || t_aeroway || t_railway || t_power ||
+                        t_shop) {
                         cat = PoiCategory::UNNAMED_RANK30;
                     }
                 }
@@ -1229,6 +1365,7 @@ int main(int argc, char* argv[]) {
                         const char* n_wikidata = nullptr;
                         const char* n_ele = nullptr;
                         const char* n_highway = nullptr;
+                        const char* n_shop = nullptr;
                         for (size_t i = 0; i < ntags; i++) {
                             if (tag_keys[i] >= st.size()) continue;
                             const auto& k = st[tag_keys[i]];
@@ -1269,6 +1406,7 @@ int main(int argc, char* argv[]) {
                                     if (k == "railway") n_railway = v;
                                     else if (k == "ref") n_ref = v;
                                     break;
+                                case 's': if (k == "shop") n_shop = v; break;
                                 case 't': if (k == "tourism") n_tourism = v; break;
                                 case 'w':
                                     if (k == "waterway") n_waterway = v;
@@ -1306,7 +1444,7 @@ int main(int argc, char* argv[]) {
                                 n_man_made, n_building, n_craft, n_power, n_place, n_waterway,
                                 n_office,
                                 n_wikipedia, n_wikidata,
-                                n_highway);
+                                n_highway, n_shop);
                             // Unnamed specific-category POIs are still
                             // noise in the display path (e.g. unnamed
                             // ATTRACTION / MONUMENT — no useful road to
@@ -1612,6 +1750,7 @@ int main(int argc, char* argv[]) {
                     const char* t_wikipedia = nullptr;
                     const char* t_wikidata = nullptr;
                     const char* t_ele = nullptr;
+                    const char* t_shop = nullptr;
                     for (size_t i = 0; i < ntags; i++) {
                         if (tag_keys[i] >= st.size()) continue;
                         const auto& k = st[tag_keys[i]];
@@ -1659,6 +1798,7 @@ int main(int argc, char* argv[]) {
                                 else if (k == "power") t_power = v;
                                 break;
                             case 'r': if (k == "railway") t_railway = v; break;
+                            case 's': if (k == "shop") t_shop = v; break;
                             case 't':
                                 if (k == "tourism") t_tourism = v;
                                 else if (k == "tunnel") t_tunnel = v;
@@ -1815,7 +1955,7 @@ int main(int argc, char* argv[]) {
                             t_man_made, t_building, t_craft, t_power, t_place, t_waterway,
                             t_office,
                             t_wikipedia, t_wikidata,
-                            t_highway);
+                            t_highway, t_shop);
                         if (cls) {
                             // Compute centroid
                             double sum_lat = 0, sum_lng = 0;
@@ -5124,7 +5264,7 @@ int main(int argc, char* argv[]) {
 
         std::ofstream mf(output_dir + "/manifest.json");
         mf << "{\n";
-        mf << "  \"build_version\": 11,\n";
+        mf << "  \"build_version\": 12,\n";
         mf << "  \"patch_version\": 5,\n";
         mf << "  \"regions\": {\n";
 

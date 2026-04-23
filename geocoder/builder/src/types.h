@@ -196,21 +196,74 @@ struct PlaceNode {
 // --- POI (Points of Interest) ---
 
 enum class PoiCategory : uint8_t {
-    // tourism
+    // tourism — one category per OSM tag value
     MUSEUM = 0, ATTRACTION = 1, VIEWPOINT = 2, THEME_PARK = 3, ZOO = 4,
     GALLERY = 5, ARTWORK = 6, ALPINE_HUT = 7, AQUARIUM = 8, CAMP_SITE = 9,
     PICNIC_SITE = 10, RESORT = 11,
-    // historic
+    HOTEL = 12, INFORMATION = 13, MOTEL = 14, GUEST_HOUSE = 15,
+    HOSTEL = 16, APARTMENT = 17, CHALET = 18, CARAVAN_SITE = 19,
+    // historic — each OSM value gets its own category
     CASTLE = 20, MONUMENT = 21, RUINS = 22, ARCHAEOLOGICAL_SITE = 23,
     MEMORIAL = 24, BATTLEFIELD = 25, FORT = 26, SHIP = 27,
-    // amenity
+    WAYSIDE_CROSS = 28, WAYSIDE_SHRINE = 29, CITY_GATE = 30,
+    CITYWALLS = 31, BOUNDARY_STONE = 32, MILESTONE = 33,
+    HISTORIC_MINE = 34, HISTORIC_AIRCRAFT = 35, LOCOMOTIVE = 36,
+    CANNON = 37, TOMB = 38, MANOR = 39,
+    // amenity — landmarks
     PLACE_OF_WORSHIP = 40, UNIVERSITY = 41, COLLEGE = 42, HOSPITAL = 43,
     THEATRE = 44, CINEMA = 45, LIBRARY = 46, MARKETPLACE = 47, EMBASSY = 48,
     FOUNTAIN = 49, CASINO = 50, CEMETERY = 51, FERRY_TERMINAL = 52,
     PLANETARIUM = 53, PRISON = 54,
+    // amenity — civic/services (one per OSM value)
+    RESTAURANT = 55, SCHOOL = 56, PHARMACY = 57, BANK = 58, POST_OFFICE = 59,
+    POLICE = 67, FIRE_STATION = 68, TOWNHALL = 69,
     // leisure
     PARK = 60, NATURE_RESERVE = 61, STADIUM = 62, GARDEN = 63,
     WATER_PARK = 64, GOLF_COURSE = 65, MARINA = 66,
+    PLAYGROUND = 70, PITCH = 71, SHELTER = 72,
+    // transport / commerce / infrastructure roots
+    BUS_STOP = 73, PARKING = 74, FUEL = 75, SHOP = 76,
+    SPORTS_CENTRE = 77, FITNESS_CENTRE = 78, SPORTS_HALL = 79,
+    // ── Sub-categories (171+) — each maps 1:1 to an OSM tag value
+    //    so the surfaced `category` string is always meaningful.
+    // Small amenities that show up as named rank-30 features
+    TOILETS = 171, DRINKING_WATER = 172, BENCH = 173,
+    VENDING_MACHINE = 174, WASTE_BASKET = 175, RECYCLING = 176,
+    CLOCK = 177, TELEPHONE = 178, BBQ = 179,
+    // Food & drink (amenity)
+    CAFE = 180, BAR = 181, PUB = 182, FAST_FOOD = 183,
+    ICE_CREAM = 184, BIERGARTEN = 185, FOOD_COURT = 186, NIGHTCLUB = 187,
+    ARTS_CENTRE = 188, STUDIO = 189,
+    // Education (amenity)
+    KINDERGARTEN = 190, DRIVING_SCHOOL = 191, MUSIC_SCHOOL = 192,
+    LANGUAGE_SCHOOL = 193, TRAINING = 194,
+    // Health (amenity)
+    DOCTORS = 200, DENTIST = 201, CLINIC = 202, VETERINARY = 203,
+    NURSING_HOME = 204, AMBULANCE_STATION = 205, HOSPICE = 206,
+    // Finance (amenity)
+    ATM = 210, BUREAU_DE_CHANGE = 211,
+    // Mail (amenity)
+    POST_BOX = 215, PARCEL_LOCKER = 216,
+    // Civic extras (amenity)
+    COURTHOUSE = 220, COMMUNITY_CENTRE = 221, SOCIAL_CENTRE = 222,
+    MONASTERY = 223, GRAVE_YARD = 224,
+    // Transport extras (amenity)
+    BUS_STATION = 225, TAXI = 226, CHARGING_STATION = 227,
+    BICYCLE_PARKING = 228, MOTORCYCLE_PARKING = 229,
+    CAR_WASH = 230, CAR_RENTAL = 231, BICYCLE_RENTAL = 232,
+    BICYCLE_REPAIR_STATION = 233, VEHICLE_INSPECTION = 234,
+    // Leisure extras
+    FITNESS_STATION = 235, TRACK = 236, SAUNA = 237,
+    HORSE_RIDING = 238, BIRD_HIDE = 239, MINIATURE_GOLF = 240,
+    // Shop sub-categories — keep SHOP=76 as the generic fallback for
+    // shop=* values we don't split below. These cover the commonly
+    // surfaced shops so "shop" isn't a single fuzzy bucket.
+    SHOP_SUPERMARKET = 241, SHOP_CONVENIENCE = 242,
+    SHOP_CLOTHES = 243, SHOP_MALL = 244,
+    SHOP_DEPARTMENT_STORE = 245, SHOP_BAKERY = 246,
+    SHOP_BUTCHER = 247, SHOP_HARDWARE = 248,
+    SHOP_ELECTRONICS = 249, SHOP_FURNITURE = 250,
+    SHOP_JEWELRY = 251, SHOP_BOOKS = 252, SHOP_PET = 253,
     // natural
     PEAK = 80, VOLCANO = 81, BEACH = 82, CAVE_ENTRANCE = 83, SPRING = 84,
     WATERFALL = 85, GLACIER = 86, CLIFF = 87, ARCH = 88, HOT_SPRING = 89,
@@ -222,6 +275,7 @@ enum class PoiCategory : uint8_t {
     // man_made
     TOWER = 110, LIGHTHOUSE = 111, WINDMILL = 112, BRIDGE = 113, PIER = 114,
     DAM = 115, OBSERVATORY = 116,
+    SILO = 117, CHIMNEY = 118, WATERMILL = 119,
     // building
     CATHEDRAL = 120, PALACE = 121,
     // boundary
@@ -285,6 +339,68 @@ inline uint8_t poi_get_default_tier(PoiCategory cat) {
         case PoiCategory::TOWER: case PoiCategory::WINDMILL: case PoiCategory::BRIDGE:
         case PoiCategory::PIER:
         case PoiCategory::WINERY: case PoiCategory::BREWERY:
+        case PoiCategory::HOTEL: case PoiCategory::MOTEL:
+        case PoiCategory::GUEST_HOUSE: case PoiCategory::HOSTEL:
+        case PoiCategory::APARTMENT: case PoiCategory::CHALET:
+        case PoiCategory::CARAVAN_SITE:
+        case PoiCategory::INFORMATION:
+        case PoiCategory::RESTAURANT: case PoiCategory::CAFE:
+        case PoiCategory::BAR: case PoiCategory::PUB:
+        case PoiCategory::FAST_FOOD: case PoiCategory::ICE_CREAM:
+        case PoiCategory::BIERGARTEN: case PoiCategory::FOOD_COURT:
+        case PoiCategory::NIGHTCLUB:
+        case PoiCategory::SCHOOL: case PoiCategory::KINDERGARTEN:
+        case PoiCategory::DRIVING_SCHOOL: case PoiCategory::MUSIC_SCHOOL:
+        case PoiCategory::PHARMACY: case PoiCategory::DOCTORS:
+        case PoiCategory::DENTIST: case PoiCategory::CLINIC:
+        case PoiCategory::VETERINARY:
+        case PoiCategory::BANK: case PoiCategory::ATM:
+        case PoiCategory::BUREAU_DE_CHANGE:
+        case PoiCategory::POST_OFFICE: case PoiCategory::POST_BOX:
+        case PoiCategory::PARCEL_LOCKER:
+        case PoiCategory::POLICE: case PoiCategory::FIRE_STATION:
+        case PoiCategory::TOWNHALL: case PoiCategory::COURTHOUSE:
+        case PoiCategory::COMMUNITY_CENTRE: case PoiCategory::SOCIAL_CENTRE:
+        case PoiCategory::PLAYGROUND: case PoiCategory::PITCH:
+        case PoiCategory::TRACK: case PoiCategory::FITNESS_STATION:
+        case PoiCategory::FITNESS_CENTRE: case PoiCategory::SHELTER:
+        case PoiCategory::SPORTS_CENTRE: case PoiCategory::SPORTS_HALL:
+        case PoiCategory::BUS_STOP: case PoiCategory::BUS_STATION:
+        case PoiCategory::TAXI:
+        case PoiCategory::PARKING: case PoiCategory::BICYCLE_PARKING:
+        case PoiCategory::MOTORCYCLE_PARKING:
+        case PoiCategory::FUEL: case PoiCategory::CHARGING_STATION:
+        case PoiCategory::SHOP:
+        case PoiCategory::WAYSIDE_CROSS: case PoiCategory::WAYSIDE_SHRINE:
+        case PoiCategory::CITY_GATE: case PoiCategory::CITYWALLS:
+        case PoiCategory::BOUNDARY_STONE: case PoiCategory::MILESTONE:
+        case PoiCategory::HISTORIC_MINE: case PoiCategory::HISTORIC_AIRCRAFT:
+        case PoiCategory::LOCOMOTIVE: case PoiCategory::CANNON:
+        case PoiCategory::TOMB: case PoiCategory::MANOR:
+        case PoiCategory::SILO: case PoiCategory::CHIMNEY:
+        case PoiCategory::WATERMILL:
+        case PoiCategory::TOILETS: case PoiCategory::DRINKING_WATER:
+        case PoiCategory::BENCH: case PoiCategory::VENDING_MACHINE:
+        case PoiCategory::WASTE_BASKET: case PoiCategory::RECYCLING:
+        case PoiCategory::CLOCK: case PoiCategory::TELEPHONE:
+        case PoiCategory::BBQ:
+        case PoiCategory::ARTS_CENTRE: case PoiCategory::STUDIO:
+        case PoiCategory::LANGUAGE_SCHOOL: case PoiCategory::TRAINING:
+        case PoiCategory::NURSING_HOME: case PoiCategory::AMBULANCE_STATION:
+        case PoiCategory::HOSPICE:
+        case PoiCategory::MONASTERY: case PoiCategory::GRAVE_YARD:
+        case PoiCategory::CAR_WASH: case PoiCategory::CAR_RENTAL:
+        case PoiCategory::BICYCLE_RENTAL: case PoiCategory::BICYCLE_REPAIR_STATION:
+        case PoiCategory::VEHICLE_INSPECTION:
+        case PoiCategory::SAUNA: case PoiCategory::HORSE_RIDING:
+        case PoiCategory::BIRD_HIDE: case PoiCategory::MINIATURE_GOLF:
+        case PoiCategory::SHOP_SUPERMARKET: case PoiCategory::SHOP_CONVENIENCE:
+        case PoiCategory::SHOP_CLOTHES: case PoiCategory::SHOP_MALL:
+        case PoiCategory::SHOP_DEPARTMENT_STORE: case PoiCategory::SHOP_BAKERY:
+        case PoiCategory::SHOP_BUTCHER: case PoiCategory::SHOP_HARDWARE:
+        case PoiCategory::SHOP_ELECTRONICS: case PoiCategory::SHOP_FURNITURE:
+        case PoiCategory::SHOP_JEWELRY: case PoiCategory::SHOP_BOOKS:
+        case PoiCategory::SHOP_PET:
             return 3;
         // Generic rank-30 unnamed node — lowest priority for display/
         // ranking but eligible as a primary-feature candidate.
@@ -371,6 +487,18 @@ inline const char* poi_category_label(PoiCategory cat) {
         case PoiCategory::RUINS: return "ruins"; case PoiCategory::ARCHAEOLOGICAL_SITE: return "archaeological_site";
         case PoiCategory::MEMORIAL: return "memorial"; case PoiCategory::BATTLEFIELD: return "battlefield";
         case PoiCategory::FORT: return "fort"; case PoiCategory::SHIP: return "ship";
+        case PoiCategory::WAYSIDE_CROSS: return "wayside_cross";
+        case PoiCategory::WAYSIDE_SHRINE: return "wayside_shrine";
+        case PoiCategory::CITY_GATE: return "city_gate";
+        case PoiCategory::CITYWALLS: return "citywalls";
+        case PoiCategory::BOUNDARY_STONE: return "boundary_stone";
+        case PoiCategory::MILESTONE: return "milestone";
+        case PoiCategory::HISTORIC_MINE: return "mine";
+        case PoiCategory::HISTORIC_AIRCRAFT: return "aircraft";
+        case PoiCategory::LOCOMOTIVE: return "locomotive";
+        case PoiCategory::CANNON: return "cannon";
+        case PoiCategory::TOMB: return "tomb";
+        case PoiCategory::MANOR: return "manor";
         case PoiCategory::PLACE_OF_WORSHIP: return "place_of_worship"; case PoiCategory::UNIVERSITY: return "university";
         case PoiCategory::COLLEGE: return "college"; case PoiCategory::HOSPITAL: return "hospital";
         case PoiCategory::THEATRE: return "theatre"; case PoiCategory::CINEMA: return "cinema";
@@ -395,11 +523,122 @@ inline const char* poi_category_label(PoiCategory cat) {
         case PoiCategory::WINDMILL: return "windmill"; case PoiCategory::BRIDGE: return "bridge";
         case PoiCategory::PIER: return "pier"; case PoiCategory::DAM: return "dam";
         case PoiCategory::OBSERVATORY: return "observatory";
+        case PoiCategory::SILO: return "silo";
+        case PoiCategory::CHIMNEY: return "chimney";
+        case PoiCategory::WATERMILL: return "watermill";
         case PoiCategory::CATHEDRAL: return "cathedral"; case PoiCategory::PALACE: return "palace";
         case PoiCategory::NATIONAL_PARK: return "national_park"; case PoiCategory::PROTECTED_AREA: return "protected_area";
         case PoiCategory::WINERY: return "winery"; case PoiCategory::BREWERY: return "brewery";
         case PoiCategory::POWER_PLANT: return "power_plant";
         case PoiCategory::GOVERNMENT: return "government";
+        case PoiCategory::HOTEL: return "hotel";
+        case PoiCategory::MOTEL: return "motel";
+        case PoiCategory::GUEST_HOUSE: return "guest_house";
+        case PoiCategory::HOSTEL: return "hostel";
+        case PoiCategory::APARTMENT: return "apartment";
+        case PoiCategory::CHALET: return "chalet";
+        case PoiCategory::CARAVAN_SITE: return "caravan_site";
+        case PoiCategory::INFORMATION: return "information";
+        case PoiCategory::RESTAURANT: return "restaurant";
+        case PoiCategory::CAFE: return "cafe";
+        case PoiCategory::BAR: return "bar";
+        case PoiCategory::PUB: return "pub";
+        case PoiCategory::FAST_FOOD: return "fast_food";
+        case PoiCategory::ICE_CREAM: return "ice_cream";
+        case PoiCategory::BIERGARTEN: return "biergarten";
+        case PoiCategory::FOOD_COURT: return "food_court";
+        case PoiCategory::NIGHTCLUB: return "nightclub";
+        case PoiCategory::SCHOOL: return "school";
+        case PoiCategory::KINDERGARTEN: return "kindergarten";
+        case PoiCategory::DRIVING_SCHOOL: return "driving_school";
+        case PoiCategory::MUSIC_SCHOOL: return "music_school";
+        case PoiCategory::PHARMACY: return "pharmacy";
+        case PoiCategory::DOCTORS: return "doctors";
+        case PoiCategory::DENTIST: return "dentist";
+        case PoiCategory::CLINIC: return "clinic";
+        case PoiCategory::VETERINARY: return "veterinary";
+        case PoiCategory::BANK: return "bank";
+        case PoiCategory::ATM: return "atm";
+        case PoiCategory::BUREAU_DE_CHANGE: return "bureau_de_change";
+        case PoiCategory::POST_OFFICE: return "post_office";
+        case PoiCategory::POST_BOX: return "post_box";
+        case PoiCategory::PARCEL_LOCKER: return "parcel_locker";
+        case PoiCategory::POLICE: return "police";
+        case PoiCategory::FIRE_STATION: return "fire_station";
+        case PoiCategory::TOWNHALL: return "townhall";
+        case PoiCategory::COURTHOUSE: return "courthouse";
+        case PoiCategory::COMMUNITY_CENTRE: return "community_centre";
+        case PoiCategory::SOCIAL_CENTRE: return "social_centre";
+        case PoiCategory::PLAYGROUND: return "playground";
+        case PoiCategory::PITCH: return "pitch";
+        case PoiCategory::TRACK: return "track";
+        case PoiCategory::FITNESS_STATION: return "fitness_station";
+        case PoiCategory::FITNESS_CENTRE: return "fitness_centre";
+        case PoiCategory::SHELTER: return "shelter";
+        case PoiCategory::SPORTS_CENTRE: return "sports_centre";
+        case PoiCategory::SPORTS_HALL: return "sports_hall";
+        case PoiCategory::BUS_STOP: return "bus_stop";
+        case PoiCategory::BUS_STATION: return "bus_station";
+        case PoiCategory::TAXI: return "taxi";
+        case PoiCategory::PARKING: return "parking";
+        case PoiCategory::BICYCLE_PARKING: return "bicycle_parking";
+        case PoiCategory::MOTORCYCLE_PARKING: return "motorcycle_parking";
+        case PoiCategory::FUEL: return "fuel";
+        case PoiCategory::CHARGING_STATION: return "charging_station";
+        case PoiCategory::SHOP: return "shop";
+        // Small amenities
+        case PoiCategory::TOILETS: return "toilets";
+        case PoiCategory::DRINKING_WATER: return "drinking_water";
+        case PoiCategory::BENCH: return "bench";
+        case PoiCategory::VENDING_MACHINE: return "vending_machine";
+        case PoiCategory::WASTE_BASKET: return "waste_basket";
+        case PoiCategory::RECYCLING: return "recycling";
+        case PoiCategory::CLOCK: return "clock";
+        case PoiCategory::TELEPHONE: return "telephone";
+        case PoiCategory::BBQ: return "bbq";
+        // Arts/culture + education extras
+        case PoiCategory::ARTS_CENTRE: return "arts_centre";
+        case PoiCategory::STUDIO: return "studio";
+        case PoiCategory::LANGUAGE_SCHOOL: return "language_school";
+        case PoiCategory::TRAINING: return "training";
+        // Health extras
+        case PoiCategory::NURSING_HOME: return "nursing_home";
+        case PoiCategory::AMBULANCE_STATION: return "ambulance_station";
+        case PoiCategory::HOSPICE: return "hospice";
+        // Civic extras
+        case PoiCategory::MONASTERY: return "monastery";
+        case PoiCategory::GRAVE_YARD: return "grave_yard";
+        // Transport extras
+        case PoiCategory::CAR_WASH: return "car_wash";
+        case PoiCategory::CAR_RENTAL: return "car_rental";
+        case PoiCategory::BICYCLE_RENTAL: return "bicycle_rental";
+        case PoiCategory::BICYCLE_REPAIR_STATION: return "bicycle_repair_station";
+        case PoiCategory::VEHICLE_INSPECTION: return "vehicle_inspection";
+        // Leisure extras
+        case PoiCategory::SAUNA: return "sauna";
+        case PoiCategory::HORSE_RIDING: return "horse_riding";
+        case PoiCategory::BIRD_HIDE: return "bird_hide";
+        case PoiCategory::MINIATURE_GOLF: return "miniature_golf";
+        // Shop sub-types
+        case PoiCategory::SHOP_SUPERMARKET: return "supermarket";
+        case PoiCategory::SHOP_CONVENIENCE: return "convenience";
+        case PoiCategory::SHOP_CLOTHES: return "clothes";
+        case PoiCategory::SHOP_MALL: return "mall";
+        case PoiCategory::SHOP_DEPARTMENT_STORE: return "department_store";
+        case PoiCategory::SHOP_BAKERY: return "bakery";
+        case PoiCategory::SHOP_BUTCHER: return "butcher";
+        case PoiCategory::SHOP_HARDWARE: return "hardware";
+        case PoiCategory::SHOP_ELECTRONICS: return "electronics";
+        case PoiCategory::SHOP_FURNITURE: return "furniture";
+        case PoiCategory::SHOP_JEWELRY: return "jewelry";
+        case PoiCategory::SHOP_BOOKS: return "books";
+        case PoiCategory::SHOP_PET: return "pet";
+        // Named rank-30 feature that didn't match a specific
+        // PoiCategory. "feature" reads better than "unknown" when
+        // an occasional OSM tagging that we don't special-case
+        // bubbles up to the client (e.g. a named office=ngo or
+        // amenity=studio).
+        case PoiCategory::UNNAMED_RANK30: return "feature";
         default: return "unknown";
     }
 }

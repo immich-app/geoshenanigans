@@ -307,41 +307,49 @@ fn place_type_to_field(pt: u8) -> Option<&'static str> {
 // rank-30 filler.
 fn poi_category_to_osm_class(cat: u8) -> Option<&'static str> {
     match cat {
-        // tourism (museum=0, attraction=1, viewpoint=2, theme_park=3,
-        // zoo=4, gallery=5, artwork=6, alpine_hut=7, aquarium=8,
-        // camp_site=9, picnic_site=10, resort=11)
-        0..=11 => Some("tourism"),
-        // historic (castle=20, monument=21, ruins=22,
-        // archaeological_site=23, memorial=24, battlefield=25,
-        // fort=26, ship=27)
-        20..=27 => Some("historic"),
-        // amenity (place_of_worship=40, university=41, college=42,
-        // hospital=43, theatre=44, cinema=45, library=46,
-        // marketplace=47, embassy=48, fountain=49, casino=50,
-        // cemetery=51, ferry_terminal=52, planetarium=53, prison=54)
+        // tourism: museum, attraction, viewpoint, theme_park, zoo,
+        // gallery, artwork, alpine_hut, aquarium, camp_site,
+        // picnic_site, resort, hotel, information, motel,
+        // guest_house, hostel, apartment, chalet, caravan_site
+        0..=19 => Some("tourism"),
+        // historic: castle, monument, ruins, archaeological_site,
+        // memorial, battlefield, fort, ship, wayside_cross,
+        // wayside_shrine, city_gate, citywalls, boundary_stone,
+        // milestone, mine, aircraft, locomotive, cannon, tomb, manor
+        20..=39 => Some("historic"),
+        // amenity landmarks (40-54)
         40..=54 => Some("amenity"),
-        // leisure (park=60, nature_reserve=61, stadium=62, garden=63,
-        // water_park=64, golf_course=65, marina=66)
-        60..=66 => Some("leisure"),
-        // natural — only surface the small, specific ones. Skip
-        // island=93 (area-label), bay=91, cape=92 (admin-scale).
-        82 | 83 | 84 | 85 | 87 | 88 | 89 | 90 => Some("natural"),
-        // peak=80, volcano=81, glacier=86 — let these through too
-        80 | 81 | 86 => Some("natural"),
-        // aeroway=aerodrome
+        // amenity civic (55-59, 67-69) — keep `amenity` class
+        55..=59 | 67..=69 => Some("amenity"),
+        // leisure (60-66, 70-72, 77-79)
+        60..=66 | 70..=72 | 77..=79 => Some("leisure"),
+        // transport / commerce root (73 bus_stop, 75 fuel, 76 shop)
+        73 | 75 | 76 => Some("amenity"),
+        // natural — skip large area-label values (bay=91, cape=92,
+        // island=93). Everything else in 80..=90 is small enough.
+        80..=90 => Some("natural"),
+        // aeroway, railway
         100 => Some("aeroway"),
-        // railway=station
         105 => Some("railway"),
-        // man_made (tower=110, lighthouse=111, windmill=112,
-        // bridge=113, pier=114, dam=115, observatory=116)
-        110..=116 => Some("man_made"),
-        // building (cathedral=120, palace=121)
+        // man_made (110..=119)
+        110..=119 => Some("man_made"),
+        // building (cathedral, palace)
         120..=121 => Some("building"),
         // office=government
         160 => Some("office"),
+        // Small-amenity sub-categories (171..=179) — toilets, clock…
+        171..=179 => Some("amenity"),
+        // Food / civic / health / finance / mail / transport extras
+        // (180..=234) all stay in `amenity`
+        180..=234 => Some("amenity"),
+        // Leisure extras (235..=240) stay in `leisure`
+        235..=240 => Some("leisure"),
+        // Shop sub-categories (241..=253)
+        241..=253 => Some("shop"),
         // Excluded: national_park=130, protected_area=131 (too large
-        // as a display name — Yosemite covers thousands of km²),
-        // winery/brewery (too specific), power_plant, unnamed_rank30.
+        // for a display name); winery=140, brewery=141, power_plant
+        // =150 (specialised). UNNAMED_RANK30=170 never surfaces as a
+        // landmark (by definition generic).
         _ => None,
     }
 }
@@ -3028,18 +3036,19 @@ impl Index {
         let (landmark_tourism, landmark_historic, landmark_amenity,
              landmark_leisure, landmark_natural, landmark_man_made,
              landmark_building, landmark_aeroway, landmark_railway,
-             landmark_office) = match landmark {
-            Some((n, "tourism"))   => (Some(n), None, None, None, None, None, None, None, None, None),
-            Some((n, "historic"))  => (None, Some(n), None, None, None, None, None, None, None, None),
-            Some((n, "amenity"))   => (None, None, Some(n), None, None, None, None, None, None, None),
-            Some((n, "leisure"))   => (None, None, None, Some(n), None, None, None, None, None, None),
-            Some((n, "natural"))   => (None, None, None, None, Some(n), None, None, None, None, None),
-            Some((n, "man_made"))  => (None, None, None, None, None, Some(n), None, None, None, None),
-            Some((n, "building"))  => (None, None, None, None, None, None, Some(n), None, None, None),
-            Some((n, "aeroway"))   => (None, None, None, None, None, None, None, Some(n), None, None),
-            Some((n, "railway"))   => (None, None, None, None, None, None, None, None, Some(n), None),
-            Some((n, "office"))    => (None, None, None, None, None, None, None, None, None, Some(n)),
-            _ => (None, None, None, None, None, None, None, None, None, None),
+             landmark_office, landmark_shop) = match landmark {
+            Some((n, "tourism"))   => (Some(n), None, None, None, None, None, None, None, None, None, None),
+            Some((n, "historic"))  => (None, Some(n), None, None, None, None, None, None, None, None, None),
+            Some((n, "amenity"))   => (None, None, Some(n), None, None, None, None, None, None, None, None),
+            Some((n, "leisure"))   => (None, None, None, Some(n), None, None, None, None, None, None, None),
+            Some((n, "natural"))   => (None, None, None, None, Some(n), None, None, None, None, None, None),
+            Some((n, "man_made"))  => (None, None, None, None, None, Some(n), None, None, None, None, None),
+            Some((n, "building"))  => (None, None, None, None, None, None, Some(n), None, None, None, None),
+            Some((n, "aeroway"))   => (None, None, None, None, None, None, None, Some(n), None, None, None),
+            Some((n, "railway"))   => (None, None, None, None, None, None, None, None, Some(n), None, None),
+            Some((n, "office"))    => (None, None, None, None, None, None, None, None, None, Some(n), None),
+            Some((n, "shop"))      => (None, None, None, None, None, None, None, None, None, None, Some(n)),
+            _ => (None, None, None, None, None, None, None, None, None, None, None),
         };
         let address = AddressDetails {
             tourism: landmark_tourism,
@@ -3052,6 +3061,7 @@ impl Index {
             aeroway: landmark_aeroway,
             railway: landmark_railway,
             office: landmark_office,
+            shop: landmark_shop,
             house_number,
             road,
             city: admin.city.or(place.city).or(fallback_city),
@@ -3368,6 +3378,8 @@ struct AddressDetails<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     office: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    shop: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     house_number: Option<Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     road: Option<&'a str>,
@@ -3516,6 +3528,7 @@ fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
     if let Some(s) = addr.aeroway  { entries.push((32, s.to_string())); }
     if let Some(s) = addr.railway  { entries.push((32, s.to_string())); }
     if let Some(s) = addr.office   { entries.push((32, s.to_string())); }
+    if let Some(s) = addr.shop     { entries.push((32, s.to_string())); }
 
     // Rank 30: house_number + road
     if let Some(road) = addr.road {
