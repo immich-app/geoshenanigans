@@ -2030,6 +2030,14 @@ impl Index {
 
                 let dist_m;
                 let contained;
+                // Polygon area via the shoelace formula, in squared-
+                // degree units. Only computed for contained polygons
+                // and used solely as a tie-break to prefer the more
+                // specific polygon when multiple contain the query
+                // (Eiffel Tower's ~0.0000002 over Field of Mars's
+                // ~0.00001 over Banks of the Seine's much larger
+                // area).
+                let mut area_sq_deg = 0.0_f64;
 
                 if poi.vertex_count > 0 && (poi.vertex_offset as usize) < all_poi_vertices.len() {
                     let offset = poi.vertex_offset as usize;
@@ -2039,6 +2047,13 @@ impl Index {
 
                     if contained {
                         dist_m = 0.0;
+                        let mut a = 0.0_f64;
+                        for i in 0..count {
+                            let j = if i + 1 < count { i + 1 } else { 0 };
+                            a += verts[i].lng as f64 * verts[j].lat as f64
+                               - verts[j].lng as f64 * verts[i].lat as f64;
+                        }
+                        area_sq_deg = (a / 2.0).abs();
                     } else {
                         let mut min_dist_sq = f64::MAX;
                         for i in 0..count {
@@ -2100,12 +2115,33 @@ impl Index {
                     distance_m: if contained { 0.0 } else { dist_m },
                     contained,
                     score,
+                    area: area_sq_deg,
                 });
             });
         }
 
-        // Sort by score descending
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        // Ordering:
+        //   1. Contained polygons first — the query is physically
+        //      inside them, so they beat any nearby point POI
+        //      regardless of score.
+        //   2. Within contained, sort by polygon area ascending —
+        //      smallest = most specific (Eiffel Tower over Field of
+        //      Mars over "Paris, Banks of the Seine"). Area beats
+        //      importance here: a wikidata-boosted attraction that
+        //      happens to be the bigger containing polygon should
+        //      not outrank the tiny, specific landmark the user
+        //      clicked on.
+        //   3. Non-contained POIs: by score descending (the usual
+        //      importance × proximity-decay).
+        results.sort_by(|a, b| {
+            use std::cmp::Ordering;
+            match (a.contained, b.contained) {
+                (true, false) => Ordering::Less,
+                (false, true) => Ordering::Greater,
+                (true, true) => a.area.partial_cmp(&b.area).unwrap_or(Ordering::Equal),
+                (false, false) => b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal),
+            }
+        });
         let mut seen = std::collections::HashSet::new();
         results.retain(|r| seen.insert(r.name));
         results.truncate(5);
@@ -3170,6 +3206,11 @@ struct PoiMatch<'a> {
     distance_m: f64,
     contained: bool,
     score: f64,
+    // Polygon area in (squared-degree-ish shoelace units). Used to
+    // tie-break between POIs that all contain the query — the
+    // smallest polygon is the most specific ("Eiffel Tower" rather
+    // than "Field of Mars"). 0.0 for point POIs or uncontained.
+    area: f64,
 }
 
 #[derive(Default)]
