@@ -566,6 +566,14 @@ struct PoiRecord {
     // NO_DATA (0xFFFFFFFF) if the POI isn't inside any postal
     // boundary.
     uint32_t parent_postcode_id = 0xFFFFFFFF;
+    // Polygon id of the smallest admin boundary (admin_level <= 10)
+    // containing the POI. The server walks admin_parents from here
+    // to get the POI's administrative chain — a cheap approximation
+    // of Nominatim's parent_place_id walk. Used to demote POIs
+    // whose chain doesn't match the query's admin chain (e.g. a
+    // cross-border landmark that happens to be spatially nearest).
+    // NO_DATA (0xFFFFFFFF) if no containing admin polygon found.
+    uint32_t parent_poly_id = 0xFFFFFFFF;
 };
 
 // Collected POI relation data for parallel polygon assembly

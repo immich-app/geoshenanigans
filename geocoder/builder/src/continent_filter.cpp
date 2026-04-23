@@ -300,6 +300,17 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         }
     }
 
+    // poi_records.parent_poly_id — same treatment. Records whose
+    // parent admin polygon was filtered out by the continent split
+    // get NO_DATA (server treats missing parent as unknown and skips
+    // the chain-containment penalty for those rows).
+    for (auto& pr : out.poi_records) {
+        if (pr.parent_poly_id != NO_DATA) {
+            auto it = admin_remap.find(pr.parent_poly_id);
+            pr.parent_poly_id = (it != admin_remap.end()) ? it->second : NO_DATA;
+        }
+    }
+
     // --- Project postcode-id parallel arrays ---
     // Values are string offsets in full.string_pool — remapped during string
     // compaction below.

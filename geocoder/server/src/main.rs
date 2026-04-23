@@ -126,6 +126,15 @@ struct PoiRecord {
     /// parent_place_id. `NO_DATA` if no postal boundary contains
     /// this POI.
     parent_postcode_id: u32,
+    /// Smallest admin polygon (admin_level 2..10) containing the
+    /// POI, computed at build time via PIP. Used by the server as
+    /// the starting point of a chain-containment check: when the
+    /// primary is a POI whose admin ancestry doesn't include the
+    /// query's containing city/state, the POI is demoted in favour
+    /// of a more locally-correct candidate. `NO_DATA` if no admin
+    /// boundary contains the POI (e.g. ocean nodes, cross-border
+    /// features lost during continent-filter remap).
+    parent_poly_id: u32,
 }
 
 const POI_FLAG_WIKIPEDIA: u8 = 0x01;
@@ -1783,6 +1792,42 @@ impl Index {
         )
     }
 
+    // Chain-containment check for a POI primary candidate.
+    // The POI's parent_poly_id is the smallest admin polygon (level
+    // 2..10) that contained the POI at build time. At query time we
+    // verify that polygon actually contains the query point — if it
+    // does, the POI is in the same admin jurisdiction as the query
+    // and is a valid primary candidate. If not, the POI centroid
+    // sits in a different admin (common for river-boundary landmarks
+    // and cross-border features) and we reject it.
+    //
+    // POIs built before parent_poly_id was added have NO_DATA and
+    // always pass. POIs whose parent was dropped during continent-
+    // filter remap also have NO_DATA and pass.
+    fn poi_chain_contains_query(&self, poi: &PoiRecord, lat: f64, lng: f64) -> bool {
+        if poi.parent_poly_id == NO_DATA { return true; }
+        let all_polygons: &[AdminPolygon] = unsafe {
+            std::slice::from_raw_parts(
+                self.admin_polygons.as_ptr() as *const AdminPolygon,
+                self.admin_polygons.len() / std::mem::size_of::<AdminPolygon>(),
+            )
+        };
+        let pid = poi.parent_poly_id as usize;
+        if pid >= all_polygons.len() { return true; }
+        let poly = &all_polygons[pid];
+        let all_vertices: &[NodeCoord] = unsafe {
+            std::slice::from_raw_parts(
+                self.admin_vertices.as_ptr() as *const NodeCoord,
+                self.admin_vertices.len() / std::mem::size_of::<NodeCoord>(),
+            )
+        };
+        let off = poly.vertex_offset as usize;
+        let cnt = poly.vertex_count as usize;
+        if off + cnt > all_vertices.len() { return true; }
+        let verts = &all_vertices[off..off + cnt];
+        point_in_polygon(lat as f32, lng as f32, verts)
+    }
+
     // --- POI primary-feature lookup ---
     //
     // Returns the nearest POI with a valid parent_street_id to the
@@ -2526,7 +2571,18 @@ impl Index {
             let r = 100.0_f64 / 6_371_000.0;
             r * r
         };
-        let poi_primary = poi_primary_raw.filter(|(d, _)| *d <= poi_max_sq);
+        let poi_primary = poi_primary_raw
+            .filter(|(d, _)| *d <= poi_max_sq)
+            // Chain-containment check: reject POIs whose parent admin
+            // polygon isn't in the query's containing admin chain.
+            // A river-boundary landmark whose centroid sits on the
+            // other side of the state line would otherwise win as
+            // primary for a query on the "correct" side; this filter
+            // confirms the POI's pre-computed parent_poly_id actually
+            // contains the query point before letting it compete.
+            // POIs built with pre-#11 builders have parent_poly_id =
+            // NO_DATA and bypass this check so old data still works.
+            .filter(|(_, p)| self.poi_chain_contains_query(p, lat, lng));
 
         // addr_dist already reflects real distance-to-polygon for
         // building-sourced addr_points (computed in the cell sweep via
