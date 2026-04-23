@@ -2067,9 +2067,26 @@ impl Index {
                     if dist_m > effective_max { return; }
                 }
 
-                // Score with squared distance decay
+                // Islands (PoiCategory::ISLAND=93) are admin-level
+                // area labels (Manhattan Island, Staten Island,
+                // Manhattan-level stuff) — they duplicate what
+                // address.borough / address.suburb already convey and
+                // crowd out true landmarks. Drop from places[] so a
+                // query at Strawberry Fields doesn't lead with
+                // "Manhattan Island, Central Park, 72nd Street".
+                if poi.category == 93 { return; }
+                // Score with squared distance decay. Contained-polygon
+                // POIs (Disneyland / London Zoo / Yellowstone / a
+                // university campus around the query) get an explicit
+                // 3× boost so they surface ahead of the cluster of
+                // point-attractions inside them. Without the boost,
+                // clicking Walt's Plaza returns "Astro Orbitor /
+                // Buzz Lightyear / ..." with Disneyland buried at rank
+                // 10+ — the user almost certainly wants "Disneyland"
+                // as the primary landmark label and the rides as
+                // supporting context.
                 let proximity_weight = if contained {
-                    1.0
+                    3.0
                 } else {
                     let r = dist_m / ref_dist;
                     1.0 / (1.0 + r * r)
@@ -2683,17 +2700,23 @@ impl Index {
         // don't drag in a landmark from kilometres away.
         //
         // Boost: 50 m subtracted from the comparison distance for
-        // tier-1 POIs. Keeps the boost tight enough that random
-        // side-street queries don't flip to a nearby landmark (LA
-        // Civic Center, Cairo El Tahrir), while still letting a
-        // landmark-adjacent query (Eiffel Tower, Statue of Liberty)
-        // beat a marginally-closer side road.
+        // tier-1 POLYGON POIs (vertex_count > 0). Keeps the boost
+        // tight enough that random side-street queries don't flip to
+        // a nearby landmark (LA Civic Center, Cairo El Tahrir), while
+        // still letting a landmark-inside-polygon query win over a
+        // slightly-closer side road. Point-POIs (tier-1 attractions
+        // like "Kilometre zero" in Red Square) are excluded because
+        // they typically lack parent_postcode and would drop the
+        // address' postcode when they win — Moscow 109012 regressed
+        // to '—' when the tier-1 boost applied to a point attraction.
         let tier1_bonus_sq: f64 = {
             let r = 50.0_f64 / 6_371_000.0_f64;
             r * r
         };
         let compare_poi_dist = match poi_primary.as_ref() {
-            Some((_, poi)) if poi.tier == 1 && effective_poi_dist < max_dist => {
+            Some((_, poi)) if poi.tier == 1
+                && poi.vertex_count > 0
+                && effective_poi_dist < max_dist => {
                 if effective_poi_dist > tier1_bonus_sq {
                     effective_poi_dist - tier1_bonus_sq
                 } else {

@@ -414,7 +414,7 @@ inline uint8_t category_base_importance(PoiCategory cat) {
             return 30;
         case PoiCategory::MUSEUM: case PoiCategory::ATTRACTION:
         case PoiCategory::CASTLE: case PoiCategory::STADIUM:
-        case PoiCategory::UNIVERSITY: case PoiCategory::STATION:
+        case PoiCategory::UNIVERSITY:
         case PoiCategory::LIGHTHOUSE: case PoiCategory::WATERFALL:
             return 20;
         case PoiCategory::PARK: case PoiCategory::NATURE_RESERVE:
@@ -422,14 +422,20 @@ inline uint8_t category_base_importance(PoiCategory cat) {
         case PoiCategory::FORT: case PoiCategory::MONUMENT:
         case PoiCategory::VIEWPOINT: case PoiCategory::DAM:
         case PoiCategory::OBSERVATORY: case PoiCategory::PROTECTED_AREA:
+        case PoiCategory::MEMORIAL:
             return 15;
         case PoiCategory::PLACE_OF_WORSHIP: case PoiCategory::HOSPITAL:
         case PoiCategory::THEATRE: case PoiCategory::CAVE_ENTRANCE:
         case PoiCategory::BRIDGE: case PoiCategory::TOWER:
         case PoiCategory::PEAK: case PoiCategory::GOVERNMENT:
+        // STATION demoted from 20 → 10: transit stations are landmarks
+        // but subway entrances in dense cities otherwise shadow
+        // actual tourist landmarks in the places[] list (72nd Street
+        // beating Strawberry Fields at the Central Park memorial).
+        case PoiCategory::STATION:
             return 10;
         case PoiCategory::LIBRARY: case PoiCategory::CINEMA:
-        case PoiCategory::MEMORIAL: case PoiCategory::GALLERY:
+        case PoiCategory::GALLERY:
         case PoiCategory::GARDEN: case PoiCategory::MARINA:
         case PoiCategory::PIER: case PoiCategory::SPRING:
         case PoiCategory::CAMP_SITE: case PoiCategory::BREWERY:
@@ -458,10 +464,17 @@ inline uint16_t category_reference_distance(PoiCategory cat) {
         case PoiCategory::AERODROME: case PoiCategory::NATIONAL_PARK:
         case PoiCategory::PROTECTED_AREA: case PoiCategory::POWER_PLANT:
             return 100;
-        case PoiCategory::MONUMENT: case PoiCategory::MEMORIAL: case PoiCategory::FOUNTAIN:
+        case PoiCategory::FOUNTAIN:
         case PoiCategory::ARTWORK: case PoiCategory::GEYSER: case PoiCategory::PICNIC_SITE:
         case PoiCategory::EMBASSY:
             return 50;
+        case PoiCategory::MONUMENT: case PoiCategory::MEMORIAL:
+            // Memorials / monuments (Strawberry Fields, JFK memorial,
+            // Holocaust Memorial) are landmarks people recognise from
+            // further away than a 50 m fountain. Extend their ref
+            // distance to 100 m so they surface in places[] for
+            // queries a short walk away, not just on top of them.
+            return 100;
         case PoiCategory::MUSEUM: case PoiCategory::ATTRACTION: case PoiCategory::GALLERY:
         case PoiCategory::AQUARIUM: case PoiCategory::CASTLE: case PoiCategory::SHIP:
         case PoiCategory::PLACE_OF_WORSHIP: case PoiCategory::THEATRE: case PoiCategory::CINEMA:
@@ -503,10 +516,14 @@ inline uint16_t category_max_distance(PoiCategory cat) {
         case PoiCategory::PROTECTED_AREA: case PoiCategory::POWER_PLANT:
             return 0;
         // Tiny
-        case PoiCategory::ARTWORK: case PoiCategory::FOUNTAIN: case PoiCategory::MEMORIAL:
-        case PoiCategory::PICNIC_SITE: case PoiCategory::GEYSER: case PoiCategory::MONUMENT:
+        case PoiCategory::ARTWORK: case PoiCategory::FOUNTAIN:
+        case PoiCategory::PICNIC_SITE: case PoiCategory::GEYSER:
         case PoiCategory::EMBASSY:
             return 200;
+        // Memorials / monuments get landmark-scale max (500 m) since
+        // their names travel further than the fountain-tier tiny POIs.
+        case PoiCategory::MEMORIAL: case PoiCategory::MONUMENT:
+            return 500;
         // Small
         case PoiCategory::MUSEUM: case PoiCategory::ATTRACTION: case PoiCategory::CASTLE:
         case PoiCategory::CATHEDRAL: case PoiCategory::PALACE: case PoiCategory::THEATRE:
