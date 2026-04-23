@@ -2918,16 +2918,20 @@ impl Index {
         }
 
         let pois = self.find_pois(lat, lng);
-        // Landmark field: surface the smallest-area contained polygon
-        // POI in its OSM-class field (tourism / historic / amenity /
-        // leisure / …). Mirrors Nominatim's behaviour of populating
-        // `address.tourism = "Statue Of Liberty"` when the query is
-        // inside a tourism polygon. find_pois already sorts contained
-        // polygons first by area ascending, so the first qualifying
-        // hit is the most specific enclosing landmark.
-        let landmark: Option<(&str, &'static str)> = pois.iter().find_map(|p| {
+        // Landmark: name of the smallest contained polygon POI whose
+        // category is a surfaceable landmark class (filters out
+        // admin-level area labels, generic UNNAMED_RANK30 and very
+        // large natural / boundary features). find_pois already
+        // sorts contained polygons first by area ascending, so the
+        // first qualifying hit is the most specific enclosing
+        // landmark.
+        let landmark_name: Option<&str> = pois.iter().find_map(|p| {
             if !p.contained { return None; }
-            poi_category_to_osm_class(p.category_id).map(|cls| (p.name, cls))
+            if poi_category_to_osm_class(p.category_id).is_some() {
+                Some(p.name)
+            } else {
+                None
+            }
         });
         // De-dupe by name, keep nearest instance. Chain outlets in
         // dense cities (Starbucks / McDonald's / 7-Eleven) often
@@ -3030,38 +3034,8 @@ impl Index {
         } else {
             None
         };
-        // Split the landmark (name, osm_class) into the matching
-        // typed field so exactly one of tourism/historic/amenity/etc.
-        // is populated.
-        let (landmark_tourism, landmark_historic, landmark_amenity,
-             landmark_leisure, landmark_natural, landmark_man_made,
-             landmark_building, landmark_aeroway, landmark_railway,
-             landmark_office, landmark_shop) = match landmark {
-            Some((n, "tourism"))   => (Some(n), None, None, None, None, None, None, None, None, None, None),
-            Some((n, "historic"))  => (None, Some(n), None, None, None, None, None, None, None, None, None),
-            Some((n, "amenity"))   => (None, None, Some(n), None, None, None, None, None, None, None, None),
-            Some((n, "leisure"))   => (None, None, None, Some(n), None, None, None, None, None, None, None),
-            Some((n, "natural"))   => (None, None, None, None, Some(n), None, None, None, None, None, None),
-            Some((n, "man_made"))  => (None, None, None, None, None, Some(n), None, None, None, None, None),
-            Some((n, "building"))  => (None, None, None, None, None, None, Some(n), None, None, None, None),
-            Some((n, "aeroway"))   => (None, None, None, None, None, None, None, Some(n), None, None, None),
-            Some((n, "railway"))   => (None, None, None, None, None, None, None, None, Some(n), None, None),
-            Some((n, "office"))    => (None, None, None, None, None, None, None, None, None, Some(n), None),
-            Some((n, "shop"))      => (None, None, None, None, None, None, None, None, None, None, Some(n)),
-            _ => (None, None, None, None, None, None, None, None, None, None, None),
-        };
         let address = AddressDetails {
-            tourism: landmark_tourism,
-            historic: landmark_historic,
-            amenity: landmark_amenity,
-            leisure: landmark_leisure,
-            natural: landmark_natural,
-            man_made: landmark_man_made,
-            building: landmark_building,
-            aeroway: landmark_aeroway,
-            railway: landmark_railway,
-            office: landmark_office,
-            shop: landmark_shop,
+            landmark: landmark_name,
             house_number,
             road,
             city: admin.city.or(place.city).or(fallback_city),
@@ -3351,34 +3325,14 @@ struct AdminResult<'a> {
 
 #[derive(Serialize, Default)]
 struct AddressDetails<'a> {
-    // Landmark fields populated when a tier-1 polygon POI contains
-    // the query point. The field name matches the OSM top-level
-    // class of the feature (Nominatim's convention) so API consumers
-    // that already key on `tourism` / `historic` / etc. work
-    // unchanged. Only one of these fields is ever set per response —
-    // the smallest-area contained polygon wins.
+    // Landmark field: set to the name of the smallest-area
+    // polygon POI that contains the query point. Category details
+    // (specific type, distance, …) live in places[], so a single
+    // field here is enough to let display_name lead with the
+    // landmark name while clients still know the "what" via
+    // places[0].category.
     #[serde(skip_serializing_if = "Option::is_none")]
-    tourism: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    historic: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    amenity: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    leisure: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    natural: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    man_made: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    building: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    aeroway: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    railway: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    office: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    shop: Option<&'a str>,
+    landmark: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     house_number: Option<Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3513,22 +3467,12 @@ fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
     // and drops the duplicate city.
     let mut entries: Vec<(u8, String)> = Vec::new();
 
-    // Rank 32: landmark class fields (tourism / historic / amenity /
-    // leisure / …). Higher than road so the landmark name leads the
-    // display line — "Eiffel Tower, 5 Avenue Gustave Eiffel, Paris,
-    // France" reads better than the road alone. Only one of these
-    // is ever populated per response.
-    if let Some(s) = addr.tourism  { entries.push((32, s.to_string())); }
-    if let Some(s) = addr.historic { entries.push((32, s.to_string())); }
-    if let Some(s) = addr.amenity  { entries.push((32, s.to_string())); }
-    if let Some(s) = addr.leisure  { entries.push((32, s.to_string())); }
-    if let Some(s) = addr.natural  { entries.push((32, s.to_string())); }
-    if let Some(s) = addr.man_made { entries.push((32, s.to_string())); }
-    if let Some(s) = addr.building { entries.push((32, s.to_string())); }
-    if let Some(s) = addr.aeroway  { entries.push((32, s.to_string())); }
-    if let Some(s) = addr.railway  { entries.push((32, s.to_string())); }
-    if let Some(s) = addr.office   { entries.push((32, s.to_string())); }
-    if let Some(s) = addr.shop     { entries.push((32, s.to_string())); }
+    // Rank 32: landmark name. Higher than road so the landmark
+    // leads the display line — "Eiffel Tower, 5 Avenue Gustave
+    // Eiffel, Paris, France" reads better than the road alone.
+    // The category / OSM type is carried on places[0] for clients
+    // that need it, so a single field here is enough.
+    if let Some(s) = addr.landmark { entries.push((32, s.to_string())); }
 
     // Rank 30: house_number + road
     if let Some(road) = addr.road {

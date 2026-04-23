@@ -999,7 +999,8 @@ int main(int argc, char* argv[]) {
                                    const char* t_office,
                                    const char* t_wikipedia, const char* t_wikidata,
                                    const char* t_highway,
-                                   const char* t_shop)
+                                   const char* t_shop,
+                                   const char* t_landuse)
                 -> std::optional<PoiClassification> {
                 PoiCategory cat = PoiCategory::UNKNOWN;
 
@@ -1057,6 +1058,35 @@ int main(int argc, char* argv[]) {
                 if (cat == PoiCategory::UNKNOWN && t_boundary) {
                     if (std::strcmp(t_boundary, "national_park") == 0) cat = PoiCategory::NATIONAL_PARK;
                     else if (std::strcmp(t_boundary, "protected_area") == 0) cat = PoiCategory::PROTECTED_AREA;
+                    // `boundary=forest` (managed-forest admin) folds
+                    // into WOOD since both surface as "named forested
+                    // area" in the landmark line.
+                    else if (std::strcmp(t_boundary, "forest") == 0) cat = PoiCategory::WOOD;
+                }
+                // landuse — only named landuse polygons get indexed.
+                // Note: classify_poi still falls through for unnamed
+                // features to UNNAMED_RANK30 below, but landuse is
+                // deliberately NOT in that fallback's trigger list so
+                // unnamed residential/industrial zones don't flood
+                // the index.
+                if (cat == PoiCategory::UNKNOWN && t_landuse) {
+                    if (std::strcmp(t_landuse, "forest") == 0) cat = PoiCategory::WOOD;
+                    else if (std::strcmp(t_landuse, "meadow") == 0) cat = PoiCategory::MEADOW;
+                    else if (std::strcmp(t_landuse, "orchard") == 0) cat = PoiCategory::ORCHARD;
+                    else if (std::strcmp(t_landuse, "vineyard") == 0) cat = PoiCategory::VINEYARD;
+                    else if (std::strcmp(t_landuse, "farmland") == 0) cat = PoiCategory::FARMLAND;
+                    else if (std::strcmp(t_landuse, "allotments") == 0) cat = PoiCategory::ALLOTMENTS;
+                    else if (std::strcmp(t_landuse, "quarry") == 0) cat = PoiCategory::QUARRY;
+                    else if (std::strcmp(t_landuse, "reservoir") == 0) cat = PoiCategory::RESERVOIR;
+                    else if (std::strcmp(t_landuse, "basin") == 0) cat = PoiCategory::RESERVOIR;
+                    else if (std::strcmp(t_landuse, "recreation_ground") == 0) cat = PoiCategory::RECREATION_GROUND;
+                    else if (std::strcmp(t_landuse, "military") == 0) cat = PoiCategory::MILITARY;
+                    else if (std::strcmp(t_landuse, "religious") == 0) cat = PoiCategory::RELIGIOUS_LANDUSE;
+                    else if (std::strcmp(t_landuse, "cemetery") == 0) cat = PoiCategory::CEMETERY;
+                    else if (std::strcmp(t_landuse, "residential") == 0) cat = PoiCategory::RESIDENTIAL;
+                    else if (std::strcmp(t_landuse, "industrial") == 0) cat = PoiCategory::INDUSTRIAL;
+                    else if (std::strcmp(t_landuse, "commercial") == 0) cat = PoiCategory::COMMERCIAL;
+                    else if (std::strcmp(t_landuse, "retail") == 0) cat = PoiCategory::RETAIL;
                 }
                 // amenity
                 if (cat == PoiCategory::UNKNOWN && t_amenity) {
@@ -1181,6 +1211,17 @@ int main(int argc, char* argv[]) {
                     else if (std::strcmp(t_natural, "beach") == 0) cat = PoiCategory::BEACH;
                     else if (std::strcmp(t_natural, "cave_entrance") == 0) cat = PoiCategory::CAVE_ENTRANCE;
                     else if (std::strcmp(t_natural, "spring") == 0) cat = PoiCategory::SPRING;
+                    else if (std::strcmp(t_natural, "wood") == 0) cat = PoiCategory::WOOD;
+                    else if (std::strcmp(t_natural, "heath") == 0) cat = PoiCategory::HEATH;
+                    else if (std::strcmp(t_natural, "scrub") == 0) cat = PoiCategory::SCRUB;
+                    else if (std::strcmp(t_natural, "wetland") == 0) cat = PoiCategory::WETLAND;
+                    else if (std::strcmp(t_natural, "grassland") == 0) cat = PoiCategory::GRASSLAND;
+                    else if (std::strcmp(t_natural, "water") == 0) cat = PoiCategory::NATURAL_WATER;
+                    else if (std::strcmp(t_natural, "valley") == 0) cat = PoiCategory::VALLEY;
+                    else if (std::strcmp(t_natural, "ridge") == 0) cat = PoiCategory::RIDGE;
+                    else if (std::strcmp(t_natural, "saddle") == 0) cat = PoiCategory::SADDLE;
+                    else if (std::strcmp(t_natural, "gorge") == 0) cat = PoiCategory::GORGE;
+                    else if (std::strcmp(t_natural, "bare_rock") == 0) cat = PoiCategory::BARE_ROCK;
                     else if (std::strcmp(t_natural, "cliff") == 0) cat = PoiCategory::CLIFF;
                     else if (std::strcmp(t_natural, "arch") == 0) cat = PoiCategory::ARCH;
                     else if (std::strcmp(t_natural, "hot_spring") == 0) cat = PoiCategory::HOT_SPRING;
@@ -1366,6 +1407,7 @@ int main(int argc, char* argv[]) {
                         const char* n_ele = nullptr;
                         const char* n_highway = nullptr;
                         const char* n_shop = nullptr;
+                        const char* n_landuse = nullptr;
                         for (size_t i = 0; i < ntags; i++) {
                             if (tag_keys[i] >= st.size()) continue;
                             const auto& k = st[tag_keys[i]];
@@ -1388,7 +1430,10 @@ int main(int argc, char* argv[]) {
                                     if (k == "historic") n_historic = v;
                                     else if (k == "highway") n_highway = v;
                                     break;
-                                case 'l': if (k == "leisure") n_leisure = v; break;
+                                case 'l':
+                                    if (k == "leisure") n_leisure = v;
+                                    else if (k == "landuse") n_landuse = v;
+                                    break;
                                 case 'm': if (k == "man_made") n_man_made = v; break;
                                 case 'n':
                                     if (k == "name") n_name = v;
@@ -1444,7 +1489,7 @@ int main(int argc, char* argv[]) {
                                 n_man_made, n_building, n_craft, n_power, n_place, n_waterway,
                                 n_office,
                                 n_wikipedia, n_wikidata,
-                                n_highway, n_shop);
+                                n_highway, n_shop, n_landuse);
                             // Unnamed specific-category POIs are still
                             // noise in the display path (e.g. unnamed
                             // ATTRACTION / MONUMENT — no useful road to
@@ -1751,6 +1796,7 @@ int main(int argc, char* argv[]) {
                     const char* t_wikidata = nullptr;
                     const char* t_ele = nullptr;
                     const char* t_shop = nullptr;
+                    const char* t_landuse = nullptr;
                     for (size_t i = 0; i < ntags; i++) {
                         if (tag_keys[i] >= st.size()) continue;
                         const auto& k = st[tag_keys[i]];
@@ -1782,6 +1828,7 @@ int main(int argc, char* argv[]) {
                             case 'l':
                                 if (k == "leisure") t_leisure = v;
                                 else if (k == "linked_place") t_linked_place = v;
+                                else if (k == "landuse") t_landuse = v;
                                 break;
                             case 'm': if (k == "man_made") t_man_made = v; break;
                             case 'n':
@@ -1955,7 +2002,7 @@ int main(int argc, char* argv[]) {
                             t_man_made, t_building, t_craft, t_power, t_place, t_waterway,
                             t_office,
                             t_wikipedia, t_wikidata,
-                            t_highway, t_shop);
+                            t_highway, t_shop, t_landuse);
                         if (cls) {
                             // Compute centroid
                             double sum_lat = 0, sum_lng = 0;
@@ -5264,7 +5311,7 @@ int main(int argc, char* argv[]) {
 
         std::ofstream mf(output_dir + "/manifest.json");
         mf << "{\n";
-        mf << "  \"build_version\": 12,\n";
+        mf << "  \"build_version\": 13,\n";
         mf << "  \"patch_version\": 5,\n";
         mf << "  \"regions\": {\n";
 

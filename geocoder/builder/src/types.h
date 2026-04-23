@@ -268,6 +268,25 @@ enum class PoiCategory : uint8_t {
     PEAK = 80, VOLCANO = 81, BEACH = 82, CAVE_ENTRANCE = 83, SPRING = 84,
     WATERFALL = 85, GLACIER = 86, CLIFF = 87, ARCH = 88, HOT_SPRING = 89,
     GEYSER = 90, BAY = 91, CAPE = 92, ISLAND = 93,
+    // Woodland / forest — `natural=wood`, `boundary=forest`, and
+    // `landuse=forest` all fold into WOOD since from a reverse-
+    // geocode perspective they're the same feature (named forested
+    // area).
+    WOOD = 94, HEATH = 95, SCRUB = 96, WETLAND = 97, GRASSLAND = 98,
+    NATURAL_WATER = 99,
+    // Extra natural features — landforms people name. Skip
+    // `natural=tree` / `tree_row` which are ubiquitous and rarely
+    // named; an unnamed tree as a landmark is noise.
+    VALLEY = 132, RIDGE = 133, SADDLE = 134, GORGE = 135,
+    BARE_ROCK = 136,
+    // Landuse — only NAMED landuse polygons surface (unnamed
+    // residential / industrial / farmland would dominate otherwise).
+    MEADOW = 142, ORCHARD = 143, VINEYARD = 144, FARMLAND = 145,
+    ALLOTMENTS = 146, QUARRY = 147, RESERVOIR = 148,
+    RECREATION_GROUND = 149,
+    MILITARY = 151, RELIGIOUS_LANDUSE = 152,
+    RESIDENTIAL = 153, INDUSTRIAL = 154,
+    COMMERCIAL = 155, RETAIL = 156,
     // aeroway
     AERODROME = 100,
     // railway
@@ -401,6 +420,19 @@ inline uint8_t poi_get_default_tier(PoiCategory cat) {
         case PoiCategory::SHOP_ELECTRONICS: case PoiCategory::SHOP_FURNITURE:
         case PoiCategory::SHOP_JEWELRY: case PoiCategory::SHOP_BOOKS:
         case PoiCategory::SHOP_PET:
+        case PoiCategory::WOOD: case PoiCategory::HEATH:
+        case PoiCategory::SCRUB: case PoiCategory::WETLAND:
+        case PoiCategory::GRASSLAND: case PoiCategory::NATURAL_WATER:
+        case PoiCategory::VALLEY: case PoiCategory::RIDGE:
+        case PoiCategory::SADDLE: case PoiCategory::GORGE:
+        case PoiCategory::BARE_ROCK:
+        case PoiCategory::MEADOW: case PoiCategory::ORCHARD:
+        case PoiCategory::VINEYARD: case PoiCategory::FARMLAND:
+        case PoiCategory::ALLOTMENTS: case PoiCategory::QUARRY:
+        case PoiCategory::RESERVOIR: case PoiCategory::RECREATION_GROUND:
+        case PoiCategory::MILITARY: case PoiCategory::RELIGIOUS_LANDUSE:
+        case PoiCategory::RESIDENTIAL: case PoiCategory::INDUSTRIAL:
+        case PoiCategory::COMMERCIAL: case PoiCategory::RETAIL:
             return 3;
         // Generic rank-30 unnamed node — lowest priority for display/
         // ranking but eligible as a primary-feature candidate.
@@ -518,6 +550,31 @@ inline const char* poi_category_label(PoiCategory cat) {
         case PoiCategory::ARCH: return "arch"; case PoiCategory::HOT_SPRING: return "hot_spring";
         case PoiCategory::GEYSER: return "geyser"; case PoiCategory::BAY: return "bay";
         case PoiCategory::CAPE: return "cape"; case PoiCategory::ISLAND: return "island";
+        case PoiCategory::WOOD: return "wood";
+        case PoiCategory::HEATH: return "heath";
+        case PoiCategory::SCRUB: return "scrub";
+        case PoiCategory::WETLAND: return "wetland";
+        case PoiCategory::GRASSLAND: return "grassland";
+        case PoiCategory::NATURAL_WATER: return "water";
+        case PoiCategory::VALLEY: return "valley";
+        case PoiCategory::RIDGE: return "ridge";
+        case PoiCategory::SADDLE: return "saddle";
+        case PoiCategory::GORGE: return "gorge";
+        case PoiCategory::BARE_ROCK: return "bare_rock";
+        case PoiCategory::MEADOW: return "meadow";
+        case PoiCategory::ORCHARD: return "orchard";
+        case PoiCategory::VINEYARD: return "vineyard";
+        case PoiCategory::FARMLAND: return "farmland";
+        case PoiCategory::ALLOTMENTS: return "allotments";
+        case PoiCategory::QUARRY: return "quarry";
+        case PoiCategory::RESERVOIR: return "reservoir";
+        case PoiCategory::RECREATION_GROUND: return "recreation_ground";
+        case PoiCategory::MILITARY: return "military";
+        case PoiCategory::RELIGIOUS_LANDUSE: return "religious";
+        case PoiCategory::RESIDENTIAL: return "residential";
+        case PoiCategory::INDUSTRIAL: return "industrial";
+        case PoiCategory::COMMERCIAL: return "commercial";
+        case PoiCategory::RETAIL: return "retail";
         case PoiCategory::AERODROME: return "aerodrome"; case PoiCategory::STATION: return "station";
         case PoiCategory::TOWER: return "tower"; case PoiCategory::LIGHTHOUSE: return "lighthouse";
         case PoiCategory::WINDMILL: return "windmill"; case PoiCategory::BRIDGE: return "bridge";
