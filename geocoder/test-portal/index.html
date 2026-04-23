@@ -314,8 +314,9 @@
     </section>
 
     <div class="results-section">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;gap:6px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;gap:6px;flex-wrap:wrap;">
         <h3 style="margin:0;flex:1">Results <span id="resultCount"></span></h3>
+        <button id="nominatimBtn" onclick="toggleNominatim()" style="padding:4px 12px;font-size:12px;background:var(--surface2);color:#fff;border:1px solid var(--border);border-radius:4px;cursor:pointer;" title="Query Nominatim's public API for side-by-side comparison. Off by default — each query hits api.openstreetmap.org so leave off unless you need the comparison.">Nominatim: Off</button>
         <button id="polygonsBtn" onclick="togglePolygons()" style="padding:4px 12px;font-size:12px;background:var(--surface2);color:#fff;border:1px solid var(--border);border-radius:4px;cursor:pointer;">Polygons</button>
         <button id="retestBtn" onclick="retestAllResults()" style="padding:4px 12px;font-size:12px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer;">Re-test</button>
         <button onclick="clearResults()" style="padding:4px 12px;font-size:12px;background:var(--red);color:#fff;border:none;border-radius:4px;cursor:pointer;">Clear</button>
@@ -607,11 +608,15 @@ function reverseGeocode(lat, lng, source) {
   const doFetch = () => {
     activeRequests++;
 
-    // Fetch from our API + Nominatim in parallel
+    // Fetch from our API + Nominatim in parallel. Nominatim is opt-in
+    // (button in the results header); when off we resolve null for the
+    // comparison leg instead of hitting their API.
     const ourFetch = fetch(`/reverse?lat=${lat}&lon=${lng}&key=test`)
       .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
-    const nomFetch = fetch(`https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=jsonv2`, {headers: {'User-Agent': 'geoshenanigans-test'}})
-      .then(r => r.ok ? r.json() : null).catch(() => null);
+    const nomFetch = nominatimEnabled
+      ? fetch(`https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=jsonv2`, {headers: {'User-Agent': 'geoshenanigans-test'}})
+          .then(r => r.ok ? r.json() : null).catch(() => null)
+      : Promise.resolve(null);
 
     Promise.all([ourFetch, nomFetch])
       .then(([data, nom]) => {
@@ -721,6 +726,27 @@ const POLY_FILL = 'debug-polygons-fill';
 const POLY_LINE = 'debug-polygons-line';
 const POLY_LABELS = 'debug-polygons-labels';
 let polygonsEnabled = localStorage.getItem('polygons_enabled') === '1';
+
+// Nominatim side-by-side lookup is opt-in — every query goes out to
+// nominatim.openstreetmap.org so we don't want to hit it unsolicited.
+// Default off; toggle button persists choice in localStorage.
+let nominatimEnabled = localStorage.getItem('nominatim_enabled') === '1';
+function toggleNominatim() {
+  nominatimEnabled = !nominatimEnabled;
+  localStorage.setItem('nominatim_enabled', nominatimEnabled ? '1' : '0');
+  updateNominatimBtn();
+  // Re-render the currently-open detail so the comparison panel
+  // shows/hides immediately without needing a new query.
+  if (selectedId) showDetail(selectedId);
+}
+function updateNominatimBtn() {
+  const btn = document.getElementById('nominatimBtn');
+  if (!btn) return;
+  btn.textContent = 'Nominatim: ' + (nominatimEnabled ? 'On' : 'Off');
+  btn.style.background = nominatimEnabled ? 'var(--green)' : 'var(--surface2)';
+}
+// Run once on initial load so the button reflects the saved state.
+document.addEventListener('DOMContentLoaded', updateNominatimBtn);
 
 // Shoelace-weighted centroid of a closed lng/lat ring
 function polygonCentroid(ring) {
@@ -862,37 +888,75 @@ function showDetail(id) {
 
   const d = r.data;
   const nom = r.nominatim;
+  const showNom = nominatimEnabled && nom;
   let html = '';
 
   // Display names
-  html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:12px">';
-  html += `<div><div style="font-size:11px;text-transform:uppercase;color:var(--accent);margin-bottom:4px">Ours</div><div style="font-size:13px;color:var(--text-dim)">${d.display_name ? escHtml(d.display_name) : '—'}</div></div>`;
-  html += `<div><div style="font-size:11px;text-transform:uppercase;color:var(--green);margin-bottom:4px">Nominatim</div><div style="font-size:13px;color:var(--text-dim)">${nom && nom.display_name ? escHtml(nom.display_name) : '—'}</div></div>`;
-  html += '</div>';
+  if (showNom) {
+    html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:12px">';
+    html += `<div><div style="font-size:11px;text-transform:uppercase;color:var(--accent);margin-bottom:4px">Ours</div><div style="font-size:13px;color:var(--text-dim)">${d.display_name ? escHtml(d.display_name) : '—'}</div></div>`;
+    html += `<div><div style="font-size:11px;text-transform:uppercase;color:var(--green);margin-bottom:4px">Nominatim</div><div style="font-size:13px;color:var(--text-dim)">${nom.display_name ? escHtml(nom.display_name) : '—'}</div></div>`;
+    html += '</div>';
+  } else {
+    html += `<div style="margin-bottom:12px"><div style="font-size:11px;text-transform:uppercase;color:var(--accent);margin-bottom:4px">Display name</div><div style="font-size:13px;color:var(--text-dim)">${d.display_name ? escHtml(d.display_name) : '—'}</div></div>`;
+  }
 
-  // Aligned field comparison table
-  const allFields = ['house_number', 'road', 'neighbourhood', 'suburb', 'city', 'county', 'state', 'postcode', 'country', 'country_code'];
+  // Aligned field breakdown table. Row set = every key present on
+  // EITHER side (ours or nominatim if enabled), not a hand-picked
+  // allow-list. That way any field we add to the response (new
+  // landmark class, shop, etc.) automatically appears in the UI
+  // without touching the test tool.
   const ourAddr = d.address || {};
-  const nomAddr = (nom && nom.address) || {};
+  const nomAddr = (showNom && nom.address) || {};
+  const rowKeys = Array.from(new Set([...Object.keys(ourAddr), ...Object.keys(nomAddr)]));
+  // Preferred ordering for the common address hierarchy. Unknown
+  // fields (landmark classes etc.) fall through to alphabetical at
+  // the end so they're still shown, just less prominently.
+  const preferredOrder = [
+    'tourism', 'historic', 'amenity', 'leisure', 'natural', 'man_made',
+    'building', 'aeroway', 'railway', 'office', 'shop',
+    'house_number', 'road', 'city_block', 'neighbourhood', 'quarter',
+    'suburb', 'borough', 'city_district', 'city', 'town', 'village',
+    'hamlet', 'municipality', 'district', 'county', 'state_district',
+    'region', 'province', 'state', 'postcode', 'country', 'country_code',
+  ];
+  rowKeys.sort((a, b) => {
+    const ia = preferredOrder.indexOf(a);
+    const ib = preferredOrder.indexOf(b);
+    if (ia !== -1 && ib !== -1) return ia - ib;
+    if (ia !== -1) return -1;
+    if (ib !== -1) return 1;
+    return a.localeCompare(b);
+  });
 
   html += '<table style="width:100%;border-collapse:collapse;font-size:13px">';
-  html += '<tr style="border-bottom:1px solid var(--border)"><th style="text-align:left;padding:4px 8px;color:var(--text-dim);width:140px">Field</th><th style="text-align:left;padding:4px 8px;color:var(--accent)">Ours</th><th style="text-align:left;padding:4px 8px;color:var(--green)">Nominatim</th></tr>';
-  for (const f of allFields) {
+  if (showNom) {
+    html += '<tr style="border-bottom:1px solid var(--border)"><th style="text-align:left;padding:4px 8px;color:var(--text-dim);width:140px">Field</th><th style="text-align:left;padding:4px 8px;color:var(--accent)">Ours</th><th style="text-align:left;padding:4px 8px;color:var(--green)">Nominatim</th></tr>';
+  } else {
+    html += '<tr style="border-bottom:1px solid var(--border)"><th style="text-align:left;padding:4px 8px;color:var(--text-dim);width:140px">Field</th><th style="text-align:left;padding:4px 8px;color:var(--accent)">Value</th></tr>';
+  }
+  for (const f of rowKeys) {
     const ours = ourAddr[f] || '';
     const theirs = nomAddr[f] || '';
     if (!ours && !theirs) continue;
-    const match = ours && theirs && ours === theirs;
-    const mismatch = ours && theirs && ours !== theirs;
-    const weMiss = !ours && theirs;
-    const theyMiss = ours && !theirs;
-    const ourStyle = mismatch ? 'color:var(--red)' : (theyMiss ? '' : '');
-    const nomStyle = mismatch ? 'color:var(--red)' : (weMiss ? 'color:var(--orange)' : '');
-    const rowBg = (mismatch || weMiss) ? 'background:rgba(217,74,74,0.08)' : '';
-    html += `<tr style="border-bottom:1px solid var(--border);${rowBg}">`;
-    html += `<td style="padding:4px 8px;color:var(--text-dim)">${f}</td>`;
-    html += `<td style="padding:4px 8px;${ourStyle}">${ours ? escHtml(ours) : '<span style="color:var(--orange)">—</span>'}</td>`;
-    html += `<td style="padding:4px 8px;${nomStyle}">${theirs ? escHtml(theirs) : '<span style="color:var(--text-dim)">—</span>'}</td>`;
-    html += '</tr>';
+    if (showNom) {
+      const mismatch = ours && theirs && ours !== theirs;
+      const weMiss = !ours && theirs;
+      const theyMiss = ours && !theirs;
+      const ourStyle = mismatch ? 'color:var(--red)' : (theyMiss ? '' : '');
+      const nomStyle = mismatch ? 'color:var(--red)' : (weMiss ? 'color:var(--orange)' : '');
+      const rowBg = (mismatch || weMiss) ? 'background:rgba(217,74,74,0.08)' : '';
+      html += `<tr style="border-bottom:1px solid var(--border);${rowBg}">`;
+      html += `<td style="padding:4px 8px;color:var(--text-dim)">${escHtml(f)}</td>`;
+      html += `<td style="padding:4px 8px;${ourStyle}">${ours ? escHtml(ours) : '<span style="color:var(--orange)">—</span>'}</td>`;
+      html += `<td style="padding:4px 8px;${nomStyle}">${theirs ? escHtml(theirs) : '<span style="color:var(--text-dim)">—</span>'}</td>`;
+      html += '</tr>';
+    } else {
+      html += '<tr style="border-bottom:1px solid var(--border)">';
+      html += `<td style="padding:4px 8px;color:var(--text-dim)">${escHtml(f)}</td>`;
+      html += `<td style="padding:4px 8px">${escHtml(ours)}</td>`;
+      html += '</tr>';
+    }
   }
   html += '</table>';
 
@@ -909,7 +973,7 @@ function showDetail(id) {
   html += '<details style="margin-top:10px"><summary style="cursor:pointer;color:var(--accent)">Our response JSON</summary>';
   html += `<div class="json-block">${syntaxHighlight(d)}</div>`;
   html += '</details>';
-  if (nom) {
+  if (showNom) {
     html += '<details style="margin-top:6px"><summary style="cursor:pointer;color:var(--green)">Nominatim response JSON</summary>';
     html += `<div class="json-block">${syntaxHighlight(nom)}</div>`;
     html += '</details>';
