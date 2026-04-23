@@ -178,6 +178,28 @@
     font-size: 11px;
     color: var(--text-dim);
     margin-bottom: 4px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .result-copy {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    border-radius: 3px;
+    padding: 0 5px;
+    font-size: 11px;
+    line-height: 16px;
+    cursor: pointer;
+    margin-left: auto;
+  }
+  .result-copy:hover {
+    background: var(--surface2);
+    color: var(--text);
+  }
+  .result-copy.copied {
+    color: var(--green);
+    border-color: var(--green);
   }
 
   .result-name { font-weight: 500; }
@@ -684,7 +706,14 @@ function renderResults() {
       (r.error ? ' error' : '') +
       (r.id === selectedId ? ' selected' : '');
 
-    let inner = `<div class="result-coords">${r.lat.toFixed(5)}, ${r.lng.toFixed(5)}</div>`;
+    const coordsText = `${r.lat.toFixed(5)}, ${r.lng.toFixed(5)}`;
+    // Coords line + inline copy button. `data-copy` on the button
+    // holds the exact text so the click handler (delegated below)
+    // can reach it without a closure per card — the results list
+    // can grow large and re-rendering every card should stay cheap.
+    let inner = `<div class="result-coords">${coordsText}` +
+      `<button class="result-copy" data-copy="${coordsText}" title="Copy coordinates">⧉</button>` +
+      `</div>`;
 
     if (r.loading) {
       inner += `<div class="result-name"><span class="loading-spinner"></span>Loading...</div>`;
@@ -704,12 +733,52 @@ function renderResults() {
     }
 
     card.innerHTML = inner;
-    card.addEventListener('click', () => {
+    card.addEventListener('click', (ev) => {
+      // Copy button intercept — skip the card's open-detail action
+      // when the click actually landed on the copy button.
+      if (ev.target.classList && ev.target.classList.contains('result-copy')) {
+        ev.stopPropagation();
+        const text = ev.target.getAttribute('data-copy') || '';
+        copyToClipboard(text, ev.target);
+        return;
+      }
       selectResult(r.id);
       map.flyTo({ center: [r.lng, r.lat], zoom: Math.max(map.getZoom(), 13) });
     });
     list.appendChild(card);
   }
+}
+
+function copyToClipboard(text, btn) {
+  const finish = () => {
+    if (!btn) return;
+    const orig = btn.textContent;
+    btn.textContent = '✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = orig;
+      btn.classList.remove('copied');
+    }, 1000);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(finish).catch(() => legacyCopy(text, finish));
+  } else {
+    legacyCopy(text, finish);
+  }
+}
+function legacyCopy(text, cb) {
+  // Fallback for older browsers / non-HTTPS origins where the async
+  // Clipboard API is unavailable. A hidden textarea + execCommand
+  // is the standard workaround.
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.left = '-9999px';
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand('copy'); } catch (_) {}
+  document.body.removeChild(ta);
+  cb && cb();
 }
 
 function selectResult(id) {
