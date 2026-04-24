@@ -473,6 +473,12 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
 
     log_phase("      filter: string pool rebuild (masked)", _ft, _fc);
 
+    // Partition the continent's flat pool into the same 5 tier files
+    // the full planet produces, so write_index can emit them per-mode.
+    // Records get remapped a second time (flat-continent offsets →
+    // tiered-continent offsets) which is correct.
+    partition_strings_into_tiers(out);
+
     std::cerr << "    subset: ways=" << out.ways.size()
               << " addrs=" << out.addr_points.size()
               << " interps=" << out.interp_ways.size()

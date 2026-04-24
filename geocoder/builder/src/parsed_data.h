@@ -205,6 +205,149 @@ struct ParsedData {
     }
 };
 
+// Partition the string pool in `data` into 5 per-consumer tiers, sorting
+// alphabetically within each, and remap all record name_id fields to the
+// new globally-contiguous offset space. Used by both the canonical sort
+// step (applied to the full planet pool) and continent filter (applied
+// per-continent subset after a flat pool is rebuilt).  Rule: each
+// string's home tier is the lowest set bit of its consumer mask.  On
+// return, `data.strings_tiers` + `data.strings_tier_bases` are populated
+// and `data.string_pool.mutable_data()` is replaced with a concat view
+// of the tier buffers (so legacy `string_pool.data().data() + off` reads
+// continue to work for global offsets).
+inline void partition_strings_into_tiers(ParsedData& data) {
+    auto& pool_data = data.string_pool.mutable_data();
+    if (pool_data.empty()) {
+        data.strings_tiers = {};
+        data.strings_tier_bases = {};
+        return;
+    }
+    std::vector<std::pair<uint32_t, const char*>> strings;
+    size_t pos = 0;
+    while (pos < pool_data.size()) {
+        strings.emplace_back(static_cast<uint32_t>(pos), pool_data.data() + pos);
+        pos += strlen(pool_data.data() + pos) + 1;
+    }
+
+    std::unordered_map<uint32_t, uint8_t> tier_mask;
+    tier_mask.reserve(strings.size());
+    auto mark = [&](uint32_t off, uint8_t bit) {
+        if (off == NO_DATA || off == 0xFFFFFFFFu) return;
+        tier_mask[off] |= bit;
+    };
+
+    for (const auto& ap : data.admin_polygons) mark(ap.name_id, STR_TIER_BIT_CORE);
+    for (const auto& pn : data.place_nodes)    mark(pn.name_id, STR_TIER_BIT_CORE);
+
+    for (const auto& w : data.ways)            mark(w.name_id, STR_TIER_BIT_STREET);
+    for (uint32_t id : data.way_orig_name_ids) mark(id, STR_TIER_BIT_STREET);
+    for (const auto& a : data.addr_points)     mark(a.street_id, STR_TIER_BIT_STREET);
+    for (const auto& iw : data.interp_ways)    mark(iw.street_id, STR_TIER_BIT_STREET);
+    for (const auto& pr : data.poi_records)    mark(pr.parent_street_id, STR_TIER_BIT_STREET);
+
+    for (const auto& a : data.addr_points) mark(a.housenumber_id, STR_TIER_BIT_ADDR);
+
+    for (uint32_t pc : data.way_postcode_ids)  mark(pc, STR_TIER_BIT_POSTCODE);
+    for (uint32_t pc : data.addr_postcode_ids) mark(pc, STR_TIER_BIT_POSTCODE);
+    for (const auto& [pc_id, _acc] : data.postcode_accum) mark(pc_id, STR_TIER_BIT_POSTCODE);
+    for (const auto& pr : data.poi_records)    mark(pr.parent_postcode_id, STR_TIER_BIT_POSTCODE);
+
+    for (const auto& pr : data.poi_records) mark(pr.name_id, STR_TIER_BIT_POI);
+
+    auto home_tier = [&](uint32_t old_off) -> uint8_t {
+        auto it = tier_mask.find(old_off);
+        uint8_t m = (it != tier_mask.end()) ? it->second : STR_TIER_BIT_CORE;
+        if (m == 0) m = STR_TIER_BIT_CORE;
+        return static_cast<uint8_t>(__builtin_ctz(m));
+    };
+
+    std::sort(strings.begin(), strings.end(),
+        [&](const auto& a, const auto& b) {
+            uint8_t ta = home_tier(a.first), tb = home_tier(b.first);
+            if (ta != tb) return ta < tb;
+            return strcmp(a.second, b.second) < 0;
+        });
+
+    std::array<std::vector<char>, STR_TIER_COUNT> tier_bufs;
+    for (auto& b : tier_bufs) b.clear();
+    std::unordered_map<uint32_t, uint32_t> remap;
+    remap.reserve(strings.size());
+
+    uint32_t global_off = 0;
+    std::array<uint32_t, STR_TIER_COUNT + 1> bases{};
+    size_t cur_tier = 0;
+    for (auto& [old_off, str] : strings) {
+        uint8_t t = home_tier(old_off);
+        while (cur_tier < t) {
+            bases[cur_tier + 1] = global_off;
+            cur_tier++;
+        }
+        remap[old_off] = global_off;
+        size_t len = strlen(str);
+        tier_bufs[t].insert(tier_bufs[t].end(), str, str + len + 1);
+        global_off += static_cast<uint32_t>(len + 1);
+    }
+    while (cur_tier < STR_TIER_COUNT) {
+        bases[cur_tier + 1] = global_off;
+        cur_tier++;
+    }
+
+    data.strings_tiers = std::move(tier_bufs);
+    data.strings_tier_bases = bases;
+
+    // Rebuild pool_data as concat-of-tiers so legacy reads (pool_data.data()
+    // + global_offset) still resolve correctly. Cheap vs. updating every
+    // call site.
+    pool_data.clear();
+    pool_data.reserve(global_off);
+    for (size_t t = 0; t < STR_TIER_COUNT; t++) {
+        pool_data.insert(pool_data.end(),
+            data.strings_tiers[t].begin(), data.strings_tiers[t].end());
+    }
+
+    const auto& rm = remap;
+    auto remap_one = [&](uint32_t& off) {
+        if (off == NO_DATA || off == 0xFFFFFFFFu) return;
+        auto it = rm.find(off);
+        if (it != rm.end()) off = it->second;
+        else off = 0xFFFFFFFFu;
+    };
+    for (auto& w : data.ways) remap_one(w.name_id);
+    data.way_orig_name_ids = {};
+    for (auto& a : data.addr_points) {
+        remap_one(a.housenumber_id);
+        remap_one(a.street_id);
+    }
+    for (auto& iw : data.interp_ways) remap_one(iw.street_id);
+    for (auto& ap : data.admin_polygons) remap_one(ap.name_id);
+    for (auto& pr : data.poi_records) {
+        remap_one(pr.name_id);
+        remap_one(pr.parent_street_id);
+        remap_one(pr.parent_postcode_id);
+    }
+    for (auto& pn : data.place_nodes) remap_one(pn.name_id);
+    auto remap_pc_vec = [&](std::vector<uint32_t>& v) {
+        for (auto& pc : v) {
+            if (pc != NO_DATA) {
+                auto it = rm.find(pc);
+                if (it != rm.end()) pc = it->second;
+                else pc = NO_DATA;
+            }
+        }
+    };
+    remap_pc_vec(data.way_postcode_ids);
+    remap_pc_vec(data.addr_postcode_ids);
+    {
+        std::unordered_map<uint32_t, ParsedData::PostcodeAccum> remapped;
+        remapped.reserve(data.postcode_accum.size());
+        for (auto& [old_id, acc] : data.postcode_accum) {
+            auto it = rm.find(old_id);
+            if (it != rm.end()) remapped[it->second] = acc;
+        }
+        data.postcode_accum = std::move(remapped);
+    }
+}
+
 // --- Deduplicate IDs per cell ---
 
 template<typename Map>
