@@ -10,6 +10,7 @@
 // Usage: geocoder-diff <old-dir> <new-dir> -o <patch-file>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -550,12 +551,36 @@ int main(int argc, char* argv[]) {
     std::string tmpdir = "/tmp/geocoder-diff-" + std::to_string(getpid());
     ensure_dir(tmpdir);
 
-    // Build string remap (mmap both pools — read-only sequential scan)
+    // Build string remap (mmap each tier's pool — read-only sequential
+    // scan). Virtual "concat pool" reproduces the global-offset layout
+    // that record name_ids point into, so build_string_remap works
+    // unchanged. Tier bases are read from strings_layout.json; if any
+    // tier file is absent we treat it as empty (e.g. a diff between two
+    // admin-only builds has no street/addr/postcode/poi tiers).
     std::cerr << "Building string remap... (RSS=" << get_rss_mb() << " MiB)" << std::endl;
-    auto old_str_map = mmap_file(old_dir + "/strings.bin");
-    auto new_str_map = mmap_file(new_dir + "/strings.bin");
-    auto str_remap = build_string_remap(old_str_map.data, old_str_map.size,
-                                         new_str_map.data, new_str_map.size);
+    static const char* kStrTierFilenames[5] = {
+        "strings_core.bin", "strings_street.bin", "strings_addr.bin",
+        "strings_postcode.bin", "strings_poi.bin"
+    };
+    std::array<MappedFile, 5> old_tier_maps{}, new_tier_maps{};
+    std::vector<char> old_concat, new_concat;
+    std::array<uint32_t, 6> old_tier_bases{}, new_tier_bases{};
+    for (int t = 0; t < 5; t++) {
+        old_tier_maps[t] = mmap_file(old_dir + "/" + kStrTierFilenames[t]);
+        new_tier_maps[t] = mmap_file(new_dir + "/" + kStrTierFilenames[t]);
+        old_tier_bases[t] = static_cast<uint32_t>(old_concat.size());
+        new_tier_bases[t] = static_cast<uint32_t>(new_concat.size());
+        if (old_tier_maps[t].size > 0)
+            old_concat.insert(old_concat.end(), old_tier_maps[t].data,
+                              old_tier_maps[t].data + old_tier_maps[t].size);
+        if (new_tier_maps[t].size > 0)
+            new_concat.insert(new_concat.end(), new_tier_maps[t].data,
+                              new_tier_maps[t].data + new_tier_maps[t].size);
+    }
+    old_tier_bases[5] = static_cast<uint32_t>(old_concat.size());
+    new_tier_bases[5] = static_cast<uint32_t>(new_concat.size());
+    auto str_remap = build_string_remap(old_concat.data(), old_concat.size(),
+                                         new_concat.data(), new_concat.size());
 
     // Detect strides (stat only, no data loaded)
     auto detect = [](const std::string& path, std::initializer_list<size_t> cs) -> size_t {
@@ -594,28 +619,47 @@ int main(int argc, char* argv[]) {
     // Stored merge sequences for ID remap derivation
     std::unordered_map<uint32_t, MergeSequence> stored_merges;
 
-    // strings.bin: string-level diff (both pools are sorted alphabetically)
+    // Per-tier string-level diffs. Each tier is independently sorted
+    // alphabetically, so we diff tier-by-tier. Wire format: one header
+    // marker 0xFFFFFFF6 followed by 5 blocks of {n_added, n_deleted,
+    // added_strings..., deleted_indices...}. The patch tool applies
+    // each block to the matching tier file in cur_dir.
     {
-        std::vector<std::string> old_strs, new_strs;
-        { size_t p = 0; while (p < old_str_map.size) { old_strs.push_back(old_str_map.data+p); p += strlen(old_str_map.data+p)+1; } }
-        { size_t p = 0; while (p < new_str_map.size) { new_strs.push_back(new_str_map.data+p); p += strlen(new_str_map.data+p)+1; } }
-        std::vector<std::string> added_strings;
-        std::vector<uint32_t> deleted_indices;
-        size_t oi = 0, ni = 0;
-        while (oi < old_strs.size() && ni < new_strs.size()) {
-            int c = old_strs[oi].compare(new_strs[ni]);
-            if (c == 0) { oi++; ni++; }
-            else if (c < 0) { deleted_indices.push_back(oi); oi++; }
-            else { added_strings.push_back(new_strs[ni]); ni++; }
+        uint32_t tiered_marker = 0xFFFFFFF6;
+        wval(patch, &tiered_marker, 4);
+        for (int t = 0; t < 5; t++) {
+            std::vector<std::string> old_strs, new_strs;
+            {
+                size_t p = 0;
+                while (p < old_tier_maps[t].size) {
+                    old_strs.push_back(old_tier_maps[t].data + p);
+                    p += strlen(old_tier_maps[t].data + p) + 1;
+                }
+            }
+            {
+                size_t p = 0;
+                while (p < new_tier_maps[t].size) {
+                    new_strs.push_back(new_tier_maps[t].data + p);
+                    p += strlen(new_tier_maps[t].data + p) + 1;
+                }
+            }
+            std::vector<std::string> added_strings;
+            std::vector<uint32_t> deleted_indices;
+            size_t oi = 0, ni = 0;
+            while (oi < old_strs.size() && ni < new_strs.size()) {
+                int c = old_strs[oi].compare(new_strs[ni]);
+                if (c == 0) { oi++; ni++; }
+                else if (c < 0) { deleted_indices.push_back(oi); oi++; }
+                else { added_strings.push_back(new_strs[ni]); ni++; }
+            }
+            while (oi < old_strs.size()) { deleted_indices.push_back(oi); oi++; }
+            while (ni < new_strs.size()) { added_strings.push_back(new_strs[ni]); ni++; }
+            uint32_t n_added = added_strings.size(), n_deleted = deleted_indices.size();
+            wval(patch, &n_added, 4); wval(patch, &n_deleted, 4);
+            for (auto& s : added_strings) { patch.insert(patch.end(), s.begin(), s.end()); patch.push_back('\0'); }
+            for (auto idx : deleted_indices) wval(patch, &idx, 4);
+            std::cerr << "  " << kStrTierFilenames[t] << ": +" << n_added << " -" << n_deleted << " strings" << std::endl;
         }
-        while (oi < old_strs.size()) { deleted_indices.push_back(oi); oi++; }
-        while (ni < new_strs.size()) { added_strings.push_back(new_strs[ni]); ni++; }
-        uint32_t str_diff_marker = 0xFFFFFFF7;
-        uint32_t n_added = added_strings.size(), n_deleted = deleted_indices.size();
-        wval(patch, &str_diff_marker, 4); wval(patch, &n_added, 4); wval(patch, &n_deleted, 4);
-        for (auto& s : added_strings) { patch.insert(patch.end(), s.begin(), s.end()); patch.push_back('\0'); }
-        for (auto idx : deleted_indices) wval(patch, &idx, 4);
-        std::cerr << "  strings.bin: +" << n_added << " -" << n_deleted << " strings" << std::endl;
     }
 
     // Build merge sequences for all data files in parallel (4 groups)
@@ -1030,7 +1074,12 @@ int main(int argc, char* argv[]) {
     t_addr.join(); t_street.join(); t_interp.join(); t_admin.join(); t_poi.join(); t_place.join(); t_cells.join();
     log_time("All merge sequences + cell changes built", merge_start);
     // Free string pools + remap (no longer needed after all merges complete)
-    unmap_file(old_str_map); unmap_file(new_str_map);
+    for (int t = 0; t < 5; t++) {
+        unmap_file(old_tier_maps[t]);
+        unmap_file(new_tier_maps[t]);
+    }
+    { std::vector<char>().swap(old_concat); }
+    { std::vector<char>().swap(new_concat); }
     { std::unordered_map<uint32_t,uint32_t>().swap(str_remap); }
     std::cerr << "  RSS after merge phase: " << get_rss_mb() << " MiB" << std::endl;
 

@@ -12,6 +12,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -315,7 +316,16 @@ enum class PatchFileId : uint32_t {
     // like the other secondary files — the diff tool doesn't yet have
     // record-level logic for this file.
     ADDR_VERTICES = 30,
-    COUNT = 31
+    // Per-tier strings files (build_version 14). Replaces the single
+    // STRINGS=0 slot. Each is a raw-replacement section — the pool
+    // contents are globally ordered so small changes produce small
+    // diffs in a single tier file even without record-level logic.
+    STRINGS_CORE = 31,
+    STRINGS_STREET = 32,
+    STRINGS_ADDR = 33,
+    STRINGS_POSTCODE = 34,
+    STRINGS_POI = 35,
+    COUNT = 36
 };
 
 static const char* patch_file_names[] = {
@@ -328,7 +338,9 @@ static const char* patch_file_names[] = {
     "addr_postcodes.bin", "admin_parents.bin", "way_parents.bin", "way_postcodes.bin",
     "postcode_centroids.bin", "postcode_centroid_cells.bin", "postcode_centroid_entries.bin",
     "postal_polygons.bin", "postal_vertices.bin",
-    "addr_vertices.bin"
+    "addr_vertices.bin",
+    "strings_core.bin", "strings_street.bin", "strings_addr.bin",
+    "strings_postcode.bin", "strings_poi.bin"
 };
 
 // Encoding types for each section

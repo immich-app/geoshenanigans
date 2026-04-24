@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <iostream>
 #include <mutex>
@@ -89,6 +90,32 @@ inline void log_phase(const char* name, std::chrono::steady_clock::time_point& t
     t = std::chrono::steady_clock::now();
 }
 
+// --- String pool tiers ---
+//
+// At build finalization, every interned string is assigned to exactly one
+// tier based on which record types reference it. Clients download the tier
+// files they need and the remaining get_string() lookups for missing tiers
+// fall back to an empty string. Rule: a string's home tier is the lowest
+// set bit of its consumer-mask, so e.g. a name used by both streets and
+// POIs lives in strings_street.bin (POI clients always have streets).
+constexpr uint8_t STR_TIER_BIT_CORE     = 1 << 0;  // admin_polygons, place_nodes
+constexpr uint8_t STR_TIER_BIT_STREET   = 1 << 1;  // ways, addr_point.street_id, interp, poi.parent_street_id
+constexpr uint8_t STR_TIER_BIT_ADDR     = 1 << 2;  // addr housenumbers
+constexpr uint8_t STR_TIER_BIT_POSTCODE = 1 << 3;  // postcode strings (any consumer)
+constexpr uint8_t STR_TIER_BIT_POI      = 1 << 4;  // poi_records.name_id
+
+constexpr size_t STR_TIER_COUNT = 5;
+constexpr const char* STR_TIER_FILENAMES[STR_TIER_COUNT] = {
+    "strings_core.bin",
+    "strings_street.bin",
+    "strings_addr.bin",
+    "strings_postcode.bin",
+    "strings_poi.bin",
+};
+constexpr const char* STR_TIER_NAMES[STR_TIER_COUNT] = {
+    "core", "street", "addr", "postcode", "poi"
+};
+
 // --- Parsed data container ---
 
 struct ParsedData {
@@ -155,6 +182,27 @@ struct ParsedData {
     // used for postcode inheritance then discarded. Not written to disk.
     std::vector<CdpPostcodeRelation> cdp_postcode_relations;
     std::vector<CdpPostcodePoly> cdp_postcode_polys;
+
+    // Post-canonical-sort: strings partitioned into per-consumer tiers.
+    // Global offset space is contiguous: tier N occupies
+    // [strings_tier_bases[N], strings_tier_bases[N+1]). Record name_ids
+    // are global offsets.  string_pool.data() is cleared after partition
+    // to free memory.
+    std::array<std::vector<char>, STR_TIER_COUNT> strings_tiers;
+    std::array<uint32_t, STR_TIER_COUNT + 1> strings_tier_bases{};
+
+    // Look up a string by its global offset (post-partition).  Returns
+    // nullptr if the offset is NO_DATA / 0xFFFFFFFF or out of range.
+    const char* get_string(uint32_t off) const {
+        if (off == NO_DATA || off == 0xFFFFFFFFu) return nullptr;
+        for (size_t t = 0; t < STR_TIER_COUNT; t++) {
+            if (off < strings_tier_bases[t + 1]) {
+                uint32_t local = off - strings_tier_bases[t];
+                return strings_tiers[t].data() + local;
+            }
+        }
+        return nullptr;
+    }
 };
 
 // --- Deduplicate IDs per cell ---

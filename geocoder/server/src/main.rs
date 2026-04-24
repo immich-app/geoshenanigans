@@ -412,6 +412,71 @@ fn place_type_to_rank(pt: u8) -> u8 {
     }
 }
 
+// --- String pool (tiered) ---
+//
+// Strings are split into 5 files: core/street/addr/postcode/poi.  Record
+// name_ids are offsets into a global virtual pool spanning all tiers,
+// contiguously in [bases[t], bases[t+1]).  Clients download the subset
+// of tier files they need; any offset referencing an unloaded tier
+// resolves to "" (graceful degradation).  strings_core.bin is required.
+
+const STR_TIER_COUNT: usize = 5;
+const STR_TIER_FILENAMES: [&str; STR_TIER_COUNT] = [
+    "strings_core.bin", "strings_street.bin", "strings_addr.bin",
+    "strings_postcode.bin", "strings_poi.bin",
+];
+
+struct StringPool {
+    tiers: [Option<Mmap>; STR_TIER_COUNT],
+    bases: [u32; STR_TIER_COUNT + 1],
+}
+
+impl StringPool {
+    fn load(dir: &str) -> Result<Self, String> {
+        let layout_path = format!("{}/strings_layout.json", dir);
+        let layout_src = std::fs::read_to_string(&layout_path)
+            .map_err(|e| format!("Failed to read {}: {}", layout_path, e))?;
+        let v: serde_json::Value = serde_json::from_str(&layout_src)
+            .map_err(|e| format!("Failed to parse {}: {}", layout_path, e))?;
+        let entries = v.get("tiers").and_then(|t| t.as_array())
+            .ok_or_else(|| format!("{}: missing 'tiers' array", layout_path))?;
+        if entries.len() != STR_TIER_COUNT {
+            return Err(format!("{}: expected {} tier entries, got {}",
+                layout_path, STR_TIER_COUNT, entries.len()));
+        }
+        let mut bases = [0u32; STR_TIER_COUNT + 1];
+        let mut tiers: [Option<Mmap>; STR_TIER_COUNT] = Default::default();
+        for (t, entry) in entries.iter().enumerate() {
+            let start = entry.get("start").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+            let end   = entry.get("end").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+            bases[t] = start;
+            bases[t + 1] = end;
+            tiers[t] = mmap_file_optional(&format!("{}/{}", dir, STR_TIER_FILENAMES[t]));
+        }
+        // Core tier is mandatory — admin record names resolve from it.
+        if tiers[0].is_none() {
+            return Err(format!("Required {}/{} missing", dir, STR_TIER_FILENAMES[0]));
+        }
+        Ok(StringPool { tiers, bases })
+    }
+
+    fn get(&self, offset: u32) -> &str {
+        if offset == NO_DATA { return ""; }
+        for t in 0..STR_TIER_COUNT {
+            if offset < self.bases[t + 1] {
+                let Some(m) = &self.tiers[t] else { return ""; };
+                if offset < self.bases[t] { return ""; }
+                let local = (offset - self.bases[t]) as usize;
+                if local >= m.len() { return ""; }
+                let bytes = &m[local..];
+                let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                return std::str::from_utf8(&bytes[..end]).unwrap_or("");
+            }
+        }
+        ""
+    }
+}
+
 // --- Index data ---
 
 struct Index {
@@ -449,7 +514,7 @@ struct Index {
     postcode_centroid_cells: Option<Mmap>,
     postcode_centroid_entries: Option<Mmap>,
     admin_config: AdminLevelConfig,
-    strings: Mmap,
+    strings: StringPool,
     street_cell_level: u64,
     admin_cell_level: u64,
     max_distance_sq: f64,
@@ -527,7 +592,7 @@ impl Index {
             postcode_centroid_cells: mmap_file_optional(&format!("{}/postcode_centroid_cells.bin", dir)),
             postcode_centroid_entries: mmap_file_optional(&format!("{}/postcode_centroid_entries.bin", dir)),
             admin_config: AdminLevelConfig::load(),
-            strings: mmap_file(&format!("{}/strings.bin", dir))?,
+            strings: StringPool::load(dir)?,
             street_cell_level,
             admin_cell_level,
             max_distance_sq,
@@ -535,9 +600,7 @@ impl Index {
     }
 
     fn get_string(&self, offset: u32) -> &str {
-        let bytes = &self.strings[offset as usize..];
-        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-        std::str::from_utf8(&bytes[..end]).unwrap_or("")
+        self.strings.get(offset)
     }
 
     fn read_u16(data: &[u8], offset: usize) -> u16 {

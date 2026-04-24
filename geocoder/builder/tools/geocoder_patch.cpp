@@ -6,7 +6,9 @@
 // Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <fstream>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -91,87 +93,120 @@ int main(int argc, char* argv[]) {
 
     // --- Phase 2: String rebuild ---
     // Sorted vector remap: (old_offset, new_offset) pairs sorted by old_offset.
-    // Uses 96 MiB for 12M entries vs 672 MiB for unordered_map.
+    // Offsets are global across all tiers (tier 0 occupies [0, base[1]),
+    // tier N at [base[N], base[N+1])) so a single remap covers everything.
+    static const char* kStrTierFilenames[5] = {
+        "strings_core.bin", "strings_street.bin", "strings_addr.bin",
+        "strings_postcode.bin", "strings_poi.bin"
+    };
+    static const char* kStrTierNames[5] = {"core", "street", "addr", "postcode", "poi"};
     std::vector<std::pair<uint32_t, uint32_t>> str_remap_vec;
+    std::array<uint32_t, 6> new_tier_bases{};
     {
         uint32_t marker = ru32();
-        if (marker == 0xFFFFFFF7) {
-            uint32_t n_added = ru32(), n_deleted = ru32();
-            std::vector<std::string> added;
-            for (uint32_t i = 0; i < n_added; i++) { const char* s = P+pos; added.push_back(s); pos += strlen(s)+1; }
-            std::vector<uint32_t> del_idx(n_deleted);
-            for (uint32_t i = 0; i < n_deleted; i++) del_idx[i] = ru32();
-            std::unordered_set<uint32_t> del_set(del_idx.begin(), del_idx.end());
+        if (marker == 0xFFFFFFF6) {
+            // Tiered format — 5 independent per-tier diffs.  For each tier:
+            //   1. Read its n_added/n_deleted block from the patch.
+            //   2. Merge-write the old tier file + added (minus deleted)
+            //      into the new tier file.
+            //   3. Walk old/new to extend str_remap_vec using global offsets.
+            uint32_t old_global_base = 0;
+            uint32_t new_global_base = 0;
+            uint32_t total_added = 0, total_deleted = 0;
+            for (int t = 0; t < 5; t++) {
+                uint32_t n_added = ru32(), n_deleted = ru32();
+                total_added += n_added; total_deleted += n_deleted;
+                std::vector<std::string> added;
+                for (uint32_t i = 0; i < n_added; i++) { const char* s = P+pos; added.push_back(s); pos += strlen(s)+1; }
+                std::vector<uint32_t> del_idx(n_deleted);
+                for (uint32_t i = 0; i < n_deleted; i++) del_idx[i] = ru32();
+                std::unordered_set<uint32_t> del_set(del_idx.begin(), del_idx.end());
 
-            MappedFile old_pool = mmap_file(cur_dir + "/strings.bin");
-
-            // Phase A: merge old (minus deleted) + added strings, write directly to file.
-            // Both old pool and added are sorted alphabetically → merge-write with no sort.
-            // Memory: only the added strings vector (~small) + del_set (~small).
-            {
-                FILE* fp = fopen((out_dir + "/strings.bin").c_str(), "wb");
-                size_t sp = 0; uint32_t idx = 0; size_t ai = 0;
-                // Sort added strings (they should already be sorted from diff tool, but ensure)
-                std::sort(added.begin(), added.end());
-                while (sp < old_pool.size || ai < added.size()) {
-                    const char* old_s = nullptr;
-                    // Skip deleted strings
-                    while (sp < old_pool.size) {
-                        if (!del_set.count(idx)) { old_s = old_pool.data + sp; break; }
-                        sp += strlen(old_pool.data + sp) + 1; idx++;
-                    }
-                    const char* add_s = ai < added.size() ? added[ai].c_str() : nullptr;
-                    // Merge: pick the smaller string
-                    if (old_s && add_s) {
-                        int c = strcmp(old_s, add_s);
-                        if (c <= 0) {
+                MappedFile old_pool = mmap_file(cur_dir + "/" + kStrTierFilenames[t]);
+                // Phase A: write new tier file via alphabetical merge.
+                {
+                    FILE* fp = fopen((out_dir + "/" + kStrTierFilenames[t]).c_str(), "wb");
+                    size_t sp = 0; uint32_t idx = 0; size_t ai = 0;
+                    std::sort(added.begin(), added.end());
+                    while (sp < old_pool.size || ai < added.size()) {
+                        const char* old_s = nullptr;
+                        while (sp < old_pool.size) {
+                            if (!del_set.count(idx)) { old_s = old_pool.data + sp; break; }
+                            sp += strlen(old_pool.data + sp) + 1; idx++;
+                        }
+                        const char* add_s = ai < added.size() ? added[ai].c_str() : nullptr;
+                        if (old_s && add_s) {
+                            int c = strcmp(old_s, add_s);
+                            if (c <= 0) {
+                                size_t l = strlen(old_s) + 1; fwrite(old_s, 1, l, fp);
+                                sp += l; idx++;
+                                if (c == 0) ai++;
+                            } else {
+                                size_t l = added[ai].size() + 1; fwrite(add_s, 1, l, fp);
+                                ai++;
+                            }
+                        } else if (old_s) {
                             size_t l = strlen(old_s) + 1; fwrite(old_s, 1, l, fp);
                             sp += l; idx++;
-                            if (c == 0) ai++; // duplicate — skip added
-                        } else {
+                        } else if (add_s) {
                             size_t l = added[ai].size() + 1; fwrite(add_s, 1, l, fp);
                             ai++;
-                        }
-                    } else if (old_s) {
-                        size_t l = strlen(old_s) + 1; fwrite(old_s, 1, l, fp);
-                        sp += l; idx++;
-                    } else if (add_s) {
-                        size_t l = added[ai].size() + 1; fwrite(add_s, 1, l, fp);
-                        ai++;
-                    } else break;
+                        } else break;
+                    }
+                    fclose(fp);
                 }
-                fclose(fp);
-            }
-            { std::vector<std::string>().swap(added); std::unordered_set<uint32_t>().swap(del_set);
-              std::vector<uint32_t>().swap(del_idx); }
-            malloc_trim(0);
+                { std::vector<std::string>().swap(added); std::unordered_set<uint32_t>().swap(del_set);
+                  std::vector<uint32_t>().swap(del_idx); }
 
-            // Phase B: build remap by merge-walking old pool vs new pool (both sorted, both mmap'd)
-            MappedFile new_pool = mmap_file(out_dir + "/strings.bin");
-            {
-                // Walk both pools simultaneously — no vectors needed, just cursors
-                size_t old_pos = 0, new_pos = 0;
-                while (old_pos < old_pool.size && new_pos < new_pool.size) {
-                    const char* os = old_pool.data + old_pos;
-                    const char* ns = new_pool.data + new_pos;
-                    int c = strcmp(os, ns);
-                    if (c == 0) {
-                        if (old_pos != new_pos) // offset changed
-                            str_remap_vec.push_back({(uint32_t)old_pos, (uint32_t)new_pos});
-                        old_pos += strlen(os) + 1;
-                        new_pos += strlen(ns) + 1;
-                    } else if (c < 0) {
-                        old_pos += strlen(os) + 1; // deleted string
-                    } else {
-                        new_pos += strlen(ns) + 1; // added string
+                // Phase B: extend remap by merge-walking old vs new in this tier.
+                MappedFile new_pool = mmap_file(out_dir + "/" + kStrTierFilenames[t]);
+                {
+                    size_t old_pos = 0, new_pos = 0;
+                    while (old_pos < old_pool.size && new_pos < new_pool.size) {
+                        const char* os = old_pool.data + old_pos;
+                        const char* ns = new_pool.data + new_pos;
+                        int c = strcmp(os, ns);
+                        if (c == 0) {
+                            uint32_t old_global = old_global_base + static_cast<uint32_t>(old_pos);
+                            uint32_t new_global = new_global_base + static_cast<uint32_t>(new_pos);
+                            if (old_global != new_global)
+                                str_remap_vec.push_back({old_global, new_global});
+                            old_pos += strlen(os) + 1;
+                            new_pos += strlen(ns) + 1;
+                        } else if (c < 0) {
+                            old_pos += strlen(os) + 1;
+                        } else {
+                            new_pos += strlen(ns) + 1;
+                        }
                     }
                 }
+                old_global_base += static_cast<uint32_t>(old_pool.size);
+                new_global_base += static_cast<uint32_t>(new_pool.size);
+                new_tier_bases[t + 1] = new_global_base;
+                unmap_file(old_pool);
+                unmap_file(new_pool);
             }
+            malloc_trim(0);
             std::sort(str_remap_vec.begin(), str_remap_vec.end());
-            unmap_file(old_pool);
-            unmap_file(new_pool);
-            std::cerr << "  Strings: +" << n_added << " -" << n_deleted
-                      << ", " << str_remap_vec.size() << " remapped (" << str_remap_vec.size() * 8 / 1024 / 1024 << " MiB)" << std::endl;
+            std::cerr << "  Strings (tiered): +" << total_added << " -" << total_deleted
+                      << ", " << str_remap_vec.size() << " remapped ("
+                      << str_remap_vec.size() * 8 / 1024 / 1024 << " MiB)" << std::endl;
+
+            // Write strings_layout.json (new tier bases).
+            {
+                std::ofstream f(out_dir + "/strings_layout.json");
+                f << "{\n  \"tiers\": [\n";
+                for (int t = 0; t < 5; t++) {
+                    f << "    {\"name\": \"" << kStrTierNames[t]
+                      << "\", \"file\": \"" << kStrTierFilenames[t]
+                      << "\", \"start\": " << new_tier_bases[t]
+                      << ", \"end\": " << new_tier_bases[t + 1] << "}";
+                    if (t < 4) f << ",";
+                    f << "\n";
+                }
+                f << "  ]\n}\n";
+            }
+
             marker = ru32();
         }
         if (marker == 0xFFFFFFFE) {

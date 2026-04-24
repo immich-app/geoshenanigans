@@ -4360,66 +4360,136 @@ int main(int argc, char* argv[]) {
         auto _st = std::chrono::steady_clock::now();
         auto _sc = CpuTicks::now();
 
-        // 1. Sort string pool alphabetically, remap all string offsets
+        // 1. Partition the string pool into per-consumer tiers, sort
+        //    alphabetically within each tier, and rewrite all record
+        //    offsets to the new globally-contiguous layout.
+        //
+        //    Rule: each string's home tier is the lowest set bit of its
+        //    consumer mask, so a name shared between e.g. streets and
+        //    POIs ends up in the street tier — POI clients always have
+        //    the street files. This keeps each string stored once while
+        //    letting admin-only clients skip tiers they don't reference.
         {
             auto& pool_data = data.string_pool.mutable_data();
             if (!pool_data.empty()) {
-                // Extract strings
+                // Extract strings and build consumer-mask per old offset.
                 std::vector<std::pair<uint32_t, const char*>> strings;
                 size_t pos = 0;
                 while (pos < pool_data.size()) {
                     strings.emplace_back(static_cast<uint32_t>(pos), pool_data.data() + pos);
                     pos += strlen(pool_data.data() + pos) + 1;
                 }
-                std::sort(strings.begin(), strings.end(), [](const auto& a, const auto& b) {
-                    return strcmp(a.second, b.second) < 0;
-                });
 
-                // Build remap + new pool
+                std::unordered_map<uint32_t, uint8_t> tier_mask;
+                tier_mask.reserve(strings.size());
+                auto mark = [&](uint32_t off, uint8_t bit) {
+                    if (off == NO_DATA || off == 0xFFFFFFFFu) return;
+                    tier_mask[off] |= bit;
+                };
+
+                // admin_polygons + place_nodes → CORE tier.
+                for (const auto& ap : data.admin_polygons) mark(ap.name_id, STR_TIER_BIT_CORE);
+                for (const auto& pn : data.place_nodes)     mark(pn.name_id, STR_TIER_BIT_CORE);
+
+                // ways + addr_point.street_id + interp.street_id +
+                // poi.parent_street_id → STREET tier. way_orig_name_ids
+                // isn't written to disk, but their strings live in the
+                // pool and we group them with streets.
+                for (const auto& w : data.ways)            mark(w.name_id, STR_TIER_BIT_STREET);
+                for (uint32_t id : data.way_orig_name_ids) mark(id, STR_TIER_BIT_STREET);
+                for (const auto& a : data.addr_points)     mark(a.street_id, STR_TIER_BIT_STREET);
+                for (const auto& iw : data.interp_ways)    mark(iw.street_id, STR_TIER_BIT_STREET);
+                for (const auto& pr : data.poi_records)    mark(pr.parent_street_id, STR_TIER_BIT_STREET);
+
+                // addr_point housenumbers → ADDR tier.
+                for (const auto& a : data.addr_points) mark(a.housenumber_id, STR_TIER_BIT_ADDR);
+
+                // Postcode strings (way/addr/centroid/poi.parent_postcode) → POSTCODE tier.
+                for (uint32_t pc : data.way_postcode_ids)  mark(pc, STR_TIER_BIT_POSTCODE);
+                for (uint32_t pc : data.addr_postcode_ids) mark(pc, STR_TIER_BIT_POSTCODE);
+                for (const auto& [pc_id, _acc] : data.postcode_accum) mark(pc_id, STR_TIER_BIT_POSTCODE);
+                for (const auto& pr : data.poi_records)    mark(pr.parent_postcode_id, STR_TIER_BIT_POSTCODE);
+
+                // POI record names → POI tier.
+                for (const auto& pr : data.poi_records) mark(pr.name_id, STR_TIER_BIT_POI);
+
+                // Determine each string's home tier (lowest set bit).
+                // Any unreferenced string (shouldn't happen, but safe)
+                // defaults to CORE.
+                auto home_tier = [&](uint32_t old_off) -> uint8_t {
+                    auto it = tier_mask.find(old_off);
+                    uint8_t m = (it != tier_mask.end()) ? it->second : STR_TIER_BIT_CORE;
+                    if (m == 0) m = STR_TIER_BIT_CORE;
+                    return static_cast<uint8_t>(__builtin_ctz(m));
+                };
+
+                // Sort by (tier, string). Strings within a tier are
+                // alphabetical — gives canonical order for patch diffs.
+                std::sort(strings.begin(), strings.end(),
+                    [&](const auto& a, const auto& b) {
+                        uint8_t ta = home_tier(a.first), tb = home_tier(b.first);
+                        if (ta != tb) return ta < tb;
+                        return strcmp(a.second, b.second) < 0;
+                    });
+
+                // Emit per-tier buffers + global remap. Each tier's
+                // bytes are contiguous in the global offset space:
+                // tier N spans [tier_bases[N], tier_bases[N+1]).
+                std::array<std::vector<char>, STR_TIER_COUNT> tier_bufs;
+                for (auto& b : tier_bufs) b.clear();
+
                 std::unordered_map<uint32_t, uint32_t> remap;
                 remap.reserve(strings.size());
-                std::vector<char> new_data;
-                new_data.reserve(pool_data.size());
-                for (auto& [old_off, str] : strings) {
-                    remap[old_off] = static_cast<uint32_t>(new_data.size());
-                    size_t len = strlen(str);
-                    new_data.insert(new_data.end(), str, str + len + 1);
-                }
-                pool_data = std::move(new_data);
 
-                // Apply remap to all data records
+                uint32_t global_off = 0;
+                std::array<uint32_t, STR_TIER_COUNT + 1> bases{};
+                size_t cur_tier = 0;
+                for (auto& [old_off, str] : strings) {
+                    uint8_t t = home_tier(old_off);
+                    while (cur_tier < t) {
+                        bases[cur_tier + 1] = global_off;
+                        cur_tier++;
+                    }
+                    remap[old_off] = global_off;
+                    size_t len = strlen(str);
+                    tier_bufs[t].insert(tier_bufs[t].end(), str, str + len + 1);
+                    global_off += static_cast<uint32_t>(len + 1);
+                }
+                while (cur_tier < STR_TIER_COUNT) {
+                    bases[cur_tier + 1] = global_off;
+                    cur_tier++;
+                }
+
+                data.strings_tiers = std::move(tier_bufs);
+                data.strings_tier_bases = bases;
+                pool_data.clear();
+                pool_data.shrink_to_fit();
+
+                // Apply remap to all data records (offsets are now
+                // positions in the virtual contiguous pool).
                 const auto& rm = remap;
-                for (auto& w : data.ways) w.name_id = rm.at(w.name_id);
+                auto remap_one = [&](uint32_t& off) {
+                    if (off == NO_DATA || off == 0xFFFFFFFFu) return;
+                    auto it = rm.find(off);
+                    if (it != rm.end()) off = it->second;
+                    else off = 0xFFFFFFFFu;
+                };
+                for (auto& w : data.ways) remap_one(w.name_id);
+                // way_orig_name_ids is build-time only and no longer
+                // consumed after the canonical sort — release it.
+                data.way_orig_name_ids = {};
                 for (auto& a : data.addr_points) {
-                    a.housenumber_id = rm.at(a.housenumber_id);
-                    // street_id may be NO_DATA if the parent-street
-                    // backfill sweep didn't find a nearby named way.
-                    if (a.street_id != NO_DATA) a.street_id = rm.at(a.street_id);
+                    remap_one(a.housenumber_id);
+                    remap_one(a.street_id);
                 }
-                for (auto& iw : data.interp_ways) iw.street_id = rm.at(iw.street_id);
-                for (auto& ap : data.admin_polygons) ap.name_id = rm.at(ap.name_id);
+                for (auto& iw : data.interp_ways) remap_one(iw.street_id);
+                for (auto& ap : data.admin_polygons) remap_one(ap.name_id);
                 for (auto& pr : data.poi_records) {
-                    if (pr.name_id != NO_DATA) pr.name_id = rm.at(pr.name_id);
-                    else { /* UNNAMED_RANK30: no name → stays NO_DATA */ }
-                    if (pr.parent_street_id != 0xFFFFFFFFu) {
-                        auto psit = rm.find(pr.parent_street_id);
-                        if (psit != rm.end()) {
-                            pr.parent_street_id = psit->second;
-                        } else {
-                            pr.parent_street_id = 0xFFFFFFFFu;
-                        }
-                    }
-                    if (pr.parent_postcode_id != 0xFFFFFFFFu) {
-                        auto ppit = rm.find(pr.parent_postcode_id);
-                        if (ppit != rm.end()) {
-                            pr.parent_postcode_id = ppit->second;
-                        } else {
-                            pr.parent_postcode_id = 0xFFFFFFFFu;
-                        }
-                    }
+                    remap_one(pr.name_id);
+                    remap_one(pr.parent_street_id);
+                    remap_one(pr.parent_postcode_id);
                 }
-                for (auto& pn : data.place_nodes) pn.name_id = rm.at(pn.name_id);
-                // Remap way_postcode_ids and addr_postcode_ids (string offsets)
+                for (auto& pn : data.place_nodes) remap_one(pn.name_id);
                 auto remap_pc_vec = [&](std::vector<uint32_t>& v) {
                     for (auto& pc : v) {
                         if (pc != NO_DATA) {
@@ -4431,20 +4501,22 @@ int main(int argc, char* argv[]) {
                 };
                 remap_pc_vec(data.way_postcode_ids);
                 remap_pc_vec(data.addr_postcode_ids);
-                // Remap postcode_accum keys and build centroid vector
                 {
                     std::unordered_map<uint32_t, ParsedData::PostcodeAccum> remapped;
                     remapped.reserve(data.postcode_accum.size());
                     for (auto& [old_id, acc] : data.postcode_accum) {
                         auto it = rm.find(old_id);
-                        if (it != rm.end()) {
-                            remapped[it->second] = acc;
-                        }
+                        if (it != rm.end()) remapped[it->second] = acc;
                     }
                     data.postcode_accum = std::move(remapped);
                 }
 
                 std::cerr << "  String pool sorted: " << strings.size() << " strings" << std::endl;
+                for (size_t t = 0; t < STR_TIER_COUNT; t++) {
+                    size_t tier_size = data.strings_tiers[t].size();
+                    std::cerr << "    " << STR_TIER_NAMES[t] << ": "
+                              << (tier_size / (1024*1024)) << " MiB" << std::endl;
+                }
             }
         }
         log_phase("  Sort strings", _st, _sc);
@@ -5103,6 +5175,28 @@ int main(int argc, char* argv[]) {
                 write_cell_index(poi_dir + "/poi_cells.bin", poi_dir + "/poi_entries.bin",
                                  filtered_cell_map);
 
+                // POI tier strings — only clients opting in to POI get
+                // these names. Layout file lets the server resolve
+                // global offsets without needing the mode dir.
+                {
+                    const auto& buf = d.strings_tiers[4];
+                    std::ofstream f(poi_dir + "/" + STR_TIER_FILENAMES[4], std::ios::binary);
+                    f.write(buf.data(), buf.size());
+                }
+                {
+                    std::ofstream f(poi_dir + "/strings_layout.json");
+                    f << "{\n  \"tiers\": [\n";
+                    for (size_t t = 0; t < STR_TIER_COUNT; t++) {
+                        f << "    {\"name\": \"" << STR_TIER_NAMES[t]
+                          << "\", \"file\": \"" << STR_TIER_FILENAMES[t]
+                          << "\", \"start\": " << d.strings_tier_bases[t]
+                          << ", \"end\": " << d.strings_tier_bases[t + 1] << "}";
+                        if (t + 1 < STR_TIER_COUNT) f << ",";
+                        f << "\n";
+                    }
+                    f << "  ]\n}\n";
+                }
+
                 // Write poi_meta.json (category metadata for the server)
                 {
                     std::ofstream mf(poi_dir + "/poi_meta.json");
@@ -5311,7 +5405,7 @@ int main(int argc, char* argv[]) {
 
         std::ofstream mf(output_dir + "/manifest.json");
         mf << "{\n";
-        mf << "  \"build_version\": 13,\n";
+        mf << "  \"build_version\": 14,\n";
         mf << "  \"patch_version\": 5,\n";
         mf << "  \"regions\": {\n";
 

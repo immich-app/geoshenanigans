@@ -18,6 +18,24 @@
 
 #include <s2/s2latlng.h>
 
+// Write strings_layout.json — records each tier's [start, end) in the
+// global string-offset space so the server can route a global offset to
+// the right tier file. Same content regardless of which subset of tier
+// files a given dir contains.
+static inline void write_strings_layout(const std::string& dir, const ParsedData& data) {
+    std::ofstream f(dir + "/strings_layout.json");
+    f << "{\n  \"tiers\": [\n";
+    for (size_t t = 0; t < STR_TIER_COUNT; t++) {
+        f << "    {\"name\": \"" << STR_TIER_NAMES[t]
+          << "\", \"file\": \"" << STR_TIER_FILENAMES[t]
+          << "\", \"start\": " << data.strings_tier_bases[t]
+          << ", \"end\": " << data.strings_tier_bases[t + 1] << "}";
+        if (t + 1 < STR_TIER_COUNT) f << ",";
+        f << "\n";
+    }
+    f << "  ]\n}\n";
+}
+
 std::vector<uint32_t> write_entries(
     const std::string& path,
     const std::vector<uint64_t>& sorted_cells,
@@ -364,50 +382,29 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             }));
         }
     }
-    // Compact string pool for modes that don't write all data types.
-    // Admin polygon names are always included since admin_cells/admin_entries reference them.
-    std::vector<char> compact_strings;
-    const bool need_compact = (!write_streets || !write_addresses);
+    // Per-tier strings files. Each mode writes only the tiers its records
+    // need to resolve: admin → CORE, no-addresses → CORE+STREET, full →
+    // CORE+STREET+ADDR. The postcode (3) and POI (4) tiers are written
+    // alongside their respective opt-in files below (postcode_centroids /
+    // poi_records).  Admin polygons / vertices live in the quality/
+    // directory and don't affect string tiers.
+    auto write_tier = [&](size_t tier_idx) {
+        const auto& buf = data.strings_tiers[tier_idx];
+        write_futures.push_back(std::async(std::launch::async, [&, tier_idx] {
+            std::ofstream f(output_dir + "/" + STR_TIER_FILENAMES[tier_idx], std::ios::binary);
+            f.write(buf.data(), buf.size());
+        }));
+    };
+    write_tier(0);  // core — always
+    if (write_streets) write_tier(1);   // street
+    if (write_addresses) write_tier(2); // addr
 
-    if (need_compact) {
-        std::unordered_set<uint32_t> used_offsets;
-        if (write_streets) {
-            for (const auto& w : data.ways) used_offsets.insert(w.name_id);
-            if (write_addresses) {
-                for (const auto& a : data.addr_points) {
-                    used_offsets.insert(a.housenumber_id);
-                    used_offsets.insert(a.street_id);
-                }
-                for (const auto& iw : data.interp_ways) used_offsets.insert(iw.street_id);
-            }
-        }
-        for (const auto& ap : data.admin_polygons) used_offsets.insert(ap.name_id);
-
-        const auto& old_sp = data.string_pool.data();
-        std::vector<uint32_t> sorted_offs(used_offsets.begin(), used_offsets.end());
-        std::sort(sorted_offs.begin(), sorted_offs.end());
-        compact_strings.reserve(used_offsets.size() * 16);
-        for (uint32_t off : sorted_offs) {
-            size_t len = std::strlen(old_sp.data() + off);
-            compact_strings.insert(compact_strings.end(), old_sp.data() + off,
-                old_sp.data() + off + len + 1);
-        }
-    }
-
-    // Admin polygons/vertices are NOT written here — they live in the quality/ directory.
-    // Each quality level (including uncapped) writes its own admin_polygons + admin_vertices.
-    write_futures.push_back(std::async(std::launch::async, [&] {
-        if (need_compact) {
-            std::ofstream f(output_dir + "/strings.bin", std::ios::binary);
-            f.write(compact_strings.data(), compact_strings.size());
-            std::cerr << "strings.bin: " << compact_strings.size() << " bytes (compacted from "
-                      << data.string_pool.data().size() << ")" << std::endl;
-        } else {
-            std::ofstream f(output_dir + "/strings.bin", std::ios::binary);
-            f.write(data.string_pool.data().data(), data.string_pool.data().size());
-            std::cerr << "strings.bin: " << data.string_pool.data().size() << " bytes" << std::endl;
-        }
-    }));
+    // strings_layout.json records each tier's start/end offset in the
+    // global string-offset space so the server can translate a record's
+    // name_id into the correct tier file. Written unconditionally into
+    // every directory that contains a strings_*.bin so the server can
+    // load from any mode/opt-in dir without cross-dir discovery.
+    write_strings_layout(output_dir, data);
 
     // Write postcode centroid index (optional files)
     // Validate each centroid's postcode against the country's pattern
@@ -423,9 +420,8 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             // country of each individual addr_point contribution.
             // Since postcode_accum only stores aggregate (sum_lat,
             // sum_lng, count), we need to re-scan addr_points.
-            const auto& sp = data.string_pool.data();
             auto get_str = [&](uint32_t off) -> const char* {
-                return sp.data() + off;
+                return data.get_string(off);
             };
 
             // Per-country accumulator: (country_code, postcode_id) → centroid
@@ -560,6 +556,16 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             write_cell_index(output_dir + "/postcode_centroid_cells.bin",
                              output_dir + "/postcode_centroid_entries.bin",
                              centroid_cells);
+
+            // Write postcode tier strings alongside the postcode files
+            // so clients opting in to postcodes also get the names. Note
+            // the mode dir already has strings_layout.json from the main
+            // per-tier write above, which covers this file too.
+            {
+                const auto& buf = data.strings_tiers[3];
+                std::ofstream f(output_dir + "/" + STR_TIER_FILENAMES[3], std::ios::binary);
+                f.write(buf.data(), buf.size());
+            }
 
             std::cerr << "postcode centroids: " << centroids.size() << " entries, "
                       << centroid_cells.size() << " cells" << std::endl;
