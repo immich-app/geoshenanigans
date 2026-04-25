@@ -29,6 +29,9 @@ export interface PoiMatch {
   is_point: boolean;
   score: number;
   area: number;
+  // String pool offset of the POI's calculated_postcode (parent
+  // postal_code polygon at build time). NO_DATA / 0xFFFFFFFF if unset.
+  parent_postcode_id: number;
 }
 
 export function findPois(
@@ -70,6 +73,9 @@ export function findPois(
       const category = poiRecords.readUInt8(off + 20);
       // tier byte at off+21, flags at off+22
       const importanceRaw = poiRecords.readUInt8(off + 23);
+      // parent_street_id at off+24 (used by full primary-feature flow,
+      // not by find_pois directly).
+      const parentPostcodeId = poiRecords.readUInt32LE(off + 28);
 
       if (nameId === NO_DATA) return;
       const name = strings.get(nameId);
@@ -153,6 +159,7 @@ export function findPois(
         is_point: vertCount === 0,
         score,
         area: areaSqDeg,
+        parent_postcode_id: parentPostcodeId,
       });
     });
   }

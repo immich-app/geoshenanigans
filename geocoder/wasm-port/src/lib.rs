@@ -264,6 +264,18 @@ struct Index {
     poi_cells: Option<Vec<u8>>,
     poi_entries: Option<Vec<u8>>,
     poi_meta: PoiMeta,
+    geo_cells: Option<Vec<u8>>,
+    street_ways: Option<Vec<u8>>,
+    street_nodes: Option<Vec<u8>>,
+    street_entries: Option<Vec<u8>>,
+    addr_points: Option<Vec<u8>>,
+    addr_vertices: Option<Vec<u8>>,
+    addr_entries: Option<Vec<u8>>,
+    interp_ways: Option<Vec<u8>>,
+    interp_nodes: Option<Vec<u8>>,
+    interp_entries: Option<Vec<u8>>,
+    way_postcodes: Option<Vec<u8>>,
+    addr_postcodes: Option<Vec<u8>>,
     strings: StringPool,
 }
 
@@ -271,6 +283,8 @@ const ADMIN_LEVEL_COUNT: usize = 16;
 
 #[derive(Default, serde::Serialize)]
 struct AddressDetails {
+    #[serde(skip_serializing_if = "Option::is_none")] house_number: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")] road: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")] landmark: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")] city: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")] town: Option<String>,
@@ -594,6 +608,7 @@ struct PoiHit {
     is_point: bool,
     score: f64,
     area: f64,
+    parent_postcode_id: u32,
 }
 
 fn point_to_segment_dist_sq(
@@ -710,6 +725,7 @@ fn find_pois(idx: &Index, lat: f64, lng: f64) -> Vec<PoiHit> {
                 is_point: poi.vertex_count == 0,
                 score,
                 area: area_sq_deg,
+                parent_postcode_id: poi.parent_postcode_id,
             });
         });
     }
@@ -733,6 +749,270 @@ fn find_pois(idx: &Index, lat: f64, lng: f64) -> Vec<PoiHit> {
         if out.len() >= 5 { break; }
     }
     out
+}
+
+// --- Streets / addresses / interpolation primary feature ---
+//
+// query_geo finds the nearest street segment, addr_point, and
+// interpolation segment to the query.  Caller picks the closest as the
+// primary feature (`road` + optional `house_number`).  Mirrors Rust
+// query_geo at line 684.  Cell stride for geo_cells is 20 bytes
+// (u64 cell + u32 street + u32 addr + u32 interp).
+const GEO_CELL_RECORD_SIZE: usize = 20;
+const ADDR_POINT_SIZE: usize = 28;
+const WAY_HEADER_SIZE: usize = 12;
+const INTERP_WAY_SIZE: usize = 24;
+const STREET_CELL_LEVEL: u64 = 17;
+
+#[derive(Clone, Copy)]
+struct GeoOffsets { street: u32, addr: u32, interp: u32 }
+
+fn lookup_geo_cell(buf: &[u8], target: u64) -> GeoOffsets {
+    let n = buf.len() / GEO_CELL_RECORD_SIZE;
+    let mut lo = 0;
+    let mut hi = n;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let off = mid * GEO_CELL_RECORD_SIZE;
+        let id = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+        if id < target { lo = mid + 1; }
+        else if id > target { hi = mid; }
+        else {
+            return GeoOffsets {
+                street: u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap()),
+                addr:   u32::from_le_bytes(buf[off + 12..off + 16].try_into().unwrap()),
+                interp: u32::from_le_bytes(buf[off + 16..off + 20].try_into().unwrap()),
+            };
+        }
+    }
+    GeoOffsets { street: NO_DATA, addr: NO_DATA, interp: NO_DATA }
+}
+
+#[derive(Clone, Copy)]
+struct AddrCandidate { dist_sq: f64, index: u32, housenumber_id: u32, street_id: u32, parent_way_id: u32 }
+#[derive(Clone, Copy)]
+struct StreetCandidate { dist_sq: f64, way_index: u32, name_id: u32 }
+struct InterpCandidate { dist_sq: f64, street_id: u32, number: u32 }
+
+fn polygon_distance_sq(lat: f32, lng: f32, vertices: &[u8], vert_off_bytes: usize, vert_count: usize, cos_lat: f64, lat_d: f64, lng_d: f64) -> f64 {
+    if vert_count < 3 { return f64::MAX; }
+    if point_in_polygon(lat, lng, vertices, vert_off_bytes, vert_count) { return 0.0; }
+    let mut best = f64::MAX;
+    for i in 0..vert_count {
+        let j = if i + 1 < vert_count { i + 1 } else { 0 };
+        let a = vert_off_bytes + i * 8;
+        let b = vert_off_bytes + j * 8;
+        let i_lat = f32::from_le_bytes(vertices[a..a + 4].try_into().unwrap()) as f64;
+        let i_lng = f32::from_le_bytes(vertices[a + 4..a + 8].try_into().unwrap()) as f64;
+        let j_lat = f32::from_le_bytes(vertices[b..b + 4].try_into().unwrap()) as f64;
+        let j_lng = f32::from_le_bytes(vertices[b + 4..b + 8].try_into().unwrap()) as f64;
+        let d = point_to_segment_dist_sq(lat_d, lng_d, i_lat, i_lng, j_lat, j_lng, cos_lat);
+        if d < best { best = d; }
+    }
+    best
+}
+
+fn query_geo(idx: &Index, lat: f64, lng: f64) -> (Option<AddrCandidate>, Option<StreetCandidate>, Option<InterpCandidate>) {
+    let geo = match idx.geo_cells.as_ref() { Some(g) => g, None => return (None, None, None) };
+    let cell = cell_id_at_level(lat, lng, STREET_CELL_LEVEL);
+    let neighbors = cell_neighbors_at_level(cell, STREET_CELL_LEVEL);
+    const DEG: f64 = std::f64::consts::PI / 180.0;
+    let cos_lat = (lat * DEG).cos();
+    let lat_f = lat as f32;
+    let lng_f = lng as f32;
+
+    let mut best_addr: Option<AddrCandidate> = None;
+    let mut best_addr_dist = f64::MAX;
+    let mut best_street: Option<StreetCandidate> = None;
+    let mut best_street_dist = f64::MAX;
+    let mut best_interp_iw: Option<(u32, f64, f64)> = None;
+    let mut best_interp_dist = f64::MAX;
+
+    let mut seen_streets: [u32; 64] = [u32::MAX; 64];
+
+    for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+        let offs = lookup_geo_cell(geo, c);
+
+        if let (Some(addr_e), Some(addr_p)) = (idx.addr_entries.as_ref(), idx.addr_points.as_ref()) {
+            let total_addr = addr_p.len() / ADDR_POINT_SIZE;
+            for_each_entry(addr_e, offs.addr, |id| {
+                let i = id as usize;
+                if i >= total_addr { return; }
+                let off = i * ADDR_POINT_SIZE;
+                let a_lat = f32::from_le_bytes(addr_p[off..off + 4].try_into().unwrap());
+                let a_lng = f32::from_le_bytes(addr_p[off + 4..off + 8].try_into().unwrap());
+                let housenumber_id = u32::from_le_bytes(addr_p[off + 8..off + 12].try_into().unwrap());
+                let street_id = u32::from_le_bytes(addr_p[off + 12..off + 16].try_into().unwrap());
+                let parent_way_id = u32::from_le_bytes(addr_p[off + 16..off + 20].try_into().unwrap());
+                let vert_off = u32::from_le_bytes(addr_p[off + 20..off + 24].try_into().unwrap());
+                let vert_count = u32::from_le_bytes(addr_p[off + 24..off + 28].try_into().unwrap());
+
+                let dlat = (a_lat as f64 - lat) * DEG;
+                let dlng = (a_lng as f64 - lng) * DEG;
+                let mut dist = dlat * dlat + dlng * dlng * cos_lat * cos_lat;
+                if vert_count > 0 && vert_off != NO_DATA {
+                    if let Some(av) = idx.addr_vertices.as_ref() {
+                        dist = polygon_distance_sq(lat_f, lng_f, av, vert_off as usize * 8, vert_count as usize, cos_lat, lat, lng);
+                    }
+                }
+                if dist < best_addr_dist {
+                    best_addr_dist = dist;
+                    best_addr = Some(AddrCandidate { dist_sq: dist, index: id, housenumber_id, street_id, parent_way_id });
+                }
+            });
+        }
+
+        if let (Some(se), Some(sw), Some(sn)) = (idx.street_entries.as_ref(), idx.street_ways.as_ref(), idx.street_nodes.as_ref()) {
+            let total_ways = sw.len() / WAY_HEADER_SIZE;
+            for_each_entry(se, offs.street, |id| {
+                let slot = (id as usize) & 0x3F;
+                if seen_streets[slot] == id { return; }
+                seen_streets[slot] = id;
+                let i = id as usize;
+                if i >= total_ways { return; }
+                let way_off = i * WAY_HEADER_SIZE;
+                let node_offset = u32::from_le_bytes(sw[way_off..way_off + 4].try_into().unwrap());
+                let node_count = sw[way_off + 4];
+                let name_id = u32::from_le_bytes(sw[way_off + 8..way_off + 12].try_into().unwrap());
+                if node_count < 2 { return; }
+                let nodes_base = node_offset as usize * 8;
+                if nodes_base + node_count as usize * 8 > sn.len() { return; }
+                for j in 0..(node_count as usize - 1) {
+                    let a = nodes_base + j * 8;
+                    let b = nodes_base + (j + 1) * 8;
+                    let a_lat = f32::from_le_bytes(sn[a..a + 4].try_into().unwrap()) as f64;
+                    let a_lng = f32::from_le_bytes(sn[a + 4..a + 8].try_into().unwrap()) as f64;
+                    let b_lat = f32::from_le_bytes(sn[b..b + 4].try_into().unwrap()) as f64;
+                    let b_lng = f32::from_le_bytes(sn[b + 4..b + 8].try_into().unwrap()) as f64;
+                    let d = point_to_segment_dist_sq(lat, lng, a_lat, a_lng, b_lat, b_lng, cos_lat);
+                    if d < best_street_dist {
+                        best_street_dist = d;
+                        best_street = Some(StreetCandidate { dist_sq: d, way_index: id, name_id });
+                    }
+                }
+            });
+        }
+
+        if let (Some(ie), Some(iw), Some(in_n)) = (idx.interp_entries.as_ref(), idx.interp_ways.as_ref(), idx.interp_nodes.as_ref()) {
+            let total_interps = iw.len() / INTERP_WAY_SIZE;
+            for_each_entry(ie, offs.interp, |id| {
+                let i = id as usize;
+                if i >= total_interps { return; }
+                let iw_off = i * INTERP_WAY_SIZE;
+                let node_offset = u32::from_le_bytes(iw[iw_off..iw_off + 4].try_into().unwrap());
+                let node_count = iw[iw_off + 4];
+                let start_number = u32::from_le_bytes(iw[iw_off + 12..iw_off + 16].try_into().unwrap());
+                let end_number = u32::from_le_bytes(iw[iw_off + 16..iw_off + 20].try_into().unwrap());
+                if start_number == 0 || end_number == 0 { return; }
+                if node_count < 2 { return; }
+                let nodes_base = node_offset as usize * 8;
+                if nodes_base + node_count as usize * 8 > in_n.len() { return; }
+                let mut total_len = 0.0;
+                for j in 0..(node_count as usize - 1) {
+                    let a = nodes_base + j * 8;
+                    let b = nodes_base + (j + 1) * 8;
+                    let a_lat = f32::from_le_bytes(in_n[a..a + 4].try_into().unwrap()) as f64;
+                    let a_lng = f32::from_le_bytes(in_n[a + 4..a + 8].try_into().unwrap()) as f64;
+                    let b_lat = f32::from_le_bytes(in_n[b..b + 4].try_into().unwrap()) as f64;
+                    let b_lng = f32::from_le_bytes(in_n[b + 4..b + 8].try_into().unwrap()) as f64;
+                    let dlat = (b_lat - a_lat) * DEG;
+                    let dlng = (b_lng - a_lng) * DEG;
+                    total_len += dlat * dlat + dlng * dlng * cos_lat * cos_lat;
+                }
+                if total_len == 0.0 { return; }
+                let mut best_seg_dist = f64::MAX;
+                let mut best_seg_t = 0.0;
+                let mut prev_acc = 0.0;
+                for j in 0..(node_count as usize - 1) {
+                    let a = nodes_base + j * 8;
+                    let b = nodes_base + (j + 1) * 8;
+                    let a_lat = f32::from_le_bytes(in_n[a..a + 4].try_into().unwrap()) as f64;
+                    let a_lng = f32::from_le_bytes(in_n[a + 4..a + 8].try_into().unwrap()) as f64;
+                    let b_lat = f32::from_le_bytes(in_n[b..b + 4].try_into().unwrap()) as f64;
+                    let b_lng = f32::from_le_bytes(in_n[b + 4..b + 8].try_into().unwrap()) as f64;
+                    let dlat = (b_lat - a_lat) * DEG;
+                    let dlng = (b_lng - a_lng) * DEG;
+                    let seg_len = dlat * dlat + dlng * dlng * cos_lat * cos_lat;
+                    let dx = b_lng - a_lng;
+                    let dy = b_lat - a_lat;
+                    let len_sq_raw = dx * dx + dy * dy;
+                    let mut t = if len_sq_raw == 0.0 { 0.0 } else { ((lng - a_lng) * dx + (lat - a_lat) * dy) / len_sq_raw };
+                    if t < 0.0 { t = 0.0; } else if t > 1.0 { t = 1.0; }
+                    let proj_lat = a_lat + t * dy;
+                    let proj_lng = a_lng + t * dx;
+                    let dlat2 = (lat - proj_lat) * DEG;
+                    let dlng2 = (lng - proj_lng) * DEG;
+                    let dist = dlat2 * dlat2 + dlng2 * dlng2 * cos_lat * cos_lat;
+                    if dist < best_seg_dist {
+                        best_seg_dist = dist;
+                        best_seg_t = (prev_acc + t * seg_len) / total_len;
+                    }
+                    prev_acc += seg_len;
+                }
+                if best_seg_dist < best_interp_dist {
+                    best_interp_dist = best_seg_dist;
+                    best_interp_iw = Some((id, best_seg_dist, best_seg_t));
+                }
+            });
+        }
+    }
+
+    let interp_result = best_interp_iw.map(|(id, dist, t)| {
+        let iw = idx.interp_ways.as_ref().unwrap();
+        let off = id as usize * INTERP_WAY_SIZE;
+        let street_id = u32::from_le_bytes(iw[off + 8..off + 12].try_into().unwrap());
+        let start = u32::from_le_bytes(iw[off + 12..off + 16].try_into().unwrap());
+        let end = u32::from_le_bytes(iw[off + 16..off + 20].try_into().unwrap());
+        let interpolation = iw[off + 20];
+        let raw = start as f64 + t * (end as f64 - start as f64);
+        let step: u32 = if interpolation == 1 || interpolation == 2 { 2 } else { 1 };
+        let number = if step == 2 {
+            start + ((raw - start as f64) / 2.0).round() as u32 * 2
+        } else {
+            raw.round() as u32
+        };
+        InterpCandidate { dist_sq: dist, street_id, number }
+    });
+
+    (best_addr, best_street, interp_result)
+}
+
+fn find_addr_on_way(idx: &Index, lat: f64, lng: f64, parent_way_idx: u32, max_dist_sq: f64) -> Option<AddrCandidate> {
+    let geo = idx.geo_cells.as_ref()?;
+    let addr_e = idx.addr_entries.as_ref()?;
+    let addr_p = idx.addr_points.as_ref()?;
+    let cell = cell_id_at_level(lat, lng, STREET_CELL_LEVEL);
+    let neighbors = cell_neighbors_at_level(cell, STREET_CELL_LEVEL);
+    const DEG: f64 = std::f64::consts::PI / 180.0;
+    let cos_lat = (lat * DEG).cos();
+    let total_addr = addr_p.len() / ADDR_POINT_SIZE;
+    let mut best_dist = max_dist_sq;
+    let mut best: Option<AddrCandidate> = None;
+    for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+        let offs = lookup_geo_cell(geo, c);
+        for_each_entry(addr_e, offs.addr, |id| {
+            let i = id as usize;
+            if i >= total_addr { return; }
+            let off = i * ADDR_POINT_SIZE;
+            let parent_way_id = u32::from_le_bytes(addr_p[off + 16..off + 20].try_into().unwrap());
+            if parent_way_id != parent_way_idx { return; }
+            let a_lat = f32::from_le_bytes(addr_p[off..off + 4].try_into().unwrap()) as f64;
+            let a_lng = f32::from_le_bytes(addr_p[off + 4..off + 8].try_into().unwrap()) as f64;
+            let dlat = (a_lat - lat) * DEG;
+            let dlng = (a_lng - lng) * DEG;
+            let d = dlat * dlat + dlng * dlng * cos_lat * cos_lat;
+            if d < best_dist {
+                best_dist = d;
+                best = Some(AddrCandidate {
+                    dist_sq: d, index: id,
+                    housenumber_id: u32::from_le_bytes(addr_p[off + 8..off + 12].try_into().unwrap()),
+                    street_id: u32::from_le_bytes(addr_p[off + 12..off + 16].try_into().unwrap()),
+                    parent_way_id,
+                });
+            }
+        });
+    }
+    best
 }
 
 fn read_postcode_centroid(buf: &[u8], idx: usize) -> Option<PostcodeCentroid> {
@@ -837,7 +1117,69 @@ fn query_inner(idx: &Index, lat: f64, lng: f64) -> Address {
         addr.landmark = Some(pois[0].name.clone());
     }
 
-    if let Some(pc) = resolve_postcode(idx, lat, lng, cc.as_deref()) {
+    // Streets / addrs / interp primary feature.  Picks the closest of
+    // addr / street / interp as the road+house_number pair. Available
+    // only when geo_cells.bin is loaded (skipped on planet due to the
+    // wasm32 4 GiB linear-memory cap).
+    let mut street_way_idx: u32 = NO_DATA;
+    if idx.geo_cells.is_some() {
+        let (a, s, i) = query_geo(idx, lat, lng);
+        let mut cands: [(f64, u8); 3] = [(f64::MAX, 0); 3];
+        if let Some(ref ac) = a { cands[0] = (ac.dist_sq, 1); }
+        if let Some(ref sc) = s { cands[1] = (sc.dist_sq, 2); }
+        if let Some(ref ic) = i { cands[2] = (ic.dist_sq, 3); }
+        let winner = cands.iter().min_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some(&(_, kind)) = winner {
+            match kind {
+                1 => if let Some(ac) = a {
+                    if ac.housenumber_id != NO_DATA {
+                        addr.house_number = Some(idx.strings.get(ac.housenumber_id).to_string());
+                    }
+                    if ac.street_id != NO_DATA {
+                        addr.road = Some(idx.strings.get(ac.street_id).to_string());
+                    }
+                }
+                3 => if let Some(ic) = i {
+                    addr.house_number = Some(ic.number.to_string());
+                    addr.road = Some(idx.strings.get(ic.street_id).to_string());
+                }
+                2 => if let Some(sc) = s {
+                    addr.road = Some(idx.strings.get(sc.name_id).to_string());
+                    street_way_idx = sc.way_index;
+                    if let Some(refined) = find_addr_on_way(idx, lat, lng, street_way_idx, 0.001 * 0.001) {
+                        if refined.housenumber_id != NO_DATA {
+                            addr.house_number = Some(idx.strings.get(refined.housenumber_id).to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Postcode chain: tier 1 (way_postcode for winning street) → tier 1b
+    // (POI parent_postcode) → tier 4 (nearest centroid).
+    let mut postcode: Option<String> = None;
+    if street_way_idx != NO_DATA {
+        if let Some(wp) = idx.way_postcodes.as_ref() {
+            let off = street_way_idx as usize * 4;
+            if off + 4 <= wp.len() {
+                let id = u32::from_le_bytes(wp[off..off + 4].try_into().unwrap());
+                if id != NO_DATA {
+                    let s = idx.strings.get(id);
+                    if !s.is_empty() { postcode = Some(s.to_string()); }
+                }
+            }
+        }
+    }
+    if postcode.is_none() && !pois.is_empty() && pois[0].parent_postcode_id != NO_DATA {
+        let s = idx.strings.get(pois[0].parent_postcode_id);
+        if !s.is_empty() { postcode = Some(s.to_string()); }
+    }
+    if postcode.is_none() {
+        postcode = resolve_postcode(idx, lat, lng, cc.as_deref());
+    }
+    if let Some(pc) = postcode {
         addr.postcode = Some(pc);
     }
     let display = build_display(&addr);
@@ -927,6 +1269,18 @@ impl Geocoder {
             poi_cells: take_optional("poi_cells"),
             poi_entries: take_optional("poi_entries"),
             poi_meta: PoiMeta::from_json(&poi_meta_json),
+            geo_cells: take_optional("geo_cells"),
+            street_ways: take_optional("street_ways"),
+            street_nodes: take_optional("street_nodes"),
+            street_entries: take_optional("street_entries"),
+            addr_points: take_optional("addr_points"),
+            addr_vertices: take_optional("addr_vertices"),
+            addr_entries: take_optional("addr_entries"),
+            interp_ways: take_optional("interp_ways"),
+            interp_nodes: take_optional("interp_nodes"),
+            interp_entries: take_optional("interp_entries"),
+            way_postcodes: take_optional("way_postcodes"),
+            addr_postcodes: take_optional("addr_postcodes"),
             strings,
         };
 

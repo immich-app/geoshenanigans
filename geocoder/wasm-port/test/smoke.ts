@@ -8,8 +8,24 @@ import { Geocoder } from "../pkg/geocoder_wasm.js";
 
 const dataDir = process.env.GEOCODER_DATA ?? "/home/zack/geocoder-data-v14";
 
+// Same reasoning as the ts-port loader: JS Uint8Array max is ~4 GiB,
+// wasm32 linear memory is capped at 4 GiB total. Skip files that
+// exceed a conservative threshold so the constructor doesn't OOM.
+// wasm32 linear memory is capped at 4 GiB and the JS-side Uint8Array
+// copies count against that budget on construction. Total of all loaded
+// buffers needs to stay well under 4 GiB. 600 MiB per file keeps the
+// summed planet load under ~3 GiB; continent extracts fit comfortably.
+const SKIP_OVER_BYTES = 600 * 1024 * 1024;
 function readOptional(name: string): Buffer | null {
-  try { return readFileSync(join(dataDir, name)); } catch { return null; }
+  try {
+    const path = join(dataDir, name);
+    const stat = require("node:fs").statSync(path);
+    if (stat.size > SKIP_OVER_BYTES) {
+      console.warn(`[wasm-port] skipping ${name}: ${(stat.size / 2 ** 30).toFixed(1)} GiB exceeds wasm32 budget`);
+      return null;
+    }
+    return readFileSync(path);
+  } catch { return null; }
 }
 
 console.log(`Loading WASM port from ${dataDir}…`);
@@ -37,6 +53,18 @@ const buffers = {
   poi_cells:      readOptional("poi_cells.bin"),
   poi_entries:    readOptional("poi_entries.bin"),
   poi_meta:       (() => { try { return readFileSync(join(dataDir, "poi_meta.json"), "utf8"); } catch { return ""; } })(),
+  geo_cells:      readOptional("geo_cells.bin"),
+  street_ways:    readOptional("street_ways.bin"),
+  street_nodes:   readOptional("street_nodes.bin"),
+  street_entries: readOptional("street_entries.bin"),
+  addr_points:    readOptional("addr_points.bin"),
+  addr_vertices:  readOptional("addr_vertices.bin"),
+  addr_entries:   readOptional("addr_entries.bin"),
+  interp_ways:    readOptional("interp_ways.bin"),
+  interp_nodes:   readOptional("interp_nodes.bin"),
+  interp_entries: readOptional("interp_entries.bin"),
+  way_postcodes:  readOptional("way_postcodes.bin"),
+  addr_postcodes: readOptional("addr_postcodes.bin"),
 };
 
 const geo = new Geocoder(buffers);

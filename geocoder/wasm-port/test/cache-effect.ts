@@ -23,8 +23,16 @@ const rustUrl = process.env.RUST_URL ?? "http://localhost:3556";
 const apiKey = process.env.API_KEY ?? "test";
 const N = Number(process.env.N ?? 200);
 
+// wasm32 + JS Uint8Array share a 4 GiB ceiling; cap per-file size to
+// keep the wasm constructor from OOM'ing on the planet build.
+const SKIP_OVER_BYTES = 600 * 1024 * 1024;
 function readOptional(name: string): Buffer | null {
-  try { return readFileSync(join(dataDir, name)); } catch { return null; }
+  try {
+    const path = join(dataDir, name);
+    const stat = require("node:fs").statSync(path);
+    if (stat.size > SKIP_OVER_BYTES) return null;
+    return readFileSync(path);
+  } catch { return null; }
 }
 
 const wasmBuffers = {
@@ -49,6 +57,18 @@ const wasmBuffers = {
   poi_cells:      readOptional("poi_cells.bin"),
   poi_entries:    readOptional("poi_entries.bin"),
   poi_meta:       (() => { try { return readFileSync(join(dataDir, "poi_meta.json"), "utf8"); } catch { return ""; } })(),
+  geo_cells:      readOptional("geo_cells.bin"),
+  street_ways:    readOptional("street_ways.bin"),
+  street_nodes:   readOptional("street_nodes.bin"),
+  street_entries: readOptional("street_entries.bin"),
+  addr_points:    readOptional("addr_points.bin"),
+  addr_vertices:  readOptional("addr_vertices.bin"),
+  addr_entries:   readOptional("addr_entries.bin"),
+  interp_ways:    readOptional("interp_ways.bin"),
+  interp_nodes:   readOptional("interp_nodes.bin"),
+  interp_entries: readOptional("interp_entries.bin"),
+  way_postcodes:  readOptional("way_postcodes.bin"),
+  addr_postcodes: readOptional("addr_postcodes.bin"),
 };
 
 const tsGeo = new TsGeocoder(dataDir);
