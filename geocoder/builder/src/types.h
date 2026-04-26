@@ -67,17 +67,42 @@ enum class AdminPlaceType : uint8_t {
     MUNICIPALITY = 14,  // place=municipality (e.g. Sydney Council L6)
 };
 
+// Vertex encoding tag: picks the bytes-per-vertex / precision tradeoff
+// for this polygon.  Builder picks the finest scale that fits the
+// polygon's bbox; reader decodes per-vertex via the inverse scale.
+//
+// Stored values per vertex are unsigned deltas relative to bbox_min:
+//   v_lat = bbox_min_lat + (stored_dlat * scale)
+//   v_lng = bbox_min_lng + (stored_dlng * scale)
+//
+// All schemes encode vertex_offset as a BYTE offset into the vertices
+// file (not a vertex index) since the per-vertex stride varies.
+enum class VertexEncoding : uint8_t {
+    U16_1M    = 0,  // u16 @ 1e-5° (1.1 m), fits 73 km × 73 km bbox  → suburbs/cities
+    U16_11M   = 1,  // u16 @ 1e-4° (11 m),  fits 730 km × 730 km     → states/regions
+    U16_011M  = 2,  // u16 @ 1e-6° (11 cm), fits 7.3 km × 7.3 km     → POI buildings
+    U32_1CM   = 3,  // u32 @ 1e-7° (1.1 cm), fits any polygon        → countries / fallback
+    F32       = 4,  // raw f32 lat/lng (current format)              → escape hatch
+};
+static constexpr uint8_t VERTEX_STRIDE[5] = {4, 4, 4, 8, 8};
+
 struct AdminPolygon {
-    uint32_t vertex_offset;
+    uint32_t vertex_offset;       // BYTE offset into admin_vertices.bin
     uint32_t vertex_count;
     uint32_t name_id;
     uint8_t admin_level;
     uint8_t place_type_override = 0; // AdminPlaceType — overrides admin_level for field mapping
-    uint8_t _pad2 = 0, _pad3 = 0;
+    uint8_t encoding = 4;         // VertexEncoding (default F32 for legacy code paths)
+    uint8_t _pad3 = 0;
     float area;
     uint16_t country_code;
     uint16_t _pad4 = 0;
+    // Reference point for delta-encoded schemes (encoding != F32).
+    // Vertices reconstruct as bbox_min + (stored_delta * scale_for_encoding).
+    float bbox_min_lat = 0.0f;
+    float bbox_min_lng = 0.0f;
 };
+static_assert(sizeof(AdminPolygon) == 32, "AdminPolygon must be 32 bytes");
 
 struct NodeCoord {
     float lat;
@@ -883,7 +908,16 @@ struct PoiRecord {
     // cross-border landmark that happens to be spatially nearest).
     // NO_DATA (0xFFFFFFFF) if no containing admin polygon found.
     uint32_t parent_poly_id = 0xFFFFFFFF;
+    // VertexEncoding tag (default F32 for point POIs / legacy data).
+    // Builder picks the finest scale that fits the polygon's bbox.
+    // vertex_offset is a BYTE offset into poi_vertices.bin when
+    // encoding != F32 (variable per-vertex stride).
+    uint8_t encoding = 4;
+    uint8_t _pad_enc1 = 0, _pad_enc2 = 0, _pad_enc3 = 0;
+    float bbox_min_lat = 0.0f;
+    float bbox_min_lng = 0.0f;
 };
+static_assert(sizeof(PoiRecord) == 48, "PoiRecord must be 48 bytes");
 
 // Collected POI relation data for parallel polygon assembly
 struct CollectedPoiRelation {

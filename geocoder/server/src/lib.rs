@@ -167,6 +167,85 @@ impl FileBytes {
     }
 }
 
+/// Decode a polygon's quantized vertices into NodeCoord values.
+/// Used by both Index::admin_verts and Index::poi_verts (and any
+/// future addr_vertices consumer) so the encoding logic lives in
+/// one place.  vertex_offset is a BYTE offset into the source file.
+/// Returns Cow::Owned for delta-encoded schemes (decoding allocates),
+/// Cow::Borrowed for the F32 escape hatch when the source is
+/// Owned/Mmap (zero-copy slice cast).
+pub fn decode_polygon_verts<'a>(
+    src: &'a FileBytes,
+    vertex_offset: u32,
+    vertex_count: u32,
+    encoding: u8,
+    bbox_min_lat: f32,
+    bbox_min_lng: f32,
+) -> Option<std::borrow::Cow<'a, [NodeCoord]>> {
+    if vertex_count == 0 || vertex_offset == NO_DATA { return None; }
+    let stride = vertex_stride(encoding) as u64;
+    let off = vertex_offset as u64;
+    let total_bytes = (vertex_count as u64) * stride;
+    if off + total_bytes > src.len() { return None; }
+    let bytes = src.read_chunk(off, total_bytes as usize);
+
+    if encoding == 4 {
+        // Legacy F32 — direct cast, zero-copy when borrowed.
+        match bytes {
+            std::borrow::Cow::Borrowed(b) => {
+                let verts: &[NodeCoord] = unsafe {
+                    std::slice::from_raw_parts(
+                        b.as_ptr() as *const NodeCoord,
+                        vertex_count as usize,
+                    )
+                };
+                Some(std::borrow::Cow::Borrowed(verts))
+            }
+            std::borrow::Cow::Owned(v) => {
+                let mut out = Vec::<NodeCoord>::with_capacity(vertex_count as usize);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        v.as_ptr() as *const NodeCoord,
+                        out.as_mut_ptr(),
+                        vertex_count as usize,
+                    );
+                    out.set_len(vertex_count as usize);
+                }
+                Some(std::borrow::Cow::Owned(out))
+            }
+        }
+    } else {
+        // Delta-encoded.  Decode each vertex into a fresh NodeCoord.
+        let scale = vertex_scale(encoding);
+        let bmin_lat = bbox_min_lat as f64;
+        let bmin_lng = bbox_min_lng as f64;
+        let count = vertex_count as usize;
+        let mut out = Vec::<NodeCoord>::with_capacity(count);
+        if encoding == 3 {
+            // u32 deltas (8 bytes/vertex)
+            for i in 0..count {
+                let dlat = u32::from_le_bytes(bytes[i*8..i*8+4].try_into().unwrap()) as f64;
+                let dlng = u32::from_le_bytes(bytes[i*8+4..i*8+8].try_into().unwrap()) as f64;
+                out.push(NodeCoord {
+                    lat: (bmin_lat + dlat * scale) as f32,
+                    lng: (bmin_lng + dlng * scale) as f32,
+                });
+            }
+        } else {
+            // u16 deltas (4 bytes/vertex) — encodings 0, 1, 2
+            for i in 0..count {
+                let dlat = u16::from_le_bytes(bytes[i*4..i*4+2].try_into().unwrap()) as f64;
+                let dlng = u16::from_le_bytes(bytes[i*4+2..i*4+4].try_into().unwrap()) as f64;
+                out.push(NodeCoord {
+                    lat: (bmin_lat + dlat * scale) as f32,
+                    lng: (bmin_lng + dlng * scale) as f32,
+                });
+            }
+        }
+        Some(std::borrow::Cow::Owned(out))
+    }
+}
+
 // Allow `&self.field[off..end]` indexing on Owned/Mmap-backed sources.
 // Panics on JsChunked — call read_chunk instead.
 impl std::ops::Deref for FileBytes {
@@ -242,19 +321,56 @@ pub struct InterpWay {
     pub interpolation: u8,
 }
 
+/// Vertex encoding tag for delta-quantized polygon storage.  Each
+/// AdminPolygon (and PoiRecord, AddrPoint) carries a per-record
+/// encoding picked by the builder to fit the polygon's bbox at the
+/// finest precision possible.  Reader decodes per-vertex via the
+/// inverse of the tag's scale.
+#[repr(u8)]
+#[allow(non_camel_case_types)]
+pub enum VertexEncoding {
+    U16_1M    = 0,  // u16 @ 1e-5° (1.1 m), fits 73 km × 73 km bbox
+    U16_11M   = 1,  // u16 @ 1e-4° (11 m),  fits 730 km × 730 km
+    U16_011M  = 2,  // u16 @ 1e-6° (11 cm), fits 7.3 km × 7.3 km — POI buildings
+    U32_1CM   = 3,  // u32 @ 1e-7° (1.1 cm), fits any polygon
+    F32       = 4,  // raw f32 lat/lng (legacy / escape hatch)
+}
+
+#[inline]
+pub fn vertex_stride(enc: u8) -> usize {
+    match enc {
+        0 | 1 | 2 => 4, // u16 dlat + u16 dlng
+        3 | 4     => 8, // u32 dlat + u32 dlng OR f32 + f32
+        _ => 8,
+    }
+}
+
+#[inline]
+pub fn vertex_scale(enc: u8) -> f64 {
+    match enc {
+        0 => 1e-5, // 1.1 m
+        1 => 1e-4, // 11 m
+        2 => 1e-6, // 11 cm
+        3 => 1e-7, // 1.1 cm
+        _ => 0.0,  // F32: not used
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct AdminPolygon {
-    pub vertex_offset: u32,
+    pub vertex_offset: u32,       // BYTE offset into admin_vertices.bin
     pub vertex_count: u32,
     pub name_id: u32,
     pub admin_level: u8,
     pub place_type_override: u8,  // 0=none, 1=city, 2=town, 3=village, 4=suburb, 5=neighbourhood, 6=quarter
-    pub _pad2: u8,
+    pub encoding: u8,             // VertexEncoding tag (default F32=4 for legacy data)
     pub _pad3: u8,
     pub area: f32,
     pub country_code: u16,
     pub _pad4: u16,
+    pub bbox_min_lat: f32,        // reference point for delta-encoded vertex schemes
+    pub bbox_min_lng: f32,
 }
 
 #[repr(C)]
@@ -269,13 +385,24 @@ pub struct NodeCoord {
 pub struct PoiRecord {
     pub lat: f32,
     pub lng: f32,
-    pub vertex_offset: u32,
+    pub vertex_offset: u32,       // BYTE offset into poi_vertices.bin
     pub vertex_count: u32,
     pub name_id: u32,
     pub category: u8,
     pub tier: u8,
     pub flags: u8,
     pub importance: u8,
+    // Vertex encoding tag + bbox_min reference for delta-quantized
+    // polygon storage.  encoding = 4 (F32) means legacy f32 NodeCoords
+    // (vertex_offset is then a vertex index, not a byte offset — but
+    // newer builders always set encoding so this code path is for
+    // backward compatibility only).
+    pub encoding: u8,
+    pub _pad_enc1: u8,
+    pub _pad_enc2: u8,
+    pub _pad_enc3: u8,
+    pub bbox_min_lat: f32,
+    pub bbox_min_lng: f32,
     /// Name offset of the nearest named street to this POI, pre-
     /// computed at build time. Used to populate the `road` field
     /// when this POI wins query_geo primary-feature selection.
@@ -785,13 +912,22 @@ pub struct GeoCellOffsets {
 pub fn mmap_file(path: &str) -> Result<FileBytes, String> {
     let file = File::open(path).map_err(|e| format!("Failed to open {}: {}", path, e))?;
     let mmap = unsafe { Mmap::map(&file).map_err(|e| format!("Failed to mmap {}: {}", path, e))? };
+    // MADV_RANDOM disables kernel readahead.  All our access patterns are
+    // random index lookups (cell binary search, polygon vertex slices,
+    // string offsets) — readahead pulls in 32 pages of neighbours per
+    // touched page, inflating RSS several × without helping the next
+    // access.  Random-mode keeps RSS proportional to actually-touched
+    // bytes.  Cuts admin_vertices RSS from ~150 MB → ~35 MB on planet.
+    let _ = mmap.advise(memmap2::Advice::Random);
     Ok(FileBytes::Mmap(mmap))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn mmap_file_optional(path: &str) -> Option<FileBytes> {
     let file = File::open(path).ok()?;
-    unsafe { Mmap::map(&file).ok() }.map(FileBytes::Mmap)
+    let mmap = unsafe { Mmap::map(&file).ok() }?;
+    let _ = mmap.advise(memmap2::Advice::Random);
+    Some(FileBytes::Mmap(mmap))
 }
 
 impl Index {
@@ -929,25 +1065,20 @@ impl Index {
         self.strings.get(offset)
     }
 
-    /// Materialize a polygon's vertex slice from `admin_vertices` —
-    /// borrowed for native (Mmap/Owned), owned Vec for JsChunked.
-    /// Returns None if the offset/count would overrun the file (defends
-    /// against corrupted indices; valid data should never trip this).
-    pub fn admin_verts(&self, offset: u32, count: u32) -> Option<std::borrow::Cow<'_, [NodeCoord]>> {
-        if count == 0 || offset == NO_DATA { return None; }
-        let total = self.admin_vertices.len() / std::mem::size_of::<NodeCoord>() as u64;
-        if offset as u64 + count as u64 > total { return None; }
-        Some(self.admin_vertices.read_records::<NodeCoord>(offset as u64, count as usize))
+    /// Decode a polygon's quantized vertex slice from `admin_vertices`
+    /// using the polygon's encoding tag + bbox_min reference point.
+    /// Always returns owned Vec<NodeCoord> (decoding allocates) except
+    /// for the F32 escape hatch which returns the slice in-place.
+    pub fn admin_verts(&self, poly: &AdminPolygon) -> Option<std::borrow::Cow<'_, [NodeCoord]>> {
+        decode_polygon_verts(&self.admin_vertices, poly.vertex_offset, poly.vertex_count,
+                             poly.encoding, poly.bbox_min_lat, poly.bbox_min_lng)
     }
 
-    /// Same shape as `admin_verts` but for `poi_vertices`, which is an
-    /// optional file (returns None when not loaded).
-    pub fn poi_verts(&self, offset: u32, count: u32) -> Option<std::borrow::Cow<'_, [NodeCoord]>> {
-        if count == 0 || offset == NO_DATA { return None; }
+    /// Same shape as `admin_verts` but for `poi_vertices` (optional file).
+    pub fn poi_verts(&self, poly: &PoiRecord) -> Option<std::borrow::Cow<'_, [NodeCoord]>> {
         let v = self.poi_vertices.as_ref()?;
-        let total = v.len() / std::mem::size_of::<NodeCoord>() as u64;
-        if offset as u64 + count as u64 > total { return None; }
-        Some(v.read_records::<NodeCoord>(offset as u64, count as usize))
+        decode_polygon_verts(v, poly.vertex_offset, poly.vertex_count,
+                             poly.encoding, poly.bbox_min_lat, poly.bbox_min_lng)
     }
 
     /// Read a single record from a chunkable file by index.  Returns
@@ -1503,7 +1634,7 @@ impl Index {
                 if level >= 12 { return; }
                 if poly.area <= 0.0 { return; }
 
-                let Some(verts) = self.admin_verts(poly.vertex_offset, poly.vertex_count) else { return; };
+                let Some(verts) = self.admin_verts(&poly) else { return; };
                 let pip = point_in_polygon(lat as f32, lng as f32, &verts);
 
                 seen_in_level[level].push(serde_json::json!({
@@ -1573,7 +1704,7 @@ impl Index {
                 if level >= 12 { return; }
                 if poly.area <= 0.0 { return; }
 
-                let Some(verts) = self.admin_verts(poly.vertex_offset, poly.vertex_count) else { return; };
+                let Some(verts) = self.admin_verts(&poly) else { return; };
 
                 if let Some((best_area, _, best_verified)) = best_by_level[level] {
                     if poly.area >= best_area {
@@ -1582,7 +1713,7 @@ impl Index {
                         if !best_verified {
                             // Current best only passed via interior flag — verify it now
                             let (_, best_poly, _) = best_by_level[level].unwrap();
-                            let bverts = self.admin_verts(best_poly.vertex_offset, best_poly.vertex_count);
+                            let bverts = self.admin_verts(&best_poly);
                             let best_inside = bverts.as_deref().map(|b| point_in_polygon(lat as f32, lng as f32, b)).unwrap_or(false);
                             if best_inside {
                                 best_by_level[level] = Some((best_area, best_poly, true));
@@ -1618,7 +1749,7 @@ impl Index {
         // Verify any uncontested winners that only passed via interior flag
         for level in 0..12 {
             if let Some((area, poly, false)) = best_by_level[level] {
-                let inside = self.admin_verts(poly.vertex_offset, poly.vertex_count)
+                let inside = self.admin_verts(&poly)
                     .map(|v| point_in_polygon(lat as f32, lng as f32, &v))
                     .unwrap_or(false);
                 if inside {
@@ -1641,7 +1772,7 @@ impl Index {
                 let Some(poly) = self.admin_polygon(poly_id) else { return; };
                 if poly.admin_level != 15 { return; }
                 if poly.area <= 0.0 { return; }
-                let Some(verts) = self.admin_verts(poly.vertex_offset, poly.vertex_count) else { return; };
+                let Some(verts) = self.admin_verts(&poly) else { return; };
                 if !point_in_polygon(lat as f32, lng as f32, &verts) { return; }
                 if !place_area_polygons.iter().any(|(pid, _)| *pid == poly_id) {
                     place_area_polygons.push((poly_id, poly));
@@ -1969,7 +2100,7 @@ impl Index {
                 let Some(poly) = self.admin_polygon(poly_id) else { return; };
                 if poly.admin_level < 8 || poly.admin_level > 10 { return; }
                 if poly.area >= best_area { return; }
-                let Some(verts) = self.admin_verts(poly.vertex_offset, poly.vertex_count) else { return; };
+                let Some(verts) = self.admin_verts(&poly) else { return; };
                 if point_in_polygon(lat as f32, lng as f32, &verts) {
                     best_area = poly.area;
                     best = Some(poly);
@@ -2010,7 +2141,7 @@ impl Index {
                 let Some(poly) = self.admin_polygon(poly_id) else { return; };
                 if poly.admin_level < 7 || poly.admin_level > 8 { return; }
                 if poly.area >= best_area { return; }
-                let Some(verts) = self.admin_verts(poly.vertex_offset, poly.vertex_count) else { return; };
+                let Some(verts) = self.admin_verts(&poly) else { return; };
                 if point_in_polygon(lat as f32, lng as f32, &verts) {
                     best_area = poly.area;
                     best = Some(poly);
@@ -2093,7 +2224,7 @@ impl Index {
             match current_boundary {
                 None => true, // no admin boundary found — accept all
                 Some(poly) => {
-                    let Some(verts) = self.admin_verts(poly.vertex_offset, poly.vertex_count) else { return true; };
+                    let Some(verts) = self.admin_verts(&poly) else { return true; };
                     // PIP test the PLACE NODE's centroid, not the query point
                     point_in_polygon(pn.lat, pn.lng, &verts)
                 }
@@ -2110,7 +2241,7 @@ impl Index {
             match municipality_boundary {
                 None => true,
                 Some(poly) => {
-                    let Some(verts) = self.admin_verts(poly.vertex_offset, poly.vertex_count) else { return true; };
+                    let Some(verts) = self.admin_verts(&poly) else { return true; };
                     point_in_polygon(pn.lat, pn.lng, &verts)
                 }
             }
@@ -2266,7 +2397,7 @@ impl Index {
     pub fn poi_chain_contains_query(&self, poi: &PoiRecord, lat: f64, lng: f64) -> bool {
         if poi.parent_poly_id == NO_DATA { return true; }
         let Some(poly) = self.admin_polygon(poi.parent_poly_id) else { return true; };
-        let Some(verts) = self.admin_verts(poly.vertex_offset, poly.vertex_count) else { return true; };
+        let Some(verts) = self.admin_verts(&poly) else { return true; };
         point_in_polygon(lat as f32, lng as f32, &verts)
     }
 
@@ -2335,7 +2466,7 @@ impl Index {
                 // direct point-to-point distance.
                 let dist_sq_val;
                 if poi.vertex_count > 0 && poi.vertex_offset != NO_DATA {
-                    let Some(verts) = self.poi_verts(poi.vertex_offset, poi.vertex_count) else { return; };
+                    let Some(verts) = self.poi_verts(&poi) else { return; };
                     let count = verts.len();
                     if is_interior || point_in_polygon(lat as f32, lng as f32, &verts) {
                         dist_sq_val = 0.0;
@@ -2440,7 +2571,7 @@ impl Index {
                 let mut area_sq_deg = 0.0_f64;
 
                 if poi.vertex_count > 0 && poi.vertex_offset != NO_DATA {
-                    let Some(verts) = self.poi_verts(poi.vertex_offset, poi.vertex_count) else { return; };
+                    let Some(verts) = self.poi_verts(&poi) else { return; };
                     let count = verts.len();
                     contained = is_interior || point_in_polygon(lat as f32, lng as f32, &verts);
 
@@ -2605,7 +2736,7 @@ impl Index {
                 let Some(poly) = self.admin_polygon(poly_id) else { return; };
                 if poly.admin_level != 15 { return; }
                 if poly.area <= 0.0 { return; }
-                let Some(verts) = self.admin_verts(poly.vertex_offset, poly.vertex_count) else { return; };
+                let Some(verts) = self.admin_verts(&poly) else { return; };
                 if !point_in_polygon(lat as f32, lng as f32, &verts) { return; }
                 place_area_polygons.push(poly);
             });
@@ -3072,7 +3203,7 @@ impl Index {
                 } else if addr_pt.vertex_count == 0 && poi.vertex_count > 0
                     && poi.vertex_offset != NO_DATA {
                     let mut inside = false;
-                    if let Some(verts) = self.poi_verts(poi.vertex_offset, poi.vertex_count) {
+                    if let Some(verts) = self.poi_verts(&poi) {
                         inside = point_in_polygon(addr_pt.lat, addr_pt.lng, &verts);
                     }
                     // Fallback proximity gate: POI polygons go through the

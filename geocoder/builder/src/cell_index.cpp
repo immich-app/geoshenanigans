@@ -630,7 +630,82 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
     // (admin_level=11) are kept in the main arrays (cell index references
     // them by ID) AND also written to separate optional files.
     std::vector<AdminPolygon> postal_polys;
-    std::vector<NodeCoord> postal_verts;
+    std::vector<uint8_t> new_verts_bytes;       // packed: variable stride per polygon
+    std::vector<uint8_t> postal_verts_bytes;
+    new_verts_bytes.reserve(data.admin_polygons.size() * 8 * 100); // rough hint
+
+    // Pack one polygon's vertices into the byte stream.  Picks the
+    // finest VertexEncoding that fits the polygon's bbox; writes
+    // unsigned u16/u32 deltas relative to bbox_min.  Returns the byte
+    // offset where vertices start, plus the encoding tag and bbox_min
+    // (caller stores those on the AdminPolygon).
+    auto pack_polygon = [](std::vector<uint8_t>& out_bytes,
+                           const std::vector<std::pair<double,double>>& verts,
+                           uint8_t admin_level)
+        -> std::tuple<uint32_t /*byte_offset*/, VertexEncoding, float /*min_lat*/, float /*min_lng*/>
+    {
+        // Compute bbox min/max
+        double min_lat = verts[0].first, max_lat = verts[0].first;
+        double min_lng = verts[0].second, max_lng = verts[0].second;
+        for (size_t k = 1; k < verts.size(); k++) {
+            if (verts[k].first  < min_lat) min_lat = verts[k].first;
+            if (verts[k].first  > max_lat) max_lat = verts[k].first;
+            if (verts[k].second < min_lng) min_lng = verts[k].second;
+            if (verts[k].second > max_lng) max_lng = verts[k].second;
+        }
+        double dlat_span = max_lat - min_lat;
+        double dlng_span = max_lng - min_lng;
+        double max_span = std::max(dlat_span, dlng_span);
+
+        // Pick smallest encoding that fits.  u16 max = 65535.
+        // Span thresholds use 65535 * scale to leave no headroom.
+        VertexEncoding enc;
+        double scale;
+        if (max_span < 65535.0 * 1e-6) {
+            // 11 cm grid, 7.3 km bbox — POI building footprints
+            enc = VertexEncoding::U16_011M;
+            scale = 1e-6;
+        } else if (max_span < 65535.0 * 1e-5) {
+            // 1.1 m grid, 73 km bbox — most cities, suburbs, neighbourhoods
+            enc = VertexEncoding::U16_1M;
+            scale = 1e-5;
+        } else if (max_span < 65535.0 * 1e-4) {
+            // 11 m grid, 730 km bbox — counties, regions, small countries
+            enc = VertexEncoding::U16_11M;
+            scale = 1e-4;
+        } else {
+            // u32 @ 1 cm — fits any polygon (max span ~214 deg)
+            enc = VertexEncoding::U32_1CM;
+            scale = 1e-7;
+        }
+
+        uint32_t byte_offset = static_cast<uint32_t>(out_bytes.size());
+        if (enc == VertexEncoding::U32_1CM) {
+            for (const auto& [lat, lng] : verts) {
+                uint32_t dlat = static_cast<uint32_t>(std::lround((lat - min_lat) / scale));
+                uint32_t dlng = static_cast<uint32_t>(std::lround((lng - min_lng) / scale));
+                out_bytes.insert(out_bytes.end(),
+                    reinterpret_cast<const uint8_t*>(&dlat),
+                    reinterpret_cast<const uint8_t*>(&dlat) + 4);
+                out_bytes.insert(out_bytes.end(),
+                    reinterpret_cast<const uint8_t*>(&dlng),
+                    reinterpret_cast<const uint8_t*>(&dlng) + 4);
+            }
+        } else {
+            for (const auto& [lat, lng] : verts) {
+                uint16_t dlat = static_cast<uint16_t>(std::lround((lat - min_lat) / scale));
+                uint16_t dlng = static_cast<uint16_t>(std::lround((lng - min_lng) / scale));
+                out_bytes.insert(out_bytes.end(),
+                    reinterpret_cast<const uint8_t*>(&dlat),
+                    reinterpret_cast<const uint8_t*>(&dlat) + 2);
+                out_bytes.insert(out_bytes.end(),
+                    reinterpret_cast<const uint8_t*>(&dlng),
+                    reinterpret_cast<const uint8_t*>(&dlng) + 2);
+            }
+        }
+        (void)admin_level;
+        return {byte_offset, enc, static_cast<float>(min_lat), static_cast<float>(min_lng)};
+    };
 
     for (size_t i = 0; i < data.admin_polygons.size(); i++) {
         auto& sv = simplified[i].verts;
@@ -638,31 +713,30 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
 
         AdminPolygon np = data.admin_polygons[i];
 
-        // All polys go into the main arrays (preserving cell index IDs)
-        np.vertex_offset = static_cast<uint32_t>(new_verts.size());
+        auto [byte_off, enc, min_lat, min_lng] = pack_polygon(new_verts_bytes, sv, np.admin_level);
+        np.vertex_offset = byte_off;
         np.vertex_count = static_cast<uint32_t>(sv.size());
+        np.encoding = static_cast<uint8_t>(enc);
+        np.bbox_min_lat = min_lat;
+        np.bbox_min_lng = min_lng;
         np.area = polygon_area(sv);
-
-        for (const auto& [lat, lng] : sv) {
-            new_verts.push_back({static_cast<float>(lat), static_cast<float>(lng)});
-        }
         new_polys.push_back(np);
 
         // Postal also go into separate files (for optional loading)
         if (np.admin_level == 11) {
             AdminPolygon pp = np;
-            pp.vertex_offset = static_cast<uint32_t>(postal_verts.size());
-            for (const auto& [lat, lng] : sv) {
-                postal_verts.push_back({static_cast<float>(lat), static_cast<float>(lng)});
-            }
+            auto [pb, pe, pml, pmg] = pack_polygon(postal_verts_bytes, sv, np.admin_level);
+            pp.vertex_offset = pb;
+            pp.encoding = static_cast<uint8_t>(pe);
+            pp.bbox_min_lat = pml;
+            pp.bbox_min_lng = pmg;
             postal_polys.push_back(pp);
         }
     }
 
     std::cerr << "Quality " << epsilon_scale << "x: " << new_polys.size()
-              << " admin polygons, " << new_verts.size() << " vertices ("
-              << new_verts.size() * 8 / 1024 / 1024 << " MiB)"
-              << ", " << postal_polys.size() << " postal polygons" << std::endl;
+              << " admin polygons, " << new_verts_bytes.size() / 1024 / 1024
+              << " MiB packed vertices, " << postal_polys.size() << " postal polygons" << std::endl;
 
     // Write admin files (excluding postal)
     {
@@ -671,7 +745,7 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
     }
     {
         std::ofstream f(output_dir + "/admin_vertices.bin", std::ios::binary);
-        f.write(reinterpret_cast<const char*>(new_verts.data()), new_verts.size() * sizeof(NodeCoord));
+        f.write(reinterpret_cast<const char*>(new_verts_bytes.data()), new_verts_bytes.size());
     }
 
     // Write postal boundary files (optional, admin_level=11 only)
@@ -682,7 +756,7 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
         }
         {
             std::ofstream f(output_dir + "/postal_vertices.bin", std::ios::binary);
-            f.write(reinterpret_cast<const char*>(postal_verts.data()), postal_verts.size() * sizeof(NodeCoord));
+            f.write(reinterpret_cast<const char*>(postal_verts_bytes.data()), postal_verts_bytes.size());
         }
     }
 

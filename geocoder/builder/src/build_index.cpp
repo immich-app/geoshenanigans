@@ -4980,10 +4980,11 @@ int main(int argc, char* argv[]) {
                 std::string poi_dir = base_dir + "/" + tier_var.name;
                 ensure_dir(poi_dir);
 
-                // Filter records by tier
+                // Filter records by tier; pack each polygon's vertices
+                // into the variable-stride byte stream (per-record
+                // VertexEncoding tag, byte_offset into vertex stream).
                 std::vector<PoiRecord> filtered_records;
-                std::vector<NodeCoord> filtered_vertices;
-                // Build old→new ID mapping for filtering
+                std::vector<uint8_t> filtered_vertex_bytes;
                 std::vector<uint32_t> id_remap(d.poi_records.size(), NO_DATA);
 
                 for (size_t i = 0; i < d.poi_records.size(); i++) {
@@ -4992,10 +4993,63 @@ int main(int argc, char* argv[]) {
                         auto pr = d.poi_records[i];
                         uint32_t old_voff = pr.vertex_offset;
                         uint32_t vc = pr.vertex_count;
-                        pr.vertex_offset = static_cast<uint32_t>(filtered_vertices.size());
                         if (vc > 0 && old_voff != NO_DATA) {
-                            for (uint32_t j = 0; j < vc; j++)
-                                filtered_vertices.push_back(d.poi_vertices[old_voff + j]);
+                            // Compute bbox + pick encoding
+                            double min_lat = d.poi_vertices[old_voff].lat;
+                            double max_lat = min_lat;
+                            double min_lng = d.poi_vertices[old_voff].lng;
+                            double max_lng = min_lng;
+                            for (uint32_t j = 1; j < vc; j++) {
+                                const auto& v = d.poi_vertices[old_voff + j];
+                                if (v.lat < min_lat) min_lat = v.lat;
+                                if (v.lat > max_lat) max_lat = v.lat;
+                                if (v.lng < min_lng) min_lng = v.lng;
+                                if (v.lng > max_lng) max_lng = v.lng;
+                            }
+                            double max_span = std::max(max_lat - min_lat, max_lng - min_lng);
+                            VertexEncoding enc;
+                            double scale;
+                            // POI buildings prefer the 0.11 m grid when
+                            // they fit (sub-meter GPS distinguishes
+                            // building edges).  Larger POIs (parks,
+                            // campuses) fall through to coarser grids.
+                            if (max_span < 65535.0 * 1e-6) {
+                                enc = VertexEncoding::U16_011M; scale = 1e-6;
+                            } else if (max_span < 65535.0 * 1e-5) {
+                                enc = VertexEncoding::U16_1M; scale = 1e-5;
+                            } else if (max_span < 65535.0 * 1e-4) {
+                                enc = VertexEncoding::U16_11M; scale = 1e-4;
+                            } else {
+                                enc = VertexEncoding::U32_1CM; scale = 1e-7;
+                            }
+                            pr.vertex_offset = static_cast<uint32_t>(filtered_vertex_bytes.size());
+                            pr.encoding = static_cast<uint8_t>(enc);
+                            pr.bbox_min_lat = static_cast<float>(min_lat);
+                            pr.bbox_min_lng = static_cast<float>(min_lng);
+                            for (uint32_t j = 0; j < vc; j++) {
+                                const auto& v = d.poi_vertices[old_voff + j];
+                                if (enc == VertexEncoding::U32_1CM) {
+                                    uint32_t dlat = static_cast<uint32_t>(std::lround((v.lat - min_lat) / scale));
+                                    uint32_t dlng = static_cast<uint32_t>(std::lround((v.lng - min_lng) / scale));
+                                    auto* dp = reinterpret_cast<const uint8_t*>(&dlat);
+                                    filtered_vertex_bytes.insert(filtered_vertex_bytes.end(), dp, dp + 4);
+                                    auto* gp = reinterpret_cast<const uint8_t*>(&dlng);
+                                    filtered_vertex_bytes.insert(filtered_vertex_bytes.end(), gp, gp + 4);
+                                } else {
+                                    uint16_t dlat = static_cast<uint16_t>(std::lround((v.lat - min_lat) / scale));
+                                    uint16_t dlng = static_cast<uint16_t>(std::lround((v.lng - min_lng) / scale));
+                                    auto* dp = reinterpret_cast<const uint8_t*>(&dlat);
+                                    filtered_vertex_bytes.insert(filtered_vertex_bytes.end(), dp, dp + 2);
+                                    auto* gp = reinterpret_cast<const uint8_t*>(&dlng);
+                                    filtered_vertex_bytes.insert(filtered_vertex_bytes.end(), gp, gp + 2);
+                                }
+                            }
+                        } else {
+                            // Point POI — vertex_offset stays NO_DATA;
+                            // encoding is irrelevant but default F32 keeps
+                            // the field deterministic.
+                            pr.vertex_offset = NO_DATA;
+                            pr.encoding = static_cast<uint8_t>(VertexEncoding::F32);
                         }
                         filtered_records.push_back(pr);
                     }
@@ -5024,8 +5078,8 @@ int main(int argc, char* argv[]) {
                 }
                 {
                     std::ofstream f(poi_dir + "/poi_vertices.bin", std::ios::binary);
-                    f.write(reinterpret_cast<const char*>(filtered_vertices.data()),
-                            filtered_vertices.size() * sizeof(NodeCoord));
+                    f.write(reinterpret_cast<const char*>(filtered_vertex_bytes.data()),
+                            filtered_vertex_bytes.size());
                 }
                 write_cell_index(poi_dir + "/poi_cells.bin", poi_dir + "/poi_entries.bin",
                                  filtered_cell_map);
@@ -5075,7 +5129,7 @@ int main(int argc, char* argv[]) {
 
                 std::cerr << "  POI " << tier_var.name << ": "
                           << filtered_records.size() << " records, "
-                          << filtered_vertices.size() << " vertices, "
+                          << filtered_vertex_bytes.size() << " vertex bytes, "
                           << filtered_cell_map.size() << " cells" << std::endl;
             }
         }
