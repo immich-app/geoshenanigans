@@ -299,7 +299,6 @@ dependencies = [
  "num-bigint",
  "num-integer",
  "num-traits",
- "serde",
 ]
 
 [[package]]
@@ -532,15 +531,6 @@ name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
-
-[[package]]
-name = "float_extras"
-version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b22b70f8649ea2315955f1a36d964b0e4da482dfaa5f0d04df0d1fb7c338ab7a"
-dependencies = [
- "libc",
-]
 
 [[package]]
 name = "fnv"
@@ -1323,10 +1313,8 @@ checksum = "23434007bcef0196e3f083834576ac004241f354001a22c61d2f2208c780e8df"
 dependencies = [
  "bigdecimal",
  "cgmath",
- "float_extras",
  "lazy_static",
  "libm",
- "serde",
 ]
 
 [[package]]

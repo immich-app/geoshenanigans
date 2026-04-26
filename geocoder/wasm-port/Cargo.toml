@@ -7,13 +7,17 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
+# Single source of truth for the geocoding logic. The query-server
+# crate's Cargo.toml gates its own native-only deps (axum, tokio,
+# memmap2, etc.) by `cfg(not(target_arch = "wasm32"))`, so this path
+# dep doesn't pull them in for wasm builds.
+query-server = { path = "../server" }
+
 wasm-bindgen = "0.2"
 js-sys = "0.3"
-serde = { version = "1", features = ["derive"] }
 serde-wasm-bindgen = "0.6"
 serde_json = "1"
 getrandom = { version = "0.2", features = ["js"] }
-s2 = { version = "0.0.13", default-features = false, features = ["serde"] }
 
 [profile.release]
 opt-level = 3
@@ -22,6 +26,5 @@ strip = true
 
 [package.metadata.wasm-pack.profile.release]
 # Bundled wasm-opt is too old for the bulk-memory + non-trapping-fp
-# features rustc 1.88 emits. Disable it; rustc -O3 + LTO gives 90%
-# of the size win anyway.
+# features rustc 1.88 emits. Disable; rustc -O3 + LTO does the work.
 wasm-opt = false
