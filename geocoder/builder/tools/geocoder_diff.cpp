@@ -605,16 +605,6 @@ int main(int argc, char* argv[]) {
     uint32_t ver = 2, flags = 0; // version 2 = custom format
     wval(patch, &ver, 4); wval(patch, &flags, 4);
 
-    // --- Section: String remap ---
-    // When string-level diff is present, the remap is derived by the patch tool.
-    // Only include explicit remap if string diff is NOT used.
-    // For now, always include empty remap (string diff handles everything).
-    {
-        uint32_t marker = 0xFFFFFFFE, count = 0;
-        wval(patch, &marker, 4); wval(patch, &count, 4);
-        std::cerr << "  String remap: derived from string diff (0 explicit entries)" << std::endl;
-    }
-
     // --- Section: Per-file merge sequences (computed in parallel) ---
     // Stored merge sequences for ID remap derivation
     std::unordered_map<uint32_t, MergeSequence> stored_merges;
@@ -624,6 +614,11 @@ int main(int argc, char* argv[]) {
     // marker 0xFFFFFFF6 followed by 5 blocks of {n_added, n_deleted,
     // added_strings..., deleted_indices...}. The patch tool applies
     // each block to the matching tier file in cur_dir.
+    //
+    // MUST come before the explicit-remap marker below — the patcher
+    // checks for the tiered marker first; if it sees the explicit
+    // marker first, it consumes that section and exits (never reading
+    // the tiered marker that follows), leaving strings_*.bin unwritten.
     {
         uint32_t tiered_marker = 0xFFFFFFF6;
         wval(patch, &tiered_marker, 4);
@@ -660,6 +655,15 @@ int main(int argc, char* argv[]) {
             for (auto idx : deleted_indices) wval(patch, &idx, 4);
             std::cerr << "  " << kStrTierFilenames[t] << ": +" << n_added << " -" << n_deleted << " strings" << std::endl;
         }
+    }
+
+    // Explicit-remap section follows the tiered diff (always empty when
+    // tiered handles everything — patcher's tiered branch reads next
+    // marker and falls through here).
+    {
+        uint32_t marker = 0xFFFFFFFE, count = 0;
+        wval(patch, &marker, 4); wval(patch, &count, 4);
+        std::cerr << "  String remap: derived from string diff (0 explicit entries)" << std::endl;
     }
 
     // Build merge sequences for all data files in parallel (4 groups)
@@ -911,13 +915,12 @@ int main(int argc, char* argv[]) {
         size_t n = old_data.size / admin_stride;
         std::vector<uint32_t> old_offsets(n);
         for (size_t i = 0; i < n; i++) memcpy(&old_offsets[i], old_data.data + i * admin_stride, 4);
-        fixup_admin_offsets(old_data.data, old_data.size, old_v.data, old_v.size,
-                            new_data.data, new_data.size, new_v.data, new_v.size, admin_stride);
+        // v15: vertex_offset is a BYTE offset into a variable-stride
+        // packed stream (not a vertex index).  Skip fixup_admin_offsets
+        // and build_child_merge — both assume fixed 8-byte stride and
+        // would crash or produce garbage on the new layout.  vertex
+        // file goes through emit_raw at serialize time.
         std::vector<std::pair<uint32_t,uint32_t>> fixups;
-        for (size_t i = 0; i < n; i++) {
-            uint32_t new_off; memcpy(&new_off, old_data.data + i * admin_stride, 4);
-            if (new_off != old_offsets[i]) fixups.push_back({static_cast<uint32_t>(i), new_off});
-        }
         auto ap_seq = build_merge_seq(old_data.data, old_data.size, new_data.data, new_data.size, admin_stride);
         auto soft = secondary_match_from_merge(ap_seq, old_data.data, old_data.size, new_data.data, new_data.size, admin_stride,
             [](const char* rec) -> uint64_t {
@@ -929,12 +932,7 @@ int main(int argc, char* argv[]) {
         res_admin_p = {PatchFileId::ADMIN_POLYGONS, "admin_polygons.bin", admin_stride,
                        old_data.size, new_data.size, ap_seq, std::move(fixups), std::move(soft), {}};
         log_merge(res_admin_p);
-        for (size_t i = 0; i < n; i++) memcpy(old_data.data + i * admin_stride, &old_offsets[i], 4);
-        auto av_seq = build_child_merge(ap_seq, old_data.data, old_data.size, new_data.data, new_data.size,
-                                         old_v.data, old_v.size, new_v.data, new_v.size, admin_stride, true);
-        res_admin_v = {PatchFileId::ADMIN_VERTICES, "admin_vertices.bin", 8,
-                       old_v.size, new_v.size, std::move(av_seq), {}};
-        log_merge(res_admin_v);
+        // res_admin_v stays default-constructed; not serialized
         unmap_file(old_data); unmap_file(new_data); unmap_file(old_v); unmap_file(new_v);
         log_time("  group:admin", gs);
         std::cerr << "  RSS after admin: " << get_rss_mb() << " MiB" << std::endl;
@@ -984,15 +982,10 @@ int main(int argc, char* argv[]) {
         res_poi_r = {PatchFileId::POI_RECORDS, "poi_records.bin", poi_stride,
                      old_data.size, new_data.size, pr_seq, std::move(fixups), std::move(soft), {}};
         log_merge(res_poi_r);
-        // Restore original vertex_offsets for child merge
+        // v15: skip build_child_merge for poi_vertices — same byte-
+        // offset / variable-stride mismatch as admin_vertices.  POI
+        // vertex file goes through emit_raw at serialize time.
         for (size_t i = 0; i < n; i++) memcpy(old_data.data + i * poi_stride + 8, &old_offsets[i], 4);
-        auto pv_seq = build_child_merge(pr_seq, old_data.data, old_data.size,
-                                         new_data.data, new_data.size,
-                                         old_v.data, old_v.size, new_v.data, new_v.size,
-                                         poi_stride, true, 8, 12);
-        res_poi_v = {PatchFileId::POI_VERTICES, "poi_vertices.bin", 8,
-                     old_v.size, new_v.size, std::move(pv_seq), {}};
-        log_merge(res_poi_v);
         if (old_data.data) unmap_file(old_data);
         unmap_file(new_data);
         if (old_v.data) unmap_file(old_v);
@@ -1083,6 +1076,37 @@ int main(int argc, char* argv[]) {
     { std::unordered_map<uint32_t,uint32_t>().swap(str_remap); }
     std::cerr << "  RSS after merge phase: " << get_rss_mb() << " MiB" << std::endl;
 
+    // Inline raw-emit helper for the v15 vertex files (admin_vertices /
+    // poi_vertices).  Their variable-stride layout doesn't fit the
+    // merge-sequence walker; just embed the new file in the patch.
+    // Same wire format as the emit_raw lambda below — patcher reads
+    // stride==0 as "full replacement".
+    auto emit_raw_inline = [&](PatchFileId fid, const std::string& fname) {
+        std::string new_path = new_dir + "/" + fname;
+        struct stat nst;
+        if (stat(new_path.c_str(), &nst) != 0) return;
+        uint64_t new_size = (uint64_t)nst.st_size;
+        struct stat ost;
+        std::string old_path = old_dir + "/" + fname;
+        uint64_t old_size = (stat(old_path.c_str(), &ost) == 0) ? (uint64_t)ost.st_size : 0;
+        uint32_t fid_u = static_cast<uint32_t>(fid);
+        uint32_t stride = 0;
+        uint32_t nfix = 0;
+        uint64_t ds = new_size;
+        wval(patch, &fid_u, 4);
+        wval(patch, &stride, 4);
+        wval(patch, &old_size, 8);
+        wval(patch, &new_size, 8);
+        wval(patch, &nfix, 4);
+        wval(patch, &ds, 8);
+        if (new_size > 0) {
+            std::ifstream in(new_path, std::ios::binary);
+            std::vector<char> buf(new_size);
+            in.read(buf.data(), new_size);
+            patch.insert(patch.end(), buf.begin(), buf.end());
+        }
+    };
+
     // Serialize merge results to patch in canonical order, freeing as we go
     serialize_merge(patch, res_addr);
     serialize_merge(patch, res_ways);
@@ -1092,17 +1116,10 @@ int main(int argc, char* argv[]) {
     serialize_merge(patch, res_interp_n);
     { std::vector<char>().swap(res_interp_n.seq.data); }
     serialize_merge(patch, res_admin_p);
-    // admin_vertices.bin no longer fits the merge-sequence pattern
-    // since v15 (variable per-polygon stride + inline polygon header).
-    // Emit raw and let the patcher take the full new file.  Larger
-    // patches but always correct; can revisit with a format-aware
-    // diff later.
-    emit_raw(PatchFileId::ADMIN_VERTICES, "admin_vertices.bin");
+    emit_raw_inline(PatchFileId::ADMIN_VERTICES, "admin_vertices.bin");
     { std::vector<char>().swap(res_admin_v.seq.data); }
     serialize_merge(patch, res_poi_r);
-    // Same reasoning as admin_vertices — variable-stride v15 format
-    // is opaque to the merge-sequence walker.
-    emit_raw(PatchFileId::POI_VERTICES, "poi_vertices.bin");
+    emit_raw_inline(PatchFileId::POI_VERTICES, "poi_vertices.bin");
     { std::vector<char>().swap(res_poi_v.seq.data); }
     serialize_merge(patch, res_place_n);
     malloc_trim(0); // return freed heap to OS
