@@ -54,12 +54,14 @@ pub enum FileBytes {
 }
 
 impl FileBytes {
-    /// Total file length in bytes.
-    pub fn len(&self) -> usize {
+    /// Total file length in bytes.  Returned as u64 because wasm32's
+    /// `usize` is 32 bits and would truncate any file over 4 GiB
+    /// (planet's geo_cells / addr_vertices etc. are >4 GiB).
+    pub fn len(&self) -> u64 {
         match self {
-            Self::Owned(v) => v.len(),
+            Self::Owned(v) => v.len() as u64,
             #[cfg(not(target_arch = "wasm32"))]
-            Self::Mmap(m) => m.len(),
+            Self::Mmap(m) => m.len() as u64,
             #[cfg(target_arch = "wasm32")]
             Self::JsChunked(j) => j.len(),
         }
@@ -70,7 +72,8 @@ impl FileBytes {
     /// Full-file slice access.  Cheap for Owned and Mmap.  Panics for
     /// JsChunked since the file isn't resident — only chunked access is
     /// available.  Callers operating on potentially-chunked files
-    /// should use `read_chunk` instead.
+    /// should use `read_chunk` instead.  Also panics if the file is
+    /// >usize::MAX (only relevant on 32-bit native).
     pub fn as_slice(&self) -> &[u8] {
         match self {
             Self::Owned(v) => v,
@@ -81,18 +84,39 @@ impl FileBytes {
         }
     }
 
-    /// Read `len` bytes starting at `off`.  Returns `Cow::Borrowed` for
-    /// Owned/Mmap (zero-copy slice), `Cow::Owned` for JsChunked
-    /// (allocates from the chunk cache).  All Index methods that may
-    /// run against a chunked source use this.
-    pub fn read_chunk(&self, off: usize, len: usize) -> std::borrow::Cow<'_, [u8]> {
+    /// Read `len` bytes starting at `off`.  Offsets are u64 so files
+    /// >4 GiB on wasm address correctly.  `len` stays usize because
+    /// individual reads are always tiny (max a few KiB of vertices).
+    /// Returns `Cow::Borrowed` for Owned/Mmap (zero-copy slice),
+    /// `Cow::Owned` for JsChunked (allocates from the chunk cache).
+    pub fn read_chunk(&self, off: u64, len: usize) -> std::borrow::Cow<'_, [u8]> {
         match self {
-            Self::Owned(v) => std::borrow::Cow::Borrowed(&v[off..off + len]),
+            Self::Owned(v) => {
+                let off = off as usize;
+                std::borrow::Cow::Borrowed(&v[off..off + len])
+            }
             #[cfg(not(target_arch = "wasm32"))]
-            Self::Mmap(m) => std::borrow::Cow::Borrowed(&m[off..off + len]),
+            Self::Mmap(m) => {
+                let off = off as usize;
+                std::borrow::Cow::Borrowed(&m[off..off + len])
+            }
             #[cfg(target_arch = "wasm32")]
             Self::JsChunked(j) => std::borrow::Cow::Owned(j.read(off, len)),
         }
+    }
+
+    /// Read a `Copy` record at index `idx` (byte offset = idx * sizeof T).
+    /// Index is u64 so >4 GiB files address correctly on wasm.
+    /// Native Mmap / Owned: pointer cast through read_unaligned.
+    /// JsChunked: fetches sizeof(T) bytes from the chunk cache.
+    pub fn read_at<T: Copy>(&self, idx: u64) -> T {
+        let size = std::mem::size_of::<T>();
+        let off = idx * size as u64;
+        let bytes = self.read_chunk(off, size);
+        // SAFETY: read_chunk returns at least `size` bytes; T is
+        // `repr(C)` + `Copy`. read_unaligned is safe regardless of
+        // source slice alignment.
+        unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const T) }
     }
 }
 
@@ -575,7 +599,7 @@ impl StringPool {
                 let Some(m) = &self.tiers[t] else { return ""; };
                 if offset < self.bases[t] { return ""; }
                 let local = (offset - self.bases[t]) as usize;
-                if local >= m.len() { return ""; }
+                if local as u64 >= m.len() { return ""; }
                 let bytes = &m[local..];
                 let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
                 return std::str::from_utf8(&bytes[..end]).unwrap_or("");
@@ -863,130 +887,125 @@ impl Index {
     // --- Geo lookup (streets, addresses, interpolation from merged index) ---
 
     pub fn query_geo(&self, lat: f64, lng: f64)
-        -> (Option<(f64, &AddrPoint)>, Option<(f64, &str, u32)>, Option<(f64, &WayHeader, u32)>)
+        -> (Option<(f64, AddrPoint, u32)>, Option<(f64, &str, u32)>, Option<(f64, WayHeader, u32)>)
     {
         let geo_cells = match &self.geo_cells {
             Some(gc) => gc,
             None => return (None, None, None),
         };
         let street_entries = self.street_entries.as_ref().unwrap();
-        let street_ways_mmap = self.street_ways.as_ref().unwrap();
-        let street_nodes_mmap = self.street_nodes.as_ref().unwrap();
+        let street_ways = self.street_ways.as_ref().unwrap();
+        let street_nodes = self.street_nodes.as_ref().unwrap();
         let cell = cell_id_at_level(lat, lng, self.street_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.street_cell_level);
-
-        let empty_addr: &[AddrPoint] = &[];
-        let all_points: &[AddrPoint] = if let Some(ref m) = self.addr_points {
-            unsafe {
-                std::slice::from_raw_parts(
-                    m.as_ptr() as *const AddrPoint,
-                    m.len() / std::mem::size_of::<AddrPoint>(),
-                )
-            }
-        } else {
-            empty_addr
-        };
-        let all_ways: &[WayHeader] = unsafe {
-            std::slice::from_raw_parts(
-                street_ways_mmap.as_ptr() as *const WayHeader,
-                street_ways_mmap.len() / std::mem::size_of::<WayHeader>(),
-            )
-        };
-        let all_street_nodes: &[NodeCoord] = unsafe {
-            std::slice::from_raw_parts(
-                street_nodes_mmap.as_ptr() as *const NodeCoord,
-                street_nodes_mmap.len() / std::mem::size_of::<NodeCoord>(),
-            )
-        };
-        let empty_interp: &[InterpWay] = &[];
-        let all_interps: &[InterpWay] = if let Some(ref m) = self.interp_ways {
-            unsafe {
-                std::slice::from_raw_parts(
-                    m.as_ptr() as *const InterpWay,
-                    m.len() / std::mem::size_of::<InterpWay>(),
-                )
-            }
-        } else {
-            empty_interp
-        };
-        let empty_interp_nodes: &[NodeCoord] = &[];
-        let all_interp_nodes: &[NodeCoord] = if let Some(ref m) = self.interp_nodes {
-            unsafe {
-                std::slice::from_raw_parts(
-                    m.as_ptr() as *const NodeCoord,
-                    m.len() / std::mem::size_of::<NodeCoord>(),
-                )
-            }
-        } else {
-            empty_interp_nodes
-        };
-        let empty_addr_verts: &[NodeCoord] = &[];
-        let all_addr_vertices: &[NodeCoord] = if let Some(ref m) = self.addr_vertices {
-            unsafe {
-                std::slice::from_raw_parts(
-                    m.as_ptr() as *const NodeCoord,
-                    m.len() / std::mem::size_of::<NodeCoord>(),
-                )
-            }
-        } else {
-            empty_addr_verts
-        };
 
         let cos_lat = lat.to_radians().cos();
 
         let mut best_addr_dist = f64::MAX;
-        let mut best_addr: Option<&AddrPoint> = None;
+        let mut best_addr: Option<AddrPoint> = None;
+        let mut best_addr_id: u32 = NO_DATA;
         let mut best_street_dist = f64::MAX;
-        let mut best_street: Option<&WayHeader> = None;
+        let mut best_street: Option<WayHeader> = None;
         let mut best_street_idx: u32 = NO_DATA;
         let mut best_interp_dist = f64::MAX;
-        let mut best_interp: Option<&InterpWay> = None;
+        let mut best_interp: Option<InterpWay> = None;
         let mut best_interp_t: f64 = 0.0;
 
         // Fixed-size hash set on stack to skip duplicate street IDs across cells
         let mut seen_streets: [u32; 64] = [u32::MAX; 64];
 
-        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            let offsets = Self::lookup_geo_cell(geo_cells, c);
+        // geo_cells is a 20-byte-stride sorted index — use chunk-aware
+        // binary search so it works on JsChunked sources where the
+        // file isn't resident.  All offsets u64 so >4 GiB files
+        // address correctly on wasm32.
+        let lookup_geo_chunked = |target: u64| -> GeoCellOffsets {
+            let entry_size: u64 = 20;
+            let count = geo_cells.len() / entry_size;
+            let empty = GeoCellOffsets { street: NO_DATA, addr: NO_DATA, interp: NO_DATA };
+            if count == 0 { return empty; }
+            let mut lo: u64 = 0;
+            let mut hi = count;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let bytes = geo_cells.read_chunk(mid * entry_size, entry_size as usize);
+                let mid_id = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                if mid_id == target {
+                    return GeoCellOffsets {
+                        street: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+                        addr:   u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+                        interp: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+                    };
+                } else if mid_id < target { lo = mid + 1; } else { hi = mid; }
+            }
+            empty
+        };
 
-            // Addresses. For building-sourced addr_points (vertex_count
-            // > 0), use distance-to-polygon instead of centroid distance
-            // — matches Nominatim's ST_Distance(query, placex.geometry),
-            // which is 0 when the query lies inside the footprint.
-            if let Some(ref addr_entries) = self.addr_entries {
-                Self::for_each_entry(addr_entries, offsets.addr, |id| {
-                    let idx = id as usize;
-                    if idx >= all_points.len() { return; }
-                    let point = &all_points[idx];
+        // Read entries blob as Cow so it works on chunked sources.
+        let read_entries = |source: &FileBytes, offset: u32| -> Vec<u32> {
+            if offset == NO_DATA { return Vec::new(); }
+            let off = offset as u64;
+            if off + 2 > source.len() { return Vec::new(); }
+            let header = source.read_chunk(off, 2);
+            let count = u16::from_le_bytes([header[0], header[1]]) as usize;
+            if count == 0 { return Vec::new(); }
+            let blob = source.read_chunk(off + 2, count * 4);
+            let mut out = Vec::with_capacity(count);
+            for i in 0..count {
+                out.push(u32::from_le_bytes(blob[i*4..i*4+4].try_into().unwrap()));
+            }
+            out
+        };
+
+        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+            let offsets = lookup_geo_chunked(c);
+
+            // Addresses. Building-sourced points (vertex_count > 0)
+            // use polygon distance, matching ST_Distance behaviour.
+            if let (Some(addr_entries), Some(addr_points)) = (self.addr_entries.as_ref(), self.addr_points.as_ref()) {
+                let total_addr = addr_points.len() / std::mem::size_of::<AddrPoint>() as u64 as u64;
+                for id in read_entries(addr_entries, offsets.addr) {
+                    let idx = id as u64;
+                    if idx >= total_addr { continue; }
+                    let point: AddrPoint = addr_points.read_at(idx);
                     let dlat = (point.lat as f64 - lat).to_radians();
                     let dlng = (point.lng as f64 - lng).to_radians();
                     let mut dist = dist_sq(dlat, dlng, cos_lat);
                     if point.vertex_count > 0 && point.vertex_offset != NO_DATA {
-                        let off = point.vertex_offset as usize;
-                        let cnt = point.vertex_count as usize;
-                        if off + cnt <= all_addr_vertices.len() {
-                            let verts = &all_addr_vertices[off..off + cnt];
+                        if let Some(av) = self.addr_vertices.as_ref() {
+                            let off = point.vertex_offset as u64;
+                            let cnt = point.vertex_count as usize;
+                            let vbytes = av.read_chunk(off * std::mem::size_of::<NodeCoord>() as u64,
+                                                        cnt * std::mem::size_of::<NodeCoord>());
+                            let verts: &[NodeCoord] = unsafe {
+                                std::slice::from_raw_parts(
+                                    vbytes.as_ptr() as *const NodeCoord, cnt,
+                                )
+                            };
                             dist = polygon_distance_sq(lat, lng, verts, cos_lat);
                         }
                     }
                     if dist < best_addr_dist {
                         best_addr_dist = dist;
                         best_addr = Some(point);
+                        best_addr_id = id;
                     }
-                });
+                }
             }
 
             // Streets
-            Self::for_each_entry(street_entries, offsets.street, |id| {
+            for id in read_entries(street_entries, offsets.street) {
                 let slot = (id as usize) & 0x3F;
-                if seen_streets[slot] == id { return; }
+                if seen_streets[slot] == id { continue; }
                 seen_streets[slot] = id;
 
-                let way = &all_ways[id as usize];
-                let offset = way.node_offset as usize;
-                let count = way.node_count as usize;
-                let nodes = &all_street_nodes[offset..offset + count];
-
+                let way: WayHeader = street_ways.read_at(id as u64);
+                let off = way.node_offset as u64;
+                let cnt = way.node_count as usize;
+                let nbytes = street_nodes.read_chunk(off * std::mem::size_of::<NodeCoord>() as u64,
+                                                     cnt * std::mem::size_of::<NodeCoord>());
+                let nodes: &[NodeCoord] = unsafe {
+                    std::slice::from_raw_parts(nbytes.as_ptr() as *const NodeCoord, cnt)
+                };
                 for i in 0..nodes.len() - 1 {
                     let dist = point_to_segment_distance(
                         lat, lng,
@@ -1000,30 +1019,33 @@ impl Index {
                         best_street_idx = id;
                     }
                 }
-            });
+            }
 
             // Interpolation
-            if let Some(ref interp_entries) = self.interp_entries {
-                Self::for_each_entry(interp_entries, offsets.interp, |id| {
-                    let iw = &all_interps[id as usize];
-                    if iw.start_number == 0 || iw.end_number == 0 { return; }
-
-                    let offset = iw.node_offset as usize;
-                    let count = iw.node_count as usize;
-                    let nodes = &all_interp_nodes[offset..offset + count];
-
+            if let (Some(interp_entries), Some(interp_ways), Some(interp_nodes)) =
+                (self.interp_entries.as_ref(), self.interp_ways.as_ref(), self.interp_nodes.as_ref())
+            {
+                for id in read_entries(interp_entries, offsets.interp) {
+                    let iw: InterpWay = interp_ways.read_at(id as u64);
+                    if iw.start_number == 0 || iw.end_number == 0 { continue; }
+                    let off = iw.node_offset as u64;
+                    let cnt = iw.node_count as usize;
+                    let nbytes = interp_nodes.read_chunk(off * std::mem::size_of::<NodeCoord>() as u64,
+                                                          cnt * std::mem::size_of::<NodeCoord>());
+                    let nodes: &[NodeCoord] = unsafe {
+                        std::slice::from_raw_parts(nbytes.as_ptr() as *const NodeCoord, cnt)
+                    };
+                    if nodes.len() < 2 { continue; }
                     let mut total_len: f64 = 0.0;
                     for i in 0..nodes.len() - 1 {
                         let dlat = (nodes[i + 1].lat as f64 - nodes[i].lat as f64).to_radians();
                         let dlng = (nodes[i + 1].lng as f64 - nodes[i].lng as f64).to_radians();
                         total_len += dist_sq(dlat, dlng, cos_lat);
                     }
-                    if total_len == 0.0 { return; }
-
+                    if total_len == 0.0 { continue; }
                     let mut best_seg_dist = f64::MAX;
                     let mut best_seg_t: f64 = 0.0;
                     let mut prev_accumulated: f64 = 0.0;
-
                     for i in 0..nodes.len() - 1 {
                         let dlat = (nodes[i + 1].lat as f64 - nodes[i].lat as f64).to_radians();
                         let dlng = (nodes[i + 1].lng as f64 - nodes[i].lng as f64).to_radians();
@@ -1040,28 +1062,22 @@ impl Index {
                         }
                         prev_accumulated += seg_len;
                     }
-
                     if best_seg_dist < best_interp_dist {
                         best_interp_dist = best_seg_dist;
                         best_interp = Some(iw);
                         best_interp_t = best_seg_t;
                     }
-                });
+                }
             }
         }
 
-        let addr_result = best_addr.map(|p| (best_addr_dist, p));
+        let addr_result = best_addr.map(|p| (best_addr_dist, p, best_addr_id));
         let street_result = best_street.map(|w| (best_street_dist, w, best_street_idx));
         let interp_result = best_interp.map(|iw| {
             let start = iw.start_number as f64;
             let end = iw.end_number as f64;
             let raw = start + best_interp_t * (end - start);
-
-            let step: u32 = match iw.interpolation {
-                1 | 2 => 2,
-                _ => 1,
-            };
-
+            let step: u32 = match iw.interpolation { 1 | 2 => 2, _ => 1 };
             let number = if step == 2 {
                 let base = iw.start_number;
                 let offset = ((raw - base as f64) / step as f64).round() as u32 * step;
@@ -1069,7 +1085,6 @@ impl Index {
             } else {
                 raw.round() as u32
             };
-
             (best_interp_dist, self.get_string(iw.street_id), number)
         });
 
@@ -1082,46 +1097,75 @@ impl Index {
     // index, gated by `ST_DWithin(query, 0.001)` (~100m). Returns the
     // addr_point whose housenumber should refine the result.
     pub fn find_addr_on_way(&self, lat: f64, lng: f64, parent_way_idx: u32, max_dist_sq: f64)
-        -> Option<&AddrPoint>
+        -> Option<AddrPoint>
     {
         let geo_cells = self.geo_cells.as_ref()?;
         let addr_entries = self.addr_entries.as_ref()?;
-        let all_points: &[AddrPoint] = self.addr_points.as_ref().map(|m| unsafe {
-            std::slice::from_raw_parts(
-                m.as_ptr() as *const AddrPoint,
-                m.len() / std::mem::size_of::<AddrPoint>(),
-            )
-        })?;
-        let all_addr_vertices: &[NodeCoord] = self.addr_vertices.as_ref()
-            .map(|m| unsafe {
-                std::slice::from_raw_parts(
-                    m.as_ptr() as *const NodeCoord,
-                    m.len() / std::mem::size_of::<NodeCoord>(),
-                )
-            })
-            .unwrap_or(&[]);
+        let addr_points = self.addr_points.as_ref()?;
+        let total_addr = addr_points.len() / std::mem::size_of::<AddrPoint>() as u64 as u64;
 
         let cell = cell_id_at_level(lat, lng, self.street_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.street_cell_level);
         let cos_lat = lat.to_radians().cos();
 
+        let lookup_geo_chunked = |target: u64| -> GeoCellOffsets {
+            let entry_size: u64 = 20;
+            let count = geo_cells.len() / entry_size;
+            let empty = GeoCellOffsets { street: NO_DATA, addr: NO_DATA, interp: NO_DATA };
+            if count == 0 { return empty; }
+            let mut lo: u64 = 0;
+            let mut hi = count;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let bytes = geo_cells.read_chunk(mid * entry_size, entry_size as usize);
+                let mid_id = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                if mid_id == target {
+                    return GeoCellOffsets {
+                        street: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+                        addr:   u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+                        interp: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+                    };
+                } else if mid_id < target { lo = mid + 1; } else { hi = mid; }
+            }
+            empty
+        };
+
+        let read_entries = |source: &FileBytes, offset: u32| -> Vec<u32> {
+            if offset == NO_DATA { return Vec::new(); }
+            let off = offset as u64;
+            if off + 2 > source.len() { return Vec::new(); }
+            let header = source.read_chunk(off, 2);
+            let count = u16::from_le_bytes([header[0], header[1]]) as usize;
+            if count == 0 { return Vec::new(); }
+            let blob = source.read_chunk(off + 2, count * 4);
+            let mut out = Vec::with_capacity(count);
+            for i in 0..count {
+                out.push(u32::from_le_bytes(blob[i*4..i*4+4].try_into().unwrap()));
+            }
+            out
+        };
+
         let mut best_dist = max_dist_sq;
-        let mut best: Option<&AddrPoint> = None;
+        let mut best: Option<AddrPoint> = None;
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            let offsets = Self::lookup_geo_cell(geo_cells, c);
-            Self::for_each_entry(addr_entries, offsets.addr, |id| {
-                let idx = id as usize;
-                if idx >= all_points.len() { return; }
-                let point = &all_points[idx];
-                if point.parent_way_id != parent_way_idx { return; }
+            let offsets = lookup_geo_chunked(c);
+            for id in read_entries(addr_entries, offsets.addr) {
+                let idx = id as u64;
+                if idx >= total_addr { continue; }
+                let point: AddrPoint = addr_points.read_at(idx);
+                if point.parent_way_id != parent_way_idx { continue; }
                 let dlat = (point.lat as f64 - lat).to_radians();
                 let dlng = (point.lng as f64 - lng).to_radians();
                 let mut dist = dist_sq(dlat, dlng, cos_lat);
                 if point.vertex_count > 0 && point.vertex_offset != NO_DATA {
-                    let off = point.vertex_offset as usize;
-                    let cnt = point.vertex_count as usize;
-                    if off + cnt <= all_addr_vertices.len() {
-                        let verts = &all_addr_vertices[off..off + cnt];
+                    if let Some(av) = self.addr_vertices.as_ref() {
+                        let off = point.vertex_offset as u64;
+                        let cnt = point.vertex_count as usize;
+                        let vbytes = av.read_chunk(off * std::mem::size_of::<NodeCoord>() as u64,
+                                                    cnt * std::mem::size_of::<NodeCoord>());
+                        let verts: &[NodeCoord] = unsafe {
+                            std::slice::from_raw_parts(vbytes.as_ptr() as *const NodeCoord, cnt)
+                        };
                         dist = polygon_distance_sq(lat, lng, verts, cos_lat);
                     }
                 }
@@ -1129,7 +1173,7 @@ impl Index {
                     best_dist = dist;
                     best = Some(point);
                 }
-            });
+            }
         }
         best
     }
@@ -1140,7 +1184,7 @@ impl Index {
         let poi_primary = self.find_nearest_poi_with_parent(lat, lng);
         let to_m = |d2: f64| (d2.sqrt() * 6_371_000.0) as f64;
         serde_json::json!({
-            "addr": addr.map(|(d, p)| serde_json::json!({
+            "addr": addr.map(|(d, p, _id)| serde_json::json!({
                 "dist_m": to_m(d),
                 "house_number": if p.housenumber_id != NO_DATA { self.get_string(p.housenumber_id) } else { "" },
                 "street": if p.street_id != NO_DATA { self.get_string(p.street_id) } else { "" },
@@ -1187,7 +1231,7 @@ impl Index {
         let all_places: &[PlaceNode] = unsafe {
             std::slice::from_raw_parts(
                 place_nodes_mmap.as_ptr() as *const PlaceNode,
-                place_nodes_mmap.len() / std::mem::size_of::<PlaceNode>(),
+                place_nodes_mmap.len() as usize / std::mem::size_of::<PlaceNode>(),
             )
         };
         let to_m = |d2: f64| (d2.sqrt() * 6_371_000.0) as f64;
@@ -1245,13 +1289,13 @@ impl Index {
         let all_polygons: &[AdminPolygon] = unsafe {
             std::slice::from_raw_parts(
                 self.admin_polygons.as_ptr() as *const AdminPolygon,
-                self.admin_polygons.len() / std::mem::size_of::<AdminPolygon>(),
+                self.admin_polygons.len() as usize / std::mem::size_of::<AdminPolygon>(),
             )
         };
         let all_vertices: &[NodeCoord] = unsafe {
             std::slice::from_raw_parts(
                 self.admin_vertices.as_ptr() as *const NodeCoord,
-                self.admin_vertices.len() / std::mem::size_of::<NodeCoord>(),
+                self.admin_vertices.len() as usize / std::mem::size_of::<NodeCoord>(),
             )
         };
 
@@ -1324,13 +1368,13 @@ impl Index {
         let all_polygons: &[AdminPolygon] = unsafe {
             std::slice::from_raw_parts(
                 self.admin_polygons.as_ptr() as *const AdminPolygon,
-                self.admin_polygons.len() / std::mem::size_of::<AdminPolygon>(),
+                self.admin_polygons.len() as usize / std::mem::size_of::<AdminPolygon>(),
             )
         };
         let all_vertices: &[NodeCoord] = unsafe {
             std::slice::from_raw_parts(
                 self.admin_vertices.as_ptr() as *const NodeCoord,
-                self.admin_vertices.len() / std::mem::size_of::<NodeCoord>(),
+                self.admin_vertices.len() as usize / std::mem::size_of::<NodeCoord>(),
             )
         };
 
@@ -1754,13 +1798,13 @@ impl Index {
         let all_polygons: &[AdminPolygon] = unsafe {
             std::slice::from_raw_parts(
                 self.admin_polygons.as_ptr() as *const AdminPolygon,
-                self.admin_polygons.len() / std::mem::size_of::<AdminPolygon>(),
+                self.admin_polygons.len() as usize / std::mem::size_of::<AdminPolygon>(),
             )
         };
         let all_vertices: &[NodeCoord] = unsafe {
             std::slice::from_raw_parts(
                 self.admin_vertices.as_ptr() as *const NodeCoord,
-                self.admin_vertices.len() / std::mem::size_of::<NodeCoord>(),
+                self.admin_vertices.len() as usize / std::mem::size_of::<NodeCoord>(),
             )
         };
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
@@ -1814,13 +1858,13 @@ impl Index {
         let all_polygons: &[AdminPolygon] = unsafe {
             std::slice::from_raw_parts(
                 self.admin_polygons.as_ptr() as *const AdminPolygon,
-                self.admin_polygons.len() / std::mem::size_of::<AdminPolygon>(),
+                self.admin_polygons.len() as usize / std::mem::size_of::<AdminPolygon>(),
             )
         };
         let all_vertices: &[NodeCoord] = unsafe {
             std::slice::from_raw_parts(
                 self.admin_vertices.as_ptr() as *const NodeCoord,
-                self.admin_vertices.len() / std::mem::size_of::<NodeCoord>(),
+                self.admin_vertices.len() as usize / std::mem::size_of::<NodeCoord>(),
             )
         };
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
@@ -1867,7 +1911,7 @@ impl Index {
         let all_places: &[PlaceNode] = unsafe {
             std::slice::from_raw_parts(
                 place_nodes_mmap.as_ptr() as *const PlaceNode,
-                place_nodes_mmap.len() / std::mem::size_of::<PlaceNode>(),
+                place_nodes_mmap.len() as usize / std::mem::size_of::<PlaceNode>(),
             )
         };
 
@@ -1933,7 +1977,7 @@ impl Index {
         let all_vertices: &[NodeCoord] = unsafe {
             std::slice::from_raw_parts(
                 self.admin_vertices.as_ptr() as *const NodeCoord,
-                self.admin_vertices.len() / std::mem::size_of::<NodeCoord>(),
+                self.admin_vertices.len() as usize / std::mem::size_of::<NodeCoord>(),
             )
         };
         let node_inside_boundary = |pn: &PlaceNode| -> bool {
@@ -2121,7 +2165,7 @@ impl Index {
         let all_polygons: &[AdminPolygon] = unsafe {
             std::slice::from_raw_parts(
                 self.admin_polygons.as_ptr() as *const AdminPolygon,
-                self.admin_polygons.len() / std::mem::size_of::<AdminPolygon>(),
+                self.admin_polygons.len() as usize / std::mem::size_of::<AdminPolygon>(),
             )
         };
         let pid = poi.parent_poly_id as usize;
@@ -2130,7 +2174,7 @@ impl Index {
         let all_vertices: &[NodeCoord] = unsafe {
             std::slice::from_raw_parts(
                 self.admin_vertices.as_ptr() as *const NodeCoord,
-                self.admin_vertices.len() / std::mem::size_of::<NodeCoord>(),
+                self.admin_vertices.len() as usize / std::mem::size_of::<NodeCoord>(),
             )
         };
         let off = poly.vertex_offset as usize;
@@ -2159,14 +2203,14 @@ impl Index {
         let all_pois: &[PoiRecord] = unsafe {
             std::slice::from_raw_parts(
                 poi_records_mmap.as_ptr() as *const PoiRecord,
-                poi_records_mmap.len() / std::mem::size_of::<PoiRecord>(),
+                poi_records_mmap.len() as usize / std::mem::size_of::<PoiRecord>(),
             )
         };
         let all_poi_vertices: &[NodeCoord] = match &self.poi_vertices {
             Some(v) => unsafe {
                 std::slice::from_raw_parts(
                     v.as_ptr() as *const NodeCoord,
-                    v.len() / std::mem::size_of::<NodeCoord>(),
+                    v.len() as usize / std::mem::size_of::<NodeCoord>(),
                 )
             },
             None => &[],
@@ -2300,14 +2344,14 @@ impl Index {
         let all_pois: &[PoiRecord] = unsafe {
             std::slice::from_raw_parts(
                 poi_records_mmap.as_ptr() as *const PoiRecord,
-                poi_records_mmap.len() / std::mem::size_of::<PoiRecord>(),
+                poi_records_mmap.len() as usize / std::mem::size_of::<PoiRecord>(),
             )
         };
         let all_poi_vertices: &[NodeCoord] = match &self.poi_vertices {
             Some(v) => unsafe {
                 std::slice::from_raw_parts(
                     v.as_ptr() as *const NodeCoord,
-                    v.len() / std::mem::size_of::<NodeCoord>(),
+                    v.len() as usize / std::mem::size_of::<NodeCoord>(),
                 )
             },
             None => &[],
@@ -2493,7 +2537,7 @@ impl Index {
             Some(m) => unsafe {
                 std::slice::from_raw_parts(
                     m.as_ptr() as *const u32,
-                    m.len() / 4,
+                    m.len() as usize / 4,
                 )
             },
             None => return self.find_admin(lat, lng),
@@ -2501,7 +2545,7 @@ impl Index {
         let all_polygons: &[AdminPolygon] = unsafe {
             std::slice::from_raw_parts(
                 self.admin_polygons.as_ptr() as *const AdminPolygon,
-                self.admin_polygons.len() / std::mem::size_of::<AdminPolygon>(),
+                self.admin_polygons.len() as usize / std::mem::size_of::<AdminPolygon>(),
             )
         };
 
@@ -2521,7 +2565,7 @@ impl Index {
         let all_vertices: &[NodeCoord] = unsafe {
             std::slice::from_raw_parts(
                 self.admin_vertices.as_ptr() as *const NodeCoord,
-                self.admin_vertices.len() / std::mem::size_of::<NodeCoord>(),
+                self.admin_vertices.len() as usize / std::mem::size_of::<NodeCoord>(),
             )
         };
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
@@ -2718,39 +2762,30 @@ impl Index {
     // at index time. `postal_polygons.bin` is consumed at BUILD time only
     // (for way_postcodes.bin / PoiRecord.parent_postcode_id inheritance);
     // it is not consulted here.
-    pub fn resolve_postcode(&self, lat: f64, lng: f64, street: Option<&WayHeader>, addr: Option<&AddrPoint>, poi: Option<&PoiRecord>, country_code: Option<[u8; 2]>) -> Option<&str> {
+    pub fn resolve_postcode(&self, lat: f64, lng: f64, street: Option<(usize, &WayHeader)>, addr: Option<(usize, &AddrPoint)>, poi: Option<&PoiRecord>, country_code: Option<[u8; 2]>) -> Option<&str> {
         // 0. Nearest addr_point's own postcode (from addr_postcodes.bin)
         // Matches Nominatim's token_get_postcode — the feature's own
         // addr:postcode tag is the highest-priority source.
-        if let (Some(ref apc), Some(ap)) = (&self.addr_postcodes, addr) {
-            let all_points: &[AddrPoint] = unsafe {
-                std::slice::from_raw_parts(
-                    self.addr_points.as_ref().unwrap().as_ptr() as *const AddrPoint,
-                    self.addr_points.as_ref().unwrap().len() / std::mem::size_of::<AddrPoint>(),
-                )
-            };
-            let addr_id = unsafe {
-                (ap as *const AddrPoint).offset_from(all_points.as_ptr()) as usize
-            };
-            let all_addr_pc: &[u32] = unsafe {
-                std::slice::from_raw_parts(apc.as_ptr() as *const u32, apc.len() / 4)
-            };
-            if addr_id < all_addr_pc.len() && all_addr_pc[addr_id] != NO_DATA {
-                return Some(self.get_string(all_addr_pc[addr_id]));
+        if let (Some(apc), Some((addr_id, _))) = (self.addr_postcodes.as_ref(), addr) {
+            let off = (addr_id as u64) * 4;
+            if off + 4 <= apc.len() {
+                let bytes = apc.read_chunk(off, 4);
+                let pid = u32::from_le_bytes(bytes[..].try_into().unwrap());
+                if pid != NO_DATA {
+                    return Some(self.get_string(pid));
+                }
             }
         }
 
         // 1. way_postcodes[street.way_id] — street's computed postcode
-        if let (Some(ref wpc), Some(way)) = (&self.way_postcodes, street) {
-            let way_id = unsafe {
-                let ways_base = self.street_ways.as_ref().unwrap().as_ptr() as *const WayHeader;
-                (way as *const WayHeader).offset_from(ways_base) as usize
-            };
-            let all_postcodes: &[u32] = unsafe {
-                std::slice::from_raw_parts(wpc.as_ptr() as *const u32, wpc.len() / 4)
-            };
-            if way_id < all_postcodes.len() && all_postcodes[way_id] != NO_DATA {
-                return Some(self.get_string(all_postcodes[way_id]));
+        if let (Some(wpc), Some((way_id, _))) = (self.way_postcodes.as_ref(), street) {
+            let off = (way_id as u64) * 4;
+            if off + 4 <= wpc.len() {
+                let bytes = wpc.read_chunk(off, 4);
+                let pid = u32::from_le_bytes(bytes[..].try_into().unwrap());
+                if pid != NO_DATA {
+                    return Some(self.get_string(pid));
+                }
             }
         }
 
@@ -2779,7 +2814,7 @@ impl Index {
         });
         if let Some(ref pc_mmap) = self.postcode_centroids {
             let all_centroids: &[PostcodeCentroid] = unsafe {
-                std::slice::from_raw_parts(pc_mmap.as_ptr() as *const PostcodeCentroid, pc_mmap.len() / std::mem::size_of::<PostcodeCentroid>())
+                std::slice::from_raw_parts(pc_mmap.as_ptr() as *const PostcodeCentroid, pc_mmap.len() as usize / std::mem::size_of::<PostcodeCentroid>())
             };
             // 0.05 deg ~ 5.5km, matches Nominatim's get_nearest_postcode
             let max_dist_sq = (0.05_f64).to_radians().powi(2);
@@ -2862,16 +2897,14 @@ impl Index {
         let admin_pip = self.find_admin(lat, lng);
         let admin_chain = (|| -> Option<AdminResult<'_>> {
             let wp = self.way_parents.as_ref()?;
-            let sw = self.street_ways.as_ref()?;
-            let (_, way, _) = street.as_ref()?;
-            let ways_base = sw.as_ptr() as *const WayHeader;
-            let way_ptr = *way as *const WayHeader;
-            let way_id = unsafe { way_ptr.offset_from(ways_base) as usize };
-            let all_parents: &[u32] = unsafe {
-                std::slice::from_raw_parts(wp.as_ptr() as *const u32, wp.len() / 4)
-            };
-            if way_id >= all_parents.len() { return None; }
-            let start = all_parents[way_id];
+            let (_, _, way_idx) = street.as_ref()?;
+            // way_parents is u32 per way; chunked-aware read so it
+            // works with JsChunked sources too.
+            let way_id = *way_idx as u64;
+            let off = way_id * 4;
+            if off + 4 > wp.len() { return None; }
+            let pbytes = wp.read_chunk(off, 4);
+            let start = u32::from_le_bytes(pbytes[..].try_into().unwrap());
             if start == NO_DATA { return None; }
             Some(self.find_admin_from_chain(start, lat, lng))
         })();
@@ -2972,7 +3005,7 @@ impl Index {
         // polygon_distance_sq). For node-sourced addr_points, it's
         // centroid distance, matching Nominatim's ST_Distance to a
         // point geometry.
-        let addr_dist = addr.as_ref().map(|(d, _)| *d).unwrap_or(f64::MAX);
+        let addr_dist = addr.as_ref().map(|(d, _, _)| *d).unwrap_or(f64::MAX);
         // Nominatim's `_find_closest_street_or_pois` queries the placex
         // table (streets + rank-30 POIs / addr points). Interpolation
         // rows live in the separate `osmline` table and are looked up
@@ -3004,7 +3037,7 @@ impl Index {
         // inside, demote the POI so the node wins.
         let mut effective_poi_dist = poi_dist;
         if poi_dist == 0.0 {
-            if let (Some((_, addr_pt)), Some((_, poi))) = (addr.as_ref(), poi_primary.as_ref()) {
+            if let (Some((_, addr_pt, _)), Some((_, poi))) = (addr.as_ref(), poi_primary.as_ref()) {
                 // Case 1: addr polygon also contains the query (v9 building
                 // addr_points with footprint geometry). Both records describe
                 // the same underlying OSM way — Nominatim has a single placex
@@ -3018,7 +3051,7 @@ impl Index {
                         Some(v) => unsafe {
                             std::slice::from_raw_parts(
                                 v.as_ptr() as *const NodeCoord,
-                                v.len() / std::mem::size_of::<NodeCoord>(),
+                                v.len() as usize / std::mem::size_of::<NodeCoord>(),
                             )
                         },
                         None => &[],
@@ -3121,7 +3154,7 @@ impl Index {
             } else if addr_dist <= interp_dist && addr_dist <= street_dist && addr_dist <= effective_poi_dist {
                 // Address is closest — use it with its housenumber.
                 addr_won_primary = true;
-                let (_, point) = addr.unwrap();
+                let (_, point, _) = addr.unwrap();
                 house_number = Some(Cow::Borrowed(self.get_string(point.housenumber_id)));
                 // street_id == NO_DATA means the builder's parent-
                 // street backfill didn't find a named way nearby; in
@@ -3178,8 +3211,8 @@ impl Index {
             && effective_poi_dist <= street_dist;
         let resolved_postcode = self.resolve_postcode(
             lat, lng,
-            if poi_won_primary { None } else { street.as_ref().map(|(_, w, _)| *w) },
-            if addr_won_primary { addr.as_ref().map(|(_, a)| *a) } else { None },
+            if poi_won_primary { None } else { street.as_ref().map(|(_, w, idx)| (*idx as usize, w)) },
+            if addr_won_primary { addr.as_ref().map(|(_, a, id)| (*id as usize, a)) } else { None },
             if poi_won_primary { poi_primary.as_ref().map(|(_, p)| *p) } else { None },
             admin.country_code,
         );

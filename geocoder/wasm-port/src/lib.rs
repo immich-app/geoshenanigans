@@ -51,7 +51,7 @@ fn take_chunked(obj: &js_sys::Object, key: &str) -> Option<FileBytes> {
     let handle = js_sys::Reflect::get(&desc, &JsValue::from_str("handle")).ok()?
         .as_f64()?;
     let len = js_sys::Reflect::get(&desc, &JsValue::from_str("len")).ok()?
-        .as_f64()? as usize;
+        .as_f64()? as u64;
     let js_read = JS_READ.with(|r| r.borrow().clone())
         .expect("set_js_read must be called before constructing a chunked-backed Geocoder");
     Some(FileBytes::JsChunked(query_server::wasm_chunked::JsChunked::new(js_read, handle, len)))

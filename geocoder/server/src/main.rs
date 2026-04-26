@@ -112,13 +112,13 @@ async fn polygons_geojson(
     let all_polygons: &[AdminPolygon] = unsafe {
         std::slice::from_raw_parts(
             idx.admin_polygons.as_ptr() as *const AdminPolygon,
-            idx.admin_polygons.len() / std::mem::size_of::<AdminPolygon>(),
+            idx.admin_polygons.len() as usize / std::mem::size_of::<AdminPolygon>(),
         )
     };
     let all_vertices: &[NodeCoord] = unsafe {
         std::slice::from_raw_parts(
             idx.admin_vertices.as_ptr() as *const NodeCoord,
-            idx.admin_vertices.len() / std::mem::size_of::<NodeCoord>(),
+            idx.admin_vertices.len() as usize / std::mem::size_of::<NodeCoord>(),
         )
     };
 
@@ -158,10 +158,10 @@ async fn polygons_geojson(
 
     if let (Some(ref pp), Some(ref pv)) = (&idx.postal_polygons, &idx.postal_vertices) {
         let all_postal: &[AdminPolygon] = unsafe {
-            std::slice::from_raw_parts(pp.as_ptr() as *const AdminPolygon, pp.len() / std::mem::size_of::<AdminPolygon>())
+            std::slice::from_raw_parts(pp.as_ptr() as *const AdminPolygon, pp.len() as usize / std::mem::size_of::<AdminPolygon>())
         };
         let all_pverts: &[NodeCoord] = unsafe {
-            std::slice::from_raw_parts(pv.as_ptr() as *const NodeCoord, pv.len() / std::mem::size_of::<NodeCoord>())
+            std::slice::from_raw_parts(pv.as_ptr() as *const NodeCoord, pv.len() as usize / std::mem::size_of::<NodeCoord>())
         };
         for poly in all_postal {
             let off = poly.vertex_offset as usize;
@@ -210,13 +210,13 @@ async fn main() {
     let index = match Index::load(data_dir, street_cell_level, admin_cell_level, search_distance) {
         Ok(idx) => {
             let place_status = if idx.place_nodes.is_some() {
-                let count = idx.place_nodes.as_ref().unwrap().len() / std::mem::size_of::<PlaceNode>();
+                let count = idx.place_nodes.as_ref().unwrap().len() as usize / std::mem::size_of::<PlaceNode>();
                 format!(" + {} place nodes", count)
             } else {
                 String::new()
             };
             let poi_status = if idx.poi_records.is_some() {
-                let count = idx.poi_records.as_ref().unwrap().len() / std::mem::size_of::<PoiRecord>();
+                let count = idx.poi_records.as_ref().unwrap().len() as usize / std::mem::size_of::<PoiRecord>();
                 format!(" + {} POIs ({} categories)", count, idx.poi_meta.categories.len())
             } else {
                 String::new()
