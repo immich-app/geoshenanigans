@@ -13,11 +13,23 @@ const CHUNK_THRESHOLD = Number(process.env.CHUNK_THRESHOLD ?? 100 * 1024 * 1024)
 
 const fdMap = new Map<number, number>();
 let nextHandle = 1;
+// Reusable read buffer — avoids per-callback Uint8Array allocations
+// that otherwise inflate the JSC heap by hundreds of MB across many
+// queries.  Sized to fit the largest chunk read (256 bytes for
+// strings, 64 KiB for page reads).
+const READ_BUF = new Uint8Array(128 * 1024);
 set_js_read((handle: number, off: number, len: number): Uint8Array => {
   const fd = fdMap.get(handle)!;
-  const buf = new Uint8Array(len);
-  readSync(fd, buf, 0, len, off);
-  return buf;
+  if (len > READ_BUF.length) {
+    // Cold path — caller wants more than our reusable buffer.  Fall
+    // back to a fresh allocation; rare since pages are bounded.
+    const big = new Uint8Array(len);
+    readSync(fd, big, 0, len, off);
+    return big;
+  }
+  const view = new Uint8Array(READ_BUF.buffer, 0, len);
+  readSync(fd, view, 0, len, off);
+  return view;
 });
 function openChunked(path: string) {
   const fd = openSync(path, "r");
@@ -27,17 +39,11 @@ function openChunked(path: string) {
   return { handle, len };
 }
 
-const MUST_BE_INLINE = new Set([
-  "strings_core","strings_street","strings_addr","strings_postcode","strings_poi",
-  "place_nodes","place_cells","place_entries",
-  "postcode_centroids","postcode_centroid_cells","postcode_centroid_entries",
-  "poi_records","poi_cells","poi_entries",
-  "admin_parents",
-  "postal_polygons","postal_vertices",
-  "admin_cells","admin_entries","admin_polygons",
-  // admin_vertices + poi_vertices now chunkable (refactored read paths)
+const MUST_BE_INLINE = new Set<string>([
+  // Empty — every file consumer now uses chunk-aware reads.
 ]);
 const allFiles = [
+  "admin_cells","admin_entries","admin_polygons","admin_vertices",
   "strings_core","strings_street","strings_addr","strings_postcode","strings_poi",
   "place_nodes","place_cells","place_entries",
   "postcode_centroids","postcode_centroid_cells","postcode_centroid_entries",
@@ -48,16 +54,12 @@ const allFiles = [
   "way_postcodes","addr_postcodes",
   "admin_parents","way_parents",
   "postal_polygons","postal_vertices",
-  "admin_vertices",
 ];
 
 const buffers: Record<string, unknown> = {
-  // admin_cells/entries/polygons must stay inline (admin_polygons is
-  // 12 MiB and accessed by reference). admin_vertices is now
-  // chunkable so it goes through the for-loop below.
-  admin_cells: readFileSync(join(dataDir, "admin_cells.bin")),
-  admin_entries: readFileSync(join(dataDir, "admin_entries.bin")),
-  admin_polygons: readFileSync(join(dataDir, "admin_polygons.bin")),
+  // Layout/meta JSON are always inline (small text).  All binary files
+  // route through the for-loop below and pick inline-or-chunked based
+  // on size + MUST_BE_INLINE.
   strings_layout: readFileSync(join(dataDir, "strings_layout.json"), "utf8"),
   poi_meta: (() => { try { return readFileSync(join(dataDir, "poi_meta.json"), "utf8"); } catch { return ""; } })(),
 };

@@ -58,34 +58,30 @@ let loadMs = 0;
 
 if (target === "wasm") {
   const { Geocoder, set_js_read } = await import("../pkg/geocoder_wasm.js");
+  // Reusable read buffer — avoids per-callback Uint8Array allocations.
+  const READ_BUF = new Uint8Array(128 * 1024);
   set_js_read((handle: number, off: number, len: number): Uint8Array => {
     const fd = fdMap.get(handle)!;
-    const buf = new Uint8Array(len);
-    readSync(fd, buf, 0, len, off);
-    return buf;
+    if (len > READ_BUF.length) {
+      const big = new Uint8Array(len);
+      readSync(fd, big, 0, len, off);
+      return big;
+    }
+    const view = new Uint8Array(READ_BUF.buffer, 0, len);
+    readSync(fd, view, 0, len, off);
+    return view;
   });
   const t0 = performance.now();
   const buffers: Record<string, unknown> = {
-    admin_cells: readFileSync(join(dataDir, "admin_cells.bin")),
-    admin_entries: readFileSync(join(dataDir, "admin_entries.bin")),
-    admin_polygons: readFileSync(join(dataDir, "admin_polygons.bin")),
-    admin_vertices: readFileSync(join(dataDir, "admin_vertices.bin")),
     strings_layout: readFileSync(join(dataDir, "strings_layout.json"), "utf8"),
     poi_meta: (() => { try { return readFileSync(join(dataDir, "poi_meta.json"), "utf8"); } catch { return ""; } })(),
   };
-  // These files MUST be inline — their consumers in lib.rs use
-  // as_slice()/Deref which panics on JsChunked (StringPool, find_admin,
-  // find_places, find_pois, postcode centroid lookup, postal PIP,
-  // admin_parents chain walk).
-  const MUST_BE_INLINE = new Set([
-    "strings_core","strings_street","strings_addr","strings_postcode","strings_poi",
-    "place_nodes","place_cells","place_entries",
-    "postcode_centroids","postcode_centroid_cells","postcode_centroid_entries",
-    "poi_records","poi_vertices","poi_cells","poi_entries",
-    "admin_parents",
-    "postal_polygons","postal_vertices",
-  ]);
+  // Every binary file is now chunk-aware — no MUST_BE_INLINE list.
+  // CHUNK_THRESHOLD picks per-file inline-vs-chunked: 0 chunks
+  // everything (lowest RSS), large threshold inlines small files
+  // (lower latency for hot lookups).
   const allFiles = [
+    "admin_cells","admin_entries","admin_polygons","admin_vertices",
     "strings_core","strings_street","strings_addr","strings_postcode","strings_poi",
     "place_nodes","place_cells","place_entries",
     "postcode_centroids","postcode_centroid_cells","postcode_centroid_entries",
@@ -101,7 +97,7 @@ if (target === "wasm") {
     const path = join(dataDir, `${name}.bin`);
     let stat;
     try { stat = statSync(path); } catch { continue; }
-    if (MUST_BE_INLINE.has(name) || stat.size <= CHUNK_THRESHOLD) {
+    if (stat.size <= CHUNK_THRESHOLD) {
       buffers[name] = readFileSync(path);
     } else {
       buffers[`${name}_chunked`] = openChunked(path);

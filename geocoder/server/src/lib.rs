@@ -600,6 +600,14 @@ pub const STR_TIER_FILENAMES: [&str; STR_TIER_COUNT] = [
 pub struct StringPool {
     pub tiers: [Option<FileBytes>; STR_TIER_COUNT],
     pub bases: [u32; STR_TIER_COUNT + 1],
+    /// Resolved-string cache for JsChunked tiers.  Box<str> contents
+    /// have stable heap addresses, so &str returned from a cached Box
+    /// stays valid across HashMap rehashes / further inserts (we
+    /// never remove entries).  Only used on wasm32; on native the
+    /// in-place mmap slice path is taken and the cache is empty.
+    /// Single-threaded wasm32 makes UnsafeCell sound.
+    #[cfg(target_arch = "wasm32")]
+    pub cache: std::cell::UnsafeCell<std::collections::HashMap<u32, Box<str>>>,
 }
 
 impl StringPool {
@@ -607,7 +615,12 @@ impl StringPool {
     /// Used by both the wasm port (caller passes Vec<u8>) and the
     /// native loader (which mmaps then wraps).
     pub fn from_parts(tiers: [Option<FileBytes>; STR_TIER_COUNT], bases: [u32; STR_TIER_COUNT + 1]) -> Self {
-        StringPool { tiers, bases }
+        StringPool {
+            tiers,
+            bases,
+            #[cfg(target_arch = "wasm32")]
+            cache: std::cell::UnsafeCell::new(std::collections::HashMap::new()),
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -636,7 +649,7 @@ impl StringPool {
         if tiers[0].is_none() {
             return Err(format!("Required {}/{} missing", dir, STR_TIER_FILENAMES[0]));
         }
-        Ok(StringPool { tiers, bases })
+        Ok(StringPool::from_parts(tiers, bases))
     }
 
     pub fn get(&self, offset: u32) -> &str {
@@ -645,14 +658,75 @@ impl StringPool {
             if offset < self.bases[t + 1] {
                 let Some(m) = &self.tiers[t] else { return ""; };
                 if offset < self.bases[t] { return ""; }
-                let local = (offset - self.bases[t]) as usize;
-                if local as u64 >= m.len() { return ""; }
-                let bytes = &m[local..];
-                let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-                return std::str::from_utf8(&bytes[..end]).unwrap_or("");
+                let local = (offset - self.bases[t]) as u64;
+                if local >= m.len() { return ""; }
+                return self.read_string(t, m, offset, local);
             }
         }
         ""
+    }
+
+    /// Resolve a single string from a tier.  In-place borrow for
+    /// Owned/Mmap, cached Box<str> via interior-mutability for
+    /// JsChunked (so &self can return &str backed by a stable Box).
+    fn read_string<'a>(&'a self, _tier: usize, m: &'a FileBytes, _offset: u32, local: u64) -> &'a str {
+        match m {
+            FileBytes::Owned(v) => {
+                let bytes = &v[local as usize..];
+                let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                std::str::from_utf8(&bytes[..end]).unwrap_or("")
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            FileBytes::Mmap(mm) => {
+                let bytes = &mm[local as usize..];
+                let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                std::str::from_utf8(&bytes[..end]).unwrap_or("")
+            }
+            #[cfg(target_arch = "wasm32")]
+            FileBytes::JsChunked(_) => self.read_chunked(_tier, _offset, local),
+        }
+    }
+
+    /// Walk the chunked tier byte-by-page until a NUL terminator,
+    /// allocate a stable Box<str>, and return a reference borrowed
+    /// from the cache.  Subsequent calls for the same offset reuse
+    /// the cached Box.  Box bytes never move — HashMap rehash only
+    /// moves the Box value (a pointer + len), not the bytes it owns.
+    #[cfg(target_arch = "wasm32")]
+    fn read_chunked(&self, tier: usize, offset: u32, local: u64) -> &str {
+        // SAFETY: wasm32 is single-threaded; we never mutate the
+        // HashMap from a borrow held by a caller because each get()
+        // is a self-contained sequence of insert-then-return.  The
+        // returned &str is from the Box's stable heap allocation,
+        // which outlives all subsequent inserts.
+        let cache = unsafe { &mut *self.cache.get() };
+        if let Some(s) = cache.get(&offset) {
+            // Extend lifetime via raw pointer round-trip — sound
+            // because the Box's str data is at a stable heap address.
+            let p: *const str = &**s;
+            return unsafe { &*p };
+        }
+        let m = match self.tiers[tier].as_ref() { Some(m) => m, None => return "" };
+        let mut buf = Vec::<u8>::with_capacity(64);
+        let mut cur = local;
+        let total = m.len();
+        const CHUNK: u64 = 256;
+        loop {
+            if cur >= total { break; }
+            let want = std::cmp::min(CHUNK, total - cur) as usize;
+            let chunk = m.read_chunk(cur, want);
+            let mut found = false;
+            for &b in chunk.iter() {
+                if b == 0 { found = true; break; }
+                buf.push(b);
+            }
+            if found { break; }
+            cur += want as u64;
+        }
+        let s: Box<str> = String::from_utf8(buf).unwrap_or_default().into_boxed_str();
+        let p: *const str = &*s;
+        cache.insert(offset, s);
+        unsafe { &*p }
     }
 }
 
@@ -874,6 +948,77 @@ impl Index {
         let total = v.len() / std::mem::size_of::<NodeCoord>() as u64;
         if offset as u64 + count as u64 > total { return None; }
         Some(v.read_records::<NodeCoord>(offset as u64, count as usize))
+    }
+
+    /// Read a single record from a chunkable file by index.  Returns
+    /// None if the file is absent or `idx` would overrun.  Used by
+    /// hot paths that need an owned record copy (place/poi/postcode
+    /// iteration) — Box::new pattern would force allocation; this
+    /// returns a stack-resident value via FileBytes::read_at.
+    pub fn place_node(&self, idx: u32) -> Option<PlaceNode> {
+        let m = self.place_nodes.as_ref()?;
+        let total = m.len() / std::mem::size_of::<PlaceNode>() as u64;
+        if (idx as u64) >= total { return None; }
+        Some(m.read_at::<PlaceNode>(idx as u64))
+    }
+
+    pub fn poi_record(&self, idx: u32) -> Option<PoiRecord> {
+        let m = self.poi_records.as_ref()?;
+        let total = m.len() / std::mem::size_of::<PoiRecord>() as u64;
+        if (idx as u64) >= total { return None; }
+        Some(m.read_at::<PoiRecord>(idx as u64))
+    }
+
+    pub fn postcode_centroid(&self, idx: u32) -> Option<PostcodeCentroid> {
+        let m = self.postcode_centroids.as_ref()?;
+        let total = m.len() / std::mem::size_of::<PostcodeCentroid>() as u64;
+        if (idx as u64) >= total { return None; }
+        Some(m.read_at::<PostcodeCentroid>(idx as u64))
+    }
+
+    pub fn admin_polygon(&self, idx: u32) -> Option<AdminPolygon> {
+        let m = &self.admin_polygons;
+        let total = m.len() / std::mem::size_of::<AdminPolygon>() as u64;
+        if (idx as u64) >= total { return None; }
+        Some(m.read_at::<AdminPolygon>(idx as u64))
+    }
+
+    /// Chunked-aware version of for_each_entry (reads from FileBytes
+    /// instead of &[u8]).  Same wire format: u16 count, then count
+    /// u32 IDs.  Bulk-reads the entries into a Cow once so the inner
+    /// loop doesn't pay per-id chunk-fetch overhead.
+    pub fn for_each_entry_fb(entries: &FileBytes, offset: u32, mut f: impl FnMut(u32)) {
+        if offset == NO_DATA { return; }
+        let off = offset as u64;
+        if off + 2 > entries.len() { return; }
+        let header = entries.read_chunk(off, 2);
+        let count = u16::from_le_bytes([header[0], header[1]]) as usize;
+        if count == 0 { return; }
+        let total = count * 4;
+        if off + 2 + total as u64 > entries.len() { return; }
+        let blob = entries.read_chunk(off + 2, total);
+        for i in 0..count {
+            f(u32::from_le_bytes(blob[i*4..i*4+4].try_into().unwrap()));
+        }
+    }
+
+    /// Chunked-aware admin-cell lookup: 12-byte stride sorted index
+    /// (u64 cell_id + u32 entries_offset) over a FileBytes source.
+    pub fn lookup_admin_cell_fb(cells: &FileBytes, cell_id: u64) -> u32 {
+        const STRIDE: u64 = 12;
+        let count = cells.len() / STRIDE;
+        if count == 0 { return NO_DATA; }
+        let mut lo: u64 = 0;
+        let mut hi = count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let bytes = cells.read_chunk(mid * STRIDE, STRIDE as usize);
+            let mid_id = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+            if mid_id == cell_id {
+                return u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+            } else if mid_id < cell_id { lo = mid + 1; } else { hi = mid; }
+        }
+        NO_DATA
     }
 
     pub fn read_u16(data: &[u8], offset: usize) -> u16 {
@@ -1282,7 +1427,7 @@ impl Index {
     pub fn debug_places(&self, lat: f64, lng: f64) -> serde_json::Value {
         let current_boundary = self.find_current_boundary(lat, lng);
         let municipality_boundary = self.find_municipality_boundary(lat, lng);
-        let place = self.find_places(lat, lng, current_boundary, municipality_boundary);
+        let place = self.find_places(lat, lng, current_boundary.as_ref(), municipality_boundary.as_ref());
 
         let place_cells = match &self.place_cells {
             Some(c) => c,
@@ -1292,16 +1437,7 @@ impl Index {
             Some(e) => e,
             None => return serde_json::json!({"error": "no place index"}),
         };
-        let place_nodes_mmap = match &self.place_nodes {
-            Some(n) => n,
-            None => return serde_json::json!({"error": "no place index"}),
-        };
-        let all_places: &[PlaceNode] = unsafe {
-            std::slice::from_raw_parts(
-                place_nodes_mmap.as_ptr() as *const PlaceNode,
-                place_nodes_mmap.len() as usize / std::mem::size_of::<PlaceNode>(),
-            )
-        };
+        if self.place_nodes.is_none() { return serde_json::json!({"error": "no place index"}); }
         let to_m = |d2: f64| (d2.sqrt() * 6_371_000.0) as f64;
         let cos_lat = lat.to_radians().cos();
         let type_names = ["city", "town", "village", "suburb", "hamlet", "neighbourhood", "quarter"];
@@ -1311,10 +1447,8 @@ impl Index {
 
         let mut nearby: Vec<serde_json::Value> = Vec::new();
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            Self::for_each_entry(place_entries, Self::lookup_admin_cell(place_cells, c), |id| {
-                let place_id = id as usize;
-                if place_id >= all_places.len() { return; }
-                let pn = &all_places[place_id];
+            Self::for_each_entry_fb(place_entries, Self::lookup_admin_cell_fb(place_cells, c), |id| {
+                let Some(pn) = self.place_node(id) else { return; };
                 let pt = pn.place_type as usize;
                 if pt >= 7 { return; }
                 let dlat = (lat - pn.lat as f64).to_radians();
@@ -1354,26 +1488,17 @@ impl Index {
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
 
-        let all_polygons: &[AdminPolygon] = unsafe {
-            std::slice::from_raw_parts(
-                self.admin_polygons.as_ptr() as *const AdminPolygon,
-                self.admin_polygons.len() as usize / std::mem::size_of::<AdminPolygon>(),
-            )
-        };
-
         const INTERIOR_FLAG: u32 = 0x80000000;
         const ID_MASK: u32 = 0x7FFFFFFF;
 
-        // Mirror find_admin's best_by_level logic with full logging.
-        let mut best_by_level: [Option<(f32, &AdminPolygon, bool)>; 12] = [None; 12];
+        let mut best_by_level: [Option<(f32, AdminPolygon, bool)>; 12] = [None; 12];
         let mut seen_in_level: [Vec<serde_json::Value>; 12] = Default::default();
 
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            Self::for_each_entry(&self.admin_entries, Self::lookup_admin_cell(&self.admin_cells, c), |id| {
+            Self::for_each_entry_fb(&self.admin_entries, Self::lookup_admin_cell_fb(&self.admin_cells, c), |id| {
                 let is_interior = (id & INTERIOR_FLAG) != 0;
-                let poly_id = (id & ID_MASK) as usize;
-                if poly_id >= all_polygons.len() { return; }
-                let poly = &all_polygons[poly_id];
+                let poly_id = id & ID_MASK;
+                let Some(poly) = self.admin_polygon(poly_id) else { return; };
                 let level = poly.admin_level as usize;
                 if level >= 12 { return; }
                 if poly.area <= 0.0 { return; }
@@ -1424,13 +1549,6 @@ impl Index {
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
 
-        let all_polygons: &[AdminPolygon] = unsafe {
-            std::slice::from_raw_parts(
-                self.admin_polygons.as_ptr() as *const AdminPolygon,
-                self.admin_polygons.len() as usize / std::mem::size_of::<AdminPolygon>(),
-            )
-        };
-
         // For each admin level, find the smallest-area polygon actually containing
         // the point. Interior flags are used as a fast path for uncontested cells,
         // but PIP is always run when a polygon would win the smallest-area contest
@@ -1438,23 +1556,19 @@ impl Index {
         const INTERIOR_FLAG: u32 = 0x80000000;
         const ID_MASK: u32 = 0x7FFFFFFF;
 
-        let mut best_by_level: [Option<(f32, &AdminPolygon, bool)>; 12] = [None; 12]; // (area, poly, pip_verified)
-        // Class='place' polygons (stored by our builder at admin_level=15 as a
-        // marker). These are boundary=place / multipolygon+place=* entries —
-        // Nominatim's second-check nested adjustment (placex_triggers.sql
-        // lines 944-963) uses only these, NOT admin boundaries with
-        // linked_place tags. Tracked separately so we can apply rule #3
-        // only for genuine class='place' polygons — see Buenos Aires
-        // Comuna 1 where L8 Buenos Aires (boundary + linked_place=city)
-        // would otherwise incorrectly promote L5 Comuna 1 to rank 18.
-        let mut place_area_polygons: Vec<&AdminPolygon> = Vec::new();
+        // (area, poly, pip_verified) — owned AdminPolygon values so the
+        // backing admin_polygons file can be a chunked source.
+        let mut best_by_level: [Option<(f32, AdminPolygon, bool)>; 12] = [None; 12];
+        // Class='place' polygons (admin_level=15 marker).  Stored as
+        // (poly_id, AdminPolygon) so we can dedup by id (the original
+        // pointer-equality dedup doesn't survive owned copies).
+        let mut place_area_polygons: Vec<(u32, AdminPolygon)> = Vec::new();
 
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            Self::for_each_entry(&self.admin_entries, Self::lookup_admin_cell(&self.admin_cells, c), |id| {
+            Self::for_each_entry_fb(&self.admin_entries, Self::lookup_admin_cell_fb(&self.admin_cells, c), |id| {
                 let is_interior = (id & INTERIOR_FLAG) != 0;
-                let poly_id = (id & ID_MASK) as usize;
-                if poly_id >= all_polygons.len() { return; }
-                let poly = &all_polygons[poly_id];
+                let poly_id = id & ID_MASK;
+                let Some(poly) = self.admin_polygon(poly_id) else { return; };
                 let level = poly.admin_level as usize;
                 if level >= 12 { return; }
                 if poly.area <= 0.0 { return; }
@@ -1522,16 +1636,15 @@ impl Index {
         // tags. Kept in a separate vec so we don't disturb best_by_level[].
         let neighbors2 = cell_neighbors_at_level(cell, self.admin_cell_level);
         for c in std::iter::once(cell).chain(neighbors2.into_iter()) {
-            Self::for_each_entry(&self.admin_entries, Self::lookup_admin_cell(&self.admin_cells, c), |id| {
-                let poly_id = (id & ID_MASK) as usize;
-                if poly_id >= all_polygons.len() { return; }
-                let poly = &all_polygons[poly_id];
+            Self::for_each_entry_fb(&self.admin_entries, Self::lookup_admin_cell_fb(&self.admin_cells, c), |id| {
+                let poly_id = id & ID_MASK;
+                let Some(poly) = self.admin_polygon(poly_id) else { return; };
                 if poly.admin_level != 15 { return; }
                 if poly.area <= 0.0 { return; }
                 let Some(verts) = self.admin_verts(poly.vertex_offset, poly.vertex_count) else { return; };
                 if !point_in_polygon(lat as f32, lng as f32, &verts) { return; }
-                if !place_area_polygons.iter().any(|p| std::ptr::eq(*p, poly)) {
-                    place_area_polygons.push(poly);
+                if !place_area_polygons.iter().any(|(pid, _)| *pid == poly_id) {
+                    place_area_polygons.push((poly_id, poly));
                 }
             });
         }
@@ -1632,7 +1745,7 @@ impl Index {
         //
         // Pick the smallest polygon per name to avoid duplicates
         // when multiple overlapping place areas share a name.
-        for poly in &place_area_polygons {
+        for (_pid, poly) in &place_area_polygons {
             if poly.place_type_override == 0 { continue; }
             let r = place_type_to_rank(poly.place_type_override);
             if r == 0 { continue; }
@@ -1734,7 +1847,7 @@ impl Index {
                 // restricts this loop to class='place'.
                 if self_override == 0 {
                     let mut place_parent_rank: u8 = 0;
-                    for pa in &place_area_polygons {
+                    for (_pid, pa) in &place_area_polygons {
                         if pa.place_type_override == 0 { continue; }
                         if pa.area <= self_area { continue; }
                         let pa_rank = place_type_to_rank(pa.place_type_override);
@@ -1842,28 +1955,18 @@ impl Index {
     // level) that contains the query point. This is Nominatim's
     // `current_boundary` used in the cascading containment gate for
     // place nodes (placex_triggers.sql lines 597-600, 627-635).
-    pub fn find_current_boundary(&self, lat: f64, lng: f64) -> Option<&AdminPolygon> {
-        let all_polygons: &[AdminPolygon] = unsafe {
-            std::slice::from_raw_parts(
-                self.admin_polygons.as_ptr() as *const AdminPolygon,
-                self.admin_polygons.len() as usize / std::mem::size_of::<AdminPolygon>(),
-            )
-        };
+    pub fn find_current_boundary(&self, lat: f64, lng: f64) -> Option<AdminPolygon> {
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
 
         const ID_MASK: u32 = 0x7FFFFFFF;
-        let mut best: Option<&AdminPolygon> = None;
+        let mut best: Option<AdminPolygon> = None;
         let mut best_area: f32 = f32::MAX;
 
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            Self::for_each_entry(&self.admin_entries, Self::lookup_admin_cell(&self.admin_cells, c), |id| {
-                let poly_id = (id & ID_MASK) as usize;
-                if poly_id >= all_polygons.len() { return; }
-                let poly = &all_polygons[poly_id];
-                // Only city/suburb level and deeper (admin_level >= 8)
-                // Matches Nominatim's current_boundary which gets
-                // updated for rank_address != 11 AND rank_address != 5
+            Self::for_each_entry_fb(&self.admin_entries, Self::lookup_admin_cell_fb(&self.admin_cells, c), |id| {
+                let poly_id = id & ID_MASK;
+                let Some(poly) = self.admin_polygon(poly_id) else { return; };
                 if poly.admin_level < 8 || poly.admin_level > 10 { return; }
                 if poly.area >= best_area { return; }
                 let Some(verts) = self.admin_verts(poly.vertex_offset, poly.vertex_count) else { return; };
@@ -1893,25 +1996,18 @@ impl Index {
     // most countries: it's county/district, not municipality). If no
     // L7/L8 contains the query (rural / unincorporated), returns None
     // and the gate in find_places falls back to radius-only behaviour.
-    pub fn find_municipality_boundary(&self, lat: f64, lng: f64) -> Option<&AdminPolygon> {
-        let all_polygons: &[AdminPolygon] = unsafe {
-            std::slice::from_raw_parts(
-                self.admin_polygons.as_ptr() as *const AdminPolygon,
-                self.admin_polygons.len() as usize / std::mem::size_of::<AdminPolygon>(),
-            )
-        };
+    pub fn find_municipality_boundary(&self, lat: f64, lng: f64) -> Option<AdminPolygon> {
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
 
         const ID_MASK: u32 = 0x7FFFFFFF;
-        let mut best: Option<&AdminPolygon> = None;
+        let mut best: Option<AdminPolygon> = None;
         let mut best_area: f32 = f32::MAX;
 
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            Self::for_each_entry(&self.admin_entries, Self::lookup_admin_cell(&self.admin_cells, c), |id| {
-                let poly_id = (id & ID_MASK) as usize;
-                if poly_id >= all_polygons.len() { return; }
-                let poly = &all_polygons[poly_id];
+            Self::for_each_entry_fb(&self.admin_entries, Self::lookup_admin_cell_fb(&self.admin_cells, c), |id| {
+                let poly_id = id & ID_MASK;
+                let Some(poly) = self.admin_polygon(poly_id) else { return; };
                 if poly.admin_level < 7 || poly.admin_level > 8 { return; }
                 if poly.area >= best_area { return; }
                 let Some(verts) = self.admin_verts(poly.vertex_offset, poly.vertex_count) else { return; };
@@ -1933,33 +2029,22 @@ impl Index {
             Some(e) => e,
             None => return PlaceResult::default(),
         };
-        let place_nodes_mmap = match &self.place_nodes {
-            Some(n) => n,
-            None => return PlaceResult::default(),
-        };
-
-        let all_places: &[PlaceNode] = unsafe {
-            std::slice::from_raw_parts(
-                place_nodes_mmap.as_ptr() as *const PlaceNode,
-                place_nodes_mmap.len() as usize / std::mem::size_of::<PlaceNode>(),
-            )
-        };
+        if self.place_nodes.is_none() { return PlaceResult::default(); }
 
         // Place nodes are indexed at admin cell level (L10, ~10km cells).
         // Cell + 8 neighbors covers ~30km — sufficient for all place types.
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
 
-        // For each place type, find the nearest node
+        // For each place type, find the nearest node (owned copy so the
+        // place_nodes file can be a chunked source).
         // 0=city, 1=town, 2=village, 3=suburb, 4=hamlet, 5=neighbourhood, 6=quarter
-        let mut best: [Option<(f64, &PlaceNode)>; 7] = [None; 7];
+        let mut best: [Option<(f64, PlaceNode)>; 7] = [None; 7];
         let cos_lat = lat.to_radians().cos();
 
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            Self::for_each_entry(place_entries, Self::lookup_admin_cell(place_cells, c), |id| {
-                let place_id = id as usize;
-                if place_id >= all_places.len() { return; }
-                let pn = &all_places[place_id];
+            Self::for_each_entry_fb(place_entries, Self::lookup_admin_cell_fb(place_cells, c), |id| {
+                let Some(pn) = self.place_node(id) else { return; };
                 let pt = pn.place_type as usize;
                 if pt >= 7 { return; }
 
@@ -2080,7 +2165,7 @@ impl Index {
                     1 => max_town,    // town: 0.08 deg
                     _ => max_village, // village: 0.04 deg
                 };
-                if dist_sq <= threshold && node_inside_municipality(pn) {
+                if dist_sq <= threshold && node_inside_municipality(&pn) {
                     let name = self.get_string(pn.name_id);
                     match pt {
                         0 => result.city = Some(name),
@@ -2180,15 +2265,7 @@ impl Index {
     // filter remap also have NO_DATA and pass.
     pub fn poi_chain_contains_query(&self, poi: &PoiRecord, lat: f64, lng: f64) -> bool {
         if poi.parent_poly_id == NO_DATA { return true; }
-        let all_polygons: &[AdminPolygon] = unsafe {
-            std::slice::from_raw_parts(
-                self.admin_polygons.as_ptr() as *const AdminPolygon,
-                self.admin_polygons.len() as usize / std::mem::size_of::<AdminPolygon>(),
-            )
-        };
-        let pid = poi.parent_poly_id as usize;
-        if pid >= all_polygons.len() { return true; }
-        let poly = &all_polygons[pid];
+        let Some(poly) = self.admin_polygon(poi.parent_poly_id) else { return true; };
         let Some(verts) = self.admin_verts(poly.vertex_offset, poly.vertex_count) else { return true; };
         point_in_polygon(lat as f32, lng as f32, &verts)
     }
@@ -2204,17 +2281,11 @@ impl Index {
     //
     // For polygon POIs, returns distance 0 if the query is inside
     // the polygon, otherwise the distance to the nearest edge.
-    pub fn find_nearest_poi_with_parent(&self, lat: f64, lng: f64) -> Option<(f64, &PoiRecord)> {
+    pub fn find_nearest_poi_with_parent(&self, lat: f64, lng: f64) -> Option<(f64, PoiRecord)> {
         let poi_cells = self.poi_cells.as_ref()?;
         let poi_entries = self.poi_entries.as_ref()?;
-        let poi_records_mmap = self.poi_records.as_ref()?;
+        if self.poi_records.is_none() { return None; }
 
-        let all_pois: &[PoiRecord] = unsafe {
-            std::slice::from_raw_parts(
-                poi_records_mmap.as_ptr() as *const PoiRecord,
-                poi_records_mmap.len() as usize / std::mem::size_of::<PoiRecord>(),
-            )
-        };
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
 
@@ -2223,21 +2294,20 @@ impl Index {
 
         let cos_lat = lat.to_radians().cos();
         let mut best_dist_sq = f64::MAX;
-        let mut best_idx: Option<usize> = None;
+        let mut best_idx: Option<u32> = None;
         // Fallback tier: the closest area-label POI (national park,
         // island, bay, campus). Only wins primary if no specific
         // POI qualifies — so "middle of Yosemite with no roads" can
         // surface the park, while urban queries never get "Manhattan
         // Island" as the primary feature.
         let mut fallback_dist_sq = f64::MAX;
-        let mut fallback_idx: Option<usize> = None;
+        let mut fallback_idx: Option<u32> = None;
 
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            Self::for_each_entry(poi_entries, Self::lookup_admin_cell(poi_cells, c), |id| {
+            Self::for_each_entry_fb(poi_entries, Self::lookup_admin_cell_fb(poi_cells, c), |id| {
                 let is_interior = (id & INTERIOR_FLAG) != 0;
-                let poi_id = (id & ID_MASK) as usize;
-                if poi_id >= all_pois.len() { return; }
-                let poi = &all_pois[poi_id];
+                let poi_id = (id & ID_MASK) as u32;
+                let Some(poi) = self.poi_record(poi_id) else { return; };
                 // Need a linked parent street (for the `road` field)
                 // when this POI wins — without it we have nothing to
                 // surface as the road name.
@@ -2311,14 +2381,11 @@ impl Index {
         }
 
         // Only fall back to the area-label candidate when no specific
-        // POI was found at all within the search radius. If a
-        // specific POI exists anywhere in the cell neighbourhood we
-        // prefer it, no matter how far — the primary-selection outer
-        // loop still applies the DEFAULT_SEARCH_DISTANCE cutoff.
+        // POI was found at all within the search radius.
         if let Some(i) = best_idx {
-            Some((best_dist_sq, &all_pois[i]))
+            self.poi_record(i).map(|p| (best_dist_sq, p))
         } else {
-            fallback_idx.map(|i| (fallback_dist_sq, &all_pois[i]))
+            fallback_idx.and_then(|i| self.poi_record(i).map(|p| (fallback_dist_sq, p)))
         }
     }
 
@@ -2333,17 +2400,8 @@ impl Index {
             Some(e) => e,
             None => return vec![],
         };
-        let poi_records_mmap = match &self.poi_records {
-            Some(r) => r,
-            None => return vec![],
-        };
+        if self.poi_records.is_none() { return vec![]; }
 
-        let all_pois: &[PoiRecord] = unsafe {
-            std::slice::from_raw_parts(
-                poi_records_mmap.as_ptr() as *const PoiRecord,
-                poi_records_mmap.len() as usize / std::mem::size_of::<PoiRecord>(),
-            )
-        };
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
 
@@ -2353,11 +2411,10 @@ impl Index {
         let mut results: Vec<PoiMatch<'_>> = Vec::new();
 
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            Self::for_each_entry(poi_entries, Self::lookup_admin_cell(poi_cells, c), |id| {
+            Self::for_each_entry_fb(poi_entries, Self::lookup_admin_cell_fb(poi_cells, c), |id| {
                 let is_interior = (id & INTERIOR_FLAG) != 0;
-                let poi_id = (id & ID_MASK) as usize;
-                if poi_id >= all_pois.len() { return; }
-                let poi = &all_pois[poi_id];
+                let poi_id = (id & ID_MASK) as u32;
+                let Some(poi) = self.poi_record(poi_id) else { return; };
                 if poi.name_id == NO_DATA { return; }
                 let name = self.get_string(poi.name_id);
                 if name.is_empty() { return; }
@@ -2520,29 +2577,20 @@ impl Index {
     // the pure PIP approach.
     pub fn find_admin_from_chain(&self, start_poly_id: u32, lat: f64, lng: f64) -> AdminResult<'_> {
         let admin_parents = match &self.admin_parents {
-            Some(m) => unsafe {
-                std::slice::from_raw_parts(
-                    m.as_ptr() as *const u32,
-                    m.len() as usize / 4,
-                )
-            },
+            Some(m) => m,
             None => return self.find_admin(lat, lng),
         };
-        let all_polygons: &[AdminPolygon] = unsafe {
-            std::slice::from_raw_parts(
-                self.admin_polygons.as_ptr() as *const AdminPolygon,
-                self.admin_polygons.len() as usize / std::mem::size_of::<AdminPolygon>(),
-            )
-        };
+        let parents_count = admin_parents.len() / 4;
+        let total_polys = self.admin_polygons.len() / std::mem::size_of::<AdminPolygon>() as u64;
 
         // Collect chain: walk start → parent → parent → ...
         let mut chain_ids: Vec<u32> = Vec::with_capacity(12);
         let mut current = start_poly_id;
         for _ in 0..15 { // safety bound
-            if current == NO_DATA || current as usize >= all_polygons.len() { break; }
+            if current == NO_DATA || (current as u64) >= total_polys { break; }
             chain_ids.push(current);
-            if current as usize >= admin_parents.len() { break; }
-            current = admin_parents[current as usize];
+            if (current as u64) >= parents_count { break; }
+            current = admin_parents.read_at::<u32>(current as u64);
         }
 
         // Also collect class='place' polygons (admin_level=15) via
@@ -2550,12 +2598,11 @@ impl Index {
         // but provide place-area rank promotions.
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
-        let mut place_area_polygons: Vec<&AdminPolygon> = Vec::new();
+        let mut place_area_polygons: Vec<AdminPolygon> = Vec::new();
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            Self::for_each_entry(&self.admin_entries, Self::lookup_admin_cell(&self.admin_cells, c), |id| {
-                let poly_id = (id & 0x7FFFFFFF) as usize;
-                if poly_id >= all_polygons.len() { return; }
-                let poly = &all_polygons[poly_id];
+            Self::for_each_entry_fb(&self.admin_entries, Self::lookup_admin_cell_fb(&self.admin_cells, c), |id| {
+                let poly_id = id & 0x7FFFFFFF;
+                let Some(poly) = self.admin_polygon(poly_id) else { return; };
                 if poly.admin_level != 15 { return; }
                 if poly.area <= 0.0 { return; }
                 let Some(verts) = self.admin_verts(poly.vertex_offset, poly.vertex_count) else { return; };
@@ -2569,7 +2616,7 @@ impl Index {
 
         let country_code_str: String = chain_ids.iter()
             .find_map(|&pid| {
-                let poly = &all_polygons[pid as usize];
+                let poly = self.admin_polygon(pid)?;
                 if poly.admin_level == 2 && poly.country_code != 0 {
                     Some(format!("{}{}",
                         (poly.country_code >> 8) as u8 as char,
@@ -2589,7 +2636,7 @@ impl Index {
         }
         let mut ranked: Vec<RankedPoly2<'_>> = Vec::new();
         for &pid in &chain_ids {
-            let poly = &all_polygons[pid as usize];
+            let Some(poly) = self.admin_polygon(pid) else { continue; };
             if poly.admin_level == 11 { continue; } // postal
             let initial_rank = self.admin_config.to_rank(&country_code_str, poly.admin_level);
             if initial_rank == 0 && poly.place_type_override == 0 { continue; }
@@ -2790,9 +2837,7 @@ impl Index {
             (cc[0] as u16) << 8 | (cc[1] as u16)
         });
         if let Some(ref pc_mmap) = self.postcode_centroids {
-            let all_centroids: &[PostcodeCentroid] = unsafe {
-                std::slice::from_raw_parts(pc_mmap.as_ptr() as *const PostcodeCentroid, pc_mmap.len() as usize / std::mem::size_of::<PostcodeCentroid>())
-            };
+            let total_centroids = pc_mmap.len() / std::mem::size_of::<PostcodeCentroid>() as u64;
             // 0.05 deg ~ 5.5km, matches Nominatim's get_nearest_postcode
             let max_dist_sq = (0.05_f64).to_radians().powi(2);
             let cos_lat = lat.to_radians().cos();
@@ -2803,10 +2848,8 @@ impl Index {
                 let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
                 let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
                 for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-                    Self::for_each_entry(entries, Self::lookup_admin_cell(cells, c), |id| {
-                        let idx = id as usize;
-                        if idx >= all_centroids.len() { return; }
-                        let pc = &all_centroids[idx];
+                    Self::for_each_entry_fb(entries, Self::lookup_admin_cell_fb(cells, c), |id| {
+                        let Some(pc) = self.postcode_centroid(id) else { return; };
                         if let Some(cc) = country_gate {
                             if pc.country_code != 0 && pc.country_code != cc { return; }
                         }
@@ -2823,7 +2866,11 @@ impl Index {
                     });
                 }
             } else {
-                for pc in all_centroids {
+                // Full-scan fallback when the cell index isn't loaded.
+                // O(N) but only triggers in admin-only deployments
+                // where N is small.
+                for i in 0..total_centroids as u32 {
+                    let Some(pc) = self.postcode_centroid(i) else { continue; };
                     if let Some(cc) = country_gate {
                         if pc.country_code != 0 && pc.country_code != cc { continue; }
                     }
@@ -2857,7 +2904,7 @@ impl Index {
         // sit inside to be accepted in the address walk.
         let current_boundary = self.find_current_boundary(lat, lng);
         let municipality_boundary = self.find_municipality_boundary(lat, lng);
-        let place = self.find_places(lat, lng, current_boundary, municipality_boundary);
+        let place = self.find_places(lat, lng, current_boundary.as_ref(), municipality_boundary.as_ref());
         let (addr, interp, street) = self.query_geo(lat, lng);
 
         // Hybrid admin resolution: when the primary is a street with a
@@ -3178,7 +3225,7 @@ impl Index {
             lat, lng,
             if poi_won_primary { None } else { street.as_ref().map(|(_, w, idx)| (*idx as usize, w)) },
             if addr_won_primary { addr.as_ref().map(|(_, a, id)| (*id as usize, a)) } else { None },
-            if poi_won_primary { poi_primary.as_ref().map(|(_, p)| *p) } else { None },
+            if poi_won_primary { poi_primary.as_ref().map(|(_, p)| p) } else { None },
             admin.country_code,
         );
 
