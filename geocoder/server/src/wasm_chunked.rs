@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 
 const PAGE_SIZE: usize = 64 * 1024; // 64 KiB pages
-const MAX_PAGES: usize = 16;         // 1 MiB cache cap per file
+const MAX_PAGES: usize = 32;         // 2 MiB cache cap per file
 
 // On wasm32, `usize` is 32 bits — files >4 GiB can't be addressed with
 // it.  All offsets and lengths exposed here are `u64` so the planet's
