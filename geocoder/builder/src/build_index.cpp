@@ -5023,9 +5023,16 @@ int main(int argc, char* argv[]) {
                                 enc = VertexEncoding::U32_1CM; scale = 1e-7;
                             }
                             pr.vertex_offset = static_cast<uint32_t>(filtered_vertex_bytes.size());
-                            pr.encoding = static_cast<uint8_t>(enc);
-                            pr.bbox_min_lat = static_cast<float>(min_lat);
-                            pr.bbox_min_lng = static_cast<float>(min_lng);
+                            // Write 10-byte polygon header inline
+                            uint8_t enc_byte = static_cast<uint8_t>(enc);
+                            filtered_vertex_bytes.push_back(enc_byte);
+                            filtered_vertex_bytes.push_back(0); // pad
+                            float bml = static_cast<float>(min_lat);
+                            float bmg = static_cast<float>(min_lng);
+                            auto* lp = reinterpret_cast<const uint8_t*>(&bml);
+                            filtered_vertex_bytes.insert(filtered_vertex_bytes.end(), lp, lp + 4);
+                            auto* gp_h = reinterpret_cast<const uint8_t*>(&bmg);
+                            filtered_vertex_bytes.insert(filtered_vertex_bytes.end(), gp_h, gp_h + 4);
                             for (uint32_t j = 0; j < vc; j++) {
                                 const auto& v = d.poi_vertices[old_voff + j];
                                 if (enc == VertexEncoding::U32_1CM) {
@@ -5045,11 +5052,8 @@ int main(int argc, char* argv[]) {
                                 }
                             }
                         } else {
-                            // Point POI — vertex_offset stays NO_DATA;
-                            // encoding is irrelevant but default F32 keeps
-                            // the field deterministic.
+                            // Point POI — no header / no vertices.
                             pr.vertex_offset = NO_DATA;
-                            pr.encoding = static_cast<uint8_t>(VertexEncoding::F32);
                         }
                         filtered_records.push_back(pr);
                     }

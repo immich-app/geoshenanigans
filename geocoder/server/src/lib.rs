@@ -168,26 +168,31 @@ impl FileBytes {
 }
 
 /// Decode a polygon's quantized vertices into NodeCoord values.
-/// Used by both Index::admin_verts and Index::poi_verts (and any
-/// future addr_vertices consumer) so the encoding logic lives in
-/// one place.  vertex_offset is a BYTE offset into the source file.
-/// Returns Cow::Owned for delta-encoded schemes (decoding allocates),
-/// Cow::Borrowed for the F32 escape hatch when the source is
-/// Owned/Mmap (zero-copy slice cast).
+/// Reads the inline 10-byte polygon header (encoding tag + bbox_min)
+/// at vertex_offset, then `vertex_count` vertices that follow.  Used
+/// by Index::admin_verts, Index::poi_verts, Index::addr_polygon_verts
+/// — keeping the encoding logic in one place.
 pub fn decode_polygon_verts<'a>(
     src: &'a FileBytes,
     vertex_offset: u32,
     vertex_count: u32,
-    encoding: u8,
-    bbox_min_lat: f32,
-    bbox_min_lng: f32,
 ) -> Option<std::borrow::Cow<'a, [NodeCoord]>> {
     if vertex_count == 0 || vertex_offset == NO_DATA { return None; }
-    let stride = vertex_stride(encoding) as u64;
     let off = vertex_offset as u64;
+    if off + POLY_HEADER_BYTES > src.len() { return None; }
+
+    // Read 10-byte header
+    let header = src.read_chunk(off, POLY_HEADER_BYTES as usize);
+    let encoding = header[0];
+    let bbox_min_lat = f32::from_le_bytes(header[2..6].try_into().unwrap());
+    let bbox_min_lng = f32::from_le_bytes(header[6..10].try_into().unwrap());
+    drop(header);
+
+    let stride = vertex_stride(encoding) as u64;
+    let verts_off = off + POLY_HEADER_BYTES;
     let total_bytes = (vertex_count as u64) * stride;
-    if off + total_bytes > src.len() { return None; }
-    let bytes = src.read_chunk(off, total_bytes as usize);
+    if verts_off + total_bytes > src.len() { return None; }
+    let bytes = src.read_chunk(verts_off, total_bytes as usize);
 
     if encoding == 4 {
         // Legacy F32 — direct cast, zero-copy when borrowed.
@@ -356,21 +361,30 @@ pub fn vertex_scale(enc: u8) -> f64 {
     }
 }
 
+/// Per-polygon header at the start of each polygon's vertex slice in
+/// admin_vertices.bin / poi_vertices.bin / addr_vertices.bin:
+///   byte 0     : VertexEncoding tag
+///   byte 1     : padding
+///   bytes 2..6 : bbox_min_lat (f32)
+///   bytes 6..10: bbox_min_lng (f32)
+/// Vertices follow at byte 10, packed at the encoding's stride.
+/// Header is omitted for vertex_count == 0 (point-only records,
+/// vertex_offset == NO_DATA).
+pub const POLY_HEADER_BYTES: u64 = 10;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct AdminPolygon {
-    pub vertex_offset: u32,       // BYTE offset into admin_vertices.bin
+    pub vertex_offset: u32,       // BYTE offset into admin_vertices.bin (to header)
     pub vertex_count: u32,
     pub name_id: u32,
     pub admin_level: u8,
     pub place_type_override: u8,  // 0=none, 1=city, 2=town, 3=village, 4=suburb, 5=neighbourhood, 6=quarter
-    pub encoding: u8,             // VertexEncoding tag (default F32=4 for legacy data)
+    pub _pad2: u8,
     pub _pad3: u8,
     pub area: f32,
     pub country_code: u16,
     pub _pad4: u16,
-    pub bbox_min_lat: f32,        // reference point for delta-encoded vertex schemes
-    pub bbox_min_lng: f32,
 }
 
 #[repr(C)]
@@ -385,24 +399,13 @@ pub struct NodeCoord {
 pub struct PoiRecord {
     pub lat: f32,
     pub lng: f32,
-    pub vertex_offset: u32,       // BYTE offset into poi_vertices.bin
+    pub vertex_offset: u32,       // BYTE offset into poi_vertices.bin (to header), NO_DATA for point POIs
     pub vertex_count: u32,
     pub name_id: u32,
     pub category: u8,
     pub tier: u8,
     pub flags: u8,
     pub importance: u8,
-    // Vertex encoding tag + bbox_min reference for delta-quantized
-    // polygon storage.  encoding = 4 (F32) means legacy f32 NodeCoords
-    // (vertex_offset is then a vertex index, not a byte offset — but
-    // newer builders always set encoding so this code path is for
-    // backward compatibility only).
-    pub encoding: u8,
-    pub _pad_enc1: u8,
-    pub _pad_enc2: u8,
-    pub _pad_enc3: u8,
-    pub bbox_min_lat: f32,
-    pub bbox_min_lng: f32,
     /// Name offset of the nearest named street to this POI, pre-
     /// computed at build time. Used to populate the `road` field
     /// when this POI wins query_geo primary-feature selection.
@@ -1065,20 +1068,24 @@ impl Index {
         self.strings.get(offset)
     }
 
-    /// Decode a polygon's quantized vertex slice from `admin_vertices`
-    /// using the polygon's encoding tag + bbox_min reference point.
-    /// Always returns owned Vec<NodeCoord> (decoding allocates) except
-    /// for the F32 escape hatch which returns the slice in-place.
+    /// Decode a polygon's quantized vertex slice from `admin_vertices`.
+    /// Reads the inline 10-byte polygon header (encoding + bbox_min)
+    /// at `poly.vertex_offset`, then decodes the following vertices.
     pub fn admin_verts(&self, poly: &AdminPolygon) -> Option<std::borrow::Cow<'_, [NodeCoord]>> {
-        decode_polygon_verts(&self.admin_vertices, poly.vertex_offset, poly.vertex_count,
-                             poly.encoding, poly.bbox_min_lat, poly.bbox_min_lng)
+        decode_polygon_verts(&self.admin_vertices, poly.vertex_offset, poly.vertex_count)
     }
 
     /// Same shape as `admin_verts` but for `poi_vertices` (optional file).
     pub fn poi_verts(&self, poly: &PoiRecord) -> Option<std::borrow::Cow<'_, [NodeCoord]>> {
         let v = self.poi_vertices.as_ref()?;
-        decode_polygon_verts(v, poly.vertex_offset, poly.vertex_count,
-                             poly.encoding, poly.bbox_min_lat, poly.bbox_min_lng)
+        decode_polygon_verts(v, poly.vertex_offset, poly.vertex_count)
+    }
+
+    /// Decode an addr_point's polygon footprint vertex slice.  Same
+    /// inline-header layout as admin/POI vertices.
+    pub fn addr_polygon_verts(&self, point: &AddrPoint) -> Option<std::borrow::Cow<'_, [NodeCoord]>> {
+        let v = self.addr_vertices.as_ref()?;
+        decode_polygon_verts(v, point.vertex_offset, point.vertex_count)
     }
 
     /// Read a single record from a chunkable file by index.  Returns
@@ -1314,19 +1321,8 @@ impl Index {
                     let dlat = (point.lat as f64 - lat).to_radians();
                     let dlng = (point.lng as f64 - lng).to_radians();
                     let mut dist = dist_sq(dlat, dlng, cos_lat);
-                    if point.vertex_count > 0 && point.vertex_offset != NO_DATA {
-                        if let Some(av) = self.addr_vertices.as_ref() {
-                            let off = point.vertex_offset as u64;
-                            let cnt = point.vertex_count as usize;
-                            let vbytes = av.read_chunk(off * std::mem::size_of::<NodeCoord>() as u64,
-                                                        cnt * std::mem::size_of::<NodeCoord>());
-                            let verts: &[NodeCoord] = unsafe {
-                                std::slice::from_raw_parts(
-                                    vbytes.as_ptr() as *const NodeCoord, cnt,
-                                )
-                            };
-                            dist = polygon_distance_sq(lat, lng, verts, cos_lat);
-                        }
+                    if let Some(verts) = self.addr_polygon_verts(&point) {
+                        dist = polygon_distance_sq(lat, lng, &verts, cos_lat);
                     }
                     if dist < best_addr_dist {
                         best_addr_dist = dist;
@@ -1501,17 +1497,8 @@ impl Index {
                 let dlat = (point.lat as f64 - lat).to_radians();
                 let dlng = (point.lng as f64 - lng).to_radians();
                 let mut dist = dist_sq(dlat, dlng, cos_lat);
-                if point.vertex_count > 0 && point.vertex_offset != NO_DATA {
-                    if let Some(av) = self.addr_vertices.as_ref() {
-                        let off = point.vertex_offset as u64;
-                        let cnt = point.vertex_count as usize;
-                        let vbytes = av.read_chunk(off * std::mem::size_of::<NodeCoord>() as u64,
-                                                    cnt * std::mem::size_of::<NodeCoord>());
-                        let verts: &[NodeCoord] = unsafe {
-                            std::slice::from_raw_parts(vbytes.as_ptr() as *const NodeCoord, cnt)
-                        };
-                        dist = polygon_distance_sq(lat, lng, verts, cos_lat);
-                    }
+                if let Some(verts) = self.addr_polygon_verts(&point) {
+                    dist = polygon_distance_sq(lat, lng, &verts, cos_lat);
                 }
                 if dist < best_dist {
                     best_dist = dist;

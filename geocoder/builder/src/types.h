@@ -68,41 +68,45 @@ enum class AdminPlaceType : uint8_t {
 };
 
 // Vertex encoding tag: picks the bytes-per-vertex / precision tradeoff
-// for this polygon.  Builder picks the finest scale that fits the
-// polygon's bbox; reader decodes per-vertex via the inverse scale.
-//
-// Stored values per vertex are unsigned deltas relative to bbox_min:
-//   v_lat = bbox_min_lat + (stored_dlat * scale)
-//   v_lng = bbox_min_lng + (stored_dlng * scale)
-//
-// All schemes encode vertex_offset as a BYTE offset into the vertices
-// file (not a vertex index) since the per-vertex stride varies.
+// for this polygon.  Stored as a 1-byte tag in the per-polygon header
+// at the start of the polygon's vertex slice.
 enum class VertexEncoding : uint8_t {
     U16_1M    = 0,  // u16 @ 1e-5° (1.1 m), fits 73 km × 73 km bbox  → suburbs/cities
     U16_11M   = 1,  // u16 @ 1e-4° (11 m),  fits 730 km × 730 km     → states/regions
     U16_011M  = 2,  // u16 @ 1e-6° (11 cm), fits 7.3 km × 7.3 km     → POI buildings
     U32_1CM   = 3,  // u32 @ 1e-7° (1.1 cm), fits any polygon        → countries / fallback
-    F32       = 4,  // raw f32 lat/lng (current format)              → escape hatch
+    F32       = 4,  // raw f32 lat/lng (legacy escape hatch)
 };
 static constexpr uint8_t VERTEX_STRIDE[5] = {4, 4, 4, 8, 8};
 
+// admin_vertices.bin / poi_vertices.bin / addr_vertices.bin layout per
+// polygon (only present when vertex_count > 0):
+//
+//   byte 0     : VertexEncoding tag
+//   byte 1     : padding (alignment)
+//   bytes 2..6 : bbox_min_lat (f32)
+//   bytes 6..10: bbox_min_lng (f32)
+//   bytes 10.. : vertex_count vertices, packed at the encoding's stride
+//
+// vertex_offset on the record is the BYTE offset to byte 0 of this
+// header.  Header is omitted for vertex_count == 0 (point-only records,
+// vertex_offset = NO_DATA).  Storing the header inline saves the
+// per-record 12-byte tax on PoiRecord/AddrPoint where most records are
+// point-only and would otherwise carry unused bbox_min fields.
+static constexpr uint32_t POLY_HEADER_BYTES = 10;
+
 struct AdminPolygon {
-    uint32_t vertex_offset;       // BYTE offset into admin_vertices.bin
+    uint32_t vertex_offset;       // BYTE offset into admin_vertices.bin (to polygon header)
     uint32_t vertex_count;
     uint32_t name_id;
     uint8_t admin_level;
     uint8_t place_type_override = 0; // AdminPlaceType — overrides admin_level for field mapping
-    uint8_t encoding = 4;         // VertexEncoding (default F32 for legacy code paths)
-    uint8_t _pad3 = 0;
+    uint8_t _pad2 = 0, _pad3 = 0;
     float area;
     uint16_t country_code;
     uint16_t _pad4 = 0;
-    // Reference point for delta-encoded schemes (encoding != F32).
-    // Vertices reconstruct as bbox_min + (stored_delta * scale_for_encoding).
-    float bbox_min_lat = 0.0f;
-    float bbox_min_lng = 0.0f;
 };
-static_assert(sizeof(AdminPolygon) == 32, "AdminPolygon must be 32 bytes");
+static_assert(sizeof(AdminPolygon) == 24, "AdminPolygon must be 24 bytes");
 
 struct NodeCoord {
     float lat;
@@ -908,16 +912,13 @@ struct PoiRecord {
     // cross-border landmark that happens to be spatially nearest).
     // NO_DATA (0xFFFFFFFF) if no containing admin polygon found.
     uint32_t parent_poly_id = 0xFFFFFFFF;
-    // VertexEncoding tag (default F32 for point POIs / legacy data).
-    // Builder picks the finest scale that fits the polygon's bbox.
-    // vertex_offset is a BYTE offset into poi_vertices.bin when
-    // encoding != F32 (variable per-vertex stride).
-    uint8_t encoding = 4;
-    uint8_t _pad_enc1 = 0, _pad_enc2 = 0, _pad_enc3 = 0;
-    float bbox_min_lat = 0.0f;
-    float bbox_min_lng = 0.0f;
+    // For polygon POIs (vertex_count > 0), vertex_offset is a BYTE
+    // offset into poi_vertices.bin pointing to a 10-byte polygon
+    // header (encoding tag + bbox_min_lat/lng) followed by the
+    // packed vertex bytes.  Point POIs have vertex_count = 0 and
+    // vertex_offset = NO_DATA; no header is written for them.
 };
-static_assert(sizeof(PoiRecord) == 48, "PoiRecord must be 48 bytes");
+static_assert(sizeof(PoiRecord) == 36, "PoiRecord must be 36 bytes");
 
 // Collected POI relation data for parallel polygon assembly
 struct CollectedPoiRelation {
