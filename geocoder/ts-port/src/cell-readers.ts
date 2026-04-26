@@ -13,6 +13,8 @@
 //     three offsets (street/addr/interp) per cell. Not used in the
 //     admin-only port but the binary search machinery is shared.
 
+import { ByteSource } from "./byte-source.js";
+
 // admin_cells.bin stride: u64 cell_id + u32 entries_offset, no padding.
 // Matches builder/src/cell_index.cpp:174-180.
 const ADMIN_CELL_RECORD_SIZE = 12;
@@ -43,18 +45,26 @@ export function lookupAdminCell(cellsBuf: Buffer, cellId: bigint): number {
 // Iterate IDs in an entries blob starting at the given offset.
 // Mirrors Rust's for_each_entry: u16 count, then count u32 IDs.
 // Caller's callback receives the raw u32 (high bit may be INTERIOR_FLAG).
+//
+// Accepts either Buffer or ByteSource so it works on chunked sources
+// (planet street_entries / addr_entries / interp_entries are >600 MiB
+// each — they'd be loaded as ChunkedFile via index-loader).  For
+// ByteSource we batch-read the entries into a single buffer copy first
+// so we don't pay a syscall per ID.
 export function forEachEntry(
-  entriesBuf: Buffer,
+  entriesBuf: ByteSource,
   offset: number,
   cb: (id: number) => void,
 ): void {
   if (offset === 0xFFFFFFFF) return;
   if (offset + 2 > entriesBuf.length) return;
   const count = entriesBuf.readUInt16LE(offset);
-  let p = offset + 2;
+  if (count === 0) return;
+  // Batch read: pull the full ID list once.  ChunkedFile.subarray()
+  // returns a contiguous Buffer; Buffer.subarray() is zero-copy.
+  const blob = entriesBuf.subarray(offset + 2, offset + 2 + count * 4);
+  if (blob.length < count * 4) return;
   for (let i = 0; i < count; i++) {
-    if (p + 4 > entriesBuf.length) return;
-    cb(entriesBuf.readUInt32LE(p));
-    p += 4;
+    cb(blob.readUInt32LE(i * 4));
   }
 }

@@ -3,10 +3,11 @@
 
 import { pointInPolygon, pointToSegmentDistance } from "./geometry.js";
 import { NODE_COORD_SIZE } from "./types.js";
+import { ByteSource } from "./byte-source.js";
 
 export function polygonDistanceSq(
   lat: number, lng: number,
-  vertsBuf: Buffer, vertOffsetBytes: number, vertCount: number,
+  vertsBuf: ByteSource, vertOffsetBytes: number, vertCount: number,
   cosLat: number,
 ): number {
   if (vertCount < 3) return Infinity;

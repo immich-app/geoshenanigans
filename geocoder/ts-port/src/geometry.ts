@@ -9,6 +9,7 @@
 // readers index in-place to avoid allocation per record.
 
 import { NODE_COORD_SIZE } from "./types.js";
+import { ByteSource } from "./byte-source.js";
 
 // Ray-casting PIP. Vertices form a closed ring (first == last is fine
 // but not required by the algorithm itself; our builder emits closed rings).
@@ -16,7 +17,7 @@ import { NODE_COORD_SIZE } from "./types.js";
 export function pointInPolygon(
   lat: number,
   lng: number,
-  vertsBuf: Buffer,
+  vertsBuf: ByteSource,
   vertOffsetBytes: number,
   vertCount: number,
 ): boolean {

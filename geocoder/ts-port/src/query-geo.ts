@@ -21,6 +21,7 @@ import {
   DEFAULT_STREET_CELL_LEVEL,
 } from "./types.js";
 import { polygonDistanceSq } from "./polygon-distance.js";
+import { ByteSource } from "./byte-source.js";
 
 const DEG_TO_RAD = Math.PI / 180;
 const GEO_CELL_RECORD_SIZE = 20; // u64 cell + u32 street + u32 addr + u32 interp
@@ -31,7 +32,7 @@ interface GeoCellOffsets {
   interp: number;
 }
 
-function lookupGeoCell(buf: Buffer, target: bigint): GeoCellOffsets {
+function lookupGeoCell(buf: ByteSource, target: bigint): GeoCellOffsets {
   const n = Math.floor(buf.length / GEO_CELL_RECORD_SIZE);
   let lo = 0, hi = n;
   while (lo < hi) {
@@ -82,16 +83,16 @@ export interface QueryGeoResult {
 export function queryGeo(
   lat: number,
   lng: number,
-  geoCells: Buffer,
-  streetEntries: Buffer | null,
-  streetWays: Buffer | null,
-  streetNodes: Buffer | null,
-  addrEntries: Buffer | null,
-  addrPoints: Buffer | null,
-  addrVertices: Buffer | null,
-  interpEntries: Buffer | null,
-  interpWays: Buffer | null,
-  interpNodes: Buffer | null,
+  geoCells: ByteSource,
+  streetEntries: ByteSource | null,
+  streetWays: ByteSource | null,
+  streetNodes: ByteSource | null,
+  addrEntries: ByteSource | null,
+  addrPoints: ByteSource | null,
+  addrVertices: ByteSource | null,
+  interpEntries: ByteSource | null,
+  interpWays: ByteSource | null,
+  interpNodes: ByteSource | null,
   cellLevel: number = DEFAULT_STREET_CELL_LEVEL,
 ): QueryGeoResult {
   const ll = S2LatLng.fromDegrees(lat, lng);
@@ -275,9 +276,9 @@ export function findAddrOnWay(
   lng: number,
   parentWayIdx: number,
   maxDistSq: number,
-  geoCells: Buffer,
-  addrEntries: Buffer,
-  addrPoints: Buffer,
+  geoCells: ByteSource,
+  addrEntries: ByteSource,
+  addrPoints: ByteSource,
   cellLevel: number = DEFAULT_STREET_CELL_LEVEL,
 ): AddrCandidate | null {
   const ll = S2LatLng.fromDegrees(lat, lng);
