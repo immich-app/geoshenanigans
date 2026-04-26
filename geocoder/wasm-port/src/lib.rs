@@ -22,20 +22,60 @@ pub struct Geocoder {
     index: Index,
 }
 
-fn take_required(obj: &js_sys::Object, key: &str) -> Result<Vec<u8>, JsValue> {
+fn take_required(obj: &js_sys::Object, key: &str) -> Result<FileBytes, JsValue> {
     let v = js_sys::Reflect::get(obj, &JsValue::from_str(key))?;
     if v.is_undefined() || v.is_null() {
         return Err(JsValue::from_str(&format!("missing required buffer: {}", key)));
     }
-    Ok(js_sys::Uint8Array::from(v).to_vec())
+    Ok(FileBytes::Owned(js_sys::Uint8Array::from(v).to_vec()))
 }
 
-fn take_optional(obj: &js_sys::Object, key: &str) -> Option<Vec<u8>> {
+fn take_optional(obj: &js_sys::Object, key: &str) -> Option<FileBytes> {
     let v = js_sys::Reflect::get(obj, &JsValue::from_str(key)).ok()?;
     if v.is_undefined() || v.is_null() {
         return None;
     }
-    Some(js_sys::Uint8Array::from(v).to_vec())
+    Some(FileBytes::Owned(js_sys::Uint8Array::from(v).to_vec()))
+}
+
+/// Pull a chunked-byte-source descriptor for a given key.  The JS
+/// caller provides `<key>_chunked: { handle: number, len: number }`
+/// when the file is too large for in-linear-memory loading.  Returns
+/// None if the key is absent.  Requires a global `js_read` callback
+/// previously installed via `set_js_read`.
+fn take_chunked(obj: &js_sys::Object, key: &str) -> Option<FileBytes> {
+    let chunked_key = format!("{}_chunked", key);
+    let v = js_sys::Reflect::get(obj, &JsValue::from_str(&chunked_key)).ok()?;
+    if v.is_undefined() || v.is_null() { return None; }
+    let desc = js_sys::Object::from(v);
+    let handle = js_sys::Reflect::get(&desc, &JsValue::from_str("handle")).ok()?
+        .as_f64()?;
+    let len = js_sys::Reflect::get(&desc, &JsValue::from_str("len")).ok()?
+        .as_f64()? as usize;
+    let js_read = JS_READ.with(|r| r.borrow().clone())
+        .expect("set_js_read must be called before constructing a chunked-backed Geocoder");
+    Some(FileBytes::JsChunked(query_server::wasm_chunked::JsChunked::new(js_read, handle, len)))
+}
+
+/// Either an Owned buffer or a JsChunked source — caller may pass
+/// whichever fits.  Owned is preferred when the file is small enough
+/// to copy into wasm linear memory; JsChunked is required for files
+/// larger than ~2-3 GiB total.
+fn take_either(obj: &js_sys::Object, key: &str) -> Option<FileBytes> {
+    take_optional(obj, key).or_else(|| take_chunked(obj, key))
+}
+
+thread_local! {
+    static JS_READ: std::cell::RefCell<Option<js_sys::Function>> = std::cell::RefCell::new(None);
+}
+
+/// Install the JS read callback used by JsChunked-backed sources.
+/// Signature: `(handle: number, off: number, len: number) -> Uint8Array`.
+/// Must be called before constructing a Geocoder that uses any
+/// `*_chunked` buffer descriptors.
+#[wasm_bindgen]
+pub fn set_js_read(f: js_sys::Function) {
+    JS_READ.with(|r| *r.borrow_mut() = Some(f));
 }
 
 fn take_string(obj: &js_sys::Object, key: &str) -> Result<String, JsValue> {
@@ -44,7 +84,7 @@ fn take_string(obj: &js_sys::Object, key: &str) -> Result<String, JsValue> {
         .ok_or_else(|| JsValue::from_str(&format!("expected string: {}", key)))
 }
 
-fn parse_strings_layout(json: &str, tiers: [Option<Vec<u8>>; STR_TIER_COUNT]) -> Result<StringPool, String> {
+fn parse_strings_layout(json: &str, tiers: [Option<FileBytes>; STR_TIER_COUNT]) -> Result<StringPool, String> {
     let v: serde_json::Value = serde_json::from_str(json)
         .map_err(|e| format!("strings_layout parse: {}", e))?;
     let entries = v.get("tiers").and_then(|t| t.as_array())
@@ -60,9 +100,7 @@ fn parse_strings_layout(json: &str, tiers: [Option<Vec<u8>>; STR_TIER_COUNT]) ->
     if tiers[0].is_none() {
         return Err("strings_core (tier 0) is required".into());
     }
-    // FileBytes IS Vec<u8> on wasm32, so we can pass tiers through.
-    let tiers_typed: [Option<FileBytes>; STR_TIER_COUNT] = tiers;
-    Ok(StringPool::from_parts(tiers_typed, bases))
+    Ok(StringPool::from_parts(tiers, bases))
 }
 
 #[wasm_bindgen]
@@ -82,12 +120,12 @@ impl Geocoder {
         let admin_vertices = take_required(&obj, "admin_vertices")?;
         let strings_layout = take_string(&obj, "strings_layout")?;
 
-        let str_tiers: [Option<Vec<u8>>; STR_TIER_COUNT] = [
-            take_optional(&obj, "strings_core"),
-            take_optional(&obj, "strings_street"),
-            take_optional(&obj, "strings_addr"),
-            take_optional(&obj, "strings_postcode"),
-            take_optional(&obj, "strings_poi"),
+        let str_tiers: [Option<FileBytes>; STR_TIER_COUNT] = [
+            take_either(&obj, "strings_core"),
+            take_either(&obj, "strings_street"),
+            take_either(&obj, "strings_addr"),
+            take_either(&obj, "strings_postcode"),
+            take_either(&obj, "strings_poi"),
         ];
         let strings = parse_strings_layout(&strings_layout, str_tiers)
             .map_err(|e| JsValue::from_str(&e))?;
@@ -101,33 +139,33 @@ impl Geocoder {
         let index = Index::from_buffers(
             admin_cells, admin_entries, admin_polygons, admin_vertices,
             strings,
-            take_optional(&obj, "place_nodes"),
-            take_optional(&obj, "place_cells"),
-            take_optional(&obj, "place_entries"),
-            take_optional(&obj, "postcode_centroids"),
-            take_optional(&obj, "postcode_centroid_cells"),
-            take_optional(&obj, "postcode_centroid_entries"),
-            take_optional(&obj, "poi_records"),
-            take_optional(&obj, "poi_vertices"),
-            take_optional(&obj, "poi_cells"),
-            take_optional(&obj, "poi_entries"),
+            take_either(&obj, "place_nodes"),
+            take_either(&obj, "place_cells"),
+            take_either(&obj, "place_entries"),
+            take_either(&obj, "postcode_centroids"),
+            take_either(&obj, "postcode_centroid_cells"),
+            take_either(&obj, "postcode_centroid_entries"),
+            take_either(&obj, "poi_records"),
+            take_either(&obj, "poi_vertices"),
+            take_either(&obj, "poi_cells"),
+            take_either(&obj, "poi_entries"),
             poi_meta,
-            take_optional(&obj, "geo_cells"),
-            take_optional(&obj, "street_ways"),
-            take_optional(&obj, "street_nodes"),
-            take_optional(&obj, "street_entries"),
-            take_optional(&obj, "addr_points"),
-            take_optional(&obj, "addr_vertices"),
-            take_optional(&obj, "addr_entries"),
-            take_optional(&obj, "interp_ways"),
-            take_optional(&obj, "interp_nodes"),
-            take_optional(&obj, "interp_entries"),
-            take_optional(&obj, "way_postcodes"),
-            take_optional(&obj, "addr_postcodes"),
-            take_optional(&obj, "admin_parents"),
-            take_optional(&obj, "way_parents"),
-            take_optional(&obj, "postal_polygons"),
-            take_optional(&obj, "postal_vertices"),
+            take_either(&obj, "geo_cells"),
+            take_either(&obj, "street_ways"),
+            take_either(&obj, "street_nodes"),
+            take_either(&obj, "street_entries"),
+            take_either(&obj, "addr_points"),
+            take_either(&obj, "addr_vertices"),
+            take_either(&obj, "addr_entries"),
+            take_either(&obj, "interp_ways"),
+            take_either(&obj, "interp_nodes"),
+            take_either(&obj, "interp_entries"),
+            take_either(&obj, "way_postcodes"),
+            take_either(&obj, "addr_postcodes"),
+            take_either(&obj, "admin_parents"),
+            take_either(&obj, "way_parents"),
+            take_either(&obj, "postal_polygons"),
+            take_either(&obj, "postal_vertices"),
             DEFAULT_STREET_CELL_LEVEL,
             DEFAULT_ADMIN_CELL_LEVEL,
             DEFAULT_SEARCH_DISTANCE,

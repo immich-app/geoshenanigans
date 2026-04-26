@@ -8,19 +8,103 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-// Byte-source abstraction. Native uses memmap2 for zero-copy lazy
-// page-faulting (handles >4 GiB files). Wasm32 has no mmap and a 4 GiB
-// linear-memory cap, so it owns the bytes as Vec<u8>; callers (JS)
-// must keep total file size below ~3 GiB to fit.
-#[cfg(not(target_arch = "wasm32"))]
-pub type FileBytes = memmap2::Mmap;
-#[cfg(target_arch = "wasm32")]
-pub type FileBytes = Vec<u8>;
+// Byte-source abstraction.  Two access patterns:
+//
+//   1. Small files (<4 GiB): the whole file is resident in process
+//      memory.  `as_slice()` returns the full contiguous bytes, and the
+//      typed-slice patterns (`from_raw_parts(buf.as_ptr() as *const T,
+//      ...)`) work directly on it.  Used for admin/place/poi/postcode
+//      tier files everywhere, and for large files on native (mmap is
+//      contiguous in process address space regardless of file size).
+//
+//   2. Large files (>4 GiB) on wasm32: can't fit in linear memory.
+//      Use `read_chunk(off, len)` to fetch only the bytes you need via
+//      a JS callback.  The chunked API works on any backing store, so
+//      methods written against it run on native + wasm uniformly.
+//
+// Index methods that touch >4 GiB files (query_geo, find_addr_on_way)
+// MUST use read_chunk.  Methods that don't (find_admin, find_pois,
+// find_places, resolve_postcode for centroids) can keep the
+// typed-slice pattern via as_slice().
 
 #[cfg(not(target_arch = "wasm32"))]
 use memmap2::Mmap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs::File;
+
+/// Backing storage for an indexed file.  All variants implement
+/// `as_slice()` for full-file access (zero-copy on Mmap/Bytes), and
+/// `read_chunk(off, len)` for windowed access (zero-copy on Mmap/Bytes,
+/// allocating on JsChunked).  The JsChunked variant is wasm-only and
+/// supports files larger than wasm's 4 GiB linear memory cap.
+pub enum FileBytes {
+    /// Owned bytes resident in process memory.  Used for small files
+    /// on wasm and for any test data.
+    Owned(Vec<u8>),
+    /// Memory-mapped file.  Native only.  Zero-copy lazy page-faulting
+    /// from the OS page cache; works for files of any size.
+    #[cfg(not(target_arch = "wasm32"))]
+    Mmap(Mmap),
+    /// Wasm-only chunked access via a JS callback.  Each `read_chunk`
+    /// call invokes the JS function `read(file_handle, off, len) →
+    /// Uint8Array`.  An internal page cache reduces JS round-trips
+    /// for hot pages.  Used for files >4 GiB on wasm.
+    #[cfg(target_arch = "wasm32")]
+    JsChunked(crate::wasm_chunked::JsChunked),
+}
+
+impl FileBytes {
+    /// Total file length in bytes.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Owned(v) => v.len(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Mmap(m) => m.len(),
+            #[cfg(target_arch = "wasm32")]
+            Self::JsChunked(j) => j.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
+
+    /// Full-file slice access.  Cheap for Owned and Mmap.  Panics for
+    /// JsChunked since the file isn't resident — only chunked access is
+    /// available.  Callers operating on potentially-chunked files
+    /// should use `read_chunk` instead.
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Owned(v) => v,
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Mmap(m) => m,
+            #[cfg(target_arch = "wasm32")]
+            Self::JsChunked(_) => panic!("FileBytes::as_slice on JsChunked — use read_chunk for chunked sources"),
+        }
+    }
+
+    /// Read `len` bytes starting at `off`.  Returns `Cow::Borrowed` for
+    /// Owned/Mmap (zero-copy slice), `Cow::Owned` for JsChunked
+    /// (allocates from the chunk cache).  All Index methods that may
+    /// run against a chunked source use this.
+    pub fn read_chunk(&self, off: usize, len: usize) -> std::borrow::Cow<'_, [u8]> {
+        match self {
+            Self::Owned(v) => std::borrow::Cow::Borrowed(&v[off..off + len]),
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Mmap(m) => std::borrow::Cow::Borrowed(&m[off..off + len]),
+            #[cfg(target_arch = "wasm32")]
+            Self::JsChunked(j) => std::borrow::Cow::Owned(j.read(off, len)),
+        }
+    }
+}
+
+// Allow `&self.field[off..end]` indexing on Owned/Mmap-backed sources.
+// Panics on JsChunked — call read_chunk instead.
+impl std::ops::Deref for FileBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] { self.as_slice() }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub mod wasm_chunked;
 
 // --- S2 helpers ---
 
@@ -553,15 +637,16 @@ pub struct GeoCellOffsets {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub fn mmap_file(path: &str) -> Result<Mmap, String> {
+pub fn mmap_file(path: &str) -> Result<FileBytes, String> {
     let file = File::open(path).map_err(|e| format!("Failed to open {}: {}", path, e))?;
-    unsafe { Mmap::map(&file).map_err(|e| format!("Failed to mmap {}: {}", path, e)) }
+    let mmap = unsafe { Mmap::map(&file).map_err(|e| format!("Failed to mmap {}: {}", path, e))? };
+    Ok(FileBytes::Mmap(mmap))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub fn mmap_file_optional(path: &str) -> Option<Mmap> {
+pub fn mmap_file_optional(path: &str) -> Option<FileBytes> {
     let file = File::open(path).ok()?;
-    unsafe { Mmap::map(&file).ok() }
+    unsafe { Mmap::map(&file).ok() }.map(FileBytes::Mmap)
 }
 
 impl Index {
@@ -577,7 +662,7 @@ impl Index {
         let geo_cells = mmap_file_optional(&format!("{}/geo_cells.bin", dir));
         let has_geo = geo_cells.is_some();
 
-        let required_geo = |name: &str| -> Result<Option<Mmap>, String> {
+        let required_geo = |name: &str| -> Result<Option<FileBytes>, String> {
             let path = format!("{}/{}", dir, name);
             let mmap = mmap_file_optional(&path);
             if has_geo && mmap.is_none() {
