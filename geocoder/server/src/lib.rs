@@ -118,6 +118,53 @@ impl FileBytes {
         // source slice alignment.
         unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const T) }
     }
+
+    /// Read `count` consecutive records of type T starting at record-
+    /// index `idx`.  Borrowed for Owned/Mmap (zero-copy slice view),
+    /// owned Vec<T> for JsChunked.  Used to materialize a `&[T]` slice
+    /// over a polygon's vertices, a place-node array slice, etc. so
+    /// callers can iterate without manual transmutes per call site.
+    pub fn read_records<T: Copy>(&self, idx: u64, count: usize) -> std::borrow::Cow<'_, [T]> {
+        let size = std::mem::size_of::<T>();
+        let off = idx * size as u64;
+        let total = count * size;
+        match self {
+            Self::Owned(v) => {
+                let ob = off as usize;
+                let bytes = &v[ob..ob + total];
+                std::borrow::Cow::Borrowed(unsafe {
+                    std::slice::from_raw_parts(bytes.as_ptr() as *const T, count)
+                })
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Mmap(m) => {
+                let ob = off as usize;
+                let bytes = &m[ob..ob + total];
+                std::borrow::Cow::Borrowed(unsafe {
+                    std::slice::from_raw_parts(bytes.as_ptr() as *const T, count)
+                })
+            }
+            #[cfg(target_arch = "wasm32")]
+            Self::JsChunked(j) => {
+                let bytes = j.read(off, total);
+                let mut out = Vec::<T>::with_capacity(count);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr() as *const T,
+                        out.as_mut_ptr(),
+                        count,
+                    );
+                    out.set_len(count);
+                }
+                std::borrow::Cow::Owned(out)
+            }
+        }
+    }
+
+    /// Number of records of type T this file holds.
+    pub fn record_count<T>(&self) -> usize {
+        (self.len() as usize) / std::mem::size_of::<T>()
+    }
 }
 
 // Allow `&self.field[off..end]` indexing on Owned/Mmap-backed sources.
@@ -808,6 +855,27 @@ impl Index {
         self.strings.get(offset)
     }
 
+    /// Materialize a polygon's vertex slice from `admin_vertices` —
+    /// borrowed for native (Mmap/Owned), owned Vec for JsChunked.
+    /// Returns None if the offset/count would overrun the file (defends
+    /// against corrupted indices; valid data should never trip this).
+    pub fn admin_verts(&self, offset: u32, count: u32) -> Option<std::borrow::Cow<'_, [NodeCoord]>> {
+        if count == 0 || offset == NO_DATA { return None; }
+        let total = self.admin_vertices.len() / std::mem::size_of::<NodeCoord>() as u64;
+        if offset as u64 + count as u64 > total { return None; }
+        Some(self.admin_vertices.read_records::<NodeCoord>(offset as u64, count as usize))
+    }
+
+    /// Same shape as `admin_verts` but for `poi_vertices`, which is an
+    /// optional file (returns None when not loaded).
+    pub fn poi_verts(&self, offset: u32, count: u32) -> Option<std::borrow::Cow<'_, [NodeCoord]>> {
+        if count == 0 || offset == NO_DATA { return None; }
+        let v = self.poi_vertices.as_ref()?;
+        let total = v.len() / std::mem::size_of::<NodeCoord>() as u64;
+        if offset as u64 + count as u64 > total { return None; }
+        Some(v.read_records::<NodeCoord>(offset as u64, count as usize))
+    }
+
     pub fn read_u16(data: &[u8], offset: usize) -> u16 {
         u16::from_le_bytes([data[offset], data[offset + 1]])
     }
@@ -1292,12 +1360,6 @@ impl Index {
                 self.admin_polygons.len() as usize / std::mem::size_of::<AdminPolygon>(),
             )
         };
-        let all_vertices: &[NodeCoord] = unsafe {
-            std::slice::from_raw_parts(
-                self.admin_vertices.as_ptr() as *const NodeCoord,
-                self.admin_vertices.len() as usize / std::mem::size_of::<NodeCoord>(),
-            )
-        };
 
         const INTERIOR_FLAG: u32 = 0x80000000;
         const ID_MASK: u32 = 0x7FFFFFFF;
@@ -1316,11 +1378,8 @@ impl Index {
                 if level >= 12 { return; }
                 if poly.area <= 0.0 { return; }
 
-                let offset = poly.vertex_offset as usize;
-                let count = poly.vertex_count as usize;
-                if offset + count > all_vertices.len() { return; }
-                let verts = &all_vertices[offset..offset + count];
-                let pip = point_in_polygon(lat as f32, lng as f32, verts);
+                let Some(verts) = self.admin_verts(poly.vertex_offset, poly.vertex_count) else { return; };
+                let pip = point_in_polygon(lat as f32, lng as f32, &verts);
 
                 seen_in_level[level].push(serde_json::json!({
                     "name": self.get_string(poly.name_id),
@@ -1371,12 +1430,6 @@ impl Index {
                 self.admin_polygons.len() as usize / std::mem::size_of::<AdminPolygon>(),
             )
         };
-        let all_vertices: &[NodeCoord] = unsafe {
-            std::slice::from_raw_parts(
-                self.admin_vertices.as_ptr() as *const NodeCoord,
-                self.admin_vertices.len() as usize / std::mem::size_of::<NodeCoord>(),
-            )
-        };
 
         // For each admin level, find the smallest-area polygon actually containing
         // the point. Interior flags are used as a fast path for uncontested cells,
@@ -1406,10 +1459,7 @@ impl Index {
                 if level >= 12 { return; }
                 if poly.area <= 0.0 { return; }
 
-                let offset = poly.vertex_offset as usize;
-                let count = poly.vertex_count as usize;
-                if offset + count > all_vertices.len() { return; }
-                let verts = &all_vertices[offset..offset + count];
+                let Some(verts) = self.admin_verts(poly.vertex_offset, poly.vertex_count) else { return; };
 
                 if let Some((best_area, _, best_verified)) = best_by_level[level] {
                     if poly.area >= best_area {
@@ -1418,13 +1468,13 @@ impl Index {
                         if !best_verified {
                             // Current best only passed via interior flag — verify it now
                             let (_, best_poly, _) = best_by_level[level].unwrap();
-                            let boff = best_poly.vertex_offset as usize;
-                            let bcnt = best_poly.vertex_count as usize;
-                            if point_in_polygon(lat as f32, lng as f32, &all_vertices[boff..boff + bcnt]) {
+                            let bverts = self.admin_verts(best_poly.vertex_offset, best_poly.vertex_count);
+                            let best_inside = bverts.as_deref().map(|b| point_in_polygon(lat as f32, lng as f32, b)).unwrap_or(false);
+                            if best_inside {
                                 best_by_level[level] = Some((best_area, best_poly, true));
                             } else {
                                 // Best was wrong — try this polygon instead
-                                let pip = point_in_polygon(lat as f32, lng as f32, verts);
+                                let pip = point_in_polygon(lat as f32, lng as f32, &verts);
                                 if is_interior || pip {
                                     best_by_level[level] = Some((poly.area, poly, pip));
                                 } else {
@@ -1435,7 +1485,7 @@ impl Index {
                         return;
                     }
                     // This polygon is smaller — must verify with PIP
-                    let pip = point_in_polygon(lat as f32, lng as f32, verts);
+                    let pip = point_in_polygon(lat as f32, lng as f32, &verts);
                     if pip {
                         best_by_level[level] = Some((poly.area, poly, true));
                     }
@@ -1444,7 +1494,7 @@ impl Index {
                     // No existing candidate — accept with interior flag, verify later if contested
                     if is_interior {
                         best_by_level[level] = Some((poly.area, poly, false));
-                    } else if point_in_polygon(lat as f32, lng as f32, verts) {
+                    } else if point_in_polygon(lat as f32, lng as f32, &verts) {
                         best_by_level[level] = Some((poly.area, poly, true));
                     }
                 }
@@ -1454,9 +1504,10 @@ impl Index {
         // Verify any uncontested winners that only passed via interior flag
         for level in 0..12 {
             if let Some((area, poly, false)) = best_by_level[level] {
-                let offset = poly.vertex_offset as usize;
-                let count = poly.vertex_count as usize;
-                if point_in_polygon(lat as f32, lng as f32, &all_vertices[offset..offset + count]) {
+                let inside = self.admin_verts(poly.vertex_offset, poly.vertex_count)
+                    .map(|v| point_in_polygon(lat as f32, lng as f32, &v))
+                    .unwrap_or(false);
+                if inside {
                     best_by_level[level] = Some((area, poly, true));
                 } else {
                     best_by_level[level] = None;
@@ -1477,11 +1528,8 @@ impl Index {
                 let poly = &all_polygons[poly_id];
                 if poly.admin_level != 15 { return; }
                 if poly.area <= 0.0 { return; }
-                let offset = poly.vertex_offset as usize;
-                let count = poly.vertex_count as usize;
-                if offset + count > all_vertices.len() { return; }
-                let verts = &all_vertices[offset..offset + count];
-                if !point_in_polygon(lat as f32, lng as f32, verts) { return; }
+                let Some(verts) = self.admin_verts(poly.vertex_offset, poly.vertex_count) else { return; };
+                if !point_in_polygon(lat as f32, lng as f32, &verts) { return; }
                 if !place_area_polygons.iter().any(|p| std::ptr::eq(*p, poly)) {
                     place_area_polygons.push(poly);
                 }
@@ -1801,12 +1849,6 @@ impl Index {
                 self.admin_polygons.len() as usize / std::mem::size_of::<AdminPolygon>(),
             )
         };
-        let all_vertices: &[NodeCoord] = unsafe {
-            std::slice::from_raw_parts(
-                self.admin_vertices.as_ptr() as *const NodeCoord,
-                self.admin_vertices.len() as usize / std::mem::size_of::<NodeCoord>(),
-            )
-        };
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
 
@@ -1824,11 +1866,8 @@ impl Index {
                 // updated for rank_address != 11 AND rank_address != 5
                 if poly.admin_level < 8 || poly.admin_level > 10 { return; }
                 if poly.area >= best_area { return; }
-                let offset = poly.vertex_offset as usize;
-                let count = poly.vertex_count as usize;
-                if offset + count > all_vertices.len() { return; }
-                let verts = &all_vertices[offset..offset + count];
-                if point_in_polygon(lat as f32, lng as f32, verts) {
+                let Some(verts) = self.admin_verts(poly.vertex_offset, poly.vertex_count) else { return; };
+                if point_in_polygon(lat as f32, lng as f32, &verts) {
                     best_area = poly.area;
                     best = Some(poly);
                 }
@@ -1861,12 +1900,6 @@ impl Index {
                 self.admin_polygons.len() as usize / std::mem::size_of::<AdminPolygon>(),
             )
         };
-        let all_vertices: &[NodeCoord] = unsafe {
-            std::slice::from_raw_parts(
-                self.admin_vertices.as_ptr() as *const NodeCoord,
-                self.admin_vertices.len() as usize / std::mem::size_of::<NodeCoord>(),
-            )
-        };
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
 
@@ -1881,11 +1914,8 @@ impl Index {
                 let poly = &all_polygons[poly_id];
                 if poly.admin_level < 7 || poly.admin_level > 8 { return; }
                 if poly.area >= best_area { return; }
-                let offset = poly.vertex_offset as usize;
-                let count = poly.vertex_count as usize;
-                if offset + count > all_vertices.len() { return; }
-                let verts = &all_vertices[offset..offset + count];
-                if point_in_polygon(lat as f32, lng as f32, verts) {
+                let Some(verts) = self.admin_verts(poly.vertex_offset, poly.vertex_count) else { return; };
+                if point_in_polygon(lat as f32, lng as f32, &verts) {
                     best_area = poly.area;
                     best = Some(poly);
                 }
@@ -1974,22 +2004,13 @@ impl Index {
         // against `current_boundary` (the smallest accepted admin
         // polygon from find_admin). This is the correct Nominatim
         // check: the NODE must be inside the boundary, not the query.
-        let all_vertices: &[NodeCoord] = unsafe {
-            std::slice::from_raw_parts(
-                self.admin_vertices.as_ptr() as *const NodeCoord,
-                self.admin_vertices.len() as usize / std::mem::size_of::<NodeCoord>(),
-            )
-        };
         let node_inside_boundary = |pn: &PlaceNode| -> bool {
             match current_boundary {
                 None => true, // no admin boundary found — accept all
                 Some(poly) => {
-                    let off = poly.vertex_offset as usize;
-                    let cnt = poly.vertex_count as usize;
-                    if off + cnt > all_vertices.len() { return true; }
-                    let verts = &all_vertices[off..off + cnt];
+                    let Some(verts) = self.admin_verts(poly.vertex_offset, poly.vertex_count) else { return true; };
                     // PIP test the PLACE NODE's centroid, not the query point
-                    point_in_polygon(pn.lat, pn.lng, verts)
+                    point_in_polygon(pn.lat, pn.lng, &verts)
                 }
             }
         };
@@ -2004,11 +2025,8 @@ impl Index {
             match municipality_boundary {
                 None => true,
                 Some(poly) => {
-                    let off = poly.vertex_offset as usize;
-                    let cnt = poly.vertex_count as usize;
-                    if off + cnt > all_vertices.len() { return true; }
-                    let verts = &all_vertices[off..off + cnt];
-                    point_in_polygon(pn.lat, pn.lng, verts)
+                    let Some(verts) = self.admin_verts(poly.vertex_offset, poly.vertex_count) else { return true; };
+                    point_in_polygon(pn.lat, pn.lng, &verts)
                 }
             }
         };
@@ -2171,17 +2189,8 @@ impl Index {
         let pid = poi.parent_poly_id as usize;
         if pid >= all_polygons.len() { return true; }
         let poly = &all_polygons[pid];
-        let all_vertices: &[NodeCoord] = unsafe {
-            std::slice::from_raw_parts(
-                self.admin_vertices.as_ptr() as *const NodeCoord,
-                self.admin_vertices.len() as usize / std::mem::size_of::<NodeCoord>(),
-            )
-        };
-        let off = poly.vertex_offset as usize;
-        let cnt = poly.vertex_count as usize;
-        if off + cnt > all_vertices.len() { return true; }
-        let verts = &all_vertices[off..off + cnt];
-        point_in_polygon(lat as f32, lng as f32, verts)
+        let Some(verts) = self.admin_verts(poly.vertex_offset, poly.vertex_count) else { return true; };
+        point_in_polygon(lat as f32, lng as f32, &verts)
     }
 
     // --- POI primary-feature lookup ---
@@ -2206,16 +2215,6 @@ impl Index {
                 poi_records_mmap.len() as usize / std::mem::size_of::<PoiRecord>(),
             )
         };
-        let all_poi_vertices: &[NodeCoord] = match &self.poi_vertices {
-            Some(v) => unsafe {
-                std::slice::from_raw_parts(
-                    v.as_ptr() as *const NodeCoord,
-                    v.len() as usize / std::mem::size_of::<NodeCoord>(),
-                )
-            },
-            None => &[],
-        };
-
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
 
@@ -2265,12 +2264,10 @@ impl Index {
                 // otherwise min distance to any edge; for point POIs,
                 // direct point-to-point distance.
                 let dist_sq_val;
-                if poi.vertex_count > 0 && (poi.vertex_offset as usize) < all_poi_vertices.len() {
-                    let offset = poi.vertex_offset as usize;
-                    let count = poi.vertex_count as usize;
-                    if offset + count > all_poi_vertices.len() { return; }
-                    let verts = &all_poi_vertices[offset..offset + count];
-                    if is_interior || point_in_polygon(lat as f32, lng as f32, verts) {
+                if poi.vertex_count > 0 && poi.vertex_offset != NO_DATA {
+                    let Some(verts) = self.poi_verts(poi.vertex_offset, poi.vertex_count) else { return; };
+                    let count = verts.len();
+                    if is_interior || point_in_polygon(lat as f32, lng as f32, &verts) {
                         dist_sq_val = 0.0;
                     } else {
                         let mut mind = f64::MAX;
@@ -2347,16 +2344,6 @@ impl Index {
                 poi_records_mmap.len() as usize / std::mem::size_of::<PoiRecord>(),
             )
         };
-        let all_poi_vertices: &[NodeCoord] = match &self.poi_vertices {
-            Some(v) => unsafe {
-                std::slice::from_raw_parts(
-                    v.as_ptr() as *const NodeCoord,
-                    v.len() as usize / std::mem::size_of::<NodeCoord>(),
-                )
-            },
-            None => &[],
-        };
-
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
 
@@ -2395,11 +2382,10 @@ impl Index {
                 // area).
                 let mut area_sq_deg = 0.0_f64;
 
-                if poi.vertex_count > 0 && (poi.vertex_offset as usize) < all_poi_vertices.len() {
-                    let offset = poi.vertex_offset as usize;
-                    let count = poi.vertex_count as usize;
-                    let verts = &all_poi_vertices[offset..offset + count];
-                    contained = is_interior || point_in_polygon(lat as f32, lng as f32, verts);
+                if poi.vertex_count > 0 && poi.vertex_offset != NO_DATA {
+                    let Some(verts) = self.poi_verts(poi.vertex_offset, poi.vertex_count) else { return; };
+                    let count = verts.len();
+                    contained = is_interior || point_in_polygon(lat as f32, lng as f32, &verts);
 
                     if contained {
                         dist_m = 0.0;
@@ -2562,12 +2548,6 @@ impl Index {
         // Also collect class='place' polygons (admin_level=15) via
         // PIP from the query point — these aren't in the parent chain
         // but provide place-area rank promotions.
-        let all_vertices: &[NodeCoord] = unsafe {
-            std::slice::from_raw_parts(
-                self.admin_vertices.as_ptr() as *const NodeCoord,
-                self.admin_vertices.len() as usize / std::mem::size_of::<NodeCoord>(),
-            )
-        };
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
         let mut place_area_polygons: Vec<&AdminPolygon> = Vec::new();
@@ -2578,11 +2558,8 @@ impl Index {
                 let poly = &all_polygons[poly_id];
                 if poly.admin_level != 15 { return; }
                 if poly.area <= 0.0 { return; }
-                let offset = poly.vertex_offset as usize;
-                let count = poly.vertex_count as usize;
-                if offset + count > all_vertices.len() { return; }
-                let verts = &all_vertices[offset..offset + count];
-                if !point_in_polygon(lat as f32, lng as f32, verts) { return; }
+                let Some(verts) = self.admin_verts(poly.vertex_offset, poly.vertex_count) else { return; };
+                if !point_in_polygon(lat as f32, lng as f32, &verts) { return; }
                 place_area_polygons.push(poly);
             });
         }
@@ -3047,21 +3024,9 @@ impl Index {
                     effective_poi_dist = f64::MAX;
                 } else if addr_pt.vertex_count == 0 && poi.vertex_count > 0
                     && poi.vertex_offset != NO_DATA {
-                    let all_poi_vertices: &[NodeCoord] = match &self.poi_vertices {
-                        Some(v) => unsafe {
-                            std::slice::from_raw_parts(
-                                v.as_ptr() as *const NodeCoord,
-                                v.len() as usize / std::mem::size_of::<NodeCoord>(),
-                            )
-                        },
-                        None => &[],
-                    };
-                    let off = poi.vertex_offset as usize;
-                    let cnt = poi.vertex_count as usize;
                     let mut inside = false;
-                    if off + cnt <= all_poi_vertices.len() {
-                        let verts = &all_poi_vertices[off..off + cnt];
-                        inside = point_in_polygon(addr_pt.lat, addr_pt.lng, verts);
+                    if let Some(verts) = self.poi_verts(poi.vertex_offset, poi.vertex_count) {
+                        inside = point_in_polygon(addr_pt.lat, addr_pt.lng, &verts);
                     }
                     // Fallback proximity gate: POI polygons go through the
                     // continent-filter simplifier (reduced vertex count),

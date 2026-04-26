@@ -23,11 +23,12 @@ pub struct Geocoder {
 }
 
 fn take_required(obj: &js_sys::Object, key: &str) -> Result<FileBytes, JsValue> {
-    let v = js_sys::Reflect::get(obj, &JsValue::from_str(key))?;
-    if v.is_undefined() || v.is_null() {
-        return Err(JsValue::from_str(&format!("missing required buffer: {}", key)));
+    // Accept either an inline Uint8Array OR a {handle, len} chunked
+    // descriptor — required just means "must be present in some form".
+    if let Some(fb) = take_either(obj, key) {
+        return Ok(fb);
     }
-    Ok(FileBytes::Owned(js_sys::Uint8Array::from(v).to_vec()))
+    Err(JsValue::from_str(&format!("missing required buffer: {}", key)))
 }
 
 fn take_optional(obj: &js_sys::Object, key: &str) -> Option<FileBytes> {

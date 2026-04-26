@@ -21,7 +21,7 @@ export interface ByteSource {
 }
 
 const PAGE_SIZE = 64 * 1024;
-const MAX_PAGES = 4096; // 256 MiB cache cap, matches the wasm side
+const MAX_PAGES = 4096; // 256 MiB cache cap per file, matches the wasm side
 
 export class ChunkedFile implements ByteSource {
   private fd: number;
