@@ -1092,10 +1092,17 @@ int main(int argc, char* argv[]) {
     serialize_merge(patch, res_interp_n);
     { std::vector<char>().swap(res_interp_n.seq.data); }
     serialize_merge(patch, res_admin_p);
-    serialize_merge(patch, res_admin_v);
+    // admin_vertices.bin no longer fits the merge-sequence pattern
+    // since v15 (variable per-polygon stride + inline polygon header).
+    // Emit raw and let the patcher take the full new file.  Larger
+    // patches but always correct; can revisit with a format-aware
+    // diff later.
+    emit_raw(PatchFileId::ADMIN_VERTICES, "admin_vertices.bin");
     { std::vector<char>().swap(res_admin_v.seq.data); }
     serialize_merge(patch, res_poi_r);
-    serialize_merge(patch, res_poi_v);
+    // Same reasoning as admin_vertices — variable-stride v15 format
+    // is opaque to the merge-sequence walker.
+    emit_raw(PatchFileId::POI_VERTICES, "poi_vertices.bin");
     { std::vector<char>().swap(res_poi_v.seq.data); }
     serialize_merge(patch, res_place_n);
     malloc_trim(0); // return freed heap to OS
