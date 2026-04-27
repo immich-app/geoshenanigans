@@ -1,12 +1,34 @@
 services:
-  geocoder:
+  # Default test server — q2.5 admin polygons (most aggressive
+  # simplification, smallest disk footprint).  ~37 m boundary precision
+  # at L8, invisible at typical photo-GPS accuracy.
+  geocoder-q2.5:
     build:
       context: ..
       dockerfile: test-portal/Dockerfile
     ports:
       - "3000:3000"
+    environment:
+      QUALITY: q2.5
+      POI_TIER: all
     volumes:
-      - geocoder-data:/data
+      - geocoder-data-q2.5:/data
+
+  # Second test server — uncapped quality for comparison.  Identical
+  # data otherwise; only the admin_polygons.bin / admin_vertices.bin
+  # files differ (full resolution, ~280 MB larger on disk).
+  geocoder-uncapped:
+    build:
+      context: ..
+      dockerfile: test-portal/Dockerfile
+    ports:
+      - "3001:3000"
+    environment:
+      QUALITY: uncapped
+      POI_TIER: all
+    volumes:
+      - geocoder-data-uncapped:/data
 
 volumes:
-  geocoder-data:
+  geocoder-data-q2.5:
+  geocoder-data-uncapped:

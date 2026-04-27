@@ -14,7 +14,7 @@ RUN cargo build --release --manifest-path server/Cargo.toml
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates \
+    curl ca-certificates zstd \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/server/target/release/query-server /usr/local/bin/

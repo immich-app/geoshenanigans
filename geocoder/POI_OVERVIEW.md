@@ -93,15 +93,15 @@ A client picks: **region** + **mode** + **quality** + **POI tier** (all independ
 
 ### By Quality (planet, admin boundary resolution)
 
-| Quality | Size | Simplification |
-|---|---|---|
-| Uncapped | 2.7 GiB | Full resolution boundaries |
-| q0.2 | 1.5 GiB | Minimal simplification |
-| q0.5 | 1.0 GiB | Light simplification |
-| q1 | 703 MiB | Moderate (default) |
-| q1.5 | 594 MiB | Noticeable simplification |
-| q2 | 506 MiB | Heavy simplification |
-| q2.5 | 445 MiB | Maximum simplification |
+| Quality | Size (planet, v15) | Simplification | Boundary precision |
+|---|---|---|---|
+| Uncapped | 1.46 GiB | Full resolution | <1 m |
+| q0.2 | 765 MiB | Minimal simplification | ~3 m at L8 |
+| q0.5 | 519 MiB | Light simplification | ~7 m at L8 |
+| q1 | 369 MiB | Moderate | ~15 m at L8 |
+| q1.5 | 297 MiB | Noticeable simplification | ~22 m at L8 |
+| q2 | 253 MiB | Heavy simplification | ~30 m at L8 |
+| **q2.5** | **223 MiB** | **Default — maximum simplification** | **~37 m at L8** |
 
 ### By POI Tier (planet)
 
