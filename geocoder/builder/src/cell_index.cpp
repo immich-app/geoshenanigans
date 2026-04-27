@@ -365,11 +365,19 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                 std::vector<AddrPoint> packed_points;
                 packed_points.reserve(data.addr_points.size());
                 std::vector<uint8_t> packed_bytes;
-                packed_bytes.reserve(data.addr_points.size());
+                // Only ~5% of addr_points carry footprints; reserve a
+                // small fraction to avoid the over-allocation that
+                // contributed to OOM on planet-scale runs.
+                packed_bytes.reserve(data.addr_points.size() / 16);
                 for (size_t i = 0; i < data.addr_points.size(); i++) {
                     AddrPoint ap = data.addr_points[i];
-                    if (ap.vertex_count == 0 || ap.vertex_offset == NO_DATA) {
+                    if (ap.vertex_count == 0 || ap.vertex_offset == NO_DATA
+                        || (size_t)ap.vertex_offset + ap.vertex_count > data.addr_vertices.size()) {
+                        // Point address, polygon footprint missing, or
+                        // out-of-range index (defends against caller
+                        // passing addr_points without matching addr_vertices).
                         ap.vertex_offset = NO_DATA;
+                        ap.vertex_count = 0;
                         packed_points.push_back(ap);
                         continue;
                     }

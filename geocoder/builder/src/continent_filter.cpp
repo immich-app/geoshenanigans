@@ -160,20 +160,37 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         return std::make_tuple(std::move(remap), std::move(ways), std::move(nodes));
     });
 
-    // Addrs — coord polygon refinement
+    // Addrs — coord polygon refinement.  Also carries through the
+    // addr_vertices buffer for addr_points with building footprints,
+    // remapping vertex_offset to the new buffer.  Without this, the
+    // continent's data.addr_vertices stays empty and any polygon-aware
+    // downstream consumer (e.g. cell_index.cpp's addr_vertices packer
+    // added in v15) crashes on out-of-bounds access.
     auto f_remap_addrs = std::async(std::launch::async, [&]() {
         auto& sorted_ids = used_addr_ids;
         std::vector<AddrPoint> addrs;
         addrs.reserve(sorted_ids.size());
+        std::vector<NodeCoord> verts;
         std::unordered_map<uint32_t, uint32_t> remap;
         remap.reserve(sorted_ids.size());
         for (uint32_t old_id : sorted_ids) {
             const auto& a = full.addr_points[old_id];
             if (polygon && !point_in_polygon(a.lat, a.lng, *polygon)) continue;
             remap[old_id] = static_cast<uint32_t>(addrs.size());
-            addrs.push_back(a);
+            AddrPoint na = a;
+            if (a.vertex_count > 0 && a.vertex_offset != NO_DATA
+                && (size_t)a.vertex_offset + a.vertex_count <= full.addr_vertices.size()) {
+                uint32_t old_voff = a.vertex_offset;
+                na.vertex_offset = static_cast<uint32_t>(verts.size());
+                for (uint32_t j = 0; j < a.vertex_count; j++)
+                    verts.push_back(full.addr_vertices[old_voff + j]);
+            } else {
+                na.vertex_offset = NO_DATA;
+                na.vertex_count = 0;
+            }
+            addrs.push_back(na);
         }
-        return std::make_tuple(std::move(remap), std::move(addrs));
+        return std::make_tuple(std::move(remap), std::move(addrs), std::move(verts));
     });
 
     // Interps
@@ -260,7 +277,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     });
 
     { auto [wr, ways, nodes] = f_remap_ways.get();    way_remap    = std::move(wr); out.ways           = std::move(ways); out.street_nodes = std::move(nodes); }
-    { auto [ar, addrs]       = f_remap_addrs.get();   addr_remap   = std::move(ar); out.addr_points    = std::move(addrs); }
+    { auto [ar, addrs, vts]  = f_remap_addrs.get();   addr_remap   = std::move(ar); out.addr_points    = std::move(addrs); out.addr_vertices = std::move(vts); }
     { auto [ir, iways, inds] = f_remap_interps.get(); interp_remap = std::move(ir); out.interp_ways    = std::move(iways); out.interp_nodes = std::move(inds); }
     { auto [ar, polys, vts]  = f_remap_admins.get();  admin_remap  = std::move(ar); out.admin_polygons = std::move(polys); out.admin_vertices = std::move(vts); }
     { auto [pr, pois, vts]   = f_remap_pois.get();    poi_remap    = std::move(pr); out.poi_records    = std::move(pois); out.poi_vertices = std::move(vts); }
