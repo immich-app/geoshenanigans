@@ -109,9 +109,15 @@ jobs:
             echo "has_previous=false" >> "$GITHUB_OUTPUT"
             echo "force_fresh=true requested — building fresh (ignoring $PREV_DATE)"
           elif s5cmd --endpoint-url $S3_ENDPOINT ls "$PREV_BUILD/" 2>/dev/null | head -1 | grep -q .; then
-            # Check build_version in previous manifest
-            PREV_VERSION=$(s5cmd --endpoint-url $S3_ENDPOINT cat "$PREV_BUILD/manifest.json" 2>/dev/null \
-              | jq -r '.build_version // 0' 2>/dev/null || echo 0)
+            # Check build_version in previous configurations.json. Falls back
+            # to the legacy manifest.json path so the very first build after
+            # this rename still reads the previous day's metadata.
+            PREV_VERSION=$(s5cmd --endpoint-url $S3_ENDPOINT cat "$PREV_BUILD/configurations.json" 2>/dev/null \
+              | jq -r '.build.version // 0' 2>/dev/null || echo 0)
+            if [ "$PREV_VERSION" = "0" ]; then
+              PREV_VERSION=$(s5cmd --endpoint-url $S3_ENDPOINT cat "$PREV_BUILD/manifest.json" 2>/dev/null \
+                | jq -r '.build_version // 0' 2>/dev/null || echo 0)
+            fi
             if [ "$PREV_VERSION" = "$EXPECTED_BUILD_VERSION" ]; then
               echo "has_previous=true" >> "$GITHUB_OUTPUT"
               echo "Previous build ($PREV_DATE) found, build_version=$PREV_VERSION — compatible"
@@ -444,13 +450,22 @@ jobs:
           START=$(date +%s)
           # pipefail so build-index crashes propagate (without it, the
           # downstream tee/tail mask exit code and the workflow proceeds
-          # to compress with no manifest.json — see 24968665275).
+          # to compress with no configurations.json — see 24968665275).
           set -o pipefail
           build-index "$WORKDIR/output/" "$WORKDIR/planet.osm.pbf" \
             $BUILD_ARGS 2>&1 | tee "$WORKDIR/build.log" | tail -30
           echo "Build completed in $(($(date +%s) - START))s"
           echo "Build log kept at $WORKDIR/build.log ($(wc -l < "$WORKDIR/build.log") lines)"
           echo "$(find "$WORKDIR/output" -name "*.bin" | wc -l) bin files produced"
+
+          # Seed configurations.json from the static template. CI augments
+          # it with the per-file size/sha256 table during the compress
+          # step, then with date / previous / built_at / wikidata_date
+          # during finalize. The C++ builder no longer writes any JSON
+          # itself — the template is the single source of truth for the
+          # axes/components/constraints/presets schema.
+          cp "$GITHUB_WORKSPACE/geocoder/builder/configurations.template.json" \
+             "$WORKDIR/output/configurations.json"
 
           # Wait for background PBF cache upload, then free disk
           wait
@@ -606,7 +621,7 @@ jobs:
             echo "::warning::$FAIL variants failed patch verify — continuing to upload for debugging"
           fi
 
-      # ── Compress .bin files + rewrite manifest with per-file sizes ─
+      # ── Compress .bin files + splice per-file sizes into configurations.json ─
       - name: Compress index files
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
@@ -629,9 +644,12 @@ jobs:
           from concurrent.futures import ProcessPoolExecutor, as_completed
 
           out = os.environ["WORKDIR"] + "/output"
-          mpath = f"{out}/manifest.json"
-          with open(mpath) as f:
-              m = json.load(f)
+          # Single source of truth — built from the static template at
+          # build start, augmented here with the per-file table and at
+          # finalize-time with date/previous/built_at metadata.
+          cpath = f"{out}/configurations.json"
+          with open(cpath) as f:
+              cfg = json.load(f)
 
           bin_files = []
           for root, _, fs in os.walk(out):
@@ -658,31 +676,30 @@ jobs:
               zst = full + ".zst"
               comp_size = os.path.getsize(zst)
               os.remove(full)
-              return {
-                  "path": os.path.relpath(full, out),
-                  "raw_size": raw_size,
-                  "compressed_size": comp_size,
-                  "sha256": h.hexdigest(),
+              return os.path.relpath(full, out), {
+                  "size_zst": comp_size,
+                  "size_raw": raw_size,
+                  "sha256":   h.hexdigest(),
               }
 
-          files = []
+          files = {}
           total_raw = 0
           total_comp = 0
           workers = int(os.environ.get("WORKERS", "1"))
           with ProcessPoolExecutor(max_workers=workers) as ex:
               futures = {ex.submit(process, f): f for f in bin_files}
               for fut in as_completed(futures):
-                  entry = fut.result()
-                  files.append(entry)
-                  total_raw += entry["raw_size"]
-                  total_comp += entry["compressed_size"]
-                  pct = 100 * entry["compressed_size"] / entry["raw_size"] if entry["raw_size"] else 0
-                  print(f"  {entry['path']}: {entry['raw_size']/1e6:.0f} → {entry['compressed_size']/1e6:.0f} MiB ({pct:.0f}%)", flush=True)
+                  path, entry = fut.result()
+                  files[path] = entry
+                  total_raw += entry["size_raw"]
+                  total_comp += entry["size_zst"]
+                  pct = 100 * entry["size_zst"] / entry["size_raw"] if entry["size_raw"] else 0
+                  print(f"  {path}: {entry['size_raw']/1e6:.0f} → {entry['size_zst']/1e6:.0f} MiB ({pct:.0f}%)", flush=True)
 
-          files.sort(key=lambda x: x["path"])
-          m["files"] = files
-          with open(mpath, "w") as f:
-              json.dump(m, f, indent=2)
+          # Stable ordering for deterministic diffs.
+          cfg["files"] = dict(sorted(files.items()))
+          with open(cpath, "w") as f:
+              json.dump(cfg, f, indent=2)
 
           if total_raw:
               ratio = 100 * total_comp / total_raw
@@ -693,8 +710,8 @@ jobs:
           ZST_COUNT=$(find "$WORKDIR/output" -name "*.bin.zst" | wc -l)
           echo "$ZST_COUNT .bin.zst files produced"
 
-      # ── Finalize upload + manifest ──────────────────────────────────
-      - name: Finalize upload and manifest
+      # ── Finalize upload + configurations.json ──────────────────────
+      - name: Finalize upload and configurations.json
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
           CACHE_ENDPOINT: ${{ steps.setup.outputs.cache_endpoint }}
@@ -722,19 +739,22 @@ jobs:
           $CACHE cp --concurrency 16 \
             "$WORKDIR/output/*" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/" 2>/dev/null || true
 
-          # ── Augment build tool's manifest.json with date/previous info ──
+          # ── Augment configurations.json with build metadata ─────────
+          # Splices date / previous / built_at / wikidata_date into the
+          # `build` block (which the static template stamps with
+          # build_version + patch_version).
           PREV_VAL="$( [ "$HAS_PREVIOUS" = "true" ] && echo "$OLD_DATE" || echo "null" )"
           jq --arg date "$NEW_DATE" \
              --arg previous "$PREV_VAL" \
              --arg built_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
              --arg wikidata_date "${{ steps.download.outputs.wikidata_date || 'null' }}" \
-             '. + {date: $date, previous: (if $previous == "null" then null else $previous end), built_at: $built_at, wikidata_date: (if $wikidata_date == "null" then null else $wikidata_date end)}' \
-             "$WORKDIR/output/manifest.json" > "$WORKDIR/output/manifest.tmp" \
-             && mv "$WORKDIR/output/manifest.tmp" "$WORKDIR/output/manifest.json"
-          echo "Manifest size: $(stat -c%s "$WORKDIR/output/manifest.json") bytes"
+             '.build = ((.build // {}) + {date: $date, previous: (if $previous == "null" then null else $previous end), built_at: $built_at, wikidata_date: (if $wikidata_date == "null" then null else $wikidata_date end)})' \
+             "$WORKDIR/output/configurations.json" > "$WORKDIR/output/configurations.tmp" \
+             && mv "$WORKDIR/output/configurations.tmp" "$WORKDIR/output/configurations.json"
+          echo "configurations.json size: $(stat -c%s "$WORKDIR/output/configurations.json") bytes"
 
-          # Generate checksums — .bin.zst + .gcpatch + .json. Note that the
-          # manifest.files[].sha256 field holds the RAW (pre-compression)
+          # Generate checksums — .bin.zst + .gcpatch + .json. Note that
+          # configurations.files[].sha256 holds the RAW (pre-compression)
           # hashes for server-side verification after decompression, while
           # this checksums.sha256 holds the on-wire hashes (compressed).
           echo "Generating checksums..."
@@ -743,14 +763,15 @@ jobs:
           done) > "$WORKDIR/output/checksums.sha256"
           echo "$(wc -l < "$WORKDIR/output/checksums.sha256") file checksums generated"
 
-          # Upload manifest + checksums (index files + patches already uploaded above).
-          # Note: checksums.sha256 is generated AFTER the bulk cache cp at the
-          # top of this step, so we re-upload it (and manifest) to cache here
-          # so the sentinel check sees the full file set — otherwise every
-          # build warns "Cache incomplete (N-1/N) — no sentinel".
-          $S5 cp "$WORKDIR/output/manifest.json" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/manifest.json"
+          # Upload configurations.json + checksums (index files + patches
+          # already uploaded above). Note: checksums.sha256 is generated
+          # AFTER the bulk cache cp at the top of this step, so we
+          # re-upload it (and configurations.json) to cache here so the
+          # sentinel check sees the full file set — otherwise every build
+          # warns "Cache incomplete (N-1/N) — no sentinel".
+          $S5 cp "$WORKDIR/output/configurations.json" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/configurations.json"
           $S5 cp "$WORKDIR/output/checksums.sha256" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/checksums.sha256"
-          $CACHE cp "$WORKDIR/output/manifest.json" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/manifest.json" 2>/dev/null || true
+          $CACHE cp "$WORKDIR/output/configurations.json" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/configurations.json" 2>/dev/null || true
           $CACHE cp "$WORKDIR/output/checksums.sha256" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/checksums.sha256" 2>/dev/null || true
 
           # Verify upload completeness — walk local files and re-upload any that

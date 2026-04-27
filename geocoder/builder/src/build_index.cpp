@@ -432,6 +432,10 @@ int main(int argc, char* argv[]) {
     bool multi_quality = false;
     std::vector<double> quality_scales;
 
+    // q2.5 — admin-minimal isn't tiered by quality, this is the
+    // single epsilon used when re-simplifying its polygon set.
+    constexpr double kAdminMinimalEpsilonScale = 2.5;
+
     for (int i = 2; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--street-level" && i + 1 < argc) {
@@ -4964,6 +4968,85 @@ int main(int argc, char* argv[]) {
                       << place_cell_map.size() << " cells" << std::endl;
         }
 
+        // Write admin-minimal tier — smallest useful deployable. Drops:
+        //   - place_nodes with place_type ∈ {SUBURB=3, NEIGHBOURHOOD=5, QUARTER=6}
+        //   - admin polygons (and their vertex bytes) whose admin_level
+        //     falls outside [2, 8] (L9 borough, L10 quarter-area,
+        //     L11 admin-postal, L15 place-area markers are skipped).
+        // Re-simplifies the kept polygons at q2.5 and writes them to a
+        // dense ID space so the on-disk admin_polygons.bin / admin_vertices.bin
+        // are self-contained — admin-minimal does NOT share polygon
+        // files with quality/q2.5/. strings_core.bin is shared from
+        // full/.
+        if (multi_output && !d.place_nodes.empty() && !d.admin_polygons.empty()) {
+            std::string mdir = base_dir + "/admin-minimal";
+            ensure_dir(mdir);
+
+            // 1. Filter + re-simplify + pack admin polygons. q2.5 only —
+            //    admin-minimal isn't tiered by quality. Returns a remap
+            //    from old polygon IDs to new dense IDs (or NO_DATA for
+            //    dropped polygons), used below to rewrite the cell index.
+            std::vector<uint32_t> poly_remap;
+            write_admin_minimal_polygons(d, mdir, kAdminMinimalEpsilonScale, poly_remap);
+
+            // 2. place_nodes filter + ID remap. Keep types 0=city, 1=town,
+            //    2=village, 4=hamlet.
+            std::vector<PlaceNode> filtered_places;
+            filtered_places.reserve(d.place_nodes.size());
+            std::vector<uint32_t> place_remap(d.place_nodes.size(), NO_DATA);
+            for (size_t i = 0; i < d.place_nodes.size(); i++) {
+                uint8_t pt = d.place_nodes[i].place_type;
+                if (pt == 0 || pt == 1 || pt == 2 || pt == 4) {
+                    place_remap[i] = static_cast<uint32_t>(filtered_places.size());
+                    filtered_places.push_back(d.place_nodes[i]);
+                }
+            }
+            {
+                std::ofstream f(mdir + "/place_nodes.bin", std::ios::binary);
+                f.write(reinterpret_cast<const char*>(filtered_places.data()),
+                        filtered_places.size() * sizeof(PlaceNode));
+            }
+
+            // 3. Rebuild place cell index with the place_remap.
+            std::unordered_map<uint64_t, std::vector<uint32_t>> filtered_place_cells;
+            for (const auto& p : d.sorted_place_cells) {
+                if (p.item_id < place_remap.size()
+                    && place_remap[p.item_id] != NO_DATA) {
+                    filtered_place_cells[p.cell_id].push_back(place_remap[p.item_id]);
+                }
+            }
+            write_cell_index(mdir + "/place_cells.bin", mdir + "/place_entries.bin",
+                             filtered_place_cells);
+
+            // 4. Rebuild admin cell index against the new polygon ID space.
+            //    Preserves the high-bit INTERIOR_FLAG used by the cell
+            //    index format (polys that fully contain a cell vs. just
+            //    intersect it).
+            constexpr uint32_t ADMIN_ID_MASK = 0x7FFFFFFFu;
+            constexpr uint32_t ADMIN_INTERIOR_FLAG = 0x80000000u;
+            std::unordered_map<uint64_t, std::vector<uint32_t>> filtered_admin_cells;
+            for (const auto& [cell_id, ids] : d.cell_to_admin) {
+                std::vector<uint32_t> kept;
+                kept.reserve(ids.size());
+                for (uint32_t flagged : ids) {
+                    uint32_t poly_id = flagged & ADMIN_ID_MASK;
+                    uint32_t flags   = flagged & ADMIN_INTERIOR_FLAG;
+                    if (poly_id >= poly_remap.size()) continue;
+                    uint32_t new_id = poly_remap[poly_id];
+                    if (new_id == NO_DATA) continue;
+                    kept.push_back(new_id | flags);
+                }
+                if (!kept.empty()) filtered_admin_cells[cell_id] = std::move(kept);
+            }
+            write_cell_index(mdir + "/admin_cells.bin", mdir + "/admin_entries.bin",
+                             filtered_admin_cells);
+
+            std::cerr << "  Admin-minimal: " << filtered_places.size()
+                      << " place nodes (of " << d.place_nodes.size() << "), "
+                      << filtered_admin_cells.size() << " cells (of "
+                      << d.cell_to_admin.size() << ")" << std::endl;
+        }
+
         // Write POI tier variants
         if (!d.poi_records.empty()) {
             struct PoiTierVariant {
@@ -5266,149 +5349,6 @@ int main(int argc, char* argv[]) {
     // Wait for planet write if not already done
     planet_future.get();
     log_phase("All index writing (total)", _pt, _cpu);
-
-    // --- Generate manifest.json ---
-    {
-        auto file_size = [](const std::string& path) -> int64_t {
-            struct stat st;
-            if (stat(path.c_str(), &st) == 0) return st.st_size;
-            return -1;
-        };
-
-        auto dir_size = [&](const std::string& dir, const std::vector<std::string>& files) -> int64_t {
-            int64_t total = 0;
-            for (const auto& f : files) {
-                int64_t s = file_size(dir + "/" + f);
-                if (s > 0) total += s;
-            }
-            return total;
-        };
-
-        std::vector<std::string> admin_base_files = {
-            "admin_cells.bin", "admin_entries.bin", "strings.bin"
-        };
-        std::vector<std::string> admin_quality_files = {
-            "admin_polygons.bin", "admin_vertices.bin"
-        };
-        std::vector<std::string> street_files = {
-            "street_ways.bin", "street_nodes.bin", "street_entries.bin"
-        };
-        std::vector<std::string> address_files = {
-            "addr_points.bin", "addr_vertices.bin", "addr_entries.bin",
-            "interp_ways.bin", "interp_nodes.bin", "interp_entries.bin"
-        };
-        std::vector<std::string> geo_files = {"geo_cells.bin"};
-
-        // Build list of regions
-        std::vector<std::pair<std::string, std::string>> regions; // (name, path)
-        regions.push_back({"planet", output_dir + "/planet"});
-        if (generate_continents) {
-            for (size_t ci = 0; ci < kContinentCount; ci++) {
-                regions.push_back({kContinents[ci].name,
-                    output_dir + "/" + kContinents[ci].name});
-            }
-        }
-
-        // Quality level names
-        auto quality_dir_name = [](double scale) -> std::string {
-            if (scale == 0) return "uncapped";
-            char buf[32]; snprintf(buf, sizeof(buf), "q%.4g", scale);
-            return buf;
-        };
-
-        std::ofstream mf(output_dir + "/manifest.json");
-        mf << "{\n";
-        mf << "  \"build_version\": 15,\n";
-        mf << "  \"patch_version\": 5,\n";
-        mf << "  \"regions\": {\n";
-
-        for (size_t ri = 0; ri < regions.size(); ri++) {
-            const auto& [rname, rpath] = regions[ri];
-            mf << "    \"" << rname << "\": {\n";
-
-            // Modes (no admin_polygons/vertices — those are in quality/)
-            mf << "      \"modes\": {\n";
-            if (multi_output) {
-                std::string full_dir = rpath + "/full";
-                int64_t full_sz = dir_size(full_dir, geo_files) +
-                    dir_size(full_dir, street_files) +
-                    dir_size(full_dir, address_files) +
-                    dir_size(full_dir, admin_base_files);
-                mf << "        \"full\": {\"size\": " << full_sz << "},\n";
-
-                std::string na_dir = rpath + "/no-addresses";
-                int64_t na_sz = dir_size(na_dir, geo_files) +
-                    dir_size(na_dir, street_files) +
-                    dir_size(na_dir, admin_base_files);
-                mf << "        \"no-addresses\": {\"size\": " << na_sz << "},\n";
-
-                std::string admin_dir = rpath + "/admin";
-                int64_t admin_sz = dir_size(admin_dir, admin_base_files);
-                mf << "        \"admin\": {\"size\": " << admin_sz << "}\n";
-            } else {
-                int64_t sz = 0;
-                for (const auto& lists : {geo_files, street_files, address_files,
-                                          admin_base_files}) {
-                    sz += dir_size(rpath, lists);
-                }
-                mf << "        \"" << (mode == IndexMode::Full ? "full" :
-                    mode == IndexMode::NoAddresses ? "no-addresses" : "admin") << "\": {\"size\": " << sz << "}\n";
-            }
-            mf << "      },\n";
-
-            // Quality variants (each has admin_polygons + admin_vertices)
-            if (multi_quality) {
-                std::string quality_dir = multi_output ? rpath + "/quality" : rpath;
-                mf << "      \"qualities\": {\n";
-                for (size_t qi = 0; qi < quality_scales.size(); qi++) {
-                    double scale = quality_scales[qi];
-                    std::string qname = quality_dir_name(scale);
-                    std::string qdir = quality_dir + "/" + qname;
-                    int64_t qsz = dir_size(qdir, admin_quality_files);
-
-                    double eps_l2 = (scale == 0) ? 0 : 500.0 * scale * kEpsilonScale;
-                    double eps_l8 = (scale == 0) ? 0 : 15.0 * scale * kEpsilonScale;
-
-                    mf << "        \"" << qname << "\": {\"scale\": " << scale
-                       << ", \"size\": " << qsz
-                       << ", \"epsilon_l2_m\": " << eps_l2
-                       << ", \"epsilon_l8_m\": " << eps_l8
-                       << "}";
-                    if (qi + 1 < quality_scales.size()) mf << ",";
-                    mf << "\n";
-                }
-                mf << "      },\n";
-            } else {
-                mf << "      \"qualities\": {},\n";
-            }
-
-            // POI tier info
-            {
-                std::vector<std::string> poi_files = {
-                    "poi_records.bin", "poi_vertices.bin", "poi_cells.bin", "poi_entries.bin"
-                };
-                mf << "      \"poi\": {\n";
-                const char* poi_tier_names[] = {"major", "notable", "all"};
-                for (int ti = 0; ti < 3; ti++) {
-                    std::string pdir = rpath + "/poi/" + poi_tier_names[ti];
-                    int64_t psz = dir_size(pdir, poi_files);
-                    mf << "        \"" << poi_tier_names[ti] << "\": {\"size\": " << psz << "}";
-                    if (ti < 2) mf << ",";
-                    mf << "\n";
-                }
-                mf << "      }\n";
-            }
-
-            mf << "    }";
-            if (ri + 1 < regions.size()) mf << ",";
-            mf << "\n";
-        }
-
-        mf << "  }\n";
-        mf << "}\n";
-
-        std::cerr << "Wrote " << output_dir << "/manifest.json" << std::endl;
-    }
 
     std::cerr << "Done." << std::endl;
     return 0;

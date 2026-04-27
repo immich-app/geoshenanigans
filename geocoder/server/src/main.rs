@@ -1,4 +1,8 @@
 mod auth;
+mod downloader;
+mod region_state;
+
+use region_state::{Configuration, RegionState};
 
 use axum::extract::Query;
 use axum::http::StatusCode;
@@ -28,7 +32,8 @@ struct QueryParams {
 async fn reverse_geocode(
     Query(params): Query<QueryParams>,
     state: axum::extract::State<Arc<RwLock<auth::Db>>>,
-    index: axum::extract::Extension<Arc<Index>>,
+    index: axum::extract::Extension<Arc<MultiIndex>>,
+    region_state: axum::extract::Extension<Arc<RegionState>>,
     limiter: axum::extract::Extension<Arc<auth::RateLimiter>>,
     connect_info: axum::extract::ConnectInfo<std::net::SocketAddr>,
 ) -> Response {
@@ -52,12 +57,36 @@ async fn reverse_geocode(
         return (StatusCode::TOO_MANY_REQUESTS, msg).into_response();
     }
 
+    // On-demand region download: if the point bbox-matches one or
+    // more continents we don't have loaded, trigger a synchronous
+    // download (single-flighted) and block this request until done.
+    // Concurrent requests for the same unloaded continent share one
+    // download via the per-region mutex in RegionState.
+    let unloaded = index.unloaded_matches(params.lat, params.lon);
+    for region in &unloaded {
+        if let Err(e) = region_state.ensure_loaded(region).await {
+            eprintln!("on-demand load of {}: {}", region, e);
+            // Fall through — the query against still-loaded continents
+            // (if any) returns whatever it can. Failure to download
+            // one continent shouldn't block answers from others.
+        }
+    }
+
     if let Some(ref mode) = params.debug {
+        // Debug endpoints route to the first loaded continent that
+        // bbox-matches the point. In single-region (legacy flat) deploys
+        // that's the world Index; in per-continent setups it's whichever
+        // continent the query lands in. No cross-continent merging on
+        // debug paths — they're for inspecting a single Index's internals.
+        let arcs = index.loaded_matches(params.lat, params.lon);
+        let Some(idx) = arcs.first() else {
+            return ([(axum::http::header::CONTENT_TYPE, "application/json")], "{}").into_response();
+        };
         if mode == "all" {
-            let address = index.query(params.lat, params.lon);
-            let admin_debug = index.debug_admin(params.lat, params.lon);
-            let primary_debug = index.debug_primary(params.lat, params.lon);
-            let places_debug = index.debug_places(params.lat, params.lon);
+            let address = idx.query(params.lat, params.lon);
+            let admin_debug = idx.debug_admin(params.lat, params.lon);
+            let primary_debug = idx.debug_primary(params.lat, params.lon);
+            let places_debug = idx.debug_places(params.lat, params.lon);
             let combined = serde_json::json!({
                 "result": serde_json::from_str::<serde_json::Value>(
                     &serde_json::to_string(&address).unwrap_or_default()
@@ -70,18 +99,17 @@ async fn reverse_geocode(
             return ([(axum::http::header::CONTENT_TYPE, "application/json")], json).into_response();
         }
         let debug = if mode == "primary" {
-            index.debug_primary(params.lat, params.lon)
+            idx.debug_primary(params.lat, params.lon)
         } else if mode == "places" {
-            index.debug_places(params.lat, params.lon)
+            idx.debug_places(params.lat, params.lon)
         } else {
-            index.debug_admin(params.lat, params.lon)
+            idx.debug_admin(params.lat, params.lon)
         };
         let json = serde_json::to_string_pretty(&debug).unwrap_or_default();
         return ([(axum::http::header::CONTENT_TYPE, "application/json")], json).into_response();
     }
 
-    let address = index.query(params.lat, params.lon);
-    let json = serde_json::to_string(&address).unwrap_or_default();
+    let json = index.query_json(params.lat, params.lon);
     ([(axum::http::header::CONTENT_TYPE, "application/json")], json).into_response()
 }
 
@@ -92,10 +120,49 @@ async fn test_portal() -> impl IntoResponse {
     )
 }
 
+async fn get_configuration(
+    state: axum::extract::Extension<Arc<RegionState>>,
+) -> Response {
+    let cfg = state.get_configuration().await;
+    let json = serde_json::to_string_pretty(&cfg).unwrap_or_default();
+    ([(axum::http::header::CONTENT_TYPE, "application/json")], json).into_response()
+}
+
+async fn put_configuration(
+    state: axum::extract::Extension<Arc<RegionState>>,
+    axum::Json(new_cfg): axum::Json<Configuration>,
+) -> Response {
+    if let Err(e) = state.set_configuration(new_cfg).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("persist failed: {}", e)).into_response();
+    }
+    (StatusCode::ACCEPTED, "configuration updated, downloads scheduled").into_response()
+}
+
+// Permissive CORS for the test portal. The full-dataset server embeds
+// the test page; the page also fetches from a second minimal-dataset
+// server on a different port for side-by-side comparison. Browsers
+// treat that as cross-origin so we tag every response with `*`.
+async fn cors_middleware(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    if req.method() == axum::http::Method::OPTIONS {
+        let mut resp = Response::default();
+        let h = resp.headers_mut();
+        h.insert("access-control-allow-origin", "*".parse().unwrap());
+        h.insert("access-control-allow-methods", "GET, OPTIONS".parse().unwrap());
+        h.insert("access-control-allow-headers", "*".parse().unwrap());
+        return resp;
+    }
+    let mut resp = next.run(req).await;
+    resp.headers_mut().insert("access-control-allow-origin", "*".parse().unwrap());
+    resp
+}
+
 async fn polygons_geojson(
     Query(params): Query<QueryParams>,
     state: axum::extract::State<Arc<RwLock<auth::Db>>>,
-    index: axum::extract::Extension<Arc<Index>>,
+    index: axum::extract::Extension<Arc<MultiIndex>>,
 ) -> Response {
     let key = match params.key {
         Some(k) => k,
@@ -107,41 +174,35 @@ async fn polygons_geojson(
 
     let lat = params.lat;
     let lng = params.lon;
-    let idx = &**index;
-
-    let all_polygons: &[AdminPolygon] = unsafe {
-        std::slice::from_raw_parts(
-            idx.admin_polygons.as_ptr() as *const AdminPolygon,
-            idx.admin_polygons.len() as usize / std::mem::size_of::<AdminPolygon>(),
-        )
-    };
-    let all_vertices: &[NodeCoord] = unsafe {
-        std::slice::from_raw_parts(
-            idx.admin_vertices.as_ptr() as *const NodeCoord,
-            idx.admin_vertices.len() as usize / std::mem::size_of::<NodeCoord>(),
-        )
-    };
 
     const ID_MASK: u32 = 0x7FFFFFFF;
 
     let mut features: Vec<serde_json::Value> = Vec::new();
-    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
-    let cell = cell_id_at_level(lat, lng, idx.admin_cell_level);
-    let neighbors = cell_neighbors_at_level(cell, idx.admin_cell_level);
+    // Iterate every loaded continent whose bbox covers the query.
+    // For boundary points (Russia/Türkiye/Egypt) two continents may
+    // contribute — feature IDs are local to each Index, so we dedupe
+    // per-Index using `seen`.
+    for idx in index.loaded_matches(lat, lng) {
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
-    for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-        Index::for_each_entry(&idx.admin_entries, Index::lookup_admin_cell(&idx.admin_cells, c), |id| {
-            let poly_id = id & ID_MASK;
-            if !seen.insert(poly_id) { return; }
-            let pid = poly_id as usize;
-            if pid >= all_polygons.len() { return; }
-            let poly = &all_polygons[pid];
-            let offset = poly.vertex_offset as usize;
-            let count = poly.vertex_count as usize;
-            if offset + count > all_vertices.len() { return; }
-            let verts = &all_vertices[offset..offset + count];
-            if !point_in_polygon(lat as f32, lng as f32, verts) { return; }
+        let cell = cell_id_at_level(lat, lng, idx.admin_cell_level);
+        let neighbors = cell_neighbors_at_level(cell, idx.admin_cell_level);
+
+        let mut hits: Vec<u32> = Vec::new();
+        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+            Index::for_each_entry_fb(&idx.admin_entries, Index::lookup_admin_cell_fb(&idx.admin_cells, c), |id| {
+                let poly_id = id & ID_MASK;
+                if seen.insert(poly_id) { hits.push(poly_id); }
+            });
+        }
+        for poly_id in hits {
+            let Some(poly) = idx.admin_polygon(poly_id) else { continue; };
+            // v15 vertices are per-polygon delta-encoded with a 10-byte
+            // inline header — must decode through admin_verts(), not a
+            // raw [NodeCoord] cast (which produces nonsense floats).
+            let Some(verts) = idx.admin_verts(&poly) else { continue; };
+            if !point_in_polygon(lat as f32, lng as f32, &verts) { continue; }
             let coords: Vec<[f64; 2]> = verts.iter().map(|v| [v.lng as f64, v.lat as f64]).collect();
             features.push(serde_json::json!({
                 "type": "Feature",
@@ -153,33 +214,29 @@ async fn polygons_geojson(
                     "kind": "admin",
                 }
             }));
-        });
-    }
+        }
 
-    if let (Some(ref pp), Some(ref pv)) = (&idx.postal_polygons, &idx.postal_vertices) {
-        let all_postal: &[AdminPolygon] = unsafe {
-            std::slice::from_raw_parts(pp.as_ptr() as *const AdminPolygon, pp.len() as usize / std::mem::size_of::<AdminPolygon>())
-        };
-        let all_pverts: &[NodeCoord] = unsafe {
-            std::slice::from_raw_parts(pv.as_ptr() as *const NodeCoord, pv.len() as usize / std::mem::size_of::<NodeCoord>())
-        };
-        for poly in all_postal {
-            let off = poly.vertex_offset as usize;
-            let cnt = poly.vertex_count as usize;
-            if off + cnt > all_pverts.len() { continue; }
-            let verts = &all_pverts[off..off + cnt];
-            if !point_in_polygon(lat as f32, lng as f32, verts) { continue; }
-            let coords: Vec<[f64; 2]> = verts.iter().map(|v| [v.lng as f64, v.lat as f64]).collect();
-            features.push(serde_json::json!({
-                "type": "Feature",
-                "geometry": { "type": "Polygon", "coordinates": [coords] },
-                "properties": {
-                    "name": idx.get_string(poly.name_id),
-                    "admin_level": 99,
-                    "area": poly.area,
-                    "kind": "postal",
-                }
-            }));
+        if let Some(ref pp) = &idx.postal_polygons {
+            let total = pp.len() / std::mem::size_of::<AdminPolygon>() as u64;
+            for i in 0..total {
+                let poly: AdminPolygon = pp.read_at::<AdminPolygon>(i);
+                let Some(verts) = decode_polygon_verts(
+                    idx.postal_vertices.as_ref().unwrap(),
+                    poly.vertex_offset, poly.vertex_count
+                ) else { continue; };
+                if !point_in_polygon(lat as f32, lng as f32, &verts) { continue; }
+                let coords: Vec<[f64; 2]> = verts.iter().map(|v| [v.lng as f64, v.lat as f64]).collect();
+                features.push(serde_json::json!({
+                    "type": "Feature",
+                    "geometry": { "type": "Polygon", "coordinates": [coords] },
+                    "properties": {
+                        "name": idx.get_string(poly.name_id),
+                        "admin_level": 99,
+                        "area": poly.area,
+                        "kind": "postal",
+                    }
+                }));
+            }
         }
     }
 
@@ -207,30 +264,18 @@ async fn main() {
     let db = auth::Db::load(&db_path);
 
     eprintln!("Loading index from {}...", data_dir);
-    let index = match Index::load(data_dir, street_cell_level, admin_cell_level, search_distance) {
-        Ok(idx) => {
-            let place_status = if idx.place_nodes.is_some() {
-                let count = idx.place_nodes.as_ref().unwrap().len() as usize / std::mem::size_of::<PlaceNode>();
-                format!(" + {} place nodes", count)
+    let index = match MultiIndex::load(data_dir, street_cell_level, admin_cell_level, search_distance) {
+        Ok(mi) => {
+            let loaded: Vec<_> = mi.continents.iter()
+                .filter(|c| c.index.load().is_some())
+                .map(|c| c.bbox.name)
+                .collect();
+            if loaded.len() == 1 && loaded[0] == "world" {
+                eprintln!("Loaded single-region index from {}", data_dir);
             } else {
-                String::new()
-            };
-            let poi_status = if idx.poi_records.is_some() {
-                let count = idx.poi_records.as_ref().unwrap().len() as usize / std::mem::size_of::<PoiRecord>();
-                format!(" + {} POIs ({} categories)", count, idx.poi_meta.categories.len())
-            } else {
-                String::new()
-            };
-            if idx.geo_cells.is_some() {
-                if idx.addr_points.is_some() {
-                    eprintln!("Loaded full index (admin + geo + addresses{}{})", place_status, poi_status);
-                } else {
-                    eprintln!("Loaded streets index (admin + geo, no addresses{})", poi_status);
-                }
-            } else {
-                eprintln!("Loaded admin-only index (geo files not found{})", poi_status);
+                eprintln!("Loaded {} continent(s): {}", loaded.len(), loaded.join(", "));
             }
-            Arc::new(idx)
+            Arc::new(mi)
         }
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -241,13 +286,34 @@ async fn main() {
     let db = Arc::new(RwLock::new(db));
     let limiter = Arc::new(auth::RateLimiter::default()); // RwLock<HashMap> with atomic counters
 
+    let region_state = Arc::new(RegionState::new(index.clone(), std::path::PathBuf::from(data_dir)));
+
+    // On startup, kick off any preload downloads from the persisted
+    // configuration. Skipped silently if there's no persisted file —
+    // server starts empty and waits for an Immich PUT.
+    {
+        let s = region_state.clone();
+        let cfg = s.get_configuration().await;
+        for region in cfg.preload {
+            let s = s.clone();
+            tokio::spawn(async move {
+                if let Err(e) = s.ensure_loaded(&region).await {
+                    eprintln!("startup preload {}: {}", region, e);
+                }
+            });
+        }
+    }
+
     let app = Router::new()
         .route("/reverse", get(reverse_geocode))
         .route("/polygons", get(polygons_geojson))
         .route("/test", get(test_portal))
+        .route("/admin/configuration", get(get_configuration).put(put_configuration))
         .merge(auth::router())
         .layer(axum::Extension(index))
+        .layer(axum::Extension(region_state))
         .layer(axum::Extension(limiter))
+        .layer(axum::middleware::from_fn(cors_middleware))
         .with_state(db);
 
     // ACME mode: --domain <domain> [--cache <dir>]

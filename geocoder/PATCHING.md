@@ -6,7 +6,7 @@
 builds/
   latest.json                              # entry point for all clients
   2026-04-07/
-    manifest.json                          # build metadata + region/quality info
+    configurations.json                    # build metadata + axes/components/files + sha256s
     planet/
       full/            *.bin + patch.gcpatch
       no-addresses/    *.bin + patch.gcpatch
@@ -86,37 +86,40 @@ The entry point for all clients:
 | `oldest_indexes` | Oldest date that still has full `.bin` index files available for download. |
 | `oldest_patches` | Oldest date that still has `patch.gcpatch` files available. |
 
-## manifest.json (per-build)
+## configurations.json (per-build)
 
-Each build date has a manifest with region details and sizes:
+Each build date has a `configurations.json` covering both the per-build
+metadata (formerly in `manifest.json`) and the schema that drives the
+client UI — axes (region/mode/quality/poi_tier), components (which
+files belong to each axis value), constraints, presets, and the flat
+`files` map keyed by relative path with `size_zst`/`size_raw`/`sha256`:
 
 ```json
 {
-  "build_version": 2,
-  "patch_version": 1,
-  "date": "2026-04-10",
-  "previous": "2026-04-09",
-  "indexes_available": true,
-  "regions": {
-    "planet": {
-      "modes": {
-        "full": { "size": 19734832441 },
-        "no-addresses": { "size": 16139154204 },
-        "admin": { "size": 81058844 }
-      },
-      "qualities": {
-        "uncapped": { "scale": 0, "size": 2951027360 },
-        "q0.5": { "scale": 0.5, "size": 1037646024 },
-        "q1": { "scale": 1, "size": 737764592 }
-      }
-    },
-    "europe": { ... },
-    "africa": { ... }
+  "schema_version": 1,
+  "build": {
+    "version": 15,
+    "patch_version": 5,
+    "date": "2026-04-10",
+    "previous": "2026-04-09",
+    "built_at": "2026-04-10T09:00:14Z",
+    "wikidata_date": "2026-04-08"
+  },
+  "axes":        { "region": { ... }, "mode": { ... }, ... },
+  "components":  { "mode.full": { "files": ["{region}/full/...", ... ] }, ... },
+  "constraints": [ { "when": { "mode": "admin-minimal" }, "requires": { "quality": "q2.5" } } ],
+  "presets":     [ { "id": "smallest", "selections": { ... } }, ... ],
+  "files": {
+    "planet/full/admin_cells.bin": { "size_zst": 6393328, "size_raw": 24807168, "sha256": "..." },
+    "...": "..."
   }
 }
 ```
 
-After cleanup (indexes older than 3 days are removed), `indexes_available` is set to `false`. Patches remain available for weeks.
+The static portions (axes/components/constraints/presets) come from
+`geocoder/builder/configurations.template.json` and are stable across
+builds. CI splices in `build.*` and the `files` table during the
+build's compress step.
 
 ## Client Decision Tree
 
@@ -125,7 +128,7 @@ After cleanup (indexes older than 3 days are removed), `indexes_available` is se
 ```
 1. GET builds/latest.json
 2. Choose a date >= oldest_indexes (typically use latest)
-3. GET builds/{date}/manifest.json
+3. GET builds/{date}/configurations.json
 4. Choose region (e.g. europe), mode (e.g. full), quality (e.g. q1), and POI tier (e.g. notable)
 5. Download:
    - builds/{date}/europe/full/*.bin             (12 files)
@@ -143,8 +146,8 @@ After cleanup (indexes older than 3 days are removed), `indexes_available` is se
 3. If local_date == latest → already up to date, done
 4. If local_date < oldest_patches → patches too old, go to "Fresh Install"
 5. Walk the patch chain:
-   a. GET builds/{latest}/manifest.json → previous = date_n-1
-   b. GET builds/{date_n-1}/manifest.json → previous = date_n-2
+   a. GET builds/{latest}/configurations.json → build.previous = date_n-1
+   b. GET builds/{date_n-1}/configurations.json → build.previous = date_n-2
    c. Continue until previous == local_date
 6. Apply patches in order (oldest first):
    For each date in the chain:

@@ -1,34 +1,40 @@
 services:
-  # Default test server — q2.5 admin polygons (most aggressive
-  # simplification, smallest disk footprint).  ~37 m boundary precision
-  # at L8, invisible at typical photo-GPS accuracy.
-  geocoder-q2.5:
+  # Full dataset — q2.5 admin polygons + all POIs + postcodes + postal
+  # polygons.  Hosts the test portal HTML and acts as the "Ours" leg
+  # in the side-by-side comparison.
+  geocoder-full:
     build:
       context: ..
       dockerfile: test-portal/Dockerfile
     ports:
-      - "3000:3000"
+      # 3002 because :3000 is normally claimed by `immich_web` in the
+      # local dev stack.  The test portal is served from this port; it
+      # cross-fetches the minimal server on :3001 for side-by-side.
+      - "3002:3000"
     environment:
       QUALITY: q2.5
       POI_TIER: all
+      MINIMAL: "0"
     volumes:
-      - geocoder-data-q2.5:/data
+      - geocoder-data-full:/data
 
-  # Second test server — uncapped quality for comparison.  Identical
-  # data otherwise; only the admin_polygons.bin / admin_vertices.bin
-  # files differ (full resolution, ~280 MB larger on disk).
-  geocoder-uncapped:
+  # Minimal dataset — q2.5 admin polygons + place nodes + streets +
+  # addresses only.  No postcodes, no POIs.  Smallest deployable that
+  # still resolves admin + cities/towns/villages/hamlets at GeoNames
+  # cities500-equivalent detail.  The test portal queries this server
+  # at http://localhost:3001 for the side-by-side comparison.
+  geocoder-minimal:
     build:
       context: ..
       dockerfile: test-portal/Dockerfile
     ports:
       - "3001:3000"
     environment:
-      QUALITY: uncapped
-      POI_TIER: all
+      QUALITY: q2.5
+      MINIMAL: "1"
     volumes:
-      - geocoder-data-uncapped:/data
+      - geocoder-data-minimal:/data
 
 volumes:
-  geocoder-data-q2.5:
-  geocoder-data-uncapped:
+  geocoder-data-full:
+  geocoder-data-minimal:

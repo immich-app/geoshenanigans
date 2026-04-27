@@ -28,3 +28,14 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
 // Scale 0 = uncapped (no simplification). Other files are symlinked/copied from source_dir.
 void write_quality_variant(const ParsedData& data, const std::string& source_dir,
                            const std::string& output_dir, double epsilon_scale);
+
+// Write a minimal admin polygon/vertex pair containing only polygons whose
+// admin_level falls in [2, 8] (drops L9/L10/L11/L15 sub-municipal levels).
+// Same delta-encoded vertex format as write_quality_variant. Fills
+// id_remap so the caller can rewrite the admin cell index against the
+// new dense ID space. Always emitted at q2.5 — admin-minimal isn't
+// tiered by quality.
+void write_admin_minimal_polygons(const ParsedData& data,
+                                  const std::string& output_dir,
+                                  double epsilon_scale,
+                                  std::vector<uint32_t>& id_remap);

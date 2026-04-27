@@ -338,6 +338,7 @@
     <div class="results-section">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;gap:6px;flex-wrap:wrap;">
         <h3 style="margin:0;flex:1">Results <span id="resultCount"></span></h3>
+        <button id="minimalBtn" onclick="toggleMinimal()" style="padding:4px 12px;font-size:12px;background:var(--surface2);color:#fff;border:1px solid var(--border);border-radius:4px;cursor:pointer;" title="Query the minimal-dataset server (port 3001) side-by-side. Shows what the smallest admin-only deployable would resolve.">Minimal: Off</button>
         <button id="nominatimBtn" onclick="toggleNominatim()" style="padding:4px 12px;font-size:12px;background:var(--surface2);color:#fff;border:1px solid var(--border);border-radius:4px;cursor:pointer;" title="Query Nominatim's public API for side-by-side comparison. Off by default — each query hits api.openstreetmap.org so leave off unless you need the comparison.">Nominatim: Off</button>
         <button id="polygonsBtn" onclick="togglePolygons()" style="padding:4px 12px;font-size:12px;background:var(--surface2);color:#fff;border:1px solid var(--border);border-radius:4px;cursor:pointer;">Polygons</button>
         <button id="retestBtn" onclick="retestAllResults()" style="padding:4px 12px;font-size:12px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer;">Re-test</button>
@@ -371,10 +372,24 @@ const STORAGE_KEY = 'geocoder_test_results';
 
 function saveResults() {
   const serializable = results.filter(r => !r.loading).map(r => ({
-    id: r.id, lat: r.lat, lng: r.lng, data: r.data, nominatim: r.nominatim || null, error: r.error, source: r.source
+    id: r.id, lat: r.lat, lng: r.lng, data: r.data,
+    nominatim: r.nominatim || null,
+    minimal: r.minimal || null,
+    error: r.error, source: r.source
   }));
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(serializable)); } catch(e) {}
 }
+
+// Base URL for the minimal-dataset server. The full server embeds
+// this page; the minimal server runs on the same host at :3001
+// (see docker-compose.yml). Override with ?minimal_url=... to point
+// at a different host (e.g. a remote test instance).
+const MINIMAL_BASE_URL = (() => {
+  const params = new URLSearchParams(location.search);
+  const override = params.get('minimal_url');
+  if (override) return override.replace(/\/$/, '');
+  return `${location.protocol}//${location.hostname}:3001`;
+})();
 
 function loadResults() {
   try {
@@ -452,14 +467,19 @@ function retestAllResults() {
   renderResults();
 
   const runOne = (entry) => new Promise((resolve) => {
-    fetch(`/reverse?lat=${entry.lat}&lon=${entry.lng}&key=test`)
-      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
-      .then(data => {
+    const fullFetch = fetch(`/reverse?lat=${entry.lat}&lon=${entry.lng}&key=test`)
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
+    // Re-query minimal too (its build can change with full server
+    // rebuilds — same source data). Nominatim is held over from the
+    // original fetch since the public API isn't tied to our build.
+    const minFetch = minimalEnabled
+      ? fetch(`${MINIMAL_BASE_URL}/reverse?lat=${entry.lat}&lon=${entry.lng}&key=test`)
+          .then(r => r.ok ? r.json() : null).catch(() => null)
+      : Promise.resolve(entry.minimal || null);
+    Promise.all([fullFetch, minFetch])
+      .then(([data, min]) => {
         entry.data = data;
-        // Keep entry.nominatim from the original fetch — Nominatim's
-        // answer doesn't change between our server rebuilds and
-        // re-querying it would just waste requests against the public
-        // instance.
+        entry.minimal = min;
         entry.loading = false;
         const hasPlaces = data.places && data.places.length > 0;
         const m = markers.get(entry.id);
@@ -630,19 +650,24 @@ function reverseGeocode(lat, lng, source) {
   const doFetch = () => {
     activeRequests++;
 
-    // Fetch from our API + Nominatim in parallel. Nominatim is opt-in
-    // (button in the results header); when off we resolve null for the
-    // comparison leg instead of hitting their API.
+    // Fetch from full + minimal + Nominatim in parallel. Minimal and
+    // Nominatim are both opt-in (toggles in the results header); when
+    // off we resolve null for that comparison leg.
     const ourFetch = fetch(`/reverse?lat=${lat}&lon=${lng}&key=test`)
       .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
+    const minFetch = minimalEnabled
+      ? fetch(`${MINIMAL_BASE_URL}/reverse?lat=${lat}&lon=${lng}&key=test`)
+          .then(r => r.ok ? r.json() : null).catch(() => null)
+      : Promise.resolve(null);
     const nomFetch = nominatimEnabled
       ? fetch(`https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=jsonv2`, {headers: {'User-Agent': 'geoshenanigans-test'}})
           .then(r => r.ok ? r.json() : null).catch(() => null)
       : Promise.resolve(null);
 
-    Promise.all([ourFetch, nomFetch])
-      .then(([data, nom]) => {
+    Promise.all([ourFetch, minFetch, nomFetch])
+      .then(([data, min, nom]) => {
         entry.data = data;
+        entry.minimal = min;
         entry.nominatim = nom;
         entry.loading = false;
         const hasPlaces = data.places && data.places.length > 0;
@@ -814,8 +839,48 @@ function updateNominatimBtn() {
   btn.textContent = 'Nominatim: ' + (nominatimEnabled ? 'On' : 'Off');
   btn.style.background = nominatimEnabled ? 'var(--green)' : 'var(--surface2)';
 }
-// Run once on initial load so the button reflects the saved state.
-document.addEventListener('DOMContentLoaded', updateNominatimBtn);
+
+// Minimal-dataset side-by-side lookup — queries the second server
+// on port 3001 (no postcodes, no POIs, admin + streets + addresses
+// + place nodes only).  Off by default to avoid CORS noise when the
+// minimal server isn't running.
+let minimalEnabled = localStorage.getItem('minimal_enabled') === '1';
+function toggleMinimal() {
+  minimalEnabled = !minimalEnabled;
+  localStorage.setItem('minimal_enabled', minimalEnabled ? '1' : '0');
+  updateMinimalBtn();
+  // When turning Minimal ON, fetch missing minimal data for any
+  // results that don't have it yet (cached from before the toggle
+  // existed, or fetched while toggle was off).  Without this the
+  // user has to manually click Re-test to populate minimal data.
+  if (minimalEnabled) {
+    const missing = results.filter(r => !r.loading && !r.error && (r.minimal === undefined || r.minimal === null));
+    if (missing.length > 0) {
+      const fillOne = (entry) => fetch(`${MINIMAL_BASE_URL}/reverse?lat=${entry.lat}&lon=${entry.lng}&key=test`)
+        .then(r => r.ok ? r.json() : null)
+        .catch(() => null)
+        .then(min => {
+          entry.minimal = min;
+          if (selectedId === entry.id) showDetail(entry.id);
+        });
+      // Fire all in parallel — minimal endpoint is local and rate
+      // limits are generous (100/s).
+      Promise.all(missing.map(fillOne)).then(() => { saveResults(); renderResults(); });
+    }
+  }
+  if (selectedId) showDetail(selectedId);
+}
+function updateMinimalBtn() {
+  const btn = document.getElementById('minimalBtn');
+  if (!btn) return;
+  btn.textContent = 'Minimal: ' + (minimalEnabled ? 'On' : 'Off');
+  btn.style.background = minimalEnabled ? 'var(--blue)' : 'var(--surface2)';
+}
+// Run once on initial load so buttons reflect saved state.
+document.addEventListener('DOMContentLoaded', () => {
+  updateNominatimBtn();
+  updateMinimalBtn();
+});
 
 // Shoelace-weighted centroid of a closed lng/lat ring
 function polygonCentroid(ring) {
@@ -956,28 +1021,39 @@ function showDetail(id) {
   }
 
   const d = r.data;
+  const min = r.minimal;
   const nom = r.nominatim;
+  const showMin = minimalEnabled && min;
   const showNom = nominatimEnabled && nom;
+
+  // Build column descriptors so the table render is a single loop
+  // regardless of which comparison legs are enabled.  Full is always
+  // present; minimal/nominatim toggle in via their state flags.
+  const cols = [
+    { label: 'Full',      color: 'var(--accent)', data: d,   addr: d.address || {} },
+  ];
+  if (showMin) cols.push({ label: 'Minimal',   color: 'var(--blue)',   data: min, addr: min.address || {} });
+  if (showNom) cols.push({ label: 'Nominatim', color: 'var(--green)',  data: nom, addr: nom.address || {} });
+
   let html = '';
 
-  // Display names
-  if (showNom) {
-    html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:12px">';
-    html += `<div><div style="font-size:11px;text-transform:uppercase;color:var(--accent);margin-bottom:4px">Ours</div><div style="font-size:13px;color:var(--text-dim)">${d.display_name ? escHtml(d.display_name) : '—'}</div></div>`;
-    html += `<div><div style="font-size:11px;text-transform:uppercase;color:var(--green);margin-bottom:4px">Nominatim</div><div style="font-size:13px;color:var(--text-dim)">${nom.display_name ? escHtml(nom.display_name) : '—'}</div></div>`;
+  // Display names — one block per active column.
+  if (cols.length > 1) {
+    html += `<div style="display:grid;grid-template-columns:repeat(${cols.length},1fr);gap:16px;margin-bottom:12px">`;
+    for (const c of cols) {
+      const dn = (c.data && c.data.display_name) ? escHtml(c.data.display_name) : '—';
+      html += `<div><div style="font-size:11px;text-transform:uppercase;color:${c.color};margin-bottom:4px">${c.label}</div><div style="font-size:13px;color:var(--text-dim)">${dn}</div></div>`;
+    }
     html += '</div>';
   } else {
     html += `<div style="margin-bottom:12px"><div style="font-size:11px;text-transform:uppercase;color:var(--accent);margin-bottom:4px">Display name</div><div style="font-size:13px;color:var(--text-dim)">${d.display_name ? escHtml(d.display_name) : '—'}</div></div>`;
   }
 
   // Aligned field breakdown table. Row set = every key present on
-  // EITHER side (ours or nominatim if enabled), not a hand-picked
-  // allow-list. That way any field we add to the response (new
-  // landmark class, shop, etc.) automatically appears in the UI
-  // without touching the test tool.
-  const ourAddr = d.address || {};
-  const nomAddr = (showNom && nom.address) || {};
-  const rowKeys = Array.from(new Set([...Object.keys(ourAddr), ...Object.keys(nomAddr)]));
+  // ANY active column, not a hand-picked allow-list. That way any
+  // field we add to the response (new landmark class, shop, etc.)
+  // automatically appears in the UI without touching the test tool.
+  const rowKeys = Array.from(new Set(cols.flatMap(c => Object.keys(c.addr))));
   // Preferred ordering for the common address hierarchy. Unknown
   // fields (landmark classes etc.) fall through to alphabetical at
   // the end so they're still shown, just less prominently.
@@ -998,53 +1074,82 @@ function showDetail(id) {
   });
 
   html += '<table style="width:100%;border-collapse:collapse;font-size:13px">';
-  if (showNom) {
-    html += '<tr style="border-bottom:1px solid var(--border)"><th style="text-align:left;padding:4px 8px;color:var(--text-dim);width:140px">Field</th><th style="text-align:left;padding:4px 8px;color:var(--accent)">Ours</th><th style="text-align:left;padding:4px 8px;color:var(--green)">Nominatim</th></tr>';
-  } else {
-    html += '<tr style="border-bottom:1px solid var(--border)"><th style="text-align:left;padding:4px 8px;color:var(--text-dim);width:140px">Field</th><th style="text-align:left;padding:4px 8px;color:var(--accent)">Value</th></tr>';
+  html += '<tr style="border-bottom:1px solid var(--border)"><th style="text-align:left;padding:4px 8px;color:var(--text-dim);width:140px">Field</th>';
+  for (const c of cols) {
+    html += `<th style="text-align:left;padding:4px 8px;color:${c.color}">${c.label}</th>`;
   }
+  html += '</tr>';
   for (const f of rowKeys) {
-    const ours = ourAddr[f] || '';
-    const theirs = nomAddr[f] || '';
-    if (!ours && !theirs) continue;
-    if (showNom) {
-      const mismatch = ours && theirs && ours !== theirs;
-      const weMiss = !ours && theirs;
-      const theyMiss = ours && !theirs;
-      const ourStyle = mismatch ? 'color:var(--red)' : (theyMiss ? '' : '');
-      const nomStyle = mismatch ? 'color:var(--red)' : (weMiss ? 'color:var(--orange)' : '');
-      const rowBg = (mismatch || weMiss) ? 'background:rgba(217,74,74,0.08)' : '';
-      html += `<tr style="border-bottom:1px solid var(--border);${rowBg}">`;
-      html += `<td style="padding:4px 8px;color:var(--text-dim)">${escHtml(f)}</td>`;
-      html += `<td style="padding:4px 8px;${ourStyle}">${ours ? escHtml(ours) : '<span style="color:var(--orange)">—</span>'}</td>`;
-      html += `<td style="padding:4px 8px;${nomStyle}">${theirs ? escHtml(theirs) : '<span style="color:var(--text-dim)">—</span>'}</td>`;
-      html += '</tr>';
-    } else {
-      html += '<tr style="border-bottom:1px solid var(--border)">';
-      html += `<td style="padding:4px 8px;color:var(--text-dim)">${escHtml(f)}</td>`;
-      html += `<td style="padding:4px 8px">${escHtml(ours)}</td>`;
-      html += '</tr>';
+    const vals = cols.map(c => c.addr[f] || '');
+    if (vals.every(v => !v)) continue;
+    // Mismatch = at least two non-empty values disagree. Highlight the
+    // whole row faintly red if any disagreement, and color individual
+    // cells: red for cells participating in a disagreement, orange for
+    // empty cells in a row where another column has a value.
+    const present = vals.filter(v => v);
+    const allAgree = present.every(v => v === present[0]);
+    const anyMismatch = !allAgree;
+    const someEmpty = vals.some(v => !v) && present.length > 0;
+    const rowBg = (anyMismatch || someEmpty) ? 'background:rgba(217,74,74,0.06)' : '';
+    html += `<tr style="border-bottom:1px solid var(--border);${rowBg}">`;
+    html += `<td style="padding:4px 8px;color:var(--text-dim)">${escHtml(f)}</td>`;
+    for (const v of vals) {
+      let style = '';
+      let cellHtml;
+      if (!v) {
+        cellHtml = '<span style="color:var(--orange)">—</span>';
+      } else if (anyMismatch) {
+        style = 'color:var(--red)';
+        cellHtml = escHtml(v);
+      } else {
+        cellHtml = escHtml(v);
+      }
+      html += `<td style="padding:4px 8px;${style}">${cellHtml}</td>`;
     }
+    html += '</tr>';
   }
   html += '</table>';
 
-  // Places
-  if (d.places && d.places.length > 0) {
-    html += '<div class="detail-places"><h3 style="margin:10px 0 6px">Places</h3><table><tr><th>Name</th><th>Category</th><th>Distance</th></tr>';
-    for (const p of d.places) {
-      html += `<tr><td>${escHtml(p.name)}</td><td>${escHtml(p.category)}</td><td>${p.distance_m}m</td></tr>`;
+  // Places — show one section per column when there's a comparison,
+  // otherwise the original single-table view. Minimal mode usually
+  // returns no places (POI data is omitted) so its column will be
+  // empty by design.
+  const haveAnyPlaces = cols.some(c => c.data && c.data.places && c.data.places.length > 0);
+  if (haveAnyPlaces) {
+    if (cols.length > 1) {
+      html += `<div class="detail-places"><h3 style="margin:10px 0 6px">Places</h3>`;
+      html += `<div style="display:grid;grid-template-columns:repeat(${cols.length},1fr);gap:12px">`;
+      for (const c of cols) {
+        const places = (c.data && c.data.places) || [];
+        html += `<div><div style="font-size:11px;text-transform:uppercase;color:${c.color};margin-bottom:4px">${c.label}</div>`;
+        if (places.length === 0) {
+          html += '<div style="font-size:12px;color:var(--text-dim)">— no places —</div>';
+        } else {
+          html += '<table style="width:100%;font-size:12px"><tr><th style="text-align:left;color:var(--text-dim)">Name</th><th style="text-align:left;color:var(--text-dim)">Category</th><th style="text-align:left;color:var(--text-dim)">Dist</th></tr>';
+          for (const p of places) {
+            html += `<tr><td>${escHtml(p.name)}</td><td>${escHtml(p.category)}</td><td>${p.distance_m}m</td></tr>`;
+          }
+          html += '</table>';
+        }
+        html += '</div>';
+      }
+      html += '</div></div>';
+    } else if (d.places && d.places.length > 0) {
+      html += '<div class="detail-places"><h3 style="margin:10px 0 6px">Places</h3><table><tr><th>Name</th><th>Category</th><th>Distance</th></tr>';
+      for (const p of d.places) {
+        html += `<tr><td>${escHtml(p.name)}</td><td>${escHtml(p.category)}</td><td>${p.distance_m}m</td></tr>`;
+      }
+      html += '</table></div>';
     }
-    html += '</table></div>';
   }
 
-  // Raw JSON (both, collapsible)
-  html += '<details style="margin-top:10px"><summary style="cursor:pointer;color:var(--accent)">Our response JSON</summary>';
-  html += `<div class="json-block">${syntaxHighlight(d)}</div>`;
-  html += '</details>';
+  // Raw JSON for each active column (collapsible).
+  html += `<details style="margin-top:10px"><summary style="cursor:pointer;color:var(--accent)">Full response JSON</summary><div class="json-block">${syntaxHighlight(d)}</div></details>`;
+  if (showMin) {
+    html += `<details style="margin-top:6px"><summary style="cursor:pointer;color:var(--blue)">Minimal response JSON</summary><div class="json-block">${syntaxHighlight(min)}</div></details>`;
+  }
   if (showNom) {
-    html += '<details style="margin-top:6px"><summary style="cursor:pointer;color:var(--green)">Nominatim response JSON</summary>';
-    html += `<div class="json-block">${syntaxHighlight(nom)}</div>`;
-    html += '</details>';
+    html += `<details style="margin-top:6px"><summary style="cursor:pointer;color:var(--green)">Nominatim response JSON</summary><div class="json-block">${syntaxHighlight(nom)}</div></details>`;
   }
 
   content.innerHTML = html;

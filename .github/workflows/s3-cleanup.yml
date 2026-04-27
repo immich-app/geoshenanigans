@@ -67,7 +67,8 @@ jobs:
 
           for DATE in $BUILD_DATES; do
             if [ "$DATE" \< "$INDEX_CUTOFF" ]; then
-              # Old build — remove index files (.bin) but keep patches + manifests
+              # Old build — remove index files (.bin) but keep patches +
+              # configurations.json
               echo "[Tigris] $DATE: removing index files (keeping patches)..."
               # List and remove only .bin files
               $S5 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$DATE/*.bin" 2>/dev/null \
@@ -77,12 +78,14 @@ jobs:
                   done
               echo "[Tigris] $DATE: indexes removed"
 
-              # Update this date's manifest to mark indexes as removed
-              MANIFEST=$($S5 cat "s3://$S3_BUCKET/$S3_PREFIX/builds/$DATE/manifest.json" 2>/dev/null || echo "{}")
-              if [ "$MANIFEST" != "{}" ]; then
-                echo "$MANIFEST" | jq '. + {indexes_available: false}' \
-                  | $S5 pipe "s3://$S3_BUCKET/$S3_PREFIX/builds/$DATE/manifest.json"
-                echo "[Tigris] $DATE: manifest updated (indexes_available: false)"
+              # Mark indexes as removed in this date's configurations.json
+              # so clients know patches are still available but the full
+              # download set has aged out.
+              CFG=$($S5 cat "s3://$S3_BUCKET/$S3_PREFIX/builds/$DATE/configurations.json" 2>/dev/null || echo "{}")
+              if [ "$CFG" != "{}" ]; then
+                echo "$CFG" | jq '.build = ((.build // {}) + {indexes_available: false})' \
+                  | $S5 pipe "s3://$S3_BUCKET/$S3_PREFIX/builds/$DATE/configurations.json"
+                echo "[Tigris] $DATE: configurations.json updated (build.indexes_available: false)"
               fi
 
               [ -z "$OLDEST_PATCHES" ] && OLDEST_PATCHES="$DATE"
@@ -134,10 +137,18 @@ jobs:
           echo "=== Updating latest.json ==="
           LATEST=$(echo "$BUILD_DATES" | tail -1)
           if [ -n "$LATEST" ]; then
-            # Get build_version and patch_version from latest manifest
-            LATEST_MANIFEST=$($S5 cat "s3://$S3_BUCKET/$S3_PREFIX/builds/$LATEST/manifest.json" 2>/dev/null || echo "{}")
-            BUILD_VER=$(echo "$LATEST_MANIFEST" | jq -r '.build_version // 2')
-            PATCH_VER=$(echo "$LATEST_MANIFEST" | jq -r '.patch_version // 1')
+            # Read build_version and patch_version from latest configurations.json.
+            # Falls back to legacy manifest.json for any old builds still
+            # using that name during the transition.
+            LATEST_CFG=$($S5 cat "s3://$S3_BUCKET/$S3_PREFIX/builds/$LATEST/configurations.json" 2>/dev/null || echo "")
+            if [ -n "$LATEST_CFG" ] && [ "$LATEST_CFG" != "{}" ]; then
+              BUILD_VER=$(echo "$LATEST_CFG" | jq -r '.build.version // 2')
+              PATCH_VER=$(echo "$LATEST_CFG" | jq -r '.build.patch_version // 1')
+            else
+              LATEST_MANIFEST=$($S5 cat "s3://$S3_BUCKET/$S3_PREFIX/builds/$LATEST/manifest.json" 2>/dev/null || echo "{}")
+              BUILD_VER=$(echo "$LATEST_MANIFEST" | jq -r '.build_version // 2')
+              PATCH_VER=$(echo "$LATEST_MANIFEST" | jq -r '.patch_version // 1')
+            fi
 
             jq -n \
               --argjson build_version "$BUILD_VER" \

@@ -31,6 +31,11 @@ rustls-acme = { version = "0.14", features = ["axum"] }
 axum-server = "0.7"
 bcrypt = "0.15"
 getrandom = "0.2"
+arc-swap = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+zstd = "0.13"
+sha2 = "0.10"
+futures-util = "0.3"
 
 # Wasm-only deps for the JS-callback chunked-byte-source backing.
 [target.'cfg(target_arch = "wasm32")'.dependencies]

@@ -7,6 +7,8 @@ use s2::latlng::LatLng;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Arc;
 
 // Byte-source abstraction.  Two access patterns:
 //
@@ -859,6 +861,44 @@ impl StringPool {
         unsafe { &*p }
     }
 }
+
+// --- Continent layout ---
+//
+// One Index per OSM continent. The builder writes per-continent
+// directories (`<root>/<name>/`) with the same file shape as planet,
+// just filtered to that continent's bbox. The server picks the
+// matching continent(s) per query via bbox dispatch.
+//
+// Bboxes are kept verbatim from `builder/src/continent_filter.cpp`'s
+// `kContinents[]` so a query lands in the same set of continents the
+// builder used when assigning records.
+
+#[derive(Clone, Copy, Debug)]
+pub struct ContinentBBox {
+    pub name: &'static str,
+    pub min_lat: f64,
+    pub max_lat: f64,
+    pub min_lng: f64,
+    pub max_lng: f64,
+}
+
+impl ContinentBBox {
+    pub fn contains(&self, lat: f64, lng: f64) -> bool {
+        lat >= self.min_lat && lat <= self.max_lat
+            && lng >= self.min_lng && lng <= self.max_lng
+    }
+}
+
+pub const CONTINENTS: &[ContinentBBox] = &[
+    ContinentBBox { name: "africa",          min_lat: -35.0, max_lat:  37.5, min_lng:  -25.0, max_lng:  55.0 },
+    ContinentBBox { name: "asia",            min_lat: -12.0, max_lat:  82.0, min_lng:   25.0, max_lng: 180.0 },
+    ContinentBBox { name: "europe",          min_lat:  35.0, max_lat:  72.0, min_lng:  -25.0, max_lng:  45.0 },
+    ContinentBBox { name: "north-america",   min_lat:   7.0, max_lat:  84.0, min_lng: -170.0, max_lng: -50.0 },
+    ContinentBBox { name: "south-america",   min_lat: -56.0, max_lat:  13.0, min_lng:  -82.0, max_lng: -34.0 },
+    ContinentBBox { name: "oceania",         min_lat: -50.0, max_lat:   0.0, min_lng:  110.0, max_lng: 180.0 },
+    ContinentBBox { name: "central-america", min_lat:   7.0, max_lat:  23.5, min_lng: -120.0, max_lng: -57.0 },
+    ContinentBBox { name: "antarctica",      min_lat: -90.0, max_lat: -60.0, min_lng: -180.0, max_lng: 180.0 },
+];
 
 // --- Index data ---
 
@@ -3513,6 +3553,243 @@ impl Index {
         let display_name = format_address(&address);
         Address { display_name, address, places }
     }
+}
+
+// --- Multi-continent dispatcher ---
+//
+// Holds one optionally-loaded `Index` per continent. Each query bbox-
+// matches against `CONTINENTS`; for matching continents that have an
+// index loaded the query runs and the most-specific result wins.
+// Unloaded matches are surfaced via `unloaded_matches()` so the caller
+// (later: the on-demand downloader) can decide what to do.
+//
+// Backward-compat: if `<root>/admin_cells.bin` exists at construction
+// time, the old flat single-region layout is wrapped in a synthetic
+// "world" continent with a global bbox. New deployments use per-
+// continent subdirs.
+
+pub struct ContinentSlot {
+    pub bbox: ContinentBBox,
+    /// Atomically-swappable index slot. `None` until the continent's
+    /// files are loaded (or when load is asked but the dir is empty).
+    /// Hot-add via `MultiIndex::install_region` swaps a fresh Arc in
+    /// without locking out concurrent queries.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub index: arc_swap::ArcSwapOption<Index>,
+    #[cfg(target_arch = "wasm32")]
+    pub index: Option<Index>,
+}
+
+pub struct MultiIndex {
+    pub continents: Vec<ContinentSlot>,
+    /// Captured at construction so `install_region` knows where to
+    /// look for newly-downloaded files.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub root_dir: String,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub street_cell_level: u64,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub admin_cell_level: u64,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub search_distance: f64,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl MultiIndex {
+    /// Try per-continent subdirs first (`<root>/africa/`, `<root>/asia/`, …).
+    /// Fall back to a single-region "world" Index if `<root>` itself looks
+    /// like a flat layout. Either way, returns a MultiIndex whose query()
+    /// behaves the same — single-region setups just see one slot.
+    pub fn load(root: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Self, String> {
+        // Flat-layout fast path: keep existing single-region deployments
+        // working without changes. The synthetic bbox covers the globe.
+        if std::path::Path::new(&format!("{}/admin_cells.bin", root)).exists() {
+            let idx = Index::load(root, street_cell_level, admin_cell_level, search_distance)?;
+            let world = ContinentBBox {
+                name: "world",
+                min_lat: -90.0, max_lat: 90.0,
+                min_lng: -180.0, max_lng: 180.0,
+            };
+            return Ok(MultiIndex {
+                continents: vec![ContinentSlot {
+                    bbox: world,
+                    index: arc_swap::ArcSwapOption::from(Some(Arc::new(idx))),
+                }],
+                root_dir: root.to_string(),
+                street_cell_level, admin_cell_level, search_distance,
+            });
+        }
+
+        // Per-continent layout: walk the canonical list, load whichever
+        // dirs exist. Missing continents stay as None — they'll either
+        // remain empty (caller doesn't care) or get downloaded later.
+        let mut continents = Vec::with_capacity(CONTINENTS.len());
+        let mut loaded = 0usize;
+        for bbox in CONTINENTS {
+            let dir = format!("{}/{}", root, bbox.name);
+            let arc_opt = if std::path::Path::new(&format!("{}/admin_cells.bin", dir)).exists() {
+                loaded += 1;
+                Some(Arc::new(Index::load(&dir, street_cell_level, admin_cell_level, search_distance)?))
+            } else {
+                None
+            };
+            continents.push(ContinentSlot {
+                bbox: *bbox,
+                index: arc_swap::ArcSwapOption::from(arc_opt),
+            });
+        }
+        if loaded == 0 {
+            // Empty start is OK now — the downloader can populate
+            // continents later. Caller can check `loaded_count()`.
+        }
+        Ok(MultiIndex {
+            continents,
+            root_dir: root.to_string(),
+            street_cell_level, admin_cell_level, search_distance,
+        })
+    }
+
+    pub fn loaded_count(&self) -> usize {
+        self.continents.iter().filter(|c| c.index.load().is_some()).count()
+    }
+
+    /// Snapshot of indices whose bbox covers the point. Returns Arc
+    /// clones so callers can hold them across an await without keeping
+    /// the MultiIndex borrowed. Most points hit one continent; boundary
+    /// regions (Russia, Türkiye, Egypt-Sinai) hit two.
+    pub fn loaded_matches(&self, lat: f64, lng: f64) -> Vec<Arc<Index>> {
+        self.continents.iter()
+            .filter(|c| c.bbox.contains(lat, lng))
+            .filter_map(|c| c.index.load_full())
+            .collect()
+    }
+
+    /// Names of bbox-matching continents that aren't loaded. The
+    /// downloader uses this to know what to fetch when a request lands
+    /// on an unloaded region.
+    pub fn unloaded_matches(&self, lat: f64, lng: f64) -> Vec<&'static str> {
+        self.continents.iter()
+            .filter(|c| c.bbox.contains(lat, lng) && c.index.load().is_none())
+            .map(|c| c.bbox.name)
+            .collect()
+    }
+
+    /// Hot-add a freshly-downloaded continent. Atomically swaps in a
+    /// new Arc<Index>; concurrent readers either still see the old
+    /// slot or the new one — never a torn state.
+    pub fn install_region(&self, name: &str) -> Result<(), String> {
+        let slot = self.continents.iter().find(|c| c.bbox.name == name)
+            .ok_or_else(|| format!("unknown continent: {}", name))?;
+        let dir = format!("{}/{}", self.root_dir, name);
+        let idx = Index::load(&dir,
+            self.street_cell_level, self.admin_cell_level, self.search_distance)?;
+        slot.index.store(Some(Arc::new(idx)));
+        Ok(())
+    }
+
+    /// Reverse-geocode dispatch. Picks the best result among matching
+    /// loaded continents — "best" = the one whose Address chain has the
+    /// most populated fields (deeper admin chain wins). On the typical
+    /// non-boundary case there's only one match and this is just a
+    /// pass-through.
+    ///
+    /// Returns (Vec<Arc<Index>>, JSON-serialized response). The Arcs
+    /// are returned alongside so the caller can keep them alive while
+    /// the borrowed-string Address gets serialized — borrowing across
+    /// an Arc deref is sound only while the Arc is held.
+    pub fn query_json(&self, lat: f64, lng: f64) -> String {
+        let arcs = self.loaded_matches(lat, lng);
+        let mut best_json: Option<(i32, String)> = None;
+        for arc in &arcs {
+            let r = arc.query(lat, lng);
+            let s = address_score(&r);
+            if best_json.as_ref().map_or(true, |(prev, _)| s > *prev) {
+                best_json = Some((s, serde_json::to_string(&r).unwrap_or_default()));
+            }
+        }
+        best_json.map(|(_, j)| j).unwrap_or_else(|| "{}".to_string())
+    }
+}
+
+#[cfg(test)]
+mod multi_index_tests {
+    use super::*;
+
+    fn b(name: &str) -> ContinentBBox {
+        *CONTINENTS.iter().find(|c| c.name == name).unwrap()
+    }
+
+    #[test]
+    fn istanbul_hits_both_europe_and_asia() {
+        // 41.01°N, 28.97°E — straddles the bbox split between europe
+        // and asia, so a query here should bbox-match both.
+        assert!(b("europe").contains(41.01, 28.97));
+        assert!(b("asia").contains(41.01, 28.97));
+    }
+
+    #[test]
+    fn moscow_hits_both_europe_and_asia() {
+        // 55.75°N, 37.62°E — Russia overlaps the bbox split.
+        assert!(b("europe").contains(55.75, 37.62));
+        assert!(b("asia").contains(55.75, 37.62));
+    }
+
+    #[test]
+    fn lagos_hits_only_africa() {
+        // 6.45°N, 3.40°E — well inside africa, west of every other
+        // continent's bbox.
+        assert!(b("africa").contains(6.45, 3.40));
+        assert!(!b("asia").contains(6.45, 3.40));
+        assert!(!b("europe").contains(6.45, 3.40));
+    }
+
+    #[test]
+    fn sinai_hits_both_africa_and_asia() {
+        // 28.5°N, 33.6°E — Egyptian Sinai is on the asia side of the
+        // OSM continent split but still inside africa's bbox.
+        assert!(b("africa").contains(28.5, 33.6));
+        assert!(b("asia").contains(28.5, 33.6));
+    }
+
+    #[test]
+    fn pacific_ocean_no_match() {
+        // 0°N, 180°E (Antimeridian over deep Pacific). Inside oceania's
+        // bbox technically, but most other continents miss.
+        let matches: Vec<_> = CONTINENTS.iter().filter(|c| c.contains(0.0, 180.0)).collect();
+        assert!(matches.iter().any(|c| c.name == "oceania"));
+        assert!(!matches.iter().any(|c| c.name == "europe"));
+        assert!(!matches.iter().any(|c| c.name == "africa"));
+    }
+
+    #[test]
+    fn address_score_prefers_populated() {
+        let empty = Address::default();
+        let mut populated = Address::default();
+        populated.address.country = Some("France");
+        populated.address.city = Some("Paris");
+        assert!(address_score(&populated) > address_score(&empty));
+    }
+}
+
+/// Crude "how specific is this result" score for picking among
+/// boundary-overlap candidates. Counts populated address fields plus a
+/// nudge for places resolved.
+fn address_score(a: &Address<'_>) -> i32 {
+    let d = &a.address;
+    let mut score = 0;
+    if d.country.is_some() { score += 1; }
+    if d.state.is_some() { score += 2; }
+    if d.region.is_some() { score += 2; }
+    if d.county.is_some() { score += 3; }
+    if d.city.is_some() { score += 4; }
+    if d.town.is_some() { score += 4; }
+    if d.village.is_some() { score += 4; }
+    if d.suburb.is_some() { score += 3; }
+    if d.neighbourhood.is_some() { score += 3; }
+    if d.road.is_some() { score += 5; }
+    if d.house_number.is_some() { score += 6; }
+    if !a.places.is_empty() { score += 1; }
+    score
 }
 
 // --- Geometry helpers ---

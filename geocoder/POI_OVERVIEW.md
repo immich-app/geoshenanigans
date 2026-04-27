@@ -93,15 +93,20 @@ A client picks: **region** + **mode** + **quality** + **POI tier** (all independ
 
 ### By Quality (planet, admin boundary resolution)
 
-| Quality | Size (planet, v15) | Simplification | Boundary precision |
-|---|---|---|---|
-| Uncapped | 1.46 GiB | Full resolution | <1 m |
-| q0.2 | 765 MiB | Minimal simplification | ~3 m at L8 |
-| q0.5 | 519 MiB | Light simplification | ~7 m at L8 |
-| q1 | 369 MiB | Moderate | ~15 m at L8 |
-| q1.5 | 297 MiB | Noticeable simplification | ~22 m at L8 |
-| q2 | 253 MiB | Heavy simplification | ~30 m at L8 |
-| **q2.5** | **223 MiB** | **Default — maximum simplification** | **~37 m at L8** |
+The vertex file (`admin_vertices.bin`) is what varies between quality
+variants — the rest of the admin-only deployable set (place_nodes,
+postcode_centroids, strings tiers, admin polygons, postal vertices,
+parents, etc.) adds **328 MiB raw / 118 MiB zstd** regardless of quality.
+
+| Quality | `admin_vertices.bin` | Full admin-only set (raw) | (zstd download) | Boundary precision (L8) |
+|---|---|---|---|---|
+| Uncapped | 1.46 GiB | 1.87 GiB | 1.44 GiB | <1 m |
+| q0.2 | 765 MiB | 1.13 GiB | 865 MiB | ~3 m |
+| q0.5 | 519 MiB | 899 MiB | 635 MiB | ~7 m |
+| q1 | 369 MiB | 741 MiB | 489 MiB | ~15 m |
+| q1.5 | 297 MiB | 665 MiB | 419 MiB | ~22 m |
+| q2 | 253 MiB | 619 MiB | 375 MiB | ~30 m |
+| **q2.5** | **223 MiB** | **587 MiB** | **345 MiB** | **~37 m — default** |
 
 ### By POI Tier (planet)
 
