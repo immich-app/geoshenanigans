@@ -442,8 +442,10 @@ jobs:
 
           echo "Building geocoder index for $TODAY..."
           START=$(date +%s)
-          # Tee the full log to a file so continent warnings etc. aren't lost,
-          # while still streaming the tail to the step output for quick glance.
+          # pipefail so build-index crashes propagate (without it, the
+          # downstream tee/tail mask exit code and the workflow proceeds
+          # to compress with no manifest.json — see 24968665275).
+          set -o pipefail
           build-index "$WORKDIR/output/" "$WORKDIR/planet.osm.pbf" \
             $BUILD_ARGS 2>&1 | tee "$WORKDIR/build.log" | tail -30
           echo "Build completed in $(($(date +%s) - START))s"
