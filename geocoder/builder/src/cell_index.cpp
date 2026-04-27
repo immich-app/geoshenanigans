@@ -711,7 +711,9 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
     std::vector<AdminPolygon> postal_polys;
     std::vector<uint8_t> new_verts_bytes;       // packed: variable stride per polygon
     std::vector<uint8_t> postal_verts_bytes;
-    new_verts_bytes.reserve(data.admin_polygons.size() * 8 * 100); // rough hint
+    // Don't pre-reserve — overestimates lead to large unused
+    // allocations across multiple concurrent continent writers and can
+    // OOM the GH runner.  Vector growth is amortized cheap.
 
     // Pack one polygon's vertices into the byte stream.  Writes a
     // 10-byte header (encoding tag + bbox_min lat/lng) followed by
