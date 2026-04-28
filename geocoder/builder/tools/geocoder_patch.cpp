@@ -253,6 +253,19 @@ int main(int argc, char* argv[]) {
     std::unordered_map<uint64_t, uint8_t> flag_corrections;
     struct CellCorr { uint64_t cell_id; std::vector<uint32_t> ids; };
     std::unordered_map<uint32_t, std::vector<CellCorr>> entry_corrections;
+    // POI parent-id remap (from POI_PARENT_REMAP_MARKER). Applied during
+    // POI_RECORDS MATCH replay to bytes 24/32 of each record alongside
+    // the str_remap on byte 16. Sorted by old_id for binary-search lookup.
+    std::vector<std::pair<uint32_t,uint32_t>> poi_admin_remap;
+    std::vector<std::pair<uint32_t,uint32_t>> poi_street_remap;
+    auto poi_remap_lookup = [](const std::vector<std::pair<uint32_t,uint32_t>>& v,
+                               uint32_t old_id) -> uint32_t {
+        if (v.empty()) return old_id;
+        auto it = std::lower_bound(v.begin(), v.end(),
+            std::make_pair(old_id, (uint32_t)0));
+        if (it != v.end() && it->first == old_id) return it->second;
+        return old_id;
+    };
 
     while (pos < patch_size) {
         uint32_t file_id = ru32();
@@ -366,6 +379,26 @@ int main(int argc, char* argv[]) {
                 }
                 std::cerr << "  Secondary remap " << fid << ": " << np << " pairs" << std::endl;
             }
+            continue;
+        }
+        if (file_id == POI_PARENT_REMAP_MARKER) {
+            // Format: n_admin_pairs(u32), [(o,n):u32]*na, n_street_pairs(u32), [(o,n):u32]*ns
+            uint32_t na = ru32();
+            poi_admin_remap.resize(na);
+            for (uint32_t i = 0; i < na; i++) {
+                uint32_t o = ru32(), n = ru32();
+                poi_admin_remap[i] = {o, n};
+            }
+            uint32_t ns = ru32();
+            poi_street_remap.resize(ns);
+            for (uint32_t i = 0; i < ns; i++) {
+                uint32_t o = ru32(), n = ru32();
+                poi_street_remap[i] = {o, n};
+            }
+            std::sort(poi_admin_remap.begin(), poi_admin_remap.end());
+            std::sort(poi_street_remap.begin(), poi_street_remap.end());
+            std::cerr << "  POI parent-id remap: admin_pairs=" << na
+                      << " street_pairs=" << ns << std::endl;
             continue;
         }
         if (file_id == ENTRY_CORRECTION_MARKER) {
@@ -507,6 +540,11 @@ int main(int argc, char* argv[]) {
                     bool modified = false;
                     // Check if this record needs any modification
                     if (!remap_offs.empty() || needs_padding) modified = true;
+                    // POI records always need parent-id remap consideration
+                    // (admin/street id-space shifts every build).
+                    if (file_id == (uint32_t)PatchFileId::POI_RECORDS &&
+                        (!poi_admin_remap.empty() || !poi_street_remap.empty()))
+                        modified = true;
                     // Check fixup using lazy decoder (reads from patch mmap, zero allocation)
                     uint32_t fixup_val = 0;
                     bool has_fixup = fixup_dec.lookup(old_rec + k, fixup_val);
@@ -526,6 +564,26 @@ int main(int argc, char* argv[]) {
                             uint32_t v; memcpy(&v, rec_buf.data() + off, 4);
                             uint32_t nv = str_remap_lookup(v);
                             if (nv != v) memcpy(rec_buf.data() + off, &nv, 4);
+                        }
+                        // Apply POI parent-id remap (must mirror the diff
+                        // tool's pre-pr_seq rewrite of bytes 24/32 so MATCH
+                        // replays reconstruct identical bytes).
+                        if (file_id == (uint32_t)PatchFileId::POI_RECORDS) {
+                            constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
+                            if (actual_stride >= 28 && !poi_street_remap.empty()) {
+                                uint32_t st; memcpy(&st, rec_buf.data() + 24, 4);
+                                if (st != NO_DATA) {
+                                    uint32_t nst = poi_remap_lookup(poi_street_remap, st);
+                                    if (nst != st) memcpy(rec_buf.data() + 24, &nst, 4);
+                                }
+                            }
+                            if (actual_stride >= 36 && !poi_admin_remap.empty()) {
+                                uint32_t pp; memcpy(&pp, rec_buf.data() + 32, 4);
+                                if (pp != NO_DATA) {
+                                    uint32_t npp = poi_remap_lookup(poi_admin_remap, pp);
+                                    if (npp != pp) memcpy(rec_buf.data() + 32, &npp, 4);
+                                }
+                            }
                         }
                         // Apply fixup (node_offset/vertex_offset — at byte 0 for most types, byte 8 for POI records)
                         if (has_fixup) {

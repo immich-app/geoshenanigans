@@ -17,6 +17,7 @@
 #include <ctime>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iomanip>
 #include <iostream>
 #include <malloc.h>
@@ -671,6 +672,38 @@ int main(int argc, char* argv[]) {
         if (m.size > 0 || m.data != nullptr) return m;
         return mmap_file(dir + "/../../full/" + fname);
     };
+    // Generic fallback loader for shared-across-variants files. Used so
+    // t_admin/t_street can compute the parent-id remap that t_poi needs
+    // even when geocoder-diff is invoked on a per-variant subdir
+    // (e.g. <region>/poi/<tier>/) where admin_polygons.bin lives in
+    // <region>/quality/q2.5/ and street_ways.bin lives in <region>/full/.
+    // Returns the load path on success (so caller can detect fallback
+    // and suppress emitting a merge section that would target the
+    // wrong output directory).
+    auto try_load_with_fallback = [&](const std::string& dir, const char* fname,
+                                       std::initializer_list<const char*> fallbacks)
+            -> std::pair<MappedFile, bool> {
+        MappedFile m = mmap_file(dir + "/" + fname);
+        if (m.size > 0) return {m, false};
+        for (const char* fb : fallbacks) {
+            if (m.data) unmap_file(m);
+            m = mmap_file(dir + "/" + fb + fname);
+            if (m.size > 0) return {m, true};
+        }
+        return {m, false};
+    };
+    auto try_load_with_fallback_rw = [&](const std::string& dir, const char* fname,
+                                          std::initializer_list<const char*> fallbacks)
+            -> std::pair<MappedFileRW, bool> {
+        MappedFileRW m = mmap_file_rw(dir + "/" + fname);
+        if (m.size > 0) return {m, false};
+        for (const char* fb : fallbacks) {
+            if (m.data) unmap_file(m);
+            m = mmap_file_rw(dir + "/" + fb + fname);
+            if (m.size > 0) return {m, true};
+        }
+        return {m, false};
+    };
     for (int t = 0; t < 5; t++) {
         old_tier_maps[t] = try_load_tier(old_dir, kStrTierFilenames[t]);
         new_tier_maps[t] = try_load_tier(new_dir, kStrTierFilenames[t]);
@@ -983,6 +1016,15 @@ int main(int argc, char* argv[]) {
     double merge_start = now_ms();
     std::cerr << "Building merge sequences (parallel)..." << std::endl;
 
+    // t_poi needs the full admin + street id_remaps to rewrite old
+    // PoiRecord parent ids before pr_seq is built. t_admin and t_street
+    // signal completion via these promises so t_poi can run in parallel
+    // with t_addr / t_interp / t_place / t_cells (only blocking on the
+    // narrow window where the remaps are consumed).
+    std::promise<void> admin_remap_ready, street_remap_ready;
+    std::shared_future<void> admin_remap_future = admin_remap_ready.get_future().share();
+    std::shared_future<void> street_remap_future = street_remap_ready.get_future().share();
+
     // Group 1: addr_points (old=COW mmap for string remap, new=read-only mmap)
     std::thread t_addr([&]() {
         double gs = now_ms();
@@ -1027,13 +1069,19 @@ int main(int argc, char* argv[]) {
     // Group 2: street_ways → street_nodes
     // old_w = COW mmap (needs string remap + offset fixup), new_w = read-only mmap
     // nodes = read-only mmap (huge files, never modified — biggest memory win)
+    bool street_from_fallback = false;
     std::thread t_street([&]() {
         double gs = now_ms();
-        auto old_w = mmap_file_rw(old_dir + "/street_ways.bin");
+        auto [old_w, ow_fb] = try_load_with_fallback_rw(old_dir, "street_ways.bin",
+                                                         {"../full/", "../../full/"});
+        auto [new_w, nw_fb] = try_load_with_fallback(new_dir, "street_ways.bin",
+                                                      {"../full/", "../../full/"});
+        street_from_fallback = (ow_fb || nw_fb);
         remap_field(old_w.data, old_w.size, way_stride, way_stride == 12 ? 8 : 5, str_remap);
-        auto new_w = mmap_file(new_dir + "/street_ways.bin");
-        auto old_n = mmap_file(old_dir + "/street_nodes.bin");
-        auto new_n = mmap_file(new_dir + "/street_nodes.bin");
+        auto [old_n, _on_fb] = try_load_with_fallback(old_dir, "street_nodes.bin",
+                                                       {"../full/", "../../full/"});
+        auto [new_n, _nn_fb] = try_load_with_fallback(new_dir, "street_nodes.bin",
+                                                       {"../full/", "../../full/"});
         madvise(const_cast<char*>(old_n.data), old_n.size, MADV_SEQUENTIAL);
         madvise(const_cast<char*>(new_n.data), new_n.size, MADV_SEQUENTIAL);
         // Fixup node_offsets
@@ -1060,13 +1108,39 @@ int main(int argc, char* argv[]) {
         res_ways = {PatchFileId::STREET_WAYS, "street_ways.bin", way_stride,
                     old_w.size, new_w.size, way_seq, std::move(fixups), std::move(soft), std::move(id_rm)};
         log_merge(res_ways);
+        // Signal t_poi that res_ways.id_remap is ready. Anything that
+        // happens after this point in t_street (node merge, suppression,
+        // unmaps) doesn't affect the data t_poi reads.
+        street_remap_ready.set_value();
         // Restore original node_offsets for child merge
         for (size_t i = 0; i < wn; i++) memcpy(old_w.data + i * way_stride, &old_offsets[i], 4);
-        auto node_seq = build_child_merge(way_seq, old_w.data, old_w.size, new_w.data, new_w.size,
-                                           old_n.data, old_n.size, new_n.data, new_n.size, way_stride, false);
-        res_nodes = {PatchFileId::STREET_NODES, "street_nodes.bin", 8,
-                     old_n.size, new_n.size, std::move(node_seq), {}};
+        // Skip the node merge when ways came from fallback — street_nodes.bin
+        // typically isn't shipped to the poi/<tier> subdir input, and even
+        // when it is the output gets cleared below. build_child_merge would
+        // dereference nullptr if either nodes file failed to load.
+        if (!street_from_fallback && old_n.data && new_n.data) {
+            auto node_seq = build_child_merge(way_seq, old_w.data, old_w.size, new_w.data, new_w.size,
+                                               old_n.data, old_n.size, new_n.data, new_n.size, way_stride, false);
+            res_nodes = {PatchFileId::STREET_NODES, "street_nodes.bin", 8,
+                         old_n.size, new_n.size, std::move(node_seq), {}};
+        } else {
+            res_nodes = {PatchFileId::STREET_NODES, "street_nodes.bin", 8,
+                         0, 0, MergeSequence{}, {}};
+        }
         log_merge(res_nodes);
+        // Same suppression rule as t_admin: don't emit a real merge for
+        // STREET_WAYS / STREET_NODES when the source files came from the
+        // <region>/full/ fallback while the patch targets a poi/<tier>
+        // subdir. id_remap is preserved for the POI parent-id remap.
+        if (street_from_fallback) {
+            res_ways.seq = MergeSequence{};
+            res_ways.old_size = 0;
+            res_ways.new_size = 0;
+            res_ways.fixups.clear();
+            res_nodes.seq = MergeSequence{};
+            res_nodes.old_size = 0;
+            res_nodes.new_size = 0;
+        }
         unmap_file(old_w); unmap_file(new_w); unmap_file(old_n); unmap_file(new_n);
         log_time("  group:streets", gs);
         std::cerr << "  RSS after streets: " << get_rss_mb() << " MiB" << std::endl;
@@ -1122,10 +1196,14 @@ int main(int argc, char* argv[]) {
     });
 
     // Group 4: admin_polygons → admin_vertices
+    bool admin_from_fallback = false;
     std::thread t_admin([&]() {
         double gs = now_ms();
-        auto old_data = mmap_file_rw(old_dir + "/admin_polygons.bin");
-        auto new_data = mmap_file_rw(new_dir + "/admin_polygons.bin"); // COW: need to zero padding
+        auto [old_data, old_fb] = try_load_with_fallback_rw(old_dir, "admin_polygons.bin",
+                                                             {"../../quality/q2.5/", "../quality/q2.5/"});
+        auto [new_data, new_fb] = try_load_with_fallback_rw(new_dir, "admin_polygons.bin",
+                                                             {"../../quality/q2.5/", "../quality/q2.5/"});
+        admin_from_fallback = (old_fb || new_fb);
         if (admin_stride == 24) {
             // Zero only actual padding bytes (14-15), preserve place_type_override at byte 13
             for (size_t i = 0; i + admin_stride <= old_data.size; i += admin_stride)
@@ -1134,8 +1212,12 @@ int main(int argc, char* argv[]) {
                 memset(new_data.data + i + 14, 0, 2);
         }
         remap_field(old_data.data, old_data.size, admin_stride, 8, str_remap);
-        auto old_v = mmap_file(old_dir + "/admin_vertices.bin");
-        auto new_v = mmap_file(new_dir + "/admin_vertices.bin");
+        // admin_vertices.bin lives next to admin_polygons.bin in every
+        // build mode, so it follows the same fallback resolution.
+        auto [old_v, _ov_fb] = try_load_with_fallback(old_dir, "admin_vertices.bin",
+                                                       {"../../quality/q2.5/", "../quality/q2.5/"});
+        auto [new_v, _nv_fb] = try_load_with_fallback(new_dir, "admin_vertices.bin",
+                                                       {"../../quality/q2.5/", "../quality/q2.5/"});
         madvise(const_cast<char*>(old_v.data), old_v.size, MADV_SEQUENTIAL);
         madvise(const_cast<char*>(new_v.data), new_v.size, MADV_SEQUENTIAL);
         size_t n = old_data.size / admin_stride;
@@ -1171,9 +1253,17 @@ int main(int argc, char* argv[]) {
                 uint16_t cc; memcpy(&cc, rec + 20, 2);
                 return ((uint64_t)name_id << 24) | ((uint64_t)level << 16) | cc;
             });
+        // Populate id_remap up-front so t_poi can consume the full
+        // primary+secondary admin remap before pr_seq is built.
+        auto admin_id_rm = derive_id_remap_from_merge(ap_seq, old_data.size / admin_stride, admin_stride);
+        for (auto& [o,n] : soft) if (o < admin_id_rm.size()) admin_id_rm[o] = n;
         res_admin_p = {PatchFileId::ADMIN_POLYGONS, "admin_polygons.bin", admin_stride,
-                       old_data.size, new_data.size, ap_seq, std::move(fixups), std::move(soft), {}};
+                       old_data.size, new_data.size, ap_seq, std::move(fixups), std::move(soft), std::move(admin_id_rm)};
         log_merge(res_admin_p);
+        // Signal t_poi that res_admin_p.id_remap is ready. Vertex merge
+        // below restores byte 0 of each old record but t_poi only reads
+        // res_admin_p.id_remap which is already populated.
+        admin_remap_ready.set_value();
         // Restore original old vertex_offsets — build_vertex_byte_merge
         // reads each polygon's bytes from old_v at the *original* old
         // offset, not the post-fixup new offset. (build_merge_seq above
@@ -1185,6 +1275,20 @@ int main(int argc, char* argv[]) {
         res_admin_v = {PatchFileId::ADMIN_VERTICES, "admin_vertices.bin", 1,
                        old_v.size, new_v.size, std::move(av_seq), {}, {}, {}};
         log_merge(res_admin_v);
+        // When admin_polygons.bin came from a sibling/parent quality dir
+        // (poi-only invocation), the patch must NOT contain a real merge
+        // for ADMIN_POLYGONS / ADMIN_VERTICES — applying it on the poi
+        // subdir would write the wrong files. The id_remap above is
+        // still preserved for use by t_poi and POI_PARENT_REMAP_MARKER.
+        if (admin_from_fallback) {
+            res_admin_p.seq = MergeSequence{};
+            res_admin_p.old_size = 0;
+            res_admin_p.new_size = 0;
+            res_admin_p.fixups.clear();
+            res_admin_v.seq = MergeSequence{};
+            res_admin_v.old_size = 0;
+            res_admin_v.new_size = 0;
+        }
         unmap_file(old_data); unmap_file(new_data); unmap_file(old_v); unmap_file(new_v);
         log_time("  group:admin", gs);
         std::cerr << "  RSS after admin: " << get_rss_mb() << " MiB" << std::endl;
@@ -1198,7 +1302,7 @@ int main(int argc, char* argv[]) {
         // Handle missing POI files gracefully (new feature, old builds may not have them)
         if (new_data.size == 0 && old_data.size == 0) {
             res_poi_r = {PatchFileId::POI_RECORDS, "poi_records.bin", poi_stride, 0, 0, MergeSequence{}, {}};
-            res_poi_v = {PatchFileId::POI_VERTICES, "poi_vertices.bin", 8, 0, 0, MergeSequence{}, {}};
+            res_poi_v = {PatchFileId::POI_VERTICES, "poi_vertices.bin", 1, 0, 0, MergeSequence{}, {}};
             if (old_data.data) unmap_file(old_data);
             if (new_data.data) unmap_file(new_data);
             log_time("  group:poi (empty)", gs);
@@ -1207,6 +1311,41 @@ int main(int argc, char* argv[]) {
         // String remap on name_id field (offset 16 in 24-byte stride)
         if (old_data.size > 0)
             remap_field(old_data.data, old_data.size, poi_stride, 16, str_remap);
+
+        // Parent-id remap: rewrite old PoiRecord bytes 24 (parent_street_id)
+        // and 32 (parent_poly_id) from the previous build's id-space into
+        // the current build's. Without this, two consecutive builds' POI
+        // records differ at bytes 24/32 for unchanged POIs whenever the
+        // parent admin polygon or street way moved (which happens on
+        // every build), pr_seq classifies them as INSERT/DELETE, and
+        // build_vertex_byte_merge emits INSERT for nearly every vertex
+        // block. Block on t_admin/t_street having computed their id_remaps
+        // so we can apply them before fixup_v15_offsets runs (which would
+        // otherwise hash byte content including stale parent ids).
+        // parent_postcode_id at byte 28 is left unmapped — postcode_centroids
+        // is full-replace and most postcode ids stay stable across builds.
+        constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
+        admin_remap_future.wait();
+        street_remap_future.wait();
+        if (old_data.size > 0 && poi_stride >= 36) {
+            const auto& adm_rm = res_admin_p.id_remap;
+            const auto& way_rm = res_ways.id_remap;
+            size_t pn = old_data.size / poi_stride;
+            for (size_t i = 0; i < pn; i++) {
+                char* rec = old_data.data + i * poi_stride;
+                if (poi_stride >= 28 && !way_rm.empty()) {
+                    uint32_t st; memcpy(&st, rec + 24, 4);
+                    if (st != NO_DATA && st < way_rm.size() && way_rm[st] != NO_DATA && way_rm[st] != st)
+                        memcpy(rec + 24, &way_rm[st], 4);
+                }
+                if (!adm_rm.empty()) {
+                    uint32_t pp; memcpy(&pp, rec + 32, 4);
+                    if (pp != NO_DATA && pp < adm_rm.size() && adm_rm[pp] != NO_DATA && adm_rm[pp] != pp)
+                        memcpy(rec + 32, &adm_rm[pp], 4);
+                }
+            }
+        }
+
         auto old_v = mmap_file(old_dir + "/poi_vertices.bin");
         auto new_v = mmap_file(new_dir + "/poi_vertices.bin");
         if (old_v.data) madvise(const_cast<char*>(old_v.data), old_v.size, MADV_SEQUENTIAL);
@@ -1244,16 +1383,20 @@ int main(int argc, char* argv[]) {
         res_poi_r = {PatchFileId::POI_RECORDS, "poi_records.bin", poi_stride,
                      old_data.size, new_data.size, pr_seq, std::move(fixups), std::move(soft), {}};
         log_merge(res_poi_r);
-        // POI byte-block delta is currently a regression (PoiRecord
-        // carries parent_poly_id / parent_street_id / parent_postcode_id
-        // — admin/way/postcode IDs that shift between builds. Without
-        // remapping those, build_merge_seq sees most POIs as different,
-        // and the byte-block walker emits INSERT for nearly every block.
-        // poi_vertices.bin still goes through emit_raw_inline below.
-        // Worth revisiting once the parent-ID remap pipeline runs
-        // before pr_seq is built — would unlock the same ~99% shrink
-        // that admin gets.
+        // Byte-block delta over poi_vertices.bin — same shape as the
+        // admin_vertices path. Restore original old vert_offsets first
+        // (build_vertex_byte_merge reads each POI's bytes from old_v
+        // at the *original* old offset; build_merge_seq above used the
+        // fixed-up offsets to find MATCH runs).
         for (size_t i = 0; i < n; i++) memcpy(old_data.data + i * poi_stride + 8, &old_offsets[i], 4);
+        auto pv_seq = build_vertex_byte_merge(pr_seq,
+            old_data.data, old_data.size, new_data.data, new_data.size,
+            old_v.data ? old_v.data : "", old_v.size,
+            new_v.data ? new_v.data : "", new_v.size,
+            poi_stride, /*off_field_pos=*/8);
+        res_poi_v = {PatchFileId::POI_VERTICES, "poi_vertices.bin", 1,
+                     old_v.size, new_v.size, std::move(pv_seq), {}, {}, {}};
+        log_merge(res_poi_v);
         if (old_data.data) unmap_file(old_data);
         unmap_file(new_data);
         if (old_v.data) unmap_file(old_v);
@@ -1344,11 +1487,9 @@ int main(int argc, char* argv[]) {
     { std::unordered_map<uint32_t,uint32_t>().swap(str_remap); }
     std::cerr << "  RSS after merge phase: " << get_rss_mb() << " MiB" << std::endl;
 
-    // Inline raw-emit for files where byte-block delta isn't a win
-    // yet. v15 admin_vertices goes through proper byte-block delta
-    // via build_vertex_byte_merge; poi_vertices still falls back to
-    // emit_raw because PoiRecord parent IDs aren't remapped before
-    // pr_seq is built.
+    // Inline raw-emit fallback retained for any file whose byte-block
+    // pipeline isn't wired up yet. v15 admin_vertices and poi_vertices
+    // both go through proper byte-block delta via build_vertex_byte_merge.
     auto emit_raw_inline = [&](PatchFileId fid, const std::string& fname) {
         std::string new_path = new_dir + "/" + fname;
         struct stat nst;
@@ -1386,8 +1527,33 @@ int main(int argc, char* argv[]) {
     serialize_merge(patch, res_admin_p);
     serialize_merge(patch, res_admin_v);
     { std::vector<char>().swap(res_admin_v.seq.data); }
+    // POI parent-id remap section. Has to be emitted BEFORE POI_RECORDS
+    // so the patcher can build its in-memory street/admin id_remap
+    // vectors and apply them during POI_RECORDS MATCH replay.
+    {
+        uint32_t marker = POI_PARENT_REMAP_MARKER;
+        wval(patch, &marker, 4);
+        auto emit_pairs = [&](const std::vector<uint32_t>& rm) {
+            uint32_t n_pairs = 0;
+            for (uint32_t i = 0; i < rm.size(); i++)
+                if (rm[i] != 0xFFFFFFFFu && rm[i] != i) n_pairs++;
+            wval(patch, &n_pairs, 4);
+            for (uint32_t i = 0; i < rm.size(); i++) {
+                if (rm[i] != 0xFFFFFFFFu && rm[i] != i) {
+                    uint32_t o = i, nn = rm[i];
+                    wval(patch, &o, 4);
+                    wval(patch, &nn, 4);
+                }
+            }
+            return n_pairs;
+        };
+        uint32_t na = emit_pairs(res_admin_p.id_remap);
+        uint32_t ns = emit_pairs(res_ways.id_remap);
+        std::cerr << "  POI parent-id remap: admin_pairs=" << na
+                  << " street_pairs=" << ns << std::endl;
+    }
     serialize_merge(patch, res_poi_r);
-    emit_raw_inline(PatchFileId::POI_VERTICES, "poi_vertices.bin");
+    serialize_merge(patch, res_poi_v);
     { std::vector<char>().swap(res_poi_v.seq.data); }
     serialize_merge(patch, res_place_n);
     malloc_trim(0); // return freed heap to OS
