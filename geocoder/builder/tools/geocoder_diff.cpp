@@ -657,13 +657,34 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Explicit-remap section follows the tiered diff (always empty when
-    // tiered handles everything — patcher's tiered branch reads next
-    // marker and falls through here).
+    // Explicit-remap section follows the tiered diff. Same-tier remaps
+    // (where old and new offsets are in the matching tier file) are
+    // derived by the patcher walking each tier's old/new pool side by
+    // side. CROSS-TIER moves — a string that lived in addr in the
+    // previous build and now lives in street — aren't visible to the
+    // per-tier walk, so they have to be transmitted explicitly here.
+    // Without this, records pointing at the moved string keep their old
+    // (now stale) global offset after patch (verified: 566 oceania
+    // addr_points, ~thousands of street_ways across regions when a
+    // numeric/short string flips tier between consecutive builds).
     {
-        uint32_t marker = 0xFFFFFFFE, count = 0;
+        auto tier_of = [](uint32_t global, const std::array<uint32_t, 6>& bases) -> int {
+            for (int t = 0; t < 5; t++) if (global >= bases[t] && global < bases[t + 1]) return t;
+            return -1;
+        };
+        std::vector<std::pair<uint32_t, uint32_t>> cross_tier;
+        cross_tier.reserve(str_remap.size() / 8);
+        for (const auto& [og, ng] : str_remap) {
+            int ot = tier_of(og, old_tier_bases);
+            int nt = tier_of(ng, new_tier_bases);
+            if (ot != nt) cross_tier.push_back({og, ng});
+        }
+        std::sort(cross_tier.begin(), cross_tier.end());
+        uint32_t marker = 0xFFFFFFFE;
+        uint32_t count = static_cast<uint32_t>(cross_tier.size());
         wval(patch, &marker, 4); wval(patch, &count, 4);
-        std::cerr << "  String remap: derived from string diff (0 explicit entries)" << std::endl;
+        for (auto& [og, ng] : cross_tier) { wval(patch, &og, 4); wval(patch, &ng, 4); }
+        std::cerr << "  String remap: " << count << " cross-tier explicit entries" << std::endl;
     }
 
     // Build merge sequences for all data files in parallel (4 groups)
