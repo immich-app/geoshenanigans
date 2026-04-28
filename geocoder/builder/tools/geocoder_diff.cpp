@@ -656,9 +656,24 @@ int main(int argc, char* argv[]) {
     std::array<MappedFile, 5> old_tier_maps{}, new_tier_maps{};
     std::vector<char> old_concat, new_concat;
     std::array<uint32_t, 6> old_tier_bases{}, new_tier_bases{};
+    // String tiers may be absent from the input dir when geocoder-diff
+    // is invoked on a per-variant subdir (e.g. <region>/quality/<q>/
+    // or <region>/poi/<tier>/) — strings_*.bin live under the sibling
+    // <region>/full/ directory. Fall back upward through one or two
+    // path levels to find them. Without this fallback the str_remap
+    // ends up empty and records that should match (after name_id
+    // re-tier) get classified as INSERT/DELETE → byte-block walker
+    // produces patches the size of the whole vertex stream.
+    auto try_load_tier = [&](const std::string& dir, const char* fname) -> MappedFile {
+        MappedFile m = mmap_file(dir + "/" + fname);
+        if (m.size > 0 || m.data != nullptr) return m;
+        m = mmap_file(dir + "/../full/" + fname);
+        if (m.size > 0 || m.data != nullptr) return m;
+        return mmap_file(dir + "/../../full/" + fname);
+    };
     for (int t = 0; t < 5; t++) {
-        old_tier_maps[t] = mmap_file(old_dir + "/" + kStrTierFilenames[t]);
-        new_tier_maps[t] = mmap_file(new_dir + "/" + kStrTierFilenames[t]);
+        old_tier_maps[t] = try_load_tier(old_dir, kStrTierFilenames[t]);
+        new_tier_maps[t] = try_load_tier(new_dir, kStrTierFilenames[t]);
         old_tier_bases[t] = static_cast<uint32_t>(old_concat.size());
         new_tier_bases[t] = static_cast<uint32_t>(new_concat.size());
         if (old_tier_maps[t].size > 0)

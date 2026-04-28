@@ -122,7 +122,21 @@ int main(int argc, char* argv[]) {
                 for (uint32_t i = 0; i < n_deleted; i++) del_idx[i] = ru32();
                 std::unordered_set<uint32_t> del_set(del_idx.begin(), del_idx.end());
 
+                // Fallback to ../full/ when applying a patch on a per-
+                // variant subdir (quality, poi, admin-minimal). Strings
+                // live under <region>/full/, so the str_remap_vec built
+                // here has to walk those instead of the (missing)
+                // strings_*.bin in cur_dir.  Without this, the str_remap
+                // is empty and admin_polygons.bin name_id MATCH replays
+                // keep the old name_id while the new build expects the
+                // re-tiered offset → byte-mismatch on verify.
                 MappedFile old_pool = mmap_file(cur_dir + "/" + kStrTierFilenames[t]);
+                if (old_pool.size == 0 && old_pool.data == nullptr) {
+                    old_pool = mmap_file(cur_dir + "/../full/" + kStrTierFilenames[t]);
+                }
+                if (old_pool.size == 0 && old_pool.data == nullptr) {
+                    old_pool = mmap_file(cur_dir + "/../../full/" + kStrTierFilenames[t]);
+                }
                 // Phase A: write new tier file via alphabetical merge.
                 {
                     FILE* fp = fopen((out_dir + "/" + kStrTierFilenames[t]).c_str(), "wb");
