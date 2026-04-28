@@ -24,6 +24,8 @@ jobs:
     runs-on: mich
     outputs:
       KEY: ${{ steps.latest_build.outputs.KEY }}
+    env:
+      RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -58,21 +60,26 @@ jobs:
       - name: Install GH CLI
         uses: dev-hanz-ops/install-gh-cli-action@af38ce09b1ec248aeb08eea2b16bbecea9e059f8 # v0.2.1
 
-      - name: Setup Rclone
-        uses: AnimMouse/setup-rclone@26ef2133e09fd383329a1d4c1fbe6a71db1976c9 # v1.12.0
-        with:
-          disable_base64: true
-          rclone_config: |
-            [r2]
-            type = s3
-            provider = Cloudflare
-            region = auto
-            endpoint = https://601adaaa1eab190cdfe2945f9a6c89d0.r2.cloudflarestorage.com
-            access_key_id = ${{ secrets.CLOUDFLARE_TILES_R2_KV_TOKEN_ID }}
-            secret_access_key = ${{ secrets.CLOUDFLARE_TILES_R2_KV_TOKEN_HASHED_VALUE }}
-            [pmtiles]
-            type = http
-            url = https://build.protomaps.com/
+      - name: Setup Mise
+        uses: immich-app/devtools/actions/use-mise@035e80a7d4355d5f087ffb95db9e4a0944c04e56 # use-mise-action-v1.1.3
+
+      - name: Configure Rclone
+        env:
+          ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_TILES_R2_KV_TOKEN_ID }}
+          SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_TILES_R2_KV_TOKEN_HASHED_VALUE }}
+        run: |
+          cat > "$RCLONE_CONFIG" <<EOF
+          [r2]
+          type = s3
+          provider = Cloudflare
+          region = auto
+          endpoint = https://601adaaa1eab190cdfe2945f9a6c89d0.r2.cloudflarestorage.com
+          access_key_id = $ACCESS_KEY_ID
+          secret_access_key = $SECRET_ACCESS_KEY
+          [pmtiles]
+          type = http
+          url = https://build.protomaps.com/
+          EOF
 
       - name: Download latest tiles from build server
         run: |
