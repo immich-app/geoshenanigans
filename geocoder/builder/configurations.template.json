@@ -1,5 +1,9 @@
 {
   "schema_version": 1,
+  "build": {
+    "version": 15,
+    "patch_version": 5
+  },
   "axes": {
     "region": {
       "label": "Region",

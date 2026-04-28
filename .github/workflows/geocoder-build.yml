@@ -103,17 +103,28 @@ jobs:
           echo "Server:     $CURRENT_DATE (seq $CURRENT_SEQ, offset: -${DAYS_OFFSET}d)"
 
           # Check if previous build exists on Tigris with compatible build_version
-          EXPECTED_BUILD_VERSION=14
+          EXPECTED_BUILD_VERSION=15
           PREV_BUILD="s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV_DATE"
           if [ "$FORCE_FRESH" = "true" ]; then
             echo "has_previous=false" >> "$GITHUB_OUTPUT"
             echo "force_fresh=true requested — building fresh (ignoring $PREV_DATE)"
           elif s5cmd --endpoint-url $S3_ENDPOINT ls "$PREV_BUILD/" 2>/dev/null | head -1 | grep -q .; then
             # Check build_version in previous configurations.json. Falls back
-            # to the legacy manifest.json path so the very first build after
-            # this rename still reads the previous day's metadata.
-            PREV_VERSION=$(s5cmd --endpoint-url $S3_ENDPOINT cat "$PREV_BUILD/configurations.json" 2>/dev/null \
-              | jq -r '.build.version // 0' 2>/dev/null || echo 0)
+            # to the legacy manifest.json for very old builds. Final
+            # fallback: a configurations.json with schema_version=1 but no
+            # build.version field is from the migration build (2026-04-27)
+            # — treat that schema_version as the compatibility marker so
+            # the first patching build doesn't have to wait a day to
+            # bootstrap.
+            PREV_CFG=$(s5cmd --endpoint-url $S3_ENDPOINT cat "$PREV_BUILD/configurations.json" 2>/dev/null || echo "")
+            PREV_VERSION=$(echo "$PREV_CFG" | jq -r '.build.version // 0' 2>/dev/null || echo 0)
+            if [ "$PREV_VERSION" = "0" ]; then
+              PREV_SCHEMA=$(echo "$PREV_CFG" | jq -r '.schema_version // 0' 2>/dev/null || echo 0)
+              if [ "$PREV_SCHEMA" = "1" ]; then
+                PREV_VERSION="$EXPECTED_BUILD_VERSION"
+                echo "Previous build's configurations.json has schema_version=1 but no build.version (migration build) — treating as compatible"
+              fi
+            fi
             if [ "$PREV_VERSION" = "0" ]; then
               PREV_VERSION=$(s5cmd --endpoint-url $S3_ENDPOINT cat "$PREV_BUILD/manifest.json" 2>/dev/null \
                 | jq -r '.build_version // 0' 2>/dev/null || echo 0)

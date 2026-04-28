@@ -340,7 +340,7 @@
         <h3 style="margin:0;flex:1">Results <span id="resultCount"></span></h3>
         <button id="minimalBtn" onclick="toggleMinimal()" style="padding:4px 12px;font-size:12px;background:var(--surface2);color:#fff;border:1px solid var(--border);border-radius:4px;cursor:pointer;" title="Query the minimal-dataset server (port 3001) side-by-side. Shows what the smallest admin-only deployable would resolve.">Minimal: Off</button>
         <button id="nominatimBtn" onclick="toggleNominatim()" style="padding:4px 12px;font-size:12px;background:var(--surface2);color:#fff;border:1px solid var(--border);border-radius:4px;cursor:pointer;" title="Query Nominatim's public API for side-by-side comparison. Off by default — each query hits api.openstreetmap.org so leave off unless you need the comparison.">Nominatim: Off</button>
-        <button id="polygonsBtn" onclick="togglePolygons()" style="padding:4px 12px;font-size:12px;background:var(--surface2);color:#fff;border:1px solid var(--border);border-radius:4px;cursor:pointer;">Polygons</button>
+        <button id="polygonsBtn" onclick="togglePolygons()" style="padding:4px 12px;font-size:12px;background:var(--surface2);color:#fff;border:1px solid var(--border);border-radius:4px;cursor:pointer;" title="Cycle the polygon overlay: Off → Full (port 3002) → Minimal (port 3001) → Off. Use to compare which admin levels disappear in the minimal dataset.">Polygons: Off</button>
         <button id="retestBtn" onclick="retestAllResults()" style="padding:4px 12px;font-size:12px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer;">Re-test</button>
         <button onclick="clearResults()" style="padding:4px 12px;font-size:12px;background:var(--red);color:#fff;border:none;border-radius:4px;cursor:pointer;">Clear</button>
       </div>
@@ -558,8 +558,7 @@ map.on('click', function(e) {
 map.on('load', function() {
   loadResults();
   const btn = document.getElementById('polygonsBtn');
-  if (polygonsEnabled) {
-    btn.style.background = 'var(--accent)';
+  if (polygonsSource !== 'off') {
     ensurePolygonLayer();
     if (selectedId !== null) updatePolygonLayer(selectedId);
   }
@@ -810,7 +809,7 @@ function selectResult(id) {
   selectedId = id;
   renderResults();
   showDetail(id);
-  if (polygonsEnabled) updatePolygonLayer(id);
+  if (polygonsSource !== 'off') updatePolygonLayer(id);
 }
 
 // -- Polygon overlay --
@@ -819,7 +818,22 @@ const POLY_LABEL_SOURCE = 'debug-polygon-labels';
 const POLY_FILL = 'debug-polygons-fill';
 const POLY_LINE = 'debug-polygons-line';
 const POLY_LABELS = 'debug-polygons-labels';
-let polygonsEnabled = localStorage.getItem('polygons_enabled') === '1';
+// Polygon overlay source — three-state cycle:
+//   "off"     no overlay
+//   "full"    fetch /polygons from the page's origin (full server, port 3002)
+//   "minimal" fetch from MINIMAL_BASE_URL (minimal server, port 3001)
+// Use to A/B the L9/L10/L11/L15 polygons that admin-minimal drops.
+const POLY_STATES = ['off', 'full', 'minimal'];
+let polygonsSource = (() => {
+  const saved = localStorage.getItem('polygons_source');
+  // Migrate the old boolean key — "1" → "full", "0" → "off".
+  if (saved === null) {
+    const legacy = localStorage.getItem('polygons_enabled');
+    if (legacy === '1') return 'full';
+    return 'off';
+  }
+  return POLY_STATES.includes(saved) ? saved : 'off';
+})();
 
 // Nominatim side-by-side lookup is opt-in — every query goes out to
 // nominatim.openstreetmap.org so we don't want to hit it unsolicited.
@@ -880,6 +894,7 @@ function updateMinimalBtn() {
 document.addEventListener('DOMContentLoaded', () => {
   updateNominatimBtn();
   updateMinimalBtn();
+  updatePolygonsBtn();
 });
 
 // Shoelace-weighted centroid of a closed lng/lat ring
@@ -965,11 +980,14 @@ function clearPolygonLayer() {
 }
 
 function updatePolygonLayer(id) {
-  if (!polygonsEnabled) return;
+  if (polygonsSource === 'off') return;
   ensurePolygonLayer();
   const r = results.find(x => x.id === id);
   if (!r) { clearPolygonLayer(); return; }
-  fetch(`/polygons?lat=${r.lat}&lon=${r.lng}&key=test`)
+  // Pick the source server: full = same-origin, minimal = cross-origin
+  // to MINIMAL_BASE_URL. Same /polygons endpoint shape on both.
+  const base = polygonsSource === 'minimal' ? MINIMAL_BASE_URL : '';
+  fetch(`${base}/polygons?lat=${r.lat}&lon=${r.lng}&key=test`)
     .then(res => { if (!res.ok) throw new Error(`HTTP ${res.status}`); return res.json(); })
     .then(fc => {
       // Sort largest-first so smaller polygons render on top
@@ -994,16 +1012,28 @@ function updatePolygonLayer(id) {
 }
 
 function togglePolygons() {
-  polygonsEnabled = !polygonsEnabled;
-  localStorage.setItem('polygons_enabled', polygonsEnabled ? '1' : '0');
-  const btn = document.getElementById('polygonsBtn');
-  btn.style.background = polygonsEnabled ? 'var(--accent)' : 'var(--surface2)';
-  if (polygonsEnabled) {
+  // Cycle: off → full → minimal → off
+  const next = (POLY_STATES.indexOf(polygonsSource) + 1) % POLY_STATES.length;
+  polygonsSource = POLY_STATES[next];
+  localStorage.setItem('polygons_source', polygonsSource);
+  updatePolygonsBtn();
+  if (polygonsSource === 'off') {
+    clearPolygonLayer();
+  } else {
     ensurePolygonLayer();
     if (selectedId !== null) updatePolygonLayer(selectedId);
-  } else {
-    clearPolygonLayer();
   }
+}
+function updatePolygonsBtn() {
+  const btn = document.getElementById('polygonsBtn');
+  if (!btn) return;
+  const label = polygonsSource === 'off' ? 'Off'
+    : polygonsSource === 'full' ? 'Full'
+    : 'Minimal';
+  btn.textContent = `Polygons: ${label}`;
+  btn.style.background = polygonsSource === 'off'    ? 'var(--surface2)'
+                       : polygonsSource === 'full'   ? 'var(--accent)'
+                       : 'var(--blue)';
 }
 
 // -- Detail panel --
