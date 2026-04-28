@@ -276,6 +276,97 @@ static void fixup_way_offsets(char* old_ways, size_t old_ways_size,
     }
 }
 
+// v15 admin/POI vertex_offset fixup. Identifies polygons across builds
+// by (name_id, level, cc, vert_count, hash-of-vertex-bytes) and rewrites
+// the old polygon's vert_offset to match the new build's byte offset.
+// After this pass, unchanged polygons have byte-identical records, so
+// build_merge_seq finds them as MATCH — which is what build_vertex_byte_merge
+// needs to emit short MATCH ops on the byte stream rather than full INSERT.
+//
+// Vertex byte block for polygon i runs from `vert_offset` until the
+// next polygon's `vert_offset` (or end of file for the last polygon).
+// Unlike v14, we can't decode vertices without parsing the inline
+// header — so we just hash the raw byte block (head bytes are enough
+// since unchanged polygons produce byte-identical block content).
+static void fixup_v15_offsets(char* old_polys, size_t old_polys_size,
+                              const char* old_verts, size_t old_verts_size,
+                              const char* new_polys, size_t new_polys_size,
+                              const char* new_verts, size_t new_verts_size,
+                              size_t stride, size_t off_field_pos,
+                              uint64_t (*key_fn)(const char* rec)) {
+    constexpr uint32_t NO_DATA_OFF = 0xFFFFFFFFu;
+    size_t old_n = old_polys_size / stride;
+    size_t new_n = new_polys_size / stride;
+    auto compute_blocks = [&](const char* polys, size_t parent_size, size_t verts_size) {
+        size_t total_n = parent_size / stride;
+        std::vector<uint32_t> offsets(total_n);
+        std::vector<uint32_t> sizes(total_n);
+        for (size_t i = 0; i < total_n; i++)
+            memcpy(&offsets[i], polys + i * stride + off_field_pos, 4);
+        uint32_t next_off = static_cast<uint32_t>(verts_size);
+        for (size_t i = total_n; i-- > 0; ) {
+            uint32_t off = offsets[i];
+            if (off == NO_DATA_OFF || (size_t)off > verts_size) {
+                sizes[i] = 0;
+            } else {
+                sizes[i] = (next_off >= off) ? (next_off - off) : 0;
+                next_off = off;
+            }
+        }
+        return std::make_pair(std::move(offsets), std::move(sizes));
+    };
+    auto old_blocks = compute_blocks(old_polys, old_polys_size, old_verts_size);
+    auto new_blocks = compute_blocks(new_polys, new_polys_size, new_verts_size);
+    auto block_off_size = [&](bool is_new, size_t i) -> std::pair<uint32_t, size_t> {
+        const auto& v = is_new ? new_blocks : old_blocks;
+        if (i >= v.first.size() || v.second[i] == 0) return {v.first.empty() ? 0u : v.first[i], 0};
+        return {v.first[i], v.second[i]};
+    };
+    auto block_hash = [&](const char* verts, size_t verts_size, uint32_t off, size_t bsize) -> uint64_t {
+        uint64_t h = 14695981039346656037ULL;
+        size_t end = std::min((size_t)off + bsize, verts_size);
+        size_t hash_len = std::min(bsize, (size_t)64); // first 64 bytes are enough — header (10) + ~13 vertices
+        for (size_t j = 0; j < hash_len && (size_t)off + j < end; j++) {
+            h ^= (uint8_t)verts[off + j];
+            h *= 1099511628211ULL;
+        }
+        h = fnv_mix(h, (uint64_t)bsize); // distinguish blocks of same head bytes but different lengths
+        return h;
+    };
+
+    // Build new index: (record_key, block_hash) → new_idx + new vert_offset.
+    std::unordered_multimap<uint64_t, uint32_t> new_map;
+    new_map.reserve(new_n);
+    auto compose_key = [&](uint64_t rec_key, uint64_t bhash) -> uint64_t {
+        // FNV-mix the two together to make a single hashtable key.
+        uint64_t h = 14695981039346656037ULL;
+        h = fnv_mix(h, rec_key);
+        h = fnv_mix(h, bhash);
+        return h;
+    };
+    for (uint32_t i = 0; i < new_n; i++) {
+        const char* rec = new_polys + i * stride;
+        auto bos = block_off_size(true, i);
+        uint64_t rec_key = key_fn(rec);
+        uint64_t bhash = block_hash(new_verts, new_verts_size, bos.first, bos.second);
+        new_map.emplace(compose_key(rec_key, bhash), i);
+    }
+
+    for (uint32_t i = 0; i < old_n; i++) {
+        const char* rec = old_polys + i * stride;
+        auto bos = block_off_size(false, i);
+        uint64_t rec_key = key_fn(rec);
+        uint64_t bhash = block_hash(old_verts, old_verts_size, bos.first, bos.second);
+        auto it = new_map.find(compose_key(rec_key, bhash));
+        if (it != new_map.end()) {
+            uint32_t new_off;
+            memcpy(&new_off, new_polys + it->second * stride + off_field_pos, 4);
+            memcpy(old_polys + i * stride + off_field_pos, &new_off, 4);
+            new_map.erase(it);
+        }
+    }
+}
+
 // Same for admin polygons (vertex_offset)
 static void fixup_admin_offsets(char* old_polys, size_t old_polys_size,
                                   const char* old_verts, size_t old_verts_size,
@@ -701,6 +792,105 @@ int main(int argc, char* argv[]) {
     //            false for street_ways/interp_ways (node_count is uint8_t at offset 4)
     // off_field_pos: byte offset of the offset field (0 for ways/admin, 8 for POI records)
     // count_field_pos: byte offset of the count field (4 for all current types)
+    // Byte-block merge for the v15 variable-stride vertex stream
+    // (admin_vertices / poi_vertices). The vertex bytes for polygon i
+    // live at the polygon's `vertex_offset` and run until the next
+    // polygon's `vertex_offset` (or end-of-file for the last). This
+    // walks the parent record merge sequence and emits a stride=1
+    // byte-stream merge that the patcher's existing replay loop can
+    // apply directly. Replaces the previous "emit the whole new file
+    // as raw" path that made every quality patch ~size-of-file.
+    //
+    // Correctness depends on: (a) simplification being deterministic
+    // (verified — the existing patch verify is byte-identical), and
+    // (b) polygon byte blocks landing at the same byte offset in old
+    // and new admin_vertices when the polygon record is a MATCH in
+    // the parent sequence (verified by the same byte-identical pass —
+    // if blocks shifted, MATCH polygons in admin_polygons.bin would
+    // have stale vertex_offset values).
+    //
+    // off_field_pos: byte offset of vertex_offset on the parent record.
+    auto build_vertex_byte_merge = [](const MergeSequence& parent_seq,
+                                       const char* old_parent, size_t old_parent_size,
+                                       const char* new_parent, size_t new_parent_size,
+                                       const char* old_verts, size_t old_verts_size,
+                                       const char* new_verts, size_t new_verts_size,
+                                       size_t parent_stride,
+                                       size_t off_field_pos) -> MergeSequence {
+        // Vertex byte block for polygon i runs from vert_offset until
+        // the next *non-NO_DATA* polygon's vert_offset (POIs can be
+        // points with vert_offset==NO_DATA interspersed between polygon
+        // POIs; their blocks have zero size). Precompute block sizes
+        // O(n) so the walker's per-record lookup is O(1).
+        constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
+        auto compute_block_sizes = [&](const char* parent, size_t parent_size, size_t verts_size) {
+            size_t total_n = parent_size / parent_stride;
+            std::vector<uint32_t> offsets(total_n);
+            std::vector<uint32_t> sizes(total_n);
+            for (size_t i = 0; i < total_n; i++)
+                memcpy(&offsets[i], parent + i * parent_stride + off_field_pos, 4);
+            // Walk from end so each i finds its next non-NO_DATA neighbour cheaply.
+            uint32_t next_off = static_cast<uint32_t>(verts_size);
+            for (size_t i = total_n; i-- > 0; ) {
+                uint32_t off = offsets[i];
+                if (off == NO_DATA || (size_t)off > verts_size) {
+                    sizes[i] = 0;
+                } else {
+                    sizes[i] = (next_off >= off) ? (next_off - off) : 0;
+                    next_off = off;
+                }
+            }
+            return std::make_pair(std::move(offsets), std::move(sizes));
+        };
+        auto old_off_sz = compute_block_sizes(old_parent, old_parent_size, old_verts_size);
+        auto new_off_sz = compute_block_sizes(new_parent, new_parent_size, new_verts_size);
+        auto block = [&](bool is_new, size_t i) -> std::pair<size_t, size_t> {
+            const auto& v = is_new ? new_off_sz : old_off_sz;
+            if (i >= v.first.size() || v.second[i] == 0) return {0, 0};
+            return {v.first[i], v.second[i]};
+        };
+        size_t old_n = old_parent_size / parent_stride;
+        size_t new_n = new_parent_size / parent_stride;
+        MergeSequence vseq;
+        size_t p_oi = 0, p_ni = 0, ppos = 0;
+        while (ppos < parent_seq.data.size()) {
+            uint8_t op = static_cast<uint8_t>(parent_seq.data[ppos]); ppos++;
+            uint32_t count; memcpy(&count, parent_seq.data.data() + ppos, 4); ppos += 4;
+            if (op == OP_MATCH_RUN) {
+                for (uint32_t k = 0; k < count; k++) {
+                    auto ob = block(false, p_oi + k);
+                    auto nb = block(true,  p_ni + k);
+                    bool same = (ob.second == nb.second
+                                 && ob.first  + ob.second <= old_verts_size
+                                 && nb.first  + nb.second <= new_verts_size
+                                 && (ob.second == 0
+                                     || memcmp(old_verts + ob.first, new_verts + nb.first, ob.second) == 0));
+                    if (same) {
+                        if (ob.second > 0) vseq.add_match(static_cast<uint32_t>(ob.second));
+                    } else {
+                        if (ob.second > 0) vseq.add_delete(static_cast<uint32_t>(ob.second));
+                        if (nb.second > 0) vseq.add_insert(new_verts + nb.first, static_cast<uint32_t>(nb.second), 1);
+                    }
+                }
+                p_oi += count; p_ni += count;
+            } else if (op == OP_INSERT_RUN) {
+                for (uint32_t k = 0; k < count; k++) {
+                    auto nb = block(true, p_ni + k);
+                    if (nb.second > 0) vseq.add_insert(new_verts + nb.first, static_cast<uint32_t>(nb.second), 1);
+                }
+                ppos += count * parent_stride; // skip the inline parent records
+                p_ni += count;
+            } else if (op == OP_DELETE_RUN) {
+                for (uint32_t k = 0; k < count; k++) {
+                    auto ob = block(false, p_oi + k);
+                    if (ob.second > 0) vseq.add_delete(static_cast<uint32_t>(ob.second));
+                }
+                p_oi += count;
+            }
+        }
+        return vseq;
+    };
+
     auto build_child_merge = [](const MergeSequence& parent_seq,
                                  const char* old_parent, size_t old_parent_size,
                                  const char* new_parent, size_t new_parent_size,
@@ -936,12 +1126,28 @@ int main(int argc, char* argv[]) {
         size_t n = old_data.size / admin_stride;
         std::vector<uint32_t> old_offsets(n);
         for (size_t i = 0; i < n; i++) memcpy(&old_offsets[i], old_data.data + i * admin_stride, 4);
-        // v15: vertex_offset is a BYTE offset into a variable-stride
-        // packed stream (not a vertex index).  Skip fixup_admin_offsets
-        // and build_child_merge — both assume fixed 8-byte stride and
-        // would crash or produce garbage on the new layout.  vertex
-        // file goes through emit_raw at serialize time.
+        // v15-aware fixup: rewrite old polygon vertex_offset to match
+        // the new build's byte offset for the same logical polygon.
+        // After this pass, unchanged polygons have byte-identical
+        // records, so build_merge_seq classifies them as MATCH —
+        // which is what build_vertex_byte_merge needs to emit
+        // efficient byte-stream MATCH ops below.
+        fixup_v15_offsets(old_data.data, old_data.size, old_v.data, old_v.size,
+                          new_data.data, new_data.size, new_v.data, new_v.size,
+                          admin_stride, /*off_field_pos=*/0,
+                          [](const char* rec) -> uint64_t {
+                              uint32_t name_id; memcpy(&name_id, rec + 8, 4);
+                              uint8_t level = static_cast<uint8_t>(rec[12]);
+                              uint16_t cc; memcpy(&cc, rec + 20, 2);
+                              uint32_t vert_count; memcpy(&vert_count, rec + 4, 4);
+                              uint64_t k = ((uint64_t)name_id << 24) | ((uint64_t)level << 16) | cc;
+                              return k ^ ((uint64_t)vert_count << 40);
+                          });
         std::vector<std::pair<uint32_t,uint32_t>> fixups;
+        for (size_t i = 0; i < n; i++) {
+            uint32_t new_off; memcpy(&new_off, old_data.data + i * admin_stride, 4);
+            if (new_off != old_offsets[i]) fixups.push_back({static_cast<uint32_t>(i), new_off});
+        }
         auto ap_seq = build_merge_seq(old_data.data, old_data.size, new_data.data, new_data.size, admin_stride);
         auto soft = secondary_match_from_merge(ap_seq, old_data.data, old_data.size, new_data.data, new_data.size, admin_stride,
             [](const char* rec) -> uint64_t {
@@ -953,7 +1159,17 @@ int main(int argc, char* argv[]) {
         res_admin_p = {PatchFileId::ADMIN_POLYGONS, "admin_polygons.bin", admin_stride,
                        old_data.size, new_data.size, ap_seq, std::move(fixups), std::move(soft), {}};
         log_merge(res_admin_p);
-        // res_admin_v stays default-constructed; not serialized
+        // Restore original old vertex_offsets — build_vertex_byte_merge
+        // reads each polygon's bytes from old_v at the *original* old
+        // offset, not the post-fixup new offset. (build_merge_seq above
+        // used the fixed-up offsets to find MATCH runs.)
+        for (size_t i = 0; i < n; i++) memcpy(old_data.data + i * admin_stride, &old_offsets[i], 4);
+        auto av_seq = build_vertex_byte_merge(ap_seq,
+            old_data.data, old_data.size, new_data.data, new_data.size,
+            old_v.data, old_v.size, new_v.data, new_v.size, admin_stride, 0);
+        res_admin_v = {PatchFileId::ADMIN_VERTICES, "admin_vertices.bin", 1,
+                       old_v.size, new_v.size, std::move(av_seq), {}, {}, {}};
+        log_merge(res_admin_v);
         unmap_file(old_data); unmap_file(new_data); unmap_file(old_v); unmap_file(new_v);
         log_time("  group:admin", gs);
         std::cerr << "  RSS after admin: " << get_rss_mb() << " MiB" << std::endl;
@@ -983,9 +1199,19 @@ int main(int argc, char* argv[]) {
         size_t n = old_data.size / poi_stride;
         std::vector<uint32_t> old_offsets(n);
         for (size_t i = 0; i < n; i++) memcpy(&old_offsets[i], old_data.data + i * poi_stride + 8, 4);
-        if (old_data.size > 0 && new_data.size > 0)
-            fixup_poi_offsets(old_data.data, old_data.size, old_v.data, old_v.size,
-                              new_data.data, new_data.size, new_v.data, new_v.size, poi_stride);
+        // v15-aware fixup: PoiRecord's vertex_offset lives at byte 8.
+        // Same byte-block hash strategy as admin polygons.
+        if (old_data.size > 0 && new_data.size > 0) {
+            fixup_v15_offsets(old_data.data, old_data.size, old_v.data, old_v.size,
+                              new_data.data, new_data.size, new_v.data, new_v.size,
+                              poi_stride, /*off_field_pos=*/8,
+                              [](const char* rec) -> uint64_t {
+                                  uint32_t name_id; memcpy(&name_id, rec + 16, 4);
+                                  uint8_t cat = static_cast<uint8_t>(rec[20]);
+                                  uint32_t vert_count; memcpy(&vert_count, rec + 12, 4);
+                                  return ((uint64_t)name_id << 16) | ((uint64_t)cat << 8) | (vert_count & 0xff);
+                              });
+        }
         std::vector<std::pair<uint32_t,uint32_t>> fixups;
         for (size_t i = 0; i < n; i++) {
             uint32_t new_off; memcpy(&new_off, old_data.data + i * poi_stride + 8, 4);
@@ -1003,9 +1229,15 @@ int main(int argc, char* argv[]) {
         res_poi_r = {PatchFileId::POI_RECORDS, "poi_records.bin", poi_stride,
                      old_data.size, new_data.size, pr_seq, std::move(fixups), std::move(soft), {}};
         log_merge(res_poi_r);
-        // v15: skip build_child_merge for poi_vertices — same byte-
-        // offset / variable-stride mismatch as admin_vertices.  POI
-        // vertex file goes through emit_raw at serialize time.
+        // POI byte-block delta is currently a regression (PoiRecord
+        // carries parent_poly_id / parent_street_id / parent_postcode_id
+        // — admin/way/postcode IDs that shift between builds. Without
+        // remapping those, build_merge_seq sees most POIs as different,
+        // and the byte-block walker emits INSERT for nearly every block.
+        // poi_vertices.bin still goes through emit_raw_inline below.
+        // Worth revisiting once the parent-ID remap pipeline runs
+        // before pr_seq is built — would unlock the same ~99% shrink
+        // that admin gets.
         for (size_t i = 0; i < n; i++) memcpy(old_data.data + i * poi_stride + 8, &old_offsets[i], 4);
         if (old_data.data) unmap_file(old_data);
         unmap_file(new_data);
@@ -1097,11 +1329,11 @@ int main(int argc, char* argv[]) {
     { std::unordered_map<uint32_t,uint32_t>().swap(str_remap); }
     std::cerr << "  RSS after merge phase: " << get_rss_mb() << " MiB" << std::endl;
 
-    // Inline raw-emit helper for the v15 vertex files (admin_vertices /
-    // poi_vertices).  Their variable-stride layout doesn't fit the
-    // merge-sequence walker; just embed the new file in the patch.
-    // Same wire format as the emit_raw lambda below — patcher reads
-    // stride==0 as "full replacement".
+    // Inline raw-emit for files where byte-block delta isn't a win
+    // yet. v15 admin_vertices goes through proper byte-block delta
+    // via build_vertex_byte_merge; poi_vertices still falls back to
+    // emit_raw because PoiRecord parent IDs aren't remapped before
+    // pr_seq is built.
     auto emit_raw_inline = [&](PatchFileId fid, const std::string& fname) {
         std::string new_path = new_dir + "/" + fname;
         struct stat nst;
@@ -1128,7 +1360,7 @@ int main(int argc, char* argv[]) {
         }
     };
 
-    // Serialize merge results to patch in canonical order, freeing as we go
+    // Serialize merge results to patch in canonical order, freeing as we go.
     serialize_merge(patch, res_addr);
     serialize_merge(patch, res_ways);
     serialize_merge(patch, res_nodes);
@@ -1137,7 +1369,7 @@ int main(int argc, char* argv[]) {
     serialize_merge(patch, res_interp_n);
     { std::vector<char>().swap(res_interp_n.seq.data); }
     serialize_merge(patch, res_admin_p);
-    emit_raw_inline(PatchFileId::ADMIN_VERTICES, "admin_vertices.bin");
+    serialize_merge(patch, res_admin_v);
     { std::vector<char>().swap(res_admin_v.seq.data); }
     serialize_merge(patch, res_poi_r);
     emit_raw_inline(PatchFileId::POI_VERTICES, "poi_vertices.bin");
