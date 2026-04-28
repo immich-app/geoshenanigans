@@ -144,6 +144,11 @@ jobs:
       # ── Download PBF + previous indexes (parallel) ─────────────────
       - name: Download PBF and previous indexes
         id: download
+        # Hard cap on the whole download phase. Reference: previous successful
+        # runs finish this step in ~9 min (PBF + 38 GiB of compressed indexes
+        # in parallel). 30 min gives 3x headroom for slower-than-usual mirrors
+        # without letting a wedged urllib/curl call park the runner overnight.
+        timeout-minutes: 30
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
           CACHE_ENDPOINT: ${{ steps.setup.outputs.cache_endpoint }}
@@ -273,13 +278,16 @@ jobs:
             echo "pbf_source=mirror" >> "$GITHUB_OUTPUT"
           fi
 
-          # Download wikidata sitelinks (if available)
+          # Download wikidata sitelinks (if available). curl gets explicit
+          # timeouts so a stalled connection can't hang the workflow.
+          # --connect-timeout caps DNS+TCP handshake, --max-time caps the
+          # whole transfer. Both fall through to "skip" via `|| true`.
           echo "[wikidata] Checking for sitelinks data..."
-          WIKIDATA_LATEST=$(curl -sL "$S3_PUBLIC_URL/geocoder/wikidata/latest.json" 2>/dev/null)
+          WIKIDATA_LATEST=$(curl -sL --connect-timeout 30 --max-time 60 "$S3_PUBLIC_URL/geocoder/wikidata/latest.json" 2>/dev/null)
           WD_DATE=$(echo "$WIKIDATA_LATEST" | jq -r '.dump_date // ""' 2>/dev/null)
           if [ -n "$WD_DATE" ]; then
             echo "[wikidata] Found sitelinks from $WD_DATE, downloading..."
-            curl -sL -o "$WORKDIR/qid_sitelinks.bin" \
+            curl -sL --connect-timeout 30 --max-time 600 -o "$WORKDIR/qid_sitelinks.bin" \
               "$S3_PUBLIC_URL/geocoder/wikidata/$WD_DATE/qid_sitelinks.bin" || true
             if [ -f "$WORKDIR/qid_sitelinks.bin" ] && [ "$(stat -c%s "$WORKDIR/qid_sitelinks.bin")" -gt 1000 ]; then
               echo "[wikidata] Downloaded: $(( $(stat -c%s "$WORKDIR/qid_sitelinks.bin") / 6 )) entries"
@@ -293,11 +301,18 @@ jobs:
             echo "[wikidata] No sitelinks data available"
           fi
 
-          # Download GeoNames postcode data (4.3M postcodes from ~100 countries)
+          # Download GeoNames postcode data (4.3M postcodes from ~100 countries).
+          # An earlier run hung for 4h on urllib.request.urlretrieve when
+          # download.geonames.org stopped serving bytes mid-transfer — urllib's
+          # default socket timeout is None. Set a global socket timeout AND
+          # wrap the whole step in `timeout` so a stuck mirror can't park the
+          # entire build. GeoNames is non-blocking (postcode coverage tops
+          # what's already in OSM); skip on failure rather than fail the job.
           echo "[geonames] Downloading GeoNames postcode data..."
           GEONAMES_FILE="$WORKDIR/postcode_centroids_external.csv.gz"
-          python3 -c "
-          import zipfile, io, gzip, urllib.request, os, tempfile
+          timeout 600 python3 -c "
+          import socket, zipfile, io, gzip, urllib.request, os, tempfile
+          socket.setdefaulttimeout(120)
           entries = {}
           tmpdir = tempfile.mkdtemp()
           for url, cc_filter in [
@@ -328,7 +343,7 @@ jobs:
               for (cc, pc), (lat, lng) in sorted(entries.items()):
                   f.write(f'{pc},{lat},{lng},{cc}\n')
           print(f'[geonames] {len(entries)} postcodes, {os.path.getsize(\"$GEONAMES_FILE\")//1024//1024} MiB')
-          " 2>&1
+          " 2>&1 || echo "[geonames] timed out or failed"
           if [ -f "$GEONAMES_FILE" ] && [ "$(stat -c%s "$GEONAMES_FILE")" -gt 1000 ]; then
             echo "postcode_centroids_external=$GEONAMES_FILE" >> "$GITHUB_OUTPUT"
           else
