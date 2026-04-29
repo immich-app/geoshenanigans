@@ -1688,6 +1688,7 @@ int main(int argc, char* argv[]) {
                 // Thread-local data for parallel way processing
                 struct ThreadLocalData {
                     std::vector<WayHeader> ways;
+                    std::vector<int64_t> way_osm_ids;  // parallel to ways; stable identity for strategy-2 allocator
                     std::vector<NodeCoord> street_nodes;
                     std::vector<DeferredWay> deferred_ways;
                     std::vector<InterpWay> interp_ways;
@@ -1974,6 +1975,7 @@ int main(int argc, char* argv[]) {
                             WayHeader header{}; header.node_offset = noff;
                             header.node_count = static_cast<uint8_t>(std::min(refs_size, size_t(255)));
                             local.ways.push_back(header);
+                            local.way_osm_ids.push_back(way_id);
                             local.way_strings.push_back(t_best_name);
                             local.way_orig_names.push_back(t_name ? t_name : (t_best_name ? t_best_name : ""));
                             local.deferred_ways.push_back({wid, noff, header.node_count});
@@ -2149,11 +2151,13 @@ int main(int argc, char* argv[]) {
                     uint32_t interp_node_base = static_cast<uint32_t>(data.interp_nodes.size());
 
                     // Merge street ways
+                    data.way_osm_ids.reserve(data.way_osm_ids.size() + local.ways.size());
                     for (size_t i = 0; i < local.ways.size(); i++) {
                         auto h = local.ways[i];
                         h.node_offset += node_base;
                         h.name_id = data.string_pool.intern(local.way_strings[i]);
                         data.ways.push_back(h);
+                        data.way_osm_ids.push_back(i < local.way_osm_ids.size() ? local.way_osm_ids[i] : 0);
                         // Store original name for token matching
                         uint32_t orig_id = NO_DATA;
                         if (i < local.way_orig_names.size() && !local.way_orig_names[i].empty()) {

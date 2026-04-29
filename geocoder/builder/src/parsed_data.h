@@ -121,6 +121,13 @@ constexpr const char* STR_TIER_NAMES[STR_TIER_COUNT] = {
 struct ParsedData {
     StringPool string_pool;
     std::vector<WayHeader> ways;
+    // Stable identity per way, parallel to `ways`. The IdAllocator
+    // (strategy 2) consumes these alongside the previous build's
+    // sidecar to assign the same dense way_id to each osm_way_id
+    // across builds — eliminating cascade-shift in addr_points'
+    // parent_way_id, poi_records' parent_street_id, cell entries,
+    // and so on. Build-time only; not written to user-facing files.
+    std::vector<int64_t> way_osm_ids;
     std::vector<NodeCoord> street_nodes;
     std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_ways;
     std::vector<AddrPoint> addr_points;

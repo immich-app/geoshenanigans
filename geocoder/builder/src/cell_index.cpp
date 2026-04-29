@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "geometry.h"
+#include "id_allocator.h"
 #include "postcode_validation.h"
 #include "s2_helpers.h"
 
@@ -326,6 +327,23 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             std::ofstream f(output_dir + "/street_ways.bin", std::ios::binary);
             f.write(reinterpret_cast<const char*>(data.ways.data()), data.ways.size() * sizeof(WayHeader));
         }));
+        // Strategy-2 sidecar: idx → osm_way_id mapping. The diff/patch
+        // tools read both the old and new sidecars to compute perfect
+        // id_remaps without identity-key collisions or fixup_way_offsets
+        // gymnastics. Cached only — never shipped to clients.
+        if (!data.way_osm_ids.empty()) {
+            write_futures.push_back(std::async(std::launch::async, [&] {
+                using namespace gc::id_alloc;
+                std::vector<SidecarSlot> slots(data.way_osm_ids.size());
+                for (size_t i = 0; i < data.way_osm_ids.size(); i++) {
+                    slots[i].object_type = static_cast<uint8_t>(ObjectType::OSM_WAY);
+                    slots[i].flags = 0;
+                    slots[i].reserved = 0;
+                    slots[i].stable_id = static_cast<uint64_t>(data.way_osm_ids[i]);
+                }
+                IdAllocator::write_sidecar(output_dir + "/street_ways.osm_ids.bin", slots);
+            }));
+        }
         write_futures.push_back(std::async(std::launch::async, [&] {
             std::ofstream f(output_dir + "/street_nodes.bin", std::ios::binary);
             f.write(reinterpret_cast<const char*>(data.street_nodes.data()), data.street_nodes.size() * sizeof(NodeCoord));
