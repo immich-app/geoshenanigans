@@ -318,6 +318,14 @@ void add_admin_polygon(ParsedData& data,
         ? static_cast<uint16_t>((country_code[0] << 8) | country_code[1])
         : 0;
     data.admin_polygons.push_back(poly);
+    // Strategy-2 stable identity. Closed-way polygons aren't from a
+    // relation; their identity is the closed way's osm_way_id which
+    // isn't carried into here. Use 0 as a sentinel — the IdAllocator
+    // treats this like any new entity and assigns a fresh idx that
+    // won't be stable across builds. Closed-way admin polygons are a
+    // tiny minority (<1% of admin set), so per-build instability for
+    // those is acceptable for the first cut.
+    data.admin_osm_ids.push_back(0);
 
     if (admin_pool) {
         admin_pool->submit(poly_id, std::move(simplified));

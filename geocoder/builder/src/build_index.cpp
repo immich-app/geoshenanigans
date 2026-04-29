@@ -2319,6 +2319,12 @@ int main(int argc, char* argv[]) {
                         uint8_t admin_level;
                         std::string country_code;
                         uint8_t place_type_override;
+                        // Strategy-2 stable identity. Together (relation_id,
+                        // ring_index) uniquely identifies one polygon ring
+                        // across builds: a relation can produce multiple
+                        // outer rings, and OSM ring order is deterministic.
+                        int64_t relation_id;
+                        uint16_t ring_index;
                     };
 
                     std::vector<std::vector<AdminResult>> thread_admin_results(num_threads);
@@ -2450,6 +2456,7 @@ int main(int argc, char* argv[]) {
                                     pto = rel.fallback_place_type;
                                 }
 
+                                uint16_t ring_idx = 0;
                                 for (auto& ring : rings) {
                                     if (ring.size() >= 3) {
                                         AdminResult ar;
@@ -2458,8 +2465,11 @@ int main(int argc, char* argv[]) {
                                         ar.admin_level = rel.admin_level;
                                         ar.country_code = rel.country_code;
                                         ar.place_type_override = pto;
+                                        ar.relation_id = rel.id;
+                                        ar.ring_index = ring_idx;
                                         local_results.push_back(std::move(ar));
                                     }
+                                    ring_idx++;
                                 }
 
                                 uint64_t done = assembled_count.fetch_add(1) + 1;
@@ -2498,6 +2508,8 @@ int main(int argc, char* argv[]) {
                         std::string country_code;
                         float area;
                         uint8_t place_type_override;
+                        int64_t relation_id;
+                        uint16_t ring_index;
                     };
                     std::vector<PreparedPolygon> prepared(total_admin_rings);
                     {
@@ -2530,6 +2542,8 @@ int main(int argc, char* argv[]) {
                                     pp.admin_level = ar.admin_level;
                                     pp.country_code = std::move(ar.country_code);
                                     pp.place_type_override = ar.place_type_override;
+                                    pp.relation_id = ar.relation_id;
+                                    pp.ring_index = ar.ring_index;
                                 }
                             });
                         }
@@ -2560,6 +2574,13 @@ int main(int argc, char* argv[]) {
                         poly.country_code = (cc && cc[0] && cc[1])
                             ? static_cast<uint16_t>((cc[0] << 8) | cc[1]) : 0;
                         data.admin_polygons.push_back(poly);
+                        // Pack (relation_id, ring_index) into the 64-bit
+                        // stable_id. Top 48 bits = relation_id (covers
+                        // OSM's ~20M relations comfortably), bottom 16 =
+                        // ring_index. Strategy-2 IdAllocator uses this.
+                        data.admin_osm_ids.push_back(
+                            (static_cast<uint64_t>(pp.relation_id) << 16) |
+                            static_cast<uint64_t>(pp.ring_index));
 
                         admin_pool.submit(poly_id, std::move(pp.simplified));
                     }

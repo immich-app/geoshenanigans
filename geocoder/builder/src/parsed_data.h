@@ -145,6 +145,12 @@ struct ParsedData {
     std::vector<NodeCoord> interp_nodes;
     std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_interps;
     std::vector<AdminPolygon> admin_polygons;
+    // Parallel to admin_polygons. Encoded as (relation_id<<16 |
+    // ring_index) for relation-sourced polygons; 0 for closed-way
+    // polygons (no relation). Strategy-2 IdAllocator uses this.
+    std::vector<uint64_t> admin_osm_ids;
+    // Filled by apply_strategy2_remaps after the admin remap pass.
+    std::vector<uint8_t> admin_sidecar_blob;
     std::vector<NodeCoord> admin_vertices;
     std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_admin;
 

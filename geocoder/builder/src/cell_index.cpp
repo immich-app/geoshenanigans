@@ -272,12 +272,91 @@ static void apply_strategy2_streets(ParsedData& data, const std::string& prev_di
               << ")" << std::endl;
 }
 
+// Strategy-2 stable IDs for admin_polygons.
+// Stable identity: (relation_id<<16 | ring_index) packed into uint64_t.
+// Closed-way admin polygons (non-relation-sourced) carry stable_id=0
+// and get fresh IDs each build (acceptable: <1% of admin polygons).
+//
+// Reference sites updated:
+//   - data.cell_to_admin (map values)
+//   - data.admin_parent_ids (parallel array — both reorder AND value remap)
+//   - data.way_parent_ids (values point to admin polys — value remap)
+//   - data.poi_records[*].parent_poly_id
+//   - data.place_nodes[*].parent_poly_id
+//
+// admin_polygons are written to /full/admin_polygons.bin in the admin
+// variant and to /quality/q*/ in quality variants; sidecar is canonical
+// at /admin/admin_polygons.osm_ids.bin (admin variant always has it).
+static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir) {
+    using namespace gc::id_alloc;
+    if (data.admin_polygons.empty()) return;
+    if (data.admin_osm_ids.size() != data.admin_polygons.size()) return;
+
+    IdAllocator alloc;
+    if (!prev_dir.empty()) {
+        // The admin variant always has admin_polygons.bin alongside
+        // its sidecar; quality variants are derived from the same
+        // polygon set and would have identical sidecars.
+        alloc.load_previous(prev_dir + "/admin/admin_polygons.osm_ids.bin");
+    }
+
+    const size_t n_old = data.admin_polygons.size();
+    std::vector<uint32_t> remap(n_old);
+    for (size_t i = 0; i < n_old; i++) {
+        // stable_id == 0 means closed-way polygon: NONE-typed slot, no reuse.
+        ObjectType t = data.admin_osm_ids[i] == 0
+            ? ObjectType::SYNTHETIC : ObjectType::OSM_RELATION;
+        remap[i] = alloc.allocate(t, data.admin_osm_ids[i]);
+    }
+
+    const uint32_t n_new = alloc.total_slots();
+
+    AdminPolygon tomb_poly{};
+    std::memset(&tomb_poly, 0, sizeof(tomb_poly));
+    tomb_poly.name_id = NO_DATA;
+    std::vector<AdminPolygon> new_polys(n_new, tomb_poly);
+    std::vector<uint64_t>     new_osm_ids(n_new, 0);
+    std::vector<uint32_t>     new_parents(data.admin_parent_ids.empty() ? 0 : n_new, NO_DATA);
+
+    for (size_t i = 0; i < n_old; i++) {
+        uint32_t k = remap[i];
+        new_polys[k]   = data.admin_polygons[i];
+        new_osm_ids[k] = data.admin_osm_ids[i];
+        if (i < data.admin_parent_ids.size()) new_parents[k] = data.admin_parent_ids[i];
+    }
+    data.admin_polygons = std::move(new_polys);
+    data.admin_osm_ids  = std::move(new_osm_ids);
+    if (!new_parents.empty()) data.admin_parent_ids = std::move(new_parents);
+
+    // Apply remap to every reference site that points into admin_polygons[].
+    auto map_ref = [&](uint32_t& v) {
+        if (v != NO_DATA && v < remap.size()) v = remap[v];
+    };
+    for (auto& [cell, ids] : data.cell_to_admin) for (auto& id : ids) map_ref(id);
+    // admin_parent_ids and way_parent_ids hold admin polygon IDs (parent chain).
+    // admin_parent_ids was reordered above; now value-remap each entry.
+    for (auto& v : data.admin_parent_ids) map_ref(v);
+    for (auto& v : data.way_parent_ids)   map_ref(v);
+    for (auto& pr : data.poi_records)     map_ref(pr.parent_poly_id);
+    for (auto& pn : data.place_nodes)     map_ref(pn.parent_poly_id);
+
+    auto slots = alloc.build_sidecar();
+    data.admin_sidecar_blob.assign(
+        reinterpret_cast<const uint8_t*>(slots.data()),
+        reinterpret_cast<const uint8_t*>(slots.data() + slots.size()));
+
+    std::cerr << "  strategy2 admins: " << alloc.live_count() << " live, "
+              << alloc.tombstone_count() << " tombstones, "
+              << n_new << " total slots" << std::endl;
+}
+
 void apply_strategy2_remaps(ParsedData& data, const std::string& prev_dir) {
     apply_strategy2_streets(data, prev_dir);
-    // TODO: same for admin_polygons, postcode_centroids, addr_points,
-    // place_nodes, poi_records, interp_ways. Each follows the same
-    // pattern: track stable identity at collection time, allocate
-    // against previous sidecar, reorder + remap references, emit sidecar.
+    apply_strategy2_admins(data, prev_dir);
+    // TODO: same for postcode_centroids, addr_points, place_nodes,
+    // poi_records, interp_ways. Each follows the same pattern: track
+    // stable identity at collection time, allocate against previous
+    // sidecar, reorder + remap references, emit sidecar.
 }
 
 void write_index(const ParsedData& data, const std::string& output_dir, IndexMode mode) {
@@ -961,6 +1040,38 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
     {
         std::ofstream f(output_dir + "/admin_vertices.bin", std::ios::binary);
         f.write(reinterpret_cast<const char*>(new_verts_bytes.data()), new_verts_bytes.size());
+    }
+    // Strategy-2 sidecar for admin polygons (cached only). After
+    // apply_strategy2_remaps runs, data.admin_sidecar_blob holds the
+    // post-remap slot table. Emit the same sidecar in every admin
+    // variant's output dir — they share the same polygon set, so the
+    // sidecar is identical content across full/no-addresses/admin.
+    if (!data.admin_sidecar_blob.empty()) {
+        using namespace gc::id_alloc;
+        size_t count = data.admin_sidecar_blob.size() / sizeof(SidecarSlot);
+        std::ofstream f(output_dir + "/admin_polygons.osm_ids.bin", std::ios::binary);
+        uint32_t magic = SIDECAR_MAGIC, version = SIDECAR_VERSION;
+        uint32_t cnt = static_cast<uint32_t>(count);
+        f.write(reinterpret_cast<const char*>(&magic), 4);
+        f.write(reinterpret_cast<const char*>(&version), 4);
+        f.write(reinterpret_cast<const char*>(&cnt), 4);
+        f.write(reinterpret_cast<const char*>(data.admin_sidecar_blob.data()),
+                data.admin_sidecar_blob.size());
+    } else if (!data.admin_osm_ids.empty()) {
+        // Fallback emission — strategy-2 not applied (no prev_dir or
+        // first build). Emit current osm_ids so the next build can
+        // stabilize against this one.
+        using namespace gc::id_alloc;
+        std::vector<SidecarSlot> slots(data.admin_osm_ids.size());
+        for (size_t i = 0; i < data.admin_osm_ids.size(); i++) {
+            slots[i].object_type = data.admin_osm_ids[i] == 0
+                ? static_cast<uint8_t>(ObjectType::SYNTHETIC)
+                : static_cast<uint8_t>(ObjectType::OSM_RELATION);
+            slots[i].flags = 0;
+            slots[i].reserved = 0;
+            slots[i].stable_id = data.admin_osm_ids[i];
+        }
+        IdAllocator::write_sidecar(output_dir + "/admin_polygons.osm_ids.bin", slots);
     }
 
     // Write postal boundary files (optional, admin_level=11 only)
