@@ -35,6 +35,15 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
 // empty or its sidecars don't exist (first build / fresh start).
 void apply_strategy2_remaps(ParsedData& data, const std::string& prev_dir);
 
+// Emit a strategy-2 *.osm_ids sidecar to disk. If `blob` is non-empty
+// (apply_strategy2_remaps already ran), uses that pre-built table.
+// Otherwise falls back to deriving slots from `osm_ids_fallback` so a
+// first build (no prev sidecar) still emits a sidecar that subsequent
+// builds can stabilize against.
+void emit_strategy2_sidecar(const std::string& path,
+                            const std::vector<uint8_t>& blob,
+                            const std::vector<uint64_t>& osm_ids_fallback);
+
 // Write admin polygon/vertex files with on-the-fly simplification at a given epsilon scale.
 // Scale 0 = uncapped (no simplification). Other files are symlinked/copied from source_dir.
 void write_quality_variant(const ParsedData& data, const std::string& source_dir,

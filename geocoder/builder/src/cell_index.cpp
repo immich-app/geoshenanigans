@@ -573,6 +573,36 @@ static void apply_strategy2_interps(ParsedData& data, const std::string& prev_di
               << alloc.tombstone_count() << " tombstones" << std::endl;
 }
 
+// Helper: emit a strategy-2 sidecar from a sidecar_blob (post-remap)
+// or from a parallel osm_ids vector (fallback when strategy-2 wasn't
+// applied). Wraps the count + magic header. No-op if both are empty.
+void emit_strategy2_sidecar(const std::string& path,
+                            const std::vector<uint8_t>& blob,
+                            const std::vector<uint64_t>& osm_ids_fallback) {
+    using namespace gc::id_alloc;
+    if (!blob.empty()) {
+        size_t count = blob.size() / sizeof(SidecarSlot);
+        std::ofstream f(path, std::ios::binary);
+        uint32_t magic = SIDECAR_MAGIC, version = SIDECAR_VERSION;
+        uint32_t cnt = static_cast<uint32_t>(count);
+        f.write(reinterpret_cast<const char*>(&magic), 4);
+        f.write(reinterpret_cast<const char*>(&version), 4);
+        f.write(reinterpret_cast<const char*>(&cnt), 4);
+        f.write(reinterpret_cast<const char*>(blob.data()), blob.size());
+        return;
+    }
+    if (osm_ids_fallback.empty()) return;
+    std::vector<SidecarSlot> slots(osm_ids_fallback.size());
+    for (size_t i = 0; i < osm_ids_fallback.size(); i++) {
+        uint64_t packed = osm_ids_fallback[i];
+        slots[i].object_type = static_cast<uint8_t>(packed >> 56);
+        slots[i].flags = 0;
+        slots[i].reserved = 0;
+        slots[i].stable_id = packed & 0x00FFFFFFFFFFFFFFull;
+    }
+    IdAllocator::write_sidecar(path, slots);
+}
+
 void apply_strategy2_remaps(ParsedData& data, const std::string& prev_dir) {
     apply_strategy2_streets(data, prev_dir);
     apply_strategy2_admins(data, prev_dir);
@@ -727,38 +757,24 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             std::ofstream f(output_dir + "/street_ways.bin", std::ios::binary);
             f.write(reinterpret_cast<const char*>(data.ways.data()), data.ways.size() * sizeof(WayHeader));
         }));
-        // Strategy-2 sidecar: idx → osm_way_id mapping. After
-        // apply_strategy2_remaps runs, data.way_sidecar_blob holds the
-        // post-remap slot table (with tombstones). Fall back to deriving
-        // slots from way_osm_ids when strategy-2 wasn't applied (no
-        // prev_dir / first build). Cached only — never shipped to
-        // clients (workflow excludes *.osm_ids from user upload).
-        if (!data.way_sidecar_blob.empty()) {
-            write_futures.push_back(std::async(std::launch::async, [&] {
-                using namespace gc::id_alloc;
-                size_t count = data.way_sidecar_blob.size() / sizeof(SidecarSlot);
-                std::ofstream f(output_dir + "/street_ways.osm_ids", std::ios::binary);
-                uint32_t magic = SIDECAR_MAGIC, version = SIDECAR_VERSION;
-                uint32_t cnt = static_cast<uint32_t>(count);
-                f.write(reinterpret_cast<const char*>(&magic), 4);
-                f.write(reinterpret_cast<const char*>(&version), 4);
-                f.write(reinterpret_cast<const char*>(&cnt), 4);
-                f.write(reinterpret_cast<const char*>(data.way_sidecar_blob.data()),
-                        data.way_sidecar_blob.size());
-            }));
-        } else if (!data.way_osm_ids.empty()) {
-            write_futures.push_back(std::async(std::launch::async, [&] {
-                using namespace gc::id_alloc;
-                std::vector<SidecarSlot> slots(data.way_osm_ids.size());
+        // Strategy-2 sidecar (cached only — workflow excludes *.osm_ids
+        // from user-facing upload). If apply_strategy2_remaps ran,
+        // data.way_sidecar_blob holds the post-remap slot table. Else
+        // fall back to deriving slots from data.way_osm_ids.
+        write_futures.push_back(std::async(std::launch::async, [&] {
+            // way_osm_ids is int64_t but pack-as-OSM_WAY happens implicitly
+            // when blob is empty; build a uint64_t fallback view.
+            std::vector<uint64_t> packed_fallback;
+            if (data.way_sidecar_blob.empty() && !data.way_osm_ids.empty()) {
+                packed_fallback.resize(data.way_osm_ids.size());
                 for (size_t i = 0; i < data.way_osm_ids.size(); i++) {
-                    slots[i].object_type = static_cast<uint8_t>(ObjectType::OSM_WAY);
-                    slots[i].flags = 0;
-                    slots[i].reserved = 0;
-                    slots[i].stable_id = static_cast<uint64_t>(data.way_osm_ids[i]);
+                    packed_fallback[i] = (static_cast<uint64_t>(gc::id_alloc::ObjectType::OSM_WAY) << 56) |
+                                         (static_cast<uint64_t>(data.way_osm_ids[i]) & 0x00FFFFFFFFFFFFFFull);
                 }
-                IdAllocator::write_sidecar(output_dir + "/street_ways.osm_ids", slots);
-            }));
-        }
+            }
+            emit_strategy2_sidecar(output_dir + "/street_ways.osm_ids",
+                                    data.way_sidecar_blob, packed_fallback);
+        }));
         write_futures.push_back(std::async(std::launch::async, [&] {
             std::ofstream f(output_dir + "/street_nodes.bin", std::ios::binary);
             f.write(reinterpret_cast<const char*>(data.street_nodes.data()), data.street_nodes.size() * sizeof(NodeCoord));
@@ -883,6 +899,8 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                     f.write(reinterpret_cast<const char*>(packed_bytes.data()),
                             packed_bytes.size());
                 }
+                emit_strategy2_sidecar(output_dir + "/addr_points.osm_ids",
+                                        data.addr_sidecar_blob, data.addr_osm_ids);
             }));
             // Per-addr postcode (optional separate file, parallel to addr_points)
             if (!data.addr_postcode_ids.empty()) {
@@ -895,6 +913,8 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             write_futures.push_back(std::async(std::launch::async, [&] {
                 std::ofstream f(output_dir + "/interp_ways.bin", std::ios::binary);
                 f.write(reinterpret_cast<const char*>(data.interp_ways.data()), data.interp_ways.size() * sizeof(InterpWay));
+                emit_strategy2_sidecar(output_dir + "/interp_ways.osm_ids",
+                                        data.interp_sidecar_blob, data.interp_osm_ids);
             }));
             write_futures.push_back(std::async(std::launch::async, [&] {
                 std::ofstream f(output_dir + "/interp_nodes.bin", std::ios::binary);
@@ -1270,37 +1290,24 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
         std::ofstream f(output_dir + "/admin_vertices.bin", std::ios::binary);
         f.write(reinterpret_cast<const char*>(new_verts_bytes.data()), new_verts_bytes.size());
     }
-    // Strategy-2 sidecar for admin polygons (cached only). After
-    // apply_strategy2_remaps runs, data.admin_sidecar_blob holds the
-    // post-remap slot table. Emit the same sidecar in every admin
-    // variant's output dir — they share the same polygon set, so the
-    // sidecar is identical content across full/no-addresses/admin.
-    if (!data.admin_sidecar_blob.empty()) {
-        using namespace gc::id_alloc;
-        size_t count = data.admin_sidecar_blob.size() / sizeof(SidecarSlot);
-        std::ofstream f(output_dir + "/admin_polygons.osm_ids", std::ios::binary);
-        uint32_t magic = SIDECAR_MAGIC, version = SIDECAR_VERSION;
-        uint32_t cnt = static_cast<uint32_t>(count);
-        f.write(reinterpret_cast<const char*>(&magic), 4);
-        f.write(reinterpret_cast<const char*>(&version), 4);
-        f.write(reinterpret_cast<const char*>(&cnt), 4);
-        f.write(reinterpret_cast<const char*>(data.admin_sidecar_blob.data()),
-                data.admin_sidecar_blob.size());
-    } else if (!data.admin_osm_ids.empty()) {
-        // Fallback emission — strategy-2 not applied (no prev_dir or
-        // first build). Emit current osm_ids so the next build can
-        // stabilize against this one.
-        using namespace gc::id_alloc;
-        std::vector<SidecarSlot> slots(data.admin_osm_ids.size());
-        for (size_t i = 0; i < data.admin_osm_ids.size(); i++) {
-            slots[i].object_type = data.admin_osm_ids[i] == 0
-                ? static_cast<uint8_t>(ObjectType::SYNTHETIC)
-                : static_cast<uint8_t>(ObjectType::OSM_RELATION);
-            slots[i].flags = 0;
-            slots[i].reserved = 0;
-            slots[i].stable_id = data.admin_osm_ids[i];
+    // Strategy-2 sidecar for admin polygons (cached only). Same content
+    // across full/no-addresses/admin since they share the same polygon
+    // set. The fallback path packs SYNTHETIC for closed-way polygons
+    // (admin_osm_ids[i]==0) and OSM_RELATION for relation-sourced ones.
+    {
+        std::vector<uint64_t> packed_fallback;
+        if (data.admin_sidecar_blob.empty() && !data.admin_osm_ids.empty()) {
+            packed_fallback.resize(data.admin_osm_ids.size());
+            for (size_t i = 0; i < data.admin_osm_ids.size(); i++) {
+                gc::id_alloc::ObjectType t = data.admin_osm_ids[i] == 0
+                    ? gc::id_alloc::ObjectType::SYNTHETIC
+                    : gc::id_alloc::ObjectType::OSM_RELATION;
+                packed_fallback[i] = (static_cast<uint64_t>(t) << 56) |
+                                     (data.admin_osm_ids[i] & 0x00FFFFFFFFFFFFFFull);
+            }
         }
-        IdAllocator::write_sidecar(output_dir + "/admin_polygons.osm_ids", slots);
+        emit_strategy2_sidecar(output_dir + "/admin_polygons.osm_ids",
+                                data.admin_sidecar_blob, packed_fallback);
     }
 
     // Write postal boundary files (optional, admin_level=11 only)

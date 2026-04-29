@@ -5107,6 +5107,8 @@ int main(int argc, char* argv[]) {
                     f.write(reinterpret_cast<const char*>(d.place_nodes.data()),
                             d.place_nodes.size() * sizeof(PlaceNode));
                 }
+                emit_strategy2_sidecar(dir + "/place_nodes.osm_ids",
+                                        d.place_sidecar_blob, d.place_osm_ids);
                 write_cell_index(dir + "/place_cells.bin", dir + "/place_entries.bin", place_cell_map);
             };
 
@@ -5222,10 +5224,13 @@ int main(int argc, char* argv[]) {
                 std::vector<PoiRecord> filtered_records;
                 std::vector<uint8_t> filtered_vertex_bytes;
                 std::vector<uint32_t> id_remap(d.poi_records.size(), NO_DATA);
+                std::vector<uint64_t> filtered_osm_ids;
+                filtered_osm_ids.reserve(d.poi_records.size());
 
                 for (size_t i = 0; i < d.poi_records.size(); i++) {
                     if (d.poi_records[i].tier <= tier_var.max_tier) {
                         id_remap[i] = static_cast<uint32_t>(filtered_records.size());
+                        if (i < d.poi_osm_ids.size()) filtered_osm_ids.push_back(d.poi_osm_ids[i]);
                         auto pr = d.poi_records[i];
                         uint32_t old_voff = pr.vertex_offset;
                         uint32_t vc = pr.vertex_count;
@@ -5321,6 +5326,13 @@ int main(int argc, char* argv[]) {
                     f.write(reinterpret_cast<const char*>(filtered_vertex_bytes.data()),
                             filtered_vertex_bytes.size());
                 }
+                // Strategy-2 sidecar parallel to filtered_records.
+                // Tier-filtered subset: each tier (major/notable/all)
+                // gets its own sidecar with only the records that
+                // survived the filter, in their post-filter order.
+                emit_strategy2_sidecar(poi_dir + "/poi_records.osm_ids",
+                                        std::vector<uint8_t>{},
+                                        filtered_osm_ids);
                 write_cell_index(poi_dir + "/poi_cells.bin", poi_dir + "/poi_entries.bin",
                                  filtered_cell_map);
 
