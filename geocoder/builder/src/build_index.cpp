@@ -30,7 +30,18 @@
 #include "string_pool.h"
 #include "geometry.h"
 #include "postcode_validation.h"
+#include "id_allocator.h"
 #include "parsed_data.h"
+
+// Strategy-2 helper: pack (ObjectType, osm_id) into a single uint64_t.
+// Top 8 bits = type discriminator, bottom 56 bits = the id (or content
+// hash for synthetic identities like TIGER imports). OSM ids fit
+// comfortably in 56 bits (the largest live osm_node_id is ~13B = 34
+// bits, leaving 22 bits of headroom).
+inline uint64_t pack_osm_id(gc::id_alloc::ObjectType type, int64_t osm_id) {
+    return (static_cast<uint64_t>(type) << 56) |
+           (static_cast<uint64_t>(osm_id) & 0x00FFFFFFFFFFFFFFull);
+}
 #include "s2_helpers.h"
 #include "ring_assembly.h"
 #include "continent_boundaries.h"
@@ -228,6 +239,26 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
             // Defer S2 computation
             uint32_t interp_id = static_cast<uint32_t>(data.interp_ways.size());
             data.interp_ways.push_back(iw);
+            // Strategy-2: TIGER interpolation has no OSM origin; use a
+            // synthetic content hash (street string + range + first node
+            // coords) so the same TIGER record gets the same dense idx
+            // across builds.
+            uint64_t syn_h = 14695981039346656037ULL;
+            auto mix = [&](uint64_t v) { syn_h ^= v; syn_h *= 1099511628211ULL; };
+            for (char c : street) mix(static_cast<uint8_t>(c));
+            mix(0);
+            mix(static_cast<uint64_t>(iw.start_number));
+            mix(static_cast<uint64_t>(iw.end_number));
+            if (!nodes.empty()) {
+                uint32_t lb, gb;
+                std::memcpy(&lb, &nodes[0].lat, 4);
+                std::memcpy(&gb, &nodes[0].lng, 4);
+                mix(static_cast<uint64_t>(lb));
+                mix(static_cast<uint64_t>(gb));
+            }
+            data.interp_osm_ids.push_back(
+                pack_osm_id(gc::id_alloc::ObjectType::SYNTHETIC,
+                            static_cast<int64_t>(syn_h & 0x00FFFFFFFFFFFFFFull)));
             data.deferred_interps.push_back({interp_id, node_offset, iw.node_count});
 
             // Accumulate TIGER postcode centroids — TIGER has excellent
@@ -1358,16 +1389,19 @@ int main(int argc, char* argv[]) {
                     std::vector<std::pair<double,double>> addr_coords;
                     std::vector<std::pair<std::string,std::string>> addr_strings;
                     std::vector<std::string> addr_postcodes; // parallel to addr_strings
+                    std::vector<int64_t> addr_osm_node_ids; // parallel to addr_coords; strategy-2 stable identity
                     uint64_t count = 0;
                     std::vector<std::pair<int64_t, uint8_t>> label_hits; // (node_id, PlaceType)
                     // POI node data
                     std::vector<PoiRecord> poi_records;
+                    std::vector<int64_t> poi_osm_node_ids; // parallel to poi_records; strategy-2 stable identity
                     std::vector<std::string> poi_names;
                     std::vector<float> poi_elevations;
                     std::vector<uint32_t> poi_qids;
                     uint64_t poi_count = 0;
                     // Place node data
                     std::vector<PlaceNode> place_nodes;
+                    std::vector<int64_t> place_osm_node_ids; // parallel to place_nodes; strategy-2 stable identity
                     std::vector<std::string> place_names;
                     std::vector<std::pair<std::string, uint8_t>> place_wikidata; // (wikidata_id, PlaceType)
                 };
@@ -1483,6 +1517,7 @@ int main(int argc, char* argv[]) {
                             tl_node_data->addr_coords.push_back({lat, lng});
                             tl_node_data->addr_strings.push_back({housenumber, street ? street : ""});
                             tl_node_data->addr_postcodes.push_back(postcode ? postcode : "");
+                            tl_node_data->addr_osm_node_ids.push_back(id);
                             tl_node_data->count++;
                         }
 
@@ -1519,6 +1554,7 @@ int main(int argc, char* argv[]) {
                                 pr.tier = cls->tier;
                                 pr.flags = cls->flags;
                                 tl_node_data->poi_records.push_back(pr);
+                                tl_node_data->poi_osm_node_ids.push_back(id);
                                 tl_node_data->poi_names.push_back(best_name ? std::string(best_name) : std::string());
                                 float ele_val = 0;
                                 if (n_ele) { char* end; ele_val = std::strtof(n_ele, &end); if (end == n_ele) ele_val = 0; }
@@ -1560,6 +1596,7 @@ int main(int argc, char* argv[]) {
                                 pn.lng = static_cast<float>(lng);
                                 pn.place_type = static_cast<uint8_t>(settlement_pt);
                                 tl_node_data->place_nodes.push_back(pn);
+                                tl_node_data->place_osm_node_ids.push_back(id);
                                 tl_node_data->place_names.push_back(place_name);
                             }
 
@@ -1614,9 +1651,11 @@ int main(int argc, char* argv[]) {
                     for (size_t j = 0; j < local.addr_coords.size(); j++) {
                         uint64_t dummy = 0;
                         const char* pc_ptr = local.addr_postcodes[j].empty() ? nullptr : local.addr_postcodes[j].c_str();
+                        int64_t node_id = j < local.addr_osm_node_ids.size() ? local.addr_osm_node_ids[j] : 0;
                         add_addr_point(data, local.addr_coords[j].first, local.addr_coords[j].second,
                                        local.addr_strings[j].first.c_str(),
-                                       local.addr_strings[j].second.c_str(), pc_ptr, dummy);
+                                       local.addr_strings[j].second.c_str(), pc_ptr, dummy,
+                                       pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, node_id));
                         // Accumulate postcode centroids (basic validation;
                         // per-country pattern validation happens later when
                         // building the centroid index).
@@ -1644,6 +1683,10 @@ int main(int argc, char* argv[]) {
                             ? NO_DATA
                             : data.string_pool.intern(local.poi_names[j]);
                         data.poi_records.push_back(pr);
+                        // Strategy-2 stable identity: node-sourced POI.
+                        int64_t poi_node_id = j < local.poi_osm_node_ids.size() ? local.poi_osm_node_ids[j] : 0;
+                        data.poi_osm_ids.push_back(
+                            pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, poi_node_id));
                     }
                     poi_elevations.insert(poi_elevations.end(),
                         local.poi_elevations.begin(), local.poi_elevations.end());
@@ -1657,6 +1700,11 @@ int main(int argc, char* argv[]) {
                         auto pn = local.place_nodes[j];
                         pn.name_id = data.string_pool.intern(local.place_names[j]);
                         data.place_nodes.push_back(pn);
+                        // Strategy-2 stable identity: place_nodes are always
+                        // settlement nodes from the OSM node stream.
+                        int64_t place_node_id = j < local.place_osm_node_ids.size() ? local.place_osm_node_ids[j] : 0;
+                        data.place_osm_ids.push_back(
+                            pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, place_node_id));
                     }
                 }
                 // Build wikidata → place type map for admin boundary linking
@@ -1712,6 +1760,8 @@ int main(int argc, char* argv[]) {
                     std::vector<NodeCoord> building_addr_poly_verts;
                     std::vector<uint32_t> building_addr_poly_off;   // NO_DATA = no polygon
                     std::vector<uint32_t> building_addr_poly_cnt;   // 0 = no polygon
+                    std::vector<int64_t> building_addr_osm_way_ids; // parallel to building_addrs; strategy-2 stable identity
+                    std::vector<int64_t> interp_osm_way_ids;        // parallel to interp_ways; strategy-2 stable identity
                     std::vector<std::string> way_strings;      // way name (name:en ?: name)
                     std::vector<std::string> way_orig_names;   // way original name (always name tag)
                     std::vector<std::pair<std::string,std::string>> addr_strings; // building addr {hn, street}
@@ -1745,6 +1795,7 @@ int main(int argc, char* argv[]) {
                         std::vector<NodeCoord> vertices;
                         float elevation;
                         uint32_t qid;
+                        int64_t osm_way_id; // strategy-2 stable identity
                     };
                     std::vector<PoiWayEntry> poi_ways;
                     // POI way geometries for relation assembly
@@ -1917,6 +1968,7 @@ int main(int argc, char* argv[]) {
                                 iw.node_count = static_cast<uint8_t>(std::min(refs_size, size_t(255)));
                                 iw.interpolation = interp_type;
                                 local.interp_ways.push_back(iw);
+                                local.interp_osm_way_ids.push_back(way_id);
                                 local.interp_strings.push_back(street);
                                 local.deferred_interps.push_back({interp_id, node_offset, iw.node_count});
                                 local.interp_count++;
@@ -1941,6 +1993,7 @@ int main(int argc, char* argv[]) {
                             double clat = sum_lat/valid, clng = sum_lng/valid;
                             local.building_addr_coords.push_back({clat, clng});
                             local.building_addrs.push_back({static_cast<float>(clat), static_cast<float>(clng), 0, 0, 0, NO_DATA, 0});
+                            local.building_addr_osm_way_ids.push_back(way_id);
                             local.addr_strings.push_back({housenumber, street ? street : ""});
                             local.addr_postcodes.push_back(t_postcode ? t_postcode : "");
                             // Polygon vertices for closed ways (buildings).
@@ -2059,7 +2112,7 @@ int main(int argc, char* argv[]) {
                             if (t_wikidata && t_wikidata[0] == 'Q') {
                                 way_qid = static_cast<uint32_t>(std::strtoul(t_wikidata + 1, nullptr, 10));
                             }
-                            local.poi_ways.push_back({pr, t_best_name, std::move(verts), way_ele, way_qid});
+                            local.poi_ways.push_back({pr, t_best_name, std::move(verts), way_ele, way_qid, way_id});
                         }
                     }
 
@@ -2191,9 +2244,12 @@ int main(int argc, char* argv[]) {
                         const NodeCoord* poly_verts = (poly_cnt > 0 && poly_off != NO_DATA)
                             ? &local.building_addr_poly_verts[poly_off]
                             : nullptr;
+                        int64_t bldg_way_id = i < local.building_addr_osm_way_ids.size()
+                            ? local.building_addr_osm_way_ids[i] : 0;
                         add_addr_point(data, local.building_addrs[i].lat, local.building_addrs[i].lng,
                                        local.addr_strings[i].first.c_str(),
                                        local.addr_strings[i].second.c_str(), bpc_ptr, dummy,
+                                       pack_osm_id(gc::id_alloc::ObjectType::OSM_WAY, bldg_way_id),
                                        poly_verts, poly_cnt);
                         // Accumulate postcode centroids (validated)
                         const auto& pc = local.addr_postcodes[i];
@@ -2212,6 +2268,10 @@ int main(int argc, char* argv[]) {
                         iw.node_offset += interp_node_base;
                         iw.street_id = data.string_pool.intern(local.interp_strings[i]);
                         data.interp_ways.push_back(iw);
+                        // Strategy-2 stable identity: PBF-sourced interp_way is from a way.
+                        int64_t iw_osm_id = i < local.interp_osm_way_ids.size() ? local.interp_osm_way_ids[i] : 0;
+                        data.interp_osm_ids.push_back(
+                            pack_osm_id(gc::id_alloc::ObjectType::OSM_WAY, iw_osm_id));
                     }
                     data.interp_nodes.insert(data.interp_nodes.end(),
                         local.interp_nodes.begin(), local.interp_nodes.end());
@@ -2262,6 +2322,9 @@ int main(int argc, char* argv[]) {
                         pw.record.vertex_offset = vertex_offset;
                         pw.record.name_id = data.string_pool.intern(pw.name);
                         data.poi_records.push_back(pw.record);
+                        // Strategy-2 stable identity: way-sourced POI.
+                        data.poi_osm_ids.push_back(
+                            pack_osm_id(gc::id_alloc::ObjectType::OSM_WAY, pw.osm_way_id));
                         poi_elevations.push_back(pw.elevation);
                         poi_qids.push_back(pw.qid);
                     }
@@ -2611,6 +2674,12 @@ int main(int argc, char* argv[]) {
                             std::string addr_housenumber;
                             std::string addr_street;
                             std::string addr_postcode;
+                            // Strategy-2 stable identity: relation_id +
+                            // ring_index. A multi-ring POI relation produces
+                            // one PoiResult per ring; ring_index makes them
+                            // distinguishable across builds.
+                            int64_t relation_id;
+                            uint16_t ring_index;
                         };
 
                         std::vector<std::vector<PoiResult>> thread_poi_results(num_threads);
@@ -2649,6 +2718,7 @@ int main(int argc, char* argv[]) {
                                         }
                                     }
 
+                                    uint16_t poi_ring_idx = 0;
                                     for (auto& ring : rings) {
                                         if (ring.size() >= 3) {
                                             // Normalize ring rotation
@@ -2677,9 +2747,12 @@ int main(int argc, char* argv[]) {
                                                 pr.addr_housenumber = rel.addr_housenumber;
                                                 pr.addr_street = rel.addr_street;
                                                 pr.addr_postcode = rel.addr_postcode;
+                                                pr.relation_id = rel.id;
+                                                pr.ring_index = poi_ring_idx;
                                                 local_results.push_back(std::move(pr));
                                             }
                                         }
+                                        poi_ring_idx++;
                                     }
 
                                     poi_assembled_count.fetch_add(1);
@@ -2715,6 +2788,15 @@ int main(int argc, char* argv[]) {
                                 rec.tier = pr.tier;
                                 rec.flags = pr.flags;
                                 data.poi_records.push_back(rec);
+                                // Strategy-2 stable identity: pack
+                                // (relation_id<<16 | ring_index) into the
+                                // 56-bit id payload, type=OSM_RELATION.
+                                uint64_t rel_payload =
+                                    (static_cast<uint64_t>(pr.relation_id) << 16) |
+                                    static_cast<uint64_t>(pr.ring_index);
+                                data.poi_osm_ids.push_back(
+                                    pack_osm_id(gc::id_alloc::ObjectType::OSM_RELATION,
+                                                static_cast<int64_t>(rel_payload)));
                                 poi_elevations.push_back(0); // relations don't have ele
                                 poi_qids.push_back(pr.qid);
                                 total_poi_rings++;
@@ -2732,10 +2814,32 @@ int main(int argc, char* argv[]) {
                                     for (const auto& [vlat, vlng] : pr.vertices) {
                                         poly_verts.push_back({static_cast<float>(vlat), static_cast<float>(vlng)});
                                     }
+                                    // TIGER addrs have no OSM origin. Use a synthetic
+                                    // 56-bit hash of (lat_bits, lng_bits, housenumber,
+                                    // street) so the same TIGER record gets the same
+                                    // dense idx across builds (TIGER snapshots are
+                                    // re-imported daily but mostly unchanged).
+                                    uint64_t synthetic_h = 14695981039346656037ULL;
+                                    auto mix64 = [&](uint64_t v) {
+                                        synthetic_h ^= v;
+                                        synthetic_h *= 1099511628211ULL;
+                                    };
+                                    uint32_t lat_bits, lng_bits;
+                                    float clat_f = static_cast<float>(clat);
+                                    float clng_f = static_cast<float>(clng);
+                                    std::memcpy(&lat_bits, &clat_f, 4);
+                                    std::memcpy(&lng_bits, &clng_f, 4);
+                                    mix64(static_cast<uint64_t>(lat_bits));
+                                    mix64(static_cast<uint64_t>(lng_bits));
+                                    for (char c : pr.addr_housenumber) mix64(static_cast<uint8_t>(c));
+                                    mix64(0); // separator
+                                    for (char c : pr.addr_street) mix64(static_cast<uint8_t>(c));
                                     add_addr_point(data, clat, clng,
                                                    pr.addr_housenumber.c_str(),
                                                    pr.addr_street.c_str(),
                                                    bpc_ptr, dummy,
+                                                   pack_osm_id(gc::id_alloc::ObjectType::SYNTHETIC,
+                                                               static_cast<int64_t>(synthetic_h & 0x00FFFFFFFFFFFFFFull)),
                                                    poly_verts.data(),
                                                    static_cast<uint32_t>(poly_verts.size()));
                                     if (!pr.addr_postcode.empty() && is_valid_postcode(pr.addr_postcode.c_str())) {

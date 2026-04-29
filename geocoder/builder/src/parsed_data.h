@@ -139,9 +139,16 @@ struct ParsedData {
     std::vector<NodeCoord> street_nodes;
     std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_ways;
     std::vector<AddrPoint> addr_points;
+    // Parallel to addr_points. Packed: top 8 bits = ObjectType
+    // (OSM_NODE for node-sourced, OSM_WAY for closed-way buildings,
+    // SYNTHETIC for TIGER imports). Bottom 56 bits = osm id (or
+    // synthetic hash). Strategy-2 IdAllocator uses this.
+    std::vector<uint64_t> addr_osm_ids;
     std::vector<NodeCoord> addr_vertices;  // polygon vertices for building addr_points
     std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_addrs;
     std::vector<InterpWay> interp_ways;
+    // Parallel to interp_ways: packed (OSM_WAY, osm_way_id).
+    std::vector<uint64_t> interp_osm_ids;
     std::vector<NodeCoord> interp_nodes;
     std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_interps;
     std::vector<AdminPolygon> admin_polygons;
@@ -185,10 +192,16 @@ struct ParsedData {
 
     // Place nodes (settlements)
     std::vector<PlaceNode> place_nodes;
+    // Parallel: packed (OSM_NODE, osm_node_id). Strategy-2 IdAllocator uses this.
+    std::vector<uint64_t> place_osm_ids;
     std::vector<CellItemPair> sorted_place_cells;
 
     // POI data
     std::vector<PoiRecord> poi_records;
+    // Parallel: packed (object_type, osm_id). object_type ∈ {OSM_NODE,
+    // OSM_WAY, OSM_RELATION} since POIs come from any of three OSM
+    // entity kinds. Strategy-2 IdAllocator uses this.
+    std::vector<uint64_t> poi_osm_ids;
     std::vector<NodeCoord> poi_vertices;
     std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_pois;
     std::vector<CellItemPair> sorted_poi_cells;

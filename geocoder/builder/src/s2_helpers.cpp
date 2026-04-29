@@ -241,6 +241,7 @@ void add_addr_point(ParsedData& data, double lat, double lng,
                     const char* housenumber, const char* street,
                     const char* postcode,
                     uint64_t& addr_count_total,
+                    uint64_t osm_id_packed,
                     const NodeCoord* polygon_vertices,
                     uint32_t polygon_vertex_count) {
     uint32_t addr_id = static_cast<uint32_t>(data.addr_points.size());
@@ -264,6 +265,8 @@ void add_addr_point(ParsedData& data, double lat, double lng,
         vertex_offset,
         vertex_count
     });
+    // Strategy-2 stable identity, parallel to addr_points.
+    data.addr_osm_ids.push_back(osm_id_packed);
     // Store postcode in separate parallel vector (optional file)
     uint32_t pc_id = (postcode && postcode[0])
         ? data.string_pool.intern(postcode) : NO_DATA;

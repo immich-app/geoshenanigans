@@ -91,6 +91,7 @@ void add_addr_point(ParsedData& data, double lat, double lng,
                     const char* housenumber, const char* street,
                     const char* postcode,
                     uint64_t& addr_count_total,
+                    uint64_t osm_id_packed,
                     const NodeCoord* polygon_vertices = nullptr,
                     uint32_t polygon_vertex_count = 0);
 
