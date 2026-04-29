@@ -555,6 +555,14 @@ int main(int argc, char* argv[]) {
                     if (file_id == (uint32_t)PatchFileId::POI_RECORDS &&
                         (!poi_admin_remap.empty() || !poi_street_remap.empty() || !poi_postcode_remap.empty()))
                         modified = true;
+                    // PlaceNode parent_poly_id (byte 16) shifts with admin id-space.
+                    if (file_id == (uint32_t)PatchFileId::PLACE_NODES &&
+                        actual_stride >= 20 && !poi_admin_remap.empty())
+                        modified = true;
+                    // AddrPoint parent_way_id (byte 16) shifts with street id-space.
+                    if (file_id == (uint32_t)PatchFileId::ADDR_POINTS &&
+                        actual_stride >= 20 && !poi_street_remap.empty())
+                        modified = true;
                     // Check fixup using lazy decoder (reads from patch mmap, zero allocation)
                     uint32_t fixup_val = 0;
                     bool has_fixup = fixup_dec.lookup(old_rec + k, fixup_val);
@@ -600,6 +608,26 @@ int main(int argc, char* argv[]) {
                                     uint32_t npp = poi_remap_lookup(poi_admin_remap, pp);
                                     if (npp != pp) memcpy(rec_buf.data() + 32, &npp, 4);
                                 }
+                            }
+                        }
+                        // PlaceNode parent_poly_id at byte 16 (20-byte stride).
+                        if (file_id == (uint32_t)PatchFileId::PLACE_NODES &&
+                            actual_stride >= 20 && !poi_admin_remap.empty()) {
+                            constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
+                            uint32_t pp; memcpy(&pp, rec_buf.data() + 16, 4);
+                            if (pp != NO_DATA) {
+                                uint32_t npp = poi_remap_lookup(poi_admin_remap, pp);
+                                if (npp != pp) memcpy(rec_buf.data() + 16, &npp, 4);
+                            }
+                        }
+                        // AddrPoint parent_way_id at byte 16 (20+ stride).
+                        if (file_id == (uint32_t)PatchFileId::ADDR_POINTS &&
+                            actual_stride >= 20 && !poi_street_remap.empty()) {
+                            constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
+                            uint32_t pw; memcpy(&pw, rec_buf.data() + 16, 4);
+                            if (pw != NO_DATA) {
+                                uint32_t npw = poi_remap_lookup(poi_street_remap, pw);
+                                if (npw != pw) memcpy(rec_buf.data() + 16, &npw, 4);
                             }
                         }
                         // Apply fixup (node_offset/vertex_offset — at byte 0 for most types, byte 8 for POI records)

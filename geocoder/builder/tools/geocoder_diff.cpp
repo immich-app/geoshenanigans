@@ -1057,6 +1057,28 @@ int main(int argc, char* argv[]) {
         }
         size_t addr_stride = new_stride;
         remap_addr_points(old_m.data, old_m.size, str_remap);
+        // parent_way_id (byte 16-19) is a foreign id into street_ways.bin.
+        // It shifts day-over-day whenever the way ordering changes (which
+        // is on every build). Without rewriting it to the new id-space,
+        // every addr_point's bytes differ between old and new even when
+        // the underlying address didn't change — build_merge_seq would
+        // classify all 174M planet addr_points as DELETE+INSERT, which is
+        // exactly what we observed (4.89 GB merge sequence on a 4.89 GB
+        // file). Wait on t_street's id_remap and apply before merge_seq.
+        if (addr_stride >= 20 && old_m.size > 0) {
+            street_remap_future.wait();
+            const auto& way_rm = res_ways.id_remap;
+            if (!way_rm.empty()) {
+                constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
+                size_t n = old_m.size / addr_stride;
+                for (size_t i = 0; i < n; i++) {
+                    char* rec = old_m.data + i * addr_stride;
+                    uint32_t pw; memcpy(&pw, rec + 16, 4);
+                    if (pw != NO_DATA && pw < way_rm.size() && way_rm[pw] != NO_DATA && way_rm[pw] != pw)
+                        memcpy(rec + 16, &way_rm[pw], 4);
+                }
+            }
+        }
         auto seq = build_merge_seq(old_m.data, old_m.size, new_m.data, new_m.size, addr_stride);
         auto soft = secondary_match_from_merge(seq, old_m.data, old_m.size, new_m.data, new_m.size, addr_stride,
             [](const char* rec) -> uint64_t {
@@ -1537,6 +1559,28 @@ int main(int argc, char* argv[]) {
         // String remap on name_id field (offset 8 in 16-byte stride)
         if (old_data.size > 0)
             remap_field(old_data.data, old_data.size, place_stride, 8, str_remap);
+        // parent_poly_id (byte 16-19, only present in 20-byte stride) is a
+        // foreign id into admin_polygons.bin and shifts day-over-day with
+        // the admin id-space. Without rewriting it the sort-based merge
+        // sees byte-different records on the byte-equality check at
+        // build_merge_seq_sorted line 90 → emits DELETE+INSERT for every
+        // place_node whose containing admin polygon's id moved (which is
+        // most of them). planet/admin patch's place_nodes merge was
+        // 106 MiB on an 80 MiB file before this fix.
+        if (place_stride >= 20 && old_data.size > 0) {
+            admin_remap_future.wait();
+            const auto& adm_rm = res_admin_p.id_remap;
+            if (!adm_rm.empty()) {
+                constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
+                size_t n = old_data.size / place_stride;
+                for (size_t i = 0; i < n; i++) {
+                    char* rec = old_data.data + i * place_stride;
+                    uint32_t pp; memcpy(&pp, rec + 16, 4);
+                    if (pp != NO_DATA && pp < adm_rm.size() && adm_rm[pp] != NO_DATA && adm_rm[pp] != pp)
+                        memcpy(rec + 16, &adm_rm[pp], 4);
+                }
+            }
+        }
         // Sort-based merge: match by (place_type, name_id, lat_bits, lng_bits)
         auto pn_seq = build_merge_seq_sorted(
             old_data.data, old_data.size, new_data.data, new_data.size, place_stride,
@@ -1618,14 +1662,20 @@ int main(int argc, char* argv[]) {
     serialize_merge(patch, res_admin_p);
     serialize_merge(patch, res_admin_v);
     { std::vector<char>().swap(res_admin_v.seq.data); }
-    // POI parent-id remap section. Only emit when this variant actually
-    // contains POI records — otherwise the patcher loads the entire
-    // (admin, street) id_remap into memory (potentially hundreds of MB
-    // on planet) and never applies any of it. The previous unconditional
-    // emission was the dominant contributor to non-POI patch bloat
-    // (planet/quality/q2.5 patch was 95% POI_PARENT_REMAP bytes).
+    // Parent-id remap section. Emitted whenever the patch contains any
+    // file that references foreign IDs that shift day-over-day:
+    //   - poi_records.bin: bytes 24/28/32 (street/postcode/admin)
+    //   - place_nodes.bin: byte 16 (admin)
+    //   - addr_points.bin: byte 16 (street)
+    // Without this, those files' merge sequences classify nearly every
+    // record as DELETE+INSERT (e.g. planet/full's addr_points was 4.89 GiB
+    // emitted as INSERT — the entire file). Quality/postal-only variants
+    // skip the marker entirely so they don't carry hundreds of MiB of
+    // remap pairs they'll never apply.
     bool has_poi = res_poi_r.old_size > 0 || res_poi_r.new_size > 0;
-    if (has_poi) {
+    bool has_place = res_place_n.old_size > 0 || res_place_n.new_size > 0;
+    bool has_addr = res_addr.old_size > 0 || res_addr.new_size > 0;
+    if (has_poi || has_place || has_addr) {
         uint32_t marker = POI_PARENT_REMAP_MARKER;
         wval(patch, &marker, 4);
         auto emit_pairs = [&](const std::vector<uint32_t>& rm) {
