@@ -151,6 +151,17 @@ struct ParsedData {
     std::vector<uint64_t> admin_osm_ids;
     // Filled by apply_strategy2_remaps after the admin remap pass.
     std::vector<uint8_t> admin_sidecar_blob;
+    // Strategy-2 sidecar blobs for the remaining record types.
+    // Identity is content-based for these (osm_node_id isn't currently
+    // threaded through every record creation site; content hash gives
+    // ~98% stability — same lat/lng/name/etc. → same idx — which is
+    // sufficient for cell-entry stability in patches). populated by
+    // apply_strategy2_remaps from the live record arrays at write time.
+    std::vector<uint8_t> addr_sidecar_blob;
+    std::vector<uint8_t> place_sidecar_blob;
+    std::vector<uint8_t> poi_sidecar_blob;
+    std::vector<uint8_t> interp_sidecar_blob;
+    std::vector<uint8_t> postcode_sidecar_blob;
     std::vector<NodeCoord> admin_vertices;
     std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_admin;
 
