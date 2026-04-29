@@ -350,13 +350,242 @@ static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir
               << n_new << " total slots" << std::endl;
 }
 
+// Strategy-2 stable IDs for addr_points.
+// Stable identity comes pre-packed in data.addr_osm_ids: top 8 bits
+// = ObjectType (NODE / WAY / SYNTHETIC), bottom 56 bits = the id.
+// Reference sites updated:
+//   - data.cell_to_addrs (map values)
+//   - data.sorted_addr_cells (item_id)
+//   - data.addr_postcode_ids (parallel array — reorder)
+// addr_vertices.bin is keyed by byte offset, not idx, so no remap.
+static void apply_strategy2_addrs(ParsedData& data, const std::string& prev_dir) {
+    using namespace gc::id_alloc;
+    if (data.addr_points.empty()) return;
+    if (data.addr_osm_ids.size() != data.addr_points.size()) return;
+
+    IdAllocator alloc;
+    if (!prev_dir.empty()) {
+        alloc.load_previous(prev_dir + "/full/addr_points.osm_ids");
+    }
+
+    const size_t n_old = data.addr_points.size();
+    std::vector<uint32_t> remap(n_old);
+    for (size_t i = 0; i < n_old; i++) {
+        ObjectType t = static_cast<ObjectType>(data.addr_osm_ids[i] >> 56);
+        uint64_t sid = data.addr_osm_ids[i] & 0x00FFFFFFFFFFFFFFull;
+        remap[i] = alloc.allocate(t, sid);
+    }
+    const uint32_t n_new = alloc.total_slots();
+
+    AddrPoint tomb_addr{};
+    std::memset(&tomb_addr, 0, sizeof(tomb_addr));
+    tomb_addr.parent_way_id = NO_DATA;
+    tomb_addr.vertex_offset = NO_DATA;
+    std::vector<AddrPoint> new_addrs(n_new, tomb_addr);
+    std::vector<uint64_t>  new_osm_ids(n_new, 0);
+    std::vector<uint32_t>  new_postcodes(data.addr_postcode_ids.empty() ? 0 : n_new, NO_DATA);
+
+    for (size_t i = 0; i < n_old; i++) {
+        uint32_t k = remap[i];
+        new_addrs[k]   = data.addr_points[i];
+        new_osm_ids[k] = data.addr_osm_ids[i];
+        if (i < data.addr_postcode_ids.size()) new_postcodes[k] = data.addr_postcode_ids[i];
+    }
+    data.addr_points  = std::move(new_addrs);
+    data.addr_osm_ids = std::move(new_osm_ids);
+    if (!new_postcodes.empty()) data.addr_postcode_ids = std::move(new_postcodes);
+
+    auto map_ref = [&](uint32_t& v) {
+        if (v != NO_DATA && v < remap.size()) v = remap[v];
+    };
+    for (auto& [cell, ids] : data.cell_to_addrs) for (auto& id : ids) map_ref(id);
+    for (auto& p : data.sorted_addr_cells) map_ref(p.item_id);
+
+    auto slots = alloc.build_sidecar();
+    data.addr_sidecar_blob.assign(
+        reinterpret_cast<const uint8_t*>(slots.data()),
+        reinterpret_cast<const uint8_t*>(slots.data() + slots.size()));
+
+    std::cerr << "  strategy2 addrs: " << alloc.live_count() << " live, "
+              << alloc.tombstone_count() << " tombstones, "
+              << n_new << " total slots" << std::endl;
+}
+
+// Strategy-2 stable IDs for place_nodes.
+// place_nodes are referenced from cell_to_place / sorted_place_cells.
+// They aren't sorted by content for binary search (verified — server
+// uses cell-driven lookup); reordering is safe.
+static void apply_strategy2_places(ParsedData& data, const std::string& prev_dir) {
+    using namespace gc::id_alloc;
+    if (data.place_nodes.empty()) return;
+    if (data.place_osm_ids.size() != data.place_nodes.size()) return;
+
+    IdAllocator alloc;
+    if (!prev_dir.empty()) {
+        // place_nodes live in /admin/ (and /full/, /no-addresses/).
+        // Use /admin/ as canonical since it's always present when
+        // place_nodes exist.
+        alloc.load_previous(prev_dir + "/admin/place_nodes.osm_ids");
+    }
+
+    const size_t n_old = data.place_nodes.size();
+    std::vector<uint32_t> remap(n_old);
+    for (size_t i = 0; i < n_old; i++) {
+        ObjectType t = static_cast<ObjectType>(data.place_osm_ids[i] >> 56);
+        uint64_t sid = data.place_osm_ids[i] & 0x00FFFFFFFFFFFFFFull;
+        remap[i] = alloc.allocate(t, sid);
+    }
+    const uint32_t n_new = alloc.total_slots();
+
+    PlaceNode tomb_pn{};
+    std::memset(&tomb_pn, 0, sizeof(tomb_pn));
+    tomb_pn.name_id = NO_DATA;
+    std::vector<PlaceNode> new_places(n_new, tomb_pn);
+    std::vector<uint64_t>  new_osm_ids(n_new, 0);
+
+    for (size_t i = 0; i < n_old; i++) {
+        uint32_t k = remap[i];
+        new_places[k]  = data.place_nodes[i];
+        new_osm_ids[k] = data.place_osm_ids[i];
+    }
+    data.place_nodes   = std::move(new_places);
+    data.place_osm_ids = std::move(new_osm_ids);
+
+    auto map_ref = [&](uint32_t& v) {
+        if (v != NO_DATA && v < remap.size()) v = remap[v];
+    };
+    for (auto& p : data.sorted_place_cells) map_ref(p.item_id);
+
+    auto slots = alloc.build_sidecar();
+    data.place_sidecar_blob.assign(
+        reinterpret_cast<const uint8_t*>(slots.data()),
+        reinterpret_cast<const uint8_t*>(slots.data() + slots.size()));
+
+    std::cerr << "  strategy2 places: " << alloc.live_count() << " live, "
+              << alloc.tombstone_count() << " tombstones" << std::endl;
+}
+
+// Strategy-2 stable IDs for poi_records.
+// Reference sites updated:
+//   - data.cell_to_pois (map values)
+//   - data.sorted_poi_cells (item_id)
+// poi_vertices.bin is byte-offset keyed (no remap needed).
+static void apply_strategy2_pois(ParsedData& data, const std::string& prev_dir) {
+    using namespace gc::id_alloc;
+    if (data.poi_records.empty()) return;
+    if (data.poi_osm_ids.size() != data.poi_records.size()) return;
+
+    IdAllocator alloc;
+    if (!prev_dir.empty()) {
+        // POIs are in /poi/all/ canonically (always has the full set).
+        alloc.load_previous(prev_dir + "/poi/all/poi_records.osm_ids");
+    }
+
+    const size_t n_old = data.poi_records.size();
+    std::vector<uint32_t> remap(n_old);
+    for (size_t i = 0; i < n_old; i++) {
+        ObjectType t = static_cast<ObjectType>(data.poi_osm_ids[i] >> 56);
+        uint64_t sid = data.poi_osm_ids[i] & 0x00FFFFFFFFFFFFFFull;
+        remap[i] = alloc.allocate(t, sid);
+    }
+    const uint32_t n_new = alloc.total_slots();
+
+    PoiRecord tomb_pr{};
+    std::memset(&tomb_pr, 0, sizeof(tomb_pr));
+    tomb_pr.name_id = NO_DATA;
+    tomb_pr.vertex_offset = NO_DATA;
+    tomb_pr.parent_street_id = NO_DATA;
+    tomb_pr.parent_postcode_id = NO_DATA;
+    tomb_pr.parent_poly_id = NO_DATA;
+    std::vector<PoiRecord> new_pois(n_new, tomb_pr);
+    std::vector<uint64_t>  new_osm_ids(n_new, 0);
+
+    for (size_t i = 0; i < n_old; i++) {
+        uint32_t k = remap[i];
+        new_pois[k]    = data.poi_records[i];
+        new_osm_ids[k] = data.poi_osm_ids[i];
+    }
+    data.poi_records = std::move(new_pois);
+    data.poi_osm_ids = std::move(new_osm_ids);
+
+    auto map_ref = [&](uint32_t& v) {
+        if (v != NO_DATA && v < remap.size()) v = remap[v];
+    };
+    for (auto& [cell, ids] : data.cell_to_pois) for (auto& id : ids) map_ref(id);
+    for (auto& p : data.sorted_poi_cells) map_ref(p.item_id);
+
+    auto slots = alloc.build_sidecar();
+    data.poi_sidecar_blob.assign(
+        reinterpret_cast<const uint8_t*>(slots.data()),
+        reinterpret_cast<const uint8_t*>(slots.data() + slots.size()));
+
+    std::cerr << "  strategy2 pois: " << alloc.live_count() << " live, "
+              << alloc.tombstone_count() << " tombstones" << std::endl;
+}
+
+// Strategy-2 stable IDs for interp_ways.
+// References: data.cell_to_interps + data.sorted_interp_cells.
+static void apply_strategy2_interps(ParsedData& data, const std::string& prev_dir) {
+    using namespace gc::id_alloc;
+    if (data.interp_ways.empty()) return;
+    if (data.interp_osm_ids.size() != data.interp_ways.size()) return;
+
+    IdAllocator alloc;
+    if (!prev_dir.empty()) {
+        alloc.load_previous(prev_dir + "/full/interp_ways.osm_ids");
+    }
+
+    const size_t n_old = data.interp_ways.size();
+    std::vector<uint32_t> remap(n_old);
+    for (size_t i = 0; i < n_old; i++) {
+        ObjectType t = static_cast<ObjectType>(data.interp_osm_ids[i] >> 56);
+        uint64_t sid = data.interp_osm_ids[i] & 0x00FFFFFFFFFFFFFFull;
+        remap[i] = alloc.allocate(t, sid);
+    }
+    const uint32_t n_new = alloc.total_slots();
+
+    InterpWay tomb_iw{};
+    std::memset(&tomb_iw, 0, sizeof(tomb_iw));
+    tomb_iw.street_id = NO_DATA;
+    std::vector<InterpWay> new_iw(n_new, tomb_iw);
+    std::vector<uint64_t>  new_osm_ids(n_new, 0);
+
+    for (size_t i = 0; i < n_old; i++) {
+        uint32_t k = remap[i];
+        new_iw[k]      = data.interp_ways[i];
+        new_osm_ids[k] = data.interp_osm_ids[i];
+    }
+    data.interp_ways    = std::move(new_iw);
+    data.interp_osm_ids = std::move(new_osm_ids);
+
+    auto map_ref = [&](uint32_t& v) {
+        if (v != NO_DATA && v < remap.size()) v = remap[v];
+    };
+    for (auto& [cell, ids] : data.cell_to_interps) for (auto& id : ids) map_ref(id);
+    for (auto& p : data.sorted_interp_cells) map_ref(p.item_id);
+
+    auto slots = alloc.build_sidecar();
+    data.interp_sidecar_blob.assign(
+        reinterpret_cast<const uint8_t*>(slots.data()),
+        reinterpret_cast<const uint8_t*>(slots.data() + slots.size()));
+
+    std::cerr << "  strategy2 interps: " << alloc.live_count() << " live, "
+              << alloc.tombstone_count() << " tombstones" << std::endl;
+}
+
 void apply_strategy2_remaps(ParsedData& data, const std::string& prev_dir) {
     apply_strategy2_streets(data, prev_dir);
     apply_strategy2_admins(data, prev_dir);
-    // TODO: same for postcode_centroids, addr_points, place_nodes,
-    // poi_records, interp_ways. Each follows the same pattern: track
-    // stable identity at collection time, allocate against previous
-    // sidecar, reorder + remap references, emit sidecar.
+    apply_strategy2_addrs(data, prev_dir);
+    apply_strategy2_places(data, prev_dir);
+    apply_strategy2_pois(data, prev_dir);
+    apply_strategy2_interps(data, prev_dir);
+    // postcode_centroids: their stable identity is (country_code,
+    // postcode_string) and the centroid records get materialized from
+    // the unordered_map<postcode_id, PostcodeAccum> at write time, AFTER
+    // strategy-2 runs. Stability there is handled by deterministic
+    // sorting at write time + the existing postcode_id remap pipeline
+    // in geocoder-diff; revisit once the other types are validated.
 }
 
 void write_index(const ParsedData& data, const std::string& output_dir, IndexMode mode) {
