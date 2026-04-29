@@ -408,16 +408,18 @@ static constexpr uint32_t CELL_FLAGS_MARKER = 0xFFFFFFF9;
 static constexpr uint32_t SECONDARY_REMAP_MARKER = 0xFFFFFFF6;
 
 // POI parent-id remap marker: 0xFFFFFFF3
-// Carries the full primary+secondary admin-polygon and street-way old→new ID
-// remap that the diff side applied to old PoiRecord bytes 24/32 before
-// computing pr_seq + the byte-block delta over poi_vertices.bin. The
-// patcher applies the same remap during POI_RECORDS MATCH replay so the
-// reconstructed bytes match the new file. Emitted whenever a patch
-// includes POI_RECORDS, even on poi-only subdir invocations where
-// admin_polygons.bin / street_ways.bin live in fallback paths.
+// Carries the full primary+secondary admin-polygon, street-way, and
+// postcode-centroid old→new ID remap that the diff side applied to old
+// PoiRecord bytes 24/28/32 before computing pr_seq + the byte-block
+// delta over poi_vertices.bin. The patcher applies the same remap
+// during POI_RECORDS MATCH replay so the reconstructed bytes match the
+// new file. Emitted only when the patch contains POI_RECORDS — quality,
+// admin, full, etc. variants without POI files would otherwise carry
+// hundreds of MiB of remap pairs that are never applied.
 // Format: marker(4),
-//   n_admin_pairs(4), [(old_id:u32, new_id:u32)] × n_admin_pairs,
-//   n_street_pairs(4), [(old_id:u32, new_id:u32)] × n_street_pairs.
+//   n_admin_pairs(4),    [(old_id:u32, new_id:u32)] × n_admin_pairs,
+//   n_street_pairs(4),   [(old_id:u32, new_id:u32)] × n_street_pairs,
+//   n_postcode_pairs(4), [(old_id:u32, new_id:u32)] × n_postcode_pairs.
 // Only entries where old_id != new_id are transmitted.
 static constexpr uint32_t POI_PARENT_REMAP_MARKER = 0xFFFFFFF3;
 

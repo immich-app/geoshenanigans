@@ -254,10 +254,11 @@ int main(int argc, char* argv[]) {
     struct CellCorr { uint64_t cell_id; std::vector<uint32_t> ids; };
     std::unordered_map<uint32_t, std::vector<CellCorr>> entry_corrections;
     // POI parent-id remap (from POI_PARENT_REMAP_MARKER). Applied during
-    // POI_RECORDS MATCH replay to bytes 24/32 of each record alongside
+    // POI_RECORDS MATCH replay to bytes 24/28/32 of each record alongside
     // the str_remap on byte 16. Sorted by old_id for binary-search lookup.
     std::vector<std::pair<uint32_t,uint32_t>> poi_admin_remap;
     std::vector<std::pair<uint32_t,uint32_t>> poi_street_remap;
+    std::vector<std::pair<uint32_t,uint32_t>> poi_postcode_remap;
     auto poi_remap_lookup = [](const std::vector<std::pair<uint32_t,uint32_t>>& v,
                                uint32_t old_id) -> uint32_t {
         if (v.empty()) return old_id;
@@ -382,7 +383,8 @@ int main(int argc, char* argv[]) {
             continue;
         }
         if (file_id == POI_PARENT_REMAP_MARKER) {
-            // Format: n_admin_pairs(u32), [(o,n):u32]*na, n_street_pairs(u32), [(o,n):u32]*ns
+            // Format: n_admin(u32), [(o,n):u32]*na, n_street(u32), [(o,n):u32]*ns,
+            //         n_postcode(u32), [(o,n):u32]*np
             uint32_t na = ru32();
             poi_admin_remap.resize(na);
             for (uint32_t i = 0; i < na; i++) {
@@ -395,10 +397,18 @@ int main(int argc, char* argv[]) {
                 uint32_t o = ru32(), n = ru32();
                 poi_street_remap[i] = {o, n};
             }
+            uint32_t np = ru32();
+            poi_postcode_remap.resize(np);
+            for (uint32_t i = 0; i < np; i++) {
+                uint32_t o = ru32(), n = ru32();
+                poi_postcode_remap[i] = {o, n};
+            }
             std::sort(poi_admin_remap.begin(), poi_admin_remap.end());
             std::sort(poi_street_remap.begin(), poi_street_remap.end());
+            std::sort(poi_postcode_remap.begin(), poi_postcode_remap.end());
             std::cerr << "  POI parent-id remap: admin_pairs=" << na
-                      << " street_pairs=" << ns << std::endl;
+                      << " street_pairs=" << ns
+                      << " postcode_pairs=" << np << std::endl;
             continue;
         }
         if (file_id == ENTRY_CORRECTION_MARKER) {
@@ -541,9 +551,9 @@ int main(int argc, char* argv[]) {
                     // Check if this record needs any modification
                     if (!remap_offs.empty() || needs_padding) modified = true;
                     // POI records always need parent-id remap consideration
-                    // (admin/street id-space shifts every build).
+                    // (admin/street/postcode id-spaces all shift every build).
                     if (file_id == (uint32_t)PatchFileId::POI_RECORDS &&
-                        (!poi_admin_remap.empty() || !poi_street_remap.empty()))
+                        (!poi_admin_remap.empty() || !poi_street_remap.empty() || !poi_postcode_remap.empty()))
                         modified = true;
                     // Check fixup using lazy decoder (reads from patch mmap, zero allocation)
                     uint32_t fixup_val = 0;
@@ -566,8 +576,8 @@ int main(int argc, char* argv[]) {
                             if (nv != v) memcpy(rec_buf.data() + off, &nv, 4);
                         }
                         // Apply POI parent-id remap (must mirror the diff
-                        // tool's pre-pr_seq rewrite of bytes 24/32 so MATCH
-                        // replays reconstruct identical bytes).
+                        // tool's pre-pr_seq rewrite of bytes 24/28/32 so
+                        // MATCH replays reconstruct identical bytes).
                         if (file_id == (uint32_t)PatchFileId::POI_RECORDS) {
                             constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
                             if (actual_stride >= 28 && !poi_street_remap.empty()) {
@@ -575,6 +585,13 @@ int main(int argc, char* argv[]) {
                                 if (st != NO_DATA) {
                                     uint32_t nst = poi_remap_lookup(poi_street_remap, st);
                                     if (nst != st) memcpy(rec_buf.data() + 24, &nst, 4);
+                                }
+                            }
+                            if (actual_stride >= 32 && !poi_postcode_remap.empty()) {
+                                uint32_t pc; memcpy(&pc, rec_buf.data() + 28, 4);
+                                if (pc != NO_DATA) {
+                                    uint32_t npc = poi_remap_lookup(poi_postcode_remap, pc);
+                                    if (npc != pc) memcpy(rec_buf.data() + 28, &npc, 4);
                                 }
                             }
                             if (actual_stride >= 36 && !poi_admin_remap.empty()) {
