@@ -5224,6 +5224,24 @@ int main(int argc, char* argv[]) {
                 {"poi/all",     3},
             };
 
+            // Canonical FULL-set POI sidecar that apply_strategy2_pois
+            // reads as <prev>/poi/all/poi_records.osm_ids on the next
+            // build. This must contain ALL d.poi_records (not the
+            // tier-filtered subset) so the IdAllocator can stabilize
+            // every POI's idx — otherwise the lookup keys (osm_id) map
+            // to indices in tier-filtered space, not full-set space,
+            // and the next build assigns wrong slots to most POIs.
+            //
+            // Emit BEFORE the tier filter loop runs, into the canonical
+            // /poi/all/ subdir (which apply_strategy2_pois already
+            // looks for). The per-tier writes below still emit their
+            // own sidecars for any future per-tier strategy-2 work but
+            // those aren't read by anything today; this canonical one
+            // is the source of truth.
+            ensure_dir(base_dir + "/poi/all");
+            emit_strategy2_sidecar(base_dir + "/poi/all/poi_records.osm_ids",
+                                    d.poi_sidecar_blob, d.poi_osm_ids);
+
             for (const auto& tier_var : poi_tiers) {
                 std::string poi_dir = base_dir + "/" + tier_var.name;
                 ensure_dir(poi_dir);
@@ -5336,13 +5354,14 @@ int main(int argc, char* argv[]) {
                     f.write(reinterpret_cast<const char*>(filtered_vertex_bytes.data()),
                             filtered_vertex_bytes.size());
                 }
-                // Strategy-2 sidecar parallel to filtered_records.
-                // Tier-filtered subset: each tier (major/notable/all)
-                // gets its own sidecar with only the records that
-                // survived the filter, in their post-filter order.
-                emit_strategy2_sidecar(poi_dir + "/poi_records.osm_ids",
-                                        std::vector<uint8_t>{},
-                                        filtered_osm_ids);
+                // No per-tier sidecar emission — the canonical sidecar
+                // for apply_strategy2_pois lives at base_dir/poi/all/
+                // and contains the FULL POI set (emitted above, before
+                // this loop). Per-tier sidecars would represent
+                // tier-filtered index spaces that don't match what
+                // apply_strategy2_pois operates on (the full d.poi_records
+                // array), so reading them at the next build's allocator
+                // would put records at the wrong slots.
                 write_cell_index(poi_dir + "/poi_cells.bin", poi_dir + "/poi_entries.bin",
                                  filtered_cell_map);
 
