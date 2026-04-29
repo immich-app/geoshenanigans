@@ -425,7 +425,7 @@ int main(int argc, char* argv[]) {
     std::string tiger_data_path;
     std::string external_postcodes_path;
     // strategy-2: previous build's output root, used to read
-    // <prev_dir>/<region>/<variant>/*.osm_ids.bin sidecars and assign
+    // <prev_dir>/<region>/<variant>/*.osm_ids sidecars and assign
     // the same dense IDs to records carried over from the previous
     // build. Empty means "fresh start, no stable IDs".
     std::string prev_output_dir;

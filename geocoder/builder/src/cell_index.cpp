@@ -190,7 +190,7 @@ void write_cell_index(
 
 // Strategy-2 persistent dense IDs for street_ways.
 //
-// Loads <prev_dir>/full/street_ways.osm_ids.bin (if it exists), allocates
+// Loads <prev_dir>/full/street_ways.osm_ids (if it exists), allocates
 // a new idx for each current way preferring the previous build's slot,
 // reorders data.ways + parallel arrays, applies the resulting old→new
 // remap to every reference site (cell_to_ways, sorted_way_cells,
@@ -213,7 +213,7 @@ static void apply_strategy2_streets(ParsedData& data, const std::string& prev_di
     if (!prev_dir.empty()) {
         // Streets live in /full/ for non-admin-only builds. Try the
         // canonical path; missing-file is fine (first build).
-        alloc.load_previous(prev_dir + "/full/street_ways.osm_ids.bin");
+        alloc.load_previous(prev_dir + "/full/street_ways.osm_ids");
     }
 
     const size_t n_old = data.ways.size();
@@ -286,7 +286,7 @@ static void apply_strategy2_streets(ParsedData& data, const std::string& prev_di
 //
 // admin_polygons are written to /full/admin_polygons.bin in the admin
 // variant and to /quality/q*/ in quality variants; sidecar is canonical
-// at /admin/admin_polygons.osm_ids.bin (admin variant always has it).
+// at /admin/admin_polygons.osm_ids (admin variant always has it).
 static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir) {
     using namespace gc::id_alloc;
     if (data.admin_polygons.empty()) return;
@@ -297,7 +297,7 @@ static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir
         // The admin variant always has admin_polygons.bin alongside
         // its sidecar; quality variants are derived from the same
         // polygon set and would have identical sidecars.
-        alloc.load_previous(prev_dir + "/admin/admin_polygons.osm_ids.bin");
+        alloc.load_previous(prev_dir + "/admin/admin_polygons.osm_ids");
     }
 
     const size_t n_old = data.admin_polygons.size();
@@ -503,12 +503,12 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
         // post-remap slot table (with tombstones). Fall back to deriving
         // slots from way_osm_ids when strategy-2 wasn't applied (no
         // prev_dir / first build). Cached only — never shipped to
-        // clients (workflow excludes *.osm_ids.bin from user upload).
+        // clients (workflow excludes *.osm_ids from user upload).
         if (!data.way_sidecar_blob.empty()) {
             write_futures.push_back(std::async(std::launch::async, [&] {
                 using namespace gc::id_alloc;
                 size_t count = data.way_sidecar_blob.size() / sizeof(SidecarSlot);
-                std::ofstream f(output_dir + "/street_ways.osm_ids.bin", std::ios::binary);
+                std::ofstream f(output_dir + "/street_ways.osm_ids", std::ios::binary);
                 uint32_t magic = SIDECAR_MAGIC, version = SIDECAR_VERSION;
                 uint32_t cnt = static_cast<uint32_t>(count);
                 f.write(reinterpret_cast<const char*>(&magic), 4);
@@ -527,7 +527,7 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                     slots[i].reserved = 0;
                     slots[i].stable_id = static_cast<uint64_t>(data.way_osm_ids[i]);
                 }
-                IdAllocator::write_sidecar(output_dir + "/street_ways.osm_ids.bin", slots);
+                IdAllocator::write_sidecar(output_dir + "/street_ways.osm_ids", slots);
             }));
         }
         write_futures.push_back(std::async(std::launch::async, [&] {
@@ -1049,7 +1049,7 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
     if (!data.admin_sidecar_blob.empty()) {
         using namespace gc::id_alloc;
         size_t count = data.admin_sidecar_blob.size() / sizeof(SidecarSlot);
-        std::ofstream f(output_dir + "/admin_polygons.osm_ids.bin", std::ios::binary);
+        std::ofstream f(output_dir + "/admin_polygons.osm_ids", std::ios::binary);
         uint32_t magic = SIDECAR_MAGIC, version = SIDECAR_VERSION;
         uint32_t cnt = static_cast<uint32_t>(count);
         f.write(reinterpret_cast<const char*>(&magic), 4);
@@ -1071,7 +1071,7 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
             slots[i].reserved = 0;
             slots[i].stable_id = data.admin_osm_ids[i];
         }
-        IdAllocator::write_sidecar(output_dir + "/admin_polygons.osm_ids.bin", slots);
+        IdAllocator::write_sidecar(output_dir + "/admin_polygons.osm_ids", slots);
     }
 
     // Write postal boundary files (optional, admin_level=11 only)

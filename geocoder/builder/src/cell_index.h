@@ -25,7 +25,7 @@ void write_cell_index(
 void write_index(const ParsedData& data, const std::string& output_dir, IndexMode mode);
 
 // Strategy-2 persistent dense IDs. Loads the previous build's
-// <prev_dir>/full/<file>.osm_ids.bin sidecars (if present), allocates
+// <prev_dir>/full/<file>.osm_ids sidecars (if present), allocates
 // stable indices for each record by osm_id matching, reorders the
 // in-memory record arrays, applies remap to every reference site,
 // and stores the per-record sidecar slot vector on ParsedData so

@@ -2,7 +2,7 @@
 
 // Persistent ID allocator (Strategy 2).
 //
-// Reads the previous build's <file>.osm_ids.bin sidecar to learn which
+// Reads the previous build's <file>.osm_ids sidecar to learn which
 // dense `idx` was assigned to each stable identity (osm_id-derived) last
 // build, and hands out the SAME idx to the same identity on the new
 // build. New identities go to a free-list slot from a previously-deleted
@@ -23,8 +23,8 @@
 //   //   uint16_t reserved
 //   //   uint64_t stable_id     (osm_id, or hash of stable identity for postcodes)
 //
-// One sidecar per record file (street_ways.osm_ids.bin,
-// admin_polygons.osm_ids.bin, etc.). Cached only — never shipped.
+// One sidecar per record file (street_ways.osm_ids,
+// admin_polygons.osm_ids, etc.). Cached only — never shipped.
 
 #include <cstdint>
 #include <cstring>

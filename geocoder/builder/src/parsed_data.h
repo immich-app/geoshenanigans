@@ -132,7 +132,7 @@ struct ParsedData {
     // Indexed by the post-remap dense way_id; tombstone entries (slots
     // owned by a previous-build way that no longer exists in this
     // build) have object_type=NONE + flags|=1. write_index emits these
-    // as the street_ways.osm_ids.bin sidecar. Empty when strategy 2
+    // as the street_ways.osm_ids sidecar. Empty when strategy 2
     // wasn't applied (e.g. fresh build, no prev_dir) — in that case
     // write_index falls back to deriving slots from way_osm_ids.
     std::vector<uint8_t> way_sidecar_blob;  // raw bytes ready for fwrite (count*sizeof(SidecarSlot))

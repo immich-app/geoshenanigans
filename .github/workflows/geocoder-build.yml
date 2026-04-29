@@ -471,6 +471,14 @@ jobs:
             BUILD_ARGS="$BUILD_ARGS --external-postcodes $GEONAMES_FILE"
             echo "Using GeoNames postcode data"
           fi
+          # Strategy-2: pass the previous build's output root so the
+          # IdAllocator can stabilize dense IDs against yesterday's
+          # *.osm_ids sidecars. Empty / missing dir → first-build
+          # fresh allocation (allocator no-ops cleanly).
+          if [ -d "$WORKDIR/old-output" ]; then
+            BUILD_ARGS="$BUILD_ARGS --prev-output $WORKDIR/old-output"
+            echo "Using previous build for stable-ID allocation"
+          fi
 
           echo "Building geocoder index for $TODAY..."
           START=$(date +%s)
@@ -574,8 +582,14 @@ jobs:
 
               MATCH=0
               MISMATCH_LIST=""
+              EXPECTED=0
               for f in "$NEW_DIR"/*.bin; do
                 b=$(basename "$f")
+                # Skip strategy-2 sidecars: they're cached only, not
+                # transmitted in the patch, and the patcher doesn't
+                # write them out. The build emits them fresh every run.
+                case "$b" in *.osm_ids) continue;; esac
+                EXPECTED=$((EXPECTED + 1))
                 if cmp -s "$VERIFY_DIR/$b" "$NEW_DIR/$b"; then
                   MATCH=$((MATCH + 1))
                 else
@@ -588,10 +602,10 @@ jobs:
               done
               rm -rf "$VERIFY_DIR"
 
-              if [ $MATCH -eq $N_NEW ]; then
-                echo "PASS $N_NEW $PATCH_KB" > "$RESULTS_DIR/$SAFE"
+              if [ $MATCH -eq $EXPECTED ]; then
+                echo "PASS $EXPECTED $PATCH_KB" > "$RESULTS_DIR/$SAFE"
               else
-                echo "FAIL $MATCH $N_NEW $PATCH_KB" > "$RESULTS_DIR/$SAFE"
+                echo "FAIL $MATCH $EXPECTED $PATCH_KB" > "$RESULTS_DIR/$SAFE"
                 echo "$MISMATCH_LIST" > "$RESULTS_DIR/$SAFE.mismatches"
               fi
             ) &
@@ -680,6 +694,12 @@ jobs:
           bin_files = []
           for root, _, fs in os.walk(out):
               for name in fs:
+                  # Strategy-2 sidecars stay uncompressed: they're cached
+                  # only and the next build's IdAllocator reads them
+                  # directly. Excluding them here keeps the user-facing
+                  # `*.bin.zst` set unchanged.
+                  if name.endswith(".osm_ids"):
+                      continue
                   if name.endswith(".bin"):
                       bin_files.append(os.path.join(root, name))
           # Largest-first scheduling minimizes tail latency.
@@ -758,7 +778,13 @@ jobs:
 
           echo "Uploading .bin.zst + patches to Tigris..."
           UPLOAD_START=$(date +%s)
+          # Strategy-2 sidecars (*.osm_ids) are cached only — they
+          # carry osm_id ↔ dense-idx mapping that the next build's
+          # IdAllocator reads, but clients never need them. Exclude
+          # from the user-facing Tigris upload, include in the
+          # internal build cache below.
           s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 4 cp --concurrency 8 \
+            --exclude "*.osm_ids" \
             "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/" || \
             echo "::warning::Some files failed on first pass — verify loop will retry"
           echo "Tigris upload first pass complete in $(($(date +%s) - UPLOAD_START))s"
