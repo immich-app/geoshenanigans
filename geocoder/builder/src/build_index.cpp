@@ -5075,6 +5075,16 @@ int main(int argc, char* argv[]) {
             region_prev = prev_output_dir + rel;
         }
         apply_strategy2_remaps(d, region_prev);
+        // Expose the prev-output root to write_index via env var so the
+        // postcode_centroids strategy-2 pass (which runs inside write_index
+        // after centroids materialize, and so doesn't get prev_dir as a
+        // parameter) can locate <prev_root>/<region>/full/postcode_centroids.osm_ids.
+        // Cleared at end of write_region to keep the global state scoped.
+        if (!prev_output_dir.empty()) {
+            setenv("GC_PREV_OUTPUT_ROOT", prev_output_dir.c_str(), 1);
+        } else {
+            unsetenv("GC_PREV_OUTPUT_ROOT");
+        }
 
         if (multi_output) {
             // Write all 3 modes in parallel (they read shared data, write to separate dirs)
