@@ -131,12 +131,16 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     std::unordered_map<uint32_t, uint32_t> way_remap, addr_remap, interp_remap,
                                             admin_remap, poi_remap, place_remap;
 
-    // Ways — with coordinate-level polygon refinement if provided
+    // Ways — with coordinate-level polygon refinement if provided.
+    // Strategy-2: also forward osm_ids (parallel to ways) so the
+    // continent's IdAllocator pass can run with stable identity.
     auto f_remap_ways = std::async(std::launch::async, [&]() {
         auto& sorted_ids = used_way_ids;
         std::vector<WayHeader> ways;
         std::vector<NodeCoord> nodes;
+        std::vector<int64_t> osm_ids;
         ways.reserve(sorted_ids.size());
+        osm_ids.reserve(sorted_ids.size());
         nodes.reserve(sorted_ids.size() * 5);
         std::unordered_map<uint32_t, uint32_t> remap;
         remap.reserve(sorted_ids.size());
@@ -154,10 +158,11 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
             WayHeader nw = w;
             nw.node_offset = static_cast<uint32_t>(nodes.size());
             ways.push_back(nw);
+            osm_ids.push_back(old_id < full.way_osm_ids.size() ? full.way_osm_ids[old_id] : 0);
             for (uint8_t n = 0; n < w.node_count; n++)
                 nodes.push_back(full.street_nodes[w.node_offset + n]);
         }
-        return std::make_tuple(std::move(remap), std::move(ways), std::move(nodes));
+        return std::make_tuple(std::move(remap), std::move(ways), std::move(nodes), std::move(osm_ids));
     });
 
     // Addrs — coord polygon refinement.  Also carries through the
@@ -171,6 +176,8 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         std::vector<AddrPoint> addrs;
         addrs.reserve(sorted_ids.size());
         std::vector<NodeCoord> verts;
+        std::vector<uint64_t> osm_ids;
+        osm_ids.reserve(sorted_ids.size());
         std::unordered_map<uint32_t, uint32_t> remap;
         remap.reserve(sorted_ids.size());
         for (uint32_t old_id : sorted_ids) {
@@ -189,8 +196,9 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
                 na.vertex_count = 0;
             }
             addrs.push_back(na);
+            osm_ids.push_back(old_id < full.addr_osm_ids.size() ? full.addr_osm_ids[old_id] : 0);
         }
-        return std::make_tuple(std::move(remap), std::move(addrs), std::move(verts));
+        return std::make_tuple(std::move(remap), std::move(addrs), std::move(verts), std::move(osm_ids));
     });
 
     // Interps
@@ -198,7 +206,9 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         auto& sorted_ids = used_interp_ids;
         std::vector<InterpWay> iways;
         std::vector<NodeCoord> inodes;
+        std::vector<uint64_t> osm_ids;
         iways.reserve(sorted_ids.size());
+        osm_ids.reserve(sorted_ids.size());
         std::unordered_map<uint32_t, uint32_t> remap;
         remap.reserve(sorted_ids.size());
         for (uint32_t old_id : sorted_ids) {
@@ -207,10 +217,11 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
             InterpWay niw = iw;
             niw.node_offset = static_cast<uint32_t>(inodes.size());
             iways.push_back(niw);
+            osm_ids.push_back(old_id < full.interp_osm_ids.size() ? full.interp_osm_ids[old_id] : 0);
             for (uint8_t n = 0; n < iw.node_count; n++)
                 inodes.push_back(full.interp_nodes[iw.node_offset + n]);
         }
-        return std::make_tuple(std::move(remap), std::move(iways), std::move(inodes));
+        return std::make_tuple(std::move(remap), std::move(iways), std::move(inodes), std::move(osm_ids));
     });
 
     // Admin
@@ -219,7 +230,9 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         std::sort(sorted_ids.begin(), sorted_ids.end());
         std::vector<AdminPolygon> polys;
         std::vector<NodeCoord> verts;
+        std::vector<uint64_t> osm_ids;
         polys.reserve(sorted_ids.size());
+        osm_ids.reserve(sorted_ids.size());
         std::unordered_map<uint32_t, uint32_t> remap;
         remap.reserve(sorted_ids.size());
         for (uint32_t old_id : sorted_ids) {
@@ -228,10 +241,11 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
             AdminPolygon nap = ap;
             nap.vertex_offset = static_cast<uint32_t>(verts.size());
             polys.push_back(nap);
+            osm_ids.push_back(old_id < full.admin_osm_ids.size() ? full.admin_osm_ids[old_id] : 0);
             for (uint32_t v = 0; v < ap.vertex_count; v++)
                 verts.push_back(full.admin_vertices[ap.vertex_offset + v]);
         }
-        return std::make_tuple(std::move(remap), std::move(polys), std::move(verts));
+        return std::make_tuple(std::move(remap), std::move(polys), std::move(verts), std::move(osm_ids));
     });
 
     // POIs — coord polygon refinement, preserve vertex arrays for polygon POIs
@@ -239,7 +253,9 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         auto& sorted_ids = used_poi_ids;
         std::vector<PoiRecord> pois;
         std::vector<NodeCoord> verts;
+        std::vector<uint64_t> osm_ids;
         pois.reserve(sorted_ids.size());
+        osm_ids.reserve(sorted_ids.size());
         std::unordered_map<uint32_t, uint32_t> remap;
         remap.reserve(sorted_ids.size());
         for (uint32_t old_id : sorted_ids) {
@@ -255,8 +271,9 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
                     verts.push_back(full.poi_vertices[old_voff + v]);
             }
             pois.push_back(np);
+            osm_ids.push_back(old_id < full.poi_osm_ids.size() ? full.poi_osm_ids[old_id] : 0);
         }
-        return std::make_tuple(std::move(remap), std::move(pois), std::move(verts));
+        return std::make_tuple(std::move(remap), std::move(pois), std::move(verts), std::move(osm_ids));
     });
 
     // Place nodes — parent_poly_id remapped in a second pass below, after
@@ -264,7 +281,9 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     auto f_remap_places = std::async(std::launch::async, [&]() {
         auto& sorted_ids = used_place_ids;
         std::vector<PlaceNode> places;
+        std::vector<uint64_t> osm_ids;
         places.reserve(sorted_ids.size());
+        osm_ids.reserve(sorted_ids.size());
         std::unordered_map<uint32_t, uint32_t> remap;
         remap.reserve(sorted_ids.size());
         for (uint32_t old_id : sorted_ids) {
@@ -272,16 +291,17 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
             if (polygon && !point_in_polygon(pn.lat, pn.lng, *polygon)) continue;
             remap[old_id] = static_cast<uint32_t>(places.size());
             places.push_back(pn);
+            osm_ids.push_back(old_id < full.place_osm_ids.size() ? full.place_osm_ids[old_id] : 0);
         }
-        return std::make_tuple(std::move(remap), std::move(places));
+        return std::make_tuple(std::move(remap), std::move(places), std::move(osm_ids));
     });
 
-    { auto [wr, ways, nodes] = f_remap_ways.get();    way_remap    = std::move(wr); out.ways           = std::move(ways); out.street_nodes = std::move(nodes); }
-    { auto [ar, addrs, vts]  = f_remap_addrs.get();   addr_remap   = std::move(ar); out.addr_points    = std::move(addrs); out.addr_vertices = std::move(vts); }
-    { auto [ir, iways, inds] = f_remap_interps.get(); interp_remap = std::move(ir); out.interp_ways    = std::move(iways); out.interp_nodes = std::move(inds); }
-    { auto [ar, polys, vts]  = f_remap_admins.get();  admin_remap  = std::move(ar); out.admin_polygons = std::move(polys); out.admin_vertices = std::move(vts); }
-    { auto [pr, pois, vts]   = f_remap_pois.get();    poi_remap    = std::move(pr); out.poi_records    = std::move(pois); out.poi_vertices = std::move(vts); }
-    { auto [plr, places]     = f_remap_places.get();  place_remap  = std::move(plr); out.place_nodes   = std::move(places); }
+    { auto [wr, ways, nodes, oids] = f_remap_ways.get();    way_remap    = std::move(wr); out.ways           = std::move(ways);  out.street_nodes  = std::move(nodes); out.way_osm_ids     = std::move(oids); }
+    { auto [ar, addrs, vts, oids]  = f_remap_addrs.get();   addr_remap   = std::move(ar); out.addr_points    = std::move(addrs); out.addr_vertices = std::move(vts);   out.addr_osm_ids    = std::move(oids); }
+    { auto [ir, iways, inds, oids] = f_remap_interps.get(); interp_remap = std::move(ir); out.interp_ways    = std::move(iways); out.interp_nodes  = std::move(inds);  out.interp_osm_ids  = std::move(oids); }
+    { auto [ar, polys, vts, oids]  = f_remap_admins.get();  admin_remap  = std::move(ar); out.admin_polygons = std::move(polys); out.admin_vertices= std::move(vts);   out.admin_osm_ids   = std::move(oids); }
+    { auto [pr, pois, vts, oids]   = f_remap_pois.get();    poi_remap    = std::move(pr); out.poi_records    = std::move(pois);  out.poi_vertices  = std::move(vts);   out.poi_osm_ids     = std::move(oids); }
+    { auto [plr, places, oids]     = f_remap_places.get();  place_remap  = std::move(plr); out.place_nodes   = std::move(places);                                       out.place_osm_ids   = std::move(oids); }
     log_phase("      filter: data remap (masked)", _ft, _fc);
 
     // --- Project parent chains through admin_remap ---
