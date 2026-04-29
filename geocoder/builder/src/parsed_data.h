@@ -128,6 +128,14 @@ struct ParsedData {
     // parent_way_id, poi_records' parent_street_id, cell entries,
     // and so on. Build-time only; not written to user-facing files.
     std::vector<int64_t> way_osm_ids;
+    // Filled by apply_strategy2_remaps after the remap+reorder pass.
+    // Indexed by the post-remap dense way_id; tombstone entries (slots
+    // owned by a previous-build way that no longer exists in this
+    // build) have object_type=NONE + flags|=1. write_index emits these
+    // as the street_ways.osm_ids.bin sidecar. Empty when strategy 2
+    // wasn't applied (e.g. fresh build, no prev_dir) — in that case
+    // write_index falls back to deriving slots from way_osm_ids.
+    std::vector<uint8_t> way_sidecar_blob;  // raw bytes ready for fwrite (count*sizeof(SidecarSlot))
     std::vector<NodeCoord> street_nodes;
     std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_ways;
     std::vector<AddrPoint> addr_points;

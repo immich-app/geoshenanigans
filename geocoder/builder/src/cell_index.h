@@ -24,6 +24,17 @@ void write_cell_index(
 
 void write_index(const ParsedData& data, const std::string& output_dir, IndexMode mode);
 
+// Strategy-2 persistent dense IDs. Loads the previous build's
+// <prev_dir>/full/<file>.osm_ids.bin sidecars (if present), allocates
+// stable indices for each record by osm_id matching, reorders the
+// in-memory record arrays, applies remap to every reference site,
+// and stores the per-record sidecar slot vector on ParsedData so
+// write_index can emit the new sidecar.
+//
+// Idempotent on the same input + same prev_dir. No-op if prev_dir is
+// empty or its sidecars don't exist (first build / fresh start).
+void apply_strategy2_remaps(ParsedData& data, const std::string& prev_dir);
+
 // Write admin polygon/vertex files with on-the-fly simplification at a given epsilon scale.
 // Scale 0 = uncapped (no simplification). Other files are symlinked/copied from source_dir.
 void write_quality_variant(const ParsedData& data, const std::string& source_dir,

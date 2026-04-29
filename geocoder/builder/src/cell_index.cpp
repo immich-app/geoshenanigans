@@ -188,6 +188,98 @@ void write_cell_index(
       } }
 }
 
+// Strategy-2 persistent dense IDs for street_ways.
+//
+// Loads <prev_dir>/full/street_ways.osm_ids.bin (if it exists), allocates
+// a new idx for each current way preferring the previous build's slot,
+// reorders data.ways + parallel arrays, applies the resulting old→new
+// remap to every reference site (cell_to_ways, sorted_way_cells,
+// addr_points.parent_way_id, poi_records.parent_street_id), and stores
+// the new sidecar bytes on data.way_sidecar_blob for write_index to emit.
+//
+// On miss (no prev sidecar / first build), each way gets a fresh
+// sequential idx — equivalent to today's behavior, with a sidecar
+// emitted so the NEXT build can stabilize against this one.
+static void apply_strategy2_streets(ParsedData& data, const std::string& prev_dir) {
+    using namespace gc::id_alloc;
+    if (data.ways.empty()) return;
+    // Belt-and-braces: continent_filter.cpp builds subset ParsedData
+    // without yet preserving way_osm_ids (TODO). When that path is
+    // taken sizes won't match; skip strategy-2 cleanly so subset
+    // builds still produce correct output even if not yet stable.
+    if (data.way_osm_ids.size() != data.ways.size()) return;
+
+    IdAllocator alloc;
+    if (!prev_dir.empty()) {
+        // Streets live in /full/ for non-admin-only builds. Try the
+        // canonical path; missing-file is fine (first build).
+        alloc.load_previous(prev_dir + "/full/street_ways.osm_ids.bin");
+    }
+
+    const size_t n_old = data.ways.size();
+    std::vector<uint32_t> remap(n_old);
+    for (size_t i = 0; i < n_old; i++) {
+        remap[i] = alloc.allocate(ObjectType::OSM_WAY,
+                                   static_cast<uint64_t>(data.way_osm_ids[i]));
+    }
+
+    const uint32_t n_new = alloc.total_slots();
+
+    // Reorder data.ways into a tombstoned dense layout indexed by remap[i].
+    WayHeader tomb_way{};
+    tomb_way.node_offset = 0;
+    tomb_way.node_count  = 0;
+    tomb_way.name_id     = NO_DATA;
+    std::vector<WayHeader> new_ways(n_new, tomb_way);
+    std::vector<int64_t>   new_osm_ids(n_new, 0);
+    std::vector<uint32_t>  new_orig_names(n_new, NO_DATA);
+    std::vector<uint32_t>  new_parent_ids(data.way_parent_ids.empty() ? 0 : n_new, NO_DATA);
+    std::vector<uint32_t>  new_postcode_ids(data.way_postcode_ids.empty() ? 0 : n_new, NO_DATA);
+
+    for (size_t i = 0; i < n_old; i++) {
+        uint32_t k = remap[i];
+        new_ways[k] = data.ways[i];
+        new_osm_ids[k] = data.way_osm_ids[i];
+        if (i < data.way_orig_name_ids.size()) new_orig_names[k] = data.way_orig_name_ids[i];
+        if (i < data.way_parent_ids.size())    new_parent_ids[k]    = data.way_parent_ids[i];
+        if (i < data.way_postcode_ids.size())  new_postcode_ids[k]  = data.way_postcode_ids[i];
+    }
+    data.ways              = std::move(new_ways);
+    data.way_osm_ids       = std::move(new_osm_ids);
+    data.way_orig_name_ids = std::move(new_orig_names);
+    if (!new_parent_ids.empty())   data.way_parent_ids   = std::move(new_parent_ids);
+    if (!new_postcode_ids.empty()) data.way_postcode_ids = std::move(new_postcode_ids);
+
+    // Apply remap to every reference site that points into ways[].
+    auto map_ref = [&](uint32_t& v) {
+        if (v != NO_DATA && v < remap.size()) v = remap[v];
+    };
+    for (auto& [cell, ids] : data.cell_to_ways) for (auto& id : ids) map_ref(id);
+    for (auto& p : data.sorted_way_cells) map_ref(p.item_id);
+    for (auto& ap : data.addr_points)     map_ref(ap.parent_way_id);
+    for (auto& pr : data.poi_records)     map_ref(pr.parent_street_id);
+
+    // Build the sidecar blob (full slot table including tombstones).
+    auto slots = alloc.build_sidecar();
+    data.way_sidecar_blob.assign(
+        reinterpret_cast<const uint8_t*>(slots.data()),
+        reinterpret_cast<const uint8_t*>(slots.data() + slots.size()));
+
+    std::cerr << "  strategy2 streets: " << alloc.live_count() << " live, "
+              << alloc.tombstone_count() << " tombstones, "
+              << n_new << " total slots ("
+              << (alloc.live_count() == n_old ? "no shifts" : "remap applied")
+              << ")" << std::endl;
+}
+
+void apply_strategy2_remaps(ParsedData& data, const std::string& prev_dir) {
+    apply_strategy2_streets(data, prev_dir);
+    // TODO: same for admin_polygons, postcode_centroids, addr_points,
+    // place_nodes, poi_records, interp_ways. Each follows the same
+    // pattern: track stable identity at collection time, allocate
+    // against previous sidecar, reorder + remap references, emit sidecar.
+}
+
 void write_index(const ParsedData& data, const std::string& output_dir, IndexMode mode) {
     ensure_dir(output_dir);
     auto _wt = std::chrono::steady_clock::now();
@@ -327,11 +419,26 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             std::ofstream f(output_dir + "/street_ways.bin", std::ios::binary);
             f.write(reinterpret_cast<const char*>(data.ways.data()), data.ways.size() * sizeof(WayHeader));
         }));
-        // Strategy-2 sidecar: idx → osm_way_id mapping. The diff/patch
-        // tools read both the old and new sidecars to compute perfect
-        // id_remaps without identity-key collisions or fixup_way_offsets
-        // gymnastics. Cached only — never shipped to clients.
-        if (!data.way_osm_ids.empty()) {
+        // Strategy-2 sidecar: idx → osm_way_id mapping. After
+        // apply_strategy2_remaps runs, data.way_sidecar_blob holds the
+        // post-remap slot table (with tombstones). Fall back to deriving
+        // slots from way_osm_ids when strategy-2 wasn't applied (no
+        // prev_dir / first build). Cached only — never shipped to
+        // clients (workflow excludes *.osm_ids.bin from user upload).
+        if (!data.way_sidecar_blob.empty()) {
+            write_futures.push_back(std::async(std::launch::async, [&] {
+                using namespace gc::id_alloc;
+                size_t count = data.way_sidecar_blob.size() / sizeof(SidecarSlot);
+                std::ofstream f(output_dir + "/street_ways.osm_ids.bin", std::ios::binary);
+                uint32_t magic = SIDECAR_MAGIC, version = SIDECAR_VERSION;
+                uint32_t cnt = static_cast<uint32_t>(count);
+                f.write(reinterpret_cast<const char*>(&magic), 4);
+                f.write(reinterpret_cast<const char*>(&version), 4);
+                f.write(reinterpret_cast<const char*>(&cnt), 4);
+                f.write(reinterpret_cast<const char*>(data.way_sidecar_blob.data()),
+                        data.way_sidecar_blob.size());
+            }));
+        } else if (!data.way_osm_ids.empty()) {
             write_futures.push_back(std::async(std::launch::async, [&] {
                 using namespace gc::id_alloc;
                 std::vector<SidecarSlot> slots(data.way_osm_ids.size());

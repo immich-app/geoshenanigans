@@ -424,6 +424,11 @@ int main(int argc, char* argv[]) {
     std::string wikidata_sitelinks_path;
     std::string tiger_data_path;
     std::string external_postcodes_path;
+    // strategy-2: previous build's output root, used to read
+    // <prev_dir>/<region>/<variant>/*.osm_ids.bin sidecars and assign
+    // the same dense IDs to records carried over from the previous
+    // build. Empty means "fresh start, no stable IDs".
+    std::string prev_output_dir;
     bool multi_output = false;
     bool generate_continents = false;
     IndexMode mode = IndexMode::Full;
@@ -523,6 +528,8 @@ int main(int argc, char* argv[]) {
             tiger_data_path = argv[++i];
         } else if (arg == "--external-postcodes" && i + 1 < argc) {
             external_postcodes_path = argv[++i];
+        } else if (arg == "--prev-output" && i + 1 < argc) {
+            prev_output_dir = argv[++i];
         } else {
             input_files.push_back(arg);
         }
@@ -4923,9 +4930,26 @@ int main(int argc, char* argv[]) {
         for (auto& f : qfutures) f.get();
     };
 
-    // Write one region: modes + quality variants
-    auto write_region = [&](const ParsedData& d, const std::string& base_dir) {
+    // Write one region: modes + quality variants.
+    // Takes ParsedData& (non-const) because apply_strategy2_remaps
+    // reorders the in-memory record arrays and rewrites every
+    // reference site before the parallel write_index calls fan out.
+    // The 3 mode writes still see consistent (read-only) data
+    // because the remap completes synchronously before they launch.
+    auto write_region = [&](ParsedData& d, const std::string& base_dir) {
         ensure_dir(base_dir);
+
+        // Locate this region's previous build dir under prev_output_dir
+        // (mirrors the layout we write under output_dir). Empty path
+        // is the "no prev / fresh start" signal — apply_strategy2_remaps
+        // becomes a no-op and IDs remain in collection order.
+        std::string region_prev;
+        if (!prev_output_dir.empty()) {
+            std::string rel = base_dir;
+            if (rel.rfind(output_dir, 0) == 0) rel = rel.substr(output_dir.size());
+            region_prev = prev_output_dir + rel;
+        }
+        apply_strategy2_remaps(d, region_prev);
 
         if (multi_output) {
             // Write all 3 modes in parallel (they read shared data, write to separate dirs)
