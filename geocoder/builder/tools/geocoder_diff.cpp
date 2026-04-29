@@ -1078,6 +1078,51 @@ int main(int argc, char* argv[]) {
                                                       {"../full/", "../../full/"});
         street_from_fallback = (ow_fb || nw_fb);
         remap_field(old_w.data, old_w.size, way_stride, way_stride == 12 ? 8 : 5, str_remap);
+
+        // Fast path for poi-only invocations: when street_ways came via
+        // fallback we suppress STREET_WAYS / STREET_NODES emission anyway
+        // (they're in the sibling /full/ dir's patch, not ours), so the
+        // only thing we still need from t_street is the id_remap that
+        // t_poi uses to rewrite PoiRecord.parent_street_id. The full
+        // pipeline (load street_nodes.bin, fixup_way_offsets, merge_seq,
+        // secondary_match) costs ~10 GiB per planet invocation and ran
+        // the runner OOM when N parallel poi diffs piled up. Use the
+        // identity-key (name_id_after_remap, node_count) directly —
+        // same matching the secondary_match would have produced anyway,
+        // without the merge-seq detour or the street_nodes.bin mmap.
+        if (street_from_fallback) {
+            size_t way_name_off = (way_stride == 12) ? 8 : 5;
+            size_t old_n_w = old_w.size / way_stride;
+            size_t new_n_w = new_w.size / way_stride;
+            std::unordered_map<uint64_t, uint32_t> new_idx;
+            new_idx.reserve(new_n_w);
+            for (uint32_t i = 0; i < new_n_w; i++) {
+                uint32_t name_id; memcpy(&name_id, new_w.data + (size_t)i * way_stride + way_name_off, 4);
+                uint8_t nc = static_cast<uint8_t>(new_w.data[(size_t)i * way_stride + 4]);
+                uint64_t key = ((uint64_t)name_id << 8) | nc;
+                new_idx.emplace(key, i);
+            }
+            std::vector<uint32_t> id_rm(old_n_w, 0xFFFFFFFFu);
+            for (uint32_t i = 0; i < old_n_w; i++) {
+                uint32_t name_id; memcpy(&name_id, old_w.data + (size_t)i * way_stride + way_name_off, 4);
+                uint8_t nc = static_cast<uint8_t>(old_w.data[(size_t)i * way_stride + 4]);
+                uint64_t key = ((uint64_t)name_id << 8) | nc;
+                auto it = new_idx.find(key);
+                if (it != new_idx.end()) id_rm[i] = it->second;
+            }
+            res_ways = {PatchFileId::STREET_WAYS, "street_ways.bin", way_stride,
+                        0, 0, MergeSequence{}, {}, {}, std::move(id_rm)};
+            res_nodes = {PatchFileId::STREET_NODES, "street_nodes.bin", 8,
+                         0, 0, MergeSequence{}, {}};
+            log_merge(res_ways);
+            log_merge(res_nodes);
+            street_remap_ready.set_value();
+            unmap_file(old_w); unmap_file(new_w);
+            log_time("  group:streets (fallback)", gs);
+            std::cerr << "  RSS after streets: " << get_rss_mb() << " MiB" << std::endl;
+            return;
+        }
+
         auto [old_n, _on_fb] = try_load_with_fallback(old_dir, "street_nodes.bin",
                                                        {"../full/", "../../full/"});
         auto [new_n, _nn_fb] = try_load_with_fallback(new_dir, "street_nodes.bin",
@@ -1114,11 +1159,7 @@ int main(int argc, char* argv[]) {
         street_remap_ready.set_value();
         // Restore original node_offsets for child merge
         for (size_t i = 0; i < wn; i++) memcpy(old_w.data + i * way_stride, &old_offsets[i], 4);
-        // Skip the node merge when ways came from fallback — street_nodes.bin
-        // typically isn't shipped to the poi/<tier> subdir input, and even
-        // when it is the output gets cleared below. build_child_merge would
-        // dereference nullptr if either nodes file failed to load.
-        if (!street_from_fallback && old_n.data && new_n.data) {
+        if (old_n.data && new_n.data) {
             auto node_seq = build_child_merge(way_seq, old_w.data, old_w.size, new_w.data, new_w.size,
                                                old_n.data, old_n.size, new_n.data, new_n.size, way_stride, false);
             res_nodes = {PatchFileId::STREET_NODES, "street_nodes.bin", 8,
@@ -1128,10 +1169,9 @@ int main(int argc, char* argv[]) {
                          0, 0, MergeSequence{}, {}};
         }
         log_merge(res_nodes);
-        // Same suppression rule as t_admin: don't emit a real merge for
-        // STREET_WAYS / STREET_NODES when the source files came from the
-        // <region>/full/ fallback while the patch targets a poi/<tier>
-        // subdir. id_remap is preserved for the POI parent-id remap.
+        // Should not happen now that the fallback branch returns early,
+        // but kept as a safety net for any future code path that loads
+        // ways from a fallback dir without taking the fast path above.
         if (street_from_fallback) {
             res_ways.seq = MergeSequence{};
             res_ways.old_size = 0;
@@ -1269,25 +1309,26 @@ int main(int argc, char* argv[]) {
         // offset, not the post-fixup new offset. (build_merge_seq above
         // used the fixed-up offsets to find MATCH runs.)
         for (size_t i = 0; i < n; i++) memcpy(old_data.data + i * admin_stride, &old_offsets[i], 4);
-        auto av_seq = build_vertex_byte_merge(ap_seq,
-            old_data.data, old_data.size, new_data.data, new_data.size,
-            old_v.data, old_v.size, new_v.data, new_v.size, admin_stride, 0);
-        res_admin_v = {PatchFileId::ADMIN_VERTICES, "admin_vertices.bin", 1,
-                       old_v.size, new_v.size, std::move(av_seq), {}, {}, {}};
-        log_merge(res_admin_v);
-        // When admin_polygons.bin came from a sibling/parent quality dir
-        // (poi-only invocation), the patch must NOT contain a real merge
-        // for ADMIN_POLYGONS / ADMIN_VERTICES — applying it on the poi
-        // subdir would write the wrong files. The id_remap above is
-        // still preserved for use by t_poi and POI_PARENT_REMAP_MARKER.
+        // Skip the vertex byte-block merge entirely when admin came from
+        // fallback — its output goes straight into the suppression block
+        // below, so emitting it just wastes a few hundred MiB of memory
+        // (av_seq holds INSERT data for every changed block) and a few
+        // seconds of CPU per parallel poi diff.
         if (admin_from_fallback) {
             res_admin_p.seq = MergeSequence{};
             res_admin_p.old_size = 0;
             res_admin_p.new_size = 0;
             res_admin_p.fixups.clear();
-            res_admin_v.seq = MergeSequence{};
-            res_admin_v.old_size = 0;
-            res_admin_v.new_size = 0;
+            res_admin_v = {PatchFileId::ADMIN_VERTICES, "admin_vertices.bin", 1,
+                           0, 0, MergeSequence{}, {}, {}, {}};
+            log_merge(res_admin_v);
+        } else {
+            auto av_seq = build_vertex_byte_merge(ap_seq,
+                old_data.data, old_data.size, new_data.data, new_data.size,
+                old_v.data, old_v.size, new_v.data, new_v.size, admin_stride, 0);
+            res_admin_v = {PatchFileId::ADMIN_VERTICES, "admin_vertices.bin", 1,
+                           old_v.size, new_v.size, std::move(av_seq), {}, {}, {}};
+            log_merge(res_admin_v);
         }
         unmap_file(old_data); unmap_file(new_data); unmap_file(old_v); unmap_file(new_v);
         log_time("  group:admin", gs);
