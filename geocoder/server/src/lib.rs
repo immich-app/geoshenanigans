@@ -1133,18 +1133,31 @@ impl Index {
     /// hot paths that need an owned record copy (place/poi/postcode
     /// iteration) — Box::new pattern would force allocation; this
     /// returns a stack-resident value via FileBytes::read_at.
+    ///
+    /// Strategy-2 tombstones: when the previous build had a record
+    /// at idx K that no longer exists in this build, the slot is
+    /// emitted as a zeroed record with name_id = NO_DATA (or
+    /// equivalent sentinel). These accessors detect tombstones and
+    /// return None so callers iterating slot ranges naturally skip
+    /// them. Cell-driven access only sees live IDs (cell entries are
+    /// rebuilt against the live record set), so tombstones are only
+    /// reached via direct iteration paths.
     pub fn place_node(&self, idx: u32) -> Option<PlaceNode> {
         let m = self.place_nodes.as_ref()?;
         let total = m.len() / std::mem::size_of::<PlaceNode>() as u64;
         if (idx as u64) >= total { return None; }
-        Some(m.read_at::<PlaceNode>(idx as u64))
+        let pn = m.read_at::<PlaceNode>(idx as u64);
+        if pn.name_id == NO_DATA { return None; }
+        Some(pn)
     }
 
     pub fn poi_record(&self, idx: u32) -> Option<PoiRecord> {
         let m = self.poi_records.as_ref()?;
         let total = m.len() / std::mem::size_of::<PoiRecord>() as u64;
         if (idx as u64) >= total { return None; }
-        Some(m.read_at::<PoiRecord>(idx as u64))
+        let pr = m.read_at::<PoiRecord>(idx as u64);
+        if pr.name_id == NO_DATA && pr.vertex_offset == NO_DATA { return None; }
+        Some(pr)
     }
 
     pub fn postcode_centroid(&self, idx: u32) -> Option<PostcodeCentroid> {
@@ -1158,7 +1171,9 @@ impl Index {
         let m = &self.admin_polygons;
         let total = m.len() / std::mem::size_of::<AdminPolygon>() as u64;
         if (idx as u64) >= total { return None; }
-        Some(m.read_at::<AdminPolygon>(idx as u64))
+        let ap = m.read_at::<AdminPolygon>(idx as u64);
+        if ap.name_id == NO_DATA { return None; }
+        Some(ap)
     }
 
     /// Chunked-aware version of for_each_entry (reads from FileBytes
