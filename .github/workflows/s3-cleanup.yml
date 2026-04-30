@@ -1,0 +1,168 @@
+name: S3 Cleanup
+
+on:
+  schedule:
+    - cron: '0 4 * * *'  # 4am UTC daily (after 2am build)
+  workflow_dispatch:
+
+env:
+  S3_BUCKET: geoshenanigans-reverse-geocoding
+  S3_PREFIX: geocoder
+  S3_ENDPOINT: https://t3.storage.dev
+  INDEX_RETENTION_DAYS: 3
+  PBF_RETENTION_DAYS: 5
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    runs-on: pokedex-giant
+    timeout-minutes: 30
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq
+          curl -sL "https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-64bit.tar.gz" \
+            -o /tmp/s5cmd.tar.gz
+          sudo tar xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd
+
+      - name: Configure credentials
+        run: |
+          echo "::add-mask::$AWS_ACCESS_KEY_ID"
+          echo "::add-mask::$AWS_SECRET_ACCESS_KEY"
+          echo "CACHE_AWS_KEY=$AWS_ACCESS_KEY_ID" >> "$GITHUB_ENV"
+          echo "CACHE_AWS_SECRET=$AWS_SECRET_ACCESS_KEY" >> "$GITHUB_ENV"
+          echo "CACHE_ENDPOINT=http://${BUCKET_HOST}:${BUCKET_PORT}" >> "$GITHUB_ENV"
+          echo "CACHE_BUCKET=$BUCKET_NAME" >> "$GITHUB_ENV"
+          echo "AWS_ACCESS_KEY_ID=$KEY" >> "$GITHUB_ENV"
+          echo "AWS_SECRET_ACCESS_KEY=$SECRET" >> "$GITHUB_ENV"
+        env:
+          KEY: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
+          SECRET: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
+
+      - name: Clean up old data
+        run: |
+          S5="s5cmd --endpoint-url $S3_ENDPOINT"
+          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15 --concurrency 16"
+          TODAY=$(date -u +%Y-%m-%d)
+          INDEX_CUTOFF=$(date -u -d "$TODAY - $INDEX_RETENTION_DAYS days" +%Y-%m-%d)
+          PBF_CUTOFF=$(date -u -d "$TODAY - $PBF_RETENTION_DAYS days" +%Y-%m-%d)
+
+          echo "Today: $TODAY"
+          echo "Index cutoff: $INDEX_CUTOFF (keep >= this date)"
+          echo "PBF cutoff: $PBF_CUTOFF (keep >= this date)"
+          echo ""
+
+          # ── List all build dates on Tigris ──
+          echo "=== Builds on Tigris ==="
+          BUILD_DATES=$($S5 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/" 2>/dev/null \
+            | awk '/DIR/{print $NF}' | sed 's|/$||' | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' | sort)
+          echo "$BUILD_DATES"
+          echo ""
+
+          OLDEST_FULL=""
+          OLDEST_PATCHES=""
+
+          for DATE in $BUILD_DATES; do
+            if [ "$DATE" \< "$INDEX_CUTOFF" ]; then
+              # Old build — remove index files (.bin) but keep patches +
+              # configurations.json
+              echo "[Tigris] $DATE: removing index files (keeping patches)..."
+              # List and remove only .bin files
+              $S5 ls "s3://$S3_BUCKET/$S3_PREFIX/builds/$DATE/*.bin" 2>/dev/null \
+                | awk '{print $NF}' \
+                | while read -r FILE; do
+                    $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$DATE/$FILE" 2>/dev/null
+                  done
+              echo "[Tigris] $DATE: indexes removed"
+
+              # Mark indexes as removed in this date's configurations.json
+              # so clients know patches are still available but the full
+              # download set has aged out.
+              CFG=$($S5 cat "s3://$S3_BUCKET/$S3_PREFIX/builds/$DATE/configurations.json" 2>/dev/null || echo "{}")
+              if [ "$CFG" != "{}" ]; then
+                echo "$CFG" | jq '.build = ((.build // {}) + {indexes_available: false})' \
+                  | $S5 pipe "s3://$S3_BUCKET/$S3_PREFIX/builds/$DATE/configurations.json"
+                echo "[Tigris] $DATE: configurations.json updated (build.indexes_available: false)"
+              fi
+
+              [ -z "$OLDEST_PATCHES" ] && OLDEST_PATCHES="$DATE"
+            else
+              # Recent build — keep everything
+              echo "[Tigris] $DATE: keeping (within retention)"
+              [ -z "$OLDEST_FULL" ] && OLDEST_FULL="$DATE"
+              [ -z "$OLDEST_PATCHES" ] && OLDEST_PATCHES="$DATE"
+            fi
+          done
+
+          echo ""
+          echo "Oldest with full indexes: ${OLDEST_FULL:-none}"
+          echo "Oldest with patches: ${OLDEST_PATCHES:-none}"
+
+          # ── Clean cache: remove old build indexes ──
+          echo ""
+          echo "=== Cache cleanup ==="
+          CACHE_DATES=$($CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/builds/" 2>/dev/null \
+            | awk '/DIR/{print $NF}' | sed 's|/$||' | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' | sort)
+
+          for DATE in $CACHE_DATES; do
+            if [ "$DATE" \< "$INDEX_CUTOFF" ]; then
+              echo "[Cache] $DATE: removing build cache..."
+              $CACHE rm "s3://$CACHE_BUCKET/geocoder-cache/builds/$DATE/*" 2>/dev/null || true
+              echo "[Cache] $DATE: removed"
+            else
+              echo "[Cache] $DATE: keeping"
+            fi
+          done
+
+          # ── Clean cache: remove old PBFs ──
+          echo ""
+          echo "=== PBF cleanup ==="
+          $CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/" 2>/dev/null | grep "planet-" | while read -r LINE; do
+            FILE=$(echo "$LINE" | awk '{print $NF}')
+            # Extract date from filename: planet-2026-04-05.osm.pbf
+            PBF_DATE=$(echo "$FILE" | grep -oP '\d{4}-\d{2}-\d{2}')
+            if [ -n "$PBF_DATE" ] && [ "$PBF_DATE" \< "$PBF_CUTOFF" ]; then
+              echo "[Cache] Removing old PBF: $FILE (date: $PBF_DATE)"
+              $CACHE rm "s3://$CACHE_BUCKET/geocoder-cache/$FILE" 2>/dev/null || true
+            else
+              echo "[Cache] Keeping PBF: $FILE"
+            fi
+          done
+
+          # ── Update latest.json with availability info ──
+          echo ""
+          echo "=== Updating latest.json ==="
+          LATEST=$(echo "$BUILD_DATES" | tail -1)
+          if [ -n "$LATEST" ]; then
+            # Read build_version and patch_version from latest configurations.json.
+            # Falls back to legacy manifest.json for any old builds still
+            # using that name during the transition.
+            LATEST_CFG=$($S5 cat "s3://$S3_BUCKET/$S3_PREFIX/builds/$LATEST/configurations.json" 2>/dev/null || echo "")
+            if [ -n "$LATEST_CFG" ] && [ "$LATEST_CFG" != "{}" ]; then
+              BUILD_VER=$(echo "$LATEST_CFG" | jq -r '.build.version // 2')
+              PATCH_VER=$(echo "$LATEST_CFG" | jq -r '.build.patch_version // 1')
+            else
+              LATEST_MANIFEST=$($S5 cat "s3://$S3_BUCKET/$S3_PREFIX/builds/$LATEST/manifest.json" 2>/dev/null || echo "{}")
+              BUILD_VER=$(echo "$LATEST_MANIFEST" | jq -r '.build_version // 2')
+              PATCH_VER=$(echo "$LATEST_MANIFEST" | jq -r '.patch_version // 1')
+            fi
+
+            jq -n \
+              --argjson build_version "$BUILD_VER" \
+              --argjson patch_version "$PATCH_VER" \
+              --arg latest "$LATEST" \
+              --arg oldest_indexes "${OLDEST_FULL:-$LATEST}" \
+              --arg oldest_patches "${OLDEST_PATCHES:-$LATEST}" \
+              --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              '{build_version: $build_version, patch_version: $patch_version, latest: $latest, oldest_indexes: $oldest_indexes, oldest_patches: $oldest_patches, updated_at: $updated_at}' \
+              | $S5 pipe "s3://$S3_BUCKET/$S3_PREFIX/builds/latest.json"
+
+            echo "latest.json updated:"
+            $S5 cat "s3://$S3_BUCKET/$S3_PREFIX/builds/latest.json" 2>/dev/null | jq .
+          fi
+
+          echo ""
+          echo "Cleanup complete."
