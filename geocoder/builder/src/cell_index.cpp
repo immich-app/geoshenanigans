@@ -218,12 +218,30 @@ static void apply_strategy2_streets(ParsedData& data, const std::string& prev_di
 
     const size_t n_old = data.ways.size();
     std::vector<uint32_t> remap(n_old);
+    bool identity = true;
     for (size_t i = 0; i < n_old; i++) {
         remap[i] = alloc.allocate(ObjectType::OSM_WAY,
                                    static_cast<uint64_t>(data.way_osm_ids[i]));
+        if (remap[i] != static_cast<uint32_t>(i)) identity = false;
     }
 
     const uint32_t n_new = alloc.total_slots();
+
+    // Fast path: no actual reorder needed (first build / fresh allocation
+    // / coincidentally-stable). Skip allocating shadow vectors entirely —
+    // saves ~3 GiB peak RSS on planet for the way arrays alone, which
+    // was running the self-hosted runner OOM during step 9.
+    if (identity && n_new == n_old) {
+        // Build sidecar blob from existing arrays directly.
+        auto slots = alloc.build_sidecar();
+        data.way_sidecar_blob.assign(
+            reinterpret_cast<const uint8_t*>(slots.data()),
+            reinterpret_cast<const uint8_t*>(slots.data() + slots.size()));
+        std::cerr << "  strategy2 streets: " << alloc.live_count() << " live, "
+                  << alloc.tombstone_count() << " tombstones, "
+                  << n_new << " total slots (no shifts)" << std::endl;
+        return;
+    }
 
     // Reorder data.ways into a tombstoned dense layout indexed by remap[i].
     WayHeader tomb_way{};
@@ -302,14 +320,27 @@ static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir
 
     const size_t n_old = data.admin_polygons.size();
     std::vector<uint32_t> remap(n_old);
+    bool identity = true;
     for (size_t i = 0; i < n_old; i++) {
         // stable_id == 0 means closed-way polygon: NONE-typed slot, no reuse.
         ObjectType t = data.admin_osm_ids[i] == 0
             ? ObjectType::SYNTHETIC : ObjectType::OSM_RELATION;
         remap[i] = alloc.allocate(t, data.admin_osm_ids[i]);
+        if (remap[i] != static_cast<uint32_t>(i)) identity = false;
     }
 
     const uint32_t n_new = alloc.total_slots();
+
+    if (identity && n_new == n_old) {
+        auto slots = alloc.build_sidecar();
+        data.admin_sidecar_blob.assign(
+            reinterpret_cast<const uint8_t*>(slots.data()),
+            reinterpret_cast<const uint8_t*>(slots.data() + slots.size()));
+        std::cerr << "  strategy2 admins: " << alloc.live_count() << " live, "
+                  << alloc.tombstone_count() << " tombstones, "
+                  << n_new << " total slots (no shifts)" << std::endl;
+        return;
+    }
 
     AdminPolygon tomb_poly{};
     std::memset(&tomb_poly, 0, sizeof(tomb_poly));
@@ -370,12 +401,25 @@ static void apply_strategy2_addrs(ParsedData& data, const std::string& prev_dir)
 
     const size_t n_old = data.addr_points.size();
     std::vector<uint32_t> remap(n_old);
+    bool identity = true;
     for (size_t i = 0; i < n_old; i++) {
         ObjectType t = static_cast<ObjectType>(data.addr_osm_ids[i] >> 56);
         uint64_t sid = data.addr_osm_ids[i] & 0x00FFFFFFFFFFFFFFull;
         remap[i] = alloc.allocate(t, sid);
+        if (remap[i] != static_cast<uint32_t>(i)) identity = false;
     }
     const uint32_t n_new = alloc.total_slots();
+
+    if (identity && n_new == n_old) {
+        auto slots = alloc.build_sidecar();
+        data.addr_sidecar_blob.assign(
+            reinterpret_cast<const uint8_t*>(slots.data()),
+            reinterpret_cast<const uint8_t*>(slots.data() + slots.size()));
+        std::cerr << "  strategy2 addrs: " << alloc.live_count() << " live, "
+                  << alloc.tombstone_count() << " tombstones, "
+                  << n_new << " total slots (no shifts)" << std::endl;
+        return;
+    }
 
     AddrPoint tomb_addr{};
     std::memset(&tomb_addr, 0, sizeof(tomb_addr));
@@ -430,12 +474,24 @@ static void apply_strategy2_places(ParsedData& data, const std::string& prev_dir
 
     const size_t n_old = data.place_nodes.size();
     std::vector<uint32_t> remap(n_old);
+    bool identity = true;
     for (size_t i = 0; i < n_old; i++) {
         ObjectType t = static_cast<ObjectType>(data.place_osm_ids[i] >> 56);
         uint64_t sid = data.place_osm_ids[i] & 0x00FFFFFFFFFFFFFFull;
         remap[i] = alloc.allocate(t, sid);
+        if (remap[i] != static_cast<uint32_t>(i)) identity = false;
     }
     const uint32_t n_new = alloc.total_slots();
+
+    if (identity && n_new == n_old) {
+        auto slots = alloc.build_sidecar();
+        data.place_sidecar_blob.assign(
+            reinterpret_cast<const uint8_t*>(slots.data()),
+            reinterpret_cast<const uint8_t*>(slots.data() + slots.size()));
+        std::cerr << "  strategy2 places: " << alloc.live_count() << " live, "
+                  << alloc.tombstone_count() << " tombstones (no shifts)" << std::endl;
+        return;
+    }
 
     PlaceNode tomb_pn{};
     std::memset(&tomb_pn, 0, sizeof(tomb_pn));
@@ -483,12 +539,24 @@ static void apply_strategy2_pois(ParsedData& data, const std::string& prev_dir) 
 
     const size_t n_old = data.poi_records.size();
     std::vector<uint32_t> remap(n_old);
+    bool identity = true;
     for (size_t i = 0; i < n_old; i++) {
         ObjectType t = static_cast<ObjectType>(data.poi_osm_ids[i] >> 56);
         uint64_t sid = data.poi_osm_ids[i] & 0x00FFFFFFFFFFFFFFull;
         remap[i] = alloc.allocate(t, sid);
+        if (remap[i] != static_cast<uint32_t>(i)) identity = false;
     }
     const uint32_t n_new = alloc.total_slots();
+
+    if (identity && n_new == n_old) {
+        auto slots = alloc.build_sidecar();
+        data.poi_sidecar_blob.assign(
+            reinterpret_cast<const uint8_t*>(slots.data()),
+            reinterpret_cast<const uint8_t*>(slots.data() + slots.size()));
+        std::cerr << "  strategy2 pois: " << alloc.live_count() << " live, "
+                  << alloc.tombstone_count() << " tombstones (no shifts)" << std::endl;
+        return;
+    }
 
     PoiRecord tomb_pr{};
     std::memset(&tomb_pr, 0, sizeof(tomb_pr));
@@ -537,12 +605,24 @@ static void apply_strategy2_interps(ParsedData& data, const std::string& prev_di
 
     const size_t n_old = data.interp_ways.size();
     std::vector<uint32_t> remap(n_old);
+    bool identity = true;
     for (size_t i = 0; i < n_old; i++) {
         ObjectType t = static_cast<ObjectType>(data.interp_osm_ids[i] >> 56);
         uint64_t sid = data.interp_osm_ids[i] & 0x00FFFFFFFFFFFFFFull;
         remap[i] = alloc.allocate(t, sid);
+        if (remap[i] != static_cast<uint32_t>(i)) identity = false;
     }
     const uint32_t n_new = alloc.total_slots();
+
+    if (identity && n_new == n_old) {
+        auto slots = alloc.build_sidecar();
+        data.interp_sidecar_blob.assign(
+            reinterpret_cast<const uint8_t*>(slots.data()),
+            reinterpret_cast<const uint8_t*>(slots.data() + slots.size()));
+        std::cerr << "  strategy2 interps: " << alloc.live_count() << " live, "
+                  << alloc.tombstone_count() << " tombstones (no shifts)" << std::endl;
+        return;
+    }
 
     InterpWay tomb_iw{};
     std::memset(&tomb_iw, 0, sizeof(tomb_iw));
@@ -1134,18 +1214,22 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
 
                 const size_t n_old = centroids.size();
                 std::vector<uint32_t> remap(n_old);
+                bool identity = true;
                 for (size_t i = 0; i < n_old; i++) {
                     const char* pc_str = get_str(centroids[i].postcode_id);
                     uint64_t id = fnv(pc_str, centroids[i].country_code);
                     remap[i] = alloc.allocate(ObjectType::POSTCODE, id);
+                    if (remap[i] != static_cast<uint32_t>(i)) identity = false;
                 }
                 const uint32_t n_new = alloc.total_slots();
 
-                PostcodeCentroid tomb_pc{};
-                tomb_pc.postcode_id = NO_DATA;
-                std::vector<PostcodeCentroid> reordered(n_new, tomb_pc);
-                for (size_t i = 0; i < n_old; i++) reordered[remap[i]] = centroids[i];
-                centroids = std::move(reordered);
+                if (!(identity && n_new == n_old)) {
+                    PostcodeCentroid tomb_pc{};
+                    tomb_pc.postcode_id = NO_DATA;
+                    std::vector<PostcodeCentroid> reordered(n_new, tomb_pc);
+                    for (size_t i = 0; i < n_old; i++) reordered[remap[i]] = centroids[i];
+                    centroids = std::move(reordered);
+                }
 
                 std::cerr << "  strategy2 postcodes: " << alloc.live_count()
                           << " live, " << alloc.tombstone_count()
