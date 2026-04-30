@@ -103,7 +103,7 @@ jobs:
           echo "Server:     $CURRENT_DATE (seq $CURRENT_SEQ, offset: -${DAYS_OFFSET}d)"
 
           # Check if previous build exists on Tigris with compatible build_version
-          EXPECTED_BUILD_VERSION=17
+          EXPECTED_BUILD_VERSION=16
           PREV_BUILD="s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV_DATE"
           if [ "$FORCE_FRESH" = "true" ]; then
             echo "has_previous=false" >> "$GITHUB_OUTPUT"

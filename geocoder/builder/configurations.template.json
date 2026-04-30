@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "build": {
-    "version": 17,
+    "version": 16,
     "patch_version": 1
   },
   "axes": {
