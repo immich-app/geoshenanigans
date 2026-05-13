@@ -482,13 +482,13 @@ jobs:
 
           echo "Building geocoder index for $TODAY..."
           START=$(date +%s)
-          # Background memory sampler: timestamp + MemAvailable + RSS
-          # of build-index every 30s. The runner has been losing
-          # communication mid-build; this lets us see whether peak RSS
-          # crosses MemTotal at the moment of disconnect (OOM-killer
-          # taking the runner agent vs unrelated network/process death).
-          # Output goes to build.log so it ships in the build-log
-          # artifact alongside the regular build output.
+          # Background memory sampler: writes timestamp + MemAvailable +
+          # build-index RSS every 30s directly to step stdout. Previous
+          # iteration wrote to a file and tailed at exit, which loses
+          # the data if the runner agent dies mid-step (the file is on
+          # the dead runner's disk). Streaming to stdout means GitHub's
+          # log uploader carries each sample to us in near real-time,
+          # so we can see RSS at the moment of disconnect.
           (
             while true; do
               ts=$(date '+%H:%M:%S')
@@ -497,20 +497,18 @@ jobs:
               echo "[memwatch $ts] $mem build_index_rss=$rss"
               sleep 30
             done
-          ) > "$WORKDIR/memwatch.log" 2>&1 &
+          ) &
           MEMWATCH_PID=$!
           # pipefail so build-index crashes propagate (without it, the
           # downstream tee/tail mask exit code and the workflow proceeds
           # to compress with no configurations.json — see 24968665275).
           set -o pipefail
+          # Don't `tail -30` here: we want full build-index output in the
+          # streamed step log so the last lines before a crash are visible.
           build-index "$WORKDIR/output/" "$WORKDIR/planet.osm.pbf" \
-            $BUILD_ARGS 2>&1 | tee "$WORKDIR/build.log" | tail -30
+            $BUILD_ARGS 2>&1 | tee "$WORKDIR/build.log"
           BUILD_RC=$?
           kill $MEMWATCH_PID 2>/dev/null || true
-          # Append the last 60 memwatch samples (~30 min) to the build
-          # log so they appear in the artifact and step output.
-          echo "=== memwatch tail ===" | tee -a "$WORKDIR/build.log"
-          tail -60 "$WORKDIR/memwatch.log" | tee -a "$WORKDIR/build.log"
           if [ "$BUILD_RC" != "0" ]; then exit "$BUILD_RC"; fi
           echo "Build completed in $(($(date +%s) - START))s"
           echo "Build log kept at $WORKDIR/build.log ($(wc -l < "$WORKDIR/build.log") lines)"

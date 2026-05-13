@@ -5501,7 +5501,12 @@ int main(int argc, char* argv[]) {
             return area(kContinents[a]) > area(kContinents[b]);
         });
 
-        unsigned max_concurrent = std::max(1u, std::min(4u,
+        // Cap at 2 so peak memory stays bounded: each concurrent
+        // continent holds its own filtered ParsedData (10–25 GiB for
+        // the larger ones) plus an in-flight IdAllocator while
+        // apply_strategy2 runs. With 4 concurrent the runner OOMs on
+        // planet builds; with 2 it stays under MemTotal.
+        unsigned max_concurrent = std::max(1u, std::min(2u,
             std::thread::hardware_concurrency() / 8));
         std::cerr << "Processing " << kContinentCount << " continents ("
                   << max_concurrent << " concurrent, largest first)..." << std::endl;
