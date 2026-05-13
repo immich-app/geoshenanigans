@@ -482,19 +482,24 @@ jobs:
 
           echo "Building geocoder index for $TODAY..."
           START=$(date +%s)
-          # Background memory sampler: writes timestamp + MemAvailable +
-          # build-index RSS every 30s directly to step stdout. Previous
-          # iteration wrote to a file and tailed at exit, which loses
-          # the data if the runner agent dies mid-step (the file is on
-          # the dead runner's disk). Streaming to stdout means GitHub's
-          # log uploader carries each sample to us in near real-time,
-          # so we can see RSS at the moment of disconnect.
+          # Background memory sampler: writes each 30 s sample to a
+          # local rolling file AND pushes that file to S3 after every
+          # write. Streaming to stdout doesn't survive a runner-agent
+          # crash mid-step (GitHub never finalises the partial step
+          # log), so we land the data in S3 where it's accessible even
+          # if the runner dies. After failure, fetch the latest sample
+          # from s3://$CACHE_BUCKET/geocoder-cache/memwatch/$RUN_ID.log
+          # to see RSS at the moment of disconnect.
+          MEMWATCH_KEY="s3://$CACHE_BUCKET/geocoder-cache/memwatch/${GITHUB_RUN_ID}.log"
+          : > "$WORKDIR/memwatch.log"
           (
             while true; do
               ts=$(date '+%H:%M:%S')
               mem=$(awk '/^MemTotal:|^MemAvailable:/{printf "%s=%dMi ", $1, $2/1024}' /proc/meminfo)
               rss=$(ps -C build-index -o rss= 2>/dev/null | awk '{s+=$1} END{printf "%dMi", s/1024}')
-              echo "[memwatch $ts] $mem build_index_rss=$rss"
+              echo "[memwatch $ts] $mem build_index_rss=$rss" \
+                | tee -a "$WORKDIR/memwatch.log"
+              $CACHE cp "$WORKDIR/memwatch.log" "$MEMWATCH_KEY" >/dev/null 2>&1 || true
               sleep 30
             done
           ) &
