@@ -660,8 +660,19 @@ int main(int argc, char* argv[]) {
                           << "GB virtual address space" << std::endl;
             }
 
+            // Explicitly release the mmap (~100 GiB RSS for planet) once
+            // way parsing has resolved everything it needs. Idempotent —
+            // safe to call before the destructor.
+            void release() {
+                if (data) {
+                    munmap(data, capacity * sizeof(PackedLocation));
+                    data = nullptr;
+                    capacity = 0;
+                }
+            }
+
             ~DenseIndex() {
-                munmap(data, capacity * sizeof(PackedLocation));
+                release();
             }
 
             // Lockless — each node ID maps to a unique array slot
@@ -2866,6 +2877,15 @@ int main(int argc, char* argv[]) {
                 }
             }
         }
+
+        // All way-node coordinate lookups happen during pass 3 (way
+        // parsing) and the relation member geometry resolution that
+        // immediately follows. Once those are done the dense node
+        // index — ~100 GiB resident on planet — is dead weight and
+        // starves later phases of memory. Release before strategy-2
+        // and continent filtering run.
+        index.release();
+        std::cerr << "Released dense node index." << std::endl;
 
         std::cerr << "Done reading:" << std::endl;
         std::cerr << "  " << data.ways.size() << " street ways" << std::endl;
