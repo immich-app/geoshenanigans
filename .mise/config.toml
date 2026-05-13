@@ -1,6 +1,6 @@
 [tools]
 opentofu = "1.11.6"
-rclone = "1.73.5"
+rclone = "1.74.1"
 terragrunt = "1.0.4"
 
 [tasks.tg]
