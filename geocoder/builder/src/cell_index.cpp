@@ -559,10 +559,9 @@ static void apply_strategy2_pois(ParsedData& data, const std::string& prev_dir) 
     for (auto& p : data.sorted_poi_cells) map_ref(p.item_id);
 
     alloc.finalize();
-    data.poi_sidecar_blob = alloc.take_slots();
-
     std::cerr << "  strategy2 pois: " << alloc.live_count() << " live, "
               << alloc.tombstone_count() << " tombstones" << std::endl;
+    data.poi_sidecar_blob = alloc.take_slots();
 }
 
 // Strategy-2 stable IDs for interp_ways.
