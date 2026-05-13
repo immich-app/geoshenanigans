@@ -446,6 +446,7 @@ jobs:
           PBF_SOURCE: ${{ steps.download.outputs.pbf_source }}
         run: |
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
+          S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 4"
 
           # Cache the up-to-date PBF in background (skip if today's was already cached)
           if [ "$PBF_SOURCE" != "today" ]; then
@@ -483,14 +484,16 @@ jobs:
           echo "Building geocoder index for $TODAY..."
           START=$(date +%s)
           # Background memory sampler: writes each 30 s sample to a
-          # local rolling file AND pushes that file to S3 after every
-          # write. Streaming to stdout doesn't survive a runner-agent
-          # crash mid-step (GitHub never finalises the partial step
-          # log), so we land the data in S3 where it's accessible even
-          # if the runner dies. After failure, fetch the latest sample
-          # from s3://$CACHE_BUCKET/geocoder-cache/memwatch/$RUN_ID.log
-          # to see RSS at the moment of disconnect.
-          MEMWATCH_KEY="s3://$CACHE_BUCKET/geocoder-cache/memwatch/${GITHUB_RUN_ID}.log"
+          # local rolling file AND pushes that file to the PUBLIC
+          # Tigris bucket after every write. Streaming to stdout
+          # doesn't survive a runner-agent crash mid-step (GitHub
+          # never finalises the partial step log) and the internal
+          # cache bucket isn't public-readable, so we land the data
+          # at $S3_PUBLIC_URL/geocoder/memwatch/$RUN_ID.log where
+          # `curl` works without auth. After a failure, fetch with:
+          #   curl $S3_PUBLIC_URL/geocoder/memwatch/$RUN_ID.log
+          # to see RSS right up to the disconnect.
+          MEMWATCH_KEY="s3://$S3_BUCKET/$S3_PREFIX/memwatch/${GITHUB_RUN_ID}.log"
           : > "$WORKDIR/memwatch.log"
           (
             while true; do
@@ -499,7 +502,7 @@ jobs:
               rss=$(ps -C build-index -o rss= 2>/dev/null | awk '{s+=$1} END{printf "%dMi", s/1024}')
               echo "[memwatch $ts] $mem build_index_rss=$rss" \
                 | tee -a "$WORKDIR/memwatch.log"
-              $CACHE cp "$WORKDIR/memwatch.log" "$MEMWATCH_KEY" >/dev/null 2>&1 || true
+              $S5 cp "$WORKDIR/memwatch.log" "$MEMWATCH_KEY" >/dev/null 2>&1 || true
               sleep 30
             done
           ) &
