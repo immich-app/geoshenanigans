@@ -23,8 +23,15 @@
 //   //   uint16_t reserved
 //   //   uint64_t stable_id     (osm_id, or hash of stable identity for postcodes)
 //
-// One sidecar per record file (street_ways.osm_ids,
-// admin_polygons.osm_ids, etc.). Cached only — never shipped.
+// Memory model: slots_ is the single source of truth — populated from
+// the previous sidecar at load_previous(), then mutated in-place by
+// allocate(). Reused slots get their existing payload (already correct);
+// recycled tombstones get rewritten; fresh allocations append. After
+// the allocate() loop, finalize() marks any unconsumed-prev slots as
+// tombstones and drops the prev_to_idx_ map + free-list immediately so
+// only the slot table itself remains. take_slots() then moves the table
+// out without copying — for 250M addr_points the savings are ~15 GiB
+// of peak RSS over the previous build_sidecar()+claimed_ design.
 
 #include <cstdint>
 #include <cstring>
@@ -70,7 +77,6 @@ inline uint64_t make_key(ObjectType t, uint64_t id) {
 
 class IdAllocator {
 public:
-    // No previous build — fresh allocation from idx 0.
     IdAllocator() = default;
 
     // Load (osm_id → previous_idx) from a previous build's sidecar.
@@ -84,20 +90,24 @@ public:
         f.read(reinterpret_cast<char*>(&version), 4);
         f.read(reinterpret_cast<char*>(&count), 4);
         if (!f || magic != SIDECAR_MAGIC || version != SIDECAR_VERSION) return false;
+        slots_.resize(count);
+        if (count > 0) {
+            f.read(reinterpret_cast<char*>(slots_.data()),
+                   static_cast<std::streamsize>(count) * sizeof(SidecarSlot));
+            if (!f) { slots_.clear(); return false; }
+        }
         prev_to_idx_.reserve(count);
         for (uint32_t i = 0; i < count; i++) {
-            SidecarSlot slot;
-            f.read(reinterpret_cast<char*>(&slot), sizeof(slot));
-            if (!f) return false;
-            bool is_tomb = (slot.flags & 0x01) != 0;
-            if (is_tomb || slot.object_type == static_cast<uint8_t>(ObjectType::NONE)) {
+            const SidecarSlot& s = slots_[i];
+            bool is_tomb = (s.flags & 0x01) != 0
+                || s.object_type == static_cast<uint8_t>(ObjectType::NONE);
+            if (is_tomb) {
                 free_list_.push_back(i);
             } else {
-                uint64_t key = make_key(static_cast<ObjectType>(slot.object_type), slot.stable_id);
-                prev_to_idx_.emplace(key, i);
+                prev_to_idx_.emplace(
+                    make_key(static_cast<ObjectType>(s.object_type), s.stable_id), i);
             }
         }
-        next_fresh_idx_ = count;
         return true;
     }
 
@@ -110,55 +120,62 @@ public:
         auto it = prev_to_idx_.find(key);
         if (it != prev_to_idx_.end()) {
             uint32_t idx = it->second;
-            claimed_.push_back({idx, type, stable_id});
             prev_to_idx_.erase(it);
+            // slot already has correct {type, stable_id} from the load
+            live_count_++;
             return idx;
         }
         if (!free_list_.empty()) {
             uint32_t idx = free_list_.back();
             free_list_.pop_back();
-            claimed_.push_back({idx, type, stable_id});
+            slots_[idx] = SidecarSlot{
+                static_cast<uint8_t>(type), 0, 0, stable_id};
+            live_count_++;
             return idx;
         }
-        uint32_t idx = next_fresh_idx_++;
-        claimed_.push_back({idx, type, stable_id});
+        uint32_t idx = static_cast<uint32_t>(slots_.size());
+        slots_.push_back(SidecarSlot{
+            static_cast<uint8_t>(type), 0, 0, stable_id});
+        live_count_++;
         return idx;
     }
 
-    // After all allocations, build the final sidecar.
-    // Tombstone slots are filled in for any idx claimed by no record
-    // in this build (i.e., the previous occupant was deleted and no
-    // new record claimed the slot via the free-list before allocation
-    // ran out of new records to assign).
-    std::vector<SidecarSlot> build_sidecar() const {
-        std::vector<SidecarSlot> slots(next_fresh_idx_);
-        for (auto& s : slots) {
-            s.object_type = static_cast<uint8_t>(ObjectType::NONE);
-            s.flags = 0x01;  // tombstone by default
-            s.reserved = 0;
-            s.stable_id = 0;
+    // Mark surviving prev_to_idx_ entries (= deleted records) as
+    // tombstones in slots_, then drop the lookup map and free-list to
+    // release the bulk of the working memory before slots_ moves out.
+    // For 250M addr_points the prev_to_idx_ unordered_map alone is
+    // ~8 GiB of resident memory; releasing it here is what keeps the
+    // peak inside the runner's RAM budget.
+    void finalize() {
+        for (auto& kv : prev_to_idx_) {
+            slots_[kv.second] = SidecarSlot{
+                static_cast<uint8_t>(ObjectType::NONE), 0x01, 0, 0};
         }
-        for (const auto& c : claimed_) {
-            if (c.idx < slots.size()) {
-                slots[c.idx].object_type = static_cast<uint8_t>(c.type);
-                slots[c.idx].flags = 0;
-                slots[c.idx].stable_id = c.stable_id;
-            }
-        }
-        return slots;
+        std::unordered_map<uint64_t, uint32_t>().swap(prev_to_idx_);
+        std::vector<uint32_t>().swap(free_list_);
     }
+
+    // Move-out the finalized slot table. After this returns the
+    // allocator is empty and must not be allocated against again.
+    std::vector<SidecarSlot> take_slots() {
+        std::vector<SidecarSlot> out;
+        out.swap(slots_);
+        return out;
+    }
+
+    const std::vector<SidecarSlot>& slots() const { return slots_; }
 
     // Total slots including tombstones — i.e., the size the record
     // file should be written at. All claimed indices are < this value.
-    uint32_t total_slots() const { return next_fresh_idx_; }
+    uint32_t total_slots() const { return static_cast<uint32_t>(slots_.size()); }
 
     // Number of records actually claimed this build (live records).
-    size_t live_count() const { return claimed_.size(); }
+    size_t live_count() const { return live_count_; }
 
     // Number of tombstone slots (deleted from previous build, not yet
     // recycled or recycled-to-tombstone at end-of-build).
     size_t tombstone_count() const {
-        return next_fresh_idx_ - claimed_.size();
+        return slots_.size() - live_count_;
     }
 
     static void write_sidecar(const std::string& path,
@@ -170,19 +187,14 @@ public:
         f.write(reinterpret_cast<const char*>(&version), 4);
         f.write(reinterpret_cast<const char*>(&count), 4);
         f.write(reinterpret_cast<const char*>(slots.data()),
-                slots.size() * sizeof(SidecarSlot));
+                static_cast<std::streamsize>(slots.size()) * sizeof(SidecarSlot));
     }
 
 private:
-    struct Claimed {
-        uint32_t idx;
-        ObjectType type;
-        uint64_t stable_id;
-    };
-    std::unordered_map<uint64_t, uint32_t> prev_to_idx_;  // unconsumed entries from previous sidecar
-    std::vector<uint32_t> free_list_;                     // tombstone slots to recycle
-    std::vector<Claimed> claimed_;                        // every allocate() call this build
-    uint32_t next_fresh_idx_ = 0;
+    std::vector<SidecarSlot> slots_;
+    std::unordered_map<uint64_t, uint32_t> prev_to_idx_;
+    std::vector<uint32_t> free_list_;
+    size_t live_count_ = 0;
 };
 
 } // namespace gc::id_alloc

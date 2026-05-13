@@ -232,14 +232,11 @@ static void apply_strategy2_streets(ParsedData& data, const std::string& prev_di
     // saves ~3 GiB peak RSS on planet for the way arrays alone, which
     // was running the self-hosted runner OOM during step 9.
     if (identity && n_new == n_old) {
-        // Build sidecar blob from existing arrays directly.
-        auto slots = alloc.build_sidecar();
-        data.way_sidecar_blob.assign(
-            reinterpret_cast<const uint8_t*>(slots.data()),
-            reinterpret_cast<const uint8_t*>(slots.data() + slots.size()));
+        alloc.finalize();
         std::cerr << "  strategy2 streets: " << alloc.live_count() << " live, "
                   << alloc.tombstone_count() << " tombstones, "
                   << n_new << " total slots (no shifts)" << std::endl;
+        data.way_sidecar_blob = alloc.take_slots();
         return;
     }
 
@@ -277,17 +274,13 @@ static void apply_strategy2_streets(ParsedData& data, const std::string& prev_di
     for (auto& ap : data.addr_points)     map_ref(ap.parent_way_id);
     for (auto& pr : data.poi_records)     map_ref(pr.parent_street_id);
 
-    // Build the sidecar blob (full slot table including tombstones).
-    auto slots = alloc.build_sidecar();
-    data.way_sidecar_blob.assign(
-        reinterpret_cast<const uint8_t*>(slots.data()),
-        reinterpret_cast<const uint8_t*>(slots.data() + slots.size()));
-
+    alloc.finalize();
     std::cerr << "  strategy2 streets: " << alloc.live_count() << " live, "
               << alloc.tombstone_count() << " tombstones, "
               << n_new << " total slots ("
               << (alloc.live_count() == n_old ? "no shifts" : "remap applied")
               << ")" << std::endl;
+    data.way_sidecar_blob = alloc.take_slots();
 }
 
 // Strategy-2 stable IDs for admin_polygons.
@@ -332,13 +325,11 @@ static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir
     const uint32_t n_new = alloc.total_slots();
 
     if (identity && n_new == n_old) {
-        auto slots = alloc.build_sidecar();
-        data.admin_sidecar_blob.assign(
-            reinterpret_cast<const uint8_t*>(slots.data()),
-            reinterpret_cast<const uint8_t*>(slots.data() + slots.size()));
+        alloc.finalize();
         std::cerr << "  strategy2 admins: " << alloc.live_count() << " live, "
                   << alloc.tombstone_count() << " tombstones, "
                   << n_new << " total slots (no shifts)" << std::endl;
+        data.admin_sidecar_blob = alloc.take_slots();
         return;
     }
 
@@ -371,14 +362,11 @@ static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir
     for (auto& pr : data.poi_records)     map_ref(pr.parent_poly_id);
     for (auto& pn : data.place_nodes)     map_ref(pn.parent_poly_id);
 
-    auto slots = alloc.build_sidecar();
-    data.admin_sidecar_blob.assign(
-        reinterpret_cast<const uint8_t*>(slots.data()),
-        reinterpret_cast<const uint8_t*>(slots.data() + slots.size()));
-
+    alloc.finalize();
     std::cerr << "  strategy2 admins: " << alloc.live_count() << " live, "
               << alloc.tombstone_count() << " tombstones, "
               << n_new << " total slots" << std::endl;
+    data.admin_sidecar_blob = alloc.take_slots();
 }
 
 // Strategy-2 stable IDs for addr_points.
@@ -411,13 +399,11 @@ static void apply_strategy2_addrs(ParsedData& data, const std::string& prev_dir)
     const uint32_t n_new = alloc.total_slots();
 
     if (identity && n_new == n_old) {
-        auto slots = alloc.build_sidecar();
-        data.addr_sidecar_blob.assign(
-            reinterpret_cast<const uint8_t*>(slots.data()),
-            reinterpret_cast<const uint8_t*>(slots.data() + slots.size()));
+        alloc.finalize();
         std::cerr << "  strategy2 addrs: " << alloc.live_count() << " live, "
                   << alloc.tombstone_count() << " tombstones, "
                   << n_new << " total slots (no shifts)" << std::endl;
+        data.addr_sidecar_blob = alloc.take_slots();
         return;
     }
 
@@ -445,14 +431,11 @@ static void apply_strategy2_addrs(ParsedData& data, const std::string& prev_dir)
     for (auto& [cell, ids] : data.cell_to_addrs) for (auto& id : ids) map_ref(id);
     for (auto& p : data.sorted_addr_cells) map_ref(p.item_id);
 
-    auto slots = alloc.build_sidecar();
-    data.addr_sidecar_blob.assign(
-        reinterpret_cast<const uint8_t*>(slots.data()),
-        reinterpret_cast<const uint8_t*>(slots.data() + slots.size()));
-
+    alloc.finalize();
     std::cerr << "  strategy2 addrs: " << alloc.live_count() << " live, "
               << alloc.tombstone_count() << " tombstones, "
               << n_new << " total slots" << std::endl;
+    data.addr_sidecar_blob = alloc.take_slots();
 }
 
 // Strategy-2 stable IDs for place_nodes.
@@ -484,12 +467,10 @@ static void apply_strategy2_places(ParsedData& data, const std::string& prev_dir
     const uint32_t n_new = alloc.total_slots();
 
     if (identity && n_new == n_old) {
-        auto slots = alloc.build_sidecar();
-        data.place_sidecar_blob.assign(
-            reinterpret_cast<const uint8_t*>(slots.data()),
-            reinterpret_cast<const uint8_t*>(slots.data() + slots.size()));
+        alloc.finalize();
         std::cerr << "  strategy2 places: " << alloc.live_count() << " live, "
                   << alloc.tombstone_count() << " tombstones (no shifts)" << std::endl;
+        data.place_sidecar_blob = alloc.take_slots();
         return;
     }
 
@@ -512,13 +493,10 @@ static void apply_strategy2_places(ParsedData& data, const std::string& prev_dir
     };
     for (auto& p : data.sorted_place_cells) map_ref(p.item_id);
 
-    auto slots = alloc.build_sidecar();
-    data.place_sidecar_blob.assign(
-        reinterpret_cast<const uint8_t*>(slots.data()),
-        reinterpret_cast<const uint8_t*>(slots.data() + slots.size()));
-
+    alloc.finalize();
     std::cerr << "  strategy2 places: " << alloc.live_count() << " live, "
               << alloc.tombstone_count() << " tombstones" << std::endl;
+    data.place_sidecar_blob = alloc.take_slots();
 }
 
 // Strategy-2 stable IDs for poi_records.
@@ -549,12 +527,10 @@ static void apply_strategy2_pois(ParsedData& data, const std::string& prev_dir) 
     const uint32_t n_new = alloc.total_slots();
 
     if (identity && n_new == n_old) {
-        auto slots = alloc.build_sidecar();
-        data.poi_sidecar_blob.assign(
-            reinterpret_cast<const uint8_t*>(slots.data()),
-            reinterpret_cast<const uint8_t*>(slots.data() + slots.size()));
+        alloc.finalize();
         std::cerr << "  strategy2 pois: " << alloc.live_count() << " live, "
                   << alloc.tombstone_count() << " tombstones (no shifts)" << std::endl;
+        data.poi_sidecar_blob = alloc.take_slots();
         return;
     }
 
@@ -582,10 +558,8 @@ static void apply_strategy2_pois(ParsedData& data, const std::string& prev_dir) 
     for (auto& [cell, ids] : data.cell_to_pois) for (auto& id : ids) map_ref(id);
     for (auto& p : data.sorted_poi_cells) map_ref(p.item_id);
 
-    auto slots = alloc.build_sidecar();
-    data.poi_sidecar_blob.assign(
-        reinterpret_cast<const uint8_t*>(slots.data()),
-        reinterpret_cast<const uint8_t*>(slots.data() + slots.size()));
+    alloc.finalize();
+    data.poi_sidecar_blob = alloc.take_slots();
 
     std::cerr << "  strategy2 pois: " << alloc.live_count() << " live, "
               << alloc.tombstone_count() << " tombstones" << std::endl;
@@ -615,12 +589,10 @@ static void apply_strategy2_interps(ParsedData& data, const std::string& prev_di
     const uint32_t n_new = alloc.total_slots();
 
     if (identity && n_new == n_old) {
-        auto slots = alloc.build_sidecar();
-        data.interp_sidecar_blob.assign(
-            reinterpret_cast<const uint8_t*>(slots.data()),
-            reinterpret_cast<const uint8_t*>(slots.data() + slots.size()));
+        alloc.finalize();
         std::cerr << "  strategy2 interps: " << alloc.live_count() << " live, "
                   << alloc.tombstone_count() << " tombstones (no shifts)" << std::endl;
+        data.interp_sidecar_blob = alloc.take_slots();
         return;
     }
 
@@ -644,31 +616,21 @@ static void apply_strategy2_interps(ParsedData& data, const std::string& prev_di
     for (auto& [cell, ids] : data.cell_to_interps) for (auto& id : ids) map_ref(id);
     for (auto& p : data.sorted_interp_cells) map_ref(p.item_id);
 
-    auto slots = alloc.build_sidecar();
-    data.interp_sidecar_blob.assign(
-        reinterpret_cast<const uint8_t*>(slots.data()),
-        reinterpret_cast<const uint8_t*>(slots.data() + slots.size()));
-
+    alloc.finalize();
     std::cerr << "  strategy2 interps: " << alloc.live_count() << " live, "
               << alloc.tombstone_count() << " tombstones" << std::endl;
+    data.interp_sidecar_blob = alloc.take_slots();
 }
 
 // Helper: emit a strategy-2 sidecar from a sidecar_blob (post-remap)
 // or from a parallel osm_ids vector (fallback when strategy-2 wasn't
 // applied). Wraps the count + magic header. No-op if both are empty.
 void emit_strategy2_sidecar(const std::string& path,
-                            const std::vector<uint8_t>& blob,
+                            const std::vector<gc::id_alloc::SidecarSlot>& blob,
                             const std::vector<uint64_t>& osm_ids_fallback) {
     using namespace gc::id_alloc;
     if (!blob.empty()) {
-        size_t count = blob.size() / sizeof(SidecarSlot);
-        std::ofstream f(path, std::ios::binary);
-        uint32_t magic = SIDECAR_MAGIC, version = SIDECAR_VERSION;
-        uint32_t cnt = static_cast<uint32_t>(count);
-        f.write(reinterpret_cast<const char*>(&magic), 4);
-        f.write(reinterpret_cast<const char*>(&version), 4);
-        f.write(reinterpret_cast<const char*>(&cnt), 4);
-        f.write(reinterpret_cast<const char*>(blob.data()), blob.size());
+        IdAllocator::write_sidecar(path, blob);
         return;
     }
     if (osm_ids_fallback.empty()) return;
@@ -1237,12 +1199,10 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
 
                 // Emit sidecar (cached, not user-facing — same exclusion
                 // patterns as the others).
-                auto slots = alloc.build_sidecar();
-                std::vector<uint8_t> blob(
-                    reinterpret_cast<const uint8_t*>(slots.data()),
-                    reinterpret_cast<const uint8_t*>(slots.data() + slots.size()));
-                emit_strategy2_sidecar(output_dir + "/postcode_centroids.osm_ids",
-                                        blob, std::vector<uint64_t>{});
+                alloc.finalize();
+                IdAllocator::write_sidecar(
+                    output_dir + "/postcode_centroids.osm_ids",
+                    alloc.slots());
             }
 
             // Write flat centroid array (post-strategy-2 layout — slots in

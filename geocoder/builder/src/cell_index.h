@@ -41,7 +41,7 @@ void apply_strategy2_remaps(ParsedData& data, const std::string& prev_dir);
 // first build (no prev sidecar) still emits a sidecar that subsequent
 // builds can stabilize against.
 void emit_strategy2_sidecar(const std::string& path,
-                            const std::vector<uint8_t>& blob,
+                            const std::vector<gc::id_alloc::SidecarSlot>& blob,
                             const std::vector<uint64_t>& osm_ids_fallback);
 
 // Write admin polygon/vertex files with on-the-fly simplification at a given epsilon scale.

@@ -19,6 +19,7 @@
 
 #include "types.h"
 #include "string_pool.h"
+#include "id_allocator.h"
 
 // --- Directory creation ---
 
@@ -135,7 +136,9 @@ struct ParsedData {
     // as the street_ways.osm_ids sidecar. Empty when strategy 2
     // wasn't applied (e.g. fresh build, no prev_dir) — in that case
     // write_index falls back to deriving slots from way_osm_ids.
-    std::vector<uint8_t> way_sidecar_blob;  // raw bytes ready for fwrite (count*sizeof(SidecarSlot))
+    // Filled by apply_strategy2_remaps; moved out of the IdAllocator's
+    // internal table with no copy. write_index emits this directly.
+    std::vector<gc::id_alloc::SidecarSlot> way_sidecar_blob;
     std::vector<NodeCoord> street_nodes;
     std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_ways;
     std::vector<AddrPoint> addr_points;
@@ -156,19 +159,12 @@ struct ParsedData {
     // ring_index) for relation-sourced polygons; 0 for closed-way
     // polygons (no relation). Strategy-2 IdAllocator uses this.
     std::vector<uint64_t> admin_osm_ids;
-    // Filled by apply_strategy2_remaps after the admin remap pass.
-    std::vector<uint8_t> admin_sidecar_blob;
-    // Strategy-2 sidecar blobs for the remaining record types.
-    // Identity is content-based for these (osm_node_id isn't currently
-    // threaded through every record creation site; content hash gives
-    // ~98% stability — same lat/lng/name/etc. → same idx — which is
-    // sufficient for cell-entry stability in patches). populated by
-    // apply_strategy2_remaps from the live record arrays at write time.
-    std::vector<uint8_t> addr_sidecar_blob;
-    std::vector<uint8_t> place_sidecar_blob;
-    std::vector<uint8_t> poi_sidecar_blob;
-    std::vector<uint8_t> interp_sidecar_blob;
-    std::vector<uint8_t> postcode_sidecar_blob;
+    std::vector<gc::id_alloc::SidecarSlot> admin_sidecar_blob;
+    std::vector<gc::id_alloc::SidecarSlot> addr_sidecar_blob;
+    std::vector<gc::id_alloc::SidecarSlot> place_sidecar_blob;
+    std::vector<gc::id_alloc::SidecarSlot> poi_sidecar_blob;
+    std::vector<gc::id_alloc::SidecarSlot> interp_sidecar_blob;
+    std::vector<gc::id_alloc::SidecarSlot> postcode_sidecar_blob;
     std::vector<NodeCoord> admin_vertices;
     std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_admin;
 
