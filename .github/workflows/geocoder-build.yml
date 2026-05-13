@@ -482,12 +482,36 @@ jobs:
 
           echo "Building geocoder index for $TODAY..."
           START=$(date +%s)
+          # Background memory sampler: timestamp + MemAvailable + RSS
+          # of build-index every 30s. The runner has been losing
+          # communication mid-build; this lets us see whether peak RSS
+          # crosses MemTotal at the moment of disconnect (OOM-killer
+          # taking the runner agent vs unrelated network/process death).
+          # Output goes to build.log so it ships in the build-log
+          # artifact alongside the regular build output.
+          (
+            while true; do
+              ts=$(date '+%H:%M:%S')
+              mem=$(awk '/^MemTotal:|^MemAvailable:/{printf "%s=%dMi ", $1, $2/1024}' /proc/meminfo)
+              rss=$(ps -C build-index -o rss= 2>/dev/null | awk '{s+=$1} END{printf "%dMi", s/1024}')
+              echo "[memwatch $ts] $mem build_index_rss=$rss"
+              sleep 30
+            done
+          ) > "$WORKDIR/memwatch.log" 2>&1 &
+          MEMWATCH_PID=$!
           # pipefail so build-index crashes propagate (without it, the
           # downstream tee/tail mask exit code and the workflow proceeds
           # to compress with no configurations.json — see 24968665275).
           set -o pipefail
           build-index "$WORKDIR/output/" "$WORKDIR/planet.osm.pbf" \
             $BUILD_ARGS 2>&1 | tee "$WORKDIR/build.log" | tail -30
+          BUILD_RC=$?
+          kill $MEMWATCH_PID 2>/dev/null || true
+          # Append the last 60 memwatch samples (~30 min) to the build
+          # log so they appear in the artifact and step output.
+          echo "=== memwatch tail ===" | tee -a "$WORKDIR/build.log"
+          tail -60 "$WORKDIR/memwatch.log" | tee -a "$WORKDIR/build.log"
+          if [ "$BUILD_RC" != "0" ]; then exit "$BUILD_RC"; fi
           echo "Build completed in $(($(date +%s) - START))s"
           echo "Build log kept at $WORKDIR/build.log ($(wc -l < "$WORKDIR/build.log") lines)"
           echo "$(find "$WORKDIR/output" -name "*.bin" | wc -l) bin files produced"
