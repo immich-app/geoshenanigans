@@ -1612,14 +1612,20 @@ int main(int argc, char* argv[]) {
 
     t_addr.join(); t_street.join(); t_interp.join(); t_admin.join(); t_poi.join(); t_place.join(); t_cells.join();
     log_time("All merge sequences + cell changes built", merge_start);
-    // Free string pools + remap (no longer needed after all merges complete)
+    // Free string pools (no longer needed after all merges complete).
+    // str_remap is kept alive for emit_sparse_delta below — it consumes
+    // the unordered_map directly to decide which addr_postcodes /
+    // way_postcodes / postcode_centroids positions actually shifted vs
+    // just got a string-tier remap. Freeing it here previously caused
+    // sparse_delta to see an empty map → no remap applied during diff,
+    // patch applied the full remap → verify mismatch
+    // (e.g. oceania/full addr_postcodes.bin first_diff=267889).
     for (int t = 0; t < 5; t++) {
         unmap_file(old_tier_maps[t]);
         unmap_file(new_tier_maps[t]);
     }
     { std::vector<char>().swap(old_concat); }
     { std::vector<char>().swap(new_concat); }
-    { std::unordered_map<uint32_t,uint32_t>().swap(str_remap); }
     std::cerr << "  RSS after merge phase: " << get_rss_mb() << " MiB" << std::endl;
 
     // Inline raw-emit fallback retained for any file whose byte-block
@@ -2392,6 +2398,10 @@ int main(int argc, char* argv[]) {
     emit_raw(PatchFileId::POSTAL_POLYGONS, "postal_polygons.bin");
     emit_raw(PatchFileId::POSTAL_VERTICES, "postal_vertices.bin");
     emit_raw(PatchFileId::ADDR_VERTICES, "addr_vertices.bin");
+
+    // Now safe to free str_remap — all consumers (sparse_delta above)
+    // have finished using it.
+    { std::unordered_map<uint32_t,uint32_t>().swap(str_remap); }
 
     // End marker
     uint32_t end_marker = 0xFFFFFFFF;
