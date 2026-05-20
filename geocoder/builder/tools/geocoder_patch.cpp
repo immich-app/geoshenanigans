@@ -467,6 +467,69 @@ int main(int argc, char* argv[]) {
             continue;
         }
         if (stride == 0xFE) { uint32_t nf = ru32(); (void)nf; uint64_t ds = ru64(); pos += ds; continue; }
+        if (stride == SPARSE_DELTA_STRIDE) {
+            // SPARSE_DELTA: position-keyed delta. Format already decoded
+            // old_size + new_size above; next fields are value_stride,
+            // remap_kind, n_changes, then the (pos, value) pairs.
+            uint32_t value_stride = ru32();
+            uint32_t remap_kind = ru32();
+            uint32_t n_changes = ru32();
+
+            // Load OLD bytes, apply the same remap the diff applied
+            // before computing the delta, then overwrite at each
+            // (pos, value) pair to produce NEW.
+            std::vector<char> buf((size_t)new_size, 0);
+            MappedFile old_mmap = mmap_file(cur_dir + "/" + std::string(fname));
+            size_t copy_n = std::min((size_t)old_size, (size_t)new_size);
+            if (old_mmap.data && copy_n > 0) {
+                memcpy(buf.data(), old_mmap.data, copy_n);
+            }
+            if (old_mmap.data) unmap_file(old_mmap);
+
+            constexpr uint32_t NO_DATA_VAL = 0xFFFFFFFFu;
+            if (remap_kind == 1 && !poi_admin_remap.empty() && value_stride == 4) {
+                size_t n_records = copy_n / 4;
+                for (size_t i = 0; i < n_records; i++) {
+                    uint32_t v; memcpy(&v, buf.data() + i * 4, 4);
+                    if (v == NO_DATA_VAL) continue;
+                    uint32_t nv = poi_remap_lookup(poi_admin_remap, v);
+                    if (nv != v) memcpy(buf.data() + i * 4, &nv, 4);
+                }
+            } else if (remap_kind == 2 && !str_remap_vec.empty() && value_stride == 4) {
+                size_t n_records = copy_n / 4;
+                for (size_t i = 0; i < n_records; i++) {
+                    uint32_t v; memcpy(&v, buf.data() + i * 4, 4);
+                    if (v == NO_DATA_VAL) continue;
+                    uint32_t nv = str_remap_lookup(v);
+                    if (nv != v) memcpy(buf.data() + i * 4, &nv, 4);
+                }
+            } else if (remap_kind == 3 && !str_remap_vec.empty() && value_stride == 16) {
+                size_t n_records = copy_n / 16;
+                for (size_t i = 0; i < n_records; i++) {
+                    uint32_t pid; memcpy(&pid, buf.data() + i * 16 + 8, 4);
+                    if (pid == NO_DATA_VAL) continue;
+                    uint32_t npid = str_remap_lookup(pid);
+                    if (npid != pid) memcpy(buf.data() + i * 16 + 8, &npid, 4);
+                }
+            }
+
+            for (uint32_t i = 0; i < n_changes; i++) {
+                uint32_t arr_pos = ru32();
+                size_t byte_off = (size_t)arr_pos * value_stride;
+                if (byte_off + value_stride <= (size_t)new_size) {
+                    memcpy(buf.data() + byte_off, P + pos, value_stride);
+                }
+                pos += value_stride;
+            }
+
+            FILE* fp = fopen((out_dir + "/" + std::string(fname)).c_str(), "wb");
+            if (new_size > 0) fwrite(buf.data(), 1, new_size, fp);
+            fclose(fp);
+
+            std::cerr << "  " << fname << ": sparse delta " << n_changes
+                      << " changes (" << new_size << " bytes)" << std::endl;
+            continue;
+        }
 
         size_t actual_stride = stride;
         if (file_id == (uint32_t)PatchFileId::STREET_WAYS) actual_stride = way_stride;

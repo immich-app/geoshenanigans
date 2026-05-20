@@ -1656,6 +1656,9 @@ int main(int argc, char* argv[]) {
     //   - addr_points.bin: byte 16 parent_way_id (uses street pairs)
     //   - poi_records.bin: bytes 24/28/32 (street/postcode/admin pairs)
     //   - place_nodes.bin: byte 16 parent_poly_id (uses admin pairs)
+    //   - way_parents/admin_parents (sparse delta, admin id remap)
+    //   - way_postcodes/addr_postcodes (sparse delta, string remap)
+    //   - postcode_centroids (sparse delta, string remap on postcode_id)
     // Previous ordering emitted this AFTER addr_points, so addr_points'
     // pw remap saw an empty poi_street_remap → every addr_point that
     // matched via the street-shifted secondary path kept its OLD
@@ -1670,7 +1673,19 @@ int main(int argc, char* argv[]) {
     bool has_poi = res_poi_r.old_size > 0 || res_poi_r.new_size > 0;
     bool has_place = res_place_n.old_size > 0 || res_place_n.new_size > 0;
     bool has_addr = res_addr.old_size > 0 || res_addr.new_size > 0;
-    if (has_poi || has_place || has_addr) {
+    // Sparse-delta files also need the remap pairs to reconstruct the
+    // old → new id mapping during replay.
+    auto sparse_file_present = [&](const char* fname) -> bool {
+        struct stat st;
+        return stat((new_dir + "/" + fname).c_str(), &st) == 0;
+    };
+    bool has_sparse_delta_files =
+        sparse_file_present("way_parents.bin")    ||
+        sparse_file_present("way_postcodes.bin")  ||
+        sparse_file_present("addr_postcodes.bin") ||
+        sparse_file_present("admin_parents.bin")  ||
+        sparse_file_present("postcode_centroids.bin");
+    if (has_poi || has_place || has_addr || has_sparse_delta_files) {
         uint32_t marker = POI_PARENT_REMAP_MARKER;
         wval(patch, &marker, 4);
         auto emit_pairs = [&](const std::vector<uint32_t>& rm) {
@@ -2205,11 +2220,173 @@ int main(int argc, char* argv[]) {
         }
         std::cerr << "  " << fname << ": full replace " << new_size << " bytes" << std::endl;
     };
-    emit_raw(PatchFileId::ADDR_POSTCODES, "addr_postcodes.bin");
-    emit_raw(PatchFileId::ADMIN_PARENTS, "admin_parents.bin");
-    emit_raw(PatchFileId::WAY_PARENTS, "way_parents.bin");
-    emit_raw(PatchFileId::WAY_POSTCODES, "way_postcodes.bin");
-    emit_raw(PatchFileId::POSTCODE_CENTROIDS, "postcode_centroids.bin");
+
+    // Sparse position-keyed delta for files where strategy-2 keeps the
+    // record index stable but the stored *value* needs a remap to align
+    // old & new (admin polygon ids shift via res_admin_p.id_remap;
+    // postcode string offsets shift via str_remap). For unchanged
+    // entries (vast majority day-over-day), the diff after remap matches
+    // byte-for-byte and contributes 0 to the patch. For changed entries,
+    // each emits 4 + value_stride bytes. Replaces full_replace which
+    // dumped the entire file every day (planet was 666 MiB way_parents,
+    // 208 MiB addr_postcodes, 208 MiB admin_parents, 63 MiB
+    // postcode_centroids, 4 MiB way_postcodes — about 1.1 GiB
+    // uncompressed cut from the patch).
+    //
+    // remap_kind:
+    //   0 = none                  (raw byte compare)
+    //   1 = admin polygon idx     (res_admin_p.id_remap, NO_DATA passthrough)
+    //   2 = string pool offset    (str_remap)
+    //   3 = postcode_centroid     (16B struct, str_remap on bytes 8-11 only)
+    auto emit_sparse_delta = [&](PatchFileId fid, const char* fname,
+                                  uint32_t value_stride, uint32_t remap_kind) {
+        std::string new_path = new_dir + "/" + std::string(fname);
+        std::string old_path = old_dir + "/" + std::string(fname);
+        struct stat nst;
+        if (stat(new_path.c_str(), &nst) != 0) return;
+        uint64_t new_size = (uint64_t)nst.st_size;
+        struct stat ost;
+        uint64_t old_size = (stat(old_path.c_str(), &ost) == 0) ? (uint64_t)ost.st_size : 0;
+        if (new_size > 0 && new_size % value_stride != 0) {
+            // Stride mismatch — fall back to full_replace to avoid corruption.
+            std::cerr << "  " << fname << ": stride mismatch (size " << new_size
+                      << " not divisible by " << value_stride << "), using full replace" << std::endl;
+            uint32_t fid_u = (uint32_t)fid;
+            uint32_t stride = 0;
+            uint32_t nfix = 0;
+            uint64_t ds = new_size;
+            wval(patch, &fid_u, 4);
+            wval(patch, &stride, 4);
+            wval(patch, &old_size, 8);
+            wval(patch, &new_size, 8);
+            wval(patch, &nfix, 4);
+            wval(patch, &ds, 8);
+            if (new_size > 0) {
+                auto new_m = mmap_file(new_path);
+                if (new_m.data) {
+                    patch.insert(patch.end(), new_m.data, new_m.data + new_size);
+                    unmap_file(new_m);
+                }
+            }
+            return;
+        }
+
+        auto old_m = (old_size > 0) ? mmap_file(old_path) : MappedFile{0, 0};
+        auto new_m = (new_size > 0) ? mmap_file(new_path) : MappedFile{0, 0};
+
+        size_t old_n = (old_m.data ? old_m.size : 0) / value_stride;
+        size_t new_n = (new_m.data ? new_m.size : 0) / value_stride;
+        constexpr uint32_t NO_DATA_VAL = 0xFFFFFFFFu;
+
+        std::vector<char> delta_buf;
+        delta_buf.reserve(std::min(new_n * (size_t)(4 + value_stride),
+                                    (size_t)64 * 1024));
+        uint32_t n_changes = 0;
+        auto emit_change = [&](uint32_t pos, const char* val_ptr) {
+            delta_buf.insert(delta_buf.end(),
+                             reinterpret_cast<const char*>(&pos),
+                             reinterpret_cast<const char*>(&pos) + 4);
+            delta_buf.insert(delta_buf.end(), val_ptr, val_ptr + value_stride);
+            n_changes++;
+        };
+
+        if (remap_kind == 3) {
+            // 16-byte postcode_centroid: str_remap on bytes 8-11 (postcode_id),
+            // raw compare on bytes 0-7 (lat/lng) and 12-15 (cc + pad).
+            for (size_t pos = 0; pos < new_n; pos++) {
+                const char* np = new_m.data + pos * 16;
+                if (pos >= old_n) { emit_change((uint32_t)pos, np); continue; }
+                const char* op = old_m.data + pos * 16;
+                bool d = (memcmp(op, np, 8) != 0) || (memcmp(op + 12, np + 12, 4) != 0);
+                if (!d) {
+                    uint32_t old_pid; memcpy(&old_pid, op + 8, 4);
+                    uint32_t new_pid; memcpy(&new_pid, np + 8, 4);
+                    if (old_pid != NO_DATA_VAL) {
+                        auto it = str_remap.find(old_pid);
+                        if (it != str_remap.end()) old_pid = it->second;
+                    }
+                    d = (old_pid != new_pid);
+                }
+                if (d) emit_change((uint32_t)pos, np);
+            }
+        } else {
+            // 4-byte uint32 array with optional remap on the value.
+            for (size_t pos = 0; pos < new_n; pos++) {
+                uint32_t new_val; memcpy(&new_val, new_m.data + pos * 4, 4);
+                bool d = false;
+                if (pos >= old_n) {
+                    d = true;
+                } else {
+                    uint32_t old_val; memcpy(&old_val, old_m.data + pos * 4, 4);
+                    uint32_t remapped = old_val;
+                    if (old_val != NO_DATA_VAL) {
+                        if (remap_kind == 1 && old_val < res_admin_p.id_remap.size()) {
+                            uint32_t r = res_admin_p.id_remap[old_val];
+                            if (r != NO_DATA_VAL) remapped = r;
+                        } else if (remap_kind == 2) {
+                            auto it = str_remap.find(old_val);
+                            if (it != str_remap.end()) remapped = it->second;
+                        }
+                    }
+                    d = (remapped != new_val);
+                }
+                if (d) emit_change((uint32_t)pos, reinterpret_cast<const char*>(&new_val));
+            }
+        }
+
+        uint32_t fid_u = (uint32_t)fid;
+        // If the sparse delta turns out larger than just shipping the
+        // file (which happens when day-over-day stability is poor —
+        // strategy-2 not fully bootstrapped or many positions shift),
+        // fall back to full_replace so the patch never grows.
+        size_t sparse_section_bytes = 4 /*stride*/ + 8 /*old_size*/ + 8 /*new_size*/
+                                       + 4 /*value_stride*/ + 4 /*remap_kind*/
+                                       + 4 /*n_changes*/ + delta_buf.size();
+        size_t full_section_bytes = 4 /*stride*/ + 8 + 8 + 4 /*nfix*/ + 8 /*ds*/ + (size_t)new_size;
+        if (sparse_section_bytes >= full_section_bytes) {
+            uint32_t stride = 0;
+            uint32_t nfix = 0;
+            uint64_t ds = new_size;
+            wval(patch, &fid_u, 4);
+            wval(patch, &stride, 4);
+            wval(patch, &old_size, 8);
+            wval(patch, &new_size, 8);
+            wval(patch, &nfix, 4);
+            wval(patch, &ds, 8);
+            if (new_size > 0 && new_m.data) {
+                patch.insert(patch.end(), new_m.data, new_m.data + new_size);
+            }
+            if (old_m.data) unmap_file(old_m);
+            if (new_m.data) unmap_file(new_m);
+            std::cerr << "  " << fname << ": full replace " << new_size
+                      << " bytes (sparse would be " << sparse_section_bytes
+                      << " for " << n_changes << "/" << new_n << ")" << std::endl;
+            return;
+        }
+
+        uint32_t stride = SPARSE_DELTA_STRIDE;
+        wval(patch, &fid_u, 4);
+        wval(patch, &stride, 4);
+        wval(patch, &old_size, 8);
+        wval(patch, &new_size, 8);
+        wval(patch, &value_stride, 4);
+        wval(patch, &remap_kind, 4);
+        wval(patch, &n_changes, 4);
+        patch.insert(patch.end(), delta_buf.begin(), delta_buf.end());
+
+        if (old_m.data) unmap_file(old_m);
+        if (new_m.data) unmap_file(new_m);
+
+        std::cerr << "  " << fname << ": sparse delta " << n_changes << "/"
+                  << new_n << " (" << sparse_section_bytes
+                  << " bytes vs " << new_size << " full)" << std::endl;
+    };
+
+    emit_sparse_delta(PatchFileId::ADDR_POSTCODES,       "addr_postcodes.bin",  4,  2);
+    emit_sparse_delta(PatchFileId::ADMIN_PARENTS,        "admin_parents.bin",   4,  1);
+    emit_sparse_delta(PatchFileId::WAY_PARENTS,          "way_parents.bin",     4,  1);
+    emit_sparse_delta(PatchFileId::WAY_POSTCODES,        "way_postcodes.bin",   4,  2);
+    emit_sparse_delta(PatchFileId::POSTCODE_CENTROIDS,   "postcode_centroids.bin", 16, 3);
     emit_raw(PatchFileId::POSTCODE_CENTROID_CELLS, "postcode_centroid_cells.bin");
     emit_raw(PatchFileId::POSTCODE_CENTROID_ENTRIES, "postcode_centroid_entries.bin");
     emit_raw(PatchFileId::POSTAL_POLYGONS, "postal_polygons.bin");

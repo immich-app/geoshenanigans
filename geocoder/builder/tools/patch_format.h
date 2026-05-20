@@ -407,6 +407,29 @@ static constexpr uint32_t CELL_FLAGS_MARKER = 0xFFFFFFF9;
 //   for each: file_id(4), n_pairs(4), [(old_id:u32, new_id:u32)] × n_pairs
 static constexpr uint32_t SECONDARY_REMAP_MARKER = 0xFFFFFFF6;
 
+// Sparse position-keyed delta. Stride sentinel that signals the section
+// payload is a list of (position, value) pairs for the positions where
+// new differs from old. Used for files where strategy-2 keeps the index
+// stable but values still need remap (e.g. way_parents holds admin
+// polygon ids that shift when closed-way polygons get fresh ids; the
+// diff applies an admin or string remap to the loaded old array before
+// computing the delta, and the patcher applies the same remap before
+// overwriting the changed positions). Daily delta drops from a full
+// replace (hundreds of MiB per file) to tens of KiB.
+//
+// Section format:
+//   file_id(u32),
+//   stride = SPARSE_DELTA_STRIDE (u32),
+//   old_size(u64), new_size(u64),
+//   value_stride(u32) — bytes per record (4 for uint32 arrays, 16 for postcode_centroid),
+//   remap_kind(u32)  — 0=none, 1=admin idx, 2=string offset, 3=postcode_centroid struct,
+//   n_changes(u32),
+//   [(pos:u32, value:value_stride bytes)] × n_changes.
+//
+// remap_kind 3 means a 16-byte postcode_centroid record: lat(4) lng(4)
+// postcode_id(4) cc(2) pad(2). Only the postcode_id field uses str_remap.
+constexpr uint32_t SPARSE_DELTA_STRIDE = 0xFC;
+
 // POI parent-id remap marker: 0xFFFFFFF3
 // Carries the full primary+secondary admin-polygon, street-way, and
 // postcode-centroid old→new ID remap that the diff side applied to old
