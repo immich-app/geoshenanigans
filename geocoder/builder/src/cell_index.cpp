@@ -265,6 +265,33 @@ static void apply_strategy2_streets(ParsedData& data, const std::string& prev_di
     if (!new_parent_ids.empty())   data.way_parent_ids   = std::move(new_parent_ids);
     if (!new_postcode_ids.empty()) data.way_postcode_ids = std::move(new_postcode_ids);
 
+    // Rebuild street_nodes in way order with sequential offsets. Before
+    // this pass, each new_ways[k].node_offset still points at the OLD
+    // parse-order position in data.street_nodes (we only reshuffled
+    // the WayHeader array, not the node array). The patch tool replays
+    // node merge ops sequentially — it cannot follow out-of-order
+    // node_offsets — so without this rebuild verify reads from the
+    // wrong byte positions and the patched street_nodes.bin diverges
+    // from the build's at byte 0 (cf. africa/full first_diff=1).
+    {
+        std::vector<NodeCoord> new_nodes;
+        new_nodes.reserve(data.street_nodes.size());
+        for (uint32_t k = 0; k < n_new; k++) {
+            WayHeader& w = data.ways[k];
+            if (w.node_count == 0) continue;
+            uint32_t old_off = w.node_offset;
+            if (static_cast<size_t>(old_off) + w.node_count > data.street_nodes.size()) {
+                w.node_offset = 0; w.node_count = 0;
+                continue;
+            }
+            w.node_offset = static_cast<uint32_t>(new_nodes.size());
+            new_nodes.insert(new_nodes.end(),
+                             data.street_nodes.begin() + old_off,
+                             data.street_nodes.begin() + old_off + w.node_count);
+        }
+        data.street_nodes = std::move(new_nodes);
+    }
+
     // Apply remap to every reference site that points into ways[].
     auto map_ref = [&](uint32_t& v) {
         if (v != NO_DATA && v < remap.size()) v = remap[v];
@@ -608,6 +635,32 @@ static void apply_strategy2_interps(ParsedData& data, const std::string& prev_di
     }
     data.interp_ways    = std::move(new_iw);
     data.interp_osm_ids = std::move(new_osm_ids);
+
+    // Rebuild interp_nodes in interp_way order with sequential offsets —
+    // same reason as the street_nodes rebuild above. The patch tool
+    // replays child node merges sequentially; if node_offsets are
+    // shuffled (which is what we get after reordering interp_ways
+    // without touching interp_nodes), the patch reads from the wrong
+    // bytes and verify diverges from the build's interp_nodes.bin at
+    // byte 0.
+    {
+        std::vector<NodeCoord> new_nodes;
+        new_nodes.reserve(data.interp_nodes.size());
+        for (uint32_t k = 0; k < n_new; k++) {
+            InterpWay& w = data.interp_ways[k];
+            if (w.node_count == 0) continue;
+            uint32_t old_off = w.node_offset;
+            if (static_cast<size_t>(old_off) + w.node_count > data.interp_nodes.size()) {
+                w.node_offset = 0; w.node_count = 0;
+                continue;
+            }
+            w.node_offset = static_cast<uint32_t>(new_nodes.size());
+            new_nodes.insert(new_nodes.end(),
+                             data.interp_nodes.begin() + old_off,
+                             data.interp_nodes.begin() + old_off + w.node_count);
+        }
+        data.interp_nodes = std::move(new_nodes);
+    }
 
     auto map_ref = [&](uint32_t& v) {
         if (v != NO_DATA && v < remap.size()) v = remap[v];
