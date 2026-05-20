@@ -54,6 +54,27 @@ static size_t detect_stride(const std::string& path, std::initializer_list<size_
     return *candidates.begin();
 }
 
+// Resolve a per-file path with fallback to sibling variant directories.
+// Used by admin_polygons.bin and admin_vertices.bin in admin-mode variants
+// (`<region>/admin/`) which don't carry the polygon files themselves —
+// they live alongside the quality variants at `<region>/quality/q2.5/`.
+// Without this, the patch tool sees a missing admin_polygons.bin in
+// cur_dir, the merge replay runs against an empty old, and the id_remap
+// it should have produced for the admin_entries rebuild comes out empty.
+// Mirrors geocoder-diff's try_load_with_fallback fallback list so the
+// diff and patch resolve the same on-disk file for the same variant.
+static std::string resolve_with_fallback(const std::string& cur_dir, const std::string& fname,
+                                          std::initializer_list<const char*> fallbacks) {
+    std::string primary = cur_dir + "/" + fname;
+    struct stat st;
+    if (stat(primary.c_str(), &st) == 0 && st.st_size > 0) return primary;
+    for (const char* fb : fallbacks) {
+        std::string p = cur_dir + "/" + fb + fname;
+        if (stat(p.c_str(), &st) == 0 && st.st_size > 0) return p;
+    }
+    return primary;
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 5 || std::string(argv[3]) != "-o") {
         std::cerr << "Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir>" << std::endl;
@@ -233,10 +254,15 @@ int main(int argc, char* argv[]) {
     madvise(const_cast<char*>(patch_map.data), pos, MADV_DONTNEED);
     log_phase("Strings", t_start);
 
-    // Detect strides
+    // Detect strides. admin_polygons.bin/admin_vertices.bin live in
+    // <region>/quality/q2.5/ for admin-mode variants; fall back to
+    // resolve correctly there.
     size_t way_stride = detect_stride(cur_dir + "/street_ways.bin", {12, 9});
     size_t interp_stride = detect_stride(cur_dir + "/interp_ways.bin", {24, 20, 18});
-    size_t admin_stride = detect_stride(cur_dir + "/admin_polygons.bin", {24, 20, 19});
+    size_t admin_stride = detect_stride(
+        resolve_with_fallback(cur_dir, "admin_polygons.bin",
+                              {"../../quality/q2.5/", "../quality/q2.5/"}),
+        {24, 20, 19});
 
     // String remap lookup via sorted vector + binary search
     auto str_remap_lookup = [&](uint32_t old_off) -> uint32_t {
@@ -509,8 +535,20 @@ int main(int argc, char* argv[]) {
             else if (file_id == (uint32_t)PatchFileId::PLACE_NODES) remap_offs = {8};
         }
 
-        // mmap old file read-only (zero allocation)
-        MappedFile old_mmap = mmap_file(cur_dir + "/" + std::string(fname));
+        // mmap old file read-only (zero allocation). admin_polygons.bin
+        // and admin_vertices.bin live in `<region>/quality/q2.5/` for
+        // admin-mode variants; fall back so the merge replay's id_remap
+        // (consumed later by the admin_entries reconstruction) is built
+        // against the correct old polygon set instead of an empty file.
+        std::string old_path;
+        if (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS ||
+            file_id == (uint32_t)PatchFileId::ADMIN_VERTICES) {
+            old_path = resolve_with_fallback(cur_dir, std::string(fname),
+                                              {"../../quality/q2.5/", "../quality/q2.5/"});
+        } else {
+            old_path = cur_dir + "/" + std::string(fname);
+        }
+        MappedFile old_mmap = mmap_file(old_path);
         madvise(const_cast<char*>(old_mmap.data), old_mmap.size, MADV_SEQUENTIAL);
         size_t n_old_records = old_mmap.size / actual_stride;
 

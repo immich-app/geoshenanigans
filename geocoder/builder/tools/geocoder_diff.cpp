@@ -1651,27 +1651,22 @@ int main(int argc, char* argv[]) {
         }
     };
 
-    // Serialize merge results to patch in canonical order, freeing as we go.
-    serialize_merge(patch, res_addr);
-    serialize_merge(patch, res_ways);
-    serialize_merge(patch, res_nodes);
-    { std::vector<char>().swap(res_nodes.seq.data); }
-    serialize_merge(patch, res_interp_w);
-    serialize_merge(patch, res_interp_n);
-    { std::vector<char>().swap(res_interp_n.seq.data); }
-    serialize_merge(patch, res_admin_p);
-    serialize_merge(patch, res_admin_v);
-    { std::vector<char>().swap(res_admin_v.seq.data); }
-    // Parent-id remap section. Emitted whenever the patch contains any
-    // file that references foreign IDs that shift day-over-day:
-    //   - poi_records.bin: bytes 24/28/32 (street/postcode/admin)
-    //   - place_nodes.bin: byte 16 (admin)
-    //   - addr_points.bin: byte 16 (street)
-    // Without this, those files' merge sequences classify nearly every
-    // record as DELETE+INSERT (e.g. planet/full's addr_points was 4.89 GiB
-    // emitted as INSERT — the entire file). Quality/postal-only variants
-    // skip the marker entirely so they don't carry hundreds of MiB of
-    // remap pairs they'll never apply.
+    // Parent-id remap section. Emitted FIRST so it's loaded before any
+    // merge section that consumes it during MATCH replay:
+    //   - addr_points.bin: byte 16 parent_way_id (uses street pairs)
+    //   - poi_records.bin: bytes 24/28/32 (street/postcode/admin pairs)
+    //   - place_nodes.bin: byte 16 parent_poly_id (uses admin pairs)
+    // Previous ordering emitted this AFTER addr_points, so addr_points'
+    // pw remap saw an empty poi_street_remap → every addr_point that
+    // matched via the street-shifted secondary path kept its OLD
+    // parent_way_id in the verify output, producing byte mismatches
+    // like the oceania/south-america addr_points failures we saw.
+    // Without this section, files that reference foreign IDs that
+    // shift day-over-day classify nearly every record as DELETE+INSERT
+    // (e.g. planet/full's addr_points was 4.89 GiB emitted as INSERT —
+    // the entire file). Quality/postal-only variants skip the marker
+    // entirely so they don't carry hundreds of MiB of remap pairs they'll
+    // never apply.
     bool has_poi = res_poi_r.old_size > 0 || res_poi_r.new_size > 0;
     bool has_place = res_place_n.old_size > 0 || res_place_n.new_size > 0;
     bool has_addr = res_addr.old_size > 0 || res_addr.new_size > 0;
@@ -1699,6 +1694,18 @@ int main(int argc, char* argv[]) {
                   << " street_pairs=" << ns
                   << " postcode_pairs=" << np << std::endl;
     }
+
+    // Serialize merge results to patch in canonical order, freeing as we go.
+    serialize_merge(patch, res_addr);
+    serialize_merge(patch, res_ways);
+    serialize_merge(patch, res_nodes);
+    { std::vector<char>().swap(res_nodes.seq.data); }
+    serialize_merge(patch, res_interp_w);
+    serialize_merge(patch, res_interp_n);
+    { std::vector<char>().swap(res_interp_n.seq.data); }
+    serialize_merge(patch, res_admin_p);
+    serialize_merge(patch, res_admin_v);
+    { std::vector<char>().swap(res_admin_v.seq.data); }
     serialize_merge(patch, res_poi_r);
     serialize_merge(patch, res_poi_v);
     { std::vector<char>().swap(res_poi_v.seq.data); }
