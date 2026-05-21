@@ -1,0 +1,4689 @@
+{
+  "schema_version": 1,
+  "axes": {
+    "region": {
+      "label": "Region",
+      "description": "Geographic coverage area",
+      "order": 1,
+      "values": {
+        "planet": {
+          "label": "Planet (entire world)",
+          "order": 1
+        },
+        "europe": {
+          "label": "Europe",
+          "order": 2
+        },
+        "asia": {
+          "label": "Asia",
+          "order": 3
+        },
+        "north-america": {
+          "label": "North America",
+          "order": 4
+        },
+        "south-america": {
+          "label": "South America",
+          "order": 5
+        },
+        "africa": {
+          "label": "Africa",
+          "order": 6
+        },
+        "oceania": {
+          "label": "Oceania",
+          "order": 7
+        },
+        "central-america": {
+          "label": "Central America",
+          "order": 8
+        },
+        "antarctica": {
+          "label": "Antarctica",
+          "order": 9
+        }
+      }
+    },
+    "mode": {
+      "label": "Coverage detail",
+      "description": "How much road and address data to include alongside admin boundaries",
+      "order": 2,
+      "values": {
+        "full": {
+          "label": "Full",
+          "description": "Streets + addresses + interpolation + admin + postcodes. Largest, most complete.",
+          "order": 1
+        },
+        "no-addresses": {
+          "label": "No addresses",
+          "description": "Streets + interpolation + admin + postcodes. No house-number resolution.",
+          "order": 2
+        },
+        "admin": {
+          "label": "Admin only",
+          "description": "Admin boundaries + place nodes + postcodes. No streets or addresses.",
+          "order": 3
+        },
+        "admin-minimal": {
+          "label": "Admin minimal",
+          "description": "Admin boundaries + place nodes only \u2014 no postcodes, no postal polygons. Smallest possible deployable. Country/state/city + cities500-equivalent place names.",
+          "order": 4
+        }
+      }
+    },
+    "quality": {
+      "label": "Boundary precision",
+      "description": "Higher quality = sharper admin polygon edges but larger download. Default q2.5 is invisible at typical photo-GPS accuracy.",
+      "order": 3,
+      "values": {
+        "uncapped": {
+          "label": "Uncapped",
+          "precision_m": 0,
+          "description": "Full vertex precision (<1m).",
+          "order": 1
+        },
+        "q0.2": {
+          "label": "q0.2",
+          "precision_m": 3,
+          "description": "~3m boundary precision.",
+          "order": 2
+        },
+        "q0.5": {
+          "label": "q0.5",
+          "precision_m": 7,
+          "description": "~7m boundary precision.",
+          "order": 3
+        },
+        "q1": {
+          "label": "q1",
+          "precision_m": 15,
+          "description": "~15m boundary precision.",
+          "order": 4
+        },
+        "q1.5": {
+          "label": "q1.5",
+          "precision_m": 22,
+          "description": "~22m boundary precision.",
+          "order": 5
+        },
+        "q2": {
+          "label": "q2",
+          "precision_m": 30,
+          "description": "~30m boundary precision.",
+          "order": 6
+        },
+        "q2.5": {
+          "label": "q2.5",
+          "precision_m": 37,
+          "description": "~37m boundary precision.",
+          "order": 7
+        }
+      }
+    },
+    "poi_tier": {
+      "label": "Points of interest",
+      "description": "Landmarks, parks, museums, peaks, airports, etc.",
+      "order": 4,
+      "values": {
+        "none": {
+          "label": "None",
+          "description": "No POI data.",
+          "order": 1
+        },
+        "major": {
+          "label": "Major (~900K POIs)",
+          "description": "Airports, national parks, palaces, train stations, UNESCO sites, volcanoes.",
+          "order": 2
+        },
+        "notable": {
+          "label": "Notable (~3M POIs)",
+          "description": "+ museums, castles, stadiums, beaches, waterfalls, universities, viewpoints.",
+          "order": 3
+        },
+        "all": {
+          "label": "All (~5.9M POIs)",
+          "description": "Every named POI (places of worship, peaks, memorials, artwork, gardens).",
+          "order": 4
+        }
+      }
+    }
+  },
+  "constraints": [
+    {
+      "id": "admin-minimal-needs-q2.5",
+      "when": {
+        "mode": "admin-minimal"
+      },
+      "requires": {
+        "quality": "q2.5"
+      },
+      "message": "Admin minimal mode is only built at q2.5 \u2014 the whole point is the smallest possible deployable."
+    }
+  ],
+  "components": {
+    "mode.admin-minimal": {
+      "files": [
+        "{region}/admin-minimal/admin_cells.bin",
+        "{region}/admin-minimal/admin_entries.bin",
+        "{region}/admin-minimal/admin_polygons.bin",
+        "{region}/admin-minimal/admin_vertices.bin",
+        "{region}/admin-minimal/place_cells.bin",
+        "{region}/admin-minimal/place_entries.bin",
+        "{region}/admin-minimal/place_nodes.bin",
+        "{region}/full/strings_core.bin"
+      ],
+      "replaces": [
+        "{region}/quality/{quality}/admin_polygons.bin",
+        "{region}/quality/{quality}/admin_vertices.bin",
+        "{region}/quality/{quality}/postal_polygons.bin",
+        "{region}/quality/{quality}/postal_vertices.bin"
+      ]
+    },
+    "mode.admin": {
+      "files": [
+        "{region}/admin/admin_cells.bin",
+        "{region}/admin/admin_entries.bin",
+        "{region}/admin/place_cells.bin",
+        "{region}/admin/place_entries.bin",
+        "{region}/admin/place_nodes.bin",
+        "{region}/admin/postcode_centroids.bin",
+        "{region}/admin/postcode_centroid_cells.bin",
+        "{region}/admin/postcode_centroid_entries.bin",
+        "{region}/admin/strings_core.bin",
+        "{region}/admin/strings_postcode.bin"
+      ]
+    },
+    "mode.no-addresses": {
+      "files": [
+        "{region}/no-addresses/geo_cells.bin",
+        "{region}/no-addresses/street_entries.bin",
+        "{region}/no-addresses/street_ways.bin",
+        "{region}/no-addresses/street_nodes.bin",
+        "{region}/no-addresses/interp_entries.bin",
+        "{region}/no-addresses/interp_ways.bin",
+        "{region}/no-addresses/interp_nodes.bin",
+        "{region}/no-addresses/admin_cells.bin",
+        "{region}/no-addresses/admin_entries.bin",
+        "{region}/no-addresses/admin_parents.bin",
+        "{region}/no-addresses/place_cells.bin",
+        "{region}/no-addresses/place_entries.bin",
+        "{region}/no-addresses/place_nodes.bin",
+        "{region}/no-addresses/postcode_centroids.bin",
+        "{region}/no-addresses/postcode_centroid_cells.bin",
+        "{region}/no-addresses/postcode_centroid_entries.bin",
+        "{region}/no-addresses/way_parents.bin",
+        "{region}/no-addresses/way_postcodes.bin",
+        "{region}/no-addresses/strings_core.bin",
+        "{region}/no-addresses/strings_street.bin",
+        "{region}/no-addresses/strings_postcode.bin"
+      ]
+    },
+    "mode.full": {
+      "files": [
+        "{region}/full/geo_cells.bin",
+        "{region}/full/street_entries.bin",
+        "{region}/full/street_ways.bin",
+        "{region}/full/street_nodes.bin",
+        "{region}/full/addr_entries.bin",
+        "{region}/full/addr_points.bin",
+        "{region}/full/addr_vertices.bin",
+        "{region}/full/addr_postcodes.bin",
+        "{region}/full/interp_entries.bin",
+        "{region}/full/interp_ways.bin",
+        "{region}/full/interp_nodes.bin",
+        "{region}/full/admin_cells.bin",
+        "{region}/full/admin_entries.bin",
+        "{region}/full/admin_parents.bin",
+        "{region}/full/place_cells.bin",
+        "{region}/full/place_entries.bin",
+        "{region}/full/place_nodes.bin",
+        "{region}/full/postcode_centroids.bin",
+        "{region}/full/postcode_centroid_cells.bin",
+        "{region}/full/postcode_centroid_entries.bin",
+        "{region}/full/way_parents.bin",
+        "{region}/full/way_postcodes.bin",
+        "{region}/full/strings_core.bin",
+        "{region}/full/strings_street.bin",
+        "{region}/full/strings_addr.bin",
+        "{region}/full/strings_postcode.bin"
+      ]
+    },
+    "quality.uncapped": {
+      "files": [
+        "{region}/quality/uncapped/admin_polygons.bin",
+        "{region}/quality/uncapped/admin_vertices.bin",
+        "{region}/quality/uncapped/postal_polygons.bin",
+        "{region}/quality/uncapped/postal_vertices.bin"
+      ]
+    },
+    "quality.q0.2": {
+      "files": [
+        "{region}/quality/q0.2/admin_polygons.bin",
+        "{region}/quality/q0.2/admin_vertices.bin",
+        "{region}/quality/q0.2/postal_polygons.bin",
+        "{region}/quality/q0.2/postal_vertices.bin"
+      ]
+    },
+    "quality.q0.5": {
+      "files": [
+        "{region}/quality/q0.5/admin_polygons.bin",
+        "{region}/quality/q0.5/admin_vertices.bin",
+        "{region}/quality/q0.5/postal_polygons.bin",
+        "{region}/quality/q0.5/postal_vertices.bin"
+      ]
+    },
+    "quality.q1": {
+      "files": [
+        "{region}/quality/q1/admin_polygons.bin",
+        "{region}/quality/q1/admin_vertices.bin",
+        "{region}/quality/q1/postal_polygons.bin",
+        "{region}/quality/q1/postal_vertices.bin"
+      ]
+    },
+    "quality.q1.5": {
+      "files": [
+        "{region}/quality/q1.5/admin_polygons.bin",
+        "{region}/quality/q1.5/admin_vertices.bin",
+        "{region}/quality/q1.5/postal_polygons.bin",
+        "{region}/quality/q1.5/postal_vertices.bin"
+      ]
+    },
+    "quality.q2": {
+      "files": [
+        "{region}/quality/q2/admin_polygons.bin",
+        "{region}/quality/q2/admin_vertices.bin",
+        "{region}/quality/q2/postal_polygons.bin",
+        "{region}/quality/q2/postal_vertices.bin"
+      ]
+    },
+    "quality.q2.5": {
+      "files": [
+        "{region}/quality/q2.5/admin_polygons.bin",
+        "{region}/quality/q2.5/admin_vertices.bin",
+        "{region}/quality/q2.5/postal_polygons.bin",
+        "{region}/quality/q2.5/postal_vertices.bin"
+      ]
+    },
+    "poi_tier.none": {
+      "files": []
+    },
+    "poi_tier.major": {
+      "files": [
+        "{region}/poi/major/poi_records.bin",
+        "{region}/poi/major/poi_vertices.bin",
+        "{region}/poi/major/poi_cells.bin",
+        "{region}/poi/major/poi_entries.bin",
+        "{region}/poi/major/strings_poi.bin"
+      ]
+    },
+    "poi_tier.notable": {
+      "files": [
+        "{region}/poi/notable/poi_records.bin",
+        "{region}/poi/notable/poi_vertices.bin",
+        "{region}/poi/notable/poi_cells.bin",
+        "{region}/poi/notable/poi_entries.bin",
+        "{region}/poi/notable/strings_poi.bin"
+      ]
+    },
+    "poi_tier.all": {
+      "files": [
+        "{region}/poi/all/poi_records.bin",
+        "{region}/poi/all/poi_vertices.bin",
+        "{region}/poi/all/poi_cells.bin",
+        "{region}/poi/all/poi_entries.bin",
+        "{region}/poi/all/strings_poi.bin"
+      ]
+    }
+  },
+  "presets": [
+    {
+      "id": "smallest",
+      "label": "Smallest useful",
+      "description": "Admin boundaries + cities500-level place names, no POIs.",
+      "selections": {
+        "region": "planet",
+        "mode": "admin-minimal",
+        "quality": "q2.5",
+        "poi_tier": "none"
+      }
+    },
+    {
+      "id": "immich-recommended",
+      "label": "Immich recommended",
+      "description": "Admin + major POIs (airports, parks, palaces). Best balance for photo apps.",
+      "selections": {
+        "region": "planet",
+        "mode": "admin",
+        "quality": "q2.5",
+        "poi_tier": "major"
+      },
+      "default": true
+    },
+    {
+      "id": "with-addresses",
+      "label": "With street addresses",
+      "description": "Streets + addresses + interpolation. House-number resolution where tagged.",
+      "selections": {
+        "region": "planet",
+        "mode": "full",
+        "quality": "q2.5",
+        "poi_tier": "all"
+      }
+    },
+    {
+      "id": "max-quality",
+      "label": "Maximum quality",
+      "description": "Full mode at uncapped boundary precision. Largest configuration available.",
+      "selections": {
+        "region": "planet",
+        "mode": "full",
+        "quality": "uncapped",
+        "poi_tier": "all"
+      }
+    }
+  ],
+  "files": {
+    "africa/admin/admin_cells.bin": {
+      "size_zst": 1475099,
+      "size_raw": 5376792,
+      "sha256": "d8e41275dd8438853b01dc17d66abae134c5102fa75f462585850bc7ef06a6f5"
+    },
+    "africa/admin/admin_entries.bin": {
+      "size_zst": 749858,
+      "size_raw": 8867752,
+      "sha256": "f4a9e72c63eafbed6a511af42d6df54d2340b8fc5db8fed2c840f687807cf3dc"
+    },
+    "africa/admin/place_cells.bin": {
+      "size_zst": 280318,
+      "size_raw": 979824,
+      "sha256": "df527bc893b5ecb8de64c98dbd380b0b2035e07ac76b5df715810340e8ee74d5"
+    },
+    "africa/admin/place_entries.bin": {
+      "size_zst": 1187665,
+      "size_raw": 1754608,
+      "sha256": "be8a6d3ea1e16147b6560683e93ae6b436572b819b8e7ce8bffa130a26c19fc7"
+    },
+    "africa/admin/place_nodes.bin": {
+      "size_zst": 4447115,
+      "size_raw": 7956520,
+      "sha256": "039735be1cf4495f65183d064787810e7871a85da8e683d373b5da0b0dc6ba7a"
+    },
+    "africa/admin/postcode_centroid_cells.bin": {
+      "size_zst": 17085,
+      "size_raw": 42684,
+      "sha256": "179702fef019990ae296cf33a87ef0b673544fe14da1d9da4f708e9681cf7d04"
+    },
+    "africa/admin/postcode_centroid_entries.bin": {
+      "size_zst": 50941,
+      "size_raw": 86642,
+      "sha256": "5dfd56f0d69bf142c654aa1f0948aae3e3291951950c22e9d03e2a0e2df834e2"
+    },
+    "africa/admin/postcode_centroids.bin": {
+      "size_zst": 137946,
+      "size_raw": 318112,
+      "sha256": "a62b94d932aa14b1bdc933f158ae119f89808b81701a6d2e102a532a860eb608"
+    },
+    "africa/admin/strings_core.bin": {
+      "size_zst": 1308615,
+      "size_raw": 4215940,
+      "sha256": "949de61d16cb02f405702803c7e00fa0efdbaceb3ab5e28de52bdadf6c0c8c73"
+    },
+    "africa/admin/strings_postcode.bin": {
+      "size_zst": 5600791,
+      "size_raw": 35983663,
+      "sha256": "d85fcfca36358487f6eff5f52c229297ee86010356af63e73623bb1a6a209495"
+    },
+    "africa/full/addr_entries.bin": {
+      "size_zst": 6786167,
+      "size_raw": 13620764,
+      "sha256": "2bea9703931b06c2507636abb1c9dbb0f0ed265d89655caeda3ec0642e7368d0"
+    },
+    "africa/full/addr_points.bin": {
+      "size_zst": 22873141,
+      "size_raw": 88796764,
+      "sha256": "6f4578da86afc5a79b03fbc66325da762dfd302f63763906d71762d64b52d181"
+    },
+    "africa/full/addr_postcodes.bin": {
+      "size_zst": 1070854,
+      "size_raw": 12685252,
+      "sha256": "ec6b4a87025ae3a11ab77f743a1b4c7b7ddfd7284bfcdc74abe6aaf6ac4011f2"
+    },
+    "africa/full/addr_vertices.bin": {
+      "size_zst": 6020386,
+      "size_raw": 11448000,
+      "sha256": "054020057427182e8f10d2ff32f7f56bd95228246c420719a01b12b1a20dcdea"
+    },
+    "africa/full/admin_cells.bin": {
+      "size_zst": 1475099,
+      "size_raw": 5376792,
+      "sha256": "d8e41275dd8438853b01dc17d66abae134c5102fa75f462585850bc7ef06a6f5"
+    },
+    "africa/full/admin_entries.bin": {
+      "size_zst": 749858,
+      "size_raw": 8867752,
+      "sha256": "f4a9e72c63eafbed6a511af42d6df54d2340b8fc5db8fed2c840f687807cf3dc"
+    },
+    "africa/full/admin_parents.bin": {
+      "size_zst": 116960,
+      "size_raw": 297420,
+      "sha256": "4bbdf45b9d261151c326c4fe67db2f3e37ca9091f04d2e42e50acbe268a421c5"
+    },
+    "africa/full/geo_cells.bin": {
+      "size_zst": 24894525,
+      "size_raw": 166624500,
+      "sha256": "e37da74ecc6a4e156401776dec8f1190b2f50f66a4595d9aba155a3051706cc7"
+    },
+    "africa/full/interp_entries.bin": {
+      "size_zst": 623,
+      "size_raw": 2662,
+      "sha256": "02789043fe4d0d8b72663a9c29d365ab54efd2e36d3bdc6b3fcf64b430b350d5"
+    },
+    "africa/full/interp_nodes.bin": {
+      "size_zst": 2939,
+      "size_raw": 6024,
+      "sha256": "40d1e34b23d263a733f6b9ac9f76737a1b2e3b1131204ecdd80fb5c64919df9e"
+    },
+    "africa/full/interp_ways.bin": {
+      "size_zst": 965,
+      "size_raw": 3600,
+      "sha256": "ff9663df722d014ce58e9c94308f456b1bf04d0bdebb0b8d357074fc6218ec2b"
+    },
+    "africa/full/place_cells.bin": {
+      "size_zst": 280318,
+      "size_raw": 979824,
+      "sha256": "df527bc893b5ecb8de64c98dbd380b0b2035e07ac76b5df715810340e8ee74d5"
+    },
+    "africa/full/place_entries.bin": {
+      "size_zst": 1187665,
+      "size_raw": 1754608,
+      "sha256": "be8a6d3ea1e16147b6560683e93ae6b436572b819b8e7ce8bffa130a26c19fc7"
+    },
+    "africa/full/place_nodes.bin": {
+      "size_zst": 4447115,
+      "size_raw": 7956520,
+      "sha256": "039735be1cf4495f65183d064787810e7871a85da8e683d373b5da0b0dc6ba7a"
+    },
+    "africa/full/postcode_centroid_cells.bin": {
+      "size_zst": 17085,
+      "size_raw": 42684,
+      "sha256": "179702fef019990ae296cf33a87ef0b673544fe14da1d9da4f708e9681cf7d04"
+    },
+    "africa/full/postcode_centroid_entries.bin": {
+      "size_zst": 50941,
+      "size_raw": 86642,
+      "sha256": "5dfd56f0d69bf142c654aa1f0948aae3e3291951950c22e9d03e2a0e2df834e2"
+    },
+    "africa/full/postcode_centroids.bin": {
+      "size_zst": 137946,
+      "size_raw": 318112,
+      "sha256": "a62b94d932aa14b1bdc933f158ae119f89808b81701a6d2e102a532a860eb608"
+    },
+    "africa/full/street_entries.bin": {
+      "size_zst": 9023937,
+      "size_raw": 60118820,
+      "sha256": "dc67182abab1909dda8fe6f0203d1d455cdd0790d08c6ccd503ae8ca8314c0f4"
+    },
+    "africa/full/street_nodes.bin": {
+      "size_zst": 62583774,
+      "size_raw": 113232032,
+      "sha256": "5ab6b0d66601f5a56b1b249cf96e1f5dd8161517f5058e21b2c63c5f4f8d72b3"
+    },
+    "africa/full/street_ways.bin": {
+      "size_zst": 2896582,
+      "size_raw": 13402116,
+      "sha256": "4d5513f366866a3225974543b88c8eb989aa41ad715dccb75df6b95e0af5ff56"
+    },
+    "africa/full/strings_addr.bin": {
+      "size_zst": 159922,
+      "size_raw": 537632,
+      "sha256": "fb1ec97daad49fa6ac7b216cc9991d725574196a67fd45c248d131287f4f1b04"
+    },
+    "africa/full/strings_core.bin": {
+      "size_zst": 1308615,
+      "size_raw": 4215940,
+      "sha256": "949de61d16cb02f405702803c7e00fa0efdbaceb3ab5e28de52bdadf6c0c8c73"
+    },
+    "africa/full/strings_postcode.bin": {
+      "size_zst": 5600791,
+      "size_raw": 35983663,
+      "sha256": "d85fcfca36358487f6eff5f52c229297ee86010356af63e73623bb1a6a209495"
+    },
+    "africa/full/strings_street.bin": {
+      "size_zst": 1981400,
+      "size_raw": 9857330,
+      "sha256": "98f567d0ab7a369bbf640adbac3ee2e62b9d74738b5ca75a7a478197eda38796"
+    },
+    "africa/full/way_parents.bin": {
+      "size_zst": 1089622,
+      "size_raw": 4467372,
+      "sha256": "de37729e1de6a330f66ebb625274cb973ac223b4787a1d955bd4b8b232ac8fdf"
+    },
+    "africa/full/way_postcodes.bin": {
+      "size_zst": 54675,
+      "size_raw": 4467372,
+      "sha256": "d9c40215361506eddc7977440f157b163401937fab62a79ef3149424aad6774b"
+    },
+    "africa/no-addresses/admin_cells.bin": {
+      "size_zst": 1475099,
+      "size_raw": 5376792,
+      "sha256": "d8e41275dd8438853b01dc17d66abae134c5102fa75f462585850bc7ef06a6f5"
+    },
+    "africa/no-addresses/admin_entries.bin": {
+      "size_zst": 749858,
+      "size_raw": 8867752,
+      "sha256": "f4a9e72c63eafbed6a511af42d6df54d2340b8fc5db8fed2c840f687807cf3dc"
+    },
+    "africa/no-addresses/admin_parents.bin": {
+      "size_zst": 116960,
+      "size_raw": 297420,
+      "sha256": "4bbdf45b9d261151c326c4fe67db2f3e37ca9091f04d2e42e50acbe268a421c5"
+    },
+    "africa/no-addresses/geo_cells.bin": {
+      "size_zst": 22836028,
+      "size_raw": 163364920,
+      "sha256": "6a79a1006e9c98939037390fee1c9ba4d499cdcb5530c7ddba9d54a94c8bbd7b"
+    },
+    "africa/no-addresses/place_cells.bin": {
+      "size_zst": 280318,
+      "size_raw": 979824,
+      "sha256": "df527bc893b5ecb8de64c98dbd380b0b2035e07ac76b5df715810340e8ee74d5"
+    },
+    "africa/no-addresses/place_entries.bin": {
+      "size_zst": 1187665,
+      "size_raw": 1754608,
+      "sha256": "be8a6d3ea1e16147b6560683e93ae6b436572b819b8e7ce8bffa130a26c19fc7"
+    },
+    "africa/no-addresses/place_nodes.bin": {
+      "size_zst": 4447115,
+      "size_raw": 7956520,
+      "sha256": "039735be1cf4495f65183d064787810e7871a85da8e683d373b5da0b0dc6ba7a"
+    },
+    "africa/no-addresses/postcode_centroid_cells.bin": {
+      "size_zst": 17085,
+      "size_raw": 42684,
+      "sha256": "179702fef019990ae296cf33a87ef0b673544fe14da1d9da4f708e9681cf7d04"
+    },
+    "africa/no-addresses/postcode_centroid_entries.bin": {
+      "size_zst": 50941,
+      "size_raw": 86642,
+      "sha256": "5dfd56f0d69bf142c654aa1f0948aae3e3291951950c22e9d03e2a0e2df834e2"
+    },
+    "africa/no-addresses/postcode_centroids.bin": {
+      "size_zst": 137946,
+      "size_raw": 318112,
+      "sha256": "a62b94d932aa14b1bdc933f158ae119f89808b81701a6d2e102a532a860eb608"
+    },
+    "africa/no-addresses/street_entries.bin": {
+      "size_zst": 9023937,
+      "size_raw": 60118820,
+      "sha256": "dc67182abab1909dda8fe6f0203d1d455cdd0790d08c6ccd503ae8ca8314c0f4"
+    },
+    "africa/no-addresses/street_nodes.bin": {
+      "size_zst": 62583774,
+      "size_raw": 113232032,
+      "sha256": "5ab6b0d66601f5a56b1b249cf96e1f5dd8161517f5058e21b2c63c5f4f8d72b3"
+    },
+    "africa/no-addresses/street_ways.bin": {
+      "size_zst": 2896582,
+      "size_raw": 13402116,
+      "sha256": "4d5513f366866a3225974543b88c8eb989aa41ad715dccb75df6b95e0af5ff56"
+    },
+    "africa/no-addresses/strings_core.bin": {
+      "size_zst": 1308615,
+      "size_raw": 4215940,
+      "sha256": "949de61d16cb02f405702803c7e00fa0efdbaceb3ab5e28de52bdadf6c0c8c73"
+    },
+    "africa/no-addresses/strings_postcode.bin": {
+      "size_zst": 5600791,
+      "size_raw": 35983663,
+      "sha256": "d85fcfca36358487f6eff5f52c229297ee86010356af63e73623bb1a6a209495"
+    },
+    "africa/no-addresses/strings_street.bin": {
+      "size_zst": 1981400,
+      "size_raw": 9857330,
+      "sha256": "98f567d0ab7a369bbf640adbac3ee2e62b9d74738b5ca75a7a478197eda38796"
+    },
+    "africa/no-addresses/way_parents.bin": {
+      "size_zst": 1089622,
+      "size_raw": 4467372,
+      "sha256": "de37729e1de6a330f66ebb625274cb973ac223b4787a1d955bd4b8b232ac8fdf"
+    },
+    "africa/no-addresses/way_postcodes.bin": {
+      "size_zst": 54675,
+      "size_raw": 4467372,
+      "sha256": "d9c40215361506eddc7977440f157b163401937fab62a79ef3149424aad6774b"
+    },
+    "africa/poi/all/poi_cells.bin": {
+      "size_zst": 463226,
+      "size_raw": 1640772,
+      "sha256": "84652b699a66d983c6bb33c360ad0d00e2c134cb0ff74c1f15c14f4c15e5770d"
+    },
+    "africa/poi/all/poi_entries.bin": {
+      "size_zst": 2678919,
+      "size_raw": 4630590,
+      "sha256": "92c5cca7f65c87a59103340ae732f5f02bca9bdcd3029c283c94e7b99274fdac"
+    },
+    "africa/poi/all/poi_records.bin": {
+      "size_zst": 13855042,
+      "size_raw": 35358012,
+      "sha256": "f7657ea1152f69f1a592eff8e4c785e5276fab705de91880e6afb1c4b5a56c10"
+    },
+    "africa/poi/all/poi_vertices.bin": {
+      "size_zst": 13417698,
+      "size_raw": 16488482,
+      "sha256": "0bdc7bb1c03ec5300dc618794172a3244f7ae0fd5cc9b2a9babe76dd0561d27a"
+    },
+    "africa/poi/all/strings_poi.bin": {
+      "size_zst": 5021839,
+      "size_raw": 18940581,
+      "sha256": "9198ca7748ea4746c089c8c41d8430f5111f37be2beff6698194ce7f8e79ae2e"
+    },
+    "africa/poi/major/poi_cells.bin": {
+      "size_zst": 233183,
+      "size_raw": 844548,
+      "sha256": "51d9d3b3f0fa8d6f6382fd8e6b8693d9bb6aa7eb5614af1077257784ef774563"
+    },
+    "africa/poi/major/poi_entries.bin": {
+      "size_zst": 107136,
+      "size_raw": 579982,
+      "sha256": "d14c88ad9f4c25fe0e51e5a32e99ed315d1ee5fa14b137c682dbdb3f30110830"
+    },
+    "africa/poi/major/poi_records.bin": {
+      "size_zst": 409013,
+      "size_raw": 952668,
+      "sha256": "4785d0608e87790fdb4fd1418aebaa0e03946367b2df150df58d614ccd359c10"
+    },
+    "africa/poi/major/poi_vertices.bin": {
+      "size_zst": 3365855,
+      "size_raw": 3639928,
+      "sha256": "5cc3de92aade089f8b325c2c384055c184be32f9be0ea3bd9dbaa18825f5542c"
+    },
+    "africa/poi/major/strings_poi.bin": {
+      "size_zst": 5021839,
+      "size_raw": 18940581,
+      "sha256": "9198ca7748ea4746c089c8c41d8430f5111f37be2beff6698194ce7f8e79ae2e"
+    },
+    "africa/poi/notable/poi_cells.bin": {
+      "size_zst": 304533,
+      "size_raw": 1092576,
+      "sha256": "92b0ba4180bc6c55a2f89a6d86e5dcfd4b781e8c699f5fc2b01ae4dbab28c3cb"
+    },
+    "africa/poi/notable/poi_entries.bin": {
+      "size_zst": 454066,
+      "size_raw": 1149356,
+      "sha256": "7486c18f403eb64bf7fd7e97432ea63691f6510b96a3179761019ed7ad6a8082"
+    },
+    "africa/poi/notable/poi_records.bin": {
+      "size_zst": 2278308,
+      "size_raw": 5440032,
+      "sha256": "614bdbf060cfe7940b6d64c4eed719e0d3cd7b367bb63a0ff3170c2bddd6dc2f"
+    },
+    "africa/poi/notable/poi_vertices.bin": {
+      "size_zst": 5735173,
+      "size_raw": 6560318,
+      "sha256": "b30abcb5e9302a6b1fe66c8ef776a51c5b0d4d77da0da9c9209865f841a1bf30"
+    },
+    "africa/poi/notable/strings_poi.bin": {
+      "size_zst": 5021839,
+      "size_raw": 18940581,
+      "sha256": "9198ca7748ea4746c089c8c41d8430f5111f37be2beff6698194ce7f8e79ae2e"
+    },
+    "africa/quality/q0.2/admin_polygons.bin": {
+      "size_zst": 832944,
+      "size_raw": 1784520,
+      "sha256": "f52b6dc22ca58c28de796c18cdc018c2a24c86e6a8fe82f73669221270c2ab3e"
+    },
+    "africa/quality/q0.2/admin_vertices.bin": {
+      "size_zst": 60324766,
+      "size_raw": 66637790,
+      "sha256": "d85e99766f35ad44de2fdade37c3763af892729d6907a729cd7d3899ded8a278"
+    },
+    "africa/quality/q0.2/postal_polygons.bin": {
+      "size_zst": 2781,
+      "size_raw": 6144,
+      "sha256": "cf2d5ae9270e38c7963a48c59554ef95709ab8bd5987d0715c841ccfbe07ecd5"
+    },
+    "africa/quality/q0.2/postal_vertices.bin": {
+      "size_zst": 280785,
+      "size_raw": 298588,
+      "sha256": "d29a015428c7a8bb07441957cf06e4ca3692c358b0d38dd1ca42ef39f38f9474"
+    },
+    "africa/quality/q0.5/admin_polygons.bin": {
+      "size_zst": 821259,
+      "size_raw": 1784520,
+      "sha256": "aff9b9fa0877d5216305bfc64d32e2f9eabb6c5270d17c00f2e1404e02d04e45"
+    },
+    "africa/quality/q0.5/admin_vertices.bin": {
+      "size_zst": 41556248,
+      "size_raw": 45049342,
+      "sha256": "434d4840e24677bfe5a074597c6b97c1568bc507a9bd21bbf8868c59513f48dd"
+    },
+    "africa/quality/q0.5/postal_polygons.bin": {
+      "size_zst": 2680,
+      "size_raw": 6144,
+      "sha256": "937fcedd148afac08d07a6f1ac48e79f01a8e48dc2130b5f5333088cdb86d7b2"
+    },
+    "africa/quality/q0.5/postal_vertices.bin": {
+      "size_zst": 214275,
+      "size_raw": 227344,
+      "sha256": "c06f6d1bfe1a73d94fd6fd3d6806b847b2322376457fcdd4d05298cbdb717bb3"
+    },
+    "africa/quality/q1.5/admin_polygons.bin": {
+      "size_zst": 794075,
+      "size_raw": 1784520,
+      "sha256": "348920fc03dfd21ef083b84772b85a515825f2c6b4418708849e6f1313e669a4"
+    },
+    "africa/quality/q1.5/admin_vertices.bin": {
+      "size_zst": 23652553,
+      "size_raw": 25478770,
+      "sha256": "6af641b572be3c42df8eaf40dadc28c02ee852a639696f677e600dbf077caae3"
+    },
+    "africa/quality/q1.5/postal_polygons.bin": {
+      "size_zst": 2584,
+      "size_raw": 6144,
+      "sha256": "c66d24a222cf1a077a11a8bab172e544afcf47831503797702cd221cca05687a"
+    },
+    "africa/quality/q1.5/postal_vertices.bin": {
+      "size_zst": 116368,
+      "size_raw": 122796,
+      "sha256": "3c6c2581294dffd93f431581015d027cbf9e88727913456795e3ebd6b6444f2a"
+    },
+    "africa/quality/q1/admin_polygons.bin": {
+      "size_zst": 810356,
+      "size_raw": 1784520,
+      "sha256": "449353f75c5647d0f09ffaa0cfb9bea69b5cd7696cbd2fa62eaf7ede38ae2a62"
+    },
+    "africa/quality/q1/admin_vertices.bin": {
+      "size_zst": 29468038,
+      "size_raw": 31739490,
+      "sha256": "fd661b68361b044aa7a6b64c1d8ea51bf3c9e18ed92c638db0e5e7d542b72857"
+    },
+    "africa/quality/q1/postal_polygons.bin": {
+      "size_zst": 2631,
+      "size_raw": 6144,
+      "sha256": "18b4ac2b0c5aac7c91ad4b7574c853c7ac43b924fdcc3c4bf4fa6aa21edc0cb4"
+    },
+    "africa/quality/q1/postal_vertices.bin": {
+      "size_zst": 149983,
+      "size_raw": 158316,
+      "sha256": "eb29aa8d24b98ac3a6e1c571613482ffc807a9b8d656c85db4ac601646704f84"
+    },
+    "africa/quality/q2.5/admin_polygons.bin": {
+      "size_zst": 782576,
+      "size_raw": 1784520,
+      "sha256": "dd04e72ce5b3f81918cc8e4d971a362ad756ba9fb0453a90796e98807ee116c4"
+    },
+    "africa/quality/q2.5/admin_vertices.bin": {
+      "size_zst": 17670155,
+      "size_raw": 19119774,
+      "sha256": "56e49b63d7a749bfa74a98a77c5aa669df2d8500fee55ac045d4f3d6bb50be09"
+    },
+    "africa/quality/q2.5/postal_polygons.bin": {
+      "size_zst": 2503,
+      "size_raw": 6144,
+      "sha256": "5ad380dec0bf115d8e3a7a5a57483d5232c84d5ce34b25d779027413823a6a7d"
+    },
+    "africa/quality/q2.5/postal_vertices.bin": {
+      "size_zst": 80583,
+      "size_raw": 85116,
+      "sha256": "723b39e2f628ba7171f4b0c781599c1f8c7e1eb401825b0f4588a4b04cbe44e0"
+    },
+    "africa/quality/q2/admin_polygons.bin": {
+      "size_zst": 777630,
+      "size_raw": 1784520,
+      "sha256": "920e16f81bc78f2b5c0c902c2803672a73f1ab0f8dac5eb519331d881a94e7aa"
+    },
+    "africa/quality/q2/admin_vertices.bin": {
+      "size_zst": 20115501,
+      "size_raw": 21706162,
+      "sha256": "fa83d1c0c9a63660ea6c90b698dd3202efb12254440813c48a6a70ba40f64265"
+    },
+    "africa/quality/q2/postal_polygons.bin": {
+      "size_zst": 2549,
+      "size_raw": 6144,
+      "sha256": "3a52cc02a4415485c6bb44c00cfdcab95e6444147acc036d7fcb31be6e9bccef"
+    },
+    "africa/quality/q2/postal_vertices.bin": {
+      "size_zst": 95514,
+      "size_raw": 100776,
+      "sha256": "ef9269f20f65674dab48a3801aa38e480c81eafb5742d443791ba2269517e270"
+    },
+    "africa/quality/uncapped/admin_polygons.bin": {
+      "size_zst": 842090,
+      "size_raw": 1784520,
+      "sha256": "8978df7efb8cadfe2e7e103f0da3639dcc2bbf96712870bfb159eee3d464ebd1"
+    },
+    "africa/quality/uncapped/admin_vertices.bin": {
+      "size_zst": 112919119,
+      "size_raw": 137150174,
+      "sha256": "b4b6ffffbd4573271c274569735f2a110b8581e41b8481f836a163710e05f0f3"
+    },
+    "africa/quality/uncapped/postal_polygons.bin": {
+      "size_zst": 2837,
+      "size_raw": 6144,
+      "sha256": "2ec7c4dce93bb95b7edba40ad24dbbdfe695481730eb029aa59d67f768b75236"
+    },
+    "africa/quality/uncapped/postal_vertices.bin": {
+      "size_zst": 415959,
+      "size_raw": 456776,
+      "sha256": "39066326206d2ea7f7f2f2d073073645146a39b02657c37911bf0ea6b2729e94"
+    },
+    "antarctica/admin/admin_cells.bin": {
+      "size_zst": 5429,
+      "size_raw": 16560,
+      "sha256": "fdfc4f23f595bbafc452ed6b9b70c53a3d95369dfacc97a7ecad3703ac846959"
+    },
+    "antarctica/admin/admin_entries.bin": {
+      "size_zst": 6808,
+      "size_raw": 18936,
+      "sha256": "797a3cf1174cb7deb180e97f65d74fc08d6b52fd8512463baacc16e7853e1d7a"
+    },
+    "antarctica/admin/place_cells.bin": {
+      "size_zst": 208,
+      "size_raw": 432,
+      "sha256": "21bd96f7a1c880844180a8979b07e4494fe2591ac9f8473b8a9b7414b0508c12"
+    },
+    "antarctica/admin/place_entries.bin": {
+      "size_zst": 114,
+      "size_raw": 260,
+      "sha256": "ea1bd01a804f41a1335874238f351697b07bfed192c81b5afd3ae205478a5018"
+    },
+    "antarctica/admin/place_nodes.bin": {
+      "size_zst": 500,
+      "size_raw": 940,
+      "sha256": "c20f02518011ec13995a847b382a6df9cf0423449ba27c746a817740837d4604"
+    },
+    "antarctica/admin/postcode_centroid_cells.bin": {
+      "size_zst": 13,
+      "size_raw": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "antarctica/admin/postcode_centroid_entries.bin": {
+      "size_zst": 13,
+      "size_raw": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "antarctica/admin/postcode_centroids.bin": {
+      "size_zst": 13,
+      "size_raw": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "antarctica/admin/strings_core.bin": {
+      "size_zst": 557,
+      "size_raw": 994,
+      "sha256": "f6ba771cb5ef6f0230b3b16850db4cd698fb6d6f516778b422193149ef4bb111"
+    },
+    "antarctica/admin/strings_postcode.bin": {
+      "size_zst": 5609867,
+      "size_raw": 36074687,
+      "sha256": "040c0623894e239ff4496e34c88decdb8c8441e92facc46422c6792dd245afde"
+    },
+    "antarctica/full/addr_entries.bin": {
+      "size_zst": 88,
+      "size_raw": 202,
+      "sha256": "de8e9e7fd1835c7873190a18856b8ff30dfcbf960458c94f51f0ec3c02dd498e"
+    },
+    "antarctica/full/addr_points.bin": {
+      "size_zst": 434,
+      "size_raw": 1064,
+      "sha256": "1645ef8c6c48a139e6b46de82e51f88695e4abc324255df3322e6512442938dc"
+    },
+    "antarctica/full/addr_postcodes.bin": {
+      "size_zst": 21,
+      "size_raw": 152,
+      "sha256": "98a1a382b32ccf7bc6d87cda8c196485641b07ee46a1b1d3748788e197fe985b"
+    },
+    "antarctica/full/addr_vertices.bin": {
+      "size_zst": 1120,
+      "size_raw": 1664,
+      "sha256": "593cb9710cd586c4bf53940b3d7291e9edb35421fdc13bfdba4862a476dfa861"
+    },
+    "antarctica/full/admin_cells.bin": {
+      "size_zst": 5429,
+      "size_raw": 16560,
+      "sha256": "fdfc4f23f595bbafc452ed6b9b70c53a3d95369dfacc97a7ecad3703ac846959"
+    },
+    "antarctica/full/admin_entries.bin": {
+      "size_zst": 6808,
+      "size_raw": 18936,
+      "sha256": "797a3cf1174cb7deb180e97f65d74fc08d6b52fd8512463baacc16e7853e1d7a"
+    },
+    "antarctica/full/admin_parents.bin": {
+      "size_zst": 22,
+      "size_raw": 10280,
+      "sha256": "e83faadb690ed079b489a17f39de43bd62e7fefab1ecf6ae6f5648c7ff8e4c07"
+    },
+    "antarctica/full/geo_cells.bin": {
+      "size_zst": 270887,
+      "size_raw": 1890940,
+      "sha256": "fc898d2790aa542a378fc7de4b48330532385cfc2a279e6b8d510d110d1baa27"
+    },
+    "antarctica/full/interp_entries.bin": {
+      "size_zst": 13,
+      "size_raw": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "antarctica/full/interp_nodes.bin": {
+      "size_zst": 13,
+      "size_raw": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "antarctica/full/interp_ways.bin": {
+      "size_zst": 13,
+      "size_raw": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "antarctica/full/place_cells.bin": {
+      "size_zst": 208,
+      "size_raw": 432,
+      "sha256": "21bd96f7a1c880844180a8979b07e4494fe2591ac9f8473b8a9b7414b0508c12"
+    },
+    "antarctica/full/place_entries.bin": {
+      "size_zst": 114,
+      "size_raw": 260,
+      "sha256": "ea1bd01a804f41a1335874238f351697b07bfed192c81b5afd3ae205478a5018"
+    },
+    "antarctica/full/place_nodes.bin": {
+      "size_zst": 500,
+      "size_raw": 940,
+      "sha256": "c20f02518011ec13995a847b382a6df9cf0423449ba27c746a817740837d4604"
+    },
+    "antarctica/full/postcode_centroid_cells.bin": {
+      "size_zst": 13,
+      "size_raw": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "antarctica/full/postcode_centroid_entries.bin": {
+      "size_zst": 13,
+      "size_raw": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "antarctica/full/postcode_centroids.bin": {
+      "size_zst": 13,
+      "size_raw": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "antarctica/full/street_entries.bin": {
+      "size_zst": 1976,
+      "size_raw": 567658,
+      "sha256": "60566c2b3fe9091d6139885fb745aa5c267f9bf57432951c635ad69ba04b250c"
+    },
+    "antarctica/full/street_nodes.bin": {
+      "size_zst": 13797,
+      "size_raw": 22368,
+      "sha256": "02477c78735141586000ec3b7cbea89f0f80e554323051c2679428f28fe1f590"
+    },
+    "antarctica/full/street_ways.bin": {
+      "size_zst": 455,
+      "size_raw": 1656,
+      "sha256": "97ad0795fa67e55ad528fc8b88cf6c38744d07fe912168ae50f6076dc1c3544b"
+    },
+    "antarctica/full/strings_addr.bin": {
+      "size_zst": 81,
+      "size_raw": 124,
+      "sha256": "5d5c9beaf18453fb962845d9ff86c1fcc360b7d2270b50cef5b100cd4f7f6a25"
+    },
+    "antarctica/full/strings_core.bin": {
+      "size_zst": 557,
+      "size_raw": 994,
+      "sha256": "f6ba771cb5ef6f0230b3b16850db4cd698fb6d6f516778b422193149ef4bb111"
+    },
+    "antarctica/full/strings_postcode.bin": {
+      "size_zst": 5609867,
+      "size_raw": 36074687,
+      "sha256": "040c0623894e239ff4496e34c88decdb8c8441e92facc46422c6792dd245afde"
+    },
+    "antarctica/full/strings_street.bin": {
+      "size_zst": 592,
+      "size_raw": 1013,
+      "sha256": "04cca63067c7c96ecf4bf2b8c5872873931b54d43511a116253e7433f55eee10"
+    },
+    "antarctica/full/way_parents.bin": {
+      "size_zst": 22,
+      "size_raw": 552,
+      "sha256": "b25bad142c08f590f0a02a9fc1e5eed1738a3acce0e9a2fc0e57d15185c9598f"
+    },
+    "antarctica/full/way_postcodes.bin": {
+      "size_zst": 22,
+      "size_raw": 552,
+      "sha256": "b25bad142c08f590f0a02a9fc1e5eed1738a3acce0e9a2fc0e57d15185c9598f"
+    },
+    "antarctica/no-addresses/admin_cells.bin": {
+      "size_zst": 5429,
+      "size_raw": 16560,
+      "sha256": "fdfc4f23f595bbafc452ed6b9b70c53a3d95369dfacc97a7ecad3703ac846959"
+    },
+    "antarctica/no-addresses/admin_entries.bin": {
+      "size_zst": 6808,
+      "size_raw": 18936,
+      "sha256": "797a3cf1174cb7deb180e97f65d74fc08d6b52fd8512463baacc16e7853e1d7a"
+    },
+    "antarctica/no-addresses/admin_parents.bin": {
+      "size_zst": 22,
+      "size_raw": 10280,
+      "sha256": "e83faadb690ed079b489a17f39de43bd62e7fefab1ecf6ae6f5648c7ff8e4c07"
+    },
+    "antarctica/no-addresses/geo_cells.bin": {
+      "size_zst": 270586,
+      "size_raw": 1890540,
+      "sha256": "0e67b529da580acb3e282b5c6916e9018f8cc66bdbae74ba420f968060bf87ac"
+    },
+    "antarctica/no-addresses/place_cells.bin": {
+      "size_zst": 208,
+      "size_raw": 432,
+      "sha256": "21bd96f7a1c880844180a8979b07e4494fe2591ac9f8473b8a9b7414b0508c12"
+    },
+    "antarctica/no-addresses/place_entries.bin": {
+      "size_zst": 114,
+      "size_raw": 260,
+      "sha256": "ea1bd01a804f41a1335874238f351697b07bfed192c81b5afd3ae205478a5018"
+    },
+    "antarctica/no-addresses/place_nodes.bin": {
+      "size_zst": 500,
+      "size_raw": 940,
+      "sha256": "c20f02518011ec13995a847b382a6df9cf0423449ba27c746a817740837d4604"
+    },
+    "antarctica/no-addresses/postcode_centroid_cells.bin": {
+      "size_zst": 13,
+      "size_raw": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "antarctica/no-addresses/postcode_centroid_entries.bin": {
+      "size_zst": 13,
+      "size_raw": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "antarctica/no-addresses/postcode_centroids.bin": {
+      "size_zst": 13,
+      "size_raw": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "antarctica/no-addresses/street_entries.bin": {
+      "size_zst": 1976,
+      "size_raw": 567658,
+      "sha256": "60566c2b3fe9091d6139885fb745aa5c267f9bf57432951c635ad69ba04b250c"
+    },
+    "antarctica/no-addresses/street_nodes.bin": {
+      "size_zst": 13797,
+      "size_raw": 22368,
+      "sha256": "02477c78735141586000ec3b7cbea89f0f80e554323051c2679428f28fe1f590"
+    },
+    "antarctica/no-addresses/street_ways.bin": {
+      "size_zst": 455,
+      "size_raw": 1656,
+      "sha256": "97ad0795fa67e55ad528fc8b88cf6c38744d07fe912168ae50f6076dc1c3544b"
+    },
+    "antarctica/no-addresses/strings_core.bin": {
+      "size_zst": 557,
+      "size_raw": 994,
+      "sha256": "f6ba771cb5ef6f0230b3b16850db4cd698fb6d6f516778b422193149ef4bb111"
+    },
+    "antarctica/no-addresses/strings_postcode.bin": {
+      "size_zst": 5609867,
+      "size_raw": 36074687,
+      "sha256": "040c0623894e239ff4496e34c88decdb8c8441e92facc46422c6792dd245afde"
+    },
+    "antarctica/no-addresses/strings_street.bin": {
+      "size_zst": 592,
+      "size_raw": 1013,
+      "sha256": "04cca63067c7c96ecf4bf2b8c5872873931b54d43511a116253e7433f55eee10"
+    },
+    "antarctica/no-addresses/way_parents.bin": {
+      "size_zst": 22,
+      "size_raw": 552,
+      "sha256": "b25bad142c08f590f0a02a9fc1e5eed1738a3acce0e9a2fc0e57d15185c9598f"
+    },
+    "antarctica/no-addresses/way_postcodes.bin": {
+      "size_zst": 22,
+      "size_raw": 552,
+      "sha256": "b25bad142c08f590f0a02a9fc1e5eed1738a3acce0e9a2fc0e57d15185c9598f"
+    },
+    "antarctica/poi/all/poi_cells.bin": {
+      "size_zst": 73818,
+      "size_raw": 272256,
+      "sha256": "10b1047232a76ff3b5ee595749684f60e6f7239f3f78510d2d97d876bebc4f08"
+    },
+    "antarctica/poi/all/poi_entries.bin": {
+      "size_zst": 21211,
+      "size_raw": 159000,
+      "sha256": "50a5a9c8cec0831b944270ba1181fdacdf60cf1df809506f20d33eca6db7c99d"
+    },
+    "antarctica/poi/all/poi_records.bin": {
+      "size_zst": 72086,
+      "size_raw": 222552,
+      "sha256": "ce05449ba42e8bdfadbaa8f3a4361bb834ac73ed9bb5c45b329b131612bf25b6"
+    },
+    "antarctica/poi/all/poi_vertices.bin": {
+      "size_zst": 421383,
+      "size_raw": 456358,
+      "sha256": "1c61126de39dd696c1376e70fd729ad29ddf755897d7ede28ddd8829ea1e4511"
+    },
+    "antarctica/poi/all/strings_poi.bin": {
+      "size_zst": 30511,
+      "size_raw": 85819,
+      "sha256": "324dddff80bbe47c658b3c34dd1bc138b060f1630361d8c8cd7c81b6cfd078ba"
+    },
+    "antarctica/poi/major/poi_cells.bin": {
+      "size_zst": 66411,
+      "size_raw": 246408,
+      "sha256": "f5f0d699d3ba49a7459eae3b5291572029b3483519098e13fc6f013f6f9a5763"
+    },
+    "antarctica/poi/major/poi_entries.bin": {
+      "size_zst": 8317,
+      "size_raw": 134668,
+      "sha256": "8c4f0c7e9d60ac933ba2a08b4f3a95f8daea9ab148a06e763423825c161c6866"
+    },
+    "antarctica/poi/major/poi_records.bin": {
+      "size_zst": 24270,
+      "size_raw": 64800,
+      "sha256": "c8e930bbd21c99f694f3a52bf54c468f4507d80afcb6e2703344fe501804df2f"
+    },
+    "antarctica/poi/major/poi_vertices.bin": {
+      "size_zst": 366868,
+      "size_raw": 394532,
+      "sha256": "3aa3a4bf27f4e1a40a5ae6e4b8db3f33ee1b046581effb25d1709602aa5f8ac8"
+    },
+    "antarctica/poi/major/strings_poi.bin": {
+      "size_zst": 30511,
+      "size_raw": 85819,
+      "sha256": "324dddff80bbe47c658b3c34dd1bc138b060f1630361d8c8cd7c81b6cfd078ba"
+    },
+    "antarctica/poi/notable/poi_cells.bin": {
+      "size_zst": 73312,
+      "size_raw": 270744,
+      "sha256": "de1433558a0e02f76191ee15d5ab9ef5522951c39f788f70dd82d6d5ee188d0b"
+    },
+    "antarctica/poi/notable/poi_entries.bin": {
+      "size_zst": 19292,
+      "size_raw": 156020,
+      "sha256": "1152a36894efc741e1078dd3c85c710b830c46ddef4ef338ff273c4541e902af"
+    },
+    "antarctica/poi/notable/poi_records.bin": {
+      "size_zst": 64001,
+      "size_raw": 198756,
+      "sha256": "551cb71c291454ad468169d4843b2871712ba6880953b0fed4d1305dbbe20b96"
+    },
+    "antarctica/poi/notable/poi_vertices.bin": {
+      "size_zst": 410846,
+      "size_raw": 442708,
+      "sha256": "f533c1eff39fd17e08b3babcbc6f4c32bbddced7e05bee0d79b492ef5637358e"
+    },
+    "antarctica/poi/notable/strings_poi.bin": {
+      "size_zst": 30511,
+      "size_raw": 85819,
+      "sha256": "324dddff80bbe47c658b3c34dd1bc138b060f1630361d8c8cd7c81b6cfd078ba"
+    },
+    "antarctica/quality/q0.2/admin_polygons.bin": {
+      "size_zst": 18563,
+      "size_raw": 61680,
+      "sha256": "1924d0b2519b6a1c7c532814d33fd8f4c27f70437a53c58f237c6898a0abe8a9"
+    },
+    "antarctica/quality/q0.2/admin_vertices.bin": {
+      "size_zst": 757359,
+      "size_raw": 878412,
+      "sha256": "8134004199b5eedc0be385cf1128e58723907b45b0cd1553303a9b6b6f127384"
+    },
+    "antarctica/quality/q0.5/admin_polygons.bin": {
+      "size_zst": 18289,
+      "size_raw": 61680,
+      "sha256": "63887dec76122f617ba166c5f81c609d6b696fe263121a1deca0c3dfd5e9e2d8"
+    },
+    "antarctica/quality/q0.5/admin_vertices.bin": {
+      "size_zst": 475187,
+      "size_raw": 544992,
+      "sha256": "136d0f73909ac9dcff5b5a82fc997593ec923d3b917849b5b101c625ae9b39de"
+    },
+    "antarctica/quality/q1.5/admin_polygons.bin": {
+      "size_zst": 18060,
+      "size_raw": 61680,
+      "sha256": "40d326c560ccca72d33c7c5acdbb4233c991e6fcd049bc7ccd0c9cb645c202be"
+    },
+    "antarctica/quality/q1.5/admin_vertices.bin": {
+      "size_zst": 241310,
+      "size_raw": 279628,
+      "sha256": "9ddfdf434233f251cfc8b9e92f8160b42f5a4816c6bec326730b15cabc019ce4"
+    },
+    "antarctica/quality/q1/admin_polygons.bin": {
+      "size_zst": 17679,
+      "size_raw": 61680,
+      "sha256": "0d7aec0a7743e2ea96ce616d7b77689ffa8c49611465fb57fe08e7496c61e0f7"
+    },
+    "antarctica/quality/q1/admin_vertices.bin": {
+      "size_zst": 311549,
+      "size_raw": 358116,
+      "sha256": "ad5686ce3fdc45d1e9182160acb9f5d9f0b5ad28ce01cdc6b4529c77b4e7c071"
+    },
+    "antarctica/quality/q2.5/admin_polygons.bin": {
+      "size_zst": 17079,
+      "size_raw": 61680,
+      "sha256": "91ffadbdfdbee33d8dec8f4b5e1b7ac75747d80410557ee597a25bdcce0b854c"
+    },
+    "antarctica/quality/q2.5/admin_vertices.bin": {
+      "size_zst": 173014,
+      "size_raw": 204684,
+      "sha256": "cbb4ed9530301375bb9f2ed3b966aedc637b9977631bc713a2d4b40bc60788cf"
+    },
+    "antarctica/quality/q2/admin_polygons.bin": {
+      "size_zst": 17719,
+      "size_raw": 61680,
+      "sha256": "1935ed658c67425acb8f8df43506d87de6c5c74134010b6d15439ec7fee86326"
+    },
+    "antarctica/quality/q2/admin_vertices.bin": {
+      "size_zst": 199181,
+      "size_raw": 233672,
+      "sha256": "9f5ca95ca17c8bd81de06afe96b30278a96ee23fdb8650eccb96bed33f305219"
+    },
+    "antarctica/quality/uncapped/admin_polygons.bin": {
+      "size_zst": 16763,
+      "size_raw": 61680,
+      "sha256": "9cd07343caed91028f6da2e93c13834ee1e38a8589d21963f1798ea91a08ab72"
+    },
+    "antarctica/quality/uncapped/admin_vertices.bin": {
+      "size_zst": 1281033,
+      "size_raw": 1533680,
+      "sha256": "10e30ac947be311634334cdc2211598d8f5f1529091d8281ffe9d9ad05c061d4"
+    },
+    "asia/admin/admin_cells.bin": {
+      "size_zst": 2753775,
+      "size_raw": 11084256,
+      "sha256": "30a468ef0d9750a89a6eb4b437d0d613a591d88da3db840e593a264ad24d4fe0"
+    },
+    "asia/admin/admin_entries.bin": {
+      "size_zst": 2796157,
+      "size_raw": 21311912,
+      "sha256": "f97afd4539d00e89ca6503e75b52006e3ff29b4c029ae4f0e3fa9d93a7bc5b84"
+    },
+    "asia/admin/place_cells.bin": {
+      "size_zst": 678041,
+      "size_raw": 2336364,
+      "sha256": "9cb445f9059dac3e1cb292dea60c1104886b9c5c4141da29e2d6b06793f729f7"
+    },
+    "asia/admin/place_entries.bin": {
+      "size_zst": 5108013,
+      "size_raw": 7236778,
+      "sha256": "2a3c2697989ecd48d187584497cba98e7ec549fe6e9f00d00949eda8a2ada1e8"
+    },
+    "asia/admin/place_nodes.bin": {
+      "size_zst": 18716117,
+      "size_raw": 34236920,
+      "sha256": "4d8d03343957e4fd3c43d0d4203a27edde084eee23a2265d6306853624bb754a"
+    },
+    "asia/admin/postcode_centroid_cells.bin": {
+      "size_zst": 178216,
+      "size_raw": 614772,
+      "sha256": "3ca1582458d75a6d3661bce0357303f0122d56b19db9dc9405d9d483fa1f2f74"
+    },
+    "asia/admin/postcode_centroid_entries.bin": {
+      "size_zst": 459111,
+      "size_raw": 1211326,
+      "sha256": "325b91c88e2cbe2d45ab8613134804269096d0fa8eac3fe6cf9cf424d4d9998d"
+    },
+    "asia/admin/postcode_centroids.bin": {
+      "size_zst": 1793013,
+      "size_raw": 4435456,
+      "sha256": "69f2942b92b37fe73e9bbd4cb67ba1954352d19b09d348cd063ee88c1b92da8d"
+    },
+    "asia/admin/strings_core.bin": {
+      "size_zst": 4635336,
+      "size_raw": 18523037,
+      "sha256": "5e90003a908da91fd11da3ebf487f97eed6249a1652cc3b47f3323657da8b3b1"
+    },
+    "asia/admin/strings_postcode.bin": {
+      "size_zst": 5572267,
+      "size_raw": 35988965,
+      "sha256": "3709ce98d246ee154527d5a0dddaec02cd54d0816ca250b903ec33dc6f6c9914"
+    },
+    "asia/full/addr_entries.bin": {
+      "size_zst": 48391387,
+      "size_raw": 105387962,
+      "sha256": "9ddfb4a2e3385c1913440cadb569708d8e392473b4a4f964d7a9ba50c2e6ac0a"
+    },
+    "asia/full/addr_points.bin": {
+      "size_zst": 164311822,
+      "size_raw": 531868988,
+      "sha256": "c82446a8459fc8a2249115bd39e628c9d3cfaadaefed84fbf1ebaf1f61138316"
+    },
+    "asia/full/addr_postcodes.bin": {
+      "size_zst": 3142034,
+      "size_raw": 75981284,
+      "sha256": "113631ac9dba0fdd6b8015e8c0983170fab73e1e3d064360c3264a6a4d68c49b"
+    },
+    "asia/full/addr_vertices.bin": {
+      "size_zst": 181550042,
+      "size_raw": 405222826,
+      "sha256": "01bc87b7964000ce137d72d5b774625c69dfbe2701f88460db13e98f4cd6317e"
+    },
+    "asia/full/admin_cells.bin": {
+      "size_zst": 2753775,
+      "size_raw": 11084256,
+      "sha256": "30a468ef0d9750a89a6eb4b437d0d613a591d88da3db840e593a264ad24d4fe0"
+    },
+    "asia/full/admin_entries.bin": {
+      "size_zst": 2796157,
+      "size_raw": 21311912,
+      "sha256": "f97afd4539d00e89ca6503e75b52006e3ff29b4c029ae4f0e3fa9d93a7bc5b84"
+    },
+    "asia/full/admin_parents.bin": {
+      "size_zst": 747354,
+      "size_raw": 1698276,
+      "sha256": "1ecd74e42c8e1e4f19a84b6346d6e06b995108cb93b07a5e3bec1f7a57aa1515"
+    },
+    "asia/full/geo_cells.bin": {
+      "size_zst": 193647707,
+      "size_raw": 1262755360,
+      "sha256": "74625db784230ab147ac6ff36e282b66e69a1ddc3d98a2b9a04b895c0b492abe"
+    },
+    "asia/full/interp_entries.bin": {
+      "size_zst": 4754,
+      "size_raw": 18642,
+      "sha256": "68c181276bfbddc2e6cfe59a9c34a132fb7a99779cc45f50cdefc572f7bb21a1"
+    },
+    "asia/full/interp_nodes.bin": {
+      "size_zst": 11145,
+      "size_raw": 24408,
+      "sha256": "69027f7e9e425eb487660b1ba707c5417ec82fb02eccfb9dbb6236c6a701130c"
+    },
+    "asia/full/interp_ways.bin": {
+      "size_zst": 6100,
+      "size_raw": 24960,
+      "sha256": "8d7e38c299d274a277a59ed7bc902ab8909e4bdf65dfb6a6d98ec484c852ede0"
+    },
+    "asia/full/place_cells.bin": {
+      "size_zst": 678041,
+      "size_raw": 2336364,
+      "sha256": "9cb445f9059dac3e1cb292dea60c1104886b9c5c4141da29e2d6b06793f729f7"
+    },
+    "asia/full/place_entries.bin": {
+      "size_zst": 5108013,
+      "size_raw": 7236778,
+      "sha256": "2a3c2697989ecd48d187584497cba98e7ec549fe6e9f00d00949eda8a2ada1e8"
+    },
+    "asia/full/place_nodes.bin": {
+      "size_zst": 18716117,
+      "size_raw": 34236920,
+      "sha256": "4d8d03343957e4fd3c43d0d4203a27edde084eee23a2265d6306853624bb754a"
+    },
+    "asia/full/postcode_centroid_cells.bin": {
+      "size_zst": 178216,
+      "size_raw": 614772,
+      "sha256": "3ca1582458d75a6d3661bce0357303f0122d56b19db9dc9405d9d483fa1f2f74"
+    },
+    "asia/full/postcode_centroid_entries.bin": {
+      "size_zst": 459111,
+      "size_raw": 1211326,
+      "sha256": "325b91c88e2cbe2d45ab8613134804269096d0fa8eac3fe6cf9cf424d4d9998d"
+    },
+    "asia/full/postcode_centroids.bin": {
+      "size_zst": 1793013,
+      "size_raw": 4435456,
+      "sha256": "69f2942b92b37fe73e9bbd4cb67ba1954352d19b09d348cd063ee88c1b92da8d"
+    },
+    "asia/full/street_entries.bin": {
+      "size_zst": 64674553,
+      "size_raw": 457295696,
+      "sha256": "21a34eedc29516bf643cad7ff94ea942eaebee9d8ce2dee1176de5bae2e4fbc4"
+    },
+    "asia/full/street_nodes.bin": {
+      "size_zst": 313085135,
+      "size_raw": 663338280,
+      "sha256": "fc15da447bb7fa96ca6f8fe706f57e052b63a302210e4d49f4a407665df0aaf8"
+    },
+    "asia/full/street_ways.bin": {
+      "size_zst": 19831390,
+      "size_raw": 89185452,
+      "sha256": "7045fc29707991ccd83b5b70f991944e04bece3d6cef871571ae0c7c05eff75d"
+    },
+    "asia/full/strings_addr.bin": {
+      "size_zst": 1059636,
+      "size_raw": 4152092,
+      "sha256": "2911cd663c3fe8c273adac439b08e38da9a5f1e1b1dc4c03974f72ddfe0da333"
+    },
+    "asia/full/strings_core.bin": {
+      "size_zst": 4635336,
+      "size_raw": 18523037,
+      "sha256": "5e90003a908da91fd11da3ebf487f97eed6249a1652cc3b47f3323657da8b3b1"
+    },
+    "asia/full/strings_postcode.bin": {
+      "size_zst": 5572267,
+      "size_raw": 35988965,
+      "sha256": "3709ce98d246ee154527d5a0dddaec02cd54d0816ca250b903ec33dc6f6c9914"
+    },
+    "asia/full/strings_street.bin": {
+      "size_zst": 7832245,
+      "size_raw": 41218741,
+      "sha256": "1777ff878819a1cbcdf17c83ad33dc7c18ce5fd73f4aa3db91ee1804c297839a"
+    },
+    "asia/full/way_parents.bin": {
+      "size_zst": 7534576,
+      "size_raw": 29728484,
+      "sha256": "ada458091f92f4666c6a9b78420c2aa090ef76d4b5b9f4bb48c71e11c283481d"
+    },
+    "asia/full/way_postcodes.bin": {
+      "size_zst": 255078,
+      "size_raw": 29728484,
+      "sha256": "134633b2e70b9e939c40fad1c8b767d6f7608443c2cd49e1e5445d50a54da8a9"
+    },
+    "asia/no-addresses/admin_cells.bin": {
+      "size_zst": 2753775,
+      "size_raw": 11084256,
+      "sha256": "30a468ef0d9750a89a6eb4b437d0d613a591d88da3db840e593a264ad24d4fe0"
+    },
+    "asia/no-addresses/admin_entries.bin": {
+      "size_zst": 2796157,
+      "size_raw": 21311912,
+      "sha256": "f97afd4539d00e89ca6503e75b52006e3ff29b4c029ae4f0e3fa9d93a7bc5b84"
+    },
+    "asia/no-addresses/admin_parents.bin": {
+      "size_zst": 747354,
+      "size_raw": 1698276,
+      "sha256": "1ecd74e42c8e1e4f19a84b6346d6e06b995108cb93b07a5e3bec1f7a57aa1515"
+    },
+    "asia/no-addresses/geo_cells.bin": {
+      "size_zst": 171003383,
+      "size_raw": 1222282360,
+      "sha256": "c153348d536e37570d3cf0f77e2115988c8e501c34b9bd4f01a494a4949e061e"
+    },
+    "asia/no-addresses/place_cells.bin": {
+      "size_zst": 678041,
+      "size_raw": 2336364,
+      "sha256": "9cb445f9059dac3e1cb292dea60c1104886b9c5c4141da29e2d6b06793f729f7"
+    },
+    "asia/no-addresses/place_entries.bin": {
+      "size_zst": 5108013,
+      "size_raw": 7236778,
+      "sha256": "2a3c2697989ecd48d187584497cba98e7ec549fe6e9f00d00949eda8a2ada1e8"
+    },
+    "asia/no-addresses/place_nodes.bin": {
+      "size_zst": 18716117,
+      "size_raw": 34236920,
+      "sha256": "4d8d03343957e4fd3c43d0d4203a27edde084eee23a2265d6306853624bb754a"
+    },
+    "asia/no-addresses/postcode_centroid_cells.bin": {
+      "size_zst": 178216,
+      "size_raw": 614772,
+      "sha256": "3ca1582458d75a6d3661bce0357303f0122d56b19db9dc9405d9d483fa1f2f74"
+    },
+    "asia/no-addresses/postcode_centroid_entries.bin": {
+      "size_zst": 459111,
+      "size_raw": 1211326,
+      "sha256": "325b91c88e2cbe2d45ab8613134804269096d0fa8eac3fe6cf9cf424d4d9998d"
+    },
+    "asia/no-addresses/postcode_centroids.bin": {
+      "size_zst": 1793013,
+      "size_raw": 4435456,
+      "sha256": "69f2942b92b37fe73e9bbd4cb67ba1954352d19b09d348cd063ee88c1b92da8d"
+    },
+    "asia/no-addresses/street_entries.bin": {
+      "size_zst": 64674553,
+      "size_raw": 457295696,
+      "sha256": "21a34eedc29516bf643cad7ff94ea942eaebee9d8ce2dee1176de5bae2e4fbc4"
+    },
+    "asia/no-addresses/street_nodes.bin": {
+      "size_zst": 313085135,
+      "size_raw": 663338280,
+      "sha256": "fc15da447bb7fa96ca6f8fe706f57e052b63a302210e4d49f4a407665df0aaf8"
+    },
+    "asia/no-addresses/street_ways.bin": {
+      "size_zst": 19831390,
+      "size_raw": 89185452,
+      "sha256": "7045fc29707991ccd83b5b70f991944e04bece3d6cef871571ae0c7c05eff75d"
+    },
+    "asia/no-addresses/strings_core.bin": {
+      "size_zst": 4635336,
+      "size_raw": 18523037,
+      "sha256": "5e90003a908da91fd11da3ebf487f97eed6249a1652cc3b47f3323657da8b3b1"
+    },
+    "asia/no-addresses/strings_postcode.bin": {
+      "size_zst": 5572267,
+      "size_raw": 35988965,
+      "sha256": "3709ce98d246ee154527d5a0dddaec02cd54d0816ca250b903ec33dc6f6c9914"
+    },
+    "asia/no-addresses/strings_street.bin": {
+      "size_zst": 7832245,
+      "size_raw": 41218741,
+      "sha256": "1777ff878819a1cbcdf17c83ad33dc7c18ce5fd73f4aa3db91ee1804c297839a"
+    },
+    "asia/no-addresses/way_parents.bin": {
+      "size_zst": 7534576,
+      "size_raw": 29728484,
+      "sha256": "ada458091f92f4666c6a9b78420c2aa090ef76d4b5b9f4bb48c71e11c283481d"
+    },
+    "asia/no-addresses/way_postcodes.bin": {
+      "size_zst": 255078,
+      "size_raw": 29728484,
+      "sha256": "134633b2e70b9e939c40fad1c8b767d6f7608443c2cd49e1e5445d50a54da8a9"
+    },
+    "asia/poi/all/poi_cells.bin": {
+      "size_zst": 896668,
+      "size_raw": 3071292,
+      "sha256": "56e45e8b7f7a1a1bdccf5fccd8e8284a16debb01abf86ff46526a610dd83fc47"
+    },
+    "asia/poi/all/poi_entries.bin": {
+      "size_zst": 16389329,
+      "size_raw": 24760818,
+      "sha256": "40e98d75dde2960e7474b9244a27141e5a1466304b956f4f4e159e4a111cbd56"
+    },
+    "asia/poi/all/poi_records.bin": {
+      "size_zst": 86399785,
+      "size_raw": 211683240,
+      "sha256": "79e862aab1929778766bfebf525957d4a855b6049ca5cbe1802861864d3c487a"
+    },
+    "asia/poi/all/poi_vertices.bin": {
+      "size_zst": 92691941,
+      "size_raw": 123888920,
+      "sha256": "0bd74a169a7ec697cdbdc49245ef664d04a326f582d42df151f08f9d8ce338f8"
+    },
+    "asia/poi/all/strings_poi.bin": {
+      "size_zst": 25856679,
+      "size_raw": 107393750,
+      "sha256": "4915c8bd514fa20150fbfd44a08ca87889d056e80e57349476348639330f19ee"
+    },
+    "asia/poi/major/poi_cells.bin": {
+      "size_zst": 382151,
+      "size_raw": 1353360,
+      "sha256": "1fc0bfd8b2f69e3e7f41b2b83adbb1fa884bcbbc1bbaeb57896b9f41ce76e7b9"
+    },
+    "asia/poi/major/poi_entries.bin": {
+      "size_zst": 447353,
+      "size_raw": 1121800,
+      "sha256": "6799ac84cc8e17b16a43cc97ea5282cddac4c3f41e81366b803298b70b6bb284"
+    },
+    "asia/poi/major/poi_records.bin": {
+      "size_zst": 2325058,
+      "size_raw": 4832964,
+      "sha256": "f1ad86964f11297fb3ea57e9ae719022c27c42da0932c55e228ea6eff033a0b1"
+    },
+    "asia/poi/major/poi_vertices.bin": {
+      "size_zst": 13926574,
+      "size_raw": 15485366,
+      "sha256": "edadaed4f90de57bb9d28d64efd737035a596c676e7860cfc54e036026d380df"
+    },
+    "asia/poi/major/strings_poi.bin": {
+      "size_zst": 25856679,
+      "size_raw": 107393750,
+      "sha256": "4915c8bd514fa20150fbfd44a08ca87889d056e80e57349476348639330f19ee"
+    },
+    "asia/poi/notable/poi_cells.bin": {
+      "size_zst": 581215,
+      "size_raw": 2032596,
+      "sha256": "8359ac75e55fc87de1dcead959b8aecb6e43fe82b1fc6eb070b7a8bbe4ec194e"
+    },
+    "asia/poi/notable/poi_entries.bin": {
+      "size_zst": 2411193,
+      "size_raw": 4149014,
+      "sha256": "5151539c9740672c600e64a68192e714df9c9bf5e88eaf2e175b3b2184f45cc0"
+    },
+    "asia/poi/notable/poi_records.bin": {
+      "size_zst": 13647209,
+      "size_raw": 30025620,
+      "sha256": "2b0a2244406b89427d986f8e24dbe3bd8b887f70511744a62118a8f01802697c"
+    },
+    "asia/poi/notable/poi_vertices.bin": {
+      "size_zst": 32057026,
+      "size_raw": 39756428,
+      "sha256": "21dd9d914eeb8e9a29222cee99f182e7a91741c0e536e8b7f0b6ec6c5725b9f2"
+    },
+    "asia/poi/notable/strings_poi.bin": {
+      "size_zst": 25856679,
+      "size_raw": 107393750,
+      "sha256": "4915c8bd514fa20150fbfd44a08ca87889d056e80e57349476348639330f19ee"
+    },
+    "asia/quality/q0.2/admin_polygons.bin": {
+      "size_zst": 4729316,
+      "size_raw": 10189656,
+      "sha256": "561cd9d5ad47b03f7a376d0bd17b6e08286995c8a914e11a75551a19bc6572ef"
+    },
+    "asia/quality/q0.2/admin_vertices.bin": {
+      "size_zst": 251585325,
+      "size_raw": 269604206,
+      "sha256": "a48dc12b456fcf1083a3b9bc988ee72e2790679493f1cc4bdc5a8e3bd39d9cca"
+    },
+    "asia/quality/q0.2/postal_polygons.bin": {
+      "size_zst": 79074,
+      "size_raw": 186144,
+      "sha256": "612c7ba388d632520d1f3593a3368ea781cb04147cb7be810e589338220c04c9"
+    },
+    "asia/quality/q0.2/postal_vertices.bin": {
+      "size_zst": 3656192,
+      "size_raw": 3849512,
+      "sha256": "b139a2b6c9a0e50ab5e7720c9f64485f362903e0d54e26d42ab96fb9572d4f5e"
+    },
+    "asia/quality/q0.5/admin_polygons.bin": {
+      "size_zst": 4645318,
+      "size_raw": 10189656,
+      "sha256": "dddaf0fa1b3a1e0400845d224a3b7d3712b8ca13fd562f63e672c6824cb1c696"
+    },
+    "asia/quality/q0.5/admin_vertices.bin": {
+      "size_zst": 182007123,
+      "size_raw": 193096006,
+      "sha256": "886fe03b74c24436328e4d86052b8b764396255501bf5205744d37d15f6c09ef"
+    },
+    "asia/quality/q0.5/postal_polygons.bin": {
+      "size_zst": 77480,
+      "size_raw": 186144,
+      "sha256": "bc91c11654531ceeeb6ab5704871c43bcce64299fb9da01abd03bb2bc1037f91"
+    },
+    "asia/quality/q0.5/postal_vertices.bin": {
+      "size_zst": 2714067,
+      "size_raw": 2859528,
+      "sha256": "37384550658c85716d71c1d1e533e65c6c652a37cabe8af2537c29aa5f636017"
+    },
+    "asia/quality/q1.5/admin_polygons.bin": {
+      "size_zst": 4520632,
+      "size_raw": 10189656,
+      "sha256": "32df8d56aec12842c1fddcccc5e42ac00bbaf11291748a722b3df6de2f7d6a98"
+    },
+    "asia/quality/q1.5/admin_vertices.bin": {
+      "size_zst": 109452266,
+      "size_raw": 115992854,
+      "sha256": "4a06a940985b6e5109a390080ef24ae95846f4b4dc14afc91d76606c65280310"
+    },
+    "asia/quality/q1.5/postal_polygons.bin": {
+      "size_zst": 73106,
+      "size_raw": 186144,
+      "sha256": "e3e90618e2a772179c31074d6af08de1dec5ac524020bf2982b3ef87e23fde71"
+    },
+    "asia/quality/q1.5/postal_vertices.bin": {
+      "size_zst": 1547890,
+      "size_raw": 1648404,
+      "sha256": "65c0121834dc12cbae675ba8b6a395edc780646bae70caa0ae6285e556d56be5"
+    },
+    "asia/quality/q1/admin_polygons.bin": {
+      "size_zst": 4581971,
+      "size_raw": 10189656,
+      "sha256": "ce41799331e92ee189270d1bc2695565a55d009b967d94bf440e8baa0211c72f"
+    },
+    "asia/quality/q1/admin_vertices.bin": {
+      "size_zst": 133916515,
+      "size_raw": 141779554,
+      "sha256": "cce9d1148f0477b1fd9fc58e33f0b3ca71d8b226e82dba07af3889bc19d7a51e"
+    },
+    "asia/quality/q1/postal_polygons.bin": {
+      "size_zst": 76163,
+      "size_raw": 186144,
+      "sha256": "ac18892384fa1f2c6f8985aa8c84160f5981adf6b921d523cf3797213ffaa19f"
+    },
+    "asia/quality/q1/postal_vertices.bin": {
+      "size_zst": 1942878,
+      "size_raw": 2057404,
+      "sha256": "2e33e0aea402b54a80344ea6f221752530f24b3a8bd2ec2781fc2ea824382a88"
+    },
+    "asia/quality/q2.5/admin_polygons.bin": {
+      "size_zst": 4495180,
+      "size_raw": 10189656,
+      "sha256": "1b694b795d9c453ea6ac988ee6d8f9d091d75305153284b88b5437b1cfa3f479"
+    },
+    "asia/quality/q2.5/admin_vertices.bin": {
+      "size_zst": 82768908,
+      "size_raw": 88089498,
+      "sha256": "0caa6212b85a7c645badfb73da8c7063a5c2a2224dcdd4b47b470ae872a4cb1c"
+    },
+    "asia/quality/q2.5/postal_polygons.bin": {
+      "size_zst": 73677,
+      "size_raw": 186144,
+      "sha256": "9d29ce30f0cd4418eeb4dc68960b7d90342ecfc4828b73ac14ee479ba23c5001"
+    },
+    "asia/quality/q2.5/postal_vertices.bin": {
+      "size_zst": 1135351,
+      "size_raw": 1221340,
+      "sha256": "c7bd82c2547a379c7d1e46042289d815b3714d0f757e265bb0e2ae77fa3598dc"
+    },
+    "asia/quality/q2/admin_polygons.bin": {
+      "size_zst": 4479521,
+      "size_raw": 10189656,
+      "sha256": "4ed5096c0f274f4b110f827d41f255314c3540c29aaa5a9798b52d90cfb01864"
+    },
+    "asia/quality/q2/admin_vertices.bin": {
+      "size_zst": 93832288,
+      "size_raw": 99633678,
+      "sha256": "ff82f35f8577eab49b7b444c2b557478f100f48f76e99cfe3aa0ed1bd24fdb2a"
+    },
+    "asia/quality/q2/postal_polygons.bin": {
+      "size_zst": 74013,
+      "size_raw": 186144,
+      "sha256": "d8678c1439cea4522419f402d381f06338d9c58434b757ec3b715256745928f1"
+    },
+    "asia/quality/q2/postal_vertices.bin": {
+      "size_zst": 1302756,
+      "size_raw": 1394528,
+      "sha256": "5ecdb24684e8011cb01df90be297da23864b412d11fd9207c61eb19ab90a9c4f"
+    },
+    "asia/quality/uncapped/admin_polygons.bin": {
+      "size_zst": 4822793,
+      "size_raw": 10189656,
+      "sha256": "c475eb15f7e7553f21a43cb3c4759830609ed80d9c96bd3eb1c7b8e927f989a9"
+    },
+    "asia/quality/uncapped/admin_vertices.bin": {
+      "size_zst": 420732578,
+      "size_raw": 480495242,
+      "sha256": "5faa59eec06fc40d9e0f11a0dacb232861e5e69c35ab8c58207a10eba97d4d9a"
+    },
+    "asia/quality/uncapped/postal_polygons.bin": {
+      "size_zst": 81251,
+      "size_raw": 186144,
+      "sha256": "0e952bb533fd5b77951e3917a7b913363466a127a568657bcee73401c351efa8"
+    },
+    "asia/quality/uncapped/postal_vertices.bin": {
+      "size_zst": 5153016,
+      "size_raw": 5477212,
+      "sha256": "3a6e0ca671bf6f28cd8185b0f5acf9af0d42de91b34424801c3ce8de45885110"
+    },
+    "central-america/admin/admin_cells.bin": {
+      "size_zst": 137919,
+      "size_raw": 494964,
+      "sha256": "a251701faf1bc5d66bc5bec21bc46c80faddcc1a97b9e1bdb233d800c3c32640"
+    },
+    "central-america/admin/admin_entries.bin": {
+      "size_zst": 197028,
+      "size_raw": 914270,
+      "sha256": "c6bc84609f9cd062a3eea368eb27e726862a9cfec40c18a7e2634626343e8c19"
+    },
+    "central-america/admin/place_cells.bin": {
+      "size_zst": 24674,
+      "size_raw": 82776,
+      "sha256": "357cc1868d4b9eb4289a29e4451c7fe0fdee8c04042c62aa590527e3be8b3cca"
+    },
+    "central-america/admin/place_entries.bin": {
+      "size_zst": 168972,
+      "size_raw": 280120,
+      "sha256": "18ed7077c100a41d90ea17c59a88d589c9ac3ec692a7f2affb97a97c03003946"
+    },
+    "central-america/admin/place_nodes.bin": {
+      "size_zst": 734013,
+      "size_raw": 1331620,
+      "sha256": "930a1184bb950a707c6955ee4433eb4adf3adb1f83edc20da4fcc8e5a4e74825"
+    },
+    "central-america/admin/postcode_centroid_cells.bin": {
+      "size_zst": 14220,
+      "size_raw": 39900,
+      "sha256": "88e9facdd1dfc0b69309e757e24d04875186dcafe24c6b1deee7f754b4a341e1"
+    },
+    "central-america/admin/postcode_centroid_entries.bin": {
+      "size_zst": 14201,
+      "size_raw": 34514,
+      "sha256": "f5007ba20f506107d3872badeaa7ea2157a9ff2bb73dac865c0d019769eb47cf"
+    },
+    "central-america/admin/postcode_centroids.bin": {
+      "size_zst": 59289,
+      "size_raw": 111456,
+      "sha256": "436261ddbfe00e811405d89a753c25f1617623efa80630876d774c5f0dcccfd5"
+    },
+    "central-america/admin/strings_core.bin": {
+      "size_zst": 239893,
+      "size_raw": 864377,
+      "sha256": "336ae9a0253e109895f948b500b027c43eaa2f707e89609bc47c5cec2493a951"
+    },
+    "central-america/admin/strings_postcode.bin": {
+      "size_zst": 5447823,
+      "size_raw": 36033424,
+      "sha256": "58a4ca83cadd09b2f47c165664128faace58efca778dc990ef5a84d7813b11e3"
+    },
+    "central-america/full/addr_entries.bin": {
+      "size_zst": 1213685,
+      "size_raw": 2645848,
+      "sha256": "7d5d809104f03d95b8d3f4bc2850c95d9d6cee88b2647989953a69f237a426e1"
+    },
+    "central-america/full/addr_points.bin": {
+      "size_zst": 4921291,
+      "size_raw": 16276148,
+      "sha256": "05eb42d4007adf696b74bc485814f7dacd6b30ccd497567eac737fb833895cc8"
+    },
+    "central-america/full/addr_postcodes.bin": {
+      "size_zst": 35440,
+      "size_raw": 2325164,
+      "sha256": "37e30ba636a8dbc6b2eddcdbcf6188860bb1b469d5243c6ace0f541638c06e2b"
+    },
+    "central-america/full/addr_vertices.bin": {
+      "size_zst": 4126503,
+      "size_raw": 9020834,
+      "sha256": "8ca800e674886ff9dd4814999d2fd130e32637d995bceb2c8d01dd60e9e8ae7b"
+    },
+    "central-america/full/admin_cells.bin": {
+      "size_zst": 137919,
+      "size_raw": 494964,
+      "sha256": "a251701faf1bc5d66bc5bec21bc46c80faddcc1a97b9e1bdb233d800c3c32640"
+    },
+    "central-america/full/admin_entries.bin": {
+      "size_zst": 197028,
+      "size_raw": 914270,
+      "sha256": "c6bc84609f9cd062a3eea368eb27e726862a9cfec40c18a7e2634626343e8c19"
+    },
+    "central-america/full/admin_parents.bin": {
+      "size_zst": 53846,
+      "size_raw": 150108,
+      "sha256": "c011810948b9650367cea675841126cd9e9c0932289e486fe7c5619aad35523e"
+    },
+    "central-america/full/geo_cells.bin": {
+      "size_zst": 10283076,
+      "size_raw": 63073500,
+      "sha256": "e2bd94470130a4ceb94ac1e93e8df150621c1a96584c76d056ecd9b73e199c5c"
+    },
+    "central-america/full/interp_entries.bin": {
+      "size_zst": 345035,
+      "size_raw": 987834,
+      "sha256": "160b573639b30068a877d5b9b294e6ab073cd8513a7d957bde8ca7c861ba4d51"
+    },
+    "central-america/full/interp_nodes.bin": {
+      "size_zst": 1084430,
+      "size_raw": 2446200,
+      "sha256": "73ae150903b4a4e46e12b7539b049518cd04068340f7b82bfa091ddf44bdc869"
+    },
+    "central-america/full/interp_ways.bin": {
+      "size_zst": 425081,
+      "size_raw": 1974144,
+      "sha256": "dc485a8166afe0e61cee0fafd02365341efa259032bb09e0a061a27587172776"
+    },
+    "central-america/full/place_cells.bin": {
+      "size_zst": 24674,
+      "size_raw": 82776,
+      "sha256": "357cc1868d4b9eb4289a29e4451c7fe0fdee8c04042c62aa590527e3be8b3cca"
+    },
+    "central-america/full/place_entries.bin": {
+      "size_zst": 168972,
+      "size_raw": 280120,
+      "sha256": "18ed7077c100a41d90ea17c59a88d589c9ac3ec692a7f2affb97a97c03003946"
+    },
+    "central-america/full/place_nodes.bin": {
+      "size_zst": 734013,
+      "size_raw": 1331620,
+      "sha256": "930a1184bb950a707c6955ee4433eb4adf3adb1f83edc20da4fcc8e5a4e74825"
+    },
+    "central-america/full/postcode_centroid_cells.bin": {
+      "size_zst": 14220,
+      "size_raw": 39900,
+      "sha256": "88e9facdd1dfc0b69309e757e24d04875186dcafe24c6b1deee7f754b4a341e1"
+    },
+    "central-america/full/postcode_centroid_entries.bin": {
+      "size_zst": 14201,
+      "size_raw": 34514,
+      "sha256": "f5007ba20f506107d3872badeaa7ea2157a9ff2bb73dac865c0d019769eb47cf"
+    },
+    "central-america/full/postcode_centroids.bin": {
+      "size_zst": 59289,
+      "size_raw": 111456,
+      "sha256": "436261ddbfe00e811405d89a753c25f1617623efa80630876d774c5f0dcccfd5"
+    },
+    "central-america/full/street_entries.bin": {
+      "size_zst": 4373483,
+      "size_raw": 23225214,
+      "sha256": "ed5ab4a8080eea49105b1b18ba829adb2c8977d1f591a5f30be6caf6509402ce"
+    },
+    "central-america/full/street_nodes.bin": {
+      "size_zst": 24108422,
+      "size_raw": 49898592,
+      "sha256": "5f1211ca78bbf21d4ea7e21aa6dd3f7c2e64680eec6b74f95ecfe2e945c814ec"
+    },
+    "central-america/full/street_ways.bin": {
+      "size_zst": 1548429,
+      "size_raw": 6607596,
+      "sha256": "17c5b42bec2908b76bc9d02052441761ba543f691877a873ce337d95121ca686"
+    },
+    "central-america/full/strings_addr.bin": {
+      "size_zst": 95690,
+      "size_raw": 310944,
+      "sha256": "4dbfe3b6a96b9c265443740f1e0e52728b2e657416fff0d3c94c1fad7ef3fc9e"
+    },
+    "central-america/full/strings_core.bin": {
+      "size_zst": 239893,
+      "size_raw": 864377,
+      "sha256": "336ae9a0253e109895f948b500b027c43eaa2f707e89609bc47c5cec2493a951"
+    },
+    "central-america/full/strings_postcode.bin": {
+      "size_zst": 5447823,
+      "size_raw": 36033424,
+      "sha256": "58a4ca83cadd09b2f47c165664128faace58efca778dc990ef5a84d7813b11e3"
+    },
+    "central-america/full/strings_street.bin": {
+      "size_zst": 696281,
+      "size_raw": 2879226,
+      "sha256": "88da3010d6e672ee0a9258291c6b5832528c971eeb5df9b7f8d720b6e440a375"
+    },
+    "central-america/full/way_parents.bin": {
+      "size_zst": 592288,
+      "size_raw": 2202532,
+      "sha256": "ec7bf1c3cb70c84150ada16ad43ead8758fb11eb10a7dba721b31509a13209d1"
+    },
+    "central-america/full/way_postcodes.bin": {
+      "size_zst": 29204,
+      "size_raw": 2202532,
+      "sha256": "5ad0b2dd18869d9d598b10101cd096bbd986192660a6f3166fbfc205f07221bc"
+    },
+    "central-america/no-addresses/admin_cells.bin": {
+      "size_zst": 137919,
+      "size_raw": 494964,
+      "sha256": "a251701faf1bc5d66bc5bec21bc46c80faddcc1a97b9e1bdb233d800c3c32640"
+    },
+    "central-america/no-addresses/admin_entries.bin": {
+      "size_zst": 197028,
+      "size_raw": 914270,
+      "sha256": "c6bc84609f9cd062a3eea368eb27e726862a9cfec40c18a7e2634626343e8c19"
+    },
+    "central-america/no-addresses/admin_parents.bin": {
+      "size_zst": 53846,
+      "size_raw": 150108,
+      "sha256": "c011810948b9650367cea675841126cd9e9c0932289e486fe7c5619aad35523e"
+    },
+    "central-america/no-addresses/geo_cells.bin": {
+      "size_zst": 8621921,
+      "size_raw": 62258820,
+      "sha256": "a8616636b358e52c6c846bec6a61642b4210a56e151c4fb7be8df3ff8ddc9183"
+    },
+    "central-america/no-addresses/place_cells.bin": {
+      "size_zst": 24674,
+      "size_raw": 82776,
+      "sha256": "357cc1868d4b9eb4289a29e4451c7fe0fdee8c04042c62aa590527e3be8b3cca"
+    },
+    "central-america/no-addresses/place_entries.bin": {
+      "size_zst": 168972,
+      "size_raw": 280120,
+      "sha256": "18ed7077c100a41d90ea17c59a88d589c9ac3ec692a7f2affb97a97c03003946"
+    },
+    "central-america/no-addresses/place_nodes.bin": {
+      "size_zst": 734013,
+      "size_raw": 1331620,
+      "sha256": "930a1184bb950a707c6955ee4433eb4adf3adb1f83edc20da4fcc8e5a4e74825"
+    },
+    "central-america/no-addresses/postcode_centroid_cells.bin": {
+      "size_zst": 14220,
+      "size_raw": 39900,
+      "sha256": "88e9facdd1dfc0b69309e757e24d04875186dcafe24c6b1deee7f754b4a341e1"
+    },
+    "central-america/no-addresses/postcode_centroid_entries.bin": {
+      "size_zst": 14201,
+      "size_raw": 34514,
+      "sha256": "f5007ba20f506107d3872badeaa7ea2157a9ff2bb73dac865c0d019769eb47cf"
+    },
+    "central-america/no-addresses/postcode_centroids.bin": {
+      "size_zst": 59289,
+      "size_raw": 111456,
+      "sha256": "436261ddbfe00e811405d89a753c25f1617623efa80630876d774c5f0dcccfd5"
+    },
+    "central-america/no-addresses/street_entries.bin": {
+      "size_zst": 4373483,
+      "size_raw": 23225214,
+      "sha256": "ed5ab4a8080eea49105b1b18ba829adb2c8977d1f591a5f30be6caf6509402ce"
+    },
+    "central-america/no-addresses/street_nodes.bin": {
+      "size_zst": 24108422,
+      "size_raw": 49898592,
+      "sha256": "5f1211ca78bbf21d4ea7e21aa6dd3f7c2e64680eec6b74f95ecfe2e945c814ec"
+    },
+    "central-america/no-addresses/street_ways.bin": {
+      "size_zst": 1548429,
+      "size_raw": 6607596,
+      "sha256": "17c5b42bec2908b76bc9d02052441761ba543f691877a873ce337d95121ca686"
+    },
+    "central-america/no-addresses/strings_core.bin": {
+      "size_zst": 239893,
+      "size_raw": 864377,
+      "sha256": "336ae9a0253e109895f948b500b027c43eaa2f707e89609bc47c5cec2493a951"
+    },
+    "central-america/no-addresses/strings_postcode.bin": {
+      "size_zst": 5447823,
+      "size_raw": 36033424,
+      "sha256": "58a4ca83cadd09b2f47c165664128faace58efca778dc990ef5a84d7813b11e3"
+    },
+    "central-america/no-addresses/strings_street.bin": {
+      "size_zst": 696281,
+      "size_raw": 2879226,
+      "sha256": "88da3010d6e672ee0a9258291c6b5832528c971eeb5df9b7f8d720b6e440a375"
+    },
+    "central-america/no-addresses/way_parents.bin": {
+      "size_zst": 592288,
+      "size_raw": 2202532,
+      "sha256": "ec7bf1c3cb70c84150ada16ad43ead8758fb11eb10a7dba721b31509a13209d1"
+    },
+    "central-america/no-addresses/way_postcodes.bin": {
+      "size_zst": 29204,
+      "size_raw": 2202532,
+      "sha256": "5ad0b2dd18869d9d598b10101cd096bbd986192660a6f3166fbfc205f07221bc"
+    },
+    "central-america/poi/all/poi_cells.bin": {
+      "size_zst": 53847,
+      "size_raw": 183204,
+      "sha256": "f7baeeaf99fc46dd3293c8fdf9908a7cd32d4bd1a07de9d663e3d7ee219c0cfa"
+    },
+    "central-america/poi/all/poi_entries.bin": {
+      "size_zst": 929013,
+      "size_raw": 1556974,
+      "sha256": "dc99dc688843ec71e022e5c8d1dfd5b916b4dffd0ca51b162fc53ba33554b35d"
+    },
+    "central-america/poi/all/poi_records.bin": {
+      "size_zst": 5333842,
+      "size_raw": 13149252,
+      "sha256": "76068b6141a093fbdb708e9094cf98ce47d4d2eb3371a5ec2a6f53316805e5d9"
+    },
+    "central-america/poi/all/poi_vertices.bin": {
+      "size_zst": 6292772,
+      "size_raw": 8699728,
+      "sha256": "0997b9257c05913ac133608081cfc99b4ff6c092eb3a9a5490dd2ebecf3b8a0b"
+    },
+    "central-america/poi/all/strings_poi.bin": {
+      "size_zst": 1673533,
+      "size_raw": 6275686,
+      "sha256": "1209c7b3671c52ee802783399df5c60e5342554cf4c04050dd90dd79aa31162e"
+    },
+    "central-america/poi/major/poi_cells.bin": {
+      "size_zst": 40315,
+      "size_raw": 145488,
+      "sha256": "2ee43edb763bf6f87cbb77d1a198444d407206fca20b1f27b1148ab7ee7e619c"
+    },
+    "central-america/poi/major/poi_entries.bin": {
+      "size_zst": 32187,
+      "size_raw": 117064,
+      "sha256": "8318f95fb75d2dbc26cdb05e75c71fd7f82a82e492b3389d6f2dfebd113f484d"
+    },
+    "central-america/poi/major/poi_records.bin": {
+      "size_zst": 162367,
+      "size_raw": 359784,
+      "sha256": "9f8feda695986fb22829e93a8836632d42977066694707fbcb2a75a70faf7fc7"
+    },
+    "central-america/poi/major/poi_vertices.bin": {
+      "size_zst": 1354741,
+      "size_raw": 1490998,
+      "sha256": "d000f40ea99cefb51e906ba2744d5ee55456a4efc905d7e476fa1a42cd8355b9"
+    },
+    "central-america/poi/major/strings_poi.bin": {
+      "size_zst": 1673533,
+      "size_raw": 6275686,
+      "sha256": "1209c7b3671c52ee802783399df5c60e5342554cf4c04050dd90dd79aa31162e"
+    },
+    "central-america/poi/notable/poi_cells.bin": {
+      "size_zst": 48190,
+      "size_raw": 170640,
+      "sha256": "1157ba840be1fe6dd12cab8124ca2e7c3d491b98c5985c06948b053cbbab0339"
+    },
+    "central-america/poi/notable/poi_entries.bin": {
+      "size_zst": 127290,
+      "size_raw": 280864,
+      "sha256": "66f86bcacc769770bfe7f8dcc73c4171286f0449cadc60a787527b9ae5eee233"
+    },
+    "central-america/poi/notable/poi_records.bin": {
+      "size_zst": 783580,
+      "size_raw": 1743084,
+      "sha256": "6f3041ecec1198331e17c6874fca3615c391d2edcc1f86a481ebe647f06bd655"
+    },
+    "central-america/poi/notable/poi_vertices.bin": {
+      "size_zst": 2547971,
+      "size_raw": 2989536,
+      "sha256": "88b4e078aa434d36fcb8777828fb7713fee018834f873cdb935665cd2ac9c722"
+    },
+    "central-america/poi/notable/strings_poi.bin": {
+      "size_zst": 1673533,
+      "size_raw": 6275686,
+      "sha256": "1209c7b3671c52ee802783399df5c60e5342554cf4c04050dd90dd79aa31162e"
+    },
+    "central-america/quality/q0.2/admin_polygons.bin": {
+      "size_zst": 409875,
+      "size_raw": 900648,
+      "sha256": "7bc6e58878851ee8804dc55ed9197ffb13a7c84375dca6fab28bacc61ba9a878"
+    },
+    "central-america/quality/q0.2/admin_vertices.bin": {
+      "size_zst": 29330533,
+      "size_raw": 32390590,
+      "sha256": "30437551fe5b4a8245c5239b5cbc966a66b5b251edb032f4a9fb74f21651ce43"
+    },
+    "central-america/quality/q0.2/postal_polygons.bin": {
+      "size_zst": 17544,
+      "size_raw": 43704,
+      "sha256": "139880b9c2d29d060efd52e243229c29a62a01773a1b91ff3e290d4443bd0857"
+    },
+    "central-america/quality/q0.2/postal_vertices.bin": {
+      "size_zst": 1522527,
+      "size_raw": 1727666,
+      "sha256": "20938bdd701fe1213442625e8a7c3696d36fb0a07384aa9b4c2b1eae0e5efcb7"
+    },
+    "central-america/quality/q0.5/admin_polygons.bin": {
+      "size_zst": 401777,
+      "size_raw": 900648,
+      "sha256": "cf9122d4f2eda42738f1f0df280e04724099209417011fd8c57b0c31220c961e"
+    },
+    "central-america/quality/q0.5/admin_vertices.bin": {
+      "size_zst": 19486366,
+      "size_raw": 21131334,
+      "sha256": "f2756cb14c1929dbb19bae285229eac6ed1389b37880f1e8231b7915028c9ac4"
+    },
+    "central-america/quality/q0.5/postal_polygons.bin": {
+      "size_zst": 16906,
+      "size_raw": 43704,
+      "sha256": "fd804bbf44ceeca032f1152e27e1aeaae1f7551ade02683e5b9d310cb3ca8d6d"
+    },
+    "central-america/quality/q0.5/postal_vertices.bin": {
+      "size_zst": 962871,
+      "size_raw": 1058814,
+      "sha256": "2b4c5dca1d19045a9534e083f4873b390e8d9d60d5cce89308f800f1b49ecba4"
+    },
+    "central-america/quality/q1.5/admin_polygons.bin": {
+      "size_zst": 380914,
+      "size_raw": 900648,
+      "sha256": "ffa9ea3be783b0a69e2368bc3542fc3c4bd5c3116b67bd0b3af1c773cb0f2d0b"
+    },
+    "central-america/quality/q1.5/admin_vertices.bin": {
+      "size_zst": 10594963,
+      "size_raw": 11535262,
+      "sha256": "d45be17af3342a06f452addeb6457d61f5402394492143e32cca9b086ab2481b"
+    },
+    "central-america/quality/q1.5/postal_polygons.bin": {
+      "size_zst": 16297,
+      "size_raw": 43704,
+      "sha256": "8e9b6ec031e01b88a5d60b75ae7fd11610089aa24a79cff7fe5d85863104e831"
+    },
+    "central-america/quality/q1.5/postal_vertices.bin": {
+      "size_zst": 529994,
+      "size_raw": 571218,
+      "sha256": "d0d2a8dcf9c53a0758959d984611f0e0fb300aaf896f8443a7f02c76c2b98c9d"
+    },
+    "central-america/quality/q1/admin_polygons.bin": {
+      "size_zst": 397295,
+      "size_raw": 900648,
+      "sha256": "de1714c0f58ccf844945f94df81528eb5f90653d3ee50cd6b599596dd866c4d5"
+    },
+    "central-america/quality/q1/admin_vertices.bin": {
+      "size_zst": 13463783,
+      "size_raw": 14597998,
+      "sha256": "e9db8916f01603ec0115027e2d25c352f5a003beef61c76b527f6f47ff953784"
+    },
+    "central-america/quality/q1/postal_polygons.bin": {
+      "size_zst": 16887,
+      "size_raw": 43704,
+      "sha256": "c06da9edb44dfc4af33b5cf3178613e6587bf8026565cf4502d236f564124306"
+    },
+    "central-america/quality/q1/postal_vertices.bin": {
+      "size_zst": 667668,
+      "size_raw": 722534,
+      "sha256": "417391c0ff575527f29f54658c2065687f5f06b59cbdbfa89e651690759b1c9b"
+    },
+    "central-america/quality/q2.5/admin_polygons.bin": {
+      "size_zst": 379825,
+      "size_raw": 900648,
+      "sha256": "53c7f1a5eafbf655ba6f1a8a75874ba8e1e913994f733fa861a81df250616084"
+    },
+    "central-america/quality/q2.5/admin_vertices.bin": {
+      "size_zst": 7686301,
+      "size_raw": 8387650,
+      "sha256": "bf521acc814c2a82175f69dd045ffbc07ad7db6c233e27572fba31b97263c3cc"
+    },
+    "central-america/quality/q2.5/postal_polygons.bin": {
+      "size_zst": 15859,
+      "size_raw": 43704,
+      "sha256": "1c32f850723f1ee7ed20cb824ed749f02cb69c582f08f24adbaeb2de0dca52e1"
+    },
+    "central-america/quality/q2.5/postal_vertices.bin": {
+      "size_zst": 387147,
+      "size_raw": 416006,
+      "sha256": "70e38faded345d5c55920b7a84a5f5ff7aa8146147c5d9939823963214b1df1a"
+    },
+    "central-america/quality/q2/admin_polygons.bin": {
+      "size_zst": 389031,
+      "size_raw": 900648,
+      "sha256": "edd9488614e6a84b0464a8456043fadaed6b9eee357e8a98a0401952fd4350b4"
+    },
+    "central-america/quality/q2/admin_vertices.bin": {
+      "size_zst": 8867930,
+      "size_raw": 9668018,
+      "sha256": "6d35c514a23c2c1c0bf3ec63bdddcf8dd83a330ea6ed13b69a245b4cef013e90"
+    },
+    "central-america/quality/q2/postal_polygons.bin": {
+      "size_zst": 15992,
+      "size_raw": 43704,
+      "sha256": "ff1ae6a87f41ae83d06579f8b49ac9b61ddfc8ef4d816865abdc0571222ec8f8"
+    },
+    "central-america/quality/q2/postal_vertices.bin": {
+      "size_zst": 445674,
+      "size_raw": 479126,
+      "sha256": "55f9af71bc044aeb39da82cabd73fc6020a18a42f2045d1c378a1616df05ad30"
+    },
+    "central-america/quality/uncapped/admin_polygons.bin": {
+      "size_zst": 410250,
+      "size_raw": 900648,
+      "sha256": "b74754dac720ae35d9de45d5b4500519c95ee91545a3fc58fe0bea6f5a3c9df4"
+    },
+    "central-america/quality/uncapped/admin_vertices.bin": {
+      "size_zst": 59987759,
+      "size_raw": 73221462,
+      "sha256": "d78df8296293e21851b140a38ae52899be1a796ec4c7934edbda0630a4f12957"
+    },
+    "central-america/quality/uncapped/postal_polygons.bin": {
+      "size_zst": 19620,
+      "size_raw": 43704,
+      "sha256": "5f697064adc44b0a75bc529ffb2f3b18268d5bc053db7f5abdafa08b2abd4577"
+    },
+    "central-america/quality/uncapped/postal_vertices.bin": {
+      "size_zst": 3278590,
+      "size_raw": 4129166,
+      "sha256": "70b20d1c29c2fda0710085b3eb7d6d0e69fda3ddb7735ebd548a4f1133d8edf9"
+    },
+    "europe/admin/admin_cells.bin": {
+      "size_zst": 492526,
+      "size_raw": 1837176,
+      "sha256": "5424688b1fa99ae9e6f82684e916f2433d6f75370c0ef14b653910f845d4a8d5"
+    },
+    "europe/admin/admin_entries.bin": {
+      "size_zst": 2419945,
+      "size_raw": 7460912,
+      "sha256": "2ea2597d56f0db2484e7b3bd00db93dff954488870ad87bffeb85343f639f637"
+    },
+    "europe/admin/place_cells.bin": {
+      "size_zst": 354878,
+      "size_raw": 1231404,
+      "sha256": "648b587acb381a184e39c8e5df6251aae2dfc5a5cf2df0bcf69e2987f6edfc58"
+    },
+    "europe/admin/place_entries.bin": {
+      "size_zst": 3986326,
+      "size_raw": 5429962,
+      "sha256": "22cc69e41e16930af5f64a6aa03c42f63cfa9c2659366683bc5b68f1f3248dc6"
+    },
+    "europe/admin/place_nodes.bin": {
+      "size_zst": 15316333,
+      "size_raw": 26123640,
+      "sha256": "284f57e28fcedf352f101bcb2d13c2223dace76e21ad5200325e7bb4947c1016"
+    },
+    "europe/admin/postcode_centroid_cells.bin": {
+      "size_zst": 185422,
+      "size_raw": 643860,
+      "sha256": "1f37639570912f5be138d2e00ffc1ffef4b1059f62aa3183dea39a66439ca518"
+    },
+    "europe/admin/postcode_centroid_entries.bin": {
+      "size_zst": 3366530,
+      "size_raw": 11907978,
+      "sha256": "050395c1d99cbd4734cb32c6ae4305df50c2a129d8769a00b6f57d2079ec99d9"
+    },
+    "europe/admin/postcode_centroids.bin": {
+      "size_zst": 18543987,
+      "size_raw": 47202672,
+      "sha256": "fb94dec5a981b5e5e395ece9ff5f46ac195788761e678a611cd24a2230428f12"
+    },
+    "europe/admin/strings_core.bin": {
+      "size_zst": 3668579,
+      "size_raw": 13551368,
+      "sha256": "1d78606bf9eb40fbfdaa41cc2cb4de95c6971a391dfd533d2e72e08cbef4a357"
+    },
+    "europe/admin/strings_postcode.bin": {
+      "size_zst": 5485008,
+      "size_raw": 35846573,
+      "sha256": "4b7d70bb31a9c93f9d8eedfbba8a033112af10d4d4cb7414a122d607a27f75e4"
+    },
+    "europe/full/addr_entries.bin": {
+      "size_zst": 253681506,
+      "size_raw": 467109742,
+      "sha256": "1cd7de05b68314b4b3a8731c26cf47570c41a6bc011ffa286cab8a5924e7e2e7"
+    },
+    "europe/full/addr_points.bin": {
+      "size_zst": 940462835,
+      "size_raw": 2825734240,
+      "sha256": "39f01b7afbebc6c3b7910ae11a24eaed72efe8225dc42b0ecc1a522d9d42eb84"
+    },
+    "europe/full/addr_postcodes.bin": {
+      "size_zst": 46503757,
+      "size_raw": 403676320,
+      "sha256": "3cd4bb5c8b7e01496c84076cda0ab4cfd997351afb3d2e50d3f6c4283c15f05b"
+    },
+    "europe/full/addr_vertices.bin": {
+      "size_zst": 1049262294,
+      "size_raw": 1982320114,
+      "sha256": "9df059c99d85d94a62f1dce5b29533a750cfc523fae331820d386211b6b263f8"
+    },
+    "europe/full/admin_cells.bin": {
+      "size_zst": 492526,
+      "size_raw": 1837176,
+      "sha256": "5424688b1fa99ae9e6f82684e916f2433d6f75370c0ef14b653910f845d4a8d5"
+    },
+    "europe/full/admin_entries.bin": {
+      "size_zst": 2419945,
+      "size_raw": 7460912,
+      "sha256": "2ea2597d56f0db2484e7b3bd00db93dff954488870ad87bffeb85343f639f637"
+    },
+    "europe/full/admin_parents.bin": {
+      "size_zst": 1073122,
+      "size_raw": 2003600,
+      "sha256": "7c6367faf4c404f83e03689cc7da14d49e2b62e63ebe61bf21f6ca03ff700d96"
+    },
+    "europe/full/geo_cells.bin": {
+      "size_zst": 368710627,
+      "size_raw": 2053639860,
+      "sha256": "bb2c7f41687da0a841d23cb5510bec08e4d72ba53956ce622100212e6e0cfc78"
+    },
+    "europe/full/interp_entries.bin": {
+      "size_zst": 55344,
+      "size_raw": 160990,
+      "sha256": "c2fa9803582f703ebc8b7403e69a5b8dd61331bbb3d1509b3d8aed1ddbdc95e3"
+    },
+    "europe/full/interp_nodes.bin": {
+      "size_zst": 417178,
+      "size_raw": 745424,
+      "sha256": "969bbce3afd7c56ff48dde5d8c5918c4aca0ef79a67e2d0b2a6ba87aec727248"
+    },
+    "europe/full/interp_ways.bin": {
+      "size_zst": 71094,
+      "size_raw": 342864,
+      "sha256": "dd0be1c1a11172f4f9297e34632df737df5db304bf734cb86469a707d6d3985a"
+    },
+    "europe/full/place_cells.bin": {
+      "size_zst": 354878,
+      "size_raw": 1231404,
+      "sha256": "648b587acb381a184e39c8e5df6251aae2dfc5a5cf2df0bcf69e2987f6edfc58"
+    },
+    "europe/full/place_entries.bin": {
+      "size_zst": 3986326,
+      "size_raw": 5429962,
+      "sha256": "22cc69e41e16930af5f64a6aa03c42f63cfa9c2659366683bc5b68f1f3248dc6"
+    },
+    "europe/full/place_nodes.bin": {
+      "size_zst": 15316333,
+      "size_raw": 26123640,
+      "sha256": "284f57e28fcedf352f101bcb2d13c2223dace76e21ad5200325e7bb4947c1016"
+    },
+    "europe/full/postcode_centroid_cells.bin": {
+      "size_zst": 185422,
+      "size_raw": 643860,
+      "sha256": "1f37639570912f5be138d2e00ffc1ffef4b1059f62aa3183dea39a66439ca518"
+    },
+    "europe/full/postcode_centroid_entries.bin": {
+      "size_zst": 3366530,
+      "size_raw": 11907978,
+      "sha256": "050395c1d99cbd4734cb32c6ae4305df50c2a129d8769a00b6f57d2079ec99d9"
+    },
+    "europe/full/postcode_centroids.bin": {
+      "size_zst": 18543987,
+      "size_raw": 47202672,
+      "sha256": "fb94dec5a981b5e5e395ece9ff5f46ac195788761e678a611cd24a2230428f12"
+    },
+    "europe/full/street_entries.bin": {
+      "size_zst": 170474360,
+      "size_raw": 708853524,
+      "sha256": "5ec82297ce86e69e9a393967af90a4cf7419473085dd04209b01ff207e454113"
+    },
+    "europe/full/street_nodes.bin": {
+      "size_zst": 984536324,
+      "size_raw": 1808421176,
+      "sha256": "e7435b6b34e58f6f759caacadc3bba9d4b92b86c9aac9b6de7d4ecd4ef0013c9"
+    },
+    "europe/full/street_ways.bin": {
+      "size_zst": 56843214,
+      "size_raw": 280966056,
+      "sha256": "1fb6b4ffeb0377018e7f2bd7b985727196e161bab0e160f3b4bac0940b9f3309"
+    },
+    "europe/full/strings_addr.bin": {
+      "size_zst": 1759755,
+      "size_raw": 7977039,
+      "sha256": "873a63a758ccfa3d86140a4c81f1ea154e85cfda7c91fa4dca6086eb7d4dff9e"
+    },
+    "europe/full/strings_core.bin": {
+      "size_zst": 3668579,
+      "size_raw": 13551368,
+      "sha256": "1d78606bf9eb40fbfdaa41cc2cb4de95c6971a391dfd533d2e72e08cbef4a357"
+    },
+    "europe/full/strings_postcode.bin": {
+      "size_zst": 5485008,
+      "size_raw": 35846573,
+      "sha256": "4b7d70bb31a9c93f9d8eedfbba8a033112af10d4d4cb7414a122d607a27f75e4"
+    },
+    "europe/full/strings_street.bin": {
+      "size_zst": 17223429,
+      "size_raw": 79688594,
+      "sha256": "a65a1a94d63f23a2cfa927f05ed6ea3574d8d8eca8331cbcf6274ae36e20fc1c"
+    },
+    "europe/full/way_parents.bin": {
+      "size_zst": 31758143,
+      "size_raw": 93655352,
+      "sha256": "de85c2331e822474ec4bfa9bd7cee63daa3fa946600414c399f5693ccd4728e7"
+    },
+    "europe/full/way_postcodes.bin": {
+      "size_zst": 12871663,
+      "size_raw": 93655352,
+      "sha256": "d9cd6294ccac97c8f16dcc46c60347f89f9a29f5b3db35aceabfbfc8e3fbb041"
+    },
+    "europe/no-addresses/admin_cells.bin": {
+      "size_zst": 492526,
+      "size_raw": 1837176,
+      "sha256": "5424688b1fa99ae9e6f82684e916f2433d6f75370c0ef14b653910f845d4a8d5"
+    },
+    "europe/no-addresses/admin_entries.bin": {
+      "size_zst": 2419945,
+      "size_raw": 7460912,
+      "sha256": "2ea2597d56f0db2484e7b3bd00db93dff954488870ad87bffeb85343f639f637"
+    },
+    "europe/no-addresses/admin_parents.bin": {
+      "size_zst": 1073122,
+      "size_raw": 2003600,
+      "sha256": "7c6367faf4c404f83e03689cc7da14d49e2b62e63ebe61bf21f6ca03ff700d96"
+    },
+    "europe/no-addresses/geo_cells.bin": {
+      "size_zst": 254373445,
+      "size_raw": 1836698360,
+      "sha256": "e8d9bedec76654a83f0a4a5ed7669fa1f3701ae9b110d0dcd2603e944bae96df"
+    },
+    "europe/no-addresses/place_cells.bin": {
+      "size_zst": 354878,
+      "size_raw": 1231404,
+      "sha256": "648b587acb381a184e39c8e5df6251aae2dfc5a5cf2df0bcf69e2987f6edfc58"
+    },
+    "europe/no-addresses/place_entries.bin": {
+      "size_zst": 3986326,
+      "size_raw": 5429962,
+      "sha256": "22cc69e41e16930af5f64a6aa03c42f63cfa9c2659366683bc5b68f1f3248dc6"
+    },
+    "europe/no-addresses/place_nodes.bin": {
+      "size_zst": 15316333,
+      "size_raw": 26123640,
+      "sha256": "284f57e28fcedf352f101bcb2d13c2223dace76e21ad5200325e7bb4947c1016"
+    },
+    "europe/no-addresses/postcode_centroid_cells.bin": {
+      "size_zst": 185422,
+      "size_raw": 643860,
+      "sha256": "1f37639570912f5be138d2e00ffc1ffef4b1059f62aa3183dea39a66439ca518"
+    },
+    "europe/no-addresses/postcode_centroid_entries.bin": {
+      "size_zst": 3366530,
+      "size_raw": 11907978,
+      "sha256": "050395c1d99cbd4734cb32c6ae4305df50c2a129d8769a00b6f57d2079ec99d9"
+    },
+    "europe/no-addresses/postcode_centroids.bin": {
+      "size_zst": 18543987,
+      "size_raw": 47202672,
+      "sha256": "fb94dec5a981b5e5e395ece9ff5f46ac195788761e678a611cd24a2230428f12"
+    },
+    "europe/no-addresses/street_entries.bin": {
+      "size_zst": 170474360,
+      "size_raw": 708853524,
+      "sha256": "5ec82297ce86e69e9a393967af90a4cf7419473085dd04209b01ff207e454113"
+    },
+    "europe/no-addresses/street_nodes.bin": {
+      "size_zst": 984536324,
+      "size_raw": 1808421176,
+      "sha256": "e7435b6b34e58f6f759caacadc3bba9d4b92b86c9aac9b6de7d4ecd4ef0013c9"
+    },
+    "europe/no-addresses/street_ways.bin": {
+      "size_zst": 56843214,
+      "size_raw": 280966056,
+      "sha256": "1fb6b4ffeb0377018e7f2bd7b985727196e161bab0e160f3b4bac0940b9f3309"
+    },
+    "europe/no-addresses/strings_core.bin": {
+      "size_zst": 3668579,
+      "size_raw": 13551368,
+      "sha256": "1d78606bf9eb40fbfdaa41cc2cb4de95c6971a391dfd533d2e72e08cbef4a357"
+    },
+    "europe/no-addresses/strings_postcode.bin": {
+      "size_zst": 5485008,
+      "size_raw": 35846573,
+      "sha256": "4b7d70bb31a9c93f9d8eedfbba8a033112af10d4d4cb7414a122d607a27f75e4"
+    },
+    "europe/no-addresses/strings_street.bin": {
+      "size_zst": 17223429,
+      "size_raw": 79688594,
+      "sha256": "a65a1a94d63f23a2cfa927f05ed6ea3574d8d8eca8331cbcf6274ae36e20fc1c"
+    },
+    "europe/no-addresses/way_parents.bin": {
+      "size_zst": 31758143,
+      "size_raw": 93655352,
+      "sha256": "de85c2331e822474ec4bfa9bd7cee63daa3fa946600414c399f5693ccd4728e7"
+    },
+    "europe/no-addresses/way_postcodes.bin": {
+      "size_zst": 12871663,
+      "size_raw": 93655352,
+      "sha256": "d9cd6294ccac97c8f16dcc46c60347f89f9a29f5b3db35aceabfbfc8e3fbb041"
+    },
+    "europe/poi/all/poi_cells.bin": {
+      "size_zst": 478389,
+      "size_raw": 1494348,
+      "sha256": "d9fe5fcb94fa045e7e4bd57b1c0f45af82d51d52d11760605fdaeb490e1711f1"
+    },
+    "europe/poi/all/poi_entries.bin": {
+      "size_zst": 31800301,
+      "size_raw": 43174434,
+      "sha256": "f49dce887d739e21f57d5a3186877d65428cce2fdb8ed277aff59d2437bd0796"
+    },
+    "europe/poi/all/poi_records.bin": {
+      "size_zst": 173065308,
+      "size_raw": 380384928,
+      "sha256": "cf41fee4bafdf89f272561325b46ca001e745be144c73a6e1c92fee17d5b8955"
+    },
+    "europe/poi/all/poi_vertices.bin": {
+      "size_zst": 224932425,
+      "size_raw": 297458108,
+      "sha256": "627bc9eca63065656de356f5e7c8d1d6d9f3aa39a63e6d9d25f3eeb928f75b3a"
+    },
+    "europe/poi/all/strings_poi.bin": {
+      "size_zst": 43164772,
+      "size_raw": 165634945,
+      "sha256": "aa2da0b50d537dbb14a1c1eb57ff6fc0e7259703c057da9e4f61e1f6efe81bbc"
+    },
+    "europe/poi/major/poi_cells.bin": {
+      "size_zst": 287401,
+      "size_raw": 1018932,
+      "sha256": "00fb396fd8ac5280aba08265d1bdd3e11caee1c1eccc20ac2820064cec4176ee"
+    },
+    "europe/poi/major/poi_entries.bin": {
+      "size_zst": 1094788,
+      "size_raw": 1921442,
+      "sha256": "de3ec3e4ce12ccf76f01eca7487e5e44e85db3b786266066fe13974aef23fac1"
+    },
+    "europe/poi/major/poi_records.bin": {
+      "size_zst": 6528331,
+      "size_raw": 12966516,
+      "sha256": "fa0da484bb5353e24a180584ebbeebeea3995198bfffe2dc3f93c4e0327a5353"
+    },
+    "europe/poi/major/poi_vertices.bin": {
+      "size_zst": 38759782,
+      "size_raw": 45413972,
+      "sha256": "ca0bdaffe7e63a3b644ec06c22a29cee243f2b3c7f77724de35f63ccc61ca1b2"
+    },
+    "europe/poi/major/strings_poi.bin": {
+      "size_zst": 43164772,
+      "size_raw": 165634945,
+      "sha256": "aa2da0b50d537dbb14a1c1eb57ff6fc0e7259703c057da9e4f61e1f6efe81bbc"
+    },
+    "europe/poi/notable/poi_cells.bin": {
+      "size_zst": 377621,
+      "size_raw": 1274508,
+      "sha256": "a9b60d96711e5805333b4c05128675ee71d80e00ec0bfd6764bb03f30f7da83d"
+    },
+    "europe/poi/notable/poi_entries.bin": {
+      "size_zst": 4380409,
+      "size_raw": 6653594,
+      "sha256": "8720d8486db9f2aac5be904da92a8d6e3ee005498b8e02acf6b38b004322f613"
+    },
+    "europe/poi/notable/poi_records.bin": {
+      "size_zst": 27101319,
+      "size_raw": 54266328,
+      "sha256": "e84132881f0240378f2d512994aab0bcce68a7c23f572aa7511bfa27bd641697"
+    },
+    "europe/poi/notable/poi_vertices.bin": {
+      "size_zst": 88685714,
+      "size_raw": 112608920,
+      "sha256": "0afde19a17aab789ef9bb1c7f5546ddc6ce7677355ae6777ef5b273f45d321b7"
+    },
+    "europe/poi/notable/strings_poi.bin": {
+      "size_zst": 43164772,
+      "size_raw": 165634945,
+      "sha256": "aa2da0b50d537dbb14a1c1eb57ff6fc0e7259703c057da9e4f61e1f6efe81bbc"
+    },
+    "europe/quality/q0.2/admin_polygons.bin": {
+      "size_zst": 5689517,
+      "size_raw": 12021600,
+      "sha256": "fc0f03b103ff30f5c1fea0cf279a5fcdc283227a1d081d52957fa20724146a0a"
+    },
+    "europe/quality/q0.2/admin_vertices.bin": {
+      "size_zst": 322782617,
+      "size_raw": 349880956,
+      "sha256": "a2a40386127bcb713f5b4e98bcede7c7587db8c3a2cff676999f5b87d99d47c1"
+    },
+    "europe/quality/q0.2/postal_polygons.bin": {
+      "size_zst": 297356,
+      "size_raw": 627840,
+      "sha256": "8e35bc14bf1058431520a7130ea2e55eabd67324cf02da1c3c4697aae534961a"
+    },
+    "europe/quality/q0.2/postal_vertices.bin": {
+      "size_zst": 33210640,
+      "size_raw": 35091184,
+      "sha256": "0db84c79465996d78c70e3df7942307c9f4aa236c825820b5a2dd64123c082a7"
+    },
+    "europe/quality/q0.5/admin_polygons.bin": {
+      "size_zst": 5550725,
+      "size_raw": 12021600,
+      "sha256": "efac1e495e817a61c65c514d466e30be5181900e4fbfc33be0f5b177c425c136"
+    },
+    "europe/quality/q0.5/admin_vertices.bin": {
+      "size_zst": 212496810,
+      "size_raw": 228686712,
+      "sha256": "7bf3bc7a8df6fdec21749cf5ebe7d3006f91ef223dd45a8304f6daab7bf31a98"
+    },
+    "europe/quality/q0.5/postal_polygons.bin": {
+      "size_zst": 286099,
+      "size_raw": 627840,
+      "sha256": "36a4a373886f71f8e501d96968a0d3166c6b51a10bc854d8f25c83a65a51c303"
+    },
+    "europe/quality/q0.5/postal_vertices.bin": {
+      "size_zst": 22170316,
+      "size_raw": 23333584,
+      "sha256": "92a5b69dfa1efd1dd78ecb94a47cbe69ba598faca0429ae070700cb5617cefd1"
+    },
+    "europe/quality/q1.5/admin_polygons.bin": {
+      "size_zst": 5356506,
+      "size_raw": 12021600,
+      "sha256": "6ede765f0d43eb1c02b9d830b900ea80e10adba48339b80138e85517fc08020d"
+    },
+    "europe/quality/q1.5/admin_vertices.bin": {
+      "size_zst": 116895954,
+      "size_raw": 126071452,
+      "sha256": "344d88bde8991b70374eb9a00963c95f34f2a7837aaf8422b59707a18e0aeed1"
+    },
+    "europe/quality/q1.5/postal_polygons.bin": {
+      "size_zst": 281286,
+      "size_raw": 627840,
+      "sha256": "09cd5dab3398e2bb2094ab8a39d293044e679e89ff5e1f765a42332fb0cf2c66"
+    },
+    "europe/quality/q1.5/postal_vertices.bin": {
+      "size_zst": 12251998,
+      "size_raw": 12899552,
+      "sha256": "6ba3f0f20e4a07bf93fba6978c61b5057d1dc84b85d1d380aa7bfa49a0b72495"
+    },
+    "europe/quality/q1/admin_polygons.bin": {
+      "size_zst": 5423595,
+      "size_raw": 12021600,
+      "sha256": "36381bb544662ca88bdb9ea162c76c31ed91947db43eb0823dd565b82226749d"
+    },
+    "europe/quality/q1/admin_vertices.bin": {
+      "size_zst": 147312462,
+      "size_raw": 158495156,
+      "sha256": "2e0009252577248f25ad945573cc44c5349f3eaecd4f5154a47d4de26d3abf18"
+    },
+    "europe/quality/q1/postal_polygons.bin": {
+      "size_zst": 278276,
+      "size_raw": 627840,
+      "sha256": "207bddb43e335808074e4e9a408376f06953c793b917fcc22a472e1dd0e0f4e8"
+    },
+    "europe/quality/q1/postal_vertices.bin": {
+      "size_zst": 15481560,
+      "size_raw": 16282380,
+      "sha256": "153e16ade7156ee357f98ad1b26a30f1adec7b4540b789d022c5d5d345311192"
+    },
+    "europe/quality/q2.5/admin_polygons.bin": {
+      "size_zst": 5249854,
+      "size_raw": 12021600,
+      "sha256": "25b9fddc02a89c01c7af6f9bec598f21840584fc52bac23d016ac69e8628e154"
+    },
+    "europe/quality/q2.5/admin_vertices.bin": {
+      "size_zst": 85700245,
+      "size_raw": 93006820,
+      "sha256": "c2957d8bc57874c7959ad03bc09850906d1fac39d02dd24d862aae92b713c432"
+    },
+    "europe/quality/q2.5/postal_polygons.bin": {
+      "size_zst": 273185,
+      "size_raw": 627840,
+      "sha256": "07417c4cb67b62d89ee8607d9cba06287860a3ae605003b3d93b5e304255a041"
+    },
+    "europe/quality/q2.5/postal_vertices.bin": {
+      "size_zst": 8891271,
+      "size_raw": 9391988,
+      "sha256": "17c8e545155a6ec42ed151e59efb8907bc1b406bb2ea9fd4d679c0d3721b4ce5"
+    },
+    "europe/quality/q2/admin_polygons.bin": {
+      "size_zst": 5294371,
+      "size_raw": 12021600,
+      "sha256": "02143c0567bddc7eb0e9a45faa25e130c1366d7b204d0e510dd9544c9fc63169"
+    },
+    "europe/quality/q2/admin_vertices.bin": {
+      "size_zst": 98350424,
+      "size_raw": 106418024,
+      "sha256": "f68d61c3632ca89104ebaa4913e0e7c2f09a197fa811c8a1ba41828c6e5c9b53"
+    },
+    "europe/quality/q2/postal_polygons.bin": {
+      "size_zst": 271917,
+      "size_raw": 627840,
+      "sha256": "216745801cda99dedd1f568eb5d0566d55251c020ee6c78a8cc8fbd867bf42be"
+    },
+    "europe/quality/q2/postal_vertices.bin": {
+      "size_zst": 10250102,
+      "size_raw": 10811532,
+      "sha256": "63566091570c8f6c5a426a3126c6356554d4248ea713a8b319e2492844a760d0"
+    },
+    "europe/quality/uncapped/admin_polygons.bin": {
+      "size_zst": 5830037,
+      "size_raw": 12021600,
+      "sha256": "9e1f96a6a6452bd2e78da191ec9ce7dedda1ec81f72d9207f4a684b5f74c002b"
+    },
+    "europe/quality/uncapped/admin_vertices.bin": {
+      "size_zst": 638085532,
+      "size_raw": 732992708,
+      "sha256": "4b1f0db4d057059631772224b2dbd7ef8b43661372140b1109bad261ef70f707"
+    },
+    "europe/quality/uncapped/postal_polygons.bin": {
+      "size_zst": 303244,
+      "size_raw": 627840,
+      "sha256": "95d3b143585bd5de7abcdd49af75f532988682e9c301fe7fa0652754903864de"
+    },
+    "europe/quality/uncapped/postal_vertices.bin": {
+      "size_zst": 62770536,
+      "size_raw": 68506460,
+      "sha256": "885c57489ceb3e225f341486a9a49994eb0f1c0a62f9c50e2ca2817ffda3502d"
+    },
+    "north-america/admin/admin_cells.bin": {
+      "size_zst": 1104413,
+      "size_raw": 4474944,
+      "sha256": "5d015ab55282973caa6cb01fb05ade5065495c5db194cd86d8033ff9796752f1"
+    },
+    "north-america/admin/admin_entries.bin": {
+      "size_zst": 857762,
+      "size_raw": 7559716,
+      "sha256": "9270931536a618f8e45d116bb6af0aacc9bc49f2bf6dda91193609ac613e7691"
+    },
+    "north-america/admin/place_cells.bin": {
+      "size_zst": 253596,
+      "size_raw": 906240,
+      "sha256": "e1fd571ad44c65e3b6e85399f93b23de5c9a18f9cb74754b81ba47e47fa108d0"
+    },
+    "north-america/admin/place_entries.bin": {
+      "size_zst": 789624,
+      "size_raw": 1197144,
+      "sha256": "ecba635fec57e07314b97401ac9cbbc8a644462a979e46b2b3b7bd1b435e6033"
+    },
+    "north-america/admin/place_nodes.bin": {
+      "size_zst": 2902867,
+      "size_raw": 5230520,
+      "sha256": "6d826421dc5555bd8eaadf46f79e590c670c741b25516c6efea972486aa9ec2d"
+    },
+    "north-america/admin/postcode_centroid_cells.bin": {
+      "size_zst": 122365,
+      "size_raw": 421488,
+      "sha256": "b7fea32611c01bef2002556a2f8e257b8339bf9cc868317adf2ea115e1812d54"
+    },
+    "north-america/admin/postcode_centroid_entries.bin": {
+      "size_zst": 1204572,
+      "size_raw": 3408544,
+      "sha256": "cc2db676cdec5f7eda9f6339b801958e2ea11ffbca8d7535b34971ddb2111f94"
+    },
+    "north-america/admin/postcode_centroids.bin": {
+      "size_zst": 4577914,
+      "size_raw": 13353184,
+      "sha256": "6836390713662ea1b19b1f309790d82f2cc71b787ac6c305eba997a195572109"
+    },
+    "north-america/admin/strings_core.bin": {
+      "size_zst": 771216,
+      "size_raw": 2993621,
+      "sha256": "3875cdb33041d7c89921914cf6314db7e604aa5c147ec46251b2abe921d49c90"
+    },
+    "north-america/admin/strings_postcode.bin": {
+      "size_zst": 5559808,
+      "size_raw": 36074786,
+      "sha256": "fe08eb42bd88ab6d2ffdda3f3bfc8eb75be24ad596929f206f89051e012a53c1"
+    },
+    "north-america/full/addr_entries.bin": {
+      "size_zst": 97055197,
+      "size_raw": 200893680,
+      "sha256": "c9e18cbb59dcc1fbc0ec903804d5f21c4bb0d1eeec95dccd205bbe869b3e009c"
+    },
+    "north-america/full/addr_points.bin": {
+      "size_zst": 382990999,
+      "size_raw": 1182698384,
+      "sha256": "ac62c07c7bee25baabd6bdb2f9c94f601610a09a587ae352919e8283f6d9106c"
+    },
+    "north-america/full/addr_postcodes.bin": {
+      "size_zst": 16268043,
+      "size_raw": 168956912,
+      "sha256": "04e0121688de7f20eb45b74bc35b24ff1f06757482a369b9f087855a610d0d98"
+    },
+    "north-america/full/addr_vertices.bin": {
+      "size_zst": 498491638,
+      "size_raw": 1172406786,
+      "sha256": "a0b67ff9ac42fd492a15979cb42c5056df531e1b75f63b6ebd5c0036c7b52f7b"
+    },
+    "north-america/full/admin_cells.bin": {
+      "size_zst": 1104413,
+      "size_raw": 4474944,
+      "sha256": "5d015ab55282973caa6cb01fb05ade5065495c5db194cd86d8033ff9796752f1"
+    },
+    "north-america/full/admin_entries.bin": {
+      "size_zst": 857762,
+      "size_raw": 7559716,
+      "sha256": "9270931536a618f8e45d116bb6af0aacc9bc49f2bf6dda91193609ac613e7691"
+    },
+    "north-america/full/admin_parents.bin": {
+      "size_zst": 217677,
+      "size_raw": 508204,
+      "sha256": "556b81c05ab73891ec5f4e40d7e5f43feff0d6d04ca4491312ce83ae768838ea"
+    },
+    "north-america/full/geo_cells.bin": {
+      "size_zst": 778171388,
+      "size_raw": 3349958780,
+      "sha256": "ff944ddd02c81970e2413d2307b75b2216e9da3f7a0500888e0169f9dc912edc"
+    },
+    "north-america/full/interp_entries.bin": {
+      "size_zst": 206526676,
+      "size_raw": 867671760,
+      "sha256": "8811ca8ac7759f980f77648c3fbb149a25d71642fcb02f0a711b469a4713f962"
+    },
+    "north-america/full/interp_nodes.bin": {
+      "size_zst": 705823651,
+      "size_raw": 1803193472,
+      "sha256": "8d69570f782a12246372c4cc2cefd5b344f980ca421282843bc8227619833f48"
+    },
+    "north-america/full/interp_ways.bin": {
+      "size_zst": 176160306,
+      "size_raw": 814711632,
+      "sha256": "0c16d4b4560f43ef5d2cade0300bd5ab4528d15724f15e0d4791f61f3ad8a379"
+    },
+    "north-america/full/place_cells.bin": {
+      "size_zst": 253596,
+      "size_raw": 906240,
+      "sha256": "e1fd571ad44c65e3b6e85399f93b23de5c9a18f9cb74754b81ba47e47fa108d0"
+    },
+    "north-america/full/place_entries.bin": {
+      "size_zst": 789624,
+      "size_raw": 1197144,
+      "sha256": "ecba635fec57e07314b97401ac9cbbc8a644462a979e46b2b3b7bd1b435e6033"
+    },
+    "north-america/full/place_nodes.bin": {
+      "size_zst": 2902867,
+      "size_raw": 5230520,
+      "sha256": "6d826421dc5555bd8eaadf46f79e590c670c741b25516c6efea972486aa9ec2d"
+    },
+    "north-america/full/postcode_centroid_cells.bin": {
+      "size_zst": 122365,
+      "size_raw": 421488,
+      "sha256": "b7fea32611c01bef2002556a2f8e257b8339bf9cc868317adf2ea115e1812d54"
+    },
+    "north-america/full/postcode_centroid_entries.bin": {
+      "size_zst": 1204572,
+      "size_raw": 3408544,
+      "sha256": "cc2db676cdec5f7eda9f6339b801958e2ea11ffbca8d7535b34971ddb2111f94"
+    },
+    "north-america/full/postcode_centroids.bin": {
+      "size_zst": 4577914,
+      "size_raw": 13353184,
+      "sha256": "6836390713662ea1b19b1f309790d82f2cc71b787ac6c305eba997a195572109"
+    },
+    "north-america/full/street_entries.bin": {
+      "size_zst": 153784220,
+      "size_raw": 978426262,
+      "sha256": "9785940ec4575b9c3b8862edafbc985763a9de13107ab8c3a7e093f20d64fd08"
+    },
+    "north-america/full/street_nodes.bin": {
+      "size_zst": 714790558,
+      "size_raw": 1694023000,
+      "sha256": "db1609e58818ce7bb68f8b6167361d44666ec34938484abadd02196ea3c8578d"
+    },
+    "north-america/full/street_ways.bin": {
+      "size_zst": 41091433,
+      "size_raw": 193972104,
+      "sha256": "2c866df6dfb36396ba78fd969fc31e59368b5873f54912e6b8fcbdd1acaf912a"
+    },
+    "north-america/full/strings_addr.bin": {
+      "size_zst": 892050,
+      "size_raw": 4074659,
+      "sha256": "ff74aac61f854dcda819209ea11899082d8b3b9842bfd883376db22644cf9b01"
+    },
+    "north-america/full/strings_core.bin": {
+      "size_zst": 771216,
+      "size_raw": 2993621,
+      "sha256": "3875cdb33041d7c89921914cf6314db7e604aa5c147ec46251b2abe921d49c90"
+    },
+    "north-america/full/strings_postcode.bin": {
+      "size_zst": 5559808,
+      "size_raw": 36074786,
+      "sha256": "fe08eb42bd88ab6d2ffdda3f3bfc8eb75be24ad596929f206f89051e012a53c1"
+    },
+    "north-america/full/strings_street.bin": {
+      "size_zst": 14557107,
+      "size_raw": 76781463,
+      "sha256": "c207af83844bb93783cda54e5526d48aa048e552c3f6516856d2b261a5887dff"
+    },
+    "north-america/full/way_parents.bin": {
+      "size_zst": 22739693,
+      "size_raw": 64657368,
+      "sha256": "828ebe8f0666b0709752d18b5a0110348b5a3d8ae05a410a589f18fba66607ac"
+    },
+    "north-america/full/way_postcodes.bin": {
+      "size_zst": 525649,
+      "size_raw": 64657368,
+      "sha256": "7a9b9504d43967b180c292e1855413ff1a095f063f73ee8f6bc94409185ea874"
+    },
+    "north-america/no-addresses/admin_cells.bin": {
+      "size_zst": 1104413,
+      "size_raw": 4474944,
+      "sha256": "5d015ab55282973caa6cb01fb05ade5065495c5db194cd86d8033ff9796752f1"
+    },
+    "north-america/no-addresses/admin_entries.bin": {
+      "size_zst": 857762,
+      "size_raw": 7559716,
+      "sha256": "9270931536a618f8e45d116bb6af0aacc9bc49f2bf6dda91193609ac613e7691"
+    },
+    "north-america/no-addresses/admin_parents.bin": {
+      "size_zst": 217677,
+      "size_raw": 508204,
+      "sha256": "556b81c05ab73891ec5f4e40d7e5f43feff0d6d04ca4491312ce83ae768838ea"
+    },
+    "north-america/no-addresses/geo_cells.bin": {
+      "size_zst": 393116421,
+      "size_raw": 2848951060,
+      "sha256": "be6b62aa402c0466591fb23220ac20940ad2374dc5e144677df1bfb9035220ef"
+    },
+    "north-america/no-addresses/place_cells.bin": {
+      "size_zst": 253596,
+      "size_raw": 906240,
+      "sha256": "e1fd571ad44c65e3b6e85399f93b23de5c9a18f9cb74754b81ba47e47fa108d0"
+    },
+    "north-america/no-addresses/place_entries.bin": {
+      "size_zst": 789624,
+      "size_raw": 1197144,
+      "sha256": "ecba635fec57e07314b97401ac9cbbc8a644462a979e46b2b3b7bd1b435e6033"
+    },
+    "north-america/no-addresses/place_nodes.bin": {
+      "size_zst": 2902867,
+      "size_raw": 5230520,
+      "sha256": "6d826421dc5555bd8eaadf46f79e590c670c741b25516c6efea972486aa9ec2d"
+    },
+    "north-america/no-addresses/postcode_centroid_cells.bin": {
+      "size_zst": 122365,
+      "size_raw": 421488,
+      "sha256": "b7fea32611c01bef2002556a2f8e257b8339bf9cc868317adf2ea115e1812d54"
+    },
+    "north-america/no-addresses/postcode_centroid_entries.bin": {
+      "size_zst": 1204572,
+      "size_raw": 3408544,
+      "sha256": "cc2db676cdec5f7eda9f6339b801958e2ea11ffbca8d7535b34971ddb2111f94"
+    },
+    "north-america/no-addresses/postcode_centroids.bin": {
+      "size_zst": 4577914,
+      "size_raw": 13353184,
+      "sha256": "6836390713662ea1b19b1f309790d82f2cc71b787ac6c305eba997a195572109"
+    },
+    "north-america/no-addresses/street_entries.bin": {
+      "size_zst": 153784220,
+      "size_raw": 978426262,
+      "sha256": "9785940ec4575b9c3b8862edafbc985763a9de13107ab8c3a7e093f20d64fd08"
+    },
+    "north-america/no-addresses/street_nodes.bin": {
+      "size_zst": 714790558,
+      "size_raw": 1694023000,
+      "sha256": "db1609e58818ce7bb68f8b6167361d44666ec34938484abadd02196ea3c8578d"
+    },
+    "north-america/no-addresses/street_ways.bin": {
+      "size_zst": 41091433,
+      "size_raw": 193972104,
+      "sha256": "2c866df6dfb36396ba78fd969fc31e59368b5873f54912e6b8fcbdd1acaf912a"
+    },
+    "north-america/no-addresses/strings_core.bin": {
+      "size_zst": 771216,
+      "size_raw": 2993621,
+      "sha256": "3875cdb33041d7c89921914cf6314db7e604aa5c147ec46251b2abe921d49c90"
+    },
+    "north-america/no-addresses/strings_postcode.bin": {
+      "size_zst": 5559808,
+      "size_raw": 36074786,
+      "sha256": "fe08eb42bd88ab6d2ffdda3f3bfc8eb75be24ad596929f206f89051e012a53c1"
+    },
+    "north-america/no-addresses/strings_street.bin": {
+      "size_zst": 14557107,
+      "size_raw": 76781463,
+      "sha256": "c207af83844bb93783cda54e5526d48aa048e552c3f6516856d2b261a5887dff"
+    },
+    "north-america/no-addresses/way_parents.bin": {
+      "size_zst": 22739693,
+      "size_raw": 64657368,
+      "sha256": "828ebe8f0666b0709752d18b5a0110348b5a3d8ae05a410a589f18fba66607ac"
+    },
+    "north-america/no-addresses/way_postcodes.bin": {
+      "size_zst": 525649,
+      "size_raw": 64657368,
+      "sha256": "7a9b9504d43967b180c292e1855413ff1a095f063f73ee8f6bc94409185ea874"
+    },
+    "north-america/poi/all/poi_cells.bin": {
+      "size_zst": 770859,
+      "size_raw": 2667216,
+      "sha256": "f171eefa5c7c9c6fdb6c53fa95693b79a8e2223c31f4df4d572b612f32937d66"
+    },
+    "north-america/poi/all/poi_entries.bin": {
+      "size_zst": 12338708,
+      "size_raw": 17563416,
+      "sha256": "2128ad141e2a3ec95e6b37ddce8134f77fb3003f78b883764ceab8268cdd2945"
+    },
+    "north-america/poi/all/poi_records.bin": {
+      "size_zst": 63427810,
+      "size_raw": 145206144,
+      "sha256": "9394bf0b6b94e37c84769fa778e87b380e1df126e8a084fed873941b9925ac51"
+    },
+    "north-america/poi/all/poi_vertices.bin": {
+      "size_zst": 133499926,
+      "size_raw": 181028950,
+      "sha256": "65d301c32080357996f2fc9238c93e4549113a4e404d347d4c69b0a00df0551d"
+    },
+    "north-america/poi/all/strings_poi.bin": {
+      "size_zst": 13117322,
+      "size_raw": 57086599,
+      "sha256": "a7898657bab2f484f0bb0c2d394cce2e7f005aa61a6c02b30ed779193b51bebc"
+    },
+    "north-america/poi/major/poi_cells.bin": {
+      "size_zst": 459690,
+      "size_raw": 1684236,
+      "sha256": "750e72d12a9c797661c9ace642df557400be934fc009220622c6980865b36848"
+    },
+    "north-america/poi/major/poi_entries.bin": {
+      "size_zst": 706505,
+      "size_raw": 1860906,
+      "sha256": "9319130d260e8ad3e66a2a66ea99e41a83db529def2567d2afbaa666eed453d1"
+    },
+    "north-america/poi/major/poi_records.bin": {
+      "size_zst": 3543547,
+      "size_raw": 8615880,
+      "sha256": "3454e1c8a0e6ec64bf7c1af179b7d5d18eda0a9c975ee7de6aa1c810b83fd503"
+    },
+    "north-america/poi/major/poi_vertices.bin": {
+      "size_zst": 20443269,
+      "size_raw": 24061702,
+      "sha256": "08e95e0a0e7bc71c4364e6e23553c03188621688296ffaa95728ce78152b6514"
+    },
+    "north-america/poi/major/strings_poi.bin": {
+      "size_zst": 13117322,
+      "size_raw": 57086599,
+      "sha256": "a7898657bab2f484f0bb0c2d394cce2e7f005aa61a6c02b30ed779193b51bebc"
+    },
+    "north-america/poi/notable/poi_cells.bin": {
+      "size_zst": 594462,
+      "size_raw": 2116488,
+      "sha256": "27dcb0fb278972e2138ead73c7643fca7fdf445c0cc815747fe968c553d80ada"
+    },
+    "north-america/poi/notable/poi_entries.bin": {
+      "size_zst": 2284243,
+      "size_raw": 4111012,
+      "sha256": "04e1240352edb010d0a028e407690ffe6581a4bce8b5399016d2c66c09581909"
+    },
+    "north-america/poi/notable/poi_records.bin": {
+      "size_zst": 12253975,
+      "size_raw": 26724240,
+      "sha256": "750a4df77dd593147a91d3074f20dddaf635db646638dbdece6c475a09b48c42"
+    },
+    "north-america/poi/notable/poi_vertices.bin": {
+      "size_zst": 49715479,
+      "size_raw": 61321330,
+      "sha256": "86f51396cbd7a20ba73d0d2f61fc38548d9c4da9314cabc968bab766972d9af9"
+    },
+    "north-america/poi/notable/strings_poi.bin": {
+      "size_zst": 13117322,
+      "size_raw": 57086599,
+      "sha256": "a7898657bab2f484f0bb0c2d394cce2e7f005aa61a6c02b30ed779193b51bebc"
+    },
+    "north-america/quality/q0.2/admin_polygons.bin": {
+      "size_zst": 1380007,
+      "size_raw": 3049224,
+      "sha256": "73839ba417931803230269be9f6ed02057afbefed75b529b208fae3029a043ba"
+    },
+    "north-america/quality/q0.2/admin_vertices.bin": {
+      "size_zst": 67263145,
+      "size_raw": 74803298,
+      "sha256": "92208658e6e888d03ea8e95d423e8edc45d48a99e2ac735618b1640c27377ab8"
+    },
+    "north-america/quality/q0.2/postal_polygons.bin": {
+      "size_zst": 20063,
+      "size_raw": 49656,
+      "sha256": "53095fd13a05f1c2c063607078c4e0c48777881e7f2d3e42c09bcf710119bfb8"
+    },
+    "north-america/quality/q0.2/postal_vertices.bin": {
+      "size_zst": 1596029,
+      "size_raw": 1805910,
+      "sha256": "bb62e15ff73e21ef69b4cd9927bee4a7b0d6ea2640d977ceeb2a0dec086b440e"
+    },
+    "north-america/quality/q0.5/admin_polygons.bin": {
+      "size_zst": 1358415,
+      "size_raw": 3049224,
+      "sha256": "287022dbf7c3c60c458675abb3ec1469c45aa2593ed9cd51f173e0b1d8c5d6c2"
+    },
+    "north-america/quality/q0.5/admin_vertices.bin": {
+      "size_zst": 45462593,
+      "size_raw": 49952670,
+      "sha256": "4cfbe21b16f0f670a61f5f5fced8ba2155743a327beee63bd03c0fb0c0c46afe"
+    },
+    "north-america/quality/q0.5/postal_polygons.bin": {
+      "size_zst": 20737,
+      "size_raw": 49656,
+      "sha256": "15ae9bd09f0ba3b444e45ddbe8dabb384d27b52dc384a998b8c4ca3198f08ac2"
+    },
+    "north-america/quality/q0.5/postal_vertices.bin": {
+      "size_zst": 1013988,
+      "size_raw": 1112898,
+      "sha256": "ccfe42b0511806cc278cfe4ef8f8ea6c4424f1a4f6aee856416b4d54e5ad4cf6"
+    },
+    "north-america/quality/q1.5/admin_polygons.bin": {
+      "size_zst": 1317896,
+      "size_raw": 3049224,
+      "sha256": "c29537c79c1df81722505a8ba6c62cc14ee3ccf41768cfb8140bfb2807881f20"
+    },
+    "north-america/quality/q1.5/admin_vertices.bin": {
+      "size_zst": 26458864,
+      "size_raw": 29075798,
+      "sha256": "eba272f20b8d1bc0a04c66fc0ad50374d9f27906365209ce28279c94bdfdcf3f"
+    },
+    "north-america/quality/q1.5/postal_polygons.bin": {
+      "size_zst": 18623,
+      "size_raw": 49656,
+      "sha256": "4208dac036b3e05fb2c7449caf37d61d027c3534f6882529636a055840e278ed"
+    },
+    "north-america/quality/q1.5/postal_vertices.bin": {
+      "size_zst": 561826,
+      "size_raw": 605462,
+      "sha256": "6a005e748e95aeb3feee39bb2a8e89b4ea4d94515ab7135535f7d3c3b4da5feb"
+    },
+    "north-america/quality/q1/admin_polygons.bin": {
+      "size_zst": 1338729,
+      "size_raw": 3049224,
+      "sha256": "85372b8e57dcf5bb2c56366499188da0212680393906319ff5b47bc4557f7c4c"
+    },
+    "north-america/quality/q1/admin_vertices.bin": {
+      "size_zst": 32537756,
+      "size_raw": 35720826,
+      "sha256": "e5579d5af6e30a5c8edcf07fa01ae10bbab60fb00a47f586e56f0f1cc102059d"
+    },
+    "north-america/quality/q1/postal_polygons.bin": {
+      "size_zst": 20289,
+      "size_raw": 49656,
+      "sha256": "33d95162a934f31ce65d81e4fa948a97e0f1e8b76d3a79abfe9fefab2ed5cb80"
+    },
+    "north-america/quality/q1/postal_vertices.bin": {
+      "size_zst": 705749,
+      "size_raw": 763138,
+      "sha256": "147e3542a1c3ce9addba27dc553e32f9e2bfe04ce0b9385ebbeea460f3aeb262"
+    },
+    "north-america/quality/q2.5/admin_polygons.bin": {
+      "size_zst": 1303546,
+      "size_raw": 3049224,
+      "sha256": "0822f8f73f2ec192b4e3e94bf48e7c5b302ff5b2cbc7269348a0829cacd7b8b5"
+    },
+    "north-america/quality/q2.5/admin_vertices.bin": {
+      "size_zst": 20110529,
+      "size_raw": 22156606,
+      "sha256": "e8d9e5d17980a88dafc430313b3e02087a3b4b3715032bc07be254a9f85c460c"
+    },
+    "north-america/quality/q2.5/postal_polygons.bin": {
+      "size_zst": 18196,
+      "size_raw": 49656,
+      "sha256": "b2d16e14c223d44a5d3a3ca1e7d261af0a516f4750c73f30a5c4b36b86ecaeee"
+    },
+    "north-america/quality/q2.5/postal_vertices.bin": {
+      "size_zst": 412826,
+      "size_raw": 443578,
+      "sha256": "a4b190bc3ddc832d9dc273f3ca77514edd460f3a73123168a66ffbefca9ba34f"
+    },
+    "north-america/quality/q2/admin_polygons.bin": {
+      "size_zst": 1312858,
+      "size_raw": 3049224,
+      "sha256": "f46a487b7a28f22136469c47d999b7492e72e95408ccdc36bb848fad399a83f3"
+    },
+    "north-america/quality/q2/admin_vertices.bin": {
+      "size_zst": 22711952,
+      "size_raw": 24988118,
+      "sha256": "5827158a9f25a8159125aa6ac0597245dd432e145189150cb7b56b186910937d"
+    },
+    "north-america/quality/q2/postal_polygons.bin": {
+      "size_zst": 19844,
+      "size_raw": 49656,
+      "sha256": "d523efe754f3f60627c32905fb2651cc4e80168255fe3b6a00b51ff279dd5ae3"
+    },
+    "north-america/quality/q2/postal_vertices.bin": {
+      "size_zst": 473325,
+      "size_raw": 509494,
+      "sha256": "af75020e07705b07a334e789ae9ba39c3b042d0c84b623122e7fe5401e88a2c4"
+    },
+    "north-america/quality/uncapped/admin_polygons.bin": {
+      "size_zst": 1402532,
+      "size_raw": 3049224,
+      "sha256": "220b6a729c002ffcbdf2a3e6e5a3008cd532d1525b1d72c9eee63a58c40b647b"
+    },
+    "north-america/quality/uncapped/admin_vertices.bin": {
+      "size_zst": 130995030,
+      "size_raw": 155984818,
+      "sha256": "0e56a206e78ea6ef1d15abe4d5c6295aec1fd4acd3923c499c66a53de5dfab3e"
+    },
+    "north-america/quality/uncapped/postal_polygons.bin": {
+      "size_zst": 22438,
+      "size_raw": 49656,
+      "sha256": "0394a96325381b9f6318ef13ea8093b1e4c884a77a4077aa32e385097119b07b"
+    },
+    "north-america/quality/uncapped/postal_vertices.bin": {
+      "size_zst": 3414664,
+      "size_raw": 4278338,
+      "sha256": "1857a9c7a6e19c9f89cf8c2a2e0908677586e6f2a41ea98ebcf32b91792e6c94"
+    },
+    "oceania/admin/admin_cells.bin": {
+      "size_zst": 692300,
+      "size_raw": 2531028,
+      "sha256": "ebbaadab865dc578f73c6d84b047550210510beac66008df2e48d204c63bdd06"
+    },
+    "oceania/admin/admin_entries.bin": {
+      "size_zst": 318909,
+      "size_raw": 3887602,
+      "sha256": "73a419ff5ce77739c33732c730b40dcc6e418e78e82d4e782e2d048524abb9ce"
+    },
+    "oceania/admin/place_cells.bin": {
+      "size_zst": 48053,
+      "size_raw": 165564,
+      "sha256": "0d4e41baf14d64d4cc63286fa562749dcc80daf1c00c51e365c00462855f2404"
+    },
+    "oceania/admin/place_entries.bin": {
+      "size_zst": 101360,
+      "size_raw": 175034,
+      "sha256": "20031c8848e30d8b63b031098c27a4e530614f2c1e17ce128b9e63a32467ea54"
+    },
+    "oceania/admin/place_nodes.bin": {
+      "size_zst": 422549,
+      "size_raw": 737200,
+      "sha256": "16b768c47c7796acea7729d8d7d85a03445c3881baf42211d83f1508da666a4d"
+    },
+    "oceania/admin/postcode_centroid_cells.bin": {
+      "size_zst": 12202,
+      "size_raw": 34104,
+      "sha256": "44b561250664591542ace1afbfb439d8faff3c46bf15fb5402c0d9fdb9f9e23f"
+    },
+    "oceania/admin/postcode_centroid_entries.bin": {
+      "size_zst": 11434,
+      "size_raw": 22996,
+      "sha256": "23e238cb9382080cdd328a8902084228d8566762d4b8c6c56491e6092da82bb6"
+    },
+    "oceania/admin/postcode_centroids.bin": {
+      "size_zst": 38738,
+      "size_raw": 69248,
+      "sha256": "6ed4a738acb00a04abdc7ff3ea1d11367f32b1b01664ccacaffc9d2a44400ea3"
+    },
+    "oceania/admin/strings_core.bin": {
+      "size_zst": 163106,
+      "size_raw": 487488,
+      "sha256": "25a0cd303f0790c52a664825a90d26cdaa5768a9f8a76b11d3ada7d0501cbf50"
+    },
+    "oceania/admin/strings_postcode.bin": {
+      "size_zst": 5701362,
+      "size_raw": 36022709,
+      "sha256": "b498dee0061b510b18025f80555eab1b59005e7d3bd6327be0a4a241a6ec5002"
+    },
+    "oceania/full/addr_entries.bin": {
+      "size_zst": 13554496,
+      "size_raw": 30082748,
+      "sha256": "349bd362eec537308da494b1700db48e8640ab670fee8e6597547d349f5afd3b"
+    },
+    "oceania/full/addr_points.bin": {
+      "size_zst": 45376822,
+      "size_raw": 182926016,
+      "sha256": "c720fa23d20c6575f93f2e2e6a331b188bb818010e0f8495cf1f288c6403a57f"
+    },
+    "oceania/full/addr_postcodes.bin": {
+      "size_zst": 1007153,
+      "size_raw": 26132288,
+      "sha256": "02ddacbab970460f7d4a7fab1caa65da0a154ed1583e11fc69dee4febc7049aa"
+    },
+    "oceania/full/addr_vertices.bin": {
+      "size_zst": 18351705,
+      "size_raw": 43091150,
+      "sha256": "fa2f3400d07d1b41cdab86c7804b3487b3612062742839085864a95fb4e8734d"
+    },
+    "oceania/full/admin_cells.bin": {
+      "size_zst": 692300,
+      "size_raw": 2531028,
+      "sha256": "ebbaadab865dc578f73c6d84b047550210510beac66008df2e48d204c63bdd06"
+    },
+    "oceania/full/admin_entries.bin": {
+      "size_zst": 318909,
+      "size_raw": 3887602,
+      "sha256": "73a419ff5ce77739c33732c730b40dcc6e418e78e82d4e782e2d048524abb9ce"
+    },
+    "oceania/full/admin_parents.bin": {
+      "size_zst": 50692,
+      "size_raw": 153808,
+      "sha256": "5422ef8d8d3a0dfd5164f3a6d561af19206de09c816e9bf4d45505f0e02ab2d7"
+    },
+    "oceania/full/geo_cells.bin": {
+      "size_zst": 64577575,
+      "size_raw": 407258900,
+      "sha256": "641f3221687d4938c851a36a32503dda75a7b54d1257fa82fc076fab99ff07d5"
+    },
+    "oceania/full/interp_entries.bin": {
+      "size_zst": 32111,
+      "size_raw": 97824,
+      "sha256": "3ff3b66abf1b5d3897a8695b2b44f32f2736bca2f0446ad2ab3c9b92baa27020"
+    },
+    "oceania/full/interp_nodes.bin": {
+      "size_zst": 140502,
+      "size_raw": 339456,
+      "sha256": "a0c6f288815729df35002b70d649f889ab118f03ae6193b5fc79c4283ecf10a2"
+    },
+    "oceania/full/interp_ways.bin": {
+      "size_zst": 44731,
+      "size_raw": 178536,
+      "sha256": "1ce448a1800f53a174318f788390c7c939bb5d89e6d8235eeaf69c2e93a622af"
+    },
+    "oceania/full/place_cells.bin": {
+      "size_zst": 48053,
+      "size_raw": 165564,
+      "sha256": "0d4e41baf14d64d4cc63286fa562749dcc80daf1c00c51e365c00462855f2404"
+    },
+    "oceania/full/place_entries.bin": {
+      "size_zst": 101360,
+      "size_raw": 175034,
+      "sha256": "20031c8848e30d8b63b031098c27a4e530614f2c1e17ce128b9e63a32467ea54"
+    },
+    "oceania/full/place_nodes.bin": {
+      "size_zst": 422549,
+      "size_raw": 737200,
+      "sha256": "16b768c47c7796acea7729d8d7d85a03445c3881baf42211d83f1508da666a4d"
+    },
+    "oceania/full/postcode_centroid_cells.bin": {
+      "size_zst": 12202,
+      "size_raw": 34104,
+      "sha256": "44b561250664591542ace1afbfb439d8faff3c46bf15fb5402c0d9fdb9f9e23f"
+    },
+    "oceania/full/postcode_centroid_entries.bin": {
+      "size_zst": 11434,
+      "size_raw": 22996,
+      "sha256": "23e238cb9382080cdd328a8902084228d8566762d4b8c6c56491e6092da82bb6"
+    },
+    "oceania/full/postcode_centroids.bin": {
+      "size_zst": 38738,
+      "size_raw": 69248,
+      "sha256": "6ed4a738acb00a04abdc7ff3ea1d11367f32b1b01664ccacaffc9d2a44400ea3"
+    },
+    "oceania/full/street_entries.bin": {
+      "size_zst": 13828521,
+      "size_raw": 129803346,
+      "sha256": "18c28c663e1701e621cd0d6a2f83f8eae9a5bb4f5e390b0e5bc6ea6a8feafd1c"
+    },
+    "oceania/full/street_nodes.bin": {
+      "size_zst": 71656516,
+      "size_raw": 168793416,
+      "sha256": "de1d4fe59669d51f6e6bebf1521a68caef17891f5866ffc9d3ccc36e2ba8a396"
+    },
+    "oceania/full/street_ways.bin": {
+      "size_zst": 3643838,
+      "size_raw": 19157988,
+      "sha256": "588811a2925b74167fa9af065edf1b0fd5a0d4d82182abad3f5e60cdb5d7b6a6"
+    },
+    "oceania/full/strings_addr.bin": {
+      "size_zst": 122542,
+      "size_raw": 479176,
+      "sha256": "c8762d399629a72e958db5924e8b33d3881d7d2d3323117e71253cba6d1d94e3"
+    },
+    "oceania/full/strings_core.bin": {
+      "size_zst": 163106,
+      "size_raw": 487488,
+      "sha256": "25a0cd303f0790c52a664825a90d26cdaa5768a9f8a76b11d3ada7d0501cbf50"
+    },
+    "oceania/full/strings_postcode.bin": {
+      "size_zst": 5701362,
+      "size_raw": 36022709,
+      "sha256": "b498dee0061b510b18025f80555eab1b59005e7d3bd6327be0a4a241a6ec5002"
+    },
+    "oceania/full/strings_street.bin": {
+      "size_zst": 1216893,
+      "size_raw": 5423040,
+      "sha256": "2ab4db7371aa24ab1ccd6a8cd424dc8e06258ac443b692a30b559542abbe9a88"
+    },
+    "oceania/full/way_parents.bin": {
+      "size_zst": 1987139,
+      "size_raw": 6385996,
+      "sha256": "e2b16354cf11ad2475d7aebf967cece0bad655da71e8a37cd44b3cbaa3d00c8c"
+    },
+    "oceania/full/way_postcodes.bin": {
+      "size_zst": 236114,
+      "size_raw": 6385996,
+      "sha256": "9895ac1386409b3a3e42cab42129b41eee22ca47b8ec5e65618026204310ad9f"
+    },
+    "oceania/no-addresses/admin_cells.bin": {
+      "size_zst": 692300,
+      "size_raw": 2531028,
+      "sha256": "ebbaadab865dc578f73c6d84b047550210510beac66008df2e48d204c63bdd06"
+    },
+    "oceania/no-addresses/admin_entries.bin": {
+      "size_zst": 318909,
+      "size_raw": 3887602,
+      "sha256": "73a419ff5ce77739c33732c730b40dcc6e418e78e82d4e782e2d048524abb9ce"
+    },
+    "oceania/no-addresses/admin_parents.bin": {
+      "size_zst": 50692,
+      "size_raw": 153808,
+      "sha256": "5422ef8d8d3a0dfd5164f3a6d561af19206de09c816e9bf4d45505f0e02ab2d7"
+    },
+    "oceania/no-addresses/geo_cells.bin": {
+      "size_zst": 54919051,
+      "size_raw": 394517180,
+      "sha256": "23be0a44752bfa84e4ef9ae31e581b4d112be71c607de4a78d0f8913c38bee40"
+    },
+    "oceania/no-addresses/place_cells.bin": {
+      "size_zst": 48053,
+      "size_raw": 165564,
+      "sha256": "0d4e41baf14d64d4cc63286fa562749dcc80daf1c00c51e365c00462855f2404"
+    },
+    "oceania/no-addresses/place_entries.bin": {
+      "size_zst": 101360,
+      "size_raw": 175034,
+      "sha256": "20031c8848e30d8b63b031098c27a4e530614f2c1e17ce128b9e63a32467ea54"
+    },
+    "oceania/no-addresses/place_nodes.bin": {
+      "size_zst": 422549,
+      "size_raw": 737200,
+      "sha256": "16b768c47c7796acea7729d8d7d85a03445c3881baf42211d83f1508da666a4d"
+    },
+    "oceania/no-addresses/postcode_centroid_cells.bin": {
+      "size_zst": 12202,
+      "size_raw": 34104,
+      "sha256": "44b561250664591542ace1afbfb439d8faff3c46bf15fb5402c0d9fdb9f9e23f"
+    },
+    "oceania/no-addresses/postcode_centroid_entries.bin": {
+      "size_zst": 11434,
+      "size_raw": 22996,
+      "sha256": "23e238cb9382080cdd328a8902084228d8566762d4b8c6c56491e6092da82bb6"
+    },
+    "oceania/no-addresses/postcode_centroids.bin": {
+      "size_zst": 38738,
+      "size_raw": 69248,
+      "sha256": "6ed4a738acb00a04abdc7ff3ea1d11367f32b1b01664ccacaffc9d2a44400ea3"
+    },
+    "oceania/no-addresses/street_entries.bin": {
+      "size_zst": 13828521,
+      "size_raw": 129803346,
+      "sha256": "18c28c663e1701e621cd0d6a2f83f8eae9a5bb4f5e390b0e5bc6ea6a8feafd1c"
+    },
+    "oceania/no-addresses/street_nodes.bin": {
+      "size_zst": 71656516,
+      "size_raw": 168793416,
+      "sha256": "de1d4fe59669d51f6e6bebf1521a68caef17891f5866ffc9d3ccc36e2ba8a396"
+    },
+    "oceania/no-addresses/street_ways.bin": {
+      "size_zst": 3643838,
+      "size_raw": 19157988,
+      "sha256": "588811a2925b74167fa9af065edf1b0fd5a0d4d82182abad3f5e60cdb5d7b6a6"
+    },
+    "oceania/no-addresses/strings_core.bin": {
+      "size_zst": 163106,
+      "size_raw": 487488,
+      "sha256": "25a0cd303f0790c52a664825a90d26cdaa5768a9f8a76b11d3ada7d0501cbf50"
+    },
+    "oceania/no-addresses/strings_postcode.bin": {
+      "size_zst": 5701362,
+      "size_raw": 36022709,
+      "sha256": "b498dee0061b510b18025f80555eab1b59005e7d3bd6327be0a4a241a6ec5002"
+    },
+    "oceania/no-addresses/strings_street.bin": {
+      "size_zst": 1216893,
+      "size_raw": 5423040,
+      "sha256": "2ab4db7371aa24ab1ccd6a8cd424dc8e06258ac443b692a30b559542abbe9a88"
+    },
+    "oceania/no-addresses/way_parents.bin": {
+      "size_zst": 1987139,
+      "size_raw": 6385996,
+      "sha256": "e2b16354cf11ad2475d7aebf967cece0bad655da71e8a37cd44b3cbaa3d00c8c"
+    },
+    "oceania/no-addresses/way_postcodes.bin": {
+      "size_zst": 236114,
+      "size_raw": 6385996,
+      "sha256": "9895ac1386409b3a3e42cab42129b41eee22ca47b8ec5e65618026204310ad9f"
+    },
+    "oceania/poi/all/poi_cells.bin": {
+      "size_zst": 661991,
+      "size_raw": 2432076,
+      "sha256": "0793356e5e15cd0cfaeb2f7c66ea3e1d305bcf7fe6808771ee66fec9e0b53279"
+    },
+    "oceania/poi/all/poi_entries.bin": {
+      "size_zst": 1479038,
+      "size_raw": 3511566,
+      "sha256": "df0a19eabbb195d5baf3bfbf648ad41d47a486fc1c28c6e4920d2e24fd1724c0"
+    },
+    "oceania/poi/all/poi_records.bin": {
+      "size_zst": 7856485,
+      "size_raw": 18922356,
+      "sha256": "cc24eba38567278213a27cf3b1b61ec716bff3e86ad15cbe50a71df8260e7a2e"
+    },
+    "oceania/poi/all/poi_vertices.bin": {
+      "size_zst": 16316313,
+      "size_raw": 21239308,
+      "sha256": "fa54c1446b11031e4ed59092c26da68963e465b231585f33bbdb3c9f95875fc6"
+    },
+    "oceania/poi/all/strings_poi.bin": {
+      "size_zst": 2142748,
+      "size_raw": 8548496,
+      "sha256": "88309a49418e67371494663b3038b7115b195542f9075c37f33d5b4be469dfa5"
+    },
+    "oceania/poi/major/poi_cells.bin": {
+      "size_zst": 601070,
+      "size_raw": 2227452,
+      "sha256": "d42c51faae236fef4c993dce442073dd83bff2077b942f7c7fde8e1780efdcb1"
+    },
+    "oceania/poi/major/poi_entries.bin": {
+      "size_zst": 258716,
+      "size_raw": 1614758,
+      "sha256": "145630d9ce70264b994fd01c14b5470af253e6960efb59fe425806cde7ffe212"
+    },
+    "oceania/poi/major/poi_records.bin": {
+      "size_zst": 1171458,
+      "size_raw": 2833308,
+      "sha256": "cc40a7dd011f29949ef39ec3b933a0e34a37dcc86e5cdcc55edbe35d585d7d03"
+    },
+    "oceania/poi/major/poi_vertices.bin": {
+      "size_zst": 6554677,
+      "size_raw": 7425862,
+      "sha256": "6d514f1ddd86194a00eb9cab0fb1bb16f7318d802a421939217bea096e22ff65"
+    },
+    "oceania/poi/major/strings_poi.bin": {
+      "size_zst": 2142748,
+      "size_raw": 8548496,
+      "sha256": "88309a49418e67371494663b3038b7115b195542f9075c37f33d5b4be469dfa5"
+    },
+    "oceania/poi/notable/poi_cells.bin": {
+      "size_zst": 614902,
+      "size_raw": 2272068,
+      "sha256": "d2b7c28c9768934bc08b1d850edc5a552532f7d418c25a3fae56bb8276ca9c5b"
+    },
+    "oceania/poi/notable/poi_entries.bin": {
+      "size_zst": 506727,
+      "size_raw": 1999882,
+      "sha256": "53c7225986909191c9a5cece1d7af6bf449c976c723c50859e2f9b4224d9c5f9"
+    },
+    "oceania/poi/notable/poi_records.bin": {
+      "size_zst": 2666622,
+      "size_raw": 6069096,
+      "sha256": "711cc2415b71bd4a343d0510a6dfe66a7efd66ae1de7a82cd26eadcbaed7cf27"
+    },
+    "oceania/poi/notable/poi_vertices.bin": {
+      "size_zst": 10476734,
+      "size_raw": 12538474,
+      "sha256": "146a7dd711fc878bb44baa58f59ed55517d5ed67f4e9b10e8f11ba308311927b"
+    },
+    "oceania/poi/notable/strings_poi.bin": {
+      "size_zst": 2142748,
+      "size_raw": 8548496,
+      "sha256": "88309a49418e67371494663b3038b7115b195542f9075c37f33d5b4be469dfa5"
+    },
+    "oceania/quality/q0.2/admin_polygons.bin": {
+      "size_zst": 423584,
+      "size_raw": 922848,
+      "sha256": "b528d44b8ce64c28dab490b45f13a7d683eadfc300c3b0d1d956287b06ff9c03"
+    },
+    "oceania/quality/q0.2/admin_vertices.bin": {
+      "size_zst": 29497979,
+      "size_raw": 32850464,
+      "sha256": "6e183135b4833f7592e802d4b831b6de87be90b23cf92f7a3d22f62119878a96"
+    },
+    "oceania/quality/q0.2/postal_polygons.bin": {
+      "size_zst": 2226,
+      "size_raw": 4776,
+      "sha256": "3303360b0a38e72131e6096700bf7a43c25bb4d50877d24da88ec2b536c3d1fb"
+    },
+    "oceania/quality/q0.2/postal_vertices.bin": {
+      "size_zst": 238563,
+      "size_raw": 245574,
+      "sha256": "e406a8d1324066ddf2df65275a899cc8e7f029ea3e43dc6165c2a8824d5fb333"
+    },
+    "oceania/quality/q0.5/admin_polygons.bin": {
+      "size_zst": 414612,
+      "size_raw": 922848,
+      "sha256": "d6598bfa3a5ba3f2531dd86329331dbb6cf3db1c68daf8eed6608fe4d0245d74"
+    },
+    "oceania/quality/q0.5/admin_vertices.bin": {
+      "size_zst": 19935212,
+      "size_raw": 21630120,
+      "sha256": "86d7ac64a53cad2ca0899bc44dd0a109aec1af948ddfaeaf0ad72c1bdb851263"
+    },
+    "oceania/quality/q0.5/postal_polygons.bin": {
+      "size_zst": 2189,
+      "size_raw": 4776,
+      "sha256": "9b1fb1310ecb70e1d48b9fd81aac272cee8e9ef075cae72b6eee419e9a473d85"
+    },
+    "oceania/quality/q0.5/postal_vertices.bin": {
+      "size_zst": 171281,
+      "size_raw": 175394,
+      "sha256": "aa1e1eb45e5e0bb21e9342f8c00823b4d99171d5b0498f16d0505c5c7b056b09"
+    },
+    "oceania/quality/q1.5/admin_polygons.bin": {
+      "size_zst": 402910,
+      "size_raw": 922848,
+      "sha256": "a19c3bc6688dacbdb78f3cae210a04b551af6fead44e31f21a534488b7bce859"
+    },
+    "oceania/quality/q1.5/admin_vertices.bin": {
+      "size_zst": 11403949,
+      "size_raw": 12231860,
+      "sha256": "0b49fa06f353d7be39e57026f3990ba6ec719ca1ef1d3638690c754fb8c38765"
+    },
+    "oceania/quality/q1.5/postal_polygons.bin": {
+      "size_zst": 2163,
+      "size_raw": 4776,
+      "sha256": "18c0899984edaf2b6eda4b6d6940d2174c8ff6cb0288689377a2271e0e35bff7"
+    },
+    "oceania/quality/q1.5/postal_vertices.bin": {
+      "size_zst": 103281,
+      "size_raw": 105898,
+      "sha256": "66ab526cbf3da52de3988dae0b7d9c9b725e69fc1575fa919b1fc23b88efdf2d"
+    },
+    "oceania/quality/q1/admin_polygons.bin": {
+      "size_zst": 412116,
+      "size_raw": 922848,
+      "sha256": "2876a05c4cc2249b0cfdf6f549de21211906e788ae463a567bf32f6016313ad8"
+    },
+    "oceania/quality/q1/admin_vertices.bin": {
+      "size_zst": 14142664,
+      "size_raw": 15199308,
+      "sha256": "f0dc6ee1d8d094bf5ba57f16dd200d4195df71f0af9b29df07b332bdb58fe913"
+    },
+    "oceania/quality/q1/postal_polygons.bin": {
+      "size_zst": 2161,
+      "size_raw": 4776,
+      "sha256": "10446d6d097c64573f9830073cc6a8c7ff6d7057f3b501f1e508387467219adc"
+    },
+    "oceania/quality/q1/postal_vertices.bin": {
+      "size_zst": 126473,
+      "size_raw": 129530,
+      "sha256": "24b5e5f608236322cabcf6d4acba0f68bfbdeedefdab0c2c2e610bb07533c8f3"
+    },
+    "oceania/quality/q2.5/admin_polygons.bin": {
+      "size_zst": 395152,
+      "size_raw": 922848,
+      "sha256": "8f3305e344a7c0a91e13d29e949ed2c1602aa6ccedfef5adf279f7358066e594"
+    },
+    "oceania/quality/q2.5/admin_vertices.bin": {
+      "size_zst": 8589332,
+      "size_raw": 9227800,
+      "sha256": "daf5655a770c8ea8950041189dd2e09bc0e9760802d7fc3db98a953a536f309c"
+    },
+    "oceania/quality/q2.5/postal_polygons.bin": {
+      "size_zst": 2124,
+      "size_raw": 4776,
+      "sha256": "983a8c56f6d059be5efb2cf17a6d2d4ac50e33dc12d50cac2fe7023b228572c5"
+    },
+    "oceania/quality/q2.5/postal_vertices.bin": {
+      "size_zst": 77405,
+      "size_raw": 79534,
+      "sha256": "75e0a9a74d8095344fbabf6038e3ad546d7be009d59eebac2109b3cdb75b2f1c"
+    },
+    "oceania/quality/q2/admin_polygons.bin": {
+      "size_zst": 398865,
+      "size_raw": 922848,
+      "sha256": "85598385d58d7838854ac06d83e0332966b9c1554c0a6c79103bb427d6b31cee"
+    },
+    "oceania/quality/q2/admin_vertices.bin": {
+      "size_zst": 9737507,
+      "size_raw": 10447448,
+      "sha256": "a33975aada816e062cf1021b61f59761908b8f337c5443b633be736f96bc74ba"
+    },
+    "oceania/quality/q2/postal_polygons.bin": {
+      "size_zst": 2132,
+      "size_raw": 4776,
+      "sha256": "d9d6b523ebbf1ab9efdfde388d6012ce92019331510711fac760e6f89b5455df"
+    },
+    "oceania/quality/q2/postal_vertices.bin": {
+      "size_zst": 88028,
+      "size_raw": 90358,
+      "sha256": "4f82a5a97918318ad87b7167c8c29f41c9acfd22ab42d6a39c86654e7b515265"
+    },
+    "oceania/quality/uncapped/admin_polygons.bin": {
+      "size_zst": 427522,
+      "size_raw": 922848,
+      "sha256": "2eebd6223c37fa5ced834791d41c3fb11890b7667aaf196b78434596469cd7c7"
+    },
+    "oceania/quality/uncapped/admin_vertices.bin": {
+      "size_zst": 49173206,
+      "size_raw": 58359588,
+      "sha256": "103482dbfa3db5251ca523606f26e7db44cbd118dd8a7c338fe25dcbdc07de77"
+    },
+    "oceania/quality/uncapped/postal_polygons.bin": {
+      "size_zst": 2229,
+      "size_raw": 4776,
+      "sha256": "3be7f4fc8a4514d99366e1673c83be50eb6aef1899695d72dc6738c2a1f4271b"
+    },
+    "oceania/quality/uncapped/postal_vertices.bin": {
+      "size_zst": 339687,
+      "size_raw": 354286,
+      "sha256": "b9d1642f00c97eab4249c6133e361b625d26a78ad1cca27ef00a56693e3275bd"
+    },
+    "planet/admin/admin_cells.bin": {
+      "size_zst": 6393328,
+      "size_raw": 24807168,
+      "sha256": "31444540797e1a1e63b031fcfb33acc2b2915549d12cedec2ef3ec852628a72a"
+    },
+    "planet/admin/admin_entries.bin": {
+      "size_zst": 6960098,
+      "size_raw": 49010336,
+      "sha256": "30d26d008ef540ff0ff2b1ada5dcfc918531148eca9dbaba91569cb81f0066ac"
+    },
+    "planet/admin/place_cells.bin": {
+      "size_zst": 1834597,
+      "size_raw": 6361656,
+      "sha256": "52df2aea21de90eaf691eeeb5b1aab880ba3ea8115d06fd558911a86187efda6"
+    },
+    "planet/admin/place_entries.bin": {
+      "size_zst": 12796092,
+      "size_raw": 17252728,
+      "sha256": "f9dee83c4b7b6314dcea9d83d0b40a71b2cafed4f14c5a65b0295f1d26e62531"
+    },
+    "planet/admin/place_nodes.bin": {
+      "size_zst": 46455561,
+      "size_raw": 80962260,
+      "sha256": "e63d4a877d7640e9e5682de2dddf61b468572df305c50c2a4f222b97d026f961"
+    },
+    "planet/admin/postcode_centroid_cells.bin": {
+      "size_zst": 494635,
+      "size_raw": 1697232,
+      "sha256": "f1dd87e8d97c45cb7ef5af7a5511bea93e3f7efb16dca9cbdd1b9ebe9a64e36d"
+    },
+    "planet/admin/postcode_centroid_entries.bin": {
+      "size_zst": 5065960,
+      "size_raw": 16731060,
+      "sha256": "e373e1eff45a96b6c886e83c2b908a9d2fb694a4a0d7399b5540a8412ef4f607"
+    },
+    "planet/admin/postcode_centroids.bin": {
+      "size_zst": 25583600,
+      "size_raw": 65792752,
+      "sha256": "20805e61cff418f579468e15bd389a3140f999dac09906ff0360d1820f5432f1"
+    },
+    "planet/admin/strings_core.bin": {
+      "size_zst": 12251213,
+      "size_raw": 45219788,
+      "sha256": "69462095a61dc9c068649e1133bb4f194717f8d2dd90b03bf3153a0c17d12581"
+    },
+    "planet/admin/strings_postcode.bin": {
+      "size_zst": 5694612,
+      "size_raw": 36002206,
+      "sha256": "14e2821cb572477091a840a00e8ee33f0c6f28398697986cc196443b71e4f092"
+    },
+    "planet/full/addr_entries.bin": {
+      "size_zst": 431063956,
+      "size_raw": 828408600,
+      "sha256": "c6772ca955f4afd1076a1240e2e64158bc1b075e69b1084e88ded89b1a0fd9e6"
+    },
+    "planet/full/addr_points.bin": {
+      "size_zst": 1578826421,
+      "size_raw": 4887232112,
+      "sha256": "ea3620b6e4aa9abdcf2a795cb987adbd716f9894b7a50e306ffa675c01c0f903"
+    },
+    "planet/full/addr_postcodes.bin": {
+      "size_zst": 71475362,
+      "size_raw": 698176016,
+      "sha256": "c4b8dfdc49a359c1d5ac167d96ce0fbb35957e7ff42b577f3978b6b9d595a7f7"
+    },
+    "planet/full/addr_vertices.bin": {
+      "size_zst": 1750849955,
+      "size_raw": 3552394492,
+      "sha256": "9b263561e226eb5546e060bde0cd36f387c43147d8cd8f07b6c2a1edcc2375a0"
+    },
+    "planet/full/admin_cells.bin": {
+      "size_zst": 6393328,
+      "size_raw": 24807168,
+      "sha256": "31444540797e1a1e63b031fcfb33acc2b2915549d12cedec2ef3ec852628a72a"
+    },
+    "planet/full/admin_entries.bin": {
+      "size_zst": 6960098,
+      "size_raw": 49010336,
+      "sha256": "30d26d008ef540ff0ff2b1ada5dcfc918531148eca9dbaba91569cb81f0066ac"
+    },
+    "planet/full/admin_parents.bin": {
+      "size_zst": 2237178,
+      "size_raw": 4324628,
+      "sha256": "71cc23fadc5e33388f67bbe6ae2b08530e2db9289c65f793246d321a37141594"
+    },
+    "planet/full/geo_cells.bin": {
+      "size_zst": 1509677740,
+      "size_raw": 7757058240,
+      "sha256": "ba14083ecf941b841a08a4c342b2d19ad9e7f10877f00603ffcd677e2d65bb09"
+    },
+    "planet/full/interp_entries.bin": {
+      "size_zst": 207147357,
+      "size_raw": 869364026,
+      "sha256": "e65f5897183cfc2bcdc6b7a61f6af94f0c0ac56bda567cc61ec628b5a9689e14"
+    },
+    "planet/full/interp_nodes.bin": {
+      "size_zst": 706813980,
+      "size_raw": 1807323016,
+      "sha256": "a4d892f57dd0a2e548b39326122ab15607f2adfe384326813b07e9c2d9787032"
+    },
+    "planet/full/interp_ways.bin": {
+      "size_zst": 176282266,
+      "size_raw": 817792176,
+      "sha256": "e5e0880d8768bec3bf728fca478da5e0facc422c84c9cca65cf6787b1ef19134"
+    },
+    "planet/full/place_cells.bin": {
+      "size_zst": 1834597,
+      "size_raw": 6361656,
+      "sha256": "52df2aea21de90eaf691eeeb5b1aab880ba3ea8115d06fd558911a86187efda6"
+    },
+    "planet/full/place_entries.bin": {
+      "size_zst": 12796092,
+      "size_raw": 17252728,
+      "sha256": "f9dee83c4b7b6314dcea9d83d0b40a71b2cafed4f14c5a65b0295f1d26e62531"
+    },
+    "planet/full/place_nodes.bin": {
+      "size_zst": 46455561,
+      "size_raw": 80962260,
+      "sha256": "e63d4a877d7640e9e5682de2dddf61b468572df305c50c2a4f222b97d026f961"
+    },
+    "planet/full/postcode_centroid_cells.bin": {
+      "size_zst": 494635,
+      "size_raw": 1697232,
+      "sha256": "f1dd87e8d97c45cb7ef5af7a5511bea93e3f7efb16dca9cbdd1b9ebe9a64e36d"
+    },
+    "planet/full/postcode_centroid_entries.bin": {
+      "size_zst": 5065960,
+      "size_raw": 16731060,
+      "sha256": "e373e1eff45a96b6c886e83c2b908a9d2fb694a4a0d7399b5540a8412ef4f607"
+    },
+    "planet/full/postcode_centroids.bin": {
+      "size_zst": 25583600,
+      "size_raw": 65792752,
+      "sha256": "20805e61cff418f579468e15bd389a3140f999dac09906ff0360d1820f5432f1"
+    },
+    "planet/full/street_entries.bin": {
+      "size_zst": 464045759,
+      "size_raw": 2539175284,
+      "sha256": "5f913ec56b2b68bdcc3667a74d3a0b46ace9b4ca914540565d814aaa23fab200"
+    },
+    "planet/full/street_nodes.bin": {
+      "size_zst": 2339707573,
+      "size_raw": 4789693304,
+      "sha256": "c23b98fbfe0a77c062801b6b1cd1d1f1f33d6a7a093649243f63b1d3cbc79fe0"
+    },
+    "planet/full/street_ways.bin": {
+      "size_zst": 128964177,
+      "size_raw": 654400800,
+      "sha256": "328bbef15f64507afbe2993d1cf4bef59cb2c96d0584cc3506965a12f30f2f07"
+    },
+    "planet/full/strings_addr.bin": {
+      "size_zst": 3848831,
+      "size_raw": 16640300,
+      "sha256": "e8e30d3083b80f85757d22c50b4981323b8ad9143504c442302b3e700074d34b"
+    },
+    "planet/full/strings_core.bin": {
+      "size_zst": 12251213,
+      "size_raw": 45219788,
+      "sha256": "69462095a61dc9c068649e1133bb4f194717f8d2dd90b03bf3153a0c17d12581"
+    },
+    "planet/full/strings_postcode.bin": {
+      "size_zst": 5694612,
+      "size_raw": 36002206,
+      "sha256": "14e2821cb572477091a840a00e8ee33f0c6f28398697986cc196443b71e4f092"
+    },
+    "planet/full/strings_street.bin": {
+      "size_zst": 48912830,
+      "size_raw": 241563501,
+      "sha256": "706e7c8a167cc11df2f200b15b3538fefae053a04c438e7a01e79a9285986686"
+    },
+    "planet/full/way_parents.bin": {
+      "size_zst": 77079327,
+      "size_raw": 218133600,
+      "sha256": "a0cfb6b445f14204bbbe4735831e69c44205076e7bbecba81496072f6b9b71d7"
+    },
+    "planet/full/way_postcodes.bin": {
+      "size_zst": 15003028,
+      "size_raw": 218133600,
+      "sha256": "4dd564e727a24e23e627fe31ba28633d75b14c610ea91aec1e16a8b60a2edbc8"
+    },
+    "planet/no-addresses/admin_cells.bin": {
+      "size_zst": 6393328,
+      "size_raw": 24807168,
+      "sha256": "31444540797e1a1e63b031fcfb33acc2b2915549d12cedec2ef3ec852628a72a"
+    },
+    "planet/no-addresses/admin_entries.bin": {
+      "size_zst": 6960098,
+      "size_raw": 49010336,
+      "sha256": "30d26d008ef540ff0ff2b1ada5dcfc918531148eca9dbaba91569cb81f0066ac"
+    },
+    "planet/no-addresses/admin_parents.bin": {
+      "size_zst": 2237178,
+      "size_raw": 4324628,
+      "sha256": "71cc23fadc5e33388f67bbe6ae2b08530e2db9289c65f793246d321a37141594"
+    },
+    "planet/no-addresses/geo_cells.bin": {
+      "size_zst": 969385765,
+      "size_raw": 6986348400,
+      "sha256": "529fbd869679851e6fee440f041cb43c4ac274cc223c4d862db0da9d5da14c2b"
+    },
+    "planet/no-addresses/place_cells.bin": {
+      "size_zst": 1834597,
+      "size_raw": 6361656,
+      "sha256": "52df2aea21de90eaf691eeeb5b1aab880ba3ea8115d06fd558911a86187efda6"
+    },
+    "planet/no-addresses/place_entries.bin": {
+      "size_zst": 12796092,
+      "size_raw": 17252728,
+      "sha256": "f9dee83c4b7b6314dcea9d83d0b40a71b2cafed4f14c5a65b0295f1d26e62531"
+    },
+    "planet/no-addresses/place_nodes.bin": {
+      "size_zst": 46455561,
+      "size_raw": 80962260,
+      "sha256": "e63d4a877d7640e9e5682de2dddf61b468572df305c50c2a4f222b97d026f961"
+    },
+    "planet/no-addresses/postcode_centroid_cells.bin": {
+      "size_zst": 494635,
+      "size_raw": 1697232,
+      "sha256": "f1dd87e8d97c45cb7ef5af7a5511bea93e3f7efb16dca9cbdd1b9ebe9a64e36d"
+    },
+    "planet/no-addresses/postcode_centroid_entries.bin": {
+      "size_zst": 5065960,
+      "size_raw": 16731060,
+      "sha256": "e373e1eff45a96b6c886e83c2b908a9d2fb694a4a0d7399b5540a8412ef4f607"
+    },
+    "planet/no-addresses/postcode_centroids.bin": {
+      "size_zst": 25583600,
+      "size_raw": 65792752,
+      "sha256": "20805e61cff418f579468e15bd389a3140f999dac09906ff0360d1820f5432f1"
+    },
+    "planet/no-addresses/street_entries.bin": {
+      "size_zst": 464045759,
+      "size_raw": 2539175284,
+      "sha256": "5f913ec56b2b68bdcc3667a74d3a0b46ace9b4ca914540565d814aaa23fab200"
+    },
+    "planet/no-addresses/street_nodes.bin": {
+      "size_zst": 2339707573,
+      "size_raw": 4789693304,
+      "sha256": "c23b98fbfe0a77c062801b6b1cd1d1f1f33d6a7a093649243f63b1d3cbc79fe0"
+    },
+    "planet/no-addresses/street_ways.bin": {
+      "size_zst": 128964177,
+      "size_raw": 654400800,
+      "sha256": "328bbef15f64507afbe2993d1cf4bef59cb2c96d0584cc3506965a12f30f2f07"
+    },
+    "planet/no-addresses/strings_core.bin": {
+      "size_zst": 12251213,
+      "size_raw": 45219788,
+      "sha256": "69462095a61dc9c068649e1133bb4f194717f8d2dd90b03bf3153a0c17d12581"
+    },
+    "planet/no-addresses/strings_postcode.bin": {
+      "size_zst": 5694612,
+      "size_raw": 36002206,
+      "sha256": "14e2821cb572477091a840a00e8ee33f0c6f28398697986cc196443b71e4f092"
+    },
+    "planet/no-addresses/strings_street.bin": {
+      "size_zst": 48912830,
+      "size_raw": 241563501,
+      "sha256": "706e7c8a167cc11df2f200b15b3538fefae053a04c438e7a01e79a9285986686"
+    },
+    "planet/no-addresses/way_parents.bin": {
+      "size_zst": 77079327,
+      "size_raw": 218133600,
+      "sha256": "a0cfb6b445f14204bbbe4735831e69c44205076e7bbecba81496072f6b9b71d7"
+    },
+    "planet/no-addresses/way_postcodes.bin": {
+      "size_zst": 15003028,
+      "size_raw": 218133600,
+      "sha256": "4dd564e727a24e23e627fe31ba28633d75b14c610ea91aec1e16a8b60a2edbc8"
+    },
+    "planet/poi/all/poi_cells.bin": {
+      "size_zst": 3841258,
+      "size_raw": 13335756,
+      "sha256": "6a3768f9be62ba8e0e0a60b41df6c82a81d0df6dd1b906d4178bb63c2cd1775f"
+    },
+    "planet/poi/all/poi_entries.bin": {
+      "size_zst": 73121832,
+      "size_raw": 101531602,
+      "sha256": "04583af279b9bdbed1d11fb9105457873802a852422262c99fcf53864df58199"
+    },
+    "planet/poi/all/poi_records.bin": {
+      "size_zst": 392766304,
+      "size_raw": 854659476,
+      "sha256": "ca2ca690b8b92ff91be8b741cce8f064ca0e8ab25651eedc569b7028743acdb9"
+    },
+    "planet/poi/all/poi_vertices.bin": {
+      "size_zst": 534821478,
+      "size_raw": 700105702,
+      "sha256": "39e96f0a8276e3dea61ca8ba258cb2809534992ccb568cae0c931b5504093ceb"
+    },
+    "planet/poi/all/strings_poi.bin": {
+      "size_zst": 96674401,
+      "size_raw": 383652938,
+      "sha256": "41e30b15f91d859ecbfae3f76a5521aa48ed823b9870b5966c44cba1c3f562f6"
+    },
+    "planet/poi/major/poi_cells.bin": {
+      "size_zst": 2368097,
+      "size_raw": 8590332,
+      "sha256": "e6ec82a87af351f9cdf49a9c2e05dad4b6c5b5fb65c1980f7bae008d7bb3902b"
+    },
+    "planet/poi/major/poi_entries.bin": {
+      "size_zst": 2922060,
+      "size_raw": 8056670,
+      "sha256": "080671ceced343488dfd4926d0f6905412d0187f27339a97e0f4ef157d9ed4ca"
+    },
+    "planet/poi/major/poi_records.bin": {
+      "size_zst": 15198376,
+      "size_raw": 32043492,
+      "sha256": "3a8febf27a002cdc08beb580bde8603b20a433760bc259ec7ada5c161032e707"
+    },
+    "planet/poi/major/poi_vertices.bin": {
+      "size_zst": 103103913,
+      "size_raw": 117297360,
+      "sha256": "9aecac8273e78df37568b9f99df325d62814e62c31394ba75c206e36815d4814"
+    },
+    "planet/poi/major/strings_poi.bin": {
+      "size_zst": 96674401,
+      "size_raw": 383652938,
+      "sha256": "41e30b15f91d859ecbfae3f76a5521aa48ed823b9870b5966c44cba1c3f562f6"
+    },
+    "planet/poi/notable/poi_cells.bin": {
+      "size_zst": 2939282,
+      "size_raw": 10482924,
+      "sha256": "49600e2a3287b5089f6fbe94289fae6589acddf5bf0215cd5e995ef3dcfe44d9"
+    },
+    "planet/poi/notable/poi_entries.bin": {
+      "size_zst": 11422235,
+      "size_raw": 19961786,
+      "sha256": "47539c5c2b6155012778950478c1156565d5fc8a07026a069d8223951296df70"
+    },
+    "planet/poi/notable/poi_records.bin": {
+      "size_zst": 64838883,
+      "size_raw": 132349428,
+      "sha256": "ba42ef4da352dea7e2f8fc4c3701313feca8e3f6b8318ee40c241dfb7f889384"
+    },
+    "planet/poi/notable/poi_vertices.bin": {
+      "size_zst": 215970893,
+      "size_raw": 264100724,
+      "sha256": "f593589a0ef7426834b77782c241f0f24f31bbcd495f6d47763dcf08723dc39f"
+    },
+    "planet/poi/notable/strings_poi.bin": {
+      "size_zst": 96674401,
+      "size_raw": 383652938,
+      "sha256": "41e30b15f91d859ecbfae3f76a5521aa48ed823b9870b5966c44cba1c3f562f6"
+    },
+    "planet/quality/q0.2/admin_polygons.bin": {
+      "size_zst": 12118313,
+      "size_raw": 25947768,
+      "sha256": "a5fdf9a1b297023ee824320ba89a539469bcf4058188bfa51288de8b672d1ff7"
+    },
+    "planet/quality/q0.2/admin_vertices.bin": {
+      "size_zst": 733139522,
+      "size_raw": 802463414,
+      "sha256": "5ac34474077a242153360872aad1a31a496d2dafc00aeb6c33151b46502fd2d6"
+    },
+    "planet/quality/q0.2/postal_polygons.bin": {
+      "size_zst": 411456,
+      "size_raw": 888504,
+      "sha256": "c1483ead08c5eb00101c5cf612fcd3bb15e53f6f0f8ae7378f45e8b1637d8fa0"
+    },
+    "planet/quality/q0.2/postal_vertices.bin": {
+      "size_zst": 38287239,
+      "size_raw": 40619482,
+      "sha256": "81b1d76d739ebb320e1670d629093b9e7fec57a415e81272b3993c856db0b1c7"
+    },
+    "planet/quality/q0.5/admin_polygons.bin": {
+      "size_zst": 12051860,
+      "size_raw": 25947768,
+      "sha256": "e0541f013a4763f0dd50c4fb0f30a10b5a6da33f91d5a489def35d12faa4acb6"
+    },
+    "planet/quality/q0.5/admin_vertices.bin": {
+      "size_zst": 503858191,
+      "size_raw": 544609138,
+      "sha256": "32652ba4d7628b4efe537a074b694ec505b4f2eb1c6800d79bb0ad34ace78870"
+    },
+    "planet/quality/q0.5/postal_polygons.bin": {
+      "size_zst": 401717,
+      "size_raw": 888504,
+      "sha256": "61c3697b8333d5a6f09244ce1ac8f0d823f9ffccf9c37d8b5eb4f473eb9c11c7"
+    },
+    "planet/quality/q0.5/postal_vertices.bin": {
+      "size_zst": 25675091,
+      "size_raw": 27092058,
+      "sha256": "3fbd8d104d994e3dd4d6f893b456dd5395844b726e96281dc16cec6fdc2cfe4c"
+    },
+    "planet/quality/q1.5/admin_polygons.bin": {
+      "size_zst": 11569605,
+      "size_raw": 25947768,
+      "sha256": "6016f4d1f6f85e912c54f795d87fdec703b6694a48311fc6b5e10d174449812c"
+    },
+    "planet/quality/q1.5/admin_vertices.bin": {
+      "size_zst": 289811722,
+      "size_raw": 311864962,
+      "sha256": "8ce91db4923367cf10fe9adc7b8ac9c4572f3d89f188c586b2a21b3de79724f9"
+    },
+    "planet/quality/q1.5/postal_polygons.bin": {
+      "size_zst": 375919,
+      "size_raw": 888504,
+      "sha256": "1b69b874550569cc5b88745f0ca44735da6cdde2fae890ba42d0c85da67d8b96"
+    },
+    "planet/quality/q1.5/postal_vertices.bin": {
+      "size_zst": 14221542,
+      "size_raw": 15015450,
+      "sha256": "da3333defc80dabe3a9d6feea2b58cea2a7cb1250cf73c16e2ca82b56b70874e"
+    },
+    "planet/quality/q1/admin_polygons.bin": {
+      "size_zst": 11641252,
+      "size_raw": 25947768,
+      "sha256": "2c7b0291854327fbb968279e3a3d9945df81fb2ce4119b2c4ce57f3df9cbd2e5"
+    },
+    "planet/quality/q1/admin_vertices.bin": {
+      "size_zst": 359608403,
+      "size_raw": 387029562,
+      "sha256": "de15543b591cbb99dd17ed6b0797139b634b2d6702196260d934532eaca95792"
+    },
+    "planet/quality/q1/postal_polygons.bin": {
+      "size_zst": 389968,
+      "size_raw": 888504,
+      "sha256": "259dc4af5cb14faf49aae985790fdbd08f5f1c57482be77572d0b75f2baa26ad"
+    },
+    "planet/quality/q1/postal_vertices.bin": {
+      "size_zst": 17943220,
+      "size_raw": 18929414,
+      "sha256": "4b6978b07f93dfc500b7f2aa1c075147c33922654a2dadb7a7264257b7e26d25"
+    },
+    "planet/quality/q2.5/admin_polygons.bin": {
+      "size_zst": 11363986,
+      "size_raw": 25947768,
+      "sha256": "6a04feafd9ffa41019974f6f013c288b3738fa07b7cd899e8fcf424d72629ac9"
+    },
+    "planet/quality/q2.5/admin_vertices.bin": {
+      "size_zst": 216351796,
+      "size_raw": 233532362,
+      "sha256": "7d15a537c7d62ef10244c0871bbabed3c4837439c1d70080ee5f3e10ce96f028"
+    },
+    "planet/quality/q2.5/postal_polygons.bin": {
+      "size_zst": 367479,
+      "size_raw": 888504,
+      "sha256": "fffa91620953b4308e1161901682a2a8d647ba76f1e8586c9df23b0ef3b31a37"
+    },
+    "planet/quality/q2.5/postal_vertices.bin": {
+      "size_zst": 10344525,
+      "size_raw": 10964118,
+      "sha256": "f29e689ee21a1a898c018d475d54df011cd0f6b9950d34c5bc2b0afc146d4562"
+    },
+    "planet/quality/q2/admin_polygons.bin": {
+      "size_zst": 11359327,
+      "size_raw": 25947768,
+      "sha256": "ef48adb2e166b84c2c8a732f30388575f33d9c8feaf91e2bbcc262b68402d81b"
+    },
+    "planet/quality/q2/admin_vertices.bin": {
+      "size_zst": 246467910,
+      "size_raw": 265571202,
+      "sha256": "754586dd8994a9ae43d1bb139f0ec6193d2a7c219b5b49d0e735ed51969df705"
+    },
+    "planet/quality/q2/postal_polygons.bin": {
+      "size_zst": 371265,
+      "size_raw": 888504,
+      "sha256": "d9e8debc2953f942b4125418dca324920d983aedcf6d3b38abaacd3a0ab35f0b"
+    },
+    "planet/quality/q2/postal_vertices.bin": {
+      "size_zst": 11909910,
+      "size_raw": 12601226,
+      "sha256": "9a8fb6530f362c1b1f23e6a44a9670bf305df24eb76667df0831c27ee3b1b2b6"
+    },
+    "planet/quality/uncapped/admin_polygons.bin": {
+      "size_zst": 12439351,
+      "size_raw": 25947768,
+      "sha256": "59b1eefd637353e3f15c2ca377f49be461c6ab02f74af0c7e994ec90b71af140"
+    },
+    "planet/quality/uncapped/admin_vertices.bin": {
+      "size_zst": 1338658175,
+      "size_raw": 1563627390,
+      "sha256": "620fbf400f468c6ef971d2d2eae01c432684348f8a5f7584bbe830b5c35e3548"
+    },
+    "planet/quality/uncapped/postal_polygons.bin": {
+      "size_zst": 418246,
+      "size_raw": 888504,
+      "sha256": "27357f6ae45c84d566e8f62005454b3bc6d95d30dd36b42cbf6e6f101678c7eb"
+    },
+    "planet/quality/uncapped/postal_vertices.bin": {
+      "size_zst": 71677100,
+      "size_raw": 78944234,
+      "sha256": "5a9ec0db617cd3fd0c7bcb13ca833b35c2c4f526cbd251dc5d4295c3da42d052"
+    },
+    "south-america/admin/admin_cells.bin": {
+      "size_zst": 826817,
+      "size_raw": 3039516,
+      "sha256": "1af800f8183d1f72458b430b62baafb379ed39a820ec3182e26922a011de6c2a"
+    },
+    "south-america/admin/admin_entries.bin": {
+      "size_zst": 745389,
+      "size_raw": 7126434,
+      "sha256": "68c26a5ff3d6aeffd364ed1444190e7c3277ea3e529ac7b6efff0be0d1ac8f11"
+    },
+    "south-america/admin/place_cells.bin": {
+      "size_zst": 228089,
+      "size_raw": 798852,
+      "sha256": "cd64b707bca2c0748a6aedb4020660b90ce71edf273ee49e9df24350918fa8af"
+    },
+    "south-america/admin/place_entries.bin": {
+      "size_zst": 948582,
+      "size_raw": 1406530,
+      "sha256": "069f86d0b50d1258b653aad574cd0ae0336c27c8fe1ea6a5e615b21691f7066c"
+    },
+    "south-america/admin/place_nodes.bin": {
+      "size_zst": 3606487,
+      "size_raw": 6366940,
+      "sha256": "0c392f2ebe2b8f5e68589bc2d2bdb6d387b394598c637d13d1f2452dd2035b7e"
+    },
+    "south-america/admin/postcode_centroid_cells.bin": {
+      "size_zst": 39451,
+      "size_raw": 132096,
+      "sha256": "98422eec34e82b7195cd06f00f823ac2abe78f42a83dd183b6be01a9d7dd519a"
+    },
+    "south-america/admin/postcode_centroid_entries.bin": {
+      "size_zst": 192900,
+      "size_raw": 352648,
+      "sha256": "c6896718d7041e205fae3e31c7252e0ed1dea04d1b163a8f2fda4f448fa815ba"
+    },
+    "south-america/admin/postcode_centroids.bin": {
+      "size_zst": 636610,
+      "size_raw": 1322528,
+      "sha256": "91f3ede61ff46583b66a1c924098f3f62f072b722d574ed9ee76e9dac11b8753"
+    },
+    "south-america/admin/strings_core.bin": {
+      "size_zst": 805158,
+      "size_raw": 3142147,
+      "sha256": "800d8ce1a1035900ad25d6fb4aa052a09b68a33a85a80aba7272a15c9c692d13"
+    },
+    "south-america/admin/strings_postcode.bin": {
+      "size_zst": 5503432,
+      "size_raw": 35965946,
+      "sha256": "4aeb81dbcf18910d773ce475ecbe8c154120b2f19ded161c5e97bdb37d6b065c"
+    },
+    "south-america/full/addr_entries.bin": {
+      "size_zst": 12390353,
+      "size_raw": 24964032,
+      "sha256": "0b11998fb20d2fbf43f94de15852cafec3bd1d5e5827d310ac39e146d4055a32"
+    },
+    "south-america/full/addr_points.bin": {
+      "size_zst": 44970911,
+      "size_raw": 155970500,
+      "sha256": "6818ae18d05ce80ce9d8913e62a0cfcaa509ae3849dac41b3c2c9a6fa322bdf0"
+    },
+    "south-america/full/addr_postcodes.bin": {
+      "size_zst": 1663595,
+      "size_raw": 22281500,
+      "sha256": "51cc135aecb53c349ab9de4830eda595c691d5fe19991d9111cef347a3cabb98"
+    },
+    "south-america/full/addr_vertices.bin": {
+      "size_zst": 17284440,
+      "size_raw": 32856314,
+      "sha256": "0dc1f5a75810eb1dfba24d7479d58c9065a88d7b7623836cd1f2d2f83a82324b"
+    },
+    "south-america/full/admin_cells.bin": {
+      "size_zst": 826817,
+      "size_raw": 3039516,
+      "sha256": "1af800f8183d1f72458b430b62baafb379ed39a820ec3182e26922a011de6c2a"
+    },
+    "south-america/full/admin_entries.bin": {
+      "size_zst": 745389,
+      "size_raw": 7126434,
+      "sha256": "68c26a5ff3d6aeffd364ed1444190e7c3277ea3e529ac7b6efff0be0d1ac8f11"
+    },
+    "south-america/full/admin_parents.bin": {
+      "size_zst": 168893,
+      "size_raw": 365800,
+      "sha256": "d449c655161c1d87a2386f43a5344c8e8c3b9175eac1e134d92703a4c6d4788e"
+    },
+    "south-america/full/geo_cells.bin": {
+      "size_zst": 79061209,
+      "size_raw": 526197400,
+      "sha256": "21f5e43af81d13248c498410d635ec772e9cfe967c3b405b6e9bbbd03a1b05b2"
+    },
+    "south-america/full/interp_entries.bin": {
+      "size_zst": 118757,
+      "size_raw": 426068,
+      "sha256": "d588282ee44d32567bf77b34bbaa35700bd408ddd7f01ef47a4bda1af7adc2cf"
+    },
+    "south-america/full/interp_nodes.bin": {
+      "size_zst": 271985,
+      "size_raw": 569512,
+      "sha256": "260f5d2bdd4587569348ef5fda83632b5591ae127174430cba577c41acb312cd"
+    },
+    "south-america/full/interp_ways.bin": {
+      "size_zst": 112128,
+      "size_raw": 557880,
+      "sha256": "b473d485b7f96fce069205cc61366d882c389675680283bcb73500d2d2623b7c"
+    },
+    "south-america/full/place_cells.bin": {
+      "size_zst": 228089,
+      "size_raw": 798852,
+      "sha256": "cd64b707bca2c0748a6aedb4020660b90ce71edf273ee49e9df24350918fa8af"
+    },
+    "south-america/full/place_entries.bin": {
+      "size_zst": 948582,
+      "size_raw": 1406530,
+      "sha256": "069f86d0b50d1258b653aad574cd0ae0336c27c8fe1ea6a5e615b21691f7066c"
+    },
+    "south-america/full/place_nodes.bin": {
+      "size_zst": 3606487,
+      "size_raw": 6366940,
+      "sha256": "0c392f2ebe2b8f5e68589bc2d2bdb6d387b394598c637d13d1f2452dd2035b7e"
+    },
+    "south-america/full/postcode_centroid_cells.bin": {
+      "size_zst": 39451,
+      "size_raw": 132096,
+      "sha256": "98422eec34e82b7195cd06f00f823ac2abe78f42a83dd183b6be01a9d7dd519a"
+    },
+    "south-america/full/postcode_centroid_entries.bin": {
+      "size_zst": 192900,
+      "size_raw": 352648,
+      "sha256": "c6896718d7041e205fae3e31c7252e0ed1dea04d1b163a8f2fda4f448fa815ba"
+    },
+    "south-america/full/postcode_centroids.bin": {
+      "size_zst": 636610,
+      "size_raw": 1322528,
+      "sha256": "91f3ede61ff46583b66a1c924098f3f62f072b722d574ed9ee76e9dac11b8753"
+    },
+    "south-america/full/street_entries.bin": {
+      "size_zst": 41043542,
+      "size_raw": 204452962,
+      "sha256": "acf65e922cc39666a30df8174d87ebc56249ecbfd7f424394473468762ac19e1"
+    },
+    "south-america/full/street_nodes.bin": {
+      "size_zst": 171488480,
+      "size_raw": 323504320,
+      "sha256": "0025827b81f53dd0fb5492ff922a228616ab5300a7ff0e1c16bad9353df49624"
+    },
+    "south-america/full/street_ways.bin": {
+      "size_zst": 10217212,
+      "size_raw": 55782264,
+      "sha256": "99531c37be7a5c45f015caff0e466d6481c388d493f65b321d1fda35adcb2416"
+    },
+    "south-america/full/strings_addr.bin": {
+      "size_zst": 351206,
+      "size_raw": 1388868,
+      "sha256": "7d20551ce0f90ed24169ca381602b71a8594788028b7928060547c0b3447638c"
+    },
+    "south-america/full/strings_core.bin": {
+      "size_zst": 805158,
+      "size_raw": 3142147,
+      "sha256": "800d8ce1a1035900ad25d6fb4aa052a09b68a33a85a80aba7272a15c9c692d13"
+    },
+    "south-america/full/strings_postcode.bin": {
+      "size_zst": 5503432,
+      "size_raw": 35965946,
+      "sha256": "4aeb81dbcf18910d773ce475ecbe8c154120b2f19ded161c5e97bdb37d6b065c"
+    },
+    "south-america/full/strings_street.bin": {
+      "size_zst": 5319989,
+      "size_raw": 26692081,
+      "sha256": "95c9368580bd6573068f44d93a7ad1c4f35d5057eebc706a7e0187ad8a86ae17"
+    },
+    "south-america/full/way_parents.bin": {
+      "size_zst": 6432895,
+      "size_raw": 18594088,
+      "sha256": "eece9c63b6c365ab84b01bd12a2bf2734f0648265cba75af088eae53c7c3e55d"
+    },
+    "south-america/full/way_postcodes.bin": {
+      "size_zst": 174887,
+      "size_raw": 18594088,
+      "sha256": "04496d8de14800321e6dc0072519aff45d4c6c569d4d30c3ce2fb5454b43b47c"
+    },
+    "south-america/no-addresses/admin_cells.bin": {
+      "size_zst": 826817,
+      "size_raw": 3039516,
+      "sha256": "1af800f8183d1f72458b430b62baafb379ed39a820ec3182e26922a011de6c2a"
+    },
+    "south-america/no-addresses/admin_entries.bin": {
+      "size_zst": 745389,
+      "size_raw": 7126434,
+      "sha256": "68c26a5ff3d6aeffd364ed1444190e7c3277ea3e529ac7b6efff0be0d1ac8f11"
+    },
+    "south-america/no-addresses/admin_parents.bin": {
+      "size_zst": 168893,
+      "size_raw": 365800,
+      "sha256": "d449c655161c1d87a2386f43a5344c8e8c3b9175eac1e134d92703a4c6d4788e"
+    },
+    "south-america/no-addresses/geo_cells.bin": {
+      "size_zst": 74407509,
+      "size_raw": 523533020,
+      "sha256": "b3d1b8de273cc2e96ea6c827a08029654d58f409a7506005169271fc31d68cb5"
+    },
+    "south-america/no-addresses/place_cells.bin": {
+      "size_zst": 228089,
+      "size_raw": 798852,
+      "sha256": "cd64b707bca2c0748a6aedb4020660b90ce71edf273ee49e9df24350918fa8af"
+    },
+    "south-america/no-addresses/place_entries.bin": {
+      "size_zst": 948582,
+      "size_raw": 1406530,
+      "sha256": "069f86d0b50d1258b653aad574cd0ae0336c27c8fe1ea6a5e615b21691f7066c"
+    },
+    "south-america/no-addresses/place_nodes.bin": {
+      "size_zst": 3606487,
+      "size_raw": 6366940,
+      "sha256": "0c392f2ebe2b8f5e68589bc2d2bdb6d387b394598c637d13d1f2452dd2035b7e"
+    },
+    "south-america/no-addresses/postcode_centroid_cells.bin": {
+      "size_zst": 39451,
+      "size_raw": 132096,
+      "sha256": "98422eec34e82b7195cd06f00f823ac2abe78f42a83dd183b6be01a9d7dd519a"
+    },
+    "south-america/no-addresses/postcode_centroid_entries.bin": {
+      "size_zst": 192900,
+      "size_raw": 352648,
+      "sha256": "c6896718d7041e205fae3e31c7252e0ed1dea04d1b163a8f2fda4f448fa815ba"
+    },
+    "south-america/no-addresses/postcode_centroids.bin": {
+      "size_zst": 636610,
+      "size_raw": 1322528,
+      "sha256": "91f3ede61ff46583b66a1c924098f3f62f072b722d574ed9ee76e9dac11b8753"
+    },
+    "south-america/no-addresses/street_entries.bin": {
+      "size_zst": 41043542,
+      "size_raw": 204452962,
+      "sha256": "acf65e922cc39666a30df8174d87ebc56249ecbfd7f424394473468762ac19e1"
+    },
+    "south-america/no-addresses/street_nodes.bin": {
+      "size_zst": 171488480,
+      "size_raw": 323504320,
+      "sha256": "0025827b81f53dd0fb5492ff922a228616ab5300a7ff0e1c16bad9353df49624"
+    },
+    "south-america/no-addresses/street_ways.bin": {
+      "size_zst": 10217212,
+      "size_raw": 55782264,
+      "sha256": "99531c37be7a5c45f015caff0e466d6481c388d493f65b321d1fda35adcb2416"
+    },
+    "south-america/no-addresses/strings_core.bin": {
+      "size_zst": 805158,
+      "size_raw": 3142147,
+      "sha256": "800d8ce1a1035900ad25d6fb4aa052a09b68a33a85a80aba7272a15c9c692d13"
+    },
+    "south-america/no-addresses/strings_postcode.bin": {
+      "size_zst": 5503432,
+      "size_raw": 35965946,
+      "sha256": "4aeb81dbcf18910d773ce475ecbe8c154120b2f19ded161c5e97bdb37d6b065c"
+    },
+    "south-america/no-addresses/strings_street.bin": {
+      "size_zst": 5319989,
+      "size_raw": 26692081,
+      "sha256": "95c9368580bd6573068f44d93a7ad1c4f35d5057eebc706a7e0187ad8a86ae17"
+    },
+    "south-america/no-addresses/way_parents.bin": {
+      "size_zst": 6432895,
+      "size_raw": 18594088,
+      "sha256": "eece9c63b6c365ab84b01bd12a2bf2734f0648265cba75af088eae53c7c3e55d"
+    },
+    "south-america/no-addresses/way_postcodes.bin": {
+      "size_zst": 174887,
+      "size_raw": 18594088,
+      "sha256": "04496d8de14800321e6dc0072519aff45d4c6c569d4d30c3ce2fb5454b43b47c"
+    },
+    "south-america/poi/all/poi_cells.bin": {
+      "size_zst": 482292,
+      "size_raw": 1702464,
+      "sha256": "f352d647c4ca2d5d99506026c5e2f7722c38a584742376bca1345298d8537736"
+    },
+    "south-america/poi/all/poi_entries.bin": {
+      "size_zst": 4587323,
+      "size_raw": 7371196,
+      "sha256": "46cdfffcf5b0c2d9037fd85ed10eb952a7c8156d866a3aa89863862d0e08b718"
+    },
+    "south-america/poi/all/poi_records.bin": {
+      "size_zst": 25012965,
+      "size_raw": 59439276,
+      "sha256": "5b18f4c0462fefa0327a53ec3120944be2e00f365bf10a78e3b56df4018450d6"
+    },
+    "south-america/poi/all/poi_vertices.bin": {
+      "size_zst": 31237873,
+      "size_raw": 40531218,
+      "sha256": "de6bbf5187ff17c4d7986e2bcdc67282c5f9fe43717852bd4c2aff24a91d1aa3"
+    },
+    "south-america/poi/all/strings_poi.bin": {
+      "size_zst": 6823921,
+      "size_raw": 29967526,
+      "sha256": "cbc35c1edb483336cd9a15f59176a0d08df6c9ba64fd834f215bc84840b36a51"
+    },
+    "south-america/poi/major/poi_cells.bin": {
+      "size_zst": 304629,
+      "size_raw": 1109052,
+      "sha256": "82d31e992ff7908f55f2e579336d678829c10a0d6618b8077fa71d81ddbc1bf2"
+    },
+    "south-america/poi/major/poi_entries.bin": {
+      "size_zst": 145224,
+      "size_raw": 740678,
+      "sha256": "8207f9c8d45ac4e6ef24159c0b6a6c14b30ce9cbb12d916c50ff9aaf57665a86"
+    },
+    "south-america/poi/major/poi_records.bin": {
+      "size_zst": 622541,
+      "size_raw": 1366236,
+      "sha256": "b4a2fe99c45590e6f59f431b45e8517a1cfd6f5f319755166e176df42dc167c0"
+    },
+    "south-america/poi/major/poi_vertices.bin": {
+      "size_zst": 6122808,
+      "size_raw": 6713532,
+      "sha256": "8cceed214a3c58211768a9683d9ce40f0a781c55ec85205afd324a05d97303d8"
+    },
+    "south-america/poi/major/strings_poi.bin": {
+      "size_zst": 6823921,
+      "size_raw": 29967526,
+      "sha256": "cbc35c1edb483336cd9a15f59176a0d08df6c9ba64fd834f215bc84840b36a51"
+    },
+    "south-america/poi/notable/poi_cells.bin": {
+      "size_zst": 367217,
+      "size_raw": 1323588,
+      "sha256": "7364cfd0179871c97f98c5cfdc675458a637e28e29e7243bc17d843ce424fc7f"
+    },
+    "south-america/poi/notable/poi_entries.bin": {
+      "size_zst": 711539,
+      "size_raw": 1607490,
+      "sha256": "72ee1cac77c1b37d017526af9b5490390f58a99426d860ace771511783b57e6e"
+    },
+    "south-america/poi/notable/poi_records.bin": {
+      "size_zst": 3987294,
+      "size_raw": 8597520,
+      "sha256": "81d9a82580cffce1b53c529556591678222c095a954de80e2df75c63e9aaaade"
+    },
+    "south-america/poi/notable/poi_vertices.bin": {
+      "size_zst": 12007174,
+      "size_raw": 14594874,
+      "sha256": "b7b02a70f7f492afa477426a611599748cc457950fc197f2b381277f47b88f32"
+    },
+    "south-america/poi/notable/strings_poi.bin": {
+      "size_zst": 6823921,
+      "size_raw": 29967526,
+      "sha256": "cbc35c1edb483336cd9a15f59176a0d08df6c9ba64fd834f215bc84840b36a51"
+    },
+    "south-america/quality/q0.2/admin_polygons.bin": {
+      "size_zst": 983166,
+      "size_raw": 2194800,
+      "sha256": "b8c981a14db1a1037a6862ec9551b9c865e86a6c46f4a645c5ef0c78cd600661"
+    },
+    "south-america/quality/q0.2/admin_vertices.bin": {
+      "size_zst": 97283176,
+      "size_raw": 113910312,
+      "sha256": "eb20870d56fe713bfd64a173f863c6cb40e71611681187116e68e682b0835beb"
+    },
+    "south-america/quality/q0.2/postal_polygons.bin": {
+      "size_zst": 6185,
+      "size_raw": 14160,
+      "sha256": "b8ace356b903ce90f014f7f4136190156c1f86dcd90a42ae4051e0013c40167a"
+    },
+    "south-america/quality/q0.2/postal_vertices.bin": {
+      "size_zst": 1563724,
+      "size_raw": 1794104,
+      "sha256": "deff4cbc2a59a1b5775ced1d0df66a28670528ae6ec44b825fb5a99fd4dc6752"
+    },
+    "south-america/quality/q0.5/admin_polygons.bin": {
+      "size_zst": 953230,
+      "size_raw": 2194800,
+      "sha256": "8743e126912902d9e8a5eb451061c0d7b4bc506da37f5211eaa0c8d7707dae6f"
+    },
+    "south-america/quality/q0.5/admin_vertices.bin": {
+      "size_zst": 69170446,
+      "size_raw": 79404728,
+      "sha256": "ec9ca52844500b59f473e748485cd5bb45cc82ebeddeac8deb5746ff8bb679f9"
+    },
+    "south-america/quality/q0.5/postal_polygons.bin": {
+      "size_zst": 6039,
+      "size_raw": 14160,
+      "sha256": "c76bfcde6a5910c55666b04cf851677d7377e47882e65e7e2507ae3db429e5fd"
+    },
+    "south-america/quality/q0.5/postal_vertices.bin": {
+      "size_zst": 1024933,
+      "size_raw": 1130032,
+      "sha256": "34a998acf699d0a901b26f5c96a280836b9ad74e162d8894c8d322bc758fa614"
+    },
+    "south-america/quality/q1.5/admin_polygons.bin": {
+      "size_zst": 932500,
+      "size_raw": 2194800,
+      "sha256": "ab8e532802529840e913c4d7f6ea376f4257354c8fcb0db9341109c0dcba0bbd"
+    },
+    "south-america/quality/q1.5/admin_vertices.bin": {
+      "size_zst": 40257112,
+      "size_raw": 45603100,
+      "sha256": "376f131bd0eb79b790ede76760e0553d1fddbcf4081a7f9d52b07f0f02c6e335"
+    },
+    "south-america/quality/q1.5/postal_polygons.bin": {
+      "size_zst": 5881,
+      "size_raw": 14160,
+      "sha256": "a0ec914fb7df6f156492c01f46a943890d0ea6d2c82588c6b6cc5c8c5db54d3f"
+    },
+    "south-america/quality/q1.5/postal_vertices.bin": {
+      "size_zst": 576553,
+      "size_raw": 614588,
+      "sha256": "94d2f8146a9c7f86bc6aedb9b6756ac8b386a1bc43e2bab3247d76af2d4aeaf5"
+    },
+    "south-america/quality/q1/admin_polygons.bin": {
+      "size_zst": 942767,
+      "size_raw": 2194800,
+      "sha256": "135319ced7e97b24455fc3640a48d28c0f21c45c3c08c3e8f05fbf0edd495fbb"
+    },
+    "south-america/quality/q1/admin_vertices.bin": {
+      "size_zst": 49915633,
+      "size_raw": 56712788,
+      "sha256": "4e8b8925f3d65fee79dce337c00939af03e9726f4dfa3e6ecda479a76d12a86b"
+    },
+    "south-america/quality/q1/postal_polygons.bin": {
+      "size_zst": 5924,
+      "size_raw": 14160,
+      "sha256": "5d74f712d952a90e457980e383867f4a324c8cc582198a2f39b258a90cbe0dfd"
+    },
+    "south-america/quality/q1/postal_vertices.bin": {
+      "size_zst": 722439,
+      "size_raw": 777652,
+      "sha256": "81d3fe2c8b1a2ed4253dafa6b72ee79cc12c23b77cf541f0cb1fae8352401247"
+    },
+    "south-america/quality/q2.5/admin_polygons.bin": {
+      "size_zst": 917428,
+      "size_raw": 2194800,
+      "sha256": "e02e1f7a14b41cfabb9f0cfdd47f908a5681e5c059423baf50ffa78d77da6261"
+    },
+    "south-america/quality/q2.5/admin_vertices.bin": {
+      "size_zst": 30038998,
+      "size_raw": 33983584,
+      "sha256": "1f6789e9dd2aef519598806df5fc4998e3e0392782747ed5c6643280fec10a6a"
+    },
+    "south-america/quality/q2.5/postal_polygons.bin": {
+      "size_zst": 5781,
+      "size_raw": 14160,
+      "sha256": "a67b29f47c8413e4dd429d856de5b8b6fe70a7ef2f356ae7b3a091950c56e2cb"
+    },
+    "south-america/quality/q2.5/postal_vertices.bin": {
+      "size_zst": 423199,
+      "size_raw": 446824,
+      "sha256": "2c832ab384230a53cd1ebb0be1442124651d17d32eb41e1b1e0e58e0da598990"
+    },
+    "south-america/quality/q2/admin_polygons.bin": {
+      "size_zst": 924227,
+      "size_raw": 2194800,
+      "sha256": "faef8692d3952eba16cb6dfe401be9316d5f2fad05d91bac79cb6380ccec42ba"
+    },
+    "south-america/quality/q2/admin_vertices.bin": {
+      "size_zst": 34249550,
+      "size_raw": 38753012,
+      "sha256": "5a9db4129253d51bae0b9bef27cbc5c4a899cebb53dae8e612876b987c62c9aa"
+    },
+    "south-america/quality/q2/postal_polygons.bin": {
+      "size_zst": 5829,
+      "size_raw": 14160,
+      "sha256": "985064e32801dae71b7871253c6a07f63166b3cc84324e4951709b86ab3885d6"
+    },
+    "south-america/quality/q2/postal_vertices.bin": {
+      "size_zst": 486034,
+      "size_raw": 515232,
+      "sha256": "4f42a753eb78ae9136e3b63b194f9bf5afb777d0c999701304aaf154726c371f"
+    },
+    "south-america/quality/uncapped/admin_polygons.bin": {
+      "size_zst": 998065,
+      "size_raw": 2194800,
+      "sha256": "709a4d789b5792c68f2c094423b950ac0e4bd9175aae31a4f8de66a88df0d36d"
+    },
+    "south-america/quality/uncapped/admin_vertices.bin": {
+      "size_zst": 166267102,
+      "size_raw": 211333428,
+      "sha256": "2167d5d7c6d2c0d96404edda756e81dfda6b501ee5f6ca5489049f9894ce54a2"
+    },
+    "south-america/quality/uncapped/postal_polygons.bin": {
+      "size_zst": 6257,
+      "size_raw": 14160,
+      "sha256": "cd07cf4bb588821ba9c068282e0f55846a1a91e80ad9b1539722ff3112228296"
+    },
+    "south-america/quality/uncapped/postal_vertices.bin": {
+      "size_zst": 3059935,
+      "size_raw": 3887556,
+      "sha256": "c6182e02ae0becfe10e725e71e5001b9723de1841f0a4e9ecdc32f525c3800cf"
+    }
+  },
+  "build": {
+    "date": "2026-04-27",
+    "version": 15,
+    "patch_version": 5,
+    "wikidata_date": "20260401",
+    "built_at": "2026-04-27T08:58:23Z"
+  }
+}

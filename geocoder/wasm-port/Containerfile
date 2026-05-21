@@ -1,0 +1,18 @@
+# Build environment for the wasm-port. Self-contained so we don't have
+# to install rustup / wasm-pack / wasm32 target on the host.
+#
+# Usage:
+#   docker build -t geocoder-wasm-builder geocoder/wasm-port
+#   docker run --rm -v "$PWD:/work" -w /work/geocoder/wasm-port \
+#       geocoder-wasm-builder wasm-pack build --target nodejs --release
+
+FROM rust:1.88-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config libssl-dev curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add wasm32-unknown-unknown
+RUN cargo install --locked wasm-pack
+
+WORKDIR /work

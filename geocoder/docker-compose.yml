@@ -1,0 +1,12 @@
+services:
+  geocoder:
+    image: traccar/traccar-geocoder
+    environment:
+      - PBF_URLS=https://download.geofabrik.de/europe/monaco-latest.osm.pbf
+    ports:
+      - "3000:3000"
+    volumes:
+      - geocoder-data:/data
+
+volumes:
+  geocoder-data:

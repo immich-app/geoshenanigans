@@ -1,0 +1,48 @@
+[package]
+name = "query-server"
+version = "0.1.0"
+edition = "2021"
+
+# Library: pure geocoding logic, used by both the HTTP binary and the
+# wasm-port crate. Lives in src/lib.rs.
+[lib]
+name = "query_server"
+path = "src/lib.rs"
+
+# Binary: HTTP server with axum + auth.  Lives in src/main.rs and
+# imports the library via `use query_server::*;`.
+[[bin]]
+name = "query-server"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+s2 = { version = "0.0.13", default-features = false }
+
+# Native-only deps (HTTP, mmap, auth). Gated so wasm-port doesn't pull
+# them when it path-deps this crate.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+memmap2 = "0.9"
+rustls-acme = { version = "0.14", features = ["axum"] }
+axum-server = "0.7"
+bcrypt = "0.15"
+getrandom = "0.2"
+arc-swap = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+zstd = "0.13"
+sha2 = "0.10"
+futures-util = "0.3"
+
+# Wasm-only deps for the JS-callback chunked-byte-source backing.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+getrandom = { version = "0.2", features = ["js"] }
+
+[profile.release]
+opt-level = 3
+lto = true
