@@ -2288,12 +2288,35 @@ int main(int argc, char* argv[]) {
         delta_buf.reserve(std::min(new_n * (size_t)(4 + value_stride),
                                     (size_t)64 * 1024));
         uint32_t n_changes = 0;
+        // Run-length stats — tells us whether changes cluster (run-length
+        // encoding would shrink the fallback) or are scattered (only a
+        // structural fix to slot-position stability helps).
+        uint32_t n_runs = 0;
+        uint32_t cur_run_len = 0;
+        uint32_t max_run_len = 0;
+        uint64_t sum_runs_len_sq = 0; // for mean-of-squares (run-length-aware size)
+        uint32_t last_change_pos = UINT32_MAX;
+        auto close_run = [&]() {
+            if (cur_run_len > 0) {
+                if (cur_run_len > max_run_len) max_run_len = cur_run_len;
+                sum_runs_len_sq += (uint64_t)cur_run_len * cur_run_len;
+                cur_run_len = 0;
+            }
+        };
         auto emit_change = [&](uint32_t pos, const char* val_ptr) {
             delta_buf.insert(delta_buf.end(),
                              reinterpret_cast<const char*>(&pos),
                              reinterpret_cast<const char*>(&pos) + 4);
             delta_buf.insert(delta_buf.end(), val_ptr, val_ptr + value_stride);
             n_changes++;
+            if (last_change_pos != UINT32_MAX && pos == last_change_pos + 1) {
+                cur_run_len++;
+            } else {
+                close_run();
+                cur_run_len = 1;
+                n_runs++;
+            }
+            last_change_pos = pos;
         };
 
         if (remap_kind == 3) {
@@ -2340,6 +2363,12 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        close_run();
+        // Hypothetical run-length-encoded size for diagnostic comparison.
+        // Format would be (start_pos:u32, run_len:u32, values:run_len*vs).
+        // Per-run overhead is 8 bytes (pos+len); per-value cost is vs bytes.
+        size_t rle_payload_bytes = (size_t)n_runs * 8 + (size_t)n_changes * value_stride;
+        double mean_run_len = n_runs ? (double)n_changes / (double)n_runs : 0.0;
         uint32_t fid_u = (uint32_t)fid;
         // If the sparse delta turns out larger than just shipping the
         // file (which happens when day-over-day stability is poor —
@@ -2366,7 +2395,10 @@ int main(int argc, char* argv[]) {
             if (new_m.data) unmap_file(new_m);
             std::cerr << "  " << fname << ": full replace " << new_size
                       << " bytes (sparse would be " << sparse_section_bytes
-                      << " for " << n_changes << "/" << new_n << ")" << std::endl;
+                      << " for " << n_changes << "/" << new_n
+                      << " runs=" << n_runs << " mean_run=" << mean_run_len
+                      << " max_run=" << max_run_len
+                      << " rle_payload=" << rle_payload_bytes << ")" << std::endl;
             return;
         }
 
@@ -2385,7 +2417,10 @@ int main(int argc, char* argv[]) {
 
         std::cerr << "  " << fname << ": sparse delta " << n_changes << "/"
                   << new_n << " (" << sparse_section_bytes
-                  << " bytes vs " << new_size << " full)" << std::endl;
+                  << " bytes vs " << new_size << " full"
+                  << " runs=" << n_runs << " mean_run=" << mean_run_len
+                  << " max_run=" << max_run_len
+                  << " rle_payload=" << rle_payload_bytes << ")" << std::endl;
     };
 
     emit_sparse_delta(PatchFileId::ADDR_POSTCODES,       "addr_postcodes.bin",  4,  2);
