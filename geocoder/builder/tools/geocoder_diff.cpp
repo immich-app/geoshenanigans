@@ -557,6 +557,101 @@ static std::unordered_map<uint32_t, uint32_t> secondary_match_from_merge(
     return remap;
 }
 
+// Load strategy-2 sidecar (.osm_ids) into a per-slot identity key array.
+// Format: magic(u32=0xD0510EAD) + version(u32=1) + count(u32)
+//       + count × {object_type(u8), flags(u8), reserved(u16), stable_id(u64)}
+// Returns a vector of size count where each entry is
+//   (object_type << 56) | (stable_id & 0x00FFFFFFFFFFFFFF), or 0 for tombstones.
+// Returns empty vector if the file is missing or malformed (caller falls
+// back to the legacy byte-derived key path).
+static std::vector<uint64_t> load_sidecar_keys(const std::string& path) {
+    std::vector<uint64_t> keys;
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return keys;
+    uint32_t magic = 0, version = 0, count = 0;
+    f.read(reinterpret_cast<char*>(&magic), 4);
+    f.read(reinterpret_cast<char*>(&version), 4);
+    f.read(reinterpret_cast<char*>(&count), 4);
+    if (!f || magic != 0xD0510EADu || version != 1u) return keys;
+    keys.resize(count, 0);
+    for (uint32_t i = 0; i < count; i++) {
+        uint8_t  ot = 0, flags = 0;
+        uint16_t res = 0;
+        uint64_t sid = 0;
+        f.read(reinterpret_cast<char*>(&ot), 1);
+        f.read(reinterpret_cast<char*>(&flags), 1);
+        f.read(reinterpret_cast<char*>(&res), 2);
+        f.read(reinterpret_cast<char*>(&sid), 8);
+        if (!f) { keys.clear(); return keys; }
+        // Tombstone (flags bit 0) or NONE object type → key 0 so they
+        // never participate in secondary matching.
+        bool is_tomb = (flags & 0x01) != 0 || ot == 0 /* ObjectType::NONE */;
+        if (!is_tomb) {
+            keys[i] = (static_cast<uint64_t>(ot) << 56)
+                    | (sid & 0x00FFFFFFFFFFFFFFull);
+        }
+    }
+    return keys;
+}
+
+// Sidecar-keyed variant of secondary_match_from_merge. Identical algorithm,
+// but the per-record identity key is read from a pre-loaded osm_id array
+// (one per slot) rather than derived from bytes that shift across builds.
+// When old_keys/new_keys come from strategy-2 sidecars, a DELETE/INSERT
+// pair representing "same osm_id, different bytes" will share a key and
+// recover as a soft match — fixing the root cause of the daily 50M-pair
+// POI_PARENT_REMAP section.
+static std::unordered_map<uint32_t, uint32_t> secondary_match_by_idx(
+    const MergeSequence& seq, size_t stride,
+    const std::vector<uint64_t>& old_keys,
+    const std::vector<uint64_t>& new_keys)
+{
+    std::vector<uint32_t> del_indices, ins_indices;
+    size_t pos = 0, old_rec = 0, new_rec = 0;
+    while (pos < seq.data.size()) {
+        uint8_t op = static_cast<uint8_t>(seq.data[pos]); pos++;
+        uint32_t count; memcpy(&count, seq.data.data() + pos, 4); pos += 4;
+        if (op == OP_MATCH_RUN) {
+            old_rec += count; new_rec += count;
+        } else if (op == OP_INSERT_RUN) {
+            for (uint32_t k = 0; k < count; k++)
+                ins_indices.push_back(static_cast<uint32_t>(new_rec + k));
+            pos += count * stride;
+            new_rec += count;
+        } else if (op == OP_DELETE_RUN) {
+            for (uint32_t k = 0; k < count; k++)
+                del_indices.push_back(static_cast<uint32_t>(old_rec + k));
+            old_rec += count;
+        }
+    }
+    std::unordered_map<uint64_t, std::vector<uint32_t>> del_by_key, ins_by_key;
+    for (uint32_t di : del_indices) {
+        if (di >= old_keys.size()) continue;
+        uint64_t k = old_keys[di];
+        if (k == 0) continue; // tombstone — never match
+        del_by_key[k].push_back(di);
+    }
+    for (uint32_t ii : ins_indices) {
+        if (ii >= new_keys.size()) continue;
+        uint64_t k = new_keys[ii];
+        if (k == 0) continue;
+        ins_by_key[k].push_back(ii);
+    }
+    std::unordered_map<uint32_t, uint32_t> remap;
+    for (auto& [key, del_vec] : del_by_key) {
+        auto it = ins_by_key.find(key);
+        if (it == ins_by_key.end()) continue;
+        auto& ins_vec = it->second;
+        if (del_vec.size() == ins_vec.size()) {
+            std::sort(del_vec.begin(), del_vec.end());
+            std::sort(ins_vec.begin(), ins_vec.end());
+            for (size_t i = 0; i < del_vec.size(); i++)
+                remap[del_vec[i]] = ins_vec[i];
+        }
+    }
+    return remap;
+}
+
 // --- Derive ID remap from merge sequence (same logic as patch tool) ---
 static std::vector<uint32_t> derive_id_remap_from_merge(
     const MergeSequence& seq, size_t old_count, size_t stride)
@@ -703,6 +798,25 @@ int main(int argc, char* argv[]) {
             if (m.size > 0) return {m, true};
         }
         return {m, false};
+    };
+    // Sidecar (.osm_ids) loader that mirrors the .bin fallback search.
+    // Returns an empty vector if no sidecar is found at any candidate
+    // path — caller falls back to byte-key matching in that case (first
+    // build, sidecar not yet emitted, or non-sidecar record type).
+    auto try_load_sidecar = [&](const std::string& dir, const char* bin_fname,
+                                 std::initializer_list<const char*> fallbacks)
+            -> std::vector<uint64_t> {
+        std::string sname = bin_fname;
+        auto dot = sname.find_last_of('.');
+        if (dot != std::string::npos) sname = sname.substr(0, dot);
+        sname += ".osm_ids";
+        auto keys = load_sidecar_keys(dir + "/" + sname);
+        if (!keys.empty()) return keys;
+        for (const char* fb : fallbacks) {
+            keys = load_sidecar_keys(dir + "/" + fb + sname);
+            if (!keys.empty()) return keys;
+        }
+        return keys;
     };
     for (int t = 0; t < 5; t++) {
         old_tier_maps[t] = try_load_tier(old_dir, kStrTierFilenames[t]);
@@ -1080,12 +1194,21 @@ int main(int argc, char* argv[]) {
             }
         }
         auto seq = build_merge_seq(old_m.data, old_m.size, new_m.data, new_m.size, addr_stride);
-        auto soft = secondary_match_from_merge(seq, old_m.data, old_m.size, new_m.data, new_m.size, addr_stride,
-            [](const char* rec) -> uint64_t {
-                uint32_t hn_id, st_id;
-                memcpy(&hn_id, rec + 8, 4); memcpy(&st_id, rec + 12, 4);
-                return ((uint64_t)st_id << 32) | hn_id;
-            });
+        // Prefer osm_id from strategy-2 sidecar; falls back to legacy
+        // (housenumber_id, street_id) composite when no sidecar exists.
+        auto old_addr_keys = try_load_sidecar(old_dir, "addr_points.bin", {});
+        auto new_addr_keys = try_load_sidecar(new_dir, "addr_points.bin", {});
+        std::unordered_map<uint32_t, uint32_t> soft;
+        if (!old_addr_keys.empty() && !new_addr_keys.empty()) {
+            soft = secondary_match_by_idx(seq, addr_stride, old_addr_keys, new_addr_keys);
+        } else {
+            soft = secondary_match_from_merge(seq, old_m.data, old_m.size, new_m.data, new_m.size, addr_stride,
+                [](const char* rec) -> uint64_t {
+                    uint32_t hn_id, st_id;
+                    memcpy(&hn_id, rec + 8, 4); memcpy(&st_id, rec + 12, 4);
+                    return ((uint64_t)st_id << 32) | hn_id;
+                });
+        }
         auto id_rm = derive_id_remap_from_merge(seq, old_m.size / addr_stride, addr_stride);
         for (auto& [o,n] : soft) if (o < id_rm.size()) id_rm[o] = n;
         res_addr = {PatchFileId::ADDR_POINTS, "addr_points.bin", addr_stride,
@@ -1124,21 +1247,42 @@ int main(int argc, char* argv[]) {
             size_t way_name_off = (way_stride == 12) ? 8 : 5;
             size_t old_n_w = old_w.size / way_stride;
             size_t new_n_w = new_w.size / way_stride;
+            // Prefer osm_id from strategy-2 sidecar if available; falls
+            // back to the legacy (name_id, node_count) byte composite
+            // when no sidecar exists. The byte key shifts daily with
+            // string-pool re-tiering, producing a 90%+ miss rate; osm_id
+            // is permanently stable per OSM record.
+            auto fb_old_keys = try_load_sidecar(old_dir, "street_ways.bin", {"../full/", "../../full/"});
+            auto fb_new_keys = try_load_sidecar(new_dir, "street_ways.bin", {"../full/", "../../full/"});
             std::unordered_map<uint64_t, uint32_t> new_idx;
             new_idx.reserve(new_n_w);
-            for (uint32_t i = 0; i < new_n_w; i++) {
-                uint32_t name_id; memcpy(&name_id, new_w.data + (size_t)i * way_stride + way_name_off, 4);
-                uint8_t nc = static_cast<uint8_t>(new_w.data[(size_t)i * way_stride + 4]);
-                uint64_t key = ((uint64_t)name_id << 8) | nc;
-                new_idx.emplace(key, i);
-            }
             std::vector<uint32_t> id_rm(old_n_w, 0xFFFFFFFFu);
-            for (uint32_t i = 0; i < old_n_w; i++) {
-                uint32_t name_id; memcpy(&name_id, old_w.data + (size_t)i * way_stride + way_name_off, 4);
-                uint8_t nc = static_cast<uint8_t>(old_w.data[(size_t)i * way_stride + 4]);
-                uint64_t key = ((uint64_t)name_id << 8) | nc;
-                auto it = new_idx.find(key);
-                if (it != new_idx.end()) id_rm[i] = it->second;
+            if (!fb_old_keys.empty() && !fb_new_keys.empty()
+                && fb_old_keys.size() >= old_n_w && fb_new_keys.size() >= new_n_w) {
+                for (uint32_t i = 0; i < new_n_w; i++) {
+                    uint64_t k = fb_new_keys[i];
+                    if (k != 0) new_idx.emplace(k, i);
+                }
+                for (uint32_t i = 0; i < old_n_w; i++) {
+                    uint64_t k = fb_old_keys[i];
+                    if (k == 0) continue;
+                    auto it = new_idx.find(k);
+                    if (it != new_idx.end()) id_rm[i] = it->second;
+                }
+            } else {
+                for (uint32_t i = 0; i < new_n_w; i++) {
+                    uint32_t name_id; memcpy(&name_id, new_w.data + (size_t)i * way_stride + way_name_off, 4);
+                    uint8_t nc = static_cast<uint8_t>(new_w.data[(size_t)i * way_stride + 4]);
+                    uint64_t key = ((uint64_t)name_id << 8) | nc;
+                    new_idx.emplace(key, i);
+                }
+                for (uint32_t i = 0; i < old_n_w; i++) {
+                    uint32_t name_id; memcpy(&name_id, old_w.data + (size_t)i * way_stride + way_name_off, 4);
+                    uint8_t nc = static_cast<uint8_t>(old_w.data[(size_t)i * way_stride + 4]);
+                    uint64_t key = ((uint64_t)name_id << 8) | nc;
+                    auto it = new_idx.find(key);
+                    if (it != new_idx.end()) id_rm[i] = it->second;
+                }
             }
             res_ways = {PatchFileId::STREET_WAYS, "street_ways.bin", way_stride,
                         0, 0, MergeSequence{}, {}, {}, std::move(id_rm)};
@@ -1172,12 +1316,21 @@ int main(int argc, char* argv[]) {
         }
         auto way_seq = build_merge_seq(old_w.data, old_w.size, new_w.data, new_w.size, way_stride);
         size_t way_name_off = (way_stride == 12) ? 8 : 5;
-        auto soft = secondary_match_from_merge(way_seq, old_w.data, old_w.size, new_w.data, new_w.size, way_stride,
-            [way_name_off](const char* rec) -> uint64_t {
-                uint32_t name_id; memcpy(&name_id, rec + way_name_off, 4);
-                uint8_t nc = static_cast<uint8_t>(rec[4]);
-                return ((uint64_t)name_id << 8) | nc;
-            });
+        // Prefer osm_id from strategy-2 sidecar; falls back to the
+        // (name_id, node_count) byte key for first builds.
+        auto old_way_keys = try_load_sidecar(old_dir, "street_ways.bin", {"../full/", "../../full/"});
+        auto new_way_keys = try_load_sidecar(new_dir, "street_ways.bin", {"../full/", "../../full/"});
+        std::unordered_map<uint32_t, uint32_t> soft;
+        if (!old_way_keys.empty() && !new_way_keys.empty()) {
+            soft = secondary_match_by_idx(way_seq, way_stride, old_way_keys, new_way_keys);
+        } else {
+            soft = secondary_match_from_merge(way_seq, old_w.data, old_w.size, new_w.data, new_w.size, way_stride,
+                [way_name_off](const char* rec) -> uint64_t {
+                    uint32_t name_id; memcpy(&name_id, rec + way_name_off, 4);
+                    uint8_t nc = static_cast<uint8_t>(rec[4]);
+                    return ((uint64_t)name_id << 8) | nc;
+                });
+        }
         auto id_rm = derive_id_remap_from_merge(way_seq, old_w.size / way_stride, way_stride);
         for (auto& [o,n] : soft) if (o < id_rm.size()) id_rm[o] = n;
         res_ways = {PatchFileId::STREET_WAYS, "street_ways.bin", way_stride,
@@ -1242,13 +1395,22 @@ int main(int argc, char* argv[]) {
         }
         auto iw_seq = build_merge_seq(old_data.data, old_data.size, new_data.data, new_data.size, interp_stride);
         size_t ist_off = (interp_stride >= 20) ? 8 : 5;
-        auto soft = secondary_match_from_merge(iw_seq, old_data.data, old_data.size, new_data.data, new_data.size, interp_stride,
-            [ist_off](const char* rec) -> uint64_t {
-                uint32_t street_id, start;
-                memcpy(&street_id, rec + ist_off, 4);
-                memcpy(&start, rec + ist_off + 4, 4);
-                return ((uint64_t)street_id << 32) | start;
-            });
+        // Prefer osm_id from strategy-2 sidecar; falls back to legacy
+        // (street_id, start) composite when no sidecar exists.
+        auto old_interp_keys = try_load_sidecar(old_dir, "interp_ways.bin", {});
+        auto new_interp_keys = try_load_sidecar(new_dir, "interp_ways.bin", {});
+        std::unordered_map<uint32_t, uint32_t> soft;
+        if (!old_interp_keys.empty() && !new_interp_keys.empty()) {
+            soft = secondary_match_by_idx(iw_seq, interp_stride, old_interp_keys, new_interp_keys);
+        } else {
+            soft = secondary_match_from_merge(iw_seq, old_data.data, old_data.size, new_data.data, new_data.size, interp_stride,
+                [ist_off](const char* rec) -> uint64_t {
+                    uint32_t street_id, start;
+                    memcpy(&street_id, rec + ist_off, 4);
+                    memcpy(&start, rec + ist_off + 4, 4);
+                    return ((uint64_t)street_id << 32) | start;
+                });
+        }
         auto id_rm = derive_id_remap_from_merge(iw_seq, old_data.size / interp_stride, interp_stride);
         for (auto& [o,n] : soft) if (o < id_rm.size()) id_rm[o] = n;
         res_interp_w = {PatchFileId::INTERP_WAYS, "interp_ways.bin", interp_stride,
@@ -1316,13 +1478,25 @@ int main(int argc, char* argv[]) {
             if (new_off != old_offsets[i]) fixups.push_back({static_cast<uint32_t>(i), new_off});
         }
         auto ap_seq = build_merge_seq(old_data.data, old_data.size, new_data.data, new_data.size, admin_stride);
-        auto soft = secondary_match_from_merge(ap_seq, old_data.data, old_data.size, new_data.data, new_data.size, admin_stride,
-            [](const char* rec) -> uint64_t {
-                uint32_t name_id; memcpy(&name_id, rec + 8, 4);
-                uint8_t level = static_cast<uint8_t>(rec[12]);
-                uint16_t cc; memcpy(&cc, rec + 20, 2);
-                return ((uint64_t)name_id << 24) | ((uint64_t)level << 16) | cc;
-            });
+        // Prefer osm_id (strategy-2 sidecar) for secondary matching —
+        // it's permanently stable, unlike the legacy (name_id, level, cc)
+        // composite which churns daily because name_id is a string-pool
+        // offset that re-tiers. Falls back to the byte key for first
+        // builds where no sidecar exists yet.
+        auto old_admin_keys = try_load_sidecar(old_dir, "admin_polygons.bin", {"../../admin/"});
+        auto new_admin_keys = try_load_sidecar(new_dir, "admin_polygons.bin", {"../../admin/"});
+        std::unordered_map<uint32_t, uint32_t> soft;
+        if (!old_admin_keys.empty() && !new_admin_keys.empty()) {
+            soft = secondary_match_by_idx(ap_seq, admin_stride, old_admin_keys, new_admin_keys);
+        } else {
+            soft = secondary_match_from_merge(ap_seq, old_data.data, old_data.size, new_data.data, new_data.size, admin_stride,
+                [](const char* rec) -> uint64_t {
+                    uint32_t name_id; memcpy(&name_id, rec + 8, 4);
+                    uint8_t level = static_cast<uint8_t>(rec[12]);
+                    uint16_t cc; memcpy(&cc, rec + 20, 2);
+                    return ((uint64_t)name_id << 24) | ((uint64_t)level << 16) | cc;
+                });
+        }
         // Populate id_remap up-front so t_poi can consume the full
         // primary+secondary admin remap before pr_seq is built.
         auto admin_id_rm = derive_id_remap_from_merge(ap_seq, old_data.size / admin_stride, admin_stride);
@@ -1486,13 +1660,22 @@ int main(int argc, char* argv[]) {
         }
         auto pr_seq = build_merge_seq(old_data.data, old_data.size,
                                        new_data.data, new_data.size, poi_stride);
-        auto soft = secondary_match_from_merge(pr_seq, old_data.data, old_data.size,
-            new_data.data, new_data.size, poi_stride,
-            [](const char* rec) -> uint64_t {
-                uint32_t name_id; memcpy(&name_id, rec + 16, 4);
-                uint8_t category = static_cast<uint8_t>(rec[20]);
-                return ((uint64_t)name_id << 8) | category;
-            });
+        // Prefer osm_id from strategy-2 sidecar; falls back to legacy
+        // (name_id, category) composite when no sidecar exists.
+        auto old_poi_keys = try_load_sidecar(old_dir, "poi_records.bin", {});
+        auto new_poi_keys = try_load_sidecar(new_dir, "poi_records.bin", {});
+        std::unordered_map<uint32_t, uint32_t> soft;
+        if (!old_poi_keys.empty() && !new_poi_keys.empty()) {
+            soft = secondary_match_by_idx(pr_seq, poi_stride, old_poi_keys, new_poi_keys);
+        } else {
+            soft = secondary_match_from_merge(pr_seq, old_data.data, old_data.size,
+                new_data.data, new_data.size, poi_stride,
+                [](const char* rec) -> uint64_t {
+                    uint32_t name_id; memcpy(&name_id, rec + 16, 4);
+                    uint8_t category = static_cast<uint8_t>(rec[20]);
+                    return ((uint64_t)name_id << 8) | category;
+                });
+        }
         res_poi_r = {PatchFileId::POI_RECORDS, "poi_records.bin", poi_stride,
                      old_data.size, new_data.size, pr_seq, std::move(fixups), std::move(soft), {}};
         log_merge(res_poi_r);
@@ -1592,13 +1775,22 @@ int main(int argc, char* argv[]) {
                 if (na != nb) return na < nb ? -1 : 1;
                 return memcmp(a, b, 8); // lat + lng
             });
-        auto soft = secondary_match_from_merge(pn_seq, old_data.data, old_data.size,
-            new_data.data, new_data.size, place_stride,
-            [](const char* rec) -> uint64_t {
-                uint32_t name_id; memcpy(&name_id, rec + 8, 4);
-                uint8_t place_type = static_cast<uint8_t>(rec[12]);
-                return ((uint64_t)name_id << 8) | place_type;
-            });
+        // Prefer osm_id from strategy-2 sidecar; falls back to legacy
+        // (name_id, place_type) composite when no sidecar exists.
+        auto old_place_keys = try_load_sidecar(old_dir, "place_nodes.bin", {});
+        auto new_place_keys = try_load_sidecar(new_dir, "place_nodes.bin", {});
+        std::unordered_map<uint32_t, uint32_t> soft;
+        if (!old_place_keys.empty() && !new_place_keys.empty()) {
+            soft = secondary_match_by_idx(pn_seq, place_stride, old_place_keys, new_place_keys);
+        } else {
+            soft = secondary_match_from_merge(pn_seq, old_data.data, old_data.size,
+                new_data.data, new_data.size, place_stride,
+                [](const char* rec) -> uint64_t {
+                    uint32_t name_id; memcpy(&name_id, rec + 8, 4);
+                    uint8_t place_type = static_cast<uint8_t>(rec[12]);
+                    return ((uint64_t)name_id << 8) | place_type;
+                });
+        }
         auto id_rm = derive_id_remap_from_merge(pn_seq, old_data.size / place_stride, place_stride);
         for (auto& [o,n] : soft) if (o < id_rm.size()) id_rm[o] = n;
         res_place_n = {PatchFileId::PLACE_NODES, "place_nodes.bin", place_stride,
