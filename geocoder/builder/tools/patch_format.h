@@ -388,34 +388,12 @@ static constexpr uint32_t CELL_CHANGES_ADMIN_MARKER = 0xFFFFFFFA;
 static constexpr uint32_t CELL_CHANGES_POI_MARKER = 0xFFFFFFF5;
 static constexpr uint32_t CELL_CHANGES_PLACE_MARKER = 0xFFFFFFF4;
 
-// Entry correction marker: 0xFFFFFFF8 (legacy full-list format, gcpatch v2)
+// Entry correction marker: 0xFFFFFFF8
 // Cell-level diff of entries: lists cells whose entries differ between derived and new.
 // Format: marker(4), file_id(4), count(4),
-//   for each: cell_id(8), entry_count(2), [id(4)] * entry_count
-// The patch consumer treats the embedded list as the FULL new entry set
-// for the cell, discarding whatever it would have derived from old + remap.
+//   for each: cell_index(4), entry_count(2), [id(4)] * entry_count
+// cell_index is the position in the geo_cells/admin_cells array.
 static constexpr uint32_t ENTRY_CORRECTION_MARKER = 0xFFFFFFF8;
-
-// Entry correction DELTA marker: 0xFFFFFFF1 (gcpatch v3, replaces 0xFFFFFFF8)
-// Same intent as ENTRY_CORRECTION_MARKER but carries the per-cell SET
-// DIFFERENCE between remapped_old and new instead of the full new list.
-// For planet/full this shrinks the section from ~135 MiB worst-case to
-// ~tens of MiB and — more importantly — caps the cost of denser id_remaps
-// (each correction is bounded by the count of records that actually
-// shifted in/out of the cell, not the full per-cell entry count).
-//
-// Format: marker(4), file_id(4), count(4),
-//   for each: cell_id(8), n_removed(2), n_added(2),
-//             [id(4)] × n_removed, [id(4)] × n_added
-//
-// Both id lists are sorted ascending. Application:
-//   remapped_old = sorted(remap(old_entries[cell]))
-//   buf = remapped_old MINUS removed_ids   (multiset subtract, sorted merge)
-//   buf = buf UNION added_ids              (sorted merge)
-//   write buf as the new entry list for this cell (or NO if empty)
-// When the cell didn't exist in old, remapped_old is empty, n_removed
-// is always 0, and the section reduces to the full new list under added.
-static constexpr uint32_t ENTRY_CORRECTION_DELTA_MARKER = 0xFFFFFFF1;
 
 // Cell flag corrections marker: 0xFFFFFFF9
 // Format: marker, count(u32), [(cell_id:u64, flags:u8)] × count

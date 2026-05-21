@@ -1855,28 +1855,6 @@ int main(int argc, char* argv[]) {
         std::sort(ids.begin(), ids.end());
     };
 
-    // Multiset symmetric difference between two sorted u32 lists.
-    // `removed` = items in `d` not in `n` (with multiplicity).
-    // `added`   = items in `n` not in `d` (with multiplicity).
-    // The patch side reproduces the new list as (d MINUS removed) UNION added,
-    // so dropping duplicates here would mis-encode cells whose remapped_old
-    // list contains the same id twice (e.g. two old records remapped to the
-    // same new idx). Multiset semantics preserve correctness.
-    auto diff_ids = [](const std::vector<uint32_t>& d,
-                       const std::vector<uint32_t>& n,
-                       std::vector<uint32_t>& removed,
-                       std::vector<uint32_t>& added) {
-        removed.clear(); added.clear();
-        size_t di = 0, ni = 0;
-        while (di < d.size() && ni < n.size()) {
-            if (d[di] < n[ni]) { removed.push_back(d[di]); di++; }
-            else if (d[di] > n[ni]) { added.push_back(n[ni]); ni++; }
-            else { di++; ni++; }
-        }
-        while (di < d.size()) { removed.push_back(d[di]); di++; }
-        while (ni < n.size()) { added.push_back(n[ni]); ni++; }
-    };
-
     // Build sorted list of old cell_ids to handle added/removed cells
     size_t old_nc = old_geo_m.size / 20;
     size_t new_nc = new_geo_m.size / 20;
@@ -1975,9 +1953,8 @@ int main(int argc, char* argv[]) {
 
             if (eff_old == UINT64_MAX && n_cid == UINT64_MAX) break;
 
-            std::vector<uint32_t> removed, added;
             if (eff_old == n_cid) {
-                // Cell in both — derive remapped_old and set-diff against new
+                // Cell in both — compute derived and compare
                 std::vector<uint32_t> d_ids;
                 if (!is_added) {
                     uint32_t off; memcpy(&off, old_geo_m.data + oi * 20 + geo_off_pos, 4);
@@ -1989,18 +1966,16 @@ int main(int argc, char* argv[]) {
                 }
                 uint32_t n_off; memcpy(&n_off, new_geo_m.data + ni * 20 + geo_off_pos, 4);
                 auto n_ids = parse_ids_raw(new_entries.data, new_entries.size, n_off);
-                diff_ids(d_ids, n_ids, removed, added);
-                if (!removed.empty() || !added.empty()) {
-                    wval(buf, &eff_old, 8);
-                    uint16_t nr = (uint16_t)removed.size(), na = (uint16_t)added.size();
-                    wval(buf, &nr, 2); wval(buf, &na, 2);
-                    if (nr) buf.insert(buf.end(), (const char*)removed.data(), (const char*)removed.data() + nr * 4);
-                    if (na) buf.insert(buf.end(), (const char*)added.data(), (const char*)added.data() + na * 4);
+                bool differs = (d_ids.size() != n_ids.size()) ||
+                    (!d_ids.empty() && memcmp(d_ids.data(), n_ids.data(), d_ids.size() * 4) != 0);
+                if (differs) {
+                    wval(buf, &eff_old, 8); uint16_t c = n_ids.size(); wval(buf, &c, 2);
+                    if (!n_ids.empty()) buf.insert(buf.end(), (const char*)n_ids.data(), (const char*)n_ids.data() + n_ids.size() * 4);
                     dc++;
                 }
                 ni++;
             } else if (eff_old < n_cid) {
-                // Cell only in effective-old — correct to empty (remove all)
+                // Cell only in effective-old — correct to empty
                 std::vector<uint32_t> d_ids;
                 if (!is_added) {
                     uint32_t off; memcpy(&off, old_geo_m.data + oi * 20 + geo_off_pos, 4);
@@ -2011,27 +1986,22 @@ int main(int argc, char* argv[]) {
                     added_i++;
                 }
                 if (!d_ids.empty()) {
-                    wval(buf, &eff_old, 8);
-                    uint16_t nr = (uint16_t)d_ids.size(), na = 0;
-                    wval(buf, &nr, 2); wval(buf, &na, 2);
-                    buf.insert(buf.end(), (const char*)d_ids.data(), (const char*)d_ids.data() + nr * 4);
+                    wval(buf, &eff_old, 8); uint16_t c = 0; wval(buf, &c, 2);
                     dc++;
                 }
             } else {
-                // Cell only in new — remapped_old is empty, everything is added
+                // Cell only in new — emit new entries
                 uint32_t n_off; memcpy(&n_off, new_geo_m.data + ni * 20 + geo_off_pos, 4);
                 auto n_ids = parse_ids_raw(new_entries.data, new_entries.size, n_off);
                 if (!n_ids.empty()) {
-                    wval(buf, &n_cid, 8);
-                    uint16_t nr = 0, na = (uint16_t)n_ids.size();
-                    wval(buf, &nr, 2); wval(buf, &na, 2);
-                    buf.insert(buf.end(), (const char*)n_ids.data(), (const char*)n_ids.data() + na * 4);
+                    wval(buf, &n_cid, 8); uint16_t c = n_ids.size(); wval(buf, &c, 2);
+                    buf.insert(buf.end(), (const char*)n_ids.data(), (const char*)n_ids.data() + n_ids.size() * 4);
                     dc++;
                 }
                 ni++;
             }
         }
-        uint32_t marker = ENTRY_CORRECTION_DELTA_MARKER, file = static_cast<uint32_t>(fid);
+        uint32_t marker = ENTRY_CORRECTION_MARKER, file = static_cast<uint32_t>(fid);
         memcpy(buf.data(), &marker, 4); memcpy(buf.data() + 4, &file, 4); memcpy(buf.data() + 8, &dc, 4);
         std::cerr << "  " << fname << ": " << dc << " cell corrections (" << buf.size() - 12 << " bytes)" << std::endl;
         return buf;
@@ -2087,30 +2057,15 @@ int main(int argc, char* argv[]) {
         auto dm = parse_admin(admin_derived.admin_cells_data, admin_derived.admin_entries_data);
         auto nm = parse_admin(new_admc, new_adme);
         std::vector<char> buf; buf.resize(12, 0); uint32_t dc = 0;
-        std::vector<uint32_t> removed, added;
         for (auto& [cid, nids] : nm) {
             auto it = dm.find(cid); auto* dids = it != dm.end() ? &it->second : nullptr;
-            if (dids) diff_ids(*dids, nids, removed, added);
-            else      { removed.clear(); added = nids; }
-            if (!removed.empty() || !added.empty()) {
-                wval(buf, &cid, 8);
-                uint16_t nr = (uint16_t)removed.size(), na = (uint16_t)added.size();
-                wval(buf, &nr, 2); wval(buf, &na, 2);
-                if (nr) buf.insert(buf.end(), (const char*)removed.data(), (const char*)removed.data()+nr*4);
-                if (na) buf.insert(buf.end(), (const char*)added.data(), (const char*)added.data()+na*4);
-                dc++;
-            }
+            bool differs = !dids ? !nids.empty() : (dids->size() != nids.size()) ||
+                          (!dids->empty() && memcmp(dids->data(), nids.data(), dids->size()*4) != 0);
+            if (differs) { wval(buf, &cid, 8); uint16_t c = nids.size(); wval(buf, &c, 2);
+                if (!nids.empty()) buf.insert(buf.end(), (const char*)nids.data(), (const char*)nids.data()+nids.size()*4); dc++; }
         }
-        for (auto& [cid, dids] : dm) {
-            if (!nm.count(cid) && !dids.empty()) {
-                wval(buf, &cid, 8);
-                uint16_t nr = (uint16_t)dids.size(), na = 0;
-                wval(buf, &nr, 2); wval(buf, &na, 2);
-                buf.insert(buf.end(), (const char*)dids.data(), (const char*)dids.data()+nr*4);
-                dc++;
-            }
-        }
-        uint32_t marker = ENTRY_CORRECTION_DELTA_MARKER, file = static_cast<uint32_t>(PatchFileId::ADMIN_ENTRIES);
+        for (auto& [cid, dids] : dm) { if (!nm.count(cid) && !dids.empty()) { wval(buf, &cid, 8); uint16_t c = 0; wval(buf, &c, 2); dc++; } }
+        uint32_t marker = ENTRY_CORRECTION_MARKER, file = static_cast<uint32_t>(PatchFileId::ADMIN_ENTRIES);
         memcpy(buf.data(), &marker, 4); memcpy(buf.data()+4, &file, 4); memcpy(buf.data()+8, &dc, 4);
         patch.insert(patch.end(), buf.begin(), buf.end());
         std::cerr << "  admin_entries.bin: " << dc << " cell corrections (" << buf.size()-12 << " bytes)" << std::endl;
@@ -2144,30 +2099,15 @@ int main(int argc, char* argv[]) {
         auto dm = parse_poi(poi_derived.poi_cells_data, poi_derived.poi_entries_data);
         auto nm = parse_poi(new_poic, new_poie);
         std::vector<char> buf; buf.resize(12, 0); uint32_t dc = 0;
-        std::vector<uint32_t> removed, added;
         for (auto& [cid, nids] : nm) {
             auto it = dm.find(cid); auto* dids = it != dm.end() ? &it->second : nullptr;
-            if (dids) diff_ids(*dids, nids, removed, added);
-            else      { removed.clear(); added = nids; }
-            if (!removed.empty() || !added.empty()) {
-                wval(buf, &cid, 8);
-                uint16_t nr = (uint16_t)removed.size(), na = (uint16_t)added.size();
-                wval(buf, &nr, 2); wval(buf, &na, 2);
-                if (nr) buf.insert(buf.end(), (const char*)removed.data(), (const char*)removed.data()+nr*4);
-                if (na) buf.insert(buf.end(), (const char*)added.data(), (const char*)added.data()+na*4);
-                dc++;
-            }
+            bool differs = !dids ? !nids.empty() : (dids->size() != nids.size()) ||
+                          (!dids->empty() && memcmp(dids->data(), nids.data(), dids->size()*4) != 0);
+            if (differs) { wval(buf, &cid, 8); uint16_t c = nids.size(); wval(buf, &c, 2);
+                if (!nids.empty()) buf.insert(buf.end(), (const char*)nids.data(), (const char*)nids.data()+nids.size()*4); dc++; }
         }
-        for (auto& [cid, dids] : dm) {
-            if (!nm.count(cid) && !dids.empty()) {
-                wval(buf, &cid, 8);
-                uint16_t nr = (uint16_t)dids.size(), na = 0;
-                wval(buf, &nr, 2); wval(buf, &na, 2);
-                buf.insert(buf.end(), (const char*)dids.data(), (const char*)dids.data()+nr*4);
-                dc++;
-            }
-        }
-        uint32_t marker = ENTRY_CORRECTION_DELTA_MARKER, file = static_cast<uint32_t>(PatchFileId::POI_ENTRIES);
+        for (auto& [cid, dids] : dm) { if (!nm.count(cid) && !dids.empty()) { wval(buf, &cid, 8); uint16_t c = 0; wval(buf, &c, 2); dc++; } }
+        uint32_t marker = ENTRY_CORRECTION_MARKER, file = static_cast<uint32_t>(PatchFileId::POI_ENTRIES);
         memcpy(buf.data(), &marker, 4); memcpy(buf.data()+4, &file, 4); memcpy(buf.data()+8, &dc, 4);
         patch.insert(patch.end(), buf.begin(), buf.end());
         std::cerr << "  poi_entries.bin: " << dc << " cell corrections (" << buf.size()-12 << " bytes)" << std::endl;
@@ -2201,30 +2141,15 @@ int main(int argc, char* argv[]) {
         auto dm = parse_place(place_derived.place_cells_data, place_derived.place_entries_data);
         auto nm = parse_place(new_plc, new_ple);
         std::vector<char> buf; buf.resize(12, 0); uint32_t dc = 0;
-        std::vector<uint32_t> removed, added;
         for (auto& [cid, nids] : nm) {
             auto it = dm.find(cid); auto* dids = it != dm.end() ? &it->second : nullptr;
-            if (dids) diff_ids(*dids, nids, removed, added);
-            else      { removed.clear(); added = nids; }
-            if (!removed.empty() || !added.empty()) {
-                wval(buf, &cid, 8);
-                uint16_t nr = (uint16_t)removed.size(), na = (uint16_t)added.size();
-                wval(buf, &nr, 2); wval(buf, &na, 2);
-                if (nr) buf.insert(buf.end(), (const char*)removed.data(), (const char*)removed.data()+nr*4);
-                if (na) buf.insert(buf.end(), (const char*)added.data(), (const char*)added.data()+na*4);
-                dc++;
-            }
+            bool differs = !dids ? !nids.empty() : (dids->size() != nids.size()) ||
+                          (!dids->empty() && memcmp(dids->data(), nids.data(), dids->size()*4) != 0);
+            if (differs) { wval(buf, &cid, 8); uint16_t c = nids.size(); wval(buf, &c, 2);
+                if (!nids.empty()) buf.insert(buf.end(), (const char*)nids.data(), (const char*)nids.data()+nids.size()*4); dc++; }
         }
-        for (auto& [cid, dids] : dm) {
-            if (!nm.count(cid) && !dids.empty()) {
-                wval(buf, &cid, 8);
-                uint16_t nr = (uint16_t)dids.size(), na = 0;
-                wval(buf, &nr, 2); wval(buf, &na, 2);
-                buf.insert(buf.end(), (const char*)dids.data(), (const char*)dids.data()+nr*4);
-                dc++;
-            }
-        }
-        uint32_t marker = ENTRY_CORRECTION_DELTA_MARKER, file = static_cast<uint32_t>(PatchFileId::PLACE_ENTRIES);
+        for (auto& [cid, dids] : dm) { if (!nm.count(cid) && !dids.empty()) { wval(buf, &cid, 8); uint16_t c = 0; wval(buf, &c, 2); dc++; } }
+        uint32_t marker = ENTRY_CORRECTION_MARKER, file = static_cast<uint32_t>(PatchFileId::PLACE_ENTRIES);
         memcpy(buf.data(), &marker, 4); memcpy(buf.data()+4, &file, 4); memcpy(buf.data()+8, &dc, 4);
         patch.insert(patch.end(), buf.begin(), buf.end());
         std::cerr << "  place_entries.bin: " << dc << " cell corrections (" << buf.size()-12 << " bytes)" << std::endl;
