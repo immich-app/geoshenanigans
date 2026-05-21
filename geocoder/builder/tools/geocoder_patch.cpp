@@ -277,7 +277,19 @@ int main(int argc, char* argv[]) {
     std::unordered_map<uint32_t, std::vector<uint32_t>> id_remaps;
     std::vector<uint64_t> geo_added, geo_removed, admin_added, admin_removed, poi_added, poi_removed, place_added, place_removed;
     std::unordered_map<uint64_t, uint8_t> flag_corrections;
-    struct CellCorr { uint64_t cell_id; std::vector<uint32_t> ids; };
+    // CellCorr supports two formats:
+    //   - Legacy ENTRY_CORRECTION_MARKER (0xFFFFFFF8): `added` holds the full
+    //     new entry list and `removed` is empty + `is_delta == false`. Apply
+    //     by overwriting whatever remapped_old would have been.
+    //   - Delta ENTRY_CORRECTION_DELTA_MARKER (0xFFFFFFF1): `removed` lists
+    //     ids to subtract from remapped_old (multiset) and `added` lists ids
+    //     to merge in. Apply by computing remapped_old then transforming it.
+    struct CellCorr {
+        uint64_t cell_id;
+        std::vector<uint32_t> removed;
+        std::vector<uint32_t> added;
+        bool is_delta;
+    };
     std::unordered_map<uint32_t, std::vector<CellCorr>> entry_corrections;
     // POI parent-id remap (from POI_PARENT_REMAP_MARKER). Applied during
     // POI_RECORDS MATCH replay to bytes 24/28/32 of each record alongside
@@ -445,9 +457,27 @@ int main(int argc, char* argv[]) {
                 uint16_t ec; memcpy(&ec, P+pos, 2); pos += 2;
                 std::vector<uint32_t> ids(ec);
                 if (ec > 0) { memcpy(ids.data(), P+pos, ec*4); pos += ec*4; }
-                list.push_back({cid, std::move(ids)});
+                // Legacy full-list correction → store under `added` with
+                // `is_delta=false`. The apply path treats it as the literal
+                // new list and skips the remapped_old derivation.
+                list.push_back({cid, {}, std::move(ids), false});
             }
             std::cerr << "  Entry corrections " << fid << ": " << c << std::endl;
+            continue;
+        }
+        if (file_id == ENTRY_CORRECTION_DELTA_MARKER) {
+            uint32_t fid = ru32(), c = ru32();
+            auto& list = entry_corrections[fid];
+            for (uint32_t i = 0; i < c; i++) {
+                uint64_t cid; memcpy(&cid, P+pos, 8); pos += 8;
+                uint16_t nr; memcpy(&nr, P+pos, 2); pos += 2;
+                uint16_t na; memcpy(&na, P+pos, 2); pos += 2;
+                std::vector<uint32_t> removed(nr), added(na);
+                if (nr) { memcpy(removed.data(), P+pos, nr*4); pos += nr*4; }
+                if (na) { memcpy(added.data(),   P+pos, na*4); pos += na*4; }
+                list.push_back({cid, std::move(removed), std::move(added), true});
+            }
+            std::cerr << "  Entry corrections (delta) " << fid << ": " << c << std::endl;
             continue;
         }
 
@@ -839,23 +869,23 @@ int main(int argc, char* argv[]) {
 
         // Build sorted correction vectors + removed set (better cache locality than hash maps)
         std::unordered_set<uint64_t> rm_set(geo_removed.begin(), geo_removed.end());
-        struct CorrEntry { uint64_t cid; const std::vector<uint32_t>* ids; };
+        struct CorrEntry { uint64_t cid; const CellCorr* c; };
         std::vector<CorrEntry> cs, ca, ci_map;
         for (auto& [fid, list] : entry_corrections) {
             auto* v = (fid == (uint32_t)PatchFileId::STREET_ENTRIES) ? &cs :
                       (fid == (uint32_t)PatchFileId::ADDR_ENTRIES) ? &ca :
                       (fid == (uint32_t)PatchFileId::INTERP_ENTRIES) ? &ci_map : nullptr;
-            if (v) for (auto& c : list) v->push_back({c.cell_id, &c.ids});
+            if (v) for (auto& c : list) v->push_back({c.cell_id, &c});
         }
         auto corr_cmp = [](const CorrEntry& a, const CorrEntry& b) { return a.cid < b.cid; };
         std::sort(cs.begin(), cs.end(), corr_cmp);
         std::sort(ca.begin(), ca.end(), corr_cmp);
         std::sort(ci_map.begin(), ci_map.end(), corr_cmp);
         // Binary search helper
-        auto corr_find = [](const std::vector<CorrEntry>& v, uint64_t cid) -> const std::vector<uint32_t>* {
+        auto corr_find = [](const std::vector<CorrEntry>& v, uint64_t cid) -> const CellCorr* {
             auto it = std::lower_bound(v.begin(), v.end(), CorrEntry{cid, nullptr},
                 [](const CorrEntry& a, const CorrEntry& b) { return a.cid < b.cid; });
-            return (it != v.end() && it->cid == cid) ? it->ids : nullptr;
+            return (it != v.end() && it->cid == cid) ? it->c : nullptr;
         };
         // Added cells sorted
         std::sort(geo_added.begin(), geo_added.end());
@@ -916,18 +946,49 @@ int main(int argc, char* argv[]) {
                 }
                 auto fc = flag_corrections.find(cid);
                 if (fc != flag_corrections.end()) has = (fc->second & flag_bit) != 0;
-                auto* corr_ids = corr_find(corr, cid);
-                if (corr_ids) has = true;
+                const CellCorr* cc = corr_find(corr, cid);
+                if (cc) has = true;
                 if (!has) return NO;
 
-                if (corr_ids) return emit(outf, corr_ids->data(), corr_ids->size());
+                // Legacy full-list correction: emit added directly, skip
+                // the remapped_old derivation entirely.
+                if (cc && !cc->is_delta) return emit(outf, cc->added.data(), cc->added.size());
 
-                if (oi < 0) return NO;
-                if ((size_t)oi * 20 + geo_off + 4 > m_geo.size) return NO;
-                uint32_t off; memcpy(&off, m_geo.data + oi * 20 + geo_off, 4);
-                parse(old_e, off);
+                // Derive remapped_old (may be empty if oi<0 or no entries).
+                buf.clear();
+                if (oi >= 0 && (size_t)oi * 20 + geo_off + 4 <= m_geo.size) {
+                    uint32_t off; memcpy(&off, m_geo.data + oi * 20 + geo_off, 4);
+                    parse(old_e, off);
+                    if (!buf.empty()) remap(buf, rm);
+                }
+                if (cc && cc->is_delta) {
+                    // Apply delta: (remapped_old MINUS removed) UNION added.
+                    // All three lists are sorted; do sorted merge subtraction
+                    // followed by sorted merge union.
+                    const auto& rem = cc->removed;
+                    const auto& add = cc->added;
+                    std::vector<uint32_t> tmp;
+                    tmp.reserve(buf.size() + add.size());
+                    size_t bi = 0, ri = 0;
+                    while (bi < buf.size() && ri < rem.size()) {
+                        if (buf[bi] < rem[ri]) { tmp.push_back(buf[bi]); bi++; }
+                        else if (buf[bi] > rem[ri]) { ri++; }
+                        else { bi++; ri++; }
+                    }
+                    while (bi < buf.size()) { tmp.push_back(buf[bi]); bi++; }
+                    // Now tmp = remapped_old - removed (sorted). Merge with sorted added.
+                    std::vector<uint32_t> result;
+                    result.reserve(tmp.size() + add.size());
+                    size_t ti = 0, ai = 0;
+                    while (ti < tmp.size() && ai < add.size()) {
+                        if (tmp[ti] <= add[ai]) { result.push_back(tmp[ti]); ti++; }
+                        else                     { result.push_back(add[ai]); ai++; }
+                    }
+                    while (ti < tmp.size()) { result.push_back(tmp[ti]); ti++; }
+                    while (ai < add.size()) { result.push_back(add[ai]); ai++; }
+                    buf = std::move(result);
+                }
                 if (buf.empty()) return NO;
-                remap(buf, rm);
                 return emit(outf, buf.data(), buf.size());
             };
 
@@ -984,22 +1045,60 @@ int main(int argc, char* argv[]) {
 
             auto ecit = entry_corrections.find((uint32_t)PatchFileId::ADMIN_ENTRIES);
             if (ecit != entry_corrections.end()) {
-                std::unordered_map<uint64_t, const std::vector<uint32_t>*> ac_corr;
-                for (auto& c : ecit->second) ac_corr[c.cell_id] = &c.ids;
+                std::unordered_map<uint64_t, const CellCorr*> ac_corr;
+                for (auto& c : ecit->second) ac_corr[c.cell_id] = &c;
                 size_t n = admin.admin_cells_data.size() / 12;
                 FILE* fac = fopen((out_dir + "/admin_cells.bin").c_str(), "wb");
                 FILE* fae = fopen((out_dir + "/admin_entries.bin").c_str(), "wb");
                 uint32_t ae_wpos = 0;
+                std::vector<uint32_t> tmp_ids;
                 for (size_t i = 0; i < n; i++) {
                     uint64_t cid; memcpy(&cid, admin.admin_cells_data.data()+i*12, 8);
                     fwrite(&cid, 8, 1, fac);
                     auto cit = ac_corr.find(cid);
                     if (cit != ac_corr.end()) {
-                        uint32_t off = cit->second->empty() ? no_data : ae_wpos;
+                        const CellCorr* cc = cit->second;
+                        const std::vector<uint32_t>* eff;
+                        if (!cc->is_delta) {
+                            eff = &cc->added; // legacy: full new list
+                        } else {
+                            // Derive remapped_old from rebuilt admin file, apply delta
+                            tmp_ids.clear();
+                            uint32_t old_off; memcpy(&old_off, admin.admin_cells_data.data()+i*12+8, 4);
+                            if (old_off != no_data && old_off+2 <= admin.admin_entries_data.size()) {
+                                uint16_t oc; memcpy(&oc, admin.admin_entries_data.data()+old_off, 2);
+                                if (old_off + 2 + (size_t)oc*4 <= admin.admin_entries_data.size()) {
+                                    tmp_ids.resize(oc);
+                                    memcpy(tmp_ids.data(), admin.admin_entries_data.data()+old_off+2, oc*4);
+                                }
+                            }
+                            // Apply delta: (tmp_ids - removed) UNION added (all sorted)
+                            const auto& rem = cc->removed; const auto& add = cc->added;
+                            std::vector<uint32_t> sub;
+                            sub.reserve(tmp_ids.size());
+                            size_t bi=0, ri=0;
+                            while (bi < tmp_ids.size() && ri < rem.size()) {
+                                if (tmp_ids[bi] < rem[ri])      { sub.push_back(tmp_ids[bi]); bi++; }
+                                else if (tmp_ids[bi] > rem[ri]) { ri++; }
+                                else                              { bi++; ri++; }
+                            }
+                            while (bi < tmp_ids.size()) { sub.push_back(tmp_ids[bi]); bi++; }
+                            tmp_ids.clear();
+                            tmp_ids.reserve(sub.size() + add.size());
+                            size_t si=0, ai=0;
+                            while (si < sub.size() && ai < add.size()) {
+                                if (sub[si] <= add[ai]) { tmp_ids.push_back(sub[si]); si++; }
+                                else                     { tmp_ids.push_back(add[ai]); ai++; }
+                            }
+                            while (si < sub.size()) { tmp_ids.push_back(sub[si]); si++; }
+                            while (ai < add.size()) { tmp_ids.push_back(add[ai]); ai++; }
+                            eff = &tmp_ids;
+                        }
+                        uint32_t off = eff->empty() ? no_data : ae_wpos;
                         fwrite(&off, 4, 1, fac);
-                        if (!cit->second->empty()) {
-                            uint16_t c = cit->second->size();
-                            fwrite(&c, 2, 1, fae); fwrite(cit->second->data(), 4, c, fae);
+                        if (!eff->empty()) {
+                            uint16_t c = eff->size();
+                            fwrite(&c, 2, 1, fae); fwrite(eff->data(), 4, c, fae);
                             ae_wpos += 2 + c*4;
                         }
                     } else {
@@ -1079,21 +1178,50 @@ int main(int argc, char* argv[]) {
                 // Apply entry corrections
                 auto ecit = entry_corrections.find((uint32_t)PatchFileId::POI_ENTRIES);
                 if (ecit != entry_corrections.end()) {
-                    std::unordered_map<uint64_t, const std::vector<uint32_t>*> pc_corr;
-                    for (auto& c : ecit->second) pc_corr[c.cell_id] = &c.ids;
+                    std::unordered_map<uint64_t, const CellCorr*> pc_corr;
+                    for (auto& cc : ecit->second) pc_corr[cc.cell_id] = &cc;
                     FILE* fpc = fopen((out_dir + "/poi_cells.bin").c_str(), "wb");
                     FILE* fpe = fopen((out_dir + "/poi_entries.bin").c_str(), "wb");
                     uint32_t pe_wpos = 0;
+                    std::vector<uint32_t> tmp_ids;
                     for (size_t i = 0; i < poi_cells.size(); i++) {
                         uint64_t cid = poi_cells[i].cell_id;
                         fwrite(&cid, 8, 1, fpc);
                         auto cit = pc_corr.find(cid);
                         if (cit != pc_corr.end()) {
-                            uint32_t off = cit->second->empty() ? no_data : pe_wpos;
+                            const CellCorr* cc = cit->second;
+                            const std::vector<uint32_t>* eff;
+                            if (!cc->is_delta) {
+                                eff = &cc->added;
+                            } else {
+                                // poi_cells[i].ids IS the remapped_old (sorted)
+                                tmp_ids = poi_cells[i].ids;
+                                const auto& rem = cc->removed; const auto& add = cc->added;
+                                std::vector<uint32_t> sub;
+                                sub.reserve(tmp_ids.size());
+                                size_t bi=0, ri=0;
+                                while (bi < tmp_ids.size() && ri < rem.size()) {
+                                    if (tmp_ids[bi] < rem[ri])      { sub.push_back(tmp_ids[bi]); bi++; }
+                                    else if (tmp_ids[bi] > rem[ri]) { ri++; }
+                                    else                              { bi++; ri++; }
+                                }
+                                while (bi < tmp_ids.size()) { sub.push_back(tmp_ids[bi]); bi++; }
+                                tmp_ids.clear();
+                                tmp_ids.reserve(sub.size() + add.size());
+                                size_t si=0, ai=0;
+                                while (si < sub.size() && ai < add.size()) {
+                                    if (sub[si] <= add[ai]) { tmp_ids.push_back(sub[si]); si++; }
+                                    else                     { tmp_ids.push_back(add[ai]); ai++; }
+                                }
+                                while (si < sub.size()) { tmp_ids.push_back(sub[si]); si++; }
+                                while (ai < add.size()) { tmp_ids.push_back(add[ai]); ai++; }
+                                eff = &tmp_ids;
+                            }
+                            uint32_t off = eff->empty() ? no_data : pe_wpos;
                             fwrite(&off, 4, 1, fpc);
-                            if (!cit->second->empty()) {
-                                uint16_t c = cit->second->size();
-                                fwrite(&c, 2, 1, fpe); fwrite(cit->second->data(), 4, c, fpe);
+                            if (!eff->empty()) {
+                                uint16_t c = eff->size();
+                                fwrite(&c, 2, 1, fpe); fwrite(eff->data(), 4, c, fpe);
                                 pe_wpos += 2 + c*4;
                             }
                         } else {
@@ -1196,21 +1324,50 @@ int main(int argc, char* argv[]) {
                 // Apply entry corrections
                 auto ecit = entry_corrections.find((uint32_t)PatchFileId::PLACE_ENTRIES);
                 if (ecit != entry_corrections.end()) {
-                    std::unordered_map<uint64_t, const std::vector<uint32_t>*> plc_corr;
-                    for (auto& c : ecit->second) plc_corr[c.cell_id] = &c.ids;
+                    std::unordered_map<uint64_t, const CellCorr*> plc_corr;
+                    for (auto& cc : ecit->second) plc_corr[cc.cell_id] = &cc;
                     FILE* fplc = fopen((out_dir + "/place_cells.bin").c_str(), "wb");
                     FILE* fple = fopen((out_dir + "/place_entries.bin").c_str(), "wb");
                     uint32_t ple_wpos = 0;
+                    std::vector<uint32_t> tmp_ids;
                     for (size_t i = 0; i < place_cells.size(); i++) {
                         uint64_t cid = place_cells[i].cell_id;
                         fwrite(&cid, 8, 1, fplc);
                         auto cit = plc_corr.find(cid);
                         if (cit != plc_corr.end()) {
-                            uint32_t off = cit->second->empty() ? no_data : ple_wpos;
+                            const CellCorr* cc = cit->second;
+                            const std::vector<uint32_t>* eff;
+                            if (!cc->is_delta) {
+                                eff = &cc->added;
+                            } else {
+                                // place_cells[i].ids IS the remapped_old (sorted)
+                                tmp_ids = place_cells[i].ids;
+                                const auto& rem = cc->removed; const auto& add = cc->added;
+                                std::vector<uint32_t> sub;
+                                sub.reserve(tmp_ids.size());
+                                size_t bi=0, ri=0;
+                                while (bi < tmp_ids.size() && ri < rem.size()) {
+                                    if (tmp_ids[bi] < rem[ri])      { sub.push_back(tmp_ids[bi]); bi++; }
+                                    else if (tmp_ids[bi] > rem[ri]) { ri++; }
+                                    else                              { bi++; ri++; }
+                                }
+                                while (bi < tmp_ids.size()) { sub.push_back(tmp_ids[bi]); bi++; }
+                                tmp_ids.clear();
+                                tmp_ids.reserve(sub.size() + add.size());
+                                size_t si=0, ai=0;
+                                while (si < sub.size() && ai < add.size()) {
+                                    if (sub[si] <= add[ai]) { tmp_ids.push_back(sub[si]); si++; }
+                                    else                     { tmp_ids.push_back(add[ai]); ai++; }
+                                }
+                                while (si < sub.size()) { tmp_ids.push_back(sub[si]); si++; }
+                                while (ai < add.size()) { tmp_ids.push_back(add[ai]); ai++; }
+                                eff = &tmp_ids;
+                            }
+                            uint32_t off = eff->empty() ? no_data : ple_wpos;
                             fwrite(&off, 4, 1, fplc);
-                            if (!cit->second->empty()) {
-                                uint16_t c = cit->second->size();
-                                fwrite(&c, 2, 1, fple); fwrite(cit->second->data(), 4, c, fple);
+                            if (!eff->empty()) {
+                                uint16_t c = eff->size();
+                                fwrite(&c, 2, 1, fple); fwrite(eff->data(), 4, c, fple);
                                 ple_wpos += 2 + c*4;
                             }
                         } else {
