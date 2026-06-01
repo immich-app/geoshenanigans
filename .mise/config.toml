@@ -1,5 +1,5 @@
 [tools]
-opentofu = "1.11.8"
+opentofu = "1.12.1"
 rclone = "1.74.1"
 terragrunt = "1.0.5"
 
