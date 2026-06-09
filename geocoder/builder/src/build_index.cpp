@@ -2382,6 +2382,15 @@ int main(int argc, char* argv[]) {
                 {
                     log_phase("Pass 2b: way processing", _pt, _cpu);
                     pbf.unmap(); // release 86 GiB PBF mmap before admin/S2 phases
+                    // Release the dense node index here, BEFORE admin/POI
+                    // ring assembly runs — that phase only reads from
+                    // data.way_geometries (pre-resolved way coords) and
+                    // never calls index.get(). Releasing here drops peak
+                    // RSS from ~196 GiB (with the index resident during
+                    // admin assembly) to ~75 GiB on planet. Previously
+                    // released ~700 lines below at line 2887.
+                    index.release();
+                    std::cerr << "Released dense node index (pre-admin)." << std::endl;
                     std::cerr << "  Assembling admin polygons in parallel ("
                               << data.collected_relations.size() << " relations, "
                               << data.way_geometries.size() << " way geometries)..." << std::endl;
