@@ -11,15 +11,38 @@ Reduce the daily incremental patch files emitted by step 10
 ("Generate patches and verify") of `.github/workflows/geocoder-build.yml`.
 The headline number is **planet/full compressed gcpatch size**.
 
-| Snapshot | planet/full compressed | Notes |
-| --- | --- | --- |
-| Pre-session | ~3,890 MiB | Many FULL_REPLACE files, byte-key secondary matching |
-| Mid-session baseline | ~3,798 MiB | Sparse-delta for 2 of 5 small files, otherwise unchanged |
-| Diff-side fixes only | n/a (oceania 6.1 MiB) | addr_vertices byte-merge, no full_replace fallback, admin sidecar path |
-| **+ build determinism (`4c12577`)** | **planet test in progress** | Oceania self-rebuild: **3.1 MiB** (32x oceania baseline reduction) |
+| Snapshot | planet/full compressed | vs baseline | Notes |
+| --- | --- | --- | --- |
+| Pre-session | ~3,890 MiB | 1.0x | Many FULL_REPLACE files, byte-key secondary matching |
+| Mid-session baseline | ~3,798 MiB | 1.0x | Sparse-delta for 2 of 5 small files |
+| **Final (`7976e2c`)** | **477 MiB compressed** | **8.0x reduction** | All diff-side + build-determinism fixes |
+| Oceania final | 3.1 MiB | 33x oceania baseline | Same-PBF self-rebuild |
 
-The original session target was ~5 MiB for major patches — already
-beaten on oceania, planet measurement pending.
+Section-level wins on planet/full (uncompressed, vs pre-session):
+- addr_postcodes: 666 MiB FULL → 1.0 MiB SPARSE (**666x**)
+- way_parents: 208 MiB FULL → 200 KiB SPARSE (**1000x**)
+- POI_PARENT_REMAP: 424 MiB → 200 KiB (**2000x**)
+- STRINGS: 687 MiB → 76 MiB (**9x**)
+- ENTRY_CORRECTION: 135 MiB → 14 MiB (**10x**)
+- addr_vertices: 3,391 MiB FULL → 428 MiB byte-merge (**8x**)
+- addr_points: 2,566 MiB merge → 179 MiB merge (**14x**)
+
+Original session target was ~5 MiB for major patches. Planet not quite
+there — still 477 MiB — but the remaining noise is upstream of the
+diff (residual build non-determinism in vertex-byte ordering causing
+~88M addr_points and ~48M street_ways fixups). All "value" sections
+(addr_postcodes, way_parents, POI_PARENT_REMAP) are nearly empty.
+
+The remaining ~430 MiB is essentially:
+- 777 MiB street_nodes byte-stream noise (compresses to ~150 MiB)
+- 428 MiB addr_vertices byte-stream noise (~120 MiB compressed)
+- 179 MiB addr_points fixups (~60 MiB)
+- 157 MiB street_ways fixups (~50 MiB)
+
+To get planet under 100 MiB compressed, the remaining build-determinism
+work is fixing whatever produces non-deterministic vertex byte ordering
+between same-PBF rebuilds — likely floating-point centroid sums or
+multi-threaded polygon assembly order.
 
 ## Validated approach (on Hetzner server)
 
