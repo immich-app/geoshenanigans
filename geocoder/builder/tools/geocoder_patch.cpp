@@ -644,6 +644,24 @@ int main(int argc, char* argv[]) {
             uint8_t op = P[pos++];
             uint32_t count; memcpy(&count, P+pos, 4); pos += 4;
             if (op == OP_MATCH_RUN) {
+                // Fast path: byte streams (stride=1) with no per-record
+                // transforms become a single bulk fwrite of `count` bytes
+                // from old. Used by admin_vertices / poi_vertices /
+                // addr_vertices byte-block merges where each MATCH spans
+                // a whole polygon footprint (often dozens to thousands
+                // of bytes). The per-byte loop below would do `count`
+                // fwrite calls each writing 1 byte — fine for tiny
+                // files but catastrophic at planet/full's 3.4 GiB
+                // addr_vertices.
+                if (actual_stride == 1 && !needs_remap && !needs_padding
+                    && remap_offs.empty() && n_fixups == 0) {
+                    if (old_bytes + count <= old_mmap.size) {
+                        fwrite(old_mmap.data + old_bytes, 1, count, outf);
+                    }
+                    written += count;
+                    old_rec += count; new_rec += count; old_bytes += count;
+                    continue;
+                }
                 for (uint32_t k = 0; k < count; k++) {
                     size_t rec_off = old_bytes + k * actual_stride;
                     if (rec_off + actual_stride > old_mmap.size) break;

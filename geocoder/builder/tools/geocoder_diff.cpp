@@ -831,7 +831,7 @@ int main(int argc, char* argv[]) {
     // Group 2: street_ways → street_nodes (sequential within group)
     // Group 3: interp_ways → interp_nodes (sequential within group)
     // Group 4: admin_polygons → admin_vertices (sequential within group)
-    FileMergeResult res_addr, res_ways, res_nodes, res_interp_w, res_interp_n, res_admin_p, res_admin_v, res_poi_r, res_poi_v, res_place_n;
+    FileMergeResult res_addr, res_addr_v, res_ways, res_nodes, res_interp_w, res_interp_n, res_admin_p, res_admin_v, res_poi_r, res_poi_v, res_place_n;
 
     // Helper to build parent-aware node merge from a parent way merge
     // count_u32: true for admin_polygons (vertex_count is uint32_t at offset 4)
@@ -1079,6 +1079,35 @@ int main(int argc, char* argv[]) {
                 }
             }
         }
+        // Identify polygon-bearing addr_points across builds by polygon
+        // VERTEX BYTE CONTENT (purely content-hash; key_fn returns 0 so
+        // the match is independent of any other addr_point field). This
+        // rewrites old_m's byte-20 vertex_offset to point at the matching
+        // polygon's byte position in NEW addr_vertices, so build_merge_seq
+        // below classifies stable-polygon addr_points as MATCH instead of
+        // DELETE+INSERT — without depending on slot stability.
+        //
+        // For point-only addr_points (vertex_offset==NO_DATA, block_size
+        // 0), the fixup is a no-op (NO_DATA→NO_DATA). Their identity is
+        // recovered downstream by str_remap + the secondary-match path.
+        MappedFile old_av{}, new_av{};
+        std::vector<uint32_t> old_vert_offsets;
+        if (addr_stride >= 28) {
+            old_av = mmap_file(old_dir + "/addr_vertices.bin");
+            new_av = mmap_file(new_dir + "/addr_vertices.bin");
+            size_t n_old = old_m.size / addr_stride;
+            old_vert_offsets.resize(n_old);
+            for (size_t i = 0; i < n_old; i++)
+                memcpy(&old_vert_offsets[i],
+                       old_m.data + i * addr_stride + 20, 4);
+            fixup_v15_offsets(old_m.data, old_m.size,
+                              old_av.data ? old_av.data : "", old_av.size,
+                              new_m.data, new_m.size,
+                              new_av.data ? new_av.data : "", new_av.size,
+                              addr_stride, /*off_field_pos*/ 20,
+                              /*key_fn*/ [](const char*) -> uint64_t { return 0; });
+        }
+
         auto seq = build_merge_seq(old_m.data, old_m.size, new_m.data, new_m.size, addr_stride);
         auto soft = secondary_match_from_merge(seq, old_m.data, old_m.size, new_m.data, new_m.size, addr_stride,
             [](const char* rec) -> uint64_t {
@@ -1091,6 +1120,39 @@ int main(int argc, char* argv[]) {
         res_addr = {PatchFileId::ADDR_POINTS, "addr_points.bin", addr_stride,
                     old_m.size, new_m.size, std::move(seq), {}, std::move(soft), std::move(id_rm)};
         log_merge(res_addr);
+
+        // Byte-block merge for addr_vertices. Walk the addr_points parent
+        // merge sequence: MATCH parent slots contribute MATCH ops on the
+        // polygon byte block (since fixup_v15_offsets above made stable
+        // polygons share a byte position in BOTH old and new), DELETE
+        // parent slots drop their old block, INSERT parent slots emit
+        // new block bytes. Mirrors build_vertex_byte_merge usage for
+        // admin_vertices and poi_vertices.
+        if (addr_stride >= 28) {
+            // Restore old's original vertex_offsets so build_vertex_byte_merge
+            // reads each polygon's old block from the *original* byte
+            // position (it was rewritten by fixup_v15_offsets to match new).
+            size_t n_old = old_m.size / addr_stride;
+            for (size_t i = 0; i < n_old; i++)
+                memcpy(old_m.data + i * addr_stride + 20,
+                       &old_vert_offsets[i], 4);
+            auto av_seq = build_vertex_byte_merge(res_addr.seq,
+                old_m.data, old_m.size,
+                new_m.data, new_m.size,
+                old_av.data ? old_av.data : "", old_av.size,
+                new_av.data ? new_av.data : "", new_av.size,
+                addr_stride, /*off_field_pos*/ 20);
+            res_addr_v = {PatchFileId::ADDR_VERTICES, "addr_vertices.bin", 1,
+                          old_av.size, new_av.size, std::move(av_seq), {}};
+            log_merge(res_addr_v);
+        } else {
+            // Pre-v15 (no inline polygon header) — addr_vertices is fixed-
+            // stride NodeCoord array. Fall through to emit_raw later.
+            res_addr_v = {PatchFileId::ADDR_VERTICES, "addr_vertices.bin", 0,
+                          0, 0, MergeSequence{}, {}};
+        }
+        if (old_av.data) unmap_file(old_av);
+        if (new_av.data) unmap_file(new_av);
         unmap_file(old_m); unmap_file(new_m);
         log_time("  group:addr_points", gs);
         std::cerr << "  RSS after addr_points: " << get_rss_mb() << " MiB" << std::endl;
@@ -1718,6 +1780,14 @@ int main(int argc, char* argv[]) {
 
     // Serialize merge results to patch in canonical order, freeing as we go.
     serialize_merge(patch, res_addr);
+    // res_addr_v is built in t_addr only when addr_stride >= 28 (v15+);
+    // older variants leave stride=0 and old/new sizes 0, which we treat as
+    // "not built" → fall through to the emit_raw(ADDR_VERTICES) call later
+    // in the section pipeline. stride=1 marks a byte-merge ready to ship.
+    if (res_addr_v.stride == 1) {
+        serialize_merge(patch, res_addr_v);
+        { std::vector<char>().swap(res_addr_v.seq.data); }
+    }
     serialize_merge(patch, res_ways);
     serialize_merge(patch, res_nodes);
     { std::vector<char>().swap(res_nodes.seq.data); }
@@ -2432,7 +2502,12 @@ int main(int argc, char* argv[]) {
     emit_raw(PatchFileId::POSTCODE_CENTROID_ENTRIES, "postcode_centroid_entries.bin");
     emit_raw(PatchFileId::POSTAL_POLYGONS, "postal_polygons.bin");
     emit_raw(PatchFileId::POSTAL_VERTICES, "postal_vertices.bin");
-    emit_raw(PatchFileId::ADDR_VERTICES, "addr_vertices.bin");
+    // ADDR_VERTICES was already serialized as a byte-merge for v15+
+    // (addr_stride >= 28) just after res_addr. Only fall back to FULL_REPLACE
+    // here for older variants where t_addr left res_addr_v.stride == 0.
+    if (res_addr_v.stride != 1) {
+        emit_raw(PatchFileId::ADDR_VERTICES, "addr_vertices.bin");
+    }
 
     // Now safe to free str_remap — all consumers (sparse_delta above)
     // have finished using it.
