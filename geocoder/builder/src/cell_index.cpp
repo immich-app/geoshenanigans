@@ -332,10 +332,18 @@ static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir
 
     IdAllocator alloc;
     if (!prev_dir.empty()) {
-        // The admin variant always has admin_polygons.bin alongside
-        // its sidecar; quality variants are derived from the same
-        // polygon set and would have identical sidecars.
-        alloc.load_previous(prev_dir + "/admin/admin_polygons.osm_ids");
+        // admin_polygons.osm_ids canonical paths, in priority order:
+        // quality/uncapped (admin_polygons.bin written for every quality
+        // tier including uncapped, sidecars are identical), then quality/q2.5,
+        // then admin-minimal. Try each — only one needs to load successfully.
+        // (Previous comment claimed /admin/ — incorrect; admin_polygons.bin
+        // is not written there, so the sidecar isn't either, and
+        // load_previous silently failed → strategy-2 stability broke for
+        // every admin polygon between builds.)
+        if (!alloc.load_previous(prev_dir + "/quality/uncapped/admin_polygons.osm_ids"))
+        if (!alloc.load_previous(prev_dir + "/quality/q2.5/admin_polygons.osm_ids"))
+        if (!alloc.load_previous(prev_dir + "/admin-minimal/admin_polygons.osm_ids"))
+            { /* fall through: no prev — fresh allocation */ }
     }
 
     const size_t n_old = data.admin_polygons.size();
