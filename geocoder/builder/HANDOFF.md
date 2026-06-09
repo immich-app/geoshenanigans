@@ -79,6 +79,38 @@ on oceania (just the appended-slot byte count). Both contain the
 same data; the chain is what's published and reproducible from a
 prior day + chain of patches.
 
+### Multi-day chain (catch-up scenario)
+Concrete user: starts from `d1` full, downloads `patch_d2` + `patch_d3`,
+applies them in sequence.
+- `d1 + patch_d2 → step1_out` — all 26 `.bin` files byte-identical to
+  published `d2` ✓
+- `step1_out + patch_d3 → step2_out` — all 26 `.bin` files
+  byte-identical to published `d3` ✓
+
+5 of 31 `.osm_ids` sidecars in patched output stay stale (current patch
+format does not update them). Sidecars are pipeline-internal metadata
+used by the next build's `--prev-output` chain — end users / the
+runtime never query them. Including sidecars in patches is a small
+follow-up if we want patched output to be 31/31 file-equal.
+
+### Per-preset day-over-day sizes (oceania, real Geofabrik diff)
+
+| Preset | Uncompressed | Compressed |
+| --- | --- | --- |
+| `full` | 39.8 MiB | 8.1 MiB |
+| `admin` | 18.3 MiB | 2.7 MiB |
+| `no-addresses` | 33.2 MiB | 6.9 MiB |
+| `admin-minimal` | 6.3 MiB | 1.3 MiB |
+| `poi/all` | 50.9 MiB | 26.0 MiB |
+| `poi/major` | 17.7 MiB | 8.9 MiB |
+| `poi/notable` | 25.7 MiB | 13.6 MiB |
+| **Total all variants** | **192.0 MiB** | **67.5 MiB** |
+
+POI variants compress notably less well (~50% ratio vs ~20% for
+the others) — POI-data content shape is different (varint-encoded
+strings, denser numeric content) and may have room for a targeted
+optimization in a follow-up.
+
 ### Section breakdown (oceania same-PBF, 27 MiB uncompressed)
 | Section | Size | Notes |
 |---|---|---|
