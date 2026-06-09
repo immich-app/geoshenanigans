@@ -2455,38 +2455,20 @@ int main(int argc, char* argv[]) {
         // Per-run overhead is 8 bytes (pos+len); per-value cost is vs bytes.
         size_t rle_payload_bytes = (size_t)n_runs * 8 + (size_t)n_changes * value_stride;
         double mean_run_len = n_runs ? (double)n_changes / (double)n_runs : 0.0;
-        uint32_t fid_u = (uint32_t)fid;
-        // If the sparse delta turns out larger than just shipping the
-        // file (which happens when day-over-day stability is poor —
-        // strategy-2 not fully bootstrapped or many positions shift),
-        // fall back to full_replace so the patch never grows.
         size_t sparse_section_bytes = 4 /*stride*/ + 8 /*old_size*/ + 8 /*new_size*/
                                        + 4 /*value_stride*/ + 4 /*remap_kind*/
                                        + 4 /*n_changes*/ + delta_buf.size();
         size_t full_section_bytes = 4 /*stride*/ + 8 + 8 + 4 /*nfix*/ + 8 /*ds*/ + (size_t)new_size;
-        if (sparse_section_bytes >= full_section_bytes) {
-            uint32_t stride = 0;
-            uint32_t nfix = 0;
-            uint64_t ds = new_size;
-            wval(patch, &fid_u, 4);
-            wval(patch, &stride, 4);
-            wval(patch, &old_size, 8);
-            wval(patch, &new_size, 8);
-            wval(patch, &nfix, 4);
-            wval(patch, &ds, 8);
-            if (new_size > 0 && new_m.data) {
-                patch.insert(patch.end(), new_m.data, new_m.data + new_size);
-            }
-            if (old_m.data) unmap_file(old_m);
-            if (new_m.data) unmap_file(new_m);
-            std::cerr << "  " << fname << ": full replace " << new_size
-                      << " bytes (sparse would be " << sparse_section_bytes
-                      << " for " << n_changes << "/" << new_n
-                      << " runs=" << n_runs << " mean_run=" << mean_run_len
-                      << " max_run=" << max_run_len
-                      << " rle_payload=" << rle_payload_bytes << ")" << std::endl;
-            return;
-        }
+        // NOTE: we used to fall back to FULL_REPLACE when sparse ≥ full.
+        // That branch hid the underlying defect — sparse only grows past
+        // full when >50% of positions appear "changed" after remap, which
+        // means strategy-2 slot stability is broken upstream (the file
+        // contents at slot[i] genuinely diverge day-over-day instead of
+        // mostly matching via str_remap / admin_id_remap / postcode remap).
+        // Per project direction: never silently fall back. Always emit
+        // the sparse format and let the patch size expose the real cost
+        // of any instability so the build-side fix can be tracked.
+        uint32_t fid_u = (uint32_t)fid;
 
         uint32_t stride = SPARSE_DELTA_STRIDE;
         wval(patch, &fid_u, 4);
