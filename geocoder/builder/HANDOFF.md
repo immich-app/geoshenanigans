@@ -87,11 +87,13 @@ applies them in sequence.
 - `step1_out + patch_d3 → step2_out` — all 26 `.bin` files
   byte-identical to published `d3` ✓
 
-5 of 31 `.osm_ids` sidecars in patched output stay stale (current patch
-format does not update them). Sidecars are pipeline-internal metadata
-used by the next build's `--prev-output` chain — end users / the
-runtime never query them. Including sidecars in patches is a small
-follow-up if we want patched output to be 31/31 file-equal.
+5 of 31 `.osm_ids` sidecars in patched output stay stale — but these
+files are **never published** in the first place. The Tigris upload
+step in `.github/workflows/geocoder-build.yml:824` excludes
+`*.osm_ids` from the user-facing bucket ("Strategy-2 sidecars
+(*.osm_ids) are cached only ... clients never need them"). End users
+only ever receive `.bin` files. A user who patches forward and a user
+who downloads today's bundle end up with identical published files.
 
 ### Per-preset day-over-day sizes (oceania, real Geofabrik diff)
 
