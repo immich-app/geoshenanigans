@@ -4560,7 +4560,15 @@ int main(int argc, char* argv[]) {
                 if (la != lb) return la < lb;
                 uint32_t ga = float_bits(pa.lng), gb = float_bits(pb.lng);
                 if (ga != gb) return ga < gb;
-                return a < b; // stable tiebreaker: original index
+                // Final tiebreaker: osm_id. Using the original index `a < b`
+                // here resolved ties non-deterministically because the
+                // index reflected build-encounter order from multi-threaded
+                // PBF parsing. osm_id is invariant per record and gives a
+                // truly canonical order, so dedup picks the same record
+                // every run.
+                if (data.addr_osm_ids.size() == data.addr_points.size())
+                    return data.addr_osm_ids[a] < data.addr_osm_ids[b];
+                return a < b;
             });
             std::vector<uint32_t> old_to_new(n);
             for (uint32_t i = 0; i < n; i++) old_to_new[order[i]] = i;
@@ -4675,6 +4683,11 @@ int main(int argc, char* argv[]) {
                     uint32_t gb = float_bits(data.street_nodes[wb.node_offset + j].lng);
                     if (ga != gb) return ga < gb;
                 }
+                // osm_id tiebreaker for full determinism — without it,
+                // duplicate-content ways resolve to whichever index was
+                // first in the build-encounter order (non-deterministic).
+                if (data.way_osm_ids.size() == data.ways.size())
+                    return data.way_osm_ids[a] < data.way_osm_ids[b];
                 return false;
             });
             // Reorder ways + nodes by sort order, dedup identical consecutive ways
@@ -4785,7 +4798,10 @@ int main(int argc, char* argv[]) {
                     uint32_t gb = float_bits(data.interp_nodes[ib.node_offset + j].lng);
                     if (ga != gb) return ga < gb;
                 }
-                return ia.node_count < ib.node_count;
+                if (ia.node_count != ib.node_count) return ia.node_count < ib.node_count;
+                if (data.interp_osm_ids.size() == data.interp_ways.size())
+                    return data.interp_osm_ids[a] < data.interp_osm_ids[b];
+                return false;
             });
             std::vector<uint32_t> old_to_new(n);
             for (uint32_t i = 0; i < n; i++) old_to_new[order[i]] = i;
@@ -4802,7 +4818,7 @@ int main(int argc, char* argv[]) {
             }
             // Reorder interp_osm_ids in lockstep (no dedup here)
             if (data.interp_osm_ids.size() == n) {
-                std::vector<int64_t> new_osm(n);
+                std::vector<uint64_t> new_osm(n);
                 for (uint32_t i = 0; i < n; i++)
                     new_osm[i] = data.interp_osm_ids[order[i]];
                 data.interp_osm_ids = std::move(new_osm);
@@ -4843,6 +4859,8 @@ int main(int argc, char* argv[]) {
                     uint32_t gb = float_bits(data.admin_vertices[pb.vertex_offset + j].lng);
                     if (ga != gb) return ga < gb;
                 }
+                if (data.admin_osm_ids.size() == data.admin_polygons.size())
+                    return data.admin_osm_ids[a] < data.admin_osm_ids[b];
                 return false;
             });
             std::vector<uint32_t> old_to_new(n);
@@ -4926,7 +4944,9 @@ int main(int argc, char* argv[]) {
                 if (la != lb) return la < lb;
                 uint32_t ga = float_bits(pa.lng), gb = float_bits(pb.lng);
                 if (ga != gb) return ga < gb;
-                return a < b; // stable tiebreaker
+                if (data.poi_osm_ids.size() == data.poi_records.size())
+                    return data.poi_osm_ids[a] < data.poi_osm_ids[b];
+                return a < b;
             });
 
             // Build old→new mapping
@@ -5085,7 +5105,11 @@ int main(int argc, char* argv[]) {
                 if (pa.name_id != pb.name_id) return pa.name_id < pb.name_id;
                 uint32_t la = float_bits(pa.lat), lb = float_bits(pb.lat);
                 if (la != lb) return la < lb;
-                return float_bits(pa.lng) < float_bits(pb.lng);
+                uint32_t ga = float_bits(pa.lng), gb = float_bits(pb.lng);
+                if (ga != gb) return ga < gb;
+                if (data.place_osm_ids.size() == data.place_nodes.size())
+                    return data.place_osm_ids[a] < data.place_osm_ids[b];
+                return false;
             });
             std::vector<uint32_t> old_to_new(n);
             for (uint32_t i = 0; i < n; i++) old_to_new[order[i]] = i;
