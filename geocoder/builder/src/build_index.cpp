@@ -4728,17 +4728,20 @@ int main(int argc, char* argv[]) {
                 }
             }
             size_t deduped = n - new_ways.size();
-            // Reorder + dedup way_osm_ids in lockstep (same reason as
-            // addr_osm_ids above — without this, strategy-2 streets sees
-            // a size mismatch with data.ways and silently exits, so
-            // street_ways.osm_ids ends up reflecting build-encounter
-            // order instead of the deterministic sort order).
+            // Reorder + dedup way_osm_ids in lockstep. Must iterate in
+            // SORT order (not original order) so the FIRST sort-position
+            // mapping to each new_idx wins — matching how data.ways picks
+            // its dedup survivor above. Iterating in original order picks
+            // a different winner per build (build-encounter order is
+            // non-deterministic) and the resulting way_osm_ids[k]
+            // wouldn't match the osm_id of data.ways[k].
             if (data.way_osm_ids.size() == n) {
                 std::vector<int64_t> new_osm(new_ways.size(), 0);
-                for (uint32_t i = 0; i < n; i++) {
-                    uint32_t new_idx = old_to_new[i];
+                for (uint32_t si = 0; si < n; si++) {
+                    uint32_t orig_i = order[si];
+                    uint32_t new_idx = old_to_new[orig_i];
                     if (new_idx < new_osm.size() && new_osm[new_idx] == 0)
-                        new_osm[new_idx] = data.way_osm_ids[i];
+                        new_osm[new_idx] = data.way_osm_ids[orig_i];
                 }
                 data.way_osm_ids = std::move(new_osm);
             }
@@ -5001,14 +5004,17 @@ int main(int argc, char* argv[]) {
             }
 
             size_t deduped = n - new_pois.size();
-            // Reorder + dedup poi_osm_ids in lockstep with the dedup'd
-            // record vector — same pattern as addr_points and ways above.
+            // Reorder + dedup poi_osm_ids in lockstep. The POI dedup loop
+            // above iterates SORT order (for (uint32_t i = 0; i < n; i++)
+            // using order[i]), so dedup_remap[i] is sort-indexed and the
+            // FIRST sort-position to map to each new_idx wins. Match
+            // that here too.
             if (data.poi_osm_ids.size() == n) {
                 std::vector<uint64_t> new_osm(new_pois.size(), 0);
-                for (uint32_t i = 0; i < n; i++) {
-                    uint32_t new_idx = dedup_remap[i];
+                for (uint32_t si = 0; si < n; si++) {
+                    uint32_t new_idx = dedup_remap[si];
                     if (new_idx < new_osm.size() && new_osm[new_idx] == 0)
-                        new_osm[new_idx] = data.poi_osm_ids[order[i]];
+                        new_osm[new_idx] = data.poi_osm_ids[order[si]];
                 }
                 data.poi_osm_ids = std::move(new_osm);
             }
