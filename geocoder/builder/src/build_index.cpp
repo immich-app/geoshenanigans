@@ -4981,6 +4981,17 @@ int main(int argc, char* argv[]) {
             }
 
             size_t deduped = n - new_pois.size();
+            // Reorder + dedup poi_osm_ids in lockstep with the dedup'd
+            // record vector — same pattern as addr_points and ways above.
+            if (data.poi_osm_ids.size() == n) {
+                std::vector<uint64_t> new_osm(new_pois.size(), 0);
+                for (uint32_t i = 0; i < n; i++) {
+                    uint32_t new_idx = dedup_remap[i];
+                    if (new_idx < new_osm.size() && new_osm[new_idx] == 0)
+                        new_osm[new_idx] = data.poi_osm_ids[order[i]];
+                }
+                data.poi_osm_ids = std::move(new_osm);
+            }
             data.poi_records = std::move(new_pois);
             data.poi_vertices = std::move(new_poi_verts);
             if (have_elevations) poi_elevations = std::move(new_poi_elevations);
@@ -5080,6 +5091,12 @@ int main(int argc, char* argv[]) {
             for (uint32_t i = 0; i < n; i++) old_to_new[order[i]] = i;
             std::vector<PlaceNode> sorted(n);
             for (uint32_t i = 0; i < n; i++) sorted[i] = data.place_nodes[order[i]];
+            // Reorder place_osm_ids in lockstep
+            if (data.place_osm_ids.size() == n) {
+                std::vector<uint64_t> new_osm(n);
+                for (uint32_t i = 0; i < n; i++) new_osm[i] = data.place_osm_ids[order[i]];
+                data.place_osm_ids = std::move(new_osm);
+            }
             data.place_nodes = std::move(sorted);
             for (auto& p : data.sorted_place_cells) p.item_id = old_to_new[p.item_id];
             auto cmp = [](const CellItemPair& a, const CellItemPair& b) {
