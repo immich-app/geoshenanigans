@@ -13,236 +13,134 @@ The headline number is **planet/full compressed gcpatch size**.
 
 | Snapshot | planet/full compressed | Notes |
 | --- | --- | --- |
-| Before this work series | ~3,890 MiB | Many FULL_REPLACE files, byte-key secondary matching |
-| **Current baseline (HEAD = `e2f3c0e`)** | **~3,798 MiB** | Sparse-delta for 2 of 5 small files, otherwise unchanged |
-| Last failed attempt | 4,164 MiB grew / 6 variants FAIL verify | See "What was tried and reverted" |
+| Pre-session | ~3,890 MiB | Many FULL_REPLACE files, byte-key secondary matching |
+| Mid-session baseline | ~3,798 MiB | Sparse-delta for 2 of 5 small files, otherwise unchanged |
+| **Current (HEAD = `587613c`)** | TBD | Byte-block merge for addr_vertices, no full_replace fallback, admin sidecar path fix |
+| Latest oceania test result | **6.1 MiB compressed** (same-PBF rebuild) | 17x vs ~103 MiB pre-session oceania baseline |
 
-The original session target was ~5 MiB for major patches. We are nowhere near
-that — the structural cost is dominated by `addr_vertices` (3,391 MiB
-FULL_REPLACE) and `addr_points` (2,566 MiB merge), neither of which we have
-yet touched.
+The original session target was ~5 MiB for major patches. Oceania is
+already there for same-PBF; planet still needs real measurement.
 
-## Repository state
+## Validated approach (on Hetzner server)
 
-- Branch: `feat/geocoder`
-- HEAD: `e2f3c0e` (Revert "perf(geocoder-patch): delta-encode ENTRY_CORRECTION")
-- All work has been pushed.
-- Working tree carries one untracked + one modified file unrelated to this
-  session — leave them alone:
-  - `M geocoder/builder-ui/static/configurations.json` (modified before this
-    session began; appears to be a stale local build artifact)
-  - `?? geocoder/HANDOFF.md` (different project — TS/WASM port refactor)
+Built oceania twice from same PBF (1.5 GB) using strategy-2 chain:
+- Build 1: fresh, no prev
+- Build 2: `--prev-output build1`
+- Diff via geocoder-diff → 6.1 MiB compressed patch
+- All 26 files verify byte-identical
 
-## Where things stand
-
-The reverted commits are preserved in git history for re-use. Commit chain
-on `feat/geocoder` (newest first):
-
-```
-e2f3c0e Revert delta-encode ENTRY_CORRECTION       ← HEAD (clean baseline)
-7dc21d3 Revert sidecar secondary-match key
-8b15bfe fix(geocoder-diff): osm_id sidecar as secondary-match key   ← cherry-pick of 5453880
-948cdfb perf(geocoder-patch): delta-encode ENTRY_CORRECTION
-bc83158 Revert sidecar secondary-match key (first attempt)
-5453880 fix(geocoder-diff): osm_id sidecar as secondary-match key   ← original implementation
-8c1e39d chore(geocoder-diff): log sparse-delta run-length stats
-aa54f52 fix(geocoder-diff): keep str_remap alive until after emit_sparse_delta
-55ca34f perf(geocoder-diff,patch): sparse position-delta for FULL_REPLACE files
-```
-
-The two reverted experiments still apply cleanly on top of HEAD if you want
-to retry them after fixing the underlying bugs.
-
-## What's in the working baseline (HEAD)
-
-planet/full uncompressed section breakdown from CI run **26194306798**
-(2026-05-01 build with HEAD's code path):
-
+### Section breakdown (oceania same-PBF, 27 MiB uncompressed)
 | Section | Size | Notes |
-| --- | --- | --- |
-| addr_vertices (FULL_REPLACE) | 3,391 MiB | Untouched — biggest remaining target |
-| addr_points (merge stride=28) | 2,566 MiB | secondary key is byte-derived |
-| street_nodes (merge stride=8) | 764 MiB | |
-| STRINGS_or_SECONDARY | 687 MiB | tier diff + secondary remap pairs |
-| addr_postcodes (FULL_REPLACE) | 666 MiB | sparse-delta fell back |
-| POI_PARENT_REMAP | 424 MiB | ~50M admin/street/postcode old→new id pairs |
-| way_parents (FULL_REPLACE) | 208 MiB | sparse-delta fell back |
-| interp_nodes (merge) | 177 MiB | |
-| street_ways (merge w/ 49M fixups) | 158 MiB | |
-| ENTRY_CORRECTION | 135 MiB | Full new-list per changed cell |
-| way_postcodes [SPARSE] | 110 MiB | sparse-delta WIN (47% saving) |
-| interp_ways (merge) | 77 MiB | |
-| admin_parents (FULL_REPLACE) | 4 MiB | tiny, fallback doesn't matter |
-| postcode_centroids [SPARSE] | 0.03 MiB | sparse-delta WIN (99.95% saving) |
-| (total uncompressed) | 9,387 MiB | compresses to ~3,798 MiB |
+|---|---|---|
+| addr_postcodes (SPARSE) | 12.0 MiB | 76% positions match; rest from build non-determinism |
+| street_nodes (merge) | 7.7 MiB | |
+| **addr_vertices (byte-merge)** | **4.5 MiB** | Was ~50 MiB FULL_REPLACE before my fix |
+| addr_points (merge) | 1.8 MiB | Only 50K seq bytes — fixup_v15 working great |
+| place_nodes (merge) | 0.9 MiB | |
+| STRINGS_or_SECONDARY | 0.3 MiB | |
 
-## What was tried and reverted (do NOT just re-apply blindly)
+## Commits this session (newest first)
 
-### Attempt A: osm_id sidecar as secondary-match key (#119)
+```
+587613c fix(geocoder-build): correct admin_polygons sidecar prev_dir path
+60f1532 perf(geocoder-diff): remove emit_sparse_delta FULL_REPLACE fallback
+8daca37 chore(ci): capture per-variant diff logs as artifact
+e02ca59 fix(geocoder): emit addr_points vertex_offset fixups for byte-block merge
+c1f7101 perf(geocoder): byte-block merge for addr_vertices via content-hash
+```
 
-**Theory:** The diff's secondary-match fallback used byte-derived composite
-keys like `(name_id<<8) | node_count` for `street_ways` or `(housenumber_id,
-street_id)` for `addr_points`. These keys all embed a string-pool offset that
-re-tiers daily, so the fallback can't recover the obvious "same osm_id,
-different bytes" case → ~50M records per planet build get classified as
-DELETE+INSERT, blowing POI_PARENT_REMAP to 424 MiB. Strategy-2 sidecars
-(`.osm_ids`) already carry stable per-slot osm_ids; use those as the
-secondary key instead.
+### What each does
+- **`c1f7101`** — Replace `addr_vertices.bin` FULL_REPLACE with a byte-block
+  merge: uses `fixup_v15_offsets` with `key_fn=0` so polygons are matched
+  purely by vertex-content hash (no slot-stability assumption). After
+  rewriting OLD addr_points' vertex_offset to NEW's byte position, the
+  vertex byte stream becomes a tight MATCH/INSERT/DELETE sequence.
+- **`e02ca59`** — Emit `addr_points` vertex_offset fixups in the merge
+  result so the patch tool can rewrite byte 20 during MATCH replay
+  (mirrors what admin_polygons already does for byte 0). Without this,
+  any MATCH that fired would carry OLD's vertex_offset instead of NEW's
+  and verify would fail.
+- **`8daca37`** — Save per-variant `geocoder-diff` stderr to
+  `$WORKDIR/diff-logs/$variant.log` and upload as artifact. The
+  workflow previously `2>/dev/null`'d this output so the per-variant
+  POI_PARENT_REMAP / sparse-vs-full / secondary-match stats were
+  invisible.
+- **`60f1532`** — Drop the `sparse_delta ≥ full_replace` fallback in
+  `emit_sparse_delta`. The fallback hid the underlying defect (slot
+  stability broken → >50% positions appear changed) by shipping the
+  whole file. Per project direction, always emit sparse so the cost is
+  visible. On test data with broken stability the section grows; with
+  real strategy-2 stability it tracks the actual change count.
+- **`587613c`** — Fix `apply_strategy2_admins` reading from
+  `<prev>/admin/admin_polygons.osm_ids` (which is never written) instead
+  of `<prev>/quality/uncapped/admin_polygons.osm_ids` (the canonical
+  write location). Without this load, every admin polygon was getting
+  a fresh slot every build. Same-PBF test with the fix surfaces 357
+  tombstones in admins — the underlying PBF parsing is non-deterministic
+  so admin osm_id ordering varies between builds. This is the real
+  noise floor — fixing it requires sorting `data.admin_osm_ids` etc.
+  before strategy-2.
 
-**Implementation:** commit `5453880` / cherry-pick `8b15bfe`. Adds
-`load_sidecar_keys()` + `secondary_match_by_idx()` + a `try_load_sidecar()`
-fallback path lambda, converts the 6 call sites
-(street_ways/addr_points/interp_ways/admin_polygons/poi_records/place_nodes)
-plus the poi-only street_ways "cheap fallback" path.
+## Build non-determinism (remaining noise floor)
 
-**Result (alone, CI run 26221015149):** All 126 variants PASSED verify, but
-planet/full compressed GREW 3,798 → 4,164 MiB (+366 MiB). Section breakdown
-showed POI_PARENT_REMAP shrunk only modestly (424 → 387 MiB) and STRINGS
-shrunk (687 → 459 MiB), but **ENTRY_CORRECTION exploded 135 → 1,594 MiB**
-and addr_points merge grew 2,566 → 2,911 MiB. Reverted in `bc83158`.
+Even with the same PBF and proper strategy-2 chain, 10 of 26 `.bin`
+files differ between builds. Pattern from oceania:
+- street_ways/admin_polygons/postcode_centroids sidecars all DIFFER
+  byte-level between same-PBF builds. addr_points and place_nodes ditto.
+- "(no shifts)" in strategy-2 logs is misleading — it's also reported
+  for fresh allocations, where remap[i]=i is trivially true.
+- For `addr_postcodes`: 76.1% identical, 10.2% v1=NO_DATA→v2=real,
+  10.2% symmetric flip, 3.5% both real but different. Clear sign that
+  PBF parsing yields non-deterministic addr_osm_ids order →
+  non-deterministic slot assignment → non-deterministic postcode_id
+  assignment.
 
-**Diagnosis:** ENTRY_CORRECTION's full-new-list-per-cell encoding amplifies
-with denser id_remaps. Each cell that trips the differs-check after sort
-pays the cost of writing its entire entry list (not the delta).
+The fix is build-side: sort `data.addr_osm_ids` (and the parallel
+arrays `data.addr_points`, `data.addr_postcode_ids`, plus references
+in `data.cell_to_addrs`) by osm_id before strategy-2 runs. Same for
+admins (sort by (relation_id, ring_index)), POIs, places, interps.
 
-### Attempt B: delta-encode ENTRY_CORRECTION (#120)
+## Test infrastructure (Hetzner server)
 
-**Theory:** Replace the full-list emission with set-diff encoding. Cap the
-per-cell cost at the count of records that actually shifted in/out, not the
-cell's total entry count. Should help the baseline AND unblock attempt A.
-
-**Implementation:** commit `948cdfb`. New marker `ENTRY_CORRECTION_DELTA_MARKER
-= 0xFFFFFFF1` (legacy `0xFFFFFFF8` still handled for backward compat). Per
-cell: `cell_id(8) + n_removed(2) + n_added(2) + removed_ids[] + added_ids[]`.
-Patch side derives `remapped_old` (same parse+remap as the no-correction
-path) then applies `(remapped_old MINUS removed) UNION added` to produce
-the new list. All 4 emit sites updated (street/addr/interp via
-`streaming_corrections`, plus admin/poi/place).
-
-**Local validation:** oceania 29→30, 26/26 file MATCH on verify.
-
-### Combined A+B: failure mode
-
-Cherry-picked Attempt A on top of Attempt B (HEAD `8b15bfe` over `948cdfb`).
-Local oceania 29→30 verify: 26/26 PASS (both alone, and combined).
-
-**CI run 26249158568 result:** 120/126 PASS, **6 FAIL on entries files only**:
-
-| Variant | Failed file | first_diff offset |
-| --- | --- | --- |
-| africa/full | interp_entries.bin | 53 |
-| asia/full | interp_entries.bin + street_entries.bin (old/new size differs 457,556,752 vs 457,599,226) | 6,521 / 262,005,910 |
-| asia/no-addresses | street_entries.bin | 262,005,910 |
-| north-america/full | interp_entries.bin | 4,262,883 |
-| oceania/full | interp_entries.bin | 243 |
-| planet/full | interp_entries.bin | 4,447,659 |
-
-**europe/* and south-america/* all passed**, including their /full variants.
-verify_size always equals new_size — files are the right LENGTH but wrong
-CONTENT. The mismatches are concentrated in `interp_entries` (5 of 6) and
-`street_entries` (2 of 6), never `addr_entries`. Both reverted in `7dc21d3`
-+ `e2f3c0e`.
-
-**Why this is suspicious:** Either attempt alone passes locally. Combined,
-they pass locally on oceania 29→30 but fail in CI on bigger / differently
-shaped data. My best guess for the bug is a subtle divergence between the
-diff's `id_rm` and the patch's reconstructed `rm` for `interp_ways`/
-`street_ways` when sidecar soft matches make those remaps denser, which the
-delta-encoded ENTRY_CORRECTION then propagates as silent content corruption
-(because the legacy format embedded the full new list and never relied on
-patch-side remap equality). Both sides should produce identical sorted IDs
-by construction (`derive_id_remap_from_merge` + soft matches mirrored via
-`SECONDARY_REMAP_MARKER`'s `+1` encoding), so the divergence is non-obvious.
+Working server at `157.180.105.198`:
+- AMD EPYC 7502P, 32 cores / 64 threads, 256 GB RAM
+- `/dev/md4` (RAID1 across 2 NVMe drives) mounted at `/ssd` (6.8 TB)
+  — was originally RAID0; switched at user's request for faster reads
+- Tmux session `geo` (`tmux a -t geo` to attach)
+- `/ssd/geoshenanigans` — clone of feat/geocoder branch
+- `/ssd/work/` — PBFs and build outputs
+- `/ssd/work/run-diff.sh OLD NEW` — runs diff+verify, prints sizes
+- `/ssd/work/run-planet.sh` — full planet pipeline (waiting on PBF dl)
 
 ## Open tasks
 
-(Mirror of `TaskList` — keep in sync if you edit there.)
-
-- **#101 pending** — Strategy 2: simplify diff/patch — drop fixup_*_offsets
-  and PARENT_REMAP_MARKER once strategy-2 is fully bootstrapped.
-- **#105 pending** — Investigate residual POI parent-link non-determinism.
-- **#115 pending** — Rebuild `*_vertices` files in record-order after
-  strategy-2 reorder (admin_vertices, poi_vertices, addr_vertices,
-  postal_vertices). `addr_vertices` 3,391 MiB FULL_REPLACE is the single
-  biggest remaining target.
-- **#117 pending** — Improve `addr_points` secondary match key (2.5 GiB
-  merge). Essentially: re-apply Attempt A *just* for addr_points once the
-  delta-correctness issue is resolved.
-- **#119 pending (reverted)** — Use osm_id from sidecar as diff
-  secondary-match key. Implementation in commits `5453880` / `8b15bfe`.
-- **#120 pending (reverted)** — Delta-encode ENTRY_CORRECTION. Implementation
-  in commit `948cdfb`.
-
-## Useful artefacts
-
-- Walker for decompressed `.gcpatch` files: `/tmp/walk-patch.py` — reports
-  per-section sizes. NOTE: its `FILE_NAMES` table maps `PatchFileId` →
-  filename; if `patch_format.h` changes the enum, fix the table or you'll
-  mis-label sections (see commit history for an example).
-- `geocoder-diff` stderr is `2>/dev/null`'d at line 605 of
-  `.github/workflows/geocoder-build.yml`. To see per-variant diff stats in
-  CI logs, un-redirect that line. Otherwise, fetch the patch from
-  `https://geoshenanigans-reverse-geocoding.t3.tigrisfiles.io/geocoder/builds/<DATE>/<region>/<variant>/patch.gcpatch`,
-  zstd-decompress, and run walk-patch.
-- Sidecar format (12 bytes/slot): magic `0xD0510EAD`, version `1`, count,
-  then `{u8 object_type, u8 flags, u16 reserved, u64 stable_id}` per slot.
-  Tombstones = `flags & 0x01` or `object_type == 0` (ObjectType::NONE).
-  See `src/id_allocator.h` line 60+.
-- Strategy-2 logs from step 9 (`Build geocoder index`) — `strategy2 streets:
-  N live, M tombstones, total slots (no shifts)`. `(no shifts)` appears only
-  when the identity check passes. `streets`/`admins`/`postcodes` always
-  report it; `addrs`/`places`/`pois`/`interps` reshuffle (this is fine —
-  positions still end up stable post-reshuffle).
-
-## Memory entries worth knowing
-
-The auto-memory under
-`/home/zack/.claude/projects/-home-zack-Source-immich-geoshenanigans/memory/`
-already has these (relevant to this work):
-
-- `project_entry_correction_amplifies.md` — full record of the ENTRY_CORRECTION
-  blowup observed with attempt A alone. The diagnosis there is correct.
-- `reference_diff_stderr_redirected.md` — the `2>/dev/null` gotcha.
-- `feedback_keep_iterating_on_build.md`, `feedback_ship_dont_pause.md`,
-  `feedback_github_actions_build.md` — process feedback that shaped this
-  session's cadence.
+- **#115** in_progress — Vertex byte-merge for addr_vertices [DONE
+  for diff side; needs planet-scale measurement]
+- **#119 / #120** still pending — sidecar-osm_id secondary matching +
+  ENTRY_CORRECTION delta encoding were both reverted previously due
+  to combo verify failures on planet/full; with the determinism
+  story now clearer, they may apply cleanly.
+- **#117** pending — improve addr_points secondary match key.
+  Already partially done via fixup_v15_offsets (`c1f7101`).
+- **#101 / #105** pending — strategy-2 simplifications and POI
+  parent-link non-determinism investigation.
 
 ## Next concrete step
 
-Pick **one** of these:
-
-1. **Debug the delta+sidecar combo (highest leverage).** Get the asia/full
-   or planet/full failing data locally, reproduce the verify failure, and
-   trace where diff's `d_ids` vs patch's `remapped_old` diverge for an
-   `interp_entries` cell. The diff and patch side ID maps should be
-   identical by construction — finding what's actually different will
-   unlock both #119 and #120. Start by un-redirecting the CI stderr or
-   adding a temporary log dump inside `streaming_corrections` (diff) and
-   `process_cell::do_entry`'s delta-application branch (patch) for one
-   specific cell_id from the failing offset.
-2. **Tackle `addr_vertices` (#115).** 3,391 MiB FULL_REPLACE every day is
-   the single biggest section. Strategy-2 reshuffles addr_points but
-   `addr_vertices.bin` is byte-offset-keyed, not slot-keyed. Rebuilding it
-   in record-order after the strategy-2 reshuffle would make it byte-block
-   diffable like `admin_vertices` / `poi_vertices` already are.
-3. **Accept the baseline and ship.** 3.8 GiB compressed daily for an
-   11-billion-coordinate global geocoder isn't unreasonable. Close #117 /
-   #119 / #120 as "won't pursue further" if the cost-benefit doesn't
-   justify another debug cycle.
-
-If picking option 1 and you successfully isolate the bug, the cleanest
-re-introduction order is: fix the delta-correctness issue → land #120 alone
-→ verify CI passes + measure → land #119 on top → verify CI passes +
-measure.
+1. Wait for planet PBF download to finish (started in tmux `geo`).
+2. Run `/ssd/work/run-planet.sh` — builds planet twice with
+   strategy-2 chain, diffs, verifies. Measures the *actual* current
+   patch size at planet scale with all my fixes applied.
+3. If the patch is in the low hundreds of MiB compressed: ship it
+   — this is well in line with OSM planet diff scale.
+4. If still gigabytes: the noise floor is build-side non-determinism.
+   Sort the parallel-array vectors (addr_osm_ids etc.) before
+   strategy-2 — single most impactful build-side fix.
 
 ## Don't do
 
-- Don't trust local oceania 29→30 PASS as evidence the change works at
-  planet scale. It didn't catch the combo bug.
-- Don't push another change without local oceania PASS AND a clear
-  prediction of the planet/full section breakdown. Two cycles of "should
-  shrink" → "actually grew" cost ~6 hours of CI.
-- Don't commit `geocoder/builder-ui/static/configurations.json` — it's
-  modified from a stale local build and unrelated to this work.
-- Don't touch `geocoder/HANDOFF.md` (root) — it's for a different project
-  (TS/WASM port refactor), not the patch tools.
+- Don't re-add a FULL_REPLACE fallback in sparse_delta. The whole
+  point of removing it is to surface noise so it can be fixed.
+- Don't run any more CI builds while the local server can validate
+  the same thing in ~1 hour. CI burns hours per iteration.
+- Don't touch `geocoder/HANDOFF.md` (root) — different project.
