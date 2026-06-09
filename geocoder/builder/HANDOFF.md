@@ -87,6 +87,23 @@ applies them in sequence.
 - `step1_out + patch_d3 → step2_out` — all 26 `.bin` files
   byte-identical to published `d3` ✓
 
+### What "fresh build" means and why patched ≠ fresh standalone
+
+A "fresh build" of day N (no `--prev-output`) produces a different
+`.bin` layout than the published day-N build, which always runs with
+`--prev-output day-N-1`. Strategy-2 IS this divergence: the chained
+build keeps day-1's slot positions for any osm_id present in both days
+and appends new osm_ids at end; the fresh build sorts everything anew.
+On oceania day 2 the difference is ~2 KB across 11 of 26 `.bin` files
+— same data, different slot ordering for ~85 newly-added addresses.
+
+The pipeline never publishes a fresh-of-day-N build. The Tigris bundle
+is always the chained build. So the operationally-relevant question
+is "does patched == chained published" (yes, 26/26 ✓), not
+"does patched == hypothetical fresh standalone" (no, impossible
+without removing strategy-2 — which would balloon patches back to
+multi-GiB and defeat the entire effort here).
+
 5 of 31 `.osm_ids` sidecars in patched output stay stale — but these
 files are **never published** in the first place. The Tigris upload
 step in `.github/workflows/geocoder-build.yml:824` excludes
