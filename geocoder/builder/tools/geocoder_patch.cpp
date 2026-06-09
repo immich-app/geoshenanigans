@@ -749,9 +749,13 @@ int main(int argc, char* argv[]) {
                                 if (npw != pw) memcpy(rec_buf.data() + 16, &npw, 4);
                             }
                         }
-                        // Apply fixup (node_offset/vertex_offset — at byte 0 for most types, byte 8 for POI records)
+                        // Apply fixup (node_offset/vertex_offset — at byte 0 for
+                        // most types, byte 8 for POI records, byte 20 for AddrPoint
+                        // which has vertex_offset after lat/lng/hn_id/st_id/pw_id).
                         if (has_fixup) {
-                            size_t fixup_off = (file_id == (uint32_t)PatchFileId::POI_RECORDS) ? 8 : 0;
+                            size_t fixup_off =
+                                (file_id == (uint32_t)PatchFileId::POI_RECORDS) ? 8 :
+                                (file_id == (uint32_t)PatchFileId::ADDR_POINTS)  ? 20 : 0;
                             memcpy(rec_buf.data() + fixup_off, &fixup_val, 4);
                         }
                         fwrite(rec_buf.data(), 1, actual_stride, outf);

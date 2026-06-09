@@ -1117,8 +1117,24 @@ int main(int argc, char* argv[]) {
             });
         auto id_rm = derive_id_remap_from_merge(seq, old_m.size / addr_stride, addr_stride);
         for (auto& [o,n] : soft) if (o < id_rm.size()) id_rm[o] = n;
+        // Capture vertex_offset (byte 20) fixups for the merge so the
+        // patch tool can rewrite byte 20 of each MATCH-replayed record
+        // (it reads raw OLD from disk; without the fixup the reconstructed
+        // bytes would carry OLD's vertex_offset instead of NEW's, mismatching
+        // the new file).
+        std::vector<std::pair<uint32_t,uint32_t>> addr_fixups;
+        if (addr_stride >= 28 && !old_vert_offsets.empty()) {
+            size_t n_old = old_m.size / addr_stride;
+            for (size_t i = 0; i < n_old; i++) {
+                uint32_t new_off;
+                memcpy(&new_off, old_m.data + i * addr_stride + 20, 4);
+                if (new_off != old_vert_offsets[i])
+                    addr_fixups.push_back({static_cast<uint32_t>(i), new_off});
+            }
+        }
         res_addr = {PatchFileId::ADDR_POINTS, "addr_points.bin", addr_stride,
-                    old_m.size, new_m.size, std::move(seq), {}, std::move(soft), std::move(id_rm)};
+                    old_m.size, new_m.size, std::move(seq), std::move(addr_fixups),
+                    std::move(soft), std::move(id_rm)};
         log_merge(res_addr);
 
         // Byte-block merge for addr_vertices. Walk the addr_points parent
