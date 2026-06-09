@@ -4565,7 +4565,18 @@ int main(int argc, char* argv[]) {
             std::vector<uint32_t> old_to_new(n);
             for (uint32_t i = 0; i < n; i++) old_to_new[order[i]] = i;
             std::vector<AddrPoint> sorted(n);
-            for (uint32_t i = 0; i < n; i++) sorted[i] = data.addr_points[order[i]];
+            // Reorder data.addr_osm_ids in lockstep so slot[i] keeps the
+            // matching osm_id. Without this, strategy-2 reads garbage
+            // osm_ids (whatever survived in build-encounter order at
+            // index i), assigns slots from those, and the resulting
+            // addr_points.bin / sidecar are non-deterministic across
+            // same-PBF rebuilds. This was the dominant noise source.
+            std::vector<uint64_t> sorted_osm;
+            if (data.addr_osm_ids.size() == n) sorted_osm.resize(n);
+            for (uint32_t i = 0; i < n; i++) {
+                sorted[i] = data.addr_points[order[i]];
+                if (!sorted_osm.empty()) sorted_osm[i] = data.addr_osm_ids[order[i]];
+            }
             // Reorder vertex buffer alongside addr_points. Copy each
             // record's polygon vertices into a new buffer and update
             // vertex_offset in the sorted array.
@@ -4603,6 +4614,19 @@ int main(int argc, char* argv[]) {
             }
             sorted.resize(write_pos);
             data.addr_points = std::move(sorted);
+            // Dedup addr_osm_ids in lockstep: keep the first occurrence's
+            // osm_id, mirroring how addr_points dedup keeps the first
+            // record. Without this, addr_osm_ids stays at the pre-dedup
+            // size, the size-equality check in apply_strategy2_addrs
+            // fails, and strategy-2 silently early-returns.
+            if (!sorted_osm.empty()) {
+                std::vector<uint64_t> deduped_osm(write_pos, 0);
+                for (size_t i = 0; i < n; i++) {
+                    uint32_t new_idx = dedup_remap[i];
+                    if (deduped_osm[new_idx] == 0) deduped_osm[new_idx] = sorted_osm[i];
+                }
+                data.addr_osm_ids = std::move(deduped_osm);
+            }
             // Reorder + dedup addr_postcode_ids in parallel
             if (data.addr_postcode_ids.size() == n) {
                 std::vector<uint32_t> sorted_pc(n);
@@ -4691,6 +4715,20 @@ int main(int argc, char* argv[]) {
                 }
             }
             size_t deduped = n - new_ways.size();
+            // Reorder + dedup way_osm_ids in lockstep (same reason as
+            // addr_osm_ids above — without this, strategy-2 streets sees
+            // a size mismatch with data.ways and silently exits, so
+            // street_ways.osm_ids ends up reflecting build-encounter
+            // order instead of the deterministic sort order).
+            if (data.way_osm_ids.size() == n) {
+                std::vector<int64_t> new_osm(new_ways.size(), 0);
+                for (uint32_t i = 0; i < n; i++) {
+                    uint32_t new_idx = old_to_new[i];
+                    if (new_idx < new_osm.size() && new_osm[new_idx] == 0)
+                        new_osm[new_idx] = data.way_osm_ids[i];
+                }
+                data.way_osm_ids = std::move(new_osm);
+            }
             data.ways = std::move(new_ways);
             data.street_nodes = std::move(new_nodes);
             for (auto& p : data.sorted_way_cells) p.item_id = old_to_new[p.item_id];
@@ -4812,6 +4850,15 @@ int main(int argc, char* argv[]) {
                 for (uint32_t j = 0; j < p.vertex_count; j++)
                     new_verts.push_back(data.admin_vertices[old_off + j]);
                 new_polys[i] = p;
+            }
+            // Reorder admin_osm_ids in lockstep (no dedup happens in
+            // this sort — just a permutation — so the size stays the
+            // same).
+            if (data.admin_osm_ids.size() == n) {
+                std::vector<uint64_t> new_osm(n);
+                for (uint32_t i = 0; i < n; i++)
+                    new_osm[i] = data.admin_osm_ids[order[i]];
+                data.admin_osm_ids = std::move(new_osm);
             }
             data.admin_polygons = std::move(new_polys);
             data.admin_vertices = std::move(new_verts);

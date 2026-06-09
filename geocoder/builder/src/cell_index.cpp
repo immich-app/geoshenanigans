@@ -418,38 +418,6 @@ static void apply_strategy2_addrs(ParsedData& data, const std::string& prev_dir)
     if (data.addr_points.empty()) return;
     if (data.addr_osm_ids.size() != data.addr_points.size()) return;
 
-    // Canonicalize order before strategy-2. PBF parsing is multi-threaded so
-    // push_back order into data.addr_osm_ids is non-deterministic — same PBF,
-    // different run, different slot assignment for fresh builds. That noise
-    // then propagates through every parallel array and through every diff
-    // forever after. Sort once here so the slot-0 osm_id (and every other
-    // slot) is a deterministic function of the input data, not the thread
-    // scheduling that day.
-    {
-        const size_t n = data.addr_osm_ids.size();
-        std::vector<uint32_t> perm(n);
-        std::iota(perm.begin(), perm.end(), 0);
-        std::sort(perm.begin(), perm.end(),
-            [&](uint32_t a, uint32_t b) { return data.addr_osm_ids[a] < data.addr_osm_ids[b]; });
-        std::vector<uint32_t> inv(n);
-        for (uint32_t i = 0; i < n; i++) inv[perm[i]] = i;
-        std::vector<AddrPoint> new_addr(n);
-        std::vector<uint64_t>  new_osm(n);
-        std::vector<uint32_t>  new_pc(data.addr_postcode_ids.size());
-        for (size_t i = 0; i < n; i++) {
-            new_addr[i] = data.addr_points[perm[i]];
-            new_osm[i]  = data.addr_osm_ids[perm[i]];
-            if (i < new_pc.size()) new_pc[i] = data.addr_postcode_ids[perm[i]];
-        }
-        data.addr_points  = std::move(new_addr);
-        data.addr_osm_ids = std::move(new_osm);
-        if (!new_pc.empty()) data.addr_postcode_ids = std::move(new_pc);
-        for (auto& [cell, ids] : data.cell_to_addrs)
-            for (auto& id : ids) if (id < inv.size()) id = inv[id];
-        for (auto& p : data.sorted_addr_cells)
-            if (p.item_id < inv.size()) p.item_id = inv[p.item_id];
-    }
-
     IdAllocator alloc;
     if (!prev_dir.empty()) {
         alloc.load_previous(prev_dir + "/full/addr_points.osm_ids");
