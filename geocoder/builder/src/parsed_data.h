@@ -91,6 +91,26 @@ inline void log_phase(const char* name, std::chrono::steady_clock::time_point& t
     t = std::chrono::steady_clock::now();
 }
 
+// Approximate heap bytes held by a vector (size + capacity slack).
+template <class V>
+inline size_t vec_bytes(const V& v) {
+    return v.capacity() * sizeof(typename V::value_type);
+}
+// unordered_map: bucket array + node payload. Approx — close enough for
+// "which structure is fat" decisions; not a precise audit.
+template <class M>
+inline size_t map_bytes_approx(const M& m) {
+    using K = typename M::key_type;
+    using V = typename M::mapped_type;
+    return m.bucket_count() * sizeof(void*)
+         + m.size() * (sizeof(K) + sizeof(V) + 2 * sizeof(void*));
+}
+inline void log_mem(const char* label, size_t bytes) {
+    if (bytes < (1ull << 20)) return;  // skip noise <1 MiB
+    std::cerr << "    [mem] " << label << ": "
+              << (bytes / (1024*1024)) << " MiB" << std::endl;
+}
+
 // --- String pool tiers ---
 //
 // At build finalization, every interned string is assigned to exactly one

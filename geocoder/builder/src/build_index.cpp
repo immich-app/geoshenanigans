@@ -2887,6 +2887,42 @@ int main(int argc, char* argv[]) {
         index.release();
         std::cerr << "Released dense node index." << std::endl;
 
+        // Memory breakdown — what's holding RSS now (before the strategy-2
+        // and deterministic-ordering passes that follow). Identifies the
+        // structures to target for further reduction. Approximate sizes
+        // (vector capacity * sizeof(T)); not exact for unordered_maps.
+        log_mem("data.ways (capacity)",              vec_bytes(data.ways));
+        log_mem("data.way_osm_ids",                  vec_bytes(data.way_osm_ids));
+        log_mem("data.way_orig_name_ids",            vec_bytes(data.way_orig_name_ids));
+        log_mem("data.street_nodes",                 vec_bytes(data.street_nodes));
+        log_mem("data.way_parent_ids",               vec_bytes(data.way_parent_ids));
+        log_mem("data.way_postcode_ids",             vec_bytes(data.way_postcode_ids));
+        log_mem("data.cell_to_ways (approx)",        map_bytes_approx(data.cell_to_ways));
+        log_mem("data.addr_points",                  vec_bytes(data.addr_points));
+        log_mem("data.addr_osm_ids",                 vec_bytes(data.addr_osm_ids));
+        log_mem("data.addr_vertices",                vec_bytes(data.addr_vertices));
+        log_mem("data.addr_postcode_ids",            vec_bytes(data.addr_postcode_ids));
+        log_mem("data.cell_to_addrs (approx)",       map_bytes_approx(data.cell_to_addrs));
+        log_mem("data.admin_polygons",               vec_bytes(data.admin_polygons));
+        log_mem("data.admin_osm_ids",                vec_bytes(data.admin_osm_ids));
+        log_mem("data.admin_vertices",               vec_bytes(data.admin_vertices));
+        log_mem("data.cell_to_admin (approx)",       map_bytes_approx(data.cell_to_admin));
+        log_mem("data.admin_parent_ids",             vec_bytes(data.admin_parent_ids));
+        log_mem("data.poi_records",                  vec_bytes(data.poi_records));
+        log_mem("data.poi_osm_ids",                  vec_bytes(data.poi_osm_ids));
+        log_mem("data.poi_vertices",                 vec_bytes(data.poi_vertices));
+        log_mem("data.cell_to_pois (approx)",        map_bytes_approx(data.cell_to_pois));
+        log_mem("data.place_nodes",                  vec_bytes(data.place_nodes));
+        log_mem("data.place_osm_ids",                vec_bytes(data.place_osm_ids));
+        log_mem("data.interp_ways",                  vec_bytes(data.interp_ways));
+        log_mem("data.interp_osm_ids",               vec_bytes(data.interp_osm_ids));
+        log_mem("data.interp_nodes",                 vec_bytes(data.interp_nodes));
+        log_mem("data.deferred_ways",                vec_bytes(data.deferred_ways));
+        log_mem("data.deferred_interps",             vec_bytes(data.deferred_interps));
+        log_mem("data.collected_relations",          vec_bytes(data.collected_relations));
+        log_mem("data.collected_poi_relations",      vec_bytes(data.collected_poi_relations));
+        log_mem("data.string_pool",                  data.string_pool.data().size());
+
         std::cerr << "Done reading:" << std::endl;
         std::cerr << "  " << data.ways.size() << " street ways" << std::endl;
         std::cerr << "  " << data.addr_points.size() << " address points" << std::endl;
