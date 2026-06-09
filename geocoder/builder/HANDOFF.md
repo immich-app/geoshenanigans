@@ -15,8 +15,9 @@ The headline number is **planet/full compressed gcpatch size**.
 | --- | --- | --- | --- |
 | Pre-session | ~3,890 MiB | 1.0x | Many FULL_REPLACE files, byte-key secondary matching |
 | Mid-session baseline | ~3,798 MiB | 1.0x | Sparse-delta for 2 of 5 small files |
-| **Final (`7976e2c`)** | **477 MiB compressed** | **8.0x reduction** | All diff-side + build-determinism fixes |
-| Oceania final | 3.1 MiB | 33x oceania baseline | Same-PBF self-rebuild |
+| With diff-side + initial determinism fixes (`7976e2c`) | 477 MiB | 8.0x | |
+| **Final (`627ae7e`)** | **92 MiB compressed** | **41x reduction** | osm_id tiebreakers + sort-order dedup iteration |
+| Oceania final | 1.4 MiB | 70x baseline | Equal to diff-tool base overhead (out8 vs out8 = 1.4 MiB) |
 
 Section-level wins on planet/full (uncompressed, vs pre-session):
 - addr_postcodes: 666 MiB FULL → 1.0 MiB SPARSE (**666x**)
