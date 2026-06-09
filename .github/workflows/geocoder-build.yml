@@ -600,9 +600,16 @@ jobs:
                 exit 0
               fi
 
-              # Generate patch into the output directory (colocated with .bin files)
+              # Generate patch into the output directory (colocated with .bin files).
+              # Save diff stderr to a per-variant log so the post-build
+              # patch breakdown (per-section sizes, sparse vs full_replace
+              # decisions, secondary-match recovery counts) survives to
+              # the artifact — without un-redirecting we'd lose visibility
+              # into why a section grew/shrunk.
               PATCH_FILE="$NEW_DIR/patch.gcpatch"
-              geocoder-diff "$OLD_DIR" "$NEW_DIR" -o "$PATCH_FILE" 2>/dev/null
+              DIFF_LOG="$WORKDIR/diff-logs/$SAFE.log"
+              mkdir -p "$WORKDIR/diff-logs"
+              geocoder-diff "$OLD_DIR" "$NEW_DIR" -o "$PATCH_FILE" 2> "$DIFF_LOG"
               PATCH_KB=$(( $(stat -c%s "$PATCH_FILE" 2>/dev/null || echo 0) / 1024 ))
 
               # Verify
@@ -941,6 +948,15 @@ jobs:
         with:
           name: build-log
           path: ${{ steps.setup.outputs.workdir }}/build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload per-variant diff logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diff-logs
+          path: ${{ steps.setup.outputs.workdir }}/diff-logs/
           if-no-files-found: ignore
           retention-days: 7
 
