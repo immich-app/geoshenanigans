@@ -47,11 +47,37 @@ multi-threaded polygon assembly order.
 
 ## Validated approach (on Hetzner server)
 
-Built oceania twice from same PBF (1.5 GB) using strategy-2 chain:
+### Same-PBF self-rebuild (build-determinism check)
+Built oceania and planet twice from the same PBF using strategy-2 chain:
 - Build 1: fresh, no prev
 - Build 2: `--prev-output build1`
-- Diff via geocoder-diff → 6.1 MiB compressed patch
+- Result: oceania 1.4 MiB compressed (matches diff-tool base overhead),
+  planet 92 MiB compressed
 - All 26 files verify byte-identical
+
+### Real day-over-day chain (oceania, 3 consecutive Geofabrik snapshots)
+PBFs from `australia-oceania-260606/07/08.osm.pbf`:
+- Day 1 (260606): fresh build → `d1`
+- Day 2 (260607): build with `--prev-output d1` → `d2`
+  - Patch `d1 → d2`: **6.7 MiB compressed**
+  - VERIFY 26/26 — patch + apply to `d1` reproduces `d2` byte-identical
+- Day 3 (260608): build with `--prev-output d2` → `d3`
+  - Patch `d2 → d3`: **8.1 MiB compressed**
+  - VERIFY 26/26 — patch + apply to `d2` reproduces `d3` byte-identical
+
+A user who downloads day N's full or starts from day N-7 and applies
+7 daily patches ends up with byte-identical files to what the official
+pipeline emits on day N. Strategy-2 tombstones (~20 streets/85 addrs/
+74 POIs of real-world churn per day on oceania) flow through the patch
+correctly.
+
+The "fresh-build vs chained-build" comparison shows 11–12 of 26 files
+differ — this is the intended strategy-2 behaviour: chain preserves
+day-N-1's slot positions for stable osm_ids and appends new ones at
+end, while a fresh build sorts everything anew. Size delta is ~2 KB
+on oceania (just the appended-slot byte count). Both contain the
+same data; the chain is what's published and reproducible from a
+prior day + chain of patches.
 
 ### Section breakdown (oceania same-PBF, 27 MiB uncompressed)
 | Section | Size | Notes |
