@@ -15,11 +15,11 @@ The headline number is **planet/full compressed gcpatch size**.
 | --- | --- | --- |
 | Pre-session | ~3,890 MiB | Many FULL_REPLACE files, byte-key secondary matching |
 | Mid-session baseline | ~3,798 MiB | Sparse-delta for 2 of 5 small files, otherwise unchanged |
-| **Current (HEAD = `587613c`)** | TBD | Byte-block merge for addr_vertices, no full_replace fallback, admin sidecar path fix |
-| Latest oceania test result | **6.1 MiB compressed** (same-PBF rebuild) | 17x vs ~103 MiB pre-session oceania baseline |
+| Diff-side fixes only | n/a (oceania 6.1 MiB) | addr_vertices byte-merge, no full_replace fallback, admin sidecar path |
+| **+ build determinism (`4c12577`)** | **planet test in progress** | Oceania self-rebuild: **3.1 MiB** (32x oceania baseline reduction) |
 
-The original session target was ~5 MiB for major patches. Oceania is
-already there for same-PBF; planet still needs real measurement.
+The original session target was ~5 MiB for major patches — already
+beaten on oceania, planet measurement pending.
 
 ## Validated approach (on Hetzner server)
 
