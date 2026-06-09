@@ -4800,6 +4800,13 @@ int main(int argc, char* argv[]) {
                     new_nodes.push_back(data.interp_nodes[old_off + j]);
                 new_interps[i] = iw;
             }
+            // Reorder interp_osm_ids in lockstep (no dedup here)
+            if (data.interp_osm_ids.size() == n) {
+                std::vector<int64_t> new_osm(n);
+                for (uint32_t i = 0; i < n; i++)
+                    new_osm[i] = data.interp_osm_ids[order[i]];
+                data.interp_osm_ids = std::move(new_osm);
+            }
             data.interp_ways = std::move(new_interps);
             data.interp_nodes = std::move(new_nodes);
             for (auto& p : data.sorted_interp_cells) p.item_id = old_to_new[p.item_id];
