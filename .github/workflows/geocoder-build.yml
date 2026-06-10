@@ -5,6 +5,12 @@ concurrency:
   cancel-in-progress: false
 
 on:
+  schedule:
+    # Daily at 06:00 UTC. OSM publishes its daily replication diff
+    # shortly after 00:00 UTC; 06:00 leaves headroom if their pipeline
+    # slips. Adjusts behaviour purely via the cron — manual dispatch
+    # below still works for ad-hoc runs.
+    - cron: '0 6 * * *'
   workflow_dispatch:
     inputs:
       build_date:
@@ -941,6 +947,134 @@ jobs:
           fi
 
           echo "Upload complete."
+
+      # ── Cleanup old Tigris builds ──────────────────────────────────────
+      # Retention policy:
+      #   - Full builds (every .bin.zst, manifest, etc.): keep 3 days
+      #   - Patches (patch.gcpatch only): keep next 11 days (14 total)
+      #   - Older than 14 days: delete entirely
+      # Skip cleanup if:
+      #   - This run had patch verify failures (don't trash history when
+      #     the new build is unhealthy)
+      #   - Today's build directory isn't present in Tigris (defensive
+      #     check — refuses to delete anything if the new data didn't
+      #     actually land)
+      - name: Cleanup old Tigris builds
+        if: env.PATCH_VERIFY_FAILED != '1'
+        env:
+          NEW_DATE: ${{ steps.setup.outputs.today }}
+        run: |
+          set -eu
+          S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
+          BUILDS_PREFIX="s3://$S3_BUCKET/$S3_PREFIX/builds"
+
+          KEEP_FULL_DAYS=3
+          KEEP_PATCH_DAYS=14
+          # Cutoff dates (inclusive of the cutoff day itself).
+          FULL_CUTOFF=$(date -u -d "$NEW_DATE -${KEEP_FULL_DAYS} days +1 day" +%Y-%m-%d)
+          PATCH_CUTOFF=$(date -u -d "$NEW_DATE -${KEEP_PATCH_DAYS} days +1 day" +%Y-%m-%d)
+
+          # Defensive: verify today's build is reachable. Without this,
+          # a misconfigured run with the wrong NEW_DATE could nuke
+          # every recoverable build.
+          if ! $S5 ls "$BUILDS_PREFIX/$NEW_DATE/" >/dev/null 2>&1; then
+            echo "::warning::$NEW_DATE not present at $BUILDS_PREFIX — skipping cleanup"
+            exit 0
+          fi
+
+          echo "Retention: full ≥ $FULL_CUTOFF, patches ≥ $PATCH_CUTOFF, today=$NEW_DATE"
+
+          # Enumerate every dated build directory and decide its fate.
+          # s5cmd ls on a prefix returns one DIR line per immediate child.
+          ALL_DATES=$($S5 ls "$BUILDS_PREFIX/" 2>/dev/null \
+            | awk '/DIR/ {print $NF}' \
+            | tr -d '/' \
+            | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \
+            | sort)
+
+          for d in $ALL_DATES; do
+            if [ "$d" \> "$FULL_CUTOFF" ] || [ "$d" = "$FULL_CUTOFF" ]; then
+              echo "  $d: KEEP (full)"
+            elif [ "$d" \> "$PATCH_CUTOFF" ] || [ "$d" = "$PATCH_CUTOFF" ]; then
+              echo "  $d: KEEP patches only — pruning non-patch files"
+              # List every object under this date, then rm everything
+              # whose key does not end in .gcpatch. Use a single
+              # multi-object rm so we make one round-trip per file
+              # instead of one per dir.
+              KEYS=$($S5 ls "$BUILDS_PREFIX/$d/*" 2>/dev/null \
+                | awk '{print $NF}' \
+                | grep -v '\.gcpatch$' || true)
+              if [ -n "$KEYS" ]; then
+                echo "$KEYS" | while read -r rel; do
+                  $S5 rm "$BUILDS_PREFIX/$d/$rel" >/dev/null 2>&1 || true
+                done
+              fi
+            else
+              echo "  $d: DELETE (older than $PATCH_CUTOFF)"
+              $S5 rm "$BUILDS_PREFIX/$d/*" >/dev/null 2>&1 || true
+            fi
+          done
+          echo "Public bucket cleanup complete."
+
+      # ── Cleanup old cache bucket entries ───────────────────────────────
+      # Cache bucket holds the *.osm_ids sidecars (strategy-2 ID-remap
+      # mappings) under geocoder-cache/builds/<DATE>/ AND the raw PBFs
+      # under geocoder-cache/planet-<DATE>.osm.pbf used to skip
+      # re-download on subsequent runs.
+      #
+      # Retention:
+      #   - geocoder-cache/builds/<DATE>/ : keep 7 days — only the most
+      #     recent is needed for --prev-output chaining, but 7 days
+      #     gives recovery headroom if a few daily builds fail.
+      #   - geocoder-cache/planet-<DATE>.osm.pbf : keep 3 days — only
+      #     yesterday/today are useful; older is dead weight at 93 GiB
+      #     each.
+      - name: Cleanup old cache bucket
+        if: env.PATCH_VERIFY_FAILED != '1'
+        env:
+          CACHE_ENDPOINT: ${{ steps.setup.outputs.cache_endpoint }}
+          CACHE_BUCKET: ${{ steps.setup.outputs.cache_bucket }}
+          NEW_DATE: ${{ steps.setup.outputs.today }}
+        run: |
+          set -eu
+          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
+
+          # ── Build dirs in cache (contain *.osm_ids sidecars) ──
+          BUILD_CUTOFF=$(date -u -d "$NEW_DATE -7 days +1 day" +%Y-%m-%d)
+          echo "Cache builds: keep ≥ $BUILD_CUTOFF"
+
+          CACHE_DATES=$($CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/builds/" 2>/dev/null \
+            | awk '/DIR/ {print $NF}' \
+            | tr -d '/' \
+            | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \
+            | sort)
+          for d in $CACHE_DATES; do
+            if [ "$d" \> "$BUILD_CUTOFF" ] || [ "$d" = "$BUILD_CUTOFF" ]; then
+              echo "  cache builds/$d: KEEP"
+            else
+              echo "  cache builds/$d: DELETE"
+              $CACHE rm "s3://$CACHE_BUCKET/geocoder-cache/builds/$d/*" >/dev/null 2>&1 || true
+            fi
+          done
+
+          # ── Cached PBFs (planet-YYYY-MM-DD.osm.pbf) ──
+          PBF_CUTOFF=$(date -u -d "$NEW_DATE -3 days +1 day" +%Y-%m-%d)
+          echo "Cache PBFs: keep ≥ $PBF_CUTOFF"
+
+          CACHE_PBFS=$($CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/planet-*.osm.pbf" 2>/dev/null \
+            | awk '{print $NF}' \
+            | sed 's/^planet-//; s/\.osm\.pbf$//' \
+            | sort)
+          for d in $CACHE_PBFS; do
+            if [ "$d" \> "$PBF_CUTOFF" ] || [ "$d" = "$PBF_CUTOFF" ]; then
+              echo "  cache planet-$d.osm.pbf: KEEP"
+            else
+              echo "  cache planet-$d.osm.pbf: DELETE"
+              $CACHE rm "s3://$CACHE_BUCKET/geocoder-cache/planet-$d.osm.pbf" >/dev/null 2>&1 || true
+            fi
+          done
+
+          echo "Cache cleanup complete."
 
       - name: Upload build log artifact
         if: always()
