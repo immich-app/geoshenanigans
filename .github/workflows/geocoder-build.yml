@@ -819,15 +819,17 @@ jobs:
           echo "Clearing stale files at s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/..."
           $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
 
-          echo "Uploading .bin.zst + patches to Tigris..."
+          echo "Uploading .bin.zst + patches + osm_ids sidecars to Tigris..."
           UPLOAD_START=$(date +%s)
-          # Strategy-2 sidecars (*.osm_ids) are cached only — they
-          # carry osm_id ↔ dense-idx mapping that the next build's
-          # IdAllocator reads, but clients never need them. Exclude
-          # from the user-facing Tigris upload, include in the
-          # internal build cache below.
+          # Strategy-2 sidecars (*.osm_ids) carry the osm_id ↔ dense-idx
+          # mapping that the next build's IdAllocator reads as
+          # --prev-output. Clients never read them. We upload them to
+          # Tigris (the durable bucket) anyway because the cache bucket
+          # may be cleared between runs — losing yesterday's sidecars
+          # there breaks strategy-2 chaining and balloons the next
+          # patch back to multi-GiB. The cleanup step further down
+          # ages them out at the same rate as full builds (3 days).
           s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 4 cp --concurrency 8 \
-            --exclude "*.osm_ids" \
             "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/" || \
             echo "::warning::Some files failed on first pass — verify loop will retry"
           echo "Tigris upload first pass complete in $(($(date +%s) - UPLOAD_START))s"
@@ -882,8 +884,10 @@ jobs:
             | sed "s|^s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/||" \
             | sort > /tmp/remote.txt
 
-          # List local files, strip the workdir prefix
-          (cd "$WORKDIR/output" && find . -type f \( -name "*.bin.zst" -o -name "*.gcpatch" -o -name "*.json" -o -name "*.sha256" \)) \
+          # List local files, strip the workdir prefix. Includes osm_ids
+          # sidecars now that they upload to Tigris too (for durable
+          # storage; the cache bucket may be cleared between runs).
+          (cd "$WORKDIR/output" && find . -type f \( -name "*.bin.zst" -o -name "*.gcpatch" -o -name "*.json" -o -name "*.sha256" -o -name "*.osm_ids" \)) \
             | sed 's|^\./||' | sort > /tmp/local.txt
 
           missing=$(comm -23 /tmp/local.txt /tmp/remote.txt)
