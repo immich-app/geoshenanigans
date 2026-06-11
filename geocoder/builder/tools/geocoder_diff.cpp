@@ -1457,78 +1457,43 @@ int main(int argc, char* argv[]) {
             log_time("  group:poi (empty)", gs);
             return;
         }
-        // String remap on name_id field (offset 16 in 24-byte stride)
-        if (old_data.size > 0)
+        // String remap on the three string-offset fields:
+        //   byte 16 = name_id           (all strides)
+        //   byte 24 = parent_street_id  (string offset of nearest street name, v9+ / stride>=28)
+        //   byte 28 = parent_postcode_id(string offset of POI postcode, v10+ / stride>=32)
+        // All three are string-pool offsets and shift day-over-day exactly
+        // like name_id, so they get the same str_remap. (Previously bytes
+        // 24/28 were wrongly remapped via the way-index / postcode-centroid
+        // tables — see the parent-id block below, now removed.)
+        if (old_data.size > 0) {
             remap_field(old_data.data, old_data.size, poi_stride, 16, str_remap);
+            if (poi_stride >= 28)
+                remap_field(old_data.data, old_data.size, poi_stride, 24, str_remap);
+            if (poi_stride >= 32)
+                remap_field(old_data.data, old_data.size, poi_stride, 28, str_remap);
+        }
 
-        // Parent-id remap: rewrite old PoiRecord bytes 24 (parent_street_id),
-        // 28 (parent_postcode_id), and 32 (parent_poly_id) from the previous
-        // build's id-space into the current build's. Without all three,
-        // unchanged POIs differ on these bytes day-over-day — primary admin
-        // and street IDs shift on any insertion, and postcode_centroids is
-        // full-replace so postcode IDs shift on any postcode change. Without
-        // remapping, pr_seq classifies most POIs as INSERT/DELETE and the
-        // byte-block walker emits INSERT for nearly every vertex block.
-        // Block on t_admin/t_street so we can apply admin/street remaps
-        // before fixup_v15_offsets runs.
+        // Remap old PoiRecord parent ids into the new build's id-space so
+        // unchanged POIs don't differ day-over-day (otherwise pr_seq
+        // classifies most POIs as INSERT/DELETE and the byte-block walker
+        // emits INSERT for nearly every vertex block):
+        //   bytes 16/24/28 (name_id, parent_street_id, parent_postcode_id)
+        //     — string offsets, already remapped via str_remap above.
+        //   byte 32 (parent_poly_id) — admin polygon index, remapped below.
+        // Block on t_admin so the admin remap is ready before fixup runs.
         constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
         admin_remap_future.wait();
         street_remap_future.wait();
 
-        // Build postcode_id_remap from old + new postcode_centroids.bin.
-        // PostcodeCentroid is 16 bytes: lat(4) lng(4) postcode_id(4) cc(2) pad(2).
-        // Identity key is (country_code, str_remap(postcode_id)) — same
-        // postcode string in the same country in old vs new.
-        {
-            auto [old_pc, _] = try_load_with_fallback(old_dir, "postcode_centroids.bin",
-                                                      {"../full/", "../../full/", "../no-addresses/"});
-            auto [new_pc, __] = try_load_with_fallback(new_dir, "postcode_centroids.bin",
-                                                       {"../full/", "../../full/", "../no-addresses/"});
-            constexpr size_t pcc_stride = 16;
-            if (old_pc.size > 0 && new_pc.size > 0) {
-                auto str_remap_lookup = [&](uint32_t old_off) -> uint32_t {
-                    auto it = str_remap.find(old_off);
-                    return (it != str_remap.end()) ? it->second : old_off;
-                };
-                size_t old_n = old_pc.size / pcc_stride;
-                size_t new_n = new_pc.size / pcc_stride;
-                std::unordered_map<uint64_t, uint32_t> new_idx;
-                new_idx.reserve(new_n);
-                for (uint32_t i = 0; i < new_n; i++) {
-                    uint32_t pid; memcpy(&pid, new_pc.data + (size_t)i * pcc_stride + 8, 4);
-                    uint16_t cc; memcpy(&cc, new_pc.data + (size_t)i * pcc_stride + 12, 2);
-                    uint64_t key = ((uint64_t)cc << 32) | pid;
-                    new_idx.emplace(key, i);
-                }
-                postcode_id_remap.assign(old_n, NO_DATA);
-                for (uint32_t i = 0; i < old_n; i++) {
-                    uint32_t pid; memcpy(&pid, old_pc.data + (size_t)i * pcc_stride + 8, 4);
-                    uint16_t cc; memcpy(&cc, old_pc.data + (size_t)i * pcc_stride + 12, 2);
-                    uint64_t key = ((uint64_t)cc << 32) | str_remap_lookup(pid);
-                    auto it = new_idx.find(key);
-                    if (it != new_idx.end()) postcode_id_remap[i] = it->second;
-                }
-            }
-            unmap_file(old_pc); unmap_file(new_pc);
-        }
-
+        // Parent-poly remap: byte 32 (parent_poly_id) is a genuine admin
+        // polygon index and must be remapped from the old build's admin
+        // id-space into the new one. (Bytes 24/28 are string offsets,
+        // handled by str_remap above — NOT here.)
         if (old_data.size > 0 && poi_stride >= 36) {
             const auto& adm_rm = res_admin_p.id_remap;
-            const auto& way_rm = res_ways.id_remap;
-            const auto& pcc_rm = postcode_id_remap;
             size_t pn = old_data.size / poi_stride;
             for (size_t i = 0; i < pn; i++) {
                 char* rec = old_data.data + i * poi_stride;
-                if (poi_stride >= 28 && !way_rm.empty()) {
-                    uint32_t st; memcpy(&st, rec + 24, 4);
-                    if (st != NO_DATA && st < way_rm.size() && way_rm[st] != NO_DATA && way_rm[st] != st)
-                        memcpy(rec + 24, &way_rm[st], 4);
-                }
-                if (poi_stride >= 32 && !pcc_rm.empty()) {
-                    uint32_t pc; memcpy(&pc, rec + 28, 4);
-                    if (pc != NO_DATA && pc < pcc_rm.size() && pcc_rm[pc] != NO_DATA && pcc_rm[pc] != pc)
-                        memcpy(rec + 28, &pcc_rm[pc], 4);
-                }
                 if (!adm_rm.empty()) {
                     uint32_t pp; memcpy(&pp, rec + 32, 4);
                     if (pp != NO_DATA && pp < adm_rm.size() && adm_rm[pp] != NO_DATA && adm_rm[pp] != pp)

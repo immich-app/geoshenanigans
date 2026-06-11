@@ -50,25 +50,32 @@ jobs:
           # 5 covers ~10h of runner instability — past that, the failure
           # is likely a real bug and a human should look.
           MAX_RETRIES: 5
-          # Ref the daily builds run on. Keep in sync with the manual
-          # default; if you renamed feat/geocoder-memory, update here.
-          BUILD_REF: feat/geocoder-memory
         run: |
           set -euo pipefail
           TODAY=$(date -u +%Y-%m-%d)
           WORKFLOW=geocoder-build.yml
 
-          # Fetch the last 30 runs of the build workflow, filter to
-          # today (by createdAt prefix), and categorize by conclusion.
-          # gh prints UTC ISO timestamps which match $TODAY for direct
-          # string comparison.
+          # Daily builds (and our retries) run on the repo's default
+          # branch — that's the only branch GitHub fires scheduled
+          # workflows from, so it's where the build workflow lives in
+          # production. Derive it instead of hardcoding a branch name.
+          BUILD_REF=$(gh repo view --json defaultBranchRef --jq .defaultBranchRef.name)
+
+          # Fetch the last 30 runs of the build workflow and filter to
+          # today's runs ON THE DEFAULT BRANCH. The headBranch filter
+          # excludes feature-branch test runs that would otherwise skew
+          # the retry count. We intentionally do NOT filter by event:
+          # both the scheduled run and our own workflow_dispatch retries
+          # must count toward MAX_RETRIES. (gh prints UTC ISO timestamps,
+          # so startswith($t) is a valid same-day check.)
           RUNS_JSON=$(gh run list \
             --workflow="$WORKFLOW" \
             --limit=30 \
             --json conclusion,status,createdAt,event,headBranch)
 
           TODAY_RUNS=$(echo "$RUNS_JSON" \
-            | jq --arg t "$TODAY" '[.[] | select(.createdAt | startswith($t))]')
+            | jq --arg t "$TODAY" --arg ref "$BUILD_REF" \
+                 '[.[] | select(.createdAt | startswith($t)) | select(.headBranch == $ref)]')
 
           TOTAL=$(echo "$TODAY_RUNS" | jq 'length')
           SUCCEEDED=$(echo "$TODAY_RUNS" | jq '[.[] | select(.conclusion == "success")] | length')

@@ -594,7 +594,14 @@ int main(int argc, char* argv[]) {
             else if (file_id == (uint32_t)PatchFileId::STREET_WAYS) remap_offs = {(actual_stride == 12) ? 8ul : 5ul};
             else if (file_id == (uint32_t)PatchFileId::INTERP_WAYS) remap_offs = {(actual_stride >= 20) ? 8ul : 5ul};
             else if (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS) remap_offs = {8};
-            else if (file_id == (uint32_t)PatchFileId::POI_RECORDS) remap_offs = {16};
+            else if (file_id == (uint32_t)PatchFileId::POI_RECORDS) {
+                // byte 16 = name_id; byte 24 = parent_street_id;
+                // byte 28 = parent_postcode_id — all string offsets, all
+                // remapped via str_remap (mirrors geocoder_diff.cpp).
+                remap_offs = {16};
+                if (actual_stride >= 28) remap_offs.push_back(24);
+                if (actual_stride >= 32) remap_offs.push_back(28);
+            }
             else if (file_id == (uint32_t)PatchFileId::PLACE_NODES) remap_offs = {8};
         }
 
@@ -669,10 +676,12 @@ int main(int argc, char* argv[]) {
                     bool modified = false;
                     // Check if this record needs any modification
                     if (!remap_offs.empty() || needs_padding) modified = true;
-                    // POI records always need parent-id remap consideration
-                    // (admin/street/postcode id-spaces all shift every build).
+                    // POI records: byte-32 parent_poly_id shifts with the
+                    // admin id-space. (name_id/parent_street_id/parent_postcode_id
+                    // are string offsets handled by remap_offs, which already
+                    // set modified=true above.)
                     if (file_id == (uint32_t)PatchFileId::POI_RECORDS &&
-                        (!poi_admin_remap.empty() || !poi_street_remap.empty() || !poi_postcode_remap.empty()))
+                        !poi_admin_remap.empty())
                         modified = true;
                     // PlaceNode parent_poly_id (byte 16) shifts with admin id-space.
                     if (file_id == (uint32_t)PatchFileId::PLACE_NODES &&
@@ -702,25 +711,13 @@ int main(int argc, char* argv[]) {
                             uint32_t nv = str_remap_lookup(v);
                             if (nv != v) memcpy(rec_buf.data() + off, &nv, 4);
                         }
-                        // Apply POI parent-id remap (must mirror the diff
-                        // tool's pre-pr_seq rewrite of bytes 24/28/32 so
-                        // MATCH replays reconstruct identical bytes).
+                        // Apply POI parent_poly_id remap (byte 32, admin
+                        // polygon index). Bytes 24/28 (parent_street_id,
+                        // parent_postcode_id) are string offsets and are
+                        // handled by the str_remap pass via remap_offs
+                        // above — NOT here. Mirrors geocoder_diff.cpp.
                         if (file_id == (uint32_t)PatchFileId::POI_RECORDS) {
                             constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
-                            if (actual_stride >= 28 && !poi_street_remap.empty()) {
-                                uint32_t st; memcpy(&st, rec_buf.data() + 24, 4);
-                                if (st != NO_DATA) {
-                                    uint32_t nst = poi_remap_lookup(poi_street_remap, st);
-                                    if (nst != st) memcpy(rec_buf.data() + 24, &nst, 4);
-                                }
-                            }
-                            if (actual_stride >= 32 && !poi_postcode_remap.empty()) {
-                                uint32_t pc; memcpy(&pc, rec_buf.data() + 28, 4);
-                                if (pc != NO_DATA) {
-                                    uint32_t npc = poi_remap_lookup(poi_postcode_remap, pc);
-                                    if (npc != pc) memcpy(rec_buf.data() + 28, &npc, 4);
-                                }
-                            }
                             if (actual_stride >= 36 && !poi_admin_remap.empty()) {
                                 uint32_t pp; memcpy(&pp, rec_buf.data() + 32, 4);
                                 if (pp != NO_DATA) {

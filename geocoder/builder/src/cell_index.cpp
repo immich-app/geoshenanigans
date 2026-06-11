@@ -300,7 +300,15 @@ static void apply_strategy2_streets(ParsedData& data, const std::string& prev_di
     for (auto& [cell, ids] : data.cell_to_ways) for (auto& id : ids) map_ref(id);
     for (auto& p : data.sorted_way_cells) map_ref(p.item_id);
     for (auto& ap : data.addr_points)     map_ref(ap.parent_way_id);
-    for (auto& pr : data.poi_records)     map_ref(pr.parent_street_id);
+    // NOTE: PoiRecord::parent_street_id is NOT a way index — it holds the
+    // string offset of the nearest street's name (w.name_id, set at
+    // build_index.cpp's POI parent-street linking). String offsets are
+    // assigned by the deterministic-ordering/string-partition pass that
+    // runs BEFORE strategy-2, and are not perturbed by the way reorder
+    // here. Remapping it through the way-index `remap[]` (as this code
+    // previously did) corrupted it whenever name_id happened to be < n_ways.
+    // The day-over-day string-offset shift is handled by str_remap in the
+    // diff/patch tools, exactly like PoiRecord::name_id.
 
     alloc.finalize();
     std::cerr << "  strategy2 streets: " << alloc.live_count() << " live, "
@@ -390,9 +398,22 @@ static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir
     auto map_ref = [&](uint32_t& v) {
         if (v != NO_DATA && v < remap.size()) v = remap[v];
     };
-    for (auto& [cell, ids] : data.cell_to_admin) for (auto& id : ids) map_ref(id);
+    // cell_to_admin entries carry the high-bit INTERIOR_FLAG (set during
+    // the admin S2-covering pass for cells fully inside a polygon). A
+    // flagged value is ≥ 2^31, so the plain map_ref's `v < remap.size()`
+    // guard would skip it and leave a stale polygon index after reorder.
+    // Mask the flag off, remap the index, then re-OR the flag — mirroring
+    // the deterministic-sort pass's handling of the same array.
+    auto map_ref_flagged = [&](uint32_t& v) {
+        uint32_t flag = v & INTERIOR_FLAG;
+        uint32_t idx  = v & ~INTERIOR_FLAG;
+        if (idx != (NO_DATA & ~INTERIOR_FLAG) && idx < remap.size())
+            v = remap[idx] | flag;
+    };
+    for (auto& [cell, ids] : data.cell_to_admin) for (auto& id : ids) map_ref_flagged(id);
     // admin_parent_ids and way_parent_ids hold admin polygon IDs (parent chain).
     // admin_parent_ids was reordered above; now value-remap each entry.
+    // These are plain indices (no INTERIOR_FLAG), so the plain map_ref is correct.
     for (auto& v : data.admin_parent_ids) map_ref(v);
     for (auto& v : data.way_parent_ids)   map_ref(v);
     for (auto& pr : data.poi_records)     map_ref(pr.parent_poly_id);
@@ -588,11 +609,19 @@ static void apply_strategy2_pois(ParsedData& data, const std::string& prev_dir) 
     data.poi_records = std::move(new_pois);
     data.poi_osm_ids = std::move(new_osm_ids);
 
-    auto map_ref = [&](uint32_t& v) {
-        if (v != NO_DATA && v < remap.size()) v = remap[v];
+    // cell_to_pois and sorted_poi_cells item_ids carry the high-bit
+    // INTERIOR_FLAG (set during POI cell covering at build_index.cpp). A
+    // flagged value is ≥ 2^31, so a plain `v < remap.size()` guard would
+    // skip it and leave a stale POI index after reorder. Mask, remap,
+    // re-OR — mirroring the deterministic-sort pass's handling.
+    auto map_ref_flagged = [&](uint32_t& v) {
+        uint32_t flag = v & INTERIOR_FLAG;
+        uint32_t idx  = v & ~INTERIOR_FLAG;
+        if (idx != (NO_DATA & ~INTERIOR_FLAG) && idx < remap.size())
+            v = remap[idx] | flag;
     };
-    for (auto& [cell, ids] : data.cell_to_pois) for (auto& id : ids) map_ref(id);
-    for (auto& p : data.sorted_poi_cells) map_ref(p.item_id);
+    for (auto& [cell, ids] : data.cell_to_pois) for (auto& id : ids) map_ref_flagged(id);
+    for (auto& p : data.sorted_poi_cells) map_ref_flagged(p.item_id);
 
     alloc.finalize();
     std::cerr << "  strategy2 pois: " << alloc.live_count() << " live, "
