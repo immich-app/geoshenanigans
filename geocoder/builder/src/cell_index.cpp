@@ -1477,20 +1477,35 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
     std::vector<AdminPolygon> postal_polys;
     std::vector<uint8_t> new_verts_bytes;       // packed: variable stride per polygon
     std::vector<uint8_t> postal_verts_bytes;
-    // Don't pre-reserve — overestimates lead to large unused
+    // Don't pre-reserve verts — overestimates lead to large unused
     // allocations across multiple concurrent continent writers and can
     // OOM the GH runner.  Vector growth is amortized cheap.
 
+    // admin_polygons.bin MUST stay index-aligned with data.admin_polygons:
+    // the cell index (admin_cells/admin_entries, written by the full/admin
+    // variants) references slot `i` in this space, and the server's
+    // admin_polygon(idx) accessor reads admin_polygons[idx] directly with
+    // no remap. Build new_polys at full size and place each simplified
+    // polygon at its own index `i`. Slots that have no usable geometry —
+    // strategy-2 tombstones (a polygon that existed in the previous build
+    // but not this one) and any polygon that simplifies to <3 vertices —
+    // are written as NO_DATA tombstone records, which the accessor skips.
+    // (Previously this loop push_back-compacted; with strategy-2 tombstones
+    // present that shifted every slot past the first gap and corrupted
+    // admin lookups.)
+    new_polys.assign(data.admin_polygons.size(), AdminPolygon{});
+    for (auto& p : new_polys) { p.name_id = NO_DATA; p.vertex_count = 0; }
+
     for (size_t i = 0; i < data.admin_polygons.size(); i++) {
         auto& sv = simplified[i].verts;
-        if (sv.size() < 3) continue;
+        if (sv.size() < 3) continue;  // leave slot i as a NO_DATA tombstone
 
         AdminPolygon np = data.admin_polygons[i];
 
         np.vertex_offset = pack_polygon_bytes(new_verts_bytes, sv);
         np.vertex_count = static_cast<uint32_t>(sv.size());
         np.area = polygon_area(sv);
-        new_polys.push_back(np);
+        new_polys[i] = np;
 
         // Postal also go into separate files (for optional loading)
         if (np.admin_level == 11) {
