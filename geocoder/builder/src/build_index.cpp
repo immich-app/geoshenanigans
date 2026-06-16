@@ -4289,11 +4289,26 @@ int main(int argc, char* argv[]) {
                             double best_d2 = 1e18;
                             uint32_t best_name = NO_DATA;
                             uint32_t best_way_idx = NO_DATA;
+                            // Stable tie-break for EXACT-distance ties. The
+                            // candidate iteration is ordered by sorted_way_cells
+                            // item_id = the pre-sort way index, which is
+                            // non-deterministic (parallel PBF parse order). When
+                            // an addr point is exactly equidistant from two
+                            // different (non-duplicate) ways — corners,
+                            // intersections, shared nodes — a strict `d2 < best`
+                            // pick lets the build-encounter order decide the
+                            // winner, so parent_way_id flips between same-PBF
+                            // builds. Since parent_way_id is part of the dedup
+                            // key, those flips cascade into massive addr_points
+                            // patch churn. Break exact ties by the way's osm_id
+                            // (invariant across builds) for a deterministic pick.
+                            int64_t best_osm = INT64_MAX;
                             // Token-matched resolution: track nearest
                             // way whose original name matches addr:street
                             double best_match_d2 = 1e18;
                             uint32_t best_match_name = NO_DATA;
                             uint32_t best_match_way = NO_DATA;
+                            int64_t best_match_osm = INT64_MAX;
                             const char* addr_street_str = nullptr;
                             if (ap.street_id != NO_DATA) {
                                 addr_street_str = pool_data.data() + ap.street_id;
@@ -4341,14 +4356,20 @@ int main(int argc, char* argv[]) {
                                             double qy = ay + tt * dy;
                                             d2 = qx * qx + qy * qy;
                                         }
-                                        if (d2 < best_d2) {
+                                        int64_t cand_osm = way_id < data.way_osm_ids.size()
+                                            ? data.way_osm_ids[way_id] : INT64_MAX;
+                                        if (d2 < best_d2 ||
+                                            (d2 == best_d2 && cand_osm < best_osm)) {
                                             best_d2 = d2;
                                             best_name = w.name_id;
                                             best_way_idx = way_id;
+                                            best_osm = cand_osm;
                                         }
                                         // Token-matched: check if way's
                                         // original name matches addr:street
-                                        if (d2 < best_match_d2 && addr_street_str
+                                        if ((d2 < best_match_d2 ||
+                                             (d2 == best_match_d2 && cand_osm < best_match_osm))
+                                            && addr_street_str
                                             && way_id < data.way_orig_name_ids.size()) {
                                             uint32_t orig_id = data.way_orig_name_ids[way_id];
                                             if (orig_id != NO_DATA) {
@@ -4357,6 +4378,7 @@ int main(int argc, char* argv[]) {
                                                     best_match_d2 = d2;
                                                     best_match_name = w.name_id;
                                                     best_match_way = way_id;
+                                                    best_match_osm = cand_osm;
                                                 }
                                             }
                                         }
