@@ -899,7 +899,26 @@ int main(int argc, char* argv[]) {
         };
         size_t old_n = old_parent_size / parent_stride;
         size_t new_n = new_parent_size / parent_stride;
+        (void)old_n; (void)new_n;
         MergeSequence vseq;
+        // Coalesce adjacent same-type ops on the byte stream — see the
+        // matching note in build_child_merge. The child stride is 1
+        // (raw bytes); counts are byte counts. Without this, every stable
+        // polygon block emitted its own 5-byte MATCH op (~tens of MiB of
+        // opcode overhead on planet addr_vertices) despite the bytes being
+        // unchanged.
+        uint32_t m_run = 0, d_run = 0;
+        const char* ins_ptr = nullptr; uint32_t ins_cnt = 0;  // contiguous span in new_verts (bytes)
+        auto flush_match = [&]{ if (m_run) { vseq.add_match(m_run); m_run = 0; } };
+        auto flush_del   = [&]{ if (d_run) { vseq.add_delete(d_run); d_run = 0; } };
+        auto flush_ins   = [&]{ if (ins_cnt) { vseq.add_insert(ins_ptr, ins_cnt, 1); ins_cnt = 0; ins_ptr = nullptr; } };
+        auto emit_match  = [&](uint32_t n){ flush_del(); flush_ins(); m_run += n; };
+        auto emit_del    = [&](uint32_t n){ flush_match(); d_run += n; };
+        auto emit_ins    = [&](const char* p, uint32_t n){
+            flush_match();
+            if (ins_cnt && ins_ptr + ins_cnt == p) ins_cnt += n;
+            else { flush_ins(); ins_ptr = p; ins_cnt = n; }
+        };
         size_t p_oi = 0, p_ni = 0, ppos = 0;
         while (ppos < parent_seq.data.size()) {
             uint8_t op = static_cast<uint8_t>(parent_seq.data[ppos]); ppos++;
@@ -914,28 +933,29 @@ int main(int argc, char* argv[]) {
                                  && (ob.second == 0
                                      || memcmp(old_verts + ob.first, new_verts + nb.first, ob.second) == 0));
                     if (same) {
-                        if (ob.second > 0) vseq.add_match(static_cast<uint32_t>(ob.second));
+                        if (ob.second > 0) emit_match(static_cast<uint32_t>(ob.second));
                     } else {
-                        if (ob.second > 0) vseq.add_delete(static_cast<uint32_t>(ob.second));
-                        if (nb.second > 0) vseq.add_insert(new_verts + nb.first, static_cast<uint32_t>(nb.second), 1);
+                        if (ob.second > 0) emit_del(static_cast<uint32_t>(ob.second));
+                        if (nb.second > 0) emit_ins(new_verts + nb.first, static_cast<uint32_t>(nb.second));
                     }
                 }
                 p_oi += count; p_ni += count;
             } else if (op == OP_INSERT_RUN) {
                 for (uint32_t k = 0; k < count; k++) {
                     auto nb = block(true, p_ni + k);
-                    if (nb.second > 0) vseq.add_insert(new_verts + nb.first, static_cast<uint32_t>(nb.second), 1);
+                    if (nb.second > 0) emit_ins(new_verts + nb.first, static_cast<uint32_t>(nb.second));
                 }
                 ppos += count * parent_stride; // skip the inline parent records
                 p_ni += count;
             } else if (op == OP_DELETE_RUN) {
                 for (uint32_t k = 0; k < count; k++) {
                     auto ob = block(false, p_oi + k);
-                    if (ob.second > 0) vseq.add_delete(static_cast<uint32_t>(ob.second));
+                    if (ob.second > 0) emit_del(static_cast<uint32_t>(ob.second));
                 }
                 p_oi += count;
             }
         }
+        flush_match(); flush_del(); flush_ins();
         return vseq;
     };
 
@@ -954,6 +974,29 @@ int main(int argc, char* argv[]) {
         auto read_off = [&](const char* rec) -> uint32_t {
             uint32_t v; memcpy(&v, rec + off_field_pos, 4); return v;
         };
+        // Coalesce adjacent same-type ops. The patch tool replays the
+        // child stream sequentially (MATCH n = copy n old records, DELETE n
+        // = drop n old, INSERT bytes = append), so merging runs is a pure
+        // size optimization with identical output. Previously this emitted
+        // one op per parent record — on planet that's ~570 M five-byte
+        // MATCH ops (~tens of MiB of pure opcode overhead) even when every
+        // record was unchanged. Deletes+inserts within a non-match run are
+        // grouped as one DELETE then one INSERT (deletes only advance the
+        // old cursor; inserts append contiguous new bytes), which is
+        // equivalent to the original interleaved del/ins per record.
+        uint32_t m_run = 0, d_run = 0;
+        const char* ins_ptr = nullptr; uint32_t ins_cnt = 0;  // contiguous span in new_child (records)
+        auto flush_match = [&]{ if (m_run) { seq.add_match(m_run); m_run = 0; } };
+        auto flush_del   = [&]{ if (d_run) { seq.add_delete(d_run); d_run = 0; } };
+        auto flush_ins   = [&]{ if (ins_cnt) { seq.add_insert(ins_ptr, ins_cnt, 8); ins_cnt = 0; ins_ptr = nullptr; } };
+        auto emit_match  = [&](uint32_t vc){ flush_del(); flush_ins(); m_run += vc; };
+        auto emit_del    = [&](uint32_t vc){ flush_match(); d_run += vc; };
+        auto emit_ins    = [&](const char* p, uint32_t vc){
+            flush_match();
+            if (ins_cnt && ins_ptr + (size_t)ins_cnt * 8 == p) ins_cnt += vc;
+            else { flush_ins(); ins_ptr = p; ins_cnt = vc; }
+        };
+
         size_t p_oi = 0, p_ni = 0, ppos = 0;
         while (ppos < parent_seq.data.size()) {
             uint8_t op = static_cast<uint8_t>(parent_seq.data[ppos]); ppos++;
@@ -975,8 +1018,8 @@ int main(int argc, char* argv[]) {
                         bool match = old_byte_off + vc_bytes <= old_child_size &&
                                     new_byte_off + vc_bytes <= new_child_size &&
                                     memcmp(old_child + old_byte_off, new_child + new_byte_off, vc_bytes) == 0;
-                        if (match) seq.add_match(vc);
-                        else { seq.add_delete(vc); seq.add_insert(new_child + new_byte_off, vc, 8); }
+                        if (match) emit_match(vc);
+                        else { emit_del(vc); emit_ins(new_child + new_byte_off, vc); }
                     }
                 }
                 p_oi += count; p_ni += count;
@@ -988,18 +1031,19 @@ int main(int argc, char* argv[]) {
                     size_t byte_off = (size_t)off * 8;
                     size_t vc_bytes = (size_t)vc * 8;
                     if (vc > 0 && byte_off + vc_bytes <= new_child_size)
-                        seq.add_insert(new_child + byte_off, vc, 8);
+                        emit_ins(new_child + byte_off, vc);
                 }
                 ppos += count * parent_stride;
                 p_ni += count;
             } else if (op == OP_DELETE_RUN) {
                 for (uint32_t k = 0; k < count; k++) {
                     uint32_t vc = read_count(old_parent + (p_oi+k)*parent_stride);
-                    if (vc > 0) seq.add_delete(vc);
+                    if (vc > 0) emit_del(vc);
                 }
                 p_oi += count;
             }
         }
+        flush_match(); flush_del(); flush_ins();
         return seq;
     };
 
