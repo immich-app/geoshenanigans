@@ -1797,6 +1797,7 @@ int main(int argc, char* argv[]) {
                         std::string country_code;
                         uint8_t fallback_place_type;  // from own place tag, used last
                         std::string wikidata; // for place linking
+                        int64_t way_id;       // source closed-way id (strategy-2 stable identity)
                     };
                     std::vector<ClosedWayAdmin> closed_way_admins;
                     // POI way data
@@ -2151,7 +2152,7 @@ int main(int argc, char* argv[]) {
                                         auto po = classify_place_override(t_linked_place, t_border_type, t_place);
                                         uint8_t fallback = static_cast<uint8_t>(po.type);
                                         std::string wd_str = t_wikidata ? t_wikidata : "";
-                                        local.closed_way_admins.push_back({std::move(verts), std::move(name_str), al, std::move(cc), fallback, std::move(wd_str)});
+                                        local.closed_way_admins.push_back({std::move(verts), std::move(name_str), al, std::move(cc), fallback, std::move(wd_str), way_id});
                                     }
                                 }
                             }
@@ -2165,7 +2166,7 @@ int main(int argc, char* argv[]) {
                                     std::vector<std::pair<double,double>> verts;
                                     for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});
                                     std::string wd_str = t_wikidata ? t_wikidata : "";
-                                    local.closed_way_admins.push_back({std::move(verts), std::string(aname), uint8_t(15), std::string(), static_cast<uint8_t>(pt), std::move(wd_str)});
+                                    local.closed_way_admins.push_back({std::move(verts), std::string(aname), uint8_t(15), std::string(), static_cast<uint8_t>(pt), std::move(wd_str), way_id});
                                 }
                             }
                         }
@@ -2204,7 +2205,8 @@ int main(int argc, char* argv[]) {
                                 uint8_t(15),
                                 std::string(),
                                 static_cast<uint8_t>(pt),
-                                std::move(wd_str)});
+                                std::move(wd_str),
+                                way_id});
                         }
                     }
                 });
@@ -2364,7 +2366,8 @@ int main(int argc, char* argv[]) {
                             if (pto == 0) pto = cwa.fallback_place_type;
                             const char* cc = cwa.country_code.empty() ? nullptr : cwa.country_code.c_str();
                             add_admin_polygon(data, cwa.vertices, cwa.name.c_str(),
-                                              cwa.admin_level, cc, &admin_pool, pto);
+                                              cwa.admin_level, cc, &admin_pool, pto,
+                                              cwa.way_id);
                             closed_way_admin_count++;
                         }
                         local.closed_way_admins.clear();
@@ -2657,13 +2660,18 @@ int main(int argc, char* argv[]) {
                         poly.country_code = (cc && cc[0] && cc[1])
                             ? static_cast<uint16_t>((cc[0] << 8) | cc[1]) : 0;
                         data.admin_polygons.push_back(poly);
-                        // Pack (relation_id, ring_index) into the 64-bit
-                        // stable_id. Top 48 bits = relation_id (covers
-                        // OSM's ~20M relations comfortably), bottom 16 =
-                        // ring_index. Strategy-2 IdAllocator uses this.
+                        // Strategy-2 stable identity, packed like addr/poi:
+                        // top 8 bits = ObjectType, bottom 56 bits = the
+                        // stable id. For relation-sourced admin polygons the
+                        // stable id is (relation_id<<16 | ring_index) — ring
+                        // in the low 16 bits, relation_id above (OSM has
+                        // ~20M relations, so this fits 56 bits comfortably).
+                        // The type byte keeps relation ids from colliding
+                        // with closed-way ids (which use OSM_WAY + way_id).
                         data.admin_osm_ids.push_back(
-                            (static_cast<uint64_t>(pp.relation_id) << 16) |
-                            static_cast<uint64_t>(pp.ring_index));
+                            (static_cast<uint64_t>(gc::id_alloc::ObjectType::OSM_RELATION) << 56) |
+                            ((((static_cast<uint64_t>(pp.relation_id) << 16) |
+                               static_cast<uint64_t>(pp.ring_index))) & 0x00FFFFFFFFFFFFFFull));
 
                         admin_pool.submit(poly_id, std::move(pp.simplified));
                     }
