@@ -1,7 +1,7 @@
 [tools]
 opentofu = "1.12.1"
 rclone = "1.74.3"
-terragrunt = "1.0.7"
+terragrunt = "1.0.8"
 
 [tasks.tg]
 run = "op run '--env-file={{config_root}}/deployment/.env' -- terragrunt"
