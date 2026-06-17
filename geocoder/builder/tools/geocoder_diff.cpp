@@ -594,10 +594,39 @@ struct FileMergeResult {
 };
 
 // Serialize a pre-computed merge result into the patch buffer
-static void serialize_merge(std::vector<char>& patch, const FileMergeResult& r) {
+static void serialize_merge(std::vector<char>& patch, const FileMergeResult& r,
+                            const std::string& old_dir = "",
+                            const std::string& new_dir = "") {
     auto wv = [&](const void* data, size_t size) {
         patch.insert(patch.end(), (const char*)data, (const char*)data + size);
     };
+    // Unchanged short-circuit (mirrors emit_raw / emit_sparse_delta): if the
+    // file is byte-identical to old, emit a copy-old marker (stride 0xFD, no
+    // data) instead of the merge sequence. The merge runs after upstream
+    // fixups (string-pool remap, vertex_offset rewrites) that can perturb the
+    // byte-merge into emitting ops for a file that is in fact identical —
+    // observed on a same-PBF planet diff: addr_vertices / street_nodes were
+    // byte-equal yet still encoded ~0.1 MiB each. geocoder-patch reproduces
+    // the file by copying it verbatim from the old build. Only fires when both
+    // files exist at <dir>/<name> (so the apply's copy from cur_dir succeeds);
+    // fallback-located files (admin_*) simply skip the check.
+    if (!old_dir.empty() && r.new_size > 0 && r.old_size == r.new_size) {
+        auto om = mmap_file(old_dir + "/" + r.name);
+        auto nm = mmap_file(new_dir + "/" + r.name);
+        bool same = om.data && nm.data &&
+                    memcmp(om.data, nm.data, (size_t)r.new_size) == 0;
+        if (om.data) unmap_file(om);
+        if (nm.data) unmap_file(nm);
+        if (same) {
+            uint32_t fid_u = (uint32_t)r.id, stride = 0xFD, nfix = 0;
+            uint64_t ds = 0;
+            wv(&fid_u, 4); wv(&stride, 4); wv(&r.old_size, 8);
+            wv(&r.new_size, 8); wv(&nfix, 4); wv(&ds, 8);
+            std::cerr << "  " << r.name << ": unchanged (copy old, "
+                      << r.new_size << " bytes saved)" << std::endl;
+            return;
+        }
+    }
     uint32_t fid = static_cast<uint32_t>(r.id);
     uint32_t st = static_cast<uint32_t>(r.stride);
     uint32_t n_fixups = static_cast<uint32_t>(r.fixups.size());
@@ -1804,28 +1833,28 @@ int main(int argc, char* argv[]) {
     }
 
     // Serialize merge results to patch in canonical order, freeing as we go.
-    serialize_merge(patch, res_addr);
+    serialize_merge(patch, res_addr, old_dir, new_dir);
     // res_addr_v is built in t_addr only when addr_stride >= 28 (v15+);
     // older variants leave stride=0 and old/new sizes 0, which we treat as
     // "not built" → fall through to the emit_raw(ADDR_VERTICES) call later
     // in the section pipeline. stride=1 marks a byte-merge ready to ship.
     if (res_addr_v.stride == 1) {
-        serialize_merge(patch, res_addr_v);
+        serialize_merge(patch, res_addr_v, old_dir, new_dir);
         { std::vector<char>().swap(res_addr_v.seq.data); }
     }
-    serialize_merge(patch, res_ways);
-    serialize_merge(patch, res_nodes);
+    serialize_merge(patch, res_ways, old_dir, new_dir);
+    serialize_merge(patch, res_nodes, old_dir, new_dir);
     { std::vector<char>().swap(res_nodes.seq.data); }
-    serialize_merge(patch, res_interp_w);
-    serialize_merge(patch, res_interp_n);
+    serialize_merge(patch, res_interp_w, old_dir, new_dir);
+    serialize_merge(patch, res_interp_n, old_dir, new_dir);
     { std::vector<char>().swap(res_interp_n.seq.data); }
-    serialize_merge(patch, res_admin_p);
-    serialize_merge(patch, res_admin_v);
+    serialize_merge(patch, res_admin_p, old_dir, new_dir);
+    serialize_merge(patch, res_admin_v, old_dir, new_dir);
     { std::vector<char>().swap(res_admin_v.seq.data); }
-    serialize_merge(patch, res_poi_r);
-    serialize_merge(patch, res_poi_v);
+    serialize_merge(patch, res_poi_r, old_dir, new_dir);
+    serialize_merge(patch, res_poi_v, old_dir, new_dir);
     { std::vector<char>().swap(res_poi_v.seq.data); }
-    serialize_merge(patch, res_place_n);
+    serialize_merge(patch, res_place_n, old_dir, new_dir);
     malloc_trim(0); // return freed heap to OS
     std::cerr << "  RSS after serialize: " << get_rss_mb() << " MiB" << std::endl;
     double t0 = now_ms();
