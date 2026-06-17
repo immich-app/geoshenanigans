@@ -242,6 +242,18 @@ static void fixup_way_offsets(char* old_ways, size_t old_ways_size,
                                 const char* new_ways, size_t new_ways_size,
                                 const char* new_nodes, size_t new_nodes_size,
                                 size_t stride) {
+    // If the way records AND node coords are byte-identical between builds,
+    // the fixup is a no-op at best and a corruptor at worst: a way_hash
+    // collision can match an unchanged record to a different same-hash record
+    // and rewrite its node_offset to the wrong value, perturbing OLD so
+    // build_merge_seq classifies unchanged records as DELETE+INSERT and the
+    // derived id_remap goes non-identity — emitting thousands of spurious
+    // entry corrections (street_entries) for data that did not change. Skip.
+    if (old_ways_size == new_ways_size && old_nodes_size == new_nodes_size &&
+        old_ways_size > 0 &&
+        memcmp(old_ways, new_ways, old_ways_size) == 0 &&
+        memcmp(old_nodes, new_nodes, old_nodes_size) == 0)
+        return;
     size_t name_off = (stride == 12) ? 8 : 5;
     size_t old_n = old_ways_size / stride, new_n = new_ways_size / stride;
     size_t old_nc = old_nodes_size / 8, new_nc = new_nodes_size / 8;
@@ -295,6 +307,16 @@ static void fixup_v15_offsets(char* old_polys, size_t old_polys_size,
                               const char* new_verts, size_t new_verts_size,
                               size_t stride, size_t off_field_pos,
                               uint64_t (*key_fn)(const char* rec)) {
+    // Skip when polygon records AND vertex bytes are byte-identical (see
+    // fixup_way_offsets): the content-hash match can otherwise rewrite an
+    // unchanged polygon's vert_offset to a colliding polygon's offset,
+    // perturbing OLD and producing spurious non-identity id_remaps / admin_
+    // and addr_entries corrections on same-build diffs.
+    if (old_polys_size == new_polys_size && old_verts_size == new_verts_size &&
+        old_polys_size > 0 &&
+        memcmp(old_polys, new_polys, old_polys_size) == 0 &&
+        memcmp(old_verts, new_verts, old_verts_size) == 0)
+        return;
     constexpr uint32_t NO_DATA_OFF = 0xFFFFFFFFu;
     size_t old_n = old_polys_size / stride;
     size_t new_n = new_polys_size / stride;
@@ -594,10 +616,39 @@ struct FileMergeResult {
 };
 
 // Serialize a pre-computed merge result into the patch buffer
-static void serialize_merge(std::vector<char>& patch, const FileMergeResult& r) {
+static void serialize_merge(std::vector<char>& patch, const FileMergeResult& r,
+                            const std::string& old_dir = "",
+                            const std::string& new_dir = "") {
     auto wv = [&](const void* data, size_t size) {
         patch.insert(patch.end(), (const char*)data, (const char*)data + size);
     };
+    // Unchanged short-circuit (mirrors emit_raw / emit_sparse_delta): if the
+    // file is byte-identical to old, emit a copy-old marker (stride 0xFD, no
+    // data) instead of the merge sequence. The merge runs after upstream
+    // fixups (string-pool remap, vertex_offset rewrites) that can perturb the
+    // byte-merge into emitting ops for a file that is in fact identical —
+    // observed on a same-PBF planet diff: addr_vertices / street_nodes were
+    // byte-equal yet still encoded ~0.1 MiB each. geocoder-patch reproduces
+    // the file by copying it verbatim from the old build. Only fires when both
+    // files exist at <dir>/<name> (so the apply's copy from cur_dir succeeds);
+    // fallback-located files (admin_*) simply skip the check.
+    if (!old_dir.empty() && r.new_size > 0 && r.old_size == r.new_size) {
+        auto om = mmap_file(old_dir + "/" + r.name);
+        auto nm = mmap_file(new_dir + "/" + r.name);
+        bool same = om.data && nm.data &&
+                    memcmp(om.data, nm.data, (size_t)r.new_size) == 0;
+        if (om.data) unmap_file(om);
+        if (nm.data) unmap_file(nm);
+        if (same) {
+            uint32_t fid_u = (uint32_t)r.id, stride = 0xFD, nfix = 0;
+            uint64_t ds = 0;
+            wv(&fid_u, 4); wv(&stride, 4); wv(&r.old_size, 8);
+            wv(&r.new_size, 8); wv(&nfix, 4); wv(&ds, 8);
+            std::cerr << "  " << r.name << ": unchanged (copy old, "
+                      << r.new_size << " bytes saved)" << std::endl;
+            return;
+        }
+    }
     uint32_t fid = static_cast<uint32_t>(r.id);
     uint32_t st = static_cast<uint32_t>(r.stride);
     uint32_t n_fixups = static_cast<uint32_t>(r.fixups.size());
@@ -1804,28 +1855,28 @@ int main(int argc, char* argv[]) {
     }
 
     // Serialize merge results to patch in canonical order, freeing as we go.
-    serialize_merge(patch, res_addr);
+    serialize_merge(patch, res_addr, old_dir, new_dir);
     // res_addr_v is built in t_addr only when addr_stride >= 28 (v15+);
     // older variants leave stride=0 and old/new sizes 0, which we treat as
     // "not built" → fall through to the emit_raw(ADDR_VERTICES) call later
     // in the section pipeline. stride=1 marks a byte-merge ready to ship.
     if (res_addr_v.stride == 1) {
-        serialize_merge(patch, res_addr_v);
+        serialize_merge(patch, res_addr_v, old_dir, new_dir);
         { std::vector<char>().swap(res_addr_v.seq.data); }
     }
-    serialize_merge(patch, res_ways);
-    serialize_merge(patch, res_nodes);
+    serialize_merge(patch, res_ways, old_dir, new_dir);
+    serialize_merge(patch, res_nodes, old_dir, new_dir);
     { std::vector<char>().swap(res_nodes.seq.data); }
-    serialize_merge(patch, res_interp_w);
-    serialize_merge(patch, res_interp_n);
+    serialize_merge(patch, res_interp_w, old_dir, new_dir);
+    serialize_merge(patch, res_interp_n, old_dir, new_dir);
     { std::vector<char>().swap(res_interp_n.seq.data); }
-    serialize_merge(patch, res_admin_p);
-    serialize_merge(patch, res_admin_v);
+    serialize_merge(patch, res_admin_p, old_dir, new_dir);
+    serialize_merge(patch, res_admin_v, old_dir, new_dir);
     { std::vector<char>().swap(res_admin_v.seq.data); }
-    serialize_merge(patch, res_poi_r);
-    serialize_merge(patch, res_poi_v);
+    serialize_merge(patch, res_poi_r, old_dir, new_dir);
+    serialize_merge(patch, res_poi_v, old_dir, new_dir);
     { std::vector<char>().swap(res_poi_v.seq.data); }
-    serialize_merge(patch, res_place_n);
+    serialize_merge(patch, res_place_n, old_dir, new_dir);
     malloc_trim(0); // return freed heap to OS
     std::cerr << "  RSS after serialize: " << get_rss_mb() << " MiB" << std::endl;
     double t0 = now_ms();
@@ -2301,6 +2352,38 @@ int main(int argc, char* argv[]) {
         struct stat ost;
         uint64_t old_size = (stat(old_path.c_str(), &ost) == 0) ? (uint64_t)ost.st_size : 0;
 
+        // Unchanged short-circuit: if the old file exists and is
+        // byte-identical to the new one, emit a tiny "copy old" marker
+        // (stride 0xFD, no data) instead of dumping the whole file.
+        // Several raw-emitted files (postcode_centroid_cells/entries,
+        // postal_*) are fully deterministic and identical day-over-day;
+        // full-replacing them wasted ~5.8 MiB/planet. patch-apply
+        // reproduces them by copying the old file. memcmp via mmap is
+        // cheap vs the bytes saved.
+        if (old_size == new_size && new_size > 0) {
+            auto om = mmap_file(old_path);
+            auto nm = mmap_file(new_path);
+            bool same = om.data && nm.data &&
+                        memcmp(om.data, nm.data, (size_t)new_size) == 0;
+            if (om.data) unmap_file(om);
+            if (nm.data) unmap_file(nm);
+            if (same) {
+                uint32_t fid_u = static_cast<uint32_t>(fid);
+                uint32_t stride = 0xFD;  // sentinel: unchanged, copy old
+                uint32_t nfix = 0;
+                uint64_t ds = 0;
+                wval(patch, &fid_u, 4);
+                wval(patch, &stride, 4);
+                wval(patch, &old_size, 8);
+                wval(patch, &new_size, 8);
+                wval(patch, &nfix, 4);
+                wval(patch, &ds, 8);
+                std::cerr << "  " << fname << ": unchanged (copy old, "
+                          << new_size << " bytes saved)" << std::endl;
+                return;
+            }
+        }
+
         uint32_t fid_u = static_cast<uint32_t>(fid);
         uint32_t stride = 0;  // sentinel: full replacement
         uint32_t nfix = 0;
@@ -2348,6 +2431,33 @@ int main(int argc, char* argv[]) {
         uint64_t new_size = (uint64_t)nst.st_size;
         struct stat ost;
         uint64_t old_size = (stat(old_path.c_str(), &ost) == 0) ? (uint64_t)ost.st_size : 0;
+        // Unchanged short-circuit (mirrors emit_raw): if the old file is
+        // byte-identical to the new one, emit a copy-old marker (stride
+        // 0xFD, no data). The sparse delta remaps OLD values via an
+        // id_remap before comparing, so when an upstream array is
+        // non-deterministic (e.g. admin_polygons place_type_override) the
+        // remap can be spuriously non-identity and emit thousands of changes
+        // for a file that is in fact byte-identical (observed: 30k
+        // way_parents entries on a same-PBF planet diff). geocoder-patch
+        // reproduces the file by copying it verbatim from the old build.
+        if (old_size == new_size && new_size > 0) {
+            auto om = mmap_file(old_path);
+            auto nm = mmap_file(new_path);
+            bool same = om.data && nm.data &&
+                        memcmp(om.data, nm.data, (size_t)new_size) == 0;
+            if (om.data) unmap_file(om);
+            if (nm.data) unmap_file(nm);
+            if (same) {
+                uint32_t fid_u = (uint32_t)fid, stride = 0xFD, nfix = 0;
+                uint64_t ds = 0;
+                wval(patch, &fid_u, 4); wval(patch, &stride, 4);
+                wval(patch, &old_size, 8); wval(patch, &new_size, 8);
+                wval(patch, &nfix, 4); wval(patch, &ds, 8);
+                std::cerr << "  " << fname << ": unchanged (copy old, "
+                          << new_size << " bytes saved)" << std::endl;
+                return;
+            }
+        }
         if (new_size > 0 && new_size % value_stride != 0) {
             // Stride mismatch — fall back to full_replace to avoid corruption.
             std::cerr << "  " << fname << ": stride mismatch (size " << new_size

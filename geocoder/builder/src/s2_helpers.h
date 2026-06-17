@@ -100,4 +100,5 @@ void add_admin_polygon(ParsedData& data,
                        const char* name, uint8_t admin_level,
                        const char* country_code,
                        AdminCoverPool* admin_pool = nullptr,
-                       uint8_t place_type_override = 0);
+                       uint8_t place_type_override = 0,
+                       int64_t osm_way_id = 0);

@@ -1718,17 +1718,29 @@ int main(int argc, char* argv[]) {
                             pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, place_node_id));
                     }
                 }
-                // Build wikidata → place type map for admin boundary linking
+                // Build wikidata → place type map for admin boundary linking.
+                // Deterministic conflict resolution: when two place nodes share
+                // a wikidata id but carry different place types, plain
+                // last-write-wins picks the value from whichever thread-local
+                // batch happened to be processed last — and work-stealing makes
+                // that order non-deterministic, so the admin's
+                // place_type_override (and thus admin_polygons.bin) varied
+                // between same-PBF builds, cascading a spurious admin id_remap
+                // into way_parents / admin_entries. Keep the smallest PlaceType,
+                // which is order-independent.
                 for (auto& local : ntld) {
                     for (auto& [wd, pt] : local.place_wikidata) {
-                        wikidata_to_place_type[wd] = pt;
+                        auto [it, ins] = wikidata_to_place_type.try_emplace(wd, pt);
+                        if (!ins && pt < it->second) it->second = pt;
                     }
                     local.place_wikidata.clear();
                 }
-                // Build label-node → place type map (Nominatim's primary link method)
+                // Build label-node → place type map (Nominatim's primary link
+                // method). Same deterministic conflict resolution.
                 for (auto& local : ntld) {
                     for (auto& [nid, pt] : local.label_hits) {
-                        label_node_to_place_type[nid] = pt;
+                        auto [it, ins] = label_node_to_place_type.try_emplace(nid, pt);
+                        if (!ins && pt < it->second) it->second = pt;
                     }
                     local.label_hits.clear();
                 }
@@ -1797,6 +1809,7 @@ int main(int argc, char* argv[]) {
                         std::string country_code;
                         uint8_t fallback_place_type;  // from own place tag, used last
                         std::string wikidata; // for place linking
+                        int64_t way_id;       // source closed-way id (strategy-2 stable identity)
                     };
                     std::vector<ClosedWayAdmin> closed_way_admins;
                     // POI way data
@@ -2151,7 +2164,7 @@ int main(int argc, char* argv[]) {
                                         auto po = classify_place_override(t_linked_place, t_border_type, t_place);
                                         uint8_t fallback = static_cast<uint8_t>(po.type);
                                         std::string wd_str = t_wikidata ? t_wikidata : "";
-                                        local.closed_way_admins.push_back({std::move(verts), std::move(name_str), al, std::move(cc), fallback, std::move(wd_str)});
+                                        local.closed_way_admins.push_back({std::move(verts), std::move(name_str), al, std::move(cc), fallback, std::move(wd_str), way_id});
                                     }
                                 }
                             }
@@ -2165,7 +2178,7 @@ int main(int argc, char* argv[]) {
                                     std::vector<std::pair<double,double>> verts;
                                     for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});
                                     std::string wd_str = t_wikidata ? t_wikidata : "";
-                                    local.closed_way_admins.push_back({std::move(verts), std::string(aname), uint8_t(15), std::string(), static_cast<uint8_t>(pt), std::move(wd_str)});
+                                    local.closed_way_admins.push_back({std::move(verts), std::string(aname), uint8_t(15), std::string(), static_cast<uint8_t>(pt), std::move(wd_str), way_id});
                                 }
                             }
                         }
@@ -2204,7 +2217,8 @@ int main(int argc, char* argv[]) {
                                 uint8_t(15),
                                 std::string(),
                                 static_cast<uint8_t>(pt),
-                                std::move(wd_str)});
+                                std::move(wd_str),
+                                way_id});
                         }
                     }
                 });
@@ -2364,7 +2378,8 @@ int main(int argc, char* argv[]) {
                             if (pto == 0) pto = cwa.fallback_place_type;
                             const char* cc = cwa.country_code.empty() ? nullptr : cwa.country_code.c_str();
                             add_admin_polygon(data, cwa.vertices, cwa.name.c_str(),
-                                              cwa.admin_level, cc, &admin_pool, pto);
+                                              cwa.admin_level, cc, &admin_pool, pto,
+                                              cwa.way_id);
                             closed_way_admin_count++;
                         }
                         local.closed_way_admins.clear();
@@ -2657,13 +2672,18 @@ int main(int argc, char* argv[]) {
                         poly.country_code = (cc && cc[0] && cc[1])
                             ? static_cast<uint16_t>((cc[0] << 8) | cc[1]) : 0;
                         data.admin_polygons.push_back(poly);
-                        // Pack (relation_id, ring_index) into the 64-bit
-                        // stable_id. Top 48 bits = relation_id (covers
-                        // OSM's ~20M relations comfortably), bottom 16 =
-                        // ring_index. Strategy-2 IdAllocator uses this.
+                        // Strategy-2 stable identity, packed like addr/poi:
+                        // top 8 bits = ObjectType, bottom 56 bits = the
+                        // stable id. For relation-sourced admin polygons the
+                        // stable id is (relation_id<<16 | ring_index) — ring
+                        // in the low 16 bits, relation_id above (OSM has
+                        // ~20M relations, so this fits 56 bits comfortably).
+                        // The type byte keeps relation ids from colliding
+                        // with closed-way ids (which use OSM_WAY + way_id).
                         data.admin_osm_ids.push_back(
-                            (static_cast<uint64_t>(pp.relation_id) << 16) |
-                            static_cast<uint64_t>(pp.ring_index));
+                            (static_cast<uint64_t>(gc::id_alloc::ObjectType::OSM_RELATION) << 56) |
+                            ((((static_cast<uint64_t>(pp.relation_id) << 16) |
+                               static_cast<uint64_t>(pp.ring_index))) & 0x00FFFFFFFFFFFFFFull));
 
                         admin_pool.submit(poly_id, std::move(pp.simplified));
                     }
@@ -2834,32 +2854,28 @@ int main(int argc, char* argv[]) {
                                     for (const auto& [vlat, vlng] : pr.vertices) {
                                         poly_verts.push_back({static_cast<float>(vlat), static_cast<float>(vlng)});
                                     }
-                                    // TIGER addrs have no OSM origin. Use a synthetic
-                                    // 56-bit hash of (lat_bits, lng_bits, housenumber,
-                                    // street) so the same TIGER record gets the same
-                                    // dense idx across builds (TIGER snapshots are
-                                    // re-imported daily but mostly unchanged).
-                                    uint64_t synthetic_h = 14695981039346656037ULL;
-                                    auto mix64 = [&](uint64_t v) {
-                                        synthetic_h ^= v;
-                                        synthetic_h *= 1099511628211ULL;
-                                    };
-                                    uint32_t lat_bits, lng_bits;
-                                    float clat_f = static_cast<float>(clat);
-                                    float clng_f = static_cast<float>(clng);
-                                    std::memcpy(&lat_bits, &clat_f, 4);
-                                    std::memcpy(&lng_bits, &clng_f, 4);
-                                    mix64(static_cast<uint64_t>(lat_bits));
-                                    mix64(static_cast<uint64_t>(lng_bits));
-                                    for (char c : pr.addr_housenumber) mix64(static_cast<uint8_t>(c));
-                                    mix64(0); // separator
-                                    for (char c : pr.addr_street) mix64(static_cast<uint8_t>(c));
+                                    // Stable identity: this addr point is emitted by
+                                    // a POI RELATION, so reuse the relation's
+                                    // (relation_id<<16 | ring_index) key with type
+                                    // OSM_RELATION — the SAME scheme the POI record
+                                    // above uses. The previous synthetic 56-bit hash of
+                                    // (lat,lng,housenumber,street) COLLIDED for two
+                                    // relations sharing those fields but with different
+                                    // geometry; strategy-2 (which matches addr points by
+                                    // osm_id) then slotted the colliding pair non-
+                                    // deterministically — moving one record to the end
+                                    // and leaving a tombstone — which shifted
+                                    // addr_vertices packing and cascaded ~52M
+                                    // vertex_offset fixups (98.9 MiB) into the planet
+                                    // same-PBF patch. rel_payload is unique per
+                                    // (relation, ring), and addr_osm_ids is a separate
+                                    // sidecar from poi_osm_ids so sharing the key is safe.
                                     add_addr_point(data, clat, clng,
                                                    pr.addr_housenumber.c_str(),
                                                    pr.addr_street.c_str(),
                                                    bpc_ptr, dummy,
-                                                   pack_osm_id(gc::id_alloc::ObjectType::SYNTHETIC,
-                                                               static_cast<int64_t>(synthetic_h & 0x00FFFFFFFFFFFFFFull)),
+                                                   pack_osm_id(gc::id_alloc::ObjectType::OSM_RELATION,
+                                                               static_cast<int64_t>(rel_payload)),
                                                    poly_verts.data(),
                                                    static_cast<uint32_t>(poly_verts.size()));
                                     if (!pr.addr_postcode.empty() && is_valid_postcode(pr.addr_postcode.c_str())) {
@@ -3012,6 +3028,23 @@ int main(int argc, char* argv[]) {
             data.admin_polygons = std::move(new_polys);
             data.admin_vertices = std::move(new_verts);
 
+            // Reorder admin_osm_ids in lockstep. This is a parallel array
+            // (slot i is the stable osm-id of admin_polygons[i]); failing
+            // to permute it here leaves the sidecar misaligned from the
+            // polygon array, so the canonical sort below and strategy-2
+            // (which match by osm-id) attach the wrong stable id to each
+            // polygon → non-deterministic sidecar + massive admin churn on
+            // chained builds. The later content sort already does this; so
+            // must we. (admin_parent_ids / way_parent_ids / poi+place
+            // parent_poly_id are all computed AFTER this sort, so they need
+            // no remap here.)
+            if (data.admin_osm_ids.size() == n) {
+                std::vector<uint64_t> new_osm_ids(n);
+                for (uint32_t new_id = 0; new_id < n; new_id++)
+                    new_osm_ids[new_id] = data.admin_osm_ids[order[new_id]];
+                data.admin_osm_ids = std::move(new_osm_ids);
+            }
+
             // Remap poly_ids in cell_to_admin (preserving INTERIOR_FLAG)
             for (auto& [cell_id, ids] : data.cell_to_admin) {
                 for (auto& id : ids) {
@@ -3021,6 +3054,29 @@ int main(int argc, char* argv[]) {
                 }
             }
             std::cerr << "Sorted admin polygons largest-first (" << n << " polygons)." << std::endl;
+        }
+
+        // Deterministic tie-break for the smallest-containing-admin parent
+        // computations below (way_parent / admin_parent / poi parent). Those
+        // pick the min-area containing polygon with a strict `area < best`,
+        // leaving exact-area ties to whichever candidate is iterated first.
+        // AdminPolygon.area is float32, so distinct polygons routinely share
+        // an area value, and cell_to_admin's in-memory order is
+        // non-deterministic (S2 cover drain + Sort #1 remap, never re-sorted),
+        // so the tie winner flipped between same-PBF builds (~33k way parents
+        // + ~33k place parents of churn). Sort each cell's candidate list by
+        // admin osm_id (build-invariant, unique, kept aligned by Sort #1) so
+        // the first-of-equal-area winner is stable. write_cell_index re-sorts
+        // by raw poly_id at write time, so the on-disk layout is unaffected;
+        // this order only governs the parent tie-breaks. (Place-node uses its
+        // own (area, osm_id) candidate sort.)
+        if (data.admin_osm_ids.size() == data.admin_polygons.size()) {
+            for (auto& [cell_id, ids] : data.cell_to_admin) {
+                std::sort(ids.begin(), ids.end(), [&](uint32_t x, uint32_t y) {
+                    return data.admin_osm_ids[x & ID_MASK] <
+                           data.admin_osm_ids[y & ID_MASK];
+                });
+            }
         }
 
         // --- Place-node addressline containment ---
@@ -3072,11 +3128,20 @@ int main(int argc, char* argv[]) {
                             cand.push_back(id & 0x7FFFFFFFu);
                         }
                         // Sort candidates by ascending area so the first
-                        // PIP hit is the smallest containing polygon.
+                        // PIP hit is the smallest containing polygon. Break
+                        // exact-area ties by admin osm_id: AdminPolygon.area
+                        // is float32, so distinct polygons routinely share an
+                        // area value, and an area-only sort leaves their order
+                        // to the (non-deterministic) cell_to_admin iteration
+                        // order — making parent_poly_id flip between same-PBF
+                        // builds (~33k place nodes / 1.1 MiB churn). osm_id is
+                        // build-invariant and unique, giving a total order.
                         std::sort(cand.begin(), cand.end(),
                                   [&](uint32_t a, uint32_t b) {
-                            return data.admin_polygons[a].area <
-                                   data.admin_polygons[b].area;
+                            const auto& pa = data.admin_polygons[a];
+                            const auto& pb = data.admin_polygons[b];
+                            if (pa.area != pb.area) return pa.area < pb.area;
+                            return data.admin_osm_ids[a] < data.admin_osm_ids[b];
                         });
                         // Pick the smallest containing admin polygon at
                         // a rank level matching this place node's type.
@@ -3230,7 +3295,21 @@ int main(int argc, char* argv[]) {
                                 double dlat = (double)pn.lat - clat;
                                 double dlng = (double)pn.lng - clng;
                                 double d2 = dlat * dlat + dlng * dlng;
-                                if (d2 >= best_dist_sq) continue;
+                                if (d2 > best_dist_sq) continue;
+                                // Break exact-distance ties by the place node's
+                                // stable osm_id. name_to_places[nb] is iterated
+                                // in a non-deterministic order, so when two
+                                // same-named place nodes are equidistant from
+                                // the boundary centroid the linked place type
+                                // (-> place_type_override) flipped between
+                                // same-PBF builds, perturbing admin_polygons.bin
+                                // and cascading admin_entries churn. osm_id is
+                                // build-invariant and unique.
+                                if (d2 == best_dist_sq && best_idx != NO_DATA &&
+                                    pidx < data.place_osm_ids.size() &&
+                                    best_idx < data.place_osm_ids.size() &&
+                                    data.place_osm_ids[pidx] >= data.place_osm_ids[best_idx])
+                                    continue;
                                 best_dist_sq = d2;
                                 best_idx = pidx;
                             }
@@ -4264,11 +4343,26 @@ int main(int argc, char* argv[]) {
                             double best_d2 = 1e18;
                             uint32_t best_name = NO_DATA;
                             uint32_t best_way_idx = NO_DATA;
+                            // Stable tie-break for EXACT-distance ties. The
+                            // candidate iteration is ordered by sorted_way_cells
+                            // item_id = the pre-sort way index, which is
+                            // non-deterministic (parallel PBF parse order). When
+                            // an addr point is exactly equidistant from two
+                            // different (non-duplicate) ways — corners,
+                            // intersections, shared nodes — a strict `d2 < best`
+                            // pick lets the build-encounter order decide the
+                            // winner, so parent_way_id flips between same-PBF
+                            // builds. Since parent_way_id is part of the dedup
+                            // key, those flips cascade into massive addr_points
+                            // patch churn. Break exact ties by the way's osm_id
+                            // (invariant across builds) for a deterministic pick.
+                            int64_t best_osm = INT64_MAX;
                             // Token-matched resolution: track nearest
                             // way whose original name matches addr:street
                             double best_match_d2 = 1e18;
                             uint32_t best_match_name = NO_DATA;
                             uint32_t best_match_way = NO_DATA;
+                            int64_t best_match_osm = INT64_MAX;
                             const char* addr_street_str = nullptr;
                             if (ap.street_id != NO_DATA) {
                                 addr_street_str = pool_data.data() + ap.street_id;
@@ -4316,14 +4410,20 @@ int main(int argc, char* argv[]) {
                                             double qy = ay + tt * dy;
                                             d2 = qx * qx + qy * qy;
                                         }
-                                        if (d2 < best_d2) {
+                                        int64_t cand_osm = way_id < data.way_osm_ids.size()
+                                            ? data.way_osm_ids[way_id] : INT64_MAX;
+                                        if (d2 < best_d2 ||
+                                            (d2 == best_d2 && cand_osm < best_osm)) {
                                             best_d2 = d2;
                                             best_name = w.name_id;
                                             best_way_idx = way_id;
+                                            best_osm = cand_osm;
                                         }
                                         // Token-matched: check if way's
                                         // original name matches addr:street
-                                        if (d2 < best_match_d2 && addr_street_str
+                                        if ((d2 < best_match_d2 ||
+                                             (d2 == best_match_d2 && cand_osm < best_match_osm))
+                                            && addr_street_str
                                             && way_id < data.way_orig_name_ids.size()) {
                                             uint32_t orig_id = data.way_orig_name_ids[way_id];
                                             if (orig_id != NO_DATA) {
@@ -4332,6 +4432,7 @@ int main(int argc, char* argv[]) {
                                                     best_match_d2 = d2;
                                                     best_match_name = w.name_id;
                                                     best_match_way = way_id;
+                                                    best_match_osm = cand_osm;
                                                 }
                                             }
                                         }
@@ -4640,8 +4741,33 @@ int main(int argc, char* argv[]) {
                 // PBF parsing. osm_id is invariant per record and gives a
                 // truly canonical order, so dedup picks the same record
                 // every run.
-                if (data.addr_osm_ids.size() == data.addr_points.size())
+                if (data.addr_osm_ids.size() == data.addr_points.size()
+                    && data.addr_osm_ids[a] != data.addr_osm_ids[b])
                     return data.addr_osm_ids[a] < data.addr_osm_ids[b];
+                // osm_id can still COLLIDE: synthetic TIGER ids are a 56-bit
+                // FNV hash of (lat,lng,housenumber,street), so two distinct
+                // records with the same addressing keys share an id. Without a
+                // further tiebreak std::sort leaves their relative order to
+                // build-encounter order (non-deterministic); when a polygon/node
+                // pair swaps, the vertex_count sequence shifts addr_vertices
+                // packing and cascades vertex_offset for every later record
+                // (~98.9 MiB planet churn) plus a strategy-2 tombstone. Extend
+                // to a total order: vertex_count, parent_way_id, then the
+                // polygon vertex bytes (pre-sort offsets are still valid here —
+                // addr_vertices is repacked only after this sort).
+                if (pa.vertex_count != pb.vertex_count)
+                    return pa.vertex_count < pb.vertex_count;
+                if (pa.parent_way_id != pb.parent_way_id)
+                    return pa.parent_way_id < pb.parent_way_id;
+                if (pa.vertex_count > 0 &&
+                    pa.vertex_offset != NO_DATA && pb.vertex_offset != NO_DATA &&
+                    (size_t)pa.vertex_offset + pa.vertex_count <= data.addr_vertices.size() &&
+                    (size_t)pb.vertex_offset + pb.vertex_count <= data.addr_vertices.size()) {
+                    int c = std::memcmp(&data.addr_vertices[pa.vertex_offset],
+                                        &data.addr_vertices[pb.vertex_offset],
+                                        (size_t)pa.vertex_count * sizeof(NodeCoord));
+                    if (c != 0) return c < 0;
+                }
                 return a < b;
             });
             std::vector<uint32_t> old_to_new(n);

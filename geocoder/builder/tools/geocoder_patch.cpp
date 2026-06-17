@@ -466,6 +466,25 @@ int main(int argc, char* argv[]) {
             std::cerr << "  " << fname << ": full replace " << ds << " bytes" << std::endl;
             continue;
         }
+        if (stride == 0xFD) {
+            // Unchanged file: the diff verified old==new and emitted no
+            // data. Reproduce by copying the old (current) file verbatim.
+            uint32_t nf = ru32(); (void)nf; uint64_t ds = ru64(); pos += ds; // ds == 0
+            std::string src = cur_dir + "/" + fname;
+            FILE* in = fopen(src.c_str(), "rb");
+            FILE* out = fopen((out_dir + "/" + fname).c_str(), "wb");
+            if (in && out) {
+                std::vector<char> cbuf(1 << 20);
+                size_t r;
+                while ((r = fread(cbuf.data(), 1, cbuf.size(), in)) > 0)
+                    fwrite(cbuf.data(), 1, r, out);
+            }
+            if (in) fclose(in);
+            if (out) fclose(out);
+            std::cerr << "  " << fname << ": unchanged (copied " << new_size
+                      << " bytes from old)" << std::endl;
+            continue;
+        }
         if (stride == 0xFE) { uint32_t nf = ru32(); (void)nf; uint64_t ds = ru64(); pos += ds; continue; }
         if (stride == SPARSE_DELTA_STRIDE) {
             // SPARSE_DELTA: position-keyed delta. Format already decoded

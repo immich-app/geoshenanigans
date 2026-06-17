@@ -359,10 +359,17 @@ static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir
     std::vector<uint32_t> remap(n_old);
     bool identity = true;
     for (size_t i = 0; i < n_old; i++) {
-        // stable_id == 0 means closed-way polygon: NONE-typed slot, no reuse.
-        ObjectType t = data.admin_osm_ids[i] == 0
-            ? ObjectType::SYNTHETIC : ObjectType::OSM_RELATION;
-        remap[i] = alloc.allocate(t, data.admin_osm_ids[i]);
+        // admin_osm_ids are packed (ObjectType<<56 | stable56), same as
+        // addr/poi: OSM_RELATION for relation rings, OSM_WAY for
+        // closed-way polygons (stable id = way id). A bare 0 is the
+        // legacy "no stable id" sentinel — treat as SYNTHETIC so it
+        // never reuses a slot.
+        uint64_t packed = data.admin_osm_ids[i];
+        ObjectType t = packed == 0
+            ? ObjectType::SYNTHETIC
+            : static_cast<ObjectType>(packed >> 56);
+        uint64_t sid = packed & 0x00FFFFFFFFFFFFFFull;
+        remap[i] = alloc.allocate(t, sid);
         if (remap[i] != static_cast<uint32_t>(i)) identity = false;
     }
 
@@ -1530,18 +1537,18 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
     }
     // Strategy-2 sidecar for admin polygons (cached only). Same content
     // across full/no-addresses/admin since they share the same polygon
-    // set. The fallback path packs SYNTHETIC for closed-way polygons
-    // (admin_osm_ids[i]==0) and OSM_RELATION for relation-sourced ones.
+    // set. data.admin_osm_ids is already packed (ObjectType<<56 |
+    // stable56) — OSM_RELATION for relation rings, OSM_WAY for closed
+    // ways — so the fallback passes it straight through. A bare 0 is the
+    // legacy "no stable id" sentinel → emit as a SYNTHETIC slot.
     {
         std::vector<uint64_t> packed_fallback;
         if (data.admin_sidecar_blob.empty() && !data.admin_osm_ids.empty()) {
             packed_fallback.resize(data.admin_osm_ids.size());
             for (size_t i = 0; i < data.admin_osm_ids.size(); i++) {
-                gc::id_alloc::ObjectType t = data.admin_osm_ids[i] == 0
-                    ? gc::id_alloc::ObjectType::SYNTHETIC
-                    : gc::id_alloc::ObjectType::OSM_RELATION;
-                packed_fallback[i] = (static_cast<uint64_t>(t) << 56) |
-                                     (data.admin_osm_ids[i] & 0x00FFFFFFFFFFFFFFull);
+                packed_fallback[i] = data.admin_osm_ids[i] != 0
+                    ? data.admin_osm_ids[i]
+                    : (static_cast<uint64_t>(gc::id_alloc::ObjectType::SYNTHETIC) << 56);
             }
         }
         emit_strategy2_sidecar(output_dir + "/admin_polygons.osm_ids",
