@@ -1718,17 +1718,29 @@ int main(int argc, char* argv[]) {
                             pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, place_node_id));
                     }
                 }
-                // Build wikidata → place type map for admin boundary linking
+                // Build wikidata → place type map for admin boundary linking.
+                // Deterministic conflict resolution: when two place nodes share
+                // a wikidata id but carry different place types, plain
+                // last-write-wins picks the value from whichever thread-local
+                // batch happened to be processed last — and work-stealing makes
+                // that order non-deterministic, so the admin's
+                // place_type_override (and thus admin_polygons.bin) varied
+                // between same-PBF builds, cascading a spurious admin id_remap
+                // into way_parents / admin_entries. Keep the smallest PlaceType,
+                // which is order-independent.
                 for (auto& local : ntld) {
                     for (auto& [wd, pt] : local.place_wikidata) {
-                        wikidata_to_place_type[wd] = pt;
+                        auto [it, ins] = wikidata_to_place_type.try_emplace(wd, pt);
+                        if (!ins && pt < it->second) it->second = pt;
                     }
                     local.place_wikidata.clear();
                 }
-                // Build label-node → place type map (Nominatim's primary link method)
+                // Build label-node → place type map (Nominatim's primary link
+                // method). Same deterministic conflict resolution.
                 for (auto& local : ntld) {
                     for (auto& [nid, pt] : local.label_hits) {
-                        label_node_to_place_type[nid] = pt;
+                        auto [it, ins] = label_node_to_place_type.try_emplace(nid, pt);
+                        if (!ins && pt < it->second) it->second = pt;
                     }
                     local.label_hits.clear();
                 }
