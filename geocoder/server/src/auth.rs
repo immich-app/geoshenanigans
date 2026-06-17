@@ -366,3 +366,115 @@ fn html_escape(s: &str) -> String {
 
 const LOGIN_HTML: &str = include_str!("web/login.html");
 const DASHBOARD_HTML: &str = include_str!("web/dashboard.html");
+
+// --- Pure-helper regression tests -------------------------------------------
+//
+// Lock in current behaviour of the auth helper functions.  Private items
+// are visible here via `use super::*;`.  No network/filesystem; the rate
+// tests run fast enough to stay inside a single wall-clock second so the
+// per-second rollover doesn't fire spuriously.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn html_escape_all_entities() {
+        assert_eq!(html_escape("a&b<c>d\"e"), "a&amp;b&lt;c&gt;d&quot;e");
+        // No special chars -> unchanged.
+        assert_eq!(html_escape("plain text 123"), "plain text 123");
+        // Empty -> empty.
+        assert_eq!(html_escape(""), "");
+    }
+
+    #[test]
+    fn html_escape_ampersand_first() {
+        // & is replaced before <,>," so an already-encoded entity is NOT
+        // double-encoded into &amp;lt; — the literal "&lt;" becomes
+        // "&amp;lt;" because the bare '&' is escaped, then the 'l','t'
+        // pass through.  This proves '&' is handled first.
+        assert_eq!(html_escape("&lt;"), "&amp;lt;");
+        // A real "<" turns into &lt; (the &amp; pass already ran, so the
+        // ';' from &lt; is not re-touched).
+        assert_eq!(html_escape("<>"), "&lt;&gt;");
+    }
+
+    fn headers_with_cookies(cookies: &[&str]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for c in cookies {
+            h.append("cookie", HeaderValue::from_str(c).unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn get_session_cookie_single() {
+        let h = headers_with_cookies(&["session=abc123"]);
+        assert_eq!(get_session_cookie(&h).as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn get_session_cookie_among_many_in_one_header() {
+        // session= mixed with other cookies in a single header line.
+        let h = headers_with_cookies(&["theme=dark; session=xyz; lang=en"]);
+        assert_eq!(get_session_cookie(&h).as_deref(), Some("xyz"));
+    }
+
+    #[test]
+    fn get_session_cookie_across_multiple_headers() {
+        // Multiple Cookie header lines; session is in the second.
+        let h = headers_with_cookies(&["theme=dark", "session=multi"]);
+        assert_eq!(get_session_cookie(&h).as_deref(), Some("multi"));
+    }
+
+    #[test]
+    fn get_session_cookie_absent() {
+        let h = headers_with_cookies(&["theme=dark; lang=en"]);
+        assert_eq!(get_session_cookie(&h), None);
+        // No cookie headers at all.
+        assert_eq!(get_session_cookie(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn check_rate_zero_means_unlimited() {
+        let limiter: RateLimiter = Default::default();
+        // rate_per_second=0 and rate_per_day=0 -> never limited.
+        for _ in 0..1000 {
+            assert!(check_rate(&limiter, "u", 0, 0).is_ok());
+        }
+    }
+
+    #[test]
+    fn check_rate_per_second_boundary() {
+        // rate_per_second=2: the first two calls pass, the third trips the
+        // limit (fetch_add returns the pre-increment value, compared >=).
+        let limiter: RateLimiter = Default::default();
+        assert!(check_rate(&limiter, "persec", 2, 0).is_ok());
+        assert!(check_rate(&limiter, "persec", 2, 0).is_ok());
+        let third = check_rate(&limiter, "persec", 2, 0);
+        assert_eq!(third, Err("Rate limit exceeded (per second)"));
+    }
+
+    #[test]
+    fn check_rate_per_day_boundary() {
+        // rate_per_second=0 (unlimited/sec) so only the per-day cap applies.
+        // rate_per_day=3: three pass, the fourth trips.
+        let limiter: RateLimiter = Default::default();
+        assert!(check_rate(&limiter, "perday", 0, 3).is_ok());
+        assert!(check_rate(&limiter, "perday", 0, 3).is_ok());
+        assert!(check_rate(&limiter, "perday", 0, 3).is_ok());
+        let fourth = check_rate(&limiter, "perday", 0, 3);
+        assert_eq!(fourth, Err("Rate limit exceeded (per day)"));
+    }
+
+    #[test]
+    fn check_rate_per_user_isolation() {
+        // Different logins have independent counters.
+        let limiter: RateLimiter = Default::default();
+        assert!(check_rate(&limiter, "alice", 1, 0).is_ok());
+        // alice is now at her per-second limit.
+        assert_eq!(check_rate(&limiter, "alice", 1, 0), Err("Rate limit exceeded (per second)"));
+        // bob still has his full allowance.
+        assert!(check_rate(&limiter, "bob", 1, 0).is_ok());
+    }
+}

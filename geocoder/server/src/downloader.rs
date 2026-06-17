@@ -256,3 +256,155 @@ pub async fn download_region(
 
     Ok(())
 }
+
+// --- Pure-helper regression tests -------------------------------------------
+//
+// Lock in current behaviour of resolve_files (component graph walking) and
+// the DownloadError Display strings.  No network/filesystem.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn component(files: &[&str], replaces: &[&str], extends: Option<&str>) -> Component {
+        Component {
+            files: files.iter().map(|s| s.to_string()).collect(),
+            replaces: replaces.iter().map(|s| s.to_string()).collect(),
+            extends: extends.map(|s| s.to_string()),
+        }
+    }
+
+    fn cfg(components: Vec<(&str, Component)>) -> Configurations {
+        Configurations {
+            build: BuildMeta { date: "2026-01-01".into() },
+            components: components.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            files: BTreeMap::new(),
+        }
+    }
+
+    fn sel(region: &str, mode: &str, quality: &str, poi_tier: &str) -> RegionSelection {
+        RegionSelection {
+            region: region.to_string(),
+            mode: mode.to_string(),
+            quality: quality.to_string(),
+            poi_tier: poi_tier.to_string(),
+        }
+    }
+
+    #[test]
+    fn resolve_files_substitutes_placeholders() {
+        let c = cfg(vec![
+            ("mode.full", component(
+                &["{region}/{mode}/admin.bin", "{region}/{quality}/q.bin"],
+                &[], None)),
+            ("quality.q2.5", component(&["{region}/{quality}/cells.bin"], &[], None)),
+            ("poi_tier.major", component(&["{region}/poi/{poi_tier}.bin"], &[], None)),
+        ]);
+        let s = sel("europe", "full", "q2.5", "major");
+        let files = resolve_files(&c, &s);
+        // BTreeSet => sorted, deduped. {region}->europe, {mode}->full,
+        // {quality}->q2.5, {poi_tier}->major.
+        assert_eq!(files, vec![
+            "europe/full/admin.bin".to_string(),
+            "europe/poi/major.bin".to_string(),
+            "europe/q2.5/cells.bin".to_string(),
+            "europe/q2.5/q.bin".to_string(),
+        ]);
+    }
+
+    #[test]
+    fn resolve_files_extends_chain_collects_parent_files() {
+        // quality.q2.5 extends quality.base; both sets of files appear.
+        let c = cfg(vec![
+            ("mode.full", component(&["m.bin"], &[], None)),
+            ("quality.base", component(&["base_a.bin", "base_b.bin"], &[], None)),
+            ("quality.q2.5", component(&["q.bin"], &[], Some("quality.base"))),
+            ("poi_tier.none", component(&[], &[], None)),
+        ]);
+        let s = sel("eu", "full", "q2.5", "none");
+        let files = resolve_files(&c, &s);
+        assert_eq!(files, vec![
+            "base_a.bin".to_string(),
+            "base_b.bin".to_string(),
+            "m.bin".to_string(),
+            "q.bin".to_string(),
+        ]);
+    }
+
+    #[test]
+    fn resolve_files_replaces_removes_matching_path() {
+        // quality.q2.5 replaces the base admin file with a higher-quality one.
+        let c = cfg(vec![
+            ("mode.full", component(&["admin_lo.bin", "cells.bin"], &[], None)),
+            ("quality.q2.5", component(&["admin_hi.bin"], &["admin_lo.bin"], None)),
+            ("poi_tier.none", component(&[], &[], None)),
+        ]);
+        let s = sel("eu", "full", "q2.5", "none");
+        let files = resolve_files(&c, &s);
+        assert_eq!(files, vec![
+            "admin_hi.bin".to_string(),
+            "cells.bin".to_string(),
+        ]);
+        // admin_lo.bin was replaced out.
+        assert!(!files.contains(&"admin_lo.bin".to_string()));
+    }
+
+    #[test]
+    fn resolve_files_replaces_uses_substitution() {
+        // A replaces entry containing {region} is substituted before matching.
+        let c = cfg(vec![
+            ("mode.full", component(&["{region}/admin_lo.bin"], &[], None)),
+            ("quality.q2.5", component(&["{region}/admin_hi.bin"], &["{region}/admin_lo.bin"], None)),
+            ("poi_tier.none", component(&[], &[], None)),
+        ]);
+        let s = sel("asia", "full", "q2.5", "none");
+        let files = resolve_files(&c, &s);
+        assert_eq!(files, vec!["asia/admin_hi.bin".to_string()]);
+    }
+
+    #[test]
+    fn resolve_files_dedups_identical_paths() {
+        // Same path emitted by two components collapses to one entry.
+        let c = cfg(vec![
+            ("mode.full", component(&["shared.bin"], &[], None)),
+            ("quality.q2.5", component(&["shared.bin", "extra.bin"], &[], None)),
+            ("poi_tier.none", component(&[], &[], None)),
+        ]);
+        let s = sel("eu", "full", "q2.5", "none");
+        let files = resolve_files(&c, &s);
+        assert_eq!(files, vec!["extra.bin".to_string(), "shared.bin".to_string()]);
+    }
+
+    #[test]
+    fn resolve_files_missing_component_ids_yield_empty() {
+        // No matching component ids at all -> empty result.
+        let c = cfg(vec![("something.else", component(&["x.bin"], &[], None))]);
+        let s = sel("eu", "full", "q2.5", "none");
+        assert!(resolve_files(&c, &s).is_empty());
+    }
+
+    #[test]
+    fn download_error_display_strings() {
+        assert_eq!(DownloadError::Http("boom".into()).to_string(), "HTTP error: boom");
+        assert_eq!(DownloadError::Io("nope".into()).to_string(), "I/O error: nope");
+        assert_eq!(
+            DownloadError::HashMismatch {
+                path: "a/b.bin".into(),
+                expected: "deadbeef".into(),
+                got: "cafef00d".into(),
+            }.to_string(),
+            "sha256 mismatch on a/b.bin: expected deadbeef, got cafef00d"
+        );
+        assert_eq!(
+            DownloadError::NotInManifest("x.bin".into()).to_string(),
+            "file not in manifest: x.bin"
+        );
+        assert_eq!(
+            DownloadError::Decompress("bad frame".into()).to_string(),
+            "zstd decompress: bad frame"
+        );
+        assert_eq!(
+            DownloadError::UnknownRegion("atlantis".into()).to_string(),
+            "unknown region: atlantis"
+        );
+    }
+}

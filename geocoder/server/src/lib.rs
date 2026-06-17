@@ -4287,3 +4287,501 @@ pub fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
 
     if parts.is_empty() { None } else { Some(parts.join(", ")) }
 }
+
+// --- Pure-helper regression tests -------------------------------------------
+//
+// These lock in the *current* output of the pure helper functions so a
+// refactor can't silently change Nominatim-parity results.  They are a
+// regression net, NOT a spec: where current behaviour looks surprising
+// it's still asserted as-is with a `// NOTE:` explaining why.
+#[cfg(test)]
+mod pure_helper_tests {
+    use super::*;
+
+    // -- postcode formatting / validation ------------------------------------
+
+    fn cc(s: &str) -> [u8; 2] {
+        let b = s.as_bytes();
+        [b[0], b[1]]
+    }
+
+    #[test]
+    fn format_postcode_se_gr_inserts_space_at_3() {
+        // ddd dd — 5 digits split after the third.
+        assert_eq!(format_postcode(&cc("se"), "11422"), "114 22");
+        assert_eq!(format_postcode(&cc("gr"), "10431"), "104 31");
+        // sk / cz share the same ddd dd rule.
+        assert_eq!(format_postcode(&cc("sk"), "81101"), "811 01");
+        assert_eq!(format_postcode(&cc("cz"), "11000"), "110 00");
+        // Already-spaced input is stripped then reformatted identically.
+        assert_eq!(format_postcode(&cc("se"), "114 22"), "114 22");
+        // Wrong length -> no match -> original returned verbatim.
+        assert_eq!(format_postcode(&cc("se"), "1142"), "1142");
+        assert_eq!(format_postcode(&cc("se"), "1142A"), "1142A");
+    }
+
+    #[test]
+    fn format_postcode_nl_dddd_aa() {
+        // dddd AA — uppercased, space inserted after 4th char.
+        assert_eq!(format_postcode(&cc("nl"), "1011ab"), "1011 AB");
+        assert_eq!(format_postcode(&cc("nl"), "1011 AB"), "1011 AB");
+        // Letters where digits expected -> no match.
+        assert_eq!(format_postcode(&cc("nl"), "10A1AB"), "10A1AB");
+        // Wrong length -> no match.
+        assert_eq!(format_postcode(&cc("nl"), "1011A"), "1011A");
+    }
+
+    #[test]
+    fn format_postcode_ca_ldl_dld() {
+        // ldl dld — letter/digit alternating, space after 3rd char.
+        assert_eq!(format_postcode(&cc("ca"), "K1A0B1"), "K1A 0B1");
+        // Lowercase is uppercased first.
+        assert_eq!(format_postcode(&cc("ca"), "k1a0b1"), "K1A 0B1");
+        // Pattern mismatch (all digits) -> no match.
+        assert_eq!(format_postcode(&cc("ca"), "123456"), "123456");
+    }
+
+    #[test]
+    fn format_postcode_jp_and_br() {
+        // JP: ddd-dddd (7 digits, dash after 3rd).
+        assert_eq!(format_postcode(&cc("jp"), "1000001"), "100-0001");
+        // BR: ddddd-ddd (8 digits, dash after 5th).
+        assert_eq!(format_postcode(&cc("br"), "01310100"), "01310-100");
+        // Wrong digit count -> original.
+        assert_eq!(format_postcode(&cc("jp"), "100001"), "100001");
+    }
+
+    #[test]
+    fn format_postcode_uppercases_cc_and_unknown_passthrough() {
+        // Country code is lowercased internally, so an uppercase CC still matches.
+        assert_eq!(format_postcode(&cc("SE"), "11422"), "114 22");
+        // A country with no rule returns the input borrowed, unchanged.
+        assert_eq!(format_postcode(&cc("us"), "10001"), "10001");
+        assert_eq!(format_postcode(&cc("gb"), "SW1A 1AA"), "SW1A 1AA");
+    }
+
+    #[test]
+    fn postcode_looks_valid_rejects_placeholders() {
+        // All-same digits / chars are placeholders.
+        assert!(!postcode_looks_valid(&cc("us"), "000000"));
+        assert!(!postcode_looks_valid(&cc("us"), "0000"));
+        assert!(!postcode_looks_valid(&cc("us"), "-----"));
+        // Empty after stripping whitespace and dashes.
+        assert!(!postcode_looks_valid(&cc("us"), ""));
+        assert!(!postcode_looks_valid(&cc("us"), "   "));
+        assert!(!postcode_looks_valid(&cc("us"), "-"));
+        // NOTE: a single repeated char counts as "all same" and is rejected,
+        // so a lone "5" is invalid even though it could be a real value.
+        assert!(!postcode_looks_valid(&cc("us"), "5"));
+        // Normal values pass.
+        assert!(postcode_looks_valid(&cc("us"), "10001"));
+        assert!(postcode_looks_valid(&cc("se"), "114 22"));
+    }
+
+    #[test]
+    fn centroid_postcode_ok_rules() {
+        assert!(centroid_postcode_ok("10001"));
+        assert!(centroid_postcode_ok("SW1A 1AA"));
+        // > 10 chars rejected.
+        assert!(!centroid_postcode_ok("12345678901"));
+        // semicolon (multiple values) rejected.
+        assert!(!centroid_postcode_ok("10001;10002"));
+        // "PO" / "Box" substrings rejected (case-sensitive).
+        assert!(!centroid_postcode_ok("PO 123"));
+        assert!(!centroid_postcode_ok("Box 5"));
+        // NOTE: the check is case-sensitive substring; "po box" passes since
+        // neither "PO" nor "Box" appears with this exact casing.
+        assert!(centroid_postcode_ok("po 1"));
+        // US zip+4 (len 10, dash at index 5) rejected.
+        assert!(!centroid_postcode_ok("10001-2062"));
+        // A 9-char dashed value is NOT caught by the len==10 zip+4 rule.
+        assert!(centroid_postcode_ok("1001-2062"));
+    }
+
+    #[test]
+    fn country_has_no_postcode_membership() {
+        // In the no-postcode set.
+        assert!(country_has_no_postcode(&cc("ae")));
+        assert!(country_has_no_postcode(&cc("qa")));
+        assert!(country_has_no_postcode(&cc("zw")));
+        // Case-insensitive (uppercased input still matches).
+        assert!(country_has_no_postcode(&cc("AE")));
+        // Not in the set.
+        assert!(!country_has_no_postcode(&cc("us")));
+        assert!(!country_has_no_postcode(&cc("gb")));
+        assert!(!country_has_no_postcode(&cc("de")));
+    }
+
+    // -- enum -> field/rank/class snapshots ----------------------------------
+
+    #[test]
+    fn place_type_to_field_snapshot() {
+        assert_eq!(place_type_to_field(1), Some("city"));
+        assert_eq!(place_type_to_field(2), Some("town"));
+        assert_eq!(place_type_to_field(3), Some("village"));
+        assert_eq!(place_type_to_field(4), Some("suburb"));
+        assert_eq!(place_type_to_field(5), Some("neighbourhood"));
+        assert_eq!(place_type_to_field(6), Some("quarter"));
+        assert_eq!(place_type_to_field(7), Some("state"));
+        assert_eq!(place_type_to_field(8), Some("province"));
+        assert_eq!(place_type_to_field(9), Some("region"));
+        assert_eq!(place_type_to_field(10), Some("county"));
+        assert_eq!(place_type_to_field(11), Some("district"));
+        assert_eq!(place_type_to_field(12), Some("borough"));
+        assert_eq!(place_type_to_field(13), Some("hamlet"));
+        assert_eq!(place_type_to_field(14), Some("municipality"));
+        assert_eq!(place_type_to_field(0), None);
+        assert_eq!(place_type_to_field(15), None);
+        assert_eq!(place_type_to_field(255), None);
+    }
+
+    #[test]
+    fn rank_to_field_snapshot() {
+        // Below 4 -> None.
+        assert_eq!(rank_to_field(0), None);
+        assert_eq!(rank_to_field(3), None);
+        assert_eq!(rank_to_field(4), Some("country"));
+        assert_eq!(rank_to_field(5), Some("country"));
+        assert_eq!(rank_to_field(6), Some("region"));
+        assert_eq!(rank_to_field(7), Some("region"));
+        assert_eq!(rank_to_field(8), Some("state"));
+        assert_eq!(rank_to_field(9), Some("state"));
+        assert_eq!(rank_to_field(10), Some("state_district"));
+        assert_eq!(rank_to_field(11), Some("state_district"));
+        assert_eq!(rank_to_field(12), Some("county"));
+        assert_eq!(rank_to_field(13), Some("county"));
+        assert_eq!(rank_to_field(14), Some("municipality"));
+        assert_eq!(rank_to_field(15), Some("municipality"));
+        assert_eq!(rank_to_field(16), Some("city"));
+        assert_eq!(rank_to_field(17), Some("city"));
+        assert_eq!(rank_to_field(18), Some("city_district"));
+        assert_eq!(rank_to_field(19), Some("city_district"));
+        assert_eq!(rank_to_field(20), Some("suburb"));
+        assert_eq!(rank_to_field(21), Some("suburb"));
+        assert_eq!(rank_to_field(22), Some("neighbourhood"));
+        assert_eq!(rank_to_field(23), Some("neighbourhood"));
+        assert_eq!(rank_to_field(24), Some("city_block"));
+        assert_eq!(rank_to_field(25), Some("city_block"));
+        // 26+ -> None.
+        assert_eq!(rank_to_field(26), None);
+        assert_eq!(rank_to_field(30), None);
+    }
+
+    #[test]
+    fn place_type_to_rank_snapshot() {
+        assert_eq!(place_type_to_rank(1), 16);
+        assert_eq!(place_type_to_rank(2), 16);
+        assert_eq!(place_type_to_rank(3), 16);
+        assert_eq!(place_type_to_rank(4), 20);
+        assert_eq!(place_type_to_rank(5), 24);
+        assert_eq!(place_type_to_rank(6), 22);
+        // NOTE: state/province/region map to 0 (deliberately not in address chain).
+        assert_eq!(place_type_to_rank(7), 0);
+        assert_eq!(place_type_to_rank(8), 0);
+        assert_eq!(place_type_to_rank(9), 0);
+        assert_eq!(place_type_to_rank(10), 12);
+        assert_eq!(place_type_to_rank(11), 12);
+        assert_eq!(place_type_to_rank(12), 18);
+        assert_eq!(place_type_to_rank(13), 20);
+        assert_eq!(place_type_to_rank(14), 14);
+        assert_eq!(place_type_to_rank(0), 0);
+        assert_eq!(place_type_to_rank(255), 0);
+    }
+
+    #[test]
+    fn poi_category_to_osm_class_snapshot() {
+        // Range boundaries for each class.
+        assert_eq!(poi_category_to_osm_class(0), Some("tourism"));
+        assert_eq!(poi_category_to_osm_class(19), Some("tourism"));
+        assert_eq!(poi_category_to_osm_class(20), Some("historic"));
+        assert_eq!(poi_category_to_osm_class(39), Some("historic"));
+        assert_eq!(poi_category_to_osm_class(40), Some("amenity"));
+        assert_eq!(poi_category_to_osm_class(54), Some("amenity"));
+        assert_eq!(poi_category_to_osm_class(55), Some("amenity"));
+        assert_eq!(poi_category_to_osm_class(59), Some("amenity"));
+        assert_eq!(poi_category_to_osm_class(60), Some("leisure"));
+        assert_eq!(poi_category_to_osm_class(66), Some("leisure"));
+        assert_eq!(poi_category_to_osm_class(67), Some("amenity"));
+        assert_eq!(poi_category_to_osm_class(69), Some("amenity"));
+        assert_eq!(poi_category_to_osm_class(70), Some("leisure"));
+        assert_eq!(poi_category_to_osm_class(72), Some("leisure"));
+        assert_eq!(poi_category_to_osm_class(73), Some("amenity"));
+        // NOTE: 74 is not covered by any arm -> None (gap between 73 and 75).
+        assert_eq!(poi_category_to_osm_class(74), None);
+        assert_eq!(poi_category_to_osm_class(75), Some("amenity"));
+        assert_eq!(poi_category_to_osm_class(76), Some("amenity"));
+        assert_eq!(poi_category_to_osm_class(77), Some("leisure"));
+        assert_eq!(poi_category_to_osm_class(79), Some("leisure"));
+        assert_eq!(poi_category_to_osm_class(80), Some("natural"));
+        assert_eq!(poi_category_to_osm_class(90), Some("natural"));
+        // NOTE: 91/92/93 (bay/cape/island) are area labels -> None.
+        assert_eq!(poi_category_to_osm_class(91), None);
+        assert_eq!(poi_category_to_osm_class(92), None);
+        assert_eq!(poi_category_to_osm_class(93), None);
+        assert_eq!(poi_category_to_osm_class(94), Some("natural"));
+        assert_eq!(poi_category_to_osm_class(99), Some("natural"));
+        assert_eq!(poi_category_to_osm_class(100), Some("aeroway"));
+        assert_eq!(poi_category_to_osm_class(105), Some("railway"));
+        assert_eq!(poi_category_to_osm_class(110), Some("man_made"));
+        assert_eq!(poi_category_to_osm_class(119), Some("man_made"));
+        assert_eq!(poi_category_to_osm_class(120), Some("building"));
+        assert_eq!(poi_category_to_osm_class(121), Some("building"));
+        assert_eq!(poi_category_to_osm_class(130), Some("boundary"));
+        assert_eq!(poi_category_to_osm_class(131), Some("boundary"));
+        assert_eq!(poi_category_to_osm_class(132), Some("natural"));
+        assert_eq!(poi_category_to_osm_class(136), Some("natural"));
+        assert_eq!(poi_category_to_osm_class(140), Some("craft"));
+        assert_eq!(poi_category_to_osm_class(141), Some("craft"));
+        assert_eq!(poi_category_to_osm_class(142), Some("landuse"));
+        assert_eq!(poi_category_to_osm_class(152), Some("landuse"));
+        // NOTE: POWER_PLANT=150 falls in 142..=152 -> "landuse" (not excluded
+        // here despite the doc comment about exclusion).
+        assert_eq!(poi_category_to_osm_class(150), Some("landuse"));
+        assert_eq!(poi_category_to_osm_class(160), Some("office"));
+        // NOTE: UNNAMED_RANK30=170 -> None (generic filler).
+        assert_eq!(poi_category_to_osm_class(170), None);
+        assert_eq!(poi_category_to_osm_class(171), Some("amenity"));
+        assert_eq!(poi_category_to_osm_class(179), Some("amenity"));
+        assert_eq!(poi_category_to_osm_class(180), Some("amenity"));
+        assert_eq!(poi_category_to_osm_class(234), Some("amenity"));
+        assert_eq!(poi_category_to_osm_class(235), Some("leisure"));
+        assert_eq!(poi_category_to_osm_class(240), Some("leisure"));
+        assert_eq!(poi_category_to_osm_class(241), Some("shop"));
+        assert_eq!(poi_category_to_osm_class(253), Some("shop"));
+        assert_eq!(poi_category_to_osm_class(254), None);
+        assert_eq!(poi_category_to_osm_class(255), None);
+    }
+
+    #[test]
+    fn is_area_label_category_snapshot() {
+        // A representative sample of the matched set.
+        for cat in [80u8, 81, 82, 86, 91, 92, 93, 60, 61, 62, 63, 64, 65,
+                    130, 131, 41, 42, 43, 47, 51, 54, 3, 4, 9, 11, 25, 100, 150] {
+            assert!(Index::is_area_label_category(cat), "expected {cat} to be an area label");
+        }
+        // A representative sample of non-matches.
+        for cat in [0u8, 1, 2, 5, 40, 44, 50, 66, 70, 90, 120, 170, 200, 255] {
+            assert!(!Index::is_area_label_category(cat), "expected {cat} to NOT be an area label");
+        }
+    }
+
+    // -- address_score -------------------------------------------------------
+
+    #[test]
+    fn address_score_field_weights() {
+        // Empty address scores 0.
+        let empty = Address::default();
+        assert_eq!(address_score(&empty), 0);
+
+        // Each field contributes its documented weight, additively.
+        let mut a = Address::default();
+        a.address.country = Some("X");       // +1
+        a.address.state = Some("X");         // +2
+        a.address.county = Some("X");        // +3
+        a.address.city = Some("X");          // +4
+        a.address.road = Some("X");          // +5
+        a.address.house_number = Some(Cow::Borrowed("1")); // +6
+        assert_eq!(address_score(&a), 1 + 2 + 3 + 4 + 5 + 6);
+
+        // A populated result outscores an emptier one (monotonic refinement).
+        let mut coarse = Address::default();
+        coarse.address.country = Some("France");
+        let mut fine = Address::default();
+        fine.address.country = Some("France");
+        fine.address.city = Some("Paris");
+        fine.address.road = Some("Rue de Rivoli");
+        assert!(address_score(&fine) > address_score(&coarse));
+
+        // A non-empty places vec adds 1.
+        let mut with_place = Address::default();
+        with_place.places.push(PoiDetail {
+            name: "Eiffel Tower".into(),
+            category: "tourism".into(),
+            distance_m: 0.0,
+        });
+        assert_eq!(address_score(&with_place), 1);
+    }
+
+    // -- geometry: point_in_polygon / distances ------------------------------
+
+    fn nc(lat: f32, lng: f32) -> NodeCoord { NodeCoord { lat, lng } }
+
+    fn unit_square() -> Vec<NodeCoord> {
+        // CCW unit square [0,1]x[0,1] (lat, lng).
+        vec![nc(0.0, 0.0), nc(0.0, 1.0), nc(1.0, 1.0), nc(1.0, 0.0)]
+    }
+
+    #[test]
+    fn point_in_polygon_square() {
+        let sq = unit_square();
+        // Interior.
+        assert!(point_in_polygon(0.5, 0.5, &sq));
+        // Clearly outside on every side.
+        assert!(!point_in_polygon(0.5, 1.5, &sq));
+        assert!(!point_in_polygon(0.5, -0.5, &sq));
+        assert!(!point_in_polygon(1.5, 0.5, &sq));
+        assert!(!point_in_polygon(-0.5, 0.5, &sq));
+    }
+
+    #[test]
+    fn point_in_polygon_triangle() {
+        // Triangle with vertices (0,0), (0,4), (4,0) — right triangle.
+        let tri = vec![nc(0.0, 0.0), nc(0.0, 4.0), nc(4.0, 0.0)];
+        // Inside (below the hypotenuse lat+lng < 4).
+        assert!(point_in_polygon(1.0, 1.0, &tri));
+        // Outside, beyond the hypotenuse.
+        assert!(!point_in_polygon(3.0, 3.0, &tri));
+        // Outside entirely.
+        assert!(!point_in_polygon(-1.0, -1.0, &tri));
+    }
+
+    #[test]
+    fn dist_sq_basic() {
+        // cos_lat = 1: plain euclidean squared distance.
+        assert!((dist_sq(3.0, 4.0, 1.0) - 25.0).abs() < 1e-12);
+        // cos_lat scales the lng component.
+        assert!((dist_sq(0.0, 2.0, 0.5) - (2.0_f64 * 2.0 * 0.5 * 0.5)).abs() < 1e-12);
+        assert_eq!(dist_sq(0.0, 0.0, 1.0), 0.0);
+    }
+
+    #[test]
+    fn point_to_segment_with_t_clamping() {
+        // Segment from (0,0) to (0,10) along lng axis, cos_lat=1.
+        // Projection of (0,5) lands at the midpoint, t=0.5, dist 0.
+        let (d, t) = point_to_segment_with_t(0.0, 5.0, 0.0, 0.0, 0.0, 10.0, 1.0);
+        assert!((t - 0.5).abs() < 1e-12);
+        assert!(d < 1e-12);
+
+        // Point before the start clamps t to 0.
+        let (_, t0) = point_to_segment_with_t(0.0, -5.0, 0.0, 0.0, 0.0, 10.0, 1.0);
+        assert_eq!(t0, 0.0);
+
+        // Point past the end clamps t to 1.
+        let (_, t1) = point_to_segment_with_t(0.0, 50.0, 0.0, 0.0, 0.0, 10.0, 1.0);
+        assert_eq!(t1, 1.0);
+    }
+
+    #[test]
+    fn point_to_segment_with_t_zero_length() {
+        // Degenerate (zero-length) segment: t forced to 0, distance is the
+        // radian-space distance to the single point.
+        let (d, t) = point_to_segment_with_t(0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0);
+        assert_eq!(t, 0.0);
+        // dlng = 1 degree in radians, dlat = 0.
+        let expect = dist_sq(0.0_f64.to_radians(), 1.0_f64.to_radians(), 1.0);
+        assert!((d - expect).abs() < 1e-18);
+    }
+
+    #[test]
+    fn polygon_distance_sq_inside_is_zero() {
+        let sq = unit_square();
+        // Inside -> exactly 0.0.
+        assert_eq!(polygon_distance_sq(0.5, 0.5, &sq, 1.0), 0.0);
+        // Empty polygon -> f64::MAX (guarded before the ray cast).
+        assert_eq!(polygon_distance_sq(0.5, 0.5, &[], 1.0), f64::MAX);
+    }
+
+    #[test]
+    fn polygon_distance_sq_outside_matches_nearest_edge() {
+        let sq = unit_square();
+        // Point at (0.5, 2.0): nearest edge is lng=1 at lat 0.5, so the
+        // perpendicular distance is 1 degree of lng (in radians, cos_lat=1).
+        let got = polygon_distance_sq(0.5, 2.0, &sq, 1.0);
+        let expect = dist_sq(0.0, 1.0_f64.to_radians(), 1.0);
+        assert!((got - expect).abs() < 1e-12, "got {got} expect {expect}");
+    }
+
+    // -- vertex encoding round-trips -----------------------------------------
+
+    #[test]
+    fn vertex_stride_and_scale_snapshot() {
+        assert_eq!(vertex_stride(0), 4);
+        assert_eq!(vertex_stride(1), 4);
+        assert_eq!(vertex_stride(2), 4);
+        assert_eq!(vertex_stride(3), 8);
+        assert_eq!(vertex_stride(4), 8);
+        // NOTE: unknown encodings fall through to 8.
+        assert_eq!(vertex_stride(99), 8);
+
+        assert_eq!(vertex_scale(0), 1e-5);
+        assert_eq!(vertex_scale(1), 1e-4);
+        assert_eq!(vertex_scale(2), 1e-6);
+        assert_eq!(vertex_scale(3), 1e-7);
+        // F32 (and unknown) report scale 0.0 (unused for the f32 path).
+        assert_eq!(vertex_scale(4), 0.0);
+        assert_eq!(vertex_scale(99), 0.0);
+    }
+
+    // Build a polygon buffer: 10-byte header + packed vertices.
+    fn build_poly_buf(enc: u8, bmin_lat: f32, bmin_lng: f32, verts: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(enc);
+        buf.push(0); // padding
+        buf.extend_from_slice(&bmin_lat.to_le_bytes());
+        buf.extend_from_slice(&bmin_lng.to_le_bytes());
+        buf.extend_from_slice(verts);
+        buf
+    }
+
+    #[test]
+    fn decode_polygon_verts_u16_encodings() {
+        // Encodings 0,1,2 all use u16 deltas (4 bytes/vertex) with differing
+        // scales.  One vertex with dlat=10, dlng=20.
+        let mut vbytes = Vec::new();
+        vbytes.extend_from_slice(&10u16.to_le_bytes());
+        vbytes.extend_from_slice(&20u16.to_le_bytes());
+
+        for enc in [0u8, 1, 2] {
+            let buf = build_poly_buf(enc, 50.0, 5.0, &vbytes);
+            let src = FileBytes::Owned(buf);
+            let got = decode_polygon_verts(&src, 0, 1).expect("decode");
+            assert_eq!(got.len(), 1);
+            let scale = vertex_scale(enc);
+            let expect_lat = (50.0_f64 + 10.0 * scale) as f32;
+            let expect_lng = (5.0_f64 + 20.0 * scale) as f32;
+            assert_eq!(got[0].lat, expect_lat, "enc {enc} lat");
+            assert_eq!(got[0].lng, expect_lng, "enc {enc} lng");
+        }
+    }
+
+    #[test]
+    fn decode_polygon_verts_u32_encoding3() {
+        // Encoding 3: u32 deltas (8 bytes/vertex), scale 1e-7.
+        let mut vbytes = Vec::new();
+        vbytes.extend_from_slice(&1_000_000u32.to_le_bytes()); // dlat
+        vbytes.extend_from_slice(&2_000_000u32.to_le_bytes()); // dlng
+        let buf = build_poly_buf(3, -10.0, 100.0, &vbytes);
+        let src = FileBytes::Owned(buf);
+        let got = decode_polygon_verts(&src, 0, 1).expect("decode");
+        assert_eq!(got.len(), 1);
+        let expect_lat = (-10.0_f64 + 1_000_000.0 * 1e-7) as f32;
+        let expect_lng = (100.0_f64 + 2_000_000.0 * 1e-7) as f32;
+        assert_eq!(got[0].lat, expect_lat);
+        assert_eq!(got[0].lng, expect_lng);
+    }
+
+    // NOTE: encoding 4 (raw F32, zero-copy) is NOT covered here.  Its
+    // decode path does `slice::from_raw_parts(bytes.as_ptr() as *const
+    // NodeCoord, ..)` directly over the borrowed byte slice.  NodeCoord
+    // needs 4-byte alignment, but vertices start at byte offset
+    // POLY_HEADER_BYTES (10) which is only 2-aligned, so any test that
+    // exercises this path aborts under the debug `slice::from_raw_parts`
+    // alignment precondition check (UB in release).  This is a latent
+    // alignment hazard in the production code — flagged, not tested,
+    // since asserting on UB isn't meaningful.  In practice it relies on
+    // the mmap base + offset happening to be 4-aligned.
+
+    #[test]
+    fn decode_polygon_verts_guards() {
+        let buf = build_poly_buf(0, 0.0, 0.0, &[0, 0, 0, 0]);
+        let src = FileBytes::Owned(buf);
+        // vertex_count == 0 -> None.
+        assert!(decode_polygon_verts(&src, 0, 0).is_none());
+        // NO_DATA offset -> None.
+        assert!(decode_polygon_verts(&src, NO_DATA, 1).is_none());
+        // Offset+header past EOF -> None (offset way beyond buffer).
+        assert!(decode_polygon_verts(&src, 1000, 1).is_none());
+        // Declared more vertices than the buffer holds -> None.
+        assert!(decode_polygon_verts(&src, 0, 5).is_none());
+    }
+}
