@@ -3922,9 +3922,7 @@ int main(int argc, char* argv[]) {
                             dst.reserve(src.size());
                             for (auto& ci : src) dst.push_back({ci.cell_id, ci.item_id});
                             src.clear(); src.shrink_to_fit();
-                            std::sort(dst.begin(), dst.end(), [](const CellItemPair& a, const CellItemPair& b) {
-                                return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
-                            });
+                            std::sort(dst.begin(), dst.end(), cell_item_less);
                         });
                     }
                     for (auto& t : sort_threads) t.join();
@@ -3933,9 +3931,7 @@ int main(int argc, char* argv[]) {
                 // Step 2: Concatenate sorted chunks and merge using parallel tree.
                 // Each chunk is already sorted. Record run boundaries, concatenate,
                 // then merge adjacent runs pairwise in parallel at each level.
-                auto cmp = [](const CellItemPair& a, const CellItemPair& b) {
-                    return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
-                };
+                auto cmp = cell_item_less;
 
                 // Record run boundaries before concatenation
                 std::vector<size_t> run_bounds = {0};
@@ -4899,9 +4895,7 @@ int main(int argc, char* argv[]) {
             // Remap IDs through both old→new and dedup
             for (auto& p : data.sorted_addr_cells)
                 p.item_id = dedup_remap[old_to_new[p.item_id]];
-            auto cmp = [](const CellItemPair& a, const CellItemPair& b) {
-                return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
-            };
+            auto cmp = cell_item_less;
             std::sort(data.sorted_addr_cells.begin(), data.sorted_addr_cells.end(), cmp);
             data.cell_to_addrs.clear();
             std::cerr << "  Addr points sorted: " << n << std::endl;
@@ -4994,9 +4988,7 @@ int main(int argc, char* argv[]) {
             data.ways = std::move(new_ways);
             data.street_nodes = std::move(new_nodes);
             for (auto& p : data.sorted_way_cells) p.item_id = old_to_new[p.item_id];
-            auto cmp = [](const CellItemPair& a, const CellItemPair& b) {
-                return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
-            };
+            auto cmp = cell_item_less;
             std::sort(data.sorted_way_cells.begin(), data.sorted_way_cells.end(), cmp);
             data.cell_to_ways.clear();
             // Remap way_parent_ids + way_postcode_ids: reorder + dedup
@@ -5109,9 +5101,7 @@ int main(int argc, char* argv[]) {
             data.interp_ways = std::move(new_interps);
             data.interp_nodes = std::move(new_nodes);
             for (auto& p : data.sorted_interp_cells) p.item_id = old_to_new[p.item_id];
-            auto cmp = [](const CellItemPair& a, const CellItemPair& b) {
-                return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
-            };
+            auto cmp = cell_item_less;
             std::sort(data.sorted_interp_cells.begin(), data.sorted_interp_cells.end(), cmp);
             // Dedup now-identical (cell_id, item_id) pairs: when two duplicate
             // interps in the same cell collapse to one survivor their cell
@@ -5320,9 +5310,7 @@ int main(int argc, char* argv[]) {
                 uint32_t old_id = p.item_id & ID_MASK;
                 p.item_id = dedup_remap[old_to_new[old_id]] | flags;
             }
-            auto cmp = [](const CellItemPair& a, const CellItemPair& b) {
-                return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
-            };
+            auto cmp = cell_item_less;
             std::sort(data.sorted_poi_cells.begin(), data.sorted_poi_cells.end(), cmp);
             data.cell_to_pois.clear();
             std::cerr << "  POI records sorted: " << n << " (" << deduped << " duplicates removed)" << std::endl;
@@ -5420,9 +5408,7 @@ int main(int argc, char* argv[]) {
             }
             data.place_nodes = std::move(sorted);
             for (auto& p : data.sorted_place_cells) p.item_id = old_to_new[p.item_id];
-            auto cmp = [](const CellItemPair& a, const CellItemPair& b) {
-                return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
-            };
+            auto cmp = cell_item_less;
             std::sort(data.sorted_place_cells.begin(), data.sorted_place_cells.end(), cmp);
             std::cerr << "  Place nodes sorted: " << n << std::endl;
         }

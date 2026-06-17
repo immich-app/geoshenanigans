@@ -164,3 +164,14 @@ HTTP server wiring (main.rs) exposing /reverse, /polygons, /test, /admin/configu
 - **MEDIUM** [error-handling] `auth.rs:67-69 Db::save` — save() does `serde_json::to_string_pretty(self).unwrap()` and `fs::write(...).expect(...)` — a serialization or disk error panics the handler thread (and on create_user/create_token paths can take do… → _Return Result from save() and propagate, and use the same tmp-file+rename atomic-write pattern already in downloader.rs:171-177. Behavior-preserving for the success path; no determinism/parity impact._
 
 _Tests:_ downloader::resolve_files (easy); wasm_chunked::JsChunked (read/ensure_page LRU) (moderate); auth::check_rate (moderate); auth::html_escape (easy); auth::get_session_cookie (easy); downloader::DownloadError Display (easy)
+
+## Suspected pre-existing bugs (surfaced while writing the test suite)
+
+These were found while writing regression tests; left UNFIXED because they are behaviour/parity-affecting and need human review. The tests assert current behaviour.
+
+- **HIGH (server/lib.rs `decode_polygon_verts` encoding 4 / F32):** the zero-copy path does `slice::from_raw_parts(bytes.as_ptr().add(POLY_HEADER_BYTES) as *const NodeCoord, …)`. `POLY_HEADER_BYTES` is 10 (2-aligned), but `NodeCoord` needs 4-byte alignment → undefined behaviour; only "works" when the mmap base happens to land it 4-aligned. Worth fixing with an unaligned read / copy.
+- **LOW (server/lib.rs `poi_category_to_osm_class`):** value 74 returns `None` (gap between the `73` and `75` arms).
+- **LOW (server/lib.rs):** `poi_category_to_osm_class(150)` (POWER_PLANT) returns `Some("landuse")` even though the doc comment says it's "Excluded" — the `142..=152` arm catches it. Comment/code mismatch.
+- **LOW (server/lib.rs `postcode_looks_valid`):** the all-same-char placeholder rule rejects a legitimate single-char postcode like `"5"`.
+- **LOW (server/lib.rs `centroid_postcode_ok`):** the "PO Box" filter is a case-sensitive substring check, so `"po 1"` slips through.
+- **NOTE (builder/postcode_validation.h):** US ZIP+4 like `"12345-6789"` is REJECTED — hyphens are stripped (not treated as a separator), yielding 9 digits which fails the exact-5 rule. Same shape for other exact-length numeric countries.

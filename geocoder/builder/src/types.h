@@ -119,6 +119,14 @@ struct CellItemPair {
     uint32_t item_id;
 };
 
+// Canonical ordering for cell→item index tables: by cell_id, then item_id.
+// Hoisted here because the deterministic-ordering passes sorted these tables
+// with an identical inline lambda in 7 places; the exact tiebreak defines
+// on-disk byte layout, so keeping it single-sourced prevents drift.
+inline bool cell_item_less(const CellItemPair& a, const CellItemPair& b) {
+    return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
+}
+
 // --- Constants ---
 
 static const uint32_t INTERIOR_FLAG = 0x80000000u;
