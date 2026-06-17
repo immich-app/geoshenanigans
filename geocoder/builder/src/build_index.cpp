@@ -240,19 +240,26 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
             uint32_t interp_id = static_cast<uint32_t>(data.interp_ways.size());
             data.interp_ways.push_back(iw);
             // Strategy-2: TIGER interpolation has no OSM origin; use a
-            // synthetic content hash (street string + range + first node
+            // synthetic content hash (street string + range + ALL node
             // coords) so the same TIGER record gets the same dense idx
-            // across builds.
+            // across builds. Hashing only the FIRST node collided two
+            // distinct interpolation ways that shared a street/range/start
+            // node but differed downstream — ~97k collisions on the planet,
+            // which the strategy-2 allocator could not disambiguate
+            // (tombstone + non-deterministic reslot, churning interp_ways/
+            // nodes/entries). Mixing every node coordinate makes distinct
+            // geometries get distinct ids; truly identical interps still
+            // collide but are genuine duplicates.
             uint64_t syn_h = 14695981039346656037ULL;
             auto mix = [&](uint64_t v) { syn_h ^= v; syn_h *= 1099511628211ULL; };
             for (char c : street) mix(static_cast<uint8_t>(c));
             mix(0);
             mix(static_cast<uint64_t>(iw.start_number));
             mix(static_cast<uint64_t>(iw.end_number));
-            if (!nodes.empty()) {
+            for (const auto& nd : nodes) {
                 uint32_t lb, gb;
-                std::memcpy(&lb, &nodes[0].lat, 4);
-                std::memcpy(&gb, &nodes[0].lng, 4);
+                std::memcpy(&lb, &nd.lat, 4);
+                std::memcpy(&gb, &nd.lng, 4);
                 mix(static_cast<uint64_t>(lb));
                 mix(static_cast<uint64_t>(gb));
             }
@@ -339,6 +346,20 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
         pn.name_id = data.string_pool.intern(city_name);
         pn.place_type = static_cast<uint8_t>(PlaceType::TOWN); // TIGER cities as towns
         data.place_nodes.push_back(pn);
+        // Strategy-2 stable identity for TIGER place nodes. TIGER cities have
+        // no OSM origin, so synthesize a stable 56-bit id from the (unique per
+        // city_centroids map) city name. Without a place_osm_ids entry PER
+        // TIGER node the array desyncs from place_nodes, which both disables
+        // apply_strategy2_places entirely (it has a size-equality guard) AND
+        // defeats the place_nodes sort's osm_id tiebreak — making
+        // place_nodes.bin non-deterministic on TIGER builds (production planet
+        // loads TIGER). SYNTHETIC type can't collide with the OSM_NODE-typed
+        // ids used for OSM place nodes.
+        uint64_t tiger_place_h = 14695981039346656037ULL;
+        for (char c : city_name) { tiger_place_h ^= static_cast<uint8_t>(c); tiger_place_h *= 1099511628211ULL; }
+        data.place_osm_ids.push_back(
+            pack_osm_id(gc::id_alloc::ObjectType::SYNTHETIC,
+                        static_cast<int64_t>(tiger_place_h & 0x00FFFFFFFFFFFFFFull)));
         tiger_places++;
     }
     std::cerr << "  TIGER: created " << tiger_places << " place nodes from "
@@ -3141,7 +3162,13 @@ int main(int argc, char* argv[]) {
                             const auto& pa = data.admin_polygons[a];
                             const auto& pb = data.admin_polygons[b];
                             if (pa.area != pb.area) return pa.area < pb.area;
-                            return data.admin_osm_ids[a] < data.admin_osm_ids[b];
+                            // osm_id tiebreak (build-invariant total order); guard
+                            // the parallel-array access like every other site and
+                            // fall back to the (still-unique) poly index if the
+                            // sidecar isn't aligned.
+                            if (data.admin_osm_ids.size() == data.admin_polygons.size())
+                                return data.admin_osm_ids[a] < data.admin_osm_ids[b];
+                            return a < b;
                         });
                         // Pick the smallest containing admin polygon at
                         // a rank level matching this place node's type.
@@ -3296,20 +3323,25 @@ int main(int argc, char* argv[]) {
                                 double dlng = (double)pn.lng - clng;
                                 double d2 = dlat * dlat + dlng * dlng;
                                 if (d2 > best_dist_sq) continue;
-                                // Break exact-distance ties by the place node's
-                                // stable osm_id. name_to_places[nb] is iterated
-                                // in a non-deterministic order, so when two
-                                // same-named place nodes are equidistant from
-                                // the boundary centroid the linked place type
-                                // (-> place_type_override) flipped between
-                                // same-PBF builds, perturbing admin_polygons.bin
-                                // and cascading admin_entries churn. osm_id is
-                                // build-invariant and unique.
-                                if (d2 == best_dist_sq && best_idx != NO_DATA &&
-                                    pidx < data.place_osm_ids.size() &&
-                                    best_idx < data.place_osm_ids.size() &&
-                                    data.place_osm_ids[pidx] >= data.place_osm_ids[best_idx])
-                                    continue;
+                                if (d2 == best_dist_sq) {
+                                    // Preserve the original `>=` reject at the
+                                    // distance threshold (no real candidate yet:
+                                    // best_dist_sq is still max_dist_sq), so this
+                                    // only adds a tiebreak, not a behaviour change
+                                    // at the 0.5° boundary.
+                                    if (best_idx == NO_DATA) continue;
+                                    // Break exact-distance ties by the place node's
+                                    // stable osm_id (build-invariant, unique).
+                                    // name_to_places[nb] is iterated in a non-
+                                    // deterministic order, so equidistant same-
+                                    // named place nodes otherwise flipped the
+                                    // linked place type → place_type_override →
+                                    // admin_polygons.bin between same-PBF builds.
+                                    if (pidx >= data.place_osm_ids.size() ||
+                                        best_idx >= data.place_osm_ids.size() ||
+                                        data.place_osm_ids[pidx] >= data.place_osm_ids[best_idx])
+                                        continue;
+                                }
                                 best_dist_sq = d2;
                                 best_idx = pidx;
                             }
@@ -4024,6 +4056,16 @@ int main(int argc, char* argv[]) {
 
                             double best_d2 = 1e18;
                             uint32_t best_name = 0xFFFFFFFFu;
+                            // Stable tie-break for EXACT-distance ties, mirroring
+                            // the addr parent_way_id pick. Candidates are iterated
+                            // in sorted_way_cells item_id order = pre-sort way
+                            // index (non-deterministic, parallel parse). A strict
+                            // `d2 < best` lets build-encounter order decide the
+                            // winner when a POI is exactly equidistant from two
+                            // differently-named streets, so parent_street_id flips
+                            // between same-PBF builds (~7k POIs / poi_records.bin
+                            // churn). Break exact ties by the way's osm_id.
+                            int64_t best_street_osm = INT64_MAX;
                             const double cos_lat = std::cos(
                                 plat * M_PI / 180.0);
                             // cell_to_ways is empty at this point
@@ -4077,9 +4119,13 @@ int main(int argc, char* argv[]) {
                                             double qy = ay + tt * dy;
                                             d2 = qx * qx + qy * qy;
                                         }
-                                        if (d2 < best_d2) {
+                                        int64_t cand_osm = way_id < data.way_osm_ids.size()
+                                            ? data.way_osm_ids[way_id] : INT64_MAX;
+                                        if (d2 < best_d2 ||
+                                            (d2 == best_d2 && cand_osm < best_street_osm)) {
                                             best_d2 = d2;
                                             best_name = w.name_id;
+                                            best_street_osm = cand_osm;
                                         }
                                     }
                                 }
@@ -5006,26 +5052,60 @@ int main(int argc, char* argv[]) {
                     return data.interp_osm_ids[a] < data.interp_osm_ids[b];
                 return false;
             });
+            // Reorder + DEDUP. TIGER frequently emits the exact same
+            // interpolation way twice (identical street/range/type/geometry —
+            // e.g. overlapping county extracts). Those duplicates share a
+            // synthetic osm_id, which the strategy-2 allocator can't
+            // disambiguate: it tombstones + reslots one of each pair non-
+            // deterministically (~97k tombstones on the planet), churning
+            // interp_ways/nodes/entries between same-PBF builds. They are
+            // genuine duplicates (a redundant interpolation segment), so drop
+            // consecutive identical entries — mirroring the street-way dedup —
+            // and map both old indices to the surviving one. (Compared on
+            // street/range/type/node_count + node geometry; node_offset is
+            // position-dependent and excluded.)
             std::vector<uint32_t> old_to_new(n);
-            for (uint32_t i = 0; i < n; i++) old_to_new[order[i]] = i;
-            std::vector<InterpWay> new_interps(n);
+            std::vector<InterpWay> new_interps;
             std::vector<NodeCoord> new_nodes;
+            new_interps.reserve(n);
             new_nodes.reserve(data.interp_nodes.size());
+            const bool have_interp_osm = (data.interp_osm_ids.size() == n);
+            std::vector<uint64_t> new_osm;
+            if (have_interp_osm) new_osm.reserve(n);
             for (uint32_t i = 0; i < n; i++) {
-                auto iw = data.interp_ways[order[i]];
-                uint32_t old_off = iw.node_offset;
-                iw.node_offset = static_cast<uint32_t>(new_nodes.size());
-                for (uint8_t j = 0; j < iw.node_count; j++)
-                    new_nodes.push_back(data.interp_nodes[old_off + j]);
-                new_interps[i] = iw;
+                uint32_t oi = order[i];
+                const InterpWay& cur = data.interp_ways[oi];
+                uint32_t old_off = cur.node_offset;
+                bool is_dup = false;
+                if (!new_interps.empty()) {
+                    const InterpWay& prev = new_interps.back();
+                    if (prev.street_id == cur.street_id &&
+                        prev.start_number == cur.start_number &&
+                        prev.end_number == cur.end_number &&
+                        prev.interpolation == cur.interpolation &&
+                        prev.node_count == cur.node_count) {
+                        is_dup = true;
+                        for (uint8_t j = 0; j < cur.node_count; j++) {
+                            if (memcmp(&new_nodes[prev.node_offset + j],
+                                       &data.interp_nodes[old_off + j],
+                                       sizeof(NodeCoord)) != 0) { is_dup = false; break; }
+                        }
+                    }
+                }
+                if (is_dup) {
+                    old_to_new[oi] = static_cast<uint32_t>(new_interps.size() - 1);
+                } else {
+                    old_to_new[oi] = static_cast<uint32_t>(new_interps.size());
+                    InterpWay iw = cur;
+                    iw.node_offset = static_cast<uint32_t>(new_nodes.size());
+                    for (uint8_t j = 0; j < iw.node_count; j++)
+                        new_nodes.push_back(data.interp_nodes[old_off + j]);
+                    if (have_interp_osm) new_osm.push_back(data.interp_osm_ids[oi]);
+                    new_interps.push_back(iw);
+                }
             }
-            // Reorder interp_osm_ids in lockstep (no dedup here)
-            if (data.interp_osm_ids.size() == n) {
-                std::vector<uint64_t> new_osm(n);
-                for (uint32_t i = 0; i < n; i++)
-                    new_osm[i] = data.interp_osm_ids[order[i]];
-                data.interp_osm_ids = std::move(new_osm);
-            }
+            size_t interp_deduped = n - new_interps.size();
+            if (have_interp_osm) data.interp_osm_ids = std::move(new_osm);
             data.interp_ways = std::move(new_interps);
             data.interp_nodes = std::move(new_nodes);
             for (auto& p : data.sorted_interp_cells) p.item_id = old_to_new[p.item_id];
@@ -5033,8 +5113,19 @@ int main(int argc, char* argv[]) {
                 return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
             };
             std::sort(data.sorted_interp_cells.begin(), data.sorted_interp_cells.end(), cmp);
+            // Dedup now-identical (cell_id, item_id) pairs: when two duplicate
+            // interps in the same cell collapse to one survivor their cell
+            // entries become identical, which would otherwise list the survivor
+            // twice per cell.
+            data.sorted_interp_cells.erase(
+                std::unique(data.sorted_interp_cells.begin(), data.sorted_interp_cells.end(),
+                            [](const CellItemPair& a, const CellItemPair& b) {
+                                return a.cell_id == b.cell_id && a.item_id == b.item_id;
+                            }),
+                data.sorted_interp_cells.end());
             data.cell_to_interps.clear();
-            std::cerr << "  Interps sorted: " << n << std::endl;
+            std::cerr << "  Interps sorted: " << data.interp_ways.size()
+                      << " (" << interp_deduped << " duplicates removed)" << std::endl;
         }
         log_phase("  Sort interps", _st, _sc);
 
