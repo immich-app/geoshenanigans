@@ -2301,6 +2301,38 @@ int main(int argc, char* argv[]) {
         struct stat ost;
         uint64_t old_size = (stat(old_path.c_str(), &ost) == 0) ? (uint64_t)ost.st_size : 0;
 
+        // Unchanged short-circuit: if the old file exists and is
+        // byte-identical to the new one, emit a tiny "copy old" marker
+        // (stride 0xFD, no data) instead of dumping the whole file.
+        // Several raw-emitted files (postcode_centroid_cells/entries,
+        // postal_*) are fully deterministic and identical day-over-day;
+        // full-replacing them wasted ~5.8 MiB/planet. patch-apply
+        // reproduces them by copying the old file. memcmp via mmap is
+        // cheap vs the bytes saved.
+        if (old_size == new_size && new_size > 0) {
+            auto om = mmap_file(old_path);
+            auto nm = mmap_file(new_path);
+            bool same = om.data && nm.data &&
+                        memcmp(om.data, nm.data, (size_t)new_size) == 0;
+            if (om.data) unmap_file(om);
+            if (nm.data) unmap_file(nm);
+            if (same) {
+                uint32_t fid_u = static_cast<uint32_t>(fid);
+                uint32_t stride = 0xFD;  // sentinel: unchanged, copy old
+                uint32_t nfix = 0;
+                uint64_t ds = 0;
+                wval(patch, &fid_u, 4);
+                wval(patch, &stride, 4);
+                wval(patch, &old_size, 8);
+                wval(patch, &new_size, 8);
+                wval(patch, &nfix, 4);
+                wval(patch, &ds, 8);
+                std::cerr << "  " << fname << ": unchanged (copy old, "
+                          << new_size << " bytes saved)" << std::endl;
+                return;
+            }
+        }
+
         uint32_t fid_u = static_cast<uint32_t>(fid);
         uint32_t stride = 0;  // sentinel: full replacement
         uint32_t nfix = 0;
