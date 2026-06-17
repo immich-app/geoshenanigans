@@ -98,3 +98,21 @@ else()
         Threads::Threads
     )
 endif()
+
+# --- Unit tests (geocoder-tests) ---
+#
+# Dependency-free unit tests for the builder's pure logic (no S2 needed — the
+# helpers under test only include standard headers + types.h/parsed_data.h).
+# Every tests/*.cpp is auto-discovered; run with `ctest` or by executing the
+# geocoder-tests binary directly. Not in the default critical build path: build
+# explicitly with `make geocoder-tests`.
+enable_testing()
+file(GLOB GEOCODER_TEST_SRCS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp")
+add_executable(geocoder-tests
+    ${GEOCODER_TEST_SRCS}
+    src/ring_assembly.cpp
+    src/interpolation.cpp
+)
+target_include_directories(geocoder-tests PRIVATE src tools tests)
+target_link_libraries(geocoder-tests PRIVATE Threads::Threads)
+add_test(NAME geocoder-tests COMMAND geocoder-tests)
