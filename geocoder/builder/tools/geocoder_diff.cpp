@@ -242,6 +242,18 @@ static void fixup_way_offsets(char* old_ways, size_t old_ways_size,
                                 const char* new_ways, size_t new_ways_size,
                                 const char* new_nodes, size_t new_nodes_size,
                                 size_t stride) {
+    // If the way records AND node coords are byte-identical between builds,
+    // the fixup is a no-op at best and a corruptor at worst: a way_hash
+    // collision can match an unchanged record to a different same-hash record
+    // and rewrite its node_offset to the wrong value, perturbing OLD so
+    // build_merge_seq classifies unchanged records as DELETE+INSERT and the
+    // derived id_remap goes non-identity — emitting thousands of spurious
+    // entry corrections (street_entries) for data that did not change. Skip.
+    if (old_ways_size == new_ways_size && old_nodes_size == new_nodes_size &&
+        old_ways_size > 0 &&
+        memcmp(old_ways, new_ways, old_ways_size) == 0 &&
+        memcmp(old_nodes, new_nodes, old_nodes_size) == 0)
+        return;
     size_t name_off = (stride == 12) ? 8 : 5;
     size_t old_n = old_ways_size / stride, new_n = new_ways_size / stride;
     size_t old_nc = old_nodes_size / 8, new_nc = new_nodes_size / 8;
@@ -295,6 +307,16 @@ static void fixup_v15_offsets(char* old_polys, size_t old_polys_size,
                               const char* new_verts, size_t new_verts_size,
                               size_t stride, size_t off_field_pos,
                               uint64_t (*key_fn)(const char* rec)) {
+    // Skip when polygon records AND vertex bytes are byte-identical (see
+    // fixup_way_offsets): the content-hash match can otherwise rewrite an
+    // unchanged polygon's vert_offset to a colliding polygon's offset,
+    // perturbing OLD and producing spurious non-identity id_remaps / admin_
+    // and addr_entries corrections on same-build diffs.
+    if (old_polys_size == new_polys_size && old_verts_size == new_verts_size &&
+        old_polys_size > 0 &&
+        memcmp(old_polys, new_polys, old_polys_size) == 0 &&
+        memcmp(old_verts, new_verts, old_verts_size) == 0)
+        return;
     constexpr uint32_t NO_DATA_OFF = 0xFFFFFFFFu;
     size_t old_n = old_polys_size / stride;
     size_t new_n = new_polys_size / stride;
