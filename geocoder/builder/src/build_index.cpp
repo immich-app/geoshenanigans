@@ -3044,6 +3044,29 @@ int main(int argc, char* argv[]) {
             std::cerr << "Sorted admin polygons largest-first (" << n << " polygons)." << std::endl;
         }
 
+        // Deterministic tie-break for the smallest-containing-admin parent
+        // computations below (way_parent / admin_parent / poi parent). Those
+        // pick the min-area containing polygon with a strict `area < best`,
+        // leaving exact-area ties to whichever candidate is iterated first.
+        // AdminPolygon.area is float32, so distinct polygons routinely share
+        // an area value, and cell_to_admin's in-memory order is
+        // non-deterministic (S2 cover drain + Sort #1 remap, never re-sorted),
+        // so the tie winner flipped between same-PBF builds (~33k way parents
+        // + ~33k place parents of churn). Sort each cell's candidate list by
+        // admin osm_id (build-invariant, unique, kept aligned by Sort #1) so
+        // the first-of-equal-area winner is stable. write_cell_index re-sorts
+        // by raw poly_id at write time, so the on-disk layout is unaffected;
+        // this order only governs the parent tie-breaks. (Place-node uses its
+        // own (area, osm_id) candidate sort.)
+        if (data.admin_osm_ids.size() == data.admin_polygons.size()) {
+            for (auto& [cell_id, ids] : data.cell_to_admin) {
+                std::sort(ids.begin(), ids.end(), [&](uint32_t x, uint32_t y) {
+                    return data.admin_osm_ids[x & ID_MASK] <
+                           data.admin_osm_ids[y & ID_MASK];
+                });
+            }
+        }
+
         // --- Place-node addressline containment ---
         //
         // For each place node, find the smallest-area admin polygon that
@@ -3093,11 +3116,20 @@ int main(int argc, char* argv[]) {
                             cand.push_back(id & 0x7FFFFFFFu);
                         }
                         // Sort candidates by ascending area so the first
-                        // PIP hit is the smallest containing polygon.
+                        // PIP hit is the smallest containing polygon. Break
+                        // exact-area ties by admin osm_id: AdminPolygon.area
+                        // is float32, so distinct polygons routinely share an
+                        // area value, and an area-only sort leaves their order
+                        // to the (non-deterministic) cell_to_admin iteration
+                        // order — making parent_poly_id flip between same-PBF
+                        // builds (~33k place nodes / 1.1 MiB churn). osm_id is
+                        // build-invariant and unique, giving a total order.
                         std::sort(cand.begin(), cand.end(),
                                   [&](uint32_t a, uint32_t b) {
-                            return data.admin_polygons[a].area <
-                                   data.admin_polygons[b].area;
+                            const auto& pa = data.admin_polygons[a];
+                            const auto& pb = data.admin_polygons[b];
+                            if (pa.area != pb.area) return pa.area < pb.area;
+                            return data.admin_osm_ids[a] < data.admin_osm_ids[b];
                         });
                         // Pick the smallest containing admin polygon at
                         // a rank level matching this place node's type.
