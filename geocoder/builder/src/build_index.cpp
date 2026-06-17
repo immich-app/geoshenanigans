@@ -3295,7 +3295,21 @@ int main(int argc, char* argv[]) {
                                 double dlat = (double)pn.lat - clat;
                                 double dlng = (double)pn.lng - clng;
                                 double d2 = dlat * dlat + dlng * dlng;
-                                if (d2 >= best_dist_sq) continue;
+                                if (d2 > best_dist_sq) continue;
+                                // Break exact-distance ties by the place node's
+                                // stable osm_id. name_to_places[nb] is iterated
+                                // in a non-deterministic order, so when two
+                                // same-named place nodes are equidistant from
+                                // the boundary centroid the linked place type
+                                // (-> place_type_override) flipped between
+                                // same-PBF builds, perturbing admin_polygons.bin
+                                // and cascading admin_entries churn. osm_id is
+                                // build-invariant and unique.
+                                if (d2 == best_dist_sq && best_idx != NO_DATA &&
+                                    pidx < data.place_osm_ids.size() &&
+                                    best_idx < data.place_osm_ids.size() &&
+                                    data.place_osm_ids[pidx] >= data.place_osm_ids[best_idx])
+                                    continue;
                                 best_dist_sq = d2;
                                 best_idx = pidx;
                             }
