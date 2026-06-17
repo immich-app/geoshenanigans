@@ -615,6 +615,39 @@ struct FileMergeResult {
     std::vector<uint32_t> id_remap; // derived old→new ID remap (with secondary merged in)
 };
 
+// Emit a COPY_OLD_STRIDE section (standard 6-field header, no data) iff the new
+// file at new_path is byte-identical to old_path. Returns true if emitted, so
+// callers do `if (try_emit_copy_old(...)) return;`. Single source of truth for
+// the copy-old wire format shared by emit_raw / emit_sparse_delta /
+// serialize_merge. Never short-circuits a missing or zero-size file (mmap
+// returns null → same=false), so the patcher's copy from cur_dir always has a
+// real source. memcmp via mmap is cheap relative to the bytes saved.
+//
+// Safe even for data files that feed entry corrections: byte-identity of the
+// source forces an identity id_remap (the fixup passes are skipped for identical
+// files), so the patcher reconstructs dependents with the same identity remap.
+static bool try_emit_copy_old(std::vector<char>& patch, uint32_t fid,
+                              const std::string& old_path, const std::string& new_path,
+                              uint64_t old_size, uint64_t new_size, const char* log_name) {
+    if (old_size != new_size || new_size == 0) return false;
+    auto om = mmap_file(old_path);
+    auto nm = mmap_file(new_path);
+    bool same = om.data && nm.data &&
+                memcmp(om.data, nm.data, (size_t)new_size) == 0;
+    if (om.data) unmap_file(om);
+    if (nm.data) unmap_file(nm);
+    if (!same) return false;
+    uint32_t stride = COPY_OLD_STRIDE, nfix = 0;
+    uint64_t ds = 0;
+    auto w = [&](const void* d, size_t s) {
+        patch.insert(patch.end(), (const char*)d, (const char*)d + s);
+    };
+    w(&fid, 4); w(&stride, 4); w(&old_size, 8); w(&new_size, 8); w(&nfix, 4); w(&ds, 8);
+    std::cerr << "  " << log_name << ": unchanged (copy old, "
+              << new_size << " bytes saved)" << std::endl;
+    return true;
+}
+
 // Serialize a pre-computed merge result into the patch buffer
 static void serialize_merge(std::vector<char>& patch, const FileMergeResult& r,
                             const std::string& old_dir = "",
@@ -622,33 +655,20 @@ static void serialize_merge(std::vector<char>& patch, const FileMergeResult& r,
     auto wv = [&](const void* data, size_t size) {
         patch.insert(patch.end(), (const char*)data, (const char*)data + size);
     };
-    // Unchanged short-circuit (mirrors emit_raw / emit_sparse_delta): if the
-    // file is byte-identical to old, emit a copy-old marker (stride 0xFD, no
-    // data) instead of the merge sequence. The merge runs after upstream
-    // fixups (string-pool remap, vertex_offset rewrites) that can perturb the
-    // byte-merge into emitting ops for a file that is in fact identical —
-    // observed on a same-PBF planet diff: addr_vertices / street_nodes were
-    // byte-equal yet still encoded ~0.1 MiB each. geocoder-patch reproduces
-    // the file by copying it verbatim from the old build. Only fires when both
-    // files exist at <dir>/<name> (so the apply's copy from cur_dir succeeds);
-    // fallback-located files (admin_*) simply skip the check.
-    if (!old_dir.empty() && r.new_size > 0 && r.old_size == r.new_size) {
-        auto om = mmap_file(old_dir + "/" + r.name);
-        auto nm = mmap_file(new_dir + "/" + r.name);
-        bool same = om.data && nm.data &&
-                    memcmp(om.data, nm.data, (size_t)r.new_size) == 0;
-        if (om.data) unmap_file(om);
-        if (nm.data) unmap_file(nm);
-        if (same) {
-            uint32_t fid_u = (uint32_t)r.id, stride = 0xFD, nfix = 0;
-            uint64_t ds = 0;
-            wv(&fid_u, 4); wv(&stride, 4); wv(&r.old_size, 8);
-            wv(&r.new_size, 8); wv(&nfix, 4); wv(&ds, 8);
-            std::cerr << "  " << r.name << ": unchanged (copy old, "
-                      << r.new_size << " bytes saved)" << std::endl;
-            return;
-        }
-    }
+    // Unchanged short-circuit: emit a copy-old marker instead of the merge
+    // sequence when the file is byte-identical to old. The merge runs after
+    // upstream fixups (string-pool remap, vertex_offset rewrites) that can
+    // perturb the byte-merge into emitting ops for a file that is in fact
+    // identical (addr_vertices / street_nodes were byte-equal yet encoded
+    // ~0.1 MiB each on a same-PBF planet diff). Skipped automatically when
+    // either file isn't present at <dir>/<name> (mmap returns null); admin_*
+    // live at a fallback path during apply but the diff still finds them under
+    // old_dir/new_dir here, so they DO participate.
+    if (!old_dir.empty() &&
+        try_emit_copy_old(patch, static_cast<uint32_t>(r.id),
+                          old_dir + "/" + r.name, new_dir + "/" + r.name,
+                          r.old_size, r.new_size, r.name.c_str()))
+        return;
     uint32_t fid = static_cast<uint32_t>(r.id);
     uint32_t st = static_cast<uint32_t>(r.stride);
     uint32_t n_fixups = static_cast<uint32_t>(r.fixups.size());
@@ -2352,37 +2372,14 @@ int main(int argc, char* argv[]) {
         struct stat ost;
         uint64_t old_size = (stat(old_path.c_str(), &ost) == 0) ? (uint64_t)ost.st_size : 0;
 
-        // Unchanged short-circuit: if the old file exists and is
-        // byte-identical to the new one, emit a tiny "copy old" marker
-        // (stride 0xFD, no data) instead of dumping the whole file.
-        // Several raw-emitted files (postcode_centroid_cells/entries,
-        // postal_*) are fully deterministic and identical day-over-day;
-        // full-replacing them wasted ~5.8 MiB/planet. patch-apply
-        // reproduces them by copying the old file. memcmp via mmap is
-        // cheap vs the bytes saved.
-        if (old_size == new_size && new_size > 0) {
-            auto om = mmap_file(old_path);
-            auto nm = mmap_file(new_path);
-            bool same = om.data && nm.data &&
-                        memcmp(om.data, nm.data, (size_t)new_size) == 0;
-            if (om.data) unmap_file(om);
-            if (nm.data) unmap_file(nm);
-            if (same) {
-                uint32_t fid_u = static_cast<uint32_t>(fid);
-                uint32_t stride = 0xFD;  // sentinel: unchanged, copy old
-                uint32_t nfix = 0;
-                uint64_t ds = 0;
-                wval(patch, &fid_u, 4);
-                wval(patch, &stride, 4);
-                wval(patch, &old_size, 8);
-                wval(patch, &new_size, 8);
-                wval(patch, &nfix, 4);
-                wval(patch, &ds, 8);
-                std::cerr << "  " << fname << ": unchanged (copy old, "
-                          << new_size << " bytes saved)" << std::endl;
-                return;
-            }
-        }
+        // Unchanged short-circuit: emit a copy-old marker instead of dumping
+        // the whole file when it's byte-identical to old. Several raw-emitted
+        // files (postcode_centroid_cells/entries, postal_*) are fully
+        // deterministic and identical day-over-day; full-replacing them wasted
+        // ~5.8 MiB/planet.
+        if (try_emit_copy_old(patch, static_cast<uint32_t>(fid), old_path, new_path,
+                              old_size, new_size, fname.c_str()))
+            return;
 
         uint32_t fid_u = static_cast<uint32_t>(fid);
         uint32_t stride = 0;  // sentinel: full replacement
@@ -2431,33 +2428,15 @@ int main(int argc, char* argv[]) {
         uint64_t new_size = (uint64_t)nst.st_size;
         struct stat ost;
         uint64_t old_size = (stat(old_path.c_str(), &ost) == 0) ? (uint64_t)ost.st_size : 0;
-        // Unchanged short-circuit (mirrors emit_raw): if the old file is
-        // byte-identical to the new one, emit a copy-old marker (stride
-        // 0xFD, no data). The sparse delta remaps OLD values via an
-        // id_remap before comparing, so when an upstream array is
-        // non-deterministic (e.g. admin_polygons place_type_override) the
-        // remap can be spuriously non-identity and emit thousands of changes
-        // for a file that is in fact byte-identical (observed: 30k
-        // way_parents entries on a same-PBF planet diff). geocoder-patch
-        // reproduces the file by copying it verbatim from the old build.
-        if (old_size == new_size && new_size > 0) {
-            auto om = mmap_file(old_path);
-            auto nm = mmap_file(new_path);
-            bool same = om.data && nm.data &&
-                        memcmp(om.data, nm.data, (size_t)new_size) == 0;
-            if (om.data) unmap_file(om);
-            if (nm.data) unmap_file(nm);
-            if (same) {
-                uint32_t fid_u = (uint32_t)fid, stride = 0xFD, nfix = 0;
-                uint64_t ds = 0;
-                wval(patch, &fid_u, 4); wval(patch, &stride, 4);
-                wval(patch, &old_size, 8); wval(patch, &new_size, 8);
-                wval(patch, &nfix, 4); wval(patch, &ds, 8);
-                std::cerr << "  " << fname << ": unchanged (copy old, "
-                          << new_size << " bytes saved)" << std::endl;
-                return;
-            }
-        }
+        // Unchanged short-circuit: emit a copy-old marker when byte-identical.
+        // The sparse delta remaps OLD values via an id_remap before comparing,
+        // so when an upstream array is non-deterministic the remap can be
+        // spuriously non-identity and emit thousands of changes for a file that
+        // is in fact byte-identical (observed: 30k way_parents entries on a
+        // same-PBF planet diff).
+        if (try_emit_copy_old(patch, static_cast<uint32_t>(fid), old_path, new_path,
+                              old_size, new_size, fname))
+            return;
         if (new_size > 0 && new_size % value_stride != 0) {
             // Stride mismatch — fall back to full_replace to avoid corruption.
             std::cerr << "  " << fname << ": stride mismatch (size " << new_size

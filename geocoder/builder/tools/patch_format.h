@@ -430,6 +430,20 @@ static constexpr uint32_t SECONDARY_REMAP_MARKER = 0xFFFFFFF6;
 // postcode_id(4) cc(2) pad(2). Only the postcode_id field uses str_remap.
 constexpr uint32_t SPARSE_DELTA_STRIDE = 0xFC;
 
+// Stride sentinel: the new file is byte-identical to the old build. The section
+// carries the standard 6-field header (fid, stride, old_size, new_size, nfix=0,
+// ds=0) with NO data; the patcher reproduces the file by copying it verbatim
+// from cur_dir. Emitted by emit_raw / emit_sparse_delta / serialize_merge (via
+// try_emit_copy_old) when memcmp(old,new)==0. Safe for data files that feed
+// entry corrections because byte-identity implies an identity id_remap (the
+// fixup passes are skipped for identical files), so the patcher's identity
+// reconstruction matches.
+constexpr uint32_t COPY_OLD_STRIDE = 0xFD;
+
+// Legacy/reserved stride sentinel: skip the section (read header + data, write
+// nothing). Consumed by geocoder-patch; not emitted by the current diff.
+constexpr uint32_t LEGACY_SKIP_STRIDE = 0xFE;
+
 // POI parent-id remap marker: 0xFFFFFFF3
 // Carries the full primary+secondary admin-polygon, street-way, and
 // postcode-centroid old→new ID remap that the diff side applied to old

@@ -466,26 +466,35 @@ int main(int argc, char* argv[]) {
             std::cerr << "  " << fname << ": full replace " << ds << " bytes" << std::endl;
             continue;
         }
-        if (stride == 0xFD) {
+        if (stride == COPY_OLD_STRIDE) {
             // Unchanged file: the diff verified old==new and emitted no
             // data. Reproduce by copying the old (current) file verbatim.
             uint32_t nf = ru32(); (void)nf; uint64_t ds = ru64(); pos += ds; // ds == 0
             std::string src = cur_dir + "/" + fname;
             FILE* in = fopen(src.c_str(), "rb");
             FILE* out = fopen((out_dir + "/" + fname).c_str(), "wb");
-            if (in && out) {
-                std::vector<char> cbuf(1 << 20);
-                size_t r;
-                while ((r = fread(cbuf.data(), 1, cbuf.size(), in)) > 0)
-                    fwrite(cbuf.data(), 1, r, out);
+            if (!in || !out) {
+                // The diff only emits COPY_OLD for a file that existed (and was
+                // byte-identical) at diff time, so a missing source here is a
+                // real error — surface it loudly instead of silently writing a
+                // truncated/empty file and logging a false success.
+                std::cerr << "  ERROR: " << fname << ": copy-old failed (src "
+                          << (in ? "ok" : "MISSING") << ", dst "
+                          << (out ? "ok" : "FAILED") << ")" << std::endl;
+                if (in) fclose(in);
+                if (out) fclose(out);
+                return 1;
             }
-            if (in) fclose(in);
-            if (out) fclose(out);
-            std::cerr << "  " << fname << ": unchanged (copied " << new_size
+            std::vector<char> cbuf(1 << 20);
+            size_t r, written = 0;
+            while ((r = fread(cbuf.data(), 1, cbuf.size(), in)) > 0)
+                written += fwrite(cbuf.data(), 1, r, out);
+            fclose(in); fclose(out);
+            std::cerr << "  " << fname << ": unchanged (copied " << written
                       << " bytes from old)" << std::endl;
             continue;
         }
-        if (stride == 0xFE) { uint32_t nf = ru32(); (void)nf; uint64_t ds = ru64(); pos += ds; continue; }
+        if (stride == LEGACY_SKIP_STRIDE) { uint32_t nf = ru32(); (void)nf; uint64_t ds = ru64(); pos += ds; continue; }
         if (stride == SPARSE_DELTA_STRIDE) {
             // SPARSE_DELTA: position-keyed delta. Format already decoded
             // old_size + new_size above; next fields are value_stride,
