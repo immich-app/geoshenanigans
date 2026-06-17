@@ -2842,32 +2842,28 @@ int main(int argc, char* argv[]) {
                                     for (const auto& [vlat, vlng] : pr.vertices) {
                                         poly_verts.push_back({static_cast<float>(vlat), static_cast<float>(vlng)});
                                     }
-                                    // TIGER addrs have no OSM origin. Use a synthetic
-                                    // 56-bit hash of (lat_bits, lng_bits, housenumber,
-                                    // street) so the same TIGER record gets the same
-                                    // dense idx across builds (TIGER snapshots are
-                                    // re-imported daily but mostly unchanged).
-                                    uint64_t synthetic_h = 14695981039346656037ULL;
-                                    auto mix64 = [&](uint64_t v) {
-                                        synthetic_h ^= v;
-                                        synthetic_h *= 1099511628211ULL;
-                                    };
-                                    uint32_t lat_bits, lng_bits;
-                                    float clat_f = static_cast<float>(clat);
-                                    float clng_f = static_cast<float>(clng);
-                                    std::memcpy(&lat_bits, &clat_f, 4);
-                                    std::memcpy(&lng_bits, &clng_f, 4);
-                                    mix64(static_cast<uint64_t>(lat_bits));
-                                    mix64(static_cast<uint64_t>(lng_bits));
-                                    for (char c : pr.addr_housenumber) mix64(static_cast<uint8_t>(c));
-                                    mix64(0); // separator
-                                    for (char c : pr.addr_street) mix64(static_cast<uint8_t>(c));
+                                    // Stable identity: this addr point is emitted by
+                                    // a POI RELATION, so reuse the relation's
+                                    // (relation_id<<16 | ring_index) key with type
+                                    // OSM_RELATION — the SAME scheme the POI record
+                                    // above uses. The previous synthetic 56-bit hash of
+                                    // (lat,lng,housenumber,street) COLLIDED for two
+                                    // relations sharing those fields but with different
+                                    // geometry; strategy-2 (which matches addr points by
+                                    // osm_id) then slotted the colliding pair non-
+                                    // deterministically — moving one record to the end
+                                    // and leaving a tombstone — which shifted
+                                    // addr_vertices packing and cascaded ~52M
+                                    // vertex_offset fixups (98.9 MiB) into the planet
+                                    // same-PBF patch. rel_payload is unique per
+                                    // (relation, ring), and addr_osm_ids is a separate
+                                    // sidecar from poi_osm_ids so sharing the key is safe.
                                     add_addr_point(data, clat, clng,
                                                    pr.addr_housenumber.c_str(),
                                                    pr.addr_street.c_str(),
                                                    bpc_ptr, dummy,
-                                                   pack_osm_id(gc::id_alloc::ObjectType::SYNTHETIC,
-                                                               static_cast<int64_t>(synthetic_h & 0x00FFFFFFFFFFFFFFull)),
+                                                   pack_osm_id(gc::id_alloc::ObjectType::OSM_RELATION,
+                                                               static_cast<int64_t>(rel_payload)),
                                                    poly_verts.data(),
                                                    static_cast<uint32_t>(poly_verts.size()));
                                     if (!pr.addr_postcode.empty() && is_valid_postcode(pr.addr_postcode.c_str())) {
@@ -4687,8 +4683,33 @@ int main(int argc, char* argv[]) {
                 // PBF parsing. osm_id is invariant per record and gives a
                 // truly canonical order, so dedup picks the same record
                 // every run.
-                if (data.addr_osm_ids.size() == data.addr_points.size())
+                if (data.addr_osm_ids.size() == data.addr_points.size()
+                    && data.addr_osm_ids[a] != data.addr_osm_ids[b])
                     return data.addr_osm_ids[a] < data.addr_osm_ids[b];
+                // osm_id can still COLLIDE: synthetic TIGER ids are a 56-bit
+                // FNV hash of (lat,lng,housenumber,street), so two distinct
+                // records with the same addressing keys share an id. Without a
+                // further tiebreak std::sort leaves their relative order to
+                // build-encounter order (non-deterministic); when a polygon/node
+                // pair swaps, the vertex_count sequence shifts addr_vertices
+                // packing and cascades vertex_offset for every later record
+                // (~98.9 MiB planet churn) plus a strategy-2 tombstone. Extend
+                // to a total order: vertex_count, parent_way_id, then the
+                // polygon vertex bytes (pre-sort offsets are still valid here —
+                // addr_vertices is repacked only after this sort).
+                if (pa.vertex_count != pb.vertex_count)
+                    return pa.vertex_count < pb.vertex_count;
+                if (pa.parent_way_id != pb.parent_way_id)
+                    return pa.parent_way_id < pb.parent_way_id;
+                if (pa.vertex_count > 0 &&
+                    pa.vertex_offset != NO_DATA && pb.vertex_offset != NO_DATA &&
+                    (size_t)pa.vertex_offset + pa.vertex_count <= data.addr_vertices.size() &&
+                    (size_t)pb.vertex_offset + pb.vertex_count <= data.addr_vertices.size()) {
+                    int c = std::memcmp(&data.addr_vertices[pa.vertex_offset],
+                                        &data.addr_vertices[pb.vertex_offset],
+                                        (size_t)pa.vertex_count * sizeof(NodeCoord));
+                    if (c != 0) return c < 0;
+                }
                 return a < b;
             });
             std::vector<uint32_t> old_to_new(n);
