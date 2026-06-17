@@ -167,9 +167,9 @@ _Tests:_ downloader::resolve_files (easy); wasm_chunked::JsChunked (read/ensure_
 
 ## Suspected pre-existing bugs (surfaced while writing the test suite)
 
-These were found while writing regression tests; left UNFIXED because they are behaviour/parity-affecting and need human review. The tests assert current behaviour.
+All but the first were left UNFIXED because they are behaviour/parity-affecting: changing them alters which postcodes/categories the query path accepts, which must be confirmed against Nominatim's source and re-validated with the 500-city parity test before it can land. The tests assert current behaviour. The first (an alignment UB on a dead code path) was safe to fix and has been.
 
-- **HIGH (server/lib.rs `decode_polygon_verts` encoding 4 / F32):** the zero-copy path does `slice::from_raw_parts(bytes.as_ptr().add(POLY_HEADER_BYTES) as *const NodeCoord, …)`. `POLY_HEADER_BYTES` is 10 (2-aligned), but `NodeCoord` needs 4-byte alignment → undefined behaviour; only "works" when the mmap base happens to land it 4-aligned. Worth fixing with an unaligned read / copy.
+- **HIGH (server/lib.rs `decode_polygon_verts` encoding 4 / F32) — FIXED:** the zero-copy path did `slice::from_raw_parts(bytes.as_ptr().add(POLY_HEADER_BYTES) as *const NodeCoord, …)`. `POLY_HEADER_BYTES` is 10 (2-aligned), but `NodeCoord` needs 4-byte alignment → undefined behaviour; only "worked" when the mmap base happened to land it 4-aligned. Fixed by decoding each vertex with per-field unaligned `f32::from_le_bytes` reads (bit-identical f32 values on little-endian, no alignment hazard) and added test `decode_polygon_verts_f32_encoding4`. Risk-free: the builder only ever emits encodings 0/1/2/3 (`build_index.cpp:5683-5691`), so encoding 4 is a legacy/compat reader branch that never appears in any index the current pipeline produces — the change cannot alter any current query result.
 - **LOW (server/lib.rs `poi_category_to_osm_class`):** value 74 returns `None` (gap between the `73` and `75` arms).
 - **LOW (server/lib.rs):** `poi_category_to_osm_class(150)` (POWER_PLANT) returns `Some("landuse")` even though the doc comment says it's "Excluded" — the `142..=152` arm catches it. Comment/code mismatch.
 - **LOW (server/lib.rs `postcode_looks_valid`):** the all-same-char placeholder rule rejects a legitimate single-char postcode like `"5"`.

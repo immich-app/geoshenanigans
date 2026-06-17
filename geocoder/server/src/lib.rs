@@ -197,30 +197,21 @@ pub fn decode_polygon_verts<'a>(
     let bytes = src.read_chunk(verts_off, total_bytes as usize);
 
     if encoding == 4 {
-        // Legacy F32 — direct cast, zero-copy when borrowed.
-        match bytes {
-            std::borrow::Cow::Borrowed(b) => {
-                let verts: &[NodeCoord] = unsafe {
-                    std::slice::from_raw_parts(
-                        b.as_ptr() as *const NodeCoord,
-                        vertex_count as usize,
-                    )
-                };
-                Some(std::borrow::Cow::Borrowed(verts))
-            }
-            std::borrow::Cow::Owned(v) => {
-                let mut out = Vec::<NodeCoord>::with_capacity(vertex_count as usize);
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        v.as_ptr() as *const NodeCoord,
-                        out.as_mut_ptr(),
-                        vertex_count as usize,
-                    );
-                    out.set_len(vertex_count as usize);
-                }
-                Some(std::borrow::Cow::Owned(out))
-            }
+        // Legacy raw F32 lat/lng (8 bytes/vertex). Vertices start at
+        // POLY_HEADER_BYTES (byte 10), which is only 2-aligned, so a direct
+        // `bytes.as_ptr() as *const NodeCoord` cast is undefined behaviour
+        // (NodeCoord needs 4-byte alignment). Decode each field with an
+        // unaligned little-endian read instead: this yields bit-identical
+        // f32 values to the cast on little-endian targets without the
+        // alignment hazard.
+        let count = vertex_count as usize;
+        let mut out = Vec::<NodeCoord>::with_capacity(count);
+        for i in 0..count {
+            let lat = f32::from_le_bytes(bytes[i*8..i*8+4].try_into().unwrap());
+            let lng = f32::from_le_bytes(bytes[i*8+4..i*8+8].try_into().unwrap());
+            out.push(NodeCoord { lat, lng });
         }
+        Some(std::borrow::Cow::Owned(out))
     } else {
         // Delta-encoded.  Decode each vertex into a fresh NodeCoord.
         let scale = vertex_scale(encoding);
@@ -4760,16 +4751,26 @@ mod pure_helper_tests {
         assert_eq!(got[0].lng, expect_lng);
     }
 
-    // NOTE: encoding 4 (raw F32, zero-copy) is NOT covered here.  Its
-    // decode path does `slice::from_raw_parts(bytes.as_ptr() as *const
-    // NodeCoord, ..)` directly over the borrowed byte slice.  NodeCoord
-    // needs 4-byte alignment, but vertices start at byte offset
-    // POLY_HEADER_BYTES (10) which is only 2-aligned, so any test that
-    // exercises this path aborts under the debug `slice::from_raw_parts`
-    // alignment precondition check (UB in release).  This is a latent
-    // alignment hazard in the production code — flagged, not tested,
-    // since asserting on UB isn't meaningful.  In practice it relies on
-    // the mmap base + offset happening to be 4-aligned.
+    #[test]
+    fn decode_polygon_verts_f32_encoding4() {
+        // Encoding 4: raw f32 lat/lng (8 bytes/vertex), no scale/bbox.
+        // Vertices begin at POLY_HEADER_BYTES (byte 10), which is only
+        // 2-aligned, so this exercises the unaligned-read decode path
+        // (a `*const NodeCoord` cast here would be UB). Two vertices.
+        let mut vbytes = Vec::new();
+        vbytes.extend_from_slice(&51.5074_f32.to_le_bytes());
+        vbytes.extend_from_slice(&(-0.1278_f32).to_le_bytes());
+        vbytes.extend_from_slice(&48.8566_f32.to_le_bytes());
+        vbytes.extend_from_slice(&2.3522_f32.to_le_bytes());
+        let buf = build_poly_buf(4, 0.0, 0.0, &vbytes);
+        let src = FileBytes::Owned(buf);
+        let got = decode_polygon_verts(&src, 0, 2).expect("decode");
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].lat, 51.5074_f32);
+        assert_eq!(got[0].lng, -0.1278_f32);
+        assert_eq!(got[1].lat, 48.8566_f32);
+        assert_eq!(got[1].lng, 2.3522_f32);
+    }
 
     #[test]
     fn decode_polygon_verts_guards() {
