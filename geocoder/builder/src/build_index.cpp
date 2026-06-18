@@ -124,7 +124,10 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
         // Extract tar.gz to a temp directory
         std::string tmpdir = "/tmp/tiger-extract-" + std::to_string(getpid());
         std::string cmd = "mkdir -p " + tmpdir + " && tar xzf " + path + " -C " + tmpdir;
-        system(cmd.c_str());
+        if (system(cmd.c_str()) != 0) {
+            std::cerr << "  TIGER extraction failed (tar xzf " << path << ")" << std::endl;
+            return;
+        }
         DIR* dir = opendir(tmpdir.c_str());
         if (dir) {
             struct dirent* ent;
@@ -250,8 +253,8 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
             // nodes/entries). Mixing every node coordinate makes distinct
             // geometries get distinct ids; truly identical interps still
             // collide but are genuine duplicates.
-            uint64_t syn_h = 14695981039346656037ULL;
-            auto mix = [&](uint64_t v) { syn_h ^= v; syn_h *= 1099511628211ULL; };
+            uint64_t syn_h = FNV1A_OFFSET_BASIS;
+            auto mix = [&](uint64_t v) { syn_h ^= v; syn_h *= FNV1A_PRIME; };
             for (char c : street) mix(static_cast<uint8_t>(c));
             mix(0);
             mix(static_cast<uint64_t>(iw.start_number));
@@ -355,8 +358,8 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
         // place_nodes.bin non-deterministic on TIGER builds (production planet
         // loads TIGER). SYNTHETIC type can't collide with the OSM_NODE-typed
         // ids used for OSM place nodes.
-        uint64_t tiger_place_h = 14695981039346656037ULL;
-        for (char c : city_name) { tiger_place_h ^= static_cast<uint8_t>(c); tiger_place_h *= 1099511628211ULL; }
+        uint64_t tiger_place_h = FNV1A_OFFSET_BASIS;
+        for (char c : city_name) { tiger_place_h ^= static_cast<uint8_t>(c); tiger_place_h *= FNV1A_PRIME; }
         data.place_osm_ids.push_back(
             pack_osm_id(gc::id_alloc::ObjectType::SYNTHETIC,
                         static_cast<int64_t>(tiger_place_h & 0x00FFFFFFFFFFFFFFull)));
@@ -378,7 +381,10 @@ static void load_external_postcodes(ParsedData& data, const std::string& path) {
     if (path.find(".gz") != std::string::npos) {
         tmp_csv = "/tmp/external_postcodes_" + std::to_string(getpid()) + ".csv";
         cmd = "gunzip -c " + path + " > " + tmp_csv;
-        system(cmd.c_str());
+        if (system(cmd.c_str()) != 0) {
+            std::cerr << "  Failed to gunzip " << path << std::endl;
+            return;
+        }
     } else {
         tmp_csv = path;
     }
@@ -3144,7 +3150,7 @@ int main(int argc, char* argv[]) {
                         cand.clear();
                         cand.reserve(it->second.size());
                         for (uint32_t id : it->second) {
-                            cand.push_back(id & 0x7FFFFFFFu);
+                            cand.push_back(id & ID_MASK);
                         }
                         // Sort candidates by ascending area so the first
                         // PIP hit is the smallest containing polygon. Break
@@ -3406,7 +3412,7 @@ int main(int argc, char* argv[]) {
                             auto it = data.cell_to_admin.find(cid);
                             if (it == data.cell_to_admin.end()) return;
                             for (uint32_t raw_id : it->second) {
-                                uint32_t pid = raw_id & 0x7FFFFFFF;
+                                uint32_t pid = raw_id & ID_MASK;
                                 if (pid == i || pid >= data.admin_polygons.size()) continue;
                                 const auto& cand = data.admin_polygons[pid];
                                 if (cand.admin_level >= self.admin_level) continue;
@@ -3541,7 +3547,7 @@ int main(int argc, char* argv[]) {
                             auto it = data.cell_to_admin.find(cid);
                             if (it == data.cell_to_admin.end()) return;
                             for (uint32_t raw_id : it->second) {
-                                uint32_t pid = raw_id & 0x7FFFFFFF;
+                                uint32_t pid = raw_id & ID_MASK;
                                 if (pid >= data.admin_polygons.size()) continue;
                                 const auto& cand = data.admin_polygons[pid];
                                 if (cand.admin_level > 11) continue;
@@ -4190,7 +4196,7 @@ int main(int argc, char* argv[]) {
                                 auto it = data.cell_to_admin.find(cid);
                                 if (it == data.cell_to_admin.end()) return;
                                 for (uint32_t raw_id : it->second) {
-                                    uint32_t pid = raw_id & 0x7FFFFFFF;
+                                    uint32_t pid = raw_id & ID_MASK;
                                     if (pid >= data.admin_polygons.size()) continue;
                                     const auto& cand = data.admin_polygons[pid];
                                     if (cand.admin_level != 11) continue;
@@ -4278,7 +4284,7 @@ int main(int argc, char* argv[]) {
                                 auto it = data.cell_to_admin.find(cid);
                                 if (it == data.cell_to_admin.end()) return;
                                 for (uint32_t raw_id : it->second) {
-                                    uint32_t pid = raw_id & 0x7FFFFFFF;
+                                    uint32_t pid = raw_id & ID_MASK;
                                     if (pid >= data.admin_polygons.size()) continue;
                                     const auto& cand = data.admin_polygons[pid];
                                     if (cand.admin_level < 2 || cand.admin_level > 10) continue;
@@ -5200,8 +5206,8 @@ int main(int argc, char* argv[]) {
             // Remap admin cell entries
             for (auto& [cell_id, ids] : data.cell_to_admin) {
                 for (auto& id : ids) {
-                    uint32_t flags = id & 0x80000000u;
-                    uint32_t masked = id & 0x7FFFFFFFu;
+                    uint32_t flags = id & INTERIOR_FLAG;
+                    uint32_t masked = id & ID_MASK;
                     if (masked < old_to_new.size())
                         id = old_to_new[masked] | flags;
                 }
@@ -5583,15 +5589,13 @@ int main(int argc, char* argv[]) {
             //    Preserves the high-bit INTERIOR_FLAG used by the cell
             //    index format (polys that fully contain a cell vs. just
             //    intersect it).
-            constexpr uint32_t ADMIN_ID_MASK = 0x7FFFFFFFu;
-            constexpr uint32_t ADMIN_INTERIOR_FLAG = 0x80000000u;
             std::unordered_map<uint64_t, std::vector<uint32_t>> filtered_admin_cells;
             for (const auto& [cell_id, ids] : d.cell_to_admin) {
                 std::vector<uint32_t> kept;
                 kept.reserve(ids.size());
                 for (uint32_t flagged : ids) {
-                    uint32_t poly_id = flagged & ADMIN_ID_MASK;
-                    uint32_t flags   = flagged & ADMIN_INTERIOR_FLAG;
+                    uint32_t poly_id = flagged & ID_MASK;
+                    uint32_t flags   = flagged & INTERIOR_FLAG;
                     if (poly_id >= poly_remap.size()) continue;
                     uint32_t new_id = poly_remap[poly_id];
                     if (new_id == NO_DATA) continue;

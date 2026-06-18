@@ -133,6 +133,11 @@ static const uint32_t INTERIOR_FLAG = 0x80000000u;
 static const uint32_t ID_MASK       = 0x7FFFFFFFu;
 static const uint32_t NO_DATA       = 0xFFFFFFFFu;
 
+// FNV-1a 64-bit hash parameters, used to derive deterministic SYNTHETIC
+// stable ids for TIGER interpolation ways and place nodes (build_index.cpp).
+static const uint64_t FNV1A_OFFSET_BASIS = 14695981039346656037ULL;
+static const uint64_t FNV1A_PRIME        = 1099511628211ULL;
+
 // Simplification mode
 enum class SimplifyMode { MaxVertices, ErrorBounded };
 
