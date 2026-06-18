@@ -798,6 +798,16 @@ static std::optional<PoiClassification> classify_poi(
     return PoiClassification{cat, tier, flags};
 }
 
+// Reinterpret a float as a uint32 that sorts in the same order as the float
+// (IEEE-754 total ordering): flip all bits for negatives, flip just the sign
+// bit for non-negatives. Used as the byte-layout-defining lat/lng tiebreak in
+// the deterministic-ordering pass.
+static inline uint32_t float_bits(float v) {
+    uint32_t bits;
+    memcpy(&bits, &v, 4);
+    return (bits & 0x80000000) ? ~bits : (bits ^ 0x80000000);
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [options]" << std::endl;
@@ -4078,10 +4088,7 @@ int main(int argc, char* argv[]) {
                                 auto lo = std::lower_bound(
                                     data.sorted_way_cells.begin(),
                                     data.sorted_way_cells.end(), probe,
-                                    [](const CellItemPair& a, const CellItemPair& b) {
-                                        return a.cell_id < b.cell_id ||
-                                               (a.cell_id == b.cell_id && a.item_id < b.item_id);
-                                    });
+                                    cell_item_less);
                                 for (auto p = lo;
                                      p != data.sorted_way_cells.end() && p->cell_id == cid;
                                      ++p) {
@@ -4420,10 +4427,7 @@ int main(int argc, char* argv[]) {
                                 auto lo = std::lower_bound(
                                     data.sorted_way_cells.begin(),
                                     data.sorted_way_cells.end(), probe,
-                                    [](const CellItemPair& a, const CellItemPair& b) {
-                                        return a.cell_id < b.cell_id ||
-                                               (a.cell_id == b.cell_id && a.item_id < b.item_id);
-                                    });
+                                    cell_item_less);
                                 for (auto p = lo;
                                      p != data.sorted_way_cells.end() && p->cell_id == cid;
                                      ++p) {
@@ -4757,14 +4761,8 @@ int main(int argc, char* argv[]) {
         }
         log_phase("  Sort strings", _st, _sc);
 
-        // Helper: reinterpret float as uint32 for total ordering (works for IEEE 754)
-        auto float_bits = [](float v) -> uint32_t {
-            uint32_t bits;
-            memcpy(&bits, &v, 4);
-            // Handle negative floats: flip all bits if sign bit set, else flip sign bit
-            return (bits & 0x80000000) ? ~bits : (bits ^ 0x80000000);
-        };
-
+        // float_bits() (file-scope helper above main) reinterprets a float as a
+        // uint32 for total ordering — used as the lat/lng tiebreak below.
         // 2. Sort addr_points by (street_id, housenumber_id, lat_bits, lng_bits)
         //    Using string offsets directly (already remapped to sorted pool) gives
         //    deterministic order. Raw float bits as final tiebreaker for total order.
