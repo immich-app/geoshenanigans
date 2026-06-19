@@ -37,7 +37,7 @@ static double now_ms() {
 static size_t get_rss_mb() {
     FILE* f = fopen("/proc/self/statm", "r");
     if (!f) return 0;
-    size_t dummy, rss; fscanf(f, "%zu %zu", &dummy, &rss); fclose(f);
+    size_t dummy, rss; if (fscanf(f, "%zu %zu", &dummy, &rss) != 2) rss = 0; fclose(f);
     return rss * 4096 / (1024*1024);
 }
 static void log_phase(const char* label, double start) {
@@ -103,13 +103,24 @@ int main(int argc, char* argv[]) {
     log_phase("Decompress", t_start);
 
     size_t pos = 0;
-    auto ru32 = [&]() -> uint32_t { uint32_t v; memcpy(&v, P+pos, 4); pos += 4; return v; };
-    auto ru64 = [&]() -> uint64_t { uint64_t v; memcpy(&v, P+pos, 8); pos += 8; return v; };
+    // Bounds-checked read of n bytes at the current position. Fails loudly
+    // (rather than reading past the mmap) if a malformed/truncated patch would
+    // run the cursor off the end. On the success path pos+n <= patch_size
+    // always holds, so this never fires and the read bytes are unchanged.
+    auto require_bytes = [&](size_t n, const char* what) {
+        if (pos + n > patch_size) {
+            std::cerr << "Truncated patch: need " << n << " bytes for " << what
+                      << " at offset " << pos << " (size " << patch_size << ")" << std::endl;
+            std::exit(1);
+        }
+    };
+    auto ru32 = [&]() -> uint32_t { require_bytes(4, "u32"); uint32_t v; memcpy(&v, P+pos, 4); pos += 4; return v; };
+    auto ru64 = [&]() -> uint64_t { require_bytes(8, "u64"); uint64_t v; memcpy(&v, P+pos, 8); pos += 8; return v; };
 
     // Header
     if (memcmp(P, GCPATCH_MAGIC, 8) != 0) { std::cerr << "Bad magic" << std::endl; return 1; }
     pos = 8;
-    uint32_t ver = ru32(); if (ver != 2) { std::cerr << "Bad version" << std::endl; return 1; }
+    uint32_t ver = ru32(); if (ver != GCPATCH_VERSION) { std::cerr << "Bad version" << std::endl; return 1; }
     ru32(); // flags
 
     // --- Phase 2: String rebuild ---
@@ -125,7 +136,7 @@ int main(int argc, char* argv[]) {
     std::array<uint32_t, 6> new_tier_bases{};
     {
         uint32_t marker = ru32();
-        if (marker == 0xFFFFFFF6) {
+        if (marker == STRINGS_TIERED_MARKER) {
             // Tiered format — 5 independent per-tier diffs.  For each tier:
             //   1. Read its n_added/n_deleted block from the patch.
             //   2. Merge-write the old tier file + added (minus deleted)
@@ -244,7 +255,7 @@ int main(int argc, char* argv[]) {
 
             marker = ru32();
         }
-        if (marker == 0xFFFFFFFE) {
+        if (marker == STRINGS_CROSS_TIER_REMAP_MARKER) {
             uint32_t c = ru32();
             for (uint32_t i = 0; i < c; i++) { uint32_t a = ru32(), b = ru32(); str_remap_vec.push_back({a, b}); }
             std::sort(str_remap_vec.begin(), str_remap_vec.end());
@@ -299,7 +310,7 @@ int main(int argc, char* argv[]) {
         if (file_id == 0xFFFFFFFF) break;
 
         // --- Metadata sections ---
-        if (file_id == 0xFFFFFFF7) {
+        if (file_id == STRINGS_LOOP_DIFF_MARKER) {
             // String diff in main loop — same memory-efficient approach as Phase 2
             uint32_t n_added = ru32(), n_deleted = ru32();
             std::vector<std::string> added;
@@ -389,17 +400,36 @@ int main(int argc, char* argv[]) {
                 // Open remap file for read-write
                 int rfd = open(remap_path.c_str(), O_RDWR);
                 if (rfd >= 0) {
-                    struct stat st; fstat(rfd, &st);
-                    size_t remap_size = st.st_size;
-                    uint32_t* remap_data = static_cast<uint32_t*>(
-                        mmap(nullptr, remap_size, PROT_READ | PROT_WRITE, MAP_SHARED, rfd, 0));
-                    size_t remap_count = remap_size / 4;
-                    for (uint32_t i = 0; i < np; i++) {
-                        uint32_t o = ru32(), n = ru32();
-                        if (o < remap_count) remap_data[o] = n + 1; // +1 encoding
+                    struct stat st;
+                    if (fstat(rfd, &st) != 0) {
+                        std::cerr << "  ERROR: fstat failed on " << remap_path << std::endl;
+                        close(rfd);
+                        return 1;
                     }
-                    munmap(remap_data, remap_size);
-                    close(rfd);
+                    size_t remap_size = st.st_size;
+                    if (remap_size == 0) {
+                        // Legitimately empty remap (file had 0 old records).
+                        // mmap(len=0) returns MAP_FAILED, so don't map — but the
+                        // np pairs must still be consumed to keep the patch
+                        // cursor in sync (matches the pre-check behaviour).
+                        for (uint32_t i = 0; i < np; i++) { ru32(); ru32(); }
+                        close(rfd);
+                    } else {
+                        uint32_t* remap_data = static_cast<uint32_t*>(
+                            mmap(nullptr, remap_size, PROT_READ | PROT_WRITE, MAP_SHARED, rfd, 0));
+                        if (remap_data == MAP_FAILED) {
+                            std::cerr << "  ERROR: mmap failed on " << remap_path << std::endl;
+                            close(rfd);
+                            return 1;
+                        }
+                        size_t remap_count = remap_size / 4;
+                        for (uint32_t i = 0; i < np; i++) {
+                            uint32_t o = ru32(), n = ru32();
+                            if (o < remap_count) remap_data[o] = n + 1; // +1 encoding
+                        }
+                        munmap(remap_data, remap_size);
+                        close(rfd);
+                    }
                 } else {
                     // Skip data if file doesn't exist
                     for (uint32_t i = 0; i < np; i++) { ru32(); ru32(); }
@@ -454,7 +484,7 @@ int main(int argc, char* argv[]) {
         // --- Merge sequence replay (streaming) ---
         uint32_t stride = ru32();
         uint64_t old_size = ru64(), new_size = ru64();
-        if (file_id >= (uint32_t)PatchFileId::COUNT) { std::cerr << "Unknown file " << file_id << std::endl; break; }
+        if (file_id >= (uint32_t)PatchFileId::COUNT) { std::cerr << "Unknown file " << file_id << std::endl; return 1; }
         const char* fname = patch_file_names[file_id];
 
         if (stride == 0) {
@@ -618,19 +648,19 @@ int main(int argc, char* argv[]) {
             // corrupted parent_way_id for every record that sat in a
             // MATCH run, producing the "first_diff=17" (first byte of
             // parent_way_id) mismatches we saw in patch verify.
-            if (file_id == (uint32_t)PatchFileId::ADDR_POINTS) remap_offs = {8, 12};
-            else if (file_id == (uint32_t)PatchFileId::STREET_WAYS) remap_offs = {(actual_stride == 12) ? 8ul : 5ul};
-            else if (file_id == (uint32_t)PatchFileId::INTERP_WAYS) remap_offs = {(actual_stride >= 20) ? 8ul : 5ul};
-            else if (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS) remap_offs = {8};
+            if (file_id == (uint32_t)PatchFileId::ADDR_POINTS) remap_offs = {ADDR_POINT_HOUSENUMBER_ID_OFF, ADDR_POINT_STREET_ID_OFF};
+            else if (file_id == (uint32_t)PatchFileId::STREET_WAYS) remap_offs = {(actual_stride == 12) ? WAY_HEADER_NAME_ID_OFF_PADDED : WAY_HEADER_NAME_ID_OFF_PACKED};
+            else if (file_id == (uint32_t)PatchFileId::INTERP_WAYS) remap_offs = {(actual_stride >= 20) ? INTERP_WAY_STREET_ID_OFF_PADDED : INTERP_WAY_STREET_ID_OFF_PACKED};
+            else if (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS) remap_offs = {ADMIN_POLYGON_NAME_ID_OFF};
             else if (file_id == (uint32_t)PatchFileId::POI_RECORDS) {
                 // byte 16 = name_id; byte 24 = parent_street_id;
                 // byte 28 = parent_postcode_id — all string offsets, all
                 // remapped via str_remap (mirrors geocoder_diff.cpp).
-                remap_offs = {16};
-                if (actual_stride >= 28) remap_offs.push_back(24);
-                if (actual_stride >= 32) remap_offs.push_back(28);
+                remap_offs = {POI_RECORD_NAME_ID_OFF};
+                if (actual_stride >= 28) remap_offs.push_back(POI_RECORD_PARENT_STREET_ID_OFF);
+                if (actual_stride >= 32) remap_offs.push_back(POI_RECORD_PARENT_POSTCODE_ID_OFF);
             }
-            else if (file_id == (uint32_t)PatchFileId::PLACE_NODES) remap_offs = {8};
+            else if (file_id == (uint32_t)PatchFileId::PLACE_NODES) remap_offs = {PLACE_NODE_NAME_ID_OFF};
         }
 
         // mmap old file read-only (zero allocation). admin_polygons.bin
@@ -663,10 +693,26 @@ int main(int argc, char* argv[]) {
         if (track) {
             remap_path = tmpdir + "/remap_" + std::to_string(file_id) + ".bin";
             remap_fd = open(remap_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+            if (remap_fd < 0) {
+                std::cerr << "  ERROR: failed to create remap file " << remap_path << std::endl;
+                return 1;
+            }
             size_t remap_bytes = n_old_records * 4;
-            ftruncate(remap_fd, remap_bytes); // zero-filled by OS (sparse)
+            if (ftruncate(remap_fd, remap_bytes) != 0) { // zero-filled by OS (sparse)
+                std::cerr << "  ERROR: ftruncate failed on " << remap_path << std::endl;
+                close(remap_fd);
+                return 1;
+            }
             id_map_ptr = static_cast<uint32_t*>(
                 mmap(nullptr, remap_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, remap_fd, 0));
+            // Only treat MAP_FAILED as fatal when there were records to map;
+            // a zero-length old file legitimately yields remap_bytes==0 (mmap
+            // returns MAP_FAILED for len 0) and id_map_ptr is never read.
+            if (remap_bytes > 0 && id_map_ptr == MAP_FAILED) {
+                std::cerr << "  ERROR: mmap failed on " << remap_path << std::endl;
+                close(remap_fd);
+                return 1;
+            }
             // File is zero-filled. We store new_index+1 so that 0 means "unmapped".
             // The entry pipeline reads these and subtracts 1.
         }
@@ -747,10 +793,10 @@ int main(int argc, char* argv[]) {
                         if (file_id == (uint32_t)PatchFileId::POI_RECORDS) {
                             constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
                             if (actual_stride >= 36 && !poi_admin_remap.empty()) {
-                                uint32_t pp; memcpy(&pp, rec_buf.data() + 32, 4);
+                                uint32_t pp; memcpy(&pp, rec_buf.data() + POI_RECORD_PARENT_POLY_ID_OFF, 4);
                                 if (pp != NO_DATA) {
                                     uint32_t npp = poi_remap_lookup(poi_admin_remap, pp);
-                                    if (npp != pp) memcpy(rec_buf.data() + 32, &npp, 4);
+                                    if (npp != pp) memcpy(rec_buf.data() + POI_RECORD_PARENT_POLY_ID_OFF, &npp, 4);
                                 }
                             }
                         }
@@ -758,20 +804,20 @@ int main(int argc, char* argv[]) {
                         if (file_id == (uint32_t)PatchFileId::PLACE_NODES &&
                             actual_stride >= 20 && !poi_admin_remap.empty()) {
                             constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
-                            uint32_t pp; memcpy(&pp, rec_buf.data() + 16, 4);
+                            uint32_t pp; memcpy(&pp, rec_buf.data() + PLACE_NODE_PARENT_POLY_ID_OFF, 4);
                             if (pp != NO_DATA) {
                                 uint32_t npp = poi_remap_lookup(poi_admin_remap, pp);
-                                if (npp != pp) memcpy(rec_buf.data() + 16, &npp, 4);
+                                if (npp != pp) memcpy(rec_buf.data() + PLACE_NODE_PARENT_POLY_ID_OFF, &npp, 4);
                             }
                         }
                         // AddrPoint parent_way_id at byte 16 (20+ stride).
                         if (file_id == (uint32_t)PatchFileId::ADDR_POINTS &&
                             actual_stride >= 20 && !poi_street_remap.empty()) {
                             constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
-                            uint32_t pw; memcpy(&pw, rec_buf.data() + 16, 4);
+                            uint32_t pw; memcpy(&pw, rec_buf.data() + ADDR_POINT_PARENT_WAY_ID_OFF, 4);
                             if (pw != NO_DATA) {
                                 uint32_t npw = poi_remap_lookup(poi_street_remap, pw);
-                                if (npw != pw) memcpy(rec_buf.data() + 16, &npw, 4);
+                                if (npw != pw) memcpy(rec_buf.data() + ADDR_POINT_PARENT_WAY_ID_OFF, &npw, 4);
                             }
                         }
                         // Apply fixup (node_offset/vertex_offset — at byte 0 for
@@ -779,8 +825,8 @@ int main(int argc, char* argv[]) {
                         // which has vertex_offset after lat/lng/hn_id/st_id/pw_id).
                         if (has_fixup) {
                             size_t fixup_off =
-                                (file_id == (uint32_t)PatchFileId::POI_RECORDS) ? 8 :
-                                (file_id == (uint32_t)PatchFileId::ADDR_POINTS)  ? 20 : 0;
+                                (file_id == (uint32_t)PatchFileId::POI_RECORDS) ? POI_RECORD_VERTEX_OFFSET_OFF :
+                                (file_id == (uint32_t)PatchFileId::ADDR_POINTS)  ? ADDR_POINT_VERTEX_OFFSET_OFF : (size_t)0;
                             memcpy(rec_buf.data() + fixup_off, &fixup_val, 4);
                         }
                         fwrite(rec_buf.data(), 1, actual_stride, outf);
@@ -804,9 +850,17 @@ int main(int argc, char* argv[]) {
         unmap_file(old_mmap);
 
         if (track) {
-            // Sync and munmap the file-backed remap (data is already on disk)
+            // Sync and munmap the file-backed remap (data is already on disk).
+            // A failed msync would leave the remap that the entry pipeline later
+            // reads partially flushed → silent output corruption, so fail loudly.
+            // Skip the check for an empty mapping (remap_bytes==0 → MAP_FAILED).
             size_t remap_bytes = n_old_records * 4;
-            msync(id_map_ptr, remap_bytes, MS_SYNC);
+            if (remap_bytes > 0 && msync(id_map_ptr, remap_bytes, MS_SYNC) != 0) {
+                std::cerr << "  ERROR: msync failed on " << remap_path << std::endl;
+                munmap(id_map_ptr, remap_bytes);
+                close(remap_fd);
+                return 1;
+            }
             munmap(id_map_ptr, remap_bytes);
             close(remap_fd);
             id_map_ptr = nullptr;

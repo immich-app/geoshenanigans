@@ -74,6 +74,11 @@ struct PatchWayHeader {
     uint32_t name_id;
 };
 static_assert(sizeof(PatchWayHeader) == 9, "WayHeader must be 9 bytes packed");
+// name_id byte offset within a street WayHeader record. The builder may emit
+// the struct packed (stride 9, name_id at 5) or padded (stride 12, name_id at
+// 8); pick by the detected stride.
+static constexpr size_t WAY_HEADER_NAME_ID_OFF_PADDED = 8;
+static constexpr size_t WAY_HEADER_NAME_ID_OFF_PACKED = 5;
 
 struct PatchAddrPoint {
     float lat;
@@ -83,6 +88,14 @@ struct PatchAddrPoint {
     uint32_t parent_way_id;
 };
 static_assert(sizeof(PatchAddrPoint) == 20, "AddrPoint must be 20 bytes");
+// Byte offsets within an AddrPoint record (used by the patch tool's per-record
+// remap/fixup passes). housenumber_id/street_id are string-pool offsets;
+// parent_way_id is a WAY id (street id-space), NOT a string offset; the
+// vertex_offset (polygon footprint) lives after the record's 20 fixed bytes.
+static constexpr size_t ADDR_POINT_HOUSENUMBER_ID_OFF = 8;
+static constexpr size_t ADDR_POINT_STREET_ID_OFF = 12;
+static constexpr size_t ADDR_POINT_PARENT_WAY_ID_OFF = 16;
+static constexpr size_t ADDR_POINT_VERTEX_OFFSET_OFF = 20;
 
 struct PatchNodeCoord {
     float lat;
@@ -102,6 +115,11 @@ struct PatchInterpWay {
     uint32_t end_number;
     uint8_t interpolation;
 };
+// street_id byte offset within an InterpWay record. node_count is followed by
+// 3 padding bytes at stride>=20 (street_id at 8) or no padding at stride 18
+// (street_id at 5).
+static constexpr size_t INTERP_WAY_STREET_ID_OFF_PADDED = 8;
+static constexpr size_t INTERP_WAY_STREET_ID_OFF_PACKED = 5;
 
 struct PatchAdminPolygon {
     uint32_t vertex_offset;
@@ -112,6 +130,8 @@ struct PatchAdminPolygon {
     float area;
     uint16_t country_code;
 };
+// name_id byte offset within an AdminPolygon record (string-pool offset).
+static constexpr size_t ADMIN_POLYGON_NAME_ID_OFF = 8;
 
 struct PatchPoiRecord {
     float lat;
@@ -124,6 +144,25 @@ struct PatchPoiRecord {
     uint8_t flags;
     uint8_t importance;
 };
+// Byte offsets within a PoiRecord, keyed off the on-disk stride (which grew
+// across build versions). vertex_offset is the fixup target. name_id /
+// parent_street_id / parent_postcode_id are string-pool offsets; parent_poly_id
+// is an admin polygon index (admin id-space).
+//   stride 24: lat,lng,vertex_offset,vertex_count,name_id,4×u8
+//   stride 28: + parent_street_id at 24
+//   stride 32: + parent_postcode_id at 28
+//   stride 36: + parent_poly_id at 32
+static constexpr size_t POI_RECORD_VERTEX_OFFSET_OFF = 8;
+static constexpr size_t POI_RECORD_NAME_ID_OFF = 16;
+static constexpr size_t POI_RECORD_PARENT_STREET_ID_OFF = 24;
+static constexpr size_t POI_RECORD_PARENT_POSTCODE_ID_OFF = 28;
+static constexpr size_t POI_RECORD_PARENT_POLY_ID_OFF = 32;
+
+// PlaceNode byte offsets (no dedicated Patch struct — parsed by stride).
+// name_id is a string-pool offset; parent_poly_id (present at stride>=20) is an
+// admin polygon index.
+static constexpr size_t PLACE_NODE_NAME_ID_OFF = 8;
+static constexpr size_t PLACE_NODE_PARENT_POLY_ID_OFF = 16;
 
 // --- File I/O helpers ---
 
@@ -274,7 +313,9 @@ inline std::vector<PatchPoiRecord> read_poi_records(const std::string& path) {
 // --- Patch file format ---
 
 static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
-static constexpr uint32_t GCPATCH_VERSION = 1;
+// Custom merge-sequence patch format. Emitted by geocoder-diff, checked by
+// geocoder-patch. Value 2 (the legacy value 1 was the old zlib-section format).
+static constexpr uint32_t GCPATCH_VERSION = 2;
 
 enum class PatchFileId : uint32_t {
     STRINGS = 0,
@@ -406,6 +447,25 @@ static constexpr uint32_t CELL_FLAGS_MARKER = 0xFFFFFFF9;
 // Format: marker(4), n_files(4),
 //   for each: file_id(4), n_pairs(4), [(old_id:u32, new_id:u32)] × n_pairs
 static constexpr uint32_t SECONDARY_REMAP_MARKER = 0xFFFFFFF6;
+
+// String-section markers, read by geocoder-patch during the Phase-2 string
+// rebuild and the legacy in-loop string diff. These intentionally share their
+// raw values with markers above (e.g. STRINGS_TIERED_MARKER reuses 0xFFFFFFF6,
+// the SECONDARY_REMAP_MARKER value) because they are disambiguated by read
+// position, not by value — the string markers are consumed before the main
+// section loop where SECONDARY_REMAP_MARKER appears.
+//
+//   STRINGS_TIERED_MARKER  — tiered per-tier strings diff (5 blocks of
+//                            {n_added, n_deleted, added..., deleted_idx...}).
+//                            Emitted by geocoder-diff as `tiered_marker`.
+//   STRINGS_CROSS_TIER_REMAP_MARKER — explicit cross-tier (old_off,new_off)
+//                            string remap pairs. Emitted by geocoder-diff.
+//   STRINGS_LOOP_DIFF_MARKER — legacy single-pool in-loop string diff,
+//                            consumed by geocoder-patch only (not emitted by
+//                            the current diff).
+static constexpr uint32_t STRINGS_TIERED_MARKER = 0xFFFFFFF6;
+static constexpr uint32_t STRINGS_CROSS_TIER_REMAP_MARKER = 0xFFFFFFFE;
+static constexpr uint32_t STRINGS_LOOP_DIFF_MARKER = 0xFFFFFFF7;
 
 // Sparse position-keyed delta. Stride sentinel that signals the section
 // payload is a list of (position, value) pairs for the positions where

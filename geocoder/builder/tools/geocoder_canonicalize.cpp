@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -20,6 +21,35 @@
 #include <vector>
 
 #include "patch_format.h"
+
+// --- Record/entry framing constants ---
+// Sentinel offset meaning "this cell has no entry list" (written into the
+// offset column of geo_cells / admin_cells).
+static constexpr uint32_t kNoEntryOffset = 0xFFFFFFFF;
+// Entry framing: each cell's entry list is [uint16 count][uint32 id]*count.
+static constexpr size_t kEntryCountBytes = 2; // sizeof(uint16_t) count prefix
+static constexpr size_t kEntryIdBytes = 4;    // sizeof(uint32_t) per id
+// Cell record strides (cell_id u64 + offset column(s) u32).
+static constexpr size_t kGeoCellStride = 20;   // u64 cell_id + 3 * u32 offsets
+static constexpr size_t kAdminCellStride = 12; // u64 cell_id + 1 * u32 offset
+
+// Validate an input file exists and its size is an exact multiple of `stride`.
+// Read-only: produces no output and never triggers for well-formed inputs.
+// Aborts (failure path only) on a missing file or a size that is not a whole
+// number of records, which would otherwise be silently truncated.
+static void validate_input(const std::string& path, size_t stride) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) {
+        std::cerr << "ERROR: missing input file: " << path << std::endl;
+        std::exit(1);
+    }
+    size_t sz = static_cast<size_t>(st.st_size);
+    if (stride != 0 && sz % stride != 0) {
+        std::cerr << "ERROR: " << path << " size " << sz
+                  << " is not a multiple of record stride " << stride << std::endl;
+        std::exit(1);
+    }
+}
 
 // --- Canonical string pool ---
 // Sort all strings alphabetically, build old_offset -> new_offset remap.
@@ -80,7 +110,7 @@ struct CellAssignments {
 };
 
 static std::vector<uint32_t> parse_entry(const std::vector<char>& entries, uint32_t offset) {
-    if (offset == 0xFFFFFFFF || offset + 2 > entries.size()) return {};
+    if (offset == kNoEntryOffset || offset + 2 > entries.size()) return {};
     uint16_t count;
     memcpy(&count, entries.data() + offset, 2);
     std::vector<uint32_t> ids(count);
@@ -93,18 +123,19 @@ static CellAssignments extract_cell_assignments(const std::string& dir) {
     CellAssignments ca;
 
     // Geo cells
+    validate_input(dir + "/geo_cells.bin", kGeoCellStride);
     auto geo_data = read_file(dir + "/geo_cells.bin");
     auto street_entries = read_file(dir + "/street_entries.bin");
     auto addr_entries = read_file(dir + "/addr_entries.bin");
     auto interp_entries = read_file(dir + "/interp_entries.bin");
 
-    size_t n_geo = geo_data.size() / 20;
+    size_t n_geo = geo_data.size() / kGeoCellStride;
     for (size_t i = 0; i < n_geo; i++) {
         GeoCellEntry e;
-        memcpy(&e.cell_id, geo_data.data() + i * 20, 8);
-        memcpy(&e.street_offset, geo_data.data() + i * 20 + 8, 4);
-        memcpy(&e.addr_offset, geo_data.data() + i * 20 + 12, 4);
-        memcpy(&e.interp_offset, geo_data.data() + i * 20 + 16, 4);
+        memcpy(&e.cell_id, geo_data.data() + i * kGeoCellStride, 8);
+        memcpy(&e.street_offset, geo_data.data() + i * kGeoCellStride + 8, 4);
+        memcpy(&e.addr_offset, geo_data.data() + i * kGeoCellStride + 12, 4);
+        memcpy(&e.interp_offset, geo_data.data() + i * kGeoCellStride + 16, 4);
 
         auto s_ids = parse_entry(street_entries, e.street_offset);
         if (!s_ids.empty()) ca.street_cells[e.cell_id] = std::move(s_ids);
@@ -117,14 +148,15 @@ static CellAssignments extract_cell_assignments(const std::string& dir) {
     }
 
     // Admin cells
+    validate_input(dir + "/admin_cells.bin", kAdminCellStride);
     auto admin_cell_data = read_file(dir + "/admin_cells.bin");
     auto admin_entry_data = read_file(dir + "/admin_entries.bin");
-    size_t n_admin = admin_cell_data.size() / 12;
+    size_t n_admin = admin_cell_data.size() / kAdminCellStride;
     for (size_t i = 0; i < n_admin; i++) {
         uint64_t cell_id;
         uint32_t offset;
-        memcpy(&cell_id, admin_cell_data.data() + i * 12, 8);
-        memcpy(&offset, admin_cell_data.data() + i * 12 + 8, 4);
+        memcpy(&cell_id, admin_cell_data.data() + i * kAdminCellStride, 8);
+        memcpy(&offset, admin_cell_data.data() + i * kAdminCellStride + 8, 4);
         auto ids = parse_entry(admin_entry_data, offset);
         if (!ids.empty()) ca.admin_cells[cell_id] = std::move(ids);
     }
@@ -147,12 +179,52 @@ static void remap_cells(std::unordered_map<uint64_t, std::vector<uint32_t>>& cel
     }
 }
 
+// --- Shared entry serialization ---
+// Serialize per-cell entry lists into `buf` in the given cell order and record
+// each non-empty cell's byte offset. Frame: [uint16 count][uint32 id]*count.
+// Used by both the merged geo writer and the single-column (admin) writer so
+// the two paths emit byte-identical entry buffers.
+static std::unordered_map<uint64_t, uint32_t> serialize_entries(
+    std::vector<char>& buf,
+    const std::vector<uint64_t>& ordered_cells,
+    const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map)
+{
+    std::unordered_map<uint64_t, uint32_t> offsets;
+    for (uint64_t cell_id : ordered_cells) {
+        auto it = cell_map.find(cell_id);
+        if (it == cell_map.end() || it->second.empty()) continue;
+        offsets[cell_id] = static_cast<uint32_t>(buf.size());
+        uint16_t count = static_cast<uint16_t>(it->second.size());
+        buf.insert(buf.end(), reinterpret_cast<const char*>(&count),
+                   reinterpret_cast<const char*>(&count) + 2);
+        buf.insert(buf.end(), reinterpret_cast<const char*>(it->second.data()),
+                   reinterpret_cast<const char*>(it->second.data()) + it->second.size() * 4);
+    }
+    return offsets;
+}
+
+// Serialize a single-column cell index: [uint64 cell_id][uint32 offset] per cell
+// in the given order, using the no-entry sentinel where a cell has no list.
+static void serialize_cells(
+    std::vector<char>& buf,
+    const std::vector<uint64_t>& ordered_cells,
+    const std::unordered_map<uint64_t, uint32_t>& cell_offsets)
+{
+    for (uint64_t cell_id : ordered_cells) {
+        buf.insert(buf.end(), reinterpret_cast<const char*>(&cell_id),
+                   reinterpret_cast<const char*>(&cell_id) + 8);
+        auto it = cell_offsets.find(cell_id);
+        uint32_t off = (it != cell_offsets.end()) ? it->second : kNoEntryOffset;
+        buf.insert(buf.end(), reinterpret_cast<const char*>(&off),
+                   reinterpret_cast<const char*>(&off) + 4);
+    }
+}
+
 // --- Write entries + cells files ---
 static void write_entries_and_cells(
     const std::string& cells_path,
     const std::string& entries_path,
-    const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map,
-    size_t cell_entry_size) // 20 for geo, 12 for admin
+    const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map)
 {
     // Collect and sort cells
     std::vector<uint64_t> sorted_cells;
@@ -162,31 +234,12 @@ static void write_entries_and_cells(
 
     // Write entries file
     std::vector<char> entries_buf;
-    std::unordered_map<uint64_t, uint32_t> cell_offsets;
-    for (uint64_t cell_id : sorted_cells) {
-        auto it = cell_map.find(cell_id);
-        if (it == cell_map.end() || it->second.empty()) continue;
-        cell_offsets[cell_id] = static_cast<uint32_t>(entries_buf.size());
-        uint16_t count = static_cast<uint16_t>(it->second.size());
-        entries_buf.insert(entries_buf.end(), reinterpret_cast<const char*>(&count),
-                          reinterpret_cast<const char*>(&count) + 2);
-        entries_buf.insert(entries_buf.end(),
-                          reinterpret_cast<const char*>(it->second.data()),
-                          reinterpret_cast<const char*>(it->second.data()) + it->second.size() * 4);
-    }
+    auto cell_offsets = serialize_entries(entries_buf, sorted_cells, cell_map);
     write_file(entries_path, entries_buf);
 
     // Write cells file
     std::vector<char> cells_buf;
-    uint32_t no_data = 0xFFFFFFFF;
-    for (uint64_t cell_id : sorted_cells) {
-        cells_buf.insert(cells_buf.end(), reinterpret_cast<const char*>(&cell_id),
-                        reinterpret_cast<const char*>(&cell_id) + 8);
-        auto it = cell_offsets.find(cell_id);
-        uint32_t off = (it != cell_offsets.end()) ? it->second : no_data;
-        cells_buf.insert(cells_buf.end(), reinterpret_cast<const char*>(&off),
-                        reinterpret_cast<const char*>(&off) + 4);
-    }
+    serialize_cells(cells_buf, sorted_cells, cell_offsets);
     write_file(cells_path, cells_buf);
 }
 
@@ -210,17 +263,7 @@ static void write_geo_cells_and_entries(
         -> std::unordered_map<uint64_t, uint32_t>
     {
         std::vector<char> buf;
-        std::unordered_map<uint64_t, uint32_t> offsets;
-        for (uint64_t cell_id : all_cells) {
-            auto it = cells.find(cell_id);
-            if (it == cells.end() || it->second.empty()) continue;
-            offsets[cell_id] = static_cast<uint32_t>(buf.size());
-            uint16_t count = static_cast<uint16_t>(it->second.size());
-            buf.insert(buf.end(), reinterpret_cast<const char*>(&count),
-                      reinterpret_cast<const char*>(&count) + 2);
-            buf.insert(buf.end(), reinterpret_cast<const char*>(it->second.data()),
-                      reinterpret_cast<const char*>(it->second.data()) + it->second.size() * 4);
-        }
+        auto offsets = serialize_entries(buf, all_cells, cells);
         write_file(path, buf);
         return offsets;
     };
@@ -230,15 +273,14 @@ static void write_geo_cells_and_entries(
     auto i_off = write_entries(dir + "/interp_entries.bin", interp_cells);
 
     // Write geo_cells.bin
-    uint32_t no_data = 0xFFFFFFFF;
     std::vector<char> buf;
-    buf.reserve(all_cells.size() * 20);
+    buf.reserve(all_cells.size() * kGeoCellStride);
     for (uint64_t cell_id : all_cells) {
         buf.insert(buf.end(), reinterpret_cast<const char*>(&cell_id),
                   reinterpret_cast<const char*>(&cell_id) + 8);
         auto get = [&](const auto& m) -> uint32_t {
             auto it = m.find(cell_id);
-            return (it != m.end()) ? it->second : no_data;
+            return (it != m.end()) ? it->second : kNoEntryOffset;
         };
         uint32_t so = get(s_off), ao = get(a_off), io = get(i_off);
         buf.insert(buf.end(), reinterpret_cast<const char*>(&so), reinterpret_cast<const char*>(&so) + 4);
@@ -277,6 +319,7 @@ int main(int argc, char* argv[]) {
     // 3. Canonicalize addr_points
     std::cerr << "  Sorting addr_points..." << std::endl;
     {
+        validate_input(input_dir + "/addr_points.bin", sizeof(PatchAddrPoint));
         auto points = read_structs<PatchAddrPoint>(input_dir + "/addr_points.bin");
         size_t n = points.size();
         std::vector<uint32_t> order(n);
@@ -319,6 +362,8 @@ int main(int argc, char* argv[]) {
     // 4. Canonicalize street_ways + street_nodes
     std::cerr << "  Sorting street_ways..." << std::endl;
     {
+        validate_input(input_dir + "/street_ways.bin", 0); // variable stride (9/12), existence only
+        validate_input(input_dir + "/street_nodes.bin", sizeof(PatchNodeCoord));
         auto ways = read_ways(input_dir + "/street_ways.bin");
         auto nodes = read_structs<PatchNodeCoord>(input_dir + "/street_nodes.bin");
         size_t n = ways.size();
@@ -392,6 +437,8 @@ int main(int argc, char* argv[]) {
     // 5. Canonicalize interp_ways + interp_nodes
     std::cerr << "  Sorting interp_ways..." << std::endl;
     {
+        validate_input(input_dir + "/interp_ways.bin", 0); // variable stride (18/20), existence only
+        validate_input(input_dir + "/interp_nodes.bin", sizeof(PatchNodeCoord));
         auto interps = read_interps(input_dir + "/interp_ways.bin");
         auto nodes = read_structs<PatchNodeCoord>(input_dir + "/interp_nodes.bin");
         size_t n = interps.size();
@@ -459,6 +506,8 @@ int main(int argc, char* argv[]) {
     // 6. Canonicalize admin_polygons + admin_vertices
     std::cerr << "  Sorting admin_polygons..." << std::endl;
     {
+        validate_input(input_dir + "/admin_polygons.bin", 0); // variable stride (19/20/24), existence only
+        validate_input(input_dir + "/admin_vertices.bin", sizeof(PatchNodeCoord));
         auto polygons = read_admin_polygons(input_dir + "/admin_polygons.bin");
         auto vertices = read_structs<PatchNodeCoord>(input_dir + "/admin_vertices.bin");
         size_t n = polygons.size();
@@ -531,7 +580,7 @@ int main(int argc, char* argv[]) {
     std::cerr << "  Writing cell indexes..." << std::endl;
     write_geo_cells_and_entries(output_dir, ca.street_cells, ca.addr_cells, ca.interp_cells);
     write_entries_and_cells(output_dir + "/admin_cells.bin", output_dir + "/admin_entries.bin",
-                           ca.admin_cells, 12);
+                           ca.admin_cells);
 
     std::cerr << "Done. Canonical output in " << output_dir << std::endl;
     return 0;

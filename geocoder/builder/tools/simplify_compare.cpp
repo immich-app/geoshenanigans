@@ -3,12 +3,21 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
 
+// On-disk AdminPolygon record layout. This MUST track the AdminPolygon
+// definition in the builder (see PatchAdminPolygon in patch_format.h and
+// types.h): this tool reinterpret_casts the raw file bytes and indexes by
+// sizeof(AdminPolygon), so the explicit padding below is load-bearing and
+// must match the on-disk 24-byte layout. patch_format.h deliberately reads
+// the same record field-by-field instead of struct-casting, so its
+// PatchAdminPolygon (no explicit padding, with place_type_override where the
+// padding sits here) is not a drop-in replacement for this cast-based access.
 struct AdminPolygon {
     uint32_t vertex_offset;
     uint32_t vertex_count;
@@ -108,7 +117,21 @@ int main(int argc, char* argv[]) {
     std::vector<char> poly_buf, vert_buf, str_buf;
     auto load = [](const std::string& path, std::vector<char>& buf) {
         std::ifstream f(path, std::ios::binary | std::ios::ate);
-        buf.resize(f.tellg()); f.seekg(0); f.read(buf.data(), buf.size());
+        if (!f.is_open()) {
+            fprintf(stderr, "Error: cannot open %s\n", path.c_str());
+            exit(1);
+        }
+        std::streamoff size = f.tellg();
+        if (size < 0) {
+            fprintf(stderr, "Error: cannot determine size of %s\n", path.c_str());
+            exit(1);
+        }
+        buf.resize(static_cast<size_t>(size)); f.seekg(0); f.read(buf.data(), buf.size());
+        if (static_cast<size_t>(f.gcount()) != buf.size()) {
+            fprintf(stderr, "Error: short read on %s (%zu of %zu bytes)\n",
+                    path.c_str(), static_cast<size_t>(f.gcount()), buf.size());
+            exit(1);
+        }
     };
     load(dir + "/admin_polygons.bin", poly_buf);
     load(dir + "/admin_vertices.bin", vert_buf);

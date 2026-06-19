@@ -24,6 +24,7 @@
 #include <mutex>
 #include <string>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
 #include <unordered_map>
@@ -31,6 +32,14 @@
 #include <vector>
 
 #include "patch_format.h"
+
+// Sentinel meaning "no offset / no data / unmapped id" in cell offset fields
+// and id-remap tables. Emitted/compared as a raw uint32_t.
+static constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
+// Terminator written after the last patch section; the patch reader breaks its
+// section loop when it reads this as a file_id. Same bytes as NO_DATA, but a
+// distinct concept, so it gets its own name.
+static constexpr uint32_t SECTION_END_MARKER = 0xFFFFFFFFu;
 
 static size_t get_rss_mb() {
     FILE* f = fopen("/proc/self/statm", "r");
@@ -317,7 +326,6 @@ static void fixup_v15_offsets(char* old_polys, size_t old_polys_size,
         memcmp(old_polys, new_polys, old_polys_size) == 0 &&
         memcmp(old_verts, new_verts, old_verts_size) == 0)
         return;
-    constexpr uint32_t NO_DATA_OFF = 0xFFFFFFFFu;
     size_t old_n = old_polys_size / stride;
     size_t new_n = new_polys_size / stride;
     auto compute_blocks = [&](const char* polys, size_t parent_size, size_t verts_size) {
@@ -329,7 +337,7 @@ static void fixup_v15_offsets(char* old_polys, size_t old_polys_size,
         uint32_t next_off = static_cast<uint32_t>(verts_size);
         for (size_t i = total_n; i-- > 0; ) {
             uint32_t off = offsets[i];
-            if (off == NO_DATA_OFF || (size_t)off > verts_size) {
+            if (off == NO_DATA || (size_t)off > verts_size) {
                 sizes[i] = 0;
             } else {
                 sizes[i] = (next_off >= off) ? (next_off - off) : 0;
@@ -583,7 +591,7 @@ static std::unordered_map<uint32_t, uint32_t> secondary_match_from_merge(
 static std::vector<uint32_t> derive_id_remap_from_merge(
     const MergeSequence& seq, size_t old_count, size_t stride)
 {
-    std::vector<uint32_t> id_map(old_count, 0xFFFFFFFF);
+    std::vector<uint32_t> id_map(old_count, NO_DATA);
     size_t pos = 0, old_rec = 0, new_rec = 0;
     while (pos < seq.data.size()) {
         uint8_t op = static_cast<uint8_t>(seq.data[pos]); pos++;
@@ -812,7 +820,7 @@ int main(int argc, char* argv[]) {
     // Build patch data (uncompressed, will be zstd-compressed at the end)
     std::vector<char> patch;
     patch.insert(patch.end(), GCPATCH_MAGIC, GCPATCH_MAGIC + 8);
-    uint32_t ver = 2, flags = 0; // version 2 = custom format
+    uint32_t ver = GCPATCH_VERSION, flags = 0; // custom merge-sequence format
     wval(patch, &ver, 4); wval(patch, &flags, 4);
 
     // --- Section: Per-file merge sequences (computed in parallel) ---
@@ -941,7 +949,6 @@ int main(int argc, char* argv[]) {
         // points with vert_offset==NO_DATA interspersed between polygon
         // POIs; their blocks have zero size). Precompute block sizes
         // O(n) so the walker's per-record lookup is O(1).
-        constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
         auto compute_block_sizes = [&](const char* parent, size_t parent_size, size_t verts_size) {
             size_t total_n = parent_size / parent_stride;
             std::vector<uint32_t> offsets(total_n);
@@ -1184,7 +1191,6 @@ int main(int argc, char* argv[]) {
             street_remap_future.wait();
             const auto& way_rm = res_ways.id_remap;
             if (!way_rm.empty()) {
-                constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
                 size_t n = old_m.size / addr_stride;
                 for (size_t i = 0; i < n; i++) {
                     char* rec = old_m.data + i * addr_stride;
@@ -1325,7 +1331,7 @@ int main(int argc, char* argv[]) {
                 uint64_t key = ((uint64_t)name_id << 8) | nc;
                 new_idx.emplace(key, i);
             }
-            std::vector<uint32_t> id_rm(old_n_w, 0xFFFFFFFFu);
+            std::vector<uint32_t> id_rm(old_n_w, NO_DATA);
             for (uint32_t i = 0; i < old_n_w; i++) {
                 uint32_t name_id; memcpy(&name_id, old_w.data + (size_t)i * way_stride + way_name_off, 4);
                 uint8_t nc = static_cast<uint8_t>(old_w.data[(size_t)i * way_stride + 4]);
@@ -1596,7 +1602,6 @@ int main(int argc, char* argv[]) {
         //     — string offsets, already remapped via str_remap above.
         //   byte 32 (parent_poly_id) — admin polygon index, remapped below.
         // Block on t_admin so the admin remap is ready before fixup runs.
-        constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
         admin_remap_future.wait();
         street_remap_future.wait();
 
@@ -1729,7 +1734,6 @@ int main(int argc, char* argv[]) {
             admin_remap_future.wait();
             const auto& adm_rm = res_admin_p.id_remap;
             if (!adm_rm.empty()) {
-                constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
                 size_t n = old_data.size / place_stride;
                 for (size_t i = 0; i < n; i++) {
                     char* rec = old_data.data + i * place_stride;
@@ -1786,35 +1790,6 @@ int main(int argc, char* argv[]) {
     { std::vector<char>().swap(new_concat); }
     std::cerr << "  RSS after merge phase: " << get_rss_mb() << " MiB" << std::endl;
 
-    // Inline raw-emit fallback retained for any file whose byte-block
-    // pipeline isn't wired up yet. v15 admin_vertices and poi_vertices
-    // both go through proper byte-block delta via build_vertex_byte_merge.
-    auto emit_raw_inline = [&](PatchFileId fid, const std::string& fname) {
-        std::string new_path = new_dir + "/" + fname;
-        struct stat nst;
-        if (stat(new_path.c_str(), &nst) != 0) return;
-        uint64_t new_size = (uint64_t)nst.st_size;
-        struct stat ost;
-        std::string old_path = old_dir + "/" + fname;
-        uint64_t old_size = (stat(old_path.c_str(), &ost) == 0) ? (uint64_t)ost.st_size : 0;
-        uint32_t fid_u = static_cast<uint32_t>(fid);
-        uint32_t stride = 0;
-        uint32_t nfix = 0;
-        uint64_t ds = new_size;
-        wval(patch, &fid_u, 4);
-        wval(patch, &stride, 4);
-        wval(patch, &old_size, 8);
-        wval(patch, &new_size, 8);
-        wval(patch, &nfix, 4);
-        wval(patch, &ds, 8);
-        if (new_size > 0) {
-            std::ifstream in(new_path, std::ios::binary);
-            std::vector<char> buf(new_size);
-            in.read(buf.data(), new_size);
-            patch.insert(patch.end(), buf.begin(), buf.end());
-        }
-    };
-
     // Parent-id remap section. Emitted FIRST so it's loaded before any
     // merge section that consumes it during MATCH replay:
     //   - addr_points.bin: byte 16 parent_way_id (uses street pairs)
@@ -1855,10 +1830,10 @@ int main(int argc, char* argv[]) {
         auto emit_pairs = [&](const std::vector<uint32_t>& rm) {
             uint32_t n_pairs = 0;
             for (uint32_t i = 0; i < rm.size(); i++)
-                if (rm[i] != 0xFFFFFFFFu && rm[i] != i) n_pairs++;
+                if (rm[i] != NO_DATA && rm[i] != i) n_pairs++;
             wval(patch, &n_pairs, 4);
             for (uint32_t i = 0; i < rm.size(); i++) {
-                if (rm[i] != 0xFFFFFFFFu && rm[i] != i) {
+                if (rm[i] != NO_DATA && rm[i] != i) {
                     uint32_t o = i, nn = rm[i];
                     wval(patch, &o, 4);
                     wval(patch, &nn, 4);
@@ -1914,7 +1889,7 @@ int main(int argc, char* argv[]) {
             res_admin_p.old_size / admin_stride, admin_stride);
         ad_rm_d.reserve(vec.size());
         for (uint32_t i = 0; i < vec.size(); i++)
-            if (vec[i] != 0xFFFFFFFF) ad_rm_d[i] = vec[i];
+            if (vec[i] != NO_DATA) ad_rm_d[i] = vec[i];
         for (auto& [o,n] : res_admin_p.secondary_matches) ad_rm_d[o] = n;
     }
     std::unordered_map<uint32_t,uint32_t> poi_rm_d;
@@ -1924,7 +1899,7 @@ int main(int argc, char* argv[]) {
             res_poi_r.old_size / poi_stride, poi_stride);
         poi_rm_d.reserve(vec.size());
         for (uint32_t i = 0; i < vec.size(); i++)
-            if (vec[i] != 0xFFFFFFFF) poi_rm_d[i] = vec[i];
+            if (vec[i] != NO_DATA) poi_rm_d[i] = vec[i];
         for (auto& [o,n] : res_poi_r.secondary_matches) poi_rm_d[o] = n;
     }
     std::unordered_map<uint32_t,uint32_t> place_rm_d;
@@ -1934,7 +1909,7 @@ int main(int argc, char* argv[]) {
             res_place_n.old_size / place_stride, place_stride);
         place_rm_d.reserve(vec.size());
         for (uint32_t i = 0; i < vec.size(); i++)
-            if (vec[i] != 0xFFFFFFFF) place_rm_d[i] = vec[i];
+            if (vec[i] != NO_DATA) place_rm_d[i] = vec[i];
         for (auto& [o,n] : res_place_n.secondary_matches) place_rm_d[o] = n;
     }
     log_time("Admin+POI+Place remap", t0);
@@ -2005,8 +1980,11 @@ int main(int argc, char* argv[]) {
     auto new_ae_m = mmap_file(new_dir + "/addr_entries.bin");
     auto new_ie_m = mmap_file(new_dir + "/interp_entries.bin");
 
-    auto parse_ids_raw = [](const char* data, size_t data_size, uint32_t off) -> std::vector<uint32_t> {
-        if (off == 0xFFFFFFFF || off + 2 > data_size) return {};
+    // Shared cell-entry-list parser: reads a uint16 count at `off` followed by
+    // `count` uint32 ids. Used for both raw mmap pointers and std::vector<char>
+    // buffers (call with .data()/.size()).
+    auto parse_ids = [](const char* data, size_t data_size, uint32_t off) -> std::vector<uint32_t> {
+        if (off == NO_DATA || off + 2 > data_size) return {};
         uint16_t count; memcpy(&count, data + off, 2);
         if (off + 2 + count * 4 > data_size) return {};
         std::vector<uint32_t> ids(count);
@@ -2017,7 +1995,7 @@ int main(int argc, char* argv[]) {
     // Remap IDs in-place using vector remap (O(1) per ID)
     auto remap_ids_vec = [](std::vector<uint32_t>& ids, const std::vector<uint32_t>& rm) {
         for (auto& id : ids)
-            if (id < rm.size() && rm[id] != 0xFFFFFFFF) id = rm[id];
+            if (id < rm.size() && rm[id] != NO_DATA) id = rm[id];
         std::sort(ids.begin(), ids.end());
     };
 
@@ -2044,58 +2022,11 @@ int main(int argc, char* argv[]) {
                                       const std::vector<uint32_t>& id_rm) -> std::vector<char> {
         std::vector<char> buf; buf.resize(12, 0); uint32_t dc = 0;
 
-        // Merge-walk: effective old (old - removed + added) vs new
-        // Both are sorted by cell_id.
+        // Merge-walk: effective old (old - removed + added) vs new.
+        // Both are sorted by cell_id. Walk old and new geo_cells arrays in
+        // lockstep, applying added/removed on the old side.
         size_t oi = 0, ni = 0, added_i = 0;
-
-        auto next_old = [&](uint64_t& cid) -> bool {
-            // Skip removed cells, merge in added cells
-            while (true) {
-                uint64_t old_cid = UINT64_MAX, add_cid = UINT64_MAX;
-                if (oi < old_nc) memcpy(&old_cid, old_geo_m.data + oi * 20, 8);
-                if (added_i < g_added.size()) add_cid = g_added[added_i];
-
-                if (old_cid == UINT64_MAX && add_cid == UINT64_MAX) return false;
-
-                if (add_cid < old_cid) {
-                    // Added cell (empty entries in derived)
-                    cid = add_cid; added_i++;
-                    return true;
-                }
-                // Old cell
-                if (removed_set.count(old_cid)) { oi++; continue; } // skip removed
-                cid = old_cid;
-                return true;
-            }
-        };
-
-        // Helper to get derived entries for current old cell
-        auto get_derived = [&](uint64_t cid) -> std::vector<uint32_t> {
-            // Check if this is an added cell (no old entries)
-            // We know it's added if it wasn't from old_geo_m
-            if (oi < old_nc) {
-                uint64_t old_cid; memcpy(&old_cid, old_geo_m.data + oi * 20, 8);
-                if (old_cid == cid) {
-                    // Old cell — parse and remap
-                    uint32_t off; memcpy(&off, old_geo_m.data + oi * 20 + geo_off_pos, 4);
-                    auto ids = parse_ids_raw(old_entries.data, old_entries.size, off);
-                    remap_ids_vec(ids, id_rm);
-                    oi++;
-                    return ids;
-                }
-            }
-            // Added cell — empty derived entries
-            return {};
-        };
-
-        uint64_t d_cid;
-        // We need to track oi separately for each entry type, but they share the same
-        // geo_cells walk. So let's do a simpler approach: walk both arrays together.
-
-        // Actually let's simplify: walk old and new geo_cells arrays in lockstep,
-        // applying added/removed on the old side.
         buf.resize(12, 0); dc = 0;
-        oi = 0; ni = 0; added_i = 0;
 
         while (oi < old_nc || ni < new_nc || added_i < g_added.size()) {
             // Determine next effective-old cell_id
@@ -2124,14 +2055,14 @@ int main(int argc, char* argv[]) {
                 std::vector<uint32_t> d_ids;
                 if (!is_added) {
                     uint32_t off; memcpy(&off, old_geo_m.data + oi * 20 + geo_off_pos, 4);
-                    d_ids = parse_ids_raw(old_entries.data, old_entries.size, off);
+                    d_ids = parse_ids(old_entries.data, old_entries.size, off);
                     remap_ids_vec(d_ids, id_rm);
                     oi++;
                 } else {
                     added_i++;
                 }
                 uint32_t n_off; memcpy(&n_off, new_geo_m.data + ni * 20 + geo_off_pos, 4);
-                auto n_ids = parse_ids_raw(new_entries.data, new_entries.size, n_off);
+                auto n_ids = parse_ids(new_entries.data, new_entries.size, n_off);
                 bool differs = (d_ids.size() != n_ids.size()) ||
                     (!d_ids.empty() && memcmp(d_ids.data(), n_ids.data(), d_ids.size() * 4) != 0);
                 if (differs) {
@@ -2145,7 +2076,7 @@ int main(int argc, char* argv[]) {
                 std::vector<uint32_t> d_ids;
                 if (!is_added) {
                     uint32_t off; memcpy(&off, old_geo_m.data + oi * 20 + geo_off_pos, 4);
-                    d_ids = parse_ids_raw(old_entries.data, old_entries.size, off);
+                    d_ids = parse_ids(old_entries.data, old_entries.size, off);
                     remap_ids_vec(d_ids, id_rm);
                     oi++;
                 } else {
@@ -2158,7 +2089,7 @@ int main(int argc, char* argv[]) {
             } else {
                 // Cell only in new — emit new entries
                 uint32_t n_off; memcpy(&n_off, new_geo_m.data + ni * 20 + geo_off_pos, 4);
-                auto n_ids = parse_ids_raw(new_entries.data, new_entries.size, n_off);
+                auto n_ids = parse_ids(new_entries.data, new_entries.size, n_off);
                 if (!n_ids.empty()) {
                     wval(buf, &n_cid, 8); uint16_t c = n_ids.size(); wval(buf, &c, 2);
                     buf.insert(buf.end(), (const char*)n_ids.data(), (const char*)n_ids.data() + n_ids.size() * 4);
@@ -2202,21 +2133,13 @@ int main(int argc, char* argv[]) {
         auto admin_derived = rebuild_admin_from_remap(old_admc, old_adme, ad_rm_d, a_added, a_removed);
         auto new_admc = read_file(new_dir + "/admin_cells.bin");
         auto new_adme = read_file(new_dir + "/admin_entries.bin");
-        auto parse_ids_v = [](const std::vector<char>& data, uint32_t off) -> std::vector<uint32_t> {
-            if (off == 0xFFFFFFFF || off + 2 > data.size()) return {};
-            uint16_t count; memcpy(&count, data.data() + off, 2);
-            if (off + 2 + count * 4 > data.size()) return {};
-            std::vector<uint32_t> ids(count);
-            memcpy(ids.data(), data.data() + off + 2, count * 4);
-            return ids;
-        };
         auto parse_admin = [&](const std::vector<char>& cells, const std::vector<char>& entries)
             -> std::unordered_map<uint64_t, std::vector<uint32_t>> {
             std::unordered_map<uint64_t, std::vector<uint32_t>> m;
             for (size_t i = 0; i < cells.size() / 12; i++) {
                 uint64_t cid; memcpy(&cid, cells.data()+i*12, 8);
                 uint32_t off; memcpy(&off, cells.data()+i*12+8, 4);
-                m[cid] = parse_ids_v(entries, off);
+                m[cid] = parse_ids(entries.data(), entries.size(), off);
             }
             return m;
         };
@@ -2244,21 +2167,13 @@ int main(int argc, char* argv[]) {
         auto poi_derived = rebuild_poi_from_remap(old_poic, old_poie, poi_rm_d, p_added, p_removed);
         auto new_poic = read_file(new_dir + "/poi_cells.bin");
         auto new_poie = read_file(new_dir + "/poi_entries.bin");
-        auto parse_ids_v = [](const std::vector<char>& data, uint32_t off) -> std::vector<uint32_t> {
-            if (off == 0xFFFFFFFF || off + 2 > data.size()) return {};
-            uint16_t count; memcpy(&count, data.data() + off, 2);
-            if (off + 2 + count * 4 > data.size()) return {};
-            std::vector<uint32_t> ids(count);
-            memcpy(ids.data(), data.data() + off + 2, count * 4);
-            return ids;
-        };
         auto parse_poi = [&](const std::vector<char>& cells, const std::vector<char>& entries)
             -> std::unordered_map<uint64_t, std::vector<uint32_t>> {
             std::unordered_map<uint64_t, std::vector<uint32_t>> m;
             for (size_t i = 0; i < cells.size() / 12; i++) {
                 uint64_t cid; memcpy(&cid, cells.data()+i*12, 8);
                 uint32_t off; memcpy(&off, cells.data()+i*12+8, 4);
-                m[cid] = parse_ids_v(entries, off);
+                m[cid] = parse_ids(entries.data(), entries.size(), off);
             }
             return m;
         };
@@ -2286,21 +2201,13 @@ int main(int argc, char* argv[]) {
         auto place_derived = rebuild_place_from_remap(old_plc, old_ple, place_rm_d, pl_added, pl_removed);
         auto new_plc = read_file(new_dir + "/place_cells.bin");
         auto new_ple = read_file(new_dir + "/place_entries.bin");
-        auto parse_ids_v = [](const std::vector<char>& data, uint32_t off) -> std::vector<uint32_t> {
-            if (off == 0xFFFFFFFF || off + 2 > data.size()) return {};
-            uint16_t count; memcpy(&count, data.data() + off, 2);
-            if (off + 2 + count * 4 > data.size()) return {};
-            std::vector<uint32_t> ids(count);
-            memcpy(ids.data(), data.data() + off + 2, count * 4);
-            return ids;
-        };
         auto parse_place = [&](const std::vector<char>& cells, const std::vector<char>& entries)
             -> std::unordered_map<uint64_t, std::vector<uint32_t>> {
             std::unordered_map<uint64_t, std::vector<uint32_t>> m;
             for (size_t i = 0; i < cells.size() / 12; i++) {
                 uint64_t cid; memcpy(&cid, cells.data()+i*12, 8);
                 uint32_t off; memcpy(&off, cells.data()+i*12+8, 4);
-                m[cid] = parse_ids_v(entries, off);
+                m[cid] = parse_ids(entries.data(), entries.size(), off);
             }
             return m;
         };
@@ -2330,7 +2237,7 @@ int main(int argc, char* argv[]) {
             uint64_t cid; memcpy(&cid, old_geo_m.data+i*20, 8);
             uint32_t s, a, ip; memcpy(&s, old_geo_m.data+i*20+8, 4);
             memcpy(&a, old_geo_m.data+i*20+12, 4); memcpy(&ip, old_geo_m.data+i*20+16, 4);
-            old_cell_flags[cid] = (s != 0xFFFFFFFF ? 1 : 0) | (a != 0xFFFFFFFF ? 2 : 0) | (ip != 0xFFFFFFFF ? 4 : 0);
+            old_cell_flags[cid] = (s != NO_DATA ? 1 : 0) | (a != NO_DATA ? 2 : 0) | (ip != NO_DATA ? 4 : 0);
         }
         std::vector<std::pair<uint64_t, uint8_t>> flag_corrections;
         size_t ngc = new_geo_m.size / 20;
@@ -2338,7 +2245,7 @@ int main(int argc, char* argv[]) {
             uint64_t cid; memcpy(&cid, new_geo_m.data+i*20, 8);
             uint32_t s, a, ip; memcpy(&s, new_geo_m.data+i*20+8, 4);
             memcpy(&a, new_geo_m.data+i*20+12, 4); memcpy(&ip, new_geo_m.data+i*20+16, 4);
-            uint8_t nf = (s != 0xFFFFFFFF ? 1 : 0) | (a != 0xFFFFFFFF ? 2 : 0) | (ip != 0xFFFFFFFF ? 4 : 0);
+            uint8_t nf = (s != NO_DATA ? 1 : 0) | (a != NO_DATA ? 2 : 0) | (ip != NO_DATA ? 4 : 0);
             auto it = old_cell_flags.find(cid);
             if (nf != (it != old_cell_flags.end() ? it->second : 0))
                 flag_corrections.push_back({cid, nf});
@@ -2466,7 +2373,6 @@ int main(int argc, char* argv[]) {
 
         size_t old_n = (old_m.data ? old_m.size : 0) / value_stride;
         size_t new_n = (new_m.data ? new_m.size : 0) / value_stride;
-        constexpr uint32_t NO_DATA_VAL = 0xFFFFFFFFu;
 
         std::vector<char> delta_buf;
         delta_buf.reserve(std::min(new_n * (size_t)(4 + value_stride),
@@ -2514,7 +2420,7 @@ int main(int argc, char* argv[]) {
                 if (!d) {
                     uint32_t old_pid; memcpy(&old_pid, op + 8, 4);
                     uint32_t new_pid; memcpy(&new_pid, np + 8, 4);
-                    if (old_pid != NO_DATA_VAL) {
+                    if (old_pid != NO_DATA) {
                         auto it = str_remap.find(old_pid);
                         if (it != str_remap.end()) old_pid = it->second;
                     }
@@ -2532,10 +2438,10 @@ int main(int argc, char* argv[]) {
                 } else {
                     uint32_t old_val; memcpy(&old_val, old_m.data + pos * 4, 4);
                     uint32_t remapped = old_val;
-                    if (old_val != NO_DATA_VAL) {
+                    if (old_val != NO_DATA) {
                         if (remap_kind == 1 && old_val < res_admin_p.id_remap.size()) {
                             uint32_t r = res_admin_p.id_remap[old_val];
-                            if (r != NO_DATA_VAL) remapped = r;
+                            if (r != NO_DATA) remapped = r;
                         } else if (remap_kind == 2) {
                             auto it = str_remap.find(old_val);
                             if (it != str_remap.end()) remapped = it->second;
@@ -2610,7 +2516,7 @@ int main(int argc, char* argv[]) {
     { std::unordered_map<uint32_t,uint32_t>().swap(str_remap); }
 
     // End marker
-    uint32_t end_marker = 0xFFFFFFFF;
+    uint32_t end_marker = SECTION_END_MARKER;
     wval(patch, &end_marker, 4);
 
     std::cerr << "\nUncompressed patch: " << patch.size() << " bytes ("
@@ -2623,7 +2529,15 @@ int main(int argc, char* argv[]) {
         std::string raw_path = tmpdir + "/patch.raw";
         write_file(raw_path, patch);
         std::string cmd = "zstd -19 -T0 '" + raw_path + "' -o '" + patch_path + "' -f --quiet 2>/dev/null";
-        system(cmd.c_str());
+        int rc = system(cmd.c_str());
+        if (rc == -1 || !WIFEXITED(rc) || WEXITSTATUS(rc) != 0) {
+            std::cerr << "ERROR: zstd compression failed (system rc=" << rc << ")" << std::endl;
+            remove(raw_path.c_str());
+            std::string rm_fail = "rm -rf '" + tmpdir + "'";
+            if (system(rm_fail.c_str()) != 0)
+                std::cerr << "WARNING: failed to clean up temp dir " << tmpdir << std::endl;
+            return 1;
+        }
         struct stat cst; stat(patch_path.c_str(), &cst);
         std::cerr << "Compressed patch: " << cst.st_size << " bytes ("
                   << cst.st_size / 1024 / 1024 << " MiB)" << std::endl;
@@ -2632,6 +2546,7 @@ int main(int argc, char* argv[]) {
     }
 
     std::string rm_cmd = "rm -rf '" + tmpdir + "'";
-    system(rm_cmd.c_str());
+    if (system(rm_cmd.c_str()) != 0)
+        std::cerr << "WARNING: failed to clean up temp dir " << tmpdir << std::endl;
     return 0;
 }

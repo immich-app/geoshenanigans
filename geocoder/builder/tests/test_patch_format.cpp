@@ -190,7 +190,10 @@ TEST(patch_format_section_marker_values) {
 // --- Format identity / enum constants ---
 
 TEST(patch_format_magic_and_version) {
-    CHECK_EQ(GCPATCH_VERSION, uint32_t(1));
+    // GCPATCH_VERSION is now bound to the value actually emitted/checked by the
+    // diff/patch tools (2). It was previously a dead constant left at 1 while
+    // both tools hardcoded the literal 2.
+    CHECK_EQ(GCPATCH_VERSION, uint32_t(2));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
     for (int i = 0; i < 8; i++) CHECK_EQ(GCPATCH_MAGIC[i], expect[i]);
 }
