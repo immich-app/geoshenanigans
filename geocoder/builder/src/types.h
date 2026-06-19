@@ -10,6 +10,7 @@ struct WayHeader {
     uint8_t node_count;
     uint32_t name_id;
 };
+static_assert(sizeof(WayHeader) == 12, "WayHeader must be 12 bytes");
 
 struct AddrPoint {
     float lat;
@@ -20,6 +21,7 @@ struct AddrPoint {
     uint32_t vertex_offset;   // into addr_vertices.bin (NO_DATA for node-sourced points)
     uint32_t vertex_count;    // 0 for nodes, >0 for building polygons
 };
+static_assert(sizeof(AddrPoint) == 28, "AddrPoint must be 28 bytes");
 
 // Postcode centroid: one per unique postcode string, stored in
 // postcode_centroids.bin. Matches Nominatim's location_postcode table.
@@ -30,6 +32,7 @@ struct PostcodeCentroid {
     uint16_t country_code;
     uint16_t _pad = 0;
 };
+static_assert(sizeof(PostcodeCentroid) == 16, "PostcodeCentroid must be 16 bytes");
 
 struct InterpWay {
     uint32_t node_offset;
@@ -41,6 +44,7 @@ struct InterpWay {
     uint8_t interpolation;
     uint8_t _pad4 = 0, _pad5 = 0, _pad6 = 0; // explicit padding
 };
+static_assert(sizeof(InterpWay) == 24, "InterpWay must be 24 bytes");
 
 // Place type override for admin polygons, derived from either a place/
 // linked_place tag on the boundary itself, or the place type of a
@@ -231,9 +235,10 @@ struct PlaceNode {
     // time: a quarter/neighbourhood candidate is only returned if the
     // query point is inside the polygon referenced here. Mirrors
     // Nominatim's insert_addresslines containment check at indexing.
-    // 0xFFFFFFFF means "unknown / no containing admin polygon".
-    uint32_t parent_poly_id = 0xFFFFFFFF;
+    // NO_DATA means "unknown / no containing admin polygon".
+    uint32_t parent_poly_id = NO_DATA;
 };  // 20 bytes
+static_assert(sizeof(PlaceNode) == 20, "PlaceNode must be 20 bytes");
 
 // --- POI (Points of Interest) ---
 
@@ -905,26 +910,26 @@ struct PoiRecord {
     // computed at build time. Used by the server's query_geo to
     // populate the `road` field when the POI wins primary-feature
     // selection. Mirrors Nominatim's parent_place_id chain from a
-    // rank-30 POI back to its rank-26 road. NO_DATA (0xFFFFFFFF)
+    // rank-30 POI back to its rank-26 road. NO_DATA
     // if no named street was found in the POI's search radius.
-    uint32_t parent_street_id = 0xFFFFFFFF;
+    uint32_t parent_street_id = NO_DATA;
     // String offset of the POI's calculated postcode, inherited
     // from the smallest containing boundary=postal_code polygon
     // at build time. Mirrors Nominatim's placex.postcode chain
     // for rank-30 POI rows whose postcode comes via their
     // parent_place_id. Used by the server's resolve_postcode as
     // a primary-feature tier when the POI wins selection.
-    // NO_DATA (0xFFFFFFFF) if the POI isn't inside any postal
+    // NO_DATA if the POI isn't inside any postal
     // boundary.
-    uint32_t parent_postcode_id = 0xFFFFFFFF;
+    uint32_t parent_postcode_id = NO_DATA;
     // Polygon id of the smallest admin boundary (admin_level <= 10)
     // containing the POI. The server walks admin_parents from here
     // to get the POI's administrative chain — a cheap approximation
     // of Nominatim's parent_place_id walk. Used to demote POIs
     // whose chain doesn't match the query's admin chain (e.g. a
     // cross-border landmark that happens to be spatially nearest).
-    // NO_DATA (0xFFFFFFFF) if no containing admin polygon found.
-    uint32_t parent_poly_id = 0xFFFFFFFF;
+    // NO_DATA if no containing admin polygon found.
+    uint32_t parent_poly_id = NO_DATA;
     // For polygon POIs (vertex_count > 0), vertex_offset is a BYTE
     // offset into poi_vertices.bin pointing to a 10-byte polygon
     // header (encoding tag + bbox_min_lat/lng) followed by the

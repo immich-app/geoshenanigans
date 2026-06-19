@@ -71,6 +71,10 @@ namespace RelationTag {
     constexpr int TYPES = 10;
 }
 
+// Coordinate scale: OSM PBF stores lat/lon in nanodegree units.
+// Value is exactly 1e-9 == 0.000000001 (same nearest double).
+static constexpr double NANO_DEG = 1e-9;
+
 // --- File I/O helpers ---
 
 static std::string read_bytes(int fd, size_t offset, size_t count) {
@@ -177,13 +181,18 @@ static void read_and_decompress_blob_into(int fd, const BlobInfo& info,
         out.resize(raw_size);
         thread_local z_stream strm{};
         thread_local bool strm_init = false;
-        if (!strm_init) { inflateInit(&strm); strm_init = true; }
-        else inflateReset(&strm);
+        if (!strm_init) {
+            if (inflateInit(&strm) != Z_OK) throw std::runtime_error("inflateInit failed");
+            strm_init = true;
+        } else {
+            if (inflateReset(&strm) != Z_OK) throw std::runtime_error("inflateReset failed");
+        }
         strm.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(zlib_view.data()));
         strm.avail_in = zlib_view.size();
         strm.next_out = reinterpret_cast<Bytef*>(out.data());
         strm.avail_out = out.size();
-        inflate(&strm, Z_FINISH);
+        int ret = inflate(&strm, Z_FINISH);
+        if (ret != Z_STREAM_END) throw std::runtime_error("zlib inflate failed: " + std::to_string(ret));
         out.resize(strm.total_out);
         return;
     }
@@ -245,54 +254,6 @@ std::string read_and_decompress_blob(int fd, const BlobInfo& info) {
     }
 
     throw std::runtime_error("blob has neither raw nor zlib data");
-}
-
-// Decompress from mmap'd file into reusable buffer (no allocation after warmup)
-static void decompress_blob_from_mmap(const char* file_data, const BlobInfo& info,
-                                       std::string& out) {
-    const char* blob_ptr = file_data + info.offset + 4 + info.header_size;
-    size_t blob_size = info.data_size;
-
-    protozero::pbf_reader blob_pbf(blob_ptr, blob_size);
-    protozero::data_view raw_view{}, zlib_view{};
-    int32_t raw_size = 0;
-
-    while (blob_pbf.next()) {
-        switch (blob_pbf.tag()) {
-            case BlobTag::RAW: raw_view = blob_pbf.get_view(); break;
-            case BlobTag::RAW_SIZE: raw_size = blob_pbf.get_int32(); break;
-            case BlobTag::ZLIB: zlib_view = blob_pbf.get_view(); break;
-            default: blob_pbf.skip();
-        }
-    }
-
-    if (raw_view.size() > 0) {
-        out.assign(raw_view.data(), raw_view.size());
-        return;
-    }
-
-    if (zlib_view.size() > 0) {
-        out.resize(raw_size);
-        // Reuse thread-local z_stream to avoid inflateInit/End overhead per block
-        thread_local z_stream strm{};
-        thread_local bool strm_init = false;
-        if (!strm_init) {
-            if (inflateInit(&strm) != Z_OK) throw std::runtime_error("inflateInit failed");
-            strm_init = true;
-        } else {
-            inflateReset(&strm);
-        }
-        strm.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(zlib_view.data()));
-        strm.avail_in = zlib_view.size();
-        strm.next_out = reinterpret_cast<Bytef*>(out.data());
-        strm.avail_out = out.size();
-        int ret = inflate(&strm, Z_FINISH);
-        if (ret != Z_STREAM_END) throw std::runtime_error("zlib inflate failed");
-        out.resize(strm.total_out);
-        return;
-    }
-
-    throw std::runtime_error("blob has no data");
 }
 
 // --- PrimitiveBlock decoding ---
@@ -382,8 +343,8 @@ PbfBlock decode_pbf_blob(const char* data, size_t size) {
 
                         PbfNode node;
                         node.id = id;
-                        node.lat = 0.000000001 * (lat_offset + (int64_t)granularity * lat);
-                        node.lng = 0.000000001 * (lon_offset + (int64_t)granularity * lon);
+                        node.lat = NANO_DEG * (lat_offset + (int64_t)granularity * lat);
+                        node.lng = NANO_DEG * (lon_offset + (int64_t)granularity * lon);
 
                         // Only allocate tags if this node has any
                         if (kv_pos < kv_vec.size() && kv_vec[kv_pos] != 0) {
@@ -597,8 +558,8 @@ void decode_nodes_streaming(const char* data, size_t size, const NodeCallback& c
                                 }
                             }
 
-                            double dlat = 0.000000001 * (lat_offset + (int64_t)granularity * lat);
-                            double dlng = 0.000000001 * (lon_offset + (int64_t)granularity * lon);
+                            double dlat = NANO_DEG * (lat_offset + (int64_t)granularity * lat);
+                            double dlng = NANO_DEG * (lon_offset + (int64_t)granularity * lon);
                             callback(id, dlat, dlng,
                                      tag_keys.data(), tag_vals.data(), tag_keys.size(),
                                      string_table);
@@ -758,8 +719,8 @@ void decode_pbf_blob_into(const char* data, size_t size, PbfBlock& block) {
 
                         PbfNode node;
                         node.id = id;
-                        node.lat = 0.000000001 * (lat_offset + (int64_t)granularity * lat);
-                        node.lng = 0.000000001 * (lon_offset + (int64_t)granularity * lon);
+                        node.lat = NANO_DEG * (lat_offset + (int64_t)granularity * lat);
+                        node.lng = NANO_DEG * (lon_offset + (int64_t)granularity * lon);
 
                         // Parse tags (kv pairs terminated by 0)
                         if (kv_ptr < kv_end) {
@@ -875,13 +836,14 @@ void read_pbf_parallel(const std::string& filename,
     // Parallel decode
     std::atomic<size_t> next_block{0};
     std::mutex callback_mutex;
+    std::atomic<bool> open_failed{false};
     std::vector<std::thread> threads;
 
     for (unsigned t = 0; t < num_threads; t++) {
         threads.emplace_back([&]() {
             // Each thread opens its own fd for independent pread
             int local_fd = open(filename.c_str(), O_RDONLY);
-            if (local_fd < 0) return;
+            if (local_fd < 0) { open_failed.store(true); return; }
 
             while (true) {
                 size_t idx = next_block.fetch_add(1);
@@ -907,6 +869,7 @@ void read_pbf_parallel(const std::string& filename,
 
     for (auto& t : threads) t.join();
     close(fd);
+    if (open_failed.load()) throw std::runtime_error("cannot open " + filename + " in worker thread");
 }
 
 // --- PbfFile implementation ---
@@ -974,6 +937,7 @@ void PbfFile::read_nodes_streaming(const NodeCallback& callback) {
 
     std::atomic<size_t> next_idx{0};
     std::atomic<size_t> blocks_done{0};
+    std::atomic<bool> open_failed{false};
     std::vector<std::thread> threads;
 
     struct ThreadStats { double read_us = 0, decode_us = 0; size_t count = 0; };
@@ -982,7 +946,7 @@ void PbfFile::read_nodes_streaming(const NodeCallback& callback) {
     for (unsigned t = 0; t < num_threads_; t++) {
         threads.emplace_back([&, t]() {
             int local_fd = open(filename_.c_str(), O_RDONLY);
-            if (local_fd < 0) return;
+            if (local_fd < 0) { open_failed.store(true); return; }
             std::string decomp, blob_buf;
             auto& st = stats[t];
             while (true) {
@@ -1008,6 +972,7 @@ void PbfFile::read_nodes_streaming(const NodeCallback& callback) {
         });
     }
     for (auto& t : threads) t.join();
+    if (open_failed.load()) throw std::runtime_error("cannot open " + filename_ + " in worker thread");
 
     double total_read = 0, total_decode = 0; size_t total_blocks = 0;
     for (auto& s : stats) { total_read += s.read_us; total_decode += s.decode_us; total_blocks += s.count; }
@@ -1036,6 +1001,7 @@ void PbfFile::read_ways_streaming(const WayCallback& callback) {
 
     std::atomic<size_t> next_idx{0};
     std::atomic<size_t> blocks_done{0};
+    std::atomic<bool> open_failed{false};
     std::vector<std::thread> threads;
 
     struct ThreadStats { double read_us = 0, decode_us = 0; size_t count = 0; };
@@ -1044,7 +1010,7 @@ void PbfFile::read_ways_streaming(const WayCallback& callback) {
     for (unsigned t = 0; t < num_threads_; t++) {
         threads.emplace_back([&, t]() {
             int local_fd = open(filename_.c_str(), O_RDONLY);
-            if (local_fd < 0) return;
+            if (local_fd < 0) { open_failed.store(true); return; }
             std::string decomp, blob_buf;
             auto& st = stats[t];
             while (true) {
@@ -1070,6 +1036,7 @@ void PbfFile::read_ways_streaming(const WayCallback& callback) {
         });
     }
     for (auto& t : threads) t.join();
+    if (open_failed.load()) throw std::runtime_error("cannot open " + filename_ + " in worker thread");
 
     double total_read = 0, total_decode = 0; size_t total_blocks = 0;
     for (auto& s : stats) { total_read += s.read_us; total_decode += s.decode_us; total_blocks += s.count; }
@@ -1189,12 +1156,13 @@ void PbfFile::read_blocks(std::function<void(PbfBlock&, unsigned thread_idx)> ca
         for (auto& r : ring_ready) r.store(false);
 
         std::atomic<size_t> next_decompress{0};
+        std::atomic<bool> open_failed{false};
         std::vector<std::thread> decomp_threads;
 
         for (unsigned t = 0; t < num_threads_; t++) {
             decomp_threads.emplace_back([&]() {
                 int local_fd = open(filename_.c_str(), O_RDONLY);
-                if (local_fd < 0) return;
+                if (local_fd < 0) { open_failed.store(true); return; }
                 while (true) {
                     size_t j = next_decompress.fetch_add(1);
                     if (j >= indices.size()) break;
@@ -1235,6 +1203,7 @@ void PbfFile::read_blocks(std::function<void(PbfBlock&, unsigned thread_idx)> ca
         }
 
         for (auto& t : decomp_threads) t.join();
+        if (open_failed.load()) throw std::runtime_error("cannot open " + filename_ + " in worker thread");
         return;
     }
 
@@ -1243,6 +1212,7 @@ void PbfFile::read_blocks(std::function<void(PbfBlock&, unsigned thread_idx)> ca
 
     std::atomic<size_t> next_idx{0};
     std::atomic<size_t> blocks_done{0};
+    std::atomic<bool> open_failed{false};
     std::vector<std::thread> threads;
 
     // Per-thread timing accumulators
@@ -1255,7 +1225,7 @@ void PbfFile::read_blocks(std::function<void(PbfBlock&, unsigned thread_idx)> ca
     for (unsigned t = 0; t < num_threads_; t++) {
         threads.emplace_back([&, t]() {
             int local_fd = open(filename_.c_str(), O_RDONLY);
-            if (local_fd < 0) return;
+            if (local_fd < 0) { open_failed.store(true); return; }
             PbfBlock block;
             std::string decomp, blob_buf;
             auto& st = stats[t];
@@ -1294,6 +1264,7 @@ void PbfFile::read_blocks(std::function<void(PbfBlock&, unsigned thread_idx)> ca
     }
 
     for (auto& t : threads) t.join();
+    if (open_failed.load()) throw std::runtime_error("cannot open " + filename_ + " in worker thread");
 
     // Report timing breakdown
     double total_read = 0, total_decode = 0, total_callback = 0;
@@ -1311,10 +1282,4 @@ void PbfFile::read_blocks(std::function<void(PbfBlock&, unsigned thread_idx)> ca
               << "s decode=" << (total_decode/1e6/num_threads_)
               << "s callback=" << (total_callback/1e6/num_threads_) << "s)"
               << std::endl;
-
-    // Skip the duplicate join below
-    threads.clear();
-    return;
-
-    for (auto& t : threads) t.join();
 }

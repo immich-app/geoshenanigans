@@ -253,9 +253,9 @@ struct ParsedData {
     std::array<uint32_t, STR_TIER_COUNT + 1> strings_tier_bases{};
 
     // Look up a string by its global offset (post-partition).  Returns
-    // nullptr if the offset is NO_DATA / 0xFFFFFFFF or out of range.
+    // nullptr if the offset is NO_DATA or out of range.
     const char* get_string(uint32_t off) const {
-        if (off == NO_DATA || off == 0xFFFFFFFFu) return nullptr;
+        if (off == NO_DATA) return nullptr;
         for (size_t t = 0; t < STR_TIER_COUNT; t++) {
             if (off < strings_tier_bases[t + 1]) {
                 uint32_t local = off - strings_tier_bases[t];
@@ -293,7 +293,7 @@ inline void partition_strings_into_tiers(ParsedData& data) {
     std::unordered_map<uint32_t, uint8_t> tier_mask;
     tier_mask.reserve(strings.size());
     auto mark = [&](uint32_t off, uint8_t bit) {
-        if (off == NO_DATA || off == 0xFFFFFFFFu) return;
+        if (off == NO_DATA) return;
         tier_mask[off] |= bit;
     };
 
@@ -368,10 +368,10 @@ inline void partition_strings_into_tiers(ParsedData& data) {
 
     const auto& rm = remap;
     auto remap_one = [&](uint32_t& off) {
-        if (off == NO_DATA || off == 0xFFFFFFFFu) return;
+        if (off == NO_DATA) return;
         auto it = rm.find(off);
         if (it != rm.end()) off = it->second;
-        else off = 0xFFFFFFFFu;
+        else off = NO_DATA;
     };
     for (auto& w : data.ways) remap_one(w.name_id);
     data.way_orig_name_ids = {};

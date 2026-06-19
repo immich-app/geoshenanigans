@@ -234,23 +234,6 @@ inline double meters_to_degrees(double meters, double latitude_deg) {
     return meters / (111320.0 * cos_lat);
 }
 
-// Per-level epsilon defaults in meters. Index 0-1 unused, 2=country ... 8=city.
-// Can be overridden at runtime via kAdminEpsilonMeters and kEpsilonScale.
-inline double kDefaultEpsilon[] = {
-    15.0,   // 0 (unused)
-    15.0,   // 1 (unused)
-    500.0,  // 2 country
-    200.0,  // 3 large region
-    100.0,  // 4 state/province
-    50.0,   // 5 district
-    30.0,   // 6 county
-    20.0,   // 7 municipality
-    15.0,   // 8 city/town
-    15.0,   // 9
-    15.0,   // 10
-    15.0,   // 11 postal
-};
-
 // Runtime-configurable epsilon table and scale factor.
 // Set by main() from CLI args. Scale multiplies all values uniformly.
 inline double kAdminEpsilonMeters[12] = {

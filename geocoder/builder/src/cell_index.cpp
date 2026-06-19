@@ -7,6 +7,7 @@
 #include <future>
 #include <iostream>
 #include <numeric>
+#include <stdexcept>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -36,6 +37,38 @@ static inline void write_strings_layout(const std::string& dir, const ParsedData
         f << "\n";
     }
     f << "  ]\n}\n";
+}
+
+// Strategy-2 reference-site remap helpers. These were previously
+// redefined as identical local lambdas in every apply_strategy2_*
+// function; hoisted here verbatim so all call sites share one
+// definition. `remap` maps old record index → new (post-reorder) index.
+//
+// remap_index: plain index field. Leaves NO_DATA and any value past the
+// remap table untouched (same out-of-range guard the lambdas used).
+static inline void remap_index(uint32_t& v, const std::vector<uint32_t>& remap) {
+    if (v != NO_DATA && v < remap.size()) v = remap[v];
+}
+
+// remap_index_flagged: index field that may carry the high-bit
+// INTERIOR_FLAG (cell-to-record entries set during the S2-covering
+// pass). Mask the flag off, remap the index, then re-OR the flag —
+// mirroring the deterministic-sort pass's handling of the same arrays.
+static inline void remap_index_flagged(uint32_t& v, const std::vector<uint32_t>& remap) {
+    uint32_t flag = v & INTERIOR_FLAG;
+    uint32_t idx  = v & ~INTERIOR_FLAG;
+    if (idx != (NO_DATA & ~INTERIOR_FLAG) && idx < remap.size())
+        v = remap[idx] | flag;
+}
+
+// Checked binary write: emits `buf` to `path` and throws on any stream
+// failure. The success path writes exactly the same bytes std::ofstream
+// would have; this only adds a failure-path check so a truncated/failed
+// write surfaces as an error instead of a silently-corrupt index.
+static inline void write_binary_file(const std::string& path, const char* data, size_t size) {
+    std::ofstream f(path, std::ios::binary);
+    f.write(data, size);
+    if (!f) throw std::runtime_error("failed to write " + path);
 }
 
 std::vector<uint32_t> write_entries(
@@ -71,8 +104,7 @@ std::vector<uint32_t> write_entries(
         current += sizeof(uint16_t) + ids.size() * sizeof(uint32_t);
         ri++;
     }
-    std::ofstream f(path, std::ios::binary);
-    f.write(buf.data(), buf.size());
+    write_binary_file(path, buf.data(), buf.size());
     return offsets;
 }
 
@@ -83,7 +115,8 @@ std::vector<uint32_t> write_entries_from_sorted(
 ) {
     std::vector<uint32_t> offsets(sorted_cells.size(), NO_DATA);
     if (sorted_pairs.empty()) {
-        std::ofstream f(path, std::ios::binary);
+        // Still create (truncate) the file, just empty.
+        write_binary_file(path, nullptr, 0);
         return offsets;
     }
 
@@ -150,8 +183,7 @@ std::vector<uint32_t> write_entries_from_sorted(
     buf.reserve(global_offset);
     for (auto& chunk : chunks) buf.insert(buf.end(), chunk.buf.begin(), chunk.buf.end());
 
-    std::ofstream f(path, std::ios::binary);
-    f.write(buf.data(), buf.size());
+    write_binary_file(path, buf.data(), buf.size());
     return offsets;
 }
 
@@ -294,12 +326,9 @@ static void apply_strategy2_streets(ParsedData& data, const std::string& prev_di
     }
 
     // Apply remap to every reference site that points into ways[].
-    auto map_ref = [&](uint32_t& v) {
-        if (v != NO_DATA && v < remap.size()) v = remap[v];
-    };
-    for (auto& [cell, ids] : data.cell_to_ways) for (auto& id : ids) map_ref(id);
-    for (auto& p : data.sorted_way_cells) map_ref(p.item_id);
-    for (auto& ap : data.addr_points)     map_ref(ap.parent_way_id);
+    for (auto& [cell, ids] : data.cell_to_ways) for (auto& id : ids) remap_index(id, remap);
+    for (auto& p : data.sorted_way_cells) remap_index(p.item_id, remap);
+    for (auto& ap : data.addr_points)     remap_index(ap.parent_way_id, remap);
     // NOTE: PoiRecord::parent_street_id is NOT a way index — it holds the
     // string offset of the nearest street's name (w.name_id, set at
     // build_index.cpp's POI parent-street linking). String offsets are
@@ -402,29 +431,19 @@ static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir
     if (!new_parents.empty()) data.admin_parent_ids = std::move(new_parents);
 
     // Apply remap to every reference site that points into admin_polygons[].
-    auto map_ref = [&](uint32_t& v) {
-        if (v != NO_DATA && v < remap.size()) v = remap[v];
-    };
     // cell_to_admin entries carry the high-bit INTERIOR_FLAG (set during
     // the admin S2-covering pass for cells fully inside a polygon). A
-    // flagged value is ≥ 2^31, so the plain map_ref's `v < remap.size()`
-    // guard would skip it and leave a stale polygon index after reorder.
-    // Mask the flag off, remap the index, then re-OR the flag — mirroring
-    // the deterministic-sort pass's handling of the same array.
-    auto map_ref_flagged = [&](uint32_t& v) {
-        uint32_t flag = v & INTERIOR_FLAG;
-        uint32_t idx  = v & ~INTERIOR_FLAG;
-        if (idx != (NO_DATA & ~INTERIOR_FLAG) && idx < remap.size())
-            v = remap[idx] | flag;
-    };
-    for (auto& [cell, ids] : data.cell_to_admin) for (auto& id : ids) map_ref_flagged(id);
+    // flagged value is ≥ 2^31, so the plain remap_index's `v < remap.size()`
+    // guard would skip it and leave a stale polygon index after reorder, so
+    // use remap_index_flagged which masks the flag, remaps, then re-ORs.
+    for (auto& [cell, ids] : data.cell_to_admin) for (auto& id : ids) remap_index_flagged(id, remap);
     // admin_parent_ids and way_parent_ids hold admin polygon IDs (parent chain).
     // admin_parent_ids was reordered above; now value-remap each entry.
-    // These are plain indices (no INTERIOR_FLAG), so the plain map_ref is correct.
-    for (auto& v : data.admin_parent_ids) map_ref(v);
-    for (auto& v : data.way_parent_ids)   map_ref(v);
-    for (auto& pr : data.poi_records)     map_ref(pr.parent_poly_id);
-    for (auto& pn : data.place_nodes)     map_ref(pn.parent_poly_id);
+    // These are plain indices (no INTERIOR_FLAG), so plain remap_index is correct.
+    for (auto& v : data.admin_parent_ids) remap_index(v, remap);
+    for (auto& v : data.way_parent_ids)   remap_index(v, remap);
+    for (auto& pr : data.poi_records)     remap_index(pr.parent_poly_id, remap);
+    for (auto& pn : data.place_nodes)     remap_index(pn.parent_poly_id, remap);
 
     alloc.finalize();
     std::cerr << "  strategy2 admins: " << alloc.live_count() << " live, "
@@ -489,11 +508,8 @@ static void apply_strategy2_addrs(ParsedData& data, const std::string& prev_dir)
     data.addr_osm_ids = std::move(new_osm_ids);
     if (!new_postcodes.empty()) data.addr_postcode_ids = std::move(new_postcodes);
 
-    auto map_ref = [&](uint32_t& v) {
-        if (v != NO_DATA && v < remap.size()) v = remap[v];
-    };
-    for (auto& [cell, ids] : data.cell_to_addrs) for (auto& id : ids) map_ref(id);
-    for (auto& p : data.sorted_addr_cells) map_ref(p.item_id);
+    for (auto& [cell, ids] : data.cell_to_addrs) for (auto& id : ids) remap_index(id, remap);
+    for (auto& p : data.sorted_addr_cells) remap_index(p.item_id, remap);
 
     alloc.finalize();
     std::cerr << "  strategy2 addrs: " << alloc.live_count() << " live, "
@@ -552,10 +568,7 @@ static void apply_strategy2_places(ParsedData& data, const std::string& prev_dir
     data.place_nodes   = std::move(new_places);
     data.place_osm_ids = std::move(new_osm_ids);
 
-    auto map_ref = [&](uint32_t& v) {
-        if (v != NO_DATA && v < remap.size()) v = remap[v];
-    };
-    for (auto& p : data.sorted_place_cells) map_ref(p.item_id);
+    for (auto& p : data.sorted_place_cells) remap_index(p.item_id, remap);
 
     alloc.finalize();
     std::cerr << "  strategy2 places: " << alloc.live_count() << " live, "
@@ -619,16 +632,10 @@ static void apply_strategy2_pois(ParsedData& data, const std::string& prev_dir) 
     // cell_to_pois and sorted_poi_cells item_ids carry the high-bit
     // INTERIOR_FLAG (set during POI cell covering at build_index.cpp). A
     // flagged value is ≥ 2^31, so a plain `v < remap.size()` guard would
-    // skip it and leave a stale POI index after reorder. Mask, remap,
-    // re-OR — mirroring the deterministic-sort pass's handling.
-    auto map_ref_flagged = [&](uint32_t& v) {
-        uint32_t flag = v & INTERIOR_FLAG;
-        uint32_t idx  = v & ~INTERIOR_FLAG;
-        if (idx != (NO_DATA & ~INTERIOR_FLAG) && idx < remap.size())
-            v = remap[idx] | flag;
-    };
-    for (auto& [cell, ids] : data.cell_to_pois) for (auto& id : ids) map_ref_flagged(id);
-    for (auto& p : data.sorted_poi_cells) map_ref_flagged(p.item_id);
+    // skip it and leave a stale POI index after reorder. remap_index_flagged
+    // masks, remaps, re-ORs — mirroring the deterministic-sort pass.
+    for (auto& [cell, ids] : data.cell_to_pois) for (auto& id : ids) remap_index_flagged(id, remap);
+    for (auto& p : data.sorted_poi_cells) remap_index_flagged(p.item_id, remap);
 
     alloc.finalize();
     std::cerr << "  strategy2 pois: " << alloc.live_count() << " live, "
@@ -707,11 +714,8 @@ static void apply_strategy2_interps(ParsedData& data, const std::string& prev_di
         data.interp_nodes = std::move(new_nodes);
     }
 
-    auto map_ref = [&](uint32_t& v) {
-        if (v != NO_DATA && v < remap.size()) v = remap[v];
-    };
-    for (auto& [cell, ids] : data.cell_to_interps) for (auto& id : ids) map_ref(id);
-    for (auto& p : data.sorted_interp_cells) map_ref(p.item_id);
+    for (auto& [cell, ids] : data.cell_to_interps) for (auto& id : ids) remap_index(id, remap);
+    for (auto& p : data.sorted_interp_cells) remap_index(p.item_id, remap);
 
     alloc.finalize();
     std::cerr << "  strategy2 interps: " << alloc.live_count() << " live, "
@@ -755,6 +759,29 @@ void apply_strategy2_remaps(ParsedData& data, const std::string& prev_dir) {
     // strategy-2 runs. Stability there is handled by deterministic
     // sorting at write time + the existing postcode_id remap pipeline
     // in geocoder-diff; revisit once the other types are validated.
+}
+
+// Find the level-2 (country) admin polygon covering (lat, lng) and return
+// its country_code, or 0 if none is found. Resolves the point to its
+// kAdminCellLevel S2 cell, walks that cell's admin entries (masking off
+// the INTERIOR_FLAG high bit), and returns the first admin_level==2
+// polygon's non-zero country_code. Extracted verbatim from the two
+// identical lookups in the postcode-centroid write path (one keyed off an
+// addr_point's coords, one off a re-accumulated centroid's coords).
+static uint16_t country_code_at_cell(const ParsedData& data, double lat, double lng) {
+    S2CellId cell = S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(kAdminCellLevel);
+    auto it = data.cell_to_admin.find(cell.id());
+    if (it != data.cell_to_admin.end()) {
+        for (uint32_t raw_id : it->second) {
+            uint32_t pid = raw_id & 0x7FFFFFFF;
+            if (pid >= data.admin_polygons.size()) continue;
+            const auto& poly = data.admin_polygons[pid];
+            if (poly.admin_level == 2 && poly.country_code != 0) {
+                return poly.country_code;
+            }
+        }
+    }
+    return 0;
 }
 
 void write_index(const ParsedData& data, const std::string& output_dir, IndexMode mode) {
@@ -875,8 +902,7 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             }
             for (auto& t : fill_threads) t.join();
 
-            std::ofstream f(output_dir + "/geo_cells.bin", std::ios::binary);
-            f.write(buf.data(), buf.size());
+            write_binary_file(output_dir + "/geo_cells.bin", buf.data(), buf.size());
         }
 
         std::cerr << "geo index: " << sorted_geo_cells.size() << " cells ("
@@ -893,8 +919,9 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
     std::vector<std::future<void>> write_futures;
     if (write_streets) {
         write_futures.push_back(std::async(std::launch::async, [&] {
-            std::ofstream f(output_dir + "/street_ways.bin", std::ios::binary);
-            f.write(reinterpret_cast<const char*>(data.ways.data()), data.ways.size() * sizeof(WayHeader));
+            write_binary_file(output_dir + "/street_ways.bin",
+                              reinterpret_cast<const char*>(data.ways.data()),
+                              data.ways.size() * sizeof(WayHeader));
         }));
         // Strategy-2 sidecar (cached only — workflow excludes *.osm_ids
         // from user-facing upload). If apply_strategy2_remaps ran,
@@ -915,31 +942,32 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                                     data.way_sidecar_blob, packed_fallback);
         }));
         write_futures.push_back(std::async(std::launch::async, [&] {
-            std::ofstream f(output_dir + "/street_nodes.bin", std::ios::binary);
-            f.write(reinterpret_cast<const char*>(data.street_nodes.data()), data.street_nodes.size() * sizeof(NodeCoord));
+            write_binary_file(output_dir + "/street_nodes.bin",
+                              reinterpret_cast<const char*>(data.street_nodes.data()),
+                              data.street_nodes.size() * sizeof(NodeCoord));
         }));
         // Way parent chain (parallel array indexed by way_id)
         if (!data.way_parent_ids.empty()) {
             write_futures.push_back(std::async(std::launch::async, [&] {
-                std::ofstream f(output_dir + "/way_parents.bin", std::ios::binary);
-                f.write(reinterpret_cast<const char*>(data.way_parent_ids.data()),
-                        data.way_parent_ids.size() * sizeof(uint32_t));
+                write_binary_file(output_dir + "/way_parents.bin",
+                                  reinterpret_cast<const char*>(data.way_parent_ids.data()),
+                                  data.way_parent_ids.size() * sizeof(uint32_t));
             }));
         }
         // Admin parent chain (parallel array indexed by polygon_id)
         if (!data.admin_parent_ids.empty()) {
             write_futures.push_back(std::async(std::launch::async, [&] {
-                std::ofstream f(output_dir + "/admin_parents.bin", std::ios::binary);
-                f.write(reinterpret_cast<const char*>(data.admin_parent_ids.data()),
-                        data.admin_parent_ids.size() * sizeof(uint32_t));
+                write_binary_file(output_dir + "/admin_parents.bin",
+                                  reinterpret_cast<const char*>(data.admin_parent_ids.data()),
+                                  data.admin_parent_ids.size() * sizeof(uint32_t));
             }));
         }
         // Per-way postcode (parallel array indexed by way_id)
         if (!data.way_postcode_ids.empty()) {
             write_futures.push_back(std::async(std::launch::async, [&] {
-                std::ofstream f(output_dir + "/way_postcodes.bin", std::ios::binary);
-                f.write(reinterpret_cast<const char*>(data.way_postcode_ids.data()),
-                        data.way_postcode_ids.size() * sizeof(uint32_t));
+                write_binary_file(output_dir + "/way_postcodes.bin",
+                                  reinterpret_cast<const char*>(data.way_postcode_ids.data()),
+                                  data.way_postcode_ids.size() * sizeof(uint32_t));
             }));
         }
         if (write_addresses) {
@@ -1028,36 +1056,34 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                     }
                     packed_points.push_back(ap);
                 }
-                {
-                    std::ofstream f(output_dir + "/addr_points.bin", std::ios::binary);
-                    f.write(reinterpret_cast<const char*>(packed_points.data()),
-                            packed_points.size() * sizeof(AddrPoint));
-                }
-                {
-                    std::ofstream f(output_dir + "/addr_vertices.bin", std::ios::binary);
-                    f.write(reinterpret_cast<const char*>(packed_bytes.data()),
-                            packed_bytes.size());
-                }
+                write_binary_file(output_dir + "/addr_points.bin",
+                                  reinterpret_cast<const char*>(packed_points.data()),
+                                  packed_points.size() * sizeof(AddrPoint));
+                write_binary_file(output_dir + "/addr_vertices.bin",
+                                  reinterpret_cast<const char*>(packed_bytes.data()),
+                                  packed_bytes.size());
                 emit_strategy2_sidecar(output_dir + "/addr_points.osm_ids",
                                         data.addr_sidecar_blob, data.addr_osm_ids);
             }));
             // Per-addr postcode (optional separate file, parallel to addr_points)
             if (!data.addr_postcode_ids.empty()) {
                 write_futures.push_back(std::async(std::launch::async, [&] {
-                    std::ofstream f(output_dir + "/addr_postcodes.bin", std::ios::binary);
-                    f.write(reinterpret_cast<const char*>(data.addr_postcode_ids.data()),
-                            data.addr_postcode_ids.size() * sizeof(uint32_t));
+                    write_binary_file(output_dir + "/addr_postcodes.bin",
+                                      reinterpret_cast<const char*>(data.addr_postcode_ids.data()),
+                                      data.addr_postcode_ids.size() * sizeof(uint32_t));
                 }));
             }
             write_futures.push_back(std::async(std::launch::async, [&] {
-                std::ofstream f(output_dir + "/interp_ways.bin", std::ios::binary);
-                f.write(reinterpret_cast<const char*>(data.interp_ways.data()), data.interp_ways.size() * sizeof(InterpWay));
+                write_binary_file(output_dir + "/interp_ways.bin",
+                                  reinterpret_cast<const char*>(data.interp_ways.data()),
+                                  data.interp_ways.size() * sizeof(InterpWay));
                 emit_strategy2_sidecar(output_dir + "/interp_ways.osm_ids",
                                         data.interp_sidecar_blob, data.interp_osm_ids);
             }));
             write_futures.push_back(std::async(std::launch::async, [&] {
-                std::ofstream f(output_dir + "/interp_nodes.bin", std::ios::binary);
-                f.write(reinterpret_cast<const char*>(data.interp_nodes.data()), data.interp_nodes.size() * sizeof(NodeCoord));
+                write_binary_file(output_dir + "/interp_nodes.bin",
+                                  reinterpret_cast<const char*>(data.interp_nodes.data()),
+                                  data.interp_nodes.size() * sizeof(NodeCoord));
             }));
         }
     }
@@ -1070,8 +1096,8 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
     auto write_tier = [&](size_t tier_idx) {
         const auto& buf = data.strings_tiers[tier_idx];
         write_futures.push_back(std::async(std::launch::async, [&, tier_idx] {
-            std::ofstream f(output_dir + "/" + STR_TIER_FILENAMES[tier_idx], std::ios::binary);
-            f.write(buf.data(), buf.size());
+            write_binary_file(output_dir + "/" + STR_TIER_FILENAMES[tier_idx],
+                              buf.data(), buf.size());
         }));
     };
     write_tier(0);  // core — always
@@ -1124,20 +1150,7 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                 if (pc_id == NO_DATA) continue;
                 const auto& ap = data.addr_points[i];
                 // Look up country for this addr_point
-                S2CellId cell = S2CellId(S2LatLng::FromDegrees(ap.lat, ap.lng)).parent(kAdminCellLevel);
-                uint16_t cc = 0;
-                auto it = data.cell_to_admin.find(cell.id());
-                if (it != data.cell_to_admin.end()) {
-                    for (uint32_t raw_id : it->second) {
-                        uint32_t pid = raw_id & 0x7FFFFFFF;
-                        if (pid >= data.admin_polygons.size()) continue;
-                        const auto& poly = data.admin_polygons[pid];
-                        if (poly.admin_level == 2 && poly.country_code != 0) {
-                            cc = poly.country_code;
-                            break;
-                        }
-                    }
-                }
+                uint16_t cc = country_code_at_cell(data, ap.lat, ap.lng);
                 if (cc == 0) continue; // skip if no country found
                 auto& acc = country_accum[{cc, pc_id}];
                 acc.sum_lat += ap.lat;
@@ -1154,20 +1167,7 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                 float clat = static_cast<float>(acc.sum_lat / acc.count);
                 float clng = static_cast<float>(acc.sum_lng / acc.count);
                 // Look up country for this centroid
-                S2CellId pcell = S2CellId(S2LatLng::FromDegrees(clat, clng)).parent(kAdminCellLevel);
-                uint16_t cc = 0;
-                auto pit = data.cell_to_admin.find(pcell.id());
-                if (pit != data.cell_to_admin.end()) {
-                    for (uint32_t raw_id : pit->second) {
-                        uint32_t pid2 = raw_id & 0x7FFFFFFF;
-                        if (pid2 >= data.admin_polygons.size()) continue;
-                        const auto& poly = data.admin_polygons[pid2];
-                        if (poly.admin_level == 2 && poly.country_code != 0) {
-                            cc = poly.country_code;
-                            break;
-                        }
-                    }
-                }
+                uint16_t cc = country_code_at_cell(data, clat, clng);
                 if (cc == 0) continue;
                 auto key = CountryPcKey{cc, pc_id};
                 if (country_accum.count(key) > 0) continue; // OSM data takes priority
@@ -1305,11 +1305,9 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             // Write flat centroid array (post-strategy-2 layout — slots in
             // stable-idx order, with tombstones for indices whose previous
             // occupant was deleted this build).
-            {
-                std::ofstream f(output_dir + "/postcode_centroids.bin", std::ios::binary);
-                f.write(reinterpret_cast<const char*>(centroids.data()),
-                        centroids.size() * sizeof(PostcodeCentroid));
-            }
+            write_binary_file(output_dir + "/postcode_centroids.bin",
+                              reinterpret_cast<const char*>(centroids.data()),
+                              centroids.size() * sizeof(PostcodeCentroid));
 
             // Build S2 cell index for spatial lookup. Skip tombstones —
             // they have postcode_id = NO_DATA and bogus lat/lng (0,0)
@@ -1333,8 +1331,8 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             // per-tier write above, which covers this file too.
             {
                 const auto& buf = data.strings_tiers[3];
-                std::ofstream f(output_dir + "/" + STR_TIER_FILENAMES[3], std::ios::binary);
-                f.write(buf.data(), buf.size());
+                write_binary_file(output_dir + "/" + STR_TIER_FILENAMES[3],
+                                  buf.data(), buf.size());
             }
 
             std::cerr << "postcode centroids: " << centroids.size() << " entries, "
@@ -1527,14 +1525,12 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
               << " MiB packed vertices, " << postal_polys.size() << " postal polygons" << std::endl;
 
     // Write admin files (excluding postal)
-    {
-        std::ofstream f(output_dir + "/admin_polygons.bin", std::ios::binary);
-        f.write(reinterpret_cast<const char*>(new_polys.data()), new_polys.size() * sizeof(AdminPolygon));
-    }
-    {
-        std::ofstream f(output_dir + "/admin_vertices.bin", std::ios::binary);
-        f.write(reinterpret_cast<const char*>(new_verts_bytes.data()), new_verts_bytes.size());
-    }
+    write_binary_file(output_dir + "/admin_polygons.bin",
+                      reinterpret_cast<const char*>(new_polys.data()),
+                      new_polys.size() * sizeof(AdminPolygon));
+    write_binary_file(output_dir + "/admin_vertices.bin",
+                      reinterpret_cast<const char*>(new_verts_bytes.data()),
+                      new_verts_bytes.size());
     // Strategy-2 sidecar for admin polygons (cached only). Same content
     // across full/no-addresses/admin since they share the same polygon
     // set. data.admin_osm_ids is already packed (ObjectType<<56 |
@@ -1557,14 +1553,12 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
 
     // Write postal boundary files (optional, admin_level=11 only)
     if (!postal_polys.empty()) {
-        {
-            std::ofstream f(output_dir + "/postal_polygons.bin", std::ios::binary);
-            f.write(reinterpret_cast<const char*>(postal_polys.data()), postal_polys.size() * sizeof(AdminPolygon));
-        }
-        {
-            std::ofstream f(output_dir + "/postal_vertices.bin", std::ios::binary);
-            f.write(reinterpret_cast<const char*>(postal_verts_bytes.data()), postal_verts_bytes.size());
-        }
+        write_binary_file(output_dir + "/postal_polygons.bin",
+                          reinterpret_cast<const char*>(postal_polys.data()),
+                          postal_polys.size() * sizeof(AdminPolygon));
+        write_binary_file(output_dir + "/postal_vertices.bin",
+                          reinterpret_cast<const char*>(postal_verts_bytes.data()),
+                          postal_verts_bytes.size());
     }
 
     // Quality directories only contain the files that change.
@@ -1625,16 +1619,12 @@ void write_admin_minimal_polygons(const ParsedData& data,
         new_polys.push_back(np);
     }
 
-    {
-        std::ofstream f(output_dir + "/admin_polygons.bin", std::ios::binary);
-        f.write(reinterpret_cast<const char*>(new_polys.data()),
-                new_polys.size() * sizeof(AdminPolygon));
-    }
-    {
-        std::ofstream f(output_dir + "/admin_vertices.bin", std::ios::binary);
-        f.write(reinterpret_cast<const char*>(new_verts_bytes.data()),
-                new_verts_bytes.size());
-    }
+    write_binary_file(output_dir + "/admin_polygons.bin",
+                      reinterpret_cast<const char*>(new_polys.data()),
+                      new_polys.size() * sizeof(AdminPolygon));
+    write_binary_file(output_dir + "/admin_vertices.bin",
+                      reinterpret_cast<const char*>(new_verts_bytes.data()),
+                      new_verts_bytes.size());
 
     std::cerr << "  Admin-minimal polygons: " << new_polys.size()
               << " kept (of " << data.admin_polygons.size() << "), "
