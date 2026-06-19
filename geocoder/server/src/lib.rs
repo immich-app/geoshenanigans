@@ -617,8 +617,11 @@ pub fn poi_category_to_osm_class(cat: u8) -> Option<&'static str> {
         55..=59 | 67..=69 => Some("amenity"),
         // leisure (60-66, 70-72, 77-79)
         60..=66 | 70..=72 | 77..=79 => Some("leisure"),
-        // transport / commerce root (73 bus_stop, 75 fuel, 76 shop)
-        73 | 75 | 76 => Some("amenity"),
+        // transport / commerce root (73 bus_stop, 74 parking, 75 fuel, 76 shop).
+        // amenity=parking is a rank-30 named POI in Nominatim (like its
+        // bicycle/motorcycle-parking siblings 228/229), so it must map to a
+        // class to surface as a landmark — 74 was previously an unintended gap.
+        73 | 74 | 75 | 76 => Some("amenity"),
         // natural — skip large area-label values (bay=91, cape=92,
         // island=93). Everything else in 80..=99 is small enough.
         80..=90 | 94..=99 => Some("natural"),
@@ -638,6 +641,10 @@ pub fn poi_category_to_osm_class(cat: u8) -> Option<&'static str> {
         132..=136 => Some("natural"),
         // craft (winery, brewery) — also named landmarks
         140..=141 => Some("craft"),
+        // power=plant (150) is NOT a Nominatim main tag — it never becomes a
+        // placex row or a reverse landmark, so exclude it explicitly. This arm
+        // must precede the 142..=152 band that would otherwise catch it.
+        150 => None,
         // landuse (meadow, orchard, vineyard, farmland, allotments,
         // quarry, reservoir, recreation_ground, military, religious)
         142..=152 => Some("landuse"),
@@ -652,8 +659,8 @@ pub fn poi_category_to_osm_class(cat: u8) -> Option<&'static str> {
         235..=240 => Some("leisure"),
         // Shop sub-categories (241..=253)
         241..=253 => Some("shop"),
-        // Excluded: POWER_PLANT=150 (specialised, rarely a landmark).
         // UNNAMED_RANK30=170 never surfaces (by definition generic).
+        // (POWER_PLANT=150 is excluded explicitly above.)
         _ => None,
     }
 }
@@ -3804,7 +3811,10 @@ pub fn postcode_looks_valid(_country_code: &[u8; 2], postcode: &str) -> bool {
 pub fn centroid_postcode_ok(s: &str) -> bool {
     if s.len() > 10 { return false; }  // postcodes are short
     if s.contains(';') { return false; } // multiple values
-    if s.contains("PO") || s.contains("Box") { return false; }
+    // NOTE: no PO/Box substring filter — Nominatim has none. It wrongly dropped
+    // every legitimate UK Portsmouth-area postcode (PO1 1BA, etc.). The
+    // per-country pattern is enforced at build time (postcode_validation.h) and
+    // placeholders (all-zeros/dashes) by postcode_looks_valid.
     // Reject US zip+4 (5+4 digit format like "10001-2062")
     if s.len() == 10 && s.as_bytes().get(5) == Some(&b'-') {
         return false;
@@ -4336,12 +4346,11 @@ mod pure_helper_tests {
         assert!(!centroid_postcode_ok("12345678901"));
         // semicolon (multiple values) rejected.
         assert!(!centroid_postcode_ok("10001;10002"));
-        // "PO" / "Box" substrings rejected (case-sensitive).
-        assert!(!centroid_postcode_ok("PO 123"));
-        assert!(!centroid_postcode_ok("Box 5"));
-        // NOTE: the check is case-sensitive substring; "po box" passes since
-        // neither "PO" nor "Box" appears with this exact casing.
-        assert!(centroid_postcode_ok("po 1"));
+        // No PO/Box substring filter: legitimate UK Portsmouth-area postcodes
+        // (the "PO" postcode area) must NOT be dropped — Nominatim has no such
+        // filter. This was a real divergence (Portsmouth returned no postcode).
+        assert!(centroid_postcode_ok("PO1 1BA"));
+        assert!(centroid_postcode_ok("PO16 7GZ"));
         // US zip+4 (len 10, dash at index 5) rejected.
         assert!(!centroid_postcode_ok("10001-2062"));
         // A 9-char dashed value is NOT caught by the len==10 zip+4 rule.
@@ -4456,8 +4465,10 @@ mod pure_helper_tests {
         assert_eq!(poi_category_to_osm_class(70), Some("leisure"));
         assert_eq!(poi_category_to_osm_class(72), Some("leisure"));
         assert_eq!(poi_category_to_osm_class(73), Some("amenity"));
-        // NOTE: 74 is not covered by any arm -> None (gap between 73 and 75).
-        assert_eq!(poi_category_to_osm_class(74), None);
+        // 74 (PARKING) maps to amenity like its 73/75/76 neighbours and the
+        // bicycle/motorcycle-parking sibs (228/229); Nominatim surfaces
+        // amenity=parking as a rank-30 named POI.
+        assert_eq!(poi_category_to_osm_class(74), Some("amenity"));
         assert_eq!(poi_category_to_osm_class(75), Some("amenity"));
         assert_eq!(poi_category_to_osm_class(76), Some("amenity"));
         assert_eq!(poi_category_to_osm_class(77), Some("leisure"));
@@ -4484,9 +4495,10 @@ mod pure_helper_tests {
         assert_eq!(poi_category_to_osm_class(141), Some("craft"));
         assert_eq!(poi_category_to_osm_class(142), Some("landuse"));
         assert_eq!(poi_category_to_osm_class(152), Some("landuse"));
-        // NOTE: POWER_PLANT=150 falls in 142..=152 -> "landuse" (not excluded
-        // here despite the doc comment about exclusion).
-        assert_eq!(poi_category_to_osm_class(150), Some("landuse"));
+        // POWER_PLANT=150 is excluded (None): power is not a Nominatim main tag
+        // and never surfaces as a reverse landmark. The explicit `150 => None`
+        // arm precedes the 142..=152 landuse band.
+        assert_eq!(poi_category_to_osm_class(150), None);
         assert_eq!(poi_category_to_osm_class(160), Some("office"));
         // NOTE: UNNAMED_RANK30=170 -> None (generic filler).
         assert_eq!(poi_category_to_osm_class(170), None);
