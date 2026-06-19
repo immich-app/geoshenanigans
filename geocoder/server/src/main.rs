@@ -29,6 +29,27 @@ struct QueryParams {
     debug: Option<String>,
 }
 
+// Shared key-validation preamble for authenticated endpoints. Returns the
+// validated token tuple `(login, rps, rpd, by_ip)` on success, or the
+// appropriate error `Response` (401 "Missing API key" / 401 "Invalid API
+// key") on failure. Callers decide whether to use the returned rate-limit
+// fields: `/reverse` rate-limits with them; `/polygons` discards them,
+// preserving its existing validate-only (no rate-limit) behaviour.
+fn require_valid_key(
+    db: &RwLock<auth::Db>,
+    key: Option<&str>,
+) -> Result<(String, u32, u32, bool), Response> {
+    let key = match key {
+        Some(k) => k,
+        None => return Err((StatusCode::UNAUTHORIZED, "Missing API key").into_response()),
+    };
+
+    match db.read().unwrap().validate_token(key) {
+        Some(info) => Ok(info),
+        None => Err((StatusCode::UNAUTHORIZED, "Invalid API key").into_response()),
+    }
+}
+
 async fn reverse_geocode(
     Query(params): Query<QueryParams>,
     state: axum::extract::State<Arc<RwLock<auth::Db>>>,
@@ -37,14 +58,9 @@ async fn reverse_geocode(
     limiter: axum::extract::Extension<Arc<auth::RateLimiter>>,
     connect_info: axum::extract::ConnectInfo<std::net::SocketAddr>,
 ) -> Response {
-    let key = match params.key {
-        Some(k) => k,
-        None => return (StatusCode::UNAUTHORIZED, "Missing API key").into_response(),
-    };
-
-    let (login, rps, rpd, by_ip) = match state.read().unwrap().validate_token(&key) {
-        Some(info) => info,
-        None => return (StatusCode::UNAUTHORIZED, "Invalid API key").into_response(),
+    let (login, rps, rpd, by_ip) = match require_valid_key(&state, params.key.as_deref()) {
+        Ok(info) => info,
+        Err(resp) => return resp,
     };
 
     let rate_key = if by_ip {
@@ -88,9 +104,7 @@ async fn reverse_geocode(
             let primary_debug = idx.debug_primary(params.lat, params.lon);
             let places_debug = idx.debug_places(params.lat, params.lon);
             let combined = serde_json::json!({
-                "result": serde_json::from_str::<serde_json::Value>(
-                    &serde_json::to_string(&address).unwrap_or_default()
-                ).unwrap_or_default(),
+                "result": serde_json::to_value(&address).unwrap_or_default(),
                 "admin_polygons": admin_debug,
                 "primary_features": primary_debug,
                 "place_nodes": places_debug,
@@ -164,12 +178,8 @@ async fn polygons_geojson(
     state: axum::extract::State<Arc<RwLock<auth::Db>>>,
     index: axum::extract::Extension<Arc<MultiIndex>>,
 ) -> Response {
-    let key = match params.key {
-        Some(k) => k,
-        None => return (StatusCode::UNAUTHORIZED, "Missing API key").into_response(),
-    };
-    if state.read().unwrap().validate_token(&key).is_none() {
-        return (StatusCode::UNAUTHORIZED, "Invalid API key").into_response();
+    if let Err(resp) = require_valid_key(&state, params.key.as_deref()) {
+        return resp;
     }
 
     let lat = params.lat;

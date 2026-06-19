@@ -64,9 +64,14 @@ impl Db {
         db
     }
 
-    fn save(&self) {
-        let data = serde_json::to_string_pretty(self).unwrap();
-        fs::write(&self.path, data).expect("Failed to save database");
+    fn save(&self) -> std::io::Result<()> {
+        let data = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        // Atomic write: tmp file + rename, mirroring downloader::download_file.
+        let tmp = format!("{}.tmp", self.path);
+        fs::write(&tmp, data)?;
+        fs::rename(&tmp, &self.path)?;
+        Ok(())
     }
 
     fn create_user(&mut self, login: &str, password: &str, admin: bool, rate_per_second: u32, rate_per_day: u32, rate_by_ip: bool) {
@@ -78,7 +83,9 @@ impl Db {
             rate_per_day,
             rate_by_ip,
         });
-        self.save();
+        if let Err(e) = self.save() {
+            eprintln!("auth: failed to save database: {}", e);
+        }
     }
 
     pub fn validate_token(&self, key: &str) -> Option<(String, u32, u32, bool)> {
@@ -284,7 +291,9 @@ async fn create_token(headers: HeaderMap, state: State<Arc<RwLock<Db>>>) -> Resp
     if let Some(login) = db.sessions.get(&session_id).cloned() {
         let token = random_hex(16);
         db.tokens.insert(token, login);
-        db.save();
+        if let Err(e) = db.save() {
+            eprintln!("auth: failed to save database: {}", e);
+        }
     }
     Redirect::to("/").into_response()
 }
@@ -303,7 +312,9 @@ async fn delete_token(
     if let Some(login) = db.sessions.get(&session_id) {
         if db.tokens.get(&token).map(|o| o == login).unwrap_or(false) {
             db.tokens.remove(&token);
-            db.save();
+            if let Err(e) = db.save() {
+                eprintln!("auth: failed to save database: {}", e);
+            }
         }
     }
     Redirect::to("/").into_response()
@@ -351,7 +362,9 @@ async fn delete_user(
         if is_admin && target != login {
             db.users.remove(&target);
             db.tokens.retain(|_, owner| owner != &target);
-            db.save();
+            if let Err(e) = db.save() {
+                eprintln!("auth: failed to save database: {}", e);
+            }
         }
     }
     Redirect::to("/").into_response()

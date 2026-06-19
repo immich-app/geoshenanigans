@@ -936,6 +936,12 @@ pub struct Index {
 
 pub const NO_DATA: u32 = 0xFFFFFFFF;
 
+// Entry-ID encoding for admin/POI cell entries: the high bit flags an
+// "interior" entry (cell fully inside the polygon, a fast path for PIP),
+// and the low 31 bits carry the polygon/POI index.
+pub const INTERIOR_FLAG: u32 = 0x80000000;
+pub const ID_MASK: u32 = 0x7FFFFFFF;
+
 pub struct GeoCellOffsets {
     pub street: u32,
     pub addr: u32,
@@ -1205,6 +1211,52 @@ impl Index {
         NO_DATA
     }
 
+    // geo_cells is a 20-byte-stride sorted index — use chunk-aware
+    // binary search so it works on JsChunked sources where the
+    // file isn't resident.  All offsets u64 so >4 GiB files
+    // address correctly on wasm32.  Chunked-aware twin of
+    // `lookup_geo_cell` (which reads from a resident &[u8]).
+    pub fn lookup_geo_cell_fb(geo_cells: &FileBytes, target: u64) -> GeoCellOffsets {
+        let entry_size: u64 = 20;
+        let count = geo_cells.len() / entry_size;
+        let empty = GeoCellOffsets { street: NO_DATA, addr: NO_DATA, interp: NO_DATA };
+        if count == 0 { return empty; }
+        let mut lo: u64 = 0;
+        let mut hi = count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let bytes = geo_cells.read_chunk(mid * entry_size, entry_size as usize);
+            let mid_id = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+            if mid_id == target {
+                return GeoCellOffsets {
+                    street: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+                    addr:   u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+                    interp: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+                };
+            } else if mid_id < target { lo = mid + 1; } else { hi = mid; }
+        }
+        empty
+    }
+
+    // Read entries blob as Cow so it works on chunked sources.
+    // Same wire format as `for_each_entry_fb` (u16 count, then count
+    // u32 IDs), but materialises the IDs into a Vec for callers that
+    // need to iterate them more than once.
+    pub fn read_entries_fb(source: &FileBytes, offset: u32) -> Vec<u32> {
+        if offset == NO_DATA { return Vec::new(); }
+        let off = offset as u64;
+        if off + 2 > source.len() { return Vec::new(); }
+        let header = source.read_chunk(off, 2);
+        let count = u16::from_le_bytes([header[0], header[1]]) as usize;
+        if count == 0 { return Vec::new(); }
+        let blob = source.read_chunk(off + 2, count * 4);
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            out.push(u32::from_le_bytes(blob[i*4..i*4+4].try_into().unwrap()));
+        }
+        out
+    }
+
     pub fn read_u16(data: &[u8], offset: usize) -> u16 {
         u16::from_le_bytes([data[offset], data[offset + 1]])
     }
@@ -1311,56 +1363,14 @@ impl Index {
         // Fixed-size hash set on stack to skip duplicate street IDs across cells
         let mut seen_streets: [u32; 64] = [u32::MAX; 64];
 
-        // geo_cells is a 20-byte-stride sorted index — use chunk-aware
-        // binary search so it works on JsChunked sources where the
-        // file isn't resident.  All offsets u64 so >4 GiB files
-        // address correctly on wasm32.
-        let lookup_geo_chunked = |target: u64| -> GeoCellOffsets {
-            let entry_size: u64 = 20;
-            let count = geo_cells.len() / entry_size;
-            let empty = GeoCellOffsets { street: NO_DATA, addr: NO_DATA, interp: NO_DATA };
-            if count == 0 { return empty; }
-            let mut lo: u64 = 0;
-            let mut hi = count;
-            while lo < hi {
-                let mid = lo + (hi - lo) / 2;
-                let bytes = geo_cells.read_chunk(mid * entry_size, entry_size as usize);
-                let mid_id = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-                if mid_id == target {
-                    return GeoCellOffsets {
-                        street: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-                        addr:   u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
-                        interp: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
-                    };
-                } else if mid_id < target { lo = mid + 1; } else { hi = mid; }
-            }
-            empty
-        };
-
-        // Read entries blob as Cow so it works on chunked sources.
-        let read_entries = |source: &FileBytes, offset: u32| -> Vec<u32> {
-            if offset == NO_DATA { return Vec::new(); }
-            let off = offset as u64;
-            if off + 2 > source.len() { return Vec::new(); }
-            let header = source.read_chunk(off, 2);
-            let count = u16::from_le_bytes([header[0], header[1]]) as usize;
-            if count == 0 { return Vec::new(); }
-            let blob = source.read_chunk(off + 2, count * 4);
-            let mut out = Vec::with_capacity(count);
-            for i in 0..count {
-                out.push(u32::from_le_bytes(blob[i*4..i*4+4].try_into().unwrap()));
-            }
-            out
-        };
-
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            let offsets = lookup_geo_chunked(c);
+            let offsets = Self::lookup_geo_cell_fb(geo_cells, c);
 
             // Addresses. Building-sourced points (vertex_count > 0)
             // use polygon distance, matching ST_Distance behaviour.
             if let (Some(addr_entries), Some(addr_points)) = (self.addr_entries.as_ref(), self.addr_points.as_ref()) {
                 let total_addr = addr_points.len() / std::mem::size_of::<AddrPoint>() as u64 as u64;
-                for id in read_entries(addr_entries, offsets.addr) {
+                for id in Self::read_entries_fb(addr_entries, offsets.addr) {
                     let idx = id as u64;
                     if idx >= total_addr { continue; }
                     let point: AddrPoint = addr_points.read_at(idx);
@@ -1379,7 +1389,7 @@ impl Index {
             }
 
             // Streets
-            for id in read_entries(street_entries, offsets.street) {
+            for id in Self::read_entries_fb(street_entries, offsets.street) {
                 let slot = (id as usize) & 0x3F;
                 if seen_streets[slot] == id { continue; }
                 seen_streets[slot] = id;
@@ -1411,7 +1421,7 @@ impl Index {
             if let (Some(interp_entries), Some(interp_ways), Some(interp_nodes)) =
                 (self.interp_entries.as_ref(), self.interp_ways.as_ref(), self.interp_nodes.as_ref())
             {
-                for id in read_entries(interp_entries, offsets.interp) {
+                for id in Self::read_entries_fb(interp_entries, offsets.interp) {
                     let iw: InterpWay = interp_ways.read_at(id as u64);
                     if iw.start_number == 0 || iw.end_number == 0 { continue; }
                     let off = iw.node_offset as u64;
@@ -1494,48 +1504,11 @@ impl Index {
         let neighbors = cell_neighbors_at_level(cell, self.street_cell_level);
         let cos_lat = lat.to_radians().cos();
 
-        let lookup_geo_chunked = |target: u64| -> GeoCellOffsets {
-            let entry_size: u64 = 20;
-            let count = geo_cells.len() / entry_size;
-            let empty = GeoCellOffsets { street: NO_DATA, addr: NO_DATA, interp: NO_DATA };
-            if count == 0 { return empty; }
-            let mut lo: u64 = 0;
-            let mut hi = count;
-            while lo < hi {
-                let mid = lo + (hi - lo) / 2;
-                let bytes = geo_cells.read_chunk(mid * entry_size, entry_size as usize);
-                let mid_id = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-                if mid_id == target {
-                    return GeoCellOffsets {
-                        street: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-                        addr:   u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
-                        interp: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
-                    };
-                } else if mid_id < target { lo = mid + 1; } else { hi = mid; }
-            }
-            empty
-        };
-
-        let read_entries = |source: &FileBytes, offset: u32| -> Vec<u32> {
-            if offset == NO_DATA { return Vec::new(); }
-            let off = offset as u64;
-            if off + 2 > source.len() { return Vec::new(); }
-            let header = source.read_chunk(off, 2);
-            let count = u16::from_le_bytes([header[0], header[1]]) as usize;
-            if count == 0 { return Vec::new(); }
-            let blob = source.read_chunk(off + 2, count * 4);
-            let mut out = Vec::with_capacity(count);
-            for i in 0..count {
-                out.push(u32::from_le_bytes(blob[i*4..i*4+4].try_into().unwrap()));
-            }
-            out
-        };
-
         let mut best_dist = max_dist_sq;
         let mut best: Option<AddrPoint> = None;
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            let offsets = lookup_geo_chunked(c);
-            for id in read_entries(addr_entries, offsets.addr) {
+            let offsets = Self::lookup_geo_cell_fb(geo_cells, c);
+            for id in Self::read_entries_fb(addr_entries, offsets.addr) {
                 let idx = id as u64;
                 if idx >= total_addr { continue; }
                 let point: AddrPoint = addr_points.read_at(idx);
@@ -1652,9 +1625,6 @@ impl Index {
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
 
-        const INTERIOR_FLAG: u32 = 0x80000000;
-        const ID_MASK: u32 = 0x7FFFFFFF;
-
         let mut best_by_level: [Option<(f32, AdminPolygon, bool)>; 12] = [None; 12];
         let mut seen_in_level: [Vec<serde_json::Value>; 12] = Default::default();
 
@@ -1717,9 +1687,6 @@ impl Index {
         // the point. Interior flags are used as a fast path for uncontested cells,
         // but PIP is always run when a polygon would win the smallest-area contest
         // (interior flags can be wrong at polygon borders, e.g. NJ/NY).
-        const INTERIOR_FLAG: u32 = 0x80000000;
-        const ID_MASK: u32 = 0x7FFFFFFF;
-
         // (area, poly, pip_verified) — owned AdminPolygon values so the
         // backing admin_polygons file can be a chunked source.
         let mut best_by_level: [Option<(f32, AdminPolygon, bool)>; 12] = [None; 12];
@@ -2123,7 +2090,6 @@ impl Index {
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
 
-        const ID_MASK: u32 = 0x7FFFFFFF;
         let mut best: Option<AdminPolygon> = None;
         let mut best_area: f32 = f32::MAX;
 
@@ -2164,7 +2130,6 @@ impl Index {
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
 
-        const ID_MASK: u32 = 0x7FFFFFFF;
         let mut best: Option<AdminPolygon> = None;
         let mut best_area: f32 = f32::MAX;
 
@@ -2453,9 +2418,6 @@ impl Index {
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
 
-        const INTERIOR_FLAG: u32 = 0x80000000;
-        const ID_MASK: u32 = 0x7FFFFFFF;
-
         let cos_lat = lat.to_radians().cos();
         let mut best_dist_sq = f64::MAX;
         let mut best_idx: Option<u32> = None;
@@ -2568,9 +2530,6 @@ impl Index {
 
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
-
-        const INTERIOR_FLAG: u32 = 0x80000000;
-        const ID_MASK: u32 = 0x7FFFFFFF;
 
         let mut results: Vec<PoiMatch<'_>> = Vec::new();
 

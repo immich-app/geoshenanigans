@@ -40,7 +40,11 @@ impl JsChunked {
     pub fn len(&self) -> u64 { self.file_len }
 
     fn fetch_page(&self, page_off: u64) -> Vec<u8> {
-        let want = std::cmp::min(PAGE_SIZE as u64, self.file_len - page_off) as usize;
+        // `saturating_sub` guards against an out-of-bounds `page_off`:
+        // for any in-bounds page (`page_off <= file_len`) it is identical
+        // to `file_len - page_off`; it only differs by avoiding a u64
+        // underflow when `page_off > file_len`.
+        let want = std::cmp::min(PAGE_SIZE as u64, self.file_len.saturating_sub(page_off)) as usize;
         let res = self.js_read.call3(
             &JsValue::NULL,
             &JsValue::from_f64(self.handle),
@@ -79,7 +83,13 @@ impl JsChunked {
     /// Always returns an owned Vec — the chunk cache pages may be
     /// evicted before the caller is done.
     pub fn read(&self, off: u64, len: usize) -> Vec<u8> {
-        let end = off + len as u64;
+        // Out-of-bounds guards: an in-bounds read (`off + len <= file_len`)
+        // is unaffected — `end` is unchanged and the early return never
+        // fires.  They only act when the request already runs past EOF.
+        if off >= self.file_len {
+            return Vec::new();
+        }
+        let end = std::cmp::min(off + len as u64, self.file_len);
         let mut out = Vec::with_capacity(len);
         let mut cur = off;
         while cur < end {
