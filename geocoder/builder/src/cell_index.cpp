@@ -1265,9 +1265,9 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                 if (!prev_path.empty()) alloc.load_previous(prev_path);
 
                 auto fnv = [](const char* s, uint16_t cc) -> uint64_t {
-                    uint64_t h = 14695981039346656037ULL;
-                    h ^= static_cast<uint64_t>(cc); h *= 1099511628211ULL;
-                    if (s) for (; *s; s++) { h ^= static_cast<uint8_t>(*s); h *= 1099511628211ULL; }
+                    uint64_t h = FNV1A_OFFSET_BASIS;
+                    h ^= static_cast<uint64_t>(cc); h *= FNV1A_PRIME;
+                    if (s) for (; *s; s++) { h ^= static_cast<uint8_t>(*s); h *= FNV1A_PRIME; }
                     return h & 0x00FFFFFFFFFFFFFFull;
                 };
 
