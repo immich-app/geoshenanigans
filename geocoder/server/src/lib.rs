@@ -3873,6 +3873,19 @@ pub fn format_postcode<'a>(country_code: &[u8; 2], postcode: &'a str) -> Cow<'a,
         "jp" if matches_digits(7) => split_at(3, '-'),
         // ddddd-ddd — Brazil
         "br" if matches_digits(8) => split_at(5, '-'),
+        // ddddd-dddd — US ZIP+4: Nominatim's country pattern is
+        // "(ddddd)(?:-dddd)?" with output \1, i.e. it stores only the 5-digit
+        // base. Match the exact ZIP+4 shape on the ORIGINAL string (not `bare`,
+        // since a dashless 9-digit string would not fullmatch Nominatim's
+        // pattern) and emit the 5-digit base. Output-path only: a stored
+        // "12345-6789" (a US addr's own addr:postcode) becomes "12345"; plain
+        // 5-digit ZIPs and postcode centroids are unaffected.
+        "us" if postcode.len() == 10
+            && postcode.as_bytes()[5] == b'-'
+            && postcode.as_bytes()[..5].iter().all(u8::is_ascii_digit)
+            && postcode.as_bytes()[6..].iter().all(u8::is_ascii_digit) => {
+            Some(postcode[..5].to_string())
+        }
         _ => None,
     };
 
@@ -4309,6 +4322,20 @@ mod pure_helper_tests {
         assert_eq!(format_postcode(&cc("br"), "01310100"), "01310-100");
         // Wrong digit count -> original.
         assert_eq!(format_postcode(&cc("jp"), "100001"), "100001");
+    }
+
+    #[test]
+    fn format_postcode_us_zip4_truncates_to_base() {
+        // US ZIP+4 -> 5-digit base (Nominatim country pattern output \1).
+        assert_eq!(format_postcode(&cc("us"), "12345-6789"), "12345");
+        assert_eq!(format_postcode(&cc("us"), "10001-2062"), "10001");
+        // Plain 5-digit ZIP unchanged.
+        assert_eq!(format_postcode(&cc("us"), "12345"), "12345");
+        // A dashless 9-digit string does NOT fullmatch Nominatim's pattern, so
+        // it is left untouched (not silently truncated).
+        assert_eq!(format_postcode(&cc("us"), "123456789"), "123456789");
+        // Non-US ddddd-dddd is not a US ZIP+4 — left to its own (or no) rule.
+        assert_eq!(format_postcode(&cc("gb"), "12345-6789"), "12345-6789");
     }
 
     #[test]
