@@ -2078,6 +2078,207 @@ static void compute_poi_parent_admin(ParsedData& data, const BuildConfig& cfg,
     }
 }
 
+// S2 + POI cell computation: builds the street/interp cell index, then the POI
+// parent links (street/postcode/admin) and the POI/place cell index. Owns the
+// section running timer (_s2t); takes the outer _pt/_cpu only for the opening
+// 'Admin assembly' transition log.
+static void compute_s2_and_poi_cells(ParsedData& data, const BuildConfig& cfg,
+                std::chrono::steady_clock::time_point& _pt, CpuTicks& _cpu) {
+    unsigned int num_threads = cfg.num_threads;
+    {
+        log_phase("Admin assembly", _pt, _cpu);
+        std::cerr << "Computing S2 cells for ways with " << num_threads << " threads..." << std::endl;
+
+        // Flat-array approach: threads emit (cell_id, item_id) pairs into
+        // thread-local vectors, then we sort globally and group by cell_id.
+        // This avoids hash maps entirely — sort is cache-friendly O(n log n).
+
+
+        auto _s2t = std::chrono::steady_clock::now();
+        auto _s2cpu = CpuTicks::now();
+
+        // Process streets: emit (cell_id, way_id) pairs
+        std::cerr << "  Processing " << data.deferred_ways.size() << " street ways..." << std::endl;
+        std::vector<std::vector<CellItemPair>> way_pairs(num_threads);
+        {
+            std::atomic<size_t> way_idx{0};
+            std::vector<std::thread> threads;
+            for (unsigned int t = 0; t < num_threads; t++) {
+                threads.emplace_back([&, t]() {
+                    auto& local = way_pairs[t];
+                    local.reserve(data.deferred_ways.size() / num_threads * 3);
+                    std::vector<S2CellId> edge_cells;
+                    std::vector<uint64_t> way_cells;
+                    while (true) {
+                        size_t i = way_idx.fetch_add(1);
+                        if (i >= data.deferred_ways.size()) break;
+                        const auto& dw = data.deferred_ways[i];
+                        way_cells.clear();
+                        for (uint8_t j = 0; j + 1 < dw.node_count; j++) {
+                            const auto& n1 = data.street_nodes[dw.node_offset + j];
+                            const auto& n2 = data.street_nodes[dw.node_offset + j + 1];
+                            cover_edge(n1.lat, n1.lng, n2.lat, n2.lng, edge_cells);
+                            for (const auto& c : edge_cells) way_cells.push_back(c.id());
+                        }
+                        std::sort(way_cells.begin(), way_cells.end());
+                        way_cells.erase(std::unique(way_cells.begin(), way_cells.end()), way_cells.end());
+                        for (uint64_t cell_id : way_cells) {
+                            local.push_back({cell_id, dw.way_id});
+                        }
+                    }
+                });
+            }
+            for (auto& t : threads) t.join();
+        }
+        log_phase("  S2: street ways (parallel)", _s2t, _s2cpu);
+
+        // Process interpolations: emit (cell_id, interp_id) pairs
+        std::cerr << "  Processing " << data.deferred_interps.size() << " interpolation ways..." << std::endl;
+        std::vector<std::vector<CellItemPair>> interp_pairs(num_threads);
+        {
+            std::atomic<size_t> interp_idx{0};
+            std::vector<std::thread> threads;
+            for (unsigned int t = 0; t < num_threads; t++) {
+                threads.emplace_back([&, t]() {
+                    auto& local = interp_pairs[t];
+                    std::vector<S2CellId> edge_cells;
+                    std::vector<uint64_t> way_cells;
+                    while (true) {
+                        size_t i = interp_idx.fetch_add(1);
+                        if (i >= data.deferred_interps.size()) break;
+                        const auto& di = data.deferred_interps[i];
+                        way_cells.clear();
+                        for (uint8_t j = 0; j + 1 < di.node_count; j++) {
+                            const auto& n1 = data.interp_nodes[di.node_offset + j];
+                            const auto& n2 = data.interp_nodes[di.node_offset + j + 1];
+                            cover_edge(n1.lat, n1.lng, n2.lat, n2.lng, edge_cells);
+                            for (const auto& c : edge_cells) way_cells.push_back(c.id());
+                        }
+                        std::sort(way_cells.begin(), way_cells.end());
+                        way_cells.erase(std::unique(way_cells.begin(), way_cells.end()), way_cells.end());
+                        for (uint64_t cell_id : way_cells) {
+                            local.push_back({cell_id, di.interp_id});
+                        }
+                    }
+                });
+            }
+            for (auto& t : threads) t.join();
+        }
+        log_phase("  S2: interp ways (parallel)", _s2t, _s2cpu);
+
+        // Merge thread-local pairs into single vectors, sort, build cell maps
+        std::cerr << "  Sorting and grouping cell pairs..." << std::endl;
+        // Concatenate + sort helper for flat CellItem pairs
+        // Parallel sort each thread's pairs, then k-way merge directly into
+        // hash map + sorted output. No intermediate merged vector needed.
+
+
+        // Sort each thread's pairs in parallel, then k-way merge directly
+        // into hash map + sorted output. No intermediate merged vector.
+        auto f_ways = std::async(std::launch::async, [&] {
+            parallel_sort_and_build(way_pairs, data.cell_to_ways, data.sorted_way_cells);
+        });
+        auto f_interps = std::async(std::launch::async, [&] {
+            parallel_sort_and_build(interp_pairs, data.cell_to_interps, data.sorted_interp_cells);
+        });
+        f_ways.get();
+        f_interps.get();
+        log_phase("  S2: sort + group into cell maps", _s2t, _s2cpu);
+
+        compute_poi_parent_streets(data, cfg, _s2t, _s2cpu);
+
+        compute_poi_parent_postcode(data, cfg, _s2t, _s2cpu);
+
+        compute_poi_parent_admin(data, cfg, _s2t, _s2cpu);
+
+        backfill_addr_point_parent_streets(data, cfg);
+
+        // Free deferred work items
+        data.deferred_ways.clear();
+        data.deferred_ways.shrink_to_fit();
+        data.deferred_interps.clear();
+        data.deferred_interps.shrink_to_fit();
+
+        // --- POI S2 cell computation ---
+        if (!data.poi_records.empty()) {
+            std::cerr << "  Computing S2 cells for " << data.poi_records.size() << " POIs..." << std::endl;
+            std::vector<std::vector<CellItemPair>> poi_pairs(num_threads);
+            {
+                std::atomic<size_t> poi_idx{0};
+                std::vector<std::thread> threads;
+                for (unsigned int t = 0; t < num_threads; t++) {
+                    threads.emplace_back([&, t]() {
+                        auto& local = poi_pairs[t];
+                        local.reserve(data.poi_records.size() / num_threads * 2);
+                        while (true) {
+                            size_t i = poi_idx.fetch_add(1);
+                            if (i >= data.poi_records.size()) break;
+                            const auto& pr = data.poi_records[i];
+
+                            if (pr.vertex_count == 0) {
+                                // Point POI
+                                S2CellId cell = S2CellId(S2LatLng::FromDegrees(pr.lat, pr.lng))
+                                    .parent(kAdminCellLevel);
+                                local.push_back({cell.id(), static_cast<uint32_t>(i)});
+                            } else {
+                                // Polygon POI — cover with S2 cells
+                                std::vector<std::pair<double,double>> verts;
+                                verts.reserve(pr.vertex_count);
+                                for (uint32_t j = 0; j < pr.vertex_count; j++) {
+                                    const auto& v = data.poi_vertices[pr.vertex_offset + j];
+                                    verts.emplace_back(v.lat, v.lng);
+                                }
+                                auto cells = cover_polygon(verts);
+                                for (const auto& [cell_id, is_interior] : cells) {
+                                    uint32_t id = static_cast<uint32_t>(i);
+                                    if (is_interior) id |= INTERIOR_FLAG;
+                                    local.push_back({cell_id.id(), id});
+                                }
+                            }
+                        }
+                    });
+                }
+                for (auto& t : threads) t.join();
+            }
+            log_phase("  S2: POI cells (parallel)", _s2t, _s2cpu);
+
+            parallel_sort_and_build(poi_pairs, data.cell_to_pois, data.sorted_poi_cells);
+            log_phase("  S2: POI sort + group", _s2t, _s2cpu);
+        }
+
+        // Place node S2 cells
+        if (!data.place_nodes.empty()) {
+            std::cerr << "  Computing S2 cells for " << data.place_nodes.size() << " place nodes..." << std::endl;
+            std::vector<std::vector<CellItemPair>> place_pairs(num_threads);
+            {
+                std::atomic<size_t> place_idx{0};
+                std::vector<std::thread> threads;
+                for (unsigned int t = 0; t < num_threads; t++) {
+                    threads.emplace_back([&, t]() {
+                        auto& local = place_pairs[t];
+                        while (true) {
+                            size_t i = place_idx.fetch_add(1);
+                            if (i >= data.place_nodes.size()) break;
+                            const auto& pn = data.place_nodes[i];
+                            S2CellId cell = S2CellId(S2LatLng::FromDegrees(pn.lat, pn.lng))
+                                .parent(kAdminCellLevel);
+                            local.push_back({cell.id(), static_cast<uint32_t>(i)});
+                        }
+                    });
+                }
+                for (auto& t : threads) t.join();
+            }
+            std::unordered_map<uint64_t, std::vector<uint32_t>> dummy_map;
+            parallel_sort_and_build(place_pairs, dummy_map, data.sorted_place_cells);
+            std::cerr << "  Place nodes: " << data.place_nodes.size() << " nodes, "
+                      << data.sorted_place_cells.size() << " cell pairs" << std::endl;
+            log_phase("  S2: place nodes", _s2t, _s2cpu);
+        }
+
+        std::cerr << "S2 cell computation complete." << std::endl;
+    }
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [options]" << std::endl;
@@ -4403,199 +4604,7 @@ int main(int argc, char* argv[]) {
             load_external_postcodes(data, external_postcodes_path);
         }
 
-        // --- Parallel S2 cell computation for ways and interpolation ---
-        {
-            log_phase("Admin assembly", _pt, _cpu);
-            std::cerr << "Computing S2 cells for ways with " << num_threads << " threads..." << std::endl;
-
-            // Flat-array approach: threads emit (cell_id, item_id) pairs into
-            // thread-local vectors, then we sort globally and group by cell_id.
-            // This avoids hash maps entirely — sort is cache-friendly O(n log n).
-
-
-            auto _s2t = std::chrono::steady_clock::now();
-            auto _s2cpu = CpuTicks::now();
-
-            // Process streets: emit (cell_id, way_id) pairs
-            std::cerr << "  Processing " << data.deferred_ways.size() << " street ways..." << std::endl;
-            std::vector<std::vector<CellItemPair>> way_pairs(num_threads);
-            {
-                std::atomic<size_t> way_idx{0};
-                std::vector<std::thread> threads;
-                for (unsigned int t = 0; t < num_threads; t++) {
-                    threads.emplace_back([&, t]() {
-                        auto& local = way_pairs[t];
-                        local.reserve(data.deferred_ways.size() / num_threads * 3);
-                        std::vector<S2CellId> edge_cells;
-                        std::vector<uint64_t> way_cells;
-                        while (true) {
-                            size_t i = way_idx.fetch_add(1);
-                            if (i >= data.deferred_ways.size()) break;
-                            const auto& dw = data.deferred_ways[i];
-                            way_cells.clear();
-                            for (uint8_t j = 0; j + 1 < dw.node_count; j++) {
-                                const auto& n1 = data.street_nodes[dw.node_offset + j];
-                                const auto& n2 = data.street_nodes[dw.node_offset + j + 1];
-                                cover_edge(n1.lat, n1.lng, n2.lat, n2.lng, edge_cells);
-                                for (const auto& c : edge_cells) way_cells.push_back(c.id());
-                            }
-                            std::sort(way_cells.begin(), way_cells.end());
-                            way_cells.erase(std::unique(way_cells.begin(), way_cells.end()), way_cells.end());
-                            for (uint64_t cell_id : way_cells) {
-                                local.push_back({cell_id, dw.way_id});
-                            }
-                        }
-                    });
-                }
-                for (auto& t : threads) t.join();
-            }
-            log_phase("  S2: street ways (parallel)", _s2t, _s2cpu);
-
-            // Process interpolations: emit (cell_id, interp_id) pairs
-            std::cerr << "  Processing " << data.deferred_interps.size() << " interpolation ways..." << std::endl;
-            std::vector<std::vector<CellItemPair>> interp_pairs(num_threads);
-            {
-                std::atomic<size_t> interp_idx{0};
-                std::vector<std::thread> threads;
-                for (unsigned int t = 0; t < num_threads; t++) {
-                    threads.emplace_back([&, t]() {
-                        auto& local = interp_pairs[t];
-                        std::vector<S2CellId> edge_cells;
-                        std::vector<uint64_t> way_cells;
-                        while (true) {
-                            size_t i = interp_idx.fetch_add(1);
-                            if (i >= data.deferred_interps.size()) break;
-                            const auto& di = data.deferred_interps[i];
-                            way_cells.clear();
-                            for (uint8_t j = 0; j + 1 < di.node_count; j++) {
-                                const auto& n1 = data.interp_nodes[di.node_offset + j];
-                                const auto& n2 = data.interp_nodes[di.node_offset + j + 1];
-                                cover_edge(n1.lat, n1.lng, n2.lat, n2.lng, edge_cells);
-                                for (const auto& c : edge_cells) way_cells.push_back(c.id());
-                            }
-                            std::sort(way_cells.begin(), way_cells.end());
-                            way_cells.erase(std::unique(way_cells.begin(), way_cells.end()), way_cells.end());
-                            for (uint64_t cell_id : way_cells) {
-                                local.push_back({cell_id, di.interp_id});
-                            }
-                        }
-                    });
-                }
-                for (auto& t : threads) t.join();
-            }
-            log_phase("  S2: interp ways (parallel)", _s2t, _s2cpu);
-
-            // Merge thread-local pairs into single vectors, sort, build cell maps
-            std::cerr << "  Sorting and grouping cell pairs..." << std::endl;
-            // Concatenate + sort helper for flat CellItem pairs
-            // Parallel sort each thread's pairs, then k-way merge directly into
-            // hash map + sorted output. No intermediate merged vector needed.
-
-
-            // Sort each thread's pairs in parallel, then k-way merge directly
-            // into hash map + sorted output. No intermediate merged vector.
-            auto f_ways = std::async(std::launch::async, [&] {
-                parallel_sort_and_build(way_pairs, data.cell_to_ways, data.sorted_way_cells);
-            });
-            auto f_interps = std::async(std::launch::async, [&] {
-                parallel_sort_and_build(interp_pairs, data.cell_to_interps, data.sorted_interp_cells);
-            });
-            f_ways.get();
-            f_interps.get();
-            log_phase("  S2: sort + group into cell maps", _s2t, _s2cpu);
-
-            compute_poi_parent_streets(data, cfg, _s2t, _s2cpu);
-
-            compute_poi_parent_postcode(data, cfg, _s2t, _s2cpu);
-
-            compute_poi_parent_admin(data, cfg, _s2t, _s2cpu);
-
-            backfill_addr_point_parent_streets(data, cfg);
-
-            // Free deferred work items
-            data.deferred_ways.clear();
-            data.deferred_ways.shrink_to_fit();
-            data.deferred_interps.clear();
-            data.deferred_interps.shrink_to_fit();
-
-            // --- POI S2 cell computation ---
-            if (!data.poi_records.empty()) {
-                std::cerr << "  Computing S2 cells for " << data.poi_records.size() << " POIs..." << std::endl;
-                std::vector<std::vector<CellItemPair>> poi_pairs(num_threads);
-                {
-                    std::atomic<size_t> poi_idx{0};
-                    std::vector<std::thread> threads;
-                    for (unsigned int t = 0; t < num_threads; t++) {
-                        threads.emplace_back([&, t]() {
-                            auto& local = poi_pairs[t];
-                            local.reserve(data.poi_records.size() / num_threads * 2);
-                            while (true) {
-                                size_t i = poi_idx.fetch_add(1);
-                                if (i >= data.poi_records.size()) break;
-                                const auto& pr = data.poi_records[i];
-
-                                if (pr.vertex_count == 0) {
-                                    // Point POI
-                                    S2CellId cell = S2CellId(S2LatLng::FromDegrees(pr.lat, pr.lng))
-                                        .parent(kAdminCellLevel);
-                                    local.push_back({cell.id(), static_cast<uint32_t>(i)});
-                                } else {
-                                    // Polygon POI — cover with S2 cells
-                                    std::vector<std::pair<double,double>> verts;
-                                    verts.reserve(pr.vertex_count);
-                                    for (uint32_t j = 0; j < pr.vertex_count; j++) {
-                                        const auto& v = data.poi_vertices[pr.vertex_offset + j];
-                                        verts.emplace_back(v.lat, v.lng);
-                                    }
-                                    auto cells = cover_polygon(verts);
-                                    for (const auto& [cell_id, is_interior] : cells) {
-                                        uint32_t id = static_cast<uint32_t>(i);
-                                        if (is_interior) id |= INTERIOR_FLAG;
-                                        local.push_back({cell_id.id(), id});
-                                    }
-                                }
-                            }
-                        });
-                    }
-                    for (auto& t : threads) t.join();
-                }
-                log_phase("  S2: POI cells (parallel)", _s2t, _s2cpu);
-
-                parallel_sort_and_build(poi_pairs, data.cell_to_pois, data.sorted_poi_cells);
-                log_phase("  S2: POI sort + group", _s2t, _s2cpu);
-            }
-
-            // Place node S2 cells
-            if (!data.place_nodes.empty()) {
-                std::cerr << "  Computing S2 cells for " << data.place_nodes.size() << " place nodes..." << std::endl;
-                std::vector<std::vector<CellItemPair>> place_pairs(num_threads);
-                {
-                    std::atomic<size_t> place_idx{0};
-                    std::vector<std::thread> threads;
-                    for (unsigned int t = 0; t < num_threads; t++) {
-                        threads.emplace_back([&, t]() {
-                            auto& local = place_pairs[t];
-                            while (true) {
-                                size_t i = place_idx.fetch_add(1);
-                                if (i >= data.place_nodes.size()) break;
-                                const auto& pn = data.place_nodes[i];
-                                S2CellId cell = S2CellId(S2LatLng::FromDegrees(pn.lat, pn.lng))
-                                    .parent(kAdminCellLevel);
-                                local.push_back({cell.id(), static_cast<uint32_t>(i)});
-                            }
-                        });
-                    }
-                    for (auto& t : threads) t.join();
-                }
-                std::unordered_map<uint64_t, std::vector<uint32_t>> dummy_map;
-                parallel_sort_and_build(place_pairs, dummy_map, data.sorted_place_cells);
-                std::cerr << "  Place nodes: " << data.place_nodes.size() << " nodes, "
-                          << data.sorted_place_cells.size() << " cell pairs" << std::endl;
-                log_phase("  S2: place nodes", _s2t, _s2cpu);
-            }
-
-            std::cerr << "S2 cell computation complete." << std::endl;
-        }
+        compute_s2_and_poi_cells(data, cfg, _pt, _cpu);
 
         // Resolve interpolation endpoints
         std::cerr << "Resolving interpolation endpoints..." << std::endl;
