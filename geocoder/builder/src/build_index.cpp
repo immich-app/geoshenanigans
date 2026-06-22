@@ -1510,6 +1510,257 @@ static void parallel_sort_and_build(
     // cell_map stays empty (only needed for cache/continent modes).
 }
 
+// Place-node addressline containment: for each place node, record the smallest-area
+// admin polygon containing its centroid (gates the server's nearest-place fallback).
+static void compute_place_node_containment(ParsedData& data, const BuildConfig& cfg,
+                std::chrono::steady_clock::time_point& _pt, CpuTicks& _cpu) {
+    unsigned int num_threads = cfg.num_threads;
+    if (!data.place_nodes.empty() && !data.admin_polygons.empty()) {
+        auto _pn_t = std::chrono::steady_clock::now();
+        std::cerr << "Computing place-node parent admin polygons ("
+                  << data.place_nodes.size() << " nodes)..." << std::endl;
+
+        // Precompute candidate sets sorted by ascending area so we can
+        // pick the smallest containing polygon with a single PIP pass.
+        // The cell_to_admin map has (INTERIOR_FLAG | poly_id) values —
+        // strip the flag before indexing.
+        std::atomic<size_t> pn_idx{0};
+        std::atomic<uint64_t> contained_count{0};
+        std::vector<std::thread> pn_workers;
+        for (unsigned int t = 0; t < num_threads; t++) {
+            pn_workers.emplace_back([&]() {
+                std::vector<uint32_t> cand;
+                while (true) {
+                    size_t i = pn_idx.fetch_add(1);
+                    if (i >= data.place_nodes.size()) break;
+                    auto& pn = data.place_nodes[i];
+                    pn.parent_poly_id = 0xFFFFFFFFu;
+                    // Compute the node's S2 cell at the admin level
+                    // and fetch candidate polygons covering it.
+                    S2CellId cell = S2CellId(
+                        S2LatLng::FromDegrees(pn.lat, pn.lng))
+                        .parent(kAdminCellLevel);
+                    auto it = data.cell_to_admin.find(cell.id());
+                    if (it == data.cell_to_admin.end()) continue;
+                    cand.clear();
+                    cand.reserve(it->second.size());
+                    for (uint32_t id : it->second) {
+                        cand.push_back(id & ID_MASK);
+                    }
+                    // Sort candidates by ascending area so the first
+                    // PIP hit is the smallest containing polygon. Break
+                    // exact-area ties by admin osm_id: AdminPolygon.area
+                    // is float32, so distinct polygons routinely share an
+                    // area value, and an area-only sort leaves their order
+                    // to the (non-deterministic) cell_to_admin iteration
+                    // order — making parent_poly_id flip between same-PBF
+                    // builds (~33k place nodes / 1.1 MiB churn). osm_id is
+                    // build-invariant and unique, giving a total order.
+                    std::sort(cand.begin(), cand.end(),
+                              [&](uint32_t a, uint32_t b) {
+                        const auto& pa = data.admin_polygons[a];
+                        const auto& pb = data.admin_polygons[b];
+                        if (pa.area != pb.area) return pa.area < pb.area;
+                        // osm_id tiebreak (build-invariant total order); guard
+                        // the parallel-array access like every other site and
+                        // fall back to the (still-unique) poly index if the
+                        // sidecar isn't aligned.
+                        if (data.admin_osm_ids.size() == data.admin_polygons.size())
+                            return data.admin_osm_ids[a] < data.admin_osm_ids[b];
+                        return a < b;
+                    });
+                    // Pick the smallest containing admin polygon at
+                    // a rank level matching this place node's type.
+                    // Mirrors Nominatim's `current_boundary` cascading
+                    // gate: a place=neighbourhood node must be inside
+                    // the suburb-level boundary (admin_level >= 8),
+                    // not just inside the country. This prevents a
+                    // neighbourhood node 800m from the query (but
+                    // in the same country/state) from being accepted
+                    // when the query is in a different suburb.
+                    //
+                    // For city/town/village (pt 0-2): parent at L3+
+                    // For suburb/hamlet (pt 3-4): parent at L6+
+                    // For neighbourhood/quarter (pt 5-6): parent at L9+
+                    uint8_t pt = pn.place_type;
+                    uint8_t min_parent_al = (pt <= 2) ? 3 : (pt <= 4) ? 6 : 9;
+                    for (uint32_t poly_id : cand) {
+                        const auto& p = data.admin_polygons[poly_id];
+                        if (p.admin_level < min_parent_al) continue;
+                        if (p.admin_level > 10) continue; // skip postcode/place markers
+                        const NodeCoord* verts =
+                            &data.admin_vertices[p.vertex_offset];
+                        if (point_in_polygon_nc(pn.lat, pn.lng,
+                                                verts, p.vertex_count)) {
+                            pn.parent_poly_id = poly_id;
+                            contained_count.fetch_add(1);
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+        for (auto& w : pn_workers) w.join();
+
+        double _pn_elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - _pn_t).count();
+        std::cerr << "Place-node containment: "
+                  << contained_count.load() << "/"
+                  << data.place_nodes.size() << " nodes linked to a "
+                  << "parent admin polygon in " << _pn_elapsed << "s"
+                  << std::endl;
+        log_phase("Place-node containment", _pt, _cpu);
+    }
+}
+
+// find_linked_place step 4: name-based linking of admin boundaries to place nodes
+// (Nominatim find_linked_place name-match fallback).
+static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
+                std::chrono::steady_clock::time_point& _pt, CpuTicks& _cpu) {
+    unsigned int num_threads = cfg.num_threads;
+    if (!data.admin_polygons.empty() && !data.place_nodes.empty()) {
+        auto _nl_t = std::chrono::steady_clock::now();
+
+        // Normalised-name → place-node index for exact-match lookup.
+        // Nominatim's find_linked_place step 4 requires an exact name
+        // overlap via hstore `&&` (same language key, same value) —
+        // effectively a full-name identity match on at least one
+        // name:* tag. Our data only carries a single `name`, so we
+        // approximate by matching on the normalised primary name.
+        // Using exact-match avoids spurious token-overlap links like
+        // "1st District of Athens" → "Athens" or "Manhattan Community
+        // Board 3" → any "Manhattan" place node.
+        std::unordered_map<std::string, std::vector<uint32_t>> name_to_places;
+        name_to_places.reserve(data.place_nodes.size());
+        const auto& pool_data = data.string_pool.data();
+        for (uint32_t i = 0; i < data.place_nodes.size(); i++) {
+            const auto& pn = data.place_nodes[i];
+            if (pn.name_id == NO_DATA) continue;
+            const char* nm = pool_data.data() + pn.name_id;
+            if (!nm[0]) continue;
+            std::string nn = normalise_for_matching(nm);
+            if (nn.empty()) continue;
+            name_to_places[std::move(nn)].push_back(i);
+        }
+
+        // PlaceType → rank_search. Matches Nominatim's
+        // address_levels.json defaults: place=city 16, town 18,
+        // village 19, suburb/hamlet 20, neighbourhood/quarter 22.
+        auto place_rank = [](uint8_t pt) -> uint8_t {
+            switch (static_cast<PlaceType>(pt)) {
+                case PlaceType::CITY:          return 16;
+                case PlaceType::TOWN:          return 18;
+                case PlaceType::BOROUGH:       return 18;
+                case PlaceType::VILLAGE:       return 19;
+                case PlaceType::SUBURB:        return 20;
+                case PlaceType::HAMLET:        return 20;
+                case PlaceType::NEIGHBOURHOOD: return 22;
+                case PlaceType::QUARTER:       return 22;
+                default:                        return 255;
+            }
+        };
+
+        // Nominatim gates step 4 to boundaries with
+        // rank_address 16-23 (admin_level 8-11 under the default
+        // rank mapping al*2). Coarser boundaries never fall through
+        // to step 4 because steps 1-3 almost always catch them
+        // (country/state wikidata coverage is near-total).
+        std::atomic<size_t> pol_idx{0};
+        std::atomic<uint64_t> linked{0};
+        std::atomic<uint64_t> considered{0};
+        std::vector<std::thread> nl_workers;
+        const double max_dist_deg = 0.5;
+        const double max_dist_sq = max_dist_deg * max_dist_deg;
+
+        for (unsigned int t = 0; t < num_threads; t++) {
+            nl_workers.emplace_back([&]() {
+                while (true) {
+                    size_t i = pol_idx.fetch_add(1);
+                    if (i >= data.admin_polygons.size()) break;
+                    auto& poly = data.admin_polygons[i];
+                    if (poly.place_type_override != 0) continue;
+                    if (poly.admin_level < 8 || poly.admin_level > 11) continue;
+                    if (poly.vertex_count == 0) continue;
+                    if (poly.name_id == NO_DATA) continue;
+                    const char* bnd_name = pool_data.data() + poly.name_id;
+                    if (!bnd_name[0]) continue;
+                    considered.fetch_add(1);
+
+                    uint8_t bnd_rank = poly.admin_level * 2;
+
+                    double sum_lat = 0.0, sum_lng = 0.0;
+                    for (uint32_t v = 0; v < poly.vertex_count; v++) {
+                        sum_lat += data.admin_vertices[poly.vertex_offset + v].lat;
+                        sum_lng += data.admin_vertices[poly.vertex_offset + v].lng;
+                    }
+                    double clat = sum_lat / poly.vertex_count;
+                    double clng = sum_lng / poly.vertex_count;
+
+                    std::string nb = normalise_for_matching(bnd_name);
+                    if (nb.empty()) continue;
+
+                    uint32_t best_idx = NO_DATA;
+                    double best_dist_sq = max_dist_sq;
+
+                    auto it = name_to_places.find(nb);
+                    if (it != name_to_places.end()) {
+                        for (uint32_t pidx : it->second) {
+                            const auto& pn = data.place_nodes[pidx];
+                            uint8_t pr = place_rank(pn.place_type);
+                            if (pr == 255) continue;
+                            int drank = (int)pr - (int)bnd_rank;
+                            if (drank < -2 || drank > 2) continue;
+                            double dlat = (double)pn.lat - clat;
+                            double dlng = (double)pn.lng - clng;
+                            double d2 = dlat * dlat + dlng * dlng;
+                            if (d2 > best_dist_sq) continue;
+                            if (d2 == best_dist_sq) {
+                                // Preserve the original `>=` reject at the
+                                // distance threshold (no real candidate yet:
+                                // best_dist_sq is still max_dist_sq), so this
+                                // only adds a tiebreak, not a behaviour change
+                                // at the 0.5° boundary.
+                                if (best_idx == NO_DATA) continue;
+                                // Break exact-distance ties by the place node's
+                                // stable osm_id (build-invariant, unique).
+                                // name_to_places[nb] is iterated in a non-
+                                // deterministic order, so equidistant same-
+                                // named place nodes otherwise flipped the
+                                // linked place type → place_type_override →
+                                // admin_polygons.bin between same-PBF builds.
+                                if (pidx >= data.place_osm_ids.size() ||
+                                    best_idx >= data.place_osm_ids.size() ||
+                                    data.place_osm_ids[pidx] >= data.place_osm_ids[best_idx])
+                                    continue;
+                            }
+                            best_dist_sq = d2;
+                            best_idx = pidx;
+                        }
+                    }
+
+                    if (best_idx != NO_DATA) {
+                        const auto& pn = data.place_nodes[best_idx];
+                        uint8_t pto = place_type_to_admin_override(pn.place_type);
+                        if (pto != 0) {
+                            poly.place_type_override = pto;
+                            linked.fetch_add(1);
+                        }
+                    }
+                }
+            });
+        }
+        for (auto& w : nl_workers) w.join();
+
+        double _nl_elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - _nl_t).count();
+        std::cerr << "find_linked_place step 4 (name match): "
+                  << linked.load() << "/" << considered.load()
+                  << " unlinked AL8-11 boundaries linked in "
+                  << _nl_elapsed << "s" << std::endl;
+        log_phase("find_linked_place step 4", _pt, _cpu);
+    }
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [options]" << std::endl;
@@ -3817,274 +4068,9 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // --- Place-node addressline containment ---
-        //
-        // For each place node, find the smallest-area admin polygon that
-        // geometrically contains its centroid, and record that polygon's
-        // id on the node. At query time the server uses this to gate the
-        // nearest-place fallback so adjacent-but-wrong place nodes (Paris
-        // Beaubourg beside Saint-Merri, Moscow Kitay-gorod beside
-        // Ilinka, etc.) no longer bleed into the response. This mirrors
-        // the effect of Nominatim's insert_addresslines containment check
-        // (ST_Contains at indexing time).
-        //
-        // We iterate place nodes in parallel, looking up candidate admin
-        // polygons via the existing cell_to_admin S2 index (fast nearest-
-        // candidate filter), then running point-in-polygon on each
-        // candidate in ascending-area order. The first hit is the
-        // smallest containing polygon.
-        if (!data.place_nodes.empty() && !data.admin_polygons.empty()) {
-            auto _pn_t = std::chrono::steady_clock::now();
-            std::cerr << "Computing place-node parent admin polygons ("
-                      << data.place_nodes.size() << " nodes)..." << std::endl;
+        compute_place_node_containment(data, cfg, _pt, _cpu);
 
-            // Precompute candidate sets sorted by ascending area so we can
-            // pick the smallest containing polygon with a single PIP pass.
-            // The cell_to_admin map has (INTERIOR_FLAG | poly_id) values —
-            // strip the flag before indexing.
-            std::atomic<size_t> pn_idx{0};
-            std::atomic<uint64_t> contained_count{0};
-            std::vector<std::thread> pn_workers;
-            for (unsigned int t = 0; t < num_threads; t++) {
-                pn_workers.emplace_back([&]() {
-                    std::vector<uint32_t> cand;
-                    while (true) {
-                        size_t i = pn_idx.fetch_add(1);
-                        if (i >= data.place_nodes.size()) break;
-                        auto& pn = data.place_nodes[i];
-                        pn.parent_poly_id = 0xFFFFFFFFu;
-                        // Compute the node's S2 cell at the admin level
-                        // and fetch candidate polygons covering it.
-                        S2CellId cell = S2CellId(
-                            S2LatLng::FromDegrees(pn.lat, pn.lng))
-                            .parent(kAdminCellLevel);
-                        auto it = data.cell_to_admin.find(cell.id());
-                        if (it == data.cell_to_admin.end()) continue;
-                        cand.clear();
-                        cand.reserve(it->second.size());
-                        for (uint32_t id : it->second) {
-                            cand.push_back(id & ID_MASK);
-                        }
-                        // Sort candidates by ascending area so the first
-                        // PIP hit is the smallest containing polygon. Break
-                        // exact-area ties by admin osm_id: AdminPolygon.area
-                        // is float32, so distinct polygons routinely share an
-                        // area value, and an area-only sort leaves their order
-                        // to the (non-deterministic) cell_to_admin iteration
-                        // order — making parent_poly_id flip between same-PBF
-                        // builds (~33k place nodes / 1.1 MiB churn). osm_id is
-                        // build-invariant and unique, giving a total order.
-                        std::sort(cand.begin(), cand.end(),
-                                  [&](uint32_t a, uint32_t b) {
-                            const auto& pa = data.admin_polygons[a];
-                            const auto& pb = data.admin_polygons[b];
-                            if (pa.area != pb.area) return pa.area < pb.area;
-                            // osm_id tiebreak (build-invariant total order); guard
-                            // the parallel-array access like every other site and
-                            // fall back to the (still-unique) poly index if the
-                            // sidecar isn't aligned.
-                            if (data.admin_osm_ids.size() == data.admin_polygons.size())
-                                return data.admin_osm_ids[a] < data.admin_osm_ids[b];
-                            return a < b;
-                        });
-                        // Pick the smallest containing admin polygon at
-                        // a rank level matching this place node's type.
-                        // Mirrors Nominatim's `current_boundary` cascading
-                        // gate: a place=neighbourhood node must be inside
-                        // the suburb-level boundary (admin_level >= 8),
-                        // not just inside the country. This prevents a
-                        // neighbourhood node 800m from the query (but
-                        // in the same country/state) from being accepted
-                        // when the query is in a different suburb.
-                        //
-                        // For city/town/village (pt 0-2): parent at L3+
-                        // For suburb/hamlet (pt 3-4): parent at L6+
-                        // For neighbourhood/quarter (pt 5-6): parent at L9+
-                        uint8_t pt = pn.place_type;
-                        uint8_t min_parent_al = (pt <= 2) ? 3 : (pt <= 4) ? 6 : 9;
-                        for (uint32_t poly_id : cand) {
-                            const auto& p = data.admin_polygons[poly_id];
-                            if (p.admin_level < min_parent_al) continue;
-                            if (p.admin_level > 10) continue; // skip postcode/place markers
-                            const NodeCoord* verts =
-                                &data.admin_vertices[p.vertex_offset];
-                            if (point_in_polygon_nc(pn.lat, pn.lng,
-                                                    verts, p.vertex_count)) {
-                                pn.parent_poly_id = poly_id;
-                                contained_count.fetch_add(1);
-                                break;
-                            }
-                        }
-                    }
-                });
-            }
-            for (auto& w : pn_workers) w.join();
-
-            double _pn_elapsed = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - _pn_t).count();
-            std::cerr << "Place-node containment: "
-                      << contained_count.load() << "/"
-                      << data.place_nodes.size() << " nodes linked to a "
-                      << "parent admin polygon in " << _pn_elapsed << "s"
-                      << std::endl;
-            log_phase("Place-node containment", _pt, _cpu);
-        }
-
-        // --- find_linked_place step 4: name-based linking ---
-        //
-        // Nominatim's find_linked_place (placex_triggers.sql) falls back
-        // to a name-match search when label-role / wikidata / own-place-tag
-        // linking all fail: it picks the nearest place=X node within
-        // ~50 km whose rank_search is within ±2 of the boundary's
-        // rank_address and whose name overlaps the boundary's name.
-        // The matched place node's type becomes the boundary's
-        // place_type_override.
-        //
-        // This catches settlement-rank links Nominatim makes but we
-        // previously missed — e.g. a borough L6 whose name=Cuauhtémoc
-        // matches a nearby place=borough node when neither has a
-        // wikidata tag and no label member is set.
-        if (!data.admin_polygons.empty() && !data.place_nodes.empty()) {
-            auto _nl_t = std::chrono::steady_clock::now();
-
-            // Normalised-name → place-node index for exact-match lookup.
-            // Nominatim's find_linked_place step 4 requires an exact name
-            // overlap via hstore `&&` (same language key, same value) —
-            // effectively a full-name identity match on at least one
-            // name:* tag. Our data only carries a single `name`, so we
-            // approximate by matching on the normalised primary name.
-            // Using exact-match avoids spurious token-overlap links like
-            // "1st District of Athens" → "Athens" or "Manhattan Community
-            // Board 3" → any "Manhattan" place node.
-            std::unordered_map<std::string, std::vector<uint32_t>> name_to_places;
-            name_to_places.reserve(data.place_nodes.size());
-            const auto& pool_data = data.string_pool.data();
-            for (uint32_t i = 0; i < data.place_nodes.size(); i++) {
-                const auto& pn = data.place_nodes[i];
-                if (pn.name_id == NO_DATA) continue;
-                const char* nm = pool_data.data() + pn.name_id;
-                if (!nm[0]) continue;
-                std::string nn = normalise_for_matching(nm);
-                if (nn.empty()) continue;
-                name_to_places[std::move(nn)].push_back(i);
-            }
-
-            // PlaceType → rank_search. Matches Nominatim's
-            // address_levels.json defaults: place=city 16, town 18,
-            // village 19, suburb/hamlet 20, neighbourhood/quarter 22.
-            auto place_rank = [](uint8_t pt) -> uint8_t {
-                switch (static_cast<PlaceType>(pt)) {
-                    case PlaceType::CITY:          return 16;
-                    case PlaceType::TOWN:          return 18;
-                    case PlaceType::BOROUGH:       return 18;
-                    case PlaceType::VILLAGE:       return 19;
-                    case PlaceType::SUBURB:        return 20;
-                    case PlaceType::HAMLET:        return 20;
-                    case PlaceType::NEIGHBOURHOOD: return 22;
-                    case PlaceType::QUARTER:       return 22;
-                    default:                        return 255;
-                }
-            };
-
-            // Nominatim gates step 4 to boundaries with
-            // rank_address 16-23 (admin_level 8-11 under the default
-            // rank mapping al*2). Coarser boundaries never fall through
-            // to step 4 because steps 1-3 almost always catch them
-            // (country/state wikidata coverage is near-total).
-            std::atomic<size_t> pol_idx{0};
-            std::atomic<uint64_t> linked{0};
-            std::atomic<uint64_t> considered{0};
-            std::vector<std::thread> nl_workers;
-            const double max_dist_deg = 0.5;
-            const double max_dist_sq = max_dist_deg * max_dist_deg;
-
-            for (unsigned int t = 0; t < num_threads; t++) {
-                nl_workers.emplace_back([&]() {
-                    while (true) {
-                        size_t i = pol_idx.fetch_add(1);
-                        if (i >= data.admin_polygons.size()) break;
-                        auto& poly = data.admin_polygons[i];
-                        if (poly.place_type_override != 0) continue;
-                        if (poly.admin_level < 8 || poly.admin_level > 11) continue;
-                        if (poly.vertex_count == 0) continue;
-                        if (poly.name_id == NO_DATA) continue;
-                        const char* bnd_name = pool_data.data() + poly.name_id;
-                        if (!bnd_name[0]) continue;
-                        considered.fetch_add(1);
-
-                        uint8_t bnd_rank = poly.admin_level * 2;
-
-                        double sum_lat = 0.0, sum_lng = 0.0;
-                        for (uint32_t v = 0; v < poly.vertex_count; v++) {
-                            sum_lat += data.admin_vertices[poly.vertex_offset + v].lat;
-                            sum_lng += data.admin_vertices[poly.vertex_offset + v].lng;
-                        }
-                        double clat = sum_lat / poly.vertex_count;
-                        double clng = sum_lng / poly.vertex_count;
-
-                        std::string nb = normalise_for_matching(bnd_name);
-                        if (nb.empty()) continue;
-
-                        uint32_t best_idx = NO_DATA;
-                        double best_dist_sq = max_dist_sq;
-
-                        auto it = name_to_places.find(nb);
-                        if (it != name_to_places.end()) {
-                            for (uint32_t pidx : it->second) {
-                                const auto& pn = data.place_nodes[pidx];
-                                uint8_t pr = place_rank(pn.place_type);
-                                if (pr == 255) continue;
-                                int drank = (int)pr - (int)bnd_rank;
-                                if (drank < -2 || drank > 2) continue;
-                                double dlat = (double)pn.lat - clat;
-                                double dlng = (double)pn.lng - clng;
-                                double d2 = dlat * dlat + dlng * dlng;
-                                if (d2 > best_dist_sq) continue;
-                                if (d2 == best_dist_sq) {
-                                    // Preserve the original `>=` reject at the
-                                    // distance threshold (no real candidate yet:
-                                    // best_dist_sq is still max_dist_sq), so this
-                                    // only adds a tiebreak, not a behaviour change
-                                    // at the 0.5° boundary.
-                                    if (best_idx == NO_DATA) continue;
-                                    // Break exact-distance ties by the place node's
-                                    // stable osm_id (build-invariant, unique).
-                                    // name_to_places[nb] is iterated in a non-
-                                    // deterministic order, so equidistant same-
-                                    // named place nodes otherwise flipped the
-                                    // linked place type → place_type_override →
-                                    // admin_polygons.bin between same-PBF builds.
-                                    if (pidx >= data.place_osm_ids.size() ||
-                                        best_idx >= data.place_osm_ids.size() ||
-                                        data.place_osm_ids[pidx] >= data.place_osm_ids[best_idx])
-                                        continue;
-                                }
-                                best_dist_sq = d2;
-                                best_idx = pidx;
-                            }
-                        }
-
-                        if (best_idx != NO_DATA) {
-                            const auto& pn = data.place_nodes[best_idx];
-                            uint8_t pto = place_type_to_admin_override(pn.place_type);
-                            if (pto != 0) {
-                                poly.place_type_override = pto;
-                                linked.fetch_add(1);
-                            }
-                        }
-                    }
-                });
-            }
-            for (auto& w : nl_workers) w.join();
-
-            double _nl_elapsed = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - _nl_t).count();
-            std::cerr << "find_linked_place step 4 (name match): "
-                      << linked.load() << "/" << considered.load()
-                      << " unlinked AL8-11 boundaries linked in "
-                      << _nl_elapsed << "s" << std::endl;
-            log_phase("find_linked_place step 4", _pt, _cpu);
-        }
+        link_places_by_name(data, cfg, _pt, _cpu);
 
         compute_admin_parent_chain(data, cfg);
 
