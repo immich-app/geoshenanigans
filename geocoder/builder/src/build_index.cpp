@@ -808,6 +808,635 @@ static inline uint32_t float_bits(float v) {
     return (bits & 0x80000000) ? ~bits : (bits ^ 0x80000000);
 }
 
+// Build configuration parsed from argv, threaded through the extracted pipeline
+// phases (decomposition seam: free functions taking ParsedData& data + const BuildConfig&).
+struct BuildConfig {
+    unsigned int num_threads = 1;
+    IndexMode mode = IndexMode::Full;
+    bool multi_output = false;
+    bool multi_quality = false;
+    std::string output_dir;
+    std::string prev_output_dir;
+};
+
+// Admin polygon parent chain: for each admin polygon, find the smallest containing
+// polygon with a lower admin_level so the server walks the chain without PIP.
+static void compute_admin_parent_chain(ParsedData& data, const BuildConfig& cfg) {
+    unsigned int num_threads = cfg.num_threads;
+    {
+        auto _ap_t = std::chrono::steady_clock::now();
+        data.admin_parent_ids.assign(data.admin_polygons.size(), NO_DATA);
+        std::atomic<size_t> ap_idx{0};
+        std::vector<std::thread> workers;
+        for (unsigned int t = 0; t < num_threads; t++) {
+            workers.emplace_back([&]() {
+                while (true) {
+                    size_t i = ap_idx.fetch_add(1);
+                    if (i >= data.admin_polygons.size()) break;
+                    const auto& self = data.admin_polygons[i];
+                    if (self.vertex_count == 0 || self.admin_level <= 2) continue;
+                    // Compute centroid
+                    float sum_lat = 0, sum_lng = 0;
+                    for (uint32_t v = 0; v < self.vertex_count; v++) {
+                        sum_lat += data.admin_vertices[self.vertex_offset + v].lat;
+                        sum_lng += data.admin_vertices[self.vertex_offset + v].lng;
+                    }
+                    float clat = sum_lat / self.vertex_count;
+                    float clng = sum_lng / self.vertex_count;
+                    S2CellId cell = S2CellId(S2LatLng::FromDegrees(clat, clng)).parent(kAdminCellLevel);
+                    std::vector<S2CellId> nbrs;
+                    cell.AppendAllNeighbors(kAdminCellLevel, &nbrs);
+
+                    // Pick the closest parent: highest admin_level
+                    // (most immediate), with smallest area as tiebreaker.
+                    // This matches Nominatim's parent_place_id = closest
+                    // containing by rank_address.
+                    uint8_t best_al = 0;
+                    float best_area = 1e18f;
+                    uint32_t best_id = NO_DATA;
+                    auto check_cell = [&](uint64_t cid) {
+                        auto it = data.cell_to_admin.find(cid);
+                        if (it == data.cell_to_admin.end()) return;
+                        for (uint32_t raw_id : it->second) {
+                            uint32_t pid = raw_id & ID_MASK;
+                            if (pid == i || pid >= data.admin_polygons.size()) continue;
+                            const auto& cand = data.admin_polygons[pid];
+                            if (cand.admin_level >= self.admin_level) continue;
+                            // Prefer highest admin_level (closest parent)
+                            if (cand.admin_level < best_al) continue;
+                            if (cand.admin_level == best_al && cand.area >= best_area) continue;
+                            // PIP check
+                            uint32_t off = cand.vertex_offset;
+                            uint32_t cnt = cand.vertex_count;
+                            if (off + cnt > data.admin_vertices.size()) continue;
+                            const auto* verts = &data.admin_vertices[off];
+                            bool inside = false;
+                            for (uint32_t a = 0, b = cnt - 1; a < cnt; b = a++) {
+                                if (((verts[a].lng > clng) != (verts[b].lng > clng)) &&
+                                    (clat < (verts[b].lat - verts[a].lat) * (clng - verts[a].lng) / (verts[b].lng - verts[a].lng) + verts[a].lat))
+                                    inside = !inside;
+                            }
+                            if (inside) {
+                                best_al = cand.admin_level;
+                                best_area = cand.area;
+                                best_id = pid;
+                            }
+                        }
+                    };
+                    check_cell(cell.id());
+                    for (const auto& n : nbrs) check_cell(n.id());
+                    data.admin_parent_ids[i] = best_id;
+                }
+            });
+        }
+        for (auto& w : workers) w.join();
+        double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - _ap_t).count();
+        uint32_t linked = 0;
+        for (auto id : data.admin_parent_ids) if (id != NO_DATA) linked++;
+        std::cerr << "Admin parent chain: " << linked << "/" << data.admin_polygons.size()
+                  << " polygons linked in " << el << "s" << std::endl;
+    }
+}
+
+// Way parent polygon: for each street way, find the smallest admin polygon containing
+// its centroid (server walks the admin chain from a road).
+static void compute_way_parent_polygons(ParsedData& data, const BuildConfig& cfg) {
+    unsigned int num_threads = cfg.num_threads;
+    {
+        auto _wp_t = std::chrono::steady_clock::now();
+        data.way_parent_ids.assign(data.ways.size(), NO_DATA);
+        data.way_postcode_ids.assign(data.ways.size(), NO_DATA);
+
+        // Note: per-way postcode is set from postal boundary PIP only.
+        // The centroid fallback (get_nearest_postcode) is handled at
+        // query time by the server using the per-country-validated
+        // centroid index. Previously the way sweep also did centroid
+        // lookup, but that used the raw (non-per-country) accum which
+        // produced wrong results from cross-country contamination.
+
+        std::atomic<size_t> way_idx{0};
+        std::atomic<uint64_t> way_linked{0};
+        std::vector<std::thread> workers;
+        for (unsigned int t = 0; t < num_threads; t++) {
+            workers.emplace_back([&]() {
+                while (true) {
+                    size_t i = way_idx.fetch_add(1);
+                    if (i >= data.ways.size()) break;
+                    const auto& w = data.ways[i];
+                    if (w.node_count < 1) continue;
+                    // Compute way centroid
+                    float sum_lat = 0, sum_lng = 0;
+                    uint8_t cnt = w.node_count;
+                    for (uint8_t k = 0; k < cnt; k++) {
+                        sum_lat += data.street_nodes[w.node_offset + k].lat;
+                        sum_lng += data.street_nodes[w.node_offset + k].lng;
+                    }
+                    float clat = sum_lat / cnt;
+                    float clng = sum_lng / cnt;
+                    S2CellId cell = S2CellId(S2LatLng::FromDegrees(clat, clng)).parent(kAdminCellLevel);
+                    std::vector<S2CellId> nbrs;
+                    cell.AppendAllNeighbors(kAdminCellLevel, &nbrs);
+
+                    // Pick the most specific containing polygon:
+                    // highest admin_level, then smallest area.
+                    // Skip admin_level > 10 (postal boundaries) for parent chain.
+                    uint8_t best_al = 0;
+                    float best_area = 1e18f;
+                    uint32_t best_id = NO_DATA;
+                    // Nominatim's `getNearFeatures`
+                    // (lib-sql/functions/partition-functions.sql:42)
+                    // returns every postal polygon that intersects
+                    // the street's LineString, ordered by
+                    //   `min(ST_Distance(way_centroid, poly_geom))
+                    //    + 0.00001 * ST_Distance(way, poly_centroid)`.
+                    // The dominant term picks polygons containing
+                    // the way's centroid; when multiple polygons
+                    // overlap the way but only one contains its
+                    // centroid, that one wins. For a long street
+                    // crossing several postal polygons (Delhi's
+                    // Kartavya Path traverses 110001 / 110004 /
+                    // 110098), which polygon owns the centroid
+                    // depends on the street's shape — centroid PIP
+                    // alone can pick a polygon that covers only a
+                    // small fraction of the way. We tally a per-
+                    // polygon vertex-containment vote and pick the
+                    // polygon that covers the most way vertices;
+                    // ties break by smallest area. That matches the
+                    // spirit of `ST_Distance(way, poly_centroid)`
+                    // closer than pure centroid containment.
+                    struct PostalVote { uint32_t pid; uint32_t votes; float area; };
+                    std::vector<PostalVote> postal_votes;
+                    postal_votes.reserve(4);
+                    auto tally_postal = [&](uint32_t pid, float poly_area) {
+                        for (auto& v : postal_votes) {
+                            if (v.pid == pid) { v.votes++; return; }
+                        }
+                        postal_votes.push_back({pid, 1u, poly_area});
+                    };
+                    auto poly_contains = [&](uint32_t pid, float plat, float plng) -> bool {
+                        const auto& cand = data.admin_polygons[pid];
+                        uint32_t off = cand.vertex_offset;
+                        uint32_t cnt2 = cand.vertex_count;
+                        if (off + cnt2 > data.admin_vertices.size()) return false;
+                        const auto* verts = &data.admin_vertices[off];
+                        bool inside = false;
+                        for (uint32_t a = 0, b = cnt2 - 1; a < cnt2; b = a++) {
+                            if (((verts[a].lng > plng) != (verts[b].lng > plng)) &&
+                                (plat < (verts[b].lat - verts[a].lat) * (plng - verts[a].lng) / (verts[b].lng - verts[a].lng) + verts[a].lat))
+                                inside = !inside;
+                        }
+                        return inside;
+                    };
+                    // Parent-chain pick still uses centroid PIP —
+                    // admin hierarchy is fine-grained enough that
+                    // centroid containment gives a stable result.
+                    auto check_cell = [&](uint64_t cid) {
+                        auto it = data.cell_to_admin.find(cid);
+                        if (it == data.cell_to_admin.end()) return;
+                        for (uint32_t raw_id : it->second) {
+                            uint32_t pid = raw_id & ID_MASK;
+                            if (pid >= data.admin_polygons.size()) continue;
+                            const auto& cand = data.admin_polygons[pid];
+                            if (cand.admin_level > 11) continue;
+                            if (cand.admin_level <= 10) {
+                                bool dominated = (cand.admin_level < best_al) ||
+                                    (cand.admin_level == best_al && cand.area >= best_area);
+                                if (dominated) continue;
+                                if (poly_contains(pid, clat, clng)) {
+                                    if (cand.admin_level > best_al ||
+                                        (cand.admin_level == best_al && cand.area < best_area)) {
+                                        best_al = cand.admin_level;
+                                        best_area = cand.area;
+                                        best_id = pid;
+                                    }
+                                }
+                            } else if (cand.admin_level == 11) {
+                                // Per-vertex vote: if any way vertex
+                                // is inside this postal polygon, it
+                                // gets credit proportional to how
+                                // many vertices it covers. Capped at
+                                // 16 vertices to bound work on huge
+                                // ways (interpolations aren't in
+                                // this loop since they're separate).
+                                uint8_t samples = cnt < 16 ? cnt : 16;
+                                uint8_t step = cnt > samples ? cnt / samples : 1;
+                                for (uint8_t k = 0; k < cnt; k += step) {
+                                    const auto& nd = data.street_nodes[w.node_offset + k];
+                                    if (poly_contains(pid, nd.lat, nd.lng)) {
+                                        tally_postal(pid, cand.area);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    check_cell(cell.id());
+                    for (const auto& n : nbrs) check_cell(n.id());
+                    if (best_id != NO_DATA) {
+                        data.way_parent_ids[i] = best_id;
+                        way_linked.fetch_add(1);
+                    }
+                    // Re-run vertex vote across all candidate postal
+                    // polygons: for each polygon that contains at
+                    // least one vertex, count how many vertices it
+                    // covers.
+                    if (!postal_votes.empty()) {
+                        for (auto& pv : postal_votes) {
+                            pv.votes = 0;
+                            uint8_t samples = cnt < 16 ? cnt : 16;
+                            uint8_t step = cnt > samples ? cnt / samples : 1;
+                            for (uint8_t k = 0; k < cnt; k += step) {
+                                const auto& nd = data.street_nodes[w.node_offset + k];
+                                if (poly_contains(pv.pid, nd.lat, nd.lng)) pv.votes++;
+                            }
+                        }
+                        // Sort: highest votes first, tiebreak by
+                        // smaller area (more specific).
+                        std::sort(postal_votes.begin(), postal_votes.end(),
+                            [](const PostalVote& a, const PostalVote& b) {
+                                if (a.votes != b.votes) return a.votes > b.votes;
+                                return a.area < b.area;
+                            });
+                        if (postal_votes[0].votes > 0) {
+                            data.way_postcode_ids[i] = data.admin_polygons[postal_votes[0].pid].name_id;
+                        }
+                    }
+
+                    // Centroid fallback removed from way sweep — now
+                    // handled at query time by the server's per-country
+                    // validated centroid index (resolve_postcode tier 3).
+                    if (false) {
+                        uint32_t best_pc_id = NO_DATA; // dead code
+                        if (best_pc_id != NO_DATA) {
+                            data.way_postcode_ids[i] = best_pc_id;
+                        }
+                    }
+                }
+            });
+        }
+        for (auto& w : workers) w.join();
+        double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - _wp_t).count();
+        std::cerr << "Way parent polygon: " << way_linked.load() << "/" << data.ways.size()
+                  << " ways linked in " << el << "s" << std::endl;
+    }
+}
+
+// CDP postcode inheritance: propagate boundary=census/postal_code polygon postcodes
+// onto contained ways/addr where missing (build-time only).
+static void inherit_cdp_postcodes(ParsedData& data, const BuildConfig& cfg) {
+    unsigned int num_threads = cfg.num_threads;
+    if (!data.cdp_postcode_relations.empty()) {
+        auto _cdp_t = std::chrono::steady_clock::now();
+        std::cerr << "Assembling " << data.cdp_postcode_relations.size()
+                  << " boundary=census polygons..." << std::endl;
+
+        size_t skipped_no_geom = 0;
+        for (auto& cr : data.cdp_postcode_relations) {
+            bool has_missing = false;
+            for (const auto& [way_id, role] : cr.members) {
+                if (data.way_geometries.find(way_id) == data.way_geometries.end()) {
+                    has_missing = true;
+                    break;
+                }
+            }
+            if (has_missing) { skipped_no_geom++; continue; }
+
+            auto rings = assemble_outer_rings(cr.members, data.way_geometries);
+            if (rings.empty()) {
+                auto retry = assemble_outer_rings(cr.members, data.way_geometries, true);
+                for (auto& r : retry) rings.push_back(std::move(r));
+            }
+            if (rings.empty()) { skipped_no_geom++; continue; }
+
+            for (auto& ring : rings) {
+                if (ring.size() < 3) continue;
+                CdpPostcodePoly p;
+                p.postcode = cr.postcode;
+                p.min_lat = ring[0].first;
+                p.max_lat = ring[0].first;
+                p.min_lng = ring[0].second;
+                p.max_lng = ring[0].second;
+                for (const auto& [la, ln] : ring) {
+                    if (la < p.min_lat) p.min_lat = la;
+                    if (la > p.max_lat) p.max_lat = la;
+                    if (ln < p.min_lng) p.min_lng = ln;
+                    if (ln > p.max_lng) p.max_lng = ln;
+                }
+                p.vertices = std::move(ring);
+                data.cdp_postcode_polys.push_back(std::move(p));
+            }
+        }
+        data.cdp_postcode_relations.clear();
+        data.cdp_postcode_relations.shrink_to_fit();
+
+        double cdp_el = std::chrono::duration<double>(std::chrono::steady_clock::now() - _cdp_t).count();
+        std::cerr << "CDP assembly: " << data.cdp_postcode_polys.size()
+                  << " polys built in " << cdp_el << "s ("
+                  << skipped_no_geom << " skipped for missing geometry)" << std::endl;
+    }
+
+    if (!data.cdp_postcode_polys.empty()) {
+        auto _inh_t = std::chrono::steady_clock::now();
+
+        // Pre-intern postcode strings (one entry per unique postcode)
+        std::unordered_map<std::string, uint32_t> pc_to_id;
+        std::vector<uint32_t> cdp_offsets(data.cdp_postcode_polys.size());
+        for (size_t i = 0; i < data.cdp_postcode_polys.size(); i++) {
+            const auto& pc = data.cdp_postcode_polys[i].postcode;
+            auto it = pc_to_id.find(pc);
+            if (it == pc_to_id.end()) {
+                uint32_t off = data.string_pool.intern(pc);
+                pc_to_id[pc] = off;
+                cdp_offsets[i] = off;
+            } else {
+                cdp_offsets[i] = it->second;
+            }
+        }
+
+        // Cell-indexed lookup: register each CDP in every admin-level
+        // cell that any of its vertices fall into, plus the 8 immediate
+        // neighbours of each such cell. For typical US CDPs (small
+        // enough that vertex cells + neighbours cover the interior)
+        // this captures every query that could be inside the CDP.
+        std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_cdp;
+        for (uint32_t ci = 0; ci < data.cdp_postcode_polys.size(); ci++) {
+            const auto& cdp = data.cdp_postcode_polys[ci];
+            std::unordered_set<uint64_t> cells;
+            for (const auto& [la, ln] : cdp.vertices) {
+                S2CellId c = S2CellId(S2LatLng::FromDegrees(la, ln)).parent(kAdminCellLevel);
+                cells.insert(c.id());
+                std::vector<S2CellId> nbrs;
+                c.AppendAllNeighbors(kAdminCellLevel, &nbrs);
+                for (const auto& n : nbrs) cells.insert(n.id());
+            }
+            for (uint64_t cid : cells) cell_to_cdp[cid].push_back(ci);
+        }
+        std::cerr << "CDP cell index: " << cell_to_cdp.size() << " cells" << std::endl;
+
+        std::atomic<size_t> inherited_addr{0};
+        std::atomic<size_t> inherited_way{0};
+
+        // Parallel scan over addr_points
+        std::atomic<size_t> addr_idx{0};
+        std::vector<std::thread> addr_workers;
+        for (unsigned int t = 0; t < num_threads; t++) {
+            addr_workers.emplace_back([&]() {
+                while (true) {
+                    size_t start = addr_idx.fetch_add(4096);
+                    if (start >= data.addr_points.size()) break;
+                    size_t end = std::min(start + 4096, data.addr_points.size());
+                    for (size_t j = start; j < end; j++) {
+                        if (j >= data.addr_postcode_ids.size()) break;
+                        if (data.addr_postcode_ids[j] != NO_DATA) continue;
+                        const auto& ap = data.addr_points[j];
+                        S2CellId cell = S2CellId(S2LatLng::FromDegrees(ap.lat, ap.lng)).parent(kAdminCellLevel);
+                        auto it = cell_to_cdp.find(cell.id());
+                        if (it == cell_to_cdp.end()) continue;
+                        for (uint32_t ci : it->second) {
+                            const auto& cdp = data.cdp_postcode_polys[ci];
+                            if ((double)ap.lat < cdp.min_lat || (double)ap.lat > cdp.max_lat) continue;
+                            if ((double)ap.lng < cdp.min_lng || (double)ap.lng > cdp.max_lng) continue;
+                            if (point_in_polygon((double)ap.lat, (double)ap.lng, cdp.vertices)) {
+                                data.addr_postcode_ids[j] = cdp_offsets[ci];
+                                inherited_addr.fetch_add(1);
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        for (auto& w : addr_workers) w.join();
+
+        // Parallel scan over ways (use centroid as PIP point)
+        std::atomic<size_t> way_pc_idx{0};
+        std::vector<std::thread> way_pc_workers;
+        for (unsigned int t = 0; t < num_threads; t++) {
+            way_pc_workers.emplace_back([&]() {
+                while (true) {
+                    size_t start = way_pc_idx.fetch_add(4096);
+                    if (start >= data.ways.size()) break;
+                    size_t end = std::min(start + 4096, data.ways.size());
+                    for (size_t j = start; j < end; j++) {
+                        if (j >= data.way_postcode_ids.size()) break;
+                        if (data.way_postcode_ids[j] != NO_DATA) continue;
+                        const auto& w = data.ways[j];
+                        if (w.node_count == 0) continue;
+                        float sum_lat = 0, sum_lng = 0;
+                        for (uint8_t k = 0; k < w.node_count; k++) {
+                            sum_lat += data.street_nodes[w.node_offset + k].lat;
+                            sum_lng += data.street_nodes[w.node_offset + k].lng;
+                        }
+                        double clat = sum_lat / w.node_count;
+                        double clng = sum_lng / w.node_count;
+                        S2CellId cell = S2CellId(S2LatLng::FromDegrees(clat, clng)).parent(kAdminCellLevel);
+                        auto it = cell_to_cdp.find(cell.id());
+                        if (it == cell_to_cdp.end()) continue;
+                        for (uint32_t ci : it->second) {
+                            const auto& cdp = data.cdp_postcode_polys[ci];
+                            if (clat < cdp.min_lat || clat > cdp.max_lat) continue;
+                            if (clng < cdp.min_lng || clng > cdp.max_lng) continue;
+                            if (point_in_polygon(clat, clng, cdp.vertices)) {
+                                data.way_postcode_ids[j] = cdp_offsets[ci];
+                                inherited_way.fetch_add(1);
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        for (auto& w : way_pc_workers) w.join();
+
+        double inh_el = std::chrono::duration<double>(std::chrono::steady_clock::now() - _inh_t).count();
+        std::cerr << "CDP postcode inheritance: " << inherited_addr.load()
+                  << " addrs + " << inherited_way.load() << " ways inherited from "
+                  << data.cdp_postcode_polys.size() << " CDPs in " << inh_el << "s" << std::endl;
+
+        // Discard CDP polys — they are build-time only
+        data.cdp_postcode_polys.clear();
+        data.cdp_postcode_polys.shrink_to_fit();
+    }
+}
+
+// Address-point parent-street backfill: link addr_points lacking addr:street to the
+// nearest named street's name_id (Nominatim parent_place_id parity).
+static void backfill_addr_point_parent_streets(ParsedData& data, const BuildConfig& cfg) {
+    unsigned int num_threads = cfg.num_threads;
+    if (!data.addr_points.empty() && !data.ways.empty()) {
+        auto _as_t = std::chrono::steady_clock::now();
+        auto _as_cpu = CpuTicks::now();
+        std::atomic<uint64_t> backfill_candidates{0};
+        for (const auto& p : data.addr_points) {
+            if (p.street_id == NO_DATA) backfill_candidates.fetch_add(1);
+        }
+        std::cerr << "Backfilling addr_point parent streets ("
+                  << backfill_candidates.load() << "/"
+                  << data.addr_points.size() << " need it)..."
+                  << std::endl;
+
+        std::atomic<size_t> ap_idx{0};
+        std::atomic<uint64_t> ap_linked{0};
+        const auto& pool_data = data.string_pool.data();
+        std::vector<std::thread> ap_workers;
+        for (unsigned int t = 0; t < num_threads; t++) {
+            ap_workers.emplace_back([&]() {
+                std::vector<uint64_t> cells_to_check;
+                while (true) {
+                    size_t i = ap_idx.fetch_add(1);
+                    if (i >= data.addr_points.size()) break;
+                    auto& ap = data.addr_points[i];
+                    ap.parent_way_id = NO_DATA;
+
+                    float plat = ap.lat;
+                    float plng = ap.lng;
+                    S2CellId center = S2CellId(
+                        S2LatLng::FromDegrees(plat, plng))
+                        .parent(kStreetCellLevel);
+                    cells_to_check.clear();
+                    cells_to_check.push_back(center.id());
+                    std::vector<S2CellId> ring1;
+                    center.AppendAllNeighbors(kStreetCellLevel, &ring1);
+                    for (const auto& n : ring1) {
+                        cells_to_check.push_back(n.id());
+                        std::vector<S2CellId> ring2;
+                        n.AppendAllNeighbors(kStreetCellLevel, &ring2);
+                        for (const auto& n2 : ring2) {
+                            cells_to_check.push_back(n2.id());
+                        }
+                    }
+                    std::sort(cells_to_check.begin(), cells_to_check.end());
+                    cells_to_check.erase(
+                        std::unique(cells_to_check.begin(), cells_to_check.end()),
+                        cells_to_check.end());
+
+                    double best_d2 = 1e18;
+                    uint32_t best_name = NO_DATA;
+                    uint32_t best_way_idx = NO_DATA;
+                    // Stable tie-break for EXACT-distance ties. The
+                    // candidate iteration is ordered by sorted_way_cells
+                    // item_id = the pre-sort way index, which is
+                    // non-deterministic (parallel PBF parse order). When
+                    // an addr point is exactly equidistant from two
+                    // different (non-duplicate) ways — corners,
+                    // intersections, shared nodes — a strict `d2 < best`
+                    // pick lets the build-encounter order decide the
+                    // winner, so parent_way_id flips between same-PBF
+                    // builds. Since parent_way_id is part of the dedup
+                    // key, those flips cascade into massive addr_points
+                    // patch churn. Break exact ties by the way's osm_id
+                    // (invariant across builds) for a deterministic pick.
+                    int64_t best_osm = INT64_MAX;
+                    // Token-matched resolution: track nearest
+                    // way whose original name matches addr:street
+                    double best_match_d2 = 1e18;
+                    uint32_t best_match_name = NO_DATA;
+                    uint32_t best_match_way = NO_DATA;
+                    int64_t best_match_osm = INT64_MAX;
+                    const char* addr_street_str = nullptr;
+                    if (ap.street_id != NO_DATA) {
+                        addr_street_str = pool_data.data() + ap.street_id;
+                    }
+                    const double cos_lat = std::cos(
+                        plat * M_PI / 180.0);
+                    for (uint64_t cid : cells_to_check) {
+                        CellItemPair probe{cid, 0};
+                        auto lo = std::lower_bound(
+                            data.sorted_way_cells.begin(),
+                            data.sorted_way_cells.end(), probe,
+                            cell_item_less);
+                        for (auto p = lo;
+                             p != data.sorted_way_cells.end() && p->cell_id == cid;
+                             ++p) {
+                            uint32_t way_id = p->item_id;
+                            if (way_id >= data.ways.size()) continue;
+                            const auto& w = data.ways[way_id];
+                            if (w.name_id == NO_DATA) continue;
+                            uint32_t off = w.node_offset;
+                            uint8_t cnt = w.node_count;
+                            if (cnt < 2) continue;
+                            if (static_cast<size_t>(off) + cnt > data.street_nodes.size()) continue;
+                            for (uint8_t k = 0; k + 1 < cnt; k++) {
+                                const auto& a = data.street_nodes[off + k];
+                                const auto& b = data.street_nodes[off + k + 1];
+                                double ax = (a.lng - plng) * cos_lat;
+                                double ay = (a.lat - plat);
+                                double bx = (b.lng - plng) * cos_lat;
+                                double by = (b.lat - plat);
+                                double dx = bx - ax;
+                                double dy = by - ay;
+                                double seg_len2 = dx * dx + dy * dy;
+                                double d2;
+                                if (seg_len2 < 1e-18) {
+                                    d2 = ax * ax + ay * ay;
+                                } else {
+                                    double tt = -(ax * dx + ay * dy) / seg_len2;
+                                    if (tt < 0.0) tt = 0.0;
+                                    else if (tt > 1.0) tt = 1.0;
+                                    double qx = ax + tt * dx;
+                                    double qy = ay + tt * dy;
+                                    d2 = qx * qx + qy * qy;
+                                }
+                                int64_t cand_osm = way_id < data.way_osm_ids.size()
+                                    ? data.way_osm_ids[way_id] : INT64_MAX;
+                                if (d2 < best_d2 ||
+                                    (d2 == best_d2 && cand_osm < best_osm)) {
+                                    best_d2 = d2;
+                                    best_name = w.name_id;
+                                    best_way_idx = way_id;
+                                    best_osm = cand_osm;
+                                }
+                                // Token-matched: check if way's
+                                // original name matches addr:street
+                                if ((d2 < best_match_d2 ||
+                                     (d2 == best_match_d2 && cand_osm < best_match_osm))
+                                    && addr_street_str
+                                    && way_id < data.way_orig_name_ids.size()) {
+                                    uint32_t orig_id = data.way_orig_name_ids[way_id];
+                                    if (orig_id != NO_DATA) {
+                                        const char* orig_str = pool_data.data() + orig_id;
+                                        if (tokens_overlap(addr_street_str, orig_str)) {
+                                            best_match_d2 = d2;
+                                            best_match_name = w.name_id;
+                                            best_match_way = way_id;
+                                            best_match_osm = cand_osm;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (best_way_idx != NO_DATA) {
+                        // Prefer token-matched way (matches
+                        // Nominatim's getNearestNamedRoadPlaceId
+                        // which finds the closest street whose
+                        // name tokens overlap with addr:street).
+                        if (best_match_way != NO_DATA) {
+                            ap.parent_way_id = best_match_way;
+                            ap.street_id = best_match_name;
+                        } else {
+                            ap.parent_way_id = best_way_idx;
+                            if (ap.street_id == NO_DATA && best_name != NO_DATA) {
+                                ap.street_id = best_name;
+                            }
+                        }
+                        ap_linked.fetch_add(1);
+                    }
+                }
+            });
+        }
+        for (auto& w : ap_workers) w.join();
+        double _ap_elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - _as_t).count();
+        std::cerr << "Addr parent-street backfill: "
+                  << ap_linked.load() << "/"
+                  << backfill_candidates.load()
+                  << " addr_points linked in "
+                  << _ap_elapsed << "s" << std::endl;
+        log_phase("  Addr: parent-street backfill", _as_t, _as_cpu);
+    }
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [options]" << std::endl;
@@ -1012,6 +1641,7 @@ int main(int argc, char* argv[]) {
 
         // Create thread pool for concurrent admin polygon S2 covering
         unsigned int num_threads = std::max(1u, std::thread::hardware_concurrency() - 1);
+        BuildConfig cfg{num_threads, mode, multi_output, multi_quality, output_dir, prev_output_dir};
         std::cerr << "Using " << num_threads << " worker threads." << std::endl;
         AdminCoverPool admin_pool(num_threads);
         // BuildHandler no longer used — parallel processing handles everything
@@ -3383,443 +4013,11 @@ int main(int argc, char* argv[]) {
             log_phase("find_linked_place step 4", _pt, _cpu);
         }
 
-        // --- Admin polygon parent chain ---
-        // For each admin polygon, find the smallest containing polygon
-        // with a lower admin_level. This lets the server walk up the
-        // chain (way → suburb → city → state → country) without PIP.
-        {
-            auto _ap_t = std::chrono::steady_clock::now();
-            data.admin_parent_ids.assign(data.admin_polygons.size(), NO_DATA);
-            std::atomic<size_t> ap_idx{0};
-            std::vector<std::thread> workers;
-            for (unsigned int t = 0; t < num_threads; t++) {
-                workers.emplace_back([&]() {
-                    while (true) {
-                        size_t i = ap_idx.fetch_add(1);
-                        if (i >= data.admin_polygons.size()) break;
-                        const auto& self = data.admin_polygons[i];
-                        if (self.vertex_count == 0 || self.admin_level <= 2) continue;
-                        // Compute centroid
-                        float sum_lat = 0, sum_lng = 0;
-                        for (uint32_t v = 0; v < self.vertex_count; v++) {
-                            sum_lat += data.admin_vertices[self.vertex_offset + v].lat;
-                            sum_lng += data.admin_vertices[self.vertex_offset + v].lng;
-                        }
-                        float clat = sum_lat / self.vertex_count;
-                        float clng = sum_lng / self.vertex_count;
-                        S2CellId cell = S2CellId(S2LatLng::FromDegrees(clat, clng)).parent(kAdminCellLevel);
-                        std::vector<S2CellId> nbrs;
-                        cell.AppendAllNeighbors(kAdminCellLevel, &nbrs);
+        compute_admin_parent_chain(data, cfg);
 
-                        // Pick the closest parent: highest admin_level
-                        // (most immediate), with smallest area as tiebreaker.
-                        // This matches Nominatim's parent_place_id = closest
-                        // containing by rank_address.
-                        uint8_t best_al = 0;
-                        float best_area = 1e18f;
-                        uint32_t best_id = NO_DATA;
-                        auto check_cell = [&](uint64_t cid) {
-                            auto it = data.cell_to_admin.find(cid);
-                            if (it == data.cell_to_admin.end()) return;
-                            for (uint32_t raw_id : it->second) {
-                                uint32_t pid = raw_id & ID_MASK;
-                                if (pid == i || pid >= data.admin_polygons.size()) continue;
-                                const auto& cand = data.admin_polygons[pid];
-                                if (cand.admin_level >= self.admin_level) continue;
-                                // Prefer highest admin_level (closest parent)
-                                if (cand.admin_level < best_al) continue;
-                                if (cand.admin_level == best_al && cand.area >= best_area) continue;
-                                // PIP check
-                                uint32_t off = cand.vertex_offset;
-                                uint32_t cnt = cand.vertex_count;
-                                if (off + cnt > data.admin_vertices.size()) continue;
-                                const auto* verts = &data.admin_vertices[off];
-                                bool inside = false;
-                                for (uint32_t a = 0, b = cnt - 1; a < cnt; b = a++) {
-                                    if (((verts[a].lng > clng) != (verts[b].lng > clng)) &&
-                                        (clat < (verts[b].lat - verts[a].lat) * (clng - verts[a].lng) / (verts[b].lng - verts[a].lng) + verts[a].lat))
-                                        inside = !inside;
-                                }
-                                if (inside) {
-                                    best_al = cand.admin_level;
-                                    best_area = cand.area;
-                                    best_id = pid;
-                                }
-                            }
-                        };
-                        check_cell(cell.id());
-                        for (const auto& n : nbrs) check_cell(n.id());
-                        data.admin_parent_ids[i] = best_id;
-                    }
-                });
-            }
-            for (auto& w : workers) w.join();
-            double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - _ap_t).count();
-            uint32_t linked = 0;
-            for (auto id : data.admin_parent_ids) if (id != NO_DATA) linked++;
-            std::cerr << "Admin parent chain: " << linked << "/" << data.admin_polygons.size()
-                      << " polygons linked in " << el << "s" << std::endl;
-        }
+        compute_way_parent_polygons(data, cfg);
 
-        // --- Way parent polygon ---
-        // For each street way, find the smallest admin polygon containing
-        // its centroid. The server uses this to walk the admin chain from
-        // the primary street without PIP.
-        {
-            auto _wp_t = std::chrono::steady_clock::now();
-            data.way_parent_ids.assign(data.ways.size(), NO_DATA);
-            data.way_postcode_ids.assign(data.ways.size(), NO_DATA);
-
-            // Note: per-way postcode is set from postal boundary PIP only.
-            // The centroid fallback (get_nearest_postcode) is handled at
-            // query time by the server using the per-country-validated
-            // centroid index. Previously the way sweep also did centroid
-            // lookup, but that used the raw (non-per-country) accum which
-            // produced wrong results from cross-country contamination.
-
-            std::atomic<size_t> way_idx{0};
-            std::atomic<uint64_t> way_linked{0};
-            std::vector<std::thread> workers;
-            for (unsigned int t = 0; t < num_threads; t++) {
-                workers.emplace_back([&]() {
-                    while (true) {
-                        size_t i = way_idx.fetch_add(1);
-                        if (i >= data.ways.size()) break;
-                        const auto& w = data.ways[i];
-                        if (w.node_count < 1) continue;
-                        // Compute way centroid
-                        float sum_lat = 0, sum_lng = 0;
-                        uint8_t cnt = w.node_count;
-                        for (uint8_t k = 0; k < cnt; k++) {
-                            sum_lat += data.street_nodes[w.node_offset + k].lat;
-                            sum_lng += data.street_nodes[w.node_offset + k].lng;
-                        }
-                        float clat = sum_lat / cnt;
-                        float clng = sum_lng / cnt;
-                        S2CellId cell = S2CellId(S2LatLng::FromDegrees(clat, clng)).parent(kAdminCellLevel);
-                        std::vector<S2CellId> nbrs;
-                        cell.AppendAllNeighbors(kAdminCellLevel, &nbrs);
-
-                        // Pick the most specific containing polygon:
-                        // highest admin_level, then smallest area.
-                        // Skip admin_level > 10 (postal boundaries) for parent chain.
-                        uint8_t best_al = 0;
-                        float best_area = 1e18f;
-                        uint32_t best_id = NO_DATA;
-                        // Nominatim's `getNearFeatures`
-                        // (lib-sql/functions/partition-functions.sql:42)
-                        // returns every postal polygon that intersects
-                        // the street's LineString, ordered by
-                        //   `min(ST_Distance(way_centroid, poly_geom))
-                        //    + 0.00001 * ST_Distance(way, poly_centroid)`.
-                        // The dominant term picks polygons containing
-                        // the way's centroid; when multiple polygons
-                        // overlap the way but only one contains its
-                        // centroid, that one wins. For a long street
-                        // crossing several postal polygons (Delhi's
-                        // Kartavya Path traverses 110001 / 110004 /
-                        // 110098), which polygon owns the centroid
-                        // depends on the street's shape — centroid PIP
-                        // alone can pick a polygon that covers only a
-                        // small fraction of the way. We tally a per-
-                        // polygon vertex-containment vote and pick the
-                        // polygon that covers the most way vertices;
-                        // ties break by smallest area. That matches the
-                        // spirit of `ST_Distance(way, poly_centroid)`
-                        // closer than pure centroid containment.
-                        struct PostalVote { uint32_t pid; uint32_t votes; float area; };
-                        std::vector<PostalVote> postal_votes;
-                        postal_votes.reserve(4);
-                        auto tally_postal = [&](uint32_t pid, float poly_area) {
-                            for (auto& v : postal_votes) {
-                                if (v.pid == pid) { v.votes++; return; }
-                            }
-                            postal_votes.push_back({pid, 1u, poly_area});
-                        };
-                        auto poly_contains = [&](uint32_t pid, float plat, float plng) -> bool {
-                            const auto& cand = data.admin_polygons[pid];
-                            uint32_t off = cand.vertex_offset;
-                            uint32_t cnt2 = cand.vertex_count;
-                            if (off + cnt2 > data.admin_vertices.size()) return false;
-                            const auto* verts = &data.admin_vertices[off];
-                            bool inside = false;
-                            for (uint32_t a = 0, b = cnt2 - 1; a < cnt2; b = a++) {
-                                if (((verts[a].lng > plng) != (verts[b].lng > plng)) &&
-                                    (plat < (verts[b].lat - verts[a].lat) * (plng - verts[a].lng) / (verts[b].lng - verts[a].lng) + verts[a].lat))
-                                    inside = !inside;
-                            }
-                            return inside;
-                        };
-                        // Parent-chain pick still uses centroid PIP —
-                        // admin hierarchy is fine-grained enough that
-                        // centroid containment gives a stable result.
-                        auto check_cell = [&](uint64_t cid) {
-                            auto it = data.cell_to_admin.find(cid);
-                            if (it == data.cell_to_admin.end()) return;
-                            for (uint32_t raw_id : it->second) {
-                                uint32_t pid = raw_id & ID_MASK;
-                                if (pid >= data.admin_polygons.size()) continue;
-                                const auto& cand = data.admin_polygons[pid];
-                                if (cand.admin_level > 11) continue;
-                                if (cand.admin_level <= 10) {
-                                    bool dominated = (cand.admin_level < best_al) ||
-                                        (cand.admin_level == best_al && cand.area >= best_area);
-                                    if (dominated) continue;
-                                    if (poly_contains(pid, clat, clng)) {
-                                        if (cand.admin_level > best_al ||
-                                            (cand.admin_level == best_al && cand.area < best_area)) {
-                                            best_al = cand.admin_level;
-                                            best_area = cand.area;
-                                            best_id = pid;
-                                        }
-                                    }
-                                } else if (cand.admin_level == 11) {
-                                    // Per-vertex vote: if any way vertex
-                                    // is inside this postal polygon, it
-                                    // gets credit proportional to how
-                                    // many vertices it covers. Capped at
-                                    // 16 vertices to bound work on huge
-                                    // ways (interpolations aren't in
-                                    // this loop since they're separate).
-                                    uint8_t samples = cnt < 16 ? cnt : 16;
-                                    uint8_t step = cnt > samples ? cnt / samples : 1;
-                                    for (uint8_t k = 0; k < cnt; k += step) {
-                                        const auto& nd = data.street_nodes[w.node_offset + k];
-                                        if (poly_contains(pid, nd.lat, nd.lng)) {
-                                            tally_postal(pid, cand.area);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        };
-                        check_cell(cell.id());
-                        for (const auto& n : nbrs) check_cell(n.id());
-                        if (best_id != NO_DATA) {
-                            data.way_parent_ids[i] = best_id;
-                            way_linked.fetch_add(1);
-                        }
-                        // Re-run vertex vote across all candidate postal
-                        // polygons: for each polygon that contains at
-                        // least one vertex, count how many vertices it
-                        // covers.
-                        if (!postal_votes.empty()) {
-                            for (auto& pv : postal_votes) {
-                                pv.votes = 0;
-                                uint8_t samples = cnt < 16 ? cnt : 16;
-                                uint8_t step = cnt > samples ? cnt / samples : 1;
-                                for (uint8_t k = 0; k < cnt; k += step) {
-                                    const auto& nd = data.street_nodes[w.node_offset + k];
-                                    if (poly_contains(pv.pid, nd.lat, nd.lng)) pv.votes++;
-                                }
-                            }
-                            // Sort: highest votes first, tiebreak by
-                            // smaller area (more specific).
-                            std::sort(postal_votes.begin(), postal_votes.end(),
-                                [](const PostalVote& a, const PostalVote& b) {
-                                    if (a.votes != b.votes) return a.votes > b.votes;
-                                    return a.area < b.area;
-                                });
-                            if (postal_votes[0].votes > 0) {
-                                data.way_postcode_ids[i] = data.admin_polygons[postal_votes[0].pid].name_id;
-                            }
-                        }
-
-                        // Centroid fallback removed from way sweep — now
-                        // handled at query time by the server's per-country
-                        // validated centroid index (resolve_postcode tier 3).
-                        if (false) {
-                            uint32_t best_pc_id = NO_DATA; // dead code
-                            if (best_pc_id != NO_DATA) {
-                                data.way_postcode_ids[i] = best_pc_id;
-                            }
-                        }
-                    }
-                });
-            }
-            for (auto& w : workers) w.join();
-            double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - _wp_t).count();
-            std::cerr << "Way parent polygon: " << way_linked.load() << "/" << data.ways.size()
-                      << " ways linked in " << el << "s" << std::endl;
-        }
-
-        // --- CDP postcode inheritance ---
-        // Mirrors Nominatim's calculated_postcode propagation: for each
-        // addr_point or way without a postcode, inherit from a containing
-        // boundary=census relation that has a postal_code tag. CDPs are
-        // build-time only and are NOT written to any output file.
-        if (!data.cdp_postcode_relations.empty()) {
-            auto _cdp_t = std::chrono::steady_clock::now();
-            std::cerr << "Assembling " << data.cdp_postcode_relations.size()
-                      << " boundary=census polygons..." << std::endl;
-
-            size_t skipped_no_geom = 0;
-            for (auto& cr : data.cdp_postcode_relations) {
-                bool has_missing = false;
-                for (const auto& [way_id, role] : cr.members) {
-                    if (data.way_geometries.find(way_id) == data.way_geometries.end()) {
-                        has_missing = true;
-                        break;
-                    }
-                }
-                if (has_missing) { skipped_no_geom++; continue; }
-
-                auto rings = assemble_outer_rings(cr.members, data.way_geometries);
-                if (rings.empty()) {
-                    auto retry = assemble_outer_rings(cr.members, data.way_geometries, true);
-                    for (auto& r : retry) rings.push_back(std::move(r));
-                }
-                if (rings.empty()) { skipped_no_geom++; continue; }
-
-                for (auto& ring : rings) {
-                    if (ring.size() < 3) continue;
-                    CdpPostcodePoly p;
-                    p.postcode = cr.postcode;
-                    p.min_lat = ring[0].first;
-                    p.max_lat = ring[0].first;
-                    p.min_lng = ring[0].second;
-                    p.max_lng = ring[0].second;
-                    for (const auto& [la, ln] : ring) {
-                        if (la < p.min_lat) p.min_lat = la;
-                        if (la > p.max_lat) p.max_lat = la;
-                        if (ln < p.min_lng) p.min_lng = ln;
-                        if (ln > p.max_lng) p.max_lng = ln;
-                    }
-                    p.vertices = std::move(ring);
-                    data.cdp_postcode_polys.push_back(std::move(p));
-                }
-            }
-            data.cdp_postcode_relations.clear();
-            data.cdp_postcode_relations.shrink_to_fit();
-
-            double cdp_el = std::chrono::duration<double>(std::chrono::steady_clock::now() - _cdp_t).count();
-            std::cerr << "CDP assembly: " << data.cdp_postcode_polys.size()
-                      << " polys built in " << cdp_el << "s ("
-                      << skipped_no_geom << " skipped for missing geometry)" << std::endl;
-        }
-
-        if (!data.cdp_postcode_polys.empty()) {
-            auto _inh_t = std::chrono::steady_clock::now();
-
-            // Pre-intern postcode strings (one entry per unique postcode)
-            std::unordered_map<std::string, uint32_t> pc_to_id;
-            std::vector<uint32_t> cdp_offsets(data.cdp_postcode_polys.size());
-            for (size_t i = 0; i < data.cdp_postcode_polys.size(); i++) {
-                const auto& pc = data.cdp_postcode_polys[i].postcode;
-                auto it = pc_to_id.find(pc);
-                if (it == pc_to_id.end()) {
-                    uint32_t off = data.string_pool.intern(pc);
-                    pc_to_id[pc] = off;
-                    cdp_offsets[i] = off;
-                } else {
-                    cdp_offsets[i] = it->second;
-                }
-            }
-
-            // Cell-indexed lookup: register each CDP in every admin-level
-            // cell that any of its vertices fall into, plus the 8 immediate
-            // neighbours of each such cell. For typical US CDPs (small
-            // enough that vertex cells + neighbours cover the interior)
-            // this captures every query that could be inside the CDP.
-            std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_cdp;
-            for (uint32_t ci = 0; ci < data.cdp_postcode_polys.size(); ci++) {
-                const auto& cdp = data.cdp_postcode_polys[ci];
-                std::unordered_set<uint64_t> cells;
-                for (const auto& [la, ln] : cdp.vertices) {
-                    S2CellId c = S2CellId(S2LatLng::FromDegrees(la, ln)).parent(kAdminCellLevel);
-                    cells.insert(c.id());
-                    std::vector<S2CellId> nbrs;
-                    c.AppendAllNeighbors(kAdminCellLevel, &nbrs);
-                    for (const auto& n : nbrs) cells.insert(n.id());
-                }
-                for (uint64_t cid : cells) cell_to_cdp[cid].push_back(ci);
-            }
-            std::cerr << "CDP cell index: " << cell_to_cdp.size() << " cells" << std::endl;
-
-            std::atomic<size_t> inherited_addr{0};
-            std::atomic<size_t> inherited_way{0};
-
-            // Parallel scan over addr_points
-            std::atomic<size_t> addr_idx{0};
-            std::vector<std::thread> addr_workers;
-            for (unsigned int t = 0; t < num_threads; t++) {
-                addr_workers.emplace_back([&]() {
-                    while (true) {
-                        size_t start = addr_idx.fetch_add(4096);
-                        if (start >= data.addr_points.size()) break;
-                        size_t end = std::min(start + 4096, data.addr_points.size());
-                        for (size_t j = start; j < end; j++) {
-                            if (j >= data.addr_postcode_ids.size()) break;
-                            if (data.addr_postcode_ids[j] != NO_DATA) continue;
-                            const auto& ap = data.addr_points[j];
-                            S2CellId cell = S2CellId(S2LatLng::FromDegrees(ap.lat, ap.lng)).parent(kAdminCellLevel);
-                            auto it = cell_to_cdp.find(cell.id());
-                            if (it == cell_to_cdp.end()) continue;
-                            for (uint32_t ci : it->second) {
-                                const auto& cdp = data.cdp_postcode_polys[ci];
-                                if ((double)ap.lat < cdp.min_lat || (double)ap.lat > cdp.max_lat) continue;
-                                if ((double)ap.lng < cdp.min_lng || (double)ap.lng > cdp.max_lng) continue;
-                                if (point_in_polygon((double)ap.lat, (double)ap.lng, cdp.vertices)) {
-                                    data.addr_postcode_ids[j] = cdp_offsets[ci];
-                                    inherited_addr.fetch_add(1);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-            for (auto& w : addr_workers) w.join();
-
-            // Parallel scan over ways (use centroid as PIP point)
-            std::atomic<size_t> way_pc_idx{0};
-            std::vector<std::thread> way_pc_workers;
-            for (unsigned int t = 0; t < num_threads; t++) {
-                way_pc_workers.emplace_back([&]() {
-                    while (true) {
-                        size_t start = way_pc_idx.fetch_add(4096);
-                        if (start >= data.ways.size()) break;
-                        size_t end = std::min(start + 4096, data.ways.size());
-                        for (size_t j = start; j < end; j++) {
-                            if (j >= data.way_postcode_ids.size()) break;
-                            if (data.way_postcode_ids[j] != NO_DATA) continue;
-                            const auto& w = data.ways[j];
-                            if (w.node_count == 0) continue;
-                            float sum_lat = 0, sum_lng = 0;
-                            for (uint8_t k = 0; k < w.node_count; k++) {
-                                sum_lat += data.street_nodes[w.node_offset + k].lat;
-                                sum_lng += data.street_nodes[w.node_offset + k].lng;
-                            }
-                            double clat = sum_lat / w.node_count;
-                            double clng = sum_lng / w.node_count;
-                            S2CellId cell = S2CellId(S2LatLng::FromDegrees(clat, clng)).parent(kAdminCellLevel);
-                            auto it = cell_to_cdp.find(cell.id());
-                            if (it == cell_to_cdp.end()) continue;
-                            for (uint32_t ci : it->second) {
-                                const auto& cdp = data.cdp_postcode_polys[ci];
-                                if (clat < cdp.min_lat || clat > cdp.max_lat) continue;
-                                if (clng < cdp.min_lng || clng > cdp.max_lng) continue;
-                                if (point_in_polygon(clat, clng, cdp.vertices)) {
-                                    data.way_postcode_ids[j] = cdp_offsets[ci];
-                                    inherited_way.fetch_add(1);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-            for (auto& w : way_pc_workers) w.join();
-
-            double inh_el = std::chrono::duration<double>(std::chrono::steady_clock::now() - _inh_t).count();
-            std::cerr << "CDP postcode inheritance: " << inherited_addr.load()
-                      << " addrs + " << inherited_way.load() << " ways inherited from "
-                      << data.cdp_postcode_polys.size() << " CDPs in " << inh_el << "s" << std::endl;
-
-            // Discard CDP polys — they are build-time only
-            data.cdp_postcode_polys.clear();
-            data.cdp_postcode_polys.shrink_to_fit();
-        }
+        inherit_cdp_postcodes(data, cfg);
 
         // Load TIGER address data
         if (!tiger_data_path.empty()) {
@@ -4334,190 +4532,7 @@ int main(int argc, char* argv[]) {
                 log_phase("  POI: parent-admin linking", _s2t, _s2cpu);
             }
 
-            // --- Address-point parent-street backfill ---
-            //
-            // Nominatim indexes any rank-30 row with addr:housenumber
-            // as an address point and resolves its street via
-            // parent_place_id at import time. Our node/way extraction
-            // now accepts housenumber without addr:street — those
-            // rows are stored with street_id == NO_DATA and need to
-            // be backfilled with the name_id of the nearest named
-            // street. We iterate addr_points in parallel, looking up
-            // candidate ways via sorted_way_cells at L17 (same as the
-            // POI sweep above) and assign the closest named-way's
-            // name_id.
-            if (!data.addr_points.empty() && !data.ways.empty()) {
-                auto _as_t = std::chrono::steady_clock::now();
-                auto _as_cpu = CpuTicks::now();
-                std::atomic<uint64_t> backfill_candidates{0};
-                for (const auto& p : data.addr_points) {
-                    if (p.street_id == NO_DATA) backfill_candidates.fetch_add(1);
-                }
-                std::cerr << "Backfilling addr_point parent streets ("
-                          << backfill_candidates.load() << "/"
-                          << data.addr_points.size() << " need it)..."
-                          << std::endl;
-
-                std::atomic<size_t> ap_idx{0};
-                std::atomic<uint64_t> ap_linked{0};
-                const auto& pool_data = data.string_pool.data();
-                std::vector<std::thread> ap_workers;
-                for (unsigned int t = 0; t < num_threads; t++) {
-                    ap_workers.emplace_back([&]() {
-                        std::vector<uint64_t> cells_to_check;
-                        while (true) {
-                            size_t i = ap_idx.fetch_add(1);
-                            if (i >= data.addr_points.size()) break;
-                            auto& ap = data.addr_points[i];
-                            ap.parent_way_id = NO_DATA;
-
-                            float plat = ap.lat;
-                            float plng = ap.lng;
-                            S2CellId center = S2CellId(
-                                S2LatLng::FromDegrees(plat, plng))
-                                .parent(kStreetCellLevel);
-                            cells_to_check.clear();
-                            cells_to_check.push_back(center.id());
-                            std::vector<S2CellId> ring1;
-                            center.AppendAllNeighbors(kStreetCellLevel, &ring1);
-                            for (const auto& n : ring1) {
-                                cells_to_check.push_back(n.id());
-                                std::vector<S2CellId> ring2;
-                                n.AppendAllNeighbors(kStreetCellLevel, &ring2);
-                                for (const auto& n2 : ring2) {
-                                    cells_to_check.push_back(n2.id());
-                                }
-                            }
-                            std::sort(cells_to_check.begin(), cells_to_check.end());
-                            cells_to_check.erase(
-                                std::unique(cells_to_check.begin(), cells_to_check.end()),
-                                cells_to_check.end());
-
-                            double best_d2 = 1e18;
-                            uint32_t best_name = NO_DATA;
-                            uint32_t best_way_idx = NO_DATA;
-                            // Stable tie-break for EXACT-distance ties. The
-                            // candidate iteration is ordered by sorted_way_cells
-                            // item_id = the pre-sort way index, which is
-                            // non-deterministic (parallel PBF parse order). When
-                            // an addr point is exactly equidistant from two
-                            // different (non-duplicate) ways — corners,
-                            // intersections, shared nodes — a strict `d2 < best`
-                            // pick lets the build-encounter order decide the
-                            // winner, so parent_way_id flips between same-PBF
-                            // builds. Since parent_way_id is part of the dedup
-                            // key, those flips cascade into massive addr_points
-                            // patch churn. Break exact ties by the way's osm_id
-                            // (invariant across builds) for a deterministic pick.
-                            int64_t best_osm = INT64_MAX;
-                            // Token-matched resolution: track nearest
-                            // way whose original name matches addr:street
-                            double best_match_d2 = 1e18;
-                            uint32_t best_match_name = NO_DATA;
-                            uint32_t best_match_way = NO_DATA;
-                            int64_t best_match_osm = INT64_MAX;
-                            const char* addr_street_str = nullptr;
-                            if (ap.street_id != NO_DATA) {
-                                addr_street_str = pool_data.data() + ap.street_id;
-                            }
-                            const double cos_lat = std::cos(
-                                plat * M_PI / 180.0);
-                            for (uint64_t cid : cells_to_check) {
-                                CellItemPair probe{cid, 0};
-                                auto lo = std::lower_bound(
-                                    data.sorted_way_cells.begin(),
-                                    data.sorted_way_cells.end(), probe,
-                                    cell_item_less);
-                                for (auto p = lo;
-                                     p != data.sorted_way_cells.end() && p->cell_id == cid;
-                                     ++p) {
-                                    uint32_t way_id = p->item_id;
-                                    if (way_id >= data.ways.size()) continue;
-                                    const auto& w = data.ways[way_id];
-                                    if (w.name_id == NO_DATA) continue;
-                                    uint32_t off = w.node_offset;
-                                    uint8_t cnt = w.node_count;
-                                    if (cnt < 2) continue;
-                                    if (static_cast<size_t>(off) + cnt > data.street_nodes.size()) continue;
-                                    for (uint8_t k = 0; k + 1 < cnt; k++) {
-                                        const auto& a = data.street_nodes[off + k];
-                                        const auto& b = data.street_nodes[off + k + 1];
-                                        double ax = (a.lng - plng) * cos_lat;
-                                        double ay = (a.lat - plat);
-                                        double bx = (b.lng - plng) * cos_lat;
-                                        double by = (b.lat - plat);
-                                        double dx = bx - ax;
-                                        double dy = by - ay;
-                                        double seg_len2 = dx * dx + dy * dy;
-                                        double d2;
-                                        if (seg_len2 < 1e-18) {
-                                            d2 = ax * ax + ay * ay;
-                                        } else {
-                                            double tt = -(ax * dx + ay * dy) / seg_len2;
-                                            if (tt < 0.0) tt = 0.0;
-                                            else if (tt > 1.0) tt = 1.0;
-                                            double qx = ax + tt * dx;
-                                            double qy = ay + tt * dy;
-                                            d2 = qx * qx + qy * qy;
-                                        }
-                                        int64_t cand_osm = way_id < data.way_osm_ids.size()
-                                            ? data.way_osm_ids[way_id] : INT64_MAX;
-                                        if (d2 < best_d2 ||
-                                            (d2 == best_d2 && cand_osm < best_osm)) {
-                                            best_d2 = d2;
-                                            best_name = w.name_id;
-                                            best_way_idx = way_id;
-                                            best_osm = cand_osm;
-                                        }
-                                        // Token-matched: check if way's
-                                        // original name matches addr:street
-                                        if ((d2 < best_match_d2 ||
-                                             (d2 == best_match_d2 && cand_osm < best_match_osm))
-                                            && addr_street_str
-                                            && way_id < data.way_orig_name_ids.size()) {
-                                            uint32_t orig_id = data.way_orig_name_ids[way_id];
-                                            if (orig_id != NO_DATA) {
-                                                const char* orig_str = pool_data.data() + orig_id;
-                                                if (tokens_overlap(addr_street_str, orig_str)) {
-                                                    best_match_d2 = d2;
-                                                    best_match_name = w.name_id;
-                                                    best_match_way = way_id;
-                                                    best_match_osm = cand_osm;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            if (best_way_idx != NO_DATA) {
-                                // Prefer token-matched way (matches
-                                // Nominatim's getNearestNamedRoadPlaceId
-                                // which finds the closest street whose
-                                // name tokens overlap with addr:street).
-                                if (best_match_way != NO_DATA) {
-                                    ap.parent_way_id = best_match_way;
-                                    ap.street_id = best_match_name;
-                                } else {
-                                    ap.parent_way_id = best_way_idx;
-                                    if (ap.street_id == NO_DATA && best_name != NO_DATA) {
-                                        ap.street_id = best_name;
-                                    }
-                                }
-                                ap_linked.fetch_add(1);
-                            }
-                        }
-                    });
-                }
-                for (auto& w : ap_workers) w.join();
-                double _ap_elapsed = std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - _as_t).count();
-                std::cerr << "Addr parent-street backfill: "
-                          << ap_linked.load() << "/"
-                          << backfill_candidates.load()
-                          << " addr_points linked in "
-                          << _ap_elapsed << "s" << std::endl;
-                log_phase("  Addr: parent-street backfill", _as_t, _as_cpu);
-            }
+            backfill_addr_point_parent_streets(data, cfg);
 
             // Free deferred work items
             data.deferred_ways.clear();
