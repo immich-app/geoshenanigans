@@ -1437,6 +1437,79 @@ static void backfill_addr_point_parent_streets(ParsedData& data, const BuildConf
     }
 }
 
+// Flat (cell_id,item_id) pair sort+merge used by the S2 cell-computation phases
+// (street/interp ways and POIs/places). Captureless; hoisted to file scope so
+// both the ways/interp and the POI/place S2 phases share it.
+static void parallel_sort_and_build(
+    std::vector<std::vector<CellItemPair>>& thread_pairs,
+    std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map,
+    std::vector<CellItemPair>& sorted_out
+) {
+    // Step 1: Convert + sort each thread's data in parallel
+    size_t total = 0;
+    for (auto& v : thread_pairs) total += v.size();
+
+    std::vector<std::vector<CellItemPair>> chunks(thread_pairs.size());
+    {
+        std::vector<std::thread> sort_threads;
+        for (size_t t = 0; t < thread_pairs.size(); t++) {
+            sort_threads.emplace_back([&, t]() {
+                auto& src = thread_pairs[t];
+                auto& dst = chunks[t];
+                dst.reserve(src.size());
+                for (auto& ci : src) dst.push_back({ci.cell_id, ci.item_id});
+                src.clear(); src.shrink_to_fit();
+                std::sort(dst.begin(), dst.end(), cell_item_less);
+            });
+        }
+        for (auto& t : sort_threads) t.join();
+    }
+
+    // Step 2: Concatenate sorted chunks and merge using parallel tree.
+    // Each chunk is already sorted. Record run boundaries, concatenate,
+    // then merge adjacent runs pairwise in parallel at each level.
+    auto cmp = cell_item_less;
+
+    // Record run boundaries before concatenation
+    std::vector<size_t> run_bounds = {0};
+    sorted_out.clear();
+    sorted_out.reserve(total);
+    for (auto& chunk : chunks) {
+        sorted_out.insert(sorted_out.end(), chunk.begin(), chunk.end());
+        run_bounds.push_back(sorted_out.size());
+        chunk.clear(); chunk.shrink_to_fit();
+    }
+
+    // Parallel tree merge: at each level, merge adjacent run pairs in parallel.
+    // Level 0: merge runs (0,1), (2,3), ... → N/2 runs
+    // Level 1: merge runs (01,23), (45,67), ... → N/4 runs
+    // ... until one sorted run remains.
+    while (run_bounds.size() > 2) {
+        std::vector<size_t> new_bounds = {0};
+        std::vector<std::thread> merge_threads;
+        for (size_t i = 0; i + 2 < run_bounds.size(); i += 2) {
+            size_t left = run_bounds[i];
+            size_t mid = run_bounds[i + 1];
+            size_t right = run_bounds[i + 2];
+            merge_threads.emplace_back([&, left, mid, right] {
+                std::inplace_merge(sorted_out.begin() + left,
+                                   sorted_out.begin() + mid,
+                                   sorted_out.begin() + right, cmp);
+            });
+            new_bounds.push_back(right);
+        }
+        // If odd number of runs, carry the last one forward
+        if (run_bounds.size() % 2 == 0) {
+            new_bounds.push_back(run_bounds.back());
+        }
+        for (auto& t : merge_threads) t.join();
+        run_bounds = std::move(new_bounds);
+    }
+
+    // Skip building hash map — sorted_out is used directly for writing.
+    // cell_map stays empty (only needed for cache/continent modes).
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [options]" << std::endl;
@@ -4036,14 +4109,13 @@ int main(int argc, char* argv[]) {
             // thread-local vectors, then we sort globally and group by cell_id.
             // This avoids hash maps entirely — sort is cache-friendly O(n log n).
 
-            struct CellItem { uint64_t cell_id; uint32_t item_id; };
 
             auto _s2t = std::chrono::steady_clock::now();
             auto _s2cpu = CpuTicks::now();
 
             // Process streets: emit (cell_id, way_id) pairs
             std::cerr << "  Processing " << data.deferred_ways.size() << " street ways..." << std::endl;
-            std::vector<std::vector<CellItem>> way_pairs(num_threads);
+            std::vector<std::vector<CellItemPair>> way_pairs(num_threads);
             {
                 std::atomic<size_t> way_idx{0};
                 std::vector<std::thread> threads;
@@ -4078,7 +4150,7 @@ int main(int argc, char* argv[]) {
 
             // Process interpolations: emit (cell_id, interp_id) pairs
             std::cerr << "  Processing " << data.deferred_interps.size() << " interpolation ways..." << std::endl;
-            std::vector<std::vector<CellItem>> interp_pairs(num_threads);
+            std::vector<std::vector<CellItemPair>> interp_pairs(num_threads);
             {
                 std::atomic<size_t> interp_idx{0};
                 std::vector<std::thread> threads;
@@ -4115,75 +4187,6 @@ int main(int argc, char* argv[]) {
             // Concatenate + sort helper for flat CellItem pairs
             // Parallel sort each thread's pairs, then k-way merge directly into
             // hash map + sorted output. No intermediate merged vector needed.
-            auto parallel_sort_and_build = [](
-                std::vector<std::vector<CellItem>>& thread_pairs,
-                std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map,
-                std::vector<CellItemPair>& sorted_out
-            ) {
-                // Step 1: Convert + sort each thread's data in parallel
-                size_t total = 0;
-                for (auto& v : thread_pairs) total += v.size();
-
-                std::vector<std::vector<CellItemPair>> chunks(thread_pairs.size());
-                {
-                    std::vector<std::thread> sort_threads;
-                    for (size_t t = 0; t < thread_pairs.size(); t++) {
-                        sort_threads.emplace_back([&, t]() {
-                            auto& src = thread_pairs[t];
-                            auto& dst = chunks[t];
-                            dst.reserve(src.size());
-                            for (auto& ci : src) dst.push_back({ci.cell_id, ci.item_id});
-                            src.clear(); src.shrink_to_fit();
-                            std::sort(dst.begin(), dst.end(), cell_item_less);
-                        });
-                    }
-                    for (auto& t : sort_threads) t.join();
-                }
-
-                // Step 2: Concatenate sorted chunks and merge using parallel tree.
-                // Each chunk is already sorted. Record run boundaries, concatenate,
-                // then merge adjacent runs pairwise in parallel at each level.
-                auto cmp = cell_item_less;
-
-                // Record run boundaries before concatenation
-                std::vector<size_t> run_bounds = {0};
-                sorted_out.clear();
-                sorted_out.reserve(total);
-                for (auto& chunk : chunks) {
-                    sorted_out.insert(sorted_out.end(), chunk.begin(), chunk.end());
-                    run_bounds.push_back(sorted_out.size());
-                    chunk.clear(); chunk.shrink_to_fit();
-                }
-
-                // Parallel tree merge: at each level, merge adjacent run pairs in parallel.
-                // Level 0: merge runs (0,1), (2,3), ... → N/2 runs
-                // Level 1: merge runs (01,23), (45,67), ... → N/4 runs
-                // ... until one sorted run remains.
-                while (run_bounds.size() > 2) {
-                    std::vector<size_t> new_bounds = {0};
-                    std::vector<std::thread> merge_threads;
-                    for (size_t i = 0; i + 2 < run_bounds.size(); i += 2) {
-                        size_t left = run_bounds[i];
-                        size_t mid = run_bounds[i + 1];
-                        size_t right = run_bounds[i + 2];
-                        merge_threads.emplace_back([&, left, mid, right] {
-                            std::inplace_merge(sorted_out.begin() + left,
-                                               sorted_out.begin() + mid,
-                                               sorted_out.begin() + right, cmp);
-                        });
-                        new_bounds.push_back(right);
-                    }
-                    // If odd number of runs, carry the last one forward
-                    if (run_bounds.size() % 2 == 0) {
-                        new_bounds.push_back(run_bounds.back());
-                    }
-                    for (auto& t : merge_threads) t.join();
-                    run_bounds = std::move(new_bounds);
-                }
-
-                // Skip building hash map — sorted_out is used directly for writing.
-                // cell_map stays empty (only needed for cache/continent modes).
-            };
 
 
             // Sort each thread's pairs in parallel, then k-way merge directly
@@ -4543,7 +4546,7 @@ int main(int argc, char* argv[]) {
             // --- POI S2 cell computation ---
             if (!data.poi_records.empty()) {
                 std::cerr << "  Computing S2 cells for " << data.poi_records.size() << " POIs..." << std::endl;
-                std::vector<std::vector<CellItem>> poi_pairs(num_threads);
+                std::vector<std::vector<CellItemPair>> poi_pairs(num_threads);
                 {
                     std::atomic<size_t> poi_idx{0};
                     std::vector<std::thread> threads;
@@ -4590,7 +4593,7 @@ int main(int argc, char* argv[]) {
             // Place node S2 cells
             if (!data.place_nodes.empty()) {
                 std::cerr << "  Computing S2 cells for " << data.place_nodes.size() << " place nodes..." << std::endl;
-                std::vector<std::vector<CellItem>> place_pairs(num_threads);
+                std::vector<std::vector<CellItemPair>> place_pairs(num_threads);
                 {
                     std::atomic<size_t> place_idx{0};
                     std::vector<std::thread> threads;
