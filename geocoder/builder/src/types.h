@@ -489,57 +489,6 @@ inline uint8_t poi_get_default_tier(PoiCategory cat) {
     }
 }
 
-// Proximity radius in meters (0 = polygon containment only)
-inline uint16_t poi_get_proximity_meters(PoiCategory cat) {
-    switch (cat) {
-        // polygon containment (0m)
-        case PoiCategory::THEME_PARK: case PoiCategory::ZOO: case PoiCategory::CAMP_SITE:
-        case PoiCategory::RESORT: case PoiCategory::BATTLEFIELD:
-        case PoiCategory::UNIVERSITY: case PoiCategory::COLLEGE: case PoiCategory::HOSPITAL:
-        case PoiCategory::MARKETPLACE: case PoiCategory::CEMETERY: case PoiCategory::PRISON:
-        case PoiCategory::PARK: case PoiCategory::NATURE_RESERVE: case PoiCategory::STADIUM:
-        case PoiCategory::GARDEN: case PoiCategory::WATER_PARK: case PoiCategory::GOLF_COURSE:
-        case PoiCategory::BAY: case PoiCategory::ISLAND:
-        case PoiCategory::AERODROME:
-        case PoiCategory::NATIONAL_PARK: case PoiCategory::PROTECTED_AREA:
-        case PoiCategory::POWER_PLANT:
-            return 0;
-        // tiny (50m)
-        case PoiCategory::MONUMENT: case PoiCategory::MEMORIAL: case PoiCategory::FOUNTAIN:
-        case PoiCategory::ARTWORK: case PoiCategory::GEYSER: case PoiCategory::PICNIC_SITE:
-            return 50;
-        // small (100m)
-        case PoiCategory::MUSEUM: case PoiCategory::ATTRACTION: case PoiCategory::GALLERY:
-        case PoiCategory::AQUARIUM: case PoiCategory::CASTLE: case PoiCategory::SHIP:
-        case PoiCategory::PLACE_OF_WORSHIP: case PoiCategory::THEATRE: case PoiCategory::CINEMA:
-        case PoiCategory::LIBRARY: case PoiCategory::EMBASSY: case PoiCategory::CASINO:
-        case PoiCategory::PLANETARIUM:
-        case PoiCategory::CATHEDRAL: case PoiCategory::PALACE:
-        case PoiCategory::GOVERNMENT:
-            return 100;
-        // medium (200m)
-        case PoiCategory::ALPINE_HUT: case PoiCategory::RUINS: case PoiCategory::ARCHAEOLOGICAL_SITE:
-        case PoiCategory::FORT: case PoiCategory::FERRY_TERMINAL: case PoiCategory::MARINA:
-        case PoiCategory::SPRING: case PoiCategory::HOT_SPRING:
-        case PoiCategory::STATION: case PoiCategory::WINDMILL: case PoiCategory::BRIDGE:
-        case PoiCategory::PIER: case PoiCategory::WINERY: case PoiCategory::BREWERY:
-            return 200;
-        // medium-large (300m)
-        case PoiCategory::VIEWPOINT: case PoiCategory::TOWER: case PoiCategory::DAM:
-        case PoiCategory::OBSERVATORY:
-            return 300;
-        // large (500m)
-        case PoiCategory::BEACH: case PoiCategory::CAVE_ENTRANCE: case PoiCategory::WATERFALL:
-        case PoiCategory::CLIFF: case PoiCategory::ARCH: case PoiCategory::LIGHTHOUSE:
-            return 500;
-        // very large (1000m+)
-        case PoiCategory::PEAK:    return 2000;
-        case PoiCategory::VOLCANO: return 3000;
-        case PoiCategory::GLACIER: return 1000;
-        case PoiCategory::CAPE:    return 1000;
-        default: return 100;
-    }
-}
 
 static constexpr uint8_t POI_FLAG_WIKIPEDIA = 0x01;
 static constexpr uint8_t POI_FLAG_WIKIDATA  = 0x02;

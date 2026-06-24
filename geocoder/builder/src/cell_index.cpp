@@ -96,6 +96,7 @@ std::vector<uint32_t> write_entries(
         if (sorted_cells[si] > sorted_refs[ri].cell_id) { si--; ri++; continue; }
         offsets[si] = current;
         const auto& ids = *sorted_refs[ri].ids;
+        if (ids.size() > 0xFFFFu) std::cerr << "WARNING: cell entry count " << ids.size() << " exceeds 65535; uint16 count field overflows" << std::endl;
         uint16_t count = static_cast<uint16_t>(std::min(ids.size(), size_t(MAX_VERTEX_COUNT)));
         buf.insert(buf.end(), reinterpret_cast<const char*>(&count),
                    reinterpret_cast<const char*>(&count) + sizeof(count));
@@ -156,6 +157,7 @@ std::vector<uint32_t> write_entries_from_sorted(
                 offsets[si] = chunk.local_size;
                 size_t start = pi;
                 while (pi < sorted_pairs.size() && sorted_pairs[pi].cell_id == sorted_cells[si]) pi++;
+                if (pi - start > 0xFFFFu) std::cerr << "WARNING: cell entry count " << (pi - start) << " exceeds 65535; uint16 count field overflows" << std::endl;
                 uint16_t count = static_cast<uint16_t>(std::min(pi - start, size_t(MAX_VERTEX_COUNT)));
                 size_t entry_size = sizeof(uint16_t) + (pi - start) * sizeof(uint32_t);
                 size_t buf_pos = chunk.buf.size();
@@ -215,6 +217,7 @@ void write_cell_index(
 
     { std::ofstream f(entries_path, std::ios::binary);
       for (const auto& [cell_id, ids] : sorted) {
+          if (ids.size() > 0xFFFFu) std::cerr << "WARNING: cell entry count " << ids.size() << " exceeds 65535; uint16 count field overflows" << std::endl;
           uint16_t count = static_cast<uint16_t>(std::min(ids.size(), size_t(MAX_VERTEX_COUNT)));
           f.write(reinterpret_cast<const char*>(&count), sizeof(count));
           f.write(reinterpret_cast<const char*>(ids.data()), ids.size() * sizeof(uint32_t));

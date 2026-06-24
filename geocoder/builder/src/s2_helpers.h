@@ -31,7 +31,6 @@ extern double kSimplifyEpsilonOverride; // 0 = use per-level defaults
 void cover_edge(double lat1, double lng1, double lat2, double lng2,
                 std::vector<S2CellId>& out);
 
-std::vector<S2CellId> cover_edge(double lat1, double lng1, double lat2, double lng2);
 
 S2CellId point_to_cell(double lat, double lng);
 

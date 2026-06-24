@@ -11,7 +11,6 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
-#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -1062,15 +1061,6 @@ static void compute_way_parent_polygons(ParsedData& data, const BuildConfig& cfg
                         }
                     }
 
-                    // Centroid fallback removed from way sweep — now
-                    // handled at query time by the server's per-country
-                    // validated centroid index (resolve_postcode tier 3).
-                    if (false) {
-                        uint32_t best_pc_id = NO_DATA; // dead code
-                        if (best_pc_id != NO_DATA) {
-                            data.way_postcode_ids[i] = best_pc_id;
-                        }
-                    }
                 }
             });
         }

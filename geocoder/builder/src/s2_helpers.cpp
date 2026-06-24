@@ -61,11 +61,6 @@ void cover_edge(double lat1, double lng1, double lat2, double lng2,
     out = std::move(covering.cell_ids());
 }
 
-std::vector<S2CellId> cover_edge(double lat1, double lng1, double lat2, double lng2) {
-    std::vector<S2CellId> result;
-    cover_edge(lat1, lng1, lat2, lng2, result);
-    return result;
-}
 
 S2CellId point_to_cell(double lat, double lng) {
     return S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(kStreetCellLevel);

@@ -128,10 +128,6 @@ std::string read_and_decompress_blob(int fd, const BlobInfo& info);
 // calls the callback for each decoded block (in arbitrary order).
 // `num_threads` controls parallelism (0 = hardware_concurrency).
 // `entity_filter` controls which entity types to parse: 'n' = nodes, 'w' = ways, 'r' = relations
-void read_pbf_parallel(const std::string& filename,
-                       std::function<void(PbfBlock&, size_t block_index)> callback,
-                       unsigned num_threads = 0,
-                       const std::string& entity_filter = "nwr");
 
 // Managed PBF file — opens once, provides phased parallel reading.
 class PbfFile {
