@@ -233,6 +233,20 @@ void write_cell_index(
 // On miss (no prev sidecar / first build), each way gets a fresh
 // sequential idx — equivalent to today's behavior, with a sidecar
 // emitted so the NEXT build can stabilize against this one.
+// Finalize an IdAllocator pass: log the slot summary and move the slot table
+// into the sidecar blob. Shared by all six apply_strategy2_* passes (both the
+// identity fast-path and the post-reorder finalize).
+static void finalize_strategy2(gc::id_alloc::IdAllocator& alloc, uint32_t n_new, size_t n_old,
+                               std::vector<gc::id_alloc::SidecarSlot>& sidecar_blob, const char* label) {
+    alloc.finalize();
+    std::cerr << "  strategy2 " << label << ": " << alloc.live_count() << " live, "
+              << alloc.tombstone_count() << " tombstones, "
+              << n_new << " total slots ("
+              << (alloc.live_count() == n_old ? "no shifts" : "remap applied")
+              << ")" << std::endl;
+    sidecar_blob = alloc.take_slots();
+}
+
 static void apply_strategy2_streets(ParsedData& data, const std::string& prev_dir) {
     using namespace gc::id_alloc;
     if (data.ways.empty()) return;
@@ -265,11 +279,7 @@ static void apply_strategy2_streets(ParsedData& data, const std::string& prev_di
     // saves ~3 GiB peak RSS on planet for the way arrays alone, which
     // was running the self-hosted runner OOM during step 9.
     if (identity && n_new == n_old) {
-        alloc.finalize();
-        std::cerr << "  strategy2 streets: " << alloc.live_count() << " live, "
-                  << alloc.tombstone_count() << " tombstones, "
-                  << n_new << " total slots (no shifts)" << std::endl;
-        data.way_sidecar_blob = alloc.take_slots();
+        finalize_strategy2(alloc, n_new, n_old, data.way_sidecar_blob, "streets");
         return;
     }
 
@@ -339,13 +349,7 @@ static void apply_strategy2_streets(ParsedData& data, const std::string& prev_di
     // The day-over-day string-offset shift is handled by str_remap in the
     // diff/patch tools, exactly like PoiRecord::name_id.
 
-    alloc.finalize();
-    std::cerr << "  strategy2 streets: " << alloc.live_count() << " live, "
-              << alloc.tombstone_count() << " tombstones, "
-              << n_new << " total slots ("
-              << (alloc.live_count() == n_old ? "no shifts" : "remap applied")
-              << ")" << std::endl;
-    data.way_sidecar_blob = alloc.take_slots();
+    finalize_strategy2(alloc, n_new, n_old, data.way_sidecar_blob, "streets");
 }
 
 // Strategy-2 stable IDs for admin_polygons.
@@ -405,11 +409,7 @@ static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir
     const uint32_t n_new = alloc.total_slots();
 
     if (identity && n_new == n_old) {
-        alloc.finalize();
-        std::cerr << "  strategy2 admins: " << alloc.live_count() << " live, "
-                  << alloc.tombstone_count() << " tombstones, "
-                  << n_new << " total slots (no shifts)" << std::endl;
-        data.admin_sidecar_blob = alloc.take_slots();
+        finalize_strategy2(alloc, n_new, n_old, data.admin_sidecar_blob, "admins");
         return;
     }
 
@@ -445,11 +445,7 @@ static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir
     for (auto& pr : data.poi_records)     remap_index(pr.parent_poly_id, remap);
     for (auto& pn : data.place_nodes)     remap_index(pn.parent_poly_id, remap);
 
-    alloc.finalize();
-    std::cerr << "  strategy2 admins: " << alloc.live_count() << " live, "
-              << alloc.tombstone_count() << " tombstones, "
-              << n_new << " total slots" << std::endl;
-    data.admin_sidecar_blob = alloc.take_slots();
+    finalize_strategy2(alloc, n_new, n_old, data.admin_sidecar_blob, "admins");
 }
 
 // Strategy-2 stable IDs for addr_points.
@@ -482,11 +478,7 @@ static void apply_strategy2_addrs(ParsedData& data, const std::string& prev_dir)
     const uint32_t n_new = alloc.total_slots();
 
     if (identity && n_new == n_old) {
-        alloc.finalize();
-        std::cerr << "  strategy2 addrs: " << alloc.live_count() << " live, "
-                  << alloc.tombstone_count() << " tombstones, "
-                  << n_new << " total slots (no shifts)" << std::endl;
-        data.addr_sidecar_blob = alloc.take_slots();
+        finalize_strategy2(alloc, n_new, n_old, data.addr_sidecar_blob, "addrs");
         return;
     }
 
@@ -511,11 +503,7 @@ static void apply_strategy2_addrs(ParsedData& data, const std::string& prev_dir)
     for (auto& [cell, ids] : data.cell_to_addrs) for (auto& id : ids) remap_index(id, remap);
     for (auto& p : data.sorted_addr_cells) remap_index(p.item_id, remap);
 
-    alloc.finalize();
-    std::cerr << "  strategy2 addrs: " << alloc.live_count() << " live, "
-              << alloc.tombstone_count() << " tombstones, "
-              << n_new << " total slots" << std::endl;
-    data.addr_sidecar_blob = alloc.take_slots();
+    finalize_strategy2(alloc, n_new, n_old, data.addr_sidecar_blob, "addrs");
 }
 
 // Strategy-2 stable IDs for place_nodes.
@@ -547,10 +535,7 @@ static void apply_strategy2_places(ParsedData& data, const std::string& prev_dir
     const uint32_t n_new = alloc.total_slots();
 
     if (identity && n_new == n_old) {
-        alloc.finalize();
-        std::cerr << "  strategy2 places: " << alloc.live_count() << " live, "
-                  << alloc.tombstone_count() << " tombstones (no shifts)" << std::endl;
-        data.place_sidecar_blob = alloc.take_slots();
+        finalize_strategy2(alloc, n_new, n_old, data.place_sidecar_blob, "places");
         return;
     }
 
@@ -570,10 +555,7 @@ static void apply_strategy2_places(ParsedData& data, const std::string& prev_dir
 
     for (auto& p : data.sorted_place_cells) remap_index(p.item_id, remap);
 
-    alloc.finalize();
-    std::cerr << "  strategy2 places: " << alloc.live_count() << " live, "
-              << alloc.tombstone_count() << " tombstones" << std::endl;
-    data.place_sidecar_blob = alloc.take_slots();
+    finalize_strategy2(alloc, n_new, n_old, data.place_sidecar_blob, "places");
 }
 
 // Strategy-2 stable IDs for poi_records.
@@ -604,10 +586,7 @@ static void apply_strategy2_pois(ParsedData& data, const std::string& prev_dir) 
     const uint32_t n_new = alloc.total_slots();
 
     if (identity && n_new == n_old) {
-        alloc.finalize();
-        std::cerr << "  strategy2 pois: " << alloc.live_count() << " live, "
-                  << alloc.tombstone_count() << " tombstones (no shifts)" << std::endl;
-        data.poi_sidecar_blob = alloc.take_slots();
+        finalize_strategy2(alloc, n_new, n_old, data.poi_sidecar_blob, "pois");
         return;
     }
 
@@ -637,10 +616,7 @@ static void apply_strategy2_pois(ParsedData& data, const std::string& prev_dir) 
     for (auto& [cell, ids] : data.cell_to_pois) for (auto& id : ids) remap_index_flagged(id, remap);
     for (auto& p : data.sorted_poi_cells) remap_index_flagged(p.item_id, remap);
 
-    alloc.finalize();
-    std::cerr << "  strategy2 pois: " << alloc.live_count() << " live, "
-              << alloc.tombstone_count() << " tombstones" << std::endl;
-    data.poi_sidecar_blob = alloc.take_slots();
+    finalize_strategy2(alloc, n_new, n_old, data.poi_sidecar_blob, "pois");
 }
 
 // Strategy-2 stable IDs for interp_ways.
@@ -667,10 +643,7 @@ static void apply_strategy2_interps(ParsedData& data, const std::string& prev_di
     const uint32_t n_new = alloc.total_slots();
 
     if (identity && n_new == n_old) {
-        alloc.finalize();
-        std::cerr << "  strategy2 interps: " << alloc.live_count() << " live, "
-                  << alloc.tombstone_count() << " tombstones (no shifts)" << std::endl;
-        data.interp_sidecar_blob = alloc.take_slots();
+        finalize_strategy2(alloc, n_new, n_old, data.interp_sidecar_blob, "interps");
         return;
     }
 
@@ -717,10 +690,7 @@ static void apply_strategy2_interps(ParsedData& data, const std::string& prev_di
     for (auto& [cell, ids] : data.cell_to_interps) for (auto& id : ids) remap_index(id, remap);
     for (auto& p : data.sorted_interp_cells) remap_index(p.item_id, remap);
 
-    alloc.finalize();
-    std::cerr << "  strategy2 interps: " << alloc.live_count() << " live, "
-              << alloc.tombstone_count() << " tombstones" << std::endl;
-    data.interp_sidecar_blob = alloc.take_slots();
+    finalize_strategy2(alloc, n_new, n_old, data.interp_sidecar_blob, "interps");
 }
 
 // Helper: emit a strategy-2 sidecar from a sidecar_blob (post-remap)
