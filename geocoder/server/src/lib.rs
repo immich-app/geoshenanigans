@@ -1264,81 +1264,6 @@ impl Index {
         out
     }
 
-    pub fn read_u16(data: &[u8], offset: usize) -> u16 {
-        u16::from_le_bytes([data[offset], data[offset + 1]])
-    }
-
-    pub fn read_u32(data: &[u8], offset: usize) -> u32 {
-        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
-    }
-
-    pub fn read_u64(data: &[u8], offset: usize) -> u64 {
-        u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
-    }
-
-    // Iterate entry IDs inline from entries file at given offset
-    pub fn for_each_entry(entries: &[u8], offset: u32, mut f: impl FnMut(u32)) {
-        if offset == NO_DATA { return; }
-        let offset = offset as usize;
-        if offset + 2 > entries.len() { return; }
-
-        let id_count = Self::read_u16(entries, offset) as usize;
-        let data_start = offset + 2;
-        if data_start + id_count * 4 > entries.len() { return; }
-
-        for i in 0..id_count {
-            f(Self::read_u32(entries, data_start + i * 4));
-        }
-    }
-
-    // Binary search geo cell index: 20 bytes per entry (u64 cell_id + u32 street + u32 addr + u32 interp)
-    pub fn lookup_geo_cell(cells: &[u8], cell_id: u64) -> GeoCellOffsets {
-        let entry_size: usize = 20;
-        let count = cells.len() / entry_size;
-        let empty = GeoCellOffsets { street: NO_DATA, addr: NO_DATA, interp: NO_DATA };
-        if count == 0 { return empty; }
-
-        let mut lo = 0usize;
-        let mut hi = count;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let mid_id = Self::read_u64(cells, mid * entry_size);
-            if mid_id == cell_id {
-                return GeoCellOffsets {
-                    street: Self::read_u32(cells, mid * entry_size + 8),
-                    addr: Self::read_u32(cells, mid * entry_size + 12),
-                    interp: Self::read_u32(cells, mid * entry_size + 16),
-                };
-            } else if mid_id < cell_id {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        empty
-    }
-
-    // Binary search admin cell index: 12 bytes per entry (u64 cell_id + u32 offset)
-    pub fn lookup_admin_cell(cells: &[u8], cell_id: u64) -> u32 {
-        let entry_size: usize = 12;
-        let count = cells.len() / entry_size;
-        if count == 0 { return NO_DATA; }
-
-        let mut lo = 0usize;
-        let mut hi = count;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let mid_id = Self::read_u64(cells, mid * entry_size);
-            if mid_id == cell_id {
-                return Self::read_u32(cells, mid * entry_size + 8);
-            } else if mid_id < cell_id {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        NO_DATA
-    }
 
     // --- Geo lookup (streets, addresses, interpolation from merged index) ---
 
@@ -1376,7 +1301,7 @@ impl Index {
             // Addresses. Building-sourced points (vertex_count > 0)
             // use polygon distance, matching ST_Distance behaviour.
             if let (Some(addr_entries), Some(addr_points)) = (self.addr_entries.as_ref(), self.addr_points.as_ref()) {
-                let total_addr = addr_points.len() / std::mem::size_of::<AddrPoint>() as u64 as u64;
+                let total_addr = addr_points.len() / std::mem::size_of::<AddrPoint>() as u64;
                 for id in Self::read_entries_fb(addr_entries, offsets.addr) {
                     let idx = id as u64;
                     if idx >= total_addr { continue; }
@@ -1505,7 +1430,7 @@ impl Index {
         let geo_cells = self.geo_cells.as_ref()?;
         let addr_entries = self.addr_entries.as_ref()?;
         let addr_points = self.addr_points.as_ref()?;
-        let total_addr = addr_points.len() / std::mem::size_of::<AddrPoint>() as u64 as u64;
+        let total_addr = addr_points.len() / std::mem::size_of::<AddrPoint>() as u64;
 
         let cell = cell_id_at_level(lat, lng, self.street_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.street_cell_level);

@@ -9,13 +9,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
-use memmap2::Mmap;
-use s2::cellid::CellID;
-use s2::latlng::LatLng;
-use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-use std::collections::HashMap;
-use std::fs::File;
+use serde::Deserialize;
 use std::sync::{Arc, RwLock};
 
 // Library: all geocoding logic now lives in query_server (src/lib.rs).
