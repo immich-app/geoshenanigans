@@ -3024,19 +3024,7 @@ impl Index {
 
     // --- Combined query ---
 
-    pub fn query(&self, lat: f64, lng: f64) -> Address<'_> {
-        let max_dist = self.max_distance_sq;
-
-        // Run geo lookups first so we know the primary street
-        // Find the smallest admin polygon containing the query at
-        // admin_level >= 8 (city/suburb level). This is Nominatim's
-        // `current_boundary` — the geometry that place nodes must
-        // sit inside to be accepted in the address walk.
-        let current_boundary = self.find_current_boundary(lat, lng);
-        let municipality_boundary = self.find_municipality_boundary(lat, lng);
-        let place = self.find_places(lat, lng, current_boundary.as_ref(), municipality_boundary.as_ref());
-        let (addr, interp, street) = self.query_geo(lat, lng);
-
+    fn resolve_admin(&self, lat: f64, lng: f64, street: Option<&(f64, WayHeader, u32)>) -> AdminResult<'_> {
         // Hybrid admin resolution: when the primary is a street with a
         // pre-computed parent polygon, walk its admin_parents chain for
         // coarse ranks (country → city) and use PIP for finer ranks
@@ -3051,7 +3039,7 @@ impl Index {
         let admin_pip = self.find_admin(lat, lng);
         let admin_chain = (|| -> Option<AdminResult<'_>> {
             let wp = self.way_parents.as_ref()?;
-            let (_, _, way_idx) = street.as_ref()?;
+            let (_, _, way_idx) = street?;
             // way_parents is u32 per way; chunked-aware read so it
             // works with JsChunked sources too.
             let way_id = *way_idx as u64;
@@ -3062,7 +3050,7 @@ impl Index {
             if start == NO_DATA { return None; }
             Some(self.find_admin_from_chain(start, lat, lng))
         })();
-        let admin = match admin_chain {
+        match admin_chain {
             Some(chain) => AdminResult {
                 // Only country/state/region/province replace PIP from
                 // chain — at those ranks PIP false-positives are rare
@@ -3095,7 +3083,65 @@ impl Index {
                 city_block: admin_pip.city_block,
             },
             None => admin_pip,
-        };
+        }
+    }
+
+    // Collect the most-specific surfaceable landmark name plus the
+    // name-deduped list of nearby POIs for the response.
+    fn collect_landmark_and_places(&self, lat: f64, lng: f64) -> (Option<&str>, Vec<PoiDetail>) {
+        let pois = self.find_pois(lat, lng);
+        // Landmark: name of the smallest contained polygon POI whose
+        // category is a surfaceable landmark class (filters out
+        // admin-level area labels, generic UNNAMED_RANK30 and very
+        // large natural / boundary features). find_pois already
+        // sorts contained polygons first by area ascending, so the
+        // first qualifying hit is the most specific enclosing
+        // landmark.
+        let landmark_name: Option<&str> = pois.iter().find_map(|p| {
+            if !p.contained { return None; }
+            if poi_category_to_osm_class(p.category_id).is_some() {
+                Some(p.name)
+            } else {
+                None
+            }
+        });
+        // De-dupe by name, keep nearest instance. Chain outlets in
+        // dense cities (Starbucks / McDonald's / 7-Eleven) often
+        // cluster several branches inside a single query radius — a
+        // user browsing nearby landmarks wants a diverse list, not
+        // three copies of the same brand. Pure-name dedup is safe in
+        // practice because distinct venues with the same name are
+        // rare at rank-30; where they legitimately exist (e.g. two
+        // "Central Park" instances) the nearest one is still the one
+        // the user most likely means.
+        let mut places: Vec<PoiDetail> = Vec::with_capacity(pois.len());
+        let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::with_capacity(pois.len());
+        for p in pois.into_iter() {
+            if seen_names.insert(p.name.to_string()) {
+                places.push(PoiDetail {
+                    name: p.name.to_string(),
+                    category: p.category.to_string(),
+                    distance_m: (p.distance_m * 10.0).round() / 10.0,
+                });
+            }
+        }
+        (landmark_name, places)
+    }
+
+    pub fn query(&self, lat: f64, lng: f64) -> Address<'_> {
+        let max_dist = self.max_distance_sq;
+
+        // Run geo lookups first so we know the primary street
+        // Find the smallest admin polygon containing the query at
+        // admin_level >= 8 (city/suburb level). This is Nominatim's
+        // `current_boundary` — the geometry that place nodes must
+        // sit inside to be accepted in the address walk.
+        let current_boundary = self.find_current_boundary(lat, lng);
+        let municipality_boundary = self.find_municipality_boundary(lat, lng);
+        let place = self.find_places(lat, lng, current_boundary.as_ref(), municipality_boundary.as_ref());
+        let (addr, interp, street) = self.query_geo(lat, lng);
+
+        let admin = self.resolve_admin(lat, lng, street.as_ref());
 
         // Primary-feature selection: match Nominatim's reverse flow —
         // pick the closest rank-26+ feature (road OR addressable POI),
@@ -3363,42 +3409,7 @@ impl Index {
             return Address::default();
         }
 
-        let pois = self.find_pois(lat, lng);
-        // Landmark: name of the smallest contained polygon POI whose
-        // category is a surfaceable landmark class (filters out
-        // admin-level area labels, generic UNNAMED_RANK30 and very
-        // large natural / boundary features). find_pois already
-        // sorts contained polygons first by area ascending, so the
-        // first qualifying hit is the most specific enclosing
-        // landmark.
-        let landmark_name: Option<&str> = pois.iter().find_map(|p| {
-            if !p.contained { return None; }
-            if poi_category_to_osm_class(p.category_id).is_some() {
-                Some(p.name)
-            } else {
-                None
-            }
-        });
-        // De-dupe by name, keep nearest instance. Chain outlets in
-        // dense cities (Starbucks / McDonald's / 7-Eleven) often
-        // cluster several branches inside a single query radius — a
-        // user browsing nearby landmarks wants a diverse list, not
-        // three copies of the same brand. Pure-name dedup is safe in
-        // practice because distinct venues with the same name are
-        // rare at rank-30; where they legitimately exist (e.g. two
-        // "Central Park" instances) the nearest one is still the one
-        // the user most likely means.
-        let mut places: Vec<PoiDetail> = Vec::with_capacity(pois.len());
-        let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::with_capacity(pois.len());
-        for p in pois.into_iter() {
-            if seen_names.insert(p.name.to_string()) {
-                places.push(PoiDetail {
-                    name: p.name.to_string(),
-                    category: p.category.to_string(),
-                    distance_m: (p.distance_m * 10.0).round() / 10.0,
-                });
-            }
-        }
+        let (landmark_name, places) = self.collect_landmark_and_places(lat, lng);
 
         // Note on name-suffix normalisation (previously considered as
         // Option 6): Nominatim does not normalise the localname it
