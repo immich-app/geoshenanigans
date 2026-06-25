@@ -5418,14 +5418,7 @@ int main(int argc, char* argv[]) {
 
                                     // Normalize ring rotation
                                     auto& vertices = ar.vertices;
-                                    if (vertices.size() >= 4 &&
-                                        std::fabs(vertices.front().first - vertices.back().first) < 1e-7 &&
-                                        std::fabs(vertices.front().second - vertices.back().second) < 1e-7) {
-                                        vertices.pop_back();
-                                        auto min_it = std::min_element(vertices.begin(), vertices.end());
-                                        std::rotate(vertices.begin(), min_it, vertices.end());
-                                        vertices.push_back(vertices.front());
-                                    }
+                                    canonicalize_ring_rotation(vertices);
 
                                     pp.simplified = simplify_admin_polygon(vertices, ar.admin_level);
                                     if (pp.simplified.size() >= 3) {
@@ -5557,14 +5550,7 @@ int main(int argc, char* argv[]) {
                                     for (auto& ring : rings) {
                                         if (ring.size() >= 3) {
                                             // Normalize ring rotation
-                                            if (ring.size() >= 4 &&
-                                                std::fabs(ring.front().first - ring.back().first) < 1e-7 &&
-                                                std::fabs(ring.front().second - ring.back().second) < 1e-7) {
-                                                ring.pop_back();
-                                                auto min_it = std::min_element(ring.begin(), ring.end());
-                                                std::rotate(ring.begin(), min_it, ring.end());
-                                                ring.push_back(ring.front());
-                                            }
+                                            canonicalize_ring_rotation(ring);
 
                                             // Simplify with ~50m epsilon
                                             double lat0 = ring.empty() ? 0.0 : ring[0].first;

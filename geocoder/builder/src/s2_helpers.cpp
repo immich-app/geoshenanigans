@@ -286,14 +286,7 @@ void add_admin_polygon(ParsedData& data,
                        uint8_t place_type_override,
                        int64_t osm_way_id) {
     auto vertices = vertices_in;
-    if (vertices.size() >= 4 &&
-        std::fabs(vertices.front().first - vertices.back().first) < 1e-7 &&
-        std::fabs(vertices.front().second - vertices.back().second) < 1e-7) {
-        vertices.pop_back();
-        auto min_it = std::min_element(vertices.begin(), vertices.end());
-        std::rotate(vertices.begin(), min_it, vertices.end());
-        vertices.push_back(vertices.front());
-    }
+    canonicalize_ring_rotation(vertices);
 
     auto simplified = simplify_admin_polygon(vertices, admin_level);
     if (simplified.size() < 3) return;

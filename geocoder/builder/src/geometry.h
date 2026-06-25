@@ -488,3 +488,17 @@ inline bool is_included_highway_full(const char* highway, const char* footway,
     // the enclosing POI).
     return true;
 }
+
+// Canonicalize a closed ring's vertex order: drop the duplicate closing
+// point, rotate so the lexicographically-smallest vertex leads, then re-close.
+// Makes ring serialization independent of the input's starting rotation.
+inline void canonicalize_ring_rotation(std::vector<std::pair<double,double>>& ring) {
+    if (ring.size() >= 4 &&
+        std::fabs(ring.front().first - ring.back().first) < 1e-7 &&
+        std::fabs(ring.front().second - ring.back().second) < 1e-7) {
+        ring.pop_back();
+        auto min_it = std::min_element(ring.begin(), ring.end());
+        std::rotate(ring.begin(), min_it, ring.end());
+        ring.push_back(ring.front());
+    }
+}
