@@ -1274,9 +1274,15 @@ impl Index {
             Some(gc) => gc,
             None => return (None, None, None),
         };
-        let street_entries = self.street_entries.as_ref().unwrap();
-        let street_ways = self.street_ways.as_ref().unwrap();
-        let street_nodes = self.street_nodes.as_ref().unwrap();
+        // Street files always accompany geo_cells in a well-formed index
+        // (required_geo enforces all-or-nothing at load). Guard rather than
+        // unwrap so a partial/admin-only index degrades gracefully instead
+        // of panicking.
+        let (Some(street_entries), Some(street_ways), Some(street_nodes)) =
+            (self.street_entries.as_ref(), self.street_ways.as_ref(), self.street_nodes.as_ref())
+        else {
+            return (None, None, None);
+        };
         let cell = cell_id_at_level(lat, lng, self.street_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.street_cell_level);
 
