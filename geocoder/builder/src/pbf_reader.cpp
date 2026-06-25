@@ -256,6 +256,17 @@ std::string read_and_decompress_blob(int fd, const BlobInfo& info) {
     throw std::runtime_error("blob has neither raw nor zlib data");
 }
 
+// Extract a PrimitiveBlock string table (repeated `s` byte fields) into `out`.
+static inline void decode_string_table(protozero::pbf_reader& pb, std::vector<std::string>& out) {
+    protozero::pbf_reader st = pb.get_message();
+    while (st.next()) {
+        if (st.tag() == StringTableTag::S) {
+            auto view = st.get_view();
+            out.emplace_back(view.data(), view.size());
+        } else { st.skip(); }
+    }
+}
+
 // --- PrimitiveBlock decoding ---
 
 PbfBlock decode_pbf_blob(const char* data, size_t size) {
@@ -270,18 +281,7 @@ PbfBlock decode_pbf_blob(const char* data, size_t size) {
     // First pass: extract string table and granularity
     while (pb.next()) {
         switch (pb.tag()) {
-            case PrimitiveBlockTag::STRINGTABLE: {
-                protozero::pbf_reader st = pb.get_message();
-                while (st.next()) {
-                    if (st.tag() == StringTableTag::S) {
-                        auto view = st.get_view();
-                        string_table.emplace_back(view.data(), view.size());
-                    } else {
-                        st.skip();
-                    }
-                }
-                break;
-            }
+            case PrimitiveBlockTag::STRINGTABLE: decode_string_table(pb, string_table); break;
             case PrimitiveBlockTag::GRANULARITY:
                 granularity = pb.get_int32();
                 break;
@@ -494,16 +494,7 @@ void decode_nodes_streaming(const char* data, size_t size, const NodeCallback& c
     protozero::pbf_reader pb(data, size);
     while (pb.next()) {
         switch (pb.tag()) {
-            case PrimitiveBlockTag::STRINGTABLE: {
-                protozero::pbf_reader st = pb.get_message();
-                while (st.next()) {
-                    if (st.tag() == StringTableTag::S) {
-                        auto view = st.get_view();
-                        string_table.emplace_back(view.data(), view.size());
-                    } else { st.skip(); }
-                }
-                break;
-            }
+            case PrimitiveBlockTag::STRINGTABLE: decode_string_table(pb, string_table); break;
             case PrimitiveBlockTag::GRANULARITY: granularity = pb.get_int32(); break;
             case PrimitiveBlockTag::LAT_OFFSET: lat_offset = pb.get_int64(); break;
             case PrimitiveBlockTag::LON_OFFSET: lon_offset = pb.get_int64(); break;
@@ -587,16 +578,7 @@ void decode_ways_streaming(const char* data, size_t size, const WayCallback& cal
     protozero::pbf_reader pb(data, size);
     while (pb.next()) {
         switch (pb.tag()) {
-            case PrimitiveBlockTag::STRINGTABLE: {
-                protozero::pbf_reader st = pb.get_message();
-                while (st.next()) {
-                    if (st.tag() == StringTableTag::S) {
-                        auto view = st.get_view();
-                        string_table.emplace_back(view.data(), view.size());
-                    } else { st.skip(); }
-                }
-                break;
-            }
+            case PrimitiveBlockTag::STRINGTABLE: decode_string_table(pb, string_table); break;
             case PrimitiveBlockTag::GRANULARITY: granularity = pb.get_int32(); break;
             case PrimitiveBlockTag::LAT_OFFSET: lat_offset = pb.get_int64(); break;
             case PrimitiveBlockTag::LON_OFFSET: lon_offset = pb.get_int64(); break;
@@ -661,16 +643,7 @@ void decode_pbf_blob_into(const char* data, size_t size, PbfBlock& block) {
 
     while (pb.next()) {
         switch (pb.tag()) {
-            case PrimitiveBlockTag::STRINGTABLE: {
-                protozero::pbf_reader st = pb.get_message();
-                while (st.next()) {
-                    if (st.tag() == StringTableTag::S) {
-                        auto view = st.get_view();
-                        string_table.emplace_back(view.data(), view.size());
-                    } else { st.skip(); }
-                }
-                break;
-            }
+            case PrimitiveBlockTag::STRINGTABLE: decode_string_table(pb, string_table); break;
             case PrimitiveBlockTag::GRANULARITY: granularity = pb.get_int32(); break;
             case PrimitiveBlockTag::LAT_OFFSET: lat_offset = pb.get_int64(); break;
             case PrimitiveBlockTag::LON_OFFSET: lon_offset = pb.get_int64(); break;
