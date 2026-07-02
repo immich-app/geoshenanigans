@@ -1,0 +1,105 @@
+name: Geocoder Build Watchdog
+
+# Auto-retry the daily geocoder build if its runner crashes mid-flight
+# (annotation "The self-hosted runner lost communication with the
+# server"). Two triggers:
+#
+#   1. workflow_run on the main Build Geocoder Index workflow's
+#      completion. If conclusion is failure (including infrastructure
+#      failure where steps didn't even start), schedule a retry.
+#   2. Hourly cron belt-and-braces — if a notification was missed
+#      or the runner came back hours later, this catches it.
+#
+# Self-limiting: walks recent runs, counts how many times we've tried
+# today, and bails if we've already retried MAX_RETRIES times. Prevents
+# runaway loops if the build is broken for non-runner reasons.
+
+on:
+  workflow_run:
+    workflows: ['Build Geocoder Index']
+    types: [completed]
+  schedule:
+    # Every 2 hours. Hourly might be excessive; 2h keeps the loop
+    # tight enough that a missed notification still gets caught
+    # within the same day, but slow enough that the watchdog itself
+    # doesn't dominate the runner queue.
+    - cron: '15 */2 * * *'
+  workflow_dispatch: {}
+
+# Single concurrency group so the watchdog never runs twice
+# simultaneously (e.g. a workflow_run trigger landing during the
+# cron run). The newer invocation cancels the older.
+concurrency:
+  group: geocoder-build-watchdog
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: write   # needs gh workflow run
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check and maybe retry today's build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          # Cap how many times we'll retry a single day before giving up.
+          # 5 covers ~10h of runner instability — past that, the failure
+          # is likely a real bug and a human should look.
+          MAX_RETRIES: 5
+        run: |
+          set -euo pipefail
+          TODAY=$(date -u +%Y-%m-%d)
+          WORKFLOW=geocoder-build.yml
+
+          # Daily builds (and our retries) run on the repo's default
+          # branch — that's the only branch GitHub fires scheduled
+          # workflows from, so it's where the build workflow lives in
+          # production. Derive it instead of hardcoding a branch name.
+          BUILD_REF=$(gh repo view --json defaultBranchRef --jq .defaultBranchRef.name)
+
+          # Fetch the last 30 runs of the build workflow and filter to
+          # today's runs ON THE DEFAULT BRANCH. The headBranch filter
+          # excludes feature-branch test runs that would otherwise skew
+          # the retry count. We intentionally do NOT filter by event:
+          # both the scheduled run and our own workflow_dispatch retries
+          # must count toward MAX_RETRIES. (gh prints UTC ISO timestamps,
+          # so startswith($t) is a valid same-day check.)
+          RUNS_JSON=$(gh run list \
+            --workflow="$WORKFLOW" \
+            --limit=30 \
+            --json conclusion,status,createdAt,event,headBranch)
+
+          TODAY_RUNS=$(echo "$RUNS_JSON" \
+            | jq --arg t "$TODAY" --arg ref "$BUILD_REF" \
+                 '[.[] | select(.createdAt | startswith($t)) | select(.headBranch == $ref)]')
+
+          TOTAL=$(echo "$TODAY_RUNS" | jq 'length')
+          SUCCEEDED=$(echo "$TODAY_RUNS" | jq '[.[] | select(.conclusion == "success")] | length')
+          IN_FLIGHT=$(echo "$TODAY_RUNS" | jq '[.[] | select(.status == "in_progress" or .status == "queued" or .status == "pending")] | length')
+
+          echo "Today=$TODAY  total=$TOTAL  succeeded=$SUCCEEDED  in_flight=$IN_FLIGHT"
+
+          if [ "$SUCCEEDED" -gt 0 ]; then
+            echo "Today already has a successful build — nothing to do."
+            exit 0
+          fi
+
+          if [ "$IN_FLIGHT" -gt 0 ]; then
+            echo "A build is already running for today — let it finish."
+            exit 0
+          fi
+
+          if [ "$TOTAL" -ge "$MAX_RETRIES" ]; then
+            echo "::error::Reached $MAX_RETRIES attempts for $TODAY without success — giving up. Investigate manually."
+            exit 1
+          fi
+
+          ATTEMPT=$((TOTAL + 1))
+          echo "Triggering retry $ATTEMPT/$MAX_RETRIES for $TODAY on $BUILD_REF"
+          gh workflow run "$WORKFLOW" \
+            --ref "$BUILD_REF" \
+            -f "build_date=$TODAY"

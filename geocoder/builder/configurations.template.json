@@ -1,0 +1,213 @@
+{
+  "schema_version": 1,
+  "build": {
+    "version": 16,
+    "patch_version": 1
+  },
+  "axes": {
+    "region": {
+      "label": "Region",
+      "description": "Geographic coverage area",
+      "order": 1,
+      "values": {
+        "planet":          { "label": "Planet (entire world)", "order": 1 },
+        "europe":          { "label": "Europe",                "order": 2 },
+        "asia":            { "label": "Asia",                  "order": 3 },
+        "north-america":   { "label": "North America",         "order": 4 },
+        "south-america":   { "label": "South America",         "order": 5 },
+        "africa":          { "label": "Africa",                "order": 6 },
+        "oceania":         { "label": "Oceania",               "order": 7 },
+        "central-america": { "label": "Central America",       "order": 8 },
+        "antarctica":      { "label": "Antarctica",            "order": 9 }
+      }
+    },
+    "mode": {
+      "label": "Coverage detail",
+      "description": "How much road and address data to include alongside admin boundaries",
+      "order": 2,
+      "values": {
+        "full": {
+          "label": "Full",
+          "description": "Streets + addresses + interpolation + admin + postcodes. Largest, most complete.",
+          "order": 1
+        },
+        "no-addresses": {
+          "label": "No addresses",
+          "description": "Streets + interpolation + admin + postcodes. No house-number resolution.",
+          "order": 2
+        },
+        "admin": {
+          "label": "Admin only",
+          "description": "Admin boundaries + place nodes + postcodes. No streets or addresses.",
+          "order": 3
+        },
+        "admin-minimal": {
+          "label": "Admin minimal",
+          "description": "Admin boundaries + place nodes only — no postcodes, no postal polygons. Smallest possible deployable. Country/state/city + cities500-equivalent place names.",
+          "order": 4
+        }
+      }
+    },
+    "quality": {
+      "label": "Boundary precision",
+      "description": "Higher quality = sharper admin polygon edges but larger download. Default q2.5 is invisible at typical photo-GPS accuracy.",
+      "order": 3,
+      "values": {
+        "uncapped": { "label": "Uncapped", "precision_m": 0,  "description": "Full vertex precision (<1m).",  "order": 1 },
+        "q0.2":     { "label": "q0.2",     "precision_m": 3,  "description": "~3m boundary precision.",      "order": 2 },
+        "q0.5":     { "label": "q0.5",     "precision_m": 7,  "description": "~7m boundary precision.",      "order": 3 },
+        "q1":       { "label": "q1",       "precision_m": 15, "description": "~15m boundary precision.",     "order": 4 },
+        "q1.5":     { "label": "q1.5",     "precision_m": 22, "description": "~22m boundary precision.",     "order": 5 },
+        "q2":       { "label": "q2",       "precision_m": 30, "description": "~30m boundary precision.",     "order": 6 },
+        "q2.5":     { "label": "q2.5",     "precision_m": 37, "description": "~37m boundary precision.",     "order": 7 }
+      }
+    },
+    "poi_tier": {
+      "label": "Points of interest",
+      "description": "Landmarks, parks, museums, peaks, airports, etc.",
+      "order": 4,
+      "values": {
+        "none":    { "label": "None",                              "description": "No POI data.",                                                                "order": 1 },
+        "major":   { "label": "Major (~900K POIs)",                "description": "Airports, national parks, palaces, train stations, UNESCO sites, volcanoes.",  "order": 2 },
+        "notable": { "label": "Notable (~3M POIs)",                "description": "+ museums, castles, stadiums, beaches, waterfalls, universities, viewpoints.",  "order": 3 },
+        "all":     { "label": "All (~5.9M POIs)",                  "description": "Every named POI (places of worship, peaks, memorials, artwork, gardens).",     "order": 4 }
+      }
+    }
+  },
+  "constraints": [
+    {
+      "id": "admin-minimal-needs-q2.5",
+      "when":     { "mode": "admin-minimal" },
+      "requires": { "quality": "q2.5" },
+      "message": "Admin minimal mode is only built at q2.5 — the whole point is the smallest possible deployable."
+    }
+  ],
+  "components": {
+    "mode.admin-minimal": {
+      "files": [
+        "{region}/admin-minimal/admin_cells.bin",
+        "{region}/admin-minimal/admin_entries.bin",
+        "{region}/admin-minimal/admin_polygons.bin",
+        "{region}/admin-minimal/admin_vertices.bin",
+        "{region}/admin-minimal/place_cells.bin",
+        "{region}/admin-minimal/place_entries.bin",
+        "{region}/admin-minimal/place_nodes.bin",
+        "{region}/full/strings_core.bin"
+      ],
+      "replaces": [
+        "{region}/quality/{quality}/admin_polygons.bin",
+        "{region}/quality/{quality}/admin_vertices.bin",
+        "{region}/quality/{quality}/postal_polygons.bin",
+        "{region}/quality/{quality}/postal_vertices.bin"
+      ]
+    },
+    "mode.admin": {
+      "files": [
+        "{region}/admin/admin_cells.bin",
+        "{region}/admin/admin_entries.bin",
+        "{region}/admin/place_cells.bin",
+        "{region}/admin/place_entries.bin",
+        "{region}/admin/place_nodes.bin",
+        "{region}/admin/postcode_centroids.bin",
+        "{region}/admin/postcode_centroid_cells.bin",
+        "{region}/admin/postcode_centroid_entries.bin",
+        "{region}/admin/strings_core.bin",
+        "{region}/admin/strings_postcode.bin"
+      ]
+    },
+    "mode.no-addresses": {
+      "files": [
+        "{region}/no-addresses/geo_cells.bin",
+        "{region}/no-addresses/street_entries.bin",
+        "{region}/no-addresses/street_ways.bin",
+        "{region}/no-addresses/street_nodes.bin",
+        "{region}/no-addresses/interp_entries.bin",
+        "{region}/no-addresses/interp_ways.bin",
+        "{region}/no-addresses/interp_nodes.bin",
+        "{region}/no-addresses/admin_cells.bin",
+        "{region}/no-addresses/admin_entries.bin",
+        "{region}/no-addresses/admin_parents.bin",
+        "{region}/no-addresses/place_cells.bin",
+        "{region}/no-addresses/place_entries.bin",
+        "{region}/no-addresses/place_nodes.bin",
+        "{region}/no-addresses/postcode_centroids.bin",
+        "{region}/no-addresses/postcode_centroid_cells.bin",
+        "{region}/no-addresses/postcode_centroid_entries.bin",
+        "{region}/no-addresses/way_parents.bin",
+        "{region}/no-addresses/way_postcodes.bin",
+        "{region}/no-addresses/strings_core.bin",
+        "{region}/no-addresses/strings_street.bin",
+        "{region}/no-addresses/strings_postcode.bin"
+      ]
+    },
+    "mode.full": {
+      "files": [
+        "{region}/full/geo_cells.bin",
+        "{region}/full/street_entries.bin",
+        "{region}/full/street_ways.bin",
+        "{region}/full/street_nodes.bin",
+        "{region}/full/addr_entries.bin",
+        "{region}/full/addr_points.bin",
+        "{region}/full/addr_vertices.bin",
+        "{region}/full/addr_postcodes.bin",
+        "{region}/full/interp_entries.bin",
+        "{region}/full/interp_ways.bin",
+        "{region}/full/interp_nodes.bin",
+        "{region}/full/admin_cells.bin",
+        "{region}/full/admin_entries.bin",
+        "{region}/full/admin_parents.bin",
+        "{region}/full/place_cells.bin",
+        "{region}/full/place_entries.bin",
+        "{region}/full/place_nodes.bin",
+        "{region}/full/postcode_centroids.bin",
+        "{region}/full/postcode_centroid_cells.bin",
+        "{region}/full/postcode_centroid_entries.bin",
+        "{region}/full/way_parents.bin",
+        "{region}/full/way_postcodes.bin",
+        "{region}/full/strings_core.bin",
+        "{region}/full/strings_street.bin",
+        "{region}/full/strings_addr.bin",
+        "{region}/full/strings_postcode.bin"
+      ]
+    },
+    "quality.uncapped": { "files": ["{region}/quality/uncapped/admin_polygons.bin", "{region}/quality/uncapped/admin_vertices.bin", "{region}/quality/uncapped/postal_polygons.bin", "{region}/quality/uncapped/postal_vertices.bin"] },
+    "quality.q0.2":     { "files": ["{region}/quality/q0.2/admin_polygons.bin",     "{region}/quality/q0.2/admin_vertices.bin",     "{region}/quality/q0.2/postal_polygons.bin",     "{region}/quality/q0.2/postal_vertices.bin"] },
+    "quality.q0.5":     { "files": ["{region}/quality/q0.5/admin_polygons.bin",     "{region}/quality/q0.5/admin_vertices.bin",     "{region}/quality/q0.5/postal_polygons.bin",     "{region}/quality/q0.5/postal_vertices.bin"] },
+    "quality.q1":       { "files": ["{region}/quality/q1/admin_polygons.bin",       "{region}/quality/q1/admin_vertices.bin",       "{region}/quality/q1/postal_polygons.bin",       "{region}/quality/q1/postal_vertices.bin"] },
+    "quality.q1.5":     { "files": ["{region}/quality/q1.5/admin_polygons.bin",     "{region}/quality/q1.5/admin_vertices.bin",     "{region}/quality/q1.5/postal_polygons.bin",     "{region}/quality/q1.5/postal_vertices.bin"] },
+    "quality.q2":       { "files": ["{region}/quality/q2/admin_polygons.bin",       "{region}/quality/q2/admin_vertices.bin",       "{region}/quality/q2/postal_polygons.bin",       "{region}/quality/q2/postal_vertices.bin"] },
+    "quality.q2.5":     { "files": ["{region}/quality/q2.5/admin_polygons.bin",     "{region}/quality/q2.5/admin_vertices.bin",     "{region}/quality/q2.5/postal_polygons.bin",     "{region}/quality/q2.5/postal_vertices.bin"] },
+    "poi_tier.none":    { "files": [] },
+    "poi_tier.major":   { "files": ["{region}/poi/major/poi_records.bin",   "{region}/poi/major/poi_vertices.bin",   "{region}/poi/major/poi_cells.bin",   "{region}/poi/major/poi_entries.bin",   "{region}/poi/major/strings_poi.bin"] },
+    "poi_tier.notable": { "files": ["{region}/poi/notable/poi_records.bin", "{region}/poi/notable/poi_vertices.bin", "{region}/poi/notable/poi_cells.bin", "{region}/poi/notable/poi_entries.bin", "{region}/poi/notable/strings_poi.bin"] },
+    "poi_tier.all":     { "files": ["{region}/poi/all/poi_records.bin",     "{region}/poi/all/poi_vertices.bin",     "{region}/poi/all/poi_cells.bin",     "{region}/poi/all/poi_entries.bin",     "{region}/poi/all/strings_poi.bin"] }
+  },
+  "presets": [
+    {
+      "id": "smallest",
+      "label": "Smallest useful",
+      "description": "Admin boundaries + cities500-level place names, no POIs.",
+      "selections": { "region": "planet", "mode": "admin-minimal", "quality": "q2.5", "poi_tier": "none" }
+    },
+    {
+      "id": "immich-recommended",
+      "label": "Immich recommended",
+      "description": "Admin + major POIs (airports, parks, palaces). Best balance for photo apps.",
+      "selections": { "region": "planet", "mode": "admin", "quality": "q2.5", "poi_tier": "major" },
+      "default": true
+    },
+    {
+      "id": "with-addresses",
+      "label": "With street addresses",
+      "description": "Streets + addresses + interpolation. House-number resolution where tagged.",
+      "selections": { "region": "planet", "mode": "full", "quality": "q2.5", "poi_tier": "all" }
+    },
+    {
+      "id": "max-quality",
+      "label": "Maximum quality",
+      "description": "Full mode at uncapped boundary precision. Largest configuration available.",
+      "selections": { "region": "planet", "mode": "full", "quality": "uncapped", "poi_tier": "all" }
+    }
+  ],
+  "files": {}
+}
