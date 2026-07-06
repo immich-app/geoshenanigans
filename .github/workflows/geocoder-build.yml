@@ -73,8 +73,16 @@ jobs:
         run: |
           cd geocoder/builder && mkdir -p build && cd build
           cmake .. -DCMAKE_BUILD_TYPE=Release
-          make -j$(nproc) build-index geocoder-diff geocoder-patch
+          make -j$(nproc) build-index geocoder-diff geocoder-patch geocoder-tests
           echo "$PWD" >> "$GITHUB_PATH"
+
+      - name: Run builder tests
+        run: |
+          # Unit tests gate the build: the suite locks in parity-critical
+          # pure functions (postcode validation, patch format, id
+          # allocator) that a broken toolchain or bad merge would corrupt
+          # long before the multi-hour planet build surfaces it.
+          cd geocoder/builder/build && ./geocoder-tests
 
       - name: Setup
         id: setup
@@ -109,7 +117,7 @@ jobs:
           echo "Server:     $CURRENT_DATE (seq $CURRENT_SEQ, offset: -${DAYS_OFFSET}d)"
 
           # Check if previous build exists on Tigris with compatible build_version
-          EXPECTED_BUILD_VERSION=16
+          EXPECTED_BUILD_VERSION=$(jq -r .build.version "$GITHUB_WORKSPACE/geocoder/builder/configurations.template.json")
           PREV_BUILD="s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV_DATE"
           if [ "$FORCE_FRESH" = "true" ]; then
             echo "has_previous=false" >> "$GITHUB_OUTPUT"
@@ -289,8 +297,8 @@ jobs:
           # --connect-timeout caps DNS+TCP handshake, --max-time caps the
           # whole transfer. Both fall through to "skip" via `|| true`.
           echo "[wikidata] Checking for sitelinks data..."
-          WIKIDATA_LATEST=$(curl -sL --connect-timeout 30 --max-time 60 "$S3_PUBLIC_URL/geocoder/wikidata/latest.json" 2>/dev/null)
-          WD_DATE=$(echo "$WIKIDATA_LATEST" | jq -r '.dump_date // ""' 2>/dev/null)
+          WIKIDATA_LATEST=$(curl -sL --fail --connect-timeout 30 --max-time 60 "$S3_PUBLIC_URL/geocoder/wikidata/latest.json" 2>/dev/null || echo '{}')
+          WD_DATE=$(echo "$WIKIDATA_LATEST" | jq -r '.dump_date // ""' 2>/dev/null || echo "")
           if [ -n "$WD_DATE" ]; then
             echo "[wikidata] Found sitelinks from $WD_DATE, downloading..."
             curl -sL --connect-timeout 30 --max-time 600 -o "$WORKDIR/qid_sitelinks.bin" \
@@ -368,11 +376,12 @@ jobs:
               echo "[tiger] Downloaded: $(( $(stat -c%s "$WORKDIR/tiger-data.tar.gz") / 1024 / 1024 )) MiB"
               echo "tiger_data=$WORKDIR/tiger-data.tar.gz" >> "$GITHUB_OUTPUT"
             else
-              echo "[tiger] Download failed or empty, skipping"
-              rm -f "$WORKDIR/tiger-data.tar.gz"
+              echo "::error::[tiger] Download failed or empty — a TIGER-less planet build silently drops US address ranges and ZIPs"
+              exit 1
             fi
           else
-            echo "[tiger] No TIGER data available"
+            echo "::error::[tiger] No TIGER data available at $S3_PUBLIC_URL/geocoder/tiger/latest.json — refusing to build a US-less planet index"
+            exit 1
           fi
 
           # Wait for index download
@@ -402,8 +411,9 @@ jobs:
             DIR2=$(printf "%03d" $(((TODAY_SEQ / 1000) % 1000)))
             FILE=$(printf "%03d" $((TODAY_SEQ % 1000)))
             echo "Downloading replication diff (seq $TODAY_SEQ)..."
-            curl -sL -o "$WORKDIR/diff-today.osc.gz" \
+            curl -sL --fail -o "$WORKDIR/diff-today.osc.gz" \
               "$SERVER/$DIR1/$DIR2/${FILE}.osc.gz"
+            gzip -t "$WORKDIR/diff-today.osc.gz"
             DIFF_SIZE=$(stat -c%s "$WORKDIR/diff-today.osc.gz")
             echo "Diff: $((DIFF_SIZE/1024/1024)) MiB"
 
@@ -429,7 +439,8 @@ jobs:
                 DIR1=$(printf "%03d" $((S / 1000000)))
                 DIR2=$(printf "%03d" $(((S / 1000) % 1000)))
                 FILE=$(printf "%03d" $((S % 1000)))
-                curl -sL -o "$WORKDIR/diff-${S}.osc.gz" "$SERVER/$DIR1/$DIR2/${FILE}.osc.gz"
+                curl -sL --fail -o "$WORKDIR/diff-${S}.osc.gz" "$SERVER/$DIR1/$DIR2/${FILE}.osc.gz"
+                gzip -t "$WORKDIR/diff-${S}.osc.gz"
                 DIFFS="$DIFFS $WORKDIR/diff-${S}.osc.gz"
               done
               echo "Applying $DAYS_NEEDED diffs..."
@@ -600,8 +611,16 @@ jobs:
               N_OLD=$(ls "$OLD_DIR"/*.bin 2>/dev/null | wc -l)
               SAFE=$(echo "$variant" | tr '/' '_')
 
-              [ "$N_NEW" -lt 2 ] && exit 0
-              if [ "$N_OLD" -ne "$N_NEW" ]; then
+              if [ "$N_NEW" -lt 2 ]; then
+                echo "SKIP" > "$RESULTS_DIR/$SAFE"
+                exit 0
+              fi
+              # Only a fresh build (no previous output at all) skips. A file-
+              # count mismatch with a previous build present is a real diff
+              # (added/removed optional files, e.g. a sidecar introduction
+              # day) — the tools emit full-replace sections for those, so run
+              # the diff and let verify judge it.
+              if [ "$N_OLD" -eq 0 ]; then
                 echo "SKIP" > "$RESULTS_DIR/$SAFE"
                 exit 0
               fi
@@ -621,7 +640,7 @@ jobs:
               # Verify
               VERIFY_DIR="$WORKDIR/verify-$SAFE"
               mkdir -p "$VERIFY_DIR"
-              geocoder-patch "$OLD_DIR" "$PATCH_FILE" -o "$VERIFY_DIR/" 2>/dev/null
+              geocoder-patch "$OLD_DIR" "$PATCH_FILE" -o "$VERIFY_DIR/" 2>> "$DIFF_LOG"
 
               MATCH=0
               MISMATCH_LIST=""
@@ -666,7 +685,14 @@ jobs:
           PASS=0; FAIL=0; SKIP=0
           for variant in $VARIANTS; do
             SAFE=$(echo "$variant" | tr '/' '_')
-            [ ! -f "$RESULTS_DIR/$SAFE" ] && continue
+            if [ ! -f "$RESULTS_DIR/$SAFE" ]; then
+              # Every eligible variant writes PASS/FAIL/SKIP; a missing file
+              # means the verify subshell died mid-flight (tool crash).
+              echo "::error::$variant: no verify result — diff/patch tool crashed"
+              echo "| $variant | - | - | **CRASH** |" >> "$GITHUB_STEP_SUMMARY"
+              FAIL=$((FAIL + 1))
+              continue
+            fi
             RESULT=$(cat "$RESULTS_DIR/$SAFE")
 
             if [ "$RESULT" = "SKIP" ]; then
@@ -938,9 +964,11 @@ jobs:
           # build.
           if [ -z "$PATCH_VERIFY_FAILED" ]; then
             PREV_VAL="$( [ "$HAS_PREVIOUS" = "true" ] && echo "$OLD_DATE" || echo "null" )"
+            BUILD_V=$(jq -r .build.version "$GITHUB_WORKSPACE/geocoder/builder/configurations.template.json")
+            PATCH_V=$(jq -r .build.patch_version "$GITHUB_WORKSPACE/geocoder/builder/configurations.template.json")
             jq -n \
-              --argjson build_version 14 \
-              --argjson patch_version 5 \
+              --argjson build_version "$BUILD_V" \
+              --argjson patch_version "$PATCH_V" \
               --arg latest "$NEW_DATE" \
               --arg previous "$PREV_VAL" \
               --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \

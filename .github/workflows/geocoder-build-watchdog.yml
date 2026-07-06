@@ -93,6 +93,14 @@ jobs:
             exit 0
           fi
 
+          if [ "$TOTAL" -eq 0 ]; then
+            # No run today at all: the scheduled build owns the first
+            # attempt. Dispatching here raced the daily cron and produced
+            # duplicate multi-hour builds — the watchdog is retry-only.
+            echo "No build attempted today yet — leaving the first attempt to the schedule."
+            exit 0
+          fi
+
           if [ "$TOTAL" -ge "$MAX_RETRIES" ]; then
             echo "::error::Reached $MAX_RETRIES attempts for $TODAY without success — giving up. Investigate manually."
             exit 1
