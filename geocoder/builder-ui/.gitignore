@@ -2,3 +2,7 @@ node_modules/
 .svelte-kit/
 build/
 dist/
+
+# Generated per-build manifest (template + build hashes). Prod fetches the
+# live one from Tigris; not source. See geocoder/builder/configurations.template.json.
+static/configurations.json
