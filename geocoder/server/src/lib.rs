@@ -978,6 +978,23 @@ fn street_tokens_overlap(a: &str, b: &str) -> bool {
     na.split(' ').filter(|t| t.len() >= 2).any(|t| bt.contains(t))
 }
 
+/// House number at fraction `t` along an interpolation way. Rounds to the
+/// even/odd grid relative to start_number and clamps into [min, max] of the
+/// range — the old open-coded version computed the offset in unsigned space,
+/// so descending ranges (start > end) saturated the negative offset to 0.
+fn interpolate_house_number(start: u32, end: u32, interpolation: u8, t: f64) -> u32 {
+    let raw = start as f64 + t * (end as f64 - start as f64);
+    let step = match interpolation { 1 | 2 => 2.0, _ => 1.0 };
+    let lo = start.min(end) as f64;
+    let hi = start.max(end) as f64;
+    let snapped = if step == 2.0 {
+        start as f64 + ((raw - start as f64) / 2.0).round() * 2.0
+    } else {
+        raw.round()
+    };
+    snapped.max(lo).min(hi) as u32
+}
+
 pub const NO_DATA: u32 = 0xFFFFFFFF;
 
 // Entry-ID encoding for admin/POI cell entries: the high bit flags an
@@ -1351,6 +1368,8 @@ impl Index {
         let header = source.read_chunk(off, 2);
         let count = u16::from_le_bytes([header[0], header[1]]) as usize;
         if count == 0 { return Vec::new(); }
+        // Bound the payload: a corrupt count must not read past EOF.
+        if off + 2 + (count as u64) * 4 > source.len() { return Vec::new(); }
         let blob = source.read_chunk(off + 2, count * 4);
         let mut out = Vec::with_capacity(count);
         for i in 0..count {
@@ -1423,14 +1442,19 @@ impl Index {
             }
 
             // Streets
+            let total_ways = street_ways.len() / std::mem::size_of::<WayHeader>() as u64;
+            let total_street_nodes = street_nodes.len() / std::mem::size_of::<NodeCoord>() as u64;
             for id in Self::read_entries_fb(street_entries, offsets.street) {
                 let slot = (id as usize) & 0x3F;
                 if seen_streets[slot] == id { continue; }
                 seen_streets[slot] = id;
 
+                // Corrupt cell entries must not read past the record files.
+                if (id as u64) >= total_ways { continue; }
                 let way: WayHeader = street_ways.read_at(id as u64);
                 let off = way.node_offset as u64;
                 let cnt = way.node_count as usize;
+                if cnt < 2 || off + cnt as u64 > total_street_nodes { continue; }
                 let nbytes = street_nodes.read_chunk(off * std::mem::size_of::<NodeCoord>() as u64,
                                                      cnt * std::mem::size_of::<NodeCoord>());
                 let nodes: &[NodeCoord] = unsafe {
@@ -1455,11 +1479,16 @@ impl Index {
             if let (Some(interp_entries), Some(interp_ways), Some(interp_nodes)) =
                 (self.interp_entries.as_ref(), self.interp_ways.as_ref(), self.interp_nodes.as_ref())
             {
+                let total_interps = interp_ways.len() / std::mem::size_of::<InterpWay>() as u64;
+                let total_interp_nodes = interp_nodes.len() / std::mem::size_of::<NodeCoord>() as u64;
                 for id in Self::read_entries_fb(interp_entries, offsets.interp) {
+                    // Corrupt cell entries must not read past the record files.
+                    if (id as u64) >= total_interps { continue; }
                     let iw: InterpWay = interp_ways.read_at(id as u64);
                     if iw.start_number == 0 || iw.end_number == 0 { continue; }
                     let off = iw.node_offset as u64;
                     let cnt = iw.node_count as usize;
+                    if cnt < 2 || off + cnt as u64 > total_interp_nodes { continue; }
                     let nbytes = interp_nodes.read_chunk(off * std::mem::size_of::<NodeCoord>() as u64,
                                                           cnt * std::mem::size_of::<NodeCoord>());
                     let nodes: &[NodeCoord] = unsafe {
@@ -1470,7 +1499,9 @@ impl Index {
                     for i in 0..nodes.len() - 1 {
                         let dlat = (nodes[i + 1].lat as f64 - nodes[i].lat as f64).to_radians();
                         let dlng = (nodes[i + 1].lng as f64 - nodes[i].lng as f64).to_radians();
-                        total_len += dist_sq(dlat, dlng, cos_lat);
+                        // sqrt: dist_sq is squared length; accumulating squares
+                        // skews the along-way fraction toward long segments.
+                        total_len += dist_sq(dlat, dlng, cos_lat).sqrt();
                     }
                     if total_len == 0.0 { continue; }
                     let mut best_seg_dist = f64::MAX;
@@ -1479,7 +1510,7 @@ impl Index {
                     for i in 0..nodes.len() - 1 {
                         let dlat = (nodes[i + 1].lat as f64 - nodes[i].lat as f64).to_radians();
                         let dlng = (nodes[i + 1].lng as f64 - nodes[i].lng as f64).to_radians();
-                        let seg_len = dist_sq(dlat, dlng, cos_lat);
+                        let seg_len = dist_sq(dlat, dlng, cos_lat).sqrt();
                         let (dist, seg_t) = point_to_segment_with_t(
                             lat, lng,
                             nodes[i].lat as f64, nodes[i].lng as f64,
@@ -1505,17 +1536,8 @@ impl Index {
         let addr_result = best_addr.map(|p| (best_addr_dist, p, best_addr_id));
         let street_result = best_street.map(|w| (best_street_dist, w, best_street_idx));
         let interp_result = best_interp.map(|iw| {
-            let start = iw.start_number as f64;
-            let end = iw.end_number as f64;
-            let raw = start + best_interp_t * (end - start);
-            let step: u32 = match iw.interpolation { 1 | 2 => 2, _ => 1 };
-            let number = if step == 2 {
-                let base = iw.start_number;
-                let offset = ((raw - base as f64) / step as f64).round() as u32 * step;
-                base + offset
-            } else {
-                raw.round() as u32
-            };
+            let number = interpolate_house_number(
+                iw.start_number, iw.end_number, iw.interpolation, best_interp_t);
             (best_interp_dist, self.get_string(iw.street_id), number, best_interp_id)
         });
 
@@ -3775,6 +3797,19 @@ mod multi_index_tests {
     use super::*;
 
     #[test]
+    fn interpolate_house_number_ranges() {
+        // ascending even range, midpoint
+        assert_eq!(interpolate_house_number(2, 10, 1, 0.5), 6);
+        // descending range: negative offsets must not saturate to start
+        assert_eq!(interpolate_house_number(10, 2, 1, 0.5), 6);
+        assert_eq!(interpolate_house_number(10, 2, 1, 1.0), 2);
+        // odd step keeps parity of start
+        assert_eq!(interpolate_house_number(1, 9, 2, 0.55), 5);
+        // clamped to range ends
+        assert_eq!(interpolate_house_number(2, 4, 1, 1.4), 4);
+    }
+
+    #[test]
     fn street_tokens_overlap_matches_tiger_names() {
         // TIGER abbreviated vs OSM full name: shared significant token.
         assert!(street_tokens_overlap("W 1st St", "West 1st Street"));
@@ -3941,6 +3976,13 @@ pub fn format_postcode<'a>(country_code: &[u8; 2], postcode: &'a str) -> Cow<'a,
         .filter(|c| !c.is_whitespace() && *c != '-')
         .flat_map(|c| c.to_uppercase())
         .collect();
+
+    // Non-ASCII postcodes (possible in raw addr:postcode tags) are returned
+    // verbatim: every split arm below indexes `bare` by byte offset, which
+    // panics on a non-char-boundary. All real formats are ASCII.
+    if !bare.is_ascii() {
+        return Cow::Borrowed(postcode);
+    }
 
     // Helper — split at index `at`, joined by `sep`.
     let split_at = |at: usize, sep: char| -> Option<String> {

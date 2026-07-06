@@ -224,17 +224,34 @@ pub async fn download_region(
         ..Default::default()
     });
 
+    // Files land FLAT under <root>/<region>/ — Index::load (via
+    // install_region) reads a flat dir, not the manifest's nested
+    // {region}/{mode}/... layout. Later paths overwrite earlier basenames
+    // (quality-variant admin polygons over the mode set), mirroring how
+    // server dirs are assembled from build output.
+    let region_dir = root.join(&sel.region);
+    tokio::fs::create_dir_all(&region_dir).await
+        .map_err(|e| DownloadError::Io(format!("mkdir {}: {}", region_dir.display(), e)))?;
+
+    // Key the dir by build date: size-only resume checks across different
+    // builds would otherwise mix files from two builds into one index.
+    let stamp = region_dir.join(".build_date");
+    let existing = tokio::fs::read_to_string(&stamp).await.unwrap_or_default();
+    let fresh_build = existing.trim() != cfg.build.date;
+    if fresh_build {
+        tokio::fs::write(&stamp, &cfg.build.date).await
+            .map_err(|e| DownloadError::Io(format!("write {}: {}", stamp.display(), e)))?;
+    }
+
     for (i, path) in paths.iter().enumerate() {
         let entry = cfg.files.get(path)
             .ok_or_else(|| DownloadError::NotInManifest(path.clone()))?;
 
-        let dest = root.join(path);
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent).await
-                .map_err(|e| DownloadError::Io(format!("mkdir {}: {}", parent.display(), e)))?;
-        }
+        let fname = Path::new(path).file_name()
+            .ok_or_else(|| DownloadError::Io(format!("bad manifest path: {}", path)))?;
+        let dest = region_dir.join(fname);
 
-        let already_correct = match tokio::fs::metadata(&dest).await {
+        let already_correct = !fresh_build && match tokio::fs::metadata(&dest).await {
             Ok(m) => m.len() == entry.size_raw,
             Err(_) => false,
         };

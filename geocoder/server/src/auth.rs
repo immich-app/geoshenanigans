@@ -97,12 +97,19 @@ impl Db {
 
 pub fn check_rate(limiter: &RateLimiter, login: &str, rate_per_second: u32, rate_per_day: u32) -> Result<(), &'static str> {
     let state = {
-        let map = limiter.read().unwrap();
+        let map = limiter.read().unwrap_or_else(|e| e.into_inner());
         if let Some(s) = map.get(login) {
             Arc::clone(s)
         } else {
             drop(map);
-            let mut map = limiter.write().unwrap();
+            let mut map = limiter.write().unwrap_or_else(|e| e.into_inner());
+            // Evict stale entries once the map grows: with rate_by_ip every
+            // distinct client IP inserts a key, so the map is otherwise
+            // unbounded (slow memory DoS). Keep entries seen today/yesterday.
+            if map.len() >= 10_000 {
+                let day = (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() / 86400) as u32;
+                map.retain(|_, s| s.day_ts.load(Relaxed) + 1 >= day);
+            }
             Arc::clone(map.entry(login.to_string()).or_default())
         }
     };
@@ -181,7 +188,7 @@ struct LoginForm {
 
 async fn login_page(headers: HeaderMap, state: State<Arc<RwLock<Db>>>) -> Response {
     if let Some(session_id) = get_session_cookie(&headers) {
-        let db = state.read().unwrap();
+        let db = state.read().unwrap_or_else(|e| e.into_inner());
         if db.sessions.contains_key(&session_id) {
             return Redirect::to("/").into_response();
         }
@@ -190,7 +197,7 @@ async fn login_page(headers: HeaderMap, state: State<Arc<RwLock<Db>>>) -> Respon
 }
 
 async fn login_submit(state: State<Arc<RwLock<Db>>>, Form(form): Form<LoginForm>) -> Response {
-    let mut db = state.write().unwrap();
+    let mut db = state.write().unwrap_or_else(|e| e.into_inner());
 
     // First login ever — create admin account
     if db.users.is_empty() {
@@ -211,7 +218,7 @@ async fn login_submit(state: State<Arc<RwLock<Db>>>, Form(form): Form<LoginForm>
 
 async fn logout(headers: HeaderMap, state: State<Arc<RwLock<Db>>>) -> Response {
     if let Some(session_id) = get_session_cookie(&headers) {
-        let mut db = state.write().unwrap();
+        let mut db = state.write().unwrap_or_else(|e| e.into_inner());
         db.sessions.remove(&session_id);
     }
     let (cookie,) = clear_session_cookie();
@@ -228,7 +235,7 @@ async fn dashboard(
         None => return Redirect::to("/login").into_response(),
     };
 
-    let db = state.read().unwrap();
+    let db = state.read().unwrap_or_else(|e| e.into_inner());
     let login = match db.sessions.get(&session_id) {
         Some(l) => l.clone(),
         None => return Redirect::to("/login").into_response(),
@@ -266,7 +273,7 @@ async fn dashboard(
 
     let now_day = (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() / 86400) as u32;
     let daily_usage = {
-        let map = limiter.read().unwrap();
+        let map = limiter.read().unwrap_or_else(|e| e.into_inner());
         map.get(&login).map(|s| {
             if s.day_ts.load(Relaxed) == now_day { s.day_count.load(Relaxed) } else { 0 }
         }).unwrap_or(0)
@@ -287,7 +294,7 @@ async fn create_token(headers: HeaderMap, state: State<Arc<RwLock<Db>>>) -> Resp
         None => return Redirect::to("/login").into_response(),
     };
 
-    let mut db = state.write().unwrap();
+    let mut db = state.write().unwrap_or_else(|e| e.into_inner());
     if let Some(login) = db.sessions.get(&session_id).cloned() {
         let token = random_hex(16);
         db.tokens.insert(token, login);
@@ -308,7 +315,7 @@ async fn delete_token(
         None => return Redirect::to("/login").into_response(),
     };
 
-    let mut db = state.write().unwrap();
+    let mut db = state.write().unwrap_or_else(|e| e.into_inner());
     if let Some(login) = db.sessions.get(&session_id) {
         if db.tokens.get(&token).map(|o| o == login).unwrap_or(false) {
             db.tokens.remove(&token);
@@ -336,7 +343,7 @@ async fn create_user_handler(headers: HeaderMap, state: State<Arc<RwLock<Db>>>, 
         None => return Redirect::to("/login").into_response(),
     };
 
-    let mut db = state.write().unwrap();
+    let mut db = state.write().unwrap_or_else(|e| e.into_inner());
     if let Some(login) = db.sessions.get(&session_id).cloned() {
         let is_admin = db.users.get(&login).map(|u| u.admin).unwrap_or(false);
         if is_admin && !form.login.is_empty() && !form.password.is_empty() {
@@ -356,7 +363,7 @@ async fn delete_user(
         None => return Redirect::to("/login").into_response(),
     };
 
-    let mut db = state.write().unwrap();
+    let mut db = state.write().unwrap_or_else(|e| e.into_inner());
     if let Some(login) = db.sessions.get(&session_id).cloned() {
         let is_admin = db.users.get(&login).map(|u| u.admin).unwrap_or(false);
         if is_admin && target != login {
