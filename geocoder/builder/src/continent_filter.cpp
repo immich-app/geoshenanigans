@@ -53,6 +53,19 @@ static bool cell_in_bbox(uint64_t cell_id, const ContinentBBox& bbox) {
            lng >= bbox.min_lng && lng <= bbox.max_lng;
 }
 
+// Cell membership test used for the admin cell maps: polygon-based when a
+// boundary polygon is available (same semantics as precompute_masks for the
+// record classes), hand-written bbox fallback otherwise. The bbox-only test
+// dropped admin data for zones the bboxes miss but the Geofabrik polygons
+// cover (Guam, Adak, the Azores, island territories).
+static bool cell_in_continent(uint64_t cell_id, const ContinentBBox& bbox,
+                              const std::vector<std::pair<double,double>>* polygon) {
+    if (!polygon) return cell_in_bbox(cell_id, bbox);
+    S2CellId cell(cell_id);
+    S2LatLng center = cell.ToLatLng();
+    return point_in_polygon(center.lat().degrees(), center.lng().degrees(), *polygon);
+}
+
 ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bbox,
     uint8_t continent_bit,
     const std::vector<uint8_t>& way_masks,
@@ -111,7 +124,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
                                 bool mask_interior = false) {
         std::unordered_set<uint32_t> ids;
         for (const auto& [cell_id, cell_ids] : cell_map) {
-            if (cell_in_bbox(cell_id, bbox)) {
+            if (cell_in_continent(cell_id, bbox, polygon)) {
                 for (uint32_t id : cell_ids)
                     ids.insert(mask_interior ? (id & ID_MASK) : id);
             }
@@ -434,7 +447,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
                                std::unordered_map<uint64_t, std::vector<uint32_t>>& dst,
                                bool handle_flags = false) {
         for (const auto& [cell_id, ids] : src) {
-            if (!cell_in_bbox(cell_id, bbox)) continue;
+            if (!cell_in_continent(cell_id, bbox, polygon)) continue;
             std::vector<uint32_t> new_ids;
             for (uint32_t id : ids) {
                 uint32_t raw_id = handle_flags ? (id & ID_MASK) : id;

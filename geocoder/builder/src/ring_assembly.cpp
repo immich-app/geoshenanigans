@@ -188,6 +188,10 @@ std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
                         bt_rings.push_back(std::move(r));
                         continue;
                     }
+                    // Ring rejected (self-intersecting): try_close left every
+                    // path way marked used — release them, or later seeds can
+                    // never close rings through those ways.
+                    for (const auto& [wi, rev] : path) bt_used[wi] = false;
                 }
                 bt_used[si] = false;
                 total_bt_calls += bt2.calls;

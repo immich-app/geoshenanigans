@@ -3357,15 +3357,32 @@ int main(int argc, char* argv[]) {
     std::vector<float> poi_elevations; // build-time only, not in ParsedData
     std::vector<uint32_t> poi_qids; // build-time only: wikidata QID numbers
 
-    // Load wikidata sitelinks data (QID → sitelinks count)
+    // Load wikidata sitelinks data (QID → sitelinks count).
+    // The file is PACKED 6-byte records — struct.pack('<IH', qid, count) in
+    // extract_wikidata_sitelinks.py — NOT sizeof(QidSitelinks)=8 with padding.
+    // The old 8-byte-stride read parsed record 0 correctly and garbage for
+    // every record after it, silently zeroing sitelink-based POI importance.
     std::vector<QidSitelinks> sitelinks_data;
     if (!wikidata_sitelinks_path.empty()) {
         std::ifstream sf(wikidata_sitelinks_path, std::ios::binary | std::ios::ate);
         if (sf) {
             size_t sz = sf.tellg();
             sf.seekg(0);
-            sitelinks_data.resize(sz / sizeof(QidSitelinks));
-            sf.read(reinterpret_cast<char*>(sitelinks_data.data()), sz);
+            if (sz % 6 != 0)
+                throw std::runtime_error("qid_sitelinks.bin size not a multiple of 6 bytes");
+            std::vector<char> raw(sz);
+            sf.read(raw.data(), sz);
+            if (!sf) throw std::runtime_error("short read on " + wikidata_sitelinks_path);
+            sitelinks_data.resize(sz / 6);
+            for (size_t i = 0; i < sitelinks_data.size(); i++) {
+                std::memcpy(&sitelinks_data[i].qid,   raw.data() + i * 6,     4);
+                std::memcpy(&sitelinks_data[i].count, raw.data() + i * 6 + 4, 2);
+            }
+            // lookup_sitelinks binary-searches by qid — enforce sortedness.
+            for (size_t i = 1; i < sitelinks_data.size(); i++) {
+                if (sitelinks_data[i].qid < sitelinks_data[i - 1].qid)
+                    throw std::runtime_error("qid_sitelinks.bin not sorted by qid");
+            }
             std::cerr << "Loaded " << sitelinks_data.size() << " wikidata sitelinks entries." << std::endl;
         }
     }
