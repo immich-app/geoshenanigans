@@ -3,6 +3,24 @@
 Parallel multi-agent review of the builder (C++) + server (Rust), for the refactor pass on `refactor/geocoder-quality`.
 Hard invariants every refactor must preserve: **(1) determinism** — chained build from identical PBF reproduces a byte-identical index (same-PBF planet patch ~243 B, verify 26/26); **(2) Nominatim parity** — 500-city query results unchanged. HIGH/MEDIUM findings only (low-severity + full text were in the agent output).
 
+## Full PR-branch review round (2026-07) — 47 verified findings shipped
+
+A second, branch-wide review (8 areas, adversarially verified) landed five
+commits: builder races/hardening/dead-code (incl. the planet-write vs
+continent-filter race and the GCPATCH v3 gate), three behaviour fixes
+(wikidata sitelinks were parsed at the wrong stride — POI importance was
+garbage planet-wide; ring-assembly backtracking leaked used-flags on
+self-intersection rejection; continent admin cells now filter by boundary
+polygon instead of hand-written bboxes), CI pipeline guards (watchdog
+duplicate-build race, verify-crash-is-green, hardcoded stale version stamps,
+s3-cleanup.yml deleted), server fixes (on-demand downloads landed in a layout
+the loader never read, non-ASCII postcode panic, rate-limiter growth,
+corrupt-index bounds), and a test round (REQUIRE, highway/ring/poi_classify
+parity lock-ins; 109 tests). Validated: whole-tree same-PBF determinism
+1088/1088, same-PBF patch 251 B verify 27/27, day-over-day 26/26 at baseline
+patch sizes, 327K-coord grid identical, planet-scope byte diffs exactly
+attributable to the three intended behaviour changes.
+
 ## Refactors applied in this pass (validated)
 
 Every change below was validated against the hard invariants before commit. "byte-identical" means a same-binary build was diffed file-by-file against a pre-change baseline (`cmp -s` over every output `.bin`); "planet" includes TIGER + wikidata sitelinks. The two builder refactors are determinism-critical, so both were proven byte-identical at oceania **and** planet scale — byte-identical output is the strongest possible proof a refactor changed no behaviour (it also implies Nominatim parity is untouched).
@@ -123,7 +141,7 @@ types.h defines the on-disk binary record structs (WayHeader, AddrPoint, Postcod
 
 _Tests:_ partition_strings_into_tiers (parsed_data.h:279) (moderate); ParsedData::get_string (parsed_data.h:257) (easy); deduplicate (parsed_data.h:414) (easy); poi_get_default_tier / poi_category_label / poi_get_proximity_meters / category_base_importance / category_reference_distance / category_max_distance (types.h) (moderate); ensure_dir (parsed_data.h:26) (easy)
 
-## geocoder/builder pure helpers (ring_assembly, s2_helpers, interpolation, continent_filter, continent_boundaries, cache, geometry.h, postcode_validation.h, string_pool.h, id_allocator.h, relation_collector.h)
+## geocoder/builder pure helpers (ring_assembly, s2_helpers, interpolation, continent_filter, continent_boundaries, cache, geometry.h, postcode_validation.h, string_pool.h, id_allocator.h)
 These files form the builder's geometry/identity helper layer. geometry.h holds pure computational primitives (coord hashing, shoelace area, segment-intersection, self-intersection, Douglas-Peucker simplification, postcode/highway validation, ICU-approximate string normalisation, house-number parsi…
 
 **Refactor risk:** HIGH for the geometry/identity core; MEDIUM-LOW for the leaf validators. Concretely: DETERMINISM (invariant #1) — these touch on-disk byte layout / id assignment and must be treated as golden: - ring_assembly.cpp (ring vertex ordering, the rotate-to-min-vertex normalisation in add_admin_polygon at s2_helpers.cpp:298-300, append order in greedy/backtrack passes) feeds simplify -> admin_vertices.bi…
