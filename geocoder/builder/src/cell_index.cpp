@@ -71,6 +71,20 @@ static inline void write_binary_file(const std::string& path, const char* data, 
     if (!f) throw std::runtime_error("failed to write " + path);
 }
 
+// A cell's entry list is prefixed by a uint16 count on disk. More entries than
+// fit would silently wrap the count and make the server under-read the cell,
+// so overflow is a hard build failure instead. Widening the field is a routine
+// build_version bump (one no-patch day) if growth ever approaches the limit —
+// planet max as of 2026-06 is 29,975 entries (poi/all), 46% of the limit. The
+// per-file "max entries/cell" line logged by each writer is the early-warning
+// canary to watch.
+static inline uint16_t checked_entry_count(size_t n, const std::string& path) {
+    if (n > 0xFFFFu)
+        throw std::runtime_error("cell entry count " + std::to_string(n) +
+                                 " exceeds uint16 limit (65535) in " + path);
+    return static_cast<uint16_t>(n);
+}
+
 std::vector<uint32_t> write_entries(
     const std::string& path,
     const std::vector<uint64_t>& sorted_cells,
@@ -91,13 +105,14 @@ std::vector<uint32_t> write_entries(
     buf.reserve(total_size);
     uint32_t current = 0;
     size_t ri = 0;
+    size_t max_count = 0;
     for (uint32_t si = 0; si < sorted_cells.size() && ri < sorted_refs.size(); si++) {
         if (sorted_cells[si] < sorted_refs[ri].cell_id) continue;
         if (sorted_cells[si] > sorted_refs[ri].cell_id) { si--; ri++; continue; }
         offsets[si] = current;
         const auto& ids = *sorted_refs[ri].ids;
-        if (ids.size() > 0xFFFFu) std::cerr << "WARNING: cell entry count " << ids.size() << " exceeds 65535; uint16 count field overflows" << std::endl;
-        uint16_t count = static_cast<uint16_t>(std::min(ids.size(), size_t(MAX_VERTEX_COUNT)));
+        uint16_t count = checked_entry_count(ids.size(), path);
+        if (ids.size() > max_count) max_count = ids.size();
         buf.insert(buf.end(), reinterpret_cast<const char*>(&count),
                    reinterpret_cast<const char*>(&count) + sizeof(count));
         buf.insert(buf.end(), reinterpret_cast<const char*>(ids.data()),
@@ -105,6 +120,7 @@ std::vector<uint32_t> write_entries(
         current += sizeof(uint16_t) + ids.size() * sizeof(uint32_t);
         ri++;
     }
+    std::cerr << "  " << path << ": max entries/cell = " << max_count << std::endl;
     write_binary_file(path, buf.data(), buf.size());
     return offsets;
 }
@@ -129,6 +145,7 @@ std::vector<uint32_t> write_entries_from_sorted(
         std::vector<char> buf;
         size_t cell_start, cell_end;
         uint32_t local_size;
+        size_t max_count = 0;  // largest per-cell entry count seen (overflow checked after join)
     };
     std::vector<ChunkResult> chunks(nthreads);
 
@@ -157,8 +174,10 @@ std::vector<uint32_t> write_entries_from_sorted(
                 offsets[si] = chunk.local_size;
                 size_t start = pi;
                 while (pi < sorted_pairs.size() && sorted_pairs[pi].cell_id == sorted_cells[si]) pi++;
-                if (pi - start > 0xFFFFu) std::cerr << "WARNING: cell entry count " << (pi - start) << " exceeds 65535; uint16 count field overflows" << std::endl;
-                uint16_t count = static_cast<uint16_t>(std::min(pi - start, size_t(MAX_VERTEX_COUNT)));
+                // Can't throw from a worker thread; record the max and let the
+                // post-join check below fail the build on overflow.
+                if (pi - start > chunk.max_count) chunk.max_count = pi - start;
+                uint16_t count = static_cast<uint16_t>(pi - start);
                 size_t entry_size = sizeof(uint16_t) + (pi - start) * sizeof(uint32_t);
                 size_t buf_pos = chunk.buf.size();
                 chunk.buf.resize(buf_pos + entry_size);
@@ -172,6 +191,12 @@ std::vector<uint32_t> write_entries_from_sorted(
         });
     }
     for (auto& t : threads) t.join();
+
+    size_t max_count = 0;
+    for (auto& chunk : chunks)
+        if (chunk.max_count > max_count) max_count = chunk.max_count;
+    checked_entry_count(max_count, path);
+    std::cerr << "  " << path << ": max entries/cell = " << max_count << std::endl;
 
     uint32_t global_offset = 0;
     for (auto& chunk : chunks) {
@@ -216,12 +241,14 @@ void write_cell_index(
       } }
 
     { std::ofstream f(entries_path, std::ios::binary);
+      size_t max_count = 0;
       for (const auto& [cell_id, ids] : sorted) {
-          if (ids.size() > 0xFFFFu) std::cerr << "WARNING: cell entry count " << ids.size() << " exceeds 65535; uint16 count field overflows" << std::endl;
-          uint16_t count = static_cast<uint16_t>(std::min(ids.size(), size_t(MAX_VERTEX_COUNT)));
+          uint16_t count = checked_entry_count(ids.size(), entries_path);
+          if (ids.size() > max_count) max_count = ids.size();
           f.write(reinterpret_cast<const char*>(&count), sizeof(count));
           f.write(reinterpret_cast<const char*>(ids.data()), ids.size() * sizeof(uint32_t));
-      } }
+      }
+      std::cerr << "  " << entries_path << ": max entries/cell = " << max_count << std::endl; }
 }
 
 // Strategy-2 persistent dense IDs for street_ways.
