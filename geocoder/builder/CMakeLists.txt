@@ -62,9 +62,6 @@ add_executable(build-index
 )
 
 # Patch tools (no S2 dependency)
-add_executable(geocoder-canonicalize tools/geocoder_canonicalize.cpp)
-target_link_libraries(geocoder-canonicalize PRIVATE Threads::Threads)
-target_include_directories(geocoder-canonicalize PRIVATE tools)
 
 add_executable(geocoder-diff tools/geocoder_diff.cpp)
 target_link_libraries(geocoder-diff PRIVATE Threads::Threads)

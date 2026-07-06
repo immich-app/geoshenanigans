@@ -338,10 +338,13 @@ inline std::string normalise_for_matching(const char* s) {
             p += 2;
             continue;
         }
-        // Skip 3+ byte UTF-8 sequences
+        // Skip 3+ byte UTF-8 sequences. Advance at most to the NUL: a
+        // truncated sequence at end-of-string must not jump past the
+        // terminator and read out of bounds (byte-identical for valid
+        // input, where all continuation bytes are non-zero).
         if (c >= 0xE0) {
             int skip = (c < 0xF0) ? 3 : 4;
-            p += skip;
+            for (int k = 0; k < skip && *p; k++) p++;
             continue;
         }
         // ASCII range

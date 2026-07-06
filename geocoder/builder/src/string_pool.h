@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -12,6 +13,10 @@ public:
         if (it != index_.end()) {
             return it->second;
         }
+        // String offsets are u32 across the entire index format; a pool
+        // past 4 GiB would silently wrap every subsequent offset.
+        if (data_.size() > 0xFFFFFFFFull - s.size() - 1)
+            throw std::runtime_error("string pool exceeds u32 offset space");
         uint32_t offset = static_cast<uint32_t>(data_.size());
         index_[s] = offset;
         data_.insert(data_.end(), s.begin(), s.end());

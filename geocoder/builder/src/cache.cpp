@@ -12,7 +12,10 @@ enum class SectionType : uint32_t {
 };
 
 static const char CACHE_MAGIC[8] = {'T','G','C','A','C','H','E','\0'};
-static const uint32_t CACHE_VERSION = 2;
+// v3: no format change vs v2, but versions <=2 predate POI / place /
+// parent-chain / postcode / strategy-2 data entirely — a stale cache
+// deserialized cleanly and silently produced an index missing all of it.
+static const uint32_t CACHE_VERSION = 3;
 static const uint32_t CACHE_SECTION_COUNT = 13;
 
 template<typename T>
@@ -77,6 +80,10 @@ static bool deserialize_cell_map(const char* data, uint64_t length,
 
 void serialize_cache(const ParsedData& data, const std::string& path) {
     std::cerr << "Saving cache to " << path << "..." << std::endl;
+    std::cerr << "WARNING: the cache carries only the core parse set (strings/ways/"
+                 "nodes/addr/interp/admin cells). POI, place, parent-chain, postcode "
+                 "and strategy-2 data are NOT cached — cache-based builds omit them."
+              << std::endl;
     std::ofstream f(path, std::ios::binary);
     if (!f.is_open()) { std::cerr << "Error: could not open cache file for writing: " << path << std::endl; return; }
     f.write(CACHE_MAGIC, 8);
@@ -123,7 +130,9 @@ bool deserialize_cache(ParsedData& data, const std::string& path) {
         uint32_t type; uint64_t length;
         f.read(reinterpret_cast<char*>(&type), sizeof(uint32_t));
         f.read(reinterpret_cast<char*>(&length), sizeof(uint64_t));
+        if (!f) { std::cerr << "Error: truncated cache (section header)" << std::endl; return false; }
         std::vector<char> blob(length); f.read(blob.data(), length);
+        if (!f) { std::cerr << "Error: truncated cache (section body)" << std::endl; return false; }
         switch (static_cast<SectionType>(type)) {
         case SectionType::STRING_POOL: {
             if (length < sizeof(uint64_t)) return false;

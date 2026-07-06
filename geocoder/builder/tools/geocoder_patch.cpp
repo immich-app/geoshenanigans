@@ -295,7 +295,6 @@ int main(int argc, char* argv[]) {
     // the str_remap on byte 16. Sorted by old_id for binary-search lookup.
     std::vector<std::pair<uint32_t,uint32_t>> poi_admin_remap;
     std::vector<std::pair<uint32_t,uint32_t>> poi_street_remap;
-    std::vector<std::pair<uint32_t,uint32_t>> poi_postcode_remap;
     auto poi_remap_lookup = [](const std::vector<std::pair<uint32_t,uint32_t>>& v,
                                uint32_t old_id) -> uint32_t {
         if (v.empty()) return old_id;
@@ -453,15 +452,11 @@ int main(int argc, char* argv[]) {
                 uint32_t o = ru32(), n = ru32();
                 poi_street_remap[i] = {o, n};
             }
+            // Reserved postcode leg — always 0 pairs on the wire; skip.
             uint32_t np = ru32();
-            poi_postcode_remap.resize(np);
-            for (uint32_t i = 0; i < np; i++) {
-                uint32_t o = ru32(), n = ru32();
-                poi_postcode_remap[i] = {o, n};
-            }
+            for (uint32_t i = 0; i < np; i++) { ru32(); ru32(); }
             std::sort(poi_admin_remap.begin(), poi_admin_remap.end());
             std::sort(poi_street_remap.begin(), poi_street_remap.end());
-            std::sort(poi_postcode_remap.begin(), poi_postcode_remap.end());
             std::cerr << "  POI parent-id remap: admin_pairs=" << na
                       << " street_pairs=" << ns
                       << " postcode_pairs=" << np << std::endl;

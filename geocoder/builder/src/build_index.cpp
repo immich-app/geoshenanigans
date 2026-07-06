@@ -119,13 +119,16 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
 
     // Collect all CSV files
     std::vector<std::string> csv_files;
+    std::string extract_dir;  // set when we extracted a tarball; removed at the end
     if (path.find(".tar.gz") != std::string::npos || path.find(".tgz") != std::string::npos) {
         // Extract tar.gz to a temp directory
         std::string tmpdir = "/tmp/tiger-extract-" + std::to_string(getpid());
-        std::string cmd = "mkdir -p " + tmpdir + " && tar xzf " + path + " -C " + tmpdir;
+        extract_dir = tmpdir;
+        std::string cmd = "mkdir -p '" + tmpdir + "' && tar xzf '" + path + "' -C '" + tmpdir + "'";
         if (system(cmd.c_str()) != 0) {
-            std::cerr << "  TIGER extraction failed (tar xzf " << path << ")" << std::endl;
-            return;
+            // --tiger-data was explicitly requested: a silently TIGER-less
+            // planet build would ship without US address ranges/ZIPs.
+            throw std::runtime_error("TIGER extraction failed (tar xzf " + path + ")");
         }
         DIR* dir = opendir(tmpdir.c_str());
         if (dir) {
@@ -155,6 +158,8 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
 
     std::sort(csv_files.begin(), csv_files.end());
     std::cerr << "  Found " << csv_files.size() << " TIGER CSV files" << std::endl;
+    if (csv_files.empty())
+        throw std::runtime_error("--tiger-data given but no .csv files found under " + path);
 
     uint64_t total_rows = 0;
     uint64_t loaded_rows = 0;
@@ -310,6 +315,9 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
     for (uint32_t pc : data.interp_postcode_ids) if (pc != NO_DATA) { any_zip = true; break; }
     if (!any_zip) data.interp_postcode_ids.clear();
 
+    if (loaded_rows == 0)
+        throw std::runtime_error("--tiger-data given but 0 address ranges loaded from " + path);
+
     std::cerr << "  TIGER: loaded " << loaded_rows << "/" << total_rows << " address ranges from "
               << csv_files.size() << " files" << std::endl;
     std::cerr << "  Interp ways now: " << data.interp_ways.size()
@@ -384,6 +392,11 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
     }
     std::cerr << "  TIGER: created " << tiger_places << " place nodes from "
               << city_centroids.size() << " unique city names" << std::endl;
+
+    if (!extract_dir.empty()) {
+        if (system(("rm -rf '" + extract_dir + "'").c_str()) != 0)
+            std::cerr << "  (failed to remove " << extract_dir << ")" << std::endl;
+    }
 }
 
 // --- GeoNames postcode loading ---
@@ -397,17 +410,16 @@ static void load_external_postcodes(ParsedData& data, const std::string& path) {
     std::string tmp_csv;
     if (path.find(".gz") != std::string::npos) {
         tmp_csv = "/tmp/external_postcodes_" + std::to_string(getpid()) + ".csv";
-        cmd = "gunzip -c " + path + " > " + tmp_csv;
+        cmd = "gunzip -c '" + path + "' > '" + tmp_csv + "'";
         if (system(cmd.c_str()) != 0) {
-            std::cerr << "  Failed to gunzip " << path << std::endl;
-            return;
+            throw std::runtime_error("--external-postcodes: failed to gunzip " + path);
         }
     } else {
         tmp_csv = path;
     }
 
     std::ifstream f(tmp_csv);
-    if (!f) { std::cerr << "  Failed to open " << tmp_csv << std::endl; return; }
+    if (!f) throw std::runtime_error("--external-postcodes: failed to open " + tmp_csv);
 
     std::string header;
     std::getline(f, header); // skip header
@@ -465,355 +477,7 @@ static void load_external_postcodes(ParsedData& data, const std::string& path) {
 
 // --- Main ---
 
-// POI classification: maps a node/way's raw OSM tag values to a
-// (category, tier, flags) triple (PoiClassification, defined in types.h),
-// or nullopt when nothing matches. Pure function of its tag arguments (no
-// shared state) — lifted out of main()'s node/way passes, which call it
-// identically.
-static std::optional<PoiClassification> classify_poi(
-    const char* t_tourism, const char* t_historic, const char* t_boundary,
-    const char* t_amenity, const char* t_leisure, const char* t_natural,
-    const char* t_railway, const char* t_aeroway, const char* t_man_made,
-    const char* t_building, const char* t_craft, const char* t_power,
-    const char* t_place, const char* t_waterway, const char* t_office,
-    const char* t_wikipedia, const char* t_wikidata, const char* t_highway,
-    const char* t_shop, const char* t_landuse) {
-    PoiCategory cat = PoiCategory::UNKNOWN;
-
-    // tourism (highest priority)
-    if (t_tourism) {
-        if (std::strcmp(t_tourism, "museum") == 0) cat = PoiCategory::MUSEUM;
-        else if (std::strcmp(t_tourism, "attraction") == 0) cat = PoiCategory::ATTRACTION;
-        else if (std::strcmp(t_tourism, "viewpoint") == 0) cat = PoiCategory::VIEWPOINT;
-        else if (std::strcmp(t_tourism, "theme_park") == 0) cat = PoiCategory::THEME_PARK;
-        else if (std::strcmp(t_tourism, "zoo") == 0) cat = PoiCategory::ZOO;
-        else if (std::strcmp(t_tourism, "gallery") == 0) cat = PoiCategory::GALLERY;
-        else if (std::strcmp(t_tourism, "artwork") == 0) cat = PoiCategory::ARTWORK;
-        else if (std::strcmp(t_tourism, "alpine_hut") == 0) cat = PoiCategory::ALPINE_HUT;
-        else if (std::strcmp(t_tourism, "aquarium") == 0) cat = PoiCategory::AQUARIUM;
-        else if (std::strcmp(t_tourism, "camp_site") == 0) cat = PoiCategory::CAMP_SITE;
-        else if (std::strcmp(t_tourism, "picnic_site") == 0) cat = PoiCategory::PICNIC_SITE;
-        else if (std::strcmp(t_tourism, "resort") == 0) cat = PoiCategory::RESORT;
-        // Lodging — all variants fold into HOTEL so a hostel / apartment
-        // / guesthouse shows as "hotel" class rather than "feature".
-        else if (std::strcmp(t_tourism, "hotel") == 0) cat = PoiCategory::HOTEL;
-        else if (std::strcmp(t_tourism, "motel") == 0) cat = PoiCategory::HOTEL;
-        else if (std::strcmp(t_tourism, "guest_house") == 0) cat = PoiCategory::HOTEL;
-        else if (std::strcmp(t_tourism, "hostel") == 0) cat = PoiCategory::HOTEL;
-        else if (std::strcmp(t_tourism, "apartment") == 0) cat = PoiCategory::HOTEL;
-        else if (std::strcmp(t_tourism, "chalet") == 0) cat = PoiCategory::HOTEL;
-        else if (std::strcmp(t_tourism, "caravan_site") == 0) cat = PoiCategory::CAMP_SITE;
-        else if (std::strcmp(t_tourism, "wilderness_hut") == 0) cat = PoiCategory::ALPINE_HUT;
-        // Information / visitor-services
-        else if (std::strcmp(t_tourism, "information") == 0) cat = PoiCategory::INFORMATION;
-    }
-    // historic
-    if (cat == PoiCategory::UNKNOWN && t_historic) {
-        if (std::strcmp(t_historic, "castle") == 0) cat = PoiCategory::CASTLE;
-        else if (std::strcmp(t_historic, "monument") == 0) cat = PoiCategory::MONUMENT;
-        else if (std::strcmp(t_historic, "ruins") == 0) cat = PoiCategory::RUINS;
-        else if (std::strcmp(t_historic, "archaeological_site") == 0) cat = PoiCategory::ARCHAEOLOGICAL_SITE;
-        else if (std::strcmp(t_historic, "memorial") == 0) cat = PoiCategory::MEMORIAL;
-        else if (std::strcmp(t_historic, "battlefield") == 0) cat = PoiCategory::BATTLEFIELD;
-        else if (std::strcmp(t_historic, "fort") == 0) cat = PoiCategory::FORT;
-        else if (std::strcmp(t_historic, "ship") == 0) cat = PoiCategory::SHIP;
-        else if (std::strcmp(t_historic, "wayside_cross") == 0) cat = PoiCategory::WAYSIDE_CROSS;
-        else if (std::strcmp(t_historic, "wayside_shrine") == 0) cat = PoiCategory::WAYSIDE_SHRINE;
-        else if (std::strcmp(t_historic, "city_gate") == 0) cat = PoiCategory::CITY_GATE;
-        else if (std::strcmp(t_historic, "citywalls") == 0) cat = PoiCategory::CITYWALLS;
-        else if (std::strcmp(t_historic, "boundary_stone") == 0) cat = PoiCategory::BOUNDARY_STONE;
-        else if (std::strcmp(t_historic, "milestone") == 0) cat = PoiCategory::MILESTONE;
-        else if (std::strcmp(t_historic, "mine") == 0) cat = PoiCategory::HISTORIC_MINE;
-        else if (std::strcmp(t_historic, "aircraft") == 0) cat = PoiCategory::HISTORIC_AIRCRAFT;
-        else if (std::strcmp(t_historic, "locomotive") == 0) cat = PoiCategory::LOCOMOTIVE;
-        else if (std::strcmp(t_historic, "cannon") == 0) cat = PoiCategory::CANNON;
-        else if (std::strcmp(t_historic, "tomb") == 0) cat = PoiCategory::TOMB;
-        else if (std::strcmp(t_historic, "manor") == 0) cat = PoiCategory::MANOR;
-    }
-    // boundary
-    if (cat == PoiCategory::UNKNOWN && t_boundary) {
-        if (std::strcmp(t_boundary, "national_park") == 0) cat = PoiCategory::NATIONAL_PARK;
-        else if (std::strcmp(t_boundary, "protected_area") == 0) cat = PoiCategory::PROTECTED_AREA;
-        // `boundary=forest` (managed-forest admin) folds
-        // into WOOD since both surface as "named forested
-        // area" in the landmark line.
-        else if (std::strcmp(t_boundary, "forest") == 0) cat = PoiCategory::WOOD;
-    }
-    // landuse — only named landuse polygons get indexed.
-    // Note: classify_poi still falls through for unnamed
-    // features to UNNAMED_RANK30 below, but landuse is
-    // deliberately NOT in that fallback's trigger list so
-    // unnamed residential/industrial zones don't flood
-    // the index.
-    if (cat == PoiCategory::UNKNOWN && t_landuse) {
-        if (std::strcmp(t_landuse, "forest") == 0) cat = PoiCategory::WOOD;
-        else if (std::strcmp(t_landuse, "meadow") == 0) cat = PoiCategory::MEADOW;
-        else if (std::strcmp(t_landuse, "orchard") == 0) cat = PoiCategory::ORCHARD;
-        else if (std::strcmp(t_landuse, "vineyard") == 0) cat = PoiCategory::VINEYARD;
-        else if (std::strcmp(t_landuse, "farmland") == 0) cat = PoiCategory::FARMLAND;
-        else if (std::strcmp(t_landuse, "allotments") == 0) cat = PoiCategory::ALLOTMENTS;
-        else if (std::strcmp(t_landuse, "quarry") == 0) cat = PoiCategory::QUARRY;
-        else if (std::strcmp(t_landuse, "reservoir") == 0) cat = PoiCategory::RESERVOIR;
-        else if (std::strcmp(t_landuse, "basin") == 0) cat = PoiCategory::RESERVOIR;
-        else if (std::strcmp(t_landuse, "recreation_ground") == 0) cat = PoiCategory::RECREATION_GROUND;
-        else if (std::strcmp(t_landuse, "military") == 0) cat = PoiCategory::MILITARY;
-        else if (std::strcmp(t_landuse, "religious") == 0) cat = PoiCategory::RELIGIOUS_LANDUSE;
-        else if (std::strcmp(t_landuse, "cemetery") == 0) cat = PoiCategory::CEMETERY;
-        // residential / industrial / commercial / retail
-        // landuse zones intentionally skipped — they're
-        // admin-hierarchy concepts already covered by the
-        // address chain (suburb / borough / city_district).
-    }
-    // amenity
-    if (cat == PoiCategory::UNKNOWN && t_amenity) {
-        if (std::strcmp(t_amenity, "place_of_worship") == 0) cat = PoiCategory::PLACE_OF_WORSHIP;
-        else if (std::strcmp(t_amenity, "university") == 0) cat = PoiCategory::UNIVERSITY;
-        else if (std::strcmp(t_amenity, "college") == 0) cat = PoiCategory::COLLEGE;
-        else if (std::strcmp(t_amenity, "hospital") == 0) cat = PoiCategory::HOSPITAL;
-        else if (std::strcmp(t_amenity, "theatre") == 0) cat = PoiCategory::THEATRE;
-        else if (std::strcmp(t_amenity, "cinema") == 0) cat = PoiCategory::CINEMA;
-        else if (std::strcmp(t_amenity, "library") == 0) cat = PoiCategory::LIBRARY;
-        else if (std::strcmp(t_amenity, "marketplace") == 0) cat = PoiCategory::MARKETPLACE;
-        else if (std::strcmp(t_amenity, "embassy") == 0) cat = PoiCategory::EMBASSY;
-        else if (std::strcmp(t_amenity, "fountain") == 0) cat = PoiCategory::FOUNTAIN;
-        else if (std::strcmp(t_amenity, "casino") == 0) cat = PoiCategory::CASINO;
-        else if (std::strcmp(t_amenity, "cemetery") == 0) cat = PoiCategory::CEMETERY;
-        else if (std::strcmp(t_amenity, "ferry_terminal") == 0) cat = PoiCategory::FERRY_TERMINAL;
-        else if (std::strcmp(t_amenity, "planetarium") == 0) cat = PoiCategory::PLANETARIUM;
-        else if (std::strcmp(t_amenity, "prison") == 0) cat = PoiCategory::PRISON;
-        // Food & drink (each OSM value → distinct category)
-        else if (std::strcmp(t_amenity, "restaurant") == 0) cat = PoiCategory::RESTAURANT;
-        else if (std::strcmp(t_amenity, "cafe") == 0) cat = PoiCategory::CAFE;
-        else if (std::strcmp(t_amenity, "bar") == 0) cat = PoiCategory::BAR;
-        else if (std::strcmp(t_amenity, "pub") == 0) cat = PoiCategory::PUB;
-        else if (std::strcmp(t_amenity, "fast_food") == 0) cat = PoiCategory::FAST_FOOD;
-        else if (std::strcmp(t_amenity, "biergarten") == 0) cat = PoiCategory::BIERGARTEN;
-        else if (std::strcmp(t_amenity, "food_court") == 0) cat = PoiCategory::FOOD_COURT;
-        else if (std::strcmp(t_amenity, "ice_cream") == 0) cat = PoiCategory::ICE_CREAM;
-        else if (std::strcmp(t_amenity, "nightclub") == 0) cat = PoiCategory::NIGHTCLUB;
-        // Education
-        else if (std::strcmp(t_amenity, "school") == 0) cat = PoiCategory::SCHOOL;
-        else if (std::strcmp(t_amenity, "kindergarten") == 0) cat = PoiCategory::KINDERGARTEN;
-        else if (std::strcmp(t_amenity, "driving_school") == 0) cat = PoiCategory::DRIVING_SCHOOL;
-        else if (std::strcmp(t_amenity, "music_school") == 0) cat = PoiCategory::MUSIC_SCHOOL;
-        // Health / care
-        else if (std::strcmp(t_amenity, "pharmacy") == 0) cat = PoiCategory::PHARMACY;
-        else if (std::strcmp(t_amenity, "doctors") == 0) cat = PoiCategory::DOCTORS;
-        else if (std::strcmp(t_amenity, "dentist") == 0) cat = PoiCategory::DENTIST;
-        else if (std::strcmp(t_amenity, "clinic") == 0) cat = PoiCategory::CLINIC;
-        else if (std::strcmp(t_amenity, "veterinary") == 0) cat = PoiCategory::VETERINARY;
-        // Finance
-        else if (std::strcmp(t_amenity, "bank") == 0) cat = PoiCategory::BANK;
-        else if (std::strcmp(t_amenity, "atm") == 0) cat = PoiCategory::ATM;
-        else if (std::strcmp(t_amenity, "bureau_de_change") == 0) cat = PoiCategory::BUREAU_DE_CHANGE;
-        // Mail / parcel
-        else if (std::strcmp(t_amenity, "post_office") == 0) cat = PoiCategory::POST_OFFICE;
-        else if (std::strcmp(t_amenity, "post_box") == 0) cat = PoiCategory::POST_BOX;
-        else if (std::strcmp(t_amenity, "parcel_locker") == 0) cat = PoiCategory::PARCEL_LOCKER;
-        // Emergency services
-        else if (std::strcmp(t_amenity, "police") == 0) cat = PoiCategory::POLICE;
-        else if (std::strcmp(t_amenity, "fire_station") == 0) cat = PoiCategory::FIRE_STATION;
-        // Civic
-        else if (std::strcmp(t_amenity, "townhall") == 0) cat = PoiCategory::TOWNHALL;
-        else if (std::strcmp(t_amenity, "courthouse") == 0) cat = PoiCategory::COURTHOUSE;
-        else if (std::strcmp(t_amenity, "community_centre") == 0) cat = PoiCategory::COMMUNITY_CENTRE;
-        else if (std::strcmp(t_amenity, "social_centre") == 0) cat = PoiCategory::SOCIAL_CENTRE;
-        // Transport
-        else if (std::strcmp(t_amenity, "bus_station") == 0) cat = PoiCategory::BUS_STATION;
-        else if (std::strcmp(t_amenity, "taxi") == 0) cat = PoiCategory::TAXI;
-        else if (std::strcmp(t_amenity, "parking") == 0) cat = PoiCategory::PARKING;
-        else if (std::strcmp(t_amenity, "bicycle_parking") == 0) cat = PoiCategory::BICYCLE_PARKING;
-        else if (std::strcmp(t_amenity, "motorcycle_parking") == 0) cat = PoiCategory::MOTORCYCLE_PARKING;
-        else if (std::strcmp(t_amenity, "fuel") == 0) cat = PoiCategory::FUEL;
-        else if (std::strcmp(t_amenity, "charging_station") == 0) cat = PoiCategory::CHARGING_STATION;
-        // Shelter-class
-        else if (std::strcmp(t_amenity, "shelter") == 0) cat = PoiCategory::SHELTER;
-        // Small named amenities
-        else if (std::strcmp(t_amenity, "toilets") == 0) cat = PoiCategory::TOILETS;
-        else if (std::strcmp(t_amenity, "drinking_water") == 0) cat = PoiCategory::DRINKING_WATER;
-        else if (std::strcmp(t_amenity, "bench") == 0) cat = PoiCategory::BENCH;
-        else if (std::strcmp(t_amenity, "vending_machine") == 0) cat = PoiCategory::VENDING_MACHINE;
-        else if (std::strcmp(t_amenity, "waste_basket") == 0) cat = PoiCategory::WASTE_BASKET;
-        else if (std::strcmp(t_amenity, "recycling") == 0) cat = PoiCategory::RECYCLING;
-        else if (std::strcmp(t_amenity, "clock") == 0) cat = PoiCategory::CLOCK;
-        else if (std::strcmp(t_amenity, "telephone") == 0) cat = PoiCategory::TELEPHONE;
-        else if (std::strcmp(t_amenity, "bbq") == 0) cat = PoiCategory::BBQ;
-        // Arts / culture / studio
-        else if (std::strcmp(t_amenity, "arts_centre") == 0) cat = PoiCategory::ARTS_CENTRE;
-        else if (std::strcmp(t_amenity, "studio") == 0) cat = PoiCategory::STUDIO;
-        // Education extras
-        else if (std::strcmp(t_amenity, "language_school") == 0) cat = PoiCategory::LANGUAGE_SCHOOL;
-        else if (std::strcmp(t_amenity, "training") == 0) cat = PoiCategory::TRAINING;
-        // Health extras
-        else if (std::strcmp(t_amenity, "nursing_home") == 0) cat = PoiCategory::NURSING_HOME;
-        else if (std::strcmp(t_amenity, "ambulance_station") == 0) cat = PoiCategory::AMBULANCE_STATION;
-        else if (std::strcmp(t_amenity, "hospice") == 0) cat = PoiCategory::HOSPICE;
-        // Religious extra / grave
-        else if (std::strcmp(t_amenity, "monastery") == 0) cat = PoiCategory::MONASTERY;
-        else if (std::strcmp(t_amenity, "grave_yard") == 0) cat = PoiCategory::GRAVE_YARD;
-        // Vehicle services
-        else if (std::strcmp(t_amenity, "car_wash") == 0) cat = PoiCategory::CAR_WASH;
-        else if (std::strcmp(t_amenity, "car_rental") == 0) cat = PoiCategory::CAR_RENTAL;
-        else if (std::strcmp(t_amenity, "bicycle_rental") == 0) cat = PoiCategory::BICYCLE_RENTAL;
-        else if (std::strcmp(t_amenity, "bicycle_repair_station") == 0) cat = PoiCategory::BICYCLE_REPAIR_STATION;
-        else if (std::strcmp(t_amenity, "vehicle_inspection") == 0) cat = PoiCategory::VEHICLE_INSPECTION;
-    }
-    // leisure
-    if (cat == PoiCategory::UNKNOWN && t_leisure) {
-        if (std::strcmp(t_leisure, "park") == 0) cat = PoiCategory::PARK;
-        else if (std::strcmp(t_leisure, "nature_reserve") == 0) cat = PoiCategory::NATURE_RESERVE;
-        else if (std::strcmp(t_leisure, "stadium") == 0) cat = PoiCategory::STADIUM;
-        // Each OSM leisure value → distinct category.
-        else if (std::strcmp(t_leisure, "sports_centre") == 0) cat = PoiCategory::SPORTS_CENTRE;
-        else if (std::strcmp(t_leisure, "garden") == 0) cat = PoiCategory::GARDEN;
-        else if (std::strcmp(t_leisure, "water_park") == 0) cat = PoiCategory::WATER_PARK;
-        else if (std::strcmp(t_leisure, "golf_course") == 0) cat = PoiCategory::GOLF_COURSE;
-        else if (std::strcmp(t_leisure, "marina") == 0) cat = PoiCategory::MARINA;
-        else if (std::strcmp(t_leisure, "playground") == 0) cat = PoiCategory::PLAYGROUND;
-        else if (std::strcmp(t_leisure, "fitness_station") == 0) cat = PoiCategory::FITNESS_STATION;
-        else if (std::strcmp(t_leisure, "fitness_centre") == 0) cat = PoiCategory::FITNESS_CENTRE;
-        else if (std::strcmp(t_leisure, "pitch") == 0) cat = PoiCategory::PITCH;
-        else if (std::strcmp(t_leisure, "track") == 0) cat = PoiCategory::TRACK;
-        else if (std::strcmp(t_leisure, "sports_hall") == 0) cat = PoiCategory::SPORTS_HALL;
-        else if (std::strcmp(t_leisure, "sauna") == 0) cat = PoiCategory::SAUNA;
-        else if (std::strcmp(t_leisure, "horse_riding") == 0) cat = PoiCategory::HORSE_RIDING;
-        else if (std::strcmp(t_leisure, "bird_hide") == 0) cat = PoiCategory::BIRD_HIDE;
-        else if (std::strcmp(t_leisure, "miniature_golf") == 0) cat = PoiCategory::MINIATURE_GOLF;
-    }
-    // natural
-    if (cat == PoiCategory::UNKNOWN && t_natural) {
-        if (std::strcmp(t_natural, "peak") == 0) cat = PoiCategory::PEAK;
-        else if (std::strcmp(t_natural, "volcano") == 0) cat = PoiCategory::VOLCANO;
-        else if (std::strcmp(t_natural, "beach") == 0) cat = PoiCategory::BEACH;
-        else if (std::strcmp(t_natural, "cave_entrance") == 0) cat = PoiCategory::CAVE_ENTRANCE;
-        else if (std::strcmp(t_natural, "spring") == 0) cat = PoiCategory::SPRING;
-        else if (std::strcmp(t_natural, "wood") == 0) cat = PoiCategory::WOOD;
-        else if (std::strcmp(t_natural, "heath") == 0) cat = PoiCategory::HEATH;
-        else if (std::strcmp(t_natural, "scrub") == 0) cat = PoiCategory::SCRUB;
-        else if (std::strcmp(t_natural, "wetland") == 0) cat = PoiCategory::WETLAND;
-        else if (std::strcmp(t_natural, "grassland") == 0) cat = PoiCategory::GRASSLAND;
-        else if (std::strcmp(t_natural, "water") == 0) cat = PoiCategory::NATURAL_WATER;
-        else if (std::strcmp(t_natural, "valley") == 0) cat = PoiCategory::VALLEY;
-        else if (std::strcmp(t_natural, "ridge") == 0) cat = PoiCategory::RIDGE;
-        else if (std::strcmp(t_natural, "saddle") == 0) cat = PoiCategory::SADDLE;
-        else if (std::strcmp(t_natural, "gorge") == 0) cat = PoiCategory::GORGE;
-        else if (std::strcmp(t_natural, "bare_rock") == 0) cat = PoiCategory::BARE_ROCK;
-        else if (std::strcmp(t_natural, "cliff") == 0) cat = PoiCategory::CLIFF;
-        else if (std::strcmp(t_natural, "arch") == 0) cat = PoiCategory::ARCH;
-        else if (std::strcmp(t_natural, "hot_spring") == 0) cat = PoiCategory::HOT_SPRING;
-        else if (std::strcmp(t_natural, "geyser") == 0) cat = PoiCategory::GEYSER;
-        else if (std::strcmp(t_natural, "bay") == 0) cat = PoiCategory::BAY;
-        else if (std::strcmp(t_natural, "cape") == 0) cat = PoiCategory::CAPE;
-        else if (std::strcmp(t_natural, "island") == 0) cat = PoiCategory::ISLAND;
-        else if (std::strcmp(t_natural, "glacier") == 0) cat = PoiCategory::GLACIER;
-    }
-    // railway
-    if (cat == PoiCategory::UNKNOWN && t_railway) {
-        if (std::strcmp(t_railway, "station") == 0) cat = PoiCategory::STATION;
-    }
-    // aeroway
-    if (cat == PoiCategory::UNKNOWN && t_aeroway) {
-        if (std::strcmp(t_aeroway, "aerodrome") == 0) cat = PoiCategory::AERODROME;
-    }
-    // man_made
-    if (cat == PoiCategory::UNKNOWN && t_man_made) {
-        if (std::strcmp(t_man_made, "tower") == 0) cat = PoiCategory::TOWER;
-        else if (std::strcmp(t_man_made, "lighthouse") == 0) cat = PoiCategory::LIGHTHOUSE;
-        else if (std::strcmp(t_man_made, "windmill") == 0) cat = PoiCategory::WINDMILL;
-        else if (std::strcmp(t_man_made, "bridge") == 0) cat = PoiCategory::BRIDGE;
-        else if (std::strcmp(t_man_made, "pier") == 0) cat = PoiCategory::PIER;
-        else if (std::strcmp(t_man_made, "dam") == 0) cat = PoiCategory::DAM;
-        else if (std::strcmp(t_man_made, "observatory") == 0) cat = PoiCategory::OBSERVATORY;
-        else if (std::strcmp(t_man_made, "silo") == 0) cat = PoiCategory::SILO;
-        else if (std::strcmp(t_man_made, "chimney") == 0) cat = PoiCategory::CHIMNEY;
-        else if (std::strcmp(t_man_made, "watermill") == 0) cat = PoiCategory::WATERMILL;
-    }
-    // building
-    if (cat == PoiCategory::UNKNOWN && t_building) {
-        if (std::strcmp(t_building, "cathedral") == 0) cat = PoiCategory::CATHEDRAL;
-        else if (std::strcmp(t_building, "palace") == 0) cat = PoiCategory::PALACE;
-    }
-    // craft
-    if (cat == PoiCategory::UNKNOWN && t_craft) {
-        if (std::strcmp(t_craft, "winery") == 0) cat = PoiCategory::WINERY;
-        else if (std::strcmp(t_craft, "brewery") == 0) cat = PoiCategory::BREWERY;
-    }
-    // power
-    if (cat == PoiCategory::UNKNOWN && t_power) {
-        if (std::strcmp(t_power, "plant") == 0) cat = PoiCategory::POWER_PLANT;
-    }
-    // place
-    if (cat == PoiCategory::UNKNOWN && t_place) {
-        if (std::strcmp(t_place, "island") == 0 || std::strcmp(t_place, "islet") == 0)
-            cat = PoiCategory::ISLAND;
-    }
-    // waterway
-    if (cat == PoiCategory::UNKNOWN && t_waterway) {
-        if (std::strcmp(t_waterway, "waterfall") == 0) cat = PoiCategory::WATERFALL;
-    }
-    // office
-    if (cat == PoiCategory::UNKNOWN && t_office) {
-        if (std::strcmp(t_office, "government") == 0) cat = PoiCategory::GOVERNMENT;
-    }
-    // shop — split common values, fall back to generic SHOP.
-    if (cat == PoiCategory::UNKNOWN && t_shop) {
-        if (std::strcmp(t_shop, "supermarket") == 0) cat = PoiCategory::SHOP_SUPERMARKET;
-        else if (std::strcmp(t_shop, "convenience") == 0) cat = PoiCategory::SHOP_CONVENIENCE;
-        else if (std::strcmp(t_shop, "clothes") == 0) cat = PoiCategory::SHOP_CLOTHES;
-        else if (std::strcmp(t_shop, "mall") == 0) cat = PoiCategory::SHOP_MALL;
-        else if (std::strcmp(t_shop, "department_store") == 0) cat = PoiCategory::SHOP_DEPARTMENT_STORE;
-        else if (std::strcmp(t_shop, "bakery") == 0) cat = PoiCategory::SHOP_BAKERY;
-        else if (std::strcmp(t_shop, "butcher") == 0) cat = PoiCategory::SHOP_BUTCHER;
-        else if (std::strcmp(t_shop, "hardware") == 0) cat = PoiCategory::SHOP_HARDWARE;
-        else if (std::strcmp(t_shop, "doityourself") == 0) cat = PoiCategory::SHOP_HARDWARE;
-        else if (std::strcmp(t_shop, "electronics") == 0) cat = PoiCategory::SHOP_ELECTRONICS;
-        else if (std::strcmp(t_shop, "furniture") == 0) cat = PoiCategory::SHOP_FURNITURE;
-        else if (std::strcmp(t_shop, "jewelry") == 0) cat = PoiCategory::SHOP_JEWELRY;
-        else if (std::strcmp(t_shop, "books") == 0) cat = PoiCategory::SHOP_BOOKS;
-        else if (std::strcmp(t_shop, "pet") == 0) cat = PoiCategory::SHOP_PET;
-        else cat = PoiCategory::SHOP; // generic fallback
-    }
-
-    // Fallback: any rank-30 addressable feature that didn't
-    // hit a specific PoiCategory above. Mirrors Nominatim's
-    // reverse.py DataLayer.POI filter (class_ NOT IN
-    // ('place', 'building'), rank_search==30) which drives
-    // the Moscow vending_machine / SF waste_basket / Sydney
-    // toilets / Paris clock primary selections. UNNAMED_RANK30
-    // entries carry no name_id but still have a parent_street
-    // that surfaces as `road` when they win primary contest.
-    if (cat == PoiCategory::UNKNOWN) {
-        if (t_amenity || t_tourism || t_historic || t_leisure ||
-            t_man_made || t_craft || t_office || t_waterway ||
-            t_natural || t_aeroway || t_railway || t_power ||
-            t_shop) {
-            cat = PoiCategory::UNNAMED_RANK30;
-        }
-    }
-
-    if (cat == PoiCategory::UNKNOWN) return std::optional<PoiClassification>{};
-
-    uint8_t tier = poi_get_default_tier(cat);
-    uint8_t flags = 0;
-    if (t_wikipedia) flags |= POI_FLAG_WIKIPEDIA;
-    if (t_wikidata)  flags |= POI_FLAG_WIKIDATA;
-    // Nominatim treats highway=pedestrian/footway/living_street/
-    // path/service areas as rank_search=26 (road rank) rather
-    // than rank_search=30. Mark so the server can surface the
-    // feature's own name as `road` rather than its parent street.
-    if (t_highway && (
-            std::strcmp(t_highway, "pedestrian") == 0 ||
-            std::strcmp(t_highway, "footway") == 0 ||
-            std::strcmp(t_highway, "living_street") == 0 ||
-            std::strcmp(t_highway, "path") == 0 ||
-            std::strcmp(t_highway, "cycleway") == 0 ||
-            std::strcmp(t_highway, "service") == 0)) {
-        flags |= POI_FLAG_HIGHWAY;
-    }
-    if ((flags & (POI_FLAG_WIKIPEDIA | POI_FLAG_WIKIDATA)) && tier > 1) tier--;
-
-    return PoiClassification{cat, tier, flags};
-}
+#include "poi_classify.h"
 
 // Reinterpret a float as a uint32 that sorts in the same order as the float
 // (IEEE-754 total ordering): flip all bits for negatives, flip just the sign
@@ -2295,7 +1959,13 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             std::string qdir = admin_dir + "/" + qname;
             qfutures.push_back(std::async(std::launch::async, [&, qdir, scale]() {
                 write_quality_variant(d, admin_dir, qdir, scale);
-                active.fetch_sub(1);
+                // Decrement under the mutex: an unlocked change + notify can
+                // fire between the waiter's predicate check and its block,
+                // losing the wakeup (deadlock when max_concurrent is 1).
+                {
+                    std::lock_guard<std::mutex> lk(qmtx);
+                    active.fetch_sub(1);
+                }
                 qcv.notify_one();
             }));
         }
@@ -2308,29 +1978,29 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
     // reference site before the parallel write_index calls fan out.
     // The 3 mode writes still see consistent (read-only) data
     // because the remap completes synchronously before they launch.
-    auto write_region = [&](ParsedData& d, const std::string& base_dir) {
+    //
+    // remap_already_applied: the PLANET call hoists its remap to before
+    // the planet async launches — apply_strategy2_remaps mutates the
+    // shared ParsedData, and running it inside the async raced the
+    // continent filtering that reads the same arrays (UB; benign only
+    // by schedule timing). Continent calls pass their own subsets and
+    // remap here as before.
+    auto write_region = [&](ParsedData& d, const std::string& base_dir,
+                            bool remap_already_applied = false) {
         ensure_dir(base_dir);
 
-        // Locate this region's previous build dir under prev_output_dir
-        // (mirrors the layout we write under output_dir). Empty path
-        // is the "no prev / fresh start" signal — apply_strategy2_remaps
-        // becomes a no-op and IDs remain in collection order.
-        std::string region_prev;
-        if (!prev_output_dir.empty()) {
-            std::string rel = base_dir;
-            if (rel.rfind(output_dir, 0) == 0) rel = rel.substr(output_dir.size());
-            region_prev = prev_output_dir + rel;
-        }
-        apply_strategy2_remaps(d, region_prev);
-        // Expose the prev-output root to write_index via env var so the
-        // postcode_centroids strategy-2 pass (which runs inside write_index
-        // after centroids materialize, and so doesn't get prev_dir as a
-        // parameter) can locate <prev_root>/<region>/full/postcode_centroids.osm_ids.
-        // Cleared at end of write_region to keep the global state scoped.
-        if (!prev_output_dir.empty()) {
-            setenv("GC_PREV_OUTPUT_ROOT", prev_output_dir.c_str(), 1);
-        } else {
-            unsetenv("GC_PREV_OUTPUT_ROOT");
+        if (!remap_already_applied) {
+            // Locate this region's previous build dir under prev_output_dir
+            // (mirrors the layout we write under output_dir). Empty path
+            // is the "no prev / fresh start" signal — apply_strategy2_remaps
+            // becomes a no-op and IDs remain in collection order.
+            std::string region_prev;
+            if (!prev_output_dir.empty()) {
+                std::string rel = base_dir;
+                if (rel.rfind(output_dir, 0) == 0) rel = rel.substr(output_dir.size());
+                region_prev = prev_output_dir + rel;
+            }
+            apply_strategy2_remaps(d, region_prev);
         }
 
         if (multi_output) {
@@ -2363,6 +2033,8 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                     std::ofstream f(dir + "/place_nodes.bin", std::ios::binary);
                     f.write(reinterpret_cast<const char*>(d.place_nodes.data()),
                             d.place_nodes.size() * sizeof(PlaceNode));
+                    f.flush();
+                    if (!f) throw std::runtime_error("failed to write " + dir + "/place_nodes.bin");
                 }
                 emit_strategy2_sidecar(dir + "/place_nodes.osm_ids",
                                         d.place_sidecar_blob, d.place_osm_ids);
@@ -2417,6 +2089,8 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                 std::ofstream f(mdir + "/place_nodes.bin", std::ios::binary);
                 f.write(reinterpret_cast<const char*>(filtered_places.data()),
                         filtered_places.size() * sizeof(PlaceNode));
+                f.flush();
+                if (!f) throw std::runtime_error("failed to write " + mdir + "/place_nodes.bin");
             }
 
             // 3. Rebuild place cell index with the place_remap.
@@ -2479,10 +2153,9 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             //
             // Emit BEFORE the tier filter loop runs, into the canonical
             // /poi/all/ subdir (which apply_strategy2_pois already
-            // looks for). The per-tier writes below still emit their
-            // own sidecars for any future per-tier strategy-2 work but
-            // those aren't read by anything today; this canonical one
-            // is the source of truth.
+            // looks for). The per-tier writes below do NOT emit their
+            // own sidecars — this canonical full-set one is the single
+            // source of truth.
             ensure_dir(base_dir + "/poi/all");
             emit_strategy2_sidecar(base_dir + "/poi/all/poi_records.osm_ids",
                                     d.poi_sidecar_blob, d.poi_osm_ids);
@@ -2497,13 +2170,10 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                 std::vector<PoiRecord> filtered_records;
                 std::vector<uint8_t> filtered_vertex_bytes;
                 std::vector<uint32_t> id_remap(d.poi_records.size(), NO_DATA);
-                std::vector<uint64_t> filtered_osm_ids;
-                filtered_osm_ids.reserve(d.poi_records.size());
 
                 for (size_t i = 0; i < d.poi_records.size(); i++) {
                     if (d.poi_records[i].tier <= tier_var.max_tier) {
                         id_remap[i] = static_cast<uint32_t>(filtered_records.size());
-                        if (i < d.poi_osm_ids.size()) filtered_osm_ids.push_back(d.poi_osm_ids[i]);
                         auto pr = d.poi_records[i];
                         uint32_t old_voff = pr.vertex_offset;
                         uint32_t vc = pr.vertex_count;
@@ -2661,9 +2331,35 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
         }
     };
 
+    // Strategy-2 remap for the planet region runs synchronously HERE — before
+    // the planet write launches and before continent filtering reads the
+    // record arrays. apply_strategy2_remaps mutates the shared ParsedData, so
+    // running it inside the planet async raced filter_by_bbox_masked /
+    // precompute_masks below. Continent subsets are also built from the
+    // post-remap arrays this way (the schedule the racy code effectively
+    // produced in practice).
+    {
+        std::string planet_prev;
+        if (!prev_output_dir.empty()) planet_prev = prev_output_dir + "/planet";
+        apply_strategy2_remaps(data, planet_prev);
+    }
+    // Expose the prev-output root to write_index via env var so the
+    // postcode_centroids strategy-2 pass (which runs inside write_index after
+    // centroids materialize, and so doesn't get prev_dir as a parameter) can
+    // locate <prev_root>/<region>/full/postcode_centroids.osm_ids. Set ONCE
+    // here, single-threaded, before any writer thread can call getenv —
+    // setenv/unsetenv from inside concurrent write_region calls was unsafe.
+    // The value is the same for every region, so it stays set for the whole
+    // write phase.
+    if (!prev_output_dir.empty()) {
+        setenv("GC_PREV_OUTPUT_ROOT", prev_output_dir.c_str(), 1);
+    } else {
+        unsetenv("GC_PREV_OUTPUT_ROOT");
+    }
+
     // Write planet (async — overlaps with continent filtering start)
     auto planet_future = std::async(std::launch::async, [&]() {
-        write_region(data, output_dir + "/planet");
+        write_region(data, output_dir + "/planet", /*remap_already_applied=*/true);
     });
 
     // Process continents with bounded concurrency, largest first.
@@ -2783,7 +2479,11 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                 write_region(subset, output_dir + "/" + continent.name);
                 log_phase(("  " + std::string(continent.name) + ": total").c_str(), _ct, _cc);
 
-                active.fetch_sub(1);
+                // Decrement under the mutex — see the quality-throttle note.
+                {
+                    std::lock_guard<std::mutex> lk(cv_mutex);
+                    active.fetch_sub(1);
+                }
                 cv.notify_one();
             }));
         }
@@ -3738,9 +3438,13 @@ int main(int argc, char* argv[]) {
                 release();
             }
 
-            // Lockless — each node ID maps to a unique array slot
+            // Lockless — each node ID maps to a unique array slot.
+            // over_capacity counts silently-dropped node ids: when OSM ids
+            // outgrow MAX_NODE_ID this is DATA LOSS (nodes resolve to 0,0),
+            // so the count is checked after each parse pass below.
+            std::atomic<uint64_t> over_capacity{0};
             void set(uint64_t id, double lat, double lng) {
-                if (id >= capacity) return;
+                if (id >= capacity) { over_capacity.fetch_add(1, std::memory_order_relaxed); return; }
                 data[id] = {static_cast<int32_t>(lat * 10000000.0 + (lat >= 0 ? 0.5 : -0.5)),
                             static_cast<int32_t>(lng * 10000000.0 + (lng >= 0 ? 0.5 : -0.5))};
             }
@@ -4469,6 +4173,14 @@ int main(int argc, char* argv[]) {
                           << " place nodes collected." << std::endl;
             }
             log_phase("Pass 2: node processing", _pt, _cpu);
+            // Nodes with ids past MAX_NODE_ID were silently dropped (they'd
+            // resolve to lat/lng 0,0 in every way that references them).
+            // Fail loudly the day OSM ids outgrow the DenseIndex capacity —
+            // the fix is bumping MAX_NODE_ID_DEFAULT (more RAM/vmem).
+            if (uint64_t oc = index.over_capacity.load()) {
+                throw std::runtime_error("DenseIndex: " + std::to_string(oc) +
+                    " node ids exceed MAX_NODE_ID capacity — bump MAX_NODE_ID_DEFAULT");
+            }
             pbf.release_pages(); // free PBF mmap pages, will re-fault for way pass
 
             // --- Pass 2b: Way processing (fully parallel) ---

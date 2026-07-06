@@ -825,7 +825,6 @@ int main(int argc, char* argv[]) {
 
     // --- Section: Per-file merge sequences (computed in parallel) ---
     // Stored merge sequences for ID remap derivation
-    std::unordered_map<uint32_t, MergeSequence> stored_merges;
 
     // Per-tier string-level diffs. Each tier is independently sorted
     // alphabetically, so we diff tier-by-tier. Wire format: one header
@@ -1146,14 +1145,6 @@ int main(int argc, char* argv[]) {
     std::promise<void> admin_remap_ready, street_remap_ready;
     std::shared_future<void> admin_remap_future = admin_remap_ready.get_future().share();
     std::shared_future<void> street_remap_future = street_remap_ready.get_future().share();
-    // Postcode-centroid id remap (byte 28 of PoiRecord). Computed inside
-    // t_poi from old + new postcode_centroids.bin (loaded with fallback
-    // for poi/* variants where the file lives under <region>/full/).
-    // Without this, parent_postcode_id shifts day-over-day for nearly
-    // every POI (postcode_centroids is full-replace, no record-level
-    // merge runs), pr_seq emits DELETE+INSERT for most POIs, and the
-    // byte-block walker emits INSERT for the entire vertex block.
-    std::vector<uint32_t> postcode_id_remap;
 
     // Group 1: addr_points (old=COW mmap for string remap, new=read-only mmap)
     std::thread t_addr([&]() {
@@ -1843,7 +1834,11 @@ int main(int argc, char* argv[]) {
         };
         uint32_t na = emit_pairs(res_admin_p.id_remap);
         uint32_t ns = emit_pairs(res_ways.id_remap);
-        uint32_t np = emit_pairs(postcode_id_remap);
+        // Reserved postcode leg: never populated (parent_postcode_id holds a
+        // string offset, remapped via str_remap, not a centroid index). Kept
+        // as a literal 0 on the wire for format compatibility.
+        uint32_t np = 0;
+        wval(patch, &np, 4);
         std::cerr << "  POI parent-id remap: admin_pairs=" << na
                   << " street_pairs=" << ns
                   << " postcode_pairs=" << np << std::endl;

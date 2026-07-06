@@ -135,6 +135,10 @@ std::vector<BlobInfo> scan_pbf_blobs(const std::string& filename) {
             }
         }
 
+        if (data_size < 0 || (size_t)data_size > MAX_BLOB_SIZE) {
+            throw std::runtime_error("PBF blob datasize out of range: " + std::to_string(data_size));
+        }
+
         BlobInfo info;
         info.offset = offset;
         info.header_size = header_size;
@@ -309,6 +313,11 @@ PbfBlock decode_pbf_blob(const char* data, size_t size) {
         protozero::pbf_reader group = pb2.get_message();
         while (group.next()) {
             switch (group.tag()) {
+                case PrimitiveGroupTag::NODES:
+                    // Plain (non-dense) node groups are never produced by the
+                    // planet/Geofabrik toolchain; silently skipping them would
+                    // drop node coordinates. Fail loudly instead.
+                    throw std::runtime_error("PBF contains non-dense node groups — unsupported");
                 case PrimitiveGroupTag::DENSE: {
                     protozero::pbf_reader dense = group.get_message();
                     std::vector<int64_t> ids_vec, lats_vec, lons_vec;
@@ -501,7 +510,9 @@ void decode_nodes_streaming(const char* data, size_t size, const NodeCallback& c
             case PrimitiveBlockTag::PRIMITIVEGROUP: {
                 protozero::pbf_reader group = pb.get_message();
                 while (group.next()) {
-                    if (group.tag() == PrimitiveGroupTag::DENSE) {
+                    if (group.tag() == PrimitiveGroupTag::NODES) {
+                        throw std::runtime_error("PBF contains non-dense node groups — unsupported");
+                    } else if (group.tag() == PrimitiveGroupTag::DENSE) {
                         protozero::pbf_reader dense = group.get_message();
                         protozero::data_view ids_data{}, lats_data{}, lons_data{}, kv_data{};
                         while (dense.next()) {
@@ -659,6 +670,11 @@ void decode_pbf_blob_into(const char* data, size_t size, PbfBlock& block) {
         protozero::pbf_reader group = pb2.get_message();
         while (group.next()) {
             switch (group.tag()) {
+                case PrimitiveGroupTag::NODES:
+                    // Plain (non-dense) node groups are never produced by the
+                    // planet/Geofabrik toolchain; silently skipping them would
+                    // drop node coordinates. Fail loudly instead.
+                    throw std::runtime_error("PBF contains non-dense node groups — unsupported");
                 case PrimitiveGroupTag::DENSE: {
                     protozero::pbf_reader dense = group.get_message();
                     // Save raw data views — iterate in lockstep without intermediate vectors
@@ -1033,8 +1049,7 @@ void PbfFile::classify_blobs() {
 }
 
 void PbfFile::read_blocks(std::function<void(PbfBlock&, unsigned thread_idx)> callback,
-                           const std::string& entity_filter,
-                           bool ordered) {
+                           const std::string& entity_filter) {
     // For read_blocks (used for relations), classify to avoid wasting work
     // on 50K blobs when only 454 contain relations.
     classify_blobs();
@@ -1053,66 +1068,6 @@ void PbfFile::read_blocks(std::function<void(PbfBlock&, unsigned thread_idx)> ca
     bool want_ways = entity_filter.find('w') != std::string::npos;
     bool want_rels = entity_filter.find('r') != std::string::npos;
 
-    if (ordered) {
-        // Ordered mode: decompress + decode in parallel, callback in file order.
-        // Ring buffer of decoded PbfBlocks — workers do all heavy work,
-        // consumer thread just runs the lightweight callback.
-        const size_t WINDOW = num_threads_ * 4;
-        std::vector<PbfBlock> ring(WINDOW);
-        std::vector<std::atomic<bool>> ring_ready(WINDOW);
-        for (auto& r : ring_ready) r.store(false);
-
-        std::atomic<size_t> next_decompress{0};
-        std::atomic<bool> open_failed{false};
-        std::vector<std::thread> decomp_threads;
-
-        for (unsigned t = 0; t < num_threads_; t++) {
-            decomp_threads.emplace_back([&]() {
-                int local_fd = open(filename_.c_str(), O_RDONLY);
-                if (local_fd < 0) { open_failed.store(true); return; }
-                while (true) {
-                    size_t j = next_decompress.fetch_add(1);
-                    if (j >= indices.size()) break;
-                    size_t slot = j % WINDOW;
-                    while (ring_ready[slot].load(std::memory_order_acquire)) {
-                        std::this_thread::yield();
-                    }
-                    std::string data = read_and_decompress_blob(local_fd, blobs_[indices[j]]);
-                    ring[slot] = decode_pbf_blob(data.data(), data.size());
-                    if (!want_nodes) ring[slot].nodes.clear();
-                    if (!want_ways) ring[slot].ways.clear();
-                    if (!want_rels) ring[slot].relations.clear();
-                    ring_ready[slot].store(true, std::memory_order_release);
-                }
-                close(local_fd);
-            });
-        }
-
-        // Consume in order — callback only (lightweight)
-        for (size_t j = 0; j < indices.size(); j++) {
-            size_t slot = j % WINDOW;
-            while (!ring_ready[slot].load(std::memory_order_acquire)) {
-                std::this_thread::yield();
-            }
-
-            auto& block = ring[slot];
-
-            if (!want_nodes) block.nodes.clear();
-            if (!want_ways) block.ways.clear();
-            if (!want_rels) block.relations.clear();
-
-            callback(block, 0);
-            ring_ready[slot].store(false, std::memory_order_release);
-
-            if ((j + 1) % 1000 == 0) {
-                std::cerr << "  Processed " << (j + 1) << "/" << indices.size() << " blocks..." << std::endl;
-            }
-        }
-
-        for (auto& t : decomp_threads) t.join();
-        if (open_failed.load()) throw std::runtime_error("cannot open " + filename_ + " in worker thread");
-        return;
-    }
 
     // Unordered mode: full parallel decode + callback
     // Each thread reuses a local PbfBlock to avoid repeated allocation.

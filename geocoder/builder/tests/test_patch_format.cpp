@@ -210,10 +210,3 @@ TEST(patch_format_fileid_count_and_names_aligned) {
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::STRINGS_POI)]) == "strings_poi.bin");
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::INTERP_POSTCODES)]) == "interp_postcodes.bin");
 }
-
-TEST(patch_format_encoding_and_opcodes) {
-    CHECK_EQ(static_cast<uint32_t>(PatchEncoding::RAW_REPLACE), uint32_t(0));
-    CHECK_EQ(static_cast<uint32_t>(PatchEncoding::ZSTD_DELTA), uint32_t(1));
-    CHECK_EQ(uint8_t(OP_COPY), uint8_t(0));
-    CHECK_EQ(uint8_t(OP_INSERT), uint8_t(1));
-}

@@ -38,6 +38,7 @@
 #include <fstream>
 #include <unordered_map>
 #include <vector>
+#include <stdexcept>
 
 namespace gc::id_alloc {
 
@@ -188,6 +189,8 @@ public:
         f.write(reinterpret_cast<const char*>(&count), 4);
         f.write(reinterpret_cast<const char*>(slots.data()),
                 static_cast<std::streamsize>(slots.size()) * sizeof(SidecarSlot));
+        f.flush();
+        if (!f) throw std::runtime_error("failed to write " + path);
     }
 
 private:
