@@ -1251,6 +1251,92 @@ static void inherit_cdp_postcodes(ParsedData& data, const BuildConfig& cfg) {
 
 // Address-point parent-street backfill: link addr_points lacking addr:street to the
 // nearest named street's name_id (Nominatim parent_place_id parity).
+// Shared nearest-named-street sweep used by the addr backfill and the POI
+// parent-street pass: expand a 5x5 ring of street-level cells around
+// (plat, plng) — cell_to_ways is empty at this point (parallel_sort_and_build
+// skips the hash map), so binary-search sorted_way_cells instead — then visit
+// every segment of every named street with its local-flat point-to-segment
+// distance-squared. Callers keep their own best-candidate selection, including
+// the deterministic osm_id tie-break for exact-distance ties.
+template <typename Visit>
+static void for_each_named_street_segment(const ParsedData& data,
+                float plat, float plng,
+                std::vector<uint64_t>& cells_to_check, Visit visit) {
+    // Walk the centre plus a 5x5 ring of neighbours at kStreetCellLevel
+    // (~300m per cell) = ~1.5km coverage: enough to find the nearest named
+    // street, tight enough to avoid quadratic blow-up.
+    S2CellId center = S2CellId(
+        S2LatLng::FromDegrees(plat, plng))
+        .parent(kStreetCellLevel);
+    cells_to_check.clear();
+    cells_to_check.push_back(center.id());
+    std::vector<S2CellId> ring1;
+    center.AppendAllNeighbors(kStreetCellLevel, &ring1);
+    for (const auto& n : ring1) {
+        cells_to_check.push_back(n.id());
+        std::vector<S2CellId> ring2;
+        n.AppendAllNeighbors(kStreetCellLevel, &ring2);
+        for (const auto& n2 : ring2) {
+            cells_to_check.push_back(n2.id());
+        }
+    }
+    // De-duplicate expansion.
+    std::sort(cells_to_check.begin(), cells_to_check.end());
+    cells_to_check.erase(
+        std::unique(cells_to_check.begin(), cells_to_check.end()),
+        cells_to_check.end());
+
+    const double cos_lat = std::cos(
+        plat * M_PI / 180.0);
+    for (uint64_t cid : cells_to_check) {
+        CellItemPair probe{cid, 0};
+        auto lo = std::lower_bound(
+            data.sorted_way_cells.begin(),
+            data.sorted_way_cells.end(), probe,
+            cell_item_less);
+        for (auto p = lo;
+             p != data.sorted_way_cells.end() && p->cell_id == cid;
+             ++p) {
+            uint32_t way_id = p->item_id;
+            if (way_id >= data.ways.size()) continue;
+            const auto& w = data.ways[way_id];
+            // Only named streets matter for parent linking.
+            if (w.name_id == NO_DATA) continue;
+            uint32_t off = w.node_offset;
+            uint8_t cnt = w.node_count;
+            if (cnt < 2) continue;
+            if (static_cast<size_t>(off) + cnt > data.street_nodes.size()) continue;
+            // Point-to-segment distance in local-flat approximation
+            // (good enough for nearest-street ranking).
+            for (uint8_t k = 0; k + 1 < cnt; k++) {
+                const auto& a = data.street_nodes[off + k];
+                const auto& b = data.street_nodes[off + k + 1];
+                double ax = (a.lng - plng) * cos_lat;
+                double ay = (a.lat - plat);
+                double bx = (b.lng - plng) * cos_lat;
+                double by = (b.lat - plat);
+                double dx = bx - ax;
+                double dy = by - ay;
+                double seg_len2 = dx * dx + dy * dy;
+                double d2;
+                if (seg_len2 < 1e-18) {
+                    d2 = ax * ax + ay * ay;
+                } else {
+                    double tt = -(ax * dx + ay * dy) / seg_len2;
+                    if (tt < 0.0) tt = 0.0;
+                    else if (tt > 1.0) tt = 1.0;
+                    double qx = ax + tt * dx;
+                    double qy = ay + tt * dy;
+                    d2 = qx * qx + qy * qy;
+                }
+                int64_t cand_osm = way_id < data.way_osm_ids.size()
+                    ? data.way_osm_ids[way_id] : INT64_MAX;
+                visit(way_id, w, d2, cand_osm);
+            }
+        }
+    }
+}
+
 static void backfill_addr_point_parent_streets(ParsedData& data, const BuildConfig& cfg) {
     unsigned int num_threads = cfg.num_threads;
     if (!data.addr_points.empty() && !data.ways.empty()) {
@@ -1277,28 +1363,6 @@ static void backfill_addr_point_parent_streets(ParsedData& data, const BuildConf
                     if (i >= data.addr_points.size()) break;
                     auto& ap = data.addr_points[i];
                     ap.parent_way_id = NO_DATA;
-
-                    float plat = ap.lat;
-                    float plng = ap.lng;
-                    S2CellId center = S2CellId(
-                        S2LatLng::FromDegrees(plat, plng))
-                        .parent(kStreetCellLevel);
-                    cells_to_check.clear();
-                    cells_to_check.push_back(center.id());
-                    std::vector<S2CellId> ring1;
-                    center.AppendAllNeighbors(kStreetCellLevel, &ring1);
-                    for (const auto& n : ring1) {
-                        cells_to_check.push_back(n.id());
-                        std::vector<S2CellId> ring2;
-                        n.AppendAllNeighbors(kStreetCellLevel, &ring2);
-                        for (const auto& n2 : ring2) {
-                            cells_to_check.push_back(n2.id());
-                        }
-                    }
-                    std::sort(cells_to_check.begin(), cells_to_check.end());
-                    cells_to_check.erase(
-                        std::unique(cells_to_check.begin(), cells_to_check.end()),
-                        cells_to_check.end());
 
                     double best_d2 = 1e18;
                     uint32_t best_name = NO_DATA;
@@ -1327,75 +1391,33 @@ static void backfill_addr_point_parent_streets(ParsedData& data, const BuildConf
                     if (ap.street_id != NO_DATA) {
                         addr_street_str = pool_data.data() + ap.street_id;
                     }
-                    const double cos_lat = std::cos(
-                        plat * M_PI / 180.0);
-                    for (uint64_t cid : cells_to_check) {
-                        CellItemPair probe{cid, 0};
-                        auto lo = std::lower_bound(
-                            data.sorted_way_cells.begin(),
-                            data.sorted_way_cells.end(), probe,
-                            cell_item_less);
-                        for (auto p = lo;
-                             p != data.sorted_way_cells.end() && p->cell_id == cid;
-                             ++p) {
-                            uint32_t way_id = p->item_id;
-                            if (way_id >= data.ways.size()) continue;
-                            const auto& w = data.ways[way_id];
-                            if (w.name_id == NO_DATA) continue;
-                            uint32_t off = w.node_offset;
-                            uint8_t cnt = w.node_count;
-                            if (cnt < 2) continue;
-                            if (static_cast<size_t>(off) + cnt > data.street_nodes.size()) continue;
-                            for (uint8_t k = 0; k + 1 < cnt; k++) {
-                                const auto& a = data.street_nodes[off + k];
-                                const auto& b = data.street_nodes[off + k + 1];
-                                double ax = (a.lng - plng) * cos_lat;
-                                double ay = (a.lat - plat);
-                                double bx = (b.lng - plng) * cos_lat;
-                                double by = (b.lat - plat);
-                                double dx = bx - ax;
-                                double dy = by - ay;
-                                double seg_len2 = dx * dx + dy * dy;
-                                double d2;
-                                if (seg_len2 < 1e-18) {
-                                    d2 = ax * ax + ay * ay;
-                                } else {
-                                    double tt = -(ax * dx + ay * dy) / seg_len2;
-                                    if (tt < 0.0) tt = 0.0;
-                                    else if (tt > 1.0) tt = 1.0;
-                                    double qx = ax + tt * dx;
-                                    double qy = ay + tt * dy;
-                                    d2 = qx * qx + qy * qy;
-                                }
-                                int64_t cand_osm = way_id < data.way_osm_ids.size()
-                                    ? data.way_osm_ids[way_id] : INT64_MAX;
-                                if (d2 < best_d2 ||
-                                    (d2 == best_d2 && cand_osm < best_osm)) {
-                                    best_d2 = d2;
-                                    best_name = w.name_id;
-                                    best_way_idx = way_id;
-                                    best_osm = cand_osm;
-                                }
-                                // Token-matched: check if way's
-                                // original name matches addr:street
-                                if ((d2 < best_match_d2 ||
-                                     (d2 == best_match_d2 && cand_osm < best_match_osm))
-                                    && addr_street_str
-                                    && way_id < data.way_orig_name_ids.size()) {
-                                    uint32_t orig_id = data.way_orig_name_ids[way_id];
-                                    if (orig_id != NO_DATA) {
-                                        const char* orig_str = pool_data.data() + orig_id;
-                                        if (tokens_overlap(addr_street_str, orig_str)) {
-                                            best_match_d2 = d2;
-                                            best_match_name = w.name_id;
-                                            best_match_way = way_id;
-                                            best_match_osm = cand_osm;
-                                        }
+                    for_each_named_street_segment(data, ap.lat, ap.lng, cells_to_check,
+                        [&](uint32_t way_id, const WayHeader& w, double d2, int64_t cand_osm) {
+                            if (d2 < best_d2 ||
+                                (d2 == best_d2 && cand_osm < best_osm)) {
+                                best_d2 = d2;
+                                best_name = w.name_id;
+                                best_way_idx = way_id;
+                                best_osm = cand_osm;
+                            }
+                            // Token-matched: check if way's
+                            // original name matches addr:street
+                            if ((d2 < best_match_d2 ||
+                                 (d2 == best_match_d2 && cand_osm < best_match_osm))
+                                && addr_street_str
+                                && way_id < data.way_orig_name_ids.size()) {
+                                uint32_t orig_id = data.way_orig_name_ids[way_id];
+                                if (orig_id != NO_DATA) {
+                                    const char* orig_str = pool_data.data() + orig_id;
+                                    if (tokens_overlap(addr_street_str, orig_str)) {
+                                        best_match_d2 = d2;
+                                        best_match_name = w.name_id;
+                                        best_match_way = way_id;
+                                        best_match_osm = cand_osm;
                                     }
                                 }
                             }
-                        }
-                    }
+                        });
                     if (best_way_idx != NO_DATA) {
                         // Prefer token-matched way (matches
                         // Nominatim's getNearestNamedRoadPlaceId
@@ -1773,113 +1795,24 @@ static void compute_poi_parent_streets(ParsedData& data, const BuildConfig& cfg,
                     auto& pr = data.poi_records[i];
                     pr.parent_street_id = 0xFFFFFFFFu;
 
-                    // POI centroid: use lat/lng for points,
-                    // already-stored lat/lng for polygon centroid.
-                    float plat = pr.lat;
-                    float plng = pr.lng;
-
-                    // cell_to_ways is indexed at kStreetCellLevel
-                    // (L17, ~300m per cell). We walk the centre
-                    // plus a 5×5 ring of neighbours = ~1.5km
-                    // coverage — enough for any POI to find its
-                    // nearest named street but tight enough to
-                    // avoid quadratic blow-up.
-                    S2CellId center = S2CellId(
-                        S2LatLng::FromDegrees(plat, plng))
-                        .parent(kStreetCellLevel);
-                    cells_to_check.clear();
-                    cells_to_check.push_back(center.id());
-                    std::vector<S2CellId> ring1;
-                    center.AppendAllNeighbors(
-                        kStreetCellLevel, &ring1);
-                    for (const auto& n : ring1) {
-                        cells_to_check.push_back(n.id());
-                        std::vector<S2CellId> ring2;
-                        n.AppendAllNeighbors(
-                            kStreetCellLevel, &ring2);
-                        for (const auto& n2 : ring2) {
-                            cells_to_check.push_back(n2.id());
-                        }
-                    }
-                    // De-duplicate expansion.
-                    std::sort(cells_to_check.begin(), cells_to_check.end());
-                    cells_to_check.erase(
-                        std::unique(cells_to_check.begin(), cells_to_check.end()),
-                        cells_to_check.end());
-
                     double best_d2 = 1e18;
                     uint32_t best_name = 0xFFFFFFFFu;
                     // Stable tie-break for EXACT-distance ties, mirroring
-                    // the addr parent_way_id pick. Candidates are iterated
-                    // in sorted_way_cells item_id order = pre-sort way
-                    // index (non-deterministic, parallel parse). A strict
-                    // `d2 < best` lets build-encounter order decide the
-                    // winner when a POI is exactly equidistant from two
-                    // differently-named streets, so parent_street_id flips
-                    // between same-PBF builds (~7k POIs / poi_records.bin
-                    // churn). Break exact ties by the way's osm_id.
+                    // the addr parent_way_id pick: break exact ties by the
+                    // way's osm_id so parent_street_id doesn't flip between
+                    // same-PBF builds (~7k POIs of poi_records.bin churn).
                     int64_t best_street_osm = INT64_MAX;
-                    const double cos_lat = std::cos(
-                        plat * M_PI / 180.0);
-                    // cell_to_ways is empty at this point
-                    // (parallel_sort_and_build skips building
-                    // the hash map). Binary-search the sorted
-                    // vector instead and walk forward while
-                    // cell_id matches.
-                    for (uint64_t cid : cells_to_check) {
-                        CellItemPair probe{cid, 0};
-                        auto lo = std::lower_bound(
-                            data.sorted_way_cells.begin(),
-                            data.sorted_way_cells.end(), probe,
-                            cell_item_less);
-                        for (auto p = lo;
-                             p != data.sorted_way_cells.end() && p->cell_id == cid;
-                             ++p) {
-                            uint32_t way_id = p->item_id;
-                            if (way_id >= data.ways.size()) continue;
-                            const auto& w = data.ways[way_id];
-                            // Only named streets matter for the
-                            // parent-road field.
-                            if (w.name_id == 0xFFFFFFFFu) continue;
-                            uint32_t off = w.node_offset;
-                            uint8_t cnt = w.node_count;
-                            if (cnt < 2) continue;
-                            if (static_cast<size_t>(off) + cnt > data.street_nodes.size()) continue;
-                            // Point-to-segment distance in
-                            // local-flat approximation (good
-                            // enough for nearest-street ranking).
-                            for (uint8_t k = 0; k + 1 < cnt; k++) {
-                                const auto& a = data.street_nodes[off + k];
-                                const auto& b = data.street_nodes[off + k + 1];
-                                double ax = (a.lng - plng) * cos_lat;
-                                double ay = (a.lat - plat);
-                                double bx = (b.lng - plng) * cos_lat;
-                                double by = (b.lat - plat);
-                                double dx = bx - ax;
-                                double dy = by - ay;
-                                double seg_len2 = dx * dx + dy * dy;
-                                double d2;
-                                if (seg_len2 < 1e-18) {
-                                    d2 = ax * ax + ay * ay;
-                                } else {
-                                    double tt = -(ax * dx + ay * dy) / seg_len2;
-                                    if (tt < 0.0) tt = 0.0;
-                                    else if (tt > 1.0) tt = 1.0;
-                                    double qx = ax + tt * dx;
-                                    double qy = ay + tt * dy;
-                                    d2 = qx * qx + qy * qy;
-                                }
-                                int64_t cand_osm = way_id < data.way_osm_ids.size()
-                                    ? data.way_osm_ids[way_id] : INT64_MAX;
-                                if (d2 < best_d2 ||
-                                    (d2 == best_d2 && cand_osm < best_street_osm)) {
-                                    best_d2 = d2;
-                                    best_name = w.name_id;
-                                    best_street_osm = cand_osm;
-                                }
+                    // POI centroid: lat/lng for points, already-stored
+                    // centroid lat/lng for polygons.
+                    for_each_named_street_segment(data, pr.lat, pr.lng, cells_to_check,
+                        [&](uint32_t, const WayHeader& w, double d2, int64_t cand_osm) {
+                            if (d2 < best_d2 ||
+                                (d2 == best_d2 && cand_osm < best_street_osm)) {
+                                best_d2 = d2;
+                                best_name = w.name_id;
+                                best_street_osm = cand_osm;
                             }
-                        }
-                    }
+                        });
                     if (best_name != 0xFFFFFFFFu) {
                         pr.parent_street_id = best_name;
                         linked_count.fetch_add(1);
@@ -1900,6 +1833,74 @@ static void compute_poi_parent_streets(ParsedData& data, const BuildConfig& cfg,
     }
 }
 
+// Shared smallest-containing-admin-polygon sweep for POI parent linking: for
+// each POI record, init(pr) resets the target field, then the smallest admin
+// polygon accepted by level_ok that contains the POI centroid (area as the
+// specificity proxy, lower = tighter) is passed to store(pr, poly_id).
+// Returns the number of POIs linked.
+template <typename LevelOk, typename Init, typename Store>
+static uint64_t link_poi_smallest_admin(ParsedData& data, unsigned int num_threads,
+                LevelOk level_ok, Init init, Store store) {
+    std::atomic<size_t> idx{0};
+    std::atomic<uint64_t> linked{0};
+    std::vector<std::thread> workers;
+    for (unsigned int t = 0; t < num_threads; t++) {
+        workers.emplace_back([&]() {
+            while (true) {
+                size_t i = idx.fetch_add(1);
+                if (i >= data.poi_records.size()) break;
+                auto& pr = data.poi_records[i];
+                init(pr);
+
+                float plat = pr.lat;
+                float plng = pr.lng;
+                S2CellId cell = S2CellId(
+                    S2LatLng::FromDegrees(plat, plng))
+                    .parent(kAdminCellLevel);
+                std::vector<S2CellId> nbrs;
+                cell.AppendAllNeighbors(kAdminCellLevel, &nbrs);
+
+                float best_area = 1e18f;
+                uint32_t best_pid = NO_DATA;
+                auto check_cell = [&](uint64_t cid) {
+                    auto it = data.cell_to_admin.find(cid);
+                    if (it == data.cell_to_admin.end()) return;
+                    for (uint32_t raw_id : it->second) {
+                        uint32_t pid = raw_id & ID_MASK;
+                        if (pid >= data.admin_polygons.size()) continue;
+                        const auto& cand = data.admin_polygons[pid];
+                        if (!level_ok(cand.admin_level)) continue;
+                        if (cand.area >= best_area) continue;
+                        uint32_t off = cand.vertex_offset;
+                        uint32_t cnt2 = cand.vertex_count;
+                        if (off + cnt2 > data.admin_vertices.size()) continue;
+                        const auto* verts = &data.admin_vertices[off];
+                        bool inside = false;
+                        for (uint32_t a = 0, b = cnt2 - 1; a < cnt2; b = a++) {
+                            if (((verts[a].lng > plng) != (verts[b].lng > plng)) &&
+                                (plat < (verts[b].lat - verts[a].lat) * (plng - verts[a].lng) / (verts[b].lng - verts[a].lng) + verts[a].lat))
+                                inside = !inside;
+                        }
+                        if (inside) {
+                            best_area = cand.area;
+                            best_pid = pid;
+                        }
+                    }
+                };
+                check_cell(cell.id());
+                for (const auto& n : nbrs) check_cell(n.id());
+
+                if (best_pid != NO_DATA) {
+                    store(pr, best_pid);
+                    linked.fetch_add(1);
+                }
+            }
+        });
+    }
+    for (auto& w : workers) w.join();
+    return linked.load();
+}
+
 // POI parent-postcode PIP: inherit each POI's postcode from the smallest containing
 // postal boundary (Nominatim placex.postcode chain approximation).
 static void compute_poi_parent_postcode(ParsedData& data, const BuildConfig& cfg,
@@ -1911,72 +1912,20 @@ static void compute_poi_parent_postcode(ParsedData& data, const BuildConfig& cfg
                   << data.poi_records.size() << " POIs)..."
                   << std::endl;
 
-        std::atomic<size_t> pp_idx{0};
-        std::atomic<uint64_t> pp_linked{0};
-        std::vector<std::thread> pp_workers;
-        for (unsigned int t = 0; t < num_threads; t++) {
-            pp_workers.emplace_back([&]() {
-                while (true) {
-                    size_t i = pp_idx.fetch_add(1);
-                    if (i >= data.poi_records.size()) break;
-                    auto& pr = data.poi_records[i];
-                    // parent_postcode_id has default NO_DATA,
-                    // set explicitly here to match the
-                    // parent_street_id pattern above.
-                    pr.parent_postcode_id = 0xFFFFFFFFu;
-
-                    float plat = pr.lat;
-                    float plng = pr.lng;
-                    S2CellId cell = S2CellId(
-                        S2LatLng::FromDegrees(plat, plng))
-                        .parent(kAdminCellLevel);
-                    std::vector<S2CellId> nbrs;
-                    cell.AppendAllNeighbors(kAdminCellLevel, &nbrs);
-
-                    float best_area = 1e18f;
-                    uint32_t best_pid = NO_DATA;
-                    auto check_cell = [&](uint64_t cid) {
-                        auto it = data.cell_to_admin.find(cid);
-                        if (it == data.cell_to_admin.end()) return;
-                        for (uint32_t raw_id : it->second) {
-                            uint32_t pid = raw_id & ID_MASK;
-                            if (pid >= data.admin_polygons.size()) continue;
-                            const auto& cand = data.admin_polygons[pid];
-                            if (cand.admin_level != 11) continue;
-                            if (cand.area >= best_area) continue;
-                            uint32_t off = cand.vertex_offset;
-                            uint32_t cnt2 = cand.vertex_count;
-                            if (off + cnt2 > data.admin_vertices.size()) continue;
-                            const auto* verts = &data.admin_vertices[off];
-                            bool inside = false;
-                            for (uint32_t a = 0, b = cnt2 - 1; a < cnt2; b = a++) {
-                                if (((verts[a].lng > plng) != (verts[b].lng > plng)) &&
-                                    (plat < (verts[b].lat - verts[a].lat) * (plng - verts[a].lng) / (verts[b].lng - verts[a].lng) + verts[a].lat))
-                                    inside = !inside;
-                            }
-                            if (inside) {
-                                best_area = cand.area;
-                                best_pid = pid;
-                            }
-                        }
-                    };
-                    check_cell(cell.id());
-                    for (const auto& n : nbrs) check_cell(n.id());
-
-                    if (best_pid != NO_DATA) {
-                        pr.parent_postcode_id =
-                            data.admin_polygons[best_pid].name_id;
-                        pp_linked.fetch_add(1);
-                    }
-                }
+        uint64_t linked = link_poi_smallest_admin(data, num_threads,
+            [](auto level) { return level == 11; },
+            // parent_postcode_id has default NO_DATA, set explicitly
+            // here to match the parent_street_id pattern above.
+            [](auto& pr) { pr.parent_postcode_id = 0xFFFFFFFFu; },
+            [&data](auto& pr, uint32_t best_pid) {
+                pr.parent_postcode_id =
+                    data.admin_polygons[best_pid].name_id;
             });
-        }
-        for (auto& w : pp_workers) w.join();
 
         double _pp_el = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - _pp_t).count();
         std::cerr << "POI parent-postcode linking: "
-                  << pp_linked.load() << "/"
+                  << linked << "/"
                   << data.poi_records.size()
                   << " POIs linked to a postal boundary in "
                   << _pp_el << "s" << std::endl;
@@ -1985,7 +1934,8 @@ static void compute_poi_parent_postcode(ParsedData& data, const BuildConfig& cfg
 }
 
 // POI parent-admin PIP: record each POI's smallest containing admin polygon for the
-// chain-containment check.
+// chain-containment check. Levels 2..10 only — postal (11) and place-area
+// markers (15) are skipped.
 static void compute_poi_parent_admin(ParsedData& data, const BuildConfig& cfg,
                 std::chrono::steady_clock::time_point& _s2t, CpuTicks& _s2cpu) {
     unsigned int num_threads = cfg.num_threads;
@@ -1995,72 +1945,15 @@ static void compute_poi_parent_admin(ParsedData& data, const BuildConfig& cfg,
                   << data.poi_records.size() << " POIs)..."
                   << std::endl;
 
-        std::atomic<size_t> pa_idx{0};
-        std::atomic<uint64_t> pa_linked{0};
-        std::vector<std::thread> pa_workers;
-        for (unsigned int t = 0; t < num_threads; t++) {
-            pa_workers.emplace_back([&]() {
-                while (true) {
-                    size_t i = pa_idx.fetch_add(1);
-                    if (i >= data.poi_records.size()) break;
-                    auto& pr = data.poi_records[i];
-                    pr.parent_poly_id = 0xFFFFFFFFu;
-
-                    float plat = pr.lat;
-                    float plng = pr.lng;
-                    S2CellId cell = S2CellId(
-                        S2LatLng::FromDegrees(plat, plng))
-                        .parent(kAdminCellLevel);
-                    std::vector<S2CellId> nbrs;
-                    cell.AppendAllNeighbors(kAdminCellLevel, &nbrs);
-
-                    // Smallest admin polygon at any level 2..10
-                    // that contains the POI. Skip postal (11)
-                    // and place-area markers (15). Use area as
-                    // the specificity proxy (lower = tighter).
-                    float best_area = 1e18f;
-                    uint32_t best_pid = NO_DATA;
-                    auto check_cell = [&](uint64_t cid) {
-                        auto it = data.cell_to_admin.find(cid);
-                        if (it == data.cell_to_admin.end()) return;
-                        for (uint32_t raw_id : it->second) {
-                            uint32_t pid = raw_id & ID_MASK;
-                            if (pid >= data.admin_polygons.size()) continue;
-                            const auto& cand = data.admin_polygons[pid];
-                            if (cand.admin_level < 2 || cand.admin_level > 10) continue;
-                            if (cand.area >= best_area) continue;
-                            uint32_t off = cand.vertex_offset;
-                            uint32_t cnt2 = cand.vertex_count;
-                            if (off + cnt2 > data.admin_vertices.size()) continue;
-                            const auto* verts = &data.admin_vertices[off];
-                            bool inside = false;
-                            for (uint32_t a = 0, b = cnt2 - 1; a < cnt2; b = a++) {
-                                if (((verts[a].lng > plng) != (verts[b].lng > plng)) &&
-                                    (plat < (verts[b].lat - verts[a].lat) * (plng - verts[a].lng) / (verts[b].lng - verts[a].lng) + verts[a].lat))
-                                    inside = !inside;
-                            }
-                            if (inside) {
-                                best_area = cand.area;
-                                best_pid = pid;
-                            }
-                        }
-                    };
-                    check_cell(cell.id());
-                    for (const auto& n : nbrs) check_cell(n.id());
-
-                    if (best_pid != NO_DATA) {
-                        pr.parent_poly_id = best_pid;
-                        pa_linked.fetch_add(1);
-                    }
-                }
-            });
-        }
-        for (auto& w : pa_workers) w.join();
+        uint64_t linked = link_poi_smallest_admin(data, num_threads,
+            [](auto level) { return level >= 2 && level <= 10; },
+            [](auto& pr) { pr.parent_poly_id = 0xFFFFFFFFu; },
+            [](auto& pr, uint32_t best_pid) { pr.parent_poly_id = best_pid; });
 
         double _pa_el = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - _pa_t).count();
         std::cerr << "POI parent-admin linking: "
-                  << pa_linked.load() << "/"
+                  << linked << "/"
                   << data.poi_records.size()
                   << " POIs linked to an admin polygon in "
                   << _pa_el << "s" << std::endl;
