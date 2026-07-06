@@ -977,6 +977,35 @@ pub fn mmap_file_optional(path: &str) -> Option<FileBytes> {
     Some(FileBytes::Mmap(mmap))
 }
 
+/// Open a group of files that are only valid together: either the whole
+/// group is present (returned as all-Some) or the whole group is absent
+/// (all-None, a legitimate index variant — e.g. admin-minimal ships no POI
+/// files). A half-present group means a corrupt or partially-synced index
+/// dir; loading it would silently disable the feature (or worse), so it is
+/// a hard load error instead.
+#[cfg(not(target_arch = "wasm32"))]
+fn mmap_group(dir: &str, names: &[&str]) -> Result<Vec<Option<FileBytes>>, String> {
+    let maps: Vec<Option<FileBytes>> = names
+        .iter()
+        .map(|n| mmap_file_optional(&format!("{}/{}", dir, n)))
+        .collect();
+    let present = maps.iter().filter(|m| m.is_some()).count();
+    if present != 0 && present != names.len() {
+        let missing: Vec<&str> = names
+            .iter()
+            .zip(&maps)
+            .filter(|(_, m)| m.is_none())
+            .map(|(n, _)| *n)
+            .collect();
+        return Err(format!(
+            "Partial index group [{}]: missing [{}]",
+            names.join(", "),
+            missing.join(", ")
+        ));
+    }
+    Ok(maps)
+}
+
 impl Index {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load(dir: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Self, String> {
@@ -999,38 +1028,63 @@ impl Index {
             Ok(mmap)
         };
 
+        // Files that are only meaningful together load as all-or-nothing
+        // groups (whole-group-absent = a thinner index variant; half-present
+        // = corruption). addr_vertices is NOT part of the addr group — it
+        // was added in v9 (building footprints) and older indexes
+        // legitimately lack it. The way_/admin_parents and *_postcodes
+        // sidecars are individually optional for the same version reason.
+        let [addr_entries, addr_points]: [Option<FileBytes>; 2] =
+            mmap_group(dir, &["addr_entries.bin", "addr_points.bin"])?
+                .try_into().map_err(|_| "addr group arity")?;
+        let [interp_entries, interp_ways, interp_nodes]: [Option<FileBytes>; 3] =
+            mmap_group(dir, &["interp_entries.bin", "interp_ways.bin", "interp_nodes.bin"])?
+                .try_into().map_err(|_| "interp group arity")?;
+        let [poi_cells, poi_entries, poi_records, poi_vertices]: [Option<FileBytes>; 4] =
+            mmap_group(dir, &["poi_cells.bin", "poi_entries.bin", "poi_records.bin", "poi_vertices.bin"])?
+                .try_into().map_err(|_| "poi group arity")?;
+        let [place_nodes, place_cells, place_entries]: [Option<FileBytes>; 3] =
+            mmap_group(dir, &["place_nodes.bin", "place_cells.bin", "place_entries.bin"])?
+                .try_into().map_err(|_| "place group arity")?;
+        let [postal_polygons, postal_vertices]: [Option<FileBytes>; 2] =
+            mmap_group(dir, &["postal_polygons.bin", "postal_vertices.bin"])?
+                .try_into().map_err(|_| "postal group arity")?;
+        let [postcode_centroids, postcode_centroid_cells, postcode_centroid_entries]: [Option<FileBytes>; 3] =
+            mmap_group(dir, &["postcode_centroids.bin", "postcode_centroid_cells.bin", "postcode_centroid_entries.bin"])?
+                .try_into().map_err(|_| "centroid group arity")?;
+
         Ok(Index {
             geo_cells,
             street_entries: required_geo("street_entries.bin")?,
             street_ways: required_geo("street_ways.bin")?,
             street_nodes: required_geo("street_nodes.bin")?,
-            addr_entries: mmap_file_optional(&format!("{}/addr_entries.bin", dir)),
-            addr_points: mmap_file_optional(&format!("{}/addr_points.bin", dir)),
+            addr_entries,
+            addr_points,
             addr_vertices: mmap_file_optional(&format!("{}/addr_vertices.bin", dir)),
-            interp_entries: mmap_file_optional(&format!("{}/interp_entries.bin", dir)),
-            interp_ways: mmap_file_optional(&format!("{}/interp_ways.bin", dir)),
-            interp_nodes: mmap_file_optional(&format!("{}/interp_nodes.bin", dir)),
+            interp_entries,
+            interp_ways,
+            interp_nodes,
             admin_cells: mmap_file(&format!("{}/admin_cells.bin", dir))?,
             admin_entries: mmap_file(&format!("{}/admin_entries.bin", dir))?,
             admin_polygons: mmap_file(&format!("{}/admin_polygons.bin", dir))?,
             admin_vertices: mmap_file(&format!("{}/admin_vertices.bin", dir))?,
-            poi_cells: mmap_file_optional(&format!("{}/poi_cells.bin", dir)),
-            poi_entries: mmap_file_optional(&format!("{}/poi_entries.bin", dir)),
-            poi_records: mmap_file_optional(&format!("{}/poi_records.bin", dir)),
-            poi_vertices: mmap_file_optional(&format!("{}/poi_vertices.bin", dir)),
+            poi_cells,
+            poi_entries,
+            poi_records,
+            poi_vertices,
             poi_meta: PoiMeta::load(dir),
-            place_nodes: mmap_file_optional(&format!("{}/place_nodes.bin", dir)),
-            place_cells: mmap_file_optional(&format!("{}/place_cells.bin", dir)),
-            place_entries: mmap_file_optional(&format!("{}/place_entries.bin", dir)),
+            place_nodes,
+            place_cells,
+            place_entries,
             way_parents: mmap_file_optional(&format!("{}/way_parents.bin", dir)),
             admin_parents: mmap_file_optional(&format!("{}/admin_parents.bin", dir)),
             addr_postcodes: mmap_file_optional(&format!("{}/addr_postcodes.bin", dir)),
             way_postcodes: mmap_file_optional(&format!("{}/way_postcodes.bin", dir)),
-            postal_polygons: mmap_file_optional(&format!("{}/postal_polygons.bin", dir)),
-            postal_vertices: mmap_file_optional(&format!("{}/postal_vertices.bin", dir)),
-            postcode_centroids: mmap_file_optional(&format!("{}/postcode_centroids.bin", dir)),
-            postcode_centroid_cells: mmap_file_optional(&format!("{}/postcode_centroid_cells.bin", dir)),
-            postcode_centroid_entries: mmap_file_optional(&format!("{}/postcode_centroid_entries.bin", dir)),
+            postal_polygons,
+            postal_vertices,
+            postcode_centroids,
+            postcode_centroid_cells,
+            postcode_centroid_entries,
             admin_config: AdminLevelConfig::load(),
             strings: StringPool::load(dir)?,
             street_cell_level,
