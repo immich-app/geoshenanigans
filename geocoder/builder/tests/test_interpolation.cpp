@@ -151,7 +151,10 @@ TEST(interpolation_parses_leading_digits_only) {
     add_addr(d, 0.10f, 0.10f, hn12a, st);
     add_addr(d, 0.20f, 0.20f, hnletter, st);
 
-    add_interp(d, {{0.10f, 0.10f}, {0.20f, 0.20f}}, st, 0u, 0u);
+    // Seed end_number with a sentinel: the resolver WRITES the parsed value
+    // (0 for a letter housenumber), and asserting 0 against a 0 seed could
+    // not distinguish "parsed to 0" from "resolver never ran".
+    add_interp(d, {{0.10f, 0.10f}, {0.20f, 0.20f}}, st, 0u, 9999u);
     resolve_interpolation_endpoints(d);
 
     CHECK_EQ(d.interp_ways[0].start_number, 12u);

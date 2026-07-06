@@ -295,8 +295,9 @@ static constexpr uint32_t CELL_CHANGES_PLACE_MARKER = 0xFFFFFFF4;
 // Entry correction marker: 0xFFFFFFF8
 // Cell-level diff of entries: lists cells whose entries differ between derived and new.
 // Format: marker(4), file_id(4), count(4),
-//   for each: cell_index(4), entry_count(2), [id(4)] * entry_count
-// cell_index is the position in the geo_cells/admin_cells array.
+//   for each: cell_id(8), entry_count(2), [id(4)] * entry_count
+// cell_id is the S2 cell id (u64), NOT an array position — the patcher
+// binary-searches the cells file for it.
 static constexpr uint32_t ENTRY_CORRECTION_MARKER = 0xFFFFFFF8;
 
 // Cell flag corrections marker: 0xFFFFFFF9

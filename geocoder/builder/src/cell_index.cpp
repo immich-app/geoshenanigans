@@ -289,10 +289,9 @@ static void finalize_strategy2(gc::id_alloc::IdAllocator& alloc, uint32_t n_new,
 static void apply_strategy2_streets(ParsedData& data, const std::string& prev_dir) {
     using namespace gc::id_alloc;
     if (data.ways.empty()) return;
-    // Belt-and-braces: continent_filter.cpp builds subset ParsedData
-    // without yet preserving way_osm_ids (TODO). When that path is
-    // taken sizes won't match; skip strategy-2 cleanly so subset
-    // builds still produce correct output even if not yet stable.
+    // Belt-and-braces: continent_filter.cpp does preserve way_osm_ids
+    // for subsets these days, but if any path ever produces a desynced
+    // sidecar, skip strategy-2 cleanly rather than mis-keying slots.
     if (data.way_osm_ids.size() != data.ways.size()) return;
 
     IdAllocator alloc;

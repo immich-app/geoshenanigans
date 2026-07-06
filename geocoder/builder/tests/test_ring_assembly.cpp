@@ -52,7 +52,7 @@ TEST(ring_assembly_single_closed_way) {
     std::vector<std::pair<int64_t, std::string>> members = {{1, "outer"}};
     auto rings = assemble_outer_rings(members, geoms);
 
-    CHECK_EQ(rings.size(), size_t(1));
+    REQUIRE(rings.size() == size_t(1));
     CHECK(ring_is_closed(rings[0]));
     // The ring is the way's coordinates verbatim (5 points, closed).
     CHECK_EQ(rings[0].size(), size_t(5));
@@ -68,7 +68,7 @@ TEST(ring_assembly_empty_role_is_outer) {
     std::vector<std::pair<int64_t, std::string>> members = {{1, ""}};
     auto rings = assemble_outer_rings(members, geoms);
 
-    CHECK_EQ(rings.size(), size_t(1));
+    REQUIRE(rings.size() == size_t(1));
     CHECK(ring_is_closed(rings[0]));
 }
 
@@ -84,7 +84,7 @@ TEST(ring_assembly_two_ways_stitch) {
     std::vector<std::pair<int64_t, std::string>> members = {{1, "outer"}, {2, "outer"}};
     auto rings = assemble_outer_rings(members, geoms);
 
-    CHECK_EQ(rings.size(), size_t(1));
+    REQUIRE(rings.size() == size_t(1));
     CHECK(ring_is_closed(rings[0]));
     // 3 + 3 coords stitched at the shared endpoint -> 5 distinct points,
     // closed back to start.
@@ -112,7 +112,7 @@ TEST(ring_assembly_include_all_roles_overrides_filter) {
     std::vector<std::pair<int64_t, std::string>> members = {{1, "inner"}};
     auto rings = assemble_outer_rings(members, geoms, /*include_all_roles=*/true);
 
-    CHECK_EQ(rings.size(), size_t(1));
+    REQUIRE(rings.size() == size_t(1));
     CHECK(ring_is_closed(rings[0]));
 }
 
@@ -151,7 +151,7 @@ TEST(ring_assembly_missing_geometry_skipped) {
     std::vector<std::pair<int64_t, std::string>> members = {{2, "outer"}, {1, "outer"}};
     auto rings = assemble_outer_rings(members, geoms);
 
-    CHECK_EQ(rings.size(), size_t(1));
+    REQUIRE(rings.size() == size_t(1));
     CHECK(ring_is_closed(rings[0]));
 }
 
@@ -176,4 +176,46 @@ TEST(ring_assembly_two_disjoint_closed_ways) {
     CHECK_EQ(rings.size(), size_t(2));
     CHECK(ring_is_closed(rings[0]));
     CHECK(ring_is_closed(rings[1]));
+}
+
+// NOTE: a single pre-closed way is emitted verbatim by the greedy pass with
+// NO self-intersection check — only backtrack-assembled (pass 2) rings are
+// validated. This test locks in that (long-standing) behaviour; the
+// intersection predicate itself is unit-tested in test_geometry.cpp for both
+// the brute-force and sweep-line branches.
+TEST(ring_assembly_preclosed_bowtie_passes_through) {
+    std::unordered_map<int64_t, ParsedData::WayGeometry> geoms;
+    geoms[1] = make_way({{0.0, 0.0}, {1.0, 1.0}, {1.0, 0.0}, {0.0, 1.0}, {0.0, 0.0}});
+    std::vector<std::pair<int64_t, std::string>> members = {{1, "outer"}};
+    auto rings = assemble_outer_rings(members, geoms);
+    CHECK_EQ(rings.size(), size_t(1));
+}
+
+// Two ways whose shared endpoints only line up when the second is walked in
+// reverse: the stitcher must handle reversed segments.
+TEST(ring_assembly_reversed_way_stitch) {
+    std::unordered_map<int64_t, ParsedData::WayGeometry> geoms;
+    // Way 1: (0,0) -> (0,1) -> (1,1). Way 2 REVERSED: (0,0) -> (1,0) -> (1,1)
+    // (i.e. its stored direction runs from way 1's START to way 1's END).
+    geoms[1] = make_way({{0.0, 0.0}, {0.0, 1.0}, {1.0, 1.0}});
+    geoms[2] = make_way({{0.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}});
+    std::vector<std::pair<int64_t, std::string>> members = {{1, "outer"}, {2, "outer"}};
+    auto rings = assemble_outer_rings(members, geoms);
+    REQUIRE(rings.size() == size_t(1));
+    CHECK(ring_is_closed(rings[0]));
+}
+
+// Greedy fails (three candidate continuations from a junction, greedy picks a
+// dead end first) but the backtracking pass closes the ring.
+TEST(ring_assembly_backtrack_closes_after_greedy_dead_end) {
+    std::unordered_map<int64_t, ParsedData::WayGeometry> geoms;
+    // Square via two arcs plus a dead-end spur sharing the junction (1,1):
+    geoms[1] = make_way({{0.0, 0.0}, {0.0, 1.0}, {1.0, 1.0}});   // arc A
+    geoms[2] = make_way({{1.0, 1.0}, {1.0, 0.0}, {0.0, 0.0}});   // arc B (closes)
+    geoms[3] = make_way({{1.0, 1.0}, {2.0, 2.0}});               // dead-end spur
+    std::vector<std::pair<int64_t, std::string>> members =
+        {{1, "outer"}, {2, "outer"}, {3, "outer"}};
+    auto rings = assemble_outer_rings(members, geoms);
+    REQUIRE(rings.size() >= size_t(1));
+    CHECK(ring_is_closed(rings[0]));
 }

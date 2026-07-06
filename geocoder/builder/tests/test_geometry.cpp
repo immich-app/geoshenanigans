@@ -254,3 +254,51 @@ TEST(geometry_admin_epsilon_meters_table) {
     CHECK_NEAR(admin_epsilon_meters(2), 1000.0, 1e-9);
     kEpsilonScale = saved_scale;
 }
+
+// --- is_included_highway allow-list ----------------------------------------
+// Parity-critical: the accept set mirrors Nominatim's presets.lua
+// MAIN_TAGS_STREETS.default. A missing class silently drops whole road
+// classes from the index (a live Dresden footway bug motivated the sync).
+
+TEST(highway_allowlist_accepts_full_set) {
+    const char* accepted[] = {
+        "bridleway", "cycleway", "footway", "living_street",
+        "motorway", "motorway_link", "primary", "primary_link",
+        "pedestrian", "path", "road", "residential",
+        "secondary", "secondary_link", "service", "steps",
+        "tertiary", "tertiary_link", "trunk", "trunk_link", "track",
+        "unclassified",
+    };
+    for (const char* v : accepted) CHECK(is_included_highway(v));
+}
+
+TEST(highway_allowlist_rejects_non_streets) {
+    const char* rejected[] = {
+        "bus_stop", "construction", "proposed", "raceway", "corridor",
+        "elevator", "platform", "rest_area", "services", "traffic_signals",
+        "crossing", "give_way", "stop", "street_lamp", "emergency_bay",
+        "motorway_junction", "passing_place", "turning_circle", "busway",
+        "", "residentia", "residentiall",
+    };
+    for (const char* v : rejected) CHECK(!is_included_highway(v));
+    CHECK(!is_included_highway(nullptr));
+}
+
+TEST(highway_full_filter_footway_subtypes) {
+    // footway=sidewalk / crossing are road adjuncts and excluded; any other
+    // footway subtype (or none) passes.
+    CHECK(!is_included_highway_full("footway", "sidewalk"));
+    CHECK(!is_included_highway_full("footway", "crossing"));
+    CHECK(is_included_highway_full("footway", "alley"));
+    CHECK(is_included_highway_full("footway", nullptr));
+    // The subtype filter applies to footway only.
+    CHECK(is_included_highway_full("residential", "sidewalk"));
+}
+
+TEST(highway_full_filter_ignores_access_and_tunnel) {
+    // Nominatim indexes highways regardless of access/tunnel — lock in that
+    // is_included_highway_full does NOT filter on them (the Treasury Annex
+    // Tunnel case is handled by the addr preference rule instead).
+    CHECK(is_included_highway_full("service", nullptr, "private", "yes"));
+    CHECK(is_included_highway_full("residential", nullptr, "no", "yes"));
+}

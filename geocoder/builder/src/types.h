@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <vector>
+#include <string>
 
 // --- Binary format structs (must match server's index reader) ---
 

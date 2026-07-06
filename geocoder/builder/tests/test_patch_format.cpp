@@ -143,8 +143,11 @@ TEST(patch_format_stride_sentinels_no_collision_with_real_strides) {
         12,  // padded WayHeader / admin_cells / poi_cells / place_cells
         16,  // postcode_centroid value_stride
         18,  // packed InterpWay
+        28,  // AddrPoint v15 (polygon footprint fields)
+        32,  // PoiRecord (build_version 10-14)
+        36,  // PoiRecord (current, parent ids)
         19,  // raw AdminPolygon
-        20,  // padded InterpWay / AddrPoint / geo_cell
+        20,  // padded InterpWay / legacy AddrPoint / current PlaceNode / geo_cell
         24,  // padded AdminPolygon / PoiRecord
     };
     for (uint32_t s : real_strides) {

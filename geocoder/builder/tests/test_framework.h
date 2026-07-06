@@ -45,12 +45,29 @@ struct Registrar {
     }
 };
 
+// Thrown by REQUIRE to abort the current test; caught by the runner.
+struct RequireFailed {};
+
 }  // namespace gctest
 
 #define TEST(name)                                                          \
     static void name();                                                     \
     static ::gctest::Registrar gc_reg_##name(#name, __FILE__, name);        \
     static void name()
+
+// Like CHECK but aborts the current test on failure — use when later
+// statements would be UB after the failure (e.g. indexing rings[0] after
+// asserting rings.size() == 1).
+#define REQUIRE(cond)                                                       \
+    do {                                                                    \
+        ::gctest::checks()++;                                               \
+        if (!(cond)) {                                                      \
+            std::printf("    FAIL %s:%d  REQUIRE(%s)\n", __FILE__,         \
+                        __LINE__, #cond);                                   \
+            ::gctest::failures()++;                                         \
+            throw ::gctest::RequireFailed{};                                \
+        }                                                                   \
+    } while (0)
 
 #define CHECK(cond)                                                         \
     do {                                                                    \
@@ -62,8 +79,8 @@ struct Registrar {
         }                                                                   \
     } while (0)
 
-// Equality check that prints both operands when they differ (works for any
-// type streamable to a std::string via std::to_string, plus const char*).
+// Equality check. Prints the two EXPRESSIONS on failure (not their runtime
+// values — the framework stays dependency-free and printf-based).
 #define CHECK_EQ(a, b)                                                      \
     do {                                                                    \
         ::gctest::checks()++;                                               \
