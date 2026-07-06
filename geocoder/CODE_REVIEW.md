@@ -203,7 +203,41 @@ Each was verified against Nominatim source + the live reverse API before action 
   - **Why NOT the builder (the instructive part):** the first attempt did this in the builder (`is_valid_postcode` PO/zip+4 reject removal + `canonical_postcode()` at every intern site). It compiled, kept oceania behaviorally identical, AND preserved determinism (same-PBF planet patch still 243 B / 26/26) — but a planet grid-diff vs **live Nominatim** showed a **net regression** (~80 US points: lost/changed correct postcodes, incl. a Virginia ZIP surfacing in Arizona). Root cause: the postcode centroids are **sorted by `postcode_id`** (a string-pool offset, `cell_index.cpp:1212`) AND **re-accumulated from `addr_postcode_ids`** (`cell_index.cpp:1148`), so *any* builder postcode change either reorders the centroid array (flipping adjacent-ZIP near-ties at query time) or shifts centroid positions (exposing previously-rejected bad ZIP+4 tags as valid centroids). The GB "PO"-prefix removal had **0** measurable benefit (GB "PO" postcodes already resolve via the per-country path + the shipped server `centroid_postcode_ok` fix). Reverted entirely; re-did ZIP+4 at output instead (no centroid pipeline contact). **Lesson:** builder postcode-set changes can't be validated by determinism alone — they need a grid-vs-live-Nominatim parity check; the tier-2 centroid mechanism is fragile to any such change.
   - **Left UNCHANGED:** the `all-same-char` placeholder reject — matching Nominatim there means accepting `"00000"`-style placeholders (Nominatim's `ddddd` pattern accepts them), a divergence-that's-arguably-better which per project rule needs user sign-off before removing.
 
-### Rural US postcode gap — investigated, root-caused, architectural follow-up (NOT yet fixed)
+### Fixes shipped in the 2026-07 goal session (B-1/B-2/B-4/TIGER)
+
+- **B-1 uint16 cell entry-count overflow** — now a hard build failure via
+  `checked_entry_count()` (cell_index.cpp, 3 write sites) plus a per-file
+  "max entries/cell" canary log. Planet headroom: max 29,975 (poi/all, 46%
+  of the 65,535 limit); a later u16→u32 widening is a routine build_version
+  bump if the canary ever approaches the limit.
+- **B-2 boost/postcode routing disagreement** — `poi_won_primary` is now a
+  flag set inside the same cascade branch that picks the road (was
+  recomputed with the un-boosted distance). 327K-grid: zero behaviour
+  change (the disagreement window is empirically empty); consistency is now
+  by construction.
+- **B-4 half-present index groups** — `Index::load` uses `mmap_group()`
+  all-or-nothing checks for addr/interp/poi/place/postal/centroid groups
+  (whole-group-absent = valid thin variant; half-present = hard load
+  error). addr_vertices and the parent/postcode single sidecars stay
+  individually optional (version-dependent additions).
+- **Rural-US postcodes (TIGER per-segment ZIP)** — see next section; FIXED
+  via the interp_postcodes.bin sidecar + server tier 1c.
+
+### Rural US postcode gap — FIXED (2026-07): TIGER per-segment ZIP sidecar
+
+The architectural fix described below has been implemented: the builder
+keeps each TIGER segment's ZIP (`interp_postcode_ids`, written as
+`interp_postcodes.bin`, u32 string offset per interp way, NO_DATA for OSM
+interpolations, absent on non-TIGER builds), the patch tools carry it as
+patch fid INTERP_POSTCODES (GCPATCH v3), and the server consults it as
+postcode tier 1c — gated on the street winning the primary, the segment
+lying within ~100m, and a normalised token overlap between the segment's
+TIGER street name and the winning way's name (Nominatim's
+`_find_tiger_number_for_street` parent join, approximated by name). The
+fragile nearest-centroid tier-2 pipeline was left completely untouched.
+
+#### Original analysis (historical)
+
 
 A live-Nominatim comparison over a rural-US grid sample found **~52% of our "no postcode" addressed rural points are a real divergence** — Nominatim returns a 5-digit ZIP (e.g. 77713, 13630, 03570, 32325) where we return none; the other ~48% are genuine wilderness where both return nothing. These are plain 5-digit ZIPs, **not** the ZIP+4 issue.
 

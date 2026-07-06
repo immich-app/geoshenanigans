@@ -182,24 +182,19 @@ c1f7101 perf(geocoder): byte-block merge for addr_vertices via content-hash
   noise floor — fixing it requires sorting `data.admin_osm_ids` etc.
   before strategy-2.
 
-## Build non-determinism (remaining noise floor)
+## Build non-determinism — RESOLVED (historical)
 
-Even with the same PBF and proper strategy-2 chain, 10 of 26 `.bin`
-files differ between builds. Pattern from oceania:
-- street_ways/admin_polygons/postcode_centroids sidecars all DIFFER
-  byte-level between same-PBF builds. addr_points and place_nodes ditto.
-- "(no shifts)" in strategy-2 logs is misleading — it's also reported
-  for fresh allocations, where remap[i]=i is trivially true.
-- For `addr_postcodes`: 76.1% identical, 10.2% v1=NO_DATA→v2=real,
-  10.2% symmetric flip, 3.5% both real but different. Clear sign that
-  PBF parsing yields non-deterministic addr_osm_ids order →
-  non-deterministic slot assignment → non-deterministic postcode_id
-  assignment.
+This section previously documented a same-PBF noise floor (10 of 26
+`.bin` files differing between builds, non-deterministic parse-order
+leaking into strategy-2 slots). The prescribed fix — deterministic
+sorting of every record class + parallel arrays before strategy-2 —
+was implemented as the deterministic-ordering pass
+(`reorder_deterministically` in build_index.cpp).
 
-The fix is build-side: sort `data.addr_osm_ids` (and the parallel
-arrays `data.addr_points`, `data.addr_postcode_ids`, plus references
-in `data.cell_to_addrs`) by osm_id before strategy-2 runs. Same for
-admins (sort by (relation_id, ring_index)), POIs, places, interps.
+Current, repeatedly re-validated state: a same-PBF chained planet
+rebuild is byte-identical across all files (the same-PBF planet patch
+is ~251 bytes of copy-old markers, patch verify 27/27; day-over-day
+oceania chains verify 26/26 with stable patch sizes).
 
 ## Test infrastructure (Hetzner server)
 
