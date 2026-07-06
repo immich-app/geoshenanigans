@@ -3299,9 +3299,18 @@ impl Index {
         };
         let closest_feature_dist = addr_dist.min(interp_dist).min(street_dist).min(compare_poi_dist);
         let mut addr_won_primary = false;
+        let mut poi_won_primary = false;
         if closest_feature_dist < max_dist {
             // Whichever feature class has the smallest distance wins.
             if compare_poi_dist <= addr_dist && compare_poi_dist <= interp_dist && compare_poi_dist <= street_dist {
+                // Record the win here so postcode routing below follows the
+                // SAME decision (incl. the tier-1 boost). It previously
+                // recomputed the winner with the un-boosted distance, so a
+                // POI that won primary only via the boost surfaced the POI's
+                // road but the street's postcode. Nominatim routes the whole
+                // address (postcode included) through whichever feature wins
+                // the reverse lookup, so the flag must match the road pick.
+                poi_won_primary = true;
                 // POI is closest. Nominatim splits "POI with polygon
                 // at dist=0" into two cases depending on rank_search:
                 //  - rank 26 (highway=pedestrian/footway/etc. polygons
@@ -3376,12 +3385,10 @@ impl Index {
         // feeds Tier 1 (way_postcodes.bin for streets, parent_postcode_id
         // for POIs); no query-time postal-boundary PIP. Tier 0 and Tier 1
         // are primary-feature-driven — only the winning feature's
-        // inherited postcode is consulted, so a POI win no longer leaks
-        // the street's inherited ZIP (Mexico City Zócalo 06060 leak).
-        let poi_won_primary = closest_feature_dist < max_dist
-            && effective_poi_dist <= addr_dist
-            && effective_poi_dist <= interp_dist
-            && effective_poi_dist <= street_dist;
+        // inherited postcode is consulted (poi_won_primary is set by the
+        // SAME cascade branch that picked the road above), so a POI win no
+        // longer leaks the street's inherited ZIP (Mexico City Zócalo
+        // 06060 leak).
         let resolved_postcode = self.resolve_postcode(
             lat, lng,
             if poi_won_primary { None } else { street.as_ref().map(|(_, w, idx)| (*idx as usize, w)) },
