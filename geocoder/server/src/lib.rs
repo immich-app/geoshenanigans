@@ -911,6 +911,10 @@ pub struct Index {
     pub interp_entries: Option<FileBytes>,
     pub interp_ways: Option<FileBytes>,
     pub interp_nodes: Option<FileBytes>,
+    // TIGER per-segment ZIP sidecar: u32 postcode string offset per interp
+    // way (NO_DATA for OSM interpolations). Absent on builds without TIGER
+    // data and on pre-sidecar indexes — individually optional.
+    pub interp_postcodes: Option<FileBytes>,
     pub admin_cells: FileBytes,
     pub admin_entries: FileBytes,
     pub admin_polygons: FileBytes,
@@ -939,6 +943,39 @@ pub struct Index {
     pub street_cell_level: u64,
     pub admin_cell_level: u64,
     pub max_distance_sq: f64,
+}
+
+/// Normalised street-name token overlap, mirroring the builder's
+/// tokens_overlap (geometry.h) / Nominatim's token_matches_street: lowercase,
+/// non-alphanumerics become separators, then test whether any token of >= 2
+/// chars appears in both names. (The builder also folds Latin-1 accents; the
+/// TIGER context here is US ASCII names, where that folding is a no-op.)
+fn normalise_street_tokens(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_space = true;
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_space = false;
+        } else if !last_space {
+            out.push(' ');
+            last_space = true;
+        }
+    }
+    while out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
+fn street_tokens_overlap(a: &str, b: &str) -> bool {
+    let na = normalise_street_tokens(a);
+    let nb = normalise_street_tokens(b);
+    if na.is_empty() || nb.is_empty() {
+        return false;
+    }
+    let bt: std::collections::HashSet<&str> = nb.split(' ').filter(|t| t.len() >= 2).collect();
+    na.split(' ').filter(|t| t.len() >= 2).any(|t| bt.contains(t))
 }
 
 pub const NO_DATA: u32 = 0xFFFFFFFF;
@@ -1064,6 +1101,7 @@ impl Index {
             interp_entries,
             interp_ways,
             interp_nodes,
+            interp_postcodes: mmap_file_optional(&format!("{}/interp_postcodes.bin", dir)),
             admin_cells: mmap_file(&format!("{}/admin_cells.bin", dir))?,
             admin_entries: mmap_file(&format!("{}/admin_entries.bin", dir))?,
             admin_polygons: mmap_file(&format!("{}/admin_polygons.bin", dir))?,
@@ -1151,7 +1189,10 @@ impl Index {
             poi_records, poi_vertices, poi_cells, poi_entries, poi_meta,
             geo_cells, street_ways, street_nodes, street_entries,
             addr_points, addr_vertices, addr_entries,
-            interp_ways, interp_nodes, interp_entries,
+            interp_ways, interp_nodes,
+            // wasm-only constructor; the wasm port is being dropped, so the
+            // TIGER sidecar is not plumbed through here (tier 1c stays off).
+            interp_postcodes: None, interp_entries,
             way_postcodes, addr_postcodes,
             admin_parents, way_parents,
             postal_polygons, postal_vertices,
@@ -1322,7 +1363,7 @@ impl Index {
     // --- Geo lookup (streets, addresses, interpolation from merged index) ---
 
     pub fn query_geo(&self, lat: f64, lng: f64)
-        -> (Option<(f64, AddrPoint, u32)>, Option<(f64, &str, u32)>, Option<(f64, WayHeader, u32)>)
+        -> (Option<(f64, AddrPoint, u32)>, Option<(f64, &str, u32, u32)>, Option<(f64, WayHeader, u32)>)
     {
         let geo_cells = match &self.geo_cells {
             Some(gc) => gc,
@@ -1351,6 +1392,7 @@ impl Index {
         let mut best_interp_dist = f64::MAX;
         let mut best_interp: Option<InterpWay> = None;
         let mut best_interp_t: f64 = 0.0;
+        let mut best_interp_id: u32 = NO_DATA;
 
         // Fixed-size hash set on stack to skip duplicate street IDs across cells
         let mut seen_streets: [u32; 64] = [u32::MAX; 64];
@@ -1454,6 +1496,7 @@ impl Index {
                         best_interp_dist = best_seg_dist;
                         best_interp = Some(iw);
                         best_interp_t = best_seg_t;
+                        best_interp_id = id;
                     }
                 }
             }
@@ -1473,7 +1516,7 @@ impl Index {
             } else {
                 raw.round() as u32
             };
-            (best_interp_dist, self.get_string(iw.street_id), number)
+            (best_interp_dist, self.get_string(iw.street_id), number, best_interp_id)
         });
 
         (addr_result, interp_result, street_result)
@@ -1537,7 +1580,7 @@ impl Index {
                 "dist_m": to_m(d),
                 "name": self.get_string(w.name_id),
             })),
-            "interp": interp.map(|(d, s, n)| serde_json::json!({
+            "interp": interp.map(|(d, s, n, _)| serde_json::json!({
                 "dist_m": to_m(d),
                 "street": s,
                 "number": n,
@@ -2901,30 +2944,32 @@ impl Index {
     // at index time. `postal_polygons.bin` is consumed at BUILD time only
     // (for way_postcodes.bin / PoiRecord.parent_postcode_id inheritance);
     // it is not consulted here.
-    pub fn resolve_postcode(&self, lat: f64, lng: f64, street: Option<(usize, &WayHeader)>, addr: Option<(usize, &AddrPoint)>, poi: Option<&PoiRecord>, country_code: Option<[u8; 2]>) -> Option<&str> {
+    /// Read one u32 from a per-record sidecar file (addr_postcodes /
+    /// way_postcodes / interp_postcodes: u32 per record, NO_DATA = absent).
+    fn sidecar_u32(f: &FileBytes, idx: u64) -> Option<u32> {
+        let off = idx * 4;
+        if off + 4 > f.len() {
+            return None;
+        }
+        let bytes = f.read_chunk(off, 4);
+        let v = u32::from_le_bytes(bytes[..].try_into().unwrap());
+        if v == NO_DATA { None } else { Some(v) }
+    }
+
+    pub fn resolve_postcode(&self, lat: f64, lng: f64, street: Option<(usize, &WayHeader)>, addr: Option<(usize, &AddrPoint)>, poi: Option<&PoiRecord>, interp: Option<(usize, f64, &str)>, country_code: Option<[u8; 2]>) -> Option<&str> {
         // 0. Nearest addr_point's own postcode (from addr_postcodes.bin)
         // Matches Nominatim's token_get_postcode — the feature's own
         // addr:postcode tag is the highest-priority source.
         if let (Some(apc), Some((addr_id, _))) = (self.addr_postcodes.as_ref(), addr) {
-            let off = (addr_id as u64) * 4;
-            if off + 4 <= apc.len() {
-                let bytes = apc.read_chunk(off, 4);
-                let pid = u32::from_le_bytes(bytes[..].try_into().unwrap());
-                if pid != NO_DATA {
-                    return Some(self.get_string(pid));
-                }
+            if let Some(pid) = Self::sidecar_u32(apc, addr_id as u64) {
+                return Some(self.get_string(pid));
             }
         }
 
         // 1. way_postcodes[street.way_id] — street's computed postcode
         if let (Some(wpc), Some((way_id, _))) = (self.way_postcodes.as_ref(), street) {
-            let off = (way_id as u64) * 4;
-            if off + 4 <= wpc.len() {
-                let bytes = wpc.read_chunk(off, 4);
-                let pid = u32::from_le_bytes(bytes[..].try_into().unwrap());
-                if pid != NO_DATA {
-                    return Some(self.get_string(pid));
-                }
+            if let Some(pid) = Self::sidecar_u32(wpc, way_id as u64) {
+                return Some(self.get_string(pid));
             }
         }
 
@@ -2935,6 +2980,38 @@ impl Index {
         if let Some(p) = poi {
             if p.parent_postcode_id != NO_DATA {
                 return Some(self.get_string(p.parent_postcode_id));
+            }
+        }
+
+        // 1c. TIGER per-segment ZIP (interp_postcodes.bin): when the primary
+        // is a road-ish feature (street passed in) and an interpolation
+        // segment lies within ~100m of the query, use that segment's ZIP.
+        // Mirrors Nominatim's _find_tiger_number_for_street, which returns
+        // the location_property_tiger row (postcode included) for queries
+        // within 0.001 deg of a TIGER segment parented to the winning
+        // street. Ranked below way_postcodes: where an OSM postal boundary
+        // exists it is authoritative (and agrees with TIGER); this tier
+        // exists for rural US, where no postal boundary is mapped and the
+        // nearest-centroid fallback often misses or crosses ZIP borders.
+        if let (Some(ipc), Some((iw_idx, interp_dist, seg_street))) = (self.interp_postcodes.as_ref(), interp) {
+            // Nominatim joins location_property_tiger on parent_place_id =
+            // the winning street; our segments carry the TIGER street NAME,
+            // so require a token overlap between the segment's street and
+            // the winning way's name (the same normalised-token test the
+            // builder uses to parent addr points, mirroring Nominatim's
+            // token_matches_street). An unnamed winner can't be a TIGER
+            // parent — skip.
+            if let Some((_, way)) = street {
+                if way.name_id != NO_DATA {
+                    let refine = 100.0_f64 / 6_371_000.0;
+                    if interp_dist <= refine * refine
+                        && street_tokens_overlap(seg_street, self.get_string(way.name_id))
+                    {
+                        if let Some(pid) = Self::sidecar_u32(ipc, iw_idx as u64) {
+                            return Some(self.get_string(pid));
+                        }
+                    }
+                }
             }
         }
 
@@ -3349,7 +3426,7 @@ impl Index {
                 }
             } else if interp_dist <= addr_dist && interp_dist <= street_dist && interp_dist <= effective_poi_dist {
                 // Interpolation segment is closest.
-                let (_, street_name, number) = interp.unwrap();
+                let (_, street_name, number, _) = interp.unwrap();
                 house_number = Some(Cow::Owned(number.to_string()));
                 road = Some(street_name);
             } else {
@@ -3394,6 +3471,13 @@ impl Index {
             if poi_won_primary { None } else { street.as_ref().map(|(_, w, idx)| (*idx as usize, w)) },
             if addr_won_primary { addr.as_ref().map(|(_, a, id)| (*id as usize, a)) } else { None },
             if poi_won_primary { poi_primary.as_ref().map(|(_, p)| p) } else { None },
+            // TIGER tier: only when the street itself won the primary.
+            // Nominatim consults location_property_tiger only after the
+            // street wins and no rank-30 housenumber row was found; a POI
+            // or addr-point win routes the postcode through that feature.
+            if poi_won_primary || addr_won_primary { None } else {
+                interp.as_ref().map(|(d, s, _, idx)| (*idx as usize, *d, *s))
+            },
             admin.country_code,
         );
 
@@ -3689,6 +3773,20 @@ impl MultiIndex {
 #[cfg(test)]
 mod multi_index_tests {
     use super::*;
+
+    #[test]
+    fn street_tokens_overlap_matches_tiger_names() {
+        // TIGER abbreviated vs OSM full name: shared significant token.
+        assert!(street_tokens_overlap("W 1st St", "West 1st Street"));
+        assert!(street_tokens_overlap("Boyt Road", "Boyt Road"));
+        assert!(street_tokens_overlap("RICE ROAD", "Rice Rd"));
+        // Different streets: no shared token of >= 2 chars.
+        assert!(!street_tokens_overlap("Main Street", "Oak Avenue"));
+        // Unnamed / empty never matches.
+        assert!(!street_tokens_overlap("", "Main Street"));
+        // Punctuation-only separators normalise away.
+        assert!(street_tokens_overlap("St. Mary's Road", "Saint Marys Road"));
+    }
 
     fn b(name: &str) -> ContinentBBox {
         *CONTINENTS.iter().find(|c| c.name == name).unwrap()

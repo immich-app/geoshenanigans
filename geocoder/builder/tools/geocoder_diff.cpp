@@ -2344,8 +2344,15 @@ int main(int argc, char* argv[]) {
         if (try_emit_copy_old(patch, static_cast<uint32_t>(fid), old_path, new_path,
                               old_size, new_size, fname))
             return;
-        if (new_size > 0 && new_size % value_stride != 0) {
-            // Stride mismatch — fall back to full_replace to avoid corruption.
+        if (new_size > 0 && (new_size % value_stride != 0 || old_size == 0)) {
+            // Stride mismatch OR introduction day (no old file): fall back to
+            // full_replace. A sparse delta against an absent old file would
+            // encode EVERY position as an 8-byte (pos,value) pair — 2x the
+            // raw file — where a raw replacement compresses far better.
+            if (old_size == 0)
+                std::cerr << "  " << fname << ": no old file, using full replace ("
+                          << new_size << " bytes)" << std::endl;
+            else
             std::cerr << "  " << fname << ": stride mismatch (size " << new_size
                       << " not divisible by " << value_stride << "), using full replace" << std::endl;
             uint32_t fid_u = (uint32_t)fid;
@@ -2499,6 +2506,7 @@ int main(int argc, char* argv[]) {
     emit_sparse_delta(PatchFileId::ADMIN_PARENTS,        "admin_parents.bin",   4,  1);
     emit_sparse_delta(PatchFileId::WAY_PARENTS,          "way_parents.bin",     4,  1);
     emit_sparse_delta(PatchFileId::WAY_POSTCODES,        "way_postcodes.bin",   4,  2);
+    emit_sparse_delta(PatchFileId::INTERP_POSTCODES,     "interp_postcodes.bin", 4, 2);
     emit_sparse_delta(PatchFileId::POSTCODE_CENTROIDS,   "postcode_centroids.bin", 16, 3);
     emit_raw(PatchFileId::POSTCODE_CENTROID_CELLS, "postcode_centroid_cells.bin");
     emit_raw(PatchFileId::POSTCODE_CENTROID_ENTRIES, "postcode_centroid_entries.bin");

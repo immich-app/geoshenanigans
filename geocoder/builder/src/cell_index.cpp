@@ -682,14 +682,20 @@ static void apply_strategy2_interps(ParsedData& data, const std::string& prev_di
     tomb_iw.street_id = NO_DATA;
     std::vector<InterpWay> new_iw(n_new, tomb_iw);
     std::vector<uint64_t>  new_osm_ids(n_new, 0);
+    // Strict parallel-array gate, matching reorder_deterministically: a
+    // desynced sidecar is skipped whole rather than partially copied.
+    const bool have_pc = (data.interp_postcode_ids.size() == n_old);
+    std::vector<uint32_t>  new_pc_ids(have_pc ? n_new : 0, NO_DATA);
 
     for (size_t i = 0; i < n_old; i++) {
         uint32_t k = remap[i];
         new_iw[k]      = data.interp_ways[i];
         new_osm_ids[k] = data.interp_osm_ids[i];
+        if (have_pc) new_pc_ids[k] = data.interp_postcode_ids[i];
     }
     data.interp_ways    = std::move(new_iw);
     data.interp_osm_ids = std::move(new_osm_ids);
+    if (!new_pc_ids.empty()) data.interp_postcode_ids = std::move(new_pc_ids);
 
     // Rebuild interp_nodes in interp_way order with sequential offsets —
     // same reason as the street_nodes rebuild above. The patch tool
@@ -1080,6 +1086,13 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                 emit_strategy2_sidecar(output_dir + "/interp_ways.osm_ids",
                                         data.interp_sidecar_blob, data.interp_osm_ids);
             }));
+            if (!data.interp_postcode_ids.empty()) {
+                write_futures.push_back(std::async(std::launch::async, [&] {
+                    write_binary_file(output_dir + "/interp_postcodes.bin",
+                                      reinterpret_cast<const char*>(data.interp_postcode_ids.data()),
+                                      data.interp_postcode_ids.size() * sizeof(uint32_t));
+                }));
+            }
             write_futures.push_back(std::async(std::launch::async, [&] {
                 write_binary_file(output_dir + "/interp_nodes.bin",
                                   reinterpret_cast<const char*>(data.interp_nodes.data()),

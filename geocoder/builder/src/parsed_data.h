@@ -172,6 +172,11 @@ struct ParsedData {
     std::vector<InterpWay> interp_ways;
     // Parallel to interp_ways: packed (OSM_WAY, osm_way_id).
     std::vector<uint64_t> interp_osm_ids;
+    // Parallel to interp_ways: postcode string offset for TIGER-sourced
+    // segments (the CSV's per-segment ZIP), NO_DATA for OSM interpolations.
+    // Empty when the build has no TIGER data — interp_postcodes.bin is then
+    // not written. Mirrors Nominatim's location_property_tiger.postcode.
+    std::vector<uint32_t> interp_postcode_ids;
     std::vector<NodeCoord> interp_nodes;
     std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_interps;
     std::vector<AdminPolygon> admin_polygons;
@@ -309,6 +314,7 @@ inline void partition_strings_into_tiers(ParsedData& data) {
     for (const auto& a : data.addr_points) mark(a.housenumber_id, STR_TIER_BIT_ADDR);
 
     for (uint32_t pc : data.way_postcode_ids)  mark(pc, STR_TIER_BIT_POSTCODE);
+    for (uint32_t pc : data.interp_postcode_ids) mark(pc, STR_TIER_BIT_POSTCODE);
     for (uint32_t pc : data.addr_postcode_ids) mark(pc, STR_TIER_BIT_POSTCODE);
     for (const auto& [pc_id, _acc] : data.postcode_accum) mark(pc_id, STR_TIER_BIT_POSTCODE);
     for (const auto& pr : data.poi_records)    mark(pr.parent_postcode_id, STR_TIER_BIT_POSTCODE);
@@ -398,6 +404,7 @@ inline void partition_strings_into_tiers(ParsedData& data) {
     };
     remap_pc_vec(data.way_postcode_ids);
     remap_pc_vec(data.addr_postcode_ids);
+    remap_pc_vec(data.interp_postcode_ids);
     {
         std::unordered_map<uint32_t, ParsedData::PostcodeAccum> remapped;
         remapped.reserve(data.postcode_accum.size());

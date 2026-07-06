@@ -159,6 +159,11 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
     uint64_t total_rows = 0;
     uint64_t loaded_rows = 0;
 
+    // Per-segment ZIP sidecar: cover every already-parsed OSM interpolation
+    // with NO_DATA, then record each TIGER row's postcode below. Stays empty
+    // (and interp_postcodes.bin unwritten) when no TIGER data is loaded.
+    data.interp_postcode_ids.resize(data.interp_ways.size(), NO_DATA);
+
     for (const auto& csv_file : csv_files) {
         std::ifstream f(csv_file);
         if (!f) continue;
@@ -275,8 +280,13 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
             // Nominatim imports TIGER the same way and postcodes feed
             // into location_postcode.
             const std::string& postcode = fields[6];
+            // Keep the per-segment ZIP association (Nominatim's
+            // location_property_tiger.postcode): reverse lookups use the
+            // winning street's nearby TIGER segment as the postcode source.
+            uint32_t row_pc_id = NO_DATA;
             if (!postcode.empty() && is_valid_postcode(postcode.c_str())) {
                 uint32_t pc_id = data.string_pool.intern(postcode);
+                row_pc_id = pc_id;
                 // Use the midpoint of the interpolation segment as the
                 // postcode location (centroid of the segment).
                 double mid_lat = 0, mid_lng = 0;
@@ -287,10 +297,18 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
                 acc.sum_lng += mid_lng;
                 acc.count++;
             }
+            data.interp_postcode_ids.push_back(row_pc_id);
 
             loaded_rows++;
         }
     }
+
+    // Sidecar exists iff it carries at least one real ZIP: an empty/ZIP-less
+    // TIGER path must not materialize an all-NO_DATA planet-sized file (nor a
+    // pointless patch section every day after).
+    bool any_zip = false;
+    for (uint32_t pc : data.interp_postcode_ids) if (pc != NO_DATA) { any_zip = true; break; }
+    if (!any_zip) data.interp_postcode_ids.clear();
 
     std::cerr << "  TIGER: loaded " << loaded_rows << "/" << total_rows << " address ranges from "
               << csv_files.size() << " files" << std::endl;
@@ -3116,6 +3134,9 @@ static void reorder_deterministically(ParsedData& data, std::vector<float>& poi_
             const bool have_interp_osm = (data.interp_osm_ids.size() == n);
             std::vector<uint64_t> new_osm;
             if (have_interp_osm) new_osm.reserve(n);
+            const bool have_interp_pc = (data.interp_postcode_ids.size() == n);
+            std::vector<uint32_t> new_pc;
+            if (have_interp_pc) new_pc.reserve(n);
             for (uint32_t i = 0; i < n; i++) {
                 uint32_t oi = order[i];
                 const InterpWay& cur = data.interp_ways[oi];
@@ -3145,11 +3166,13 @@ static void reorder_deterministically(ParsedData& data, std::vector<float>& poi_
                     for (uint8_t j = 0; j < iw.node_count; j++)
                         new_nodes.push_back(data.interp_nodes[old_off + j]);
                     if (have_interp_osm) new_osm.push_back(data.interp_osm_ids[oi]);
+                    if (have_interp_pc) new_pc.push_back(data.interp_postcode_ids[oi]);
                     new_interps.push_back(iw);
                 }
             }
             size_t interp_deduped = n - new_interps.size();
             if (have_interp_osm) data.interp_osm_ids = std::move(new_osm);
+            if (have_interp_pc) data.interp_postcode_ids = std::move(new_pc);
             data.interp_ways = std::move(new_interps);
             data.interp_nodes = std::move(new_nodes);
             for (auto& p : data.sorted_interp_cells) p.item_id = old_to_new[p.item_id];

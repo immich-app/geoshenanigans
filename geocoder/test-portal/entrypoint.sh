@@ -88,7 +88,7 @@ else
         full_files="geo_cells.bin
                     street_entries.bin street_ways.bin street_nodes.bin
                     addr_entries.bin addr_points.bin addr_vertices.bin addr_postcodes.bin
-                    interp_entries.bin interp_ways.bin interp_nodes.bin
+                    interp_entries.bin interp_ways.bin interp_nodes.bin interp_postcodes.bin
                     admin_cells.bin admin_entries.bin admin_parents.bin
                     place_cells.bin place_entries.bin place_nodes.bin
                     postcode_centroids.bin postcode_centroid_cells.bin postcode_centroid_entries.bin

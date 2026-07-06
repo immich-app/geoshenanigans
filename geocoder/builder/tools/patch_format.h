@@ -315,7 +315,13 @@ inline std::vector<PatchPoiRecord> read_poi_records(const std::string& path) {
 static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // Custom merge-sequence patch format. Emitted by geocoder-diff, checked by
 // geocoder-patch. Value 2 (the legacy value 1 was the old zlib-section format).
-static constexpr uint32_t GCPATCH_VERSION = 2;
+// v3: adds INTERP_POSTCODES (fid 36). Version-gated so pre-v3 appliers
+// reject the whole patch upfront ("Bad version") instead of dying mid-apply
+// on an unknown section id with a partially-written output dir.
+static constexpr uint32_t GCPATCH_VERSION = 3;
+// Oldest patch version this tool set can still apply (v2 patches contain
+// only fids <= 35, which v3 tools fully understand).
+static constexpr uint32_t GCPATCH_MIN_READ_VERSION = 2;
 
 enum class PatchFileId : uint32_t {
     STRINGS = 0,
@@ -366,7 +372,10 @@ enum class PatchFileId : uint32_t {
     STRINGS_ADDR = 33,
     STRINGS_POSTCODE = 34,
     STRINGS_POI = 35,
-    COUNT = 36
+    // Per-segment TIGER ZIP sidecar (u32 string offset per interp way,
+    // NO_DATA for OSM interpolations; absent on builds without TIGER).
+    INTERP_POSTCODES = 36,
+    COUNT = 37
 };
 
 static const char* patch_file_names[] = {
@@ -381,7 +390,8 @@ static const char* patch_file_names[] = {
     "postal_polygons.bin", "postal_vertices.bin",
     "addr_vertices.bin",
     "strings_core.bin", "strings_street.bin", "strings_addr.bin",
-    "strings_postcode.bin", "strings_poi.bin"
+    "strings_postcode.bin", "strings_poi.bin",
+    "interp_postcodes.bin"
 };
 
 // Encoding types for each section

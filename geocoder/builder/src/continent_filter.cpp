@@ -370,6 +370,18 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
             out.way_postcode_ids[new_wid] = full.way_postcode_ids[old_wid];
         }
     }
+    if (!full.interp_postcode_ids.empty()) {
+        out.interp_postcode_ids.assign(out.interp_ways.size(), NO_DATA);
+        bool any_zip = false;
+        for (const auto& [old_iid, new_iid] : interp_remap) {
+            if (old_iid >= full.interp_postcode_ids.size()) continue;
+            out.interp_postcode_ids[new_iid] = full.interp_postcode_ids[old_iid];
+            if (out.interp_postcode_ids[new_iid] != NO_DATA) any_zip = true;
+        }
+        // Continents outside TIGER coverage would otherwise ship (and patch,
+        // forever) a pure-NO_DATA file that can never produce a postcode.
+        if (!any_zip) out.interp_postcode_ids.clear();
+    }
     if (!full.addr_postcode_ids.empty()) {
         out.addr_postcode_ids.assign(out.addr_points.size(), NO_DATA);
         for (const auto& [old_aid, new_aid] : addr_remap) {
@@ -457,6 +469,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     for (const auto& pn : out.place_nodes) add_used(pn.name_id);
     for (const auto& pr : out.poi_records) { add_used(pr.name_id); add_used(pr.parent_street_id); add_used(pr.parent_postcode_id); }
     for (uint32_t off : out.way_postcode_ids) add_used(off);
+    for (uint32_t off : out.interp_postcode_ids) add_used(off);
     for (uint32_t off : out.addr_postcode_ids) add_used(off);
     for (const auto& [pc_id, _acc] : out.postcode_accum) add_used(pc_id);
 
@@ -493,6 +506,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         pr.parent_postcode_id = remap_or_sentinel(pr.parent_postcode_id);
     }
     for (auto& off : out.way_postcode_ids) off = remap_or_sentinel(off);
+    for (auto& off : out.interp_postcode_ids) off = remap_or_sentinel(off);
     for (auto& off : out.addr_postcode_ids) off = remap_or_sentinel(off);
 
     // Rebuild postcode_accum with remapped keys (drop entries whose string didn't survive)
