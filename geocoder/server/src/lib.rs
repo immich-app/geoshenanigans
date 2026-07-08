@@ -1621,7 +1621,7 @@ impl Index {
     pub fn debug_places(&self, lat: f64, lng: f64) -> serde_json::Value {
         let current_boundary = self.find_current_boundary(lat, lng);
         let municipality_boundary = self.find_municipality_boundary(lat, lng);
-        let place = self.find_places(lat, lng, current_boundary.as_ref(), municipality_boundary.as_ref());
+        let place = self.find_places(lat, lng, current_boundary.as_ref(), municipality_boundary.as_ref(), false);
 
         let place_cells = match &self.place_cells {
             Some(c) => c,
@@ -1700,6 +1700,15 @@ impl Index {
                 let Some(poly) = self.admin_polygon(poly_id) else { return; };
                 let level = poly.admin_level as usize;
                 if level >= 12 { return; }
+                // Level-2 candidates without an ISO code can never name a
+                // country. Mirrors Nominatim, where the response's country
+                // comes from the country_code -> country-names table, so a
+                // stray admin_level=2 polygon (e.g. Taiwan's 12-nautical-
+                // mile "maritime boundary" closed way, boundary=
+                // administrative + maritime=yes but no ISO tag) is invisible
+                // to addressing. Ours tied with the real country polygon on
+                // area and could win by entry order.
+                if level == 2 && poly.country_code == 0 { return; }
                 if poly.area <= 0.0 { return; }
 
                 let Some(verts) = self.admin_verts(&poly) else { return; };
@@ -1775,6 +1784,9 @@ impl Index {
                 let Some(poly) = self.admin_polygon(poly_id) else { return; };
                 let level = poly.admin_level as usize;
                 if level >= 12 { return; }
+                // See debug_admin: ISO-less level-2 polygons (maritime
+                // boundary closed ways) can never name a country.
+                if level == 2 && poly.country_code == 0 { return; }
                 if poly.area <= 0.0 { return; }
 
                 let Some(verts) = self.admin_verts(&poly) else { return; };
@@ -2222,7 +2234,7 @@ impl Index {
         best
     }
 
-    pub fn find_places(&self, lat: f64, lng: f64, current_boundary: Option<&AdminPolygon>, municipality_boundary: Option<&AdminPolygon>) -> PlaceResult<'_> {
+    pub fn find_places(&self, lat: f64, lng: f64, current_boundary: Option<&AdminPolygon>, municipality_boundary: Option<&AdminPolygon>, chain_has_rank16: bool) -> PlaceResult<'_> {
         let place_cells = match &self.place_cells {
             Some(c) => c,
             None => return PlaceResult::default(),
@@ -2360,22 +2372,31 @@ impl Index {
             }
         };
 
-        for pt in [0, 1, 2] {
-            if let Some((dist_sq, pn)) = best[pt] {
-                let threshold = match pt {
-                    0 => max_city,    // city: 0.16 deg
-                    1 => max_town,    // town: 0.08 deg
-                    _ => max_village, // village: 0.04 deg
-                };
-                if dist_sq <= threshold && node_inside_municipality(&pn) {
-                    let name = self.get_string(pn.name_id);
-                    match pt {
-                        0 => result.city = Some(name),
-                        1 => result.town = Some(name),
-                        _ => result.village = Some(name),
+        // Nominatim's address_havelevel: one entry per rank_address. When
+        // the admin chain already produced a rank-16 entry (a boundary
+        // labelled city/town/village, e.g. a linked place boundary), place
+        // nodes at rank 16 are not considered — without this, hiding a
+        // linked city node let the town slot latch onto a *different*
+        // far-away town (Nelson NZ picked Richmond across the bay), and
+        // the fuzzy-area cascade then rejected the correct suburb/quarter.
+        if !chain_has_rank16 {
+            for pt in [0, 1, 2] {
+                if let Some((dist_sq, pn)) = best[pt] {
+                    let threshold = match pt {
+                        0 => max_city,    // city: 0.16 deg
+                        1 => max_town,    // town: 0.08 deg
+                        _ => max_village, // village: 0.04 deg
+                    };
+                    if dist_sq <= threshold && node_inside_municipality(&pn) {
+                        let name = self.get_string(pn.name_id);
+                        match pt {
+                            0 => result.city = Some(name),
+                            1 => result.town = Some(name),
+                            _ => result.village = Some(name),
+                        }
+                        fuzzy_centre = Some((pn.lat as f64, pn.lng as f64, fuzzy_half_side_m(pt as u8)));
+                        break;
                     }
-                    fuzzy_centre = Some((pn.lat as f64, pn.lng as f64, fuzzy_half_side_m(pt as u8)));
-                    break;
                 }
             }
         }
@@ -2850,6 +2871,9 @@ impl Index {
         for &pid in &chain_ids {
             let Some(poly) = self.admin_polygon(pid) else { continue; };
             if poly.admin_level == 11 { continue; } // postal
+            // ISO-less level-2 polygons (maritime boundary closed ways)
+            // can never name a country — see find_admin.
+            if poly.admin_level == 2 && poly.country_code == 0 { continue; }
             let initial_rank = self.admin_config.to_rank(&country_code_str, poly.admin_level);
             if initial_rank == 0 && poly.place_type_override == 0 { continue; }
             ranked.push(RankedPoly2 {
@@ -3254,10 +3278,15 @@ impl Index {
         // sit inside to be accepted in the address walk.
         let current_boundary = self.find_current_boundary(lat, lng);
         let municipality_boundary = self.find_municipality_boundary(lat, lng);
-        let place = self.find_places(lat, lng, current_boundary.as_ref(), municipality_boundary.as_ref());
         let (addr, interp, street) = self.query_geo(lat, lng);
 
         let admin = self.resolve_admin(lat, lng, street.as_ref());
+        // address_havelevel rank 16: boundary-derived city/town/village
+        // already covers the slot, so place-node fallback must not fill
+        // (or fuzzy-anchor on) a competing rank-16 candidate.
+        let chain_has_rank16 =
+            admin.city.is_some() || admin.town.is_some() || admin.village.is_some();
+        let place = self.find_places(lat, lng, current_boundary.as_ref(), municipality_boundary.as_ref(), chain_has_rank16);
 
         // Primary-feature selection: match Nominatim's reverse flow —
         // pick the closest rank-26+ feature (road OR addressable POI),
@@ -3632,7 +3661,14 @@ impl Index {
             municipality: admin.municipality,
             state: admin.state,
             province: admin.province,
-            region: admin.region,
+            // Same-name suppression, observed Nominatim behaviour: the
+            // Kingdom of the Netherlands (AL2) and the constituent country
+            // (AL3) are both named "Nederland"; Nominatim's addressline
+            // drops the duplicate, we surfaced it as region=Netherlands.
+            region: match (admin.region, admin.country) {
+                (Some(r), Some(c)) if r == c => None,
+                (r, _) => r,
+            },
             state_district: admin.state_district,
             county: admin.county,
             district: admin.district,
