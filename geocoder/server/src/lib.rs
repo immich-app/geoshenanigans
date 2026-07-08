@@ -1687,7 +1687,15 @@ impl Index {
 
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
             Self::for_each_entry_fb(&self.admin_entries, Self::lookup_admin_cell_fb(&self.admin_cells, c), |id| {
-                let is_interior = (id & INTERIOR_FLAG) != 0;
+                // The interior flag on a (cell, polygon) entry proves
+                // containment only for queries INSIDE that cell. Neighbor
+                // cells are iterated for near-miss distance work; honoring
+                // their interior flags claimed containment for points up to
+                // a full cell away (a Dutch query 'inside' a German
+                // naturpark). A polygon truly containing the query always
+                // has the query's own cell in its covering, so this loses
+                // no true positives.
+                let is_interior = c == cell && (id & INTERIOR_FLAG) != 0;
                 let poly_id = id & ID_MASK;
                 let Some(poly) = self.admin_polygon(poly_id) else { return; };
                 let level = poly.admin_level as usize;
@@ -1754,7 +1762,15 @@ impl Index {
 
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
             Self::for_each_entry_fb(&self.admin_entries, Self::lookup_admin_cell_fb(&self.admin_cells, c), |id| {
-                let is_interior = (id & INTERIOR_FLAG) != 0;
+                // The interior flag on a (cell, polygon) entry proves
+                // containment only for queries INSIDE that cell. Neighbor
+                // cells are iterated for near-miss distance work; honoring
+                // their interior flags claimed containment for points up to
+                // a full cell away (a Dutch query 'inside' a German
+                // naturpark). A polygon truly containing the query always
+                // has the query's own cell in its covering, so this loses
+                // no true positives.
+                let is_interior = c == cell && (id & INTERIOR_FLAG) != 0;
                 let poly_id = id & ID_MASK;
                 let Some(poly) = self.admin_polygon(poly_id) else { return; };
                 let level = poly.admin_level as usize;
@@ -2488,7 +2504,15 @@ impl Index {
 
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
             Self::for_each_entry_fb(poi_entries, Self::lookup_admin_cell_fb(poi_cells, c), |id| {
-                let is_interior = (id & INTERIOR_FLAG) != 0;
+                // The interior flag on a (cell, polygon) entry proves
+                // containment only for queries INSIDE that cell. Neighbor
+                // cells are iterated for near-miss distance work; honoring
+                // their interior flags claimed containment for points up to
+                // a full cell away (a Dutch query 'inside' a German
+                // naturpark). A polygon truly containing the query always
+                // has the query's own cell in its covering, so this loses
+                // no true positives.
+                let is_interior = c == cell && (id & INTERIOR_FLAG) != 0;
                 let poi_id = (id & ID_MASK) as u32;
                 let Some(poi) = self.poi_record(poi_id) else { return; };
                 // Need a linked parent street (for the `road` field)
@@ -2592,7 +2616,15 @@ impl Index {
 
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
             Self::for_each_entry_fb(poi_entries, Self::lookup_admin_cell_fb(poi_cells, c), |id| {
-                let is_interior = (id & INTERIOR_FLAG) != 0;
+                // The interior flag on a (cell, polygon) entry proves
+                // containment only for queries INSIDE that cell. Neighbor
+                // cells are iterated for near-miss distance work; honoring
+                // their interior flags claimed containment for points up to
+                // a full cell away (a Dutch query 'inside' a German
+                // naturpark). A polygon truly containing the query always
+                // has the query's own cell in its covering, so this loses
+                // no true positives.
+                let is_interior = c == cell && (id & INTERIOR_FLAG) != 0;
                 let poi_id = (id & ID_MASK) as u32;
                 let Some(poi) = self.poi_record(poi_id) else { return; };
                 if poi.name_id == NO_DATA { return; }
