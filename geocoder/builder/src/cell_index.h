@@ -24,6 +24,10 @@ void write_cell_index(
 
 void write_index(const ParsedData& data, const std::string& output_dir, IndexMode mode);
 
+// Country of the point via its admin cell's level-2 entries; border cells
+// (multiple candidate countries) resolve by point-in-polygon. 0 if unknown.
+uint16_t country_code_at_point(const ParsedData& data, double lat, double lng);
+
 // Strategy-2 persistent dense IDs. Loads the previous build's
 // <prev_dir>/full/<file>.osm_ids sidecars (if present), allocates
 // stable indices for each record by osm_id matching, reorders the

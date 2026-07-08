@@ -297,10 +297,7 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
                 double mid_lat = 0, mid_lng = 0;
                 for (const auto& n : nodes) { mid_lat += n.lat; mid_lng += n.lng; }
                 mid_lat /= nodes.size(); mid_lng /= nodes.size();
-                auto& acc = data.postcode_accum[pc_id];
-                acc.sum_lat += mid_lat;
-                acc.sum_lng += mid_lng;
-                acc.count++;
+                data.postcode_accum[pc_id].add(mid_lat, mid_lng);
             }
             data.interp_postcode_ids.push_back(row_pc_id);
 
@@ -461,12 +458,14 @@ static void load_external_postcodes(ParsedData& data, const std::string& path) {
         uint32_t pc_id = data.string_pool.intern(postcode);
         auto it = data.postcode_accum.find(pc_id);
         if (it == data.postcode_accum.end()) {
-            auto& acc = data.postcode_accum[pc_id];
-            acc.sum_lat = lat;
-            acc.sum_lng = lng;
-            acc.count = 1;
+            data.postcode_accum[pc_id].add(lat, lng);
             loaded++;
         }
+        // Remember the CSV's authoritative country for the write path —
+        // GeoNames knows which country a postcode belongs to; deriving it
+        // from the centroid's admin cell mis-assigns border-strip entries.
+        data.postcode_external_cc.emplace(pc_id,
+            static_cast<uint16_t>((std::toupper(cc_str[0]) << 8) | std::toupper(cc_str[1])));
     }
 
     if (tmp_csv != path) std::remove(tmp_csv.c_str());
@@ -4105,10 +4104,8 @@ int main(int argc, char* argv[]) {
                         const auto& pc = local.addr_postcodes[j];
                         if (!pc.empty() && is_valid_postcode(pc.c_str())) {
                             uint32_t pc_id = data.string_pool.intern(pc.c_str());
-                            auto& acc = data.postcode_accum[pc_id];
-                            acc.sum_lat += local.addr_coords[j].first;
-                            acc.sum_lng += local.addr_coords[j].second;
-                            acc.count++;
+                            data.postcode_accum[pc_id].add(local.addr_coords[j].first,
+                                                           local.addr_coords[j].second);
                         }
                     }
                     total_addrs += local.count;
@@ -4720,10 +4717,8 @@ int main(int argc, char* argv[]) {
                         const auto& pc = local.addr_postcodes[i];
                         if (!pc.empty() && is_valid_postcode(pc.c_str())) {
                             uint32_t pc_id = data.string_pool.intern(pc.c_str());
-                            auto& acc = data.postcode_accum[pc_id];
-                            acc.sum_lat += local.building_addrs[i].lat;
-                            acc.sum_lng += local.building_addrs[i].lng;
-                            acc.count++;
+                            data.postcode_accum[pc_id].add(local.building_addrs[i].lat,
+                                                           local.building_addrs[i].lng);
                         }
                     }
 
@@ -5306,10 +5301,7 @@ int main(int argc, char* argv[]) {
                                                    static_cast<uint32_t>(poly_verts.size()));
                                     if (!pr.addr_postcode.empty() && is_valid_postcode(pr.addr_postcode.c_str())) {
                                         uint32_t pc_id = data.string_pool.intern(pr.addr_postcode.c_str());
-                                        auto& acc = data.postcode_accum[pc_id];
-                                        acc.sum_lat += clat;
-                                        acc.sum_lng += clng;
-                                        acc.count++;
+                                        data.postcode_accum[pc_id].add(clat, clng);
                                     }
                                 }
                             }

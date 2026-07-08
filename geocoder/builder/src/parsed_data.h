@@ -36,6 +36,7 @@ inline void ensure_dir(const std::string& path) {
 // --- CPU tick reading (all threads via getrusage) ---
 
 #include <sys/resource.h>
+#include <cmath>
 
 struct CpuTicks {
     long long process_us = 0;  // user+system microseconds (all threads)
@@ -414,6 +415,20 @@ inline void partition_strings_into_tiers(ParsedData& data) {
             if (it != rm.end()) remapped[it->second] = acc;
         }
         data.postcode_accum = std::move(remapped);
+    }
+    {
+        // postcode_external_cc is keyed by the same interned postcode ids;
+        // leaving it un-remapped kept raw pre-partition offsets (which vary
+        // with parse scheduling) — canonical-id lookups then mostly missed
+        // and occasionally false-hit a stale key, yielding a wrong country
+        // that flipped between otherwise-identical builds.
+        std::unordered_map<uint32_t, uint16_t> remapped_ext;
+        remapped_ext.reserve(data.postcode_external_cc.size());
+        for (auto& [old_id, cc] : data.postcode_external_cc) {
+            auto it = rm.find(old_id);
+            if (it != rm.end()) remapped_ext.emplace(it->second, cc);
+        }
+        data.postcode_external_cc = std::move(remapped_ext);
     }
 }
 

@@ -20,6 +20,7 @@
 #include "s2_helpers.h"
 
 #include <s2/s2latlng.h>
+#include <limits>
 
 // Write strings_layout.json — records each tier's [start, end) in the
 // global string-offset space so the server can route a global offset to
@@ -777,25 +778,78 @@ void apply_strategy2_remaps(ParsedData& data, const std::string& prev_dir) {
 
 // Find the level-2 (country) admin polygon covering (lat, lng) and return
 // its country_code, or 0 if none is found. Resolves the point to its
-// kAdminCellLevel S2 cell, walks that cell's admin entries (masking off
-// the INTERIOR_FLAG high bit), and returns the first admin_level==2
-// polygon's non-zero country_code. Extracted verbatim from the two
-// identical lookups in the postcode-centroid write path (one keyed off an
-// addr_point's coords, one off a re-accumulated centroid's coords).
-static uint16_t country_code_at_cell(const ParsedData& data, double lat, double lng) {
+// kAdminCellLevel S2 cell and walks that cell's admin entries. Single-
+// country cells return immediately; border cells (multiple countries in
+// the entry list) resolve by point-in-polygon.
+uint16_t country_code_at_point(const ParsedData& data, double lat, double lng) {
     S2CellId cell = S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(kAdminCellLevel);
     auto it = data.cell_to_admin.find(cell.id());
-    if (it != data.cell_to_admin.end()) {
-        for (uint32_t raw_id : it->second) {
-            uint32_t pid = raw_id & 0x7FFFFFFF;
-            if (pid >= data.admin_polygons.size()) continue;
-            const auto& poly = data.admin_polygons[pid];
-            if (poly.admin_level == 2 && poly.country_code != 0) {
-                return poly.country_code;
+    if (it == data.cell_to_admin.end()) return 0;
+
+    // Selection must be independent of the entry-vector order: the on-disk
+    // cell index is sorted at write time, but the IN-MEMORY cell_to_admin
+    // vectors reflect covering completion order, which is not guaranteed
+    // across runs. "First candidate wins" here made a few hundred
+    // borderline/offshore postcode centroids flip country between
+    // otherwise-identical builds (same-PBF chain patch blew up from 251 B
+    // to 6 MB via strategy-2 identity churn).
+    //
+    // Rules, all order-independent:
+    //  - exactly one distinct candidate country: return it (fast path)
+    //  - several: point-in-polygon; among CONTAINING candidates pick the
+    //    smallest area (most specific claim), ties by lowest country code
+    //  - none containing (offshore aggregates): lowest country code among
+    //    the candidates — arbitrary but deterministic; these are garbage
+    //    multi-country string aggregates that pattern validation mostly
+    //    rejects downstream anyway.
+    uint16_t single_cc = 0;
+    bool multiple = false;
+    for (uint32_t raw_id : it->second) {
+        uint32_t pid = raw_id & ID_MASK;
+        if (pid >= data.admin_polygons.size()) continue;
+        const auto& poly = data.admin_polygons[pid];
+        if (poly.admin_level != 2 || poly.country_code == 0) continue;
+        if (single_cc == 0) {
+            single_cc = poly.country_code;
+        } else if (poly.country_code != single_cc) {
+            multiple = true;
+            break;
+        }
+    }
+    if (single_cc == 0) return 0;
+    if (!multiple) return single_cc;
+
+    float plat = static_cast<float>(lat);
+    float plng = static_cast<float>(lng);
+    float best_area = std::numeric_limits<float>::max();
+    uint16_t best_cc = 0;        // smallest containing polygon's country
+    uint16_t fallback_cc = 0;    // lowest cc among all candidates
+    for (uint32_t raw_id : it->second) {
+        uint32_t pid = raw_id & ID_MASK;
+        if (pid >= data.admin_polygons.size()) continue;
+        const auto& poly = data.admin_polygons[pid];
+        if (poly.admin_level != 2 || poly.country_code == 0) continue;
+        if (fallback_cc == 0 || poly.country_code < fallback_cc)
+            fallback_cc = poly.country_code;
+        uint32_t off = poly.vertex_offset;
+        uint32_t cnt = poly.vertex_count;
+        if (off + cnt > data.admin_vertices.size() || cnt < 3) continue;
+        const auto* verts = &data.admin_vertices[off];
+        bool inside = false;
+        for (uint32_t a = 0, b = cnt - 1; a < cnt; b = a++) {
+            if (((verts[a].lng > plng) != (verts[b].lng > plng)) &&
+                (plat < (verts[b].lat - verts[a].lat) * (plng - verts[a].lng) / (verts[b].lng - verts[a].lng) + verts[a].lat))
+                inside = !inside;
+        }
+        if (inside) {
+            if (poly.area < best_area ||
+                (poly.area == best_area && poly.country_code < best_cc)) {
+                best_area = poly.area;
+                best_cc = poly.country_code;
             }
         }
     }
-    return 0;
+    return best_cc != 0 ? best_cc : fallback_cc;
 }
 
 void write_index(const ParsedData& data, const std::string& output_dir, IndexMode mode) {
@@ -1144,8 +1198,8 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             //
             // Re-accumulate from raw postcode_accum, splitting by the
             // country of each individual addr_point contribution.
-            // Since postcode_accum only stores aggregate (sum_lat,
-            // sum_lng, count), we need to re-scan addr_points.
+            // Since postcode_accum only stores aggregate sums and a
+            // count, we need to re-scan addr_points.
             auto get_str = [&](uint32_t off) -> const char* {
                 return data.get_string(off);
             };
@@ -1171,7 +1225,7 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                 if (pc_id == NO_DATA) continue;
                 const auto& ap = data.addr_points[i];
                 // Look up country for this addr_point
-                uint16_t cc = country_code_at_cell(data, ap.lat, ap.lng);
+                uint16_t cc = country_code_at_point(data, ap.lat, ap.lng);
                 if (cc == 0) continue; // skip if no country found
                 auto& acc = country_accum[{cc, pc_id}];
                 acc.sum_lat += ap.lat;
@@ -1185,14 +1239,22 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             // misses them. Look up country from the centroid location.
             for (const auto& [pc_id, acc] : data.postcode_accum) {
                 if (acc.count == 0) continue;
-                float clat = static_cast<float>(acc.sum_lat / acc.count);
-                float clng = static_cast<float>(acc.sum_lng / acc.count);
-                // Look up country for this centroid
-                uint16_t cc = country_code_at_cell(data, clat, clng);
+                float clat = static_cast<float>(acc.lat());
+                float clng = static_cast<float>(acc.lng());
+                // Country: the GeoNames CSV's own country code is
+                // authoritative when we have it; only OSM/TIGER-derived
+                // entries fall back to the geometric lookup.
+                uint16_t cc = 0;
+                if (auto ext = data.postcode_external_cc.find(pc_id);
+                    ext != data.postcode_external_cc.end()) {
+                    cc = ext->second;
+                } else {
+                    cc = country_code_at_point(data, clat, clng);
+                }
                 if (cc == 0) continue;
                 auto key = CountryPcKey{cc, pc_id};
                 if (country_accum.count(key) > 0) continue; // OSM data takes priority
-                country_accum[key] = {acc.sum_lat, acc.sum_lng, acc.count};
+                country_accum[key] = {acc.lat() * acc.count, acc.lng() * acc.count, acc.count};
             }
 
             // Build centroid vector with validation
