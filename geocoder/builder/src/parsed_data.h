@@ -238,13 +238,42 @@ struct ParsedData {
     std::vector<uint32_t> way_parent_ids;    // way → smallest containing admin poly
     std::vector<uint32_t> admin_parent_ids;  // poly → next-larger containing admin poly
     std::vector<uint32_t> way_postcode_ids;  // way → postcode string from containing postal boundary
+    // pc string id → authoritative country (packed 'XX', uppercase) from the
+    // GeoNames external CSV. The centroid write path uses this instead of the
+    // cell-derived country lookup: border-strip centroids otherwise resolved
+    // to the neighbouring country and were rejected by its postcode pattern
+    // (the entire NL side of the NL/DE border lost its centroids).
+    std::unordered_map<uint32_t, uint16_t> postcode_external_cc;
     std::vector<uint32_t> addr_postcode_ids; // per-addr_point postcode (optional separate file)
 
     // Postcode centroid collector: (postcode_string_id → sum_lat, sum_lng, count)
     // Built during addr_point extraction, converted to PostcodeCentroid[] at write time.
-    struct PostcodeAccum { double sum_lat = 0; double sum_lng = 0; uint64_t count = 0; uint16_t country_code = 0; };
+    // Sums are 1e7-scaled integers, not doubles: contributions arrive from
+    // dynamically-scheduled parse workers, so the merge's addition order
+    // varies run-to-run and double sums wobble in the last ULP — enough to
+    // flip the point-in-polygon country lookup at the aggregate centroid
+    // and make the postcode files nondeterministic across identical builds.
+    // Integer addition is order-independent; 1e-7° ≈ 1 cm matches OSM's
+    // native coordinate precision.
+    struct PostcodeAccum {
+        int64_t sum_lat_e7 = 0; int64_t sum_lng_e7 = 0; uint64_t count = 0; uint16_t country_code = 0;
+        void add(double lat, double lng) {
+            sum_lat_e7 += llround(lat * 1e7);
+            sum_lng_e7 += llround(lng * 1e7);
+            count++;
+        }
+        double lat() const { return (sum_lat_e7 / 1e7) / static_cast<double>(count); }
+        double lng() const { return (sum_lng_e7 / 1e7) / static_cast<double>(count); }
+    };
     std::unordered_map<uint32_t, PostcodeAccum> postcode_accum;
     std::unique_ptr<std::mutex> postcode_mutex = std::make_unique<std::mutex>();
+
+    // Place nodes claimed by label/wikidata boundary links (build-time only,
+    // consumed by link_places_by_name to hide them like Nominatim's
+    // linked_place_id). Raw OSM node ids; filled from parallel relation
+    // workers under the mutex.
+    std::vector<int64_t> linked_place_node_ids;
+    std::unique_ptr<std::mutex> linked_pn_mutex = std::make_unique<std::mutex>();
 
     // boundary=census relations with postal_code tags — build-time only,
     // used for postcode inheritance then discarded. Not written to disk.

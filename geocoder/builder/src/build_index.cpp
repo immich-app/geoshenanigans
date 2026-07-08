@@ -48,6 +48,7 @@ inline uint64_t pack_osm_id(gc::id_alloc::ObjectType type, int64_t osm_id) {
 #include "cache.h"
 #include "continent_filter.h"
 #include "cell_index.h"
+#include "admin_rank_config.h"
 
 
 // --- Place type override classification ---
@@ -1323,6 +1324,31 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
         // Using exact-match avoids spurious token-overlap links like
         // "1st District of Athens" → "Athens" or "Manhattan Community
         // Board 3" → any "Manhattan" place node.
+        // Hide nodes claimed by the label/wikidata link steps (relation
+        // assembly and closed-way admins) before building the name index:
+        // Nominatim's find_linked_place only considers places without a
+        // linked_place_id, so an already-claimed node must neither match
+        // here nor surface in results.
+        if (!data.linked_place_node_ids.empty()) {
+            std::unordered_set<uint64_t> packed;
+            packed.reserve(data.linked_place_node_ids.size());
+            for (int64_t nid : data.linked_place_node_ids) {
+                packed.insert(pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, nid));
+            }
+            size_t hidden = 0;
+            size_t n = std::min(data.place_nodes.size(), data.place_osm_ids.size());
+            for (size_t i = 0; i < n; i++) {
+                if (data.place_nodes[i].name_id == NO_DATA) continue;
+                if (packed.count(data.place_osm_ids[i])) {
+                    data.place_nodes[i].name_id = NO_DATA;
+                    hidden++;
+                }
+            }
+            std::cerr << "find_linked_place label/wikidata: hid " << hidden
+                      << " linked place nodes (" << packed.size()
+                      << " claimed ids)" << std::endl;
+        }
+
         std::unordered_map<std::string, std::vector<uint32_t>> name_to_places;
         name_to_places.reserve(data.place_nodes.size());
         const auto& pool_data = data.string_pool.data();
@@ -1339,16 +1365,20 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
         // PlaceType → rank_search. Matches Nominatim's
         // address_levels.json defaults: place=city 16, town 18,
         // village 19, suburb/hamlet 20, neighbourhood/quarter 22.
-        auto place_rank = [](uint8_t pt) -> uint8_t {
+        // Nominatim rank_address for place nodes (address-levels.json
+        // `place` map, second element): city 16, town [18,16], village
+        // [19,16], borough 18, suburb [19,20], hamlet 20, quarter [20,22],
+        // neighbourhood 24.
+        auto place_addr_rank = [](uint8_t pt) -> uint8_t {
             switch (static_cast<PlaceType>(pt)) {
                 case PlaceType::CITY:          return 16;
-                case PlaceType::TOWN:          return 18;
+                case PlaceType::TOWN:          return 16;
+                case PlaceType::VILLAGE:       return 16;
                 case PlaceType::BOROUGH:       return 18;
-                case PlaceType::VILLAGE:       return 19;
                 case PlaceType::SUBURB:        return 20;
                 case PlaceType::HAMLET:        return 20;
-                case PlaceType::NEIGHBOURHOOD: return 22;
                 case PlaceType::QUARTER:       return 22;
+                case PlaceType::NEIGHBOURHOOD: return 24;
                 default:                        return 255;
             }
         };
@@ -1362,6 +1392,12 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
         std::atomic<uint64_t> linked{0};
         std::atomic<uint64_t> considered{0};
         std::vector<std::thread> nl_workers;
+        // Node indices consumed by a link, per worker. Nominatim sets
+        // linked_place_id on the node when a boundary links it, hiding it
+        // from all results (the boundary represents it). We mirror that by
+        // clearing the node's name after the join below.
+        std::mutex linked_nodes_mutex;
+        std::vector<uint32_t> linked_nodes;
         const double max_dist_deg = 0.5;
         const double max_dist_sq = max_dist_deg * max_dist_deg;
 
@@ -1372,14 +1408,22 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
                     if (i >= data.admin_polygons.size()) break;
                     auto& poly = data.admin_polygons[i];
                     if (poly.place_type_override != 0) continue;
-                    if (poly.admin_level < 8 || poly.admin_level > 11) continue;
+                    // AL11 slots hold boundary=postal_code polygons (their
+                    // "name" is the postcode string) — Nominatim's
+                    // find_linked_place only runs for boundary=administrative,
+                    // so postal boundaries never link (or hide) place nodes.
+                    if (poly.admin_level < 8 || poly.admin_level > 10) continue;
                     if (poly.vertex_count == 0) continue;
                     if (poly.name_id == NO_DATA) continue;
                     const char* bnd_name = pool_data.data() + poly.name_id;
                     if (!bnd_name[0]) continue;
                     considered.fetch_add(1);
 
-                    uint8_t bnd_rank = poly.admin_level * 2;
+                    // Per-country rank_address (NL AL8 = 14, not the
+                    // default 16) — resolved from the boundary's country.
+                    // AL8+ boundaries don't carry country tags, so resolve
+                    // the country from the polygon centroid's admin cell.
+                    uint16_t bnd_cc = poly.country_code;
 
                     double sum_lat = 0.0, sum_lng = 0.0;
                     for (uint32_t v = 0; v < poly.vertex_count; v++) {
@@ -1388,6 +1432,10 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
                     }
                     double clat = sum_lat / poly.vertex_count;
                     double clng = sum_lng / poly.vertex_count;
+
+                    if (bnd_cc == 0) bnd_cc = country_code_at_point(data, clat, clng);
+                    uint8_t bnd_rank = admin_rank_address(bnd_cc, poly.admin_level);
+                    if (bnd_rank == 0) continue;  // not in this country's address chain
 
                     std::string nb = normalise_for_matching(bnd_name);
                     if (nb.empty()) continue;
@@ -1399,10 +1447,16 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
                     if (it != name_to_places.end()) {
                         for (uint32_t pidx : it->second) {
                             const auto& pn = data.place_nodes[pidx];
-                            uint8_t pr = place_rank(pn.place_type);
+                            uint8_t pr = place_addr_rank(pn.place_type);
                             if (pr == 255) continue;
-                            int drank = (int)pr - (int)bnd_rank;
-                            if (drank < -2 || drank > 2) continue;
+                            // Nominatim's name-match branch requires the
+                            // node's address rank to EQUAL the boundary's
+                            // rank_address (find_linked_place in
+                            // placex_triggers.sql). The previous ±2 window
+                            // on rank_search linked NL gemeentes (rank 14)
+                            // to their town nodes (16), relabelling
+                            // municipalities as towns.
+                            if (pr != bnd_rank) continue;
                             double dlat = (double)pn.lat - clat;
                             double dlng = (double)pn.lng - clng;
                             double d2 = dlat * dlat + dlng * dlng;
@@ -1437,6 +1491,8 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
                         if (pto != 0) {
                             poly.place_type_override = pto;
                             linked.fetch_add(1);
+                            std::lock_guard<std::mutex> lk(linked_nodes_mutex);
+                            linked_nodes.push_back(best_idx);
                         }
                     }
                 }
@@ -1444,11 +1500,22 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
         }
         for (auto& w : nl_workers) w.join();
 
+        // Hide linked nodes: clearing the name makes the server's
+        // place_node() accessor return None everywhere (find_places,
+        // containment, fallbacks) — the same observable effect as
+        // Nominatim's linked_place_id. Deterministic regardless of worker
+        // scheduling: the SET of linked nodes is order-independent.
+        std::sort(linked_nodes.begin(), linked_nodes.end());
+        linked_nodes.erase(std::unique(linked_nodes.begin(), linked_nodes.end()), linked_nodes.end());
+        for (uint32_t idx : linked_nodes) {
+            data.place_nodes[idx].name_id = NO_DATA;
+        }
+
         double _nl_elapsed = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - _nl_t).count();
         std::cerr << "find_linked_place step 4 (name match): "
                   << linked.load() << "/" << considered.load()
-                  << " unlinked AL8-11 boundaries linked in "
+                  << " unlinked AL8-10 boundaries linked in "
                   << _nl_elapsed << "s" << std::endl;
         log_phase("find_linked_place step 4", _pt, _cpu);
     }
@@ -3826,6 +3893,9 @@ int main(int argc, char* argv[]) {
             std::cerr << "  Pass 2: processing nodes with " << num_threads << " threads..." << std::endl;
             std::unordered_map<std::string, uint8_t> wikidata_to_place_type;
             std::unordered_map<int64_t, uint8_t> label_node_to_place_type; // node_id → PlaceType
+            // node ids per QID, so wikidata links can hide the matched
+            // place node like Nominatim's linked_place_id does
+            std::unordered_map<std::string, std::vector<int64_t>> wikidata_place_node_ids;
             {
                 struct NodeThreadLocal {
                     std::vector<std::pair<double,double>> addr_coords;
@@ -3845,7 +3915,7 @@ int main(int argc, char* argv[]) {
                     std::vector<PlaceNode> place_nodes;
                     std::vector<int64_t> place_osm_node_ids; // parallel to place_nodes; strategy-2 stable identity
                     std::vector<std::string> place_names;
-                    std::vector<std::pair<std::string, uint8_t>> place_wikidata; // (wikidata_id, PlaceType)
+                    std::vector<std::tuple<std::string, int64_t, uint8_t>> place_wikidata; // (wikidata_id, node_id, PlaceType)
                 };
                 // Use thread_local for streaming callback (no thread index available)
                 static thread_local NodeThreadLocal* tl_node_data = nullptr;
@@ -4075,7 +4145,7 @@ int main(int argc, char* argv[]) {
                             // via label role first, so wikidata
                             // linking only considers non-label nodes.
                             if (n_wikidata && !is_label_member && label_pt != PlaceType::UNKNOWN) {
-                                tl_node_data->place_wikidata.push_back({n_wikidata, static_cast<uint8_t>(label_pt)});
+                                tl_node_data->place_wikidata.push_back({n_wikidata, id, static_cast<uint8_t>(label_pt)});
                             }
                             if (is_label_member) {
                                 tl_node_data->label_hits.push_back({id, static_cast<uint8_t>(label_pt)});
@@ -4158,9 +4228,10 @@ int main(int argc, char* argv[]) {
                 // into way_parents / admin_entries. Keep the smallest PlaceType,
                 // which is order-independent.
                 for (auto& local : ntld) {
-                    for (auto& [wd, pt] : local.place_wikidata) {
+                    for (auto& [wd, nid, pt] : local.place_wikidata) {
                         auto [it, ins] = wikidata_to_place_type.try_emplace(wd, pt);
                         if (!ins && pt < it->second) it->second = pt;
+                        wikidata_place_node_ids[wd].push_back(nid);
                     }
                     local.place_wikidata.clear();
                 }
@@ -4807,7 +4878,15 @@ int main(int argc, char* argv[]) {
                                 auto it = wikidata_to_place_type.find(cwa.wikidata);
                                 if (it != wikidata_to_place_type.end()) {
                                     pto = place_type_to_admin_override(it->second);
-                                    if (pto != 0) cwa_wikidata_linked++;
+                                    if (pto != 0) {
+                                        cwa_wikidata_linked++;
+                                        auto nit = wikidata_place_node_ids.find(cwa.wikidata);
+                                        if (nit != wikidata_place_node_ids.end()) {
+                                            data.linked_place_node_ids.insert(
+                                                data.linked_place_node_ids.end(),
+                                                nit->second.begin(), nit->second.end());
+                                        }
+                                    }
                                 }
                             }
                             if (pto == 0) pto = cwa.fallback_place_type;
@@ -4974,6 +5053,11 @@ int main(int argc, char* argv[]) {
                                         if (it->second != static_cast<uint8_t>(PlaceType::UNKNOWN)) {
                                             pto = place_type_to_admin_override(it->second);
                                             if (pto != 0) wikidata_linked_count.fetch_add(1);
+                                            // The boundary claims this node
+                                            // (Nominatim linked_place_id) —
+                                            // hide it from results.
+                                            std::lock_guard<std::mutex> lk(*data.linked_pn_mutex);
+                                            data.linked_place_node_ids.push_back(rel.label_node_id);
                                         }
                                     }
                                 }
@@ -4981,7 +5065,16 @@ int main(int argc, char* argv[]) {
                                     auto it = wikidata_to_place_type.find(rel_wikidata[i]);
                                     if (it != wikidata_to_place_type.end()) {
                                         pto = place_type_to_admin_override(it->second);
-                                        if (pto != 0) wikidata_linked_count.fetch_add(1);
+                                        if (pto != 0) {
+                                            wikidata_linked_count.fetch_add(1);
+                                            auto nit = wikidata_place_node_ids.find(rel_wikidata[i]);
+                                            if (nit != wikidata_place_node_ids.end()) {
+                                                std::lock_guard<std::mutex> lk(*data.linked_pn_mutex);
+                                                data.linked_place_node_ids.insert(
+                                                    data.linked_place_node_ids.end(),
+                                                    nit->second.begin(), nit->second.end());
+                                            }
+                                        }
                                     }
                                 }
                                 // Fallback: place tag on the boundary itself
