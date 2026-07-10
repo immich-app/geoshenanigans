@@ -30,6 +30,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <deque>
 
 #include "patch_format.h"
 
@@ -137,11 +138,27 @@ static MergeSequence build_merge_seq(
         for (size_t i = 0; i < s; i++) { h ^= (uint8_t)p[i]; h *= 1099511628211ULL; }
         return h;
     };
+    // Zeroed records (tombstone slots) are excluded from the jump index:
+    // every old tombstone hash-matches every still-empty new slot, and a
+    // jump to one re-anchors the cursor at the wrong position — following
+    // records' true counterparts fall behind the forward-only window and
+    // each old tombstone triggers a self-healing DELETE+INSERT episode of
+    // unchanged records (2.9 GB patch on a chained planet pair whose old
+    // side carried 39K tombstones; fresh old sides have none, which hid
+    // this). Dead slots need no anchoring — they replay fine as plain
+    // DELETE/INSERT.
+    auto is_zero_record = [&](const char* p) -> bool {
+        for (size_t i = 0; i < stride; i++) if (p[i] != 0) return false;
+        return true;
+    };
     std::unordered_multimap<uint64_t, uint32_t> new_hash;
     if (use_hash) {
         new_hash.reserve(new_n);
-        for (uint32_t i = 0; i < new_n; i++)
-            new_hash.emplace(record_hash(new_data + i * stride, stride), i);
+        for (uint32_t i = 0; i < new_n; i++) {
+            const char* p = new_data + i * stride;
+            if (!is_zero_record(p))
+                new_hash.emplace(record_hash(p, stride), i);
+        }
     }
 
     while (oi < old_n && ni < new_n) {
@@ -162,7 +179,26 @@ static MergeSequence build_merge_seq(
                     if (it->second < best_ni) best_ni = it->second;
                 }
             }
-            if (best_ni != UINT32_MAX && best_ni > ni) {
+            // Overshoot guard: with duplicate record content the smallest
+            // in-window match can be a LATER duplicate than this record's
+            // true counterpart (e.g. when the counterpart was already
+            // passed). Re-anchoring on it starts a cascade: following
+            // records' true matches fall behind the forward-only window
+            // and drop to DELETE one by one until the cursor self-heals —
+            // tens of millions of unchanged records re-serialized on a
+            // chained planet pair. Only accept a far jump if the NEXT old
+            // record also finds its counterpart shortly after the target
+            // (tolerant to a few interleaved inserts); otherwise emit a
+            // single DELETE, which costs one record instead of an episode.
+            auto next_aligns = [&](uint32_t cand) -> bool {
+                if (oi + 1 >= old_n) return true;
+                const char* onext = old_data + (oi + 1) * stride;
+                size_t lim = std::min((size_t)cand + 1 + 16, new_n);
+                for (size_t j = cand + 1; j < lim; j++)
+                    if (memcmp(onext, new_data + j * stride, stride) == 0) return true;
+                return false;
+            };
+            if (best_ni != UINT32_MAX && best_ni > ni && next_aligns(best_ni)) {
                 flush_match(); flush_del();
                 seq.add_insert(new_data + ni * stride, best_ni - ni, stride);
                 ni = best_ni;
@@ -281,19 +317,21 @@ static void fixup_way_offsets(char* old_ways, size_t old_ways_size,
         return h;
     };
 
-    std::unordered_multimap<uint64_t, uint32_t> new_map;
+    // FIFO per hash: duplicate ways (identical name + geometry, e.g.
+    // stacked OSM ways) must pair in slot order — see fixup_v15_offsets.
+    std::unordered_map<uint64_t, std::deque<uint32_t>> new_map;
     new_map.reserve(new_n);
     for (uint32_t i = 0; i < new_n; i++)
-        new_map.emplace(way_hash(new_ways + i * stride, new_nodes, new_nc), i);
+        new_map[way_hash(new_ways + i * stride, new_nodes, new_nc)].push_back(i);
 
     for (uint32_t i = 0; i < old_n; i++) {
         uint64_t h = way_hash(old_ways + i * stride, old_nodes, old_nc);
         auto it = new_map.find(h);
-        if (it != new_map.end()) {
+        if (it != new_map.end() && !it->second.empty()) {
             uint32_t new_node_off;
-            memcpy(&new_node_off, new_ways + it->second * stride, 4);
+            memcpy(&new_node_off, new_ways + it->second.front() * stride, 4);
             memcpy(old_ways + i * stride, &new_node_off, 4);
-            new_map.erase(it);
+            it->second.pop_front();
         }
     }
 }
@@ -365,8 +403,16 @@ static void fixup_v15_offsets(char* old_polys, size_t old_polys_size,
         return h;
     };
 
-    // Build new index: (record_key, block_hash) → new_idx + new vert_offset.
-    std::unordered_multimap<uint64_t, uint32_t> new_map;
+    // Build new index: (record_key, block_hash) → new record indices in
+    // slot order. Content-identical duplicates (e.g. one building polygon
+    // copied for every unit's addr_point) MUST pair positionally: an
+    // unordered_multimap's find() returns an arbitrary duplicate, which
+    // rewrote old voffs to a DIFFERENT copy's position — the record then
+    // mismatched its true counterpart and whole duplicate groups were
+    // re-serialized (1.27 GB of unchanged addr records in an 11-day
+    // planet diff). Records keep stable slot order across chained
+    // builds, so k-th old ↔ k-th new within a group is the true pairing.
+    std::unordered_map<uint64_t, std::deque<uint32_t>> new_map;
     new_map.reserve(new_n);
     auto compose_key = [&](uint64_t rec_key, uint64_t bhash) -> uint64_t {
         // FNV-mix the two together to make a single hashtable key.
@@ -380,7 +426,7 @@ static void fixup_v15_offsets(char* old_polys, size_t old_polys_size,
         auto bos = block_off_size(true, i);
         uint64_t rec_key = key_fn(rec);
         uint64_t bhash = block_hash(new_verts, new_verts_size, bos.first, bos.second);
-        new_map.emplace(compose_key(rec_key, bhash), i);
+        new_map[compose_key(rec_key, bhash)].push_back(i);
     }
 
     for (uint32_t i = 0; i < old_n; i++) {
@@ -389,11 +435,11 @@ static void fixup_v15_offsets(char* old_polys, size_t old_polys_size,
         uint64_t rec_key = key_fn(rec);
         uint64_t bhash = block_hash(old_verts, old_verts_size, bos.first, bos.second);
         auto it = new_map.find(compose_key(rec_key, bhash));
-        if (it != new_map.end()) {
+        if (it != new_map.end() && !it->second.empty()) {
             uint32_t new_off;
-            memcpy(&new_off, new_polys + it->second * stride + off_field_pos, 4);
+            memcpy(&new_off, new_polys + it->second.front() * stride + off_field_pos, 4);
             memcpy(old_polys + i * stride + off_field_pos, &new_off, 4);
-            new_map.erase(it);
+            it->second.pop_front();
         }
     }
 }
@@ -421,19 +467,21 @@ static void fixup_admin_offsets(char* old_polys, size_t old_polys_size,
         return h;
     };
 
-    std::unordered_multimap<uint64_t, uint32_t> new_map;
+    // FIFO per hash: content-identical duplicates pair in slot order
+    // (see fixup_v15_offsets).
+    std::unordered_map<uint64_t, std::deque<uint32_t>> new_map;
     new_map.reserve(new_n);
     for (uint32_t i = 0; i < new_n; i++)
-        new_map.emplace(poly_hash(new_polys + i * stride, new_verts, new_vc), i);
+        new_map[poly_hash(new_polys + i * stride, new_verts, new_vc)].push_back(i);
 
     for (uint32_t i = 0; i < old_n; i++) {
         uint64_t h = poly_hash(old_polys + i * stride, old_verts, old_vc);
         auto it = new_map.find(h);
-        if (it != new_map.end()) {
+        if (it != new_map.end() && !it->second.empty()) {
             uint32_t new_vert_off;
-            memcpy(&new_vert_off, new_polys + it->second * stride, 4);
+            memcpy(&new_vert_off, new_polys + it->second.front() * stride, 4);
             memcpy(old_polys + i * stride, &new_vert_off, 4);
-            new_map.erase(it);
+            it->second.pop_front();
         }
     }
 }
@@ -471,19 +519,21 @@ static void fixup_poi_offsets(char* old_pois, size_t old_pois_size,
         return h;
     };
 
-    std::unordered_multimap<uint64_t, uint32_t> new_map;
+    // FIFO per hash: content-identical duplicates pair in slot order
+    // (see fixup_v15_offsets).
+    std::unordered_map<uint64_t, std::deque<uint32_t>> new_map;
     new_map.reserve(new_n);
     for (uint32_t i = 0; i < new_n; i++)
-        new_map.emplace(poi_hash(new_pois + i * stride, new_verts, new_vc), i);
+        new_map[poi_hash(new_pois + i * stride, new_verts, new_vc)].push_back(i);
 
     for (uint32_t i = 0; i < old_n; i++) {
         uint64_t h = poi_hash(old_pois + i * stride, old_verts, old_vc);
         auto it = new_map.find(h);
-        if (it != new_map.end()) {
+        if (it != new_map.end() && !it->second.empty()) {
             uint32_t new_vert_off;
-            memcpy(&new_vert_off, new_pois + it->second * stride + 8, 4);
+            memcpy(&new_vert_off, new_pois + it->second.front() * stride + 8, 4);
             memcpy(old_pois + i * stride + 8, &new_vert_off, 4);
-            new_map.erase(it);
+            it->second.pop_front();
         }
     }
 }
@@ -515,17 +565,19 @@ static void fixup_interp_offsets(char* old_data, size_t old_size,
         return h;
     };
 
-    std::unordered_multimap<uint64_t, uint32_t> new_map;
+    // FIFO per hash: content-identical duplicates pair in slot order
+    // (see fixup_v15_offsets).
+    std::unordered_map<uint64_t, std::deque<uint32_t>> new_map;
     new_map.reserve(new_n);
     for (uint32_t i = 0; i < new_n; i++)
-        new_map.emplace(ihash(new_data + i * stride, new_nodes, new_nc), i);
+        new_map[ihash(new_data + i * stride, new_nodes, new_nc)].push_back(i);
     for (uint32_t i = 0; i < old_n; i++) {
         uint64_t h = ihash(old_data + i * stride, old_nodes, old_nc);
         auto it = new_map.find(h);
-        if (it != new_map.end()) {
-            uint32_t new_off; memcpy(&new_off, new_data + it->second * stride, 4);
+        if (it != new_map.end() && !it->second.empty()) {
+            uint32_t new_off; memcpy(&new_off, new_data + it->second.front() * stride, 4);
             memcpy(old_data + i * stride, &new_off, 4);
-            new_map.erase(it);
+            it->second.pop_front();
         }
     }
 }
