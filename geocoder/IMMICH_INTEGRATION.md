@@ -53,140 +53,117 @@ city granularity, and the ~50 MB geodata import lives inside Postgres.
   1/25th the size of full. (Postcode quality is reduced in this mode —
   centroid-only — but Immich does not consume postcodes.)
 
-## 3. Integration architecture (mirrors the ML sidecar)
+## 3. Integration architecture — in-process, no new container
 
-Immich already has the exact pattern to copy — the machine-learning
-service:
+Immich keeps its container count minimal, so the geocoder embeds inside
+`immich-server` itself. Two viable shapes, both with precedent in the
+Immich codebase; A is the recommendation.
 
-- env/config: `server/src/config.ts:291` (`machineLearning.urls`,
-  default `http://immich-machine-learning:3003`, enabled flag)
-- HTTP client with health polling + multi-URL failover:
-  `server/src/repositories/machine-learning.repository.ts` (polls `/ping`
-  every 30 s, tries healthy URLs first, marks failures unhealthy, throws
-  only when all fail)
-- zod DTO drives the admin settings UI:
-  `server/src/dtos/system-config.dto.ts:175`
-- compose service with named cache volume, image healthcheck, no
-  `depends_on` from the server (graceful degradation):
-  `docker/docker-compose.yml:34`
-- remote/optional service documentation pattern:
-  `docs/docs/guides/remote-machine-learning.md`
+### Option A (recommended): napi-rs native module
 
-### Phase 1 — sidecar behind config (no schema changes, zero default-behavior change)
+The query engine (`server/src/lib.rs`) is a dependency-clean Rust
+library — no tokio/axum/http anywhere in the query path (those live only
+in the standalone binary). Wrap it as a native Node addon the same way
+`sharp` wraps libvips (already a direct dependency of immich-server, so
+native prebuilds are an established part of their toolchain):
 
-1. **Compose service** (`docker/docker-compose.yml`):
+- **New crate** `geocoder/node/` in this repo using napi-rs, exposing:
 
-   ```yaml
-   immich-geocoder:
-     container_name: immich_geocoder
-     image: ghcr.io/immich-app/immich-geocoder:${IMMICH_VERSION:-release}
-     environment:
-       - GEOCODER_ALLOW_ANONYMOUS=true
-       - GEOCODER_DATASET=planet-admin     # downloaded on first boot (1.3 GiB)
-       - GEOCODER_WORKER_THREADS=4
-     volumes:
-       - geocoder-data:/data
-     restart: always
-     mem_limit: 128m                       # 64m works; headroom for cache
-     healthcheck:
-       test: ["CMD", "curl", "-fsS", "http://localhost:3000/health"]
-   ```
+  ```ts
+  class Geocoder {
+    static load(dir: string): Geocoder;          // mmaps the index, ~3 MiB RSS
+    reverseGeocode(lat: number, lon: number): AddressResult;  // sub-ms warm
+    close(): void;
+  }
+  downloadDataset(name: string, destDir: string,
+                  onProgress?: (done: number, total: number) => void): Promise<void>;
+  datasetInfo(dir: string): { buildDate: string; mode: string } | null;
+  ```
 
-   No published ports — the server reaches it on the internal network.
+  `reverseGeocode` runs as a napi AsyncTask (libuv worker pool) so cold
+  page faults on slow disks never block the event loop; warm lookups are
+  effectively instant (no HTTP hop, no serialization beyond the result
+  object). `downloadDataset` reuses the streaming (RAM-bounded,
+  sha256-verified) downloader.
 
-2. **SystemConfig extension** (mirror the ML shape, keep back-compat):
+- **Prebuilds**: `linux-x64-gnu` + `linux-arm64-gnu` npm packages from
+  this repo's CI (the immich-server image is Debian-based; same targets
+  sharp ships).
 
-   ```ts
-   reverseGeocoding: {
-     enabled: boolean;          // existing flag, unchanged
-     urls: string[];            // NEW; [] = built-in Postgres geodata path
-     availabilityChecks: { enabled, timeout, interval };  // NEW
-   }
-   ```
+- **Immich changes** (small, all in existing files):
+  - `map.repository.ts::reverseGeocode` calls the native module when a
+    dataset is present; the existing Postgres/GeoNames path stays as the
+    fallback and remains the out-of-the-box behavior.
+  - Field mapping: `city ← city ?? town ?? village ?? hamlet ??
+    municipality`, `state ← state ?? province ?? region`,
+    `country ← country`.
+  - Config: keep `reverseGeocoding.enabled`; add a dataset selection
+    (e.g. `reverseGeocoding.dataset: 'geonames' | 'planet-admin' | ...`)
+    surfaced in the admin UI via the zod DTO pattern
+    (`system-config.dto.ts`).
+  - Dataset lifecycle: on first enable, `downloadDataset` fetches
+    `planet-admin` (1.3 GiB) into a folder next to the existing model
+    cache / upload location; version-keyed like their current
+    `geodata-date.txt` mechanism. Long-term Immich can drop the GeoNames
+    import from the base image entirely (startup Postgres import and
+    ~50 MB of image weight go away).
 
-   Env default: `IMMICH_GEOCODER_URL` → `urls`. Empty `urls` keeps the
-   current behavior exactly, so existing installs are unaffected and the
-   compose addition is opt-in until Immich flips the default.
+- **Memory**: the ~10 MiB anonymous heap and mmap page cache now live
+  inside the immich-server cgroup. Page cache is reclaimable, so the
+  effective added cost under memory pressure is ~10-25 MiB — measured
+  behavior identical to the 32-64 MiB container tests, just without the
+  container.
 
-3. **New `geocoding.repository.ts`** modeled line-for-line on
-   `machine-learning.repository.ts`: health polling against `/health`,
-   ordered failover across `urls`, single method
-   `reverseGeocode(point) → GET /reverse?lat=&lon=`.
+### Option B (fallback): vendored binary child process
 
-4. **Repository switch** in `map.repository.ts::reverseGeocode`: if
-   configured and healthy, call the sidecar and map the response;
-   on any failure fall back to the existing Postgres path (which stays
-   intact — it is the fallback and the default). Field mapping:
+Exactly the `exiftool-vendored` pattern Immich already relies on (an npm
+package shipping a platform binary that the server supervises as a child
+process): ship `query-server` per-platform, spawn it bound to
+`127.0.0.1:<ephemeral>` or a unix socket with
+`GEOCODER_ALLOW_ANONYMOUS=true`, health-check via `/health`, restart on
+exit. Zero binding work — everything (server, downloader, health) is
+reused as-is; the cost is process supervision plus a localhost HTTP hop.
+Worth keeping as the escape hatch if napi prebuilds ever become a
+maintenance burden, or as a very cheap proof-of-concept stage.
 
-   | Immich | Geocoder response (`address`) |
-   |---|---|
-   | `city` | `city ?? town ?? village ?? hamlet ?? municipality` |
-   | `state` | `state ?? province ?? region` |
-   | `country` | `country` |
+### Rollout phases
 
-   The cascade mirrors how Nominatim consumers derive a settlement name;
-   all keys are already Nominatim-parity so behavior is predictable.
-
-5. **Dataset provisioning**: extend `entrypoint.sh` with a
-   `GEOCODER_DATASET=<name>` mode that invokes the built-in manifest
-   downloader (streaming, sha256-verified, resumable per file) into
-   `/data` on first boot, then starts the server. The existing
-   `PBF_URLS`/build mode stays for self-builders.
-
-6. **Backfill**: no new job needed — the existing admin "Extract
-   Metadata" re-run repopulates `asset_exif` through the new path.
-   Optionally a targeted variant that only re-processes assets with GPS
-   coordinates (cheap query on `asset_exif.latitude is not null`).
-
-### Phase 2 — richer metadata (options for later)
-
-Kept out of phase 1 to avoid schema churn; candidates once the sidecar
-is established:
-
-- store the full `display_name` (asset detail panel: street-level "where
-  was this taken"),
-- suburb/neighbourhood columns for finer-grained places browsing,
-- POI landmark attribution from the `poi` tier ("taken at the Louvre"),
-  which also unlocks landmark search terms,
-- postcode column (requires `no-addresses`+ dataset for quality).
-
-Each is additive: larger dataset tier + one nullable column + mapping.
-
-### Phase 3 — distribution & rollout
-
-- **Image**: publish `immich-geocoder` from this repo's CI (Dockerfile
-  already has a HEALTHCHECK; multi-arch build needed — amd64/arm64).
-- **Datasets**: host the prebuilt `planet-admin` (1.3 GiB) + continent
-  subsets behind the existing manifest format. The day-to-day patch
-  pipeline (couple-hundred-MB weekly deltas after the d109013 differ
-  fix) keeps update bandwidth low; the server's `.build_date`-keyed
-  downloader already handles updates.
-- **Docs**: a `docs/docs/guides/reverse-geocoding.md` modeled on
-  `remote-machine-learning.md` (enable in admin settings, remote
-  instance option, dataset size table, memory guidance).
-- **Rollout**: ship default-off (empty `urls`); flip the compose default
-  after a release cycle of soak; the Postgres geodata path remains as
-  fallback indefinitely (it is also what keyless quick-start installs
-  without the sidecar keep using).
+1. **PoC (option B shape, days)**: spawn the existing binary from a
+   NestJS provider behind `reverseGeocoding.urls`-style config, validate
+   end-to-end metadata flow + places search against the `planet-admin`
+   dataset.
+2. **Productize (option A)**: napi crate + prebuild CI + npm publish;
+   swap `map.repository.ts` to the native call; admin-UI dataset picker;
+   download/update job; keep GeoNames fallback.
+3. **Enrichment (later, additive)**: `display_name` for the asset detail
+   panel, suburb/neighbourhood columns for places browsing, POI landmark
+   attribution ("taken at the Louvre") from the `poi` tier, postcode
+   column — each is one nullable column + a bigger dataset tier.
 
 ## 4. Performance / capacity notes
 
-- Measured 4,000 mixed real-coordinate queries in ~1 s through HTTP
-  (8-way parallel) inside a 64 MiB container — far above metadata-job
-  ingest rates; no queueing concerns.
-- Cold-cache worst case (nothing resident, NVMe): 4,000 queries in
-  0.9 s. On spinning disks expect tens of ms per cold query — still
-  fine for background metadata jobs.
-- The sidecar is stateless over a read-only dataset volume; horizontal
-  scaling or remote placement works exactly like remote ML (`urls`
-  array).
+- In-process lookups remove the HTTP hop entirely; the standalone-server
+  measurements (5-15 ms warm under a hard 32 MiB limit, 4,000 mixed
+  queries/s sustained) are an upper bound on cost — warm in-process calls
+  are sub-millisecond.
+- Metadata extraction concurrency in Immich is a handful of jobs; even
+  cold-cache spinning-disk lookups (tens of ms) cannot back up the queue.
+- The library is `Send + Sync` over immutable mmaps — one shared
+  `Geocoder` instance serves all worker calls without locking.
 
 ## 5. Open questions for the Immich team
 
-1. Hosting/bandwidth for dataset downloads (1.3 GiB initial per install;
-   who pays — mirror on their CDN vs ours).
-2. Appetite for phase-2 schema additions (display_name/suburb/postcode).
-3. e2e fixtures: Immich's e2e asserts on geodata results; CI needs a tiny
-   fixture dataset (a small regional extract serves).
-4. Whether `reverseGeocoding.urls` should instead be a new top-level
-   `geocoder` config section (cleaner separation from the legacy flag).
+1. Dataset hosting/bandwidth (1.3 GiB initial download per install;
+   weekly deltas are a couple hundred MB via the patch pipeline — or
+   simple monthly full re-downloads to start).
+2. Where the dataset lives on disk (model-cache volume vs upload
+   location vs dedicated path) and whether download happens in a job vs
+   on-boot.
+3. Appetite for phase-3 schema additions (display_name / suburb /
+   postcode columns).
+4. e2e fixtures: CI needs a tiny regional dataset for deterministic
+   geocoding assertions (a small extract builds in minutes and is a few
+   MB).
+5. napi toolchain: happy to maintain prebuild CI on our side and publish
+   the npm package, or vendor the crate into their monorepo — their
+   call.
