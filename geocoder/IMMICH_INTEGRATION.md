@@ -115,6 +115,28 @@ native prebuilds are an established part of their toolchain):
   behavior identical to the 32-64 MiB container tests, just without the
   container.
 
+#### Validated prototype
+
+`geocoder/node/` in this repo is a working napi-rs binding
+(`Geocoder.load` / `reverseGeocode` async on the libuv pool /
+`reverseGeocodeSync`), measured in Node v18 against the planet
+`admin` dataset with a fully cold page cache:
+
+| Metric | Result |
+|---|---|
+| `Geocoder.load()` | 1.2 ms, +1.5 MB RSS |
+| V8 heap / external | unaffected (index never enters V8-managed memory — no GC pressure, no `--max-old-space-size` interaction) |
+| Warm sync lookup | 0.42 ms |
+| Cold async lookup (worst case) | 0.9 ms avg over 5,000 scattered world coordinates |
+| Event-loop blocking | max 3 ms gap during the cold 5,000-query burst (AsyncTask keeps faults off the main thread) |
+| RSS growth | reclaimable mmap page cache only (~290 MB after the cold burst; bounded by whatever cgroup limit immich-server runs under, reclaimed under pressure — same mechanics validated in the 32/64 MiB container tests) |
+
+Notes: async lookups share the libuv threadpool (default 4 threads,
+`UV_THREADPOOL_SIZE`) with fs/dns/sharp — irrelevant at metadata-job
+rates but worth knowing. RSS shown by `docker stats` for immich-server
+will include the (reclaimable) touched-page cache; documentation should
+mention this is not leaked memory.
+
 ### Option B (fallback): vendored binary child process
 
 Exactly the `exiftool-vendored` pattern Immich already relies on (an npm

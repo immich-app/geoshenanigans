@@ -1,0 +1,18 @@
+[package]
+name = "geocoder-node"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "2", default-features = false, features = ["napi8"] }
+napi-derive = "2"
+query-server = { path = "../server" }
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+lto = true
