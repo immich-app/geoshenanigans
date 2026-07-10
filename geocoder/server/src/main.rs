@@ -121,6 +121,16 @@ async fn reverse_geocode(
     ([(axum::http::header::CONTENT_TYPE, "application/json")], json).into_response()
 }
 
+async fn health(
+    index: axum::extract::Extension<Arc<MultiIndex>>,
+) -> impl IntoResponse {
+    // Liveness + readiness in one: 200 once the index is loaded and
+    // serving. Container orchestrators (Immich compose health checks)
+    // poll this; keep it allocation-light and unauthenticated.
+    let body = format!("{{\"status\":\"ok\",\"regions\":{}}}", index.loaded_count());
+    ([(axum::http::header::CONTENT_TYPE, "application/json")], body)
+}
+
 async fn test_portal() -> impl IntoResponse {
     (
         [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -252,8 +262,29 @@ async fn polygons_geojson(
     ([(axum::http::header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
-#[tokio::main]
-async fn main() {
+// Worker pool sized for a lightweight sidecar: reverse geocoding is
+// short-lived CPU + page-cache work, and a handful of workers saturates
+// it. On big shared hosts the tokio default (one worker per core, 64+
+// threads on servers) is pure overhead for this service. Override with
+// GEOCODER_WORKER_THREADS when needed.
+fn worker_threads() -> usize {
+    std::env::var("GEOCODER_WORKER_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8))
+}
+
+fn main() {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads())
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(async_main());
+}
+
+async fn async_main() {
     let args: Vec<String> = std::env::args().collect();
     let data_dir = args.get(1).map(|s| s.as_str()).unwrap_or(".");
 
@@ -309,6 +340,7 @@ async fn main() {
     }
 
     let app = Router::new()
+        .route("/health", get(health))
         .route("/reverse", get(reverse_geocode))
         .route("/polygons", get(polygons_geojson))
         .route("/test", get(test_portal))

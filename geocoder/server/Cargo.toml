@@ -36,6 +36,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 zstd = "0.13"
 sha2 = "0.10"
 futures-util = "0.3"
+bytes = "1"
 
 # Wasm-only deps for the JS-callback chunked-byte-source backing.
 [target.'cfg(target_arch = "wasm32")'.dependencies]

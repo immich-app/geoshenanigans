@@ -1355,6 +1355,7 @@ dependencies = [
  "axum",
  "axum-server",
  "bcrypt",
+ "bytes",
  "futures-util",
  "getrandom 0.2.17",
  "js-sys",

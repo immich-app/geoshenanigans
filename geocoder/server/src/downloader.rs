@@ -145,20 +145,53 @@ async fn download_file(
     if !resp.status().is_success() {
         return Err(DownloadError::Http(format!("{}: HTTP {}", url, resp.status())));
     }
-    let zst_bytes = resp.bytes().await
-        .map_err(|e| DownloadError::Http(format!("{}: read body: {}", url, e)))?;
+    // Stream: HTTP chunks → zstd streaming decoder → sha256 + tmp file.
+    // The old path buffered the whole compressed body AND the whole
+    // decompressed output in RAM (multi-GiB peaks on planet addr_* files),
+    // which OOMs a memory-constrained deployment. Peak RAM is now a few
+    // network chunks plus the zstd window, regardless of file size.
+    // Decode + hash + write run on a blocking thread fed through a
+    // bounded channel so the async executor never blocks on disk I/O.
+    let tmp = dest.with_extension(format!(
+        "{}.tmp", dest.extension().and_then(|s| s.to_str()).unwrap_or("")
+    ));
 
-    // Decompress in memory. Files top out around 1.5 GiB raw on planet
-    // (full mode addr_*); fine for a server with the configured memory
-    // budget. Streaming decode + hash would let us cap RAM at ~chunk
-    // size, worth doing if multi-GB peaks become a problem.
-    let raw = zstd::decode_all(zst_bytes.as_ref())
-        .map_err(|e| DownloadError::Decompress(format!("{}: {}", path, e)))?;
+    let (tx, rx) = std::sync::mpsc::sync_channel::<bytes::Bytes>(8);
+    let tmp_for_writer = tmp.clone();
+    let path_owned = path.to_string();
+    let writer = tokio::task::spawn_blocking(move || {
+        decode_hash_write(rx, &tmp_for_writer, &path_owned)
+    });
 
-    let mut hasher = Sha256::new();
-    hasher.update(&raw);
-    let got = format!("{:x}", hasher.finalize());
+    let mut stream = resp.bytes_stream();
+    let mut stream_err: Option<DownloadError> = None;
+    use futures_util::StreamExt;
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(b) => {
+                if tx.send(b).is_err() {
+                    break; // writer died — its error surfaces below
+                }
+            }
+            Err(e) => {
+                stream_err = Some(DownloadError::Http(format!("{}: read body: {}", url, e)));
+                break;
+            }
+        }
+    }
+    drop(tx);
+    let writer_result = writer.await
+        .map_err(|e| DownloadError::Io(format!("writer task: {}", e)));
+    let got = match (stream_err, writer_result) {
+        (Some(e), _) | (None, Err(e)) | (None, Ok(Err(e))) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        (None, Ok(Ok(hash))) => hash,
+    };
+
     if got != expected.sha256 {
+        let _ = std::fs::remove_file(&tmp);
         return Err(DownloadError::HashMismatch {
             path: path.to_string(),
             expected: expected.sha256.clone(),
@@ -166,16 +199,51 @@ async fn download_file(
         });
     }
 
-    // Atomic write: tmp file + rename. dest's parent must exist; caller
-    // ensures that.
-    let tmp = dest.with_extension(format!(
-        "{}.tmp", dest.extension().and_then(|s| s.to_str()).unwrap_or("")
-    ));
-    tokio::fs::write(&tmp, &raw).await
-        .map_err(|e| DownloadError::Io(format!("write {}: {}", tmp.display(), e)))?;
     tokio::fs::rename(&tmp, dest).await
         .map_err(|e| DownloadError::Io(format!("rename {}→{}: {}", tmp.display(), dest.display(), e)))?;
     Ok(())
+}
+
+/// Blocking half of the streaming download: consume compressed chunks
+/// from `rx`, zstd-decode them, write the decompressed bytes to `tmp`
+/// and hash them incrementally. Returns the sha256 hex of the
+/// decompressed content. RAM use is bounded by the channel depth plus
+/// the zstd window regardless of file size.
+fn decode_hash_write(
+    rx: std::sync::mpsc::Receiver<bytes::Bytes>,
+    tmp: &Path,
+    label: &str,
+) -> Result<String, DownloadError> {
+    use std::io::Write;
+    struct HashWriter {
+        file: std::io::BufWriter<std::fs::File>,
+        hasher: Sha256,
+    }
+    impl std::io::Write for HashWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.hasher.update(buf);
+            self.file.write_all(buf)?;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.file.flush()
+        }
+    }
+    let file = std::fs::File::create(tmp)
+        .map_err(|e| DownloadError::Io(format!("create {}: {}", tmp.display(), e)))?;
+    let hw = HashWriter { file: std::io::BufWriter::new(file), hasher: Sha256::new() };
+    let mut dec = zstd::stream::write::Decoder::new(hw)
+        .map_err(|e| DownloadError::Decompress(format!("{}: {}", label, e)))?;
+    while let Ok(chunk) = rx.recv() {
+        dec.write_all(&chunk)
+            .map_err(|e| DownloadError::Decompress(format!("{}: {}", label, e)))?;
+    }
+    dec.flush()
+        .map_err(|e| DownloadError::Decompress(format!("{}: {}", label, e)))?;
+    let mut hw = dec.into_inner();
+    hw.flush()
+        .map_err(|e| DownloadError::Io(format!("flush {}: {}", tmp.display(), e)))?;
+    Ok(format!("{:x}", hw.hasher.finalize()))
 }
 
 // --- Region download ---------------------------------------------------------
@@ -280,6 +348,35 @@ pub async fn download_region(
 // the DownloadError Display strings.  No network/filesystem.
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn streaming_decode_hash_roundtrip() {
+        // 3 MiB of patterned data, compressed, fed through the channel in
+        // small chunks — hash and file content must match the original.
+        let raw: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let compressed = zstd::encode_all(&raw[..], 3).unwrap();
+
+        let dir = std::env::temp_dir().join(format!("gc_dl_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join("out.bin.tmp");
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<bytes::Bytes>(8);
+        let feeder = std::thread::spawn(move || {
+            for chunk in compressed.chunks(64 * 1024) {
+                tx.send(bytes::Bytes::copy_from_slice(chunk)).unwrap();
+            }
+        });
+        let got = decode_hash_write(rx, &tmp, "test").unwrap();
+        feeder.join().unwrap();
+
+        let mut hasher = Sha256::new();
+        hasher.update(&raw);
+        assert_eq!(got, format!("{:x}", hasher.finalize()));
+        assert_eq!(std::fs::read(&tmp).unwrap(), raw);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     fn component(files: &[&str], replaces: &[&str], extends: Option<&str>) -> Component {
