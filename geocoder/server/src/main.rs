@@ -33,6 +33,15 @@ fn require_valid_key(
     db: &RwLock<auth::Db>,
     key: Option<&str>,
 ) -> Result<(String, u32, u32, bool), Response> {
+    // Sidecar mode: when the server runs on a private container network
+    // (e.g. as an Immich companion service) there is no key to manage.
+    // GEOCODER_ALLOW_ANONYMOUS=true accepts keyless requests with rate
+    // limiting effectively disabled. Never set this on an internet-facing
+    // deployment.
+    if anonymous_allowed() && key.is_none() {
+        return Ok(("anonymous".to_string(), u32::MAX, u32::MAX, false));
+    }
+
     let key = match key {
         Some(k) => k,
         None => return Err((StatusCode::UNAUTHORIZED, "Missing API key").into_response()),
@@ -42,6 +51,15 @@ fn require_valid_key(
         Some(info) => Ok(info),
         None => Err((StatusCode::UNAUTHORIZED, "Invalid API key").into_response()),
     }
+}
+
+fn anonymous_allowed() -> bool {
+    static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ALLOWED.get_or_init(|| {
+        std::env::var("GEOCODER_ALLOW_ANONYMOUS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
 }
 
 async fn reverse_geocode(
