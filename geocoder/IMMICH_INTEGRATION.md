@@ -1,8 +1,9 @@
 # Immich Integration Plan
 
 Plan for replacing Immich's built-in reverse geocoding with this geocoder,
-run as a companion container. Based on reading the Immich source at the
-paths referenced below (server @ NestJS monorepo layout, 2026-07).
+embedded in-process in `immich-server` (no additional container). Based on
+reading the Immich source at the paths referenced below (server @ NestJS
+monorepo layout, 2026-07).
 
 ## 1. How Immich reverse-geocodes today
 
