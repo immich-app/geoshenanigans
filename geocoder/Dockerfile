@@ -39,5 +39,10 @@ COPY entrypoint.sh /usr/local/bin/
 
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
+# The server binds :3000 and exposes an unauthenticated /health that
+# returns 200 once the index is loaded and serving.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
+    CMD curl -fsS http://localhost:3000/health || exit 1
+
 ENTRYPOINT ["entrypoint.sh"]
 CMD ["auto"]

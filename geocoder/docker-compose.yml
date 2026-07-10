@@ -3,10 +3,23 @@ services:
     image: traccar/traccar-geocoder
     environment:
       - PBF_URLS=https://download.geofabrik.de/europe/monaco-latest.osm.pbf
+      # Tokio worker pool; defaults to min(cores, 8). Lower on very
+      # constrained hosts.
+      - GEOCODER_WORKER_THREADS=4
     ports:
       - "3000:3000"
     volumes:
       - geocoder-data:/data
+    # The server memory-maps the index: its own heap stays under ~10 MiB
+    # and everything else is reclaimable page cache, so a hard limit this
+    # low is safe — the kernel just re-reads cold pages from disk. Raise
+    # the limit on busy instances for better cache hit rates.
+    mem_limit: 64m
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 3s
+      start_period: 15s
 
 volumes:
   geocoder-data:

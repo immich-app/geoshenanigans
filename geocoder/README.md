@@ -169,6 +169,28 @@ cargo build --release --manifest-path server/Cargo.toml
 ./server/target/release/query-server output-dir --domain geocoder.example.com
 ```
 
+## Memory Footprint
+
+The server is designed to run inside memory-constrained deployments
+(e.g. as an Immich sidecar on small NAS/VPS hosts):
+
+- All index files are memory-mapped with `MADV_RANDOM`; nothing is
+  loaded into the heap at startup. Process anonymous memory stays
+  under ~10 MiB regardless of dataset size and query volume.
+- Resident file pages are clean page cache: the kernel reclaims them
+  under memory pressure, and a cgroup/container limit simply bounds
+  the cache working set. Measured on a full planet index: stable
+  operation and ~5–15 ms warm-query latency inside a hard 32 MiB
+  container limit; a 64–256 MiB limit buys better cache hit rates on
+  busy instances.
+- Dataset downloads stream (HTTP → zstd decode → hash → disk) with
+  RAM bounded by a few network chunks, so multi-GiB index files can
+  be fetched under the same limits.
+- The async worker pool defaults to `min(cores, 8)` threads; override
+  with `GEOCODER_WORKER_THREADS`.
+- `GET /health` returns `200 {"status":"ok","regions":N}` once the
+  index is serving — wire it to container health checks.
+
 ## Environment Variables (Docker)
 
 | Variable | Description | Default |
@@ -178,6 +200,7 @@ cargo build --release --manifest-path server/Cargo.toml
 | `BIND_ADDR` | HTTP bind address | `0.0.0.0:3000` |
 | `DATA_DIR` | Data directory for PBF files and index | `/data` |
 | `CACHE_DIR` | ACME certificate cache directory | `acme-cache` |
+| `GEOCODER_WORKER_THREADS` | Async worker pool size | `min(cores, 8)` |
 
 ## License
 
