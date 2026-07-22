@@ -1,0 +1,8 @@
+@import 'tailwindcss';
+@import '@immich/ui/theme/default.css';
+
+@source '../node_modules/@immich/ui/dist/**/*.{html,js,svelte,ts}';
+
+body {
+  @apply bg-light-50 text-dark min-h-screen;
+}

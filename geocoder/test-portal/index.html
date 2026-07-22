@@ -1,0 +1,1213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reverse Geocoder Test Portal</title>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5/dist/maplibre-gl.css" />
+<script src="https://unpkg.com/maplibre-gl@5/dist/maplibre-gl.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/exifr@7/dist/full.umd.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #1a1a2e;
+    --surface: #222240;
+    --surface2: #2a2a4a;
+    --border: #3a3a5c;
+    --text: #e0e0e8;
+    --text-dim: #8888a0;
+    --accent: #6c8cff;
+    --green: #4caf80;
+    --blue: #4a90d9;
+    --red: #d94a4a;
+    --orange: #d9944a;
+  }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  .layout {
+    display: flex;
+    height: 100vh;
+  }
+
+  .map-panel {
+    flex: 0 0 60%;
+    position: relative;
+  }
+
+  .side-panel {
+    flex: 0 0 40%;
+    display: flex;
+    flex-direction: column;
+    border-left: 1px solid var(--border);
+    overflow: hidden;
+  }
+
+  #map { height: 100%; width: 100%; }
+
+  /* MapLibre dark overrides */
+  .maplibregl-ctrl-attrib {
+    background: rgba(26, 26, 46, 0.8) !important;
+    color: var(--text-dim) !important;
+  }
+  .maplibregl-ctrl-attrib a { color: var(--accent) !important; }
+
+  section {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  section h3 {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    margin-bottom: 8px;
+  }
+
+  .coord-row {
+    display: flex;
+    gap: 8px;
+  }
+
+  .coord-row textarea {
+    flex: 1;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    padding: 8px;
+    font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+    font-size: 13px;
+    resize: vertical;
+    min-height: 36px;
+    height: 36px;
+  }
+
+  .coord-row textarea:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+
+  button {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    padding: 8px 16px;
+    font-size: 13px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  button:hover { filter: brightness(1.1); }
+  button:disabled { opacity: 0.5; cursor: default; }
+
+  .drop-zone {
+    border: 2px dashed var(--border);
+    border-radius: 6px;
+    padding: 20px;
+    text-align: center;
+    color: var(--text-dim);
+    font-size: 13px;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .drop-zone.dragover {
+    border-color: var(--accent);
+    background: rgba(108, 140, 255, 0.05);
+  }
+  .drop-zone input { display: none; }
+
+  .photo-list {
+    margin-top: 8px;
+    max-height: 100px;
+    overflow-y: auto;
+    font-size: 12px;
+  }
+  .photo-item {
+    display: flex;
+    justify-content: space-between;
+    padding: 3px 0;
+    color: var(--text-dim);
+  }
+  .photo-item .coords { font-family: monospace; color: var(--text); }
+  .photo-item .no-gps { color: var(--red); }
+
+  .results-section {
+    flex: 1;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .results-section h3 {
+    padding: 12px 16px 8px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+  }
+
+  .results-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 0 8px 8px;
+  }
+
+  .result-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-bottom: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    transition: border-color 0.15s;
+  }
+  .result-card:hover { border-color: var(--accent); }
+  .result-card.selected { border-color: var(--accent); background: var(--surface2); }
+  .result-card.loading { opacity: 0.6; }
+  .result-card.error { border-color: var(--red); }
+
+  .result-coords {
+    font-family: monospace;
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-bottom: 4px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .result-copy {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    border-radius: 3px;
+    padding: 0 5px;
+    font-size: 11px;
+    line-height: 16px;
+    cursor: pointer;
+    margin-left: auto;
+  }
+  .result-copy:hover {
+    background: var(--surface2);
+    color: var(--text);
+  }
+  .result-copy.copied {
+    color: var(--green);
+    border-color: var(--green);
+  }
+
+  .result-name { font-weight: 500; }
+
+  .result-places {
+    margin-top: 4px;
+    font-size: 12px;
+    color: var(--green);
+  }
+
+  .result-error {
+    color: var(--red);
+    font-size: 12px;
+    margin-top: 2px;
+  }
+
+  .result-source {
+    font-size: 10px;
+    color: var(--text-dim);
+    margin-top: 2px;
+  }
+
+  .detail-panel {
+    border-top: 1px solid var(--border);
+    max-height: 40%;
+    overflow-y: auto;
+    padding: 12px 16px;
+    display: none;
+  }
+  .detail-panel.visible { display: block; }
+
+  .detail-panel h3 {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    margin-bottom: 8px;
+  }
+
+  .detail-address {
+    margin-bottom: 10px;
+  }
+  .detail-address .field {
+    display: flex;
+    gap: 8px;
+    font-size: 12px;
+    padding: 2px 0;
+  }
+  .detail-address .label {
+    color: var(--text-dim);
+    min-width: 90px;
+  }
+
+  .detail-places {
+    margin-bottom: 10px;
+  }
+  .detail-places table {
+    width: 100%;
+    font-size: 12px;
+    border-collapse: collapse;
+  }
+  .detail-places th {
+    text-align: left;
+    color: var(--text-dim);
+    font-weight: 500;
+    padding: 3px 8px 3px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .detail-places td {
+    padding: 3px 8px 3px 0;
+  }
+
+  .json-block {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 10px;
+    font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+
+  .json-key { color: #8cb4ff; }
+  .json-string { color: #a8d8a8; }
+  .json-number { color: #d9a44a; }
+  .json-bool { color: #d98a8a; }
+  .json-null { color: var(--text-dim); }
+
+  .loading-spinner {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.6s linear infinite;
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  @media (max-width: 800px) {
+    .layout { flex-direction: column; }
+    .map-panel { flex: 0 0 45vh; }
+    .side-panel { flex: 1; border-left: none; border-top: 1px solid var(--border); }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+  <div class="map-panel">
+    <div id="map"></div>
+  </div>
+  <div class="side-panel">
+    <section>
+      <h3>Coordinates</h3>
+      <div class="coord-row">
+        <textarea id="coordInput" placeholder="lat, lng (one per line for batch)" rows="1"></textarea>
+        <button id="lookupBtn" onclick="lookupCoords()">Lookup</button>
+      </div>
+    </section>
+
+    <section>
+      <h3>Photo Upload</h3>
+      <div class="drop-zone" id="dropZone">
+        <div>Drop images here or click to browse</div>
+        <div style="font-size:11px; margin-top:4px; color:var(--text-dim)">JPG, HEIC, PNG, TIFF</div>
+        <input type="file" id="fileInput" accept="image/jpeg,image/heic,image/png,image/tiff,.heic,.heif" multiple />
+      </div>
+      <div class="photo-list" id="photoList"></div>
+    </section>
+
+    <div class="results-section">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;gap:6px;flex-wrap:wrap;">
+        <h3 style="margin:0;flex:1">Results <span id="resultCount"></span></h3>
+        <button id="minimalBtn" onclick="toggleMinimal()" style="padding:4px 12px;font-size:12px;background:var(--surface2);color:#fff;border:1px solid var(--border);border-radius:4px;cursor:pointer;" title="Query the minimal-dataset server (port 3001) side-by-side. Shows what the smallest admin-only deployable would resolve.">Minimal: Off</button>
+        <button id="nominatimBtn" onclick="toggleNominatim()" style="padding:4px 12px;font-size:12px;background:var(--surface2);color:#fff;border:1px solid var(--border);border-radius:4px;cursor:pointer;" title="Query Nominatim's public API for side-by-side comparison. Off by default — each query hits api.openstreetmap.org so leave off unless you need the comparison.">Nominatim: Off</button>
+        <button id="polygonsBtn" onclick="togglePolygons()" style="padding:4px 12px;font-size:12px;background:var(--surface2);color:#fff;border:1px solid var(--border);border-radius:4px;cursor:pointer;" title="Cycle the polygon overlay: Off → Full (port 3002) → Minimal (port 3001) → Off. Use to compare which admin levels disappear in the minimal dataset.">Polygons: Off</button>
+        <button id="retestBtn" onclick="retestAllResults()" style="padding:4px 12px;font-size:12px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer;">Re-test</button>
+        <button onclick="clearResults()" style="padding:4px 12px;font-size:12px;background:var(--red);color:#fff;border:none;border-radius:4px;cursor:pointer;">Clear</button>
+      </div>
+      <div class="results-list" id="resultsList"></div>
+    </div>
+
+    <div class="detail-panel" id="detailPanel">
+      <h3>Detail</h3>
+      <div id="detailContent"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+// -- Map setup --
+const map = new maplibregl.Map({
+  container: 'map',
+  style: 'https://tiles.immich.cloud/v1/style/dark.json',
+  center: [0, 40],
+  zoom: 3
+});
+
+const markers = new Map(); // id -> {marker, popup}
+const results = [];        // {id, lat, lng, data, error, loading, source}
+let selectedId = null;
+
+// -- LocalStorage persistence --
+const STORAGE_KEY = 'geocoder_test_results';
+
+function saveResults() {
+  const serializable = results.filter(r => !r.loading).map(r => ({
+    id: r.id, lat: r.lat, lng: r.lng, data: r.data,
+    nominatim: r.nominatim || null,
+    minimal: r.minimal || null,
+    error: r.error, source: r.source
+  }));
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(serializable)); } catch(e) {}
+}
+
+// Base URL for the minimal-dataset server. The full server embeds
+// this page; the minimal server runs on the same host at :3001
+// (see docker-compose.yml). Override with ?minimal_url=... to point
+// at a different host (e.g. a remote test instance).
+const MINIMAL_BASE_URL = (() => {
+  const params = new URLSearchParams(location.search);
+  const override = params.get('minimal_url');
+  if (override) return override.replace(/\/$/, '');
+  return `${location.protocol}//${location.hostname}:3001`;
+})();
+
+function loadResults() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+    for (const r of stored) {
+      r.loading = false;
+      results.push(r);
+      const hasPlaces = r.data && r.data.places && r.data.places.length > 0;
+      const color = r.error ? MARKER_COLORS.red : (hasPlaces ? MARKER_COLORS.green : MARKER_COLORS.blue);
+      const marker = new maplibregl.Marker({ color })
+        .setLngLat([r.lng, r.lat])
+        .addTo(map);
+      if (r.data) {
+        const label = r.data.display_name || `${r.lat.toFixed(4)}, ${r.lng.toFixed(4)}`;
+        marker.setPopup(new maplibregl.Popup({ offset: 25 }).setHTML(
+          `<b>${label}</b>${hasPlaces ? '<br>' + r.data.places.length + ' place(s)' : ''}`
+        ));
+      }
+      marker.getElement().addEventListener('click', (e) => {
+        e.stopPropagation();
+        selectResult(r.id);
+      });
+      markers.set(r.id, { marker, popup: null });
+    }
+    renderResults();
+  } catch(e) {}
+}
+
+function clearResults() {
+  results.length = 0;
+  selectedId = null;
+  markers.forEach(m => m.marker.remove());
+  markers.clear();
+  localStorage.removeItem(STORAGE_KEY);
+  renderResults();
+  document.getElementById('detailPanel').classList.remove('visible');
+}
+
+// Re-run every stored result against OUR reverse geocoder (Nominatim's
+// results won't have changed between server rebuilds, so we keep the
+// cached Nominatim comparison in place and only refresh our own data).
+// Useful after rebuilding the server to re-check saved test cases.
+function retestAllResults() {
+  if (results.length === 0) return;
+  const btn = document.getElementById('retestBtn');
+  const originalLabel = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = `Re-testing… 0/${results.length}`;
+
+  // Take a snapshot before iterating: reverseGeocode() adds new entries
+  // to the front, which would clobber the counter and re-test order.
+  const toRetest = results.slice();
+  let completed = 0;
+
+  // Reset existing markers to loading state. Preserve the cached
+  // Nominatim response so we can still render the diff after re-test.
+  for (const r of toRetest) {
+    r.loading = true;
+    r.data = null;
+    r.error = null;
+    const m = markers.get(r.id);
+    if (m) {
+      m.marker.remove();
+      const newMarker = new maplibregl.Marker({ color: MARKER_COLORS.gray })
+        .setLngLat([r.lng, r.lat])
+        .addTo(map);
+      newMarker.getElement().addEventListener('click', (e) => {
+        e.stopPropagation();
+        selectResult(r.id);
+      });
+      m.marker = newMarker;
+      m.popup = null;
+    }
+  }
+  renderResults();
+
+  const runOne = (entry) => new Promise((resolve) => {
+    const fullFetch = fetch(`/reverse?lat=${entry.lat}&lon=${entry.lng}&key=test`)
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
+    // Re-query minimal too (its build can change with full server
+    // rebuilds — same source data). Nominatim is held over from the
+    // original fetch since the public API isn't tied to our build.
+    const minFetch = minimalEnabled
+      ? fetch(`${MINIMAL_BASE_URL}/reverse?lat=${entry.lat}&lon=${entry.lng}&key=test`)
+          .then(r => r.ok ? r.json() : null).catch(() => null)
+      : Promise.resolve(entry.minimal || null);
+    Promise.all([fullFetch, minFetch])
+      .then(([data, min]) => {
+        entry.data = data;
+        entry.minimal = min;
+        entry.loading = false;
+        const hasPlaces = data.places && data.places.length > 0;
+        const m = markers.get(entry.id);
+        if (m) {
+          m.marker.remove();
+          const newMarker = new maplibregl.Marker({ color: hasPlaces ? MARKER_COLORS.green : MARKER_COLORS.blue })
+            .setLngLat([entry.lng, entry.lat])
+            .addTo(map);
+          const label = data.display_name || `${entry.lat.toFixed(4)}, ${entry.lng.toFixed(4)}`;
+          const popup = new maplibregl.Popup({ offset: 25 })
+            .setHTML(`<b>${label}</b>${hasPlaces ? '<br>' + data.places.length + ' place(s)' : ''}`);
+          newMarker.setPopup(popup);
+          newMarker.getElement().addEventListener('click', (e) => {
+            e.stopPropagation();
+            selectResult(entry.id);
+          });
+          m.marker = newMarker;
+          m.popup = popup;
+        }
+      })
+      .catch(err => {
+        entry.error = err.message;
+        entry.loading = false;
+        const m = markers.get(entry.id);
+        if (m) {
+          m.marker.remove();
+          const newMarker = new maplibregl.Marker({ color: MARKER_COLORS.red })
+            .setLngLat([entry.lng, entry.lat])
+            .addTo(map);
+          newMarker.getElement().addEventListener('click', (e) => {
+            e.stopPropagation();
+            selectResult(entry.id);
+          });
+          m.marker = newMarker;
+        }
+      })
+      .finally(() => {
+        completed++;
+        btn.textContent = `Re-testing… ${completed}/${toRetest.length}`;
+        renderResults();
+        saveResults();
+        if (selectedId === entry.id) showDetail(entry.id);
+        resolve();
+      });
+  });
+
+  // Run up to 5 in flight at once, matching reverseGeocode()'s rate limit.
+  const CONCURRENCY = 5;
+  let idx = 0;
+  const workers = Array.from({length: Math.min(CONCURRENCY, toRetest.length)}, () => {
+    return (async function loop() {
+      while (idx < toRetest.length) {
+        const my = idx++;
+        await runOne(toRetest[my]);
+      }
+    })();
+  });
+  Promise.all(workers).then(() => {
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+  });
+}
+
+// Marker color map
+const MARKER_COLORS = {
+  gray: '#888888',
+  green: '#4caf80',
+  blue: '#4a90d9',
+  red: '#d94a4a'
+};
+
+// -- Click map to geocode --
+map.on('click', function(e) {
+  reverseGeocode(e.lngLat.lat, e.lngLat.lng, 'map click');
+});
+map.on('load', function() {
+  loadResults();
+  const btn = document.getElementById('polygonsBtn');
+  if (polygonsSource !== 'off') {
+    ensurePolygonLayer();
+    if (selectedId !== null) updatePolygonLayer(selectedId);
+  }
+});
+
+// -- Coordinate lookup --
+function lookupCoords() {
+  const text = document.getElementById('coordInput').value.trim();
+  if (!text) return;
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  for (const line of lines) {
+    const parts = line.split(/[\s,]+/).map(Number);
+    if (parts.length >= 2 && isFinite(parts[0]) && isFinite(parts[1])) {
+      reverseGeocode(parts[0], parts[1], 'manual');
+    }
+  }
+  document.getElementById('coordInput').value = '';
+}
+
+document.getElementById('coordInput').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    lookupCoords();
+  }
+});
+
+// -- Photo upload --
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+
+dropZone.addEventListener('click', () => fileInput.click());
+dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+dropZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropZone.classList.remove('dragover');
+  handleFiles(e.dataTransfer.files);
+});
+fileInput.addEventListener('change', () => handleFiles(fileInput.files));
+
+async function handleFiles(files) {
+  const photoList = document.getElementById('photoList');
+  for (const file of files) {
+    const item = document.createElement('div');
+    item.className = 'photo-item';
+    item.innerHTML = `<span>${file.name}</span><span>extracting...</span>`;
+    photoList.appendChild(item);
+
+    try {
+      const exif = await exifr.gps(file);
+      if (exif && isFinite(exif.latitude) && isFinite(exif.longitude)) {
+        item.innerHTML = `<span>${file.name}</span><span class="coords">${exif.latitude.toFixed(5)}, ${exif.longitude.toFixed(5)}</span>`;
+        reverseGeocode(exif.latitude, exif.longitude, file.name);
+      } else {
+        item.innerHTML = `<span>${file.name}</span><span class="no-gps">No GPS data</span>`;
+      }
+    } catch (err) {
+      item.innerHTML = `<span>${file.name}</span><span class="no-gps">EXIF error</span>`;
+    }
+  }
+  photoList.scrollTop = photoList.scrollHeight;
+}
+
+// -- Reverse geocode with throttling --
+let activeRequests = 0;
+const queue = [];
+
+function reverseGeocode(lat, lng, source) {
+  const id = Date.now() + Math.random();
+  const entry = { id, lat, lng, data: null, error: null, loading: true, source };
+  results.unshift(entry);
+
+  // Fly to the location
+  map.flyTo({ center: [lng, lat], zoom: Math.max(map.getZoom(), 10) });
+
+  // Add a gray marker immediately
+  const marker = new maplibregl.Marker({ color: MARKER_COLORS.gray })
+    .setLngLat([lng, lat])
+    .addTo(map);
+  marker.getElement().addEventListener('click', (e) => {
+    e.stopPropagation();
+    selectResult(id);
+  });
+  markers.set(id, { marker, popup: null });
+
+  selectResult(id);
+
+  const doFetch = () => {
+    activeRequests++;
+
+    // Fetch from full + minimal + Nominatim in parallel. Minimal and
+    // Nominatim are both opt-in (toggles in the results header); when
+    // off we resolve null for that comparison leg.
+    const ourFetch = fetch(`/reverse?lat=${lat}&lon=${lng}&key=test`)
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
+    const minFetch = minimalEnabled
+      ? fetch(`${MINIMAL_BASE_URL}/reverse?lat=${lat}&lon=${lng}&key=test`)
+          .then(r => r.ok ? r.json() : null).catch(() => null)
+      : Promise.resolve(null);
+    const nomFetch = nominatimEnabled
+      ? fetch(`https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=jsonv2`, {headers: {'User-Agent': 'geoshenanigans-test'}})
+          .then(r => r.ok ? r.json() : null).catch(() => null)
+      : Promise.resolve(null);
+
+    Promise.all([ourFetch, minFetch, nomFetch])
+      .then(([data, min, nom]) => {
+        entry.data = data;
+        entry.minimal = min;
+        entry.nominatim = nom;
+        entry.loading = false;
+        const hasPlaces = data.places && data.places.length > 0;
+        const m = markers.get(id);
+        m.marker.remove();
+        const newMarker = new maplibregl.Marker({ color: hasPlaces ? MARKER_COLORS.green : MARKER_COLORS.blue })
+          .setLngLat([lng, lat])
+          .addTo(map);
+        const label = data.display_name || `${lat.toFixed(4)}, ${lng.toFixed(4)}`;
+        const popup = new maplibregl.Popup({ offset: 25 })
+          .setHTML(`<b>${label}</b>${hasPlaces ? '<br>' + data.places.length + ' place(s)' : ''}`);
+        newMarker.setPopup(popup);
+        newMarker.getElement().addEventListener('click', (e) => {
+          e.stopPropagation();
+          selectResult(id);
+        });
+        m.marker = newMarker;
+        m.popup = popup;
+      })
+      .catch(err => {
+        entry.error = err.message;
+        entry.loading = false;
+        const m = markers.get(id);
+        m.marker.remove();
+        const newMarker = new maplibregl.Marker({ color: MARKER_COLORS.red })
+          .setLngLat([lng, lat])
+          .addTo(map);
+        newMarker.getElement().addEventListener('click', (e) => {
+          e.stopPropagation();
+          selectResult(id);
+        });
+        m.marker = newMarker;
+      })
+      .finally(() => {
+        activeRequests--;
+        renderResults();
+        saveResults();
+        if (selectedId === id) showDetail(id);
+        if (queue.length > 0) queue.shift()();
+      });
+  };
+
+  if (activeRequests < 5) {
+    doFetch();
+  } else {
+    queue.push(doFetch);
+  }
+}
+
+// -- Render results list --
+function renderResults() {
+  const list = document.getElementById('resultsList');
+  const countEl = document.getElementById('resultCount');
+  countEl.textContent = `(${results.length})`;
+
+  list.innerHTML = '';
+  for (const r of results) {
+    const card = document.createElement('div');
+    card.className = 'result-card' +
+      (r.loading ? ' loading' : '') +
+      (r.error ? ' error' : '') +
+      (r.id === selectedId ? ' selected' : '');
+
+    const coordsText = `${r.lat.toFixed(5)}, ${r.lng.toFixed(5)}`;
+    // Coords line + inline copy button. `data-copy` on the button
+    // holds the exact text so the click handler (delegated below)
+    // can reach it without a closure per card — the results list
+    // can grow large and re-rendering every card should stay cheap.
+    let inner = `<div class="result-coords">${coordsText}` +
+      `<button class="result-copy" data-copy="${coordsText}" title="Copy coordinates">⧉</button>` +
+      `</div>`;
+
+    if (r.loading) {
+      inner += `<div class="result-name"><span class="loading-spinner"></span>Loading...</div>`;
+    } else if (r.error) {
+      inner += `<div class="result-error">${r.error}</div>`;
+    } else {
+      const name = r.data.display_name || 'Unknown location';
+      inner += `<div class="result-name">${escHtml(name)}</div>`;
+      if (r.data.places && r.data.places.length > 0) {
+        const names = r.data.places.slice(0, 3).map(p => p.name).join(', ');
+        const extra = r.data.places.length > 3 ? ` +${r.data.places.length - 3} more` : '';
+        inner += `<div class="result-places">${escHtml(names)}${extra}</div>`;
+      }
+    }
+    if (r.source) {
+      inner += `<div class="result-source">${escHtml(r.source)}</div>`;
+    }
+
+    card.innerHTML = inner;
+    card.addEventListener('click', (ev) => {
+      // Copy button intercept — skip the card's open-detail action
+      // when the click actually landed on the copy button.
+      if (ev.target.classList && ev.target.classList.contains('result-copy')) {
+        ev.stopPropagation();
+        const text = ev.target.getAttribute('data-copy') || '';
+        copyToClipboard(text, ev.target);
+        return;
+      }
+      selectResult(r.id);
+      map.flyTo({ center: [r.lng, r.lat], zoom: Math.max(map.getZoom(), 13) });
+    });
+    list.appendChild(card);
+  }
+}
+
+function copyToClipboard(text, btn) {
+  const finish = () => {
+    if (!btn) return;
+    const orig = btn.textContent;
+    btn.textContent = '✓';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = orig;
+      btn.classList.remove('copied');
+    }, 1000);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(finish).catch(() => legacyCopy(text, finish));
+  } else {
+    legacyCopy(text, finish);
+  }
+}
+function legacyCopy(text, cb) {
+  // Fallback for older browsers / non-HTTPS origins where the async
+  // Clipboard API is unavailable. A hidden textarea + execCommand
+  // is the standard workaround.
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.left = '-9999px';
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand('copy'); } catch (_) {}
+  document.body.removeChild(ta);
+  cb && cb();
+}
+
+function selectResult(id) {
+  selectedId = id;
+  renderResults();
+  showDetail(id);
+  if (polygonsSource !== 'off') updatePolygonLayer(id);
+}
+
+// -- Polygon overlay --
+const POLY_SOURCE = 'debug-polygons';
+const POLY_LABEL_SOURCE = 'debug-polygon-labels';
+const POLY_FILL = 'debug-polygons-fill';
+const POLY_LINE = 'debug-polygons-line';
+const POLY_LABELS = 'debug-polygons-labels';
+// Polygon overlay source — three-state cycle:
+//   "off"     no overlay
+//   "full"    fetch /polygons from the page's origin (full server, port 3002)
+//   "minimal" fetch from MINIMAL_BASE_URL (minimal server, port 3001)
+// Use to A/B the L9/L10/L11/L15 polygons that admin-minimal drops.
+const POLY_STATES = ['off', 'full', 'minimal'];
+let polygonsSource = (() => {
+  const saved = localStorage.getItem('polygons_source');
+  // Migrate the old boolean key — "1" → "full", "0" → "off".
+  if (saved === null) {
+    const legacy = localStorage.getItem('polygons_enabled');
+    if (legacy === '1') return 'full';
+    return 'off';
+  }
+  return POLY_STATES.includes(saved) ? saved : 'off';
+})();
+
+// Nominatim side-by-side lookup is opt-in — every query goes out to
+// nominatim.openstreetmap.org so we don't want to hit it unsolicited.
+// Default off; toggle button persists choice in localStorage.
+let nominatimEnabled = localStorage.getItem('nominatim_enabled') === '1';
+function toggleNominatim() {
+  nominatimEnabled = !nominatimEnabled;
+  localStorage.setItem('nominatim_enabled', nominatimEnabled ? '1' : '0');
+  updateNominatimBtn();
+  // Re-render the currently-open detail so the comparison panel
+  // shows/hides immediately without needing a new query.
+  if (selectedId) showDetail(selectedId);
+}
+function updateNominatimBtn() {
+  const btn = document.getElementById('nominatimBtn');
+  if (!btn) return;
+  btn.textContent = 'Nominatim: ' + (nominatimEnabled ? 'On' : 'Off');
+  btn.style.background = nominatimEnabled ? 'var(--green)' : 'var(--surface2)';
+}
+
+// Minimal-dataset side-by-side lookup — queries the second server
+// on port 3001 (no postcodes, no POIs, admin + streets + addresses
+// + place nodes only).  Off by default to avoid CORS noise when the
+// minimal server isn't running.
+let minimalEnabled = localStorage.getItem('minimal_enabled') === '1';
+function toggleMinimal() {
+  minimalEnabled = !minimalEnabled;
+  localStorage.setItem('minimal_enabled', minimalEnabled ? '1' : '0');
+  updateMinimalBtn();
+  // When turning Minimal ON, fetch missing minimal data for any
+  // results that don't have it yet (cached from before the toggle
+  // existed, or fetched while toggle was off).  Without this the
+  // user has to manually click Re-test to populate minimal data.
+  if (minimalEnabled) {
+    const missing = results.filter(r => !r.loading && !r.error && (r.minimal === undefined || r.minimal === null));
+    if (missing.length > 0) {
+      const fillOne = (entry) => fetch(`${MINIMAL_BASE_URL}/reverse?lat=${entry.lat}&lon=${entry.lng}&key=test`)
+        .then(r => r.ok ? r.json() : null)
+        .catch(() => null)
+        .then(min => {
+          entry.minimal = min;
+          if (selectedId === entry.id) showDetail(entry.id);
+        });
+      // Fire all in parallel — minimal endpoint is local and rate
+      // limits are generous (100/s).
+      Promise.all(missing.map(fillOne)).then(() => { saveResults(); renderResults(); });
+    }
+  }
+  if (selectedId) showDetail(selectedId);
+}
+function updateMinimalBtn() {
+  const btn = document.getElementById('minimalBtn');
+  if (!btn) return;
+  btn.textContent = 'Minimal: ' + (minimalEnabled ? 'On' : 'Off');
+  btn.style.background = minimalEnabled ? 'var(--blue)' : 'var(--surface2)';
+}
+// Run once on initial load so buttons reflect saved state.
+document.addEventListener('DOMContentLoaded', () => {
+  updateNominatimBtn();
+  updateMinimalBtn();
+  updatePolygonsBtn();
+});
+
+// Shoelace-weighted centroid of a closed lng/lat ring
+function polygonCentroid(ring) {
+  let cx = 0, cy = 0, area = 0;
+  const n = ring.length - 1; // last vertex == first for closed rings
+  for (let i = 0; i < n; i++) {
+    const [x1, y1] = ring[i];
+    const [x2, y2] = ring[i + 1];
+    const cross = x1 * y2 - x2 * y1;
+    area += cross;
+    cx += (x1 + x2) * cross;
+    cy += (y1 + y2) * cross;
+  }
+  area /= 2;
+  if (Math.abs(area) < 1e-12) return ring[0];
+  return [cx / (6 * area), cy / (6 * area)];
+}
+
+function ensurePolygonLayer() {
+  if (!map.isStyleLoaded()) { map.once('idle', ensurePolygonLayer); return; }
+  if (map.getSource(POLY_SOURCE)) return;
+  map.addSource(POLY_SOURCE, { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+  map.addSource(POLY_LABEL_SOURCE, { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+  // Color ramp by admin_level: coarser = warmer, finer = cooler, postal = magenta
+  const colorExpr = ['match', ['get', 'admin_level'],
+    2, '#ff4444',  // country
+    3, '#ff7744',
+    4, '#ffaa44',  // state
+    5, '#ffdd44',
+    6, '#aadd44',  // county
+    7, '#44dd88',
+    8, '#44ddcc',  // city
+    9, '#44aadd',
+    10, '#4488dd', // suburb
+    11, '#4466dd',
+    15, '#8844dd', // class=place marker
+    99, '#dd44bb', // postal
+    '#888888'
+  ];
+  map.addLayer({
+    id: POLY_FILL,
+    type: 'fill',
+    source: POLY_SOURCE,
+    paint: { 'fill-color': colorExpr, 'fill-opacity': 0.12 }
+  });
+  map.addLayer({
+    id: POLY_LINE,
+    type: 'line',
+    source: POLY_SOURCE,
+    paint: { 'line-color': colorExpr, 'line-width': 2, 'line-opacity': 0.9 }
+  });
+  map.addLayer({
+    id: POLY_LABELS,
+    type: 'symbol',
+    source: POLY_LABEL_SOURCE,
+    layout: {
+      'text-field': ['concat', ['to-string', ['get', 'admin_level']], ': ', ['get', 'name']],
+      'text-size': 12,
+      'symbol-placement': 'point',
+      'text-allow-overlap': true,
+      'text-ignore-placement': true,
+      'text-anchor': 'center',
+    },
+    paint: { 'text-color': '#ffffff', 'text-halo-color': '#000000', 'text-halo-width': 1.5 }
+  });
+  // Click a polygon to see its properties in the console + popup
+  map.on('click', POLY_FILL, (e) => {
+    if (!e.features || !e.features[0]) return;
+    const p = e.features[0].properties;
+    new maplibregl.Popup({ closeButton: true })
+      .setLngLat(e.lngLat)
+      .setHTML(`<b>${escHtml(p.name)}</b><br>admin_level ${p.admin_level}<br>kind: ${p.kind}<br>area: ${Number(p.area).toExponential(2)}`)
+      .addTo(map);
+  });
+}
+
+function clearPolygonLayer() {
+  const src = map.getSource(POLY_SOURCE);
+  if (src) src.setData({ type: 'FeatureCollection', features: [] });
+  const lsrc = map.getSource(POLY_LABEL_SOURCE);
+  if (lsrc) lsrc.setData({ type: 'FeatureCollection', features: [] });
+}
+
+function updatePolygonLayer(id) {
+  if (polygonsSource === 'off') return;
+  ensurePolygonLayer();
+  const r = results.find(x => x.id === id);
+  if (!r) { clearPolygonLayer(); return; }
+  // Pick the source server: full = same-origin, minimal = cross-origin
+  // to MINIMAL_BASE_URL. Same /polygons endpoint shape on both.
+  const base = polygonsSource === 'minimal' ? MINIMAL_BASE_URL : '';
+  fetch(`${base}/polygons?lat=${r.lat}&lon=${r.lng}&key=test`)
+    .then(res => { if (!res.ok) throw new Error(`HTTP ${res.status}`); return res.json(); })
+    .then(fc => {
+      // Sort largest-first so smaller polygons render on top
+      if (fc.features) {
+        fc.features.sort((a, b) => (b.properties.area || 0) - (a.properties.area || 0));
+      }
+      const src = map.getSource(POLY_SOURCE);
+      if (src) src.setData(fc);
+      // Build a parallel point FeatureCollection for label placement at centroids
+      const labelFc = {
+        type: 'FeatureCollection',
+        features: (fc.features || []).map(f => ({
+          type: 'Feature',
+          geometry: { type: 'Point', coordinates: polygonCentroid(f.geometry.coordinates[0]) },
+          properties: f.properties,
+        })),
+      };
+      const lsrc = map.getSource(POLY_LABEL_SOURCE);
+      if (lsrc) lsrc.setData(labelFc);
+    })
+    .catch(err => console.warn('polygons fetch failed:', err));
+}
+
+function togglePolygons() {
+  // Cycle: off → full → minimal → off
+  const next = (POLY_STATES.indexOf(polygonsSource) + 1) % POLY_STATES.length;
+  polygonsSource = POLY_STATES[next];
+  localStorage.setItem('polygons_source', polygonsSource);
+  updatePolygonsBtn();
+  if (polygonsSource === 'off') {
+    clearPolygonLayer();
+  } else {
+    ensurePolygonLayer();
+    if (selectedId !== null) updatePolygonLayer(selectedId);
+  }
+}
+function updatePolygonsBtn() {
+  const btn = document.getElementById('polygonsBtn');
+  if (!btn) return;
+  const label = polygonsSource === 'off' ? 'Off'
+    : polygonsSource === 'full' ? 'Full'
+    : 'Minimal';
+  btn.textContent = `Polygons: ${label}`;
+  btn.style.background = polygonsSource === 'off'    ? 'var(--surface2)'
+                       : polygonsSource === 'full'   ? 'var(--accent)'
+                       : 'var(--blue)';
+}
+
+// -- Detail panel --
+function showDetail(id) {
+  const panel = document.getElementById('detailPanel');
+  const content = document.getElementById('detailContent');
+  const r = results.find(x => x.id === id);
+  if (!r || r.loading) { panel.classList.remove('visible'); return; }
+
+  panel.classList.add('visible');
+
+  if (r.error) {
+    content.innerHTML = `<div style="color:var(--red)">Error: ${escHtml(r.error)}</div>`;
+    return;
+  }
+
+  const d = r.data;
+  const min = r.minimal;
+  const nom = r.nominatim;
+  const showMin = minimalEnabled && min;
+  const showNom = nominatimEnabled && nom;
+
+  // Build column descriptors so the table render is a single loop
+  // regardless of which comparison legs are enabled.  Full is always
+  // present; minimal/nominatim toggle in via their state flags.
+  const cols = [
+    { label: 'Full',      color: 'var(--accent)', data: d,   addr: d.address || {} },
+  ];
+  if (showMin) cols.push({ label: 'Minimal',   color: 'var(--blue)',   data: min, addr: min.address || {} });
+  if (showNom) cols.push({ label: 'Nominatim', color: 'var(--green)',  data: nom, addr: nom.address || {} });
+
+  let html = '';
+
+  // Display names — one block per active column.
+  if (cols.length > 1) {
+    html += `<div style="display:grid;grid-template-columns:repeat(${cols.length},1fr);gap:16px;margin-bottom:12px">`;
+    for (const c of cols) {
+      const dn = (c.data && c.data.display_name) ? escHtml(c.data.display_name) : '—';
+      html += `<div><div style="font-size:11px;text-transform:uppercase;color:${c.color};margin-bottom:4px">${c.label}</div><div style="font-size:13px;color:var(--text-dim)">${dn}</div></div>`;
+    }
+    html += '</div>';
+  } else {
+    html += `<div style="margin-bottom:12px"><div style="font-size:11px;text-transform:uppercase;color:var(--accent);margin-bottom:4px">Display name</div><div style="font-size:13px;color:var(--text-dim)">${d.display_name ? escHtml(d.display_name) : '—'}</div></div>`;
+  }
+
+  // Aligned field breakdown table. Row set = every key present on
+  // ANY active column, not a hand-picked allow-list. That way any
+  // field we add to the response (new landmark class, shop, etc.)
+  // automatically appears in the UI without touching the test tool.
+  const rowKeys = Array.from(new Set(cols.flatMap(c => Object.keys(c.addr))));
+  // Preferred ordering for the common address hierarchy. Unknown
+  // fields (landmark classes etc.) fall through to alphabetical at
+  // the end so they're still shown, just less prominently.
+  const preferredOrder = [
+    'landmark',
+    'house_number', 'road', 'city_block', 'neighbourhood', 'quarter',
+    'suburb', 'borough', 'city_district', 'city', 'town', 'village',
+    'hamlet', 'municipality', 'district', 'county', 'state_district',
+    'region', 'province', 'state', 'postcode', 'country', 'country_code',
+  ];
+  rowKeys.sort((a, b) => {
+    const ia = preferredOrder.indexOf(a);
+    const ib = preferredOrder.indexOf(b);
+    if (ia !== -1 && ib !== -1) return ia - ib;
+    if (ia !== -1) return -1;
+    if (ib !== -1) return 1;
+    return a.localeCompare(b);
+  });
+
+  html += '<table style="width:100%;border-collapse:collapse;font-size:13px">';
+  html += '<tr style="border-bottom:1px solid var(--border)"><th style="text-align:left;padding:4px 8px;color:var(--text-dim);width:140px">Field</th>';
+  for (const c of cols) {
+    html += `<th style="text-align:left;padding:4px 8px;color:${c.color}">${c.label}</th>`;
+  }
+  html += '</tr>';
+  for (const f of rowKeys) {
+    const vals = cols.map(c => c.addr[f] || '');
+    if (vals.every(v => !v)) continue;
+    // Mismatch = at least two non-empty values disagree. Highlight the
+    // whole row faintly red if any disagreement, and color individual
+    // cells: red for cells participating in a disagreement, orange for
+    // empty cells in a row where another column has a value.
+    const present = vals.filter(v => v);
+    const allAgree = present.every(v => v === present[0]);
+    const anyMismatch = !allAgree;
+    const someEmpty = vals.some(v => !v) && present.length > 0;
+    const rowBg = (anyMismatch || someEmpty) ? 'background:rgba(217,74,74,0.06)' : '';
+    html += `<tr style="border-bottom:1px solid var(--border);${rowBg}">`;
+    html += `<td style="padding:4px 8px;color:var(--text-dim)">${escHtml(f)}</td>`;
+    for (const v of vals) {
+      let style = '';
+      let cellHtml;
+      if (!v) {
+        cellHtml = '<span style="color:var(--orange)">—</span>';
+      } else if (anyMismatch) {
+        style = 'color:var(--red)';
+        cellHtml = escHtml(v);
+      } else {
+        cellHtml = escHtml(v);
+      }
+      html += `<td style="padding:4px 8px;${style}">${cellHtml}</td>`;
+    }
+    html += '</tr>';
+  }
+  html += '</table>';
+
+  // Places — show one section per column when there's a comparison,
+  // otherwise the original single-table view. Minimal mode usually
+  // returns no places (POI data is omitted) so its column will be
+  // empty by design.
+  const haveAnyPlaces = cols.some(c => c.data && c.data.places && c.data.places.length > 0);
+  if (haveAnyPlaces) {
+    if (cols.length > 1) {
+      html += `<div class="detail-places"><h3 style="margin:10px 0 6px">Places</h3>`;
+      html += `<div style="display:grid;grid-template-columns:repeat(${cols.length},1fr);gap:12px">`;
+      for (const c of cols) {
+        const places = (c.data && c.data.places) || [];
+        html += `<div><div style="font-size:11px;text-transform:uppercase;color:${c.color};margin-bottom:4px">${c.label}</div>`;
+        if (places.length === 0) {
+          html += '<div style="font-size:12px;color:var(--text-dim)">— no places —</div>';
+        } else {
+          html += '<table style="width:100%;font-size:12px"><tr><th style="text-align:left;color:var(--text-dim)">Name</th><th style="text-align:left;color:var(--text-dim)">Category</th><th style="text-align:left;color:var(--text-dim)">Dist</th></tr>';
+          for (const p of places) {
+            html += `<tr><td>${escHtml(p.name)}</td><td>${escHtml(p.category)}</td><td>${p.distance_m}m</td></tr>`;
+          }
+          html += '</table>';
+        }
+        html += '</div>';
+      }
+      html += '</div></div>';
+    } else if (d.places && d.places.length > 0) {
+      html += '<div class="detail-places"><h3 style="margin:10px 0 6px">Places</h3><table><tr><th>Name</th><th>Category</th><th>Distance</th></tr>';
+      for (const p of d.places) {
+        html += `<tr><td>${escHtml(p.name)}</td><td>${escHtml(p.category)}</td><td>${p.distance_m}m</td></tr>`;
+      }
+      html += '</table></div>';
+    }
+  }
+
+  // Raw JSON for each active column (collapsible).
+  html += `<details style="margin-top:10px"><summary style="cursor:pointer;color:var(--accent)">Full response JSON</summary><div class="json-block">${syntaxHighlight(d)}</div></details>`;
+  if (showMin) {
+    html += `<details style="margin-top:6px"><summary style="cursor:pointer;color:var(--blue)">Minimal response JSON</summary><div class="json-block">${syntaxHighlight(min)}</div></details>`;
+  }
+  if (showNom) {
+    html += `<details style="margin-top:6px"><summary style="cursor:pointer;color:var(--green)">Nominatim response JSON</summary><div class="json-block">${syntaxHighlight(nom)}</div></details>`;
+  }
+
+  content.innerHTML = html;
+}
+
+// -- Helpers --
+function escHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function syntaxHighlight(obj) {
+  const json = JSON.stringify(obj, null, 2);
+  return json.replace(/("(\\u[\da-fA-F]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g,
+    function(match) {
+      let cls = 'json-number';
+      if (/^"/.test(match)) {
+        cls = /:$/.test(match) ? 'json-key' : 'json-string';
+      } else if (/true|false/.test(match)) {
+        cls = 'json-bool';
+      } else if (/null/.test(match)) {
+        cls = 'json-null';
+      }
+      return `<span class="${cls}">${match}</span>`;
+    }
+  );
+}
+</script>
+</body>
+</html>

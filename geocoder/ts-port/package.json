@@ -1,0 +1,17 @@
+{
+  "name": "@geoshenanigans/ts-port",
+  "version": "0.1.0",
+  "description": "Pure-TypeScript reverse geocoder — admin-only proof-of-concept for performance comparison vs. Rust + WASM ports.",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "test": "bun test/smoke.ts",
+    "bench": "bun test/bench.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22"
+  },
+  "dependencies": {
+    "nodes2ts": "^4.0.2"
+  }
+}

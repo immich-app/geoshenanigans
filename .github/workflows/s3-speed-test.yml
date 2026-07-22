@@ -1,0 +1,88 @@
+name: S3 Speed Test
+
+on:
+  push:
+    branches: [feat/geocoder]
+    paths:
+      - '.github/workflows/s3-speed-test.yml'
+  workflow_dispatch:
+
+env:
+  S3_BUCKET: geoshenanigans-reverse-geocoding
+  S3_PREFIX: geocoder
+  S3_ENDPOINT: https://t3.storage.dev
+
+permissions:
+  contents: read
+
+jobs:
+  speed-test:
+    runs-on: pokedex-general
+    timeout-minutes: 120
+    steps:
+      - name: Install tools
+        run: |
+          curl -sL "https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-64bit.tar.gz" \
+            -o /tmp/s5cmd.tar.gz
+          sudo tar xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd
+
+      - name: Network speed test
+        run: |
+          curl -sL https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz \
+            -o /tmp/speedtest.tgz
+          sudo tar xzf /tmp/speedtest.tgz -C /usr/local/bin speedtest
+          echo "=== Speedtest CLI ==="
+          speedtest --accept-license --accept-gdpr 2>&1 || echo "(speedtest failed)"
+
+      - name: Configure credentials
+        run: |
+          echo "::add-mask::$AWS_ACCESS_KEY_ID"
+          echo "::add-mask::$AWS_SECRET_ACCESS_KEY"
+          echo "AWS_ACCESS_KEY_ID=$KEY" >> "$GITHUB_ENV"
+          echo "AWS_SECRET_ACCESS_KEY=$SECRET" >> "$GITHUB_ENV"
+        env:
+          KEY: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
+          SECRET: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
+
+      - name: Test uploads to Tigris
+        run: |
+          S5="s5cmd --endpoint-url $S3_ENDPOINT"
+          WORKDIR="/tmp/speed-test"
+          TEST_SRC="$S3_PREFIX/builds/2026-04-05"
+          UPLOAD_DEST="$S3_PREFIX/speed-test"
+
+          echo "## S3 Upload Speed Test (10G WAN)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Workers | Concurrency | Size (MiB) | Time (s) | Speed (MB/s) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---------|-------------|-----------|---------|-------------|" >> "$GITHUB_STEP_SUMMARY"
+
+          # Download all test data (~63GB, all variants)
+          echo "Downloading test data..."
+          mkdir -p "$WORKDIR/src"
+          $S5 --numworkers 32 cp --concurrency 8 \
+            "s3://$S3_BUCKET/$TEST_SRC/*" "$WORKDIR/src/" 2>/dev/null
+          SIZE=$(du -sb "$WORKDIR/src" | cut -f1)
+          SIZE_MIB=$((SIZE / 1024 / 1024))
+          COUNT=$(find "$WORKDIR/src" -type f | wc -l)
+          echo "Test data: $COUNT files, $SIZE_MIB MiB"
+          echo ""
+
+          echo "=== s5cmd uploads (remaining from previous run) ==="
+          for W in 128; do
+            for C in 8 16 32; do
+              LABEL="s5cmd w=${W} c=${C}"
+              START=$(date +%s)
+              $S5 --numworkers $W cp --concurrency $C \
+                "$WORKDIR/src/*" "s3://$S3_BUCKET/$UPLOAD_DEST/" 2>/dev/null || true
+              SEC=$(($(date +%s) - START))
+              [ "$SEC" -gt 0 ] && SPEED=$((SIZE_MIB / SEC)) || SPEED=$SIZE_MIB
+              echo "$LABEL: $SIZE_MIB MiB in ${SEC}s ($SPEED MB/s)"
+              echo "| $W | $C | $SIZE_MIB | $SEC | $SPEED |" >> "$GITHUB_STEP_SUMMARY"
+              # Clean up uploaded files
+              $S5 rm "s3://$S3_BUCKET/$UPLOAD_DEST/*" 2>/dev/null || true
+            done
+          done
+
+          rm -rf "$WORKDIR"
+          echo ""
+          echo "Reference: download best was s5cmd w=32 c=8 at 417 MB/s"
