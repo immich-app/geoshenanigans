@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Geocoder</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <style>td { word-break: break-all; } td:last-child { width: 1%; white-space: nowrap; }</style>
+</head>
+<body>
+  <main class="container">
+    <nav>
+      <ul><li>Today: {daily_usage}</li></ul>
+      <ul><li><a href="/logout">Sign out</a></li></ul>
+    </nav>
+    <article>
+      <h4>API Tokens</h4>
+      <form method="post" action="/tokens">
+        <button type="submit" class="outline">Create Token</button>
+      </form>
+      <table>
+        <thead><tr><th>Token</th><th></th></tr></thead>
+        <tbody>{rows}</tbody>
+      </table>
+    </article>
+    <article style="{users_display}">
+      <h4>Users</h4>
+      <form method="post" action="/users">
+        <fieldset role="group">
+          <input type="text" name="login" placeholder="Login" required>
+          <input type="password" name="password" placeholder="Password" required>
+          <input type="number" name="rate_per_second" placeholder="Rate/sec" value="0" min="0" required>
+          <input type="number" name="rate_per_day" placeholder="Rate/day" value="0" min="0" required>
+          <select name="rate_by_ip">
+            <option value="">By user</option>
+            <option value="on">By IP</option>
+          </select>
+          <button type="submit">Create</button>
+        </fieldset>
+      </form>
+      <table>
+        <thead><tr><th>Login</th><th>Role</th><th>Rate/sec</th><th>Rate/day</th><th>By IP</th><th></th></tr></thead>
+        <tbody>{user_rows}</tbody>
+      </table>
+    </article>
+  </main>
+</body>
+</html>
