@@ -2,7 +2,7 @@
 "1password-cli" = "2.39.0"
 opentofu = "1.12.6"
 rclone = "1.75.0"
-terragrunt = "0.83.0"
+terragrunt = "0.99.5"
 
 [tasks.tg]
 run = "op run '--env-file={{config_root}}/deployment/.env' -- terragrunt"
