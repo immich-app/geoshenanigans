@@ -10,7 +10,7 @@ description = "Wrapper for terragrunt"
 dir = "{{cwd}}"
 
 [tasks."tg:fmt"]
-run = "mise run tg hclfmt"
+run = "mise run tg hcl fmt"
 description = "Format terragrunt files"
 
 [tasks.tf]
