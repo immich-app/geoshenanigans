@@ -103,7 +103,7 @@ jobs:
           github_token: ${{ steps.token.outputs.token }}
 
       - name: Check Formatting
-        run: terragrunt hclfmt --terragrunt-check --terragrunt-diff
+        run: terragrunt hcl fmt --check --diff
 
       - name: Check TF fmt
         env:
