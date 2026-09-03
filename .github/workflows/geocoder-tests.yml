@@ -1,0 +1,41 @@
+name: Geocoder Tests
+
+on:
+  pull_request:
+    paths:
+      - "geocoder/builder/**"
+      - "geocoder/server/**"
+      - ".github/workflows/geocoder-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  builder-tests:
+    name: Builder unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake libzstd-dev zlib1g-dev libprotozero-dev \
+            libbz2-dev libexpat1-dev libs2-dev
+      - name: Build + run tests
+        run: |
+          cd geocoder/builder && mkdir -p build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          make -j$(nproc) geocoder-tests
+          ./geocoder-tests
+
+  server-tests:
+    name: Server unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        run: |
+          cd geocoder/server
+          cargo test --release
