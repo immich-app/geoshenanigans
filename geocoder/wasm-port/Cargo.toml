@@ -1,0 +1,30 @@
+[package]
+name = "geocoder-wasm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Single source of truth for the geocoding logic. The query-server
+# crate's Cargo.toml gates its own native-only deps (axum, tokio,
+# memmap2, etc.) by `cfg(not(target_arch = "wasm32"))`, so this path
+# dep doesn't pull them in for wasm builds.
+query-server = { path = "../server" }
+
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+serde-wasm-bindgen = "0.6"
+serde_json = "1"
+getrandom = { version = "0.2", features = ["js"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+
+[package.metadata.wasm-pack.profile.release]
+# Bundled wasm-opt is too old for the bulk-memory + non-trapping-fp
+# features rustc 1.88 emits. Disable; rustc -O3 + LTO does the work.
+wasm-opt = false

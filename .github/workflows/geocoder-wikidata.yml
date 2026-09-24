@@ -1,0 +1,127 @@
+name: Update Wikidata Sitelinks
+
+on:
+  schedule:
+    - cron: '17 3 * * 0'  # Weekly on Sunday at 3:17 UTC
+  workflow_dispatch:
+
+env:
+  S3_BUCKET: geoshenanigans-reverse-geocoding
+  S3_ENDPOINT: https://t3.storage.dev
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Install tools
+        run: |
+          curl -sL "https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-64bit.tar.gz" \
+            -o /tmp/s5cmd.tar.gz
+          sudo tar xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd
+
+      - name: Configure credentials
+        run: |
+          echo "::add-mask::$AWS_ACCESS_KEY_ID"
+          echo "::add-mask::$AWS_SECRET_ACCESS_KEY"
+          echo "AWS_ACCESS_KEY_ID=$KEY" >> "$GITHUB_ENV"
+          echo "AWS_SECRET_ACCESS_KEY=$SECRET" >> "$GITHUB_ENV"
+        env:
+          KEY: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
+          SECRET: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
+
+      - name: Find latest Wikidata dump
+        id: dump
+        run: |
+          # Find the latest available dump date that has the wb_items_per_site file
+          DATES=$(curl -sL "https://dumps.wikimedia.org/wikidatawiki/" | grep -oP 'href="(\d{8})/"' | grep -oP '\d{8}' | sort -r)
+          LATEST=""
+          for DATE in $DATES; do
+            URL="https://dumps.wikimedia.org/wikidatawiki/$DATE/wikidatawiki-${DATE}-wb_items_per_site.sql.gz"
+            STATUS=$(curl -sI "$URL" 2>/dev/null | head -1 | awk '{print $2}')
+            if [ "$STATUS" = "200" ]; then
+              LATEST="$DATE"
+              echo "Found available dump: $DATE"
+              break
+            fi
+            echo "Dump $DATE: file not ready (HTTP $STATUS)"
+          done
+          if [ -z "$LATEST" ]; then
+            echo "::error::No available wb_items_per_site dump found"
+            exit 1
+          fi
+          echo "Latest dump: $LATEST"
+          echo "date=$LATEST" >> "$GITHUB_OUTPUT"
+
+          # Check if we already have this version cached
+          S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 3"
+          EXISTING=$($S5 cat "s3://$S3_BUCKET/geocoder/wikidata/latest.json" 2>/dev/null || echo '{}')
+          EXISTING_DATE=$(echo "$EXISTING" | jq -r '.dump_date // ""' 2>/dev/null)
+          if [ "$EXISTING_DATE" = "$LATEST" ]; then
+            echo "Already up to date (dump $LATEST)"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "New dump available: $LATEST (current: $EXISTING_DATE)"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download and extract sitelinks
+        if: steps.dump.outputs.skip != 'true'
+        run: |
+          DUMP_DATE="${{ steps.dump.outputs.date }}"
+          URL="https://dumps.wikimedia.org/wikidatawiki/$DUMP_DATE/wikidatawiki-${DUMP_DATE}-wb_items_per_site.sql.gz"
+          echo "Downloading $URL..."
+          START=$(date +%s)
+          curl -sL "$URL" -o /tmp/wb_items_per_site.sql.gz
+          SIZE=$(stat -c%s /tmp/wb_items_per_site.sql.gz)
+          echo "Downloaded: $((SIZE / 1024 / 1024)) MiB in $(($(date +%s) - START))s"
+
+          echo "Extracting sitelinks..."
+          START=$(date +%s)
+          python3 geocoder/builder/tools/extract_wikidata_sitelinks.py \
+            /tmp/wb_items_per_site.sql.gz \
+            -o /tmp/qid_sitelinks.bin
+          echo "Extraction completed in $(($(date +%s) - START))s"
+          echo "Output: $(stat -c%s /tmp/qid_sitelinks.bin) bytes ($(( $(stat -c%s /tmp/qid_sitelinks.bin) / 6 )) entries)"
+
+      - name: Upload to Tigris
+        if: steps.dump.outputs.skip != 'true'
+        run: |
+          S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5"
+          DUMP_DATE="${{ steps.dump.outputs.date }}"
+
+          # Upload dated version
+          $S5 cp /tmp/qid_sitelinks.bin "s3://$S3_BUCKET/geocoder/wikidata/$DUMP_DATE/qid_sitelinks.bin"
+
+          # Update latest.json
+          jq -n \
+            --arg dump_date "$DUMP_DATE" \
+            --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --argjson entries "$(( $(stat -c%s /tmp/qid_sitelinks.bin) / 6 ))" \
+            --argjson size_bytes "$(stat -c%s /tmp/qid_sitelinks.bin)" \
+            '{dump_date: $dump_date, entries: $entries, size_bytes: $size_bytes, updated_at: $updated_at}' \
+            | $S5 pipe "s3://$S3_BUCKET/geocoder/wikidata/latest.json"
+
+          echo "Uploaded to s3://$S3_BUCKET/geocoder/wikidata/$DUMP_DATE/"
+          $S5 cat "s3://$S3_BUCKET/geocoder/wikidata/latest.json" | jq .
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Wikidata Sitelinks Update" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.dump.outputs.skip }}" = "true" ]; then
+            echo "Already up to date (dump ${{ steps.dump.outputs.date }})" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- Dump date: ${{ steps.dump.outputs.date }}" >> "$GITHUB_STEP_SUMMARY"
+            if [ -f /tmp/qid_sitelinks.bin ]; then
+              echo "- Entries: $(( $(stat -c%s /tmp/qid_sitelinks.bin) / 6 ))" >> "$GITHUB_STEP_SUMMARY"
+              echo "- Size: $(( $(stat -c%s /tmp/qid_sitelinks.bin) / 1024 / 1024 )) MiB" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
