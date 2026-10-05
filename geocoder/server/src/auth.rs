@@ -55,13 +55,17 @@ pub struct Db {
 }
 
 impl Db {
-    pub fn load(path: &str) -> Self {
-        let mut db = match fs::read_to_string(path) {
-            Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
-            Err(_) => Db::default(),
+    /// A missing file is a fresh deployment. An unreadable one is an error:
+    /// treating it as empty would let the next /login claim admin.
+    pub fn load(path: &str) -> Result<Self, String> {
+        let mut db: Db = match fs::read_to_string(path) {
+            Ok(data) => serde_json::from_str(&data)
+                .map_err(|e| format!("Failed to parse {}: {}", path, e))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Db::default(),
+            Err(e) => return Err(format!("Failed to read {}: {}", path, e)),
         };
         db.path = path.to_string();
-        db
+        Ok(db)
     }
 
     fn save(&self) -> std::io::Result<()> {
@@ -479,6 +483,25 @@ mod tests {
         db.sessions.insert("root-session".to_string(), "root".to_string());
         db.sessions.insert("alice-session".to_string(), "alice".to_string());
         db
+    }
+
+    #[test]
+    fn load_refuses_unreadable_database() {
+        let dir = std::env::temp_dir().join(format!("gc_auth_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("geocoder.json");
+        let path = path.to_str().unwrap();
+
+        let missing = Db::load(path);
+        std::fs::write(path, "{\"users\": {").unwrap();
+        let corrupt = Db::load(path);
+        std::fs::write(path, "{\"users\": {}, \"tokens\": {\"k\": \"root\"}}").unwrap();
+        let valid = Db::load(path);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(missing.unwrap().users.is_empty());
+        assert!(corrupt.is_err(), "a corrupt database must not silently become an empty one");
+        assert_eq!(valid.unwrap().tokens.get("k").map(String::as_str), Some("root"));
     }
 
     #[test]

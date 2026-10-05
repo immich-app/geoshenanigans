@@ -354,7 +354,13 @@ async fn async_main() {
     let search_distance = arg_value("--search-distance").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_SEARCH_DISTANCE);
 
     let db_path = format!("{}/geocoder.json", data_dir);
-    let db = auth::Db::load(&db_path);
+    let db = match auth::Db::load(&db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("Error: {} (fix or remove it; an empty account database lets the next login claim admin)", e);
+            std::process::exit(1);
+        }
+    };
 
     eprintln!("Loading index from {}...", data_dir);
     let index = match MultiIndex::load(data_dir, street_cell_level, admin_cell_level, search_distance) {
