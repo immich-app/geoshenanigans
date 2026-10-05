@@ -15,7 +15,8 @@ static const char CACHE_MAGIC[8] = {'T','G','C','A','C','H','E','\0'};
 // v3: no format change vs v2, but versions <=2 predate POI / place /
 // parent-chain / postcode / strategy-2 data entirely — a stale cache
 // deserialized cleanly and silently produced an index missing all of it.
-static const uint32_t CACHE_VERSION = 3;
+// v4: WayHeader/InterpWay node_count widened to uint16_t.
+static const uint32_t CACHE_VERSION = 4;
 static const uint32_t CACHE_SECTION_COUNT = 13;
 
 template<typename T>

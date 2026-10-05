@@ -68,17 +68,12 @@ inline size_t detect_stride_from_file(const std::string& path, std::initializer_
 // --- Binary record structs (must match types.h and server) ---
 
 #pragma pack(push, 1)
-struct PatchWayHeader {
-    uint32_t node_offset;
-    uint8_t node_count;
-    uint32_t name_id;
-};
-static_assert(sizeof(PatchWayHeader) == 9, "WayHeader must be 9 bytes packed");
-// name_id byte offset within a street WayHeader record. The builder may emit
-// the struct packed (stride 9, name_id at 5) or padded (stride 12, name_id at
-// 8); pick by the detected stride.
+// name_id byte offset within a street WayHeader record. The builder writes
+// the padded layout (stride 12, name_id at 8); legacy builds wrote it packed
+// (stride 9, name_id at 5). Pick by the detected stride.
 static constexpr size_t WAY_HEADER_NAME_ID_OFF_PADDED = 8;
 static constexpr size_t WAY_HEADER_NAME_ID_OFF_PACKED = 5;
+static constexpr size_t WAY_HEADER_STRIDE_PACKED = 9;
 
 struct PatchAddrPoint {
     float lat;
@@ -107,19 +102,21 @@ static_assert(sizeof(PatchNodeCoord) == 8, "NodeCoord must be 8 bytes");
 // InterpWay and AdminPolygon have compiler-dependent padding.
 // Read them field-by-field instead of struct-casting.
 
-struct PatchInterpWay {
-    uint32_t node_offset;
-    uint8_t node_count;
-    uint32_t street_id;
-    uint32_t start_number;
-    uint32_t end_number;
-    uint8_t interpolation;
-};
 // street_id byte offset within an InterpWay record. node_count is followed by
-// 3 padding bytes at stride>=20 (street_id at 8) or no padding at stride 18
+// padding at stride>=20 (street_id at 8) or no padding at stride 18
 // (street_id at 5).
 static constexpr size_t INTERP_WAY_STREET_ID_OFF_PADDED = 8;
 static constexpr size_t INTERP_WAY_STREET_ID_OFF_PACKED = 5;
+static constexpr size_t INTERP_WAY_STRIDE_PACKED = 18;
+
+// node_count of a WayHeader / InterpWay record: u16 at byte 4 in the padded
+// layouts the builder writes, u8 in the legacy packed layouts (stride 9 / 18).
+inline uint32_t record_node_count(const char* rec, size_t stride, size_t packed_stride) {
+    if (stride == packed_stride) return static_cast<uint8_t>(rec[4]);
+    uint16_t n;
+    memcpy(&n, rec + 4, 2);
+    return n;
+}
 
 struct PatchAdminPolygon {
     uint32_t vertex_offset;

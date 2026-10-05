@@ -10,11 +10,10 @@ export const PLACE_NODE_SIZE = 20;    // f32 lat + f32 lng + u32 name + u8 type 
 export const POI_RECORD_SIZE = 36;    // f32 lat + f32 lng + u32 vert_off + u32 vert_count + u32 name + 4 bytes (cat,tier,flags,imp) + u32 parent_street + u32 parent_postcode + u32 parent_poly
 // AddrPoint: f32 lat + f32 lng + u32 housenumber + u32 street + u32 parent_way + u32 vert_off + u32 vert_count = 28 bytes
 export const ADDR_POINT_SIZE = 28;
-// WayHeader: u32 node_offset + u8 node_count + u32 name_id with #[repr(C)]
-// alignment is 12 bytes (3 bytes padding after node_count). Detected
-// from file size at load time (planet builds = 12, older = 9).
+// WayHeader: u32 node_offset + u16 node_count + u32 name_id with #[repr(C)]
+// alignment is 12 bytes (2 bytes padding after node_count).
 export const WAY_HEADER_SIZE_DEFAULT = 12;
-// InterpWay: u32 node_offset + u8 node_count + u32 street_id + u32 start_number + u32 end_number + u8 interpolation
+// InterpWay: u32 node_offset + u16 node_count + u32 street_id + u32 start_number + u32 end_number + u8 interpolation
 // = 24 bytes with #[repr(C)] padding. Older build_versions used 18 / 20.
 export const INTERP_WAY_SIZE_DEFAULT = 24;
 // PostcodeCentroid: f32 lat + f32 lng + u32 postcode_id + u16 cc + u16 pad

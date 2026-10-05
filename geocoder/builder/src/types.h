@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 #include <string>
@@ -8,10 +9,13 @@
 
 struct WayHeader {
     uint32_t node_offset;
-    uint8_t node_count;
+    uint16_t node_count;
+    uint16_t _pad = 0;  // explicit so the written bytes are deterministic
     uint32_t name_id;
 };
 static_assert(sizeof(WayHeader) == 12, "WayHeader must be 12 bytes");
+static_assert(offsetof(WayHeader, node_count) == 4 && offsetof(WayHeader, name_id) == 8,
+              "geocoder-diff and the server read WayHeader fields at fixed offsets");
 
 struct AddrPoint {
     float lat;
@@ -37,8 +41,8 @@ static_assert(sizeof(PostcodeCentroid) == 16, "PostcodeCentroid must be 16 bytes
 
 struct InterpWay {
     uint32_t node_offset;
-    uint8_t node_count;
-    uint8_t _pad1 = 0, _pad2 = 0, _pad3 = 0; // explicit padding
+    uint16_t node_count;
+    uint16_t _pad1 = 0; // explicit padding
     uint32_t street_id;
     uint32_t start_number;
     uint32_t end_number;
@@ -46,6 +50,8 @@ struct InterpWay {
     uint8_t _pad4 = 0, _pad5 = 0, _pad6 = 0; // explicit padding
 };
 static_assert(sizeof(InterpWay) == 24, "InterpWay must be 24 bytes");
+static_assert(offsetof(InterpWay, node_count) == 4 && offsetof(InterpWay, street_id) == 8,
+              "geocoder-diff and the server read InterpWay fields at fixed offsets");
 
 // Place type override for admin polygons, derived from either a place/
 // linked_place tag on the boundary itself, or the place type of a
@@ -148,7 +154,7 @@ enum class SimplifyMode { MaxVertices, ErrorBounded };
 
 // Processing limits
 static constexpr size_t MAX_BLOCK_QUEUE         = 64;    // producer-consumer queue depth
-static constexpr int    MAX_NODE_COUNT          = 255;   // uint8_t node_count
+static constexpr int    MAX_NODE_COUNT          = 65535; // uint16_t node_count (OSM caps ways at 2000)
 static constexpr int    MAX_VERTEX_COUNT        = 0x7FFFFFFF; // uint32_t vertex_count
 static constexpr int    MAX_S2_CELLS_PER_POLY   = 200;   // S2RegionCoverer max_cells
 static constexpr int    BACKTRACK_CALL_BUDGET   = 100000; // per-ring backtracking limit
@@ -166,13 +172,13 @@ enum class IndexMode { Full, NoAddresses, AdminOnly };
 struct DeferredWay {
     uint32_t way_id;
     uint32_t node_offset;
-    uint8_t node_count;
+    uint16_t node_count;
 };
 
 struct DeferredInterp {
     uint32_t interp_id;
     uint32_t node_offset;
-    uint8_t node_count;
+    uint16_t node_count;
 };
 
 // Collected relation data for parallel admin assembly

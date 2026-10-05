@@ -240,7 +240,7 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
                 }
             }
 
-            if (nodes.size() < 2 || nodes.size() > 255) continue;
+            if (nodes.size() < 2 || nodes.size() > MAX_NODE_COUNT) continue;
 
             // As Nominatim's tiger_line_import: store the range ascending
             // with the geometry running from the start number (TIGER gives
@@ -264,7 +264,7 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
 
             InterpWay iw{};
             iw.node_offset = node_offset;
-            iw.node_count = static_cast<uint8_t>(nodes.size());
+            iw.node_count = static_cast<uint16_t>(nodes.size());
             iw.street_id = data.string_pool.intern(street);
             iw.start_number = static_cast<uint32_t>(from_num);
             iw.end_number = static_cast<uint32_t>(to_num);
@@ -555,8 +555,8 @@ static void compute_way_parent_polygons(ParsedData& data, const BuildConfig& cfg
                     if (w.node_count < 1) continue;
                     // Compute way centroid
                     float sum_lat = 0, sum_lng = 0;
-                    uint8_t cnt = w.node_count;
-                    for (uint8_t k = 0; k < cnt; k++) {
+                    uint16_t cnt = w.node_count;
+                    for (uint16_t k = 0; k < cnt; k++) {
                         sum_lat += data.street_nodes[w.node_offset + k].lat;
                         sum_lng += data.street_nodes[w.node_offset + k].lng;
                     }
@@ -648,8 +648,8 @@ static void compute_way_parent_polygons(ParsedData& data, const BuildConfig& cfg
                                 // ways (interpolations aren't in
                                 // this loop since they're separate).
                                 uint8_t samples = cnt < 16 ? cnt : 16;
-                                uint8_t step = cnt > samples ? cnt / samples : 1;
-                                for (uint8_t k = 0; k < cnt; k += step) {
+                                uint32_t step = cnt > samples ? cnt / samples : 1;
+                                for (uint32_t k = 0; k < cnt; k += step) {
                                     const auto& nd = data.street_nodes[w.node_offset + k];
                                     if (poly_contains(pid, nd.lat, nd.lng)) {
                                         tally_postal(pid, cand.area);
@@ -673,8 +673,8 @@ static void compute_way_parent_polygons(ParsedData& data, const BuildConfig& cfg
                         for (auto& pv : postal_votes) {
                             pv.votes = 0;
                             uint8_t samples = cnt < 16 ? cnt : 16;
-                            uint8_t step = cnt > samples ? cnt / samples : 1;
-                            for (uint8_t k = 0; k < cnt; k += step) {
+                            uint32_t step = cnt > samples ? cnt / samples : 1;
+                            for (uint32_t k = 0; k < cnt; k += step) {
                                 const auto& nd = data.street_nodes[w.node_offset + k];
                                 if (poly_contains(pv.pid, nd.lat, nd.lng)) pv.votes++;
                             }
@@ -755,12 +755,12 @@ static void for_each_named_street_segment(const ParsedData& data,
             // Only named streets matter for parent linking.
             if (w.name_id == NO_DATA) continue;
             uint32_t off = w.node_offset;
-            uint8_t cnt = w.node_count;
+            uint16_t cnt = w.node_count;
             if (cnt < 2) continue;
             if (static_cast<size_t>(off) + cnt > data.street_nodes.size()) continue;
             // Point-to-segment distance in local-flat approximation
             // (good enough for nearest-street ranking).
-            for (uint8_t k = 0; k + 1 < cnt; k++) {
+            for (uint16_t k = 0; k + 1 < cnt; k++) {
                 const auto& a = data.street_nodes[off + k];
                 const auto& b = data.street_nodes[off + k + 1];
                 double ax = (a.lng - plng) * cos_lat;
@@ -1505,7 +1505,7 @@ static void compute_s2_cells_ways_interp(ParsedData& data, const BuildConfig& cf
                     if (i >= data.deferred_ways.size()) break;
                     const auto& dw = data.deferred_ways[i];
                     way_cells.clear();
-                    for (uint8_t j = 0; j + 1 < dw.node_count; j++) {
+                    for (uint16_t j = 0; j + 1 < dw.node_count; j++) {
                         const auto& n1 = data.street_nodes[dw.node_offset + j];
                         const auto& n2 = data.street_nodes[dw.node_offset + j + 1];
                         cover_edge(n1.lat, n1.lng, n2.lat, n2.lng, edge_cells);
@@ -1539,7 +1539,7 @@ static void compute_s2_cells_ways_interp(ParsedData& data, const BuildConfig& cf
                     if (i >= data.deferred_interps.size()) break;
                     const auto& di = data.deferred_interps[i];
                     way_cells.clear();
-                    for (uint8_t j = 0; j + 1 < di.node_count; j++) {
+                    for (uint16_t j = 0; j + 1 < di.node_count; j++) {
                         const auto& n1 = data.interp_nodes[di.node_offset + j];
                         const auto& n2 = data.interp_nodes[di.node_offset + j + 1];
                         cover_edge(n1.lat, n1.lng, n2.lat, n2.lng, edge_cells);
@@ -2525,8 +2525,8 @@ static void reorder_deterministically(ParsedData& data, std::vector<float>& poi_
                 if (wa.name_id != wb.name_id) return wa.name_id < wb.name_id;
                 if (wa.node_count != wb.node_count) return wa.node_count < wb.node_count;
                 // Compare all nodes for total order
-                uint8_t nc = std::min(wa.node_count, wb.node_count);
-                for (uint8_t j = 0; j < nc; j++) {
+                uint16_t nc = std::min(wa.node_count, wb.node_count);
+                for (uint16_t j = 0; j < nc; j++) {
                     uint32_t la = float_bits(data.street_nodes[wa.node_offset + j].lat);
                     uint32_t lb = float_bits(data.street_nodes[wb.node_offset + j].lat);
                     if (la != lb) return la < lb;
@@ -2551,7 +2551,7 @@ static void reorder_deterministically(ParsedData& data, std::vector<float>& poi_
             for (uint32_t i = 0; i < n; i++) {
                 auto w = data.ways[order[i]];
                 uint32_t old_off = w.node_offset;
-                uint8_t nc = w.node_count;
+                uint16_t nc = w.node_count;
 
                 // Check if this way is identical to the previous one (dedup)
                 bool is_dup = false;
@@ -2559,7 +2559,7 @@ static void reorder_deterministically(ParsedData& data, std::vector<float>& poi_
                     auto& prev = new_ways.back();
                     if (prev.name_id == w.name_id && prev.node_count == nc) {
                         is_dup = true;
-                        for (uint8_t j = 0; j < nc && is_dup; j++) {
+                        for (uint16_t j = 0; j < nc && is_dup; j++) {
                             auto& pn = data.street_nodes[old_off + j];
                             auto& qn = new_nodes[prev.node_offset + j];
                             if (memcmp(&pn, &qn, sizeof(NodeCoord)) != 0) is_dup = false;
@@ -2573,7 +2573,7 @@ static void reorder_deterministically(ParsedData& data, std::vector<float>& poi_
                 } else {
                     old_to_new[order[i]] = static_cast<uint32_t>(new_ways.size());
                     w.node_offset = static_cast<uint32_t>(new_nodes.size());
-                    for (uint8_t j = 0; j < nc; j++)
+                    for (uint16_t j = 0; j < nc; j++)
                         new_nodes.push_back(data.street_nodes[old_off + j]);
                     new_ways.push_back(w);
                 }
@@ -2641,8 +2641,8 @@ static void reorder_deterministically(ParsedData& data, std::vector<float>& poi_
                 if (ia.start_number != ib.start_number) return ia.start_number < ib.start_number;
                 if (ia.end_number != ib.end_number) return ia.end_number < ib.end_number;
                 if (ia.interpolation != ib.interpolation) return ia.interpolation < ib.interpolation;
-                uint8_t nc = std::min(ia.node_count, ib.node_count);
-                for (uint8_t j = 0; j < nc; j++) {
+                uint16_t nc = std::min(ia.node_count, ib.node_count);
+                for (uint16_t j = 0; j < nc; j++) {
                     uint32_t la = float_bits(data.interp_nodes[ia.node_offset + j].lat);
                     uint32_t lb = float_bits(data.interp_nodes[ib.node_offset + j].lat);
                     if (la != lb) return la < lb;
@@ -2691,7 +2691,7 @@ static void reorder_deterministically(ParsedData& data, std::vector<float>& poi_
                         prev.interpolation == cur.interpolation &&
                         prev.node_count == cur.node_count) {
                         is_dup = true;
-                        for (uint8_t j = 0; j < cur.node_count; j++) {
+                        for (uint16_t j = 0; j < cur.node_count; j++) {
                             if (memcmp(&new_nodes[prev.node_offset + j],
                                        &data.interp_nodes[old_off + j],
                                        sizeof(NodeCoord)) != 0) { is_dup = false; break; }
@@ -2704,7 +2704,7 @@ static void reorder_deterministically(ParsedData& data, std::vector<float>& poi_
                     old_to_new[oi] = static_cast<uint32_t>(new_interps.size());
                     InterpWay iw = cur;
                     iw.node_offset = static_cast<uint32_t>(new_nodes.size());
-                    for (uint8_t j = 0; j < iw.node_count; j++)
+                    for (uint16_t j = 0; j < iw.node_count; j++)
                         new_nodes.push_back(data.interp_nodes[old_off + j]);
                     if (have_interp_osm) new_osm.push_back(data.interp_osm_ids[oi]);
                     if (have_interp_pc) new_pc.push_back(data.interp_postcode_ids[oi]);
@@ -4230,7 +4230,7 @@ int main(int argc, char* argv[]) {
                                 if (std::strcmp(t_interpolation, "even") == 0) interp_type = 1;
                                 else if (std::strcmp(t_interpolation, "odd") == 0) interp_type = 2;
                                 InterpWay iw{}; iw.node_offset = node_offset;
-                                iw.node_count = static_cast<uint8_t>(std::min(refs_size, size_t(255)));
+                                iw.node_count = static_cast<uint16_t>(std::min(refs_size, size_t(MAX_NODE_COUNT)));
                                 iw.interpolation = interp_type;
                                 local.interp_ways.push_back(iw);
                                 local.interp_osm_way_ids.push_back(way_id);
@@ -4298,7 +4298,7 @@ int main(int argc, char* argv[]) {
                             for (const auto& loc : resolved_locs)
                                 local.street_nodes.push_back({static_cast<float>(loc.lat()), static_cast<float>(loc.lon())});
                             WayHeader header{}; header.node_offset = noff;
-                            header.node_count = static_cast<uint8_t>(std::min(refs_size, size_t(255)));
+                            header.node_count = static_cast<uint16_t>(std::min(refs_size, size_t(MAX_NODE_COUNT)));
                             local.ways.push_back(header);
                             local.way_osm_ids.push_back(way_id);
                             local.way_strings.push_back(t_best_name);

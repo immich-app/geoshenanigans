@@ -304,11 +304,12 @@ static void fixup_way_offsets(char* old_ways, size_t old_ways_size,
     size_t old_nc = old_nodes_size / 8, new_nc = new_nodes_size / 8;
 
     auto way_hash = [&](const char* w, const char* nodes, size_t max_n) -> uint64_t {
-        uint32_t node_offset, name_id; uint8_t node_count;
-        memcpy(&node_offset, w, 4); node_count = (uint8_t)w[4]; memcpy(&name_id, w + name_off, 4);
+        uint32_t node_offset, name_id;
+        memcpy(&node_offset, w, 4); memcpy(&name_id, w + name_off, 4);
+        uint32_t node_count = record_node_count(w, stride, WAY_HEADER_STRIDE_PACKED);
         uint64_t h = 14695981039346656037ULL;
         h = fnv_mix(h, name_id); h = fnv_mix(h, node_count);
-        for (uint8_t j = 0; j < node_count && (node_offset + j) < max_n; j++) {
+        for (uint32_t j = 0; j < node_count && (node_offset + j) < max_n; j++) {
             float lat, lng;
             size_t off = node_byte_offset(node_offset + j);
             memcpy(&lat, nodes + off, 4);
@@ -552,15 +553,16 @@ static void fixup_interp_offsets(char* old_data, size_t old_size,
     size_t old_nc = old_nodes_size / 8, new_nc = new_nodes_size / 8;
 
     auto ihash = [&](const char* p, const char* nodes, size_t max_n) -> uint64_t {
-        uint32_t node_offset, street_id, start, end; uint8_t count, itype;
-        memcpy(&node_offset, p, 4); count = (uint8_t)p[4];
+        uint32_t node_offset, street_id, start, end; uint8_t itype;
+        memcpy(&node_offset, p, 4);
+        uint32_t count = record_node_count(p, stride, INTERP_WAY_STRIDE_PACKED);
         memcpy(&street_id, p + street_off, 4); memcpy(&start, p + street_off + 4, 4);
         memcpy(&end, p + street_off + 8, 4);
         itype = (street_off + 12 < stride) ? (uint8_t)p[street_off + 12] : 0;
         uint64_t h = 14695981039346656037ULL;
         h = fnv_mix(h, street_id); h = fnv_mix(h, start); h = fnv_mix(h, end);
         h = fnv_mix(h, itype); h = fnv_mix(h, count);
-        for (uint8_t j = 0; j < count && (node_offset + j) < max_n; j++) {
+        for (uint32_t j = 0; j < count && (node_offset + j) < max_n; j++) {
             float lat, lng;
             size_t off = node_byte_offset(node_offset + j);
             memcpy(&lat, nodes + off, 4); memcpy(&lng, nodes + off + 4, 4);
@@ -967,13 +969,10 @@ int main(int argc, char* argv[]) {
     // Group 4: admin_polygons → admin_vertices (sequential within group)
     FileMergeResult res_addr, res_addr_v, res_ways, res_nodes, res_interp_w, res_interp_n, res_admin_p, res_admin_v, res_poi_r, res_poi_v, res_place_n;
 
-    // Helper to build parent-aware node merge from a parent way merge
-    // count_u32: true for admin_polygons (vertex_count is uint32_t at offset 4)
-    //            false for street_ways/interp_ways (node_count is uint8_t at offset 4)
-    // count_u32: true for admin_polygons/poi_records (vertex_count is uint32_t)
-    //            false for street_ways/interp_ways (node_count is uint8_t at offset 4)
-    // off_field_pos: byte offset of the offset field (0 for ways/admin, 8 for POI records)
-    // count_field_pos: byte offset of the count field (4 for all current types)
+    // build_child_merge (below) builds the node merge of street_ways /
+    // interp_ways from the parent way merge: node_count is read with
+    // record_node_count (u16 at byte 4; u8 in the legacy packed strides),
+    // off_field_pos is the byte offset of node_offset (0 for both).
     // Byte-block merge for the v15 variable-stride vertex stream
     // (admin_vertices / poi_vertices). The vertex bytes for polygon i
     // live at the polygon's `vertex_offset` and run until the next
@@ -1097,12 +1096,11 @@ int main(int argc, char* argv[]) {
                                  const char* new_parent, size_t new_parent_size,
                                  const char* old_child, size_t old_child_size,
                                  const char* new_child, size_t new_child_size,
-                                 size_t parent_stride, bool count_u32,
-                                 size_t off_field_pos = 0, size_t count_field_pos = 4) -> MergeSequence {
+                                 size_t parent_stride, size_t packed_stride,
+                                 size_t off_field_pos = 0) -> MergeSequence {
         MergeSequence seq;
         auto read_count = [&](const char* rec) -> uint32_t {
-            if (count_u32) { uint32_t v; memcpy(&v, rec + count_field_pos, 4); return v; }
-            return static_cast<uint32_t>(static_cast<uint8_t>(rec[count_field_pos]));
+            return record_node_count(rec, parent_stride, packed_stride);
         };
         auto read_off = [&](const char* rec) -> uint32_t {
             uint32_t v; memcpy(&v, rec + off_field_pos, 4); return v;
@@ -1393,10 +1391,10 @@ int main(int argc, char* argv[]) {
         auto way_seq = build_merge_seq(old_w.data, old_w.size, new_w.data, new_w.size, way_stride);
         size_t way_name_off = (way_stride == 12) ? 8 : 5;
         auto soft = secondary_match_from_merge(way_seq, old_w.data, old_w.size, new_w.data, new_w.size, way_stride,
-            [way_name_off](const char* rec) -> uint64_t {
+            [way_name_off, way_stride](const char* rec) -> uint64_t {
                 uint32_t name_id; memcpy(&name_id, rec + way_name_off, 4);
-                uint8_t nc = static_cast<uint8_t>(rec[4]);
-                return ((uint64_t)name_id << 8) | nc;
+                uint32_t nc = record_node_count(rec, way_stride, WAY_HEADER_STRIDE_PACKED);
+                return ((uint64_t)name_id << 16) | nc;
             });
         auto id_rm = derive_id_remap_from_merge(way_seq, old_w.size / way_stride, way_stride);
         for (auto& [o,n] : soft) if (o < id_rm.size()) id_rm[o] = n;
@@ -1411,7 +1409,8 @@ int main(int argc, char* argv[]) {
         for (size_t i = 0; i < wn; i++) memcpy(old_w.data + i * way_stride, &old_offsets[i], 4);
         if (old_n.data && new_n.data) {
             auto node_seq = build_child_merge(way_seq, old_w.data, old_w.size, new_w.data, new_w.size,
-                                               old_n.data, old_n.size, new_n.data, new_n.size, way_stride, false);
+                                               old_n.data, old_n.size, new_n.data, new_n.size, way_stride,
+                                               WAY_HEADER_STRIDE_PACKED);
             res_nodes = {PatchFileId::STREET_NODES, "street_nodes.bin", 8,
                          old_n.size, new_n.size, std::move(node_seq), {}};
         } else {
@@ -1440,13 +1439,7 @@ int main(int argc, char* argv[]) {
     std::thread t_interp([&]() {
         double gs = now_ms();
         auto old_data = mmap_file_rw(old_dir + "/interp_ways.bin");
-        auto new_data = mmap_file_rw(new_dir + "/interp_ways.bin");  // COW: need to zero padding
-        if (interp_stride == 24) {
-            for (size_t i = 0; i + interp_stride <= old_data.size; i += interp_stride)
-                { memset(old_data.data+i+5, 0, 3); memset(old_data.data+i+21, 0, 3); }
-            for (size_t i = 0; i + interp_stride <= new_data.size; i += interp_stride)
-                { memset(new_data.data+i+5, 0, 3); memset(new_data.data+i+21, 0, 3); }
-        }
+        auto new_data = mmap_file_rw(new_dir + "/interp_ways.bin");
         remap_field(old_data.data, old_data.size, interp_stride, interp_stride >= 20 ? 8 : 5, str_remap);
         auto old_n = mmap_file(old_dir + "/interp_nodes.bin");
         auto new_n = mmap_file(new_dir + "/interp_nodes.bin");
@@ -1476,7 +1469,8 @@ int main(int argc, char* argv[]) {
         log_merge(res_interp_w);
         for (size_t i = 0; i < n; i++) memcpy(old_data.data + i * interp_stride, &old_offsets[i], 4);
         auto in_seq = build_child_merge(iw_seq, old_data.data, old_data.size, new_data.data, new_data.size,
-                                         old_n.data, old_n.size, new_n.data, new_n.size, interp_stride, false);
+                                         old_n.data, old_n.size, new_n.data, new_n.size, interp_stride,
+                                         INTERP_WAY_STRIDE_PACKED);
         res_interp_n = {PatchFileId::INTERP_NODES, "interp_nodes.bin", 8,
                         old_n.size, new_n.size, std::move(in_seq), {}};
         log_merge(res_interp_n);

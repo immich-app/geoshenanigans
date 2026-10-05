@@ -173,7 +173,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
             const auto& w = full.ways[old_id];
             if (polygon && w.node_count > 0) {
                 bool any_inside = false;
-                for (uint8_t n = 0; n < w.node_count; n++) {
+                for (uint16_t n = 0; n < w.node_count; n++) {
                     const auto& nd = full.street_nodes[w.node_offset + n];
                     if (point_in_polygon(nd.lat, nd.lng, *polygon)) { any_inside = true; break; }
                 }
@@ -184,7 +184,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
             nw.node_offset = static_cast<uint32_t>(nodes.size());
             ways.push_back(nw);
             osm_ids.push_back(old_id < full.way_osm_ids.size() ? full.way_osm_ids[old_id] : 0);
-            for (uint8_t n = 0; n < w.node_count; n++)
+            for (uint16_t n = 0; n < w.node_count; n++)
                 nodes.push_back(full.street_nodes[w.node_offset + n]);
         }
         return std::make_tuple(std::move(remap), std::move(ways), std::move(nodes), std::move(osm_ids));
@@ -243,7 +243,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
             niw.node_offset = static_cast<uint32_t>(inodes.size());
             iways.push_back(niw);
             osm_ids.push_back(old_id < full.interp_osm_ids.size() ? full.interp_osm_ids[old_id] : 0);
-            for (uint8_t n = 0; n < iw.node_count; n++)
+            for (uint16_t n = 0; n < iw.node_count; n++)
                 inodes.push_back(full.interp_nodes[iw.node_offset + n]);
         }
         return std::make_tuple(std::move(remap), std::move(iways), std::move(inodes), std::move(osm_ids));

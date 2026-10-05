@@ -55,7 +55,7 @@ uint32_t add_interp(ParsedData& d,
                     uint32_t end_seed) {
     InterpWay iw{};
     iw.node_offset = static_cast<uint32_t>(d.interp_nodes.size());
-    iw.node_count = static_cast<uint8_t>(coords.size());
+    iw.node_count = static_cast<uint16_t>(coords.size());
     iw.street_id = street_id;
     iw.start_number = start_seed;
     iw.end_number = end_seed;

@@ -156,7 +156,7 @@ export function queryGeo(
 
         const wayOff = id * WAY_HEADER_SIZE_DEFAULT;
         const nodeOffset = streetWays.readUInt32LE(wayOff + 0);
-        const nodeCount = streetWays.readUInt8(wayOff + 4);
+        const nodeCount = streetWays.readUInt16LE(wayOff + 4);
         const nameId = streetWays.readUInt32LE(wayOff + 8);
         if (nodeCount < 2) return;
 
@@ -184,7 +184,7 @@ export function queryGeo(
         if (id >= totalInterps) return;
         const iwOff = id * INTERP_WAY_SIZE_DEFAULT;
         const nodeOffset = interpWays.readUInt32LE(iwOff + 0);
-        const nodeCount = interpWays.readUInt8(iwOff + 4);
+        const nodeCount = interpWays.readUInt16LE(iwOff + 4);
         const streetId = interpWays.readUInt32LE(iwOff + 8);
         const startNumber = interpWays.readUInt32LE(iwOff + 12);
         const endNumber = interpWays.readUInt32LE(iwOff + 16);

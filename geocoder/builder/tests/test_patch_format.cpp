@@ -6,6 +6,7 @@
 #include "patch_format.h"
 
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 #include "test_framework.h"
@@ -223,4 +224,21 @@ TEST(patch_format_node_byte_offset_past_2_pow_29) {
     CHECK_EQ(node_byte_offset(1u), (size_t)8);
     CHECK_EQ(node_byte_offset(1u << 29), (size_t)1 << 32);
     CHECK_EQ(node_byte_offset(0xFFFFFFFFu), (size_t)0xFFFFFFFFu * 8);
+}
+
+// --- record_node_count ---
+
+TEST(patch_format_record_node_count_reads_u16_and_legacy_u8) {
+    // Padded layouts (stride 12 / 24): u16 at byte 4, so roads past 255
+    // nodes keep their full count.
+    char way[12] = {};
+    uint16_t n = 1358;
+    std::memcpy(way + 4, &n, 2);
+    CHECK_EQ(record_node_count(way, 12, WAY_HEADER_STRIDE_PACKED), 1358u);
+    CHECK_EQ(record_node_count(way, 24, INTERP_WAY_STRIDE_PACKED), 1358u);
+    // Legacy packed layouts (stride 9 / 18): u8 at byte 4, next byte is data.
+    char packed[9] = {};
+    packed[4] = static_cast<char>(200);
+    packed[5] = static_cast<char>(0x7F);
+    CHECK_EQ(record_node_count(packed, 9, WAY_HEADER_STRIDE_PACKED), 200u);
 }
