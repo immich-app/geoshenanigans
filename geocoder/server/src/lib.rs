@@ -2814,28 +2814,7 @@ impl Index {
             });
         }
 
-        // Ordering:
-        //   1. Contained polygons first — the query is physically
-        //      inside them, so they beat any nearby point POI
-        //      regardless of score.
-        //   2. Within contained, sort by polygon area ascending —
-        //      smallest = most specific (Eiffel Tower over Field of
-        //      Mars over "Paris, Banks of the Seine"). Area beats
-        //      importance here: a wikidata-boosted attraction that
-        //      happens to be the bigger containing polygon should
-        //      not outrank the tiny, specific landmark the user
-        //      clicked on.
-        //   3. Non-contained POIs: by score descending (the usual
-        //      importance × proximity-decay).
-        results.sort_by(|a, b| {
-            use std::cmp::Ordering;
-            match (a.contained, b.contained) {
-                (true, false) => Ordering::Less,
-                (false, true) => Ordering::Greater,
-                (true, true) => a.area.partial_cmp(&b.area).unwrap_or(Ordering::Equal),
-                (false, false) => b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal),
-            }
-        });
+        results.sort_by(poi_order);
         // Dedup rules:
         //   - always drop duplicate NAMES regardless of containment
         //     (a user clicking once shouldn't see two "Starbucks" even
@@ -4296,6 +4275,29 @@ pub struct PoiMatch<'a> {
     pub area: f64,
 }
 
+/// Ordering of POI matches (and so the landmark, the first contained one):
+///   1. Contained polygons first — the query is physically inside them,
+///      so they beat any nearby point POI regardless of score.
+///   2. Within contained, polygon area ascending — smallest = most
+///      specific (Eiffel Tower over Field of Mars over "Paris, Banks of
+///      the Seine"). Area beats importance: a wikidata-boosted attraction
+///      that happens to be the bigger containing polygon should not
+///      outrank the tiny, specific landmark the user clicked on.
+///   3. Non-contained POIs: score descending (importance × proximity).
+///   4. Ties by name, then category. Never by record order, which
+///      differs between a fresh and a chained build of the same data.
+pub fn poi_order(a: &PoiMatch<'_>, b: &PoiMatch<'_>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a.contained, b.contained) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (true, true) => a.area.partial_cmp(&b.area).unwrap_or(Ordering::Equal),
+        (false, false) => b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal),
+    }
+    .then_with(|| a.name.cmp(b.name))
+    .then_with(|| a.category_id.cmp(&b.category_id))
+}
+
 #[derive(Default)]
 pub struct PlaceResult<'a> {
     pub city: Option<&'a str>,
@@ -4571,6 +4573,42 @@ pub fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
 #[cfg(test)]
 mod pure_helper_tests {
     use super::*;
+
+    // -- POI ordering ---------------------------------------------------------
+
+    fn poi<'a>(name: &'a str, category_id: u8, contained: bool, score: f64, area: f64) -> PoiMatch<'a> {
+        PoiMatch { name, category: "", category_id, distance_m: 0.0, contained, is_point: !contained, score, area }
+    }
+
+    fn sorted_names(mut pois: Vec<PoiMatch<'_>>) -> Vec<&str> {
+        pois.sort_by(poi_order);
+        pois.iter().map(|p| p.name).collect()
+    }
+
+    // Record order differs between a fresh and a chained build of the
+    // same data, so ties must not fall back to it (DC: the landmark
+    // flipped between National Mall and Henry Park).
+    #[test]
+    fn poi_order_breaks_ties_independent_of_record_order() {
+        let a = || vec![poi("National Mall", 10, true, 1.0, 2.5), poi("Henry Park", 11, true, 1.0, 2.5)];
+        let b = || vec![poi("Henry Park", 11, true, 1.0, 2.5), poi("National Mall", 10, true, 1.0, 2.5)];
+        assert_eq!(sorted_names(a()), sorted_names(b()));
+
+        let c = || vec![poi("소프소프", 4, false, 3.0, 0.0), poi("소프청담(SOP)", 4, false, 3.0, 0.0)];
+        let d = || vec![poi("소프청담(SOP)", 4, false, 3.0, 0.0), poi("소프소프", 4, false, 3.0, 0.0)];
+        assert_eq!(sorted_names(c()), sorted_names(d()));
+    }
+
+    #[test]
+    fn poi_order_keeps_primary_keys() {
+        let got = sorted_names(vec![
+            poi("far", 1, false, 1.0, 0.0),
+            poi("big", 1, true, 1.0, 9.0),
+            poi("near", 1, false, 5.0, 0.0),
+            poi("small", 1, true, 1.0, 1.0),
+        ]);
+        assert_eq!(got, vec!["small", "big", "near", "far"]);
+    }
 
     // -- postcode formatting / validation ------------------------------------
 
