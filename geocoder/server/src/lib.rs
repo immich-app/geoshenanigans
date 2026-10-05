@@ -1042,6 +1042,41 @@ fn street_tokens_overlap(a: &str, b: &str) -> bool {
 /// even/odd grid relative to start_number and clamps into [min, max] of the
 /// range — the old open-coded version computed the offset in unsigned space,
 /// so descending ranges (start > end) saturated the negative offset to 0.
+/// Squared distance (radians²) from the point to an interpolation line and
+/// the fraction along it, by length, of the closest point. None for a line
+/// without length.
+fn interp_position(nodes: &[NodeCoord], lat: f64, lng: f64, cos_lat: f64) -> Option<(f64, f64)> {
+    if nodes.len() < 2 { return None; }
+    let seg_len = |i: usize| {
+        let dlat = (nodes[i + 1].lat as f64 - nodes[i].lat as f64).to_radians();
+        let dlng = (nodes[i + 1].lng as f64 - nodes[i].lng as f64).to_radians();
+        // sqrt: dist_sq is squared length; accumulating squares
+        // skews the along-way fraction toward long segments.
+        dist_sq(dlat, dlng, cos_lat).sqrt()
+    };
+    let total_len: f64 = (0..nodes.len() - 1).map(seg_len).sum();
+    if total_len == 0.0 { return None; }
+
+    let mut best_dist = f64::MAX;
+    let mut best_t = 0.0;
+    let mut accumulated = 0.0;
+    for i in 0..nodes.len() - 1 {
+        let len = seg_len(i);
+        let (dist, seg_t) = point_to_segment_with_t(
+            lat, lng,
+            nodes[i].lat as f64, nodes[i].lng as f64,
+            nodes[i + 1].lat as f64, nodes[i + 1].lng as f64,
+            cos_lat,
+        );
+        if dist < best_dist {
+            best_dist = dist;
+            best_t = (accumulated + seg_t * len) / total_len;
+        }
+        accumulated += len;
+    }
+    Some((best_dist, best_t))
+}
+
 fn interpolate_house_number(start: u32, end: u32, interpolation: u8, t: f64) -> u32 {
     let raw = start as f64 + t * (end as f64 - start as f64);
     let step = match interpolation { 1 | 2 => 2.0, _ => 1.0 };
@@ -1536,57 +1571,20 @@ impl Index {
             }
 
             // Interpolation
-            if let (Some(interp_entries), Some(interp_ways), Some(interp_nodes)) =
-                (self.interp_entries.as_ref(), self.interp_ways.as_ref(), self.interp_nodes.as_ref())
+            if let (Some(interp_entries), Some(interp_ways)) =
+                (self.interp_entries.as_ref(), self.interp_ways.as_ref())
             {
                 let total_interps = interp_ways.len() / std::mem::size_of::<InterpWay>() as u64;
-                let total_interp_nodes = interp_nodes.len() / std::mem::size_of::<NodeCoord>() as u64;
                 for id in Self::read_entries_fb(interp_entries, offsets.interp) {
                     // Corrupt cell entries must not read past the record files.
                     if (id as u64) >= total_interps { continue; }
                     let iw: InterpWay = interp_ways.read_at(id as u64);
                     if iw.start_number == 0 || iw.end_number == 0 { continue; }
-                    let off = iw.node_offset as u64;
-                    let cnt = iw.node_count as usize;
-                    if cnt < 2 || off + cnt as u64 > total_interp_nodes { continue; }
-                    let nbytes = interp_nodes.read_chunk(off * std::mem::size_of::<NodeCoord>() as u64,
-                                                          cnt * std::mem::size_of::<NodeCoord>());
-                    let nodes: &[NodeCoord] = unsafe {
-                        std::slice::from_raw_parts(nbytes.as_ptr() as *const NodeCoord, cnt)
-                    };
-                    if nodes.len() < 2 { continue; }
-                    let mut total_len: f64 = 0.0;
-                    for i in 0..nodes.len() - 1 {
-                        let dlat = (nodes[i + 1].lat as f64 - nodes[i].lat as f64).to_radians();
-                        let dlng = (nodes[i + 1].lng as f64 - nodes[i].lng as f64).to_radians();
-                        // sqrt: dist_sq is squared length; accumulating squares
-                        // skews the along-way fraction toward long segments.
-                        total_len += dist_sq(dlat, dlng, cos_lat).sqrt();
-                    }
-                    if total_len == 0.0 { continue; }
-                    let mut best_seg_dist = f64::MAX;
-                    let mut best_seg_t: f64 = 0.0;
-                    let mut prev_accumulated: f64 = 0.0;
-                    for i in 0..nodes.len() - 1 {
-                        let dlat = (nodes[i + 1].lat as f64 - nodes[i].lat as f64).to_radians();
-                        let dlng = (nodes[i + 1].lng as f64 - nodes[i].lng as f64).to_radians();
-                        let seg_len = dist_sq(dlat, dlng, cos_lat).sqrt();
-                        let (dist, seg_t) = point_to_segment_with_t(
-                            lat, lng,
-                            nodes[i].lat as f64, nodes[i].lng as f64,
-                            nodes[i + 1].lat as f64, nodes[i + 1].lng as f64,
-                            cos_lat,
-                        );
-                        if dist < best_seg_dist {
-                            best_seg_dist = dist;
-                            best_seg_t = (prev_accumulated + seg_t * seg_len) / total_len;
-                        }
-                        prev_accumulated += seg_len;
-                    }
-                    if best_seg_dist < best_interp_dist {
-                        best_interp_dist = best_seg_dist;
+                    let Some((dist, t)) = self.interp_way_position(&iw, lat, lng, cos_lat) else { continue };
+                    if dist < best_interp_dist {
+                        best_interp_dist = dist;
                         best_interp = Some(iw);
-                        best_interp_t = best_seg_t;
+                        best_interp_t = t;
                         best_interp_id = id;
                     }
                 }
@@ -1643,6 +1641,60 @@ impl Index {
             }
         }
         best
+    }
+
+    /// interp_position over an interpolation way's nodes; None when the
+    /// node range lies outside interp_nodes.bin.
+    fn interp_way_position(&self, iw: &InterpWay, lat: f64, lng: f64, cos_lat: f64) -> Option<(f64, f64)> {
+        let interp_nodes = self.interp_nodes.as_ref()?;
+        let total_nodes = interp_nodes.len() / std::mem::size_of::<NodeCoord>() as u64;
+        let off = iw.node_offset as u64;
+        let cnt = iw.node_count as usize;
+        if cnt < 2 || off + cnt as u64 > total_nodes { return None; }
+        let bytes = interp_nodes.read_chunk(off * std::mem::size_of::<NodeCoord>() as u64,
+                                            cnt * std::mem::size_of::<NodeCoord>());
+        let nodes: &[NodeCoord] = unsafe {
+            std::slice::from_raw_parts(bytes.as_ptr() as *const NodeCoord, cnt)
+        };
+        interp_position(nodes, lat, lng, cos_lat)
+    }
+
+    /// Nominatim's `_find_tiger_number_for_street` (reverse.py): when a US
+    /// street wins without a matching address point, the nearest
+    /// interpolation line of that street within `max_dist_sq` gives the
+    /// house number. TIGER lines carry no parent street, so "of that
+    /// street" is the name-token gate the TIGER postcode tier uses.
+    /// Equally near lines (TIGER's odd and even sides share the street
+    /// centreline) go to the lower start number, not to record order.
+    pub fn find_interp_on_way(&self, lat: f64, lng: f64, street_name: &str, max_dist_sq: f64) -> Option<u32> {
+        let geo_cells = self.geo_cells.as_ref()?;
+        let interp_entries = self.interp_entries.as_ref()?;
+        let interp_ways = self.interp_ways.as_ref()?;
+        let total_interps = interp_ways.len() / std::mem::size_of::<InterpWay>() as u64;
+
+        let cell = cell_id_at_level(lat, lng, self.street_cell_level);
+        let neighbors = cell_neighbors_at_level(cell, self.street_cell_level);
+        let cos_lat = lat.to_radians().cos();
+
+        let mut best: Option<(f64, InterpWay, f64)> = None;
+        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+            let offsets = Self::lookup_geo_cell_fb(geo_cells, c);
+            for id in Self::read_entries_fb(interp_entries, offsets.interp) {
+                if (id as u64) >= total_interps { continue; }
+                let iw: InterpWay = interp_ways.read_at(id as u64);
+                if iw.start_number == 0 || iw.end_number == 0 { continue; }
+                if !street_tokens_overlap(self.get_string(iw.street_id), street_name) { continue; }
+                let Some((dist, t)) = self.interp_way_position(&iw, lat, lng, cos_lat) else { continue };
+                if dist >= max_dist_sq { continue; }
+                let better = match best {
+                    None => true,
+                    Some((bd, bw, _)) => dist < bd
+                        || (dist == bd && (iw.start_number, iw.interpolation) < (bw.start_number, bw.interpolation)),
+                };
+                if better { best = Some((dist, iw, t)); }
+            }
+        }
+        best.map(|(_, iw, t)| interpolate_house_number(iw.start_number, iw.end_number, iw.interpolation, t))
     }
 
     // Debug helper — returns primary feature distances + names.
@@ -3378,17 +3430,12 @@ impl Index {
         let addr_dist = addr.as_ref().map(|(d, _, _)| *d).unwrap_or(f64::MAX);
         // Nominatim's `_find_closest_street_or_pois` queries the placex
         // table (streets + rank-30 POIs / addr points). Interpolation
-        // rows live in the separate `osmline` table and are looked up
-        // only AFTER a street wins, via `_find_interpolation_for_street`
-        // with a parent_place_id filter (reverse.py:253). Treating
-        // interpolation as a primary candidate in its own right picks
+        // rows live in separate tables and are looked up only AFTER a
+        // street wins (reverse.py `_find_tiger_number_for_street`), so
+        // interpolation is not a primary candidate: that picked
         // abbreviated TIGER names ("W 1st St") over the actual OSM
-        // street ("West 1st Street") when the TIGER segment happens
-        // to sit closer to the query than the raw way — a non-
-        // Nominatim behaviour. We keep interp only for housenumber
-        // refinement below.
-        let interp_dist = f64::MAX;
-        let _ = interp.as_ref();
+        // street ("West 1st Street") whenever the TIGER segment sat
+        // closer than the raw way. It only refines the street below.
         let street_dist = street.as_ref().map(|(d, _, _)| *d).unwrap_or(f64::MAX);
         let poi_dist = poi_primary.as_ref().map(|(d, _)| *d).unwrap_or(f64::MAX);
 
@@ -3482,12 +3529,12 @@ impl Index {
             }
             _ => effective_poi_dist,
         };
-        let closest_feature_dist = addr_dist.min(interp_dist).min(street_dist).min(compare_poi_dist);
+        let closest_feature_dist = addr_dist.min(street_dist).min(compare_poi_dist);
         let mut addr_won_primary = false;
         let mut poi_won_primary = false;
         if closest_feature_dist < max_dist {
             // Whichever feature class has the smallest distance wins.
-            if compare_poi_dist <= addr_dist && compare_poi_dist <= interp_dist && compare_poi_dist <= street_dist {
+            if compare_poi_dist <= addr_dist && compare_poi_dist <= street_dist {
                 // Record the win here so postcode routing below follows the
                 // SAME decision (incl. the tier-1 boost). It previously
                 // recomputed the winner with the un-boosted distance, so a
@@ -3518,7 +3565,7 @@ impl Index {
                 } else if poi.parent_street_id != NO_DATA {
                     road = Some(self.get_string(poi.parent_street_id));
                 }
-            } else if addr_dist <= interp_dist && addr_dist <= street_dist && addr_dist <= effective_poi_dist {
+            } else if addr_dist <= street_dist && addr_dist <= effective_poi_dist {
                 // Address is closest — use it with its housenumber.
                 addr_won_primary = true;
                 let (_, point, _) = addr.unwrap();
@@ -3532,11 +3579,6 @@ impl Index {
                 } else if let Some((_, way, _)) = street {
                     road = Some(self.get_string(way.name_id));
                 }
-            } else if interp_dist <= addr_dist && interp_dist <= street_dist && interp_dist <= effective_poi_dist {
-                // Interpolation segment is closest.
-                let (_, street_name, number, _) = interp.unwrap();
-                house_number = Some(Cow::Owned(number.to_string()));
-                road = Some(street_name);
             } else {
                 // Street is closest — use its name, then refine with a
                 // housenumber if an AddrPoint whose parent_way_id matches
@@ -3559,6 +3601,12 @@ impl Index {
                 if let Some(addr_pt) = self.find_addr_on_way(lat, lng, way_idx, refine_max_sq) {
                     if addr_pt.housenumber_id != NO_DATA {
                         house_number = Some(Cow::Borrowed(self.get_string(addr_pt.housenumber_id)));
+                    }
+                }
+                // No address point: Nominatim falls back to TIGER in the US.
+                if house_number.is_none() && admin.country_code == Some(*b"US") {
+                    if let Some(number) = road.and_then(|name| self.find_interp_on_way(lat, lng, name, refine_max_sq)) {
+                        house_number = Some(Cow::Owned(number.to_string()));
                     }
                 }
             }
@@ -3909,6 +3957,22 @@ mod multi_index_tests {
         assert_eq!(interpolate_house_number(1, 9, 2, 0.55), 5);
         // clamped to range ends
         assert_eq!(interpolate_house_number(2, 4, 1, 1.4), 4);
+    }
+
+    #[test]
+    fn interp_position_measures_along_the_line() {
+        let line = [NodeCoord { lat: 0.0, lng: 0.0 }, NodeCoord { lat: 0.0, lng: 0.002 }];
+        let (d, t) = interp_position(&line, 0.0001, 0.0005, 1.0).unwrap();
+        assert!((t - 0.25).abs() < 1e-6, "t={}", t);
+        assert!((d.sqrt().to_degrees() - 0.0001).abs() < 1e-9);
+
+        // Past the end clamps to the last node.
+        let (_, t_end) = interp_position(&line, 0.0, 0.01, 1.0).unwrap();
+        assert!((t_end - 1.0).abs() < 1e-9);
+
+        // Degenerate lines have no position.
+        assert!(interp_position(&line[..1], 0.0, 0.0, 1.0).is_none());
+        assert!(interp_position(&[line[0], line[0]], 0.0, 0.0, 1.0).is_none());
     }
 
     #[test]
