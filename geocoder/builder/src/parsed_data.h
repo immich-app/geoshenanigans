@@ -278,11 +278,6 @@ struct ParsedData {
     std::vector<int64_t> linked_place_node_ids;
     std::unique_ptr<std::mutex> linked_pn_mutex = std::make_unique<std::mutex>();
 
-    // boundary=census relations with postal_code tags — build-time only,
-    // used for postcode inheritance then discarded. Not written to disk.
-    std::vector<CdpPostcodeRelation> cdp_postcode_relations;
-    std::vector<CdpPostcodePoly> cdp_postcode_polys;
-
     // Post-canonical-sort: strings partitioned into per-consumer tiers.
     // Global offset space is contiguous: tier N occupies
     // [strings_tier_bases[N], strings_tier_bases[N+1]). Record name_ids
