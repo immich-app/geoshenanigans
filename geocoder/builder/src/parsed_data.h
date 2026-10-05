@@ -33,6 +33,12 @@ inline void ensure_dir(const std::string& path) {
     mkdir(path.c_str(), 0755);
 }
 
+// --- External postcode keys: (country 'XX' packed uppercase, string id) ---
+
+inline uint64_t postcode_key(uint16_t cc, uint32_t pc_id) { return (static_cast<uint64_t>(cc) << 32) | pc_id; }
+inline uint16_t postcode_key_cc(uint64_t key) { return static_cast<uint16_t>(key >> 32); }
+inline uint32_t postcode_key_pc(uint64_t key) { return static_cast<uint32_t>(key); }
+
 // --- CPU tick reading (all threads via getrusage) ---
 
 #include <sys/resource.h>
@@ -238,25 +244,22 @@ struct ParsedData {
     std::vector<uint32_t> way_parent_ids;    // way → smallest containing admin poly
     std::vector<uint32_t> admin_parent_ids;  // poly → next-larger containing admin poly
     std::vector<uint32_t> way_postcode_ids;  // way → postcode string from containing postal boundary
-    // pc string id → authoritative country (packed 'XX', uppercase) from the
-    // GeoNames external CSV. The centroid write path uses this instead of the
-    // cell-derived country lookup: border-strip centroids otherwise resolved
-    // to the neighbouring country and were rejected by its postcode pattern
-    // (the entire NL side of the NL/DE border lost its centroids).
-    std::unordered_map<uint32_t, uint16_t> postcode_external_cc;
     std::vector<uint32_t> addr_postcode_ids; // per-addr_point postcode (optional separate file)
 
-    // Postcode centroid collector: (postcode_string_id → sum_lat, sum_lng, count)
-    // Built during addr_point extraction, converted to PostcodeCentroid[] at write time.
+    // External postcode centroids (TIGER segments, GeoNames rows) keyed by
+    // postcode_key(country, postcode string id), like Nominatim's
+    // location_postcode: the same string in two countries is two postcodes
+    // (US ZIP 01069 is not Dresden's 01069). OSM addr:postcode centroids are
+    // re-accumulated per country from the addr points at write time, so
+    // they are not collected here.
     // Sums are 1e7-scaled integers, not doubles: contributions arrive from
     // dynamically-scheduled parse workers, so the merge's addition order
     // varies run-to-run and double sums wobble in the last ULP — enough to
-    // flip the point-in-polygon country lookup at the aggregate centroid
-    // and make the postcode files nondeterministic across identical builds.
+    // make the postcode files nondeterministic across identical builds.
     // Integer addition is order-independent; 1e-7° ≈ 1 cm matches OSM's
     // native coordinate precision.
     struct PostcodeAccum {
-        int64_t sum_lat_e7 = 0; int64_t sum_lng_e7 = 0; uint64_t count = 0; uint16_t country_code = 0;
+        int64_t sum_lat_e7 = 0; int64_t sum_lng_e7 = 0; uint64_t count = 0;
         void add(double lat, double lng) {
             sum_lat_e7 += llround(lat * 1e7);
             sum_lng_e7 += llround(lng * 1e7);
@@ -265,7 +268,7 @@ struct ParsedData {
         double lat() const { return (sum_lat_e7 / 1e7) / static_cast<double>(count); }
         double lng() const { return (sum_lng_e7 / 1e7) / static_cast<double>(count); }
     };
-    std::unordered_map<uint32_t, PostcodeAccum> postcode_accum;
+    std::unordered_map<uint64_t, PostcodeAccum> postcode_accum;
     std::unique_ptr<std::mutex> postcode_mutex = std::make_unique<std::mutex>();
 
     // Place nodes claimed by label/wikidata boundary links (build-time only,
@@ -347,7 +350,7 @@ inline void partition_strings_into_tiers(ParsedData& data) {
     for (uint32_t pc : data.way_postcode_ids)  mark(pc, STR_TIER_BIT_POSTCODE);
     for (uint32_t pc : data.interp_postcode_ids) mark(pc, STR_TIER_BIT_POSTCODE);
     for (uint32_t pc : data.addr_postcode_ids) mark(pc, STR_TIER_BIT_POSTCODE);
-    for (const auto& [pc_id, _acc] : data.postcode_accum) mark(pc_id, STR_TIER_BIT_POSTCODE);
+    for (const auto& [key, _acc] : data.postcode_accum) mark(postcode_key_pc(key), STR_TIER_BIT_POSTCODE);
     for (const auto& pr : data.poi_records)    mark(pr.parent_postcode_id, STR_TIER_BIT_POSTCODE);
 
     for (const auto& pr : data.poi_records) mark(pr.name_id, STR_TIER_BIT_POI);
@@ -437,27 +440,13 @@ inline void partition_strings_into_tiers(ParsedData& data) {
     remap_pc_vec(data.addr_postcode_ids);
     remap_pc_vec(data.interp_postcode_ids);
     {
-        std::unordered_map<uint32_t, ParsedData::PostcodeAccum> remapped;
+        std::unordered_map<uint64_t, ParsedData::PostcodeAccum> remapped;
         remapped.reserve(data.postcode_accum.size());
-        for (auto& [old_id, acc] : data.postcode_accum) {
-            auto it = rm.find(old_id);
-            if (it != rm.end()) remapped[it->second] = acc;
+        for (auto& [key, acc] : data.postcode_accum) {
+            auto it = rm.find(postcode_key_pc(key));
+            if (it != rm.end()) remapped[postcode_key(postcode_key_cc(key), it->second)] = acc;
         }
         data.postcode_accum = std::move(remapped);
-    }
-    {
-        // postcode_external_cc is keyed by the same interned postcode ids;
-        // leaving it un-remapped kept raw pre-partition offsets (which vary
-        // with parse scheduling) — canonical-id lookups then mostly missed
-        // and occasionally false-hit a stale key, yielding a wrong country
-        // that flipped between otherwise-identical builds.
-        std::unordered_map<uint32_t, uint16_t> remapped_ext;
-        remapped_ext.reserve(data.postcode_external_cc.size());
-        for (auto& [old_id, cc] : data.postcode_external_cc) {
-            auto it = rm.find(old_id);
-            if (it != rm.end()) remapped_ext.emplace(it->second, cc);
-        }
-        data.postcode_external_cc = std::move(remapped_ext);
     }
 }
 

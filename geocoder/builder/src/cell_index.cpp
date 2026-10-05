@@ -1189,17 +1189,16 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
     // Write postcode centroid index (optional files)
     // Validate each centroid's postcode against the country's pattern
     // (matching Nominatim's clean_postcodes sanitizer).
-    if (!data.postcode_accum.empty()) {
+    bool has_addr_postcodes = std::any_of(data.addr_postcode_ids.begin(), data.addr_postcode_ids.end(),
+                                          [](uint32_t pc) { return pc != NO_DATA; });
+    if (!data.postcode_accum.empty() || has_addr_postcodes) {
         write_futures.push_back(std::async(std::launch::async, [&] {
             // Nominatim's _PostcodeCollector accumulates per-country:
             // the same postcode string in different countries produces
             // separate centroids. This prevents a "90012" tagged on a
             // building in Sicily from shifting the US 90012 centroid.
             //
-            // Re-accumulate from raw postcode_accum, splitting by the
-            // country of each individual addr_point contribution.
-            // Since postcode_accum only stores aggregate sums and a
-            // count, we need to re-scan addr_points.
+            // OSM centroids: accumulate the addr points per country.
             auto get_str = [&](uint32_t off) -> const char* {
                 return data.get_string(off);
             };
@@ -1233,27 +1232,13 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                 acc.count++;
             }
 
-            // Also add entries from postcode_accum that aren't already
-            // in country_accum (TIGER entries, GeoNames external data).
-            // These don't have addr_points so the per-addr re-scan above
-            // misses them. Look up country from the centroid location.
-            for (const auto& [pc_id, acc] : data.postcode_accum) {
+            // External centroids (TIGER, GeoNames) fill only the
+            // (country, postcode) pairs OSM has none for, as Nominatim's
+            // _update_from_external does.
+            for (const auto& [pk, acc] : data.postcode_accum) {
                 if (acc.count == 0) continue;
-                float clat = static_cast<float>(acc.lat());
-                float clng = static_cast<float>(acc.lng());
-                // Country: the GeoNames CSV's own country code is
-                // authoritative when we have it; only OSM/TIGER-derived
-                // entries fall back to the geometric lookup.
-                uint16_t cc = 0;
-                if (auto ext = data.postcode_external_cc.find(pc_id);
-                    ext != data.postcode_external_cc.end()) {
-                    cc = ext->second;
-                } else {
-                    cc = country_code_at_point(data, clat, clng);
-                }
-                if (cc == 0) continue;
-                auto key = CountryPcKey{cc, pc_id};
-                if (country_accum.count(key) > 0) continue; // OSM data takes priority
+                auto key = CountryPcKey{postcode_key_cc(pk), postcode_key_pc(pk)};
+                if (country_accum.count(key) > 0) continue;
                 country_accum[key] = {acc.lat() * acc.count, acc.lng() * acc.count, acc.count};
             }
 

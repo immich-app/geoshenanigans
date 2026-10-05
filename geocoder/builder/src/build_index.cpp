@@ -115,6 +115,15 @@ static uint8_t place_type_to_admin_override(uint8_t pt) {
 
 // --- TIGER address data loading ---
 
+// TIGER covers the US and its territories; OSM (and so Nominatim) keeps the
+// territories as countries of their own.
+static uint16_t tiger_country(const std::string& state) {
+    for (const char* territory : {"PR", "VI", "GU", "AS", "MP"}) {
+        if (state == territory) return static_cast<uint16_t>((territory[0] << 8) | territory[1]);
+    }
+    return static_cast<uint16_t>(('U' << 8) | 'S');
+}
+
 static void load_tiger_data(ParsedData& data, const std::string& path) {
     std::cerr << "Loading TIGER address data from " << path << "..." << std::endl;
 
@@ -298,7 +307,7 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
                 double mid_lat = 0, mid_lng = 0;
                 for (const auto& n : nodes) { mid_lat += n.lat; mid_lng += n.lng; }
                 mid_lat /= nodes.size(); mid_lng /= nodes.size();
-                data.postcode_accum[pc_id].add(mid_lat, mid_lng);
+                data.postcode_accum[postcode_key(tiger_country(fields[5]), pc_id)].add(mid_lat, mid_lng);
             }
             data.interp_postcode_ids.push_back(row_pc_id);
 
@@ -400,8 +409,8 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
 // --- GeoNames postcode loading ---
 // Format: CSV with header "postcode,lat,lon,country_code"
 // Source: GeoNames allCountries + GB_full + CA_full + NL_full
-// Merged into postcode_accum as authoritative centroids that
-// override OSM-derived ones (matching Nominatim's _update_from_external).
+// Merged into postcode_accum per country; they fill the (country, postcode)
+// pairs OSM has no centroid for (matching Nominatim's _update_from_external).
 static void load_external_postcodes(ParsedData& data, const std::string& path) {
     std::cerr << "Loading external postcode centroids from " << path << "..." << std::endl;
     std::string cmd;
@@ -452,21 +461,18 @@ static void load_external_postcodes(ParsedData& data, const std::string& path) {
             continue;
         }
 
-        // GeoNames entries are authoritative — they override OSM-derived
-        // centroids. Nominatim's _update_from_external adds external
-        // postcodes only when NOT already present from OSM. We do the
-        // same: only add if no OSM entry exists for this postcode.
-        uint32_t pc_id = data.string_pool.intern(postcode);
-        auto it = data.postcode_accum.find(pc_id);
-        if (it == data.postcode_accum.end()) {
-            data.postcode_accum[pc_id].add(lat, lng);
+        // Keyed by the CSV's own country: GeoNames knows which country a
+        // postcode belongs to, where a centroid-based lookup mis-assigns
+        // border-strip entries. A (country, postcode) TIGER already
+        // provides wins; OSM pairs win at write time, as Nominatim's
+        // _update_from_external adds external postcodes only when OSM has
+        // none.
+        uint16_t cc = static_cast<uint16_t>((std::toupper(cc_str[0]) << 8) | std::toupper(cc_str[1]));
+        uint64_t key = postcode_key(cc, data.string_pool.intern(postcode));
+        if (data.postcode_accum.find(key) == data.postcode_accum.end()) {
+            data.postcode_accum[key].add(lat, lng);
             loaded++;
         }
-        // Remember the CSV's authoritative country for the write path —
-        // GeoNames knows which country a postcode belongs to; deriving it
-        // from the centroid's admin cell mis-assigns border-strip entries.
-        data.postcode_external_cc.emplace(pc_id,
-            static_cast<uint16_t>((std::toupper(cc_str[0]) << 8) | std::toupper(cc_str[1])));
     }
 
     if (tmp_csv != path) std::remove(tmp_csv.c_str());
@@ -4168,15 +4174,6 @@ int main(int argc, char* argv[]) {
                                        local.addr_strings[j].first.c_str(),
                                        local.addr_strings[j].second.c_str(), pc_ptr, dummy,
                                        pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, node_id));
-                        // Accumulate postcode centroids (basic validation;
-                        // per-country pattern validation happens later when
-                        // building the centroid index).
-                        const auto& pc = local.addr_postcodes[j];
-                        if (!pc.empty() && is_valid_postcode(pc.c_str())) {
-                            uint32_t pc_id = data.string_pool.intern(pc.c_str());
-                            data.postcode_accum[pc_id].add(local.addr_coords[j].first,
-                                                           local.addr_coords[j].second);
-                        }
                     }
                     total_addrs += local.count;
                 }
@@ -4784,13 +4781,6 @@ int main(int argc, char* argv[]) {
                                        local.addr_strings[i].second.c_str(), bpc_ptr, dummy,
                                        pack_osm_id(gc::id_alloc::ObjectType::OSM_WAY, bldg_way_id),
                                        poly_verts, poly_cnt);
-                        // Accumulate postcode centroids (validated)
-                        const auto& pc = local.addr_postcodes[i];
-                        if (!pc.empty() && is_valid_postcode(pc.c_str())) {
-                            uint32_t pc_id = data.string_pool.intern(pc.c_str());
-                            data.postcode_accum[pc_id].add(local.building_addrs[i].lat,
-                                                           local.building_addrs[i].lng);
-                        }
                     }
 
                     // Merge interpolation ways
@@ -5392,10 +5382,6 @@ int main(int argc, char* argv[]) {
                                                                static_cast<int64_t>(rel_payload)),
                                                    poly_verts.data(),
                                                    static_cast<uint32_t>(poly_verts.size()));
-                                    if (!pr.addr_postcode.empty() && is_valid_postcode(pr.addr_postcode.c_str())) {
-                                        uint32_t pc_id = data.string_pool.intern(pr.addr_postcode.c_str());
-                                        data.postcode_accum[pc_id].add(clat, clng);
-                                    }
                                 }
                             }
                             local_results.clear();

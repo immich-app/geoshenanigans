@@ -400,15 +400,12 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     }
 
     // --- Copy postcode_accum (spatially filtered) ---
-    // OSM/TIGER entries resolve their country geometrically at write time
-    // against out.cell_to_admin, so out-of-continent entries would drop out
-    // on their own — but external (GeoNames) entries carry an authoritative
-    // country code and skip that check, so without a spatial filter here
-    // every continent would ship the full global centroid set (~4.5M
-    // entries). Filter all entries by aggregate centroid; keys are string
-    // offsets in the FULL pool — remapped via string_remap below.
+    // External entries carry their country in the key, so without a spatial
+    // filter every continent would ship the full global centroid set (~4.5M
+    // entries). Filter by centroid; the string part of each key is an offset
+    // in the FULL pool — remapped via string_remap below.
     out.postcode_accum.reserve(full.postcode_accum.size());
-    for (const auto& [pc_id, acc] : full.postcode_accum) {
+    for (const auto& [key, acc] : full.postcode_accum) {
         if (acc.count == 0) continue;
         double alat = acc.lat(), alng = acc.lng();
         bool inside = polygon
@@ -416,11 +413,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
             : (alat >= bbox.min_lat && alat <= bbox.max_lat &&
                alng >= bbox.min_lng && alng <= bbox.max_lng);
         if (!inside) continue;
-        out.postcode_accum.emplace(pc_id, acc);
-        if (auto ext = full.postcode_external_cc.find(pc_id);
-            ext != full.postcode_external_cc.end()) {
-            out.postcode_external_cc.emplace(pc_id, ext->second);
-        }
+        out.postcode_accum.emplace(key, acc);
     }
 
     log_phase("      filter: parent + postcode projection", _ft, _fc);
@@ -497,7 +490,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     for (uint32_t off : out.way_postcode_ids) add_used(off);
     for (uint32_t off : out.interp_postcode_ids) add_used(off);
     for (uint32_t off : out.addr_postcode_ids) add_used(off);
-    for (const auto& [pc_id, _acc] : out.postcode_accum) add_used(pc_id);
+    for (const auto& [key, _acc] : out.postcode_accum) add_used(postcode_key_pc(key));
 
     const auto& old_sp = full.string_pool.data();
     std::unordered_map<uint32_t, uint32_t> string_remap;
@@ -537,25 +530,14 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
 
     // Rebuild postcode_accum with remapped keys (drop entries whose string didn't survive)
     {
-        std::unordered_map<uint32_t, ParsedData::PostcodeAccum> remapped;
+        std::unordered_map<uint64_t, ParsedData::PostcodeAccum> remapped;
         remapped.reserve(out.postcode_accum.size());
-        for (auto& [old_pc_id, acc] : out.postcode_accum) {
-            uint32_t new_pc_id = remap_or_sentinel(old_pc_id);
+        for (auto& [key, acc] : out.postcode_accum) {
+            uint32_t new_pc_id = remap_or_sentinel(postcode_key_pc(key));
             if (new_pc_id == NO_DATA) continue;
-            auto& dst = remapped[new_pc_id];
-            dst.sum_lat_e7 += acc.sum_lat_e7;
-            dst.sum_lng_e7 += acc.sum_lng_e7;
-            dst.count += acc.count;
-            dst.country_code = acc.country_code;
+            remapped[postcode_key(postcode_key_cc(key), new_pc_id)] = acc;
         }
         out.postcode_accum = std::move(remapped);
-        std::unordered_map<uint32_t, uint16_t> remapped_ext;
-        remapped_ext.reserve(out.postcode_external_cc.size());
-        for (auto& [old_id, cc] : out.postcode_external_cc) {
-            uint32_t nid = remap_or_sentinel(old_id);
-            if (nid != NO_DATA) remapped_ext.emplace(nid, cc);
-        }
-        out.postcode_external_cc = std::move(remapped_ext);
     }
 
     log_phase("      filter: string pool rebuild (masked)", _ft, _fc);
