@@ -93,6 +93,14 @@ impl Db {
         let user = self.users.get(login)?;
         Some((login.clone(), user.rate_per_second, user.rate_per_day, user.rate_by_ip))
     }
+
+    /// True when the dashboard session or the API key belongs to an admin.
+    pub fn is_admin(&self, session_id: Option<&str>, key: Option<&str>) -> bool {
+        let login = session_id
+            .and_then(|s| self.sessions.get(s))
+            .or_else(|| key.and_then(|k| self.tokens.get(k)));
+        login.and_then(|l| self.users.get(l)).is_some_and(|u| u.admin)
+    }
 }
 
 pub fn check_rate(limiter: &RateLimiter, login: &str, rate_per_second: u32, rate_per_day: u32) -> Result<(), &'static str> {
@@ -147,7 +155,7 @@ fn random_hex(len: usize) -> String {
     s
 }
 
-fn get_session_cookie(headers: &HeaderMap) -> Option<String> {
+pub fn get_session_cookie(headers: &HeaderMap) -> Option<String> {
     headers
         .get_all("cookie")
         .iter()
@@ -453,6 +461,40 @@ mod tests {
         assert_eq!(get_session_cookie(&h), None);
         // No cookie headers at all.
         assert_eq!(get_session_cookie(&HeaderMap::new()), None);
+    }
+
+    fn db_with_users() -> Db {
+        let mut db = Db::default();
+        for (login, admin) in [("root", true), ("alice", false)] {
+            db.users.insert(login.to_string(), User {
+                password_hash: String::new(),
+                admin,
+                rate_per_second: 0,
+                rate_per_day: 0,
+                rate_by_ip: false,
+            });
+        }
+        db.tokens.insert("root-key".to_string(), "root".to_string());
+        db.tokens.insert("alice-key".to_string(), "alice".to_string());
+        db.sessions.insert("root-session".to_string(), "root".to_string());
+        db.sessions.insert("alice-session".to_string(), "alice".to_string());
+        db
+    }
+
+    #[test]
+    fn is_admin_accepts_admin_session_or_key() {
+        let db = db_with_users();
+        assert!(db.is_admin(Some("root-session"), None));
+        assert!(db.is_admin(None, Some("root-key")));
+    }
+
+    #[test]
+    fn is_admin_rejects_non_admin_and_unknown() {
+        let db = db_with_users();
+        assert!(!db.is_admin(None, None));
+        assert!(!db.is_admin(Some("alice-session"), None));
+        assert!(!db.is_admin(None, Some("alice-key")));
+        assert!(!db.is_admin(Some("forged"), Some("forged")));
     }
 
     #[test]

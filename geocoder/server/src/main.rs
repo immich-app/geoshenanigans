@@ -53,6 +53,32 @@ fn require_valid_key(
     }
 }
 
+// Configuration changes repoint where datasets are downloaded from, so
+// they need an admin (dashboard session or an admin's API key). Sidecar
+// mode trusts the private network for this as it does for queries.
+fn require_admin(
+    db: &RwLock<auth::Db>,
+    headers: &axum::http::HeaderMap,
+    key: Option<&str>,
+) -> Result<(), Response> {
+    let session_id = auth::get_session_cookie(headers);
+    if anonymous_allowed() && key.is_none() && session_id.is_none() {
+        return Ok(());
+    }
+
+    let db = db.read().unwrap_or_else(|e| e.into_inner());
+    if db.is_admin(session_id.as_deref(), key) {
+        Ok(())
+    } else {
+        Err((StatusCode::UNAUTHORIZED, "Admin access required").into_response())
+    }
+}
+
+#[derive(Deserialize)]
+struct KeyParam {
+    key: Option<String>,
+}
+
 fn anonymous_allowed() -> bool {
     static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ALLOWED.get_or_init(|| {
@@ -157,17 +183,31 @@ async fn test_portal() -> impl IntoResponse {
 }
 
 async fn get_configuration(
+    Query(params): Query<KeyParam>,
+    headers: axum::http::HeaderMap,
+    db: axum::extract::State<Arc<RwLock<auth::Db>>>,
     state: axum::extract::Extension<Arc<RegionState>>,
 ) -> Response {
+    if let Err(resp) = require_admin(&db, &headers, params.key.as_deref()) {
+        return resp;
+    }
+
     let cfg = state.get_configuration().await;
     let json = serde_json::to_string_pretty(&cfg).unwrap_or_default();
     ([(axum::http::header::CONTENT_TYPE, "application/json")], json).into_response()
 }
 
 async fn put_configuration(
+    Query(params): Query<KeyParam>,
+    headers: axum::http::HeaderMap,
+    db: axum::extract::State<Arc<RwLock<auth::Db>>>,
     state: axum::extract::Extension<Arc<RegionState>>,
     axum::Json(new_cfg): axum::Json<Configuration>,
 ) -> Response {
+    if let Err(resp) = require_admin(&db, &headers, params.key.as_deref()) {
+        return resp;
+    }
+
     if let Err(e) = state.set_configuration(new_cfg).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("persist failed: {}", e)).into_response();
     }
