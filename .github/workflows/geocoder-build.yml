@@ -100,8 +100,16 @@ jobs:
 
           # Determine target date + sequence
           SERVER="https://planet.openstreetmap.org/replication/day"
-          CURRENT_SEQ=$(curl -sL "$SERVER/state.txt" | grep sequenceNumber | cut -d= -f2)
-          CURRENT_DATE=$(curl -sL "$SERVER/state.txt" | grep timestamp | cut -d= -f2 | tr '\\' ' ' | cut -dT -f1 | tr -d ' ')
+          # An unread state would publish under an empty date (builds//,
+          # latest.json {"latest": ""}), so fail the run instead.
+          STATE=$(curl -sSL --fail --retry 5 --retry-delay 30 "$SERVER/state.txt") \
+            || { echo "::error::Could not fetch $SERVER/state.txt"; exit 1; }
+          CURRENT_SEQ=$(echo "$STATE" | grep sequenceNumber | cut -d= -f2 | tr -d '[:space:]')
+          CURRENT_DATE=$(echo "$STATE" | grep timestamp | cut -d= -f2 | tr '\\' ' ' | cut -dT -f1 | tr -d ' ')
+          if ! [[ "$CURRENT_SEQ" =~ ^[0-9]+$ && "$CURRENT_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "::error::Unexpected replication state (seq='$CURRENT_SEQ' date='$CURRENT_DATE')"
+            exit 1
+          fi
 
           TARGET_DATE="${BUILD_DATE:-$CURRENT_DATE}"
           PREV_DATE=$(date -u -d "$TARGET_DATE - 1 day" +%Y-%m-%d)
