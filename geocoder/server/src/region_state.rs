@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -27,6 +28,11 @@ use crate::downloader::{
     download_region, Configurations, DownloadError, DownloadProgress, RegionSelection,
 };
 use query_server::MultiIndex;
+
+/// How long a fetched configurations.json is trusted before latest.json
+/// is re-resolved. CI keeps full builds for 3 days, so a server that
+/// never re-resolved would 404 on every new download from day 4.
+const CONFIGURATIONS_TTL: Duration = Duration::from_secs(3600);
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Configuration {
@@ -65,10 +71,13 @@ pub struct RegionState {
     pub root_dir: PathBuf,
     pub config_path: PathBuf,
     pub config: Mutex<Configuration>,
-    /// Cached configurations.json for the build referenced by `config.base_url`.
-    /// Loaded lazily on first download, refreshed when the configuration
-    /// is updated (a config change might point at a different build).
-    pub configurations: Mutex<Option<Configurations>>,
+    /// Cached configurations.json for the latest build under
+    /// `config.base_url`, with when it was fetched. Loaded lazily on first
+    /// download, dropped when the configuration is updated (a config
+    /// change might point at a different bucket) and re-resolved once it
+    /// is older than `configurations_ttl`.
+    pub configurations: Mutex<Option<(Instant, Configurations)>>,
+    pub configurations_ttl: Duration,
     /// Per-region serialisation. Concurrent requests for the same region
     /// share one inner Mutex; only the leader actually downloads, the
     /// rest wait on the lock and find the region already loaded.
@@ -91,6 +100,7 @@ impl RegionState {
             config_path,
             config: Mutex::new(config),
             configurations: Mutex::new(None),
+            configurations_ttl: CONFIGURATIONS_TTL,
             region_locks: Mutex::new(HashMap::new()),
             http: reqwest::Client::builder()
                 .user_agent("geocoder-server/0.1")
@@ -135,8 +145,10 @@ impl RegionState {
     /// Fetch (or return cached) configurations.json for the current
     /// configuration's base_url + latest build date.
     async fn ensure_configurations(&self) -> Result<Configurations, DownloadError> {
-        if let Some(c) = self.configurations.lock().await.as_ref() {
-            return Ok(c.clone());
+        if let Some((fetched_at, c)) = self.configurations.lock().await.as_ref() {
+            if fetched_at.elapsed() < self.configurations_ttl {
+                return Ok(c.clone());
+            }
         }
 
         let cfg = self.config.lock().await.clone();
@@ -157,7 +169,7 @@ impl RegionState {
             .json().await
             .map_err(|e| DownloadError::Http(format!("{}: parse: {}", cfg_url, e)))?;
 
-        *self.configurations.lock().await = Some(configurations.clone());
+        *self.configurations.lock().await = Some((Instant::now(), configurations.clone()));
         Ok(configurations)
     }
 
@@ -216,5 +228,71 @@ impl RegionState {
         self.multi_index.install_region(region)
             .map_err(DownloadError::UnknownRegion)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FakeBucket {
+        latest: std::sync::Mutex<String>,
+        fetches: AtomicUsize,
+    }
+
+    // Serves builds/latest.json and builds/<date>/configurations.json.
+    async fn serve(bucket: Arc<FakeBucket>) -> String {
+        use axum::extract::{Path, State};
+        use axum::routing::get;
+        let app = axum::Router::new()
+            .route("/builds/latest.json", get(|State(b): State<Arc<FakeBucket>>| async move {
+                format!("{{\"latest\":\"{}\"}}", b.latest.lock().unwrap())
+            }))
+            .route("/builds/{date}/configurations.json", get(|State(b): State<Arc<FakeBucket>>, Path(date): Path<String>| async move {
+                b.fetches.fetch_add(1, Ordering::SeqCst);
+                format!("{{\"build\":{{\"date\":\"{}\"}},\"components\":{{}},\"files\":{{}}}}", date)
+            }))
+            .with_state(bucket);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{}", addr)
+    }
+
+    async fn state_for(base_url: String, ttl: std::time::Duration) -> RegionState {
+        let root = std::env::temp_dir().join(format!("gc_rs_{}_{}", std::process::id(), ttl.as_secs()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mi = MultiIndex::load(root.to_str().unwrap(), 17, 10, 660.0).unwrap();
+        let mut state = RegionState::new(Arc::new(mi), root);
+        state.config.get_mut().base_url = base_url;
+        state.configurations_ttl = ttl;
+        state
+    }
+
+    #[tokio::test]
+    async fn configurations_are_cached_within_ttl() {
+        let bucket = Arc::new(FakeBucket { latest: "2026-01-01".to_string().into(), fetches: AtomicUsize::new(0) });
+        let state = state_for(serve(bucket.clone()).await, std::time::Duration::from_secs(3600)).await;
+
+        state.ensure_configurations().await.unwrap();
+        *bucket.latest.lock().unwrap() = "2026-01-02".to_string();
+        let second = state.ensure_configurations().await.unwrap();
+
+        assert_eq!(bucket.fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(second.build.date, "2026-01-01");
+    }
+
+    #[tokio::test]
+    async fn configurations_follow_latest_after_ttl() {
+        let bucket = Arc::new(FakeBucket { latest: "2026-01-01".to_string().into(), fetches: AtomicUsize::new(0) });
+        let state = state_for(serve(bucket.clone()).await, std::time::Duration::ZERO).await;
+
+        state.ensure_configurations().await.unwrap();
+        *bucket.latest.lock().unwrap() = "2026-01-02".to_string();
+        let second = state.ensure_configurations().await.unwrap();
+
+        assert_eq!(bucket.fetches.load(Ordering::SeqCst), 2);
+        assert_eq!(second.build.date, "2026-01-02");
     }
 }
