@@ -180,12 +180,12 @@ impl RegionState {
         // Re-check after acquiring the lock: an earlier waiter may
         // have just finished the download.
         if self.multi_index.continents.iter()
-            .any(|c| c.bbox.name == region && c.index.load().is_some())
+            .any(|c| c.name == region && c.index.load().is_some())
         {
             return Ok(());
         }
         // Bail early if `region` isn't a known continent.
-        if !self.multi_index.continents.iter().any(|c| c.bbox.name == region) {
+        if !self.multi_index.continents.iter().any(|c| c.name == region) {
             return Err(DownloadError::UnknownRegion(region.to_string()));
         }
 

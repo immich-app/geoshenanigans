@@ -22,6 +22,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /src
 COPY server/ server/
 COPY test-portal/ test-portal/
+# Continent boundaries, embedded by the server for query routing.
+COPY builder/data/ builder/data/
 RUN cargo build --release --manifest-path server/Cargo.toml
 
 # Stage 3: Runtime

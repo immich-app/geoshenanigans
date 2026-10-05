@@ -863,40 +863,100 @@ impl StringPool {
 // --- Continent layout ---
 //
 // One Index per OSM continent. The builder writes per-continent
-// directories (`<root>/<name>/`) with the same file shape as planet,
-// just filtered to that continent's bbox. The server picks the
-// matching continent(s) per query via bbox dispatch.
-//
-// Bboxes are kept verbatim from `builder/src/continent_filter.cpp`'s
-// `kContinents[]` so a query lands in the same set of continents the
-// builder used when assigning records.
+// directories (`<root>/<name>/`) with the same file shape as planet and
+// assigns every record and admin cell to the continents whose Geofabrik
+// boundary (`builder/data/*.poly`, embedded in build-index) contains the
+// S2 cell centre. The server embeds the same files and parses them the
+// same way, so a query is routed to exactly the continents that can
+// hold its data.
 
-#[derive(Clone, Copy, Debug)]
-pub struct ContinentBBox {
+const CONTINENT_POLYS: [(&str, &str); 8] = [
+    ("africa", include_str!("../../builder/data/africa.poly")),
+    ("asia", include_str!("../../builder/data/asia.poly")),
+    ("europe", include_str!("../../builder/data/europe.poly")),
+    ("north-america", include_str!("../../builder/data/north-america.poly")),
+    ("south-america", include_str!("../../builder/data/south-america.poly")),
+    ("oceania", include_str!("../../builder/data/australia-oceania.poly")),
+    ("central-america", include_str!("../../builder/data/central-america.poly")),
+    ("antarctica", include_str!("../../builder/data/antarctica.poly")),
+];
+
+pub struct Continent {
     pub name: &'static str,
-    pub min_lat: f64,
-    pub max_lat: f64,
-    pub min_lng: f64,
-    pub max_lng: f64,
+    /// (lat, lng) of every ring concatenated and closed, as
+    /// continent_boundaries.cpp builds it. Even-odd ray casting over the
+    /// concatenation equals the union of the rings.
+    vertices: Vec<(f64, f64)>,
+    min_lat: f64,
+    max_lat: f64,
+    min_lng: f64,
+    max_lng: f64,
 }
 
-impl ContinentBBox {
+impl Continent {
+    fn parse(name: &'static str, poly: &str) -> Self {
+        // .poly vertex lines are "lng lat"; ring names and END lines don't parse.
+        let mut vertices: Vec<(f64, f64)> = poly.lines()
+            .filter_map(|line| {
+                let mut it = line.split_whitespace();
+                let lng: f64 = it.next()?.parse().ok()?;
+                let lat: f64 = it.next()?.parse().ok()?;
+                Some((lat, lng))
+            })
+            .collect();
+        if let (Some(&first), Some(&last)) = (vertices.first(), vertices.last()) {
+            if first != last {
+                vertices.push(first);
+            }
+        }
+
+        let (mut min_lat, mut max_lat, mut min_lng, mut max_lng) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+        for &(lat, lng) in &vertices {
+            min_lat = min_lat.min(lat);
+            max_lat = max_lat.max(lat);
+            min_lng = min_lng.min(lng);
+            max_lng = max_lng.max(lng);
+        }
+        Continent { name, vertices, min_lat, max_lat, min_lng, max_lng }
+    }
+
     pub fn contains(&self, lat: f64, lng: f64) -> bool {
-        lat >= self.min_lat && lat <= self.max_lat
-            && lng >= self.min_lng && lng <= self.max_lng
+        if lat < self.min_lat || lat > self.max_lat || lng < self.min_lng || lng > self.max_lng {
+            return false;
+        }
+
+        let mut inside = false;
+        let mut j = self.vertices.len() - 1;
+        for (i, &(yi, xi)) in self.vertices.iter().enumerate() {
+            let (yj, xj) = self.vertices[j];
+            if (yi > lat) != (yj > lat) && lng < (xj - xi) * (lat - yi) / (yj - yi) + xi {
+                inside = !inside;
+            }
+            j = i;
+        }
+        inside
+    }
+
+    /// The builder assigns admin cells by cell centre and a query reads
+    /// its admin cell plus the 8 neighbours, so this continent can hold
+    /// data for the query when it contains any of those 9 centres.
+    pub fn covers_query(&self, lat: f64, lng: f64, admin_cell_level: u64) -> bool {
+        let cell = cell_id_at_level(lat, lng, admin_cell_level);
+        std::iter::once(cell)
+            .chain(cell_neighbors_at_level(cell, admin_cell_level))
+            .any(|c| {
+                let centre = LatLng::from(CellID(c));
+                self.contains(centre.lat.deg(), centre.lng.deg())
+            })
     }
 }
 
-pub const CONTINENTS: &[ContinentBBox] = &[
-    ContinentBBox { name: "africa",          min_lat: -35.0, max_lat:  37.5, min_lng:  -25.0, max_lng:  55.0 },
-    ContinentBBox { name: "asia",            min_lat: -12.0, max_lat:  82.0, min_lng:   25.0, max_lng: 180.0 },
-    ContinentBBox { name: "europe",          min_lat:  35.0, max_lat:  72.0, min_lng:  -25.0, max_lng:  45.0 },
-    ContinentBBox { name: "north-america",   min_lat:   7.0, max_lat:  84.0, min_lng: -170.0, max_lng: -50.0 },
-    ContinentBBox { name: "south-america",   min_lat: -56.0, max_lat:  13.0, min_lng:  -82.0, max_lng: -34.0 },
-    ContinentBBox { name: "oceania",         min_lat: -50.0, max_lat:   0.0, min_lng:  110.0, max_lng: 180.0 },
-    ContinentBBox { name: "central-america", min_lat:   7.0, max_lat:  23.5, min_lng: -120.0, max_lng: -57.0 },
-    ContinentBBox { name: "antarctica",      min_lat: -90.0, max_lat: -60.0, min_lng: -180.0, max_lng: 180.0 },
-];
+pub fn continents() -> &'static [Continent] {
+    static CONTINENTS: std::sync::OnceLock<Vec<Continent>> = std::sync::OnceLock::new();
+    CONTINENTS.get_or_init(|| {
+        CONTINENT_POLYS.iter().map(|&(name, poly)| Continent::parse(name, poly)).collect()
+    })
+}
 
 // --- Index data ---
 
@@ -3706,19 +3766,21 @@ impl Index {
 
 // --- Multi-continent dispatcher ---
 //
-// Holds one optionally-loaded `Index` per continent. Each query bbox-
-// matches against `CONTINENTS`; for matching continents that have an
-// index loaded the query runs and the most-specific result wins.
-// Unloaded matches are surfaced via `unloaded_matches()` so the caller
-// (later: the on-demand downloader) can decide what to do.
+// Holds one optionally-loaded `Index` per continent. Each query is
+// routed to the continents that cover it (`Continent::covers_query`);
+// for those with an index loaded the query runs and the most-specific
+// result wins. Unloaded matches are surfaced via `unloaded_matches()` so
+// the on-demand downloader can fetch them.
 //
 // Backward-compat: if `<root>/admin_cells.bin` exists at construction
-// time, the old flat single-region layout is wrapped in a synthetic
-// "world" continent with a global bbox. New deployments use per-
+// time, the old flat single-region layout is wrapped in a single
+// "world" slot that covers every query. New deployments use per-
 // continent subdirs.
 
 pub struct ContinentSlot {
-    pub bbox: ContinentBBox,
+    pub name: &'static str,
+    /// Boundary that routes queries here; `None` for the flat "world" slot.
+    pub continent: Option<&'static Continent>,
     /// Atomically-swappable index slot. `None` until the continent's
     /// files are loaded (or when load is asked but the dir is empty).
     /// Hot-add via `MultiIndex::install_region` swaps a fresh Arc in
@@ -3751,17 +3813,13 @@ impl MultiIndex {
     /// behaves the same — single-region setups just see one slot.
     pub fn load(root: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Self, String> {
         // Flat-layout fast path: keep existing single-region deployments
-        // working without changes. The synthetic bbox covers the globe.
+        // working without changes. The "world" slot covers the globe.
         if std::path::Path::new(&format!("{}/admin_cells.bin", root)).exists() {
             let idx = Index::load(root, street_cell_level, admin_cell_level, search_distance)?;
-            let world = ContinentBBox {
-                name: "world",
-                min_lat: -90.0, max_lat: 90.0,
-                min_lng: -180.0, max_lng: 180.0,
-            };
             return Ok(MultiIndex {
                 continents: vec![ContinentSlot {
-                    bbox: world,
+                    name: "world",
+                    continent: None,
                     index: arc_swap::ArcSwapOption::from(Some(Arc::new(idx))),
                 }],
                 root_dir: root.to_string(),
@@ -3772,9 +3830,9 @@ impl MultiIndex {
         // Per-continent layout: walk the canonical list, load whichever
         // dirs exist. Missing continents stay as None — they'll either
         // remain empty (caller doesn't care) or get downloaded later.
-        let mut continents = Vec::with_capacity(CONTINENTS.len());
-        for bbox in CONTINENTS {
-            let dir = format!("{}/{}", root, bbox.name);
+        let mut slots = Vec::with_capacity(continents().len());
+        for continent in continents() {
+            let dir = format!("{}/{}", root, continent.name);
             let arc_opt = if std::path::Path::new(&format!("{}/admin_cells.bin", dir)).exists() {
                 // An interrupted or failed download leaves a dir that has
                 // admin_cells.bin but can't load. It must not take down the
@@ -3783,20 +3841,21 @@ impl MultiIndex {
                 match Index::load(&dir, street_cell_level, admin_cell_level, search_distance) {
                     Ok(idx) => Some(Arc::new(idx)),
                     Err(e) => {
-                        eprintln!("skipping continent {}: {}", bbox.name, e);
+                        eprintln!("skipping continent {}: {}", continent.name, e);
                         None
                     }
                 }
             } else {
                 None
             };
-            continents.push(ContinentSlot {
-                bbox: *bbox,
+            slots.push(ContinentSlot {
+                name: continent.name,
+                continent: Some(continent),
                 index: arc_swap::ArcSwapOption::from(arc_opt),
             });
         }
         Ok(MultiIndex {
-            continents,
+            continents: slots,
             root_dir: root.to_string(),
             street_cell_level, admin_cell_level, search_distance,
         })
@@ -3806,24 +3865,28 @@ impl MultiIndex {
         self.continents.iter().filter(|c| c.index.load().is_some()).count()
     }
 
-    /// Snapshot of indices whose bbox covers the point. Returns Arc
+    fn covers(&self, slot: &ContinentSlot, lat: f64, lng: f64) -> bool {
+        slot.continent.map_or(true, |c| c.covers_query(lat, lng, self.admin_cell_level))
+    }
+
+    /// Snapshot of loaded indices that cover the point. Returns Arc
     /// clones so callers can hold them across an await without keeping
-    /// the MultiIndex borrowed. Most points hit one continent; boundary
-    /// regions (Russia, Türkiye, Egypt-Sinai) hit two.
+    /// the MultiIndex borrowed. Most points hit one continent; where
+    /// boundaries meet or overlap (Sinai, the Urals) two can.
     pub fn loaded_matches(&self, lat: f64, lng: f64) -> Vec<Arc<Index>> {
         self.continents.iter()
-            .filter(|c| c.bbox.contains(lat, lng))
+            .filter(|c| self.covers(c, lat, lng))
             .filter_map(|c| c.index.load_full())
             .collect()
     }
 
-    /// Names of bbox-matching continents that aren't loaded. The
-    /// downloader uses this to know what to fetch when a request lands
-    /// on an unloaded region.
+    /// Names of covering continents that aren't loaded. The downloader
+    /// uses this to know what to fetch when a request lands on an
+    /// unloaded region.
     pub fn unloaded_matches(&self, lat: f64, lng: f64) -> Vec<&'static str> {
         self.continents.iter()
-            .filter(|c| c.bbox.contains(lat, lng) && c.index.load().is_none())
-            .map(|c| c.bbox.name)
+            .filter(|c| c.index.load().is_none() && self.covers(c, lat, lng))
+            .map(|c| c.name)
             .collect()
     }
 
@@ -3831,7 +3894,7 @@ impl MultiIndex {
     /// new Arc<Index>; concurrent readers either still see the old
     /// slot or the new one — never a torn state.
     pub fn install_region(&self, name: &str) -> Result<(), String> {
-        let slot = self.continents.iter().find(|c| c.bbox.name == name)
+        let slot = self.continents.iter().find(|c| c.name == name)
             .ok_or_else(|| format!("unknown continent: {}", name))?;
         let dir = format!("{}/{}", self.root_dir, name);
         let idx = Index::load(&dir,
@@ -3895,50 +3958,58 @@ mod multi_index_tests {
         assert!(street_tokens_overlap("St. Mary's Road", "Saint Marys Road"));
     }
 
-    fn b(name: &str) -> ContinentBBox {
-        *CONTINENTS.iter().find(|c| c.name == name).unwrap()
+    fn routed(lat: f64, lng: f64) -> Vec<&'static str> {
+        continents().iter()
+            .filter(|c| c.covers_query(lat, lng, DEFAULT_ADMIN_CELL_LEVEL))
+            .map(|c| c.name)
+            .collect()
+    }
+
+    // Expected continents follow the builder's .poly membership, which
+    // decides which continent directory holds the data.
+    #[test]
+    fn interior_points_route_to_one_continent() {
+        for (lat, lng, want) in [
+            (48.85, 2.35, "europe"),
+            (6.45, 3.40, "africa"),
+            (-33.86, 151.21, "oceania"),
+            (40.71, -74.0, "north-america"),
+            (-89.0, 0.0, "antarctica"),
+        ] {
+            assert_eq!(routed(lat, lng), vec![want], "({}, {})", lat, lng);
+        }
     }
 
     #[test]
-    fn istanbul_hits_both_europe_and_asia() {
-        // 41.01°N, 28.97°E — straddles the bbox split between europe
-        // and asia, so a query here should bbox-match both.
-        assert!(b("europe").contains(41.01, 28.97));
-        assert!(b("asia").contains(41.01, 28.97));
+    fn island_territories_route_to_their_continent() {
+        // All outside the old hand-written bboxes, so they got `{}`.
+        for (lat, lng, want) in [
+            (37.74, -25.67, "europe"),          // Azores
+            (78.22, 15.65, "europe"),           // Svalbard
+            (-17.54, -149.57, "oceania"),       // Tahiti
+            (-13.83, -171.76, "oceania"),       // Samoa
+            (-21.14, -175.2, "oceania"),        // Tonga
+            (51.88, -176.66, "north-america"),  // Adak
+            (-0.74, -90.31, "south-america"),   // Galápagos
+            (-21.1, 55.5, "africa"),            // Réunion
+            (-20.16, 57.5, "africa"),           // Mauritius
+        ] {
+            assert_eq!(routed(lat, lng), vec![want], "({}, {})", lat, lng);
+        }
     }
 
     #[test]
-    fn moscow_hits_both_europe_and_asia() {
-        // 55.75°N, 37.62°E — Russia overlaps the bbox split.
-        assert!(b("europe").contains(55.75, 37.62));
-        assert!(b("asia").contains(55.75, 37.62));
+    fn overlapping_polygons_route_to_both() {
+        // The africa and asia polygons both cover the Sinai.
+        let got = routed(28.5, 33.6);
+        assert!(got.contains(&"africa") && got.contains(&"asia"), "{:?}", got);
     }
 
     #[test]
-    fn lagos_hits_only_africa() {
-        // 6.45°N, 3.40°E — well inside africa, west of every other
-        // continent's bbox.
-        assert!(b("africa").contains(6.45, 3.40));
-        assert!(!b("asia").contains(6.45, 3.40));
-        assert!(!b("europe").contains(6.45, 3.40));
-    }
-
-    #[test]
-    fn sinai_hits_both_africa_and_asia() {
-        // 28.5°N, 33.6°E — Egyptian Sinai is on the asia side of the
-        // OSM continent split but still inside africa's bbox.
-        assert!(b("africa").contains(28.5, 33.6));
-        assert!(b("asia").contains(28.5, 33.6));
-    }
-
-    #[test]
-    fn pacific_ocean_no_match() {
-        // 0°N, 180°E (Antimeridian over deep Pacific). Inside oceania's
-        // bbox technically, but most other continents miss.
-        let matches: Vec<_> = CONTINENTS.iter().filter(|c| c.contains(0.0, 180.0)).collect();
-        assert!(matches.iter().any(|c| c.name == "oceania"));
-        assert!(!matches.iter().any(|c| c.name == "europe"));
-        assert!(!matches.iter().any(|c| c.name == "africa"));
+    fn multi_ring_polygons_cover_both_sides_of_the_antimeridian() {
+        // asia and oceania are split into two rings at ±180.
+        assert!(routed(64.73, 177.5).contains(&"asia"));   // Anadyr
+        assert!(routed(-43.95, -176.56).contains(&"oceania")); // Chatham Is.
     }
 
     #[test]

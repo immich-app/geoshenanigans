@@ -361,7 +361,7 @@ async fn async_main() {
         Ok(mi) => {
             let loaded: Vec<_> = mi.continents.iter()
                 .filter(|c| c.index.load().is_some())
-                .map(|c| c.bbox.name)
+                .map(|c| c.name)
                 .collect();
             if loaded.len() == 1 && loaded[0] == "world" {
                 eprintln!("Loaded single-region index from {}", data_dir);
