@@ -354,24 +354,20 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         }
     }
 
-    // place_nodes.parent_poly_id — second pass after admin_remap is available
-    for (auto& pn : out.place_nodes) {
-        if (pn.parent_poly_id != NO_DATA) {
-            auto it = admin_remap.find(pn.parent_poly_id);
-            pn.parent_poly_id = (it != admin_remap.end()) ? it->second : NO_DATA;
-        }
-    }
-
-    // poi_records.parent_poly_id — same treatment. Records whose
-    // parent admin polygon was filtered out by the continent split
-    // get NO_DATA (server treats missing parent as unknown and skips
-    // the chain-containment penalty for those rows).
-    for (auto& pr : out.poi_records) {
-        if (pr.parent_poly_id != NO_DATA) {
-            auto it = admin_remap.find(pr.parent_poly_id);
-            pr.parent_poly_id = (it != admin_remap.end()) ? it->second : NO_DATA;
-        }
-    }
+    // Foreign ids copied from the planet records still point into the
+    // planet's id space. Project them into this continent's; a target
+    // the continent split filtered out becomes NO_DATA (the server
+    // treats a missing parent as unknown).
+    auto project = [](uint32_t& id, const std::unordered_map<uint32_t, uint32_t>& remap) {
+        if (id == NO_DATA) return;
+        auto it = remap.find(id);
+        id = (it != remap.end()) ? it->second : NO_DATA;
+    };
+    for (auto& pn : out.place_nodes) project(pn.parent_poly_id, admin_remap);
+    for (auto& pr : out.poi_records) project(pr.parent_poly_id, admin_remap);
+    // Street-won housenumber refinement matches addr points to the
+    // winning way by this id.
+    for (auto& ap : out.addr_points) project(ap.parent_way_id, way_remap);
 
     // --- Project postcode-id parallel arrays ---
     // Values are string offsets in full.string_pool — remapped during string
