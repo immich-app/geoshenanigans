@@ -793,6 +793,12 @@ inline int to_grid(float v) {
     return (int)(v * 1e5f + (v >= 0 ? 0.5f : -0.5f));
 }
 
+// Byte offset of an 8-byte NodeCoord. Widened before the multiply:
+// planet node files pass 2^29 records, where 32-bit `idx * 8` wraps.
+inline size_t node_byte_offset(uint32_t node_index) {
+    return (size_t)node_index * 8;
+}
+
 // --- Directory creation ---
 inline void ensure_dir(const std::string& path) {
     std::string cmd = "mkdir -p '" + path + "'";

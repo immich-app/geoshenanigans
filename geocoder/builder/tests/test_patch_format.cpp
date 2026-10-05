@@ -213,3 +213,14 @@ TEST(patch_format_fileid_count_and_names_aligned) {
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::STRINGS_POI)]) == "strings_poi.bin");
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::INTERP_POSTCODES)]) == "interp_postcodes.bin");
 }
+
+// --- node_byte_offset ---
+
+TEST(patch_format_node_byte_offset_past_2_pow_29) {
+    // Planet street_nodes holds ~600M 8-byte nodes; 32-bit `idx * 8`
+    // wraps at 2^29 and reads the wrong coordinates.
+    CHECK_EQ(node_byte_offset(0u), (size_t)0);
+    CHECK_EQ(node_byte_offset(1u), (size_t)8);
+    CHECK_EQ(node_byte_offset(1u << 29), (size_t)1 << 32);
+    CHECK_EQ(node_byte_offset(0xFFFFFFFFu), (size_t)0xFFFFFFFFu * 8);
+}

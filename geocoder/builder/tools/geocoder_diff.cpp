@@ -310,8 +310,9 @@ static void fixup_way_offsets(char* old_ways, size_t old_ways_size,
         h = fnv_mix(h, name_id); h = fnv_mix(h, node_count);
         for (uint8_t j = 0; j < node_count && (node_offset + j) < max_n; j++) {
             float lat, lng;
-            memcpy(&lat, nodes + (node_offset + j) * 8, 4);
-            memcpy(&lng, nodes + (node_offset + j) * 8 + 4, 4);
+            size_t off = node_byte_offset(node_offset + j);
+            memcpy(&lat, nodes + off, 4);
+            memcpy(&lng, nodes + off + 4, 4);
             h = fnv_mix(h, to_grid(lat)); h = fnv_mix(h, to_grid(lng));
         }
         return h;
@@ -461,7 +462,8 @@ static void fixup_admin_offsets(char* old_polys, size_t old_polys_size,
         h = fnv_mix(h, name_id); h = fnv_mix(h, level); h = fnv_mix(h, cc); h = fnv_mix(h, vert_count);
         for (uint32_t j = 0; j < std::min(vert_count, 10u) && (vert_offset + j) < max_v; j++) {
             float lat, lng;
-            memcpy(&lat, verts + (vert_offset + j) * 8, 4); memcpy(&lng, verts + (vert_offset + j) * 8 + 4, 4);
+            size_t off = node_byte_offset(vert_offset + j);
+            memcpy(&lat, verts + off, 4); memcpy(&lng, verts + off + 4, 4);
             h = fnv_mix(h, to_grid(lat)); h = fnv_mix(h, to_grid(lng));
         }
         return h;
@@ -512,7 +514,8 @@ static void fixup_poi_offsets(char* old_pois, size_t old_pois_size,
             // Polygon POI — use first vertices
             for (uint32_t j = 0; j < std::min(vert_count, 10u) && (vert_offset + j) < max_v; j++) {
                 float lat, lng;
-                memcpy(&lat, verts + (vert_offset + j) * 8, 4); memcpy(&lng, verts + (vert_offset + j) * 8 + 4, 4);
+                size_t off = node_byte_offset(vert_offset + j);
+                memcpy(&lat, verts + off, 4); memcpy(&lng, verts + off + 4, 4);
                 h = fnv_mix(h, to_grid(lat)); h = fnv_mix(h, to_grid(lng));
             }
         }
@@ -559,7 +562,8 @@ static void fixup_interp_offsets(char* old_data, size_t old_size,
         h = fnv_mix(h, itype); h = fnv_mix(h, count);
         for (uint8_t j = 0; j < count && (node_offset + j) < max_n; j++) {
             float lat, lng;
-            memcpy(&lat, nodes + (node_offset + j) * 8, 4); memcpy(&lng, nodes + (node_offset + j) * 8 + 4, 4);
+            size_t off = node_byte_offset(node_offset + j);
+            memcpy(&lat, nodes + off, 4); memcpy(&lng, nodes + off + 4, 4);
             h = fnv_mix(h, to_grid(lat)); h = fnv_mix(h, to_grid(lng));
         }
         return h;
@@ -1136,13 +1140,12 @@ int main(int argc, char* argv[]) {
                     uint32_t vc = read_count(old_parent + (p_oi+k)*parent_stride);
                     uint32_t new_off = read_off(new_parent + (p_ni+k)*parent_stride);
                     if (vc > 0) {
-                        // Cast to size_t before multiplying by 8 — 32-bit
-                        // multiplication overflows for files >512 M records
-                        // (street_nodes is ~570 M records on planet), which
-                        // produces wildly wrong memcmp offsets and emits
-                        // bogus INSERT/DELETE pairs deep in the file.
-                        size_t old_byte_off = (size_t)old_off * 8;
-                        size_t new_byte_off = (size_t)new_off * 8;
+                        // 32-bit `off * 8` wraps past 512 M records (planet
+                        // street_nodes is ~600 M), which produces wildly
+                        // wrong memcmp offsets and emits bogus INSERT/DELETE
+                        // pairs deep in the file.
+                        size_t old_byte_off = node_byte_offset(old_off);
+                        size_t new_byte_off = node_byte_offset(new_off);
                         size_t vc_bytes = (size_t)vc * 8;
                         bool match = old_byte_off + vc_bytes <= old_child_size &&
                                     new_byte_off + vc_bytes <= new_child_size &&
@@ -1157,7 +1160,7 @@ int main(int argc, char* argv[]) {
                     const char* rec = parent_seq.data.data() + ppos + k * parent_stride;
                     uint32_t off = read_off(rec);
                     uint32_t vc = read_count(rec);
-                    size_t byte_off = (size_t)off * 8;
+                    size_t byte_off = node_byte_offset(off);
                     size_t vc_bytes = (size_t)vc * 8;
                     if (vc > 0 && byte_off + vc_bytes <= new_child_size)
                         emit_ins(new_child + byte_off, vc);
