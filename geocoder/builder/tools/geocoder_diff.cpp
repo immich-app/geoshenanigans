@@ -1354,39 +1354,14 @@ int main(int argc, char* argv[]) {
         street_from_fallback = (ow_fb || nw_fb);
         remap_field(old_w.data, old_w.size, way_stride, way_stride == 12 ? 8 : 5, str_remap);
 
-        // Fast path for poi-only invocations: when street_ways came via
-        // fallback we suppress STREET_WAYS / STREET_NODES emission anyway
-        // (they're in the sibling /full/ dir's patch, not ours), so the
-        // only thing we still need from t_street is the id_remap that
-        // t_poi uses to rewrite PoiRecord.parent_street_id. The full
-        // pipeline (load street_nodes.bin, fixup_way_offsets, merge_seq,
-        // secondary_match) costs ~10 GiB per planet invocation and ran
-        // the runner OOM when N parallel poi diffs piled up. Use the
-        // identity-key (name_id_after_remap, node_count) directly —
-        // same matching the secondary_match would have produced anyway,
-        // without the merge-seq detour or the street_nodes.bin mmap.
+        // Variants without their own street_ways (admin, admin-minimal,
+        // poi tiers) borrow the sibling /full/ copy only for the string
+        // remap. They emit no street records and carry no addr_points,
+        // the only consumer of a street id remap, so skip the street
+        // pipeline entirely (it costs ~10 GiB per planet invocation).
         if (street_from_fallback) {
-            size_t way_name_off = (way_stride == 12) ? 8 : 5;
-            size_t old_n_w = old_w.size / way_stride;
-            size_t new_n_w = new_w.size / way_stride;
-            std::unordered_map<uint64_t, uint32_t> new_idx;
-            new_idx.reserve(new_n_w);
-            for (uint32_t i = 0; i < new_n_w; i++) {
-                uint32_t name_id; memcpy(&name_id, new_w.data + (size_t)i * way_stride + way_name_off, 4);
-                uint8_t nc = static_cast<uint8_t>(new_w.data[(size_t)i * way_stride + 4]);
-                uint64_t key = ((uint64_t)name_id << 8) | nc;
-                new_idx.emplace(key, i);
-            }
-            std::vector<uint32_t> id_rm(old_n_w, NO_DATA);
-            for (uint32_t i = 0; i < old_n_w; i++) {
-                uint32_t name_id; memcpy(&name_id, old_w.data + (size_t)i * way_stride + way_name_off, 4);
-                uint8_t nc = static_cast<uint8_t>(old_w.data[(size_t)i * way_stride + 4]);
-                uint64_t key = ((uint64_t)name_id << 8) | nc;
-                auto it = new_idx.find(key);
-                if (it != new_idx.end()) id_rm[i] = it->second;
-            }
             res_ways = {PatchFileId::STREET_WAYS, "street_ways.bin", way_stride,
-                        0, 0, MergeSequence{}, {}, {}, std::move(id_rm)};
+                        0, 0, MergeSequence{}, {}};
             res_nodes = {PatchFileId::STREET_NODES, "street_nodes.bin", 8,
                          0, 0, MergeSequence{}, {}};
             log_merge(res_ways);
@@ -1888,7 +1863,8 @@ int main(int argc, char* argv[]) {
             return n_pairs;
         };
         uint32_t na = emit_pairs(res_admin_p.id_remap);
-        uint32_t ns = emit_pairs(res_ways.id_remap);
+        // The patcher applies street pairs only to AddrPoint.parent_way_id.
+        uint32_t ns = emit_pairs(has_addr ? res_ways.id_remap : std::vector<uint32_t>{});
         // Reserved postcode leg: never populated (parent_postcode_id holds a
         // string offset, remapped via str_remap, not a centroid index). Kept
         // as a literal 0 on the wire for format compatibility.
