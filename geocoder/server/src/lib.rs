@@ -3773,12 +3773,20 @@ impl MultiIndex {
         // dirs exist. Missing continents stay as None — they'll either
         // remain empty (caller doesn't care) or get downloaded later.
         let mut continents = Vec::with_capacity(CONTINENTS.len());
-        let mut loaded = 0usize;
         for bbox in CONTINENTS {
             let dir = format!("{}/{}", root, bbox.name);
             let arc_opt = if std::path::Path::new(&format!("{}/admin_cells.bin", dir)).exists() {
-                loaded += 1;
-                Some(Arc::new(Index::load(&dir, street_cell_level, admin_cell_level, search_distance)?))
+                // An interrupted or failed download leaves a dir that has
+                // admin_cells.bin but can't load. It must not take down the
+                // continents that did load; the slot stays empty so the
+                // downloader can complete it later.
+                match Index::load(&dir, street_cell_level, admin_cell_level, search_distance) {
+                    Ok(idx) => Some(Arc::new(idx)),
+                    Err(e) => {
+                        eprintln!("skipping continent {}: {}", bbox.name, e);
+                        None
+                    }
+                }
             } else {
                 None
             };
@@ -3786,10 +3794,6 @@ impl MultiIndex {
                 bbox: *bbox,
                 index: arc_swap::ArcSwapOption::from(arc_opt),
             });
-        }
-        if loaded == 0 {
-            // Empty start is OK now — the downloader can populate
-            // continents later. Caller can check `loaded_count()`.
         }
         Ok(MultiIndex {
             continents,
@@ -3935,6 +3939,21 @@ mod multi_index_tests {
         assert!(matches.iter().any(|c| c.name == "oceania"));
         assert!(!matches.iter().any(|c| c.name == "europe"));
         assert!(!matches.iter().any(|c| c.name == "africa"));
+    }
+
+    #[test]
+    fn load_skips_unloadable_continent() {
+        let root = std::env::temp_dir().join(format!("gc_mi_partial_{}", std::process::id()));
+        let europe = root.join("europe");
+        std::fs::create_dir_all(&europe).unwrap();
+        std::fs::write(europe.join("admin_cells.bin"), b"").unwrap();
+
+        let mi = MultiIndex::load(root.to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let mi = mi.expect("a partial continent dir must not fail the whole load");
+        assert_eq!(mi.loaded_count(), 0);
+        assert_eq!(mi.unloaded_matches(48.85, 2.35), vec!["europe"]);
     }
 
     #[test]
