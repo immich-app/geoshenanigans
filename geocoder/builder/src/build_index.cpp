@@ -408,7 +408,7 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
 
 // --- GeoNames postcode loading ---
 // Format: CSV with header "postcode,lat,lon,country_code"
-// Source: GeoNames allCountries + GB_full + CA_full + NL_full
+// Source: GeoNames GB_full (CI), the GB set Nominatim also supplements with
 // Merged into postcode_accum per country; they fill the (country, postcode)
 // pairs OSM has no centroid for (matching Nominatim's _update_from_external).
 static void load_external_postcodes(ParsedData& data, const std::string& path) {

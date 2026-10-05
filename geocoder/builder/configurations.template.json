@@ -191,12 +191,14 @@
         "{region}/admin/place_cells.bin",
         "{region}/admin/place_entries.bin",
         "{region}/admin/place_nodes.bin",
+        "{region}/admin/strings_core.bin",
+        "{region}/full/strings_layout.json"
+      ],
+      "optional_files": [
         "{region}/admin/postcode_centroids.bin",
         "{region}/admin/postcode_centroid_cells.bin",
         "{region}/admin/postcode_centroid_entries.bin",
-        "{region}/admin/strings_core.bin",
-        "{region}/admin/strings_postcode.bin",
-        "{region}/full/strings_layout.json"
+        "{region}/admin/strings_postcode.bin"
       ]
     },
     "mode.no-addresses": {
@@ -211,15 +213,17 @@
         "{region}/no-addresses/place_cells.bin",
         "{region}/no-addresses/place_entries.bin",
         "{region}/no-addresses/place_nodes.bin",
-        "{region}/no-addresses/postcode_centroids.bin",
-        "{region}/no-addresses/postcode_centroid_cells.bin",
-        "{region}/no-addresses/postcode_centroid_entries.bin",
         "{region}/no-addresses/way_parents.bin",
         "{region}/no-addresses/way_postcodes.bin",
         "{region}/no-addresses/strings_core.bin",
         "{region}/no-addresses/strings_street.bin",
-        "{region}/no-addresses/strings_postcode.bin",
         "{region}/full/strings_layout.json"
+      ],
+      "optional_files": [
+        "{region}/no-addresses/postcode_centroids.bin",
+        "{region}/no-addresses/postcode_centroid_cells.bin",
+        "{region}/no-addresses/postcode_centroid_entries.bin",
+        "{region}/no-addresses/strings_postcode.bin"
       ]
     },
     "mode.full": {
@@ -241,19 +245,19 @@
         "{region}/full/place_cells.bin",
         "{region}/full/place_entries.bin",
         "{region}/full/place_nodes.bin",
-        "{region}/full/postcode_centroids.bin",
-        "{region}/full/postcode_centroid_cells.bin",
-        "{region}/full/postcode_centroid_entries.bin",
         "{region}/full/way_parents.bin",
         "{region}/full/way_postcodes.bin",
         "{region}/full/strings_core.bin",
         "{region}/full/strings_street.bin",
         "{region}/full/strings_addr.bin",
-        "{region}/full/strings_postcode.bin",
         "{region}/full/strings_layout.json"
       ],
       "optional_files": [
-        "{region}/full/interp_postcodes.bin"
+        "{region}/full/interp_postcodes.bin",
+        "{region}/full/postcode_centroids.bin",
+        "{region}/full/postcode_centroid_cells.bin",
+        "{region}/full/postcode_centroid_entries.bin",
+        "{region}/full/strings_postcode.bin"
       ]
     },
     "quality.uncapped": {

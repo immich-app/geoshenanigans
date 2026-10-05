@@ -323,7 +323,12 @@ jobs:
             echo "[wikidata] No sitelinks data available"
           fi
 
-          # Download GeoNames postcode data (4.3M postcodes from ~100 countries).
+          # Download external postcode centroids. Nominatim supplements OSM
+          # postcodes with external data for GB (Code-Point Open, which
+          # GeoNames GB_full is derived from) and US (from TIGER, which the
+          # builder already loads), so only GB is fetched here: GeoNames for
+          # other countries adds PO-box codes at post offices that beat real
+          # centroids and diverge from Nominatim.
           # An earlier run hung for 4h on urllib.request.urlretrieve when
           # download.geonames.org stopped serving bytes mid-transfer — urllib's
           # default socket timeout is None. Set a global socket timeout AND
@@ -338,10 +343,7 @@ jobs:
           entries = {}
           tmpdir = tempfile.mkdtemp()
           for url, cc_filter in [
-              ('https://download.geonames.org/export/zip/allCountries.zip', None),
               ('https://download.geonames.org/export/zip/GB_full.csv.zip', 'GB'),
-              ('https://download.geonames.org/export/zip/CA_full.csv.zip', 'CA'),
-              ('https://download.geonames.org/export/zip/NL_full.csv.zip', 'NL'),
           ]:
               zpath = os.path.join(tmpdir, os.path.basename(url))
               try:
