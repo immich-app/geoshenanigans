@@ -79,6 +79,18 @@ struct KeyParam {
     key: Option<String>,
 }
 
+fn coords_in_range(lat: f64, lon: f64) -> bool {
+    (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon)
+}
+
+fn require_coords(params: &QueryParams) -> Result<(), Response> {
+    if coords_in_range(params.lat, params.lon) {
+        Ok(())
+    } else {
+        Err((StatusCode::BAD_REQUEST, "lat must be within ±90 and lon within ±180").into_response())
+    }
+}
+
 fn anonymous_allowed() -> bool {
     static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ALLOWED.get_or_init(|| {
@@ -100,6 +112,9 @@ async fn reverse_geocode(
         Ok(info) => info,
         Err(resp) => return resp,
     };
+    if let Err(resp) = require_coords(&params) {
+        return resp;
+    }
 
     let rate_key = if by_ip {
         format!("{}:{}", login, connect_info.0.ip())
@@ -241,6 +256,9 @@ async fn polygons_geojson(
     index: axum::extract::Extension<Arc<MultiIndex>>,
 ) -> Response {
     if let Err(resp) = require_valid_key(&state, params.key.as_deref()) {
+        return resp;
+    }
+    if let Err(resp) = require_coords(&params) {
         return resp;
     }
 
@@ -456,5 +474,20 @@ async fn async_main() {
         eprintln!("Starting HTTP server on {}...", bind_addr);
         let listener = tokio::net::TcpListener::bind(bind_addr).await.unwrap();
         axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coords_in_range_accepts_the_globe_only() {
+        for (lat, lon) in [(0.0, 0.0), (90.0, 180.0), (-90.0, -180.0), (48.85, 2.35)] {
+            assert!(coords_in_range(lat, lon), "({}, {})", lat, lon);
+        }
+        for (lat, lon) in [(91.0, 0.0), (-90.5, 0.0), (0.0, 180.1), (0.0, -181.0), (f64::NAN, 0.0), (0.0, f64::INFINITY)] {
+            assert!(!coords_in_range(lat, lon), "({}, {})", lat, lon);
+        }
     }
 }
