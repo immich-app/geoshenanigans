@@ -452,10 +452,7 @@ static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir
         return;
     }
 
-    AdminPolygon tomb_poly{};
-    std::memset(&tomb_poly, 0, sizeof(tomb_poly));
-    tomb_poly.name_id = NO_DATA;
-    std::vector<AdminPolygon> new_polys(n_new, tomb_poly);
+    std::vector<AdminPolygon> new_polys(n_new, admin_polygon_tombstone());
     std::vector<uint64_t>     new_osm_ids(n_new, 0);
     std::vector<uint32_t>     new_parents(data.admin_parent_ids.empty() ? 0 : n_new, NO_DATA);
 
@@ -1547,8 +1544,7 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
     // (Previously this loop push_back-compacted; with strategy-2 tombstones
     // present that shifted every slot past the first gap and corrupted
     // admin lookups.)
-    new_polys.assign(data.admin_polygons.size(), AdminPolygon{});
-    for (auto& p : new_polys) { p.name_id = NO_DATA; p.vertex_count = 0; }
+    new_polys.assign(data.admin_polygons.size(), admin_polygon_tombstone());
 
     for (size_t i = 0; i < data.admin_polygons.size(); i++) {
         auto& sv = simplified[i].verts;

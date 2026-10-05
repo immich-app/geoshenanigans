@@ -144,6 +144,18 @@ static const uint32_t INTERIOR_FLAG = 0x80000000u;
 static const uint32_t ID_MASK       = 0x7FFFFFFFu;
 static const uint32_t NO_DATA       = 0xFFFFFFFFu;
 
+// A strategy-2 slot with no living polygon. vertex_offset must be NO_DATA,
+// not 0: geocoder-diff sizes each polygon's vertex block as the distance to
+// the next non-NO_DATA offset, so a 0 offset claims every byte before the
+// next polygon and corrupts the admin_vertices patch.
+inline AdminPolygon admin_polygon_tombstone() {
+    AdminPolygon p{};
+    p.vertex_offset = NO_DATA;
+    p.vertex_count = 0;
+    p.name_id = NO_DATA;
+    return p;
+}
+
 // FNV-1a 64-bit hash parameters, used to derive deterministic SYNTHETIC
 // stable ids for TIGER interpolation ways and place nodes (build_index.cpp).
 static const uint64_t FNV1A_OFFSET_BASIS = 14695981039346656037ULL;
