@@ -163,6 +163,14 @@ the `.bin` files, because the server can't load a region without them.
 7. Update local date to latest
 ```
 
+Apply every patch out of place (`geocoder-patch <old-dir> <patch> -o <new-dir>`;
+the tool refuses `-o` equal to the current dir) and keep the build's
+directory layout. String offsets are global across the five string tiers,
+so a variant patch needs the old `<region>/full/strings_*.bin` tiers and
+`strings_layout.json` beside it (`../full/`) at the old version. The tool
+checks each tier against the old layout and fails rather than writing
+shifted offsets when one is missing or belongs to a different build.
+
 ### Version Mismatch
 
 ```

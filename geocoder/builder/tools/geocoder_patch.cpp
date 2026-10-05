@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <climits>
 #include <cstdint>
 #include <fstream>
 #include <cstdio>
@@ -16,6 +17,7 @@
 #include <fcntl.h>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <malloc.h>
 #include <string>
 #include <sys/mman.h>
@@ -75,6 +77,28 @@ static std::string resolve_with_fallback(const std::string& cur_dir, const std::
     return primary;
 }
 
+// Byte size of each string tier, from a strings_layout.json written by
+// the builder or by this tool ({"start": N, "end": M} per tier, in order).
+// Empty when the file is missing or malformed.
+static std::vector<uint64_t> read_tier_sizes(const std::string& path) {
+    std::ifstream f(path);
+    if (!f) return {};
+    std::string json((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+
+    std::vector<uint64_t> sizes;
+    size_t at = 0;
+    while ((at = json.find("\"start\":", at)) != std::string::npos) {
+        size_t end_at = json.find("\"end\":", at);
+        if (end_at == std::string::npos) return {};
+        uint64_t start = std::strtoull(json.c_str() + at + 8, nullptr, 10);
+        uint64_t end = std::strtoull(json.c_str() + end_at + 6, nullptr, 10);
+        if (end < start) return {};
+        sizes.push_back(end - start);
+        at = end_at;
+    }
+    return sizes;
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 5 || std::string(argv[3]) != "-o") {
         std::cerr << "Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir>" << std::endl;
@@ -82,6 +106,16 @@ int main(int argc, char* argv[]) {
     }
     std::string cur_dir = argv[1], patch_path = argv[2], out_dir = argv[4];
     ensure_dir(out_dir);
+    // Output files are truncated while the current files are still
+    // mmapped as the patch base, so in-place application corrupts both.
+    {
+        char cur_real[PATH_MAX], out_real[PATH_MAX];
+        if (realpath(cur_dir.c_str(), cur_real) && realpath(out_dir.c_str(), out_real) &&
+            std::strcmp(cur_real, out_real) == 0) {
+            std::cerr << "Output dir must differ from the current dir: " << out_real << std::endl;
+            return 1;
+        }
+    }
     std::string tmpdir = "/tmp/geocoder-patch-" + std::to_string(getpid());
     ensure_dir(tmpdir);
     double t_start = now_ms();
@@ -145,6 +179,29 @@ int main(int argc, char* argv[]) {
             uint32_t old_global_base = 0;
             uint32_t new_global_base = 0;
             uint32_t total_added = 0, total_deleted = 0;
+            // Strings live under <region>/full/, so a per-variant subdir
+            // (quality, poi, admin-minimal) resolves the old tiers there.
+            auto old_tier_path = [&](int t) {
+                return resolve_with_fallback(cur_dir, kStrTierFilenames[t], {"../full/", "../../full/"});
+            };
+            // String offsets are global (cumulative tier sizes), so every
+            // old tier before the last one present must exist at exactly
+            // its recorded size, even tiers this variant doesn't ship. A
+            // missing tier used to read as empty and silently shift every
+            // later offset. Trailing absent tiers (strings_poi.bin beside
+            // full/) shift nothing.
+            std::string old_layout = resolve_with_fallback(cur_dir, "strings_layout.json",
+                                                           {"../full/", "../../full/"});
+            std::vector<uint64_t> old_tier_sizes = read_tier_sizes(old_layout);
+            if (old_tier_sizes.size() != 5) {
+                std::cerr << "Cannot read the old string layout (" << old_layout << ")" << std::endl;
+                return 1;
+            }
+            int last_present_tier = -1;
+            for (int t = 0; t < 5; t++) {
+                struct stat st;
+                if (stat(old_tier_path(t).c_str(), &st) == 0 && st.st_size > 0) last_present_tier = t;
+            }
             for (int t = 0; t < 5; t++) {
                 uint32_t n_added = ru32(), n_deleted = ru32();
                 total_added += n_added; total_deleted += n_deleted;
@@ -154,20 +211,12 @@ int main(int argc, char* argv[]) {
                 for (uint32_t i = 0; i < n_deleted; i++) del_idx[i] = ru32();
                 std::unordered_set<uint32_t> del_set(del_idx.begin(), del_idx.end());
 
-                // Fallback to ../full/ when applying a patch on a per-
-                // variant subdir (quality, poi, admin-minimal). Strings
-                // live under <region>/full/, so the str_remap_vec built
-                // here has to walk those instead of the (missing)
-                // strings_*.bin in cur_dir.  Without this, the str_remap
-                // is empty and admin_polygons.bin name_id MATCH replays
-                // keep the old name_id while the new build expects the
-                // re-tiered offset → byte-mismatch on verify.
-                MappedFile old_pool = mmap_file(cur_dir + "/" + kStrTierFilenames[t]);
-                if (old_pool.size == 0 && old_pool.data == nullptr) {
-                    old_pool = mmap_file(cur_dir + "/../full/" + kStrTierFilenames[t]);
-                }
-                if (old_pool.size == 0 && old_pool.data == nullptr) {
-                    old_pool = mmap_file(cur_dir + "/../../full/" + kStrTierFilenames[t]);
+                MappedFile old_pool = mmap_file(old_tier_path(t));
+                if (t <= last_present_tier && old_pool.size != old_tier_sizes[t]) {
+                    std::cerr << "Old " << kStrTierFilenames[t] << " is " << old_pool.size
+                              << " bytes but the layout records " << old_tier_sizes[t]
+                              << " (missing tier or wrong base)" << std::endl;
+                    return 1;
                 }
                 // Phase A: write new tier file via alphabetical merge.
                 {
