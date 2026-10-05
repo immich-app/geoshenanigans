@@ -3691,8 +3691,10 @@ impl Index {
         };
         let address = AddressDetails {
             landmark: landmark_name,
-            house_number,
-            road,
+            // A string in a tier this mode doesn't ship (admin mode has no
+            // street or addr strings) resolves to "" — omit the field.
+            house_number: house_number.filter(|s| !s.is_empty()),
+            road: road.filter(|s| !s.is_empty()),
             city: admin.city.or(place.city).or(fallback_city),
             town: admin.town.or(place.town),
             village: admin.village.or(place.village),
