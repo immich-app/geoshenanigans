@@ -723,11 +723,18 @@ jobs:
           # Patches stay in $WORKDIR/output/*.gcpatch — uploaded alongside
           # compressed .bin.zst files in the Finalize step below. Exit 1
           # is DEFERRED to the Finalize step so that compress + upload
-          # still run (we need the .bin.zst and .gcpatch files available
-          # for local inspection of the patch failures).
+          # still run (the build data itself is valid and becomes the
+          # next day's patch base).
+          #
+          # A patch CI could not reproduce must never reach clients, and
+          # the chain must not route through this date: drop every patch
+          # here and Finalize records build.previous = null, so a client
+          # walking the chain falls back to a full download. The diff
+          # logs remain in the diff-logs artifact for debugging.
           if [ $FAIL -gt 0 ]; then
             echo "PATCH_VERIFY_FAILED=1" >> "$GITHUB_ENV"
-            echo "::warning::$FAIL variants failed patch verify — continuing to upload for debugging"
+            find "$WORKDIR/output" -name "patch.gcpatch" -delete
+            echo "::warning::$FAIL variants failed patch verify — dropped this build's patches; uploading data only"
           fi
 
       # ── Compress .bin files + splice per-file sizes into configurations.json ─
@@ -872,8 +879,9 @@ jobs:
           # ── Augment configurations.json with build metadata ─────────
           # Splices date / previous / built_at / wikidata_date into the
           # `build` block (which the static template stamps with
-          # build_version + patch_version).
-          PREV_VAL="$( [ "$HAS_PREVIOUS" = "true" ] && echo "$OLD_DATE" || echo "null" )"
+          # build_version + patch_version). A build whose patches failed
+          # verify published none, so it must not claim a previous build.
+          PREV_VAL="$( [ "$HAS_PREVIOUS" = "true" ] && [ -z "${PATCH_VERIFY_FAILED:-}" ] && echo "$OLD_DATE" || echo "null" )"
           jq --arg date "$NEW_DATE" \
              --arg previous "$PREV_VAL" \
              --arg built_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
