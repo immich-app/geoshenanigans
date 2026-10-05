@@ -44,6 +44,21 @@ impl Default for RateState {
 
 pub type RateLimiter = RwLock<HashMap<String, Arc<RateState>>>;
 
+// bcrypt costs ~250 ms. It runs on a blocking thread and never under the
+// Db lock: every /reverse takes db.read(), so hashing under the write lock
+// let an unauthenticated login flood stall query traffic.
+async fn hash_password(password: String) -> String {
+    tokio::task::spawn_blocking(move || bcrypt::hash(password, bcrypt::DEFAULT_COST).expect("bcrypt hash failed"))
+        .await
+        .expect("bcrypt task panicked")
+}
+
+async fn verify_password(password: String, hash: String) -> bool {
+    tokio::task::spawn_blocking(move || bcrypt::verify(password, &hash).unwrap_or(false))
+        .await
+        .unwrap_or(false)
+}
+
 #[derive(Serialize, Deserialize, Default)]
 pub struct Db {
     users: HashMap<String, User>,
@@ -78,15 +93,8 @@ impl Db {
         Ok(())
     }
 
-    fn create_user(&mut self, login: &str, password: &str, admin: bool, rate_per_second: u32, rate_per_day: u32, rate_by_ip: bool) {
-        let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST).expect("bcrypt hash failed");
-        self.users.insert(login.to_string(), User {
-            password_hash: hash,
-            admin,
-            rate_per_second,
-            rate_per_day,
-            rate_by_ip,
-        });
+    fn insert_user(&mut self, login: &str, user: User) {
+        self.users.insert(login.to_string(), user);
         if let Err(e) = self.save() {
             eprintln!("auth: failed to save database: {}", e);
         }
@@ -209,20 +217,39 @@ async fn login_page(headers: HeaderMap, state: State<Arc<RwLock<Db>>>) -> Respon
 }
 
 async fn login_submit(state: State<Arc<RwLock<Db>>>, Form(form): Form<LoginForm>) -> Response {
-    let mut db = state.write().unwrap_or_else(|e| e.into_inner());
+    let (bootstrap, stored_hash) = {
+        let db = state.read().unwrap_or_else(|e| e.into_inner());
+        (db.users.is_empty(), db.users.get(&form.login).map(|u| u.password_hash.clone()))
+    };
 
-    // First login ever — create admin account
-    if db.users.is_empty() {
-        db.create_user(&form.login, &form.password, true, 0, 0, false);
-    }
-
-    if let Some(user) = db.users.get(&form.login) {
-        if bcrypt::verify(&form.password, &user.password_hash).unwrap_or(false) {
-            let session_id = random_hex(32);
-            db.sessions.insert(session_id.clone(), form.login);
-            let (cookie,) = set_session_cookie(&session_id);
-            return (cookie, Redirect::to("/")).into_response();
+    let authenticated = if bootstrap {
+        // First login ever — create admin account
+        let user = User {
+            password_hash: hash_password(form.password.clone()).await,
+            admin: true,
+            rate_per_second: 0,
+            rate_per_day: 0,
+            rate_by_ip: false,
+        };
+        let mut db = state.write().unwrap_or_else(|e| e.into_inner());
+        // Another login may have bootstrapped while this one hashed.
+        let still_empty = db.users.is_empty();
+        if still_empty {
+            db.insert_user(&form.login, user);
         }
+        still_empty
+    } else {
+        match stored_hash {
+            Some(hash) => verify_password(form.password.clone(), hash).await,
+            None => false,
+        }
+    };
+
+    if authenticated {
+        let session_id = random_hex(32);
+        state.write().unwrap_or_else(|e| e.into_inner()).sessions.insert(session_id.clone(), form.login);
+        let (cookie,) = set_session_cookie(&session_id);
+        return (cookie, Redirect::to("/")).into_response();
     }
     Html(LOGIN_HTML.replace("</form>", "<small><ins>Invalid credentials</ins></small></form>"))
         .into_response()
@@ -355,12 +382,16 @@ async fn create_user_handler(headers: HeaderMap, state: State<Arc<RwLock<Db>>>, 
         None => return Redirect::to("/login").into_response(),
     };
 
-    let mut db = state.write().unwrap_or_else(|e| e.into_inner());
-    if let Some(login) = db.sessions.get(&session_id).cloned() {
-        let is_admin = db.users.get(&login).map(|u| u.admin).unwrap_or(false);
-        if is_admin && !form.login.is_empty() && !form.password.is_empty() {
-            db.create_user(&form.login, &form.password, false, form.rate_per_second, form.rate_per_day, form.rate_by_ip.as_deref() == Some("on"));
-        }
+    let allowed = state.read().unwrap_or_else(|e| e.into_inner()).is_admin(Some(&session_id), None);
+    if allowed && !form.login.is_empty() && !form.password.is_empty() {
+        let user = User {
+            password_hash: hash_password(form.password).await,
+            admin: false,
+            rate_per_second: form.rate_per_second,
+            rate_per_day: form.rate_per_day,
+            rate_by_ip: form.rate_by_ip.as_deref() == Some("on"),
+        };
+        state.write().unwrap_or_else(|e| e.into_inner()).insert_user(&form.login, user);
     }
     Redirect::to("/").into_response()
 }
@@ -483,6 +514,31 @@ mod tests {
         db.sessions.insert("root-session".to_string(), "root".to_string());
         db.sessions.insert("alice-session".to_string(), "alice".to_string());
         db
+    }
+
+    fn login_form(login: &str, password: &str) -> Form<LoginForm> {
+        Form(LoginForm { login: login.to_string(), password: password.to_string() })
+    }
+
+    fn sets_session(resp: &Response) -> bool {
+        resp.headers().get(SET_COOKIE).is_some_and(|c| c.to_str().unwrap().starts_with("session="))
+    }
+
+    #[tokio::test]
+    async fn first_login_creates_admin_then_verifies_password() {
+        let db = Arc::new(RwLock::new(Db::default()));
+
+        let first = login_submit(State(db.clone()), login_form("root", "pw")).await;
+        let wrong = login_submit(State(db.clone()), login_form("root", "nope")).await;
+        let right = login_submit(State(db.clone()), login_form("root", "pw")).await;
+        let other = login_submit(State(db.clone()), login_form("eve", "pw")).await;
+
+        assert!(sets_session(&first));
+        assert!(!sets_session(&wrong));
+        assert!(sets_session(&right));
+        assert!(!sets_session(&other), "only the first login may bootstrap an account");
+        assert!(db.read().unwrap().users.get("root").unwrap().admin);
+        assert!(!db.read().unwrap().users.contains_key("eve"));
     }
 
     #[test]
