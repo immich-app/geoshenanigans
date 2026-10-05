@@ -121,6 +121,12 @@ The static portions (axes/components/constraints/presets) come from
 builds. CI splices in `build.*` and the `files` table during the
 build's compress step.
 
+A component's `optional_files` are written only when the data has them
+(`interp_postcodes.bin` in TIGER regions, `postal_*` where postal
+boundaries exist); a client skips any that are absent from `files`.
+`strings_layout.json` and `poi_meta.json` are listed and compressed like
+the `.bin` files, because the server can't load a region without them.
+
 ## Client Decision Tree
 
 ### Fresh Install

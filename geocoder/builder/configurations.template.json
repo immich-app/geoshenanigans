@@ -60,7 +60,7 @@
         },
         "no-addresses": {
           "label": "No addresses",
-          "description": "Streets + interpolation + admin + postcodes. No house-number resolution.",
+          "description": "Streets + admin + postcodes. No house-number resolution.",
           "order": 2
         },
         "admin": {
@@ -174,7 +174,8 @@
         "{region}/admin-minimal/place_cells.bin",
         "{region}/admin-minimal/place_entries.bin",
         "{region}/admin-minimal/place_nodes.bin",
-        "{region}/full/strings_core.bin"
+        "{region}/full/strings_core.bin",
+        "{region}/full/strings_layout.json"
       ],
       "replaces": [
         "{region}/quality/{quality}/admin_polygons.bin",
@@ -194,7 +195,8 @@
         "{region}/admin/postcode_centroid_cells.bin",
         "{region}/admin/postcode_centroid_entries.bin",
         "{region}/admin/strings_core.bin",
-        "{region}/admin/strings_postcode.bin"
+        "{region}/admin/strings_postcode.bin",
+        "{region}/full/strings_layout.json"
       ]
     },
     "mode.no-addresses": {
@@ -203,9 +205,6 @@
         "{region}/no-addresses/street_entries.bin",
         "{region}/no-addresses/street_ways.bin",
         "{region}/no-addresses/street_nodes.bin",
-        "{region}/no-addresses/interp_entries.bin",
-        "{region}/no-addresses/interp_ways.bin",
-        "{region}/no-addresses/interp_nodes.bin",
         "{region}/no-addresses/admin_cells.bin",
         "{region}/no-addresses/admin_entries.bin",
         "{region}/no-addresses/admin_parents.bin",
@@ -219,7 +218,8 @@
         "{region}/no-addresses/way_postcodes.bin",
         "{region}/no-addresses/strings_core.bin",
         "{region}/no-addresses/strings_street.bin",
-        "{region}/no-addresses/strings_postcode.bin"
+        "{region}/no-addresses/strings_postcode.bin",
+        "{region}/full/strings_layout.json"
       ]
     },
     "mode.full": {
@@ -235,7 +235,6 @@
         "{region}/full/interp_entries.bin",
         "{region}/full/interp_ways.bin",
         "{region}/full/interp_nodes.bin",
-        "{region}/full/interp_postcodes.bin",
         "{region}/full/admin_cells.bin",
         "{region}/full/admin_entries.bin",
         "{region}/full/admin_parents.bin",
@@ -250,13 +249,19 @@
         "{region}/full/strings_core.bin",
         "{region}/full/strings_street.bin",
         "{region}/full/strings_addr.bin",
-        "{region}/full/strings_postcode.bin"
+        "{region}/full/strings_postcode.bin",
+        "{region}/full/strings_layout.json"
+      ],
+      "optional_files": [
+        "{region}/full/interp_postcodes.bin"
       ]
     },
     "quality.uncapped": {
       "files": [
         "{region}/quality/uncapped/admin_polygons.bin",
-        "{region}/quality/uncapped/admin_vertices.bin",
+        "{region}/quality/uncapped/admin_vertices.bin"
+      ],
+      "optional_files": [
         "{region}/quality/uncapped/postal_polygons.bin",
         "{region}/quality/uncapped/postal_vertices.bin"
       ]
@@ -264,7 +269,9 @@
     "quality.q0.2": {
       "files": [
         "{region}/quality/q0.2/admin_polygons.bin",
-        "{region}/quality/q0.2/admin_vertices.bin",
+        "{region}/quality/q0.2/admin_vertices.bin"
+      ],
+      "optional_files": [
         "{region}/quality/q0.2/postal_polygons.bin",
         "{region}/quality/q0.2/postal_vertices.bin"
       ]
@@ -272,7 +279,9 @@
     "quality.q0.5": {
       "files": [
         "{region}/quality/q0.5/admin_polygons.bin",
-        "{region}/quality/q0.5/admin_vertices.bin",
+        "{region}/quality/q0.5/admin_vertices.bin"
+      ],
+      "optional_files": [
         "{region}/quality/q0.5/postal_polygons.bin",
         "{region}/quality/q0.5/postal_vertices.bin"
       ]
@@ -280,7 +289,9 @@
     "quality.q1": {
       "files": [
         "{region}/quality/q1/admin_polygons.bin",
-        "{region}/quality/q1/admin_vertices.bin",
+        "{region}/quality/q1/admin_vertices.bin"
+      ],
+      "optional_files": [
         "{region}/quality/q1/postal_polygons.bin",
         "{region}/quality/q1/postal_vertices.bin"
       ]
@@ -288,7 +299,9 @@
     "quality.q1.5": {
       "files": [
         "{region}/quality/q1.5/admin_polygons.bin",
-        "{region}/quality/q1.5/admin_vertices.bin",
+        "{region}/quality/q1.5/admin_vertices.bin"
+      ],
+      "optional_files": [
         "{region}/quality/q1.5/postal_polygons.bin",
         "{region}/quality/q1.5/postal_vertices.bin"
       ]
@@ -296,7 +309,9 @@
     "quality.q2": {
       "files": [
         "{region}/quality/q2/admin_polygons.bin",
-        "{region}/quality/q2/admin_vertices.bin",
+        "{region}/quality/q2/admin_vertices.bin"
+      ],
+      "optional_files": [
         "{region}/quality/q2/postal_polygons.bin",
         "{region}/quality/q2/postal_vertices.bin"
       ]
@@ -304,7 +319,9 @@
     "quality.q2.5": {
       "files": [
         "{region}/quality/q2.5/admin_polygons.bin",
-        "{region}/quality/q2.5/admin_vertices.bin",
+        "{region}/quality/q2.5/admin_vertices.bin"
+      ],
+      "optional_files": [
         "{region}/quality/q2.5/postal_polygons.bin",
         "{region}/quality/q2.5/postal_vertices.bin"
       ]
@@ -318,7 +335,8 @@
         "{region}/poi/major/poi_vertices.bin",
         "{region}/poi/major/poi_cells.bin",
         "{region}/poi/major/poi_entries.bin",
-        "{region}/poi/major/strings_poi.bin"
+        "{region}/poi/major/strings_poi.bin",
+        "{region}/poi/major/poi_meta.json"
       ]
     },
     "poi_tier.notable": {
@@ -327,7 +345,8 @@
         "{region}/poi/notable/poi_vertices.bin",
         "{region}/poi/notable/poi_cells.bin",
         "{region}/poi/notable/poi_entries.bin",
-        "{region}/poi/notable/strings_poi.bin"
+        "{region}/poi/notable/strings_poi.bin",
+        "{region}/poi/notable/poi_meta.json"
       ]
     },
     "poi_tier.all": {
@@ -336,7 +355,8 @@
         "{region}/poi/all/poi_vertices.bin",
         "{region}/poi/all/poi_cells.bin",
         "{region}/poi/all/poi_entries.bin",
-        "{region}/poi/all/strings_poi.bin"
+        "{region}/poi/all/strings_poi.bin",
+        "{region}/poi/all/poi_meta.json"
       ]
     }
   },

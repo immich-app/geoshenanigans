@@ -61,6 +61,10 @@ pub struct Component {
     pub replaces: Vec<String>,
     #[serde(default, rename = "extends")]
     pub extends: Option<String>,
+    /// Files the builder writes only when the data has them (TIGER
+    /// sidecars, postal boundaries). Absent from the manifest = skip.
+    #[serde(default)]
+    pub optional_files: Vec<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -82,11 +86,19 @@ pub struct RegionSelection {
 }
 
 /// Resolved file set for a single region after walking components +
-/// applying `replaces`. Each entry is a path relative to the build root
-/// (e.g. "europe/full/admin_cells.bin"); look up sizes/hashes in
+/// applying `replaces`. Each path is relative to the build root (e.g.
+/// "europe/full/admin_cells.bin"); look up sizes/hashes in
 /// configurations.files.
-pub fn resolve_files(cfg: &Configurations, sel: &RegionSelection) -> Vec<String> {
+pub struct ResolvedFiles {
+    /// Every path to fetch, sorted and deduped.
+    pub paths: Vec<String>,
+    /// Paths that may legitimately be missing from the manifest.
+    pub optional: HashSet<String>,
+}
+
+pub fn resolve_files(cfg: &Configurations, sel: &RegionSelection) -> ResolvedFiles {
     let mut files = Vec::new();
+    let mut optional = HashSet::new();
     let mut replaced = HashSet::new();
 
     let component_ids = [
@@ -105,26 +117,33 @@ pub fn resolve_files(cfg: &Configurations, sel: &RegionSelection) -> Vec<String>
     fn visit(
         cfg: &Configurations, sel: &RegionSelection, id: &str,
         seen: &mut HashSet<String>, files: &mut Vec<String>,
-        replaced: &mut HashSet<String>,
+        optional: &mut HashSet<String>, replaced: &mut HashSet<String>,
     ) {
         if !seen.insert(id.to_string()) { return; }
         let Some(c) = cfg.components.get(id) else { return; };
         if let Some(parent) = c.extends.as_deref() {
-            visit(cfg, sel, parent, seen, files, replaced);
+            visit(cfg, sel, parent, seen, files, optional, replaced);
         }
         for f in &c.files { files.push(substitute(f, sel)); }
+        for f in &c.optional_files {
+            let path = substitute(f, sel);
+            optional.insert(path.clone());
+            files.push(path);
+        }
         for r in &c.replaces { replaced.insert(substitute(r, sel)); }
     }
 
     for cid in &component_ids {
-        visit(cfg, sel, cid, &mut HashSet::new(), &mut files, &mut replaced);
+        visit(cfg, sel, cid, &mut HashSet::new(), &mut files, &mut optional, &mut replaced);
     }
 
-    files.into_iter()
+    let paths: Vec<String> = files.into_iter()
         .filter(|f| !replaced.contains(f))
         .collect::<BTreeSet<_>>() // dedup + stable order
         .into_iter()
-        .collect()
+        .collect();
+    optional.retain(|p| paths.contains(p));
+    ResolvedFiles { paths, optional }
 }
 
 // --- Download a single file -------------------------------------------------
@@ -274,13 +293,16 @@ pub async fn download_region(
     root: &Path,
     progress: impl Fn(DownloadProgress) + Send + Sync,
 ) -> Result<(), DownloadError> {
-    let paths = resolve_files(cfg, sel);
-    if paths.is_empty() {
+    let resolved = resolve_files(cfg, sel);
+    if resolved.paths.is_empty() {
         return Err(DownloadError::UnknownRegion(sel.region.clone()));
     }
+    let paths: Vec<&String> = resolved.paths.iter()
+        .filter(|p| cfg.files.contains_key(*p) || !resolved.optional.contains(*p))
+        .collect();
 
     let bytes_total: u64 = paths.iter()
-        .filter_map(|p| cfg.files.get(p).map(|f| f.size_zst))
+        .filter_map(|p| cfg.files.get(*p).map(|f| f.size_zst))
         .sum();
     let mut bytes_done: u64 = 0;
     let files_total = paths.len();
@@ -312,8 +334,8 @@ pub async fn download_region(
     }
 
     for (i, path) in paths.iter().enumerate() {
-        let entry = cfg.files.get(path)
-            .ok_or_else(|| DownloadError::NotInManifest(path.clone()))?;
+        let entry = cfg.files.get(*path)
+            .ok_or_else(|| DownloadError::NotInManifest((*path).clone()))?;
 
         let fname = Path::new(path).file_name()
             .ok_or_else(|| DownloadError::Io(format!("bad manifest path: {}", path)))?;
@@ -335,7 +357,7 @@ pub async fn download_region(
             files_total,
             bytes_done,
             bytes_total,
-            current_file: Some(path.clone()),
+            current_file: Some((*path).clone()),
         });
     }
 
@@ -384,6 +406,7 @@ mod tests {
             files: files.iter().map(|s| s.to_string()).collect(),
             replaces: replaces.iter().map(|s| s.to_string()).collect(),
             extends: extends.map(|s| s.to_string()),
+            optional_files: Vec::new(),
         }
     }
 
@@ -414,7 +437,7 @@ mod tests {
             ("poi_tier.major", component(&["{region}/poi/{poi_tier}.bin"], &[], None)),
         ]);
         let s = sel("europe", "full", "q2.5", "major");
-        let files = resolve_files(&c, &s);
+        let files = resolve_files(&c, &s).paths;
         // BTreeSet => sorted, deduped. {region}->europe, {mode}->full,
         // {quality}->q2.5, {poi_tier}->major.
         assert_eq!(files, vec![
@@ -435,7 +458,7 @@ mod tests {
             ("poi_tier.none", component(&[], &[], None)),
         ]);
         let s = sel("eu", "full", "q2.5", "none");
-        let files = resolve_files(&c, &s);
+        let files = resolve_files(&c, &s).paths;
         assert_eq!(files, vec![
             "base_a.bin".to_string(),
             "base_b.bin".to_string(),
@@ -453,7 +476,7 @@ mod tests {
             ("poi_tier.none", component(&[], &[], None)),
         ]);
         let s = sel("eu", "full", "q2.5", "none");
-        let files = resolve_files(&c, &s);
+        let files = resolve_files(&c, &s).paths;
         assert_eq!(files, vec![
             "admin_hi.bin".to_string(),
             "cells.bin".to_string(),
@@ -471,7 +494,7 @@ mod tests {
             ("poi_tier.none", component(&[], &[], None)),
         ]);
         let s = sel("asia", "full", "q2.5", "none");
-        let files = resolve_files(&c, &s);
+        let files = resolve_files(&c, &s).paths;
         assert_eq!(files, vec!["asia/admin_hi.bin".to_string()]);
     }
 
@@ -484,7 +507,7 @@ mod tests {
             ("poi_tier.none", component(&[], &[], None)),
         ]);
         let s = sel("eu", "full", "q2.5", "none");
-        let files = resolve_files(&c, &s);
+        let files = resolve_files(&c, &s).paths;
         assert_eq!(files, vec!["extra.bin".to_string(), "shared.bin".to_string()]);
     }
 
@@ -493,7 +516,50 @@ mod tests {
         // No matching component ids at all -> empty result.
         let c = cfg(vec![("something.else", component(&["x.bin"], &[], None))]);
         let s = sel("eu", "full", "q2.5", "none");
-        assert!(resolve_files(&c, &s).is_empty());
+        assert!(resolve_files(&c, &s).paths.is_empty());
+    }
+
+    #[test]
+    fn resolve_files_marks_optional_files() {
+        let mut full = component(&["{region}/full/admin_cells.bin"], &[], None);
+        full.optional_files = vec!["{region}/full/interp_postcodes.bin".to_string()];
+        let c = cfg(vec![("mode.full", full)]);
+        let s = sel("europe", "full", "q2.5", "none");
+
+        let resolved = resolve_files(&c, &s);
+
+        assert_eq!(resolved.paths, vec![
+            "europe/full/admin_cells.bin".to_string(),
+            "europe/full/interp_postcodes.bin".to_string(),
+        ]);
+        assert!(resolved.optional.contains("europe/full/interp_postcodes.bin"));
+        assert!(!resolved.optional.contains("europe/full/admin_cells.bin"));
+    }
+
+    // Index::load needs strings_layout.json in every region dir and
+    // PoiMeta::load reads poi_meta.json; a selection that resolves without
+    // them downloads GiBs into a dir that can never load.
+    #[test]
+    fn template_selections_include_load_sidecars() {
+        let v: serde_json::Value = serde_json::from_str(include_str!("../../builder/configurations.template.json")).unwrap();
+        let c = Configurations {
+            build: BuildMeta { date: "2026-01-01".into() },
+            components: serde_json::from_value(v["components"].clone()).unwrap(),
+            files: BTreeMap::new(),
+        };
+        let names = |key: &str| -> Vec<String> {
+            v["axes"][key]["values"].as_object().unwrap().keys().cloned().collect()
+        };
+        for mode in names("mode") {
+            for poi_tier in names("poi_tier") {
+                let s = sel("europe", &mode, "q2.5", &poi_tier);
+                let paths = resolve_files(&c, &s).paths;
+                let has = |name: &str| paths.iter().any(|p| p.ends_with(&format!("/{}", name)));
+                assert!(has("strings_layout.json"), "{}/{} lacks strings_layout.json", mode, poi_tier);
+                assert!(has("admin_cells.bin"), "{}/{} lacks admin_cells.bin", mode, poi_tier);
+                assert_eq!(has("poi_meta.json"), poi_tier != "none", "{}/{} poi_meta.json", mode, poi_tier);
+            }
+        }
     }
 
     #[test]
