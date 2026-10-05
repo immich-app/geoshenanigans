@@ -28,6 +28,13 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
 // (multiple candidate countries) resolve by point-in-polygon. 0 if unknown.
 uint16_t country_code_at_point(const ParsedData& data, double lat, double lng);
 
+// Fold the OSM addr:postcode points into data.postcode_accum per
+// (country, postcode), keeping external centroids only for the pairs OSM
+// lacks. Run once on the full data before the continent split, so every
+// region writes the same centroids (Nominatim's location_postcode is one
+// table) instead of recomputing them from its own subset of addr points.
+void collect_postcode_centroids(ParsedData& data);
+
 // Strategy-2 persistent dense IDs. Loads the previous build's
 // <prev_dir>/full/<file>.osm_ids sidecars (if present), allocates
 // stable indices for each record by osm_id matching, reorders the

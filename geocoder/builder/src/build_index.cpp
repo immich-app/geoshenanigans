@@ -2429,6 +2429,11 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
         unsetenv("GC_PREV_OUTPUT_ROOT");
     }
 
+    // Postcode centroids are final before the split: a continent that
+    // recomputed them from its own addr points put RU 430000 on two
+    // mis-tagged Moscow addresses (Saransk's 21 fall in the asia subset).
+    collect_postcode_centroids(data);
+
     // Write planet (async — overlaps with continent filtering start)
     auto planet_future = std::async(std::launch::async, [&]() {
         write_region(data, output_dir + "/planet", /*remap_already_applied=*/true);

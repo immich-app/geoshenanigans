@@ -781,6 +781,29 @@ void apply_strategy2_remaps(ParsedData& data, const std::string& prev_dir) {
 // kAdminCellLevel S2 cell and walks that cell's admin entries. Single-
 // country cells return immediately; border cells (multiple countries in
 // the entry list) resolve by point-in-polygon.
+void collect_postcode_centroids(ParsedData& data) {
+    std::unordered_map<uint64_t, ParsedData::PostcodeAccum> osm;
+    size_t n = std::min(data.addr_points.size(), data.addr_postcode_ids.size());
+    for (size_t i = 0; i < n; i++) {
+        uint32_t pc_id = data.addr_postcode_ids[i];
+        if (pc_id == NO_DATA) continue;
+        const auto& ap = data.addr_points[i];
+        uint16_t cc = country_code_at_point(data, ap.lat, ap.lng);
+        if (cc == 0) continue;
+        osm[postcode_key(cc, pc_id)].add(ap.lat, ap.lng);
+    }
+    // External centroids (TIGER, GeoNames) fill only the (country,
+    // postcode) pairs OSM has none for, as Nominatim's
+    // _update_from_external does.
+    size_t external = 0;
+    for (const auto& [key, acc] : data.postcode_accum) {
+        if (osm.emplace(key, acc).second) external++;
+    }
+    std::cerr << "Postcode centroids: " << osm.size() - external << " from OSM addresses, "
+              << external << " external" << std::endl;
+    data.postcode_accum = std::move(osm);
+}
+
 uint16_t country_code_at_point(const ParsedData& data, double lat, double lng) {
     S2CellId cell = S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(kAdminCellLevel);
     auto it = data.cell_to_admin.find(cell.id());
@@ -1189,86 +1212,44 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
     // Write postcode centroid index (optional files)
     // Validate each centroid's postcode against the country's pattern
     // (matching Nominatim's clean_postcodes sanitizer).
-    bool has_addr_postcodes = std::any_of(data.addr_postcode_ids.begin(), data.addr_postcode_ids.end(),
-                                          [](uint32_t pc) { return pc != NO_DATA; });
-    if (!data.postcode_accum.empty() || has_addr_postcodes) {
+    // Centroids per (country, postcode) were collected once on the full
+    // data (collect_postcode_centroids); continents carry the entries
+    // whose centroid lies inside them.
+    if (!data.postcode_accum.empty()) {
         write_futures.push_back(std::async(std::launch::async, [&] {
-            // Nominatim's _PostcodeCollector accumulates per-country:
-            // the same postcode string in different countries produces
-            // separate centroids. This prevents a "90012" tagged on a
-            // building in Sicily from shifting the US 90012 centroid.
-            //
-            // OSM centroids: accumulate the addr points per country.
             auto get_str = [&](uint32_t off) -> const char* {
                 return data.get_string(off);
             };
 
-            // Per-country accumulator: (country_code, postcode_id) → centroid
-            struct CountryPcKey {
-                uint16_t cc;
-                uint32_t pc_id;
-                bool operator==(const CountryPcKey& o) const { return cc == o.cc && pc_id == o.pc_id; }
-            };
-            struct CountryPcHash {
-                size_t operator()(const CountryPcKey& k) const {
-                    return std::hash<uint64_t>()(((uint64_t)k.cc << 32) | k.pc_id);
-                }
-            };
-            struct PcAccum { double sum_lat = 0, sum_lng = 0; uint64_t count = 0; };
-            std::unordered_map<CountryPcKey, PcAccum, CountryPcHash> country_accum;
-
-            // Re-scan addr_points + addr_postcodes to split by country
-            for (uint32_t i = 0; i < data.addr_points.size(); i++) {
-                if (i >= data.addr_postcode_ids.size()) break;
-                uint32_t pc_id = data.addr_postcode_ids[i];
-                if (pc_id == NO_DATA) continue;
-                const auto& ap = data.addr_points[i];
-                // Look up country for this addr_point
-                uint16_t cc = country_code_at_point(data, ap.lat, ap.lng);
-                if (cc == 0) continue; // skip if no country found
-                auto& acc = country_accum[{cc, pc_id}];
-                acc.sum_lat += ap.lat;
-                acc.sum_lng += ap.lng;
-                acc.count++;
-            }
-
-            // External centroids (TIGER, GeoNames) fill only the
-            // (country, postcode) pairs OSM has none for, as Nominatim's
-            // _update_from_external does.
-            for (const auto& [pk, acc] : data.postcode_accum) {
-                if (acc.count == 0) continue;
-                auto key = CountryPcKey{postcode_key_cc(pk), postcode_key_pc(pk)};
-                if (country_accum.count(key) > 0) continue;
-                country_accum[key] = {acc.lat() * acc.count, acc.lng() * acc.count, acc.count};
-            }
-
             // Build centroid vector with validation
             std::vector<PostcodeCentroid> centroids;
-            centroids.reserve(country_accum.size());
+            centroids.reserve(data.postcode_accum.size());
             uint32_t rejected = 0;
-            for (const auto& [key, acc] : country_accum) {
+            for (const auto& [pk, acc] : data.postcode_accum) {
                 if (acc.count == 0) continue;
+                uint16_t cc = postcode_key_cc(pk);
+                uint32_t pc_id = postcode_key_pc(pk);
                 char cc_str[3] = {
-                    static_cast<char>(std::tolower(key.cc >> 8)),
-                    static_cast<char>(std::tolower(key.cc & 0xFF)),
+                    static_cast<char>(std::tolower(cc >> 8)),
+                    static_cast<char>(std::tolower(cc & 0xFF)),
                     0
                 };
-                const char* pc_str = get_str(key.pc_id);
+                const char* pc_str = get_str(pc_id);
                 if (!validate_postcode_for_country(cc_str, pc_str)) {
                     rejected++;
                     continue;
                 }
                 PostcodeCentroid c{};
-                c.lat = static_cast<float>(acc.sum_lat / acc.count);
-                c.lng = static_cast<float>(acc.sum_lng / acc.count);
-                c.postcode_id = key.pc_id;
-                c.country_code = key.cc;
+                c.lat = static_cast<float>(acc.lat());
+                c.lng = static_cast<float>(acc.lng());
+                c.postcode_id = pc_id;
+                c.country_code = cc;
                 centroids.push_back(c);
             }
             std::cerr << "Postcode centroids: " << centroids.size() << " valid, "
                       << rejected << " rejected by country pattern"
-                      << " (from " << country_accum.size() << " country+postcode pairs)" << std::endl;
-            // Determinism: iterate-then-sort over `country_accum` (an
+                      << " (from " << data.postcode_accum.size() << " country+postcode pairs)" << std::endl;
+            // Determinism: iterate-then-sort over `postcode_accum` (an
             // unordered_map) produces a run-dependent insertion order.
             // Sorting on postcode_id alone leaves collisions (same pc_id
             // in different countries, e.g. "90012" in US and FR) in an
