@@ -242,6 +242,18 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
 
             if (nodes.size() < 2 || nodes.size() > 255) continue;
 
+            // As Nominatim's tiger_line_import: store the range ascending
+            // with the geometry running from the start number (TIGER gives
+            // ranges in the edge's digitising direction, often descending),
+            // and align the start with the odd/even parity.
+            if (from_num > to_num) {
+                std::swap(from_num, to_num);
+                std::reverse(nodes.begin(), nodes.end());
+            }
+            if ((interp_type == "odd" && from_num % 2 == 0) || (interp_type == "even" && from_num % 2 == 1)) {
+                from_num++;
+            }
+
             // Create InterpWay
             uint32_t node_offset = static_cast<uint32_t>(data.interp_nodes.size());
             for (const auto& n : nodes) data.interp_nodes.push_back(n);
@@ -254,8 +266,8 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
             iw.node_offset = node_offset;
             iw.node_count = static_cast<uint8_t>(nodes.size());
             iw.street_id = data.string_pool.intern(street);
-            iw.start_number = static_cast<uint32_t>(std::min(from_num, to_num));
-            iw.end_number = static_cast<uint32_t>(std::max(from_num, to_num));
+            iw.start_number = static_cast<uint32_t>(from_num);
+            iw.end_number = static_cast<uint32_t>(to_num);
             iw.interpolation = itype;
 
             // Defer S2 computation
