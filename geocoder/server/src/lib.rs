@@ -3150,28 +3150,27 @@ impl Index {
             // 0.05 deg ~ 5.5km, matches Nominatim's get_nearest_postcode
             let max_dist_sq = (0.05_f64).to_radians().powi(2);
             let cos_lat = lat.to_radians().cos();
-            let mut best_dist = f64::MAX;
-            let mut best_pc: Option<&str> = None;
+            let mut best: Option<(f64, &str)> = None;
+            let mut consider = |pc: PostcodeCentroid| {
+                if let Some(cc) = country_gate {
+                    if pc.country_code != 0 && pc.country_code != cc { return; }
+                }
+                let dlat = (lat - pc.lat as f64).to_radians();
+                let dlng = (lng - pc.lng as f64).to_radians();
+                let d = dlat * dlat + dlng * dlng * cos_lat * cos_lat;
+                if d >= max_dist_sq { return; }
+                let s = self.get_string(pc.postcode_id);
+                if centroid_postcode_ok(s) && nearer_postcode(d, s, best) {
+                    best = Some((d, s));
+                }
+            };
 
             if let (Some(ref cells), Some(ref entries)) = (&self.postcode_centroid_cells, &self.postcode_centroid_entries) {
                 let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
                 let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
                 for c in std::iter::once(cell).chain(neighbors.into_iter()) {
                     Self::for_each_entry_fb(entries, Self::lookup_admin_cell_fb(cells, c), |id| {
-                        let Some(pc) = self.postcode_centroid(id) else { return; };
-                        if let Some(cc) = country_gate {
-                            if pc.country_code != 0 && pc.country_code != cc { return; }
-                        }
-                        let dlat = (lat - pc.lat as f64).to_radians();
-                        let dlng = (lng - pc.lng as f64).to_radians();
-                        let d = dlat * dlat + dlng * dlng * cos_lat * cos_lat;
-                        if d < best_dist && d < max_dist_sq {
-                            let s = self.get_string(pc.postcode_id);
-                            if centroid_postcode_ok(s) {
-                                best_dist = d;
-                                best_pc = Some(s);
-                            }
-                        }
+                        if let Some(pc) = self.postcode_centroid(id) { consider(pc); }
                     });
                 }
             } else {
@@ -3179,23 +3178,10 @@ impl Index {
                 // O(N) but only triggers in admin-only deployments
                 // where N is small.
                 for i in 0..total_centroids as u32 {
-                    let Some(pc) = self.postcode_centroid(i) else { continue; };
-                    if let Some(cc) = country_gate {
-                        if pc.country_code != 0 && pc.country_code != cc { continue; }
-                    }
-                    let dlat = (lat - pc.lat as f64).to_radians();
-                    let dlng = (lng - pc.lng as f64).to_radians();
-                    let d = dlat * dlat + dlng * dlng * cos_lat * cos_lat;
-                    if d < best_dist && d < max_dist_sq {
-                        let s = self.get_string(pc.postcode_id);
-                        if centroid_postcode_ok(s) {
-                            best_dist = d;
-                            best_pc = Some(s);
-                        }
-                    }
+                    if let Some(pc) = self.postcode_centroid(i) { consider(pc); }
                 }
             }
-            return best_pc;
+            return best.map(|(_, s)| s);
         }
 
         None
@@ -4083,6 +4069,17 @@ pub fn postcode_looks_valid(_country_code: &[u8; 2], postcode: &str) -> bool {
 // strings that are clearly not standalone postcodes — matches
 // the spirit of Nominatim's clean_postcodes sanitizer which
 // validates against per-country regex patterns at import.
+/// Whether a centroid at squared distance `d` beats the current best.
+/// Equally near centroids (GeoNames puts many PO-box ZIPs at one post
+/// office) are ordered by postcode, never by record order, which differs
+/// between continent and planet builds and between fresh and chained ones.
+pub fn nearer_postcode(d: f64, s: &str, best: Option<(f64, &str)>) -> bool {
+    match best {
+        None => true,
+        Some((best_d, best_s)) => d < best_d || (d == best_d && s < best_s),
+    }
+}
+
 pub fn centroid_postcode_ok(s: &str) -> bool {
     if s.len() > 10 { return false; }  // postcodes are short
     if s.contains(';') { return false; } // multiple values
@@ -4575,6 +4572,18 @@ pub fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
 #[cfg(test)]
 mod pure_helper_tests {
     use super::*;
+
+    // -- nearest postcode ------------------------------------------------------
+
+    #[test]
+    fn nearer_postcode_orders_ties_by_postcode() {
+        assert!(nearer_postcode(1.0, "60680", None));
+        assert!(nearer_postcode(1.0, "60680", Some((2.0, "60454"))));
+        assert!(!nearer_postcode(3.0, "60454", Some((2.0, "60680"))));
+        // GeoNames puts many PO-box ZIPs at one post office: equal distance.
+        assert!(nearer_postcode(2.0, "60454", Some((2.0, "60680"))));
+        assert!(!nearer_postcode(2.0, "60680", Some((2.0, "60454"))));
+    }
 
     // -- POI ordering ---------------------------------------------------------
 
