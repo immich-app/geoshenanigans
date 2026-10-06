@@ -1,6 +1,8 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 #include "types.h"
@@ -25,4 +27,23 @@ inline void remap_index_flagged(uint32_t& v, const std::vector<uint32_t>& remap)
     uint32_t idx  = v & ~INTERIOR_FLAG;
     if (idx != (NO_DATA & ~INTERIOR_FLAG) && idx < remap.size())
         v = remap[idx] | flag;
+}
+
+// Remap every id of a cell → ids table and restore its canonical order (each
+// list sorted by raw value, flag bit included; pair tables by cell_item_less),
+// as the deterministic-ordering pass leaves them. The entry writers emit lists
+// as stored and diff/patch rebuild them sorted, so a list left in pre-remap
+// order costs a correction in every patch.
+template <typename RemapOne>
+void remap_cell_map(std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map, RemapOne remap_one) {
+    for (auto& [cell, ids] : cell_map) {
+        for (auto& id : ids) remap_one(id);
+        std::sort(ids.begin(), ids.end());
+    }
+}
+
+template <typename RemapOne>
+void remap_cell_pairs(std::vector<CellItemPair>& pairs, RemapOne remap_one) {
+    for (auto& p : pairs) remap_one(p.item_id);
+    std::sort(pairs.begin(), pairs.end(), cell_item_less);
 }

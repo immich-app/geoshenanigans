@@ -354,8 +354,8 @@ static void apply_strategy2_streets(ParsedData& data, const std::string& prev_di
     }
 
     // Apply remap to every reference site that points into ways[].
-    for (auto& [cell, ids] : data.cell_to_ways) for (auto& id : ids) remap_index(id, remap);
-    for (auto& p : data.sorted_way_cells) remap_index(p.item_id, remap);
+    remap_cell_map(data.cell_to_ways, [&](uint32_t& v) { remap_index(v, remap); });
+    remap_cell_pairs(data.sorted_way_cells, [&](uint32_t& v) { remap_index(v, remap); });
     for (auto& ap : data.addr_points)     remap_index(ap.parent_way_id, remap);
     // NOTE: PoiRecord::parent_street_id is NOT a way index — it holds the
     // string offset of the nearest street's name (w.name_id, set at
@@ -451,7 +451,7 @@ static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir
     // flagged value is ≥ 2^31, so the plain remap_index's `v < remap.size()`
     // guard would skip it and leave a stale polygon index after reorder, so
     // use remap_index_flagged which masks the flag, remaps, then re-ORs.
-    for (auto& [cell, ids] : data.cell_to_admin) for (auto& id : ids) remap_index_flagged(id, remap);
+    remap_cell_map(data.cell_to_admin, [&](uint32_t& v) { remap_index_flagged(v, remap); });
     // admin_parent_ids and way_parent_ids hold admin polygon IDs (parent chain).
     // admin_parent_ids was reordered above; now value-remap each entry.
     // These are plain indices (no INTERIOR_FLAG), so plain remap_index is correct.
@@ -515,8 +515,8 @@ static void apply_strategy2_addrs(ParsedData& data, const std::string& prev_dir)
     data.addr_osm_ids = std::move(new_osm_ids);
     if (!new_postcodes.empty()) data.addr_postcode_ids = std::move(new_postcodes);
 
-    for (auto& [cell, ids] : data.cell_to_addrs) for (auto& id : ids) remap_index(id, remap);
-    for (auto& p : data.sorted_addr_cells) remap_index(p.item_id, remap);
+    remap_cell_map(data.cell_to_addrs, [&](uint32_t& v) { remap_index(v, remap); });
+    remap_cell_pairs(data.sorted_addr_cells, [&](uint32_t& v) { remap_index(v, remap); });
 
     finalize_strategy2(alloc, n_new, n_old, data.addr_sidecar_blob, "addrs", /*no_shifts=*/false);
 }
@@ -568,7 +568,7 @@ static void apply_strategy2_places(ParsedData& data, const std::string& prev_dir
     data.place_nodes   = std::move(new_places);
     data.place_osm_ids = std::move(new_osm_ids);
 
-    for (auto& p : data.sorted_place_cells) remap_index(p.item_id, remap);
+    remap_cell_pairs(data.sorted_place_cells, [&](uint32_t& v) { remap_index(v, remap); });
 
     finalize_strategy2(alloc, n_new, n_old, data.place_sidecar_blob, "places", /*no_shifts=*/false);
 }
@@ -628,8 +628,8 @@ static void apply_strategy2_pois(ParsedData& data, const std::string& prev_dir) 
     // flagged value is ≥ 2^31, so a plain `v < remap.size()` guard would
     // skip it and leave a stale POI index after reorder. remap_index_flagged
     // masks, remaps, re-ORs — mirroring the deterministic-sort pass.
-    for (auto& [cell, ids] : data.cell_to_pois) for (auto& id : ids) remap_index_flagged(id, remap);
-    for (auto& p : data.sorted_poi_cells) remap_index_flagged(p.item_id, remap);
+    remap_cell_map(data.cell_to_pois, [&](uint32_t& v) { remap_index_flagged(v, remap); });
+    remap_cell_pairs(data.sorted_poi_cells, [&](uint32_t& v) { remap_index_flagged(v, remap); });
 
     finalize_strategy2(alloc, n_new, n_old, data.poi_sidecar_blob, "pois", /*no_shifts=*/false);
 }
@@ -708,8 +708,8 @@ static void apply_strategy2_interps(ParsedData& data, const std::string& prev_di
         data.interp_nodes = std::move(new_nodes);
     }
 
-    for (auto& [cell, ids] : data.cell_to_interps) for (auto& id : ids) remap_index(id, remap);
-    for (auto& p : data.sorted_interp_cells) remap_index(p.item_id, remap);
+    remap_cell_map(data.cell_to_interps, [&](uint32_t& v) { remap_index(v, remap); });
+    remap_cell_pairs(data.sorted_interp_cells, [&](uint32_t& v) { remap_index(v, remap); });
 
     finalize_strategy2(alloc, n_new, n_old, data.interp_sidecar_blob, "interps", /*no_shifts=*/false);
 }
