@@ -122,10 +122,9 @@ inline void log_mem(const char* label, size_t bytes) {
 //
 // At build finalization, every interned string is assigned to exactly one
 // tier based on which record types reference it. Clients download the tier
-// files they need and the remaining get_string() lookups for missing tiers
-// fall back to an empty string. Rule: a string's home tier is the lowest
-// set bit of its consumer-mask, so e.g. a name used by both streets and
-// POIs lives in strings_street.bin (POI clients always have streets).
+// files their mode needs and lookups into a missing tier return an empty
+// string, so a string shared by several consumers must live in a tier every
+// one of their modes downloads. See string_home_tier.
 constexpr uint8_t STR_TIER_BIT_CORE     = 1 << 0;  // admin_polygons, place_nodes
 constexpr uint8_t STR_TIER_BIT_STREET   = 1 << 1;  // ways, addr_point.street_id, interp, poi.parent_street_id
 constexpr uint8_t STR_TIER_BIT_ADDR     = 1 << 2;  // addr housenumbers
@@ -143,6 +142,19 @@ constexpr const char* STR_TIER_FILENAMES[STR_TIER_COUNT] = {
 constexpr const char* STR_TIER_NAMES[STR_TIER_COUNT] = {
     "core", "street", "addr", "postcode", "poi"
 };
+
+// Home tier of a string from its consumer mask. The mode tiers nest by who
+// downloads them (core: every mode; postcode: admin and up; street:
+// no-addresses and up; addr: full only), so the most widely downloaded
+// consumer tier serves every consumer. The poi tier ships with any mode, so a
+// string a POI shares with anything outside core needs core.
+inline uint8_t string_home_tier(uint8_t mask) {
+    if (mask == 0 || (mask & STR_TIER_BIT_CORE)) return 0;
+    if (mask & STR_TIER_BIT_POI) return (mask & ~STR_TIER_BIT_POI) ? 0 : 4;
+    if (mask & STR_TIER_BIT_POSTCODE) return 3;
+    if (mask & STR_TIER_BIT_STREET) return 1;
+    return 2;
+}
 
 // --- Parsed data container ---
 
@@ -304,8 +316,8 @@ struct ParsedData {
 // alphabetically within each, and remap all record name_id fields to the
 // new globally-contiguous offset space. Used by both the canonical sort
 // step (applied to the full planet pool) and continent filter (applied
-// per-continent subset after a flat pool is rebuilt).  Rule: each
-// string's home tier is the lowest set bit of its consumer mask.  On
+// per-continent subset after a flat pool is rebuilt).  Each string goes
+// to string_home_tier of its consumer mask.  On
 // return, `data.strings_tiers` + `data.strings_tier_bases` are populated
 // and `data.string_pool.mutable_data()` is replaced with a concat view
 // of the tier buffers (so legacy `string_pool.data().data() + off` reads
@@ -352,9 +364,7 @@ inline void partition_strings_into_tiers(ParsedData& data) {
 
     auto home_tier = [&](uint32_t old_off) -> uint8_t {
         auto it = tier_mask.find(old_off);
-        uint8_t m = (it != tier_mask.end()) ? it->second : STR_TIER_BIT_CORE;
-        if (m == 0) m = STR_TIER_BIT_CORE;
-        return static_cast<uint8_t>(__builtin_ctz(m));
+        return string_home_tier(it != tier_mask.end() ? it->second : 0);
     };
 
     std::sort(strings.begin(), strings.end(),

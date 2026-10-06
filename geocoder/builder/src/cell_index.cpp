@@ -1182,12 +1182,12 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             }));
         }
     }
-    // Per-tier strings files. Each mode writes only the tiers its records
-    // need to resolve: admin → CORE, no-addresses → CORE+STREET, full →
-    // CORE+STREET+ADDR. The postcode (3) and POI (4) tiers are written
-    // alongside their respective opt-in files below (postcode_centroids /
-    // poi_records).  Admin polygons / vertices live in the quality/
-    // directory and don't affect string tiers.
+    // Per-tier strings files. Each mode writes the tiers its records can
+    // reference (see string_home_tier): admin → CORE+POSTCODE, no-addresses
+    // → +STREET, full → +ADDR. The postcode tier also holds house numbers
+    // and street names that double as postcodes, so it ships even in a
+    // region without postcode centroids. The POI tier (4) is written with
+    // the POI variants.
     auto write_tier = [&](size_t tier_idx) {
         const auto& buf = data.strings_tiers[tier_idx];
         write_futures.push_back(std::async(std::launch::async, [&, tier_idx] {
@@ -1196,6 +1196,7 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
         }));
     };
     write_tier(0);  // core — always
+    write_tier(3);  // postcode — always (may be empty)
     if (write_streets) write_tier(1);   // street
     if (write_addresses) write_tier(2); // addr
 
@@ -1370,16 +1371,6 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             write_cell_index(output_dir + "/postcode_centroid_cells.bin",
                              output_dir + "/postcode_centroid_entries.bin",
                              centroid_cells);
-
-            // Write postcode tier strings alongside the postcode files
-            // so clients opting in to postcodes also get the names. Note
-            // the mode dir already has strings_layout.json from the main
-            // per-tier write above, which covers this file too.
-            {
-                const auto& buf = data.strings_tiers[3];
-                write_binary_file(output_dir + "/" + STR_TIER_FILENAMES[3],
-                                  buf.data(), buf.size());
-            }
 
             std::cerr << "postcode centroids: " << centroids.size() << " entries, "
                       << centroid_cells.size() << " cells" << std::endl;

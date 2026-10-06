@@ -192,13 +192,13 @@
         "{region}/admin/place_entries.bin",
         "{region}/admin/place_nodes.bin",
         "{region}/admin/strings_core.bin",
-        "{region}/full/strings_layout.json"
+        "{region}/full/strings_layout.json",
+        "{region}/admin/strings_postcode.bin"
       ],
       "optional_files": [
         "{region}/admin/postcode_centroids.bin",
         "{region}/admin/postcode_centroid_cells.bin",
-        "{region}/admin/postcode_centroid_entries.bin",
-        "{region}/admin/strings_postcode.bin"
+        "{region}/admin/postcode_centroid_entries.bin"
       ]
     },
     "mode.no-addresses": {
@@ -217,13 +217,13 @@
         "{region}/no-addresses/way_postcodes.bin",
         "{region}/no-addresses/strings_core.bin",
         "{region}/no-addresses/strings_street.bin",
-        "{region}/full/strings_layout.json"
+        "{region}/full/strings_layout.json",
+        "{region}/no-addresses/strings_postcode.bin"
       ],
       "optional_files": [
         "{region}/no-addresses/postcode_centroids.bin",
         "{region}/no-addresses/postcode_centroid_cells.bin",
-        "{region}/no-addresses/postcode_centroid_entries.bin",
-        "{region}/no-addresses/strings_postcode.bin"
+        "{region}/no-addresses/postcode_centroid_entries.bin"
       ]
     },
     "mode.full": {
@@ -250,14 +250,14 @@
         "{region}/full/strings_core.bin",
         "{region}/full/strings_street.bin",
         "{region}/full/strings_addr.bin",
-        "{region}/full/strings_layout.json"
+        "{region}/full/strings_layout.json",
+        "{region}/full/strings_postcode.bin"
       ],
       "optional_files": [
         "{region}/full/interp_postcodes.bin",
         "{region}/full/postcode_centroids.bin",
         "{region}/full/postcode_centroid_cells.bin",
-        "{region}/full/postcode_centroid_entries.bin",
-        "{region}/full/strings_postcode.bin"
+        "{region}/full/postcode_centroid_entries.bin"
       ]
     },
     "quality.uncapped": {
