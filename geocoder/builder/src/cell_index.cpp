@@ -26,7 +26,7 @@
 // global string-offset space so the server can route a global offset to
 // the right tier file. Same content regardless of which subset of tier
 // files a given dir contains.
-static inline void write_strings_layout(const std::string& dir, const ParsedData& data) {
+void write_strings_layout(const std::string& dir, const ParsedData& data) {
     std::ofstream f(dir + "/strings_layout.json");
     f << "{\n  \"tiers\": [\n";
     for (size_t t = 0; t < STR_TIER_COUNT; t++) {

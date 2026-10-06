@@ -24,6 +24,10 @@ void write_cell_index(
 
 void write_index(const ParsedData& data, const std::string& output_dir, IndexMode mode);
 
+// strings_layout.json: each tier's [start, end) in the global string-offset
+// space, identical in every dir that resolves strings.
+void write_strings_layout(const std::string& dir, const ParsedData& data);
+
 // Country of the point via its admin cell's level-2 entries; border cells
 // (multiple candidate countries) resolve by point-in-polygon. 0 if unknown.
 uint16_t country_code_at_point(const ParsedData& data, double lat, double lng);

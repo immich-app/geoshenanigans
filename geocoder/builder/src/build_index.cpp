@@ -2121,19 +2121,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                     std::ofstream f(poi_dir + "/" + STR_TIER_FILENAMES[4], std::ios::binary);
                     f.write(buf.data(), buf.size());
                 }
-                {
-                    std::ofstream f(poi_dir + "/strings_layout.json");
-                    f << "{\n  \"tiers\": [\n";
-                    for (size_t t = 0; t < STR_TIER_COUNT; t++) {
-                        f << "    {\"name\": \"" << STR_TIER_NAMES[t]
-                          << "\", \"file\": \"" << STR_TIER_FILENAMES[t]
-                          << "\", \"start\": " << d.strings_tier_bases[t]
-                          << ", \"end\": " << d.strings_tier_bases[t + 1] << "}";
-                        if (t + 1 < STR_TIER_COUNT) f << ",";
-                        f << "\n";
-                    }
-                    f << "  ]\n}\n";
-                }
+                write_strings_layout(poi_dir, d);
 
                 // Write poi_meta.json (category metadata for the server)
                 {
