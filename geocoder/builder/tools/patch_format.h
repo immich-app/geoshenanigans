@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <fstream>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -193,14 +194,15 @@ inline const char* get_string(const std::vector<char>& pool, uint32_t offset) {
 
 static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // Custom merge-sequence patch format. Emitted by geocoder-diff, checked by
-// geocoder-patch. Value 2 (the legacy value 1 was the old zlib-section format).
-// v3: adds INTERP_POSTCODES (fid 36). Version-gated so pre-v3 appliers
-// reject the whole patch upfront ("Bad version") instead of dying mid-apply
-// on an unknown section id with a partially-written output dir.
-static constexpr uint32_t GCPATCH_VERSION = 3;
-// Oldest patch version this tool set can still apply (v2 patches contain
-// only fids <= 35, which v3 tools fully understand).
-static constexpr uint32_t GCPATCH_MIN_READ_VERSION = 2;
+// geocoder-patch. v3 added INTERP_POSTCODES (fid 36). v4 lists the variant's
+// client files (CLIENT_FILES_MARKER) right after the header, carries its JSON
+// files verbatim, and records the string tiers it was diffed against; the
+// patcher reproduces exactly that file set. Version-gated so older appliers
+// reject the whole patch upfront ("Bad version").
+static constexpr uint32_t GCPATCH_VERSION = 4;
+// v3 patches carry no file list, so a v4 patcher cannot reproduce their
+// variant's file set.
+static constexpr uint32_t GCPATCH_MIN_READ_VERSION = 4;
 
 enum class PatchFileId : uint32_t {
     STRINGS = 0,
@@ -310,7 +312,7 @@ static constexpr uint32_t CELL_FLAGS_MARKER = 0xFFFFFFF9;
 static constexpr uint32_t SECONDARY_REMAP_MARKER = 0xFFFFFFF6;
 
 // String-section markers, read by geocoder-patch during the Phase-2 string
-// rebuild and the legacy in-loop string diff. These intentionally share their
+// rebuild. These intentionally share their
 // raw values with markers above (e.g. STRINGS_TIERED_MARKER reuses 0xFFFFFFF6,
 // the SECONDARY_REMAP_MARKER value) because they are disambiguated by read
 // position, not by value — the string markers are consumed before the main
@@ -321,12 +323,8 @@ static constexpr uint32_t SECONDARY_REMAP_MARKER = 0xFFFFFFF6;
 //                            Emitted by geocoder-diff as `tiered_marker`.
 //   STRINGS_CROSS_TIER_REMAP_MARKER — explicit cross-tier (old_off,new_off)
 //                            string remap pairs. Emitted by geocoder-diff.
-//   STRINGS_LOOP_DIFF_MARKER — legacy single-pool in-loop string diff,
-//                            consumed by geocoder-patch only (not emitted by
-//                            the current diff).
 static constexpr uint32_t STRINGS_TIERED_MARKER = 0xFFFFFFF6;
 static constexpr uint32_t STRINGS_CROSS_TIER_REMAP_MARKER = 0xFFFFFFFE;
-static constexpr uint32_t STRINGS_LOOP_DIFF_MARKER = 0xFFFFFFF7;
 
 // Sparse position-keyed delta. Stride sentinel that signals the section
 // payload is a list of (position, value) pairs for the positions where
@@ -380,6 +378,79 @@ constexpr uint32_t LEGACY_SKIP_STRIDE = 0xFE;
 //   n_postcode_pairs(4), [(old_id:u32, new_id:u32)] × n_postcode_pairs.
 // Only entries where old_id != new_id are transmitted.
 static constexpr uint32_t POI_PARENT_REMAP_MARKER = 0xFFFFFFF3;
+
+// --- Client file set (v4) ---
+// The files a client holds for a variant: everything in the variant dir except
+// strategy-2 sidecars (*.osm_ids, server-side cache only), transport artifacts
+// (*.gcpatch, *.zst) and dotfiles. Read by position right after the header:
+//   marker(4), n(4), n × {name_len(u16), name, size(u64), inline(u8), [bytes]}
+// sorted by name. Non-.bin files (strings_layout.json, poi_meta.json) are
+// inline; the patcher writes them verbatim and every listed file must exist at
+// its listed size after the apply. Files it builds that are not listed (string
+// tiers the variant only uses for remapping) stay in its scratch dir.
+static constexpr uint32_t CLIENT_FILES_MARKER = 0xFFFFFFF2;
+static constexpr size_t MAX_INLINE_CLIENT_FILE_BYTES = 1 << 20;
+
+struct ClientFile {
+    std::string name;
+    uint64_t size = 0;
+    std::vector<char> bytes;  // contents, inline files only
+};
+
+inline bool has_suffix(const std::string& s, const char* suffix) {
+    size_t n = strlen(suffix);
+    return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
+}
+
+inline bool is_client_file(const std::string& name) {
+    if (name.empty() || name[0] == '.' || name.find('/') != std::string::npos) return false;
+    return !has_suffix(name, ".osm_ids") && !has_suffix(name, ".gcpatch") && !has_suffix(name, ".zst");
+}
+
+inline bool is_inline_client_file(const std::string& name) { return !has_suffix(name, ".bin"); }
+
+inline void append_client_files(std::vector<char>& out, const std::vector<ClientFile>& files) {
+    auto put = [&](const void* p, size_t n) { out.insert(out.end(), (const char*)p, (const char*)p + n); };
+    uint32_t marker = CLIENT_FILES_MARKER, n = static_cast<uint32_t>(files.size());
+    put(&marker, 4); put(&n, 4);
+    for (const auto& f : files) {
+        uint16_t len = static_cast<uint16_t>(f.name.size());
+        uint8_t is_inline = is_inline_client_file(f.name) ? 1 : 0;
+        put(&len, 2); put(f.name.data(), len); put(&f.size, 8); put(&is_inline, 1);
+        if (is_inline) put(f.bytes.data(), f.bytes.size());
+    }
+}
+
+// Parses the section at data[pos, size) and advances pos past it.
+inline std::vector<ClientFile> parse_client_files(const char* data, size_t size, size_t& pos) {
+    auto take = [&](void* dst, size_t n) {
+        if (pos + n > size) throw std::runtime_error("Truncated client file list");
+        memcpy(dst, data + pos, n);
+        pos += n;
+    };
+    uint32_t marker = 0, n = 0;
+    take(&marker, 4);
+    if (marker != CLIENT_FILES_MARKER) throw std::runtime_error("Patch has no client file list");
+    take(&n, 4);
+    std::vector<ClientFile> files(n);
+    for (auto& f : files) {
+        uint16_t len = 0;
+        take(&len, 2);
+        f.name.resize(len);
+        take(f.name.data(), len);
+        if (!is_client_file(f.name)) throw std::runtime_error("Bad client file name: " + f.name);
+        uint8_t is_inline = 0;
+        take(&f.size, 8);
+        take(&is_inline, 1);
+        if (is_inline != (is_inline_client_file(f.name) ? 1 : 0))
+            throw std::runtime_error("Bad client file entry: " + f.name);
+        if (!is_inline) continue;
+        if (f.size > MAX_INLINE_CLIENT_FILE_BYTES) throw std::runtime_error("Inline client file too large: " + f.name);
+        f.bytes.resize(f.size);
+        take(f.bytes.data(), f.size);
+    }
+    return files;
+}
 
 // --- Shared entry rebuild logic ---
 // Used by both diff and patch tools to produce identical rebuilt entries.

@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <dirent.h>
 #include <fstream>
 #include <functional>
 #include <future>
@@ -22,6 +23,7 @@
 #include <iostream>
 #include <malloc.h>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -771,7 +773,39 @@ static void wval(std::vector<char>& buf, const void* data, size_t size) {
     buf.insert(buf.end(), (const char*)data, (const char*)data + size);
 }
 
-int main(int argc, char* argv[]) {
+// The client files of a variant dir (see CLIENT_FILES_MARKER), sorted by name.
+// Fails on a file no patch section can reproduce, so a new builder output can
+// never be silently dropped from patched installs.
+static std::vector<ClientFile> list_client_files(const std::string& dir) {
+    std::unordered_set<std::string> section_files(std::begin(patch_file_names), std::end(patch_file_names));
+    section_files.erase("strings.bin");  // legacy single pool, never emitted
+    std::vector<ClientFile> files;
+    DIR* d = opendir(dir.c_str());
+    if (!d) throw std::runtime_error("Cannot read " + dir);
+    while (struct dirent* e = readdir(d)) {
+        std::string name = e->d_name;
+        if (!is_client_file(name)) continue;
+        std::string path = dir + "/" + name;
+        struct stat st;
+        if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        ClientFile f{name, static_cast<uint64_t>(st.st_size), {}};
+        if (!is_inline_client_file(name)) {
+            if (!section_files.count(name)) { closedir(d); throw std::runtime_error("No patch section for " + path); }
+        } else if (!has_suffix(name, ".json") || f.size > MAX_INLINE_CLIENT_FILE_BYTES) {
+            closedir(d);
+            throw std::runtime_error("Cannot carry " + path + " in a patch");
+        } else {
+            f.bytes = read_file(path);
+            if (f.bytes.size() != f.size) { closedir(d); throw std::runtime_error("Short read: " + path); }
+        }
+        files.push_back(std::move(f));
+    }
+    closedir(d);
+    std::sort(files.begin(), files.end(), [](const ClientFile& a, const ClientFile& b) { return a.name < b.name; });
+    return files;
+}
+
+static int run(int argc, char* argv[]) {
     if (argc < 5 || std::string(argv[3]) != "-o") {
         std::cerr << "Usage: geocoder-diff <old-dir> <new-dir> -o <patch-file>" << std::endl;
         return 1;
@@ -878,6 +912,11 @@ int main(int argc, char* argv[]) {
     patch.insert(patch.end(), GCPATCH_MAGIC, GCPATCH_MAGIC + 8);
     uint32_t ver = GCPATCH_VERSION, flags = 0; // custom merge-sequence format
     wval(patch, &ver, 4); wval(patch, &flags, 4);
+    {
+        auto client_files = list_client_files(new_dir);
+        append_client_files(patch, client_files);
+        std::cerr << "  Client files: " << client_files.size() << std::endl;
+    }
 
     // --- Section: Per-file merge sequences (computed in parallel) ---
     // Stored merge sequences for ID remap derivation
@@ -2568,4 +2607,14 @@ int main(int argc, char* argv[]) {
         log_time("zstd -19 -T0 compression", tc);
     }
     return 0;
+}
+
+// The one error edge for run().
+int main(int argc, char* argv[]) {
+    try {
+        return run(argc, argv);
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << std::endl;
+        return 1;
+    }
 }

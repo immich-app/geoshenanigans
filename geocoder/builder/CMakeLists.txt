@@ -111,5 +111,7 @@ add_executable(geocoder-tests
     src/interpolation.cpp
 )
 target_include_directories(geocoder-tests PRIVATE src tools tests)
+target_compile_definitions(geocoder-tests PRIVATE
+    GEOCODER_TEMPLATE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/configurations.template.json")
 target_link_libraries(geocoder-tests PRIVATE Threads::Threads)
 add_test(NAME geocoder-tests COMMAND geocoder-tests)

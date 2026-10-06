@@ -6,7 +6,12 @@
 #include "patch_format.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iterator>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "test_framework.h"
@@ -171,6 +176,7 @@ TEST(patch_format_section_markers_distinct) {
         CELL_FLAGS_MARKER,            // 0xFFFFFFF9
         SECONDARY_REMAP_MARKER,       // 0xFFFFFFF6
         POI_PARENT_REMAP_MARKER,      // 0xFFFFFFF3
+        CLIENT_FILES_MARKER,          // 0xFFFFFFF2
     };
     const size_t n = sizeof(markers) / sizeof(markers[0]);
     for (size_t i = 0; i < n; i++)
@@ -189,16 +195,17 @@ TEST(patch_format_section_marker_values) {
     CHECK_EQ(CELL_FLAGS_MARKER, uint32_t(0xFFFFFFF9));
     CHECK_EQ(SECONDARY_REMAP_MARKER, uint32_t(0xFFFFFFF6));
     CHECK_EQ(POI_PARENT_REMAP_MARKER, uint32_t(0xFFFFFFF3));
+    CHECK_EQ(CLIENT_FILES_MARKER, uint32_t(0xFFFFFFF2));
 }
 
 // --- Format identity / enum constants ---
 
 TEST(patch_format_magic_and_version) {
     // GCPATCH_VERSION is bound to the value actually emitted/checked by the
-    // diff/patch tools. v3 = INTERP_POSTCODES section added; v2 patches are
-    // still readable (MIN_READ_VERSION).
-    CHECK_EQ(GCPATCH_VERSION, uint32_t(3));
-    CHECK_EQ(GCPATCH_MIN_READ_VERSION, uint32_t(2));
+    // diff/patch tools. v4 = client file list; older patches have none, so
+    // they are unreadable (MIN_READ_VERSION).
+    CHECK_EQ(GCPATCH_VERSION, uint32_t(4));
+    CHECK_EQ(GCPATCH_MIN_READ_VERSION, uint32_t(4));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
     for (int i = 0; i < 8; i++) CHECK_EQ(GCPATCH_MAGIC[i], expect[i]);
 }
@@ -241,4 +248,80 @@ TEST(patch_format_record_node_count_reads_u16_and_legacy_u8) {
     packed[4] = static_cast<char>(200);
     packed[5] = static_cast<char>(0x7F);
     CHECK_EQ(record_node_count(packed, 9, WAY_HEADER_STRIDE_PACKED), 200u);
+}
+
+TEST(patch_format_template_patch_version_matches_gcpatch_version) {
+    // Clients compare build.patch_version to decide between patching and a
+    // fresh install, so it must name the format the tools emit.
+    std::ifstream f(GEOCODER_TEMPLATE_PATH);
+    REQUIRE(f.good());
+    std::string json((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    const std::string key = "\"patch_version\":";
+    size_t at = json.find(key);
+    REQUIRE(at != std::string::npos);
+    CHECK_EQ(static_cast<uint32_t>(std::strtoul(json.c_str() + at + key.size(), nullptr, 10)), GCPATCH_VERSION);
+}
+
+// --- client file set ---
+
+TEST(patch_format_client_file_names) {
+    struct Case { const char* name; bool client; bool inline_; };
+    const Case cases[] = {
+        {"street_ways.bin", true, false},
+        {"strings_layout.json", true, true},
+        {"poi_meta.json", true, true},
+        {"street_ways.osm_ids", false, false},
+        {"patch.gcpatch", false, false},
+        {"street_ways.bin.zst", false, false},
+        {".hidden.bin", false, false},
+        {"", false, false},
+        {"sub/escape.bin", false, false},
+    };
+    for (const auto& c : cases) {
+        CHECK_EQ(is_client_file(c.name), c.client);
+        if (c.client) CHECK_EQ(is_inline_client_file(c.name), c.inline_);
+    }
+}
+
+static std::vector<ClientFile> sample_client_files() {
+    ClientFile layout{"strings_layout.json", 4, {'{', ' ', '}', '\n'}};
+    ClientFile ways{"street_ways.bin", 12345678901ull, {}};
+    return {layout, ways};
+}
+
+TEST(patch_format_client_files_round_trip) {
+    std::vector<char> buf = {'x'};  // the section is read by position
+    append_client_files(buf, sample_client_files());
+    size_t pos = 1;
+    auto got = parse_client_files(buf.data(), buf.size(), pos);
+    CHECK_EQ(pos, buf.size());
+    REQUIRE(got.size() == 2);
+    CHECK(got[0].name == "strings_layout.json");
+    CHECK_EQ(got[0].size, uint64_t(4));
+    CHECK(got[0].bytes == std::vector<char>({'{', ' ', '}', '\n'}));
+    CHECK(got[1].name == "street_ways.bin");
+    CHECK_EQ(got[1].size, uint64_t(12345678901ull));
+    CHECK(got[1].bytes.empty());
+}
+
+static bool parse_throws(const std::vector<char>& buf) {
+    size_t pos = 0;
+    try { parse_client_files(buf.data(), buf.size(), pos); } catch (const std::runtime_error&) { return true; }
+    return false;
+}
+
+TEST(patch_format_client_files_rejects_missing_truncated_and_bad_names) {
+    std::vector<char> good;
+    append_client_files(good, sample_client_files());
+
+    std::vector<char> no_marker(good);
+    no_marker[0] ^= 1;
+    CHECK(parse_throws(no_marker));
+    CHECK(parse_throws(std::vector<char>(good.begin(), good.end() - 1)));
+
+    std::vector<char> escape;
+    append_client_files(escape, {ClientFile{"x.bin", 0, {}}});
+    const size_t name_at = 4 + 4 + 2;  // marker, n, name_len
+    escape[name_at] = '/';
+    CHECK(parse_throws(escape));
 }

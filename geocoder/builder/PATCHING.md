@@ -146,27 +146,42 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
 
 **Status**: Fixed by adding explicit padding fields to `AdminPolygon` and `InterpWay` structs.
 
-## Patch Format (.gcpatch, version 2)
+## Patch Format (.gcpatch, version 4)
 
-Whole file is zstd-compressed for transport. Internal structure:
+Whole file is zstd-compressed for transport. Internal structure (all integers
+little-endian; the header, client files and strings sections are read by
+position, everything after them by marker):
 
 ```
-Header: "GCPATCH\0" (8) + version=2 (u32) + flags=0 (u32)
+Header: "GCPATCH\0" (8) + version=4 (u32) + flags=0 (u32)
 
-String Remap: marker 0xFFFFFFFE (u32) + count=0 (u32)
-  (remap derived from string diff, explicit table no longer needed)
+Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
+  + n × {name_len:u16, name, size:u64, inline:u8, [bytes] if inline}
+  Every file the new variant dir holds except *.osm_ids, *.gcpatch, *.zst and
+  dotfiles, sorted by name. JSON files (strings_layout.json, poi_meta.json)
+  are inline and written verbatim. The patcher builds anything not listed in
+  its scratch dir, and every listed file must exist at its listed size.
 
-Per-file merge: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
-  + n_fixups (u32) + [(record_idx, new_offset_value)] × n_fixups
-  + seq_size (u64) + merge_ops
+Strings: marker 0xFFFFFFF6 (u32)
+  + 5 × {n_added:u32, n_deleted:u32, [string\0] × n_added, [index:u32] × n_deleted}
+  (core, street, addr, postcode, poi; a variant without a tier resolves it
+  through ../full/ and ../../full/)
+  + marker 0xFFFFFFFE (u32) + count (u32) + [(old_off:u32, new_off:u32)] × count
+  (cross-tier moves; same-tier remaps come from walking old/new tiers)
+
+Parent-id remap: marker 0xFFFFFFF3 (u32)
+  + n_admin (u32) + [(old:u32, new:u32)] × n_admin
+  + n_street (u32) + [(old:u32, new:u32)] × n_street + 0 (u32, reserved)
+
+Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64) + ...
+  stride=0: full replacement (n_fixups=0 u32, size u64, data)
+  stride=0xFD: unchanged, copy from cur_dir
+  stride=0xFC: sparse delta (value_stride, remap_kind, n, [(pos, value)] × n)
+  otherwise: n_fixups (u32) [+ size + varint fixups] + seq_size (u64) + merge ops
   Ops: MATCH(count:u32) | INSERT(count:u32, data) | DELETE(count:u32)
-  stride=0: full replacement (no fixups, data follows directly)
 
-String Diff: marker 0xFFFFFFF7 (u32) + n_added (u32) + n_deleted (u32)
-  + [string_data\0] × n_added + [deleted_index:u32] × n_deleted
-
-Cell Changes: marker 0xFFFFFFFB/0xFFFFFFFA (u32) + n_added (u32) + n_removed (u32)
-  + [cell_id:u64] × n_added + [cell_id:u64] × n_removed
+Cell Changes: marker 0xFFFFFFFB/FA/F5/F4 (geo/admin/poi/place) + n_added (u32)
+  + n_removed (u32) + [cell_id:u64] × n_added + [cell_id:u64] × n_removed
 
 Secondary ID Remap: marker 0xFFFFFFF6 (u32) + n_files (u32)
   per file: file_id (u32) + n_pairs (u32) + [(old_id:u32, new_id:u32)] × n_pairs

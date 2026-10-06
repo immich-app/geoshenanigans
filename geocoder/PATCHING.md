@@ -70,7 +70,7 @@ The entry point for all clients:
 ```json
 {
   "build_version": 2,
-  "patch_version": 2,
+  "patch_version": 4,
   "latest": "2026-04-10",
   "oldest_indexes": "2026-04-08",
   "oldest_patches": "2026-03-25",

@@ -118,6 +118,8 @@ static int run(int argc, char* argv[]) {
             return 1;
         }
     }
+    // The output is exactly the patch's file set, so stale files can't stay.
+    if (!std::filesystem::is_empty(out_dir)) throw std::runtime_error("Output dir is not empty: " + out_dir);
     ScratchDir scratch("geocoder-patch");
     const std::string& tmpdir = scratch.path();
     double t_start = now_ms();
@@ -158,6 +160,20 @@ static int run(int argc, char* argv[]) {
     uint32_t ver = ru32(); if (ver < GCPATCH_MIN_READ_VERSION || ver > GCPATCH_VERSION) { std::cerr << "Bad version" << std::endl; return 1; }
     ru32(); // flags
 
+    // The exact file set out_dir must hold after the apply. Outputs the
+    // variant does not ship (string tiers it only remaps through, sections
+    // for files it lacks) are built in scratch instead.
+    const std::vector<ClientFile> client_files = parse_client_files(P, patch_size, pos);
+    std::unordered_set<std::string> listed;
+    for (const auto& f : client_files) {
+        listed.insert(f.name);
+        if (is_inline_client_file(f.name) && !write_file(out_dir + "/" + f.name, f.bytes))
+            throw std::runtime_error("Cannot write " + f.name);
+    }
+    auto out_path = [&](const std::string& name) {
+        return (listed.count(name) ? out_dir : tmpdir) + "/" + name;
+    };
+
     // --- Phase 2: String rebuild ---
     // Sorted vector remap: (old_offset, new_offset) pairs sorted by old_offset.
     // Offsets are global across all tiers (tier 0 occupies [0, base[1]),
@@ -166,9 +182,7 @@ static int run(int argc, char* argv[]) {
         "strings_core.bin", "strings_street.bin", "strings_addr.bin",
         "strings_postcode.bin", "strings_poi.bin"
     };
-    static const char* kStrTierNames[5] = {"core", "street", "addr", "postcode", "poi"};
     std::vector<std::pair<uint32_t, uint32_t>> str_remap_vec;
-    std::array<uint32_t, 6> new_tier_bases{};
     {
         uint32_t marker = ru32();
         if (marker == STRINGS_TIERED_MARKER) {
@@ -221,7 +235,7 @@ static int run(int argc, char* argv[]) {
                 }
                 // Phase A: write new tier file via alphabetical merge.
                 {
-                    FILE* fp = fopen((out_dir + "/" + kStrTierFilenames[t]).c_str(), "wb");
+                    FILE* fp = fopen(out_path(kStrTierFilenames[t]).c_str(), "wb");
                     size_t sp = 0; uint32_t idx = 0; size_t ai = 0;
                     std::sort(added.begin(), added.end());
                     while (sp < old_pool.size || ai < added.size()) {
@@ -255,7 +269,7 @@ static int run(int argc, char* argv[]) {
                   std::vector<uint32_t>().swap(del_idx); }
 
                 // Phase B: extend remap by merge-walking old vs new in this tier.
-                MappedFile new_pool = mmap_file(out_dir + "/" + kStrTierFilenames[t]);
+                MappedFile new_pool = mmap_file(out_path(kStrTierFilenames[t]));
                 {
                     size_t old_pos = 0, new_pos = 0;
                     while (old_pos < old_pool.size && new_pos < new_pool.size) {
@@ -278,7 +292,6 @@ static int run(int argc, char* argv[]) {
                 }
                 old_global_base += static_cast<uint32_t>(old_pool.size);
                 new_global_base += static_cast<uint32_t>(new_pool.size);
-                new_tier_bases[t + 1] = new_global_base;
                 unmap_file(old_pool);
                 unmap_file(new_pool);
             }
@@ -287,21 +300,6 @@ static int run(int argc, char* argv[]) {
             std::cerr << "  Strings (tiered): +" << total_added << " -" << total_deleted
                       << ", " << str_remap_vec.size() << " remapped ("
                       << str_remap_vec.size() * 8 / 1024 / 1024 << " MiB)" << std::endl;
-
-            // Write strings_layout.json (new tier bases).
-            {
-                std::ofstream f(out_dir + "/strings_layout.json");
-                f << "{\n  \"tiers\": [\n";
-                for (int t = 0; t < 5; t++) {
-                    f << "    {\"name\": \"" << kStrTierNames[t]
-                      << "\", \"file\": \"" << kStrTierFilenames[t]
-                      << "\", \"start\": " << new_tier_bases[t]
-                      << ", \"end\": " << new_tier_bases[t + 1] << "}";
-                    if (t < 4) f << ",";
-                    f << "\n";
-                }
-                f << "  ]\n}\n";
-            }
 
             marker = ru32();
         }
@@ -359,49 +357,6 @@ static int run(int argc, char* argv[]) {
         if (file_id == 0xFFFFFFFF) break;
 
         // --- Metadata sections ---
-        if (file_id == STRINGS_LOOP_DIFF_MARKER) {
-            // String diff in main loop — same memory-efficient approach as Phase 2
-            uint32_t n_added = ru32(), n_deleted = ru32();
-            std::vector<std::string> added;
-            for (uint32_t i = 0; i < n_added; i++) { const char* s = P+pos; added.push_back(s); pos += strlen(s)+1; }
-            std::vector<uint32_t> del_idx(n_deleted);
-            for (uint32_t i = 0; i < n_deleted; i++) del_idx[i] = ru32();
-            std::unordered_set<uint32_t> del_set(del_idx.begin(), del_idx.end());
-            MappedFile old_pool = mmap_file(cur_dir + "/strings.bin");
-            struct OS { uint32_t idx; uint32_t off; const char* str; };
-            std::vector<OS> old_strs;
-            { size_t sp = 0; uint32_t ix = 0;
-              while (sp < old_pool.size) { old_strs.push_back({ix++, (uint32_t)sp, old_pool.data+sp}); sp += strlen(old_pool.data+sp)+1; }
-            }
-            std::vector<const char*> merged;
-            for (auto& os : old_strs) if (!del_set.count(os.idx)) merged.push_back(os.str);
-            for (auto& s : added) merged.push_back(s.c_str());
-            std::sort(merged.begin(), merged.end(), [](const char* a, const char* b) { return strcmp(a,b) < 0; });
-            FILE* fp = fopen((out_dir + "/strings.bin").c_str(), "wb");
-            uint32_t wpos = 0;
-            for (const char* s : merged) { size_t l = strlen(s)+1; fwrite(s, 1, l, fp); wpos += l; }
-            fclose(fp);
-            // Build remap via merge-walk
-            MappedFile new_pool = mmap_file(out_dir + "/strings.bin");
-            std::vector<std::pair<const char*, uint32_t>> new_strs;
-            { size_t sp = 0;
-              while (sp < new_pool.size) { new_strs.push_back({new_pool.data+sp, (uint32_t)sp}); sp += strlen(new_pool.data+sp)+1; }
-            }
-            size_t oi2 = 0, ni2 = 0;
-            while (oi2 < old_strs.size() && ni2 < new_strs.size()) {
-                int c = strcmp(old_strs[oi2].str, new_strs[ni2].first);
-                if (c == 0) {
-                    if (old_strs[oi2].off != new_strs[ni2].second)
-                        str_remap_vec.push_back({old_strs[oi2].off, new_strs[ni2].second});
-                    oi2++; ni2++;
-                } else if (c < 0) { oi2++; } else { ni2++; }
-            }
-            std::sort(str_remap_vec.begin(), str_remap_vec.end());
-            unmap_file(old_pool); unmap_file(new_pool);
-            std::cerr << "  Strings (loop): +" << n_added << " -" << n_deleted << " → " << merged.size()
-                      << ", " << str_remap_vec.size() << " remapped" << std::endl;
-            continue;
-        }
         if (file_id == CELL_CHANGES_GEO_MARKER) {
             uint32_t na = ru32(), nr = ru32();
             geo_added.resize(na); geo_removed.resize(nr);
@@ -535,7 +490,7 @@ static int run(int argc, char* argv[]) {
         if (stride == 0) {
             // Full replacement — write directly from patch mmap
             uint32_t nf = ru32(); (void)nf; uint64_t ds = ru64();
-            FILE* fp = fopen((out_dir + "/" + fname).c_str(), "wb");
+            FILE* fp = fopen(out_path(fname).c_str(), "wb");
             fwrite(P+pos, 1, ds, fp); fclose(fp);
             pos += ds;
             std::cerr << "  " << fname << ": full replace " << ds << " bytes" << std::endl;
@@ -547,7 +502,7 @@ static int run(int argc, char* argv[]) {
             uint32_t nf = ru32(); (void)nf; uint64_t ds = ru64(); pos += ds; // ds == 0
             std::string src = cur_dir + "/" + fname;
             FILE* in = fopen(src.c_str(), "rb");
-            FILE* out = fopen((out_dir + "/" + fname).c_str(), "wb");
+            FILE* out = fopen(out_path(fname).c_str(), "wb");
             if (!in || !out) {
                 // The diff only emits COPY_OLD for a file that existed (and was
                 // byte-identical) at diff time, so a missing source here is a
@@ -625,7 +580,7 @@ static int run(int argc, char* argv[]) {
                 pos += value_stride;
             }
 
-            FILE* fp = fopen((out_dir + "/" + std::string(fname)).c_str(), "wb");
+            FILE* fp = fopen(out_path(fname).c_str(), "wb");
             if (new_size > 0) fwrite(buf.data(), 1, new_size, fp);
             fclose(fp);
 
@@ -728,7 +683,7 @@ static int run(int argc, char* argv[]) {
         // Replay merge sequence — stream output, apply remap/fixups per-record inline
         uint64_t seq_size = ru64();
         size_t seq_end = pos + seq_size;
-        FILE* outf = fopen((out_dir + "/" + fname).c_str(), "wb");
+        FILE* outf = fopen(out_path(fname).c_str(), "wb");
 
         bool track = needs_remap; // track ID remap only for data files
         // File-backed id_map: create temp file, fill with 0xFF, mmap read-write
@@ -916,22 +871,6 @@ static int run(int argc, char* argv[]) {
     }
     log_phase("Merge replays", t_start);
 
-    // Copy POI/place data files from old if not present in patch (these sections are optional)
-    for (auto fid : {PatchFileId::POI_RECORDS, PatchFileId::POI_VERTICES, PatchFileId::PLACE_NODES}) {
-        std::string fname2 = patch_file_names[(uint32_t)fid];
-        std::string out_path = out_dir + "/" + fname2;
-        struct stat st;
-        if (stat(out_path.c_str(), &st) != 0) {
-            // Not written by patch — copy from old if it exists
-            std::string old_path = cur_dir + "/" + fname2;
-            auto data = read_file(old_path);
-            if (!data.empty()) {
-                write_file(out_path, data);
-                std::cerr << "  " << fname2 << ": copied from old (" << data.size() << " bytes)" << std::endl;
-            }
-        }
-    }
-
     // Free string remap + release all processed patch pages
     { std::vector<std::pair<uint32_t,uint32_t>>().swap(str_remap_vec); }
     madvise(const_cast<char*>(patch_map.data), pos, MADV_DONTNEED);
@@ -1004,10 +943,10 @@ static int run(int argc, char* argv[]) {
         log_phase("  Setup", t_entry);
 
         // Open 4 output files
-        FILE* f_geo = fopen((out_dir + "/geo_cells.bin").c_str(), "wb");
-        FILE* f_se = fopen((out_dir + "/street_entries.bin").c_str(), "wb");
-        FILE* f_ae = fopen((out_dir + "/addr_entries.bin").c_str(), "wb");
-        FILE* f_ie = fopen((out_dir + "/interp_entries.bin").c_str(), "wb");
+        FILE* f_geo = fopen(out_path("geo_cells.bin").c_str(), "wb");
+        FILE* f_se = fopen(out_path("street_entries.bin").c_str(), "wb");
+        FILE* f_ae = fopen(out_path("addr_entries.bin").c_str(), "wb");
+        FILE* f_ie = fopen(out_path("interp_entries.bin").c_str(), "wb");
         constexpr uint32_t NO = 0xFFFFFFFF;
 
         // Reusable buffer (one per entry type to avoid aliasing issues)
@@ -1129,8 +1068,8 @@ static int run(int argc, char* argv[]) {
                 std::unordered_map<uint64_t, const std::vector<uint32_t>*> ac_corr;
                 for (auto& c : ecit->second) ac_corr[c.cell_id] = &c.ids;
                 size_t n = admin.admin_cells_data.size() / 12;
-                FILE* fac = fopen((out_dir + "/admin_cells.bin").c_str(), "wb");
-                FILE* fae = fopen((out_dir + "/admin_entries.bin").c_str(), "wb");
+                FILE* fac = fopen(out_path("admin_cells.bin").c_str(), "wb");
+                FILE* fae = fopen(out_path("admin_entries.bin").c_str(), "wb");
                 uint32_t ae_wpos = 0;
                 for (size_t i = 0; i < n; i++) {
                     uint64_t cid; memcpy(&cid, admin.admin_cells_data.data()+i*12, 8);
@@ -1159,8 +1098,8 @@ static int run(int argc, char* argv[]) {
                 fclose(fac); fclose(fae);
                 std::cerr << "  Admin: " << n << " cells, " << ac_corr.size() << " corrections" << std::endl;
             } else {
-                write_file(out_dir + "/admin_cells.bin", admin.admin_cells_data);
-                write_file(out_dir + "/admin_entries.bin", admin.admin_entries_data);
+                write_file(out_path("admin_cells.bin"), admin.admin_cells_data);
+                write_file(out_path("admin_entries.bin"), admin.admin_entries_data);
             }
             log_phase("  Admin", t_entry);
         }
@@ -1223,8 +1162,8 @@ static int run(int argc, char* argv[]) {
                 if (ecit != entry_corrections.end()) {
                     std::unordered_map<uint64_t, const std::vector<uint32_t>*> pc_corr;
                     for (auto& c : ecit->second) pc_corr[c.cell_id] = &c.ids;
-                    FILE* fpc = fopen((out_dir + "/poi_cells.bin").c_str(), "wb");
-                    FILE* fpe = fopen((out_dir + "/poi_entries.bin").c_str(), "wb");
+                    FILE* fpc = fopen(out_path("poi_cells.bin").c_str(), "wb");
+                    FILE* fpe = fopen(out_path("poi_entries.bin").c_str(), "wb");
                     uint32_t pe_wpos = 0;
                     for (size_t i = 0; i < poi_cells.size(); i++) {
                         uint64_t cid = poi_cells[i].cell_id;
@@ -1268,16 +1207,10 @@ static int run(int argc, char* argv[]) {
                         uint32_t off = it != offsets.end() ? it->second : no_data;
                         pc_data.insert(pc_data.end(), (const char*)&off, (const char*)&off + 4);
                     }
-                    write_file(out_dir + "/poi_cells.bin", pc_data);
-                    write_file(out_dir + "/poi_entries.bin", pe_data);
+                    write_file(out_path("poi_cells.bin"), pc_data);
+                    write_file(out_path("poi_entries.bin"), pe_data);
                     std::cerr << "  POI: " << poi_cells.size() << " cells rebuilt" << std::endl;
                 }
-            } else {
-                // No POI data in old or patch — copy old files if they exist (graceful)
-                auto pc = read_file(cur_dir + "/poi_cells.bin");
-                auto pe = read_file(cur_dir + "/poi_entries.bin");
-                if (!pc.empty()) write_file(out_dir + "/poi_cells.bin", pc);
-                if (!pe.empty()) write_file(out_dir + "/poi_entries.bin", pe);
             }
             log_phase("  POI", t_entry);
         }
@@ -1340,8 +1273,8 @@ static int run(int argc, char* argv[]) {
                 if (ecit != entry_corrections.end()) {
                     std::unordered_map<uint64_t, const std::vector<uint32_t>*> plc_corr;
                     for (auto& c : ecit->second) plc_corr[c.cell_id] = &c.ids;
-                    FILE* fplc = fopen((out_dir + "/place_cells.bin").c_str(), "wb");
-                    FILE* fple = fopen((out_dir + "/place_entries.bin").c_str(), "wb");
+                    FILE* fplc = fopen(out_path("place_cells.bin").c_str(), "wb");
+                    FILE* fple = fopen(out_path("place_entries.bin").c_str(), "wb");
                     uint32_t ple_wpos = 0;
                     for (size_t i = 0; i < place_cells.size(); i++) {
                         uint64_t cid = place_cells[i].cell_id;
@@ -1385,22 +1318,28 @@ static int run(int argc, char* argv[]) {
                         uint32_t off = it != offsets.end() ? it->second : no_data;
                         plc_data.insert(plc_data.end(), (const char*)&off, (const char*)&off + 4);
                     }
-                    write_file(out_dir + "/place_cells.bin", plc_data);
-                    write_file(out_dir + "/place_entries.bin", ple_data);
+                    write_file(out_path("place_cells.bin"), plc_data);
+                    write_file(out_path("place_entries.bin"), ple_data);
                     std::cerr << "  Place: " << place_cells.size() << " cells rebuilt" << std::endl;
                 }
-            } else {
-                // No place data in old or patch — copy old files if they exist (graceful)
-                auto plc = read_file(cur_dir + "/place_cells.bin");
-                auto ple = read_file(cur_dir + "/place_entries.bin");
-                if (!plc.empty()) write_file(out_dir + "/place_cells.bin", plc);
-                if (!ple.empty()) write_file(out_dir + "/place_entries.bin", ple);
             }
             log_phase("  Place", t_entry);
         }
     }
 
     unmap_file(patch_map);
+
+    for (const auto& f : client_files) {
+        std::string p = out_dir + "/" + f.name;
+        struct stat st;
+        if (stat(p.c_str(), &st) != 0) {
+            if (f.size == 0 && write_file(p, nullptr, 0)) continue;
+            throw std::runtime_error("Patch did not produce " + f.name);
+        }
+        if (static_cast<uint64_t>(st.st_size) != f.size)
+            throw std::runtime_error("Output size mismatch: " + f.name + " is " + std::to_string(st.st_size) +
+                                     " bytes, the patch lists " + std::to_string(f.size));
+    }
     log_phase("Total", t_start);
     std::cerr << "Patch applied. Output in " << out_dir << std::endl;
     return 0;
