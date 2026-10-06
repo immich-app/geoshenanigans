@@ -325,3 +325,23 @@ TEST(patch_format_client_files_rejects_missing_truncated_and_bad_names) {
     escape[name_at] = '/';
     CHECK(parse_throws(escape));
 }
+
+// --- content_hash ---
+
+TEST(patch_format_content_hash_sees_every_byte) {
+    const std::string base("core\0street\0addr\0x", 18);  // two words + a 2-byte tail
+    const uint64_t h = content_hash(base.data(), base.size());
+    CHECK_EQ(content_hash(base.data(), base.size()), h);
+    for (size_t i = 0; i < base.size(); i++) {
+        std::string changed = base;
+        changed[i] ^= 1;
+        CHECK(content_hash(changed.data(), changed.size()) != h);
+    }
+    CHECK(content_hash(base.data(), base.size() - 1) != h);
+}
+
+TEST(patch_format_content_hash_of_nothing_is_stable) {
+    // An absent tier (nullptr, 0) and an empty file hash alike.
+    char none[1] = {0};
+    CHECK_EQ(content_hash(nullptr, 0), content_hash(none, 0));
+}

@@ -163,6 +163,9 @@ Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
   its scratch dir, and every listed file must exist at its listed size.
 
 Strings: marker 0xFFFFFFF6 (u32)
+  + 5 × {old_size:u32, new_size:u32, old_hash:u64, new_hash:u64}
+  (the tiers the diff saw; the patcher refuses other old tiers and checks
+  every tier it rebuilds)
   + 5 × {n_added:u32, n_deleted:u32, [string\0] × n_added, [index:u32] × n_deleted}
   (core, street, addr, postcode, poi; a variant without a tier resolves it
   through ../full/ and ../../full/)

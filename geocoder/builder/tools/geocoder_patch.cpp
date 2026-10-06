@@ -79,28 +79,6 @@ static std::string resolve_with_fallback(const std::string& cur_dir, const std::
     return primary;
 }
 
-// Byte size of each string tier, from a strings_layout.json written by
-// the builder or by this tool ({"start": N, "end": M} per tier, in order).
-// Empty when the file is missing or malformed.
-static std::vector<uint64_t> read_tier_sizes(const std::string& path) {
-    std::ifstream f(path);
-    if (!f) return {};
-    std::string json((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-
-    std::vector<uint64_t> sizes;
-    size_t at = 0;
-    while ((at = json.find("\"start\":", at)) != std::string::npos) {
-        size_t end_at = json.find("\"end\":", at);
-        if (end_at == std::string::npos) return {};
-        uint64_t start = std::strtoull(json.c_str() + at + 8, nullptr, 10);
-        uint64_t end = std::strtoull(json.c_str() + end_at + 6, nullptr, 10);
-        if (end < start) return {};
-        sizes.push_back(end - start);
-        at = end_at;
-    }
-    return sizes;
-}
-
 static int run(int argc, char* argv[]) {
     if (argc < 5 || std::string(argv[3]) != "-o") {
         std::cerr << "Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir>" << std::endl;
@@ -200,22 +178,13 @@ static int run(int argc, char* argv[]) {
                 return resolve_with_fallback(cur_dir, kStrTierFilenames[t], {"../full/", "../../full/"});
             };
             // String offsets are global (cumulative tier sizes), so every
-            // old tier before the last one present must exist at exactly
-            // its recorded size, even tiers this variant doesn't ship. A
-            // missing tier used to read as empty and silently shift every
-            // later offset. Trailing absent tiers (strings_poi.bin beside
-            // full/) shift nothing.
-            std::string old_layout = resolve_with_fallback(cur_dir, "strings_layout.json",
-                                                           {"../full/", "../../full/"});
-            std::vector<uint64_t> old_tier_sizes = read_tier_sizes(old_layout);
-            if (old_tier_sizes.size() != 5) {
-                std::cerr << "Cannot read the old string layout (" << old_layout << ")" << std::endl;
-                return 1;
-            }
-            int last_present_tier = -1;
-            for (int t = 0; t < 5; t++) {
-                struct stat st;
-                if (stat(old_tier_path(t).c_str(), &st) == 0 && st.st_size > 0) last_present_tier = t;
+            // old tier must be exactly the one the diff saw, even tiers this
+            // variant doesn't ship; a missing or stale tier would shift every
+            // later offset.
+            std::array<TierStamp, 5> stamps;
+            for (auto& s : stamps) {
+                s.old_size = ru32(); s.new_size = ru32();
+                s.old_hash = ru64(); s.new_hash = ru64();
             }
             for (int t = 0; t < 5; t++) {
                 uint32_t n_added = ru32(), n_deleted = ru32();
@@ -227,12 +196,11 @@ static int run(int argc, char* argv[]) {
                 std::unordered_set<uint32_t> del_set(del_idx.begin(), del_idx.end());
 
                 MappedFile old_pool = mmap_file(old_tier_path(t));
-                if (t <= last_present_tier && old_pool.size != old_tier_sizes[t]) {
-                    std::cerr << "Old " << kStrTierFilenames[t] << " is " << old_pool.size
-                              << " bytes but the layout records " << old_tier_sizes[t]
-                              << " (missing tier or wrong base)" << std::endl;
-                    return 1;
-                }
+                if (old_pool.size != stamps[t].old_size ||
+                    content_hash(old_pool.data, old_pool.size) != stamps[t].old_hash)
+                    throw std::runtime_error(std::string("Old ") + kStrTierFilenames[t] + " (" +
+                                             std::to_string(old_pool.size) + " bytes at " + old_tier_path(t) +
+                                             ") is not the one the patch was made from");
                 // Phase A: write new tier file via alphabetical merge.
                 {
                     FILE* fp = fopen(out_path(kStrTierFilenames[t]).c_str(), "wb");
@@ -270,6 +238,10 @@ static int run(int argc, char* argv[]) {
 
                 // Phase B: extend remap by merge-walking old vs new in this tier.
                 MappedFile new_pool = mmap_file(out_path(kStrTierFilenames[t]));
+                if (new_pool.size != stamps[t].new_size ||
+                    content_hash(new_pool.data, new_pool.size) != stamps[t].new_hash)
+                    throw std::runtime_error(std::string("Rebuilt ") + kStrTierFilenames[t] +
+                                             " does not match the new build");
                 {
                     size_t old_pos = 0, new_pos = 0;
                     while (old_pos < old_pool.size && new_pos < new_pool.size) {

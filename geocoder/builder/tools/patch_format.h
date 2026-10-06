@@ -326,6 +326,33 @@ static constexpr uint32_t SECONDARY_REMAP_MARKER = 0xFFFFFFF6;
 static constexpr uint32_t STRINGS_TIERED_MARKER = 0xFFFFFFF6;
 static constexpr uint32_t STRINGS_CROSS_TIER_REMAP_MARKER = 0xFFFFFFFE;
 
+// 64-bit content hash, 8 bytes per step. Not cryptographic: it proves a file
+// is the one the diff saw, against stale or mismatched inputs.
+inline uint64_t content_hash(const char* data, size_t n) {
+    uint64_t h = 0x9E3779B97F4A7C15ull ^ n;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w;
+        memcpy(&w, data + i, 8);
+        h = (h ^ w) * 0xFF51AFD7ED558CCDull;
+        h ^= h >> 32;
+    }
+    uint64_t tail = 0;
+    if (n > i) memcpy(&tail, data + i, n - i);
+    h = (h ^ tail) * 0xC4CEB9FE1A85EC53ull;
+    return h ^ (h >> 29);
+}
+
+// The old and new string tier the diff worked from, one per tier, right after
+// STRINGS_TIERED_MARKER: 5 × {old_size u32, new_size u32, old_hash u64,
+// new_hash u64}. The patcher refuses old tiers (often found through ../full)
+// that differ from what the diff saw and checks every tier it rebuilds, so a
+// stale or already-patched sibling fails loudly instead of skewing offsets.
+struct TierStamp {
+    uint32_t old_size = 0, new_size = 0;
+    uint64_t old_hash = 0, new_hash = 0;
+};
+
 // Sparse position-keyed delta. Stride sentinel that signals the section
 // payload is a list of (position, value) pairs for the positions where
 // new differs from old. Used for files where strategy-2 keeps the index

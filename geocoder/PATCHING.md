@@ -164,12 +164,14 @@ the `.bin` files, because the server can't load a region without them.
 ```
 
 Apply every patch out of place (`geocoder-patch <old-dir> <patch> -o <new-dir>`;
-the tool refuses `-o` equal to the current dir) and keep the build's
-directory layout. String offsets are global across the five string tiers,
-so a variant patch needs the old `<region>/full/strings_*.bin` tiers and
-`strings_layout.json` beside it (`../full/`) at the old version. The tool
-checks each tier against the old layout and fails rather than writing
-shifted offsets when one is missing or belongs to a different build.
+the tool refuses `-o` equal to the current dir or a non-empty one) and keep
+the build's directory layout. The new dir ends up holding exactly the
+variant's files, JSON included. String offsets are global across the five
+string tiers, so a variant without its own tiers reads the old ones from
+`<region>/full/` (`../full/`), which must still be at the old version: patch
+sibling variants before swapping in the new `full/`. The patch records the
+size and hash of every tier it was made from, and the tool fails rather than
+writing shifted offsets when one is missing or belongs to a different build.
 
 ### Version Mismatch
 

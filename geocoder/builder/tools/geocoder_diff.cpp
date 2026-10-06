@@ -815,9 +815,8 @@ static int run(int argc, char* argv[]) {
     // Build string remap (mmap each tier's pool — read-only sequential
     // scan). Virtual "concat pool" reproduces the global-offset layout
     // that record name_ids point into, so build_string_remap works
-    // unchanged. Tier bases are read from strings_layout.json; if any
-    // tier file is absent we treat it as empty (e.g. a diff between two
-    // admin-only builds has no street/addr/postcode/poi tiers).
+    // unchanged. Tier bases are the cumulative sizes of the tiers found;
+    // a tier found nowhere is empty (strings_poi.bin beside full/).
     std::cerr << "Building string remap... (RSS=" << get_rss_mb() << " MiB)" << std::endl;
     static const char* kStrTierFilenames[5] = {
         "strings_core.bin", "strings_street.bin", "strings_addr.bin",
@@ -932,8 +931,17 @@ static int run(int argc, char* argv[]) {
     // marker first, it consumes that section and exits (never reading
     // the tiered marker that follows), leaving strings_*.bin unwritten.
     {
-        uint32_t tiered_marker = 0xFFFFFFF6;
+        uint32_t tiered_marker = STRINGS_TIERED_MARKER;
         wval(patch, &tiered_marker, 4);
+        for (int t = 0; t < 5; t++) {
+            TierStamp s;
+            s.old_size = static_cast<uint32_t>(old_tier_maps[t].size);
+            s.new_size = static_cast<uint32_t>(new_tier_maps[t].size);
+            s.old_hash = content_hash(old_tier_maps[t].data, old_tier_maps[t].size);
+            s.new_hash = content_hash(new_tier_maps[t].data, new_tier_maps[t].size);
+            wval(patch, &s.old_size, 4); wval(patch, &s.new_size, 4);
+            wval(patch, &s.old_hash, 8); wval(patch, &s.new_hash, 8);
+        }
         for (int t = 0; t < 5; t++) {
             std::vector<std::string> old_strs, new_strs;
             {
@@ -992,7 +1000,7 @@ static int run(int argc, char* argv[]) {
             if (ot != nt) cross_tier.push_back({og, ng});
         }
         std::sort(cross_tier.begin(), cross_tier.end());
-        uint32_t marker = 0xFFFFFFFE;
+        uint32_t marker = STRINGS_CROSS_TIER_REMAP_MARKER;
         uint32_t count = static_cast<uint32_t>(cross_tier.size());
         wval(patch, &marker, 4); wval(patch, &count, 4);
         for (auto& [og, ng] : cross_tier) { wval(patch, &og, 4); wval(patch, &ng, 4); }
