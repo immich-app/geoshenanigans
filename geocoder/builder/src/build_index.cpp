@@ -12,6 +12,7 @@
 #include <numeric>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -49,6 +50,7 @@ inline uint64_t pack_osm_id(gc::id_alloc::ObjectType type, int64_t osm_id) {
 #include "continent_filter.h"
 #include "cell_index.h"
 #include "admin_rank_config.h"
+#include "scratch_dir.h"
 
 
 // --- Place type override classification ---
@@ -129,12 +131,11 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
 
     // Collect all CSV files
     std::vector<std::string> csv_files;
-    std::string extract_dir;  // set when we extracted a tarball; removed at the end
+    std::optional<ScratchDir> extract;  // the extracted tarball lives until the CSVs are read
     if (path.find(".tar.gz") != std::string::npos || path.find(".tgz") != std::string::npos) {
-        // Extract tar.gz to a temp directory
-        std::string tmpdir = "/tmp/tiger-extract-" + std::to_string(getpid());
-        extract_dir = tmpdir;
-        std::string cmd = "mkdir -p '" + tmpdir + "' && tar xzf '" + path + "' -C '" + tmpdir + "'";
+        extract.emplace("tiger-extract");
+        const std::string& tmpdir = extract->path();
+        std::string cmd = "tar xzf '" + path + "' -C '" + tmpdir + "'";
         if (system(cmd.c_str()) != 0) {
             // --tiger-data was explicitly requested: a silently TIGER-less
             // planet build would ship without US address ranges/ZIPs.
@@ -341,11 +342,6 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
               << csv_files.size() << " files" << std::endl;
     std::cerr << "  Interp ways now: " << data.interp_ways.size()
               << " (" << loaded_rows << " from TIGER)" << std::endl;
-
-    if (!extract_dir.empty()) {
-        if (system(("rm -rf '" + extract_dir + "'").c_str()) != 0)
-            std::cerr << "  (failed to remove " << extract_dir << ")" << std::endl;
-    }
 }
 
 // --- GeoNames postcode loading ---
@@ -357,8 +353,10 @@ static void load_external_postcodes(ParsedData& data, const std::string& path) {
     std::cerr << "Loading external postcode centroids from " << path << "..." << std::endl;
     std::string cmd;
     std::string tmp_csv;
+    std::optional<ScratchDir> scratch;
     if (path.find(".gz") != std::string::npos) {
-        tmp_csv = "/tmp/external_postcodes_" + std::to_string(getpid()) + ".csv";
+        scratch.emplace("external-postcodes");
+        tmp_csv = scratch->path() + "/postcodes.csv";
         cmd = "gunzip -c '" + path + "' > '" + tmp_csv + "'";
         if (system(cmd.c_str()) != 0) {
             throw std::runtime_error("--external-postcodes: failed to gunzip " + path);
@@ -417,7 +415,6 @@ static void load_external_postcodes(ParsedData& data, const std::string& path) {
         }
     }
 
-    if (tmp_csv != path) std::remove(tmp_csv.c_str());
     std::cerr << "  GeoNames: loaded " << loaded << " new postcodes, "
               << skipped << " rejected by pattern, "
               << data.postcode_accum.size() << " total centroids" << std::endl;
@@ -3032,7 +3029,7 @@ static void reorder_deterministically(ParsedData& data, std::vector<float>& poi_
     }
 }
 
-int main(int argc, char* argv[]) {
+static int run(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [options]" << std::endl;
         std::cerr << "       build-index <output-dir> --load-cache <path> [options]" << std::endl;
@@ -5415,4 +5412,14 @@ int main(int argc, char* argv[]) {
 
     std::cerr << "Done." << std::endl;
     return 0;
+}
+
+// The one error edge: a throw anywhere in run() unwinds its scratch dirs.
+int main(int argc, char* argv[]) {
+    try {
+        return run(argc, argv);
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
 }

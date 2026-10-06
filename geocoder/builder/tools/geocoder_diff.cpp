@@ -777,8 +777,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     std::string old_dir = argv[1], new_dir = argv[2], patch_path = argv[4];
-    std::string tmpdir = "/tmp/geocoder-diff-" + std::to_string(getpid());
-    ensure_dir(tmpdir);
 
     // Build string remap (mmap each tier's pool — read-only sequential
     // scan). Virtual "concat pool" reproduces the global-offset layout
@@ -2551,30 +2549,23 @@ int main(int argc, char* argv[]) {
               << patch.size() / 1024 / 1024 << " MiB)"
               << " RSS=" << get_rss_mb() << " MiB" << std::endl;
 
-    // Compress whole patch with zstd for transport
+    // Compress for transport, streaming straight into zstd: no staged
+    // uncompressed copy, and a short write or zstd failure fails the diff.
     {
         double tc = now_ms();
-        std::string raw_path = tmpdir + "/patch.raw";
-        write_file(raw_path, patch);
-        std::string cmd = "zstd -19 -T0 '" + raw_path + "' -o '" + patch_path + "' -f --quiet 2>/dev/null";
-        int rc = system(cmd.c_str());
-        if (rc == -1 || !WIFEXITED(rc) || WEXITSTATUS(rc) != 0) {
-            std::cerr << "ERROR: zstd compression failed (system rc=" << rc << ")" << std::endl;
-            remove(raw_path.c_str());
-            std::string rm_fail = "rm -rf '" + tmpdir + "'";
-            if (system(rm_fail.c_str()) != 0)
-                std::cerr << "WARNING: failed to clean up temp dir " << tmpdir << std::endl;
+        std::string cmd = "zstd -19 -T0 -q -f -o '" + patch_path + "'";
+        FILE* z = popen(cmd.c_str(), "w");
+        size_t put = z ? fwrite(patch.data(), 1, patch.size(), z) : 0;
+        int rc = z ? pclose(z) : -1;
+        if (put != patch.size() || rc == -1 || !WIFEXITED(rc) || WEXITSTATUS(rc) != 0) {
+            std::cerr << "Patch compression failed (wrote " << put << " of " << patch.size()
+                      << " bytes, zstd rc=" << rc << ")" << std::endl;
             return 1;
         }
         struct stat cst; stat(patch_path.c_str(), &cst);
         std::cerr << "Compressed patch: " << cst.st_size << " bytes ("
                   << cst.st_size / 1024 / 1024 << " MiB)" << std::endl;
         log_time("zstd -19 -T0 compression", tc);
-        remove(raw_path.c_str());
     }
-
-    std::string rm_cmd = "rm -rf '" + tmpdir + "'";
-    if (system(rm_cmd.c_str()) != 0)
-        std::cerr << "WARNING: failed to clean up temp dir " << tmpdir << std::endl;
     return 0;
 }

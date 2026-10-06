@@ -95,6 +95,10 @@ jobs:
           WORKDIR="$RUNNER_TEMP/geocoder"
           mkdir -p "$WORKDIR"
           echo "workdir=$WORKDIR" >> "$GITHUB_OUTPUT"
+          # Scratch on disk for every later step: /tmp on the runner is a RAM
+          # disk that counts against the job's memory limit.
+          mkdir -p "$WORKDIR/tmp"
+          echo "TMPDIR=$WORKDIR/tmp" >> "$GITHUB_ENV"
           echo "cache_endpoint=http://${BUCKET_HOST}:${BUCKET_PORT}" >> "$GITHUB_OUTPUT"
           echo "cache_bucket=$BUCKET_NAME" >> "$GITHUB_OUTPUT"
 

@@ -19,6 +19,7 @@
 #include <iostream>
 #include <iterator>
 #include <malloc.h>
+#include <stdexcept>
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -28,6 +29,7 @@
 #include <vector>
 
 #include "patch_format.h"
+#include "scratch_dir.h"
 
 enum MergeOp : uint8_t { OP_MATCH_RUN = 0, OP_INSERT_RUN = 1, OP_DELETE_RUN = 2 };
 
@@ -99,7 +101,7 @@ static std::vector<uint64_t> read_tier_sizes(const std::string& path) {
     return sizes;
 }
 
-int main(int argc, char* argv[]) {
+static int run(int argc, char* argv[]) {
     if (argc < 5 || std::string(argv[3]) != "-o") {
         std::cerr << "Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir>" << std::endl;
         return 1;
@@ -116,8 +118,8 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     }
-    std::string tmpdir = "/tmp/geocoder-patch-" + std::to_string(getpid());
-    ensure_dir(tmpdir);
+    ScratchDir scratch("geocoder-patch");
+    const std::string& tmpdir = scratch.path();
     double t_start = now_ms();
 
     // --- Phase 1: Decompress + mmap patch ---
@@ -142,11 +144,10 @@ int main(int argc, char* argv[]) {
     // run the cursor off the end. On the success path pos+n <= patch_size
     // always holds, so this never fires and the read bytes are unchanged.
     auto require_bytes = [&](size_t n, const char* what) {
-        if (pos + n > patch_size) {
-            std::cerr << "Truncated patch: need " << n << " bytes for " << what
-                      << " at offset " << pos << " (size " << patch_size << ")" << std::endl;
-            std::exit(1);
-        }
+        if (pos + n > patch_size)
+            throw std::runtime_error("Truncated patch: need " + std::to_string(n) + " bytes for " +
+                                     what + " at offset " + std::to_string(pos) +
+                                     " (size " + std::to_string(patch_size) + ")");
     };
     auto ru32 = [&]() -> uint32_t { require_bytes(4, "u32"); uint32_t v; memcpy(&v, P+pos, 4); pos += 4; return v; };
     auto ru64 = [&]() -> uint64_t { require_bytes(8, "u64"); uint64_t v; memcpy(&v, P+pos, 8); pos += 8; return v; };
@@ -1399,11 +1400,18 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Cleanup
     unmap_file(patch_map);
-    remove(raw_path.c_str());
-    { std::string cmd = "rm -rf '" + tmpdir + "'"; system(cmd.c_str()); }
     log_phase("Total", t_start);
     std::cerr << "Patch applied. Output in " << out_dir << std::endl;
     return 0;
+}
+
+// The one error edge: a throw anywhere in run() unwinds its scratch dir.
+int main(int argc, char* argv[]) {
+    try {
+        return run(argc, argv);
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << std::endl;
+        return 1;
+    }
 }

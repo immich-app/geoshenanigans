@@ -69,7 +69,7 @@ target_include_directories(geocoder-diff PRIVATE tools)
 
 add_executable(geocoder-patch tools/geocoder_patch.cpp)
 target_link_libraries(geocoder-patch PRIVATE Threads::Threads)
-target_include_directories(geocoder-patch PRIVATE tools)
+target_include_directories(geocoder-patch PRIVATE tools src)
 
 target_include_directories(build-index PRIVATE "${EMBEDDED_POLY_DIR}")
 
