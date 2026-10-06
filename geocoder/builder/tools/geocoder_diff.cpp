@@ -1884,7 +1884,8 @@ static int run(int argc, char* argv[]) {
         sparse_file_present("addr_postcodes.bin") ||
         sparse_file_present("admin_parents.bin")  ||
         sparse_file_present("postcode_centroids.bin");
-    if (has_poi || has_place || has_addr || has_sparse_delta_files) {
+    bool has_admin_entries = sparse_file_present("admin_entries.bin");
+    if (has_poi || has_place || has_addr || has_sparse_delta_files || has_admin_entries) {
         uint32_t marker = POI_PARENT_REMAP_MARKER;
         wval(patch, &marker, 4);
         auto emit_pairs = [&](const std::vector<uint32_t>& rm) {
@@ -1947,15 +1948,13 @@ static int run(int argc, char* argv[]) {
     auto& w_rm_v = res_ways.id_remap;
     auto& a_rm_v = res_addr.id_remap;
     auto& i_rm_v = res_interp_w.id_remap;
+    // The admin leg of the parent-id remap, which is what the patcher
+    // rebuilds admin_entries from: the full remap even for variants whose
+    // polygons live in quality/q2.5, so applying needs no sibling.
     std::unordered_map<uint32_t,uint32_t> ad_rm_d;
-    {
-        auto vec = derive_id_remap_from_merge(
-            res_admin_p.seq,
-            res_admin_p.old_size / admin_stride, admin_stride);
-        ad_rm_d.reserve(vec.size());
-        for (uint32_t i = 0; i < vec.size(); i++)
-            if (vec[i] != NO_DATA) ad_rm_d[i] = vec[i];
-        for (auto& [o,n] : res_admin_p.secondary_matches) ad_rm_d[o] = n;
+    for (uint32_t i = 0; i < res_admin_p.id_remap.size(); i++) {
+        uint32_t n = res_admin_p.id_remap[i];
+        if (n != NO_DATA && n != i) ad_rm_d[i] = n;
     }
     std::unordered_map<uint32_t,uint32_t> poi_rm_d;
     if (res_poi_r.old_size > 0 || res_poi_r.new_size > 0) {
@@ -2012,11 +2011,11 @@ static int run(int argc, char* argv[]) {
           wval(patch, &file, 4); wval(patch, &count, 4);
           for (auto& [o,n] : rm) { wval(patch, &o, 4); wval(patch, &n, 4); }
       };
-      uint32_t n_files = 6; wval(patch, &n_files, 4);
+      // Admin pairs travel in the parent-id remap instead.
+      uint32_t n_files = 5; wval(patch, &n_files, 4);
       emit_remap(PatchFileId::STREET_WAYS, res_ways.secondary_matches);
       emit_remap(PatchFileId::ADDR_POINTS, res_addr.secondary_matches);
       emit_remap(PatchFileId::INTERP_WAYS, res_interp_w.secondary_matches);
-      emit_remap(PatchFileId::ADMIN_POLYGONS, res_admin_p.secondary_matches);
       emit_remap(PatchFileId::POI_RECORDS, res_poi_r.secondary_matches);
       emit_remap(PatchFileId::PLACE_NODES, res_place_n.secondary_matches);
     }

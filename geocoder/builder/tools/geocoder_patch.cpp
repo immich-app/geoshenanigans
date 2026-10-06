@@ -58,15 +58,9 @@ static size_t detect_stride(const std::string& path, std::initializer_list<size_
     return *candidates.begin();
 }
 
-// Resolve a per-file path with fallback to sibling variant directories.
-// Used by admin_polygons.bin and admin_vertices.bin in admin-mode variants
-// (`<region>/admin/`) which don't carry the polygon files themselves —
-// they live alongside the quality variants at `<region>/quality/q2.5/`.
-// Without this, the patch tool sees a missing admin_polygons.bin in
-// cur_dir, the merge replay runs against an empty old, and the id_remap
-// it should have produced for the admin_entries rebuild comes out empty.
-// Mirrors geocoder-diff's try_load_with_fallback fallback list so the
-// diff and patch resolve the same on-disk file for the same variant.
+// Resolve a string tier with fallback to the region's full/ dir, where the
+// tiers live for variants that don't ship them. Mirrors geocoder-diff's
+// try_load_tier; the tier stamps prove both found the same file.
 static std::string resolve_with_fallback(const std::string& cur_dir, const std::string& fname,
                                           std::initializer_list<const char*> fallbacks) {
     std::string primary = cur_dir + "/" + fname;
@@ -285,15 +279,9 @@ static int run(int argc, char* argv[]) {
     madvise(const_cast<char*>(patch_map.data), pos, MADV_DONTNEED);
     log_phase("Strings", t_start);
 
-    // Detect strides. admin_polygons.bin/admin_vertices.bin live in
-    // <region>/quality/q2.5/ for admin-mode variants; fall back to
-    // resolve correctly there.
     size_t way_stride = detect_stride(cur_dir + "/street_ways.bin", {12, 9});
     size_t interp_stride = detect_stride(cur_dir + "/interp_ways.bin", {24, 20, 18});
-    size_t admin_stride = detect_stride(
-        resolve_with_fallback(cur_dir, "admin_polygons.bin",
-                              {"../../quality/q2.5/", "../quality/q2.5/"}),
-        {24, 20, 19});
+    size_t admin_stride = detect_stride(cur_dir + "/admin_polygons.bin", {24, 20, 19});
 
     // String remap lookup via sorted vector + binary search
     auto str_remap_lookup = [&](uint32_t old_off) -> uint32_t {
@@ -635,20 +623,8 @@ static int run(int argc, char* argv[]) {
             else if (file_id == (uint32_t)PatchFileId::PLACE_NODES) remap_offs = {PLACE_NODE_NAME_ID_OFF};
         }
 
-        // mmap old file read-only (zero allocation). admin_polygons.bin
-        // and admin_vertices.bin live in `<region>/quality/q2.5/` for
-        // admin-mode variants; fall back so the merge replay's id_remap
-        // (consumed later by the admin_entries reconstruction) is built
-        // against the correct old polygon set instead of an empty file.
-        std::string old_path;
-        if (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS ||
-            file_id == (uint32_t)PatchFileId::ADMIN_VERTICES) {
-            old_path = resolve_with_fallback(cur_dir, std::string(fname),
-                                              {"../../quality/q2.5/", "../quality/q2.5/"});
-        } else {
-            old_path = cur_dir + "/" + std::string(fname);
-        }
-        MappedFile old_mmap = mmap_file(old_path);
+        // mmap old file read-only (zero allocation).
+        MappedFile old_mmap = mmap_file(cur_dir + "/" + std::string(fname));
         madvise(const_cast<char*>(old_mmap.data), old_mmap.size, MADV_SEQUENTIAL);
         size_t n_old_records = old_mmap.size / actual_stride;
 
@@ -1022,15 +998,8 @@ static int run(int argc, char* argv[]) {
         // Admin: small, use existing rebuild + corrections
         {
             uint32_t no_data = 0xFFFFFFFF;
-            std::unordered_map<uint32_t,uint32_t> ad_rm;
-            MappedFile m_ad_rm = mmap_remap(PatchFileId::ADMIN_POLYGONS);
-            if (m_ad_rm.data) {
-                const uint32_t* ad_vec = (const uint32_t*)m_ad_rm.data;
-                size_t ad_count = m_ad_rm.size / 4;
-                for (uint32_t i = 0; i < ad_count; i++)
-                    if (ad_vec[i] != 0) ad_rm[i] = ad_vec[i] - 1; // decode +1 encoding
-                unmap_file(m_ad_rm);
-            }
+            // The admin leg of the parent-id remap, as the diff used it.
+            std::unordered_map<uint32_t,uint32_t> ad_rm(poi_admin_remap.begin(), poi_admin_remap.end());
             auto old_ac = read_file(cur_dir + "/admin_cells.bin");
             auto old_adme = read_file(cur_dir + "/admin_entries.bin");
             auto admin = rebuild_admin_from_remap(old_ac, old_adme, ad_rm, admin_added, admin_removed);
