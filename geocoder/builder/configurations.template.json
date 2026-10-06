@@ -174,8 +174,8 @@
         "{region}/admin-minimal/place_cells.bin",
         "{region}/admin-minimal/place_entries.bin",
         "{region}/admin-minimal/place_nodes.bin",
-        "{region}/full/strings_core.bin",
-        "{region}/full/strings_layout.json"
+        "{region}/admin-minimal/strings_core.bin",
+        "{region}/admin-minimal/strings_layout.json"
       ],
       "replaces": [
         "{region}/quality/{quality}/admin_polygons.bin",
@@ -192,7 +192,7 @@
         "{region}/admin/place_entries.bin",
         "{region}/admin/place_nodes.bin",
         "{region}/admin/strings_core.bin",
-        "{region}/full/strings_layout.json",
+        "{region}/admin/strings_layout.json",
         "{region}/admin/strings_postcode.bin"
       ],
       "optional_files": [
@@ -217,7 +217,7 @@
         "{region}/no-addresses/way_postcodes.bin",
         "{region}/no-addresses/strings_core.bin",
         "{region}/no-addresses/strings_street.bin",
-        "{region}/full/strings_layout.json",
+        "{region}/no-addresses/strings_layout.json",
         "{region}/no-addresses/strings_postcode.bin"
       ],
       "optional_files": [

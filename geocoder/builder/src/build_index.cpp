@@ -1893,8 +1893,9 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
         // Re-simplifies the kept polygons at q2.5 and writes them to a
         // dense ID space so the on-disk admin_polygons.bin / admin_vertices.bin
         // are self-contained — admin-minimal does NOT share polygon
-        // files with quality/q2.5/. strings_core.bin is shared from
-        // full/.
+        // files with quality/q2.5/. It also carries its own core strings
+        // and layout, so a client never needs another dir (or a patch for
+        // one) to resolve its names.
         if (multi_output && !d.place_nodes.empty() && !d.admin_polygons.empty()) {
             std::string mdir = base_dir + "/admin-minimal";
             ensure_dir(mdir);
@@ -1957,6 +1958,16 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             }
             write_cell_index(mdir + "/admin_cells.bin", mdir + "/admin_entries.bin",
                              filtered_admin_cells);
+
+            // 5. Core strings + layout: admin and place names all live in core.
+            {
+                const auto& core = d.strings_tiers[0];
+                std::ofstream f(mdir + "/" + STR_TIER_FILENAMES[0], std::ios::binary);
+                f.write(core.data(), core.size());
+                f.flush();
+                if (!f) throw std::runtime_error("failed to write " + mdir + "/" + STR_TIER_FILENAMES[0]);
+            }
+            write_strings_layout(mdir, d);
 
             std::cerr << "  Admin-minimal: " << filtered_places.size()
                       << " place nodes (of " << d.place_nodes.size() << "), "

@@ -185,8 +185,8 @@ static int run(int argc, char* argv[]) {
             uint32_t old_global_base = 0;
             uint32_t new_global_base = 0;
             uint32_t total_added = 0, total_deleted = 0;
-            // Strings live under <region>/full/, so a per-variant subdir
-            // (quality, poi, admin-minimal) resolves the old tiers there.
+            // A variant without a tier of its own (quality, poi, or a mode
+            // dir's unshipped tiers) resolves the old one under <region>/full/.
             auto old_tier_path = [&](int t) {
                 return resolve_with_fallback(cur_dir, kStrTierFilenames[t], {"../full/", "../../full/"});
             };

@@ -62,17 +62,14 @@ else
         # is needed.  Equivalent to GeoNames cities500-level detail
         # with admin boundary lookup.
         #
-        # Cell index + place_nodes come from the admin-minimal/
-        # subdir (filtered: admin polygon IDs in [L2..L8], place
-        # types in {city,town,village,hamlet}). strings_core.bin
-        # is shared, fetched from full/ — see the strings_core curl
-        # below the main loop.
-        # admin-minimal owns its own polygon + vertex files (re-simplified
-        # at q2.5 over just the L2-L8 subset) plus its own cell index +
-        # filtered place_nodes. strings_core.bin is shared from full/.
+        # Everything comes from the admin-minimal/ subdir (filtered: admin
+        # polygon IDs in [L2..L8], place types in {city,town,village,hamlet}):
+        # its own polygons re-simplified at q2.5, cell index, place_nodes,
+        # core strings and layout.
         admin_minimal_files="admin_cells.bin admin_entries.bin
                              admin_polygons.bin admin_vertices.bin
-                             place_cells.bin place_entries.bin place_nodes.bin"
+                             place_cells.bin place_entries.bin place_nodes.bin
+                             strings_core.bin strings_layout.json"
         echo "Downloading admin-minimal mode files..."
         for f in $admin_minimal_files; do
             echo "  $f"
@@ -105,12 +102,9 @@ else
         wait
     fi
 
-    # Layout JSON (always needed — string tier offsets) and strings_core
-    # (shared between full and admin-minimal — admin-minimal pulls it
-    # from full/ since the new tier doesn't re-emit it).
-    curl -sL -o "$INDEX_DIR/strings_layout.json" "$BASE/planet/full/strings_layout.json"
-    if [ "$MINIMAL" = "1" ]; then
-        fetch "$BASE/planet/full/strings_core.bin" "$INDEX_DIR/strings_core.bin"
+    # Layout JSON (string tier offsets); admin-minimal fetched its own above.
+    if [ "$MINIMAL" != "1" ]; then
+        curl -sL -o "$INDEX_DIR/strings_layout.json" "$BASE/planet/full/strings_layout.json"
     fi
 
     # Admin polygons + postal polygons from the selected quality variant.
