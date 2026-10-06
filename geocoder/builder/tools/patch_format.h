@@ -282,6 +282,11 @@ static const char* patch_file_names[] = {
 
 static constexpr uint32_t FIXUP_MARKER = 0xFFFFFFFD;
 
+// Terminator written after the last patch section; the patcher breaks its
+// section loop when it reads this as a file_id and refuses a patch that ends
+// without it. Same bytes as NO_DATA, but a distinct concept.
+static constexpr uint32_t SECTION_END_MARKER = 0xFFFFFFFFu;
+
 // Cell changes section marker: 0xFFFFFFFB
 // Format: marker, num_added(u32), num_removed(u32),
 //         [added_cell_id(u64)] * num_added, [removed_cell_id(u64)] * num_removed
@@ -459,6 +464,7 @@ inline std::vector<ClientFile> parse_client_files(const char* data, size_t size,
     take(&marker, 4);
     if (marker != CLIENT_FILES_MARKER) throw std::runtime_error("Patch has no client file list");
     take(&n, 4);
+    if ((size_t)n * 11 > size - pos) throw std::runtime_error("Truncated client file list");  // 11 = smallest entry
     std::vector<ClientFile> files(n);
     for (auto& f : files) {
         uint16_t len = 0;

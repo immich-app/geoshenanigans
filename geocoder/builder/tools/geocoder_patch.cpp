@@ -118,13 +118,26 @@ static int run(int argc, char* argv[]) {
     // run the cursor off the end. On the success path pos+n <= patch_size
     // always holds, so this never fires and the read bytes are unchanged.
     auto require_bytes = [&](size_t n, const char* what) {
-        if (pos + n > patch_size)
+        if (n > patch_size - pos)
             throw std::runtime_error("Truncated patch: need " + std::to_string(n) + " bytes for " +
                                      what + " at offset " + std::to_string(pos) +
                                      " (size " + std::to_string(patch_size) + ")");
     };
     auto ru32 = [&]() -> uint32_t { require_bytes(4, "u32"); uint32_t v; memcpy(&v, P+pos, 4); pos += 4; return v; };
     auto ru64 = [&]() -> uint64_t { require_bytes(8, "u64"); uint64_t v; memcpy(&v, P+pos, 8); pos += 8; return v; };
+    auto take = [&](size_t n, const char* what) -> const char* {
+        require_bytes(n, what);
+        const char* p = P + pos;
+        pos += n;
+        return p;
+    };
+    auto rstr = [&]() -> std::string {
+        const void* end = memchr(P + pos, '\0', patch_size - pos);
+        if (!end) throw std::runtime_error("Truncated patch: unterminated string");
+        std::string s(P + pos, static_cast<const char*>(end));
+        pos += s.size() + 1;
+        return s;
+    };
 
     // Header
     if (memcmp(P, GCPATCH_MAGIC, 8) != 0) { std::cerr << "Bad magic" << std::endl; return 1; }
@@ -144,6 +157,12 @@ static int run(int argc, char* argv[]) {
     }
     auto out_path = [&](const std::string& name) {
         return (listed.count(name) ? out_dir : tmpdir) + "/" + name;
+    };
+    auto open_out = [&](const std::string& name) -> FILE* {
+        std::string p = out_path(name);
+        FILE* f = fopen(p.c_str(), "wb");
+        if (!f) throw std::runtime_error("Cannot write " + p);
+        return f;
     };
 
     // --- Phase 2: String rebuild ---
@@ -184,7 +203,8 @@ static int run(int argc, char* argv[]) {
                 uint32_t n_added = ru32(), n_deleted = ru32();
                 total_added += n_added; total_deleted += n_deleted;
                 std::vector<std::string> added;
-                for (uint32_t i = 0; i < n_added; i++) { const char* s = P+pos; added.push_back(s); pos += strlen(s)+1; }
+                for (uint32_t i = 0; i < n_added; i++) added.push_back(rstr());
+                require_bytes((size_t)n_deleted * 4, "deleted string indices");
                 std::vector<uint32_t> del_idx(n_deleted);
                 for (uint32_t i = 0; i < n_deleted; i++) del_idx[i] = ru32();
                 std::unordered_set<uint32_t> del_set(del_idx.begin(), del_idx.end());
@@ -197,7 +217,7 @@ static int run(int argc, char* argv[]) {
                                              ") is not the one the patch was made from");
                 // Phase A: write new tier file via alphabetical merge.
                 {
-                    FILE* fp = fopen(out_path(kStrTierFilenames[t]).c_str(), "wb");
+                    FILE* fp = open_out(kStrTierFilenames[t]);
                     size_t sp = 0; uint32_t idx = 0; size_t ai = 0;
                     std::sort(added.begin(), added.end());
                     while (sp < old_pool.size || ai < added.size()) {
@@ -312,46 +332,51 @@ static int run(int argc, char* argv[]) {
         return old_id;
     };
 
+    bool saw_end = false;
     while (pos < patch_size) {
         uint32_t file_id = ru32();
-        if (file_id == 0xFFFFFFFF) break;
+        if (file_id == SECTION_END_MARKER) { saw_end = true; break; }
 
         // --- Metadata sections ---
         if (file_id == CELL_CHANGES_GEO_MARKER) {
             uint32_t na = ru32(), nr = ru32();
+            require_bytes(((size_t)na + nr) * 8, "cell changes");
             geo_added.resize(na); geo_removed.resize(nr);
-            for (uint32_t i = 0; i < na; i++) { memcpy(&geo_added[i], P+pos, 8); pos += 8; }
-            for (uint32_t i = 0; i < nr; i++) { memcpy(&geo_removed[i], P+pos, 8); pos += 8; }
+            for (uint32_t i = 0; i < na; i++) { memcpy(&geo_added[i], take(8, "cell id"), 8); }
+            for (uint32_t i = 0; i < nr; i++) { memcpy(&geo_removed[i], take(8, "cell id"), 8); }
             std::cerr << "  Geo cells: +" << na << " -" << nr << std::endl;
             continue;
         }
         if (file_id == CELL_CHANGES_ADMIN_MARKER) {
             uint32_t na = ru32(), nr = ru32();
+            require_bytes(((size_t)na + nr) * 8, "cell changes");
             admin_added.resize(na); admin_removed.resize(nr);
-            for (uint32_t i = 0; i < na; i++) { memcpy(&admin_added[i], P+pos, 8); pos += 8; }
-            for (uint32_t i = 0; i < nr; i++) { memcpy(&admin_removed[i], P+pos, 8); pos += 8; }
+            for (uint32_t i = 0; i < na; i++) { memcpy(&admin_added[i], take(8, "cell id"), 8); }
+            for (uint32_t i = 0; i < nr; i++) { memcpy(&admin_removed[i], take(8, "cell id"), 8); }
             std::cerr << "  Admin cells: +" << na << " -" << nr << std::endl;
             continue;
         }
         if (file_id == CELL_CHANGES_POI_MARKER) {
             uint32_t na = ru32(), nr = ru32();
+            require_bytes(((size_t)na + nr) * 8, "cell changes");
             poi_added.resize(na); poi_removed.resize(nr);
-            for (uint32_t i = 0; i < na; i++) { memcpy(&poi_added[i], P+pos, 8); pos += 8; }
-            for (uint32_t i = 0; i < nr; i++) { memcpy(&poi_removed[i], P+pos, 8); pos += 8; }
+            for (uint32_t i = 0; i < na; i++) { memcpy(&poi_added[i], take(8, "cell id"), 8); }
+            for (uint32_t i = 0; i < nr; i++) { memcpy(&poi_removed[i], take(8, "cell id"), 8); }
             std::cerr << "  POI cells: +" << na << " -" << nr << std::endl;
             continue;
         }
         if (file_id == CELL_CHANGES_PLACE_MARKER) {
             uint32_t na = ru32(), nr = ru32();
+            require_bytes(((size_t)na + nr) * 8, "cell changes");
             place_added.resize(na); place_removed.resize(nr);
-            for (uint32_t i = 0; i < na; i++) { memcpy(&place_added[i], P+pos, 8); pos += 8; }
-            for (uint32_t i = 0; i < nr; i++) { memcpy(&place_removed[i], P+pos, 8); pos += 8; }
+            for (uint32_t i = 0; i < na; i++) { memcpy(&place_added[i], take(8, "cell id"), 8); }
+            for (uint32_t i = 0; i < nr; i++) { memcpy(&place_removed[i], take(8, "cell id"), 8); }
             std::cerr << "  Place cells: +" << na << " -" << nr << std::endl;
             continue;
         }
         if (file_id == CELL_FLAGS_MARKER) {
             uint32_t c = ru32();
-            for (uint32_t i = 0; i < c; i++) { uint64_t cid; memcpy(&cid, P+pos, 8); pos += 8; flag_corrections[cid] = P[pos++]; }
+            for (uint32_t i = 0; i < c; i++) { uint64_t cid; memcpy(&cid, take(8, "cell id"), 8); flag_corrections[cid] = static_cast<uint8_t>(*take(1, "cell flags")); }
             std::cerr << "  Flag corrections: " << c << std::endl;
             continue;
         }
@@ -406,12 +431,14 @@ static int run(int argc, char* argv[]) {
             // Format: n_admin(u32), [(o,n):u32]*na, n_street(u32), [(o,n):u32]*ns,
             //         n_postcode(u32), [(o,n):u32]*np
             uint32_t na = ru32();
+            require_bytes((size_t)na * 8, "admin remap");
             poi_admin_remap.resize(na);
             for (uint32_t i = 0; i < na; i++) {
                 uint32_t o = ru32(), n = ru32();
                 poi_admin_remap[i] = {o, n};
             }
             uint32_t ns = ru32();
+            require_bytes((size_t)ns * 8, "street remap");
             poi_street_remap.resize(ns);
             for (uint32_t i = 0; i < ns; i++) {
                 uint32_t o = ru32(), n = ru32();
@@ -431,10 +458,10 @@ static int run(int argc, char* argv[]) {
             uint32_t fid = ru32(), c = ru32();
             auto& list = entry_corrections[fid];
             for (uint32_t i = 0; i < c; i++) {
-                uint64_t cid; memcpy(&cid, P+pos, 8); pos += 8;
-                uint16_t ec; memcpy(&ec, P+pos, 2); pos += 2;
+                uint64_t cid; memcpy(&cid, take(8, "cell id"), 8);
+                uint16_t ec; memcpy(&ec, take(2, "entry count"), 2);
                 std::vector<uint32_t> ids(ec);
-                if (ec > 0) { memcpy(ids.data(), P+pos, ec*4); pos += ec*4; }
+                if (ec > 0) memcpy(ids.data(), take((size_t)ec * 4, "entry ids"), (size_t)ec * 4);
                 list.push_back({cid, std::move(ids)});
             }
             std::cerr << "  Entry corrections " << fid << ": " << c << std::endl;
@@ -450,19 +477,18 @@ static int run(int argc, char* argv[]) {
         if (stride == 0) {
             // Full replacement — write directly from patch mmap
             uint32_t nf = ru32(); (void)nf; uint64_t ds = ru64();
-            FILE* fp = fopen(out_path(fname).c_str(), "wb");
-            fwrite(P+pos, 1, ds, fp); fclose(fp);
-            pos += ds;
+            const char* data = take(ds, "full replacement");
+            if (!write_file(out_path(fname), data, ds)) throw std::runtime_error(std::string("Cannot write ") + fname);
             std::cerr << "  " << fname << ": full replace " << ds << " bytes" << std::endl;
             continue;
         }
         if (stride == COPY_OLD_STRIDE) {
             // Unchanged file: the diff verified old==new and emitted no
             // data. Reproduce by copying the old (current) file verbatim.
-            uint32_t nf = ru32(); (void)nf; uint64_t ds = ru64(); pos += ds; // ds == 0
+            uint32_t nf = ru32(); (void)nf; take(ru64(), "copy-old payload"); // empty
             std::string src = cur_dir + "/" + fname;
             FILE* in = fopen(src.c_str(), "rb");
-            FILE* out = fopen(out_path(fname).c_str(), "wb");
+            FILE* out = open_out(fname);
             if (!in || !out) {
                 // The diff only emits COPY_OLD for a file that existed (and was
                 // byte-identical) at diff time, so a missing source here is a
@@ -484,7 +510,7 @@ static int run(int argc, char* argv[]) {
                       << " bytes from old)" << std::endl;
             continue;
         }
-        if (stride == LEGACY_SKIP_STRIDE) { uint32_t nf = ru32(); (void)nf; uint64_t ds = ru64(); pos += ds; continue; }
+        if (stride == LEGACY_SKIP_STRIDE) { uint32_t nf = ru32(); (void)nf; take(ru64(), "skipped section"); continue; }
         if (stride == SPARSE_DELTA_STRIDE) {
             // SPARSE_DELTA: position-keyed delta. Format already decoded
             // old_size + new_size above; next fields are value_stride,
@@ -492,6 +518,7 @@ static int run(int argc, char* argv[]) {
             uint32_t value_stride = ru32();
             uint32_t remap_kind = ru32();
             uint32_t n_changes = ru32();
+            require_bytes((size_t)n_changes * (4 + value_stride), "sparse changes");
 
             // Load OLD bytes, apply the same remap the diff applied
             // before computing the delta, then overwrite at each
@@ -533,16 +560,13 @@ static int run(int argc, char* argv[]) {
 
             for (uint32_t i = 0; i < n_changes; i++) {
                 uint32_t arr_pos = ru32();
+                const char* value = take(value_stride, "sparse value");
                 size_t byte_off = (size_t)arr_pos * value_stride;
-                if (byte_off + value_stride <= (size_t)new_size) {
-                    memcpy(buf.data() + byte_off, P + pos, value_stride);
-                }
-                pos += value_stride;
+                if (byte_off + value_stride <= (size_t)new_size)
+                    memcpy(buf.data() + byte_off, value, value_stride);
             }
 
-            FILE* fp = fopen(out_path(fname).c_str(), "wb");
-            if (new_size > 0) fwrite(buf.data(), 1, new_size, fp);
-            fclose(fp);
+            if (!write_file(out_path(fname), buf)) throw std::runtime_error(std::string("Cannot write ") + fname);
 
             std::cerr << "  " << fname << ": sparse delta " << n_changes
                       << " changes (" << new_size << " bytes)" << std::endl;
@@ -561,20 +585,19 @@ static int run(int argc, char* argv[]) {
                             file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS ||
                             file_id == (uint32_t)PatchFileId::POI_RECORDS ||
                             file_id == (uint32_t)PatchFileId::PLACE_NODES);
-        bool needs_padding = (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS && actual_stride == 24) ||
-                             (file_id == (uint32_t)PatchFileId::INTERP_WAYS && actual_stride == 24);
+        bool needs_padding = file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS && actual_stride == 24;
 
         // Read fixup data — decoded lazily during merge replay (zero allocation)
         uint32_t n_fixups = ru32();
-        size_t fixup_data_pos = pos;
+        size_t fixup_data_pos = pos, fixup_end = pos;
         if (n_fixups > 0) {
             uint32_t delta_size = ru32();
-            fixup_data_pos = pos;
-            pos += delta_size;
+            fixup_data_pos = take(delta_size, "fixups") - P;
+            fixup_end = pos;
         }
         // Lazy fixup decoder state (reads from patch mmap on demand)
         struct FixupDecoder {
-            const char* data; size_t read_pos;
+            const char* data; size_t read_pos, end = 0;
             uint32_t prev_idx = 0, prev_val = 0;
             uint32_t cur_idx = UINT32_MAX, cur_val = 0;
             uint32_t remaining;
@@ -586,6 +609,7 @@ static int run(int argc, char* argv[]) {
                 if (remaining == 0) { cur_idx = UINT32_MAX; return; }
                 cur_idx = prev_idx + read_varint(data, read_pos);
                 cur_val = prev_val + read_varint(data, read_pos);
+                if (read_pos > end) throw std::runtime_error("Malformed fixups");
                 prev_idx = cur_idx; prev_val = cur_val;
                 remaining--;
             }
@@ -596,6 +620,7 @@ static int run(int argc, char* argv[]) {
                 return false;
             }
         } fixup_dec;
+        fixup_dec.end = fixup_end;
         fixup_dec.init(P, fixup_data_pos, n_fixups);
 
         // Get string remap field offsets for this file type
@@ -630,8 +655,9 @@ static int run(int argc, char* argv[]) {
 
         // Replay merge sequence — stream output, apply remap/fixups per-record inline
         uint64_t seq_size = ru64();
+        require_bytes(seq_size, "merge sequence");
         size_t seq_end = pos + seq_size;
-        FILE* outf = fopen(out_path(fname).c_str(), "wb");
+        FILE* outf = open_out(fname);
 
         bool track = needs_remap; // track ID remap only for data files
         // File-backed id_map: create temp file, fill with 0xFF, mmap read-write
@@ -670,6 +696,7 @@ static int run(int argc, char* argv[]) {
 
         size_t old_rec = 0, new_rec = 0, old_bytes = 0, written = 0;
         while (pos < seq_end) {
+            if (pos + 5 > seq_end) throw std::runtime_error(std::string("Malformed merge sequence: ") + fname);
             uint8_t op = P[pos++];
             uint32_t count; memcpy(&count, P+pos, 4); pos += 4;
             if (op == OP_MATCH_RUN) {
@@ -784,6 +811,7 @@ static int run(int argc, char* argv[]) {
                 old_rec += count; new_rec += count; old_bytes += count * actual_stride;
             } else if (op == OP_INSERT_RUN) {
                 size_t bytes = count * actual_stride;
+                if (pos + bytes > seq_end) throw std::runtime_error(std::string("Malformed merge sequence: ") + fname);
                 fwrite(P+pos, 1, bytes, outf);
                 written += bytes; pos += bytes; new_rec += count;
             } else if (op == OP_DELETE_RUN) {
@@ -817,6 +845,7 @@ static int run(int argc, char* argv[]) {
         madvise(const_cast<char*>(patch_map.data), pos, MADV_DONTNEED);
         malloc_trim(0);
     }
+    if (!saw_end) throw std::runtime_error("Truncated patch: no end marker");
     log_phase("Merge replays", t_start);
 
     // Free string remap + release all processed patch pages
@@ -891,10 +920,10 @@ static int run(int argc, char* argv[]) {
         log_phase("  Setup", t_entry);
 
         // Open 4 output files
-        FILE* f_geo = fopen(out_path("geo_cells.bin").c_str(), "wb");
-        FILE* f_se = fopen(out_path("street_entries.bin").c_str(), "wb");
-        FILE* f_ae = fopen(out_path("addr_entries.bin").c_str(), "wb");
-        FILE* f_ie = fopen(out_path("interp_entries.bin").c_str(), "wb");
+        FILE* f_geo = open_out("geo_cells.bin");
+        FILE* f_se = open_out("street_entries.bin");
+        FILE* f_ae = open_out("addr_entries.bin");
+        FILE* f_ie = open_out("interp_entries.bin");
         constexpr uint32_t NO = 0xFFFFFFFF;
 
         // Reusable buffer (one per entry type to avoid aliasing issues)
@@ -1009,8 +1038,8 @@ static int run(int argc, char* argv[]) {
                 std::unordered_map<uint64_t, const std::vector<uint32_t>*> ac_corr;
                 for (auto& c : ecit->second) ac_corr[c.cell_id] = &c.ids;
                 size_t n = admin.admin_cells_data.size() / 12;
-                FILE* fac = fopen(out_path("admin_cells.bin").c_str(), "wb");
-                FILE* fae = fopen(out_path("admin_entries.bin").c_str(), "wb");
+                FILE* fac = open_out("admin_cells.bin");
+                FILE* fae = open_out("admin_entries.bin");
                 uint32_t ae_wpos = 0;
                 for (size_t i = 0; i < n; i++) {
                     uint64_t cid; memcpy(&cid, admin.admin_cells_data.data()+i*12, 8);
@@ -1103,8 +1132,8 @@ static int run(int argc, char* argv[]) {
                 if (ecit != entry_corrections.end()) {
                     std::unordered_map<uint64_t, const std::vector<uint32_t>*> pc_corr;
                     for (auto& c : ecit->second) pc_corr[c.cell_id] = &c.ids;
-                    FILE* fpc = fopen(out_path("poi_cells.bin").c_str(), "wb");
-                    FILE* fpe = fopen(out_path("poi_entries.bin").c_str(), "wb");
+                    FILE* fpc = open_out("poi_cells.bin");
+                    FILE* fpe = open_out("poi_entries.bin");
                     uint32_t pe_wpos = 0;
                     for (size_t i = 0; i < poi_cells.size(); i++) {
                         uint64_t cid = poi_cells[i].cell_id;
@@ -1214,8 +1243,8 @@ static int run(int argc, char* argv[]) {
                 if (ecit != entry_corrections.end()) {
                     std::unordered_map<uint64_t, const std::vector<uint32_t>*> plc_corr;
                     for (auto& c : ecit->second) plc_corr[c.cell_id] = &c.ids;
-                    FILE* fplc = fopen(out_path("place_cells.bin").c_str(), "wb");
-                    FILE* fple = fopen(out_path("place_entries.bin").c_str(), "wb");
+                    FILE* fplc = open_out("place_cells.bin");
+                    FILE* fple = open_out("place_entries.bin");
                     uint32_t ple_wpos = 0;
                     for (size_t i = 0; i < place_cells.size(); i++) {
                         uint64_t cid = place_cells[i].cell_id;

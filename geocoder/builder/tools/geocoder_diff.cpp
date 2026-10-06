@@ -39,10 +39,6 @@
 // Sentinel meaning "no offset / no data / unmapped id" in cell offset fields
 // and id-remap tables. Emitted/compared as a raw uint32_t.
 static constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
-// Terminator written after the last patch section; the patch reader breaks its
-// section loop when it reads this as a file_id. Same bytes as NO_DATA, but a
-// distinct concept, so it gets its own name.
-static constexpr uint32_t SECTION_END_MARKER = 0xFFFFFFFFu;
 
 static size_t get_rss_mb() {
     FILE* f = fopen("/proc/self/statm", "r");
