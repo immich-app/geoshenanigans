@@ -133,15 +133,8 @@ jobs:
               PATCH_S=$(( $(date +%s) - PS ))
               PATCH_MEM=$(grep "Maximum resident" "$WORKDIR/t-patch-${SAFE}" | awk '{print int($NF/1024)}')
 
-              MATCH=0
-              for f in "$NEW/$variant/"*.bin; do
-                b=$(basename "$f")
-                cmp -s "$VERIFY/$b" "$NEW/$variant/$b" && MATCH=$((MATCH + 1))
-              done
-
+              STATUS=$("$GITHUB_WORKSPACE/geocoder/builder/tools/verify_patch.sh" "$NEW/$variant" "$VERIFY" | tail -1)
               TOTAL_S=$(( $(date +%s) - VS ))
-              STATUS="$MATCH/$N_NEW"
-              [ "$MATCH" -ne "$N_NEW" ] && STATUS="FAIL:$MATCH/$N_NEW"
 
               echo "$variant: diff=${DIFF_S}s(${DIFF_MEM}MB) patch=${PATCH_S}s(${PATCH_MEM}MB) total=${TOTAL_S}s ${STATUS}"
               echo "| $variant | $N_NEW | $DIFF_S | $DIFF_MEM | $PATCH_KB | $PATCH_S | $PATCH_MEM | $STATUS | $TOTAL_S |" >> "$GITHUB_STEP_SUMMARY"

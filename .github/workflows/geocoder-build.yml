@@ -611,88 +611,16 @@ jobs:
           echo "|---------|-------|-----------|----------|" >> "$GITHUB_STEP_SUMMARY"
 
           RESULTS_DIR="$WORKDIR/results"
-          mkdir -p "$RESULTS_DIR"
           VARIANTS=$(cd "$WORKDIR/output" && find . -name "*.bin" -exec dirname {} \; | sort -u | sed 's|^\./||')
 
-          # Generate patch, verify, and place patch.gcpatch alongside the .bin files
-          JOBS=0
-          MAX_JOBS=$(nproc)
-          for variant in $VARIANTS; do
-            (
-              NEW_DIR="$WORKDIR/output/$variant"
-              OLD_DIR="$WORKDIR/old-output/$variant"
-              N_NEW=$(ls "$NEW_DIR"/*.bin 2>/dev/null | wc -l)
-              N_OLD=$(ls "$OLD_DIR"/*.bin 2>/dev/null | wc -l)
-              SAFE=$(echo "$variant" | tr '/' '_')
-
-              if [ "$N_NEW" -lt 2 ]; then
-                echo "SKIP" > "$RESULTS_DIR/$SAFE"
-                exit 0
-              fi
-              # Only a fresh build (no previous output at all) skips. A file-
-              # count mismatch with a previous build present is a real diff
-              # (added/removed optional files, e.g. a sidecar introduction
-              # day) — the tools emit full-replace sections for those, so run
-              # the diff and let verify judge it.
-              if [ "$N_OLD" -eq 0 ]; then
-                echo "SKIP" > "$RESULTS_DIR/$SAFE"
-                exit 0
-              fi
-
-              # Generate patch into the output directory (colocated with .bin files).
-              # Save diff stderr to a per-variant log so the post-build
-              # patch breakdown (per-section sizes, sparse vs full_replace
-              # decisions, secondary-match recovery counts) survives to
-              # the artifact — without un-redirecting we'd lose visibility
-              # into why a section grew/shrunk.
-              PATCH_FILE="$NEW_DIR/patch.gcpatch"
-              DIFF_LOG="$WORKDIR/diff-logs/$SAFE.log"
-              mkdir -p "$WORKDIR/diff-logs"
-              geocoder-diff "$OLD_DIR" "$NEW_DIR" -o "$PATCH_FILE" 2> "$DIFF_LOG"
-              PATCH_KB=$(( $(stat -c%s "$PATCH_FILE" 2>/dev/null || echo 0) / 1024 ))
-
-              # Verify
-              VERIFY_DIR="$WORKDIR/verify-$SAFE"
-              mkdir -p "$VERIFY_DIR"
-              geocoder-patch "$OLD_DIR" "$PATCH_FILE" -o "$VERIFY_DIR/" 2>> "$DIFF_LOG"
-
-              MATCH=0
-              MISMATCH_LIST=""
-              EXPECTED=0
-              for f in "$NEW_DIR"/*.bin; do
-                b=$(basename "$f")
-                # Skip strategy-2 sidecars: they're cached only, not
-                # transmitted in the patch, and the patcher doesn't
-                # write them out. The build emits them fresh every run.
-                case "$b" in *.osm_ids) continue;; esac
-                EXPECTED=$((EXPECTED + 1))
-                if cmp -s "$VERIFY_DIR/$b" "$NEW_DIR/$b"; then
-                  MATCH=$((MATCH + 1))
-                else
-                  NEW_SIZE=$(stat -c%s "$NEW_DIR/$b" 2>/dev/null || echo 0)
-                  OLD_SIZE=$(stat -c%s "$OLD_DIR/$b" 2>/dev/null || echo 0)
-                  VERIFY_SIZE=$(stat -c%s "$VERIFY_DIR/$b" 2>/dev/null || echo 0)
-                  DIFF_OFFSET=$(cmp -l "$VERIFY_DIR/$b" "$NEW_DIR/$b" 2>/dev/null | head -1 | awk '{print $1}')
-                  MISMATCH_LIST="${MISMATCH_LIST}${b}(new=${NEW_SIZE},old=${OLD_SIZE},verify=${VERIFY_SIZE},first_diff=${DIFF_OFFSET:-end});"
-                fi
-              done
-              rm -rf "$VERIFY_DIR"
-
-              if [ $MATCH -eq $EXPECTED ]; then
-                echo "PASS $EXPECTED $PATCH_KB" > "$RESULTS_DIR/$SAFE"
-              else
-                echo "FAIL $MATCH $EXPECTED $PATCH_KB" > "$RESULTS_DIR/$SAFE"
-                echo "$MISMATCH_LIST" > "$RESULTS_DIR/$SAFE.mismatches"
-              fi
-            ) &
-
-            JOBS=$((JOBS + 1))
-            if [ $JOBS -ge $MAX_JOBS ]; then
-              wait -n 2>/dev/null || true
-              JOBS=$((JOBS - 1))
-            fi
-          done
-          wait
+          # Per variant: diff, apply to a scratch copy, verify the whole client
+          # file set (JSON included, no extra files). Jobs are admitted by
+          # estimated diff memory, largest first; see the script header.
+          # A script abort leaves variants without results; the collector
+          # counts those as CRASH, so patches are dropped but data still uploads.
+          "$GITHUB_WORKSPACE/geocoder/builder/tools/generate_patches.sh" \
+            "$WORKDIR/old-output" "$WORKDIR/output" "$RESULTS_DIR" "$WORKDIR/diff-logs" \
+            || echo "::error::generate_patches.sh exited $?"
           echo "Patch generation + verification completed in $(($(date +%s) - START))s"
 
           # Collect results
@@ -721,7 +649,7 @@ jobs:
               M=$(echo "$RESULT" | awk '{print $2}')
               N=$(echo "$RESULT" | awk '{print $3}')
               KB=$(echo "$RESULT" | awk '{print $4}')
-              echo "::error::$variant: FAIL ($M/$N)"
+              echo "::error::$variant: FAIL ($M problems over $N files)"
               echo "| $variant | $N | ${KB} KiB | **FAIL** |" >> "$GITHUB_STEP_SUMMARY"
               FAIL=$((FAIL + 1))
               if [ -f "$RESULTS_DIR/$SAFE.mismatches" ]; then
