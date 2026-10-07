@@ -918,9 +918,10 @@ static int run(int argc, char* argv[]) {
 
         // Open 4 output files
         FILE* f_geo = open_out("geo_cells.bin");
-        FILE* f_se = open_out("street_entries.bin");
-        FILE* f_ae = open_out("addr_entries.bin");
-        FILE* f_ie = open_out("interp_entries.bin");
+        struct EntriesOut { FILE* f; uint64_t written; };
+        EntriesOut o_se{open_out("street_entries.bin"), 0};
+        EntriesOut o_ae{open_out("addr_entries.bin"), 0};
+        EntriesOut o_ie{open_out("interp_entries.bin"), 0};
         constexpr uint32_t NO = 0xFFFFFFFF;
 
         // Reusable buffer (one per entry type to avoid aliasing issues)
@@ -941,12 +942,15 @@ static int run(int argc, char* argv[]) {
             for (auto& id : ids) if (id < rm.size() && rm[id] != NO2) id = rm[id];
             std::sort(ids.begin(), ids.end());
         };
-        // Write entry and return offset, or NO if empty
-        auto emit = [&NO](FILE* f, const uint32_t* ids, size_t n) -> uint32_t {
+        // Write entry and return offset, or NO if empty. Offsets come from a
+        // running count per output: ftell per list cost ~40 s of client CPU
+        // on planet (~460M lists).
+        auto emit = [&NO](EntriesOut& out, const uint32_t* ids, size_t n) -> uint32_t {
             if (n == 0) return NO;
-            uint32_t off = (uint32_t)ftell(f);
+            uint32_t off = (uint32_t)out.written;
             uint16_t c = (uint16_t)n;
-            fwrite(&c, 2, 1, f); fwrite(ids, 4, n, f);
+            fwrite(&c, 2, 1, out.f); fwrite(ids, 4, n, out.f);
+            out.written += 2 + n * 4;
             return off;
         };
 
@@ -959,7 +963,7 @@ static int run(int argc, char* argv[]) {
             // For each entry type: check correction → remap old → write
             auto do_entry = [&](const MappedFile& old_e, size_t geo_off, const RemapRef& rm,
                                 const std::vector<CorrEntry>& corr,
-                                FILE* outf, uint8_t flag_bit) -> uint32_t {
+                                EntriesOut& outf, uint8_t flag_bit) -> uint32_t {
                 // Check flag
                 bool has = false;
                 if (oi >= 0 && (size_t)oi * 20 + geo_off + 4 <= m_geo.size) {
@@ -986,9 +990,9 @@ static int run(int argc, char* argv[]) {
                 return emit(outf, buf.data(), buf.size());
             };
 
-            uint32_t so = do_entry(m_se, 8, w_rm, cs, f_se, 1);
-            uint32_t ao = do_entry(m_ae, 12, a_rm, ca, f_ae, 2);
-            uint32_t io = do_entry(m_ie, 16, i_rm, ci_map, f_ie, 4);
+            uint32_t so = do_entry(m_se, 8, w_rm, cs, o_se, 1);
+            uint32_t ao = do_entry(m_ae, 12, a_rm, ca, o_ae, 2);
+            uint32_t io = do_entry(m_ie, 16, i_rm, ci_map, o_ie, 4);
             fwrite(&cid, 8, 1, f_geo); fwrite(&so, 4, 1, f_geo); fwrite(&ao, 4, 1, f_geo); fwrite(&io, 4, 1, f_geo);
             cells_written++;
         };
@@ -1009,12 +1013,12 @@ static int run(int argc, char* argv[]) {
             }
 
             if (cells_written % 10000000 == 0 && cells_written > 0) {
-                std::cerr << "    " << cells_written << " cells, se=" << ftell(f_se)/1024/1024
-                          << "M ae=" << ftell(f_ae)/1024/1024 << "M rss=" << get_rss_mb() << "M" << std::endl;
+                std::cerr << "    " << cells_written << " cells, se=" << o_se.written/1024/1024
+                          << "M ae=" << o_ae.written/1024/1024 << "M rss=" << get_rss_mb() << "M" << std::endl;
             }
         }
 
-        fclose(f_geo); fclose(f_se); fclose(f_ae); fclose(f_ie);
+        fclose(f_geo); fclose(o_se.f); fclose(o_ae.f); fclose(o_ie.f);
         unmap_file(m_geo); unmap_file(m_se); unmap_file(m_ae); unmap_file(m_ie);
         unmap_file(m_w_rm); unmap_file(m_a_rm); unmap_file(m_i_rm);
         std::cerr << "  Geo: " << cells_written << " cells written" << std::endl;
