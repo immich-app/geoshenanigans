@@ -197,12 +197,13 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // geocoder-patch. v3 added INTERP_POSTCODES (fid 36). v4 lists the variant's
 // client files (CLIENT_FILES_MARKER) right after the header, carries its JSON
 // files verbatim, and records the string tiers it was diffed against; the
-// patcher reproduces exactly that file set. Version-gated so older appliers
-// reject the whole patch upfront ("Bad version").
-static constexpr uint32_t GCPATCH_VERSION = 4;
-// v3 patches carry no file list, so a v4 patcher cannot reproduce their
-// variant's file set.
-static constexpr uint32_t GCPATCH_MIN_READ_VERSION = 4;
+// patcher reproduces exactly that file set. v5 carries offset fixups as runs
+// of one shift (OffsetFixups). Version-gated so older appliers reject the
+// whole patch upfront ("Bad version").
+static constexpr uint32_t GCPATCH_VERSION = 5;
+// v4 patches list their offset fixups one by one, which a v5 patcher no
+// longer reads.
+static constexpr uint32_t GCPATCH_MIN_READ_VERSION = 5;
 
 enum class PatchFileId : uint32_t {
     STRINGS = 0,
@@ -887,6 +888,118 @@ inline uint32_t read_varint(const char* data, size_t& pos) {
     }
     return result;
 }
+
+// --- Offset fixups ---
+//
+// The diff's fixup passes rewrite an old record's offset field (node_offset
+// or vertex_offset) to where the same block sits in the new build, so
+// unchanged records merge as MATCH, and the patcher must write the same
+// values. One edit shifts every later block by the same amount, so the moved
+// offsets come in long runs of one shift. They travel as runs of (records
+// skipped since the previous run, run length, zigzag change of the shift)
+// and the patcher adds the run's shift to each old offset in it. Records
+// whose old offset is NO_DATA own no block: runs pass over them, and the
+// rare one a pass gives an offset is listed as (index delta, offset).
+struct OffsetFixups {
+    uint32_t n_runs = 0, n_values = 0;
+    std::vector<char> runs, values;
+    bool empty() const { return n_runs == 0 && n_values == 0; }
+};
+
+inline uint32_t zigzag32(uint32_t v) { return (v << 1) ^ (0u - (v >> 31)); }
+inline uint32_t unzigzag32(uint32_t v) { return (v >> 1) ^ (0u - (v & 1)); }
+
+// fixed_at(i): record i's offset after the fixup passes.
+template <typename FixedAt>
+OffsetFixups encode_offset_fixups(const std::vector<uint32_t>& old_offsets, FixedAt fixed_at) {
+    constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
+    OffsetFixups out;
+    uint32_t prev_end = 0, prev_shift = 0, prev_value = 0;
+    uint32_t start = 0, end = 0, shift = 0;
+    bool open = false;
+    auto close_run = [&]() {
+        write_varint(out.runs, start - prev_end);
+        write_varint(out.runs, end - start);
+        write_varint(out.runs, zigzag32(shift - prev_shift));
+        out.n_runs++;
+        prev_end = end;
+        prev_shift = shift;
+        open = false;
+    };
+    for (uint32_t i = 0; i < old_offsets.size(); i++) {
+        uint32_t old = old_offsets[i], fixed = fixed_at(i);
+        if (old == NO_DATA) {
+            if (fixed != NO_DATA) {
+                write_varint(out.values, i - prev_value);
+                write_varint(out.values, fixed);
+                out.n_values++;
+                prev_value = i;
+            }
+            continue;
+        }
+        uint32_t s = fixed - old;
+        if (open && s == shift) { end = i + 1; continue; }
+        if (open) close_run();
+        if (s != 0) { open = true; start = i; end = i + 1; shift = s; }
+    }
+    if (open) close_run();
+    return out;
+}
+
+// Applies encoded OffsetFixups to old records visited in ascending order.
+class OffsetFixupReader {
+public:
+    OffsetFixupReader(const char* runs, size_t runs_size, uint32_t n_runs,
+                      const char* values, size_t values_size, uint32_t n_values)
+        : runs_(runs), runs_size_(runs_size), runs_left_(n_runs),
+          values_(values), values_size_(values_size), values_left_(n_values) {
+        next_run();
+        next_value();
+    }
+
+    // Record idx's offset after the fixups, given its old offset.
+    uint32_t apply(uint32_t idx, uint32_t old) {
+        while (value_idx_ < idx) next_value();
+        if (value_idx_ == idx) return value_;
+        if (old == END) return old;
+        while (run_end_ <= idx) next_run();
+        return idx >= run_start_ ? old + shift_ : old;
+    }
+
+private:
+    static constexpr uint32_t END = 0xFFFFFFFFu;  // also NO_DATA
+
+    static uint32_t read(const char* data, size_t& pos, size_t size) {
+        uint32_t result = 0;
+        for (uint32_t bit = 0; bit < 35; bit += 7) {
+            if (pos >= size) throw std::runtime_error("Malformed fixups");
+            uint8_t byte = static_cast<uint8_t>(data[pos++]);
+            result |= static_cast<uint32_t>(byte & 0x7F) << bit;
+            if (!(byte & 0x80)) return result;
+        }
+        throw std::runtime_error("Malformed fixups");
+    }
+    void next_run() {
+        if (runs_left_ == 0) { run_start_ = run_end_ = END; return; }
+        runs_left_--;
+        run_start_ = run_end_ + read(runs_, runs_pos_, runs_size_);
+        run_end_ = run_start_ + read(runs_, runs_pos_, runs_size_);
+        shift_ += unzigzag32(read(runs_, runs_pos_, runs_size_));
+    }
+    void next_value() {
+        if (values_left_ == 0) { value_idx_ = END; return; }
+        values_left_--;
+        value_idx_ = (value_idx_ == END ? 0 : value_idx_) + read(values_, values_pos_, values_size_);
+        value_ = read(values_, values_pos_, values_size_);
+    }
+
+    const char* runs_;
+    size_t runs_size_, runs_pos_ = 0;
+    uint32_t runs_left_, run_start_ = 0, run_end_ = 0, shift_ = 0;
+    const char* values_;
+    size_t values_size_, values_pos_ = 0;
+    uint32_t values_left_, value_idx_ = END, value_ = 0;
+};
 
 // --- Grid coordinate for fingerprinting ---
 

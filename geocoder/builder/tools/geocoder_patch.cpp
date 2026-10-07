@@ -588,41 +588,20 @@ static int run(int argc, char* argv[]) {
                             file_id == (uint32_t)PatchFileId::PLACE_NODES);
         bool needs_padding = file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS && actual_stride == 24;
 
-        // Read fixup data — decoded lazily during merge replay (zero allocation)
-        uint32_t n_fixups = ru32();
-        size_t fixup_data_pos = pos, fixup_end = pos;
-        if (n_fixups > 0) {
-            uint32_t delta_size = ru32();
-            fixup_data_pos = take(delta_size, "fixups") - P;
-            fixup_end = pos;
-        }
-        // Lazy fixup decoder state (reads from patch mmap on demand)
-        struct FixupDecoder {
-            const char* data; size_t read_pos, end = 0;
-            uint32_t prev_idx = 0, prev_val = 0;
-            uint32_t cur_idx = UINT32_MAX, cur_val = 0;
-            uint32_t remaining;
-            void init(const char* d, size_t p, uint32_t count) {
-                data = d; read_pos = p; remaining = count;
-                if (remaining > 0) advance();
-            }
-            void advance() {
-                if (remaining == 0) { cur_idx = UINT32_MAX; return; }
-                cur_idx = prev_idx + read_varint(data, read_pos);
-                cur_val = prev_val + read_varint(data, read_pos);
-                if (read_pos > end) throw std::runtime_error("Malformed fixups");
-                prev_idx = cur_idx; prev_val = cur_val;
-                remaining--;
-            }
-            // Advance past all fixups with index < target
-            bool lookup(uint32_t target_idx, uint32_t& out_val) {
-                while (cur_idx < target_idx && (remaining > 0 || cur_idx != UINT32_MAX)) advance();
-                if (cur_idx == target_idx) { out_val = cur_val; advance(); return true; }
-                return false;
-            }
-        } fixup_dec;
-        fixup_dec.end = fixup_end;
-        fixup_dec.init(P, fixup_data_pos, n_fixups);
+        // Offset fixups, decoded lazily during merge replay (zero allocation).
+        uint32_t n_fixup_runs = ru32(), n_fixup_values = ru32();
+        uint32_t fixup_runs_size = ru32(), fixup_values_size = ru32();
+        const char* fixup_runs = take(fixup_runs_size, "fixup runs");
+        const char* fixup_values = take(fixup_values_size, "fixup values");
+        OffsetFixupReader fixups(fixup_runs, fixup_runs_size, n_fixup_runs,
+                                 fixup_values, fixup_values_size, n_fixup_values);
+        const bool has_fixups = n_fixup_runs > 0 || n_fixup_values > 0;
+        // node_offset / vertex_offset: byte 0 for most types, byte 8 for POI
+        // records, byte 20 for AddrPoint (after lat/lng/hn_id/st_id/pw_id).
+        const size_t fixup_off =
+            (file_id == (uint32_t)PatchFileId::POI_RECORDS) ? POI_RECORD_VERTEX_OFFSET_OFF :
+            (file_id == (uint32_t)PatchFileId::ADDR_POINTS)  ? ADDR_POINT_VERTEX_OFFSET_OFF : (size_t)0;
+        if (has_fixups && fixup_off + 4 > actual_stride) throw std::runtime_error("Malformed fixups");
 
         // Get string remap field offsets for this file type
         std::vector<size_t> remap_offs;
@@ -712,7 +691,7 @@ static int run(int argc, char* argv[]) {
                 // files but catastrophic at planet/full's 3.4 GiB
                 // addr_vertices.
                 if (actual_stride == 1 && !needs_remap && !needs_padding
-                    && remap_offs.empty() && n_fixups == 0) {
+                    && remap_offs.empty() && !has_fixups) {
                     if (old_bytes + count <= old_mmap.size) {
                         fwrite(old_mmap.data + old_bytes, 1, count, outf);
                     }
@@ -742,9 +721,12 @@ static int run(int argc, char* argv[]) {
                     if (file_id == (uint32_t)PatchFileId::ADDR_POINTS &&
                         actual_stride >= 20 && !poi_street_remap.empty())
                         modified = true;
-                    // Check fixup using lazy decoder (reads from patch mmap, zero allocation)
-                    uint32_t fixup_val = 0;
-                    bool has_fixup = fixup_dec.lookup(old_rec + k, fixup_val);
+                    uint32_t old_off = 0, new_off = 0;
+                    if (has_fixups) {
+                        memcpy(&old_off, old_mmap.data + rec_off + fixup_off, 4);
+                        new_off = fixups.apply(static_cast<uint32_t>(old_rec + k), old_off);
+                    }
+                    bool has_fixup = new_off != old_off;
                     if (has_fixup) modified = true;
 
                     if (modified) {
@@ -793,15 +775,7 @@ static int run(int argc, char* argv[]) {
                                 if (npw != pw) memcpy(rec_buf.data() + ADDR_POINT_PARENT_WAY_ID_OFF, &npw, 4);
                             }
                         }
-                        // Apply fixup (node_offset/vertex_offset — at byte 0 for
-                        // most types, byte 8 for POI records, byte 20 for AddrPoint
-                        // which has vertex_offset after lat/lng/hn_id/st_id/pw_id).
-                        if (has_fixup) {
-                            size_t fixup_off =
-                                (file_id == (uint32_t)PatchFileId::POI_RECORDS) ? POI_RECORD_VERTEX_OFFSET_OFF :
-                                (file_id == (uint32_t)PatchFileId::ADDR_POINTS)  ? ADDR_POINT_VERTEX_OFFSET_OFF : (size_t)0;
-                            memcpy(rec_buf.data() + fixup_off, &fixup_val, 4);
-                        }
+                        if (has_fixup) memcpy(rec_buf.data() + fixup_off, &new_off, 4);
                         fwrite(rec_buf.data(), 1, actual_stride, outf);
                     } else {
                         // No modification needed — write directly from mmap

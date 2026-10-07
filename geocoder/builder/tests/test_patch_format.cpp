@@ -202,10 +202,10 @@ TEST(patch_format_section_marker_values) {
 
 TEST(patch_format_magic_and_version) {
     // GCPATCH_VERSION is bound to the value actually emitted/checked by the
-    // diff/patch tools. v4 = client file list; older patches have none, so
-    // they are unreadable (MIN_READ_VERSION).
-    CHECK_EQ(GCPATCH_VERSION, uint32_t(4));
-    CHECK_EQ(GCPATCH_MIN_READ_VERSION, uint32_t(4));
+    // diff/patch tools. v5 = offset fixups as shift runs; v4 listed them one
+    // by one, so v4 patches are unreadable (MIN_READ_VERSION).
+    CHECK_EQ(GCPATCH_VERSION, uint32_t(5));
+    CHECK_EQ(GCPATCH_MIN_READ_VERSION, uint32_t(5));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
     for (int i = 0; i < 8; i++) CHECK_EQ(GCPATCH_MAGIC[i], expect[i]);
 }
@@ -344,4 +344,81 @@ TEST(patch_format_content_hash_of_nothing_is_stable) {
     // An absent tier (nullptr, 0) and an empty file hash alike.
     char none[1] = {0};
     CHECK_EQ(content_hash(nullptr, 0), content_hash(none, 0));
+}
+
+// --- offset fixups ---
+
+static constexpr uint32_t NO_OFFSET = 0xFFFFFFFFu;
+
+static OffsetFixups encode_fixed(const std::vector<uint32_t>& old_offsets, const std::vector<uint32_t>& fixed) {
+    return encode_offset_fixups(old_offsets, [&](uint32_t i) { return fixed[i]; });
+}
+
+static OffsetFixupReader reader_of(const OffsetFixups& f) {
+    return OffsetFixupReader(f.runs.data(), f.runs.size(), f.n_runs,
+                             f.values.data(), f.values.size(), f.n_values);
+}
+
+// What the patcher writes for every record, visiting them in order.
+static std::vector<uint32_t> replay(const std::vector<uint32_t>& old_offsets, const OffsetFixups& f) {
+    auto reader = reader_of(f);
+    std::vector<uint32_t> out;
+    for (uint32_t i = 0; i < old_offsets.size(); i++) out.push_back(reader.apply(i, old_offsets[i]));
+    return out;
+}
+
+TEST(patch_format_offset_fixups_round_trip) {
+    struct Case { const char* name; std::vector<uint32_t> old_offsets, fixed; uint32_t runs, values; };
+    const Case cases[] = {
+        {"nothing moved", {0, 5, 9}, {0, 5, 9}, 0, 0},
+        {"one shift for every later block", {0, 5, 9, 14}, {0, 8, 12, 17}, 1, 0},
+        {"no-data records inside a run", {0, NO_OFFSET, 5, NO_OFFSET, 9}, {3, NO_OFFSET, 8, NO_OFFSET, 12}, 1, 0},
+        {"an unmoved record splits the run", {0, 5, 9}, {3, 5, 12}, 2, 0},
+        {"shrinking shift", {10, 20, 30}, {4, 14, 30}, 1, 0},
+        {"shift changes", {10, 20, 30, 40}, {12, 22, 25, 35}, 2, 0},
+        {"record loses its block", {10, 20}, {10, NO_OFFSET}, 1, 0},
+        {"no-data record gains an offset", {NO_OFFSET, 4, NO_OFFSET}, {7, 9, 13}, 1, 2},
+    };
+    for (const auto& c : cases) {
+        auto f = encode_fixed(c.old_offsets, c.fixed);
+        CHECK_EQ(f.n_runs, c.runs);
+        CHECK_EQ(f.n_values, c.values);
+        CHECK(replay(c.old_offsets, f) == c.fixed);
+    }
+}
+
+TEST(patch_format_offset_fixups_skip_records_the_merge_drops) {
+    // MATCH replay visits only the kept old records, still ascending.
+    std::vector<uint32_t> old_offsets = {0, 4, 8, 12, 16, 20, 24};
+    std::vector<uint32_t> fixed = {0, 4, 9, 13, 30, 34, 38};
+    auto f = encode_fixed(old_offsets, fixed);
+    auto reader = reader_of(f);
+    for (uint32_t i : {1u, 3u, 6u}) CHECK_EQ(reader.apply(i, old_offsets[i]), fixed[i]);
+}
+
+TEST(patch_format_offset_fixups_one_edit_is_one_run) {
+    // An edit at record 500000 moves every later block by the same amount;
+    // the patch carries that as one run of a few bytes, not 500000 entries.
+    std::vector<uint32_t> old_offsets(1000000), fixed(1000000);
+    for (uint32_t i = 0; i < old_offsets.size(); i++) {
+        old_offsets[i] = i * 3;
+        fixed[i] = i < 500000 ? i * 3 : i * 3 + 7;
+    }
+    auto f = encode_fixed(old_offsets, fixed);
+    CHECK_EQ(f.n_runs, uint32_t(1));
+    CHECK(f.runs.size() <= size_t(8));
+    CHECK(replay(old_offsets, f) == fixed);
+}
+
+TEST(patch_format_offset_fixups_reject_truncated_runs) {
+    auto f = encode_fixed({0, 5, 9}, {3, 5, 12});
+    f.runs.pop_back();
+    bool threw = false;
+    try {
+        auto reader = reader_of(f);
+        for (uint32_t i = 0; i < 3; i++) reader.apply(i, 0);
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    CHECK(threw);
 }

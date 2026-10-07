@@ -551,17 +551,14 @@ static void fixup_interp_offsets(char* old_data, size_t old_size,
     }
 }
 
-// (record index, fixed offset) for every old record whose offset field at
-// `field` a fixup pass above rewrote; old_offsets holds the field from before
-// the pass.
-static std::vector<std::pair<uint32_t,uint32_t>> collect_offset_fixups(
+// The offsets a fixup pass above rewrote at `field` of each old record;
+// old_offsets holds the field from before the pass.
+static OffsetFixups collect_offset_fixups(
         const std::vector<uint32_t>& old_offsets, const char* fixed, size_t stride, size_t field) {
-    std::vector<std::pair<uint32_t,uint32_t>> fixups;
-    for (size_t i = 0; i < old_offsets.size(); i++) {
-        uint32_t off; memcpy(&off, fixed + i * stride + field, 4);
-        if (off != old_offsets[i]) fixups.push_back({static_cast<uint32_t>(i), off});
-    }
-    return fixups;
+    return encode_offset_fixups(old_offsets, [&](uint32_t i) {
+        uint32_t off; memcpy(&off, fixed + (size_t)i * stride + field, 4);
+        return off;
+    });
 }
 
 // --- Secondary matching for modified records ---
@@ -652,7 +649,7 @@ struct FileMergeResult {
     size_t stride;
     uint64_t old_size, new_size;
     MergeSequence seq;
-    std::vector<std::pair<uint32_t,uint32_t>> fixups; // (record_idx, new_offset)
+    OffsetFixups fixups;
     std::unordered_map<uint32_t,uint32_t> secondary_matches; // soft old→new ID map
     std::vector<uint32_t> id_remap; // derived old→new ID remap (with secondary merged in)
 };
@@ -713,21 +710,13 @@ static void serialize_merge(std::vector<char>& patch, const FileMergeResult& r,
         return;
     uint32_t fid = static_cast<uint32_t>(r.id);
     uint32_t st = static_cast<uint32_t>(r.stride);
-    uint32_t n_fixups = static_cast<uint32_t>(r.fixups.size());
+    const OffsetFixups& f = r.fixups;
+    uint32_t runs_size = static_cast<uint32_t>(f.runs.size());
+    uint32_t values_size = static_cast<uint32_t>(f.values.size());
     wv(&fid, 4); wv(&st, 4); wv(&r.old_size, 8); wv(&r.new_size, 8);
-    wv(&n_fixups, 4);
-    if (n_fixups > 0) {
-        std::vector<char> delta_buf;
-        uint32_t prev_idx = 0, prev_val = 0;
-        for (auto& [idx, val] : r.fixups) {
-            write_varint(delta_buf, idx - prev_idx);
-            write_varint(delta_buf, val - prev_val);
-            prev_idx = idx; prev_val = val;
-        }
-        uint32_t delta_size = static_cast<uint32_t>(delta_buf.size());
-        wv(&delta_size, 4);
-        patch.insert(patch.end(), delta_buf.begin(), delta_buf.end());
-    }
+    wv(&f.n_runs, 4); wv(&f.n_values, 4); wv(&runs_size, 4); wv(&values_size, 4);
+    patch.insert(patch.end(), f.runs.begin(), f.runs.end());
+    patch.insert(patch.end(), f.values.begin(), f.values.end());
     uint64_t ss = r.seq.data.size();
     wv(&ss, 8);
     patch.insert(patch.end(), r.seq.data.begin(), r.seq.data.end());
@@ -737,7 +726,7 @@ static std::mutex log_mutex;
 static void log_merge(const FileMergeResult& r) {
     std::lock_guard<std::mutex> lock(log_mutex);
     std::cerr << "  " << r.name << ": seq=" << r.seq.data.size()
-              << " fixups=" << r.fixups.size()
+              << " fixup_runs=" << r.fixups.n_runs << " fixup_values=" << r.fixups.n_values
               << " (" << std::fixed << std::setprecision(2)
               << (r.new_size > 0 ? r.seq.data.size() * 100.0 / r.new_size : 0) << "%)" << std::endl;
 }
@@ -1432,7 +1421,7 @@ static int run(int argc, char* argv[]) {
             res_ways.seq = MergeSequence{};
             res_ways.old_size = 0;
             res_ways.new_size = 0;
-            res_ways.fixups.clear();
+            res_ways.fixups = {};
             res_nodes.seq = MergeSequence{};
             res_nodes.old_size = 0;
             res_nodes.new_size = 0;
@@ -1561,7 +1550,7 @@ static int run(int argc, char* argv[]) {
             res_admin_p.seq = MergeSequence{};
             res_admin_p.old_size = 0;
             res_admin_p.new_size = 0;
-            res_admin_p.fixups.clear();
+            res_admin_p.fixups = {};
             res_admin_v = {PatchFileId::ADMIN_VERTICES, "admin_vertices.bin", 1,
                            0, 0, MergeSequence{}, {}, {}, {}};
             log_merge(res_admin_v);
