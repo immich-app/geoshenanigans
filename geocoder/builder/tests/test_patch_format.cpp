@@ -478,28 +478,69 @@ TEST(patch_format_cell_lists_write_the_cell_index_layout) {
     CHECK(parse_cell_lists(cells, entries) == CellLists({{7, {1, 2}}, {9, {4}}}));
 }
 
+// The index stream_cell_list_delta writes for the old index plus the delta
+// from old_lists to new_lists.
+static std::pair<std::vector<char>, std::vector<char>> apply_delta(
+        const std::pair<std::vector<char>, std::vector<char>>& old_index, const std::vector<char>& delta, size_t delta_size) {
+    std::pair<std::vector<char>, std::vector<char>> out;
+    stream_cell_list_delta(old_index.first.data(), old_index.first.size(), old_index.second.data(), old_index.second.size(),
+                           delta.data(), delta_size,
+                           [&](const char* p, size_t n) { out.first.insert(out.first.end(), p, p + n); },
+                           [&](const char* p, size_t n) { out.second.insert(out.second.end(), p, p + n); });
+    return out;
+}
+
 TEST(patch_format_cell_list_delta_round_trip) {
     const CellLists old_lists = {{1, {10, 11}}, {2, {20, 21, 22}}, {3, {30}}, {5, {50}}};
-    const CellLists new_lists = {{1, {10, 11}}, {2, {20, 22, 23}}, {4, {40, 41}}, {5, {}}};
+    const CellLists new_lists = {{0, {7}}, {1, {10, 11}}, {2, {20, 22, 23}}, {4, {40, 41}}, {5, {}}, {9, {90}}};
     std::vector<char> delta;
     append_cell_list_delta(delta, old_lists, new_lists);
-    CellLists got = old_lists;
-    apply_cell_list_delta(got, delta.data(), delta.size());
-    CHECK(got == new_lists);
-    // Unchanged cells don't travel: 3 removed, 2 / 4 / 5 set, 1 skipped.
+    CHECK(apply_delta(write_cell_lists(old_lists), delta, delta.size()) == write_cell_lists(new_lists));
+    // Unchanged cells don't travel: 3 removed; 0 / 2 / 4 / 5 / 9 set; 1 skipped.
     uint32_t n_removed; std::memcpy(&n_removed, delta.data(), 4);
     uint32_t n_set; std::memcpy(&n_set, delta.data() + 4 + n_removed * 8, 4);
     CHECK_EQ(n_removed, uint32_t(1));
-    CHECK_EQ(n_set, uint32_t(3));
+    CHECK_EQ(n_set, uint32_t(5));
+}
+
+TEST(patch_format_cell_list_delta_matches_the_new_index_on_random_days) {
+    // Many random old/new indexes: applying the delta to the old bytes gives
+    // exactly the bytes write_cell_index writes for the new lists.
+    uint64_t seed = 42;
+    auto rnd = [&](uint32_t n) { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return (uint32_t)(seed >> 33) % n; };
+    for (int round = 0; round < 200; round++) {
+        CellLists old_lists, new_lists;
+        for (uint64_t cid = 0; cid < 40; cid++) {
+            auto make = [&] { std::vector<uint32_t> ids; for (uint32_t id = 0; id < 30; id++) if (rnd(4) == 0) ids.push_back(id); return ids; };
+            uint32_t kind = rnd(5);
+            if (kind != 0) old_lists[cid] = make();
+            if (kind == 1 || kind == 2) new_lists[cid] = old_lists[cid];
+            else if (kind != 0 || rnd(2)) new_lists[cid] = make();
+        }
+        std::vector<char> delta;
+        append_cell_list_delta(delta, old_lists, new_lists);
+        CHECK(apply_delta(write_cell_lists(old_lists), delta, delta.size()) == write_cell_lists(new_lists));
+    }
+}
+
+TEST(patch_format_cell_list_delta_drops_removed_no_data_cells) {
+    // A rebuilt index can hold an emptied cell (offset NO_DATA); the delta removes it.
+    auto [cells, entries] = one_cell(7, {1});
+    uint64_t gone = 9; uint32_t no_data = 0xFFFFFFFFu;
+    cells.insert(cells.end(), (const char*)&gone, (const char*)&gone + 8);
+    cells.insert(cells.end(), (const char*)&no_data, (const char*)&no_data + 4);
+    std::vector<char> delta;
+    append_cell_list_delta(delta, parse_cell_lists(cells, entries), {{7, {1}}});
+    CHECK(apply_delta({cells, entries}, delta, delta.size()) == write_cell_lists({{7, {1}}}));
 }
 
 TEST(patch_format_cell_list_delta_rejects_truncation) {
     std::vector<char> delta;
-    append_cell_list_delta(delta, {{1, {10}}}, {{1, {11}}});
+    append_cell_list_delta(delta, {{1, {10}}}, {{1, {11}}, {2, {5}}});
+    auto old_index = write_cell_lists({{1, {10}}});
     for (size_t cut = 0; cut < delta.size(); cut++) {
-        CellLists lists = {{1, {10}}};
         bool threw = false;
-        try { apply_cell_list_delta(lists, delta.data(), cut); } catch (const std::runtime_error&) { threw = true; }
+        try { apply_delta(old_index, delta, cut); } catch (const std::runtime_error&) { threw = true; }
         CHECK(threw);
     }
 }

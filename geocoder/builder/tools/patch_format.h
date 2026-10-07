@@ -833,36 +833,109 @@ inline void append_cell_list_delta(std::vector<char>& out, const CellLists& old_
     out.insert(out.end(), sets.begin(), sets.end());
 }
 
-inline void apply_cell_list_delta(CellLists& lists, const char* data, size_t size) {
+// Applies append_cell_list_delta bytes to a cell index (cells sorted by id)
+// and writes the result, in write_cell_lists layout, through
+// out_cells(bytes, n) / out_entries(bytes, n). Holds one cell's list at a
+// time: the patcher runs on client machines, and a map of planet poi/all
+// (1.1M cells, 25M ids) cost +261 MiB peak. Returns the entries bytes written.
+template <typename OutCells, typename OutEntries>
+uint64_t stream_cell_list_delta(const char* cells, size_t cells_size, const char* entries, size_t entries_size,
+                                const char* delta, size_t delta_size, OutCells out_cells, OutEntries out_entries) {
+    auto malformed = [] { throw std::runtime_error("Malformed cell list delta"); };
     size_t pos = 0;
     auto take = [&](void* dst, size_t n) {
-        if (size - pos < n) throw std::runtime_error("Malformed cell list delta");
-        memcpy(dst, data + pos, n);
+        if (delta_size - pos < n) malformed();
+        memcpy(dst, delta + pos, n);
         pos += n;
     };
     uint32_t n_removed;
     take(&n_removed, 4);
-    for (uint32_t i = 0; i < n_removed; i++) {
-        uint64_t cid;
-        take(&cid, 8);
-        lists.erase(cid);
-    }
-    uint32_t n_set;
+    if ((delta_size - pos) / 8 < n_removed) malformed();
+    const char* removed = delta + pos;
+    pos += (size_t)n_removed * 8;
+    uint32_t n_set, set_i = 0, removed_i = 0;
     take(&n_set, 4);
-    for (uint32_t i = 0; i < n_set; i++) {
-        uint64_t cid; uint32_t nl, ng;
-        take(&cid, 8); take(&nl, 4); take(&ng, 4);
-        if ((size - pos) / 4 < (size_t)nl + ng) throw std::runtime_error("Malformed cell list delta");
-        std::vector<uint32_t> lost(nl), gained(ng);
+
+    // The next changed cell from the delta, read in cell order.
+    constexpr uint64_t NONE = ~0ull;
+    uint64_t set_cid = NONE, prev_set = 0;
+    std::vector<uint32_t> lost, gained;
+    auto next_set = [&] {
+        if (set_i == n_set) { set_cid = NONE; return; }
+        uint32_t nl, ng;
+        take(&set_cid, 8); take(&nl, 4); take(&ng, 4);
+        if ((set_i > 0 && set_cid <= prev_set) || set_cid == NONE) malformed();
+        if ((delta_size - pos) / 4 < (size_t)nl + ng) malformed();
+        lost.resize(nl); gained.resize(ng);
         take(lost.data(), (size_t)nl * 4);
         take(gained.data(), (size_t)ng * 4);
-        auto& ids = lists[cid];
-        std::vector<uint32_t> kept;
-        std::set_difference(ids.begin(), ids.end(), lost.begin(), lost.end(), std::back_inserter(kept));
+        prev_set = set_cid;
+        set_i++;
+    };
+    auto is_removed = [&](uint64_t cid) {
+        uint64_t r = 0;
+        while (removed_i < n_removed) {
+            memcpy(&r, removed + (size_t)removed_i * 8, 8);
+            if (r >= cid) break;
+            removed_i++;
+        }
+        return removed_i < n_removed && r == cid;
+    };
+
+    uint64_t written = 0;
+    std::vector<uint32_t> ids, kept;
+    auto emit = [&](uint64_t cid, const std::vector<uint32_t>& list) {
+        if (list.size() > 0xFFFF) throw std::runtime_error("Cell holds more than 65535 entries");
+        if (written > 0xFFFFFFFFull) throw std::runtime_error("Cell index entries past 4 GiB");
+        uint32_t off = static_cast<uint32_t>(written);
+        uint16_t n = static_cast<uint16_t>(list.size());
+        out_cells((const char*)&cid, 8);
+        out_cells((const char*)&off, 4);
+        out_entries((const char*)&n, 2);
+        out_entries((const char*)list.data(), list.size() * 4);
+        written += 2 + list.size() * 4;
+    };
+
+    next_set();
+    size_t n_cells = cells_size / 12, i = 0;
+    uint64_t prev_cid = 0;
+    while (i < n_cells || set_cid != NONE) {
+        uint64_t cid = NONE;
+        if (i < n_cells) {
+            memcpy(&cid, cells + i * 12, 8);
+            if (i > 0 && cid <= prev_cid) throw std::runtime_error("Malformed cell index");
+        }
+        if (set_cid < cid) {  // a cell the old index doesn't have
+            emit(set_cid, gained);
+            next_set();
+            continue;
+        }
+        prev_cid = cid;
+        uint32_t off;
+        memcpy(&off, cells + i * 12 + 8, 4);
+        i++;
         ids.clear();
-        std::merge(kept.begin(), kept.end(), gained.begin(), gained.end(), std::back_inserter(ids));
+        if (off != 0xFFFFFFFF) {
+            uint16_t n;
+            if ((size_t)off + 2 > entries_size) throw std::runtime_error("Malformed cell index");
+            memcpy(&n, entries + off, 2);
+            if ((size_t)off + 2 + (size_t)n * 4 > entries_size) throw std::runtime_error("Malformed cell index");
+            ids.resize(n);
+            memcpy(ids.data(), entries + off + 2, (size_t)n * 4);
+        }
+        if (cid == set_cid) {
+            kept.clear();
+            std::set_difference(ids.begin(), ids.end(), lost.begin(), lost.end(), std::back_inserter(kept));
+            ids.clear();
+            std::merge(kept.begin(), kept.end(), gained.begin(), gained.end(), std::back_inserter(ids));
+            next_set();
+        } else if (is_removed(cid)) {
+            continue;
+        }
+        emit(cid, ids);
     }
-    if (pos != size) throw std::runtime_error("Malformed cell list delta");
+    if (pos != delta_size) malformed();
+    return written;
 }
 
 // --- Varint encoding for delta-compressed fixup tables ---

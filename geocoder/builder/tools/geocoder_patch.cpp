@@ -533,15 +533,24 @@ static int run(int argc, char* argv[]) {
             if (payload_size < 8) throw std::runtime_error("Malformed cell list delta");
             const char* payload = take(payload_size, "cell list delta");
             uint64_t new_entries_size; memcpy(&new_entries_size, payload, 8);
-            auto lists = parse_cell_lists(read_file(cur_dir + "/" + cells_name), read_file(cur_dir + "/" + entries_name));
-            apply_cell_list_delta(lists, payload + 8, payload_size - 8);
-            auto [cells, entries] = write_cell_lists(lists);
-            if (cells.size() != new_size || entries.size() != new_entries_size)
+            MappedFile old_c = mmap_file(cur_dir + "/" + cells_name);
+            MappedFile old_e = mmap_file(cur_dir + "/" + entries_name);
+            FILE* fc = open_out(cells_name);
+            FILE* fe = open_out(entries_name);
+            uint64_t cells_written = 0;
+            uint64_t entries_written = stream_cell_list_delta(
+                old_c.data, old_c.size, old_e.data, old_e.size, payload + 8, payload_size - 8,
+                [&](const char* p, size_t n) { fwrite(p, 1, n, fc); cells_written += n; },
+                [&](const char* p, size_t n) { fwrite(p, 1, n, fe); });
+            bool ok = !ferror(fc) && !ferror(fe);
+            fclose(fc); fclose(fe);
+            if (old_c.data) unmap_file(old_c);
+            if (old_e.data) unmap_file(old_e);
+            if (!ok) throw std::runtime_error("Cannot write " + cells_name);
+            if (cells_written != new_size || entries_written != new_entries_size)
                 throw std::runtime_error("Rebuilt " + cells_name + " does not match the new build");
-            if (!write_file(out_path(cells_name), cells) || !write_file(out_path(entries_name), entries))
-                throw std::runtime_error("Cannot write " + cells_name);
             std::cerr << "  " << cells_name << " + " << entries_name << ": cell list delta, "
-                      << lists.size() << " cells" << std::endl;
+                      << cells_written / 12 << " cells" << std::endl;
             continue;
         }
         if (stride == SPARSE_DELTA_STRIDE) {
@@ -1042,12 +1051,17 @@ static int run(int argc, char* argv[]) {
             size_t n = cells.size() / 12;
             auto dit = cell_index_deltas.find((uint32_t)entries_fid);
             if (dit != cell_index_deltas.end()) {
-                auto lists = parse_cell_lists(cells, entries);
-                apply_cell_list_delta(lists, dit->second.data(), dit->second.size());
-                auto [new_cells, new_entries] = write_cell_lists(lists);
-                write_file(out_path(cells_name), new_cells);
-                write_file(out_path(entries_name), new_entries);
-                std::cerr << "  " << label << ": " << lists.size() << " cells, cell index delta" << std::endl;
+                FILE* fc = open_out(cells_name);
+                FILE* fe = open_out(entries_name);
+                size_t n_out = 0;
+                stream_cell_list_delta(cells.data(), cells.size(), entries.data(), entries.size(),
+                                       dit->second.data(), dit->second.size(),
+                                       [&](const char* p, size_t len) { fwrite(p, 1, len, fc); n_out += len; },
+                                       [&](const char* p, size_t len) { fwrite(p, 1, len, fe); });
+                bool ok = !ferror(fc) && !ferror(fe);
+                fclose(fc); fclose(fe);
+                if (!ok) throw std::runtime_error("Cannot write " + cells_name);
+                std::cerr << "  " << label << ": " << n_out / 12 << " cells, cell index delta" << std::endl;
                 return;
             }
             auto ecit = entry_corrections.find((uint32_t)entries_fid);
