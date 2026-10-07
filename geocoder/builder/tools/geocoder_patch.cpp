@@ -511,6 +511,29 @@ static int run(int argc, char* argv[]) {
             continue;
         }
         if (stride == LEGACY_SKIP_STRIDE) { uint32_t nf = ru32(); (void)nf; take(ru64(), "skipped section"); continue; }
+        if (stride == CELL_LIST_DELTA_STRIDE) {
+            // A cell index patched per cell; the paired entries file is
+            // rebuilt from the same lists.
+            std::string cells_name = fname;
+            const std::string suffix = "_cells.bin";
+            if (cells_name.size() < suffix.size() || cells_name.compare(cells_name.size() - suffix.size(), suffix.size(), suffix) != 0)
+                throw std::runtime_error("Cell list delta for " + cells_name);
+            std::string entries_name = cells_name.substr(0, cells_name.size() - suffix.size()) + "_entries.bin";
+            uint64_t payload_size = ru64();
+            if (payload_size < 8) throw std::runtime_error("Malformed cell list delta");
+            const char* payload = take(payload_size, "cell list delta");
+            uint64_t new_entries_size; memcpy(&new_entries_size, payload, 8);
+            auto lists = parse_cell_lists(read_file(cur_dir + "/" + cells_name), read_file(cur_dir + "/" + entries_name));
+            apply_cell_list_delta(lists, payload + 8, payload_size - 8);
+            auto [cells, entries] = write_cell_lists(lists);
+            if (cells.size() != new_size || entries.size() != new_entries_size)
+                throw std::runtime_error("Rebuilt " + cells_name + " does not match the new build");
+            if (!write_file(out_path(cells_name), cells) || !write_file(out_path(entries_name), entries))
+                throw std::runtime_error("Cannot write " + cells_name);
+            std::cerr << "  " << cells_name << " + " << entries_name << ": cell list delta, "
+                      << lists.size() << " cells" << std::endl;
+            continue;
+        }
         if (stride == SPARSE_DELTA_STRIDE) {
             // SPARSE_DELTA: position-keyed delta. Format already decoded
             // old_size + new_size above; next fields are value_stride,

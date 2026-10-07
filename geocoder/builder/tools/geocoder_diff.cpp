@@ -2232,8 +2232,42 @@ static int run(int argc, char* argv[]) {
     emit_sparse_delta(PatchFileId::WAY_POSTCODES,        "way_postcodes.bin",   4,  2);
     emit_sparse_delta(PatchFileId::INTERP_POSTCODES,     "interp_postcodes.bin", 4, 2);
     emit_sparse_delta(PatchFileId::POSTCODE_CENTROIDS,   "postcode_centroids.bin", 16, 3);
-    emit_raw(PatchFileId::POSTCODE_CENTROID_CELLS, "postcode_centroid_cells.bin");
-    emit_raw(PatchFileId::POSTCODE_CENTROID_ENTRIES, "postcode_centroid_entries.bin");
+    // A cell index whose ids are strategy-2 slots barely changes day to day:
+    // send the cells that lost or gained ids instead of both files.
+    // Full-replacing postcode_centroid_* cost ~3.7 MiB per planet mode dir.
+    auto emit_cell_index = [&](PatchFileId cells_fid, const std::string& cells_name,
+                               PatchFileId entries_fid, const std::string& entries_name) {
+        struct stat st;
+        bool present = stat((old_dir + "/" + cells_name).c_str(), &st) == 0 &&
+                       stat((old_dir + "/" + entries_name).c_str(), &st) == 0 &&
+                       stat((new_dir + "/" + cells_name).c_str(), &st) == 0 &&
+                       stat((new_dir + "/" + entries_name).c_str(), &st) == 0;
+        if (present) {
+            auto old_c = read_file(old_dir + "/" + cells_name), old_e = read_file(old_dir + "/" + entries_name);
+            auto new_c = read_file(new_dir + "/" + cells_name), new_e = read_file(new_dir + "/" + entries_name);
+            auto new_lists = parse_cell_lists(new_c, new_e);
+            bool unchanged = old_c == new_c && old_e == new_e;
+            // Only a layout write_cell_lists reproduces byte for byte can be rebuilt.
+            if (!unchanged && write_cell_lists(new_lists) == std::make_pair(new_c, new_e)) {
+                std::vector<char> payload;
+                uint64_t new_entries_size = new_e.size();
+                payload.insert(payload.end(), (const char*)&new_entries_size, (const char*)&new_entries_size + 8);
+                append_cell_list_delta(payload, parse_cell_lists(old_c, old_e), new_lists);
+                uint32_t fid = static_cast<uint32_t>(cells_fid), stride = CELL_LIST_DELTA_STRIDE;
+                uint64_t old_size = old_c.size(), new_size = new_c.size(), payload_size = payload.size();
+                wval(patch, &fid, 4); wval(patch, &stride, 4);
+                wval(patch, &old_size, 8); wval(patch, &new_size, 8); wval(patch, &payload_size, 8);
+                patch.insert(patch.end(), payload.begin(), payload.end());
+                std::cerr << "  " << cells_name << " + " << entries_name << ": cell list delta "
+                          << payload_size << " bytes vs " << new_c.size() + new_e.size() << " full" << std::endl;
+                return;
+            }
+        }
+        emit_raw(cells_fid, cells_name);
+        emit_raw(entries_fid, entries_name);
+    };
+    emit_cell_index(PatchFileId::POSTCODE_CENTROID_CELLS, "postcode_centroid_cells.bin",
+                    PatchFileId::POSTCODE_CENTROID_ENTRIES, "postcode_centroid_entries.bin");
     // Postal polygons are the admin_level 11 copies of admin polygons, in
     // slot order with their own packed vertex stream, so they merge like
     // admin_polygons / admin_vertices. Full-replacing them re-sent ~92 MiB

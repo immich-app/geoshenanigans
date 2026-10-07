@@ -8,6 +8,8 @@
 #include <fcntl.h>
 #include <fstream>
 #include <iostream>
+#include <iterator>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <sys/mman.h>
@@ -396,6 +398,15 @@ constexpr uint32_t COPY_OLD_STRIDE = 0xFD;
 // nothing). Consumed by geocoder-patch; not emitted by the current diff.
 constexpr uint32_t LEGACY_SKIP_STRIDE = 0xFE;
 
+// Stride sentinel: a cell index (<name>_cells.bin + <name>_entries.bin)
+// patched per cell. Strategy-2 ids keep most lists unchanged day to day, so
+// only the cells that lost or gained ids travel. The section names the cells
+// file and the patcher writes both files.
+//   file_id(u32), stride = CELL_LIST_DELTA_STRIDE (u32),
+//   old_size(u64), new_size(u64) of the cells file,
+//   payload_size(u64), new entries size(u64), append_cell_list_delta bytes.
+constexpr uint32_t CELL_LIST_DELTA_STRIDE = 0xFB;
+
 // POI parent-id remap marker: 0xFFFFFFF3
 // Carries the full primary+secondary admin-polygon, street-way, and
 // postcode-centroid old→new ID remap that the diff side applied to old
@@ -739,6 +750,110 @@ inline RebuiltCells rebuild_cells_from_remap(
         result.cells_data.insert(result.cells_data.end(), (const char*)&off, (const char*)&off + 4);
     }
     return result;
+}
+
+// --- Cell index as per-cell id lists (CELL_LIST_DELTA_STRIDE) ---
+
+// cell_id → its ids (sorted), in cell order.
+using CellLists = std::map<uint64_t, std::vector<uint32_t>>;
+
+inline CellLists parse_cell_lists(const std::vector<char>& cells, const std::vector<char>& entries) {
+    CellLists out;
+    for (size_t i = 0; i + 12 <= cells.size(); i += 12) {
+        uint64_t cid; uint32_t off;
+        memcpy(&cid, cells.data() + i, 8);
+        memcpy(&off, cells.data() + i + 8, 4);
+        auto& ids = out[cid];
+        if (off == 0xFFFFFFFF) continue;
+        uint16_t n;
+        if ((size_t)off + 2 > entries.size()) throw std::runtime_error("Malformed cell index");
+        memcpy(&n, entries.data() + off, 2);
+        if ((size_t)off + 2 + (size_t)n * 4 > entries.size()) throw std::runtime_error("Malformed cell index");
+        ids.resize(n);
+        memcpy(ids.data(), entries.data() + off + 2, (size_t)n * 4);
+    }
+    return out;
+}
+
+// The bytes write_cell_index writes for these lists: (cells, entries).
+inline std::pair<std::vector<char>, std::vector<char>> write_cell_lists(const CellLists& lists) {
+    std::pair<std::vector<char>, std::vector<char>> out;
+    auto& [cells, entries] = out;
+    for (const auto& [cid, ids] : lists) {
+        if (ids.size() > 0xFFFF) throw std::runtime_error("Cell holds more than 65535 entries");
+        uint32_t off = static_cast<uint32_t>(entries.size());
+        uint16_t n = static_cast<uint16_t>(ids.size());
+        cells.insert(cells.end(), (const char*)&cid, (const char*)&cid + 8);
+        cells.insert(cells.end(), (const char*)&off, (const char*)&off + 4);
+        entries.insert(entries.end(), (const char*)&n, (const char*)&n + 2);
+        entries.insert(entries.end(), (const char*)ids.data(), (const char*)ids.data() + ids.size() * 4);
+    }
+    return out;
+}
+
+// Removed cells (u32 n, u64 each), then every cell that is new or whose list
+// changed (u32 n, then u64 cell, u32 n_lost, u32 n_gained, lost ids, gained ids).
+inline void append_cell_list_delta(std::vector<char>& out, const CellLists& old_lists, const CellLists& new_lists) {
+    auto put = [&](const void* p, size_t n) { out.insert(out.end(), (const char*)p, (const char*)p + n); };
+    std::vector<uint64_t> removed;
+    for (const auto& kv : old_lists)
+        if (!new_lists.count(kv.first)) removed.push_back(kv.first);
+    uint32_t n_removed = static_cast<uint32_t>(removed.size());
+    put(&n_removed, 4);
+    put(removed.data(), removed.size() * 8);
+
+    const std::vector<uint32_t> none;
+    std::vector<char> sets;
+    uint32_t n_set = 0;
+    for (const auto& [cid, ids] : new_lists) {
+        auto it = old_lists.find(cid);
+        if (it != old_lists.end() && it->second == ids) continue;
+        const auto& was = it != old_lists.end() ? it->second : none;
+        std::vector<uint32_t> lost, gained;
+        std::set_difference(was.begin(), was.end(), ids.begin(), ids.end(), std::back_inserter(lost));
+        std::set_difference(ids.begin(), ids.end(), was.begin(), was.end(), std::back_inserter(gained));
+        uint32_t nl = static_cast<uint32_t>(lost.size()), ng = static_cast<uint32_t>(gained.size());
+        sets.insert(sets.end(), (const char*)&cid, (const char*)&cid + 8);
+        sets.insert(sets.end(), (const char*)&nl, (const char*)&nl + 4);
+        sets.insert(sets.end(), (const char*)&ng, (const char*)&ng + 4);
+        sets.insert(sets.end(), (const char*)lost.data(), (const char*)lost.data() + lost.size() * 4);
+        sets.insert(sets.end(), (const char*)gained.data(), (const char*)gained.data() + gained.size() * 4);
+        n_set++;
+    }
+    put(&n_set, 4);
+    out.insert(out.end(), sets.begin(), sets.end());
+}
+
+inline void apply_cell_list_delta(CellLists& lists, const char* data, size_t size) {
+    size_t pos = 0;
+    auto take = [&](void* dst, size_t n) {
+        if (size - pos < n) throw std::runtime_error("Malformed cell list delta");
+        memcpy(dst, data + pos, n);
+        pos += n;
+    };
+    uint32_t n_removed;
+    take(&n_removed, 4);
+    for (uint32_t i = 0; i < n_removed; i++) {
+        uint64_t cid;
+        take(&cid, 8);
+        lists.erase(cid);
+    }
+    uint32_t n_set;
+    take(&n_set, 4);
+    for (uint32_t i = 0; i < n_set; i++) {
+        uint64_t cid; uint32_t nl, ng;
+        take(&cid, 8); take(&nl, 4); take(&ng, 4);
+        if ((size - pos) / 4 < (size_t)nl + ng) throw std::runtime_error("Malformed cell list delta");
+        std::vector<uint32_t> lost(nl), gained(ng);
+        take(lost.data(), (size_t)nl * 4);
+        take(gained.data(), (size_t)ng * 4);
+        auto& ids = lists[cid];
+        std::vector<uint32_t> kept;
+        std::set_difference(ids.begin(), ids.end(), lost.begin(), lost.end(), std::back_inserter(kept));
+        ids.clear();
+        std::merge(kept.begin(), kept.end(), gained.begin(), gained.end(), std::back_inserter(ids));
+    }
+    if (pos != size) throw std::runtime_error("Malformed cell list delta");
 }
 
 // --- Varint encoding for delta-compressed fixup tables ---

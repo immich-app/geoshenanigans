@@ -131,10 +131,14 @@ TEST(patch_format_stride_sentinels_distinct) {
     CHECK(SPARSE_DELTA_STRIDE != COPY_OLD_STRIDE);
     CHECK(SPARSE_DELTA_STRIDE != LEGACY_SKIP_STRIDE);
     CHECK(COPY_OLD_STRIDE != LEGACY_SKIP_STRIDE);
+    CHECK(CELL_LIST_DELTA_STRIDE != SPARSE_DELTA_STRIDE);
+    CHECK(CELL_LIST_DELTA_STRIDE != COPY_OLD_STRIDE);
+    CHECK(CELL_LIST_DELTA_STRIDE != LEGACY_SKIP_STRIDE);
     // Current concrete values (locked in).
     CHECK_EQ(SPARSE_DELTA_STRIDE, uint32_t(0xFC));
     CHECK_EQ(COPY_OLD_STRIDE, uint32_t(0xFD));
     CHECK_EQ(LEGACY_SKIP_STRIDE, uint32_t(0xFE));
+    CHECK_EQ(CELL_LIST_DELTA_STRIDE, uint32_t(0xFB));
 }
 
 TEST(patch_format_stride_sentinels_no_collision_with_real_strides) {
@@ -160,6 +164,7 @@ TEST(patch_format_stride_sentinels_no_collision_with_real_strides) {
         CHECK(s != SPARSE_DELTA_STRIDE);
         CHECK(s != COPY_OLD_STRIDE);
         CHECK(s != LEGACY_SKIP_STRIDE);
+        CHECK(s != CELL_LIST_DELTA_STRIDE);
     }
 }
 
@@ -453,4 +458,46 @@ TEST(patch_format_rebuild_cells_remaps_interior_entries) {
     const std::unordered_map<uint32_t, uint32_t> rm = {{3, 2}, {5, 4}};
     auto rebuilt = rebuild_cells_from_remap(cells, entries, rm);
     CHECK(ids_of_first_cell(rebuilt.cells_data, rebuilt.entries_data) == std::vector<uint32_t>({4, 2 | interior}));
+}
+
+// --- cell list delta ---
+
+TEST(patch_format_cell_lists_write_the_cell_index_layout) {
+    // Cells sorted by id with contiguous entry offsets; entries are
+    // (u16 count, ids). Matches write_cell_index.
+    auto [cells, entries] = write_cell_lists({{9, {4}}, {7, {1, 2}}});
+    auto [one_c, one_e] = one_cell(7, {1, 2});
+    CHECK(std::vector<char>(cells.begin(), cells.begin() + 12) == one_c);
+    CHECK(std::vector<char>(entries.begin(), entries.begin() + 10) == one_e);
+    uint64_t second; std::memcpy(&second, cells.data() + 12, 8);
+    uint32_t off; std::memcpy(&off, cells.data() + 20, 4);
+    CHECK_EQ(second, uint64_t(9));
+    CHECK_EQ(off, uint32_t(10));
+    CHECK(parse_cell_lists(cells, entries) == CellLists({{7, {1, 2}}, {9, {4}}}));
+}
+
+TEST(patch_format_cell_list_delta_round_trip) {
+    const CellLists old_lists = {{1, {10, 11}}, {2, {20, 21, 22}}, {3, {30}}, {5, {50}}};
+    const CellLists new_lists = {{1, {10, 11}}, {2, {20, 22, 23}}, {4, {40, 41}}, {5, {}}};
+    std::vector<char> delta;
+    append_cell_list_delta(delta, old_lists, new_lists);
+    CellLists got = old_lists;
+    apply_cell_list_delta(got, delta.data(), delta.size());
+    CHECK(got == new_lists);
+    // Unchanged cells don't travel: 3 removed, 2 / 4 / 5 set, 1 skipped.
+    uint32_t n_removed; std::memcpy(&n_removed, delta.data(), 4);
+    uint32_t n_set; std::memcpy(&n_set, delta.data() + 4 + n_removed * 8, 4);
+    CHECK_EQ(n_removed, uint32_t(1));
+    CHECK_EQ(n_set, uint32_t(3));
+}
+
+TEST(patch_format_cell_list_delta_rejects_truncation) {
+    std::vector<char> delta;
+    append_cell_list_delta(delta, {{1, {10}}}, {{1, {11}}});
+    for (size_t cut = 0; cut < delta.size(); cut++) {
+        CellLists lists = {{1, {10}}};
+        bool threw = false;
+        try { apply_cell_list_delta(lists, delta.data(), cut); } catch (const std::runtime_error&) { threw = true; }
+        CHECK(threw);
+    }
 }
