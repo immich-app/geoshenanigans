@@ -1851,8 +1851,9 @@ static int run(int argc, char* argv[]) {
     std::cerr << "  RSS after geo corrections: " << get_rss_mb() << " MiB" << std::endl;
 
     // Corrections for a cell index the patcher rebuilds from an id remap
-    // (admin / POI / place): every cell whose rebuilt list differs from the
-    // new build's travels with its new list.
+    // (admin / POI / place): a per-cell delta from the rebuilt lists, or, for
+    // a layout write_cell_lists can't reproduce, every cell whose rebuilt
+    // list differs with its new list.
     auto emit_cell_corrections = [&](PatchFileId entries_fid, const std::string& prefix,
                                      const std::unordered_map<uint32_t,uint32_t>& rm,
                                      const std::vector<uint64_t>& added, const std::vector<uint64_t>& removed) {
@@ -1861,6 +1862,17 @@ static int run(int argc, char* argv[]) {
         auto derived = rebuild_cells_from_remap(old_c, old_e, rm, added, removed);
         auto new_c = read_file(new_dir + "/" + prefix + "_cells.bin");
         auto new_e = read_file(new_dir + "/" + prefix + "_entries.bin");
+        auto new_lists = parse_cell_lists(new_c, new_e);
+        if (write_cell_lists(new_lists) == std::make_pair(new_c, new_e)) {
+            std::vector<char> payload;
+            append_cell_list_delta(payload, parse_cell_lists(derived.cells_data, derived.entries_data), new_lists);
+            uint32_t marker = CELL_INDEX_DELTA_MARKER, file = static_cast<uint32_t>(entries_fid);
+            uint64_t size = payload.size();
+            wval(patch, &marker, 4); wval(patch, &file, 4); wval(patch, &size, 8);
+            patch.insert(patch.end(), payload.begin(), payload.end());
+            std::cerr << "  " << prefix << "_entries.bin: cell index delta (" << size << " bytes)" << std::endl;
+            return;
+        }
         auto parse = [&](const std::vector<char>& cells, const std::vector<char>& entries)
             -> std::unordered_map<uint64_t, std::vector<uint32_t>> {
             std::unordered_map<uint64_t, std::vector<uint32_t>> m;

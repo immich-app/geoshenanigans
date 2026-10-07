@@ -206,6 +206,11 @@ Cell Flag Corrections: marker 0xFFFFFFF9 (u32) + count (u32)
 Entry Corrections: marker 0xFFFFFFF8 (u32) + file_id (u32) + count (u32)
   + [(cell_id:u64, entry_count:u16, [id:u32] × entry_count)] × count
 
+Cell Index Delta: marker 0xFFFFFFF7 (u32) + file_id (u32, the entries file)
+  + payload_size (u64) + the cell list delta from the rebuilt admin / POI /
+  place index to the new one (same layout as stride=0xFB); replaces Entry
+  Corrections for that file
+
 End marker: 0xFFFFFFFF (u32)
 ```
 

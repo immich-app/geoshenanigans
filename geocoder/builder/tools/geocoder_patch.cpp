@@ -318,6 +318,8 @@ static int run(int argc, char* argv[]) {
     std::unordered_map<uint64_t, uint8_t> flag_corrections;
     struct CellCorr { uint64_t cell_id; std::vector<uint32_t> ids; };
     std::unordered_map<uint32_t, std::vector<CellCorr>> entry_corrections;
+    // CELL_INDEX_DELTA payloads by entries file id (admin / POI / place).
+    std::unordered_map<uint32_t, std::vector<char>> cell_index_deltas;
     // POI parent-id remap (from POI_PARENT_REMAP_MARKER). Applied during
     // POI_RECORDS MATCH replay to bytes 24/28/32 of each record alongside
     // the str_remap on byte 16. Sorted by old_id for binary-search lookup.
@@ -452,6 +454,14 @@ static int run(int argc, char* argv[]) {
             std::cerr << "  POI parent-id remap: admin_pairs=" << na
                       << " street_pairs=" << ns
                       << " postcode_pairs=" << np << std::endl;
+            continue;
+        }
+        if (file_id == CELL_INDEX_DELTA_MARKER) {
+            uint32_t fid = ru32();
+            uint64_t n = ru64();
+            const char* p = take(n, "cell index delta");
+            cell_index_deltas[fid].assign(p, p + n);
+            std::cerr << "  Cell index delta " << fid << ": " << n << " bytes" << std::endl;
             continue;
         }
         if (file_id == ENTRY_CORRECTION_MARKER) {
@@ -1030,6 +1040,16 @@ static int run(int argc, char* argv[]) {
                                          const std::string& cells_name, const std::string& entries_name) {
             constexpr uint32_t no_data = 0xFFFFFFFF;
             size_t n = cells.size() / 12;
+            auto dit = cell_index_deltas.find((uint32_t)entries_fid);
+            if (dit != cell_index_deltas.end()) {
+                auto lists = parse_cell_lists(cells, entries);
+                apply_cell_list_delta(lists, dit->second.data(), dit->second.size());
+                auto [new_cells, new_entries] = write_cell_lists(lists);
+                write_file(out_path(cells_name), new_cells);
+                write_file(out_path(entries_name), new_entries);
+                std::cerr << "  " << label << ": " << lists.size() << " cells, cell index delta" << std::endl;
+                return;
+            }
             auto ecit = entry_corrections.find((uint32_t)entries_fid);
             if (ecit == entry_corrections.end()) {
                 write_file(out_path(cells_name), cells);

@@ -307,6 +307,15 @@ static constexpr uint32_t CELL_CHANGES_PLACE_MARKER = 0xFFFFFFF4;
 // binary-searches the cells file for it.
 static constexpr uint32_t ENTRY_CORRECTION_MARKER = 0xFFFFFFF8;
 
+// Cell index delta marker: 0xFFFFFFF7
+// An admin / POI / place cell index the patcher rebuilds from its id remap,
+// corrected per cell instead of by ENTRY_CORRECTION: a corrected cell costs
+// the ids it lost and gained, not its whole list. Sent when write_cell_lists
+// reproduces the new index byte for byte.
+// Format: marker(4), file_id(4) = the entries file, payload_size(u64),
+//   append_cell_list_delta(rebuilt → new) bytes.
+static constexpr uint32_t CELL_INDEX_DELTA_MARKER = 0xFFFFFFF7;
+
 // Cell flag corrections marker: 0xFFFFFFF9
 // Format: marker, count(u32), [(cell_id:u64, flags:u8)] × count
 // flags: bit 0 = has_street, bit 1 = has_addr, bit 2 = has_interp
