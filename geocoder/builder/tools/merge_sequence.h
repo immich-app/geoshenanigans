@@ -68,37 +68,47 @@ MergeSequence merge_child_blocks(const MergeSequence& parent_seq, size_t parent_
     };
     auto in_old = [&](const ChildBlock& b) { return b.off + b.size <= old_child_size; };
     auto in_new = [&](const ChildBlock& b) { return b.off + b.size <= new_child_size; };
+    auto drop = [&](const ChildBlock& ob) { if (ob.size > 0) emit_del(ob.size); };
+    auto append = [&](const ChildBlock& nb) { if (nb.size > 0 && in_new(nb)) emit_ins(nb); };
+    auto keep_or_replace = [&](const ChildBlock& ob, const ChildBlock& nb) {
+        bool same = ob.size == nb.size && in_old(ob) && in_new(nb)
+                    && (ob.size == 0 || memcmp(old_child + ob.off, new_child + nb.off, ob.size) == 0);
+        if (same) {
+            if (ob.size > 0) emit_match(ob.size);
+        } else {
+            drop(ob);
+            append(nb);
+        }
+    };
 
     size_t oi = 0, ni = 0, pos = 0;
     while (pos < parent_seq.data.size()) {
         uint8_t op = static_cast<uint8_t>(parent_seq.data[pos]); pos++;
         uint32_t count; memcpy(&count, parent_seq.data.data() + pos, 4); pos += 4;
         if (op == OP_MATCH_RUN) {
-            for (uint32_t k = 0; k < count; k++) {
-                ChildBlock ob = old_block(oi + k), nb = new_block(ni + k);
-                bool same = ob.size == nb.size && in_old(ob) && in_new(nb)
-                            && (ob.size == 0 || memcmp(old_child + ob.off, new_child + nb.off, ob.size) == 0);
-                if (same) {
-                    if (ob.size > 0) emit_match(ob.size);
-                } else {
-                    if (ob.size > 0) emit_del(ob.size);
-                    if (nb.size > 0) emit_ins(nb);
-                }
-            }
+            for (uint32_t k = 0; k < count; k++) keep_or_replace(old_block(oi + k), new_block(ni + k));
             oi += count; ni += count;
         } else if (op == OP_INSERT_RUN) {
-            for (uint32_t k = 0; k < count; k++) {
-                ChildBlock nb = new_block(ni + k);
-                if (nb.size > 0 && in_new(nb)) emit_ins(nb);
-            }
+            for (uint32_t k = 0; k < count; k++) append(new_block(ni + k));
             pos += (size_t)count * parent_stride;  // skip the inline parent records
             ni += count;
         } else if (op == OP_DELETE_RUN) {
-            for (uint32_t k = 0; k < count; k++) {
-                ChildBlock ob = old_block(oi + k);
-                if (ob.size > 0) emit_del(ob.size);
-            }
+            // A replaced record (DELETE then INSERT) mostly keeps its
+            // geometry (a renamed road, a re-tagged POI): pair the two runs
+            // positionally so an unchanged block stays a MATCH instead of
+            // being re-sent.
+            uint32_t ins = 0;
+            if (pos < parent_seq.data.size() && static_cast<uint8_t>(parent_seq.data[pos]) == OP_INSERT_RUN)
+                memcpy(&ins, parent_seq.data.data() + pos + 1, 4);
+            uint32_t paired = std::min(count, ins);
+            for (uint32_t k = 0; k < paired; k++) keep_or_replace(old_block(oi + k), new_block(ni + k));
+            for (uint32_t k = paired; k < count; k++) drop(old_block(oi + k));
             oi += count;
+            if (ins > 0) {
+                for (uint32_t k = paired; k < ins; k++) append(new_block(ni + k));
+                pos += 5 + (size_t)ins * parent_stride;  // the INSERT op and its inline records
+                ni += ins;
+            }
         }
     }
     flush_match(); flush_del(); flush_ins();

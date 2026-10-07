@@ -72,6 +72,18 @@ TEST(merge_child_blocks_follows_inserted_and_deleted_parents) {
     CHECK(got == want);
 }
 
+TEST(merge_child_blocks_replaced_records_keep_unchanged_blocks) {
+    // A renamed road or re-tagged POI is a DELETE+INSERT of its record; its
+    // geometry block is the same bytes and stays a MATCH.
+    MergeSequence parent;
+    parent.add_delete(3);
+    parent.add_insert(PARENT, 2, PARENT_STRIDE);
+    Stream old_s{"AAAABBBBZZ", {{0, 4}, {4, 4}, {8, 2}}}, new_s{"AAAACCCC", {{0, 4}, {4, 4}}};
+    auto got = ops_of(merge(parent, old_s, new_s), 1);
+    std::vector<Op> want = {{OP_MATCH_RUN, 4, ""}, {OP_DELETE_RUN, 6, ""}, {OP_INSERT_RUN, 4, "CCCC"}};
+    CHECK(got == want);
+}
+
 TEST(merge_child_blocks_coalesces_runs_and_skips_empty_blocks) {
     // Point records (empty blocks) between polygons don't split the runs.
     MergeSequence parent;
