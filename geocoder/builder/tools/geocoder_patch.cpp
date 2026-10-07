@@ -813,6 +813,8 @@ static int run(int argc, char* argv[]) {
                 written += bytes; pos += bytes; new_rec += count;
             } else if (op == OP_DELETE_RUN) {
                 old_rec += count; old_bytes += count * actual_stride;
+            } else {
+                throw std::runtime_error(std::string("Malformed merge sequence: ") + fname);
             }
         }
         fclose(outf);
