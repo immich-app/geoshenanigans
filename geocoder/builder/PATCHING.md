@@ -11,14 +11,44 @@ in sequence and arrive at output **byte-identical** to a fresh build.
 ### What Works
 - **Deterministic builds**: Same PBF always produces byte-identical output (verified on Germany, Europe, and Planet)
 - **Single-patch application**: Verified on both Europe and Planet — all 14 files byte-identical
-- **Sequential patching**: Verified on planet with 3 distinct weekly snapshots (Mar 9 → Mar 16 → Mar 23) — **PASS**
+- **Sequential patching**: Verified on planet with 3 distinct weekly snapshots (Mar 9 → Mar 16 → Mar 23) — **PASS**; with the v5 tools on three daily planets (Oct 4 → 5 → 6), every variant applied stacked in a client-shaped tree — **PASS** (126/126)
 - **Custom patch format**: Merge sequences, string-level diffs, parent-aware coordinate merges, secondary ID matching, cell corrections — fully custom diff/apply logic (only zstd for transport compression)
 
 ### What Needs Work
-- **Sequential test with optimized diff**: The sequential test used the old diff tool; need to re-run with all optimizations (delta fixups + secondary matching)
 - **Code cleanup**: Legacy dead code block in geocoder_patch.cpp, prototype files
 
 ## Tested Patch Sizes
+
+### One day on planet (2026-10-05 → 10-06, GCPATCH v5)
+
+Compressed `.gcpatch` bytes a client downloads for one day of OSM edits, per
+selection (sum of its variant dirs). Every patch rebuilds the new day
+byte-identically, alone and stacked on the previous day's patch. "Before"
+is the v4 tools on the same data.
+
+| Selection | Before | v5 |
+|-----------|--------|----|
+| planet full + q2.5 + poi/all | 173.5 MiB | **4.76 MiB** |
+| planet full + uncapped + poi/all | 253.8 MiB | **5.56 MiB** |
+| planet admin + q2.5 + poi/major | 65.6 MiB | **0.45 MiB** |
+| planet admin-minimal | 48.2 MiB | **0.61 MiB** |
+| europe full + q2.5 + poi/all | 74.5 MiB | **2.16 MiB** |
+| europe admin + q2.5 + poi/major | 28.8 MiB | **0.15 MiB** |
+| north-america no-addresses + q2.5 | 9.6 MiB | **0.47 MiB** |
+| all 126 variant dirs (what CI uploads) | 1094 MiB | **20.9 MiB** |
+
+Most of the old bytes were bookkeeping the patcher can derive:
+- offset fixups travel as runs of one shift (one edit shifts every later
+  node_offset / vertex_offset by the same amount)
+- place nodes and postal polygons merge instead of being re-sent whole
+- the postcode centroid cell index and the admin / POI / place corrections
+  travel as per-cell lost / gained ids
+- a replaced record keeps its unchanged geometry, an edited one keeps its
+  unchanged head and tail
+- far merge jumps need a run of matches behind them (duplicates no longer
+  re-send thousands of records); POI entries remap their interior flag
+
+The tables below predate these changes.
 
 ### Europe (7 GiB dataset)
 
