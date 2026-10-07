@@ -551,6 +551,19 @@ static void fixup_interp_offsets(char* old_data, size_t old_size,
     }
 }
 
+// (record index, fixed offset) for every old record whose offset field at
+// `field` a fixup pass above rewrote; old_offsets holds the field from before
+// the pass.
+static std::vector<std::pair<uint32_t,uint32_t>> collect_offset_fixups(
+        const std::vector<uint32_t>& old_offsets, const char* fixed, size_t stride, size_t field) {
+    std::vector<std::pair<uint32_t,uint32_t>> fixups;
+    for (size_t i = 0; i < old_offsets.size(); i++) {
+        uint32_t off; memcpy(&off, fixed + i * stride + field, 4);
+        if (off != old_offsets[i]) fixups.push_back({static_cast<uint32_t>(i), off});
+    }
+    return fixups;
+}
+
 // --- Secondary matching for modified records ---
 // After the merge sequence is built, match DELETE'd and INSERT'd records by a
 // relaxed key to recover ID mappings for records that changed (e.g. geometry edit)
@@ -1293,16 +1306,8 @@ static int run(int argc, char* argv[]) {
         // (it reads raw OLD from disk; without the fixup the reconstructed
         // bytes would carry OLD's vertex_offset instead of NEW's, mismatching
         // the new file).
-        std::vector<std::pair<uint32_t,uint32_t>> addr_fixups;
-        if (addr_stride >= 28 && !old_vert_offsets.empty()) {
-            size_t n_old = old_m.size / addr_stride;
-            for (size_t i = 0; i < n_old; i++) {
-                uint32_t new_off;
-                memcpy(&new_off, old_m.data + i * addr_stride + 20, 4);
-                if (new_off != old_vert_offsets[i])
-                    addr_fixups.push_back({static_cast<uint32_t>(i), new_off});
-            }
-        }
+        auto addr_fixups = collect_offset_fixups(old_vert_offsets, old_m.data, addr_stride,
+                                                 ADDR_POINT_VERTEX_OFFSET_OFF);
         res_addr = {PatchFileId::ADDR_POINTS, "addr_points.bin", addr_stride,
                     old_m.size, new_m.size, std::move(seq), std::move(addr_fixups),
                     std::move(soft), std::move(id_rm)};
@@ -1389,11 +1394,7 @@ static int run(int argc, char* argv[]) {
         for (size_t i = 0; i < wn; i++) memcpy(&old_offsets[i], old_w.data + i * way_stride, 4);
         fixup_way_offsets(old_w.data, old_w.size, old_n.data, old_n.size,
                           new_w.data, new_w.size, new_n.data, new_n.size, way_stride);
-        std::vector<std::pair<uint32_t,uint32_t>> fixups;
-        for (size_t i = 0; i < wn; i++) {
-            uint32_t new_off; memcpy(&new_off, old_w.data + i * way_stride, 4);
-            if (new_off != old_offsets[i]) fixups.push_back({static_cast<uint32_t>(i), new_off});
-        }
+        auto fixups = collect_offset_fixups(old_offsets, old_w.data, way_stride, 0);
         auto way_seq = build_merge_seq(old_w.data, old_w.size, new_w.data, new_w.size, way_stride);
         size_t way_name_off = (way_stride == 12) ? 8 : 5;
         auto soft = secondary_match_from_merge(way_seq, old_w.data, old_w.size, new_w.data, new_w.size, way_stride,
@@ -1454,11 +1455,7 @@ static int run(int argc, char* argv[]) {
         for (size_t i = 0; i < n; i++) memcpy(&old_offsets[i], old_data.data + i * interp_stride, 4);
         fixup_interp_offsets(old_data.data, old_data.size, old_n.data, old_n.size,
                              new_data.data, new_data.size, new_n.data, new_n.size, interp_stride);
-        std::vector<std::pair<uint32_t,uint32_t>> fixups;
-        for (size_t i = 0; i < n; i++) {
-            uint32_t new_off; memcpy(&new_off, old_data.data + i * interp_stride, 4);
-            if (new_off != old_offsets[i]) fixups.push_back({static_cast<uint32_t>(i), new_off});
-        }
+        auto fixups = collect_offset_fixups(old_offsets, old_data.data, interp_stride, 0);
         auto iw_seq = build_merge_seq(old_data.data, old_data.size, new_data.data, new_data.size, interp_stride);
         size_t ist_off = (interp_stride >= 20) ? 8 : 5;
         auto soft = secondary_match_from_merge(iw_seq, old_data.data, old_data.size, new_data.data, new_data.size, interp_stride,
@@ -1530,11 +1527,7 @@ static int run(int argc, char* argv[]) {
                               uint64_t k = ((uint64_t)name_id << 24) | ((uint64_t)level << 16) | cc;
                               return k ^ ((uint64_t)vert_count << 40);
                           });
-        std::vector<std::pair<uint32_t,uint32_t>> fixups;
-        for (size_t i = 0; i < n; i++) {
-            uint32_t new_off; memcpy(&new_off, old_data.data + i * admin_stride, 4);
-            if (new_off != old_offsets[i]) fixups.push_back({static_cast<uint32_t>(i), new_off});
-        }
+        auto fixups = collect_offset_fixups(old_offsets, old_data.data, admin_stride, 0);
         auto ap_seq = build_merge_seq(old_data.data, old_data.size, new_data.data, new_data.size, admin_stride);
         auto soft = secondary_match_from_merge(ap_seq, old_data.data, old_data.size, new_data.data, new_data.size, admin_stride,
             [](const char* rec) -> uint64_t {
@@ -1663,11 +1656,7 @@ static int run(int argc, char* argv[]) {
                                   return ((uint64_t)name_id << 16) | ((uint64_t)cat << 8) | (vert_count & 0xff);
                               });
         }
-        std::vector<std::pair<uint32_t,uint32_t>> fixups;
-        for (size_t i = 0; i < n; i++) {
-            uint32_t new_off; memcpy(&new_off, old_data.data + i * poi_stride + 8, 4);
-            if (new_off != old_offsets[i]) fixups.push_back({static_cast<uint32_t>(i), new_off});
-        }
+        auto fixups = collect_offset_fixups(old_offsets, old_data.data, poi_stride, POI_RECORD_VERTEX_OFFSET_OFF);
         auto pr_seq = build_merge_seq(old_data.data, old_data.size,
                                        new_data.data, new_data.size, poi_stride);
         auto soft = secondary_match_from_merge(pr_seq, old_data.data, old_data.size,
@@ -2554,11 +2543,7 @@ static int run(int argc, char* argv[]) {
                                   uint64_t k = ((uint64_t)name_id << 24) | ((uint64_t)level << 16) | cc;
                                   return k ^ ((uint64_t)vert_count << 40);
                               });
-            std::vector<std::pair<uint32_t,uint32_t>> fixups;
-            for (size_t i = 0; i < n; i++) {
-                uint32_t moved; memcpy(&moved, old_p.data + i * stride, 4);
-                if (moved != old_offsets[i]) fixups.push_back({static_cast<uint32_t>(i), moved});
-            }
+            auto fixups = collect_offset_fixups(old_offsets, old_p.data, stride, 0);
             auto seq = build_merge_seq(old_p.data, old_p.size, new_p.data, new_p.size, stride);
             // The vertex merge reads each polygon's bytes at its original offset.
             for (size_t i = 0; i < n; i++) memcpy(old_p.data + i * stride, &old_offsets[i], 4);
