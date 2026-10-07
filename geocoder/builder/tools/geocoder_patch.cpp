@@ -700,22 +700,18 @@ static int run(int argc, char* argv[]) {
             uint8_t op = P[pos++];
             uint32_t count; memcpy(&count, P+pos, 4); pos += 4;
             if (op == OP_MATCH_RUN) {
-                // Fast path: byte streams (stride=1) with no per-record
-                // transforms become a single bulk fwrite of `count` bytes
-                // from old. Used by admin_vertices / poi_vertices /
-                // addr_vertices byte-block merges where each MATCH spans
-                // a whole polygon footprint (often dozens to thousands
-                // of bytes). The per-byte loop below would do `count`
-                // fwrite calls each writing 1 byte — fine for tiny
-                // files but catastrophic at planet/full's 3.4 GiB
-                // addr_vertices.
-                if (actual_stride == 1 && !needs_remap && !needs_padding
-                    && remap_offs.empty() && !has_fixups) {
-                    if (old_bytes + count <= old_mmap.size) {
-                        fwrite(old_mmap.data + old_bytes, 1, count, outf);
-                    }
-                    written += count;
-                    old_rec += count; new_rec += count; old_bytes += count;
+                // Fast path: files with no per-record transform (the
+                // *_vertices byte streams, street_nodes / interp_nodes)
+                // copy the whole run from old in one fwrite. The record
+                // loop below costs one fwrite per record: one per byte
+                // of planet/full's 3.4 GiB addr_vertices, one per node
+                // of its 600M street_nodes.
+                size_t run_bytes = (size_t)count * actual_stride;
+                if (!needs_remap && !needs_padding && remap_offs.empty() && !has_fixups
+                    && old_bytes + run_bytes <= old_mmap.size) {
+                    fwrite(old_mmap.data + old_bytes, 1, run_bytes, outf);
+                    written += run_bytes;
+                    old_rec += count; new_rec += count; old_bytes += run_bytes;
                     continue;
                 }
                 for (uint32_t k = 0; k < count; k++) {
