@@ -28,10 +28,10 @@
 #include <unistd.h>
 #include <vector>
 
+#include "merge_sequence.h"
 #include "patch_format.h"
 #include "scratch_dir.h"
 
-enum MergeOp : uint8_t { OP_MATCH_RUN = 0, OP_INSERT_RUN = 1, OP_DELETE_RUN = 2 };
 
 // --- Helpers ---
 static double now_ms() {
