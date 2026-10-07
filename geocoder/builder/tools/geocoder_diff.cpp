@@ -75,41 +75,6 @@ struct MergeSequence {
     }
 };
 
-// Build merge sequence for sorted data files (no hash table needed).
-// Both old (after string remap) and new are in deterministic sort order.
-// cmp(a, b) returns <0 if a sorts before b, >0 if after, 0 if same key.
-// When cmp returns 0 but bytes differ, the record was modified (DELETE+INSERT).
-template<typename CmpFn>
-static MergeSequence build_merge_seq_sorted(
-    const char* old_data, size_t old_size, const char* new_data, size_t new_size,
-    size_t stride, CmpFn cmp)
-{
-    size_t old_n = old_size / stride;
-    size_t new_n = new_size / stride;
-    size_t oi = 0, ni = 0;
-    MergeSequence seq;
-    uint32_t match_run = 0, del_run = 0;
-    auto flush_match = [&]() { if (match_run > 0) { seq.add_match(match_run); match_run = 0; } };
-    auto flush_del = [&]() { if (del_run > 0) { seq.add_delete(del_run); del_run = 0; } };
-
-    while (oi < old_n && ni < new_n) {
-        const char* op = old_data + oi * stride;
-        const char* np = new_data + ni * stride;
-        if (memcmp(op, np, stride) == 0) {
-            flush_del(); match_run++; oi++; ni++;
-        } else {
-            int c = cmp(op, np);
-            if (c < 0) { flush_match(); del_run++; oi++; }               // old-only → deleted
-            else if (c > 0) { flush_match(); flush_del(); seq.add_insert(np, 1, stride); ni++; } // new-only → inserted
-            else { flush_match(); del_run++; oi++; flush_del(); seq.add_insert(np, 1, stride); ni++; } // same key, different bytes → modified
-        }
-    }
-    flush_match(); flush_del();
-    if (oi < old_n) seq.add_delete(old_n - oi);
-    if (ni < new_n) seq.add_insert(new_data + ni * stride, new_n - ni, stride);
-    return seq;
-}
-
 // Build merge sequence for a data file.
 // old_data has string remap already applied.
 // Records are compared by byte equality (stride bytes).
@@ -1780,12 +1745,9 @@ static int run(int argc, char* argv[]) {
             remap_field(old_data.data, old_data.size, place_stride, 8, str_remap);
         // parent_poly_id (byte 16-19, only present in 20-byte stride) is a
         // foreign id into admin_polygons.bin and shifts day-over-day with
-        // the admin id-space. Without rewriting it the sort-based merge
-        // sees byte-different records on the byte-equality check at
-        // build_merge_seq_sorted line 90 → emits DELETE+INSERT for every
-        // place_node whose containing admin polygon's id moved (which is
-        // most of them). planet/admin patch's place_nodes merge was
-        // 106 MiB on an 80 MiB file before this fix.
+        // the admin id-space. Without rewriting it the merge sees
+        // byte-different records for every place_node whose containing
+        // admin polygon's id moved.
         if (place_stride >= 20 && old_data.size > 0) {
             admin_remap_future.wait();
             const auto& adm_rm = res_admin_p.id_remap;
@@ -1799,17 +1761,12 @@ static int run(int argc, char* argv[]) {
                 }
             }
         }
-        // Sort-based merge: match by (place_type, name_id, lat_bits, lng_bits)
-        auto pn_seq = build_merge_seq_sorted(
-            old_data.data, old_data.size, new_data.data, new_data.size, place_stride,
-            [](const char* a, const char* b) -> int {
-                // Compare by place_type (byte 12), then name_id (offset 8), then lat/lng (bytes 0-7)
-                uint8_t pt_a = static_cast<uint8_t>(a[12]), pt_b = static_cast<uint8_t>(b[12]);
-                if (pt_a != pt_b) return pt_a < pt_b ? -1 : 1;
-                uint32_t na, nb; memcpy(&na, a + 8, 4); memcpy(&nb, b + 8, 4);
-                if (na != nb) return na < nb ? -1 : 1;
-                return memcmp(a, b, 8); // lat + lng
-            });
+        // Positional merge: strategy-2 keeps each place in its slot, so the
+        // files are in slot order, not (type, name, lat, lng) order. The
+        // key-sorted merge this replaced re-sent nearly the whole file daily
+        // (planet: 3.1M of 4.1M places secondary-matched).
+        auto pn_seq = build_merge_seq(old_data.data, old_data.size,
+                                      new_data.data, new_data.size, place_stride);
         auto soft = secondary_match_from_merge(pn_seq, old_data.data, old_data.size,
             new_data.data, new_data.size, place_stride,
             [](const char* rec) -> uint64_t {
