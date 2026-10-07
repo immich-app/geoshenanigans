@@ -1822,19 +1822,17 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                             bool remap_already_applied = false) {
         ensure_dir(base_dir);
 
-        if (!remap_already_applied) {
-            // Locate this region's previous build dir under prev_output_dir
-            // (mirrors the layout we write under output_dir). Empty path
-            // is the "no prev / fresh start" signal — apply_strategy2_remaps
-            // becomes a no-op and IDs remain in collection order.
-            std::string region_prev;
-            if (!prev_output_dir.empty()) {
-                std::string rel = base_dir;
-                if (rel.rfind(output_dir, 0) == 0) rel = rel.substr(output_dir.size());
-                region_prev = prev_output_dir + rel;
-            }
-            apply_strategy2_remaps(d, region_prev);
+        // Locate this region's previous build dir under prev_output_dir
+        // (mirrors the layout we write under output_dir). Empty path
+        // is the "no prev / fresh start" signal — apply_strategy2_remaps
+        // becomes a no-op and IDs remain in collection order.
+        std::string region_prev;
+        if (!prev_output_dir.empty()) {
+            std::string rel = base_dir;
+            if (rel.rfind(output_dir, 0) == 0) rel = rel.substr(output_dir.size());
+            region_prev = prev_output_dir + rel;
         }
+        if (!remap_already_applied) apply_strategy2_remaps(d, region_prev);
 
         if (multi_output) {
             // Write all 3 modes in parallel (they read shared data, write to separate dirs)
@@ -1890,8 +1888,8 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
         //   - admin polygons (and their vertex bytes) whose admin_level
         //     falls outside [2, 8] (L9 borough, L10 quarter-area,
         //     L11 admin-postal, L15 place-area markers are skipped).
-        // Re-simplifies the kept polygons at q2.5 and writes them to a
-        // dense ID space so the on-disk admin_polygons.bin / admin_vertices.bin
+        // Re-simplifies the kept polygons at q2.5 and writes them to its
+        // own stable slots so the on-disk admin_polygons.bin / admin_vertices.bin
         // are self-contained — admin-minimal does NOT share polygon
         // files with quality/q2.5/. It also carries its own core strings
         // and layout, so a client never needs another dir (or a patch for
@@ -1902,10 +1900,11 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
 
             // 1. Filter + re-simplify + pack admin polygons. q2.5 only —
             //    admin-minimal isn't tiered by quality. Returns a remap
-            //    from old polygon IDs to new dense IDs (or NO_DATA for
-            //    dropped polygons), used below to rewrite the cell index.
+            //    from full polygon IDs to admin-minimal's own stable slots
+            //    (or NO_DATA for dropped polygons), used below to rewrite
+            //    the cell index.
             std::vector<uint32_t> poly_remap;
-            write_admin_minimal_polygons(d, mdir, kAdminMinimalEpsilonScale, poly_remap);
+            write_admin_minimal_polygons(d, mdir, region_prev, kAdminMinimalEpsilonScale, poly_remap);
 
             // 2. place_nodes filter + ID remap. Keep types 0=city, 1=town,
             //    2=village, 4=hamlet.
@@ -1917,7 +1916,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                 if (pt == 0 || pt == 1 || pt == 2 || pt == 4) {
                     place_remap[i] = static_cast<uint32_t>(filtered_places.size());
                     PlaceNode pn = d.place_nodes[i];
-                    // Parents in this dir's own dense polygon ids (NO_DATA when
+                    // Parents in this dir's own polygon slots (NO_DATA when
                     // the parent polygon isn't kept), like every other id here.
                     pn.parent_poly_id = pn.parent_poly_id < poly_remap.size() ? poly_remap[pn.parent_poly_id] : NO_DATA;
                     filtered_places.push_back(pn);

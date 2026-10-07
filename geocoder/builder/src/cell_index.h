@@ -72,5 +72,6 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
 // tiered by quality.
 void write_admin_minimal_polygons(const ParsedData& data,
                                   const std::string& output_dir,
+                                  const std::string& prev_dir,
                                   double epsilon_scale,
                                   std::vector<uint32_t>& id_remap);

@@ -394,15 +394,12 @@ static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir
     if (!prev_dir.empty()) {
         // admin_polygons.osm_ids canonical paths, in priority order:
         // quality/uncapped (admin_polygons.bin written for every quality
-        // tier including uncapped, sidecars are identical), then quality/q2.5,
-        // then admin-minimal. Try each — only one needs to load successfully.
-        // (Previous comment claimed /admin/ — incorrect; admin_polygons.bin
-        // is not written there, so the sidecar isn't either, and
-        // load_previous silently failed → strategy-2 stability broke for
-        // every admin polygon between builds.)
+        // tier including uncapped, sidecars are identical), then quality/q2.5.
+        // Try each — only one needs to load successfully. (Not /admin/:
+        // admin_polygons.bin is not written there. Not admin-minimal/: its
+        // sidecar numbers only the kept polygons, in its own slots.)
         if (!alloc.load_previous(prev_dir + "/quality/uncapped/admin_polygons.osm_ids"))
         if (!alloc.load_previous(prev_dir + "/quality/q2.5/admin_polygons.osm_ids"))
-        if (!alloc.load_previous(prev_dir + "/admin-minimal/admin_polygons.osm_ids"))
             { /* fall through: no prev — fresh allocation */ }
     }
 
@@ -1583,6 +1580,7 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
 
 void write_admin_minimal_polygons(const ParsedData& data,
                                   const std::string& output_dir,
+                                  const std::string& prev_dir,
                                   double epsilon_scale,
                                   std::vector<uint32_t>& id_remap) {
     ensure_dir(output_dir);
@@ -1617,21 +1615,39 @@ void write_admin_minimal_polygons(const ParsedData& data,
         for (auto& w : workers) w.join();
     }
 
-    // Pack survivors into a fresh dense ID space; write id_remap so the
-    // caller can rewrite the admin cell index.
-    std::vector<AdminPolygon> new_polys;
-    std::vector<uint8_t> new_verts_bytes;
-    new_polys.reserve(kept_idx.size());
-
+    // Survivors keep stable slots in admin-minimal's own numbering and
+    // sidecar, like the full set's (apply_strategy2_admins). A dense
+    // renumbering shifted every later id whenever one kept polygon came or
+    // went, re-sending ~459K parent ids (3.5 MiB raw) every planet day.
+    using namespace gc::id_alloc;
+    IdAllocator alloc;
+    if (!prev_dir.empty()) alloc.load_previous(prev_dir + "/admin-minimal/admin_polygons.osm_ids");
+    std::vector<size_t> kept_at_slot;
     for (size_t k = 0; k < kept_idx.size(); k++) {
+        if (simplified[k].verts.size() < 3) continue;
+        uint64_t packed = kept_idx[k] < data.admin_osm_ids.size() ? data.admin_osm_ids[kept_idx[k]] : 0;
+        ObjectType t = packed == 0 ? ObjectType::SYNTHETIC : static_cast<ObjectType>(packed >> 56);
+        uint32_t slot = alloc.allocate(t, packed & 0x00FFFFFFFFFFFFFFull);
+        if (slot >= kept_at_slot.size()) kept_at_slot.resize(slot + 1, SIZE_MAX);
+        kept_at_slot[slot] = k;
+    }
+    alloc.finalize();
+
+    // Vertex bytes in slot order, so offsets ascend with ids.
+    std::vector<AdminPolygon> new_polys(alloc.total_slots(), admin_polygon_tombstone());
+    std::vector<uint8_t> new_verts_bytes;
+    size_t kept = 0;
+    for (size_t slot = 0; slot < kept_at_slot.size(); slot++) {
+        size_t k = kept_at_slot[slot];
+        if (k == SIZE_MAX) continue;
         auto& sv = simplified[k].verts;
-        if (sv.size() < 3) continue;
         AdminPolygon np = data.admin_polygons[kept_idx[k]];
         np.vertex_offset = pack_polygon_bytes(new_verts_bytes, sv);
         np.vertex_count = static_cast<uint32_t>(sv.size());
         np.area = polygon_area(sv);
-        id_remap[kept_idx[k]] = static_cast<uint32_t>(new_polys.size());
-        new_polys.push_back(np);
+        id_remap[kept_idx[k]] = static_cast<uint32_t>(slot);
+        new_polys[slot] = np;
+        kept++;
     }
 
     write_binary_file(output_dir + "/admin_polygons.bin",
@@ -1640,9 +1656,10 @@ void write_admin_minimal_polygons(const ParsedData& data,
     write_binary_file(output_dir + "/admin_vertices.bin",
                       reinterpret_cast<const char*>(new_verts_bytes.data()),
                       new_verts_bytes.size());
+    IdAllocator::write_sidecar(output_dir + "/admin_polygons.osm_ids", alloc.slots());
 
-    std::cerr << "  Admin-minimal polygons: " << new_polys.size()
-              << " kept (of " << data.admin_polygons.size() << "), "
+    std::cerr << "  Admin-minimal polygons: " << kept << " kept in " << new_polys.size()
+              << " slots (of " << data.admin_polygons.size() << "), "
               << new_verts_bytes.size() / 1024 / 1024 << " MiB packed vertices"
               << std::endl;
 }
