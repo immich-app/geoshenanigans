@@ -232,6 +232,8 @@ Secondary ID Remap: marker 0xFFFFFFF6 (u32) + n_files (u32)
 Cell Flag Corrections: marker 0xFFFFFFF9 (u32) + count (u32)
   + [(cell_id:u64, flags:u8)] × count
   flags: bit0=has_street, bit1=has_addr, bit2=has_interp
+  (no longer emitted: entry corrections already cover every flipped cell;
+  still accepted)
 
 Entry Corrections: marker 0xFFFFFFF8 (u32) + file_id (u32) + count (u32)
   + [(cell_id:u64, entry_count:u16, [id:u32] × entry_count)] × count

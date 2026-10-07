@@ -1847,7 +1847,6 @@ static int run(int argc, char* argv[]) {
     unmap_file(new_se_m); unmap_file(new_ae_m); unmap_file(new_ie_m);
     malloc_trim(0);
     log_time("Streaming entry corrections", t1);
-    // Keep new_geo_m + old_geo_m (re-mmap) for flag corrections below
     std::cerr << "  RSS after geo corrections: " << get_rss_mb() << " MiB" << std::endl;
 
     // Corrections for a cell index the patcher rebuilds from an id remap
@@ -1906,32 +1905,10 @@ static int run(int argc, char* argv[]) {
         emit_cell_corrections(PatchFileId::PLACE_ENTRIES, "place", place_rm_d, pl_added, pl_removed);
 
     log_time("Entry corrections", t1);
-
-    // Cell flag corrections (reuse old_geo_m and new_geo_m from streaming corrections)
-    {
-        std::unordered_map<uint64_t, uint8_t> old_cell_flags;
-        for (size_t i = 0; i < old_geo_m.size / 20; i++) {
-            uint64_t cid; memcpy(&cid, old_geo_m.data+i*20, 8);
-            uint32_t s, a, ip; memcpy(&s, old_geo_m.data+i*20+8, 4);
-            memcpy(&a, old_geo_m.data+i*20+12, 4); memcpy(&ip, old_geo_m.data+i*20+16, 4);
-            old_cell_flags[cid] = (s != NO_DATA ? 1 : 0) | (a != NO_DATA ? 2 : 0) | (ip != NO_DATA ? 4 : 0);
-        }
-        std::vector<std::pair<uint64_t, uint8_t>> flag_corrections;
-        size_t ngc = new_geo_m.size / 20;
-        for (size_t i = 0; i < ngc; i++) {
-            uint64_t cid; memcpy(&cid, new_geo_m.data+i*20, 8);
-            uint32_t s, a, ip; memcpy(&s, new_geo_m.data+i*20+8, 4);
-            memcpy(&a, new_geo_m.data+i*20+12, 4); memcpy(&ip, new_geo_m.data+i*20+16, 4);
-            uint8_t nf = (s != NO_DATA ? 1 : 0) | (a != NO_DATA ? 2 : 0) | (ip != NO_DATA ? 4 : 0);
-            auto it = old_cell_flags.find(cid);
-            if (nf != (it != old_cell_flags.end() ? it->second : 0))
-                flag_corrections.push_back({cid, nf});
-        }
-        uint32_t fm = CELL_FLAGS_MARKER, fc = flag_corrections.size();
-        wval(patch, &fm, 4); wval(patch, &fc, 4);
-        for (auto& [cid, flags] : flag_corrections) { wval(patch, &cid, 8); wval(patch, &flags, 1); }
-        std::cerr << "  Cell flag corrections: " << fc << " cells" << std::endl;
-    }
+    // No CELL_FLAGS section: every cell whose street / addr / interp list
+    // appears or empties already carries an entry correction, which decides
+    // the patcher's output on its own (planet: 0.09 MiB/day and a hash map
+    // of every old geo cell).
     unmap_file(old_geo_m); unmap_file(new_geo_m);
 
     // --- Full-replacement sections for secondary files ---

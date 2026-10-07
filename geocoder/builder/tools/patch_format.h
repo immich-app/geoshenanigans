@@ -319,6 +319,8 @@ static constexpr uint32_t CELL_INDEX_DELTA_MARKER = 0xFFFFFFF7;
 // Cell flag corrections marker: 0xFFFFFFF9
 // Format: marker, count(u32), [(cell_id:u64, flags:u8)] × count
 // flags: bit 0 = has_street, bit 1 = has_addr, bit 2 = has_interp
+// No longer emitted (entry corrections already decide every flipped cell);
+// the patcher still accepts it from older v5 patches.
 static constexpr uint32_t CELL_FLAGS_MARKER = 0xFFFFFFF9;
 
 // Secondary ID remap marker: 0xFFFFFFF6
