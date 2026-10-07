@@ -959,17 +959,20 @@ static int run(int argc, char* argv[]) {
         size_t old_i = 0, add_i = 0;
         size_t cells_written = 0;
 
-        auto process_cell = [&](uint64_t cid, int32_t oi) {
+        // oi: the cell's index in the old geo_cells, or ADDED for a new cell.
+        // size_t: planet has ~380M cells and `oi * 20` passes 2^31.
+        constexpr size_t ADDED = SIZE_MAX;
+        auto process_cell = [&](uint64_t cid, size_t oi) {
             // For each entry type: check correction → remap old → write
             auto do_entry = [&](const MappedFile& old_e, size_t geo_off, const RemapRef& rm,
                                 const std::vector<CorrEntry>& corr,
                                 EntriesOut& outf, uint8_t flag_bit) -> uint32_t {
                 // Check flag
                 bool has = false;
-                if (oi >= 0 && (size_t)oi * 20 + geo_off + 4 <= m_geo.size) {
+                if (oi != ADDED && oi * 20 + geo_off + 4 <= m_geo.size) {
                     uint32_t off; memcpy(&off, m_geo.data + oi * 20 + geo_off, 4);
                     has = (off != NO);
-                } else if (oi >= 0) {
+                } else if (oi != ADDED) {
                     std::cerr << "OOB: oi=" << oi << " geo_off=" << geo_off << " m_geo.size=" << m_geo.size << std::endl;
                     return NO;
                 }
@@ -981,8 +984,8 @@ static int run(int argc, char* argv[]) {
 
                 if (corr_ids) return emit(outf, corr_ids->data(), corr_ids->size());
 
-                if (oi < 0) return NO;
-                if ((size_t)oi * 20 + geo_off + 4 > m_geo.size) return NO;
+                if (oi == ADDED) return NO;
+                if (oi * 20 + geo_off + 4 > m_geo.size) return NO;
                 uint32_t off; memcpy(&off, m_geo.data + oi * 20 + geo_off, 4);
                 parse(old_e, off);
                 if (buf.empty()) return NO;
@@ -1004,11 +1007,11 @@ static int run(int argc, char* argv[]) {
 
             if (old_cid <= add_cid) {
                 if (!rm_set.count(old_cid))
-                    process_cell(old_cid, (int32_t)old_i);
+                    process_cell(old_cid, old_i);
                 old_i++;
                 if (old_cid == add_cid) add_i++; // skip duplicate add
             } else {
-                process_cell(add_cid, -1);
+                process_cell(add_cid, ADDED);
                 add_i++;
             }
 
