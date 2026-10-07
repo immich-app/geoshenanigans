@@ -833,27 +833,36 @@ inline void append_cell_list_delta(std::vector<char>& out, const CellLists& old_
     out.insert(out.end(), sets.begin(), sets.end());
 }
 
-// Applies append_cell_list_delta bytes to a cell index (cells sorted by id)
-// and writes the result, in write_cell_lists layout, through
-// out_cells(bytes, n) / out_entries(bytes, n). Holds one cell's list at a
-// time: the patcher runs on client machines, and a map of planet poi/all
-// (1.1M cells, 25M ids) cost +261 MiB peak. Returns the entries bytes written.
-template <typename OutCells, typename OutEntries>
-uint64_t stream_cell_list_delta(const char* cells, size_t cells_size, const char* entries, size_t entries_size,
-                                const char* delta, size_t delta_size, OutCells out_cells, OutEntries out_entries) {
+// Rebuilds a cell index and applies append_cell_list_delta bytes to it in one
+// pass, writing the result in write_cell_lists layout through
+// out_cells(bytes, n) / out_entries(bytes, n). The source is the old index
+// (cells sorted by id) plus `added` cell ids with empty lists, minus
+// `removed`; every old id moves by remap(id without INTERIOR_FLAG), flag
+// kept, and each list is sorted: the same lists rebuild_cells_from_remap
+// gives. Holds one cell's list at a time: the patcher runs on client
+// machines, where materialising planet poi/all (1.1M cells, 25M ids, a 23M
+// entry remap map) cost over 1 GiB. Returns the entries bytes written.
+template <typename Remap, typename OutCells, typename OutEntries>
+uint64_t stream_cell_index(const char* cells, size_t cells_size, const char* entries, size_t entries_size,
+                           std::vector<uint64_t> added, std::vector<uint64_t> removed, Remap remap,
+                           const char* delta, size_t delta_size, OutCells out_cells, OutEntries out_entries) {
     auto malformed = [] { throw std::runtime_error("Malformed cell list delta"); };
+    auto bad_index = [] { throw std::runtime_error("Malformed cell index"); };
+    std::sort(added.begin(), added.end());
+    std::sort(removed.begin(), removed.end());
+
     size_t pos = 0;
     auto take = [&](void* dst, size_t n) {
         if (delta_size - pos < n) malformed();
         memcpy(dst, delta + pos, n);
         pos += n;
     };
-    uint32_t n_removed;
-    take(&n_removed, 4);
-    if ((delta_size - pos) / 8 < n_removed) malformed();
-    const char* removed = delta + pos;
-    pos += (size_t)n_removed * 8;
-    uint32_t n_set, set_i = 0, removed_i = 0;
+    uint32_t n_gone;
+    take(&n_gone, 4);
+    if ((delta_size - pos) / 8 < n_gone) malformed();
+    const char* gone = delta + pos;
+    pos += (size_t)n_gone * 8;
+    uint32_t n_set, set_i = 0, gone_i = 0;
     take(&n_set, 4);
 
     // The next changed cell from the delta, read in cell order.
@@ -872,18 +881,59 @@ uint64_t stream_cell_list_delta(const char* cells, size_t cells_size, const char
         prev_set = set_cid;
         set_i++;
     };
-    auto is_removed = [&](uint64_t cid) {
-        uint64_t r = 0;
-        while (removed_i < n_removed) {
-            memcpy(&r, removed + (size_t)removed_i * 8, 8);
-            if (r >= cid) break;
-            removed_i++;
+    auto delta_drops = [&](uint64_t cid) {
+        uint64_t g = 0;
+        while (gone_i < n_gone) {
+            memcpy(&g, gone + (size_t)gone_i * 8, 8);
+            if (g >= cid) break;
+            gone_i++;
         }
-        return removed_i < n_removed && r == cid;
+        return gone_i < n_gone && g == cid;
+    };
+
+    // The next rebuilt cell: old cells minus `removed`, merged with `added`.
+    size_t n_cells = cells_size / 12, i = 0, a = 0, r = 0;
+    uint64_t prev_old = 0;
+    std::vector<uint32_t> ids;
+    auto next_source = [&](uint64_t& cid) -> bool {
+        for (;;) {
+            uint64_t old_cid = NONE;
+            if (i < n_cells) {
+                memcpy(&old_cid, cells + i * 12, 8);
+                if (i > 0 && old_cid <= prev_old) bad_index();
+            }
+            uint64_t add_cid = a < added.size() ? added[a] : NONE;
+            if (old_cid == NONE && add_cid == NONE) return false;
+            if (add_cid < old_cid) {
+                cid = add_cid; a++;
+                ids.clear();
+                return true;
+            }
+            if (add_cid == old_cid) bad_index();
+            prev_old = old_cid;
+            uint32_t off;
+            memcpy(&off, cells + i * 12 + 8, 4);
+            i++;
+            while (r < removed.size() && removed[r] < old_cid) r++;
+            if (r < removed.size() && removed[r] == old_cid) continue;
+            cid = old_cid;
+            ids.clear();
+            if (off != 0xFFFFFFFF) {
+                uint16_t n;
+                if ((size_t)off + 2 > entries_size) bad_index();
+                memcpy(&n, entries + off, 2);
+                if ((size_t)off + 2 + (size_t)n * 4 > entries_size) bad_index();
+                ids.resize(n);
+                memcpy(ids.data(), entries + off + 2, (size_t)n * 4);
+                for (auto& id : ids) id = remap(id & 0x7FFFFFFFu) | (id & 0x80000000u);
+                std::sort(ids.begin(), ids.end());
+            }
+            return true;
+        }
     };
 
     uint64_t written = 0;
-    std::vector<uint32_t> ids, kept;
+    std::vector<uint32_t> kept, merged;
     auto emit = [&](uint64_t cid, const std::vector<uint32_t>& list) {
         if (list.size() > 0xFFFF) throw std::runtime_error("Cell holds more than 65535 entries");
         if (written > 0xFFFFFFFFull) throw std::runtime_error("Cell index entries past 4 GiB");
@@ -897,45 +947,38 @@ uint64_t stream_cell_list_delta(const char* cells, size_t cells_size, const char
     };
 
     next_set();
-    size_t n_cells = cells_size / 12, i = 0;
-    uint64_t prev_cid = 0;
-    while (i < n_cells || set_cid != NONE) {
-        uint64_t cid = NONE;
-        if (i < n_cells) {
-            memcpy(&cid, cells + i * 12, 8);
-            if (i > 0 && cid <= prev_cid) throw std::runtime_error("Malformed cell index");
-        }
-        if (set_cid < cid) {  // a cell the old index doesn't have
+    uint64_t cid = NONE;
+    bool have = next_source(cid);
+    while (have || set_cid != NONE) {
+        uint64_t src = have ? cid : NONE;
+        if (set_cid < src) {  // a cell the rebuilt index doesn't have
             emit(set_cid, gained);
             next_set();
             continue;
         }
-        prev_cid = cid;
-        uint32_t off;
-        memcpy(&off, cells + i * 12 + 8, 4);
-        i++;
-        ids.clear();
-        if (off != 0xFFFFFFFF) {
-            uint16_t n;
-            if ((size_t)off + 2 > entries_size) throw std::runtime_error("Malformed cell index");
-            memcpy(&n, entries + off, 2);
-            if ((size_t)off + 2 + (size_t)n * 4 > entries_size) throw std::runtime_error("Malformed cell index");
-            ids.resize(n);
-            memcpy(ids.data(), entries + off + 2, (size_t)n * 4);
-        }
-        if (cid == set_cid) {
+        if (src == set_cid) {
             kept.clear();
             std::set_difference(ids.begin(), ids.end(), lost.begin(), lost.end(), std::back_inserter(kept));
-            ids.clear();
-            std::merge(kept.begin(), kept.end(), gained.begin(), gained.end(), std::back_inserter(ids));
+            merged.clear();
+            std::merge(kept.begin(), kept.end(), gained.begin(), gained.end(), std::back_inserter(merged));
+            emit(src, merged);
             next_set();
-        } else if (is_removed(cid)) {
-            continue;
+        } else if (!delta_drops(src)) {
+            emit(src, ids);
         }
-        emit(cid, ids);
+        have = next_source(cid);
     }
     if (pos != delta_size) malformed();
     return written;
+}
+
+// stream_cell_index for an index whose ids don't move (the postcode centroid
+// index): the old index plus the delta.
+template <typename OutCells, typename OutEntries>
+uint64_t stream_cell_list_delta(const char* cells, size_t cells_size, const char* entries, size_t entries_size,
+                                const char* delta, size_t delta_size, OutCells out_cells, OutEntries out_entries) {
+    return stream_cell_index(cells, cells_size, entries, entries_size, {}, {}, [](uint32_t id) { return id; },
+                             delta, delta_size, out_cells, out_entries);
 }
 
 // --- String offset remap (patcher) ---

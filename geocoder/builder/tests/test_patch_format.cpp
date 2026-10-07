@@ -525,6 +525,50 @@ TEST(patch_format_cell_list_delta_matches_the_new_index_on_random_days) {
     }
 }
 
+TEST(patch_format_stream_cell_index_matches_rebuild_then_delta) {
+    // The patcher's one-pass rebuild (old index + remap + added/removed +
+    // delta) writes exactly the new index the diff aimed at, on random days
+    // with interior flags, removed and added cells.
+    uint64_t seed = 99;
+    auto rnd = [&](uint32_t n) { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return (uint32_t)(seed >> 33) % n; };
+    for (int round = 0; round < 200; round++) {
+        CellLists old_lists;
+        for (uint64_t cid = 1; cid < 30; cid++) {
+            if (rnd(3) == 0) continue;
+            std::vector<uint32_t> ids;
+            for (uint32_t id = 0; id < 40; id++) if (rnd(5) == 0) ids.push_back(id | (rnd(4) == 0 ? 0x80000000u : 0));
+            std::sort(ids.begin(), ids.end());
+            old_lists[cid] = ids;
+        }
+        std::unordered_map<uint32_t, uint32_t> rm;
+        for (uint32_t id = 0; id < 40; id++) if (rnd(3) == 0) rm[id] = 100 + rnd(60);
+        std::vector<uint64_t> added, removed;
+        for (uint64_t cid = 1; cid < 34; cid++) {
+            if (!old_lists.count(cid) && rnd(3) == 0) added.push_back(cid);
+            else if (old_lists.count(cid) && rnd(6) == 0) removed.push_back(cid);
+        }
+        auto [cells, entries] = write_cell_lists(old_lists);
+        auto derived = rebuild_cells_from_remap(cells, entries, rm, added, removed);
+        CellLists new_lists = parse_cell_lists(derived.cells_data, derived.entries_data);
+        for (auto it = new_lists.begin(); it != new_lists.end();) {
+            if (rnd(5) == 0) { it = new_lists.erase(it); continue; }
+            if (rnd(3) == 0) { it->second.push_back(500 + rnd(9)); std::sort(it->second.begin(), it->second.end()); }
+            if (rnd(4) == 0 && !it->second.empty()) it->second.erase(it->second.begin());
+            ++it;
+        }
+        if (rnd(2)) new_lists[40 + rnd(5)] = {7};
+        std::vector<char> delta;
+        append_cell_list_delta(delta, parse_cell_lists(derived.cells_data, derived.entries_data), new_lists);
+        std::pair<std::vector<char>, std::vector<char>> got;
+        stream_cell_index(cells.data(), cells.size(), entries.data(), entries.size(), added, removed,
+                          [&](uint32_t id) { auto f = rm.find(id); return f != rm.end() ? f->second : id; },
+                          delta.data(), delta.size(),
+                          [&](const char* p, size_t n) { got.first.insert(got.first.end(), p, p + n); },
+                          [&](const char* p, size_t n) { got.second.insert(got.second.end(), p, p + n); });
+        CHECK(got == write_cell_lists(new_lists));
+    }
+}
+
 TEST(patch_format_cell_list_delta_drops_removed_no_data_cells) {
     // A rebuilt index can hold an emptied cell (offset NO_DATA); the delta removes it.
     auto [cells, entries] = one_cell(7, {1});
