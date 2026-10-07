@@ -2125,7 +2125,7 @@ static int run(int argc, char* argv[]) {
     {
         auto old_admc = read_file(old_dir + "/admin_cells.bin");
         auto old_adme = read_file(old_dir + "/admin_entries.bin");
-        auto admin_derived = rebuild_admin_from_remap(old_admc, old_adme, ad_rm_d, a_added, a_removed);
+        auto admin_derived = rebuild_cells_from_remap(old_admc, old_adme, ad_rm_d, a_added, a_removed);
         auto new_admc = read_file(new_dir + "/admin_cells.bin");
         auto new_adme = read_file(new_dir + "/admin_entries.bin");
         auto parse_admin = [&](const std::vector<char>& cells, const std::vector<char>& entries)
@@ -2138,7 +2138,7 @@ static int run(int argc, char* argv[]) {
             }
             return m;
         };
-        auto dm = parse_admin(admin_derived.admin_cells_data, admin_derived.admin_entries_data);
+        auto dm = parse_admin(admin_derived.cells_data, admin_derived.entries_data);
         auto nm = parse_admin(new_admc, new_adme);
         std::vector<char> buf; buf.resize(12, 0); uint32_t dc = 0;
         for (auto& [cid, nids] : nm) {
@@ -2159,7 +2159,7 @@ static int run(int argc, char* argv[]) {
     if (res_poi_r.old_size > 0 || res_poi_r.new_size > 0) {
         auto old_poic = read_file(old_dir + "/poi_cells.bin");
         auto old_poie = read_file(old_dir + "/poi_entries.bin");
-        auto poi_derived = rebuild_poi_from_remap(old_poic, old_poie, poi_rm_d, p_added, p_removed);
+        auto poi_derived = rebuild_cells_from_remap(old_poic, old_poie, poi_rm_d, p_added, p_removed);
         auto new_poic = read_file(new_dir + "/poi_cells.bin");
         auto new_poie = read_file(new_dir + "/poi_entries.bin");
         auto parse_poi = [&](const std::vector<char>& cells, const std::vector<char>& entries)
@@ -2172,7 +2172,7 @@ static int run(int argc, char* argv[]) {
             }
             return m;
         };
-        auto dm = parse_poi(poi_derived.poi_cells_data, poi_derived.poi_entries_data);
+        auto dm = parse_poi(poi_derived.cells_data, poi_derived.entries_data);
         auto nm = parse_poi(new_poic, new_poie);
         std::vector<char> buf; buf.resize(12, 0); uint32_t dc = 0;
         for (auto& [cid, nids] : nm) {
@@ -2193,7 +2193,7 @@ static int run(int argc, char* argv[]) {
     if (res_place_n.old_size > 0 || res_place_n.new_size > 0) {
         auto old_plc = read_file(old_dir + "/place_cells.bin");
         auto old_ple = read_file(old_dir + "/place_entries.bin");
-        auto place_derived = rebuild_place_from_remap(old_plc, old_ple, place_rm_d, pl_added, pl_removed);
+        auto place_derived = rebuild_cells_from_remap(old_plc, old_ple, place_rm_d, pl_added, pl_removed);
         auto new_plc = read_file(new_dir + "/place_cells.bin");
         auto new_ple = read_file(new_dir + "/place_entries.bin");
         auto parse_place = [&](const std::vector<char>& cells, const std::vector<char>& entries)
@@ -2206,7 +2206,7 @@ static int run(int argc, char* argv[]) {
             }
             return m;
         };
-        auto dm = parse_place(place_derived.place_cells_data, place_derived.place_entries_data);
+        auto dm = parse_place(place_derived.cells_data, place_derived.entries_data);
         auto nm = parse_place(new_plc, new_ple);
         std::vector<char> buf; buf.resize(12, 0); uint32_t dc = 0;
         for (auto& [cid, nids] : nm) {

@@ -422,3 +422,35 @@ TEST(patch_format_offset_fixups_reject_truncated_runs) {
     }
     CHECK(threw);
 }
+
+// --- cell index rebuild from an id remap ---
+
+static void append_u32(std::vector<char>& buf, uint32_t v) { buf.insert(buf.end(), (const char*)&v, (const char*)&v + 4); }
+
+// One cell holding `ids`, as cells (cell_id, offset) + entries (count, ids).
+static std::pair<std::vector<char>, std::vector<char>> one_cell(uint64_t cell_id, const std::vector<uint32_t>& ids) {
+    std::vector<char> cells((const char*)&cell_id, (const char*)&cell_id + 8), entries;
+    append_u32(cells, 0);
+    uint16_t n = static_cast<uint16_t>(ids.size());
+    entries.insert(entries.end(), (const char*)&n, (const char*)&n + 2);
+    for (uint32_t id : ids) append_u32(entries, id);
+    return {cells, entries};
+}
+
+static std::vector<uint32_t> ids_of_first_cell(const std::vector<char>& cells, const std::vector<char>& entries) {
+    uint32_t off; std::memcpy(&off, cells.data() + 8, 4);
+    uint16_t n; std::memcpy(&n, entries.data() + off, 2);
+    std::vector<uint32_t> ids(n);
+    std::memcpy(ids.data(), entries.data() + off + 2, n * 4);
+    return ids;
+}
+
+TEST(patch_format_rebuild_cells_remaps_interior_entries) {
+    // Interior entries carry INTERIOR_FLAG in the top bit; the remap is keyed
+    // by the bare id and the flag survives it.
+    const uint32_t interior = 0x80000000u;
+    auto [cells, entries] = one_cell(42, {3 | interior, 5});
+    const std::unordered_map<uint32_t, uint32_t> rm = {{3, 2}, {5, 4}};
+    auto rebuilt = rebuild_cells_from_remap(cells, entries, rm);
+    CHECK(ids_of_first_cell(rebuilt.cells_data, rebuilt.entries_data) == std::vector<uint32_t>({4, 2 | interior}));
+}

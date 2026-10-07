@@ -674,101 +674,37 @@ inline RebuiltGeo rebuild_geo_from_remap_vec(
     return result;
 }
 
-struct RebuiltAdmin {
-    std::vector<char> admin_cells_data;
-    std::vector<char> admin_entries_data;
+// Admin, POI and place cell index rebuild: 12-byte cells (cell_id u64,
+// entry_offset u32) over (count u16, ids u32[]) entries. An id's top bit is
+// INTERIOR_FLAG, so the remap is keyed by the bare id and the flag carried over.
+struct RebuiltCells {
+    std::vector<char> cells_data;
+    std::vector<char> entries_data;
 };
 
-inline RebuiltAdmin rebuild_admin_from_remap(
-    const std::vector<char>& old_ac, const std::vector<char>& old_ae,
-    const std::unordered_map<uint32_t,uint32_t>& admin_rm,
+inline RebuiltCells rebuild_cells_from_remap(
+    const std::vector<char>& old_cells, const std::vector<char>& old_entries,
+    const std::unordered_map<uint32_t,uint32_t>& rm,
     const std::vector<uint64_t>& added_cells = {},
     const std::vector<uint64_t>& removed_cells = {})
 {
-    size_t n_cells = old_ac.size() / 12;
+    size_t n_cells = old_cells.size() / 12;
 
     struct CellData { uint64_t cell_id; std::vector<uint32_t> ids; };
     std::vector<CellData> cells(n_cells);
     for (size_t i = 0; i < n_cells; i++) {
-        memcpy(&cells[i].cell_id, old_ac.data() + i * 12, 8);
-        uint32_t off; memcpy(&off, old_ac.data() + i * 12 + 8, 4);
-        if (off != 0xFFFFFFFF && off + 2 <= old_ae.size()) {
-            uint16_t count; memcpy(&count, old_ae.data() + off, 2);
-            if (off + 2 + count * 4 <= old_ae.size()) {
+        memcpy(&cells[i].cell_id, old_cells.data() + i * 12, 8);
+        uint32_t off; memcpy(&off, old_cells.data() + i * 12 + 8, 4);
+        if (off != 0xFFFFFFFF && off + 2 <= old_entries.size()) {
+            uint16_t count; memcpy(&count, old_entries.data() + off, 2);
+            if (off + 2 + count * 4 <= old_entries.size()) {
                 cells[i].ids.resize(count);
-                memcpy(cells[i].ids.data(), old_ae.data() + off + 2, count * 4);
+                memcpy(cells[i].ids.data(), old_entries.data() + off + 2, count * 4);
                 for (auto& id : cells[i].ids) {
                     uint32_t flags = id & 0x80000000u;
                     uint32_t masked = id & 0x7FFFFFFFu;
-                    auto it = admin_rm.find(masked);
-                    if (it != admin_rm.end()) id = it->second | flags;
-                }
-                std::sort(cells[i].ids.begin(), cells[i].ids.end());
-            }
-        }
-    }
-
-    // Apply cell changes (add/remove)
-    if (!removed_cells.empty()) {
-        std::unordered_set<uint64_t> removed_set(removed_cells.begin(), removed_cells.end());
-        cells.erase(std::remove_if(cells.begin(), cells.end(),
-            [&](const CellData& c) { return removed_set.count(c.cell_id); }), cells.end());
-    }
-    if (!added_cells.empty()) {
-        for (uint64_t cid : added_cells) {
-            CellData cd; cd.cell_id = cid;
-            cells.push_back(cd);
-        }
-        std::sort(cells.begin(), cells.end(),
-            [](const CellData& a, const CellData& b) { return a.cell_id < b.cell_id; });
-    }
-
-    RebuiltAdmin result;
-    uint32_t no_data = 0xFFFFFFFF;
-    std::unordered_map<uint64_t, uint32_t> offsets;
-    for (auto& c : cells) {
-        if (c.ids.empty()) continue;
-        offsets[c.cell_id] = static_cast<uint32_t>(result.admin_entries_data.size());
-        uint16_t count = static_cast<uint16_t>(c.ids.size());
-        result.admin_entries_data.insert(result.admin_entries_data.end(), (const char*)&count, (const char*)&count + 2);
-        result.admin_entries_data.insert(result.admin_entries_data.end(), (const char*)c.ids.data(), (const char*)c.ids.data() + c.ids.size() * 4);
-    }
-    for (auto& c : cells) {
-        result.admin_cells_data.insert(result.admin_cells_data.end(), (const char*)&c.cell_id, (const char*)&c.cell_id + 8);
-        auto it = offsets.find(c.cell_id);
-        uint32_t off = it != offsets.end() ? it->second : no_data;
-        result.admin_cells_data.insert(result.admin_cells_data.end(), (const char*)&off, (const char*)&off + 4);
-    }
-    return result;
-}
-
-// POI cell index rebuild (same structure as admin: 12-byte stride, cell_id(u64) + entry_offset(u32))
-struct RebuiltPoi {
-    std::vector<char> poi_cells_data;
-    std::vector<char> poi_entries_data;
-};
-
-inline RebuiltPoi rebuild_poi_from_remap(
-    const std::vector<char>& old_pc, const std::vector<char>& old_pe,
-    const std::unordered_map<uint32_t,uint32_t>& poi_rm,
-    const std::vector<uint64_t>& added_cells = {},
-    const std::vector<uint64_t>& removed_cells = {})
-{
-    size_t n_cells = old_pc.size() / 12;
-
-    struct CellData { uint64_t cell_id; std::vector<uint32_t> ids; };
-    std::vector<CellData> cells(n_cells);
-    for (size_t i = 0; i < n_cells; i++) {
-        memcpy(&cells[i].cell_id, old_pc.data() + i * 12, 8);
-        uint32_t off; memcpy(&off, old_pc.data() + i * 12 + 8, 4);
-        if (off != 0xFFFFFFFF && off + 2 <= old_pe.size()) {
-            uint16_t count; memcpy(&count, old_pe.data() + off, 2);
-            if (off + 2 + count * 4 <= old_pe.size()) {
-                cells[i].ids.resize(count);
-                memcpy(cells[i].ids.data(), old_pe.data() + off + 2, count * 4);
-                for (auto& id : cells[i].ids) {
-                    auto it = poi_rm.find(id);
-                    if (it != poi_rm.end()) id = it->second;
+                    auto it = rm.find(masked);
+                    if (it != rm.end()) id = it->second | flags;
                 }
                 std::sort(cells[i].ids.begin(), cells[i].ids.end());
             }
@@ -786,84 +722,21 @@ inline RebuiltPoi rebuild_poi_from_remap(
             [](const CellData& a, const CellData& b) { return a.cell_id < b.cell_id; });
     }
 
-    RebuiltPoi result;
+    RebuiltCells result;
     uint32_t no_data = 0xFFFFFFFF;
     std::unordered_map<uint64_t, uint32_t> offsets;
     for (auto& c : cells) {
         if (c.ids.empty()) continue;
-        offsets[c.cell_id] = static_cast<uint32_t>(result.poi_entries_data.size());
+        offsets[c.cell_id] = static_cast<uint32_t>(result.entries_data.size());
         uint16_t count = static_cast<uint16_t>(c.ids.size());
-        result.poi_entries_data.insert(result.poi_entries_data.end(), (const char*)&count, (const char*)&count + 2);
-        result.poi_entries_data.insert(result.poi_entries_data.end(), (const char*)c.ids.data(), (const char*)c.ids.data() + c.ids.size() * 4);
+        result.entries_data.insert(result.entries_data.end(), (const char*)&count, (const char*)&count + 2);
+        result.entries_data.insert(result.entries_data.end(), (const char*)c.ids.data(), (const char*)c.ids.data() + c.ids.size() * 4);
     }
     for (auto& c : cells) {
-        result.poi_cells_data.insert(result.poi_cells_data.end(), (const char*)&c.cell_id, (const char*)&c.cell_id + 8);
+        result.cells_data.insert(result.cells_data.end(), (const char*)&c.cell_id, (const char*)&c.cell_id + 8);
         auto it = offsets.find(c.cell_id);
         uint32_t off = it != offsets.end() ? it->second : no_data;
-        result.poi_cells_data.insert(result.poi_cells_data.end(), (const char*)&off, (const char*)&off + 4);
-    }
-    return result;
-}
-
-// Place cell index rebuild (same structure as POI: 12-byte stride, cell_id(u64) + entry_offset(u32))
-struct RebuiltPlace {
-    std::vector<char> place_cells_data;
-    std::vector<char> place_entries_data;
-};
-
-inline RebuiltPlace rebuild_place_from_remap(
-    const std::vector<char>& old_pc, const std::vector<char>& old_pe,
-    const std::unordered_map<uint32_t,uint32_t>& place_rm,
-    const std::vector<uint64_t>& added_cells = {},
-    const std::vector<uint64_t>& removed_cells = {})
-{
-    size_t n_cells = old_pc.size() / 12;
-
-    struct CellData { uint64_t cell_id; std::vector<uint32_t> ids; };
-    std::vector<CellData> cells(n_cells);
-    for (size_t i = 0; i < n_cells; i++) {
-        memcpy(&cells[i].cell_id, old_pc.data() + i * 12, 8);
-        uint32_t off; memcpy(&off, old_pc.data() + i * 12 + 8, 4);
-        if (off != 0xFFFFFFFF && off + 2 <= old_pe.size()) {
-            uint16_t count; memcpy(&count, old_pe.data() + off, 2);
-            if (off + 2 + count * 4 <= old_pe.size()) {
-                cells[i].ids.resize(count);
-                memcpy(cells[i].ids.data(), old_pe.data() + off + 2, count * 4);
-                for (auto& id : cells[i].ids) {
-                    auto it = place_rm.find(id);
-                    if (it != place_rm.end()) id = it->second;
-                }
-                std::sort(cells[i].ids.begin(), cells[i].ids.end());
-            }
-        }
-    }
-
-    if (!removed_cells.empty()) {
-        std::unordered_set<uint64_t> removed_set(removed_cells.begin(), removed_cells.end());
-        cells.erase(std::remove_if(cells.begin(), cells.end(),
-            [&](const CellData& c) { return removed_set.count(c.cell_id); }), cells.end());
-    }
-    if (!added_cells.empty()) {
-        for (uint64_t cid : added_cells) { CellData cd; cd.cell_id = cid; cells.push_back(cd); }
-        std::sort(cells.begin(), cells.end(),
-            [](const CellData& a, const CellData& b) { return a.cell_id < b.cell_id; });
-    }
-
-    RebuiltPlace result;
-    uint32_t no_data = 0xFFFFFFFF;
-    std::unordered_map<uint64_t, uint32_t> offsets;
-    for (auto& c : cells) {
-        if (c.ids.empty()) continue;
-        offsets[c.cell_id] = static_cast<uint32_t>(result.place_entries_data.size());
-        uint16_t count = static_cast<uint16_t>(c.ids.size());
-        result.place_entries_data.insert(result.place_entries_data.end(), (const char*)&count, (const char*)&count + 2);
-        result.place_entries_data.insert(result.place_entries_data.end(), (const char*)c.ids.data(), (const char*)c.ids.data() + c.ids.size() * 4);
-    }
-    for (auto& c : cells) {
-        result.place_cells_data.insert(result.place_cells_data.end(), (const char*)&c.cell_id, (const char*)&c.cell_id + 8);
-        auto it = offsets.find(c.cell_id);
-        uint32_t off = it != offsets.end() ? it->second : no_data;
-        result.place_cells_data.insert(result.place_cells_data.end(), (const char*)&off, (const char*)&off + 4);
+        result.cells_data.insert(result.cells_data.end(), (const char*)&off, (const char*)&off + 4);
     }
     return result;
 }

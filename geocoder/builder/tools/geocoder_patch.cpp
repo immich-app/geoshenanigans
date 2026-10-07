@@ -1053,9 +1053,9 @@ static int run(int argc, char* argv[]) {
             std::unordered_map<uint32_t,uint32_t> ad_rm(poi_admin_remap.begin(), poi_admin_remap.end());
             auto old_ac = read_file(cur_dir + "/admin_cells.bin");
             auto old_adme = read_file(cur_dir + "/admin_entries.bin");
-            auto admin = rebuild_admin_from_remap(old_ac, old_adme, ad_rm, admin_added, admin_removed);
-            write_corrected_cells("Admin", PatchFileId::ADMIN_ENTRIES, admin.admin_cells_data,
-                                  admin.admin_entries_data, "admin_cells.bin", "admin_entries.bin");
+            auto admin = rebuild_cells_from_remap(old_ac, old_adme, ad_rm, admin_added, admin_removed);
+            write_corrected_cells("Admin", PatchFileId::ADMIN_ENTRIES, admin.cells_data,
+                                  admin.entries_data, "admin_cells.bin", "admin_entries.bin");
             log_phase("  Admin", t_entry);
         }
 
@@ -1074,9 +1074,9 @@ static int run(int argc, char* argv[]) {
             auto old_pe = read_file(cur_dir + "/poi_entries.bin");
 
             if (!old_pc.empty() || !poi_added.empty() || !poi_removed.empty() || !poi_rm.empty()) {
-                auto poi = rebuild_poi_from_remap(old_pc, old_pe, poi_rm, poi_added, poi_removed);
-                write_corrected_cells("POI", PatchFileId::POI_ENTRIES, poi.poi_cells_data,
-                                      poi.poi_entries_data, "poi_cells.bin", "poi_entries.bin");
+                auto poi = rebuild_cells_from_remap(old_pc, old_pe, poi_rm, poi_added, poi_removed);
+                write_corrected_cells("POI", PatchFileId::POI_ENTRIES, poi.cells_data,
+                                      poi.entries_data, "poi_cells.bin", "poi_entries.bin");
             }
             log_phase("  POI", t_entry);
         }
@@ -1096,9 +1096,9 @@ static int run(int argc, char* argv[]) {
             auto old_ple = read_file(cur_dir + "/place_entries.bin");
 
             if (!old_plc.empty() || !place_added.empty() || !place_removed.empty() || !place_rm.empty()) {
-                auto place = rebuild_place_from_remap(old_plc, old_ple, place_rm, place_added, place_removed);
-                write_corrected_cells("Place", PatchFileId::PLACE_ENTRIES, place.place_cells_data,
-                                      place.place_entries_data, "place_cells.bin", "place_entries.bin");
+                auto place = rebuild_cells_from_remap(old_plc, old_ple, place_rm, place_added, place_removed);
+                write_corrected_cells("Place", PatchFileId::PLACE_ENTRIES, place.cells_data,
+                                      place.entries_data, "place_cells.bin", "place_entries.bin");
             }
             log_phase("  Place", t_entry);
         }
