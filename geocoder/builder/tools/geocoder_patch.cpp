@@ -889,8 +889,16 @@ static int run(int argc, char* argv[]) {
         madvise(const_cast<char*>(m_ie.data), m_ie.size, MADV_SEQUENTIAL);
         size_t n_old = m_geo.size / 20;
 
-        // Build sorted correction vectors + removed set (better cache locality than hash maps)
-        std::unordered_set<uint64_t> rm_set(geo_removed.begin(), geo_removed.end());
+        // Corrections and removed cells, sorted by cell id and read through
+        // forward cursors: the walk below visits cells in ascending id
+        // order, and a hash lookup plus three binary searches per cell cost
+        // ~17 s of client CPU on planet's ~380M cells.
+        std::sort(geo_removed.begin(), geo_removed.end());
+        size_t removed_i = 0;
+        auto is_removed = [&](uint64_t cid) {
+            while (removed_i < geo_removed.size() && geo_removed[removed_i] < cid) removed_i++;
+            return removed_i < geo_removed.size() && geo_removed[removed_i] == cid;
+        };
         struct CorrEntry { uint64_t cid; const std::vector<uint32_t>* ids; };
         std::vector<CorrEntry> cs, ca, ci_map;
         for (auto& [fid, list] : entry_corrections) {
@@ -903,12 +911,15 @@ static int run(int argc, char* argv[]) {
         std::sort(cs.begin(), cs.end(), corr_cmp);
         std::sort(ca.begin(), ca.end(), corr_cmp);
         std::sort(ci_map.begin(), ci_map.end(), corr_cmp);
-        // Binary search helper
-        auto corr_find = [](const std::vector<CorrEntry>& v, uint64_t cid) -> const std::vector<uint32_t>* {
-            auto it = std::lower_bound(v.begin(), v.end(), CorrEntry{cid, nullptr},
-                [](const CorrEntry& a, const CorrEntry& b) { return a.cid < b.cid; });
-            return (it != v.end() && it->cid == cid) ? it->ids : nullptr;
+        struct CorrCursor {
+            const std::vector<CorrEntry>& v;
+            size_t i = 0;
+            const std::vector<uint32_t>* at(uint64_t cid) {
+                while (i < v.size() && v[i].cid < cid) i++;
+                return i < v.size() && v[i].cid == cid ? v[i].ids : nullptr;
+            }
         };
+        CorrCursor cur_s{cs}, cur_a{ca}, cur_i{ci_map};
         // Added cells sorted
         std::sort(geo_added.begin(), geo_added.end());
         log_phase("  Setup", t_entry);
@@ -962,7 +973,7 @@ static int run(int argc, char* argv[]) {
         auto process_cell = [&](uint64_t cid, size_t oi) {
             // For each entry type: check correction → remap old → write
             auto do_entry = [&](const MappedFile& old_e, size_t geo_off, const RemapRef& rm,
-                                const std::vector<CorrEntry>& corr,
+                                CorrCursor& corr,
                                 EntriesOut& outf, uint8_t flag_bit) -> uint32_t {
                 // Check flag
                 bool has = false;
@@ -973,9 +984,11 @@ static int run(int argc, char* argv[]) {
                     std::cerr << "OOB: oi=" << oi << " geo_off=" << geo_off << " m_geo.size=" << m_geo.size << std::endl;
                     return NO;
                 }
-                auto fc = flag_corrections.find(cid);
-                if (fc != flag_corrections.end()) has = (fc->second & flag_bit) != 0;
-                auto* corr_ids = corr_find(corr, cid);
+                if (!flag_corrections.empty()) {  // only older v5 patches carry flags
+                    auto fc = flag_corrections.find(cid);
+                    if (fc != flag_corrections.end()) has = (fc->second & flag_bit) != 0;
+                }
+                auto* corr_ids = corr.at(cid);
                 if (corr_ids) has = true;
                 if (!has) return NO;
 
@@ -990,9 +1003,9 @@ static int run(int argc, char* argv[]) {
                 return emit(outf, buf.data(), buf.size());
             };
 
-            uint32_t so = do_entry(m_se, 8, w_rm, cs, o_se, 1);
-            uint32_t ao = do_entry(m_ae, 12, a_rm, ca, o_ae, 2);
-            uint32_t io = do_entry(m_ie, 16, i_rm, ci_map, o_ie, 4);
+            uint32_t so = do_entry(m_se, 8, w_rm, cur_s, o_se, 1);
+            uint32_t ao = do_entry(m_ae, 12, a_rm, cur_a, o_ae, 2);
+            uint32_t io = do_entry(m_ie, 16, i_rm, cur_i, o_ie, 4);
             fwrite(&cid, 8, 1, f_geo); fwrite(&so, 4, 1, f_geo); fwrite(&ao, 4, 1, f_geo); fwrite(&io, 4, 1, f_geo);
             cells_written++;
         };
@@ -1003,7 +1016,7 @@ static int run(int argc, char* argv[]) {
             if (add_i < geo_added.size()) add_cid = geo_added[add_i];
 
             if (old_cid <= add_cid) {
-                if (!rm_set.count(old_cid))
+                if (!is_removed(old_cid))
                     process_cell(old_cid, old_i);
                 old_i++;
                 if (old_cid == add_cid) add_i++; // skip duplicate add
