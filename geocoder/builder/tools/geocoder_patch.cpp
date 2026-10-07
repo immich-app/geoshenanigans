@@ -659,7 +659,13 @@ static int run(int argc, char* argv[]) {
         size_t seq_end = pos + seq_size;
         FILE* outf = open_out(fname);
 
-        bool track = needs_remap; // track ID remap only for data files
+        // Record the old → new record ids of the files whose remap the entry
+        // pipeline reads back (geo, POI and place indexes).
+        bool track = file_id == (uint32_t)PatchFileId::STREET_WAYS ||
+                     file_id == (uint32_t)PatchFileId::ADDR_POINTS ||
+                     file_id == (uint32_t)PatchFileId::INTERP_WAYS ||
+                     file_id == (uint32_t)PatchFileId::POI_RECORDS ||
+                     file_id == (uint32_t)PatchFileId::PLACE_NODES;
         // File-backed id_map: create temp file, fill with 0xFF, mmap read-write
         int remap_fd = -1;
         uint32_t* id_map_ptr = nullptr;
@@ -813,18 +819,11 @@ static int run(int argc, char* argv[]) {
         unmap_file(old_mmap);
 
         if (track) {
-            // Sync and munmap the file-backed remap (data is already on disk).
-            // A failed msync would leave the remap that the entry pipeline later
-            // reads partially flushed → silent output corruption, so fail loudly.
-            // Skip the check for an empty mapping (remap_bytes==0 → MAP_FAILED).
+            // munmap without msync: the entry pipeline maps the same file
+            // and reads these pages from the page cache. Forcing them to
+            // disk wrote ~1 GiB of planet/full scratch the patcher deletes.
             size_t remap_bytes = n_old_records * 4;
-            if (remap_bytes > 0 && msync(id_map_ptr, remap_bytes, MS_SYNC) != 0) {
-                std::cerr << "  ERROR: msync failed on " << remap_path << std::endl;
-                munmap(id_map_ptr, remap_bytes);
-                close(remap_fd);
-                return 1;
-            }
-            munmap(id_map_ptr, remap_bytes);
+            if (remap_bytes > 0) munmap(id_map_ptr, remap_bytes);
             close(remap_fd);
             id_map_ptr = nullptr;
             id_remaps[file_id] = {}; // empty placeholder
