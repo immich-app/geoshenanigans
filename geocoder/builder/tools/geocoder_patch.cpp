@@ -290,7 +290,8 @@ static int run(int argc, char* argv[]) {
 
     // --- Phase 3: Merge replays (streaming output) ---
     // ID remaps: file_id → vector<uint32_t> where remap[old_idx] = new_idx
-    std::unordered_map<uint32_t, std::vector<uint32_t>> id_remaps;
+    // Old → new record ids of the replayed files the entry pipeline remaps by.
+    std::unordered_map<uint32_t, RecordRemap> record_remaps;
     std::vector<uint64_t> geo_added, geo_removed, admin_added, admin_removed, poi_added, poi_removed, place_added, place_removed;
     std::unordered_map<uint64_t, uint8_t> flag_corrections;
     struct CellCorr { uint64_t cell_id; std::vector<uint32_t> ids; };
@@ -360,47 +361,17 @@ static int run(int argc, char* argv[]) {
             continue;
         }
         if (file_id == SECONDARY_REMAP_MARKER) {
-            // Apply secondary remaps directly to the temp remap files on disk
+            // Secondary matches extend the remap of a file already replayed
+            // (the diff emits them after the merges); a file sent unchanged
+            // has no remap and keeps its ids.
             uint32_t nf = ru32();
             for (uint32_t f = 0; f < nf; f++) {
                 uint32_t fid = ru32(), np = ru32();
-                std::string remap_path = tmpdir + "/remap_" + std::to_string(fid) + ".bin";
-                // Open remap file for read-write
-                int rfd = open(remap_path.c_str(), O_RDWR);
-                if (rfd >= 0) {
-                    struct stat st;
-                    if (fstat(rfd, &st) != 0) {
-                        std::cerr << "  ERROR: fstat failed on " << remap_path << std::endl;
-                        close(rfd);
-                        return 1;
-                    }
-                    size_t remap_size = st.st_size;
-                    if (remap_size == 0) {
-                        // Legitimately empty remap (file had 0 old records).
-                        // mmap(len=0) returns MAP_FAILED, so don't map — but the
-                        // np pairs must still be consumed to keep the patch
-                        // cursor in sync (matches the pre-check behaviour).
-                        for (uint32_t i = 0; i < np; i++) { ru32(); ru32(); }
-                        close(rfd);
-                    } else {
-                        uint32_t* remap_data = static_cast<uint32_t*>(
-                            mmap(nullptr, remap_size, PROT_READ | PROT_WRITE, MAP_SHARED, rfd, 0));
-                        if (remap_data == MAP_FAILED) {
-                            std::cerr << "  ERROR: mmap failed on " << remap_path << std::endl;
-                            close(rfd);
-                            return 1;
-                        }
-                        size_t remap_count = remap_size / 4;
-                        for (uint32_t i = 0; i < np; i++) {
-                            uint32_t o = ru32(), n = ru32();
-                            if (o < remap_count) remap_data[o] = n + 1; // +1 encoding
-                        }
-                        munmap(remap_data, remap_size);
-                        close(rfd);
-                    }
-                } else {
-                    // Skip data if file doesn't exist
-                    for (uint32_t i = 0; i < np; i++) { ru32(); ru32(); }
+                require_bytes((size_t)np * 8, "secondary remap");
+                auto it = record_remaps.find(fid);
+                for (uint32_t i = 0; i < np; i++) {
+                    uint32_t o = ru32(), n = ru32();
+                    if (it != record_remaps.end()) it->second.add_pair(o, n);
                 }
                 std::cerr << "  Secondary remap " << fid << ": " << np << " pairs" << std::endl;
             }
@@ -673,36 +644,7 @@ static int run(int argc, char* argv[]) {
                      file_id == (uint32_t)PatchFileId::INTERP_WAYS ||
                      file_id == (uint32_t)PatchFileId::POI_RECORDS ||
                      file_id == (uint32_t)PatchFileId::PLACE_NODES;
-        // File-backed id_map: create temp file, fill with 0xFF, mmap read-write
-        int remap_fd = -1;
-        uint32_t* id_map_ptr = nullptr;
-        std::string remap_path;
-        if (track) {
-            remap_path = tmpdir + "/remap_" + std::to_string(file_id) + ".bin";
-            remap_fd = open(remap_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
-            if (remap_fd < 0) {
-                std::cerr << "  ERROR: failed to create remap file " << remap_path << std::endl;
-                return 1;
-            }
-            size_t remap_bytes = n_old_records * 4;
-            if (ftruncate(remap_fd, remap_bytes) != 0) { // zero-filled by OS (sparse)
-                std::cerr << "  ERROR: ftruncate failed on " << remap_path << std::endl;
-                close(remap_fd);
-                return 1;
-            }
-            id_map_ptr = static_cast<uint32_t*>(
-                mmap(nullptr, remap_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, remap_fd, 0));
-            // Only treat MAP_FAILED as fatal when there were records to map;
-            // a zero-length old file legitimately yields remap_bytes==0 (mmap
-            // returns MAP_FAILED for len 0) and id_map_ptr is never read.
-            if (remap_bytes > 0 && id_map_ptr == MAP_FAILED) {
-                std::cerr << "  ERROR: mmap failed on " << remap_path << std::endl;
-                close(remap_fd);
-                return 1;
-            }
-            // File is zero-filled. We store new_index+1 so that 0 means "unmapped".
-            // The entry pipeline reads these and subtracts 1.
-        }
+        RecordRemap remap(track ? static_cast<uint32_t>(n_old_records) : 0);
 
         // Per-record buffer for applying remap/fixups inline (avoid copying entire file)
         std::vector<char> rec_buf(actual_stride);
@@ -809,8 +751,8 @@ static int run(int argc, char* argv[]) {
                         // No modification needed — write directly from mmap
                         fwrite(old_mmap.data + rec_off, 1, actual_stride, outf);
                     }
-                    if (track && old_rec + k < n_old_records) id_map_ptr[old_rec + k] = (uint32_t)(new_rec + k) + 1; // +1 so 0 means unmapped
                 }
+                if (track) remap.add_match(static_cast<uint32_t>(old_rec), static_cast<uint32_t>(new_rec), count);
                 written += count * actual_stride;
                 old_rec += count; new_rec += count; old_bytes += count * actual_stride;
             } else if (op == OP_INSERT_RUN) {
@@ -828,15 +770,8 @@ static int run(int argc, char* argv[]) {
         unmap_file(old_mmap);
 
         if (track) {
-            // munmap without msync: the entry pipeline maps the same file
-            // and reads these pages from the page cache. Forcing them to
-            // disk wrote ~1 GiB of planet/full scratch the patcher deletes.
-            size_t remap_bytes = n_old_records * 4;
-            if (remap_bytes > 0) munmap(id_map_ptr, remap_bytes);
-            close(remap_fd);
-            id_map_ptr = nullptr;
-            id_remaps[file_id] = {}; // empty placeholder
-            std::cerr << "  " << fname << ": " << written << " bytes (remap " << n_old_records << " records to disk)" << std::endl;
+            record_remaps[file_id] = std::move(remap);
+            std::cerr << "  " << fname << ": " << written << " bytes (remap of " << n_old_records << " records)" << std::endl;
         } else {
             std::cerr << "  " << fname << ": " << written << " bytes" << std::endl;
         }
@@ -860,31 +795,16 @@ static int run(int argc, char* argv[]) {
         double t_entry = now_ms();
         std::cerr << "Entry pipeline (lean streaming)..." << std::endl;
 
-        // mmap remap files from disk (only pages accessed are in RSS)
-        auto mmap_remap = [&](PatchFileId fid) -> MappedFile {
-            std::string path = tmpdir + "/remap_" + std::to_string((uint32_t)fid) + ".bin";
-            auto m = mmap_file(path);
-            if (m.data) madvise(const_cast<char*>(m.data), m.size, MADV_SEQUENTIAL);
-            return m;
+        // A file sent unchanged has no remap: its ids keep their values.
+        for (auto& kv : record_remaps) kv.second.finish();
+        const RecordRemap no_remap;
+        auto remap_of = [&](PatchFileId fid) -> const RecordRemap& {
+            auto it = record_remaps.find((uint32_t)fid);
+            return it != record_remaps.end() ? it->second : no_remap;
         };
-        // Helper: look up remap value from mmap'd file
-        // Remap values stored as new_index+1 (0 means unmapped)
-        struct RemapRef {
-            const uint32_t* data;
-            size_t count;
-            uint32_t operator[](size_t i) const {
-                if (i >= count) return 0xFFFFFFFF;
-                uint32_t v = data[i];
-                return v == 0 ? 0xFFFFFFFF : v - 1;
-            }
-            size_t size() const { return count; }
-        };
-        MappedFile m_w_rm = mmap_remap(PatchFileId::STREET_WAYS);
-        MappedFile m_a_rm = mmap_remap(PatchFileId::ADDR_POINTS);
-        MappedFile m_i_rm = mmap_remap(PatchFileId::INTERP_WAYS);
-        RemapRef w_rm = {(const uint32_t*)m_w_rm.data, m_w_rm.size / 4};
-        RemapRef a_rm = {(const uint32_t*)m_a_rm.data, m_a_rm.size / 4};
-        RemapRef i_rm = {(const uint32_t*)m_i_rm.data, m_i_rm.size / 4};
+        const RecordRemap& w_rm = remap_of(PatchFileId::STREET_WAYS);
+        const RecordRemap& a_rm = remap_of(PatchFileId::ADDR_POINTS);
+        const RecordRemap& i_rm = remap_of(PatchFileId::INTERP_WAYS);
 
         // mmap old files (zero RSS until pages are accessed, then only working set)
         MappedFile m_geo = mmap_file(cur_dir + "/geo_cells.bin");
@@ -952,7 +872,7 @@ static int run(int argc, char* argv[]) {
             buf.resize(c);
             memcpy(buf.data(), f.data + off + 2, c * 4);
         };
-        auto remap = [](std::vector<uint32_t>& ids, const RemapRef& rm) {
+        auto remap = [](std::vector<uint32_t>& ids, const RecordRemap& rm) {
             constexpr uint32_t NO2 = 0xFFFFFFFF;
             for (auto& id : ids) if (id < rm.size() && rm[id] != NO2) id = rm[id];
             std::sort(ids.begin(), ids.end());
@@ -979,7 +899,7 @@ static int run(int argc, char* argv[]) {
         constexpr size_t ADDED = SIZE_MAX;
         auto process_cell = [&](uint64_t cid, size_t oi) {
             // For each entry type: check correction → remap old → write
-            auto do_entry = [&](const MappedFile& old_e, size_t geo_off, const RemapRef& rm,
+            auto do_entry = [&](const MappedFile& old_e, size_t geo_off, const RecordRemap& rm,
                                 CorrCursor& corr,
                                 EntriesOut& outf, uint8_t flag_bit) -> uint32_t {
                 // Check flag
@@ -1040,7 +960,6 @@ static int run(int argc, char* argv[]) {
 
         fclose(f_geo); fclose(o_se.f); fclose(o_ae.f); fclose(o_ie.f);
         unmap_file(m_geo); unmap_file(m_se); unmap_file(m_ae); unmap_file(m_ie);
-        unmap_file(m_w_rm); unmap_file(m_a_rm); unmap_file(m_i_rm);
         std::cerr << "  Geo: " << cells_written << " cells written" << std::endl;
         malloc_trim(0);
         log_phase("  Geo entries complete", t_entry);
@@ -1140,9 +1059,7 @@ static int run(int argc, char* argv[]) {
         auto rebuild_by_record_remap = [&](const char* label, PatchFileId records_fid, PatchFileId entries_fid,
                                            const std::string& prefix, const std::vector<uint64_t>& added,
                                            const std::vector<uint64_t>& removed) {
-            MappedFile m_rm = mmap_remap(records_fid);
-            if (m_rm.data) madvise(const_cast<char*>(m_rm.data), m_rm.size, MADV_NORMAL);
-            RemapRef rm{(const uint32_t*)m_rm.data, m_rm.size / 4};
+            const RecordRemap& rm = remap_of(records_fid);
             auto record_remap = [&rm](uint32_t id) { uint32_t v = rm[id]; return v == 0xFFFFFFFFu ? id : v; };
             if (!stream_rebuild(label, entries_fid, prefix, added, removed, record_remap)) {
                 std::unordered_map<uint32_t,uint32_t> rm_map;
@@ -1156,7 +1073,6 @@ static int run(int argc, char* argv[]) {
                                           prefix + "_cells.bin", prefix + "_entries.bin");
                 }
             }
-            if (m_rm.data) unmap_file(m_rm);
             log_phase((std::string("  ") + label).c_str(), t_entry);
         };
         rebuild_by_record_remap("POI", PatchFileId::POI_RECORDS, PatchFileId::POI_ENTRIES, "poi", poi_added, poi_removed);

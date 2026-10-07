@@ -655,3 +655,25 @@ TEST(patch_format_string_remap_runs_match_per_string_pairs) {
         CHECK_EQ(remap.lookup(0xFFFFFFFFu), 0xFFFFFFFFu);
     }
 }
+
+// --- record id remap ---
+
+TEST(patch_format_record_remap_matches_and_secondary_pairs) {
+    // MATCH runs map kept records; unmatched ones map to NONE; a secondary
+    // match overrides (the last one for an id wins); ids past the old file
+    // and pairs for them are ignored.
+    RecordRemap rm(10);
+    rm.add_match(0, 0, 3);    // 0..2 → 0..2
+    rm.add_match(3, 3, 1);    // extends the run
+    rm.add_match(6, 9, 10);   // 6..9 → 9..12, clipped at the old size
+    rm.add_pair(4, 50);
+    rm.add_pair(1, 60);
+    rm.add_pair(1, 61);
+    rm.add_pair(12, 7);
+    rm.finish();
+    const uint32_t N = RecordRemap::NONE;
+    const std::vector<uint32_t> want = {0, 61, 2, 3, 50, N, 9, 10, 11, 12};
+    for (uint32_t i = 0; i < 10; i++) CHECK_EQ(rm[i], want[i]);
+    CHECK_EQ(rm[10], N);
+    CHECK_EQ(RecordRemap()[0], N);
+}

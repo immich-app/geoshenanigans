@@ -983,6 +983,70 @@ uint64_t stream_cell_list_delta(const char* cells, size_t cells_size, const char
                              delta, delta_size, out_cells, out_entries);
 }
 
+// --- Record id remap (patcher) ---
+
+// Old → new record ids of a replayed data file: the MATCH runs of its merge
+// sequence plus the diff's secondary matches. Strategy-2 slots keep these
+// to long runs of one shift, so this holds a few MB where the patcher used
+// to write a 4-byte-per-record scratch file (~1 GB for planet/full) and read
+// it at random from the entry pipeline: page-cache thrash on a 1 GiB client.
+class RecordRemap {
+public:
+    static constexpr uint32_t NONE = 0xFFFFFFFFu;
+
+    explicit RecordRemap(uint32_t n_old = 0) : n_old_(n_old) {}
+
+    // `count` old records from old_start were kept as new_start onwards.
+    void add_match(uint32_t old_start, uint32_t new_start, uint32_t count) {
+        if (old_start >= n_old_) return;
+        count = std::min(count, n_old_ - old_start);
+        if (count == 0) return;
+        if (!runs_.empty()) {
+            Run& last = runs_.back();
+            if (last.old_start + last.count == old_start && last.new_start + last.count == new_start) {
+                last.count += count;
+                return;
+            }
+        }
+        runs_.push_back({old_start, new_start, count});
+    }
+    // A secondary match: old_id now maps to new_id; the last one for an id wins.
+    void add_pair(uint32_t old_id, uint32_t new_id) {
+        if (old_id < n_old_) pairs_.push_back({old_id, new_id});
+    }
+    void finish() {
+        std::stable_sort(pairs_.begin(), pairs_.end(),
+                         [](const auto& a, const auto& b) { return a.first < b.first; });
+        std::vector<std::pair<uint32_t, uint32_t>> last;
+        for (size_t i = 0; i < pairs_.size(); i++)
+            if (i + 1 == pairs_.size() || pairs_[i + 1].first != pairs_[i].first) last.push_back(pairs_[i]);
+        pairs_.swap(last);
+    }
+
+    size_t size() const { return n_old_; }
+    // The new id of old record `old`, or NONE when it wasn't kept.
+    uint32_t operator[](size_t old) const {
+        if (old >= n_old_) return NONE;
+        uint32_t o = static_cast<uint32_t>(old);
+        if (!pairs_.empty()) {
+            auto p = std::lower_bound(pairs_.begin(), pairs_.end(), std::make_pair(o, 0u),
+                                      [](const auto& a, const auto& b) { return a.first < b.first; });
+            if (p != pairs_.end() && p->first == o) return p->second;
+        }
+        auto it = std::upper_bound(runs_.begin(), runs_.end(), o,
+                                   [](uint32_t v, const Run& r) { return v < r.old_start; });
+        if (it == runs_.begin()) return NONE;
+        --it;
+        return o < it->old_start + it->count ? it->new_start + (o - it->old_start) : NONE;
+    }
+
+private:
+    struct Run { uint32_t old_start, new_start, count; };
+    uint32_t n_old_;
+    std::vector<Run> runs_;
+    std::vector<std::pair<uint32_t, uint32_t>> pairs_;
+};
+
 // --- String offset remap (patcher) ---
 
 // The patcher's old → new string offset map. Between two edits every
