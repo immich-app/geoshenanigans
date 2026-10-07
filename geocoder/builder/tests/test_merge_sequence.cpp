@@ -95,6 +95,32 @@ TEST(merge_child_blocks_match_keeps_equal_blocks_and_resends_changed_ones) {
     CHECK(got == want);
 }
 
+TEST(merge_child_blocks_edited_block_keeps_its_head_and_tail) {
+    // One vertex moved inside a long ring: only the middle travels.
+    MergeSequence parent;
+    parent.add_match(1);
+    Stream old_s{"headXXtail", {{0, 10}}}, new_s{"headYYYtail", {{0, 11}}};
+    auto got = ops_of(merge(parent, old_s, new_s), 1);
+    std::vector<Op> want = {{OP_MATCH_RUN, 4, ""}, {OP_DELETE_RUN, 2, ""}, {OP_INSERT_RUN, 3, "YYY"},
+                            {OP_MATCH_RUN, 4, ""}};
+    CHECK(got == want);
+}
+
+TEST(merge_child_blocks_trims_whole_units_only) {
+    // Node streams keep whole 8-byte nodes: a node whose first byte matches
+    // still travels whole.
+    MergeSequence parent;
+    parent.add_match(1);
+    std::string o = std::string(8, 'a') + "bxxxxxxx" + std::string(8, 'c');
+    std::string n = std::string(8, 'a') + "byyyyyyy" + std::string(8, 'c');
+    std::vector<ChildBlock> ob = {{0, 24}}, nb = {{0, 24}};
+    auto seq = merge_child_blocks(parent, PARENT_STRIDE, 8, o.data(), o.size(), n.data(), n.size(),
+                                  [&](size_t i) { return ob[i]; }, [&](size_t i) { return nb[i]; });
+    std::vector<Op> want = {{OP_MATCH_RUN, 1, ""}, {OP_DELETE_RUN, 1, ""}, {OP_INSERT_RUN, 1, "byyyyyyy"},
+                            {OP_MATCH_RUN, 1, ""}};
+    CHECK(ops_of(seq, 8) == want);
+}
+
 TEST(merge_child_blocks_follows_inserted_and_deleted_parents) {
     MergeSequence parent;
     parent.add_delete(1);

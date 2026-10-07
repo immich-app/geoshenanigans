@@ -206,6 +206,23 @@ MergeSequence merge_child_blocks(const MergeSequence& parent_seq, size_t parent_
                     && (ob.size == 0 || memcmp(old_child + ob.off, new_child + nb.off, ob.size) == 0);
         if (same) {
             if (ob.size > 0) emit_match(ob.size);
+        } else if (ob.size > 0 && nb.size > 0 && in_old(ob) && in_new(nb)) {
+            // An edited block (one moved vertex in a long boundary ring, a
+            // node added mid-way) keeps its unchanged head and tail in
+            // whole units; only the middle travels.
+            const char* o = old_child + ob.off;
+            const char* n = new_child + nb.off;
+            size_t lim = std::min(ob.size, nb.size);
+            size_t head = 0;
+            while (head < lim && o[head] == n[head]) head++;
+            head -= head % unit;
+            size_t tail = 0;
+            while (tail < lim - head && o[ob.size - 1 - tail] == n[nb.size - 1 - tail]) tail++;
+            tail -= tail % unit;
+            if (head > 0) emit_match(head);
+            if (ob.size > head + tail) emit_del(ob.size - head - tail);
+            if (nb.size > head + tail) emit_ins({nb.off + head, nb.size - head - tail});
+            if (tail > 0) emit_match(tail);
         } else {
             drop(ob);
             append(nb);
