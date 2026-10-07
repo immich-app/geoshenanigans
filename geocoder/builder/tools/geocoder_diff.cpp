@@ -194,6 +194,79 @@ static MergeSequence build_merge_seq(
     return seq;
 }
 
+// A child stream (street/interp nodes, *_vertices bytes) merged along its
+// parent's merge sequence: a parent MATCH keeps its child block when the
+// bytes are equal, a DELETE drops the old block and an INSERT appends the
+// new one. old_block(i) / new_block(i) give parent i's block; ops count
+// `unit`-byte child records.
+struct ChildBlock { size_t off, size; };
+
+template <typename OldBlock, typename NewBlock>
+static MergeSequence merge_child_blocks(const MergeSequence& parent_seq, size_t parent_stride, size_t unit,
+                                        const char* old_child, size_t old_child_size,
+                                        const char* new_child, size_t new_child_size,
+                                        OldBlock old_block, NewBlock new_block) {
+    // Coalesce adjacent same-type ops. The patch tool replays the child
+    // stream sequentially (MATCH n = copy n old units, DELETE n = drop n
+    // old, INSERT = append), so merged runs give identical output; one op
+    // per parent record cost tens of MiB of opcodes on planet even when
+    // nothing changed. Deletes and inserts within a non-match stretch
+    // group as one DELETE then one INSERT (deletes only advance the old
+    // cursor, inserts append contiguous new bytes).
+    MergeSequence seq;
+    uint32_t m_run = 0, d_run = 0;
+    const char* ins_ptr = nullptr; uint32_t ins_cnt = 0;  // contiguous span in new_child (units)
+    auto flush_match = [&]{ if (m_run) { seq.add_match(m_run); m_run = 0; } };
+    auto flush_del   = [&]{ if (d_run) { seq.add_delete(d_run); d_run = 0; } };
+    auto flush_ins   = [&]{ if (ins_cnt) { seq.add_insert(ins_ptr, ins_cnt, unit); ins_cnt = 0; ins_ptr = nullptr; } };
+    auto emit_match  = [&](size_t bytes){ flush_del(); flush_ins(); m_run += static_cast<uint32_t>(bytes / unit); };
+    auto emit_del    = [&](size_t bytes){ flush_match(); d_run += static_cast<uint32_t>(bytes / unit); };
+    auto emit_ins    = [&](const ChildBlock& b){
+        flush_match();
+        const char* p = new_child + b.off;
+        uint32_t n = static_cast<uint32_t>(b.size / unit);
+        if (ins_cnt && ins_ptr + (size_t)ins_cnt * unit == p) ins_cnt += n;
+        else { flush_ins(); ins_ptr = p; ins_cnt = n; }
+    };
+    auto in_old = [&](const ChildBlock& b) { return b.off + b.size <= old_child_size; };
+    auto in_new = [&](const ChildBlock& b) { return b.off + b.size <= new_child_size; };
+
+    size_t oi = 0, ni = 0, pos = 0;
+    while (pos < parent_seq.data.size()) {
+        uint8_t op = static_cast<uint8_t>(parent_seq.data[pos]); pos++;
+        uint32_t count; memcpy(&count, parent_seq.data.data() + pos, 4); pos += 4;
+        if (op == OP_MATCH_RUN) {
+            for (uint32_t k = 0; k < count; k++) {
+                ChildBlock ob = old_block(oi + k), nb = new_block(ni + k);
+                bool same = ob.size == nb.size && in_old(ob) && in_new(nb)
+                            && (ob.size == 0 || memcmp(old_child + ob.off, new_child + nb.off, ob.size) == 0);
+                if (same) {
+                    if (ob.size > 0) emit_match(ob.size);
+                } else {
+                    if (ob.size > 0) emit_del(ob.size);
+                    if (nb.size > 0) emit_ins(nb);
+                }
+            }
+            oi += count; ni += count;
+        } else if (op == OP_INSERT_RUN) {
+            for (uint32_t k = 0; k < count; k++) {
+                ChildBlock nb = new_block(ni + k);
+                if (nb.size > 0 && in_new(nb)) emit_ins(nb);
+            }
+            pos += (size_t)count * parent_stride;  // skip the inline parent records
+            ni += count;
+        } else if (op == OP_DELETE_RUN) {
+            for (uint32_t k = 0; k < count; k++) {
+                ChildBlock ob = old_block(oi + k);
+                if (ob.size > 0) emit_del(ob.size);
+            }
+            oi += count;
+        }
+    }
+    flush_match(); flush_del(); flush_ins();
+    return seq;
+}
+
 // --- String remap ---
 
 static std::unordered_map<uint32_t, uint32_t> build_string_remap(
@@ -977,18 +1050,12 @@ static int run(int argc, char* argv[]) {
     // Group 4: admin_polygons → admin_vertices (sequential within group)
     FileMergeResult res_addr, res_addr_v, res_ways, res_nodes, res_interp_w, res_interp_n, res_admin_p, res_admin_v, res_poi_r, res_poi_v, res_place_n;
 
-    // build_child_merge (below) builds the node merge of street_ways /
-    // interp_ways from the parent way merge: node_count is read with
-    // record_node_count (u16 at byte 4; u8 in the legacy packed strides),
-    // off_field_pos is the byte offset of node_offset (0 for both).
     // Byte-block merge for the v15 variable-stride vertex stream
-    // (admin_vertices / poi_vertices). The vertex bytes for polygon i
-    // live at the polygon's `vertex_offset` and run until the next
-    // polygon's `vertex_offset` (or end-of-file for the last). This
-    // walks the parent record merge sequence and emits a stride=1
-    // byte-stream merge that the patcher's existing replay loop can
-    // apply directly. Replaces the previous "emit the whole new file
-    // as raw" path that made every quality patch ~size-of-file.
+    // (admin_vertices / poi_vertices / addr_vertices / postal_vertices). The
+    // vertex bytes for polygon i live at the polygon's `vertex_offset` and
+    // run until the next polygon's `vertex_offset` (or end-of-file for the
+    // last). Replaces the previous "emit the whole new file as raw" path
+    // that made every quality patch ~size-of-file.
     //
     // Correctness depends on: (a) simplification being deterministic
     // (verified — the existing patch verify is byte-identical), and
@@ -1032,157 +1099,38 @@ static int run(int argc, char* argv[]) {
         };
         auto old_off_sz = compute_block_sizes(old_parent, old_parent_size, old_verts_size);
         auto new_off_sz = compute_block_sizes(new_parent, new_parent_size, new_verts_size);
-        auto block = [&](bool is_new, size_t i) -> std::pair<size_t, size_t> {
-            const auto& v = is_new ? new_off_sz : old_off_sz;
-            if (i >= v.first.size() || v.second[i] == 0) return {0, 0};
-            return {v.first[i], v.second[i]};
+        auto block_of = [](const std::pair<std::vector<uint32_t>, std::vector<uint32_t>>& v) {
+            return [&v](size_t i) -> ChildBlock {
+                if (i >= v.first.size() || v.second[i] == 0) return {0, 0};
+                return {v.first[i], v.second[i]};
+            };
         };
-        size_t old_n = old_parent_size / parent_stride;
-        size_t new_n = new_parent_size / parent_stride;
-        (void)old_n; (void)new_n;
-        MergeSequence vseq;
-        // Coalesce adjacent same-type ops on the byte stream — see the
-        // matching note in build_child_merge. The child stride is 1
-        // (raw bytes); counts are byte counts. Without this, every stable
-        // polygon block emitted its own 5-byte MATCH op (~tens of MiB of
-        // opcode overhead on planet addr_vertices) despite the bytes being
-        // unchanged.
-        uint32_t m_run = 0, d_run = 0;
-        const char* ins_ptr = nullptr; uint32_t ins_cnt = 0;  // contiguous span in new_verts (bytes)
-        auto flush_match = [&]{ if (m_run) { vseq.add_match(m_run); m_run = 0; } };
-        auto flush_del   = [&]{ if (d_run) { vseq.add_delete(d_run); d_run = 0; } };
-        auto flush_ins   = [&]{ if (ins_cnt) { vseq.add_insert(ins_ptr, ins_cnt, 1); ins_cnt = 0; ins_ptr = nullptr; } };
-        auto emit_match  = [&](uint32_t n){ flush_del(); flush_ins(); m_run += n; };
-        auto emit_del    = [&](uint32_t n){ flush_match(); d_run += n; };
-        auto emit_ins    = [&](const char* p, uint32_t n){
-            flush_match();
-            if (ins_cnt && ins_ptr + ins_cnt == p) ins_cnt += n;
-            else { flush_ins(); ins_ptr = p; ins_cnt = n; }
-        };
-        size_t p_oi = 0, p_ni = 0, ppos = 0;
-        while (ppos < parent_seq.data.size()) {
-            uint8_t op = static_cast<uint8_t>(parent_seq.data[ppos]); ppos++;
-            uint32_t count; memcpy(&count, parent_seq.data.data() + ppos, 4); ppos += 4;
-            if (op == OP_MATCH_RUN) {
-                for (uint32_t k = 0; k < count; k++) {
-                    auto ob = block(false, p_oi + k);
-                    auto nb = block(true,  p_ni + k);
-                    bool same = (ob.second == nb.second
-                                 && ob.first  + ob.second <= old_verts_size
-                                 && nb.first  + nb.second <= new_verts_size
-                                 && (ob.second == 0
-                                     || memcmp(old_verts + ob.first, new_verts + nb.first, ob.second) == 0));
-                    if (same) {
-                        if (ob.second > 0) emit_match(static_cast<uint32_t>(ob.second));
-                    } else {
-                        if (ob.second > 0) emit_del(static_cast<uint32_t>(ob.second));
-                        if (nb.second > 0) emit_ins(new_verts + nb.first, static_cast<uint32_t>(nb.second));
-                    }
-                }
-                p_oi += count; p_ni += count;
-            } else if (op == OP_INSERT_RUN) {
-                for (uint32_t k = 0; k < count; k++) {
-                    auto nb = block(true, p_ni + k);
-                    if (nb.second > 0) emit_ins(new_verts + nb.first, static_cast<uint32_t>(nb.second));
-                }
-                ppos += count * parent_stride; // skip the inline parent records
-                p_ni += count;
-            } else if (op == OP_DELETE_RUN) {
-                for (uint32_t k = 0; k < count; k++) {
-                    auto ob = block(false, p_oi + k);
-                    if (ob.second > 0) emit_del(static_cast<uint32_t>(ob.second));
-                }
-                p_oi += count;
-            }
-        }
-        flush_match(); flush_del(); flush_ins();
-        return vseq;
+        return merge_child_blocks(parent_seq, parent_stride, 1, old_verts, old_verts_size,
+                                  new_verts, new_verts_size, block_of(old_off_sz), block_of(new_off_sz));
     };
 
+    // Node merge of street_ways / interp_ways from the parent way merge:
+    // node_count is read with record_node_count (u16 at byte 4; u8 in the
+    // legacy packed strides), off_field_pos is the byte offset of
+    // node_offset (0 for both).
     auto build_child_merge = [](const MergeSequence& parent_seq,
-                                 const char* old_parent, size_t old_parent_size,
-                                 const char* new_parent, size_t new_parent_size,
+                                 const char* old_parent, size_t /*old_parent_size*/,
+                                 const char* new_parent, size_t /*new_parent_size*/,
                                  const char* old_child, size_t old_child_size,
                                  const char* new_child, size_t new_child_size,
                                  size_t parent_stride, size_t packed_stride,
                                  size_t off_field_pos = 0) -> MergeSequence {
-        MergeSequence seq;
-        auto read_count = [&](const char* rec) -> uint32_t {
-            return record_node_count(rec, parent_stride, packed_stride);
+        auto block_of = [=](const char* parent) {
+            return [=](size_t i) -> ChildBlock {
+                const char* rec = parent + i * parent_stride;
+                uint32_t off; memcpy(&off, rec + off_field_pos, 4);
+                // node_byte_offset widens before `* 8`: planet street_nodes
+                // passes 2^29 nodes, where 32-bit math wraps.
+                return {node_byte_offset(off), (size_t)record_node_count(rec, parent_stride, packed_stride) * 8};
+            };
         };
-        auto read_off = [&](const char* rec) -> uint32_t {
-            uint32_t v; memcpy(&v, rec + off_field_pos, 4); return v;
-        };
-        // Coalesce adjacent same-type ops. The patch tool replays the
-        // child stream sequentially (MATCH n = copy n old records, DELETE n
-        // = drop n old, INSERT bytes = append), so merging runs is a pure
-        // size optimization with identical output. Previously this emitted
-        // one op per parent record — on planet that's ~570 M five-byte
-        // MATCH ops (~tens of MiB of pure opcode overhead) even when every
-        // record was unchanged. Deletes+inserts within a non-match run are
-        // grouped as one DELETE then one INSERT (deletes only advance the
-        // old cursor; inserts append contiguous new bytes), which is
-        // equivalent to the original interleaved del/ins per record.
-        uint32_t m_run = 0, d_run = 0;
-        const char* ins_ptr = nullptr; uint32_t ins_cnt = 0;  // contiguous span in new_child (records)
-        auto flush_match = [&]{ if (m_run) { seq.add_match(m_run); m_run = 0; } };
-        auto flush_del   = [&]{ if (d_run) { seq.add_delete(d_run); d_run = 0; } };
-        auto flush_ins   = [&]{ if (ins_cnt) { seq.add_insert(ins_ptr, ins_cnt, 8); ins_cnt = 0; ins_ptr = nullptr; } };
-        auto emit_match  = [&](uint32_t vc){ flush_del(); flush_ins(); m_run += vc; };
-        auto emit_del    = [&](uint32_t vc){ flush_match(); d_run += vc; };
-        auto emit_ins    = [&](const char* p, uint32_t vc){
-            flush_match();
-            if (ins_cnt && ins_ptr + (size_t)ins_cnt * 8 == p) ins_cnt += vc;
-            else { flush_ins(); ins_ptr = p; ins_cnt = vc; }
-        };
-
-        size_t p_oi = 0, p_ni = 0, ppos = 0;
-        while (ppos < parent_seq.data.size()) {
-            uint8_t op = static_cast<uint8_t>(parent_seq.data[ppos]); ppos++;
-            uint32_t count; memcpy(&count, parent_seq.data.data() + ppos, 4); ppos += 4;
-            if (op == OP_MATCH_RUN) {
-                for (uint32_t k = 0; k < count; k++) {
-                    uint32_t old_off = read_off(old_parent + (p_oi+k)*parent_stride);
-                    uint32_t vc = read_count(old_parent + (p_oi+k)*parent_stride);
-                    uint32_t new_off = read_off(new_parent + (p_ni+k)*parent_stride);
-                    if (vc > 0) {
-                        // 32-bit `off * 8` wraps past 512 M records (planet
-                        // street_nodes is ~600 M), which produces wildly
-                        // wrong memcmp offsets and emits bogus INSERT/DELETE
-                        // pairs deep in the file.
-                        size_t old_byte_off = node_byte_offset(old_off);
-                        size_t new_byte_off = node_byte_offset(new_off);
-                        size_t vc_bytes = (size_t)vc * 8;
-                        bool match = old_byte_off + vc_bytes <= old_child_size &&
-                                    new_byte_off + vc_bytes <= new_child_size &&
-                                    memcmp(old_child + old_byte_off, new_child + new_byte_off, vc_bytes) == 0;
-                        if (match) emit_match(vc);
-                        else { emit_del(vc); emit_ins(new_child + new_byte_off, vc); }
-                    }
-                }
-                p_oi += count; p_ni += count;
-            } else if (op == OP_INSERT_RUN) {
-                for (uint32_t k = 0; k < count; k++) {
-                    const char* rec = parent_seq.data.data() + ppos + k * parent_stride;
-                    uint32_t off = read_off(rec);
-                    uint32_t vc = read_count(rec);
-                    size_t byte_off = node_byte_offset(off);
-                    size_t vc_bytes = (size_t)vc * 8;
-                    if (vc > 0 && byte_off + vc_bytes <= new_child_size)
-                        emit_ins(new_child + byte_off, vc);
-                }
-                ppos += count * parent_stride;
-                p_ni += count;
-            } else if (op == OP_DELETE_RUN) {
-                for (uint32_t k = 0; k < count; k++) {
-                    uint32_t vc = read_count(old_parent + (p_oi+k)*parent_stride);
-                    if (vc > 0) emit_del(vc);
-                }
-                p_oi += count;
-            }
-        }
-        flush_match(); flush_del(); flush_ins();
-        return seq;
+        return merge_child_blocks(parent_seq, parent_stride, 8, old_child, old_child_size,
+                                  new_child, new_child_size, block_of(old_parent), block_of(new_parent));
     };
 
     // --- Timing helper ---
