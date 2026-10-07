@@ -537,55 +537,62 @@ static int run(int argc, char* argv[]) {
             uint32_t value_stride = ru32();
             uint32_t remap_kind = ru32();
             uint32_t n_changes = ru32();
-            require_bytes((size_t)n_changes * (4 + value_stride), "sparse changes");
+            if (value_stride != 4 && value_stride != 16) throw std::runtime_error("Malformed sparse delta");
+            const size_t change_size = 4 + value_stride;
+            const char* changes = take((size_t)n_changes * change_size, "sparse changes");
 
-            // Load OLD bytes, apply the same remap the diff applied
-            // before computing the delta, then overwrite at each
-            // (pos, value) pair to produce NEW.
-            std::vector<char> buf((size_t)new_size, 0);
+            // OLD bytes with the same remap the diff applied before computing
+            // the delta, then each (pos, value) pair overwritten, give NEW.
+            // Streamed through a 1 MiB buffer (the changes come sorted by
+            // position): holding the whole file cost ~700 MiB of client
+            // memory for planet addr_postcodes.
             MappedFile old_mmap = mmap_file(cur_dir + "/" + std::string(fname));
-            size_t copy_n = std::min((size_t)old_size, (size_t)new_size);
-            if (old_mmap.data && copy_n > 0) {
-                memcpy(buf.data(), old_mmap.data, copy_n);
-            }
-            if (old_mmap.data) unmap_file(old_mmap);
-
+            if (old_mmap.data) madvise(const_cast<char*>(old_mmap.data), old_mmap.size, MADV_SEQUENTIAL);
+            const size_t copy_n = old_mmap.data ? std::min({(size_t)old_size, (size_t)new_size, old_mmap.size}) : 0;
             constexpr uint32_t NO_DATA_VAL = 0xFFFFFFFFu;
-            if (remap_kind == 1 && !poi_admin_remap.empty() && value_stride == 4) {
-                size_t n_records = copy_n / 4;
-                for (size_t i = 0; i < n_records; i++) {
-                    uint32_t v; memcpy(&v, buf.data() + i * 4, 4);
-                    if (v == NO_DATA_VAL) continue;
-                    uint32_t nv = poi_remap_lookup(poi_admin_remap, v);
-                    if (nv != v) memcpy(buf.data() + i * 4, &nv, 4);
-                }
-            } else if (remap_kind == 2 && !str_remap.empty() && value_stride == 4) {
-                size_t n_records = copy_n / 4;
-                for (size_t i = 0; i < n_records; i++) {
-                    uint32_t v; memcpy(&v, buf.data() + i * 4, 4);
-                    if (v == NO_DATA_VAL) continue;
-                    uint32_t nv = str_remap_lookup(v);
-                    if (nv != v) memcpy(buf.data() + i * 4, &nv, 4);
-                }
-            } else if (remap_kind == 3 && !str_remap.empty() && value_stride == 16) {
-                size_t n_records = copy_n / 16;
-                for (size_t i = 0; i < n_records; i++) {
-                    uint32_t pid; memcpy(&pid, buf.data() + i * 16 + 8, 4);
-                    if (pid == NO_DATA_VAL) continue;
-                    uint32_t npid = str_remap_lookup(pid);
-                    if (npid != pid) memcpy(buf.data() + i * 16 + 8, &npid, 4);
-                }
-            }
+            auto remap_value = [&](uint32_t v) -> uint32_t {
+                if (v == NO_DATA_VAL) return v;
+                if (remap_kind == 1) return poi_remap_lookup(poi_admin_remap, v);
+                return str_remap_lookup(v);
+            };
+            // Field of each record the remap applies to (postcode_id at
+            // byte 8 of a 16-byte postcode_centroid), or none.
+            const bool remapped = (remap_kind == 1 && !poi_admin_remap.empty() && value_stride == 4) ||
+                                  (remap_kind == 2 && !str_remap.empty() && value_stride == 4) ||
+                                  (remap_kind == 3 && !str_remap.empty() && value_stride == 16);
+            const size_t field = value_stride == 16 ? 8 : 0;
 
-            for (uint32_t i = 0; i < n_changes; i++) {
-                uint32_t arr_pos = ru32();
-                const char* value = take(value_stride, "sparse value");
-                size_t byte_off = (size_t)arr_pos * value_stride;
-                if (byte_off + value_stride <= (size_t)new_size)
-                    memcpy(buf.data() + byte_off, value, value_stride);
+            FILE* out = open_out(fname);
+            constexpr size_t CHUNK = 1 << 20;  // a multiple of both value strides
+            std::vector<char> buf(CHUNK);
+            uint32_t ci = 0;
+            uint64_t prev_pos = 0;
+            for (size_t at = 0; at < (size_t)new_size; at += CHUNK) {
+                size_t n = std::min(CHUNK, (size_t)new_size - at);
+                size_t from_old = at < copy_n ? std::min(n, copy_n - at) : 0;
+                if (from_old) memcpy(buf.data(), old_mmap.data + at, from_old);
+                if (from_old < n) memset(buf.data() + from_old, 0, n - from_old);
+                if (remapped) {
+                    for (size_t r = 0; r + value_stride <= from_old; r += value_stride) {
+                        uint32_t v; memcpy(&v, buf.data() + r + field, 4);
+                        uint32_t nv = remap_value(v);
+                        if (nv != v) memcpy(buf.data() + r + field, &nv, 4);
+                    }
+                }
+                for (; ci < n_changes; ci++) {
+                    uint32_t arr_pos; memcpy(&arr_pos, changes + (size_t)ci * change_size, 4);
+                    if (ci > 0 && arr_pos <= prev_pos) throw std::runtime_error("Malformed sparse delta");
+                    size_t byte_off = (size_t)arr_pos * value_stride;
+                    if (byte_off >= at + n) break;
+                    prev_pos = arr_pos;
+                    memcpy(buf.data() + (byte_off - at), changes + (size_t)ci * change_size + 4, value_stride);
+                }
+                fwrite(buf.data(), 1, n, out);
             }
-
-            if (!write_file(out_path(fname), buf)) throw std::runtime_error(std::string("Cannot write ") + fname);
+            bool ok = !ferror(out);
+            fclose(out);
+            if (old_mmap.data) unmap_file(old_mmap);
+            if (!ok) throw std::runtime_error(std::string("Cannot write ") + fname);
 
             std::cerr << "  " << fname << ": sparse delta " << n_changes
                       << " changes (" << new_size << " bytes)" << std::endl;
