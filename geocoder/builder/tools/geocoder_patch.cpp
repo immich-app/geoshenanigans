@@ -583,6 +583,7 @@ static int run(int argc, char* argv[]) {
                             file_id == (uint32_t)PatchFileId::STREET_WAYS ||
                             file_id == (uint32_t)PatchFileId::INTERP_WAYS ||
                             file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS ||
+                            file_id == (uint32_t)PatchFileId::POSTAL_POLYGONS ||
                             file_id == (uint32_t)PatchFileId::POI_RECORDS ||
                             file_id == (uint32_t)PatchFileId::PLACE_NODES);
         bool needs_padding = file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS && actual_stride == 24;
@@ -636,7 +637,8 @@ static int run(int argc, char* argv[]) {
             if (file_id == (uint32_t)PatchFileId::ADDR_POINTS) remap_offs = {ADDR_POINT_HOUSENUMBER_ID_OFF, ADDR_POINT_STREET_ID_OFF};
             else if (file_id == (uint32_t)PatchFileId::STREET_WAYS) remap_offs = {(actual_stride == 12) ? WAY_HEADER_NAME_ID_OFF_PADDED : WAY_HEADER_NAME_ID_OFF_PACKED};
             else if (file_id == (uint32_t)PatchFileId::INTERP_WAYS) remap_offs = {(actual_stride >= 20) ? INTERP_WAY_STREET_ID_OFF_PADDED : INTERP_WAY_STREET_ID_OFF_PACKED};
-            else if (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS) remap_offs = {ADMIN_POLYGON_NAME_ID_OFF};
+            else if (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS ||
+                     file_id == (uint32_t)PatchFileId::POSTAL_POLYGONS) remap_offs = {ADMIN_POLYGON_NAME_ID_OFF};
             else if (file_id == (uint32_t)PatchFileId::POI_RECORDS) {
                 // byte 16 = name_id; byte 24 = parent_street_id;
                 // byte 28 = parent_postcode_id — all string offsets, all

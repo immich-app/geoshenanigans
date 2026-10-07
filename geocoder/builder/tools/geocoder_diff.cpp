@@ -2527,8 +2527,57 @@ static int run(int argc, char* argv[]) {
     emit_sparse_delta(PatchFileId::POSTCODE_CENTROIDS,   "postcode_centroids.bin", 16, 3);
     emit_raw(PatchFileId::POSTCODE_CENTROID_CELLS, "postcode_centroid_cells.bin");
     emit_raw(PatchFileId::POSTCODE_CENTROID_ENTRIES, "postcode_centroid_entries.bin");
-    emit_raw(PatchFileId::POSTAL_POLYGONS, "postal_polygons.bin");
-    emit_raw(PatchFileId::POSTAL_VERTICES, "postal_vertices.bin");
+    // Postal polygons are the admin_level 11 copies of admin polygons, in
+    // slot order with their own packed vertex stream, so they merge like
+    // admin_polygons / admin_vertices. Full-replacing them re-sent ~92 MiB
+    // of planet/quality/uncapped every day.
+    {
+        auto old_p = mmap_file_rw(old_dir + "/postal_polygons.bin");
+        auto new_p = mmap_file(new_dir + "/postal_polygons.bin");
+        auto old_v = mmap_file(old_dir + "/postal_vertices.bin");
+        auto new_v = mmap_file(new_dir + "/postal_vertices.bin");
+        const size_t stride = admin_stride;
+        bool mergeable = stride == 24 && old_p.size > 0 && new_p.size > 0 && old_v.size > 0 && new_v.size > 0
+                         && old_p.size % stride == 0 && new_p.size % stride == 0;
+        if (mergeable) {
+            remap_field(old_p.data, old_p.size, stride, ADMIN_POLYGON_NAME_ID_OFF, str_remap);
+            size_t n = old_p.size / stride;
+            std::vector<uint32_t> old_offsets(n);
+            for (size_t i = 0; i < n; i++) memcpy(&old_offsets[i], old_p.data + i * stride, 4);
+            fixup_v15_offsets(old_p.data, old_p.size, old_v.data, old_v.size,
+                              new_p.data, new_p.size, new_v.data, new_v.size, stride, /*off_field_pos=*/0,
+                              [](const char* rec) -> uint64_t {
+                                  uint32_t name_id; memcpy(&name_id, rec + 8, 4);
+                                  uint8_t level = static_cast<uint8_t>(rec[12]);
+                                  uint16_t cc; memcpy(&cc, rec + 20, 2);
+                                  uint32_t vert_count; memcpy(&vert_count, rec + 4, 4);
+                                  uint64_t k = ((uint64_t)name_id << 24) | ((uint64_t)level << 16) | cc;
+                                  return k ^ ((uint64_t)vert_count << 40);
+                              });
+            std::vector<std::pair<uint32_t,uint32_t>> fixups;
+            for (size_t i = 0; i < n; i++) {
+                uint32_t moved; memcpy(&moved, old_p.data + i * stride, 4);
+                if (moved != old_offsets[i]) fixups.push_back({static_cast<uint32_t>(i), moved});
+            }
+            auto seq = build_merge_seq(old_p.data, old_p.size, new_p.data, new_p.size, stride);
+            // The vertex merge reads each polygon's bytes at its original offset.
+            for (size_t i = 0; i < n; i++) memcpy(old_p.data + i * stride, &old_offsets[i], 4);
+            auto vseq = build_vertex_byte_merge(seq, old_p.data, old_p.size, new_p.data, new_p.size,
+                                                old_v.data, old_v.size, new_v.data, new_v.size, stride, 0);
+            FileMergeResult rp = {PatchFileId::POSTAL_POLYGONS, "postal_polygons.bin", stride,
+                                  old_p.size, new_p.size, std::move(seq), std::move(fixups), {}, {}};
+            FileMergeResult rv = {PatchFileId::POSTAL_VERTICES, "postal_vertices.bin", 1,
+                                  old_v.size, new_v.size, std::move(vseq), {}, {}, {}};
+            log_merge(rp); log_merge(rv);
+            serialize_merge(patch, rp, old_dir, new_dir);
+            serialize_merge(patch, rv, old_dir, new_dir);
+        }
+        unmap_file(old_p); unmap_file(new_p); unmap_file(old_v); unmap_file(new_v);
+        if (!mergeable) {
+            emit_raw(PatchFileId::POSTAL_POLYGONS, "postal_polygons.bin");
+            emit_raw(PatchFileId::POSTAL_VERTICES, "postal_vertices.bin");
+        }
+    }
     // ADDR_VERTICES was already serialized as a byte-merge for v15+
     // (addr_stride >= 28) just after res_addr. Only fall back to FULL_REPLACE
     // here for older variants where t_addr left res_addr_v.stride == 0.
