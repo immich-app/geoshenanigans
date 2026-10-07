@@ -938,6 +938,73 @@ uint64_t stream_cell_list_delta(const char* cells, size_t cells_size, const char
     return written;
 }
 
+// --- String offset remap (patcher) ---
+
+// The patcher's old → new string offset map. Between two edits every
+// surviving string of a tier moves by one amount, so the map is held as runs
+// over old offsets: a few thousand on a planet day instead of one pair per
+// moved string (20.6M pairs, 157 MiB on every client). Like the diff's
+// per-string pairs, only a string's start moves; the run checks that against
+// the old pool, where the byte before a string start is its predecessor's NUL.
+// Strings that changed tier stay explicit pairs.
+class StringRemap {
+public:
+    // Merge-walks one tier's old and new pools (both sorted) and records the
+    // surviving strings that moved. The old pool must stay mapped for lookups.
+    void add_tier(const char* old_pool, size_t old_size, uint32_t old_base,
+                  const char* new_pool, size_t new_size, uint32_t new_base) {
+        size_t o = 0, n = 0;
+        bool open = false;
+        while (o < old_size && n < new_size) {
+            const char* os = old_pool + o;
+            const char* ns = new_pool + n;
+            size_t ol = strnlen(os, old_size - o) + 1, nl = strnlen(ns, new_size - n) + 1;
+            int c = strcmp(os, ns);
+            if (c == 0) {
+                uint32_t old_off = old_base + static_cast<uint32_t>(o);
+                uint32_t shift = new_base + static_cast<uint32_t>(n) - old_off;
+                if (shift == 0) {
+                    open = false;
+                } else if (open && runs_.back().end == old_off && runs_.back().shift == shift) {
+                    runs_.back().end += static_cast<uint32_t>(ol);
+                } else {
+                    runs_.push_back({old_off, old_off + static_cast<uint32_t>(ol), shift, os});
+                    open = true;
+                }
+                o += ol; n += nl;
+            } else if (c < 0) {
+                o += ol; open = false;  // deleted: its offsets keep mapping to themselves
+            } else {
+                n += nl; open = false;
+            }
+        }
+    }
+    void add_pair(uint32_t old_off, uint32_t new_off) { pairs_.push_back({old_off, new_off}); }
+    void finish() { std::sort(pairs_.begin(), pairs_.end()); }
+    bool empty() const { return runs_.empty() && pairs_.empty(); }
+    size_t run_count() const { return runs_.size(); }
+    size_t pair_count() const { return pairs_.size(); }
+
+    uint32_t lookup(uint32_t off) const {
+        if (!pairs_.empty()) {
+            auto p = std::lower_bound(pairs_.begin(), pairs_.end(), std::make_pair(off, 0u));
+            if (p != pairs_.end() && p->first == off) return p->second;
+        }
+        auto it = std::upper_bound(runs_.begin(), runs_.end(), off,
+                                   [](uint32_t v, const Run& r) { return v < r.start; });
+        if (it == runs_.begin()) return off;
+        --it;
+        if (off >= it->end) return off;
+        if (off != it->start && it->old_bytes[off - it->start - 1] != '\0') return off;
+        return off + it->shift;
+    }
+
+private:
+    struct Run { uint32_t start, end, shift; const char* old_bytes; };
+    std::vector<Run> runs_;
+    std::vector<std::pair<uint32_t, uint32_t>> pairs_;
+};
+
 // --- Varint encoding for delta-compressed fixup tables ---
 
 inline void write_varint(std::vector<char>& buf, uint32_t value) {

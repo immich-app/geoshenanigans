@@ -173,7 +173,10 @@ static int run(int argc, char* argv[]) {
         "strings_core.bin", "strings_street.bin", "strings_addr.bin",
         "strings_postcode.bin", "strings_poi.bin"
     };
-    std::vector<std::pair<uint32_t, uint32_t>> str_remap_vec;
+    StringRemap str_remap;
+    // The old tiers stay mapped until the replays are done: str_remap's runs
+    // check string starts against them.
+    std::vector<MappedFile> old_str_pools;
     {
         uint32_t marker = ru32();
         if (marker == STRINGS_TIERED_MARKER) {
@@ -181,7 +184,7 @@ static int run(int argc, char* argv[]) {
             //   1. Read its n_added/n_deleted block from the patch.
             //   2. Merge-write the old tier file + added (minus deleted)
             //      into the new tier file.
-            //   3. Walk old/new to extend str_remap_vec using global offsets.
+            //   3. Walk old/new to extend str_remap using global offsets.
             uint32_t old_global_base = 0;
             uint32_t new_global_base = 0;
             uint32_t total_added = 0, total_deleted = 0;
@@ -256,44 +259,24 @@ static int run(int argc, char* argv[]) {
                     content_hash(new_pool.data, new_pool.size) != stamps[t].new_hash)
                     throw std::runtime_error(std::string("Rebuilt ") + kStrTierFilenames[t] +
                                              " does not match the new build");
-                {
-                    size_t old_pos = 0, new_pos = 0;
-                    while (old_pos < old_pool.size && new_pos < new_pool.size) {
-                        const char* os = old_pool.data + old_pos;
-                        const char* ns = new_pool.data + new_pos;
-                        int c = strcmp(os, ns);
-                        if (c == 0) {
-                            uint32_t old_global = old_global_base + static_cast<uint32_t>(old_pos);
-                            uint32_t new_global = new_global_base + static_cast<uint32_t>(new_pos);
-                            if (old_global != new_global)
-                                str_remap_vec.push_back({old_global, new_global});
-                            old_pos += strlen(os) + 1;
-                            new_pos += strlen(ns) + 1;
-                        } else if (c < 0) {
-                            old_pos += strlen(os) + 1;
-                        } else {
-                            new_pos += strlen(ns) + 1;
-                        }
-                    }
-                }
+                str_remap.add_tier(old_pool.data, old_pool.size, old_global_base,
+                                   new_pool.data, new_pool.size, new_global_base);
                 old_global_base += static_cast<uint32_t>(old_pool.size);
                 new_global_base += static_cast<uint32_t>(new_pool.size);
-                unmap_file(old_pool);
+                old_str_pools.push_back(old_pool);
                 unmap_file(new_pool);
             }
             malloc_trim(0);
-            std::sort(str_remap_vec.begin(), str_remap_vec.end());
             std::cerr << "  Strings (tiered): +" << total_added << " -" << total_deleted
-                      << ", " << str_remap_vec.size() << " remapped ("
-                      << str_remap_vec.size() * 8 / 1024 / 1024 << " MiB)" << std::endl;
+                      << ", " << str_remap.run_count() << " remap runs" << std::endl;
 
             marker = ru32();
         }
         if (marker == STRINGS_CROSS_TIER_REMAP_MARKER) {
             uint32_t c = ru32();
-            for (uint32_t i = 0; i < c; i++) { uint32_t a = ru32(), b = ru32(); str_remap_vec.push_back({a, b}); }
-            std::sort(str_remap_vec.begin(), str_remap_vec.end());
+            for (uint32_t i = 0; i < c; i++) { uint32_t a = ru32(), b = ru32(); str_remap.add_pair(a, b); }
         } else pos -= 4;
+        str_remap.finish();
     }
     // Release patch pages read so far (string section)
     madvise(const_cast<char*>(patch_map.data), pos, MADV_DONTNEED);
@@ -303,13 +286,7 @@ static int run(int argc, char* argv[]) {
     size_t interp_stride = detect_stride(cur_dir + "/interp_ways.bin", {24, 20, 18});
     size_t admin_stride = detect_stride(cur_dir + "/admin_polygons.bin", {24, 20, 19});
 
-    // String remap lookup via sorted vector + binary search
-    auto str_remap_lookup = [&](uint32_t old_off) -> uint32_t {
-        auto it = std::lower_bound(str_remap_vec.begin(), str_remap_vec.end(),
-            std::make_pair(old_off, (uint32_t)0));
-        if (it != str_remap_vec.end() && it->first == old_off) return it->second;
-        return old_off; // no remap
-    };
+    auto str_remap_lookup = [&](uint32_t old_off) { return str_remap.lookup(old_off); };
 
     // --- Phase 3: Merge replays (streaming output) ---
     // ID remaps: file_id → vector<uint32_t> where remap[old_idx] = new_idx
@@ -582,7 +559,7 @@ static int run(int argc, char* argv[]) {
                     uint32_t nv = poi_remap_lookup(poi_admin_remap, v);
                     if (nv != v) memcpy(buf.data() + i * 4, &nv, 4);
                 }
-            } else if (remap_kind == 2 && !str_remap_vec.empty() && value_stride == 4) {
+            } else if (remap_kind == 2 && !str_remap.empty() && value_stride == 4) {
                 size_t n_records = copy_n / 4;
                 for (size_t i = 0; i < n_records; i++) {
                     uint32_t v; memcpy(&v, buf.data() + i * 4, 4);
@@ -590,7 +567,7 @@ static int run(int argc, char* argv[]) {
                     uint32_t nv = str_remap_lookup(v);
                     if (nv != v) memcpy(buf.data() + i * 4, &nv, 4);
                 }
-            } else if (remap_kind == 3 && !str_remap_vec.empty() && value_stride == 16) {
+            } else if (remap_kind == 3 && !str_remap.empty() && value_stride == 16) {
                 size_t n_records = copy_n / 16;
                 for (size_t i = 0; i < n_records; i++) {
                     uint32_t pid; memcpy(&pid, buf.data() + i * 16 + 8, 4);
@@ -647,7 +624,7 @@ static int run(int argc, char* argv[]) {
 
         // Get string remap field offsets for this file type
         std::vector<size_t> remap_offs;
-        if (!str_remap_vec.empty() && needs_remap) {
+        if (!str_remap.empty() && needs_remap) {
             // AddrPoint string fields live at {8, 12} (housenumber_id,
             // street_id). Offset 16 is parent_way_id, which is a WAY id
             // — not a string pool offset — so it must NOT be rewritten
@@ -867,7 +844,9 @@ static int run(int argc, char* argv[]) {
     log_phase("Merge replays", t_start);
 
     // Free string remap + release all processed patch pages
-    { std::vector<std::pair<uint32_t,uint32_t>>().swap(str_remap_vec); }
+    str_remap = StringRemap();
+    for (auto& m : old_str_pools) if (m.data) unmap_file(m);
+    old_str_pools.clear();
     madvise(const_cast<char*>(patch_map.data), pos, MADV_DONTNEED);
     malloc_trim(0);
 

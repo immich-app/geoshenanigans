@@ -5,6 +5,7 @@
 // load-bearing: diff and patch must agree on them byte-for-byte).
 #include "patch_format.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -12,6 +13,7 @@
 #include <iterator>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "test_framework.h"
@@ -542,5 +544,70 @@ TEST(patch_format_cell_list_delta_rejects_truncation) {
         bool threw = false;
         try { apply_delta(old_index, delta, cut); } catch (const std::runtime_error&) { threw = true; }
         CHECK(threw);
+    }
+}
+
+// --- string remap runs ---
+
+namespace {
+
+// A tier pool: sorted unique strings, each NUL-terminated.
+std::string pool_of(std::vector<std::string> words) {
+    std::sort(words.begin(), words.end());
+    words.erase(std::unique(words.begin(), words.end()), words.end());
+    std::string out;
+    for (auto& w : words) { out += w; out.push_back('\0'); }
+    return out;
+}
+
+// The per-string pairs the patcher used to hold: every surviving string's old
+// start → new start.
+std::unordered_map<uint32_t, uint32_t> pairs_of(const std::string& o, const std::string& n, uint32_t ob, uint32_t nb) {
+    std::unordered_map<std::string, uint32_t> new_at;
+    for (size_t i = 0; i < n.size(); i += strlen(n.c_str() + i) + 1) new_at[n.c_str() + i] = nb + (uint32_t)i;
+    std::unordered_map<uint32_t, uint32_t> out;
+    for (size_t i = 0; i < o.size(); i += strlen(o.c_str() + i) + 1) {
+        auto it = new_at.find(o.c_str() + i);
+        if (it != new_at.end() && it->second != ob + i) out[ob + (uint32_t)i] = it->second;
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST(patch_format_string_remap_runs_match_per_string_pairs) {
+    // Random edits to two tiers: every offset (string starts, mid-string
+    // bytes, deleted strings, past the end) maps exactly as the pairs did.
+    uint64_t seed = 7;
+    auto rnd = [&](uint32_t n) { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return (uint32_t)(seed >> 33) % n; };
+    auto word = [&] { std::string w; for (uint32_t k = 0, len = 1 + rnd(5); k < len; k++) w.push_back('a' + rnd(6)); return w; };
+    for (int round = 0; round < 100; round++) {
+        std::string olds[2], news[2];
+        for (int t = 0; t < 2; t++) {
+            std::vector<std::string> o, n;
+            for (int i = 0; i < 40; i++) {
+                std::string w = word();
+                uint32_t kind = rnd(10);
+                if (kind != 0) o.push_back(w);           // kind 0: added
+                if (kind != 1) n.push_back(w);           // kind 1: deleted
+            }
+            olds[t] = pool_of(o); news[t] = pool_of(n);
+        }
+        StringRemap remap;
+        uint32_t ob = 0, nb = 0;
+        std::unordered_map<uint32_t, uint32_t> want;
+        for (int t = 0; t < 2; t++) {
+            remap.add_tier(olds[t].data(), olds[t].size(), ob, news[t].data(), news[t].size(), nb);
+            for (auto& kv : pairs_of(olds[t], news[t], ob, nb)) want.insert(kv);
+            ob += olds[t].size(); nb += news[t].size();
+        }
+        remap.add_pair(ob + 100, 3);  // a string that moved tier
+        want[ob + 100] = 3;
+        remap.finish();
+        for (uint32_t off = 0; off < ob + 110; off++) {
+            auto it = want.find(off);
+            CHECK_EQ(remap.lookup(off), it != want.end() ? it->second : off);
+        }
+        CHECK_EQ(remap.lookup(0xFFFFFFFFu), 0xFFFFFFFFu);
     }
 }
