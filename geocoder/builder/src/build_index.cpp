@@ -1916,7 +1916,11 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                 uint8_t pt = d.place_nodes[i].place_type;
                 if (pt == 0 || pt == 1 || pt == 2 || pt == 4) {
                     place_remap[i] = static_cast<uint32_t>(filtered_places.size());
-                    filtered_places.push_back(d.place_nodes[i]);
+                    PlaceNode pn = d.place_nodes[i];
+                    // Parents in this dir's own dense polygon ids (NO_DATA when
+                    // the parent polygon isn't kept), like every other id here.
+                    pn.parent_poly_id = pn.parent_poly_id < poly_remap.size() ? poly_remap[pn.parent_poly_id] : NO_DATA;
+                    filtered_places.push_back(pn);
                 }
             }
             {
