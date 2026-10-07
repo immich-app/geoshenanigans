@@ -118,7 +118,19 @@ inline MergeSequence build_merge_seq(
                     if (memcmp(onext, new_data + j * stride, stride) == 0) return true;
                 return false;
             };
-            if (best_ni != UINT32_MAX && best_ni > ni && next_aligns(best_ni)) {
+            // A far jump re-sends every record it skips, so it has to land
+            // on a real run: the following old records must match one for
+            // one after the target. Two duplicates in a row (a pair of POIs
+            // that changed slots) satisfied next_aligns and re-sent 4172
+            // unchanged records of an oceania POI tier.
+            constexpr size_t FAR_JUMP = 16;
+            auto run_follows = [&](uint32_t cand) -> bool {
+                if (cand - ni <= FAR_JUMP) return true;
+                for (size_t j = 1; j < FAR_JUMP && oi + j < old_n && cand + j < new_n; j++)
+                    if (memcmp(old_data + (oi + j) * stride, new_data + (cand + j) * stride, stride) != 0) return false;
+                return true;
+            };
+            if (best_ni != UINT32_MAX && best_ni > ni && next_aligns(best_ni) && run_follows(best_ni)) {
                 flush_match(); flush_del();
                 seq.add_insert(new_data + ni * stride, best_ni - ni, stride);
                 ni = best_ni;

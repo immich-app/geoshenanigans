@@ -52,6 +52,40 @@ MergeSequence merge(const MergeSequence& parent, const Stream& old_s, const Stre
 
 }  // namespace
 
+namespace {
+
+// 12-byte records (past the 8-byte stride that turns hash jumps on), each
+// labelled by one character.
+std::string records(const std::string& labels) {
+    std::string out;
+    for (char c : labels) out += std::string(12, c);
+    return out;
+}
+
+std::vector<Op> record_merge(const std::string& old_labels, const std::string& new_labels) {
+    std::string o = records(old_labels), n = records(new_labels);
+    return ops_of(build_merge_seq(o.data(), o.size(), n.data(), n.size(), 12), 12);
+}
+
+}  // namespace
+
+TEST(build_merge_seq_far_jump_needs_a_run_behind_it) {
+    // X and Y moved behind 30 unchanged records. Jumping to their copies
+    // would re-send all 30; deleting and re-inserting the pair costs two.
+    std::string body = "abcdefghijklmnopqrstuvwxyz0123";
+    auto got = record_merge("XY" + body + "Z", body + "XYZ");
+    std::vector<Op> want = {{OP_DELETE_RUN, 2, ""}, {OP_MATCH_RUN, 30, ""},
+                            {OP_INSERT_RUN, 2, records("XY")}, {OP_MATCH_RUN, 1, ""}};
+    CHECK(got == want);
+}
+
+TEST(build_merge_seq_jumps_over_inserted_records) {
+    std::string body = "abcdefghijklmnopqrstuvwxyz0123";
+    auto got = record_merge(body, "ABCDEFGHIJKLMNOPQRST" + body);
+    std::vector<Op> want = {{OP_INSERT_RUN, 20, records("ABCDEFGHIJKLMNOPQRST")}, {OP_MATCH_RUN, 30, ""}};
+    CHECK(got == want);
+}
+
 TEST(merge_child_blocks_match_keeps_equal_blocks_and_resends_changed_ones) {
     MergeSequence parent;
     parent.add_match(2);
