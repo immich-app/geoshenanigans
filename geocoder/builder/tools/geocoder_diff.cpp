@@ -1850,14 +1850,18 @@ static int run(int argc, char* argv[]) {
     // Keep new_geo_m + old_geo_m (re-mmap) for flag corrections below
     std::cerr << "  RSS after geo corrections: " << get_rss_mb() << " MiB" << std::endl;
 
-    // Admin corrections
-    {
-        auto old_admc = read_file(old_dir + "/admin_cells.bin");
-        auto old_adme = read_file(old_dir + "/admin_entries.bin");
-        auto admin_derived = rebuild_cells_from_remap(old_admc, old_adme, ad_rm_d, a_added, a_removed);
-        auto new_admc = read_file(new_dir + "/admin_cells.bin");
-        auto new_adme = read_file(new_dir + "/admin_entries.bin");
-        auto parse_admin = [&](const std::vector<char>& cells, const std::vector<char>& entries)
+    // Corrections for a cell index the patcher rebuilds from an id remap
+    // (admin / POI / place): every cell whose rebuilt list differs from the
+    // new build's travels with its new list.
+    auto emit_cell_corrections = [&](PatchFileId entries_fid, const std::string& prefix,
+                                     const std::unordered_map<uint32_t,uint32_t>& rm,
+                                     const std::vector<uint64_t>& added, const std::vector<uint64_t>& removed) {
+        auto old_c = read_file(old_dir + "/" + prefix + "_cells.bin");
+        auto old_e = read_file(old_dir + "/" + prefix + "_entries.bin");
+        auto derived = rebuild_cells_from_remap(old_c, old_e, rm, added, removed);
+        auto new_c = read_file(new_dir + "/" + prefix + "_cells.bin");
+        auto new_e = read_file(new_dir + "/" + prefix + "_entries.bin");
+        auto parse = [&](const std::vector<char>& cells, const std::vector<char>& entries)
             -> std::unordered_map<uint64_t, std::vector<uint32_t>> {
             std::unordered_map<uint64_t, std::vector<uint32_t>> m;
             for (size_t i = 0; i < cells.size() / 12; i++) {
@@ -1867,8 +1871,8 @@ static int run(int argc, char* argv[]) {
             }
             return m;
         };
-        auto dm = parse_admin(admin_derived.cells_data, admin_derived.entries_data);
-        auto nm = parse_admin(new_admc, new_adme);
+        auto dm = parse(derived.cells_data, derived.entries_data);
+        auto nm = parse(new_c, new_e);
         std::vector<char> buf; buf.resize(12, 0); uint32_t dc = 0;
         for (auto& [cid, nids] : nm) {
             auto it = dm.find(cid); auto* dids = it != dm.end() ? &it->second : nullptr;
@@ -1878,79 +1882,16 @@ static int run(int argc, char* argv[]) {
                 if (!nids.empty()) buf.insert(buf.end(), (const char*)nids.data(), (const char*)nids.data()+nids.size()*4); dc++; }
         }
         for (auto& [cid, dids] : dm) { if (!nm.count(cid) && !dids.empty()) { wval(buf, &cid, 8); uint16_t c = 0; wval(buf, &c, 2); dc++; } }
-        uint32_t marker = ENTRY_CORRECTION_MARKER, file = static_cast<uint32_t>(PatchFileId::ADMIN_ENTRIES);
+        uint32_t marker = ENTRY_CORRECTION_MARKER, file = static_cast<uint32_t>(entries_fid);
         memcpy(buf.data(), &marker, 4); memcpy(buf.data()+4, &file, 4); memcpy(buf.data()+8, &dc, 4);
         patch.insert(patch.end(), buf.begin(), buf.end());
-        std::cerr << "  admin_entries.bin: " << dc << " cell corrections (" << buf.size()-12 << " bytes)" << std::endl;
-    }
-
-    // POI corrections (same pattern as admin corrections)
-    if (res_poi_r.old_size > 0 || res_poi_r.new_size > 0) {
-        auto old_poic = read_file(old_dir + "/poi_cells.bin");
-        auto old_poie = read_file(old_dir + "/poi_entries.bin");
-        auto poi_derived = rebuild_cells_from_remap(old_poic, old_poie, poi_rm_d, p_added, p_removed);
-        auto new_poic = read_file(new_dir + "/poi_cells.bin");
-        auto new_poie = read_file(new_dir + "/poi_entries.bin");
-        auto parse_poi = [&](const std::vector<char>& cells, const std::vector<char>& entries)
-            -> std::unordered_map<uint64_t, std::vector<uint32_t>> {
-            std::unordered_map<uint64_t, std::vector<uint32_t>> m;
-            for (size_t i = 0; i < cells.size() / 12; i++) {
-                uint64_t cid; memcpy(&cid, cells.data()+i*12, 8);
-                uint32_t off; memcpy(&off, cells.data()+i*12+8, 4);
-                m[cid] = parse_ids(entries.data(), entries.size(), off);
-            }
-            return m;
-        };
-        auto dm = parse_poi(poi_derived.cells_data, poi_derived.entries_data);
-        auto nm = parse_poi(new_poic, new_poie);
-        std::vector<char> buf; buf.resize(12, 0); uint32_t dc = 0;
-        for (auto& [cid, nids] : nm) {
-            auto it = dm.find(cid); auto* dids = it != dm.end() ? &it->second : nullptr;
-            bool differs = !dids ? !nids.empty() : (dids->size() != nids.size()) ||
-                          (!dids->empty() && memcmp(dids->data(), nids.data(), dids->size()*4) != 0);
-            if (differs) { wval(buf, &cid, 8); uint16_t c = nids.size(); wval(buf, &c, 2);
-                if (!nids.empty()) buf.insert(buf.end(), (const char*)nids.data(), (const char*)nids.data()+nids.size()*4); dc++; }
-        }
-        for (auto& [cid, dids] : dm) { if (!nm.count(cid) && !dids.empty()) { wval(buf, &cid, 8); uint16_t c = 0; wval(buf, &c, 2); dc++; } }
-        uint32_t marker = ENTRY_CORRECTION_MARKER, file = static_cast<uint32_t>(PatchFileId::POI_ENTRIES);
-        memcpy(buf.data(), &marker, 4); memcpy(buf.data()+4, &file, 4); memcpy(buf.data()+8, &dc, 4);
-        patch.insert(patch.end(), buf.begin(), buf.end());
-        std::cerr << "  poi_entries.bin: " << dc << " cell corrections (" << buf.size()-12 << " bytes)" << std::endl;
-    }
-
-    // Place corrections (same pattern as POI corrections)
-    if (res_place_n.old_size > 0 || res_place_n.new_size > 0) {
-        auto old_plc = read_file(old_dir + "/place_cells.bin");
-        auto old_ple = read_file(old_dir + "/place_entries.bin");
-        auto place_derived = rebuild_cells_from_remap(old_plc, old_ple, place_rm_d, pl_added, pl_removed);
-        auto new_plc = read_file(new_dir + "/place_cells.bin");
-        auto new_ple = read_file(new_dir + "/place_entries.bin");
-        auto parse_place = [&](const std::vector<char>& cells, const std::vector<char>& entries)
-            -> std::unordered_map<uint64_t, std::vector<uint32_t>> {
-            std::unordered_map<uint64_t, std::vector<uint32_t>> m;
-            for (size_t i = 0; i < cells.size() / 12; i++) {
-                uint64_t cid; memcpy(&cid, cells.data()+i*12, 8);
-                uint32_t off; memcpy(&off, cells.data()+i*12+8, 4);
-                m[cid] = parse_ids(entries.data(), entries.size(), off);
-            }
-            return m;
-        };
-        auto dm = parse_place(place_derived.cells_data, place_derived.entries_data);
-        auto nm = parse_place(new_plc, new_ple);
-        std::vector<char> buf; buf.resize(12, 0); uint32_t dc = 0;
-        for (auto& [cid, nids] : nm) {
-            auto it = dm.find(cid); auto* dids = it != dm.end() ? &it->second : nullptr;
-            bool differs = !dids ? !nids.empty() : (dids->size() != nids.size()) ||
-                          (!dids->empty() && memcmp(dids->data(), nids.data(), dids->size()*4) != 0);
-            if (differs) { wval(buf, &cid, 8); uint16_t c = nids.size(); wval(buf, &c, 2);
-                if (!nids.empty()) buf.insert(buf.end(), (const char*)nids.data(), (const char*)nids.data()+nids.size()*4); dc++; }
-        }
-        for (auto& [cid, dids] : dm) { if (!nm.count(cid) && !dids.empty()) { wval(buf, &cid, 8); uint16_t c = 0; wval(buf, &c, 2); dc++; } }
-        uint32_t marker = ENTRY_CORRECTION_MARKER, file = static_cast<uint32_t>(PatchFileId::PLACE_ENTRIES);
-        memcpy(buf.data(), &marker, 4); memcpy(buf.data()+4, &file, 4); memcpy(buf.data()+8, &dc, 4);
-        patch.insert(patch.end(), buf.begin(), buf.end());
-        std::cerr << "  place_entries.bin: " << dc << " cell corrections (" << buf.size()-12 << " bytes)" << std::endl;
-    }
+        std::cerr << "  " << prefix << "_entries.bin: " << dc << " cell corrections (" << buf.size()-12 << " bytes)" << std::endl;
+    };
+    emit_cell_corrections(PatchFileId::ADMIN_ENTRIES, "admin", ad_rm_d, a_added, a_removed);
+    if (res_poi_r.old_size > 0 || res_poi_r.new_size > 0)
+        emit_cell_corrections(PatchFileId::POI_ENTRIES, "poi", poi_rm_d, p_added, p_removed);
+    if (res_place_n.old_size > 0 || res_place_n.new_size > 0)
+        emit_cell_corrections(PatchFileId::PLACE_ENTRIES, "place", place_rm_d, pl_added, pl_removed);
 
     log_time("Entry corrections", t1);
 
