@@ -572,7 +572,7 @@ inline void append_client_files(std::vector<char>& out, const std::vector<Client
 inline std::vector<ClientFile> parse_client_files(const char* data, size_t size, size_t& pos) {
     auto take = [&](void* dst, size_t n) {
         if (pos + n > size) throw std::runtime_error("Truncated client file list");
-        memcpy(dst, data + pos, n);
+        if (n) memcpy(dst, data + pos, n);  // an empty inline file's bytes are null
         pos += n;
     };
     uint32_t marker = 0, n = 0;
@@ -672,7 +672,7 @@ inline RebuiltGeo rebuild_geo_from_remap(
         uint16_t count; memcpy(&count, data.data() + off, 2);
         if (off + 2 + count * 4 > data.size()) return {};
         std::vector<uint32_t> ids(count);
-        memcpy(ids.data(), data.data() + off + 2, count * 4);
+        if (count) memcpy(ids.data(), data.data() + off + 2, count * 4);
         return ids;
     };
 
@@ -774,7 +774,7 @@ inline RebuiltGeo rebuild_geo_from_remap_vec(
         uint16_t count; memcpy(&count, data.data() + off, 2);
         if (off + 2 + count * 4 > data.size()) return {};
         std::vector<uint32_t> ids(count);
-        memcpy(ids.data(), data.data() + off + 2, count * 4);
+        if (count) memcpy(ids.data(), data.data() + off + 2, count * 4);
         return ids;
     };
     auto remap_ids_vec = [](std::vector<uint32_t>& ids, const std::vector<uint32_t>& rm) {
@@ -858,7 +858,7 @@ inline RebuiltCells rebuild_cells_from_remap(
             uint16_t count; memcpy(&count, old_entries.data() + off, 2);
             if (off + 2 + count * 4 <= old_entries.size()) {
                 cells[i].ids.resize(count);
-                memcpy(cells[i].ids.data(), old_entries.data() + off + 2, count * 4);
+                if (count) memcpy(cells[i].ids.data(), old_entries.data() + off + 2, count * 4);
                 for (auto& id : cells[i].ids) {
                     uint32_t flags = id & 0x80000000u;
                     uint32_t masked = id & 0x7FFFFFFFu;
@@ -918,7 +918,7 @@ inline CellLists parse_cell_lists(const std::vector<char>& cells, const std::vec
         memcpy(&n, entries.data() + off, 2);
         if ((size_t)off + 2 + (size_t)n * 4 > entries.size()) throw std::runtime_error("Malformed cell index");
         ids.resize(n);
-        memcpy(ids.data(), entries.data() + off + 2, (size_t)n * 4);
+        if (n) memcpy(ids.data(), entries.data() + off + 2, (size_t)n * 4);
     }
     return out;
 }
@@ -995,7 +995,7 @@ uint64_t stream_cell_index(Cells&& cells, Entries&& entries,
     size_t pos = 0;
     auto take = [&](void* dst, size_t n) {
         if (delta_size - pos < n) malformed();
-        memcpy(dst, delta + pos, n);
+        if (n) memcpy(dst, delta + pos, n);  // an empty list's data() may be null
         pos += n;
     };
     uint32_t n_gone;
@@ -1181,7 +1181,7 @@ struct GeoListDelta {
 inline std::vector<GeoListDelta> parse_geo_list_deltas(const char* data, size_t size, size_t& pos, uint32_t count) {
     auto take = [&](void* dst, size_t n) {
         if (size - pos < n) throw std::runtime_error("Malformed geo entry delta");
-        memcpy(dst, data + pos, n);
+        if (n) memcpy(dst, data + pos, n);  // an empty list's data() may be null
         pos += n;
     };
     std::vector<GeoListDelta> out;

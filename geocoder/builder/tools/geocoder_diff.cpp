@@ -120,7 +120,7 @@ static void fixup_way_offsets(char* old_ways, size_t old_ways_size,
     if (old_ways_size == new_ways_size && old_nodes_size == new_nodes_size &&
         old_ways_size > 0 &&
         memcmp(old_ways, new_ways, old_ways_size) == 0 &&
-        memcmp(old_nodes, new_nodes, old_nodes_size) == 0)
+        (old_nodes_size == 0 || memcmp(old_nodes, new_nodes, old_nodes_size) == 0))  // empty maps are null
         return;
     size_t name_off = (stride == 12) ? 8 : 5;
     size_t old_n = old_ways_size / stride, new_n = new_ways_size / stride;
@@ -187,7 +187,7 @@ static void fixup_v15_offsets(char* old_polys, size_t old_polys_size,
     if (old_polys_size == new_polys_size && old_verts_size == new_verts_size &&
         old_polys_size > 0 &&
         memcmp(old_polys, new_polys, old_polys_size) == 0 &&
-        memcmp(old_verts, new_verts, old_verts_size) == 0)
+        (old_verts_size == 0 || memcmp(old_verts, new_verts, old_verts_size) == 0))  // empty maps are null
         return;
     size_t old_n = old_polys_size / stride;
     size_t new_n = new_polys_size / stride;
@@ -1679,7 +1679,7 @@ static int run(int argc, char* argv[]) {
         uint16_t count; memcpy(&count, data + off, 2);
         if (off + 2 + count * 4 > data_size) return {};
         std::vector<uint32_t> ids(count);
-        memcpy(ids.data(), data + off + 2, count * 4);
+        if (count) memcpy(ids.data(), data + off + 2, count * 4);
         return ids;
     };
 

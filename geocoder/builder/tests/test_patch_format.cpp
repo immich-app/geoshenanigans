@@ -359,6 +359,18 @@ TEST(patch_format_client_files_round_trip) {
     CHECK(got[1].bytes.empty());
 }
 
+TEST(patch_format_client_files_round_trip_an_empty_inline_file) {
+    std::vector<char> buf;
+    append_client_files(buf, {ClientFile{"poi_meta.json", 0, {}}});
+    size_t pos = 0;
+    auto got = parse_client_files(buf.data(), buf.size(), pos);
+    CHECK_EQ(pos, buf.size());
+    REQUIRE(got.size() == 1);
+    CHECK(got[0].name == "poi_meta.json");
+    CHECK_EQ(got[0].size, uint64_t(0));
+    CHECK(got[0].bytes.empty());
+}
+
 static bool parse_throws(const std::vector<char>& buf) {
     size_t pos = 0;
     try { parse_client_files(buf.data(), buf.size(), pos); } catch (const std::runtime_error&) { return true; }
@@ -616,8 +628,20 @@ static std::vector<uint32_t> ids_of_first_cell(const std::vector<char>& cells, c
     uint32_t off; std::memcpy(&off, cells.data() + 8, 4);
     uint16_t n; std::memcpy(&n, entries.data() + off, 2);
     std::vector<uint32_t> ids(n);
-    std::memcpy(ids.data(), entries.data() + off + 2, n * 4);
+    if (!ids.empty()) std::memcpy(ids.data(), entries.data() + off + 2, n * 4);
     return ids;
+}
+
+TEST(patch_format_empty_cell_lists_round_trip) {
+    // An emptied cell keeps a count-0 list; parsing and rebuilding it copy
+    // no ids (its vector's data() is null).
+    auto [cells, entries] = write_cell_lists({{7, {}}, {9, {4}}});
+    CHECK(parse_cell_lists(cells, entries) == CellLists({{7, {}}, {9, {4}}}));
+    auto [one_c, one_e] = one_cell(42, {});
+    auto rebuilt = rebuild_cells_from_remap(one_c, one_e, {{3, 2}});
+    // The cell stays, with a NO_DATA offset and no list written.
+    CHECK(parse_cell_lists(rebuilt.cells_data, rebuilt.entries_data) == CellLists({{42, {}}}));
+    CHECK(rebuilt.entries_data.empty());
 }
 
 TEST(patch_format_rebuild_cells_remaps_interior_entries) {
@@ -1007,7 +1031,7 @@ TEST(patch_format_referenced_string_tiers_reads_the_listed_fields) {
     const uint32_t ends[STRING_TIER_COUNT] = {10, 30, 30, 40, 50};
     auto records = [](std::vector<std::array<uint32_t, 3>> recs) {
         std::vector<char> out(recs.size() * 12);
-        memcpy(out.data(), recs.data(), out.size());
+        if (!out.empty()) memcpy(out.data(), recs.data(), out.size());
         return out;
     };
     const std::vector<size_t> fields = {4, 8};
