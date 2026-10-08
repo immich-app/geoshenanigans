@@ -213,7 +213,10 @@ geocoder-patch <current-dir> <patch-file> -o <output-dir>
 The patch tool:
 - Reads old files front to back through `pread` (sequential readahead) and
   writes each new file in one streaming pass; only the old string tiers,
-  probed at random, and the decompressed patch are mmapped
+  probed at random, and the decompressed patch are mmapped. Long unchanged
+  runs and unchanged files are copied in the kernel (`copy_file_range`), or
+  through `pread` where the kernel, the filesystem or a seccomp profile
+  refuses that
 - Peak anonymous memory: about 10 MiB for `planet/full`; everything else is
   reclaimable page cache
 - Runs on one core inside a 1 GiB memory limit (page cache included): one

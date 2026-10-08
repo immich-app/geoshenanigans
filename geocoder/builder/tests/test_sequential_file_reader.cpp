@@ -3,11 +3,13 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <fcntl.h>
 #include <cstdio>
 #include <cstring>
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 #include "scratch_dir.h"
@@ -137,6 +139,151 @@ TEST(sequential_reader_stream_pieces_fit_the_window_and_join_to_the_range) {
     CHECK(fits);
     REQUIRE(got.size() == 900);
     CHECK(file.same(got.data(), 7, 900));
+}
+
+TEST(sequential_reader_copy_range_appends_at_the_output_position) {
+    ByteFile file(1000);
+    SequentialFileReader sut(file.path, 64);
+    std::string out_path = file.dir.path() + "/out.bin";
+    int out = ::open(out_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    REQUIRE(out >= 0);
+    REQUIRE(::write(out, "x", 1) == 1);
+    uint64_t done = sut.copy_range(100, 700, out);
+    REQUIRE(::write(out, "y", 1) == 1);
+    ::close(out);
+    // Where copy_file_range isn't supported nothing is copied; the caller
+    // streams the bytes itself.
+    REQUIRE(done == 700 || done == 0);
+    SequentialFileReader got(out_path);
+    if (done == 700) {
+        REQUIRE(got.size() == 702);
+        CHECK(*got.at(0, 1) == 'x');
+        CHECK(file.same(got.at(1, 700), 100, 700));
+        CHECK(*got.at(701, 1) == 'y');
+    }
+    int scratch = ::open(out_path.c_str(), O_WRONLY);
+    REQUIRE(scratch >= 0);
+    CHECK(throws_runtime([&] { sut.copy_range(990, 11, scratch); }, "Read past end"));
+    ::close(scratch);
+}
+
+TEST(sequential_reader_copy_range_to_a_pipe_copies_nothing) {
+    ByteFile file(1000);
+    SequentialFileReader sut(file.path);
+    int fds[2];
+    REQUIRE(::pipe(fds) == 0);
+    CHECK_EQ(sut.copy_range(0, 100, fds[1]), uint64_t(0));
+    CHECK(!sut.copy_supported());
+    CHECK_EQ(sut.copy_range(0, 100, fds[1]), uint64_t(0));
+    ::close(fds[0]);
+    ::close(fds[1]);
+}
+
+TEST(copy_in_kernel_stops_unsupported_on_errors_that_moved_nothing) {
+    struct Case { const char* name; std::vector<ssize_t> script; uint64_t copied; };
+    // Each script entry is one call: bytes copied, or -errno.
+    const std::vector<Case> cases = {
+        {"EXDEV", {-EXDEV}, 0},
+        {"EINVAL", {-EINVAL}, 0},
+        {"ENOSYS", {-ENOSYS}, 0},
+        {"EOPNOTSUPP", {-EOPNOTSUPP}, 0},
+        {"EPERM from seccomp", {-EPERM}, 0},
+        {"EIO from FUSE or NFS", {-EIO}, 0},
+        {"EBADF for an appending output", {-EBADF}, 0},
+        {"0 bytes before any copy", {0}, 0},
+        {"EPERM after a partial copy", {3, -EPERM}, 3},
+        {"0 bytes after a partial copy", {3, 0}, 3},
+    };
+    for (const auto& c : cases) {
+        size_t step = 0;
+        auto copy_at = [&](uint64_t, size_t) -> ssize_t {
+            ssize_t r = c.script[step++];
+            if (r < 0) { errno = static_cast<int>(-r); return -1; }
+            return r;
+        };
+        const KernelCopy got = copy_in_kernel(0, 8, copy_at, "fake");
+        CHECK(got.unsupported);
+        CHECK_EQ(got.copied, c.copied);
+        CHECK_EQ(step, c.script.size());
+    }
+}
+
+TEST(copy_in_kernel_retries_short_copies_and_interrupts) {
+    std::vector<uint64_t> offsets;
+    std::vector<ssize_t> script = {3, -EINTR, 5};
+    size_t step = 0;
+    auto copy_at = [&](uint64_t off, size_t k) -> ssize_t {
+        offsets.push_back(off);
+        ssize_t r = script[step++];
+        if (r < 0) { errno = static_cast<int>(-r); return -1; }
+        return std::min(r, static_cast<ssize_t>(k));
+    };
+    const KernelCopy got = copy_in_kernel(100, 8, copy_at, "fake");
+    CHECK(!got.unsupported);
+    CHECK_EQ(got.copied, uint64_t(8));
+    CHECK(offsets == std::vector<uint64_t>({100, 103, 103}));
+}
+
+TEST(copy_in_kernel_throws_on_other_errors) {
+    auto no_space = [](uint64_t, size_t) -> ssize_t { errno = ENOSPC; return -1; };
+    CHECK(throws_runtime([&] { copy_in_kernel(0, 8, no_space, "fake"); }, "Cannot copy fake"));
+}
+
+namespace {
+
+// Runs append_old_range over `runs` of `file` into a stdio stream opened
+// with `mode`, with a buffered byte before, between and after the runs.
+// Returns what landed in the output file.
+std::vector<char> append_runs(const ByteFile& file, const char* mode,
+                              const std::vector<std::pair<uint64_t, uint64_t>>& runs, bool* copy_supported) {
+    SequentialFileReader old(file.path, 4096);
+    const std::string out_path = file.dir.path() + "/appended.bin";
+    std::remove(out_path.c_str());
+    FILE* out = std::fopen(out_path.c_str(), mode);
+    if (!out) return {};
+    std::fputc('<', out);
+    for (const auto& run : runs) {
+        append_old_range(old, out, run.first, run.second, "appended.bin");
+        std::fputc('|', out);
+    }
+    std::fclose(out);
+    *copy_supported = old.copy_supported();
+    SequentialFileReader got(out_path);
+    std::vector<char> bytes(got.size());
+    got.read(0, bytes.data(), bytes.size());
+    return bytes;
+}
+
+}  // namespace
+
+TEST(append_old_range_output_matches_with_and_without_kernel_copy) {
+    // 1 MiB: a short run fills the window, a long run starts inside it, and
+    // one ends at the end of the file.
+    ByteFile file(1 << 20);
+    const std::vector<std::pair<uint64_t, uint64_t>> runs = {
+        {10, 100}, {200, 400000}, {500000, 300000}, {(1 << 20) - 300000, 300000}};
+    std::vector<char> expected = {'<'};
+    for (const auto& run : runs) {
+        expected.insert(expected.end(), file.bytes.begin() + run.first, file.bytes.begin() + run.first + run.second);
+        expected.push_back('|');
+    }
+    // "ab" opens the output with O_APPEND, which copy_file_range refuses
+    // (EBADF): every byte then goes through the window.
+    for (const char* mode : {"wb", "ab"}) {
+        bool copy_supported = true;
+        CHECK(append_runs(file, mode, runs, &copy_supported) == expected);
+        if (std::string(mode) == "ab") CHECK(!copy_supported);    }
+}
+
+TEST(append_old_range_throws_when_the_flush_before_a_copy_fails) {
+    ByteFile file(1 << 20);
+    SequentialFileReader old(file.path);
+    FILE* out = std::fopen("/dev/full", "wb");
+    REQUIRE(out != nullptr);
+    std::fputc('<', out);
+    CHECK(throws_runtime([&] { append_old_range(old, out, 0, COPY_RANGE_MIN_BYTES, "full.bin"); },
+                         "Cannot write full.bin"));
+    std::fclose(out);
 }
 
 TEST(read_fully_retries_short_reads_and_interrupts) {

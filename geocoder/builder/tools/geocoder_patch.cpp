@@ -1,9 +1,10 @@
-// geocoder-patch v4: Low-memory streaming patch application.
+// geocoder-patch: Low-memory streaming patch application.
 //
 // Key design: old files stream front to back through pread (SequentialFileReader);
 // the string tiers and the decompressed patch, read at random, stay mmapped.
-// Output streams via fwrite (never accumulate), the entry pipeline goes
-// cell-by-cell. Target: <1 GiB peak RSS for planet.
+// Long unchanged runs and unchanged files are copied in the kernel
+// (copy_file_range). Output streams via fwrite (never accumulate), the entry
+// pipeline goes cell-by-cell. Target: <1 GiB peak RSS for planet.
 //
 // Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir>
 
@@ -500,9 +501,10 @@ static int run(int argc, char* argv[]) {
                 return 1;
             }
             FILE* out = open_out(fname);
-            size_t written = 0;
-            in.stream(0, in.size(), [&](const char* p, size_t n) { written += fwrite(p, 1, n, out); });
-            fclose(out);
+            append_old_range(in, out, 0, in.size(), fname);
+            bool ok = !ferror(out);
+            if (fclose(out) != 0 || !ok) throw std::runtime_error(std::string("Cannot write ") + fname);
+            const uint64_t written = in.size();
             std::cerr << "  " << fname << ": unchanged (copied " << written
                       << " bytes from old)" << section_io() << std::endl;
             continue;
@@ -693,14 +695,14 @@ static int run(int argc, char* argv[]) {
             if (op == OP_MATCH_RUN) {
                 // Fast path: files with no per-record transform (the
                 // *_vertices byte streams, street_nodes / interp_nodes)
-                // copy the whole run from old in window-sized fwrites. The
-                // record loop below costs one fwrite per record: one per
-                // byte of planet/full's 3.4 GiB addr_vertices, one per node
-                // of its 600M street_nodes.
+                // copy the whole run from old at once. The record loop
+                // below costs one fwrite per record: one per byte of
+                // planet/full's 3.4 GiB addr_vertices, one per node of its
+                // 600M street_nodes.
                 size_t run_bytes = (size_t)count * actual_stride;
                 if (!needs_remap && !needs_padding && remap_offs.empty() && !has_fixups
                     && old_bytes + run_bytes <= old.size()) {
-                    old.stream(old_bytes, run_bytes, [&](const char* p, size_t n) { fwrite(p, 1, n, outf); });
+                    append_old_range(old, outf, old_bytes, run_bytes, fname);
                     written += run_bytes;
                     old_rec += count; new_rec += count; old_bytes += run_bytes;
                     continue;
@@ -803,7 +805,8 @@ static int run(int argc, char* argv[]) {
                 throw std::runtime_error(std::string("Malformed merge sequence: ") + fname);
             }
         }
-        fclose(outf);
+        bool out_ok = !ferror(outf);
+        if (fclose(outf) != 0 || !out_ok) throw std::runtime_error(std::string("Cannot write ") + fname);
         log_rewinds(old);
 
         if (track) {
