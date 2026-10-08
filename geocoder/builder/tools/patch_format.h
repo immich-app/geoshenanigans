@@ -1192,6 +1192,61 @@ private:
 
 // --- String offset remap (patcher) ---
 
+// The string tier files, in global offset order: tier t's strings sit at
+// [sum of the sizes of tiers < t, + its own size). Same as the builder's
+// STR_TIER_FILENAMES.
+static constexpr int STRING_TIER_COUNT = 5;
+static constexpr const char* STRING_TIER_FILES[STRING_TIER_COUNT] = {
+    "strings_core.bin", "strings_street.bin", "strings_addr.bin",
+    "strings_postcode.bin", "strings_poi.bin"
+};
+
+// Merge-walks one tier's old and new pools (both sorted, NUL-terminated
+// strings) and calls on_run(start, end, shift) for each maximal run of
+// surviving strings that moved by one shift: [start, end) are global old
+// offsets, and shift = new - old (mod 2^32). A deleted, added or unmoved
+// string ends a run, so a run covers only bytes of strings that survive.
+template <typename OnRun>
+void for_each_string_tier_run(const char* old_pool, size_t old_size, uint32_t old_base,
+                              const char* new_pool, size_t new_size, uint32_t new_base, OnRun on_run) {
+    size_t o = 0, n = 0;
+    bool open = false;
+    uint32_t start = 0, end = 0, shift = 0;
+    auto close = [&] {
+        if (open) on_run(start, end, shift);
+        open = false;
+    };
+    while (o < old_size && n < new_size) {
+        const char* os = old_pool + o;
+        const char* ns = new_pool + n;
+        size_t ol = strnlen(os, old_size - o) + 1, nl = strnlen(ns, new_size - n) + 1;
+        int c = strcmp(os, ns);
+        if (c == 0) {
+            uint32_t old_off = old_base + static_cast<uint32_t>(o);
+            uint32_t s = new_base + static_cast<uint32_t>(n) - old_off;
+            if (open && end == old_off && shift == s) {
+                end += static_cast<uint32_t>(ol);
+            } else {
+                close();
+                if (s != 0) {
+                    open = true;
+                    start = old_off;
+                    end = old_off + static_cast<uint32_t>(ol);
+                    shift = s;
+                }
+            }
+            o += ol; n += nl;
+        } else if (c < 0) {
+            close();  // deleted: its offsets keep mapping to themselves
+            o += ol;
+        } else {
+            close();
+            n += nl;
+        }
+    }
+    close();
+}
+
 // The patcher's old → new string offset map. Between two edits every
 // surviving string of a tier moves by one amount, so the map is held as runs
 // over old offsets: a few thousand on a planet day instead of one pair per
@@ -1205,31 +1260,10 @@ public:
     // surviving strings that moved. The old pool must stay mapped for lookups.
     void add_tier(const char* old_pool, size_t old_size, uint32_t old_base,
                   const char* new_pool, size_t new_size, uint32_t new_base) {
-        size_t o = 0, n = 0;
-        bool open = false;
-        while (o < old_size && n < new_size) {
-            const char* os = old_pool + o;
-            const char* ns = new_pool + n;
-            size_t ol = strnlen(os, old_size - o) + 1, nl = strnlen(ns, new_size - n) + 1;
-            int c = strcmp(os, ns);
-            if (c == 0) {
-                uint32_t old_off = old_base + static_cast<uint32_t>(o);
-                uint32_t shift = new_base + static_cast<uint32_t>(n) - old_off;
-                if (shift == 0) {
-                    open = false;
-                } else if (open && runs_.back().end == old_off && runs_.back().shift == shift) {
-                    runs_.back().end += static_cast<uint32_t>(ol);
-                } else {
-                    runs_.push_back({old_off, old_off + static_cast<uint32_t>(ol), shift, os});
-                    open = true;
-                }
-                o += ol; n += nl;
-            } else if (c < 0) {
-                o += ol; open = false;  // deleted: its offsets keep mapping to themselves
-            } else {
-                n += nl; open = false;
-            }
-        }
+        for_each_string_tier_run(old_pool, old_size, old_base, new_pool, new_size, new_base,
+                                 [&](uint32_t start, uint32_t end, uint32_t shift) {
+                                     runs_.push_back({start, end, shift, old_pool + (start - old_base)});
+                                 });
     }
     void add_pair(uint32_t old_off, uint32_t new_off) { pairs_.push_back({old_off, new_off}); }
     void finish() { std::sort(pairs_.begin(), pairs_.end()); }

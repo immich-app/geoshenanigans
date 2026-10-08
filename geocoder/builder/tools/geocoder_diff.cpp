@@ -641,10 +641,6 @@ static int run(int argc, char* argv[]) {
     // unchanged. Tier bases are the cumulative sizes of the tiers found;
     // a tier found nowhere is empty (strings_poi.bin beside full/).
     std::cerr << "Building string remap... (RSS=" << get_rss_mb() << " MiB)" << std::endl;
-    static const char* kStrTierFilenames[5] = {
-        "strings_core.bin", "strings_street.bin", "strings_addr.bin",
-        "strings_postcode.bin", "strings_poi.bin"
-    };
     std::array<MappedFile, 5> old_tier_maps{}, new_tier_maps{};
     std::vector<char> old_concat, new_concat;
     std::array<uint32_t, 6> old_tier_bases{}, new_tier_bases{};
@@ -696,8 +692,8 @@ static int run(int argc, char* argv[]) {
         return {m, false};
     };
     for (int t = 0; t < 5; t++) {
-        old_tier_maps[t] = try_load_tier(old_dir, kStrTierFilenames[t]);
-        new_tier_maps[t] = try_load_tier(new_dir, kStrTierFilenames[t]);
+        old_tier_maps[t] = try_load_tier(old_dir, STRING_TIER_FILES[t]);
+        new_tier_maps[t] = try_load_tier(new_dir, STRING_TIER_FILES[t]);
         old_tier_bases[t] = static_cast<uint32_t>(old_concat.size());
         new_tier_bases[t] = static_cast<uint32_t>(new_concat.size());
         if (old_tier_maps[t].size > 0)
@@ -796,7 +792,7 @@ static int run(int argc, char* argv[]) {
             wval(patch, &n_added, 4); wval(patch, &n_deleted, 4);
             for (auto& s : added_strings) { patch.insert(patch.end(), s.begin(), s.end()); patch.push_back('\0'); }
             for (auto idx : deleted_indices) wval(patch, &idx, 4);
-            std::cerr << "  " << kStrTierFilenames[t] << ": +" << n_added << " -" << n_deleted << " strings" << std::endl;
+            std::cerr << "  " << STRING_TIER_FILES[t] << ": +" << n_added << " -" << n_deleted << " strings" << std::endl;
         }
     }
 

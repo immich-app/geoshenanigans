@@ -752,6 +752,37 @@ TEST(patch_format_string_remap_runs_match_per_string_pairs) {
     }
 }
 
+// The builder's STR_TIER_FILENAMES (test_string_tiers.cpp: parsed_data.h
+// can't share a translation unit with patch_format.h).
+std::vector<std::string> builder_string_tier_files();
+
+TEST(patch_format_string_tier_files_stack_in_the_builder_order) {
+    // Global string offsets stack the tiers in the builder's order.
+    const std::vector<std::string> builder_order = builder_string_tier_files();
+    REQUIRE(builder_order.size() == size_t(STRING_TIER_COUNT));
+    for (int t = 0; t < STRING_TIER_COUNT; t++) CHECK_EQ(std::string(STRING_TIER_FILES[t]), builder_order[t]);
+}
+
+TEST(patch_format_string_tier_runs_are_maximal_and_skip_unmoved_strings) {
+    // old: a c e g i   new: a c d e i  (d added, g deleted).
+    // a, c don't move; e moves by +2 ("d\0"); g is gone; i moves by 0
+    // (d's +2 cancels g's -2) and opens no run.
+    const std::string o = pool_of({"a", "c", "e", "g", "i"});
+    const std::string n = pool_of({"a", "c", "d", "e", "i"});
+    std::vector<std::array<uint32_t, 3>> runs;
+    for_each_string_tier_run(o.data(), o.size(), 100, n.data(), n.size(), 100,
+                             [&](uint32_t s, uint32_t e, uint32_t sh) { runs.push_back({s, e, sh}); });
+    REQUIRE(runs.size() == 1);
+    CHECK(runs[0] == (std::array<uint32_t, 3>{104, 106, 2}));
+    // Two tiers' worth of bases: every surviving string moves by the base
+    // difference, so the whole pool is one run.
+    runs.clear();
+    for_each_string_tier_run(o.data(), o.size(), 10, o.data(), o.size(), 7,
+                             [&](uint32_t s, uint32_t e, uint32_t sh) { runs.push_back({s, e, sh}); });
+    REQUIRE(runs.size() == 1);
+    CHECK(runs[0] == (std::array<uint32_t, 3>{10, 20, uint32_t(-3)}));
+}
+
 // --- record id remap ---
 
 TEST(patch_format_record_remap_matches_and_secondary_pairs) {

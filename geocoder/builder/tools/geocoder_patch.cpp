@@ -213,10 +213,6 @@ static int run(int argc, char* argv[]) {
     // Sorted vector remap: (old_offset, new_offset) pairs sorted by old_offset.
     // Offsets are global across all tiers (tier 0 occupies [0, base[1]),
     // tier N at [base[N], base[N+1])) so a single remap covers everything.
-    static const char* kStrTierFilenames[5] = {
-        "strings_core.bin", "strings_street.bin", "strings_addr.bin",
-        "strings_postcode.bin", "strings_poi.bin"
-    };
     StringRemap str_remap;
     // The old tiers stay mapped until the replays are done: str_remap's runs
     // check string starts against them.
@@ -235,7 +231,7 @@ static int run(int argc, char* argv[]) {
             // A variant without a tier of its own (quality, poi, or a mode
             // dir's unshipped tiers) resolves the old one under <region>/full/.
             auto old_tier_path = [&](int t) {
-                return resolve_with_fallback(cur_dir, kStrTierFilenames[t], {"../full/", "../../full/"});
+                return resolve_with_fallback(cur_dir, STRING_TIER_FILES[t], {"../full/", "../../full/"});
             };
             // String offsets are global (cumulative tier sizes), so every
             // old tier must be exactly the one the diff saw, even tiers this
@@ -259,12 +255,12 @@ static int run(int argc, char* argv[]) {
                 MappedFile old_pool = mmap_file(old_tier_path(t));
                 if (old_pool.size != stamps[t].old_size ||
                     content_hash(old_pool.data, old_pool.size) != stamps[t].old_hash)
-                    throw std::runtime_error(std::string("Old ") + kStrTierFilenames[t] + " (" +
+                    throw std::runtime_error(std::string("Old ") + STRING_TIER_FILES[t] + " (" +
                                              std::to_string(old_pool.size) + " bytes at " + old_tier_path(t) +
                                              ") is not the one the patch was made from");
                 // Phase A: write new tier file via alphabetical merge.
                 {
-                    FILE* fp = open_out(kStrTierFilenames[t]);
+                    FILE* fp = open_out(STRING_TIER_FILES[t]);
                     size_t sp = 0; uint32_t idx = 0; size_t ai = 0;
                     std::sort(added.begin(), added.end());
                     while (sp < old_pool.size || ai < added.size()) {
@@ -298,10 +294,10 @@ static int run(int argc, char* argv[]) {
                   std::vector<uint32_t>().swap(del_idx); }
 
                 // Phase B: extend remap by merge-walking old vs new in this tier.
-                MappedFile new_pool = mmap_file(out_path(kStrTierFilenames[t]));
+                MappedFile new_pool = mmap_file(out_path(STRING_TIER_FILES[t]));
                 if (new_pool.size != stamps[t].new_size ||
                     content_hash(new_pool.data, new_pool.size) != stamps[t].new_hash)
-                    throw std::runtime_error(std::string("Rebuilt ") + kStrTierFilenames[t] +
+                    throw std::runtime_error(std::string("Rebuilt ") + STRING_TIER_FILES[t] +
                                              " does not match the new build");
                 str_remap.add_tier(old_pool.data, old_pool.size, old_global_base,
                                    new_pool.data, new_pool.size, new_global_base);

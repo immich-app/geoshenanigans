@@ -3,6 +3,16 @@
 
 #include "test_framework.h"
 
+#include <iterator>
+#include <string>
+#include <vector>
+
+// For test_patch_format.cpp, which can't include parsed_data.h beside
+// patch_format.h.
+std::vector<std::string> builder_string_tier_files() {
+    return {std::begin(STR_TIER_FILENAMES), std::end(STR_TIER_FILENAMES)};
+}
+
 // --- string_home_tier ---
 
 TEST(string_home_tier_picks_the_most_widely_downloaded_consumer_tier) {
