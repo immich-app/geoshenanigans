@@ -1201,12 +1201,13 @@ inline void write_varint(std::vector<char>& buf, uint32_t value) {
 }
 
 // read_varint that stays inside data[0, size): a truncated or overlong
-// value throws "Malformed <what>".
+// value, or one of 2^32 or more, throws "Malformed <what>".
 inline uint32_t read_varint_bounded(const char* data, size_t& pos, size_t size, const char* what) {
     uint32_t result = 0;
     for (uint32_t bit = 0; bit < 35; bit += 7) {
         if (pos >= size) throw std::runtime_error(std::string("Malformed ") + what);
         uint8_t byte = static_cast<uint8_t>(data[pos++]);
+        if (bit == 28 && (byte & 0x70)) throw std::runtime_error(std::string("Malformed ") + what);
         result |= static_cast<uint32_t>(byte & 0x7F) << bit;
         if (!(byte & 0x80)) return result;
     }

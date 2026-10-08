@@ -131,6 +131,20 @@ TEST(patch_format_bounded_varint_rejects_truncated_and_overlong_values) {
     CHECK(threw);
 }
 
+TEST(patch_format_bounded_varint_rejects_bits_past_32) {
+    // A 5th byte holds bits 28..31; anything above is 2^32 or more, which
+    // must not wrap to a small value (5 + 2^32 would read as 5).
+    const char too_big[5] = {'\x85', '\x80', '\x80', '\x80', '\x10'};
+    size_t pos = 0;
+    bool threw = false;
+    try { read_varint_bounded(too_big, pos, sizeof(too_big), "runs"); } catch (const std::runtime_error&) { threw = true; }
+    CHECK(threw);
+    std::vector<char> max;
+    write_varint(max, 0xFFFFFFFFu);
+    pos = 0;
+    CHECK_EQ(read_varint_bounded(max.data(), pos, max.size(), "runs"), 0xFFFFFFFFu);
+}
+
 // --- to_grid quantiser ---
 
 TEST(patch_format_to_grid_basic) {
