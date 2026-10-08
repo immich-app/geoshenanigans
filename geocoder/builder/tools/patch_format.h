@@ -1190,6 +1190,43 @@ private:
     std::vector<std::pair<uint32_t, uint32_t>> pairs_;
 };
 
+// --- Varint encoding for delta-compressed fixup tables and string runs ---
+
+inline void write_varint(std::vector<char>& buf, uint32_t value) {
+    while (value >= 128) {
+        buf.push_back(static_cast<char>((value & 0x7F) | 0x80));
+        value >>= 7;
+    }
+    buf.push_back(static_cast<char>(value));
+}
+
+// read_varint that stays inside data[0, size): a truncated or overlong
+// value throws "Malformed <what>".
+inline uint32_t read_varint_bounded(const char* data, size_t& pos, size_t size, const char* what) {
+    uint32_t result = 0;
+    for (uint32_t bit = 0; bit < 35; bit += 7) {
+        if (pos >= size) throw std::runtime_error(std::string("Malformed ") + what);
+        uint8_t byte = static_cast<uint8_t>(data[pos++]);
+        result |= static_cast<uint32_t>(byte & 0x7F) << bit;
+        if (!(byte & 0x80)) return result;
+    }
+    throw std::runtime_error(std::string("Malformed ") + what);
+}
+
+inline uint32_t read_varint(const char* data, size_t& pos) {
+    uint32_t result = 0, shift = 0;
+    while (true) {
+        uint8_t byte = static_cast<uint8_t>(data[pos++]);
+        result |= (uint32_t)(byte & 0x7F) << shift;
+        if (!(byte & 0x80)) break;
+        shift += 7;
+    }
+    return result;
+}
+
+inline uint32_t zigzag32(uint32_t v) { return (v << 1) ^ (0u - (v >> 31)); }
+inline uint32_t unzigzag32(uint32_t v) { return (v >> 1) ^ (0u - (v & 1)); }
+
 // --- String offset remap (patcher) ---
 
 // The string tier files, in global offset order: tier t's strings sit at
@@ -1291,27 +1328,6 @@ private:
     std::vector<std::pair<uint32_t, uint32_t>> pairs_;
 };
 
-// --- Varint encoding for delta-compressed fixup tables ---
-
-inline void write_varint(std::vector<char>& buf, uint32_t value) {
-    while (value >= 128) {
-        buf.push_back(static_cast<char>((value & 0x7F) | 0x80));
-        value >>= 7;
-    }
-    buf.push_back(static_cast<char>(value));
-}
-
-inline uint32_t read_varint(const char* data, size_t& pos) {
-    uint32_t result = 0, shift = 0;
-    while (true) {
-        uint8_t byte = static_cast<uint8_t>(data[pos++]);
-        result |= (uint32_t)(byte & 0x7F) << shift;
-        if (!(byte & 0x80)) break;
-        shift += 7;
-    }
-    return result;
-}
-
 // --- Offset fixups ---
 //
 // The diff's fixup passes rewrite an old record's offset field (node_offset
@@ -1328,9 +1344,6 @@ struct OffsetFixups {
     std::vector<char> runs, values;
     bool empty() const { return n_runs == 0 && n_values == 0; }
 };
-
-inline uint32_t zigzag32(uint32_t v) { return (v << 1) ^ (0u - (v >> 31)); }
-inline uint32_t unzigzag32(uint32_t v) { return (v >> 1) ^ (0u - (v & 1)); }
 
 // fixed_at(i): record i's offset after the fixup passes.
 template <typename FixedAt>
@@ -1393,14 +1406,7 @@ private:
     static constexpr uint32_t END = 0xFFFFFFFFu;  // also NO_DATA
 
     static uint32_t read(const char* data, size_t& pos, size_t size) {
-        uint32_t result = 0;
-        for (uint32_t bit = 0; bit < 35; bit += 7) {
-            if (pos >= size) throw std::runtime_error("Malformed fixups");
-            uint8_t byte = static_cast<uint8_t>(data[pos++]);
-            result |= static_cast<uint32_t>(byte & 0x7F) << bit;
-            if (!(byte & 0x80)) return result;
-        }
-        throw std::runtime_error("Malformed fixups");
+        return read_varint_bounded(data, pos, size, "fixups");
     }
     void next_run() {
         if (runs_left_ == 0) { run_start_ = run_end_ = END; return; }

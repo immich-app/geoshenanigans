@@ -110,6 +110,27 @@ TEST(patch_format_varint_sequence_in_one_buffer) {
     CHECK_EQ(pos, buf.size());
 }
 
+TEST(patch_format_bounded_varint_rejects_truncated_and_overlong_values) {
+    std::vector<char> buf;
+    write_varint(buf, 300000u);
+    for (size_t cut = 0; cut < buf.size(); cut++) {
+        size_t pos = 0;
+        bool threw = false;
+        try { read_varint_bounded(buf.data(), pos, cut, "runs"); } catch (const std::runtime_error& e) {
+            threw = std::string(e.what()) == "Malformed runs";
+        }
+        CHECK(threw);
+    }
+    size_t pos = 0;
+    CHECK_EQ(read_varint_bounded(buf.data(), pos, buf.size(), "runs"), 300000u);
+    CHECK_EQ(pos, buf.size());
+    const char overlong[6] = {'\x80', '\x80', '\x80', '\x80', '\x80', '\x01'};
+    pos = 0;
+    bool threw = false;
+    try { read_varint_bounded(overlong, pos, sizeof(overlong), "runs"); } catch (const std::runtime_error&) { threw = true; }
+    CHECK(threw);
+}
+
 // --- to_grid quantiser ---
 
 TEST(patch_format_to_grid_basic) {
