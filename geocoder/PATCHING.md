@@ -80,8 +80,9 @@ The entry point for all clients:
   "build_version": 2,
   "patch_version": 7,
   "latest": "2026-04-10",
+  "previous": "2026-04-09",
   "oldest_indexes": "2026-04-08",
-  "oldest_patches": "2026-03-25",
+  "oldest_patches": "2026-03-27",
   "updated_at": "2026-04-10T02:30:00Z"
 }
 ```
@@ -91,8 +92,9 @@ The entry point for all clients:
 | `build_version` | Incremented when file structure changes. If this doesn't match your local version, download fresh. |
 | `patch_version` | Incremented when patch format changes. If this doesn't match your local version, download fresh. |
 | `latest` | Most recent build date. |
-| `oldest_indexes` | Oldest date that still has full `.bin` index files available for download. |
-| `oldest_patches` | Oldest date that still has `patch.gcpatch` files available. |
+| `previous` | The date `latest` patches from, or `null` when `latest` has no patches (a fresh build). |
+| `oldest_indexes` | Oldest date that still has full `.bin` index files of this `build_version` available for download. `latest` when no older one does. |
+| `oldest_patches` | Oldest local date that can patch to `latest`: every build after it on the `build.previous` chain to `latest` still has its `patch.gcpatch` files. `latest` when `latest` has no patches. |
 
 ## configurations.json (per-build)
 
@@ -213,8 +215,8 @@ Regions are independent. Download the new region's mode + quality directories.
 | Data | Retention | Notes |
 |------|-----------|-------|
 | Index files (`.bin`) | 3 days | Full index available for fresh downloads |
-| Patch files (`.gcpatch`) | Weeks | Small files, allow long catch-up windows |
-| Cached PBFs | 5 days | Build server cache only, not client-facing |
+| Patch files (`.gcpatch`) and `configurations.json` | 14 days | Small files, allow long catch-up windows; `configurations.json` stays so the chain walk works |
+| Cached PBFs | 3 days | Build server cache only, not client-facing |
 
 ## Patch Application
 

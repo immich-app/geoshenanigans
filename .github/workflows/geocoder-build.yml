@@ -33,6 +33,11 @@ env:
   S3_PREFIX: geocoder
   S3_ENDPOINT: https://t3.storage.dev
   S3_PUBLIC_URL: https://geoshenanigans-reverse-geocoding.t3.tigrisfiles.io
+  # Tigris retention, in days counting the build's own date: full indexes,
+  # then patches plus configurations.json. Finalize publishes the matching
+  # oldest_indexes / oldest_patches in latest.json; cleanup enforces them.
+  KEEP_FULL_DAYS: 3
+  KEEP_PATCH_DAYS: 14
 
 permissions:
   contents: read
@@ -132,13 +137,15 @@ jobs:
           echo "Previous:   $PREV_DATE"
           echo "Server:     $CURRENT_DATE (seq $CURRENT_SEQ, offset: -${DAYS_OFFSET}d)"
 
-          # Check if previous build exists on Tigris with compatible build_version
+          # Check if previous build exists on Tigris with compatible build_version.
+          # Look for an index file, not just the directory: dates past the
+          # full-index window keep configurations.json beside their patches.
           EXPECTED_BUILD_VERSION=$(jq -r .build.version "$GITHUB_WORKSPACE/geocoder/builder/configurations.template.json")
           PREV_BUILD="s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV_DATE"
           if [ "$FORCE_FRESH" = "true" ]; then
             echo "has_previous=false" >> "$GITHUB_OUTPUT"
             echo "force_fresh=true requested — building fresh (ignoring $PREV_DATE)"
-          elif s5cmd --endpoint-url $S3_ENDPOINT ls "$PREV_BUILD/" 2>/dev/null | head -1 | grep -q .; then
+          elif [ -n "$(s5cmd --endpoint-url $S3_ENDPOINT ls "$PREV_BUILD/planet/full/*.bin.zst" 2>/dev/null)" ]; then
             # Check build_version in previous configurations.json. Falls back
             # to the legacy manifest.json for very old builds. Final
             # fallback: a configurations.json with schema_version=1 but no
@@ -168,7 +175,7 @@ jobs:
             fi
           else
             echo "has_previous=false" >> "$GITHUB_OUTPUT"
-            echo "No previous build ($PREV_DATE) — building fresh"
+            echo "No previous full index ($PREV_DATE) — building fresh"
           fi
 
       # ── Download PBF + previous indexes (parallel) ─────────────────
@@ -933,13 +940,47 @@ jobs:
             PREV_VAL="$( [ "$HAS_PREVIOUS" = "true" ] && echo "$OLD_DATE" || echo "null" )"
             BUILD_V=$(jq -r .build.version "$GITHUB_WORKSPACE/geocoder/builder/configurations.template.json")
             PATCH_V=$(jq -r .build.patch_version "$GITHUB_WORKSPACE/geocoder/builder/configurations.template.json")
+            BUILDS="s3://$S3_BUCKET/$S3_PREFIX/builds"
+            # The cleanup step below applies these same cutoffs.
+            FULL_CUTOFF=$(date -u -d "$NEW_DATE -${KEEP_FULL_DAYS} days +1 day" +%Y-%m-%d)
+            PATCH_CUTOFF=$(date -u -d "$NEW_DATE -${KEEP_PATCH_DAYS} days +1 day" +%Y-%m-%d)
+            build_field() {
+              $S5 cat "$BUILDS/$1/configurations.json" 2>/dev/null | jq -r "$2 // empty" 2>/dev/null || true
+            }
+
+            # Oldest date whose full index survives cleanup and has this
+            # build_version (a fresh install from it needs the same layout).
+            OLDEST_INDEXES=$NEW_DATE
+            d=$FULL_CUTOFF
+            while [ "$d" \< "$NEW_DATE" ]; do
+              if [ "$(build_field "$d" .build.version)" = "$BUILD_V" ]; then OLDEST_INDEXES=$d; break; fi
+              d=$(date -u -d "$d +1 day" +%Y-%m-%d)
+            done
+
+            # Oldest local date that can patch to latest: walk build.previous
+            # back from latest. A client at `prev` needs only cur's patches
+            # and configurations.json, so `cur` must be inside the retention
+            # window but `prev` need not be. A build without patches (fresh,
+            # or verify failed) has no previous and ends the chain.
+            OLDEST_PATCHES=$NEW_DATE
+            cur=$NEW_DATE
+            prev=$(jq -r '.build.previous // empty' "$WORKDIR/output/configurations.json")
+            while [ -n "$prev" ] && ! [ "$cur" \< "$PATCH_CUTOFF" ]; do
+              OLDEST_PATCHES=$prev
+              cur=$prev
+              prev=$(build_field "$cur" .build.previous)
+            done
+            echo "latest.json: oldest_indexes=$OLDEST_INDEXES oldest_patches=$OLDEST_PATCHES"
+
             jq -n \
               --argjson build_version "$BUILD_V" \
               --argjson patch_version "$PATCH_V" \
               --arg latest "$NEW_DATE" \
               --arg previous "$PREV_VAL" \
+              --arg oldest_indexes "$OLDEST_INDEXES" \
+              --arg oldest_patches "$OLDEST_PATCHES" \
               --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-              '{build_version: $build_version, patch_version: $patch_version, latest: $latest, previous: (if $previous == "null" then null else $previous end), updated_at: $updated_at}' \
+              '{build_version: $build_version, patch_version: $patch_version, latest: $latest, previous: (if $previous == "null" then null else $previous end), oldest_indexes: $oldest_indexes, oldest_patches: $oldest_patches, updated_at: $updated_at}' \
               | $S5 pipe "s3://$S3_BUCKET/$S3_PREFIX/builds/latest.json"
           else
             echo "::warning::Skipping latest.json update — patch verify failed"
@@ -950,7 +991,7 @@ jobs:
       # ── Cleanup old Tigris builds ──────────────────────────────────────
       # Retention policy:
       #   - Full builds (every .bin.zst, manifest, etc.): keep 3 days
-      #   - Patches (patch.gcpatch only): keep next 11 days (14 total)
+      #   - Patches (patch.gcpatch + configurations.json): keep next 11 days (14 total)
       #   - Older than 14 days: delete entirely
       # Skip cleanup if:
       #   - This run had patch verify failures (don't trash history when
@@ -967,8 +1008,6 @@ jobs:
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
           BUILDS_PREFIX="s3://$S3_BUCKET/$S3_PREFIX/builds"
 
-          KEEP_FULL_DAYS=3
-          KEEP_PATCH_DAYS=14
           # Cutoff dates (inclusive of the cutoff day itself).
           FULL_CUTOFF=$(date -u -d "$NEW_DATE -${KEEP_FULL_DAYS} days +1 day" +%Y-%m-%d)
           PATCH_CUTOFF=$(date -u -d "$NEW_DATE -${KEEP_PATCH_DAYS} days +1 day" +%Y-%m-%d)
@@ -995,14 +1034,13 @@ jobs:
             if [ "$d" \> "$FULL_CUTOFF" ] || [ "$d" = "$FULL_CUTOFF" ]; then
               echo "  $d: KEEP (full)"
             elif [ "$d" \> "$PATCH_CUTOFF" ] || [ "$d" = "$PATCH_CUTOFF" ]; then
-              echo "  $d: KEEP patches only — pruning non-patch files"
-              # List every object under this date, then rm everything
-              # whose key does not end in .gcpatch. Use a single
-              # multi-object rm so we make one round-trip per file
-              # instead of one per dir.
+              echo "  $d: KEEP patches + configurations.json — pruning the rest"
+              # rm everything under this date but the patches and
+              # configurations.json: clients walk build.previous through
+              # it to find the patch chain.
               KEYS=$($S5 ls "$BUILDS_PREFIX/$d/*" 2>/dev/null \
                 | awk '{print $NF}' \
-                | grep -v '\.gcpatch$' || true)
+                | grep -v -E '\.gcpatch$|^configurations\.json$' || true)
               if [ -n "$KEYS" ]; then
                 echo "$KEYS" | while read -r rel; do
                   $S5 rm "$BUILDS_PREFIX/$d/$rel" >/dev/null 2>&1 || true
