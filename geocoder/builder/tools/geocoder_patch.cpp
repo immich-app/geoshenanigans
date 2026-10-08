@@ -102,21 +102,6 @@ static size_t detect_stride(const std::string& path, std::initializer_list<size_
     return *candidates.begin();
 }
 
-// Resolve a string tier with fallback to the region's full/ dir, where the
-// tiers live for variants that don't ship them. Mirrors geocoder-diff's
-// try_load_tier; the tier stamps prove both found the same file.
-static std::string resolve_with_fallback(const std::string& cur_dir, const std::string& fname,
-                                          std::initializer_list<const char*> fallbacks) {
-    std::string primary = cur_dir + "/" + fname;
-    struct stat st;
-    if (stat(primary.c_str(), &st) == 0 && st.st_size > 0) return primary;
-    for (const char* fb : fallbacks) {
-        std::string p = cur_dir + "/" + fb + fname;
-        if (stat(p.c_str(), &st) == 0 && st.st_size > 0) return p;
-    }
-    return primary;
-}
-
 static int run(int argc, char* argv[]) {
     if (argc < 5 || std::string(argv[3]) != "-o") {
         std::cerr << "Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir>" << std::endl;
@@ -175,13 +160,6 @@ static int run(int argc, char* argv[]) {
         pos += n;
         return p;
     };
-    auto rstr = [&]() -> std::string {
-        const void* end = memchr(P + pos, '\0', patch_size - pos);
-        if (!end) throw std::runtime_error("Truncated patch: unterminated string");
-        std::string s(P + pos, static_cast<const char*>(end));
-        pos += s.size() + 1;
-        return s;
-    };
 
     // Header
     if (memcmp(P, GCPATCH_MAGIC, 8) != 0) { std::cerr << "Bad magic" << std::endl; return 1; }
@@ -190,8 +168,8 @@ static int run(int argc, char* argv[]) {
     ru32(); // flags
 
     // The exact file set out_dir must hold after the apply. Outputs the
-    // variant does not ship (string tiers it only remaps through, sections
-    // for files it lacks) are built in scratch instead.
+    // variant does not ship (sections for files it lacks) are built in
+    // scratch instead.
     const std::vector<ClientFile> client_files = parse_client_files(P, patch_size, pos);
     std::unordered_set<std::string> listed;
     for (const auto& f : client_files) {
@@ -209,114 +187,45 @@ static int run(int argc, char* argv[]) {
         return f;
     };
 
+    check_old_file_sizes(P, patch_size, pos, cur_dir);
+
     // --- Phase 2: String rebuild ---
-    // Sorted vector remap: (old_offset, new_offset) pairs sorted by old_offset.
-    // Offsets are global across all tiers (tier 0 occupies [0, base[1]),
-    // tier N at [base[N], base[N+1])) so a single remap covers everything.
+    // Offsets are global across the build's tiers (tier t at the sum of the
+    // sizes before it), so one remap covers every tier. The dir rebuilds the
+    // tiers it ships from its own old ones and derives their runs; the diff
+    // sends the runs of the tiers it doesn't ship but references.
     StringRemap str_remap;
-    // The old tiers stay mapped until the replays are done: str_remap's runs
-    // check string starts against them.
+    // The old shipped tiers stay mapped until the replays are done:
+    // str_remap's derived runs check string starts against them.
     std::vector<MappedFile> old_str_pools;
     {
-        uint32_t marker = ru32();
-        if (marker == STRINGS_TIERED_MARKER) {
-            // Tiered format — 5 independent per-tier diffs.  For each tier:
-            //   1. Read its n_added/n_deleted block from the patch.
-            //   2. Merge-write the old tier file + added (minus deleted)
-            //      into the new tier file.
-            //   3. Walk old/new to extend str_remap using global offsets.
-            uint32_t old_global_base = 0;
-            uint32_t new_global_base = 0;
-            uint32_t total_added = 0, total_deleted = 0;
-            // A variant without a tier of its own (quality, poi, or a mode
-            // dir's unshipped tiers) resolves the old one under <region>/full/.
-            auto old_tier_path = [&](int t) {
-                return resolve_with_fallback(cur_dir, STRING_TIER_FILES[t], {"../full/", "../../full/"});
-            };
-            // String offsets are global (cumulative tier sizes), so every
-            // old tier must be exactly the one the diff saw, even tiers this
-            // variant doesn't ship; a missing or stale tier would shift every
-            // later offset.
-            std::array<TierStamp, 5> stamps;
-            for (auto& s : stamps) {
-                s.old_size = ru32(); s.new_size = ru32();
-                s.old_hash = ru64(); s.new_hash = ru64();
-            }
-            for (int t = 0; t < 5; t++) {
-                uint32_t n_added = ru32(), n_deleted = ru32();
-                total_added += n_added; total_deleted += n_deleted;
-                std::vector<std::string> added;
-                for (uint32_t i = 0; i < n_added; i++) added.push_back(rstr());
-                require_bytes((size_t)n_deleted * 4, "deleted string indices");
-                std::vector<uint32_t> del_idx(n_deleted);
-                for (uint32_t i = 0; i < n_deleted; i++) del_idx[i] = ru32();
-                std::unordered_set<uint32_t> del_set(del_idx.begin(), del_idx.end());
-
-                MappedFile old_pool = mmap_file(old_tier_path(t));
-                if (old_pool.size != stamps[t].old_size ||
-                    content_hash(old_pool.data, old_pool.size) != stamps[t].old_hash)
-                    throw std::runtime_error(std::string("Old ") + STRING_TIER_FILES[t] + " (" +
-                                             std::to_string(old_pool.size) + " bytes at " + old_tier_path(t) +
-                                             ") is not the one the patch was made from");
-                // Phase A: write new tier file via alphabetical merge.
-                {
-                    FILE* fp = open_out(STRING_TIER_FILES[t]);
-                    size_t sp = 0; uint32_t idx = 0; size_t ai = 0;
-                    std::sort(added.begin(), added.end());
-                    while (sp < old_pool.size || ai < added.size()) {
-                        const char* old_s = nullptr;
-                        while (sp < old_pool.size) {
-                            if (!del_set.count(idx)) { old_s = old_pool.data + sp; break; }
-                            sp += strlen(old_pool.data + sp) + 1; idx++;
-                        }
-                        const char* add_s = ai < added.size() ? added[ai].c_str() : nullptr;
-                        if (old_s && add_s) {
-                            int c = strcmp(old_s, add_s);
-                            if (c <= 0) {
-                                size_t l = strlen(old_s) + 1; fwrite(old_s, 1, l, fp);
-                                sp += l; idx++;
-                                if (c == 0) ai++;
-                            } else {
-                                size_t l = added[ai].size() + 1; fwrite(add_s, 1, l, fp);
-                                ai++;
-                            }
-                        } else if (old_s) {
-                            size_t l = strlen(old_s) + 1; fwrite(old_s, 1, l, fp);
-                            sp += l; idx++;
-                        } else if (add_s) {
-                            size_t l = added[ai].size() + 1; fwrite(add_s, 1, l, fp);
-                            ai++;
-                        } else break;
-                    }
-                    fclose(fp);
-                }
-                { std::vector<std::string>().swap(added); std::unordered_set<uint32_t>().swap(del_set);
-                  std::vector<uint32_t>().swap(del_idx); }
-
-                // Phase B: extend remap by merge-walking old vs new in this tier.
-                MappedFile new_pool = mmap_file(out_path(STRING_TIER_FILES[t]));
-                if (new_pool.size != stamps[t].new_size ||
-                    content_hash(new_pool.data, new_pool.size) != stamps[t].new_hash)
-                    throw std::runtime_error(std::string("Rebuilt ") + STRING_TIER_FILES[t] +
-                                             " does not match the new build");
-                str_remap.add_tier(old_pool.data, old_pool.size, old_global_base,
-                                   new_pool.data, new_pool.size, new_global_base);
-                old_global_base += static_cast<uint32_t>(old_pool.size);
-                new_global_base += static_cast<uint32_t>(new_pool.size);
-                old_str_pools.push_back(old_pool);
-                unmap_file(new_pool);
-            }
-            malloc_trim(0);
-            std::cerr << "  Strings (tiered): +" << total_added << " -" << total_deleted
-                      << ", " << str_remap.run_count() << " remap runs" << std::endl;
-
-            marker = ru32();
-        }
-        if (marker == STRINGS_CROSS_TIER_REMAP_MARKER) {
-            uint32_t c = ru32();
-            for (uint32_t i = 0; i < c; i++) { uint32_t a = ru32(), b = ru32(); str_remap.add_pair(a, b); }
-        } else pos -= 4;
-        str_remap.finish();
+        const StringsSection strings = parse_strings_section(P, patch_size, pos);
+        require_shipped_tiers_listed(strings.shipped, listed);
+        uint32_t total_added = 0, total_deleted = 0;
+        load_string_remap(strings, str_remap, [&](int t) {
+            const char* name = STRING_TIER_FILES[t];
+            const StringTierDiff& diff = strings.diffs[t];
+            total_added += static_cast<uint32_t>(diff.added.size());
+            total_deleted += static_cast<uint32_t>(diff.deleted.size());
+            require_old_file_size(cur_dir, name, strings.old_size(t));
+            MappedFile old_pool = mmap_file(cur_dir + "/" + name);
+            if (old_pool.size != strings.old_size(t) || content_hash(old_pool.data, old_pool.size) != diff.old_hash)
+                throw std::runtime_error(std::string("Old ") + name + " is not the one the patch was made from");
+            FILE* fp = open_out(name);
+            rebuild_string_tier(old_pool.data, old_pool.size, diff, [&](const char* p, size_t n) { fwrite(p, 1, n, fp); });
+            bool ok = !ferror(fp);
+            if (fclose(fp) != 0 || !ok) throw std::runtime_error(std::string("Cannot write ") + name);
+            MappedFile new_pool = mmap_file(out_path(name));
+            if (new_pool.size != strings.new_size(t) || content_hash(new_pool.data, new_pool.size) != diff.new_hash)
+                throw std::runtime_error(std::string("Rebuilt ") + name + " does not match the new build");
+            str_remap.add_tier(old_pool.data, old_pool.size, strings.old_base[t],
+                               new_pool.data, new_pool.size, strings.new_base[t]);
+            old_str_pools.push_back(old_pool);
+            unmap_file(new_pool);
+        });
+        malloc_trim(0);
+        std::cerr << "  Strings: +" << total_added << " -" << total_deleted << ", "
+                  << str_remap.run_count() << " remap runs, " << strings.pairs.size() << " cross-tier pairs" << std::endl;
     }
     // Release patch pages read so far (string section)
     madvise(const_cast<char*>(patch_map.data), pos, MADV_DONTNEED);

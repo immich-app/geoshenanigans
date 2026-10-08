@@ -140,7 +140,7 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
 
 **Patch tool:**
 1. Decompress zstd
-2. Read string-level diff → reconstruct new string pool from old + additions/deletions, derive remap
+2. Read the strings section → rebuild each shipped tier from the dir's own old tier + additions/deletions and derive its remap runs; take the sent runs of unshipped tiers and the cross-tier pairs as they come
 3. For each data file: apply string remap + offset fixups to old, replay merge sequence → output file, track ID mapping from MATCH ops
 4. Read secondary ID remaps → merge into derived ID mappings
 5. Read cell changes (added/removed cell IDs) and flag corrections
@@ -178,14 +178,43 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
 
 **Status**: Fixed by adding explicit padding fields to `AdminPolygon` and `InterpWay` structs.
 
-## Patch Format (.gcpatch, version 6)
+### Each variant dir patches alone
+
+A client holds some variant dirs (a mode dir, maybe a quality and a poi dir)
+and patches each one from its own files only: the patcher never reads
+outside the dir it is given, and CI applies every patch to an isolated copy
+of the old dir (`tools/link_client_files.sh`) to prove it. Every dir of a
+build shares one global string layout, so each tier's offsets are the sum of
+the tier sizes before it, which the patch carries.
+
+- **Shipped tier**: a `strings_<tier>.bin` the old and new dir both hold
+  (empty files count). The patch sends its string diff and size and hash
+  stamps; the patcher rebuilds it and derives its remap runs by walking the
+  old and new pool, checking each looked-up offset is a string start. A tier
+  only the new dir holds is newly shipped: it counts as unshipped in the
+  strings section, and its file comes whole in a full-replacement section.
+- **Referenced tier**: a tier that some string field of the dir's own old
+  files points into (the fields the patcher remaps, `string_field_offsets`
+  and the sparse files of remap kind 2 and 3).
+- **Sent runs**: for a referenced tier the dir doesn't ship, the diff walks
+  the tier itself and sends the shift runs. The patcher looks them up without
+  a string-start check: every stored reference is a string start or NO_DATA
+  (`partition_strings_into_tiers`), and the daily byte-identity check proves
+  it.
+- A tier neither shipped nor referenced sends nothing.
+
+Dirs patched on different days don't fit together: the server combines a
+mode dir with a quality or poi dir by global string offsets, so the selected
+dirs must all be patched to the same date and swapped in together.
+
+## Patch Format (.gcpatch, version 7)
 
 Whole file is zstd-compressed for transport. Internal structure (all integers
-little-endian; the header, client files and strings sections are read by
-position, everything after them by marker):
+little-endian; the header, client files, old file sizes and strings sections
+are read by position, everything after them by marker):
 
 ```
-Header: "GCPATCH\0" (8) + version=6 (u32) + flags=0 (u32)
+Header: "GCPATCH\0" (8) + version=7 (u32) + flags=0 (u32)
 
 Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
   + n × {name_len:u16, name, size:u64, inline:u8, [bytes] if inline}
@@ -194,21 +223,32 @@ Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
   are inline and written verbatim. The patcher builds anything not listed in
   its scratch dir, and every listed file must exist at its listed size.
 
+Old file sizes: n (u32) + n × {file_id:u32, old_size:u64}
+  (the old files no section names, UNSECTIONED_OLD_FILES: the entry
+  pipeline's cell indexes and the entries file beside a cell list delta;
+  0 = absent. The patcher checks them first.)
+
 Strings: marker 0xFFFFFFF6 (u32)
-  + 5 × {old_size:u32, new_size:u32, old_hash:u64, new_hash:u64}
-  (the tiers the diff saw; the patcher refuses other old tiers and checks
-  every tier it rebuilds)
-  + 5 × {n_added:u32, n_deleted:u32, [string\0] × n_added, [index:u32] × n_deleted}
-  (core, street, addr, postcode, poi; a variant without a tier resolves it
-  through ../full/ and ../../full/)
-  + marker 0xFFFFFFFE (u32) + count (u32) + [(old_off:u32, new_off:u32)] × count
-  (cross-tier moves; same-tier remaps come from walking old/new tiers)
+  + 5 × {old_size:u32, new_size:u32} (core, street, addr, postcode, poi: the
+  build's tiers, which place every global offset)
+  + shipped (u32, bit per tier the dir rebuilds; each must be a listed
+  client file, and a listed tier without its bit comes in a per-file section)
+  + sent (u32, bit per unshipped tier the dir's old files reference)
+  + per tier in order:
+    shipped: old_hash:u64, new_hash:u64, n_added:u32, n_deleted:u32,
+      [string\0] × n_added, [index:u32] × n_deleted (the patcher refuses an
+      old tier of another size or hash and checks the one it rebuilds)
+    sent: n_runs:u32, runs_size:u32, runs of varint (start - previous end,
+      end - start, zigzag change of the shift), from the tier's old base
+  + n_pairs (u32) + [(old_off:u32, new_off:u32)] × n_pairs (strings that
+  changed tier, out of a shipped or referenced tier)
 
 Parent-id remap: marker 0xFFFFFFF3 (u32)
   + n_admin (u32) + [(old:u32, new:u32)] × n_admin
   + n_street (u32) + [(old:u32, new:u32)] × n_street + 0 (u32, reserved)
 
 Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64) + ...
+  (the patcher refuses an old file of another size, 0 meaning absent)
   stride=0: full replacement (n_fixups=0 u32, size u64, data)
   stride=0xFD: unchanged, copy from cur_dir
   stride=0xFC: sparse delta (value_stride, remap_kind, n, [(pos, value)] × n)

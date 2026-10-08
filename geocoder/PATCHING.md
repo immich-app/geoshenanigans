@@ -70,7 +70,7 @@ The entry point for all clients:
 ```json
 {
   "build_version": 2,
-  "patch_version": 6,
+  "patch_version": 7,
   "latest": "2026-04-10",
   "oldest_indexes": "2026-04-08",
   "oldest_patches": "2026-03-25",
@@ -99,7 +99,7 @@ files belong to each axis value), constraints, presets, and the flat
   "schema_version": 1,
   "build": {
     "version": 15,
-    "patch_version": 6,
+    "patch_version": 7,
     "date": "2026-04-10",
     "previous": "2026-04-09",
     "built_at": "2026-04-10T09:00:14Z",
@@ -166,12 +166,14 @@ the `.bin` files, because the server can't load a region without them.
 Apply every patch out of place (`geocoder-patch <old-dir> <patch> -o <new-dir>`;
 the tool refuses `-o` equal to the current dir or a non-empty one) and keep
 the build's directory layout. The new dir ends up holding exactly the
-variant's files, JSON included. String offsets are global across the five
-string tiers, so a variant without its own tiers reads the old ones from
-`<region>/full/` (`../full/`), which must still be at the old version: patch
-sibling variants before swapping in the new `full/`. The patch records the
-size and hash of every tier it was made from, and the tool fails rather than
-writing shifted offsets when one is missing or belongs to a different build.
+variant's files, JSON included. Each variant dir patches from its own files
+alone, in any order: the tool reads nothing outside the dir it is given. The
+patch records the size of every old file it reads and the hash of every
+string tier it rebuilds, and the tool fails when one differs. A size check
+only catches a file from another build when its size changed; the string
+tiers' hashes are the content check. The server combines a mode dir with a
+quality or poi dir by global string offsets, so patch every selected dir to
+the same date and swap the whole set in together.
 
 ### Version Mismatch
 

@@ -7,15 +7,19 @@
 #include "scratch_dir.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iterator>
+#include <map>
 #include <numeric>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "scratch_dir.h"
@@ -252,10 +256,11 @@ TEST(patch_format_section_marker_values) {
 
 TEST(patch_format_magic_and_version) {
     // GCPATCH_VERSION is bound to the value actually emitted/checked by the
-    // diff/patch tools. v6 = per-cell geo entry deltas; v5 sent full lists,
-    // so v5 patches are unreadable (MIN_READ_VERSION).
-    CHECK_EQ(GCPATCH_VERSION, uint32_t(6));
-    CHECK_EQ(GCPATCH_MIN_READ_VERSION, uint32_t(6));
+    // diff/patch tools. v7 = every variant dir patches from its own files;
+    // v6 patches need ../full's string tiers, so they are unreadable
+    // (MIN_READ_VERSION).
+    CHECK_EQ(GCPATCH_VERSION, uint32_t(7));
+    CHECK_EQ(GCPATCH_MIN_READ_VERSION, uint32_t(7));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
     for (int i = 0; i < 8; i++) CHECK_EQ(GCPATCH_MAGIC[i], expect[i]);
 }
@@ -433,6 +438,28 @@ TEST(patch_format_string_fields_match_the_record_layouts) {
     CHECK_EQ(POSTCODE_CENTROID_POSTCODE_ID_OFF, size_t(8));
 }
 
+TEST(patch_format_string_record_files_cover_every_string_field) {
+    // The diff's reference scan reads STRING_RECORD_FILES: a record file with
+    // string fields missing there would send no runs for the tiers it uses.
+    std::unordered_set<uint32_t> listed;
+    for (const auto& f : STRING_RECORD_FILES) {
+        listed.insert((uint32_t)f.fid);
+        REQUIRE(f.n_strides >= 1 && f.n_strides <= 4);
+        for (size_t i = 0; i < f.n_strides; i++) {
+            const auto fields = string_field_offsets(f.fid, f.strides[i]);
+            CHECK(!fields.empty());
+            for (size_t off : fields) CHECK(off + 4 <= f.strides[i]);
+        }
+    }
+    for (uint32_t fid = 0; fid < (uint32_t)PatchFileId::COUNT; fid++)
+        for (size_t stride = 1; stride <= 64; stride++)
+            if (!string_field_offsets((PatchFileId)fid, stride).empty()) CHECK(listed.count(fid) == 1);
+    CHECK_EQ(listed.size(), std::size(STRING_RECORD_FILES));
+    // Postal polygons sit at the admin stride.
+    for (const auto& f : STRING_RECORD_FILES)
+        if (f.fid == PatchFileId::POSTAL_POLYGONS) CHECK(f.stride_from == PatchFileId::ADMIN_POLYGONS);
+}
+
 // --- old file identity ---
 
 TEST(patch_format_old_file_must_be_the_size_the_patch_was_made_from) {
@@ -455,6 +482,43 @@ TEST(patch_format_old_file_must_be_the_size_the_patch_was_made_from) {
              std::string("Old admin_polygons.bin is not the one the patch was made from (48 bytes, the patch expects 72)"));
     CHECK(message("admin_polygons.bin", 0) != "");
     CHECK(message("absent.bin", 24) != "");
+}
+
+TEST(patch_format_old_file_sizes_cover_the_files_no_section_names) {
+    ScratchDir old_dir("old-sizes");
+    REQUIRE(write_file(old_dir.path() + "/geo_cells.bin", std::vector<char>(40, 'g')));
+    REQUIRE(write_file(old_dir.path() + "/poi_entries.bin", std::vector<char>()));
+    std::vector<char> buf;
+    append_old_file_sizes(buf, old_dir.path());
+    CHECK_EQ(buf.size(), 4 + std::size(UNSECTIONED_OLD_FILES) * 12);
+    auto check_in = [&](const std::string& dir, const std::vector<char>& b) -> std::string {
+        size_t pos = 0;
+        try {
+            check_old_file_sizes(b.data(), b.size(), pos, dir);
+        } catch (const std::runtime_error& e) {
+            return e.what();
+        }
+        return pos == b.size() ? "" : "pos";
+    };
+    CHECK_EQ(check_in(old_dir.path(), buf), std::string());
+    // Another day's index: same name, another size.
+    ScratchDir other("old-sizes-other");
+    REQUIRE(write_file(other.path() + "/geo_cells.bin", std::vector<char>(60, 'g')));
+    REQUIRE(write_file(other.path() + "/poi_entries.bin", std::vector<char>()));
+    CHECK_EQ(check_in(other.path(), buf),
+             std::string("Old geo_cells.bin is not the one the patch was made from (60 bytes, the patch expects 40)"));
+    // A file the old dir lacked must still be absent (or empty).
+    REQUIRE(write_file(other.path() + "/geo_cells.bin", std::vector<char>(40, 'g')));
+    REQUIRE(write_file(other.path() + "/admin_cells.bin", std::vector<char>(12, 'a')));
+    CHECK(!check_in(other.path(), buf).empty());
+    for (size_t cut = 0; cut < buf.size(); cut++)
+        CHECK_EQ(check_in(old_dir.path(), std::vector<char>(buf.begin(), buf.begin() + cut)),
+                 std::string("Truncated old file sizes"));
+    std::vector<char> bad(16, 0);
+    const uint32_t one = 1, past_last = (uint32_t)PatchFileId::COUNT;
+    memcpy(bad.data(), &one, 4);
+    memcpy(bad.data() + 4, &past_last, 4);
+    CHECK_EQ(check_in(old_dir.path(), bad), std::string("Malformed old file sizes"));
 }
 
 // --- offset fixups ---
@@ -785,6 +849,380 @@ TEST(patch_format_string_remap_runs_match_per_string_pairs) {
         }
         CHECK_EQ(remap.lookup(0xFFFFFFFFu), 0xFFFFFFFFu);
     }
+}
+
+namespace {
+
+// Every string start of a pool, as global offsets from base.
+std::vector<uint32_t> starts_of(const std::string& pool, uint32_t base) {
+    std::vector<uint32_t> out;
+    for (size_t i = 0; i < pool.size(); i += strlen(pool.c_str() + i) + 1) out.push_back(base + (uint32_t)i);
+    return out;
+}
+
+bool throws_runtime_error(const std::function<void()>& f) {
+    try { f(); } catch (const std::runtime_error&) { return true; }
+    return false;
+}
+
+}  // namespace
+
+TEST(patch_format_sent_string_runs_map_every_string_start) {
+    // A tier the client doesn't hold: its runs travel encoded and are looked
+    // up without the old pool, exactly for every string start.
+    const std::string o = pool_of({"a", "bb", "c", "dd", "e", "ff", "g"});
+    const std::string n = pool_of({"a", "aa", "bb", "c", "e", "eee", "ff", "g", "h"});
+    const uint32_t ob = 1000, nb = 990;
+    auto runs = encode_string_tier_runs(o.data(), o.size(), ob, n.data(), n.size(), nb);
+    StringRemap remap;
+    remap.add_sent_tier(runs.bytes.data(), runs.bytes.size(), runs.n_runs, ob, ob + (uint32_t)o.size());
+    remap.finish();
+    CHECK(!remap.empty());
+    CHECK_EQ(remap.run_count(), size_t(runs.n_runs));
+    auto want = pairs_of(o, n, ob, nb);
+    for (uint32_t v : starts_of(o, ob)) {
+        auto it = want.find(v);
+        CHECK_EQ(remap.lookup(v), it != want.end() ? it->second : v);
+    }
+    CHECK_EQ(remap.lookup(ob - 1), ob - 1);
+    CHECK_EQ(remap.lookup(ob + (uint32_t)o.size()), ob + (uint32_t)o.size());
+}
+
+TEST(patch_format_sent_string_runs_reject_malformed_input) {
+    const std::string o = pool_of({"a", "b", "c", "d", "e", "f"});
+    const std::string n = pool_of({"0", "a", "b", "bb", "c", "d", "e", "f"});
+    auto runs = encode_string_tier_runs(o.data(), o.size(), 100, n.data(), n.size(), 100);
+    REQUIRE(runs.n_runs == 2);
+    const uint32_t end = 100 + (uint32_t)o.size();
+    auto add = [](const std::vector<char>& bytes, uint32_t n_runs, uint32_t tier_start, uint32_t tier_end) {
+        StringRemap remap;
+        remap.add_sent_tier(bytes.data(), bytes.size(), n_runs, tier_start, tier_end);
+    };
+    CHECK(!throws_runtime_error([&] { add(runs.bytes, 2, 100, end); }));
+    for (size_t cut = 0; cut < runs.bytes.size(); cut++) {
+        std::vector<char> short_bytes(runs.bytes.begin(), runs.bytes.begin() + cut);
+        CHECK(throws_runtime_error([&] { add(short_bytes, 2, 100, end); }));
+    }
+    std::vector<char> extra = runs.bytes;
+    extra.push_back(0);
+    CHECK(throws_runtime_error([&] { add(extra, 2, 100, end); }));      // leftover bytes
+    CHECK(throws_runtime_error([&] { add(runs.bytes, 1, 100, end); }));  // fewer runs than bytes
+    CHECK(throws_runtime_error([&] { add(runs.bytes, 2, 100, end - 1); }));  // past the tier
+    CHECK(throws_runtime_error([&] { add(runs.bytes, 1000, 100, end); }));   // more runs than bytes allow
+    auto encode = [](std::vector<uint32_t> values) {
+        std::vector<char> out;
+        for (uint32_t v : values) write_varint(out, v);
+        return out;
+    };
+    CHECK(throws_runtime_error([&] { add(encode({0, 0, 2}), 1, 100, end); }));  // empty run
+    // A start past 2^32 must not wrap back into the tier.
+    CHECK(throws_runtime_error([&] { add(encode({0xFFFFFFF0u, 4, 2}), 1, 100, end); }));
+    // Tiers are added in offset order; a tier below earlier runs is refused.
+    StringRemap remap;
+    remap.add_sent_tier(runs.bytes.data(), runs.bytes.size(), 2, 100, end);
+    CHECK(throws_runtime_error([&] { remap.add_sent_tier(runs.bytes.data(), runs.bytes.size(), 2, 50, end); }));
+}
+
+TEST(patch_format_string_remap_maps_shipped_and_sent_tiers_and_tier_moves) {
+    // Random builds of up to 5 tiers: some shipped (derived runs over the
+    // client's own pools), the rest sent (runs decoded from the patch), and
+    // strings that move tier (pairs). Every old string start maps to where
+    // the diff's per-string remap (build_string_remap) sends it, and no run
+    // covers a pair's offset, so the lookup order can't matter.
+    uint64_t seed = 11;
+    auto rnd = [&](uint32_t n) { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return (uint32_t)(seed >> 33) % n; };
+    auto word = [&] { std::string w; for (uint32_t k = 0, len = 1 + rnd(4); k < len; k++) w.push_back('a' + rnd(5)); return w; };
+    for (int round = 0; round < 300; round++) {
+        const int n_tiers = 3 + (int)rnd(3);
+        // Each word lives in at most one tier per side.
+        std::map<std::string, std::pair<int, int>> home;  // word → (old tier, new tier), -1 = absent
+        for (int i = 0; i < 60; i++) {
+            std::string w = word();
+            if (home.count(w)) continue;
+            int ot = (int)rnd(n_tiers + 1) - 1, nt = ot;
+            uint32_t kind = rnd(10);
+            if (kind == 0) nt = (int)rnd(n_tiers + 1) - 1;  // moved tier, added or deleted
+            home[w] = {ot, nt};
+        }
+        std::vector<std::string> olds(n_tiers), news(n_tiers);
+        {
+            std::vector<std::vector<std::string>> o(n_tiers), n(n_tiers);
+            for (const auto& [w, tiers] : home) {
+                if (tiers.first >= 0) o[tiers.first].push_back(w);
+                if (tiers.second >= 0) n[tiers.second].push_back(w);
+            }
+            for (int t = 0; t < n_tiers; t++) { olds[t] = pool_of(o[t]); news[t] = pool_of(n[t]); }
+        }
+        std::vector<uint32_t> ob(n_tiers + 1, 0), nb(n_tiers + 1, 0);
+        for (int t = 0; t < n_tiers; t++) {
+            ob[t + 1] = ob[t] + (uint32_t)olds[t].size();
+            nb[t + 1] = nb[t] + (uint32_t)news[t].size();
+        }
+        // D: old start → new start of the same string, wherever it lives.
+        std::unordered_map<std::string, uint32_t> new_at;
+        for (int t = 0; t < n_tiers; t++)
+            for (uint32_t v : starts_of(news[t], nb[t])) new_at[news[t].c_str() + (v - nb[t])] = v;
+        std::unordered_map<uint32_t, uint32_t> D;
+        std::vector<std::pair<uint32_t, uint32_t>> moves;
+        auto tier_of = [&](uint32_t v, const std::vector<uint32_t>& b) {
+            for (int t = 0; t < n_tiers; t++) if (v >= b[t] && v < b[t + 1]) return t;
+            return -1;
+        };
+        for (int t = 0; t < n_tiers; t++)
+            for (uint32_t v : starts_of(olds[t], ob[t])) {
+                auto it = new_at.find(olds[t].c_str() + (v - ob[t]));
+                if (it == new_at.end()) continue;
+                D[v] = it->second;
+                if (tier_of(it->second, nb) != t) moves.push_back({v, it->second});
+            }
+
+        const uint32_t shipped = rnd(1u << n_tiers);
+        StringRemap remap, runs_only;
+        for (StringRemap* r : {&remap, &runs_only}) {
+            for (int t = 0; t < n_tiers; t++) {
+                if (shipped >> t & 1) {
+                    r->add_tier(olds[t].data(), olds[t].size(), ob[t], news[t].data(), news[t].size(), nb[t]);
+                } else {
+                    auto runs = encode_string_tier_runs(olds[t].data(), olds[t].size(), ob[t],
+                                                        news[t].data(), news[t].size(), nb[t]);
+                    r->add_sent_tier(runs.bytes.data(), runs.bytes.size(), runs.n_runs, ob[t], ob[t + 1]);
+                }
+            }
+        }
+        for (auto [a, b] : moves) remap.add_pair(a, b);
+        remap.finish();
+        runs_only.finish();
+        for (int t = 0; t < n_tiers; t++)
+            for (uint32_t v : starts_of(olds[t], ob[t])) {
+                auto it = D.find(v);
+                CHECK_EQ(remap.lookup(v), it != D.end() ? it->second : v);
+            }
+        for (auto [a, b] : moves) CHECK_EQ(runs_only.lookup(a), a);
+    }
+}
+
+TEST(patch_format_referenced_string_tiers_reads_the_listed_fields) {
+    // Tiers: core [0, 10), street [10, 30), addr empty, postcode [30, 40),
+    // poi [40, 50). Records of stride 12 with string fields at 4 and 8.
+    const uint32_t ends[STRING_TIER_COUNT] = {10, 30, 30, 40, 50};
+    auto records = [](std::vector<std::array<uint32_t, 3>> recs) {
+        std::vector<char> out(recs.size() * 12);
+        memcpy(out.data(), recs.data(), out.size());
+        return out;
+    };
+    const std::vector<size_t> fields = {4, 8};
+    auto mask_of = [&](const std::vector<char>& data) {
+        return referenced_string_tiers(data.data(), data.size(), 12, fields, ends, "test.bin");
+    };
+    // Byte 0 isn't a string field: 45 there references nothing.
+    CHECK_EQ(mask_of(records({{45, 0, 0xFFFFFFFFu}})), 1u);
+    CHECK_EQ(mask_of(records({{0, 9, 10}, {0, 0xFFFFFFFFu, 39}})), 0b1011u);
+    CHECK_EQ(mask_of(records({{0, 30, 49}})), 0b11000u);  // 30 opens postcode: addr is empty
+    CHECK_EQ(mask_of(records({})), 0u);
+    std::string what;
+    try { mask_of(records({{0, 1, 50}})); } catch (const std::runtime_error& e) { what = e.what(); }
+    CHECK_EQ(what, std::string("test.bin references string offset 50 past the old pool (50 bytes)"));
+}
+
+namespace {
+
+// A random build of 5 tiers for the strings section tests: each word lives in
+// at most one tier per side, and some change tier.
+struct RandomTiers {
+    std::array<std::string, STRING_TIER_COUNT> olds, news;
+    std::array<uint32_t, STRING_TIER_COUNT + 1> ob{}, nb{};
+    std::unordered_map<uint32_t, uint32_t> moved;  // old start → new start, every survivor (the diff's str_remap)
+    std::array<StringTierPools, STRING_TIER_COUNT> pools() const {
+        std::array<StringTierPools, STRING_TIER_COUNT> p;
+        for (int t = 0; t < STRING_TIER_COUNT; t++)
+            p[t] = {olds[t].data(), olds[t].size(), news[t].data(), news[t].size()};
+        return p;
+    }
+    int old_tier_of(uint32_t v) const {
+        for (int t = 0; t < STRING_TIER_COUNT; t++) if (v >= ob[t] && v < ob[t + 1]) return t;
+        return -1;
+    }
+    int new_tier_of(uint32_t v) const {
+        for (int t = 0; t < STRING_TIER_COUNT; t++) if (v >= nb[t] && v < nb[t + 1]) return t;
+        return -1;
+    }
+};
+
+template <typename Rnd>
+RandomTiers random_tiers(Rnd& rnd) {
+    auto word = [&] { std::string w; for (uint32_t k = 0, len = 1 + rnd(4); k < len; k++) w.push_back('a' + rnd(5)); return w; };
+    std::map<std::string, std::pair<int, int>> home;  // word → (old tier, new tier), -1 = absent
+    for (int i = 0; i < 80; i++) {
+        std::string w = word();
+        if (home.count(w)) continue;
+        int ot = (int)rnd(STRING_TIER_COUNT + 1) - 1, nt = ot;
+        if (rnd(8) == 0) nt = (int)rnd(STRING_TIER_COUNT + 1) - 1;
+        home[w] = {ot, nt};
+    }
+    RandomTiers r;
+    std::array<std::vector<std::string>, STRING_TIER_COUNT> o, n;
+    for (const auto& [w, tiers] : home) {
+        if (tiers.first >= 0) o[tiers.first].push_back(w);
+        if (tiers.second >= 0) n[tiers.second].push_back(w);
+    }
+    for (int t = 0; t < STRING_TIER_COUNT; t++) {
+        r.olds[t] = pool_of(o[t]);
+        r.news[t] = pool_of(n[t]);
+        r.ob[t + 1] = r.ob[t] + (uint32_t)r.olds[t].size();
+        r.nb[t + 1] = r.nb[t] + (uint32_t)r.news[t].size();
+    }
+    std::unordered_map<std::string, uint32_t> new_at;
+    for (int t = 0; t < STRING_TIER_COUNT; t++)
+        for (uint32_t v : starts_of(r.news[t], r.nb[t])) new_at[r.news[t].c_str() + (v - r.nb[t])] = v;
+    for (int t = 0; t < STRING_TIER_COUNT; t++)
+        for (uint32_t v : starts_of(r.olds[t], r.ob[t])) {
+            auto it = new_at.find(r.olds[t].c_str() + (v - r.ob[t]));
+            if (it != new_at.end()) r.moved[v] = it->second;
+        }
+    return r;
+}
+
+// The patcher's side: parse the section, rebuild each shipped tier from its
+// old pool (checked against the new one) and load the remap.
+struct DecodedStrings {
+    StringsSection section;
+    std::array<std::string, STRING_TIER_COUNT> rebuilt;
+};
+
+void decode_strings(const std::vector<char>& buf, const RandomTiers& r, DecodedStrings& out, StringRemap& remap) {
+    size_t pos = 0;
+    out.section = parse_strings_section(buf.data(), buf.size(), pos);
+    CHECK_EQ(pos, buf.size());
+    load_string_remap(out.section, remap, [&](int t) {
+        const StringTierDiff& d = out.section.diffs[t];
+        CHECK_EQ(d.old_hash, content_hash(r.olds[t].data(), r.olds[t].size()));
+        rebuild_string_tier(r.olds[t].data(), r.olds[t].size(), d,
+                            [&](const char* p, size_t n) { out.rebuilt[t].append(p, n); });
+        CHECK_EQ(content_hash(out.rebuilt[t].data(), out.rebuilt[t].size()), d.new_hash);
+        remap.add_tier(r.olds[t].data(), r.olds[t].size(), out.section.old_base[t],
+                       out.rebuilt[t].data(), out.rebuilt[t].size(), out.section.new_base[t]);
+    });
+}
+
+}  // namespace
+
+TEST(patch_format_strings_section_round_trip) {
+    // Random builds with every mix of shipped, referenced (sent) and neither
+    // tiers: shipped tiers rebuild byte for byte, every string start of a
+    // shipped or referenced tier maps exactly where the diff's per-string
+    // remap sends it, and no pair leaves a tier nobody looks up.
+    uint64_t seed = 23;
+    auto rnd = [&](uint32_t n) { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return (uint32_t)(seed >> 33) % n; };
+    for (int round = 0; round < 400; round++) {
+        const RandomTiers r = random_tiers(rnd);
+        const uint32_t shipped = rnd(32), referenced = rnd(32);
+        std::vector<char> buf;
+        const auto stats = append_strings_section(buf, r.pools(), shipped, referenced, r.moved);
+        DecodedStrings dec;
+        StringRemap remap;
+        decode_strings(buf, r, dec, remap);
+        const StringsSection& s = dec.section;
+        CHECK_EQ(s.shipped, shipped);
+        CHECK_EQ(s.sent, stats.sent);
+        CHECK_EQ(s.pairs.size(), size_t(stats.n_pairs));
+        const uint32_t looked_up = shipped | referenced;
+        for (int t = 0; t < STRING_TIER_COUNT; t++) {
+            CHECK_EQ(s.old_size(t), uint32_t(r.olds[t].size()));
+            CHECK_EQ(s.new_size(t), uint32_t(r.news[t].size()));
+            CHECK_EQ(bool(s.sent >> t & 1), !(shipped >> t & 1) && (referenced >> t & 1) && !r.olds[t].empty());
+            if (shipped >> t & 1) CHECK(dec.rebuilt[t] == r.news[t]);
+            if (!(looked_up >> t & 1)) continue;
+            for (uint32_t v : starts_of(r.olds[t], r.ob[t])) {
+                auto it = r.moved.find(v);
+                CHECK_EQ(remap.lookup(v), it != r.moved.end() ? it->second : v);
+            }
+        }
+        size_t want_pairs = 0;
+        for (const auto& [o, n] : r.moved) {
+            int ot = r.old_tier_of(o);
+            if (ot != r.new_tier_of(n) && (looked_up >> ot & 1)) want_pairs++;
+        }
+        CHECK_EQ(s.pairs.size(), want_pairs);
+        for (const auto& [o, n] : s.pairs) CHECK(looked_up >> r.old_tier_of(o) & 1);
+        CHECK(std::is_sorted(s.pairs.begin(), s.pairs.end()));
+        // Every cut of the section is refused.
+        for (size_t cut = 0; cut < buf.size(); cut += 1 + buf.size() / 50) {
+            size_t pos = 0;
+            CHECK(throws_runtime_error([&] { parse_strings_section(buf.data(), cut, pos); }));
+        }
+    }
+}
+
+TEST(patch_format_strings_section_rejects_bad_masks) {
+    std::vector<char> buf;
+    std::array<StringTierPools, STRING_TIER_COUNT> none{};
+    append_strings_section(buf, none, 0, 0, std::vector<std::pair<uint32_t, uint32_t>>());
+    const size_t shipped_at = 4 + STRING_TIER_COUNT * 8;
+    auto with_masks = [&](uint32_t shipped, uint32_t sent) {
+        std::vector<char> b = buf;
+        memcpy(b.data() + shipped_at, &shipped, 4);
+        memcpy(b.data() + shipped_at + 4, &sent, 4);
+        return b;
+    };
+    auto parses = [](const std::vector<char>& b) {
+        size_t pos = 0;
+        try { parse_strings_section(b.data(), b.size(), pos); } catch (const std::runtime_error& e) { return std::string(e.what()); }
+        return std::string();
+    };
+    CHECK_EQ(parses(buf), std::string());
+    CHECK_EQ(parses(with_masks(1u << STRING_TIER_COUNT, 0)), std::string("Malformed strings section"));
+    CHECK_EQ(parses(with_masks(0, 1u << STRING_TIER_COUNT)), std::string("Malformed strings section"));
+    std::vector<char> wrong_marker = buf;
+    wrong_marker[0] ^= 1;
+    CHECK_EQ(parses(wrong_marker), std::string("Patch has no strings section"));
+}
+
+TEST(patch_format_newly_shipped_tier_is_sent_and_arrives_whole) {
+    // An admin dir that starts shipping strings_postcode.bin: the old dir
+    // lacks it, so it can't be rebuilt. It counts as unshipped (its runs are
+    // sent, since the dir's postal polygons reference it) and its file comes
+    // in a section of its own.
+    ScratchDir old_dir("newly-shipped-old"), new_dir("newly-shipped-new");
+    for (const char* f : {"strings_core.bin"}) REQUIRE(write_file(old_dir.path() + "/" + f, std::vector<char>(2, 'a')));
+    for (const char* f : {"strings_core.bin", "strings_postcode.bin"})
+        REQUIRE(write_file(new_dir.path() + "/" + f, std::vector<char>(2, 'a')));
+    const ShippedStringTiers tiers = shipped_string_tiers(old_dir.path(), new_dir.path());
+    CHECK_EQ(tiers.shipped, 1u);         // core
+    CHECK_EQ(tiers.newly_shipped, 8u);   // postcode
+    CHECK_EQ(std::string(patch_file_names[(uint32_t)string_tier_file_id(3)]), std::string("strings_postcode.bin"));
+    for (int t = 0; t < STRING_TIER_COUNT; t++)
+        CHECK_EQ(std::string(patch_file_names[(uint32_t)string_tier_file_id(t)]), std::string(STRING_TIER_FILES[t]));
+
+    // The diff borrowed the old postcode tier from ../full.
+    RandomTiers r;
+    r.olds = {pool_of({"a", "c"}), pool_of({"main st"}), pool_of({"12"}), pool_of({"2000", "2010"}), ""};
+    r.news = {pool_of({"a", "b", "c"}), pool_of({"main st"}), pool_of({"12"}), pool_of({"2000", "2005", "2010"}), ""};
+    for (int t = 0; t < STRING_TIER_COUNT; t++) {
+        r.ob[t + 1] = r.ob[t] + (uint32_t)r.olds[t].size();
+        r.nb[t + 1] = r.nb[t] + (uint32_t)r.news[t].size();
+    }
+    const uint32_t old_2010 = r.ob[3] + 5, new_2010 = r.nb[3] + 10;
+    const uint32_t referenced = 0b1001;  // core, postcode
+    std::vector<char> buf;
+    const auto stats = append_strings_section(buf, r.pools(), tiers.shipped, referenced,
+                                              std::vector<std::pair<uint32_t, uint32_t>>());
+    CHECK_EQ(stats.sent, 8u);
+    DecodedStrings dec;
+    StringRemap remap;
+    decode_strings(buf, r, dec, remap);
+    CHECK_EQ(dec.section.shipped, 1u);
+    CHECK_EQ(dec.section.sent, 8u);
+    CHECK(dec.rebuilt[0] == r.news[0]);
+    CHECK_EQ(remap.lookup(r.ob[3]), r.nb[3]);
+    CHECK_EQ(remap.lookup(old_2010), new_2010);
+
+    // The patcher: a shipped tier must be listed; a listed one without the
+    // bit (postcode) is fine, its per-file section writes it.
+    const std::unordered_set<std::string> listed = {"strings_core.bin", "strings_postcode.bin", "strings_layout.json"};
+    CHECK(!throws_runtime_error([&] { require_shipped_tiers_listed(dec.section.shipped, listed); }));
+    std::string what;
+    try { require_shipped_tiers_listed(0b1001, {"strings_core.bin"}); } catch (const std::runtime_error& e) { what = e.what(); }
+    CHECK_EQ(what, std::string("Strings section ships strings_postcode.bin, which the client files don't list"));
 }
 
 // The builder's STR_TIER_FILENAMES (test_string_tiers.cpp: parsed_data.h

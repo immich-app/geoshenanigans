@@ -3,8 +3,10 @@
 #
 # For every variant dir under <new-root> holding .bin files: diff the same
 # variant under <old-root> against it into <new-root>/<variant>/patch.gcpatch,
-# apply that patch to the old dir in scratch, and verify the result is the new
-# client file set byte for byte (verify_patch.sh). Writes one result file per
+# apply that patch to an isolated copy of the old variant dir in scratch (its
+# client files only, link_client_files.sh, so a read outside the dir fails),
+# and verify the result is the new client file set byte for byte
+# (verify_patch.sh). Writes one result file per
 # variant to <results-dir>/<variant with / as _>:
 #   SKIP | PASS <files> <patch KiB> | FAIL <problems> <files> <patch KiB>
 # plus <name>.mismatches on failure. Diff and patch logs go to <log-dir>.
@@ -25,7 +27,9 @@ results_dir=$3
 log_dir=$4
 diff_bin=${GEOCODER_DIFF:-geocoder-diff}
 patch_bin=${GEOCODER_PATCH:-geocoder-patch}
-verify=$(dirname "$(readlink -f "$0")")/verify_patch.sh
+tools=$(dirname "$(readlink -f "$0")")
+verify=$tools/verify_patch.sh
+link=$tools/link_client_files.sh
 mkdir -p "$results_dir" "$log_dir"
 
 bin_count() { find "$1" -maxdepth 1 -name '*.bin' 2>/dev/null | wc -l; }
@@ -87,19 +91,23 @@ run_variant() {
     echo "SKIP" > "$result"
     return
   fi
-  local patch_file="$new_dir/patch.gcpatch" verify_dir
-  verify_dir=$(mktemp -d "${TMPDIR:-/tmp}/verify-$safe-XXXXXX")
+  local patch_file="$new_dir/patch.gcpatch" work
+  work=$(mktemp -d "${TMPDIR:-/tmp}/verify-$safe-XXXXXX")
+  # <work>/old/variant has no siblings: ../full and ../../full don't exist.
+  local iso_dir="$work/old/variant" verify_dir="$work/new"
+  mkdir -p "$work/old" "$verify_dir"
+  "$link" "$old_dir" "$iso_dir"
   if ! "$diff_bin" "$old_dir" "$new_dir" -o "$patch_file" 2> "$log"; then
     echo "FAIL 1 0 0" > "$result"
     echo "geocoder-diff failed: $(tail -1 "$log")" > "$result.mismatches"
-    rm -rf "$verify_dir"
+    rm -rf "$work"
     return
   fi
   local kib=$(( $(stat -c%s "$patch_file") / 1024 ))
-  if ! "$patch_bin" "$old_dir" "$patch_file" -o "$verify_dir/" 2>> "$log"; then
+  if ! "$patch_bin" "$iso_dir" "$patch_file" -o "$verify_dir/" 2>> "$log"; then
     echo "FAIL 1 0 $kib" > "$result"
     echo "geocoder-patch failed: $(tail -1 "$log")" > "$result.mismatches"
-    rm -rf "$verify_dir"
+    rm -rf "$work"
     return
   fi
   local report
@@ -113,7 +121,7 @@ run_variant() {
       echo "$report" | sed '$d' | tr '\n' ';' > "$result.mismatches"
       ;;
   esac
-  rm -rf "$verify_dir"
+  rm -rf "$work"
 }
 
 # Largest first, so the planet-scale diffs never pile up at the end.

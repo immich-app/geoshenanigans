@@ -628,6 +628,30 @@ static std::vector<ClientFile> list_client_files(const std::string& dir) {
     return files;
 }
 
+// The string tiers the variant's own old files reference: every string field
+// the patcher remaps (STRING_RECORD_FILES, sparse kinds 2 and 3), read from
+// old_dir only, never a sibling. Reads the raw bytes through a read-only map,
+// so it must not see the in-place remaps of the merge threads.
+static uint32_t referenced_string_tiers_of(const std::string& old_dir, const uint32_t (&tier_ends)[STRING_TIER_COUNT]) {
+    uint32_t mask = 0;
+    auto scan = [&](PatchFileId fid, size_t stride, const std::vector<size_t>& fields) {
+        const std::string name = patch_file_names[(uint32_t)fid];
+        MappedFile m = mmap_file(old_dir + "/" + name);
+        if (!m.data) return;
+        mask |= referenced_string_tiers(m.data, m.size, stride, fields, tier_ends, name);
+        unmap_file(m);
+    };
+    for (const auto& f : STRING_RECORD_FILES) {
+        size_t stride = detect_record_stride(old_dir, f);
+        scan(f.fid, stride, string_field_offsets(f.fid, stride));
+    }
+    for (const auto& f : SPARSE_DELTA_FILES) {
+        if (f.remap_kind == 2) scan(f.fid, f.value_stride, {0});
+        if (f.remap_kind == 3) scan(f.fid, f.value_stride, {POSTCODE_CENTROID_POSTCODE_ID_OFF});
+    }
+    return mask;
+}
+
 static int run(int argc, char* argv[]) {
     if (argc < 5 || std::string(argv[3]) != "-o") {
         std::cerr << "Usage: geocoder-diff <old-dir> <new-dir> -o <patch-file>" << std::endl;
@@ -691,9 +715,15 @@ static int run(int argc, char* argv[]) {
         }
         return {m, false};
     };
+    // A shipped tier is rebuilt from the client's own old file, so both
+    // sides come from the dir itself. The others are only remapped through
+    // and may be borrowed; a newly shipped one is sent whole at the end.
+    const ShippedStringTiers tier_files = shipped_string_tiers(old_dir, new_dir);
+    const uint32_t shipped = tier_files.shipped;
     for (int t = 0; t < 5; t++) {
-        old_tier_maps[t] = try_load_tier(old_dir, STRING_TIER_FILES[t]);
-        new_tier_maps[t] = try_load_tier(new_dir, STRING_TIER_FILES[t]);
+        const bool own = shipped >> t & 1;
+        old_tier_maps[t] = own ? mmap_file(old_dir + "/" + STRING_TIER_FILES[t]) : try_load_tier(old_dir, STRING_TIER_FILES[t]);
+        new_tier_maps[t] = own ? mmap_file(new_dir + "/" + STRING_TIER_FILES[t]) : try_load_tier(new_dir, STRING_TIER_FILES[t]);
         old_tier_bases[t] = static_cast<uint32_t>(old_concat.size());
         new_tier_bases[t] = static_cast<uint32_t>(new_concat.size());
         if (old_tier_maps[t].size > 0)
@@ -735,95 +765,35 @@ static int run(int argc, char* argv[]) {
         append_client_files(patch, client_files);
         std::cerr << "  Client files: " << client_files.size() << std::endl;
     }
+    append_old_file_sizes(patch, old_dir);
 
     // --- Section: Per-file merge sequences (computed in parallel) ---
     // Stored merge sequences for ID remap derivation
 
-    // Per-tier string-level diffs. Each tier is independently sorted
-    // alphabetically, so we diff tier-by-tier. Wire format: one header
-    // marker 0xFFFFFFF6 followed by 5 blocks of {n_added, n_deleted,
-    // added_strings..., deleted_indices...}. The patch tool applies
-    // each block to the matching tier file in cur_dir.
-    //
-    // MUST come before the explicit-remap marker below — the patcher
-    // checks for the tiered marker first; if it sees the explicit
-    // marker first, it consumes that section and exits (never reading
-    // the tiered marker that follows), leaving strings_*.bin unwritten.
+    // The strings section (STRINGS_TIERED_MARKER). Unshipped tiers the dir's
+    // own old files reference send their shift runs; scanning is skipped when
+    // every non-empty tier is shipped (the full variants).
     {
-        uint32_t tiered_marker = STRINGS_TIERED_MARKER;
-        wval(patch, &tiered_marker, 4);
-        for (int t = 0; t < 5; t++) {
-            TierStamp s;
-            s.old_size = static_cast<uint32_t>(old_tier_maps[t].size);
-            s.new_size = static_cast<uint32_t>(new_tier_maps[t].size);
-            s.old_hash = content_hash(old_tier_maps[t].data, old_tier_maps[t].size);
-            s.new_hash = content_hash(new_tier_maps[t].data, new_tier_maps[t].size);
-            wval(patch, &s.old_size, 4); wval(patch, &s.new_size, 4);
-            wval(patch, &s.old_hash, 8); wval(patch, &s.new_hash, 8);
+        std::array<StringTierPools, STRING_TIER_COUNT> tiers;
+        uint32_t tier_ends[STRING_TIER_COUNT];
+        for (int t = 0; t < STRING_TIER_COUNT; t++) {
+            tiers[t] = {old_tier_maps[t].data, old_tier_maps[t].size, new_tier_maps[t].data, new_tier_maps[t].size};
+            tier_ends[t] = old_tier_bases[t + 1];
         }
-        for (int t = 0; t < 5; t++) {
-            std::vector<std::string> old_strs, new_strs;
-            {
-                size_t p = 0;
-                while (p < old_tier_maps[t].size) {
-                    old_strs.push_back(old_tier_maps[t].data + p);
-                    p += strlen(old_tier_maps[t].data + p) + 1;
-                }
-            }
-            {
-                size_t p = 0;
-                while (p < new_tier_maps[t].size) {
-                    new_strs.push_back(new_tier_maps[t].data + p);
-                    p += strlen(new_tier_maps[t].data + p) + 1;
-                }
-            }
-            std::vector<std::string> added_strings;
-            std::vector<uint32_t> deleted_indices;
-            size_t oi = 0, ni = 0;
-            while (oi < old_strs.size() && ni < new_strs.size()) {
-                int c = old_strs[oi].compare(new_strs[ni]);
-                if (c == 0) { oi++; ni++; }
-                else if (c < 0) { deleted_indices.push_back(oi); oi++; }
-                else { added_strings.push_back(new_strs[ni]); ni++; }
-            }
-            while (oi < old_strs.size()) { deleted_indices.push_back(oi); oi++; }
-            while (ni < new_strs.size()) { added_strings.push_back(new_strs[ni]); ni++; }
-            uint32_t n_added = added_strings.size(), n_deleted = deleted_indices.size();
-            wval(patch, &n_added, 4); wval(patch, &n_deleted, 4);
-            for (auto& s : added_strings) { patch.insert(patch.end(), s.begin(), s.end()); patch.push_back('\0'); }
-            for (auto idx : deleted_indices) wval(patch, &idx, 4);
-            std::cerr << "  " << STRING_TIER_FILES[t] << ": +" << n_added << " -" << n_deleted << " strings" << std::endl;
+        const uint32_t referenced =
+            unshipped_string_tiers(tiers, shipped) == 0 ? 0 : referenced_string_tiers_of(old_dir, tier_ends);
+        const StringsSectionStats stats = append_strings_section(patch, tiers, shipped, referenced, str_remap);
+        for (int t = 0; t < STRING_TIER_COUNT; t++) {
+            if (stats.sent >> t & 1)
+                std::cerr << "  " << STRING_TIER_FILES[t] << ": " << stats.n_runs[t] << " shift runs ("
+                          << stats.runs_bytes[t] << " bytes, not shipped)" << std::endl;
+            else if (shipped >> t & 1)
+                std::cerr << "  " << STRING_TIER_FILES[t] << ": +" << stats.n_added[t] << " -" << stats.n_deleted[t]
+                          << " strings" << std::endl;
         }
-    }
-
-    // Explicit-remap section follows the tiered diff. Same-tier remaps
-    // (where old and new offsets are in the matching tier file) are
-    // derived by the patcher walking each tier's old/new pool side by
-    // side. CROSS-TIER moves — a string that lived in addr in the
-    // previous build and now lives in street — aren't visible to the
-    // per-tier walk, so they have to be transmitted explicitly here.
-    // Without this, records pointing at the moved string keep their old
-    // (now stale) global offset after patch (verified: 566 oceania
-    // addr_points, ~thousands of street_ways across regions when a
-    // numeric/short string flips tier between consecutive builds).
-    {
-        auto tier_of = [](uint32_t global, const std::array<uint32_t, 6>& bases) -> int {
-            for (int t = 0; t < 5; t++) if (global >= bases[t] && global < bases[t + 1]) return t;
-            return -1;
-        };
-        std::vector<std::pair<uint32_t, uint32_t>> cross_tier;
-        cross_tier.reserve(str_remap.size() / 8);
-        for (const auto& [og, ng] : str_remap) {
-            int ot = tier_of(og, old_tier_bases);
-            int nt = tier_of(ng, new_tier_bases);
-            if (ot != nt) cross_tier.push_back({og, ng});
-        }
-        std::sort(cross_tier.begin(), cross_tier.end());
-        uint32_t marker = STRINGS_CROSS_TIER_REMAP_MARKER;
-        uint32_t count = static_cast<uint32_t>(cross_tier.size());
-        wval(patch, &marker, 4); wval(patch, &count, 4);
-        for (auto& [og, ng] : cross_tier) { wval(patch, &og, 4); wval(patch, &ng, 4); }
-        std::cerr << "  String remap: " << count << " cross-tier explicit entries" << std::endl;
+        std::cerr << "  String remap: shipped tiers 0x" << std::hex << shipped << ", newly shipped 0x"
+                  << tier_files.newly_shipped << ", referenced 0x" << referenced << std::dec << ", "
+                  << stats.n_pairs << " cross-tier pairs" << std::endl;
     }
 
     // Build merge sequences for all data files in parallel (4 groups)
@@ -2242,6 +2212,9 @@ static int run(int argc, char* argv[]) {
     if (res_addr_v.stride != 1) {
         emit_raw(PatchFileId::ADDR_VERTICES, "addr_vertices.bin");
     }
+    // A string tier the old dir lacks has no old file to rebuild from.
+    for (int t = 0; t < STRING_TIER_COUNT; t++)
+        if (tier_files.newly_shipped >> t & 1) emit_raw(string_tier_file_id(t), STRING_TIER_FILES[t]);
 
     // Now safe to free str_remap — all consumers (sparse_delta above)
     // have finished using it.

@@ -3,6 +3,7 @@
 // Used by geocoder-canonicalize, geocoder-diff, and geocoder-patch.
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
@@ -59,13 +60,16 @@ inline void unmap_file(MappedFileRW& f) {
 }
 
 // Detect stride from file size (avoids loading entire file)
-inline size_t detect_stride_from_file(const std::string& path, std::initializer_list<size_t> candidates) {
+inline size_t detect_stride_from_file(const std::string& path, const size_t* candidates, size_t n) {
     struct stat st;
-    if (stat(path.c_str(), &st) != 0) return *candidates.begin();
+    if (stat(path.c_str(), &st) != 0) return candidates[0];
     size_t sz = st.st_size;
-    for (size_t s : candidates)
-        if (sz % s == 0 && sz / s > 0) return s;
-    return *candidates.begin();
+    for (size_t i = 0; i < n; i++)
+        if (sz % candidates[i] == 0 && sz / candidates[i] > 0) return candidates[i];
+    return candidates[0];
+}
+inline size_t detect_stride_from_file(const std::string& path, std::initializer_list<size_t> candidates) {
+    return detect_stride_from_file(path, candidates.begin(), candidates.size());
 }
 
 // --- Binary record structs (must match types.h and server) ---
@@ -214,12 +218,15 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // files verbatim, and records the string tiers it was diffed against; the
 // patcher reproduces exactly that file set. v5 carries offset fixups as runs
 // of one shift (OffsetFixups). v6 corrects street / addr / interp lists per
-// cell (GEO_ENTRY_DELTA_MARKER) and drops cell flags. Version-gated so older
-// appliers reject the whole patch upfront ("Bad version").
-static constexpr uint32_t GCPATCH_VERSION = 6;
-// v5 patches carry geo corrections as full lists, which a v6 patcher no
-// longer reads.
-static constexpr uint32_t GCPATCH_MIN_READ_VERSION = 6;
+// cell (GEO_ENTRY_DELTA_MARKER) and drops cell flags. v7 patches every
+// variant dir from its own files: string tiers the dir doesn't ship travel as
+// shift runs instead of string diffs (see STRINGS_TIERED_MARKER).
+// Version-gated so older appliers reject the whole patch upfront ("Bad
+// version").
+static constexpr uint32_t GCPATCH_VERSION = 7;
+// A v6 patch needs the string tiers of ../full, which a v7 patcher no longer
+// reads.
+static constexpr uint32_t GCPATCH_MIN_READ_VERSION = 7;
 
 enum class PatchFileId : uint32_t {
     STRINGS = 0,
@@ -330,6 +337,29 @@ static constexpr SparseDeltaFile SPARSE_DELTA_FILES[] = {
 };
 static constexpr size_t POSTCODE_CENTROID_POSTCODE_ID_OFF = 8;
 
+// The record files with string fields (string_field_offsets), each with the
+// file its stride is detected from and the candidate strides, the way the
+// diff detects them for the sections it writes. Postal polygons are admin
+// polygons of admin_level 11, at the admin stride.
+struct StringRecordFile {
+    PatchFileId fid, stride_from;
+    size_t strides[4];
+    size_t n_strides;
+};
+static constexpr StringRecordFile STRING_RECORD_FILES[] = {
+    {PatchFileId::ADDR_POINTS, PatchFileId::ADDR_POINTS, {28, 20, 16}, 3},
+    {PatchFileId::STREET_WAYS, PatchFileId::STREET_WAYS, {12, 9}, 2},
+    {PatchFileId::INTERP_WAYS, PatchFileId::INTERP_WAYS, {24, 20, 18}, 3},
+    {PatchFileId::ADMIN_POLYGONS, PatchFileId::ADMIN_POLYGONS, {24, 20, 19}, 3},
+    {PatchFileId::POSTAL_POLYGONS, PatchFileId::ADMIN_POLYGONS, {24, 20, 19}, 3},
+    {PatchFileId::POI_RECORDS, PatchFileId::POI_RECORDS, {36, 32, 28, 24}, 4},
+    {PatchFileId::PLACE_NODES, PatchFileId::PLACE_NODES, {20, 16}, 2},
+};
+
+inline size_t detect_record_stride(const std::string& dir, const StringRecordFile& f) {
+    return detect_stride_from_file(dir + "/" + patch_file_names[(uint32_t)f.stride_from], f.strides, f.n_strides);
+}
+
 // Offset fixup section marker: 0xFFFFFFFD
 // Format: uint32_t marker, uint32_t file_id, uint32_t stride,
 //         uint32_t count, [(uint32_t record_index, uint32_t new_offset_value)] * count
@@ -392,19 +422,29 @@ static constexpr uint32_t CELL_FLAGS_MARKER = 0xFFFFFFF9;
 //   for each: file_id(4), n_pairs(4), [(old_id:u32, new_id:u32)] × n_pairs
 static constexpr uint32_t SECONDARY_REMAP_MARKER = 0xFFFFFFF6;
 
-// String-section markers, read by geocoder-patch during the Phase-2 string
-// rebuild. These intentionally share their
-// raw values with markers above (e.g. STRINGS_TIERED_MARKER reuses 0xFFFFFFF6,
-// the SECONDARY_REMAP_MARKER value) because they are disambiguated by read
-// position, not by value — the string markers are consumed before the main
-// section loop where SECONDARY_REMAP_MARKER appears.
-//
-//   STRINGS_TIERED_MARKER  — tiered per-tier strings diff (5 blocks of
-//                            {n_added, n_deleted, added..., deleted_idx...}).
-//                            Emitted by geocoder-diff as `tiered_marker`.
-//   STRINGS_CROSS_TIER_REMAP_MARKER — explicit cross-tier (old_off,new_off)
-//                            string remap pairs. Emitted by geocoder-diff.
+// The strings section, read by position right after the old file sizes
+// (UNSECTIONED_OLD_FILES). Its marker shares 0xFFFFFFF6 with
+// SECONDARY_REMAP_MARKER: position, not value, tells them apart.
+//   marker STRINGS_TIERED_MARKER,
+//   5 × {old_size u32, new_size u32}: every tier of the build, so global
+//     offsets (tier t at the sum of the sizes before it) need no tier file,
+//   shipped u32: bit t = the dir ships tier t and rebuilds it from its own
+//     old file (a tier the old dir lacked is unshipped here and its client
+//     file comes whole in a per-file section),
+//   sent u32: bit t = runs follow for tier t, which the dir doesn't ship but
+//     its own old files reference,
+//   per tier t in order:
+//     shipped: old_hash u64, new_hash u64, n_added u32, n_deleted u32,
+//              added strings (NUL-terminated), deleted string indices (u32);
+//              the patcher rebuilds the tier and derives its shift runs by
+//              walking old and new (StringRemap::add_tier),
+//     sent: n_runs u32, runs_size u32, the tier's shift runs
+//           (encode_string_tier_runs),
+//   n_pairs u32, (old u32, new u32) × n_pairs: strings that changed tier
+//     (sorted by old), for every old tier the dir ships or references.
+// A tier neither shipped nor referenced sends nothing: no lookup lands in it.
 static constexpr uint32_t STRINGS_TIERED_MARKER = 0xFFFFFFF6;
+// v6 sent the cross-tier pairs behind this marker; the value stays reserved.
 static constexpr uint32_t STRINGS_CROSS_TIER_REMAP_MARKER = 0xFFFFFFFE;
 
 // 64-bit content hash, 8 bytes per step. Not cryptographic: it proves a file
@@ -423,16 +463,6 @@ inline uint64_t content_hash(const char* data, size_t n) {
     h = (h ^ tail) * 0xC4CEB9FE1A85EC53ull;
     return h ^ (h >> 29);
 }
-
-// The old and new string tier the diff worked from, one per tier, right after
-// STRINGS_TIERED_MARKER: 5 × {old_size u32, new_size u32, old_hash u64,
-// new_hash u64}. The patcher refuses old tiers (often found through ../full)
-// that differ from what the diff saw and checks every tier it rebuilds, so a
-// stale or already-patched sibling fails loudly instead of skewing offsets.
-struct TierStamp {
-    uint32_t old_size = 0, new_size = 0;
-    uint64_t old_hash = 0, new_hash = 0;
-};
 
 // Sparse position-keyed delta. Stride sentinel that signals the section
 // payload is a list of (position, value) pairs for the positions where
@@ -503,8 +533,8 @@ static constexpr uint32_t POI_PARENT_REMAP_MARKER = 0xFFFFFFF3;
 //   marker(4), n(4), n × {name_len(u16), name, size(u64), inline(u8), [bytes]}
 // sorted by name. Non-.bin files (strings_layout.json, poi_meta.json) are
 // inline; the patcher writes them verbatim and every listed file must exist at
-// its listed size after the apply. Files it builds that are not listed (string
-// tiers the variant only uses for remapping) stay in its scratch dir.
+// its listed size after the apply. Files it builds that are not listed (sections
+// for files the variant lacks) stay in its scratch dir.
 static constexpr uint32_t CLIENT_FILES_MARKER = 0xFFFFFFF2;
 static constexpr size_t MAX_INLINE_CLIENT_FILE_BYTES = 1 << 20;
 
@@ -568,6 +598,51 @@ inline std::vector<ClientFile> parse_client_files(const char* data, size_t size,
         take(f.bytes.data(), f.size);
     }
     return files;
+}
+
+// --- Old sizes of the files no section names (v7) ---
+// Every section names the size of the old file it replays. The patcher also
+// reads old files no section names: the cell indexes of the entry pipeline
+// and the entries file beside a cell list delta. Right after the client
+// files, the diff records their sizes in the old dir (0 when absent):
+//   n(4), n × {file_id(4), old_size(8)}
+// and the patcher checks them before it reads anything else.
+static constexpr PatchFileId UNSECTIONED_OLD_FILES[] = {
+    PatchFileId::GEO_CELLS, PatchFileId::STREET_ENTRIES, PatchFileId::ADDR_ENTRIES, PatchFileId::INTERP_ENTRIES,
+    PatchFileId::ADMIN_CELLS, PatchFileId::ADMIN_ENTRIES, PatchFileId::POI_CELLS, PatchFileId::POI_ENTRIES,
+    PatchFileId::PLACE_CELLS, PatchFileId::PLACE_ENTRIES, PatchFileId::POSTCODE_CENTROID_ENTRIES,
+};
+
+inline void append_old_file_sizes(std::vector<char>& out, const std::string& old_dir) {
+    auto put = [&](const void* p, size_t n) { out.insert(out.end(), (const char*)p, (const char*)p + n); };
+    uint32_t n = static_cast<uint32_t>(std::size(UNSECTIONED_OLD_FILES));
+    put(&n, 4);
+    for (PatchFileId fid : UNSECTIONED_OLD_FILES) {
+        struct stat st;
+        uint32_t id = static_cast<uint32_t>(fid);
+        uint64_t size = stat((old_dir + "/" + patch_file_names[id]).c_str(), &st) == 0 ? static_cast<uint64_t>(st.st_size) : 0;
+        put(&id, 4); put(&size, 8);
+    }
+}
+
+// Reads the sizes at data[pos, size), advances pos past them and checks each
+// against cur_dir (require_old_file_size).
+inline void check_old_file_sizes(const char* data, size_t size, size_t& pos, const std::string& cur_dir) {
+    auto take = [&](void* dst, size_t n) {
+        if (pos > size || n > size - pos) throw std::runtime_error("Truncated old file sizes");
+        memcpy(dst, data + pos, n);
+        pos += n;
+    };
+    uint32_t n = 0;
+    take(&n, 4);
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t id = 0;
+        uint64_t old_size = 0;
+        take(&id, 4);
+        take(&old_size, 8);
+        if (id >= static_cast<uint32_t>(PatchFileId::COUNT)) throw std::runtime_error("Malformed old file sizes");
+        require_old_file_size(cur_dir, patch_file_names[id], old_size);
+    }
 }
 
 // --- Shared entry rebuild logic ---
@@ -1285,13 +1360,46 @@ void for_each_string_tier_run(const char* old_pool, size_t old_size, uint32_t ol
     close();
 }
 
+// A tier's shift runs as the diff sends them for a tier the client doesn't
+// hold: per run, varints of (start - previous end, end - start,
+// zigzag(shift - previous shift)), starting from the tier's old base and
+// shift 0.
+struct StringTierRuns {
+    uint32_t n_runs = 0;
+    std::vector<char> bytes;
+};
+
+inline StringTierRuns encode_string_tier_runs(const char* old_pool, size_t old_size, uint32_t old_base,
+                                              const char* new_pool, size_t new_size, uint32_t new_base) {
+    StringTierRuns out;
+    uint32_t prev_end = old_base, prev_shift = 0;
+    for_each_string_tier_run(old_pool, old_size, old_base, new_pool, new_size, new_base,
+                             [&](uint32_t start, uint32_t end, uint32_t shift) {
+                                 write_varint(out.bytes, start - prev_end);
+                                 write_varint(out.bytes, end - start);
+                                 write_varint(out.bytes, zigzag32(shift - prev_shift));
+                                 out.n_runs++;
+                                 prev_end = end;
+                                 prev_shift = shift;
+                             });
+    return out;
+}
+
 // The patcher's old → new string offset map. Between two edits every
 // surviving string of a tier moves by one amount, so the map is held as runs
 // over old offsets: a few thousand on a planet day instead of one pair per
 // moved string (20.6M pairs, 157 MiB on every client). Like the diff's
-// per-string pairs, only a string's start moves; the run checks that against
-// the old pool, where the byte before a string start is its predecessor's NUL.
-// Strings that changed tier stay explicit pairs.
+// per-string pairs, only a string's start moves. A run derived from a tier
+// the client holds checks that against the old pool, where the byte before a
+// string start is its predecessor's NUL. A run sent for a tier the client
+// doesn't hold can't: it trusts that every stored reference is a string start
+// or NO_DATA, which partition_strings_into_tiers guarantees and CI's byte
+// identity check proves daily. Strings that changed tier are explicit pairs.
+//
+// Pairs are looked up first, but the order doesn't matter: a pair's old
+// offset starts a string that isn't in its old tier's new pool, the walk
+// ends a run at every such string, and a tier's runs lie inside its own old
+// range, so no run covers a pair's offset.
 class StringRemap {
 public:
     // Merge-walks one tier's old and new pools (both sorted) and records the
@@ -1302,6 +1410,26 @@ public:
                                  [&](uint32_t start, uint32_t end, uint32_t shift) {
                                      runs_.push_back({start, end, shift, old_pool + (start - old_base)});
                                  });
+    }
+    // Decodes the runs encode_string_tier_runs wrote for the tier at old
+    // offsets [tier_start, tier_end). Tiers are added in offset order, so the
+    // runs stay sorted.
+    void add_sent_tier(const char* data, size_t size, uint32_t n_runs, uint32_t tier_start, uint32_t tier_end) {
+        auto malformed = [] { throw std::runtime_error("Malformed string runs"); };
+        if (!runs_.empty() && runs_.back().end > tier_start) malformed();
+        if (n_runs > size / 3) malformed();  // a run is at least 3 bytes
+        size_t pos = 0;
+        uint64_t prev_end = tier_start;
+        uint32_t shift = 0;
+        for (uint32_t i = 0; i < n_runs; i++) {
+            uint64_t start = prev_end + read_varint_bounded(data, pos, size, "string runs");
+            uint64_t end = start + read_varint_bounded(data, pos, size, "string runs");
+            shift += unzigzag32(read_varint_bounded(data, pos, size, "string runs"));
+            if (end == start || end > tier_end) malformed();
+            runs_.push_back({static_cast<uint32_t>(start), static_cast<uint32_t>(end), shift, nullptr});
+            prev_end = end;
+        }
+        if (pos != size) malformed();
     }
     void add_pair(uint32_t old_off, uint32_t new_off) { pairs_.push_back({old_off, new_off}); }
     void finish() { std::sort(pairs_.begin(), pairs_.end()); }
@@ -1319,15 +1447,308 @@ public:
         if (it == runs_.begin()) return off;
         --it;
         if (off >= it->end) return off;
-        if (off != it->start && it->old_bytes[off - it->start - 1] != '\0') return off;
+        if (it->old_bytes && off != it->start && it->old_bytes[off - it->start - 1] != '\0') return off;
         return off + it->shift;
     }
 
 private:
+    // old_bytes: the run's bytes in the old pool, or nullptr for a sent run.
     struct Run { uint32_t start, end, shift; const char* old_bytes; };
     std::vector<Run> runs_;
     std::vector<std::pair<uint32_t, uint32_t>> pairs_;
 };
+
+// The string tiers that the given fields of a record file reference, as a
+// bit per tier. tier_ends holds each tier's end offset (the cumulative
+// sizes); NO_DATA references nothing, and any other value past the last tier
+// can't be a string start, so it throws.
+inline uint32_t referenced_string_tiers(const char* data, size_t size, size_t stride,
+                                        const std::vector<size_t>& fields,
+                                        const uint32_t (&tier_ends)[STRING_TIER_COUNT], const std::string& name) {
+    uint32_t mask = 0;
+    for (size_t at = 0; at + stride <= size; at += stride) {
+        for (size_t off : fields) {
+            uint32_t v;
+            memcpy(&v, data + at + off, 4);
+            if (v == 0xFFFFFFFFu) continue;
+            int t = static_cast<int>(std::upper_bound(tier_ends, tier_ends + STRING_TIER_COUNT, v) - tier_ends);
+            if (t == STRING_TIER_COUNT)
+                throw std::runtime_error(name + " references string offset " + std::to_string(v) +
+                                         " past the old pool (" + std::to_string(tier_ends[STRING_TIER_COUNT - 1]) + " bytes)");
+            mask |= 1u << t;
+        }
+    }
+    return mask;
+}
+
+// --- The strings section (STRINGS_TIERED_MARKER) ---
+
+// The tiers a variant dir ships: a tier file the new dir holds (even empty)
+// is shipped when the old dir holds it too, and the patcher rebuilds it from
+// the client's own old file. A tier only the new dir holds is newly shipped:
+// the patch carries its file whole in a section of its own, and the strings
+// section treats it as unshipped (its runs are sent if the dir references it).
+struct ShippedStringTiers { uint32_t shipped = 0, newly_shipped = 0; };
+
+inline ShippedStringTiers shipped_string_tiers(const std::string& old_dir, const std::string& new_dir) {
+    ShippedStringTiers out;
+    for (int t = 0; t < STRING_TIER_COUNT; t++) {
+        struct stat st;
+        if (stat((new_dir + "/" + STRING_TIER_FILES[t]).c_str(), &st) != 0) continue;
+        if (stat((old_dir + "/" + STRING_TIER_FILES[t]).c_str(), &st) == 0) out.shipped |= 1u << t;
+        else out.newly_shipped |= 1u << t;
+    }
+    return out;
+}
+
+// The section id of a string tier file.
+inline PatchFileId string_tier_file_id(int t) {
+    return static_cast<PatchFileId>(static_cast<uint32_t>(PatchFileId::STRINGS_CORE) + t);
+}
+
+// One tier's old and new pool as the diff loaded them (the dir's own, or
+// borrowed from ../full); null and 0 for a tier found nowhere.
+struct StringTierPools {
+    const char* old_data = nullptr;
+    size_t old_size = 0;
+    const char* new_data = nullptr;
+    size_t new_size = 0;
+};
+
+// What append_strings_section wrote, for the diff's log.
+struct StringsSectionStats {
+    uint32_t sent = 0, n_pairs = 0;
+    std::array<uint32_t, STRING_TIER_COUNT> n_added{}, n_deleted{}, n_runs{}, runs_bytes{};
+};
+
+// The tiers that hold strings but aren't shipped: the only ones whose runs
+// can be sent, so the diff scans the old files only when this isn't 0.
+inline uint32_t unshipped_string_tiers(const std::array<StringTierPools, STRING_TIER_COUNT>& tiers, uint32_t shipped) {
+    uint32_t mask = 0;
+    for (int t = 0; t < STRING_TIER_COUNT; t++)
+        if (!(shipped >> t & 1) && tiers[t].old_size > 0) mask |= 1u << t;
+    return mask;
+}
+
+// Appends the strings section of a dir that ships the tiers in `shipped` and
+// whose own old files reference the tiers in `referenced`. moved holds the
+// (old, new) global start of every surviving string (any iterable of pairs,
+// such as the diff's per-string remap); of those that changed tier, only the
+// ones out of a tier the dir looks up are sent.
+template <typename Moved>
+StringsSectionStats append_strings_section(std::vector<char>& out,
+                                           const std::array<StringTierPools, STRING_TIER_COUNT>& tiers,
+                                           uint32_t shipped, uint32_t referenced, const Moved& moved) {
+    auto put = [&](const void* p, size_t n) { out.insert(out.end(), (const char*)p, (const char*)p + n); };
+    std::array<uint32_t, STRING_TIER_COUNT + 1> old_base{}, new_base{};
+    for (int t = 0; t < STRING_TIER_COUNT; t++) {
+        old_base[t + 1] = old_base[t] + static_cast<uint32_t>(tiers[t].old_size);
+        new_base[t + 1] = new_base[t] + static_cast<uint32_t>(tiers[t].new_size);
+    }
+    StringsSectionStats stats;
+    stats.sent = referenced & unshipped_string_tiers(tiers, shipped);
+
+    uint32_t marker = STRINGS_TIERED_MARKER;
+    put(&marker, 4);
+    for (int t = 0; t < STRING_TIER_COUNT; t++) {
+        uint32_t old_size = static_cast<uint32_t>(tiers[t].old_size);
+        uint32_t new_size = static_cast<uint32_t>(tiers[t].new_size);
+        put(&old_size, 4); put(&new_size, 4);
+    }
+    put(&shipped, 4); put(&stats.sent, 4);
+    for (int t = 0; t < STRING_TIER_COUNT; t++) {
+        const StringTierPools& p = tiers[t];
+        if (stats.sent >> t & 1) {
+            auto runs = encode_string_tier_runs(p.old_data, p.old_size, old_base[t], p.new_data, p.new_size, new_base[t]);
+            uint32_t runs_size = static_cast<uint32_t>(runs.bytes.size());
+            put(&runs.n_runs, 4); put(&runs_size, 4);
+            out.insert(out.end(), runs.bytes.begin(), runs.bytes.end());
+            stats.n_runs[t] = runs.n_runs;
+            stats.runs_bytes[t] = runs_size;
+            continue;
+        }
+        if (!(shipped >> t & 1)) continue;
+        uint64_t old_hash = content_hash(p.old_data, p.old_size), new_hash = content_hash(p.new_data, p.new_size);
+        put(&old_hash, 8); put(&new_hash, 8);
+        std::vector<const char*> added;
+        std::vector<uint32_t> deleted;
+        size_t o = 0, n = 0;
+        uint32_t oi = 0;
+        while (o < p.old_size && n < p.new_size) {
+            int c = strcmp(p.old_data + o, p.new_data + n);
+            if (c == 0) { o += strlen(p.old_data + o) + 1; n += strlen(p.new_data + n) + 1; oi++; }
+            else if (c < 0) { deleted.push_back(oi++); o += strlen(p.old_data + o) + 1; }
+            else { added.push_back(p.new_data + n); n += strlen(p.new_data + n) + 1; }
+        }
+        for (; o < p.old_size; o += strlen(p.old_data + o) + 1) deleted.push_back(oi++);
+        for (; n < p.new_size; n += strlen(p.new_data + n) + 1) added.push_back(p.new_data + n);
+        uint32_t n_added = static_cast<uint32_t>(added.size()), n_deleted = static_cast<uint32_t>(deleted.size());
+        put(&n_added, 4); put(&n_deleted, 4);
+        for (const char* s : added) put(s, strlen(s) + 1);
+        for (uint32_t idx : deleted) put(&idx, 4);
+        stats.n_added[t] = n_added;
+        stats.n_deleted[t] = n_deleted;
+    }
+
+    // A string that moved tier is deleted in its old tier's walk, so its move
+    // travels as a pair, for every old tier a lookup can land in.
+    auto tier_of = [](uint32_t global, const std::array<uint32_t, STRING_TIER_COUNT + 1>& base) {
+        for (int t = 0; t < STRING_TIER_COUNT; t++)
+            if (global >= base[t] && global < base[t + 1]) return t;
+        return -1;
+    };
+    const uint32_t looked_up = shipped | referenced;
+    std::vector<std::pair<uint32_t, uint32_t>> pairs;
+    for (const auto& [og, ng] : moved) {
+        int ot = tier_of(og, old_base);
+        if (ot >= 0 && ot != tier_of(ng, new_base) && (looked_up >> ot & 1)) pairs.push_back({og, ng});
+    }
+    std::sort(pairs.begin(), pairs.end());
+    stats.n_pairs = static_cast<uint32_t>(pairs.size());
+    put(&stats.n_pairs, 4);
+    for (const auto& [og, ng] : pairs) { put(&og, 4); put(&ng, 4); }
+    return stats;
+}
+
+// A shipped tier's string diff: the new pool is the old one without the
+// strings at `deleted` (indices in old order), merged with `added` (pointing
+// into the patch, NUL-terminated).
+struct StringTierDiff {
+    uint64_t old_hash = 0, new_hash = 0;
+    std::vector<const char*> added;
+    std::vector<uint32_t> deleted;
+};
+
+// A sent tier's runs (encode_string_tier_runs), pointing into the patch.
+struct SentStringRuns {
+    const char* data = nullptr;
+    uint32_t size = 0, n_runs = 0;
+};
+
+struct StringsSection {
+    // Tier t sits at old offsets [old_base[t], old_base[t + 1]); new likewise.
+    std::array<uint32_t, STRING_TIER_COUNT + 1> old_base{}, new_base{};
+    uint32_t shipped = 0, sent = 0;
+    std::array<StringTierDiff, STRING_TIER_COUNT> diffs;  // shipped tiers
+    std::array<SentStringRuns, STRING_TIER_COUNT> runs;   // sent tiers
+    std::vector<std::pair<uint32_t, uint32_t>> pairs;
+    uint32_t old_size(int t) const { return old_base[t + 1] - old_base[t]; }
+    uint32_t new_size(int t) const { return new_base[t + 1] - new_base[t]; }
+};
+
+// Parses the section at data[pos, size) and advances pos past it.
+inline StringsSection parse_strings_section(const char* data, size_t size, size_t& pos) {
+    auto malformed = [] { throw std::runtime_error("Malformed strings section"); };
+    auto take = [&](size_t n) {
+        if (pos > size || n > size - pos) throw std::runtime_error("Truncated strings section");
+        const char* p = data + pos;
+        pos += n;
+        return p;
+    };
+    auto u32 = [&] { uint32_t v; memcpy(&v, take(4), 4); return v; };
+    auto u64 = [&] { uint64_t v; memcpy(&v, take(8), 8); return v; };
+    if (u32() != STRINGS_TIERED_MARKER) throw std::runtime_error("Patch has no strings section");
+    StringsSection s;
+    for (int t = 0; t < STRING_TIER_COUNT; t++) {
+        uint32_t old_size = u32(), new_size = u32();
+        if ((uint64_t)s.old_base[t] + old_size > UINT32_MAX || (uint64_t)s.new_base[t] + new_size > UINT32_MAX)
+            malformed();
+        s.old_base[t + 1] = s.old_base[t] + old_size;
+        s.new_base[t + 1] = s.new_base[t] + new_size;
+    }
+    s.shipped = u32();
+    s.sent = u32();
+    if ((s.shipped | s.sent) >> STRING_TIER_COUNT || (s.shipped & s.sent)) malformed();
+    for (int t = 0; t < STRING_TIER_COUNT; t++) {
+        if (s.sent >> t & 1) {
+            SentStringRuns& r = s.runs[t];
+            r.n_runs = u32();
+            r.size = u32();
+            r.data = take(r.size);
+            continue;
+        }
+        if (!(s.shipped >> t & 1)) continue;
+        StringTierDiff& d = s.diffs[t];
+        d.old_hash = u64();
+        d.new_hash = u64();
+        uint32_t n_added = u32(), n_deleted = u32();
+        if (n_added > size - pos) throw std::runtime_error("Truncated strings section");  // a string is at least its NUL
+        d.added.reserve(n_added);
+        for (uint32_t i = 0; i < n_added; i++) {
+            const void* end = memchr(data + pos, '\0', size - pos);
+            if (!end) throw std::runtime_error("Truncated strings section");
+            d.added.push_back(data + pos);
+            pos = static_cast<size_t>(static_cast<const char*>(end) - data) + 1;
+        }
+        const char* del = take((size_t)n_deleted * 4);
+        d.deleted.resize(n_deleted);
+        if (n_deleted) memcpy(d.deleted.data(), del, (size_t)n_deleted * 4);
+    }
+    uint32_t n_pairs = u32();
+    const char* pairs = take((size_t)n_pairs * 8);
+    s.pairs.resize(n_pairs);
+    for (uint32_t i = 0; i < n_pairs; i++) {
+        memcpy(&s.pairs[i].first, pairs + (size_t)i * 8, 4);
+        memcpy(&s.pairs[i].second, pairs + (size_t)i * 8 + 4, 4);
+    }
+    return s;
+}
+
+// A shipped tier is a client file the dir rebuilds from its own old one, so
+// it must be listed. A listed tier without the bit is one the old dir lacked:
+// its file arrives whole through its own section.
+inline void require_shipped_tiers_listed(uint32_t shipped, const std::unordered_set<std::string>& listed) {
+    for (int t = 0; t < STRING_TIER_COUNT; t++)
+        if ((shipped >> t & 1) && !listed.count(STRING_TIER_FILES[t]))
+            throw std::runtime_error(std::string("Strings section ships ") + STRING_TIER_FILES[t] +
+                                     ", which the client files don't list");
+}
+
+// Writes a shipped tier's new pool through write(bytes, n): the old pool's
+// surviving strings and the added ones, merged in sorted order.
+template <typename Write>
+void rebuild_string_tier(const char* old_pool, size_t old_size, const StringTierDiff& diff, Write write) {
+    std::vector<const char*> added = diff.added;
+    std::sort(added.begin(), added.end(), [](const char* a, const char* b) { return strcmp(a, b) < 0; });
+    std::unordered_set<uint32_t> deleted(diff.deleted.begin(), diff.deleted.end());
+    size_t sp = 0, ai = 0;
+    uint32_t idx = 0;
+    while (sp < old_size || ai < added.size()) {
+        const char* old_s = nullptr;
+        while (sp < old_size) {
+            if (!deleted.count(idx)) { old_s = old_pool + sp; break; }
+            sp += strnlen(old_pool + sp, old_size - sp) + 1; idx++;
+        }
+        const char* add_s = ai < added.size() ? added[ai] : nullptr;
+        int c = old_s && add_s ? strcmp(old_s, add_s) : 0;
+        if (old_s && (!add_s || c <= 0)) {
+            size_t l = strnlen(old_s, old_size - sp) + 1;
+            write(old_s, l);
+            sp += l; idx++;
+            if (add_s && c == 0) ai++;
+        } else if (add_s) {
+            write(add_s, strlen(add_s) + 1);
+            ai++;
+        }
+    }
+}
+
+// Fills remap from the section, tier by tier in offset order: a sent tier
+// from its runs, a shipped tier through on_shipped(t), which rebuilds it and
+// calls remap.add_tier with its old and new pool. Then the tier moves.
+template <typename OnShipped>
+void load_string_remap(const StringsSection& s, StringRemap& remap, OnShipped on_shipped) {
+    for (int t = 0; t < STRING_TIER_COUNT; t++) {
+        if (s.sent >> t & 1) {
+            const SentStringRuns& r = s.runs[t];
+            remap.add_sent_tier(r.data, r.size, r.n_runs, s.old_base[t], s.old_base[t + 1]);
+        } else if (s.shipped >> t & 1) {
+            on_shipped(t);
+        }
+    }
+    for (const auto& [a, b] : s.pairs) remap.add_pair(a, b);
+    remap.finish();
+}
 
 // --- Offset fixups ---
 //
