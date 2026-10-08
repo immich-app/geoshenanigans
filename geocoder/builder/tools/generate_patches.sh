@@ -21,6 +21,12 @@
 # Env: GEOCODER_DIFF, GEOCODER_PATCH (default: on PATH).
 set -uo pipefail
 
+# The memory-aware scheduler needs `wait -n -p` (bash 5.1).
+if (( BASH_VERSINFO[0] < 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] < 1) )); then
+  echo "generate_patches.sh: bash >= 5.1 required (wait -n -p), have $BASH_VERSION" >&2
+  exit 1
+fi
+
 old_root=$1
 new_root=$2
 results_dir=$3
@@ -138,7 +144,14 @@ for variant in $(for v in "${!weight[@]}"; do echo "${weight[$v]} $v"; done | so
     # Only tracked jobs: bash 5.3's bare wait -n also returns process substitutions.
     finished=""
     wait -n -p finished "${!running[@]}" || true
-    if [ -z "${finished:-}" ] || [ -z "${running[$finished]+x}" ]; then break; fi
+    if [ -z "${finished:-}" ] || [ -z "${running[$finished]+x}" ]; then
+      # Cannot tell which job ended: drain them all rather than launch
+      # past the memory budget.
+      wait "${!running[@]}"
+      running=()
+      running_kib=0
+      break
+    fi
     running_kib=$((running_kib - running[$finished]))
     unset "running[$finished]"
   done
