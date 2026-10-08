@@ -6,11 +6,13 @@ concurrency:
 
 on:
   schedule:
-    # Daily at 06:00 UTC. OSM publishes its daily replication diff
-    # shortly after 00:00 UTC; 06:00 leaves headroom if their pipeline
-    # slips. Adjusts behaviour purely via the cron — manual dispatch
-    # below still works for ad-hoc runs.
-    - cron: '0 6 * * *'
+    # Daily at 06:17 UTC. OSM publishes its daily replication diff
+    # shortly after 00:00 UTC; 06:17 leaves headroom if their pipeline
+    # slips. Off the hour because GitHub delays or drops top-of-hour
+    # schedule events under load, and the watchdog never starts a
+    # day's first attempt. Manual dispatch below still works for
+    # ad-hoc runs.
+    - cron: '17 6 * * *'
   workflow_dispatch:
     inputs:
       build_date:
@@ -38,6 +40,8 @@ env:
   # oldest_indexes / oldest_patches in latest.json; cleanup enforces them.
   KEEP_FULL_DAYS: 3
   KEEP_PATCH_DAYS: 14
+  # memwatch/<run id>.log, the build's memory samples (debugging only).
+  KEEP_MEMWATCH_DAYS: 14
 
 permissions:
   contents: read
@@ -1051,6 +1055,17 @@ jobs:
               $S5 rm "$BUILDS_PREFIX/$d/*" >/dev/null 2>&1 || true
             fi
           done
+
+          # memwatch logs are keyed by run id, so age them by upload date
+          # (s5cmd ls prints YYYY/MM/DD first).
+          MEMWATCH_PREFIX="s3://$S3_BUCKET/$S3_PREFIX/memwatch"
+          MEMWATCH_CUTOFF=$(date -u -d "$NEW_DATE -${KEEP_MEMWATCH_DAYS} days +1 day" +%Y/%m/%d)
+          echo "memwatch: keep logs from $MEMWATCH_CUTOFF on"
+          $S5 ls "$MEMWATCH_PREFIX/*" 2>/dev/null \
+            | awk -v cutoff="$MEMWATCH_CUTOFF" '$1 < cutoff {print $NF}' \
+            | while read -r key; do
+                $S5 rm "$MEMWATCH_PREFIX/$key" >/dev/null 2>&1 || true
+              done
           echo "Public bucket cleanup complete."
 
       # ── Cleanup old cache bucket entries ───────────────────────────────
