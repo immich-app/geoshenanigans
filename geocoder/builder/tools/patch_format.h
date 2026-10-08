@@ -51,15 +51,6 @@ inline MappedFileRW mmap_file_rw(const std::string& path) {
     return {static_cast<char*>(p), sz};
 }
 
-// Bytes in memory behind the size() / at(off, n) interface the cell index
-// streams read their old files through.
-struct ByteSpan {
-    const char* data;
-    size_t bytes;
-    uint64_t size() const { return bytes; }
-    const char* at(uint64_t off, size_t) const { return data + off; }
-};
-
 inline void unmap_file(MappedFile& f) {
     if (f.data) { munmap(const_cast<char*>(f.data), f.size); f.data = nullptr; f.size = 0; }
 }
@@ -864,8 +855,8 @@ inline void append_cell_list_delta(std::vector<char>& out, const CellLists& old_
 // gives. Holds one cell's list at a time: the patcher runs on client
 // machines, where materialising planet poi/all (1.1M cells, 25M ids, a 23M
 // entry remap map) cost over 1 GiB. The old cells and entries are read
-// front to back through size() and at(off, n) (a ByteSpan, or a file reader
-// whose view lasts until its next call). Returns the entries bytes written.
+// front to back through size() and at(off, n), a view that lasts until the
+// next call (SequentialFileReader). Returns the entries bytes written.
 template <typename Cells, typename Entries, typename Remap, typename OutCells, typename OutEntries>
 uint64_t stream_cell_index(Cells&& cells, Entries&& entries,
                            std::vector<uint64_t> added, std::vector<uint64_t> removed, Remap remap,

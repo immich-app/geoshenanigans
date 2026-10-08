@@ -70,6 +70,8 @@ target_include_directories(geocoder-diff PRIVATE tools)
 add_executable(geocoder-patch tools/geocoder_patch.cpp)
 target_link_libraries(geocoder-patch PRIVATE Threads::Threads)
 target_include_directories(geocoder-patch PRIVATE tools src)
+# pread offsets past 4 GiB on 32-bit glibc too (sequential_file_reader.h).
+target_compile_definitions(geocoder-patch PRIVATE _FILE_OFFSET_BITS=64)
 
 target_include_directories(build-index PRIVATE "${EMBEDDED_POLY_DIR}")
 
@@ -112,6 +114,7 @@ add_executable(geocoder-tests
 )
 target_include_directories(geocoder-tests PRIVATE src tools tests)
 target_compile_definitions(geocoder-tests PRIVATE
-    GEOCODER_TEMPLATE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/configurations.template.json")
+    GEOCODER_TEMPLATE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/configurations.template.json"
+    _FILE_OFFSET_BITS=64)
 target_link_libraries(geocoder-tests PRIVATE Threads::Threads)
 add_test(NAME geocoder-tests COMMAND geocoder-tests)

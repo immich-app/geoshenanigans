@@ -211,7 +211,9 @@ geocoder-patch <current-dir> <patch-file> -o <output-dir>
 ```
 
 The patch tool:
-- Reads old files via mmap and writes each new file in one streaming pass
+- Reads old files front to back through `pread` (sequential readahead) and
+  writes each new file in one streaming pass; only the old string tiers,
+  probed at random, and the decompressed patch are mmapped
 - Peak anonymous memory: about 10 MiB for `planet/full`; everything else is
   reclaimable page cache
 - Runs on one core inside a 1 GiB memory limit (page cache included): one

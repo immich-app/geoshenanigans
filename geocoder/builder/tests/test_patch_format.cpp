@@ -17,6 +17,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "scratch_dir.h"
+#include "sequential_file_reader.h"
 #include "test_framework.h"
 
 // --- write_varint / read_varint round-trip ---
@@ -469,6 +471,19 @@ TEST(patch_format_rebuild_cells_remaps_interior_entries) {
 
 // --- cell list delta ---
 
+// Bytes in memory behind the size() / at(off, n) interface the cell index
+// streams read their old files through.
+struct ByteSpan {
+    const char* data;
+    size_t bytes;
+    uint64_t size() const { return bytes; }
+    const char* at(uint64_t off, size_t) const { return data + off; }
+};
+
+static void write_bytes(const std::string& path, const std::vector<char>& bytes) {
+    std::ofstream(path, std::ios::binary).write(bytes.data(), bytes.size());
+}
+
 TEST(patch_format_cell_lists_write_the_cell_index_layout) {
     // Cells sorted by id with contiguous entry offsets; entries are
     // (u16 count, ids). Matches write_cell_index.
@@ -535,6 +550,7 @@ TEST(patch_format_stream_cell_index_matches_rebuild_then_delta) {
     // with interior flags, removed and added cells.
     uint64_t seed = 99;
     auto rnd = [&](uint32_t n) { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return (uint32_t)(seed >> 33) % n; };
+    ScratchDir dir("cell-index-test");
     for (int round = 0; round < 200; round++) {
         CellLists old_lists;
         for (uint64_t cid = 1; cid < 30; cid++) {
@@ -570,6 +586,20 @@ TEST(patch_format_stream_cell_index_matches_rebuild_then_delta) {
                           [&](const char* p, size_t n) { got.first.insert(got.first.end(), p, p + n); },
                           [&](const char* p, size_t n) { got.second.insert(got.second.end(), p, p + n); });
         CHECK(got == write_cell_lists(new_lists));
+
+        // The patcher reads the old index from files; a 16-byte window
+        // refills mid-list, grows for longer lists and skips removed cells.
+        write_bytes(dir.path() + "/cells.bin", cells);
+        write_bytes(dir.path() + "/entries.bin", entries);
+        SequentialFileReader cells_file(dir.path() + "/cells.bin", 16), entries_file(dir.path() + "/entries.bin", 16);
+        std::pair<std::vector<char>, std::vector<char>> streamed;
+        stream_cell_index(cells_file, entries_file, added, removed,
+                          [&](uint32_t id) { auto f = rm.find(id); return f != rm.end() ? f->second : id; },
+                          delta.data(), delta.size(),
+                          [&](const char* p, size_t n) { streamed.first.insert(streamed.first.end(), p, p + n); },
+                          [&](const char* p, size_t n) { streamed.second.insert(streamed.second.end(), p, p + n); });
+        CHECK(streamed == got);
+        CHECK_EQ(cells_file.rewinds() + entries_file.rewinds(), uint64_t(0));
     }
 }
 

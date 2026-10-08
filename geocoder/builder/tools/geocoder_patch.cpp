@@ -1,7 +1,9 @@
 // geocoder-patch v4: Low-memory streaming patch application.
 //
-// Key design: mmap old files (zero copy), stream output via fwrite (never accumulate),
-// process entry pipeline cell-by-cell. Target: <1 GiB peak RSS for planet.
+// Key design: old files stream front to back through pread (SequentialFileReader);
+// the string tiers and the decompressed patch, read at random, stay mmapped.
+// Output streams via fwrite (never accumulate), the entry pipeline goes
+// cell-by-cell. Target: <1 GiB peak RSS for planet.
 //
 // Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir>
 
@@ -32,6 +34,7 @@
 #include "merge_sequence.h"
 #include "patch_format.h"
 #include "scratch_dir.h"
+#include "sequential_file_reader.h"
 
 
 // --- Helpers ---
@@ -85,8 +88,11 @@ static void log_phase(const char* label, double start) {
               << "s, " << get_rss_anon_mb() << " MiB anon, " << io_delta(last, now) << "] " << label << std::endl;
     last = now;
 }
-
-// MappedFile + mmap_file + unmap_file are now in patch_format.h
+// Every old-file read is forward only on today's layouts; a rewind means a
+// layout changed and the file is being read more than once.
+static void log_rewinds(const SequentialFileReader& r) {
+    if (r.rewinds()) std::cerr << "  " << r.path() << ": read backwards " << r.rewinds() << " times" << std::endl;
+}
 
 // Detect stride from file size
 static size_t detect_stride(const std::string& path, std::initializer_list<size_t> candidates) {
@@ -118,7 +124,7 @@ static int run(int argc, char* argv[]) {
     std::string cur_dir = argv[1], patch_path = argv[2], out_dir = argv[4];
     ensure_dir(out_dir);
     // Output files are truncated while the current files are still
-    // mmapped as the patch base, so in-place application corrupts both.
+    // read as the patch base, so in-place application corrupts both.
     {
         char cur_real[PATH_MAX], out_real[PATH_MAX];
         if (realpath(cur_dir.c_str(), cur_real) && realpath(out_dir.c_str(), out_real) &&
@@ -484,26 +490,19 @@ static int run(int argc, char* argv[]) {
             // Unchanged file: the diff verified old==new and emitted no
             // data. Reproduce by copying the old (current) file verbatim.
             uint32_t nf = ru32(); (void)nf; take(ru64(), "copy-old payload"); // empty
-            std::string src = cur_dir + "/" + fname;
-            FILE* in = fopen(src.c_str(), "rb");
-            FILE* out = open_out(fname);
-            if (!in || !out) {
+            SequentialFileReader in(cur_dir + "/" + fname);
+            if (!in.is_open()) {
                 // The diff only emits COPY_OLD for a file that existed (and was
                 // byte-identical) at diff time, so a missing source here is a
                 // real error — surface it loudly instead of silently writing a
                 // truncated/empty file and logging a false success.
-                std::cerr << "  ERROR: " << fname << ": copy-old failed (src "
-                          << (in ? "ok" : "MISSING") << ", dst "
-                          << (out ? "ok" : "FAILED") << ")" << std::endl;
-                if (in) fclose(in);
-                if (out) fclose(out);
+                std::cerr << "  ERROR: " << fname << ": copy-old failed (src MISSING)" << std::endl;
                 return 1;
             }
-            std::vector<char> cbuf(1 << 20);
-            size_t r, written = 0;
-            while ((r = fread(cbuf.data(), 1, cbuf.size(), in)) > 0)
-                written += fwrite(cbuf.data(), 1, r, out);
-            fclose(in); fclose(out);
+            FILE* out = open_out(fname);
+            size_t written = 0;
+            in.stream(0, in.size(), [&](const char* p, size_t n) { written += fwrite(p, 1, n, out); });
+            fclose(out);
             std::cerr << "  " << fname << ": unchanged (copied " << written
                       << " bytes from old)" << section_io() << std::endl;
             continue;
@@ -521,19 +520,19 @@ static int run(int argc, char* argv[]) {
             if (payload_size < 8) throw std::runtime_error("Malformed cell list delta");
             const char* payload = take(payload_size, "cell list delta");
             uint64_t new_entries_size; memcpy(&new_entries_size, payload, 8);
-            MappedFile old_c = mmap_file(cur_dir + "/" + cells_name);
-            MappedFile old_e = mmap_file(cur_dir + "/" + entries_name);
+            SequentialFileReader old_c(cur_dir + "/" + cells_name);
+            SequentialFileReader old_e(cur_dir + "/" + entries_name);
             FILE* fc = open_out(cells_name);
             FILE* fe = open_out(entries_name);
             uint64_t cells_written = 0;
             uint64_t entries_written = stream_cell_list_delta(
-                ByteSpan{old_c.data, old_c.size}, ByteSpan{old_e.data, old_e.size}, payload + 8, payload_size - 8,
+                old_c, old_e, payload + 8, payload_size - 8,
                 [&](const char* p, size_t n) { fwrite(p, 1, n, fc); cells_written += n; },
                 [&](const char* p, size_t n) { fwrite(p, 1, n, fe); });
             bool ok = !ferror(fc) && !ferror(fe);
             fclose(fc); fclose(fe);
-            if (old_c.data) unmap_file(old_c);
-            if (old_e.data) unmap_file(old_e);
+            log_rewinds(old_c);
+            log_rewinds(old_e);
             if (!ok) throw std::runtime_error("Cannot write " + cells_name);
             if (cells_written != new_size || entries_written != new_entries_size)
                 throw std::runtime_error("Rebuilt " + cells_name + " does not match the new build");
@@ -557,9 +556,8 @@ static int run(int argc, char* argv[]) {
             // Streamed through a 1 MiB buffer (the changes come sorted by
             // position): holding the whole file cost ~700 MiB of client
             // memory for planet addr_postcodes.
-            MappedFile old_mmap = mmap_file(cur_dir + "/" + std::string(fname));
-            if (old_mmap.data) madvise(const_cast<char*>(old_mmap.data), old_mmap.size, MADV_SEQUENTIAL);
-            const size_t copy_n = old_mmap.data ? std::min({(size_t)old_size, (size_t)new_size, old_mmap.size}) : 0;
+            SequentialFileReader old(cur_dir + "/" + std::string(fname));
+            const size_t copy_n = std::min<uint64_t>({old_size, new_size, old.size()});
             constexpr uint32_t NO_DATA_VAL = 0xFFFFFFFFu;
             auto remap_value = [&](uint32_t v) -> uint32_t {
                 if (v == NO_DATA_VAL) return v;
@@ -581,7 +579,7 @@ static int run(int argc, char* argv[]) {
             for (size_t at = 0; at < (size_t)new_size; at += CHUNK) {
                 size_t n = std::min(CHUNK, (size_t)new_size - at);
                 size_t from_old = at < copy_n ? std::min(n, copy_n - at) : 0;
-                if (from_old) memcpy(buf.data(), old_mmap.data + at, from_old);
+                old.read(at, buf.data(), from_old);
                 if (from_old < n) memset(buf.data() + from_old, 0, n - from_old);
                 if (remapped) {
                     for (size_t r = 0; r + value_stride <= from_old; r += value_stride) {
@@ -602,7 +600,6 @@ static int run(int argc, char* argv[]) {
             }
             bool ok = !ferror(out);
             fclose(out);
-            if (old_mmap.data) unmap_file(old_mmap);
             if (!ok) throw std::runtime_error(std::string("Cannot write ") + fname);
 
             std::cerr << "  " << fname << ": sparse delta " << n_changes
@@ -666,10 +663,9 @@ static int run(int argc, char* argv[]) {
             else if (file_id == (uint32_t)PatchFileId::PLACE_NODES) remap_offs = {PLACE_NODE_NAME_ID_OFF};
         }
 
-        // mmap old file read-only (zero allocation).
-        MappedFile old_mmap = mmap_file(cur_dir + "/" + std::string(fname));
-        madvise(const_cast<char*>(old_mmap.data), old_mmap.size, MADV_SEQUENTIAL);
-        size_t n_old_records = old_mmap.size / actual_stride;
+        // The old file, read front to back (DELETE runs skip forward).
+        SequentialFileReader old(cur_dir + "/" + std::string(fname));
+        size_t n_old_records = old.size() / actual_stride;
 
         // Replay merge sequence — stream output, apply remap/fixups per-record inline
         uint64_t seq_size = ru64();
@@ -697,21 +693,22 @@ static int run(int argc, char* argv[]) {
             if (op == OP_MATCH_RUN) {
                 // Fast path: files with no per-record transform (the
                 // *_vertices byte streams, street_nodes / interp_nodes)
-                // copy the whole run from old in one fwrite. The record
-                // loop below costs one fwrite per record: one per byte
-                // of planet/full's 3.4 GiB addr_vertices, one per node
+                // copy the whole run from old in window-sized fwrites. The
+                // record loop below costs one fwrite per record: one per
+                // byte of planet/full's 3.4 GiB addr_vertices, one per node
                 // of its 600M street_nodes.
                 size_t run_bytes = (size_t)count * actual_stride;
                 if (!needs_remap && !needs_padding && remap_offs.empty() && !has_fixups
-                    && old_bytes + run_bytes <= old_mmap.size) {
-                    fwrite(old_mmap.data + old_bytes, 1, run_bytes, outf);
+                    && old_bytes + run_bytes <= old.size()) {
+                    old.stream(old_bytes, run_bytes, [&](const char* p, size_t n) { fwrite(p, 1, n, outf); });
                     written += run_bytes;
                     old_rec += count; new_rec += count; old_bytes += run_bytes;
                     continue;
                 }
                 for (uint32_t k = 0; k < count; k++) {
                     size_t rec_off = old_bytes + k * actual_stride;
-                    if (rec_off + actual_stride > old_mmap.size) break;
+                    if (rec_off + actual_stride > old.size()) break;
+                    const char* rec = old.at(rec_off, actual_stride);
 
                     bool modified = false;
                     // Check if this record needs any modification
@@ -733,14 +730,14 @@ static int run(int argc, char* argv[]) {
                         modified = true;
                     uint32_t old_off = 0, new_off = 0;
                     if (has_fixups) {
-                        memcpy(&old_off, old_mmap.data + rec_off + fixup_off, 4);
+                        memcpy(&old_off, rec + fixup_off, 4);
                         new_off = fixups.apply(static_cast<uint32_t>(old_rec + k), old_off);
                     }
                     bool has_fixup = new_off != old_off;
                     if (has_fixup) modified = true;
 
                     if (modified) {
-                        memcpy(rec_buf.data(), old_mmap.data + rec_off, actual_stride);
+                        memcpy(rec_buf.data(), rec, actual_stride);
                         // Apply padding zeroing
                         if (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS && actual_stride == 24)
                             memset(rec_buf.data() + 14, 0, 2); // preserve place_type_override at byte 13
@@ -788,8 +785,8 @@ static int run(int argc, char* argv[]) {
                         if (has_fixup) memcpy(rec_buf.data() + fixup_off, &new_off, 4);
                         fwrite(rec_buf.data(), 1, actual_stride, outf);
                     } else {
-                        // No modification needed — write directly from mmap
-                        fwrite(old_mmap.data + rec_off, 1, actual_stride, outf);
+                        // No modification needed: the record as read
+                        fwrite(rec, 1, actual_stride, outf);
                     }
                 }
                 if (track) remap.add_match(static_cast<uint32_t>(old_rec), static_cast<uint32_t>(new_rec), count);
@@ -807,7 +804,7 @@ static int run(int argc, char* argv[]) {
             }
         }
         fclose(outf);
-        unmap_file(old_mmap);
+        log_rewinds(old);
 
         if (track) {
             record_remaps[file_id] = std::move(remap);
@@ -847,15 +844,14 @@ static int run(int argc, char* argv[]) {
         const RecordRemap& a_rm = remap_of(PatchFileId::ADDR_POINTS);
         const RecordRemap& i_rm = remap_of(PatchFileId::INTERP_WAYS);
 
-        // mmap old files (zero RSS until pages are accessed, then only working set)
-        MappedFile m_geo = mmap_file(cur_dir + "/geo_cells.bin");
-        MappedFile m_se = mmap_file(cur_dir + "/street_entries.bin");
-        MappedFile m_ae = mmap_file(cur_dir + "/addr_entries.bin");
-        MappedFile m_ie = mmap_file(cur_dir + "/interp_entries.bin");
-        madvise(const_cast<char*>(m_se.data), m_se.size, MADV_SEQUENTIAL);
-        madvise(const_cast<char*>(m_ae.data), m_ae.size, MADV_SEQUENTIAL);
-        madvise(const_cast<char*>(m_ie.data), m_ie.size, MADV_SEQUENTIAL);
-        size_t n_old = m_geo.size / 20;
+        // The old geo index and its entries files, each read front to back:
+        // the builder writes every list in cell order, removed cells and
+        // NO_DATA lists only leave gaps.
+        SequentialFileReader old_geo(cur_dir + "/geo_cells.bin");
+        SequentialFileReader old_se(cur_dir + "/street_entries.bin");
+        SequentialFileReader old_ae(cur_dir + "/addr_entries.bin");
+        SequentialFileReader old_ie(cur_dir + "/interp_entries.bin");
+        size_t n_old = old_geo.size() / 20;
 
         // Corrections and removed cells, sorted by cell id and read through
         // forward cursors: the walk below visits cells in ascending id
@@ -925,7 +921,7 @@ static int run(int argc, char* argv[]) {
 
         // The cell's derived list (old list, ids remapped), then its
         // correction from the diff, if it sent one.
-        auto do_entry = [&](uint64_t cid, ByteSpan old_e, uint32_t old_off, const RecordRemap& rm,
+        auto do_entry = [&](uint64_t cid, SequentialFileReader& old_e, uint32_t old_off, const RecordRemap& rm,
                             DeltaCursor& deltas, EntriesOut& outf) -> uint32_t {
             read_entry_list(old_e, old_off, buf);
             if (!buf.empty()) remap(buf, rm);
@@ -937,9 +933,9 @@ static int run(int argc, char* argv[]) {
         // old entries files, NO for a new cell.
         using ListOffsets = std::array<uint32_t, 3>;
         auto process_cell = [&](uint64_t cid, const ListOffsets& old_offs) {
-            uint32_t so = do_entry(cid, ByteSpan{m_se.data, m_se.size}, old_offs[0], w_rm, cur_s, o_se);
-            uint32_t ao = do_entry(cid, ByteSpan{m_ae.data, m_ae.size}, old_offs[1], a_rm, cur_a, o_ae);
-            uint32_t io = do_entry(cid, ByteSpan{m_ie.data, m_ie.size}, old_offs[2], i_rm, cur_i, o_ie);
+            uint32_t so = do_entry(cid, old_se, old_offs[0], w_rm, cur_s, o_se);
+            uint32_t ao = do_entry(cid, old_ae, old_offs[1], a_rm, cur_a, o_ae);
+            uint32_t io = do_entry(cid, old_ie, old_offs[2], i_rm, cur_i, o_ie);
             fwrite(&cid, 8, 1, f_geo); fwrite(&so, 4, 1, f_geo); fwrite(&ao, 4, 1, f_geo); fwrite(&io, 4, 1, f_geo);
             cells_written++;
         };
@@ -951,7 +947,7 @@ static int run(int argc, char* argv[]) {
             if (old_i < n_old) {
                 // One 20-byte record: cell id, then the three list offsets.
                 // size_t: planet has ~380M cells and `old_i * 20` passes 2^31.
-                const char* rec = m_geo.data + old_i * 20;
+                const char* rec = old_geo.at((uint64_t)old_i * 20, 20);
                 memcpy(&old_cid, rec, 8);
                 memcpy(old_offs.data(), rec + 8, 12);
             }
@@ -974,7 +970,7 @@ static int run(int argc, char* argv[]) {
         }
 
         fclose(f_geo); fclose(o_se.f); fclose(o_ae.f); fclose(o_ie.f);
-        unmap_file(m_geo); unmap_file(m_se); unmap_file(m_ae); unmap_file(m_ie);
+        for (const SequentialFileReader* r : {&old_geo, &old_se, &old_ae, &old_ie}) log_rewinds(*r);
         std::cerr << "  Geo: " << cells_written << " cells written" << std::endl;
         malloc_trim(0);
         log_phase("  Geo entries complete", t_entry);
@@ -1036,19 +1032,19 @@ static int run(int argc, char* argv[]) {
                                   auto remap) -> bool {
             auto dit = cell_index_deltas.find((uint32_t)entries_fid);
             if (dit == cell_index_deltas.end()) return false;
-            MappedFile old_c = mmap_file(cur_dir + "/" + prefix + "_cells.bin");
-            MappedFile old_e = mmap_file(cur_dir + "/" + prefix + "_entries.bin");
+            SequentialFileReader old_c(cur_dir + "/" + prefix + "_cells.bin");
+            SequentialFileReader old_e(cur_dir + "/" + prefix + "_entries.bin");
             FILE* fc = open_out(prefix + "_cells.bin");
             FILE* fe = open_out(prefix + "_entries.bin");
             size_t n_out = 0;
-            stream_cell_index(ByteSpan{old_c.data, old_c.size}, ByteSpan{old_e.data, old_e.size}, added, removed, remap,
+            stream_cell_index(old_c, old_e, added, removed, remap,
                               dit->second.data(), dit->second.size(),
                               [&](const char* p, size_t len) { fwrite(p, 1, len, fc); n_out += len; },
                               [&](const char* p, size_t len) { fwrite(p, 1, len, fe); });
             bool ok = !ferror(fc) && !ferror(fe);
             fclose(fc); fclose(fe);
-            if (old_c.data) unmap_file(old_c);
-            if (old_e.data) unmap_file(old_e);
+            log_rewinds(old_c);
+            log_rewinds(old_e);
             if (!ok) throw std::runtime_error("Cannot write " + prefix + "_cells.bin");
             std::cerr << "  " << label << ": " << n_out / 12 << " cells, cell index delta" << std::endl;
             return true;
