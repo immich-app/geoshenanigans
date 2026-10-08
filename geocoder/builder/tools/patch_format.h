@@ -187,6 +187,19 @@ inline bool write_file(const std::string& path, const std::vector<char>& data) {
     return write_file(path, data.data(), data.size());
 }
 
+// Every patch section names the size of the old file it was made from; the
+// diff writes 0 for a file the old dir lacks. Checking it is the only thing
+// that refuses a dir from another day for variants that ship no string tier
+// (quality dirs): every other read clamps to what is there.
+inline void require_old_file_size(const std::string& dir, const std::string& name, uint64_t expected) {
+    struct stat st;
+    uint64_t actual = stat((dir + "/" + name).c_str(), &st) == 0 ? static_cast<uint64_t>(st.st_size) : 0;
+    if (actual != expected)
+        throw std::runtime_error("Old " + name + " is not the one the patch was made from (" +
+                                 std::to_string(actual) + " bytes, the patch expects " +
+                                 std::to_string(expected) + ")");
+}
+
 inline const char* get_string(const std::vector<char>& pool, uint32_t offset) {
     if (offset >= pool.size()) return "";
     return pool.data() + offset;

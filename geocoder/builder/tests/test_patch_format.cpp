@@ -4,6 +4,7 @@
 // refactor of the patch tooling can't silently shift them (the constants are
 // load-bearing: diff and patch must agree on them byte-for-byte).
 #include "patch_format.h"
+#include "scratch_dir.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -358,6 +359,30 @@ TEST(patch_format_content_hash_of_nothing_is_stable) {
     // An absent tier (nullptr, 0) and an empty file hash alike.
     char none[1] = {0};
     CHECK_EQ(content_hash(nullptr, 0), content_hash(none, 0));
+}
+
+// --- old file identity ---
+
+TEST(patch_format_old_file_must_be_the_size_the_patch_was_made_from) {
+    ScratchDir dir("old-size");
+    REQUIRE(write_file(dir.path() + "/admin_polygons.bin", std::vector<char>(48, 'x')));
+    REQUIRE(write_file(dir.path() + "/postal_polygons.bin", std::vector<char>()));
+    auto message = [&](const std::string& name, uint64_t expected) -> std::string {
+        try {
+            require_old_file_size(dir.path(), name, expected);
+        } catch (const std::runtime_error& e) {
+            return e.what();
+        }
+        return "";
+    };
+    CHECK_EQ(message("admin_polygons.bin", 48), std::string());
+    CHECK_EQ(message("postal_polygons.bin", 0), std::string());
+    // The diff writes 0 for a file the old dir lacks.
+    CHECK_EQ(message("absent.bin", 0), std::string());
+    CHECK_EQ(message("admin_polygons.bin", 72),
+             std::string("Old admin_polygons.bin is not the one the patch was made from (48 bytes, the patch expects 72)"));
+    CHECK(message("admin_polygons.bin", 0) != "");
+    CHECK(message("absent.bin", 24) != "");
 }
 
 // --- offset fixups ---
