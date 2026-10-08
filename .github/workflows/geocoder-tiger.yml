@@ -42,8 +42,9 @@ jobs:
       - name: Download preprocessed TIGER data
         run: |
           # Use OpenCage's preprocessed TIGER data (much smaller than raw shapefiles)
-          # Try latest year first, fall back to previous
-          for YEAR in 2025 2024 2023; do
+          # Newest year first: this year back to three years ago
+          THIS_YEAR=$(date -u +%Y)
+          for YEAR in $(seq "$THIS_YEAR" -1 $((THIS_YEAR - 3))); do
             URL="https://downloads.opencagedata.com/public/tiger${YEAR}-nominatim-preprocessed.csv.tar.gz"
             echo "Trying $URL..."
             STATUS=$(curl -sI "$URL" 2>/dev/null | head -1 | awk '{print $2}')
