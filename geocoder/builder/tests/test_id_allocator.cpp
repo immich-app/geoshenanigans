@@ -5,11 +5,7 @@
 // tombstoning, sidecar round-trip) so future refactors can't silently shift it.
 #include "id_allocator.h"
 
-#include <cstdio>
-#include <cstring>
-#include <fstream>
 #include <string>
-#include <unistd.h>
 
 #include "scratch_dir.h"
 #include "test_framework.h"
@@ -37,13 +33,9 @@ TEST(fresh_allocate_is_sequential) {
     CHECK_EQ(a.tombstone_count(), size_t(0));
 }
 
-static std::string tmp_sidecar(const char* tag) {
-    return std::string("/tmp/gctest_sidecar_") + tag + "_" +
-           std::to_string(::getpid()) + ".osm_ids";
-}
-
 TEST(sidecar_roundtrip_reuses_indices) {
-    const std::string path = tmp_sidecar("reuse");
+    ScratchDir dir("gctest-reuse");
+    const std::string path = dir.path() + "/prev.osm_ids";
     // Build 1: three records.
     std::vector<SidecarSlot> slots;
     {
@@ -66,11 +58,11 @@ TEST(sidecar_roundtrip_reuses_indices) {
     CHECK_EQ(b.allocate(ObjectType::OSM_NODE, 20), 1u);
     b.finalize();
     CHECK_EQ(b.tombstone_count(), size_t(0));
-    std::remove(path.c_str());
 }
 
 TEST(deleted_record_tombstones_then_slot_recycled) {
-    const std::string path = tmp_sidecar("tomb");
+    ScratchDir dir("gctest-tomb");
+    const std::string path = dir.path() + "/build1.osm_ids";
     {
         IdAllocator a;
         a.allocate(ObjectType::OSM_NODE, 10);  // idx 0
@@ -95,20 +87,19 @@ TEST(deleted_record_tombstones_then_slot_recycled) {
 
     // Build 3: a brand-new identity should recycle the tombstoned slot 1.
     std::vector<SidecarSlot> s2 = b.take_slots();
-    const std::string path3 = tmp_sidecar("tomb3");
+    const std::string path3 = dir.path() + "/build2.osm_ids";
     IdAllocator::write_sidecar(path3, s2);
     IdAllocator c;
     CHECK(c.load_previous(path3));
     CHECK_EQ(c.allocate(ObjectType::OSM_NODE, 10), 0u);   // reuse
     CHECK_EQ(c.allocate(ObjectType::OSM_NODE, 99), 2u);   // reuse
     CHECK_EQ(c.allocate(ObjectType::OSM_NODE, 77), 1u);   // recycle tombstone
-    std::remove(path.c_str());
-    std::remove(path3.c_str());
 }
 
 TEST(load_previous_missing_file_returns_false) {
     IdAllocator a;
-    CHECK(!a.load_previous("/tmp/gctest_does_not_exist_zzz.osm_ids"));
+    ScratchDir dir("gctest-missing");
+    CHECK(!a.load_previous(dir.path() + "/does_not_exist.osm_ids"));
     // Falls back to fresh allocation.
     CHECK_EQ(a.allocate(ObjectType::OSM_NODE, 1), 0u);
 }
