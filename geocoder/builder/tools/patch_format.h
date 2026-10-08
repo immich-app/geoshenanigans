@@ -1012,14 +1012,14 @@ uint64_t stream_cell_list_delta(Cells&& cells, Entries&& entries,
 // Reads the (u16 count, u32 ids) list at `off` of an old street / addr /
 // interp entries file (size() / at(off, n), like the cell index streams)
 // into `ids`. NO_DATA, or a list running past the end of the file, reads as
-// empty.
+// empty; the bounds are checked in 64 bits, so an offset near 4 GiB can't wrap.
 template <typename Entries>
 void read_entry_list(Entries& entries, uint32_t off, std::vector<uint32_t>& ids) {
     ids.clear();
-    if (off == 0xFFFFFFFFu || off + 2 > entries.size()) return;
+    if (off == 0xFFFFFFFFu || (uint64_t)off + 2 > entries.size()) return;
     uint16_t n;
     memcpy(&n, entries.at(off, 2), 2);
-    if (off + 2 + (uint64_t)n * 4 > entries.size()) return;
+    if ((uint64_t)off + 2 + (uint64_t)n * 4 > entries.size()) return;
     ids.resize(n);
     if (n) memcpy(ids.data(), entries.at((uint64_t)off + 2, (size_t)n * 4), (size_t)n * 4);
 }

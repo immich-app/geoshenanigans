@@ -753,7 +753,8 @@ TEST(patch_format_read_entry_list_reads_bad_offsets_as_empty) {
     ByteSpan sut{entries.data(), entries.size()};
     for (uint32_t off : {0xFFFFFFFFu,    // NO_DATA
                          0u,             // the list overruns the file
-                         9u}) {          // the count runs past the end
+                         9u,             // the count runs past the end
+                         0xFFFFFFFEu}) { // off + 2 wraps in 32 bits
         std::vector<uint32_t> ids = {9};
         read_entry_list(sut, off, ids);
         CHECK(ids.empty());
