@@ -20,13 +20,15 @@
 //   // count × 12 bytes:
 //   //   uint8_t  object_type   (kind discriminator; see ObjectType)
 //   //   uint8_t  flags         (bit 0 = tombstone)
-//   //   uint16_t reserved
+//   //   uint8_t  tier          (POI tier of the record holding the slot, or
+//   //                           that last held a tombstone; 0 = unknown)
+//   //   uint8_t  reserved
 //   //   uint64_t stable_id     (osm_id, or hash of stable identity for postcodes)
 //
 // Memory model: slots_ is the single source of truth — populated from
 // the previous sidecar at load_previous(), then mutated in-place by
-// allocate(). Reused slots get their existing payload (already correct);
-// recycled tombstones get rewritten; fresh allocations append. After
+// allocate(). Reused slots keep their existing payload (already correct)
+// apart from the tier; recycled tombstones get rewritten; fresh allocations append. After
 // the allocate() loop, finalize() marks any unconsumed-prev slots as
 // tombstones and drops the prev_to_idx_ map + free-list immediately so
 // only the slot table itself remains. take_slots() then moves the table
@@ -62,7 +64,11 @@ constexpr uint32_t TOMBSTONE_IDX   = 0xFFFFFFFFu;
 struct SidecarSlot {
     uint8_t  object_type;   // ObjectType
     uint8_t  flags;         // bit 0 = tombstone
-    uint16_t reserved;
+    // POI tier of the record holding the slot, or for a tombstone of the
+    // record that last held it. 0 = unknown: other kinds, and slots written
+    // before tiers were recorded (always 0 there, so version 1 still fits).
+    uint8_t  tier;
+    uint8_t  reserved;
     uint64_t stable_id;
 };
 #pragma pack(pop)
@@ -75,6 +81,16 @@ constexpr uint8_t SLOT_FLAG_TOMBSTONE = 0x01;
 // missing allocates {NONE, 0}).
 inline bool is_tombstone(const SidecarSlot& s) {
     return (s.flags & SLOT_FLAG_TOMBSTONE) != 0;
+}
+
+// POI tier whose files carry a slot: a live record's own tier, or for a
+// tombstone the tier of the record that last held it, so a death only
+// reaches the files that held the record. A tombstone of unknown tier (0)
+// ships in every tier. `slot` is null when strategy 2 did not run.
+inline uint8_t poi_shipped_tier(uint8_t record_tier, const SidecarSlot* slot) {
+    if (!slot || !is_tombstone(*slot)) return record_tier;
+
+    return slot->tier;
 }
 
 // Internal: combine (object_type, stable_id) into a single uint64_t key
@@ -122,14 +138,16 @@ public:
     // Assign a dense idx to a stable identity. Returns the same idx
     // it had in the previous build if present, else recycles a free
     // slot, else appends. Each call should be made exactly once per
-    // distinct stable identity per build.
-    uint32_t allocate(ObjectType type, uint64_t stable_id) {
+    // distinct stable identity per build. `tier` is stamped on the slot
+    // whichever path it takes (a live POI can change tier between days).
+    uint32_t allocate(ObjectType type, uint64_t stable_id, uint8_t tier = 0) {
         uint64_t key = make_key(type, stable_id);
         auto it = prev_to_idx_.find(key);
         if (it != prev_to_idx_.end()) {
             uint32_t idx = it->second;
             prev_to_idx_.erase(it);
             // slot already has correct {type, stable_id} from the load
+            slots_[idx].tier = tier;
             live_count_++;
             return idx;
         }
@@ -137,30 +155,30 @@ public:
             uint32_t idx = free_list_.back();
             free_list_.pop_back();
             slots_[idx] = SidecarSlot{
-                static_cast<uint8_t>(type), 0, 0, stable_id};
+                static_cast<uint8_t>(type), 0, tier, 0, stable_id};
             live_count_++;
             return idx;
         }
         uint32_t idx = static_cast<uint32_t>(slots_.size());
         slots_.push_back(SidecarSlot{
-            static_cast<uint8_t>(type), 0, 0, stable_id});
+            static_cast<uint8_t>(type), 0, tier, 0, stable_id});
         live_count_++;
         return idx;
     }
 
     // Mark surviving prev_to_idx_ entries (= deleted records) as
-    // tombstones in slots_, and flag every free-list slot nothing claimed:
-    // a live NONE-type slot sits there unflagged and is dead now (slots
-    // already flagged keep their bytes). Then drop the lookup map and
-    // free-list to release the bulk of the working memory before slots_
-    // moves out.
+    // tombstones in slots_, keeping the tier of the record that held each
+    // one, and flag every free-list slot nothing claimed: a live NONE-type
+    // slot sits there unflagged and is dead now (slots already flagged keep
+    // their bytes). Then drop the lookup map and free-list to release the
+    // bulk of the working memory before slots_ moves out.
     // For 250M addr_points the prev_to_idx_ unordered_map alone is
     // ~8 GiB of resident memory; releasing it here is what keeps the
     // peak inside the runner's RAM budget.
     void finalize() {
         for (auto& kv : prev_to_idx_) {
-            slots_[kv.second] = SidecarSlot{
-                static_cast<uint8_t>(ObjectType::NONE), SLOT_FLAG_TOMBSTONE, 0, 0};
+            SidecarSlot& s = slots_[kv.second];
+            s = SidecarSlot{static_cast<uint8_t>(ObjectType::NONE), SLOT_FLAG_TOMBSTONE, s.tier, 0, 0};
         }
         for (uint32_t i : free_list_) slots_[i].flags |= SLOT_FLAG_TOMBSTONE;
         std::unordered_map<uint64_t, uint32_t>().swap(prev_to_idx_);

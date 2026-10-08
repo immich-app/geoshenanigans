@@ -6,6 +6,7 @@
 #include <iostream>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -22,16 +23,40 @@
 #include "string_pool.h"
 #include "id_allocator.h"
 
-// Categories a POI tier's poi_meta.json lists: those of the live records the
-// tier ships. A tombstone is memset to category 0 (MUSEUM), so counting it
-// would list museums in a tier that holds none. `slots` is the strategy-2
-// slot table, parallel to `records`, or empty when strategy 2 did not run.
+// The records one POI tier's files carry, in record order, and how many of
+// them are tombstones. A tombstone only goes to the tiers that held its
+// record (poi_shipped_tier). `slots` is the strategy-2 slot table, parallel
+// to `records`, or empty when strategy 2 did not run.
+struct PoiTierSelection {
+    std::vector<uint32_t> indices;
+    size_t tombstones = 0;
+};
+
+inline PoiTierSelection select_poi_tier(const std::vector<PoiRecord>& records,
+                                        const std::vector<gc::id_alloc::SidecarSlot>& slots,
+                                        uint8_t max_tier) {
+    if (!slots.empty() && slots.size() != records.size())
+        throw std::runtime_error("POI slot table not parallel to poi_records");
+
+    PoiTierSelection out;
+    for (size_t i = 0; i < records.size(); i++) {
+        const gc::id_alloc::SidecarSlot* slot = slots.empty() ? nullptr : &slots[i];
+        if (gc::id_alloc::poi_shipped_tier(records[i].tier, slot) > max_tier) continue;
+
+        if (slot && gc::id_alloc::is_tombstone(*slot)) out.tombstones++;
+        out.indices.push_back(static_cast<uint32_t>(i));
+    }
+    return out;
+}
+
+// Categories a POI tier's poi_meta.json lists: those of the live records in
+// the tier's selection. A tombstone is memset to category 0 (MUSEUM), so
+// counting it would list museums in a tier that holds none.
 inline std::set<uint8_t> poi_meta_categories(const std::vector<PoiRecord>& records,
                                              const std::vector<gc::id_alloc::SidecarSlot>& slots,
-                                             uint8_t max_tier) {
+                                             const PoiTierSelection& selection) {
     std::set<uint8_t> cats;
-    for (size_t i = 0; i < records.size(); i++) {
-        if (records[i].tier > max_tier) continue;
+    for (uint32_t i : selection.indices) {
         if (!slots.empty() && gc::id_alloc::is_tombstone(slots[i])) continue;
 
         cats.insert(records[i].category);

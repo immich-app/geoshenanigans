@@ -592,7 +592,7 @@ static void apply_strategy2_pois(ParsedData& data, const std::string& prev_dir) 
     for (size_t i = 0; i < n_old; i++) {
         ObjectType t = static_cast<ObjectType>(data.poi_osm_ids[i] >> 56);
         uint64_t sid = data.poi_osm_ids[i] & 0x00FFFFFFFFFFFFFFull;
-        remap[i] = alloc.allocate(t, sid);
+        remap[i] = alloc.allocate(t, sid, data.poi_records[i].tier);
         if (remap[i] != static_cast<uint32_t>(i)) identity = false;
     }
     const uint32_t n_new = alloc.total_slots();

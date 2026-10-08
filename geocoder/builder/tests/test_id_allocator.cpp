@@ -6,6 +6,8 @@
 #include "id_allocator.h"
 
 #include <cstdio>
+#include <cstring>
+#include <fstream>
 #include <string>
 #include <unistd.h>
 
@@ -135,4 +137,126 @@ TEST(unclaimed_live_none_slot_becomes_tombstone) {
     CHECK(is_tombstone(slots[0]));
     CHECK(!is_tombstone(slots[1]));
     CHECK(!is_tombstone(slots[2]));
+}
+
+// --- POI tier on slots ---
+
+// One build against `prev` (empty = fresh): allocate each (osm node id, tier)
+// in order, finalize, and return the slot table the next build loads.
+struct TierBuild {
+    std::vector<uint32_t> idx;
+    std::vector<SidecarSlot> slots;
+};
+static TierBuild tier_build(const ScratchDir& dir, const std::vector<SidecarSlot>& prev,
+                            const std::vector<std::pair<uint64_t, uint8_t>>& records) {
+    IdAllocator a;
+    if (!prev.empty()) {
+        const std::string path = dir.path() + "/prev.osm_ids";
+        IdAllocator::write_sidecar(path, prev);
+        REQUIRE(a.load_previous(path));
+    }
+    TierBuild out;
+    for (const auto& [id, tier] : records) out.idx.push_back(a.allocate(ObjectType::OSM_NODE, id, tier));
+    a.finalize();
+    out.slots = a.take_slots();
+    return out;
+}
+
+TEST(allocate_stamps_tier_on_append_reuse_and_recycle) {
+    ScratchDir dir("gctest-tier");
+    // Build 1 appends: node 10 tier 2, node 20 tier 3.
+    const TierBuild b1 = tier_build(dir, {}, {{10, 2}, {20, 3}});
+    REQUIRE(b1.slots.size() == 2u);
+    CHECK_EQ(b1.slots[0].tier, 2);
+    CHECK_EQ(b1.slots[1].tier, 3);
+    // Build 2: node 10 is reused at tier 1; node 20 dies.
+    const TierBuild b2 = tier_build(dir, b1.slots, {{10, 1}});
+    CHECK_EQ(b2.idx[0], 0u);
+    CHECK_EQ(b2.slots[0].tier, 1);
+    // Build 3: node 30 recycles node 20's tombstone and takes its own tier.
+    const TierBuild b3 = tier_build(dir, b2.slots, {{10, 1}, {30, 2}});
+    CHECK_EQ(b3.idx[1], 1u);
+    CHECK(!is_tombstone(b3.slots[1]));
+    CHECK_EQ(b3.slots[1].tier, 2);
+    CHECK_EQ(b3.slots[1].stable_id, 30u);
+}
+
+TEST(dead_slot_keeps_tier_of_last_record) {
+    ScratchDir dir("gctest-tier");
+    const TierBuild b1 = tier_build(dir, {}, {{10, 1}, {20, 2}});
+    const TierBuild b2 = tier_build(dir, b1.slots, {{10, 1}});
+    REQUIRE(b2.slots.size() == 2u);
+    CHECK(is_tombstone(b2.slots[1]));
+    CHECK_EQ(b2.slots[1].object_type, uint8_t(ObjectType::NONE));
+    CHECK_EQ(b2.slots[1].stable_id, 0u);
+    CHECK_EQ(b2.slots[1].tier, 2);
+}
+
+TEST(still_dead_slot_keeps_its_bytes_across_builds) {
+    ScratchDir dir("gctest-tier");
+    const TierBuild b1 = tier_build(dir, {}, {{10, 1}, {20, 4}});
+    const TierBuild b2 = tier_build(dir, b1.slots, {{10, 1}});
+    const TierBuild b3 = tier_build(dir, b2.slots, {{10, 1}});
+    REQUIRE(b3.slots.size() == 2u);
+    CHECK(std::memcmp(&b3.slots[1], &b2.slots[1], sizeof(SidecarSlot)) == 0);
+    CHECK_EQ(b3.slots[1].tier, 4);
+}
+
+TEST(sidecar_written_before_tiers_reads_as_unknown_tier) {
+    // A version-1 sidecar from before the tier byte: 12-byte slots, bytes
+    // 2..3 zero. The slot that dies keeps tier 0 (ships in every tier).
+    ScratchDir dir("gctest-tier");
+    const std::string path = dir.path() + "/old.osm_ids";
+    {
+        std::ofstream f(path, std::ios::binary);
+        const uint32_t header[3] = {SIDECAR_MAGIC, 1, 2};
+        f.write(reinterpret_cast<const char*>(header), sizeof(header));
+        for (uint64_t id : {uint64_t(10), uint64_t(20)}) {
+            const uint8_t head[4] = {uint8_t(ObjectType::OSM_NODE), 0, 0, 0};
+            f.write(reinterpret_cast<const char*>(head), 4);
+            f.write(reinterpret_cast<const char*>(&id), 8);
+        }
+    }
+    IdAllocator a;
+    REQUIRE(a.load_previous(path));
+    CHECK_EQ(a.allocate(ObjectType::OSM_NODE, 10, 3), 0u);
+    a.finalize();
+    const std::vector<SidecarSlot> slots = a.take_slots();
+    REQUIRE(slots.size() == 2u);
+    CHECK_EQ(slots[0].tier, 3);
+    CHECK(is_tombstone(slots[1]));
+    CHECK_EQ(slots[1].tier, 0);
+}
+
+TEST(allocate_without_tier_leaves_slot_bytes_as_before) {
+    // Every other record kind allocates without a tier; its sidecar bytes
+    // must not change.
+    IdAllocator a;
+    a.allocate(ObjectType::OSM_WAY, 42);
+    const SidecarSlot want{uint8_t(ObjectType::OSM_WAY), 0, 0, 0, 42};
+    CHECK(std::memcmp(&a.slots()[0], &want, sizeof(SidecarSlot)) == 0);
+}
+
+TEST(is_tombstone_reads_the_flag_only) {
+    // A live slot can carry ObjectType::NONE (continent POI without an osm id).
+    const SidecarSlot live_none{uint8_t(ObjectType::NONE), 0, 0, 0, 0};
+    const SidecarSlot tomb{uint8_t(ObjectType::NONE), SLOT_FLAG_TOMBSTONE, 2, 0, 0};
+    CHECK(!is_tombstone(live_none));
+    CHECK(is_tombstone(tomb));
+}
+
+TEST(poi_shipped_tier_is_record_tier_or_remembered_tombstone_tier) {
+    struct Case { uint8_t record_tier; bool has_slot; uint8_t flags; uint8_t slot_tier; uint8_t want; };
+    const Case cases[] = {
+        {2, true, 0, 2, 2},                    // live record
+        {2, true, 0, 0, 2},                    // live record, slot tier not yet stamped
+        {0, true, SLOT_FLAG_TOMBSTONE, 1, 1},  // tombstone of a major POI
+        {0, true, SLOT_FLAG_TOMBSTONE, 4, 4},  // tombstone of an unshipped POI: no tier
+        {0, true, SLOT_FLAG_TOMBSTONE, 0, 0},  // tombstone of unknown tier: every tier
+        {3, false, 0, 0, 3},                   // no slot table
+    };
+    for (const auto& c : cases) {
+        const SidecarSlot slot{uint8_t(ObjectType::NONE), c.flags, c.slot_tier, 0, 0};
+        CHECK_EQ(poi_shipped_tier(c.record_tier, c.has_slot ? &slot : nullptr), c.want);
+    }
 }
