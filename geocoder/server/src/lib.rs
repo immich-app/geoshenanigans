@@ -1496,6 +1496,14 @@ impl Index {
         let neighbors = cell_neighbors_at_level(cell, self.street_cell_level);
 
         let cos_lat = lat.to_radians().cos();
+        let addr_key = |a: &AddrPoint| {
+            let d = dist_sq((a.lat as f64 - lat).to_radians(), (a.lng as f64 - lng).to_radians(), cos_lat);
+            (d, self.get_string(a.housenumber_id), self.get_string(a.street_id))
+        };
+        let street_key = |w: &WayHeader| {
+            let first: NodeCoord = street_nodes.read_at(w.node_offset as u64);
+            (self.get_string(w.name_id), first.lat, first.lng)
+        };
 
         let mut best_addr_dist = f64::MAX;
         let mut best_addr: Option<AddrPoint> = None;
@@ -1528,7 +1536,7 @@ impl Index {
                     if let Some(verts) = self.addr_polygon_verts(&point) {
                         dist = polygon_distance_sq(lat, lng, &verts, cos_lat);
                     }
-                    if dist < best_addr_dist {
+                    if beats(dist, best_addr_dist, || best_addr.as_ref().map(|b| (addr_key(&point), addr_key(b)))) {
                         best_addr_dist = dist;
                         best_addr = Some(point);
                         best_addr_id = id;
@@ -1562,7 +1570,7 @@ impl Index {
                         nodes[i + 1].lat as f64, nodes[i + 1].lng as f64,
                         cos_lat,
                     );
-                    if dist < best_street_dist {
+                    if beats(dist, best_street_dist, || best_street.as_ref().map(|b| (street_key(&way), street_key(b)))) {
                         best_street_dist = dist;
                         best_street = Some(way);
                         best_street_idx = id;
@@ -1618,6 +1626,10 @@ impl Index {
         let cell = cell_id_at_level(lat, lng, self.street_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.street_cell_level);
         let cos_lat = lat.to_radians().cos();
+        let addr_key = |a: &AddrPoint| {
+            let d = dist_sq((a.lat as f64 - lat).to_radians(), (a.lng as f64 - lng).to_radians(), cos_lat);
+            (d, self.get_string(a.housenumber_id), self.get_string(a.street_id))
+        };
 
         let mut best_dist = max_dist_sq;
         let mut best: Option<AddrPoint> = None;
@@ -1634,7 +1646,7 @@ impl Index {
                 if let Some(verts) = self.addr_polygon_verts(&point) {
                     dist = polygon_distance_sq(lat, lng, &verts, cos_lat);
                 }
-                if dist < best_dist {
+                if beats(dist, best_dist, || best.as_ref().map(|b| (addr_key(&point), addr_key(b)))) {
                     best_dist = dist;
                     best = Some(point);
                 }
@@ -4238,6 +4250,20 @@ pub fn format_postcode<'a>(country_code: &[u8; 2], postcode: &'a str) -> Cow<'a,
     }
 }
 
+/// Whether a candidate at `dist` beats the current best at `best_dist`.
+/// Nominatim orders address points and streets by distance alone and leaves
+/// exact ties (a point inside two buildings, the junction node two streets
+/// share) to database row order. Here a tie goes to the smaller content key,
+/// so the answer depends on neither record order (which differs between a
+/// fresh build and a chained one) nor string offsets (which move when a string
+/// changes tier). `keys` gives (candidate key, best key), None without a best.
+pub fn beats<K: PartialOrd>(dist: f64, best_dist: f64, keys: impl FnOnce() -> Option<(K, K)>) -> bool {
+    if dist != best_dist {
+        return dist < best_dist;
+    }
+    keys().is_some_and(|(k, best)| k < best)
+}
+
 pub fn dist_sq(dlat: f64, dlng: f64, cos_lat: f64) -> f64 {
     dlat * dlat + dlng * dlng * cos_lat * cos_lat
 }
@@ -5036,6 +5062,43 @@ mod pure_helper_tests {
         assert!(!point_in_polygon(3.0, 3.0, &tri));
         // Outside entirely.
         assert!(!point_in_polygon(-1.0, -1.0, &tri));
+    }
+
+    #[test]
+    fn beats_breaks_exact_ties_by_content() {
+        // Two buildings the query sits inside (both 0 m): the nearer address
+        // point wins, then the house number / street text that sorts first,
+        // whatever the string offsets; record order never decides.
+        let at = |lat: f32, lng: f32, hn: u32, st: u32| AddrPoint {
+            lat, lng, housenumber_id: hn, street_id: st, parent_way_id: 0,
+            vertex_offset: NO_DATA, vertex_count: 0,
+        };
+        let text = ["2", "1/2", "Angell Street", "Bell Road"];
+        let (lat, lng) = (52.0f64, 13.0f64);
+        let cos_lat = lat.to_radians().cos();
+        let key = |a: &AddrPoint| {
+            let d = dist_sq((a.lat as f64 - lat).to_radians(), (a.lng as f64 - lng).to_radians(), cos_lat);
+            (d, text[a.housenumber_id as usize], text[a.street_id as usize])
+        };
+        let wins = |dist: f64, p: &AddrPoint, best_dist: f64, best: Option<&AddrPoint>| {
+            beats(dist, best_dist, || best.map(|b| (key(p), key(b))))
+        };
+        let near = at(52.0001, 13.0, 0, 3);
+        let far = at(52.0005, 13.0, 1, 2);
+        assert!(wins(0.0, &near, 0.0, Some(&far)));
+        assert!(!wins(0.0, &far, 0.0, Some(&near)));
+        // "1/2" sorts before "2" although its offset is larger.
+        let half = at(52.0001, 13.0, 1, 3);
+        assert!(wins(0.0, &half, 0.0, Some(&near)));
+        assert!(!wins(0.0, &near, 0.0, Some(&half)));
+        let half_angell = at(52.0001, 13.0, 1, 2);
+        assert!(wins(0.0, &half_angell, 0.0, Some(&half)));
+        // The same candidate seen again (another cell) never replaces itself.
+        assert!(!wins(0.0, &half, 0.0, Some(&half)));
+        // Distance still comes first, and an equal first candidate never
+        // replaces the empty best.
+        assert!(wins(1.0, &far, 2.0, Some(&near)));
+        assert!(!wins(2.0, &near, 2.0, None));
     }
 
     #[test]

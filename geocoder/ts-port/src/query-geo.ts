@@ -60,6 +60,31 @@ export interface AddrCandidate {
   parent_way_id: number;
 }
 
+type TieKey = Array<number | string>;
+
+// Whether a candidate at `dist` beats the current best at `bestDist`.
+// Nominatim orders address points and streets by distance alone and leaves
+// exact ties to database row order; here a tie goes to the smaller content
+// key. `keys` gives [candidate key, best key], null without a best. Mirrors
+// Rust beats.
+export function beats(dist: number, bestDist: number, keys: () => [TieKey, TieKey] | null): boolean {
+  if (dist !== bestDist) return dist < bestDist;
+
+  const k = keys();
+  return k !== null && compareKeys(k[0], k[1]) < 0;
+}
+
+// Element-wise like a Rust tuple; strings by UTF-8 bytes (code points), which
+// JS `<` (UTF-16 units) doesn't match.
+function compareKeys(a: TieKey, b: TieKey): number {
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i], y = b[i];
+    const c = typeof x === "string" ? Buffer.compare(Buffer.from(x), Buffer.from(y as string)) : (x as number) - (y as number);
+    if (c !== 0) return c;
+  }
+  return 0;
+}
+
 export interface StreetCandidate {
   distSq: number;
   way_index: number;
@@ -93,6 +118,7 @@ export function queryGeo(
   interpEntries: ByteSource | null,
   interpWays: ByteSource | null,
   interpNodes: ByteSource | null,
+  strings: StringPool,
   cellLevel: number = DEFAULT_STREET_CELL_LEVEL,
 ): QueryGeoResult {
   const ll = S2LatLng.fromDegrees(lat, lng);
@@ -101,6 +127,16 @@ export function queryGeo(
   const cells: bigint[] = [originCell.id, ...neighbors.map((c) => c.id)];
 
   const cosLat = Math.cos(lat * DEG_TO_RAD);
+  const addrKey = (a: AddrCandidate): TieKey => [
+    distSq((a.lat - lat) * DEG_TO_RAD, (a.lng - lng) * DEG_TO_RAD, cosLat),
+    strings.get(a.housenumber_id),
+    strings.get(a.street_id),
+  ];
+  const streetKey = (w: StreetCandidate): TieKey => [
+    strings.get(w.name_id),
+    streetNodes!.readFloatLE(w.node_offset * NODE_COORD_SIZE),
+    streetNodes!.readFloatLE(w.node_offset * NODE_COORD_SIZE + 4),
+  ];
 
   let bestAddrDist = Infinity;
   let bestAddr: AddrCandidate | null = null;
@@ -139,9 +175,11 @@ export function queryGeo(
         if (vertCount > 0 && vertOff !== NO_DATA && addrVertices) {
           dist = polygonDistanceSq(lat, lng, addrVertices, vertOff * NODE_COORD_SIZE, vertCount, cosLat);
         }
-        if (dist < bestAddrDist) {
+        if (dist > bestAddrDist) return;
+        const cand = { distSq: dist, index: id, lat: aLat, lng: aLng, housenumber_id: housenumberId, street_id: streetId, parent_way_id: parentWayId };
+        if (beats(dist, bestAddrDist, () => bestAddr && [addrKey(cand), addrKey(bestAddr)])) {
           bestAddrDist = dist;
-          bestAddr = { distSq: dist, index: id, lat: aLat, lng: aLng, housenumber_id: housenumberId, street_id: streetId, parent_way_id: parentWayId };
+          bestAddr = cand;
         }
       });
     }
@@ -170,9 +208,10 @@ export function queryGeo(
           const bLat = streetNodes.readFloatLE(b);
           const bLng = streetNodes.readFloatLE(b + 4);
           const d = pointToSegmentDistance(lat, lng, aLat, aLng, bLat, bLng, cosLat);
-          if (d < bestStreetDist) {
+          const cand = { distSq: d, way_index: id, name_id: nameId, node_offset: nodeOffset, node_count: nodeCount };
+          if (beats(d, bestStreetDist, () => bestStreet && [streetKey(cand), streetKey(bestStreet)])) {
             bestStreetDist = d;
-            bestStreet = { distSq: d, way_index: id, name_id: nameId, node_offset: nodeOffset, node_count: nodeCount };
+            bestStreet = cand;
           }
         }
       });
@@ -279,6 +318,7 @@ export function findAddrOnWay(
   geoCells: ByteSource,
   addrEntries: ByteSource,
   addrPoints: ByteSource,
+  strings: StringPool,
   cellLevel: number = DEFAULT_STREET_CELL_LEVEL,
 ): AddrCandidate | null {
   const ll = S2LatLng.fromDegrees(lat, lng);
@@ -288,6 +328,11 @@ export function findAddrOnWay(
 
   const cosLat = Math.cos(lat * DEG_TO_RAD);
   const totalAddr = Math.floor(addrPoints.length / ADDR_POINT_SIZE);
+  const addrKey = (a: AddrCandidate): TieKey => [
+    distSq((a.lat - lat) * DEG_TO_RAD, (a.lng - lng) * DEG_TO_RAD, cosLat),
+    strings.get(a.housenumber_id),
+    strings.get(a.street_id),
+  ];
   let bestDist = maxDistSq;
   let best: AddrCandidate | null = null;
 
@@ -303,14 +348,16 @@ export function findAddrOnWay(
       const dlat = (aLat - lat) * DEG_TO_RAD;
       const dlng = (aLng - lng) * DEG_TO_RAD;
       const d = distSq(dlat, dlng, cosLat);
-      if (d < bestDist) {
+      if (d > bestDist) return;
+      const cand = {
+        distSq: d, index: id, lat: aLat, lng: aLng,
+        housenumber_id: addrPoints.readUInt32LE(off + 8),
+        street_id: addrPoints.readUInt32LE(off + 12),
+        parent_way_id: parentWay,
+      };
+      if (beats(d, bestDist, () => best && [addrKey(cand), addrKey(best)])) {
         bestDist = d;
-        best = {
-          distSq: d, index: id, lat: aLat, lng: aLng,
-          housenumber_id: addrPoints.readUInt32LE(off + 8),
-          street_id: addrPoints.readUInt32LE(off + 12),
-          parent_way_id: parentWay,
-        };
+        best = cand;
       }
     });
   }

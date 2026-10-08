@@ -117,6 +117,7 @@ export class Geocoder {
         this.index.interpEntries,
         this.index.interpWays,
         this.index.interpNodes,
+        this.index.strings,
         DEFAULT_STREET_CELL_LEVEL,
       );
 
@@ -151,6 +152,7 @@ export class Geocoder {
               this.index.geoCells,
               this.index.addrEntries,
               this.index.addrPoints,
+              this.index.strings,
               DEFAULT_STREET_CELL_LEVEL,
             );
             if (refined && refined.housenumber_id !== NO_DATA) {
