@@ -13,11 +13,11 @@
 // municipalities as towns — Nominatim keeps them separate.
 #include <cstdint>
 
+#include "country_code.h"
+
 inline uint8_t admin_rank_address(uint16_t cc, uint8_t admin_level) {
     // Country overrides (packed uppercase 'XY').
-    constexpr auto pack = [](char a, char b) -> uint16_t {
-        return static_cast<uint16_t>((a << 8) | b);
-    };
+    constexpr auto pack = pack_country_code;
     switch (cc) {
         case pack('A','U'): if (admin_level == 6) return 0; break;
         case pack('B','E'): switch (admin_level) {

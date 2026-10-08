@@ -1,5 +1,6 @@
 #include "s2_helpers.h"
 #include "geometry.h"
+#include "country_code.h"
 
 #include <algorithm>
 #include <cmath>
@@ -307,7 +308,7 @@ void add_admin_polygon(ParsedData& data,
     poly.place_type_override = place_type_override;
     poly.area = polygon_area(simplified);
     poly.country_code = (country_code && country_code[0] && country_code[1])
-        ? static_cast<uint16_t>((country_code[0] << 8) | country_code[1])
+        ? pack_country_code(country_code[0], country_code[1])
         : 0;
     data.admin_polygons.push_back(poly);
     // Strategy-2 stable identity, packed like addr/poi: top 8 bits =

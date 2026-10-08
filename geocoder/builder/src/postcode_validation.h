@@ -4,12 +4,14 @@
 #include <cstring>
 #include <string>
 
+#include "country_code.h"
+
 // Auto-generated from Nominatim settings/country_settings.yaml
 // Validates postcodes against per-country patterns.
 // cc must be lowercase 2-char country code.
 inline bool validate_postcode_for_country(const char* cc, const char* pc) {
     if (!cc || !cc[0] || !cc[1] || !pc || !pc[0]) return false;
-    uint16_t key = (static_cast<uint16_t>(cc[0]) << 8) | cc[1];
+    uint16_t key = pack_country_code(cc[0], cc[1]);
     std::string bare;
     for (const char* p = pc; *p; p++) {
         char c = *p;

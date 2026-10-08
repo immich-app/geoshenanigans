@@ -29,6 +29,7 @@
 #include "types.h"
 #include "string_pool.h"
 #include "geometry.h"
+#include "country_code.h"
 #include "postcode_validation.h"
 #include "id_allocator.h"
 #include "parsed_data.h"
@@ -121,9 +122,9 @@ static uint8_t place_type_to_admin_override(uint8_t pt) {
 // territories as countries of their own.
 static uint16_t tiger_country(const std::string& state) {
     for (const char* territory : {"PR", "VI", "GU", "AS", "MP"}) {
-        if (state == territory) return static_cast<uint16_t>((territory[0] << 8) | territory[1]);
+        if (state == territory) return pack_country_code(territory[0], territory[1]);
     }
-    return static_cast<uint16_t>(('U' << 8) | 'S');
+    return pack_country_code('U', 'S');
 }
 
 static void load_tiger_data(ParsedData& data, const std::string& path) {
@@ -392,8 +393,8 @@ static void load_external_postcodes(ParsedData& data, const std::string& path) {
 
         // Validate against country pattern
         char cc_lower[3] = {
-            static_cast<char>(std::tolower(cc_str[0])),
-            static_cast<char>(std::tolower(cc_str[1])),
+            static_cast<char>(std::tolower(static_cast<unsigned char>(cc_str[0]))),
+            static_cast<char>(std::tolower(static_cast<unsigned char>(cc_str[1]))),
             0
         };
         if (!validate_postcode_for_country(cc_lower, postcode.c_str())) {
@@ -407,7 +408,8 @@ static void load_external_postcodes(ParsedData& data, const std::string& path) {
         // provides wins; OSM pairs win at write time, as Nominatim's
         // _update_from_external adds external postcodes only when OSM has
         // none.
-        uint16_t cc = static_cast<uint16_t>((std::toupper(cc_str[0]) << 8) | std::toupper(cc_str[1]));
+        uint16_t cc = pack_country_code(static_cast<char>(std::toupper(static_cast<unsigned char>(cc_str[0]))),
+                                        static_cast<char>(std::toupper(static_cast<unsigned char>(cc_str[1]))));
         uint64_t key = postcode_key(cc, data.string_pool.intern(postcode));
         if (data.postcode_accum.find(key) == data.postcode_accum.end()) {
             data.postcode_accum[key].add(lat, lng);
@@ -4918,7 +4920,7 @@ static int run(int argc, char* argv[]) {
                         poly.area = pp.area;
                         const char* cc = pp.country_code.empty() ? nullptr : pp.country_code.c_str();
                         poly.country_code = (cc && cc[0] && cc[1])
-                            ? static_cast<uint16_t>((cc[0] << 8) | cc[1]) : 0;
+                            ? pack_country_code(cc[0], cc[1]) : 0;
                         data.admin_polygons.push_back(poly);
                         // Strategy-2 stable identity, packed like addr/poi:
                         // top 8 bits = ObjectType, bottom 56 bits = the
