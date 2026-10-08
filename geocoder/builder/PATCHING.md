@@ -24,19 +24,21 @@ in sequence and arrive at output **byte-identical** to a fresh build.
 Compressed `.gcpatch` bytes a client downloads for one day of OSM edits, per
 selection (sum of its variant dirs). Every patch rebuilds the new day
 byte-identically, alone and stacked on the previous day's patch. "Before"
-is the v4 tools on the same data; v6 is GCPATCH v6 with the current builder
-(admin-minimal keeps stable slots, unshipped POI names stay out of the pool).
+is the v4 tools on the same data; v6 is GCPATCH v6 with the builder of that
+time (admin-minimal keeps stable slots, unshipped POI names stay out of the
+pool); v7 is GCPATCH v7 (every variant dir patches alone) with POI
+tombstones kept to the tiers that held the record.
 
-| Selection | Before | v5 | v6 |
-|-----------|--------|----|----|
-| planet full + q2.5 + poi/all | 173.5 MiB | 4.76 MiB | **4.52 MiB** |
-| planet full + uncapped + poi/all | 253.8 MiB | 5.56 MiB | **5.32 MiB** |
-| planet admin + q2.5 + poi/major | 65.6 MiB | 0.45 MiB | **0.45 MiB** |
-| planet admin-minimal | 48.2 MiB | 0.61 MiB | **0.14 MiB** |
-| europe full + q2.5 + poi/all | 74.5 MiB | 2.16 MiB | **2.05 MiB** |
-| europe admin + q2.5 + poi/major | 28.8 MiB | 0.15 MiB | **0.15 MiB** |
-| north-america no-addresses + q2.5 | 9.6 MiB | 0.47 MiB | **0.43 MiB** |
-| all 126 variant dirs (what CI uploads) | 1094 MiB | 20.9 MiB | **18.8 MiB** |
+| Selection | Before | v5 | v6 | v7 |
+|-----------|--------|----|----|----|
+| planet full + q2.5 + poi/all | 173.5 MiB | 4.76 MiB | 4.52 MiB | **4.49 MiB** |
+| planet full + uncapped + poi/all | 253.8 MiB | 5.56 MiB | 5.32 MiB | **5.28 MiB** |
+| planet admin + q2.5 + poi/major | 65.6 MiB | 0.45 MiB | 0.45 MiB | **0.35 MiB** |
+| planet admin-minimal | 48.2 MiB | 0.61 MiB | 0.14 MiB | **0.12 MiB** |
+| europe full + q2.5 + poi/all | 74.5 MiB | 2.16 MiB | 2.05 MiB | **2.04 MiB** |
+| europe admin + q2.5 + poi/major | 28.8 MiB | 0.15 MiB | 0.15 MiB | **0.13 MiB** |
+| north-america no-addresses + q2.5 | 9.6 MiB | 0.47 MiB | 0.43 MiB | **0.43 MiB** |
+| all 126 variant dirs (what CI uploads) | 1094 MiB | 20.9 MiB | 18.8 MiB | **18.3 MiB** |
 
 Most of the old bytes were bookkeeping the patcher can derive:
 - offset fixups travel as runs of one shift (one edit shifts every later
@@ -295,8 +297,8 @@ End marker: 0xFFFFFFFF (u32)
 |-----------|--------|--------|
 | Build (deterministic) | ~12 min | ~14 min |
 | Diff generation | **3m40s** | **15m22s** |
-| Patch application, 1 core, cold cache (`full`, one day) | **88s** | **230s** |
-| Patch peak anonymous memory | **3 MiB** | **10 MiB** |
+| Patch application, 1 core, cold cache (`full`, one day) | **81s** | **241s** |
+| Patch peak anonymous memory | **5 MiB** | **12 MiB** |
 | Patch memory limit tested (page cache included) | 1 GiB | 1 GiB |
 
 ## TODO (Priority Order)
