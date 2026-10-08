@@ -211,7 +211,12 @@ geocoder-patch <current-dir> <patch-file> -o <output-dir>
 ```
 
 The patch tool:
-- Reads old files via mmap (low memory)
-- Streams output to disk
-- Peak memory: ~250 MiB for planet-scale data
+- Reads old files via mmap and writes each new file in one streaming pass
+- Peak anonymous memory: about 10 MiB for `planet/full`; everything else is
+  reclaimable page cache
+- Runs on one core inside a 1 GiB memory limit (page cache included): one
+  day of `planet/full` takes about 4 minutes, `europe/full` about 1.5 minutes
+  on an SSD. On a slow disk it is disk-bound: it reads the old variant and
+  writes the new one, about twice the variant's size in IO
+- Needs free space for the new copy of the variant (it never patches in place)
 - Produces byte-identical output to a fresh build

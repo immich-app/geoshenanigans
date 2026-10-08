@@ -19,30 +19,32 @@ in sequence and arrive at output **byte-identical** to a fresh build.
 
 ## Tested Patch Sizes
 
-### One day on planet (2026-10-05 → 10-06, GCPATCH v5)
+### One day on planet (2026-10-05 → 10-06)
 
 Compressed `.gcpatch` bytes a client downloads for one day of OSM edits, per
 selection (sum of its variant dirs). Every patch rebuilds the new day
 byte-identically, alone and stacked on the previous day's patch. "Before"
-is the v4 tools on the same data.
+is the v4 tools on the same data; v6 is GCPATCH v6 with the current builder
+(admin-minimal keeps stable slots, unshipped POI names stay out of the pool).
 
-| Selection | Before | v5 |
-|-----------|--------|----|
-| planet full + q2.5 + poi/all | 173.5 MiB | **4.76 MiB** |
-| planet full + uncapped + poi/all | 253.8 MiB | **5.56 MiB** |
-| planet admin + q2.5 + poi/major | 65.6 MiB | **0.45 MiB** |
-| planet admin-minimal | 48.2 MiB | **0.61 MiB** |
-| europe full + q2.5 + poi/all | 74.5 MiB | **2.16 MiB** |
-| europe admin + q2.5 + poi/major | 28.8 MiB | **0.15 MiB** |
-| north-america no-addresses + q2.5 | 9.6 MiB | **0.47 MiB** |
-| all 126 variant dirs (what CI uploads) | 1094 MiB | **20.9 MiB** |
+| Selection | Before | v5 | v6 |
+|-----------|--------|----|----|
+| planet full + q2.5 + poi/all | 173.5 MiB | 4.76 MiB | **4.52 MiB** |
+| planet full + uncapped + poi/all | 253.8 MiB | 5.56 MiB | **5.32 MiB** |
+| planet admin + q2.5 + poi/major | 65.6 MiB | 0.45 MiB | **0.45 MiB** |
+| planet admin-minimal | 48.2 MiB | 0.61 MiB | **0.14 MiB** |
+| europe full + q2.5 + poi/all | 74.5 MiB | 2.16 MiB | **2.05 MiB** |
+| europe admin + q2.5 + poi/major | 28.8 MiB | 0.15 MiB | **0.15 MiB** |
+| north-america no-addresses + q2.5 | 9.6 MiB | 0.47 MiB | **0.43 MiB** |
+| all 126 variant dirs (what CI uploads) | 1094 MiB | 20.9 MiB | **18.8 MiB** |
 
 Most of the old bytes were bookkeeping the patcher can derive:
 - offset fixups travel as runs of one shift (one edit shifts every later
   node_offset / vertex_offset by the same amount)
 - place nodes and postal polygons merge instead of being re-sent whole
-- the postcode centroid cell index and the admin / POI / place corrections
-  travel as per-cell lost / gained ids
+- the postcode centroid cell index, the admin / POI / place corrections and
+  (v6) the street / addr / interp entry corrections travel as per-cell lost /
+  gained ids
 - a replaced record keeps its unchanged geometry, an edited one keeps its
   unchanged head and tail
 - far merge jumps need a run of matches behind them (duplicates no longer
@@ -253,9 +255,9 @@ End marker: 0xFFFFFFFF (u32)
 |-----------|--------|--------|
 | Build (deterministic) | ~12 min | ~14 min |
 | Diff generation | **3m40s** | **15m22s** |
-| Patch application | **33s** | **1m29s** |
-| Patch peak memory | **104 MiB** | **243 MiB** |
-| Patch min cgroup | ~200 MiB | **500 MiB** |
+| Patch application, 1 core, cold cache (`full`, one day) | **88s** | **230s** |
+| Patch peak anonymous memory | **3 MiB** | **10 MiB** |
+| Patch memory limit tested (page cache included) | 1 GiB | 1 GiB |
 
 ## TODO (Priority Order)
 
@@ -284,7 +286,7 @@ End marker: 0xFFFFFFFF (u32)
 
 ### Nice to Have (Performance)
 - **Parallel merge building** — Currently sequential across files
-- **Streaming patch application** — Currently loads entire decompressed patch into memory
+- ~~Streaming patch application~~ — **DONE** (the decompressed patch is mmapped from scratch; records, cell indexes, remaps and deltas stream)
 - **Code cleanup** — Remove legacy dead code block in geocoder_patch.cpp, prototype files
 
 ### Future Consideration (Format Changes)
