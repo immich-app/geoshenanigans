@@ -22,6 +22,7 @@
 #include <stdexcept>
 #include <string>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unordered_map>
 #include <unordered_set>
@@ -38,15 +39,51 @@ static double now_ms() {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
-static size_t get_rss_mb() {
-    FILE* f = fopen("/proc/self/statm", "r");
+// Anonymous resident memory (heap, buffers). Unlike statm's RSS it leaves
+// out the page cache of mapped old files, which the kernel reclaims freely.
+static size_t get_rss_anon_mb() {
+    FILE* f = fopen("/proc/self/status", "r");
     if (!f) return 0;
-    size_t dummy, rss; if (fscanf(f, "%zu %zu", &dummy, &rss) != 2) rss = 0; fclose(f);
-    return rss * 4096 / (1024*1024);
+    char line[128];
+    size_t kb = 0;
+    while (fgets(line, sizeof line, f))
+        if (sscanf(line, "RssAnon: %zu kB", &kb) == 1) break;
+    fclose(f);
+    return kb / 1024;
 }
+// Page faults and storage reads so far. A read taken inside a page fault
+// counts in majflt, a pread only in read_bytes, so a phase needs both to
+// show where its old-file I/O went.
+struct IoCounters { uint64_t majflt = 0, minflt = 0, read_bytes = 0; };
+static IoCounters get_io_counters() {
+    IoCounters c;
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) == 0) { c.majflt = ru.ru_majflt; c.minflt = ru.ru_minflt; }
+    if (FILE* f = fopen("/proc/self/io", "r")) {
+        char line[128];
+        unsigned long long v;
+        while (fgets(line, sizeof line, f))
+            if (sscanf(line, "read_bytes: %llu", &v) == 1) { c.read_bytes = v; break; }
+        fclose(f);
+    }
+    return c;
+}
+// "maj 12, min 3400, read 1.5 MiB" between two snapshots.
+static std::string io_delta(const IoCounters& from, const IoCounters& to) {
+    char s[96];
+    snprintf(s, sizeof s, "maj %llu, min %llu, read %.1f MiB",
+             (unsigned long long)(to.majflt - from.majflt), (unsigned long long)(to.minflt - from.minflt),
+             (to.read_bytes - from.read_bytes) / 1048576.0);
+    return s;
+}
+// Elapsed time, anonymous RSS, and the faults and reads since the previous
+// phase line.
 static void log_phase(const char* label, double start) {
+    static IoCounters last;
+    IoCounters now = get_io_counters();
     std::cerr << "  [" << std::fixed << std::setprecision(1) << (now_ms() - start) / 1000.0
-              << "s, " << get_rss_mb() << " MiB] " << label << std::endl;
+              << "s, " << get_rss_anon_mb() << " MiB anon, " << io_delta(last, now) << "] " << label << std::endl;
+    last = now;
 }
 
 // MappedFile + mmap_file + unmap_file are now in patch_format.h
@@ -428,6 +465,8 @@ static int run(int argc, char* argv[]) {
         }
 
         // --- Merge sequence replay (streaming) ---
+        const IoCounters section_start = get_io_counters();
+        auto section_io = [&] { return " [" + io_delta(section_start, get_io_counters()) + "]"; };
         uint32_t stride = ru32();
         uint64_t old_size = ru64(), new_size = ru64();
         if (file_id >= (uint32_t)PatchFileId::COUNT) { std::cerr << "Unknown file " << file_id << std::endl; return 1; }
@@ -466,7 +505,7 @@ static int run(int argc, char* argv[]) {
                 written += fwrite(cbuf.data(), 1, r, out);
             fclose(in); fclose(out);
             std::cerr << "  " << fname << ": unchanged (copied " << written
-                      << " bytes from old)" << std::endl;
+                      << " bytes from old)" << section_io() << std::endl;
             continue;
         }
         if (stride == LEGACY_SKIP_STRIDE) { uint32_t nf = ru32(); (void)nf; take(ru64(), "skipped section"); continue; }
@@ -499,7 +538,7 @@ static int run(int argc, char* argv[]) {
             if (cells_written != new_size || entries_written != new_entries_size)
                 throw std::runtime_error("Rebuilt " + cells_name + " does not match the new build");
             std::cerr << "  " << cells_name << " + " << entries_name << ": cell list delta, "
-                      << cells_written / 12 << " cells" << std::endl;
+                      << cells_written / 12 << " cells" << section_io() << std::endl;
             continue;
         }
         if (stride == SPARSE_DELTA_STRIDE) {
@@ -567,7 +606,7 @@ static int run(int argc, char* argv[]) {
             if (!ok) throw std::runtime_error(std::string("Cannot write ") + fname);
 
             std::cerr << "  " << fname << ": sparse delta " << n_changes
-                      << " changes (" << new_size << " bytes)" << std::endl;
+                      << " changes (" << new_size << " bytes)" << section_io() << std::endl;
             continue;
         }
 
@@ -772,9 +811,10 @@ static int run(int argc, char* argv[]) {
 
         if (track) {
             record_remaps[file_id] = std::move(remap);
-            std::cerr << "  " << fname << ": " << written << " bytes (remap of " << n_old_records << " records)" << std::endl;
+            std::cerr << "  " << fname << ": " << written << " bytes (remap of " << n_old_records << " records)"
+                      << section_io() << std::endl;
         } else {
-            std::cerr << "  " << fname << ": " << written << " bytes" << std::endl;
+            std::cerr << "  " << fname << ": " << written << " bytes" << section_io() << std::endl;
         }
         // Release patch pages used by this section
         madvise(const_cast<char*>(patch_map.data), pos, MADV_DONTNEED);
@@ -940,7 +980,7 @@ static int run(int argc, char* argv[]) {
 
             if (cells_written % 10000000 == 0 && cells_written > 0) {
                 std::cerr << "    " << cells_written << " cells, se=" << o_se.written/1024/1024
-                          << "M ae=" << o_ae.written/1024/1024 << "M rss=" << get_rss_mb() << "M" << std::endl;
+                          << "M ae=" << o_ae.written/1024/1024 << "M anon=" << get_rss_anon_mb() << "M" << std::endl;
             }
         }
 
