@@ -345,18 +345,9 @@ End marker: 0xFFFFFFFF (u32)
 - `tools/geocoder_diff.cpp` — Diff tool
 - `tools/geocoder_patch.cpp` — Patch tool
 - `tools/patch_format.h` — Shared format definitions + rebuild functions
-- `tools/geocoder_canonicalize.cpp` — Standalone canonicalize (testing tool)
+- `tools/merge_sequence.h` — Positional merge of record files
+- `tools/sequential_file_reader.h` — The patcher's forward reads of old files (pread)
+- `tools/generate_patches.sh` — CI: diff, isolated apply and verify for every variant
+- `tools/link_client_files.sh` — An isolated copy of a variant dir (its client files only)
+- `tools/verify_patch.sh` — Whole client file set comparison
 - `CMakeLists.txt` — Build targets
-
-### Test data on Node 3 (/home/michtest/)
-- `planet-A/` — Built from planet-260309 (Mar 9), 17 GiB
-- `planet-B/` — Built from planet-260316 (Mar 16), 17 GiB
-- `planet-C/` — Built from planet-260323 (Mar 23), 17 GiB
-- `det-A/` — Europe built from Mar 21 PBF, 7 GiB
-- `det-today/` — Europe built from Mar 27 PBF, 7 GiB
-
-### Validated patches (saved for regression testing)
-- `validated-patches/europe-mar21-to-mar27-v2.gcpatch` — 32 MiB, all 14 MATCH
-- `validated-patches/planet-mar09-to-mar16-v2.gcpatch` — 74 MiB, all 14 MATCH
-- `validated-patches/planet-mar16-to-mar23-v2.gcpatch` — 73 MiB, all 14 MATCH
-- Sequential test validated: A + patch_AB → B (MATCH), patched-B + patch_BC → C (MATCH)
