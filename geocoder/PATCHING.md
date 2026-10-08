@@ -7,16 +7,19 @@ builds/
   latest.json                              # entry point for all clients
   2026-04-07/
     configurations.json                    # build metadata + axes/components/files + sha256s
+    checksums.sha256                       # on-wire hashes (*.zst, *.gcpatch, *.json)
     planet/
-      full/            *.bin + patch.gcpatch
-      no-addresses/    *.bin + patch.gcpatch
-      admin/           *.bin + patch.gcpatch
+      full/            *.bin.zst + strings_layout.json(.zst) + patch.gcpatch
+      no-addresses/    ...
+      admin/           ...
+      admin-minimal/   ...
       quality/
-        uncapped/      admin_polygons.bin + admin_vertices.bin + patch.gcpatch
-        q0.5/          admin_polygons.bin + admin_vertices.bin + patch.gcpatch
-        q1/            ...
+        uncapped/      admin_polygons.bin.zst + admin_vertices.bin.zst (+ postal_*.bin.zst) + patch.gcpatch
+        q0.2/          ...
+        q0.5/ … q2.5/  ...
       poi/
-        major/         poi_records.bin + poi_vertices.bin + poi_cells.bin + poi_entries.bin + patch.gcpatch
+        major/         poi_*.bin.zst + strings_poi.bin.zst + strings_layout.json(.zst)
+                       + poi_meta.json(.zst) + patch.gcpatch
         notable/       ...
         all/           ...
     europe/
@@ -36,20 +39,25 @@ A complete geocoder index for a given region and configuration consists of files
 
 | Mode | Files | Description |
 |------|-------|-------------|
-| `full/` | 12 files | Streets + addresses + admin cell indexes |
-| `no-addresses/` | 7 files | Streets + admin cell indexes (no address points) |
-| `admin/` | 3 files | Admin cell indexes + strings only |
+| `full/` | 24 files (+4 optional) | Streets + addresses + interpolation + admin + postcodes |
+| `no-addresses/` | 16 files (+3 optional) | Streets + admin + postcodes (no address points) |
+| `admin/` | 8 files (+3 optional) | Admin cell indexes + place nodes + postcodes |
+| `admin-minimal/` | 9 files | Admin levels 2-8 + place nodes, with its own q2.5 polygons (takes the place of the quality dir, so pick q2.5) |
+
+Optional files are written only when the data has them; see `optional_files`
+under configurations.json below.
 
 ### Quality directory (pick one)
 
 | Quality | Files | Description |
 |---------|-------|-------------|
-| `quality/uncapped/` | 2 files | Full-resolution admin boundaries |
-| `quality/q0.5/` | 2 files | Admin boundaries simplified at 0.5x |
-| `quality/q1/` | 2 files | Admin boundaries simplified at 1x |
-| `quality/q1.5/` | 2 files | Admin boundaries simplified at 1.5x |
-| `quality/q2/` | 2 files | Admin boundaries simplified at 2x |
-| `quality/q2.5/` | 2 files | Admin boundaries simplified at 2.5x |
+| `quality/uncapped/` | 2 files (+2 optional) | Full-resolution admin boundaries |
+| `quality/q0.2/` | 2 files (+2 optional) | Admin boundaries simplified at 0.2x |
+| `quality/q0.5/` | 2 files (+2 optional) | Admin boundaries simplified at 0.5x |
+| `quality/q1/` | 2 files (+2 optional) | Admin boundaries simplified at 1x |
+| `quality/q1.5/` | 2 files (+2 optional) | Admin boundaries simplified at 1.5x |
+| `quality/q2/` | 2 files (+2 optional) | Admin boundaries simplified at 2x |
+| `quality/q2.5/` | 2 files (+2 optional) | Admin boundaries simplified at 2.5x |
 
 Higher quality numbers = more simplification = smaller files = less accurate boundaries.
 
@@ -136,10 +144,14 @@ the `.bin` files, because the server can't load a region without them.
 2. Choose a date >= oldest_indexes (typically use latest)
 3. GET builds/{date}/configurations.json
 4. Choose region (e.g. europe), mode (e.g. full), quality (e.g. q1), and POI tier (e.g. notable)
-5. Download:
-   - builds/{date}/europe/full/*.bin             (12 files)
-   - builds/{date}/europe/quality/q1/*.bin       (2 files)
-   - builds/{date}/europe/poi/notable/*.bin      (4 files, optional)
+5. Download every file the selected components list (their `files`, the
+   `optional_files` that appear in `files`, minus any `replaces`), each as
+   <path>.zst, decompress, and check it against its sha256:
+   - builds/{date}/europe/full/…          (24 files + up to 4 optional)
+   - builds/{date}/europe/quality/q1/…    (2 files + up to 2 optional)
+   - builds/{date}/europe/poi/notable/…   (7 files, optional)
+   The JSON files (strings_layout.json, poi_meta.json) are part of the set:
+   the server can't load a region without them.
 6. Store build_version, patch_version, and date locally
 ```
 
