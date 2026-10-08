@@ -14,7 +14,8 @@ void resolve_interpolation_endpoints(ParsedData& data) {
     };
     struct CoordHash {
         size_t operator()(const CoordKey& k) const {
-            return std::hash<int64_t>()(((int64_t)k.lat << 32) | (uint32_t)k.lng);
+            // Shift the unsigned bit pattern: a negative int64 left shift is UB.
+            return std::hash<int64_t>()(int64_t((uint64_t(uint32_t(k.lat)) << 32) | uint32_t(k.lng)));
         }
     };
 

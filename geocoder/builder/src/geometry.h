@@ -15,7 +15,8 @@
 inline int64_t coord_key(double lat, double lng) {
     int32_t ilat = static_cast<int32_t>(lat * 1e7 + (lat >= 0 ? 0.5 : -0.5));
     int32_t ilng = static_cast<int32_t>(lng * 1e7 + (lng >= 0 ? 0.5 : -0.5));
-    return (static_cast<int64_t>(ilat) << 32) | static_cast<uint32_t>(ilng);
+    // Shift the unsigned bit pattern: a negative int64 left shift is UB.
+    return static_cast<int64_t>((uint64_t(static_cast<uint32_t>(ilat)) << 32) | static_cast<uint32_t>(ilng));
 }
 
 // Approximate polygon area in square degrees (shoelace formula)

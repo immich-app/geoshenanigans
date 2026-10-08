@@ -31,6 +31,13 @@ TEST(geometry_coord_key_deterministic) {
     CHECK_EQ(coord_key(0.0, 0.0), int64_t(0));
 }
 
+TEST(geometry_coord_key_packs_negative_coordinates) {
+    // Two's-complement halves, lat high: one nanodegree below zero is all ones.
+    CHECK_EQ(coord_key(-1e-7, -1e-7), int64_t(-1));
+    CHECK_EQ(coord_key(-1e-7, 1e-7), int64_t(-4294967295));       // 0xFFFFFFFF'00000001
+    CHECK_EQ(coord_key(1e-7, -1e-7), int64_t(0x1FFFFFFFFLL));      // 0x00000001'FFFFFFFF
+}
+
 TEST(geometry_coord_key_distinct_coords_differ) {
     // Points separated by more than one nanodegree grid step get distinct keys.
     int64_t a = coord_key(10.0, 20.0);
