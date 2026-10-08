@@ -26,6 +26,11 @@ TEST(string_home_tier_picks_the_most_widely_downloaded_consumer_tier) {
         {STR_TIER_BIT_POI | STR_TIER_BIT_POSTCODE, 0},
         {STR_TIER_BIT_POI | STR_TIER_BIT_CORE, 0},
         {STR_TIER_BIT_CORE | STR_TIER_BIT_STREET | STR_TIER_BIT_ADDR, 0},
+        // Strings only POI candidates no tier ships use aren't written;
+        // shared with a shipped consumer, they live where that one needs.
+        {STR_TIER_BIT_UNSHIPPED, STR_TIER_NONE},
+        {STR_TIER_BIT_UNSHIPPED | STR_TIER_BIT_STREET, 1},
+        {STR_TIER_BIT_UNSHIPPED | STR_TIER_BIT_POI, 4},
     };
     for (const auto& c : cases) CHECK_EQ(string_home_tier(c.mask), c.tier);
 }

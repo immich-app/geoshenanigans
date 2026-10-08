@@ -371,6 +371,10 @@ enum class PoiCategory : uint8_t {
     UNKNOWN = 255
 };
 
+// Highest POI tier a poi/<tier> dir ships (poi/all); tier 4 (generic rank-30
+// features) stays in the build only.
+constexpr uint8_t POI_MAX_SHIPPED_TIER = 3;
+
 // POI tier: 1=major, 2=notable, 3=everything. Returns 0 for unknown categories.
 inline uint8_t poi_get_default_tier(PoiCategory cat) {
     switch (cat) {

@@ -1987,7 +1987,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             PoiTierVariant poi_tiers[] = {
                 {"poi/major",   1},
                 {"poi/notable", 2},
-                {"poi/all",     3},
+                {"poi/all",     POI_MAX_SHIPPED_TIER},
             };
 
             // Canonical FULL-set POI sidecar that apply_strategy2_pois
