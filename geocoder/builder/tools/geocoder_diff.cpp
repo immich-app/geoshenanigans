@@ -1790,8 +1790,7 @@ static int run(int argc, char* argv[]) {
                 bool differs = (d_ids.size() != n_ids.size()) ||
                     (!d_ids.empty() && memcmp(d_ids.data(), n_ids.data(), d_ids.size() * 4) != 0);
                 if (differs) {
-                    wval(buf, &eff_old, 8); uint16_t c = n_ids.size(); wval(buf, &c, 2);
-                    if (!n_ids.empty()) buf.insert(buf.end(), (const char*)n_ids.data(), (const char*)n_ids.data() + n_ids.size() * 4);
+                    append_geo_list_delta(buf, eff_old, d_ids, n_ids);
                     dc++;
                 }
                 ni++;
@@ -1807,7 +1806,7 @@ static int run(int argc, char* argv[]) {
                     added_i++;
                 }
                 if (!d_ids.empty()) {
-                    wval(buf, &eff_old, 8); uint16_t c = 0; wval(buf, &c, 2);
+                    append_geo_list_delta(buf, eff_old, d_ids, {});
                     dc++;
                 }
             } else {
@@ -1815,14 +1814,13 @@ static int run(int argc, char* argv[]) {
                 uint32_t n_off; memcpy(&n_off, new_geo_m.data + ni * 20 + geo_off_pos, 4);
                 auto n_ids = parse_ids(new_entries.data, new_entries.size, n_off);
                 if (!n_ids.empty()) {
-                    wval(buf, &n_cid, 8); uint16_t c = n_ids.size(); wval(buf, &c, 2);
-                    buf.insert(buf.end(), (const char*)n_ids.data(), (const char*)n_ids.data() + n_ids.size() * 4);
+                    append_geo_list_delta(buf, n_cid, {}, n_ids);
                     dc++;
                 }
                 ni++;
             }
         }
-        uint32_t marker = ENTRY_CORRECTION_MARKER, file = static_cast<uint32_t>(fid);
+        uint32_t marker = GEO_ENTRY_DELTA_MARKER, file = static_cast<uint32_t>(fid);
         memcpy(buf.data(), &marker, 4); memcpy(buf.data() + 4, &file, 4); memcpy(buf.data() + 8, &dc, 4);
         std::cerr << "  " << fname << ": " << dc << " cell corrections (" << buf.size() - 12 << " bytes)" << std::endl;
         return buf;

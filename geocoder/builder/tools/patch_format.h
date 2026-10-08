@@ -200,12 +200,13 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // client files (CLIENT_FILES_MARKER) right after the header, carries its JSON
 // files verbatim, and records the string tiers it was diffed against; the
 // patcher reproduces exactly that file set. v5 carries offset fixups as runs
-// of one shift (OffsetFixups). Version-gated so older appliers reject the
-// whole patch upfront ("Bad version").
-static constexpr uint32_t GCPATCH_VERSION = 5;
-// v4 patches list their offset fixups one by one, which a v5 patcher no
+// of one shift (OffsetFixups). v6 corrects street / addr / interp lists per
+// cell (GEO_ENTRY_DELTA_MARKER) and drops cell flags. Version-gated so older
+// appliers reject the whole patch upfront ("Bad version").
+static constexpr uint32_t GCPATCH_VERSION = 6;
+// v5 patches carry geo corrections as full lists, which a v6 patcher no
 // longer reads.
-static constexpr uint32_t GCPATCH_MIN_READ_VERSION = 5;
+static constexpr uint32_t GCPATCH_MIN_READ_VERSION = 6;
 
 enum class PatchFileId : uint32_t {
     STRINGS = 0,
@@ -316,11 +317,21 @@ static constexpr uint32_t ENTRY_CORRECTION_MARKER = 0xFFFFFFF8;
 //   append_cell_list_delta(rebuilt → new) bytes.
 static constexpr uint32_t CELL_INDEX_DELTA_MARKER = 0xFFFFFFF7;
 
+// Geo entry delta marker: 0xFFFFFFF0
+// The street / addr / interp lists the patcher derives from the old index
+// and the record remaps, corrected per cell (v6; full new lists before).
+// Format: marker(4), file_id(4), count(4), then per cell, in cell order:
+//   cell_id(u64), n_lost(u16), n_gained(u16), lost ids, gained ids.
+// n_lost == GEO_LIST_REPLACE: the gained ids are the cell's whole new list
+// (a list that isn't sorted, or a delta that wouldn't fit).
+static constexpr uint32_t GEO_ENTRY_DELTA_MARKER = 0xFFFFFFF0;
+static constexpr uint16_t GEO_LIST_REPLACE = 0xFFFF;
+
 // Cell flag corrections marker: 0xFFFFFFF9
 // Format: marker, count(u32), [(cell_id:u64, flags:u8)] × count
 // flags: bit 0 = has_street, bit 1 = has_addr, bit 2 = has_interp
-// No longer emitted (entry corrections already decide every flipped cell);
-// the patcher still accepts it from older v5 patches.
+// Retired in v6 (entry corrections already decide every flipped cell);
+// the value stays reserved.
 static constexpr uint32_t CELL_FLAGS_MARKER = 0xFFFFFFF9;
 
 // Secondary ID remap marker: 0xFFFFFFF6
@@ -981,6 +992,68 @@ uint64_t stream_cell_list_delta(const char* cells, size_t cells_size, const char
                                 const char* delta, size_t delta_size, OutCells out_cells, OutEntries out_entries) {
     return stream_cell_index(cells, cells_size, entries, entries_size, {}, {}, [](uint32_t id) { return id; },
                              delta, delta_size, out_cells, out_entries);
+}
+
+// --- Geo entry list deltas (GEO_ENTRY_DELTA_MARKER) ---
+
+// Appends one cell's correction: the ids `derived` (sorted) lost and the
+// ids it gained to become `target`, or `target` whole when it isn't sorted or
+// the delta wouldn't fit in u16 counts. A delta even where the whole list is
+// shorter compresses better on the planet (repeated ids, small values).
+inline void append_geo_list_delta(std::vector<char>& out, uint64_t cell_id,
+                                  const std::vector<uint32_t>& derived, const std::vector<uint32_t>& target) {
+    auto put = [&](const void* p, size_t n) { out.insert(out.end(), (const char*)p, (const char*)p + n); };
+    std::vector<uint32_t> lost, gained;
+    bool delta = std::is_sorted(target.begin(), target.end());
+    if (delta) {
+        std::set_difference(derived.begin(), derived.end(), target.begin(), target.end(), std::back_inserter(lost));
+        std::set_difference(target.begin(), target.end(), derived.begin(), derived.end(), std::back_inserter(gained));
+        delta = lost.size() < GEO_LIST_REPLACE && gained.size() <= 0xFFFF;
+    }
+    if (!delta) { lost.clear(); gained = target; }
+    uint16_t nl = delta ? static_cast<uint16_t>(lost.size()) : GEO_LIST_REPLACE;
+    uint16_t ng = static_cast<uint16_t>(gained.size());
+    put(&cell_id, 8); put(&nl, 2); put(&ng, 2);
+    put(lost.data(), lost.size() * 4);
+    put(gained.data(), gained.size() * 4);
+}
+
+// One parsed cell correction; apply() turns the derived list into the new one.
+struct GeoListDelta {
+    uint64_t cell_id;
+    bool replace;
+    std::vector<uint32_t> lost, gained;
+    void apply(std::vector<uint32_t>& ids, std::vector<uint32_t>& scratch) const {
+        if (replace) { ids = gained; return; }
+        scratch.clear();
+        std::set_difference(ids.begin(), ids.end(), lost.begin(), lost.end(), std::back_inserter(scratch));
+        ids.clear();
+        std::merge(scratch.begin(), scratch.end(), gained.begin(), gained.end(), std::back_inserter(ids));
+    }
+};
+
+// Parses `count` cell corrections from data[pos, size); throws when short.
+inline std::vector<GeoListDelta> parse_geo_list_deltas(const char* data, size_t size, size_t& pos, uint32_t count) {
+    auto take = [&](void* dst, size_t n) {
+        if (size - pos < n) throw std::runtime_error("Malformed geo entry delta");
+        memcpy(dst, data + pos, n);
+        pos += n;
+    };
+    std::vector<GeoListDelta> out;
+    out.reserve(count);
+    for (uint32_t i = 0; i < count; i++) {
+        GeoListDelta d;
+        uint16_t nl, ng;
+        take(&d.cell_id, 8); take(&nl, 2); take(&ng, 2);
+        d.replace = nl == GEO_LIST_REPLACE;
+        if (d.replace) nl = 0;
+        if (!out.empty() && d.cell_id <= out.back().cell_id) throw std::runtime_error("Malformed geo entry delta");
+        d.lost.resize(nl); d.gained.resize(ng);
+        take(d.lost.data(), (size_t)nl * 4);
+        take(d.gained.data(), (size_t)ng * 4);
+        out.push_back(std::move(d));
+    }
+    return out;
 }
 
 // --- Record id remap (patcher) ---

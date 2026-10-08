@@ -293,7 +293,8 @@ static int run(int argc, char* argv[]) {
     // Old → new record ids of the replayed files the entry pipeline remaps by.
     std::unordered_map<uint32_t, RecordRemap> record_remaps;
     std::vector<uint64_t> geo_added, geo_removed, admin_added, admin_removed, poi_added, poi_removed, place_added, place_removed;
-    std::unordered_map<uint64_t, uint8_t> flag_corrections;
+    // Street / addr / interp per-cell corrections by entries file id.
+    std::unordered_map<uint32_t, std::vector<GeoListDelta>> geo_deltas;
     struct CellCorr { uint64_t cell_id; std::vector<uint32_t> ids; };
     std::unordered_map<uint32_t, std::vector<CellCorr>> entry_corrections;
     // CELL_INDEX_DELTA payloads by entries file id (admin / POI / place).
@@ -354,10 +355,10 @@ static int run(int argc, char* argv[]) {
             std::cerr << "  Place cells: +" << na << " -" << nr << std::endl;
             continue;
         }
-        if (file_id == CELL_FLAGS_MARKER) {
-            uint32_t c = ru32();
-            for (uint32_t i = 0; i < c; i++) { uint64_t cid; memcpy(&cid, take(8, "cell id"), 8); flag_corrections[cid] = static_cast<uint8_t>(*take(1, "cell flags")); }
-            std::cerr << "  Flag corrections: " << c << std::endl;
+        if (file_id == GEO_ENTRY_DELTA_MARKER) {
+            uint32_t fid = ru32(), c = ru32();
+            geo_deltas[fid] = parse_geo_list_deltas(P, patch_size, pos, c);
+            std::cerr << "  Geo entry deltas " << fid << ": " << c << " cells" << std::endl;
             continue;
         }
         if (file_id == SECONDARY_REMAP_MARKER) {
@@ -826,27 +827,24 @@ static int run(int argc, char* argv[]) {
             while (removed_i < geo_removed.size() && geo_removed[removed_i] < cid) removed_i++;
             return removed_i < geo_removed.size() && geo_removed[removed_i] == cid;
         };
-        struct CorrEntry { uint64_t cid; const std::vector<uint32_t>* ids; };
-        std::vector<CorrEntry> cs, ca, ci_map;
-        for (auto& [fid, list] : entry_corrections) {
-            auto* v = (fid == (uint32_t)PatchFileId::STREET_ENTRIES) ? &cs :
-                      (fid == (uint32_t)PatchFileId::ADDR_ENTRIES) ? &ca :
-                      (fid == (uint32_t)PatchFileId::INTERP_ENTRIES) ? &ci_map : nullptr;
-            if (v) for (auto& c : list) v->push_back({c.cell_id, &c.ids});
-        }
-        auto corr_cmp = [](const CorrEntry& a, const CorrEntry& b) { return a.cid < b.cid; };
-        std::sort(cs.begin(), cs.end(), corr_cmp);
-        std::sort(ca.begin(), ca.end(), corr_cmp);
-        std::sort(ci_map.begin(), ci_map.end(), corr_cmp);
-        struct CorrCursor {
-            const std::vector<CorrEntry>& v;
+        // The diff's per-cell corrections (sorted by cell id when parsed).
+        struct DeltaCursor {
+            const std::vector<GeoListDelta>& v;
             size_t i = 0;
-            const std::vector<uint32_t>* at(uint64_t cid) {
-                while (i < v.size() && v[i].cid < cid) i++;
-                return i < v.size() && v[i].cid == cid ? v[i].ids : nullptr;
+            const GeoListDelta* at(uint64_t cid) {
+                while (i < v.size() && v[i].cell_id < cid) i++;
+                return i < v.size() && v[i].cell_id == cid ? &v[i] : nullptr;
             }
         };
-        CorrCursor cur_s{cs}, cur_a{ca}, cur_i{ci_map};
+        const std::vector<GeoListDelta> no_deltas;
+        auto deltas_of = [&](PatchFileId fid) -> const std::vector<GeoListDelta>& {
+            auto it = geo_deltas.find((uint32_t)fid);
+            return it != geo_deltas.end() ? it->second : no_deltas;
+        };
+        DeltaCursor cur_s{deltas_of(PatchFileId::STREET_ENTRIES)};
+        DeltaCursor cur_a{deltas_of(PatchFileId::ADDR_ENTRIES)};
+        DeltaCursor cur_i{deltas_of(PatchFileId::INTERP_ENTRIES)};
+        std::vector<uint32_t> scratch;
         // Added cells sorted
         std::sort(geo_added.begin(), geo_added.end());
         log_phase("  Setup", t_entry);
@@ -899,40 +897,28 @@ static int run(int argc, char* argv[]) {
         constexpr size_t ADDED = SIZE_MAX;
         auto process_cell = [&](uint64_t cid, size_t oi) {
             // For each entry type: check correction → remap old → write
+            // The derived list (old list, ids remapped), then this cell's
+            // correction from the diff, if it sent one.
             auto do_entry = [&](const MappedFile& old_e, size_t geo_off, const RecordRemap& rm,
-                                CorrCursor& corr,
-                                EntriesOut& outf, uint8_t flag_bit) -> uint32_t {
-                // Check flag
-                bool has = false;
-                if (oi != ADDED && oi * 20 + geo_off + 4 <= m_geo.size) {
+                                DeltaCursor& deltas, EntriesOut& outf) -> uint32_t {
+                buf.clear();
+                if (oi != ADDED) {
+                    if (oi * 20 + geo_off + 4 > m_geo.size) {
+                        std::cerr << "OOB: oi=" << oi << " geo_off=" << geo_off << " m_geo.size=" << m_geo.size << std::endl;
+                        return NO;
+                    }
                     uint32_t off; memcpy(&off, m_geo.data + oi * 20 + geo_off, 4);
-                    has = (off != NO);
-                } else if (oi != ADDED) {
-                    std::cerr << "OOB: oi=" << oi << " geo_off=" << geo_off << " m_geo.size=" << m_geo.size << std::endl;
-                    return NO;
+                    parse(old_e, off);
+                    if (!buf.empty()) remap(buf, rm);
                 }
-                if (!flag_corrections.empty()) {  // only older v5 patches carry flags
-                    auto fc = flag_corrections.find(cid);
-                    if (fc != flag_corrections.end()) has = (fc->second & flag_bit) != 0;
-                }
-                auto* corr_ids = corr.at(cid);
-                if (corr_ids) has = true;
-                if (!has) return NO;
-
-                if (corr_ids) return emit(outf, corr_ids->data(), corr_ids->size());
-
-                if (oi == ADDED) return NO;
-                if (oi * 20 + geo_off + 4 > m_geo.size) return NO;
-                uint32_t off; memcpy(&off, m_geo.data + oi * 20 + geo_off, 4);
-                parse(old_e, off);
+                if (const GeoListDelta* d = deltas.at(cid)) d->apply(buf, scratch);
                 if (buf.empty()) return NO;
-                remap(buf, rm);
                 return emit(outf, buf.data(), buf.size());
             };
 
-            uint32_t so = do_entry(m_se, 8, w_rm, cur_s, o_se, 1);
-            uint32_t ao = do_entry(m_ae, 12, a_rm, cur_a, o_ae, 2);
-            uint32_t io = do_entry(m_ie, 16, i_rm, cur_i, o_ie, 4);
+            uint32_t so = do_entry(m_se, 8, w_rm, cur_s, o_se);
+            uint32_t ao = do_entry(m_ae, 12, a_rm, cur_a, o_ae);
+            uint32_t io = do_entry(m_ie, 16, i_rm, cur_i, o_ie);
             fwrite(&cid, 8, 1, f_geo); fwrite(&so, 4, 1, f_geo); fwrite(&ao, 4, 1, f_geo); fwrite(&io, 4, 1, f_geo);
             cells_written++;
         };

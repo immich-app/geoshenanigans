@@ -176,14 +176,14 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
 
 **Status**: Fixed by adding explicit padding fields to `AdminPolygon` and `InterpWay` structs.
 
-## Patch Format (.gcpatch, version 5)
+## Patch Format (.gcpatch, version 6)
 
 Whole file is zstd-compressed for transport. Internal structure (all integers
 little-endian; the header, client files and strings sections are read by
 position, everything after them by marker):
 
 ```
-Header: "GCPATCH\0" (8) + version=5 (u32) + flags=0 (u32)
+Header: "GCPATCH\0" (8) + version=6 (u32) + flags=0 (u32)
 
 Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
   + n × {name_len:u16, name, size:u64, inline:u8, [bytes] if inline}
@@ -229,11 +229,12 @@ Secondary ID Remap: marker 0xFFFFFFF6 (u32) + n_files (u32)
   per file: file_id (u32) + n_pairs (u32) + [(old_id:u32, new_id:u32)] × n_pairs
   Recovers old→new mappings for modified records (matched by relaxed key)
 
-Cell Flag Corrections: marker 0xFFFFFFF9 (u32) + count (u32)
-  + [(cell_id:u64, flags:u8)] × count
-  flags: bit0=has_street, bit1=has_addr, bit2=has_interp
-  (no longer emitted: entry corrections already cover every flipped cell;
-  still accepted)
+Geo Entry Deltas (street / addr / interp entries): marker 0xFFFFFFF0 (u32)
+  + file_id (u32) + count (u32), then per cell in cell order:
+  cell_id (u64) + n_lost (u16) + n_gained (u16) + [id:u32] × n_lost
+  + [id:u32] × n_gained, turning the list the patcher derives (old list,
+  ids remapped) into the new one. n_lost 0xFFFF: the gained ids are the
+  whole new list.
 
 Entry Corrections: marker 0xFFFFFFF8 (u32) + file_id (u32) + count (u32)
   + [(cell_id:u64, entry_count:u16, [id:u32] × entry_count)] × count

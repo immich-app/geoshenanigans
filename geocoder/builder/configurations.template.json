@@ -2,7 +2,7 @@
   "schema_version": 1,
   "build": {
     "version": 17,
-    "patch_version": 5
+    "patch_version": 6
   },
   "axes": {
     "region": {

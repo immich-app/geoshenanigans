@@ -11,6 +11,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -180,6 +181,7 @@ TEST(patch_format_section_markers_distinct) {
         CELL_CHANGES_POI_MARKER,      // 0xFFFFFFF5
         CELL_CHANGES_PLACE_MARKER,    // 0xFFFFFFF4
         ENTRY_CORRECTION_MARKER,      // 0xFFFFFFF8
+        GEO_ENTRY_DELTA_MARKER,       // 0xFFFFFFF0
         CELL_INDEX_DELTA_MARKER,      // 0xFFFFFFF7
         CELL_FLAGS_MARKER,            // 0xFFFFFFF9
         SECONDARY_REMAP_MARKER,       // 0xFFFFFFF6
@@ -200,6 +202,7 @@ TEST(patch_format_section_marker_values) {
     CHECK_EQ(CELL_CHANGES_POI_MARKER, uint32_t(0xFFFFFFF5));
     CHECK_EQ(CELL_CHANGES_PLACE_MARKER, uint32_t(0xFFFFFFF4));
     CHECK_EQ(ENTRY_CORRECTION_MARKER, uint32_t(0xFFFFFFF8));
+    CHECK_EQ(GEO_ENTRY_DELTA_MARKER, uint32_t(0xFFFFFFF0));
     CHECK_EQ(CELL_INDEX_DELTA_MARKER, uint32_t(0xFFFFFFF7));
     CHECK_EQ(CELL_FLAGS_MARKER, uint32_t(0xFFFFFFF9));
     CHECK_EQ(SECONDARY_REMAP_MARKER, uint32_t(0xFFFFFFF6));
@@ -211,10 +214,10 @@ TEST(patch_format_section_marker_values) {
 
 TEST(patch_format_magic_and_version) {
     // GCPATCH_VERSION is bound to the value actually emitted/checked by the
-    // diff/patch tools. v5 = offset fixups as shift runs; v4 listed them one
-    // by one, so v4 patches are unreadable (MIN_READ_VERSION).
-    CHECK_EQ(GCPATCH_VERSION, uint32_t(5));
-    CHECK_EQ(GCPATCH_MIN_READ_VERSION, uint32_t(5));
+    // diff/patch tools. v6 = per-cell geo entry deltas; v5 sent full lists,
+    // so v5 patches are unreadable (MIN_READ_VERSION).
+    CHECK_EQ(GCPATCH_VERSION, uint32_t(6));
+    CHECK_EQ(GCPATCH_MIN_READ_VERSION, uint32_t(6));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
     for (int i = 0; i < 8; i++) CHECK_EQ(GCPATCH_MAGIC[i], expect[i]);
 }
@@ -676,4 +679,57 @@ TEST(patch_format_record_remap_matches_and_secondary_pairs) {
     for (uint32_t i = 0; i < 10; i++) CHECK_EQ(rm[i], want[i]);
     CHECK_EQ(rm[10], N);
     CHECK_EQ(RecordRemap()[0], N);
+}
+
+// --- geo entry list deltas ---
+
+TEST(patch_format_geo_list_delta_round_trip) {
+    // derived → target by lost/gained ids; an unsorted target, or one whose
+    // delta overflows the u16 counts, travels whole.
+    struct Case { std::vector<uint32_t> derived, target; bool replace; };
+    std::vector<uint32_t> huge(GEO_LIST_REPLACE);
+    std::iota(huge.begin(), huge.end(), 0);
+    const Case cases[] = {
+        {{1, 2, 3, 5, 6, 7}, {1, 3, 4, 5, 6, 7}, false},
+        {{}, {5, 6}, false},                             // a new cell: all gains
+        {{5, 6}, {}, false},                             // emptied: all losses
+        {{1, 2, 2, 3, 8, 9, 10}, {2, 3, 3, 8, 9, 10}, false},  // duplicates are multiset differences
+        {{1, 2}, {9, 4}, true},                          // unsorted: replaced whole
+        {{1, 2}, {1, 3}, false},                         // a delta even where the list is as short
+        {huge, {70000}, true},                           // 0xFFFF lost ids don't fit: replaced whole
+    };
+    std::vector<char> buf;
+    uint64_t cid = 10;
+    for (const auto& c : cases) append_geo_list_delta(buf, cid++, c.derived, c.target);
+    size_t pos = 0;
+    auto deltas = parse_geo_list_deltas(buf.data(), buf.size(), pos, 7);
+    CHECK_EQ(pos, buf.size());
+    REQUIRE(deltas.size() == 7);
+    std::vector<uint32_t> scratch;
+    for (size_t i = 0; i < 7; i++) {
+        CHECK_EQ(deltas[i].cell_id, uint64_t(10 + i));
+        CHECK_EQ(deltas[i].replace, cases[i].replace);
+        std::vector<uint32_t> ids = cases[i].derived;
+        deltas[i].apply(ids, scratch);
+        CHECK(ids == cases[i].target);
+    }
+}
+
+TEST(patch_format_geo_list_delta_rejects_truncation_and_disorder) {
+    std::vector<char> buf;
+    append_geo_list_delta(buf, 7, {1}, {2});
+    append_geo_list_delta(buf, 9, {}, {3});
+    for (size_t cut = 0; cut < buf.size(); cut++) {
+        size_t pos = 0;
+        bool threw = false;
+        try { parse_geo_list_deltas(buf.data(), cut, pos, 2); } catch (const std::runtime_error&) { threw = true; }
+        CHECK(threw);
+    }
+    std::vector<char> back;
+    append_geo_list_delta(back, 9, {}, {3});
+    append_geo_list_delta(back, 7, {1}, {2});
+    size_t pos = 0;
+    bool threw = false;
+    try { parse_geo_list_deltas(back.data(), back.size(), pos, 2); } catch (const std::runtime_error&) { threw = true; }
+    CHECK(threw);
 }
