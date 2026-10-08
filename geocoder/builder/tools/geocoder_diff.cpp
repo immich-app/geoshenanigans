@@ -95,6 +95,12 @@ static void remap_field(char* data, size_t size, size_t stride, size_t field_off
         auto it = rm.find(v); if (it != rm.end()) memcpy(data + i + field_off, &it->second, 4);
     }
 }
+// The patcher rewrites the same fields (string_field_offsets) of the records
+// it copies from old.
+static void remap_string_fields(char* data, size_t size, PatchFileId fid, size_t stride,
+                                const std::unordered_map<uint32_t,uint32_t>& rm) {
+    for (size_t off : string_field_offsets(fid, stride)) remap_field(data, size, stride, off, rm);
+}
 
 // Content matching for ways (by name + nodes, ignoring node_offset)
 static uint64_t fnv_mix(uint64_t h, uint64_t v) { h ^= v; h *= 1099511628211ULL; return h; }
@@ -1079,7 +1085,7 @@ static int run(int argc, char* argv[]) {
         auto [new_w, nw_fb] = try_load_with_fallback(new_dir, "street_ways.bin",
                                                       {"../full/", "../../full/"});
         street_from_fallback = (ow_fb || nw_fb);
-        remap_field(old_w.data, old_w.size, way_stride, way_stride == 12 ? 8 : 5, str_remap);
+        remap_string_fields(old_w.data, old_w.size, PatchFileId::STREET_WAYS, way_stride, str_remap);
 
         // Variants without their own street_ways (admin, admin-minimal,
         // poi tiers) borrow the sibling /full/ copy only for the string
@@ -1165,7 +1171,7 @@ static int run(int argc, char* argv[]) {
         double gs = now_ms();
         auto old_data = mmap_file_rw(old_dir + "/interp_ways.bin");
         auto new_data = mmap_file_rw(new_dir + "/interp_ways.bin");
-        remap_field(old_data.data, old_data.size, interp_stride, interp_stride >= 20 ? 8 : 5, str_remap);
+        remap_string_fields(old_data.data, old_data.size, PatchFileId::INTERP_WAYS, interp_stride, str_remap);
         auto old_n = mmap_file(old_dir + "/interp_nodes.bin");
         auto new_n = mmap_file(new_dir + "/interp_nodes.bin");
         size_t n = old_data.size / interp_stride;
@@ -1216,7 +1222,7 @@ static int run(int argc, char* argv[]) {
             for (size_t i = 0; i + admin_stride <= new_data.size; i += admin_stride)
                 memset(new_data.data + i + 14, 0, 2);
         }
-        remap_field(old_data.data, old_data.size, admin_stride, 8, str_remap);
+        remap_string_fields(old_data.data, old_data.size, PatchFileId::ADMIN_POLYGONS, admin_stride, str_remap);
         // admin_vertices.bin lives next to admin_polygons.bin in every
         // build mode, so it follows the same fallback resolution.
         auto [old_v, _ov_fb] = try_load_with_fallback(old_dir, "admin_vertices.bin",
@@ -1318,13 +1324,8 @@ static int run(int argc, char* argv[]) {
         // like name_id, so they get the same str_remap. (Previously bytes
         // 24/28 were wrongly remapped via the way-index / postcode-centroid
         // tables — see the parent-id block below, now removed.)
-        if (old_data.size > 0) {
-            remap_field(old_data.data, old_data.size, poi_stride, 16, str_remap);
-            if (poi_stride >= 28)
-                remap_field(old_data.data, old_data.size, poi_stride, 24, str_remap);
-            if (poi_stride >= 32)
-                remap_field(old_data.data, old_data.size, poi_stride, 28, str_remap);
-        }
+        if (old_data.size > 0)
+            remap_string_fields(old_data.data, old_data.size, PatchFileId::POI_RECORDS, poi_stride, str_remap);
 
         // Remap old PoiRecord parent ids into the new build's id-space so
         // unchanged POIs don't differ day-over-day (otherwise pr_seq
@@ -1449,7 +1450,7 @@ static int run(int argc, char* argv[]) {
         }
         // String remap on name_id field (offset 8 in 16-byte stride)
         if (old_data.size > 0)
-            remap_field(old_data.data, old_data.size, place_stride, 8, str_remap);
+            remap_string_fields(old_data.data, old_data.size, PatchFileId::PLACE_NODES, place_stride, str_remap);
         // parent_poly_id (byte 16-19, only present in 20-byte stride) is a
         // foreign id into admin_polygons.bin and shifts day-over-day with
         // the admin id-space. Without rewriting it the merge sees
@@ -2154,12 +2155,8 @@ static int run(int argc, char* argv[]) {
                   << " rle_payload=" << rle_payload_bytes << ")" << std::endl;
     };
 
-    emit_sparse_delta(PatchFileId::ADDR_POSTCODES,       "addr_postcodes.bin",  4,  2);
-    emit_sparse_delta(PatchFileId::ADMIN_PARENTS,        "admin_parents.bin",   4,  1);
-    emit_sparse_delta(PatchFileId::WAY_PARENTS,          "way_parents.bin",     4,  1);
-    emit_sparse_delta(PatchFileId::WAY_POSTCODES,        "way_postcodes.bin",   4,  2);
-    emit_sparse_delta(PatchFileId::INTERP_POSTCODES,     "interp_postcodes.bin", 4, 2);
-    emit_sparse_delta(PatchFileId::POSTCODE_CENTROIDS,   "postcode_centroids.bin", 16, 3);
+    for (const auto& f : SPARSE_DELTA_FILES)
+        emit_sparse_delta(f.fid, patch_file_names[(uint32_t)f.fid], f.value_stride, f.remap_kind);
     // A cell index whose ids are strategy-2 slots barely changes day to day:
     // send the cells that lost or gained ids instead of both files.
     // Full-replacing postcode_centroid_* cost ~3.7 MiB per planet mode dir.
@@ -2209,7 +2206,7 @@ static int run(int argc, char* argv[]) {
         bool mergeable = stride == 24 && old_p.size > 0 && new_p.size > 0 && old_v.size > 0 && new_v.size > 0
                          && old_p.size % stride == 0 && new_p.size % stride == 0;
         if (mergeable) {
-            remap_field(old_p.data, old_p.size, stride, ADMIN_POLYGON_NAME_ID_OFF, str_remap);
+            remap_string_fields(old_p.data, old_p.size, PatchFileId::POSTAL_POLYGONS, stride, str_remap);
             size_t n = old_p.size / stride;
             std::vector<uint32_t> old_offsets(n);
             for (size_t i = 0; i < n; i++) memcpy(&old_offsets[i], old_p.data + i * stride, 4);

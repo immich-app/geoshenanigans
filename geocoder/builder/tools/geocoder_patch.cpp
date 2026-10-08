@@ -572,7 +572,7 @@ static int run(int argc, char* argv[]) {
             const bool remapped = (remap_kind == 1 && !poi_admin_remap.empty() && value_stride == 4) ||
                                   (remap_kind == 2 && !str_remap.empty() && value_stride == 4) ||
                                   (remap_kind == 3 && !str_remap.empty() && value_stride == 16);
-            const size_t field = value_stride == 16 ? 8 : 0;
+            const size_t field = value_stride == 16 ? POSTCODE_CENTROID_POSTCODE_ID_OFF : 0;
 
             FILE* out = open_out(fname);
             constexpr size_t CHUNK = 1 << 20;  // a multiple of both value strides
@@ -615,14 +615,9 @@ static int run(int argc, char* argv[]) {
         else if (file_id == (uint32_t)PatchFileId::INTERP_WAYS) actual_stride = interp_stride;
         else if (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS) actual_stride = admin_stride;
 
-        // Determine if this file needs in-memory modifications
-        bool needs_remap = (file_id == (uint32_t)PatchFileId::ADDR_POINTS ||
-                            file_id == (uint32_t)PatchFileId::STREET_WAYS ||
-                            file_id == (uint32_t)PatchFileId::INTERP_WAYS ||
-                            file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS ||
-                            file_id == (uint32_t)PatchFileId::POSTAL_POLYGONS ||
-                            file_id == (uint32_t)PatchFileId::POI_RECORDS ||
-                            file_id == (uint32_t)PatchFileId::PLACE_NODES);
+        // Records with string offset fields are rewritten one at a time.
+        const std::vector<size_t> string_fields = string_field_offsets(static_cast<PatchFileId>(file_id), actual_stride);
+        bool needs_remap = !string_fields.empty();
         bool needs_padding = file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS && actual_stride == 24;
 
         // Offset fixups, decoded lazily during merge replay (zero allocation).
@@ -640,31 +635,8 @@ static int run(int argc, char* argv[]) {
             (file_id == (uint32_t)PatchFileId::ADDR_POINTS)  ? ADDR_POINT_VERTEX_OFFSET_OFF : (size_t)0;
         if (has_fixups && fixup_off + 4 > actual_stride) throw std::runtime_error("Malformed fixups");
 
-        // Get string remap field offsets for this file type
         std::vector<size_t> remap_offs;
-        if (!str_remap.empty() && needs_remap) {
-            // AddrPoint string fields live at {8, 12} (housenumber_id,
-            // street_id). Offset 16 is parent_way_id, which is a WAY id
-            // — not a string pool offset — so it must NOT be rewritten
-            // by the string remap. The previous {8, 12, 16} mapping
-            // corrupted parent_way_id for every record that sat in a
-            // MATCH run, producing the "first_diff=17" (first byte of
-            // parent_way_id) mismatches we saw in patch verify.
-            if (file_id == (uint32_t)PatchFileId::ADDR_POINTS) remap_offs = {ADDR_POINT_HOUSENUMBER_ID_OFF, ADDR_POINT_STREET_ID_OFF};
-            else if (file_id == (uint32_t)PatchFileId::STREET_WAYS) remap_offs = {(actual_stride == 12) ? WAY_HEADER_NAME_ID_OFF_PADDED : WAY_HEADER_NAME_ID_OFF_PACKED};
-            else if (file_id == (uint32_t)PatchFileId::INTERP_WAYS) remap_offs = {(actual_stride >= 20) ? INTERP_WAY_STREET_ID_OFF_PADDED : INTERP_WAY_STREET_ID_OFF_PACKED};
-            else if (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS ||
-                     file_id == (uint32_t)PatchFileId::POSTAL_POLYGONS) remap_offs = {ADMIN_POLYGON_NAME_ID_OFF};
-            else if (file_id == (uint32_t)PatchFileId::POI_RECORDS) {
-                // byte 16 = name_id; byte 24 = parent_street_id;
-                // byte 28 = parent_postcode_id — all string offsets, all
-                // remapped via str_remap (mirrors geocoder_diff.cpp).
-                remap_offs = {POI_RECORD_NAME_ID_OFF};
-                if (actual_stride >= 28) remap_offs.push_back(POI_RECORD_PARENT_STREET_ID_OFF);
-                if (actual_stride >= 32) remap_offs.push_back(POI_RECORD_PARENT_POSTCODE_ID_OFF);
-            }
-            else if (file_id == (uint32_t)PatchFileId::PLACE_NODES) remap_offs = {PLACE_NODE_NAME_ID_OFF};
-        }
+        if (!str_remap.empty()) remap_offs = string_fields;
 
         // The old file, read front to back (DELETE runs skip forward).
         SequentialFileReader old(cur_dir + "/" + std::string(fname));

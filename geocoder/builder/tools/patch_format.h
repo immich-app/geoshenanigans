@@ -292,6 +292,44 @@ static const char* patch_file_names[] = {
     "interp_postcodes.bin"
 };
 
+// The string offset fields of a record file the patch merges, as byte
+// offsets in a record of the given stride; empty for files without any.
+// AddrPoint byte 16 is parent_way_id, a way id, not a string offset.
+inline std::vector<size_t> string_field_offsets(PatchFileId fid, size_t stride) {
+    switch (fid) {
+    case PatchFileId::ADDR_POINTS: return {ADDR_POINT_HOUSENUMBER_ID_OFF, ADDR_POINT_STREET_ID_OFF};
+    case PatchFileId::STREET_WAYS:
+        return {stride == 12 ? WAY_HEADER_NAME_ID_OFF_PADDED : WAY_HEADER_NAME_ID_OFF_PACKED};
+    case PatchFileId::INTERP_WAYS:
+        return {stride >= 20 ? INTERP_WAY_STREET_ID_OFF_PADDED : INTERP_WAY_STREET_ID_OFF_PACKED};
+    case PatchFileId::ADMIN_POLYGONS:
+    case PatchFileId::POSTAL_POLYGONS: return {ADMIN_POLYGON_NAME_ID_OFF};
+    case PatchFileId::POI_RECORDS: {
+        std::vector<size_t> offs = {POI_RECORD_NAME_ID_OFF};
+        if (stride >= 28) offs.push_back(POI_RECORD_PARENT_STREET_ID_OFF);
+        if (stride >= 32) offs.push_back(POI_RECORD_PARENT_POSTCODE_ID_OFF);
+        return offs;
+    }
+    case PatchFileId::PLACE_NODES: return {PLACE_NODE_NAME_ID_OFF};
+    default: return {};
+    }
+}
+
+// The files sent as SPARSE_DELTA_STRIDE sections, in emission order, with
+// the value each position holds:
+//   remap_kind 0 = raw, 1 = admin polygon id, 2 = string offset,
+//   3 = postcode_centroid (16 bytes, string offset at byte 8).
+struct SparseDeltaFile { PatchFileId fid; uint32_t value_stride, remap_kind; };
+static constexpr SparseDeltaFile SPARSE_DELTA_FILES[] = {
+    {PatchFileId::ADDR_POSTCODES, 4, 2},
+    {PatchFileId::ADMIN_PARENTS, 4, 1},
+    {PatchFileId::WAY_PARENTS, 4, 1},
+    {PatchFileId::WAY_POSTCODES, 4, 2},
+    {PatchFileId::INTERP_POSTCODES, 4, 2},
+    {PatchFileId::POSTCODE_CENTROIDS, 16, 3},
+};
+static constexpr size_t POSTCODE_CENTROID_POSTCODE_ID_OFF = 8;
+
 // Offset fixup section marker: 0xFFFFFFFD
 // Format: uint32_t marker, uint32_t file_id, uint32_t stride,
 //         uint32_t count, [(uint32_t record_index, uint32_t new_offset_value)] * count

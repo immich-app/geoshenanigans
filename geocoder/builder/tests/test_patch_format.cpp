@@ -361,6 +361,43 @@ TEST(patch_format_content_hash_of_nothing_is_stable) {
     CHECK_EQ(content_hash(nullptr, 0), content_hash(none, 0));
 }
 
+// --- string offset fields ---
+
+TEST(patch_format_string_fields_match_the_record_layouts) {
+    using V = std::vector<size_t>;
+    CHECK(string_field_offsets(PatchFileId::ADDR_POINTS, 28) == V({8, 12}));  // not parent_way_id at 16
+    CHECK(string_field_offsets(PatchFileId::ADDR_POINTS, 20) == V({8, 12}));
+    CHECK(string_field_offsets(PatchFileId::STREET_WAYS, 12) == V({8}));
+    CHECK(string_field_offsets(PatchFileId::STREET_WAYS, 9) == V({5}));
+    CHECK(string_field_offsets(PatchFileId::INTERP_WAYS, 24) == V({8}));
+    CHECK(string_field_offsets(PatchFileId::INTERP_WAYS, 20) == V({8}));
+    CHECK(string_field_offsets(PatchFileId::INTERP_WAYS, 18) == V({5}));
+    CHECK(string_field_offsets(PatchFileId::ADMIN_POLYGONS, 24) == V({8}));
+    CHECK(string_field_offsets(PatchFileId::POSTAL_POLYGONS, 24) == V({8}));
+    CHECK(string_field_offsets(PatchFileId::POI_RECORDS, 36) == V({16, 24, 28}));  // not parent_poly_id at 32
+    CHECK(string_field_offsets(PatchFileId::POI_RECORDS, 32) == V({16, 24, 28}));
+    CHECK(string_field_offsets(PatchFileId::POI_RECORDS, 28) == V({16, 24}));
+    CHECK(string_field_offsets(PatchFileId::POI_RECORDS, 24) == V({16}));
+    CHECK(string_field_offsets(PatchFileId::PLACE_NODES, 20) == V({8}));  // not parent_poly_id at 16
+    CHECK(string_field_offsets(PatchFileId::STREET_NODES, 8).empty());
+    CHECK(string_field_offsets(PatchFileId::ADMIN_VERTICES, 1).empty());
+    CHECK(string_field_offsets(PatchFileId::POI_VERTICES, 1).empty());
+
+    // Sparse files: string offsets are kind 2 (the u32 itself) and kind 3
+    // (byte 8 of a postcode centroid); kind 1 holds admin polygon ids.
+    std::vector<std::string> strings, admin_ids;
+    for (const auto& f : SPARSE_DELTA_FILES) {
+        const std::string name = patch_file_names[(uint32_t)f.fid];
+        if (f.remap_kind == 2) { CHECK_EQ(f.value_stride, 4u); strings.push_back(name); }
+        if (f.remap_kind == 3) { CHECK_EQ(f.value_stride, 16u); strings.push_back(name); }
+        if (f.remap_kind == 1) admin_ids.push_back(name);
+    }
+    CHECK(strings == std::vector<std::string>({"addr_postcodes.bin", "way_postcodes.bin",
+                                               "interp_postcodes.bin", "postcode_centroids.bin"}));
+    CHECK(admin_ids == std::vector<std::string>({"admin_parents.bin", "way_parents.bin"}));
+    CHECK_EQ(POSTCODE_CENTROID_POSTCODE_ID_OFF, size_t(8));
+}
+
 // --- old file identity ---
 
 TEST(patch_format_old_file_must_be_the_size_the_patch_was_made_from) {
