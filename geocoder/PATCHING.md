@@ -57,11 +57,11 @@ Higher quality numbers = more simplification = smaller files = less accurate bou
 
 | Tier | Files | Description |
 |------|-------|-------------|
-| `poi/major/` | 4 files | Major POIs only (airports, national parks, cathedrals, volcanoes, etc.) |
-| `poi/notable/` | 4 files | Major + notable POIs (museums, castles, stadiums, beaches, etc.) |
-| `poi/all/` | 4 files | All POIs including minor ones (picnic sites, small galleries, etc.) |
+| `poi/major/` | 7 files | Major POIs only (airports, national parks, cathedrals, volcanoes, etc.) |
+| `poi/notable/` | 7 files | Major + notable POIs (museums, castles, stadiums, beaches, etc.) |
+| `poi/all/` | 7 files | All POIs including minor ones (picnic sites, small galleries, etc.) |
 
-POI files: `poi_records.bin`, `poi_vertices.bin`, `poi_cells.bin`, `poi_entries.bin`. POIs with Wikipedia/Wikidata tags are promoted one tier.
+POI files: `poi_records.bin`, `poi_vertices.bin`, `poi_cells.bin`, `poi_entries.bin`, `strings_poi.bin`, `strings_layout.json`, `poi_meta.json`. POIs with Wikipedia/Wikidata tags are promoted one tier.
 
 ## latest.json
 

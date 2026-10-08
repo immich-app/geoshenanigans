@@ -340,6 +340,7 @@
         "{region}/poi/major/poi_cells.bin",
         "{region}/poi/major/poi_entries.bin",
         "{region}/poi/major/strings_poi.bin",
+        "{region}/poi/major/strings_layout.json",
         "{region}/poi/major/poi_meta.json"
       ]
     },
@@ -350,6 +351,7 @@
         "{region}/poi/notable/poi_cells.bin",
         "{region}/poi/notable/poi_entries.bin",
         "{region}/poi/notable/strings_poi.bin",
+        "{region}/poi/notable/strings_layout.json",
         "{region}/poi/notable/poi_meta.json"
       ]
     },
@@ -360,6 +362,7 @@
         "{region}/poi/all/poi_cells.bin",
         "{region}/poi/all/poi_entries.bin",
         "{region}/poi/all/strings_poi.bin",
+        "{region}/poi/all/strings_layout.json",
         "{region}/poi/all/poi_meta.json"
       ]
     }
