@@ -2006,6 +2006,8 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             ensure_dir(base_dir + "/poi/all");
             emit_strategy2_sidecar(base_dir + "/poi/all/poi_records.osm_ids",
                                     d.poi_sidecar_blob, d.poi_osm_ids);
+            if (!d.poi_sidecar_blob.empty() && d.poi_sidecar_blob.size() != d.poi_records.size())
+                throw std::runtime_error("POI slot table not parallel to poi_records");
 
             for (const auto& tier_var : poi_tiers) {
                 std::string poi_dir = base_dir + "/" + tier_var.name;
@@ -2142,10 +2144,8 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                     std::ofstream mf(poi_dir + "/poi_meta.json");
                     mf << "{\n";
                     bool first = true;
-                    // Collect categories present in this tier
-                    std::set<uint8_t> cats;
-                    for (const auto& r : filtered_records) cats.insert(r.category);
-                    for (uint8_t cat : cats) {
+                    for (uint8_t cat : poi_meta_categories(d.poi_records, d.poi_sidecar_blob,
+                                                           tier_var.max_tier)) {
                         if (!first) mf << ",\n";
                         first = false;
                         PoiCategory pc = static_cast<PoiCategory>(cat);

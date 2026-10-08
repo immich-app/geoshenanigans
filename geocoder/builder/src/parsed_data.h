@@ -5,6 +5,7 @@
 #include <chrono>
 #include <iostream>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -20,6 +21,23 @@
 #include "types.h"
 #include "string_pool.h"
 #include "id_allocator.h"
+
+// Categories a POI tier's poi_meta.json lists: those of the live records the
+// tier ships. A tombstone is memset to category 0 (MUSEUM), so counting it
+// would list museums in a tier that holds none. `slots` is the strategy-2
+// slot table, parallel to `records`, or empty when strategy 2 did not run.
+inline std::set<uint8_t> poi_meta_categories(const std::vector<PoiRecord>& records,
+                                             const std::vector<gc::id_alloc::SidecarSlot>& slots,
+                                             uint8_t max_tier) {
+    std::set<uint8_t> cats;
+    for (size_t i = 0; i < records.size(); i++) {
+        if (records[i].tier > max_tier) continue;
+        if (!slots.empty() && gc::id_alloc::is_tombstone(slots[i])) continue;
+
+        cats.insert(records[i].category);
+    }
+    return cats;
+}
 
 // --- Directory creation ---
 

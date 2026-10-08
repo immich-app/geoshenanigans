@@ -9,6 +9,7 @@
 #include <string>
 #include <unistd.h>
 
+#include "scratch_dir.h"
 #include "test_framework.h"
 
 using namespace gc::id_alloc;
@@ -108,4 +109,30 @@ TEST(load_previous_missing_file_returns_false) {
     CHECK(!a.load_previous("/tmp/gctest_does_not_exist_zzz.osm_ids"));
     // Falls back to fresh allocation.
     CHECK_EQ(a.allocate(ObjectType::OSM_NODE, 1), 0u);
+}
+
+TEST(unclaimed_live_none_slot_becomes_tombstone) {
+    // A continent POI whose planet osm id was missing allocates {NONE, 0}:
+    // a live slot that load_previous puts on the free list. If nothing
+    // claims it the next day it is dead, and only the flag says so.
+    ScratchDir dir("gctest-none");
+    const std::string path = dir.path() + "/prev.osm_ids";
+    {
+        IdAllocator a;
+        a.allocate(ObjectType::NONE, 0);      // idx 0
+        a.allocate(ObjectType::NONE, 0);      // idx 1
+        a.allocate(ObjectType::OSM_NODE, 10); // idx 2
+        a.finalize();
+        IdAllocator::write_sidecar(path, a.take_slots());
+    }
+    IdAllocator b;
+    REQUIRE(b.load_previous(path));
+    CHECK_EQ(b.allocate(ObjectType::NONE, 0), 1u);       // recycles the free-list back
+    CHECK_EQ(b.allocate(ObjectType::OSM_NODE, 10), 2u);
+    b.finalize();
+    const std::vector<SidecarSlot> slots = b.take_slots();
+    REQUIRE(slots.size() == 3u);
+    CHECK(is_tombstone(slots[0]));
+    CHECK(!is_tombstone(slots[1]));
+    CHECK(!is_tombstone(slots[2]));
 }

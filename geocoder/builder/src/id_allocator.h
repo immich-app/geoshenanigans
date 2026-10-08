@@ -68,6 +68,15 @@ struct SidecarSlot {
 #pragma pack(pop)
 static_assert(sizeof(SidecarSlot) == 12, "SidecarSlot must be 12 bytes");
 
+constexpr uint8_t SLOT_FLAG_TOMBSTONE = 0x01;
+
+// A slot finalize() turned into a tombstone. Only the flag counts: a live
+// slot can carry ObjectType::NONE (a continent POI whose planet osm id was
+// missing allocates {NONE, 0}).
+inline bool is_tombstone(const SidecarSlot& s) {
+    return (s.flags & SLOT_FLAG_TOMBSTONE) != 0;
+}
+
 // Internal: combine (object_type, stable_id) into a single uint64_t key
 // so unordered_map lookups are O(1) without struct-equality boilerplate.
 // Relies on ObjectType fitting in 8 bits and stable_id in 56 bits, which
@@ -100,9 +109,7 @@ public:
         prev_to_idx_.reserve(count);
         for (uint32_t i = 0; i < count; i++) {
             const SidecarSlot& s = slots_[i];
-            bool is_tomb = (s.flags & 0x01) != 0
-                || s.object_type == static_cast<uint8_t>(ObjectType::NONE);
-            if (is_tomb) {
+            if (is_tombstone(s) || s.object_type == static_cast<uint8_t>(ObjectType::NONE)) {
                 free_list_.push_back(i);
             } else {
                 prev_to_idx_.emplace(
@@ -142,16 +149,20 @@ public:
     }
 
     // Mark surviving prev_to_idx_ entries (= deleted records) as
-    // tombstones in slots_, then drop the lookup map and free-list to
-    // release the bulk of the working memory before slots_ moves out.
+    // tombstones in slots_, and flag every free-list slot nothing claimed:
+    // a live NONE-type slot sits there unflagged and is dead now (slots
+    // already flagged keep their bytes). Then drop the lookup map and
+    // free-list to release the bulk of the working memory before slots_
+    // moves out.
     // For 250M addr_points the prev_to_idx_ unordered_map alone is
     // ~8 GiB of resident memory; releasing it here is what keeps the
     // peak inside the runner's RAM budget.
     void finalize() {
         for (auto& kv : prev_to_idx_) {
             slots_[kv.second] = SidecarSlot{
-                static_cast<uint8_t>(ObjectType::NONE), 0x01, 0, 0};
+                static_cast<uint8_t>(ObjectType::NONE), SLOT_FLAG_TOMBSTONE, 0, 0};
         }
+        for (uint32_t i : free_list_) slots_[i].flags |= SLOT_FLAG_TOMBSTONE;
         std::unordered_map<uint64_t, uint32_t>().swap(prev_to_idx_);
         std::vector<uint32_t>().swap(free_list_);
     }
