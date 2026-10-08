@@ -63,7 +63,7 @@ jobs:
           RUNS_JSON=$(gh run list \
             --workflow="$WORKFLOW" \
             --limit=30 \
-            --json conclusion,status,createdAt,event,headBranch)
+            --json databaseId,conclusion,status,createdAt,event,headBranch)
 
           TODAY_RUNS=$(echo "$RUNS_JSON" \
             | jq --arg t "$TODAY" --arg ref "$BUILD_REF" \
@@ -98,6 +98,28 @@ jobs:
             exit 1
           fi
 
+          # Retry only infrastructure failures. A lost runner reports a
+          # failed job with no steps at all; these steps fail the same way
+          # on every rerun of the same commit and inputs, so a retry only
+          # burns hours of the shared runner. A cancelled step means the
+          # job hit its timeout (a rerun does the same work and times out
+          # again) or someone cancelled the run by hand.
+          LAST_ID=$(echo "$TODAY_RUNS" | jq -r 'sort_by(.createdAt) | last | .databaseId')
+          STOPPED_AT=$(gh run view "$LAST_ID" --json jobs --jq '
+            [.jobs[].steps[]
+             | select(.conclusion == "cancelled"
+                      or (.conclusion == "failure"
+                          and (.name == "Build tools" or .name == "Run builder tests" or .name == "Fail run on patch verify failure")))
+             | .name] | first // ""')
+          if [ -n "$STOPPED_AT" ]; then
+            echo "::notice::Run $LAST_ID stopped at '$STOPPED_AT', which a retry would repeat — not retrying. Investigate manually."
+            exit 0
+          fi
+
+          # Pin the date: a retry that waits in the runner queue past
+          # midnight would otherwise build tomorrow from scratch, breaking
+          # the patch chain. Setup fails the run if $TODAY's diff is not
+          # published yet.
           ATTEMPT=$((TOTAL + 1))
           echo "Triggering retry $ATTEMPT/$MAX_RETRIES for $TODAY on $BUILD_REF"
           gh workflow run "$WORKFLOW" \
