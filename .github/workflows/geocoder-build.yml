@@ -106,7 +106,7 @@ jobs:
           SERVER="https://planet.openstreetmap.org/replication/day"
           # An unread state would publish under an empty date (builds//,
           # latest.json {"latest": ""}), so fail the run instead.
-          STATE=$(curl -sSL --fail --retry 5 --retry-delay 30 "$SERVER/state.txt") \
+          STATE=$(curl -sSL --fail --retry 5 --retry-delay 30 --retry-all-errors "$SERVER/state.txt") \
             || { echo "::error::Could not fetch $SERVER/state.txt"; exit 1; }
           CURRENT_SEQ=$(echo "$STATE" | grep sequenceNumber | cut -d= -f2 | tr -d '[:space:]')
           CURRENT_DATE=$(echo "$STATE" | grep timestamp | cut -d= -f2 | tr '\\' ' ' | cut -dT -f1 | tr -d ' ')
@@ -119,6 +119,10 @@ jobs:
           PREV_DATE=$(date -u -d "$TARGET_DATE - 1 day" +%Y-%m-%d)
           DAYS_OFFSET=$(( ($(date -u -d "$CURRENT_DATE" +%s) - $(date -u -d "$TARGET_DATE" +%s)) / 86400 ))
           TARGET_SEQ=$((CURRENT_SEQ - DAYS_OFFSET))
+          if [ "$DAYS_OFFSET" -lt 0 ]; then
+            echo "::error::Build date $TARGET_DATE is newer than the replication state ($CURRENT_DATE, seq $CURRENT_SEQ): its diff is not published yet"
+            exit 1
+          fi
 
           echo "today=$TARGET_DATE" >> "$GITHUB_OUTPUT"
           echo "yesterday=$PREV_DATE" >> "$GITHUB_OUTPUT"
@@ -170,11 +174,11 @@ jobs:
       # ── Download PBF + previous indexes (parallel) ─────────────────
       - name: Download PBF and previous indexes
         id: download
-        # Hard cap on the whole download phase. Reference: previous successful
-        # runs finish this step in ~9 min (PBF + 38 GiB of compressed indexes
-        # in parallel). 30 min gives 3x headroom for slower-than-usual mirrors
+        # Hard cap on the whole download phase. Reference: runs take 9 to
+        # 26.5 min (PBF + ~89 GiB of compressed indexes in parallel, the
+        # slow end on a Tigris fallback). 60 min absorbs a slow mirror
         # without letting a wedged urllib/curl call park the runner overnight.
-        timeout-minutes: 30
+        timeout-minutes: 60
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
           CACHE_ENDPOINT: ${{ steps.setup.outputs.cache_endpoint }}
@@ -409,6 +413,9 @@ jobs:
       # Skipped when PBF source is already today's data.
       - name: Apply replication diffs
         if: ${{ steps.download.outputs.pbf_source != 'today' }}
+        # A mirror PBF plus its catch-up diffs took 52 min in June; a hung
+        # download or osmium must not eat the job's whole 6h budget.
+        timeout-minutes: 120
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
           TODAY: ${{ steps.setup.outputs.today }}
@@ -425,8 +432,8 @@ jobs:
             DIR2=$(printf "%03d" $(((TODAY_SEQ / 1000) % 1000)))
             FILE=$(printf "%03d" $((TODAY_SEQ % 1000)))
             echo "Downloading replication diff (seq $TODAY_SEQ)..."
-            curl -sL --fail -o "$WORKDIR/diff-today.osc.gz" \
-              "$SERVER/$DIR1/$DIR2/${FILE}.osc.gz"
+            curl -sL --fail --retry 5 --retry-delay 30 --retry-all-errors \
+              -o "$WORKDIR/diff-today.osc.gz" "$SERVER/$DIR1/$DIR2/${FILE}.osc.gz"
             gzip -t "$WORKDIR/diff-today.osc.gz"
             DIFF_SIZE=$(stat -c%s "$WORKDIR/diff-today.osc.gz")
             echo "Diff: $((DIFF_SIZE/1024/1024)) MiB"
@@ -453,7 +460,8 @@ jobs:
                 DIR1=$(printf "%03d" $((S / 1000000)))
                 DIR2=$(printf "%03d" $(((S / 1000) % 1000)))
                 FILE=$(printf "%03d" $((S % 1000)))
-                curl -sL --fail -o "$WORKDIR/diff-${S}.osc.gz" "$SERVER/$DIR1/$DIR2/${FILE}.osc.gz"
+                curl -sL --fail --retry 5 --retry-delay 30 --retry-all-errors \
+                  -o "$WORKDIR/diff-${S}.osc.gz" "$SERVER/$DIR1/$DIR2/${FILE}.osc.gz"
                 gzip -t "$WORKDIR/diff-${S}.osc.gz"
                 DIFFS="$DIFFS $WORKDIR/diff-${S}.osc.gz"
               done
