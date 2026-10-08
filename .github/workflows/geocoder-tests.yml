@@ -29,6 +29,24 @@ jobs:
           make -j$(nproc) geocoder-tests
           ./geocoder-tests
 
+  builder-tests-sanitized:
+    name: Builder unit tests (ASan + UBSan)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake libzstd-dev zlib1g-dev libprotozero-dev \
+            libbz2-dev libexpat1-dev libs2-dev
+      - name: Build + run tests
+        run: |
+          cd geocoder/builder && mkdir -p build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGEOCODER_SANITIZE=ON
+          make -j$(nproc) geocoder-tests
+          ./geocoder-tests
+
   server-tests:
     name: Server unit tests
     runs-on: ubuntu-24.04
