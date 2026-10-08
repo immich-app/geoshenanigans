@@ -656,15 +656,6 @@ TEST(patch_format_rebuild_cells_remaps_interior_entries) {
 
 // --- cell list delta ---
 
-// Bytes in memory behind the size() / at(off, n) interface the cell index
-// streams read their old files through.
-struct ByteSpan {
-    const char* data;
-    size_t bytes;
-    uint64_t size() const { return bytes; }
-    const char* at(uint64_t off, size_t) const { return data + off; }
-};
-
 static void write_bytes(const std::string& path, const std::vector<char>& bytes) {
     std::ofstream(path, std::ios::binary).write(bytes.data(), bytes.size());
 }

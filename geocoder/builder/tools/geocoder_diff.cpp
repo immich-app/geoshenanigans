@@ -1648,8 +1648,8 @@ static int run(int argc, char* argv[]) {
     }
 
     // --- Streaming entry corrections ---
-    // Instead of materializing all 15M cells' entries in memory (rebuild_geo_from_remap_vec),
-    // merge-walk old and new geo_cells in parallel. For each old cell, remap its entry IDs
+    // Instead of materializing all 15M cells' entries in memory, merge-walk old
+    // and new geo_cells in parallel. For each old cell, remap its entry IDs
     // on the fly and compare with new entries. This uses O(1) memory per cell.
     double t1 = now_ms();
 
@@ -1671,15 +1671,11 @@ static int run(int argc, char* argv[]) {
     auto new_ae_m = mmap_file(new_dir + "/addr_entries.bin");
     auto new_ie_m = mmap_file(new_dir + "/interp_entries.bin");
 
-    // Shared cell-entry-list parser: reads a uint16 count at `off` followed by
-    // `count` uint32 ids. Used for both raw mmap pointers and std::vector<char>
-    // buffers (call with .data()/.size()).
-    auto parse_ids = [](const char* data, size_t data_size, uint32_t off) -> std::vector<uint32_t> {
-        if (off == NO_DATA || off + 2 > data_size) return {};
-        uint16_t count; memcpy(&count, data + off, 2);
-        if (off + 2 + count * 4 > data_size) return {};
-        std::vector<uint32_t> ids(count);
-        if (count) memcpy(ids.data(), data + off + 2, count * 4);
+    // The entry list at `off`, read like the patcher reads it.
+    auto parse_ids = [](const char* data, size_t data_size, uint32_t off) {
+        ByteSpan entries{data, data_size};
+        std::vector<uint32_t> ids;
+        read_entry_list(entries, off, ids);
         return ids;
     };
 
