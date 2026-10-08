@@ -12,8 +12,9 @@ import { openSync, readFileSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 import { Geocoder, set_js_read } from "../pkg/geocoder_wasm.js";
+import { requireDataDir } from "./data-dir.js";
 
-const dataDir = process.env.GEOCODER_DATA ?? "/home/zack/geocoder-data-v14";
+const dataDir = requireDataDir();
 
 // In-memory threshold.  Anything larger gets a chunked descriptor.  The
 // total of all in-memory buffers must stay under wasm32's 4 GiB linear

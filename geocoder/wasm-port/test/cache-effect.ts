@@ -20,8 +20,9 @@ import { openSync, readFileSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 import { Geocoder as WasmGeocoder, set_js_read } from "../pkg/geocoder_wasm.js";
+import { requireDataDir } from "./data-dir.js";
 
-const dataDir = process.env.GEOCODER_DATA ?? "/home/zack/geocoder-data-v14";
+const dataDir = requireDataDir();
 const rustUrl = process.env.RUST_URL ?? "http://localhost:3556";
 const apiKey = process.env.API_KEY ?? "test";
 const N = Number(process.env.N ?? 200);

@@ -12,10 +12,11 @@
 
 import { openSync, readFileSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { requireDataDir } from "./data-dir.js";
 
 const target = process.env.TARGET ?? "wasm"; // wasm | rust
 const N = Number(process.env.N ?? 5000);
-const dataDir = process.env.GEOCODER_DATA ?? "/home/zack/geocoder-data-v14";
+const dataDir = requireDataDir();
 const rustUrl = process.env.RUST_URL ?? "http://localhost:3556";
 const apiKey = process.env.API_KEY ?? "test";
 

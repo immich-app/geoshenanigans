@@ -11,8 +11,8 @@
 
 set -uo pipefail
 
-REPO=/home/zack/Source/immich/geoshenanigans
-DATA=/home/zack/geocoder-data-v14
+REPO=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+DATA=${GEOCODER_DATA:?Set GEOCODER_DATA to a geocoder index directory}
 NETWORK=geocoder-bench-net
 
 # Memory limits to test. Each implementation is run at each limit.
