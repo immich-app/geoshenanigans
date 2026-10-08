@@ -51,6 +51,15 @@ inline MappedFileRW mmap_file_rw(const std::string& path) {
     return {static_cast<char*>(p), sz};
 }
 
+// Bytes in memory behind the size() / at(off, n) interface the cell index
+// streams read their old files through.
+struct ByteSpan {
+    const char* data;
+    size_t bytes;
+    uint64_t size() const { return bytes; }
+    const char* at(uint64_t off, size_t) const { return data + off; }
+};
+
 inline void unmap_file(MappedFile& f) {
     if (f.data) { munmap(const_cast<char*>(f.data), f.size); f.data = nullptr; f.size = 0; }
 }
@@ -854,9 +863,11 @@ inline void append_cell_list_delta(std::vector<char>& out, const CellLists& old_
 // kept, and each list is sorted: the same lists rebuild_cells_from_remap
 // gives. Holds one cell's list at a time: the patcher runs on client
 // machines, where materialising planet poi/all (1.1M cells, 25M ids, a 23M
-// entry remap map) cost over 1 GiB. Returns the entries bytes written.
-template <typename Remap, typename OutCells, typename OutEntries>
-uint64_t stream_cell_index(const char* cells, size_t cells_size, const char* entries, size_t entries_size,
+// entry remap map) cost over 1 GiB. The old cells and entries are read
+// front to back through size() and at(off, n) (a ByteSpan, or a file reader
+// whose view lasts until its next call). Returns the entries bytes written.
+template <typename Cells, typename Entries, typename Remap, typename OutCells, typename OutEntries>
+uint64_t stream_cell_index(Cells&& cells, Entries&& entries,
                            std::vector<uint64_t> added, std::vector<uint64_t> removed, Remap remap,
                            const char* delta, size_t delta_size, OutCells out_cells, OutEntries out_entries) {
     auto malformed = [] { throw std::runtime_error("Malformed cell list delta"); };
@@ -905,14 +916,18 @@ uint64_t stream_cell_index(const char* cells, size_t cells_size, const char* ent
     };
 
     // The next rebuilt cell: old cells minus `removed`, merged with `added`.
-    size_t n_cells = cells_size / 12, i = 0, a = 0, r = 0;
+    const uint64_t entries_size = entries.size();
+    size_t n_cells = cells.size() / 12, i = 0, a = 0, r = 0;
     uint64_t prev_old = 0;
     std::vector<uint32_t> ids;
     auto next_source = [&](uint64_t& cid) -> bool {
         for (;;) {
             uint64_t old_cid = NONE;
+            uint32_t off = 0;
             if (i < n_cells) {
-                memcpy(&old_cid, cells + i * 12, 8);
+                const char* rec = cells.at((uint64_t)i * 12, 12);
+                memcpy(&old_cid, rec, 8);
+                memcpy(&off, rec + 8, 4);
                 if (i > 0 && old_cid <= prev_old) bad_index();
             }
             uint64_t add_cid = a < added.size() ? added[a] : NONE;
@@ -924,8 +939,6 @@ uint64_t stream_cell_index(const char* cells, size_t cells_size, const char* ent
             }
             if (add_cid == old_cid) bad_index();
             prev_old = old_cid;
-            uint32_t off;
-            memcpy(&off, cells + i * 12 + 8, 4);
             i++;
             while (r < removed.size() && removed[r] < old_cid) r++;
             if (r < removed.size() && removed[r] == old_cid) continue;
@@ -933,11 +946,11 @@ uint64_t stream_cell_index(const char* cells, size_t cells_size, const char* ent
             ids.clear();
             if (off != 0xFFFFFFFF) {
                 uint16_t n;
-                if ((size_t)off + 2 > entries_size) bad_index();
-                memcpy(&n, entries + off, 2);
-                if ((size_t)off + 2 + (size_t)n * 4 > entries_size) bad_index();
+                if ((uint64_t)off + 2 > entries_size) bad_index();
+                memcpy(&n, entries.at(off, 2), 2);
+                if ((uint64_t)off + 2 + (uint64_t)n * 4 > entries_size) bad_index();
                 ids.resize(n);
-                memcpy(ids.data(), entries + off + 2, (size_t)n * 4);
+                if (n) memcpy(ids.data(), entries.at((uint64_t)off + 2, (size_t)n * 4), (size_t)n * 4);
                 for (auto& id : ids) id = remap(id & 0x7FFFFFFFu) | (id & 0x80000000u);
                 std::sort(ids.begin(), ids.end());
             }
@@ -987,14 +1000,29 @@ uint64_t stream_cell_index(const char* cells, size_t cells_size, const char* ent
 
 // stream_cell_index for an index whose ids don't move (the postcode centroid
 // index): the old index plus the delta.
-template <typename OutCells, typename OutEntries>
-uint64_t stream_cell_list_delta(const char* cells, size_t cells_size, const char* entries, size_t entries_size,
+template <typename Cells, typename Entries, typename OutCells, typename OutEntries>
+uint64_t stream_cell_list_delta(Cells&& cells, Entries&& entries,
                                 const char* delta, size_t delta_size, OutCells out_cells, OutEntries out_entries) {
-    return stream_cell_index(cells, cells_size, entries, entries_size, {}, {}, [](uint32_t id) { return id; },
+    return stream_cell_index(cells, entries, {}, {}, [](uint32_t id) { return id; },
                              delta, delta_size, out_cells, out_entries);
 }
 
 // --- Geo entry list deltas (GEO_ENTRY_DELTA_MARKER) ---
+
+// Reads the (u16 count, u32 ids) list at `off` of an old street / addr /
+// interp entries file (size() / at(off, n), like the cell index streams)
+// into `ids`. NO_DATA, or a list running past the end of the file, reads as
+// empty.
+template <typename Entries>
+void read_entry_list(Entries& entries, uint32_t off, std::vector<uint32_t>& ids) {
+    ids.clear();
+    if (off == 0xFFFFFFFFu || off + 2 > entries.size()) return;
+    uint16_t n;
+    memcpy(&n, entries.at(off, 2), 2);
+    if (off + 2 + (uint64_t)n * 4 > entries.size()) return;
+    ids.resize(n);
+    if (n) memcpy(ids.data(), entries.at((uint64_t)off + 2, (size_t)n * 4), (size_t)n * 4);
+}
 
 // Appends one cell's correction: the ids `derived` (sorted) lost and the
 // ids it gained to become `target`, or `target` whole when it isn't sorted or

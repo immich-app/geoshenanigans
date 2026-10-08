@@ -488,7 +488,8 @@ TEST(patch_format_cell_lists_write_the_cell_index_layout) {
 static std::pair<std::vector<char>, std::vector<char>> apply_delta(
         const std::pair<std::vector<char>, std::vector<char>>& old_index, const std::vector<char>& delta, size_t delta_size) {
     std::pair<std::vector<char>, std::vector<char>> out;
-    stream_cell_list_delta(old_index.first.data(), old_index.first.size(), old_index.second.data(), old_index.second.size(),
+    stream_cell_list_delta(ByteSpan{old_index.first.data(), old_index.first.size()},
+                           ByteSpan{old_index.second.data(), old_index.second.size()},
                            delta.data(), delta_size,
                            [&](const char* p, size_t n) { out.first.insert(out.first.end(), p, p + n); },
                            [&](const char* p, size_t n) { out.second.insert(out.second.end(), p, p + n); });
@@ -563,7 +564,7 @@ TEST(patch_format_stream_cell_index_matches_rebuild_then_delta) {
         std::vector<char> delta;
         append_cell_list_delta(delta, parse_cell_lists(derived.cells_data, derived.entries_data), new_lists);
         std::pair<std::vector<char>, std::vector<char>> got;
-        stream_cell_index(cells.data(), cells.size(), entries.data(), entries.size(), added, removed,
+        stream_cell_index(ByteSpan{cells.data(), cells.size()}, ByteSpan{entries.data(), entries.size()}, added, removed,
                           [&](uint32_t id) { auto f = rm.find(id); return f != rm.end() ? f->second : id; },
                           delta.data(), delta.size(),
                           [&](const char* p, size_t n) { got.first.insert(got.first.end(), p, p + n); },
@@ -732,4 +733,29 @@ TEST(patch_format_geo_list_delta_rejects_truncation_and_disorder) {
     bool threw = false;
     try { parse_geo_list_deltas(back.data(), back.size(), pos, 2); } catch (const std::runtime_error&) { threw = true; }
     CHECK(threw);
+}
+
+// --- read_entry_list ---
+
+TEST(patch_format_read_entry_list_reads_the_list_at_an_offset) {
+    // An empty list at 0, then {5, 6} at 2.
+    std::vector<char> entries = {0, 0, 2, 0, 5, 0, 0, 0, 6, 0, 0, 0};
+    ByteSpan sut{entries.data(), entries.size()};
+    std::vector<uint32_t> ids = {9};
+    read_entry_list(sut, 2, ids);
+    CHECK(ids == std::vector<uint32_t>({5, 6}));
+    read_entry_list(sut, 0, ids);
+    CHECK(ids.empty());
+}
+
+TEST(patch_format_read_entry_list_reads_bad_offsets_as_empty) {
+    std::vector<char> entries = {3, 0, 5, 0, 0, 0, 6, 0, 0, 0};  // count 3, only 2 ids
+    ByteSpan sut{entries.data(), entries.size()};
+    for (uint32_t off : {0xFFFFFFFFu,    // NO_DATA
+                         0u,             // the list overruns the file
+                         9u}) {          // the count runs past the end
+        std::vector<uint32_t> ids = {9};
+        read_entry_list(sut, off, ids);
+        CHECK(ids.empty());
+    }
 }

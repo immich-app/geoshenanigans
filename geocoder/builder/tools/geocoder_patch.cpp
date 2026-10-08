@@ -527,7 +527,7 @@ static int run(int argc, char* argv[]) {
             FILE* fe = open_out(entries_name);
             uint64_t cells_written = 0;
             uint64_t entries_written = stream_cell_list_delta(
-                old_c.data, old_c.size, old_e.data, old_e.size, payload + 8, payload_size - 8,
+                ByteSpan{old_c.data, old_c.size}, ByteSpan{old_e.data, old_e.size}, payload + 8, payload_size - 8,
                 [&](const char* p, size_t n) { fwrite(p, 1, n, fc); cells_written += n; },
                 [&](const char* p, size_t n) { fwrite(p, 1, n, fe); });
             bool ok = !ferror(fc) && !ferror(fe);
@@ -901,15 +901,6 @@ static int run(int argc, char* argv[]) {
         std::vector<uint32_t> buf;
         buf.reserve(4096);
 
-        // Helper: parse IDs from mmap'd entry file
-        auto parse = [&buf](const MappedFile& f, uint32_t off) {
-            buf.clear();
-            if (off == NO || off + 2 > f.size) return;
-            uint16_t c; memcpy(&c, f.data + off, 2);
-            if (off + 2 + (size_t)c * 4 > f.size) return;
-            buf.resize(c);
-            memcpy(buf.data(), f.data + off + 2, c * 4);
-        };
         auto remap = [](std::vector<uint32_t>& ids, const RecordRemap& rm) {
             constexpr uint32_t NO2 = 0xFFFFFFFF;
             for (auto& id : ids) if (id < rm.size() && rm[id] != NO2) id = rm[id];
@@ -932,49 +923,47 @@ static int run(int argc, char* argv[]) {
         size_t old_i = 0, add_i = 0;
         size_t cells_written = 0;
 
-        // oi: the cell's index in the old geo_cells, or ADDED for a new cell.
-        // size_t: planet has ~380M cells and `oi * 20` passes 2^31.
-        constexpr size_t ADDED = SIZE_MAX;
-        auto process_cell = [&](uint64_t cid, size_t oi) {
-            // For each entry type: check correction → remap old → write
-            // The derived list (old list, ids remapped), then this cell's
-            // correction from the diff, if it sent one.
-            auto do_entry = [&](const MappedFile& old_e, size_t geo_off, const RecordRemap& rm,
-                                DeltaCursor& deltas, EntriesOut& outf) -> uint32_t {
-                buf.clear();
-                if (oi != ADDED) {
-                    if (oi * 20 + geo_off + 4 > m_geo.size) {
-                        std::cerr << "OOB: oi=" << oi << " geo_off=" << geo_off << " m_geo.size=" << m_geo.size << std::endl;
-                        return NO;
-                    }
-                    uint32_t off; memcpy(&off, m_geo.data + oi * 20 + geo_off, 4);
-                    parse(old_e, off);
-                    if (!buf.empty()) remap(buf, rm);
-                }
-                if (const GeoListDelta* d = deltas.at(cid)) d->apply(buf, scratch);
-                if (buf.empty()) return NO;
-                return emit(outf, buf.data(), buf.size());
-            };
-
-            uint32_t so = do_entry(m_se, 8, w_rm, cur_s, o_se);
-            uint32_t ao = do_entry(m_ae, 12, a_rm, cur_a, o_ae);
-            uint32_t io = do_entry(m_ie, 16, i_rm, cur_i, o_ie);
+        // The cell's derived list (old list, ids remapped), then its
+        // correction from the diff, if it sent one.
+        auto do_entry = [&](uint64_t cid, ByteSpan old_e, uint32_t old_off, const RecordRemap& rm,
+                            DeltaCursor& deltas, EntriesOut& outf) -> uint32_t {
+            read_entry_list(old_e, old_off, buf);
+            if (!buf.empty()) remap(buf, rm);
+            if (const GeoListDelta* d = deltas.at(cid)) d->apply(buf, scratch);
+            if (buf.empty()) return NO;
+            return emit(outf, buf.data(), buf.size());
+        };
+        // old_offs: the cell's street / addr / interp list offsets in the
+        // old entries files, NO for a new cell.
+        using ListOffsets = std::array<uint32_t, 3>;
+        auto process_cell = [&](uint64_t cid, const ListOffsets& old_offs) {
+            uint32_t so = do_entry(cid, ByteSpan{m_se.data, m_se.size}, old_offs[0], w_rm, cur_s, o_se);
+            uint32_t ao = do_entry(cid, ByteSpan{m_ae.data, m_ae.size}, old_offs[1], a_rm, cur_a, o_ae);
+            uint32_t io = do_entry(cid, ByteSpan{m_ie.data, m_ie.size}, old_offs[2], i_rm, cur_i, o_ie);
             fwrite(&cid, 8, 1, f_geo); fwrite(&so, 4, 1, f_geo); fwrite(&ao, 4, 1, f_geo); fwrite(&io, 4, 1, f_geo);
             cells_written++;
         };
+        const ListOffsets added_cell = {NO, NO, NO};
 
         while (old_i < n_old || add_i < geo_added.size()) {
             uint64_t old_cid = UINT64_MAX, add_cid = UINT64_MAX;
-            if (old_i < n_old) memcpy(&old_cid, m_geo.data + old_i * 20, 8);
+            ListOffsets old_offs = added_cell;
+            if (old_i < n_old) {
+                // One 20-byte record: cell id, then the three list offsets.
+                // size_t: planet has ~380M cells and `old_i * 20` passes 2^31.
+                const char* rec = m_geo.data + old_i * 20;
+                memcpy(&old_cid, rec, 8);
+                memcpy(old_offs.data(), rec + 8, 12);
+            }
             if (add_i < geo_added.size()) add_cid = geo_added[add_i];
 
             if (old_cid <= add_cid) {
                 if (!is_removed(old_cid))
-                    process_cell(old_cid, old_i);
+                    process_cell(old_cid, old_offs);
                 old_i++;
                 if (old_cid == add_cid) add_i++; // skip duplicate add
             } else {
-                process_cell(add_cid, ADDED);
+                process_cell(add_cid, added_cell);
                 add_i++;
             }
 
@@ -1052,7 +1041,7 @@ static int run(int argc, char* argv[]) {
             FILE* fc = open_out(prefix + "_cells.bin");
             FILE* fe = open_out(prefix + "_entries.bin");
             size_t n_out = 0;
-            stream_cell_index(old_c.data, old_c.size, old_e.data, old_e.size, added, removed, remap,
+            stream_cell_index(ByteSpan{old_c.data, old_c.size}, ByteSpan{old_e.data, old_e.size}, added, removed, remap,
                               dit->second.data(), dit->second.size(),
                               [&](const char* p, size_t len) { fwrite(p, 1, len, fc); n_out += len; },
                               [&](const char* p, size_t len) { fwrite(p, 1, len, fe); });
