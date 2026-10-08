@@ -43,7 +43,7 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
@@ -475,6 +475,10 @@ jobs:
           CACHE_BUCKET: ${{ steps.setup.outputs.cache_bucket }}
           TODAY: ${{ steps.setup.outputs.today }}
           PBF_SOURCE: ${{ steps.download.outputs.pbf_source }}
+          WIKIDATA_FILE: ${{ steps.download.outputs.wikidata_sitelinks }}
+          WIKIDATA_DATE: ${{ steps.download.outputs.wikidata_date }}
+          TIGER_FILE: ${{ steps.download.outputs.tiger_data }}
+          GEONAMES_FILE: ${{ steps.download.outputs.postcode_centroids_external }}
         run: |
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 4"
@@ -488,17 +492,14 @@ jobs:
 
           # Build args
           BUILD_ARGS="--continents --multi-output --multi-quality"
-          WIKIDATA_FILE="${{ steps.download.outputs.wikidata_sitelinks }}"
           if [ -n "$WIKIDATA_FILE" ] && [ -f "$WIKIDATA_FILE" ]; then
             BUILD_ARGS="$BUILD_ARGS --wikidata-sitelinks $WIKIDATA_FILE"
-            echo "Using wikidata sitelinks from ${{ steps.download.outputs.wikidata_date }}"
+            echo "Using wikidata sitelinks from $WIKIDATA_DATE"
           fi
-          TIGER_FILE="${{ steps.download.outputs.tiger_data }}"
           if [ -n "$TIGER_FILE" ] && [ -f "$TIGER_FILE" ]; then
             BUILD_ARGS="$BUILD_ARGS --tiger-data $TIGER_FILE"
             echo "Using TIGER address data"
           fi
-          GEONAMES_FILE="${{ steps.download.outputs.postcode_centroids_external }}"
           if [ -n "$GEONAMES_FILE" ] && [ -f "$GEONAMES_FILE" ]; then
             BUILD_ARGS="$BUILD_ARGS --external-postcodes $GEONAMES_FILE"
             echo "Using GeoNames postcode data"
@@ -790,6 +791,7 @@ jobs:
           NEW_DATE: ${{ steps.setup.outputs.today }}
           OLD_DATE: ${{ steps.setup.outputs.yesterday }}
           HAS_PREVIOUS: ${{ steps.setup.outputs.has_previous }}
+          WIKIDATA_DATE: ${{ steps.download.outputs.wikidata_date || 'null' }}
         run: |
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
@@ -827,7 +829,7 @@ jobs:
           jq --arg date "$NEW_DATE" \
              --arg previous "$PREV_VAL" \
              --arg built_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-             --arg wikidata_date "${{ steps.download.outputs.wikidata_date || 'null' }}" \
+             --arg wikidata_date "$WIKIDATA_DATE" \
              '.build = ((.build // {}) + {date: $date, previous: (if $previous == "null" then null else $previous end), built_at: $built_at, wikidata_date: (if $wikidata_date == "null" then null else $wikidata_date end)})' \
              "$WORKDIR/output/configurations.json" > "$WORKDIR/output/configurations.tmp" \
              && mv "$WORKDIR/output/configurations.tmp" "$WORKDIR/output/configurations.json"
@@ -1068,7 +1070,7 @@ jobs:
 
       - name: Upload build log artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: build-log
           path: ${{ steps.setup.outputs.workdir }}/build.log
@@ -1077,7 +1079,7 @@ jobs:
 
       - name: Upload per-variant diff logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: diff-logs
           path: ${{ steps.setup.outputs.workdir }}/diff-logs/

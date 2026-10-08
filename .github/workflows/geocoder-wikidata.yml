@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
@@ -74,8 +74,9 @@ jobs:
 
       - name: Download and extract sitelinks
         if: steps.dump.outputs.skip != 'true'
+        env:
+          DUMP_DATE: ${{ steps.dump.outputs.date }}
         run: |
-          DUMP_DATE="${{ steps.dump.outputs.date }}"
           URL="https://dumps.wikimedia.org/wikidatawiki/$DUMP_DATE/wikidatawiki-${DUMP_DATE}-wb_items_per_site.sql.gz"
           echo "Downloading $URL..."
           START=$(date +%s)
@@ -93,9 +94,10 @@ jobs:
 
       - name: Upload to Tigris
         if: steps.dump.outputs.skip != 'true'
+        env:
+          DUMP_DATE: ${{ steps.dump.outputs.date }}
         run: |
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5"
-          DUMP_DATE="${{ steps.dump.outputs.date }}"
 
           # Upload dated version
           $S5 cp /tmp/qid_sitelinks.bin "s3://$S3_BUCKET/geocoder/wikidata/$DUMP_DATE/qid_sitelinks.bin"
@@ -114,12 +116,15 @@ jobs:
 
       - name: Summary
         if: always()
+        env:
+          DUMP_DATE: ${{ steps.dump.outputs.date }}
+          SKIP: ${{ steps.dump.outputs.skip }}
         run: |
           echo "## Wikidata Sitelinks Update" >> "$GITHUB_STEP_SUMMARY"
-          if [ "${{ steps.dump.outputs.skip }}" = "true" ]; then
-            echo "Already up to date (dump ${{ steps.dump.outputs.date }})" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$SKIP" = "true" ]; then
+            echo "Already up to date (dump $DUMP_DATE)" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "- Dump date: ${{ steps.dump.outputs.date }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Dump date: $DUMP_DATE" >> "$GITHUB_STEP_SUMMARY"
             if [ -f /tmp/qid_sitelinks.bin ]; then
               echo "- Entries: $(( $(stat -c%s /tmp/qid_sitelinks.bin) / 6 ))" >> "$GITHUB_STEP_SUMMARY"
               echo "- Size: $(( $(stat -c%s /tmp/qid_sitelinks.bin) / 1024 / 1024 )) MiB" >> "$GITHUB_STEP_SUMMARY"
