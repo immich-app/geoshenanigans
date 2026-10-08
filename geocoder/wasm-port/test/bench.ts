@@ -1,12 +1,10 @@
-// Three-way benchmark: WASM port (in-process), TS port (in-process),
-// and the Rust HTTP server. Same v14 admin+place+postcode index for
-// all three.
+// Two-way benchmark: WASM port (in-process) and the Rust HTTP server.
+// Same v14 admin+place+postcode index for both.
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { Geocoder as WasmGeocoder } from "../pkg/geocoder_wasm.js";
-import { Geocoder as TsGeocoder } from "../../ts-port/src/index.js";
 
 const dataDir = process.env.GEOCODER_DATA ?? "/home/zack/geocoder-data-v14";
 const rustUrl = process.env.RUST_URL ?? "http://localhost:3556";
@@ -56,11 +54,6 @@ function readOptional(name: string): Buffer | null {
   try { return readFileSync(join(dataDir, name)); } catch { return null; }
 }
 
-console.log(`Loading TS port…`);
-const tT = performance.now();
-const tsGeo = new TsGeocoder(dataDir);
-console.log(`  TS loaded in ${(performance.now() - tT).toFixed(0)} ms`);
-
 console.log(`Loading WASM port…`);
 const tW = performance.now();
 const wasmGeo = new WasmGeocoder({
@@ -89,7 +82,6 @@ const wasmGeo = new WasmGeocoder({
 console.log(`  WASM loaded in ${(performance.now() - tW).toFixed(0)} ms`);
 
 await bench("WASM port (in-process)", (lat, lng) => wasmGeo.reverse(lat, lng));
-await bench("TS port (in-process)", (lat, lng) => tsGeo.reverse(lat, lng));
 await bench(`Rust HTTP @ ${rustUrl}`, async (lat, lng) => {
   const r = await fetch(`${rustUrl}/reverse?lat=${lat}&lon=${lng}&key=${apiKey}`);
   await r.json();

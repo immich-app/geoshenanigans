@@ -1,7 +1,7 @@
 // Per-implementation throughput driver.  Runs a single port in
 // isolation so the reported RSS reflects only that port's working set.
 //
-// Configs (set via TARGET env): wasm | ts | rust
+// Configs (set via TARGET env): wasm | rust
 // Other knobs:
 //   N=<int>             requests per scenario (default 5000)
 //   GEOCODER_DATA=<path>
@@ -13,7 +13,7 @@
 import { openSync, readFileSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
 
-const target = process.env.TARGET ?? "wasm"; // wasm | ts | rust
+const target = process.env.TARGET ?? "wasm"; // wasm | rust
 const N = Number(process.env.N ?? 5000);
 const dataDir = process.env.GEOCODER_DATA ?? "/home/zack/geocoder-data-v14";
 const rustUrl = process.env.RUST_URL ?? "http://localhost:3556";
@@ -110,12 +110,6 @@ if (target === "wasm") {
   for (const k of Object.keys(buffers)) delete (buffers as Record<string, unknown>)[k];
   // Bun.gc(true) is synchronous; node-style globalThis.gc() exists if --expose-gc.
   (globalThis as { Bun?: { gc: (sync: boolean) => void } }).Bun?.gc(true);
-  loadMs = performance.now() - t0;
-  runner = (lat, lng) => geo.reverse(lat, lng);
-} else if (target === "ts") {
-  const { Geocoder } = await import("../../ts-port/src/index.js");
-  const t0 = performance.now();
-  const geo = new Geocoder(dataDir);
   loadMs = performance.now() - t0;
   runner = (lat, lng) => geo.reverse(lat, lng);
 } else if (target === "rust") {

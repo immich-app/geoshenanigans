@@ -20,7 +20,6 @@ import { openSync, readFileSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 import { Geocoder as WasmGeocoder, set_js_read } from "../pkg/geocoder_wasm.js";
-import { Geocoder as TsGeocoder } from "../../ts-port/src/index.js";
 
 const dataDir = process.env.GEOCODER_DATA ?? "/home/zack/geocoder-data-v14";
 const rustUrl = process.env.RUST_URL ?? "http://localhost:3556";
@@ -88,7 +87,6 @@ for (const name of [
   else if (e.chunked) wasmBuffers[`${name}_chunked`] = e.chunked;
 }
 
-const tsGeo = new TsGeocoder(dataDir);
 const wasmGeo = new WasmGeocoder(wasmBuffers);
 
 // Spread of test coords for FAR scenario.
@@ -111,7 +109,6 @@ interface Bench {
 
 const benches: Bench[] = [
   { name: "WASM",     run: (lat, lng) => wasmGeo.reverse(lat, lng) },
-  { name: "TS",       run: (lat, lng) => tsGeo.reverse(lat, lng) },
   { name: "RustHTTP", run: async (lat, lng) => {
       const r = await fetch(`${rustUrl}/reverse?lat=${lat}&lon=${lng}&key=${apiKey}`);
       await r.json();
