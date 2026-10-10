@@ -441,6 +441,24 @@ TEST(partition_strings_handles_an_empty_pool) {
 
 // --- Cell maps ---
 
+TEST(cell_lists_lists_every_cell_once_with_its_own_list) {
+    std::unordered_map<uint64_t, std::vector<uint32_t>> m;
+    Rng r(5);
+    for (uint32_t c = 0; c < 70000; c++) m[r.g()].push_back(c);
+    for (unsigned threads : kThreadCounts) {
+        auto cells = cell_lists(m, threads);
+        REQUIRE(cells.size() == m.size());
+        std::set<uint64_t> seen;
+        bool own = true;
+        for (const auto& [cell, ids] : cells) {
+            seen.insert(cell);
+            own = own && ids == &m.at(cell);
+        }
+        CHECK_EQ(seen.size(), m.size());
+        CHECK(own);
+    }
+}
+
 TEST(sorted_item_cells_orders_by_cell_then_item) {
     Rng r(21);
     std::vector<uint64_t> cells(200000);

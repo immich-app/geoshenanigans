@@ -728,13 +728,15 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
 
 // --- Deduplicate IDs per cell ---
 
-// Every cell of a cell map with its id list, in the map's iteration order.
+// Every cell of a cell map with its id list, in bucket order. The buckets are
+// walked on every core: following the map's node list is a cache miss per
+// cell on one core, most of a minute for the planet's addr cells.
 template<typename Map>
-inline std::vector<std::pair<uint64_t, std::vector<uint32_t>*>> cell_lists(Map& cell_map) {
-    std::vector<std::pair<uint64_t, std::vector<uint32_t>*>> cells;
-    cells.reserve(cell_map.size());
-    for (auto& [cell_id, ids] : cell_map) cells.push_back({cell_id, &ids});
-    return cells;
+inline std::vector<std::pair<uint64_t, std::vector<uint32_t>*>> cell_lists(Map& cell_map, unsigned threads = 0) {
+    using Cell = std::pair<uint64_t, std::vector<uint32_t>*>;
+    return parallel_collect<Cell>(cell_map.bucket_count(), [&](size_t b, std::vector<Cell>& out) {
+        for (auto it = cell_map.begin(b); it != cell_map.end(b); ++it) out.push_back({it->first, &it->second});
+    }, threads);
 }
 
 // Sorts and dedups each cell's ids, on every core.
@@ -751,7 +753,7 @@ inline void deduplicate_lists(const std::vector<std::pair<uint64_t, std::vector<
 
 template<typename Map>
 inline void deduplicate(Map& cell_map, unsigned threads = 0) {
-    deduplicate_lists(cell_lists(cell_map), threads);
+    deduplicate_lists(cell_lists(cell_map, threads), threads);
 }
 
 // (cell_id, item_id) pairs for items that each sit in one cell, cells[item],

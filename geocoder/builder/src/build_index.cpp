@@ -1649,11 +1649,9 @@ static void rebuild_cell_maps_for_cache(ParsedData& data,
 // cores; fn must touch only the list it is given.
 template <typename Fn>
 static void for_each_admin_cell_list(ParsedData& data, unsigned int threads, Fn fn) {
-    std::vector<std::vector<uint32_t>*> lists;
-    lists.reserve(data.cell_to_admin.size());
-    for (auto& [cell_id, ids] : data.cell_to_admin) lists.push_back(&ids);
-    parallel_for(lists.size(), [&](size_t begin, size_t end, unsigned) {
-        for (size_t i = begin; i < end; i++) fn(*lists[i]);
+    const auto cells = cell_lists(data.cell_to_admin, threads);
+    parallel_for(cells.size(), [&](size_t begin, size_t end, unsigned) {
+        for (size_t i = begin; i < end; i++) fn(*cells[i].second);
     }, threads);
 }
 

@@ -574,7 +574,7 @@ inline void reorder_admin_polygons(ParsedData& data, unsigned threads = 0) {
         if (pid != NO_DATA && pid < n) pid = old_to_new[pid];
     });
     // Remap admin cell entries
-    const auto cells = cell_lists(data.cell_to_admin);
+    const auto cells = cell_lists(data.cell_to_admin, threads);
     remap_each(cells.size(), [&](size_t c) {
         auto& ids = *cells[c].second;
         for (auto& id : ids) {
