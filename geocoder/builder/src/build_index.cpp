@@ -3156,10 +3156,28 @@ static int run(int argc, char* argv[]) {
                 log_phase("    Pass 2: node streaming", _st, _sc);
 
                 // Pool ids per thread, interned in the order the merges
-                // below meet each thread's strings.
-                std::vector<DictIds> name_ids;
-                name_ids.reserve(ntld.size());
-                for (auto& local : ntld) name_ids.emplace_back(local.strings, data.string_pool);
+                // below meet each thread's strings: address points, POI
+                // nodes, then place nodes, thread by thread.
+                auto _mt = _st;
+                auto _mc = _sc;
+                const size_t n_tl = ntld.size();
+                std::vector<const StringDict*> dicts;
+                for (const auto& local : ntld) dicts.push_back(&local.strings);
+                std::vector<uint32_t> run_dict(3 * n_tl);
+                for (size_t r = 0; r < run_dict.size(); r++) run_dict[r] = static_cast<uint32_t>(r % n_tl);
+                const auto name_ids = intern_dicts(dicts, run_dict, [&](uint32_t r, auto&& emit) {
+                    const auto& local = ntld[r % n_tl];
+                    if (r < n_tl) {
+                        for (size_t j = 0; j < local.addr_strings.size(); j++) {
+                            emit(local.addr_strings[j].second);
+                            emit(local.addr_strings[j].first);
+                            emit(local.addr_postcodes[j]);
+                        }
+                    } else {
+                        for (uint32_t code : r < 2 * n_tl ? local.poi_names : local.place_names) emit(code);
+                    }
+                }, data.string_pool);
+                log_phase("      Node merge: strings", _mt, _mc);
 
                 // Merge address points
                 uint64_t total_addrs = 0;
@@ -3651,8 +3669,43 @@ static int run(int argc, char* argv[]) {
                     g.last_node_id = wg.last_node_id;
                     return g;
                 };
-                for (auto& local : tld) {
-                    DictIds name_id(local.strings, data.string_pool);
+                // Pool ids per thread, interned in the order the merge below
+                // meets each thread's strings: its ways, building addresses,
+                // interpolations, then POI ways.
+                auto _mt = _st;
+                auto _mc = _sc;
+                std::vector<const StringDict*> dicts;
+                for (const auto& local : tld) dicts.push_back(&local.strings);
+                std::vector<uint32_t> run_dict(4 * tld.size());
+                for (size_t r = 0; r < run_dict.size(); r++) run_dict[r] = static_cast<uint32_t>(r / 4);
+                const auto name_ids = intern_dicts(dicts, run_dict, [&](uint32_t r, auto&& emit) {
+                    const auto& local = tld[r / 4];
+                    switch (r % 4) {
+                    case 0:
+                        for (size_t i = 0; i < local.ways.size(); i++) {
+                            emit(local.way_strings[i]);
+                            emit(local.way_orig_names[i]);
+                        }
+                        break;
+                    case 1:
+                        for (size_t i = 0; i < local.building_addrs.size(); i++) {
+                            emit(local.addr_strings[i].second);
+                            emit(local.addr_strings[i].first);
+                            emit(local.addr_postcodes[i]);
+                        }
+                        break;
+                    case 2:
+                        for (uint32_t code : local.interp_strings) emit(code);
+                        break;
+                    default:
+                        for (const auto& pw : local.poi_ways) emit(pw.name);
+                        break;
+                    }
+                }, data.string_pool);
+                log_phase("      Way merge: strings", _mt, _mc);
+                for (size_t k = 0; k < tld.size(); k++) {
+                    auto& local = tld[k];
+                    const DictIds& name_id = name_ids[k];
                     uint32_t way_base = static_cast<uint32_t>(data.ways.size());
                     uint32_t node_base = static_cast<uint32_t>(data.street_nodes.size());
                     uint32_t interp_base = static_cast<uint32_t>(data.interp_ways.size());

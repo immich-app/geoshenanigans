@@ -25,6 +25,15 @@ public:
         return offset;
     }
 
+    // The offset of s if it is pooled, else kAbsent. Many threads may look
+    // up at once while nothing interns.
+    static constexpr uint32_t kAbsent = UINT32_MAX;
+    uint32_t find(const std::string& s) const {
+        if (released_) throw std::logic_error("StringPool::find after release_index");
+        auto it = index_.find(s);
+        return it == index_.end() ? kAbsent : it->second;
+    }
+
     // Frees the lookup table once nothing interns any more (GiBs on planet).
     void release_index() {
         std::unordered_map<std::string, uint32_t>().swap(index_);

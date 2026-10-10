@@ -1,7 +1,8 @@
-// StringDict / DictIds: dictionary codes are stable per distinct string, and
-// interning through DictIds leaves the pool exactly as interning every value.
+// StringDict / intern_dicts: dictionary codes are stable per distinct string,
+// and intern_dicts leaves the pool exactly as interning every value.
 #include "string_dict.h"
 
+#include <algorithm>
 #include <random>
 #include <string>
 #include <unordered_map>
@@ -51,28 +52,108 @@ TEST(string_dict_stores_oversized_strings) {
     CHECK_EQ(dict.add(big.c_str()), b);
 }
 
-TEST(dict_ids_intern_like_every_value) {
-    std::vector<const char*> values = {"Elm St", "12", "Elm St", "", "12", "Oak Ave", "Elm St",
-                                       nullptr, "9", "Oak Ave", nullptr, "12"};
-    StringPool direct, cached;
-    for (StringPool* pool : {&direct, &cached}) {
-        pool->intern("Oak Ave");  // already pooled before the merge
-        pool->intern("x");
+namespace {
+
+// A merge's input: per thread a dict and the codes of its runs, plus the
+// order the merge reads the runs in.
+struct MergeInput {
+    std::vector<StringDict> dicts;
+    std::vector<std::vector<uint32_t>> run_codes;
+    std::vector<uint32_t> run_dict;
+    std::vector<std::vector<const char*>> run_values;  // nullptr: kNone
+};
+
+// Interning every value in run order, as a serial merge would.
+std::vector<std::vector<uint32_t>> intern_each_value(const MergeInput& in, StringPool& pool) {
+    std::vector<std::vector<uint32_t>> ids;
+    for (const auto& values : in.run_values) {
+        ids.emplace_back();
+        for (const char* v : values) ids.back().push_back(v ? pool.intern(v) : NO_DATA);
     }
+    return ids;
+}
 
-    std::vector<uint32_t> want;
-    for (const char* v : values) want.push_back(v ? direct.intern(v) : NO_DATA);
+std::vector<std::vector<uint32_t>> intern_bulk(const MergeInput& in, StringPool& pool, unsigned threads) {
+    std::vector<const StringDict*> dicts;
+    for (const auto& d : in.dicts) dicts.push_back(&d);
+    auto dict_ids = intern_dicts(dicts, in.run_dict, [&](uint32_t r, auto&& emit) {
+        for (uint32_t code : in.run_codes[r]) emit(code);
+    }, pool, threads);
+    std::vector<std::vector<uint32_t>> ids;
+    for (size_t r = 0; r < in.run_codes.size(); r++) {
+        ids.emplace_back();
+        for (uint32_t code : in.run_codes[r]) ids.back().push_back(dict_ids[in.run_dict[r]](code));
+    }
+    return ids;
+}
 
-    StringDict dict;
-    std::vector<uint32_t> codes;
+MergeInput new_merge_input(size_t n_dicts, size_t runs_per_dict, size_t values_per_run, uint32_t seed,
+                           std::vector<std::string>& storage) {
+    std::mt19937 rng(seed);
+    storage.clear();
+    for (int i = 0; i < 5000; i++)
+        storage.push_back((rng() % 3 ? "street " : "") + std::to_string(rng() % 4000) + std::string(rng() % 20, 'z'));
+    MergeInput in;
+    in.dicts.resize(n_dicts);
+    for (size_t s = 0; s < runs_per_dict; s++)
+        for (size_t d = 0; d < n_dicts; d++) in.run_dict.push_back(static_cast<uint32_t>(d));
+    std::shuffle(in.run_dict.begin(), in.run_dict.end(), rng);
+    in.run_values.resize(in.run_dict.size());
+    for (auto& values : in.run_values) {
+        size_t n = rng() % (2 * values_per_run + 1);
+        for (size_t i = 0; i < n; i++)
+            values.push_back(rng() % 10 == 0 ? nullptr : storage[rng() % storage.size()].c_str());
+    }
     // Codes come from parse order, which need not be merge order.
-    for (size_t i = values.size(); i-- > 0;)
-        if (values[i]) dict.add(values[i]);
-    for (const char* v : values) codes.push_back(v ? dict.add(v) : StringDict::kNone);
-    DictIds ids(dict, cached);
-    std::vector<uint32_t> got;
-    for (uint32_t code : codes) got.push_back(ids(code));
+    std::vector<size_t> parse(in.run_values.size());
+    for (size_t r = 0; r < parse.size(); r++) parse[r] = r;
+    std::shuffle(parse.begin(), parse.end(), rng);
+    for (size_t r : parse)
+        for (const char* v : in.run_values[r])
+            if (v) in.dicts[in.run_dict[r]].add(v);
+    for (size_t r = 0; r < in.run_values.size(); r++) {
+        in.run_codes.emplace_back();
+        for (const char* v : in.run_values[r])
+            in.run_codes.back().push_back(v ? in.dicts[in.run_dict[r]].add(v) : StringDict::kNone);
+    }
+    return in;
+}
 
-    CHECK(got == want);
-    CHECK(cached.data() == direct.data());
+}  // namespace
+
+TEST(intern_dicts_interns_like_every_value_in_merge_order) {
+    std::vector<std::string> storage;
+    for (uint32_t seed : {1u, 2u, 3u}) {
+        MergeInput in = new_merge_input(7, 4, 3000, seed, storage);
+        StringPool direct;
+        direct.intern(storage[0]);  // already pooled before the merge
+        direct.intern("unrelated");
+        auto want = intern_each_value(in, direct);
+        for (unsigned threads : {1u, 3u, 8u}) {
+            StringPool bulk;
+            bulk.intern(storage[0]);
+            bulk.intern("unrelated");
+            auto got = intern_bulk(in, bulk, threads);
+            CHECK(got == want);
+            CHECK(bulk.data() == direct.data());
+            CHECK_EQ(bulk.intern("unrelated"), direct.intern("unrelated"));
+        }
+    }
+}
+
+TEST(intern_dicts_skips_codes_the_merge_never_reads) {
+    StringDict dict;
+    uint32_t elm = dict.add("Elm St");
+    dict.add("never read");
+    uint32_t twelve = dict.add("12");
+    StringPool pool;
+    std::vector<const StringDict*> dicts = {&dict};
+    std::vector<uint32_t> codes = {twelve, StringDict::kNone, elm, twelve};
+    auto ids = intern_dicts(dicts, {0}, [&](uint32_t, auto&& emit) {
+        for (uint32_t c : codes) emit(c);
+    }, pool);
+    CHECK_EQ(ids[0](twelve), 0u);
+    CHECK_EQ(ids[0](elm), 3u);
+    CHECK_EQ(ids[0](StringDict::kNone), NO_DATA);
+    CHECK_EQ(std::string(pool.data().data(), pool.data().size()), std::string("12\0Elm St\0", 10));
 }
