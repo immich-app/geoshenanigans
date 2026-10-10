@@ -9,9 +9,10 @@ records each one's raw size, compressed size and raw sha256 in
 configurations.json["files"]. The .bin files stay: patch generation may still
 be reading them, so the caller removes them.
 
-zstd level 19 gives essentially the same ratio as --ultra -22 on our
-structured binary data (3 of 5 sampled files identical, the largest gain was
-2.1% on strings.bin) at ~10x less CPU; levels below 19 cost 25-30% in size.
+zstd level 18 compresses our structured binary data to within 0.3% of
+level 19 (itself within ~2% of --ultra -22) at 21% less CPU; level 17 and
+below cost 25-30% in size (planet samples of geo_cells, addr_points,
+addr_vertices, street_nodes and strings_addr).
 
 Scheduling: one worker per core, largest file first, each file compressed
 with zstd threads in proportion to its size. zstd only splits a file into
@@ -27,7 +28,7 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
-LEVEL = "-19"
+LEVEL = "-18"
 BYTES_PER_THREAD = 256 << 20
 MAX_THREADS_PER_FILE = 16
 
