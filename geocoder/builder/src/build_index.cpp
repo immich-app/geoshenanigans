@@ -3919,10 +3919,11 @@ static int run(int argc, char* argv[]) {
                     uint64_t way_count = 0;
                     uint64_t building_addr_count = 0;
                     uint64_t interp_count = 0;
-                    // Way geometries for parallel admin assembly
+                    // Way geometries for parallel admin assembly. Locations
+                    // stay packed (8 B, not 16) until the merge decodes them.
                     struct WayGeomEntry {
                         int64_t way_id;
-                        std::vector<std::pair<double,double>> coords;
+                        std::vector<PackedLocation> locs;
                         int64_t first_node_id;
                         int64_t last_node_id;
                     };
@@ -3949,13 +3950,7 @@ static int run(int argc, char* argv[]) {
                     };
                     std::vector<PoiWayEntry> poi_ways;
                     // POI way geometries for relation assembly
-                    struct PoiWayGeomEntry {
-                        int64_t way_id;
-                        std::vector<std::pair<double,double>> coords;
-                        int64_t first_node_id;
-                        int64_t last_node_id;
-                    };
-                    std::vector<PoiWayGeomEntry> poi_way_geoms;
+                    std::vector<WayGeomEntry> poi_way_geoms;
                 };
 
                 static thread_local ThreadLocalData* tl_way_data = nullptr;
@@ -4082,20 +4077,24 @@ static int run(int argc, char* argv[]) {
                         }
                     }
 
+                    auto valid_locs = [&] {
+                        std::vector<PackedLocation> geom;
+                        geom.reserve(refs_size);
+                        for (const auto& loc : resolved_locs)
+                            if (loc.valid()) geom.push_back(loc);
+                        return geom;
+                    };
+
                     // Admin boundary member ways
                     if (refs_size > 0 && is_admin_way(way_id)) {
-                        std::vector<std::pair<double,double>> geom;
-                        for (const auto& loc : resolved_locs)
-                            if (loc.valid()) geom.push_back({loc.lat(), loc.lon()});
+                        auto geom = valid_locs();
                         if (!geom.empty())
                             local.way_geoms.push_back({way_id, std::move(geom), refs_data[0], refs_data[refs_size-1]});
                     }
 
                     // POI way geometries for relation assembly
                     if (refs_size > 0 && is_poi_way(way_id)) {
-                        std::vector<std::pair<double,double>> geom;
-                        for (const auto& loc : resolved_locs)
-                            if (loc.valid()) geom.push_back({loc.lat(), loc.lon()});
+                        auto geom = valid_locs();
                         if (!geom.empty())
                             local.poi_way_geoms.push_back({way_id, std::move(geom), refs_data[0], refs_data[refs_size-1]});
                     }
@@ -4254,6 +4253,14 @@ static int run(int argc, char* argv[]) {
                 // Merge thread-local way/interp data into main ParsedData
                 std::cerr << "  Merging thread-local data..." << std::endl;
                 uint64_t total_ways = 0, total_building_addrs = 0, total_interps = 0;
+                auto to_geometry = [](const ThreadLocalData::WayGeomEntry& wg) {
+                    ParsedData::WayGeometry g;
+                    g.coords.reserve(wg.locs.size());
+                    for (const auto& loc : wg.locs) g.coords.push_back({loc.lat(), loc.lon()});
+                    g.first_node_id = wg.first_node_id;
+                    g.last_node_id = wg.last_node_id;
+                    return g;
+                };
                 for (auto& local : tld) {
                     uint32_t way_base = static_cast<uint32_t>(data.ways.size());
                     uint32_t node_base = static_cast<uint32_t>(data.street_nodes.size());
@@ -4330,13 +4337,8 @@ static int run(int argc, char* argv[]) {
 
                     // Merge way geometries for admin assembly
                     {
-                        for (auto& wg : local.way_geoms) {
-                            ParsedData::WayGeometry g;
-                            g.coords = std::move(wg.coords);
-                            g.first_node_id = wg.first_node_id;
-                            g.last_node_id = wg.last_node_id;
-                            data.way_geometries[wg.way_id] = std::move(g);
-                        }
+                        for (auto& wg : local.way_geoms)
+                            data.way_geometries[wg.way_id] = to_geometry(wg);
                         local.way_geoms.clear();
                         local.way_geoms.shrink_to_fit();
                     }
@@ -4344,13 +4346,8 @@ static int run(int argc, char* argv[]) {
                     // Merge POI way geometries for relation assembly
                     for (auto& wg : local.poi_way_geoms) {
                         // Store in way_geometries (shared with admin — no conflict since IDs differ)
-                        if (data.way_geometries.find(wg.way_id) == data.way_geometries.end()) {
-                            ParsedData::WayGeometry g;
-                            g.coords = std::move(wg.coords);
-                            g.first_node_id = wg.first_node_id;
-                            g.last_node_id = wg.last_node_id;
-                            data.way_geometries[wg.way_id] = std::move(g);
-                        }
+                        if (data.way_geometries.find(wg.way_id) == data.way_geometries.end())
+                            data.way_geometries[wg.way_id] = to_geometry(wg);
                     }
                     local.poi_way_geoms.clear();
                     local.poi_way_geoms.shrink_to_fit();
