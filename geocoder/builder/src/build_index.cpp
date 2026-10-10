@@ -2393,8 +2393,10 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
 
 // Deterministically sort/reorder/dedup/remap all data so the same input yields
 // the same on-disk byte layout regardless of thread scheduling (enables patching).
-static void reorder_deterministically(ParsedData& data, std::vector<float>& poi_elevations,
-                std::vector<uint32_t>& poi_qids, const std::vector<QidSitelinks>& sitelinks_data) {
+// The POI side arrays and sitelinks serve only the POI step: taken by value,
+// they are gone before the write phase.
+static void reorder_deterministically(ParsedData& data, std::vector<float> poi_elevations,
+                std::vector<uint32_t> poi_qids, std::vector<QidSitelinks> sitelinks_data) {
     std::cerr << "Deterministic ordering..." << std::endl;
     auto _st = std::chrono::steady_clock::now();
     auto _sc = CpuTicks::now();
@@ -4893,7 +4895,7 @@ static int run(int argc, char* argv[]) {
     }
 
     // --- Deterministic ordering ---
-    reorder_deterministically(data, poi_elevations, poi_qids, sitelinks_data);
+    reorder_deterministically(data, std::move(poi_elevations), std::move(poi_qids), std::move(sitelinks_data));
 
     // --- Write index files ---
     write_all_index_files(data, cfg, quality_scales, generate_continents, _pt, _cpu);
