@@ -113,11 +113,21 @@ inline Winners resolve_winners(const std::vector<std::unique_ptr<ChangeChunk>>& 
             g = g_end;
         }
     }, threads);
+    // The winners by type: entries sort by type first.
+    std::vector<uint32_t> won = parallel_filter(n, [&](size_t i) { return wins[i] != 0; }, threads);
     Winners out;
-    for (size_t i = 0; i < n; i++) {
-        if (!wins[i]) continue;
-        const Entry& e = entries[i];
-        out[e.type].push_back({e.key, {&object(e), &chunks[e.chunk]->store}, false});
+    for (size_t t = 0, begin = 0; t < kOsmTypes; t++) {
+        size_t end = size_t(std::partition_point(won.begin() + begin, won.end(),
+                                                 [&](uint32_t i) { return entries[i].type == t; }) -
+                            won.begin());
+        out[t].resize(end - begin);
+        parallel_for(end - begin, [&](size_t b, size_t e, unsigned) {
+            for (size_t k = b; k < e; k++) {
+                const Entry& x = entries[won[begin + k]];
+                out[t][k] = {x.key, {&object(x), &chunks[x.chunk]->store}, false};
+            }
+        }, threads);
+        begin = end;
     }
     return out;
 }
