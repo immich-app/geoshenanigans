@@ -159,6 +159,16 @@ std::vector<BlobInfo> scan_pbf_blobs(const std::string& filename, unsigned threa
 
 // --- Blob decompression ---
 
+// Reads a blob's Blob message into blob_buf, reusing its capacity.
+static void read_blob_into(int fd, const BlobInfo& info, std::string& blob_buf) {
+    size_t blob_offset = info.offset + 4 + info.header_size;
+    blob_buf.resize(info.data_size);
+    ssize_t n = pread(fd, blob_buf.data(), info.data_size, blob_offset);
+    if (n != (ssize_t)info.data_size) {
+        throw std::runtime_error("pread failed");
+    }
+}
+
 // A thread's inflate state, reset for each blob and ended with the thread.
 struct Inflater {
     z_stream strm{};
@@ -171,16 +181,8 @@ struct Inflater {
     Inflater& operator=(const Inflater&) = delete;
 };
 
-// Reusable-buffer version: avoids allocation after warmup
-static void read_and_decompress_blob_into(int fd, const BlobInfo& info,
-                                            std::string& blob_buf, std::string& out) {
-    size_t blob_offset = info.offset + 4 + info.header_size;
-    blob_buf.resize(info.data_size);
-    ssize_t n = pread(fd, blob_buf.data(), info.data_size, blob_offset);
-    if (n != (ssize_t)info.data_size) {
-        throw std::runtime_error("pread failed");
-    }
-
+// Decompresses the Blob message in blob_buf into `out`, reusing its capacity.
+static void inflate_blob_into(const std::string& blob_buf, std::string& out) {
     protozero::pbf_reader blob_pbf(blob_buf);
     protozero::data_view raw_view{}, zlib_view{};
     int32_t raw_size = 0;
@@ -211,6 +213,13 @@ static void read_and_decompress_blob_into(int fd, const BlobInfo& info,
         return;
     }
     throw std::runtime_error("blob has no data");
+}
+
+// Reusable-buffer version: avoids allocation after warmup
+static void read_and_decompress_blob_into(int fd, const BlobInfo& info,
+                                            std::string& blob_buf, std::string& out) {
+    read_blob_into(fd, info, blob_buf);
+    inflate_blob_into(blob_buf, out);
 }
 
 std::string read_and_decompress_blob(int fd, const BlobInfo& info) {
@@ -826,8 +835,8 @@ PbfFile::PbfFile(const std::string& filename, unsigned num_threads)
 }
 
 // Lightweight I/O semaphore — limits concurrent preads without queue overhead.
-// All threads still do their own read+decode+callback, but only max_io threads
-// can be in the pread phase simultaneously.
+// All threads still do their own read+inflate+decode+callback, but only max_io
+// threads can be in the pread phase simultaneously.
 struct IoSemaphore {
     std::mutex mtx;
     std::condition_variable cv;
@@ -860,8 +869,10 @@ static unsigned max_concurrent_reads(unsigned threads) {
 
 // Reads and decompresses the blobs `indices` names on `threads` threads,
 // each taking the next blob as it frees up, and runs decode(j, data, size) on
-// blob indices[j] in the thread that read it. Logs the time spent per stage
-// under `label`.
+// blob indices[j] in the thread that read it. Only the pread is limited:
+// inflating is most of a blob's cost when the file is cached, and limited
+// with it, half the cores would idle. Logs the time spent per stage under
+// `label`.
 template <class Decode>
 static void stream_blobs(const std::string& filename, const std::vector<BlobInfo>& blobs,
                          const std::vector<size_t>& indices, unsigned threads, const char* label,
@@ -875,7 +886,7 @@ static void stream_blobs(const std::string& filename, const std::vector<BlobInfo
     std::atomic<bool> open_failed{false};
     std::vector<std::thread> workers;
 
-    struct ThreadStats { double read_us = 0, decode_us = 0; size_t count = 0; };
+    struct ThreadStats { double read_us = 0, inflate_us = 0, decode_us = 0; size_t count = 0; };
     std::vector<ThreadStats> stats(threads);
 
     for (unsigned t = 0; t < threads; t++) {
@@ -890,14 +901,17 @@ static void stream_blobs(const std::string& filename, const std::vector<BlobInfo
 
                 io_sem.acquire();
                 auto t0 = std::chrono::steady_clock::now();
-                read_and_decompress_blob_into(local_fd, blobs[indices[j]], blob_buf, decomp);
+                read_blob_into(local_fd, blobs[indices[j]], blob_buf);
                 auto t1 = std::chrono::steady_clock::now();
                 io_sem.release();
 
-                decode(j, decomp.data(), decomp.size());
+                inflate_blob_into(blob_buf, decomp);
                 auto t2 = std::chrono::steady_clock::now();
+                decode(j, decomp.data(), decomp.size());
+                auto t3 = std::chrono::steady_clock::now();
                 st.read_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
-                st.decode_us += std::chrono::duration<double, std::micro>(t2 - t1).count();
+                st.inflate_us += std::chrono::duration<double, std::micro>(t2 - t1).count();
+                st.decode_us += std::chrono::duration<double, std::micro>(t3 - t2).count();
                 st.count++;
                 size_t done = blocks_done.fetch_add(1) + 1;
                 if (done % 5000 == 0)
@@ -909,12 +923,19 @@ static void stream_blobs(const std::string& filename, const std::vector<BlobInfo
     for (auto& w : workers) w.join();
     if (open_failed.load()) throw std::runtime_error("cannot open " + filename + " in worker thread");
 
-    double total_read = 0, total_decode = 0; size_t total_blocks = 0;
-    for (auto& s : stats) { total_read += s.read_us; total_decode += s.decode_us; total_blocks += s.count; }
+    double total_read = 0, total_inflate = 0, total_decode = 0; size_t total_blocks = 0;
+    for (auto& s : stats) {
+        total_read += s.read_us;
+        total_inflate += s.inflate_us;
+        total_decode += s.decode_us;
+        total_blocks += s.count;
+    }
     std::cerr << "  " << label << " (" << total_blocks << " blocks, " << threads << " threads, "
               << max_io << " max_io): "
-              << "read=" << (total_read/1e6) << "s decode+callback=" << (total_decode/1e6) << "s"
+              << "read=" << (total_read/1e6) << "s inflate=" << (total_inflate/1e6)
+              << "s decode+callback=" << (total_decode/1e6) << "s"
               << " (per-thread avg: read=" << (total_read/1e6/threads)
+              << "s inflate=" << (total_inflate/1e6/threads)
               << "s decode+cb=" << (total_decode/1e6/threads) << "s)" << std::endl;
 }
 
