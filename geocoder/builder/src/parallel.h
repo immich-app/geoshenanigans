@@ -443,6 +443,36 @@ SortedIndices parallel_sort_indices(size_t n, Less less, TieMatters tie_matters,
     return {std_sort_indices(n, less), true};
 }
 
+// parallel_sort_indices sorting keys instead of bare indices: key_of(i)
+// carries i as .index, and key_less on two keys must answer as less on
+// their indices would. std::sort's comparisons and moves depend only on the
+// comparator's answers, so the order, serial fallback included, is the same;
+// the fields compared first just sit together instead of behind an index.
+template <class KeyOf, class KeyLess, class TieMatters>
+SortedIndices parallel_sort_keys(size_t n, KeyOf key_of, KeyLess key_less, TieMatters tie_matters,
+                                 unsigned threads = 0) {
+    std::vector<decltype(key_of(size_t(0)))> keys(n);
+    auto fill = [&] {
+        parallel_for(n, [&](size_t b, size_t e, unsigned) {
+            for (size_t i = b; i < e; i++) keys[i] = key_of(i);
+        }, threads);
+    };
+    fill();
+    parallel_sort(keys.begin(), keys.end(), key_less, threads);
+    bool ties = parallel_any(n ? n - 1 : 0, [&](size_t k) {
+        return !key_less(keys[k], keys[k + 1]) && tie_matters(keys[k].index, keys[k + 1].index);
+    }, threads);
+    if (ties) {
+        fill();
+        std::sort(keys.begin(), keys.end(), key_less);
+    }
+    std::vector<uint32_t> order(n);
+    parallel_for(n, [&](size_t b, size_t e, unsigned) {
+        for (size_t i = b; i < e; i++) order[i] = keys[i].index;
+    }, threads);
+    return {std::move(order), ties};
+}
+
 // Sorts each run of [first, last) by less with std::sort, on every core. A
 // run is a maximal stretch whose neighbours same_run(prev, next) joins, so
 // the cuts between threads fall on run boundaries and can't change it.

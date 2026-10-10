@@ -353,6 +353,26 @@ TEST(parallel_sort_indices_keeps_std_sort_order_when_ties_matter) {
     CHECK(is_perm);
 }
 
+TEST(parallel_sort_keys_orders_like_std_sort_indices) {
+    auto recs = new_recs(400000, 3000, 11);
+    struct Key {
+        uint32_t key;
+        uint32_t index;
+    };
+    auto key_of = [&](size_t i) { return Key{recs[i].key, static_cast<uint32_t>(i)}; };
+    auto key_less = [](const Key& a, const Key& b) { return a.key < b.key; };
+    auto by_key = [&](uint32_t a, uint32_t b) { return recs[a].key < recs[b].key; };
+    auto payload_differs = [&](uint32_t a, uint32_t b) { return recs[a].payload != recs[b].payload; };
+    auto expect = std_sort_indices(recs.size(), by_key);
+    for (unsigned threads : {1u, 3u, 16u}) {
+        // Ties that show take the serial sort, which must tie-break as
+        // std::sort over bare indices does.
+        auto got = parallel_sort_keys(recs.size(), key_of, key_less, payload_differs, threads);
+        CHECK(got.order == expect);
+        CHECK(got.serial);
+    }
+}
+
 TEST(parallel_sort_runs_sorts_each_run_alone) {
     std::mt19937 rng(4);
     std::vector<std::pair<uint32_t, uint32_t>> input;  // (run, value), runs adjacent
