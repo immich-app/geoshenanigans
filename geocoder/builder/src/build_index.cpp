@@ -4626,42 +4626,16 @@ static int run(int argc, char* argv[]) {
                 return data.admin_polygons[a].vertex_count > data.admin_polygons[b].vertex_count;
             });
 
-            // Build old→new ID mapping
-            std::vector<uint32_t> old_to_new(n);
-            for (uint32_t new_id = 0; new_id < n; new_id++)
-                old_to_new[order[new_id]] = new_id;
-
-            // Reorder polygons and vertices
-            std::vector<AdminPolygon> new_polys(n);
-            std::vector<NodeCoord> new_verts;
-            new_verts.reserve(data.admin_vertices.size());
-            for (uint32_t new_id = 0; new_id < n; new_id++) {
-                auto p = data.admin_polygons[order[new_id]];
-                uint32_t old_offset = p.vertex_offset;
-                p.vertex_offset = static_cast<uint32_t>(new_verts.size());
-                new_polys[new_id] = p;
-                for (uint32_t v = 0; v < p.vertex_count; v++)
-                    new_verts.push_back(data.admin_vertices[old_offset + v]);
-            }
-            data.admin_polygons = std::move(new_polys);
-            data.admin_vertices = std::move(new_verts);
-
-            // Reorder admin_osm_ids in lockstep. This is a parallel array
-            // (slot i is the stable osm-id of admin_polygons[i]); failing
-            // to permute it here leaves the sidecar misaligned from the
-            // polygon array, so the canonical sort below and strategy-2
-            // (which match by osm-id) attach the wrong stable id to each
-            // polygon → non-deterministic sidecar + massive admin churn on
-            // chained builds. The later content sort already does this; so
-            // must we. (admin_parent_ids / way_parent_ids / poi+place
-            // parent_poly_id are all computed AFTER this sort, so they need
-            // no remap here.)
-            if (data.admin_osm_ids.size() == n) {
-                std::vector<uint64_t> new_osm_ids(n);
-                for (uint32_t new_id = 0; new_id < n; new_id++)
-                    new_osm_ids[new_id] = data.admin_osm_ids[order[new_id]];
-                data.admin_osm_ids = std::move(new_osm_ids);
-            }
+            // Reorder polygons, vertices and admin_osm_ids in lockstep.
+            // admin_osm_ids is a parallel array (slot i is the stable
+            // osm-id of admin_polygons[i]); failing to permute it here
+            // leaves the sidecar misaligned from the polygon array, so the
+            // canonical sort below and strategy-2 (which match by osm-id)
+            // attach the wrong stable id to each polygon → non-deterministic
+            // sidecar + massive admin churn on chained builds.
+            // (admin_parent_ids / way_parent_ids / poi+place parent_poly_id
+            // are all computed AFTER this sort, so they need no remap here.)
+            const std::vector<uint32_t> old_to_new = permute_admin_polygons(data, order, num_threads);
 
             // Remap poly_ids in cell_to_admin (preserving INTERIOR_FLAG)
             for_each_admin_cell_list(data, num_threads, [&](std::vector<uint32_t>& ids) {
