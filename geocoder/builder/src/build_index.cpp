@@ -393,6 +393,37 @@ private:
     std::vector<RingBox> boxes_;
 };
 
+// Calls visit(pid, polygon) for each in-bounds admin polygon listed in `cell`
+// or its neighbours, in the order the parent passes have always scanned them:
+// the cell, then AppendAllNeighbors order, each cell's list in order. An id
+// listed in several cells is visited once per listing.
+template <typename Visit>
+static void for_each_admin_candidate(const ParsedData& data, S2CellId cell,
+                std::vector<S2CellId>& nbrs, Visit visit) {
+    auto scan = [&](S2CellId c) {
+        auto it = data.cell_to_admin.find(c.id());
+        if (it == data.cell_to_admin.end()) return;
+        for (uint32_t raw_id : it->second) {
+            uint32_t pid = raw_id & ID_MASK;
+            if (pid >= data.admin_polygons.size()) continue;
+            const auto& p = data.admin_polygons[pid];
+            if (p.vertex_offset + p.vertex_count > data.admin_vertices.size()) continue;
+            visit(pid, p);
+        }
+    };
+    nbrs.clear();
+    cell.AppendAllNeighbors(kAdminCellLevel, &nbrs);
+    scan(cell);
+    for (S2CellId n : nbrs) scan(n);
+}
+
+// rank_candidates orders admin polygons by area, which needs a strict weak
+// order. The shoelace area of finite coordinates is never NaN.
+static void require_ordered_admin_areas(const ParsedData& data) {
+    for (const auto& p : data.admin_polygons)
+        if (std::isnan(p.area)) throw std::runtime_error("Admin polygon area is NaN");
+}
+
 // Admin polygon parent chain: for each admin polygon, find the smallest containing
 // polygon with a lower admin_level so the server walks the chain without PIP.
 static void compute_admin_parent_chain(ParsedData& data, const BuildConfig& cfg) {
@@ -1282,17 +1313,24 @@ static void compute_poi_parent_streets(ParsedData& data, const BuildConfig& cfg,
 // Shared smallest-containing-admin-polygon sweep for POI parent linking: for
 // each POI record, init(pr) resets the target field, then the smallest admin
 // polygon accepted by level_ok that contains the POI centroid (area as the
-// specificity proxy, lower = tighter) is passed to store(pr, poly_id).
-// Returns the number of POIs linked.
+// specificity proxy, lower = tighter; ties to the first one scanned) is passed
+// to store(pr, poly_id). Returns the number of POIs linked.
 template <typename LevelOk, typename Init, typename Store>
 static uint64_t link_poi_smallest_admin(ParsedData& data, unsigned int num_threads,
                 LevelOk level_ok, Init init, Store store) {
+    require_ordered_admin_areas(data);
     const AdminRings rings(data, num_threads);
+    auto smaller = [&](uint32_t a, uint32_t b) {
+        return data.admin_polygons[a].area < data.admin_polygons[b].area;
+    };
     std::atomic<size_t> idx{0};
     std::atomic<uint64_t> linked{0};
     std::vector<std::thread> workers;
     for (unsigned int t = 0; t < num_threads; t++) {
         workers.emplace_back([&]() {
+            std::vector<S2CellId> nbrs;
+            std::vector<uint32_t> cands;
+            std::vector<std::pair<uint32_t, uint32_t>> scratch;
             while (true) {
                 size_t i = idx.fetch_add(1);
                 if (i >= data.poi_records.size()) break;
@@ -1304,33 +1342,17 @@ static uint64_t link_poi_smallest_admin(ParsedData& data, unsigned int num_threa
                 S2CellId cell = S2CellId(
                     S2LatLng::FromDegrees(plat, plng))
                     .parent(kAdminCellLevel);
-                std::vector<S2CellId> nbrs;
-                cell.AppendAllNeighbors(kAdminCellLevel, &nbrs);
-
-                float best_area = 1e18f;
-                uint32_t best_pid = NO_DATA;
-                auto check_cell = [&](uint64_t cid) {
-                    auto it = data.cell_to_admin.find(cid);
-                    if (it == data.cell_to_admin.end()) return;
-                    for (uint32_t raw_id : it->second) {
-                        uint32_t pid = raw_id & ID_MASK;
-                        if (pid >= data.admin_polygons.size()) continue;
-                        const auto& cand = data.admin_polygons[pid];
-                        if (!level_ok(cand.admin_level)) continue;
-                        if (cand.area >= best_area) continue;
-                        if (cand.vertex_offset + cand.vertex_count > data.admin_vertices.size()) continue;
-                        if (rings.contains(pid, plat, plng)) {
-                            best_area = cand.area;
-                            best_pid = pid;
-                        }
-                    }
-                };
-                check_cell(cell.id());
-                for (const auto& n : nbrs) check_cell(n.id());
-
-                if (best_pid != NO_DATA) {
-                    store(pr, best_pid);
+                cands.clear();
+                // 1e18 is the old scan's starting best area.
+                for_each_admin_candidate(data, cell, nbrs, [&](uint32_t pid, const AdminPolygon& p) {
+                    if (level_ok(p.admin_level) && p.area < 1e18f) cands.push_back(pid);
+                });
+                rank_candidates(cands, smaller, scratch);
+                for (uint32_t pid : cands) {
+                    if (!rings.contains(pid, plat, plng)) continue;
+                    store(pr, pid);
                     linked.fetch_add(1);
+                    break;
                 }
             }
         });

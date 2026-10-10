@@ -128,3 +128,68 @@ TEST(ring_box_excludes_only_points_outside_the_ring) {
     }
     CHECK(excluded > 100000);
 }
+
+namespace {
+
+struct Poly {
+    uint8_t level;
+    float area;
+    bool contains;
+};
+
+uint32_t first_containing(const std::vector<uint32_t>& ranked, const std::vector<Poly>& polys) {
+    for (uint32_t id : ranked)
+        if (polys[id].contains) return id;
+    return NO_DATA;
+}
+
+}  // namespace
+
+TEST(rank_candidates_without_order_keeps_first_occurrences) {
+    std::vector<uint32_t> ids = {7, 3, 7, 9, 3, 1, 9};
+    std::vector<std::pair<uint32_t, uint32_t>> scratch;
+    rank_candidates(ids, [](uint32_t, uint32_t) { return false; }, scratch);
+    CHECK((ids == std::vector<uint32_t>{7, 3, 9, 1}));
+}
+
+// The parent passes used to scan every listed id and keep a containing one
+// only when strictly better; the ranked first-containing pick must agree on
+// every sequence, ties and repeats included.
+TEST(rank_candidates_first_containing_matches_strict_improvement_scan) {
+    std::mt19937_64 rng(17);
+    std::vector<std::pair<uint32_t, uint32_t>> scratch;
+    for (int round = 0; round < 20000; round++) {
+        uint32_t k = 1 + rng() % 30;
+        std::vector<Poly> polys(k);
+        for (auto& p : polys) p = {static_cast<uint8_t>(rng() % 5), static_cast<float>(rng() % 6), rng() % 3 == 0};
+        std::vector<uint32_t> seq(rng() % 60);
+        for (auto& id : seq) id = static_cast<uint32_t>(rng() % k);
+
+        // Smallest area (POI parents).
+        float best_area = 1e18f;
+        uint32_t expect = NO_DATA;
+        for (uint32_t id : seq) {
+            if (polys[id].area >= best_area) continue;
+            if (polys[id].contains) { best_area = polys[id].area; expect = id; }
+        }
+        auto ids = seq;
+        rank_candidates(ids, [&](uint32_t a, uint32_t b) { return polys[a].area < polys[b].area; }, scratch);
+        CHECK_EQ(first_containing(ids, polys), expect);
+
+        // Highest level, then smallest area (way and admin parents).
+        uint8_t best_level = 0;
+        best_area = 1e18f;
+        expect = NO_DATA;
+        for (uint32_t id : seq) {
+            const auto& p = polys[id];
+            if (p.level < best_level || (p.level == best_level && p.area >= best_area)) continue;
+            if (p.contains) { best_level = p.level; best_area = p.area; expect = id; }
+        }
+        ids = seq;
+        rank_candidates(ids, [&](uint32_t a, uint32_t b) {
+            if (polys[a].level != polys[b].level) return polys[a].level > polys[b].level;
+            return polys[a].area < polys[b].area;
+        }, scratch);
+        CHECK_EQ(first_containing(ids, polys), expect);
+    }
+}

@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <utility>
+#include <vector>
 
 #include "types.h"
 
@@ -52,4 +54,29 @@ inline RingBox ring_box(const NodeCoord* verts, uint32_t n) {
 // straddling edges come in pairs going round the ring.
 inline bool ring_box_excludes(const RingBox& b, float lat, float lng) {
     return lng < b.lng_lo || lng >= b.lng_hi || lat < b.lat_lo || lat >= b.lat_hi;
+}
+
+// Reorders the polygon ids a neighbourhood scan meets (scan order, repeats
+// allowed) into unique ids sorted by `better`, ties to the earlier first
+// occurrence. The first ranked id containing a point is then the one a scan
+// over the original sequence ends on when it keeps a containing id only if it
+// is strictly better than the current pick: containment depends on the id
+// alone, so that scan keeps the earliest id of the best containing class.
+// `better` must be a strict weak order.
+template <class Better>
+void rank_candidates(std::vector<uint32_t>& ids, Better better,
+                     std::vector<std::pair<uint32_t, uint32_t>>& scratch) {
+    scratch.clear();
+    for (uint32_t pos = 0; pos < ids.size(); pos++) scratch.push_back({ids[pos], pos});
+    std::sort(scratch.begin(), scratch.end());
+    scratch.erase(std::unique(scratch.begin(), scratch.end(),
+                              [](const auto& a, const auto& b) { return a.first == b.first; }),
+                  scratch.end());
+    std::sort(scratch.begin(), scratch.end(), [&](const auto& a, const auto& b) {
+        if (better(a.first, b.first)) return true;
+        if (better(b.first, a.first)) return false;
+        return a.second < b.second;
+    });
+    ids.clear();
+    for (const auto& entry : scratch) ids.push_back(entry.first);
 }
