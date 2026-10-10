@@ -2293,18 +2293,27 @@ static void reorder_deterministically(ParsedData& data, std::vector<float>& poi_
     }
     log_phase("  Sort strings", _st, _sc);
 
+    // Interps share no data with the other steps, and tied TIGER duplicates
+    // can force their sort onto one core, so they sort beside them.
+    auto interps_sorted = std::async(std::launch::async, [&data] {
+        auto start = std::chrono::steady_clock::now();
+        reorder_interps(data);
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    });
     reorder_addr_points(data);
     log_phase("  Sort addr_points", _st, _sc);
     reorder_ways(data);
     log_phase("  Sort ways", _st, _sc);
-    reorder_interps(data);
-    log_phase("  Sort interps", _st, _sc);
     reorder_admin_polygons(data);
     log_phase("  Sort admin", _st, _sc);
     reorder_pois(data, poi_elevations, poi_qids, sitelinks_data);
     log_phase("  Sort POIs", _st, _sc);
     reorder_place_nodes(data);
     log_phase("  Sort place nodes", _st, _sc);
+    double interps_seconds = interps_sorted.get();
+    std::cerr << "  Interps took " << std::fixed << std::setprecision(1) << interps_seconds
+              << "s beside the other steps" << std::endl;
+    log_phase("  Sort interps (wait)", _st, _sc);
     if (addr_cells_freed.valid()) addr_cells_freed.get();
 }
 
