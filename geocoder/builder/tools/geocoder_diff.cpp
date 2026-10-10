@@ -37,6 +37,7 @@
 #include "merge_sequence.h"
 #include "patch_format.h"
 #include "record_match.h"
+#include "string_offset_map.h"
 
 // Sentinel meaning "no offset / no data / unmapped id" in cell offset fields
 // and id-remap tables. Emitted/compared as a raw uint32_t.
@@ -51,33 +52,17 @@ static size_t get_rss_mb() {
 
 // --- String remap ---
 
-static std::unordered_map<uint32_t, uint32_t> build_string_remap(
-    const char* old_pool, size_t old_size, const char* new_pool, size_t new_size)
-{
-    std::unordered_map<std::string, uint32_t> new_idx;
-    size_t pos = 0;
-    while (pos < new_size) {
-        const char* s = new_pool + pos;
-        size_t len = strlen(s);
-        new_idx[std::string(s, len)] = static_cast<uint32_t>(pos);
-        pos += len + 1;
-    }
-    std::unordered_map<uint32_t, uint32_t> remap;
-    pos = 0;
-    while (pos < old_size) {
-        const char* s = old_pool + pos;
-        size_t len = strlen(s);
-        auto it = new_idx.find(std::string(s, len));
-        if (it != new_idx.end())
-            remap[static_cast<uint32_t>(pos)] = it->second;
-        pos += len + 1;
-    }
-    return remap;
+// The string tier pools as one side of string_offset_pairs.
+static std::vector<StringPoolSegment> string_tier_segments(const std::array<MappedFile, 5>& maps,
+                                                           std::vector<char>& concat) {
+    std::vector<std::pair<const char*, size_t>> pools;
+    for (const auto& m : maps) pools.push_back({m.data, m.size});
+    return string_pool_segments(pools, concat);
 }
 
 // --- Remap + fixup helpers ---
 
-static void remap_addr_points(char* data, size_t size, const std::unordered_map<uint32_t,uint32_t>& rm) {
+static void remap_addr_points(char* data, size_t size, const SortedU32Map& rm) {
     // AddrPoint: 28 bytes (lat:4 + lng:4 + housenumber_id:4 + street_id:4 +
     //                      parent_way_id:4 + vertex_offset:4 + vertex_count:4)
     // String fields at offsets 8, 12 only; parent_way_id/vertex fields are not strings.
@@ -85,21 +70,19 @@ static void remap_addr_points(char* data, size_t size, const std::unordered_map<
     for (size_t i = 0; i + stride <= size; i += stride) {
         for (size_t off : {8, 12}) {
             uint32_t v; memcpy(&v, data + i + off, 4);
-            auto it = rm.find(v); if (it != rm.end()) memcpy(data + i + off, &it->second, 4);
+            if (const uint32_t* n = rm.find(v)) memcpy(data + i + off, n, 4);
         }
     }
 }
-static void remap_field(char* data, size_t size, size_t stride, size_t field_off,
-                         const std::unordered_map<uint32_t,uint32_t>& rm) {
+static void remap_field(char* data, size_t size, size_t stride, size_t field_off, const SortedU32Map& rm) {
     for (size_t i = 0; i + stride <= size; i += stride) {
         uint32_t v; memcpy(&v, data + i + field_off, 4);
-        auto it = rm.find(v); if (it != rm.end()) memcpy(data + i + field_off, &it->second, 4);
+        if (const uint32_t* n = rm.find(v)) memcpy(data + i + field_off, n, 4);
     }
 }
 // The patcher rewrites the same fields (string_field_offsets) of the records
 // it copies from old.
-static void remap_string_fields(char* data, size_t size, PatchFileId fid, size_t stride,
-                                const std::unordered_map<uint32_t,uint32_t>& rm) {
+static void remap_string_fields(char* data, size_t size, PatchFileId fid, size_t stride, const SortedU32Map& rm) {
     for (size_t off : string_field_offsets(fid, stride)) remap_field(data, size, stride, off, rm);
 }
 
@@ -534,14 +517,12 @@ static int run(int argc, char* argv[]) {
     std::string old_dir = argv[1], new_dir = argv[2], patch_path = argv[4];
 
     // Build string remap (mmap each tier's pool — read-only sequential
-    // scan). Virtual "concat pool" reproduces the global-offset layout
-    // that record name_ids point into, so build_string_remap works
-    // unchanged. Tier bases are the cumulative sizes of the tiers found;
-    // a tier found nowhere is empty (strings_poi.bin beside full/).
+    // scan) over the global-offset layout that record name_ids point into.
+    // Tier bases are the cumulative sizes of the tiers found; a tier found
+    // nowhere is empty (strings_poi.bin beside full/).
     std::cerr << "Building string remap... (RSS=" << get_rss_mb() << " MiB)" << std::endl;
     std::array<MappedFile, 5> old_tier_maps{}, new_tier_maps{};
-    std::vector<char> old_concat, new_concat;
-    std::array<uint32_t, 6> old_tier_bases{}, new_tier_bases{};
+    std::array<uint32_t, 6> old_tier_bases{};
     // String tiers may be absent from the input dir when geocoder-diff
     // is invoked on a per-variant subdir (e.g. <region>/quality/<q>/
     // or <region>/poi/<tier>/) — strings_*.bin live under the sibling
@@ -598,19 +579,14 @@ static int run(int argc, char* argv[]) {
         const bool own = shipped >> t & 1;
         old_tier_maps[t] = own ? mmap_file(old_dir + "/" + STRING_TIER_FILES[t]) : try_load_tier(old_dir, STRING_TIER_FILES[t]);
         new_tier_maps[t] = own ? mmap_file(new_dir + "/" + STRING_TIER_FILES[t]) : try_load_tier(new_dir, STRING_TIER_FILES[t]);
-        old_tier_bases[t] = static_cast<uint32_t>(old_concat.size());
-        new_tier_bases[t] = static_cast<uint32_t>(new_concat.size());
-        if (old_tier_maps[t].size > 0)
-            old_concat.insert(old_concat.end(), old_tier_maps[t].data,
-                              old_tier_maps[t].data + old_tier_maps[t].size);
-        if (new_tier_maps[t].size > 0)
-            new_concat.insert(new_concat.end(), new_tier_maps[t].data,
-                              new_tier_maps[t].data + new_tier_maps[t].size);
+        old_tier_bases[t + 1] = old_tier_bases[t] + static_cast<uint32_t>(old_tier_maps[t].size);
     }
-    old_tier_bases[5] = static_cast<uint32_t>(old_concat.size());
-    new_tier_bases[5] = static_cast<uint32_t>(new_concat.size());
-    auto str_remap = build_string_remap(old_concat.data(), old_concat.size(),
-                                         new_concat.data(), new_concat.size());
+    SortedU32Map str_remap;
+    {
+        std::vector<char> old_concat, new_concat;
+        str_remap = SortedU32Map(string_offset_pairs(string_tier_segments(old_tier_maps, old_concat),
+                                                     string_tier_segments(new_tier_maps, new_concat)));
+    }
 
     // Detect strides (stat only, no data loaded)
     auto detect = [](const std::string& path, std::initializer_list<size_t> cs) -> size_t {
@@ -668,6 +644,10 @@ static int run(int argc, char* argv[]) {
         std::cerr << "  String remap: shipped tiers 0x" << std::hex << shipped << ", newly shipped 0x"
                   << tier_files.newly_shipped << ", referenced 0x" << referenced << std::dec << ", "
                   << stats.n_pairs << " cross-tier pairs" << std::endl;
+    }
+    for (int t = 0; t < 5; t++) {
+        unmap_file(old_tier_maps[t]);
+        unmap_file(new_tier_maps[t]);
     }
 
     // Build merge sequences for all data files in parallel (4 groups)
@@ -1330,20 +1310,13 @@ static int run(int argc, char* argv[]) {
 
     t_addr.join(); t_street.join(); t_interp.join(); t_admin.join(); t_poi.join(); t_place.join(); t_cells.join();
     log_time("All merge sequences + cell changes built", merge_start);
-    // Free string pools (no longer needed after all merges complete).
     // str_remap is kept alive for emit_sparse_delta below — it consumes
-    // the unordered_map directly to decide which addr_postcodes /
-    // way_postcodes / postcode_centroids positions actually shifted vs
-    // just got a string-tier remap. Freeing it here previously caused
-    // sparse_delta to see an empty map → no remap applied during diff,
-    // patch applied the full remap → verify mismatch
-    // (e.g. oceania/full addr_postcodes.bin first_diff=267889).
-    for (int t = 0; t < 5; t++) {
-        unmap_file(old_tier_maps[t]);
-        unmap_file(new_tier_maps[t]);
-    }
-    { std::vector<char>().swap(old_concat); }
-    { std::vector<char>().swap(new_concat); }
+    // the map directly to decide which addr_postcodes / way_postcodes /
+    // postcode_centroids positions actually shifted vs just got a
+    // string-tier remap. Freeing it here previously caused sparse_delta to
+    // see an empty map → no remap applied during diff, patch applied the
+    // full remap → verify mismatch (e.g. oceania/full addr_postcodes.bin
+    // first_diff=267889).
     std::cerr << "  RSS after merge phase: " << get_rss_mb() << " MiB" << std::endl;
 
     // Parent-id remap section. Emitted FIRST so it's loaded before any
@@ -1912,8 +1885,7 @@ static int run(int argc, char* argv[]) {
                     uint32_t old_pid; memcpy(&old_pid, op + 8, 4);
                     uint32_t new_pid; memcpy(&new_pid, np + 8, 4);
                     if (old_pid != NO_DATA) {
-                        auto it = str_remap.find(old_pid);
-                        if (it != str_remap.end()) old_pid = it->second;
+                        old_pid = str_remap.map(old_pid);
                     }
                     d = (old_pid != new_pid);
                 }
@@ -1934,8 +1906,7 @@ static int run(int argc, char* argv[]) {
                             uint32_t r = res_admin_p.id_remap[old_val];
                             if (r != NO_DATA) remapped = r;
                         } else if (remap_kind == 2) {
-                            auto it = str_remap.find(old_val);
-                            if (it != str_remap.end()) remapped = it->second;
+                            remapped = str_remap.map(old_val);
                         }
                     }
                     d = (remapped != new_val);
@@ -2083,7 +2054,7 @@ static int run(int argc, char* argv[]) {
 
     // Now safe to free str_remap — all consumers (sparse_delta above)
     // have finished using it.
-    { std::unordered_map<uint32_t,uint32_t>().swap(str_remap); }
+    str_remap = SortedU32Map();
 
     // End marker
     uint32_t end_marker = SECTION_END_MARKER;
