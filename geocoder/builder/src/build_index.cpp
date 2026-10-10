@@ -2269,6 +2269,14 @@ static void reorder_deterministically(ParsedData& data, std::vector<float>& poi_
     auto _st = std::chrono::steady_clock::now();
     auto _sc = CpuTicks::now();
 
+    // reorder_addr_points drops cell_to_addrs, already flattened into
+    // sorted_addr_cells. Freeing its ~30M planet lists takes seconds on one
+    // core, so that runs beside the steps instead.
+    std::future<void> addr_cells_freed;
+    if (!data.sorted_addr_cells.empty())
+        addr_cells_freed = std::async(std::launch::async,
+            [cells = std::move(data.cell_to_addrs)]() mutable { cells.clear(); });
+
     // 1. Partition the string pool into per-consumer tiers, sort
     //    alphabetically within each tier, and rewrite all record
     //    offsets to the new globally-contiguous layout.  Shared
@@ -2297,6 +2305,7 @@ static void reorder_deterministically(ParsedData& data, std::vector<float>& poi_
     log_phase("  Sort POIs", _st, _sc);
     reorder_place_nodes(data);
     log_phase("  Sort place nodes", _st, _sc);
+    if (addr_cells_freed.valid()) addr_cells_freed.get();
 }
 
 static int run(int argc, char* argv[]) {
