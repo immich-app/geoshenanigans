@@ -1763,11 +1763,6 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
 
         // Write place node files into each mode directory (so diff/patch can find them)
         if (!d.place_nodes.empty()) {
-            std::unordered_map<uint64_t, std::vector<uint32_t>> place_cell_map;
-            for (const auto& p : d.sorted_place_cells) {
-                place_cell_map[p.cell_id].push_back(p.item_id);
-            }
-
             auto write_place_files = [&](const std::string& dir) {
                 ensure_dir(dir);
                 {
@@ -1779,7 +1774,8 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                 }
                 emit_strategy2_sidecar(dir + "/place_nodes.osm_ids",
                                         d.place_sidecar_blob, d.place_osm_ids);
-                write_cell_index(dir + "/place_cells.bin", dir + "/place_entries.bin", place_cell_map);
+                write_cell_index_sorted(dir + "/place_cells.bin", dir + "/place_entries.bin",
+                                        d.sorted_place_cells);
             };
 
             if (multi_output) {
@@ -1790,7 +1786,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                 write_place_files(base_dir);
             }
             std::cerr << "  Place nodes: " << d.place_nodes.size() << " nodes, "
-                      << place_cell_map.size() << " cells" << std::endl;
+                      << count_cells(d.sorted_place_cells) << " cells" << std::endl;
         }
         log_phase(("    " + region + ": place files").c_str(), _rt, _rc);
 
@@ -1841,16 +1837,17 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                 if (!f) throw std::runtime_error("failed to write " + mdir + "/place_nodes.bin");
             }
 
-            // 3. Rebuild place cell index with the place_remap.
-            std::unordered_map<uint64_t, std::vector<uint32_t>> filtered_place_cells;
+            // 3. Rebuild place cell index with the place_remap (ascending,
+            //    so the filtered table stays in canonical order).
+            std::vector<CellItemPair> filtered_place_cells;
             for (const auto& p : d.sorted_place_cells) {
                 if (p.item_id < place_remap.size()
                     && place_remap[p.item_id] != NO_DATA) {
-                    filtered_place_cells[p.cell_id].push_back(place_remap[p.item_id]);
+                    filtered_place_cells.push_back({p.cell_id, place_remap[p.item_id]});
                 }
             }
-            write_cell_index(mdir + "/place_cells.bin", mdir + "/place_entries.bin",
-                             filtered_place_cells);
+            write_cell_index_sorted(mdir + "/place_cells.bin", mdir + "/place_entries.bin",
+                                    filtered_place_cells);
 
             // 4. Rebuild admin cell index against the new polygon ID space.
             //    Preserves the high-bit INTERIOR_FLAG used by the cell
@@ -1948,19 +1945,27 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                     filtered_records.push_back(pr);
                 }
 
-                // Build filtered cell index (preserving INTERIOR_FLAG)
-                std::unordered_map<uint64_t, std::vector<uint32_t>> filtered_cell_map;
-                for (const auto& p : d.sorted_poi_cells) {
-                    uint32_t flags = p.item_id & INTERIOR_FLAG;
-                    uint32_t raw_id = p.item_id & ID_MASK;
-                    if (raw_id < id_remap.size() && id_remap[raw_id] != NO_DATA) {
-                        filtered_cell_map[p.cell_id].push_back(id_remap[raw_id] | flags);
+                // Filtered cell index (preserving INTERIOR_FLAG). id_remap
+                // ascends and keeps the flag bit, so the filtered table stays
+                // in canonical order and repeats sit side by side.
+                std::vector<std::vector<CellItemPair>> worker_cells(parallel_threads());
+                parallel_for_runs(d.sorted_poi_cells.size(), same_cell(d.sorted_poi_cells),
+                                  [&](size_t begin, size_t end, unsigned w) {
+                    auto& out = worker_cells[w];
+                    for (size_t i = begin; i < end; i++) {
+                        const auto& p = d.sorted_poi_cells[i];
+                        uint32_t flags = p.item_id & INTERIOR_FLAG;
+                        uint32_t raw_id = p.item_id & ID_MASK;
+                        if (raw_id >= id_remap.size() || id_remap[raw_id] == NO_DATA) continue;
+                        CellItemPair q{p.cell_id, id_remap[raw_id] | flags};
+                        if (!out.empty() && out.back().cell_id == q.cell_id && out.back().item_id == q.item_id) continue;
+                        out.push_back(q);
                     }
-                }
-                // Dedup cell entries
-                for (auto& [cell_id, ids] : filtered_cell_map) {
-                    std::sort(ids.begin(), ids.end());
-                    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+                });
+                std::vector<CellItemPair> filtered_cells;
+                for (auto& part : worker_cells) {
+                    filtered_cells.insert(filtered_cells.end(), part.begin(), part.end());
+                    std::vector<CellItemPair>().swap(part);
                 }
 
                 // Write files
@@ -1982,8 +1987,8 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                 // apply_strategy2_pois operates on (the full d.poi_records
                 // array), so reading them at the next build's allocator
                 // would put records at the wrong slots.
-                write_cell_index(poi_dir + "/poi_cells.bin", poi_dir + "/poi_entries.bin",
-                                 filtered_cell_map);
+                write_cell_index_sorted(poi_dir + "/poi_cells.bin", poi_dir + "/poi_entries.bin",
+                                        filtered_cells);
 
                 // POI tier strings — only clients opting in to POI get
                 // these names. Layout file lets the server resolve
@@ -2018,7 +2023,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                           << filtered_records.size() << " records ("
                           << selection.tombstones << " tombstones), "
                           << filtered_vertex_bytes.size() << " vertex bytes, "
-                          << filtered_cell_map.size() << " cells" << std::endl;
+                          << count_cells(filtered_cells) << " cells" << std::endl;
                 log_phase(("    " + region + ": " + tier_var.name).c_str(), _rt, _rc);
             }
         }

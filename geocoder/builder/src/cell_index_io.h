@@ -79,3 +79,49 @@ inline void write_cell_index(
       if (!f) throw std::runtime_error("failed to write " + entries_path);
       std::cerr << "  " << entries_path << ": max entries/cell = " << max_count << std::endl; }
 }
+
+// Distinct cells of a cell-grouped table.
+inline size_t count_cells(const std::vector<CellItemPair>& pairs) {
+    size_t cells = 0;
+    for (size_t i = 0; i < pairs.size(); i++)
+        if (i == 0 || pairs[i].cell_id != pairs[i - 1].cell_id) cells++;
+    return cells;
+}
+
+// write_cell_index for a table already in canonical order (by cell, then
+// item, as cell_item_less): the same two files the map version writes for
+// {cell: its items}, without building the map.
+inline void write_cell_index_sorted(
+    const std::string& cells_path,
+    const std::string& entries_path,
+    const std::vector<CellItemPair>& pairs
+) {
+    for (size_t i = 1; i < pairs.size(); i++)
+        if (cell_item_less(pairs[i], pairs[i - 1]))
+            throw std::logic_error("write_cell_index_sorted: table out of order for " + entries_path);
+
+    std::vector<char> cells, entries;
+    entries.reserve(pairs.size() * sizeof(uint32_t));
+    size_t max_count = 0;
+    for (size_t run = 0; run < pairs.size(); ) {
+        size_t run_end = run + 1;
+        while (run_end < pairs.size() && pairs[run_end].cell_id == pairs[run].cell_id) run_end++;
+        uint64_t cell_id = pairs[run].cell_id;
+        uint32_t offset = static_cast<uint32_t>(entries.size());
+        cells.insert(cells.end(), reinterpret_cast<const char*>(&cell_id),
+                     reinterpret_cast<const char*>(&cell_id) + sizeof(cell_id));
+        cells.insert(cells.end(), reinterpret_cast<const char*>(&offset),
+                     reinterpret_cast<const char*>(&offset) + sizeof(offset));
+        uint16_t count = checked_entry_count(run_end - run, entries_path);
+        max_count = std::max(max_count, run_end - run);
+        entries.insert(entries.end(), reinterpret_cast<const char*>(&count),
+                       reinterpret_cast<const char*>(&count) + sizeof(count));
+        for (size_t i = run; i < run_end; i++)
+            entries.insert(entries.end(), reinterpret_cast<const char*>(&pairs[i].item_id),
+                           reinterpret_cast<const char*>(&pairs[i].item_id) + sizeof(uint32_t));
+        run = run_end;
+    }
+    write_binary_file(cells_path, cells.data(), cells.size());
+    write_binary_file(entries_path, entries.data(), entries.size());
+    std::cerr << "  " << entries_path << ": max entries/cell = " << max_count << std::endl;
+}
