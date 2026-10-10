@@ -171,8 +171,11 @@ static TigerCsvFiles find_tiger_csvs(const std::string& path) {
 }
 
 // `pending` is find_tiger_csvs(path), started early so the extraction
-// overlaps the PBF passes.
-static void load_tiger_data(ParsedData& data, const std::string& path, std::future<TigerCsvFiles> pending) {
+// overlaps the PBF passes. Removing the extraction, gigabytes of CSVs, and
+// freeing their parsed rows take one core seconds: the returned future does
+// it, for the caller to wait on off the critical path.
+static std::future<void> load_tiger_data(ParsedData& data, const std::string& path,
+                std::future<TigerCsvFiles> pending) {
     std::cerr << "Loading TIGER address data from " << path << "..." << std::endl;
     auto _tt = std::chrono::steady_clock::now();
     auto _tc = CpuTicks::now();
@@ -223,6 +226,10 @@ static void load_tiger_data(ParsedData& data, const std::string& path, std::futu
     std::cerr << "  Interp ways now: " << data.interp_ways.size()
               << " (" << loaded_rows << " from TIGER)" << std::endl;
     log_phase("  TIGER: parse", _tt, _tc);
+    return std::async(std::launch::async, [csvs = std::move(csvs), parsed = std::move(parsed)]() mutable {
+        csvs.extract.reset();
+        std::vector<TigerCsv>().swap(parsed);
+    });
 }
 
 // --- GeoNames postcode loading ---
@@ -4676,19 +4683,21 @@ static int run(int argc, char* argv[]) {
         if (!external_postcodes_path.empty())
             external_postcodes = std::async(std::launch::async, read_external_postcodes, external_postcodes_path);
         auto external_data = std::async(std::launch::async, [&] {
+            std::future<void> tiger_freed;
             if (!tiger_data_path.empty()) {
-                load_tiger_data(data, tiger_data_path, std::move(tiger_csvs));
+                tiger_freed = load_tiger_data(data, tiger_data_path, std::move(tiger_csvs));
             }
             if (!external_postcodes_path.empty()) {
                 load_external_postcodes(data, external_postcodes_path, std::move(external_postcodes));
             }
+            return tiger_freed;
         });
 
         compute_admin_parent_chain(data, cfg);
 
         compute_way_parent_polygons(data, cfg);
 
-        external_data.get();
+        std::future<void> tiger_freed = external_data.get();
         // The loaders above made the last intern; the lookup table would
         // otherwise ride through ordering and the write phase. Freeing its
         // planet's worth of nodes takes one core many seconds, so that runs
@@ -4698,6 +4707,7 @@ static int run(int argc, char* argv[]) {
 
         compute_s2_and_poi_cells(data, cfg, _pt, _cpu);
         index_freed.get();
+        if (tiger_freed.valid()) tiger_freed.get();
 
         // Deduplicate + convert to sorted pairs for fast writing
         log_phase("S2 cell computation", _pt, _cpu);
