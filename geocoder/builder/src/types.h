@@ -173,7 +173,7 @@ static constexpr int    BACKTRACK_CALL_BUDGET   = 100000; // per-ring backtracki
 static constexpr int    BACKTRACK_TOTAL_BUDGET  = 500000; // per-relation backtracking limit
 static constexpr int    BACKTRACK_MAX_DEPTH     = 200;    // recursion depth limit
 static constexpr size_t MAX_SUBWAYS_FOR_RETRY   = 30;     // only retry small relations
-static constexpr size_t MAX_NODE_ID_DEFAULT     = 15000000000ULL; // dense index capacity
+static constexpr size_t MAX_NODE_ID_DEFAULT     = 15000000000ULL; // node index capacity (ids)
 
 // --- Index mode ---
 

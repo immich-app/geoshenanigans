@@ -19,7 +19,6 @@
 #include <vector>
 
 #include <fcntl.h>
-#include <sys/mman.h>
 
 #include "pbf_reader.h"
 
@@ -55,6 +54,7 @@ inline uint64_t pack_osm_id(gc::id_alloc::ObjectType type, int64_t osm_id) {
 #include "tiger.h"
 #include "parallel.h"
 #include "way_tags.h"
+#include "node_index.h"
 
 
 // --- Place type override classification ---
@@ -3173,69 +3173,6 @@ static int run(int argc, char* argv[]) {
         AdminCoverPool admin_pool(num_threads);
         // BuildHandler no longer used — parallel processing handles everything
 
-        // Dense array node location index — lockless parallel writes
-        // Planet OSM node IDs max ~12.5 billion. 8 bytes per entry = 100GB virtual.
-        // MAP_NORESERVE means OS only allocates pages on write (~80GB for 10B nodes).
-        static const size_t MAX_NODE_ID = MAX_NODE_ID_DEFAULT;
-        struct PackedLocation {
-            int32_t lat_e7;  // latitude * 10^7
-            int32_t lon_e7;  // longitude * 10^7
-            bool valid() const { return lat_e7 != 0 || lon_e7 != 0; }
-            double lat() const { return lat_e7 / 10000000.0; }
-            double lon() const { return lon_e7 / 10000000.0; }
-        };
-        struct DenseIndex {
-            PackedLocation* data;
-            size_t capacity;
-
-            DenseIndex() : capacity(MAX_NODE_ID) {
-                size_t byte_size = capacity * sizeof(PackedLocation);
-                void* ptr = mmap(nullptr, byte_size,
-                    PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
-                    -1, 0);
-                if (ptr == MAP_FAILED) {
-                    std::cerr << "Error: failed to mmap dense node index ("
-                              << (byte_size / (1024*1024*1024)) << "GB)" << std::endl;
-                    std::exit(1);
-                }
-                madvise(ptr, byte_size, MADV_HUGEPAGE);
-                data = static_cast<PackedLocation*>(ptr);
-                std::cerr << "Allocated dense node index: " << (byte_size / (1024*1024*1024))
-                          << "GB virtual address space" << std::endl;
-            }
-
-            // Explicitly release the mmap (~100 GiB RSS for planet) once
-            // way parsing has resolved everything it needs. Idempotent —
-            // safe to call before the destructor.
-            void release() {
-                if (data) {
-                    munmap(data, capacity * sizeof(PackedLocation));
-                    data = nullptr;
-                    capacity = 0;
-                }
-            }
-
-            ~DenseIndex() {
-                release();
-            }
-
-            // Lockless — each node ID maps to a unique array slot.
-            // over_capacity counts silently-dropped node ids: when OSM ids
-            // outgrow MAX_NODE_ID this is DATA LOSS (nodes resolve to 0,0),
-            // so the count is checked after each parse pass below.
-            std::atomic<uint64_t> over_capacity{0};
-            void set(uint64_t id, double lat, double lng) {
-                if (id >= capacity) { over_capacity.fetch_add(1, std::memory_order_relaxed); return; }
-                data[id] = {static_cast<int32_t>(lat * 10000000.0 + (lat >= 0 ? 0.5 : -0.5)),
-                            static_cast<int32_t>(lng * 10000000.0 + (lng >= 0 ? 0.5 : -0.5))};
-            }
-
-            PackedLocation get(uint64_t id) const {
-                if (id >= capacity) return {0, 0};
-                return data[id];
-            }
-        } index;
-
         for (const auto& input_file : input_files) {
             std::cerr << "Processing " << input_file << "..." << std::endl;
 
@@ -3552,6 +3489,29 @@ static int run(int argc, char* argv[]) {
                 return poi_way_bits[id / 8] & (1 << (id % 8));
             };
             std::cerr << "  POI assembly needs " << poi_way_count << " way geometries." << std::endl;
+
+            // --- Pass 2 pre-scan: mark the nodes the way pass looks up ---
+            // Only their coordinates are kept. The way pass applies the
+            // same way_needs_nodes rule to the same blobs, and a lookup of
+            // an unmarked id fails the build after it.
+            SparseNodeIndex index(MAX_NODE_ID_DEFAULT);
+            {
+                auto _mt = std::chrono::steady_clock::now();
+                auto _mc = CpuTicks::now();
+                pbf.read_ways_streaming([&](int64_t way_id,
+                    const int64_t* refs_data, size_t refs_size,
+                    const uint32_t* tag_keys, const uint32_t* tag_vals, size_t ntags,
+                    const std::vector<std::string>& st) {
+                    if (refs_size == 0) return;
+                    bool relation_member = is_admin_way(way_id) || is_poi_way(way_id);
+                    if (!way_needs_nodes(parse_way_tags(tag_keys, tag_vals, ntags, st), relation_member)) return;
+                    for (size_t ri = 0; ri < refs_size; ri++) index.mark(static_cast<uint64_t>(refs_data[ri]));
+                });
+                index.finalize();
+                std::cerr << "  Node index: " << index.marked() << " node ids looked up by ways ("
+                          << (index.bytes() >> 20) << " MiB)." << std::endl;
+                log_phase("    Pass 2: way node pre-scan", _mt, _mc);
+            }
 
             // --- Pass 2: Node processing (streaming — no PbfNode objects) ---
             // POI classification helper
@@ -3917,13 +3877,13 @@ static int run(int argc, char* argv[]) {
                           << " place nodes collected." << std::endl;
             }
             log_phase("Pass 2: node processing", _pt, _cpu);
-            // Nodes with ids past MAX_NODE_ID were silently dropped (they'd
-            // resolve to lat/lng 0,0 in every way that references them).
-            // Fail loudly the day OSM ids outgrow the DenseIndex capacity —
-            // the fix is bumping MAX_NODE_ID_DEFAULT (more RAM/vmem).
-            if (uint64_t oc = index.over_capacity.load()) {
-                throw std::runtime_error("DenseIndex: " + std::to_string(oc) +
-                    " node ids exceed MAX_NODE_ID capacity — bump MAX_NODE_ID_DEFAULT");
+            // Nodes with ids past MAX_NODE_ID_DEFAULT were silently dropped
+            // (they'd resolve to lat/lng 0,0 in every way that references
+            // them). Fail loudly the day OSM ids outgrow the index capacity —
+            // the fix is bumping MAX_NODE_ID_DEFAULT.
+            if (uint64_t oc = index.over_capacity()) {
+                throw std::runtime_error("node index: " + std::to_string(oc) +
+                    " node ids exceed MAX_NODE_ID_DEFAULT capacity — bump MAX_NODE_ID_DEFAULT");
             }
             pbf.release_pages(); // free PBF mmap pages, will re-fault for way pass
 
@@ -4279,12 +4239,16 @@ static int run(int argc, char* argv[]) {
                 });
                 tl_way_data = nullptr;
                 std::cerr << "  Parallel way processing complete." << std::endl;
+                if (uint64_t miss = index.unmarked_lookups()) {
+                    throw std::runtime_error("node index: " + std::to_string(miss) +
+                        " way node lookups of ids the pre-scan did not mark");
+                }
                 // The way stream was the last reader of node coordinates:
                 // admin/POI ring assembly reads data.way_geometries. Free
-                // the index (~100 GiB resident on planet) before the merge
-                // below copies the thread-local data into ParsedData.
+                // the index before the merge below copies the thread-local
+                // data into ParsedData.
                 index.release();
-                std::cerr << "Released dense node index." << std::endl;
+                std::cerr << "Released node index." << std::endl;
 
                 // Process areas/multipolygons — sequential fallback path
                 // Merge thread-local way/interp data into main ParsedData
