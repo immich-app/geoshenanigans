@@ -18,6 +18,7 @@
 #include "id_allocator.h"
 #include "parallel.h"
 #include "postcode_validation.h"
+#include "ring_contains.h"
 #include "s2_helpers.h"
 #include "strategy2_remap.h"
 #include "vertex_pack.h"
@@ -629,7 +630,10 @@ void collect_postcode_centroids(ParsedData& data) {
     data.postcode_accum = std::move(osm);
 }
 
-uint16_t country_code_at_point(const ParsedData& data, double lat, double lng) {
+// country_code_at_point's rules, with the ring test supplied as
+// contains(polygon id, vertices, count, plat, plng).
+template <class Contains>
+static uint16_t country_at(const ParsedData& data, double lat, double lng, Contains contains) {
     S2CellId cell = S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(kAdminCellLevel);
     auto it = data.cell_to_admin.find(cell.id());
     if (it == data.cell_to_admin.end()) return 0;
@@ -682,14 +686,7 @@ uint16_t country_code_at_point(const ParsedData& data, double lat, double lng) {
         uint32_t off = poly.vertex_offset;
         uint32_t cnt = poly.vertex_count;
         if (off + cnt > data.admin_vertices.size() || cnt < 3) continue;
-        const auto* verts = &data.admin_vertices[off];
-        bool inside = false;
-        for (uint32_t a = 0, b = cnt - 1; a < cnt; b = a++) {
-            if (((verts[a].lng > plng) != (verts[b].lng > plng)) &&
-                (plat < (verts[b].lat - verts[a].lat) * (plng - verts[a].lng) / (verts[b].lng - verts[a].lng) + verts[a].lat))
-                inside = !inside;
-        }
-        if (inside) {
+        if (contains(pid, &data.admin_vertices[off], cnt, plat, plng)) {
             if (poly.area < best_area ||
                 (poly.area == best_area && poly.country_code < best_cc)) {
                 best_area = poly.area;
@@ -698,6 +695,12 @@ uint16_t country_code_at_point(const ParsedData& data, double lat, double lng) {
         }
     }
     return best_cc != 0 ? best_cc : fallback_cc;
+}
+
+uint16_t country_code_at_point(const ParsedData& data, double lat, double lng) {
+    return country_at(data, lat, lng, [](uint32_t, const NodeCoord* verts, uint32_t cnt, float plat, float plng) {
+        return ring_contains(verts, cnt, plat, plng);
+    });
 }
 
 void write_index(const ParsedData& data, const std::string& output_dir, IndexMode mode) {
