@@ -1,24 +1,14 @@
 #include "interpolation.h"
 #include "geometry.h"
+#include "parallel.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
-#include <unordered_map>
 
 void resolve_interpolation_endpoints(ParsedData& data) {
-    struct CoordKey {
-        int32_t lat;
-        int32_t lng;
-        bool operator==(const CoordKey& o) const { return lat == o.lat && lng == o.lng; }
-    };
-    struct CoordHash {
-        size_t operator()(const CoordKey& k) const {
-            // Shift the unsigned bit pattern: a negative int64 left shift is UB.
-            return std::hash<int64_t>()(int64_t((uint64_t(uint32_t(k.lat)) << 32) | uint32_t(k.lng)));
-        }
-    };
-
     const auto& sp = data.string_pool.data();
     auto get_str = [&](uint32_t off) -> const char* {
         return sp.data() + off;
@@ -38,49 +28,64 @@ void resolve_interpolation_endpoints(ParsedData& data) {
         return strcmp(get_str(sa), get_str(sb)) < 0;
     };
 
-    std::unordered_map<CoordKey, uint32_t, CoordHash> addr_by_coord;
-    for (uint32_t i = 0; i < data.addr_points.size(); i++) {
-        CoordKey key{
-            static_cast<int32_t>(data.addr_points[i].lat * 100000),
-            static_cast<int32_t>(data.addr_points[i].lng * 100000)
-        };
-        auto [it, inserted] = addr_by_coord.emplace(key, i);
-        if (!inserted) {
-            // Collision: keep the deterministically "smallest" address
-            if (addr_less(i, it->second))
-                it->second = i;
+    // A point's coordinate bucket: lat/lng truncated to 1e-5 degrees, packed
+    // so equal buckets give equal keys.
+    auto key_of = [](float lat, float lng) -> uint64_t {
+        auto la = static_cast<int32_t>(lat * 100000);
+        auto ln = static_cast<int32_t>(lng * 100000);
+        return (uint64_t(uint32_t(la)) << 32) | uint32_t(ln);
+    };
+
+    // Every address by bucket, then index: within a bucket the address that
+    // stands for it is the smallest under addr_less, the earliest on ties.
+    struct Keyed { uint64_t key; uint32_t index; };
+    const size_t n = data.addr_points.size();
+    std::vector<Keyed> keyed(n);
+    parallel_for(n, [&](size_t b, size_t e, unsigned) {
+        for (size_t i = b; i < e; i++)
+            keyed[i] = {key_of(data.addr_points[i].lat, data.addr_points[i].lng), static_cast<uint32_t>(i)};
+    });
+    parallel_sort(keyed.begin(), keyed.end(), [](const Keyed& x, const Keyed& y) {
+        return x.key != y.key ? x.key < y.key : x.index < y.index;
+    });
+    // Collapse each bucket's run to its representative, in place: a run's
+    // first slot takes the winner, the rest are dropped below.
+    parallel_for_runs(n, [&](size_t i) { return keyed[i].key == keyed[i - 1].key; },
+        [&](size_t b, size_t e, unsigned) {
+            for (size_t run = b; run < e;) {
+                size_t next = run + 1;
+                uint32_t best = keyed[run].index;
+                for (; next < e && keyed[next].key == keyed[run].key; next++)
+                    if (addr_less(keyed[next].index, best)) best = keyed[next].index;
+                keyed[run].index = best;
+                for (size_t k = run + 1; k < next; k++) keyed[k].index = NO_DATA;
+                run = next;
+            }
+        });
+    keyed.erase(std::remove_if(keyed.begin(), keyed.end(), [](const Keyed& k) { return k.index == NO_DATA; }),
+                keyed.end());
+    auto find = [&](uint64_t key) -> const Keyed* {
+        auto it = std::lower_bound(keyed.begin(), keyed.end(), key,
+                                   [](const Keyed& k, uint64_t v) { return k.key < v; });
+        return it != keyed.end() && it->key == key ? &*it : nullptr;
+    };
+
+    std::atomic<uint32_t> resolved{0};
+    parallel_for(data.interp_ways.size(), [&](size_t b, size_t e, unsigned) {
+        uint32_t local = 0;
+        for (size_t w = b; w < e; w++) {
+            auto& iw = data.interp_ways[w];
+            if (iw.node_count < 2) continue;
+            const auto& start = data.interp_nodes[iw.node_offset];
+            const auto& end = data.interp_nodes[iw.node_offset + iw.node_count - 1];
+            if (const Keyed* s = find(key_of(start.lat, start.lng)))
+                iw.start_number = parse_house_number(get_str(data.addr_points[s->index].housenumber_id));
+            if (const Keyed* t = find(key_of(end.lat, end.lng)))
+                iw.end_number = parse_house_number(get_str(data.addr_points[t->index].housenumber_id));
+            if (iw.start_number > 0 && iw.end_number > 0) local++;
         }
-    }
-
-    uint32_t resolved = 0;
-    for (auto& iw : data.interp_ways) {
-        if (iw.node_count < 2) continue;
-
-        const auto& start = data.interp_nodes[iw.node_offset];
-        CoordKey start_key{
-            static_cast<int32_t>(start.lat * 100000),
-            static_cast<int32_t>(start.lng * 100000)
-        };
-        auto it_start = addr_by_coord.find(start_key);
-
-        const auto& end = data.interp_nodes[iw.node_offset + iw.node_count - 1];
-        CoordKey end_key{
-            static_cast<int32_t>(end.lat * 100000),
-            static_cast<int32_t>(end.lng * 100000)
-        };
-        auto it_end = addr_by_coord.find(end_key);
-
-        if (it_start != addr_by_coord.end()) {
-            const char* hn = data.string_pool.data().data() + data.addr_points[it_start->second].housenumber_id;
-            iw.start_number = parse_house_number(hn);
-        }
-        if (it_end != addr_by_coord.end()) {
-            const char* hn = data.string_pool.data().data() + data.addr_points[it_end->second].housenumber_id;
-            iw.end_number = parse_house_number(hn);
-        }
-
-        if (iw.start_number > 0 && iw.end_number > 0) resolved++;
-    }
+        resolved += local;
+    });
 
     std::cerr << "Resolved " << resolved << "/" << data.interp_ways.size()
               << " interpolation ways" << std::endl;

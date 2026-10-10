@@ -16,8 +16,12 @@
 //     id).
 #include "interpolation.h"
 
+#include <cstring>
+#include <map>
+#include <random>
 #include <string>
 
+#include "geometry.h"
 #include "parsed_data.h"
 #include "types.h"
 
@@ -273,4 +277,69 @@ TEST(interpolation_uses_first_and_last_node_only) {
 
     CHECK_EQ(d.interp_ways[0].start_number, 100u);
     CHECK_EQ(d.interp_ways[0].end_number, 200u);
+}
+
+// The hash-map implementation the parallel one replaced, kept as the
+// reference: both must pick the same address for every coordinate bucket.
+namespace {
+
+void reference_resolve(ParsedData& d) {
+    auto str = [&](uint32_t off) { return d.string_pool.data().data() + off; };
+    auto less = [&](uint32_t a, uint32_t b) {
+        int c = strcmp(str(d.addr_points[a].housenumber_id), str(d.addr_points[b].housenumber_id));
+        if (c != 0) return c < 0;
+        uint32_t sa = d.addr_points[a].street_id, sb = d.addr_points[b].street_id;
+        if (sa == NO_DATA || sb == NO_DATA) return sa < sb;
+        return strcmp(str(sa), str(sb)) < 0;
+    };
+    auto key = [](float lat, float lng) {
+        return std::make_pair(static_cast<int32_t>(lat * 100000), static_cast<int32_t>(lng * 100000));
+    };
+    std::map<std::pair<int32_t, int32_t>, uint32_t> by;
+    for (uint32_t i = 0; i < d.addr_points.size(); i++) {
+        auto [it, inserted] = by.emplace(key(d.addr_points[i].lat, d.addr_points[i].lng), i);
+        if (!inserted && less(i, it->second)) it->second = i;
+    }
+    for (auto& iw : d.interp_ways) {
+        if (iw.node_count < 2) continue;
+        const auto& s = d.interp_nodes[iw.node_offset];
+        const auto& e = d.interp_nodes[iw.node_offset + iw.node_count - 1];
+        auto a = by.find(key(s.lat, s.lng)), b = by.find(key(e.lat, e.lng));
+        if (a != by.end()) iw.start_number = parse_house_number(str(d.addr_points[a->second].housenumber_id));
+        if (b != by.end()) iw.end_number = parse_house_number(str(d.addr_points[b->second].housenumber_id));
+    }
+}
+
+}  // namespace
+
+// Many colliding buckets (equal housenumbers, equal streets, NO_DATA
+// streets, negative coordinates) and enough points for a multi-chunk sort.
+TEST(interpolation_matches_reference_on_random_collisions) {
+    auto fill = [](ParsedData& d) {
+        std::mt19937 rng(5);
+        std::vector<uint32_t> hns, streets;
+        for (int i = 0; i < 40; i++) hns.push_back(S(d, std::to_string(i % 13) + (i % 3 ? "" : "a")));
+        for (int i = 0; i < 7; i++) streets.push_back(S(d, "Street " + std::to_string(i % 5)));
+        auto coord = [&] { return static_cast<float>(static_cast<int>(rng() % 300) - 150) / 100000.0f * 7.0f; };
+        for (int i = 0; i < 300000; i++) {
+            uint32_t street = rng() % 9 == 0 ? NO_DATA : streets[rng() % streets.size()];
+            add_addr(d, coord(), coord(), hns[rng() % hns.size()], street);
+        }
+        for (int i = 0; i < 60000; i++) {
+            size_t a = rng() % d.addr_points.size(), b = rng() % d.addr_points.size();
+            add_interp(d, {{d.addr_points[a].lat, d.addr_points[a].lng}, {coord(), coord()},
+                           {d.addr_points[b].lat, d.addr_points[b].lng}},
+                       streets[0], rng() % 3, rng() % 3);
+        }
+    };
+    ParsedData d, ref;
+    fill(d);
+    fill(ref);
+    reference_resolve(ref);
+    resolve_interpolation_endpoints(d);
+    bool same = true;
+    for (size_t w = 0; w < d.interp_ways.size(); w++)
+        same &= d.interp_ways[w].start_number == ref.interp_ways[w].start_number &&
+                d.interp_ways[w].end_number == ref.interp_ways[w].end_number;
+    CHECK(same);
 }
