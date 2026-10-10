@@ -756,16 +756,18 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                 way_cells = f1.get();
             }
 
-            sorted_geo_cells.reserve(way_cells.size() + addr_cells.size() + interp_cells.size());
+            // Interp cells go in by an in-place merge: its buffer is the
+            // short interp side, not another copy of the whole list.
+            const size_t way_addr = way_cells.size() + addr_cells.size();
+            sorted_geo_cells.resize(way_addr + interp_cells.size());
             std::merge(way_cells.begin(), way_cells.end(), addr_cells.begin(), addr_cells.end(),
-                       std::back_inserter(sorted_geo_cells));
-            if (!interp_cells.empty()) {
-                std::vector<uint64_t> tmp;
-                tmp.reserve(sorted_geo_cells.size() + interp_cells.size());
-                std::merge(sorted_geo_cells.begin(), sorted_geo_cells.end(),
-                           interp_cells.begin(), interp_cells.end(), std::back_inserter(tmp));
-                sorted_geo_cells = std::move(tmp);
-            }
+                       sorted_geo_cells.begin());
+            std::vector<uint64_t>().swap(way_cells);
+            std::vector<uint64_t>().swap(addr_cells);
+            std::copy(interp_cells.begin(), interp_cells.end(), sorted_geo_cells.begin() + way_addr);
+            std::vector<uint64_t>().swap(interp_cells);
+            std::inplace_merge(sorted_geo_cells.begin(), sorted_geo_cells.begin() + way_addr,
+                               sorted_geo_cells.end());
             sorted_geo_cells.erase(std::unique(sorted_geo_cells.begin(), sorted_geo_cells.end()),
                                     sorted_geo_cells.end());
         }
@@ -796,33 +798,34 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
 
         log_phase((label + "entry files").c_str(), _wt, _wc);
         {
-            size_t n = sorted_geo_cells.size();
-            size_t row_size = sizeof(uint64_t) + 3 * sizeof(uint32_t);
-            std::vector<char> buf(n * row_size);
-            if (addr_offsets.empty()) addr_offsets.resize(n, NO_DATA);
-            if (interp_offsets.empty()) interp_offsets.resize(n, NO_DATA);
-
-            unsigned int nthreads = std::thread::hardware_concurrency();
-            if (nthreads == 0) nthreads = 4;
-            size_t chunk = (n + nthreads - 1) / nthreads;
-            std::vector<std::thread> fill_threads;
-            for (unsigned int t = 0; t < nthreads; t++) {
-                size_t start = t * chunk;
-                size_t end = std::min(start + chunk, n);
-                if (start >= n) break;
-                fill_threads.emplace_back([&, start, end]() {
-                    char* ptr = buf.data() + start * row_size;
-                    for (size_t i = start; i < end; i++) {
-                        memcpy(ptr, &sorted_geo_cells[i], sizeof(uint64_t)); ptr += sizeof(uint64_t);
-                        memcpy(ptr, &street_offsets[i], sizeof(uint32_t)); ptr += sizeof(uint32_t);
-                        memcpy(ptr, &addr_offsets[i], sizeof(uint32_t)); ptr += sizeof(uint32_t);
-                        memcpy(ptr, &interp_offsets[i], sizeof(uint32_t)); ptr += sizeof(uint32_t);
+            // Filled and written a piece at a time: the whole file is 20
+            // bytes per cell (7 GiB on planet). No addr/interp offsets
+            // (no-addresses mode) write as NO_DATA.
+            constexpr size_t kRowsPerPiece = size_t(1) << 22;
+            const size_t n = sorted_geo_cells.size();
+            const size_t row_size = sizeof(uint64_t) + 3 * sizeof(uint32_t);
+            auto offset_at = [](const std::vector<uint32_t>& offsets, size_t i) {
+                return offsets.empty() ? NO_DATA : offsets[i];
+            };
+            std::vector<char> piece(std::min(n, kRowsPerPiece) * row_size);
+            const std::string path = output_dir + "/geo_cells.bin";
+            std::ofstream f(path, std::ios::binary);
+            for (size_t first = 0; first < n; first += kRowsPerPiece) {
+                const size_t rows = std::min(kRowsPerPiece, n - first);
+                parallel_for(rows, [&](size_t begin, size_t end, unsigned) {
+                    char* ptr = piece.data() + begin * row_size;
+                    for (size_t i = first + begin; i < first + end; i++) {
+                        const uint32_t offsets[3] = {street_offsets[i], offset_at(addr_offsets, i),
+                                                     offset_at(interp_offsets, i)};
+                        memcpy(ptr, &sorted_geo_cells[i], sizeof(uint64_t));
+                        memcpy(ptr + sizeof(uint64_t), offsets, sizeof(offsets));
+                        ptr += row_size;
                     }
                 });
+                f.write(piece.data(), static_cast<std::streamsize>(rows * row_size));
             }
-            for (auto& t : fill_threads) t.join();
-
-            write_binary_file(output_dir + "/geo_cells.bin", buf.data(), buf.size());
+            f.flush();
+            if (!f) throw std::runtime_error("failed to write " + path);
         }
 
         std::cerr << "geo index: " << sorted_geo_cells.size() << " cells ("
