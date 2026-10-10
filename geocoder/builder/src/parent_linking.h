@@ -81,6 +81,21 @@ void rank_candidates(std::vector<uint32_t>& ids, Better better,
     for (const auto& entry : scratch) ids.push_back(entry.first);
 }
 
+// std::lower_bound(first, last, value, comp), found by galloping from first:
+// probes first+0, 1, 3, 7, ... then binary-searches the last gap, so a lookup
+// landing near first costs a few nearby probes, not a search of the range.
+template <class It, class T, class Comp>
+It gallop_lower_bound(It first, It last, const T& value, Comp comp) {
+    auto n = last - first;
+    decltype(n) lo = 0, hi = 0, step = 1;
+    while (hi < n && comp(first[hi], value)) {
+        lo = hi + 1;
+        hi += step;
+        step *= 2;
+    }
+    return std::lower_bound(first + lo, first + std::min(hi, n), value, comp);
+}
+
 // The first of `candidates` in `before` order (a strict total order) that
 // passes `qualifies`, or nullptr. Heap-ordered, so a costly `qualifies` runs
 // only on the candidates ranked ahead of the winner. Reorders `candidates`.

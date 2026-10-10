@@ -252,3 +252,18 @@ TEST(first_qualifying_matches_strict_improvement_scan) {
         }
     }
 }
+
+TEST(gallop_lower_bound_matches_lower_bound) {
+    std::mt19937_64 rng(31);
+    for (int round = 0; round < 2000; round++) {
+        std::vector<uint32_t> v(rng() % 300);
+        for (auto& x : v) x = static_cast<uint32_t>(rng() % 50);
+        std::sort(v.begin(), v.end());
+        size_t from = v.empty() ? 0 : rng() % (v.size() + 1);
+        for (uint32_t value = 0; value <= 51; value++) {
+            auto expect = std::lower_bound(v.begin() + from, v.end(), value);
+            auto got = gallop_lower_bound(v.begin() + from, v.end(), value, std::less<uint32_t>());
+            CHECK(got == expect);
+        }
+    }
+}

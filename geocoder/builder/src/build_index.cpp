@@ -678,6 +678,7 @@ static void compute_way_parent_polygons(ParsedData& data, const BuildConfig& cfg
 // only a street's smallest distance can win. Both passes walk their points
 // per street cell, so each cell's streets are gathered once.
 struct NearbyStreets {
+    std::vector<S2CellId> ring1, ring2;
     std::vector<uint64_t> cells;
     std::vector<uint32_t> ways;
     std::vector<std::pair<uint32_t, uint32_t>> order;
@@ -698,11 +699,13 @@ static void gather_nearby_named_streets(const ParsedData& data, S2CellId center,
     auto& cells_to_check = nearby.cells;
     cells_to_check.clear();
     cells_to_check.push_back(center.id());
-    std::vector<S2CellId> ring1;
+    auto& ring1 = nearby.ring1;
+    auto& ring2 = nearby.ring2;
+    ring1.clear();
     center.AppendAllNeighbors(kStreetCellLevel, &ring1);
     for (const auto& n : ring1) {
         cells_to_check.push_back(n.id());
-        std::vector<S2CellId> ring2;
+        ring2.clear();
         n.AppendAllNeighbors(kStreetCellLevel, &ring2);
         for (const auto& n2 : ring2) {
             cells_to_check.push_back(n2.id());
@@ -716,15 +719,16 @@ static void gather_nearby_named_streets(const ParsedData& data, S2CellId center,
 
     auto& ways = nearby.ways;
     ways.clear();
-    for (uint64_t cid : cells_to_check) {
+    const auto last = data.sorted_way_cells.end();
+    auto from = data.sorted_way_cells.begin();
+    for (size_t k = 0; k < cells_to_check.size(); k++) {
+        uint64_t cid = cells_to_check[k];
         CellItemPair probe{cid, 0};
-        auto lo = std::lower_bound(
-            data.sorted_way_cells.begin(),
-            data.sorted_way_cells.end(), probe,
-            cell_item_less);
-        for (auto p = lo;
-             p != data.sorted_way_cells.end() && p->cell_id == cid;
-             ++p) {
+        // The cells ascend, so each run starts past the previous one: gallop
+        // from there instead of searching the whole table again.
+        auto p = k == 0 ? std::lower_bound(from, last, probe, cell_item_less)
+                        : gallop_lower_bound(from, last, probe, cell_item_less);
+        for (; p != last && p->cell_id == cid; ++p) {
             uint32_t way_id = p->item_id;
             if (way_id >= data.ways.size()) continue;
             const auto& w = data.ways[way_id];
@@ -734,6 +738,7 @@ static void gather_nearby_named_streets(const ParsedData& data, S2CellId center,
             if (static_cast<size_t>(w.node_offset) + w.node_count > data.street_nodes.size()) continue;
             ways.push_back(way_id);
         }
+        from = p;
     }
     rank_candidates(ways, [](uint32_t, uint32_t) { return false; }, nearby.order);
 }
