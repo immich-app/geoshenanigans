@@ -262,25 +262,12 @@ static void apply_strategy2_streets(ParsedData& data, const std::string& prev_di
     tomb_way.node_offset = 0;
     tomb_way.node_count  = 0;
     tomb_way.name_id     = NO_DATA;
-    std::vector<WayHeader> new_ways(n_new, tomb_way);
-    std::vector<int64_t>   new_osm_ids(n_new, 0);
-    std::vector<uint32_t>  new_orig_names(n_new, NO_DATA);
-    std::vector<uint32_t>  new_parent_ids(data.way_parent_ids.empty() ? 0 : n_new, NO_DATA);
-    std::vector<uint32_t>  new_postcode_ids(data.way_postcode_ids.empty() ? 0 : n_new, NO_DATA);
-
-    for (size_t i = 0; i < n_old; i++) {
-        uint32_t k = remap[i];
-        new_ways[k] = data.ways[i];
-        new_osm_ids[k] = data.way_osm_ids[i];
-        if (i < data.way_orig_name_ids.size()) new_orig_names[k] = data.way_orig_name_ids[i];
-        if (i < data.way_parent_ids.size())    new_parent_ids[k]    = data.way_parent_ids[i];
-        if (i < data.way_postcode_ids.size())  new_postcode_ids[k]  = data.way_postcode_ids[i];
-    }
-    data.ways              = std::move(new_ways);
-    data.way_osm_ids       = std::move(new_osm_ids);
-    data.way_orig_name_ids = std::move(new_orig_names);
-    if (!new_parent_ids.empty())   data.way_parent_ids   = std::move(new_parent_ids);
-    if (!new_postcode_ids.empty()) data.way_postcode_ids = std::move(new_postcode_ids);
+    reorder_by_remap(data.ways, remap, n_new, tomb_way);
+    reorder_by_remap(data.way_osm_ids, remap, n_new, int64_t(0));
+    // Build-time only, and already dropped by the string-tier pass.
+    if (!data.way_orig_name_ids.empty()) reorder_by_remap(data.way_orig_name_ids, remap, n_new, NO_DATA);
+    if (!data.way_parent_ids.empty())    reorder_by_remap(data.way_parent_ids, remap, n_new, NO_DATA);
+    if (!data.way_postcode_ids.empty())  reorder_by_remap(data.way_postcode_ids, remap, n_new, NO_DATA);
 
     // Rebuild street_nodes in way order with sequential offsets. Before
     // this pass, each new_ways[k].node_offset still points at the OLD
@@ -290,29 +277,12 @@ static void apply_strategy2_streets(ParsedData& data, const std::string& prev_di
     // node_offsets — so without this rebuild verify reads from the
     // wrong byte positions and the patched street_nodes.bin diverges
     // from the build's at byte 0 (cf. africa/full first_diff=1).
-    {
-        std::vector<NodeCoord> new_nodes;
-        new_nodes.reserve(data.street_nodes.size());
-        for (uint32_t k = 0; k < n_new; k++) {
-            WayHeader& w = data.ways[k];
-            if (w.node_count == 0) continue;
-            uint32_t old_off = w.node_offset;
-            if (static_cast<size_t>(old_off) + w.node_count > data.street_nodes.size()) {
-                w.node_offset = 0; w.node_count = 0;
-                continue;
-            }
-            w.node_offset = static_cast<uint32_t>(new_nodes.size());
-            new_nodes.insert(new_nodes.end(),
-                             data.street_nodes.begin() + old_off,
-                             data.street_nodes.begin() + old_off + w.node_count);
-        }
-        data.street_nodes = std::move(new_nodes);
-    }
+    repack_nodes(data.ways, data.street_nodes);
 
     // Apply remap to every reference site that points into ways[].
     remap_cell_map(data.cell_to_ways, [&](uint32_t& v) { remap_index(v, remap); });
     remap_cell_pairs(data.sorted_way_cells, [&](uint32_t& v) { remap_index(v, remap); });
-    for (auto& ap : data.addr_points)     remap_index(ap.parent_way_id, remap);
+    parallel_each(data.addr_points, [&](AddrPoint& ap) { remap_index(ap.parent_way_id, remap); });
     // NOTE: PoiRecord::parent_street_id is NOT a way index — it holds the
     // string offset of the nearest street's name (w.name_id, set at
     // build_index.cpp's POI parent-street linking). String offsets are
@@ -372,19 +342,9 @@ static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir
         return;
     }
 
-    std::vector<AdminPolygon> new_polys(n_new, admin_polygon_tombstone());
-    std::vector<uint64_t>     new_osm_ids(n_new, 0);
-    std::vector<uint32_t>     new_parents(data.admin_parent_ids.empty() ? 0 : n_new, NO_DATA);
-
-    for (size_t i = 0; i < n_old; i++) {
-        uint32_t k = remap[i];
-        new_polys[k]   = data.admin_polygons[i];
-        new_osm_ids[k] = data.admin_osm_ids[i];
-        if (i < data.admin_parent_ids.size()) new_parents[k] = data.admin_parent_ids[i];
-    }
-    data.admin_polygons = std::move(new_polys);
-    data.admin_osm_ids  = std::move(new_osm_ids);
-    if (!new_parents.empty()) data.admin_parent_ids = std::move(new_parents);
+    reorder_by_remap(data.admin_polygons, remap, n_new, admin_polygon_tombstone());
+    reorder_by_remap(data.admin_osm_ids, remap, n_new, uint64_t(0));
+    if (!data.admin_parent_ids.empty()) reorder_by_remap(data.admin_parent_ids, remap, n_new, NO_DATA);
 
     // Apply remap to every reference site that points into admin_polygons[].
     // cell_to_admin entries carry the high-bit INTERIOR_FLAG (set during
@@ -396,10 +356,10 @@ static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir
     // admin_parent_ids and way_parent_ids hold admin polygon IDs (parent chain).
     // admin_parent_ids was reordered above; now value-remap each entry.
     // These are plain indices (no INTERIOR_FLAG), so plain remap_index is correct.
-    for (auto& v : data.admin_parent_ids) remap_index(v, remap);
-    for (auto& v : data.way_parent_ids)   remap_index(v, remap);
-    for (auto& pr : data.poi_records)     remap_index(pr.parent_poly_id, remap);
-    for (auto& pn : data.place_nodes)     remap_index(pn.parent_poly_id, remap);
+    parallel_each(data.admin_parent_ids, [&](uint32_t& v) { remap_index(v, remap); });
+    parallel_each(data.way_parent_ids, [&](uint32_t& v) { remap_index(v, remap); });
+    parallel_each(data.poi_records, [&](PoiRecord& pr) { remap_index(pr.parent_poly_id, remap); });
+    parallel_each(data.place_nodes, [&](PlaceNode& pn) { remap_index(pn.parent_poly_id, remap); });
 
     finalize_strategy2(alloc, n_new, n_old, data.admin_sidecar_blob, "admins", /*no_shifts=*/false);
 }
@@ -438,19 +398,9 @@ static void apply_strategy2_addrs(ParsedData& data, const std::string& prev_dir)
     std::memset(&tomb_addr, 0, sizeof(tomb_addr));
     tomb_addr.parent_way_id = NO_DATA;
     tomb_addr.vertex_offset = NO_DATA;
-    std::vector<AddrPoint> new_addrs(n_new, tomb_addr);
-    std::vector<uint64_t>  new_osm_ids(n_new, 0);
-    std::vector<uint32_t>  new_postcodes(data.addr_postcode_ids.empty() ? 0 : n_new, NO_DATA);
-
-    for (size_t i = 0; i < n_old; i++) {
-        uint32_t k = remap[i];
-        new_addrs[k]   = data.addr_points[i];
-        new_osm_ids[k] = data.addr_osm_ids[i];
-        if (i < data.addr_postcode_ids.size()) new_postcodes[k] = data.addr_postcode_ids[i];
-    }
-    data.addr_points  = std::move(new_addrs);
-    data.addr_osm_ids = std::move(new_osm_ids);
-    if (!new_postcodes.empty()) data.addr_postcode_ids = std::move(new_postcodes);
+    reorder_by_remap(data.addr_points, remap, n_new, tomb_addr);
+    reorder_by_remap(data.addr_osm_ids, remap, n_new, uint64_t(0));
+    if (!data.addr_postcode_ids.empty()) reorder_by_remap(data.addr_postcode_ids, remap, n_new, NO_DATA);
 
     remap_cell_map(data.cell_to_addrs, [&](uint32_t& v) { remap_index(v, remap); });
     remap_cell_pairs(data.sorted_addr_cells, [&](uint32_t& v) { remap_index(v, remap); });
@@ -490,16 +440,8 @@ static void apply_strategy2_places(ParsedData& data, const std::string& prev_dir
     PlaceNode tomb_pn{};
     std::memset(&tomb_pn, 0, sizeof(tomb_pn));
     tomb_pn.name_id = NO_DATA;
-    std::vector<PlaceNode> new_places(n_new, tomb_pn);
-    std::vector<uint64_t>  new_osm_ids(n_new, 0);
-
-    for (size_t i = 0; i < n_old; i++) {
-        uint32_t k = remap[i];
-        new_places[k]  = data.place_nodes[i];
-        new_osm_ids[k] = data.place_osm_ids[i];
-    }
-    data.place_nodes   = std::move(new_places);
-    data.place_osm_ids = std::move(new_osm_ids);
+    reorder_by_remap(data.place_nodes, remap, n_new, tomb_pn);
+    reorder_by_remap(data.place_osm_ids, remap, n_new, uint64_t(0));
 
     remap_cell_pairs(data.sorted_place_cells, [&](uint32_t& v) { remap_index(v, remap); });
 
@@ -541,16 +483,8 @@ static void apply_strategy2_pois(ParsedData& data, const std::string& prev_dir) 
     tomb_pr.parent_street_id = NO_DATA;
     tomb_pr.parent_postcode_id = NO_DATA;
     tomb_pr.parent_poly_id = NO_DATA;
-    std::vector<PoiRecord> new_pois(n_new, tomb_pr);
-    std::vector<uint64_t>  new_osm_ids(n_new, 0);
-
-    for (size_t i = 0; i < n_old; i++) {
-        uint32_t k = remap[i];
-        new_pois[k]    = data.poi_records[i];
-        new_osm_ids[k] = data.poi_osm_ids[i];
-    }
-    data.poi_records = std::move(new_pois);
-    data.poi_osm_ids = std::move(new_osm_ids);
+    reorder_by_remap(data.poi_records, remap, n_new, tomb_pr);
+    reorder_by_remap(data.poi_osm_ids, remap, n_new, uint64_t(0));
 
     // cell_to_pois and sorted_poi_cells item_ids carry the high-bit
     // INTERIOR_FLAG (set during POI cell covering at build_index.cpp). A
@@ -590,22 +524,12 @@ static void apply_strategy2_interps(ParsedData& data, const std::string& prev_di
     InterpWay tomb_iw{};
     std::memset(&tomb_iw, 0, sizeof(tomb_iw));
     tomb_iw.street_id = NO_DATA;
-    std::vector<InterpWay> new_iw(n_new, tomb_iw);
-    std::vector<uint64_t>  new_osm_ids(n_new, 0);
     // Strict parallel-array gate, matching reorder_deterministically: a
     // desynced sidecar is skipped whole rather than partially copied.
     const bool have_pc = (data.interp_postcode_ids.size() == n_old);
-    std::vector<uint32_t>  new_pc_ids(have_pc ? n_new : 0, NO_DATA);
-
-    for (size_t i = 0; i < n_old; i++) {
-        uint32_t k = remap[i];
-        new_iw[k]      = data.interp_ways[i];
-        new_osm_ids[k] = data.interp_osm_ids[i];
-        if (have_pc) new_pc_ids[k] = data.interp_postcode_ids[i];
-    }
-    data.interp_ways    = std::move(new_iw);
-    data.interp_osm_ids = std::move(new_osm_ids);
-    if (!new_pc_ids.empty()) data.interp_postcode_ids = std::move(new_pc_ids);
+    reorder_by_remap(data.interp_ways, remap, n_new, tomb_iw);
+    reorder_by_remap(data.interp_osm_ids, remap, n_new, uint64_t(0));
+    if (have_pc) reorder_by_remap(data.interp_postcode_ids, remap, n_new, NO_DATA);
 
     // Rebuild interp_nodes in interp_way order with sequential offsets —
     // same reason as the street_nodes rebuild above. The patch tool
@@ -614,24 +538,7 @@ static void apply_strategy2_interps(ParsedData& data, const std::string& prev_di
     // without touching interp_nodes), the patch reads from the wrong
     // bytes and verify diverges from the build's interp_nodes.bin at
     // byte 0.
-    {
-        std::vector<NodeCoord> new_nodes;
-        new_nodes.reserve(data.interp_nodes.size());
-        for (uint32_t k = 0; k < n_new; k++) {
-            InterpWay& w = data.interp_ways[k];
-            if (w.node_count == 0) continue;
-            uint32_t old_off = w.node_offset;
-            if (static_cast<size_t>(old_off) + w.node_count > data.interp_nodes.size()) {
-                w.node_offset = 0; w.node_count = 0;
-                continue;
-            }
-            w.node_offset = static_cast<uint32_t>(new_nodes.size());
-            new_nodes.insert(new_nodes.end(),
-                             data.interp_nodes.begin() + old_off,
-                             data.interp_nodes.begin() + old_off + w.node_count);
-        }
-        data.interp_nodes = std::move(new_nodes);
-    }
+    repack_nodes(data.interp_ways, data.interp_nodes);
 
     remap_cell_map(data.cell_to_interps, [&](uint32_t& v) { remap_index(v, remap); });
     remap_cell_pairs(data.sorted_interp_cells, [&](uint32_t& v) { remap_index(v, remap); });

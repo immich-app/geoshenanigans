@@ -74,6 +74,40 @@ TEST(remap_cell_pairs_matches_a_global_sort_on_large_tables) {
     CHECK(same_pairs(pairs, want));
 }
 
+TEST(reorder_by_remap_moves_values_to_their_slots_and_fills_the_rest) {
+    std::vector<uint32_t> values = {10, 11, 12};
+    reorder_by_remap(values, {4, 0, 2}, 6, NO_DATA);
+    CHECK(values == std::vector<uint32_t>({11, NO_DATA, 12, NO_DATA, 10, NO_DATA}));
+
+    std::vector<uint32_t> shorter = {7};  // values past the end keep the fill
+    reorder_by_remap(shorter, {1, 0}, 2, 0u);
+    CHECK(shorter == std::vector<uint32_t>({0, 7}));
+}
+
+TEST(repack_nodes_lays_nodes_out_in_record_order) {
+    // Record order 2, 0, 1 after a reorder; record 3 has no nodes and keeps
+    // its offset; record 4 runs past the array and comes out empty.
+    std::vector<NodeCoord> nodes = {{0, 0}, {0, 1}, {1, 0}, {1, 1}, {1, 2}, {2, 0}};
+    std::vector<WayHeader> ways(5);
+    ways[0] = {5, 1, 0, 0};
+    ways[1] = {0, 2, 0, 0};
+    ways[2] = {2, 3, 0, 0};
+    ways[3] = {9, 0, 0, 0};
+    ways[4] = {4, 3, 0, 0};
+    repack_nodes(ways, nodes);
+    CHECK_EQ(nodes.size(), size_t(6));
+    CHECK_EQ(ways[0].node_offset, 0u);
+    CHECK_EQ(ways[1].node_offset, 1u);
+    CHECK_EQ(ways[2].node_offset, 3u);
+    CHECK_EQ(ways[3].node_offset, 9u);
+    CHECK_EQ(ways[4].node_offset, 0u);
+    CHECK_EQ(ways[4].node_count, 0);
+    CHECK_EQ(nodes[0].lat, 2.0f);
+    CHECK_EQ(nodes[1].lat, 0.0f);
+    CHECK_EQ(nodes[2].lng, 1.0f);
+    CHECK_EQ(nodes[5].lng, 2.0f);
+}
+
 TEST(remap_cell_pairs_sorts_a_table_not_grouped_by_cell) {
     const std::vector<uint32_t> remap = {2, 0, 1};
     std::vector<CellItemPair> pairs = {{9, 0}, {3, 1}, {9, 2}, {3, 0}};

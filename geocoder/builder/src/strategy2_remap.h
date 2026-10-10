@@ -30,6 +30,46 @@ inline void remap_index_flagged(uint32_t& v, const std::vector<uint32_t>& remap)
         v = remap[idx] | flag;
 }
 
+// Moves values[i] to slot remap[i] of a new n_new-long array; the slots no
+// value lands in hold `fill`. remap is injective (strategy-2 slots).
+template <class T>
+void reorder_by_remap(std::vector<T>& values, const std::vector<uint32_t>& remap, size_t n_new, const T& fill) {
+    std::vector<T> out(n_new, fill);
+    parallel_for(std::min(values.size(), remap.size()), [&](size_t begin, size_t end, unsigned) {
+        for (size_t i = begin; i < end; i++) out[remap[i]] = values[i];
+    });
+    values = std::move(out);
+}
+
+// Copies each record's nodes into a new array in record order and points the
+// record at them, so offsets ascend with record ids (the patch tool replays
+// node merges sequentially). Records without nodes keep their offset; records
+// whose nodes run past the array come out empty.
+template <class Record>
+void repack_nodes(std::vector<Record>& records, std::vector<NodeCoord>& nodes) {
+    auto in_range = [&](const Record& r) {
+        return static_cast<size_t>(r.node_offset) + r.node_count <= nodes.size();
+    };
+    std::vector<NodeCoord> packed;
+    parallel_prefix_fill(records.size(),
+        [&](size_t k) -> size_t { return in_range(records[k]) ? records[k].node_count : 0; },
+        [&](size_t total) { packed.resize(total); },
+        [&](size_t k, size_t offset) -> size_t {
+            Record& r = records[k];
+            if (r.node_count == 0) return 0;
+            if (!in_range(r)) {
+                r.node_offset = 0;
+                r.node_count = 0;
+                return 0;
+            }
+            std::copy(nodes.begin() + r.node_offset, nodes.begin() + r.node_offset + r.node_count,
+                      packed.begin() + offset);
+            r.node_offset = static_cast<uint32_t>(offset);
+            return r.node_count;
+        });
+    nodes = std::move(packed);
+}
+
 // Remap every id of a cell → ids table and restore its canonical order (each
 // list sorted by raw value, flag bit included; pair tables by cell_item_less),
 // as the deterministic-ordering pass leaves them. The entry writers emit lists
