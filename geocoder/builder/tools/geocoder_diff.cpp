@@ -36,6 +36,7 @@
 #include "cell_id_diff.h"
 #include "geo_corrections.h"
 #include "merge_sequence.h"
+#include "parallel.h"
 #include "patch_format.h"
 #include "record_match.h"
 #include "string_offset_map.h"
@@ -63,32 +64,39 @@ static std::vector<StringPoolSegment> string_tier_segments(const std::array<Mapp
 
 // --- Remap + fixup helpers ---
 
+// fn(rec) for every whole `stride`-byte record, on every core: the remaps
+// below touch each record alone (planet addr_points: 179M records).
+template <class Fn>
+static void for_each_record(char* data, size_t size, size_t stride, Fn fn) {
+    parallel_for(size / stride, [&](size_t b, size_t e, unsigned) {
+        for (size_t i = b; i < e; i++) fn(data + i * stride);
+    });
+}
 static void remap_addr_points(char* data, size_t size, const SortedU32Map& rm) {
     // AddrPoint: 28 bytes (lat:4 + lng:4 + housenumber_id:4 + street_id:4 +
     //                      parent_way_id:4 + vertex_offset:4 + vertex_count:4)
     // String fields at offsets 8, 12 only; parent_way_id/vertex fields are not strings.
-    constexpr size_t stride = 28;
-    for (size_t i = 0; i + stride <= size; i += stride) {
+    for_each_record(data, size, 28, [&](char* rec) {
         for (size_t off : {8, 12}) {
-            uint32_t v; memcpy(&v, data + i + off, 4);
-            if (const uint32_t* n = rm.find(v)) memcpy(data + i + off, n, 4);
+            uint32_t v; memcpy(&v, rec + off, 4);
+            if (const uint32_t* n = rm.find(v)) memcpy(rec + off, n, 4);
         }
-    }
+    });
 }
 static void remap_field(char* data, size_t size, size_t stride, size_t field_off, const SortedU32Map& rm) {
-    for (size_t i = 0; i + stride <= size; i += stride) {
-        uint32_t v; memcpy(&v, data + i + field_off, 4);
-        if (const uint32_t* n = rm.find(v)) memcpy(data + i + field_off, n, 4);
-    }
+    for_each_record(data, size, stride, [&](char* rec) {
+        uint32_t v; memcpy(&v, rec + field_off, 4);
+        if (const uint32_t* n = rm.find(v)) memcpy(rec + field_off, n, 4);
+    });
 }
 // Rewrites the foreign record id at `field` of each record through an old →
 // new id remap (NO_DATA: no new id), into the new build's id space.
 static void remap_id_field(char* data, size_t size, size_t stride, size_t field, const std::vector<uint32_t>& rm) {
-    for (size_t i = 0; i + stride <= size; i += stride) {
-        uint32_t id; memcpy(&id, data + i + field, 4);
+    for_each_record(data, size, stride, [&](char* rec) {
+        uint32_t id; memcpy(&id, rec + field, 4);
         if (id != NO_DATA && id < rm.size() && rm[id] != NO_DATA && rm[id] != id)
-            memcpy(data + i + field, &rm[id], 4);
-    }
+            memcpy(rec + field, &rm[id], 4);
+    });
 }
 // The patcher rewrites the same fields (string_field_offsets) of the records
 // it copies from old.
