@@ -129,6 +129,8 @@ static uint16_t tiger_country(const std::string& state) {
 
 static void load_tiger_data(ParsedData& data, const std::string& path) {
     std::cerr << "Loading TIGER address data from " << path << "..." << std::endl;
+    auto _tt = std::chrono::steady_clock::now();
+    auto _tc = CpuTicks::now();
 
     // Collect all CSV files
     std::vector<std::string> csv_files;
@@ -169,6 +171,7 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
     }
 
     std::sort(csv_files.begin(), csv_files.end());
+    log_phase("  TIGER: extract", _tt, _tc);
     std::cerr << "  Found " << csv_files.size() << " TIGER CSV files" << std::endl;
     if (csv_files.empty())
         throw std::runtime_error("--tiger-data given but no .csv files found under " + path);
@@ -343,6 +346,7 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
               << csv_files.size() << " files" << std::endl;
     std::cerr << "  Interp ways now: " << data.interp_ways.size()
               << " (" << loaded_rows << " from TIGER)" << std::endl;
+    log_phase("  TIGER: parse", _tt, _tc);
 }
 
 // --- GeoNames postcode loading ---
@@ -352,6 +356,8 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
 // pairs OSM has no centroid for (matching Nominatim's _update_from_external).
 static void load_external_postcodes(ParsedData& data, const std::string& path) {
     std::cerr << "Loading external postcode centroids from " << path << "..." << std::endl;
+    auto _gt = std::chrono::steady_clock::now();
+    auto _gc = CpuTicks::now();
     std::string cmd;
     std::string tmp_csv;
     std::optional<ScratchDir> scratch;
@@ -420,6 +426,7 @@ static void load_external_postcodes(ParsedData& data, const std::string& path) {
     std::cerr << "  GeoNames: loaded " << loaded << " new postcodes, "
               << skipped << " rejected by pattern, "
               << data.postcode_accum.size() << " total centroids" << std::endl;
+    log_phase("  GeoNames: load", _gt, _gc);
 }
 
 // --- Main ---
@@ -3208,6 +3215,8 @@ static int run(int argc, char* argv[]) {
     // every record after it, silently zeroing sitelink-based POI importance.
     std::vector<QidSitelinks> sitelinks_data;
     if (!wikidata_sitelinks_path.empty()) {
+        auto _wt = std::chrono::steady_clock::now();
+        auto _wc = CpuTicks::now();
         std::ifstream sf(wikidata_sitelinks_path, std::ios::binary | std::ios::ate);
         if (sf) {
             size_t sz = sf.tellg();
@@ -3229,6 +3238,7 @@ static int run(int argc, char* argv[]) {
             }
             std::cerr << "Loaded " << sitelinks_data.size() << " wikidata sitelinks entries." << std::endl;
         }
+        log_phase("  Wikidata sitelinks: load", _wt, _wc);
     }
 
     // Helper to look up sitelinks count by QID (binary search since data is sorted)
@@ -3321,7 +3331,10 @@ static int run(int argc, char* argv[]) {
 
             // --- Pass 1: collect relation members for parallel admin assembly ---
             std::cerr << "  Pass 1: scanning relations..." << std::endl;
+            auto _bt = std::chrono::steady_clock::now();
+            auto _bc = CpuTicks::now();
             PbfFile pbf(input_file, num_threads);
+            log_phase("  Pass 1: blob scan", _bt, _bc);
 
             std::vector<std::string> rel_wikidata; // parallel to data.collected_relations
             std::unordered_set<int64_t> wanted_label_nodes; // node IDs referenced as role=label
