@@ -439,100 +439,116 @@ inline void reorder_interps(ParsedData& data, unsigned threads = 0) {
               << " (" << (n - kept) << " duplicates removed)" << std::endl;
 }
 
+// values[order[i]] for every i.
+template <class T>
+std::vector<T> gather(const std::vector<T>& values, const std::vector<uint32_t>& order, unsigned threads) {
+    std::vector<T> out(order.size());
+    parallel_for(order.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t i = b; i < e; i++) out[i] = values[order[i]];
+    }, threads);
+    return out;
+}
+
+// old_to_new for a permutation: order[i] becomes i.
+inline std::vector<uint32_t> invert(const std::vector<uint32_t>& order, unsigned threads) {
+    std::vector<uint32_t> old_to_new(order.size());
+    parallel_for(order.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t i = b; i < e; i++) old_to_new[order[i]] = static_cast<uint32_t>(i);
+    }, threads);
+    return old_to_new;
+}
+
 // Sorts admin polygons by (name, level, country, vertex_count) and reorders
 // their vertices.
-inline void reorder_admin_polygons(ParsedData& data) {
-    if (!data.admin_polygons.empty()) {
-        size_t n = data.admin_polygons.size();
-        std::vector<uint32_t> order(n);
-        std::iota(order.begin(), order.end(), 0);
-        const auto& sp = data.string_pool.data();
-        std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
-            const auto& pa = data.admin_polygons[a];
-            const auto& pb = data.admin_polygons[b];
-            if (pa.name_id != pb.name_id) return pa.name_id < pb.name_id;
-            if (pa.admin_level != pb.admin_level) return pa.admin_level < pb.admin_level;
-            if (pa.country_code != pb.country_code) return pa.country_code < pb.country_code;
-            if (pa.vertex_count != pb.vertex_count) return pa.vertex_count < pb.vertex_count;
-            // Compare first few vertices for tiebreaking
-            uint32_t nc = std::min(pa.vertex_count, pb.vertex_count);
-            nc = std::min(nc, 20u); // limit comparison depth
-            for (uint32_t j = 0; j < nc; j++) {
-                uint32_t la = float_bits(data.admin_vertices[pa.vertex_offset + j].lat);
-                uint32_t lb = float_bits(data.admin_vertices[pb.vertex_offset + j].lat);
-                if (la != lb) return la < lb;
-                uint32_t ga = float_bits(data.admin_vertices[pa.vertex_offset + j].lng);
-                uint32_t gb = float_bits(data.admin_vertices[pb.vertex_offset + j].lng);
-                if (ga != gb) return ga < gb;
-            }
-            if (data.admin_osm_ids.size() == data.admin_polygons.size())
-                return data.admin_osm_ids[a] < data.admin_osm_ids[b];
-            return false;
+inline void reorder_admin_polygons(ParsedData& data, unsigned threads = 0) {
+    if (data.admin_polygons.empty()) return;
+
+    const size_t n = data.admin_polygons.size();
+    const auto& polys = data.admin_polygons;
+    const auto& vertices = data.admin_vertices;
+    const bool have_osm = data.admin_osm_ids.size() == n;
+    auto admin_less = [&](uint32_t a, uint32_t b) {
+        const auto& pa = polys[a];
+        const auto& pb = polys[b];
+        if (pa.name_id != pb.name_id) return pa.name_id < pb.name_id;
+        if (pa.admin_level != pb.admin_level) return pa.admin_level < pb.admin_level;
+        if (pa.country_code != pb.country_code) return pa.country_code < pb.country_code;
+        if (pa.vertex_count != pb.vertex_count) return pa.vertex_count < pb.vertex_count;
+        // Compare first few vertices for tiebreaking
+        uint32_t nc = std::min(pa.vertex_count, pb.vertex_count);
+        nc = std::min(nc, 20u); // limit comparison depth
+        for (uint32_t j = 0; j < nc; j++) {
+            uint32_t la = float_bits(vertices[pa.vertex_offset + j].lat);
+            uint32_t lb = float_bits(vertices[pb.vertex_offset + j].lat);
+            if (la != lb) return la < lb;
+            uint32_t ga = float_bits(vertices[pa.vertex_offset + j].lng);
+            uint32_t gb = float_bits(vertices[pb.vertex_offset + j].lng);
+            if (ga != gb) return ga < gb;
+        }
+        if (have_osm) return data.admin_osm_ids[a] < data.admin_osm_ids[b];
+        return false;
+    };
+    // Every polygon keeps its own slot and references point at it, so any
+    // tie's order shows.
+    const std::vector<uint32_t> order =
+        parallel_sort_indices(n, admin_less, [](uint32_t, uint32_t) { return true; }, threads);
+    const std::vector<uint32_t> old_to_new = invert(order, threads);
+
+    Repacked<NodeCoord> repacked = repack(n, vertices,
+        [&](size_t i) { return size_t(polys[order[i]].vertex_count); },
+        [&](size_t i) { return polys[order[i]].vertex_offset; }, threads);
+    std::vector<AdminPolygon> new_polys = gather(polys, order, threads);
+    parallel_for(n, [&](size_t b, size_t e, unsigned) {
+        for (size_t i = b; i < e; i++) new_polys[i].vertex_offset = static_cast<uint32_t>(repacked.at[i]);
+    }, threads);
+    // Reorder admin_osm_ids in lockstep (no dedup happens in
+    // this sort — just a permutation — so the size stays the
+    // same).
+    if (have_osm) data.admin_osm_ids = gather(data.admin_osm_ids, order, threads);
+    data.admin_polygons = std::move(new_polys);
+    data.admin_vertices = std::move(repacked.items);
+
+    auto remap_each = [&](size_t count, auto&& remap_one) {
+        parallel_for(count, [&](size_t b, size_t e, unsigned) {
+            for (size_t i = b; i < e; i++) remap_one(i);
+        }, threads);
+    };
+    // Remap place-node and POI parent_poly_id references
+    remap_each(data.place_nodes.size(), [&](size_t i) {
+        auto& pn = data.place_nodes[i];
+        if (pn.parent_poly_id != 0xFFFFFFFFu && pn.parent_poly_id < n) pn.parent_poly_id = old_to_new[pn.parent_poly_id];
+    });
+    remap_each(data.poi_records.size(), [&](size_t i) {
+        auto& pr = data.poi_records[i];
+        if (pr.parent_poly_id != 0xFFFFFFFFu && pr.parent_poly_id < n) pr.parent_poly_id = old_to_new[pr.parent_poly_id];
+    });
+    // Remap admin_parent_ids (both indices and values)
+    if (data.admin_parent_ids.size() == n) {
+        std::vector<uint32_t> new_ap = gather(data.admin_parent_ids, order, threads);
+        remap_each(n, [&](size_t i) {
+            new_ap[i] = (new_ap[i] != NO_DATA && new_ap[i] < n) ? old_to_new[new_ap[i]] : NO_DATA;
         });
-        std::vector<uint32_t> old_to_new(n);
-        for (uint32_t i = 0; i < n; i++) old_to_new[order[i]] = i;
-        std::vector<AdminPolygon> new_polys(n);
-        std::vector<NodeCoord> new_verts;
-        new_verts.reserve(data.admin_vertices.size());
-        for (uint32_t i = 0; i < n; i++) {
-            auto p = data.admin_polygons[order[i]];
-            uint32_t old_off = p.vertex_offset;
-            p.vertex_offset = static_cast<uint32_t>(new_verts.size());
-            for (uint32_t j = 0; j < p.vertex_count; j++)
-                new_verts.push_back(data.admin_vertices[old_off + j]);
-            new_polys[i] = p;
-        }
-        // Reorder admin_osm_ids in lockstep (no dedup happens in
-        // this sort — just a permutation — so the size stays the
-        // same).
-        if (data.admin_osm_ids.size() == n) {
-            std::vector<uint64_t> new_osm(n);
-            for (uint32_t i = 0; i < n; i++)
-                new_osm[i] = data.admin_osm_ids[order[i]];
-            data.admin_osm_ids = std::move(new_osm);
-        }
-        data.admin_polygons = std::move(new_polys);
-        data.admin_vertices = std::move(new_verts);
-        // Remap place-node parent_poly_id references
-        for (auto& pn : data.place_nodes) {
-            if (pn.parent_poly_id != 0xFFFFFFFFu &&
-                pn.parent_poly_id < old_to_new.size()) {
-                pn.parent_poly_id = old_to_new[pn.parent_poly_id];
-            }
-        }
-        // Remap poi parent_poly_id references
-        for (auto& pr : data.poi_records) {
-            if (pr.parent_poly_id != 0xFFFFFFFFu &&
-                pr.parent_poly_id < old_to_new.size()) {
-                pr.parent_poly_id = old_to_new[pr.parent_poly_id];
-            }
-        }
-        // Remap admin_parent_ids (both indices and values)
-        if (data.admin_parent_ids.size() == n) {
-            std::vector<uint32_t> new_ap(n);
-            for (uint32_t i = 0; i < n; i++) {
-                uint32_t old_parent = data.admin_parent_ids[order[i]];
-                new_ap[i] = (old_parent != NO_DATA && old_parent < n)
-                    ? old_to_new[old_parent] : NO_DATA;
-            }
-            data.admin_parent_ids = std::move(new_ap);
-        }
-        // Remap way_parent_ids (values only — way order hasn't changed yet)
-        for (auto& pid : data.way_parent_ids) {
-            if (pid != NO_DATA && pid < n) pid = old_to_new[pid];
-        }
-        // Remap admin cell entries
-        for (auto& [cell_id, ids] : data.cell_to_admin) {
-            for (auto& id : ids) {
-                uint32_t flags = id & INTERIOR_FLAG;
-                uint32_t masked = id & ID_MASK;
-                if (masked < old_to_new.size())
-                    id = old_to_new[masked] | flags;
-            }
-            std::sort(ids.begin(), ids.end());
-        }
-        std::cerr << "  Admin polygons sorted: " << n << std::endl;
+        data.admin_parent_ids = std::move(new_ap);
     }
+    // Remap way_parent_ids (values only)
+    remap_each(data.way_parent_ids.size(), [&](size_t i) {
+        uint32_t& pid = data.way_parent_ids[i];
+        if (pid != NO_DATA && pid < n) pid = old_to_new[pid];
+    });
+    // Remap admin cell entries
+    std::vector<std::vector<uint32_t>*> cells;
+    cells.reserve(data.cell_to_admin.size());
+    for (auto& [cell_id, ids] : data.cell_to_admin) cells.push_back(&ids);
+    remap_each(cells.size(), [&](size_t c) {
+        auto& ids = *cells[c];
+        for (auto& id : ids) {
+            uint32_t flags = id & INTERIOR_FLAG;
+            uint32_t masked = id & ID_MASK;
+            if (masked < n) id = old_to_new[masked] | flags;
+        }
+        std::sort(ids.begin(), ids.end());
+    });
+    std::cerr << "  Admin polygons sorted: " << n << std::endl;
 }
 
 // Sorts POI records by (category, tier, name_id, lat_bits, lng_bits), reorders
