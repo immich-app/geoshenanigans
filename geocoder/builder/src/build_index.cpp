@@ -191,19 +191,24 @@ static void load_tiger_data(ParsedData& data, const std::string& path, std::futu
     // (and interp_postcodes.bin unwritten) when no TIGER data is loaded.
     data.interp_postcode_ids.resize(data.interp_ways.size(), NO_DATA);
 
-    // Files parse in parallel, leaving a core to add their ranges and
-    // strings in file order, as a serial load would.
+    // Files parse in parallel, leaving a core to intern their strings in
+    // file order, as a serial load would; their ranges are laid out after,
+    // every file at once.
+    std::vector<TigerCsv> parsed(csv_files.size());
+    std::vector<std::vector<uint32_t>> string_ids(csv_files.size());
     parallel_ordered(csv_files.size(), [&](size_t i) {
         std::optional<TigerCsv> csv;
         std::string text;
         if (read_whole_file(csv_files[i], text)) csv = parse_tiger_csv(text);
         return csv;
-    }, [&](size_t, std::optional<TigerCsv>&& csv) {
+    }, [&](size_t i, std::optional<TigerCsv>&& csv) {
         if (!csv) return;
         total_rows += csv->rows;
         loaded_rows += csv->ranges.size();
-        add_tiger_ranges(data, *csv);
+        string_ids[i] = intern_tiger_csv(data, *csv);
+        parsed[i] = std::move(*csv);
     }, std::max(1u, parallel_threads() - 1));
+    append_tiger_ranges(data, parsed, string_ids);
 
     // Sidecar exists iff it carries at least one real ZIP: an empty/ZIP-less
     // TIGER path must not materialize an all-NO_DATA planet-sized file (nor a

@@ -205,36 +205,61 @@ inline TigerCsv parse_tiger_csv(std::string_view text) {
     return csv;
 }
 
-// Appends one TIGER CSV's ranges to the interpolation arrays and its
-// postcode midpoints to postcode_accum.
-inline void add_tiger_ranges(ParsedData& data, const TigerCsv& csv) {
+// Interns one TIGER CSV's strings and adds its postcode midpoints to
+// postcode_accum, returning each string's pool id: the part of loading a
+// file whose order shows, so files go through it one by one in file order.
+inline std::vector<uint32_t> intern_tiger_csv(ParsedData& data, const TigerCsv& csv) {
     std::vector<uint32_t> string_ids(csv.strings.size());
     for (size_t i = 0; i < csv.strings.size(); i++) string_ids[i] = data.string_pool.intern(csv.strings[i]);
-
-    uint32_t node_base = static_cast<uint32_t>(data.interp_nodes.size());
-    data.interp_nodes.insert(data.interp_nodes.end(), csv.nodes.begin(), csv.nodes.end());
-    for (const auto& range : csv.ranges) {
-        InterpWay iw{};
-        iw.node_offset = node_base + range.node_offset;
-        iw.node_count = range.node_count;
-        iw.street_id = string_ids[range.street];
-        iw.start_number = range.start_number;
-        iw.end_number = range.end_number;
-        iw.interpolation = range.interpolation;
-
-        // Defer S2 computation
-        uint32_t interp_id = static_cast<uint32_t>(data.interp_ways.size());
-        data.interp_ways.push_back(iw);
-        data.interp_osm_ids.push_back(
-            pack_osm_id(gc::id_alloc::ObjectType::SYNTHETIC, static_cast<int64_t>(range.synthetic_id)));
-        data.deferred_interps.push_back({interp_id, iw.node_offset, iw.node_count});
-        data.interp_postcode_ids.push_back(
-            range.postcode == TigerCsv::kNoPostcode ? NO_DATA : string_ids[range.postcode]);
-    }
     for (const auto& pc : csv.postcodes) {
         auto& acc = data.postcode_accum[postcode_key(pc.country, string_ids[pc.postcode])];
         acc.sum_lat_e7 += pc.sum.sum_lat_e7;
         acc.sum_lng_e7 += pc.sum.sum_lng_e7;
         acc.count += pc.sum.count;
     }
+    return string_ids;
+}
+
+// Appends the files' nodes and ranges to the interpolation arrays where
+// appending them file after file would put them, every file at once.
+// string_ids[f] is intern_tiger_csv's answer for csvs[f].
+inline void append_tiger_ranges(ParsedData& data, const std::vector<TigerCsv>& csvs,
+                                const std::vector<std::vector<uint32_t>>& string_ids, unsigned threads = 0) {
+    const size_t files = csvs.size();
+    const auto node_at = parallel_offsets<size_t>(files, [&](size_t f) { return csvs[f].nodes.size(); }, threads);
+    const auto range_at = parallel_offsets<size_t>(files, [&](size_t f) { return csvs[f].ranges.size(); }, threads);
+    const size_t nodes_from = data.interp_nodes.size(), ways_from = data.interp_ways.size();
+    const size_t osm_from = data.interp_osm_ids.size(), deferred_from = data.deferred_interps.size();
+    const size_t postcodes_from = data.interp_postcode_ids.size();
+    data.interp_nodes.resize(nodes_from + node_at[files]);
+    data.interp_ways.resize(ways_from + range_at[files]);
+    data.interp_osm_ids.resize(osm_from + range_at[files]);
+    data.deferred_interps.resize(deferred_from + range_at[files]);
+    data.interp_postcode_ids.resize(postcodes_from + range_at[files]);
+    parallel_for_each(files, [&](size_t f, unsigned) {
+        const TigerCsv& csv = csvs[f];
+        const auto& ids = string_ids[f];
+        const uint32_t node_base = static_cast<uint32_t>(nodes_from + node_at[f]);
+        std::copy(csv.nodes.begin(), csv.nodes.end(), data.interp_nodes.begin() + node_base);
+        for (size_t k = 0; k < csv.ranges.size(); k++) {
+            const auto& range = csv.ranges[k];
+            InterpWay iw{};
+            iw.node_offset = node_base + range.node_offset;
+            iw.node_count = range.node_count;
+            iw.street_id = ids[range.street];
+            iw.start_number = range.start_number;
+            iw.end_number = range.end_number;
+            iw.interpolation = range.interpolation;
+
+            // Defer S2 computation
+            const size_t r = range_at[f] + k;
+            const uint32_t interp_id = static_cast<uint32_t>(ways_from + r);
+            data.interp_ways[ways_from + r] = iw;
+            data.interp_osm_ids[osm_from + r] =
+                pack_osm_id(gc::id_alloc::ObjectType::SYNTHETIC, static_cast<int64_t>(range.synthetic_id));
+            data.deferred_interps[deferred_from + r] = {interp_id, iw.node_offset, iw.node_count};
+            data.interp_postcode_ids[postcodes_from + r] =
+                range.postcode == TigerCsv::kNoPostcode ? NO_DATA : ids[range.postcode];
+        }
+    }, threads);
 }
