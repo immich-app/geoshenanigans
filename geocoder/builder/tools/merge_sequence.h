@@ -211,23 +211,41 @@ struct VertexBlocks {
 };
 
 inline VertexBlocks vertex_blocks(const char* parent, size_t parent_size, size_t stride, size_t off_field_pos,
-                                  size_t verts_size) {
+                                  size_t verts_size, unsigned threads = 0) {
     constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
     size_t total_n = parent_size / stride;
     VertexBlocks b{std::vector<uint32_t>(total_n), std::vector<uint32_t>(total_n)};
-    for (size_t i = 0; i < total_n; i++)
-        memcpy(&b.offsets[i], parent + i * stride + off_field_pos, 4);
-    // Walk from end so each i finds its next non-NO_DATA neighbour cheaply.
-    uint32_t next_off = static_cast<uint32_t>(verts_size);
-    for (size_t i = total_n; i-- > 0; ) {
-        uint32_t off = b.offsets[i];
-        if (off == NO_DATA || (size_t)off > verts_size) {
-            b.sizes[i] = 0;
-        } else {
-            b.sizes[i] = (next_off >= off) ? (next_off - off) : 0;
-            next_off = off;
+    auto owns_block = [&](uint32_t off) { return off != NO_DATA && (size_t)off <= verts_size; };
+    // Chunks walk from their end so each i finds its next non-NO_DATA
+    // neighbour cheaply, starting from the first one after the chunk.
+    size_t chunks = std::max<size_t>(1, std::min<size_t>(total_n, threads ? threads : parallel_threads()));
+    auto chunk_begin = [&](size_t c) { return total_n * c / chunks; };
+    std::vector<uint32_t> first_owner(chunks, NO_DATA), next_after(chunks);
+    parallel_for(chunks, [&](size_t cb, size_t ce, unsigned) {
+        for (size_t c = cb; c < ce; c++) {
+            for (size_t i = chunk_begin(c); i < chunk_begin(c + 1); i++) {
+                memcpy(&b.offsets[i], parent + i * stride + off_field_pos, 4);
+                if (first_owner[c] == NO_DATA && owns_block(b.offsets[i])) first_owner[c] = b.offsets[i];
+            }
         }
-    }
+    }, threads);
+    next_after[chunks - 1] = static_cast<uint32_t>(verts_size);
+    for (size_t c = chunks - 1; c-- > 0;)
+        next_after[c] = first_owner[c + 1] != NO_DATA ? first_owner[c + 1] : next_after[c + 1];
+    parallel_for(chunks, [&](size_t cb, size_t ce, unsigned) {
+        for (size_t c = cb; c < ce; c++) {
+            uint32_t next_off = next_after[c];
+            for (size_t i = chunk_begin(c + 1); i-- > chunk_begin(c);) {
+                uint32_t off = b.offsets[i];
+                if (!owns_block(off)) {
+                    b.sizes[i] = 0;
+                } else {
+                    b.sizes[i] = (next_off >= off) ? (next_off - off) : 0;
+                    next_off = off;
+                }
+            }
+        }
+    }, threads);
     return b;
 }
 

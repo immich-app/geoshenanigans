@@ -82,6 +82,29 @@ TEST(vertex_blocks_run_to_the_next_record_with_an_offset) {
     CHECK(b.sizes == std::vector<uint32_t>({10, 0, 0, 25, 10, 0, 10}));
 }
 
+TEST(vertex_blocks_same_for_any_thread_count) {
+    // Mostly NO_DATA (point records) with long gaps, so chunks often hold
+    // no block and take their next offset from a later chunk.
+    std::mt19937 rng(12);
+    for (size_t n : {size_t(0), size_t(1), size_t(3), size_t(20000)}) {
+        std::string parent(n * 12, '\0');
+        uint32_t at = 0;
+        for (size_t i = 0; i < n; i++) {
+            uint32_t off = 0xFFFFFFFFu;
+            int kind = static_cast<int>(rng() % 50);
+            if (kind == 0) off = rng() % 400000;
+            else if (kind < 4) off = at += rng() % 60;
+            std::memcpy(&parent[i * 12 + 8], &off, 4);
+        }
+        VertexBlocks one = vertex_blocks(parent.data(), parent.size(), 12, 8, 300000, 1);
+        for (unsigned threads : {2u, 7u, 64u}) {
+            VertexBlocks many = vertex_blocks(parent.data(), parent.size(), 12, 8, 300000, threads);
+            CHECK(many.offsets == one.offsets);
+            CHECK(many.sizes == one.sizes);
+        }
+    }
+}
+
 TEST(record_jump_index_finds_the_first_equal_record_in_range) {
     // Few distinct 12-byte records, zeroed ones among them: duplicates and
     // tombstones are what the index must get right.
