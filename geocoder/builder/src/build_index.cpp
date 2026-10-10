@@ -5241,17 +5241,23 @@ static int run(int argc, char* argv[]) {
 
         link_places_by_name(data, cfg, _pt, _cpu);
 
+        // TIGER and GeoNames write only the string pool, interpolations and
+        // postcode centroids, none of which the parent chains read, so they
+        // load alongside them.
+        auto external_data = std::async(std::launch::async, [&] {
+            if (!tiger_data_path.empty()) {
+                load_tiger_data(data, tiger_data_path, std::move(tiger_csvs));
+            }
+            if (!external_postcodes_path.empty()) {
+                load_external_postcodes(data, external_postcodes_path);
+            }
+        });
+
         compute_admin_parent_chain(data, cfg);
 
         compute_way_parent_polygons(data, cfg);
 
-        // Load TIGER address data
-        if (!tiger_data_path.empty()) {
-            load_tiger_data(data, tiger_data_path, std::move(tiger_csvs));
-        }
-        if (!external_postcodes_path.empty()) {
-            load_external_postcodes(data, external_postcodes_path);
-        }
+        external_data.get();
 
         compute_s2_and_poi_cells(data, cfg, _pt, _cpu);
 
