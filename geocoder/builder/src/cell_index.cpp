@@ -25,6 +25,7 @@
 
 #include <s2/s2latlng.h>
 #include <limits>
+#include <memory>
 
 // Write strings_layout.json — records each tier's [start, end) in the
 // global string-offset space so the server can route a global offset to
@@ -590,48 +591,8 @@ void apply_strategy2_remaps(ParsedData& data, const std::string& prev_dir) {
 // its country_code, or 0 if none is found. Resolves the point to its
 // kAdminCellLevel S2 cell and walks that cell's admin entries. Single-
 // country cells return immediately; border cells (multiple countries in
-// the entry list) resolve by point-in-polygon.
-void collect_postcode_centroids(ParsedData& data) {
-    using Accums = std::unordered_map<uint64_t, ParsedData::PostcodeAccum>;
-    size_t n = std::min(data.addr_points.size(), data.addr_postcode_ids.size());
-    // Border cells cost a point-in-polygon each, so workers take small
-    // ranges as they free up. The sums are integers: merging the workers'
-    // maps in any order gives the same totals.
-    std::vector<Accums> parts(parallel_threads());
-    parallel_for_dynamic(n, 1 << 14, [&](size_t begin, size_t end, unsigned w) {
-        for (size_t i = begin; i < end; i++) {
-            uint32_t pc_id = data.addr_postcode_ids[i];
-            if (pc_id == NO_DATA) continue;
-            const auto& ap = data.addr_points[i];
-            uint16_t cc = country_code_at_point(data, ap.lat, ap.lng);
-            if (cc == 0) continue;
-            parts[w][postcode_key(cc, pc_id)].add(ap.lat, ap.lng);
-        }
-    });
-    Accums osm;
-    for (auto& part : parts) {
-        for (const auto& [key, acc] : part) {
-            auto& sum = osm[key];
-            sum.sum_lat_e7 += acc.sum_lat_e7;
-            sum.sum_lng_e7 += acc.sum_lng_e7;
-            sum.count += acc.count;
-        }
-        Accums().swap(part);
-    }
-    // External centroids (TIGER, GeoNames) fill only the (country,
-    // postcode) pairs OSM has none for, as Nominatim's
-    // _update_from_external does.
-    size_t external = 0;
-    for (const auto& [key, acc] : data.postcode_accum) {
-        if (osm.emplace(key, acc).second) external++;
-    }
-    std::cerr << "Postcode centroids: " << osm.size() - external << " from OSM addresses, "
-              << external << " external" << std::endl;
-    data.postcode_accum = std::move(osm);
-}
-
-// country_code_at_point's rules, with the ring test supplied as
-// contains(polygon id, vertices, count, plat, plng).
+// the entry list) resolve by point-in-polygon, with the ring test supplied
+// as contains(polygon id, vertices, count, plat, plng).
 template <class Contains>
 static uint16_t country_at(const ParsedData& data, double lat, double lng, Contains contains) {
     S2CellId cell = S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(kAdminCellLevel);
@@ -701,6 +662,90 @@ uint16_t country_code_at_point(const ParsedData& data, double lat, double lng) {
     return country_at(data, lat, lng, [](uint32_t, const NodeCoord* verts, uint32_t cnt, float plat, float plng) {
         return ring_contains(verts, cnt, plat, plng);
     });
+}
+
+// Edge indexes of the country rings that border cells (several countries
+// in the entry list) test, by polygon id; null for the rest. Planet country
+// rings run to millions of vertices.
+static std::vector<std::unique_ptr<RingEdgeIndex>> index_border_rings(const ParsedData& data) {
+    auto country_ring = [&](uint32_t raw_id) {
+        uint32_t pid = raw_id & ID_MASK;
+        return pid < data.admin_polygons.size() && data.admin_polygons[pid].admin_level == 2
+            && data.admin_polygons[pid].country_code != 0;
+    };
+    std::vector<char> tested(data.admin_polygons.size(), 0);
+    for (const auto& [cell_id, ids] : data.cell_to_admin) {
+        uint16_t first_cc = 0;
+        bool border = false;
+        for (uint32_t raw_id : ids) {
+            if (!country_ring(raw_id)) continue;
+            uint16_t cc = data.admin_polygons[raw_id & ID_MASK].country_code;
+            if (first_cc == 0) first_cc = cc;
+            else if (cc != first_cc) border = true;
+        }
+        if (!border) continue;
+        for (uint32_t raw_id : ids)
+            if (country_ring(raw_id)) tested[raw_id & ID_MASK] = 1;
+    }
+    std::vector<uint32_t> pids;
+    for (uint32_t pid = 0; pid < tested.size(); pid++) {
+        const auto& poly = data.admin_polygons[pid];
+        if (tested[pid] && poly.vertex_offset + poly.vertex_count <= data.admin_vertices.size()
+            && poly.vertex_count >= 3)
+            pids.push_back(pid);
+    }
+    std::vector<std::unique_ptr<RingEdgeIndex>> rings(data.admin_polygons.size());
+    parallel_for_dynamic(pids.size(), 1, [&](size_t begin, size_t end, unsigned) {
+        for (size_t k = begin; k < end; k++) {
+            const auto& poly = data.admin_polygons[pids[k]];
+            rings[pids[k]] = std::make_unique<RingEdgeIndex>(&data.admin_vertices[poly.vertex_offset],
+                                                             poly.vertex_count);
+        }
+    });
+    return rings;
+}
+
+void collect_postcode_centroids(ParsedData& data) {
+    using Accums = std::unordered_map<uint64_t, ParsedData::PostcodeAccum>;
+    size_t n = std::min(data.addr_points.size(), data.addr_postcode_ids.size());
+    const auto rings = index_border_rings(data);
+    auto contains = [&](uint32_t pid, const NodeCoord* verts, uint32_t cnt, float plat, float plng) {
+        return rings[pid] ? rings[pid]->contains(plat, plng) : ring_contains(verts, cnt, plat, plng);
+    };
+    // Border cells cost a point-in-polygon each, so workers take small
+    // ranges as they free up. The sums are integers: merging the workers'
+    // maps in any order gives the same totals.
+    std::vector<Accums> parts(parallel_threads());
+    parallel_for_dynamic(n, 1 << 14, [&](size_t begin, size_t end, unsigned w) {
+        for (size_t i = begin; i < end; i++) {
+            uint32_t pc_id = data.addr_postcode_ids[i];
+            if (pc_id == NO_DATA) continue;
+            const auto& ap = data.addr_points[i];
+            uint16_t cc = country_at(data, ap.lat, ap.lng, contains);
+            if (cc == 0) continue;
+            parts[w][postcode_key(cc, pc_id)].add(ap.lat, ap.lng);
+        }
+    });
+    Accums osm;
+    for (auto& part : parts) {
+        for (const auto& [key, acc] : part) {
+            auto& sum = osm[key];
+            sum.sum_lat_e7 += acc.sum_lat_e7;
+            sum.sum_lng_e7 += acc.sum_lng_e7;
+            sum.count += acc.count;
+        }
+        Accums().swap(part);
+    }
+    // External centroids (TIGER, GeoNames) fill only the (country,
+    // postcode) pairs OSM has none for, as Nominatim's
+    // _update_from_external does.
+    size_t external = 0;
+    for (const auto& [key, acc] : data.postcode_accum) {
+        if (osm.emplace(key, acc).second) external++;
+    }
+    std::cerr << "Postcode centroids: " << osm.size() - external << " from OSM addresses, "
+              << external << " external" << std::endl;
+    data.postcode_accum = std::move(osm);
 }
 
 void write_index(const ParsedData& data, const std::string& output_dir, IndexMode mode) {
