@@ -27,20 +27,21 @@
 //
 // Memory model: slots_ is the single source of truth — populated from
 // the previous sidecar at load_previous(), then mutated in-place by
-// allocate(). Reused slots keep their existing payload (already correct)
+// allocate_all(). Reused slots keep their existing payload (already correct)
 // apart from the tier; recycled tombstones get rewritten; fresh allocations append. After
-// the allocate() loop, finalize() marks any unconsumed-prev slots as
-// tombstones and drops the prev_to_idx_ map + free-list immediately so
-// only the slot table itself remains. take_slots() then moves the table
-// out without copying — for 250M addr_points the savings are ~15 GiB
-// of peak RSS over the previous build_sidecar()+claimed_ design.
+// allocate_all(), finalize() marks any unconsumed-prev slots as
+// tombstones and drops the bookkeeping immediately so only the slot
+// table itself remains. take_slots() then moves the table out without
+// copying.
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
-#include <unordered_map>
 #include <vector>
 #include <stdexcept>
+
+#include "parallel.h"
 
 namespace gc::id_alloc {
 
@@ -94,20 +95,28 @@ inline uint8_t poi_shipped_tier(uint8_t record_tier, const SidecarSlot* slot) {
 }
 
 // Internal: combine (object_type, stable_id) into a single uint64_t key
-// so unordered_map lookups are O(1) without struct-equality boilerplate.
+// so identities match and sort as one integer.
 // Relies on ObjectType fitting in 8 bits and stable_id in 56 bits, which
 // is true for all OSM ids today (highest osm_node_id ~13B = 34 bits).
 inline uint64_t make_key(ObjectType t, uint64_t id) {
     return (static_cast<uint64_t>(t) << 56) | (id & 0x00FFFFFFFFFFFFFFull);
 }
 
+// One record's stable identity, as allocate_all asks for it. `tier` is
+// stamped on the slot whichever way the record gets it (a live POI can
+// change tier between days); other kinds leave it 0.
+struct SlotIdentity {
+    ObjectType type;
+    uint64_t stable_id;
+    uint8_t tier = 0;
+};
+
 class IdAllocator {
 public:
     IdAllocator() = default;
 
-    // Load (osm_id → previous_idx) from a previous build's sidecar.
-    // Tombstone slots in the previous build go onto the free-list so
-    // they can be reused by new records this build.
+    // Load the previous build's slot table from its sidecar. Tombstone
+    // slots go onto the free-list so new records can reuse them.
     bool load_previous(const std::string& sidecar_path) {
         std::ifstream f(sidecar_path, std::ios::binary);
         if (!f) return false;
@@ -122,66 +131,107 @@ public:
                    static_cast<std::streamsize>(count) * sizeof(SidecarSlot));
             if (!f) { slots_.clear(); return false; }
         }
-        prev_to_idx_.reserve(count);
         for (uint32_t i = 0; i < count; i++) {
             const SidecarSlot& s = slots_[i];
-            if (is_tombstone(s) || s.object_type == static_cast<uint8_t>(ObjectType::NONE)) {
+            if (is_tombstone(s) || s.object_type == static_cast<uint8_t>(ObjectType::NONE))
                 free_list_.push_back(i);
-            } else {
-                prev_to_idx_.emplace(
-                    make_key(static_cast<ObjectType>(s.object_type), s.stable_id), i);
-            }
         }
         return true;
     }
 
-    // Assign a dense idx to a stable identity. Returns the same idx
-    // it had in the previous build if present, else recycles a free
-    // slot, else appends. Each call should be made exactly once per
-    // distinct stable identity per build. `tier` is stamped on the slot
-    // whichever path it takes (a live POI can change tier between days).
-    uint32_t allocate(ObjectType type, uint64_t stable_id, uint8_t tier = 0) {
-        uint64_t key = make_key(type, stable_id);
-        auto it = prev_to_idx_.find(key);
-        if (it != prev_to_idx_.end()) {
-            uint32_t idx = it->second;
-            prev_to_idx_.erase(it);
-            // slot already has correct {type, stable_id} from the load
-            slots_[idx].tier = tier;
-            live_count_++;
-            return idx;
+    // Assign every record of this build its dense idx, as handing them out
+    // one at a time in record order would: a record whose identity held a
+    // live slot last build gets that slot back (the first record when several
+    // share an identity, the lowest slot when several slots do), every other
+    // record recycles the free-list from the back, then appends.
+    // identity(i) returns record i's SlotIdentity. Matching identities to
+    // slots is two sorts and a merge on every core; only the hand-out of
+    // recycled and new slots walks the records in order. Once per allocator.
+    template <class Identity>
+    std::vector<uint32_t> allocate_all(size_t n, Identity identity) {
+        if (allocated_) throw std::logic_error("IdAllocator::allocate_all called twice");
+        allocated_ = true;
+
+        struct KeyIdx { uint64_t key; uint32_t idx; };
+        auto by_key = [](const KeyIdx& a, const KeyIdx& b) {
+            return a.key != b.key ? a.key < b.key : a.idx < b.idx;
+        };
+
+        // The previous build's live identities; of a repeated key only the
+        // lowest slot can be reclaimed, the others stay as they are.
+        std::vector<KeyIdx> prev;
+        for (uint32_t i = 0; i < slots_.size(); i++) {
+            const SidecarSlot& s = slots_[i];
+            if (is_tombstone(s) || s.object_type == static_cast<uint8_t>(ObjectType::NONE)) continue;
+            prev.push_back({make_key(static_cast<ObjectType>(s.object_type), s.stable_id), i});
         }
-        if (!free_list_.empty()) {
-            uint32_t idx = free_list_.back();
-            free_list_.pop_back();
-            slots_[idx] = SidecarSlot{
-                static_cast<uint8_t>(type), 0, tier, 0, stable_id};
-            live_count_++;
-            return idx;
+        parallel_sort(prev.begin(), prev.end(), by_key);
+        prev.erase(std::unique(prev.begin(), prev.end(),
+                               [](const KeyIdx& a, const KeyIdx& b) { return a.key == b.key; }),
+                   prev.end());
+
+        constexpr uint32_t kUnmatched = TOMBSTONE_IDX;
+        std::vector<uint32_t> out(n, kUnmatched);
+        std::vector<char> claimed(prev.size(), 0);
+        {
+            std::vector<KeyIdx> records(n);
+            parallel_for(n, [&](size_t begin, size_t end, unsigned) {
+                for (size_t i = begin; i < end; i++) {
+                    SlotIdentity id = identity(i);
+                    records[i] = {make_key(id.type, id.stable_id), static_cast<uint32_t>(i)};
+                }
+            });
+            parallel_sort(records.begin(), records.end(), by_key);
+            // The first record of each key (lowest index) takes the slot.
+            parallel_for_runs(n, [&](size_t i) { return records[i].key == records[i - 1].key; },
+                              [&](size_t begin, size_t end, unsigned) {
+                auto p = std::lower_bound(prev.begin(), prev.end(), records[begin].key,
+                                          [](const KeyIdx& e, uint64_t key) { return e.key < key; });
+                for (size_t r = begin; r < end && p != prev.end(); r++) {
+                    if (r > begin && records[r].key == records[r - 1].key) continue;
+                    while (p != prev.end() && p->key < records[r].key) ++p;
+                    if (p == prev.end() || p->key != records[r].key) continue;
+                    out[records[r].idx] = p->idx;
+                    claimed[p - prev.begin()] = 1;
+                }
+            });
         }
-        uint32_t idx = static_cast<uint32_t>(slots_.size());
-        slots_.push_back(SidecarSlot{
-            static_cast<uint8_t>(type), 0, tier, 0, stable_id});
-        live_count_++;
-        return idx;
+
+        for (size_t i = 0; i < n; i++) {
+            SlotIdentity id = identity(i);
+            if (out[i] != kUnmatched) {
+                // slot already has correct {type, stable_id} from the load
+                slots_[out[i]].tier = id.tier;
+                continue;
+            }
+            const SidecarSlot fresh{static_cast<uint8_t>(id.type), 0, id.tier, 0, id.stable_id};
+            if (!free_list_.empty()) {
+                out[i] = free_list_.back();
+                free_list_.pop_back();
+                slots_[out[i]] = fresh;
+            } else {
+                out[i] = static_cast<uint32_t>(slots_.size());
+                slots_.push_back(fresh);
+            }
+        }
+        live_count_ += n;
+        for (size_t p = 0; p < prev.size(); p++)
+            if (!claimed[p]) unclaimed_.push_back(prev[p].idx);
+        return out;
     }
 
-    // Mark surviving prev_to_idx_ entries (= deleted records) as
-    // tombstones in slots_, keeping the tier of the record that held each
+    // Mark the previous build's slots no record reclaimed (= deleted
+    // records) as tombstones, keeping the tier of the record that held each
     // one, and flag every free-list slot nothing claimed: a live NONE-type
     // slot sits there unflagged and is dead now (slots already flagged keep
-    // their bytes). Then drop the lookup map and free-list to release the
-    // bulk of the working memory before slots_ moves out.
-    // For 250M addr_points the prev_to_idx_ unordered_map alone is
-    // ~8 GiB of resident memory; releasing it here is what keeps the
-    // peak inside the runner's RAM budget.
+    // their bytes). Then drop the bookkeeping before slots_ moves out.
     void finalize() {
-        for (auto& kv : prev_to_idx_) {
-            SidecarSlot& s = slots_[kv.second];
+        for (uint32_t i : unclaimed_) {
+            SidecarSlot& s = slots_[i];
             s = SidecarSlot{static_cast<uint8_t>(ObjectType::NONE), SLOT_FLAG_TOMBSTONE, s.tier, 0, 0};
         }
         for (uint32_t i : free_list_) slots_[i].flags |= SLOT_FLAG_TOMBSTONE;
-        std::unordered_map<uint64_t, uint32_t>().swap(prev_to_idx_);
+        std::vector<uint32_t>().swap(unclaimed_);
         std::vector<uint32_t>().swap(free_list_);
     }
 
@@ -224,9 +274,11 @@ public:
 
 private:
     std::vector<SidecarSlot> slots_;
-    std::unordered_map<uint64_t, uint32_t> prev_to_idx_;
     std::vector<uint32_t> free_list_;
+    // Previous-build slots whose identity no record of this build had.
+    std::vector<uint32_t> unclaimed_;
     size_t live_count_ = 0;
+    bool allocated_ = false;
 };
 
 } // namespace gc::id_alloc

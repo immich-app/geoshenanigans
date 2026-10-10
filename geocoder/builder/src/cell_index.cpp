@@ -275,6 +275,27 @@ static void finalize_strategy2(gc::id_alloc::IdAllocator& alloc, uint32_t n_new,
     sidecar_blob = alloc.take_slots();
 }
 
+// A record identity packed as (ObjectType << 56 | 56-bit id).
+static gc::id_alloc::SlotIdentity unpack_identity(uint64_t packed, uint8_t tier = 0) {
+    return {static_cast<gc::id_alloc::ObjectType>(packed >> 56), packed & 0x00FFFFFFFFFFFFFFull, tier};
+}
+
+// admin_osm_ids are packed like the others: OSM_RELATION for relation
+// rings, OSM_WAY for closed-way polygons (stable id = way id). A bare 0 is
+// the legacy "no stable id" sentinel — SYNTHETIC, so it never reuses a slot.
+static gc::id_alloc::SlotIdentity admin_identity(uint64_t packed) {
+    if (packed == 0) return {gc::id_alloc::ObjectType::SYNTHETIC, 0};
+
+    return unpack_identity(packed);
+}
+
+// Whether every record keeps its index.
+static bool is_identity(const std::vector<uint32_t>& remap) {
+    for (size_t i = 0; i < remap.size(); i++)
+        if (remap[i] != static_cast<uint32_t>(i)) return false;
+    return true;
+}
+
 static void apply_strategy2_streets(ParsedData& data, const std::string& prev_dir) {
     using namespace gc::id_alloc;
     if (data.ways.empty()) return;
@@ -291,13 +312,10 @@ static void apply_strategy2_streets(ParsedData& data, const std::string& prev_di
     }
 
     const size_t n_old = data.ways.size();
-    std::vector<uint32_t> remap(n_old);
-    bool identity = true;
-    for (size_t i = 0; i < n_old; i++) {
-        remap[i] = alloc.allocate(ObjectType::OSM_WAY,
-                                   static_cast<uint64_t>(data.way_osm_ids[i]));
-        if (remap[i] != static_cast<uint32_t>(i)) identity = false;
-    }
+    const std::vector<uint32_t> remap = alloc.allocate_all(n_old, [&](size_t i) {
+        return SlotIdentity{ObjectType::OSM_WAY, static_cast<uint64_t>(data.way_osm_ids[i])};
+    });
+    const bool identity = is_identity(remap);
 
     const uint32_t n_new = alloc.total_slots();
 
@@ -413,22 +431,10 @@ static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir
     }
 
     const size_t n_old = data.admin_polygons.size();
-    std::vector<uint32_t> remap(n_old);
-    bool identity = true;
-    for (size_t i = 0; i < n_old; i++) {
-        // admin_osm_ids are packed (ObjectType<<56 | stable56), same as
-        // addr/poi: OSM_RELATION for relation rings, OSM_WAY for
-        // closed-way polygons (stable id = way id). A bare 0 is the
-        // legacy "no stable id" sentinel — treat as SYNTHETIC so it
-        // never reuses a slot.
-        uint64_t packed = data.admin_osm_ids[i];
-        ObjectType t = packed == 0
-            ? ObjectType::SYNTHETIC
-            : static_cast<ObjectType>(packed >> 56);
-        uint64_t sid = packed & 0x00FFFFFFFFFFFFFFull;
-        remap[i] = alloc.allocate(t, sid);
-        if (remap[i] != static_cast<uint32_t>(i)) identity = false;
-    }
+    const std::vector<uint32_t> remap = alloc.allocate_all(n_old, [&](size_t i) {
+        return admin_identity(data.admin_osm_ids[i]);
+    });
+    const bool identity = is_identity(remap);
 
     const uint32_t n_new = alloc.total_slots();
 
@@ -488,14 +494,10 @@ static void apply_strategy2_addrs(ParsedData& data, const std::string& prev_dir)
     }
 
     const size_t n_old = data.addr_points.size();
-    std::vector<uint32_t> remap(n_old);
-    bool identity = true;
-    for (size_t i = 0; i < n_old; i++) {
-        ObjectType t = static_cast<ObjectType>(data.addr_osm_ids[i] >> 56);
-        uint64_t sid = data.addr_osm_ids[i] & 0x00FFFFFFFFFFFFFFull;
-        remap[i] = alloc.allocate(t, sid);
-        if (remap[i] != static_cast<uint32_t>(i)) identity = false;
-    }
+    const std::vector<uint32_t> remap = alloc.allocate_all(n_old, [&](size_t i) {
+        return unpack_identity(data.addr_osm_ids[i]);
+    });
+    const bool identity = is_identity(remap);
     const uint32_t n_new = alloc.total_slots();
 
     if (identity && n_new == n_old) {
@@ -545,14 +547,10 @@ static void apply_strategy2_places(ParsedData& data, const std::string& prev_dir
     }
 
     const size_t n_old = data.place_nodes.size();
-    std::vector<uint32_t> remap(n_old);
-    bool identity = true;
-    for (size_t i = 0; i < n_old; i++) {
-        ObjectType t = static_cast<ObjectType>(data.place_osm_ids[i] >> 56);
-        uint64_t sid = data.place_osm_ids[i] & 0x00FFFFFFFFFFFFFFull;
-        remap[i] = alloc.allocate(t, sid);
-        if (remap[i] != static_cast<uint32_t>(i)) identity = false;
-    }
+    const std::vector<uint32_t> remap = alloc.allocate_all(n_old, [&](size_t i) {
+        return unpack_identity(data.place_osm_ids[i]);
+    });
+    const bool identity = is_identity(remap);
     const uint32_t n_new = alloc.total_slots();
 
     if (identity && n_new == n_old) {
@@ -596,14 +594,10 @@ static void apply_strategy2_pois(ParsedData& data, const std::string& prev_dir) 
     }
 
     const size_t n_old = data.poi_records.size();
-    std::vector<uint32_t> remap(n_old);
-    bool identity = true;
-    for (size_t i = 0; i < n_old; i++) {
-        ObjectType t = static_cast<ObjectType>(data.poi_osm_ids[i] >> 56);
-        uint64_t sid = data.poi_osm_ids[i] & 0x00FFFFFFFFFFFFFFull;
-        remap[i] = alloc.allocate(t, sid, data.poi_records[i].tier);
-        if (remap[i] != static_cast<uint32_t>(i)) identity = false;
-    }
+    const std::vector<uint32_t> remap = alloc.allocate_all(n_old, [&](size_t i) {
+        return unpack_identity(data.poi_osm_ids[i], data.poi_records[i].tier);
+    });
+    const bool identity = is_identity(remap);
     const uint32_t n_new = alloc.total_slots();
 
     if (identity && n_new == n_old) {
@@ -653,14 +647,10 @@ static void apply_strategy2_interps(ParsedData& data, const std::string& prev_di
     }
 
     const size_t n_old = data.interp_ways.size();
-    std::vector<uint32_t> remap(n_old);
-    bool identity = true;
-    for (size_t i = 0; i < n_old; i++) {
-        ObjectType t = static_cast<ObjectType>(data.interp_osm_ids[i] >> 56);
-        uint64_t sid = data.interp_osm_ids[i] & 0x00FFFFFFFFFFFFFFull;
-        remap[i] = alloc.allocate(t, sid);
-        if (remap[i] != static_cast<uint32_t>(i)) identity = false;
-    }
+    const std::vector<uint32_t> remap = alloc.allocate_all(n_old, [&](size_t i) {
+        return unpack_identity(data.interp_osm_ids[i]);
+    });
+    const bool identity = is_identity(remap);
     const uint32_t n_new = alloc.total_slots();
 
     if (identity && n_new == n_old) {
@@ -1316,14 +1306,11 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                 };
 
                 const size_t n_old = centroids.size();
-                std::vector<uint32_t> remap(n_old);
-                bool identity = true;
-                for (size_t i = 0; i < n_old; i++) {
-                    const char* pc_str = get_str(centroids[i].postcode_id);
-                    uint64_t id = fnv(pc_str, centroids[i].country_code);
-                    remap[i] = alloc.allocate(ObjectType::POSTCODE, id);
-                    if (remap[i] != static_cast<uint32_t>(i)) identity = false;
-                }
+                const std::vector<uint32_t> remap = alloc.allocate_all(n_old, [&](size_t i) {
+                    return SlotIdentity{ObjectType::POSTCODE,
+                                        fnv(get_str(centroids[i].postcode_id), centroids[i].country_code)};
+                });
+                const bool identity = is_identity(remap);
                 const uint32_t n_new = alloc.total_slots();
 
                 if (!(identity && n_new == n_old)) {
@@ -1649,16 +1636,16 @@ void write_admin_minimal_polygons(const ParsedData& data,
     using namespace gc::id_alloc;
     IdAllocator alloc;
     if (!prev_dir.empty()) alloc.load_previous(prev_dir + "/admin-minimal/admin_polygons.osm_ids");
-    std::vector<size_t> kept_at_slot;
-    for (size_t k = 0; k < kept_idx.size(); k++) {
-        if (simplified[k].verts.size() < 3) continue;
-        uint64_t packed = kept_idx[k] < data.admin_osm_ids.size() ? data.admin_osm_ids[kept_idx[k]] : 0;
-        ObjectType t = packed == 0 ? ObjectType::SYNTHETIC : static_cast<ObjectType>(packed >> 56);
-        uint32_t slot = alloc.allocate(t, packed & 0x00FFFFFFFFFFFFFFull);
-        if (slot >= kept_at_slot.size()) kept_at_slot.resize(slot + 1, SIZE_MAX);
-        kept_at_slot[slot] = k;
-    }
+    std::vector<size_t> drawn;  // kept polygons with a shape left after simplifying
+    for (size_t k = 0; k < kept_idx.size(); k++)
+        if (simplified[k].verts.size() >= 3) drawn.push_back(k);
+    const std::vector<uint32_t> drawn_slots = alloc.allocate_all(drawn.size(), [&](size_t j) {
+        size_t old_id = kept_idx[drawn[j]];
+        return admin_identity(old_id < data.admin_osm_ids.size() ? data.admin_osm_ids[old_id] : 0);
+    });
     alloc.finalize();
+    std::vector<size_t> kept_at_slot(alloc.total_slots(), SIZE_MAX);
+    for (size_t j = 0; j < drawn.size(); j++) kept_at_slot[drawn_slots[j]] = drawn[j];
 
     // Vertex bytes in slot order, so offsets ascend with ids.
     std::vector<AdminPolygon> new_polys(alloc.total_slots(), admin_polygon_tombstone());
