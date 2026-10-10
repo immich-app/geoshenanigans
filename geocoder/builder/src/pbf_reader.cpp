@@ -853,18 +853,8 @@ PbfFile::PbfFile(const std::string& filename, unsigned num_threads)
 
     blobs_ = scan_pbf_blobs(filename_, num_threads_);
 
-    // Advise kernel to preload PBF into page cache.
-    // Dramatically reduces pread latency for parallel reads (72% faster in testing).
-    int fd = open(filename_.c_str(), O_RDONLY);
-    if (fd >= 0) {
-        off_t file_size = lseek(fd, 0, SEEK_END);
-        posix_fadvise(fd, 0, file_size, POSIX_FADV_WILLNEED);
-        close(fd);
-        std::cerr << "  PBF: " << blobs_.size() << " blobs, "
-                  << (file_size / (1024*1024)) << " MiB (preloading to page cache)" << std::endl;
-    } else {
-        std::cerr << "  PBF: " << blobs_.size() << " blobs" << std::endl;
-    }
+    size_t bytes = blobs_.empty() ? 0 : blobs_.back().offset + 4 + blobs_.back().header_size + blobs_.back().data_size;
+    std::cerr << "  PBF: " << blobs_.size() << " blobs, " << (bytes / (1024*1024)) << " MiB" << std::endl;
 }
 
 // Lightweight I/O semaphore — limits concurrent preads without queue overhead.
