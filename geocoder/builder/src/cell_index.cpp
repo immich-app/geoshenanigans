@@ -20,6 +20,7 @@
 #include "postcode_validation.h"
 #include "s2_helpers.h"
 #include "strategy2_remap.h"
+#include "vertex_pack.h"
 
 #include <s2/s2latlng.h>
 #include <limits>
@@ -1079,63 +1080,8 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                         packed_points.push_back(ap);
                         continue;
                     }
-                    uint32_t old_off = ap.vertex_offset;
-                    uint32_t vc = ap.vertex_count;
-                    // Compute bbox
-                    double min_lat = data.addr_vertices[old_off].lat;
-                    double max_lat = min_lat;
-                    double min_lng = data.addr_vertices[old_off].lng;
-                    double max_lng = min_lng;
-                    for (uint32_t j = 1; j < vc; j++) {
-                        const auto& v = data.addr_vertices[old_off + j];
-                        if (v.lat < min_lat) min_lat = v.lat;
-                        if (v.lat > max_lat) max_lat = v.lat;
-                        if (v.lng < min_lng) min_lng = v.lng;
-                        if (v.lng > max_lng) max_lng = v.lng;
-                    }
-                    double max_span = std::max(max_lat - min_lat, max_lng - min_lng);
-                    VertexEncoding enc;
-                    double scale;
-                    // Building footprints prefer the 0.11 m grid for
-                    // sub-meter GPS edge precision; fall back as needed.
-                    if (max_span < 65535.0 * 1e-6) {
-                        enc = VertexEncoding::U16_011M; scale = 1e-6;
-                    } else if (max_span < 65535.0 * 1e-5) {
-                        enc = VertexEncoding::U16_1M; scale = 1e-5;
-                    } else if (max_span < 65535.0 * 1e-4) {
-                        enc = VertexEncoding::U16_11M; scale = 1e-4;
-                    } else {
-                        enc = VertexEncoding::U32_1CM; scale = 1e-7;
-                    }
-                    ap.vertex_offset = static_cast<uint32_t>(packed_bytes.size());
-                    // 10-byte polygon header
-                    packed_bytes.push_back(static_cast<uint8_t>(enc));
-                    packed_bytes.push_back(0);
-                    float bml = static_cast<float>(min_lat);
-                    float bmg = static_cast<float>(min_lng);
-                    auto* lp = reinterpret_cast<const uint8_t*>(&bml);
-                    packed_bytes.insert(packed_bytes.end(), lp, lp + 4);
-                    auto* gp = reinterpret_cast<const uint8_t*>(&bmg);
-                    packed_bytes.insert(packed_bytes.end(), gp, gp + 4);
-                    // Delta-encoded vertices
-                    for (uint32_t j = 0; j < vc; j++) {
-                        const auto& v = data.addr_vertices[old_off + j];
-                        if (enc == VertexEncoding::U32_1CM) {
-                            uint32_t dlat = static_cast<uint32_t>(std::lround((v.lat - min_lat) / scale));
-                            uint32_t dlng = static_cast<uint32_t>(std::lround((v.lng - min_lng) / scale));
-                            auto* dp = reinterpret_cast<const uint8_t*>(&dlat);
-                            packed_bytes.insert(packed_bytes.end(), dp, dp + 4);
-                            auto* gp2 = reinterpret_cast<const uint8_t*>(&dlng);
-                            packed_bytes.insert(packed_bytes.end(), gp2, gp2 + 4);
-                        } else {
-                            uint16_t dlat = static_cast<uint16_t>(std::lround((v.lat - min_lat) / scale));
-                            uint16_t dlng = static_cast<uint16_t>(std::lround((v.lng - min_lng) / scale));
-                            auto* dp = reinterpret_cast<const uint8_t*>(&dlat);
-                            packed_bytes.insert(packed_bytes.end(), dp, dp + 2);
-                            auto* gp2 = reinterpret_cast<const uint8_t*>(&dlng);
-                            packed_bytes.insert(packed_bytes.end(), gp2, gp2 + 2);
-                        }
-                    }
+                    ap.vertex_offset = append_polygon(packed_bytes, &data.addr_vertices[ap.vertex_offset],
+                                                      ap.vertex_count);
                     packed_points.push_back(ap);
                 }
                 write_binary_file(output_dir + "/addr_points.bin",
@@ -1377,86 +1323,6 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
     log_phase((label + "total").c_str(), _total_t, _total_c);
 }
 
-// Pack one polygon's vertices into the byte stream.  Writes a 10-byte
-// header (encoding tag + bbox_min lat/lng) followed by packed unsigned
-// deltas.  Returns the byte offset to the header (caller stores on the
-// record). Inline header keeps PoiRecord/AdminPolygon at their original
-// sizes — no per-record bbox_min tax. Shared between write_quality_variant
-// and write_admin_minimal_polygons.
-static uint32_t pack_polygon_bytes(std::vector<uint8_t>& out_bytes,
-                                   const std::vector<std::pair<double,double>>& verts) {
-    // Compute bbox min/max
-    double min_lat = verts[0].first, max_lat = verts[0].first;
-    double min_lng = verts[0].second, max_lng = verts[0].second;
-    for (size_t k = 1; k < verts.size(); k++) {
-        if (verts[k].first  < min_lat) min_lat = verts[k].first;
-        if (verts[k].first  > max_lat) max_lat = verts[k].first;
-        if (verts[k].second < min_lng) min_lng = verts[k].second;
-        if (verts[k].second > max_lng) max_lng = verts[k].second;
-    }
-    double dlat_span = max_lat - min_lat;
-    double dlng_span = max_lng - min_lng;
-    double max_span = std::max(dlat_span, dlng_span);
-
-    // Pick smallest encoding that fits.  u16 max = 65535. Span thresholds
-    // use 65535 * scale to leave no headroom.
-    VertexEncoding enc;
-    double scale;
-    if (max_span < 65535.0 * 1e-6) {
-        // 11 cm grid, 7.3 km bbox — POI building footprints
-        enc = VertexEncoding::U16_011M;
-        scale = 1e-6;
-    } else if (max_span < 65535.0 * 1e-5) {
-        // 1.1 m grid, 73 km bbox — most cities, suburbs, neighbourhoods
-        enc = VertexEncoding::U16_1M;
-        scale = 1e-5;
-    } else if (max_span < 65535.0 * 1e-4) {
-        // 11 m grid, 730 km bbox — counties, regions, small countries
-        enc = VertexEncoding::U16_11M;
-        scale = 1e-4;
-    } else {
-        // u32 @ 1 cm — fits any polygon (max span ~214 deg)
-        enc = VertexEncoding::U32_1CM;
-        scale = 1e-7;
-    }
-
-    uint32_t byte_offset = static_cast<uint32_t>(out_bytes.size());
-    // 10-byte polygon header: encoding (1) + pad (1) + bbox_min_lat (4) + bbox_min_lng (4)
-    uint8_t enc_byte = static_cast<uint8_t>(enc);
-    out_bytes.push_back(enc_byte);
-    out_bytes.push_back(0); // padding
-    float bml = static_cast<float>(min_lat);
-    float bmg = static_cast<float>(min_lng);
-    auto* lp = reinterpret_cast<const uint8_t*>(&bml);
-    out_bytes.insert(out_bytes.end(), lp, lp + 4);
-    auto* gp_ = reinterpret_cast<const uint8_t*>(&bmg);
-    out_bytes.insert(out_bytes.end(), gp_, gp_ + 4);
-    if (enc == VertexEncoding::U32_1CM) {
-        for (const auto& [lat, lng] : verts) {
-            uint32_t dlat = static_cast<uint32_t>(std::lround((lat - min_lat) / scale));
-            uint32_t dlng = static_cast<uint32_t>(std::lround((lng - min_lng) / scale));
-            out_bytes.insert(out_bytes.end(),
-                reinterpret_cast<const uint8_t*>(&dlat),
-                reinterpret_cast<const uint8_t*>(&dlat) + 4);
-            out_bytes.insert(out_bytes.end(),
-                reinterpret_cast<const uint8_t*>(&dlng),
-                reinterpret_cast<const uint8_t*>(&dlng) + 4);
-        }
-    } else {
-        for (const auto& [lat, lng] : verts) {
-            uint16_t dlat = static_cast<uint16_t>(std::lround((lat - min_lat) / scale));
-            uint16_t dlng = static_cast<uint16_t>(std::lround((lng - min_lng) / scale));
-            out_bytes.insert(out_bytes.end(),
-                reinterpret_cast<const uint8_t*>(&dlat),
-                reinterpret_cast<const uint8_t*>(&dlat) + 2);
-            out_bytes.insert(out_bytes.end(),
-                reinterpret_cast<const uint8_t*>(&dlng),
-                reinterpret_cast<const uint8_t*>(&dlng) + 2);
-        }
-    }
-    return byte_offset;
-}
-
 // Simplify one polygon's vertices at a given epsilon (or pass through if
 // epsilon_scale == 0). Helper used by both quality variant + admin-minimal.
 static std::vector<std::pair<double,double>>
@@ -1530,7 +1396,7 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
 
         AdminPolygon np = data.admin_polygons[i];
 
-        np.vertex_offset = pack_polygon_bytes(new_verts_bytes, sv);
+        np.vertex_offset = append_polygon(new_verts_bytes, sv.data(), sv.size());
         np.vertex_count = static_cast<uint32_t>(sv.size());
         np.area = polygon_area(sv);
         new_polys[i] = np;
@@ -1538,7 +1404,7 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
         // Postal also go into separate files (for optional loading)
         if (np.admin_level == 11) {
             AdminPolygon pp = np;
-            pp.vertex_offset = pack_polygon_bytes(postal_verts_bytes, sv);
+            pp.vertex_offset = append_polygon(postal_verts_bytes, sv.data(), sv.size());
             postal_polys.push_back(pp);
         }
     }
@@ -1642,7 +1508,7 @@ void write_admin_minimal_polygons(const ParsedData& data,
         if (k == SIZE_MAX) continue;
         auto& sv = simplified[k].verts;
         AdminPolygon np = data.admin_polygons[kept_idx[k]];
-        np.vertex_offset = pack_polygon_bytes(new_verts_bytes, sv);
+        np.vertex_offset = append_polygon(new_verts_bytes, sv.data(), sv.size());
         np.vertex_count = static_cast<uint32_t>(sv.size());
         np.area = polygon_area(sv);
         id_remap[kept_idx[k]] = static_cast<uint32_t>(slot);
