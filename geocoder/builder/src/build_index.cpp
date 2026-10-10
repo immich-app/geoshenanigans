@@ -54,6 +54,7 @@ inline uint64_t pack_osm_id(gc::id_alloc::ObjectType type, int64_t osm_id) {
 #include "scratch_dir.h"
 #include "tiger.h"
 #include "parallel.h"
+#include "way_tags.h"
 
 
 // --- Place type override classification ---
@@ -4013,123 +4014,13 @@ static int run(int argc, char* argv[]) {
                     }
                     auto& local = *tl_way_data;
 
-                    // Single-pass tag extraction — avoid repeated linear scans
-                    const char* t_interpolation = nullptr;
-                    const char* t_housenumber = nullptr;
-                    const char* t_street = nullptr;
-                    const char* t_postcode = nullptr;
-                    const char* t_highway = nullptr;
-                    const char* t_footway = nullptr;
-                    const char* t_access = nullptr;
-                    const char* t_tunnel = nullptr;
-                    const char* t_name = nullptr;
-                    const char* t_name_en = nullptr;
-                    const char* t_boundary = nullptr;
-                    const char* t_admin_level = nullptr;
-                    const char* t_postal_code = nullptr;
-                    const char* t_iso = nullptr;
-                    const char* t_linked_place = nullptr;
-                    const char* t_border_type = nullptr;
-                    // POI tags
-                    const char* t_tourism = nullptr;
-                    const char* t_historic = nullptr;
-                    const char* t_amenity = nullptr;
-                    const char* t_leisure = nullptr;
-                    const char* t_natural = nullptr;
-                    const char* t_aeroway = nullptr;
-                    const char* t_railway = nullptr;
-                    const char* t_man_made = nullptr;
-                    const char* t_building = nullptr;
-                    const char* t_craft = nullptr;
-                    const char* t_power = nullptr;
-                    const char* t_place = nullptr;
-                    const char* t_waterway = nullptr;
-                    const char* t_office = nullptr;
-                    const char* t_wikipedia = nullptr;
-                    const char* t_wikidata = nullptr;
-                    const char* t_ele = nullptr;
-                    const char* t_shop = nullptr;
-                    const char* t_landuse = nullptr;
-                    for (size_t i = 0; i < ntags; i++) {
-                        if (tag_keys[i] >= st.size()) continue;
-                        const auto& k = st[tag_keys[i]];
-                        const char* v = tag_vals[i] < st.size() ? st[tag_vals[i]].c_str() : nullptr;
-                        // Fast dispatch by first character
-                        switch (k.size() > 0 ? k[0] : 0) {
-                            case 'a':
-                                if (k == "addr:interpolation") t_interpolation = v;
-                                else if (k == "addr:housenumber") t_housenumber = v;
-                                else if (k == "addr:street") t_street = v;
-                                else if (k == "addr:postcode") t_postcode = v;
-                                else if (k == "admin_level") t_admin_level = v;
-                                else if (k == "amenity") t_amenity = v;
-                                else if (k == "aeroway") t_aeroway = v;
-                                else if (k == "access") t_access = v;
-                                break;
-                            case 'b':
-                                if (k == "boundary") t_boundary = v;
-                                else if (k == "building") t_building = v;
-                                else if (k == "border_type") t_border_type = v;
-                                break;
-                            case 'c': if (k == "craft") t_craft = v; break;
-                            case 'e': if (k == "ele") t_ele = v; break;
-                            case 'f': if (k == "footway") t_footway = v; break;
-                            case 'h':
-                                if (k == "highway") t_highway = v;
-                                else if (k == "historic") t_historic = v;
-                                break;
-                            case 'l':
-                                if (k == "leisure") t_leisure = v;
-                                else if (k == "linked_place") t_linked_place = v;
-                                else if (k == "landuse") t_landuse = v;
-                                break;
-                            case 'm': if (k == "man_made") t_man_made = v; break;
-                            case 'n':
-                                if (k == "name") t_name = v;
-                                else if (k == "name:en") t_name_en = v;
-                                else if (k == "natural") t_natural = v;
-                                break;
-                            case 'o':
-                                if (k == "office") t_office = v;
-                                break;
-                            case 'p':
-                                if (k == "postal_code") t_postal_code = v;
-                                else if (k == "place") t_place = v;
-                                else if (k == "power") t_power = v;
-                                break;
-                            case 'r': if (k == "railway") t_railway = v; break;
-                            case 's': if (k == "shop") t_shop = v; break;
-                            case 't':
-                                if (k == "tourism") t_tourism = v;
-                                else if (k == "tunnel") t_tunnel = v;
-                                break;
-                            case 'I': if (k == "ISO3166-1:alpha2") t_iso = v; break;
-                            case 'w':
-                                if (k == "waterway") t_waterway = v;
-                                else if (k == "wikipedia") t_wikipedia = v;
-                                else if (k == "wikidata") t_wikidata = v;
-                                break;
-                        }
-                    }
-
-                    // Prefer name:en where present (English-only mode)
-                    const char* t_best_name = (t_name_en && t_name_en[0]) ? t_name_en : t_name;
-
-                    // Check if this way has POI-qualifying tags
-                    bool has_poi_tags = t_tourism || t_historic || t_amenity || t_leisure ||
-                        t_natural || t_aeroway || t_railway || t_man_made || t_building ||
-                        t_craft || t_power || t_place || t_waterway || t_office ||
-                        (t_boundary && (std::strcmp(t_boundary, "national_park") == 0 ||
-                                        std::strcmp(t_boundary, "protected_area") == 0));
+                    const WayTags t = parse_way_tags(tag_keys, tag_vals, ntags, st);
+                    const char* t_best_name = t.best_name();
+                    bool has_poi_tags = t.has_poi_tags();
 
                     // Early exit: if no relevant tags, skip expensive node resolution
-                    bool need_nodes = t_interpolation || t_housenumber ||
-                        (t_highway && is_included_highway_full(t_highway, t_footway, t_access, t_tunnel) && t_name) ||
-                        t_boundary ||
-                        (refs_size > 0 && is_admin_way(way_id)) ||
-                        (has_poi_tags && t_name) ||
-                        (refs_size > 0 && is_poi_way(way_id));
-                    if (!need_nodes) return;
+                    bool relation_member = refs_size > 0 && (is_admin_way(way_id) || is_poi_way(way_id));
+                    if (!way_needs_nodes(t, relation_member)) return;
 
                     // Pre-resolve all node locations
                     thread_local std::vector<PackedLocation> resolved_locs;
@@ -4143,17 +4034,17 @@ static int run(int argc, char* argv[]) {
                     }
 
                     // Address interpolation
-                    if (t_interpolation) {
+                    if (t.interpolation) {
                         if (refs_size >= 2 && all_valid) {
-                            const char* street = t_street;
+                            const char* street = t.street;
                             if (street) {
                                 uint32_t interp_id = static_cast<uint32_t>(local.interp_ways.size());
                                 uint32_t node_offset = static_cast<uint32_t>(local.interp_nodes.size());
                                 for (const auto& loc : resolved_locs)
                                     local.interp_nodes.push_back({static_cast<float>(loc.lat()), static_cast<float>(loc.lon())});
                                 uint8_t interp_type = 0;
-                                if (std::strcmp(t_interpolation, "even") == 0) interp_type = 1;
-                                else if (std::strcmp(t_interpolation, "odd") == 0) interp_type = 2;
+                                if (std::strcmp(t.interpolation, "even") == 0) interp_type = 1;
+                                else if (std::strcmp(t.interpolation, "odd") == 0) interp_type = 2;
                                 InterpWay iw{}; iw.node_offset = node_offset;
                                 iw.node_count = static_cast<uint16_t>(std::min(refs_size, size_t(MAX_NODE_COUNT)));
                                 iw.interpolation = interp_type;
@@ -4172,9 +4063,9 @@ static int run(int argc, char* argv[]) {
                     // backfilled via the nearest-named-street sweep
                     // after way indexing, matching Nominatim's
                     // parent_place_id resolution behaviour.
-                    const char* housenumber = t_housenumber;
+                    const char* housenumber = t.housenumber;
                     if (housenumber && refs_size > 0) {
-                        const char* street = t_street;
+                        const char* street = t.street;
                         double sum_lat = 0, sum_lng = 0; int valid = 0;
                         for (const auto& loc : resolved_locs) {
                             if (loc.valid()) { sum_lat += loc.lat(); sum_lng += loc.lon(); valid++; }
@@ -4185,7 +4076,7 @@ static int run(int argc, char* argv[]) {
                             local.building_addrs.push_back({static_cast<float>(clat), static_cast<float>(clng), 0, 0, 0, NO_DATA, 0});
                             local.building_addr_osm_way_ids.push_back(way_id);
                             local.addr_strings.push_back({housenumber, street ? street : ""});
-                            local.addr_postcodes.push_back(t_postcode ? t_postcode : "");
+                            local.addr_postcodes.push_back(t.postcode ? t.postcode : "");
                             // Polygon vertices for closed ways (buildings).
                             // Lets the server compute exact distance-to-
                             // polygon for Nominatim parity instead of the
@@ -4216,7 +4107,7 @@ static int run(int argc, char* argv[]) {
                     }
 
                     // Highway ways
-                    if (t_highway && is_included_highway_full(t_highway, t_footway, t_access, t_tunnel)) {
+                    if (t.highway && is_included_highway_full(t.highway, t.footway, t.access, t.tunnel)) {
                         if (t_best_name && refs_size >= 2 && all_valid) {
                             uint32_t wid = static_cast<uint32_t>(local.ways.size());
                             uint32_t noff = static_cast<uint32_t>(local.street_nodes.size());
@@ -4227,7 +4118,7 @@ static int run(int argc, char* argv[]) {
                             local.ways.push_back(header);
                             local.way_osm_ids.push_back(way_id);
                             local.way_strings.push_back(t_best_name);
-                            local.way_orig_names.push_back(t_name ? t_name : (t_best_name ? t_best_name : ""));
+                            local.way_orig_names.push_back(t.name ? t.name : (t_best_name ? t_best_name : ""));
                             local.deferred_ways.push_back({wid, noff, header.node_count});
                             local.way_count++;
                         }
@@ -4253,12 +4144,12 @@ static int run(int argc, char* argv[]) {
 
                     // Closed way POI polygons
                     if (has_poi_tags && t_best_name && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1] && all_valid) {
-                        auto cls = classify_poi(t_tourism, t_historic, t_boundary,
-                            t_amenity, t_leisure, t_natural, t_railway, t_aeroway,
-                            t_man_made, t_building, t_craft, t_power, t_place, t_waterway,
-                            t_office,
-                            t_wikipedia, t_wikidata,
-                            t_highway, t_shop, t_landuse);
+                        auto cls = classify_poi(t.tourism, t.historic, t.boundary,
+                            t.amenity, t.leisure, t.natural, t.railway, t.aeroway,
+                            t.man_made, t.building, t.craft, t.power, t.place, t.waterway,
+                            t.office,
+                            t.wikipedia, t.wikidata,
+                            t.highway, t.shop, t.landuse);
                         if (cls) {
                             // Compute centroid
                             double sum_lat = 0, sum_lng = 0;
@@ -4297,39 +4188,39 @@ static int run(int argc, char* argv[]) {
                             pr.flags = cls->flags;
 
                             float way_ele = 0;
-                            if (t_ele) { char* end; way_ele = std::strtof(t_ele, &end); if (end == t_ele) way_ele = 0; }
+                            if (t.ele) { char* end; way_ele = std::strtof(t.ele, &end); if (end == t.ele) way_ele = 0; }
                             uint32_t way_qid = 0;
-                            if (t_wikidata && t_wikidata[0] == 'Q') {
-                                way_qid = static_cast<uint32_t>(std::strtoul(t_wikidata + 1, nullptr, 10));
+                            if (t.wikidata && t.wikidata[0] == 'Q') {
+                                way_qid = static_cast<uint32_t>(std::strtoul(t.wikidata + 1, nullptr, 10));
                             }
                             local.poi_ways.push_back({pr, t_best_name, std::move(verts), way_ele, way_qid, way_id});
                         }
                     }
 
                     // Closed way admin boundaries
-                    const char* boundary = t_boundary;
+                    const char* boundary = t.boundary;
                     if (boundary) {
                         bool is_admin = (std::strcmp(boundary, "administrative") == 0);
                         bool is_postal = (std::strcmp(boundary, "postal_code") == 0);
                         bool is_place_boundary = (std::strcmp(boundary, "place") == 0);
                         if ((is_admin || is_postal) && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1]) {
                             uint8_t al = 0;
-                            if (is_admin) { const char* ls = t_admin_level; if (ls) al = static_cast<uint8_t>(std::atoi(ls)); }
+                            if (is_admin) { const char* ls = t.admin_level; if (ls) al = static_cast<uint8_t>(std::atoi(ls)); }
                             else al = 11;
                             int max_al = is_postal ? 11 : 10;
                             if (al >= 2 && al <= max_al && (kMaxAdminLevel == 0 || al <= kMaxAdminLevel)) {
                                 const char* aname = t_best_name;
                                 if (aname || !is_admin) {
                                     std::string name_str;
-                                    if (is_postal) { const char* pc = t_postal_code; if (!pc) pc = aname; if (pc) name_str = pc; }
+                                    if (is_postal) { const char* pc = t.postal_code; if (!pc) pc = aname; if (pc) name_str = pc; }
                                     else if (aname) name_str = aname;
                                     if (!name_str.empty() && all_valid && resolved_locs.size() >= 3) {
                                         std::vector<std::pair<double,double>> verts;
                                         for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});
-                                        std::string cc; if (al == 2) { const char* iso = t_iso; if (iso) cc = iso; }
-                                        auto po = classify_place_override(t_linked_place, t_border_type, t_place);
+                                        std::string cc; if (al == 2) { const char* iso = t.iso; if (iso) cc = iso; }
+                                        auto po = classify_place_override(t.linked_place, t.border_type, t.place);
                                         uint8_t fallback = static_cast<uint8_t>(po.type);
-                                        std::string wd_str = t_wikidata ? t_wikidata : "";
+                                        std::string wd_str = t.wikidata ? t.wikidata : "";
                                         local.closed_way_admins.push_back({std::move(verts), std::move(name_str), al, std::move(cc), fallback, std::move(wd_str), way_id});
                                     }
                                 }
@@ -4338,12 +4229,12 @@ static int run(int argc, char* argv[]) {
                         // Closed way boundary=place (e.g., Washington DC)
                         if (is_place_boundary && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1]) {
                             const char* aname = t_best_name;
-                            if (aname && t_place) {
-                                AdminPlaceType pt = classify_place_override(nullptr, nullptr, t_place).type;
+                            if (aname && t.place) {
+                                AdminPlaceType pt = classify_place_override(nullptr, nullptr, t.place).type;
                                 if (pt != AdminPlaceType::NONE && all_valid && resolved_locs.size() >= 3) {
                                     std::vector<std::pair<double,double>> verts;
                                     for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});
-                                    std::string wd_str = t_wikidata ? t_wikidata : "";
+                                    std::string wd_str = t.wikidata ? t.wikidata : "";
                                     local.closed_way_admins.push_back({std::move(verts), std::string(aname), uint8_t(15), std::string(), static_cast<uint8_t>(pt), std::move(wd_str), way_id});
                                 }
                             }
@@ -4361,9 +4252,9 @@ static int run(int argc, char* argv[]) {
                     // with place=neighbourhood + name:en, and nominatim
                     // returns it as neighbourhood for queries inside
                     // the polygon.
-                    if (!boundary && t_place && t_best_name
+                    if (!boundary && t.place && t_best_name
                             && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1]) {
-                        AdminPlaceType pt = classify_place_override(nullptr, nullptr, t_place).type;
+                        AdminPlaceType pt = classify_place_override(nullptr, nullptr, t.place).type;
                         // Only the rank-20+ place types (neighbourhood,
                         // quarter, suburb, borough) — higher-level place
                         // types on closed ways are rare and adding them
@@ -4376,7 +4267,7 @@ static int run(int argc, char* argv[]) {
                         if (want && all_valid && resolved_locs.size() >= 3) {
                             std::vector<std::pair<double,double>> verts;
                             for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});
-                            std::string wd_str = t_wikidata ? t_wikidata : "";
+                            std::string wd_str = t.wikidata ? t.wikidata : "";
                             local.closed_way_admins.push_back({
                                 std::move(verts),
                                 std::string(t_best_name),
