@@ -130,60 +130,49 @@ std::vector<uint32_t> write_entries_from_sorted(
         return offsets;
     }
 
-    unsigned int nthreads = std::thread::hardware_concurrency();
-    if (nthreads == 0) nthreads = 4;
-    size_t cells_per_chunk = (sorted_cells.size() + nthreads - 1) / nthreads;
-
+    // Each worker packs its cells into its own buffer with offsets local to
+    // it; the offsets are then rebased and the buffers written in order.
     struct ChunkResult {
         std::vector<char> buf;
-        size_t cell_start, cell_end;
-        uint32_t local_size;
+        size_t cell_start = 0, cell_end = 0;
+        uint32_t local_size = 0;
         size_t max_count = 0;  // largest per-cell entry count seen (overflow checked after join)
     };
-    std::vector<ChunkResult> chunks(nthreads);
+    const unsigned threads = parallel_threads();
+    std::vector<ChunkResult> chunks(threads);
+    parallel_for(sorted_cells.size(), [&](size_t cs, size_t ce, unsigned t) {
+        auto& chunk = chunks[t];
+        chunk.cell_start = cs;
+        chunk.cell_end = ce;
 
-    std::vector<std::thread> threads;
-    for (unsigned int t = 0; t < nthreads; t++) {
-        size_t cs = t * cells_per_chunk;
-        size_t ce = std::min(cs + cells_per_chunk, sorted_cells.size());
-        if (cs >= sorted_cells.size()) break;
+        size_t pi = std::lower_bound(sorted_pairs.begin(), sorted_pairs.end(),
+            sorted_cells[cs], [](const CellItemPair& p, uint64_t id) {
+                return p.cell_id < id;
+            }) - sorted_pairs.begin();
 
-        threads.emplace_back([&, t, cs, ce]() {
-            auto& chunk = chunks[t];
-            chunk.cell_start = cs;
-            chunk.cell_end = ce;
-            chunk.local_size = 0;
+        for (size_t si = cs; si < ce && pi < sorted_pairs.size(); si++) {
+            if (sorted_cells[si] < sorted_pairs[pi].cell_id) continue;
+            while (pi < sorted_pairs.size() && sorted_pairs[pi].cell_id < sorted_cells[si]) pi++;
+            if (pi >= sorted_pairs.size() || sorted_pairs[pi].cell_id != sorted_cells[si]) continue;
 
-            size_t pi = std::lower_bound(sorted_pairs.begin(), sorted_pairs.end(),
-                sorted_cells[cs], [](const CellItemPair& p, uint64_t id) {
-                    return p.cell_id < id;
-                }) - sorted_pairs.begin();
-
-            for (size_t si = cs; si < ce && pi < sorted_pairs.size(); si++) {
-                if (sorted_cells[si] < sorted_pairs[pi].cell_id) continue;
-                while (pi < sorted_pairs.size() && sorted_pairs[pi].cell_id < sorted_cells[si]) pi++;
-                if (pi >= sorted_pairs.size() || sorted_pairs[pi].cell_id != sorted_cells[si]) continue;
-
-                offsets[si] = chunk.local_size;
-                size_t start = pi;
-                while (pi < sorted_pairs.size() && sorted_pairs[pi].cell_id == sorted_cells[si]) pi++;
-                // Can't throw from a worker thread; record the max and let the
-                // post-join check below fail the build on overflow.
-                if (pi - start > chunk.max_count) chunk.max_count = pi - start;
-                uint16_t count = static_cast<uint16_t>(pi - start);
-                size_t entry_size = sizeof(uint16_t) + (pi - start) * sizeof(uint32_t);
-                size_t buf_pos = chunk.buf.size();
-                chunk.buf.resize(buf_pos + entry_size);
-                memcpy(chunk.buf.data() + buf_pos, &count, sizeof(count));
-                for (size_t k = start; k < pi; k++) {
-                    memcpy(chunk.buf.data() + buf_pos + sizeof(uint16_t) + (k - start) * sizeof(uint32_t),
-                           &sorted_pairs[k].item_id, sizeof(uint32_t));
-                }
-                chunk.local_size += entry_size;
+            offsets[si] = chunk.local_size;
+            size_t start = pi;
+            while (pi < sorted_pairs.size() && sorted_pairs[pi].cell_id == sorted_cells[si]) pi++;
+            // Can't throw from a worker thread; record the max and let the
+            // post-join check below fail the build on overflow.
+            if (pi - start > chunk.max_count) chunk.max_count = pi - start;
+            uint16_t count = static_cast<uint16_t>(pi - start);
+            size_t entry_size = sizeof(uint16_t) + (pi - start) * sizeof(uint32_t);
+            size_t buf_pos = chunk.buf.size();
+            chunk.buf.resize(buf_pos + entry_size);
+            memcpy(chunk.buf.data() + buf_pos, &count, sizeof(count));
+            for (size_t k = start; k < pi; k++) {
+                memcpy(chunk.buf.data() + buf_pos + sizeof(uint16_t) + (k - start) * sizeof(uint32_t),
+                       &sorted_pairs[k].item_id, sizeof(uint32_t));
             }
-        });
-    }
-    for (auto& t : threads) t.join();
+            chunk.local_size += entry_size;
+        }
+    }, threads);
 
     size_t max_count = 0;
     for (auto& chunk : chunks)
@@ -191,19 +180,23 @@ std::vector<uint32_t> write_entries_from_sorted(
     checked_entry_count(max_count, path);
     std::cerr << "  " << path << ": max entries/cell = " << max_count << std::endl;
 
-    uint32_t global_offset = 0;
-    for (auto& chunk : chunks) {
-        for (size_t si = chunk.cell_start; si < chunk.cell_end; si++) {
-            if (offsets[si] != NO_DATA) offsets[si] += global_offset;
+    std::vector<uint32_t> chunk_base(threads, 0);
+    for (unsigned t = 1; t < threads; t++) chunk_base[t] = chunk_base[t - 1] + chunks[t - 1].local_size;
+    parallel_for(threads, [&](size_t b, size_t e, unsigned) {
+        for (size_t t = b; t < e; t++) {
+            if (chunk_base[t] == 0) continue;
+            for (size_t si = chunks[t].cell_start; si < chunks[t].cell_end; si++)
+                if (offsets[si] != NO_DATA) offsets[si] += chunk_base[t];
         }
-        global_offset += chunk.local_size;
+    }, threads);
+
+    std::ofstream f(path, std::ios::binary);
+    for (auto& chunk : chunks) {
+        f.write(chunk.buf.data(), static_cast<std::streamsize>(chunk.buf.size()));
+        std::vector<char>().swap(chunk.buf);
     }
-
-    std::vector<char> buf;
-    buf.reserve(global_offset);
-    for (auto& chunk : chunks) buf.insert(buf.end(), chunk.buf.begin(), chunk.buf.end());
-
-    write_binary_file(path, buf.data(), buf.size());
+    f.flush();
+    if (!f) throw std::runtime_error("failed to write " + path);
     return offsets;
 }
 
