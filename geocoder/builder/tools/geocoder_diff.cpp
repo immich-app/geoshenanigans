@@ -33,6 +33,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "cell_id_diff.h"
 #include "merge_sequence.h"
 #include "patch_format.h"
 #include "record_match.h"
@@ -1250,7 +1251,6 @@ static int run(int argc, char* argv[]) {
     });
 
     // Group 6: cell changes
-    // Uses sorted vectors + set_difference instead of unordered_sets — much faster for 15M cells
     std::vector<uint64_t> g_added, g_removed, a_added, a_removed, p_added, p_removed, pl_added, pl_removed;
     std::thread t_cells([&]() {
         double gs = now_ms();
@@ -1258,13 +1258,9 @@ static int run(int argc, char* argv[]) {
                              size_t stride, std::vector<uint64_t>& added, std::vector<uint64_t>& removed) {
             auto old_m = mmap_file(old_path);
             auto new_m = mmap_file(new_path);
-            std::vector<uint64_t> old_ids(old_m.size / stride), new_ids(new_m.size / stride);
-            for (size_t i = 0; i < old_ids.size(); i++) memcpy(&old_ids[i], old_m.data+i*stride, 8);
-            for (size_t i = 0; i < new_ids.size(); i++) memcpy(&new_ids[i], new_m.data+i*stride, 8);
-            std::sort(old_ids.begin(), old_ids.end());
-            std::sort(new_ids.begin(), new_ids.end());
-            std::set_difference(new_ids.begin(), new_ids.end(), old_ids.begin(), old_ids.end(), std::back_inserter(added));
-            std::set_difference(old_ids.begin(), old_ids.end(), new_ids.begin(), new_ids.end(), std::back_inserter(removed));
+            auto d = diff_cell_ids(old_m.data, old_m.size / stride, new_m.data, new_m.size / stride, stride);
+            added = std::move(d.added);
+            removed = std::move(d.removed);
             unmap_file(old_m); unmap_file(new_m);
         };
         diff_cells(old_dir + "/geo_cells.bin", new_dir + "/geo_cells.bin", 20, g_added, g_removed);
