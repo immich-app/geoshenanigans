@@ -3549,6 +3549,8 @@ static int run(int argc, char* argv[]) {
                 static thread_local NodeThreadLocal* tl_node_data = nullptr;
                 std::vector<NodeThreadLocal> ntld(num_threads);
                 std::atomic<unsigned> next_tl{0};
+                auto _st = std::chrono::steady_clock::now();
+                auto _sc = CpuTicks::now();
 
                 pbf.read_nodes_streaming([&](int64_t id, double lat, double lng,
                     const uint32_t* tag_keys, const uint32_t* tag_vals, size_t ntags,
@@ -3784,6 +3786,7 @@ static int run(int argc, char* argv[]) {
 
                 // Reset thread_local for next use
                 tl_node_data = nullptr;
+                log_phase("    Pass 2: node streaming", _st, _sc);
 
                 // Merge address points
                 uint64_t total_addrs = 0;
@@ -3875,6 +3878,7 @@ static int run(int argc, char* argv[]) {
                           << " address points, " << total_poi_nodes
                           << " POI nodes, " << data.place_nodes.size()
                           << " place nodes collected." << std::endl;
+                log_phase("    Pass 2: node merge", _st, _sc);
             }
             log_phase("Pass 2: node processing", _pt, _cpu);
             // Nodes with ids past MAX_NODE_ID_DEFAULT were silently dropped
@@ -3956,6 +3960,8 @@ static int run(int argc, char* argv[]) {
                 static thread_local ThreadLocalData* tl_way_data = nullptr;
                 std::vector<ThreadLocalData> tld(num_threads);
                 std::atomic<unsigned> next_tl_way{0};
+                auto _st = std::chrono::steady_clock::now();
+                auto _sc = CpuTicks::now();
 
                 pbf.read_ways_streaming([&](int64_t way_id,
                     const int64_t* refs_data, size_t refs_size,
@@ -4248,6 +4254,7 @@ static int run(int argc, char* argv[]) {
                 // data into ParsedData.
                 index.release();
                 std::cerr << "Released node index." << std::endl;
+                log_phase("    Pass 2b: way streaming", _st, _sc);
 
                 // Process areas/multipolygons — sequential fallback path
                 // Merge thread-local way/interp data into main ParsedData
@@ -4420,6 +4427,8 @@ static int run(int argc, char* argv[]) {
                         std::cerr << "." << std::endl;
                     }
                 }
+
+                log_phase("    Pass 2b: way merge", _st, _sc);
 
                 // --- Parallel admin boundary assembly ---
                 {
