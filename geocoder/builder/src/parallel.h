@@ -319,6 +319,29 @@ void parallel_stream(Next&& next, Work&& work, unsigned threads = 0, size_t queu
     if (error) std::rethrow_exception(error);
 }
 
+// parallel_prefix_fill for output streamed out in order instead of held
+// whole: items [0, n) go back to back in slices of `slice` items. size(i)
+// gives item i's size; build(begin, end, offset, bytes) lays out the slice
+// [begin, end), whose items take `bytes` from `offset` on, and returns it;
+// consume(result) gets the slices in order, at most `window` built ahead of
+// it (0 = two per thread). Returns the total size.
+template <class Size, class Build, class Consume>
+size_t parallel_prefix_stream(size_t n, size_t slice, Size size, Build build, Consume consume,
+                              unsigned threads = 0, size_t window = 0) {
+    slice = std::max<size_t>(slice, 1);
+    const size_t slices = (n + slice - 1) / slice;
+    std::vector<size_t> offset(slices + 1, 0);
+    parallel_for(slices, [&](size_t b, size_t e, unsigned) {
+        for (size_t k = b; k < e; k++)
+            for (size_t i = k * slice, end = std::min(n, i + slice); i < end; i++) offset[k + 1] += size(i);
+    }, threads);
+    for (size_t k = 0; k < slices; k++) offset[k + 1] += offset[k];
+    parallel_ordered(slices, [&](size_t k) {
+        return build(k * slice, std::min(n, (k + 1) * slice), offset[k], offset[k + 1] - offset[k]);
+    }, [&](size_t, auto&& result) { consume(std::move(result)); }, threads, window);
+    return offset[slices];
+}
+
 // Follows a chain of records over [0, size), each record giving where the
 // next starts, in `stripes` stripes walked in parallel. walk(offset, stop,
 // out) appends the records from `offset` that start before `stop` and

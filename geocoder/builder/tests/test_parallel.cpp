@@ -517,6 +517,41 @@ TEST(parallel_prefix_fill_places_items_back_to_back_in_order) {
     }
 }
 
+TEST(parallel_prefix_stream_hands_over_slices_placed_back_to_back_in_order) {
+    std::mt19937 rng(23);
+    for (size_t n : {size_t(0), size_t(1), size_t(9), size_t(5000)}) {
+        std::vector<size_t> sizes(n);
+        for (auto& s : sizes) s = rng() % 4 == 0 ? 0 : rng() % 50;
+        std::vector<size_t> want(n);
+        size_t total = 0;
+        for (size_t i = 0; i < n; i++) { want[i] = total; total += sizes[i]; }
+        for (size_t slice : {size_t(1), size_t(7), size_t(64), size_t(10000)}) {
+            for (unsigned threads : {1u, 3u, 16u}) {
+                struct Slice { size_t begin, end, offset, bytes; std::vector<size_t> at; };
+                std::vector<size_t> got;
+                size_t next = 0, placed = 0;
+                bool contiguous = true;
+                size_t returned = parallel_prefix_stream(n, slice, [&](size_t i) { return sizes[i]; },
+                    [&](size_t begin, size_t end, size_t offset, size_t bytes) {
+                        Slice s{begin, end, offset, bytes, {}};
+                        for (size_t i = begin; i < end; i++, offset += sizes[i - 1]) s.at.push_back(offset);
+                        return s;
+                    },
+                    [&](Slice&& s) {
+                        contiguous = contiguous && s.begin == next && s.offset == placed;
+                        next = s.end;
+                        placed += s.bytes;
+                        got.insert(got.end(), s.at.begin(), s.at.end());
+                    }, threads);
+                CHECK(contiguous);
+                CHECK_EQ(returned, total);
+                CHECK_EQ(placed, total);
+                CHECK(got == want);
+            }
+        }
+    }
+}
+
 TEST(parallel_for_runs_covers_every_index_in_whole_runs) {
     std::mt19937 rng(11);
     std::vector<uint32_t> keys(5000);
