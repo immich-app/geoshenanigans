@@ -16,7 +16,9 @@
 # string tiers it loads, its own or borrowed from ../full. Measured vs
 # estimated GiB: planet/full 114.8 vs 122.5, planet/poi/all 24.6 vs 25.1,
 # planet/quality/q2.5 5.4 vs 9.7. The budget is 3/4 of the memory available at
-# start, or of the job's cgroup limit if lower. At most nproc jobs run at once.
+# start, or of the job's cgroup limit if lower. A variant holds its estimate
+# only while its diff runs: the patch + verify after it stream in about 10 MiB,
+# so they run alongside later diffs. At most nproc jobs run at once.
 #
 # Env: GEOCODER_DIFF, GEOCODER_PATCH (default: on PATH).
 set -uo pipefail
@@ -86,7 +88,9 @@ if [ -n "$cgroup_kib" ] && [ "$cgroup_kib" -lt "$budget_kib" ]; then budget_kib=
 budget_kib=$(( budget_kib * 3 / 4 ))
 max_jobs=$(nproc)
 
-run_variant() {
+# Diff stage: the memory-heavy half. Writes the result only when the variant
+# is done (SKIP or a diff failure); otherwise verify_variant takes over.
+diff_variant() {
   local variant=$1
   local new_dir="$new_root/$variant" old_dir="$old_root/$variant"
   local safe=${variant//\//_}
@@ -97,18 +101,26 @@ run_variant() {
     echo "SKIP" > "$result"
     return
   fi
+  if ! "$diff_bin" "$old_dir" "$new_dir" -o "$new_dir/patch.gcpatch" 2> "$log"; then
+    echo "FAIL 1 0 0" > "$result"
+    echo "geocoder-diff failed: $(tail -1 "$log")" > "$result.mismatches"
+  fi
+}
+
+# Verify stage: apply the patch to an isolated copy and compare. The patcher
+# streams (about 10 MiB), so this half holds no memory budget.
+verify_variant() {
+  local variant=$1
+  local new_dir="$new_root/$variant" old_dir="$old_root/$variant"
+  local safe=${variant//\//_}
+  local result="$results_dir/$safe" log="$log_dir/$safe.log"
+  [ -e "$result" ] && return
   local patch_file="$new_dir/patch.gcpatch" work
   work=$(mktemp -d "${TMPDIR:-/tmp}/verify-$safe-XXXXXX")
   # <work>/old/variant has no siblings: ../full and ../../full don't exist.
   local iso_dir="$work/old/variant" verify_dir="$work/new"
   mkdir -p "$work/old" "$verify_dir"
   "$link" "$old_dir" "$iso_dir"
-  if ! "$diff_bin" "$old_dir" "$new_dir" -o "$patch_file" 2> "$log"; then
-    echo "FAIL 1 0 0" > "$result"
-    echo "geocoder-diff failed: $(tail -1 "$log")" > "$result.mismatches"
-    rm -rf "$work"
-    return
-  fi
   local kib=$(( $(stat -c%s "$patch_file") / 1024 ))
   if ! "$patch_bin" "$iso_dir" "$patch_file" -o "$verify_dir/" 2>> "$log"; then
     echo "FAIL 1 0 $kib" > "$result"
@@ -136,27 +148,44 @@ for variant in $(cd "$new_root" && find . -name '*.bin' -printf '%h\n' | sed 's|
   weight[$variant]=$(( $(side_weight_kib "$old_root/$variant") + $(side_weight_kib "$new_root/$variant") ))
 done
 
-declare -A running=()
+# running: pid -> memory weight held (verifies hold none); stage/name: what it
+# runs. A diff that ends queues its variant's verify.
+pending=($(for v in "${!weight[@]}"; do echo "${weight[$v]} $v"; done | sort -rn | awk '{print $2}'))
+next=0
+verifies=()
+declare -A running=() stage=() name=()
 running_kib=0
-for variant in $(for v in "${!weight[@]}"; do echo "${weight[$v]} $v"; done | sort -rn | awk '{print $2}'); do
-  w=${weight[$variant]}
-  while [ ${#running[@]} -gt 0 ] && { [ $((running_kib + w)) -gt "$budget_kib" ] || [ ${#running[@]} -ge "$max_jobs" ]; }; do
-    # Only tracked jobs: bash 5.3's bare wait -n also returns process substitutions.
-    finished=""
-    wait -n -p finished "${!running[@]}" || true
-    if [ -z "${finished:-}" ] || [ -z "${running[$finished]+x}" ]; then
-      # Cannot tell which job ended: drain them all rather than launch
-      # past the memory budget.
-      wait "${!running[@]}"
-      running=()
-      running_kib=0
-      break
-    fi
-    running_kib=$((running_kib - running[$finished]))
-    unset "running[$finished]"
+while [ $next -lt ${#pending[@]} ] || [ ${#verifies[@]} -gt 0 ] || [ ${#running[@]} -gt 0 ]; do
+  while [ ${#verifies[@]} -gt 0 ] && [ ${#running[@]} -lt "$max_jobs" ]; do
+    verify_variant "${verifies[0]}" &
+    running[$!]=0; stage[$!]=verify; name[$!]=${verifies[0]}
+    verifies=("${verifies[@]:1}")
   done
-  run_variant "$variant" &
-  running[$!]=$w
-  running_kib=$((running_kib + w))
+  while [ $next -lt ${#pending[@]} ] && [ ${#running[@]} -lt "$max_jobs" ]; do
+    variant=${pending[$next]}
+    w=${weight[$variant]}
+    # A diff bigger than the whole budget still runs, alone.
+    [ ${#running[@]} -gt 0 ] && [ $((running_kib + w)) -gt "$budget_kib" ] && break
+    diff_variant "$variant" &
+    running[$!]=$w; stage[$!]=diff; name[$!]=$variant
+    running_kib=$((running_kib + w))
+    next=$((next + 1))
+  done
+  # Only tracked jobs: bash 5.3's bare wait -n also returns process substitutions.
+  finished=""
+  wait -n -p finished "${!running[@]}" || true
+  if [ -z "${finished:-}" ] || [ -z "${running[$finished]+x}" ]; then
+    # Cannot tell which job ended: drain them all rather than launch past
+    # the memory budget.
+    wait "${!running[@]}"
+    for pid in "${!running[@]}"; do
+      [ "${stage[$pid]}" = diff ] && verifies+=("${name[$pid]}")
+    done
+    running=(); stage=(); name=()
+    running_kib=0
+    continue
+  fi
+  running_kib=$((running_kib - running[$finished]))
+  [ "${stage[$finished]}" = diff ] && verifies+=("${name[$finished]}")
+  unset "running[$finished]" "stage[$finished]" "name[$finished]"
 done
-wait
