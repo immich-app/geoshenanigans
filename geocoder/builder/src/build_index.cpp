@@ -698,17 +698,36 @@ static void gather_nearby_named_streets(const ParsedData& data, S2CellId center,
     // street, tight enough to avoid quadratic blow-up.
     auto& cells_to_check = nearby.cells;
     cells_to_check.clear();
-    cells_to_check.push_back(center.id());
-    auto& ring1 = nearby.ring1;
-    auto& ring2 = nearby.ring2;
-    ring1.clear();
-    center.AppendAllNeighbors(kStreetCellLevel, &ring1);
-    for (const auto& n : ring1) {
-        cells_to_check.push_back(n.id());
-        ring2.clear();
-        n.AppendAllNeighbors(kStreetCellLevel, &ring2);
-        for (const auto& n2 : ring2) {
-            cells_to_check.push_back(n2.id());
+    // Two or more cells in from every cube-face edge, the neighbours of the
+    // neighbours are exactly the same-face block (i, j) +- 2 cells; build it
+    // directly. Nearer an edge they wrap onto other faces: expand through S2.
+    int ci, cj;
+    int face = center.ToFaceIJOrientation(&ci, &cj, nullptr);
+    int size = center.GetSizeIJ();
+    ci &= -size;
+    cj &= -size;
+    int64_t reach = 2 * int64_t(size);
+    if (ci - reach >= 0 && ci + reach < S2CellId::kMaxSize &&
+        cj - reach >= 0 && cj + reach < S2CellId::kMaxSize) {
+        for (int a = -2; a <= 2; a++) {
+            for (int b = -2; b <= 2; b++) {
+                cells_to_check.push_back(S2CellId::FromFaceIJ(face, ci + a * size, cj + b * size)
+                                             .parent(kStreetCellLevel).id());
+            }
+        }
+    } else {
+        cells_to_check.push_back(center.id());
+        auto& ring1 = nearby.ring1;
+        auto& ring2 = nearby.ring2;
+        ring1.clear();
+        center.AppendAllNeighbors(kStreetCellLevel, &ring1);
+        for (const auto& n : ring1) {
+            cells_to_check.push_back(n.id());
+            ring2.clear();
+            n.AppendAllNeighbors(kStreetCellLevel, &ring2);
+            for (const auto& n2 : ring2) {
+                cells_to_check.push_back(n2.id());
+            }
         }
     }
     // De-duplicate expansion.
