@@ -62,6 +62,16 @@ TEST(parallel_for_rethrows_a_worker_exception) {
     CHECK(thrown);
 }
 
+TEST(parallel_find_all_lists_matches_in_order_for_any_thread_count) {
+    for (size_t n : {size_t(0), size_t(1), size_t(7), size_t(100000)}) {
+        auto pred = [](size_t i) { return (i * 2654435761u) % 7 < 2; };
+        std::vector<size_t> expect;
+        for (size_t i = 0; i < n; i++)
+            if (pred(i)) expect.push_back(i);
+        for (unsigned threads : {1u, 3u, 64u}) CHECK(parallel_find_all(n, pred, threads) == expect);
+    }
+}
+
 TEST(parallel_sort_matches_std_sort_for_any_thread_count) {
     auto input = new_recs(1 << 20, 5000, 7);
     auto expect = input;

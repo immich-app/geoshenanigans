@@ -45,6 +45,21 @@ void parallel_for(size_t n, Fn&& fn, unsigned threads = 0) {
         if (e) std::rethrow_exception(e);
 }
 
+// The indices i in [0, n) where pred(i) holds, ascending, tested on every
+// core.
+template <class Pred>
+std::vector<size_t> parallel_find_all(size_t n, Pred pred, unsigned threads = 0) {
+    if (threads == 0) threads = parallel_threads();
+    std::vector<std::vector<size_t>> found(std::max<size_t>(1, std::min<size_t>(threads, n)));
+    parallel_for(n, [&](size_t b, size_t e, unsigned w) {
+        for (size_t i = b; i < e; i++)
+            if (pred(i)) found[w].push_back(i);
+    }, threads);
+    std::vector<size_t> out;
+    for (const auto& f : found) out.insert(out.end(), f.begin(), f.end());
+    return out;
+}
+
 // Sorts [first, last) by cmp on every core (sample sort: sort chunks, cut
 // them at shared splitters, merge each slice). The sorted sequence is the
 // one std::sort gives whenever it is unique: cmp a strict total order, or

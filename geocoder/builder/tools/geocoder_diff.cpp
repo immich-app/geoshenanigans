@@ -1762,12 +1762,14 @@ static int run(int argc, char* argv[]) {
             last_change_pos = pos;
         };
 
+        // The changed positions are found on every core (planet addr_postcodes:
+        // 179M string remap lookups), then emitted in order.
         if (remap_kind == 3) {
             // 16-byte postcode_centroid: str_remap on bytes 8-11 (postcode_id),
             // raw compare on bytes 0-7 (lat/lng) and 12-15 (cc + pad).
-            for (size_t pos = 0; pos < new_n; pos++) {
+            auto changed = [&](size_t pos) {
                 const char* np = new_m.data + pos * 16;
-                if (pos >= old_n) { emit_change((uint32_t)pos, np); continue; }
+                if (pos >= old_n) return true;
                 const char* op = old_m.data + pos * 16;
                 bool d = (memcmp(op, np, 8) != 0) || (memcmp(op + 12, np + 12, 4) != 0);
                 if (!d) {
@@ -1778,29 +1780,29 @@ static int run(int argc, char* argv[]) {
                     }
                     d = (old_pid != new_pid);
                 }
-                if (d) emit_change((uint32_t)pos, np);
-            }
+                return d;
+            };
+            for (size_t pos : parallel_find_all(new_n, changed)) emit_change((uint32_t)pos, new_m.data + pos * 16);
         } else {
             // 4-byte uint32 array with optional remap on the value.
-            for (size_t pos = 0; pos < new_n; pos++) {
+            auto changed = [&](size_t pos) {
                 uint32_t new_val; memcpy(&new_val, new_m.data + pos * 4, 4);
-                bool d = false;
-                if (pos >= old_n) {
-                    d = true;
-                } else {
-                    uint32_t old_val; memcpy(&old_val, old_m.data + pos * 4, 4);
-                    uint32_t remapped = old_val;
-                    if (old_val != NO_DATA) {
-                        if (remap_kind == 1 && old_val < res_admin_p.id_remap.size()) {
-                            uint32_t r = res_admin_p.id_remap[old_val];
-                            if (r != NO_DATA) remapped = r;
-                        } else if (remap_kind == 2) {
-                            remapped = str_remap.map(old_val);
-                        }
+                if (pos >= old_n) return true;
+                uint32_t old_val; memcpy(&old_val, old_m.data + pos * 4, 4);
+                uint32_t remapped = old_val;
+                if (old_val != NO_DATA) {
+                    if (remap_kind == 1 && old_val < res_admin_p.id_remap.size()) {
+                        uint32_t r = res_admin_p.id_remap[old_val];
+                        if (r != NO_DATA) remapped = r;
+                    } else if (remap_kind == 2) {
+                        remapped = str_remap.map(old_val);
                     }
-                    d = (remapped != new_val);
                 }
-                if (d) emit_change((uint32_t)pos, reinterpret_cast<const char*>(&new_val));
+                return remapped != new_val;
+            };
+            for (size_t pos : parallel_find_all(new_n, changed)) {
+                uint32_t new_val; memcpy(&new_val, new_m.data + pos * 4, 4);
+                emit_change((uint32_t)pos, reinterpret_cast<const char*>(&new_val));
             }
         }
 
