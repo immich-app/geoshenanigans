@@ -775,7 +775,8 @@ inline void deduplicate(Map& cell_map, unsigned threads = 0) {
 // (cell_id, item_id) pairs for items that each sit in one cell, cells[item],
 // ordered by cell, then item.
 inline std::vector<CellItemPair> sorted_item_cells(const std::vector<uint64_t>& cells, unsigned threads = 0) {
-    std::vector<CellItemPair> pairs(cells.size());
+    std::vector<CellItemPair> pairs;
+    parallel_resize(pairs, cells.size());
     parallel_for(cells.size(), [&](size_t b, size_t e, unsigned) {
         for (size_t i = b; i < e; i++) pairs[i] = {cells[i], static_cast<uint32_t>(i)};
     }, threads);

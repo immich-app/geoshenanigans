@@ -588,7 +588,8 @@ std::vector<uint32_t> costliest_first(size_t n, Cost cost, unsigned threads = 0)
         float cost;
         uint32_t index;
     };
-    std::vector<Item> items(n);
+    std::vector<Item> items;
+    parallel_resize(items, n);
     parallel_for(n, [&](size_t b, size_t e, unsigned) {
         for (size_t i = b; i < e; i++) {
             float c = static_cast<float>(cost(i));
@@ -598,7 +599,8 @@ std::vector<uint32_t> costliest_first(size_t n, Cost cost, unsigned threads = 0)
     parallel_sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
         return a.cost != b.cost ? a.cost > b.cost : a.index < b.index;
     }, threads);
-    std::vector<uint32_t> order(n);
+    std::vector<uint32_t> order;
+    parallel_resize(order, n);
     parallel_for(n, [&](size_t b, size_t e, unsigned) {
         for (size_t k = b; k < e; k++) order[k] = items[k].index;
     }, threads);
@@ -626,7 +628,10 @@ size_t parallel_blocks(size_t n, Fn&& fn, unsigned threads = 0) {
 template <class T, class SizeOf>
 std::vector<T> parallel_offsets(size_t n, SizeOf size_of, unsigned threads = 0, std::vector<T> out = {}) {
     if (threads == 0) threads = parallel_threads();
-    if (out.size() != n + 1) out.assign(n + 1, T(0));
+    if (out.size() != n + 1) {
+        out.clear();
+        parallel_resize(out, n + 1);
+    }
     std::vector<T> block_base(threads + 1, T(0));
     size_t blocks = parallel_blocks(n, [&](size_t b, size_t begin, size_t end) {
         T sum = 0;
@@ -657,7 +662,8 @@ std::vector<T> parallel_collect(size_t n, Emit emit, unsigned threads = 0) {
     }, threads);
     std::vector<size_t> at(blocks + 1, 0);
     for (size_t b = 0; b < blocks; b++) at[b + 1] = at[b] + parts[b].size();
-    std::vector<T> out(at[blocks]);
+    std::vector<T> out;
+    parallel_resize(out, at[blocks]);
     parallel_for(blocks, [&](size_t b0, size_t b1, unsigned) {
         for (size_t b = b0; b < b1; b++) {
             std::move(parts[b].begin(), parts[b].end(), out.begin() + at[b]);
@@ -732,7 +738,8 @@ struct SortedIndices {
 // checking neighbours covers every tied pair.
 template <class Less, class TieMatters>
 SortedIndices parallel_sort_indices(size_t n, Less less, TieMatters tie_matters, unsigned threads = 0) {
-    std::vector<uint32_t> order(n);
+    std::vector<uint32_t> order;
+    parallel_resize(order, n);
     parallel_for(n, [&](size_t b, size_t e, unsigned) {
         for (size_t i = b; i < e; i++) order[i] = static_cast<uint32_t>(i);
     }, threads);
@@ -752,7 +759,8 @@ SortedIndices parallel_sort_indices(size_t n, Less less, TieMatters tie_matters,
 template <class KeyOf, class KeyLess, class TieMatters>
 SortedIndices parallel_sort_keys(size_t n, KeyOf key_of, KeyLess key_less, TieMatters tie_matters,
                                  unsigned threads = 0) {
-    std::vector<decltype(key_of(size_t(0)))> keys(n);
+    std::vector<decltype(key_of(size_t(0)))> keys;
+    parallel_resize(keys, n);
     auto fill = [&] {
         parallel_for(n, [&](size_t b, size_t e, unsigned) {
             for (size_t i = b; i < e; i++) keys[i] = key_of(i);
@@ -767,7 +775,8 @@ SortedIndices parallel_sort_keys(size_t n, KeyOf key_of, KeyLess key_less, TieMa
         fill();
         std::sort(keys.begin(), keys.end(), key_less);
     }
-    std::vector<uint32_t> order(n);
+    std::vector<uint32_t> order;
+    parallel_resize(order, n);
     parallel_for(n, [&](size_t b, size_t e, unsigned) {
         for (size_t i = b; i < e; i++) order[i] = keys[i].index;
     }, threads);

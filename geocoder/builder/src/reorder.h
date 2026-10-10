@@ -53,7 +53,8 @@ inline size_t run_end(const std::vector<uint32_t>& starts, size_t k, size_t n) {
 // positions [starts[k], starts[k + 1])) becomes record k.
 inline std::vector<uint32_t> renumber_runs(const std::vector<uint32_t>& order,
                                            const std::vector<uint32_t>& starts, unsigned threads) {
-    std::vector<uint32_t> old_to_new(order.size());
+    std::vector<uint32_t> old_to_new;
+    parallel_resize(old_to_new, order.size());
     parallel_for(starts.size(), [&](size_t b, size_t e, unsigned) {
         for (size_t k = b; k < e; k++)
             for (size_t i = starts[k], end = run_end(starts, k, order.size()); i < end; i++)
@@ -70,7 +71,10 @@ template <class T>
 std::vector<T> first_set_per_run(const std::vector<T>& values, const std::vector<uint32_t>& order,
                                  const std::vector<uint32_t>& starts, T none, unsigned threads,
                                  std::vector<T> out = {}) {
-    if (out.size() != starts.size()) out.assign(starts.size(), none);
+    if (out.size() != starts.size()) {
+        out.clear();
+        parallel_resize(out, starts.size(), none);
+    }
     parallel_for(starts.size(), [&](size_t b, size_t e, unsigned) {
         for (size_t k = b; k < e; k++) {
             out[k] = none;
@@ -115,7 +119,10 @@ template <class T, class Count, class From>
 Repacked<T> repack(size_t n, const std::vector<T>& src, Count count, From from, unsigned threads,
                    std::vector<size_t> at = {}, std::vector<T> items = {}) {
     Repacked<T> out{std::move(items), parallel_offsets<size_t>(n, count, threads, std::move(at))};
-    if (out.items.size() < out.at[n]) out.items.assign(out.at[n], T{});
+    if (out.items.size() < out.at[n]) {
+        out.items.clear();
+        parallel_resize(out.items, out.at[n]);
+    }
     out.items.resize(out.at[n]);
     parallel_for(n, [&](size_t b, size_t e, unsigned) {
         for (size_t i = b; i < e; i++)
@@ -127,7 +134,8 @@ Repacked<T> repack(size_t n, const std::vector<T>& src, Count count, From from, 
 // values[order[i]] for every i.
 template <class T>
 std::vector<T> gather(const std::vector<T>& values, const std::vector<uint32_t>& order, unsigned threads) {
-    std::vector<T> out(order.size());
+    std::vector<T> out;
+    parallel_resize(out, order.size());
     parallel_for(order.size(), [&](size_t b, size_t e, unsigned) {
         for (size_t i = b; i < e; i++) out[i] = values[order[i]];
     }, threads);
@@ -136,7 +144,8 @@ std::vector<T> gather(const std::vector<T>& values, const std::vector<uint32_t>&
 
 // old_to_new for a permutation: order[i] becomes i.
 inline std::vector<uint32_t> invert(const std::vector<uint32_t>& order, unsigned threads) {
-    std::vector<uint32_t> old_to_new(order.size());
+    std::vector<uint32_t> old_to_new;
+    parallel_resize(old_to_new, order.size());
     parallel_for(order.size(), [&](size_t b, size_t e, unsigned) {
         for (size_t i = b; i < e; i++) old_to_new[order[i]] = static_cast<uint32_t>(i);
     }, threads);
@@ -406,7 +415,8 @@ inline void reorder_ways(ParsedData& data, unsigned threads = 0) {
     // values overwriting.
     auto remap_way_vec = [&](std::vector<uint32_t>& vec) {
         if (vec.size() != n) return;
-        std::vector<uint32_t> nv(kept, NO_DATA);
+        std::vector<uint32_t> nv;
+        parallel_resize(nv, kept, NO_DATA);
         parallel_for(kept, [&](size_t b, size_t e, unsigned) {
             for (size_t k = b; k < e; k++) {
                 uint32_t last = 0;
@@ -526,9 +536,12 @@ inline void reorder_interps(ParsedData& data, unsigned threads = 0) {
     Repacked<NodeCoord> repacked = repack(kept, nodes,
         [&](size_t k) { return size_t(interps[order[starts[k]]].node_count); },
         [&](size_t k) { return interps[order[starts[k]]].node_offset; }, threads);
-    std::vector<InterpWay> new_interps(kept);
-    std::vector<uint64_t> new_osm(have_interp_osm ? kept : 0);
-    std::vector<uint32_t> new_pc(have_interp_pc ? kept : 0);
+    std::vector<InterpWay> new_interps;
+    std::vector<uint64_t> new_osm;
+    std::vector<uint32_t> new_pc;
+    parallel_resize(new_interps, kept);
+    parallel_resize(new_osm, have_interp_osm ? kept : 0);
+    parallel_resize(new_pc, have_interp_pc ? kept : 0);
     parallel_for(kept, [&](size_t b, size_t e, unsigned) {
         for (size_t k = b; k < e; k++) {
             uint32_t oi = order[starts[k]];

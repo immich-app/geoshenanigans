@@ -22,13 +22,15 @@ std::vector<uint32_t> copy_subset(const std::vector<uint32_t>& ids,
                                          const std::vector<NodeCoord>& full_coords,
                                          Keep keep, CoordsOf coords_of, Rebase rebase,
                                          std::vector<Record>& records, std::vector<NodeCoord>& coords) {
-    std::vector<char> kept(ids.size());
+    std::vector<char> kept;
+    parallel_resize(kept, ids.size());
     parallel_for(ids.size(), [&](size_t begin, size_t end, unsigned) {
         for (size_t k = begin; k < end; k++) kept[k] = keep(ids[k]) ? 1 : 0;
     });
-    std::vector<uint32_t> remap(full_records.size(), NO_DATA);
+    std::vector<uint32_t> remap;
+    parallel_resize(remap, full_records.size(), NO_DATA);
     parallel_prefix_fill(ids.size(), [&](size_t k) -> size_t { return kept[k]; },
-        [&](size_t total) { records.resize(total); },
+        [&](size_t total) { parallel_resize(records, total); },
         [&](size_t k, size_t slot) -> size_t {
             if (!kept[k]) return 0;
             records[slot] = full_records[ids[k]];
@@ -36,7 +38,7 @@ std::vector<uint32_t> copy_subset(const std::vector<uint32_t>& ids,
             return 1;
         });
     parallel_prefix_fill(ids.size(), [&](size_t k) -> size_t { return kept[k] ? coords_of(ids[k]).count : 0; },
-        [&](size_t total) { coords.resize(total); },
+        [&](size_t total) { parallel_resize(coords, total); },
         [&](size_t k, size_t offset) -> size_t {
             if (!kept[k]) return 0;
             CoordRun run = coords_of(ids[k]);
@@ -52,7 +54,8 @@ std::vector<uint32_t> copy_subset(const std::vector<uint32_t>& ids,
 template <class Id>
 std::vector<Id> subset_osm_ids(const std::vector<uint32_t>& ids, const std::vector<uint32_t>& remap,
                                       size_t subset_size, const std::vector<Id>& full_osm_ids) {
-    std::vector<Id> out(subset_size);
+    std::vector<Id> out;
+    parallel_resize(out, subset_size);
     parallel_for(ids.size(), [&](size_t begin, size_t end, unsigned) {
         for (size_t k = begin; k < end; k++) {
             uint32_t slot = remap[ids[k]];

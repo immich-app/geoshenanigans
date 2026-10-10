@@ -187,8 +187,10 @@ public:
                    prev.end());
 
         constexpr uint32_t kUnmatched = TOMBSTONE_IDX;
-        std::vector<uint32_t> out(n, kUnmatched);
-        std::vector<char> claimed(prev.size(), 0);
+        std::vector<uint32_t> out;
+        std::vector<char> claimed;
+        parallel_resize(out, n, kUnmatched);
+        parallel_resize(claimed, prev.size());
         {
             // The first record of each key (lowest index) takes the slot.
             // Passes go in index order, so a key an earlier pass claimed

@@ -34,7 +34,8 @@ inline void remap_index_flagged(uint32_t& v, const std::vector<uint32_t>& remap)
 // value lands in hold `fill`. remap is injective (strategy-2 slots).
 template <class T>
 void reorder_by_remap(std::vector<T>& values, const std::vector<uint32_t>& remap, size_t n_new, const T& fill) {
-    std::vector<T> out(n_new, fill);
+    std::vector<T> out;
+    parallel_resize(out, n_new, fill);
     parallel_for(std::min(values.size(), remap.size()), [&](size_t begin, size_t end, unsigned) {
         for (size_t i = begin; i < end; i++) out[remap[i]] = values[i];
     });
@@ -53,7 +54,7 @@ void repack_nodes(std::vector<Record>& records, std::vector<NodeCoord>& nodes) {
     std::vector<NodeCoord> packed;
     parallel_prefix_fill(records.size(),
         [&](size_t k) -> size_t { return in_range(records[k]) ? records[k].node_count : 0; },
-        [&](size_t total) { packed.resize(total); },
+        [&](size_t total) { parallel_resize(packed, total); },
         [&](size_t k, size_t offset) -> size_t {
             Record& r = records[k];
             if (r.node_count == 0) return 0;
