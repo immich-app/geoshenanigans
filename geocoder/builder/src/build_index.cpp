@@ -2301,6 +2301,21 @@ static std::vector<size_t> local_offsets(const Locals& locals, SizeOf size_of) {
     return at;
 }
 
+// Appends each parse thread's buffer(local) to `out` in thread order, freeing
+// each once copied. A plain copy runs at memory speed on one core, about as
+// fast as growing `out` for a parallel one, and never holds both in full.
+template <class T, class Locals, class Buffer>
+static void append_locals(std::vector<T>& out, Locals& locals, Buffer buffer) {
+    size_t n = 0;
+    for (auto& local : locals) n += buffer(local).size();
+    reserve_for(out, n);
+    for (auto& local : locals) {
+        auto& b = buffer(local);
+        out.insert(out.end(), b.begin(), b.end());
+        free_storage(b);
+    }
+}
+
 static int run(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [options]" << std::endl;
@@ -3673,7 +3688,6 @@ static int run(int argc, char* argv[]) {
                 // Process areas/multipolygons — sequential fallback path
                 // Merge thread-local way/interp data into main ParsedData
                 std::cerr << "  Merging thread-local data..." << std::endl;
-                uint64_t total_ways = 0, total_building_addrs = 0, total_interps = 0;
                 auto to_geometry = [](const ThreadLocalData::WayGeomEntry& wg) {
                     ParsedData::WayGeometry g;
                     g.coords.reserve(wg.locs.size());
@@ -3716,54 +3730,108 @@ static int run(int argc, char* argv[]) {
                     }
                 }, data.string_pool);
                 log_phase("      Way merge: strings", _mt, _mc);
-                for (size_t k = 0; k < tld.size(); k++) {
-                    auto& local = tld[k];
-                    const DictIds& name_id = name_ids[k];
-                    uint32_t way_base = static_cast<uint32_t>(data.ways.size());
-                    uint32_t node_base = static_cast<uint32_t>(data.street_nodes.size());
-                    uint32_t interp_base = static_cast<uint32_t>(data.interp_ways.size());
-                    uint32_t interp_node_base = static_cast<uint32_t>(data.interp_nodes.size());
+                parallel_for_each(tld.size(), [&](size_t k, unsigned) { free_storage(tld[k].strings); });
+                uint64_t total_ways = 0, total_building_addrs = 0, total_interps = 0;
+                for (const auto& local : tld) {
+                    total_ways += local.way_count;
+                    total_building_addrs += local.building_addr_count;
+                    total_interps += local.interp_count;
+                }
 
-                    // Merge street ways
-                    for (size_t i = 0; i < local.ways.size(); i++) {
+                // Each thread's buffers are freed as soon as they are merged
+                // rather than when tld goes out of scope after admin assembly:
+                // they hold tens of GiB on planet. Closed-way admins are
+                // merged below.
+
+                // Merge street ways
+                const auto way_at = local_offsets(tld, [](const auto& l) { return l.ways.size(); });
+                const auto node_at = local_offsets(tld, [](const auto& l) { return l.street_nodes.size(); });
+                const size_t way_base = grow_by(data.ways, way_at.back());
+                const size_t way_osm_base = grow_by(data.way_osm_ids, way_at.back());
+                const size_t way_orig_base = grow_by(data.way_orig_name_ids, way_at.back());
+                const size_t node_base = data.street_nodes.size();
+                parallel_for_parts(way_at, kMergeGrain, [&](size_t k, size_t begin, size_t end, size_t at) {
+                    const auto& local = tld[k];
+                    const auto& name_id = name_ids[k];
+                    const uint32_t node_offset = static_cast<uint32_t>(node_base + node_at[k]);
+                    for (size_t i = begin; i < end; i++, at++) {
                         auto h = local.ways[i];
-                        h.node_offset += node_base;
+                        h.node_offset += node_offset;
                         h.name_id = name_id(local.way_strings[i]);
-                        data.ways.push_back(h);
-                        data.way_osm_ids.push_back(i < local.way_osm_ids.size() ? local.way_osm_ids[i] : 0);
+                        data.ways[way_base + at] = h;
+                        data.way_osm_ids[way_osm_base + at] = i < local.way_osm_ids.size() ? local.way_osm_ids[i] : 0;
                         // Store original name for token matching
-                        data.way_orig_name_ids.push_back(name_id(local.way_orig_names[i]));
+                        data.way_orig_name_ids[way_orig_base + at] = name_id(local.way_orig_names[i]);
                     }
-                    data.street_nodes.insert(data.street_nodes.end(),
-                        local.street_nodes.begin(), local.street_nodes.end());
+                });
 
-                    // Remap deferred ways
-                    for (auto dw : local.deferred_ways) {
-                        dw.way_id += way_base;
-                        dw.node_offset += node_base;
-                        data.deferred_ways.push_back(dw);
+                // Remap deferred ways
+                const auto deferred_at = local_offsets(tld, [](const auto& l) { return l.deferred_ways.size(); });
+                const size_t deferred_base = grow_by(data.deferred_ways, deferred_at.back());
+                parallel_for_parts(deferred_at, kMergeGrain, [&](size_t k, size_t begin, size_t end, size_t at) {
+                    const auto& local = tld[k];
+                    const uint32_t way_offset = static_cast<uint32_t>(way_base + way_at[k]);
+                    const uint32_t node_offset = static_cast<uint32_t>(node_base + node_at[k]);
+                    for (size_t i = begin; i < end; i++, at++) {
+                        auto dw = local.deferred_ways[i];
+                        dw.way_id += way_offset;
+                        dw.node_offset += node_offset;
+                        data.deferred_ways[deferred_base + at] = dw;
                     }
+                });
+                parallel_for_each(tld.size(), [&](size_t k, unsigned) {
+                    auto& local = tld[k];
+                    free_storage(local.ways);
+                    free_storage(local.way_osm_ids);
+                    free_storage(local.way_strings);
+                    free_storage(local.way_orig_names);
+                    free_storage(local.deferred_ways);
+                });
+                append_locals(data.street_nodes, tld, [](auto& l) -> auto& { return l.street_nodes; });
+                log_phase("      Way merge: street ways", _mt, _mc);
 
-                    // Merge building addresses
-                    for (size_t i = 0; i < local.building_addrs.size(); i++) {
-                        uint32_t street_id = name_id(local.addr_strings[i].second);
-                        uint32_t housenumber_id = name_id(local.addr_strings[i].first);
-                        uint32_t postcode_id = name_id(local.addr_postcodes[i]);
+                // Merge building addresses. A thread's building polygons sit
+                // back to back in point order, as they do in addr_vertices.
+                const auto bldg_at = local_offsets(tld, [](const auto& l) { return l.building_addrs.size(); });
+                const auto bldg_vert_at = local_offsets(tld, [](const auto& l) { return l.building_addr_poly_verts.size(); });
+                const size_t bldg_base = grow_addr_points(data, bldg_at.back());
+                const size_t bldg_vert_base = data.addr_vertices.size();
+                parallel_for_parts(bldg_at, kMergeGrain, [&](size_t k, size_t begin, size_t end, size_t at) {
+                    const auto& local = tld[k];
+                    const auto& name_id = name_ids[k];
+                    for (size_t i = begin; i < end; i++, at++) {
                         uint32_t poly_off = local.building_addr_poly_off[i];
                         uint32_t poly_cnt = local.building_addr_poly_cnt[i];
-                        const NodeCoord* poly_verts = (poly_cnt > 0 && poly_off != NO_DATA)
-                            ? &local.building_addr_poly_verts[poly_off]
-                            : nullptr;
+                        bool has_poly = poly_cnt > 0 && poly_off != NO_DATA;
                         int64_t bldg_way_id = i < local.building_addr_osm_way_ids.size()
                             ? local.building_addr_osm_way_ids[i] : 0;
-                        append_addr_point(data, local.building_addrs[i].lat, local.building_addrs[i].lng,
-                                          housenumber_id, street_id, postcode_id,
-                                          S2CellId(local.building_addr_cells[i]),
-                                          pack_osm_id(gc::id_alloc::ObjectType::OSM_WAY, bldg_way_id),
-                                          poly_verts, poly_cnt);
+                        put_addr_point(data, bldg_base + at, local.building_addrs[i].lat, local.building_addrs[i].lng,
+                                       name_id(local.addr_strings[i].first), name_id(local.addr_strings[i].second),
+                                       name_id(local.addr_postcodes[i]), local.building_addr_cells[i],
+                                       pack_osm_id(gc::id_alloc::ObjectType::OSM_WAY, bldg_way_id),
+                                       has_poly ? static_cast<uint32_t>(bldg_vert_base + bldg_vert_at[k] + poly_off) : NO_DATA,
+                                       has_poly ? poly_cnt : 0);
                     }
+                });
+                parallel_for_each(tld.size(), [&](size_t k, unsigned) {
+                    auto& local = tld[k];
+                    free_storage(local.building_addrs);
+                    free_storage(local.building_addr_cells);
+                    free_storage(local.building_addr_poly_off);
+                    free_storage(local.building_addr_poly_cnt);
+                    free_storage(local.building_addr_osm_way_ids);
+                    free_storage(local.addr_strings);
+                    free_storage(local.addr_postcodes);
+                });
+                append_locals(data.addr_vertices, tld, [](auto& l) -> auto& { return l.building_addr_poly_verts; });
+                log_phase("      Way merge: building addresses", _mt, _mc);
 
-                    // Merge interpolation ways
+                // Merge interpolation ways
+                for (size_t k = 0; k < tld.size(); k++) {
+                    auto& local = tld[k];
+                    const auto& name_id = name_ids[k];
+                    uint32_t interp_base = static_cast<uint32_t>(data.interp_ways.size());
+                    uint32_t interp_node_base = static_cast<uint32_t>(data.interp_nodes.size());
                     for (size_t i = 0; i < local.interp_ways.size(); i++) {
                         auto iw = local.interp_ways[i];
                         iw.node_offset += interp_node_base;
@@ -3783,51 +3851,75 @@ static int run(int argc, char* argv[]) {
                         di.node_offset += interp_node_base;
                         data.deferred_interps.push_back(di);
                     }
+                }
 
-                    total_ways += local.way_count;
-                    total_building_addrs += local.building_addr_count;
-                    total_interps += local.interp_count;
-
-                    // Merge way geometries for admin assembly
-                    {
-                        for (auto& wg : local.way_geoms)
-                            data.way_geometries[wg.way_id] = to_geometry(wg);
-                        local.way_geoms.clear();
-                        local.way_geoms.shrink_to_fit();
-                    }
-
-                    // Merge POI way geometries for relation assembly
-                    for (auto& wg : local.poi_way_geoms) {
-                        // Store in way_geometries (shared with admin — no conflict since IDs differ)
-                        if (data.way_geometries.find(wg.way_id) == data.way_geometries.end())
-                            data.way_geometries[wg.way_id] = to_geometry(wg);
-                    }
-                    local.poi_way_geoms.clear();
-                    local.poi_way_geoms.shrink_to_fit();
-
-                    // Merge POI ways (closed way polygons)
+                // Merge POI ways (closed way polygons), a thread to a worker.
+                const auto poi_way_at = local_offsets(tld, [](const auto& l) { return l.poi_ways.size(); });
+                const auto poi_vert_at = local_offsets(tld, [](const auto& l) {
+                    size_t n = 0;
+                    for (const auto& pw : l.poi_ways) n += pw.vertices.size();
+                    return n;
+                });
+                const size_t poi_base = grow_by(data.poi_records, poi_way_at.back());
+                const size_t poi_osm_base = grow_by(data.poi_osm_ids, poi_way_at.back());
+                const size_t poi_ele_base = grow_by(poi_elevations, poi_way_at.back());
+                const size_t poi_qid_base = grow_by(poi_qids, poi_way_at.back());
+                const size_t poi_vert_base = grow_by(data.poi_vertices, poi_vert_at.back());
+                parallel_for_each(tld.size(), [&](size_t k, unsigned) {
+                    auto& local = tld[k];
+                    const auto& name_id = name_ids[k];
+                    size_t at = poi_way_at[k];
+                    size_t vertex_offset = poi_vert_base + poi_vert_at[k];
                     for (auto& pw : local.poi_ways) {
-                        uint32_t vertex_offset = static_cast<uint32_t>(data.poi_vertices.size());
-                        data.poi_vertices.insert(data.poi_vertices.end(),
-                            pw.vertices.begin(), pw.vertices.end());
-                        pw.record.vertex_offset = vertex_offset;
+                        std::copy(pw.vertices.begin(), pw.vertices.end(), data.poi_vertices.begin() + vertex_offset);
+                        pw.record.vertex_offset = static_cast<uint32_t>(vertex_offset);
                         pw.record.name_id = name_id(pw.name);
-                        data.poi_records.push_back(pw.record);
+                        data.poi_records[poi_base + at] = pw.record;
                         // Strategy-2 stable identity: way-sourced POI.
-                        data.poi_osm_ids.push_back(
-                            pack_osm_id(gc::id_alloc::ObjectType::OSM_WAY, pw.osm_way_id));
-                        poi_elevations.push_back(pw.elevation);
-                        poi_qids.push_back(pw.qid);
+                        data.poi_osm_ids[poi_osm_base + at] =
+                            pack_osm_id(gc::id_alloc::ObjectType::OSM_WAY, pw.osm_way_id);
+                        poi_elevations[poi_ele_base + at] = pw.elevation;
+                        poi_qids[poi_qid_base + at] = pw.qid;
+                        vertex_offset += pw.vertices.size();
+                        at++;
                     }
+                    free_storage(local.poi_ways);
+                });
+                log_phase("      Way merge: interpolations + POI ways", _mt, _mc);
 
-                    // Free this thread's buffers as soon as they are merged
-                    // rather than when tld goes out of scope after admin
-                    // assembly: they hold tens of GiB on planet. Closed-way
-                    // admins are merged below.
+                // Merge way geometries for admin and POI relation assembly:
+                // converted on worker threads, stored in thread order.
+                struct ConvertedGeoms {
+                    std::vector<std::pair<int64_t, ParsedData::WayGeometry>> admin, poi;
+                };
+                size_t n_geoms = data.way_geometries.size();
+                for (const auto& local : tld) n_geoms += local.way_geoms.size() + local.poi_way_geoms.size();
+                data.way_geometries.reserve(n_geoms);
+                parallel_ordered(tld.size(), [&](size_t k) {
+                    auto& local = tld[k];
+                    ConvertedGeoms out;
+                    out.admin.reserve(local.way_geoms.size());
+                    for (const auto& wg : local.way_geoms) out.admin.emplace_back(wg.way_id, to_geometry(wg));
+                    free_storage(local.way_geoms);
+                    out.poi.reserve(local.poi_way_geoms.size());
+                    for (const auto& wg : local.poi_way_geoms) out.poi.emplace_back(wg.way_id, to_geometry(wg));
+                    free_storage(local.poi_way_geoms);
+                    return out;
+                }, [&](size_t, ConvertedGeoms geoms) {
+                    for (auto& [way_id, g] : geoms.admin) data.way_geometries[way_id] = std::move(g);
+                    // Stored with the admin ones (no conflict since IDs differ)
+                    for (auto& [way_id, g] : geoms.poi)
+                        if (data.way_geometries.find(way_id) == data.way_geometries.end())
+                            data.way_geometries[way_id] = std::move(g);
+                });
+                log_phase("      Way merge: way geometries", _mt, _mc);
+
+                parallel_for_each(tld.size(), [&](size_t k, unsigned) {
+                    auto& local = tld[k];
                     auto closed_way_admins = std::move(local.closed_way_admins);
                     local = ThreadLocalData{};
                     local.closed_way_admins = std::move(closed_way_admins);
-                }
+                });
                 std::cerr << "  Merged: " << total_ways << " ways, "
                           << total_building_addrs << " building addrs, "
                           << total_interps << " interps from parallel processing." << std::endl;

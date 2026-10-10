@@ -377,6 +377,12 @@ struct ParsedData {
     }
 };
 
+// Frees v's storage now (clear() keeps it).
+template <class V>
+inline void free_storage(V& v) {
+    v = V();
+}
+
 // Makes room for n more elements in one step. Capacity doubles past the new
 // size, as push_back growth would leave it, so the appends that follow a
 // merge (the next merge, POI relations) grow v in place instead of copying
