@@ -2,6 +2,7 @@
 #include "tiger.h"
 
 #include <cstring>
+#include <random>
 #include <string>
 
 #include "test_framework.h"
@@ -153,7 +154,32 @@ TEST(tiger_parse_header_only_or_empty) {
     CHECK_EQ(parse_tiger_csv(kHeader).rows, uint64_t(0));
 }
 
-TEST(tiger_append_lays_files_out_as_adding_them_one_by_one_would) {
+static void check_same_load(const ParsedData& got, const ParsedData& want) {
+    CHECK(got.string_pool.data() == want.string_pool.data());
+    CHECK(got.interp_nodes.size() == want.interp_nodes.size() &&
+          std::memcmp(got.interp_nodes.data(), want.interp_nodes.data(),
+                      want.interp_nodes.size() * sizeof(NodeCoord)) == 0);
+    CHECK(got.interp_ways.size() == want.interp_ways.size() &&
+          std::memcmp(got.interp_ways.data(), want.interp_ways.data(),
+                      want.interp_ways.size() * sizeof(InterpWay)) == 0);
+    CHECK(got.interp_osm_ids == want.interp_osm_ids);
+    CHECK(got.interp_postcode_ids == want.interp_postcode_ids);
+    bool same_deferred = got.deferred_interps.size() == want.deferred_interps.size();
+    for (size_t i = 0; same_deferred && i < want.deferred_interps.size(); i++) {
+        const auto& a = got.deferred_interps[i];
+        const auto& b = want.deferred_interps[i];
+        same_deferred = a.interp_id == b.interp_id && a.node_offset == b.node_offset &&
+                        a.node_count == b.node_count;
+    }
+    CHECK(same_deferred);
+    // Same insertion sequence, so the same iteration order too.
+    std::vector<std::pair<uint64_t, uint64_t>> pa, pb;
+    for (const auto& [k, acc] : got.postcode_accum) pa.push_back({k, acc.count});
+    for (const auto& [k, acc] : want.postcode_accum) pb.push_back({k, acc.count});
+    CHECK(pa == pb);
+}
+
+TEST(tiger_load_lays_files_out_as_adding_them_one_by_one_would) {
     std::vector<TigerCsv> files = {
         parse_tiger_csv(csv("1;9;all;B St;;TX;76701;LINESTRING(1 1,2 2)\n"
                             "2;8;even;Oak St;;PR;00601;LINESTRING(3 3,4 4,5 5)\n")),
@@ -168,31 +194,37 @@ TEST(tiger_append_lays_files_out_as_adding_them_one_by_one_would) {
 
     for (unsigned threads : {1u, 3u, 8u}) {
         ParsedData got = new_data_with_one_interp();
-        std::vector<std::vector<uint32_t>> ids;
-        for (const auto& f : files) ids.push_back(intern_tiger_csv(got, f));
-        append_tiger_ranges(got, files, ids, threads);
+        append_tiger_ranges(got, files, intern_tiger_csvs(got, files, threads), threads);
+        check_same_load(got, want);
+    }
+}
 
-        CHECK(got.string_pool.data() == want.string_pool.data());
-        CHECK(got.interp_nodes.size() == want.interp_nodes.size() &&
-              std::memcmp(got.interp_nodes.data(), want.interp_nodes.data(),
-                          want.interp_nodes.size() * sizeof(NodeCoord)) == 0);
-        CHECK(got.interp_ways.size() == want.interp_ways.size() &&
-              std::memcmp(got.interp_ways.data(), want.interp_ways.data(),
-                          want.interp_ways.size() * sizeof(InterpWay)) == 0);
-        CHECK(got.interp_osm_ids == want.interp_osm_ids);
-        CHECK(got.interp_postcode_ids == want.interp_postcode_ids);
-        bool same_deferred = got.deferred_interps.size() == want.deferred_interps.size();
-        for (size_t i = 0; same_deferred && i < want.deferred_interps.size(); i++) {
-            const auto& a = got.deferred_interps[i];
-            const auto& b = want.deferred_interps[i];
-            same_deferred = a.interp_id == b.interp_id && a.node_offset == b.node_offset &&
-                            a.node_count == b.node_count;
+TEST(tiger_load_interns_many_files_as_a_serial_load_would) {
+    // Streets and postcodes recur across files, some already pooled.
+    std::mt19937 rng(7);
+    std::vector<TigerCsv> files;
+    for (int f = 0; f < 60; f++) {
+        std::string rows;
+        for (int r = 0; r < 1500; r++) {
+            rows += std::to_string(1 + rng() % 50) + ";" + std::to_string(51 + rng() % 50) + ";all;Street " +
+                    std::to_string(rng() % 4000) + ";;TX;" + (rng() % 4 ? std::to_string(70000 + rng() % 90) : "") +
+                    ";LINESTRING(" + std::to_string(1 + rng() % 89) + " " + std::to_string(1 + rng() % 89) + "," +
+                    std::to_string(1 + rng() % 89) + " " + std::to_string(1 + rng() % 89) + ")\n";
         }
-        CHECK(same_deferred);
-        // Same insertion sequence, so the same iteration order too.
-        std::vector<std::pair<uint64_t, uint64_t>> pa, pb;
-        for (const auto& [k, acc] : got.postcode_accum) pa.push_back({k, acc.count});
-        for (const auto& [k, acc] : want.postcode_accum) pb.push_back({k, acc.count});
-        CHECK(pa == pb);
+        files.push_back(parse_tiger_csv(csv(rows)));
+    }
+    auto new_data = [] {
+        ParsedData d = new_data_with_one_interp();
+        for (int s = 0; s < 4000; s += 3) d.string_pool.intern("Street " + std::to_string(s));
+        d.string_pool.intern("70011");
+        return d;
+    };
+    ParsedData want = new_data();
+    for (const auto& f : files) add_tiger_ranges_serially(want, f);
+
+    for (unsigned threads : {1u, 3u, 8u}) {
+        ParsedData got = new_data();
+        append_tiger_ranges(got, files, intern_tiger_csvs(got, files, threads), threads);
+        check_same_load(got, want);
     }
 }

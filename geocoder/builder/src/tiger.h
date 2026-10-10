@@ -205,24 +205,63 @@ inline TigerCsv parse_tiger_csv(std::string_view text) {
     return csv;
 }
 
-// Interns one TIGER CSV's strings and adds its postcode midpoints to
-// postcode_accum, returning each string's pool id: the part of loading a
-// file whose order shows, so files go through it one by one in file order.
-inline std::vector<uint32_t> intern_tiger_csv(ParsedData& data, const TigerCsv& csv) {
-    std::vector<uint32_t> string_ids(csv.strings.size());
-    for (size_t i = 0; i < csv.strings.size(); i++) string_ids[i] = data.string_pool.intern(csv.strings[i]);
-    for (const auto& pc : csv.postcodes) {
-        auto& acc = data.postcode_accum[postcode_key(pc.country, string_ids[pc.postcode])];
-        acc.sum_lat_e7 += pc.sum.sum_lat_e7;
-        acc.sum_lng_e7 += pc.sum.sum_lng_e7;
-        acc.count += pc.sum.count;
+// Interns the files' strings and adds their postcode midpoints to
+// postcode_accum as loading file after file would; string_ids[f][k] is the
+// pool id of csvs[f].strings[k]. Strings the pool holds already are looked
+// up on every core: only the others go through the pool, each once, in the
+// order of their first use, where interning them use by use puts them.
+inline std::vector<std::vector<uint32_t>> intern_tiger_csvs(ParsedData& data, const std::vector<TigerCsv>& csvs,
+                                                            unsigned threads = 0) {
+    std::vector<std::vector<uint32_t>> ids(csvs.size());
+    parallel_for_each(csvs.size(), [&](size_t f, unsigned) {
+        ids[f].resize(csvs[f].strings.size());
+        for (size_t k = 0; k < ids[f].size(); k++) ids[f][k] = data.string_pool.find(csvs[f].strings[k]);
+    }, threads);
+
+    // The uses of new strings, by string and then by use.
+    struct Use {
+        const std::string* text;
+        uint32_t file, index;
+    };
+    std::vector<Use> uses = parallel_collect<Use>(csvs.size(), [&](size_t f, std::vector<Use>& out) {
+        for (size_t k = 0; k < ids[f].size(); k++)
+            if (ids[f][k] == StringPool::kAbsent)
+                out.push_back({&csvs[f].strings[k], static_cast<uint32_t>(f), static_cast<uint32_t>(k)});
+    }, threads);
+    auto earlier = [](const Use& a, const Use& b) { return a.file != b.file ? a.file < b.file : a.index < b.index; };
+    parallel_sort(uses.begin(), uses.end(), [&](const Use& a, const Use& b) {
+        if (int c = a.text->compare(*b.text)) return c < 0;
+        return earlier(a, b);
+    }, threads);
+    std::vector<uint32_t> firsts = parallel_filter(uses.size(), [&](size_t u) {
+        return u == 0 || *uses[u - 1].text != *uses[u].text;
+    }, threads);
+    std::vector<uint32_t> by_first_use = firsts;
+    parallel_sort(by_first_use.begin(), by_first_use.end(),
+                  [&](uint32_t a, uint32_t b) { return earlier(uses[a], uses[b]); }, threads);
+    for (uint32_t u : by_first_use) ids[uses[u].file][uses[u].index] = data.string_pool.intern(*uses[u].text);
+    parallel_for(firsts.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t r = b; r < e; r++) {
+            const uint32_t id = ids[uses[firsts[r]].file][uses[firsts[r]].index];
+            const size_t end = r + 1 < firsts.size() ? firsts[r + 1] : uses.size();
+            for (size_t u = firsts[r] + 1; u < end; u++) ids[uses[u].file][uses[u].index] = id;
+        }
+    }, threads);
+
+    for (size_t f = 0; f < csvs.size(); f++) {
+        for (const auto& pc : csvs[f].postcodes) {
+            auto& acc = data.postcode_accum[postcode_key(pc.country, ids[f][pc.postcode])];
+            acc.sum_lat_e7 += pc.sum.sum_lat_e7;
+            acc.sum_lng_e7 += pc.sum.sum_lng_e7;
+            acc.count += pc.sum.count;
+        }
     }
-    return string_ids;
+    return ids;
 }
 
 // Appends the files' nodes and ranges to the interpolation arrays where
 // appending them file after file would put them, every file at once.
-// string_ids[f] is intern_tiger_csv's answer for csvs[f].
+// string_ids is intern_tiger_csvs's answer for csvs.
 inline void append_tiger_ranges(ParsedData& data, const std::vector<TigerCsv>& csvs,
                                 const std::vector<std::vector<uint32_t>>& string_ids, unsigned threads = 0) {
     const size_t files = csvs.size();

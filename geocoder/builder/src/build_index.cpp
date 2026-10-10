@@ -183,32 +183,26 @@ static void load_tiger_data(ParsedData& data, const std::string& path, std::futu
     if (csv_files.empty())
         throw std::runtime_error("--tiger-data given but no .csv files found under " + path);
 
-    uint64_t total_rows = 0;
-    uint64_t loaded_rows = 0;
-
     // Per-segment ZIP sidecar: cover every already-parsed OSM interpolation
     // with NO_DATA, then record each TIGER row's postcode below. Stays empty
     // (and interp_postcodes.bin unwritten) when no TIGER data is loaded.
     data.interp_postcode_ids.resize(data.interp_ways.size(), NO_DATA);
 
-    // Files parse in parallel, leaving a core to intern their strings in
-    // file order, as a serial load would; their ranges are laid out after,
-    // every file at once.
+    // Files parse on every core; their strings intern as a serial load
+    // interns them, and their ranges are laid out after, every file at once.
+    // A file that can't be read stays empty.
     std::vector<TigerCsv> parsed(csv_files.size());
-    std::vector<std::vector<uint32_t>> string_ids(csv_files.size());
-    parallel_ordered(csv_files.size(), [&](size_t i) {
-        std::optional<TigerCsv> csv;
+    parallel_for_each(csv_files.size(), [&](size_t i, unsigned) {
         std::string text;
-        if (read_whole_file(csv_files[i], text)) csv = parse_tiger_csv(text);
-        return csv;
-    }, [&](size_t i, std::optional<TigerCsv>&& csv) {
-        if (!csv) return;
-        total_rows += csv->rows;
-        loaded_rows += csv->ranges.size();
-        string_ids[i] = intern_tiger_csv(data, *csv);
-        parsed[i] = std::move(*csv);
-    }, std::max(1u, parallel_threads() - 1));
-    append_tiger_ranges(data, parsed, string_ids);
+        if (read_whole_file(csv_files[i], text)) parsed[i] = parse_tiger_csv(text);
+    });
+    uint64_t total_rows = 0;
+    uint64_t loaded_rows = 0;
+    for (const auto& csv : parsed) {
+        total_rows += csv.rows;
+        loaded_rows += csv.ranges.size();
+    }
+    append_tiger_ranges(data, parsed, intern_tiger_csvs(data, parsed));
 
     // Sidecar exists iff it carries at least one real ZIP: an empty/ZIP-less
     // TIGER path must not materialize an all-NO_DATA planet-sized file (nor a
