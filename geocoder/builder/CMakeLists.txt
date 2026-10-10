@@ -9,7 +9,15 @@ find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(BZip2 REQUIRED)
 find_package(EXPAT REQUIRED)
-find_package(s2 QUIET)
+# GEOCODER_S2_PREFIX links the static S2 and abseil that tools/build_s2.sh
+# installed there (both without their debug checks, as CI builds them).
+# Without it the system S2 (and abseil) are used; they are only looked up
+# then, so a system absl_DIR can't shadow the prefix's abseil.
+set(GEOCODER_S2_PREFIX "" CACHE PATH "Prefix of a static S2 and abseil from tools/build_s2.sh")
+if(NOT GEOCODER_S2_PREFIX)
+    find_package(s2 QUIET)
+    find_package(absl QUIET)
+endif()
 
 # --- Generate embedded_polys.h from data/*.poly ---
 #
@@ -85,9 +93,6 @@ if(EXISTS /opt/homebrew/include)
     target_include_directories(build-index PRIVATE /opt/homebrew/include)
 endif()
 
-# GEOCODER_S2_PREFIX links the static S2 and abseil that tools/build_s2.sh
-# installed there (both without their debug checks, as CI builds them).
-set(GEOCODER_S2_PREFIX "" CACHE PATH "Prefix of a static S2 and abseil from tools/build_s2.sh")
 if(GEOCODER_S2_PREFIX)
     find_package(absl REQUIRED PATHS "${GEOCODER_S2_PREFIX}" NO_DEFAULT_PATH)
     find_package(OpenSSL REQUIRED)
@@ -112,6 +117,16 @@ target_link_libraries(build-index PRIVATE
     EXPAT::EXPAT
     Threads::Threads
 )
+# main() switches off absl's Mutex deadlock detection, S2's dependency:
+# the distro abseil is built without NDEBUG (the prefix's is a release build
+# and already links absl::synchronization).
+if(NOT GEOCODER_S2_PREFIX)
+    if(absl_FOUND)
+        target_link_libraries(build-index PRIVATE absl::synchronization)
+    else()
+        target_link_libraries(build-index PRIVATE absl_synchronization)
+    endif()
+endif()
 
 # --- Unit tests (geocoder-tests) ---
 #

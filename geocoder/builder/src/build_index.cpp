@@ -27,6 +27,7 @@
 
 #include "pbf_reader.h"
 
+#include <absl/synchronization/mutex.h>
 #include <s2/s2cell_id.h>
 #include <s2/s2latlng.h>
 
@@ -4734,6 +4735,11 @@ static int run(int argc, char* argv[]) {
 
 // The one error edge: a throw anywhere in run() unwinds its scratch dirs.
 int main(int argc, char* argv[]) {
+    // libabsl built without NDEBUG, as Debian and Ubuntu ship it, enters
+    // every Mutex lock in a deadlock graph behind one process-wide spinlock,
+    // and S2 locks a Mutex for every shape index it builds: the threads
+    // covering POI polygons spent half their time queued on it.
+    absl::SetMutexDeadlockDetectionMode(absl::OnDeadlockCycle::kIgnore);
     try {
         return run(argc, argv);
     } catch (const std::exception& e) {
