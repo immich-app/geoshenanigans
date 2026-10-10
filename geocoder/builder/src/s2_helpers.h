@@ -97,7 +97,8 @@ void add_addr_point(ParsedData& data, double lat, double lng,
                     uint32_t polygon_vertex_count = 0);
 
 // Appends one address point whose strings are already interned (NO_DATA
-// for a missing street or postcode); `cell` is point_to_cell(lat, lng).
+// for a missing street or postcode); `cell` is point_to_cell() of its
+// location (lat/lng are stored as float).
 void append_addr_point(ParsedData& data, double lat, double lng,
                        uint32_t housenumber_id, uint32_t street_id, uint32_t postcode_id,
                        S2CellId cell, uint64_t osm_id_packed,

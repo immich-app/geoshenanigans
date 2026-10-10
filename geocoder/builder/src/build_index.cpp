@@ -3529,7 +3529,10 @@ static int run(int argc, char* argv[]) {
                 struct NodeThreadLocal {
                     // Strings below are codes into `strings` (kNone: none).
                     StringDict strings;
-                    std::vector<std::pair<double,double>> addr_coords;
+                    // Address locations as stored (float) and street cells of
+                    // the exact node locations, computed here in parallel.
+                    std::vector<NodeCoord> addr_coords;
+                    std::vector<uint64_t> addr_cells;
                     std::vector<std::pair<uint32_t, uint32_t>> addr_strings; // {hn, street}
                     std::vector<uint32_t> addr_postcodes; // parallel to addr_strings
                     std::vector<int64_t> addr_osm_node_ids; // parallel to addr_coords; strategy-2 stable identity
@@ -3659,7 +3662,8 @@ static int run(int argc, char* argv[]) {
                             // backfill the street later via a
                             // nearest-named-street sweep. Empty
                             // street sentinel = "needs backfill".
-                            tl_node_data->addr_coords.push_back({lat, lng});
+                            tl_node_data->addr_coords.push_back({static_cast<float>(lat), static_cast<float>(lng)});
+                            tl_node_data->addr_cells.push_back(point_to_cell(lat, lng).id());
                             auto& strs = tl_node_data->strings;
                             tl_node_data->addr_strings.push_back({strs.add(housenumber),
                                 (street && street[0]) ? strs.add(street) : StringDict::kNone});
@@ -3809,10 +3813,10 @@ static int run(int argc, char* argv[]) {
                         uint32_t street_id = name_ids[k](local.addr_strings[j].second);
                         uint32_t housenumber_id = name_ids[k](local.addr_strings[j].first);
                         uint32_t postcode_id = name_ids[k](local.addr_postcodes[j]);
-                        double lat = local.addr_coords[j].first, lng = local.addr_coords[j].second;
                         int64_t node_id = j < local.addr_osm_node_ids.size() ? local.addr_osm_node_ids[j] : 0;
-                        append_addr_point(data, lat, lng, housenumber_id, street_id, postcode_id,
-                                          point_to_cell(lat, lng),
+                        append_addr_point(data, local.addr_coords[j].lat, local.addr_coords[j].lng,
+                                          housenumber_id, street_id, postcode_id,
+                                          S2CellId(local.addr_cells[j]),
                                           pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, node_id));
                     }
                     total_addrs += local.count;
@@ -3919,6 +3923,7 @@ static int run(int argc, char* argv[]) {
                     std::vector<NodeCoord> interp_nodes;
                     std::vector<DeferredInterp> deferred_interps;
                     std::vector<NodeCoord> building_addrs;  // centroids
+                    std::vector<uint64_t> building_addr_cells;  // their street cells
                     // Flat polygon storage, parallel to building_addrs via
                     // (offset, count) into building_addr_poly_verts. Stored as
                     // NodeCoord (2× float = 8 bytes/vertex) instead of
@@ -4049,7 +4054,9 @@ static int run(int argc, char* argv[]) {
                         }
                         if (valid > 0) {
                             double clat = sum_lat/valid, clng = sum_lng/valid;
-                            local.building_addrs.push_back({static_cast<float>(clat), static_cast<float>(clng)});
+                            NodeCoord centroid{static_cast<float>(clat), static_cast<float>(clng)};
+                            local.building_addrs.push_back(centroid);
+                            local.building_addr_cells.push_back(point_to_cell(centroid.lat, centroid.lng).id());
                             local.building_addr_osm_way_ids.push_back(way_id);
                             local.addr_strings.push_back({local.strings.add(housenumber),
                                 (street && street[0]) ? local.strings.add(street) : StringDict::kNone});
@@ -4328,9 +4335,9 @@ static int run(int argc, char* argv[]) {
                             : nullptr;
                         int64_t bldg_way_id = i < local.building_addr_osm_way_ids.size()
                             ? local.building_addr_osm_way_ids[i] : 0;
-                        double lat = local.building_addrs[i].lat, lng = local.building_addrs[i].lng;
-                        append_addr_point(data, lat, lng, housenumber_id, street_id, postcode_id,
-                                          point_to_cell(lat, lng),
+                        append_addr_point(data, local.building_addrs[i].lat, local.building_addrs[i].lng,
+                                          housenumber_id, street_id, postcode_id,
+                                          S2CellId(local.building_addr_cells[i]),
                                           pack_osm_id(gc::id_alloc::ObjectType::OSM_WAY, bldg_way_id),
                                           poly_verts, poly_cnt);
                     }
