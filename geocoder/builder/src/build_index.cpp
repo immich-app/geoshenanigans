@@ -2289,6 +2289,18 @@ static void reorder_deterministically(ParsedData& data, std::vector<float>& poi_
     log_phase("  Sort interps (wait)", _st, _sc);
 }
 
+// Records a parse merge copies per parallel_for_parts range.
+static constexpr size_t kMergeGrain = size_t(1) << 16;
+
+// Where each parse thread's records start once the merge lays the threads'
+// buffers back to back, in thread order, with the total last.
+template <class Locals, class SizeOf>
+static std::vector<size_t> local_offsets(const Locals& locals, SizeOf size_of) {
+    std::vector<size_t> at{0};
+    for (const auto& local : locals) at.push_back(at.back() + size_of(local));
+    return at;
+}
+
 static int run(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [options]" << std::endl;
@@ -3171,58 +3183,68 @@ static int run(int argc, char* argv[]) {
                 log_phase("      Node merge: strings", _mt, _mc);
 
                 // Merge address points
-                uint64_t total_addrs = 0;
-                for (size_t k = 0; k < ntld.size(); k++) {
-                    auto& local = ntld[k];
-                    for (size_t j = 0; j < local.addr_coords.size(); j++) {
-                        uint32_t street_id = name_ids[k](local.addr_strings[j].second);
-                        uint32_t housenumber_id = name_ids[k](local.addr_strings[j].first);
-                        uint32_t postcode_id = name_ids[k](local.addr_postcodes[j]);
+                const auto addr_at = local_offsets(ntld, [](const auto& l) { return l.addr_coords.size(); });
+                const size_t addr_base = grow_addr_points(data, addr_at.back());
+                parallel_for_parts(addr_at, kMergeGrain, [&](size_t k, size_t begin, size_t end, size_t at) {
+                    const auto& local = ntld[k];
+                    const auto& ids = name_ids[k];
+                    for (size_t j = begin; j < end; j++, at++) {
                         int64_t node_id = j < local.addr_osm_node_ids.size() ? local.addr_osm_node_ids[j] : 0;
-                        append_addr_point(data, local.addr_coords[j].lat, local.addr_coords[j].lng,
-                                          housenumber_id, street_id, postcode_id,
-                                          S2CellId(local.addr_cells[j]),
-                                          pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, node_id));
+                        put_addr_point(data, addr_base + at, local.addr_coords[j].lat, local.addr_coords[j].lng,
+                                       ids(local.addr_strings[j].first), ids(local.addr_strings[j].second),
+                                       ids(local.addr_postcodes[j]), local.addr_cells[j],
+                                       pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, node_id));
                     }
-                    total_addrs += local.count;
-                }
+                });
+                uint64_t total_addrs = 0;
+                for (const auto& local : ntld) total_addrs += local.count;
+                log_phase("      Node merge: address points", _mt, _mc);
+
                 // Merge POI node records
-                uint64_t total_poi_nodes = 0;
-                for (size_t k = 0; k < ntld.size(); k++) {
-                    auto& local = ntld[k];
-                    for (size_t j = 0; j < local.poi_records.size(); j++) {
+                const auto poi_at = local_offsets(ntld, [](const auto& l) { return l.poi_records.size(); });
+                const size_t poi_base = grow_by(data.poi_records, poi_at.back());
+                const size_t poi_osm_base = grow_by(data.poi_osm_ids, poi_at.back());
+                const size_t poi_ele_base = grow_by(poi_elevations, poi_at.back());
+                const size_t poi_qid_base = grow_by(poi_qids, poi_at.back());
+                parallel_for_parts(poi_at, kMergeGrain, [&](size_t k, size_t begin, size_t end, size_t at) {
+                    const auto& local = ntld[k];
+                    for (size_t j = begin; j < end; j++, at++) {
                         auto pr = local.poi_records[j];
                         // Empty name → NO_DATA sentinel. UNNAMED_RANK30
                         // POIs come in nameless; the server reads name_id
                         // == NO_DATA to surface parent_street as `road`
                         // instead of the POI's (missing) own name.
                         pr.name_id = name_ids[k](local.poi_names[j]);
-                        data.poi_records.push_back(pr);
+                        data.poi_records[poi_base + at] = pr;
                         // Strategy-2 stable identity: node-sourced POI.
                         int64_t poi_node_id = j < local.poi_osm_node_ids.size() ? local.poi_osm_node_ids[j] : 0;
-                        data.poi_osm_ids.push_back(
-                            pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, poi_node_id));
+                        data.poi_osm_ids[poi_osm_base + at] =
+                            pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, poi_node_id);
+                        poi_elevations[poi_ele_base + at] = local.poi_elevations[j];
+                        poi_qids[poi_qid_base + at] = local.poi_qids[j];
                     }
-                    poi_elevations.insert(poi_elevations.end(),
-                        local.poi_elevations.begin(), local.poi_elevations.end());
-                    poi_qids.insert(poi_qids.end(),
-                        local.poi_qids.begin(), local.poi_qids.end());
-                    total_poi_nodes += local.poi_count;
-                }
+                });
+                uint64_t total_poi_nodes = 0;
+                for (const auto& local : ntld) total_poi_nodes += local.poi_count;
+                log_phase("      Node merge: POI nodes", _mt, _mc);
+
                 // Merge place nodes
-                for (size_t k = 0; k < ntld.size(); k++) {
-                    auto& local = ntld[k];
-                    for (size_t j = 0; j < local.place_nodes.size(); j++) {
+                const auto place_at = local_offsets(ntld, [](const auto& l) { return l.place_nodes.size(); });
+                const size_t place_base = grow_by(data.place_nodes, place_at.back());
+                const size_t place_osm_base = grow_by(data.place_osm_ids, place_at.back());
+                parallel_for_parts(place_at, kMergeGrain, [&](size_t k, size_t begin, size_t end, size_t at) {
+                    const auto& local = ntld[k];
+                    for (size_t j = begin; j < end; j++, at++) {
                         auto pn = local.place_nodes[j];
                         pn.name_id = name_ids[k](local.place_names[j]);
-                        data.place_nodes.push_back(pn);
+                        data.place_nodes[place_base + at] = pn;
                         // Strategy-2 stable identity: place_nodes are always
                         // settlement nodes from the OSM node stream.
                         int64_t place_node_id = j < local.place_osm_node_ids.size() ? local.place_osm_node_ids[j] : 0;
-                        data.place_osm_ids.push_back(
-                            pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, place_node_id));
+                        data.place_osm_ids[place_osm_base + at] =
+                            pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, place_node_id);
                     }
-                }
+                });
                 // Build wikidata → place type map for admin boundary linking.
                 // Deterministic conflict resolution: when two place nodes share
                 // a wikidata id but carry different place types, plain

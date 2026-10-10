@@ -297,20 +297,9 @@ void append_addr_point(ParsedData& data, double lat, double lng,
         data.addr_vertices.insert(data.addr_vertices.end(),
             polygon_vertices, polygon_vertices + polygon_vertex_count);
     }
-    data.addr_points.push_back({
-        static_cast<float>(lat),
-        static_cast<float>(lng),
-        housenumber_id,
-        street_id,
-        NO_DATA,  // parent_way_id — filled in during nearest-street sweep
-        vertex_offset,
-        vertex_count
-    });
-    // Strategy-2 stable identity, parallel to addr_points.
-    data.addr_osm_ids.push_back(osm_id_packed);
-    // Store postcode in separate parallel vector (optional file)
-    data.addr_postcode_ids.push_back(postcode_id);
-    data.addr_cells.push_back(cell.id());
+    put_addr_point(data, grow_addr_points(data, 1), static_cast<float>(lat), static_cast<float>(lng),
+                   housenumber_id, street_id, postcode_id, cell.id(), osm_id_packed,
+                   vertex_offset, vertex_count);
 }
 
 // --- add_admin_polygon ---

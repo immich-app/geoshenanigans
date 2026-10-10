@@ -377,6 +377,51 @@ struct ParsedData {
     }
 };
 
+// Makes room for n more elements in one step. Capacity doubles past the new
+// size, as push_back growth would leave it, so the appends that follow a
+// merge (the next merge, POI relations) grow v in place instead of copying
+// it whole; capacity never written costs no memory.
+template <class T>
+inline void reserve_for(std::vector<T>& v, size_t n) {
+    if (v.size() + n > v.capacity()) v.reserve(2 * (v.size() + n));
+}
+
+// Grows v by n elements for a fill in place; returns the first new index.
+template <class T>
+inline size_t grow_by(std::vector<T>& v, size_t n) {
+    size_t at = v.size();
+    reserve_for(v, n);
+    v.resize(at + n);
+    return at;
+}
+
+// Grows addr_points and the arrays parallel to it by n points, which
+// put_addr_point then fills (from many threads at once); returns the first.
+inline size_t grow_addr_points(ParsedData& data, size_t n) {
+    // put_addr_point writes one index into all four arrays.
+    const size_t size = data.addr_points.size();
+    if (data.addr_osm_ids.size() != size || data.addr_postcode_ids.size() != size || data.addr_cells.size() != size)
+        throw std::logic_error("addr_points and its parallel arrays differ in length");
+    grow_by(data.addr_osm_ids, n);
+    grow_by(data.addr_postcode_ids, n);
+    grow_by(data.addr_cells, n);
+    return grow_by(data.addr_points, n);
+}
+
+// Stores address point i, its strings already interned (NO_DATA for a
+// missing street or postcode); `cell` is point_to_cell() of its location. A
+// building's polygon already sits at addr_vertices[vertex_offset].
+inline void put_addr_point(ParsedData& data, size_t i, float lat, float lng,
+                           uint32_t housenumber_id, uint32_t street_id, uint32_t postcode_id,
+                           uint64_t cell, uint64_t osm_id_packed,
+                           uint32_t vertex_offset = NO_DATA, uint32_t vertex_count = 0) {
+    // parent_way_id is filled in during the nearest-street sweep.
+    data.addr_points[i] = {lat, lng, housenumber_id, street_id, NO_DATA, vertex_offset, vertex_count};
+    data.addr_osm_ids[i] = osm_id_packed;
+    data.addr_postcode_ids[i] = postcode_id;
+    data.addr_cells[i] = cell;
+}
+
 // Offset -> string index over a pool of NUL-terminated strings: one start bit
 // per pool byte, ranked per 64-byte block. Marking and remapping visit every
 // string reference of the planet (~1e9), so a lookup is one block load where

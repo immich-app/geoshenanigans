@@ -471,6 +471,29 @@ TEST(parallel_for_dynamic_hands_out_grain_sized_ranges) {
     }
 }
 
+TEST(parallel_for_parts_visits_every_item_once_at_its_place) {
+    std::mt19937 rng(17);
+    for (size_t parts : {size_t(0), size_t(1), size_t(7), size_t(300)}) {
+        std::vector<size_t> offsets{0};
+        for (size_t p = 0; p < parts; p++) offsets.push_back(offsets.back() + (rng() % 3 == 0 ? 0 : rng() % 400));
+        for (unsigned threads : {1u, 3u, 16u}) {
+            for (size_t grain : {size_t(1), size_t(64), size_t(100000)}) {
+                std::vector<std::atomic<int>> seen(offsets.back());
+                std::atomic<bool> placed{true};
+                parallel_for_parts(offsets, grain, [&](size_t part, size_t begin, size_t end, size_t at) {
+                    if (begin >= end || offsets[part] + end > offsets[part + 1] || at != offsets[part] + begin)
+                        placed = false;
+                    for (size_t i = begin; i < end; i++) seen[offsets[part] + i]++;
+                }, threads);
+                CHECK(placed.load());
+                bool once = true;
+                for (auto& s : seen) once = once && s.load() == 1;
+                CHECK(once);
+            }
+        }
+    }
+}
+
 TEST(parallel_prefix_fill_places_items_back_to_back_in_order) {
     std::mt19937 rng(21);
     for (size_t n : {size_t(0), size_t(1), size_t(9), size_t(5000)}) {

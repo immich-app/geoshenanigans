@@ -75,6 +75,24 @@ void parallel_for_dynamic(size_t n, size_t grain, Fn&& fn, unsigned threads = 0)
     }, threads);
 }
 
+// Runs fn(part, begin, end, at) over parts laid out back to back, on every
+// core: part p holds offsets[p + 1] - offsets[p] items, and its item i sits
+// at offsets[p] + i. Ranges of about `grain` items never cross a part; `at`
+// is where [begin, end) of `part` starts. Which worker gets a range varies
+// run to run, so fn must not let it shape its output.
+template <class Fn>
+void parallel_for_parts(const std::vector<size_t>& offsets, size_t grain, Fn&& fn, unsigned threads = 0) {
+    size_t n = offsets.empty() ? 0 : offsets.back();
+    parallel_for_dynamic(n, grain, [&](size_t begin, size_t end, unsigned) {
+        size_t p = static_cast<size_t>(std::upper_bound(offsets.begin(), offsets.end(), begin) - offsets.begin()) - 1;
+        for (; begin < end; p++) {
+            size_t part_end = std::min(end, offsets[p + 1]);
+            if (begin < part_end) fn(p, begin - offsets[p], part_end - offsets[p], begin);
+            begin = part_end;
+        }
+    }, threads);
+}
+
 // Lays n variable-size items out back to back on every core, in index
 // order: size(i) gives item i's size, alloc(total) runs once when the total
 // is known, then place(i, offset) writes item i at `offset` (the sizes of
