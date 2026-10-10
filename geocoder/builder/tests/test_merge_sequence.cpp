@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -68,6 +69,33 @@ std::vector<Op> record_merge(const std::string& old_labels, const std::string& n
 }
 
 }  // namespace
+
+TEST(record_jump_index_finds_the_first_equal_record_in_range) {
+    // Few distinct 12-byte records, zeroed ones among them: duplicates and
+    // tombstones are what the index must get right.
+    constexpr size_t STRIDE = 12;
+    std::mt19937 rng(9);
+    for (size_t n : {size_t(0), size_t(1), size_t(50), size_t(300000)}) {
+        std::string data(n * STRIDE, '\0');
+        for (size_t i = 0; i < n; i++) {
+            uint32_t v = rng() % 40;
+            if (v != 0) std::memcpy(&data[i * STRIDE + 4], &v, 4);
+        }
+        for (unsigned threads : {1u, 5u}) {
+            RecordJumpIndex index(data.data(), n, STRIDE, threads);
+            for (int q = 0; q < 2000; q++) {
+                std::string rec(STRIDE, '\0');
+                uint32_t v = rng() % 41;
+                if (v != 0) std::memcpy(&rec[4], &v, 4);
+                size_t lo = n ? rng() % n : 0, hi = lo + rng() % 3000;
+                uint32_t expect = UINT32_MAX;
+                for (size_t j = lo; j < std::min(hi, n) && expect == UINT32_MAX; j++)
+                    if (v != 0 && std::memcmp(rec.data(), data.data() + j * STRIDE, STRIDE) == 0) expect = j;
+                CHECK_EQ(index.first_equal(rec.data(), lo, hi), expect);
+            }
+        }
+    }
+}
 
 TEST(build_merge_seq_far_jump_needs_a_run_behind_it) {
     // X and Y moved behind 30 unchanged records. Jumping to their copies

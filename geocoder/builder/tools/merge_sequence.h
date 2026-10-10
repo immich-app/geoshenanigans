@@ -7,8 +7,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <unordered_map>
+#include <functional>
 #include <vector>
+
+#include "parallel.h"
 
 enum MergeOp : uint8_t { OP_MATCH_RUN = 0, OP_INSERT_RUN = 1, OP_DELETE_RUN = 2 };
 
@@ -33,6 +35,68 @@ struct MergeSequence {
     }
 };
 
+// The non-zero records of a file by content hash, for build_merge_seq's jumps:
+// (hash << 32 | index) sorted, 8 bytes a record where an unordered_multimap
+// cost ~40 (7 GB for planet addr_points), plus a directory of where each hash
+// prefix starts, so a lookup touches about as few cache lines as a hash map.
+// A candidate is confirmed by its bytes, so any hash gives the same answers.
+class RecordJumpIndex {
+public:
+    RecordJumpIndex(const char* data, size_t n, size_t stride, unsigned threads = 0)
+        : data_(data), stride_(stride) {
+        // Zeroed records (tombstone slots) are left out: see build_merge_seq.
+        constexpr uint64_t ZERO = UINT64_MAX;  // above every entry: indices stay below UINT32_MAX
+        entries_.resize(n);
+        parallel_for(n, [&](size_t b, size_t e, unsigned) {
+            for (size_t i = b; i < e; i++) {
+                const char* p = data + i * stride;
+                bool zero = true;
+                for (size_t k = 0; k < stride && zero; k++) zero = p[k] == 0;
+                entries_[i] = zero ? ZERO : (uint64_t)hash(p, stride) << 32 | i;
+            }
+        }, threads);
+        parallel_sort(entries_.begin(), entries_.end(), std::less<uint64_t>(), threads);
+        entries_.erase(std::lower_bound(entries_.begin(), entries_.end(), ZERO), entries_.end());
+        entries_.shrink_to_fit();
+
+        while (bits_ < 28 && (size_t(8) << bits_) < entries_.size()) bits_++;
+        dir_.assign((size_t(1) << bits_) + 1, 0);
+        size_t at = 0;
+        for (size_t p = 0; p < dir_.size(); p++) {
+            while (at < entries_.size() && prefix(static_cast<uint32_t>(entries_[at] >> 32)) < p) at++;
+            dir_[p] = static_cast<uint32_t>(at);
+        }
+    }
+
+    // The smallest index in [lo, hi) whose record equals rec, or UINT32_MAX.
+    uint32_t first_equal(const char* rec, size_t lo, size_t hi) const {
+        if (entries_.empty()) return UINT32_MAX;
+        uint32_t h = hash(rec, stride_);
+        size_t p = prefix(h);
+        auto it = std::lower_bound(entries_.begin() + dir_[p], entries_.begin() + dir_[p + 1], (uint64_t)h << 32 | lo);
+        for (auto end = entries_.begin() + dir_[p + 1]; it != end && (*it >> 32) == h; ++it) {
+            size_t idx = static_cast<uint32_t>(*it);
+            if (idx >= hi) break;
+            if (memcmp(rec, data_ + idx * stride_, stride_) == 0) return static_cast<uint32_t>(idx);
+        }
+        return UINT32_MAX;
+    }
+
+private:
+    static uint32_t hash(const char* p, size_t stride) {
+        uint64_t h = 14695981039346656037ULL;
+        for (size_t i = 0; i < stride; i++) { h ^= (uint8_t)p[i]; h *= 1099511628211ULL; }
+        return static_cast<uint32_t>(h ^ (h >> 32));
+    }
+    size_t prefix(uint32_t h) const { return bits_ ? h >> (32 - bits_) : 0; }
+
+    const char* data_;
+    size_t stride_;
+    std::vector<uint64_t> entries_;
+    std::vector<uint32_t> dir_;
+    unsigned bits_ = 0;
+};
+
 // Record merge of one data file: walk old (string remap already applied) and
 // new in parallel, comparing records by their stride bytes.
 inline MergeSequence build_merge_seq(
@@ -52,12 +116,7 @@ inline MergeSequence build_merge_seq(
     // Use simple sequential scan instead.
     bool use_hash = (stride > 8);
 
-    // Pre-build hash index of new records for fast mismatch resolution
-    auto record_hash = [&](const char* p, size_t s) -> uint64_t {
-        uint64_t h = 14695981039346656037ULL;
-        for (size_t i = 0; i < s; i++) { h ^= (uint8_t)p[i]; h *= 1099511628211ULL; }
-        return h;
-    };
+    // Pre-build hash index of new records for fast mismatch resolution.
     // Zeroed records (tombstone slots) are excluded from the jump index:
     // every old tombstone hash-matches every still-empty new slot, and a
     // jump to one re-anchors the cursor at the wrong position — following
@@ -67,19 +126,7 @@ inline MergeSequence build_merge_seq(
     // side carried 39K tombstones; fresh old sides have none, which hid
     // this). Dead slots need no anchoring — they replay fine as plain
     // DELETE/INSERT.
-    auto is_zero_record = [&](const char* p) -> bool {
-        for (size_t i = 0; i < stride; i++) if (p[i] != 0) return false;
-        return true;
-    };
-    std::unordered_multimap<uint64_t, uint32_t> new_hash;
-    if (use_hash) {
-        new_hash.reserve(new_n);
-        for (uint32_t i = 0; i < new_n; i++) {
-            const char* p = new_data + i * stride;
-            if (!is_zero_record(p))
-                new_hash.emplace(record_hash(p, stride), i);
-        }
-    }
+    RecordJumpIndex new_index(new_data, use_hash ? new_n : 0, stride);
 
     while (oi < old_n && ni < new_n) {
         const char* op = old_data + oi * stride;
@@ -90,15 +137,7 @@ inline MergeSequence build_merge_seq(
             match_run++;
             oi++; ni++;
         } else if (use_hash) {
-            uint64_t oh = record_hash(op, stride);
-            auto range = new_hash.equal_range(oh);
-            uint32_t best_ni = UINT32_MAX;
-            for (auto it = range.first; it != range.second; ++it) {
-                if (it->second >= ni && it->second < ni + 10000 &&
-                    memcmp(op, new_data + it->second * stride, stride) == 0) {
-                    if (it->second < best_ni) best_ni = it->second;
-                }
-            }
+            uint32_t best_ni = new_index.first_equal(op, ni, ni + 10000);
             // Overshoot guard: with duplicate record content the smallest
             // in-window match can be a LATER duplicate than this record's
             // true counterpart (e.g. when the counterpart was already
