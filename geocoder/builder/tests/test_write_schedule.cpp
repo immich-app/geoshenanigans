@@ -37,6 +37,23 @@ TEST(strategy2_cost_holds_every_kind_or_the_largest) {
     CHECK_EQ(strategy2_cost(counts, RunOrder::Serial), 30 * kStrategy2BytesPerRecord);
 }
 
+TEST(strategy2_pass_costs_add_the_repacked_nodes_to_streets_and_interps) {
+    ParsedData d;
+    d.ways.resize(2);
+    d.street_nodes.resize(7);
+    d.addr_points.resize(3);
+    d.addr_vertices.resize(11);  // addrs keep their vertices where they are
+    d.interp_ways.resize(1);
+    d.interp_nodes.resize(5);
+    d.poi_records.resize(4);
+    const KindValues costs = strategy2_pass_costs(d);
+    CHECK_EQ(at(costs, RecordKind::Ways), 2 * kStrategy2BytesPerRecord + 7 * sizeof(NodeCoord));
+    CHECK_EQ(at(costs, RecordKind::Addrs), 3 * kStrategy2BytesPerRecord);
+    CHECK_EQ(at(costs, RecordKind::Interps), 1 * kStrategy2BytesPerRecord + 5 * sizeof(NodeCoord));
+    CHECK_EQ(at(costs, RecordKind::Pois), 4 * kStrategy2BytesPerRecord);
+    CHECK_EQ(at(costs, RecordKind::Places), uint64_t(0));
+}
+
 TEST(filter_cost_holds_the_planet_maps_and_half_the_subset_pairs) {
     const KindValues planet_counts = kinds(80, 160, 0, 0, 0, 0);
     const KindValues pairs = kinds(10, 0, 0, 0, 0, 0);

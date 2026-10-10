@@ -7,6 +7,7 @@
 #include "types.h"
 #include "parsed_data.h"
 #include "cell_index_io.h"
+#include "memory_limit.h"
 
 void write_index(const ParsedData& data, const std::string& output_dir, IndexMode mode);
 
@@ -34,9 +35,11 @@ void collect_postcode_centroids(ParsedData& data);
 //
 // Idempotent on the same input + same prev_dir. No-op if prev_dir is
 // empty or its sidecars don't exist (first build / fresh start). The record
-// kinds' passes run at once unless `order` is Serial.
+// kinds' passes run at once unless `order` is Serial. With a `budget`, each
+// pass holds its estimated cost of it while it runs (strategy2_pass_costs),
+// so a pass that doesn't fit beside the running ones waits for them.
 void apply_strategy2_remaps(ParsedData& data, const std::string& prev_dir,
-                            RunOrder order = RunOrder::Concurrent);
+                            RunOrder order = RunOrder::Concurrent, MemoryBudget* budget = nullptr);
 
 // Emit a strategy-2 *.osm_ids sidecar to disk. If `blob` is non-empty
 // (apply_strategy2_remaps already ran), uses that pre-built table.

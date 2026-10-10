@@ -138,6 +138,17 @@ inline uint64_t strategy2_cost(const KindValues& counts, RunOrder order) {
     return (order == RunOrder::Serial ? largest(counts) : sum(counts)) * kStrategy2BytesPerRecord;
 }
 
+// What each strategy-2 pass holds while it runs: the allocator's working set
+// per record, and the copy of the nodes the street and interpolation passes
+// repack.
+inline KindValues strategy2_pass_costs(const ParsedData& d) {
+    KindValues c = record_counts(d);
+    for (uint64_t& v : c) v *= kStrategy2BytesPerRecord;
+    at(c, RecordKind::Ways) += vector_bytes(d.street_nodes);
+    at(c, RecordKind::Interps) += vector_bytes(d.interp_nodes);
+    return c;
+}
+
 // What the continent split holds beyond the subset it builds.
 inline uint64_t filter_cost(const KindValues& planet_counts, const KindValues& continent_pairs, unsigned threads) {
     const uint64_t records = sum(planet_counts);

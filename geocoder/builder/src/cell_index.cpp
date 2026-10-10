@@ -7,6 +7,7 @@
 #include <future>
 #include <iostream>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -22,6 +23,7 @@
 #include "s2_helpers.h"
 #include "strategy2_remap.h"
 #include "vertex_pack.h"
+#include "write_schedule.h"
 
 #include <s2/s2latlng.h>
 #include <functional>
@@ -452,7 +454,7 @@ void emit_strategy2_sidecar(const std::string& path,
     IdAllocator::write_sidecar(path, slots);
 }
 
-void apply_strategy2_remaps(ParsedData& data, const std::string& prev_dir, RunOrder order) {
+void apply_strategy2_remaps(ParsedData& data, const std::string& prev_dir, RunOrder order, MemoryBudget* budget) {
     const std::string label = "      strategy2 " + prev_dir.substr(prev_dir.find_last_of('/') + 1) + ": ";
     // Admins first: their remap reaches into the way, POI and place arrays
     // the other passes reorder (a value remap commutes with a reorder, but
@@ -461,17 +463,23 @@ void apply_strategy2_remaps(ParsedData& data, const std::string& prev_dir, RunOr
     // the streets afterwards, which commutes with the addrs' reorder (an
     // addr tombstone's parent way is NO_DATA).
     timed_phase(label + "admins", [&] { apply_strategy2_admins(data, prev_dir); });
+    const KindValues costs = strategy2_pass_costs(data);
     std::vector<uint32_t> way_remap;
     std::vector<std::future<void>> passes;
-    auto start = [&](const char* kind, std::function<void()> pass) {
-        if (order == RunOrder::Serial) return timed_phase(label + kind, pass);
-        passes.push_back(std::async(std::launch::async, [&, kind, pass] { timed_phase(label + kind, pass); }));
+    auto start = [&](RecordKind kind, const char* name, std::function<void()> pass) {
+        auto run = [&, kind, name, pass] {
+            std::optional<BudgetLease> lease;
+            if (budget) lease.emplace(*budget, at(costs, kind));
+            timed_phase(label + name, pass);
+        };
+        if (order == RunOrder::Serial) return run();
+        passes.push_back(std::async(std::launch::async, run));
     };
-    start("streets", [&] { way_remap = apply_strategy2_streets(data, prev_dir); });
-    start("addrs", [&] { apply_strategy2_addrs(data, prev_dir); });
-    start("places", [&] { apply_strategy2_places(data, prev_dir); });
-    start("pois", [&] { apply_strategy2_pois(data, prev_dir); });
-    start("interps", [&] { apply_strategy2_interps(data, prev_dir); });
+    start(RecordKind::Ways, "streets", [&] { way_remap = apply_strategy2_streets(data, prev_dir); });
+    start(RecordKind::Addrs, "addrs", [&] { apply_strategy2_addrs(data, prev_dir); });
+    start(RecordKind::Places, "places", [&] { apply_strategy2_places(data, prev_dir); });
+    start(RecordKind::Pois, "pois", [&] { apply_strategy2_pois(data, prev_dir); });
+    start(RecordKind::Interps, "interps", [&] { apply_strategy2_interps(data, prev_dir); });
     for (auto& f : passes) f.get();
     if (!way_remap.empty())
         parallel_each(data.addr_points, [&](AddrPoint& ap) { remap_index(ap.parent_way_id, way_remap); });

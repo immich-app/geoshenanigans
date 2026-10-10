@@ -2141,11 +2141,16 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
     // running it inside the planet async raced filter_by_bbox_masked /
     // precompute_masks below. Continent subsets are also built from the
     // post-remap arrays this way (the schedule the racy code effectively
-    // produced in practice).
+    // produced in practice). Its passes run at once as far as the memory the
+    // host allows past what the build holds.
+    const uint64_t memory_limit = memory_limit_bytes();
     {
         std::string planet_prev;
         if (!prev_output_dir.empty()) planet_prev = prev_output_dir + "/planet";
-        timed_phase("    planet: strategy2 remap", [&] { apply_strategy2_remaps(data, planet_prev); });
+        MemoryBudget remap_budget(write_budget(memory_limit, static_cast<uint64_t>(get_rss_mb()) << 20));
+        timed_phase("    planet: strategy2 remap", [&] {
+            apply_strategy2_remaps(data, planet_prev, RunOrder::Concurrent, &remap_budget);
+        });
     }
     // Expose the prev-output root to write_index via env var so the
     // postcode_centroids strategy-2 pass (which runs inside write_index after
@@ -2176,7 +2181,6 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
     // continents share the memory the host allows past what the build holds
     // now (and the continent masks, a byte per cell pair, will), each
     // holding its estimated cost while it runs.
-    const uint64_t memory_limit = memory_limit_bytes();
     const uint64_t in_use = static_cast<uint64_t>(get_rss_mb()) << 20;
     const KindValues planet_pairs = pair_counts(data);
     const uint64_t masks_bytes = generate_continents ? sum(planet_pairs) : 0;
