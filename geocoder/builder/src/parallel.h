@@ -575,6 +575,22 @@ std::vector<size_t> parallel_find_all(size_t n, Pred pred, unsigned threads = 0)
     }, threads);
 }
 
+// How many i in [0, n) pred(i) holds for, tested on every core. Counting per
+// block keeps the cores off one shared counter.
+template <class Pred>
+size_t parallel_count(size_t n, Pred pred, unsigned threads = 0) {
+    if (threads == 0) threads = parallel_threads();
+    std::vector<size_t> counts(threads, 0);
+    size_t blocks = parallel_blocks(n, [&](size_t b, size_t begin, size_t end) {
+        size_t c = 0;
+        for (size_t i = begin; i < end; i++) c += pred(i) ? 1 : 0;
+        counts[b] = c;
+    }, threads);
+    size_t total = 0;
+    for (size_t b = 0; b < blocks; b++) total += counts[b];
+    return total;
+}
+
 // Whether pred(i) holds for any i in [0, n).
 template <class Pred>
 bool parallel_any(size_t n, Pred pred, unsigned threads = 0) {

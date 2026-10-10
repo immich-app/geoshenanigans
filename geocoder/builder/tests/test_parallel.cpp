@@ -378,6 +378,15 @@ TEST(parallel_filter_keeps_matching_indices_in_order) {
     }
 }
 
+TEST(parallel_count_counts_matches_for_any_thread_count) {
+    for (size_t n : {size_t(0), size_t(5), size_t(300000)}) {
+        size_t expect = 0;
+        for (size_t i = 0; i < n; i++) expect += i % 7 == 3;
+        for (unsigned threads : {1u, 4u, 64u})
+            CHECK_EQ(parallel_count(n, [](size_t i) { return i % 7 == 3; }, threads), expect);
+    }
+}
+
 TEST(parallel_any_finds_a_single_match) {
     for (unsigned threads : {1u, 3u, 64u}) {
         CHECK(parallel_any(100000, [](size_t i) { return i == 99999; }, threads));

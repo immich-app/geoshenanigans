@@ -575,7 +575,6 @@ static void compute_way_parent_polygons(ParsedData& data, const BuildConfig& cfg
             std::vector<uint32_t> seen;
             std::vector<PostalVote> postal_votes;
         };
-        std::atomic<uint64_t> way_linked{0};
         walk_items_by_cell<Candidates>(order, num_threads,
             [&](S2CellId cell, Candidates& c) {
                 // Admin levels <= 10 compete for the parent chain, postal
@@ -602,11 +601,7 @@ static void compute_way_parent_polygons(ParsedData& data, const BuildConfig& cfg
                 // admin_level, then smallest area. Parent-chain pick uses
                 // centroid PIP — admin hierarchy is fine-grained enough
                 // that centroid containment gives a stable result.
-                uint32_t parent = rings.first_containing(c.admins, center.lat, center.lng);
-                if (parent != NO_DATA) {
-                    data.way_parent_ids[i] = parent;
-                    way_linked++;
-                }
+                data.way_parent_ids[i] = rings.first_containing(c.admins, center.lat, center.lng);
 
                 // Nominatim's `getNearFeatures`
                 // (lib-sql/functions/partition-functions.sql:42)
@@ -654,8 +649,12 @@ static void compute_way_parent_polygons(ParsedData& data, const BuildConfig& cfg
                     data.way_postcode_ids[i] = data.admin_polygons[postal_votes[0].pid].name_id;
                 }
             });
+        // Counted afterwards: a shared per-way counter would bounce one
+        // cache line between every core.
+        size_t way_linked = parallel_count(data.ways.size(),
+            [&](size_t i) { return data.way_parent_ids[i] != NO_DATA; }, num_threads);
         double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - _wp_t).count();
-        std::cerr << "Way parent polygon: " << way_linked.load() << "/" << data.ways.size()
+        std::cerr << "Way parent polygon: " << way_linked << "/" << data.ways.size()
                   << " ways linked in " << el << "s" << std::endl;
         log_phase("    Admin: way parent polygons", _wp_t, _wp_cpu);
     }
@@ -807,16 +806,13 @@ static void backfill_addr_point_parent_streets(ParsedData& data, const BuildConf
     unsigned int num_threads = cfg.num_threads;
     if (!data.addr_points.empty() && !data.ways.empty()) {
         auto _as_t = std::chrono::steady_clock::now();
-        std::atomic<uint64_t> backfill_candidates{0};
-        for (const auto& p : data.addr_points) {
-            if (p.street_id == NO_DATA) backfill_candidates.fetch_add(1);
-        }
+        size_t backfill_candidates = parallel_count(data.addr_points.size(),
+            [&](size_t i) { return data.addr_points[i].street_id == NO_DATA; }, num_threads);
         std::cerr << "Backfilling addr_point parent streets ("
-                  << backfill_candidates.load() << "/"
+                  << backfill_candidates << "/"
                   << data.addr_points.size() << " need it)..."
                   << std::endl;
 
-        std::atomic<uint64_t> ap_linked{0};
         const auto& pool_data = data.string_pool.data();
         auto order = items_by_cell(data.addr_points.size(), num_threads, [&](size_t i) {
             return street_cell_of(data.addr_points[i].lat, data.addr_points[i].lng);
@@ -917,14 +913,17 @@ static void backfill_addr_point_parent_streets(ParsedData& data, const BuildConf
                             ap.street_id = best_name;
                         }
                     }
-                    ap_linked.fetch_add(1);
                 }
             });
+        // Counted afterwards: a shared per-point counter would bounce one
+        // cache line between every core.
+        size_t ap_linked = parallel_count(data.addr_points.size(),
+            [&](size_t i) { return data.addr_points[i].parent_way_id != NO_DATA; }, num_threads);
         double _ap_elapsed = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - _as_t).count();
         std::cerr << "Addr parent-street backfill: "
-                  << ap_linked.load() << "/"
-                  << backfill_candidates.load()
+                  << ap_linked << "/"
+                  << backfill_candidates
                   << " addr_points linked in "
                   << _ap_elapsed << "s" << std::endl;
         log_phase("  Addr: parent-street backfill", _s2t, _s2cpu);
@@ -1279,7 +1278,6 @@ static void compute_poi_parent_streets(ParsedData& data, const BuildConfig& cfg,
         std::cerr << "Computing POI parent-street links ("
                   << data.poi_records.size() << " POIs)..." << std::endl;
 
-        std::atomic<uint64_t> linked_count{0};
         auto order = items_by_cell(data.poi_records.size(), num_threads, [&](size_t i) {
             return street_cell_of(data.poi_records[i].lat, data.poi_records[i].lng);
         });
@@ -1307,16 +1305,17 @@ static void compute_poi_parent_streets(ParsedData& data, const BuildConfig& cfg,
                             best_street_osm = cand_osm;
                         }
                     });
-                if (best_name != 0xFFFFFFFFu) {
-                    pr.parent_street_id = best_name;
-                    linked_count.fetch_add(1);
-                }
+                pr.parent_street_id = best_name;
             });
+        // Counted afterwards: a shared per-POI counter would bounce one
+        // cache line between every core.
+        size_t linked_count = parallel_count(data.poi_records.size(),
+            [&](size_t i) { return data.poi_records[i].parent_street_id != 0xFFFFFFFFu; }, num_threads);
 
         double _elapsed = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - _ps_t).count();
         std::cerr << "POI parent-street linking: "
-                  << linked_count.load() << "/"
+                  << linked_count << "/"
                   << data.poi_records.size()
                   << " POIs linked to a named street in "
                   << _elapsed << "s" << std::endl;
@@ -1356,7 +1355,6 @@ static void compute_poi_parent_polygons(ParsedData& data, const BuildConfig& cfg
             std::vector<uint32_t> postal, admin;
             std::vector<std::pair<uint32_t, uint32_t>> scratch;
         };
-        std::atomic<uint64_t> postcode_linked{0}, admin_linked{0};
         walk_items_by_cell<Candidates>(order, num_threads,
             [&](S2CellId cell, Candidates& c) {
                 c.postal.clear();
@@ -1375,18 +1373,23 @@ static void compute_poi_parent_polygons(ParsedData& data, const BuildConfig& cfg
                 uint32_t postal = rings.first_containing(c.postal, pr.lat, pr.lng);
                 pr.parent_postcode_id = postal == NO_DATA ? NO_DATA : data.admin_polygons[postal].name_id;
                 pr.parent_poly_id = rings.first_containing(c.admin, pr.lat, pr.lng);
-                if (postal != NO_DATA) postcode_linked++;
-                if (pr.parent_poly_id != NO_DATA) admin_linked++;
             });
+        // Counted afterwards: shared per-POI counters would bounce one cache
+        // line between every core. Postal boundaries are named, so a POI
+        // has a postcode exactly when it found one.
+        size_t postcode_linked = parallel_count(data.poi_records.size(),
+            [&](size_t i) { return data.poi_records[i].parent_postcode_id != NO_DATA; }, num_threads);
+        size_t admin_linked = parallel_count(data.poi_records.size(),
+            [&](size_t i) { return data.poi_records[i].parent_poly_id != NO_DATA; }, num_threads);
 
         double _pp_el = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - _pp_t).count();
         std::cerr << "POI parent-postcode linking: "
-                  << postcode_linked.load() << "/"
+                  << postcode_linked << "/"
                   << data.poi_records.size()
                   << " POIs linked to a postal boundary" << std::endl;
         std::cerr << "POI parent-admin linking: "
-                  << admin_linked.load() << "/"
+                  << admin_linked << "/"
                   << data.poi_records.size()
                   << " POIs linked to an admin polygon in "
                   << _pp_el << "s" << std::endl;
