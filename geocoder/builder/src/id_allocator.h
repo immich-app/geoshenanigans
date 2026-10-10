@@ -308,3 +308,13 @@ private:
 };
 
 } // namespace gc::id_alloc
+
+// Strategy-2 helper: pack (ObjectType, osm_id) into a single uint64_t.
+// Top 8 bits = type discriminator, bottom 56 bits = the id (or content
+// hash for synthetic identities like TIGER imports). OSM ids fit
+// comfortably in 56 bits (the largest live osm_node_id is ~13B = 34
+// bits, leaving 22 bits of headroom).
+inline uint64_t pack_osm_id(gc::id_alloc::ObjectType type, int64_t osm_id) {
+    return (static_cast<uint64_t>(type) << 56) |
+           (static_cast<uint64_t>(osm_id) & 0x00FFFFFFFFFFFFFFull);
+}

@@ -39,15 +39,6 @@
 #include "parsed_data.h"
 #include "reorder.h"
 
-// Strategy-2 helper: pack (ObjectType, osm_id) into a single uint64_t.
-// Top 8 bits = type discriminator, bottom 56 bits = the id (or content
-// hash for synthetic identities like TIGER imports). OSM ids fit
-// comfortably in 56 bits (the largest live osm_node_id is ~13B = 34
-// bits, leaving 22 bits of headroom).
-inline uint64_t pack_osm_id(gc::id_alloc::ObjectType type, int64_t osm_id) {
-    return (static_cast<uint64_t>(type) << 56) |
-           (static_cast<uint64_t>(osm_id) & 0x00FFFFFFFFFFFFFFull);
-}
 #include "s2_helpers.h"
 #include "ring_assembly.h"
 #include "continent_boundaries.h"
@@ -141,40 +132,6 @@ static bool read_whole_file(const std::string& path, std::string& out) {
     f.read(out.data(), static_cast<std::streamsize>(out.size()));
     out.resize(static_cast<size_t>(f.gcount()));
     return true;
-}
-
-// Appends one TIGER CSV's ranges to the interpolation arrays and its
-// postcode midpoints to postcode_accum.
-static void add_tiger_ranges(ParsedData& data, const TigerCsv& csv) {
-    std::vector<uint32_t> string_ids(csv.strings.size());
-    for (size_t i = 0; i < csv.strings.size(); i++) string_ids[i] = data.string_pool.intern(csv.strings[i]);
-
-    uint32_t node_base = static_cast<uint32_t>(data.interp_nodes.size());
-    data.interp_nodes.insert(data.interp_nodes.end(), csv.nodes.begin(), csv.nodes.end());
-    for (const auto& range : csv.ranges) {
-        InterpWay iw{};
-        iw.node_offset = node_base + range.node_offset;
-        iw.node_count = range.node_count;
-        iw.street_id = string_ids[range.street];
-        iw.start_number = range.start_number;
-        iw.end_number = range.end_number;
-        iw.interpolation = range.interpolation;
-
-        // Defer S2 computation
-        uint32_t interp_id = static_cast<uint32_t>(data.interp_ways.size());
-        data.interp_ways.push_back(iw);
-        data.interp_osm_ids.push_back(
-            pack_osm_id(gc::id_alloc::ObjectType::SYNTHETIC, static_cast<int64_t>(range.synthetic_id)));
-        data.deferred_interps.push_back({interp_id, iw.node_offset, iw.node_count});
-        data.interp_postcode_ids.push_back(
-            range.postcode == TigerCsv::kNoPostcode ? NO_DATA : string_ids[range.postcode]);
-    }
-    for (const auto& pc : csv.postcodes) {
-        auto& acc = data.postcode_accum[postcode_key(pc.country, string_ids[pc.postcode])];
-        acc.sum_lat_e7 += pc.sum.sum_lat_e7;
-        acc.sum_lng_e7 += pc.sum.sum_lng_e7;
-        acc.count += pc.sum.count;
-    }
 }
 
 // The TIGER CSVs to load, sorted: those in the directory given, or in the
