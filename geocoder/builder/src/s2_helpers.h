@@ -28,7 +28,10 @@ extern double kSimplifyEpsilonOverride; // 0 = use per-level defaults
 
 // --- S2 helpers ---
 
-void cover_edge(double lat1, double lng1, double lat2, double lng2,
+// The street-level cells the edge from (lat1, lng1) to (lat2, lng2) crosses.
+// c1 and c2 are its ends' cells, point_to_cell of each: a polyline's inner
+// nodes end two edges, so callers compute each once.
+void cover_edge(S2CellId c1, S2CellId c2, double lat1, double lng1, double lat2, double lng2,
                 std::vector<S2CellId>& out);
 
 

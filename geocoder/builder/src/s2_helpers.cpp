@@ -25,12 +25,9 @@ double kSimplifyEpsilonOverride = 0;
 
 // --- cover_edge ---
 
-void cover_edge(double lat1, double lng1, double lat2, double lng2,
+void cover_edge(S2CellId c1, S2CellId c2, double lat1, double lng1, double lat2, double lng2,
                 std::vector<S2CellId>& out) {
     out.clear();
-
-    S2CellId c1 = S2CellId(S2LatLng::FromDegrees(lat1, lng1)).parent(kStreetCellLevel);
-    S2CellId c2 = S2CellId(S2LatLng::FromDegrees(lat2, lng2)).parent(kStreetCellLevel);
 
     // Same cell — most common case for short edges
     if (c1 == c2) {

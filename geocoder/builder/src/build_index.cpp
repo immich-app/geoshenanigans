@@ -953,7 +953,7 @@ static std::vector<std::vector<CellItemPair>> emit_item_cells(size_t n, size_t g
 
 // Scratch for covering a polyline's edges with street-level cells.
 struct EdgeCellScratch {
-    std::vector<S2CellId> edge_cells;
+    std::vector<S2CellId> node_cells, edge_cells;
     std::vector<uint64_t> cells;
 };
 
@@ -962,8 +962,12 @@ struct EdgeCellScratch {
 static void emit_polyline_cells(const NodeCoord* nodes, uint16_t count, uint32_t item,
                 EdgeCellScratch& s, std::vector<CellItemPair>& out) {
     s.cells.clear();
+    s.node_cells.clear();
+    if (count >= 2)
+        for (uint16_t j = 0; j < count; j++) s.node_cells.push_back(point_to_cell(nodes[j].lat, nodes[j].lng));
     for (uint16_t j = 0; j + 1 < count; j++) {
-        cover_edge(nodes[j].lat, nodes[j].lng, nodes[j + 1].lat, nodes[j + 1].lng, s.edge_cells);
+        cover_edge(s.node_cells[j], s.node_cells[j + 1], nodes[j].lat, nodes[j].lng, nodes[j + 1].lat,
+                   nodes[j + 1].lng, s.edge_cells);
         for (const auto& c : s.edge_cells) s.cells.push_back(c.id());
     }
     std::sort(s.cells.begin(), s.cells.end());
