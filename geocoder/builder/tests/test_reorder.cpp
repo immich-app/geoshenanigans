@@ -275,7 +275,7 @@ void check_steps_match_reference(uint64_t seed, const Shape& s) {
         reorder_interps(got, threads);
         reorder_admin_polygons(got, threads);
         reorder_pois(got, got_ele, got_qids, links, threads);
-        reorder_place_nodes(got);
+        reorder_place_nodes(got, threads);
 
         check_same_records(want, got);
         CHECK(same_bytes(want_ele, got_ele));

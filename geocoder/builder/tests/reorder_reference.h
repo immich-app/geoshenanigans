@@ -3,6 +3,8 @@
 // reproduce for any input and thread count (test_reorder.cpp).
 #pragma once
 
+#include <numeric>
+
 #include "reorder.h"
 
 namespace reorder_ref {

@@ -10,7 +10,6 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
-#include <numeric>
 #include <vector>
 
 #include "parallel.h"
@@ -106,6 +105,25 @@ Repacked<T> repack(size_t n, const std::vector<T>& src, Count count, From from, 
             if (size_t c = out.at[i + 1] - out.at[i]) std::copy_n(src.begin() + from(i), c, out.items.begin() + out.at[i]);
     }, threads);
     return out;
+}
+
+// values[order[i]] for every i.
+template <class T>
+std::vector<T> gather(const std::vector<T>& values, const std::vector<uint32_t>& order, unsigned threads) {
+    std::vector<T> out(order.size());
+    parallel_for(order.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t i = b; i < e; i++) out[i] = values[order[i]];
+    }, threads);
+    return out;
+}
+
+// old_to_new for a permutation: order[i] becomes i.
+inline std::vector<uint32_t> invert(const std::vector<uint32_t>& order, unsigned threads) {
+    std::vector<uint32_t> old_to_new(order.size());
+    parallel_for(order.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t i = b; i < e; i++) old_to_new[order[i]] = static_cast<uint32_t>(i);
+    }, threads);
+    return old_to_new;
 }
 
 // Sorts addr_points by (street_id, housenumber_id, lat_bits, lng_bits, ...).
@@ -439,25 +457,6 @@ inline void reorder_interps(ParsedData& data, unsigned threads = 0) {
               << " (" << (n - kept) << " duplicates removed)" << std::endl;
 }
 
-// values[order[i]] for every i.
-template <class T>
-std::vector<T> gather(const std::vector<T>& values, const std::vector<uint32_t>& order, unsigned threads) {
-    std::vector<T> out(order.size());
-    parallel_for(order.size(), [&](size_t b, size_t e, unsigned) {
-        for (size_t i = b; i < e; i++) out[i] = values[order[i]];
-    }, threads);
-    return out;
-}
-
-// old_to_new for a permutation: order[i] becomes i.
-inline std::vector<uint32_t> invert(const std::vector<uint32_t>& order, unsigned threads) {
-    std::vector<uint32_t> old_to_new(order.size());
-    parallel_for(order.size(), [&](size_t b, size_t e, unsigned) {
-        for (size_t i = b; i < e; i++) old_to_new[order[i]] = static_cast<uint32_t>(i);
-    }, threads);
-    return old_to_new;
-}
-
 // Sorts admin polygons by (name, level, country, vertex_count) and reorders
 // their vertices.
 inline void reorder_admin_polygons(ParsedData& data, unsigned threads = 0) {
@@ -713,38 +712,30 @@ inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
 }
 
 // Sorts place nodes by (place_type, name_id, lat_bits, lng_bits).
-inline void reorder_place_nodes(ParsedData& data) {
-    if (!data.place_nodes.empty()) {
-        size_t n = data.place_nodes.size();
-        std::vector<uint32_t> order(n);
-        std::iota(order.begin(), order.end(), 0);
-        std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
-            const auto& pa = data.place_nodes[a];
-            const auto& pb = data.place_nodes[b];
-            if (pa.place_type != pb.place_type) return pa.place_type < pb.place_type;
-            if (pa.name_id != pb.name_id) return pa.name_id < pb.name_id;
-            uint32_t la = float_bits(pa.lat), lb = float_bits(pb.lat);
-            if (la != lb) return la < lb;
-            uint32_t ga = float_bits(pa.lng), gb = float_bits(pb.lng);
-            if (ga != gb) return ga < gb;
-            if (data.place_osm_ids.size() == data.place_nodes.size())
-                return data.place_osm_ids[a] < data.place_osm_ids[b];
-            return false;
-        });
-        std::vector<uint32_t> old_to_new(n);
-        for (uint32_t i = 0; i < n; i++) old_to_new[order[i]] = i;
-        std::vector<PlaceNode> sorted(n);
-        for (uint32_t i = 0; i < n; i++) sorted[i] = data.place_nodes[order[i]];
-        // Reorder place_osm_ids in lockstep
-        if (data.place_osm_ids.size() == n) {
-            std::vector<uint64_t> new_osm(n);
-            for (uint32_t i = 0; i < n; i++) new_osm[i] = data.place_osm_ids[order[i]];
-            data.place_osm_ids = std::move(new_osm);
-        }
-        data.place_nodes = std::move(sorted);
-        for (auto& p : data.sorted_place_cells) p.item_id = old_to_new[p.item_id];
-        auto cmp = cell_item_less;
-        std::sort(data.sorted_place_cells.begin(), data.sorted_place_cells.end(), cmp);
-        std::cerr << "  Place nodes sorted: " << n << std::endl;
-    }
+inline void reorder_place_nodes(ParsedData& data, unsigned threads = 0) {
+    if (data.place_nodes.empty()) return;
+
+    const size_t n = data.place_nodes.size();
+    const auto& places = data.place_nodes;
+    const bool have_osm = data.place_osm_ids.size() == n;
+    auto place_less = [&](uint32_t a, uint32_t b) {
+        const auto& pa = places[a];
+        const auto& pb = places[b];
+        if (pa.place_type != pb.place_type) return pa.place_type < pb.place_type;
+        if (pa.name_id != pb.name_id) return pa.name_id < pb.name_id;
+        uint32_t la = float_bits(pa.lat), lb = float_bits(pb.lat);
+        if (la != lb) return la < lb;
+        uint32_t ga = float_bits(pa.lng), gb = float_bits(pb.lng);
+        if (ga != gb) return ga < gb;
+        if (have_osm) return data.place_osm_ids[a] < data.place_osm_ids[b];
+        return false;
+    };
+    const std::vector<uint32_t> order =
+        parallel_sort_indices(n, place_less, [](uint32_t, uint32_t) { return true; }, threads);
+    // Reorder place_osm_ids in lockstep
+    if (have_osm) data.place_osm_ids = gather(data.place_osm_ids, order, threads);
+    data.place_nodes = gather(places, order, threads);
+    const std::vector<uint32_t> old_to_new = invert(order, threads);
+    renumber_cell_pairs(data.sorted_place_cells, [&](uint32_t id) { return old_to_new[id]; }, threads);
+    std::cerr << "  Place nodes sorted: " << n << std::endl;
 }
