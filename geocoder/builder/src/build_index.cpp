@@ -474,6 +474,7 @@ static void compute_admin_parent_chain(ParsedData& data, const BuildConfig& cfg)
     unsigned int num_threads = cfg.num_threads;
     {
         auto _ap_t = std::chrono::steady_clock::now();
+        auto _ap_cpu = CpuTicks::now();
         data.admin_parent_ids.assign(data.admin_polygons.size(), NO_DATA);
         const AdminRings rings(data, num_threads);
         std::atomic<size_t> ap_idx{0};
@@ -535,6 +536,7 @@ static void compute_admin_parent_chain(ParsedData& data, const BuildConfig& cfg)
         for (auto id : data.admin_parent_ids) if (id != NO_DATA) linked++;
         std::cerr << "Admin parent chain: " << linked << "/" << data.admin_polygons.size()
                   << " polygons linked in " << el << "s" << std::endl;
+        log_phase("    Admin: parent chain", _ap_t, _ap_cpu);
     }
 }
 
@@ -544,6 +546,7 @@ static void compute_way_parent_polygons(ParsedData& data, const BuildConfig& cfg
     unsigned int num_threads = cfg.num_threads;
     {
         auto _wp_t = std::chrono::steady_clock::now();
+        auto _wp_cpu = CpuTicks::now();
         data.way_parent_ids.assign(data.ways.size(), NO_DATA);
         data.way_postcode_ids.assign(data.ways.size(), NO_DATA);
         require_ordered_admin_areas(data);
@@ -670,6 +673,7 @@ static void compute_way_parent_polygons(ParsedData& data, const BuildConfig& cfg
         double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - _wp_t).count();
         std::cerr << "Way parent polygon: " << way_linked.load() << "/" << data.ways.size()
                   << " ways linked in " << el << "s" << std::endl;
+        log_phase("    Admin: way parent polygons", _wp_t, _wp_cpu);
     }
 }
 
@@ -790,11 +794,11 @@ static void for_each_nearby_named_street(const ParsedData& data, const NearbyStr
 
 // Address-point parent-street backfill: link addr_points lacking addr:street to the
 // nearest named street's name_id (Nominatim parent_place_id parity).
-static void backfill_addr_point_parent_streets(ParsedData& data, const BuildConfig& cfg) {
+static void backfill_addr_point_parent_streets(ParsedData& data, const BuildConfig& cfg,
+                std::chrono::steady_clock::time_point& _s2t, CpuTicks& _s2cpu) {
     unsigned int num_threads = cfg.num_threads;
     if (!data.addr_points.empty() && !data.ways.empty()) {
         auto _as_t = std::chrono::steady_clock::now();
-        auto _as_cpu = CpuTicks::now();
         std::atomic<uint64_t> backfill_candidates{0};
         for (const auto& p : data.addr_points) {
             if (p.street_id == NO_DATA) backfill_candidates.fetch_add(1);
@@ -915,7 +919,7 @@ static void backfill_addr_point_parent_streets(ParsedData& data, const BuildConf
                   << backfill_candidates.load()
                   << " addr_points linked in "
                   << _ap_elapsed << "s" << std::endl;
-        log_phase("  Addr: parent-street backfill", _as_t, _as_cpu);
+        log_phase("  Addr: parent-street backfill", _s2t, _s2cpu);
     }
 }
 
@@ -1634,7 +1638,7 @@ static void compute_s2_and_poi_cells(ParsedData& data, const BuildConfig& cfg,
 
         compute_poi_parent_polygons(data, cfg, _s2t, _s2cpu);
 
-        backfill_addr_point_parent_streets(data, cfg);
+        backfill_addr_point_parent_streets(data, cfg, _s2t, _s2cpu);
 
         // Free deferred work items
         data.deferred_ways.clear();
