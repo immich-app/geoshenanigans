@@ -1033,23 +1033,49 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
     log_phase((label + "total").c_str(), _total_t, _total_c);
 }
 
-// Simplify one polygon's vertices at a given epsilon (or pass through if
-// epsilon_scale == 0). Helper used by both quality variant + admin-minimal.
-static std::vector<std::pair<double,double>>
-simplify_admin_polygon(const ParsedData& data,
-                       const AdminPolygon& ap,
-                       double epsilon_scale) {
+// One admin polygon re-simplified at epsilon_scale (0 = as is) and packed on
+// its own; no bytes when fewer than 3 vertices survive. Packed bytes don't
+// depend on where they land, so the writers lay these out back to back
+// instead of holding every simplified vertex list (6 GiB of doubles for the
+// planet's uncapped variant).
+struct PackedPolygon {
+    std::vector<uint8_t> bytes;
+    uint32_t vertex_count = 0;
+    float area = 0;
+};
+static PackedPolygon pack_admin_polygon(const ParsedData& data, const AdminPolygon& ap,
+                                        double epsilon_scale) {
     std::vector<std::pair<double,double>> pts;
     pts.reserve(ap.vertex_count);
     for (uint32_t j = 0; j < ap.vertex_count; j++) {
         const auto& v = data.admin_vertices[ap.vertex_offset + j];
         pts.emplace_back(v.lat, v.lng);
     }
-    if (epsilon_scale <= 0) return pts;
-    double eps_m = admin_epsilon_meters(ap.admin_level) * epsilon_scale;
-    double lat = pts.empty() ? 0.0 : pts[0].first;
-    double eps_deg = meters_to_degrees(eps_m, lat);
-    return simplify_polygon_epsilon(pts, eps_deg);
+    if (epsilon_scale > 0) {
+        double eps_m = admin_epsilon_meters(ap.admin_level) * epsilon_scale;
+        double lat = pts.empty() ? 0.0 : pts[0].first;
+        pts = simplify_polygon_epsilon(pts, meters_to_degrees(eps_m, lat));
+    }
+    PackedPolygon out;
+    if (pts.size() < 3) return out;
+
+    out.bytes.resize(plan_polygon(pts.data(), pts.size()).bytes);
+    pack_polygon_at(out.bytes.data(), pts.data(), pts.size());
+    out.vertex_count = static_cast<uint32_t>(pts.size());
+    out.area = polygon_area(pts);
+    return out;
+}
+
+// Writes packed polygons back to back: bytes_of(j) for j in [0, n), null to
+// skip one.
+template <class BytesOf>
+static void write_packed_polygons(const std::string& path, size_t n, BytesOf bytes_of) {
+    std::ofstream f(path, std::ios::binary);
+    for (size_t j = 0; j < n; j++)
+        if (const std::vector<uint8_t>* bytes = bytes_of(j))
+            f.write(reinterpret_cast<const char*>(bytes->data()), static_cast<std::streamsize>(bytes->size()));
+    f.flush();
+    if (!f) throw std::runtime_error("failed to write " + path);
 }
 
 void write_quality_variant(const ParsedData& data, const std::string& source_dir,
@@ -1059,32 +1085,13 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
     auto _qt = std::chrono::steady_clock::now();
     auto _qc = CpuTicks::now();
 
-    // Re-simplify admin polygons at the given epsilon scale
-    std::vector<AdminPolygon> new_polys;
-    std::vector<NodeCoord> new_verts;
-    new_polys.reserve(data.admin_polygons.size());
-
-    // Parallel simplification
-    struct SimplifiedPoly {
-        std::vector<std::pair<double,double>> verts;
-    };
-    std::vector<SimplifiedPoly> simplified(data.admin_polygons.size());
-
-    parallel_for_dynamic(data.admin_polygons.size(), 1, [&](size_t begin, size_t end, unsigned) {
+    const size_t n = data.admin_polygons.size();
+    std::vector<PackedPolygon> packed(n);
+    parallel_for_dynamic(n, 1, [&](size_t begin, size_t end, unsigned) {
         for (size_t i = begin; i < end; i++)
-            simplified[i].verts = simplify_admin_polygon(data, data.admin_polygons[i], epsilon_scale);
+            packed[i] = pack_admin_polygon(data, data.admin_polygons[i], epsilon_scale);
     });
     log_phase((label + "simplify").c_str(), _qt, _qc);
-
-    // Sequential: build new polygon/vertex arrays. Postal boundaries
-    // (admin_level=11) are kept in the main arrays (cell index references
-    // them by ID) AND also written to separate optional files.
-    std::vector<AdminPolygon> postal_polys;
-    std::vector<uint8_t> new_verts_bytes;       // packed: variable stride per polygon
-    std::vector<uint8_t> postal_verts_bytes;
-    // Don't pre-reserve verts — overestimates lead to large unused
-    // allocations across multiple concurrent continent writers and can
-    // OOM the GH runner.  Vector growth is amortized cheap.
 
     // admin_polygons.bin MUST stay index-aligned with data.admin_polygons:
     // the cell index (admin_cells/admin_entries, written by the full/admin
@@ -1097,56 +1104,40 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
     // are written as NO_DATA tombstone records, which the accessor skips.
     // (Previously this loop push_back-compacted; with strategy-2 tombstones
     // present that shifted every slot past the first gap and corrupted
-    // admin lookups.)
-    new_polys.assign(data.admin_polygons.size(), admin_polygon_tombstone());
-
-    // Slot i stays a NO_DATA tombstone when fewer than 3 vertices survive.
-    auto drawn_bytes = [&](size_t i) -> size_t {
-        const auto& sv = simplified[i].verts;
-        return sv.size() < 3 ? 0 : plan_polygon(sv.data(), sv.size()).bytes;
-    };
-    parallel_prefix_fill(data.admin_polygons.size(), drawn_bytes,
-        [&](size_t total) { new_verts_bytes.resize(total); },
-        [&](size_t i, size_t offset) -> size_t {
-            const auto& sv = simplified[i].verts;
-            if (sv.size() < 3) return 0;
-
-            AdminPolygon np = data.admin_polygons[i];
-            size_t bytes = pack_polygon_at(new_verts_bytes.data() + offset, sv.data(), sv.size());
-            np.vertex_offset = static_cast<uint32_t>(offset);
-            np.vertex_count = static_cast<uint32_t>(sv.size());
-            np.area = polygon_area(sv);
-            new_polys[i] = np;
-            return bytes;
-        });
-
-    // Postal also go into separate files (for optional loading)
+    // admin lookups.) Postal boundaries (admin_level=11) are kept in the
+    // main arrays (cell index references them by ID) AND also written to
+    // separate optional files.
+    std::vector<AdminPolygon> new_polys(n, admin_polygon_tombstone());
+    std::vector<AdminPolygon> postal_polys;
     std::vector<uint32_t> postal_idx;
-    for (size_t i = 0; i < new_polys.size(); i++)
-        if (simplified[i].verts.size() >= 3 && new_polys[i].admin_level == 11)
-            postal_idx.push_back(static_cast<uint32_t>(i));
-    postal_polys.resize(postal_idx.size());
-    parallel_prefix_fill(postal_idx.size(), [&](size_t k) { return drawn_bytes(postal_idx[k]); },
-        [&](size_t total) { postal_verts_bytes.resize(total); },
-        [&](size_t k, size_t offset) -> size_t {
-            const auto& sv = simplified[postal_idx[k]].verts;
-            AdminPolygon pp = new_polys[postal_idx[k]];
-            pp.vertex_offset = static_cast<uint32_t>(offset);
-            postal_polys[k] = pp;
-            return pack_polygon_at(postal_verts_bytes.data() + offset, sv.data(), sv.size());
-        });
+    size_t vertex_bytes = 0, postal_bytes = 0;
+    for (size_t i = 0; i < n; i++) {
+        const PackedPolygon& pp = packed[i];
+        if (pp.bytes.empty()) continue;
+
+        AdminPolygon np = data.admin_polygons[i];
+        np.vertex_offset = static_cast<uint32_t>(vertex_bytes);
+        np.vertex_count = pp.vertex_count;
+        np.area = pp.area;
+        new_polys[i] = np;
+        vertex_bytes += pp.bytes.size();
+        if (np.admin_level != 11) continue;
+        np.vertex_offset = static_cast<uint32_t>(postal_bytes);
+        postal_polys.push_back(np);
+        postal_idx.push_back(static_cast<uint32_t>(i));
+        postal_bytes += pp.bytes.size();
+    }
 
     std::cerr << "Quality " << epsilon_scale << "x: " << new_polys.size()
-              << " admin polygons, " << new_verts_bytes.size() / 1024 / 1024
+              << " admin polygons, " << vertex_bytes / 1024 / 1024
               << " MiB packed vertices, " << postal_polys.size() << " postal polygons" << std::endl;
 
     // Write admin files (excluding postal)
     write_binary_file(output_dir + "/admin_polygons.bin",
                       reinterpret_cast<const char*>(new_polys.data()),
                       new_polys.size() * sizeof(AdminPolygon));
-    write_binary_file(output_dir + "/admin_vertices.bin",
-                      reinterpret_cast<const char*>(new_verts_bytes.data()),
-                      new_verts_bytes.size());
+    write_packed_polygons(output_dir + "/admin_vertices.bin", n,
+                          [&](size_t i) { return &packed[i].bytes; });
     // Strategy-2 sidecar for admin polygons (cached only). Same content
     // across full/no-addresses/admin since they share the same polygon
     // set. data.admin_osm_ids is already packed (ObjectType<<56 |
@@ -1172,9 +1163,8 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
         write_binary_file(output_dir + "/postal_polygons.bin",
                           reinterpret_cast<const char*>(postal_polys.data()),
                           postal_polys.size() * sizeof(AdminPolygon));
-        write_binary_file(output_dir + "/postal_vertices.bin",
-                          reinterpret_cast<const char*>(postal_verts_bytes.data()),
-                          postal_verts_bytes.size());
+        write_packed_polygons(output_dir + "/postal_vertices.bin", postal_idx.size(),
+                              [&](size_t k) { return &packed[postal_idx[k]].bytes; });
     }
 
     log_phase((label + "pack + write").c_str(), _qt, _qc);
@@ -1200,12 +1190,10 @@ void write_admin_minimal_polygons(const ParsedData& data,
     }
 
     // Parallel simplification of just the kept polygons.
-    struct SimplifiedPoly { std::vector<std::pair<double,double>> verts; };
-    std::vector<SimplifiedPoly> simplified(kept_idx.size());
+    std::vector<PackedPolygon> packed(kept_idx.size());
     parallel_for_dynamic(kept_idx.size(), 1, [&](size_t begin, size_t end, unsigned) {
         for (size_t k = begin; k < end; k++)
-            simplified[k].verts = simplify_admin_polygon(
-                data, data.admin_polygons[kept_idx[k]], epsilon_scale);
+            packed[k] = pack_admin_polygon(data, data.admin_polygons[kept_idx[k]], epsilon_scale);
     });
 
     // Survivors keep stable slots in admin-minimal's own numbering and
@@ -1217,7 +1205,7 @@ void write_admin_minimal_polygons(const ParsedData& data,
     if (!prev_dir.empty()) alloc.load_previous(prev_dir + "/admin-minimal/admin_polygons.osm_ids");
     std::vector<size_t> drawn;  // kept polygons with a shape left after simplifying
     for (size_t k = 0; k < kept_idx.size(); k++)
-        if (simplified[k].verts.size() >= 3) drawn.push_back(k);
+        if (!packed[k].bytes.empty()) drawn.push_back(k);
     const std::vector<uint32_t> drawn_slots = alloc.allocate_all(drawn.size(), [&](size_t j) {
         size_t old_id = kept_idx[drawn[j]];
         return admin_identity(old_id < data.admin_osm_ids.size() ? data.admin_osm_ids[old_id] : 0);
@@ -1228,40 +1216,32 @@ void write_admin_minimal_polygons(const ParsedData& data,
 
     // Vertex bytes in slot order, so offsets ascend with ids.
     std::vector<AdminPolygon> new_polys(alloc.total_slots(), admin_polygon_tombstone());
-    std::vector<uint8_t> new_verts_bytes;
     const size_t kept = drawn.size();
-    parallel_prefix_fill(kept_at_slot.size(),
-        [&](size_t slot) -> size_t {
-            size_t k = kept_at_slot[slot];
-            if (k == SIZE_MAX) return 0;
-            const auto& sv = simplified[k].verts;
-            return plan_polygon(sv.data(), sv.size()).bytes;
-        },
-        [&](size_t total) { new_verts_bytes.resize(total); },
-        [&](size_t slot, size_t offset) -> size_t {
-            size_t k = kept_at_slot[slot];
-            if (k == SIZE_MAX) return 0;
-            const auto& sv = simplified[k].verts;
-            AdminPolygon np = data.admin_polygons[kept_idx[k]];
-            size_t bytes = pack_polygon_at(new_verts_bytes.data() + offset, sv.data(), sv.size());
-            np.vertex_offset = static_cast<uint32_t>(offset);
-            np.vertex_count = static_cast<uint32_t>(sv.size());
-            np.area = polygon_area(sv);
-            id_remap[kept_idx[k]] = static_cast<uint32_t>(slot);
-            new_polys[slot] = np;
-            return bytes;
-        });
+    size_t vertex_bytes = 0;
+    for (size_t slot = 0; slot < kept_at_slot.size(); slot++) {
+        size_t k = kept_at_slot[slot];
+        if (k == SIZE_MAX) continue;
+
+        AdminPolygon np = data.admin_polygons[kept_idx[k]];
+        np.vertex_offset = static_cast<uint32_t>(vertex_bytes);
+        np.vertex_count = packed[k].vertex_count;
+        np.area = packed[k].area;
+        id_remap[kept_idx[k]] = static_cast<uint32_t>(slot);
+        new_polys[slot] = np;
+        vertex_bytes += packed[k].bytes.size();
+    }
 
     write_binary_file(output_dir + "/admin_polygons.bin",
                       reinterpret_cast<const char*>(new_polys.data()),
                       new_polys.size() * sizeof(AdminPolygon));
-    write_binary_file(output_dir + "/admin_vertices.bin",
-                      reinterpret_cast<const char*>(new_verts_bytes.data()),
-                      new_verts_bytes.size());
+    write_packed_polygons(output_dir + "/admin_vertices.bin", kept_at_slot.size(),
+        [&](size_t slot) -> const std::vector<uint8_t>* {
+            return kept_at_slot[slot] == SIZE_MAX ? nullptr : &packed[kept_at_slot[slot]].bytes;
+        });
     IdAllocator::write_sidecar(output_dir + "/admin_polygons.osm_ids", alloc.slots());
 
     std::cerr << "  Admin-minimal polygons: " << kept << " kept in " << new_polys.size()
               << " slots (of " << data.admin_polygons.size() << "), "
-              << new_verts_bytes.size() / 1024 / 1024 << " MiB packed vertices"
+              << vertex_bytes / 1024 / 1024 << " MiB packed vertices"
               << std::endl;
 }
