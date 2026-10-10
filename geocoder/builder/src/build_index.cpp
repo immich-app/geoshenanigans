@@ -1154,18 +1154,24 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
                       << " claimed ids)" << std::endl;
         }
 
-        std::unordered_map<std::string, std::vector<uint32_t>> name_to_places;
-        name_to_places.reserve(data.place_nodes.size());
+        // (normalised name, node) of every named node, sorted on every core:
+        // a name's nodes sit together, in node order.
         const auto& pool_data = data.string_pool.data();
-        for (uint32_t i = 0; i < data.place_nodes.size(); i++) {
-            const auto& pn = data.place_nodes[i];
-            if (pn.name_id == NO_DATA) continue;
-            const char* nm = pool_data.data() + pn.name_id;
-            if (!nm[0]) continue;
-            std::string nn = normalise_for_matching(nm);
-            if (nn.empty()) continue;
-            name_to_places[std::move(nn)].push_back(i);
-        }
+        using NamedPlace = std::pair<std::string, uint32_t>;
+        std::vector<NamedPlace> named = parallel_collect<NamedPlace>(data.place_nodes.size(),
+            [&](size_t i, std::vector<NamedPlace>& out) {
+                const auto& pn = data.place_nodes[i];
+                if (pn.name_id == NO_DATA) return;
+                const char* nm = pool_data.data() + pn.name_id;
+                if (!nm[0]) return;
+                std::string nn = normalise_for_matching(nm);
+                if (!nn.empty()) out.emplace_back(std::move(nn), static_cast<uint32_t>(i));
+            }, num_threads);
+        parallel_sort(named.begin(), named.end(), std::less<NamedPlace>(), num_threads);
+        auto places_named = [&](const std::string& name) {
+            return std::equal_range(named.begin(), named.end(), NamedPlace{name, 0},
+                                    [](const NamedPlace& a, const NamedPlace& b) { return a.first < b.first; });
+        };
 
         // PlaceType → rank_search. Matches Nominatim's
         // address_levels.json defaults: place=city 16, town 18,
@@ -1248,46 +1254,45 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
                     uint32_t best_idx = NO_DATA;
                     double best_dist_sq = max_dist_sq;
 
-                    auto it = name_to_places.find(nb);
-                    if (it != name_to_places.end()) {
-                        for (uint32_t pidx : it->second) {
-                            const auto& pn = data.place_nodes[pidx];
-                            uint8_t pr = place_addr_rank(pn.place_type);
-                            if (pr == 255) continue;
-                            // Nominatim's name-match branch requires the
-                            // node's address rank to EQUAL the boundary's
-                            // rank_address (find_linked_place in
-                            // placex_triggers.sql). The previous ±2 window
-                            // on rank_search linked NL gemeentes (rank 14)
-                            // to their town nodes (16), relabelling
-                            // municipalities as towns.
-                            if (pr != bnd_rank) continue;
-                            double dlat = (double)pn.lat - clat;
-                            double dlng = (double)pn.lng - clng;
-                            double d2 = dlat * dlat + dlng * dlng;
-                            if (d2 > best_dist_sq) continue;
-                            if (d2 == best_dist_sq) {
-                                // Preserve the original `>=` reject at the
-                                // distance threshold (no real candidate yet:
-                                // best_dist_sq is still max_dist_sq), so this
-                                // only adds a tiebreak, not a behaviour change
-                                // at the 0.5° boundary.
-                                if (best_idx == NO_DATA) continue;
-                                // Break exact-distance ties by the place node's
-                                // stable osm_id (build-invariant, unique).
-                                // name_to_places[nb] is iterated in a non-
-                                // deterministic order, so equidistant same-
-                                // named place nodes otherwise flipped the
-                                // linked place type → place_type_override →
-                                // admin_polygons.bin between same-PBF builds.
-                                if (pidx >= data.place_osm_ids.size() ||
-                                    best_idx >= data.place_osm_ids.size() ||
-                                    data.place_osm_ids[pidx] >= data.place_osm_ids[best_idx])
-                                    continue;
-                            }
-                            best_dist_sq = d2;
-                            best_idx = pidx;
+                    const auto [first, last] = places_named(nb);
+                    for (auto it = first; it != last; ++it) {
+                        const uint32_t pidx = it->second;
+                        const auto& pn = data.place_nodes[pidx];
+                        uint8_t pr = place_addr_rank(pn.place_type);
+                        if (pr == 255) continue;
+                        // Nominatim's name-match branch requires the
+                        // node's address rank to EQUAL the boundary's
+                        // rank_address (find_linked_place in
+                        // placex_triggers.sql). The previous ±2 window
+                        // on rank_search linked NL gemeentes (rank 14)
+                        // to their town nodes (16), relabelling
+                        // municipalities as towns.
+                        if (pr != bnd_rank) continue;
+                        double dlat = (double)pn.lat - clat;
+                        double dlng = (double)pn.lng - clng;
+                        double d2 = dlat * dlat + dlng * dlng;
+                        if (d2 > best_dist_sq) continue;
+                        if (d2 == best_dist_sq) {
+                            // Preserve the original `>=` reject at the
+                            // distance threshold (no real candidate yet:
+                            // best_dist_sq is still max_dist_sq), so this
+                            // only adds a tiebreak, not a behaviour change
+                            // at the 0.5° boundary.
+                            if (best_idx == NO_DATA) continue;
+                            // Break exact-distance ties by the place node's
+                            // stable osm_id (build-invariant, unique). A
+                            // name's nodes come in place-node order, a
+                            // non-deterministic one, so equidistant same-
+                            // named place nodes otherwise flipped the
+                            // linked place type → place_type_override →
+                            // admin_polygons.bin between same-PBF builds.
+                            if (pidx >= data.place_osm_ids.size() ||
+                                best_idx >= data.place_osm_ids.size() ||
+                                data.place_osm_ids[pidx] >= data.place_osm_ids[best_idx])
+                                continue;
                         }
+                        best_dist_sq = d2;
+                        best_idx = pidx;
                     }
 
                     if (best_idx != NO_DATA) {
