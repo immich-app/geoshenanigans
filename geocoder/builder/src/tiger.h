@@ -259,26 +259,40 @@ inline std::vector<std::vector<uint32_t>> intern_tiger_csvs(ParsedData& data, co
     return ids;
 }
 
-// Appends the files' nodes and ranges to the interpolation arrays where
-// appending them file after file would put them, every file at once.
-// string_ids is intern_tiger_csvs's answer for csvs.
-inline void append_tiger_ranges(ParsedData& data, const std::vector<TigerCsv>& csvs,
-                                const std::vector<std::vector<uint32_t>>& string_ids, unsigned threads = 0) {
+// Where each file's nodes and ranges go in the interpolation arrays: past
+// what they held, file after file.
+struct TigerLayout {
+    std::vector<size_t> node_at, range_at;  // per file, then the total
+    size_t nodes_from, ways_from, osm_from, deferred_from, postcodes_from;
+};
+
+// Grows the interpolation arrays by the files' nodes and ranges and returns
+// where each file's go. It touches nothing intern_tiger_csvs does, so the
+// two can run side by side.
+inline TigerLayout grow_tiger_arrays(ParsedData& data, const std::vector<TigerCsv>& csvs, unsigned threads = 0) {
     const size_t files = csvs.size();
-    const auto node_at = parallel_offsets<size_t>(files, [&](size_t f) { return csvs[f].nodes.size(); }, threads);
-    const auto range_at = parallel_offsets<size_t>(files, [&](size_t f) { return csvs[f].ranges.size(); }, threads);
-    const size_t nodes_from = data.interp_nodes.size(), ways_from = data.interp_ways.size();
-    const size_t osm_from = data.interp_osm_ids.size(), deferred_from = data.deferred_interps.size();
-    const size_t postcodes_from = data.interp_postcode_ids.size();
-    data.interp_nodes.resize(nodes_from + node_at[files]);
-    data.interp_ways.resize(ways_from + range_at[files]);
-    data.interp_osm_ids.resize(osm_from + range_at[files]);
-    data.deferred_interps.resize(deferred_from + range_at[files]);
-    data.interp_postcode_ids.resize(postcodes_from + range_at[files]);
-    parallel_for_each(files, [&](size_t f, unsigned) {
+    TigerLayout at{parallel_offsets<size_t>(files, [&](size_t f) { return csvs[f].nodes.size(); }, threads),
+                   parallel_offsets<size_t>(files, [&](size_t f) { return csvs[f].ranges.size(); }, threads),
+                   data.interp_nodes.size(), data.interp_ways.size(), data.interp_osm_ids.size(),
+                   data.deferred_interps.size(), data.interp_postcode_ids.size()};
+    data.interp_nodes.resize(at.nodes_from + at.node_at[files]);
+    data.interp_ways.resize(at.ways_from + at.range_at[files]);
+    data.interp_osm_ids.resize(at.osm_from + at.range_at[files]);
+    data.deferred_interps.resize(at.deferred_from + at.range_at[files]);
+    data.interp_postcode_ids.resize(at.postcodes_from + at.range_at[files]);
+    return at;
+}
+
+// Fills the room grow_tiger_arrays made with the files' nodes and ranges,
+// as appending them file after file would, every file at once. string_ids
+// is intern_tiger_csvs's answer for csvs.
+inline void fill_tiger_ranges(ParsedData& data, const std::vector<TigerCsv>& csvs,
+                              const std::vector<std::vector<uint32_t>>& string_ids, const TigerLayout& at,
+                              unsigned threads = 0) {
+    parallel_for_each(csvs.size(), [&](size_t f, unsigned) {
         const TigerCsv& csv = csvs[f];
         const auto& ids = string_ids[f];
-        const uint32_t node_base = static_cast<uint32_t>(nodes_from + node_at[f]);
+        const uint32_t node_base = static_cast<uint32_t>(at.nodes_from + at.node_at[f]);
         std::copy(csv.nodes.begin(), csv.nodes.end(), data.interp_nodes.begin() + node_base);
         for (size_t k = 0; k < csv.ranges.size(); k++) {
             const auto& range = csv.ranges[k];
@@ -291,13 +305,13 @@ inline void append_tiger_ranges(ParsedData& data, const std::vector<TigerCsv>& c
             iw.interpolation = range.interpolation;
 
             // Defer S2 computation
-            const size_t r = range_at[f] + k;
-            const uint32_t interp_id = static_cast<uint32_t>(ways_from + r);
-            data.interp_ways[ways_from + r] = iw;
-            data.interp_osm_ids[osm_from + r] =
+            const size_t r = at.range_at[f] + k;
+            const uint32_t interp_id = static_cast<uint32_t>(at.ways_from + r);
+            data.interp_ways[at.ways_from + r] = iw;
+            data.interp_osm_ids[at.osm_from + r] =
                 pack_osm_id(gc::id_alloc::ObjectType::SYNTHETIC, static_cast<int64_t>(range.synthetic_id));
-            data.deferred_interps[deferred_from + r] = {interp_id, iw.node_offset, iw.node_count};
-            data.interp_postcode_ids[postcodes_from + r] =
+            data.deferred_interps[at.deferred_from + r] = {interp_id, iw.node_offset, iw.node_count};
+            data.interp_postcode_ids[at.postcodes_from + r] =
                 range.postcode == TigerCsv::kNoPostcode ? NO_DATA : ids[range.postcode];
         }
     }, threads);

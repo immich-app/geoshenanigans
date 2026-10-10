@@ -202,7 +202,10 @@ static void load_tiger_data(ParsedData& data, const std::string& path, std::futu
         total_rows += csv.rows;
         loaded_rows += csv.ranges.size();
     }
-    append_tiger_ranges(data, parsed, intern_tiger_csvs(data, parsed));
+    // The arrays grow, seconds of page faults, while the strings intern.
+    auto layout = std::async(std::launch::async, [&] { return grow_tiger_arrays(data, parsed); });
+    const auto string_ids = intern_tiger_csvs(data, parsed);
+    fill_tiger_ranges(data, parsed, string_ids, layout.get());
 
     // Sidecar exists iff it carries at least one real ZIP: an empty/ZIP-less
     // TIGER path must not materialize an all-NO_DATA planet-sized file (nor a

@@ -194,7 +194,8 @@ TEST(tiger_load_lays_files_out_as_adding_them_one_by_one_would) {
 
     for (unsigned threads : {1u, 3u, 8u}) {
         ParsedData got = new_data_with_one_interp();
-        append_tiger_ranges(got, files, intern_tiger_csvs(got, files, threads), threads);
+        const TigerLayout at = grow_tiger_arrays(got, files, threads);
+        fill_tiger_ranges(got, files, intern_tiger_csvs(got, files, threads), at, threads);
         check_same_load(got, want);
     }
 }
@@ -224,7 +225,8 @@ TEST(tiger_load_interns_many_files_as_a_serial_load_would) {
 
     for (unsigned threads : {1u, 3u, 8u}) {
         ParsedData got = new_data();
-        append_tiger_ranges(got, files, intern_tiger_csvs(got, files, threads), threads);
+        auto ids = intern_tiger_csvs(got, files, threads);
+        fill_tiger_ranges(got, files, ids, grow_tiger_arrays(got, files, threads), threads);
         check_same_load(got, want);
     }
 }
