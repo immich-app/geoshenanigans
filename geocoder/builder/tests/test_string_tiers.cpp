@@ -1,4 +1,4 @@
-// Unit tests for string_home_tier (parsed_data.h).
+// Unit tests for string_home_tier and string_starts (parsed_data.h).
 #include "parsed_data.h"
 
 #include "test_framework.h"
@@ -45,21 +45,21 @@ TEST(string_home_tier_picks_the_most_widely_downloaded_consumer_tier) {
     for (const auto& c : cases) CHECK_EQ(string_home_tier(c.mask), c.tier);
 }
 
-// --- StringStarts ---
+// --- string_starts ---
 
 TEST(string_starts_indexes_only_string_starts) {
     const std::string bytes("ab\0\0cde\0", 8);
     const std::vector<char> pool(bytes.begin(), bytes.end());
-    const StringStarts starts(pool);
+    const RankedBits starts = string_starts(pool);
     CHECK_EQ(starts.count(), 3u);
     CHECK_EQ(starts.index(0), 0u);
     CHECK_EQ(starts.index(3), 1u);  // the empty string
     CHECK_EQ(starts.index(4), 2u);
-    CHECK_EQ(starts.index(1), StringStarts::npos);
-    CHECK_EQ(starts.index(7), StringStarts::npos);
-    CHECK_EQ(starts.index(8), StringStarts::npos);
-    CHECK_EQ(starts.index(NO_DATA), StringStarts::npos);
-    CHECK(starts.offsets() == std::vector<uint32_t>({0, 3, 4}));
+    CHECK_EQ(starts.index(1), RankedBits::npos);
+    CHECK_EQ(starts.index(7), RankedBits::npos);
+    CHECK_EQ(starts.index(8), RankedBits::npos);
+    CHECK_EQ(starts.index(NO_DATA), RankedBits::npos);
+    CHECK(starts.ones() == std::vector<uint32_t>({0, 3, 4}));
 }
 
 TEST(string_starts_ranks_across_blocks_for_any_thread_count) {
@@ -71,15 +71,15 @@ TEST(string_starts_ranks_across_blocks_for_any_thread_count) {
         pool.push_back('\0');
     }
     for (unsigned threads : {1u, 5u, 64u}) {
-        const StringStarts starts(pool, threads);
+        const RankedBits starts = string_starts(pool, threads);
         REQUIRE(starts.count() == expect.size());
-        CHECK(starts.offsets(threads) == expect);
+        CHECK(starts.ones(threads) == expect);
         bool all = true;
         for (size_t s = 0; s < expect.size(); s++) {
             all = all && starts.index(expect[s]) == s;
             // The previous string's terminator, unless that string is empty.
             if (s > 0 && expect[s] - 1 != expect[s - 1])
-                all = all && starts.index(expect[s] - 1) == StringStarts::npos;
+                all = all && starts.index(expect[s] - 1) == RankedBits::npos;
         }
         CHECK(all);
     }

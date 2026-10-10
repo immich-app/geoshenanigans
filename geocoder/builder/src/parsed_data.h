@@ -21,11 +21,11 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
-#include "bits.h"
 #include "types.h"
 #include "string_pool.h"
 #include "id_allocator.h"
 #include "parallel.h"
+#include "ranked_bits.h"
 
 // The records one POI tier's files carry, in record order, and how many of
 // them are tombstones. A tombstone only goes to the tiers that held its
@@ -461,69 +461,20 @@ inline void put_addr_point(ParsedData& data, size_t i, float lat, float lng,
     data.addr_cells[i] = cell;
 }
 
-// Offset -> string index over a pool of NUL-terminated strings: one start bit
-// per pool byte, ranked per 64-byte block. Marking and remapping visit every
-// string reference of the planet (~1e9), so a lookup is one block load where
-// a hash map probe would miss the cache several times.
-class StringStarts {
-public:
-    static constexpr size_t npos = SIZE_MAX;
-
-    explicit StringStarts(const std::vector<char>& pool, unsigned threads = 0)
-        : size_(pool.size()), blocks_((pool.size() + 63) / 64) {
-        const char* p = pool.data();
-        parallel_for(blocks_.size(), [&](size_t b0, size_t b1, unsigned) {
-            for (size_t b = b0; b < b1; b++) {
-                uint64_t bits = 0;
-                for (size_t off = b * 64, end = std::min(size_, off + 64); off < end; off++)
-                    if (off == 0 || p[off - 1] == '\0') bits |= uint64_t(1) << (off & 63);
-                blocks_[b].bits = bits;
-            }
-        }, threads);
-        // A pool under 4 GiB holds fewer than 2^32 strings.
-        auto ranks = parallel_offsets<uint32_t>(blocks_.size(), [&](size_t b) {
-            return popcount64(blocks_[b].bits);
-        }, threads);
-        parallel_for(blocks_.size(), [&](size_t b0, size_t b1, unsigned) {
-            for (size_t b = b0; b < b1; b++) blocks_[b].rank = ranks[b];
-        }, threads);
-        count_ = ranks.back();
-    }
-
-    size_t count() const { return count_; }
-
-    // Index of the string starting at off (in pool order), or npos when no
-    // string starts there.
-    size_t index(uint32_t off) const {
-        if (off >= size_) return npos;
-        const Block& b = blocks_[off >> 6];
-        uint64_t bit = uint64_t(1) << (off & 63);
-        if (!(b.bits & bit)) return npos;
-        return b.rank + static_cast<size_t>(popcount64(b.bits & (bit - 1)));
-    }
-
-    // The start offset of every string, by index.
-    std::vector<uint32_t> offsets(unsigned threads = 0) const {
-        std::vector<uint32_t> out(count_);
-        parallel_for(blocks_.size(), [&](size_t b0, size_t b1, unsigned) {
-            for (size_t b = b0; b < b1; b++) {
-                size_t s = blocks_[b].rank;
-                for (uint64_t bits = blocks_[b].bits; bits; bits &= bits - 1)
-                    out[s++] = static_cast<uint32_t>(b * 64 + __builtin_ctzll(bits));
-            }
-        }, threads);
-        return out;
-    }
-
-private:
-    struct Block {
-        uint64_t bits;
-        uint32_t rank;  // strings starting before this block
-    };
-    size_t size_;
-    std::vector<Block> blocks_;
-    size_t count_ = 0;
-};
+// Offset -> string index over a pool of NUL-terminated strings: a bit per
+// pool byte where a string starts. Marking and remapping visit every string
+// reference of the planet (~1e9). A pool under 4 GiB holds fewer than 2^32
+// strings.
+inline RankedBits string_starts(const std::vector<char>& pool, unsigned threads = 0) {
+    const char* p = pool.data();
+    const size_t size = pool.size();
+    return RankedBits(size, [&](size_t b) {
+        uint64_t bits = 0;
+        for (size_t off = b * 64, end = std::min(size, off + 64); off < end; off++)
+            if (off == 0 || p[off - 1] == '\0') bits |= uint64_t(1) << (off & 63);
+        return bits;
+    }, threads);
+}
 
 // Partition the string pool in `data` into 5 per-consumer tiers, sorting
 // alphabetically within each, and remap all record name_id fields to the
@@ -543,7 +494,7 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
         return;
     }
     const char* pool = pool_data.data();
-    const StringStarts starts(pool_data, threads);
+    const RankedBits starts = string_starts(pool_data, threads);
     const size_t n = starts.count();
 
     std::vector<uint8_t> tier(n);
@@ -552,7 +503,7 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
         auto mark = [&](uint32_t off, uint8_t bit) {
             if (off == NO_DATA) return;
             size_t s = starts.index(off);
-            if (s == StringStarts::npos) return;
+            if (s == RankedBits::npos) return;
             // Load first: a hot string (house number "1") would otherwise
             // bounce its cache line between every core.
             if (!(mask[s].load(std::memory_order_relaxed) & bit))
@@ -598,7 +549,7 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
     // below like any offset missing from the layout.
     std::array<std::vector<uint32_t>, STR_TIER_COUNT> sorted;
     {
-        const std::vector<uint32_t> offsets = starts.offsets(threads);
+        const std::vector<uint32_t> offsets = starts.ones(threads);
         // The sort orders each string's first 8 bytes beside its offset, so
         // most comparisons never reach into the pool. Big-endian, the bytes
         // compare as strcmp's unsigned chars; equal heads that hold the
@@ -689,7 +640,7 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
     auto new_offset = [&](uint32_t off) -> uint32_t {
         if (off == NO_DATA) return NO_DATA;
         size_t s = starts.index(off);
-        return s == StringStarts::npos || tier[s] == STR_TIER_NONE ? NO_DATA : new_off[s];
+        return s == RankedBits::npos || tier[s] == STR_TIER_NONE ? NO_DATA : new_off[s];
     };
     auto remap_each = [&](size_t count, auto&& remap_one) {
         parallel_for(count, [&](size_t b, size_t e, unsigned) {

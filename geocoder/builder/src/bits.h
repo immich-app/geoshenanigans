@@ -1,4 +1,4 @@
-// Bit counting for the rank structures (node_index.h, StringStarts).
+// Bit counting for the rank structures (node_index.h, ranked_bits.h).
 #pragma once
 
 #include <cstdint>
