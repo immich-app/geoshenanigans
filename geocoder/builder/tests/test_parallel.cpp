@@ -322,6 +322,49 @@ TEST(parallel_any_finds_a_single_match) {
     }
 }
 
+TEST(parallel_sort_indices_matches_std_sort_without_ties) {
+    auto recs = new_recs(400000, 3000, 9);
+    auto less = [&](uint32_t a, uint32_t b) { return rec_less(recs[a], recs[b]); };
+    auto expect = std_sort_indices(recs.size(), less);
+    for (unsigned threads : {1u, 3u, 16u}) {
+        auto got = parallel_sort_indices(recs.size(), less, [](uint32_t, uint32_t) { return true; }, threads);
+        CHECK(got == expect);
+    }
+}
+
+TEST(parallel_sort_indices_keeps_std_sort_order_when_ties_matter) {
+    auto recs = new_recs(400000, 3000, 10);
+    auto by_key = [&](uint32_t a, uint32_t b) { return recs[a].key < recs[b].key; };
+    auto expect = std_sort_indices(recs.size(), by_key);
+    auto payload_differs = [&](uint32_t a, uint32_t b) { return recs[a].payload != recs[b].payload; };
+    auto got = parallel_sort_indices(recs.size(), by_key, payload_differs, 8);
+    CHECK(got == expect);
+
+    // Ties whose order can't show stay parallel: any order sorted by key.
+    auto never = parallel_sort_indices(recs.size(), by_key, [](uint32_t, uint32_t) { return false; }, 8);
+    CHECK(std::is_sorted(never.begin(), never.end(), by_key));
+    auto perm = never;
+    std::sort(perm.begin(), perm.end());
+    bool is_perm = true;
+    for (size_t i = 0; i < perm.size(); i++) is_perm = is_perm && perm[i] == i;
+    CHECK(is_perm);
+}
+
+TEST(parallel_sort_runs_sorts_each_run_alone) {
+    std::mt19937 rng(4);
+    std::vector<std::pair<uint32_t, uint32_t>> input;  // (run, value), runs adjacent
+    for (uint32_t run = 0; input.size() < 300000; run++)
+        for (uint32_t k = rng() % (run % 50 == 0 ? 40000 : 30); k > 0; k--) input.push_back({run, rng() % 100});
+    auto same_run = [](const auto& a, const auto& b) { return a.first == b.first; };
+    auto expect = input;
+    std::sort(expect.begin(), expect.end());
+    for (unsigned threads : {1u, 3u, 64u}) {
+        auto v = input;
+        parallel_sort_runs(v.begin(), v.end(), same_run, std::less<std::pair<uint32_t, uint32_t>>(), threads);
+        CHECK(v == expect);
+    }
+}
+
 TEST(parallel_sort_small_and_presorted_inputs) {
     for (size_t n : {size_t(0), size_t(1), size_t(2), size_t(70000), size_t(300000)}) {
         std::vector<uint64_t> asc(n), desc(n);

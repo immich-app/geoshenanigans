@@ -13,6 +13,7 @@
 #include <numeric>
 #include <vector>
 
+#include "parallel.h"
 #include "parsed_data.h"
 #include "types.h"
 
@@ -28,146 +29,202 @@ static inline uint32_t float_bits(float v) {
     return (bits & 0x80000000) ? ~bits : (bits ^ 0x80000000);
 }
 
+// Sorted positions that start a run of duplicates: i == 0 or !same(i - 1, i).
+// The serial dedups compared each record with the last one they kept; for an
+// equivalence `same` that is the same test as comparing with the predecessor,
+// since every record in between duplicates the kept one.
+template <class Same>
+std::vector<uint32_t> run_starts(size_t n, Same same, unsigned threads) {
+    return parallel_filter(n, [&](size_t i) { return i == 0 || !same(i - 1, i); }, threads);
+}
+
+inline size_t run_end(const std::vector<uint32_t>& starts, size_t k, size_t n) {
+    return k + 1 < starts.size() ? starts[k + 1] : n;
+}
+
+// old_to_new for records deduped into runs: every record of run k (sorted
+// positions [starts[k], starts[k + 1])) becomes record k.
+inline std::vector<uint32_t> renumber_runs(const std::vector<uint32_t>& order,
+                                           const std::vector<uint32_t>& starts, unsigned threads) {
+    std::vector<uint32_t> old_to_new(order.size());
+    parallel_for(starts.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t k = b; k < e; k++)
+            for (size_t i = starts[k], end = run_end(starts, k, order.size()); i < end; i++)
+                old_to_new[order[i]] = static_cast<uint32_t>(k);
+    }, threads);
+    return old_to_new;
+}
+
+// Per run, the first value (in sorted order) that isn't `none`, else none:
+// the serial dedups filled each kept slot from the first duplicate with one.
+template <class T>
+std::vector<T> first_set_per_run(const std::vector<T>& values, const std::vector<uint32_t>& order,
+                                 const std::vector<uint32_t>& starts, T none, unsigned threads) {
+    std::vector<T> out(starts.size(), none);
+    parallel_for(starts.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t k = b; k < e; k++)
+            for (size_t i = starts[k], end = run_end(starts, k, order.size()); i < end && out[k] == none; i++)
+                out[k] = values[order[i]];
+    }, threads);
+    return out;
+}
+
+// Renumbers the item ids of (cell_id, item_id) pairs and restores their
+// (cell, item) order. Pairs sorted by cell stay grouped by cell, so only
+// each cell's run needs sorting; pairs equal in both fields are
+// interchangeable, so either way this matches a full std::sort.
+template <class Renumber>
+void renumber_cell_pairs(std::vector<CellItemPair>& pairs, Renumber renumber, unsigned threads) {
+    parallel_for(pairs.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t i = b; i < e; i++) pairs[i].item_id = renumber(pairs[i].item_id);
+    }, threads);
+    bool by_cell = !parallel_any(pairs.empty() ? 0 : pairs.size() - 1, [&](size_t i) {
+        return pairs[i + 1].cell_id < pairs[i].cell_id;
+    }, threads);
+    if (by_cell)
+        parallel_sort_runs(pairs.begin(), pairs.end(),
+                           [](const CellItemPair& a, const CellItemPair& b) { return a.cell_id == b.cell_id; },
+                           cell_item_less, threads);
+    else
+        parallel_sort(pairs.begin(), pairs.end(), cell_item_less, threads);
+}
+
+template <class T>
+struct Repacked {
+    std::vector<T> items;
+    std::vector<size_t> at;  // where each source range landed; n + 1 entries
+};
+
+// Copies count(i) elements of src from from(i) onwards into a new buffer,
+// for i in [0, n) in order.
+template <class T, class Count, class From>
+Repacked<T> repack(size_t n, const std::vector<T>& src, Count count, From from, unsigned threads) {
+    Repacked<T> out{{}, parallel_offsets<size_t>(n, count, threads)};
+    out.items.resize(out.at[n]);
+    parallel_for(n, [&](size_t b, size_t e, unsigned) {
+        for (size_t i = b; i < e; i++)
+            if (size_t c = out.at[i + 1] - out.at[i]) std::copy_n(src.begin() + from(i), c, out.items.begin() + out.at[i]);
+    }, threads);
+    return out;
+}
+
 // Sorts addr_points by (street_id, housenumber_id, lat_bits, lng_bits, ...).
 // String offsets are already remapped to the sorted pool, so they order
 // deterministically; raw float bits break the remaining ties.
-inline void reorder_addr_points(ParsedData& data) {
-    if (!data.sorted_addr_cells.empty()) {
-        size_t n = data.addr_points.size();
-        std::vector<uint32_t> order(n);
-        std::iota(order.begin(), order.end(), 0);
-        std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
-            const auto& pa = data.addr_points[a];
-            const auto& pb = data.addr_points[b];
-            if (pa.street_id != pb.street_id) return pa.street_id < pb.street_id;
-            if (pa.housenumber_id != pb.housenumber_id) return pa.housenumber_id < pb.housenumber_id;
-            uint32_t la = float_bits(pa.lat), lb = float_bits(pb.lat);
-            if (la != lb) return la < lb;
-            uint32_t ga = float_bits(pa.lng), gb = float_bits(pb.lng);
-            if (ga != gb) return ga < gb;
-            // Final tiebreaker: osm_id. Using the original index `a < b`
-            // here resolved ties non-deterministically because the
-            // index reflected build-encounter order from multi-threaded
-            // PBF parsing. osm_id is invariant per record and gives a
-            // truly canonical order, so dedup picks the same record
-            // every run.
-            if (data.addr_osm_ids.size() == data.addr_points.size()
-                && data.addr_osm_ids[a] != data.addr_osm_ids[b])
-                return data.addr_osm_ids[a] < data.addr_osm_ids[b];
-            // osm_id can still COLLIDE: synthetic TIGER ids are a 56-bit
-            // FNV hash of (lat,lng,housenumber,street), so two distinct
-            // records with the same addressing keys share an id. Without a
-            // further tiebreak std::sort leaves their relative order to
-            // build-encounter order (non-deterministic); when a polygon/node
-            // pair swaps, the vertex_count sequence shifts addr_vertices
-            // packing and cascades vertex_offset for every later record
-            // (~98.9 MiB planet churn) plus a strategy-2 tombstone. Extend
-            // to a total order: vertex_count, parent_way_id, then the
-            // polygon vertex bytes (pre-sort offsets are still valid here —
-            // addr_vertices is repacked only after this sort).
-            if (pa.vertex_count != pb.vertex_count)
-                return pa.vertex_count < pb.vertex_count;
-            if (pa.parent_way_id != pb.parent_way_id)
-                return pa.parent_way_id < pb.parent_way_id;
-            if (pa.vertex_count > 0 &&
-                pa.vertex_offset != NO_DATA && pb.vertex_offset != NO_DATA &&
-                (size_t)pa.vertex_offset + pa.vertex_count <= data.addr_vertices.size() &&
-                (size_t)pb.vertex_offset + pb.vertex_count <= data.addr_vertices.size()) {
-                int c = std::memcmp(&data.addr_vertices[pa.vertex_offset],
-                                    &data.addr_vertices[pb.vertex_offset],
-                                    (size_t)pa.vertex_count * sizeof(NodeCoord));
-                if (c != 0) return c < 0;
-            }
-            return a < b;
-        });
-        std::vector<uint32_t> old_to_new(n);
-        for (uint32_t i = 0; i < n; i++) old_to_new[order[i]] = i;
-        std::vector<AddrPoint> sorted(n);
-        // Reorder data.addr_osm_ids in lockstep so slot[i] keeps the
-        // matching osm_id. Without this, strategy-2 reads garbage
-        // osm_ids (whatever survived in build-encounter order at
-        // index i), assigns slots from those, and the resulting
-        // addr_points.bin / sidecar are non-deterministic across
-        // same-PBF rebuilds. This was the dominant noise source.
-        std::vector<uint64_t> sorted_osm;
-        if (data.addr_osm_ids.size() == n) sorted_osm.resize(n);
-        for (uint32_t i = 0; i < n; i++) {
-            sorted[i] = data.addr_points[order[i]];
-            if (!sorted_osm.empty()) sorted_osm[i] = data.addr_osm_ids[order[i]];
+inline void reorder_addr_points(ParsedData& data, unsigned threads = 0) {
+    if (data.sorted_addr_cells.empty()) return;
+
+    const size_t n = data.addr_points.size();
+    const auto& points = data.addr_points;
+    const auto& vertices = data.addr_vertices;
+    const bool have_osm = data.addr_osm_ids.size() == n;
+    auto addr_less = [&](uint32_t a, uint32_t b) {
+        const auto& pa = points[a];
+        const auto& pb = points[b];
+        if (pa.street_id != pb.street_id) return pa.street_id < pb.street_id;
+        if (pa.housenumber_id != pb.housenumber_id) return pa.housenumber_id < pb.housenumber_id;
+        uint32_t la = float_bits(pa.lat), lb = float_bits(pb.lat);
+        if (la != lb) return la < lb;
+        uint32_t ga = float_bits(pa.lng), gb = float_bits(pb.lng);
+        if (ga != gb) return ga < gb;
+        // Final tiebreaker: osm_id. Using the original index `a < b`
+        // here resolved ties non-deterministically because the
+        // index reflected build-encounter order from multi-threaded
+        // PBF parsing. osm_id is invariant per record and gives a
+        // truly canonical order, so dedup picks the same record
+        // every run.
+        if (have_osm && data.addr_osm_ids[a] != data.addr_osm_ids[b])
+            return data.addr_osm_ids[a] < data.addr_osm_ids[b];
+        // osm_id can still COLLIDE: synthetic TIGER ids are a 56-bit
+        // FNV hash of (lat,lng,housenumber,street), so two distinct
+        // records with the same addressing keys share an id. Without a
+        // further tiebreak std::sort leaves their relative order to
+        // build-encounter order (non-deterministic); when a polygon/node
+        // pair swaps, the vertex_count sequence shifts addr_vertices
+        // packing and cascades vertex_offset for every later record
+        // (~98.9 MiB planet churn) plus a strategy-2 tombstone. Extend
+        // to a total order: vertex_count, parent_way_id, then the
+        // polygon vertex bytes (pre-sort offsets are still valid here —
+        // addr_vertices is repacked only after this sort).
+        if (pa.vertex_count != pb.vertex_count)
+            return pa.vertex_count < pb.vertex_count;
+        if (pa.parent_way_id != pb.parent_way_id)
+            return pa.parent_way_id < pb.parent_way_id;
+        if (pa.vertex_count > 0 &&
+            pa.vertex_offset != NO_DATA && pb.vertex_offset != NO_DATA &&
+            (size_t)pa.vertex_offset + pa.vertex_count <= vertices.size() &&
+            (size_t)pb.vertex_offset + pb.vertex_count <= vertices.size()) {
+            int c = std::memcmp(&vertices[pa.vertex_offset], &vertices[pb.vertex_offset],
+                                (size_t)pa.vertex_count * sizeof(NodeCoord));
+            if (c != 0) return c < 0;
         }
-        // Reorder vertex buffer alongside addr_points. Copy each
-        // record's polygon vertices into a new buffer and update
-        // vertex_offset in the sorted array.
-        std::vector<NodeCoord> new_addr_vertices;
-        new_addr_vertices.reserve(data.addr_vertices.size());
-        for (auto& a : sorted) {
-            if (a.vertex_count > 0 && a.vertex_offset != NO_DATA) {
-                uint32_t old_off = a.vertex_offset;
-                a.vertex_offset = static_cast<uint32_t>(new_addr_vertices.size());
-                for (uint32_t j = 0; j < a.vertex_count; j++)
-                    new_addr_vertices.push_back(data.addr_vertices[old_off + j]);
-            }
+        return a < b;
+    };
+    // The comparator ends on the index, so it is a strict total order —
+    // provided the vertex tiebreak applies to every polygon. A polygon
+    // without its vertices skips it, which can make the order intransitive;
+    // std::sort then decides alone.
+    bool total_order = !parallel_any(n, [&](size_t i) {
+        const auto& p = points[i];
+        return p.vertex_count > 0 &&
+               (p.vertex_offset == NO_DATA || (size_t)p.vertex_offset + p.vertex_count > vertices.size());
+    }, threads);
+    std::vector<uint32_t> order = total_order
+        ? parallel_sort_indices(n, addr_less, [](uint32_t, uint32_t) { return true; }, threads)
+        : std_sort_indices(n, addr_less);
+
+    // Dedup consecutive identical records (planet has ~4M duplicates).
+    // Compare everything except vertex_offset — same polygon content
+    // stored at different offsets should still dedup.
+    std::vector<uint32_t> starts = run_starts(n, [&](size_t i, size_t j) {
+        const auto& a = points[order[i]];
+        const auto& b = points[order[j]];
+        return a.lat == b.lat && a.lng == b.lng &&
+               a.housenumber_id == b.housenumber_id &&
+               a.street_id == b.street_id &&
+               a.parent_way_id == b.parent_way_id &&
+               a.vertex_count == b.vertex_count;
+    }, threads);
+    const size_t kept = starts.size();
+
+    // Reorder the vertex buffer alongside addr_points. Duplicates keep
+    // their copy of the vertices too: the buffer is packed in sorted order
+    // before the dedup.
+    auto has_polygon = [](const AddrPoint& p) { return p.vertex_count > 0 && p.vertex_offset != NO_DATA; };
+    Repacked<NodeCoord> repacked = repack(n, vertices,
+        [&](size_t i) { const auto& p = points[order[i]]; return has_polygon(p) ? size_t(p.vertex_count) : 0; },
+        [&](size_t i) { return points[order[i]].vertex_offset; }, threads);
+    std::vector<AddrPoint> sorted(kept);
+    parallel_for(kept, [&](size_t b, size_t e, unsigned) {
+        for (size_t k = b; k < e; k++) {
+            AddrPoint p = points[order[starts[k]]];
+            if (has_polygon(p)) p.vertex_offset = static_cast<uint32_t>(repacked.at[starts[k]]);
+            sorted[k] = p;
         }
-        data.addr_vertices = std::move(new_addr_vertices);
-        // Dedup consecutive identical records (planet has ~4M duplicates).
-        // Compare everything except vertex_offset — same polygon content
-        // stored at different offsets should still dedup.
-        auto addr_equal = [](const AddrPoint& a, const AddrPoint& b) {
-            return a.lat == b.lat && a.lng == b.lng &&
-                   a.housenumber_id == b.housenumber_id &&
-                   a.street_id == b.street_id &&
-                   a.parent_way_id == b.parent_way_id &&
-                   a.vertex_count == b.vertex_count;
-        };
-        std::vector<uint32_t> dedup_remap(n);
-        size_t write_pos = 0;
-        for (size_t i = 0; i < n; i++) {
-            if (write_pos == 0 || !addr_equal(sorted[i], sorted[write_pos - 1])) {
-                sorted[write_pos] = sorted[i];
-                dedup_remap[i] = static_cast<uint32_t>(write_pos);
-                write_pos++;
-            } else {
-                dedup_remap[i] = static_cast<uint32_t>(write_pos - 1);
-            }
-        }
-        sorted.resize(write_pos);
-        data.addr_points = std::move(sorted);
-        // Dedup addr_osm_ids in lockstep: keep the first occurrence's
-        // osm_id, mirroring how addr_points dedup keeps the first
-        // record. Without this, addr_osm_ids stays at the pre-dedup
-        // size, the size-equality check in apply_strategy2_addrs
-        // fails, and strategy-2 silently early-returns.
-        if (!sorted_osm.empty()) {
-            std::vector<uint64_t> deduped_osm(write_pos, 0);
-            for (size_t i = 0; i < n; i++) {
-                uint32_t new_idx = dedup_remap[i];
-                if (deduped_osm[new_idx] == 0) deduped_osm[new_idx] = sorted_osm[i];
-            }
-            data.addr_osm_ids = std::move(deduped_osm);
-        }
-        // Reorder + dedup addr_postcode_ids in parallel
-        if (data.addr_postcode_ids.size() == n) {
-            std::vector<uint32_t> sorted_pc(n);
-            for (uint32_t i = 0; i < n; i++) sorted_pc[i] = data.addr_postcode_ids[order[i]];
-            // Dedup: keep the first occurrence's postcode
-            std::vector<uint32_t> deduped_pc(write_pos, NO_DATA);
-            for (size_t i = 0; i < n; i++) {
-                uint32_t new_idx = dedup_remap[i];
-                if (deduped_pc[new_idx] == NO_DATA) deduped_pc[new_idx] = sorted_pc[i];
-            }
-            data.addr_postcode_ids = std::move(deduped_pc);
-        }
-        if (write_pos < n)
-            std::cerr << "  Deduped addr_points: " << n << " → " << write_pos
-                      << " (-" << (n - write_pos) << ")" << std::endl;
-        // Remap IDs through both old→new and dedup
-        for (auto& p : data.sorted_addr_cells)
-            p.item_id = dedup_remap[old_to_new[p.item_id]];
-        auto cmp = cell_item_less;
-        std::sort(data.sorted_addr_cells.begin(), data.sorted_addr_cells.end(), cmp);
-        data.cell_to_addrs.clear();
-        std::cerr << "  Addr points sorted: " << n << std::endl;
-    }
+    }, threads);
+    data.addr_vertices = std::move(repacked.items);
+    repacked.at = {};
+    data.addr_points = std::move(sorted);
+    // Reorder + dedup addr_osm_ids in lockstep so slot[i] keeps the
+    // matching osm_id. Without this, strategy-2 reads garbage osm_ids
+    // (whatever survived in build-encounter order at index i) and the
+    // resulting addr_points.bin / sidecar are non-deterministic across
+    // same-PBF rebuilds; left at the pre-dedup size, it fails the
+    // size-equality check in apply_strategy2_addrs and strategy-2
+    // silently early-returns.
+    if (have_osm) data.addr_osm_ids = first_set_per_run(data.addr_osm_ids, order, starts, uint64_t(0), threads);
+    if (data.addr_postcode_ids.size() == n)
+        data.addr_postcode_ids = first_set_per_run(data.addr_postcode_ids, order, starts, NO_DATA, threads);
+    if (kept < n)
+        std::cerr << "  Deduped addr_points: " << n << " → " << kept
+                  << " (-" << (n - kept) << ")" << std::endl;
+
+    const std::vector<uint32_t> old_to_new = renumber_runs(order, starts, threads);
+    order = {};
+    starts = {};
+    renumber_cell_pairs(data.sorted_addr_cells, [&](uint32_t id) { return old_to_new[id]; }, threads);
+    data.cell_to_addrs.clear();
+    std::cerr << "  Addr points sorted: " << n << std::endl;
 }
 
 // Sorts ways by (name, node_count, nodes) and reorders their nodes.

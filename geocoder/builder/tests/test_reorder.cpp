@@ -23,6 +23,7 @@ struct Shape {
     bool odd_vertices = false;  // addr polygons with vertex_count > 0 but no vertices
     bool nan = false;           // NaN coordinates
     bool uniform_interp_postcodes = false;  // tied interps carry one postcode
+    bool unique_osm_ids = false;            // no record ties another
 };
 
 struct Rng {
@@ -78,7 +79,7 @@ void fill_records(ParsedData& d, std::vector<float>& elevations, std::vector<uin
             }
         }
         d.addr_points.push_back(a);
-        if (s.osm_ids) d.addr_osm_ids.push_back(r.below(static_cast<uint32_t>(n / 3)));
+        if (s.osm_ids) d.addr_osm_ids.push_back(s.unique_osm_ids ? i + 1 : r.one_in(5) ? 0 : r.below(static_cast<uint32_t>(n / 3)));
         if (s.side_arrays) d.addr_postcode_ids.push_back(small_id(r, 5));
     }
     d.sorted_addr_cells = new_cell_pairs(r, n, static_cast<uint32_t>(n), false);
@@ -91,7 +92,7 @@ void fill_records(ParsedData& d, std::vector<float>& elevations, std::vector<uin
         w.name_id = small_id(r, 5);
         for (uint32_t j = 0; j < w.node_count; j++) d.street_nodes.push_back(node(r, s));
         d.ways.push_back(w);
-        if (s.osm_ids) d.way_osm_ids.push_back(static_cast<int64_t>(r.below(n_ways / 4)) - 7);
+        if (s.osm_ids) d.way_osm_ids.push_back(s.unique_osm_ids ? i + 1 : r.one_in(5) ? 0 : static_cast<int64_t>(r.below(n_ways / 4)) - 7);
         if (s.side_arrays) {
             d.way_parent_ids.push_back(r.one_in(20) ? n_admin + 3 : small_id(r, n_admin));
             d.way_postcode_ids.push_back(small_id(r, 4));
@@ -109,7 +110,7 @@ void fill_records(ParsedData& d, std::vector<float>& elevations, std::vector<uin
         iw.interpolation = static_cast<uint8_t>(r.below(2));
         for (uint32_t j = 0; j < iw.node_count; j++) d.interp_nodes.push_back(node(r, s));
         d.interp_ways.push_back(iw);
-        uint64_t osm = r.below(n_ways / 8);
+        uint64_t osm = s.unique_osm_ids ? i + 1 : r.below(n_ways / 8);
         if (s.osm_ids) d.interp_osm_ids.push_back(osm);
         if (s.side_arrays)
             d.interp_postcode_ids.push_back(s.uniform_interp_postcodes ? static_cast<uint32_t>(osm % 7)
@@ -128,7 +129,7 @@ void fill_records(ParsedData& d, std::vector<float>& elevations, std::vector<uin
         for (uint32_t j = 0; j < p.vertex_count; j++)
             d.admin_vertices.push_back(j < 3 ? node(r, s) : NodeCoord{1.0f, 1.0f});
         d.admin_polygons.push_back(p);
-        if (s.osm_ids) d.admin_osm_ids.push_back(r.one_in(50) ? 0 : i);
+        if (s.osm_ids) d.admin_osm_ids.push_back(r.one_in(50) && !s.unique_osm_ids ? 0 : i + 1);
         if (s.side_arrays) d.admin_parent_ids.push_back(r.one_in(20) ? n_admin + 1 : small_id(r, n_admin));
     }
     for (uint32_t c = 0; c < 500; c++) {
@@ -155,7 +156,7 @@ void fill_records(ParsedData& d, std::vector<float>& elevations, std::vector<uin
         p.parent_postcode_id = small_id(r, 4);
         p.parent_poly_id = r.one_in(20) ? n_admin + 4 : small_id(r, n_admin);
         d.poi_records.push_back(p);
-        if (s.osm_ids) d.poi_osm_ids.push_back(r.below(static_cast<uint32_t>(n / 2)));
+        if (s.osm_ids) d.poi_osm_ids.push_back(s.unique_osm_ids ? i + 1 : r.one_in(5) ? 0 : r.below(static_cast<uint32_t>(n / 2)));
         if (s.side_arrays) {
             elevations.push_back(static_cast<float>(r.below(4000)) - 100.0f);
             qids.push_back(r.below(50));
@@ -228,12 +229,10 @@ void check_same_records(const ParsedData& a, const ParsedData& b) {
 
 void check_steps_match_reference(uint64_t seed, const Shape& s) {
     const auto links = sitelinks();
-    ParsedData want, got;
-    std::vector<float> want_ele, got_ele;
-    std::vector<uint32_t> want_qids, got_qids;
+    ParsedData want;
+    std::vector<float> want_ele;
+    std::vector<uint32_t> want_qids;
     fill_records(want, want_ele, want_qids, seed, s);
-    fill_records(got, got_ele, got_qids, seed, s);
-
     reorder_ref::reorder_addr_points(want);
     reorder_ref::reorder_ways(want);
     reorder_ref::reorder_interps(want);
@@ -241,16 +240,22 @@ void check_steps_match_reference(uint64_t seed, const Shape& s) {
     reorder_ref::reorder_pois(want, want_ele, want_qids, links);
     reorder_ref::reorder_place_nodes(want);
 
-    reorder_addr_points(got);
-    reorder_ways(got);
-    reorder_interps(got);
-    reorder_admin_polygons(got);
-    reorder_pois(got, got_ele, got_qids, links);
-    reorder_place_nodes(got);
+    for (unsigned threads : kThreadCounts) {
+        ParsedData got;
+        std::vector<float> got_ele;
+        std::vector<uint32_t> got_qids;
+        fill_records(got, got_ele, got_qids, seed, s);
+        reorder_addr_points(got, threads);
+        reorder_ways(got);
+        reorder_interps(got);
+        reorder_admin_polygons(got);
+        reorder_pois(got, got_ele, got_qids, links);
+        reorder_place_nodes(got);
 
-    check_same_records(want, got);
-    CHECK(same_bytes(want_ele, got_ele));
-    CHECK(same_bytes(want_qids, got_qids));
+        check_same_records(want, got);
+        CHECK(same_bytes(want_ele, got_ele));
+        CHECK(same_bytes(want_qids, got_qids));
+    }
 }
 
 // --- String pool partition ---
@@ -368,6 +373,12 @@ TEST(reorder_steps_match_when_tied_interps_share_a_postcode) {
     Shape s;
     s.uniform_interp_postcodes = true;
     check_steps_match_reference(4, s);
+}
+
+TEST(reorder_steps_match_when_no_records_tie) {
+    Shape s;
+    s.unique_osm_ids = true;
+    check_steps_match_reference(6, s);
 }
 
 TEST(reorder_steps_match_on_tiny_inputs) {

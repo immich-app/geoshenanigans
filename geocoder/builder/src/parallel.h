@@ -408,3 +408,58 @@ bool parallel_any(size_t n, Pred pred, unsigned threads = 0) {
     }, threads);
     return found.load();
 }
+
+// The indices [0, n) in the order std::sort leaves them under less.
+template <class Less>
+std::vector<uint32_t> std_sort_indices(size_t n, Less less) {
+    std::vector<uint32_t> order(n);
+    for (size_t i = 0; i < n; i++) order[i] = static_cast<uint32_t>(i);
+    std::sort(order.begin(), order.end(), less);
+    return order;
+}
+
+// std_sort_indices on every core. Indices that tie under less (a strict weak
+// order) land in std::sort's own order only by luck, so when two adjacent
+// ones tie and tie_matters(a, b) says their order reaches the caller's
+// output, this falls back to std_sort_indices. tie_matters must be the
+// negation of an equivalence (e.g. "some output field differs"), so that
+// checking neighbours covers every tied pair.
+template <class Less, class TieMatters>
+std::vector<uint32_t> parallel_sort_indices(size_t n, Less less, TieMatters tie_matters, unsigned threads = 0) {
+    std::vector<uint32_t> order(n);
+    parallel_for(n, [&](size_t b, size_t e, unsigned) {
+        for (size_t i = b; i < e; i++) order[i] = static_cast<uint32_t>(i);
+    }, threads);
+    parallel_sort(order.begin(), order.end(), less, threads);
+    bool ties = parallel_any(n ? n - 1 : 0, [&](size_t k) {
+        return !less(order[k], order[k + 1]) && tie_matters(order[k], order[k + 1]);
+    }, threads);
+    if (!ties) return order;
+    return std_sort_indices(n, less);
+}
+
+// Sorts each run of [first, last) by less with std::sort, on every core. A
+// run is a maximal stretch whose neighbours same_run(prev, next) joins, so
+// the cuts between threads fall on run boundaries and can't change it.
+template <class It, class SameRun, class Less>
+void parallel_sort_runs(It first, It last, SameRun same_run, Less less, unsigned threads = 0) {
+    constexpr size_t kMinPerPart = size_t(1) << 14;
+    size_t n = static_cast<size_t>(last - first);
+    if (threads == 0) threads = parallel_threads();
+    size_t parts = std::max<size_t>(1, std::min<size_t>(threads, n / kMinPerPart));
+    std::vector<size_t> cut(parts + 1, n);
+    cut[0] = 0;
+    for (size_t p = 1; p < parts; p++) {
+        size_t c = std::max(cut[p - 1], n * p / parts);
+        while (c > 0 && c < n && same_run(first[c - 1], first[c])) c++;
+        cut[p] = c;
+    }
+    parallel_for(parts, [&](size_t p0, size_t p1, unsigned) {
+        for (size_t run = cut[p0], end = cut[p1]; run < end;) {
+            size_t next = run + 1;
+            while (next < end && same_run(first[next - 1], first[next])) next++;
+            std::sort(first + run, first + next, less);
+            run = next;
+        }
+    }, threads);
+}
