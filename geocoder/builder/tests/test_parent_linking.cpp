@@ -1,6 +1,7 @@
 // parent_linking.h: helpers the parent-linking passes share.
 #include "parent_linking.h"
 
+#include <algorithm>
 #include <cmath>
 #include <random>
 #include <vector>
@@ -203,30 +204,92 @@ struct Street {
     bool matches;
 };
 
-bool nearer(const Street& a, const Street& b) {
-    if (a.d2 != b.d2) return a.d2 < b.d2;
-    if (a.osm != b.osm) return a.osm < b.osm;
-    return a.listed < b.listed;
+struct StreetKey {
+    double d2;
+    int64_t osm;
+    uint32_t listed;
+    bool operator<(const StreetKey& o) const {
+        if (d2 != o.d2) return d2 < o.d2;
+        if (osm != o.osm) return osm < o.osm;
+        return listed < o.listed;
+    }
+};
+
+// Streets whose bounds are their d2 less up to `slack`, never below 0.
+std::vector<Street> new_streets(std::mt19937_64& rng, double* bounds, double slack) {
+    std::vector<Street> streets(rng() % 40);
+    for (uint32_t k = 0; k < streets.size(); k++) {
+        streets[k] = {static_cast<double>(rng() % 5), static_cast<int64_t>(rng() % 4), k, rng() % 3 == 0};
+        bounds[k] = std::max(0.0, streets[k].d2 - slack * static_cast<double>(rng() % 3));
+    }
+    return streets;
 }
 
 }  // namespace
 
-TEST(first_qualifying_of_nothing_is_null) {
-    std::vector<Street> none;
-    CHECK(first_qualifying(none, nearer, [](const Street&) { return true; }) == nullptr);
-    std::vector<Street> unmatched = {{1, 1, 0, false}, {2, 2, 1, false}};
-    CHECK(first_qualifying(unmatched, nearer, [](const Street& s) { return s.matches; }) == nullptr);
+TEST(lazy_ascending_of_nothing_hands_out_nothing) {
+    LazyAscending<StreetKey> order;
+    order.reset(0, [](uint32_t) { return 0.0; });
+    uint32_t item;
+    StreetKey key;
+    CHECK(!order.next(item, key, [](uint32_t) { return StreetKey{}; }, [](double, const StreetKey&) { return false; }));
+}
+
+TEST(lazy_ascending_hands_out_every_item_in_key_order) {
+    std::mt19937_64 rng(19);
+    LazyAscending<StreetKey> order;
+    double bounds[40];
+    for (int round = 0; round < 5000; round++) {
+        const auto streets = new_streets(rng, bounds, 1.0);
+        order.reset(static_cast<uint32_t>(streets.size()), [&](uint32_t k) { return bounds[k]; });
+        std::vector<StreetKey> expect, got;
+        for (const auto& s : streets) expect.push_back({s.d2, s.osm, s.listed});
+        std::sort(expect.begin(), expect.end());
+        uint32_t item;
+        StreetKey key;
+        auto key_of = [&](uint32_t k) { return StreetKey{streets[k].d2, streets[k].osm, k}; };
+        auto beyond = [](double bound, const StreetKey& k) { return bound > k.d2; };
+        while (order.next(item, key, key_of, beyond)) got.push_back(key);
+        CHECK(got.size() == expect.size());
+        for (size_t i = 0; i < got.size() && i < expect.size(); i++) CHECK(!(got[i] < expect[i]) && !(expect[i] < got[i]));
+    }
+}
+
+// Exact bounds: handing out the first item computes the keys of the items
+// sharing the least d2 and of no other.
+TEST(lazy_ascending_computes_only_the_keys_that_could_come_first) {
+    std::mt19937_64 rng(29);
+    LazyAscending<StreetKey> order;
+    double bounds[40];
+    for (int round = 0; round < 5000; round++) {
+        const auto streets = new_streets(rng, bounds, 0.0);
+        if (streets.empty()) continue;
+        order.reset(static_cast<uint32_t>(streets.size()), [&](uint32_t k) { return bounds[k]; });
+        int computed = 0;
+        uint32_t item;
+        StreetKey key;
+        CHECK(order.next(item, key, [&](uint32_t k) {
+            computed++;
+            return StreetKey{streets[k].d2, streets[k].osm, k};
+        }, [](double bound, const StreetKey& k) { return bound > k.d2; }));
+        double least = 1e18;
+        for (const auto& s : streets) least = std::min(least, s.d2);
+        int sharing = 0;
+        for (const auto& s : streets) sharing += s.d2 == least;
+        CHECK_EQ(computed, sharing);
+    }
 }
 
 // The token-matched street used to come from a visit-order scan keeping a
-// matching street only when strictly nearer by (d2, osm_id); nearest-first
-// must pick the same one, ties included, and test no street beyond it.
-TEST(first_qualifying_matches_strict_improvement_scan) {
+// matching street only when strictly nearer by (d2, osm_id); the first
+// matching street handed out must be the same one, ties included, after
+// handing out exactly the streets ahead of it.
+TEST(lazy_ascending_first_match_matches_strict_improvement_scan) {
     std::mt19937_64 rng(23);
+    LazyAscending<StreetKey> order;
+    double bounds[40];
     for (int round = 0; round < 20000; round++) {
-        std::vector<Street> visits(rng() % 40);
-        for (uint32_t k = 0; k < visits.size(); k++)
-            visits[k] = {static_cast<double>(rng() % 5), static_cast<int64_t>(rng() % 4), k, rng() % 3 == 0};
+        const auto visits = new_streets(rng, bounds, 1.0);
 
         double best_d2 = 1e18;
         int64_t best_osm = INT64_MAX;
@@ -238,17 +301,25 @@ TEST(first_qualifying_matches_strict_improvement_scan) {
             expect = v.listed;
         }
 
-        auto candidates = visits;
-        int tested = 0;
-        const Street* got = first_qualifying(candidates, nearer, [&](const Street& s) {
-            tested++;
-            return s.matches;
-        });
-        CHECK_EQ(got ? static_cast<int64_t>(got->listed) : -1, expect);
-        if (got) {
+        order.reset(static_cast<uint32_t>(visits.size()), [&](uint32_t k) { return bounds[k]; });
+        int64_t got = -1;
+        int handed = 0;
+        uint32_t item;
+        StreetKey key;
+        while (order.next(item, key, [&](uint32_t k) { return StreetKey{visits[k].d2, visits[k].osm, k}; },
+                          [](double bound, const StreetKey& k) { return bound > k.d2; })) {
+            handed++;
+            if (visits[item].matches) {
+                got = item;
+                break;
+            }
+        }
+        CHECK_EQ(got, expect);
+        if (got >= 0) {
+            const StreetKey match{visits[got].d2, visits[got].osm, static_cast<uint32_t>(got)};
             int ahead = 0;
-            for (const auto& v : visits) ahead += nearer(v, *got);
-            CHECK_EQ(tested, ahead + 1);
+            for (const auto& v : visits) ahead += StreetKey{v.d2, v.osm, v.listed} < match;
+            CHECK_EQ(handed, ahead + 1);
         }
     }
 }
@@ -281,4 +352,39 @@ TEST(gallop_lower_bound_matches_lower_bound) {
             CHECK(got == expect);
         }
     }
+}
+
+TEST(street_d2_is_zero_on_the_street_and_grows_off_it) {
+    const std::vector<NodeCoord> street = {{0, 0}, {0, 1}, {1, 1}};
+    const double cos_lat = std::cos(0.5 * M_PI / 180.0);
+    CHECK(street_d2(street.data(), 3, 0.0f, 0.5f, 1.0) == 0.0);
+    CHECK(street_d2(street.data(), 3, 0.5f, 1.0f, 1.0) == 0.0);
+    CHECK(street_d2(street.data(), 3, 0.5f, 0.5f, cos_lat) > 0.0);
+    CHECK(street_d2(street.data(), 1, 0.0f, 0.0f, 1.0) == INFINITY);
+}
+
+// The sweep skips a street when its box is farther than a street already
+// met by kStreetBoxSlack: sound only if no box ever lies farther than its
+// street by that much, near the antimeridian, the equator and the poles too.
+TEST(street_box_d2_never_exceeds_street_d2_by_the_slack) {
+    std::mt19937_64 rng(41);
+    std::uniform_real_distribution<double> unit(0.0, 1.0);
+    double worst = 0;
+    for (int round = 0; round < 200000; round++) {
+        const double lat0 = round % 4 == 0 ? 0.0 : -89.0 + 178.0 * unit(rng);
+        const double lng0 = round % 4 == 1 ? 179.99 : (round % 4 == 2 ? 0.0 : -180.0 + 360.0 * unit(rng));
+        const double reach = std::pow(10.0, -6 + 5 * unit(rng));
+        std::vector<NodeCoord> street(2 + rng() % 8);
+        for (auto& nd : street)
+            nd = {static_cast<float>(std::clamp(lat0 + reach * (2 * unit(rng) - 1), -90.0, 90.0)),
+                  static_cast<float>(std::clamp(lng0 + reach * (2 * unit(rng) - 1), -180.0, 180.0))};
+        const float plat = static_cast<float>(std::clamp(lat0 + reach * (2 * unit(rng) - 1), -90.0, 90.0));
+        const float plng = static_cast<float>(std::clamp(lng0 + reach * (2 * unit(rng) - 1), -180.0, 180.0));
+        const double cos_lat = std::cos(plat * M_PI / 180.0);
+        const uint16_t n = static_cast<uint16_t>(street.size());
+        const double box = street_box_d2(street_box(street.data(), n), plat, plng, cos_lat);
+        const double d2 = street_d2(street.data(), n, plat, plng, cos_lat);
+        worst = std::max(worst, std::sqrt(box) - std::sqrt(d2));
+    }
+    CHECK(worst < kStreetBoxSlack / 100);
 }

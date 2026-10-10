@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <utility>
 #include <vector>
 
@@ -106,16 +107,105 @@ It gallop_lower_bound(It first, It last, const T& value, Comp comp) {
     return std::lower_bound(first + lo, first + std::min(hi, n), value, comp);
 }
 
-// The first of `candidates` in `before` order (a strict total order) that
-// passes `qualifies`, or nullptr. Heap-ordered, so a costly `qualifies` runs
-// only on the candidates ranked ahead of the winner. Reorders `candidates`.
-template <class T, class Before, class Qualifies>
-const T* first_qualifying(std::vector<T>& candidates, Before before, Qualifies qualifies) {
-    auto after = [&](const T& a, const T& b) { return before(b, a); };
-    std::make_heap(candidates.begin(), candidates.end(), after);
-    for (auto end = candidates.end(); end != candidates.begin(); --end) {
-        std::pop_heap(candidates.begin(), end, after);
-        if (qualifies(*(end - 1))) return &*(end - 1);
+// The smallest distance-squared from (plat, plng) to the polyline's segments,
+// in local-flat approximation (good enough for nearest-street ranking):
+// longitudes scale by cos_lat, the cosine of plat.
+inline double street_d2(const NodeCoord* nodes, uint16_t count, float plat, float plng, double cos_lat) {
+    double min_d2 = INFINITY;
+    for (uint16_t k = 0; k + 1 < count; k++) {
+        const auto& a = nodes[k];
+        const auto& b = nodes[k + 1];
+        double ax = (a.lng - plng) * cos_lat;
+        double ay = (a.lat - plat);
+        double bx = (b.lng - plng) * cos_lat;
+        double by = (b.lat - plat);
+        double dx = bx - ax;
+        double dy = by - ay;
+        double seg_len2 = dx * dx + dy * dy;
+        double d2;
+        if (seg_len2 < 1e-18) {
+            d2 = ax * ax + ay * ay;
+        } else {
+            double tt = -(ax * dx + ay * dy) / seg_len2;
+            if (tt < 0.0) tt = 0.0;
+            else if (tt > 1.0) tt = 1.0;
+            double qx = ax + tt * dx;
+            double qy = ay + tt * dy;
+            d2 = qx * qx + qy * qy;
+        }
+        if (d2 < min_d2) min_d2 = d2;
     }
-    return nullptr;
+    return min_d2;
 }
+
+// A street's lat/lng bounds.
+struct StreetBox {
+    float lat_lo, lat_hi, lng_lo, lng_hi;
+};
+
+inline StreetBox street_box(const NodeCoord* nodes, uint16_t count) {
+    StreetBox box{INFINITY, -INFINITY, INFINITY, -INFINITY};
+    for (uint16_t k = 0; k < count; k++)
+        box = {std::min(box.lat_lo, nodes[k].lat), std::max(box.lat_hi, nodes[k].lat),
+               std::min(box.lng_lo, nodes[k].lng), std::max(box.lng_hi, nodes[k].lng)};
+    return box;
+}
+
+// Distance-squared from (plat, plng) to the box, in street_d2's frame. The
+// frame rounds a node's coordinates as it rounds the box corners, so every
+// segment lies in the rounded box, and no street_d2 of the street's nodes
+// is below this but by rounding: their square roots differ by under 1e-13
+// degrees (differences of up to 360 degrees, a few roundings each), far
+// under kStreetBoxSlack.
+inline double street_box_d2(const StreetBox& box, float plat, float plng, double cos_lat) {
+    double x_lo = (box.lng_lo - plng) * cos_lat, x_hi = (box.lng_hi - plng) * cos_lat;
+    double y_lo = (box.lat_lo - plat), y_hi = (box.lat_hi - plat);
+    double dx = x_lo > 0 ? x_lo : (x_hi < 0 ? -x_hi : 0.0);
+    double dy = y_lo > 0 ? y_lo : (y_hi < 0 ? -y_hi : 0.0);
+    return dx * dx + dy * dy;
+}
+
+// Degrees: a street whose sqrt(street_box_d2) exceeds a sqrt(street_d2) by
+// this has a street_d2 above it.
+static constexpr double kStreetBoxSlack = 1e-11;
+
+// Hands out items [0, n) in ascending key order (a strict total order under
+// <), computing an item's key only once it could come next: key_of(i) is
+// costly, bound(i) a cheap lower bound on it, and beyond(b, key) true only
+// when every item bounded by b or more has a key above `key`. A caller that
+// stops early never pays for the keys of the items it did not reach. One
+// instance serves many orders, keeping its storage.
+template <class Key>
+class LazyAscending {
+public:
+    template <class Bound>
+    void reset(uint32_t n, Bound bound) {
+        unvisited_.clear();
+        visited_.clear();
+        for (uint32_t i = 0; i < n; i++) unvisited_.push_back({bound(i), i});
+        std::make_heap(unvisited_.begin(), unvisited_.end(), std::greater<>());
+    }
+
+    // The next item and its key; false once every item has been handed out.
+    template <class KeyOf, class Beyond>
+    bool next(uint32_t& item, Key& key, KeyOf key_of, Beyond beyond) {
+        while (!unvisited_.empty() &&
+               (visited_.empty() || !beyond(unvisited_.front().first, visited_.front().first))) {
+            std::pop_heap(unvisited_.begin(), unvisited_.end(), std::greater<>());
+            const uint32_t i = unvisited_.back().second;
+            unvisited_.pop_back();
+            visited_.push_back({key_of(i), i});
+            std::push_heap(visited_.begin(), visited_.end(), std::greater<>());
+        }
+        if (visited_.empty()) return false;
+        std::pop_heap(visited_.begin(), visited_.end(), std::greater<>());
+        item = visited_.back().second;
+        key = visited_.back().first;
+        visited_.pop_back();
+        return true;
+    }
+
+private:
+    std::vector<std::pair<double, uint32_t>> unvisited_;  // (bound, item), a min-heap
+    std::vector<std::pair<Key, uint32_t>> visited_;       // (key, item), a min-heap
+};
