@@ -86,23 +86,17 @@ if(EXISTS /opt/homebrew/include)
 endif()
 
 if(s2_FOUND)
-    target_link_libraries(build-index PRIVATE
-        s2::s2
-        ZLIB::ZLIB
-        BZip2::BZip2
-        EXPAT::EXPAT
-        Threads::Threads
-    )
+    target_link_libraries(build-index PRIVATE s2::s2)
 else()
     target_include_directories(build-index PRIVATE /usr/include/s2)
-    target_link_libraries(build-index PRIVATE
-        s2
-        ZLIB::ZLIB
-        BZip2::BZip2
-        EXPAT::EXPAT
-        Threads::Threads
-    )
+    target_link_libraries(build-index PRIVATE s2)
 endif()
+target_link_libraries(build-index PRIVATE
+    ZLIB::ZLIB
+    BZip2::BZip2
+    EXPAT::EXPAT
+    Threads::Threads
+)
 
 # --- Unit tests (geocoder-tests) ---
 #
