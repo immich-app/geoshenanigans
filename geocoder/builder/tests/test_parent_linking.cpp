@@ -253,6 +253,21 @@ TEST(first_qualifying_matches_strict_improvement_scan) {
     }
 }
 
+TEST(keep_first_occurrences_matches_unordered_ranking) {
+    std::mt19937_64 rng(37);
+    std::vector<std::pair<uint32_t, uint32_t>> scratch;
+    std::vector<uint32_t> table;
+    for (int round = 0; round < 5000; round++) {
+        std::vector<uint32_t> ids(rng() % 300);
+        uint32_t range = 1 + static_cast<uint32_t>(rng() % 400);
+        for (auto& id : ids) id = rng() % 2 ? static_cast<uint32_t>(rng() % range) : 0xFFFFFFFEu - static_cast<uint32_t>(rng() % range);
+        auto expect = ids;
+        rank_candidates(expect, [](uint32_t, uint32_t) { return false; }, scratch);
+        keep_first_occurrences(ids, table);
+        CHECK(ids == expect);
+    }
+}
+
 TEST(gallop_lower_bound_matches_lower_bound) {
     std::mt19937_64 rng(31);
     for (int round = 0; round < 2000; round++) {

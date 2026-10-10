@@ -81,6 +81,25 @@ void rank_candidates(std::vector<uint32_t>& ids, Better better,
     for (const auto& entry : scratch) ids.push_back(entry.first);
 }
 
+// Drops repeated ids, keeping each first occurrence in order: rank_candidates
+// with no order, in linear time (open addressing over `table`). No id may be
+// NO_DATA, the empty-slot marker.
+inline void keep_first_occurrences(std::vector<uint32_t>& ids, std::vector<uint32_t>& table) {
+    int bits = 4;
+    while ((size_t(1) << bits) < 2 * ids.size()) bits++;
+    size_t mask = (size_t(1) << bits) - 1;
+    table.assign(mask + 1, NO_DATA);
+    size_t kept = 0;
+    for (uint32_t id : ids) {
+        size_t h = static_cast<size_t>((id * 0x9E3779B97F4A7C15ull) >> (64 - bits));
+        while (table[h] != NO_DATA && table[h] != id) h = (h + 1) & mask;
+        if (table[h] == id) continue;
+        table[h] = id;
+        ids[kept++] = id;
+    }
+    ids.resize(kept);
+}
+
 // std::lower_bound(first, last, value, comp), found by galloping from first:
 // probes first+0, 1, 3, 7, ... then binary-searches the last gap, so a lookup
 // landing near first costs a few nearby probes, not a search of the range.

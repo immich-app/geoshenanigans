@@ -546,7 +546,6 @@ static void compute_way_parent_polygons(ParsedData& data, const BuildConfig& cfg
         require_ordered_admin_areas(data);
         const AdminRings rings(data, num_threads);
         auto more_specific = closest_parent_first(data);
-        auto listed_first = [](uint32_t, uint32_t) { return false; };
 
         // Note: per-way postcode is set from postal boundary PIP only.
         // The centroid fallback (get_nearest_postcode) is handled at
@@ -578,6 +577,7 @@ static void compute_way_parent_polygons(ParsedData& data, const BuildConfig& cfg
             std::vector<S2CellId> nbrs;
             std::vector<uint32_t> admins, postals;
             std::vector<std::pair<uint32_t, uint32_t>> scratch;
+            std::vector<uint32_t> seen;
             std::vector<PostalVote> postal_votes;
         };
         std::atomic<uint64_t> way_linked{0};
@@ -596,7 +596,7 @@ static void compute_way_parent_polygons(ParsedData& data, const BuildConfig& cfg
                     }
                 });
                 rank_candidates(c.admins, more_specific, c.scratch);
-                rank_candidates(c.postals, listed_first, c.scratch);
+                keep_first_occurrences(c.postals, c.seen);
             },
             [&](uint32_t i, Candidates& c) {
                 const auto& w = data.ways[i];
@@ -681,7 +681,7 @@ struct NearbyStreets {
     std::vector<S2CellId> ring1, ring2;
     std::vector<uint64_t> cells;
     std::vector<uint32_t> ways;
-    std::vector<std::pair<uint32_t, uint32_t>> order;
+    std::vector<uint32_t> seen;
 };
 
 static uint64_t street_cell_of(float lat, float lng) {
@@ -740,7 +740,7 @@ static void gather_nearby_named_streets(const ParsedData& data, S2CellId center,
         }
         from = p;
     }
-    rank_candidates(ways, [](uint32_t, uint32_t) { return false; }, nearby.order);
+    keep_first_occurrences(ways, nearby.seen);
 }
 
 // visit(way_id, way, d2, osm_id) for each of nearby.ways, gathered around the
