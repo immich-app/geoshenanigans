@@ -4630,6 +4630,10 @@ static int run(int argc, char* argv[]) {
 
         log_phase("    Release + shrink parsed data", _pt, _cpu);
 
+        // The largest-first sort below repacks the admin vertices into a
+        // buffer faulted in meanwhile.
+        auto admin_vertex_buffer = vector_beside<NodeCoord>(data.admin_vertices.size());
+
         // Drain admin polygon thread pool (may still be processing)
         std::cerr << "Waiting for admin polygon S2 covering to complete..." << std::endl;
         admin_pool.wait_idle();
@@ -4660,7 +4664,8 @@ static int run(int argc, char* argv[]) {
             // sidecar + massive admin churn on chained builds.
             // (admin_parent_ids / way_parent_ids / poi+place parent_poly_id
             // are all computed AFTER this sort, so they need no remap here.)
-            const std::vector<uint32_t> old_to_new = permute_admin_polygons(data, order, num_threads);
+            const std::vector<uint32_t> old_to_new =
+                permute_admin_polygons(data, order, num_threads, admin_vertex_buffer.get());
 
             // Remap poly_ids in cell_to_admin (preserving INTERIOR_FLAG)
             for_each_admin_cell_list(data, num_threads, [&](std::vector<uint32_t>& ids) {
