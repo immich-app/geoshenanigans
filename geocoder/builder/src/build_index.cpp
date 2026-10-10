@@ -19,6 +19,9 @@
 #include <vector>
 
 #include <fcntl.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 
 #include "pbf_reader.h"
 
@@ -4953,6 +4956,16 @@ static int run(int argc, char* argv[]) {
                 }
             }
         }
+
+#ifdef __GLIBC__
+        // The parse threads' freed buffers sit in free chunks of their
+        // malloc arenas, between live chunks, where free() never hands the
+        // pages back; malloc_trim returns them to the OS for later phases.
+        long rss_before_trim = get_rss_mb();
+        malloc_trim(0);
+        std::cerr << "Trimmed malloc arenas: " << rss_before_trim << " -> "
+                  << get_rss_mb() << " MiB resident." << std::endl;
+#endif
 
         // Memory breakdown — what's holding RSS now (before the strategy-2
         // and deterministic-ordering passes that follow). Identifies the
