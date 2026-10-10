@@ -181,12 +181,14 @@ void parallel_ordered(size_t n, Produce&& produce, Consume&& consume, unsigned t
             } catch (...) {
                 out.error = std::current_exception();
             }
+            bool awaited;  // the consumer waits for this one
             {
                 std::lock_guard<std::mutex> lock(mtx);
                 slots[i % window] = std::move(out);
                 slots[i % window].ready = true;
+                awaited = i == done;
             }
-            produced.notify_all();
+            if (awaited) produced.notify_one();
         }
     };
     std::vector<std::thread> pool;
@@ -215,7 +217,8 @@ void parallel_ordered(size_t n, Produce&& produce, Consume&& consume, unsigned t
                 std::lock_guard<std::mutex> lock(mtx);
                 done = i + 1;
             }
-            consumed.notify_all();
+            // One more index fits the window: one worker can take it.
+            consumed.notify_one();
         }
     } catch (...) {
         finish();
