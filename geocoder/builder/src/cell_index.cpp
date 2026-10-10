@@ -655,27 +655,6 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
     bool write_streets = (mode != IndexMode::AdminOnly);
     bool write_addresses = (mode == IndexMode::Full);
 
-    if (write_streets) {
-        // The cell maps stand in for tables a cache load left empty.
-        std::array<std::vector<CellItemPair>, GEO_TABLE_COUNT> from_maps;
-        auto table = [&](size_t t, const std::vector<CellItemPair>& sorted,
-                         const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map) {
-            if (!sorted.empty() || cell_map.empty()) return &sorted;
-            from_maps[t] = pairs_in_list_order(cell_map);
-            return static_cast<const std::vector<CellItemPair>*>(&from_maps[t]);
-        };
-        GeoTables tables{table(0, data.sorted_way_cells, data.cell_to_ways), nullptr, nullptr};
-        if (write_addresses) {
-            tables[1] = table(1, data.sorted_addr_cells, data.cell_to_addrs);
-            tables[2] = table(2, data.sorted_interp_cells, data.cell_to_interps);
-        }
-        size_t cells = write_geo_index(output_dir, tables);
-        std::cerr << "geo index: " << cells << " cells ("
-                  << data.ways.size() << " ways, " << data.addr_points.size() << " addrs, "
-                  << data.interp_ways.size() << " interps)" << std::endl;
-    }
-
-    log_phase((label + "geo index").c_str(), _wt, _wc);
     auto admin_future = std::async(std::launch::async, [&] {
         timed_phase(label + "admin cells", [&] {
             write_cell_index(output_dir + "/admin_cells.bin", output_dir + "/admin_entries.bin", data.cell_to_admin);
@@ -1028,6 +1007,29 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             log_phase((label + "postcode centroids").c_str(), _pt, _pc);
         }));
     }
+
+    // The geo index goes last, beside the files above.
+    if (write_streets) {
+        // The cell maps stand in for tables a cache load left empty.
+        std::array<std::vector<CellItemPair>, GEO_TABLE_COUNT> from_maps;
+        auto table = [&](size_t t, const std::vector<CellItemPair>& sorted,
+                         const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map) {
+            if (!sorted.empty() || cell_map.empty()) return &sorted;
+            from_maps[t] = pairs_in_list_order(cell_map);
+            return static_cast<const std::vector<CellItemPair>*>(&from_maps[t]);
+        };
+        GeoTables tables{table(0, data.sorted_way_cells, data.cell_to_ways), nullptr, nullptr};
+        if (write_addresses) {
+            tables[1] = table(1, data.sorted_addr_cells, data.cell_to_addrs);
+            tables[2] = table(2, data.sorted_interp_cells, data.cell_to_interps);
+        }
+        size_t cells = write_geo_index(output_dir, tables);
+        std::cerr << "geo index: " << cells << " cells ("
+                  << data.ways.size() << " ways, " << data.addr_points.size() << " addrs, "
+                  << data.interp_ways.size() << " interps)" << std::endl;
+    }
+
+    log_phase((label + "geo index").c_str(), _wt, _wc);
 
     admin_future.get();
     for (auto& f : write_futures) f.get();
