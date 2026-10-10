@@ -70,6 +70,18 @@ std::vector<Op> record_merge(const std::string& old_labels, const std::string& n
 
 }  // namespace
 
+TEST(vertex_blocks_run_to_the_next_record_with_an_offset) {
+    // 8-byte records, the vertex offset at byte 4; a 50-byte vertex stream.
+    const uint32_t offs[] = {0, 0xFFFFFFFFu, 10, 5, 30, 100, 40};
+    std::string parent(sizeof(offs) / 4 * 8, 'x');
+    for (size_t i = 0; i < sizeof(offs) / 4; i++) std::memcpy(&parent[i * 8 + 4], &offs[i], 4);
+    VertexBlocks b = vertex_blocks(parent.data(), parent.size(), 8, 4, 50);
+    CHECK(b.offsets == std::vector<uint32_t>(std::begin(offs), std::end(offs)));
+    // NO_DATA and past-the-stream offsets own nothing; 10 lies past its
+    // successor's 5 and owns nothing either.
+    CHECK(b.sizes == std::vector<uint32_t>({10, 0, 0, 25, 10, 0, 10}));
+}
+
 TEST(record_jump_index_finds_the_first_equal_record_in_range) {
     // Few distinct 12-byte records, zeroed ones among them: duplicates and
     // tombstones are what the index must get right.

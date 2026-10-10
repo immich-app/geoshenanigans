@@ -202,6 +202,35 @@ inline MergeSequence build_merge_seq(
     return seq;
 }
 
+// Each parent record's block of a v15 vertex byte stream: a block runs from
+// its record's vertex offset to the next record's that has one, or to the
+// end of the stream; a NO_DATA or out-of-range offset owns no block (POIs
+// can be points between polygon POIs), nor does one past its successor.
+struct VertexBlocks {
+    std::vector<uint32_t> offsets, sizes;
+};
+
+inline VertexBlocks vertex_blocks(const char* parent, size_t parent_size, size_t stride, size_t off_field_pos,
+                                  size_t verts_size) {
+    constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
+    size_t total_n = parent_size / stride;
+    VertexBlocks b{std::vector<uint32_t>(total_n), std::vector<uint32_t>(total_n)};
+    for (size_t i = 0; i < total_n; i++)
+        memcpy(&b.offsets[i], parent + i * stride + off_field_pos, 4);
+    // Walk from end so each i finds its next non-NO_DATA neighbour cheaply.
+    uint32_t next_off = static_cast<uint32_t>(verts_size);
+    for (size_t i = total_n; i-- > 0; ) {
+        uint32_t off = b.offsets[i];
+        if (off == NO_DATA || (size_t)off > verts_size) {
+            b.sizes[i] = 0;
+        } else {
+            b.sizes[i] = (next_off >= off) ? (next_off - off) : 0;
+            next_off = off;
+        }
+    }
+    return b;
+}
+
 // A child stream (street/interp nodes, *_vertices bytes) merged along its
 // parent's merge sequence: a parent MATCH keeps its child block when the
 // bytes are equal, a DELETE drops the old block and an INSERT appends the

@@ -207,24 +207,6 @@ static FixupKeys v15_fixup_keys(const char* old_polys, size_t old_polys_size,
                                 const char* new_verts, size_t new_verts_size,
                                 size_t stride, size_t off_field_pos,
                                 uint64_t (*key_fn)(const char* rec)) {
-    auto compute_blocks = [&](const char* polys, size_t parent_size, size_t verts_size) {
-        size_t total_n = parent_size / stride;
-        std::vector<uint32_t> offsets(total_n);
-        std::vector<uint32_t> sizes(total_n);
-        for (size_t i = 0; i < total_n; i++)
-            memcpy(&offsets[i], polys + i * stride + off_field_pos, 4);
-        uint32_t next_off = static_cast<uint32_t>(verts_size);
-        for (size_t i = total_n; i-- > 0; ) {
-            uint32_t off = offsets[i];
-            if (off == NO_DATA || (size_t)off > verts_size) {
-                sizes[i] = 0;
-            } else {
-                sizes[i] = (next_off >= off) ? (next_off - off) : 0;
-                next_off = off;
-            }
-        }
-        return std::make_pair(std::move(offsets), std::move(sizes));
-    };
     auto block_hash = [&](const char* verts, size_t verts_size, uint32_t off, size_t bsize) -> uint64_t {
         uint64_t h = 14695981039346656037ULL;
         size_t end = std::min((size_t)off + bsize, verts_size);
@@ -246,10 +228,10 @@ static FixupKeys v15_fixup_keys(const char* old_polys, size_t old_polys_size,
     };
     // Each record's (record_key, block_hash) key, the blocks freed per side.
     auto keys_of = [&](const char* polys, size_t polys_size, const char* verts, size_t verts_size) {
-        auto blocks = compute_blocks(polys, polys_size, verts_size);
+        auto blocks = vertex_blocks(polys, polys_size, stride, off_field_pos, verts_size);
         return keyed_records(polys_size / stride, [&](size_t i) {
             return compose_key(key_fn(polys + i * stride),
-                               block_hash(verts, verts_size, blocks.first[i], blocks.second[i]));
+                               block_hash(verts, verts_size, blocks.offsets[i], blocks.sizes[i]));
         });
     };
 
@@ -727,36 +709,13 @@ static int run(int argc, char* argv[]) {
                                        const char* new_verts, size_t new_verts_size,
                                        size_t parent_stride,
                                        size_t off_field_pos) -> MergeSequence {
-        // Vertex byte block for polygon i runs from vert_offset until
-        // the next *non-NO_DATA* polygon's vert_offset (POIs can be
-        // points with vert_offset==NO_DATA interspersed between polygon
-        // POIs; their blocks have zero size). Precompute block sizes
-        // O(n) so the walker's per-record lookup is O(1).
-        auto compute_block_sizes = [&](const char* parent, size_t parent_size, size_t verts_size) {
-            size_t total_n = parent_size / parent_stride;
-            std::vector<uint32_t> offsets(total_n);
-            std::vector<uint32_t> sizes(total_n);
-            for (size_t i = 0; i < total_n; i++)
-                memcpy(&offsets[i], parent + i * parent_stride + off_field_pos, 4);
-            // Walk from end so each i finds its next non-NO_DATA neighbour cheaply.
-            uint32_t next_off = static_cast<uint32_t>(verts_size);
-            for (size_t i = total_n; i-- > 0; ) {
-                uint32_t off = offsets[i];
-                if (off == NO_DATA || (size_t)off > verts_size) {
-                    sizes[i] = 0;
-                } else {
-                    sizes[i] = (next_off >= off) ? (next_off - off) : 0;
-                    next_off = off;
-                }
-            }
-            return std::make_pair(std::move(offsets), std::move(sizes));
-        };
-        auto old_off_sz = compute_block_sizes(old_parent, old_parent_size, old_verts_size);
-        auto new_off_sz = compute_block_sizes(new_parent, new_parent_size, new_verts_size);
-        auto block_of = [](const std::pair<std::vector<uint32_t>, std::vector<uint32_t>>& v) {
+        // Precompute block sizes O(n) so the walker's per-record lookup is O(1).
+        auto old_off_sz = vertex_blocks(old_parent, old_parent_size, parent_stride, off_field_pos, old_verts_size);
+        auto new_off_sz = vertex_blocks(new_parent, new_parent_size, parent_stride, off_field_pos, new_verts_size);
+        auto block_of = [](const VertexBlocks& v) {
             return [&v](size_t i) -> ChildBlock {
-                if (i >= v.first.size() || v.second[i] == 0) return {0, 0};
-                return {v.first[i], v.second[i]};
+                if (i >= v.offsets.size() || v.sizes[i] == 0) return {0, 0};
+                return {v.offsets[i], v.sizes[i]};
             };
         };
         return merge_child_blocks(parent_seq, parent_stride, 1, old_verts, old_verts_size,
