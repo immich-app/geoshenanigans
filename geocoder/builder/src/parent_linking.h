@@ -80,3 +80,17 @@ void rank_candidates(std::vector<uint32_t>& ids, Better better,
     ids.clear();
     for (const auto& entry : scratch) ids.push_back(entry.first);
 }
+
+// The first of `candidates` in `before` order (a strict total order) that
+// passes `qualifies`, or nullptr. Heap-ordered, so a costly `qualifies` runs
+// only on the candidates ranked ahead of the winner. Reorders `candidates`.
+template <class T, class Before, class Qualifies>
+const T* first_qualifying(std::vector<T>& candidates, Before before, Qualifies qualifies) {
+    auto after = [&](const T& a, const T& b) { return before(b, a); };
+    std::make_heap(candidates.begin(), candidates.end(), after);
+    for (auto end = candidates.end(); end != candidates.begin(); --end) {
+        std::pop_heap(candidates.begin(), end, after);
+        if (qualifies(*(end - 1))) return &*(end - 1);
+    }
+    return nullptr;
+}

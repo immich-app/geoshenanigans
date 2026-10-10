@@ -193,3 +193,62 @@ TEST(rank_candidates_first_containing_matches_strict_improvement_scan) {
         CHECK_EQ(first_containing(ids, polys), expect);
     }
 }
+
+namespace {
+
+struct Street {
+    double d2;
+    int64_t osm;
+    uint32_t listed;
+    bool matches;
+};
+
+bool nearer(const Street& a, const Street& b) {
+    if (a.d2 != b.d2) return a.d2 < b.d2;
+    if (a.osm != b.osm) return a.osm < b.osm;
+    return a.listed < b.listed;
+}
+
+}  // namespace
+
+TEST(first_qualifying_of_nothing_is_null) {
+    std::vector<Street> none;
+    CHECK(first_qualifying(none, nearer, [](const Street&) { return true; }) == nullptr);
+    std::vector<Street> unmatched = {{1, 1, 0, false}, {2, 2, 1, false}};
+    CHECK(first_qualifying(unmatched, nearer, [](const Street& s) { return s.matches; }) == nullptr);
+}
+
+// The token-matched street used to come from a visit-order scan keeping a
+// matching street only when strictly nearer by (d2, osm_id); nearest-first
+// must pick the same one, ties included, and test no street beyond it.
+TEST(first_qualifying_matches_strict_improvement_scan) {
+    std::mt19937_64 rng(23);
+    for (int round = 0; round < 20000; round++) {
+        std::vector<Street> visits(rng() % 40);
+        for (uint32_t k = 0; k < visits.size(); k++)
+            visits[k] = {static_cast<double>(rng() % 5), static_cast<int64_t>(rng() % 4), k, rng() % 3 == 0};
+
+        double best_d2 = 1e18;
+        int64_t best_osm = INT64_MAX;
+        int64_t expect = -1;
+        for (const auto& v : visits) {
+            if (!(v.d2 < best_d2 || (v.d2 == best_d2 && v.osm < best_osm)) || !v.matches) continue;
+            best_d2 = v.d2;
+            best_osm = v.osm;
+            expect = v.listed;
+        }
+
+        auto candidates = visits;
+        int tested = 0;
+        const Street* got = first_qualifying(candidates, nearer, [&](const Street& s) {
+            tested++;
+            return s.matches;
+        });
+        CHECK_EQ(got ? static_cast<int64_t>(got->listed) : -1, expect);
+        if (got) {
+            int ahead = 0;
+            for (const auto& v : visits) ahead += nearer(v, *got);
+            CHECK_EQ(tested, ahead + 1);
+        }
+    }
+}

@@ -809,9 +809,24 @@ static void backfill_addr_point_parent_streets(ParsedData& data, const BuildConf
         auto order = items_by_cell(data.addr_points.size(), num_threads, [&](size_t i) {
             return street_cell_of(data.addr_points[i].lat, data.addr_points[i].lng);
         });
-        walk_items_by_cell<NearbyStreets>(order, num_threads,
-            [&](S2CellId cell, NearbyStreets& nearby) { gather_nearby_named_streets(data, cell, nearby); },
-            [&](uint32_t i, NearbyStreets& nearby) {
+        // A street the token match may take: listed is its visit order.
+        struct MatchCandidate {
+            double d2;
+            int64_t osm;
+            uint32_t listed, way_id, name_id, orig_id;
+        };
+        auto nearer = [](const MatchCandidate& a, const MatchCandidate& b) {
+            if (a.d2 != b.d2) return a.d2 < b.d2;
+            if (a.osm != b.osm) return a.osm < b.osm;
+            return a.listed < b.listed;
+        };
+        struct Scratch {
+            NearbyStreets nearby;
+            std::vector<MatchCandidate> match_candidates;
+        };
+        walk_items_by_cell<Scratch>(order, num_threads,
+            [&](S2CellId cell, Scratch& scratch) { gather_nearby_named_streets(data, cell, scratch.nearby); },
+            [&](uint32_t i, Scratch& scratch) {
                 auto& ap = data.addr_points[i];
                 ap.parent_way_id = NO_DATA;
 
@@ -834,15 +849,15 @@ static void backfill_addr_point_parent_streets(ParsedData& data, const BuildConf
                 int64_t best_osm = INT64_MAX;
                 // Token-matched resolution: track nearest
                 // way whose original name matches addr:street
-                double best_match_d2 = 1e18;
                 uint32_t best_match_name = NO_DATA;
                 uint32_t best_match_way = NO_DATA;
-                int64_t best_match_osm = INT64_MAX;
                 const char* addr_street_str = nullptr;
                 if (ap.street_id != NO_DATA) {
                     addr_street_str = pool_data.data() + ap.street_id;
                 }
-                for_each_nearby_named_street(data, nearby, ap.lat, ap.lng,
+                auto& candidates = scratch.match_candidates;
+                candidates.clear();
+                for_each_nearby_named_street(data, scratch.nearby, ap.lat, ap.lng,
                     [&](uint32_t way_id, const WayHeader& w, double d2, int64_t cand_osm) {
                         if (d2 < best_d2 ||
                             (d2 == best_d2 && cand_osm < best_osm)) {
@@ -851,24 +866,31 @@ static void backfill_addr_point_parent_streets(ParsedData& data, const BuildConf
                             best_way_idx = way_id;
                             best_osm = cand_osm;
                         }
-                        // Token-matched: check if way's
-                        // original name matches addr:street
-                        if ((d2 < best_match_d2 ||
-                             (d2 == best_match_d2 && cand_osm < best_match_osm))
+                        // Token-matched: a way whose original name may
+                        // match addr:street, within the (1e18, INT64_MAX)
+                        // bound the match starts from.
+                        if ((d2 < 1e18 || (d2 == 1e18 && cand_osm < INT64_MAX))
                             && addr_street_str
                             && way_id < data.way_orig_name_ids.size()) {
                             uint32_t orig_id = data.way_orig_name_ids[way_id];
                             if (orig_id != NO_DATA) {
-                                const char* orig_str = pool_data.data() + orig_id;
-                                if (tokens_overlap(addr_street_str, orig_str)) {
-                                    best_match_d2 = d2;
-                                    best_match_name = w.name_id;
-                                    best_match_way = way_id;
-                                    best_match_osm = cand_osm;
-                                }
+                                candidates.push_back({d2, cand_osm, static_cast<uint32_t>(candidates.size()),
+                                                      way_id, w.name_id, orig_id});
                             }
                         }
                     });
+                // The match is the smallest (d2, osm_id) whose original
+                // name shares a token with addr:street, the first visited
+                // on exact ties: test candidates nearest first, sparing
+                // tokens_overlap on everything beyond the match.
+                const MatchCandidate* match = first_qualifying(candidates, nearer,
+                    [&](const MatchCandidate& c) {
+                        return tokens_overlap(addr_street_str, pool_data.data() + c.orig_id);
+                    });
+                if (match) {
+                    best_match_name = match->name_id;
+                    best_match_way = match->way_id;
+                }
                 if (best_way_idx != NO_DATA) {
                     // Prefer token-matched way (matches
                     // Nominatim's getNearestNamedRoadPlaceId
