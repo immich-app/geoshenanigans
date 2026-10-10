@@ -87,9 +87,12 @@ std::vector<std::pair<S2CellId, bool>> cover_polygon(
     S2Error error;
     auto loop = std::make_unique<S2Loop>(points, S2Debug::DISABLE);
     loop->Normalize();
-    if (loop->FindValidationError(&error)) return {};
-
-    S2Polygon polygon(std::move(loop));
+    // Validate through the polygon: for one loop of 3+ vertices
+    // S2Polygon::FindValidationError runs exactly S2Loop's checks (the
+    // empty-loop, orientation and nesting checks cannot fire), on the shape
+    // index the coverer reuses instead of a second index for the loop alone.
+    S2Polygon polygon(std::move(loop), S2Debug::DISABLE);
+    if (polygon.FindValidationError(&error)) return {};
 
     S2RegionCoverer::Options options;
     options.set_max_level(kAdminCellLevel);
