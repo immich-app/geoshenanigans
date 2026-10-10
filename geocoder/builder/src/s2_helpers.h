@@ -50,6 +50,8 @@ public:
     ~AdminCoverPool();
 
     void submit(uint32_t poly_id, std::vector<std::pair<double,double>>&& vertices);
+    // Blocks until every submitted polygon is covered.
+    void wait_idle();
     std::unordered_map<uint64_t, std::vector<uint32_t>> drain();
 
 private:

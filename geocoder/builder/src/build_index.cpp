@@ -5056,14 +5056,18 @@ static int run(int argc, char* argv[]) {
                   << data.poi_vertices.size() << " polygon vertices)" << std::endl;
         std::cerr << "  " << data.place_nodes.size() << " place nodes" << std::endl;
 
+        log_phase("    Release + shrink parsed data", _pt, _cpu);
+
         // Drain admin polygon thread pool (may still be processing)
         std::cerr << "Waiting for admin polygon S2 covering to complete..." << std::endl;
+        admin_pool.wait_idle();
+        log_phase("    Admin: S2 covering wait", _pt, _cpu);
         auto admin_results = admin_pool.drain();
-        log_phase("    Admin: S2 covering drain", _pt, _cpu);
         for (auto& [cell_id, ids] : admin_results) {
             auto& target = data.cell_to_admin[cell_id];
             target.insert(target.end(), ids.begin(), ids.end());
         }
+        log_phase("    Admin: S2 covering merge", _pt, _cpu);
         std::cerr << "Admin polygon S2 covering complete (" << data.cell_to_admin.size() << " cells)." << std::endl;
 
         // Sort admin polygons largest-first (by vertex count descending).

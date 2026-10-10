@@ -171,11 +171,13 @@ void AdminCoverPool::submit(uint32_t poly_id, std::vector<std::pair<double,doubl
     cv_.notify_one();
 }
 
+void AdminCoverPool::wait_idle() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    done_cv_.wait(lock, [this]() { return queue_.empty() && active_workers_ == 0; });
+}
+
 std::unordered_map<uint64_t, std::vector<uint32_t>> AdminCoverPool::drain() {
-    {
-        std::unique_lock<std::mutex> lock(mutex_);
-        done_cv_.wait(lock, [this]() { return queue_.empty() && active_workers_ == 0; });
-    }
+    wait_idle();
     std::unordered_map<uint64_t, std::vector<uint32_t>> merged;
     for (auto& local : thread_results_) {
         for (auto& [cell_id, ids] : local) {
