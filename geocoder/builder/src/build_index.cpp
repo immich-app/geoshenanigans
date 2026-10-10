@@ -927,77 +927,25 @@ static void backfill_addr_point_parent_streets(ParsedData& data, const BuildConf
     }
 }
 
-// Flat (cell_id,item_id) pair sort+merge used by the S2 cell-computation phases
-// (street/interp ways and POIs/places). Captureless; hoisted to file scope so
-// both the ways/interp and the POI/place S2 phases share it.
+// Flat (cell_id,item_id) pair sort used by the S2 cell-computation phases
+// (street/interp ways and POIs/places): concatenates the per-thread pairs and
+// sorts them on every core. Pairs equal under cell_item_less are equal in
+// both fields, so the order is unique. The cell map stays empty (only needed
+// for cache/continent modes); sorted_out is used directly for writing.
 static void parallel_sort_and_build(
     std::vector<std::vector<CellItemPair>>& thread_pairs,
-    std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map,
+    std::unordered_map<uint64_t, std::vector<uint32_t>>& /*cell_map*/,
     std::vector<CellItemPair>& sorted_out
 ) {
-    // Step 1: Convert + sort each thread's data in parallel
-    size_t total = 0;
-    for (auto& v : thread_pairs) total += v.size();
-
-    std::vector<std::vector<CellItemPair>> chunks(thread_pairs.size());
-    {
-        std::vector<std::thread> sort_threads;
-        for (size_t t = 0; t < thread_pairs.size(); t++) {
-            sort_threads.emplace_back([&, t]() {
-                auto& src = thread_pairs[t];
-                auto& dst = chunks[t];
-                dst.reserve(src.size());
-                for (auto& ci : src) dst.push_back({ci.cell_id, ci.item_id});
-                src.clear(); src.shrink_to_fit();
-                std::sort(dst.begin(), dst.end(), cell_item_less);
-            });
+    auto at = parallel_offsets<size_t>(thread_pairs.size(), [&](size_t t) { return thread_pairs[t].size(); });
+    sorted_out.assign(at.back(), CellItemPair{});
+    parallel_for(thread_pairs.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t t = b; t < e; t++) {
+            std::copy(thread_pairs[t].begin(), thread_pairs[t].end(), sorted_out.begin() + at[t]);
+            thread_pairs[t] = {};
         }
-        for (auto& t : sort_threads) t.join();
-    }
-
-    // Step 2: Concatenate sorted chunks and merge using parallel tree.
-    // Each chunk is already sorted. Record run boundaries, concatenate,
-    // then merge adjacent runs pairwise in parallel at each level.
-    auto cmp = cell_item_less;
-
-    // Record run boundaries before concatenation
-    std::vector<size_t> run_bounds = {0};
-    sorted_out.clear();
-    sorted_out.reserve(total);
-    for (auto& chunk : chunks) {
-        sorted_out.insert(sorted_out.end(), chunk.begin(), chunk.end());
-        run_bounds.push_back(sorted_out.size());
-        chunk.clear(); chunk.shrink_to_fit();
-    }
-
-    // Parallel tree merge: at each level, merge adjacent run pairs in parallel.
-    // Level 0: merge runs (0,1), (2,3), ... → N/2 runs
-    // Level 1: merge runs (01,23), (45,67), ... → N/4 runs
-    // ... until one sorted run remains.
-    while (run_bounds.size() > 2) {
-        std::vector<size_t> new_bounds = {0};
-        std::vector<std::thread> merge_threads;
-        for (size_t i = 0; i + 2 < run_bounds.size(); i += 2) {
-            size_t left = run_bounds[i];
-            size_t mid = run_bounds[i + 1];
-            size_t right = run_bounds[i + 2];
-            merge_threads.emplace_back([&, left, mid, right] {
-                std::inplace_merge(sorted_out.begin() + left,
-                                   sorted_out.begin() + mid,
-                                   sorted_out.begin() + right, cmp);
-            });
-            new_bounds.push_back(right);
-        }
-        // If odd number of runs, carry the last one forward
-        if (run_bounds.size() % 2 == 0) {
-            new_bounds.push_back(run_bounds.back());
-        }
-        for (auto& t : merge_threads) t.join();
-        run_bounds = std::move(new_bounds);
-    }
-
-    // Skip building hash map — sorted_out is used directly for writing.
-    // cell_map stays empty (only needed for cache/continent modes).
+    });
+    parallel_sort(sorted_out.begin(), sorted_out.end(), cell_item_less);
 }
 
 // Place-node addressline containment: for each place node, record the smallest-area
