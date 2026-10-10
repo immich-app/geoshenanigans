@@ -925,13 +925,12 @@ static int run(int argc, char* argv[]) {
         auto [new_w, nw_fb] = try_load_with_fallback(new_dir, "street_ways.bin",
                                                       {"../full/", "../../full/"});
         street_from_fallback = (ow_fb || nw_fb);
-        remap_string_fields(old_w.data, old_w.size, PatchFileId::STREET_WAYS, way_stride, str_remap);
 
         // Variants without their own street_ways (admin, admin-minimal,
-        // poi tiers) borrow the sibling /full/ copy only for the string
-        // remap. They emit no street records and carry no addr_points,
-        // the only consumer of a street id remap, so skip the street
-        // pipeline entirely (it costs ~10 GiB per planet invocation).
+        // poi tiers) borrow the sibling /full/ copy. They emit no street
+        // records and carry no addr_points, the only consumer of a street
+        // id remap, so skip the street pipeline entirely (it costs ~10 GiB
+        // per planet invocation), string remap included.
         if (street_from_fallback) {
             res_ways = {PatchFileId::STREET_WAYS, "street_ways.bin", way_stride,
                         0, 0, MergeSequence{}, {}};
@@ -946,6 +945,7 @@ static int run(int argc, char* argv[]) {
             return;
         }
 
+        remap_string_fields(old_w.data, old_w.size, PatchFileId::STREET_WAYS, way_stride, str_remap);
         auto [old_n, _on_fb] = try_load_with_fallback(old_dir, "street_nodes.bin",
                                                        {"../full/", "../../full/"});
         auto [new_n, _nn_fb] = try_load_with_fallback(new_dir, "street_nodes.bin",
