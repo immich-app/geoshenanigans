@@ -739,13 +739,20 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
     remap_vec(data.addr_postcode_ids);
     remap_vec(data.interp_postcode_ids);
     {
+        // Re-keys the nodes rather than copying them: a planet's worth of
+        // node allocations and frees on one core takes seconds.
+        auto& accum = data.postcode_accum;
         std::unordered_map<uint64_t, ParsedData::PostcodeAccum> remapped;
-        remapped.reserve(data.postcode_accum.size());
-        for (auto& [key, acc] : data.postcode_accum) {
-            uint32_t pc = new_offset(postcode_key_pc(key));
-            if (pc != NO_DATA) remapped[postcode_key(postcode_key_cc(key), pc)] = acc;
+        remapped.reserve(accum.size());
+        for (auto it = accum.begin(); it != accum.end();) {
+            auto node = accum.extract(it++);
+            uint32_t pc = new_offset(postcode_key_pc(node.key()));
+            if (pc == NO_DATA) continue;
+            node.key() = postcode_key(postcode_key_cc(node.key()), pc);
+            auto placed = remapped.insert(std::move(node));
+            if (!placed.inserted) placed.position->second = placed.node.mapped();
         }
-        data.postcode_accum = std::move(remapped);
+        accum = std::move(remapped);
     }
 }
 
