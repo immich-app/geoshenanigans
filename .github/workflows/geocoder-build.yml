@@ -974,10 +974,10 @@ jobs:
               KEYS=$($S5 ls "$BUILDS_PREFIX/$d/*" 2>/dev/null \
                 | awk '{print $NF}' \
                 | grep -v -E '\.gcpatch$|^configurations\.json$' || true)
+              # One batch (s5cmd's workers) rather than a process per key:
+              # a build is ~1000 keys.
               if [ -n "$KEYS" ]; then
-                echo "$KEYS" | while read -r rel; do
-                  $S5 rm "$BUILDS_PREFIX/$d/$rel" >/dev/null 2>&1 || true
-                done
+                echo "$KEYS" | sed "s|^|rm $BUILDS_PREFIX/$d/|" | $S5 run >/dev/null 2>&1 || true
               fi
             else
               echo "  $d: DELETE (older than $PATCH_CUTOFF)"
@@ -991,10 +991,8 @@ jobs:
           MEMWATCH_CUTOFF=$(date -u -d "$NEW_DATE -${KEEP_MEMWATCH_DAYS} days +1 day" +%Y/%m/%d)
           echo "memwatch: keep logs from $MEMWATCH_CUTOFF on"
           $S5 ls "$MEMWATCH_PREFIX/*" 2>/dev/null \
-            | awk -v cutoff="$MEMWATCH_CUTOFF" '$1 < cutoff {print $NF}' \
-            | while read -r key; do
-                $S5 rm "$MEMWATCH_PREFIX/$key" >/dev/null 2>&1 || true
-              done
+            | awk -v cutoff="$MEMWATCH_CUTOFF" -v prefix="$MEMWATCH_PREFIX" '$1 < cutoff {print "rm " prefix "/" $NF}' \
+            | $S5 run >/dev/null 2>&1 || true
           echo "Public bucket cleanup complete."
 
       # ── Cleanup old cache bucket entries ───────────────────────────────
