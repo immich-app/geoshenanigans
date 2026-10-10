@@ -85,7 +85,23 @@ if(EXISTS /opt/homebrew/include)
     target_include_directories(build-index PRIVATE /opt/homebrew/include)
 endif()
 
-if(s2_FOUND)
+# GEOCODER_S2_PREFIX links the static libs2.a that tools/build_s2.sh
+# installed there (S2 without its debug checks, as CI builds it) with the
+# abseil and OpenSSL libraries it references.
+set(GEOCODER_S2_PREFIX "" CACHE PATH "Prefix of a static S2 from tools/build_s2.sh")
+if(GEOCODER_S2_PREFIX)
+    find_package(absl REQUIRED)
+    find_package(OpenSSL REQUIRED)
+    target_include_directories(build-index PRIVATE "${GEOCODER_S2_PREFIX}/include")
+    target_link_libraries(build-index PRIVATE
+        "${GEOCODER_S2_PREFIX}/lib/libs2.a"
+        absl::flat_hash_map
+        absl::str_format
+        absl::strings
+        absl::synchronization
+        OpenSSL::Crypto
+    )
+elseif(s2_FOUND)
     target_link_libraries(build-index PRIVATE s2::s2)
 else()
     target_include_directories(build-index PRIVATE /usr/include/s2)
