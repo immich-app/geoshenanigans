@@ -57,128 +57,6 @@ static std::string dir_label(const std::string& dir) {
     return prev == std::string::npos ? dir : dir.substr(prev + 1);
 }
 
-std::vector<uint32_t> write_entries(
-    const std::string& path,
-    const std::vector<uint64_t>& sorted_cells,
-    const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map
-) {
-    struct CellRef { uint64_t cell_id; const std::vector<uint32_t>* ids; };
-    std::vector<CellRef> sorted_refs;
-    sorted_refs.reserve(cell_map.size());
-    for (auto& [id, ids] : cell_map) sorted_refs.push_back({id, &ids});
-    std::sort(sorted_refs.begin(), sorted_refs.end(),
-        [](const CellRef& a, const CellRef& b) { return a.cell_id < b.cell_id; });
-
-    std::vector<uint32_t> offsets(sorted_cells.size(), NO_DATA);
-    size_t total_size = 0;
-    for (auto& r : sorted_refs) total_size += sizeof(uint16_t) + r.ids->size() * sizeof(uint32_t);
-
-    std::vector<char> buf;
-    buf.reserve(total_size);
-    uint32_t current = 0;
-    size_t ri = 0;
-    size_t max_count = 0;
-    for (uint32_t si = 0; si < sorted_cells.size() && ri < sorted_refs.size(); si++) {
-        if (sorted_cells[si] < sorted_refs[ri].cell_id) continue;
-        if (sorted_cells[si] > sorted_refs[ri].cell_id) { si--; ri++; continue; }
-        offsets[si] = current;
-        const auto& ids = *sorted_refs[ri].ids;
-        uint16_t count = checked_entry_count(ids.size(), path);
-        if (ids.size() > max_count) max_count = ids.size();
-        buf.insert(buf.end(), reinterpret_cast<const char*>(&count),
-                   reinterpret_cast<const char*>(&count) + sizeof(count));
-        buf.insert(buf.end(), reinterpret_cast<const char*>(ids.data()),
-                   reinterpret_cast<const char*>(ids.data()) + ids.size() * sizeof(uint32_t));
-        current += sizeof(uint16_t) + ids.size() * sizeof(uint32_t);
-        ri++;
-    }
-    std::cerr << "  " << path << ": max entries/cell = " << max_count << std::endl;
-    write_binary_file(path, buf.data(), buf.size());
-    return offsets;
-}
-
-std::vector<uint32_t> write_entries_from_sorted(
-    const std::string& path,
-    const std::vector<uint64_t>& sorted_cells,
-    const std::vector<CellItemPair>& sorted_pairs
-) {
-    std::vector<uint32_t> offsets(sorted_cells.size(), NO_DATA);
-    if (sorted_pairs.empty()) {
-        // Still create (truncate) the file, just empty.
-        write_binary_file(path, nullptr, 0);
-        return offsets;
-    }
-
-    // Each worker packs its cells into its own buffer with offsets local to
-    // it; the offsets are then rebased and the buffers written in order.
-    struct ChunkResult {
-        std::vector<char> buf;
-        size_t cell_start = 0, cell_end = 0;
-        uint32_t local_size = 0;
-        size_t max_count = 0;  // largest per-cell entry count seen (overflow checked after join)
-    };
-    const unsigned threads = parallel_threads();
-    std::vector<ChunkResult> chunks(threads);
-    parallel_for(sorted_cells.size(), [&](size_t cs, size_t ce, unsigned t) {
-        auto& chunk = chunks[t];
-        chunk.cell_start = cs;
-        chunk.cell_end = ce;
-
-        size_t pi = std::lower_bound(sorted_pairs.begin(), sorted_pairs.end(),
-            sorted_cells[cs], [](const CellItemPair& p, uint64_t id) {
-                return p.cell_id < id;
-            }) - sorted_pairs.begin();
-
-        for (size_t si = cs; si < ce && pi < sorted_pairs.size(); si++) {
-            if (sorted_cells[si] < sorted_pairs[pi].cell_id) continue;
-            while (pi < sorted_pairs.size() && sorted_pairs[pi].cell_id < sorted_cells[si]) pi++;
-            if (pi >= sorted_pairs.size() || sorted_pairs[pi].cell_id != sorted_cells[si]) continue;
-
-            offsets[si] = chunk.local_size;
-            size_t start = pi;
-            while (pi < sorted_pairs.size() && sorted_pairs[pi].cell_id == sorted_cells[si]) pi++;
-            // Can't throw from a worker thread; record the max and let the
-            // post-join check below fail the build on overflow.
-            if (pi - start > chunk.max_count) chunk.max_count = pi - start;
-            uint16_t count = static_cast<uint16_t>(pi - start);
-            size_t entry_size = sizeof(uint16_t) + (pi - start) * sizeof(uint32_t);
-            size_t buf_pos = chunk.buf.size();
-            chunk.buf.resize(buf_pos + entry_size);
-            memcpy(chunk.buf.data() + buf_pos, &count, sizeof(count));
-            for (size_t k = start; k < pi; k++) {
-                memcpy(chunk.buf.data() + buf_pos + sizeof(uint16_t) + (k - start) * sizeof(uint32_t),
-                       &sorted_pairs[k].item_id, sizeof(uint32_t));
-            }
-            chunk.local_size += entry_size;
-        }
-    }, threads);
-
-    size_t max_count = 0;
-    for (auto& chunk : chunks)
-        if (chunk.max_count > max_count) max_count = chunk.max_count;
-    checked_entry_count(max_count, path);
-    std::cerr << "  " << path << ": max entries/cell = " << max_count << std::endl;
-
-    std::vector<uint32_t> chunk_base(threads, 0);
-    for (unsigned t = 1; t < threads; t++) chunk_base[t] = chunk_base[t - 1] + chunks[t - 1].local_size;
-    parallel_for(threads, [&](size_t b, size_t e, unsigned) {
-        for (size_t t = b; t < e; t++) {
-            if (chunk_base[t] == 0) continue;
-            for (size_t si = chunks[t].cell_start; si < chunks[t].cell_end; si++)
-                if (offsets[si] != NO_DATA) offsets[si] += chunk_base[t];
-        }
-    }, threads);
-
-    std::ofstream f(path, std::ios::binary);
-    for (auto& chunk : chunks) {
-        f.write(chunk.buf.data(), static_cast<std::streamsize>(chunk.buf.size()));
-        std::vector<char>().swap(chunk.buf);
-    }
-    f.flush();
-    if (!f) throw std::runtime_error("failed to write " + path);
-    return offsets;
-}
-
 // Strategy-2 persistent dense IDs for street_ways.
 //
 // Loads <prev_dir>/full/street_ways.osm_ids (if it exists), allocates
@@ -777,128 +655,26 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
     bool write_addresses = (mode == IndexMode::Full);
 
     if (write_streets) {
-        std::vector<uint64_t> sorted_geo_cells;
-        {
-            auto extract_unique_cells = [](const std::vector<CellItemPair>& pairs) {
-                std::vector<uint64_t> cells;
-                cells.reserve(pairs.size() / 2);
-                for (size_t i = 0; i < pairs.size(); ) {
-                    cells.push_back(pairs[i].cell_id);
-                    uint64_t cur = pairs[i].cell_id;
-                    while (i < pairs.size() && pairs[i].cell_id == cur) i++;
-                }
-                return cells;
-            };
-            auto extract_from_map = [](const std::unordered_map<uint64_t, std::vector<uint32_t>>& m) {
-                std::vector<uint64_t> cells;
-                cells.reserve(m.size());
-                for (auto& [id, _] : m) cells.push_back(id);
-                std::sort(cells.begin(), cells.end());
-                return cells;
-            };
-
-            std::vector<uint64_t> way_cells, addr_cells, interp_cells;
-            {
-                auto f1 = std::async(std::launch::async, [&] {
-                    return !data.sorted_way_cells.empty()
-                        ? extract_unique_cells(data.sorted_way_cells)
-                        : extract_from_map(data.cell_to_ways);
-                });
-                if (write_addresses) {
-                    auto f2 = std::async(std::launch::async, [&] {
-                        return !data.sorted_addr_cells.empty()
-                            ? extract_unique_cells(data.sorted_addr_cells)
-                            : extract_from_map(data.cell_to_addrs);
-                    });
-                    auto f3 = std::async(std::launch::async, [&] {
-                        return !data.sorted_interp_cells.empty()
-                            ? extract_unique_cells(data.sorted_interp_cells)
-                            : extract_from_map(data.cell_to_interps);
-                    });
-                    addr_cells = f2.get();
-                    interp_cells = f3.get();
-                }
-                way_cells = f1.get();
-            }
-
-            // Interp cells go in by an in-place merge: its buffer is the
-            // short interp side, not another copy of the whole list.
-            const size_t way_addr = way_cells.size() + addr_cells.size();
-            sorted_geo_cells.resize(way_addr + interp_cells.size());
-            std::merge(way_cells.begin(), way_cells.end(), addr_cells.begin(), addr_cells.end(),
-                       sorted_geo_cells.begin());
-            std::vector<uint64_t>().swap(way_cells);
-            std::vector<uint64_t>().swap(addr_cells);
-            std::copy(interp_cells.begin(), interp_cells.end(), sorted_geo_cells.begin() + way_addr);
-            std::vector<uint64_t>().swap(interp_cells);
-            std::inplace_merge(sorted_geo_cells.begin(), sorted_geo_cells.begin() + way_addr,
-                               sorted_geo_cells.end());
-            sorted_geo_cells.erase(std::unique(sorted_geo_cells.begin(), sorted_geo_cells.end()),
-                                    sorted_geo_cells.end());
+        // The cell maps stand in for tables a cache load left empty.
+        std::array<std::vector<CellItemPair>, GEO_TABLE_COUNT> from_maps;
+        auto table = [&](size_t t, const std::vector<CellItemPair>& sorted,
+                         const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map) {
+            if (!sorted.empty() || cell_map.empty()) return &sorted;
+            from_maps[t] = pairs_in_list_order(cell_map);
+            return static_cast<const std::vector<CellItemPair>*>(&from_maps[t]);
+        };
+        GeoTables tables{table(0, data.sorted_way_cells, data.cell_to_ways), nullptr, nullptr};
+        if (write_addresses) {
+            tables[1] = table(1, data.sorted_addr_cells, data.cell_to_addrs);
+            tables[2] = table(2, data.sorted_interp_cells, data.cell_to_interps);
         }
-
-        std::vector<uint32_t> street_offsets, addr_offsets, interp_offsets;
-        {
-            auto f1 = std::async(std::launch::async, [&]() {
-                if (!data.sorted_way_cells.empty())
-                    return write_entries_from_sorted(output_dir + "/street_entries.bin", sorted_geo_cells, data.sorted_way_cells);
-                return write_entries(output_dir + "/street_entries.bin", sorted_geo_cells, data.cell_to_ways);
-            });
-            if (write_addresses) {
-                auto f2 = std::async(std::launch::async, [&]() {
-                    if (!data.sorted_addr_cells.empty())
-                        return write_entries_from_sorted(output_dir + "/addr_entries.bin", sorted_geo_cells, data.sorted_addr_cells);
-                    return write_entries(output_dir + "/addr_entries.bin", sorted_geo_cells, data.cell_to_addrs);
-                });
-                auto f3 = std::async(std::launch::async, [&]() {
-                    if (!data.sorted_interp_cells.empty())
-                        return write_entries_from_sorted(output_dir + "/interp_entries.bin", sorted_geo_cells, data.sorted_interp_cells);
-                    return write_entries(output_dir + "/interp_entries.bin", sorted_geo_cells, data.cell_to_interps);
-                });
-                addr_offsets = f2.get();
-                interp_offsets = f3.get();
-            }
-            street_offsets = f1.get();
-        }
-
-        log_phase((label + "entry files").c_str(), _wt, _wc);
-        {
-            // Filled and written a piece at a time: the whole file is 20
-            // bytes per cell (7 GiB on planet). No addr/interp offsets
-            // (no-addresses mode) write as NO_DATA.
-            constexpr size_t kRowsPerPiece = size_t(1) << 22;
-            const size_t n = sorted_geo_cells.size();
-            const size_t row_size = sizeof(uint64_t) + 3 * sizeof(uint32_t);
-            auto offset_at = [](const std::vector<uint32_t>& offsets, size_t i) {
-                return offsets.empty() ? NO_DATA : offsets[i];
-            };
-            std::vector<char> piece(std::min(n, kRowsPerPiece) * row_size);
-            const std::string path = output_dir + "/geo_cells.bin";
-            std::ofstream f(path, std::ios::binary);
-            for (size_t first = 0; first < n; first += kRowsPerPiece) {
-                const size_t rows = std::min(kRowsPerPiece, n - first);
-                parallel_for(rows, [&](size_t begin, size_t end, unsigned) {
-                    char* ptr = piece.data() + begin * row_size;
-                    for (size_t i = first + begin; i < first + end; i++) {
-                        const uint32_t offsets[3] = {street_offsets[i], offset_at(addr_offsets, i),
-                                                     offset_at(interp_offsets, i)};
-                        memcpy(ptr, &sorted_geo_cells[i], sizeof(uint64_t));
-                        memcpy(ptr + sizeof(uint64_t), offsets, sizeof(offsets));
-                        ptr += row_size;
-                    }
-                });
-                f.write(piece.data(), static_cast<std::streamsize>(rows * row_size));
-            }
-            f.flush();
-            if (!f) throw std::runtime_error("failed to write " + path);
-        }
-
-        std::cerr << "geo index: " << sorted_geo_cells.size() << " cells ("
+        size_t cells = write_geo_index(output_dir, tables);
+        std::cerr << "geo index: " << cells << " cells ("
                   << data.ways.size() << " ways, " << data.addr_points.size() << " addrs, "
                   << data.interp_ways.size() << " interps)" << std::endl;
     }
 
-    log_phase((label + "geo_cells.bin").c_str(), _wt, _wc);
+    log_phase((label + "geo index").c_str(), _wt, _wc);
     auto admin_future = std::async(std::launch::async, [&] {
         timed_phase(label + "admin cells", [&] {
             write_cell_index(output_dir + "/admin_cells.bin", output_dir + "/admin_entries.bin", data.cell_to_admin);

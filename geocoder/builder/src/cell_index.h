@@ -8,16 +8,6 @@
 #include "parsed_data.h"
 #include "cell_index_io.h"
 
-std::vector<uint32_t> write_entries(
-    const std::string& path,
-    const std::vector<uint64_t>& sorted_cells,
-    const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map);
-
-std::vector<uint32_t> write_entries_from_sorted(
-    const std::string& path,
-    const std::vector<uint64_t>& sorted_cells,
-    const std::vector<CellItemPair>& sorted_pairs);
-
 void write_index(const ParsedData& data, const std::string& output_dir, IndexMode mode);
 
 // strings_layout.json: each tier's [start, end) in the global string-offset
