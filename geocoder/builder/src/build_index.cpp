@@ -2227,12 +2227,12 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             return sum(continent_pairs[a]) > sum(continent_pairs[b]);
         });
 
-        // Cap at 2 so the cores stay shared with the planet's stages; the
+        // Cap at 3 so the cores stay shared with the planet's stages; the
         // budget may hold fewer. A continent whose cost doesn't fit beside
         // what runs waits, and a later one that fits goes ahead of it; one
         // that doesn't fit the budget even alone runs alone, its steps one
         // after another.
-        unsigned max_concurrent = std::max(1u, std::min(2u,
+        unsigned max_concurrent = std::max(1u, std::min(3u,
             std::thread::hardware_concurrency() / 8));
         const KindValues planet_bytes = record_bytes(data);
         const KindValues planet_counts = record_counts(data);
