@@ -761,12 +761,15 @@ jobs:
           # there breaks strategy-2 chaining and balloons the next
           # patch back to multi-GiB. The cleanup step further down
           # ages them out at the same rate as full builds (3 days).
+          # The in-cluster cache copy runs alongside the Tigris upload.
+          $CACHE cp --concurrency 16 \
+            "$WORKDIR/output/*" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/" > /dev/null 2>&1 &
+          CACHE_PID=$!
           s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 4 cp --concurrency 8 \
             "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/" || \
             echo "::warning::Some files failed on first pass — verify loop will retry"
           echo "Tigris upload first pass complete in $(($(date +%s) - UPLOAD_START))s"
-          $CACHE cp --concurrency 16 \
-            "$WORKDIR/output/*" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/" 2>/dev/null || true
+          wait $CACHE_PID || true
 
           # ── Augment configurations.json with build metadata ─────────
           # Splices date / previous / built_at / wikidata_date into the
