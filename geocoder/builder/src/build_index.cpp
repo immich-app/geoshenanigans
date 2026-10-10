@@ -1312,7 +1312,9 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
 
 // POI parent-street precomputation: store each POI's nearest named street name_id
 // (server populates `road` when the POI wins; Nominatim parent_place_id parity).
+// `order` holds the POIs by street cell (items_by_cell).
 static void compute_poi_parent_streets(ParsedData& data, const BuildConfig& cfg,
+                const std::vector<CellItemPair>& order,
                 std::chrono::steady_clock::time_point& _s2t, CpuTicks& _s2cpu) {
     unsigned int num_threads = cfg.num_threads;
     if (!data.poi_records.empty() && !data.ways.empty()) {
@@ -1320,9 +1322,6 @@ static void compute_poi_parent_streets(ParsedData& data, const BuildConfig& cfg,
         std::cerr << "Computing POI parent-street links ("
                   << data.poi_records.size() << " POIs)..." << std::endl;
 
-        auto order = items_by_cell(data.poi_records.size(), num_threads, [&](size_t i) {
-            return street_cell_of(data.poi_records[i].lat, data.poi_records[i].lng);
-        });
         walk_items_by_cell<NearbyStreets>(order, num_threads,
             [&](S2CellId cell, NearbyStreets& nearby) { gather_nearby_named_streets(data, cell, nearby); },
             [&](uint32_t i, NearbyStreets& nearby) {
@@ -1372,8 +1371,11 @@ static void compute_poi_parent_streets(ParsedData& data, const BuildConfig& cfg,
 // - parent_poly_id: the admin polygon (levels 2..10; place-area markers 15
 //   skipped) the server's chain-containment check walks up from.
 // POIs are walked per admin cell, so each cell's candidates are gathered and
-// ranked once for both.
+// ranked once for both. `order` holds the POIs by street cell (items_by_cell):
+// a POI's admin cell is an ancestor of its street cell, so the same order
+// keeps each admin cell's POIs together.
 static void compute_poi_parent_polygons(ParsedData& data, const BuildConfig& cfg,
+                std::vector<CellItemPair> order,
                 std::chrono::steady_clock::time_point& _s2t, CpuTicks& _s2cpu) {
     unsigned int num_threads = cfg.num_threads;
     if (!data.poi_records.empty() && !data.admin_polygons.empty()) {
@@ -1387,10 +1389,17 @@ static void compute_poi_parent_polygons(ParsedData& data, const BuildConfig& cfg
         auto smaller = [&](uint32_t a, uint32_t b) {
             return data.admin_polygons[a].area < data.admin_polygons[b].area;
         };
-        auto order = items_by_cell(data.poi_records.size(), num_threads, [&](size_t i) {
-            const auto& pr = data.poi_records[i];
-            return S2CellId(S2LatLng::FromDegrees(pr.lat, pr.lng)).parent(kAdminCellLevel).id();
-        });
+        // order holds each POI's street cell, whose parent is its admin cell
+        // unless --admin-level is the finer one; then the point decides.
+        const bool admin_from_street = kAdminCellLevel <= kStreetCellLevel;
+        parallel_for(order.size(), [&](size_t b, size_t e, unsigned) {
+            for (size_t k = b; k < e; k++) {
+                const auto& poi = data.poi_records[order[k].item_id];
+                S2CellId cell = admin_from_street ? S2CellId(order[k].cell_id)
+                                                  : S2CellId(S2LatLng::FromDegrees(poi.lat, poi.lng));
+                order[k].cell_id = cell.parent(kAdminCellLevel).id();
+            }
+        }, num_threads);
 
         struct Candidates {
             std::vector<S2CellId> nbrs;
@@ -1567,9 +1576,16 @@ static void compute_s2_and_poi_cells(ParsedData& data, const BuildConfig& cfg,
 
         compute_s2_cells_ways_interp(data, cfg, _s2t, _s2cpu);
 
-        compute_poi_parent_streets(data, cfg, _s2t, _s2cpu);
+        // The POIs by street cell, for both POI passes.
+        std::vector<CellItemPair> poi_order;
+        if (!data.poi_records.empty())
+            poi_order = items_by_cell(data.poi_records.size(), num_threads, [&](size_t i) {
+                return street_cell_of(data.poi_records[i].lat, data.poi_records[i].lng);
+            });
 
-        compute_poi_parent_polygons(data, cfg, _s2t, _s2cpu);
+        compute_poi_parent_streets(data, cfg, poi_order, _s2t, _s2cpu);
+
+        compute_poi_parent_polygons(data, cfg, std::move(poi_order), _s2t, _s2cpu);
 
         backfill_addr_point_parent_streets(data, cfg, _s2t, _s2cpu);
 
