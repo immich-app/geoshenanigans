@@ -11,6 +11,7 @@
 #include <sys/mman.h>
 #include <mutex>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <unistd.h>
 #include <zlib.h>
@@ -18,11 +19,20 @@
 #include <protozero/pbf_reader.hpp>
 #include <protozero/varint.hpp>
 
+#include "parallel.h"
+
 // --- PBF file format constants ---
 // BlobHeader max size: 32 MiB (per spec), but typically <100 bytes
 // Blob max size: 32 MiB (per spec)
 static constexpr size_t MAX_BLOB_HEADER_SIZE = 64 * 1024;
 static constexpr size_t MAX_BLOB_SIZE = 64 * 1024 * 1024;
+
+// scan_pbf_blobs walks the file in stripes, several per thread so uneven
+// blob densities balance, none so small that finding its first blob costs
+// more than walking it. A stripe's first blob is searched for in chunks.
+static constexpr size_t SCAN_STRIPES_PER_THREAD = 8;
+static constexpr size_t SCAN_MIN_STRIPE_BYTES = 16 * 1024 * 1024;
+static constexpr size_t SCAN_SEARCH_CHUNK = 128 * 1024;
 
 // Protobuf field tags (from OSM PBF spec)
 namespace BlobHeaderTag {
@@ -150,15 +160,44 @@ static size_t walk_blobs(int fd, size_t offset, size_t stop, std::vector<BlobInf
     return offset;
 }
 
-std::vector<BlobInfo> scan_pbf_blobs(const std::string& filename) {
+// The first offset in [from, to) that looks like the start of an OSMData
+// blob (a BlobHeader length under 64 KiB, then the type field), or `to` if
+// none does. Blob data can hold the same bytes, so this is only a hint.
+static size_t find_blob_candidate(int fd, size_t from, size_t to) {
+    static constexpr std::string_view kTypeField("\x0a\x07OSMData", 9);
+    std::string buf(SCAN_SEARCH_CHUNK + 4 + kTypeField.size(), '\0');
+    for (size_t pos = from; pos < to; pos += SCAN_SEARCH_CHUNK) {
+        ssize_t got = pread(fd, buf.data(), buf.size(), pos);
+        if (got <= 0) break;
+        std::string_view view(buf.data(), static_cast<size_t>(got));
+        for (size_t q = view.find(kTypeField, 4); q != std::string_view::npos; q = view.find(kTypeField, q + 1)) {
+            size_t p = q - 4;
+            if (p >= SCAN_SEARCH_CHUNK || pos + p >= to) break;
+            if (view[p] == 0 && view[p + 1] == 0) return pos + p;
+        }
+    }
+    return to;
+}
+
+// Walking the blob chain is one cold header read per blob, 1.5M on the
+// planet: minutes at queue depth one, so stripes of the file are walked in
+// parallel from the first blob-like offset in each.
+std::vector<BlobInfo> scan_pbf_blobs(const std::string& filename, unsigned threads) {
     int fd = open(filename.c_str(), O_RDONLY);
     if (fd < 0) throw std::runtime_error("cannot open " + filename + ": " + strerror(errno));
 
     // Get file size
     off_t file_size = lseek(fd, 0, SEEK_END);
 
-    std::vector<BlobInfo> blobs;
-    walk_blobs(fd, 0, file_size, blobs);
+    if (threads == 0) threads = parallel_threads();
+    size_t stripes = file_size > 0
+        ? std::min<size_t>(size_t(threads) * SCAN_STRIPES_PER_THREAD, size_t(file_size) / SCAN_MIN_STRIPE_BYTES)
+        : 0;
+    std::vector<BlobInfo> blobs = parallel_chain_walk<BlobInfo>(
+        size_t(file_size), stripes,
+        [&](size_t from, size_t to) { return find_blob_candidate(fd, from, to); },
+        [&](size_t offset, size_t stop, std::vector<BlobInfo>& out) { return walk_blobs(fd, offset, stop, out); },
+        threads);
 
     close(fd);
     return blobs;
@@ -812,7 +851,7 @@ PbfFile::PbfFile(const std::string& filename, unsigned num_threads)
     if (num_threads_ == 0) num_threads_ = std::thread::hardware_concurrency();
     if (num_threads_ == 0) num_threads_ = 4;
 
-    blobs_ = scan_pbf_blobs(filename_);
+    blobs_ = scan_pbf_blobs(filename_, num_threads_);
 
     // Advise kernel to preload PBF into page cache.
     // Dramatically reduces pread latency for parallel reads (72% faster in testing).

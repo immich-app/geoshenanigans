@@ -1,10 +1,11 @@
-// parallel_for / parallel_sort: results must not depend on the thread count.
+// parallel.h helpers: results must not depend on the thread count.
 #include "parallel.h"
 
 #include <atomic>
 #include <cstdint>
 #include <random>
 #include <stdexcept>
+#include <string>
 #include <tuple>
 
 #include "test_framework.h"
@@ -26,6 +27,54 @@ bool same(const std::vector<Rec>& a, const std::vector<Rec>& b) {
     for (size_t i = 0; i < a.size(); i++)
         if (a[i].key != b[i].key || a[i].id != b[i].id || a[i].payload != b[i].payload) return false;
     return true;
+}
+
+// A chain of records: 0xAB 0xCD, a little-endian u16 payload length, the
+// payload. Payloads are random and often hold a fake 0xAB 0xCD.
+struct ChainRecord {
+    size_t offset, length;
+    bool operator==(const ChainRecord& o) const { return offset == o.offset && length == o.length; }
+};
+
+std::vector<uint8_t> new_chain(size_t records, uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::vector<uint8_t> bytes;
+    for (size_t r = 0; r < records; r++) {
+        size_t length = rng() % 300;
+        bytes.insert(bytes.end(), {0xAB, 0xCD, static_cast<uint8_t>(length), static_cast<uint8_t>(length >> 8)});
+        for (size_t i = 0; i < length; i++) bytes.push_back(static_cast<uint8_t>(rng()));
+        if (length >= 6 && rng() % 2) {
+            size_t at = bytes.size() - length + rng() % (length - 5);
+            bytes[at] = 0xAB;
+            bytes[at + 1] = 0xCD;
+        }
+    }
+    return bytes;
+}
+
+size_t walk_chain(const std::vector<uint8_t>& bytes, size_t offset, size_t stop, std::vector<ChainRecord>& out) {
+    while (offset < stop) {
+        if (offset + 4 > bytes.size() || bytes[offset] != 0xAB || bytes[offset + 1] != 0xCD)
+            throw std::runtime_error("bad record at " + std::to_string(offset));
+        size_t length = bytes[offset + 2] | (size_t(bytes[offset + 3]) << 8);
+        out.push_back({offset, length});
+        offset += 4 + length;
+    }
+    return offset;
+}
+
+size_t find_chain_start(const std::vector<uint8_t>& bytes, size_t from, size_t to) {
+    for (size_t p = from; p < to && p + 1 < bytes.size(); p++)
+        if (bytes[p] == 0xAB && bytes[p + 1] == 0xCD) return p;
+    return to;
+}
+
+std::vector<ChainRecord> chain_walk(const std::vector<uint8_t>& bytes, size_t stripes, unsigned threads) {
+    return parallel_chain_walk<ChainRecord>(
+        bytes.size(), stripes,
+        [&](size_t from, size_t to) { return find_chain_start(bytes, from, to); },
+        [&](size_t offset, size_t stop, std::vector<ChainRecord>& out) { return walk_chain(bytes, offset, stop, out); },
+        threads);
 }
 
 std::vector<Rec> new_recs(size_t n, uint32_t key_range, uint32_t seed) {
@@ -135,6 +184,44 @@ TEST(parallel_ordered_rethrows_from_either_side) {
         }
         CHECK(thrown);
         CHECK_EQ(consumed, size_t(10));
+    }
+}
+
+TEST(parallel_chain_walk_matches_the_serial_walk) {
+    for (uint32_t seed : {1u, 2u, 3u}) {
+        auto bytes = new_chain(5000, seed);
+        std::vector<ChainRecord> expect;
+        walk_chain(bytes, 0, bytes.size(), expect);
+        // Stripes far smaller than a record leave many with no start at all.
+        for (size_t stripes : {size_t(1), size_t(2), size_t(7), size_t(64), size_t(5000), size_t(100000)}) {
+            for (unsigned threads : {1u, 2u, 3u, 16u}) {
+                CHECK(chain_walk(bytes, stripes, threads) == expect);
+            }
+        }
+    }
+}
+
+TEST(parallel_chain_walk_throws_the_serial_walks_error) {
+    auto bytes = new_chain(3000, 9);
+    std::vector<ChainRecord> records;
+    walk_chain(bytes, 0, bytes.size(), records);
+    bytes[records[2000].offset] = 0;
+    std::string expect;
+    try {
+        std::vector<ChainRecord> out;
+        walk_chain(bytes, 0, bytes.size(), out);
+    } catch (const std::runtime_error& e) {
+        expect = e.what();
+    }
+    REQUIRE(!expect.empty());
+    for (size_t stripes : {size_t(2), size_t(40), size_t(3000)}) {
+        std::string got;
+        try {
+            chain_walk(bytes, stripes, 8);
+        } catch (const std::runtime_error& e) {
+            got = e.what();
+        }
+        CHECK_EQ(got, expect);
     }
 }
 

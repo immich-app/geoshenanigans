@@ -150,6 +150,68 @@ void parallel_ordered(size_t n, Produce&& produce, Consume&& consume, unsigned t
     finish();
 }
 
+// Follows a chain of records over [0, size), each record giving where the
+// next starts, in `stripes` stripes walked in parallel. walk(offset, stop,
+// out) appends the records from `offset` that start before `stop` and
+// returns where the chain reaches (>= stop), throwing on a malformed record;
+// find_start(from, to) guesses the first record start in [from, to) (`to`
+// for none). A guess may be wrong, so a stripe's walk is kept only where the
+// chain from 0 lands exactly on its start, and the stripe is walked again in
+// order anywhere else: the records and any exception are exactly those of
+// walk(0, size, out).
+template <class Record, class FindStart, class Walk>
+std::vector<Record> parallel_chain_walk(size_t size, size_t stripes, FindStart&& find_start, Walk&& walk,
+                                        unsigned threads = 0) {
+    std::vector<Record> out;
+    if (threads == 0) threads = parallel_threads();
+    stripes = std::min(stripes, size);
+    if (threads <= 1 || stripes <= 1) {
+        walk(size_t(0), size, out);
+        return out;
+    }
+
+    std::vector<size_t> bounds(stripes + 1);
+    for (size_t k = 0; k < stripes; k++) bounds[k] = size / stripes * k;
+    bounds[stripes] = size;
+
+    struct Stripe {
+        size_t start = 0, end = 0;
+        bool walked = false;
+        std::vector<Record> records;
+    };
+    std::vector<Stripe> walks(stripes);
+    parallel_for_each(stripes, [&](size_t k, unsigned) {
+        Stripe& s = walks[k];
+        s.start = k == 0 ? 0 : find_start(bounds[k], bounds[k + 1]);
+        if (s.start < bounds[k] || s.start >= bounds[k + 1]) return;
+        try {
+            s.end = walk(s.start, bounds[k + 1], s.records);
+            s.walked = true;
+        } catch (...) {
+            std::vector<Record>().swap(s.records);
+        }
+    }, threads);
+
+    size_t total = 0;
+    for (const auto& s : walks) total += s.records.size();
+    out.reserve(total);
+    size_t offset = 0;
+    for (size_t k = 0; k < stripes; k++) {
+        Stripe& s = walks[k];
+        if (offset < bounds[k + 1]) {
+            if (s.walked && s.start == offset) {
+                out.insert(out.end(), std::make_move_iterator(s.records.begin()),
+                           std::make_move_iterator(s.records.end()));
+                offset = s.end;
+            } else {
+                offset = walk(offset, bounds[k + 1], out);
+            }
+        }
+        std::vector<Record>().swap(s.records);
+    }
+    return out;
+}
+
 // The indices i in [0, n) where pred(i) holds, ascending, tested on every
 // core.
 template <class Pred>

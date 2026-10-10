@@ -93,8 +93,8 @@ struct BlobInfo {
 
 // --- PBF Reader ---
 
-// Scan the file to find all blob offsets
-std::vector<BlobInfo> scan_pbf_blobs(const std::string& filename);
+// Scan the file to find all blob offsets, on `threads` threads (0 = every core)
+std::vector<BlobInfo> scan_pbf_blobs(const std::string& filename, unsigned threads = 0);
 
 // Decode a single blob from raw file data into a PbfBlock.
 PbfBlock decode_pbf_blob(const char* blob_data, size_t blob_size);
