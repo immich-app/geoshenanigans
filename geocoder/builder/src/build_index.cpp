@@ -982,12 +982,14 @@ static void emit_polyline_cells(const NodeCoord* nodes, uint16_t count, uint32_t
 // sorts them on every core. Pairs equal under cell_item_less are equal in
 // both fields, so the order is unique. sorted_out is used directly for
 // writing; the cell maps stay empty (only needed for cache/continent modes).
+// A sorted_out already holding as many pairs as the lists (made beside
+// earlier work) is filled as it is.
 static void parallel_sort_and_build(
     std::vector<std::vector<CellItemPair>>& thread_pairs,
     std::vector<CellItemPair>& sorted_out
 ) {
     auto at = parallel_offsets<size_t>(thread_pairs.size(), [&](size_t t) { return thread_pairs[t].size(); });
-    sorted_out.assign(at.back(), CellItemPair{});
+    if (sorted_out.size() != at.back()) sorted_out.assign(at.back(), CellItemPair{});
     parallel_for(thread_pairs.size(), [&](size_t b, size_t e, unsigned) {
         for (size_t t = b; t < e; t++) {
             std::copy(thread_pairs[t].begin(), thread_pairs[t].end(), sorted_out.begin() + at[t]);
@@ -1465,6 +1467,13 @@ static void compute_s2_cells_ways_interp(ParsedData& data, const BuildConfig& cf
             emit_polyline_cells(data.street_nodes.data() + dw.node_offset, dw.node_count, dw.way_id, scratch, out);
         });
     log_phase("  S2: street ways (parallel)", _s2t, _s2cpu);
+    // The street table's pages take seconds to fault in on one core: that
+    // core takes them while the others cover the interps.
+    size_t way_pair_count = 0;
+    for (const auto& pairs : way_pairs) way_pair_count += pairs.size();
+    auto way_cells = std::async(std::launch::async, [way_pair_count] {
+        return std::vector<CellItemPair>(way_pair_count);
+    });
 
     // Process interpolations: emit (cell_id, interp_id) pairs
     std::cerr << "  Processing " << data.deferred_interps.size() << " interpolation ways..." << std::endl;
@@ -1474,6 +1483,7 @@ static void compute_s2_cells_ways_interp(ParsedData& data, const BuildConfig& cf
             emit_polyline_cells(data.interp_nodes.data() + di.node_offset, di.node_count, di.interp_id, scratch, out);
         });
     log_phase("  S2: interp ways (parallel)", _s2t, _s2cpu);
+    data.sorted_way_cells = way_cells.get();
 
     // Merge the per-worker pairs into single sorted tables.
     std::cerr << "  Sorting and grouping cell pairs..." << std::endl;
