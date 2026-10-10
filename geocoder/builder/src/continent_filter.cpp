@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <cstring>
 #include <future>
-#include <unordered_set>
 
 #include <s2/s2cell_id.h>
 #include <s2/s2latlng.h>
@@ -452,9 +451,13 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
 
     // --- String pool compaction ---
     // Collect every surviving offset from ways, addrs, interps, admin polygons,
-    // place nodes, POI records, way/addr postcode arrays, and postcode_accum keys.
-    std::unordered_set<uint32_t> used_offsets;
-    auto add_used = [&](uint32_t off) { if (off != NO_DATA) used_offsets.insert(off); };
+    // place nodes, POI records, way/addr postcode arrays, and postcode_accum keys,
+    // as bits over the planet pool: ascending set bits are the kept strings.
+    const auto& old_sp = full.string_pool.data();
+    std::vector<uint64_t> used_bits(old_sp.size() / 64 + 1, 0);
+    auto add_used = [&](uint32_t off) {
+        if (off < old_sp.size()) used_bits[off / 64] |= uint64_t(1) << (off % 64);
+    };
     for (const auto& w : out.ways) add_used(w.name_id);
     for (const auto& a : out.addr_points) { add_used(a.housenumber_id); add_used(a.street_id); }
     for (const auto& iw : out.interp_ways) add_used(iw.street_id);
@@ -466,41 +469,49 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     for (uint32_t off : out.addr_postcode_ids) add_used(off);
     for (const auto& [key, _acc] : out.postcode_accum) add_used(postcode_key_pc(key));
 
-    const auto& old_sp = full.string_pool.data();
-    std::unordered_map<uint32_t, uint32_t> string_remap;
+    std::vector<uint32_t> kept_offsets;  // ascending planet offsets
+    std::vector<uint32_t> new_offsets;   // each one's offset in the continent pool
     auto& new_sp = out.string_pool.mutable_data();
     new_sp.clear();
-    std::vector<uint32_t> sorted_offsets(used_offsets.begin(), used_offsets.end());
-    std::sort(sorted_offsets.begin(), sorted_offsets.end());
-    for (uint32_t old_off : sorted_offsets) {
-        uint32_t new_off = static_cast<uint32_t>(new_sp.size());
-        string_remap[old_off] = new_off;
-        const char* str = old_sp.data() + old_off;
-        size_t len = std::strlen(str);
-        new_sp.insert(new_sp.end(), str, str + len + 1);
+    for (size_t word = 0; word < used_bits.size(); word++) {
+        for (uint64_t bits = used_bits[word]; bits; bits &= bits - 1) {
+            uint32_t old_off = static_cast<uint32_t>(word * 64 + __builtin_ctzll(bits));
+            kept_offsets.push_back(old_off);
+            new_offsets.push_back(static_cast<uint32_t>(new_sp.size()));
+            const char* str = old_sp.data() + old_off;
+            size_t len = std::strlen(str);
+            new_sp.insert(new_sp.end(), str, str + len + 1);
+        }
     }
+    std::vector<uint64_t>().swap(used_bits);
     auto remap_or_sentinel = [&](uint32_t off) -> uint32_t {
-        if (off == NO_DATA) return NO_DATA;
-        auto it = string_remap.find(off);
-        return it == string_remap.end() ? NO_DATA : it->second;
+        auto it = std::lower_bound(kept_offsets.begin(), kept_offsets.end(), off);
+        if (it == kept_offsets.end() || *it != off) return NO_DATA;
+        return new_offsets[it - kept_offsets.begin()];
+    };
+    auto remap_each = [&](auto& records, auto remap_record) {
+        parallel_for(records.size(), [&](size_t begin, size_t end, unsigned) {
+            for (size_t i = begin; i < end; i++) remap_record(records[i]);
+        });
     };
 
-    for (auto& w : out.ways) w.name_id = remap_or_sentinel(w.name_id);
-    for (auto& a : out.addr_points) {
+    remap_each(out.ways, [&](WayHeader& w) { w.name_id = remap_or_sentinel(w.name_id); });
+    remap_each(out.addr_points, [&](AddrPoint& a) {
         a.housenumber_id = remap_or_sentinel(a.housenumber_id);
         a.street_id = remap_or_sentinel(a.street_id);
-    }
-    for (auto& iw : out.interp_ways) iw.street_id = remap_or_sentinel(iw.street_id);
-    for (auto& ap : out.admin_polygons) ap.name_id = remap_or_sentinel(ap.name_id);
-    for (auto& pn : out.place_nodes) pn.name_id = remap_or_sentinel(pn.name_id);
-    for (auto& pr : out.poi_records) {
+    });
+    remap_each(out.interp_ways, [&](InterpWay& iw) { iw.street_id = remap_or_sentinel(iw.street_id); });
+    remap_each(out.admin_polygons, [&](AdminPolygon& ap) { ap.name_id = remap_or_sentinel(ap.name_id); });
+    remap_each(out.place_nodes, [&](PlaceNode& pn) { pn.name_id = remap_or_sentinel(pn.name_id); });
+    remap_each(out.poi_records, [&](PoiRecord& pr) {
         pr.name_id = remap_or_sentinel(pr.name_id);
         pr.parent_street_id = remap_or_sentinel(pr.parent_street_id);
         pr.parent_postcode_id = remap_or_sentinel(pr.parent_postcode_id);
-    }
-    for (auto& off : out.way_postcode_ids) off = remap_or_sentinel(off);
-    for (auto& off : out.interp_postcode_ids) off = remap_or_sentinel(off);
-    for (auto& off : out.addr_postcode_ids) off = remap_or_sentinel(off);
+    });
+    auto remap_offset = [&](uint32_t& off) { off = remap_or_sentinel(off); };
+    remap_each(out.way_postcode_ids, remap_offset);
+    remap_each(out.interp_postcode_ids, remap_offset);
+    remap_each(out.addr_postcode_ids, remap_offset);
 
     // Rebuild postcode_accum with remapped keys (drop entries whose string didn't survive)
     {
