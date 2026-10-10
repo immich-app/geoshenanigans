@@ -2250,14 +2250,6 @@ static void reorder_deterministically(ParsedData& data, std::vector<float>& poi_
     auto _st = std::chrono::steady_clock::now();
     auto _sc = CpuTicks::now();
 
-    // reorder_addr_points drops cell_to_addrs, already flattened into
-    // sorted_addr_cells. Freeing its ~30M planet lists takes seconds on one
-    // core, so that runs beside the steps instead.
-    std::future<void> addr_cells_freed;
-    if (!data.sorted_addr_cells.empty())
-        addr_cells_freed = std::async(std::launch::async,
-            [cells = std::move(data.cell_to_addrs)]() mutable { cells.clear(); });
-
     // 1. Partition the string pool into per-consumer tiers, sort
     //    alphabetically within each tier, and rewrite all record
     //    offsets to the new globally-contiguous layout.  Shared
@@ -2295,7 +2287,6 @@ static void reorder_deterministically(ParsedData& data, std::vector<float>& poi_
     std::cerr << "  Interps took " << std::fixed << std::setprecision(1) << interps_seconds
               << "s beside the other steps" << std::endl;
     log_phase("  Sort interps (wait)", _st, _sc);
-    if (addr_cells_freed.valid()) addr_cells_freed.get();
 }
 
 static int run(int argc, char* argv[]) {
@@ -4384,7 +4375,7 @@ static int run(int argc, char* argv[]) {
         log_mem("data.addr_osm_ids",                 vec_bytes(data.addr_osm_ids));
         log_mem("data.addr_vertices",                vec_bytes(data.addr_vertices));
         log_mem("data.addr_postcode_ids",            vec_bytes(data.addr_postcode_ids));
-        log_mem("data.cell_to_addrs (approx)",       map_bytes_approx(data.cell_to_addrs));
+        log_mem("data.addr_cells",                   vec_bytes(data.addr_cells));
         log_mem("data.admin_polygons",               vec_bytes(data.admin_polygons));
         log_mem("data.admin_osm_ids",                vec_bytes(data.admin_osm_ids));
         log_mem("data.admin_vertices",               vec_bytes(data.admin_vertices));
@@ -4545,8 +4536,9 @@ static int run(int argc, char* argv[]) {
         {
             auto _dt = std::chrono::steady_clock::now();
             auto _dc = CpuTicks::now();
-            data.sorted_addr_cells = sorted_cell_pairs(data.cell_to_addrs);
-            log_phase("    Dedup: addr cell pairs", _dt, _dc);
+            data.sorted_addr_cells = sorted_item_cells(data.addr_cells);
+            std::vector<uint64_t>().swap(data.addr_cells);
+            log_phase("    Sort: addr cell pairs", _dt, _dc);
             deduplicate(data.cell_to_admin);
             log_phase("    Dedup: admin cells", _dt, _dc);
         }

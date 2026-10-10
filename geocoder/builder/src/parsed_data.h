@@ -249,6 +249,9 @@ struct ParsedData {
     // synthetic hash). Strategy-2 IdAllocator uses this.
     std::vector<uint64_t> addr_osm_ids;
     std::vector<NodeCoord> addr_vertices;  // polygon vertices for building addr_points
+    // Street cell of each addr point, parallel to addr_points until a parse
+    // turns it into sorted_addr_cells. Only a cache load fills cell_to_addrs.
+    std::vector<uint64_t> addr_cells;
     std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_addrs;
     std::vector<InterpWay> interp_ways;
     // Parallel to interp_ways: packed (OSM_WAY, osm_way_id).
@@ -653,21 +656,14 @@ inline void deduplicate(Map& cell_map, unsigned threads = 0) {
     deduplicate_lists(cell_lists(cell_map), threads);
 }
 
-// Dedups a cell map in place and flattens it into (cell_id, item_id) pairs
+// (cell_id, item_id) pairs for items that each sit in one cell, cells[item],
 // ordered by cell, then item.
-template<typename Map>
-inline std::vector<CellItemPair> sorted_cell_pairs(Map& cell_map, unsigned threads = 0) {
-    auto cells = cell_lists(cell_map);
-    deduplicate_lists(cells, threads);
-    // Map keys are unique, so the cell order is too.
-    parallel_sort(cells.begin(), cells.end(), [](const auto& a, const auto& b) { return a.first < b.first; }, threads);
-    auto at = parallel_offsets<size_t>(cells.size(), [&](size_t c) { return cells[c].second->size(); }, threads);
-    std::vector<CellItemPair> pairs(at.back());
+inline std::vector<CellItemPair> sorted_item_cells(const std::vector<uint64_t>& cells, unsigned threads = 0) {
+    std::vector<CellItemPair> pairs(cells.size());
     parallel_for(cells.size(), [&](size_t b, size_t e, unsigned) {
-        for (size_t c = b; c < e; c++) {
-            size_t i = at[c];
-            for (uint32_t id : *cells[c].second) pairs[i++] = {cells[c].first, id};
-        }
+        for (size_t i = b; i < e; i++) pairs[i] = {cells[i], static_cast<uint32_t>(i)};
     }, threads);
+    // Items are unique, so the order is too.
+    parallel_sort(pairs.begin(), pairs.end(), cell_item_less, threads);
     return pairs;
 }

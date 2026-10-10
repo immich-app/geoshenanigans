@@ -289,7 +289,6 @@ void append_addr_point(ParsedData& data, double lat, double lng,
                        S2CellId cell, uint64_t osm_id_packed,
                        const NodeCoord* polygon_vertices,
                        uint32_t polygon_vertex_count) {
-    uint32_t addr_id = static_cast<uint32_t>(data.addr_points.size());
     uint32_t vertex_offset = NO_DATA;
     uint32_t vertex_count = 0;
     if (polygon_vertices && polygon_vertex_count > 0) {
@@ -311,8 +310,7 @@ void append_addr_point(ParsedData& data, double lat, double lng,
     data.addr_osm_ids.push_back(osm_id_packed);
     // Store postcode in separate parallel vector (optional file)
     data.addr_postcode_ids.push_back(postcode_id);
-
-    data.cell_to_addrs[cell.id()].push_back(addr_id);
+    data.addr_cells.push_back(cell.id());
 }
 
 // --- add_admin_polygon ---

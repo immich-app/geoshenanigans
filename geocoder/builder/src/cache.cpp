@@ -57,6 +57,26 @@ static std::vector<char> serialize_cell_map(const std::unordered_map<uint64_t, s
     return buf;
 }
 
+// The serialize_cell_map layout from a table ordered by cell.
+static std::vector<char> serialize_cell_pairs(const std::vector<CellItemPair>& pairs) {
+    uint64_t entry_count = 0;
+    for (size_t i = 0; i < pairs.size(); i++)
+        if (i == 0 || pairs[i].cell_id != pairs[i - 1].cell_id) entry_count++;
+    std::vector<char> buf(sizeof(uint64_t) + entry_count * (sizeof(uint64_t) + sizeof(uint32_t)) +
+                          pairs.size() * sizeof(uint32_t));
+    char* ptr = buf.data();
+    std::memcpy(ptr, &entry_count, sizeof(uint64_t)); ptr += sizeof(uint64_t);
+    for (size_t i = 0; i < pairs.size();) {
+        size_t end = i + 1;
+        while (end < pairs.size() && pairs[end].cell_id == pairs[i].cell_id) end++;
+        uint32_t id_count = static_cast<uint32_t>(end - i);
+        std::memcpy(ptr, &pairs[i].cell_id, sizeof(uint64_t)); ptr += sizeof(uint64_t);
+        std::memcpy(ptr, &id_count, sizeof(uint32_t)); ptr += sizeof(uint32_t);
+        for (; i < end; i++) { std::memcpy(ptr, &pairs[i].item_id, sizeof(uint32_t)); ptr += sizeof(uint32_t); }
+    }
+    return buf;
+}
+
 static bool deserialize_cell_map(const char* data, uint64_t length,
                                   std::unordered_map<uint64_t, std::vector<uint32_t>>& map) {
     if (length < sizeof(uint64_t)) return false;
@@ -108,7 +128,8 @@ void serialize_cache(const ParsedData& data, const std::string& path) {
     write_section(SectionType::CELL_TO_WAYS, serialize_cell_map(data.cell_to_ways));
     write_section(SectionType::ADDR_POINTS, serialize_vector(data.addr_points));
     write_section(SectionType::ADDR_VERTICES, serialize_vector(data.addr_vertices));
-    write_section(SectionType::CELL_TO_ADDRS, serialize_cell_map(data.cell_to_addrs));
+    // A parse leaves the address cells only as sorted pairs.
+    write_section(SectionType::CELL_TO_ADDRS, serialize_cell_pairs(data.sorted_addr_cells));
     write_section(SectionType::INTERP_WAYS, serialize_vector(data.interp_ways));
     write_section(SectionType::INTERP_NODES, serialize_vector(data.interp_nodes));
     write_section(SectionType::CELL_TO_INTERPS, serialize_cell_map(data.cell_to_interps));
