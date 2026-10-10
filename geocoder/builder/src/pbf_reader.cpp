@@ -99,6 +99,57 @@ static uint32_t read_u32_be(int fd, size_t offset) {
 
 // --- Blob scanning ---
 
+// Reads the BlobHeader of the blob whose length prefix starts at `offset`.
+static BlobInfo read_blob_header(int fd, size_t offset) {
+    // Read 4-byte big-endian BlobHeader size
+    uint32_t header_size = read_u32_be(fd, offset);
+    if (header_size > MAX_BLOB_HEADER_SIZE) {
+        throw std::runtime_error("BlobHeader too large: " + std::to_string(header_size));
+    }
+
+    // Read BlobHeader
+    std::string header_data = read_bytes(fd, offset + 4, header_size);
+    protozero::pbf_reader header_pbf(header_data);
+
+    std::string type;
+    int32_t data_size = 0;
+    while (header_pbf.next()) {
+        switch (header_pbf.tag()) {
+            case BlobHeaderTag::TYPE:
+                type = header_pbf.get_string();
+                break;
+            case BlobHeaderTag::DATASIZE:
+                data_size = header_pbf.get_int32();
+                break;
+            default:
+                header_pbf.skip();
+        }
+    }
+
+    if (data_size < 0 || (size_t)data_size > MAX_BLOB_SIZE) {
+        throw std::runtime_error("PBF blob datasize out of range: " + std::to_string(data_size));
+    }
+
+    BlobInfo info;
+    info.offset = offset;
+    info.header_size = header_size;
+    info.data_size = data_size;
+    info.type = type;
+    return info;
+}
+
+// Follows the blob chain from the blob at `offset`, appending every blob
+// that starts before `stop`. Returns the offset the chain reaches (>= stop).
+static size_t walk_blobs(int fd, size_t offset, size_t stop, std::vector<BlobInfo>& blobs) {
+    while (offset < stop) {
+        blobs.push_back(read_blob_header(fd, offset));
+        const BlobInfo& info = blobs.back();
+        // Advance past: 4 bytes length + header + blob data
+        offset += 4 + info.header_size + info.data_size;
+    }
+    return offset;
+}
+
 std::vector<BlobInfo> scan_pbf_blobs(const std::string& filename) {
     int fd = open(filename.c_str(), O_RDONLY);
     if (fd < 0) throw std::runtime_error("cannot open " + filename + ": " + strerror(errno));
@@ -107,48 +158,7 @@ std::vector<BlobInfo> scan_pbf_blobs(const std::string& filename) {
     off_t file_size = lseek(fd, 0, SEEK_END);
 
     std::vector<BlobInfo> blobs;
-    size_t offset = 0;
-
-    while (offset < (size_t)file_size) {
-        // Read 4-byte big-endian BlobHeader size
-        uint32_t header_size = read_u32_be(fd, offset);
-        if (header_size > MAX_BLOB_HEADER_SIZE) {
-            throw std::runtime_error("BlobHeader too large: " + std::to_string(header_size));
-        }
-
-        // Read BlobHeader
-        std::string header_data = read_bytes(fd, offset + 4, header_size);
-        protozero::pbf_reader header_pbf(header_data);
-
-        std::string type;
-        int32_t data_size = 0;
-        while (header_pbf.next()) {
-            switch (header_pbf.tag()) {
-                case BlobHeaderTag::TYPE:
-                    type = header_pbf.get_string();
-                    break;
-                case BlobHeaderTag::DATASIZE:
-                    data_size = header_pbf.get_int32();
-                    break;
-                default:
-                    header_pbf.skip();
-            }
-        }
-
-        if (data_size < 0 || (size_t)data_size > MAX_BLOB_SIZE) {
-            throw std::runtime_error("PBF blob datasize out of range: " + std::to_string(data_size));
-        }
-
-        BlobInfo info;
-        info.offset = offset;
-        info.header_size = header_size;
-        info.data_size = data_size;
-        info.type = type;
-        blobs.push_back(info);
-
-        // Advance past: 4 bytes length + header + blob data
-        offset += 4 + header_size + data_size;
-    }
+    walk_blobs(fd, 0, file_size, blobs);
 
     close(fd);
     return blobs;
