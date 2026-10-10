@@ -2,6 +2,7 @@
 #include "continent_boundaries.h"
 #include "parsed_data.h"
 #include "parallel.h"
+#include "subset_copy.h"
 
 #include <algorithm>
 #include <cstring>
@@ -145,33 +146,20 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     // Strategy-2: also forward osm_ids (parallel to ways) so the
     // continent's IdAllocator pass can run with stable identity.
     auto f_remap_ways = std::async(std::launch::async, [&]() {
-        auto& sorted_ids = used_way_ids;
-        std::vector<WayHeader> ways;
-        std::vector<NodeCoord> nodes;
-        std::vector<int64_t> osm_ids;
-        ways.reserve(sorted_ids.size());
-        osm_ids.reserve(sorted_ids.size());
-        nodes.reserve(sorted_ids.size() * 5);
-        std::vector<uint32_t> remap(max_way_id, NO_DATA);
-        for (uint32_t old_id : sorted_ids) {
-            const auto& w = full.ways[old_id];
-            if (polygon && w.node_count > 0) {
-                bool any_inside = false;
+        way_remap = copy_subset(used_way_ids, full.ways, full.street_nodes,
+            [&](uint32_t id) {
+                const auto& w = full.ways[id];
+                if (!polygon || w.node_count == 0) return true;
                 for (uint16_t n = 0; n < w.node_count; n++) {
                     const auto& nd = full.street_nodes[w.node_offset + n];
-                    if (point_in_polygon(nd.lat, nd.lng, *polygon)) { any_inside = true; break; }
+                    if (point_in_polygon(nd.lat, nd.lng, *polygon)) return true;
                 }
-                if (!any_inside) continue;
-            }
-            remap[old_id] = static_cast<uint32_t>(ways.size());
-            WayHeader nw = w;
-            nw.node_offset = static_cast<uint32_t>(nodes.size());
-            ways.push_back(nw);
-            osm_ids.push_back(old_id < full.way_osm_ids.size() ? full.way_osm_ids[old_id] : 0);
-            for (uint16_t n = 0; n < w.node_count; n++)
-                nodes.push_back(full.street_nodes[w.node_offset + n]);
-        }
-        return std::make_tuple(std::move(remap), std::move(ways), std::move(nodes), std::move(osm_ids));
+                return false;
+            },
+            [&](uint32_t id) { return CoordRun{full.ways[id].node_offset, full.ways[id].node_count}; },
+            [](WayHeader& w, uint32_t offset, uint32_t) { w.node_offset = offset; },
+            out.ways, out.street_nodes);
+        out.way_osm_ids = subset_osm_ids(used_way_ids, way_remap, out.ways.size(), full.way_osm_ids);
     });
 
     // Addrs — coord polygon refinement.  Also carries through the
@@ -181,130 +169,88 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     // downstream consumer (e.g. cell_index.cpp's addr_vertices packer
     // added in v15) crashes on out-of-bounds access.
     auto f_remap_addrs = std::async(std::launch::async, [&]() {
-        auto& sorted_ids = used_addr_ids;
-        std::vector<AddrPoint> addrs;
-        addrs.reserve(sorted_ids.size());
-        std::vector<NodeCoord> verts;
-        std::vector<uint64_t> osm_ids;
-        osm_ids.reserve(sorted_ids.size());
-        std::vector<uint32_t> remap(max_addr_id, NO_DATA);
-        for (uint32_t old_id : sorted_ids) {
-            const auto& a = full.addr_points[old_id];
-            if (polygon && !point_in_polygon(a.lat, a.lng, *polygon)) continue;
-            remap[old_id] = static_cast<uint32_t>(addrs.size());
-            AddrPoint na = a;
-            if (a.vertex_count > 0 && a.vertex_offset != NO_DATA
-                && (size_t)a.vertex_offset + a.vertex_count <= full.addr_vertices.size()) {
-                uint32_t old_voff = a.vertex_offset;
-                na.vertex_offset = static_cast<uint32_t>(verts.size());
-                for (uint32_t j = 0; j < a.vertex_count; j++)
-                    verts.push_back(full.addr_vertices[old_voff + j]);
-            } else {
-                na.vertex_offset = NO_DATA;
-                na.vertex_count = 0;
-            }
-            addrs.push_back(na);
-            osm_ids.push_back(old_id < full.addr_osm_ids.size() ? full.addr_osm_ids[old_id] : 0);
-        }
-        return std::make_tuple(std::move(remap), std::move(addrs), std::move(verts), std::move(osm_ids));
+        addr_remap = copy_subset(used_addr_ids, full.addr_points, full.addr_vertices,
+            [&](uint32_t id) {
+                const auto& a = full.addr_points[id];
+                return !polygon || point_in_polygon(a.lat, a.lng, *polygon);
+            },
+            [&](uint32_t id) {
+                const auto& a = full.addr_points[id];
+                bool footprint = a.vertex_count > 0 && a.vertex_offset != NO_DATA
+                    && (size_t)a.vertex_offset + a.vertex_count <= full.addr_vertices.size();
+                return footprint ? CoordRun{a.vertex_offset, a.vertex_count} : CoordRun{0, 0};
+            },
+            [](AddrPoint& a, uint32_t offset, uint32_t count) {
+                a.vertex_offset = count > 0 ? offset : NO_DATA;
+                a.vertex_count = count;
+            },
+            out.addr_points, out.addr_vertices);
+        out.addr_osm_ids = subset_osm_ids(used_addr_ids, addr_remap, out.addr_points.size(), full.addr_osm_ids);
     });
 
     // Interps
     auto f_remap_interps = std::async(std::launch::async, [&]() {
-        auto& sorted_ids = used_interp_ids;
-        std::vector<InterpWay> iways;
-        std::vector<NodeCoord> inodes;
-        std::vector<uint64_t> osm_ids;
-        iways.reserve(sorted_ids.size());
-        osm_ids.reserve(sorted_ids.size());
-        std::vector<uint32_t> remap(max_interp_id, NO_DATA);
-        for (uint32_t old_id : sorted_ids) {
-            remap[old_id] = static_cast<uint32_t>(iways.size());
-            const auto& iw = full.interp_ways[old_id];
-            InterpWay niw = iw;
-            niw.node_offset = static_cast<uint32_t>(inodes.size());
-            iways.push_back(niw);
-            osm_ids.push_back(old_id < full.interp_osm_ids.size() ? full.interp_osm_ids[old_id] : 0);
-            for (uint16_t n = 0; n < iw.node_count; n++)
-                inodes.push_back(full.interp_nodes[iw.node_offset + n]);
-        }
-        return std::make_tuple(std::move(remap), std::move(iways), std::move(inodes), std::move(osm_ids));
+        interp_remap = copy_subset(used_interp_ids, full.interp_ways, full.interp_nodes,
+            [](uint32_t) { return true; },
+            [&](uint32_t id) { return CoordRun{full.interp_ways[id].node_offset, full.interp_ways[id].node_count}; },
+            [](InterpWay& iw, uint32_t offset, uint32_t) { iw.node_offset = offset; },
+            out.interp_ways, out.interp_nodes);
+        out.interp_osm_ids = subset_osm_ids(used_interp_ids, interp_remap, out.interp_ways.size(), full.interp_osm_ids);
     });
 
     // Admin
     auto f_remap_admins = std::async(std::launch::async, [&]() {
-        const auto& sorted_ids = used_admin_ids;
-        std::vector<AdminPolygon> polys;
-        std::vector<NodeCoord> verts;
-        std::vector<uint64_t> osm_ids;
-        polys.reserve(sorted_ids.size());
-        osm_ids.reserve(sorted_ids.size());
-        std::vector<uint32_t> remap(full.admin_polygons.size(), NO_DATA);
-        for (uint32_t old_id : sorted_ids) {
-            remap[old_id] = static_cast<uint32_t>(polys.size());
-            const auto& ap = full.admin_polygons[old_id];
-            AdminPolygon nap = ap;
-            nap.vertex_offset = static_cast<uint32_t>(verts.size());
-            polys.push_back(nap);
-            osm_ids.push_back(old_id < full.admin_osm_ids.size() ? full.admin_osm_ids[old_id] : 0);
-            for (uint32_t v = 0; v < ap.vertex_count; v++)
-                verts.push_back(full.admin_vertices[ap.vertex_offset + v]);
-        }
-        return std::make_tuple(std::move(remap), std::move(polys), std::move(verts), std::move(osm_ids));
+        admin_remap = copy_subset(used_admin_ids, full.admin_polygons, full.admin_vertices,
+            [](uint32_t) { return true; },
+            [&](uint32_t id) {
+                return CoordRun{full.admin_polygons[id].vertex_offset, full.admin_polygons[id].vertex_count};
+            },
+            [](AdminPolygon& ap, uint32_t offset, uint32_t) { ap.vertex_offset = offset; },
+            out.admin_polygons, out.admin_vertices);
+        out.admin_osm_ids = subset_osm_ids(used_admin_ids, admin_remap, out.admin_polygons.size(), full.admin_osm_ids);
     });
 
     // POIs — coord polygon refinement, preserve vertex arrays for polygon POIs
+    // A point POI's vertex_offset also moves to the current end of the
+    // vertex array, as it always has.
     auto f_remap_pois = std::async(std::launch::async, [&]() {
-        auto& sorted_ids = used_poi_ids;
-        std::vector<PoiRecord> pois;
-        std::vector<NodeCoord> verts;
-        std::vector<uint64_t> osm_ids;
-        pois.reserve(sorted_ids.size());
-        osm_ids.reserve(sorted_ids.size());
-        std::vector<uint32_t> remap(max_poi_id, NO_DATA);
-        for (uint32_t old_id : sorted_ids) {
-            const auto& p = full.poi_records[old_id];
-            if (polygon && !point_in_polygon(p.lat, p.lng, *polygon)) continue;
-            remap[old_id] = static_cast<uint32_t>(pois.size());
-            PoiRecord np = p;
-            uint32_t old_voff = p.vertex_offset;
-            uint32_t vc = p.vertex_count;
-            np.vertex_offset = static_cast<uint32_t>(verts.size());
-            if (vc > 0 && old_voff != NO_DATA) {
-                for (uint32_t v = 0; v < vc; v++)
-                    verts.push_back(full.poi_vertices[old_voff + v]);
-            }
-            pois.push_back(np);
-            osm_ids.push_back(old_id < full.poi_osm_ids.size() ? full.poi_osm_ids[old_id] : 0);
-        }
-        return std::make_tuple(std::move(remap), std::move(pois), std::move(verts), std::move(osm_ids));
+        poi_remap = copy_subset(used_poi_ids, full.poi_records, full.poi_vertices,
+            [&](uint32_t id) {
+                const auto& p = full.poi_records[id];
+                return !polygon || point_in_polygon(p.lat, p.lng, *polygon);
+            },
+            [&](uint32_t id) {
+                const auto& p = full.poi_records[id];
+                return p.vertex_count > 0 && p.vertex_offset != NO_DATA ? CoordRun{p.vertex_offset, p.vertex_count}
+                                                                        : CoordRun{0, 0};
+            },
+            [](PoiRecord& p, uint32_t offset, uint32_t) { p.vertex_offset = offset; },
+            out.poi_records, out.poi_vertices);
+        out.poi_osm_ids = subset_osm_ids(used_poi_ids, poi_remap, out.poi_records.size(), full.poi_osm_ids);
     });
 
     // Place nodes — parent_poly_id remapped in a second pass below, after
     // admin_remap is ready. Keeps the async pipeline free of dependencies.
     auto f_remap_places = std::async(std::launch::async, [&]() {
-        auto& sorted_ids = used_place_ids;
-        std::vector<PlaceNode> places;
-        std::vector<uint64_t> osm_ids;
-        places.reserve(sorted_ids.size());
-        osm_ids.reserve(sorted_ids.size());
-        std::vector<uint32_t> remap(max_place_id, NO_DATA);
-        for (uint32_t old_id : sorted_ids) {
-            const auto& pn = full.place_nodes[old_id];
-            if (polygon && !point_in_polygon(pn.lat, pn.lng, *polygon)) continue;
-            remap[old_id] = static_cast<uint32_t>(places.size());
-            places.push_back(pn);
-            osm_ids.push_back(old_id < full.place_osm_ids.size() ? full.place_osm_ids[old_id] : 0);
-        }
-        return std::make_tuple(std::move(remap), std::move(places), std::move(osm_ids));
+        const std::vector<NodeCoord> no_coords;
+        std::vector<NodeCoord> unused;
+        place_remap = copy_subset(used_place_ids, full.place_nodes, no_coords,
+            [&](uint32_t id) {
+                const auto& pn = full.place_nodes[id];
+                return !polygon || point_in_polygon(pn.lat, pn.lng, *polygon);
+            },
+            [](uint32_t) { return CoordRun{0, 0}; },
+            [](PlaceNode&, uint32_t, uint32_t) {},
+            out.place_nodes, unused);
+        out.place_osm_ids = subset_osm_ids(used_place_ids, place_remap, out.place_nodes.size(), full.place_osm_ids);
     });
 
-    { auto [wr, ways, nodes, oids] = f_remap_ways.get();    way_remap    = std::move(wr); out.ways           = std::move(ways);  out.street_nodes  = std::move(nodes); out.way_osm_ids     = std::move(oids); }
-    { auto [ar, addrs, vts, oids]  = f_remap_addrs.get();   addr_remap   = std::move(ar); out.addr_points    = std::move(addrs); out.addr_vertices = std::move(vts);   out.addr_osm_ids    = std::move(oids); }
-    { auto [ir, iways, inds, oids] = f_remap_interps.get(); interp_remap = std::move(ir); out.interp_ways    = std::move(iways); out.interp_nodes  = std::move(inds);  out.interp_osm_ids  = std::move(oids); }
-    { auto [ar, polys, vts, oids]  = f_remap_admins.get();  admin_remap  = std::move(ar); out.admin_polygons = std::move(polys); out.admin_vertices= std::move(vts);   out.admin_osm_ids   = std::move(oids); }
-    { auto [pr, pois, vts, oids]   = f_remap_pois.get();    poi_remap    = std::move(pr); out.poi_records    = std::move(pois);  out.poi_vertices  = std::move(vts);   out.poi_osm_ids     = std::move(oids); }
-    { auto [plr, places, oids]     = f_remap_places.get();  place_remap  = std::move(plr); out.place_nodes   = std::move(places);                                       out.place_osm_ids   = std::move(oids); }
+    f_remap_ways.get();
+    f_remap_addrs.get();
+    f_remap_interps.get();
+    f_remap_admins.get();
+    f_remap_pois.get();
+    f_remap_places.get();
     log_phase(("      " + std::string(bbox.name) + " filter: data remap (masked)").c_str(), _ft, _fc);
 
     // --- Project parent chains through admin_remap ---
