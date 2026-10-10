@@ -43,6 +43,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include "direct_file_writer.h"
 #include "osc_reader.h"
 #include "osm_objects.h"
 #include "parallel.h"
@@ -219,9 +220,10 @@ struct OutputItem {
 
 namespace pbf_apply_detail {
 
+// A file opened for reading.
 class FileDescriptor {
 public:
-    FileDescriptor(const std::string& path, int flags, mode_t mode = 0) : fd_(open(path.c_str(), flags, mode)) {
+    explicit FileDescriptor(const std::string& path) : fd_(open(path.c_str(), O_RDONLY)) {
         if (fd_ < 0) throw std::runtime_error("cannot open " + path + ": " + std::strerror(errno));
     }
     ~FileDescriptor() { close(fd_); }
@@ -235,19 +237,6 @@ private:
 
 inline double seconds_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-}
-
-inline void write_all(int fd, const std::string& bytes) {
-    const char* p = bytes.data();
-    for (size_t n = bytes.size(); n;) {
-        ssize_t w = ::write(fd, p, n);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            throw std::runtime_error(std::string("write failed: ") + std::strerror(errno));
-        }
-        p += w;
-        n -= size_t(w);
-    }
 }
 
 inline std::string read_span(int fd, uint64_t offset, size_t n) {
@@ -271,7 +260,7 @@ inline InputLayout scan_input(const std::string& path, unsigned threads) {
     for (size_t i = 1; i < in.blobs.size(); i++)
         if (in.blobs[i].type != "OSMData") throw std::runtime_error(path + ": unexpected blob type " + in.blobs[i].type);
     // A peek reads a few KiB per blob: readahead would read whole blobs.
-    pbf_apply_detail::FileDescriptor fd(path, O_RDONLY);
+    pbf_apply_detail::FileDescriptor fd(path);
     posix_fadvise(fd.get(), 0, 0, POSIX_FADV_RANDOM);
     in.peeks.resize(in.blobs.size());
     parallel_for_each(in.blobs.size() - 1, [&](size_t i, unsigned) {
@@ -504,22 +493,19 @@ inline ApplyStats apply_changes(const ApplyOptions& opt) {
         std::to_string(stats.copied_blobs) + " to copy; planned in " + std::to_string(seconds_since(t_plan)) + " s");
 
     auto t_write = clock::now();
-    FileDescriptor input(opt.input, O_RDONLY);
-    FileDescriptor output(opt.output, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    FileDescriptor input(opt.input);
+    DirectFileWriter output(opt.output);
     {
         PbfHeader header = decode_header_block(read_and_decompress_blob(input.get(), in.blobs[0]));
         std::string bytes;
         append_blob(bytes, "OSMHeader", encode_header_block(output_header(header, opt)));
-        write_all(output.get(), bytes);
-        stats.output_bytes += bytes.size();
+        output.append(bytes);
     }
     std::atomic<size_t> encoded{0};
     parallel_ordered(items.size(), [&](size_t k) { return produce_item(items[k], input.get(), in, winners, opt, encoded); },
-                     [&](size_t, std::string bytes) {
-                         write_all(output.get(), bytes);
-                         stats.output_bytes += bytes.size();
-                     },
-                     threads, kWritesAheadPerThread * threads);
+                     [&](size_t, std::string bytes) { output.append(bytes); }, threads,
+                     kWritesAheadPerThread * threads);
+    stats.output_bytes = output.finish();
     stats.encoded_blobs = encoded.load();
     log("wrote " + std::to_string(stats.output_bytes >> 20) + " MiB (" + std::to_string(stats.encoded_blobs) +
         " blobs encoded) in " + std::to_string(seconds_since(t_write)) + " s; total " +
