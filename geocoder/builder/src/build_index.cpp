@@ -4690,7 +4690,7 @@ static int run(int argc, char* argv[]) {
         // planet's worth of nodes takes one core many seconds, so that runs
         // beside the S2 pass.
         auto index_freed = std::async(std::launch::async,
-            [index = data.string_pool.release_index()]() mutable { for (auto& shard : index) shard.clear(); });
+            [index = data.string_pool.release_index()]() mutable { for (auto& shard : index) release_gently(shard); });
 
         compute_s2_and_poi_cells(data, cfg, _pt, _cpu);
 

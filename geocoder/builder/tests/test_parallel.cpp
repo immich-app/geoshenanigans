@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 
 #include "test_framework.h"
 
@@ -440,6 +441,15 @@ TEST(parallel_merge_merges_runs_lower_run_first_on_ties) {
         parallel_merge(spans, got.data(), by_key, threads);
         CHECK(got == expect);
     }
+}
+
+TEST(release_gently_empties_the_container) {
+    using CellMap = std::unordered_map<uint64_t, std::vector<uint32_t>>;
+    CellMap m;
+    for (uint32_t i = 0; i < 10000; i++) m[i * 7919u].push_back(i);
+    release_gently(m);
+    CHECK(m.empty());
+    CHECK_EQ(m.bucket_count(), CellMap().bucket_count());
 }
 
 TEST(parallel_any_finds_a_single_match) {

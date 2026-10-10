@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
@@ -22,6 +23,22 @@
 
 inline unsigned parallel_threads() {
     return std::max(1u, std::thread::hardware_concurrency());
+}
+
+// Empties a node container a batch of nodes at a time, pausing between
+// batches, for freeing one beside other work: its nodes go back to the
+// malloc arena they came from, and freed back to back they hold that
+// arena's lock against every other allocation from it, which can wait
+// seconds for its turn.
+template <class Container>
+void release_gently(Container& nodes) {
+    constexpr size_t kNodesPerBatch = 4096;
+    constexpr auto kPause = std::chrono::microseconds(20);
+    while (!nodes.empty()) {
+        for (size_t k = 0; k < kNodesPerBatch && !nodes.empty(); k++) nodes.erase(nodes.begin());
+        std::this_thread::sleep_for(kPause);
+    }
+    Container().swap(nodes);
 }
 
 // A vector of n value-initialized elements, made on a thread of its own:
