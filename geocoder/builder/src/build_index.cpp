@@ -634,19 +634,29 @@ static void compute_way_parent_polygons(ParsedData& data, const BuildConfig& cfg
 // parent-street pass: expand a 5x5 ring of street-level cells around
 // (plat, plng) — cell_to_ways is empty at this point (parallel_sort_and_build
 // skips the hash map), so binary-search sorted_way_cells instead — then visit
-// every segment of every named street with its local-flat point-to-segment
-// distance-squared. Callers keep their own best-candidate selection, including
-// the deterministic osm_id tie-break for exact-distance ties.
+// every named street listed there once, with the smallest local-flat
+// point-to-segment distance-squared over its segments. Callers keep their own
+// best-candidate selection, including the deterministic osm_id tie-break for
+// exact-distance ties. Visiting per listing and per segment would pick the
+// same streets: a repeat never beats the pick it already lost or set, and
+// only a street's smallest distance can win.
+struct NearbyStreetScratch {
+    std::vector<uint64_t> cells;
+    std::vector<uint32_t> ways;
+    std::vector<std::pair<uint32_t, uint32_t>> order;
+};
+
 template <typename Visit>
-static void for_each_named_street_segment(const ParsedData& data,
+static void for_each_nearby_named_street(const ParsedData& data,
                 float plat, float plng,
-                std::vector<uint64_t>& cells_to_check, Visit visit) {
+                NearbyStreetScratch& scratch, Visit visit) {
     // Walk the centre plus a 5x5 ring of neighbours at kStreetCellLevel
     // (~300m per cell) = ~1.5km coverage: enough to find the nearest named
     // street, tight enough to avoid quadratic blow-up.
     S2CellId center = S2CellId(
         S2LatLng::FromDegrees(plat, plng))
         .parent(kStreetCellLevel);
+    auto& cells_to_check = scratch.cells;
     cells_to_check.clear();
     cells_to_check.push_back(center.id());
     std::vector<S2CellId> ring1;
@@ -665,8 +675,8 @@ static void for_each_named_street_segment(const ParsedData& data,
         std::unique(cells_to_check.begin(), cells_to_check.end()),
         cells_to_check.end());
 
-    const double cos_lat = std::cos(
-        plat * M_PI / 180.0);
+    auto& ways = scratch.ways;
+    ways.clear();
     for (uint64_t cid : cells_to_check) {
         CellItemPair probe{cid, 0};
         auto lo = std::lower_bound(
@@ -681,38 +691,48 @@ static void for_each_named_street_segment(const ParsedData& data,
             const auto& w = data.ways[way_id];
             // Only named streets matter for parent linking.
             if (w.name_id == NO_DATA) continue;
-            uint32_t off = w.node_offset;
-            uint16_t cnt = w.node_count;
-            if (cnt < 2) continue;
-            if (static_cast<size_t>(off) + cnt > data.street_nodes.size()) continue;
-            // Point-to-segment distance in local-flat approximation
-            // (good enough for nearest-street ranking).
-            for (uint16_t k = 0; k + 1 < cnt; k++) {
-                const auto& a = data.street_nodes[off + k];
-                const auto& b = data.street_nodes[off + k + 1];
-                double ax = (a.lng - plng) * cos_lat;
-                double ay = (a.lat - plat);
-                double bx = (b.lng - plng) * cos_lat;
-                double by = (b.lat - plat);
-                double dx = bx - ax;
-                double dy = by - ay;
-                double seg_len2 = dx * dx + dy * dy;
-                double d2;
-                if (seg_len2 < 1e-18) {
-                    d2 = ax * ax + ay * ay;
-                } else {
-                    double tt = -(ax * dx + ay * dy) / seg_len2;
-                    if (tt < 0.0) tt = 0.0;
-                    else if (tt > 1.0) tt = 1.0;
-                    double qx = ax + tt * dx;
-                    double qy = ay + tt * dy;
-                    d2 = qx * qx + qy * qy;
-                }
-                int64_t cand_osm = way_id < data.way_osm_ids.size()
-                    ? data.way_osm_ids[way_id] : INT64_MAX;
-                visit(way_id, w, d2, cand_osm);
-            }
+            if (w.node_count < 2) continue;
+            if (static_cast<size_t>(w.node_offset) + w.node_count > data.street_nodes.size()) continue;
+            ways.push_back(way_id);
         }
+    }
+    rank_candidates(ways, [](uint32_t, uint32_t) { return false; }, scratch.order);
+
+    const double cos_lat = std::cos(
+        plat * M_PI / 180.0);
+    for (uint32_t way_id : ways) {
+        const auto& w = data.ways[way_id];
+        uint32_t off = w.node_offset;
+        uint16_t cnt = w.node_count;
+        // Point-to-segment distance in local-flat approximation
+        // (good enough for nearest-street ranking).
+        double min_d2 = INFINITY;
+        for (uint16_t k = 0; k + 1 < cnt; k++) {
+            const auto& a = data.street_nodes[off + k];
+            const auto& b = data.street_nodes[off + k + 1];
+            double ax = (a.lng - plng) * cos_lat;
+            double ay = (a.lat - plat);
+            double bx = (b.lng - plng) * cos_lat;
+            double by = (b.lat - plat);
+            double dx = bx - ax;
+            double dy = by - ay;
+            double seg_len2 = dx * dx + dy * dy;
+            double d2;
+            if (seg_len2 < 1e-18) {
+                d2 = ax * ax + ay * ay;
+            } else {
+                double tt = -(ax * dx + ay * dy) / seg_len2;
+                if (tt < 0.0) tt = 0.0;
+                else if (tt > 1.0) tt = 1.0;
+                double qx = ax + tt * dx;
+                double qy = ay + tt * dy;
+                d2 = qx * qx + qy * qy;
+            }
+            if (d2 < min_d2) min_d2 = d2;
+        }
+        int64_t cand_osm = way_id < data.way_osm_ids.size()
+            ? data.way_osm_ids[way_id] : INT64_MAX;
+        visit(way_id, w, min_d2, cand_osm);
     }
 }
 
@@ -736,7 +756,7 @@ static void backfill_addr_point_parent_streets(ParsedData& data, const BuildConf
         std::vector<std::thread> ap_workers;
         for (unsigned int t = 0; t < num_threads; t++) {
             ap_workers.emplace_back([&]() {
-                std::vector<uint64_t> cells_to_check;
+                NearbyStreetScratch nearby;
                 while (true) {
                     size_t i = ap_idx.fetch_add(1);
                     if (i >= data.addr_points.size()) break;
@@ -770,7 +790,7 @@ static void backfill_addr_point_parent_streets(ParsedData& data, const BuildConf
                     if (ap.street_id != NO_DATA) {
                         addr_street_str = pool_data.data() + ap.street_id;
                     }
-                    for_each_named_street_segment(data, ap.lat, ap.lng, cells_to_check,
+                    for_each_nearby_named_street(data, ap.lat, ap.lng, nearby,
                         [&](uint32_t way_id, const WayHeader& w, double d2, int64_t cand_osm) {
                             if (d2 < best_d2 ||
                                 (d2 == best_d2 && cand_osm < best_osm)) {
@@ -1233,7 +1253,7 @@ static void compute_poi_parent_streets(ParsedData& data, const BuildConfig& cfg,
         std::vector<std::thread> workers;
         for (unsigned int t = 0; t < num_threads; t++) {
             workers.emplace_back([&]() {
-                std::vector<uint64_t> cells_to_check;
+                NearbyStreetScratch nearby;
                 while (true) {
                     size_t i = poi_idx.fetch_add(1);
                     if (i >= data.poi_records.size()) break;
@@ -1249,7 +1269,7 @@ static void compute_poi_parent_streets(ParsedData& data, const BuildConfig& cfg,
                     int64_t best_street_osm = INT64_MAX;
                     // POI centroid: lat/lng for points, already-stored
                     // centroid lat/lng for polygons.
-                    for_each_named_street_segment(data, pr.lat, pr.lng, cells_to_check,
+                    for_each_nearby_named_street(data, pr.lat, pr.lng, nearby,
                         [&](uint32_t, const WayHeader& w, double d2, int64_t cand_osm) {
                             if (d2 < best_d2 ||
                                 (d2 == best_d2 && cand_osm < best_street_osm)) {
