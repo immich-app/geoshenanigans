@@ -2092,6 +2092,12 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
     // mis-tagged Moscow addresses (Saransk's 21 fall in the asia subset).
     timed_phase("    planet: postcode centroids", [&] { collect_postcode_centroids(data); });
 
+#ifdef __GLIBC__
+    // The earlier phases' freed blocks sit in the malloc arenas; handed back,
+    // they leave the write phase and the page cache room.
+    timed_phase("    malloc trim", [] { malloc_trim(0); });
+#endif
+
     // Write planet (async — overlaps with continent filtering start). Its
     // stages run one after another, to hold memory down while continent
     // subsets build beside it.
