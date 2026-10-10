@@ -84,6 +84,12 @@ inline bool is_tombstone(const SidecarSlot& s) {
     return (s.flags & SLOT_FLAG_TOMBSTONE) != 0;
 }
 
+// A slot whose identity a record of the next build can reclaim;
+// load_previous puts the others on the free-list.
+inline bool is_reclaimable(const SidecarSlot& s) {
+    return !is_tombstone(s) && s.object_type != static_cast<uint8_t>(ObjectType::NONE);
+}
+
 // POI tier whose files carry a slot: a live record's own tier, or for a
 // tombstone the tier of the record that last held it, so a death only
 // reaches the files that held the record. A tombstone of unknown tier (0)
@@ -145,11 +151,7 @@ public:
                    static_cast<std::streamsize>(count) * sizeof(SidecarSlot));
             if (!f) { slots_.clear(); return false; }
         }
-        for (uint32_t i = 0; i < count; i++) {
-            const SidecarSlot& s = slots_[i];
-            if (is_tombstone(s) || s.object_type == static_cast<uint8_t>(ObjectType::NONE))
-                free_list_.push_back(i);
-        }
+        free_list_ = parallel_filter(count, [&](size_t i) { return !is_reclaimable(slots_[i]); });
         return true;
     }
 
@@ -174,13 +176,11 @@ public:
 
         // The previous build's live identities; of a repeated key only the
         // lowest slot can be reclaimed, the others stay as they are.
-        std::vector<KeyIdx> prev;
-        prev.reserve(slots_.size());
-        for (uint32_t i = 0; i < slots_.size(); i++) {
+        std::vector<KeyIdx> prev = parallel_collect<KeyIdx>(slots_.size(), [&](size_t i, std::vector<KeyIdx>& found) {
             const SidecarSlot& s = slots_[i];
-            if (is_tombstone(s) || s.object_type == static_cast<uint8_t>(ObjectType::NONE)) continue;
-            prev.push_back({make_key(static_cast<ObjectType>(s.object_type), s.stable_id), i});
-        }
+            if (is_reclaimable(s))
+                found.push_back({make_key(static_cast<ObjectType>(s.object_type), s.stable_id), static_cast<uint32_t>(i)});
+        });
         parallel_sort(prev.begin(), prev.end(), by_key);
         prev.erase(std::unique(prev.begin(), prev.end(),
                                [](const KeyIdx& a, const KeyIdx& b) { return a.key == b.key; }),
@@ -223,13 +223,17 @@ public:
             }
         }
 
-        for (size_t i = 0; i < n; i++) {
+        // A matched record's slot already holds its {type, stable_id} from
+        // the load and is its alone: the tiers go in on every core. Only the
+        // others take slots in record order.
+        const std::vector<uint32_t> unmatched = parallel_filter(n, [&](size_t i) { return out[i] == kUnmatched; });
+        parallel_for(n, [&](size_t begin, size_t end, unsigned) {
+            for (size_t i = begin; i < end; i++)
+                if (out[i] != kUnmatched) slots_[out[i]].tier = identity(i).tier;
+        });
+        if (unmatched.size() > free_list_.size()) slots_.reserve(slots_.size() + unmatched.size() - free_list_.size());
+        for (uint32_t i : unmatched) {
             SlotIdentity id = identity(i);
-            if (out[i] != kUnmatched) {
-                // slot already has correct {type, stable_id} from the load
-                slots_[out[i]].tier = id.tier;
-                continue;
-            }
             const SidecarSlot fresh{static_cast<uint8_t>(id.type), 0, id.tier, 0, id.stable_id};
             if (!free_list_.empty()) {
                 out[i] = free_list_.back();
@@ -241,8 +245,9 @@ public:
             }
         }
         live_count_ += n;
-        for (size_t p = 0; p < prev.size(); p++)
-            if (!claimed[p]) unclaimed_.push_back(prev[p].idx);
+        unclaimed_ = parallel_collect<uint32_t>(prev.size(), [&](size_t p, std::vector<uint32_t>& found) {
+            if (!claimed[p]) found.push_back(prev[p].idx);
+        });
         return out;
     }
 
