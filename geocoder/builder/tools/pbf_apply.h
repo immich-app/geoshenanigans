@@ -3,6 +3,13 @@
 // type then id, copying every blob no change touches byte for byte and
 // re-encoding the touched ones on every core.
 //
+// A blob's id range runs from its first id to the next blob's (its first
+// object is found from a few KiB of it), so the changes in each range say
+// which blobs to touch. A touched blob is merged with its changes and
+// encoded again on its own string table, its unchanged ways and relations
+// copied message by message; changes past the last id of their type go in
+// new blobs at the end of the type.
+//
 // osmium (osmium-tool src/command_apply_changes.cpp, run()) reads every
 // change object in file order, reverses the list, stable-sorts it by
 // object_order_type_id_reverse_version (type, id, then newest version and
@@ -144,13 +151,13 @@ inline void merge_objects(const ObjectStore& input, const Winner* w, const Winne
 
 // Appends objs (all of one type, in order) to `out` as zlib OSMData blobs
 // of at most max_objects objects, a block over kTargetBlockBytes split in
-// halves. Returns the number of blobs.
+// halves; seed as for encode_block. Returns the number of blobs.
 inline size_t append_object_blobs(std::string& out, OsmType type, const ObjectRef* objs, size_t n,
-                                  size_t max_objects = kMaxBlockObjects) {
+                                  size_t max_objects = kMaxBlockObjects, const ObjectStore* seed = nullptr) {
     std::string raw;
     size_t count_blobs = 0;
     auto encode = [&](auto&& self, const ObjectRef* first, size_t count) -> void {
-        encode_block(type, first, count, raw);
+        encode_block(type, first, count, raw, seed);
         if (raw.size() > kTargetBlockBytes && count > 1) {
             self(self, first, count / 2);
             self(self, first + count / 2, count - count / 2);
@@ -413,7 +420,8 @@ inline std::string produce_item(const OutputItem& it, int fd, const InputLayout&
     if (it.kind == OutputItem::Merge) {
         payload = read_and_decompress_blob(fd, in.blobs[it.blob]);
         std::string where = opt.input + " blob " + std::to_string(it.blob);
-        if (decode_block(payload, input) != int(it.type)) throw std::runtime_error(where + ": unexpected object type");
+        if (decode_block(payload, input, DecodeLists::UnlessCopyable) != int(it.type))
+            throw std::runtime_error(where + ": unexpected object type");
         for (size_t i = 0; i < input.objects.size(); i++) {
             uint64_t key = id_order_key(input.objects[i].id);
             if (key < it.lo || key >= it.hi || (i && key <= id_order_key(input.objects[i - 1].id)))
@@ -425,7 +433,10 @@ inline std::string produce_item(const OutputItem& it, int fd, const InputLayout&
             if (!w->suppressed && w->ref.object->visible) objs.push_back(w->ref);
     }
     std::string out;
-    encoded += append_object_blobs(out, it.type, objs.data(), objs.size(), opt.max_block_objects);
+    // A merged blob keeps its string table: its objects' strings need no
+    // lookups and its unchanged ways and relations are copied as they are.
+    const ObjectStore* seed = it.kind == OutputItem::Merge ? &input : nullptr;
+    encoded += append_object_blobs(out, it.type, objs.data(), objs.size(), opt.max_block_objects, seed);
     return out;
 }
 

@@ -74,19 +74,25 @@ inline uint32_t to_changeset(int64_t value) {
 
 inline uint32_t to_uid(int32_t value) { return value < 0 ? 0 : static_cast<uint32_t>(value); }
 
-inline void decode_info(protozero::pbf_reader info, const std::vector<std::string_view>& table,
-                        const BlockScale& scale, OsmObject& o) {
+// Decodes an Info message into o; returns the user's string index.
+inline uint32_t decode_info(protozero::pbf_reader info, const std::vector<std::string_view>& table,
+                            const BlockScale& scale, OsmObject& o) {
+    uint32_t user_sid = kNoSid;
     while (info.next()) {
         switch (info.tag()) {
             case InfoTag::VERSION: o.version = to_version(info.get_int32()); break;
             case InfoTag::TIMESTAMP: o.timestamp = to_timestamp(info.get_int64(), scale); break;
             case InfoTag::CHANGESET: o.changeset = to_changeset(info.get_int64()); break;
             case InfoTag::UID: o.uid = to_uid(info.get_int32()); break;
-            case InfoTag::USER_SID: o.user = string_at(table, info.get_uint32()); break;
+            case InfoTag::USER_SID:
+                user_sid = info.get_uint32();
+                o.user = string_at(table, user_sid);
+                break;
             case InfoTag::VISIBLE: o.visible = info.get_bool(); break;
             default: info.skip();
         }
     }
+    return user_sid;
 }
 
 // The varints of a packed field, one at a time.
@@ -100,13 +106,26 @@ struct Varints {
     int32_t next_sint32() { return protozero::decode_zigzag32(static_cast<uint32_t>(next())); }
 };
 
+inline void add_tag(uint64_t key, uint64_t value, const std::vector<std::string_view>& table, ObjectStore& out) {
+    out.tags.push_back({string_at(table, key), string_at(table, value)});
+    out.source.tag_sids.push_back(static_cast<uint32_t>(key));
+    out.source.tag_sids.push_back(static_cast<uint32_t>(value));
+}
+
 // osmium's build_tag_list: pairs while both lists last.
 inline void add_tags(protozero::data_view keys, protozero::data_view vals,
                      const std::vector<std::string_view>& table, ObjectStore& out, OsmObject& o) {
     o.first_tag = static_cast<uint32_t>(out.tags.size());
-    for (Varints k(keys), v(vals); !k.empty() && !v.empty();)
-        out.tags.push_back({string_at(table, k.next()), string_at(table, v.next())});
+    for (Varints k(keys), v(vals); !k.empty() && !v.empty();) add_tag(k.next(), v.next(), table, out);
     o.tag_count = static_cast<uint32_t>(out.tags.size()) - o.first_tag;
+}
+
+// Appends a decoded object with its user's string index and, for a way or
+// relation whose lists were skipped, its message.
+inline void add_object(const OsmObject& o, uint32_t user_sid, std::string_view message, ObjectStore& out) {
+    out.objects.push_back(o);
+    out.source.user_sids.push_back(user_sid);
+    out.source.messages.push_back(message);
 }
 
 inline int group_type(uint32_t tag) {
@@ -155,6 +174,7 @@ inline void decode_dense(protozero::pbf_reader dense, const std::vector<std::str
         if (lat_it.empty() || lon_it.empty()) format_error("dense node without coordinates");
         OsmObject o;
         o.type = OsmType::Node;
+        uint32_t user_sid = kNoSid;
         id += id_it.next_sint();
         o.id = id;
         if (has_info) {
@@ -163,7 +183,11 @@ inline void decode_dense(protozero::pbf_reader dense, const std::vector<std::str
             if (!ts_it.empty()) o.timestamp = to_timestamp(ts += ts_it.next_sint(), scale);
             if (!uid_it.empty()) o.uid = to_uid(static_cast<int32_t>(uid += uid_it.next_sint32()));
             if (!vis_it.empty()) o.visible = vis_it.next() != 0;
-            if (!user_it.empty()) o.user = string_at(table, static_cast<uint64_t>(user += user_it.next_sint32()));
+            if (!user_it.empty()) {
+                user += user_it.next_sint32();
+                o.user = string_at(table, static_cast<uint64_t>(user));
+                user_sid = static_cast<uint32_t>(user);
+            }
         }
         lat += lat_it.next_sint();
         lon += lon_it.next_sint();
@@ -176,10 +200,10 @@ inline void decode_dense(protozero::pbf_reader dense, const std::vector<std::str
             uint64_t k = kv_it.next();
             if (k == 0) break;
             if (kv_it.empty()) format_error("dense node key without value");
-            out.tags.push_back({string_at(table, k), string_at(table, kv_it.next())});
+            add_tag(k, kv_it.next(), table, out);
         }
         o.tag_count = static_cast<uint32_t>(out.tags.size()) - o.first_tag;
-        out.objects.push_back(o);
+        add_object(o, user_sid, {}, out);
     }
 }
 
@@ -190,12 +214,13 @@ inline void decode_node(protozero::pbf_reader msg, const std::vector<std::string
     protozero::data_view keys, vals;
     constexpr int64_t kMissing = INT64_MAX;
     int64_t lat = kMissing, lon = kMissing;
+    uint32_t user_sid = kNoSid;
     while (msg.next()) {
         switch (msg.tag()) {
             case NodeTag::ID: o.id = msg.get_sint64(); break;
             case NodeTag::KEYS: keys = msg.get_view(); break;
             case NodeTag::VALS: vals = msg.get_view(); break;
-            case NodeTag::INFO: decode_info(msg.get_message(), table, scale, o); break;
+            case NodeTag::INFO: user_sid = decode_info(msg.get_message(), table, scale, o); break;
             case NodeTag::LAT: lat = msg.get_sint64(); break;
             case NodeTag::LON: lon = msg.get_sint64(); break;
             default: msg.skip();
@@ -207,22 +232,28 @@ inline void decode_node(protozero::pbf_reader msg, const std::vector<std::string
         o.lon = to_coordinate(lon, scale.lon_offset, scale);
     }
     add_tags(keys, vals, table, out, o);
-    out.objects.push_back(o);
+    add_object(o, user_sid, {}, out);
 }
 
-inline void decode_way(protozero::pbf_reader msg, const std::vector<std::string_view>& table,
-                       const BlockScale& scale, ObjectStore& out) {
+// A way; with skip_lists only its id and Info, keeping its message.
+inline void decode_way(protozero::data_view message, const std::vector<std::string_view>& table,
+                       const BlockScale& scale, bool skip_lists, ObjectStore& out) {
     OsmObject o;
     o.type = OsmType::Way;
     protozero::data_view keys, vals;
+    uint32_t user_sid = kNoSid;
     o.first_ref = static_cast<uint32_t>(out.refs.size());
-    while (msg.next()) {
+    for (protozero::pbf_reader msg(message); msg.next();) {
         switch (msg.tag()) {
             case WayTag::ID: o.id = msg.get_int64(); break;
+            case WayTag::INFO: user_sid = decode_info(msg.get_message(), table, scale, o); break;
             case WayTag::KEYS: keys = msg.get_view(); break;
             case WayTag::VALS: vals = msg.get_view(); break;
-            case WayTag::INFO: decode_info(msg.get_message(), table, scale, o); break;
             case WayTag::REFS: {
+                if (skip_lists) {
+                    msg.skip();
+                    break;
+                }
                 int64_t ref = 0;
                 for (int64_t delta : msg.get_packed_sint64()) out.refs.push_back(ref += delta);
                 break;
@@ -231,29 +262,39 @@ inline void decode_way(protozero::pbf_reader msg, const std::vector<std::string_
         }
     }
     o.ref_count = static_cast<uint32_t>(out.refs.size()) - o.first_ref;
+    if (skip_lists) {
+        add_object(o, user_sid, std::string_view(message.data(), message.size()), out);
+        return;
+    }
     add_tags(keys, vals, table, out, o);
-    out.objects.push_back(o);
+    add_object(o, user_sid, {}, out);
 }
 
-inline void decode_relation(protozero::pbf_reader msg, const std::vector<std::string_view>& table,
-                            const BlockScale& scale, ObjectStore& out) {
+// A relation; with skip_lists only its id and Info, keeping its message.
+inline void decode_relation(protozero::data_view message, const std::vector<std::string_view>& table,
+                            const BlockScale& scale, bool skip_lists, ObjectStore& out) {
     OsmObject o;
     o.type = OsmType::Relation;
     protozero::data_view keys, vals, roles, memids, types;
-    while (msg.next()) {
+    uint32_t user_sid = kNoSid;
+    for (protozero::pbf_reader msg(message); msg.next();) {
         switch (msg.tag()) {
             case RelationTag::ID: o.id = msg.get_int64(); break;
             case RelationTag::KEYS: keys = msg.get_view(); break;
             case RelationTag::VALS: vals = msg.get_view(); break;
-            case RelationTag::INFO: decode_info(msg.get_message(), table, scale, o); break;
+            case RelationTag::INFO: user_sid = decode_info(msg.get_message(), table, scale, o); break;
             case RelationTag::ROLES_SID: roles = msg.get_view(); break;
             case RelationTag::MEMIDS: memids = msg.get_view(); break;
             case RelationTag::TYPES: types = msg.get_view(); break;
             default: msg.skip();
         }
     }
-    // osmium's decode_relation: members while all three lists last.
     o.first_member = static_cast<uint32_t>(out.members.size());
+    if (skip_lists) {
+        add_object(o, user_sid, std::string_view(message.data(), message.size()), out);
+        return;
+    }
+    // osmium's decode_relation: members while all three lists last.
     int64_t ref = 0;
     for (Varints r(roles), m(memids), t(types); !r.empty() && !m.empty() && !t.empty();) {
         int32_t role = static_cast<int32_t>(r.next());
@@ -261,23 +302,34 @@ inline void decode_relation(protozero::pbf_reader msg, const std::vector<std::st
         if (type < 0 || type > 2) format_error("unknown relation member type");
         if (role < 0) format_error("negative role index");
         out.members.push_back({ref += m.next_sint(), string_at(table, uint64_t(role)), static_cast<OsmType>(type)});
+        out.source.role_sids.push_back(static_cast<uint32_t>(role));
     }
     o.member_count = static_cast<uint32_t>(out.members.size()) - o.first_member;
     add_tags(keys, vals, table, out, o);
-    out.objects.push_back(o);
+    add_object(o, user_sid, {}, out);
 }
 
 }  // namespace pbf_codec_detail
 
+// What decode_block keeps of a way or relation.
+enum class DecodeLists : uint8_t {
+    All,
+    // Only its id and metadata when its message can be copied as is into a
+    // block that keeps the string table (encode_block with this store as
+    // the seed): what merging it needs.
+    UnlessCopyable,
+};
+
 // Decodes the PrimitiveBlock `raw` into `out` (cleared first) as osmium's
 // PBF reader does: coordinates truncated to 1e-7 degrees, timestamps scaled
 // by date_granularity, a negative uid as 0, version or changeset -1 as 0.
-// Strings are views into raw. Returns the type the objects share, or -1 for
-// a block without objects; throws on a block mixing types.
-inline int decode_block(std::string_view raw, ObjectStore& out) {
+// Strings are views into raw; out.source keeps the string table and each
+// string's index. Returns the type the objects share, or -1 for a block
+// without objects; throws on a block mixing types.
+inline int decode_block(std::string_view raw, ObjectStore& out, DecodeLists lists = DecodeLists::All) {
     using namespace pbf_codec_detail;
     out.clear();
-    std::vector<std::string_view> table;
+    std::vector<std::string_view>& table = out.source.strings;
     BlockScale scale;
     protozero::pbf_reader block(raw.data(), raw.size());
     while (block.next()) {
@@ -301,6 +353,9 @@ inline int decode_block(std::string_view raw, ObjectStore& out) {
             default: block.skip();
         }
     }
+    // An Info timestamp counts in its block's date granularity; encode_block
+    // writes the default one.
+    const bool skip_lists = lists == DecodeLists::UnlessCopyable && scale.date_granularity == 1000;
     int type = -1;
     protozero::pbf_reader groups(raw.data(), raw.size());
     while (groups.next(PrimitiveBlockTag::PRIMITIVEGROUP)) {
@@ -316,8 +371,10 @@ inline int decode_block(std::string_view raw, ObjectStore& out) {
             switch (group.tag()) {
                 case PrimitiveGroupTag::NODES: decode_node(group.get_message(), table, scale, out); break;
                 case PrimitiveGroupTag::DENSE: decode_dense(group.get_message(), table, scale, out); break;
-                case PrimitiveGroupTag::WAYS: decode_way(group.get_message(), table, scale, out); break;
-                case PrimitiveGroupTag::RELATIONS: decode_relation(group.get_message(), table, scale, out); break;
+                case PrimitiveGroupTag::WAYS: decode_way(group.get_view(), table, scale, skip_lists, out); break;
+                case PrimitiveGroupTag::RELATIONS:
+                    decode_relation(group.get_view(), table, scale, skip_lists, out);
+                    break;
             }
         }
     }
@@ -328,11 +385,13 @@ namespace pbf_codec_detail {
 
 // A block's string table: index 0 stays the empty placeholder dense nodes
 // use as their tag terminator, so every string, "" too, gets an index >= 1
-// (osmium's StringTable does the same).
+// (osmium's StringTable does the same). Seeded with a decoded block's
+// table, it keeps that table's indices and adds strings after it.
 class StringTableBuilder {
 public:
-    explicit StringTableBuilder(size_t expected = 0) {
-        strings_.emplace_back();
+    StringTableBuilder(const std::vector<std::string_view>* seed, size_t expected) {
+        if (seed && !seed->empty()) strings_ = *seed;
+        else strings_.emplace_back();
         index_.reserve(expected);
     }
     uint32_t add(std::string_view s) {
@@ -347,27 +406,69 @@ private:
     std::vector<std::string_view> strings_;
 };
 
-inline void add_info(protozero::pbf_writer& parent, int tag, const OsmObject& o, StringTableBuilder& st) {
+// The string indices of the objects one block encodes: those of the seed
+// store's own objects as decoded, the rest's added to the table.
+class StringIndexer {
+public:
+    StringIndexer(const ObjectStore* seed, size_t objects)
+        : seed_(seed && !seed->source.strings.empty() ? seed : nullptr),
+          table_(seed_ ? &seed_->source.strings : nullptr, objects) {}
+
+    uint32_t user(const ObjectRef& r) {
+        if (from_seed(r)) {
+            uint32_t sid = seed_->source.user_sids[index(r)];
+            if (sid != kNoSid) return sid;
+        }
+        return table_.add(r.object->user);
+    }
+    uint32_t key(const ObjectRef& r, uint32_t t) {
+        return from_seed(r) ? seed_->source.tag_sids[2 * (size_t(r.object->first_tag) + t)]
+                            : table_.add(r.store->tags_of(*r.object)[t].key);
+    }
+    uint32_t value(const ObjectRef& r, uint32_t t) {
+        return from_seed(r) ? seed_->source.tag_sids[2 * (size_t(r.object->first_tag) + t) + 1]
+                            : table_.add(r.store->tags_of(*r.object)[t].value);
+    }
+    uint32_t role(const ObjectRef& r, uint32_t m) {
+        return from_seed(r) ? seed_->source.role_sids[size_t(r.object->first_member) + m]
+                            : table_.add(r.store->members_of(*r.object)[m].role);
+    }
+    // The way's or relation's message as decoded, empty if not kept: its
+    // string indices hold in this table.
+    std::string_view message(const ObjectRef& r) const {
+        return from_seed(r) ? seed_->source.messages[index(r)] : std::string_view();
+    }
+    const std::vector<std::string_view>& strings() const { return table_.strings(); }
+
+private:
+    bool from_seed(const ObjectRef& r) const { return seed_ && r.store == seed_; }
+    size_t index(const ObjectRef& r) const { return size_t(r.object - seed_->objects.data()); }
+
+    const ObjectStore* seed_;
+    StringTableBuilder table_;
+};
+
+inline void add_info(protozero::pbf_writer& parent, int tag, const ObjectRef& r, StringIndexer& ix) {
+    const OsmObject& o = *r.object;
     protozero::pbf_writer info(parent, tag);
     info.add_int32(InfoTag::VERSION, static_cast<int32_t>(o.version));
     info.add_int64(InfoTag::TIMESTAMP, o.timestamp);
     info.add_int64(InfoTag::CHANGESET, o.changeset);
     info.add_int32(InfoTag::UID, static_cast<int32_t>(o.uid));
-    info.add_uint32(InfoTag::USER_SID, st.add(o.user));
+    info.add_uint32(InfoTag::USER_SID, ix.user(r));
 }
 
 inline void add_keys_vals(protozero::pbf_writer& msg, int keys_tag, int vals_tag, const ObjectRef& r,
-                          StringTableBuilder& st) {
-    const OsmTag* tags = r.store->tags_of(*r.object);
+                          StringIndexer& ix) {
     {
         protozero::packed_field_uint32 keys(msg, keys_tag);
-        for (uint32_t i = 0; i < r.object->tag_count; i++) keys.add_element(st.add(tags[i].key));
+        for (uint32_t t = 0; t < r.object->tag_count; t++) keys.add_element(ix.key(r, t));
     }
     protozero::packed_field_uint32 vals(msg, vals_tag);
-    for (uint32_t i = 0; i < r.object->tag_count; i++) vals.add_element(st.add(tags[i].value));
+    for (uint32_t t = 0; t < r.object->tag_count; t++) vals.add_element(ix.value(r, t));
 }
 
-inline void encode_dense(const ObjectRef* objs, size_t n, StringTableBuilder& st, std::string& group) {
+inline void encode_dense(const ObjectRef* objs, size_t n, StringIndexer& ix, std::string& group) {
     std::vector<int64_t> ids, timestamps, changesets, lats, lons;
     std::vector<int32_t> versions, uids, user_sids, kvs;
     int64_t id = 0, ts = 0, cs = 0, lat = 0, lon = 0;
@@ -383,17 +484,16 @@ inline void encode_dense(const ObjectRef* objs, size_t n, StringTableBuilder& st
         cs = o.changeset;
         uids.push_back(static_cast<int32_t>(o.uid - static_cast<uint32_t>(uid)));
         uid = static_cast<int32_t>(o.uid);
-        int32_t sid = static_cast<int32_t>(st.add(o.user));
+        int32_t sid = static_cast<int32_t>(ix.user(objs[i]));
         user_sids.push_back(sid - user);
         user = sid;
         lats.push_back(int64_t(o.lat) - lat);
         lat = o.lat;
         lons.push_back(int64_t(o.lon) - lon);
         lon = o.lon;
-        const OsmTag* tags = objs[i].store->tags_of(o);
         for (uint32_t t = 0; t < o.tag_count; t++) {
-            kvs.push_back(static_cast<int32_t>(st.add(tags[t].key)));
-            kvs.push_back(static_cast<int32_t>(st.add(tags[t].value)));
+            kvs.push_back(static_cast<int32_t>(ix.key(objs[i], t)));
+            kvs.push_back(static_cast<int32_t>(ix.value(objs[i], t)));
         }
         kvs.push_back(0);
     }
@@ -413,14 +513,19 @@ inline void encode_dense(const ObjectRef* objs, size_t n, StringTableBuilder& st
     dense.add_packed_int32(DenseNodesTag::KEYS_VALS, kvs.begin(), kvs.end());
 }
 
-inline void encode_ways(const ObjectRef* objs, size_t n, StringTableBuilder& st, std::string& group) {
+inline void encode_ways(const ObjectRef* objs, size_t n, StringIndexer& ix, std::string& group) {
     protozero::pbf_writer pg(group);
     for (size_t i = 0; i < n; i++) {
+        std::string_view kept = ix.message(objs[i]);
+        if (!kept.empty()) {
+            pg.add_message(PrimitiveGroupTag::WAYS, kept.data(), kept.size());
+            continue;
+        }
         const OsmObject& o = *objs[i].object;
         protozero::pbf_writer way(pg, PrimitiveGroupTag::WAYS);
         way.add_int64(WayTag::ID, o.id);
-        add_keys_vals(way, WayTag::KEYS, WayTag::VALS, objs[i], st);
-        add_info(way, WayTag::INFO, o, st);
+        add_keys_vals(way, WayTag::KEYS, WayTag::VALS, objs[i], ix);
+        add_info(way, WayTag::INFO, objs[i], ix);
         protozero::packed_field_sint64 refs(way, WayTag::REFS);
         const int64_t* r = objs[i].store->refs_of(o);
         int64_t prev = 0;
@@ -431,18 +536,23 @@ inline void encode_ways(const ObjectRef* objs, size_t n, StringTableBuilder& st,
     }
 }
 
-inline void encode_relations(const ObjectRef* objs, size_t n, StringTableBuilder& st, std::string& group) {
+inline void encode_relations(const ObjectRef* objs, size_t n, StringIndexer& ix, std::string& group) {
     protozero::pbf_writer pg(group);
     for (size_t i = 0; i < n; i++) {
+        std::string_view kept = ix.message(objs[i]);
+        if (!kept.empty()) {
+            pg.add_message(PrimitiveGroupTag::RELATIONS, kept.data(), kept.size());
+            continue;
+        }
         const OsmObject& o = *objs[i].object;
         protozero::pbf_writer rel(pg, PrimitiveGroupTag::RELATIONS);
         rel.add_int64(RelationTag::ID, o.id);
-        add_keys_vals(rel, RelationTag::KEYS, RelationTag::VALS, objs[i], st);
-        add_info(rel, RelationTag::INFO, o, st);
+        add_keys_vals(rel, RelationTag::KEYS, RelationTag::VALS, objs[i], ix);
+        add_info(rel, RelationTag::INFO, objs[i], ix);
         const OsmMember* m = objs[i].store->members_of(o);
         {
             protozero::packed_field_int32 roles(rel, RelationTag::ROLES_SID);
-            for (uint32_t k = 0; k < o.member_count; k++) roles.add_element(static_cast<int32_t>(st.add(m[k].role)));
+            for (uint32_t k = 0; k < o.member_count; k++) roles.add_element(static_cast<int32_t>(ix.role(objs[i], k)));
         }
         {
             protozero::packed_field_sint64 memids(rel, RelationTag::MEMIDS);
@@ -461,21 +571,25 @@ inline void encode_relations(const ObjectRef* objs, size_t n, StringTableBuilder
 
 // Encodes objs[0, n), all of `type` and in order, as one PrimitiveBlock
 // laid out like osmium's PBF writer's (string table first, one group, dense
-// nodes, granularity 100, full metadata).
-inline void encode_block(OsmType type, const ObjectRef* objs, size_t n, std::string& raw) {
+// nodes, granularity 100, full metadata). With a seed, a store decode_block
+// filled, the block starts from the seed's string table, so the seed's own
+// objects keep their string indices and its kept way and relation messages
+// are copied as they are.
+inline void encode_block(OsmType type, const ObjectRef* objs, size_t n, std::string& raw,
+                         const ObjectStore* seed = nullptr) {
     using namespace pbf_codec_detail;
-    StringTableBuilder st(n);
+    StringIndexer ix(seed, n);
     std::string group;
     switch (type) {
-        case OsmType::Node: encode_dense(objs, n, st, group); break;
-        case OsmType::Way: encode_ways(objs, n, st, group); break;
-        case OsmType::Relation: encode_relations(objs, n, st, group); break;
+        case OsmType::Node: encode_dense(objs, n, ix, group); break;
+        case OsmType::Way: encode_ways(objs, n, ix, group); break;
+        case OsmType::Relation: encode_relations(objs, n, ix, group); break;
     }
     raw.clear();
     protozero::pbf_writer block(raw);
     {
         protozero::pbf_writer table(block, PrimitiveBlockTag::STRINGTABLE);
-        for (std::string_view s : st.strings()) table.add_bytes(StringTableTag::S, s.data(), s.size());
+        for (std::string_view s : ix.strings()) table.add_bytes(StringTableTag::S, s.data(), s.size());
     }
     block.add_message(PrimitiveBlockTag::PRIMITIVEGROUP, group);
 }

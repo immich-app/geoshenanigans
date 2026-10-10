@@ -41,18 +41,41 @@ struct OsmObject {
     bool visible = true;
 };
 
+// A string table index for a string that has none.
+constexpr uint32_t kNoSid = UINT32_MAX;
+
+// What a store decoded from a PBF block knows of it, so its objects can be
+// encoded again with their string indices, or copied (pbf_codec.h).
+struct BlockSource {
+    std::vector<std::string_view> strings;   // the block's string table
+    std::vector<uint32_t> user_sids;         // per object; kNoSid for none
+    std::vector<uint32_t> tag_sids;          // per tag: key, value
+    std::vector<uint32_t> role_sids;         // per member
+    std::vector<std::string_view> messages;  // per object: its Way or Relation message, if kept
+
+    void clear() {
+        strings.clear();
+        user_sids.clear();
+        tag_sids.clear();
+        role_sids.clear();
+        messages.clear();
+    }
+};
+
 // The objects of a block or chunk and the lists they index into.
 struct ObjectStore {
     std::vector<OsmObject> objects;
     std::vector<OsmTag> tags;
     std::vector<int64_t> refs;
     std::vector<OsmMember> members;
+    BlockSource source;  // empty unless decoded from a block
 
     void clear() {
         objects.clear();
         tags.clear();
         refs.clear();
         members.clear();
+        source.clear();
     }
     const OsmTag* tags_of(const OsmObject& o) const { return tags.data() + o.first_tag; }
     const int64_t* refs_of(const OsmObject& o) const { return refs.data() + o.first_ref; }

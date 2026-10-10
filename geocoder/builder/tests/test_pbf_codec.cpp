@@ -86,6 +86,85 @@ TEST(pbf_codec_round_trips_ways_and_relations) {
     CHECK(describe(round_trip(OsmType::Relation, relations)) == describe(relations));
 }
 
+TEST(pbf_codec_seeded_encode_keeps_content_mixing_kept_and_new_objects) {
+    // A block decoded for merging, re-encoded on its own string table with
+    // another store's objects in between: the same objects come back.
+    for (OsmType type : {OsmType::Node, OsmType::Way, OsmType::Relation}) {
+        std::vector<TestObject> in = type == OsmType::Node ? sample_nodes()
+                                     : type == OsmType::Way ? sample_ways()
+                                                            : sample_relations();
+        std::vector<TestObject> extra = in;
+        for (auto& o : extra) {
+            o.id += 1000000;
+            o.user = "new user";
+            o.tags.push_back({"new", "tag"});
+        }
+        ObjectStore in_store = make_store(in), extra_store = make_store(extra);
+        std::vector<ObjectRef> refs;
+        for (const auto& o : in_store.objects) refs.push_back({&o, &in_store});
+        std::string raw;
+        encode_block(type, refs.data(), refs.size(), raw);
+
+        ObjectStore merged;
+        REQUIRE(decode_block(raw, merged, DecodeLists::UnlessCopyable) == int(type));
+        CHECK_EQ(merged.source.messages[0].empty(), type == OsmType::Node);
+        std::vector<ObjectRef> mix;
+        std::vector<TestObject> expected;
+        for (size_t i = 0; i < in.size(); i++) {
+            mix.push_back({&merged.objects[i], &merged});
+            expected.push_back(in[i]);
+            mix.push_back({&extra_store.objects[i], &extra_store});
+            expected.push_back(extra[i]);
+        }
+        std::string again;
+        encode_block(type, mix.data(), mix.size(), again, &merged);
+        ObjectStore back;
+        REQUIRE(decode_block(again, back) == int(type));
+        std::vector<TestObject> got;
+        for (const auto& o : back.objects) got.push_back(test_object(o, back));
+        CHECK(describe(got) == describe(expected));
+    }
+}
+
+TEST(pbf_codec_reencodes_messages_of_a_block_with_another_date_granularity) {
+    // Info timestamps count in date_granularity milliseconds; a block
+    // without the default one has its ways decoded and written out anew.
+    std::string raw;
+    {
+        protozero::pbf_writer block(raw);
+        {
+            protozero::pbf_writer st(block, PrimitiveBlockTag::STRINGTABLE);
+            st.add_bytes(StringTableTag::S, "", 0);
+            st.add_bytes(StringTableTag::S, "u", 1);
+        }
+        std::string group;
+        {
+            protozero::pbf_writer pg(group);
+            protozero::pbf_writer way(pg, PrimitiveGroupTag::WAYS);
+            way.add_int64(WayTag::ID, 42);
+            {
+                protozero::pbf_writer info(way, WayTag::INFO);
+                info.add_int32(InfoTag::VERSION, 3);
+                info.add_int64(InfoTag::TIMESTAMP, 4000);
+                info.add_uint32(InfoTag::USER_SID, 1);
+            }
+            std::vector<int64_t> refs{5, 1};
+            way.add_packed_sint64(WayTag::REFS, refs.begin(), refs.end());
+        }
+        block.add_message(PrimitiveBlockTag::PRIMITIVEGROUP, group);
+        block.add_int32(PrimitiveBlockTag::DATE_GRANULARITY, 500);
+    }
+    ObjectStore merged;
+    REQUIRE(decode_block(raw, merged, DecodeLists::UnlessCopyable) == int(OsmType::Way));
+    CHECK(merged.source.messages[0].empty());
+    std::vector<ObjectRef> refs{{&merged.objects[0], &merged}};
+    std::string again;
+    encode_block(OsmType::Way, refs.data(), 1, again, &merged);
+    ObjectStore back;
+    REQUIRE(decode_block(again, back) == int(OsmType::Way));
+    CHECK_EQ(describe(test_object(back.objects[0], back)), std::string("w42 v3 t2000 c0 i0 uu V T N5,6, M"));
+}
+
 TEST(pbf_codec_rejects_a_block_mixing_object_types) {
     auto nodes = sample_nodes();
     auto ways = sample_ways();
