@@ -563,109 +563,110 @@ static void compute_way_parent_polygons(ParsedData& data, const BuildConfig& cfg
         // lookup, but that used the raw (non-per-country) accum which
         // produced wrong results from cross-country contamination.
 
-        std::atomic<size_t> way_idx{0};
+        auto centroid = [&](const WayHeader& w) {
+            float sum_lat = 0, sum_lng = 0;
+            uint16_t cnt = w.node_count;
+            for (uint16_t k = 0; k < cnt; k++) {
+                sum_lat += data.street_nodes[w.node_offset + k].lat;
+                sum_lng += data.street_nodes[w.node_offset + k].lng;
+            }
+            return NodeCoord{sum_lat / cnt, sum_lng / cnt};
+        };
+        // Ways are walked per centroid admin cell, so each cell's
+        // candidates are gathered and ranked once.
+        auto order = items_by_cell(data.ways.size(), num_threads, [&](size_t i) -> uint64_t {
+            const auto& w = data.ways[i];
+            if (w.node_count < 1) return 0;
+            NodeCoord c = centroid(w);
+            return S2CellId(S2LatLng::FromDegrees(c.lat, c.lng)).parent(kAdminCellLevel).id();
+        });
+
+        struct PostalVote { uint32_t pid; uint32_t votes; float area; };
+        struct Candidates {
+            std::vector<S2CellId> nbrs;
+            std::vector<uint32_t> admins, postals;
+            std::vector<std::pair<uint32_t, uint32_t>> scratch;
+            std::vector<PostalVote> postal_votes;
+        };
         std::atomic<uint64_t> way_linked{0};
-        std::vector<std::thread> workers;
-        for (unsigned int t = 0; t < num_threads; t++) {
-            workers.emplace_back([&]() {
-                std::vector<S2CellId> nbrs;
-                std::vector<uint32_t> admins, postals;
-                std::vector<std::pair<uint32_t, uint32_t>> scratch;
-                struct PostalVote { uint32_t pid; uint32_t votes; float area; };
-                std::vector<PostalVote> postal_votes;
-                while (true) {
-                    size_t i = way_idx.fetch_add(1);
-                    if (i >= data.ways.size()) break;
-                    const auto& w = data.ways[i];
-                    if (w.node_count < 1) continue;
-                    // Compute way centroid
-                    float sum_lat = 0, sum_lng = 0;
-                    uint16_t cnt = w.node_count;
-                    for (uint16_t k = 0; k < cnt; k++) {
-                        sum_lat += data.street_nodes[w.node_offset + k].lat;
-                        sum_lng += data.street_nodes[w.node_offset + k].lng;
+        walk_items_by_cell<Candidates>(order, num_threads,
+            [&](S2CellId cell, Candidates& c) {
+                // Admin levels <= 10 compete for the parent chain, postal
+                // boundaries (11) for the postcode. A level-0 polygon must
+                // beat the old per-way scan's starting best area.
+                c.admins.clear();
+                c.postals.clear();
+                for_each_admin_candidate(data, cell, c.nbrs, [&](uint32_t pid, const AdminPolygon& p) {
+                    if (p.admin_level <= 10) {
+                        if (p.admin_level > 0 || p.area < 1e18f) c.admins.push_back(pid);
+                    } else if (p.admin_level == 11) {
+                        c.postals.push_back(pid);
                     }
-                    float clat = sum_lat / cnt;
-                    float clng = sum_lng / cnt;
-                    S2CellId cell = S2CellId(S2LatLng::FromDegrees(clat, clng)).parent(kAdminCellLevel);
+                });
+                rank_candidates(c.admins, more_specific, c.scratch);
+                rank_candidates(c.postals, listed_first, c.scratch);
+            },
+            [&](uint32_t i, Candidates& c) {
+                const auto& w = data.ways[i];
+                uint16_t cnt = w.node_count;
+                NodeCoord center = centroid(w);
 
-                    // Admin levels <= 10 compete for the parent chain,
-                    // postal boundaries (11) for the postcode. A level-0
-                    // polygon must beat the old scan's starting best area.
-                    admins.clear();
-                    postals.clear();
-                    for_each_admin_candidate(data, cell, nbrs, [&](uint32_t pid, const AdminPolygon& p) {
-                        if (p.admin_level <= 10) {
-                            if (p.admin_level > 0 || p.area < 1e18f) admins.push_back(pid);
-                        } else if (p.admin_level == 11) {
-                            postals.push_back(pid);
-                        }
+                // Pick the most specific containing polygon: highest
+                // admin_level, then smallest area. Parent-chain pick uses
+                // centroid PIP — admin hierarchy is fine-grained enough
+                // that centroid containment gives a stable result.
+                uint32_t parent = rings.first_containing(c.admins, center.lat, center.lng);
+                if (parent != NO_DATA) {
+                    data.way_parent_ids[i] = parent;
+                    way_linked++;
+                }
+
+                // Nominatim's `getNearFeatures`
+                // (lib-sql/functions/partition-functions.sql:42)
+                // returns every postal polygon that intersects the
+                // street's LineString, ordered by
+                //   `min(ST_Distance(way_centroid, poly_geom))
+                //    + 0.00001 * ST_Distance(way, poly_centroid)`.
+                // The dominant term picks polygons containing the way's
+                // centroid; when multiple polygons overlap the way but
+                // only one contains its centroid, that one wins. For a
+                // long street crossing several postal polygons (Delhi's
+                // Kartavya Path traverses 110001 / 110004 / 110098),
+                // which polygon owns the centroid depends on the
+                // street's shape — centroid PIP alone can pick a polygon
+                // that covers only a small fraction of the way. We tally
+                // a per-polygon vertex-containment vote and pick the
+                // polygon that covers the most way vertices; ties break
+                // by smallest area. That matches the spirit of
+                // `ST_Distance(way, poly_centroid)` closer than pure
+                // centroid containment.
+                // Votes count sampled vertices (every step-th, to bound
+                // work on huge ways). Polygons holding at least one
+                // sample vote in first-listed order: std::sort breaks
+                // (votes, area) ties by input order.
+                auto& postal_votes = c.postal_votes;
+                postal_votes.clear();
+                uint8_t samples = cnt < 16 ? cnt : 16;
+                uint32_t step = cnt > samples ? cnt / samples : 1;
+                for (uint32_t pid : c.postals) {
+                    uint32_t votes = 0;
+                    for (uint32_t k = 0; k < cnt; k += step) {
+                        const auto& nd = data.street_nodes[w.node_offset + k];
+                        if (rings.contains(pid, nd.lat, nd.lng)) votes++;
+                    }
+                    if (votes > 0) postal_votes.push_back({pid, votes, data.admin_polygons[pid].area});
+                }
+                // Sort: highest votes first, tiebreak by smaller area
+                // (more specific).
+                std::sort(postal_votes.begin(), postal_votes.end(),
+                    [](const PostalVote& a, const PostalVote& b) {
+                        if (a.votes != b.votes) return a.votes > b.votes;
+                        return a.area < b.area;
                     });
-
-                    // Pick the most specific containing polygon:
-                    // highest admin_level, then smallest area. Parent-
-                    // chain pick uses centroid PIP — admin hierarchy is
-                    // fine-grained enough that centroid containment
-                    // gives a stable result.
-                    rank_candidates(admins, more_specific, scratch);
-                    for (uint32_t pid : admins) {
-                        if (!rings.contains(pid, clat, clng)) continue;
-                        data.way_parent_ids[i] = pid;
-                        way_linked.fetch_add(1);
-                        break;
-                    }
-
-                    // Nominatim's `getNearFeatures`
-                    // (lib-sql/functions/partition-functions.sql:42)
-                    // returns every postal polygon that intersects
-                    // the street's LineString, ordered by
-                    //   `min(ST_Distance(way_centroid, poly_geom))
-                    //    + 0.00001 * ST_Distance(way, poly_centroid)`.
-                    // The dominant term picks polygons containing
-                    // the way's centroid; when multiple polygons
-                    // overlap the way but only one contains its
-                    // centroid, that one wins. For a long street
-                    // crossing several postal polygons (Delhi's
-                    // Kartavya Path traverses 110001 / 110004 /
-                    // 110098), which polygon owns the centroid
-                    // depends on the street's shape — centroid PIP
-                    // alone can pick a polygon that covers only a
-                    // small fraction of the way. We tally a per-
-                    // polygon vertex-containment vote and pick the
-                    // polygon that covers the most way vertices;
-                    // ties break by smallest area. That matches the
-                    // spirit of `ST_Distance(way, poly_centroid)`
-                    // closer than pure centroid containment.
-                    // Votes count sampled vertices (every step-th, to
-                    // bound work on huge ways). Polygons holding at least
-                    // one sample vote in first-listed order: std::sort
-                    // breaks (votes, area) ties by input order.
-                    rank_candidates(postals, listed_first, scratch);
-                    postal_votes.clear();
-                    uint8_t samples = cnt < 16 ? cnt : 16;
-                    uint32_t step = cnt > samples ? cnt / samples : 1;
-                    for (uint32_t pid : postals) {
-                        uint32_t votes = 0;
-                        for (uint32_t k = 0; k < cnt; k += step) {
-                            const auto& nd = data.street_nodes[w.node_offset + k];
-                            if (rings.contains(pid, nd.lat, nd.lng)) votes++;
-                        }
-                        if (votes > 0) postal_votes.push_back({pid, votes, data.admin_polygons[pid].area});
-                    }
-                    // Sort: highest votes first, tiebreak by
-                    // smaller area (more specific).
-                    std::sort(postal_votes.begin(), postal_votes.end(),
-                        [](const PostalVote& a, const PostalVote& b) {
-                            if (a.votes != b.votes) return a.votes > b.votes;
-                            return a.area < b.area;
-                        });
-                    if (!postal_votes.empty()) {
-                        data.way_postcode_ids[i] = data.admin_polygons[postal_votes[0].pid].name_id;
-                    }
+                if (!postal_votes.empty()) {
+                    data.way_postcode_ids[i] = data.admin_polygons[postal_votes[0].pid].name_id;
                 }
             });
-        }
-        for (auto& w : workers) w.join();
         double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - _wp_t).count();
         std::cerr << "Way parent polygon: " << way_linked.load() << "/" << data.ways.size()
                   << " ways linked in " << el << "s" << std::endl;
