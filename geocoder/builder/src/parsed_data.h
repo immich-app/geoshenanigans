@@ -392,11 +392,31 @@ inline void reserve_for(std::vector<T>& v, size_t n) {
     if (v.size() + n > v.capacity()) v.reserve(2 * (v.size() + n));
 }
 
+// Faults in the pages v's next n elements will take, on every core, when
+// they span enough to matter: growing v zero-fills them on one core, which
+// otherwise takes a page fault per page. A store to each page of the spare
+// capacity faults it in (the grow then overwrites it), and unlike
+// MADV_POPULATE_WRITE, which takes the mmap lock, scales with the cores.
+// Capacity must already cover them.
+template <class T>
+inline void prefault_for(std::vector<T>& v, size_t n) {
+    constexpr size_t kMinBytes = size_t(64) << 20;
+    const size_t bytes = n * sizeof(T);
+    if (bytes < kMinBytes) return;
+
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    volatile unsigned char* spare = reinterpret_cast<unsigned char*>(v.data() + v.size());
+    parallel_for((bytes + page - 1) / page, [&](size_t b, size_t e, unsigned) {
+        for (size_t p = b; p < e; p++) spare[p * page] = 0;
+    });
+}
+
 // Grows v by n elements for a fill in place; returns the first new index.
 template <class T>
 inline size_t grow_by(std::vector<T>& v, size_t n) {
     size_t at = v.size();
     reserve_for(v, n);
+    prefault_for(v, n);
     v.resize(at + n);
     return at;
 }

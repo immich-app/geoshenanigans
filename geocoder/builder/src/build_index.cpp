@@ -2301,19 +2301,17 @@ static std::vector<size_t> local_offsets(const Locals& locals, SizeOf size_of) {
     return at;
 }
 
-// Appends each parse thread's buffer(local) to `out` in thread order, freeing
-// each once copied. A plain copy runs at memory speed on one core, about as
-// fast as growing `out` for a parallel one, and never holds both in full.
+// Appends each parse thread's buffer(local) to `out` in thread order, on
+// every core, then frees the buffers.
 template <class T, class Locals, class Buffer>
 static void append_locals(std::vector<T>& out, Locals& locals, Buffer buffer) {
-    size_t n = 0;
-    for (auto& local : locals) n += buffer(local).size();
-    reserve_for(out, n);
-    for (auto& local : locals) {
-        auto& b = buffer(local);
-        out.insert(out.end(), b.begin(), b.end());
-        free_storage(b);
-    }
+    const auto at = local_offsets(locals, [&](const auto& local) { return buffer(local).size(); });
+    const size_t base = grow_by(out, at.back());
+    parallel_for_parts(at, kMergeGrain, [&](size_t k, size_t begin, size_t end, size_t to) {
+        const auto& b = buffer(locals[k]);
+        std::copy(b.begin() + begin, b.begin() + end, out.begin() + base + to);
+    });
+    parallel_for_each(locals.size(), [&](size_t k, unsigned) { free_storage(buffer(locals[k])); });
 }
 
 static int run(int argc, char* argv[]) {
