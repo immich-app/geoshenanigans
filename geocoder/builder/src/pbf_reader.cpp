@@ -159,6 +159,18 @@ std::vector<BlobInfo> scan_pbf_blobs(const std::string& filename, unsigned threa
 
 // --- Blob decompression ---
 
+// A thread's inflate state, reset for each blob and ended with the thread.
+struct Inflater {
+    z_stream strm{};
+
+    Inflater() {
+        if (inflateInit(&strm) != Z_OK) throw std::runtime_error("inflateInit failed");
+    }
+    ~Inflater() { inflateEnd(&strm); }
+    Inflater(const Inflater&) = delete;
+    Inflater& operator=(const Inflater&) = delete;
+};
+
 // Reusable-buffer version: avoids allocation after warmup
 static void read_and_decompress_blob_into(int fd, const BlobInfo& info,
                                             std::string& blob_buf, std::string& out) {
@@ -186,14 +198,9 @@ static void read_and_decompress_blob_into(int fd, const BlobInfo& info,
     }
     if (zlib_view.size() > 0) {
         out.resize(raw_size);
-        thread_local z_stream strm{};
-        thread_local bool strm_init = false;
-        if (!strm_init) {
-            if (inflateInit(&strm) != Z_OK) throw std::runtime_error("inflateInit failed");
-            strm_init = true;
-        } else {
-            if (inflateReset(&strm) != Z_OK) throw std::runtime_error("inflateReset failed");
-        }
+        thread_local Inflater inflater;
+        z_stream& strm = inflater.strm;
+        if (inflateReset(&strm) != Z_OK) throw std::runtime_error("inflateReset failed");
         strm.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(zlib_view.data()));
         strm.avail_in = zlib_view.size();
         strm.next_out = reinterpret_cast<Bytef*>(out.data());
@@ -839,6 +846,78 @@ struct IoSemaphore {
     }
 };
 
+// How many of `threads` stream_blobs workers may read the file at once:
+// BUILD_MAX_IO (0 = all of them), else half of them, at least 8. On fast
+// storage every thread gets through quickly; on slow storage the rest decode
+// while they wait.
+static unsigned max_concurrent_reads(unsigned threads) {
+    if (const char* env = getenv("BUILD_MAX_IO")) {
+        unsigned max_io = static_cast<unsigned>(std::atoi(env));
+        return max_io == 0 ? threads : max_io;
+    }
+    return std::min(threads, std::max(8u, threads / 2));
+}
+
+// Reads and decompresses the blobs `indices` names on `threads` threads,
+// each taking the next blob as it frees up, and runs decode(j, data, size) on
+// blob indices[j] in the thread that read it. Logs the time spent per stage
+// under `label`.
+template <class Decode>
+static void stream_blobs(const std::string& filename, const std::vector<BlobInfo>& blobs,
+                         const std::vector<size_t>& indices, unsigned threads, const char* label,
+                         Decode decode) {
+    if (indices.empty()) return;
+    const unsigned max_io = max_concurrent_reads(threads);
+    IoSemaphore io_sem(max_io);
+
+    std::atomic<size_t> next_idx{0};
+    std::atomic<size_t> blocks_done{0};
+    std::atomic<bool> open_failed{false};
+    std::vector<std::thread> workers;
+
+    struct ThreadStats { double read_us = 0, decode_us = 0; size_t count = 0; };
+    std::vector<ThreadStats> stats(threads);
+
+    for (unsigned t = 0; t < threads; t++) {
+        workers.emplace_back([&, t]() {
+            int local_fd = open(filename.c_str(), O_RDONLY);
+            if (local_fd < 0) { open_failed.store(true); return; }
+            std::string decomp, blob_buf;
+            auto& st = stats[t];
+            while (true) {
+                size_t j = next_idx.fetch_add(1);
+                if (j >= indices.size()) break;
+
+                io_sem.acquire();
+                auto t0 = std::chrono::steady_clock::now();
+                read_and_decompress_blob_into(local_fd, blobs[indices[j]], blob_buf, decomp);
+                auto t1 = std::chrono::steady_clock::now();
+                io_sem.release();
+
+                decode(j, decomp.data(), decomp.size());
+                auto t2 = std::chrono::steady_clock::now();
+                st.read_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
+                st.decode_us += std::chrono::duration<double, std::micro>(t2 - t1).count();
+                st.count++;
+                size_t done = blocks_done.fetch_add(1) + 1;
+                if (done % 5000 == 0)
+                    std::cerr << "  Processed " << done << "/" << indices.size() << " blocks..." << std::endl;
+            }
+            close(local_fd);
+        });
+    }
+    for (auto& w : workers) w.join();
+    if (open_failed.load()) throw std::runtime_error("cannot open " + filename + " in worker thread");
+
+    double total_read = 0, total_decode = 0; size_t total_blocks = 0;
+    for (auto& s : stats) { total_read += s.read_us; total_decode += s.decode_us; total_blocks += s.count; }
+    std::cerr << "  " << label << " (" << total_blocks << " blocks, " << threads << " threads, "
+              << max_io << " max_io): "
+              << "read=" << (total_read/1e6) << "s decode+callback=" << (total_decode/1e6) << "s"
+              << " (per-thread avg: read=" << (total_read/1e6/threads)
+              << "s decode+cb=" << (total_decode/1e6/threads) << "s)" << std::endl;
+}
+
 void PbfFile::read_nodes_streaming(const NodeCallback& callback) {
     // Skipping the way blobs saves decompressing them here. The
     // classification trusts the file to be sorted by type, so a node blob
@@ -846,71 +925,14 @@ void PbfFile::read_nodes_streaming(const NodeCallback& callback) {
     classify_blobs();
     std::vector<size_t> data_indices = node_blobs_;
     data_indices.insert(data_indices.end(), relation_blobs_.begin(), relation_blobs_.end());
-    if (data_indices.empty()) return;
-
-    // Limit concurrent I/O to avoid saturating slow storage.
-    // On fast storage, all threads get through the semaphore quickly.
-    // On slow storage, excess threads do decode+callback while waiting.
-    unsigned max_io;
-    const char* max_io_env = getenv("BUILD_MAX_IO");
-    if (max_io_env) {
-        max_io = static_cast<unsigned>(std::atoi(max_io_env));
-        if (max_io == 0) max_io = num_threads_;
-    } else {
-        max_io = std::min(num_threads_, std::max(8u, num_threads_ / 2));
-    }
-    IoSemaphore io_sem(max_io);
-
-    std::atomic<size_t> next_idx{0};
-    std::atomic<size_t> blocks_done{0};
-    std::atomic<bool> open_failed{false};
     std::atomic<size_t> misplaced{0};
-    std::vector<std::thread> threads;
-
-    struct ThreadStats { double read_us = 0, decode_us = 0; size_t count = 0; };
-    std::vector<ThreadStats> stats(num_threads_);
-
-    for (unsigned t = 0; t < num_threads_; t++) {
-        threads.emplace_back([&, t]() {
-            int local_fd = open(filename_.c_str(), O_RDONLY);
-            if (local_fd < 0) { open_failed.store(true); return; }
-            std::string decomp, blob_buf;
-            auto& st = stats[t];
-            while (true) {
-                size_t j = next_idx.fetch_add(1);
-                if (j >= data_indices.size()) break;
-
-                io_sem.acquire();
-                auto t0 = std::chrono::steady_clock::now();
-                read_and_decompress_blob_into(local_fd, blobs_[data_indices[j]], blob_buf, decomp);
-                auto t1 = std::chrono::steady_clock::now();
-                io_sem.release();
-
-                size_t foreign = decode_nodes_streaming(decomp.data(), decomp.size(), callback);
-                if (foreign && j < node_blobs_.size()) misplaced.fetch_add(foreign);
-                auto t2 = std::chrono::steady_clock::now();
-                st.read_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
-                st.decode_us += std::chrono::duration<double, std::micro>(t2 - t1).count();
-                st.count++;
-                size_t done = blocks_done.fetch_add(1) + 1;
-                if (done % 5000 == 0)
-                    std::cerr << "  Processed " << done << "/" << data_indices.size() << " blocks..." << std::endl;
-            }
-            close(local_fd);
-        });
-    }
-    for (auto& t : threads) t.join();
-    if (open_failed.load()) throw std::runtime_error("cannot open " + filename_ + " in worker thread");
+    stream_blobs(filename_, blobs_, data_indices, num_threads_, "Node streaming",
+                 [&](size_t j, const char* data, size_t size) {
+        size_t foreign = decode_nodes_streaming(data, size, callback);
+        if (foreign && j < node_blobs_.size()) misplaced.fetch_add(foreign);
+    });
     if (misplaced.load())
         throw std::runtime_error(filename_ + ": way groups in node blobs, PBF not sorted by type");
-
-    double total_read = 0, total_decode = 0; size_t total_blocks = 0;
-    for (auto& s : stats) { total_read += s.read_us; total_decode += s.decode_us; total_blocks += s.count; }
-    std::cerr << "  Node streaming (" << total_blocks << " blocks, " << num_threads_ << " threads, "
-              << max_io << " max_io): "
-              << "read=" << (total_read/1e6) << "s decode+callback=" << (total_decode/1e6) << "s"
-              << " (per-thread avg: read=" << (total_read/1e6/num_threads_)
-              << "s decode+cb=" << (total_decode/1e6/num_threads_) << "s)" << std::endl;
 }
 
 void PbfFile::read_ways_streaming(const WayCallback& callback) {
@@ -918,68 +940,14 @@ void PbfFile::read_ways_streaming(const WayCallback& callback) {
     classify_blobs();
     std::vector<size_t> data_indices = way_blobs_;
     data_indices.insert(data_indices.end(), relation_blobs_.begin(), relation_blobs_.end());
-    if (data_indices.empty()) return;
-
-    unsigned max_io;
-    const char* max_io_env = getenv("BUILD_MAX_IO");
-    if (max_io_env) {
-        max_io = static_cast<unsigned>(std::atoi(max_io_env));
-        if (max_io == 0) max_io = num_threads_;
-    } else {
-        max_io = std::min(num_threads_, std::max(8u, num_threads_ / 2));
-    }
-    IoSemaphore io_sem(max_io);
-
-    std::atomic<size_t> next_idx{0};
-    std::atomic<size_t> blocks_done{0};
-    std::atomic<bool> open_failed{false};
     std::atomic<size_t> misplaced{0};
-    std::vector<std::thread> threads;
-
-    struct ThreadStats { double read_us = 0, decode_us = 0; size_t count = 0; };
-    std::vector<ThreadStats> stats(num_threads_);
-
-    for (unsigned t = 0; t < num_threads_; t++) {
-        threads.emplace_back([&, t]() {
-            int local_fd = open(filename_.c_str(), O_RDONLY);
-            if (local_fd < 0) { open_failed.store(true); return; }
-            std::string decomp, blob_buf;
-            auto& st = stats[t];
-            while (true) {
-                size_t j = next_idx.fetch_add(1);
-                if (j >= data_indices.size()) break;
-
-                io_sem.acquire();
-                auto t0 = std::chrono::steady_clock::now();
-                read_and_decompress_blob_into(local_fd, blobs_[data_indices[j]], blob_buf, decomp);
-                auto t1 = std::chrono::steady_clock::now();
-                io_sem.release();
-
-                size_t foreign = decode_ways_streaming(decomp.data(), decomp.size(), callback);
-                if (foreign && j < way_blobs_.size()) misplaced.fetch_add(foreign);
-                auto t2 = std::chrono::steady_clock::now();
-                st.read_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
-                st.decode_us += std::chrono::duration<double, std::micro>(t2 - t1).count();
-                st.count++;
-                size_t done = blocks_done.fetch_add(1) + 1;
-                if (done % 5000 == 0)
-                    std::cerr << "  Processed " << done << "/" << data_indices.size() << " blocks..." << std::endl;
-            }
-            close(local_fd);
-        });
-    }
-    for (auto& t : threads) t.join();
-    if (open_failed.load()) throw std::runtime_error("cannot open " + filename_ + " in worker thread");
+    stream_blobs(filename_, blobs_, data_indices, num_threads_, "Way streaming",
+                 [&](size_t j, const char* data, size_t size) {
+        size_t foreign = decode_ways_streaming(data, size, callback);
+        if (foreign && j < way_blobs_.size()) misplaced.fetch_add(foreign);
+    });
     if (misplaced.load())
         throw std::runtime_error(filename_ + ": node groups in way blobs, PBF not sorted by type");
-
-    double total_read = 0, total_decode = 0; size_t total_blocks = 0;
-    for (auto& s : stats) { total_read += s.read_us; total_decode += s.decode_us; total_blocks += s.count; }
-    std::cerr << "  Way streaming (" << total_blocks << " blocks, " << num_threads_ << " threads, "
-              << max_io << " max_io): "
-              << "read=" << (total_read/1e6) << "s decode+callback=" << (total_decode/1e6) << "s"
-              << " (per-thread avg: read=" << (total_read/1e6/num_threads_)
-              << "s decode+cb=" << (total_decode/1e6/num_threads_) << "s)" << std::endl;
 }
 
 PbfFile::~PbfFile() = default;
