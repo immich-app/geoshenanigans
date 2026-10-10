@@ -833,6 +833,40 @@ static int run(int argc, char* argv[]) {
         }
         size_t addr_stride = new_stride;
         remap_addr_points(old_m.data, old_m.size, str_remap);
+        // Identify polygon-bearing addr_points across builds by polygon
+        // VERTEX BYTE CONTENT (purely content-hash; key_fn returns 0 so
+        // the match is independent of any other addr_point field). This
+        // rewrites old_m's byte-20 vertex_offset to point at the matching
+        // polygon's byte position in NEW addr_vertices, so build_merge_seq
+        // below classifies stable-polygon addr_points as MATCH instead of
+        // DELETE+INSERT — without depending on slot stability.
+        //
+        // For point-only addr_points (vertex_offset==NO_DATA, block_size
+        // 0), the fixup is a no-op (NO_DATA→NO_DATA). Their identity is
+        // recovered downstream by str_remap + the secondary-match path.
+        //
+        // The keys read no parent_way_id, so they are built while t_street
+        // still runs; the skip check and the pairing wait for the remap.
+        MappedFile old_av{}, new_av{};
+        std::vector<uint32_t> old_vert_offsets;
+        FixupKeys addr_keys;
+        const char* old_av_data = "";
+        const char* new_av_data = "";
+        if (addr_stride >= 28) {
+            old_av = mmap_file(old_dir + "/addr_vertices.bin");
+            new_av = mmap_file(new_dir + "/addr_vertices.bin");
+            if (old_av.data) old_av_data = old_av.data;
+            if (new_av.data) new_av_data = new_av.data;
+            size_t n_old = old_m.size / addr_stride;
+            old_vert_offsets.resize(n_old);
+            for (size_t i = 0; i < n_old; i++)
+                memcpy(&old_vert_offsets[i],
+                       old_m.data + i * addr_stride + 20, 4);
+            addr_keys = v15_fixup_keys(old_m.data, old_m.size, old_av_data, old_av.size,
+                                       new_m.data, new_m.size, new_av_data, new_av.size,
+                                       addr_stride, /*off_field_pos*/ 20,
+                                       /*key_fn*/ [](const char*) -> uint64_t { return 0; });
+        }
         // parent_way_id (byte 16-19) is a foreign id into street_ways.bin.
         // It shifts day-over-day whenever the way ordering changes (which
         // is on every build). Without rewriting it to the new id-space,
@@ -845,34 +879,11 @@ static int run(int argc, char* argv[]) {
             street_remap_future.wait();
             remap_id_field(old_m.data, old_m.size, addr_stride, 16, res_ways.id_remap);
         }
-        // Identify polygon-bearing addr_points across builds by polygon
-        // VERTEX BYTE CONTENT (purely content-hash; key_fn returns 0 so
-        // the match is independent of any other addr_point field). This
-        // rewrites old_m's byte-20 vertex_offset to point at the matching
-        // polygon's byte position in NEW addr_vertices, so build_merge_seq
-        // below classifies stable-polygon addr_points as MATCH instead of
-        // DELETE+INSERT — without depending on slot stability.
-        //
-        // For point-only addr_points (vertex_offset==NO_DATA, block_size
-        // 0), the fixup is a no-op (NO_DATA→NO_DATA). Their identity is
-        // recovered downstream by str_remap + the secondary-match path.
-        MappedFile old_av{}, new_av{};
-        std::vector<uint32_t> old_vert_offsets;
-        if (addr_stride >= 28) {
-            old_av = mmap_file(old_dir + "/addr_vertices.bin");
-            new_av = mmap_file(new_dir + "/addr_vertices.bin");
-            size_t n_old = old_m.size / addr_stride;
-            old_vert_offsets.resize(n_old);
-            for (size_t i = 0; i < n_old; i++)
-                memcpy(&old_vert_offsets[i],
-                       old_m.data + i * addr_stride + 20, 4);
-            fixup_v15_offsets(old_m.data, old_m.size,
-                              old_av.data ? old_av.data : "", old_av.size,
-                              new_m.data, new_m.size,
-                              new_av.data ? new_av.data : "", new_av.size,
-                              addr_stride, /*off_field_pos*/ 20,
-                              /*key_fn*/ [](const char*) -> uint64_t { return 0; });
-        }
+        if (addr_stride >= 28 &&
+            !v15_fixup_skipped(old_m.data, old_m.size, old_av_data, old_av.size, new_m.data, new_m.size,
+                               new_av_data, new_av.size))
+            copy_paired_offsets(addr_keys, old_m.data, new_m.data, addr_stride, /*off_field_pos*/ 20);
+        addr_keys = {};
 
         auto seq = build_merge_seq(old_m.data, old_m.size, new_m.data, new_m.size, addr_stride);
         auto soft = secondary_match_from_merge(seq, old_m.data, old_m.size, new_m.data, new_m.size, addr_stride,
@@ -913,8 +924,8 @@ static int run(int argc, char* argv[]) {
             auto av_seq = build_vertex_byte_merge(res_addr.seq,
                 old_m.data, old_m.size,
                 new_m.data, new_m.size,
-                old_av.data ? old_av.data : "", old_av.size,
-                new_av.data ? new_av.data : "", new_av.size,
+                old_av_data, old_av.size,
+                new_av_data, new_av.size,
                 addr_stride, /*off_field_pos*/ 20);
             res_addr_v = {PatchFileId::ADDR_VERTICES, "addr_vertices.bin", 1,
                           old_av.size, new_av.size, std::move(av_seq), {}};
