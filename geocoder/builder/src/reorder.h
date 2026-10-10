@@ -195,8 +195,25 @@ inline void reorder_addr_points(ParsedData& data, unsigned threads = 0) {
         return p.vertex_count > 0 &&
                (p.vertex_offset == NO_DATA || (size_t)p.vertex_offset + p.vertex_count > vertices.size());
     }, threads);
+    // The sort orders keys holding the fields that decide nearly every
+    // comparison, rather than indices into the planet's addr_points.
+    struct AddrKey {
+        uint32_t street_id, housenumber_id, lat_bits, lng_bits, index;
+    };
+    auto key_of = [&](size_t i) {
+        const auto& p = points[i];
+        return AddrKey{p.street_id, p.housenumber_id, float_bits(p.lat), float_bits(p.lng), static_cast<uint32_t>(i)};
+    };
+    auto key_less = [&](const AddrKey& a, const AddrKey& b) {
+        if (a.street_id != b.street_id) return a.street_id < b.street_id;
+        if (a.housenumber_id != b.housenumber_id) return a.housenumber_id < b.housenumber_id;
+        if (a.lat_bits != b.lat_bits) return a.lat_bits < b.lat_bits;
+        if (a.lng_bits != b.lng_bits) return a.lng_bits < b.lng_bits;
+        return addr_less(a.index, b.index);
+    };
+    auto any_tie = [](uint32_t, uint32_t) { return true; };
     std::vector<uint32_t> order = total_order
-        ? take_order("addr_points", parallel_sort_indices(n, addr_less, [](uint32_t, uint32_t) { return true; }, threads))
+        ? take_order("addr_points", parallel_sort_keys(n, key_of, key_less, any_tie, threads))
         : std_sort_indices(n, addr_less);
 
     // Dedup consecutive identical records (planet has ~4M duplicates).
@@ -618,7 +635,26 @@ inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
         if (have_elevations && std::memcmp(&poi_elevations[a], &poi_elevations[b], sizeof(float)) != 0) return true;
         return have_qids && poi_qids[a] != poi_qids[b];
     };
-    std::vector<uint32_t> order = take_order("POI records", parallel_sort_indices(n, poi_less, tie_matters, threads));
+    // The sort orders keys holding the fields that decide nearly every
+    // comparison, rather than indices into the planet's poi_records.
+    struct PoiKey {
+        uint8_t category, tier;
+        uint32_t name_id, lat_bits, lng_bits, index;
+    };
+    auto key_of = [&](size_t i) {
+        const auto& p = pois[i];
+        return PoiKey{p.category, p.tier, p.name_id, float_bits(p.lat), float_bits(p.lng), static_cast<uint32_t>(i)};
+    };
+    auto key_less = [&](const PoiKey& a, const PoiKey& b) {
+        if (a.category != b.category) return a.category < b.category;
+        if (a.tier != b.tier) return a.tier < b.tier;
+        if (a.name_id != b.name_id) return a.name_id < b.name_id;
+        if (a.lat_bits != b.lat_bits) return a.lat_bits < b.lat_bits;
+        if (a.lng_bits != b.lng_bits) return a.lng_bits < b.lng_bits;
+        return poi_less(a.index, b.index);
+    };
+    std::vector<uint32_t> order =
+        take_order("POI records", parallel_sort_keys(n, key_of, key_less, tie_matters, threads));
 
     // Dedup consecutive POIs equal in everything but their vertices.
     std::vector<uint32_t> starts = run_starts(n, [&](size_t i, size_t j) {
