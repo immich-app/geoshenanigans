@@ -3940,7 +3940,6 @@ static int run(int argc, char* argv[]) {
                     std::vector<NodeCoord> interp_nodes;
                     std::vector<DeferredInterp> deferred_interps;
                     std::vector<AddrPoint> building_addrs;
-                    std::vector<std::pair<double, double>> building_addr_coords; // lat,lng for S2 cell
                     // Flat polygon storage, parallel to building_addrs via
                     // (offset, count) into building_addr_poly_verts. Stored as
                     // NodeCoord (2× float = 8 bytes/vertex) instead of
@@ -4072,7 +4071,6 @@ static int run(int argc, char* argv[]) {
                         }
                         if (valid > 0) {
                             double clat = sum_lat/valid, clng = sum_lng/valid;
-                            local.building_addr_coords.push_back({clat, clng});
                             local.building_addrs.push_back({static_cast<float>(clat), static_cast<float>(clng), 0, 0, 0, NO_DATA, 0});
                             local.building_addr_osm_way_ids.push_back(way_id);
                             local.addr_strings.push_back({housenumber, street ? street : ""});
