@@ -345,6 +345,25 @@ TEST(parallel_offsets_are_exclusive_prefix_sums_for_any_thread_count) {
     }
 }
 
+TEST(parallel_collect_joins_each_index_output_in_index_order) {
+    for (size_t n : {size_t(0), size_t(5), size_t(300000)}) {
+        auto emit = [](size_t i, std::vector<uint64_t>& out) {
+            for (size_t k = 0; k < i % 3; k++) out.push_back(i * 4 + k);
+        };
+        std::vector<uint64_t> expect;
+        for (size_t i = 0; i < n; i++) emit(i, expect);
+        for (unsigned threads : {1u, 4u, 64u}) {
+            std::atomic<size_t> calls{0};
+            auto got = parallel_collect<uint64_t>(n, [&](size_t i, std::vector<uint64_t>& out) {
+                calls++;
+                emit(i, out);
+            }, threads);
+            CHECK(got == expect);
+            CHECK_EQ(calls.load(), n);
+        }
+    }
+}
+
 TEST(parallel_filter_keeps_matching_indices_in_order) {
     for (size_t n : {size_t(0), size_t(5), size_t(300000)}) {
         std::vector<uint32_t> expect;

@@ -404,21 +404,6 @@ std::vector<Record> parallel_chain_walk(size_t size, size_t stripes, FindStart&&
     return out;
 }
 
-// The indices i in [0, n) where pred(i) holds, ascending, tested on every
-// core.
-template <class Pred>
-std::vector<size_t> parallel_find_all(size_t n, Pred pred, unsigned threads = 0) {
-    if (threads == 0) threads = parallel_threads();
-    std::vector<std::vector<size_t>> found(std::max<size_t>(1, std::min<size_t>(threads, n)));
-    parallel_for(n, [&](size_t b, size_t e, unsigned w) {
-        for (size_t i = b; i < e; i++)
-            if (pred(i)) found[w].push_back(i);
-    }, threads);
-    std::vector<size_t> out;
-    for (const auto& f : found) out.insert(out.end(), f.begin(), f.end());
-    return out;
-}
-
 // Sorts [first, last) by cmp on every core (sample sort: sort chunks, cut
 // them at shared splitters, merge each slice). The sorted sequence is the
 // one std::sort gives whenever it is unique: cmp a strict total order, or
@@ -551,25 +536,43 @@ std::vector<T> parallel_offsets(size_t n, SizeOf size_of, unsigned threads = 0) 
     return out;
 }
 
-// The indices i in [0, n) where keep(i), ascending. keep runs once per index.
-template <class Keep>
-std::vector<uint32_t> parallel_filter(size_t n, Keep keep, unsigned threads = 0) {
+// What emit(i, out) appends to `out` for each i in [0, n), in index order,
+// gathered on every core: each block of indices fills its own vector and the
+// blocks join in order. emit runs once per index.
+template <class T, class Emit>
+std::vector<T> parallel_collect(size_t n, Emit emit, unsigned threads = 0) {
     if (threads == 0) threads = parallel_threads();
-    std::vector<std::vector<uint32_t>> kept(threads);
+    std::vector<std::vector<T>> parts(threads);
     size_t blocks = parallel_blocks(n, [&](size_t b, size_t begin, size_t end) {
-        for (size_t i = begin; i < end; i++)
-            if (keep(i)) kept[b].push_back(static_cast<uint32_t>(i));
+        for (size_t i = begin; i < end; i++) emit(i, parts[b]);
     }, threads);
     std::vector<size_t> at(blocks + 1, 0);
-    for (size_t b = 0; b < blocks; b++) at[b + 1] = at[b] + kept[b].size();
-    std::vector<uint32_t> out(at[blocks]);
+    for (size_t b = 0; b < blocks; b++) at[b + 1] = at[b] + parts[b].size();
+    std::vector<T> out(at[blocks]);
     parallel_for(blocks, [&](size_t b0, size_t b1, unsigned) {
         for (size_t b = b0; b < b1; b++) {
-            std::copy(kept[b].begin(), kept[b].end(), out.begin() + at[b]);
-            kept[b] = {};
+            std::move(parts[b].begin(), parts[b].end(), out.begin() + at[b]);
+            parts[b] = {};
         }
     }, threads);
     return out;
+}
+
+// The indices i in [0, n) where keep(i), ascending. keep runs once per index.
+template <class Keep>
+std::vector<uint32_t> parallel_filter(size_t n, Keep keep, unsigned threads = 0) {
+    return parallel_collect<uint32_t>(n, [&](size_t i, std::vector<uint32_t>& out) {
+        if (keep(i)) out.push_back(static_cast<uint32_t>(i));
+    }, threads);
+}
+
+// The indices i in [0, n) where pred(i) holds, ascending, tested on every
+// core.
+template <class Pred>
+std::vector<size_t> parallel_find_all(size_t n, Pred pred, unsigned threads = 0) {
+    return parallel_collect<size_t>(n, [&](size_t i, std::vector<size_t>& out) {
+        if (pred(i)) out.push_back(i);
+    }, threads);
 }
 
 // Whether pred(i) holds for any i in [0, n).
