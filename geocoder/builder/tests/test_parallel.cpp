@@ -418,6 +418,30 @@ TEST(costliest_first_orders_by_descending_cost_then_index) {
     }
 }
 
+TEST(parallel_merge_merges_runs_lower_run_first_on_ties) {
+    std::mt19937 rng(3);
+    for (unsigned threads : {1u, 3u, 16u}) {
+        // Runs of uneven length, some empty; keys tie across and within runs.
+        std::vector<std::vector<std::pair<uint32_t, uint32_t>>> runs(9);
+        for (size_t r = 0; r < runs.size(); r++) {
+            size_t len = r % 4 == 1 ? 0 : 1000 + rng() % 70000;
+            for (size_t i = 0; i < len; i++) runs[r].push_back({static_cast<uint32_t>(rng() % 5000), static_cast<uint32_t>(r * 1000000 + i)});
+        }
+        auto by_key = [](const auto& a, const auto& b) { return a.first < b.first; };
+        std::vector<std::pair<uint32_t, uint32_t>> expect;
+        for (auto& run : runs) {
+            std::stable_sort(run.begin(), run.end(), by_key);
+            expect.insert(expect.end(), run.begin(), run.end());
+        }
+        std::stable_sort(expect.begin(), expect.end(), by_key);
+        std::vector<std::pair<std::pair<uint32_t, uint32_t>*, size_t>> spans;
+        for (auto& run : runs) spans.push_back({run.data(), run.size()});
+        std::vector<std::pair<uint32_t, uint32_t>> got(expect.size());
+        parallel_merge(spans, got.data(), by_key, threads);
+        CHECK(got == expect);
+    }
+}
+
 TEST(parallel_any_finds_a_single_match) {
     for (unsigned threads : {1u, 3u, 64u}) {
         CHECK(parallel_any(100000, [](size_t i) { return i == 99999; }, threads));

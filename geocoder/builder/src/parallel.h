@@ -406,17 +406,88 @@ std::vector<Record> parallel_chain_walk(size_t size, size_t stripes, FindStart&&
     return out;
 }
 
-// Sorts [first, last) by cmp on every core (sample sort: sort chunks, cut
-// them at shared splitters, merge each slice). The sorted sequence is the
-// one std::sort gives whenever it is unique: cmp a strict total order, or
-// equivalent elements bitwise identical. Equivalent but different elements
-// may land in any order, so such callers must break ties first.
+// Merges sorted runs (pointer, length) into `out`, which has room for all
+// their elements, on every core: the runs are cut at shared splitters and
+// each slice of them merges on its own. Elements move out of the runs;
+// equivalent ones come out lower run first, as a stable merge of the runs in
+// order would put them. T must be default-constructible and movable.
+template <class T, class Cmp>
+void parallel_merge(const std::vector<std::pair<T*, size_t>>& runs, T* out, Cmp cmp, unsigned threads = 0) {
+    constexpr size_t kSamplesPerRun = 32;
+    const size_t k = runs.size();
+    std::vector<T> samples;
+    samples.reserve(k * kSamplesPerRun);
+    for (const auto& [data, len] : runs)
+        if (len > 0)
+            for (size_t s = 1; s <= kSamplesPerRun; s++) samples.push_back(data[len * s / (kSamplesPerRun + 1)]);
+    if (samples.empty()) return;
+    std::sort(samples.begin(), samples.end(), cmp);
+    std::vector<T> splitters;
+    splitters.reserve(k - 1);
+    for (size_t p = 1; p < k; p++) splitters.push_back(samples[p * samples.size() / k]);
+    const size_t slices = splitters.size() + 1;
+
+    // cuts[c * (slices + 1) + p]: where slice p starts in run c. Slice p
+    // holds the elements in [splitters[p-1], splitters[p]).
+    std::vector<size_t> cuts(k * (slices + 1));
+    parallel_for(k, [&](size_t b, size_t e, unsigned) {
+        for (size_t c = b; c < e; c++) {
+            const T* data = runs[c].first;
+            const size_t len = runs[c].second;
+            size_t* cut = &cuts[c * (slices + 1)];
+            cut[0] = 0;
+            for (size_t p = 1; p < slices; p++)
+                cut[p] = static_cast<size_t>(std::lower_bound(data + cut[p - 1], data + len, splitters[p - 1], cmp) - data);
+            cut[slices] = len;
+        }
+    }, threads);
+
+    std::vector<size_t> slice_start(slices + 1, 0);
+    for (size_t p = 0; p < slices; p++) {
+        size_t len = 0;
+        for (size_t c = 0; c < k; c++) len += cuts[c * (slices + 1) + p + 1] - cuts[c * (slices + 1) + p];
+        slice_start[p + 1] = slice_start[p] + len;
+    }
+
+    parallel_for(slices, [&](size_t b, size_t e, unsigned) {
+        struct Run { size_t pos, end, run; };
+        std::vector<Run> heap;
+        auto head = [&](const Run& r) -> T& { return runs[r.run].first[r.pos]; };
+        // Min-heap on the run heads; the lower run wins ties.
+        auto later = [&](const Run& x, const Run& y) {
+            if (cmp(head(y), head(x))) return true;
+            if (cmp(head(x), head(y))) return false;
+            return x.run > y.run;
+        };
+        for (size_t p = b; p < e; p++) {
+            heap.clear();
+            for (size_t c = 0; c < k; c++) {
+                size_t from = cuts[c * (slices + 1) + p], to = cuts[c * (slices + 1) + p + 1];
+                if (from < to) heap.push_back({from, to, c});
+            }
+            std::make_heap(heap.begin(), heap.end(), later);
+            T* dst = out + slice_start[p];
+            while (!heap.empty()) {
+                std::pop_heap(heap.begin(), heap.end(), later);
+                Run& r = heap.back();
+                *dst++ = std::move(head(r));
+                if (++r.pos == r.end) heap.pop_back();
+                else std::push_heap(heap.begin(), heap.end(), later);
+            }
+        }
+    }, threads);
+}
+
+// Sorts [first, last) (contiguous) by cmp on every core (sample sort: sort
+// chunks, then parallel_merge them). The sorted sequence is the one std::sort
+// gives whenever it is unique: cmp a strict total order, or equivalent
+// elements bitwise identical. Equivalent but different elements may land in
+// any order, so such callers must break ties first.
 // T must be default-constructible and movable.
 template <class It, class Cmp>
 void parallel_sort(It first, It last, Cmp cmp, unsigned threads = 0) {
     using T = typename std::iterator_traits<It>::value_type;
     constexpr size_t kMinPerChunk = size_t(1) << 16;
-    constexpr size_t kSamplesPerChunk = 32;
 
     size_t n = static_cast<size_t>(last - first);
     if (threads == 0) threads = parallel_threads();
@@ -432,67 +503,10 @@ void parallel_sort(It first, It last, Cmp cmp, unsigned threads = 0) {
         for (size_t c = b; c < e; c++) std::sort(first + bounds[c], first + bounds[c + 1], cmp);
     }, threads);
 
-    std::vector<T> samples;
-    samples.reserve(chunks * kSamplesPerChunk);
-    for (size_t c = 0; c < chunks; c++) {
-        size_t len = bounds[c + 1] - bounds[c];
-        for (size_t s = 1; s <= kSamplesPerChunk; s++)
-            samples.push_back(first[bounds[c] + len * s / (kSamplesPerChunk + 1)]);
-    }
-    std::sort(samples.begin(), samples.end(), cmp);
-    std::vector<T> splitters;
-    splitters.reserve(chunks - 1);
-    for (size_t p = 1; p < chunks; p++) splitters.push_back(samples[p * samples.size() / chunks]);
-
-    // cuts[c * (chunks + 1) + p]: where slice p starts in chunk c. Slice p
-    // holds the elements in [splitters[p-1], splitters[p]).
-    std::vector<size_t> cuts(chunks * (chunks + 1));
-    parallel_for(chunks, [&](size_t b, size_t e, unsigned) {
-        for (size_t c = b; c < e; c++) {
-            size_t* cut = &cuts[c * (chunks + 1)];
-            cut[0] = bounds[c];
-            for (size_t p = 1; p < chunks; p++)
-                cut[p] = static_cast<size_t>(std::lower_bound(first + cut[p - 1], first + bounds[c + 1],
-                                                              splitters[p - 1], cmp) - first);
-            cut[chunks] = bounds[c + 1];
-        }
-    }, threads);
-
-    std::vector<size_t> slice_start(chunks + 1, 0);
-    for (size_t p = 0; p < chunks; p++) {
-        size_t len = 0;
-        for (size_t c = 0; c < chunks; c++) len += cuts[c * (chunks + 1) + p + 1] - cuts[c * (chunks + 1) + p];
-        slice_start[p + 1] = slice_start[p] + len;
-    }
-
+    std::vector<std::pair<T*, size_t>> runs(chunks);
+    for (size_t c = 0; c < chunks; c++) runs[c] = {&*(first + bounds[c]), bounds[c + 1] - bounds[c]};
     std::unique_ptr<T[]> out(new T[n]);
-    parallel_for(chunks, [&](size_t b, size_t e, unsigned) {
-        struct Run { size_t pos, end, chunk; };
-        std::vector<Run> heap;
-        // Min-heap on the run heads; the lower chunk wins ties, like a
-        // stable merge of the chunks in order.
-        auto later = [&](const Run& x, const Run& y) {
-            if (cmp(first[y.pos], first[x.pos])) return true;
-            if (cmp(first[x.pos], first[y.pos])) return false;
-            return x.chunk > y.chunk;
-        };
-        for (size_t p = b; p < e; p++) {
-            heap.clear();
-            for (size_t c = 0; c < chunks; c++) {
-                size_t from = cuts[c * (chunks + 1) + p], to = cuts[c * (chunks + 1) + p + 1];
-                if (from < to) heap.push_back({from, to, c});
-            }
-            std::make_heap(heap.begin(), heap.end(), later);
-            T* dst = out.get() + slice_start[p];
-            while (!heap.empty()) {
-                std::pop_heap(heap.begin(), heap.end(), later);
-                Run& r = heap.back();
-                *dst++ = std::move(first[r.pos++]);
-                if (r.pos == r.end) heap.pop_back();
-                else std::push_heap(heap.begin(), heap.end(), later);
-            }
-        }
-    }, threads);
+    parallel_merge(runs, out.get(), cmp, threads);
 
     parallel_for(n, [&](size_t b, size_t e, unsigned) {
         std::move(out.get() + b, out.get() + e, first + b);
