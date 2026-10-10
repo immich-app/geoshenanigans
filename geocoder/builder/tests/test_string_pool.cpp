@@ -106,6 +106,21 @@ TEST(string_pool_handles_embedded_and_unicode_bytes) {
     CHECK_EQ(p.data()[w + 3], '\0');  // appended terminator
 }
 
+TEST(string_pool_release_index_keeps_data_and_refuses_interning) {
+    StringPool p;
+    p.intern("kept");
+    p.release_index();
+    CHECK_EQ(read_at(p, 0), std::string("kept"));
+    bool thrown = false;
+    try {
+        p.intern("late");
+    } catch (const std::logic_error&) {
+        thrown = true;
+    }
+    CHECK(thrown);
+    CHECK_EQ(p.data().size(), size_t(5));
+}
+
 TEST(string_pool_mutable_data_is_same_buffer) {
     StringPool p;
     p.intern("zzz");

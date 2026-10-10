@@ -4412,6 +4412,9 @@ static int run(int argc, char* argv[]) {
         compute_way_parent_polygons(data, cfg);
 
         external_data.get();
+        // The loaders above made the last intern; the lookup table would
+        // otherwise ride through ordering and the write phase.
+        data.string_pool.release_index();
 
         compute_s2_and_poi_cells(data, cfg, _pt, _cpu);
 

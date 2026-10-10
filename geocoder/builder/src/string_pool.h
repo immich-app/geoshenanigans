@@ -9,6 +9,7 @@
 class StringPool {
 public:
     uint32_t intern(const std::string& s) {
+        if (released_) throw std::logic_error("StringPool::intern after release_index");
         auto it = index_.find(s);
         if (it != index_.end()) {
             return it->second;
@@ -24,10 +25,17 @@ public:
         return offset;
     }
 
+    // Frees the lookup table once nothing interns any more (GiBs on planet).
+    void release_index() {
+        std::unordered_map<std::string, uint32_t>().swap(index_);
+        released_ = true;
+    }
+
     const std::vector<char>& data() const { return data_; }
     std::vector<char>& mutable_data() { return data_; }
 
 private:
     std::unordered_map<std::string, uint32_t> index_;
     std::vector<char> data_;
+    bool released_ = false;
 };
