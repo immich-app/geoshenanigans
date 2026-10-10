@@ -2115,14 +2115,23 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
 
         log_phase("Pre-compute continent masks", _pct, _pcc);
 
-        // Sort by bbox area descending — largest continents first
+        // Most records first, so the biggest subset (Europe, whose bbox is
+        // small) doesn't start last and finish alone.
+        std::vector<uint64_t> continent_records(kContinentCount, 0);
+        for (const auto* masks : {&way_continent_masks, &addr_continent_masks, &interp_continent_masks,
+                                  &poi_continent_masks, &place_continent_masks}) {
+            std::vector<std::array<uint64_t, 8>> counts(parallel_threads(), std::array<uint64_t, 8>{});
+            parallel_for(masks->size(), [&](size_t begin, size_t end, unsigned w) {
+                for (size_t i = begin; i < end; i++)
+                    for (size_t c = 0; c < 8; c++) counts[w][c] += ((*masks)[i] >> c) & 1u;
+            });
+            for (const auto& per_worker : counts)
+                for (size_t c = 0; c < kContinentCount && c < 8; c++) continent_records[c] += per_worker[c];
+        }
         std::vector<size_t> continent_order(kContinentCount);
         std::iota(continent_order.begin(), continent_order.end(), 0u);
-        std::sort(continent_order.begin(), continent_order.end(), [](size_t a, size_t b) {
-            auto area = [](const ContinentBBox& c) {
-                return (c.max_lat - c.min_lat) * (c.max_lng - c.min_lng);
-            };
-            return area(kContinents[a]) > area(kContinents[b]);
+        std::stable_sort(continent_order.begin(), continent_order.end(), [&](size_t a, size_t b) {
+            return continent_records[a] > continent_records[b];
         });
 
         // Cap at 2 so peak memory stays bounded: each concurrent
