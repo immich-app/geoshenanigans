@@ -138,6 +138,12 @@ inline bool cell_item_less(const CellItemPair& a, const CellItemPair& b) {
     return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
 }
 
+// parallel_for_runs predicate over a cell-grouped table: pair i is in the
+// cell of pair i - 1.
+inline auto same_cell(const std::vector<CellItemPair>& pairs) {
+    return [&pairs](size_t i) { return pairs[i].cell_id == pairs[i - 1].cell_id; };
+}
+
 // --- Constants ---
 
 static const uint32_t INTERIOR_FLAG = 0x80000000u;

@@ -58,7 +58,6 @@ inline uint64_t pack_osm_id(gc::id_alloc::ObjectType type, int64_t osm_id) {
 #include "parallel.h"
 #include "scratch_dir.h"
 #include "tiger.h"
-#include "parallel.h"
 #include "way_tags.h"
 #include "node_index.h"
 #include "string_dict.h"
@@ -1613,37 +1612,15 @@ static void rebuild_cell_maps_for_cache(ParsedData& data,
     auto rebuild_map_parallel = [](const std::vector<CellItemPair>& sorted,
                                     std::unordered_map<uint64_t, std::vector<uint32_t>>& map) {
         if (sorted.empty() || !map.empty()) return;
-        unsigned nthreads = std::thread::hardware_concurrency();
-        if (nthreads == 0) nthreads = 4;
-        size_t chunk = (sorted.size() + nthreads - 1) / nthreads;
-
-        // Find cell boundaries for clean splits
-        std::vector<size_t> boundaries = {0};
-        for (unsigned t = 1; t < nthreads; t++) {
-            size_t target = t * chunk;
-            if (target >= sorted.size()) break;
-            // Advance to next cell boundary
-            while (target < sorted.size() && sorted[target].cell_id == sorted[target-1].cell_id)
-                target++;
-            if (target < sorted.size()) boundaries.push_back(target);
-        }
-        boundaries.push_back(sorted.size());
-
-        // Each thread builds its own sub-map
-        std::vector<std::unordered_map<uint64_t, std::vector<uint32_t>>> sub_maps(boundaries.size() - 1);
-        std::vector<std::thread> threads;
-        for (size_t t = 0; t + 1 < boundaries.size(); t++) {
-            threads.emplace_back([&, t]() {
-                auto& sub = sub_maps[t];
-                // Pre-estimate capacity
-                size_t n = boundaries[t+1] - boundaries[t];
-                sub.reserve(n / 3); // rough estimate of unique cells
-                for (size_t i = boundaries[t]; i < boundaries[t+1]; i++) {
-                    sub[sorted[i].cell_id].push_back(sorted[i].item_id);
-                }
-            });
-        }
-        for (auto& t : threads) t.join();
+        // Each worker builds its own sub-map over whole cells
+        std::vector<std::unordered_map<uint64_t, std::vector<uint32_t>>> sub_maps(parallel_threads());
+        parallel_for_runs(sorted.size(), same_cell(sorted), [&](size_t begin, size_t end, unsigned w) {
+            auto& sub = sub_maps[w];
+            sub.reserve((end - begin) / 3); // rough estimate of unique cells
+            for (size_t i = begin; i < end; i++) {
+                sub[sorted[i].cell_id].push_back(sorted[i].item_id);
+            }
+        });
 
         // Merge sub-maps into main map (no conflicts since splits are at cell boundaries)
         size_t total_cells = 0;
@@ -2157,42 +2134,25 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
         auto precompute_masks = [&continent_polys](const std::vector<CellItemPair>& sorted) -> std::vector<uint8_t> {
             if (sorted.empty()) return {};
             std::vector<uint8_t> masks(sorted.size(), 0);
-
-            unsigned nthreads = std::max(1u, std::thread::hardware_concurrency());
-            size_t chunk = (sorted.size() + nthreads - 1) / nthreads;
-            std::vector<size_t> bounds = {0};
-            for (unsigned t = 1; t < nthreads; t++) {
-                size_t target = t * chunk;
-                if (target >= sorted.size()) break;
-                while (target < sorted.size() && sorted[target].cell_id == sorted[target-1].cell_id)
-                    target++;
-                if (target < sorted.size()) bounds.push_back(target);
-            }
-            bounds.push_back(sorted.size());
-
-            std::vector<std::thread> threads;
-            for (size_t th = 0; th + 1 < bounds.size(); th++) {
-                threads.emplace_back([&, th]() {
-                    for (size_t i = bounds[th]; i < bounds[th+1]; ) {
-                        uint64_t cell_id = sorted[i].cell_id;
-                        S2CellId cell(cell_id);
-                        S2LatLng center = cell.ToLatLng();
-                        double lat = center.lat().degrees();
-                        double lng = center.lng().degrees();
-                        uint8_t mask = 0;
-                        // Test against continent polygons (not bboxes)
-                        for (size_t ci = 0; ci < continent_polys.size() && ci < 8; ci++) {
-                            if (point_in_polygon(lat, lng, continent_polys[ci].vertices))
-                                mask |= (1u << ci);
-                        }
-                        while (i < bounds[th+1] && sorted[i].cell_id == cell_id) {
-                            masks[i] = mask;
-                            i++;
-                        }
+            parallel_for_runs(sorted.size(), same_cell(sorted), [&](size_t begin, size_t end, unsigned) {
+                for (size_t i = begin; i < end; ) {
+                    uint64_t cell_id = sorted[i].cell_id;
+                    S2CellId cell(cell_id);
+                    S2LatLng center = cell.ToLatLng();
+                    double lat = center.lat().degrees();
+                    double lng = center.lng().degrees();
+                    uint8_t mask = 0;
+                    // Test against continent polygons (not bboxes)
+                    for (size_t ci = 0; ci < continent_polys.size() && ci < 8; ci++) {
+                        if (point_in_polygon(lat, lng, continent_polys[ci].vertices))
+                            mask |= (1u << ci);
                     }
-                });
-            }
-            for (auto& t : threads) t.join();
+                    while (i < end && sorted[i].cell_id == cell_id) {
+                        masks[i] = mask;
+                        i++;
+                    }
+                }
+            });
             return masks;
         };
 

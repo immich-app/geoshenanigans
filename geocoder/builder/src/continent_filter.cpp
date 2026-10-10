@@ -1,6 +1,7 @@
 #include "continent_filter.h"
 #include "continent_boundaries.h"
 #include "parsed_data.h"
+#include "parallel.h"
 
 #include <algorithm>
 #include <cstring>
@@ -10,25 +11,9 @@
 #include <s2/s2cell_id.h>
 #include <s2/s2latlng.h>
 
-// Cell-aligned thread-partition bounds for a cell-sorted CellItemPair array.
-// Splits `sorted` into ~equal chunks across nthreads, snapping each boundary
-// forward so a single cell_id is never split across two threads (required so
-// per-thread output ordering stays deterministic). Returns the boundary
-// offsets [0, ..., sorted.size()]; consecutive pairs delimit each thread's
-// half-open range. Shared by filter_sorted_masked and remap_sorted_masked,
-// which previously duplicated this exact arithmetic.
-static std::vector<size_t> partition_sorted_by_cell(const std::vector<CellItemPair>& sorted) {
-    unsigned nthreads = std::max(1u, std::thread::hardware_concurrency() / 4);
-    size_t chunk = (sorted.size() + nthreads - 1) / nthreads;
-    std::vector<size_t> bounds = {0};
-    for (unsigned t = 1; t < nthreads; t++) {
-        size_t target = t * chunk;
-        if (target >= sorted.size()) break;
-        while (target < sorted.size() && sorted[target].cell_id == sorted[target-1].cell_id) target++;
-        if (target < sorted.size()) bounds.push_back(target);
-    }
-    bounds.push_back(sorted.size());
-    return bounds;
+// Workers per sorted-pair pass: the record classes' passes run at once.
+static unsigned pair_pass_threads() {
+    return std::max(1u, parallel_threads() / 4);
 }
 
 const ContinentBBox kContinents[] = {
@@ -89,27 +74,23 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         if (sorted.empty() || max_id == 0) return result;
 
         size_t bitset_bytes = (max_id + 8) / 8;
-        std::vector<size_t> bounds = partition_sorted_by_cell(sorted);
-
-        std::vector<std::vector<uint8_t>> thread_bitsets(bounds.size() - 1);
-        std::vector<std::thread> threads;
-        for (size_t t = 0; t + 1 < bounds.size(); t++) {
-            threads.emplace_back([&, t]() {
-                auto& bs = thread_bitsets[t];
-                bs.resize(bitset_bytes, 0);
-                for (size_t i = bounds[t]; i < bounds[t+1]; i++) {
-                    if (masks[i] & continent_bit) {
-                        uint32_t id = sorted[i].item_id & ID_MASK;
-                        if (id < max_id)
-                            bs[id / 8] |= (1 << (id % 8));
-                    }
+        const unsigned threads = pair_pass_threads();
+        std::vector<std::vector<uint8_t>> thread_bitsets(threads);
+        parallel_for_runs(sorted.size(), same_cell(sorted), [&](size_t begin, size_t end, unsigned w) {
+            auto& bs = thread_bitsets[w];
+            bs.resize(bitset_bytes, 0);
+            for (size_t i = begin; i < end; i++) {
+                if (masks[i] & continent_bit) {
+                    uint32_t id = sorted[i].item_id & ID_MASK;
+                    if (id < max_id)
+                        bs[id / 8] |= (1 << (id % 8));
                 }
-            });
-        }
-        for (auto& t : threads) t.join();
+            }
+        }, threads);
 
         std::vector<uint8_t> bitset(bitset_bytes, 0);
         for (auto& bs : thread_bitsets) {
+            if (bs.empty()) continue;
             for (size_t i = 0; i < bitset_bytes; i++) bitset[i] |= bs[i];
         }
 
@@ -424,24 +405,20 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
                                     const std::unordered_map<uint32_t, uint32_t>& remap,
                                     std::vector<CellItemPair>& dst) {
         if (sorted.empty()) return;
-        std::vector<size_t> bounds = partition_sorted_by_cell(sorted);
-        std::vector<std::vector<CellItemPair>> thread_pairs(bounds.size() - 1);
-        std::vector<std::thread> threads;
-        for (size_t t = 0; t + 1 < bounds.size(); t++) {
-            threads.emplace_back([&, t]() {
-                auto& local = thread_pairs[t];
-                for (size_t i = bounds[t]; i < bounds[t+1]; i++) {
-                    if (masks[i] & continent_bit) {
-                        uint32_t raw   = sorted[i].item_id & ID_MASK;
-                        uint32_t flags = sorted[i].item_id & INTERIOR_FLAG;
-                        auto it = remap.find(raw);
-                        if (it != remap.end())
-                            local.push_back({sorted[i].cell_id, it->second | flags});
-                    }
+        const unsigned threads = pair_pass_threads();
+        std::vector<std::vector<CellItemPair>> thread_pairs(threads);
+        parallel_for_runs(sorted.size(), same_cell(sorted), [&](size_t begin, size_t end, unsigned w) {
+            auto& local = thread_pairs[w];
+            for (size_t i = begin; i < end; i++) {
+                if (masks[i] & continent_bit) {
+                    uint32_t raw   = sorted[i].item_id & ID_MASK;
+                    uint32_t flags = sorted[i].item_id & INTERIOR_FLAG;
+                    auto it = remap.find(raw);
+                    if (it != remap.end())
+                        local.push_back({sorted[i].cell_id, it->second | flags});
                 }
-            });
-        }
-        for (auto& t : threads) t.join();
+            }
+        }, threads);
         size_t total = 0;
         for (auto& v : thread_pairs) total += v.size();
         dst.reserve(total);

@@ -52,6 +52,28 @@ void parallel_for(size_t n, Fn&& fn, unsigned threads = 0) {
         if (e) std::rethrow_exception(e);
 }
 
+// parallel_for whose ranges never split a run: same_run(i) (i >= 1) says
+// element i continues the run of element i - 1. A range is cut at the first
+// run start at or after its even share, so fn(begin, end, worker) gets whole
+// runs; worker numbers ranges in order and stays below `threads`.
+template <class SameRun, class Fn>
+void parallel_for_runs(size_t n, SameRun same_run, Fn&& fn, unsigned threads = 0) {
+    if (threads == 0) threads = parallel_threads();
+    size_t workers = std::min<size_t>(threads, n);
+    std::vector<size_t> bounds{0};
+    for (size_t w = 1; w < workers; w++) {
+        size_t b = std::max(n * w / workers, bounds.back());
+        while (b < n && same_run(b)) b++;
+        if (b > bounds.back() && b < n) bounds.push_back(b);
+    }
+    bounds.push_back(n);
+    size_t ranges = bounds.size() - 1;
+    parallel_for(ranges, [&](size_t b, size_t e, unsigned) {
+        for (size_t r = b; r < e; r++)
+            if (bounds[r] < bounds[r + 1]) fn(bounds[r], bounds[r + 1], static_cast<unsigned>(r));
+    }, static_cast<unsigned>(ranges));
+}
+
 // Runs fn(begin, end, worker) over [0, n) in chunks of `grain` indices that
 // at most `threads` workers (0 = every core) claim in index order as they
 // free up, for loops whose cost per index is uneven. Which worker runs which

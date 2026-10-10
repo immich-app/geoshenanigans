@@ -2,6 +2,7 @@
 #include "parallel.h"
 
 #include <atomic>
+#include <mutex>
 #include <cstdint>
 #include <random>
 #include <stdexcept>
@@ -399,4 +400,46 @@ TEST(parallel_sort_small_and_presorted_inputs) {
         CHECK(a == asc);
         CHECK(d == desc);
     }
+}
+
+TEST(parallel_for_runs_covers_every_index_in_whole_runs) {
+    std::mt19937 rng(11);
+    std::vector<uint32_t> keys(5000);
+    uint32_t key = 0;
+    for (auto& k : keys) { if (rng() % 4 == 0) key++; k = key; }
+    for (size_t i = 100; i < 2600; i++) keys[i] = keys[99];  // longer than any worker's share
+    auto same_run = [&](size_t i) { return keys[i] == keys[i - 1]; };
+    for (unsigned threads : {1u, 2u, 3u, 8u, 64u}) {
+        std::vector<int> hits(keys.size(), 0);
+        std::vector<std::pair<size_t, size_t>> ranges(threads, {0, 0});
+        std::atomic<bool> worker_in_range{true};
+        parallel_for_runs(keys.size(), same_run, [&](size_t b, size_t e, unsigned w) {
+            if (w >= threads) { worker_in_range = false; return; }
+            ranges[w] = {b, e};
+            for (size_t i = b; i < e; i++) hits[i]++;
+        }, threads);
+        CHECK(worker_in_range.load());
+        for (int h : hits) CHECK_EQ(h, 1);
+        size_t next = 0;
+        for (const auto& [b, e] : ranges) {
+            if (b == e) continue;
+            CHECK_EQ(b, next);  // ranges numbered in order
+            if (b > 0) CHECK(!same_run(b));
+            next = e;
+        }
+        CHECK_EQ(next, keys.size());
+    }
+}
+
+TEST(parallel_for_runs_keeps_a_single_run_whole) {
+    std::vector<size_t> calls;
+    std::mutex m;
+    parallel_for_runs(1000, [](size_t) { return true; }, [&](size_t b, size_t e, unsigned) {
+        std::lock_guard<std::mutex> lk(m);
+        calls.push_back(e - b);
+    }, 8);
+    CHECK(calls == std::vector<size_t>({1000}));
+    calls.clear();
+    parallel_for_runs(0, [](size_t) { return false; }, [&](size_t, size_t, unsigned) { calls.push_back(1); }, 8);
+    CHECK(calls.empty());
 }
