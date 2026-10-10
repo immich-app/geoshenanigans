@@ -1591,7 +1591,16 @@ static void compute_s2_and_poi_cells(ParsedData& data, const BuildConfig& cfg,
         data.deferred_interps.clear();
         data.deferred_interps.shrink_to_fit();
 
+        // The interpolation endpoints read the addr points the backfill is
+        // done with and touch nothing the POI and place cells read, so they
+        // resolve beside them.
+        auto endpoints = std::async(std::launch::async, [&data] {
+            std::cerr << "Resolving interpolation endpoints..." << std::endl;
+            resolve_interpolation_endpoints(data);
+        });
+
         compute_poi_s2_cells(data, cfg, _s2t, _s2cpu);
+        endpoints.get();
 
         std::cerr << "S2 cell computation complete." << std::endl;
     }
@@ -4693,10 +4702,6 @@ static int run(int argc, char* argv[]) {
             [index = data.string_pool.release_index()]() mutable { for (auto& shard : index) release_gently(shard); });
 
         compute_s2_and_poi_cells(data, cfg, _pt, _cpu);
-
-        // Resolve interpolation endpoints
-        std::cerr << "Resolving interpolation endpoints..." << std::endl;
-        resolve_interpolation_endpoints(data);
         index_freed.get();
 
         // Deduplicate + convert to sorted pairs for fast writing
