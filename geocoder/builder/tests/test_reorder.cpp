@@ -17,7 +17,7 @@ namespace {
 const unsigned kThreadCounts[] = {1, 3, 8, 64};
 
 struct Shape {
-    size_t n = 1 << 17;
+    size_t n = 1 << 18;  // past parallel_sort's serial cutoff for every family
     bool osm_ids = true;      // osm id arrays parallel to their records
     bool side_arrays = true;  // postcode / parent / elevation / qid arrays
     bool odd_vertices = false;  // addr polygons with vertex_count > 0 but no vertices
@@ -61,7 +61,7 @@ void fill_records(ParsedData& d, std::vector<float>& elevations, std::vector<uin
                   uint64_t seed, const Shape& s) {
     Rng r(seed);
     const size_t n = s.n;
-    const uint32_t n_ways = static_cast<uint32_t>(n / 2), n_admin = static_cast<uint32_t>(n / 8);
+    const uint32_t n_ways = static_cast<uint32_t>(n), n_admin = static_cast<uint32_t>(n / 2);
 
     for (size_t i = 0; i < n; i++) {
         AddrPoint a{};
@@ -110,7 +110,16 @@ void fill_records(ParsedData& d, std::vector<float>& elevations, std::vector<uin
         iw.interpolation = static_cast<uint8_t>(r.below(2));
         for (uint32_t j = 0; j < iw.node_count; j++) d.interp_nodes.push_back(node(r, s));
         d.interp_ways.push_back(iw);
-        uint64_t osm = s.unique_osm_ids ? i + 1 : r.below(n_ways / 8);
+        // Like TIGER's synthetic ids: a hash of the content (type aside),
+        // so identical segments share an id.
+        uint64_t osm = iw.street_id * 31ull + iw.start_number * 7 + iw.end_number;
+        for (uint32_t j = 0; j < iw.node_count; j++) {
+            uint64_t bits;
+            std::memcpy(&bits, &d.interp_nodes[iw.node_offset + j], sizeof(bits));
+            osm = osm * 1000003 ^ bits;
+        }
+        if (s.unique_osm_ids) osm = i + 1;
+        else if (r.one_in(10)) osm = r.below(n_ways / 8);
         if (s.osm_ids) d.interp_osm_ids.push_back(osm);
         if (s.side_arrays)
             d.interp_postcode_ids.push_back(s.uniform_interp_postcodes ? static_cast<uint32_t>(osm % 7)
@@ -164,7 +173,7 @@ void fill_records(ParsedData& d, std::vector<float>& elevations, std::vector<uin
     }
     d.sorted_poi_cells = new_cell_pairs(r, n, static_cast<uint32_t>(n), true);
 
-    for (size_t i = 0; i < n / 4; i++) {
+    for (size_t i = 0; i < n; i++) {
         PlaceNode p{};
         p.lat = coord(r, s);
         p.lng = coord(r, s);
@@ -174,7 +183,7 @@ void fill_records(ParsedData& d, std::vector<float>& elevations, std::vector<uin
         d.place_nodes.push_back(p);
         if (s.osm_ids) d.place_osm_ids.push_back(i * 3 + 1);
     }
-    d.sorted_place_cells = new_cell_pairs(r, n / 4, static_cast<uint32_t>(n / 4), false);
+    d.sorted_place_cells = new_cell_pairs(r, n, static_cast<uint32_t>(n), false);
 }
 
 std::vector<QidSitelinks> sitelinks() {
@@ -247,7 +256,7 @@ void check_steps_match_reference(uint64_t seed, const Shape& s) {
         fill_records(got, got_ele, got_qids, seed, s);
         reorder_addr_points(got, threads);
         reorder_ways(got, threads);
-        reorder_interps(got);
+        reorder_interps(got, threads);
         reorder_admin_polygons(got);
         reorder_pois(got, got_ele, got_qids, links);
         reorder_place_nodes(got);

@@ -337,111 +337,106 @@ inline void reorder_ways(ParsedData& data, unsigned threads = 0) {
 }
 
 // Sorts interps by (street, start, end, type, nodes) and reorders their nodes.
-inline void reorder_interps(ParsedData& data) {
-    if (!data.interp_ways.empty()) {
-        size_t n = data.interp_ways.size();
-        std::vector<uint32_t> order(n);
-        std::iota(order.begin(), order.end(), 0);
-        const auto& sp = data.string_pool.data();
-        std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
-            const auto& ia = data.interp_ways[a];
-            const auto& ib = data.interp_ways[b];
-            if (ia.street_id != ib.street_id) return ia.street_id < ib.street_id;
-            if (ia.start_number != ib.start_number) return ia.start_number < ib.start_number;
-            if (ia.end_number != ib.end_number) return ia.end_number < ib.end_number;
-            if (ia.interpolation != ib.interpolation) return ia.interpolation < ib.interpolation;
-            uint16_t nc = std::min(ia.node_count, ib.node_count);
-            for (uint16_t j = 0; j < nc; j++) {
-                uint32_t la = float_bits(data.interp_nodes[ia.node_offset + j].lat);
-                uint32_t lb = float_bits(data.interp_nodes[ib.node_offset + j].lat);
-                if (la != lb) return la < lb;
-                uint32_t ga = float_bits(data.interp_nodes[ia.node_offset + j].lng);
-                uint32_t gb = float_bits(data.interp_nodes[ib.node_offset + j].lng);
-                if (ga != gb) return ga < gb;
-            }
-            if (ia.node_count != ib.node_count) return ia.node_count < ib.node_count;
-            if (data.interp_osm_ids.size() == data.interp_ways.size())
-                return data.interp_osm_ids[a] < data.interp_osm_ids[b];
-            return false;
-        });
-        // Reorder + DEDUP. TIGER frequently emits the exact same
-        // interpolation way twice (identical street/range/type/geometry —
-        // e.g. overlapping county extracts). Those duplicates share a
-        // synthetic osm_id, which the strategy-2 allocator can't
-        // disambiguate: it tombstones + reslots one of each pair non-
-        // deterministically (~97k tombstones on the planet), churning
-        // interp_ways/nodes/entries between same-PBF builds. They are
-        // genuine duplicates (a redundant interpolation segment), so drop
-        // consecutive identical entries — mirroring the street-way dedup —
-        // and map both old indices to the surviving one. (Compared on
-        // street/range/type/node_count + node geometry; node_offset is
-        // position-dependent and excluded.)
-        std::vector<uint32_t> old_to_new(n);
-        std::vector<InterpWay> new_interps;
-        std::vector<NodeCoord> new_nodes;
-        new_interps.reserve(n);
-        new_nodes.reserve(data.interp_nodes.size());
-        const bool have_interp_osm = (data.interp_osm_ids.size() == n);
-        std::vector<uint64_t> new_osm;
-        if (have_interp_osm) new_osm.reserve(n);
-        const bool have_interp_pc = (data.interp_postcode_ids.size() == n);
-        std::vector<uint32_t> new_pc;
-        if (have_interp_pc) new_pc.reserve(n);
-        for (uint32_t i = 0; i < n; i++) {
-            uint32_t oi = order[i];
-            const InterpWay& cur = data.interp_ways[oi];
-            uint32_t old_off = cur.node_offset;
-            bool is_dup = false;
-            if (!new_interps.empty()) {
-                const InterpWay& prev = new_interps.back();
-                if (prev.street_id == cur.street_id &&
-                    prev.start_number == cur.start_number &&
-                    prev.end_number == cur.end_number &&
-                    prev.interpolation == cur.interpolation &&
-                    prev.node_count == cur.node_count) {
-                    is_dup = true;
-                    for (uint16_t j = 0; j < cur.node_count; j++) {
-                        if (memcmp(&new_nodes[prev.node_offset + j],
-                                   &data.interp_nodes[old_off + j],
-                                   sizeof(NodeCoord)) != 0) { is_dup = false; break; }
-                    }
-                }
-            }
-            if (is_dup) {
-                old_to_new[oi] = static_cast<uint32_t>(new_interps.size() - 1);
-            } else {
-                old_to_new[oi] = static_cast<uint32_t>(new_interps.size());
-                InterpWay iw = cur;
-                iw.node_offset = static_cast<uint32_t>(new_nodes.size());
-                for (uint16_t j = 0; j < iw.node_count; j++)
-                    new_nodes.push_back(data.interp_nodes[old_off + j]);
-                if (have_interp_osm) new_osm.push_back(data.interp_osm_ids[oi]);
-                if (have_interp_pc) new_pc.push_back(data.interp_postcode_ids[oi]);
-                new_interps.push_back(iw);
-            }
+inline void reorder_interps(ParsedData& data, unsigned threads = 0) {
+    if (data.interp_ways.empty()) return;
+
+    const size_t n = data.interp_ways.size();
+    const auto& interps = data.interp_ways;
+    const auto& nodes = data.interp_nodes;
+    const bool have_interp_osm = (data.interp_osm_ids.size() == n);
+    const bool have_interp_pc = (data.interp_postcode_ids.size() == n);
+    auto interp_less = [&](uint32_t a, uint32_t b) {
+        const auto& ia = interps[a];
+        const auto& ib = interps[b];
+        if (ia.street_id != ib.street_id) return ia.street_id < ib.street_id;
+        if (ia.start_number != ib.start_number) return ia.start_number < ib.start_number;
+        if (ia.end_number != ib.end_number) return ia.end_number < ib.end_number;
+        if (ia.interpolation != ib.interpolation) return ia.interpolation < ib.interpolation;
+        uint16_t nc = std::min(ia.node_count, ib.node_count);
+        for (uint16_t j = 0; j < nc; j++) {
+            uint32_t la = float_bits(nodes[ia.node_offset + j].lat);
+            uint32_t lb = float_bits(nodes[ib.node_offset + j].lat);
+            if (la != lb) return la < lb;
+            uint32_t ga = float_bits(nodes[ia.node_offset + j].lng);
+            uint32_t gb = float_bits(nodes[ib.node_offset + j].lng);
+            if (ga != gb) return ga < gb;
         }
-        size_t interp_deduped = n - new_interps.size();
-        if (have_interp_osm) data.interp_osm_ids = std::move(new_osm);
-        if (have_interp_pc) data.interp_postcode_ids = std::move(new_pc);
-        data.interp_ways = std::move(new_interps);
-        data.interp_nodes = std::move(new_nodes);
-        for (auto& p : data.sorted_interp_cells) p.item_id = old_to_new[p.item_id];
-        auto cmp = cell_item_less;
-        std::sort(data.sorted_interp_cells.begin(), data.sorted_interp_cells.end(), cmp);
-        // Dedup now-identical (cell_id, item_id) pairs: when two duplicate
-        // interps in the same cell collapse to one survivor their cell
-        // entries become identical, which would otherwise list the survivor
-        // twice per cell.
-        data.sorted_interp_cells.erase(
-            std::unique(data.sorted_interp_cells.begin(), data.sorted_interp_cells.end(),
-                        [](const CellItemPair& a, const CellItemPair& b) {
-                            return a.cell_id == b.cell_id && a.item_id == b.item_id;
-                        }),
-            data.sorted_interp_cells.end());
-        data.cell_to_interps.clear();
-        std::cerr << "  Interps sorted: " << data.interp_ways.size()
-                  << " (" << interp_deduped << " duplicates removed)" << std::endl;
-    }
+        if (ia.node_count != ib.node_count) return ia.node_count < ib.node_count;
+        if (have_interp_osm) return data.interp_osm_ids[a] < data.interp_osm_ids[b];
+        return false;
+    };
+    // Interps that tie are duplicates the dedup below folds into the first,
+    // which keeps its own header and postcode: their order shows only when
+    // those differ. (Duplicate TIGER rows can carry different postcodes;
+    // then the surviving one is whichever std::sort put first.)
+    auto tie_matters = [&](uint32_t a, uint32_t b) {
+        constexpr size_t kAfterOffset = offsetof(InterpWay, node_count);
+        return std::memcmp(reinterpret_cast<const char*>(&interps[a]) + kAfterOffset,
+                           reinterpret_cast<const char*>(&interps[b]) + kAfterOffset,
+                           sizeof(InterpWay) - kAfterOffset) != 0 ||
+               (have_interp_pc && data.interp_postcode_ids[a] != data.interp_postcode_ids[b]);
+    };
+    std::vector<uint32_t> order = parallel_sort_indices(n, interp_less, tie_matters, threads);
+
+    // Reorder + DEDUP. TIGER frequently emits the exact same
+    // interpolation way twice (identical street/range/type/geometry —
+    // e.g. overlapping county extracts). Those duplicates share a
+    // synthetic osm_id, which the strategy-2 allocator can't
+    // disambiguate: it tombstones + reslots one of each pair non-
+    // deterministically (~97k tombstones on the planet), churning
+    // interp_ways/nodes/entries between same-PBF builds. They are
+    // genuine duplicates (a redundant interpolation segment), so drop
+    // consecutive identical entries — mirroring the street-way dedup —
+    // and map both old indices to the surviving one. (Compared on
+    // street/range/type/node_count + node geometry; node_offset is
+    // position-dependent and excluded.)
+    std::vector<uint32_t> starts = run_starts(n, [&](size_t i, size_t j) {
+        const auto& a = interps[order[i]];
+        const auto& b = interps[order[j]];
+        return a.street_id == b.street_id && a.start_number == b.start_number &&
+               a.end_number == b.end_number && a.interpolation == b.interpolation &&
+               a.node_count == b.node_count &&
+               std::memcmp(nodes.data() + a.node_offset, nodes.data() + b.node_offset,
+                           a.node_count * sizeof(NodeCoord)) == 0;
+    }, threads);
+    const size_t kept = starts.size();
+
+    Repacked<NodeCoord> repacked = repack(kept, nodes,
+        [&](size_t k) { return size_t(interps[order[starts[k]]].node_count); },
+        [&](size_t k) { return interps[order[starts[k]]].node_offset; }, threads);
+    std::vector<InterpWay> new_interps(kept);
+    std::vector<uint64_t> new_osm(have_interp_osm ? kept : 0);
+    std::vector<uint32_t> new_pc(have_interp_pc ? kept : 0);
+    parallel_for(kept, [&](size_t b, size_t e, unsigned) {
+        for (size_t k = b; k < e; k++) {
+            uint32_t oi = order[starts[k]];
+            new_interps[k] = interps[oi];
+            new_interps[k].node_offset = static_cast<uint32_t>(repacked.at[k]);
+            if (have_interp_osm) new_osm[k] = data.interp_osm_ids[oi];
+            if (have_interp_pc) new_pc[k] = data.interp_postcode_ids[oi];
+        }
+    }, threads);
+    const std::vector<uint32_t> old_to_new = renumber_runs(order, starts, threads);
+    order = {};
+    starts = {};
+    if (have_interp_osm) data.interp_osm_ids = std::move(new_osm);
+    if (have_interp_pc) data.interp_postcode_ids = std::move(new_pc);
+    data.interp_ways = std::move(new_interps);
+    data.interp_nodes = std::move(repacked.items);
+    renumber_cell_pairs(data.sorted_interp_cells, [&](uint32_t id) { return old_to_new[id]; }, threads);
+    // Dedup now-identical (cell_id, item_id) pairs: when two duplicate
+    // interps in the same cell collapse to one survivor their cell
+    // entries become identical, which would otherwise list the survivor
+    // twice per cell.
+    data.sorted_interp_cells.erase(
+        std::unique(data.sorted_interp_cells.begin(), data.sorted_interp_cells.end(),
+                    [](const CellItemPair& a, const CellItemPair& b) {
+                        return a.cell_id == b.cell_id && a.item_id == b.item_id;
+                    }),
+        data.sorted_interp_cells.end());
+    data.cell_to_interps.clear();
+    std::cerr << "  Interps sorted: " << data.interp_ways.size()
+              << " (" << (n - kept) << " duplicates removed)" << std::endl;
 }
 
 // Sorts admin polygons by (name, level, country, vertex_count) and reorders
