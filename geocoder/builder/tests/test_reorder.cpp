@@ -246,7 +246,7 @@ void check_steps_match_reference(uint64_t seed, const Shape& s) {
         std::vector<uint32_t> got_qids;
         fill_records(got, got_ele, got_qids, seed, s);
         reorder_addr_points(got, threads);
-        reorder_ways(got);
+        reorder_ways(got, threads);
         reorder_interps(got);
         reorder_admin_polygons(got);
         reorder_pois(got, got_ele, got_qids, links);

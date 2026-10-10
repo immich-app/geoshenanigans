@@ -228,119 +228,112 @@ inline void reorder_addr_points(ParsedData& data, unsigned threads = 0) {
 }
 
 // Sorts ways by (name, node_count, nodes) and reorders their nodes.
-inline void reorder_ways(ParsedData& data) {
-    if (!data.ways.empty()) {
-        size_t n = data.ways.size();
-        std::vector<uint32_t> order(n);
-        std::iota(order.begin(), order.end(), 0);
-        const auto& sp = data.string_pool.data();
-        std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
-            const auto& wa = data.ways[a];
-            const auto& wb = data.ways[b];
-            if (wa.name_id != wb.name_id) return wa.name_id < wb.name_id;
-            if (wa.node_count != wb.node_count) return wa.node_count < wb.node_count;
-            // Compare all nodes for total order
-            uint16_t nc = std::min(wa.node_count, wb.node_count);
-            for (uint16_t j = 0; j < nc; j++) {
-                uint32_t la = float_bits(data.street_nodes[wa.node_offset + j].lat);
-                uint32_t lb = float_bits(data.street_nodes[wb.node_offset + j].lat);
-                if (la != lb) return la < lb;
-                uint32_t ga = float_bits(data.street_nodes[wa.node_offset + j].lng);
-                uint32_t gb = float_bits(data.street_nodes[wb.node_offset + j].lng);
-                if (ga != gb) return ga < gb;
-            }
-            // osm_id tiebreaker for full determinism — without it,
-            // duplicate-content ways resolve to whichever index was
-            // first in the build-encounter order (non-deterministic).
-            if (data.way_osm_ids.size() == data.ways.size())
-                return data.way_osm_ids[a] < data.way_osm_ids[b];
-            return false;
-        });
-        // Reorder ways + nodes by sort order, dedup identical consecutive ways
-        std::vector<WayHeader> new_ways;
-        std::vector<NodeCoord> new_nodes;
-        new_ways.reserve(n);
-        new_nodes.reserve(data.street_nodes.size());
-        std::vector<uint32_t> old_to_new(n);
+inline void reorder_ways(ParsedData& data, unsigned threads = 0) {
+    if (data.ways.empty()) return;
 
-        for (uint32_t i = 0; i < n; i++) {
-            auto w = data.ways[order[i]];
-            uint32_t old_off = w.node_offset;
-            uint16_t nc = w.node_count;
+    const size_t n = data.ways.size();
+    const auto& ways = data.ways;
+    const auto& nodes = data.street_nodes;
+    const bool have_osm = data.way_osm_ids.size() == n;
+    auto way_less = [&](uint32_t a, uint32_t b) {
+        const auto& wa = ways[a];
+        const auto& wb = ways[b];
+        if (wa.name_id != wb.name_id) return wa.name_id < wb.name_id;
+        if (wa.node_count != wb.node_count) return wa.node_count < wb.node_count;
+        // Compare all nodes for total order
+        uint16_t nc = std::min(wa.node_count, wb.node_count);
+        for (uint16_t j = 0; j < nc; j++) {
+            uint32_t la = float_bits(nodes[wa.node_offset + j].lat);
+            uint32_t lb = float_bits(nodes[wb.node_offset + j].lat);
+            if (la != lb) return la < lb;
+            uint32_t ga = float_bits(nodes[wa.node_offset + j].lng);
+            uint32_t gb = float_bits(nodes[wb.node_offset + j].lng);
+            if (ga != gb) return ga < gb;
+        }
+        // osm_id tiebreaker for full determinism — without it,
+        // duplicate-content ways resolve to whichever index was
+        // first in the build-encounter order (non-deterministic).
+        if (have_osm) return data.way_osm_ids[a] < data.way_osm_ids[b];
+        return false;
+    };
+    // Ways that tie have the same name, nodes and osm id, so the dedup
+    // below folds them into one way whose header, nodes and osm id are the
+    // same whichever came first; only differing header padding could tell.
+    auto tie_matters = [&](uint32_t a, uint32_t b) {
+        constexpr size_t kAfterOffset = offsetof(WayHeader, node_count);
+        return std::memcmp(reinterpret_cast<const char*>(&ways[a]) + kAfterOffset,
+                           reinterpret_cast<const char*>(&ways[b]) + kAfterOffset,
+                           sizeof(WayHeader) - kAfterOffset) != 0;
+    };
+    std::vector<uint32_t> order = parallel_sort_indices(n, way_less, tie_matters, threads);
 
-            // Check if this way is identical to the previous one (dedup)
-            bool is_dup = false;
-            if (!new_ways.empty()) {
-                auto& prev = new_ways.back();
-                if (prev.name_id == w.name_id && prev.node_count == nc) {
-                    is_dup = true;
-                    for (uint16_t j = 0; j < nc && is_dup; j++) {
-                        auto& pn = data.street_nodes[old_off + j];
-                        auto& qn = new_nodes[prev.node_offset + j];
-                        if (memcmp(&pn, &qn, sizeof(NodeCoord)) != 0) is_dup = false;
+    // Dedup identical consecutive ways (name, node_count, node bytes).
+    std::vector<uint32_t> starts = run_starts(n, [&](size_t i, size_t j) {
+        const auto& a = ways[order[i]];
+        const auto& b = ways[order[j]];
+        return a.name_id == b.name_id && a.node_count == b.node_count &&
+               std::memcmp(nodes.data() + a.node_offset, nodes.data() + b.node_offset,
+                           a.node_count * sizeof(NodeCoord)) == 0;
+    }, threads);
+    const size_t kept = starts.size();
+
+    Repacked<NodeCoord> repacked = repack(kept, nodes,
+        [&](size_t k) { return size_t(ways[order[starts[k]]].node_count); },
+        [&](size_t k) { return ways[order[starts[k]]].node_offset; }, threads);
+    std::vector<WayHeader> new_ways(kept);
+    parallel_for(kept, [&](size_t b, size_t e, unsigned) {
+        for (size_t k = b; k < e; k++) {
+            new_ways[k] = ways[order[starts[k]]];
+            new_ways[k].node_offset = static_cast<uint32_t>(repacked.at[k]);
+        }
+    }, threads);
+    // Reorder + dedup way_osm_ids in lockstep. Each kept way takes the
+    // first non-zero osm id of its duplicates in SORT order (not original
+    // order), matching how data.ways picks its dedup survivor above.
+    // Original order is build-encounter order, non-deterministic, and
+    // the resulting way_osm_ids[k] wouldn't match the osm_id of
+    // data.ways[k].
+    if (have_osm) data.way_osm_ids = first_set_per_run(data.way_osm_ids, order, starts, int64_t(0), threads);
+    // Remap way_parent_ids + way_postcode_ids: reorder + dedup. Each kept
+    // way takes the set value of the duplicate with the highest original
+    // index, as the serial pass did walking the original order with set
+    // values overwriting.
+    auto remap_way_vec = [&](std::vector<uint32_t>& vec) {
+        if (vec.size() != n) return;
+        std::vector<uint32_t> nv(kept, NO_DATA);
+        parallel_for(kept, [&](size_t b, size_t e, unsigned) {
+            for (size_t k = b; k < e; k++) {
+                uint32_t last = 0;
+                bool found = false;
+                for (size_t i = starts[k], end = run_end(starts, k, n); i < end; i++) {
+                    uint32_t oi = order[i];
+                    if (vec[oi] != NO_DATA && (!found || oi > last)) {
+                        last = oi;
+                        found = true;
                     }
                 }
+                if (found) nv[k] = vec[last];
             }
-
-            if (is_dup) {
-                // Map to the previous (kept) way
-                old_to_new[order[i]] = static_cast<uint32_t>(new_ways.size() - 1);
-            } else {
-                old_to_new[order[i]] = static_cast<uint32_t>(new_ways.size());
-                w.node_offset = static_cast<uint32_t>(new_nodes.size());
-                for (uint16_t j = 0; j < nc; j++)
-                    new_nodes.push_back(data.street_nodes[old_off + j]);
-                new_ways.push_back(w);
-            }
+        }, threads);
+        vec = std::move(nv);
+    };
+    remap_way_vec(data.way_parent_ids);
+    remap_way_vec(data.way_postcode_ids);
+    const std::vector<uint32_t> old_to_new = renumber_runs(order, starts, threads);
+    order = {};
+    starts = {};
+    data.ways = std::move(new_ways);
+    data.street_nodes = std::move(repacked.items);
+    renumber_cell_pairs(data.sorted_way_cells, [&](uint32_t id) { return old_to_new[id]; }, threads);
+    data.cell_to_ways.clear();
+    // Remap addr_point parent_way_id references through way old_to_new
+    parallel_for(data.addr_points.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t i = b; i < e; i++) {
+            auto& a = data.addr_points[i];
+            if (a.parent_way_id != NO_DATA && a.parent_way_id < n) a.parent_way_id = old_to_new[a.parent_way_id];
         }
-        size_t deduped = n - new_ways.size();
-        // Reorder + dedup way_osm_ids in lockstep. Must iterate in
-        // SORT order (not original order) so the FIRST sort-position
-        // mapping to each new_idx wins — matching how data.ways picks
-        // its dedup survivor above. Iterating in original order picks
-        // a different winner per build (build-encounter order is
-        // non-deterministic) and the resulting way_osm_ids[k]
-        // wouldn't match the osm_id of data.ways[k].
-        if (data.way_osm_ids.size() == n) {
-            std::vector<int64_t> new_osm(new_ways.size(), 0);
-            for (uint32_t si = 0; si < n; si++) {
-                uint32_t orig_i = order[si];
-                uint32_t new_idx = old_to_new[orig_i];
-                if (new_idx < new_osm.size() && new_osm[new_idx] == 0)
-                    new_osm[new_idx] = data.way_osm_ids[orig_i];
-            }
-            data.way_osm_ids = std::move(new_osm);
-        }
-        data.ways = std::move(new_ways);
-        data.street_nodes = std::move(new_nodes);
-        for (auto& p : data.sorted_way_cells) p.item_id = old_to_new[p.item_id];
-        auto cmp = cell_item_less;
-        std::sort(data.sorted_way_cells.begin(), data.sorted_way_cells.end(), cmp);
-        data.cell_to_ways.clear();
-        // Remap way_parent_ids + way_postcode_ids: reorder + dedup
-        auto remap_way_vec = [&](std::vector<uint32_t>& vec) {
-            if (vec.size() != n) return;
-            std::vector<uint32_t> nv(data.ways.size(), NO_DATA);
-            for (uint32_t i = 0; i < n; i++) {
-                uint32_t new_idx = old_to_new[i];
-                if (new_idx < nv.size()) {
-                    uint32_t val = vec[i];
-                    if (nv[new_idx] == NO_DATA || val != NO_DATA)
-                        nv[new_idx] = val;
-                }
-            }
-            vec = std::move(nv);
-        };
-        remap_way_vec(data.way_parent_ids);
-        remap_way_vec(data.way_postcode_ids);
-        // Remap addr_point parent_way_id references through way old_to_new
-        for (auto& a : data.addr_points) {
-            if (a.parent_way_id != NO_DATA && a.parent_way_id < n) {
-                a.parent_way_id = old_to_new[a.parent_way_id];
-            }
-        }
-        std::cerr << "  Ways sorted: " << n << " (" << deduped << " duplicates removed)" << std::endl;
-    }
+    }, threads);
+    std::cerr << "  Ways sorted: " << n << " (" << (n - kept) << " duplicates removed)" << std::endl;
 }
 
 // Sorts interps by (street, start, end, type, nodes) and reorders their nodes.
