@@ -972,8 +972,9 @@ static void emit_polyline_cells(const NodeCoord* nodes, uint16_t count, uint32_t
 }
 
 // Flat (cell_id,item_id) pair sort used by the S2 cell-computation phases
-// (street/interp ways and POIs/places): concatenates the per-worker pairs and
-// sorts them on every core. Pairs equal under cell_item_less are equal in
+// (street/interp ways and POIs/places): sorts each worker's pairs, then
+// merges them straight into sorted_out on every core, with no concatenated
+// copy and no scratch table. Pairs equal under cell_item_less are equal in
 // both fields, so the order is unique. sorted_out is used directly for
 // writing; the cell maps stay empty (only needed for cache/continent modes).
 // A sorted_out already holding as many pairs as the lists (made beside
@@ -982,15 +983,16 @@ static void parallel_sort_and_build(
     std::vector<std::vector<CellItemPair>>& thread_pairs,
     std::vector<CellItemPair>& sorted_out
 ) {
-    auto at = parallel_offsets<size_t>(thread_pairs.size(), [&](size_t t) { return thread_pairs[t].size(); });
-    if (sorted_out.size() != at.back()) sorted_out.assign(at.back(), CellItemPair{});
-    parallel_for(thread_pairs.size(), [&](size_t b, size_t e, unsigned) {
-        for (size_t t = b; t < e; t++) {
-            std::copy(thread_pairs[t].begin(), thread_pairs[t].end(), sorted_out.begin() + at[t]);
-            thread_pairs[t] = {};
-        }
+    size_t total = 0;
+    for (const auto& pairs : thread_pairs) total += pairs.size();
+    if (sorted_out.size() != total) sorted_out.assign(total, CellItemPair{});
+    parallel_for_each(thread_pairs.size(), [&](size_t t, unsigned) {
+        std::sort(thread_pairs[t].begin(), thread_pairs[t].end(), cell_item_less);
     });
-    parallel_sort(sorted_out.begin(), sorted_out.end(), cell_item_less);
+    std::vector<std::pair<CellItemPair*, size_t>> runs;
+    for (auto& pairs : thread_pairs) runs.push_back({pairs.data(), pairs.size()});
+    parallel_merge(runs, sorted_out.data(), cell_item_less);
+    parallel_for_each(thread_pairs.size(), [&](size_t t, unsigned) { thread_pairs[t] = {}; });
 }
 
 // Place-node addressline containment: for each place node, record the smallest-area
