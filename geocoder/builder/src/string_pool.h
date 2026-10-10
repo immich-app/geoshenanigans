@@ -8,12 +8,18 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "parallel.h"
 
 class StringPool {
 public:
+    // The lookup table is split so append_new can index on every core; a
+    // few shards per core keep the cores evenly loaded.
+    static constexpr size_t kShards = 256;
+    using Index = std::array<std::unordered_map<std::string, uint32_t>, kShards>;
+
     uint32_t intern(const std::string& s) {
         if (released_) throw std::logic_error("StringPool::intern after release_index");
         auto& index = index_[shard_of(s)];
@@ -71,19 +77,17 @@ public:
         return offsets;
     }
 
-    // Frees the lookup table once nothing interns any more (GiBs on planet).
-    void release_index() {
-        for (auto& index : index_) std::unordered_map<std::string, uint32_t>().swap(index);
+    // Ends interning and hands back the lookup table (GiBs on planet), for
+    // the caller to free, off the critical path if it likes.
+    Index release_index() {
         released_ = true;
+        return std::exchange(index_, {});
     }
 
     const std::vector<char>& data() const { return data_; }
     std::vector<char>& mutable_data() { return data_; }
 
 private:
-    // The lookup table is split so append_new can index on every core; a
-    // few shards per core keep the cores evenly loaded.
-    static constexpr size_t kShards = 256;
     static_assert(kShards <= 256, "append_new keeps a shard in a byte");
     static size_t shard_of(std::string_view s) { return std::hash<std::string_view>()(s) % kShards; }
 
@@ -93,7 +97,7 @@ private:
         if (size > 0xFFFFFFFFull - len - 1) throw std::runtime_error("string pool exceeds u32 offset space");
     }
 
-    std::array<std::unordered_map<std::string, uint32_t>, kShards> index_;
+    Index index_;
     std::vector<char> data_;
     bool released_ = false;
 };

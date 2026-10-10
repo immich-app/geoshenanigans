@@ -4693,14 +4693,18 @@ static int run(int argc, char* argv[]) {
 
         external_data.get();
         // The loaders above made the last intern; the lookup table would
-        // otherwise ride through ordering and the write phase.
-        data.string_pool.release_index();
+        // otherwise ride through ordering and the write phase. Freeing its
+        // planet's worth of nodes takes one core many seconds, so that runs
+        // beside the S2 pass.
+        auto index_freed = std::async(std::launch::async,
+            [index = data.string_pool.release_index()]() mutable { for (auto& shard : index) shard.clear(); });
 
         compute_s2_and_poi_cells(data, cfg, _pt, _cpu);
 
         // Resolve interpolation endpoints
         std::cerr << "Resolving interpolation endpoints..." << std::endl;
         resolve_interpolation_endpoints(data);
+        index_freed.get();
 
         // Deduplicate + convert to sorted pairs for fast writing
         log_phase("S2 cell computation", _pt, _cpu);

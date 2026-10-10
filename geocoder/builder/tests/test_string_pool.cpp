@@ -108,10 +108,18 @@ TEST(string_pool_handles_embedded_and_unicode_bytes) {
     CHECK_EQ(p.data()[w + 3], '\0');  // appended terminator
 }
 
-TEST(string_pool_release_index_keeps_data_and_refuses_interning) {
+TEST(string_pool_release_index_hands_back_the_table_keeps_data_and_refuses_interning) {
     StringPool p;
     p.intern("kept");
-    p.release_index();
+    auto index = p.release_index();
+    size_t entries = 0;
+    uint32_t kept = StringPool::kAbsent;
+    for (const auto& shard : index) {
+        entries += shard.size();
+        if (auto it = shard.find("kept"); it != shard.end()) kept = it->second;
+    }
+    CHECK_EQ(entries, size_t(1));
+    CHECK_EQ(kept, 0u);
     CHECK_EQ(read_at(p, 0), std::string("kept"));
     bool thrown = false;
     try {
