@@ -2,12 +2,15 @@
 #include "geometry.h"
 #include "country_code.h"
 #include "parallel.h"
+#include "segment_rect.h"
 
 #include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <memory>
 
+#include <s2/s2cell.h>
+#include <s2/s2coords.h>
 #include <s2/s2latlng.h>
 #include <s2/s2region_coverer.h>
 #include <s2/s2polyline.h>
@@ -24,6 +27,70 @@ SimplifyMode kSimplifyMode = SimplifyMode::MaxVertices;
 double kSimplifyEpsilonOverride = 0;
 
 // --- cover_edge ---
+
+// The cells a fixed-level S2RegionCoverer covers the edge p1-p2 with: its
+// descent, from the same starting cells, into each child the edge
+// MayIntersect()s down to the street level. The coverer spends most of an
+// edge's time in MayIntersect, so here the cell's face (u,v), where the edge
+// is a straight segment, answers it (segment_meets_rect), and the S2 test
+// runs only where rounding could flip the answer.
+static void cover_long_edge(const S2Point& p1, const S2Point& p2, std::vector<S2CellId>& out) {
+    thread_local S2RegionCoverer start_coverer = []() {
+        // What S2RegionCoverer::GetInitialCandidates starts from.
+        S2RegionCoverer::Options options;
+        options.set_max_cells(4);
+        options.set_max_level(kStreetCellLevel);
+        return S2RegionCoverer(options);
+    }();
+    // A face's (u,v) is a central projection, well conditioned only for
+    // points well inside the face's hemisphere.
+    static constexpr double kMinFaceCosine = 0.1;
+
+    std::vector<S2Point> points = {p1, p2};
+    S2Polyline polyline(points);
+    thread_local std::vector<S2CellId> start;
+    start_coverer.GetFastCovering(polyline, &start);
+
+    struct Cell { int i, j, level; };
+    thread_local std::vector<Cell> pending;
+    for (S2CellId id : start) {
+        int i, j;
+        const int face = id.ToFaceIJOrientation(&i, &j, nullptr);
+        const S2Point norm = S2::GetNorm(face);
+        const bool planar = p1.DotProd(norm) > kMinFaceCosine && p2.DotProd(norm) > kMinFaceCosine;
+        R2Point a, b;
+        if (planar) {
+            S2::ValidFaceXYZtoUV(face, p1, &a);
+            S2::ValidFaceXYZtoUV(face, p2, &b);
+        }
+        const int size = S2CellId::GetSizeIJ(id.level());
+        pending.assign(1, Cell{i & -size, j & -size, id.level()});
+        while (!pending.empty()) {
+            const Cell c = pending.back();
+            pending.pop_back();
+            const int cell_size = S2CellId::GetSizeIJ(c.level);
+            SegmentRect meets = SegmentRect::Unsure;
+            if (planar) {
+                meets = segment_meets_rect(a[0], a[1], b[0], b[1],
+                    S2::STtoUV(S2::IJtoSTMin(c.i)), S2::STtoUV(S2::IJtoSTMin(c.i + cell_size)),
+                    S2::STtoUV(S2::IJtoSTMin(c.j)), S2::STtoUV(S2::IJtoSTMin(c.j + cell_size)));
+            }
+            if (meets == SegmentRect::Disjoint) continue;
+            auto cell_id = [&] { return S2CellId::FromFaceIJ(face, c.i, c.j).parent(c.level); };
+            if (meets == SegmentRect::Unsure && !polyline.MayIntersect(S2Cell(cell_id()))) continue;
+            if (c.level >= kStreetCellLevel) {
+                out.push_back(cell_id());
+                continue;
+            }
+            const int half = cell_size >> 1;
+            for (int k = 0; k < 4; k++)
+                pending.push_back({c.i + (k & 1) * half, c.j + (k >> 1) * half, c.level + 1});
+        }
+    }
+    // The coverer's answer is a normalized cell union: sorted, each cell once.
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+}
 
 void cover_edge(S2CellId c1, S2CellId c2, double lat1, double lng1, double lat2, double lng2,
                 std::vector<S2CellId>& out) {
@@ -43,21 +110,11 @@ void cover_edge(S2CellId c1, S2CellId c2, double lat1, double lng1, double lat2,
         return;
     }
 
-    // Longer edge — use S2RegionCoverer for correctness (handles geodesic curves)
-    thread_local S2RegionCoverer coverer = []() {
-        S2RegionCoverer::Options options;
-        options.set_fixed_level(kStreetCellLevel);
-        return S2RegionCoverer(options);
-    }();
-
+    // Longer edge — cover the geodesic as S2RegionCoverer does
     S2Point p1 = S2LatLng::FromDegrees(lat1, lng1).ToPoint();
     S2Point p2 = S2LatLng::FromDegrees(lat2, lng2).ToPoint();
     if (p1 == p2) { out.push_back(c1); return; }
-
-    std::vector<S2Point> points = {p1, p2};
-    S2Polyline polyline(points);
-    S2CellUnion covering = coverer.GetCovering(polyline);
-    out = std::move(covering.cell_ids());
+    cover_long_edge(p1, p2, out);
 }
 
 
