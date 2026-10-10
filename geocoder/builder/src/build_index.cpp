@@ -232,10 +232,20 @@ static void load_tiger_data(ParsedData& data, const std::string& path, std::futu
 // Source: GeoNames GB_full (CI), the GB set Nominatim also supplements with
 // Merged into postcode_accum per country; they fill the (country, postcode)
 // pairs OSM has no centroid for (matching Nominatim's _update_from_external).
-static void load_external_postcodes(ParsedData& data, const std::string& path) {
-    std::cerr << "Loading external postcode centroids from " << path << "..." << std::endl;
-    auto _gt = std::chrono::steady_clock::now();
-    auto _gc = CpuTicks::now();
+
+// The GeoNames rows that pass their country's postcode pattern, in file order.
+struct ExternalPostcodes {
+    struct Row {
+        std::string postcode;
+        double lat, lng;
+        uint16_t cc;
+    };
+    std::vector<Row> rows;
+    uint64_t skipped = 0;  // rejected by the pattern
+};
+
+// Reads the file apart from ParsedData, so that it can overlap TIGER's load.
+static ExternalPostcodes read_external_postcodes(const std::string& path) {
     std::string cmd;
     std::string tmp_csv;
     std::optional<ScratchDir> scratch;
@@ -256,7 +266,7 @@ static void load_external_postcodes(ParsedData& data, const std::string& path) {
     std::string header;
     std::getline(f, header); // skip header
 
-    uint64_t loaded = 0, skipped = 0;
+    ExternalPostcodes out;
     std::string line;
     while (std::getline(f, line)) {
         // Parse: postcode,lat,lon,country_code
@@ -282,27 +292,41 @@ static void load_external_postcodes(ParsedData& data, const std::string& path) {
             0
         };
         if (!validate_postcode_for_country(cc_lower, postcode.c_str())) {
-            skipped++;
+            out.skipped++;
             continue;
         }
 
+        uint16_t cc = pack_country_code(static_cast<char>(std::toupper(static_cast<unsigned char>(cc_str[0]))),
+                                        static_cast<char>(std::toupper(static_cast<unsigned char>(cc_str[1]))));
+        out.rows.push_back({std::move(postcode), lat, lng, cc});
+    }
+    return out;
+}
+
+static void load_external_postcodes(ParsedData& data, const std::string& path,
+                std::future<ExternalPostcodes> pending) {
+    std::cerr << "Loading external postcode centroids from " << path << "..." << std::endl;
+    auto _gt = std::chrono::steady_clock::now();
+    auto _gc = CpuTicks::now();
+    const ExternalPostcodes external = pending.get();
+
+    uint64_t loaded = 0;
+    for (const auto& row : external.rows) {
         // Keyed by the CSV's own country: GeoNames knows which country a
         // postcode belongs to, where a centroid-based lookup mis-assigns
         // border-strip entries. A (country, postcode) TIGER already
         // provides wins; OSM pairs win at write time, as Nominatim's
         // _update_from_external adds external postcodes only when OSM has
         // none.
-        uint16_t cc = pack_country_code(static_cast<char>(std::toupper(static_cast<unsigned char>(cc_str[0]))),
-                                        static_cast<char>(std::toupper(static_cast<unsigned char>(cc_str[1]))));
-        uint64_t key = postcode_key(cc, data.string_pool.intern(postcode));
+        uint64_t key = postcode_key(row.cc, data.string_pool.intern(row.postcode));
         if (data.postcode_accum.find(key) == data.postcode_accum.end()) {
-            data.postcode_accum[key].add(lat, lng);
+            data.postcode_accum[key].add(row.lat, row.lng);
             loaded++;
         }
     }
 
     std::cerr << "  GeoNames: loaded " << loaded << " new postcodes, "
-              << skipped << " rejected by pattern, "
+              << external.skipped << " rejected by pattern, "
               << data.postcode_accum.size() << " total centroids" << std::endl;
     log_phase("  GeoNames: load", _gt, _gc);
 }
@@ -4606,13 +4630,17 @@ static int run(int argc, char* argv[]) {
 
         // TIGER and GeoNames write only the string pool, interpolations and
         // postcode centroids, none of which the parent chains read, so they
-        // load alongside them.
+        // load alongside them. The GeoNames file is read meanwhile; its rows
+        // go in after TIGER's, as they always have.
+        std::future<ExternalPostcodes> external_postcodes;
+        if (!external_postcodes_path.empty())
+            external_postcodes = std::async(std::launch::async, read_external_postcodes, external_postcodes_path);
         auto external_data = std::async(std::launch::async, [&] {
             if (!tiger_data_path.empty()) {
                 load_tiger_data(data, tiger_data_path, std::move(tiger_csvs));
             }
             if (!external_postcodes_path.empty()) {
-                load_external_postcodes(data, external_postcodes_path);
+                load_external_postcodes(data, external_postcodes_path, std::move(external_postcodes));
             }
         });
 
