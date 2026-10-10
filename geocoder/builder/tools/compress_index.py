@@ -4,7 +4,8 @@
 Usage: compress_index.py <output dir>
 
 Writes <file>.zst next to every .bin file and load sidecar under the output
-dir and records each one's raw size, compressed size and raw sha256 in
+dir (files with identical content share one .zst through hard links) and
+records each one's raw size, compressed size and raw sha256 in
 configurations.json["files"]. The .bin files stay: patch generation may still
 be reading them, so the caller removes them.
 
@@ -48,15 +49,17 @@ def index_files(out):
     return sorted(found, key=lambda p: (-os.path.getsize(p), p))
 
 
-def compress(path):
-    raw_size = os.path.getsize(path)
+def sha256(path):
     sha = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             sha.update(chunk)
-    threads = max(1, min(MAX_THREADS_PER_FILE, raw_size // BYTES_PER_THREAD))
+    return sha.hexdigest()
+
+
+def compress(path):
+    threads = max(1, min(MAX_THREADS_PER_FILE, os.path.getsize(path) // BYTES_PER_THREAD))
     subprocess.run(["zstd", LEVEL, f"-T{threads}", "-f", "--quiet", path], check=True)
-    return {"size_zst": os.path.getsize(path + ".zst"), "size_raw": raw_size, "sha256": sha.hexdigest()}
 
 
 def main():
@@ -66,14 +69,31 @@ def main():
         cfg = json.load(f)
 
     paths = index_files(out)
-    print(f"Compressing {len(paths)} files with zstd {LEVEL} on {os.cpu_count()} workers...", flush=True)
-    files = {}
     with ThreadPoolExecutor(max_workers=os.cpu_count()) as ex:
-        for path, entry in zip(paths, ex.map(compress, paths)):
-            rel = os.path.relpath(path, out)
-            files[rel] = entry
-            pct = 100 * entry["size_zst"] / entry["size_raw"] if entry["size_raw"] else 0
-            print(f"  {rel}: {entry['size_raw'] / 1e6:.0f} -> {entry['size_zst'] / 1e6:.0f} MB ({pct:.0f}%)", flush=True)
+        hashes = list(ex.map(sha256, paths))
+    # Variants share byte-identical files (e.g. full and no-addresses have
+    # the same street files, ~18% of a planet build): compress each content
+    # once and hard-link the copies' .zst to it.
+    first = {}
+    for path, digest in zip(paths, hashes):
+        first.setdefault(digest, path)
+    distinct = list(first.values())
+    print(f"Compressing {len(distinct)} distinct of {len(paths)} files with zstd {LEVEL} "
+          f"on {os.cpu_count()} workers...", flush=True)
+    with ThreadPoolExecutor(max_workers=os.cpu_count()) as ex:
+        list(ex.map(compress, distinct))
+
+    files = {}
+    for path, digest in zip(paths, hashes):
+        source = first[digest]
+        if source != path:
+            if os.path.exists(path + ".zst"):
+                os.remove(path + ".zst")
+            os.link(source + ".zst", path + ".zst")
+        rel = os.path.relpath(path, out)
+        files[rel] = {"size_zst": os.path.getsize(path + ".zst"), "size_raw": os.path.getsize(path), "sha256": digest}
+        pct = 100 * files[rel]["size_zst"] / files[rel]["size_raw"] if files[rel]["size_raw"] else 0
+        print(f"  {rel}: {files[rel]['size_raw'] / 1e6:.0f} -> {files[rel]['size_zst'] / 1e6:.0f} MB ({pct:.0f}%)")
 
     # Stable ordering for deterministic diffs.
     cfg["files"] = dict(sorted(files.items()))
