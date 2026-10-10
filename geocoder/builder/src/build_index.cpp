@@ -445,10 +445,11 @@ static std::vector<CellItemPair> items_by_cell(size_t n, unsigned int threads, C
 // workers, large enough that chunk edges rarely repeat a cell's lookup.
 static constexpr size_t kCellWalkGrain = 1024;
 
-// Items per chunk of an S2 cell pair pass: one shared counter bump per chunk
-// instead of per item (the planet's 116M POIs are mostly a single cell
-// lookup each), small enough that a chunk of costly polygons ends quickly.
-static constexpr size_t kCellPairGrain = 64;
+// Items per chunk when a pass hands items to whichever worker is free: one
+// shared counter bump per chunk instead of per item (the planet's 116M POIs
+// are mostly a single cell lookup each), small enough that a chunk of costly
+// items ends quickly.
+static constexpr size_t kItemGrain = 64;
 
 // Walks `order` (from items_by_cell) on every core: on_cell(cell, state) runs
 // on entering a cell, then on_item(item, state) for each of its items. Each
@@ -937,7 +938,7 @@ static void backfill_addr_point_parent_streets(ParsedData& data, const BuildConf
 
 // The (cell_id, item_id) pairs emit(i, scratch, out) appends for each item i
 // in [0, n), one list per worker, for parallel_sort_and_build. Items go out
-// in chunks of kCellPairGrain to whichever worker is free; each worker keeps
+// in chunks of kItemGrain to whichever worker is free; each worker keeps
 // its own Scratch and list, off the other workers' cache lines.
 template <class Scratch, class Emit>
 static std::vector<std::vector<CellItemPair>> emit_item_cells(size_t n, unsigned int threads, Emit emit) {
@@ -946,7 +947,7 @@ static std::vector<std::vector<CellItemPair>> emit_item_cells(size_t n, unsigned
         std::vector<CellItemPair> pairs;
     };
     std::vector<Worker> workers(std::max(1u, threads));
-    parallel_for_dynamic(n, kCellPairGrain, [&](size_t begin, size_t end, unsigned w) {
+    parallel_for_dynamic(n, kItemGrain, [&](size_t begin, size_t end, unsigned w) {
         Worker& worker = workers[w];
         for (size_t i = begin; i < end; i++) emit(i, worker.scratch, worker.pairs);
     }, threads);
@@ -1009,88 +1010,82 @@ static void compute_place_node_containment(ParsedData& data, const BuildConfig& 
         // pick the smallest containing polygon with a single PIP pass.
         // The cell_to_admin map has (INTERIOR_FLAG | poly_id) values —
         // strip the flag before indexing.
-        std::atomic<size_t> pn_idx{0};
-        std::atomic<uint64_t> contained_count{0};
-        std::vector<std::thread> pn_workers;
-        for (unsigned int t = 0; t < num_threads; t++) {
-            pn_workers.emplace_back([&]() {
-                std::vector<uint32_t> cand;
-                while (true) {
-                    size_t i = pn_idx.fetch_add(1);
-                    if (i >= data.place_nodes.size()) break;
-                    auto& pn = data.place_nodes[i];
-                    pn.parent_poly_id = 0xFFFFFFFFu;
-                    // Compute the node's S2 cell at the admin level
-                    // and fetch candidate polygons covering it.
-                    S2CellId cell = S2CellId(
-                        S2LatLng::FromDegrees(pn.lat, pn.lng))
-                        .parent(kAdminCellLevel);
-                    auto it = data.cell_to_admin.find(cell.id());
-                    if (it == data.cell_to_admin.end()) continue;
-                    cand.clear();
-                    cand.reserve(it->second.size());
-                    for (uint32_t id : it->second) {
-                        cand.push_back(id & ID_MASK);
-                    }
-                    // Sort candidates by ascending area so the first
-                    // PIP hit is the smallest containing polygon. Break
-                    // exact-area ties by admin osm_id: AdminPolygon.area
-                    // is float32, so distinct polygons routinely share an
-                    // area value, and an area-only sort leaves their order
-                    // to the (non-deterministic) cell_to_admin iteration
-                    // order — making parent_poly_id flip between same-PBF
-                    // builds (~33k place nodes / 1.1 MiB churn). osm_id is
-                    // build-invariant and unique, giving a total order.
-                    std::sort(cand.begin(), cand.end(),
-                              [&](uint32_t a, uint32_t b) {
-                        const auto& pa = data.admin_polygons[a];
-                        const auto& pb = data.admin_polygons[b];
-                        if (pa.area != pb.area) return pa.area < pb.area;
-                        // osm_id tiebreak (build-invariant total order); guard
-                        // the parallel-array access like every other site and
-                        // fall back to the (still-unique) poly index if the
-                        // sidecar isn't aligned.
-                        if (data.admin_osm_ids.size() == data.admin_polygons.size())
-                            return data.admin_osm_ids[a] < data.admin_osm_ids[b];
-                        return a < b;
-                    });
-                    // Pick the smallest containing admin polygon at
-                    // a rank level matching this place node's type.
-                    // Mirrors Nominatim's `current_boundary` cascading
-                    // gate: a place=neighbourhood node must be inside
-                    // the suburb-level boundary (admin_level >= 8),
-                    // not just inside the country. This prevents a
-                    // neighbourhood node 800m from the query (but
-                    // in the same country/state) from being accepted
-                    // when the query is in a different suburb.
-                    //
-                    // For city/town/village (pt 0-2): parent at L3+
-                    // For suburb/hamlet (pt 3-4): parent at L6+
-                    // For neighbourhood/quarter (pt 5-6): parent at L9+
-                    uint8_t pt = pn.place_type;
-                    uint8_t min_parent_al = (pt <= 2) ? 3 : (pt <= 4) ? 6 : 9;
-                    for (uint32_t poly_id : cand) {
-                        const auto& p = data.admin_polygons[poly_id];
-                        if (p.admin_level < min_parent_al) continue;
-                        if (p.admin_level > 10) continue; // skip postcode/place markers
-                        const NodeCoord* verts =
-                            &data.admin_vertices[p.vertex_offset];
-                        if (point_in_polygon_nc(pn.lat, pn.lng,
-                                                verts, p.vertex_count)) {
-                            pn.parent_poly_id = poly_id;
-                            contained_count.fetch_add(1);
-                            break;
-                        }
+        parallel_for_dynamic(data.place_nodes.size(), kItemGrain, [&](size_t begin, size_t end, unsigned) {
+            std::vector<uint32_t> cand;
+            for (size_t i = begin; i < end; i++) {
+                auto& pn = data.place_nodes[i];
+                pn.parent_poly_id = 0xFFFFFFFFu;
+                // Compute the node's S2 cell at the admin level
+                // and fetch candidate polygons covering it.
+                S2CellId cell = S2CellId(
+                    S2LatLng::FromDegrees(pn.lat, pn.lng))
+                    .parent(kAdminCellLevel);
+                auto it = data.cell_to_admin.find(cell.id());
+                if (it == data.cell_to_admin.end()) continue;
+                cand.clear();
+                cand.reserve(it->second.size());
+                for (uint32_t id : it->second) {
+                    cand.push_back(id & ID_MASK);
+                }
+                // Sort candidates by ascending area so the first
+                // PIP hit is the smallest containing polygon. Break
+                // exact-area ties by admin osm_id: AdminPolygon.area
+                // is float32, so distinct polygons routinely share an
+                // area value, and an area-only sort leaves their order
+                // to the (non-deterministic) cell_to_admin iteration
+                // order — making parent_poly_id flip between same-PBF
+                // builds (~33k place nodes / 1.1 MiB churn). osm_id is
+                // build-invariant and unique, giving a total order.
+                std::sort(cand.begin(), cand.end(),
+                          [&](uint32_t a, uint32_t b) {
+                    const auto& pa = data.admin_polygons[a];
+                    const auto& pb = data.admin_polygons[b];
+                    if (pa.area != pb.area) return pa.area < pb.area;
+                    // osm_id tiebreak (build-invariant total order); guard
+                    // the parallel-array access like every other site and
+                    // fall back to the (still-unique) poly index if the
+                    // sidecar isn't aligned.
+                    if (data.admin_osm_ids.size() == data.admin_polygons.size())
+                        return data.admin_osm_ids[a] < data.admin_osm_ids[b];
+                    return a < b;
+                });
+                // Pick the smallest containing admin polygon at
+                // a rank level matching this place node's type.
+                // Mirrors Nominatim's `current_boundary` cascading
+                // gate: a place=neighbourhood node must be inside
+                // the suburb-level boundary (admin_level >= 8),
+                // not just inside the country. This prevents a
+                // neighbourhood node 800m from the query (but
+                // in the same country/state) from being accepted
+                // when the query is in a different suburb.
+                //
+                // For city/town/village (pt 0-2): parent at L3+
+                // For suburb/hamlet (pt 3-4): parent at L6+
+                // For neighbourhood/quarter (pt 5-6): parent at L9+
+                uint8_t pt = pn.place_type;
+                uint8_t min_parent_al = (pt <= 2) ? 3 : (pt <= 4) ? 6 : 9;
+                for (uint32_t poly_id : cand) {
+                    const auto& p = data.admin_polygons[poly_id];
+                    if (p.admin_level < min_parent_al) continue;
+                    if (p.admin_level > 10) continue; // skip postcode/place markers
+                    const NodeCoord* verts =
+                        &data.admin_vertices[p.vertex_offset];
+                    if (point_in_polygon_nc(pn.lat, pn.lng,
+                                            verts, p.vertex_count)) {
+                        pn.parent_poly_id = poly_id;
+                        break;
                     }
                 }
-            });
-        }
-        for (auto& w : pn_workers) w.join();
+            }
+
+        }, num_threads);
+        size_t contained_count = parallel_count(data.place_nodes.size(),
+            [&](size_t i) { return data.place_nodes[i].parent_poly_id != 0xFFFFFFFFu; }, num_threads);
 
         double _pn_elapsed = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - _pn_t).count();
         std::cerr << "Place-node containment: "
-                  << contained_count.load() << "/"
+                  << contained_count << "/"
                   << data.place_nodes.size() << " nodes linked to a "
                   << "parent admin polygon in " << _pn_elapsed << "s"
                   << std::endl;
