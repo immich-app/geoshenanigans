@@ -14,6 +14,8 @@
 
 namespace {
 
+const unsigned kThreadCounts[] = {1, 3, 8, 64};
+
 struct Shape {
     size_t n = 1 << 17;
     bool osm_ids = true;      // osm id arrays parallel to their records
@@ -329,14 +331,17 @@ void check_same_strings(const ParsedData& a, const ParsedData& b) {
 
 template <class Mutate>
 void check_partition_matches_reference(uint64_t seed, size_t n_strings, size_t n_refs, Mutate mutate) {
-    ParsedData want, got;
+    ParsedData want;
     fill_strings(want, seed, n_strings, n_refs);
-    fill_strings(got, seed, n_strings, n_refs);
     mutate(want);
-    mutate(got);
     reorder_ref::partition_strings_into_tiers(want);
-    partition_strings_into_tiers(got);
-    check_same_strings(want, got);
+    for (unsigned threads : kThreadCounts) {
+        ParsedData got;
+        fill_strings(got, seed, n_strings, n_refs);
+        mutate(got);
+        partition_strings_into_tiers(got, threads);
+        check_same_strings(want, got);
+    }
 }
 
 }  // namespace

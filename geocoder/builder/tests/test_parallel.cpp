@@ -289,6 +289,39 @@ TEST(parallel_sort_handles_heavy_identical_duplicates) {
     }
 }
 
+TEST(parallel_offsets_are_exclusive_prefix_sums_for_any_thread_count) {
+    for (size_t n : {size_t(0), size_t(1), size_t(1000), size_t(200000)}) {
+        std::vector<uint64_t> expect(n + 1, 0);
+        for (size_t i = 0; i < n; i++) expect[i + 1] = expect[i] + i % 7;
+        for (unsigned threads : {1u, 3u, 64u}) {
+            auto got = parallel_offsets<uint64_t>(n, [](size_t i) { return i % 7; }, threads);
+            CHECK(got == expect);
+        }
+    }
+}
+
+TEST(parallel_filter_keeps_matching_indices_in_order) {
+    for (size_t n : {size_t(0), size_t(5), size_t(300000)}) {
+        std::vector<uint32_t> expect;
+        for (size_t i = 0; i < n; i++)
+            if (i % 3 == 1) expect.push_back(static_cast<uint32_t>(i));
+        for (unsigned threads : {1u, 4u, 64u}) {
+            std::atomic<size_t> calls{0};
+            auto got = parallel_filter(n, [&](size_t i) { calls++; return i % 3 == 1; }, threads);
+            CHECK(got == expect);
+            CHECK_EQ(calls.load(), n);
+        }
+    }
+}
+
+TEST(parallel_any_finds_a_single_match) {
+    for (unsigned threads : {1u, 3u, 64u}) {
+        CHECK(parallel_any(100000, [](size_t i) { return i == 99999; }, threads));
+        CHECK(!parallel_any(100000, [](size_t) { return false; }, threads));
+        CHECK(!parallel_any(0, [](size_t) { return true; }, threads));
+    }
+}
+
 TEST(parallel_sort_small_and_presorted_inputs) {
     for (size_t n : {size_t(0), size_t(1), size_t(2), size_t(70000), size_t(300000)}) {
         std::vector<uint64_t> asc(n), desc(n);

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <iostream>
 #include <mutex>
@@ -22,6 +23,7 @@
 #include "types.h"
 #include "string_pool.h"
 #include "id_allocator.h"
+#include "parallel.h"
 
 // The records one POI tier's files carry, in record order, and how many of
 // them are tombstones. A tombstone only goes to the tiers that held its
@@ -362,6 +364,70 @@ struct ParsedData {
     }
 };
 
+// Offset -> string index over a pool of NUL-terminated strings: one start bit
+// per pool byte, ranked per 64-byte block. Marking and remapping visit every
+// string reference of the planet (~1e9), so a lookup is one block load where
+// a hash map probe would miss the cache several times.
+class StringStarts {
+public:
+    static constexpr size_t npos = SIZE_MAX;
+
+    explicit StringStarts(const std::vector<char>& pool, unsigned threads = 0)
+        : size_(pool.size()), blocks_((pool.size() + 63) / 64) {
+        const char* p = pool.data();
+        parallel_for(blocks_.size(), [&](size_t b0, size_t b1, unsigned) {
+            for (size_t b = b0; b < b1; b++) {
+                uint64_t bits = 0;
+                for (size_t off = b * 64, end = std::min(size_, off + 64); off < end; off++)
+                    if (off == 0 || p[off - 1] == '\0') bits |= uint64_t(1) << (off & 63);
+                blocks_[b].bits = bits;
+            }
+        }, threads);
+        // A pool under 4 GiB holds fewer than 2^32 strings.
+        auto ranks = parallel_offsets<uint32_t>(blocks_.size(), [&](size_t b) {
+            return static_cast<uint32_t>(__builtin_popcountll(blocks_[b].bits));
+        }, threads);
+        parallel_for(blocks_.size(), [&](size_t b0, size_t b1, unsigned) {
+            for (size_t b = b0; b < b1; b++) blocks_[b].rank = ranks[b];
+        }, threads);
+        count_ = ranks.back();
+    }
+
+    size_t count() const { return count_; }
+
+    // Index of the string starting at off (in pool order), or npos when no
+    // string starts there.
+    size_t index(uint32_t off) const {
+        if (off >= size_) return npos;
+        const Block& b = blocks_[off >> 6];
+        uint64_t bit = uint64_t(1) << (off & 63);
+        if (!(b.bits & bit)) return npos;
+        return b.rank + static_cast<size_t>(__builtin_popcountll(b.bits & (bit - 1)));
+    }
+
+    // The start offset of every string, by index.
+    std::vector<uint32_t> offsets(unsigned threads = 0) const {
+        std::vector<uint32_t> out(count_);
+        parallel_for(blocks_.size(), [&](size_t b0, size_t b1, unsigned) {
+            for (size_t b = b0; b < b1; b++) {
+                size_t s = blocks_[b].rank;
+                for (uint64_t bits = blocks_[b].bits; bits; bits &= bits - 1)
+                    out[s++] = static_cast<uint32_t>(b * 64 + __builtin_ctzll(bits));
+            }
+        }, threads);
+        return out;
+    }
+
+private:
+    struct Block {
+        uint64_t bits;
+        uint32_t rank;  // strings starting before this block
+    };
+    size_t size_;
+    std::vector<Block> blocks_;
+    size_t count_ = 0;
+};
+
 // Partition the string pool in `data` into 5 per-consumer tiers, sorting
 // alphabetically within each, and remap all record name_id fields to the
 // new globally-contiguous offset space. Used by both the canonical sort
@@ -372,90 +438,120 @@ struct ParsedData {
 // and `data.string_pool.mutable_data()` is replaced with a concat view
 // of the tier buffers (so legacy `string_pool.data().data() + off` reads
 // continue to work for global offsets).
-inline void partition_strings_into_tiers(ParsedData& data) {
+inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0) {
     auto& pool_data = data.string_pool.mutable_data();
     if (pool_data.empty()) {
         data.strings_tiers = {};
         data.strings_tier_bases = {};
         return;
     }
-    std::vector<std::pair<uint32_t, const char*>> strings;
-    size_t pos = 0;
-    while (pos < pool_data.size()) {
-        strings.emplace_back(static_cast<uint32_t>(pos), pool_data.data() + pos);
-        pos += strlen(pool_data.data() + pos) + 1;
-    }
+    const char* pool = pool_data.data();
+    const StringStarts starts(pool_data, threads);
+    const size_t n = starts.count();
 
-    std::unordered_map<uint32_t, uint8_t> tier_mask;
-    tier_mask.reserve(strings.size());
-    auto mark = [&](uint32_t off, uint8_t bit) {
-        if (off == NO_DATA) return;
-        tier_mask[off] |= bit;
-    };
+    std::vector<uint8_t> tier(n);
+    {
+        std::vector<std::atomic<uint8_t>> mask(n);
+        auto mark = [&](uint32_t off, uint8_t bit) {
+            if (off == NO_DATA) return;
+            size_t s = starts.index(off);
+            if (s == StringStarts::npos) return;
+            // Load first: a hot string (house number "1") would otherwise
+            // bounce its cache line between every core.
+            if (!(mask[s].load(std::memory_order_relaxed) & bit))
+                mask[s].fetch_or(bit, std::memory_order_relaxed);
+        };
+        auto mark_each = [&](size_t count, auto&& mark_one) {
+            parallel_for(count, [&](size_t b, size_t e, unsigned) {
+                for (size_t i = b; i < e; i++) mark_one(i);
+            }, threads);
+        };
+        auto shipped = [](const PoiRecord& pr) { return pr.tier <= POI_MAX_SHIPPED_TIER; };
 
-    for (const auto& ap : data.admin_polygons) mark(ap.name_id, STR_TIER_BIT_CORE);
-    for (const auto& pn : data.place_nodes)    mark(pn.name_id, STR_TIER_BIT_CORE);
+        mark_each(data.admin_polygons.size(), [&](size_t i) { mark(data.admin_polygons[i].name_id, STR_TIER_BIT_CORE); });
+        mark_each(data.place_nodes.size(), [&](size_t i) { mark(data.place_nodes[i].name_id, STR_TIER_BIT_CORE); });
 
-    for (const auto& w : data.ways)            mark(w.name_id, STR_TIER_BIT_STREET);
-    for (uint32_t id : data.way_orig_name_ids) mark(id, STR_TIER_BIT_STREET);
-    for (const auto& a : data.addr_points)     mark(a.street_id, STR_TIER_BIT_STREET);
-    for (const auto& iw : data.interp_ways)    mark(iw.street_id, STR_TIER_BIT_STREET);
-    auto shipped = [](const PoiRecord& pr) { return pr.tier <= POI_MAX_SHIPPED_TIER; };
-    for (const auto& pr : data.poi_records)
-        mark(pr.parent_street_id, shipped(pr) ? STR_TIER_BIT_STREET : STR_TIER_BIT_UNSHIPPED);
+        mark_each(data.ways.size(), [&](size_t i) { mark(data.ways[i].name_id, STR_TIER_BIT_STREET); });
+        mark_each(data.way_orig_name_ids.size(), [&](size_t i) { mark(data.way_orig_name_ids[i], STR_TIER_BIT_STREET); });
+        mark_each(data.addr_points.size(), [&](size_t i) {
+            mark(data.addr_points[i].street_id, STR_TIER_BIT_STREET);
+            mark(data.addr_points[i].housenumber_id, STR_TIER_BIT_ADDR);
+        });
+        mark_each(data.interp_ways.size(), [&](size_t i) { mark(data.interp_ways[i].street_id, STR_TIER_BIT_STREET); });
 
-    for (const auto& a : data.addr_points) mark(a.housenumber_id, STR_TIER_BIT_ADDR);
+        mark_each(data.way_postcode_ids.size(), [&](size_t i) { mark(data.way_postcode_ids[i], STR_TIER_BIT_POSTCODE); });
+        mark_each(data.interp_postcode_ids.size(), [&](size_t i) { mark(data.interp_postcode_ids[i], STR_TIER_BIT_POSTCODE); });
+        mark_each(data.addr_postcode_ids.size(), [&](size_t i) { mark(data.addr_postcode_ids[i], STR_TIER_BIT_POSTCODE); });
+        for (const auto& [key, _acc] : data.postcode_accum) mark(postcode_key_pc(key), STR_TIER_BIT_POSTCODE);
 
-    for (uint32_t pc : data.way_postcode_ids)  mark(pc, STR_TIER_BIT_POSTCODE);
-    for (uint32_t pc : data.interp_postcode_ids) mark(pc, STR_TIER_BIT_POSTCODE);
-    for (uint32_t pc : data.addr_postcode_ids) mark(pc, STR_TIER_BIT_POSTCODE);
-    for (const auto& [key, _acc] : data.postcode_accum) mark(postcode_key_pc(key), STR_TIER_BIT_POSTCODE);
-    for (const auto& pr : data.poi_records)
-        mark(pr.parent_postcode_id, shipped(pr) ? STR_TIER_BIT_POSTCODE : STR_TIER_BIT_UNSHIPPED);
-
-    for (const auto& pr : data.poi_records)
-        mark(pr.name_id, shipped(pr) ? STR_TIER_BIT_POI : STR_TIER_BIT_UNSHIPPED);
-
-    auto home_tier = [&](uint32_t old_off) -> uint8_t {
-        auto it = tier_mask.find(old_off);
-        return string_home_tier(it != tier_mask.end() ? it->second : 0);
-    };
-
-    // Strings only unshipped records use aren't written; their references
-    // become NO_DATA below like any offset missing from the layout.
-    strings.erase(std::remove_if(strings.begin(), strings.end(),
-                                 [&](const auto& s) { return home_tier(s.first) == STR_TIER_NONE; }),
-                  strings.end());
-    std::sort(strings.begin(), strings.end(),
-        [&](const auto& a, const auto& b) {
-            uint8_t ta = home_tier(a.first), tb = home_tier(b.first);
-            if (ta != tb) return ta < tb;
-            return strcmp(a.second, b.second) < 0;
+        mark_each(data.poi_records.size(), [&](size_t i) {
+            const auto& pr = data.poi_records[i];
+            mark(pr.parent_street_id, shipped(pr) ? STR_TIER_BIT_STREET : STR_TIER_BIT_UNSHIPPED);
+            mark(pr.parent_postcode_id, shipped(pr) ? STR_TIER_BIT_POSTCODE : STR_TIER_BIT_UNSHIPPED);
+            mark(pr.name_id, shipped(pr) ? STR_TIER_BIT_POI : STR_TIER_BIT_UNSHIPPED);
         });
 
-    std::array<std::vector<char>, STR_TIER_COUNT> tier_bufs;
-    for (auto& b : tier_bufs) b.clear();
-    std::unordered_map<uint32_t, uint32_t> remap;
-    remap.reserve(strings.size());
+        parallel_for(n, [&](size_t b, size_t e, unsigned) {
+            for (size_t s = b; s < e; s++) tier[s] = string_home_tier(mask[s].load(std::memory_order_relaxed));
+        }, threads);
+    }
 
-    uint32_t global_off = 0;
-    std::array<uint32_t, STR_TIER_COUNT + 1> bases{};
-    size_t cur_tier = 0;
-    for (auto& [old_off, str] : strings) {
-        uint8_t t = home_tier(old_off);
-        while (cur_tier < t) {
-            bases[cur_tier + 1] = global_off;
-            cur_tier++;
+    // Each tier's string offsets in alphabetical order. Strings only
+    // unshipped records use aren't written; their references become NO_DATA
+    // below like any offset missing from the layout.
+    std::array<std::vector<uint32_t>, STR_TIER_COUNT> sorted;
+    {
+        const std::vector<uint32_t> offsets = starts.offsets(threads);
+        auto str_less = [pool](uint32_t a, uint32_t b) { return strcmp(pool + a, pool + b) < 0; };
+        bool unique = true;
+        for (size_t t = 0; t < STR_TIER_COUNT && unique; t++) {
+            auto& list = sorted[t];
+            list = parallel_filter(n, [&](size_t s) { return tier[s] == t; }, threads);
+            parallel_for(list.size(), [&](size_t b, size_t e, unsigned) {
+                for (size_t k = b; k < e; k++) list[k] = offsets[list[k]];
+            }, threads);
+            parallel_sort(list.begin(), list.end(), str_less, threads);
+            unique = !parallel_any(list.size() > 1 ? list.size() - 1 : 0, [&](size_t k) {
+                return strcmp(pool + list[k], pool + list[k + 1]) == 0;
+            }, threads);
         }
-        remap[old_off] = global_off;
-        size_t len = strlen(str);
-        tier_bufs[t].insert(tier_bufs[t].end(), str, str + len + 1);
-        global_off += static_cast<uint32_t>(len + 1);
+        if (!unique) {
+            // Interning keeps the pool unique, but should a string repeat,
+            // std::sort's tie order is part of the layout: sort exactly as
+            // the serial pass always has.
+            std::vector<uint32_t> all = parallel_filter(n, [&](size_t s) { return tier[s] != STR_TIER_NONE; }, threads);
+            for (auto& s : all) s = offsets[s];
+            auto tier_of = [&](uint32_t off) { return tier[starts.index(off)]; };
+            std::sort(all.begin(), all.end(), [&](uint32_t a, uint32_t b) {
+                uint8_t ta = tier_of(a), tb = tier_of(b);
+                if (ta != tb) return ta < tb;
+                return strcmp(pool + a, pool + b) < 0;
+            });
+            auto at = all.begin();
+            for (size_t t = 0; t < STR_TIER_COUNT; t++) {
+                auto end = std::find_if(at, all.end(), [&](uint32_t off) { return tier_of(off) != t; });
+                sorted[t].assign(at, end);
+                at = end;
+            }
+        }
     }
-    while (cur_tier < STR_TIER_COUNT) {
-        bases[cur_tier + 1] = global_off;
-        cur_tier++;
+
+    std::array<std::vector<char>, STR_TIER_COUNT> tier_bufs;
+    std::array<uint32_t, STR_TIER_COUNT + 1> bases{};
+    std::vector<uint32_t> new_off(n);
+    for (size_t t = 0; t < STR_TIER_COUNT; t++) {
+        const auto& list = sorted[t];
+        auto at = parallel_offsets<size_t>(list.size(), [&](size_t k) { return strlen(pool + list[k]) + 1; }, threads);
+        tier_bufs[t].resize(at.back());
+        parallel_for(list.size(), [&](size_t b, size_t e, unsigned) {
+            for (size_t k = b; k < e; k++) {
+                std::memcpy(tier_bufs[t].data() + at[k], pool + list[k], at[k + 1] - at[k]);
+                new_off[starts.index(list[k])] = bases[t] + static_cast<uint32_t>(at[k]);
+            }
+        }, threads);
+        bases[t + 1] = bases[t] + static_cast<uint32_t>(at.back());
     }
+    const uint32_t global_off = bases[STR_TIER_COUNT];
 
     data.strings_tiers = std::move(tier_bufs);
     data.strings_tier_bases = bases;
@@ -470,45 +566,50 @@ inline void partition_strings_into_tiers(ParsedData& data) {
             data.strings_tiers[t].begin(), data.strings_tiers[t].end());
     }
 
-    const auto& rm = remap;
-    auto remap_one = [&](uint32_t& off) {
-        if (off == NO_DATA) return;
-        auto it = rm.find(off);
-        if (it != rm.end()) off = it->second;
-        else off = NO_DATA;
+    auto new_offset = [&](uint32_t off) -> uint32_t {
+        if (off == NO_DATA) return NO_DATA;
+        size_t s = starts.index(off);
+        return s == StringStarts::npos || tier[s] == STR_TIER_NONE ? NO_DATA : new_off[s];
     };
-    for (auto& w : data.ways) remap_one(w.name_id);
+    auto remap_each = [&](size_t count, auto&& remap_one) {
+        parallel_for(count, [&](size_t b, size_t e, unsigned) {
+            for (size_t i = b; i < e; i++) remap_one(i);
+        }, threads);
+    };
+    auto remap_vec = [&](std::vector<uint32_t>& v) {
+        remap_each(v.size(), [&](size_t i) { v[i] = new_offset(v[i]); });
+    };
+    remap_each(data.ways.size(), [&](size_t i) { data.ways[i].name_id = new_offset(data.ways[i].name_id); });
     data.way_orig_name_ids = {};
-    for (auto& a : data.addr_points) {
-        remap_one(a.housenumber_id);
-        remap_one(a.street_id);
-    }
-    for (auto& iw : data.interp_ways) remap_one(iw.street_id);
-    for (auto& ap : data.admin_polygons) remap_one(ap.name_id);
-    for (auto& pr : data.poi_records) {
-        remap_one(pr.name_id);
-        remap_one(pr.parent_street_id);
-        remap_one(pr.parent_postcode_id);
-    }
-    for (auto& pn : data.place_nodes) remap_one(pn.name_id);
-    auto remap_pc_vec = [&](std::vector<uint32_t>& v) {
-        for (auto& pc : v) {
-            if (pc != NO_DATA) {
-                auto it = rm.find(pc);
-                if (it != rm.end()) pc = it->second;
-                else pc = NO_DATA;
-            }
-        }
-    };
-    remap_pc_vec(data.way_postcode_ids);
-    remap_pc_vec(data.addr_postcode_ids);
-    remap_pc_vec(data.interp_postcode_ids);
+    remap_each(data.addr_points.size(), [&](size_t i) {
+        auto& a = data.addr_points[i];
+        a.housenumber_id = new_offset(a.housenumber_id);
+        a.street_id = new_offset(a.street_id);
+    });
+    remap_each(data.interp_ways.size(), [&](size_t i) {
+        data.interp_ways[i].street_id = new_offset(data.interp_ways[i].street_id);
+    });
+    remap_each(data.admin_polygons.size(), [&](size_t i) {
+        data.admin_polygons[i].name_id = new_offset(data.admin_polygons[i].name_id);
+    });
+    remap_each(data.poi_records.size(), [&](size_t i) {
+        auto& pr = data.poi_records[i];
+        pr.name_id = new_offset(pr.name_id);
+        pr.parent_street_id = new_offset(pr.parent_street_id);
+        pr.parent_postcode_id = new_offset(pr.parent_postcode_id);
+    });
+    remap_each(data.place_nodes.size(), [&](size_t i) {
+        data.place_nodes[i].name_id = new_offset(data.place_nodes[i].name_id);
+    });
+    remap_vec(data.way_postcode_ids);
+    remap_vec(data.addr_postcode_ids);
+    remap_vec(data.interp_postcode_ids);
     {
         std::unordered_map<uint64_t, ParsedData::PostcodeAccum> remapped;
         remapped.reserve(data.postcode_accum.size());
         for (auto& [key, acc] : data.postcode_accum) {
-            auto it = rm.find(postcode_key_pc(key));
-            if (it != rm.end()) remapped[postcode_key(postcode_key_cc(key), it->second)] = acc;
+            uint32_t pc = new_offset(postcode_key_pc(key));
+            if (pc != NO_DATA) remapped[postcode_key(postcode_key_cc(key), pc)] = acc;
         }
         data.postcode_accum = std::move(remapped);
     }

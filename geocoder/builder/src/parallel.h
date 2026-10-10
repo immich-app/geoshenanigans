@@ -5,8 +5,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <exception>
 #include <iterator>
 #include <memory>
@@ -334,4 +336,75 @@ void parallel_sort(It first, It last, Cmp cmp, unsigned threads = 0) {
     parallel_for(n, [&](size_t b, size_t e, unsigned) {
         std::move(out.get() + b, out.get() + e, first + b);
     }, threads);
+}
+
+// Splits [0, n) into at most `threads` blocks and runs fn(block, begin, end)
+// for each on its own thread; returns the block count. The blocks depend
+// only on n and the thread count, so two calls see the same blocks.
+template <class Fn>
+size_t parallel_blocks(size_t n, Fn&& fn, unsigned threads = 0) {
+    constexpr size_t kMinPerBlock = size_t(1) << 14;
+    if (threads == 0) threads = parallel_threads();
+    size_t blocks = std::max<size_t>(1, std::min<size_t>(threads, n / kMinPerBlock));
+    parallel_for(blocks, [&](size_t b0, size_t b1, unsigned) {
+        for (size_t b = b0; b < b1; b++) fn(b, n * b / blocks, n * (b + 1) / blocks);
+    }, threads);
+    return blocks;
+}
+
+// Exclusive prefix sums of size_of(i) over [0, n), plus the total as entry
+// n. size_of runs once per index. Integer sums, so the blocking can't reach
+// the result.
+template <class T, class SizeOf>
+std::vector<T> parallel_offsets(size_t n, SizeOf size_of, unsigned threads = 0) {
+    if (threads == 0) threads = parallel_threads();
+    std::vector<T> out(n + 1);
+    std::vector<T> block_base(threads + 1, T(0));
+    size_t blocks = parallel_blocks(n, [&](size_t b, size_t begin, size_t end) {
+        T sum = 0;
+        for (size_t i = begin; i < end; i++) {
+            out[i] = sum;
+            sum += size_of(i);
+        }
+        block_base[b + 1] = sum;
+    }, threads);
+    for (size_t b = 0; b < blocks; b++) block_base[b + 1] += block_base[b];
+    parallel_blocks(n, [&](size_t b, size_t begin, size_t end) {
+        if (T base = block_base[b])
+            for (size_t i = begin; i < end; i++) out[i] += base;
+    }, threads);
+    out[n] = block_base[blocks];
+    return out;
+}
+
+// The indices i in [0, n) where keep(i), ascending. keep runs once per index.
+template <class Keep>
+std::vector<uint32_t> parallel_filter(size_t n, Keep keep, unsigned threads = 0) {
+    if (threads == 0) threads = parallel_threads();
+    std::vector<std::vector<uint32_t>> kept(threads);
+    size_t blocks = parallel_blocks(n, [&](size_t b, size_t begin, size_t end) {
+        for (size_t i = begin; i < end; i++)
+            if (keep(i)) kept[b].push_back(static_cast<uint32_t>(i));
+    }, threads);
+    std::vector<size_t> at(blocks + 1, 0);
+    for (size_t b = 0; b < blocks; b++) at[b + 1] = at[b] + kept[b].size();
+    std::vector<uint32_t> out(at[blocks]);
+    parallel_for(blocks, [&](size_t b0, size_t b1, unsigned) {
+        for (size_t b = b0; b < b1; b++) {
+            std::copy(kept[b].begin(), kept[b].end(), out.begin() + at[b]);
+            kept[b] = {};
+        }
+    }, threads);
+    return out;
+}
+
+// Whether pred(i) holds for any i in [0, n).
+template <class Pred>
+bool parallel_any(size_t n, Pred pred, unsigned threads = 0) {
+    std::atomic<bool> found{false};
+    parallel_for(n, [&](size_t begin, size_t end, unsigned) {
+        for (size_t i = begin; i < end && !found.load(std::memory_order_relaxed); i++)
+            if (pred(i)) found.store(true, std::memory_order_relaxed);
+    }, threads);
+    return found.load();
 }
