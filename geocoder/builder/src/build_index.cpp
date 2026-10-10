@@ -52,6 +52,7 @@ inline uint64_t pack_osm_id(gc::id_alloc::ObjectType type, int64_t osm_id) {
 #include "cache.h"
 #include "continent_filter.h"
 #include "cell_index.h"
+#include "parent_linking.h"
 #include "admin_rank_config.h"
 #include "scratch_dir.h"
 #include "tiger.h"
@@ -409,18 +410,10 @@ static void compute_admin_parent_chain(ParsedData& data, const BuildConfig& cfg)
                             // Prefer highest admin_level (closest parent)
                             if (cand.admin_level < best_al) continue;
                             if (cand.admin_level == best_al && cand.area >= best_area) continue;
-                            // PIP check
                             uint32_t off = cand.vertex_offset;
                             uint32_t cnt = cand.vertex_count;
                             if (off + cnt > data.admin_vertices.size()) continue;
-                            const auto* verts = &data.admin_vertices[off];
-                            bool inside = false;
-                            for (uint32_t a = 0, b = cnt - 1; a < cnt; b = a++) {
-                                if (((verts[a].lng > clng) != (verts[b].lng > clng)) &&
-                                    (clat < (verts[b].lat - verts[a].lat) * (clng - verts[a].lng) / (verts[b].lng - verts[a].lng) + verts[a].lat))
-                                    inside = !inside;
-                            }
-                            if (inside) {
+                            if (ring_contains(&data.admin_vertices[off], cnt, clat, clng)) {
                                 best_al = cand.admin_level;
                                 best_area = cand.area;
                                 best_id = pid;
@@ -522,14 +515,7 @@ static void compute_way_parent_polygons(ParsedData& data, const BuildConfig& cfg
                         uint32_t off = cand.vertex_offset;
                         uint32_t cnt2 = cand.vertex_count;
                         if (off + cnt2 > data.admin_vertices.size()) return false;
-                        const auto* verts = &data.admin_vertices[off];
-                        bool inside = false;
-                        for (uint32_t a = 0, b = cnt2 - 1; a < cnt2; b = a++) {
-                            if (((verts[a].lng > plng) != (verts[b].lng > plng)) &&
-                                (plat < (verts[b].lat - verts[a].lat) * (plng - verts[a].lng) / (verts[b].lng - verts[a].lng) + verts[a].lat))
-                                inside = !inside;
-                        }
-                        return inside;
+                        return ring_contains(&data.admin_vertices[off], cnt2, plat, plng);
                     };
                     // Parent-chain pick still uses centroid PIP —
                     // admin hierarchy is fine-grained enough that
@@ -1307,14 +1293,7 @@ static uint64_t link_poi_smallest_admin(ParsedData& data, unsigned int num_threa
                         uint32_t off = cand.vertex_offset;
                         uint32_t cnt2 = cand.vertex_count;
                         if (off + cnt2 > data.admin_vertices.size()) continue;
-                        const auto* verts = &data.admin_vertices[off];
-                        bool inside = false;
-                        for (uint32_t a = 0, b = cnt2 - 1; a < cnt2; b = a++) {
-                            if (((verts[a].lng > plng) != (verts[b].lng > plng)) &&
-                                (plat < (verts[b].lat - verts[a].lat) * (plng - verts[a].lng) / (verts[b].lng - verts[a].lng) + verts[a].lat))
-                                inside = !inside;
-                        }
-                        if (inside) {
+                        if (ring_contains(&data.admin_vertices[off], cnt2, plat, plng)) {
                             best_area = cand.area;
                             best_pid = pid;
                         }
