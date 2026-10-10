@@ -102,6 +102,20 @@ inline uint64_t make_key(ObjectType t, uint64_t id) {
     return (static_cast<uint64_t>(t) << 56) | (id & 0x00FFFFFFFFFFFFFFull);
 }
 
+// A key and the slot or record holding it, packed to 12 bytes: allocate_all
+// sorts arrays of these as long as the slot table and the records.
+#pragma pack(push, 4)
+struct KeyIdx {
+    uint64_t key;
+    uint32_t idx;
+};
+#pragma pack(pop)
+static_assert(sizeof(KeyIdx) == 12, "KeyIdx must be 12 bytes");
+
+// Records allocate_all matches per pass: it sorts one pass's keys at a time,
+// so the records' sorted keys never all exist at once.
+constexpr size_t kRecordsPerMatchPass = size_t(1) << 24;
+
 // One record's stable identity, as allocate_all asks for it. `tier` is
 // stamped on the slot whichever way the record gets it (a live POI can
 // change tier between days); other kinds leave it 0.
@@ -145,14 +159,15 @@ public:
     // share an identity, the lowest slot when several slots do), every other
     // record recycles the free-list from the back, then appends.
     // identity(i) returns record i's SlotIdentity. Matching identities to
-    // slots is two sorts and a merge on every core; only the hand-out of
-    // recycled and new slots walks the records in order. Once per allocator.
+    // slots is sorts and merges on every core, the records a pass of
+    // records_per_pass at a time; only the hand-out of recycled and new
+    // slots walks the records in order. Once per allocator.
     template <class Identity>
-    std::vector<uint32_t> allocate_all(size_t n, Identity identity) {
+    std::vector<uint32_t> allocate_all(size_t n, Identity identity,
+                                       size_t records_per_pass = kRecordsPerMatchPass) {
         if (allocated_) throw std::logic_error("IdAllocator::allocate_all called twice");
         allocated_ = true;
 
-        struct KeyIdx { uint64_t key; uint32_t idx; };
         auto by_key = [](const KeyIdx& a, const KeyIdx& b) {
             return a.key != b.key ? a.key < b.key : a.idx < b.idx;
         };
@@ -160,6 +175,7 @@ public:
         // The previous build's live identities; of a repeated key only the
         // lowest slot can be reclaimed, the others stay as they are.
         std::vector<KeyIdx> prev;
+        prev.reserve(slots_.size());
         for (uint32_t i = 0; i < slots_.size(); i++) {
             const SidecarSlot& s = slots_[i];
             if (is_tombstone(s) || s.object_type == static_cast<uint8_t>(ObjectType::NONE)) continue;
@@ -174,27 +190,37 @@ public:
         std::vector<uint32_t> out(n, kUnmatched);
         std::vector<char> claimed(prev.size(), 0);
         {
-            std::vector<KeyIdx> records(n);
-            parallel_for(n, [&](size_t begin, size_t end, unsigned) {
-                for (size_t i = begin; i < end; i++) {
-                    SlotIdentity id = identity(i);
-                    records[i] = {make_key(id.type, id.stable_id), static_cast<uint32_t>(i)};
-                }
-            });
-            parallel_sort(records.begin(), records.end(), by_key);
             // The first record of each key (lowest index) takes the slot.
-            parallel_for_runs(n, [&](size_t i) { return records[i].key == records[i - 1].key; },
-                              [&](size_t begin, size_t end, unsigned) {
-                auto p = std::lower_bound(prev.begin(), prev.end(), records[begin].key,
-                                          [](const KeyIdx& e, uint64_t key) { return e.key < key; });
-                for (size_t r = begin; r < end && p != prev.end(); r++) {
-                    if (r > begin && records[r].key == records[r - 1].key) continue;
-                    while (p != prev.end() && p->key < records[r].key) ++p;
-                    if (p == prev.end() || p->key != records[r].key) continue;
-                    out[records[r].idx] = p->idx;
-                    claimed[p - prev.begin()] = 1;
-                }
-            });
+            // Passes go in index order, so a key an earlier pass claimed
+            // belongs to an earlier record.
+            records_per_pass = std::max<size_t>(records_per_pass, 1);
+            std::vector<KeyIdx> records;
+            for (size_t first = 0; first < n; first += records_per_pass) {
+                const size_t count = std::min(records_per_pass, n - first);
+                records.resize(count);
+                parallel_for(count, [&](size_t begin, size_t end, unsigned) {
+                    for (size_t k = begin; k < end; k++) {
+                        SlotIdentity id = identity(first + k);
+                        records[k] = {make_key(id.type, id.stable_id), static_cast<uint32_t>(first + k)};
+                    }
+                });
+                parallel_sort(records.begin(), records.end(), by_key);
+                parallel_for_runs(count, [&](size_t i) { return records[i].key == records[i - 1].key; },
+                                  [&](size_t begin, size_t end, unsigned) {
+                    // By value: the packed key is only 4-byte aligned, so
+                    // lower_bound's const& must not bind to it.
+                    uint64_t first_key = records[begin].key;
+                    auto p = std::lower_bound(prev.begin(), prev.end(), first_key,
+                                              [](const KeyIdx& e, uint64_t key) { return e.key < key; });
+                    for (size_t r = begin; r < end && p != prev.end(); r++) {
+                        if (r > begin && records[r].key == records[r - 1].key) continue;
+                        while (p != prev.end() && p->key < records[r].key) ++p;
+                        if (p == prev.end() || p->key != records[r].key || claimed[p - prev.begin()]) continue;
+                        out[records[r].idx] = p->idx;
+                        claimed[p - prev.begin()] = 1;
+                    }
+                });
+            }
         }
 
         for (size_t i = 0; i < n; i++) {

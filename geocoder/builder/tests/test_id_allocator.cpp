@@ -15,8 +15,9 @@
 using namespace gc::id_alloc;
 
 // allocate_all over a list of identities, in list order.
-static std::vector<uint32_t> allocate_list(IdAllocator& a, const std::vector<SlotIdentity>& ids) {
-    return a.allocate_all(ids.size(), [&](size_t i) { return ids[i]; });
+static std::vector<uint32_t> allocate_list(IdAllocator& a, const std::vector<SlotIdentity>& ids,
+                                           size_t records_per_pass = kRecordsPerMatchPass) {
+    return a.allocate_all(ids.size(), [&](size_t i) { return ids[i]; }, records_per_pass);
 }
 
 TEST(make_key_packs_type_in_high_byte) {
@@ -368,7 +369,9 @@ TEST(allocate_all_matches_one_at_a_time_allocation) {
                 IdAllocator::write_sidecar(path, prev);
                 REQUIRE(a.load_previous(path));
             }
-            const auto got = allocate_list(a, ids);
+            // Matching in passes too small to hold a key's every record.
+            const size_t per_pass = round % 3 == 0 ? kRecordsPerMatchPass : 1 + rng() % (large ? 50000 : 40);
+            const auto got = allocate_list(a, ids, per_pass);
             a.finalize();
             const std::vector<SidecarSlot> got_slots = a.take_slots();
             CHECK(got == want);
