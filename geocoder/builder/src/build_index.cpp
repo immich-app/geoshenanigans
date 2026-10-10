@@ -388,6 +388,13 @@ public:
         return ring_contains(&data_.admin_vertices[p.vertex_offset], p.vertex_count, lat, lng);
     }
 
+    // The first of `ranked` (see rank_candidates) containing the point, or NO_DATA.
+    uint32_t first_containing(const std::vector<uint32_t>& ranked, float lat, float lng) const {
+        for (uint32_t pid : ranked)
+            if (contains(pid, lat, lng)) return pid;
+        return NO_DATA;
+    }
+
 private:
     const ParsedData& data_;
     std::vector<RingBox> boxes_;
@@ -422,6 +429,43 @@ static void for_each_admin_candidate(const ParsedData& data, S2CellId cell,
 static void require_ordered_admin_areas(const ParsedData& data) {
     for (const auto& p : data.admin_polygons)
         if (std::isnan(p.area)) throw std::runtime_error("Admin polygon area is NaN");
+}
+
+// Items 0..n-1 as (cell_of(i), i) pairs sorted by cell then item, so a pass
+// that looks around each item's cell can walk a cell's items together and
+// share the lookup. cell_of returns 0 (never a valid cell id) to drop an item.
+template <typename CellOf>
+static std::vector<CellItemPair> items_by_cell(size_t n, unsigned int threads, CellOf cell_of) {
+    std::vector<CellItemPair> order(n);
+    parallel_for(n, [&](size_t begin, size_t end, unsigned) {
+        for (size_t i = begin; i < end; i++) order[i] = {cell_of(i), static_cast<uint32_t>(i)};
+    }, threads);
+    parallel_sort(order.begin(), order.end(), cell_item_less, threads);
+    order.erase(order.begin(), std::find_if(order.begin(), order.end(),
+                                            [](const CellItemPair& p) { return p.cell_id != 0; }));
+    return order;
+}
+
+// Items per chunk of a cell walk: small enough to spread dense cells over the
+// workers, large enough that chunk edges rarely repeat a cell's lookup.
+static constexpr size_t kCellWalkGrain = 1024;
+
+// Walks `order` (from items_by_cell) on every core: on_cell(cell, state) runs
+// on entering a cell, then on_item(item, state) for each of its items. Each
+// worker owns one State. A cell split across chunks is entered once per chunk,
+// so on_cell must rebuild the state from the cell alone.
+template <typename State, typename OnCell, typename OnItem>
+static void walk_items_by_cell(const std::vector<CellItemPair>& order, unsigned int threads,
+                OnCell on_cell, OnItem on_item) {
+    std::vector<State> states(std::max(1u, threads));
+    parallel_for_dynamic(order.size(), kCellWalkGrain, [&](size_t begin, size_t end, unsigned worker) {
+        State& state = states[worker];
+        for (size_t k = begin; k < end; k++) {
+            if (k == begin || order[k].cell_id != order[k - 1].cell_id)
+                on_cell(S2CellId(order[k].cell_id), state);
+            on_item(order[k].item_id, state);
+        }
+    }, threads);
 }
 
 // Admin polygon parent chain: for each admin polygon, find the smallest containing
@@ -1298,114 +1342,73 @@ static void compute_poi_parent_streets(ParsedData& data, const BuildConfig& cfg,
     }
 }
 
-// Shared smallest-containing-admin-polygon sweep for POI parent linking: for
-// each POI record, init(pr) resets the target field, then the smallest admin
-// polygon accepted by level_ok that contains the POI centroid (area as the
-// specificity proxy, lower = tighter; ties to the first one scanned) is passed
-// to store(pr, poly_id). Returns the number of POIs linked.
-template <typename LevelOk, typename Init, typename Store>
-static uint64_t link_poi_smallest_admin(ParsedData& data, unsigned int num_threads,
-                LevelOk level_ok, Init init, Store store) {
-    require_ordered_admin_areas(data);
-    const AdminRings rings(data, num_threads);
-    auto smaller = [&](uint32_t a, uint32_t b) {
-        return data.admin_polygons[a].area < data.admin_polygons[b].area;
-    };
-    std::atomic<size_t> idx{0};
-    std::atomic<uint64_t> linked{0};
-    std::vector<std::thread> workers;
-    for (unsigned int t = 0; t < num_threads; t++) {
-        workers.emplace_back([&]() {
-            std::vector<S2CellId> nbrs;
-            std::vector<uint32_t> cands;
-            std::vector<std::pair<uint32_t, uint32_t>> scratch;
-            while (true) {
-                size_t i = idx.fetch_add(1);
-                if (i >= data.poi_records.size()) break;
-                auto& pr = data.poi_records[i];
-                init(pr);
-
-                float plat = pr.lat;
-                float plng = pr.lng;
-                S2CellId cell = S2CellId(
-                    S2LatLng::FromDegrees(plat, plng))
-                    .parent(kAdminCellLevel);
-                cands.clear();
-                // 1e18 is the old scan's starting best area.
-                for_each_admin_candidate(data, cell, nbrs, [&](uint32_t pid, const AdminPolygon& p) {
-                    if (level_ok(p.admin_level) && p.area < 1e18f) cands.push_back(pid);
-                });
-                rank_candidates(cands, smaller, scratch);
-                for (uint32_t pid : cands) {
-                    if (!rings.contains(pid, plat, plng)) continue;
-                    store(pr, pid);
-                    linked.fetch_add(1);
-                    break;
-                }
-            }
-        });
-    }
-    for (auto& w : workers) w.join();
-    return linked.load();
-}
-
-// POI parent-postcode PIP: inherit each POI's postcode from the smallest containing
-// postal boundary (Nominatim placex.postcode chain approximation).
-static void compute_poi_parent_postcode(ParsedData& data, const BuildConfig& cfg,
+// POI parent polygons, the smallest containing the POI centroid (area as the
+// specificity proxy, lower = tighter; ties to the first one scanned):
+// - parent_postcode_id: the postal boundary's (11) postcode, Nominatim's
+//   placex.postcode chain approximation.
+// - parent_poly_id: the admin polygon (levels 2..10; place-area markers 15
+//   skipped) the server's chain-containment check walks up from.
+// POIs are walked per admin cell, so each cell's candidates are gathered and
+// ranked once for both.
+static void compute_poi_parent_polygons(ParsedData& data, const BuildConfig& cfg,
                 std::chrono::steady_clock::time_point& _s2t, CpuTicks& _s2cpu) {
     unsigned int num_threads = cfg.num_threads;
     if (!data.poi_records.empty() && !data.admin_polygons.empty()) {
         auto _pp_t = std::chrono::steady_clock::now();
-        std::cerr << "Computing POI parent-postcode links ("
+        std::cerr << "Computing POI parent-postcode and parent-admin links ("
                   << data.poi_records.size() << " POIs)..."
                   << std::endl;
 
-        uint64_t linked = link_poi_smallest_admin(data, num_threads,
-            [](auto level) { return level == 11; },
-            // parent_postcode_id has default NO_DATA, set explicitly
-            // here to match the parent_street_id pattern above.
-            [](auto& pr) { pr.parent_postcode_id = 0xFFFFFFFFu; },
-            [&data](auto& pr, uint32_t best_pid) {
-                pr.parent_postcode_id =
-                    data.admin_polygons[best_pid].name_id;
+        require_ordered_admin_areas(data);
+        const AdminRings rings(data, num_threads);
+        auto smaller = [&](uint32_t a, uint32_t b) {
+            return data.admin_polygons[a].area < data.admin_polygons[b].area;
+        };
+        auto order = items_by_cell(data.poi_records.size(), num_threads, [&](size_t i) {
+            const auto& pr = data.poi_records[i];
+            return S2CellId(S2LatLng::FromDegrees(pr.lat, pr.lng)).parent(kAdminCellLevel).id();
+        });
+
+        struct Candidates {
+            std::vector<S2CellId> nbrs;
+            std::vector<uint32_t> postal, admin;
+            std::vector<std::pair<uint32_t, uint32_t>> scratch;
+        };
+        std::atomic<uint64_t> postcode_linked{0}, admin_linked{0};
+        walk_items_by_cell<Candidates>(order, num_threads,
+            [&](S2CellId cell, Candidates& c) {
+                c.postal.clear();
+                c.admin.clear();
+                // 1e18 is the old per-POI scan's starting best area.
+                for_each_admin_candidate(data, cell, c.nbrs, [&](uint32_t pid, const AdminPolygon& p) {
+                    if (!(p.area < 1e18f)) return;
+                    if (p.admin_level == 11) c.postal.push_back(pid);
+                    else if (p.admin_level >= 2 && p.admin_level <= 10) c.admin.push_back(pid);
+                });
+                rank_candidates(c.postal, smaller, c.scratch);
+                rank_candidates(c.admin, smaller, c.scratch);
+            },
+            [&](uint32_t i, Candidates& c) {
+                auto& pr = data.poi_records[i];
+                uint32_t postal = rings.first_containing(c.postal, pr.lat, pr.lng);
+                pr.parent_postcode_id = postal == NO_DATA ? NO_DATA : data.admin_polygons[postal].name_id;
+                pr.parent_poly_id = rings.first_containing(c.admin, pr.lat, pr.lng);
+                if (postal != NO_DATA) postcode_linked++;
+                if (pr.parent_poly_id != NO_DATA) admin_linked++;
             });
 
         double _pp_el = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - _pp_t).count();
         std::cerr << "POI parent-postcode linking: "
-                  << linked << "/"
+                  << postcode_linked.load() << "/"
                   << data.poi_records.size()
-                  << " POIs linked to a postal boundary in "
-                  << _pp_el << "s" << std::endl;
-        log_phase("  POI: parent-postcode linking", _s2t, _s2cpu);
-    }
-}
-
-// POI parent-admin PIP: record each POI's smallest containing admin polygon for the
-// chain-containment check. Levels 2..10 only — postal (11) and place-area
-// markers (15) are skipped.
-static void compute_poi_parent_admin(ParsedData& data, const BuildConfig& cfg,
-                std::chrono::steady_clock::time_point& _s2t, CpuTicks& _s2cpu) {
-    unsigned int num_threads = cfg.num_threads;
-    if (!data.poi_records.empty() && !data.admin_polygons.empty()) {
-        auto _pa_t = std::chrono::steady_clock::now();
-        std::cerr << "Computing POI parent-admin links ("
-                  << data.poi_records.size() << " POIs)..."
-                  << std::endl;
-
-        uint64_t linked = link_poi_smallest_admin(data, num_threads,
-            [](auto level) { return level >= 2 && level <= 10; },
-            [](auto& pr) { pr.parent_poly_id = 0xFFFFFFFFu; },
-            [](auto& pr, uint32_t best_pid) { pr.parent_poly_id = best_pid; });
-
-        double _pa_el = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - _pa_t).count();
+                  << " POIs linked to a postal boundary" << std::endl;
         std::cerr << "POI parent-admin linking: "
-                  << linked << "/"
+                  << admin_linked.load() << "/"
                   << data.poi_records.size()
                   << " POIs linked to an admin polygon in "
-                  << _pa_el << "s" << std::endl;
-        log_phase("  POI: parent-admin linking", _s2t, _s2cpu);
+                  << _pp_el << "s" << std::endl;
+        log_phase("  POI: parent-postcode + parent-admin linking", _s2t, _s2cpu);
     }
 }
 
@@ -1607,9 +1610,7 @@ static void compute_s2_and_poi_cells(ParsedData& data, const BuildConfig& cfg,
 
         compute_poi_parent_streets(data, cfg, _s2t, _s2cpu);
 
-        compute_poi_parent_postcode(data, cfg, _s2t, _s2cpu);
-
-        compute_poi_parent_admin(data, cfg, _s2t, _s2cpu);
+        compute_poi_parent_polygons(data, cfg, _s2t, _s2cpu);
 
         backfill_addr_point_parent_streets(data, cfg);
 

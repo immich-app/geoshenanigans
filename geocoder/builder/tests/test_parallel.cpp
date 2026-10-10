@@ -235,6 +235,35 @@ TEST(parallel_find_all_lists_matches_in_order_for_any_thread_count) {
     }
 }
 
+TEST(parallel_for_dynamic_visits_every_index_once) {
+    for (unsigned threads : {1u, 2u, 7u, 64u}) {
+        for (size_t grain : {size_t(0), size_t(1), size_t(3), size_t(1000)}) {
+            for (size_t n : {size_t(0), size_t(1), size_t(10), size_t(2500)}) {
+                std::vector<std::atomic<int>> hits(n);
+                std::atomic<bool> chunks_in_bounds{true};
+                parallel_for_dynamic(n, grain, [&](size_t b, size_t e, unsigned worker) {
+                    if (worker >= threads || e - b > std::max<size_t>(grain, 1)) chunks_in_bounds = false;
+                    for (size_t i = b; i < e; i++) hits[i]++;
+                }, threads);
+                for (size_t i = 0; i < n; i++) CHECK_EQ(hits[i].load(), 1);
+                CHECK(chunks_in_bounds.load());
+            }
+        }
+    }
+}
+
+TEST(parallel_for_dynamic_rethrows_a_worker_exception) {
+    bool thrown = false;
+    try {
+        parallel_for_dynamic(100, 10, [](size_t b, size_t, unsigned) {
+            if (b == 50) throw std::runtime_error("boom");
+        }, 4);
+    } catch (const std::runtime_error&) {
+        thrown = true;
+    }
+    CHECK(thrown);
+}
+
 TEST(parallel_sort_matches_std_sort_for_any_thread_count) {
     auto input = new_recs(1 << 20, 5000, 7);
     auto expect = input;

@@ -50,6 +50,22 @@ void parallel_for(size_t n, Fn&& fn, unsigned threads = 0) {
         if (e) std::rethrow_exception(e);
 }
 
+// Runs fn(begin, end, worker) over [0, n) in chunks of `grain` indices that
+// at most `threads` workers (0 = every core) claim in index order as they
+// free up, for loops whose cost per index is uneven. Which worker runs which
+// chunk varies run to run, so fn must not let it shape its output.
+template <class Fn>
+void parallel_for_dynamic(size_t n, size_t grain, Fn&& fn, unsigned threads = 0) {
+    if (threads == 0) threads = parallel_threads();
+    grain = std::max<size_t>(grain, 1);
+    size_t chunks = n / grain + (n % grain != 0);
+    std::atomic<size_t> next{0};
+    parallel_for(std::min<size_t>(threads, chunks), [&](size_t, size_t, unsigned worker) {
+        for (size_t c = next++; c < chunks; c = next++)
+            fn(c * grain, std::min(n, (c + 1) * grain), worker);
+    }, threads);
+}
+
 // Runs fn(i, worker) for every i in [0, n) on at most `threads` threads
 // (0 = every core), handing indices out one at a time so uneven items
 // balance. Which worker runs which i varies run to run. The first exception
