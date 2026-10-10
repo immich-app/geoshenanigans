@@ -445,6 +445,11 @@ static std::vector<CellItemPair> items_by_cell(size_t n, unsigned int threads, C
 // workers, large enough that chunk edges rarely repeat a cell's lookup.
 static constexpr size_t kCellWalkGrain = 1024;
 
+// Items per chunk of an S2 cell pair pass: one shared counter bump per chunk
+// instead of per item (the planet's 116M POIs are mostly a single cell
+// lookup each), small enough that a chunk of costly polygons ends quickly.
+static constexpr size_t kCellPairGrain = 64;
+
 // Walks `order` (from items_by_cell) on every core: on_cell(cell, state) runs
 // on entering a cell, then on_item(item, state) for each of its items. Each
 // worker owns one State. A cell split across chunks is entered once per chunk,
@@ -932,17 +937,16 @@ static void backfill_addr_point_parent_streets(ParsedData& data, const BuildConf
 
 // The (cell_id, item_id) pairs emit(i, scratch, out) appends for each item i
 // in [0, n), one list per worker, for parallel_sort_and_build. Items go out
-// in chunks of `grain` to whichever worker is free; each worker keeps its own
-// Scratch and list, off the other workers' cache lines.
+// in chunks of kCellPairGrain to whichever worker is free; each worker keeps
+// its own Scratch and list, off the other workers' cache lines.
 template <class Scratch, class Emit>
-static std::vector<std::vector<CellItemPair>> emit_item_cells(size_t n, size_t grain, unsigned int threads,
-                Emit emit) {
+static std::vector<std::vector<CellItemPair>> emit_item_cells(size_t n, unsigned int threads, Emit emit) {
     struct alignas(64) Worker {
         Scratch scratch;
         std::vector<CellItemPair> pairs;
     };
     std::vector<Worker> workers(std::max(1u, threads));
-    parallel_for_dynamic(n, grain, [&](size_t begin, size_t end, unsigned w) {
+    parallel_for_dynamic(n, kCellPairGrain, [&](size_t begin, size_t end, unsigned w) {
         Worker& worker = workers[w];
         for (size_t i = begin; i < end; i++) emit(i, worker.scratch, worker.pairs);
     }, threads);
@@ -1448,7 +1452,7 @@ static void compute_s2_cells_ways_interp(ParsedData& data, const BuildConfig& cf
     unsigned int num_threads = cfg.num_threads;
     // Process streets: emit (cell_id, way_id) pairs
     std::cerr << "  Processing " << data.deferred_ways.size() << " street ways..." << std::endl;
-    auto way_pairs = emit_item_cells<EdgeCellScratch>(data.deferred_ways.size(), 1, num_threads,
+    auto way_pairs = emit_item_cells<EdgeCellScratch>(data.deferred_ways.size(), num_threads,
         [&](size_t i, EdgeCellScratch& scratch, std::vector<CellItemPair>& out) {
             const auto& dw = data.deferred_ways[i];
             emit_polyline_cells(data.street_nodes.data() + dw.node_offset, dw.node_count, dw.way_id, scratch, out);
@@ -1457,7 +1461,7 @@ static void compute_s2_cells_ways_interp(ParsedData& data, const BuildConfig& cf
 
     // Process interpolations: emit (cell_id, interp_id) pairs
     std::cerr << "  Processing " << data.deferred_interps.size() << " interpolation ways..." << std::endl;
-    auto interp_pairs = emit_item_cells<EdgeCellScratch>(data.deferred_interps.size(), 1, num_threads,
+    auto interp_pairs = emit_item_cells<EdgeCellScratch>(data.deferred_interps.size(), num_threads,
         [&](size_t i, EdgeCellScratch& scratch, std::vector<CellItemPair>& out) {
             const auto& di = data.deferred_interps[i];
             emit_polyline_cells(data.interp_nodes.data() + di.node_offset, di.node_count, di.interp_id, scratch, out);
@@ -1485,7 +1489,7 @@ static void compute_poi_s2_cells(ParsedData& data, const BuildConfig& cfg,
     if (!data.poi_records.empty()) {
         std::cerr << "  Computing S2 cells for " << data.poi_records.size() << " POIs..." << std::endl;
         auto poi_pairs = emit_item_cells<std::vector<std::pair<double, double>>>(
-            data.poi_records.size(), 1, num_threads,
+            data.poi_records.size(), num_threads,
             [&](size_t i, std::vector<std::pair<double, double>>& verts, std::vector<CellItemPair>& out) {
                 const auto& pr = data.poi_records[i];
                 if (pr.vertex_count == 0) {
@@ -1516,7 +1520,7 @@ static void compute_poi_s2_cells(ParsedData& data, const BuildConfig& cfg,
     if (!data.place_nodes.empty()) {
         std::cerr << "  Computing S2 cells for " << data.place_nodes.size() << " place nodes..." << std::endl;
         struct NoScratch {};
-        auto place_pairs = emit_item_cells<NoScratch>(data.place_nodes.size(), 1, num_threads,
+        auto place_pairs = emit_item_cells<NoScratch>(data.place_nodes.size(), num_threads,
             [&](size_t i, NoScratch&, std::vector<CellItemPair>& out) {
                 const auto& pn = data.place_nodes[i];
                 S2CellId cell = S2CellId(S2LatLng::FromDegrees(pn.lat, pn.lng)).parent(kAdminCellLevel);
