@@ -33,8 +33,10 @@ void collect_postcode_centroids(ParsedData& data);
 // write_index can emit the new sidecar.
 //
 // Idempotent on the same input + same prev_dir. No-op if prev_dir is
-// empty or its sidecars don't exist (first build / fresh start).
-void apply_strategy2_remaps(ParsedData& data, const std::string& prev_dir);
+// empty or its sidecars don't exist (first build / fresh start). The record
+// kinds' passes run at once unless `order` is Serial.
+void apply_strategy2_remaps(ParsedData& data, const std::string& prev_dir,
+                            RunOrder order = RunOrder::Concurrent);
 
 // Emit a strategy-2 *.osm_ids sidecar to disk. If `blob` is non-empty
 // (apply_strategy2_remaps already ran), uses that pre-built table.

@@ -185,6 +185,10 @@ static constexpr size_t MAX_NODE_ID_DEFAULT     = 15000000000ULL; // node index 
 
 enum class IndexMode { Full, NoAddresses, AdminOnly };
 
+// Whether independent write steps run at once or one after another (to hold
+// less memory at a time). The output is the same either way.
+enum class RunOrder { Concurrent, Serial };
+
 // --- Deferred S2 work items ---
 
 struct DeferredWay {

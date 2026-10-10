@@ -1718,11 +1718,12 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
     // async launches — apply_strategy2_remaps mutates the shared
     // ParsedData, and running it inside the async raced the continent
     // filtering that reads the same arrays (UB; benign only by schedule
-    // timing). Its stages run one after another, to hold memory down while
-    // continent subsets build beside it. RegionRun::Continent remaps its
-    // own subset here and runs the stages at once.
+    // timing). RegionRun::Continent remaps its own subset here.
+    //
+    // `order` runs the stages (and a continent's strategy-2 passes) at once
+    // or one after another.
     enum class RegionRun { Planet, Continent };
-    auto write_region = [&](ParsedData& d, const std::string& base_dir, RegionRun run) {
+    auto write_region = [&](ParsedData& d, const std::string& base_dir, RegionRun run, RunOrder order) {
         ensure_dir(base_dir);
         const std::string region = base_dir.substr(base_dir.find_last_of('/') + 1);
 
@@ -1737,7 +1738,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             region_prev = prev_output_dir + rel;
         }
         if (run == RegionRun::Continent)
-            timed_phase("    " + region + ": strategy2 remap", [&] { apply_strategy2_remaps(d, region_prev); });
+            timed_phase("    " + region + ": strategy2 remap", [&] { apply_strategy2_remaps(d, region_prev, order); });
 
         auto write_modes = [&] {
             if (multi_output) {
@@ -2048,7 +2049,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             {"admin-minimal", write_admin_minimal},
             {"poi tiers", write_poi_tiers},
         };
-        if (run == RegionRun::Planet) {
+        if (order == RunOrder::Serial) {
             for (const auto& [name, stage] : stages) timed_phase(std::string("    ") + region + ": " + name, stage);
             return;
         }
@@ -2091,10 +2092,12 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
     // mis-tagged Moscow addresses (Saransk's 21 fall in the asia subset).
     timed_phase("    planet: postcode centroids", [&] { collect_postcode_centroids(data); });
 
-    // Write planet (async — overlaps with continent filtering start)
+    // Write planet (async — overlaps with continent filtering start). Its
+    // stages run one after another, to hold memory down while continent
+    // subsets build beside it.
     auto planet_future = std::async(std::launch::async, [&]() {
         timed_phase("    planet: write", [&] {
-            write_region(data, output_dir + "/planet", RegionRun::Planet);
+            write_region(data, output_dir + "/planet", RegionRun::Planet, RunOrder::Serial);
         });
     });
 
@@ -2223,7 +2226,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                     way_continent_masks, addr_continent_masks, interp_continent_masks,
                     poi_continent_masks, place_continent_masks, poly);
                 log_phase(("  " + std::string(continent.name) + ": filter").c_str(), _ct, _cc);
-                write_region(subset, output_dir + "/" + continent.name, RegionRun::Continent);
+                write_region(subset, output_dir + "/" + continent.name, RegionRun::Continent, RunOrder::Concurrent);
                 log_phase(("  " + std::string(continent.name) + ": total").c_str(), _ct, _cc);
 
                 // Decrement under the mutex — see the quality-throttle note.

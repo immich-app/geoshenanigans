@@ -452,7 +452,7 @@ void emit_strategy2_sidecar(const std::string& path,
     IdAllocator::write_sidecar(path, slots);
 }
 
-void apply_strategy2_remaps(ParsedData& data, const std::string& prev_dir) {
+void apply_strategy2_remaps(ParsedData& data, const std::string& prev_dir, RunOrder order) {
     const std::string label = "      strategy2 " + prev_dir.substr(prev_dir.find_last_of('/') + 1) + ": ";
     // Admins first: their remap reaches into the way, POI and place arrays
     // the other passes reorder (a value remap commutes with a reorder, but
@@ -464,6 +464,7 @@ void apply_strategy2_remaps(ParsedData& data, const std::string& prev_dir) {
     std::vector<uint32_t> way_remap;
     std::vector<std::future<void>> passes;
     auto start = [&](const char* kind, std::function<void()> pass) {
+        if (order == RunOrder::Serial) return timed_phase(label + kind, pass);
         passes.push_back(std::async(std::launch::async, [&, kind, pass] { timed_phase(label + kind, pass); }));
     };
     start("streets", [&] { way_remap = apply_strategy2_streets(data, prev_dir); });
