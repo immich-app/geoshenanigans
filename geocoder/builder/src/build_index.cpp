@@ -52,6 +52,7 @@ inline uint64_t pack_osm_id(gc::id_alloc::ObjectType type, int64_t osm_id) {
 #include "cell_index.h"
 #include "admin_rank_config.h"
 #include "scratch_dir.h"
+#include "tiger.h"
 
 
 // --- Place type override classification ---
@@ -118,13 +119,49 @@ static uint8_t place_type_to_admin_override(uint8_t pt) {
 
 // --- TIGER address data loading ---
 
-// TIGER covers the US and its territories; OSM (and so Nominatim) keeps the
-// territories as countries of their own.
-static uint16_t tiger_country(const std::string& state) {
-    for (const char* territory : {"PR", "VI", "GU", "AS", "MP"}) {
-        if (state == territory) return pack_country_code(territory[0], territory[1]);
+// Reads a whole file into `out`; false when it can't be opened.
+static bool read_whole_file(const std::string& path, std::string& out) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) return false;
+    out.resize(static_cast<size_t>(f.tellg()));
+    f.seekg(0);
+    f.read(out.data(), static_cast<std::streamsize>(out.size()));
+    out.resize(static_cast<size_t>(f.gcount()));
+    return true;
+}
+
+// Appends one TIGER CSV's ranges to the interpolation arrays and its
+// postcode midpoints to postcode_accum.
+static void add_tiger_ranges(ParsedData& data, const TigerCsv& csv) {
+    std::vector<uint32_t> string_ids(csv.strings.size());
+    for (size_t i = 0; i < csv.strings.size(); i++) string_ids[i] = data.string_pool.intern(csv.strings[i]);
+
+    uint32_t node_base = static_cast<uint32_t>(data.interp_nodes.size());
+    data.interp_nodes.insert(data.interp_nodes.end(), csv.nodes.begin(), csv.nodes.end());
+    for (const auto& range : csv.ranges) {
+        InterpWay iw{};
+        iw.node_offset = node_base + range.node_offset;
+        iw.node_count = range.node_count;
+        iw.street_id = string_ids[range.street];
+        iw.start_number = range.start_number;
+        iw.end_number = range.end_number;
+        iw.interpolation = range.interpolation;
+
+        // Defer S2 computation
+        uint32_t interp_id = static_cast<uint32_t>(data.interp_ways.size());
+        data.interp_ways.push_back(iw);
+        data.interp_osm_ids.push_back(
+            pack_osm_id(gc::id_alloc::ObjectType::SYNTHETIC, static_cast<int64_t>(range.synthetic_id)));
+        data.deferred_interps.push_back({interp_id, iw.node_offset, iw.node_count});
+        data.interp_postcode_ids.push_back(
+            range.postcode == TigerCsv::kNoPostcode ? NO_DATA : string_ids[range.postcode]);
     }
-    return pack_country_code('U', 'S');
+    for (const auto& pc : csv.postcodes) {
+        auto& acc = data.postcode_accum[postcode_key(pc.country, string_ids[pc.postcode])];
+        acc.sum_lat_e7 += pc.sum.sum_lat_e7;
+        acc.sum_lng_e7 += pc.sum.sum_lng_e7;
+        acc.count += pc.sum.count;
+    }
 }
 
 static void load_tiger_data(ParsedData& data, const std::string& path) {
@@ -184,152 +221,13 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
     // (and interp_postcodes.bin unwritten) when no TIGER data is loaded.
     data.interp_postcode_ids.resize(data.interp_ways.size(), NO_DATA);
 
+    std::string text;
     for (const auto& csv_file : csv_files) {
-        std::ifstream f(csv_file);
-        if (!f) continue;
-
-        std::string header_line;
-        std::getline(f, header_line); // skip header
-
-        std::string line;
-        while (std::getline(f, line)) {
-            total_rows++;
-
-            // Parse semicolon-delimited: from;to;interpolation;street;city;state;postcode;geometry
-            std::vector<std::string> fields;
-            size_t pos = 0;
-            while (pos < line.size()) {
-                size_t next = line.find(';', pos);
-                if (next == std::string::npos) next = line.size();
-                fields.push_back(line.substr(pos, next - pos));
-                pos = next + 1;
-            }
-
-            if (fields.size() < 8) continue;
-
-            int from_num = std::atoi(fields[0].c_str());
-            int to_num = std::atoi(fields[1].c_str());
-            const std::string& interp_type = fields[2];
-            const std::string& street = fields[3];
-            // fields[4] = city, fields[5] = state, fields[6] = postcode
-            const std::string& geometry = fields[7];
-
-            if (from_num <= 0 || to_num <= 0 || street.empty()) continue;
-            if (geometry.find("LINESTRING") == std::string::npos) continue;
-
-            // Parse WKT LINESTRING(lng lat, lng lat, ...)
-            // Note: WKT uses lng lat order — we swap to our lat/lng convention
-            size_t paren_start = geometry.find('(');
-            size_t paren_end = geometry.rfind(')');
-            if (paren_start == std::string::npos || paren_end == std::string::npos) continue;
-
-            std::string coords_str = geometry.substr(paren_start + 1, paren_end - paren_start - 1);
-            std::vector<NodeCoord> nodes;
-
-            size_t cpos = 0;
-            while (cpos < coords_str.size()) {
-                // Skip whitespace and commas
-                while (cpos < coords_str.size() && (coords_str[cpos] == ' ' || coords_str[cpos] == ','))
-                    cpos++;
-                if (cpos >= coords_str.size()) break;
-
-                char* end;
-                double lng = std::strtod(coords_str.c_str() + cpos, &end);
-                cpos = end - coords_str.c_str();
-                while (cpos < coords_str.size() && coords_str[cpos] == ' ') cpos++;
-                double lat = std::strtod(coords_str.c_str() + cpos, &end);
-                cpos = end - coords_str.c_str();
-
-                if (lat != 0 || lng != 0) {
-                    nodes.push_back({static_cast<float>(lat), static_cast<float>(lng)});
-                }
-            }
-
-            if (nodes.size() < 2 || nodes.size() > MAX_NODE_COUNT) continue;
-
-            // As Nominatim's tiger_line_import: store the range ascending
-            // with the geometry running from the start number (TIGER gives
-            // ranges in the edge's digitising direction, often descending),
-            // and align the start with the odd/even parity.
-            if (from_num > to_num) {
-                std::swap(from_num, to_num);
-                std::reverse(nodes.begin(), nodes.end());
-            }
-            if ((interp_type == "odd" && from_num % 2 == 0) || (interp_type == "even" && from_num % 2 == 1)) {
-                from_num++;
-            }
-
-            // Create InterpWay
-            uint32_t node_offset = static_cast<uint32_t>(data.interp_nodes.size());
-            for (const auto& n : nodes) data.interp_nodes.push_back(n);
-
-            uint8_t itype = 0; // all
-            if (interp_type == "even") itype = 1;
-            else if (interp_type == "odd") itype = 2;
-
-            InterpWay iw{};
-            iw.node_offset = node_offset;
-            iw.node_count = static_cast<uint16_t>(nodes.size());
-            iw.street_id = data.string_pool.intern(street);
-            iw.start_number = static_cast<uint32_t>(from_num);
-            iw.end_number = static_cast<uint32_t>(to_num);
-            iw.interpolation = itype;
-
-            // Defer S2 computation
-            uint32_t interp_id = static_cast<uint32_t>(data.interp_ways.size());
-            data.interp_ways.push_back(iw);
-            // Strategy-2: TIGER interpolation has no OSM origin; use a
-            // synthetic content hash (street string + range + ALL node
-            // coords) so the same TIGER record gets the same dense idx
-            // across builds. Hashing only the FIRST node collided two
-            // distinct interpolation ways that shared a street/range/start
-            // node but differed downstream — ~97k collisions on the planet,
-            // which the strategy-2 allocator could not disambiguate
-            // (tombstone + non-deterministic reslot, churning interp_ways/
-            // nodes/entries). Mixing every node coordinate makes distinct
-            // geometries get distinct ids; truly identical interps still
-            // collide but are genuine duplicates.
-            uint64_t syn_h = FNV1A_OFFSET_BASIS;
-            auto mix = [&](uint64_t v) { syn_h ^= v; syn_h *= FNV1A_PRIME; };
-            for (char c : street) mix(static_cast<uint8_t>(c));
-            mix(0);
-            mix(static_cast<uint64_t>(iw.start_number));
-            mix(static_cast<uint64_t>(iw.end_number));
-            for (const auto& nd : nodes) {
-                uint32_t lb, gb;
-                std::memcpy(&lb, &nd.lat, 4);
-                std::memcpy(&gb, &nd.lng, 4);
-                mix(static_cast<uint64_t>(lb));
-                mix(static_cast<uint64_t>(gb));
-            }
-            data.interp_osm_ids.push_back(
-                pack_osm_id(gc::id_alloc::ObjectType::SYNTHETIC,
-                            static_cast<int64_t>(syn_h & 0x00FFFFFFFFFFFFFFull)));
-            data.deferred_interps.push_back({interp_id, node_offset, iw.node_count});
-
-            // Accumulate TIGER postcode centroids — TIGER has excellent
-            // US zip code coverage that OSM addr:postcode mostly lacks.
-            // Nominatim imports TIGER the same way and postcodes feed
-            // into location_postcode.
-            const std::string& postcode = fields[6];
-            // Keep the per-segment ZIP association (Nominatim's
-            // location_property_tiger.postcode): reverse lookups use the
-            // winning street's nearby TIGER segment as the postcode source.
-            uint32_t row_pc_id = NO_DATA;
-            if (!postcode.empty() && is_valid_postcode(postcode.c_str())) {
-                uint32_t pc_id = data.string_pool.intern(postcode);
-                row_pc_id = pc_id;
-                // Use the midpoint of the interpolation segment as the
-                // postcode location (centroid of the segment).
-                double mid_lat = 0, mid_lng = 0;
-                for (const auto& n : nodes) { mid_lat += n.lat; mid_lng += n.lng; }
-                mid_lat /= nodes.size(); mid_lng /= nodes.size();
-                data.postcode_accum[postcode_key(tiger_country(fields[5]), pc_id)].add(mid_lat, mid_lng);
-            }
-            data.interp_postcode_ids.push_back(row_pc_id);
-
-            loaded_rows++;
-        }
+        if (!read_whole_file(csv_file, text)) continue;
+        TigerCsv csv = parse_tiger_csv(text);
+        total_rows += csv.rows;
+        loaded_rows += csv.ranges.size();
+        add_tiger_ranges(data, csv);
     }
 
     // Sidecar exists iff it carries at least one real ZIP: an empty/ZIP-less
