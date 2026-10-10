@@ -272,16 +272,6 @@ TEST(parallel_chain_walk_throws_the_serial_walks_error) {
     }
 }
 
-TEST(parallel_find_all_lists_matches_in_order_for_any_thread_count) {
-    for (size_t n : {size_t(0), size_t(1), size_t(7), size_t(100000)}) {
-        auto pred = [](size_t i) { return (i * 2654435761u) % 7 < 2; };
-        std::vector<size_t> expect;
-        for (size_t i = 0; i < n; i++)
-            if (pred(i)) expect.push_back(i);
-        for (unsigned threads : {1u, 3u, 64u}) CHECK(parallel_find_all(n, pred, threads) == expect);
-    }
-}
-
 TEST(parallel_for_dynamic_visits_every_index_once) {
     for (unsigned threads : {1u, 2u, 7u, 64u}) {
         for (size_t grain : {size_t(0), size_t(1), size_t(3), size_t(1000)}) {
@@ -402,6 +392,8 @@ TEST(parallel_filter_keeps_matching_indices_in_order) {
             auto got = parallel_filter(n, [&](size_t i) { calls++; return i % 3 == 1; }, threads);
             CHECK(got == expect);
             CHECK_EQ(calls.load(), n);
+            auto wide = parallel_filter<size_t>(n, [](size_t i) { return i % 3 == 1; }, threads);
+            CHECK(wide == std::vector<size_t>(expect.begin(), expect.end()));
         }
     }
 }

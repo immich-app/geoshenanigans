@@ -182,10 +182,8 @@ void parallel_for_runs(size_t n, SameRun same_run, Fn&& fn, unsigned threads = 0
 // a worker throws is rethrown here after all workers finish.
 template <class Fn>
 void parallel_for_each(size_t n, Fn&& fn, unsigned threads = 0) {
-    if (threads == 0) threads = parallel_threads();
-    std::atomic<size_t> next{0};
-    parallel_for(std::min<size_t>(threads, n), [&](size_t, size_t, unsigned worker) {
-        for (size_t i; (i = next.fetch_add(1)) < n;) fn(i, worker);
+    parallel_for_dynamic(n, 1, [&](size_t begin, size_t end, unsigned worker) {
+        for (size_t i = begin; i < end; i++) fn(i, worker);
     }, threads);
 }
 
@@ -636,20 +634,12 @@ std::vector<T> parallel_collect(size_t n, Emit emit, unsigned threads = 0) {
     return out;
 }
 
-// The indices i in [0, n) where keep(i), ascending. keep runs once per index.
-template <class Keep>
-std::vector<uint32_t> parallel_filter(size_t n, Keep keep, unsigned threads = 0) {
-    return parallel_collect<uint32_t>(n, [&](size_t i, std::vector<uint32_t>& out) {
-        if (keep(i)) out.push_back(static_cast<uint32_t>(i));
-    }, threads);
-}
-
-// The indices i in [0, n) where pred(i) holds, ascending, tested on every
-// core.
-template <class Pred>
-std::vector<size_t> parallel_find_all(size_t n, Pred pred, unsigned threads = 0) {
-    return parallel_collect<size_t>(n, [&](size_t i, std::vector<size_t>& out) {
-        if (pred(i)) out.push_back(i);
+// The indices i in [0, n) where keep(i), ascending, as Index values. keep
+// runs once per index.
+template <class Index = uint32_t, class Keep>
+std::vector<Index> parallel_filter(size_t n, Keep keep, unsigned threads = 0) {
+    return parallel_collect<Index>(n, [&](size_t i, std::vector<Index>& out) {
+        if (keep(i)) out.push_back(static_cast<Index>(i));
     }, threads);
 }
 
@@ -752,25 +742,15 @@ SortedIndices parallel_sort_keys(size_t n, KeyOf key_of, KeyLess key_less, TieMa
 }
 
 // Sorts each run of [first, last) by less with std::sort, on every core. A
-// run is a maximal stretch whose neighbours same_run(prev, next) joins, so
-// the cuts between threads fall on run boundaries and can't change it.
+// run is a maximal stretch whose neighbours same_run(prev, next) joins;
+// parallel_for_runs never cuts one, so the threads can't change it.
 template <class It, class SameRun, class Less>
 void parallel_sort_runs(It first, It last, SameRun same_run, Less less, unsigned threads = 0) {
-    constexpr size_t kMinPerPart = size_t(1) << 14;
-    size_t n = static_cast<size_t>(last - first);
-    if (threads == 0) threads = parallel_threads();
-    size_t parts = std::max<size_t>(1, std::min<size_t>(threads, n / kMinPerPart));
-    std::vector<size_t> cut(parts + 1, n);
-    cut[0] = 0;
-    for (size_t p = 1; p < parts; p++) {
-        size_t c = std::max(cut[p - 1], n * p / parts);
-        while (c > 0 && c < n && same_run(first[c - 1], first[c])) c++;
-        cut[p] = c;
-    }
-    parallel_for(parts, [&](size_t p0, size_t p1, unsigned) {
-        for (size_t run = cut[p0], end = cut[p1]; run < end;) {
+    auto joins = [&](size_t i) { return same_run(first[i - 1], first[i]); };
+    parallel_for_runs(static_cast<size_t>(last - first), joins, [&](size_t begin, size_t end, unsigned) {
+        for (size_t run = begin; run < end;) {
             size_t next = run + 1;
-            while (next < end && same_run(first[next - 1], first[next])) next++;
+            while (next < end && joins(next)) next++;
             std::sort(first + run, first + next, less);
             run = next;
         }

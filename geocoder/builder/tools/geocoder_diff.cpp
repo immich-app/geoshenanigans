@@ -1781,7 +1781,7 @@ static int run(int argc, char* argv[]) {
                 }
                 return d;
             };
-            for (size_t pos : parallel_find_all(new_n, changed)) emit_change((uint32_t)pos, new_m.data + pos * 16);
+            for (size_t pos : parallel_filter<size_t>(new_n, changed)) emit_change((uint32_t)pos, new_m.data + pos * 16);
         } else {
             // 4-byte uint32 array with optional remap on the value.
             auto changed = [&](size_t pos) {
@@ -1799,7 +1799,7 @@ static int run(int argc, char* argv[]) {
                 }
                 return remapped != new_val;
             };
-            for (size_t pos : parallel_find_all(new_n, changed)) {
+            for (size_t pos : parallel_filter<size_t>(new_n, changed)) {
                 uint32_t new_val; memcpy(&new_val, new_m.data + pos * 4, 4);
                 emit_change((uint32_t)pos, reinterpret_cast<const char*>(&new_val));
             }
