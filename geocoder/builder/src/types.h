@@ -133,10 +133,15 @@ struct CellItemPair {
 // Canonical ordering for cell→item index tables: by cell_id, then item_id.
 // Hoisted here because the deterministic-ordering passes sorted these tables
 // with an identical inline lambda in 7 places; the exact tiebreak defines
-// on-disk byte layout, so keeping it single-sourced prevents drift.
-inline bool cell_item_less(const CellItemPair& a, const CellItemPair& b) {
-    return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
-}
+// on-disk byte layout, so keeping it single-sourced prevents drift. A
+// function object rather than a function, so the sorts of the planet's
+// billions of pairs inline it instead of calling through a pointer.
+struct CellItemLess {
+    bool operator()(const CellItemPair& a, const CellItemPair& b) const {
+        return a.cell_id < b.cell_id || (a.cell_id == b.cell_id && a.item_id < b.item_id);
+    }
+};
+inline constexpr CellItemLess cell_item_less{};
 
 // parallel_for_runs predicate over a cell-grouped table: pair i is in the
 // cell of pair i - 1.
