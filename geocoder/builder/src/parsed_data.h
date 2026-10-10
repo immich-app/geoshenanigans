@@ -143,6 +143,16 @@ inline void log_phase(const char* name, std::chrono::steady_clock::time_point& t
     t = std::chrono::steady_clock::now();
 }
 
+// Runs fn() and logs it as one phase line. Steps that overlap others still
+// report the whole process's cores.
+template <class Fn>
+inline void timed_phase(const std::string& name, Fn&& fn) {
+    auto t = std::chrono::steady_clock::now();
+    auto cpu = CpuTicks::now();
+    fn();
+    log_phase(name.c_str(), t, cpu);
+}
+
 // Approximate heap bytes held by a vector (size + capacity slack).
 template <class V>
 inline size_t vec_bytes(const V& v) {

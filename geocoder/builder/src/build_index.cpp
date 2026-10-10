@@ -1745,6 +1745,9 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
     auto write_region = [&](ParsedData& d, const std::string& base_dir,
                             bool remap_already_applied = false) {
         ensure_dir(base_dir);
+        const std::string region = base_dir.substr(base_dir.find_last_of('/') + 1);
+        auto _rt = std::chrono::steady_clock::now();
+        auto _rc = CpuTicks::now();
 
         // Locate this region's previous build dir under prev_output_dir
         // (mirrors the layout we write under output_dir). Empty path
@@ -1756,7 +1759,10 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             if (rel.rfind(output_dir, 0) == 0) rel = rel.substr(output_dir.size());
             region_prev = prev_output_dir + rel;
         }
-        if (!remap_already_applied) apply_strategy2_remaps(d, region_prev);
+        if (!remap_already_applied) {
+            apply_strategy2_remaps(d, region_prev);
+            log_phase(("    " + region + ": strategy2 remap").c_str(), _rt, _rc);
+        }
 
         if (multi_output) {
             // Write all 3 modes in parallel (they read shared data, write to separate dirs)
@@ -1767,12 +1773,14 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
         } else {
             write_index(d, base_dir, mode);
         }
+        log_phase(("    " + region + ": modes").c_str(), _rt, _rc);
 
         // Write quality variants (each gets admin_polygons + admin_vertices)
         if (multi_quality) {
             std::string quality_dir = multi_output ? base_dir + "/quality" : base_dir;
             std::cerr << "  Writing quality variants for " << base_dir << "..." << std::endl;
             write_qualities(d, quality_dir);
+            log_phase(("    " + region + ": quality variants").c_str(), _rt, _rc);
         }
 
         // Write place node files into each mode directory (so diff/patch can find them)
@@ -1806,6 +1814,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             std::cerr << "  Place nodes: " << d.place_nodes.size() << " nodes, "
                       << place_cell_map.size() << " cells" << std::endl;
         }
+        log_phase(("    " + region + ": place files").c_str(), _rt, _rc);
 
         // Write admin-minimal tier — smallest useful deployable. Drops:
         //   - place_nodes with place_type ∈ {SUBURB=3, NEIGHBOURHOOD=5, QUARTER=6}
@@ -1900,6 +1909,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                       << " place nodes (of " << d.place_nodes.size() << "), "
                       << filtered_admin_cells.size() << " cells (of "
                       << d.cell_to_admin.size() << ")" << std::endl;
+            log_phase(("    " + region + ": admin-minimal").c_str(), _rt, _rc);
         }
 
         // Write POI tier variants
@@ -2088,6 +2098,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                           << selection.tombstones << " tombstones), "
                           << filtered_vertex_bytes.size() << " vertex bytes, "
                           << filtered_cell_map.size() << " cells" << std::endl;
+                log_phase(("    " + region + ": " + tier_var.name).c_str(), _rt, _rc);
             }
         }
     };
@@ -2102,7 +2113,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
     {
         std::string planet_prev;
         if (!prev_output_dir.empty()) planet_prev = prev_output_dir + "/planet";
-        apply_strategy2_remaps(data, planet_prev);
+        timed_phase("    planet: strategy2 remap", [&] { apply_strategy2_remaps(data, planet_prev); });
     }
     // Expose the prev-output root to write_index via env var so the
     // postcode_centroids strategy-2 pass (which runs inside write_index after
@@ -2121,11 +2132,13 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
     // Postcode centroids are final before the split: a continent that
     // recomputed them from its own addr points put RU 430000 on two
     // mis-tagged Moscow addresses (Saransk's 21 fall in the asia subset).
-    collect_postcode_centroids(data);
+    timed_phase("    planet: postcode centroids", [&] { collect_postcode_centroids(data); });
 
     // Write planet (async — overlaps with continent filtering start)
     auto planet_future = std::async(std::launch::async, [&]() {
-        write_region(data, output_dir + "/planet", /*remap_already_applied=*/true);
+        timed_phase("    planet: write", [&] {
+            write_region(data, output_dir + "/planet", /*remap_already_applied=*/true);
+        });
     });
 
     // Process continents with bounded concurrency, largest first.

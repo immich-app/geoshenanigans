@@ -151,7 +151,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     auto used_poi_ids    = f_pois.get();
     auto used_place_ids  = f_places.get();
     auto used_admin_ids  = f_admin.get();
-    log_phase("      filter: ID collection (masked)", _ft, _fc);
+    log_phase(("      " + std::string(bbox.name) + " filter: ID collection (masked)").c_str(), _ft, _fc);
 
     std::unordered_map<uint32_t, uint32_t> way_remap, addr_remap, interp_remap,
                                             admin_remap, poi_remap, place_remap;
@@ -327,7 +327,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     { auto [ar, polys, vts, oids]  = f_remap_admins.get();  admin_remap  = std::move(ar); out.admin_polygons = std::move(polys); out.admin_vertices= std::move(vts);   out.admin_osm_ids   = std::move(oids); }
     { auto [pr, pois, vts, oids]   = f_remap_pois.get();    poi_remap    = std::move(pr); out.poi_records    = std::move(pois);  out.poi_vertices  = std::move(vts);   out.poi_osm_ids     = std::move(oids); }
     { auto [plr, places, oids]     = f_remap_places.get();  place_remap  = std::move(plr); out.place_nodes   = std::move(places);                                       out.place_osm_ids   = std::move(oids); }
-    log_phase("      filter: data remap (masked)", _ft, _fc);
+    log_phase(("      " + std::string(bbox.name) + " filter: data remap (masked)").c_str(), _ft, _fc);
 
     // --- Project parent chains through admin_remap ---
     // way_parent_ids: parallel to full.ways, values are old admin_poly_ids
@@ -416,7 +416,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         out.postcode_accum.emplace(key, acc);
     }
 
-    log_phase("      filter: parent + postcode projection", _ft, _fc);
+    log_phase(("      " + std::string(bbox.name) + " filter: parent + postcode projection").c_str(), _ft, _fc);
 
     // --- Remap sorted cell arrays for all 5 types (preserving INTERIOR_FLAG) ---
     auto remap_sorted_masked = [&](const std::vector<CellItemPair>& sorted,
@@ -474,7 +474,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         auto f6 = std::async(std::launch::async, [&]{ remap_cells_map(full.cell_to_admin, admin_remap, out.cell_to_admin, true); });
         f1.get(); f2.get(); f3.get(); f4.get(); f5.get(); f6.get();
     }
-    log_phase("      filter: cell map remap (masked)", _ft, _fc);
+    log_phase(("      " + std::string(bbox.name) + " filter: cell map remap (masked)").c_str(), _ft, _fc);
 
     // --- String pool compaction ---
     // Collect every surviving offset from ways, addrs, interps, admin polygons,
@@ -540,7 +540,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         out.postcode_accum = std::move(remapped);
     }
 
-    log_phase("      filter: string pool rebuild (masked)", _ft, _fc);
+    log_phase(("      " + std::string(bbox.name) + " filter: string pool rebuild (masked)").c_str(), _ft, _fc);
 
     // Partition the continent's flat pool into the same 5 tier files
     // the full planet produces, so write_index can emit them per-mode.

@@ -54,6 +54,15 @@ static inline void write_binary_file(const std::string& path, const char* data, 
     if (!f) throw std::runtime_error("failed to write " + path);
 }
 
+// "<region>/<mode>" of an output dir, to tell apart the phase lines of
+// regions and modes written at once.
+static std::string dir_label(const std::string& dir) {
+    size_t last = dir.find_last_of('/');
+    if (last == std::string::npos || last == 0) return dir;
+    size_t prev = dir.find_last_of('/', last - 1);
+    return prev == std::string::npos ? dir : dir.substr(prev + 1);
+}
+
 // A cell's entry list is prefixed by a uint16 count on disk. More entries than
 // fit would silently wrap the count and make the server under-read the cell,
 // so overflow is a hard build failure instead. Widening the field is a routine
@@ -735,12 +744,13 @@ void emit_strategy2_sidecar(const std::string& path,
 }
 
 void apply_strategy2_remaps(ParsedData& data, const std::string& prev_dir) {
-    apply_strategy2_streets(data, prev_dir);
-    apply_strategy2_admins(data, prev_dir);
-    apply_strategy2_addrs(data, prev_dir);
-    apply_strategy2_places(data, prev_dir);
-    apply_strategy2_pois(data, prev_dir);
-    apply_strategy2_interps(data, prev_dir);
+    const std::string label = "      strategy2 " + prev_dir.substr(prev_dir.find_last_of('/') + 1) + ": ";
+    timed_phase(label + "streets", [&] { apply_strategy2_streets(data, prev_dir); });
+    timed_phase(label + "admins", [&] { apply_strategy2_admins(data, prev_dir); });
+    timed_phase(label + "addrs", [&] { apply_strategy2_addrs(data, prev_dir); });
+    timed_phase(label + "places", [&] { apply_strategy2_places(data, prev_dir); });
+    timed_phase(label + "pois", [&] { apply_strategy2_pois(data, prev_dir); });
+    timed_phase(label + "interps", [&] { apply_strategy2_interps(data, prev_dir); });
     // postcode_centroids: their stable identity is (country_code,
     // postcode_string) and the centroid records get materialized from
     // the unordered_map<postcode_id, PostcodeAccum> at write time, AFTER
@@ -850,7 +860,11 @@ uint16_t country_code_at_point(const ParsedData& data, double lat, double lng) {
 
 void write_index(const ParsedData& data, const std::string& output_dir, IndexMode mode) {
     ensure_dir(output_dir);
+    const std::string label = "      " + dir_label(output_dir) + ": ";
     auto _wt = std::chrono::steady_clock::now();
+    auto _wc = CpuTicks::now();
+    auto _total_t = _wt;
+    auto _total_c = _wc;
 
     bool write_streets = (mode != IndexMode::AdminOnly);
     bool write_addresses = (mode == IndexMode::Full);
@@ -938,7 +952,7 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             street_offsets = f1.get();
         }
 
-        log_phase("  Write: entry files", _wt);
+        log_phase((label + "entry files").c_str(), _wt, _wc);
         {
             size_t n = sorted_geo_cells.size();
             size_t row_size = sizeof(uint64_t) + 3 * sizeof(uint32_t);
@@ -974,9 +988,11 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                   << data.interp_ways.size() << " interps)" << std::endl;
     }
 
-    log_phase("  Write: geo_cells.bin", _wt);
+    log_phase((label + "geo_cells.bin").c_str(), _wt, _wc);
     auto admin_future = std::async(std::launch::async, [&] {
-        write_cell_index(output_dir + "/admin_cells.bin", output_dir + "/admin_entries.bin", data.cell_to_admin);
+        timed_phase(label + "admin cells", [&] {
+            write_cell_index(output_dir + "/admin_cells.bin", output_dir + "/admin_entries.bin", data.cell_to_admin);
+        });
         std::cerr << "admin index: " << data.cell_to_admin.size() << " cells, " << data.admin_polygons.size() << " polygons" << std::endl;
     });
 
@@ -1042,6 +1058,8 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             // a 10-byte header + delta-encoded vertices.  Cuts the
             // 5 GB planet addr_vertices.bin to ~2.5 GB.
             write_futures.push_back(std::async(std::launch::async, [&] {
+                auto _at = std::chrono::steady_clock::now();
+                auto _ac = CpuTicks::now();
                 std::vector<AddrPoint> packed_points;
                 packed_points.reserve(data.addr_points.size());
                 std::vector<uint8_t> packed_bytes;
@@ -1128,6 +1146,7 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                                   packed_bytes.size());
                 emit_strategy2_sidecar(output_dir + "/addr_points.osm_ids",
                                         data.addr_sidecar_blob, data.addr_osm_ids);
+                log_phase((label + "addr points").c_str(), _at, _ac);
             }));
             // Per-addr postcode (optional separate file, parallel to addr_points)
             if (!data.addr_postcode_ids.empty()) {
@@ -1191,6 +1210,8 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
     // whose centroid lies inside them.
     if (!data.postcode_accum.empty()) {
         write_futures.push_back(std::async(std::launch::async, [&] {
+            auto _pt = std::chrono::steady_clock::now();
+            auto _pc = CpuTicks::now();
             auto get_str = [&](uint32_t off) -> const char* {
                 return data.get_string(off);
             };
@@ -1350,12 +1371,13 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
 
             std::cerr << "postcode centroids: " << centroids.size() << " entries, "
                       << centroid_cells.size() << " cells" << std::endl;
+            log_phase((label + "postcode centroids").c_str(), _pt, _pc);
         }));
     }
 
-    log_phase("  Write: parallel data files launched", _wt);
     admin_future.get();
     for (auto& f : write_futures) f.get();
+    log_phase((label + "total").c_str(), _total_t, _total_c);
 }
 
 // Pack one polygon's vertices into the byte stream.  Writes a 10-byte
@@ -1460,6 +1482,9 @@ simplify_admin_polygon(const ParsedData& data,
 void write_quality_variant(const ParsedData& data, const std::string& source_dir,
                            const std::string& output_dir, double epsilon_scale) {
     ensure_dir(output_dir);
+    const std::string label = "      " + dir_label(output_dir) + ": ";
+    auto _qt = std::chrono::steady_clock::now();
+    auto _qc = CpuTicks::now();
 
     // Re-simplify admin polygons at the given epsilon scale
     std::vector<AdminPolygon> new_polys;
@@ -1488,6 +1513,7 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
         }
         for (auto& w : workers) w.join();
     }
+    log_phase((label + "simplify").c_str(), _qt, _qc);
 
     // Sequential: build new polygon/vertex arrays. Postal boundaries
     // (admin_level=11) are kept in the main arrays (cell index references
@@ -1573,6 +1599,7 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
                           postal_verts_bytes.size());
     }
 
+    log_phase((label + "pack + write").c_str(), _qt, _qc);
     // Quality directories only contain the files that change.
     // Shared files (admin_cells.bin, admin_entries.bin, strings.bin)
     // stay in the parent directory.
