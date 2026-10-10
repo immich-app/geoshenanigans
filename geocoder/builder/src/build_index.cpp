@@ -64,6 +64,8 @@ inline uint64_t pack_osm_id(gc::id_alloc::ObjectType type, int64_t osm_id) {
 #include "node_index.h"
 #include "string_dict.h"
 #include "vertex_pack.h"
+#include "memory_limit.h"
+#include "write_schedule.h"
 
 
 // --- Place type override classification ---
@@ -1721,9 +1723,11 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
     // timing). RegionRun::Continent remaps its own subset here.
     //
     // `order` runs the stages (and a continent's strategy-2 passes) at once
-    // or one after another.
+    // or one after another. With a `budget`, each stage holds its estimated
+    // cost of it while it runs, beside whatever else holds the rest.
     enum class RegionRun { Planet, Continent };
-    auto write_region = [&](ParsedData& d, const std::string& base_dir, RegionRun run, RunOrder order) {
+    auto write_region = [&](ParsedData& d, const std::string& base_dir, RegionRun run, RunOrder order,
+                            MemoryBudget* budget) {
         ensure_dir(base_dir);
         const std::string region = base_dir.substr(base_dir.find_last_of('/') + 1);
 
@@ -2042,22 +2046,31 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             }
         };
 
-        const std::pair<const char*, std::function<void()>> stages[] = {
-            {"modes", write_modes},
-            {"quality variants", write_quality_dirs},
-            {"place files", write_places},
-            {"admin-minimal", write_admin_minimal},
-            {"poi tiers", write_poi_tiers},
+        const StageCosts costs = stage_costs(record_bytes(d));
+        struct Stage {
+            const char* name;
+            std::function<void()> write;
+            uint64_t cost;
+        };
+        const Stage stages[] = {
+            {"modes", write_modes, costs.modes},
+            {"quality variants", write_quality_dirs, costs.quality},
+            {"place files", write_places, costs.places},
+            {"admin-minimal", write_admin_minimal, costs.admin_minimal},
+            {"poi tiers", write_poi_tiers, costs.poi_tiers},
+        };
+        auto run_stage = [&](const Stage& stage) {
+            std::optional<BudgetLease> lease;
+            if (budget) lease.emplace(*budget, stage.cost);
+            timed_phase(std::string("    ") + region + ": " + stage.name, stage.write);
         };
         if (order == RunOrder::Serial) {
-            for (const auto& [name, stage] : stages) timed_phase(std::string("    ") + region + ": " + name, stage);
+            for (const auto& stage : stages) run_stage(stage);
             return;
         }
         std::vector<std::future<void>> running;
         for (const auto& stage : stages)
-            running.push_back(std::async(std::launch::async, [&] {
-                timed_phase(std::string("    ") + region + ": " + stage.first, stage.second);
-            }));
+            running.push_back(std::async(std::launch::async, [&] { run_stage(stage); }));
         for (auto& f : running) f.get();
     };
 
@@ -2098,12 +2111,24 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
     timed_phase("    malloc trim", [] { malloc_trim(0); });
 #endif
 
+    // What runs beside what: the planet's stages (one after another) and the
+    // continents share the memory the host allows past what the build holds
+    // now (and the continent masks, a byte per cell pair, will), each
+    // holding its estimated cost while it runs.
+    const uint64_t memory_limit = memory_limit_bytes();
+    const uint64_t in_use = static_cast<uint64_t>(get_rss_mb()) << 20;
+    const KindValues planet_pairs = pair_counts(data);
+    const uint64_t masks_bytes = generate_continents ? sum(planet_pairs) : 0;
+    MemoryBudget budget(write_budget(memory_limit, in_use + masks_bytes));
+    std::cerr << "Write schedule: memory limit " << (memory_limit >> 20) << " MiB, " << (in_use >> 20)
+              << " MiB in use, budget " << (budget.capacity() >> 20) << " MiB" << std::endl;
+
     // Write planet (async — overlaps with continent filtering start). Its
     // stages run one after another, to hold memory down while continent
     // subsets build beside it.
     auto planet_future = std::async(std::launch::async, [&]() {
         timed_phase("    planet: write", [&] {
-            write_region(data, output_dir + "/planet", RegionRun::Planet, RunOrder::Serial);
+            write_region(data, output_dir + "/planet", RegionRun::Planet, RunOrder::Serial, &budget);
         });
     });
 
@@ -2179,32 +2204,49 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
 
         log_phase("Pre-compute continent masks", _pct, _pcc);
 
-        // Most records first, so the biggest subset (Europe, whose bbox is
-        // small) doesn't start last and finish alone.
-        std::vector<uint64_t> continent_records(kContinentCount, 0);
-        for (const auto* masks : {&way_continent_masks, &addr_continent_masks, &interp_continent_masks,
-                                  &poi_continent_masks, &place_continent_masks}) {
+        // Each continent's cell pairs by kind; most first, so the biggest
+        // subset (Europe, whose bbox is small) doesn't start last and finish
+        // alone.
+        std::vector<KindValues> continent_pairs(kContinentCount, KindValues{});
+        const std::pair<RecordKind, const std::vector<uint8_t>*> kind_masks[] = {
+            {RecordKind::Ways, &way_continent_masks}, {RecordKind::Addrs, &addr_continent_masks},
+            {RecordKind::Interps, &interp_continent_masks}, {RecordKind::Pois, &poi_continent_masks},
+            {RecordKind::Places, &place_continent_masks}};
+        for (const auto& [kind, masks] : kind_masks) {
             std::vector<std::array<uint64_t, 8>> counts(parallel_threads(), std::array<uint64_t, 8>{});
             parallel_for(masks->size(), [&](size_t begin, size_t end, unsigned w) {
                 for (size_t i = begin; i < end; i++)
                     for (size_t c = 0; c < 8; c++) counts[w][c] += ((*masks)[i] >> c) & 1u;
             });
             for (const auto& per_worker : counts)
-                for (size_t c = 0; c < kContinentCount && c < 8; c++) continent_records[c] += per_worker[c];
+                for (size_t c = 0; c < kContinentCount && c < 8; c++) at(continent_pairs[c], kind) += per_worker[c];
         }
         std::vector<size_t> continent_order(kContinentCount);
         std::iota(continent_order.begin(), continent_order.end(), 0u);
         std::stable_sort(continent_order.begin(), continent_order.end(), [&](size_t a, size_t b) {
-            return continent_records[a] > continent_records[b];
+            return sum(continent_pairs[a]) > sum(continent_pairs[b]);
         });
 
-        // Cap at 2 so peak memory stays bounded: each concurrent
-        // continent holds its own filtered ParsedData (10–25 GiB for
-        // the larger ones) plus an in-flight IdAllocator while
-        // apply_strategy2 runs. With 4 concurrent the runner OOMs on
-        // planet builds; with 2 it stays under MemTotal.
+        // Cap at 2 so the cores stay shared with the planet's stages; the
+        // budget may hold fewer. A continent whose cost doesn't fit beside
+        // what runs waits, and a later one that fits goes ahead of it; one
+        // that doesn't fit the budget even alone runs alone, its steps one
+        // after another.
         unsigned max_concurrent = std::max(1u, std::min(2u,
             std::thread::hardware_concurrency() / 8));
+        const KindValues planet_bytes = record_bytes(data);
+        const KindValues planet_counts = record_counts(data);
+        struct ContinentRun {
+            size_t continent;
+            RegionCost cost;
+        };
+        std::vector<ContinentRun> pending;
+        for (size_t c : continent_order) {
+            const KindValues bytes = continent_share(planet_bytes, planet_pairs, continent_pairs[c]);
+            const KindValues counts = continent_share(planet_counts, planet_pairs, continent_pairs[c]);
+            const uint64_t filter_bytes = filter_cost(planet_counts, continent_pairs[c], parallel_threads());
+            pending.push_back({c, continent_cost(bytes, counts, filter_bytes, budget.capacity())});
+        }
         std::cerr << "Processing " << kContinentCount << " continents ("
                   << max_concurrent << " concurrent, largest first)..." << std::endl;
 
@@ -2213,35 +2255,59 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
         std::condition_variable cv;
         std::vector<std::future<void>> futures;
 
-        for (size_t i = 0; i < kContinentCount; i++) {
+        while (!pending.empty()) {
             {
                 std::unique_lock<std::mutex> lock(cv_mutex);
                 cv.wait(lock, [&]{ return active.load() < max_concurrent; });
             }
+            std::vector<uint64_t> costs;
+            for (const auto& run : pending) costs.push_back(run.cost.bytes);
+            const size_t pick = budget.acquire_first(costs);
+            const ContinentRun run = pending[pick];
+            pending.erase(pending.begin() + static_cast<std::ptrdiff_t>(pick));
             active.fetch_add(1);
 
-            futures.push_back(std::async(std::launch::async, [&, i]() {
-                const auto& continent = kContinents[continent_order[i]];
+            auto launch = [&] { return std::async(std::launch::async, [&, run]() {
+                // Frees the slot and the budget however the continent ends,
+                // so the loop above never waits on a failed one.
+                struct Done {
+                    std::atomic<unsigned>& active;
+                    std::mutex& mtx;
+                    std::condition_variable& cv;
+                    ~Done() {
+                        {
+                            std::lock_guard<std::mutex> lk(mtx);
+                            active.fetch_sub(1);
+                        }
+                        cv.notify_one();
+                    }
+                } done{active, cv_mutex, cv};
+                BudgetLease lease(budget, run.cost.bytes, std::adopt_lock);
+                const auto& continent = kContinents[run.continent];
                 auto _ct = std::chrono::steady_clock::now();
                 auto _cc = CpuTicks::now();
-                std::cerr << "Continent: " << continent.name << " (start)..." << std::endl;
-                uint8_t cbit = 1u << continent_order[i];
-                const auto* poly = (continent_order[i] < continent_polys.size() && !continent_polys[continent_order[i]].vertices.empty())
-                    ? &continent_polys[continent_order[i]].vertices : nullptr;
+                std::cerr << "Continent: " << continent.name << " (start, "
+                          << (run.cost.order == RunOrder::Serial ? "steps one at a time" : "steps at once")
+                          << ", ~" << (run.cost.bytes >> 20) << " MiB)..." << std::endl;
+                uint8_t cbit = 1u << run.continent;
+                const auto* poly = (run.continent < continent_polys.size() && !continent_polys[run.continent].vertices.empty())
+                    ? &continent_polys[run.continent].vertices : nullptr;
                 auto subset = filter_by_bbox_masked(data, continent, cbit,
                     way_continent_masks, addr_continent_masks, interp_continent_masks,
                     poi_continent_masks, place_continent_masks, poly);
                 log_phase(("  " + std::string(continent.name) + ": filter").c_str(), _ct, _cc);
-                write_region(subset, output_dir + "/" + continent.name, RegionRun::Continent, RunOrder::Concurrent);
+                write_region(subset, output_dir + "/" + continent.name, RegionRun::Continent, run.cost.order, nullptr);
                 log_phase(("  " + std::string(continent.name) + ": total").c_str(), _ct, _cc);
-
-                // Decrement under the mutex — see the quality-throttle note.
-                {
-                    std::lock_guard<std::mutex> lk(cv_mutex);
-                    active.fetch_sub(1);
-                }
-                cv.notify_one();
-            }));
+            }); };
+            try {
+                futures.push_back(launch());
+            } catch (...) {
+                // No thread holds the slot or the budget (std::async could not
+                // start one): hand both back, or later waits never end.
+                budget.release(run.cost.bytes);
+                active.fetch_sub(1);
+                throw;
+            }
         }
         for (auto& f : futures) f.get();
     }
