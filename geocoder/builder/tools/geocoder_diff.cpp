@@ -107,13 +107,22 @@ static void remap_string_fields(char* data, size_t size, PatchFileId fid, size_t
 // Content matching for ways (by name + nodes, ignoring node_offset)
 static uint64_t fnv_mix(uint64_t h, uint64_t v) { h ^= v; h *= 1099511628211ULL; return h; }
 
-// The offset fixup of the passes below: old records take the offset field of
-// the new record they pair with by content key (pair_records_by_key).
-static void copy_offsets_of_key_pairs(std::vector<KeyedRecord> old_keys, std::vector<KeyedRecord> new_keys,
-                                      char* old_recs, const char* new_recs, size_t stride, size_t field) {
+// An offset fixup's old and new records by content key, sorted for pairing.
+struct FixupKeys {
+    std::vector<KeyedRecord> old_keys, new_keys;
+};
+
+static FixupKeys sorted_fixup_keys(std::vector<KeyedRecord> old_keys, std::vector<KeyedRecord> new_keys) {
     sort_keyed_records(old_keys);
     sort_keyed_records(new_keys);
-    pair_records_by_key(old_keys, new_keys, [&](uint32_t o, uint32_t n) {
+    return {std::move(old_keys), std::move(new_keys)};
+}
+
+// The offset fixup of the passes below: old records take the offset field of
+// the new record they pair with by content key (pair_records_by_key).
+static void copy_paired_offsets(const FixupKeys& keys, char* old_recs, const char* new_recs, size_t stride,
+                                size_t field) {
+    pair_records_by_key(keys.old_keys, keys.new_keys, [&](uint32_t o, uint32_t n) {
         memcpy(old_recs + (size_t)o * stride + field, new_recs + (size_t)n * stride + field, 4);
     });
 }
@@ -157,9 +166,9 @@ static void fixup_way_offsets(char* old_ways, size_t old_ways_size,
 
     // Duplicate ways (identical name + geometry, e.g. stacked OSM ways)
     // must pair in slot order — see fixup_v15_offsets.
-    copy_offsets_of_key_pairs(
+    copy_paired_offsets(sorted_fixup_keys(
         keyed_records(old_n, [&](size_t i) { return way_hash(old_ways + i * stride, old_nodes, old_nc); }),
-        keyed_records(new_n, [&](size_t i) { return way_hash(new_ways + i * stride, new_nodes, new_nc); }),
+        keyed_records(new_n, [&](size_t i) { return way_hash(new_ways + i * stride, new_nodes, new_nc); })),
         old_ways, new_ways, stride, 0);
 }
 
@@ -175,22 +184,29 @@ static void fixup_way_offsets(char* old_ways, size_t old_ways_size,
 // Unlike v14, we can't decode vertices without parsing the inline
 // header — so we just hash the raw byte block (head bytes are enough
 // since unchanged polygons produce byte-identical block content).
-static void fixup_v15_offsets(char* old_polys, size_t old_polys_size,
+//
+// The fixup is skipped when polygon records AND vertex bytes are
+// byte-identical (see fixup_way_offsets): the content-hash match can
+// otherwise rewrite an unchanged polygon's vert_offset to a colliding
+// polygon's offset, perturbing OLD and producing spurious non-identity
+// id_remaps / admin_ and addr_entries corrections on same-build diffs.
+static bool v15_fixup_skipped(const char* old_polys, size_t old_polys_size,
                               const char* old_verts, size_t old_verts_size,
                               const char* new_polys, size_t new_polys_size,
-                              const char* new_verts, size_t new_verts_size,
-                              size_t stride, size_t off_field_pos,
-                              uint64_t (*key_fn)(const char* rec)) {
-    // Skip when polygon records AND vertex bytes are byte-identical (see
-    // fixup_way_offsets): the content-hash match can otherwise rewrite an
-    // unchanged polygon's vert_offset to a colliding polygon's offset,
-    // perturbing OLD and producing spurious non-identity id_remaps / admin_
-    // and addr_entries corrections on same-build diffs.
-    if (old_polys_size == new_polys_size && old_verts_size == new_verts_size &&
-        old_polys_size > 0 &&
-        memcmp(old_polys, new_polys, old_polys_size) == 0 &&
-        (old_verts_size == 0 || memcmp(old_verts, new_verts, old_verts_size) == 0))  // empty maps are null
-        return;
+                              const char* new_verts, size_t new_verts_size) {
+    return old_polys_size == new_polys_size && old_verts_size == new_verts_size &&
+           old_polys_size > 0 &&
+           memcmp(old_polys, new_polys, old_polys_size) == 0 &&
+           (old_verts_size == 0 || memcmp(old_verts, new_verts, old_verts_size) == 0);  // empty maps are null
+}
+
+// The v15 fixup's keys: (record key, vertex block hash) of every record.
+static FixupKeys v15_fixup_keys(const char* old_polys, size_t old_polys_size,
+                                const char* old_verts, size_t old_verts_size,
+                                const char* new_polys, size_t new_polys_size,
+                                const char* new_verts, size_t new_verts_size,
+                                size_t stride, size_t off_field_pos,
+                                uint64_t (*key_fn)(const char* rec)) {
     auto compute_blocks = [&](const char* polys, size_t parent_size, size_t verts_size) {
         size_t total_n = parent_size / stride;
         std::vector<uint32_t> offsets(total_n);
@@ -246,8 +262,21 @@ static void fixup_v15_offsets(char* old_polys, size_t old_polys_size,
     // planet diff). Records keep stable slot order across chained
     // builds, so k-th old ↔ k-th new within a group is the true pairing.
     auto new_keys = keys_of(new_polys, new_polys_size, new_verts, new_verts_size);
-    copy_offsets_of_key_pairs(keys_of(old_polys, old_polys_size, old_verts, old_verts_size), std::move(new_keys),
-                              old_polys, new_polys, stride, off_field_pos);
+    return sorted_fixup_keys(keys_of(old_polys, old_polys_size, old_verts, old_verts_size), std::move(new_keys));
+}
+
+static void fixup_v15_offsets(char* old_polys, size_t old_polys_size,
+                              const char* old_verts, size_t old_verts_size,
+                              const char* new_polys, size_t new_polys_size,
+                              const char* new_verts, size_t new_verts_size,
+                              size_t stride, size_t off_field_pos,
+                              uint64_t (*key_fn)(const char* rec)) {
+    if (v15_fixup_skipped(old_polys, old_polys_size, old_verts, old_verts_size,
+                          new_polys, new_polys_size, new_verts, new_verts_size))
+        return;
+    copy_paired_offsets(v15_fixup_keys(old_polys, old_polys_size, old_verts, old_verts_size, new_polys,
+                                       new_polys_size, new_verts, new_verts_size, stride, off_field_pos, key_fn),
+                        old_polys, new_polys, stride, off_field_pos);
 }
 
 // Same for interp ways
@@ -280,9 +309,9 @@ static void fixup_interp_offsets(char* old_data, size_t old_size,
     };
 
     // Content-identical duplicates pair in slot order (see fixup_v15_offsets).
-    copy_offsets_of_key_pairs(
+    copy_paired_offsets(sorted_fixup_keys(
         keyed_records(old_n, [&](size_t i) { return ihash(old_data + i * stride, old_nodes, old_nc); }),
-        keyed_records(new_n, [&](size_t i) { return ihash(new_data + i * stride, new_nodes, new_nc); }),
+        keyed_records(new_n, [&](size_t i) { return ihash(new_data + i * stride, new_nodes, new_nc); })),
         old_data, new_data, stride, 0);
 }
 
