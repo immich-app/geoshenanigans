@@ -263,6 +263,23 @@ TEST(apply_drops_a_first_id_equal_to_the_previous_types_last_like_osmium) {
     REQUIRE(run.output.size() == 5);
     CHECK_EQ(run.output[0].id, int64_t(3));
     CHECK(run.output[2].type == OsmType::Way && run.output[2].id == 9);
+
+    // The same for a type only the changes hold.
+    Run created = run_apply({node(1, 1), node(5, 1)}, {{{'c', of_type(OsmType::Way, node(5, 1))},
+                                                        {'c', of_type(OsmType::Way, node(6, 1))}}});
+    CHECK(describe(created.output) == describe(created.expected));
+    REQUIRE(created.output.size() == 3);
+    CHECK(created.output[2].type == OsmType::Way && created.output[2].id == 6);
+}
+
+TEST(apply_copies_every_blob_of_an_empty_change_file) {
+    std::vector<TestObject> input;
+    for (int64_t id = 1; id <= 12; id++) input.push_back(node(id, 1));
+    input.push_back(of_type(OsmType::Way, node(1, 1)));
+    Run run = run_apply(input, {{}});
+    CHECK(describe(run.output) == describe(input));
+    CHECK_EQ(run.stats.merged_blobs, size_t(0));
+    CHECK_EQ(run.verbatim_blobs, run.blob_objects.size());
 }
 
 TEST(apply_matches_osmium_on_random_files_and_copies_untouched_blobs) {
