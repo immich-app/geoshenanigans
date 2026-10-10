@@ -55,6 +55,7 @@ inline uint64_t pack_osm_id(gc::id_alloc::ObjectType type, int64_t osm_id) {
 #include "parallel.h"
 #include "way_tags.h"
 #include "node_index.h"
+#include "string_dict.h"
 
 
 // --- Place type override classification ---
@@ -3526,23 +3527,25 @@ static int run(int argc, char* argv[]) {
             std::unordered_map<std::string, std::vector<int64_t>> wikidata_place_node_ids;
             {
                 struct NodeThreadLocal {
+                    // Strings below are codes into `strings` (kNone: none).
+                    StringDict strings;
                     std::vector<std::pair<double,double>> addr_coords;
-                    std::vector<std::pair<std::string,std::string>> addr_strings;
-                    std::vector<std::string> addr_postcodes; // parallel to addr_strings
+                    std::vector<std::pair<uint32_t, uint32_t>> addr_strings; // {hn, street}
+                    std::vector<uint32_t> addr_postcodes; // parallel to addr_strings
                     std::vector<int64_t> addr_osm_node_ids; // parallel to addr_coords; strategy-2 stable identity
                     uint64_t count = 0;
                     std::vector<std::pair<int64_t, uint8_t>> label_hits; // (node_id, PlaceType)
                     // POI node data
                     std::vector<PoiRecord> poi_records;
                     std::vector<int64_t> poi_osm_node_ids; // parallel to poi_records; strategy-2 stable identity
-                    std::vector<std::string> poi_names;
+                    std::vector<uint32_t> poi_names;
                     std::vector<float> poi_elevations;
                     std::vector<uint32_t> poi_qids;
                     uint64_t poi_count = 0;
                     // Place node data
                     std::vector<PlaceNode> place_nodes;
                     std::vector<int64_t> place_osm_node_ids; // parallel to place_nodes; strategy-2 stable identity
-                    std::vector<std::string> place_names;
+                    std::vector<uint32_t> place_names;
                     std::vector<std::tuple<std::string, int64_t, uint8_t>> place_wikidata; // (wikidata_id, node_id, PlaceType)
                 };
                 // Use thread_local for streaming callback (no thread index available)
@@ -3657,8 +3660,11 @@ static int run(int argc, char* argv[]) {
                             // nearest-named-street sweep. Empty
                             // street sentinel = "needs backfill".
                             tl_node_data->addr_coords.push_back({lat, lng});
-                            tl_node_data->addr_strings.push_back({housenumber, street ? street : ""});
-                            tl_node_data->addr_postcodes.push_back(postcode ? postcode : "");
+                            auto& strs = tl_node_data->strings;
+                            tl_node_data->addr_strings.push_back({strs.add(housenumber),
+                                (street && street[0]) ? strs.add(street) : StringDict::kNone});
+                            tl_node_data->addr_postcodes.push_back(
+                                (postcode && postcode[0]) ? strs.add(postcode) : StringDict::kNone);
                             tl_node_data->addr_osm_node_ids.push_back(id);
                             tl_node_data->count++;
                         }
@@ -3697,7 +3703,8 @@ static int run(int argc, char* argv[]) {
                                 pr.flags = cls->flags;
                                 tl_node_data->poi_records.push_back(pr);
                                 tl_node_data->poi_osm_node_ids.push_back(id);
-                                tl_node_data->poi_names.push_back(best_name ? std::string(best_name) : std::string());
+                                tl_node_data->poi_names.push_back((best_name && best_name[0])
+                                    ? tl_node_data->strings.add(best_name) : StringDict::kNone);
                                 float ele_val = 0;
                                 if (n_ele) { char* end; ele_val = std::strtof(n_ele, &end); if (end == n_ele) ele_val = 0; }
                                 tl_node_data->poi_elevations.push_back(ele_val);
@@ -3739,7 +3746,7 @@ static int run(int argc, char* argv[]) {
                                 pn.place_type = static_cast<uint8_t>(settlement_pt);
                                 tl_node_data->place_nodes.push_back(pn);
                                 tl_node_data->place_osm_node_ids.push_back(id);
-                                tl_node_data->place_names.push_back(place_name);
+                                tl_node_data->place_names.push_back(tl_node_data->strings.add(place_name));
                             }
 
                             // For the label-role lookup, also recognise higher-level
@@ -3788,32 +3795,39 @@ static int run(int argc, char* argv[]) {
                 tl_node_data = nullptr;
                 log_phase("    Pass 2: node streaming", _st, _sc);
 
+                // Pool ids per thread, interned in the order the merges
+                // below meet each thread's strings.
+                std::vector<DictIds> name_ids;
+                name_ids.reserve(ntld.size());
+                for (auto& local : ntld) name_ids.emplace_back(local.strings, data.string_pool);
+
                 // Merge address points
                 uint64_t total_addrs = 0;
-                for (auto& local : ntld) {
+                for (size_t k = 0; k < ntld.size(); k++) {
+                    auto& local = ntld[k];
                     for (size_t j = 0; j < local.addr_coords.size(); j++) {
-                        uint64_t dummy = 0;
-                        const char* pc_ptr = local.addr_postcodes[j].empty() ? nullptr : local.addr_postcodes[j].c_str();
+                        uint32_t street_id = name_ids[k](local.addr_strings[j].second);
+                        uint32_t housenumber_id = name_ids[k](local.addr_strings[j].first);
+                        uint32_t postcode_id = name_ids[k](local.addr_postcodes[j]);
+                        double lat = local.addr_coords[j].first, lng = local.addr_coords[j].second;
                         int64_t node_id = j < local.addr_osm_node_ids.size() ? local.addr_osm_node_ids[j] : 0;
-                        add_addr_point(data, local.addr_coords[j].first, local.addr_coords[j].second,
-                                       local.addr_strings[j].first.c_str(),
-                                       local.addr_strings[j].second.c_str(), pc_ptr, dummy,
-                                       pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, node_id));
+                        append_addr_point(data, lat, lng, housenumber_id, street_id, postcode_id,
+                                          point_to_cell(lat, lng),
+                                          pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, node_id));
                     }
                     total_addrs += local.count;
                 }
                 // Merge POI node records
                 uint64_t total_poi_nodes = 0;
-                for (auto& local : ntld) {
+                for (size_t k = 0; k < ntld.size(); k++) {
+                    auto& local = ntld[k];
                     for (size_t j = 0; j < local.poi_records.size(); j++) {
                         auto pr = local.poi_records[j];
                         // Empty name → NO_DATA sentinel. UNNAMED_RANK30
                         // POIs come in nameless; the server reads name_id
                         // == NO_DATA to surface parent_street as `road`
                         // instead of the POI's (missing) own name.
-                        pr.name_id = local.poi_names[j].empty()
-                            ? NO_DATA
-                            : data.string_pool.intern(local.poi_names[j]);
+                        pr.name_id = name_ids[k](local.poi_names[j]);
                         data.poi_records.push_back(pr);
                         // Strategy-2 stable identity: node-sourced POI.
                         int64_t poi_node_id = j < local.poi_osm_node_ids.size() ? local.poi_osm_node_ids[j] : 0;
@@ -3827,10 +3841,11 @@ static int run(int argc, char* argv[]) {
                     total_poi_nodes += local.poi_count;
                 }
                 // Merge place nodes
-                for (auto& local : ntld) {
+                for (size_t k = 0; k < ntld.size(); k++) {
+                    auto& local = ntld[k];
                     for (size_t j = 0; j < local.place_nodes.size(); j++) {
                         auto pn = local.place_nodes[j];
-                        pn.name_id = data.string_pool.intern(local.place_names[j]);
+                        pn.name_id = name_ids[k](local.place_names[j]);
                         data.place_nodes.push_back(pn);
                         // Strategy-2 stable identity: place_nodes are always
                         // settlement nodes from the OSM node stream.
@@ -3915,11 +3930,13 @@ static int run(int argc, char* argv[]) {
                     std::vector<uint32_t> building_addr_poly_cnt;   // 0 = no polygon
                     std::vector<int64_t> building_addr_osm_way_ids; // parallel to building_addrs; strategy-2 stable identity
                     std::vector<int64_t> interp_osm_way_ids;        // parallel to interp_ways; strategy-2 stable identity
-                    std::vector<std::string> way_strings;      // way name (name:en ?: name)
-                    std::vector<std::string> way_orig_names;   // way original name (always name tag)
-                    std::vector<std::pair<std::string,std::string>> addr_strings; // building addr {hn, street}
-                    std::vector<std::string> addr_postcodes; // parallel to addr_strings
-                    std::vector<std::string> interp_strings;   // interp street name strings
+                    // Strings below are codes into `strings` (kNone: none).
+                    StringDict strings;
+                    std::vector<uint32_t> way_strings;      // way name (name:en ?: name)
+                    std::vector<uint32_t> way_orig_names;   // way original name (always name tag)
+                    std::vector<std::pair<uint32_t, uint32_t>> addr_strings; // building addr {hn, street}
+                    std::vector<uint32_t> addr_postcodes; // parallel to addr_strings
+                    std::vector<uint32_t> interp_strings;   // interp street name strings
                     uint64_t way_count = 0;
                     uint64_t building_addr_count = 0;
                     uint64_t interp_count = 0;
@@ -3946,7 +3963,7 @@ static int run(int argc, char* argv[]) {
                     // POI way data
                     struct PoiWayEntry {
                         PoiRecord record;
-                        std::string name;
+                        uint32_t name;  // code into strings
                         std::vector<NodeCoord> vertices;
                         float elevation;
                         uint32_t qid;
@@ -4010,7 +4027,7 @@ static int run(int argc, char* argv[]) {
                                 iw.interpolation = interp_type;
                                 local.interp_ways.push_back(iw);
                                 local.interp_osm_way_ids.push_back(way_id);
-                                local.interp_strings.push_back(street);
+                                local.interp_strings.push_back(local.strings.add(street));
                                 local.deferred_interps.push_back({interp_id, node_offset, iw.node_count});
                                 local.interp_count++;
                             }
@@ -4034,8 +4051,10 @@ static int run(int argc, char* argv[]) {
                             double clat = sum_lat/valid, clng = sum_lng/valid;
                             local.building_addrs.push_back({static_cast<float>(clat), static_cast<float>(clng)});
                             local.building_addr_osm_way_ids.push_back(way_id);
-                            local.addr_strings.push_back({housenumber, street ? street : ""});
-                            local.addr_postcodes.push_back(t.postcode ? t.postcode : "");
+                            local.addr_strings.push_back({local.strings.add(housenumber),
+                                (street && street[0]) ? local.strings.add(street) : StringDict::kNone});
+                            local.addr_postcodes.push_back(
+                                (t.postcode && t.postcode[0]) ? local.strings.add(t.postcode) : StringDict::kNone);
                             // Polygon vertices for closed ways (buildings).
                             // Lets the server compute exact distance-to-
                             // polygon for Nominatim parity instead of the
@@ -4076,8 +4095,9 @@ static int run(int argc, char* argv[]) {
                             header.node_count = static_cast<uint16_t>(std::min(refs_size, size_t(MAX_NODE_COUNT)));
                             local.ways.push_back(header);
                             local.way_osm_ids.push_back(way_id);
-                            local.way_strings.push_back(t_best_name);
-                            local.way_orig_names.push_back(t.name ? t.name : (t_best_name ? t_best_name : ""));
+                            const char* orig_name = t.name ? t.name : (t_best_name ? t_best_name : "");
+                            local.way_strings.push_back(local.strings.add(t_best_name));
+                            local.way_orig_names.push_back(orig_name[0] ? local.strings.add(orig_name) : StringDict::kNone);
                             local.deferred_ways.push_back({wid, noff, header.node_count});
                             local.way_count++;
                         }
@@ -4156,7 +4176,7 @@ static int run(int argc, char* argv[]) {
                             if (t.wikidata && t.wikidata[0] == 'Q') {
                                 way_qid = static_cast<uint32_t>(std::strtoul(t.wikidata + 1, nullptr, 10));
                             }
-                            local.poi_ways.push_back({pr, t_best_name, std::move(verts), way_ele, way_qid, way_id});
+                            local.poi_ways.push_back({pr, local.strings.add(t_best_name), std::move(verts), way_ele, way_qid, way_id});
                         }
                     }
 
@@ -4269,6 +4289,7 @@ static int run(int argc, char* argv[]) {
                     return g;
                 };
                 for (auto& local : tld) {
+                    DictIds name_id(local.strings, data.string_pool);
                     uint32_t way_base = static_cast<uint32_t>(data.ways.size());
                     uint32_t node_base = static_cast<uint32_t>(data.street_nodes.size());
                     uint32_t interp_base = static_cast<uint32_t>(data.interp_ways.size());
@@ -4279,15 +4300,11 @@ static int run(int argc, char* argv[]) {
                     for (size_t i = 0; i < local.ways.size(); i++) {
                         auto h = local.ways[i];
                         h.node_offset += node_base;
-                        h.name_id = data.string_pool.intern(local.way_strings[i]);
+                        h.name_id = name_id(local.way_strings[i]);
                         data.ways.push_back(h);
                         data.way_osm_ids.push_back(i < local.way_osm_ids.size() ? local.way_osm_ids[i] : 0);
                         // Store original name for token matching
-                        uint32_t orig_id = NO_DATA;
-                        if (i < local.way_orig_names.size() && !local.way_orig_names[i].empty()) {
-                            orig_id = data.string_pool.intern(local.way_orig_names[i]);
-                        }
-                        data.way_orig_name_ids.push_back(orig_id);
+                        data.way_orig_name_ids.push_back(name_id(local.way_orig_names[i]));
                     }
                     data.street_nodes.insert(data.street_nodes.end(),
                         local.street_nodes.begin(), local.street_nodes.end());
@@ -4301,8 +4318,9 @@ static int run(int argc, char* argv[]) {
 
                     // Merge building addresses
                     for (size_t i = 0; i < local.building_addrs.size(); i++) {
-                        uint64_t dummy = 0;
-                        const char* bpc_ptr = local.addr_postcodes[i].empty() ? nullptr : local.addr_postcodes[i].c_str();
+                        uint32_t street_id = name_id(local.addr_strings[i].second);
+                        uint32_t housenumber_id = name_id(local.addr_strings[i].first);
+                        uint32_t postcode_id = name_id(local.addr_postcodes[i]);
                         uint32_t poly_off = local.building_addr_poly_off[i];
                         uint32_t poly_cnt = local.building_addr_poly_cnt[i];
                         const NodeCoord* poly_verts = (poly_cnt > 0 && poly_off != NO_DATA)
@@ -4310,18 +4328,18 @@ static int run(int argc, char* argv[]) {
                             : nullptr;
                         int64_t bldg_way_id = i < local.building_addr_osm_way_ids.size()
                             ? local.building_addr_osm_way_ids[i] : 0;
-                        add_addr_point(data, local.building_addrs[i].lat, local.building_addrs[i].lng,
-                                       local.addr_strings[i].first.c_str(),
-                                       local.addr_strings[i].second.c_str(), bpc_ptr, dummy,
-                                       pack_osm_id(gc::id_alloc::ObjectType::OSM_WAY, bldg_way_id),
-                                       poly_verts, poly_cnt);
+                        double lat = local.building_addrs[i].lat, lng = local.building_addrs[i].lng;
+                        append_addr_point(data, lat, lng, housenumber_id, street_id, postcode_id,
+                                          point_to_cell(lat, lng),
+                                          pack_osm_id(gc::id_alloc::ObjectType::OSM_WAY, bldg_way_id),
+                                          poly_verts, poly_cnt);
                     }
 
                     // Merge interpolation ways
                     for (size_t i = 0; i < local.interp_ways.size(); i++) {
                         auto iw = local.interp_ways[i];
                         iw.node_offset += interp_node_base;
-                        iw.street_id = data.string_pool.intern(local.interp_strings[i]);
+                        iw.street_id = name_id(local.interp_strings[i]);
                         data.interp_ways.push_back(iw);
                         // Strategy-2 stable identity: PBF-sourced interp_way is from a way.
                         int64_t iw_osm_id = i < local.interp_osm_way_ids.size() ? local.interp_osm_way_ids[i] : 0;
@@ -4365,7 +4383,7 @@ static int run(int argc, char* argv[]) {
                         data.poi_vertices.insert(data.poi_vertices.end(),
                             pw.vertices.begin(), pw.vertices.end());
                         pw.record.vertex_offset = vertex_offset;
-                        pw.record.name_id = data.string_pool.intern(pw.name);
+                        pw.record.name_id = name_id(pw.name);
                         data.poi_records.push_back(pw.record);
                         // Strategy-2 stable identity: way-sourced POI.
                         data.poi_osm_ids.push_back(
