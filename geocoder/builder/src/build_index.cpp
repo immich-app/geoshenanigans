@@ -54,6 +54,7 @@ inline uint64_t pack_osm_id(gc::id_alloc::ObjectType type, int64_t osm_id) {
 #include "cell_index.h"
 #include "parent_linking.h"
 #include "admin_rank_config.h"
+#include "parallel.h"
 #include "scratch_dir.h"
 #include "tiger.h"
 #include "parallel.h"
@@ -364,6 +365,34 @@ struct BuildConfig {
     std::string prev_output_dir;
 };
 
+// Admin polygon containment with every ring's RingBox precomputed, so the ray
+// cast only runs where the exact box reject can't answer. Polygons whose
+// vertex range is out of bounds get the empty box; callers skip them anyway.
+class AdminRings {
+public:
+    AdminRings(const ParsedData& data, unsigned int threads)
+        : data_(data), boxes_(data.admin_polygons.size()) {
+        parallel_for(boxes_.size(), [&](size_t begin, size_t end, unsigned) {
+            for (size_t i = begin; i < end; i++) {
+                const auto& p = data.admin_polygons[i];
+                boxes_[i] = p.vertex_offset + p.vertex_count > data.admin_vertices.size()
+                    ? ring_box(nullptr, 0)
+                    : ring_box(&data.admin_vertices[p.vertex_offset], p.vertex_count);
+            }
+        }, threads);
+    }
+
+    bool contains(uint32_t pid, float lat, float lng) const {
+        if (ring_box_excludes(boxes_[pid], lat, lng)) return false;
+        const auto& p = data_.admin_polygons[pid];
+        return ring_contains(&data_.admin_vertices[p.vertex_offset], p.vertex_count, lat, lng);
+    }
+
+private:
+    const ParsedData& data_;
+    std::vector<RingBox> boxes_;
+};
+
 // Admin polygon parent chain: for each admin polygon, find the smallest containing
 // polygon with a lower admin_level so the server walks the chain without PIP.
 static void compute_admin_parent_chain(ParsedData& data, const BuildConfig& cfg) {
@@ -371,6 +400,7 @@ static void compute_admin_parent_chain(ParsedData& data, const BuildConfig& cfg)
     {
         auto _ap_t = std::chrono::steady_clock::now();
         data.admin_parent_ids.assign(data.admin_polygons.size(), NO_DATA);
+        const AdminRings rings(data, num_threads);
         std::atomic<size_t> ap_idx{0};
         std::vector<std::thread> workers;
         for (unsigned int t = 0; t < num_threads; t++) {
@@ -410,10 +440,8 @@ static void compute_admin_parent_chain(ParsedData& data, const BuildConfig& cfg)
                             // Prefer highest admin_level (closest parent)
                             if (cand.admin_level < best_al) continue;
                             if (cand.admin_level == best_al && cand.area >= best_area) continue;
-                            uint32_t off = cand.vertex_offset;
-                            uint32_t cnt = cand.vertex_count;
-                            if (off + cnt > data.admin_vertices.size()) continue;
-                            if (ring_contains(&data.admin_vertices[off], cnt, clat, clng)) {
+                            if (cand.vertex_offset + cand.vertex_count > data.admin_vertices.size()) continue;
+                            if (rings.contains(pid, clat, clng)) {
                                 best_al = cand.admin_level;
                                 best_area = cand.area;
                                 best_id = pid;
@@ -443,6 +471,7 @@ static void compute_way_parent_polygons(ParsedData& data, const BuildConfig& cfg
         auto _wp_t = std::chrono::steady_clock::now();
         data.way_parent_ids.assign(data.ways.size(), NO_DATA);
         data.way_postcode_ids.assign(data.ways.size(), NO_DATA);
+        const AdminRings rings(data, num_threads);
 
         // Note: per-way postcode is set from postal boundary PIP only.
         // The centroid fallback (get_nearest_postcode) is handled at
@@ -512,10 +541,8 @@ static void compute_way_parent_polygons(ParsedData& data, const BuildConfig& cfg
                     };
                     auto poly_contains = [&](uint32_t pid, float plat, float plng) -> bool {
                         const auto& cand = data.admin_polygons[pid];
-                        uint32_t off = cand.vertex_offset;
-                        uint32_t cnt2 = cand.vertex_count;
-                        if (off + cnt2 > data.admin_vertices.size()) return false;
-                        return ring_contains(&data.admin_vertices[off], cnt2, plat, plng);
+                        if (cand.vertex_offset + cand.vertex_count > data.admin_vertices.size()) return false;
+                        return rings.contains(pid, plat, plng);
                     };
                     // Parent-chain pick still uses centroid PIP —
                     // admin hierarchy is fine-grained enough that
@@ -1260,6 +1287,7 @@ static void compute_poi_parent_streets(ParsedData& data, const BuildConfig& cfg,
 template <typename LevelOk, typename Init, typename Store>
 static uint64_t link_poi_smallest_admin(ParsedData& data, unsigned int num_threads,
                 LevelOk level_ok, Init init, Store store) {
+    const AdminRings rings(data, num_threads);
     std::atomic<size_t> idx{0};
     std::atomic<uint64_t> linked{0};
     std::vector<std::thread> workers;
@@ -1290,10 +1318,8 @@ static uint64_t link_poi_smallest_admin(ParsedData& data, unsigned int num_threa
                         const auto& cand = data.admin_polygons[pid];
                         if (!level_ok(cand.admin_level)) continue;
                         if (cand.area >= best_area) continue;
-                        uint32_t off = cand.vertex_offset;
-                        uint32_t cnt2 = cand.vertex_count;
-                        if (off + cnt2 > data.admin_vertices.size()) continue;
-                        if (ring_contains(&data.admin_vertices[off], cnt2, plat, plng)) {
+                        if (cand.vertex_offset + cand.vertex_count > data.admin_vertices.size()) continue;
+                        if (rings.contains(pid, plat, plng)) {
                             best_area = cand.area;
                             best_pid = pid;
                         }
