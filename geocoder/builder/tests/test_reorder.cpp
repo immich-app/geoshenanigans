@@ -164,12 +164,28 @@ void fill_records(ParsedData& d, std::vector<float>& elevations, std::vector<uin
         p.parent_street_id = small_id(r, 4);
         p.parent_postcode_id = small_id(r, 4);
         p.parent_poly_id = r.one_in(20) ? n_admin + 4 : small_id(r, n_admin);
-        d.poi_records.push_back(p);
         if (s.osm_ids) d.poi_osm_ids.push_back(s.unique_osm_ids ? i + 1 : r.one_in(5) ? 0 : r.below(static_cast<uint32_t>(n / 2)));
         if (s.side_arrays) {
             elevations.push_back(static_cast<float>(r.below(4000)) - 100.0f);
             qids.push_back(r.below(50));
         }
+        if (i > 0 && r.one_in(10)) {
+            // An exact copy (vertices at their own offset): ties that can't
+            // show in the output.
+            size_t j = r.below(static_cast<uint32_t>(i));
+            p = d.poi_records[j];
+            if (p.vertex_offset != NO_DATA) {
+                p.vertex_offset = static_cast<uint32_t>(d.poi_vertices.size());
+                for (uint32_t v = 0; v < p.vertex_count; v++)
+                    d.poi_vertices.push_back(d.poi_vertices[d.poi_records[j].vertex_offset + v]);
+            }
+            if (s.osm_ids) d.poi_osm_ids.back() = d.poi_osm_ids[j];
+            if (s.side_arrays) {
+                elevations.back() = elevations[j];
+                qids.back() = qids[j];
+            }
+        }
+        d.poi_records.push_back(p);
     }
     d.sorted_poi_cells = new_cell_pairs(r, n, static_cast<uint32_t>(n), true);
 
@@ -258,7 +274,7 @@ void check_steps_match_reference(uint64_t seed, const Shape& s) {
         reorder_ways(got, threads);
         reorder_interps(got, threads);
         reorder_admin_polygons(got, threads);
-        reorder_pois(got, got_ele, got_qids, links);
+        reorder_pois(got, got_ele, got_qids, links, threads);
         reorder_place_nodes(got);
 
         check_same_records(want, got);

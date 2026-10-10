@@ -555,7 +555,7 @@ inline void reorder_admin_polygons(ParsedData& data, unsigned threads = 0) {
 // their vertices and computes their importance.
 inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
                          std::vector<uint32_t>& poi_qids,
-                         const std::vector<QidSitelinks>& sitelinks_data) {
+                         const std::vector<QidSitelinks>& sitelinks_data, unsigned threads = 0) {
     auto lookup_sitelinks = [&sitelinks_data](uint32_t qid) -> uint16_t {
         auto it = std::lower_bound(sitelinks_data.begin(), sitelinks_data.end(), qid,
             [](const QidSitelinks& entry, uint32_t q) { return entry.qid < q; });
@@ -563,168 +563,153 @@ inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
         return 0;
     };
 
-    if (!data.poi_records.empty()) {
-        size_t n = data.poi_records.size();
-        std::vector<uint32_t> order(n);
-        std::iota(order.begin(), order.end(), 0);
-        std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
-            const auto& pa = data.poi_records[a];
-            const auto& pb = data.poi_records[b];
-            if (pa.category != pb.category) return pa.category < pb.category;
-            if (pa.tier != pb.tier) return pa.tier < pb.tier;
-            if (pa.name_id != pb.name_id) return pa.name_id < pb.name_id;
-            uint32_t la = float_bits(pa.lat), lb = float_bits(pb.lat);
-            if (la != lb) return la < lb;
-            uint32_t ga = float_bits(pa.lng), gb = float_bits(pb.lng);
-            if (ga != gb) return ga < gb;
-            if (data.poi_osm_ids.size() == data.poi_records.size())
-                return data.poi_osm_ids[a] < data.poi_osm_ids[b];
-            return a < b;
-        });
+    if (data.poi_records.empty()) return;
 
-        // Build old→new mapping
-        std::vector<uint32_t> old_to_new(n);
-        for (uint32_t i = 0; i < n; i++) old_to_new[order[i]] = i;
+    const size_t n = data.poi_records.size();
+    const auto& pois = data.poi_records;
+    const auto& vertices = data.poi_vertices;
+    const bool have_osm = data.poi_osm_ids.size() == n;
+    const bool have_elevations = (poi_elevations.size() == n);
+    const bool have_qids = (poi_qids.size() == n);
+    auto poi_less = [&](uint32_t a, uint32_t b) {
+        const auto& pa = pois[a];
+        const auto& pb = pois[b];
+        if (pa.category != pb.category) return pa.category < pb.category;
+        if (pa.tier != pb.tier) return pa.tier < pb.tier;
+        if (pa.name_id != pb.name_id) return pa.name_id < pb.name_id;
+        uint32_t la = float_bits(pa.lat), lb = float_bits(pb.lat);
+        if (la != lb) return la < lb;
+        uint32_t ga = float_bits(pa.lng), gb = float_bits(pb.lng);
+        if (ga != gb) return ga < gb;
+        if (have_osm) return data.poi_osm_ids[a] < data.poi_osm_ids[b];
+        return a < b;
+    };
+    // POIs that tie share an osm id. Identical in everything the dedup below
+    // keeps of a record (its bytes bar the vertex offset, vertices,
+    // elevation, qid), they fold into one POI whichever came first.
+    auto tie_matters = [&](uint32_t a, uint32_t b) {
+        PoiRecord pa = pois[a], pb = pois[b];
+        bool va = pa.vertex_count > 0 && pa.vertex_offset != NO_DATA;
+        bool vb = pb.vertex_count > 0 && pb.vertex_offset != NO_DATA;
+        uint32_t from_a = pa.vertex_offset, from_b = pb.vertex_offset;
+        pa.vertex_offset = pb.vertex_offset = 0;
+        if (va != vb || std::memcmp(&pa, &pb, sizeof(PoiRecord)) != 0) return true;
+        if (va && std::memcmp(&vertices[from_a], &vertices[from_b], pa.vertex_count * sizeof(NodeCoord)) != 0)
+            return true;
+        if (have_elevations && std::memcmp(&poi_elevations[a], &poi_elevations[b], sizeof(float)) != 0) return true;
+        return have_qids && poi_qids[a] != poi_qids[b];
+    };
+    std::vector<uint32_t> order = parallel_sort_indices(n, poi_less, tie_matters, threads);
 
-        // Reorder records + vertices + elevations + qids, dedup
-        bool have_elevations = (poi_elevations.size() == n);
-        bool have_qids = (poi_qids.size() == n);
-        std::vector<PoiRecord> new_pois;
-        std::vector<NodeCoord> new_poi_verts;
-        std::vector<float> new_poi_elevations;
-        std::vector<uint32_t> new_poi_qids;
-        new_pois.reserve(n);
-        new_poi_verts.reserve(data.poi_vertices.size());
-        if (have_elevations) new_poi_elevations.reserve(n);
-        if (have_qids) new_poi_qids.reserve(n);
-        std::vector<uint32_t> dedup_remap(n);
-        size_t write_pos = 0;
+    // Dedup consecutive POIs equal in everything but their vertices.
+    std::vector<uint32_t> starts = run_starts(n, [&](size_t i, size_t j) {
+        const auto& prev = pois[order[i]];
+        const auto& p = pois[order[j]];
+        return prev.category == p.category && prev.tier == p.tier &&
+               prev.name_id == p.name_id &&
+               prev.lat == p.lat && prev.lng == p.lng &&
+               prev.vertex_count == p.vertex_count && prev.flags == p.flags;
+    }, threads);
+    const size_t kept = starts.size();
 
-        for (uint32_t i = 0; i < n; i++) {
-            auto p = data.poi_records[order[i]];
-            uint32_t old_voff = p.vertex_offset;
-            uint32_t vc = p.vertex_count;
+    // Reorder records + vertices + elevations + qids. Point POIs too take the
+    // running vertex offset.
+    Repacked<NodeCoord> repacked = repack(kept, vertices,
+        [&](size_t k) {
+            const auto& p = pois[order[starts[k]]];
+            return p.vertex_count > 0 && p.vertex_offset != NO_DATA ? size_t(p.vertex_count) : 0;
+        },
+        [&](size_t k) { return pois[order[starts[k]]].vertex_offset; }, threads);
+    std::vector<PoiRecord> new_pois(kept);
+    std::vector<float> new_poi_elevations(have_elevations ? kept : 0);
+    std::vector<uint32_t> new_poi_qids(have_qids ? kept : 0);
+    parallel_for(kept, [&](size_t b, size_t e, unsigned) {
+        for (size_t k = b; k < e; k++) {
+            uint32_t oi = order[starts[k]];
+            new_pois[k] = pois[oi];
+            new_pois[k].vertex_offset = static_cast<uint32_t>(repacked.at[k]);
+            if (have_elevations) new_poi_elevations[k] = poi_elevations[oi];
+            if (have_qids) new_poi_qids[k] = poi_qids[oi];
+        }
+    }, threads);
+    // Reorder + dedup poi_osm_ids in lockstep: each kept POI takes the
+    // first non-zero osm id of its duplicates in SORT order.
+    if (have_osm) data.poi_osm_ids = first_set_per_run(data.poi_osm_ids, order, starts, uint64_t(0), threads);
+    const std::vector<uint32_t> old_to_new = renumber_runs(order, starts, threads);
+    order = {};
+    starts = {};
+    data.poi_records = std::move(new_pois);
+    data.poi_vertices = std::move(repacked.items);
+    if (have_elevations) poi_elevations = std::move(new_poi_elevations);
+    if (have_qids) poi_qids = std::move(new_poi_qids);
 
-            // Check for duplicate vs previous
-            bool is_dup = false;
-            if (write_pos > 0) {
-                auto& prev = new_pois[write_pos - 1];
-                if (prev.category == p.category && prev.tier == p.tier &&
-                    prev.name_id == p.name_id &&
-                    prev.lat == p.lat && prev.lng == p.lng &&
-                    prev.vertex_count == p.vertex_count && prev.flags == p.flags) {
-                    is_dup = true;
+    // Remap sorted_poi_cells IDs (preserving INTERIOR_FLAG)
+    renumber_cell_pairs(data.sorted_poi_cells, [&](uint32_t id) {
+        return old_to_new[id & ID_MASK] | (id & INTERIOR_FLAG);
+    }, threads);
+    data.cell_to_pois.clear();
+    std::cerr << "  POI records sorted: " << n << " (" << (n - kept) << " duplicates removed)" << std::endl;
+
+    // Compute importance
+    parallel_for(data.poi_records.size(), [&](size_t first, size_t last, unsigned) {
+        for (size_t i = first; i < last; i++) {
+            auto& pr = data.poi_records[i];
+            PoiCategory cat = static_cast<PoiCategory>(pr.category);
+            double base = category_base_importance(cat);
+
+            // Wiki multiplier
+            bool has_wp = (pr.flags & POI_FLAG_WIKIPEDIA) != 0;
+            bool has_wd = (pr.flags & POI_FLAG_WIKIDATA) != 0;
+            double wiki_mult = 1.0;
+            if (!sitelinks_data.empty() && i < poi_qids.size() && poi_qids[i] > 0) {
+                uint16_t sl = lookup_sitelinks(poi_qids[i]);
+                if (sl > 0) {
+                    // Smooth curve: 1 sitelink=1.2x, 10=1.8x, 50=2.9x, 200=3.6x
+                    wiki_mult = 1.0 + std::log2(1.0 + sl) / 3.0;
+                } else if (has_wp && has_wd) {
+                    wiki_mult = 3.0;  // fallback to binary flags
+                } else if (has_wp) {
+                    wiki_mult = 2.5;
+                } else if (has_wd) {
+                    wiki_mult = 1.5;
                 }
-            }
-
-            if (is_dup) {
-                dedup_remap[i] = static_cast<uint32_t>(write_pos - 1);
             } else {
-                dedup_remap[i] = static_cast<uint32_t>(write_pos);
-                p.vertex_offset = static_cast<uint32_t>(new_poi_verts.size());
-                if (vc > 0 && old_voff != NO_DATA) {
-                    for (uint32_t j = 0; j < vc; j++)
-                        new_poi_verts.push_back(data.poi_vertices[old_voff + j]);
-                }
-                new_pois.push_back(p);
-                if (have_elevations) new_poi_elevations.push_back(poi_elevations[order[i]]);
-                if (have_qids) new_poi_qids.push_back(poi_qids[order[i]]);
-                write_pos++;
+                // No sitelinks data — use binary flags
+                if (has_wp && has_wd) wiki_mult = 3.0;
+                else if (has_wp) wiki_mult = 2.5;
+                else if (has_wd) wiki_mult = 1.5;
             }
-        }
 
-        size_t deduped = n - new_pois.size();
-        // Reorder + dedup poi_osm_ids in lockstep. The POI dedup loop
-        // above iterates SORT order (for (uint32_t i = 0; i < n; i++)
-        // using order[i]), so dedup_remap[i] is sort-indexed and the
-        // FIRST sort-position to map to each new_idx wins. Match
-        // that here too.
-        if (data.poi_osm_ids.size() == n) {
-            std::vector<uint64_t> new_osm(new_pois.size(), 0);
-            for (uint32_t si = 0; si < n; si++) {
-                uint32_t new_idx = dedup_remap[si];
-                if (new_idx < new_osm.size() && new_osm[new_idx] == 0)
-                    new_osm[new_idx] = data.poi_osm_ids[order[si]];
+            double raw = base * wiki_mult;
+
+            // Peak/volcano elevation scaling
+            if ((cat == PoiCategory::PEAK || cat == PoiCategory::VOLCANO) && i < poi_elevations.size()) {
+                float ele = poi_elevations[i];
+                if (ele > 0) raw *= std::min((double)ele / 2000.0, 3.0);
+                else raw *= 0.5;
             }
-            data.poi_osm_ids = std::move(new_osm);
-        }
-        data.poi_records = std::move(new_pois);
-        data.poi_vertices = std::move(new_poi_verts);
-        if (have_elevations) poi_elevations = std::move(new_poi_elevations);
-        if (have_qids) poi_qids = std::move(new_poi_qids);
 
-        // Remap sorted_poi_cells IDs (preserving INTERIOR_FLAG)
-        for (auto& p : data.sorted_poi_cells) {
-            uint32_t flags = p.item_id & INTERIOR_FLAG;
-            uint32_t old_id = p.item_id & ID_MASK;
-            p.item_id = dedup_remap[old_to_new[old_id]] | flags;
-        }
-        auto cmp = cell_item_less;
-        std::sort(data.sorted_poi_cells.begin(), data.sorted_poi_cells.end(), cmp);
-        data.cell_to_pois.clear();
-        std::cerr << "  POI records sorted: " << n << " (" << deduped << " duplicates removed)" << std::endl;
-
-        // Compute importance
-        {
-            for (size_t i = 0; i < data.poi_records.size(); i++) {
-                auto& pr = data.poi_records[i];
-                PoiCategory cat = static_cast<PoiCategory>(pr.category);
-                double base = category_base_importance(cat);
-
-                // Wiki multiplier
-                bool has_wp = (pr.flags & POI_FLAG_WIKIPEDIA) != 0;
-                bool has_wd = (pr.flags & POI_FLAG_WIKIDATA) != 0;
-                double wiki_mult = 1.0;
-                if (!sitelinks_data.empty() && i < poi_qids.size() && poi_qids[i] > 0) {
-                    uint16_t sl = lookup_sitelinks(poi_qids[i]);
-                    if (sl > 0) {
-                        // Smooth curve: 1 sitelink=1.2x, 10=1.8x, 50=2.9x, 200=3.6x
-                        wiki_mult = 1.0 + std::log2(1.0 + sl) / 3.0;
-                    } else if (has_wp && has_wd) {
-                        wiki_mult = 3.0;  // fallback to binary flags
-                    } else if (has_wp) {
-                        wiki_mult = 2.5;
-                    } else if (has_wd) {
-                        wiki_mult = 1.5;
-                    }
-                } else {
-                    // No sitelinks data — use binary flags
-                    if (has_wp && has_wd) wiki_mult = 3.0;
-                    else if (has_wp) wiki_mult = 2.5;
-                    else if (has_wd) wiki_mult = 1.5;
+            // Polygon area scaling
+            if (pr.vertex_count > 0 && pr.vertex_offset != NO_DATA) {
+                // Approximate area in km² using shoelace formula
+                double area_deg2 = 0;
+                for (uint32_t j = 0; j < pr.vertex_count; j++) {
+                    uint32_t k = (j + 1) % pr.vertex_count;
+                    const auto& a = data.poi_vertices[pr.vertex_offset + j];
+                    const auto& b = data.poi_vertices[pr.vertex_offset + k];
+                    area_deg2 += (double)a.lng * b.lat - (double)b.lng * a.lat;
                 }
-
-                double raw = base * wiki_mult;
-
-                // Peak/volcano elevation scaling
-                if ((cat == PoiCategory::PEAK || cat == PoiCategory::VOLCANO) && i < poi_elevations.size()) {
-                    float ele = poi_elevations[i];
-                    if (ele > 0) raw *= std::min((double)ele / 2000.0, 3.0);
-                    else raw *= 0.5;
-                }
-
-                // Polygon area scaling
-                if (pr.vertex_count > 0 && pr.vertex_offset != NO_DATA) {
-                    // Approximate area in km² using shoelace formula
-                    double area_deg2 = 0;
-                    for (uint32_t j = 0; j < pr.vertex_count; j++) {
-                        uint32_t k = (j + 1) % pr.vertex_count;
-                        const auto& a = data.poi_vertices[pr.vertex_offset + j];
-                        const auto& b = data.poi_vertices[pr.vertex_offset + k];
-                        area_deg2 += (double)a.lng * b.lat - (double)b.lng * a.lat;
-                    }
-                    area_deg2 = std::abs(area_deg2) / 2.0;
-                    double lat_mid = std::abs((double)pr.lat);
-                    double deg_to_km = 111.32 * std::cos(lat_mid * M_PI / 180.0);
-                    double area_km2 = area_deg2 * 111.32 * deg_to_km;
-                    if (area_km2 > 0) raw *= std::min(1.0 + std::log2(1.0 + area_km2) / 4.0, 2.0);
-                }
-
-                pr.importance = static_cast<uint8_t>(std::max(1.0, std::min(255.0, raw)));
+                area_deg2 = std::abs(area_deg2) / 2.0;
+                double lat_mid = std::abs((double)pr.lat);
+                double deg_to_km = 111.32 * std::cos(lat_mid * M_PI / 180.0);
+                double area_km2 = area_deg2 * 111.32 * deg_to_km;
+                if (area_km2 > 0) raw *= std::min(1.0 + std::log2(1.0 + area_km2) / 4.0, 2.0);
             }
-            std::cerr << "  POI importance computed" << std::endl;
+
+            pr.importance = static_cast<uint8_t>(std::max(1.0, std::min(255.0, raw)));
         }
-    }
+    }, threads);
+    std::cerr << "  POI importance computed" << std::endl;
 }
 
 // Sorts place nodes by (place_type, name_id, lat_bits, lng_bits).
