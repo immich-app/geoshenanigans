@@ -519,6 +519,27 @@ inline void reorder_interps(ParsedData& data, unsigned threads = 0) {
               << " (" << (n - kept) << " duplicates removed)" << std::endl;
 }
 
+// Moves admin polygon order[i] to slot i, with its vertices repacked in the
+// new order and its osm id in lockstep; returns old_to_new. References to
+// polygons elsewhere are the caller's to remap.
+inline std::vector<uint32_t> permute_admin_polygons(ParsedData& data, const std::vector<uint32_t>& order,
+                                                    unsigned threads) {
+    const size_t n = order.size();
+    const auto& polys = data.admin_polygons;
+    std::vector<uint32_t> old_to_new = invert(order, threads);
+    Repacked<NodeCoord> repacked = repack(n, data.admin_vertices,
+        [&](size_t i) { return size_t(polys[order[i]].vertex_count); },
+        [&](size_t i) { return polys[order[i]].vertex_offset; }, threads);
+    std::vector<AdminPolygon> new_polys = gather(polys, order, threads);
+    parallel_for(n, [&](size_t b, size_t e, unsigned) {
+        for (size_t i = b; i < e; i++) new_polys[i].vertex_offset = static_cast<uint32_t>(repacked.at[i]);
+    }, threads);
+    if (data.admin_osm_ids.size() == n) data.admin_osm_ids = gather(data.admin_osm_ids, order, threads);
+    data.admin_polygons = std::move(new_polys);
+    data.admin_vertices = std::move(repacked.items);
+    return old_to_new;
+}
+
 // Sorts admin polygons by (name, level, country, vertex_count) and reorders
 // their vertices.
 inline void reorder_admin_polygons(ParsedData& data, unsigned threads = 0) {
@@ -554,21 +575,9 @@ inline void reorder_admin_polygons(ParsedData& data, unsigned threads = 0) {
     const std::vector<uint32_t> order =
         take_order("admin polygons",
                    parallel_sort_indices(n, admin_less, [](uint32_t, uint32_t) { return true; }, threads));
-    const std::vector<uint32_t> old_to_new = invert(order, threads);
-
-    Repacked<NodeCoord> repacked = repack(n, vertices,
-        [&](size_t i) { return size_t(polys[order[i]].vertex_count); },
-        [&](size_t i) { return polys[order[i]].vertex_offset; }, threads);
-    std::vector<AdminPolygon> new_polys = gather(polys, order, threads);
-    parallel_for(n, [&](size_t b, size_t e, unsigned) {
-        for (size_t i = b; i < e; i++) new_polys[i].vertex_offset = static_cast<uint32_t>(repacked.at[i]);
-    }, threads);
-    // Reorder admin_osm_ids in lockstep (no dedup happens in
-    // this sort — just a permutation — so the size stays the
-    // same).
-    if (have_osm) data.admin_osm_ids = gather(data.admin_osm_ids, order, threads);
-    data.admin_polygons = std::move(new_polys);
-    data.admin_vertices = std::move(repacked.items);
+    // No dedup happens in this sort — just a permutation — so
+    // admin_osm_ids keeps its size.
+    const std::vector<uint32_t> old_to_new = permute_admin_polygons(data, order, threads);
 
     auto remap_each = [&](size_t count, auto&& remap_one) {
         parallel_for(count, [&](size_t b, size_t e, unsigned) {

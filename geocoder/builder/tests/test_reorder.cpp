@@ -441,6 +441,35 @@ TEST(partition_strings_handles_an_empty_pool) {
 
 // --- Cell maps ---
 
+TEST(permute_admin_polygons_moves_vertices_and_osm_ids_with_each_polygon) {
+    for (unsigned threads : kThreadCounts) {
+        ParsedData d;
+        const uint32_t counts[] = {3, 1, 0, 2};
+        for (uint32_t i = 0; i < 4; i++) {
+            AdminPolygon p{};
+            p.vertex_offset = static_cast<uint32_t>(d.admin_vertices.size());
+            p.vertex_count = counts[i];
+            p.name_id = i;
+            for (uint32_t v = 0; v < counts[i]; v++) d.admin_vertices.push_back({float(i), float(v)});
+            d.admin_polygons.push_back(p);
+            d.admin_osm_ids.push_back(100 + i);
+        }
+        auto old_to_new = permute_admin_polygons(d, {2, 0, 3, 1}, threads);
+        CHECK(old_to_new == std::vector<uint32_t>({1, 3, 0, 2}));
+        CHECK(d.admin_osm_ids == std::vector<uint64_t>({102, 100, 103, 101}));
+        const uint32_t want_offsets[] = {0, 0, 3, 5};
+        bool same = d.admin_vertices.size() == 6;
+        for (uint32_t i = 0; i < 4; i++) {
+            const auto& p = d.admin_polygons[i];
+            same = same && p.vertex_offset == want_offsets[i] && p.vertex_count == counts[p.name_id];
+            for (uint32_t v = 0; v < p.vertex_count; v++)
+                same = same && d.admin_vertices[p.vertex_offset + v].lat == float(p.name_id) &&
+                       d.admin_vertices[p.vertex_offset + v].lng == float(v);
+        }
+        CHECK(same);
+    }
+}
+
 TEST(cell_lists_lists_every_cell_once_with_its_own_list) {
     std::unordered_map<uint64_t, std::vector<uint32_t>> m;
     Rng r(5);
