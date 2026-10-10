@@ -4405,7 +4405,14 @@ static int run(int argc, char* argv[]) {
                         poi_elevations.push_back(pw.elevation);
                         poi_qids.push_back(pw.qid);
                     }
-                    local.poi_ways.clear();
+
+                    // Free this thread's buffers as soon as they are merged
+                    // rather than when tld goes out of scope after admin
+                    // assembly: they hold tens of GiB on planet. Closed-way
+                    // admins are merged below.
+                    auto closed_way_admins = std::move(local.closed_way_admins);
+                    local = ThreadLocalData{};
+                    local.closed_way_admins = std::move(closed_way_admins);
                 }
                 std::cerr << "  Merged: " << total_ways << " ways, "
                           << total_building_addrs << " building addrs, "
