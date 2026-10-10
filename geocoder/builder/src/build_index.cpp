@@ -1711,6 +1711,18 @@ static void rebuild_cell_maps_for_cache(ParsedData& data,
     log_phase("Rebuild cell maps", _pt, _cpu);
 }
 
+// Runs fn(ids) on every cell's list in cell_to_admin, lists spread over the
+// cores; fn must touch only the list it is given.
+template <typename Fn>
+static void for_each_admin_cell_list(ParsedData& data, unsigned int threads, Fn fn) {
+    std::vector<std::vector<uint32_t>*> lists;
+    lists.reserve(data.cell_to_admin.size());
+    for (auto& [cell_id, ids] : data.cell_to_admin) lists.push_back(&ids);
+    parallel_for(lists.size(), [&](size_t begin, size_t end, unsigned) {
+        for (size_t i = begin; i < end; i++) fn(*lists[i]);
+    }, threads);
+}
+
 // Write all index files (full + multi-output variants + qualities + continents).
 static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                 const std::vector<double>& quality_scales, bool generate_continents,
@@ -5062,11 +5074,8 @@ static int run(int argc, char* argv[]) {
         std::cerr << "Waiting for admin polygon S2 covering to complete..." << std::endl;
         admin_pool.wait_idle();
         log_phase("    Admin: S2 covering wait", _pt, _cpu);
-        auto admin_results = admin_pool.drain();
-        for (auto& [cell_id, ids] : admin_results) {
-            auto& target = data.cell_to_admin[cell_id];
-            target.insert(target.end(), ids.begin(), ids.end());
-        }
+        // Nothing else fills cell_to_admin while parsing: take the map whole.
+        data.cell_to_admin = admin_pool.drain();
         log_phase("    Admin: S2 covering merge", _pt, _cpu);
         std::cerr << "Admin polygon S2 covering complete (" << data.cell_to_admin.size() << " cells)." << std::endl;
 
@@ -5120,13 +5129,13 @@ static int run(int argc, char* argv[]) {
             }
 
             // Remap poly_ids in cell_to_admin (preserving INTERIOR_FLAG)
-            for (auto& [cell_id, ids] : data.cell_to_admin) {
+            for_each_admin_cell_list(data, num_threads, [&](std::vector<uint32_t>& ids) {
                 for (auto& id : ids) {
                     uint32_t flags = id & INTERIOR_FLAG;
                     uint32_t old_id = id & ID_MASK;
                     id = old_to_new[old_id] | flags;
                 }
-            }
+            });
             std::cerr << "Sorted admin polygons largest-first (" << n << " polygons)." << std::endl;
         }
 
@@ -5145,12 +5154,12 @@ static int run(int argc, char* argv[]) {
         // this order only governs the parent tie-breaks. (Place-node uses its
         // own (area, osm_id) candidate sort.)
         if (data.admin_osm_ids.size() == data.admin_polygons.size()) {
-            for (auto& [cell_id, ids] : data.cell_to_admin) {
+            for_each_admin_cell_list(data, num_threads, [&](std::vector<uint32_t>& ids) {
                 std::sort(ids.begin(), ids.end(), [&](uint32_t x, uint32_t y) {
                     return data.admin_osm_ids[x & ID_MASK] <
                            data.admin_osm_ids[y & ID_MASK];
                 });
-            }
+            });
         }
 
         compute_place_node_containment(data, cfg, _pt, _cpu);

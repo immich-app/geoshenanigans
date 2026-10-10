@@ -1,6 +1,7 @@
 #include "s2_helpers.h"
 #include "geometry.h"
 #include "country_code.h"
+#include "parallel.h"
 
 #include <algorithm>
 #include <cmath>
@@ -178,23 +179,45 @@ void AdminCoverPool::wait_idle() {
 
 std::unordered_map<uint64_t, std::vector<uint32_t>> AdminCoverPool::drain() {
     wait_idle();
-    std::unordered_map<uint64_t, std::vector<uint32_t>> merged;
-    for (auto& local : thread_results_) {
-        for (auto& [cell_id, ids] : local) {
-            auto& target = merged[cell_id];
-            target.insert(target.end(), ids.begin(), ids.end());
+    // Merge the per-worker maps on all workers, each cell in the one shard
+    // its id hashes to (splitmix64: level-10 ids end in 40 zero bits).
+    size_t shards = std::max<size_t>(1, thread_results_.size());
+    auto shard_of = [shards](uint64_t cell_id) {
+        uint64_t z = cell_id;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        return static_cast<size_t>((z ^ (z >> 31)) % shards);
+    };
+    std::vector<std::unordered_map<uint64_t, std::vector<uint32_t>>> parts(shards);
+    parallel_for(shards, [&](size_t begin, size_t end, unsigned) {
+        for (size_t s = begin; s < end; s++) {
+            auto& part = parts[s];
+            for (const auto& local : thread_results_) {
+                for (const auto& [cell_id, ids] : local) {
+                    if (shard_of(cell_id) != s) continue;
+                    auto& target = part[cell_id];
+                    target.insert(target.end(), ids.begin(), ids.end());
+                }
+            }
+            // Determinism: the order in which worker threads pick items off the
+            // queue is thread-scheduling dependent, so each cell's merged vector
+            // can end up in a different order across runs. Downstream code that
+            // iterates these vectors (e.g. the "first admin_level=2 polygon"
+            // country lookup in the postcode centroid writer) must see a stable
+            // ordering or its output becomes non-deterministic and breaks
+            // incremental patching. Sort each vector by its entry value (which
+            // includes the INTERIOR_FLAG bit + poly_id).
+            for (auto& [cell_id, ids] : part) {
+                std::sort(ids.begin(), ids.end());
+            }
         }
-    }
-    // Determinism: the order in which worker threads pick items off the
-    // queue is thread-scheduling dependent, so each cell's merged vector
-    // can end up in a different order across runs. Downstream code that
-    // iterates these vectors (e.g. the "first admin_level=2 polygon"
-    // country lookup in the postcode centroid writer) must see a stable
-    // ordering or its output becomes non-deterministic and breaks
-    // incremental patching. Sort each vector by its entry value (which
-    // includes the INTERIOR_FLAG bit + poly_id).
-    for (auto& [cell_id, ids] : merged) {
-        std::sort(ids.begin(), ids.end());
+    }, static_cast<unsigned>(shards));
+    std::unordered_map<uint64_t, std::vector<uint32_t>> merged;
+    size_t cells = 0;
+    for (const auto& part : parts) cells += part.size();
+    merged.reserve(cells);
+    for (auto& part : parts) {
+        for (auto& [cell_id, ids] : part) merged.emplace(cell_id, std::move(ids));
     }
     return merged;
 }
