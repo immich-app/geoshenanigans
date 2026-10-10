@@ -352,19 +352,26 @@ struct BuildConfig {
 class AdminRings {
 public:
     AdminRings(const ParsedData& data, unsigned int threads)
-        : data_(data), boxes_(data.admin_polygons.size()) {
-        parallel_for(boxes_.size(), [&](size_t begin, size_t end, unsigned) {
+        : data_(data), boxes_(data.admin_polygons.size()), edges_(data.admin_polygons.size()) {
+        // The polygons come largest first: hand them out a few at a time.
+        parallel_for_dynamic(boxes_.size(), kRingsPerChunk, [&](size_t begin, size_t end, unsigned) {
             for (size_t i = begin; i < end; i++) {
                 const auto& p = data.admin_polygons[i];
-                boxes_[i] = p.vertex_offset + p.vertex_count > data.admin_vertices.size()
-                    ? ring_box(nullptr, 0)
-                    : ring_box(&data.admin_vertices[p.vertex_offset], p.vertex_count);
+                if (p.vertex_offset + p.vertex_count > data.admin_vertices.size()) {
+                    boxes_[i] = ring_box(nullptr, 0);
+                    continue;
+                }
+                const NodeCoord* verts = &data.admin_vertices[p.vertex_offset];
+                boxes_[i] = ring_box(verts, p.vertex_count);
+                if (p.vertex_count >= kMinIndexedRingVertices)
+                    edges_[i] = std::make_unique<RingEdgeIndex>(verts, p.vertex_count);
             }
         }, threads);
     }
 
     bool contains(uint32_t pid, float lat, float lng) const {
         if (ring_box_excludes(boxes_[pid], lat, lng)) return false;
+        if (edges_[pid]) return edges_[pid]->contains(lat, lng);
         const auto& p = data_.admin_polygons[pid];
         return ring_contains(&data_.admin_vertices[p.vertex_offset], p.vertex_count, lat, lng);
     }
@@ -377,8 +384,15 @@ public:
     }
 
 private:
+    // Rings this long cast their ray through a RingEdgeIndex, which answers
+    // as ring_contains does: the passes test millions of points against the
+    // same big rings, each a scan of thousands of edges.
+    static constexpr uint32_t kMinIndexedRingVertices = 64;
+    static constexpr size_t kRingsPerChunk = 16;
+
     const ParsedData& data_;
     std::vector<RingBox> boxes_;
+    std::vector<std::unique_ptr<RingEdgeIndex>> edges_;  // null below kMinIndexedRingVertices
 };
 
 // Calls visit(pid, polygon) for each in-bounds admin polygon listed in `cell`
