@@ -73,6 +73,12 @@ target_include_directories(geocoder-patch PRIVATE tools src)
 # pread offsets past 4 GiB on 32-bit glibc too (sequential_file_reader.h).
 target_compile_definitions(geocoder-patch PRIVATE _FILE_OFFSET_BITS=64)
 
+# osmium apply-changes for the nightly planet update, blob by blob.
+add_executable(pbf-apply tools/pbf_apply.cpp src/pbf_reader.cpp)
+target_link_libraries(pbf-apply PRIVATE ZLIB::ZLIB EXPAT::EXPAT Threads::Threads)
+target_include_directories(pbf-apply PRIVATE tools src)
+target_compile_definitions(pbf-apply PRIVATE _FILE_OFFSET_BITS=64)
+
 target_include_directories(build-index PRIVATE "${EMBEDDED_POLY_DIR}")
 
 if(EXISTS /opt/homebrew/include)
@@ -100,8 +106,8 @@ endif()
 
 # --- Unit tests (geocoder-tests) ---
 #
-# Dependency-free unit tests for the builder's pure logic (no S2 needed — the
-# helpers under test only include standard headers + types.h/parsed_data.h).
+# Unit tests for the builder's pure logic and the tools (no S2 needed — the
+# helpers under test need at most zlib, expat and protozero).
 # Every tests/*.cpp is auto-discovered; run with `ctest` or by executing the
 # geocoder-tests binary directly. Not in the default critical build path: build
 # explicitly with `make geocoder-tests`.
@@ -111,12 +117,13 @@ add_executable(geocoder-tests
     ${GEOCODER_TEST_SRCS}
     src/ring_assembly.cpp
     src/interpolation.cpp
+    src/pbf_reader.cpp
 )
 target_include_directories(geocoder-tests PRIVATE src tools tests)
 target_compile_definitions(geocoder-tests PRIVATE
     GEOCODER_TEMPLATE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/configurations.template.json"
     _FILE_OFFSET_BITS=64)
-target_link_libraries(geocoder-tests PRIVATE Threads::Threads)
+target_link_libraries(geocoder-tests PRIVATE ZLIB::ZLIB EXPAT::EXPAT Threads::Threads)
 add_test(NAME geocoder-tests COMMAND geocoder-tests)
 
 # GEOCODER_SANITIZE=ON builds the unit tests with ASan + UBSan, undefined
