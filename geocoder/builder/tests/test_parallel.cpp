@@ -62,6 +62,82 @@ TEST(parallel_for_rethrows_a_worker_exception) {
     CHECK(thrown);
 }
 
+TEST(parallel_for_each_visits_every_index_once) {
+    for (unsigned threads : {1u, 2u, 3u, 8u, 64u}) {
+        for (size_t n : {size_t(0), size_t(1), size_t(5), size_t(1000)}) {
+            std::vector<std::atomic<int>> hits(n);
+            std::atomic<bool> worker_in_range{true};
+            parallel_for_each(n, [&](size_t i, unsigned worker) {
+                hits[i]++;
+                if (worker >= threads) worker_in_range = false;
+            }, threads);
+            for (size_t i = 0; i < n; i++) CHECK_EQ(hits[i].load(), 1);
+            CHECK(worker_in_range.load());
+        }
+    }
+}
+
+TEST(parallel_for_each_rethrows_a_worker_exception) {
+    bool thrown = false;
+    try {
+        parallel_for_each(100, [](size_t i, unsigned) {
+            if (i == 42) throw std::runtime_error("boom");
+        }, 4);
+    } catch (const std::runtime_error&) {
+        thrown = true;
+    }
+    CHECK(thrown);
+}
+
+TEST(parallel_ordered_consumes_in_index_order) {
+    for (unsigned threads : {1u, 2u, 3u, 8u, 64u}) {
+        for (size_t window : {size_t(0), size_t(1), size_t(4)}) {
+            for (size_t n : {size_t(0), size_t(1), size_t(7), size_t(500)}) {
+                std::vector<size_t> seen;
+                parallel_ordered(n, [](size_t i) { return std::vector<size_t>(i % 5, i); },
+                                 [&](size_t i, std::vector<size_t>&& r) {
+                                     CHECK_EQ(r.size(), i % 5);
+                                     seen.push_back(i);
+                                 }, threads, window);
+                std::vector<size_t> expect(n);
+                for (size_t i = 0; i < n; i++) expect[i] = i;
+                CHECK(seen == expect);
+            }
+        }
+    }
+}
+
+TEST(parallel_ordered_never_runs_more_than_window_ahead) {
+    std::atomic<size_t> consumed{0};
+    std::atomic<bool> too_far{false};
+    parallel_ordered(300, [&](size_t i) {
+        if (i >= consumed.load() + 3) too_far = true;
+        return i;
+    }, [&](size_t, size_t&&) { consumed++; }, 8, 3);
+    CHECK(!too_far.load());
+    CHECK_EQ(consumed.load(), size_t(300));
+}
+
+TEST(parallel_ordered_rethrows_from_either_side) {
+    for (bool in_produce : {true, false}) {
+        size_t consumed = 0;
+        bool thrown = false;
+        try {
+            parallel_ordered(1000, [&](size_t i) {
+                if (in_produce && i == 10) throw std::runtime_error("produce");
+                return i;
+            }, [&](size_t i, size_t&&) {
+                if (!in_produce && i == 10) throw std::runtime_error("consume");
+                consumed++;
+            }, 4);
+        } catch (const std::runtime_error&) {
+            thrown = true;
+        }
+        CHECK(thrown);
+        CHECK_EQ(consumed, size_t(10));
+    }
+}
+
 TEST(parallel_find_all_lists_matches_in_order_for_any_thread_count) {
     for (size_t n : {size_t(0), size_t(1), size_t(7), size_t(100000)}) {
         auto pred = [](size_t i) { return (i * 2654435761u) % 7 < 2; };

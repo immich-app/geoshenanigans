@@ -4,11 +4,16 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <exception>
 #include <iterator>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 inline unsigned parallel_threads() {
@@ -43,6 +48,106 @@ void parallel_for(size_t n, Fn&& fn, unsigned threads = 0) {
     for (auto& t : pool) t.join();
     for (auto& e : errors)
         if (e) std::rethrow_exception(e);
+}
+
+// Runs fn(i, worker) for every i in [0, n) on at most `threads` threads
+// (0 = every core), handing indices out one at a time so uneven items
+// balance. Which worker runs which i varies run to run. The first exception
+// a worker throws is rethrown here after all workers finish.
+template <class Fn>
+void parallel_for_each(size_t n, Fn&& fn, unsigned threads = 0) {
+    if (threads == 0) threads = parallel_threads();
+    std::atomic<size_t> next{0};
+    parallel_for(std::min<size_t>(threads, n), [&](size_t, size_t, unsigned worker) {
+        for (size_t i; (i = next.fetch_add(1)) < n;) fn(i, worker);
+    }, threads);
+}
+
+// Runs produce(i) for every i in [0, n) on worker threads and consume(i, r)
+// with each result on the calling thread in index order, so the consumer
+// sees what a serial loop would. At most `window` results are produced ahead
+// of the consumer (0 = two per thread), which bounds their memory. An
+// exception from produce(i) or consume(i) stops the pipeline when the
+// consumer reaches i and is rethrown here.
+template <class Produce, class Consume>
+void parallel_ordered(size_t n, Produce&& produce, Consume&& consume, unsigned threads = 0,
+                      size_t window = 0) {
+    using R = std::decay_t<std::invoke_result_t<Produce&, size_t>>;
+    if (threads == 0) threads = parallel_threads();
+    if (window == 0) window = size_t(2) * threads;
+    size_t workers = std::min<size_t>(threads, n);
+    if (workers <= 1) {
+        for (size_t i = 0; i < n; i++) consume(i, produce(i));
+        return;
+    }
+
+    struct Slot {
+        std::optional<R> result;
+        std::exception_ptr error;
+        bool ready = false;
+    };
+    std::vector<Slot> slots(window);  // index i lives in slot i % window
+    std::mutex mtx;
+    std::condition_variable produced, consumed;
+    size_t next = 0, done = 0;
+    bool stop = false;
+
+    auto work = [&] {
+        for (;;) {
+            size_t i;
+            {
+                std::unique_lock<std::mutex> lock(mtx);
+                consumed.wait(lock, [&] { return stop || next >= n || next < done + window; });
+                if (stop || next >= n) return;
+                i = next++;
+            }
+            Slot out;
+            try {
+                out.result.emplace(produce(i));
+            } catch (...) {
+                out.error = std::current_exception();
+            }
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                slots[i % window] = std::move(out);
+                slots[i % window].ready = true;
+            }
+            produced.notify_all();
+        }
+    };
+    std::vector<std::thread> pool;
+    pool.reserve(workers);
+    auto finish = [&] {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            stop = true;
+        }
+        consumed.notify_all();
+        for (auto& t : pool) t.join();
+    };
+    try {
+        for (size_t w = 0; w < workers; w++) pool.emplace_back(work);
+        for (size_t i = 0; i < n; i++) {
+            Slot in;
+            {
+                std::unique_lock<std::mutex> lock(mtx);
+                produced.wait(lock, [&] { return slots[i % window].ready; });
+                in = std::move(slots[i % window]);
+                slots[i % window] = Slot{};
+            }
+            if (in.error) std::rethrow_exception(in.error);
+            consume(i, std::move(*in.result));
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                done = i + 1;
+            }
+            consumed.notify_all();
+        }
+    } catch (...) {
+        finish();
+        throw;
+    }
+    finish();
 }
 
 // The indices i in [0, n) where pred(i) holds, ascending, tested on every
