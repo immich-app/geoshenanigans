@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """Compresses a build's index files for publishing.
 
-Usage: compress_index.py <output dir>
+Usage: compress_index.py <output dir> [--upload DEST --upload-cmd CMD]
 
 Writes <file>.zst next to every .bin file and load sidecar under the output
 dir (files with identical content share one .zst through hard links) and
 records each one's raw size, compressed size and raw sha256 in
 configurations.json["files"]. The .bin files stay: patch generation may still
 be reading them, so the caller removes them.
+
+--upload streams each .zst to DEST/<path>.zst as soon as it exists, through
+one long-running CMD (an `s5cmd ... run` reading cp commands on stdin): the
+upload is network-bound and compression CPU-bound, so they overlap instead of
+the upload waiting for the last file. Upload failures only warn; the caller
+re-uploads whatever is missing.
 
 zstd level 18 compresses our structured binary data to within 0.3% of
 level 19 (itself within ~2% of --ultra -22) at 21% less CPU; level 17 and
@@ -21,12 +27,13 @@ and need many workers, while the multi-GiB ones need threads of their own or
 they finish long after everything else. On a planet output (105.7 GiB, 64
 cores) this took 2104 s against 2933 s for the previous 4 workers x -T0.
 """
+import argparse
 import hashlib
 import json
 import os
+import shlex
 import subprocess
-import sys
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 LEVEL = "-18"
 BYTES_PER_THREAD = 256 << 20
@@ -63,8 +70,33 @@ def compress(path):
     subprocess.run(["zstd", LEVEL, f"-T{threads}", "-f", "--quiet", path], check=True)
 
 
+class Uploader:
+    """Feeds `cp <file> <dest>/<path>` lines to a running `s5cmd run`."""
+
+    def __init__(self, out, dest, cmd):
+        self.out, self.dest = out, dest.rstrip("/")
+        self.proc = subprocess.Popen(shlex.split(cmd), stdin=subprocess.PIPE, text=True) if dest else None
+
+    def send(self, path):
+        if self.proc:
+            self.proc.stdin.write(f"cp {path} {self.dest}/{os.path.relpath(path, self.out)}\n")
+            self.proc.stdin.flush()
+
+    def finish(self):
+        if not self.proc:
+            return
+        self.proc.stdin.close()
+        if self.proc.wait() != 0:
+            print("Warning: some streamed uploads failed; the caller re-uploads them", flush=True)
+
+
 def main():
-    out = sys.argv[1]
+    args = argparse.ArgumentParser()
+    args.add_argument("out")
+    args.add_argument("--upload", default="")
+    args.add_argument("--upload-cmd", default="s5cmd run")
+    opts = args.parse_args()
+    out = opts.out
     cpath = os.path.join(out, "configurations.json")
     with open(cpath) as f:
         cfg = json.load(f)
@@ -81,16 +113,25 @@ def main():
     distinct = list(first.values())
     print(f"Compressing {len(distinct)} distinct of {len(paths)} files with zstd {LEVEL} "
           f"on {os.cpu_count()} workers...", flush=True)
-    with ThreadPoolExecutor(max_workers=os.cpu_count()) as ex:
-        list(ex.map(compress, distinct))
+    uploader = Uploader(out, opts.upload, opts.upload_cmd)
+    try:
+        with ThreadPoolExecutor(max_workers=os.cpu_count()) as ex:
+            running = {ex.submit(compress, path): path for path in distinct}
+            for done in as_completed(running):
+                done.result()
+                uploader.send(running[done] + ".zst")
+        for path, digest in zip(paths, hashes):
+            source = first[digest]
+            if source != path:
+                if os.path.exists(path + ".zst"):
+                    os.remove(path + ".zst")
+                os.link(source + ".zst", path + ".zst")
+                uploader.send(path + ".zst")
+    finally:
+        uploader.finish()
 
     files = {}
     for path, digest in zip(paths, hashes):
-        source = first[digest]
-        if source != path:
-            if os.path.exists(path + ".zst"):
-                os.remove(path + ".zst")
-            os.link(source + ".zst", path + ".zst")
         rel = os.path.relpath(path, out)
         files[rel] = {"size_zst": os.path.getsize(path + ".zst"), "size_raw": os.path.getsize(path), "sha256": digest}
         pct = 100 * files[rel]["size_zst"] / files[rel]["size_raw"] if files[rel]["size_raw"] else 0

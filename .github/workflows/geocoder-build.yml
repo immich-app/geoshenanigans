@@ -637,8 +637,14 @@ jobs:
 
           # Compress the new index alongside the diffs, whose long tail
           # (planet/full) leaves most cores idle. It keeps the .bin files the
-          # diffs and verifies read; the compress step removes them.
+          # diffs and verifies read; the compress step removes them. Each
+          # .zst streams to this date's (cleared) Tigris prefix as soon as it
+          # exists: the upload is network-bound, so it hides behind the
+          # compression. Finalize uploads whatever is still missing.
+          $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
           nice -n 10 python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output" \
+            --upload "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE" \
+            --upload-cmd "s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 16 run" \
             > "$WORKDIR/compress.log" 2>&1 < /dev/null &
           COMPRESS_PID=$!
 
@@ -732,14 +738,19 @@ jobs:
       - name: Compress index files
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
+          NEW_DATE: ${{ steps.setup.outputs.today }}
         run: |
           # Patch generation compresses alongside its diffs; a fresh build
-          # (or a failed background run) compresses here.
+          # (or a failed background run) compresses here, streaming the
+          # upload the same way.
           if [ -f "$WORKDIR/compress.done" ]; then
             echo "Compressed during patch generation"
           else
             COMPRESS_START=$(date +%s)
-            python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output"
+            s5cmd --endpoint-url "$S3_ENDPOINT" --numworkers 32 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
+            python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output" \
+              --upload "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE" \
+              --upload-cmd "s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 16 run"
             echo "Compression done in $(($(date +%s) - COMPRESS_START))s"
           fi
           find "$WORKDIR/output" -name "*.bin" -delete
@@ -760,13 +771,10 @@ jobs:
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
 
-          # Clear stale files from prior builds at this date, then upload
-          # compressed .bin.zst + patches + json in one shot. Tigris
-          # occasionally fails multipart uploads under concurrency — the
-          # verify loop below re-uploads anything missing.
-          echo "Clearing stale files at s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/..."
-          $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
-
+          # Upload the patches, json and sidecars, plus any .zst the
+          # compression stream missed. Tigris occasionally fails multipart
+          # uploads under concurrency — the verify loop below re-uploads
+          # anything missing.
           echo "Uploading .bin.zst + patches + osm_ids sidecars to Tigris..."
           UPLOAD_START=$(date +%s)
           # Strategy-2 sidecars (*.osm_ids) carry the osm_id ↔ dense-idx
@@ -781,7 +789,10 @@ jobs:
           $CACHE cp --concurrency 16 \
             "$WORKDIR/output/*" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/" > /dev/null 2>&1 &
           CACHE_PID=$!
-          s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 4 cp --concurrency 8 \
+          # The .zst files streamed up during compression (the prefix was
+          # cleared then): only what is missing or differs in size goes now.
+          # The runner's ~1 Gbit/s link caps the rate; 16 workers reach it.
+          s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 16 cp --if-size-differ --concurrency 8 \
             "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/" || \
             echo "::warning::Some files failed on first pass — verify loop will retry"
           echo "Tigris upload first pass complete in $(($(date +%s) - UPLOAD_START))s"
