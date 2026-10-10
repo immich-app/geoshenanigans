@@ -1928,22 +1928,32 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                 // files that never carried it.
                 const PoiTierSelection selection =
                     select_poi_tier(d.poi_records, d.poi_sidecar_blob, tier_var.max_tier);
-                std::vector<PoiRecord> filtered_records;
+                const auto& selected = selection.indices;
+                std::vector<PoiRecord> filtered_records(selected.size());
                 std::vector<uint8_t> filtered_vertex_bytes;
                 std::vector<uint32_t> id_remap(d.poi_records.size(), NO_DATA);
-
-                for (uint32_t i : selection.indices) {
-                    id_remap[i] = static_cast<uint32_t>(filtered_records.size());
-                    auto pr = d.poi_records[i];
-                    if (pr.vertex_count > 0 && pr.vertex_offset != NO_DATA) {
-                        pr.vertex_offset = append_polygon(filtered_vertex_bytes, &d.poi_vertices[pr.vertex_offset],
-                                                          pr.vertex_count);
-                    } else {
-                        // Point POI — no header / no vertices.
-                        pr.vertex_offset = NO_DATA;
-                    }
-                    filtered_records.push_back(pr);
-                }
+                // Point POI — no header / no vertices.
+                auto is_polygon = [](const PoiRecord& pr) { return pr.vertex_count > 0 && pr.vertex_offset != NO_DATA; };
+                parallel_prefix_fill(selected.size(),
+                    [&](size_t k) -> size_t {
+                        const auto& pr = d.poi_records[selected[k]];
+                        return is_polygon(pr) ? plan_polygon(&d.poi_vertices[pr.vertex_offset], pr.vertex_count).bytes : 0;
+                    },
+                    [&](size_t total) { filtered_vertex_bytes.resize(total); },
+                    [&](size_t k, size_t offset) -> size_t {
+                        id_remap[selected[k]] = static_cast<uint32_t>(k);
+                        auto pr = d.poi_records[selected[k]];
+                        size_t bytes = 0;
+                        if (is_polygon(pr)) {
+                            bytes = pack_polygon_at(filtered_vertex_bytes.data() + offset,
+                                                    &d.poi_vertices[pr.vertex_offset], pr.vertex_count);
+                            pr.vertex_offset = static_cast<uint32_t>(offset);
+                        } else {
+                            pr.vertex_offset = NO_DATA;
+                        }
+                        filtered_records[k] = pr;
+                        return bytes;
+                    });
 
                 // Filtered cell index (preserving INTERIOR_FLAG). id_remap
                 // ascends and keeps the flag bit, so the filtered table stays

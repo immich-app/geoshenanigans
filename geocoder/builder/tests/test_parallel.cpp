@@ -419,6 +419,29 @@ TEST(parallel_for_dynamic_hands_out_grain_sized_ranges) {
     }
 }
 
+TEST(parallel_prefix_fill_places_items_back_to_back_in_order) {
+    std::mt19937 rng(21);
+    for (size_t n : {size_t(0), size_t(1), size_t(9), size_t(5000)}) {
+        std::vector<size_t> sizes(n);
+        for (auto& s : sizes) s = rng() % 4 == 0 ? 0 : rng() % 50;
+        std::vector<size_t> want(n);
+        size_t total = 0;
+        for (size_t i = 0; i < n; i++) { want[i] = total; total += sizes[i]; }
+        for (unsigned threads : {1u, 3u, 16u}) {
+            std::vector<size_t> got(n, SIZE_MAX);
+            int allocs = 0;
+            size_t allocated = SIZE_MAX;
+            size_t returned = parallel_prefix_fill(n, [&](size_t i) { return sizes[i]; },
+                [&](size_t t) { allocs++; allocated = t; },
+                [&](size_t i, size_t offset) { got[i] = offset; return sizes[i]; }, threads);
+            CHECK_EQ(allocs, 1);
+            CHECK_EQ(allocated, total);
+            CHECK_EQ(returned, total);
+            CHECK(got == want);
+        }
+    }
+}
+
 TEST(parallel_for_runs_covers_every_index_in_whole_runs) {
     std::mt19937 rng(11);
     std::vector<uint32_t> keys(5000);

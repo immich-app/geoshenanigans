@@ -9,7 +9,6 @@
 #include <cstdint>
 #include <cstring>
 #include <utility>
-#include <vector>
 
 #include "types.h"
 
@@ -86,12 +85,10 @@ void pack_polygon(uint8_t* dst, const PolygonPacking& p, const Vertex* verts, si
     }
 }
 
-// Appends one polygon to `out` and returns the byte offset of its header.
+// Packs one polygon at dst and returns its byte size.
 template <class Vertex>
-uint32_t append_polygon(std::vector<uint8_t>& out, const Vertex* verts, size_t n) {
+size_t pack_polygon_at(uint8_t* dst, const Vertex* verts, size_t n) {
     PolygonPacking p = plan_polygon(verts, n);
-    size_t offset = out.size();
-    out.resize(offset + p.bytes);
-    pack_polygon(out.data() + offset, p, verts, n);
-    return static_cast<uint32_t>(offset);
+    pack_polygon(dst, p, verts, n);
+    return p.bytes;
 }

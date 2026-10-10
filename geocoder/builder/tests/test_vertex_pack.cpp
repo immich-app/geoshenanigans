@@ -54,7 +54,7 @@ uint32_t reference_pack(std::vector<uint8_t>& out, const std::vector<std::pair<d
 
 }  // namespace
 
-TEST(append_polygon_matches_the_replaced_packer_for_every_encoding) {
+TEST(pack_polygon_matches_the_replaced_packer_for_every_encoding) {
     std::mt19937_64 rng(9);
     std::uniform_real_distribution<float> lat0(-80, 80), lng0(-179, 179);
     // Spans that land in each encoding, and the edges between them.
@@ -72,8 +72,13 @@ TEST(append_polygon_matches_the_replaced_packer_for_every_encoding) {
             pairs[k] = {nodes[k].lat, nodes[k].lng};
         }
         uint32_t want_off = reference_pack(want, pairs);
-        CHECK_EQ(append_polygon(got_float, nodes.data(), n), want_off);
-        CHECK_EQ(append_polygon(got_double, pairs.data(), n), want_off);
+        for (auto* got : {&got_float, &got_double}) {
+            CHECK_EQ(got->size(), size_t(want_off));
+            got->resize(want.size());
+        }
+        CHECK_EQ(plan_polygon(nodes.data(), n).bytes, want.size() - want_off);
+        CHECK_EQ(pack_polygon_at(got_float.data() + want_off, nodes.data(), n), want.size() - want_off);
+        CHECK_EQ(pack_polygon_at(got_double.data() + want_off, pairs.data(), n), want.size() - want_off);
     }
     CHECK(got_float == want);
     CHECK(got_double == want);

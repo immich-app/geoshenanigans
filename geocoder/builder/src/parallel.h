@@ -66,6 +66,33 @@ void parallel_for_dynamic(size_t n, size_t grain, Fn&& fn, unsigned threads = 0)
     }, threads);
 }
 
+// Lays n variable-size items out back to back on every core, in index
+// order: size(i) gives item i's size, alloc(total) runs once when the total
+// is known, then place(i, offset) writes item i at `offset` (the sizes of
+// the items before it) and returns its size, which must equal size(i).
+template <class Size, class Alloc, class Place>
+size_t parallel_prefix_fill(size_t n, Size size, Alloc alloc, Place place, unsigned threads = 0) {
+    if (threads == 0) threads = parallel_threads();
+    std::vector<size_t> base(threads, 0);
+    parallel_for(n, [&](size_t begin, size_t end, unsigned w) {
+        size_t sum = 0;
+        for (size_t i = begin; i < end; i++) sum += size(i);
+        base[w] = sum;
+    }, threads);
+    size_t total = 0;
+    for (auto& b : base) {
+        size_t range = b;
+        b = total;
+        total += range;
+    }
+    alloc(total);
+    parallel_for(n, [&](size_t begin, size_t end, unsigned w) {
+        size_t offset = base[w];
+        for (size_t i = begin; i < end; i++) offset += place(i, offset);
+    }, threads);
+    return total;
+}
+
 // parallel_for whose ranges never split a run: same_run(i) (i >= 1) says
 // element i continues the run of element i - 1. A range is cut at the first
 // run start at or after its even share, so fn(begin, end, worker) gets whole

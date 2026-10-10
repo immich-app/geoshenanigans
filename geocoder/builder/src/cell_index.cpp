@@ -995,29 +995,38 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             write_futures.push_back(std::async(std::launch::async, [&] {
                 auto _at = std::chrono::steady_clock::now();
                 auto _ac = CpuTicks::now();
-                std::vector<AddrPoint> packed_points;
-                packed_points.reserve(data.addr_points.size());
-                std::vector<uint8_t> packed_bytes;
-                // Only ~5% of addr_points carry footprints; reserve a
-                // small fraction to avoid the over-allocation that
-                // contributed to OOM on planet-scale runs.
-                packed_bytes.reserve(data.addr_points.size() / 16);
-                for (size_t i = 0; i < data.addr_points.size(); i++) {
-                    AddrPoint ap = data.addr_points[i];
+                // Point address, polygon footprint missing, or out-of-range
+                // index (defends against caller passing addr_points without
+                // matching addr_vertices) all pack as points.
+                auto footprint = [&](const AddrPoint& ap) -> const NodeCoord* {
                     if (ap.vertex_count == 0 || ap.vertex_offset == NO_DATA
-                        || (size_t)ap.vertex_offset + ap.vertex_count > data.addr_vertices.size()) {
-                        // Point address, polygon footprint missing, or
-                        // out-of-range index (defends against caller
-                        // passing addr_points without matching addr_vertices).
-                        ap.vertex_offset = NO_DATA;
-                        ap.vertex_count = 0;
-                        packed_points.push_back(ap);
-                        continue;
-                    }
-                    ap.vertex_offset = append_polygon(packed_bytes, &data.addr_vertices[ap.vertex_offset],
-                                                      ap.vertex_count);
-                    packed_points.push_back(ap);
-                }
+                        || (size_t)ap.vertex_offset + ap.vertex_count > data.addr_vertices.size())
+                        return nullptr;
+                    return &data.addr_vertices[ap.vertex_offset];
+                };
+                std::vector<AddrPoint> packed_points(data.addr_points.size());
+                std::vector<uint8_t> packed_bytes;
+                parallel_prefix_fill(data.addr_points.size(),
+                    [&](size_t i) -> size_t {
+                        const AddrPoint& ap = data.addr_points[i];
+                        const NodeCoord* verts = footprint(ap);
+                        return verts ? plan_polygon(verts, ap.vertex_count).bytes : 0;
+                    },
+                    [&](size_t total) { packed_bytes.resize(total); },
+                    [&](size_t i, size_t offset) -> size_t {
+                        AddrPoint ap = data.addr_points[i];
+                        const NodeCoord* verts = footprint(ap);
+                        size_t bytes = 0;
+                        if (verts) {
+                            bytes = pack_polygon_at(packed_bytes.data() + offset, verts, ap.vertex_count);
+                            ap.vertex_offset = static_cast<uint32_t>(offset);
+                        } else {
+                            ap.vertex_offset = NO_DATA;
+                            ap.vertex_count = 0;
+                        }
+                        packed_points[i] = ap;
+                        return bytes;
+                    });
                 write_binary_file(output_dir + "/addr_points.bin",
                                   reinterpret_cast<const char*>(packed_points.data()),
                                   packed_points.size() * sizeof(AddrPoint));
@@ -1324,24 +1333,41 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
     // admin lookups.)
     new_polys.assign(data.admin_polygons.size(), admin_polygon_tombstone());
 
-    for (size_t i = 0; i < data.admin_polygons.size(); i++) {
-        auto& sv = simplified[i].verts;
-        if (sv.size() < 3) continue;  // leave slot i as a NO_DATA tombstone
+    // Slot i stays a NO_DATA tombstone when fewer than 3 vertices survive.
+    auto drawn_bytes = [&](size_t i) -> size_t {
+        const auto& sv = simplified[i].verts;
+        return sv.size() < 3 ? 0 : plan_polygon(sv.data(), sv.size()).bytes;
+    };
+    parallel_prefix_fill(data.admin_polygons.size(), drawn_bytes,
+        [&](size_t total) { new_verts_bytes.resize(total); },
+        [&](size_t i, size_t offset) -> size_t {
+            const auto& sv = simplified[i].verts;
+            if (sv.size() < 3) return 0;
 
-        AdminPolygon np = data.admin_polygons[i];
+            AdminPolygon np = data.admin_polygons[i];
+            size_t bytes = pack_polygon_at(new_verts_bytes.data() + offset, sv.data(), sv.size());
+            np.vertex_offset = static_cast<uint32_t>(offset);
+            np.vertex_count = static_cast<uint32_t>(sv.size());
+            np.area = polygon_area(sv);
+            new_polys[i] = np;
+            return bytes;
+        });
 
-        np.vertex_offset = append_polygon(new_verts_bytes, sv.data(), sv.size());
-        np.vertex_count = static_cast<uint32_t>(sv.size());
-        np.area = polygon_area(sv);
-        new_polys[i] = np;
-
-        // Postal also go into separate files (for optional loading)
-        if (np.admin_level == 11) {
-            AdminPolygon pp = np;
-            pp.vertex_offset = append_polygon(postal_verts_bytes, sv.data(), sv.size());
-            postal_polys.push_back(pp);
-        }
-    }
+    // Postal also go into separate files (for optional loading)
+    std::vector<uint32_t> postal_idx;
+    for (size_t i = 0; i < new_polys.size(); i++)
+        if (simplified[i].verts.size() >= 3 && new_polys[i].admin_level == 11)
+            postal_idx.push_back(static_cast<uint32_t>(i));
+    postal_polys.resize(postal_idx.size());
+    parallel_prefix_fill(postal_idx.size(), [&](size_t k) { return drawn_bytes(postal_idx[k]); },
+        [&](size_t total) { postal_verts_bytes.resize(total); },
+        [&](size_t k, size_t offset) -> size_t {
+            const auto& sv = simplified[postal_idx[k]].verts;
+            AdminPolygon pp = new_polys[postal_idx[k]];
+            pp.vertex_offset = static_cast<uint32_t>(offset);
+            postal_polys[k] = pp;
+            return pack_polygon_at(postal_verts_bytes.data() + offset, sv.data(), sv.size());
+        });
 
     std::cerr << "Quality " << epsilon_scale << "x: " << new_polys.size()
               << " admin polygons, " << new_verts_bytes.size() / 1024 / 1024
@@ -1436,19 +1462,28 @@ void write_admin_minimal_polygons(const ParsedData& data,
     // Vertex bytes in slot order, so offsets ascend with ids.
     std::vector<AdminPolygon> new_polys(alloc.total_slots(), admin_polygon_tombstone());
     std::vector<uint8_t> new_verts_bytes;
-    size_t kept = 0;
-    for (size_t slot = 0; slot < kept_at_slot.size(); slot++) {
-        size_t k = kept_at_slot[slot];
-        if (k == SIZE_MAX) continue;
-        auto& sv = simplified[k].verts;
-        AdminPolygon np = data.admin_polygons[kept_idx[k]];
-        np.vertex_offset = append_polygon(new_verts_bytes, sv.data(), sv.size());
-        np.vertex_count = static_cast<uint32_t>(sv.size());
-        np.area = polygon_area(sv);
-        id_remap[kept_idx[k]] = static_cast<uint32_t>(slot);
-        new_polys[slot] = np;
-        kept++;
-    }
+    const size_t kept = drawn.size();
+    parallel_prefix_fill(kept_at_slot.size(),
+        [&](size_t slot) -> size_t {
+            size_t k = kept_at_slot[slot];
+            if (k == SIZE_MAX) return 0;
+            const auto& sv = simplified[k].verts;
+            return plan_polygon(sv.data(), sv.size()).bytes;
+        },
+        [&](size_t total) { new_verts_bytes.resize(total); },
+        [&](size_t slot, size_t offset) -> size_t {
+            size_t k = kept_at_slot[slot];
+            if (k == SIZE_MAX) return 0;
+            const auto& sv = simplified[k].verts;
+            AdminPolygon np = data.admin_polygons[kept_idx[k]];
+            size_t bytes = pack_polygon_at(new_verts_bytes.data() + offset, sv.data(), sv.size());
+            np.vertex_offset = static_cast<uint32_t>(offset);
+            np.vertex_count = static_cast<uint32_t>(sv.size());
+            np.area = polygon_area(sv);
+            id_remap[kept_idx[k]] = static_cast<uint32_t>(slot);
+            new_polys[slot] = np;
+            return bytes;
+        });
 
     write_binary_file(output_dir + "/admin_polygons.bin",
                       reinterpret_cast<const char*>(new_polys.data()),
