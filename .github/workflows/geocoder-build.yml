@@ -807,9 +807,9 @@ jobs:
           # hashes for server-side verification after decompression, while
           # this checksums.sha256 holds the on-wire hashes (compressed).
           echo "Generating checksums..."
-          (cd "$WORKDIR/output" && find . -type f \( -name "*.zst" -o -name "*.gcpatch" -o -name "*.json" \) | sort | while read -r f; do
-            sha256sum "$f"
-          done) > "$WORKDIR/output/checksums.sha256"
+          # Hashed on every core (~35 GB), listed in path order.
+          (cd "$WORKDIR/output" && find . -type f \( -name "*.zst" -o -name "*.gcpatch" -o -name "*.json" \) -print0 \
+            | xargs -0 -P "$(nproc)" -n 8 sha256sum | sort -k2) > "$WORKDIR/output/checksums.sha256"
           echo "$(wc -l < "$WORKDIR/output/checksums.sha256") file checksums generated"
 
           # Upload configurations.json + checksums (index files + patches
