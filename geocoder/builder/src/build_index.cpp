@@ -4954,39 +4954,12 @@ static int run(int argc, char* argv[]) {
             }
         }
 
-        // shrink_to_fit() the big parsed containers now that no further
-        // push_backs happen on them. Vector doubling growth typically
-        // leaves capacity at 1.3–2x size, so this reclaims a few GiB
-        // on planet. Skip the .deferred_* vectors — they're already
-        // cleared/moved-from below. Order: ways, then per-record-type
-        // parallel arrays.
-        data.ways.shrink_to_fit();
-        data.way_osm_ids.shrink_to_fit();
-        data.way_orig_name_ids.shrink_to_fit();
-        data.street_nodes.shrink_to_fit();
-        data.way_parent_ids.shrink_to_fit();
-        data.way_postcode_ids.shrink_to_fit();
-        data.addr_points.shrink_to_fit();
-        data.addr_osm_ids.shrink_to_fit();
-        data.addr_vertices.shrink_to_fit();
-        data.addr_postcode_ids.shrink_to_fit();
-        data.admin_polygons.shrink_to_fit();
-        data.admin_osm_ids.shrink_to_fit();
-        data.admin_vertices.shrink_to_fit();
-        data.admin_parent_ids.shrink_to_fit();
-        data.poi_records.shrink_to_fit();
-        data.poi_osm_ids.shrink_to_fit();
-        data.poi_vertices.shrink_to_fit();
-        data.place_nodes.shrink_to_fit();
-        data.place_osm_ids.shrink_to_fit();
-        data.interp_ways.shrink_to_fit();
-        data.interp_osm_ids.shrink_to_fit();
-        data.interp_nodes.shrink_to_fit();
-
         // Memory breakdown — what's holding RSS now (before the strategy-2
         // and deterministic-ordering passes that follow). Identifies the
         // structures to target for further reduction. Approximate sizes
-        // (vector capacity * sizeof(T)); not exact for unordered_maps.
+        // (vector capacity * sizeof(T), an upper bound: capacity past the
+        // size was never written, so it costs no RSS); not exact for
+        // unordered_maps.
         log_mem("data.ways (capacity)",              vec_bytes(data.ways));
         log_mem("data.way_osm_ids",                  vec_bytes(data.way_osm_ids));
         log_mem("data.way_orig_name_ids",            vec_bytes(data.way_orig_name_ids));
