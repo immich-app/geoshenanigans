@@ -65,7 +65,7 @@ add_executable(build-index
 
 add_executable(geocoder-diff tools/geocoder_diff.cpp)
 target_link_libraries(geocoder-diff PRIVATE Threads::Threads)
-target_include_directories(geocoder-diff PRIVATE tools)
+target_include_directories(geocoder-diff PRIVATE tools src)
 
 add_executable(geocoder-patch tools/geocoder_patch.cpp)
 target_link_libraries(geocoder-patch PRIVATE Threads::Threads)
