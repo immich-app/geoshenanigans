@@ -16,6 +16,7 @@
 
 #include "geometry.h"
 #include "id_allocator.h"
+#include "parallel.h"
 #include "postcode_validation.h"
 #include "s2_helpers.h"
 #include "strategy2_remap.h"
@@ -1484,22 +1485,10 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
     };
     std::vector<SimplifiedPoly> simplified(data.admin_polygons.size());
 
-    {
-        std::atomic<size_t> idx{0};
-        unsigned nthreads = std::thread::hardware_concurrency();
-        if (nthreads == 0) nthreads = 4;
-        std::vector<std::thread> workers;
-        for (unsigned t = 0; t < nthreads; t++) {
-            workers.emplace_back([&]() {
-                while (true) {
-                    size_t i = idx.fetch_add(1);
-                    if (i >= data.admin_polygons.size()) break;
-                    simplified[i].verts = simplify_admin_polygon(data, data.admin_polygons[i], epsilon_scale);
-                }
-            });
-        }
-        for (auto& w : workers) w.join();
-    }
+    parallel_for_dynamic(data.admin_polygons.size(), 1, [&](size_t begin, size_t end, unsigned) {
+        for (size_t i = begin; i < end; i++)
+            simplified[i].verts = simplify_admin_polygon(data, data.admin_polygons[i], epsilon_scale);
+    });
     log_phase((label + "simplify").c_str(), _qt, _qc);
 
     // Sequential: build new polygon/vertex arrays. Postal boundaries
@@ -1611,23 +1600,11 @@ void write_admin_minimal_polygons(const ParsedData& data,
     // Parallel simplification of just the kept polygons.
     struct SimplifiedPoly { std::vector<std::pair<double,double>> verts; };
     std::vector<SimplifiedPoly> simplified(kept_idx.size());
-    {
-        std::atomic<size_t> idx{0};
-        unsigned nthreads = std::thread::hardware_concurrency();
-        if (nthreads == 0) nthreads = 4;
-        std::vector<std::thread> workers;
-        for (unsigned t = 0; t < nthreads; t++) {
-            workers.emplace_back([&]() {
-                while (true) {
-                    size_t k = idx.fetch_add(1);
-                    if (k >= kept_idx.size()) break;
-                    simplified[k].verts = simplify_admin_polygon(
-                        data, data.admin_polygons[kept_idx[k]], epsilon_scale);
-                }
-            });
-        }
-        for (auto& w : workers) w.join();
-    }
+    parallel_for_dynamic(kept_idx.size(), 1, [&](size_t begin, size_t end, unsigned) {
+        for (size_t k = begin; k < end; k++)
+            simplified[k].verts = simplify_admin_polygon(
+                data, data.admin_polygons[kept_idx[k]], epsilon_scale);
+    });
 
     // Survivors keep stable slots in admin-minimal's own numbering and
     // sidecar, like the full set's (apply_strategy2_admins). A dense

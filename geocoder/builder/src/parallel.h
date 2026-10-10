@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -52,6 +51,21 @@ void parallel_for(size_t n, Fn&& fn, unsigned threads = 0) {
         if (e) std::rethrow_exception(e);
 }
 
+// parallel_for for uneven per-element cost: workers take the next `grain`
+// elements as they free up. Which worker gets which range depends on timing,
+// so fn must not let it shape its output.
+template <class Fn>
+void parallel_for_dynamic(size_t n, size_t grain, Fn&& fn, unsigned threads = 0) {
+    if (threads == 0) threads = parallel_threads();
+    grain = std::max<size_t>(grain, 1);
+    size_t pieces = (n + grain - 1) / grain;
+    std::atomic<size_t> next{0};
+    parallel_for(std::min<size_t>(threads, pieces), [&](size_t, size_t, unsigned worker) {
+        for (size_t p = next++; p < pieces; p = next++)
+            fn(p * grain, std::min(n, (p + 1) * grain), worker);
+    }, threads);
+}
+
 // parallel_for whose ranges never split a run: same_run(i) (i >= 1) says
 // element i continues the run of element i - 1. A range is cut at the first
 // run start at or after its even share, so fn(begin, end, worker) gets whole
@@ -72,22 +86,6 @@ void parallel_for_runs(size_t n, SameRun same_run, Fn&& fn, unsigned threads = 0
         for (size_t r = b; r < e; r++)
             if (bounds[r] < bounds[r + 1]) fn(bounds[r], bounds[r + 1], static_cast<unsigned>(r));
     }, static_cast<unsigned>(ranges));
-}
-
-// Runs fn(begin, end, worker) over [0, n) in chunks of `grain` indices that
-// at most `threads` workers (0 = every core) claim in index order as they
-// free up, for loops whose cost per index is uneven. Which worker runs which
-// chunk varies run to run, so fn must not let it shape its output.
-template <class Fn>
-void parallel_for_dynamic(size_t n, size_t grain, Fn&& fn, unsigned threads = 0) {
-    if (threads == 0) threads = parallel_threads();
-    grain = std::max<size_t>(grain, 1);
-    size_t chunks = n / grain + (n % grain != 0);
-    std::atomic<size_t> next{0};
-    parallel_for(std::min<size_t>(threads, chunks), [&](size_t, size_t, unsigned worker) {
-        for (size_t c = next++; c < chunks; c = next++)
-            fn(c * grain, std::min(n, (c + 1) * grain), worker);
-    }, threads);
 }
 
 // Runs fn(i, worker) for every i in [0, n) on at most `threads` threads

@@ -402,6 +402,23 @@ TEST(parallel_sort_small_and_presorted_inputs) {
     }
 }
 
+TEST(parallel_for_dynamic_hands_out_grain_sized_ranges) {
+    for (unsigned threads : {1u, 3u, 16u}) {
+        for (size_t grain : {size_t(1), size_t(7), size_t(5000)}) {
+            for (size_t n : {size_t(0), size_t(1), size_t(1000)}) {
+                std::vector<std::atomic<int>> hits(n);
+                std::atomic<bool> worker_in_range{true};
+                parallel_for_dynamic(n, grain, [&](size_t b, size_t e, unsigned w) {
+                    if (w >= threads || e - b > grain) worker_in_range = false;
+                    for (size_t i = b; i < e; i++) hits[i]++;
+                }, threads);
+                CHECK(worker_in_range.load());
+                for (size_t i = 0; i < n; i++) CHECK_EQ(hits[i].load(), 1);
+            }
+        }
+    }
+}
+
 TEST(parallel_for_runs_covers_every_index_in_whole_runs) {
     std::mt19937 rng(11);
     std::vector<uint32_t> keys(5000);
