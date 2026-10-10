@@ -308,7 +308,31 @@ inline void reorder_ways(ParsedData& data, unsigned threads = 0) {
                            reinterpret_cast<const char*>(&ways[b]) + kAfterOffset,
                            sizeof(WayHeader) - kAfterOffset) != 0;
     };
-    std::vector<uint32_t> order = take_order("ways", parallel_sort_indices(n, way_less, tie_matters, threads));
+    // The sort orders keys holding the fields that decide nearly every
+    // comparison, rather than indices into the planet's ways and nodes.
+    struct WayKey {
+        uint32_t name_id;
+        uint16_t node_count;
+        uint32_t lat_bits, lng_bits, index;  // of the first node; 0 for none
+    };
+    auto key_of = [&](size_t i) {
+        const auto& w = ways[i];
+        WayKey k{w.name_id, w.node_count, 0, 0, static_cast<uint32_t>(i)};
+        if (w.node_count > 0) {
+            k.lat_bits = float_bits(nodes[w.node_offset].lat);
+            k.lng_bits = float_bits(nodes[w.node_offset].lng);
+        }
+        return k;
+    };
+    auto key_less = [&](const WayKey& a, const WayKey& b) {
+        if (a.name_id != b.name_id) return a.name_id < b.name_id;
+        if (a.node_count != b.node_count) return a.node_count < b.node_count;
+        if (a.lat_bits != b.lat_bits) return a.lat_bits < b.lat_bits;
+        if (a.lng_bits != b.lng_bits) return a.lng_bits < b.lng_bits;
+        return way_less(a.index, b.index);
+    };
+    std::vector<uint32_t> order =
+        take_order("ways", parallel_sort_keys(n, key_of, key_less, tie_matters, threads));
 
     // Dedup identical consecutive ways (name, node_count, node bytes).
     std::vector<uint32_t> starts = run_starts(n, [&](size_t i, size_t j) {
