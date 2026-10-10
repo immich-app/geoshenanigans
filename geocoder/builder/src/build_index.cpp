@@ -2123,14 +2123,22 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
     std::cerr << "Write schedule: memory limit " << (memory_limit >> 20) << " MiB, " << (in_use >> 20)
               << " MiB in use, budget " << (budget.capacity() >> 20) << " MiB" << std::endl;
 
-    // Write planet (async — overlaps with continent filtering start). Its
-    // stages run one after another, to hold memory down while continent
-    // subsets build beside it.
-    auto planet_future = std::async(std::launch::async, [&]() {
-        timed_phase("    planet: write", [&] {
-            write_region(data, output_dir + "/planet", RegionRun::Planet, RunOrder::Serial, &budget);
+    // Write planet (async, beside the continents). Its stages run at once
+    // when the budget holds them beside the costliest continents that can
+    // run together; else one after another, to hold memory down while
+    // continent subsets build alongside.
+    const uint64_t planet_stages = stage_costs(record_bytes(data)).total();
+    std::future<void> planet_future;
+    auto write_planet = [&](uint64_t beside) {
+        const RunOrder order = planet_stages + beside <= budget.capacity() ? RunOrder::Concurrent : RunOrder::Serial;
+        std::cerr << "Planet: stages " << (order == RunOrder::Serial ? "one at a time" : "at once") << std::endl;
+        planet_future = std::async(std::launch::async, [&, order]() {
+            timed_phase("    planet: write", [&] {
+                write_region(data, output_dir + "/planet", RegionRun::Planet, order, &budget);
+            });
         });
-    });
+    };
+    if (!generate_continents) write_planet(0);
 
     // Process continents with bounded concurrency, largest first.
     if (generate_continents) {
@@ -2247,6 +2255,11 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             const uint64_t filter_bytes = filter_cost(planet_counts, continent_pairs[c], parallel_threads());
             pending.push_back({c, continent_cost(bytes, counts, filter_bytes, budget.capacity())});
         }
+        std::vector<uint64_t> costliest;
+        for (const auto& run : pending) costliest.push_back(run.cost.bytes);
+        std::sort(costliest.begin(), costliest.end(), std::greater<uint64_t>());
+        costliest.resize(std::min<size_t>(costliest.size(), max_concurrent));
+        write_planet(std::accumulate(costliest.begin(), costliest.end(), uint64_t(0)));
         std::cerr << "Processing " << kContinentCount << " continents ("
                   << max_concurrent << " concurrent, largest first)..." << std::endl;
 
