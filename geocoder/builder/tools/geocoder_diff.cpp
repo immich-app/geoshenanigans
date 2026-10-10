@@ -81,6 +81,15 @@ static void remap_field(char* data, size_t size, size_t stride, size_t field_off
         if (const uint32_t* n = rm.find(v)) memcpy(data + i + field_off, n, 4);
     }
 }
+// Rewrites the foreign record id at `field` of each record through an old →
+// new id remap (NO_DATA: no new id), into the new build's id space.
+static void remap_id_field(char* data, size_t size, size_t stride, size_t field, const std::vector<uint32_t>& rm) {
+    for (size_t i = 0; i + stride <= size; i += stride) {
+        uint32_t id; memcpy(&id, data + i + field, 4);
+        if (id != NO_DATA && id < rm.size() && rm[id] != NO_DATA && rm[id] != id)
+            memcpy(data + i + field, &rm[id], 4);
+    }
+}
 // The patcher rewrites the same fields (string_field_offsets) of the records
 // it copies from old.
 static void remap_string_fields(char* data, size_t size, PatchFileId fid, size_t stride, const SortedU32Map& rm) {
@@ -797,16 +806,7 @@ static int run(int argc, char* argv[]) {
         // file). Wait on t_street's id_remap and apply before merge_seq.
         if (addr_stride >= 20 && old_m.size > 0) {
             street_remap_future.wait();
-            const auto& way_rm = res_ways.id_remap;
-            if (!way_rm.empty()) {
-                size_t n = old_m.size / addr_stride;
-                for (size_t i = 0; i < n; i++) {
-                    char* rec = old_m.data + i * addr_stride;
-                    uint32_t pw; memcpy(&pw, rec + 16, 4);
-                    if (pw != NO_DATA && pw < way_rm.size() && way_rm[pw] != NO_DATA && way_rm[pw] != pw)
-                        memcpy(rec + 16, &way_rm[pw], 4);
-                }
-            }
+            remap_id_field(old_m.data, old_m.size, addr_stride, 16, res_ways.id_remap);
         }
         // Identify polygon-bearing addr_points across builds by polygon
         // VERTEX BYTE CONTENT (purely content-hash; key_fn returns 0 so
@@ -1163,18 +1163,8 @@ static int run(int argc, char* argv[]) {
         // polygon index and must be remapped from the old build's admin
         // id-space into the new one. (Bytes 24/28 are string offsets,
         // handled by str_remap above — NOT here.)
-        if (old_data.size > 0 && poi_stride >= 36) {
-            const auto& adm_rm = res_admin_p.id_remap;
-            size_t pn = old_data.size / poi_stride;
-            for (size_t i = 0; i < pn; i++) {
-                char* rec = old_data.data + i * poi_stride;
-                if (!adm_rm.empty()) {
-                    uint32_t pp; memcpy(&pp, rec + 32, 4);
-                    if (pp != NO_DATA && pp < adm_rm.size() && adm_rm[pp] != NO_DATA && adm_rm[pp] != pp)
-                        memcpy(rec + 32, &adm_rm[pp], 4);
-                }
-            }
-        }
+        if (old_data.size > 0 && poi_stride >= 36)
+            remap_id_field(old_data.data, old_data.size, poi_stride, 32, res_admin_p.id_remap);
 
         auto old_v = mmap_file(old_dir + "/poi_vertices.bin");
         auto new_v = mmap_file(new_dir + "/poi_vertices.bin");
@@ -1274,16 +1264,7 @@ static int run(int argc, char* argv[]) {
         // admin polygon's id moved.
         if (place_stride >= 20 && old_data.size > 0) {
             admin_remap_future.wait();
-            const auto& adm_rm = res_admin_p.id_remap;
-            if (!adm_rm.empty()) {
-                size_t n = old_data.size / place_stride;
-                for (size_t i = 0; i < n; i++) {
-                    char* rec = old_data.data + i * place_stride;
-                    uint32_t pp; memcpy(&pp, rec + 16, 4);
-                    if (pp != NO_DATA && pp < adm_rm.size() && adm_rm[pp] != NO_DATA && adm_rm[pp] != pp)
-                        memcpy(rec + 16, &adm_rm[pp], 4);
-                }
-            }
+            remap_id_field(old_data.data, old_data.size, place_stride, 16, res_admin_p.id_remap);
         }
         // Positional merge: strategy-2 keeps each place in its slot, so the
         // files are in slot order, not (type, name, lat, lng) order. The
