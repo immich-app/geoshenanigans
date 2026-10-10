@@ -165,50 +165,48 @@ static void add_tiger_ranges(ParsedData& data, const TigerCsv& csv) {
     }
 }
 
-static void load_tiger_data(ParsedData& data, const std::string& path) {
-    std::cerr << "Loading TIGER address data from " << path << "..." << std::endl;
-    auto _tt = std::chrono::steady_clock::now();
-    auto _tc = CpuTicks::now();
+// The TIGER CSVs to load, sorted: those in the directory given, or in the
+// tarball's extraction, which lives as long as this does.
+struct TigerCsvFiles {
+    std::unique_ptr<ScratchDir> extract;
+    std::vector<std::string> paths;
+};
 
-    // Collect all CSV files
-    std::vector<std::string> csv_files;
-    std::optional<ScratchDir> extract;  // the extracted tarball lives until the CSVs are read
+static TigerCsvFiles find_tiger_csvs(const std::string& path) {
+    TigerCsvFiles files;
+    std::string dir_path = path;
     if (path.find(".tar.gz") != std::string::npos || path.find(".tgz") != std::string::npos) {
-        extract.emplace("tiger-extract");
-        const std::string& tmpdir = extract->path();
-        std::string cmd = "tar xzf '" + path + "' -C '" + tmpdir + "'";
+        files.extract = std::make_unique<ScratchDir>("tiger-extract");
+        dir_path = files.extract->path();
+        std::string cmd = "tar xzf '" + path + "' -C '" + dir_path + "'";
         if (system(cmd.c_str()) != 0) {
             // --tiger-data was explicitly requested: a silently TIGER-less
             // planet build would ship without US address ranges/ZIPs.
             throw std::runtime_error("TIGER extraction failed (tar xzf " + path + ")");
         }
-        DIR* dir = opendir(tmpdir.c_str());
-        if (dir) {
-            struct dirent* ent;
-            while ((ent = readdir(dir)) != nullptr) {
-                std::string fname = ent->d_name;
-                if (fname.size() > 4 && fname.substr(fname.size()-4) == ".csv") {
-                    csv_files.push_back(tmpdir + "/" + fname);
-                }
-            }
-            closedir(dir);
-        }
-    } else {
-        // Directory of CSVs
-        DIR* dir = opendir(path.c_str());
-        if (dir) {
-            struct dirent* ent;
-            while ((ent = readdir(dir)) != nullptr) {
-                std::string fname = ent->d_name;
-                if (fname.size() > 4 && fname.substr(fname.size()-4) == ".csv") {
-                    csv_files.push_back(path + "/" + fname);
-                }
-            }
-            closedir(dir);
-        }
     }
+    DIR* dir = opendir(dir_path.c_str());
+    if (dir) {
+        struct dirent* ent;
+        while ((ent = readdir(dir)) != nullptr) {
+            std::string fname = ent->d_name;
+            if (fname.size() > 4 && fname.substr(fname.size()-4) == ".csv") {
+                files.paths.push_back(dir_path + "/" + fname);
+            }
+        }
+        closedir(dir);
+    }
+    std::sort(files.paths.begin(), files.paths.end());
+    return files;
+}
 
-    std::sort(csv_files.begin(), csv_files.end());
+static void load_tiger_data(ParsedData& data, const std::string& path) {
+    std::cerr << "Loading TIGER address data from " << path << "..." << std::endl;
+    auto _tt = std::chrono::steady_clock::now();
+    auto _tc = CpuTicks::now();
+
+    TigerCsvFiles csvs = find_tiger_csvs(path);
+    const std::vector<std::string>& csv_files = csvs.paths;
     log_phase("  TIGER: extract", _tt, _tc);
     std::cerr << "  Found " << csv_files.size() << " TIGER CSV files" << std::endl;
     if (csv_files.empty())
