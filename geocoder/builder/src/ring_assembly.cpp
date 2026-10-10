@@ -1,11 +1,12 @@
 #include "ring_assembly.h"
 #include "geometry.h"
 
+#include <unordered_map>
 #include <unordered_set>
 
 std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
     const std::vector<std::pair<int64_t, std::string>>& members,
-    const std::unordered_map<int64_t, ParsedData::WayGeometry>& way_geoms,
+    const WayGeometries& way_geoms,
     bool include_all_roles)
 {
     // Coordinate-based ring assembly: split ways at shared internal nodes,
@@ -13,21 +14,21 @@ std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
     // coord_key() from geometry.h provides coordinate hashing.
 
     std::unordered_map<int64_t, int> coord_count;
-    std::vector<const std::vector<std::pair<double,double>>*> way_coords;
+    std::vector<CoordSpan> way_coords;
     for (const auto& [way_id, role] : members) {
         if (!include_all_roles && role != "outer" && !role.empty()) continue;
-        auto it = way_geoms.find(way_id);
-        if (it == way_geoms.end() || it->second.coords.empty()) continue;
-        way_coords.push_back(&it->second.coords);
-        for (const auto& [lat, lng] : it->second.coords) {
+        const auto* way = way_geoms.find(way_id);
+        if (!way || way->count == 0) continue;
+        way_coords.push_back(way_geoms.coords_of(*way));
+        for (const auto& [lat, lng] : way_coords.back()) {
             coord_count[coord_key(lat, lng)]++;
         }
     }
 
     std::unordered_set<int64_t> split_points;
-    for (auto* coords : way_coords) {
-        split_points.insert(coord_key(coords->front().first, coords->front().second));
-        split_points.insert(coord_key(coords->back().first, coords->back().second));
+    for (const CoordSpan& coords : way_coords) {
+        split_points.insert(coord_key(coords.front().first, coords.front().second));
+        split_points.insert(coord_key(coords.back().first, coords.back().second));
     }
     for (auto& [ck, cnt] : coord_count) {
         if (cnt > 1) split_points.insert(ck);
@@ -37,22 +38,22 @@ std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
         std::vector<std::pair<double,double>> coords;
     };
     std::vector<SubWay> sub_ways;
-    for (auto* coords : way_coords) {
+    for (const CoordSpan& coords : way_coords) {
         size_t seg_start = 0;
-        for (size_t i = 1; i < coords->size(); i++) {
-            int64_t ck = coord_key((*coords)[i].first, (*coords)[i].second);
+        for (size_t i = 1; i < coords.size(); i++) {
+            int64_t ck = coord_key(coords[i].first, coords[i].second);
             if (split_points.count(ck) && i > seg_start) {
                 SubWay sw;
-                sw.coords.assign(coords->begin() + seg_start, coords->begin() + i + 1);
+                sw.coords.assign(coords.begin() + seg_start, coords.begin() + i + 1);
                 if (sw.coords.size() >= 2) {
                     sub_ways.push_back(std::move(sw));
                 }
                 seg_start = i;
             }
         }
-        if (seg_start < coords->size() - 1) {
+        if (seg_start < coords.size() - 1) {
             SubWay sw;
-            sw.coords.assign(coords->begin() + seg_start, coords->end());
+            sw.coords.assign(coords.begin() + seg_start, coords.end());
             if (sw.coords.size() >= 2) {
                 sub_ways.push_back(std::move(sw));
             }

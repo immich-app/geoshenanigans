@@ -3686,14 +3686,6 @@ static int run(int argc, char* argv[]) {
                 // Process areas/multipolygons — sequential fallback path
                 // Merge thread-local way/interp data into main ParsedData
                 std::cerr << "  Merging thread-local data..." << std::endl;
-                auto to_geometry = [](const ThreadLocalData::WayGeomEntry& wg) {
-                    ParsedData::WayGeometry g;
-                    g.coords.reserve(wg.locs.size());
-                    for (const auto& loc : wg.locs) g.coords.push_back({loc.lat(), loc.lon()});
-                    g.first_node_id = wg.first_node_id;
-                    g.last_node_id = wg.last_node_id;
-                    return g;
-                };
                 // Pool ids per thread, interned in the order the merge below
                 // meets each thread's strings: its ways, building addresses,
                 // interpolations, then POI ways.
@@ -3885,31 +3877,40 @@ static int run(int argc, char* argv[]) {
                 });
                 log_phase("      Way merge: interpolations + POI ways", _mt, _mc);
 
-                // Merge way geometries for admin and POI relation assembly:
-                // converted on worker threads, stored in thread order.
-                struct ConvertedGeoms {
-                    std::vector<std::pair<int64_t, ParsedData::WayGeometry>> admin, poi;
-                };
-                size_t n_geoms = data.way_geometries.size();
-                for (const auto& local : tld) n_geoms += local.way_geoms.size() + local.poi_way_geoms.size();
-                data.way_geometries.reserve(n_geoms);
-                parallel_ordered(tld.size(), [&](size_t k) {
-                    auto& local = tld[k];
-                    ConvertedGeoms out;
-                    out.admin.reserve(local.way_geoms.size());
-                    for (const auto& wg : local.way_geoms) out.admin.emplace_back(wg.way_id, to_geometry(wg));
-                    free_storage(local.way_geoms);
-                    out.poi.reserve(local.poi_way_geoms.size());
-                    for (const auto& wg : local.poi_way_geoms) out.poi.emplace_back(wg.way_id, to_geometry(wg));
-                    free_storage(local.poi_way_geoms);
-                    return out;
-                }, [&](size_t, ConvertedGeoms geoms) {
-                    for (auto& [way_id, g] : geoms.admin) data.way_geometries[way_id] = std::move(g);
-                    // Stored with the admin ones (no conflict since IDs differ)
-                    for (auto& [way_id, g] : geoms.poi)
-                        if (data.way_geometries.find(way_id) == data.way_geometries.end())
-                            data.way_geometries[way_id] = std::move(g);
+                // Merge way geometries for admin and POI relation assembly.
+                // Each thread's coordinates, its admin ways' then its POI
+                // ways', land after the previous thread's.
+                auto& geoms = data.way_geometries;
+                const auto geom_at = local_offsets(tld, [](const auto& l) {
+                    size_t n = 0;
+                    for (const auto& wg : l.way_geoms) n += wg.locs.size();
+                    for (const auto& wg : l.poi_way_geoms) n += wg.locs.size();
+                    return n;
                 });
+                const size_t coord_base = grow_by(geoms.coords, geom_at.back());
+                parallel_for_each(tld.size(), [&](size_t k, unsigned) {
+                    size_t at = coord_base + geom_at[k];
+                    for (const auto* list : {&tld[k].way_geoms, &tld[k].poi_way_geoms})
+                        for (const auto& wg : *list)
+                            for (const auto& loc : wg.locs) geoms.coords[at++] = {loc.lat(), loc.lon()};
+                });
+                size_t n_geoms = geoms.ways.size();
+                for (const auto& local : tld) n_geoms += local.way_geoms.size() + local.poi_way_geoms.size();
+                geoms.ways.reserve(n_geoms);
+                size_t geom_coord = coord_base;
+                for (const auto& local : tld) {
+                    for (const auto& wg : local.way_geoms) {
+                        geoms.ways[wg.way_id] = {geom_coord, static_cast<uint32_t>(wg.locs.size()),
+                                                 wg.first_node_id, wg.last_node_id};
+                        geom_coord += wg.locs.size();
+                    }
+                    // Stored with the admin ones (no conflict since IDs differ)
+                    for (const auto& wg : local.poi_way_geoms) {
+                        geoms.ways.try_emplace(wg.way_id, WayGeometries::Way{geom_coord, static_cast<uint32_t>(wg.locs.size()),
+                                                                            wg.first_node_id, wg.last_node_id});
+                        geom_coord += wg.locs.size();
+                    }
+                }
                 log_phase("      Way merge: way geometries", _mt, _mc);
 
                 parallel_for_each(tld.size(), [&](size_t k, unsigned) {
@@ -3972,7 +3973,7 @@ static int run(int argc, char* argv[]) {
                     pbf.unmap(); // release 86 GiB PBF mmap before admin/S2 phases
                     std::cerr << "  Assembling admin polygons in parallel ("
                               << data.collected_relations.size() << " relations, "
-                              << data.way_geometries.size() << " way geometries)..." << std::endl;
+                              << data.way_geometries.ways.size() << " way geometries)..." << std::endl;
 
                     // Thread-local admin results (to avoid locking add_admin_polygon)
                     struct AdminResult {
@@ -4025,7 +4026,7 @@ static int run(int argc, char* argv[]) {
                                 // incorrect partial polygons
                                 bool has_missing = false;
                                 for (const auto& [way_id, role] : rel.members) {
-                                    if (data.way_geometries.find(way_id) == data.way_geometries.end()) {
+                                    if (!data.way_geometries.find(way_id)) {
                                         has_missing = true;
                                         break;
                                     }
@@ -4055,8 +4056,8 @@ static int run(int argc, char* argv[]) {
                                     int total_ways = 0, found = 0, missing = 0;
                                     for (const auto& [way_id, role] : rel.members) {
                                         total_ways++;
-                                        auto it = data.way_geometries.find(way_id);
-                                        if (it != data.way_geometries.end() && !it->second.coords.empty()) {
+                                        const auto* way = data.way_geometries.find(way_id);
+                                        if (way && way->count > 0) {
                                             found++;
                                         } else {
                                             missing++;
@@ -4065,12 +4066,12 @@ static int run(int argc, char* argv[]) {
                                     if (missing == 0 && found > 0) {
                                         std::string detail = "  DEBUG '" + rel.name + "': ways:";
                                         for (const auto& [way_id, role] : rel.members) {
-                                            auto it = data.way_geometries.find(way_id);
-                                            if (it == data.way_geometries.end()) continue;
+                                            const auto* way = data.way_geometries.find(way_id);
+                                            if (!way) continue;
                                             detail += " [w" + std::to_string(way_id) +
-                                                      " first=" + std::to_string(it->second.first_node_id) +
-                                                      " last=" + std::to_string(it->second.last_node_id) +
-                                                      " n=" + std::to_string(it->second.coords.size()) + "]";
+                                                      " first=" + std::to_string(way->first_node_id) +
+                                                      " last=" + std::to_string(way->last_node_id) +
+                                                      " n=" + std::to_string(way->count) + "]";
                                         }
                                         std::cerr << detail << std::endl;
                                     }
@@ -4310,7 +4311,7 @@ static int run(int argc, char* argv[]) {
                                     // Skip relations with missing member ways
                                     bool has_missing = false;
                                     for (const auto& [way_id, role] : rel.members) {
-                                        if (data.way_geometries.find(way_id) == data.way_geometries.end()) {
+                                        if (!data.way_geometries.find(way_id)) {
                                             has_missing = true;
                                             break;
                                         }
@@ -4454,8 +4455,7 @@ static int run(int argc, char* argv[]) {
                     data.collected_poi_relations.clear();
                     data.collected_poi_relations.shrink_to_fit();
 
-                    data.way_geometries.clear();
-                    std::unordered_map<int64_t, ParsedData::WayGeometry>().swap(data.way_geometries);
+                    free_storage(data.way_geometries);
                 }
             }
         }

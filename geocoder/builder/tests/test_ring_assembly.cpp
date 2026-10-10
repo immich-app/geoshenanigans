@@ -20,15 +20,12 @@ namespace {
 using Coord = std::pair<double, double>;
 using Ring = std::vector<Coord>;
 
-// Build a WayGeometry from a coordinate list. The node-id fields are not used
-// by assemble_outer_rings (it works purely on coordinates), so any value is
+// Adds a way from a coordinate list. The node-id fields are not used by
+// assemble_outer_rings (it works purely on coordinates), so any value is
 // fine; we set them deterministically anyway.
-ParsedData::WayGeometry make_way(const std::vector<Coord>& coords) {
-    ParsedData::WayGeometry wg;
-    wg.coords = coords;
-    wg.first_node_id = 0;
-    wg.last_node_id = 0;
-    return wg;
+void add_way(WayGeometries& geoms, int64_t way_id, const std::vector<Coord>& coords) {
+    geoms.ways[way_id] = {geoms.coords.size(), static_cast<uint32_t>(coords.size()), 0, 0};
+    geoms.coords.insert(geoms.coords.end(), coords.begin(), coords.end());
 }
 
 // Are two coordinates equal to within float tolerance?
@@ -46,8 +43,8 @@ bool ring_is_closed(const Ring& r) {
 // A single already-closed way (a unit square, first==last) is emitted as one
 // ring in the greedy pass, unchanged.
 TEST(ring_assembly_single_closed_way) {
-    std::unordered_map<int64_t, ParsedData::WayGeometry> geoms;
-    geoms[1] = make_way({{0.0, 0.0}, {0.0, 1.0}, {1.0, 1.0}, {1.0, 0.0}, {0.0, 0.0}});
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {0.0, 1.0}, {1.0, 1.0}, {1.0, 0.0}, {0.0, 0.0}});
 
     std::vector<std::pair<int64_t, std::string>> members = {{1, "outer"}};
     auto rings = assemble_outer_rings(members, geoms);
@@ -62,8 +59,8 @@ TEST(ring_assembly_single_closed_way) {
 // An empty role string is treated like "outer" (the filter only skips named
 // non-outer roles), so an empty-role closed way still produces a ring.
 TEST(ring_assembly_empty_role_is_outer) {
-    std::unordered_map<int64_t, ParsedData::WayGeometry> geoms;
-    geoms[1] = make_way({{0.0, 0.0}, {0.0, 1.0}, {1.0, 1.0}, {1.0, 0.0}, {0.0, 0.0}});
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {0.0, 1.0}, {1.0, 1.0}, {1.0, 0.0}, {0.0, 0.0}});
 
     std::vector<std::pair<int64_t, std::string>> members = {{1, ""}};
     auto rings = assemble_outer_rings(members, geoms);
@@ -77,9 +74,9 @@ TEST(ring_assembly_empty_role_is_outer) {
 //   way 2: top + left edges      (1,1) -> (0,1) -> (0,0)
 // Stitched they form a closed square.
 TEST(ring_assembly_two_ways_stitch) {
-    std::unordered_map<int64_t, ParsedData::WayGeometry> geoms;
-    geoms[1] = make_way({{0.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}});
-    geoms[2] = make_way({{1.0, 1.0}, {0.0, 1.0}, {0.0, 0.0}});
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}});
+    add_way(geoms, 2, {{1.0, 1.0}, {0.0, 1.0}, {0.0, 0.0}});
 
     std::vector<std::pair<int64_t, std::string>> members = {{1, "outer"}, {2, "outer"}};
     auto rings = assemble_outer_rings(members, geoms);
@@ -94,8 +91,8 @@ TEST(ring_assembly_two_ways_stitch) {
 // A non-"outer" named role (e.g. "inner") is filtered out, so the way is never
 // considered and no ring is produced.
 TEST(ring_assembly_inner_role_filtered) {
-    std::unordered_map<int64_t, ParsedData::WayGeometry> geoms;
-    geoms[1] = make_way({{0.0, 0.0}, {0.0, 1.0}, {1.0, 1.0}, {1.0, 0.0}, {0.0, 0.0}});
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {0.0, 1.0}, {1.0, 1.0}, {1.0, 0.0}, {0.0, 0.0}});
 
     std::vector<std::pair<int64_t, std::string>> members = {{1, "inner"}};
     auto rings = assemble_outer_rings(members, geoms);
@@ -106,8 +103,8 @@ TEST(ring_assembly_inner_role_filtered) {
 // include_all_roles=true overrides the role filter: an "inner" closed way is
 // then assembled into a ring.
 TEST(ring_assembly_include_all_roles_overrides_filter) {
-    std::unordered_map<int64_t, ParsedData::WayGeometry> geoms;
-    geoms[1] = make_way({{0.0, 0.0}, {0.0, 1.0}, {1.0, 1.0}, {1.0, 0.0}, {0.0, 0.0}});
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {0.0, 1.0}, {1.0, 1.0}, {1.0, 0.0}, {0.0, 0.0}});
 
     std::vector<std::pair<int64_t, std::string>> members = {{1, "inner"}};
     auto rings = assemble_outer_rings(members, geoms, /*include_all_roles=*/true);
@@ -119,8 +116,8 @@ TEST(ring_assembly_include_all_roles_overrides_filter) {
 // An open, unclosable set of ways (a single open polyline whose endpoints
 // don't meet) produces no ring.
 TEST(ring_assembly_open_unclosable_no_ring) {
-    std::unordered_map<int64_t, ParsedData::WayGeometry> geoms;
-    geoms[1] = make_way({{0.0, 0.0}, {1.0, 0.0}, {2.0, 0.0}});
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {1.0, 0.0}, {2.0, 0.0}});
 
     std::vector<std::pair<int64_t, std::string>> members = {{1, "outer"}};
     auto rings = assemble_outer_rings(members, geoms);
@@ -131,9 +128,9 @@ TEST(ring_assembly_open_unclosable_no_ring) {
 // Two ways that share only ONE endpoint (the other ends dangle apart) cannot
 // close, so no ring is produced.
 TEST(ring_assembly_dangling_chain_no_ring) {
-    std::unordered_map<int64_t, ParsedData::WayGeometry> geoms;
-    geoms[1] = make_way({{0.0, 0.0}, {1.0, 0.0}});
-    geoms[2] = make_way({{1.0, 0.0}, {2.0, 0.0}});
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {1.0, 0.0}});
+    add_way(geoms, 2, {{1.0, 0.0}, {2.0, 0.0}});
 
     std::vector<std::pair<int64_t, std::string>> members = {{1, "outer"}, {2, "outer"}};
     auto rings = assemble_outer_rings(members, geoms);
@@ -144,8 +141,8 @@ TEST(ring_assembly_dangling_chain_no_ring) {
 // A member referencing a way with no geometry (missing from the map) is
 // skipped; a sibling closed way still assembles fine.
 TEST(ring_assembly_missing_geometry_skipped) {
-    std::unordered_map<int64_t, ParsedData::WayGeometry> geoms;
-    geoms[1] = make_way({{0.0, 0.0}, {0.0, 1.0}, {1.0, 1.0}, {1.0, 0.0}, {0.0, 0.0}});
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {0.0, 1.0}, {1.0, 1.0}, {1.0, 0.0}, {0.0, 0.0}});
     // way 2 has no geometry entry.
 
     std::vector<std::pair<int64_t, std::string>> members = {{2, "outer"}, {1, "outer"}};
@@ -157,7 +154,7 @@ TEST(ring_assembly_missing_geometry_skipped) {
 
 // Empty member list -> no rings (and no crash).
 TEST(ring_assembly_empty_members_no_ring) {
-    std::unordered_map<int64_t, ParsedData::WayGeometry> geoms;
+    WayGeometries geoms;
     std::vector<std::pair<int64_t, std::string>> members;
     auto rings = assemble_outer_rings(members, geoms);
     CHECK_EQ(rings.size(), size_t(0));
@@ -166,9 +163,9 @@ TEST(ring_assembly_empty_members_no_ring) {
 // Two independent closed squares (disjoint, no shared coords) each become their
 // own ring -> two rings out.
 TEST(ring_assembly_two_disjoint_closed_ways) {
-    std::unordered_map<int64_t, ParsedData::WayGeometry> geoms;
-    geoms[1] = make_way({{0.0, 0.0}, {0.0, 1.0}, {1.0, 1.0}, {1.0, 0.0}, {0.0, 0.0}});
-    geoms[2] = make_way({{5.0, 5.0}, {5.0, 6.0}, {6.0, 6.0}, {6.0, 5.0}, {5.0, 5.0}});
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {0.0, 1.0}, {1.0, 1.0}, {1.0, 0.0}, {0.0, 0.0}});
+    add_way(geoms, 2, {{5.0, 5.0}, {5.0, 6.0}, {6.0, 6.0}, {6.0, 5.0}, {5.0, 5.0}});
 
     std::vector<std::pair<int64_t, std::string>> members = {{1, "outer"}, {2, "outer"}};
     auto rings = assemble_outer_rings(members, geoms);
@@ -184,8 +181,8 @@ TEST(ring_assembly_two_disjoint_closed_ways) {
 // intersection predicate itself is unit-tested in test_geometry.cpp for both
 // the brute-force and sweep-line branches.
 TEST(ring_assembly_preclosed_bowtie_passes_through) {
-    std::unordered_map<int64_t, ParsedData::WayGeometry> geoms;
-    geoms[1] = make_way({{0.0, 0.0}, {1.0, 1.0}, {1.0, 0.0}, {0.0, 1.0}, {0.0, 0.0}});
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {1.0, 1.0}, {1.0, 0.0}, {0.0, 1.0}, {0.0, 0.0}});
     std::vector<std::pair<int64_t, std::string>> members = {{1, "outer"}};
     auto rings = assemble_outer_rings(members, geoms);
     CHECK_EQ(rings.size(), size_t(1));
@@ -194,11 +191,11 @@ TEST(ring_assembly_preclosed_bowtie_passes_through) {
 // Two ways whose shared endpoints only line up when the second is walked in
 // reverse: the stitcher must handle reversed segments.
 TEST(ring_assembly_reversed_way_stitch) {
-    std::unordered_map<int64_t, ParsedData::WayGeometry> geoms;
+    WayGeometries geoms;
     // Way 1: (0,0) -> (0,1) -> (1,1). Way 2 REVERSED: (0,0) -> (1,0) -> (1,1)
     // (i.e. its stored direction runs from way 1's START to way 1's END).
-    geoms[1] = make_way({{0.0, 0.0}, {0.0, 1.0}, {1.0, 1.0}});
-    geoms[2] = make_way({{0.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}});
+    add_way(geoms, 1, {{0.0, 0.0}, {0.0, 1.0}, {1.0, 1.0}});
+    add_way(geoms, 2, {{0.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}});
     std::vector<std::pair<int64_t, std::string>> members = {{1, "outer"}, {2, "outer"}};
     auto rings = assemble_outer_rings(members, geoms);
     REQUIRE(rings.size() == size_t(1));
@@ -208,11 +205,11 @@ TEST(ring_assembly_reversed_way_stitch) {
 // Greedy fails (three candidate continuations from a junction, greedy picks a
 // dead end first) but the backtracking pass closes the ring.
 TEST(ring_assembly_backtrack_closes_after_greedy_dead_end) {
-    std::unordered_map<int64_t, ParsedData::WayGeometry> geoms;
+    WayGeometries geoms;
     // Square via two arcs plus a dead-end spur sharing the junction (1,1):
-    geoms[1] = make_way({{0.0, 0.0}, {0.0, 1.0}, {1.0, 1.0}});   // arc A
-    geoms[2] = make_way({{1.0, 1.0}, {1.0, 0.0}, {0.0, 0.0}});   // arc B (closes)
-    geoms[3] = make_way({{1.0, 1.0}, {2.0, 2.0}});               // dead-end spur
+    add_way(geoms, 1, {{0.0, 0.0}, {0.0, 1.0}, {1.0, 1.0}});   // arc A
+    add_way(geoms, 2, {{1.0, 1.0}, {1.0, 0.0}, {0.0, 0.0}});   // arc B (closes)
+    add_way(geoms, 3, {{1.0, 1.0}, {2.0, 2.0}});               // dead-end spur
     std::vector<std::pair<int64_t, std::string>> members =
         {{1, "outer"}, {2, "outer"}, {3, "outer"}};
     auto rings = assemble_outer_rings(members, geoms);

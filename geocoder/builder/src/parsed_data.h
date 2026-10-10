@@ -218,6 +218,38 @@ inline uint8_t string_home_tier(uint8_t mask) {
     return 2;
 }
 
+// Coordinates of one way within a shared buffer.
+struct CoordSpan {
+    const std::pair<double,double>* first = nullptr;
+    size_t count = 0;
+
+    const std::pair<double,double>* begin() const { return first; }
+    const std::pair<double,double>* end() const { return first + count; }
+    size_t size() const { return count; }
+    const std::pair<double,double>& front() const { return first[0]; }
+    const std::pair<double,double>& back() const { return first[count - 1]; }
+    const std::pair<double,double>& operator[](size_t i) const { return first[i]; }
+};
+
+// The admin and POI relation member ways ring assembly reads, by way id,
+// their coordinates back to back in one buffer.
+struct WayGeometries {
+    struct Way {
+        size_t offset;  // into coords
+        uint32_t count;
+        int64_t first_node_id;
+        int64_t last_node_id;
+    };
+    std::vector<std::pair<double,double>> coords;
+    std::unordered_map<int64_t, Way> ways;
+
+    const Way* find(int64_t way_id) const {
+        auto it = ways.find(way_id);
+        return it == ways.end() ? nullptr : &it->second;
+    }
+    CoordSpan coords_of(const Way& way) const { return {coords.data() + way.offset, way.count}; }
+};
+
 // --- Parsed data container ---
 
 struct ParsedData {
@@ -289,12 +321,7 @@ struct ParsedData {
 
     // Collected data for parallel admin assembly
     std::vector<CollectedRelation> collected_relations;
-    struct WayGeometry {
-        std::vector<std::pair<double,double>> coords;
-        int64_t first_node_id;
-        int64_t last_node_id;
-    };
-    std::unordered_map<int64_t, WayGeometry> way_geometries;
+    WayGeometries way_geometries;
 
     // Place nodes (settlements)
     std::vector<PlaceNode> place_nodes;
