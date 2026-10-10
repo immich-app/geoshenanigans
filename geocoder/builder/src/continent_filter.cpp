@@ -489,29 +489,23 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         if (it == kept_offsets.end() || *it != off) return NO_DATA;
         return new_offsets[it - kept_offsets.begin()];
     };
-    auto remap_each = [&](auto& records, auto remap_record) {
-        parallel_for(records.size(), [&](size_t begin, size_t end, unsigned) {
-            for (size_t i = begin; i < end; i++) remap_record(records[i]);
-        });
-    };
-
-    remap_each(out.ways, [&](WayHeader& w) { w.name_id = remap_or_sentinel(w.name_id); });
-    remap_each(out.addr_points, [&](AddrPoint& a) {
+    parallel_each(out.ways, [&](WayHeader& w) { w.name_id = remap_or_sentinel(w.name_id); });
+    parallel_each(out.addr_points, [&](AddrPoint& a) {
         a.housenumber_id = remap_or_sentinel(a.housenumber_id);
         a.street_id = remap_or_sentinel(a.street_id);
     });
-    remap_each(out.interp_ways, [&](InterpWay& iw) { iw.street_id = remap_or_sentinel(iw.street_id); });
-    remap_each(out.admin_polygons, [&](AdminPolygon& ap) { ap.name_id = remap_or_sentinel(ap.name_id); });
-    remap_each(out.place_nodes, [&](PlaceNode& pn) { pn.name_id = remap_or_sentinel(pn.name_id); });
-    remap_each(out.poi_records, [&](PoiRecord& pr) {
+    parallel_each(out.interp_ways, [&](InterpWay& iw) { iw.street_id = remap_or_sentinel(iw.street_id); });
+    parallel_each(out.admin_polygons, [&](AdminPolygon& ap) { ap.name_id = remap_or_sentinel(ap.name_id); });
+    parallel_each(out.place_nodes, [&](PlaceNode& pn) { pn.name_id = remap_or_sentinel(pn.name_id); });
+    parallel_each(out.poi_records, [&](PoiRecord& pr) {
         pr.name_id = remap_or_sentinel(pr.name_id);
         pr.parent_street_id = remap_or_sentinel(pr.parent_street_id);
         pr.parent_postcode_id = remap_or_sentinel(pr.parent_postcode_id);
     });
     auto remap_offset = [&](uint32_t& off) { off = remap_or_sentinel(off); };
-    remap_each(out.way_postcode_ids, remap_offset);
-    remap_each(out.interp_postcode_ids, remap_offset);
-    remap_each(out.addr_postcode_ids, remap_offset);
+    parallel_each(out.way_postcode_ids, remap_offset);
+    parallel_each(out.interp_postcode_ids, remap_offset);
+    parallel_each(out.addr_postcode_ids, remap_offset);
 
     // Rebuild postcode_accum with remapped keys (drop entries whose string didn't survive)
     {

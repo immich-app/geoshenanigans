@@ -402,6 +402,14 @@ TEST(parallel_sort_small_and_presorted_inputs) {
     }
 }
 
+TEST(parallel_each_visits_every_element_once) {
+    for (unsigned threads : {1u, 4u, 64u}) {
+        std::vector<int> v(1000, 1);
+        parallel_each(v, [](int& x) { x += 1; }, threads);
+        CHECK(v == std::vector<int>(1000, 2));
+    }
+}
+
 TEST(parallel_for_dynamic_hands_out_grain_sized_ranges) {
     for (unsigned threads : {1u, 3u, 16u}) {
         for (size_t grain : {size_t(1), size_t(7), size_t(5000)}) {

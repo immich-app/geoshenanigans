@@ -51,6 +51,14 @@ void parallel_for(size_t n, Fn&& fn, unsigned threads = 0) {
         if (e) std::rethrow_exception(e);
 }
 
+// fn(element) for every element of v, on every core.
+template <class T, class Fn>
+void parallel_each(std::vector<T>& v, Fn fn, unsigned threads = 0) {
+    parallel_for(v.size(), [&](size_t begin, size_t end, unsigned) {
+        for (size_t i = begin; i < end; i++) fn(v[i]);
+    }, threads);
+}
+
 // parallel_for for uneven per-element cost: workers take the next `grain`
 // elements as they free up. Which worker gets which range depends on timing,
 // so fn must not let it shape its output.
