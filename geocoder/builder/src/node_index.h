@@ -13,6 +13,7 @@
 
 #include <sys/mman.h>
 
+#include "bits.h"
 #include "parallel.h"
 
 struct PackedLocation {
@@ -56,7 +57,7 @@ public:
             for (size_t b = begin; b < end; b++) {
                 uint64_t n = 0;
                 for (size_t w = b * kWordsPerBlock; w < (b + 1) * kWordsPerBlock; w++)
-                    n += static_cast<uint64_t>(__builtin_popcountll(words_[w]));
+                    n += popcount64(words_[w]);
                 block_rank_[b + 1] = n;
             }
         }, threads);
@@ -131,8 +132,8 @@ private:
         size_t w = id >> 6;
         uint64_t r = block_rank_[w / kWordsPerBlock];
         for (size_t i = w & ~(kWordsPerBlock - 1); i < w; i++)
-            r += static_cast<uint64_t>(__builtin_popcountll(words_[i]));
-        return r + static_cast<uint64_t>(__builtin_popcountll(words_[w] & ((uint64_t(1) << (id & 63)) - 1)));
+            r += popcount64(words_[i]);
+        return r + popcount64(words_[w] & ((uint64_t(1) << (id & 63)) - 1));
     }
 
     size_t capacity_;

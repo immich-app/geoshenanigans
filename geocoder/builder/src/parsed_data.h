@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+#include "bits.h"
 #include "types.h"
 #include "string_pool.h"
 #include "id_allocator.h"
@@ -501,7 +502,7 @@ public:
         }, threads);
         // A pool under 4 GiB holds fewer than 2^32 strings.
         auto ranks = parallel_offsets<uint32_t>(blocks_.size(), [&](size_t b) {
-            return static_cast<uint32_t>(__builtin_popcountll(blocks_[b].bits));
+            return popcount64(blocks_[b].bits);
         }, threads);
         parallel_for(blocks_.size(), [&](size_t b0, size_t b1, unsigned) {
             for (size_t b = b0; b < b1; b++) blocks_[b].rank = ranks[b];
@@ -518,7 +519,7 @@ public:
         const Block& b = blocks_[off >> 6];
         uint64_t bit = uint64_t(1) << (off & 63);
         if (!(b.bits & bit)) return npos;
-        return b.rank + static_cast<size_t>(__builtin_popcountll(b.bits & (bit - 1)));
+        return b.rank + static_cast<size_t>(popcount64(b.bits & (bit - 1)));
     }
 
     // The start offset of every string, by index.
