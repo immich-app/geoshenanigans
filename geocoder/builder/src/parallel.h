@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -495,6 +496,32 @@ void parallel_sort(It first, It last, Cmp cmp, unsigned threads = 0) {
     parallel_for(n, [&](size_t b, size_t e, unsigned) {
         std::move(out.get() + b, out.get() + e, first + b);
     }, threads);
+}
+
+// The indices [0, n) by descending cost(i), ties by index: an order to hand
+// out uneven work in, so that the costliest items start first rather than
+// finish last. A NaN cost counts as 0.
+template <class Cost>
+std::vector<uint32_t> costliest_first(size_t n, Cost cost, unsigned threads = 0) {
+    struct Item {
+        float cost;
+        uint32_t index;
+    };
+    std::vector<Item> items(n);
+    parallel_for(n, [&](size_t b, size_t e, unsigned) {
+        for (size_t i = b; i < e; i++) {
+            float c = static_cast<float>(cost(i));
+            items[i] = {std::isnan(c) ? 0.0f : c, static_cast<uint32_t>(i)};
+        }
+    }, threads);
+    parallel_sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
+        return a.cost != b.cost ? a.cost > b.cost : a.index < b.index;
+    }, threads);
+    std::vector<uint32_t> order(n);
+    parallel_for(n, [&](size_t b, size_t e, unsigned) {
+        for (size_t k = b; k < e; k++) order[k] = items[k].index;
+    }, threads);
+    return order;
 }
 
 // Splits [0, n) into at most `threads` blocks and runs fn(block, begin, end)

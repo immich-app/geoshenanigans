@@ -2,6 +2,7 @@
 #include "parallel.h"
 
 #include <atomic>
+#include <cmath>
 #include <mutex>
 #include <cstdint>
 #include <random>
@@ -384,6 +385,17 @@ TEST(parallel_count_counts_matches_for_any_thread_count) {
         for (size_t i = 0; i < n; i++) expect += i % 7 == 3;
         for (unsigned threads : {1u, 4u, 64u})
             CHECK_EQ(parallel_count(n, [](size_t i) { return i % 7 == 3; }, threads), expect);
+    }
+}
+
+TEST(costliest_first_orders_by_descending_cost_then_index) {
+    for (size_t n : {size_t(0), size_t(7), size_t(200000)}) {
+        auto cost = [](size_t i) { return i % 11 == 4 ? NAN : static_cast<float>((i * 7919) % 13); };
+        std::vector<uint32_t> expect(n);
+        for (size_t i = 0; i < n; i++) expect[i] = static_cast<uint32_t>(i);
+        auto c = [&](uint32_t i) { float x = cost(i); return std::isnan(x) ? 0.0f : x; };
+        std::stable_sort(expect.begin(), expect.end(), [&](uint32_t a, uint32_t b) { return c(a) > c(b); });
+        for (unsigned threads : {1u, 3u, 64u}) CHECK(costliest_first(n, cost, threads) == expect);
     }
 }
 
