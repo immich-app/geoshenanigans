@@ -4281,6 +4281,12 @@ static int run(int argc, char* argv[]) {
                 });
                 tl_way_data = nullptr;
                 std::cerr << "  Parallel way processing complete." << std::endl;
+                // The way stream was the last reader of node coordinates:
+                // admin/POI ring assembly reads data.way_geometries. Free
+                // the index (~100 GiB resident on planet) before the merge
+                // below copies the thread-local data into ParsedData.
+                index.release();
+                std::cerr << "Released dense node index." << std::endl;
 
                 // Process areas/multipolygons — sequential fallback path
                 // Merge thread-local way/interp data into main ParsedData
@@ -4453,15 +4459,6 @@ static int run(int argc, char* argv[]) {
                 {
                     log_phase("Pass 2b: way processing", _pt, _cpu);
                     pbf.unmap(); // release 86 GiB PBF mmap before admin/S2 phases
-                    // Release the dense node index here, BEFORE admin/POI
-                    // ring assembly runs — that phase only reads from
-                    // data.way_geometries (pre-resolved way coords) and
-                    // never calls index.get(). Releasing here drops peak
-                    // RSS from ~196 GiB (with the index resident during
-                    // admin assembly) to ~75 GiB on planet. Previously
-                    // released ~700 lines below at line 2887.
-                    index.release();
-                    std::cerr << "Released dense node index (pre-admin)." << std::endl;
                     std::cerr << "  Assembling admin polygons in parallel ("
                               << data.collected_relations.size() << " relations, "
                               << data.way_geometries.size() << " way geometries)..." << std::endl;
@@ -4951,15 +4948,6 @@ static int run(int argc, char* argv[]) {
                 }
             }
         }
-
-        // All way-node coordinate lookups happen during pass 3 (way
-        // parsing) and the relation member geometry resolution that
-        // immediately follows. Once those are done the dense node
-        // index — ~100 GiB resident on planet — is dead weight and
-        // starves later phases of memory. Release before strategy-2
-        // and continent filtering run.
-        index.release();
-        std::cerr << "Released dense node index." << std::endl;
 
         // shrink_to_fit() the big parsed containers now that no further
         // push_backs happen on them. Vector doubling growth typically
