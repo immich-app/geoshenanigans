@@ -4309,7 +4309,6 @@ static int run(int argc, char* argv[]) {
                     uint32_t interp_node_base = static_cast<uint32_t>(data.interp_nodes.size());
 
                     // Merge street ways
-                    data.way_osm_ids.reserve(data.way_osm_ids.size() + local.ways.size());
                     for (size_t i = 0; i < local.ways.size(); i++) {
                         auto h = local.ways[i];
                         h.node_offset += node_base;
