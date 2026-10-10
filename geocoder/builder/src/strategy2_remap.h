@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "parallel.h"
 #include "types.h"
 
 // Strategy-2 reference-site remap helpers. These were previously
@@ -42,8 +43,31 @@ void remap_cell_map(std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_ma
     }
 }
 
+// A remap keeps every cell_id, so a table already grouped by cell only needs
+// each cell's run re-sorted: whole runs per worker, no global sort. remap_one
+// runs on several threads at once.
 template <typename RemapOne>
 void remap_cell_pairs(std::vector<CellItemPair>& pairs, RemapOne remap_one) {
-    for (auto& p : pairs) remap_one(p.item_id);
-    std::sort(pairs.begin(), pairs.end(), cell_item_less);
+    const unsigned threads = parallel_threads();
+    std::vector<char> ungrouped(threads, 0);
+    parallel_for(pairs.size(), [&](size_t begin, size_t end, unsigned w) {
+        for (size_t i = std::max<size_t>(begin, 1); i < end; i++)
+            if (pairs[i].cell_id < pairs[i - 1].cell_id) { ungrouped[w] = 1; break; }
+    }, threads);
+    if (std::find(ungrouped.begin(), ungrouped.end(), 1) != ungrouped.end()) {
+        for (auto& p : pairs) remap_one(p.item_id);
+        parallel_sort(pairs.begin(), pairs.end(), cell_item_less);
+        return;
+    }
+
+    parallel_for_runs(pairs.size(), same_cell(pairs), [&](size_t begin, size_t end, unsigned) {
+        for (size_t i = begin; i < end; i++) remap_one(pairs[i].item_id);
+        for (size_t run = begin; run < end; ) {
+            size_t run_end = run + 1;
+            while (run_end < end && pairs[run_end].cell_id == pairs[run].cell_id) run_end++;
+            if (run_end - run > 1)
+                std::sort(pairs.begin() + run, pairs.begin() + run_end, cell_item_less);
+            run = run_end;
+        }
+    }, threads);
 }
