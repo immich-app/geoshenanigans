@@ -24,6 +24,14 @@ inline unsigned parallel_threads() {
     return std::max(1u, std::thread::hardware_concurrency());
 }
 
+// A vector of n value-initialized elements, made on a thread of its own:
+// faulting in a fresh planet-sized vector takes one core seconds, which then
+// pass beside other work. get() it where it is needed.
+template <class T>
+std::future<std::vector<T>> vector_beside(size_t n) {
+    return std::async(std::launch::async, [n] { return std::vector<T>(n); });
+}
+
 // Runs fn(begin, end, worker) over at most `threads` contiguous ranges that
 // cover [0, n), one thread each (0 = every core). The ranges move with the
 // thread count, so fn must not let them shape its output. The first
@@ -497,6 +505,9 @@ void parallel_sort(It first, It last, Cmp cmp, unsigned threads = 0) {
         return;
     }
 
+    // The merge's destination faults in beside the chunk sorts: faulted in
+    // by the merge, its pages would come one at a time on every core at once.
+    auto merged = vector_beside<T>(n);
     std::vector<size_t> bounds(chunks + 1);
     for (size_t c = 0; c <= chunks; c++) bounds[c] = n * c / chunks;
     parallel_for(chunks, [&](size_t b, size_t e, unsigned) {
@@ -505,11 +516,11 @@ void parallel_sort(It first, It last, Cmp cmp, unsigned threads = 0) {
 
     std::vector<std::pair<T*, size_t>> runs(chunks);
     for (size_t c = 0; c < chunks; c++) runs[c] = {&*(first + bounds[c]), bounds[c + 1] - bounds[c]};
-    std::unique_ptr<T[]> out(new T[n]);
-    parallel_merge(runs, out.get(), cmp, threads);
+    std::vector<T> out = merged.get();
+    parallel_merge(runs, out.data(), cmp, threads);
 
     parallel_for(n, [&](size_t b, size_t e, unsigned) {
-        std::move(out.get() + b, out.get() + e, first + b);
+        std::move(out.begin() + b, out.begin() + e, first + b);
     }, threads);
 }
 
@@ -639,14 +650,6 @@ T parallel_sum(size_t n, Value value, unsigned threads = 0) {
 template <class Pred>
 size_t parallel_count(size_t n, Pred pred, unsigned threads = 0) {
     return parallel_sum<size_t>(n, [&](size_t i) { return pred(i) ? size_t(1) : size_t(0); }, threads);
-}
-
-// A vector of n value-initialized elements, made on a thread of its own:
-// faulting in a fresh planet-sized vector takes one core seconds, which then
-// pass beside other work. get() it where it is needed.
-template <class T>
-std::future<std::vector<T>> vector_beside(size_t n) {
-    return std::async(std::launch::async, [n] { return std::vector<T>(n); });
 }
 
 // Whether pred(i) holds for any i in [0, n).
