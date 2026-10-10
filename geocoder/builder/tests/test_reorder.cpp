@@ -288,8 +288,9 @@ void check_steps_match_reference(uint64_t seed, const Shape& s) {
 // --- String pool partition ---
 
 std::string random_string(Rng& r) {
-    std::string s(r.below(9), 'a');
-    for (auto& c : s) c = static_cast<char>("abcdQ\xc3\xa9 "[r.below(8)]);
+    // Some share a head longer than the 8 bytes the sort keys hold.
+    std::string s = r.one_in(3) ? "Avenue d" : "";
+    for (uint32_t len = r.below(9); len > 0; len--) s += "abcdQ\xc3\xa9 "[r.below(8)];
     return s;
 }
 

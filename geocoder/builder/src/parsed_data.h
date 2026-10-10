@@ -613,19 +613,42 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
     std::array<std::vector<uint32_t>, STR_TIER_COUNT> sorted;
     {
         const std::vector<uint32_t> offsets = starts.offsets(threads);
-        auto str_less = [pool](uint32_t a, uint32_t b) { return strcmp(pool + a, pool + b) < 0; };
+        // The sort orders each string's first 8 bytes beside its offset, so
+        // most comparisons never reach into the pool. Big-endian, the bytes
+        // compare as strcmp's unsigned chars; equal heads that hold the
+        // terminator are equal strings.
+        struct StrKey {
+            uint64_t head;
+            uint32_t off;
+        };
+        auto key_less = [pool](const StrKey& a, const StrKey& b) {
+            if (a.head != b.head) return a.head < b.head;
+            return (a.head & 0xFF) != 0 && strcmp(pool + a.off + 8, pool + b.off + 8) < 0;
+        };
+        std::vector<StrKey> keys;
         bool unique = true;
         for (size_t t = 0; t < STR_TIER_COUNT && unique; t++) {
             auto& list = sorted[t];
             list = parallel_filter(n, [&](size_t s) { return tier[s] == t; }, threads);
+            keys.resize(list.size());
             parallel_for(list.size(), [&](size_t b, size_t e, unsigned) {
-                for (size_t k = b; k < e; k++) list[k] = offsets[list[k]];
+                for (size_t k = b; k < e; k++) {
+                    const uint32_t off = offsets[list[k]];
+                    uint64_t head = 0;
+                    for (int c = 0; c < 8 && pool[off + c]; c++)
+                        head |= uint64_t(static_cast<unsigned char>(pool[off + c])) << (56 - 8 * c);
+                    keys[k] = {head, off};
+                }
             }, threads);
-            parallel_sort(list.begin(), list.end(), str_less, threads);
-            unique = !parallel_any(list.size() > 1 ? list.size() - 1 : 0, [&](size_t k) {
-                return strcmp(pool + list[k], pool + list[k + 1]) == 0;
+            parallel_sort(keys.begin(), keys.end(), key_less, threads);
+            unique = !parallel_any(keys.size() > 1 ? keys.size() - 1 : 0, [&](size_t k) {
+                return !key_less(keys[k], keys[k + 1]);
+            }, threads);
+            parallel_for(list.size(), [&](size_t b, size_t e, unsigned) {
+                for (size_t k = b; k < e; k++) list[k] = keys[k].off;
             }, threads);
         }
+        keys = {};
         if (!unique) {
             // Interning keeps the pool unique, but should a string repeat,
             // std::sort's tie order is part of the layout: sort exactly as
