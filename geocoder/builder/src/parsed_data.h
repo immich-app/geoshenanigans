@@ -16,6 +16,7 @@
 #include <cstring>
 #include <dirent.h>
 #include <iomanip>
+#include <sstream>
 #include <thread>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -127,10 +128,14 @@ inline void log_phase(const char* name, std::chrono::steady_clock::time_point& t
     unsigned ncpu = std::thread::hardware_concurrency();
     int pct = (wall_sec > 0.1 && ncpu > 0) ? (int)(cores_used * 100.0 / ncpu) : 0;
     long rss = get_rss_mb();
-    std::cerr << "  [" << ms/1000 << "." << (ms%1000)/100 << "s"
-              << " " << std::fixed << std::setprecision(1) << cores_used << "/" << ncpu << "cores"
-              << " " << pct << "%"
-              << " " << rss << "MiB] " << name << std::endl;
+    // Formatted here and written in one call: phases end on many threads at
+    // once, and manipulators on the shared std::cerr would race.
+    std::ostringstream line;
+    line << "  [" << ms/1000 << "." << (ms%1000)/100 << "s"
+         << " " << std::fixed << std::setprecision(1) << cores_used << "/" << ncpu << "cores"
+         << " " << pct << "%"
+         << " " << rss << "MiB] " << name << "\n";
+    std::cerr << line.str();
     t = now;
     prev_cpu = cpu_now;
 }
