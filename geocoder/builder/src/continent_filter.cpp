@@ -257,13 +257,13 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     // way_parent_ids: parallel to full.ways, values are old admin_poly_ids
     if (!full.way_parent_ids.empty()) {
         out.way_parent_ids.assign(out.ways.size(), NO_DATA);
-        for (uint32_t old_wid : used_way_ids) {
+        parallel_each(used_way_ids, [&](uint32_t old_wid) {
             uint32_t new_wid = way_remap[old_wid];
-            if (new_wid == NO_DATA || old_wid >= full.way_parent_ids.size()) continue;
+            if (new_wid == NO_DATA || old_wid >= full.way_parent_ids.size()) return;
             uint32_t old_parent = full.way_parent_ids[old_wid];
-            if (old_parent == NO_DATA) continue;
+            if (old_parent == NO_DATA) return;
             out.way_parent_ids[new_wid] = remap_id(admin_remap, old_parent);
-        }
+        });
     }
 
     // admin_parent_ids: parallel to full.admin_polygons, values are old admin_poly_ids
@@ -283,22 +283,22 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     // the continent split filtered out becomes NO_DATA (the server
     // treats a missing parent as unknown).
     auto project = [&](uint32_t& id, const std::vector<uint32_t>& remap) { id = remap_id(remap, id); };
-    for (auto& pn : out.place_nodes) project(pn.parent_poly_id, admin_remap);
-    for (auto& pr : out.poi_records) project(pr.parent_poly_id, admin_remap);
+    parallel_each(out.place_nodes, [&](PlaceNode& pn) { project(pn.parent_poly_id, admin_remap); });
+    parallel_each(out.poi_records, [&](PoiRecord& pr) { project(pr.parent_poly_id, admin_remap); });
     // Street-won housenumber refinement matches addr points to the
     // winning way by this id.
-    for (auto& ap : out.addr_points) project(ap.parent_way_id, way_remap);
+    parallel_each(out.addr_points, [&](AddrPoint& ap) { project(ap.parent_way_id, way_remap); });
 
     // --- Project postcode-id parallel arrays ---
     // Values are string offsets in full.string_pool — remapped during string
     // compaction below.
     if (!full.way_postcode_ids.empty()) {
         out.way_postcode_ids.assign(out.ways.size(), NO_DATA);
-        for (uint32_t old_wid : used_way_ids) {
+        parallel_each(used_way_ids, [&](uint32_t old_wid) {
             uint32_t new_wid = way_remap[old_wid];
-            if (new_wid == NO_DATA || old_wid >= full.way_postcode_ids.size()) continue;
+            if (new_wid == NO_DATA || old_wid >= full.way_postcode_ids.size()) return;
             out.way_postcode_ids[new_wid] = full.way_postcode_ids[old_wid];
-        }
+        });
     }
     if (!full.interp_postcode_ids.empty()) {
         out.interp_postcode_ids.assign(out.interp_ways.size(), NO_DATA);
@@ -315,11 +315,11 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     }
     if (!full.addr_postcode_ids.empty()) {
         out.addr_postcode_ids.assign(out.addr_points.size(), NO_DATA);
-        for (uint32_t old_aid : used_addr_ids) {
+        parallel_each(used_addr_ids, [&](uint32_t old_aid) {
             uint32_t new_aid = addr_remap[old_aid];
-            if (new_aid == NO_DATA || old_aid >= full.addr_postcode_ids.size()) continue;
+            if (new_aid == NO_DATA || old_aid >= full.addr_postcode_ids.size()) return;
             out.addr_postcode_ids[new_aid] = full.addr_postcode_ids[old_aid];
-        }
+        });
     }
 
     // --- Copy postcode_accum (spatially filtered) ---
