@@ -1718,7 +1718,9 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
     // async launches — apply_strategy2_remaps mutates the shared
     // ParsedData, and running it inside the async raced the continent
     // filtering that reads the same arrays (UB; benign only by schedule
-    // timing). RegionRun::Continent remaps its own subset here.
+    // timing). Its stages run one after another, to hold memory down while
+    // continent subsets build beside it. RegionRun::Continent remaps its
+    // own subset here and runs the stages at once.
     enum class RegionRun { Planet, Continent };
     auto write_region = [&](ParsedData& d, const std::string& base_dir, RegionRun run) {
         ensure_dir(base_dir);
@@ -2046,7 +2048,16 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             {"admin-minimal", write_admin_minimal},
             {"poi tiers", write_poi_tiers},
         };
-        for (const auto& [name, stage] : stages) timed_phase(std::string("    ") + region + ": " + name, stage);
+        if (run == RegionRun::Planet) {
+            for (const auto& [name, stage] : stages) timed_phase(std::string("    ") + region + ": " + name, stage);
+            return;
+        }
+        std::vector<std::future<void>> running;
+        for (const auto& stage : stages)
+            running.push_back(std::async(std::launch::async, [&] {
+                timed_phase(std::string("    ") + region + ": " + stage.first, stage.second);
+            }));
+        for (auto& f : running) f.get();
     };
 
     // Strategy-2 remap for the planet region runs synchronously HERE — before
