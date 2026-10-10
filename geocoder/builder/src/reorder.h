@@ -249,8 +249,6 @@ inline void reorder_addr_points(ParsedData& data, unsigned threads = 0) {
     const size_t kept = starts.size();
     const bool have_postcodes = data.addr_postcode_ids.size() == n;
     auto sorted_buffer = vector_beside<AddrPoint>(kept);
-    auto osm_buffer = vector_beside<uint64_t>(have_osm ? kept : 0);
-    auto postcode_buffer = vector_beside<uint32_t>(have_postcodes ? kept : 0);
 
     // Reorder the vertex buffer alongside addr_points. Duplicates keep
     // their copy of the vertices too: the buffer is packed in sorted order
@@ -259,6 +257,8 @@ inline void reorder_addr_points(ParsedData& data, unsigned threads = 0) {
         [&](size_t i) { const auto& p = points[order[i]]; return has_polygon(p) ? size_t(p.vertex_count) : 0; },
         [&](size_t i) { return points[order[i]].vertex_offset; }, threads, at_buffer.get(), vertex_buffer.get());
     std::vector<AddrPoint> sorted = sorted_buffer.get();
+    auto osm_buffer = vector_beside<uint64_t>(have_osm ? kept : 0);
+    auto postcode_buffer = vector_beside<uint32_t>(have_postcodes ? kept : 0);
     parallel_for(kept, [&](size_t b, size_t e, unsigned) {
         for (size_t k = b; k < e; k++) {
             AddrPoint p = points[order[starts[k]]];
@@ -266,6 +266,9 @@ inline void reorder_addr_points(ParsedData& data, unsigned threads = 0) {
             sorted[k] = p;
         }
     }, threads);
+    // The arrays these replace unmap beside the steps left.
+    auto old_vertices_freed = free_beside(std::move(data.addr_vertices));
+    auto old_points_freed = free_beside(std::move(data.addr_points));
     data.addr_vertices = std::move(repacked.items);
     repacked.at = {};
     data.addr_points = std::move(sorted);
@@ -425,6 +428,9 @@ inline void reorder_ways(ParsedData& data, unsigned threads = 0) {
     const std::vector<uint32_t> old_to_new = renumber_runs(order, starts, threads);
     order = {};
     starts = {};
+    // The arrays these replace unmap beside the steps left.
+    auto old_ways_freed = free_beside(std::move(data.ways));
+    auto old_nodes_freed = free_beside(std::move(data.street_nodes));
     data.ways = std::move(new_ways);
     data.street_nodes = std::move(repacked.items);
     renumber_cell_pairs(data.sorted_way_cells, [&](uint32_t id) { return old_to_new[id]; }, threads);
@@ -777,6 +783,9 @@ inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
     const std::vector<uint32_t> old_to_new = renumber_runs(order, starts, threads);
     order = {};
     starts = {};
+    // The arrays these replace unmap beside the steps left.
+    auto old_pois_freed = free_beside(std::move(data.poi_records));
+    auto old_vertices_freed = free_beside(std::move(data.poi_vertices));
     data.poi_records = std::move(new_pois);
     data.poi_vertices = std::move(repacked.items);
     if (have_elevations) poi_elevations = std::move(new_poi_elevations);

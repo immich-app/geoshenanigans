@@ -360,6 +360,13 @@ TEST(parallel_sum_adds_every_value_for_any_thread_count) {
     }
 }
 
+TEST(free_beside_takes_the_vector) {
+    std::vector<uint64_t> v(1000, 3);
+    auto freed = free_beside(std::move(v));
+    freed.get();
+    CHECK(v.empty());
+}
+
 TEST(vector_beside_makes_n_zeroed_elements) {
     auto v = vector_beside<uint32_t>(1000).get();
     CHECK_EQ(v.size(), size_t(1000));

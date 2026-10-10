@@ -49,6 +49,13 @@ std::future<std::vector<T>> vector_beside(size_t n) {
     return std::async(std::launch::async, [n] { return std::vector<T>(n); });
 }
 
+// Frees a vector on a thread of its own: unmapping a planet-sized vector
+// takes one core a second. The future's destructor waits for it.
+template <class T>
+std::future<void> free_beside(std::vector<T>&& v) {
+    return std::async(std::launch::async, [v = std::move(v)]() mutable { std::vector<T>().swap(v); });
+}
+
 // Runs fn(begin, end, worker) over at most `threads` contiguous ranges that
 // cover [0, n), one thread each (0 = every core). The ranges move with the
 // thread count, so fn must not let them shape its output. The first
