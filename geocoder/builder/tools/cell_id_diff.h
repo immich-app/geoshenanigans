@@ -14,14 +14,26 @@ struct CellIdDiff {
     std::vector<uint64_t> added, removed;
 };
 
-// Whether the u64 ids leading each `stride`-byte record never decrease.
-inline bool cell_ids_sorted(const char* data, size_t n, size_t stride, unsigned threads = 0) {
+// Whether in_order(a, b) holds for every two neighbouring u64 ids leading
+// the `stride`-byte records.
+template <class InOrder>
+bool cell_ids_ordered(const char* data, size_t n, size_t stride, InOrder in_order, unsigned threads = 0) {
     auto id = [&](size_t i) { uint64_t v; memcpy(&v, data + i * stride, 8); return v; };
     std::vector<char> ok(std::max<size_t>(1, std::min<size_t>(threads ? threads : parallel_threads(), n)), 1);
     parallel_for(n > 0 ? n - 1 : 0, [&](size_t b, size_t e, unsigned w) {
-        for (size_t i = b; i < e && ok[w]; i++) ok[w] = id(i) <= id(i + 1);
+        for (size_t i = b; i < e && ok[w]; i++) ok[w] = in_order(id(i), id(i + 1));
     }, threads);
     return std::all_of(ok.begin(), ok.end(), [](char c) { return c != 0; });
+}
+
+// Whether the ids never decrease.
+inline bool cell_ids_sorted(const char* data, size_t n, size_t stride, unsigned threads = 0) {
+    return cell_ids_ordered(data, n, stride, [](uint64_t a, uint64_t b) { return a <= b; }, threads);
+}
+
+// Whether the ids strictly increase.
+inline bool cell_ids_ascending(const char* data, size_t n, size_t stride, unsigned threads = 0) {
+    return cell_ids_ordered(data, n, stride, [](uint64_t a, uint64_t b) { return a < b; }, threads);
 }
 
 // The ids new holds and old doesn't (added) and the reverse (removed), as

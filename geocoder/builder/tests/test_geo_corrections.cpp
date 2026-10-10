@@ -132,11 +132,31 @@ TEST(geo_entry_corrections_match_the_sequential_walk) {
         CellIdDiff d = diff_cell_ids(o.cells.data(), o.ids.size(), n.cells.data(), n.ids.size(), 20);
         ByteSpan oe{o.entries.data(), o.entries.size()}, ne{n.entries.data(), n.entries.size()};
         auto expect = legacy_corrections(9, og, ng, d.added, d.removed, oe, ne, 8, id_rm);
-        auto got = geo_entry_corrections(9, og, ng, d.added, d.removed, oe, ne, 8, id_rm);
-        CHECK(got.section == expect);
         uint32_t cells;
         memcpy(&cells, expect.data() + 8, 4);
-        CHECK_EQ(got.cells, cells);
+        for (unsigned threads : {1u, 3u, 16u}) {
+            auto got = geo_entry_corrections(9, og, ng, d.added, d.removed, oe, ne, 8, id_rm, threads);
+            CHECK(got.section == expect);
+            CHECK_EQ(got.cells, cells);
+        }
+    }
+}
+
+TEST(geo_entry_corrections_ranges_tolerate_inconsistent_cell_changes) {
+    // Added and removed lists that don't follow from the cell files: cells
+    // added that exist on neither side, removed ones the old side lacks.
+    std::mt19937_64 rng(8);
+    for (int round = 0; round < 30; round++) {
+        Side o = random_side(rng, 1500, 3000, 30, false), n = random_side(rng, 1500, 3000, 30, false);
+        std::vector<uint64_t> added, removed;
+        for (int i = 0; i < 200; i++) added.push_back(rng() % 3000);
+        for (int i = 0; i < 200; i++) removed.push_back(rng() % 3000);
+        std::sort(added.begin(), added.end());
+        std::vector<uint32_t> id_rm = {3, 1, 0xFFFFFFFFu, 7};
+        GeoCells og{o.cells.data(), o.ids.size()}, ng{n.cells.data(), n.ids.size()};
+        ByteSpan oe{o.entries.data(), o.entries.size()}, ne{n.entries.data(), n.entries.size()};
+        auto expect = legacy_corrections(11, og, ng, added, removed, oe, ne, 8, id_rm);
+        CHECK(geo_entry_corrections(11, og, ng, added, removed, oe, ne, 8, id_rm, 5).section == expect);
     }
 }
 
