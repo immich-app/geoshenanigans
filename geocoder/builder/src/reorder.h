@@ -28,6 +28,17 @@ static inline uint32_t float_bits(float v) {
     return (bits & 0x80000000) ? ~bits : (bits ^ 0x80000000);
 }
 
+// parallel_sort_indices, saying so in the build log when ties sent it to
+// the serial std::sort (minutes on the planet).
+template <class Less, class TieMatters>
+std::vector<uint32_t> sort_records(const char* what, size_t n, Less less, TieMatters tie_matters,
+                                   unsigned threads) {
+    SortedIndices sorted = parallel_sort_indices(n, less, tie_matters, threads);
+    if (sorted.serial)
+        std::cerr << "  " << what << ": records tie in ways the output shows; sorted serially" << std::endl;
+    return std::move(sorted.order);
+}
+
 // Sorted positions that start a run of duplicates: i == 0 or !same(i - 1, i).
 // The serial dedups compared each record with the last one they kept; for an
 // equivalence `same` that is the same test as comparing with the predecessor,
@@ -188,7 +199,7 @@ inline void reorder_addr_points(ParsedData& data, unsigned threads = 0) {
                (p.vertex_offset == NO_DATA || (size_t)p.vertex_offset + p.vertex_count > vertices.size());
     }, threads);
     std::vector<uint32_t> order = total_order
-        ? parallel_sort_indices(n, addr_less, [](uint32_t, uint32_t) { return true; }, threads)
+        ? sort_records("addr_points", n, addr_less, [](uint32_t, uint32_t) { return true; }, threads)
         : std_sort_indices(n, addr_less);
 
     // Dedup consecutive identical records (planet has ~4M duplicates).
@@ -283,7 +294,7 @@ inline void reorder_ways(ParsedData& data, unsigned threads = 0) {
                            reinterpret_cast<const char*>(&ways[b]) + kAfterOffset,
                            sizeof(WayHeader) - kAfterOffset) != 0;
     };
-    std::vector<uint32_t> order = parallel_sort_indices(n, way_less, tie_matters, threads);
+    std::vector<uint32_t> order = sort_records("ways", n, way_less, tie_matters, threads);
 
     // Dedup identical consecutive ways (name, node_count, node bytes).
     std::vector<uint32_t> starts = run_starts(n, [&](size_t i, size_t j) {
@@ -394,7 +405,7 @@ inline void reorder_interps(ParsedData& data, unsigned threads = 0) {
                            sizeof(InterpWay) - kAfterOffset) != 0 ||
                (have_interp_pc && data.interp_postcode_ids[a] != data.interp_postcode_ids[b]);
     };
-    std::vector<uint32_t> order = parallel_sort_indices(n, interp_less, tie_matters, threads);
+    std::vector<uint32_t> order = sort_records("interps", n, interp_less, tie_matters, threads);
 
     // Reorder + DEDUP. TIGER frequently emits the exact same
     // interpolation way twice (identical street/range/type/geometry —
@@ -490,7 +501,7 @@ inline void reorder_admin_polygons(ParsedData& data, unsigned threads = 0) {
     // Every polygon keeps its own slot and references point at it, so any
     // tie's order shows.
     const std::vector<uint32_t> order =
-        parallel_sort_indices(n, admin_less, [](uint32_t, uint32_t) { return true; }, threads);
+        sort_records("admin polygons", n, admin_less, [](uint32_t, uint32_t) { return true; }, threads);
     const std::vector<uint32_t> old_to_new = invert(order, threads);
 
     Repacked<NodeCoord> repacked = repack(n, vertices,
@@ -596,7 +607,7 @@ inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
         if (have_elevations && std::memcmp(&poi_elevations[a], &poi_elevations[b], sizeof(float)) != 0) return true;
         return have_qids && poi_qids[a] != poi_qids[b];
     };
-    std::vector<uint32_t> order = parallel_sort_indices(n, poi_less, tie_matters, threads);
+    std::vector<uint32_t> order = sort_records("POI records", n, poi_less, tie_matters, threads);
 
     // Dedup consecutive POIs equal in everything but their vertices.
     std::vector<uint32_t> starts = run_starts(n, [&](size_t i, size_t j) {
@@ -729,7 +740,7 @@ inline void reorder_place_nodes(ParsedData& data, unsigned threads = 0) {
         return false;
     };
     const std::vector<uint32_t> order =
-        parallel_sort_indices(n, place_less, [](uint32_t, uint32_t) { return true; }, threads);
+        sort_records("place nodes", n, place_less, [](uint32_t, uint32_t) { return true; }, threads);
     // Reorder place_osm_ids in lockstep
     if (have_osm) data.place_osm_ids = gather(data.place_osm_ids, order, threads);
     data.place_nodes = gather(places, order, threads);

@@ -418,6 +418,11 @@ std::vector<uint32_t> std_sort_indices(size_t n, Less less) {
     return order;
 }
 
+struct SortedIndices {
+    std::vector<uint32_t> order;
+    bool serial = false;  // ties whose order matters: std::sort decided
+};
+
 // std_sort_indices on every core. Indices that tie under less (a strict weak
 // order) land in std::sort's own order only by luck, so when two adjacent
 // ones tie and tie_matters(a, b) says their order reaches the caller's
@@ -425,7 +430,7 @@ std::vector<uint32_t> std_sort_indices(size_t n, Less less) {
 // negation of an equivalence (e.g. "some output field differs"), so that
 // checking neighbours covers every tied pair.
 template <class Less, class TieMatters>
-std::vector<uint32_t> parallel_sort_indices(size_t n, Less less, TieMatters tie_matters, unsigned threads = 0) {
+SortedIndices parallel_sort_indices(size_t n, Less less, TieMatters tie_matters, unsigned threads = 0) {
     std::vector<uint32_t> order(n);
     parallel_for(n, [&](size_t b, size_t e, unsigned) {
         for (size_t i = b; i < e; i++) order[i] = static_cast<uint32_t>(i);
@@ -434,8 +439,8 @@ std::vector<uint32_t> parallel_sort_indices(size_t n, Less less, TieMatters tie_
     bool ties = parallel_any(n ? n - 1 : 0, [&](size_t k) {
         return !less(order[k], order[k + 1]) && tie_matters(order[k], order[k + 1]);
     }, threads);
-    if (!ties) return order;
-    return std_sort_indices(n, less);
+    if (!ties) return {std::move(order), false};
+    return {std_sort_indices(n, less), true};
 }
 
 // Sorts each run of [first, last) by less with std::sort, on every core. A

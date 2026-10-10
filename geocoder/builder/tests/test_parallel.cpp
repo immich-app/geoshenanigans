@@ -328,7 +328,8 @@ TEST(parallel_sort_indices_matches_std_sort_without_ties) {
     auto expect = std_sort_indices(recs.size(), less);
     for (unsigned threads : {1u, 3u, 16u}) {
         auto got = parallel_sort_indices(recs.size(), less, [](uint32_t, uint32_t) { return true; }, threads);
-        CHECK(got == expect);
+        CHECK(!got.serial);
+        CHECK(got.order == expect);
     }
 }
 
@@ -338,12 +339,14 @@ TEST(parallel_sort_indices_keeps_std_sort_order_when_ties_matter) {
     auto expect = std_sort_indices(recs.size(), by_key);
     auto payload_differs = [&](uint32_t a, uint32_t b) { return recs[a].payload != recs[b].payload; };
     auto got = parallel_sort_indices(recs.size(), by_key, payload_differs, 8);
-    CHECK(got == expect);
+    CHECK(got.serial);
+    CHECK(got.order == expect);
 
     // Ties whose order can't show stay parallel: any order sorted by key.
     auto never = parallel_sort_indices(recs.size(), by_key, [](uint32_t, uint32_t) { return false; }, 8);
-    CHECK(std::is_sorted(never.begin(), never.end(), by_key));
-    auto perm = never;
+    CHECK(!never.serial);
+    CHECK(std::is_sorted(never.order.begin(), never.order.end(), by_key));
+    auto perm = never.order;
     std::sort(perm.begin(), perm.end());
     bool is_perm = true;
     for (size_t i = 0; i < perm.size(); i++) is_perm = is_perm && perm[i] == i;
