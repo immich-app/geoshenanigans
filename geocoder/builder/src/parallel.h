@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <exception>
 #include <iterator>
 #include <memory>
@@ -221,6 +222,80 @@ void parallel_ordered(size_t n, Produce&& produce, Consume&& consume, unsigned t
         throw;
     }
     finish();
+}
+
+// Runs next() on the calling thread until it returns an empty optional and
+// work(value, worker) for each value it returns on up to `threads` worker
+// threads (0 = every core): values are taken in order but finish in any,
+// at most `queued` of them waiting (0 = two per thread), which bounds their
+// memory. worker numbers the worker threads below `threads`. The first
+// exception from next or work stops the stream and is rethrown here once
+// the workers end.
+template <class T, class Next, class Work>
+void parallel_stream(Next&& next, Work&& work, unsigned threads = 0, size_t queued = 0) {
+    if (threads == 0) threads = parallel_threads();
+    if (queued == 0) queued = size_t(2) * threads;
+    std::deque<T> queue;
+    std::mutex mtx;
+    std::condition_variable ready, room;
+    bool closed = false;
+    std::exception_ptr error;
+    auto fail = [&](std::exception_ptr e) {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (!error) error = e;
+        closed = true;
+        queue.clear();
+    };
+    std::vector<std::thread> pool;
+    pool.reserve(threads);
+    for (unsigned w = 0; w < threads; w++) {
+        pool.emplace_back([&, w] {
+            for (;;) {
+                std::optional<T> item;
+                {
+                    std::unique_lock<std::mutex> lock(mtx);
+                    ready.wait(lock, [&] { return closed || !queue.empty(); });
+                    if (queue.empty()) return;
+                    item.emplace(std::move(queue.front()));
+                    queue.pop_front();
+                }
+                room.notify_one();
+                try {
+                    work(*item, w);
+                } catch (...) {
+                    fail(std::current_exception());
+                    ready.notify_all();
+                    room.notify_all();
+                    return;
+                }
+            }
+        });
+    }
+    try {
+        for (;;) {
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                if (closed) break;
+            }
+            std::optional<T> item = next();
+            if (!item) break;
+            std::unique_lock<std::mutex> lock(mtx);
+            room.wait(lock, [&] { return closed || queue.size() < queued; });
+            if (closed) break;
+            queue.push_back(std::move(*item));
+            lock.unlock();
+            ready.notify_one();
+        }
+    } catch (...) {
+        fail(std::current_exception());
+    }
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        closed = true;
+    }
+    ready.notify_all();
+    for (auto& t : pool) t.join();
+    if (error) std::rethrow_exception(error);
 }
 
 // Follows a chain of records over [0, size), each record giving where the

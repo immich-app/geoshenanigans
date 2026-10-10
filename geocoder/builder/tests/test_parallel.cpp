@@ -168,6 +168,50 @@ TEST(parallel_ordered_never_runs_more_than_window_ahead) {
     CHECK_EQ(consumed.load(), size_t(300));
 }
 
+TEST(parallel_stream_works_every_value_once) {
+    for (unsigned threads : {1u, 3u, 16u}) {
+        for (size_t queued : {size_t(0), size_t(1)}) {
+            size_t produced = 0;
+            std::mutex mtx;
+            std::vector<size_t> seen;
+            std::atomic<bool> bad_worker{false};
+            parallel_stream<size_t>([&]() -> std::optional<size_t> {
+                if (produced == 500) return std::nullopt;
+                return produced++;
+            }, [&](size_t& v, unsigned worker) {
+                if (worker >= threads) bad_worker = true;
+                std::lock_guard<std::mutex> lock(mtx);
+                seen.push_back(v);
+            }, threads, queued);
+            std::sort(seen.begin(), seen.end());
+            std::vector<size_t> expect(500);
+            for (size_t i = 0; i < 500; i++) expect[i] = i;
+            CHECK(seen == expect);
+            CHECK(!bad_worker.load());
+        }
+    }
+}
+
+TEST(parallel_stream_rethrows_from_either_side) {
+    for (bool in_next : {true, false}) {
+        size_t produced = 0;
+        bool thrown = false;
+        try {
+            parallel_stream<size_t>([&]() -> std::optional<size_t> {
+                if (in_next && produced == 10) throw std::runtime_error("next");
+                if (produced == 1000) return std::nullopt;
+                return produced++;
+            }, [&](size_t& v, unsigned) {
+                if (!in_next && v == 10) throw std::runtime_error("work");
+            }, 4);
+        } catch (const std::runtime_error&) {
+            thrown = true;
+        }
+        CHECK(thrown);
+        CHECK(produced < 1000);
+    }
+}
+
 TEST(parallel_ordered_rethrows_from_either_side) {
     for (bool in_produce : {true, false}) {
         size_t consumed = 0;
