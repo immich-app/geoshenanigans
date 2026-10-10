@@ -342,8 +342,27 @@ TEST(parallel_offsets_are_exclusive_prefix_sums_for_any_thread_count) {
         for (unsigned threads : {1u, 3u, 64u}) {
             auto got = parallel_offsets<uint64_t>(n, [](size_t i) { return i % 7; }, threads);
             CHECK(got == expect);
+            // A buffer of the right size is filled whatever it held.
+            auto filled = parallel_offsets<uint64_t>(n, [](size_t i) { return i % 7; }, threads,
+                                                     std::vector<uint64_t>(n + 1, 99));
+            CHECK(filled == expect);
         }
     }
+}
+
+TEST(parallel_sum_adds_every_value_for_any_thread_count) {
+    for (size_t n : {size_t(0), size_t(1), size_t(200000)}) {
+        uint64_t expect = 0;
+        for (size_t i = 0; i < n; i++) expect += i % 11;
+        for (unsigned threads : {1u, 3u, 64u})
+            CHECK_EQ(parallel_sum<uint64_t>(n, [](size_t i) { return i % 11; }, threads), expect);
+    }
+}
+
+TEST(vector_beside_makes_n_zeroed_elements) {
+    auto v = vector_beside<uint32_t>(1000).get();
+    CHECK_EQ(v.size(), size_t(1000));
+    CHECK(std::all_of(v.begin(), v.end(), [](uint32_t x) { return x == 0; }));
 }
 
 TEST(parallel_collect_joins_each_index_output_in_index_order) {

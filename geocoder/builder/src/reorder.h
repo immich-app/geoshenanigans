@@ -64,14 +64,19 @@ inline std::vector<uint32_t> renumber_runs(const std::vector<uint32_t>& order,
 
 // Per run, the first value (in sorted order) that isn't `none`, else none:
 // the serial dedups filled each kept slot from the first duplicate with one.
+// An `out` of one element per run (see vector_beside) is filled in place of
+// a new one.
 template <class T>
 std::vector<T> first_set_per_run(const std::vector<T>& values, const std::vector<uint32_t>& order,
-                                 const std::vector<uint32_t>& starts, T none, unsigned threads) {
-    std::vector<T> out(starts.size(), none);
+                                 const std::vector<uint32_t>& starts, T none, unsigned threads,
+                                 std::vector<T> out = {}) {
+    if (out.size() != starts.size()) out.assign(starts.size(), none);
     parallel_for(starts.size(), [&](size_t b, size_t e, unsigned) {
-        for (size_t k = b; k < e; k++)
+        for (size_t k = b; k < e; k++) {
+            out[k] = none;
             for (size_t i = starts[k], end = run_end(starts, k, order.size()); i < end && out[k] == none; i++)
                 out[k] = values[order[i]];
+        }
     }, threads);
     return out;
 }
@@ -103,10 +108,14 @@ struct Repacked {
 };
 
 // Copies count(i) elements of src from from(i) onwards into a new buffer,
-// for i in [0, n) in order.
+// for i in [0, n) in order. Buffers made beside earlier work (see
+// vector_beside) can come in: `at` of n + 1 elements, `items` of at least as
+// many elements as get copied, shrunk to fit.
 template <class T, class Count, class From>
-Repacked<T> repack(size_t n, const std::vector<T>& src, Count count, From from, unsigned threads) {
-    Repacked<T> out{{}, parallel_offsets<size_t>(n, count, threads)};
+Repacked<T> repack(size_t n, const std::vector<T>& src, Count count, From from, unsigned threads,
+                   std::vector<size_t> at = {}, std::vector<T> items = {}) {
+    Repacked<T> out{std::move(items), parallel_offsets<size_t>(n, count, threads, std::move(at))};
+    if (out.items.size() < out.at[n]) out.items.assign(out.at[n], T{});
     out.items.resize(out.at[n]);
     parallel_for(n, [&](size_t b, size_t e, unsigned) {
         for (size_t i = b; i < e; i++)
@@ -195,6 +204,15 @@ inline void reorder_addr_points(ParsedData& data, unsigned threads = 0) {
         return p.vertex_count > 0 &&
                (p.vertex_offset == NO_DATA || (size_t)p.vertex_offset + p.vertex_count > vertices.size());
     }, threads);
+    // The arrays the sorted points and vertices move into fault in beside
+    // the sort, which leaves their sizes alone.
+    auto has_polygon = [](const AddrPoint& p) { return p.vertex_count > 0 && p.vertex_offset != NO_DATA; };
+    const size_t vertex_total = parallel_sum<size_t>(n, [&](size_t i) {
+        return has_polygon(points[i]) ? size_t(points[i].vertex_count) : 0;
+    }, threads);
+    auto at_buffer = vector_beside<size_t>(n + 1);
+    auto vertex_buffer = vector_beside<NodeCoord>(vertex_total);
+
     // The sort orders keys holding the fields that decide nearly every
     // comparison, rather than indices into the planet's addr_points.
     struct AddrKey {
@@ -229,15 +247,18 @@ inline void reorder_addr_points(ParsedData& data, unsigned threads = 0) {
                a.vertex_count == b.vertex_count;
     }, threads);
     const size_t kept = starts.size();
+    const bool have_postcodes = data.addr_postcode_ids.size() == n;
+    auto sorted_buffer = vector_beside<AddrPoint>(kept);
+    auto osm_buffer = vector_beside<uint64_t>(have_osm ? kept : 0);
+    auto postcode_buffer = vector_beside<uint32_t>(have_postcodes ? kept : 0);
 
     // Reorder the vertex buffer alongside addr_points. Duplicates keep
     // their copy of the vertices too: the buffer is packed in sorted order
     // before the dedup.
-    auto has_polygon = [](const AddrPoint& p) { return p.vertex_count > 0 && p.vertex_offset != NO_DATA; };
     Repacked<NodeCoord> repacked = repack(n, vertices,
         [&](size_t i) { const auto& p = points[order[i]]; return has_polygon(p) ? size_t(p.vertex_count) : 0; },
-        [&](size_t i) { return points[order[i]].vertex_offset; }, threads);
-    std::vector<AddrPoint> sorted(kept);
+        [&](size_t i) { return points[order[i]].vertex_offset; }, threads, at_buffer.get(), vertex_buffer.get());
+    std::vector<AddrPoint> sorted = sorted_buffer.get();
     parallel_for(kept, [&](size_t b, size_t e, unsigned) {
         for (size_t k = b; k < e; k++) {
             AddrPoint p = points[order[starts[k]]];
@@ -255,9 +276,11 @@ inline void reorder_addr_points(ParsedData& data, unsigned threads = 0) {
     // same-PBF rebuilds; left at the pre-dedup size, it fails the
     // size-equality check in apply_strategy2_addrs and strategy-2
     // silently early-returns.
-    if (have_osm) data.addr_osm_ids = first_set_per_run(data.addr_osm_ids, order, starts, uint64_t(0), threads);
-    if (data.addr_postcode_ids.size() == n)
-        data.addr_postcode_ids = first_set_per_run(data.addr_postcode_ids, order, starts, NO_DATA, threads);
+    if (have_osm)
+        data.addr_osm_ids = first_set_per_run(data.addr_osm_ids, order, starts, uint64_t(0), threads, osm_buffer.get());
+    if (have_postcodes)
+        data.addr_postcode_ids =
+            first_set_per_run(data.addr_postcode_ids, order, starts, NO_DATA, threads, postcode_buffer.get());
     if (kept < n)
         std::cerr << "  Deduped addr_points: " << n << " → " << kept
                   << " (-" << (n - kept) << ")" << std::endl;
@@ -308,6 +331,14 @@ inline void reorder_ways(ParsedData& data, unsigned threads = 0) {
                            reinterpret_cast<const char*>(&ways[b]) + kAfterOffset,
                            sizeof(WayHeader) - kAfterOffset) != 0;
     };
+    // The arrays the sorted ways and nodes move into fault in beside the
+    // sort, sized for every way: the dedup drops a handful.
+    auto node_buffer = vector_beside<NodeCoord>(parallel_sum<size_t>(n, [&](size_t i) {
+        return size_t(ways[i].node_count);
+    }, threads));
+    auto way_buffer = vector_beside<WayHeader>(n);
+    auto osm_buffer = vector_beside<int64_t>(have_osm ? n : 0);
+
     // The sort orders keys holding the fields that decide nearly every
     // comparison, rather than indices into the planet's ways and nodes.
     struct WayKey {
@@ -346,8 +377,9 @@ inline void reorder_ways(ParsedData& data, unsigned threads = 0) {
 
     Repacked<NodeCoord> repacked = repack(kept, nodes,
         [&](size_t k) { return size_t(ways[order[starts[k]]].node_count); },
-        [&](size_t k) { return ways[order[starts[k]]].node_offset; }, threads);
-    std::vector<WayHeader> new_ways(kept);
+        [&](size_t k) { return ways[order[starts[k]]].node_offset; }, threads, {}, node_buffer.get());
+    std::vector<WayHeader> new_ways = way_buffer.get();
+    new_ways.resize(kept);
     parallel_for(kept, [&](size_t b, size_t e, unsigned) {
         for (size_t k = b; k < e; k++) {
             new_ways[k] = ways[order[starts[k]]];
@@ -360,7 +392,11 @@ inline void reorder_ways(ParsedData& data, unsigned threads = 0) {
     // Original order is build-encounter order, non-deterministic, and
     // the resulting way_osm_ids[k] wouldn't match the osm_id of
     // data.ways[k].
-    if (have_osm) data.way_osm_ids = first_set_per_run(data.way_osm_ids, order, starts, int64_t(0), threads);
+    if (have_osm) {
+        std::vector<int64_t> osm = osm_buffer.get();
+        osm.resize(kept);
+        data.way_osm_ids = first_set_per_run(data.way_osm_ids, order, starts, int64_t(0), threads, std::move(osm));
+    }
     // Remap way_parent_ids + way_postcode_ids: reorder + dedup. Each kept
     // way takes the set value of the duplicate with the highest original
     // index, as the serial pass did walking the original order with set
@@ -668,6 +704,17 @@ inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
         if (have_elevations && std::memcmp(&poi_elevations[a], &poi_elevations[b], sizeof(float)) != 0) return true;
         return have_qids && poi_qids[a] != poi_qids[b];
     };
+    // The arrays the sorted POIs move into fault in beside the sort, sized
+    // for every POI: the dedup drops few.
+    auto has_polygon = [](const PoiRecord& p) { return p.vertex_count > 0 && p.vertex_offset != NO_DATA; };
+    auto vertex_buffer = vector_beside<NodeCoord>(parallel_sum<size_t>(n, [&](size_t i) {
+        return has_polygon(pois[i]) ? size_t(pois[i].vertex_count) : 0;
+    }, threads));
+    auto poi_buffer = vector_beside<PoiRecord>(n);
+    auto elevation_buffer = vector_beside<float>(have_elevations ? n : 0);
+    auto qid_buffer = vector_beside<uint32_t>(have_qids ? n : 0);
+    auto osm_buffer = vector_beside<uint64_t>(have_osm ? n : 0);
+
     // The sort orders keys holding the fields that decide nearly every
     // comparison, rather than indices into the planet's poi_records.
     struct PoiKey {
@@ -703,14 +750,14 @@ inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
     // Reorder records + vertices + elevations + qids. Point POIs too take the
     // running vertex offset.
     Repacked<NodeCoord> repacked = repack(kept, vertices,
-        [&](size_t k) {
-            const auto& p = pois[order[starts[k]]];
-            return p.vertex_count > 0 && p.vertex_offset != NO_DATA ? size_t(p.vertex_count) : 0;
-        },
-        [&](size_t k) { return pois[order[starts[k]]].vertex_offset; }, threads);
-    std::vector<PoiRecord> new_pois(kept);
-    std::vector<float> new_poi_elevations(have_elevations ? kept : 0);
-    std::vector<uint32_t> new_poi_qids(have_qids ? kept : 0);
+        [&](size_t k) { const auto& p = pois[order[starts[k]]]; return has_polygon(p) ? size_t(p.vertex_count) : 0; },
+        [&](size_t k) { return pois[order[starts[k]]].vertex_offset; }, threads, {}, vertex_buffer.get());
+    std::vector<PoiRecord> new_pois = poi_buffer.get();
+    std::vector<float> new_poi_elevations = elevation_buffer.get();
+    std::vector<uint32_t> new_poi_qids = qid_buffer.get();
+    new_pois.resize(kept);
+    new_poi_elevations.resize(have_elevations ? kept : 0);
+    new_poi_qids.resize(have_qids ? kept : 0);
     parallel_for(kept, [&](size_t b, size_t e, unsigned) {
         for (size_t k = b; k < e; k++) {
             uint32_t oi = order[starts[k]];
@@ -722,7 +769,11 @@ inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
     }, threads);
     // Reorder + dedup poi_osm_ids in lockstep: each kept POI takes the
     // first non-zero osm id of its duplicates in SORT order.
-    if (have_osm) data.poi_osm_ids = first_set_per_run(data.poi_osm_ids, order, starts, uint64_t(0), threads);
+    if (have_osm) {
+        std::vector<uint64_t> osm = osm_buffer.get();
+        osm.resize(kept);
+        data.poi_osm_ids = first_set_per_run(data.poi_osm_ids, order, starts, uint64_t(0), threads, std::move(osm));
+    }
     const std::vector<uint32_t> old_to_new = renumber_runs(order, starts, threads);
     order = {};
     starts = {};

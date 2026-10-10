@@ -471,6 +471,25 @@ TEST(permute_admin_polygons_moves_vertices_and_osm_ids_with_each_polygon) {
     }
 }
 
+TEST(repack_and_first_set_per_run_fill_the_buffers_they_are_given) {
+    const std::vector<uint32_t> src = {10, 11, 12, 13, 14, 15};
+    auto count = [](size_t i) { return size_t(i % 3); };
+    auto from = [](size_t i) { return size_t(5 - i); };
+    auto fresh = repack(3, src, count, from, 2);
+    CHECK(fresh.items == std::vector<uint32_t>({14, 13, 14}));
+    CHECK(fresh.at == std::vector<size_t>({0, 0, 1, 3}));
+    auto given = repack(3, src, count, from, 2, std::vector<size_t>(4, 7), std::vector<uint32_t>(10, 9));
+    CHECK(given.items == fresh.items);
+    CHECK(given.at == fresh.at);
+
+    const std::vector<uint32_t> values = {0, 5, 0, 6, 7};
+    const std::vector<uint32_t> order = {4, 2, 0, 3, 1};
+    const std::vector<uint32_t> starts = {0, 1, 3};
+    const std::vector<uint32_t> want = {7, 0, 6};
+    CHECK(first_set_per_run(values, order, starts, 0u, 2) == want);
+    CHECK(first_set_per_run(values, order, starts, 0u, 2, std::vector<uint32_t>(3, 8)) == want);
+}
+
 TEST(cell_lists_lists_every_cell_once_with_its_own_list) {
     std::unordered_map<uint64_t, std::vector<uint32_t>> m;
     Rng r(5);

@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <deque>
 #include <exception>
+#include <future>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -540,11 +541,12 @@ size_t parallel_blocks(size_t n, Fn&& fn, unsigned threads = 0) {
 
 // Exclusive prefix sums of size_of(i) over [0, n), plus the total as entry
 // n. size_of runs once per index. Integer sums, so the blocking can't reach
-// the result.
+// the result. An `out` of n + 1 elements (see vector_beside) is filled in
+// place of a new one.
 template <class T, class SizeOf>
-std::vector<T> parallel_offsets(size_t n, SizeOf size_of, unsigned threads = 0) {
+std::vector<T> parallel_offsets(size_t n, SizeOf size_of, unsigned threads = 0, std::vector<T> out = {}) {
     if (threads == 0) threads = parallel_threads();
-    std::vector<T> out(n + 1);
+    if (out.size() != n + 1) out.assign(n + 1, T(0));
     std::vector<T> block_base(threads + 1, T(0));
     size_t blocks = parallel_blocks(n, [&](size_t b, size_t begin, size_t end) {
         T sum = 0;
@@ -602,20 +604,35 @@ std::vector<size_t> parallel_find_all(size_t n, Pred pred, unsigned threads = 0)
     }, threads);
 }
 
-// How many i in [0, n) pred(i) holds for, tested on every core. Counting per
-// block keeps the cores off one shared counter.
+// The sum of value(i) over [0, n), added up per block on every core: one
+// shared total would bounce its cache line between them. Integer sums, so
+// the blocking can't reach the result.
+template <class T, class Value>
+T parallel_sum(size_t n, Value value, unsigned threads = 0) {
+    if (threads == 0) threads = parallel_threads();
+    std::vector<T> sums(threads, T(0));
+    size_t blocks = parallel_blocks(n, [&](size_t b, size_t begin, size_t end) {
+        T sum = 0;
+        for (size_t i = begin; i < end; i++) sum += value(i);
+        sums[b] = sum;
+    }, threads);
+    T total = 0;
+    for (size_t b = 0; b < blocks; b++) total += sums[b];
+    return total;
+}
+
+// How many i in [0, n) pred(i) holds for, tested on every core.
 template <class Pred>
 size_t parallel_count(size_t n, Pred pred, unsigned threads = 0) {
-    if (threads == 0) threads = parallel_threads();
-    std::vector<size_t> counts(threads, 0);
-    size_t blocks = parallel_blocks(n, [&](size_t b, size_t begin, size_t end) {
-        size_t c = 0;
-        for (size_t i = begin; i < end; i++) c += pred(i) ? 1 : 0;
-        counts[b] = c;
-    }, threads);
-    size_t total = 0;
-    for (size_t b = 0; b < blocks; b++) total += counts[b];
-    return total;
+    return parallel_sum<size_t>(n, [&](size_t i) { return pred(i) ? size_t(1) : size_t(0); }, threads);
+}
+
+// A vector of n value-initialized elements, made on a thread of its own:
+// faulting in a fresh planet-sized vector takes one core seconds, which then
+// pass beside other work. get() it where it is needed.
+template <class T>
+std::future<std::vector<T>> vector_beside(size_t n) {
+    return std::async(std::launch::async, [n] { return std::vector<T>(n); });
 }
 
 // Whether pred(i) holds for any i in [0, n).
