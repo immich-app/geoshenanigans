@@ -6,6 +6,7 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <iostream>
 #include <limits>
@@ -1708,25 +1709,20 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
         for (auto& f : qfutures) f.get();
     };
 
-    // Write one region: modes + quality variants.
-    // Takes ParsedData& (non-const) because apply_strategy2_remaps
-    // reorders the in-memory record arrays and rewrites every
-    // reference site before the parallel write_index calls fan out.
-    // The 3 mode writes still see consistent (read-only) data
-    // because the remap completes synchronously before they launch.
+    // Write one region: modes, quality variants, place files, admin-minimal
+    // and POI tiers. Takes ParsedData& (non-const) because
+    // apply_strategy2_remaps reorders the in-memory record arrays and
+    // rewrites every reference site; the stages after it only read.
     //
-    // remap_already_applied: the PLANET call hoists its remap to before
-    // the planet async launches — apply_strategy2_remaps mutates the
-    // shared ParsedData, and running it inside the async raced the
-    // continent filtering that reads the same arrays (UB; benign only
-    // by schedule timing). Continent calls pass their own subsets and
-    // remap here as before.
-    auto write_region = [&](ParsedData& d, const std::string& base_dir,
-                            bool remap_already_applied = false) {
+    // RegionRun::Planet: the planet hoists its remap to before the planet
+    // async launches — apply_strategy2_remaps mutates the shared
+    // ParsedData, and running it inside the async raced the continent
+    // filtering that reads the same arrays (UB; benign only by schedule
+    // timing). RegionRun::Continent remaps its own subset here.
+    enum class RegionRun { Planet, Continent };
+    auto write_region = [&](ParsedData& d, const std::string& base_dir, RegionRun run) {
         ensure_dir(base_dir);
         const std::string region = base_dir.substr(base_dir.find_last_of('/') + 1);
-        auto _rt = std::chrono::steady_clock::now();
-        auto _rc = CpuTicks::now();
 
         // Locate this region's previous build dir under prev_output_dir
         // (mirrors the layout we write under output_dir). Empty path
@@ -1738,306 +1734,319 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             if (rel.rfind(output_dir, 0) == 0) rel = rel.substr(output_dir.size());
             region_prev = prev_output_dir + rel;
         }
-        if (!remap_already_applied) {
-            apply_strategy2_remaps(d, region_prev);
-            log_phase(("    " + region + ": strategy2 remap").c_str(), _rt, _rc);
-        }
+        if (run == RegionRun::Continent)
+            timed_phase("    " + region + ": strategy2 remap", [&] { apply_strategy2_remaps(d, region_prev); });
 
-        if (multi_output) {
-            // Write all 3 modes in parallel (they read shared data, write to separate dirs)
-            auto wf1 = std::async(std::launch::async, [&]{ write_index(d, base_dir + "/full", IndexMode::Full); });
-            auto wf2 = std::async(std::launch::async, [&]{ write_index(d, base_dir + "/no-addresses", IndexMode::NoAddresses); });
-            auto wf3 = std::async(std::launch::async, [&]{ write_index(d, base_dir + "/admin", IndexMode::AdminOnly); });
-            wf1.get(); wf2.get(); wf3.get();
-        } else {
-            write_index(d, base_dir, mode);
-        }
-        log_phase(("    " + region + ": modes").c_str(), _rt, _rc);
-
-        // Write quality variants (each gets admin_polygons + admin_vertices)
-        if (multi_quality) {
-            std::string quality_dir = multi_output ? base_dir + "/quality" : base_dir;
-            std::cerr << "  Writing quality variants for " << base_dir << "..." << std::endl;
-            write_qualities(d, quality_dir);
-            log_phase(("    " + region + ": quality variants").c_str(), _rt, _rc);
-        }
-
-        // Write place node files into each mode directory (so diff/patch can find them)
-        if (!d.place_nodes.empty()) {
-            auto write_place_files = [&](const std::string& dir) {
-                ensure_dir(dir);
-                {
-                    std::ofstream f(dir + "/place_nodes.bin", std::ios::binary);
-                    f.write(reinterpret_cast<const char*>(d.place_nodes.data()),
-                            d.place_nodes.size() * sizeof(PlaceNode));
-                    f.flush();
-                    if (!f) throw std::runtime_error("failed to write " + dir + "/place_nodes.bin");
-                }
-                emit_strategy2_sidecar(dir + "/place_nodes.osm_ids",
-                                        d.place_sidecar_blob, d.place_osm_ids);
-                write_cell_index_sorted(dir + "/place_cells.bin", dir + "/place_entries.bin",
-                                        d.sorted_place_cells);
-            };
-
+        auto write_modes = [&] {
             if (multi_output) {
-                write_place_files(base_dir + "/full");
-                write_place_files(base_dir + "/no-addresses");
-                write_place_files(base_dir + "/admin");
+                // Write all 3 modes in parallel (they read shared data, write to separate dirs)
+                auto wf1 = std::async(std::launch::async, [&]{ write_index(d, base_dir + "/full", IndexMode::Full); });
+                auto wf2 = std::async(std::launch::async, [&]{ write_index(d, base_dir + "/no-addresses", IndexMode::NoAddresses); });
+                auto wf3 = std::async(std::launch::async, [&]{ write_index(d, base_dir + "/admin", IndexMode::AdminOnly); });
+                wf1.get(); wf2.get(); wf3.get();
             } else {
-                write_place_files(base_dir);
+                write_index(d, base_dir, mode);
             }
-            std::cerr << "  Place nodes: " << d.place_nodes.size() << " nodes, "
-                      << count_cells(d.sorted_place_cells) << " cells" << std::endl;
-        }
-        log_phase(("    " + region + ": place files").c_str(), _rt, _rc);
+        };
+        auto write_quality_dirs = [&] {
+            // Write quality variants (each gets admin_polygons + admin_vertices)
+            if (multi_quality) {
+                std::string quality_dir = multi_output ? base_dir + "/quality" : base_dir;
+                std::cerr << "  Writing quality variants for " << base_dir << "..." << std::endl;
+                write_qualities(d, quality_dir);
+            }
 
-        // Write admin-minimal tier — smallest useful deployable. Drops:
-        //   - place_nodes with place_type ∈ {SUBURB=3, NEIGHBOURHOOD=5, QUARTER=6}
-        //   - admin polygons (and their vertex bytes) whose admin_level
-        //     falls outside [2, 8] (L9 borough, L10 quarter-area,
-        //     L11 admin-postal, L15 place-area markers are skipped).
-        // Re-simplifies the kept polygons at q2.5 and writes them to its
-        // own stable slots so the on-disk admin_polygons.bin / admin_vertices.bin
-        // are self-contained — admin-minimal does NOT share polygon
-        // files with quality/q2.5/. It also carries its own core strings
-        // and layout, so a client never needs another dir (or a patch for
-        // one) to resolve its names.
-        if (multi_output && !d.place_nodes.empty() && !d.admin_polygons.empty()) {
-            std::string mdir = base_dir + "/admin-minimal";
-            ensure_dir(mdir);
+        };
+        auto write_places = [&] {
+            // Write place node files into each mode directory (so diff/patch can find them)
+            if (!d.place_nodes.empty()) {
+                auto write_place_files = [&](const std::string& dir) {
+                    ensure_dir(dir);
+                    {
+                        std::ofstream f(dir + "/place_nodes.bin", std::ios::binary);
+                        f.write(reinterpret_cast<const char*>(d.place_nodes.data()),
+                                d.place_nodes.size() * sizeof(PlaceNode));
+                        f.flush();
+                        if (!f) throw std::runtime_error("failed to write " + dir + "/place_nodes.bin");
+                    }
+                    emit_strategy2_sidecar(dir + "/place_nodes.osm_ids",
+                                            d.place_sidecar_blob, d.place_osm_ids);
+                    write_cell_index_sorted(dir + "/place_cells.bin", dir + "/place_entries.bin",
+                                            d.sorted_place_cells);
+                };
 
-            // 1. Filter + re-simplify + pack admin polygons. q2.5 only —
-            //    admin-minimal isn't tiered by quality. Returns a remap
-            //    from full polygon IDs to admin-minimal's own stable slots
-            //    (or NO_DATA for dropped polygons), used below to rewrite
-            //    the cell index.
-            std::vector<uint32_t> poly_remap;
-            write_admin_minimal_polygons(d, mdir, region_prev, kAdminMinimalEpsilonScale, poly_remap);
-
-            // 2. place_nodes filter + ID remap. Keep types 0=city, 1=town,
-            //    2=village, 4=hamlet.
-            std::vector<PlaceNode> filtered_places;
-            filtered_places.reserve(d.place_nodes.size());
-            std::vector<uint32_t> place_remap(d.place_nodes.size(), NO_DATA);
-            for (size_t i = 0; i < d.place_nodes.size(); i++) {
-                uint8_t pt = d.place_nodes[i].place_type;
-                if (pt == 0 || pt == 1 || pt == 2 || pt == 4) {
-                    place_remap[i] = static_cast<uint32_t>(filtered_places.size());
-                    PlaceNode pn = d.place_nodes[i];
-                    // Parents in this dir's own polygon slots (NO_DATA when
-                    // the parent polygon isn't kept), like every other id here.
-                    pn.parent_poly_id = pn.parent_poly_id < poly_remap.size() ? poly_remap[pn.parent_poly_id] : NO_DATA;
-                    filtered_places.push_back(pn);
+                if (multi_output) {
+                    write_place_files(base_dir + "/full");
+                    write_place_files(base_dir + "/no-addresses");
+                    write_place_files(base_dir + "/admin");
+                } else {
+                    write_place_files(base_dir);
                 }
+                std::cerr << "  Place nodes: " << d.place_nodes.size() << " nodes, "
+                          << count_cells(d.sorted_place_cells) << " cells" << std::endl;
             }
-            {
-                std::ofstream f(mdir + "/place_nodes.bin", std::ios::binary);
-                f.write(reinterpret_cast<const char*>(filtered_places.data()),
-                        filtered_places.size() * sizeof(PlaceNode));
-                f.flush();
-                if (!f) throw std::runtime_error("failed to write " + mdir + "/place_nodes.bin");
-            }
+        };
+        auto write_admin_minimal = [&] {
+            // Write admin-minimal tier — smallest useful deployable. Drops:
+            //   - place_nodes with place_type ∈ {SUBURB=3, NEIGHBOURHOOD=5, QUARTER=6}
+            //   - admin polygons (and their vertex bytes) whose admin_level
+            //     falls outside [2, 8] (L9 borough, L10 quarter-area,
+            //     L11 admin-postal, L15 place-area markers are skipped).
+            // Re-simplifies the kept polygons at q2.5 and writes them to its
+            // own stable slots so the on-disk admin_polygons.bin / admin_vertices.bin
+            // are self-contained — admin-minimal does NOT share polygon
+            // files with quality/q2.5/. It also carries its own core strings
+            // and layout, so a client never needs another dir (or a patch for
+            // one) to resolve its names.
+            if (multi_output && !d.place_nodes.empty() && !d.admin_polygons.empty()) {
+                std::string mdir = base_dir + "/admin-minimal";
+                ensure_dir(mdir);
 
-            // 3. Rebuild place cell index with the place_remap (ascending,
-            //    so the filtered table stays in canonical order).
-            std::vector<CellItemPair> filtered_place_cells;
-            for (const auto& p : d.sorted_place_cells) {
-                if (p.item_id < place_remap.size()
-                    && place_remap[p.item_id] != NO_DATA) {
-                    filtered_place_cells.push_back({p.cell_id, place_remap[p.item_id]});
+                // 1. Filter + re-simplify + pack admin polygons. q2.5 only —
+                //    admin-minimal isn't tiered by quality. Returns a remap
+                //    from full polygon IDs to admin-minimal's own stable slots
+                //    (or NO_DATA for dropped polygons), used below to rewrite
+                //    the cell index.
+                std::vector<uint32_t> poly_remap;
+                write_admin_minimal_polygons(d, mdir, region_prev, kAdminMinimalEpsilonScale, poly_remap);
+
+                // 2. place_nodes filter + ID remap. Keep types 0=city, 1=town,
+                //    2=village, 4=hamlet.
+                std::vector<PlaceNode> filtered_places;
+                filtered_places.reserve(d.place_nodes.size());
+                std::vector<uint32_t> place_remap(d.place_nodes.size(), NO_DATA);
+                for (size_t i = 0; i < d.place_nodes.size(); i++) {
+                    uint8_t pt = d.place_nodes[i].place_type;
+                    if (pt == 0 || pt == 1 || pt == 2 || pt == 4) {
+                        place_remap[i] = static_cast<uint32_t>(filtered_places.size());
+                        PlaceNode pn = d.place_nodes[i];
+                        // Parents in this dir's own polygon slots (NO_DATA when
+                        // the parent polygon isn't kept), like every other id here.
+                        pn.parent_poly_id = pn.parent_poly_id < poly_remap.size() ? poly_remap[pn.parent_poly_id] : NO_DATA;
+                        filtered_places.push_back(pn);
+                    }
                 }
-            }
-            write_cell_index_sorted(mdir + "/place_cells.bin", mdir + "/place_entries.bin",
-                                    filtered_place_cells);
-
-            // 4. Rebuild admin cell index against the new polygon ID space.
-            //    Preserves the high-bit INTERIOR_FLAG used by the cell
-            //    index format (polys that fully contain a cell vs. just
-            //    intersect it).
-            std::unordered_map<uint64_t, std::vector<uint32_t>> filtered_admin_cells;
-            for (const auto& [cell_id, ids] : d.cell_to_admin) {
-                std::vector<uint32_t> kept;
-                kept.reserve(ids.size());
-                for (uint32_t flagged : ids) {
-                    uint32_t poly_id = flagged & ID_MASK;
-                    uint32_t flags   = flagged & INTERIOR_FLAG;
-                    if (poly_id >= poly_remap.size()) continue;
-                    uint32_t new_id = poly_remap[poly_id];
-                    if (new_id == NO_DATA) continue;
-                    kept.push_back(new_id | flags);
+                {
+                    std::ofstream f(mdir + "/place_nodes.bin", std::ios::binary);
+                    f.write(reinterpret_cast<const char*>(filtered_places.data()),
+                            filtered_places.size() * sizeof(PlaceNode));
+                    f.flush();
+                    if (!f) throw std::runtime_error("failed to write " + mdir + "/place_nodes.bin");
                 }
-                if (!kept.empty()) filtered_admin_cells[cell_id] = std::move(kept);
+
+                // 3. Rebuild place cell index with the place_remap (ascending,
+                //    so the filtered table stays in canonical order).
+                std::vector<CellItemPair> filtered_place_cells;
+                for (const auto& p : d.sorted_place_cells) {
+                    if (p.item_id < place_remap.size()
+                        && place_remap[p.item_id] != NO_DATA) {
+                        filtered_place_cells.push_back({p.cell_id, place_remap[p.item_id]});
+                    }
+                }
+                write_cell_index_sorted(mdir + "/place_cells.bin", mdir + "/place_entries.bin",
+                                        filtered_place_cells);
+
+                // 4. Rebuild admin cell index against the new polygon ID space.
+                //    Preserves the high-bit INTERIOR_FLAG used by the cell
+                //    index format (polys that fully contain a cell vs. just
+                //    intersect it).
+                std::unordered_map<uint64_t, std::vector<uint32_t>> filtered_admin_cells;
+                for (const auto& [cell_id, ids] : d.cell_to_admin) {
+                    std::vector<uint32_t> kept;
+                    kept.reserve(ids.size());
+                    for (uint32_t flagged : ids) {
+                        uint32_t poly_id = flagged & ID_MASK;
+                        uint32_t flags   = flagged & INTERIOR_FLAG;
+                        if (poly_id >= poly_remap.size()) continue;
+                        uint32_t new_id = poly_remap[poly_id];
+                        if (new_id == NO_DATA) continue;
+                        kept.push_back(new_id | flags);
+                    }
+                    if (!kept.empty()) filtered_admin_cells[cell_id] = std::move(kept);
+                }
+                write_cell_index(mdir + "/admin_cells.bin", mdir + "/admin_entries.bin",
+                                 filtered_admin_cells);
+
+                // 5. Core strings + layout: admin and place names all live in core.
+                {
+                    const auto& core = d.strings_tiers[0];
+                    std::ofstream f(mdir + "/" + STR_TIER_FILENAMES[0], std::ios::binary);
+                    f.write(core.data(), core.size());
+                    f.flush();
+                    if (!f) throw std::runtime_error("failed to write " + mdir + "/" + STR_TIER_FILENAMES[0]);
+                }
+                write_strings_layout(mdir, d);
+
+                std::cerr << "  Admin-minimal: " << filtered_places.size()
+                          << " place nodes (of " << d.place_nodes.size() << "), "
+                          << filtered_admin_cells.size() << " cells (of "
+                          << d.cell_to_admin.size() << ")" << std::endl;
             }
-            write_cell_index(mdir + "/admin_cells.bin", mdir + "/admin_entries.bin",
-                             filtered_admin_cells);
 
-            // 5. Core strings + layout: admin and place names all live in core.
-            {
-                const auto& core = d.strings_tiers[0];
-                std::ofstream f(mdir + "/" + STR_TIER_FILENAMES[0], std::ios::binary);
-                f.write(core.data(), core.size());
-                f.flush();
-                if (!f) throw std::runtime_error("failed to write " + mdir + "/" + STR_TIER_FILENAMES[0]);
-            }
-            write_strings_layout(mdir, d);
+        };
+        auto write_poi_tiers = [&] {
+            // Write POI tier variants
+            if (!d.poi_records.empty()) {
+                struct PoiTierVariant {
+                    const char* name;
+                    uint8_t max_tier;
+                };
+                PoiTierVariant poi_tiers[] = {
+                    {"poi/major",   1},
+                    {"poi/notable", 2},
+                    {"poi/all",     POI_MAX_SHIPPED_TIER},
+                };
 
-            std::cerr << "  Admin-minimal: " << filtered_places.size()
-                      << " place nodes (of " << d.place_nodes.size() << "), "
-                      << filtered_admin_cells.size() << " cells (of "
-                      << d.cell_to_admin.size() << ")" << std::endl;
-            log_phase(("    " + region + ": admin-minimal").c_str(), _rt, _rc);
-        }
+                // Canonical FULL-set POI sidecar that apply_strategy2_pois
+                // reads as <prev>/poi/all/poi_records.osm_ids on the next
+                // build. This must contain ALL d.poi_records (not the
+                // tier-filtered subset) so the IdAllocator can stabilize
+                // every POI's idx — otherwise the lookup keys (osm_id) map
+                // to indices in tier-filtered space, not full-set space,
+                // and the next build assigns wrong slots to most POIs.
+                //
+                // Emit BEFORE the tier filter loop runs, into the canonical
+                // /poi/all/ subdir (which apply_strategy2_pois already
+                // looks for). The per-tier writes below do NOT emit their
+                // own sidecars — this canonical full-set one is the single
+                // source of truth.
+                ensure_dir(base_dir + "/poi/all");
+                emit_strategy2_sidecar(base_dir + "/poi/all/poi_records.osm_ids",
+                                        d.poi_sidecar_blob, d.poi_osm_ids);
 
-        // Write POI tier variants
-        if (!d.poi_records.empty()) {
-            struct PoiTierVariant {
-                const char* name;
-                uint8_t max_tier;
-            };
-            PoiTierVariant poi_tiers[] = {
-                {"poi/major",   1},
-                {"poi/notable", 2},
-                {"poi/all",     POI_MAX_SHIPPED_TIER},
-            };
+                for (const auto& tier_var : poi_tiers) {
+                    auto _pt = std::chrono::steady_clock::now();
+                    auto _pc = CpuTicks::now();
+                    std::string poi_dir = base_dir + "/" + tier_var.name;
+                    ensure_dir(poi_dir);
 
-            // Canonical FULL-set POI sidecar that apply_strategy2_pois
-            // reads as <prev>/poi/all/poi_records.osm_ids on the next
-            // build. This must contain ALL d.poi_records (not the
-            // tier-filtered subset) so the IdAllocator can stabilize
-            // every POI's idx — otherwise the lookup keys (osm_id) map
-            // to indices in tier-filtered space, not full-set space,
-            // and the next build assigns wrong slots to most POIs.
-            //
-            // Emit BEFORE the tier filter loop runs, into the canonical
-            // /poi/all/ subdir (which apply_strategy2_pois already
-            // looks for). The per-tier writes below do NOT emit their
-            // own sidecars — this canonical full-set one is the single
-            // source of truth.
-            ensure_dir(base_dir + "/poi/all");
-            emit_strategy2_sidecar(base_dir + "/poi/all/poi_records.osm_ids",
-                                    d.poi_sidecar_blob, d.poi_osm_ids);
+                    // Filter records by tier; pack each polygon's vertices
+                    // into the variable-stride byte stream (per-record
+                    // VertexEncoding tag, byte_offset into vertex stream).
+                    // A tombstone keeps its bytes but only goes to the tiers
+                    // that held its record, so a death never touches the
+                    // files that never carried it.
+                    const PoiTierSelection selection =
+                        select_poi_tier(d.poi_records, d.poi_sidecar_blob, tier_var.max_tier);
+                    const auto& selected = selection.indices;
+                    std::vector<PoiRecord> filtered_records(selected.size());
+                    std::vector<uint8_t> filtered_vertex_bytes;
+                    std::vector<uint32_t> id_remap(d.poi_records.size(), NO_DATA);
+                    // Point POI — no header / no vertices.
+                    auto is_polygon = [](const PoiRecord& pr) { return pr.vertex_count > 0 && pr.vertex_offset != NO_DATA; };
+                    parallel_prefix_fill(selected.size(),
+                        [&](size_t k) -> size_t {
+                            const auto& pr = d.poi_records[selected[k]];
+                            return is_polygon(pr) ? plan_polygon(&d.poi_vertices[pr.vertex_offset], pr.vertex_count).bytes : 0;
+                        },
+                        [&](size_t total) { filtered_vertex_bytes.resize(total); },
+                        [&](size_t k, size_t offset) -> size_t {
+                            id_remap[selected[k]] = static_cast<uint32_t>(k);
+                            auto pr = d.poi_records[selected[k]];
+                            size_t bytes = 0;
+                            if (is_polygon(pr)) {
+                                bytes = pack_polygon_at(filtered_vertex_bytes.data() + offset,
+                                                        &d.poi_vertices[pr.vertex_offset], pr.vertex_count);
+                                pr.vertex_offset = static_cast<uint32_t>(offset);
+                            } else {
+                                pr.vertex_offset = NO_DATA;
+                            }
+                            filtered_records[k] = pr;
+                            return bytes;
+                        });
 
-            for (const auto& tier_var : poi_tiers) {
-                std::string poi_dir = base_dir + "/" + tier_var.name;
-                ensure_dir(poi_dir);
-
-                // Filter records by tier; pack each polygon's vertices
-                // into the variable-stride byte stream (per-record
-                // VertexEncoding tag, byte_offset into vertex stream).
-                // A tombstone keeps its bytes but only goes to the tiers
-                // that held its record, so a death never touches the
-                // files that never carried it.
-                const PoiTierSelection selection =
-                    select_poi_tier(d.poi_records, d.poi_sidecar_blob, tier_var.max_tier);
-                const auto& selected = selection.indices;
-                std::vector<PoiRecord> filtered_records(selected.size());
-                std::vector<uint8_t> filtered_vertex_bytes;
-                std::vector<uint32_t> id_remap(d.poi_records.size(), NO_DATA);
-                // Point POI — no header / no vertices.
-                auto is_polygon = [](const PoiRecord& pr) { return pr.vertex_count > 0 && pr.vertex_offset != NO_DATA; };
-                parallel_prefix_fill(selected.size(),
-                    [&](size_t k) -> size_t {
-                        const auto& pr = d.poi_records[selected[k]];
-                        return is_polygon(pr) ? plan_polygon(&d.poi_vertices[pr.vertex_offset], pr.vertex_count).bytes : 0;
-                    },
-                    [&](size_t total) { filtered_vertex_bytes.resize(total); },
-                    [&](size_t k, size_t offset) -> size_t {
-                        id_remap[selected[k]] = static_cast<uint32_t>(k);
-                        auto pr = d.poi_records[selected[k]];
-                        size_t bytes = 0;
-                        if (is_polygon(pr)) {
-                            bytes = pack_polygon_at(filtered_vertex_bytes.data() + offset,
-                                                    &d.poi_vertices[pr.vertex_offset], pr.vertex_count);
-                            pr.vertex_offset = static_cast<uint32_t>(offset);
-                        } else {
-                            pr.vertex_offset = NO_DATA;
+                    // Filtered cell index (preserving INTERIOR_FLAG). id_remap
+                    // ascends and keeps the flag bit, so the filtered table stays
+                    // in canonical order and repeats sit side by side.
+                    std::vector<std::vector<CellItemPair>> worker_cells(parallel_threads());
+                    parallel_for_runs(d.sorted_poi_cells.size(), same_cell(d.sorted_poi_cells),
+                                      [&](size_t begin, size_t end, unsigned w) {
+                        auto& out = worker_cells[w];
+                        for (size_t i = begin; i < end; i++) {
+                            const auto& p = d.sorted_poi_cells[i];
+                            uint32_t flags = p.item_id & INTERIOR_FLAG;
+                            uint32_t raw_id = p.item_id & ID_MASK;
+                            if (raw_id >= id_remap.size() || id_remap[raw_id] == NO_DATA) continue;
+                            CellItemPair q{p.cell_id, id_remap[raw_id] | flags};
+                            if (!out.empty() && out.back().cell_id == q.cell_id && out.back().item_id == q.item_id) continue;
+                            out.push_back(q);
                         }
-                        filtered_records[k] = pr;
-                        return bytes;
                     });
-
-                // Filtered cell index (preserving INTERIOR_FLAG). id_remap
-                // ascends and keeps the flag bit, so the filtered table stays
-                // in canonical order and repeats sit side by side.
-                std::vector<std::vector<CellItemPair>> worker_cells(parallel_threads());
-                parallel_for_runs(d.sorted_poi_cells.size(), same_cell(d.sorted_poi_cells),
-                                  [&](size_t begin, size_t end, unsigned w) {
-                    auto& out = worker_cells[w];
-                    for (size_t i = begin; i < end; i++) {
-                        const auto& p = d.sorted_poi_cells[i];
-                        uint32_t flags = p.item_id & INTERIOR_FLAG;
-                        uint32_t raw_id = p.item_id & ID_MASK;
-                        if (raw_id >= id_remap.size() || id_remap[raw_id] == NO_DATA) continue;
-                        CellItemPair q{p.cell_id, id_remap[raw_id] | flags};
-                        if (!out.empty() && out.back().cell_id == q.cell_id && out.back().item_id == q.item_id) continue;
-                        out.push_back(q);
+                    std::vector<CellItemPair> filtered_cells;
+                    for (auto& part : worker_cells) {
+                        filtered_cells.insert(filtered_cells.end(), part.begin(), part.end());
+                        std::vector<CellItemPair>().swap(part);
                     }
-                });
-                std::vector<CellItemPair> filtered_cells;
-                for (auto& part : worker_cells) {
-                    filtered_cells.insert(filtered_cells.end(), part.begin(), part.end());
-                    std::vector<CellItemPair>().swap(part);
-                }
 
-                // Write files
-                {
-                    std::ofstream f(poi_dir + "/poi_records.bin", std::ios::binary);
-                    f.write(reinterpret_cast<const char*>(filtered_records.data()),
-                            filtered_records.size() * sizeof(PoiRecord));
-                }
-                {
-                    std::ofstream f(poi_dir + "/poi_vertices.bin", std::ios::binary);
-                    f.write(reinterpret_cast<const char*>(filtered_vertex_bytes.data()),
-                            filtered_vertex_bytes.size());
-                }
-                // No per-tier sidecar emission — the canonical sidecar
-                // for apply_strategy2_pois lives at base_dir/poi/all/
-                // and contains the FULL POI set (emitted above, before
-                // this loop). Per-tier sidecars would represent
-                // tier-filtered index spaces that don't match what
-                // apply_strategy2_pois operates on (the full d.poi_records
-                // array), so reading them at the next build's allocator
-                // would put records at the wrong slots.
-                write_cell_index_sorted(poi_dir + "/poi_cells.bin", poi_dir + "/poi_entries.bin",
-                                        filtered_cells);
-
-                // POI tier strings — only clients opting in to POI get
-                // these names. Layout file lets the server resolve
-                // global offsets without needing the mode dir.
-                {
-                    const auto& buf = d.strings_tiers[4];
-                    std::ofstream f(poi_dir + "/" + STR_TIER_FILENAMES[4], std::ios::binary);
-                    f.write(buf.data(), buf.size());
-                }
-                write_strings_layout(poi_dir, d);
-
-                // Write poi_meta.json (category metadata for the server)
-                {
-                    std::ofstream mf(poi_dir + "/poi_meta.json");
-                    mf << "{\n";
-                    bool first = true;
-                    for (uint8_t cat : poi_meta_categories(d.poi_records, d.poi_sidecar_blob,
-                                                           selection)) {
-                        if (!first) mf << ",\n";
-                        first = false;
-                        PoiCategory pc = static_cast<PoiCategory>(cat);
-                        mf << "  \"" << (int)cat << "\": {\"name\": \""
-                           << poi_category_label(pc) << "\", \"reference_distance\": "
-                           << category_reference_distance(pc) << ", \"max_distance\": "
-                           << category_max_distance(pc) << ", \"default_importance\": "
-                           << (int)category_base_importance(pc) << "}";
+                    // Write files
+                    {
+                        std::ofstream f(poi_dir + "/poi_records.bin", std::ios::binary);
+                        f.write(reinterpret_cast<const char*>(filtered_records.data()),
+                                filtered_records.size() * sizeof(PoiRecord));
                     }
-                    mf << "\n}\n";
-                }
+                    {
+                        std::ofstream f(poi_dir + "/poi_vertices.bin", std::ios::binary);
+                        f.write(reinterpret_cast<const char*>(filtered_vertex_bytes.data()),
+                                filtered_vertex_bytes.size());
+                    }
+                    // No per-tier sidecar emission — the canonical sidecar
+                    // for apply_strategy2_pois lives at base_dir/poi/all/
+                    // and contains the FULL POI set (emitted above, before
+                    // this loop). Per-tier sidecars would represent
+                    // tier-filtered index spaces that don't match what
+                    // apply_strategy2_pois operates on (the full d.poi_records
+                    // array), so reading them at the next build's allocator
+                    // would put records at the wrong slots.
+                    write_cell_index_sorted(poi_dir + "/poi_cells.bin", poi_dir + "/poi_entries.bin",
+                                            filtered_cells);
 
-                std::cerr << "  POI " << tier_var.name << ": "
-                          << filtered_records.size() << " records ("
-                          << selection.tombstones << " tombstones), "
-                          << filtered_vertex_bytes.size() << " vertex bytes, "
-                          << count_cells(filtered_cells) << " cells" << std::endl;
-                log_phase(("    " + region + ": " + tier_var.name).c_str(), _rt, _rc);
+                    // POI tier strings — only clients opting in to POI get
+                    // these names. Layout file lets the server resolve
+                    // global offsets without needing the mode dir.
+                    {
+                        const auto& buf = d.strings_tiers[4];
+                        std::ofstream f(poi_dir + "/" + STR_TIER_FILENAMES[4], std::ios::binary);
+                        f.write(buf.data(), buf.size());
+                    }
+                    write_strings_layout(poi_dir, d);
+
+                    // Write poi_meta.json (category metadata for the server)
+                    {
+                        std::ofstream mf(poi_dir + "/poi_meta.json");
+                        mf << "{\n";
+                        bool first = true;
+                        for (uint8_t cat : poi_meta_categories(d.poi_records, d.poi_sidecar_blob,
+                                                               selection)) {
+                            if (!first) mf << ",\n";
+                            first = false;
+                            PoiCategory pc = static_cast<PoiCategory>(cat);
+                            mf << "  \"" << (int)cat << "\": {\"name\": \""
+                               << poi_category_label(pc) << "\", \"reference_distance\": "
+                               << category_reference_distance(pc) << ", \"max_distance\": "
+                               << category_max_distance(pc) << ", \"default_importance\": "
+                               << (int)category_base_importance(pc) << "}";
+                        }
+                        mf << "\n}\n";
+                    }
+
+                    std::cerr << "  POI " << tier_var.name << ": "
+                              << filtered_records.size() << " records ("
+                              << selection.tombstones << " tombstones), "
+                              << filtered_vertex_bytes.size() << " vertex bytes, "
+                              << count_cells(filtered_cells) << " cells" << std::endl;
+                    log_phase(("    " + region + ": " + tier_var.name).c_str(), _pt, _pc);
+                }
             }
-        }
+        };
+
+        const std::pair<const char*, std::function<void()>> stages[] = {
+            {"modes", write_modes},
+            {"quality variants", write_quality_dirs},
+            {"place files", write_places},
+            {"admin-minimal", write_admin_minimal},
+            {"poi tiers", write_poi_tiers},
+        };
+        for (const auto& [name, stage] : stages) timed_phase(std::string("    ") + region + ": " + name, stage);
     };
 
     // Strategy-2 remap for the planet region runs synchronously HERE — before
@@ -2074,7 +2083,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
     // Write planet (async — overlaps with continent filtering start)
     auto planet_future = std::async(std::launch::async, [&]() {
         timed_phase("    planet: write", [&] {
-            write_region(data, output_dir + "/planet", /*remap_already_applied=*/true);
+            write_region(data, output_dir + "/planet", RegionRun::Planet);
         });
     });
 
@@ -2203,7 +2212,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                     way_continent_masks, addr_continent_masks, interp_continent_masks,
                     poi_continent_masks, place_continent_masks, poly);
                 log_phase(("  " + std::string(continent.name) + ": filter").c_str(), _ct, _cc);
-                write_region(subset, output_dir + "/" + continent.name);
+                write_region(subset, output_dir + "/" + continent.name, RegionRun::Continent);
                 log_phase(("  " + std::string(continent.name) + ": total").c_str(), _ct, _cc);
 
                 // Decrement under the mutex — see the quality-throttle note.
