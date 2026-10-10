@@ -2976,14 +2976,13 @@ static int run(int argc, char* argv[]) {
             {
                 auto _mt = std::chrono::steady_clock::now();
                 auto _mc = CpuTicks::now();
-                pbf.read_ways_streaming([&](int64_t way_id,
-                    const int64_t* refs_data, size_t refs_size,
+                pbf.read_ways_streaming([&](int64_t way_id, const WayRefs& refs,
                     const uint32_t* tag_keys, const uint32_t* tag_vals, size_t ntags,
                     const std::vector<std::string>& st) {
-                    if (refs_size == 0) return;
+                    if (refs.empty()) return;
                     bool relation_member = is_admin_way(way_id) || is_poi_way(way_id);
                     if (!way_needs_nodes(parse_way_tags(tag_keys, tag_vals, ntags, st), relation_member)) return;
-                    for (size_t ri = 0; ri < refs_size; ri++) index.mark(static_cast<uint64_t>(refs_data[ri]));
+                    for (int64_t ref : refs.get()) index.mark(static_cast<uint64_t>(ref));
                 });
                 index.finalize();
                 std::cerr << "  Node index: " << index.marked() << " node ids looked up by ways ("
@@ -3496,8 +3495,7 @@ static int run(int argc, char* argv[]) {
                 auto _st = std::chrono::steady_clock::now();
                 auto _sc = CpuTicks::now();
 
-                pbf.read_ways_streaming([&](int64_t way_id,
-                    const int64_t* refs_data, size_t refs_size,
+                pbf.read_ways_streaming([&](int64_t way_id, const WayRefs& refs,
                     const uint32_t* tag_keys, const uint32_t* tag_vals, size_t ntags,
                     const std::vector<std::string>& st) {
 
@@ -3512,8 +3510,11 @@ static int run(int argc, char* argv[]) {
                     bool has_poi_tags = t.has_poi_tags();
 
                     // Early exit: if no relevant tags, skip expensive node resolution
-                    bool relation_member = refs_size > 0 && (is_admin_way(way_id) || is_poi_way(way_id));
+                    bool relation_member = !refs.empty() && (is_admin_way(way_id) || is_poi_way(way_id));
                     if (!way_needs_nodes(t, relation_member)) return;
+                    const std::vector<int64_t>& ref_list = refs.get();
+                    const int64_t* refs_data = ref_list.data();
+                    const size_t refs_size = ref_list.size();
 
                     // Pre-resolve all node locations
                     thread_local std::vector<PackedLocation> resolved_locs;

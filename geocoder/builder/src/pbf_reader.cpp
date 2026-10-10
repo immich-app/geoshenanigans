@@ -599,6 +599,23 @@ size_t decode_nodes_streaming(const char* data, size_t size, const NodeCallback&
     return way_groups;
 }
 
+const std::vector<int64_t>& WayRefs::get() const {
+    if (!decoded_) {
+        refs_.clear();
+        for (auto packed : packed_) {
+            const char* end = packed.data() + packed.size();
+            int64_t ref = 0;
+            for (auto delta : protozero::iterator_range<protozero::const_svarint_iterator<int64_t>>(
+                     {packed.data(), end}, {end, end})) {
+                ref += delta;
+                refs_.push_back(ref);
+            }
+        }
+        decoded_ = true;
+    }
+    return refs_;
+}
+
 size_t decode_ways_streaming(const char* data, size_t size, const WayCallback& callback) {
     std::vector<std::string> string_table;
     size_t node_groups = 0;
@@ -606,7 +623,7 @@ size_t decode_ways_streaming(const char* data, size_t size, const WayCallback& c
     int64_t lat_offset = 0, lon_offset = 0;
 
     // Reusable per-way buffers
-    thread_local std::vector<int64_t> refs;
+    thread_local WayRefs refs;
     thread_local std::vector<uint32_t> keys, vals;
 
     protozero::pbf_reader pb(data, size);
@@ -622,7 +639,7 @@ size_t decode_ways_streaming(const char* data, size_t size, const WayCallback& c
                     if (group.tag() == PrimitiveGroupTag::WAYS) {
                         protozero::pbf_reader way_msg = group.get_message();
                         int64_t way_id = 0;
-                        refs.clear();
+                        refs.reset();
                         keys.clear();
                         vals.clear();
 
@@ -636,11 +653,8 @@ size_t decode_ways_streaming(const char* data, size_t size, const WayCallback& c
                                     for (auto v : way_msg.get_packed_uint32()) vals.push_back(v);
                                     break;
                                 case WayTag::REFS: {
-                                    int64_t ref = 0;
-                                    for (auto delta : way_msg.get_packed_sint64()) {
-                                        ref += delta;
-                                        refs.push_back(ref);
-                                    }
+                                    auto packed = way_msg.get_view();
+                                    refs.add_packed({packed.data(), packed.size()});
                                     break;
                                 }
                                 default: way_msg.skip();
@@ -648,8 +662,7 @@ size_t decode_ways_streaming(const char* data, size_t size, const WayCallback& c
                         }
 
                         size_t ntags = std::min(keys.size(), vals.size());
-                        callback(way_id, refs.data(), refs.size(),
-                                 keys.data(), vals.data(), ntags, string_table);
+                        callback(way_id, refs, keys.data(), vals.data(), ntags, string_table);
                     } else {
                         if (group.tag() == PrimitiveGroupTag::NODES ||
                             group.tag() == PrimitiveGroupTag::DENSE) node_groups++;

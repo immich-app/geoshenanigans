@@ -70,10 +70,10 @@ Streamed stream(const std::string& path, unsigned threads) {
         std::lock_guard<std::mutex> lock(mutex);
         out.nodes.push_back(s);
     });
-    pbf.read_ways_streaming([&](int64_t id, const int64_t* refs, size_t nrefs, const uint32_t* keys,
+    pbf.read_ways_streaming([&](int64_t id, const WayRefs& refs, const uint32_t* keys,
                                 const uint32_t* vals, size_t ntags, const std::vector<std::string>& st) {
         std::string s = std::to_string(id) + " ";
-        for (size_t i = 0; i < nrefs; i++) s += std::to_string(refs[i]) + ",";
+        for (int64_t ref : refs.get()) s += std::to_string(ref) + ",";
         s += " " + tags_of(keys, vals, ntags, st);
         std::lock_guard<std::mutex> lock(mutex);
         out.ways.push_back(s);

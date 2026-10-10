@@ -112,11 +112,37 @@ using NodeCallback = std::function<void(int64_t id, double lat, double lng,
 
 size_t decode_nodes_streaming(const char* data, size_t size, const NodeCallback& callback);
 
+// A way's node refs as its blob holds them, delta-coded: most ways are
+// skipped on their tags, and decoding refs is most of decoding a way.
+class WayRefs {
+public:
+    bool empty() const {
+        for (auto packed : packed_)
+            if (!packed.empty()) return false;
+        return true;
+    }
+    // The refs, decoded on the first call into a buffer the decoding thread
+    // reuses: valid until the next way.
+    const std::vector<int64_t>& get() const;
+
+    // For the decoder: starts the next way, then adds each of its REFS
+    // fields, which decode one after the other, each from a ref of 0.
+    void reset() {
+        packed_.clear();
+        decoded_ = false;
+    }
+    void add_packed(std::string_view packed) { packed_.push_back(packed); }
+
+private:
+    std::vector<std::string_view> packed_;
+    mutable std::vector<int64_t> refs_;
+    mutable bool decoded_ = false;
+};
+
 // Streaming way decode — calls callback directly for each way during decode.
-// Avoids creating PbfWay objects. Node refs passed as pointer+count.
+// Avoids creating PbfWay objects.
 // Returns the number of node groups it skipped.
-using WayCallback = std::function<void(int64_t id,
-    const int64_t* refs, size_t nrefs,
+using WayCallback = std::function<void(int64_t id, const WayRefs& refs,
     const uint32_t* tag_keys, const uint32_t* tag_vals, size_t ntags,
     const std::vector<std::string>& string_table)>;
 
