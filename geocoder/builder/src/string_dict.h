@@ -152,6 +152,7 @@ std::vector<DictIds> intern_dicts(const std::vector<const StringDict*>& dicts,
         uint32_t id;
     };
     std::vector<std::vector<Distinct>> distinct(kShards);
+    std::vector<size_t> fresh_count(kShards);
     parallel_for_each(kShards, [&](size_t shard, unsigned) {
         size_t n = 0;
         for (size_t d = 0; d < n_dicts; d++) n += meets[d * kShards + shard].size();
@@ -181,6 +182,7 @@ std::vector<DictIds> intern_dicts(const std::vector<const StringDict*>& dicts,
         for (auto& s : strs) {
             buf.assign(s.str);
             s.id = pool.find(buf);
+            fresh_count[shard] += s.id == StringPool::kAbsent;
         }
     }, threads);
 
@@ -191,19 +193,25 @@ std::vector<DictIds> intern_dicts(const std::vector<const StringDict*>& dicts,
         uint32_t shard;
         uint32_t index;
     };
-    std::vector<Fresh> fresh;
-    for (uint32_t shard = 0; shard < kShards; shard++)
+    std::vector<size_t> fresh_at(kShards + 1, 0);
+    for (size_t shard = 0; shard < kShards; shard++) fresh_at[shard + 1] = fresh_at[shard] + fresh_count[shard];
+    std::vector<Fresh> fresh(fresh_at[kShards]);
+    parallel_for_each(kShards, [&](size_t shard, unsigned) {
+        size_t at = fresh_at[shard];
         for (uint32_t i = 0; i < distinct[shard].size(); i++)
             if (distinct[shard][i].id == StringPool::kAbsent)
-                fresh.push_back({distinct[shard][i].first, shard, i});
+                fresh[at++] = {distinct[shard][i].first, static_cast<uint32_t>(shard), i};
+    }, threads);
     parallel_sort(fresh.begin(), fresh.end(),
                   [](const Fresh& a, const Fresh& b) { return a.first < b.first; }, threads);
-    std::string buf;
-    for (const Fresh& f : fresh) {
-        auto& s = distinct[f.shard][f.index];
-        buf.assign(s.str);
-        s.id = pool.intern(buf);
-    }
+    std::vector<std::string_view> fresh_strs(fresh.size());
+    parallel_for(fresh.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t i = b; i < e; i++) fresh_strs[i] = distinct[fresh[i].shard][fresh[i].index].str;
+    }, threads);
+    std::vector<uint32_t> fresh_ids = pool.append_new(fresh_strs, threads);
+    parallel_for(fresh.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t i = b; i < e; i++) distinct[fresh[i].shard][fresh[i].index].id = fresh_ids[i];
+    }, threads);
 
     std::vector<std::vector<uint32_t>> ids(n_dicts);
     for (size_t d = 0; d < n_dicts; d++) ids[d].assign(dicts[d]->size(), NO_DATA);

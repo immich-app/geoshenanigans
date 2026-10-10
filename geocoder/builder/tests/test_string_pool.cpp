@@ -8,6 +8,8 @@
 
 #include <cstring>
 #include <string>
+#include <string_view>
+#include <vector>
 
 #include "test_framework.h"
 
@@ -119,6 +121,30 @@ TEST(string_pool_release_index_keeps_data_and_refuses_interning) {
     }
     CHECK(thrown);
     CHECK_EQ(p.data().size(), size_t(5));
+}
+
+TEST(string_pool_append_new_pools_like_interning_each) {
+    std::vector<std::string> strs = {"", "Elm St", std::string("a\0b", 3), "caf\xc3\xa9"};
+    for (int i = 0; i < 20000; i++) strs.push_back("street " + std::to_string(i * 7919 % 100003));
+    std::vector<std::string_view> views(strs.begin(), strs.end());
+    for (unsigned threads : {1u, 3u, 8u}) {
+        StringPool direct, bulk;
+        for (StringPool* p : {&direct, &bulk}) {
+            p->intern("already pooled");
+            p->intern("a");  // a prefix of "a\0b"
+        }
+        std::vector<uint32_t> want;
+        for (const auto& s : strs) want.push_back(direct.intern(s));
+        CHECK(bulk.append_new(views, threads) == want);
+        CHECK(bulk.data() == direct.data());
+        bool found = true;
+        for (size_t i = 0; i < strs.size(); i++) found = found && bulk.find(strs[i]) == want[i];
+        CHECK(found);
+        CHECK_EQ(bulk.find("a"), direct.find("a"));
+        CHECK_EQ(bulk.find("not pooled"), StringPool::kAbsent);
+        CHECK_EQ(bulk.intern("Elm St"), want[1]);
+        CHECK_EQ(bulk.intern("next"), direct.intern("next"));
+    }
 }
 
 TEST(string_pool_mutable_data_is_same_buffer) {
