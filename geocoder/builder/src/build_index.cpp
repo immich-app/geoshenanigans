@@ -3537,6 +3537,7 @@ static int run(int argc, char* argv[]) {
                     std::vector<uint32_t> addr_postcodes; // parallel to addr_strings
                     std::vector<int64_t> addr_osm_node_ids; // parallel to addr_coords; strategy-2 stable identity
                     uint64_t count = 0;
+                    uint64_t nodes = 0;
                     std::vector<std::pair<int64_t, uint8_t>> label_hits; // (node_id, PlaceType)
                     // POI node data
                     std::vector<PoiRecord> poi_records;
@@ -3568,6 +3569,7 @@ static int run(int argc, char* argv[]) {
                         tl_node_data = &ntld[idx % ntld.size()];
                     }
 
+                    tl_node_data->nodes++;
                     if (id > 0) {
                         index.set(static_cast<uint64_t>(id), lat, lng);
                     }
@@ -3797,6 +3799,10 @@ static int run(int argc, char* argv[]) {
 
                 // Reset thread_local for next use
                 tl_node_data = nullptr;
+                uint64_t total_nodes = 0;
+                for (const auto& local : ntld) total_nodes += local.nodes;
+                std::cerr << "  Node index: kept " << index.marked() << " of "
+                          << total_nodes << " nodes." << std::endl;
                 log_phase("    Pass 2: node streaming", _st, _sc);
 
                 // Pool ids per thread, interned in the order the merges
