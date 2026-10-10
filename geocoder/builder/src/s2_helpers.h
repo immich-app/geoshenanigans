@@ -86,6 +86,8 @@ inline std::vector<std::pair<double,double>> simplify_admin_polygon(
 
 // --- Helper functions that depend on S2 ---
 
+// Interns the address strings (street, housenumber, postcode, in that order)
+// and appends the point via append_addr_point.
 void add_addr_point(ParsedData& data, double lat, double lng,
                     const char* housenumber, const char* street,
                     const char* postcode,
@@ -93,6 +95,14 @@ void add_addr_point(ParsedData& data, double lat, double lng,
                     uint64_t osm_id_packed,
                     const NodeCoord* polygon_vertices = nullptr,
                     uint32_t polygon_vertex_count = 0);
+
+// Appends one address point whose strings are already interned (NO_DATA
+// for a missing street or postcode); `cell` is point_to_cell(lat, lng).
+void append_addr_point(ParsedData& data, double lat, double lng,
+                       uint32_t housenumber_id, uint32_t street_id, uint32_t postcode_id,
+                       S2CellId cell, uint64_t osm_id_packed,
+                       const NodeCoord* polygon_vertices = nullptr,
+                       uint32_t polygon_vertex_count = 0);
 
 void add_admin_polygon(ParsedData& data,
                        const std::vector<std::pair<double,double>>& vertices_in,

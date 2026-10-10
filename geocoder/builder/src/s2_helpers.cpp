@@ -240,10 +240,28 @@ void add_addr_point(ParsedData& data, double lat, double lng,
                     uint64_t osm_id_packed,
                     const NodeCoord* polygon_vertices,
                     uint32_t polygon_vertex_count) {
-    uint32_t addr_id = static_cast<uint32_t>(data.addr_points.size());
     uint32_t street_id = (street && street[0])
         ? data.string_pool.intern(street)
         : NO_DATA;
+    uint32_t housenumber_id = data.string_pool.intern(housenumber);
+    uint32_t pc_id = (postcode && postcode[0])
+        ? data.string_pool.intern(postcode) : NO_DATA;
+    append_addr_point(data, lat, lng, housenumber_id, street_id, pc_id,
+                      point_to_cell(lat, lng), osm_id_packed,
+                      polygon_vertices, polygon_vertex_count);
+
+    addr_count_total++;
+    if (addr_count_total % 1000000 == 0) {
+        std::cerr << "Collected " << addr_count_total / 1000000 << "M addresses..." << std::endl;
+    }
+}
+
+void append_addr_point(ParsedData& data, double lat, double lng,
+                       uint32_t housenumber_id, uint32_t street_id, uint32_t postcode_id,
+                       S2CellId cell, uint64_t osm_id_packed,
+                       const NodeCoord* polygon_vertices,
+                       uint32_t polygon_vertex_count) {
+    uint32_t addr_id = static_cast<uint32_t>(data.addr_points.size());
     uint32_t vertex_offset = NO_DATA;
     uint32_t vertex_count = 0;
     if (polygon_vertices && polygon_vertex_count > 0) {
@@ -255,7 +273,7 @@ void add_addr_point(ParsedData& data, double lat, double lng,
     data.addr_points.push_back({
         static_cast<float>(lat),
         static_cast<float>(lng),
-        data.string_pool.intern(housenumber),
+        housenumber_id,
         street_id,
         NO_DATA,  // parent_way_id — filled in during nearest-street sweep
         vertex_offset,
@@ -264,17 +282,9 @@ void add_addr_point(ParsedData& data, double lat, double lng,
     // Strategy-2 stable identity, parallel to addr_points.
     data.addr_osm_ids.push_back(osm_id_packed);
     // Store postcode in separate parallel vector (optional file)
-    uint32_t pc_id = (postcode && postcode[0])
-        ? data.string_pool.intern(postcode) : NO_DATA;
-    data.addr_postcode_ids.push_back(pc_id);
+    data.addr_postcode_ids.push_back(postcode_id);
 
-    S2CellId cell = point_to_cell(lat, lng);
     data.cell_to_addrs[cell.id()].push_back(addr_id);
-
-    addr_count_total++;
-    if (addr_count_total % 1000000 == 0) {
-        std::cerr << "Collected " << addr_count_total / 1000000 << "M addresses..." << std::endl;
-    }
 }
 
 // --- add_admin_polygon ---
