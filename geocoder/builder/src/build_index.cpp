@@ -200,14 +200,16 @@ static TigerCsvFiles find_tiger_csvs(const std::string& path) {
     return files;
 }
 
-static void load_tiger_data(ParsedData& data, const std::string& path) {
+// `pending` is find_tiger_csvs(path), started early so the extraction
+// overlaps the PBF passes.
+static void load_tiger_data(ParsedData& data, const std::string& path, std::future<TigerCsvFiles> pending) {
     std::cerr << "Loading TIGER address data from " << path << "..." << std::endl;
     auto _tt = std::chrono::steady_clock::now();
     auto _tc = CpuTicks::now();
 
-    TigerCsvFiles csvs = find_tiger_csvs(path);
+    TigerCsvFiles csvs = pending.get();
     const std::vector<std::string>& csv_files = csvs.paths;
-    log_phase("  TIGER: extract", _tt, _tc);
+    log_phase("  TIGER: extract wait", _tt, _tc);
     std::cerr << "  Found " << csv_files.size() << " TIGER CSV files" << std::endl;
     if (csv_files.empty())
         throw std::runtime_error("--tiger-data given but no .csv files found under " + path);
@@ -3160,6 +3162,11 @@ static int run(int argc, char* argv[]) {
             return 1;
         }
 
+        // The TIGER tarball extracts (a core and the disk) during the PBF passes.
+        std::future<TigerCsvFiles> tiger_csvs;
+        if (!tiger_data_path.empty())
+            tiger_csvs = std::async(std::launch::async, find_tiger_csvs, tiger_data_path);
+
         // Create thread pool for concurrent admin polygon S2 covering
         std::cerr << "Using " << num_threads << " worker threads." << std::endl;
         AdminCoverPool admin_pool(num_threads);
@@ -5240,7 +5247,7 @@ static int run(int argc, char* argv[]) {
 
         // Load TIGER address data
         if (!tiger_data_path.empty()) {
-            load_tiger_data(data, tiger_data_path);
+            load_tiger_data(data, tiger_data_path, std::move(tiger_csvs));
         }
         if (!external_postcodes_path.empty()) {
             load_external_postcodes(data, external_postcodes_path);
