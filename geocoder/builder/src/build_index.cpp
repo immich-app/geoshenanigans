@@ -53,6 +53,7 @@ inline uint64_t pack_osm_id(gc::id_alloc::ObjectType type, int64_t osm_id) {
 #include "admin_rank_config.h"
 #include "scratch_dir.h"
 #include "tiger.h"
+#include "parallel.h"
 
 
 // --- Place type override classification ---
@@ -221,14 +222,19 @@ static void load_tiger_data(ParsedData& data, const std::string& path) {
     // (and interp_postcodes.bin unwritten) when no TIGER data is loaded.
     data.interp_postcode_ids.resize(data.interp_ways.size(), NO_DATA);
 
-    std::string text;
-    for (const auto& csv_file : csv_files) {
-        if (!read_whole_file(csv_file, text)) continue;
-        TigerCsv csv = parse_tiger_csv(text);
-        total_rows += csv.rows;
-        loaded_rows += csv.ranges.size();
-        add_tiger_ranges(data, csv);
-    }
+    // Files parse in parallel, leaving a core to add their ranges and
+    // strings in file order, as a serial load would.
+    parallel_ordered(csv_files.size(), [&](size_t i) {
+        std::optional<TigerCsv> csv;
+        std::string text;
+        if (read_whole_file(csv_files[i], text)) csv = parse_tiger_csv(text);
+        return csv;
+    }, [&](size_t, std::optional<TigerCsv>&& csv) {
+        if (!csv) return;
+        total_rows += csv->rows;
+        loaded_rows += csv->ranges.size();
+        add_tiger_ranges(data, *csv);
+    }, std::max(1u, parallel_threads() - 1));
 
     // Sidecar exists iff it carries at least one real ZIP: an empty/ZIP-less
     // TIGER path must not materialize an all-NO_DATA planet-sized file (nor a
