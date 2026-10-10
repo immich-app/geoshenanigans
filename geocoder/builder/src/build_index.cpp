@@ -468,6 +468,17 @@ static void walk_items_by_cell(const std::vector<CellItemPair>& order, unsigned 
     }, threads);
 }
 
+// rank_candidates order of the admin parent-chain picks: highest admin_level
+// (the closest parent), then smallest area.
+static auto closest_parent_first(const ParsedData& data) {
+    return [&data](uint32_t a, uint32_t b) {
+        const auto& pa = data.admin_polygons[a];
+        const auto& pb = data.admin_polygons[b];
+        if (pa.admin_level != pb.admin_level) return pa.admin_level > pb.admin_level;
+        return pa.area < pb.area;
+    };
+}
+
 // Admin polygon parent chain: for each admin polygon, find the smallest containing
 // polygon with a lower admin_level so the server walks the chain without PIP.
 static void compute_admin_parent_chain(ParsedData& data, const BuildConfig& cfg) {
@@ -476,61 +487,44 @@ static void compute_admin_parent_chain(ParsedData& data, const BuildConfig& cfg)
         auto _ap_t = std::chrono::steady_clock::now();
         auto _ap_cpu = CpuTicks::now();
         data.admin_parent_ids.assign(data.admin_polygons.size(), NO_DATA);
+        require_ordered_admin_areas(data);
         const AdminRings rings(data, num_threads);
-        std::atomic<size_t> ap_idx{0};
-        std::vector<std::thread> workers;
-        for (unsigned int t = 0; t < num_threads; t++) {
-            workers.emplace_back([&]() {
-                while (true) {
-                    size_t i = ap_idx.fetch_add(1);
-                    if (i >= data.admin_polygons.size()) break;
-                    const auto& self = data.admin_polygons[i];
-                    if (self.vertex_count == 0 || self.admin_level <= 2) continue;
-                    // Compute centroid
-                    float sum_lat = 0, sum_lng = 0;
-                    for (uint32_t v = 0; v < self.vertex_count; v++) {
-                        sum_lat += data.admin_vertices[self.vertex_offset + v].lat;
-                        sum_lng += data.admin_vertices[self.vertex_offset + v].lng;
-                    }
-                    float clat = sum_lat / self.vertex_count;
-                    float clng = sum_lng / self.vertex_count;
-                    S2CellId cell = S2CellId(S2LatLng::FromDegrees(clat, clng)).parent(kAdminCellLevel);
-                    std::vector<S2CellId> nbrs;
-                    cell.AppendAllNeighbors(kAdminCellLevel, &nbrs);
-
-                    // Pick the closest parent: highest admin_level
-                    // (most immediate), with smallest area as tiebreaker.
-                    // This matches Nominatim's parent_place_id = closest
-                    // containing by rank_address.
-                    uint8_t best_al = 0;
-                    float best_area = 1e18f;
-                    uint32_t best_id = NO_DATA;
-                    auto check_cell = [&](uint64_t cid) {
-                        auto it = data.cell_to_admin.find(cid);
-                        if (it == data.cell_to_admin.end()) return;
-                        for (uint32_t raw_id : it->second) {
-                            uint32_t pid = raw_id & ID_MASK;
-                            if (pid == i || pid >= data.admin_polygons.size()) continue;
-                            const auto& cand = data.admin_polygons[pid];
-                            if (cand.admin_level >= self.admin_level) continue;
-                            // Prefer highest admin_level (closest parent)
-                            if (cand.admin_level < best_al) continue;
-                            if (cand.admin_level == best_al && cand.area >= best_area) continue;
-                            if (cand.vertex_offset + cand.vertex_count > data.admin_vertices.size()) continue;
-                            if (rings.contains(pid, clat, clng)) {
-                                best_al = cand.admin_level;
-                                best_area = cand.area;
-                                best_id = pid;
-                            }
-                        }
-                    };
-                    check_cell(cell.id());
-                    for (const auto& n : nbrs) check_cell(n.id());
-                    data.admin_parent_ids[i] = best_id;
+        auto closer = closest_parent_first(data);
+        struct Candidates {
+            std::vector<S2CellId> nbrs;
+            std::vector<uint32_t> parents;
+            std::vector<std::pair<uint32_t, uint32_t>> scratch;
+        };
+        std::vector<Candidates> scratch(std::max(1u, num_threads));
+        parallel_for_dynamic(data.admin_polygons.size(), 64, [&](size_t begin, size_t end, unsigned worker) {
+            Candidates& c = scratch[worker];
+            for (size_t i = begin; i < end; i++) {
+                const auto& self = data.admin_polygons[i];
+                if (self.vertex_count == 0 || self.admin_level <= 2) continue;
+                // Compute centroid
+                float sum_lat = 0, sum_lng = 0;
+                for (uint32_t v = 0; v < self.vertex_count; v++) {
+                    sum_lat += data.admin_vertices[self.vertex_offset + v].lat;
+                    sum_lng += data.admin_vertices[self.vertex_offset + v].lng;
                 }
-            });
-        }
-        for (auto& w : workers) w.join();
+                float clat = sum_lat / self.vertex_count;
+                float clng = sum_lng / self.vertex_count;
+                S2CellId cell = S2CellId(S2LatLng::FromDegrees(clat, clng)).parent(kAdminCellLevel);
+
+                // Pick the closest parent: highest admin_level
+                // (most immediate), with smallest area as tiebreaker.
+                // This matches Nominatim's parent_place_id = closest
+                // containing by rank_address. A level-0 polygon must
+                // beat the old scan's starting best area.
+                c.parents.clear();
+                for_each_admin_candidate(data, cell, c.nbrs, [&](uint32_t pid, const AdminPolygon& p) {
+                    if (pid == i || p.admin_level >= self.admin_level) return;
+                    if (p.admin_level > 0 || p.area < 1e18f) c.parents.push_back(pid);
+                });
+                rank_candidates(c.parents, closer, c.scratch);
+                data.admin_parent_ids[i] = rings.first_containing(c.parents, clat, clng);
+            }
+        }, num_threads);
         double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - _ap_t).count();
         uint32_t linked = 0;
         for (auto id : data.admin_parent_ids) if (id != NO_DATA) linked++;
@@ -551,12 +545,7 @@ static void compute_way_parent_polygons(ParsedData& data, const BuildConfig& cfg
         data.way_postcode_ids.assign(data.ways.size(), NO_DATA);
         require_ordered_admin_areas(data);
         const AdminRings rings(data, num_threads);
-        auto more_specific = [&](uint32_t a, uint32_t b) {
-            const auto& pa = data.admin_polygons[a];
-            const auto& pb = data.admin_polygons[b];
-            if (pa.admin_level != pb.admin_level) return pa.admin_level > pb.admin_level;
-            return pa.area < pb.area;
-        };
+        auto more_specific = closest_parent_first(data);
         auto listed_first = [](uint32_t, uint32_t) { return false; };
 
         // Note: per-way postcode is set from postal boundary PIP only.
