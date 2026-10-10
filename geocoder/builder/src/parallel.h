@@ -21,6 +21,8 @@
 #include <type_traits>
 #include <vector>
 
+#include <unistd.h>
+
 inline unsigned parallel_threads() {
     return std::max(1u, std::thread::hardware_concurrency());
 }
@@ -92,6 +94,37 @@ void parallel_each(std::vector<T>& v, Fn fn, unsigned threads = 0) {
     parallel_for(v.size(), [&](size_t begin, size_t end, unsigned) {
         for (size_t i = begin; i < end; i++) fn(v[i]);
     }, threads);
+}
+
+// Faults in the pages v's next n elements will take, on every core, when
+// they span enough to matter: growing v zero-fills them on one core, which
+// otherwise takes a page fault per page. A store to each page of the spare
+// capacity faults it in (the grow then overwrites it), and unlike
+// MADV_POPULATE_WRITE, which takes the mmap lock, scales with the cores.
+// Capacity must already cover them.
+template <class T>
+void prefault_for(std::vector<T>& v, size_t n) {
+    constexpr size_t kMinBytes = size_t(64) << 20;
+    const size_t bytes = n * sizeof(T);
+    if (bytes < kMinBytes) return;
+
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    volatile unsigned char* spare = reinterpret_cast<unsigned char*>(v.data() + v.size());
+    parallel_for((bytes + page - 1) / page, [&](size_t b, size_t e, unsigned) {
+        for (size_t p = b; p < e; p++) spare[p * page] = 0;
+    });
+}
+
+// v.resize(n) or v.resize(n, value) with the new pages faulted in on every
+// core first (prefault_for): a planet-sized vector made on one core takes
+// half a second a GiB, nearly all of it page faults; what is left is a
+// memset.
+template <class T, class... Value>
+void parallel_resize(std::vector<T>& v, size_t n, const Value&... value) {
+    static_assert(sizeof...(Value) <= 1, "parallel_resize takes at most one fill value");
+    if (n > v.capacity()) v.reserve(n);
+    if (n > v.size()) prefault_for(v, n - v.size());
+    v.resize(n, value...);
 }
 
 // parallel_for for uneven per-element cost: workers take the next `grain`

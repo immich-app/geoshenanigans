@@ -363,6 +363,19 @@ TEST(vector_beside_makes_n_zeroed_elements) {
     CHECK(std::all_of(v.begin(), v.end(), [](uint32_t x) { return x == 0; }));
 }
 
+TEST(parallel_resize_grows_and_shrinks_like_resize) {
+    // Past prefault_for's 64 MiB floor, so the pages fault in on the cores.
+    const size_t big = (size_t(64) << 20) / sizeof(uint32_t) + 3;
+    std::vector<uint32_t> v{7, 8};
+    parallel_resize(v, big);
+    CHECK_EQ(v.size(), big);
+    CHECK(v[0] == 7 && v[1] == 8 && v[2] == 0 && v.back() == 0);
+    parallel_resize(v, big + 5, 9u);
+    CHECK(v[big - 1] == 0 && v[big] == 9 && v.back() == 9);
+    parallel_resize(v, 1, 5u);
+    CHECK(v == std::vector<uint32_t>({7}));
+}
+
 TEST(parallel_collect_joins_each_index_output_in_index_order) {
     for (size_t n : {size_t(0), size_t(5), size_t(300000)}) {
         auto emit = [](size_t i, std::vector<uint64_t>& out) {
