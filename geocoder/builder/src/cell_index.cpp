@@ -24,6 +24,7 @@
 #include "vertex_pack.h"
 
 #include <s2/s2latlng.h>
+#include <functional>
 #include <limits>
 #include <memory>
 
@@ -227,13 +228,15 @@ static bool is_identity(const std::vector<uint32_t>& remap) {
     return true;
 }
 
-static void apply_strategy2_streets(ParsedData& data, const std::string& prev_dir) {
+// Returns the old -> new way id remap when the ways moved (empty when not):
+// the addr points' parent ways still need it.
+static std::vector<uint32_t> apply_strategy2_streets(ParsedData& data, const std::string& prev_dir) {
     using namespace gc::id_alloc;
-    if (data.ways.empty()) return;
+    if (data.ways.empty()) return {};
     // Belt-and-braces: continent_filter.cpp does preserve way_osm_ids
     // for subsets these days, but if any path ever produces a desynced
     // sidecar, skip strategy-2 cleanly rather than mis-keying slots.
-    if (data.way_osm_ids.size() != data.ways.size()) return;
+    if (data.way_osm_ids.size() != data.ways.size()) return {};
 
     IdAllocator alloc;
     if (!prev_dir.empty()) {
@@ -243,7 +246,7 @@ static void apply_strategy2_streets(ParsedData& data, const std::string& prev_di
     }
 
     const size_t n_old = data.ways.size();
-    const std::vector<uint32_t> remap = alloc.allocate_all(n_old, [&](size_t i) {
+    std::vector<uint32_t> remap = alloc.allocate_all(n_old, [&](size_t i) {
         return SlotIdentity{ObjectType::OSM_WAY, static_cast<uint64_t>(data.way_osm_ids[i])};
     });
     const bool identity = is_identity(remap);
@@ -256,7 +259,7 @@ static void apply_strategy2_streets(ParsedData& data, const std::string& prev_di
     // was running the self-hosted runner OOM during step 9.
     if (identity && n_new == n_old) {
         finalize_strategy2(alloc, n_new, n_old, data.way_sidecar_blob, "streets", /*no_shifts=*/true);
-        return;
+        return {};
     }
 
     // Reorder data.ways into a tombstoned dense layout indexed by remap[i].
@@ -284,7 +287,6 @@ static void apply_strategy2_streets(ParsedData& data, const std::string& prev_di
     // Apply remap to every reference site that points into ways[].
     remap_cell_map(data.cell_to_ways, [&](uint32_t& v) { remap_index(v, remap); });
     remap_cell_pairs(data.sorted_way_cells, [&](uint32_t& v) { remap_index(v, remap); });
-    parallel_each(data.addr_points, [&](AddrPoint& ap) { remap_index(ap.parent_way_id, remap); });
     // NOTE: PoiRecord::parent_street_id is NOT a way index — it holds the
     // string offset of the nearest street's name (w.name_id, set at
     // build_index.cpp's POI parent-street linking). String offsets are
@@ -296,6 +298,7 @@ static void apply_strategy2_streets(ParsedData& data, const std::string& prev_di
     // diff/patch tools, exactly like PoiRecord::name_id.
 
     finalize_strategy2(alloc, n_new, n_old, data.way_sidecar_blob, "streets", /*no_shifts=*/false);
+    return remap;
 }
 
 // Strategy-2 stable IDs for admin_polygons.
@@ -573,12 +576,26 @@ void emit_strategy2_sidecar(const std::string& path,
 
 void apply_strategy2_remaps(ParsedData& data, const std::string& prev_dir) {
     const std::string label = "      strategy2 " + prev_dir.substr(prev_dir.find_last_of('/') + 1) + ": ";
-    timed_phase(label + "streets", [&] { apply_strategy2_streets(data, prev_dir); });
+    // Admins first: their remap reaches into the way, POI and place arrays
+    // the other passes reorder (a value remap commutes with a reorder, but
+    // a place tombstone's parent is 0, not NO_DATA). The other passes touch
+    // disjoint arrays and run at once; the addr points' parent ways follow
+    // the streets afterwards, which commutes with the addrs' reorder (an
+    // addr tombstone's parent way is NO_DATA).
     timed_phase(label + "admins", [&] { apply_strategy2_admins(data, prev_dir); });
-    timed_phase(label + "addrs", [&] { apply_strategy2_addrs(data, prev_dir); });
-    timed_phase(label + "places", [&] { apply_strategy2_places(data, prev_dir); });
-    timed_phase(label + "pois", [&] { apply_strategy2_pois(data, prev_dir); });
-    timed_phase(label + "interps", [&] { apply_strategy2_interps(data, prev_dir); });
+    std::vector<uint32_t> way_remap;
+    std::vector<std::future<void>> passes;
+    auto start = [&](const char* kind, std::function<void()> pass) {
+        passes.push_back(std::async(std::launch::async, [&, kind, pass] { timed_phase(label + kind, pass); }));
+    };
+    start("streets", [&] { way_remap = apply_strategy2_streets(data, prev_dir); });
+    start("addrs", [&] { apply_strategy2_addrs(data, prev_dir); });
+    start("places", [&] { apply_strategy2_places(data, prev_dir); });
+    start("pois", [&] { apply_strategy2_pois(data, prev_dir); });
+    start("interps", [&] { apply_strategy2_interps(data, prev_dir); });
+    for (auto& f : passes) f.get();
+    if (!way_remap.empty())
+        parallel_each(data.addr_points, [&](AddrPoint& ap) { remap_index(ap.parent_way_id, way_remap); });
     // postcode_centroids: their stable identity is (country_code,
     // postcode_string) and the centroid records get materialized from
     // the unordered_map<postcode_id, PostcodeAccum> at write time, AFTER
