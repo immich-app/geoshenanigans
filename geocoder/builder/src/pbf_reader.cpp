@@ -541,9 +541,10 @@ PbfBlock decode_pbf_blob(const char* data, size_t size) {
     return block;
 }
 
-void decode_nodes_streaming(const char* data, size_t size, const NodeCallback& callback) {
+size_t decode_nodes_streaming(const char* data, size_t size, const NodeCallback& callback) {
     // Single-pass decode: string table + dense nodes in one traversal
     std::vector<std::string> string_table;
+    size_t way_groups = 0;
     int32_t granularity = 100;
     int64_t lat_offset = 0, lon_offset = 0;
 
@@ -616,6 +617,7 @@ void decode_nodes_streaming(const char* data, size_t size, const NodeCallback& c
                                      string_table);
                         }
                     } else {
+                        if (group.tag() == PrimitiveGroupTag::WAYS) way_groups++;
                         group.skip();
                     }
                 }
@@ -624,10 +626,12 @@ void decode_nodes_streaming(const char* data, size_t size, const NodeCallback& c
             default: pb.skip();
         }
     }
+    return way_groups;
 }
 
-void decode_ways_streaming(const char* data, size_t size, const WayCallback& callback) {
+size_t decode_ways_streaming(const char* data, size_t size, const WayCallback& callback) {
     std::vector<std::string> string_table;
+    size_t node_groups = 0;
     int32_t granularity = 100;
     int64_t lat_offset = 0, lon_offset = 0;
 
@@ -677,6 +681,8 @@ void decode_ways_streaming(const char* data, size_t size, const WayCallback& cal
                         callback(way_id, refs.data(), refs.size(),
                                  keys.data(), vals.data(), ntags, string_table);
                     } else {
+                        if (group.tag() == PrimitiveGroupTag::NODES ||
+                            group.tag() == PrimitiveGroupTag::DENSE) node_groups++;
                         group.skip();
                     }
                 }
@@ -685,6 +691,7 @@ void decode_ways_streaming(const char* data, size_t size, const WayCallback& cal
             default: pb.skip();
         }
     }
+    return node_groups;
 }
 
 void decode_pbf_blob_into(const char* data, size_t size, PbfBlock& block) {
@@ -879,9 +886,12 @@ struct IoSemaphore {
 };
 
 void PbfFile::read_nodes_streaming(const NodeCallback& callback) {
-    std::vector<size_t> data_indices;
-    for (size_t i = 0; i < blobs_.size(); i++)
-        if (blobs_[i].type == "OSMData") data_indices.push_back(i);
+    // Skipping the way blobs saves decompressing them here. The
+    // classification trusts the file to be sorted by type, so a node blob
+    // holding ways (which the way pass would never see) fails the build.
+    classify_blobs();
+    std::vector<size_t> data_indices = node_blobs_;
+    data_indices.insert(data_indices.end(), relation_blobs_.begin(), relation_blobs_.end());
     if (data_indices.empty()) return;
 
     // Limit concurrent I/O to avoid saturating slow storage.
@@ -900,6 +910,7 @@ void PbfFile::read_nodes_streaming(const NodeCallback& callback) {
     std::atomic<size_t> next_idx{0};
     std::atomic<size_t> blocks_done{0};
     std::atomic<bool> open_failed{false};
+    std::atomic<size_t> misplaced{0};
     std::vector<std::thread> threads;
 
     struct ThreadStats { double read_us = 0, decode_us = 0; size_t count = 0; };
@@ -921,7 +932,8 @@ void PbfFile::read_nodes_streaming(const NodeCallback& callback) {
                 auto t1 = std::chrono::steady_clock::now();
                 io_sem.release();
 
-                decode_nodes_streaming(decomp.data(), decomp.size(), callback);
+                size_t foreign = decode_nodes_streaming(decomp.data(), decomp.size(), callback);
+                if (foreign && j < node_blobs_.size()) misplaced.fetch_add(foreign);
                 auto t2 = std::chrono::steady_clock::now();
                 st.read_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
                 st.decode_us += std::chrono::duration<double, std::micro>(t2 - t1).count();
@@ -935,6 +947,8 @@ void PbfFile::read_nodes_streaming(const NodeCallback& callback) {
     }
     for (auto& t : threads) t.join();
     if (open_failed.load()) throw std::runtime_error("cannot open " + filename_ + " in worker thread");
+    if (misplaced.load())
+        throw std::runtime_error(filename_ + ": way groups in node blobs, PBF not sorted by type");
 
     double total_read = 0, total_decode = 0; size_t total_blocks = 0;
     for (auto& s : stats) { total_read += s.read_us; total_decode += s.decode_us; total_blocks += s.count; }
@@ -946,9 +960,10 @@ void PbfFile::read_nodes_streaming(const NodeCallback& callback) {
 }
 
 void PbfFile::read_ways_streaming(const WayCallback& callback) {
-    std::vector<size_t> data_indices;
-    for (size_t i = 0; i < blobs_.size(); i++)
-        if (blobs_[i].type == "OSMData") data_indices.push_back(i);
+    // Way and relation blobs only; see read_nodes_streaming.
+    classify_blobs();
+    std::vector<size_t> data_indices = way_blobs_;
+    data_indices.insert(data_indices.end(), relation_blobs_.begin(), relation_blobs_.end());
     if (data_indices.empty()) return;
 
     unsigned max_io;
@@ -964,6 +979,7 @@ void PbfFile::read_ways_streaming(const WayCallback& callback) {
     std::atomic<size_t> next_idx{0};
     std::atomic<size_t> blocks_done{0};
     std::atomic<bool> open_failed{false};
+    std::atomic<size_t> misplaced{0};
     std::vector<std::thread> threads;
 
     struct ThreadStats { double read_us = 0, decode_us = 0; size_t count = 0; };
@@ -985,7 +1001,8 @@ void PbfFile::read_ways_streaming(const WayCallback& callback) {
                 auto t1 = std::chrono::steady_clock::now();
                 io_sem.release();
 
-                decode_ways_streaming(decomp.data(), decomp.size(), callback);
+                size_t foreign = decode_ways_streaming(decomp.data(), decomp.size(), callback);
+                if (foreign && j < way_blobs_.size()) misplaced.fetch_add(foreign);
                 auto t2 = std::chrono::steady_clock::now();
                 st.read_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
                 st.decode_us += std::chrono::duration<double, std::micro>(t2 - t1).count();
@@ -999,6 +1016,8 @@ void PbfFile::read_ways_streaming(const WayCallback& callback) {
     }
     for (auto& t : threads) t.join();
     if (open_failed.load()) throw std::runtime_error("cannot open " + filename_ + " in worker thread");
+    if (misplaced.load())
+        throw std::runtime_error(filename_ + ": node groups in way blobs, PBF not sorted by type");
 
     double total_read = 0, total_decode = 0; size_t total_blocks = 0;
     for (auto& s : stats) { total_read += s.read_us; total_decode += s.decode_us; total_blocks += s.count; }

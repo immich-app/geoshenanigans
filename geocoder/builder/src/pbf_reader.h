@@ -105,20 +105,22 @@ void decode_pbf_blob_into(const char* blob_data, size_t blob_size, PbfBlock& blo
 // Streaming node decode — calls callback directly for each node during decode.
 // Avoids creating PbfNode objects entirely. String table is passed for tag lookup.
 // Callback: (id, lat, lng, tag_keys_ptr, tag_vals_ptr, ntags, string_table)
+// Returns the number of way groups it skipped.
 using NodeCallback = std::function<void(int64_t id, double lat, double lng,
     const uint32_t* tag_keys, const uint32_t* tag_vals, size_t ntags,
     const std::vector<std::string>& string_table)>;
 
-void decode_nodes_streaming(const char* data, size_t size, const NodeCallback& callback);
+size_t decode_nodes_streaming(const char* data, size_t size, const NodeCallback& callback);
 
 // Streaming way decode — calls callback directly for each way during decode.
 // Avoids creating PbfWay objects. Node refs passed as pointer+count.
+// Returns the number of node groups it skipped.
 using WayCallback = std::function<void(int64_t id,
     const int64_t* refs, size_t nrefs,
     const uint32_t* tag_keys, const uint32_t* tag_vals, size_t ntags,
     const std::vector<std::string>& string_table)>;
 
-void decode_ways_streaming(const char* data, size_t size, const WayCallback& callback);
+size_t decode_ways_streaming(const char* data, size_t size, const WayCallback& callback);
 
 // Read and decompress a single blob from file.
 // Returns the decompressed PrimitiveBlock data.
@@ -151,7 +153,9 @@ public:
     // Convenience: read only relations, only nodes, only ways
     unsigned thread_count() const { return num_threads_; }
 
-    // Streaming readers — process entities directly during decode.
+    // Streaming readers — process entities directly during decode. Each
+    // reads only its own blob class plus the relation blobs, and throws if a
+    // blob of its class holds the other kind (a file not sorted by type).
     void read_nodes_streaming(const NodeCallback& callback);
     void read_ways_streaming(const WayCallback& callback);
 
