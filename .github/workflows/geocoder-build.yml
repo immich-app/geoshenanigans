@@ -619,9 +619,15 @@ jobs:
             df -h "$WORKDIR"
           fi
 
+          # Compress the new index alongside the diffs, whose long tail
+          # (planet/full) leaves most cores idle. It keeps the .bin files the
+          # diffs and verifies read; the compress step removes them.
+          nice -n 10 python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output" \
+            > "$WORKDIR/compress.log" 2>&1 < /dev/null &
+          COMPRESS_PID=$!
+
           # Patch generation runs against uncompressed .bin files (old was
-          # decompressed just above, new was just built). Compression
-          # happens in the next step, before the finalize upload.
+          # decompressed just above, new was just built).
           echo "Generating patches ($OLD_DATE → $NEW_DATE)..."
           START=$(date +%s)
 
@@ -642,6 +648,13 @@ jobs:
             "$WORKDIR/old-output" "$WORKDIR/output" "$RESULTS_DIR" "$WORKDIR/diff-logs" \
             || echo "::error::generate_patches.sh exited $?"
           echo "Patch generation + verification completed in $(($(date +%s) - START))s"
+          if wait $COMPRESS_PID; then
+            touch "$WORKDIR/compress.done"
+            echo "Compression finished $(($(date +%s) - START))s after patch generation started"
+          else
+            echo "::warning::Background compression failed; the compress step retries"
+          fi
+          tail -1 "$WORKDIR/compress.log"
 
           # Collect results
           PASS=0; FAIL=0; SKIP=0
@@ -704,9 +717,15 @@ jobs:
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
         run: |
-          COMPRESS_START=$(date +%s)
-          python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output"
-          echo "Compression done in $(($(date +%s) - COMPRESS_START))s"
+          # Patch generation compresses alongside its diffs; a fresh build
+          # (or a failed background run) compresses here.
+          if [ -f "$WORKDIR/compress.done" ]; then
+            echo "Compressed during patch generation"
+          else
+            COMPRESS_START=$(date +%s)
+            python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output"
+            echo "Compression done in $(($(date +%s) - COMPRESS_START))s"
+          fi
           find "$WORKDIR/output" -name "*.bin" -delete
           ZST_COUNT=$(find "$WORKDIR/output" -name "*.bin.zst" | wc -l)
           echo "$ZST_COUNT .bin.zst files produced"
