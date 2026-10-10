@@ -100,16 +100,18 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         return result;
     };
 
-    // Filter admin IDs from hash map (admin still has no precomputed masks)
-    auto filter_cells_map = [&](const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map,
-                                bool mask_interior = false) {
-        std::unordered_set<uint32_t> ids;
+    // Admin ids of the continent's cells (admin has no precomputed masks),
+    // ascending.
+    auto filter_admin_cells = [&](const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map) {
+        std::vector<char> used(full.admin_polygons.size(), 0);
         for (const auto& [cell_id, cell_ids] : cell_map) {
             if (cell_in_continent(cell_id, bbox, polygon)) {
-                for (uint32_t id : cell_ids)
-                    ids.insert(mask_interior ? (id & ID_MASK) : id);
+                for (uint32_t id : cell_ids) used.at(id & ID_MASK) = 1;
             }
         }
+        std::vector<uint32_t> ids;
+        for (uint32_t id = 0; id < used.size(); id++)
+            if (used[id]) ids.push_back(id);
         return ids;
     };
 
@@ -124,7 +126,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     auto f_interps = std::async(std::launch::async, [&]{ return filter_sorted_masked(full.sorted_interp_cells, interp_masks, max_interp_id); });
     auto f_pois    = std::async(std::launch::async, [&]{ return filter_sorted_masked(full.sorted_poi_cells,    poi_masks,    max_poi_id); });
     auto f_places  = std::async(std::launch::async, [&]{ return filter_sorted_masked(full.sorted_place_cells,  place_masks,  max_place_id); });
-    auto f_admin   = std::async(std::launch::async, [&]{ return filter_cells_map(full.cell_to_admin, true); });
+    auto f_admin   = std::async(std::launch::async, [&]{ return filter_admin_cells(full.cell_to_admin); });
 
     auto used_way_ids    = f_ways.get();
     auto used_addr_ids   = f_addrs.get();
@@ -134,8 +136,11 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     auto used_admin_ids  = f_admin.get();
     log_phase(("      " + std::string(bbox.name) + " filter: ID collection (masked)").c_str(), _ft, _fc);
 
-    std::unordered_map<uint32_t, uint32_t> way_remap, addr_remap, interp_remap,
-                                            admin_remap, poi_remap, place_remap;
+    // Planet id -> continent id, NO_DATA for records the continent drops.
+    std::vector<uint32_t> way_remap, addr_remap, interp_remap, admin_remap, poi_remap, place_remap;
+    auto remap_id = [](const std::vector<uint32_t>& remap, uint32_t id) {
+        return id < remap.size() ? remap[id] : NO_DATA;
+    };
 
     // Ways — with coordinate-level polygon refinement if provided.
     // Strategy-2: also forward osm_ids (parallel to ways) so the
@@ -148,8 +153,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         ways.reserve(sorted_ids.size());
         osm_ids.reserve(sorted_ids.size());
         nodes.reserve(sorted_ids.size() * 5);
-        std::unordered_map<uint32_t, uint32_t> remap;
-        remap.reserve(sorted_ids.size());
+        std::vector<uint32_t> remap(max_way_id, NO_DATA);
         for (uint32_t old_id : sorted_ids) {
             const auto& w = full.ways[old_id];
             if (polygon && w.node_count > 0) {
@@ -184,8 +188,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         std::vector<NodeCoord> verts;
         std::vector<uint64_t> osm_ids;
         osm_ids.reserve(sorted_ids.size());
-        std::unordered_map<uint32_t, uint32_t> remap;
-        remap.reserve(sorted_ids.size());
+        std::vector<uint32_t> remap(max_addr_id, NO_DATA);
         for (uint32_t old_id : sorted_ids) {
             const auto& a = full.addr_points[old_id];
             if (polygon && !point_in_polygon(a.lat, a.lng, *polygon)) continue;
@@ -215,8 +218,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         std::vector<uint64_t> osm_ids;
         iways.reserve(sorted_ids.size());
         osm_ids.reserve(sorted_ids.size());
-        std::unordered_map<uint32_t, uint32_t> remap;
-        remap.reserve(sorted_ids.size());
+        std::vector<uint32_t> remap(max_interp_id, NO_DATA);
         for (uint32_t old_id : sorted_ids) {
             remap[old_id] = static_cast<uint32_t>(iways.size());
             const auto& iw = full.interp_ways[old_id];
@@ -232,15 +234,13 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
 
     // Admin
     auto f_remap_admins = std::async(std::launch::async, [&]() {
-        std::vector<uint32_t> sorted_ids(used_admin_ids.begin(), used_admin_ids.end());
-        std::sort(sorted_ids.begin(), sorted_ids.end());
+        const auto& sorted_ids = used_admin_ids;
         std::vector<AdminPolygon> polys;
         std::vector<NodeCoord> verts;
         std::vector<uint64_t> osm_ids;
         polys.reserve(sorted_ids.size());
         osm_ids.reserve(sorted_ids.size());
-        std::unordered_map<uint32_t, uint32_t> remap;
-        remap.reserve(sorted_ids.size());
+        std::vector<uint32_t> remap(full.admin_polygons.size(), NO_DATA);
         for (uint32_t old_id : sorted_ids) {
             remap[old_id] = static_cast<uint32_t>(polys.size());
             const auto& ap = full.admin_polygons[old_id];
@@ -262,8 +262,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         std::vector<uint64_t> osm_ids;
         pois.reserve(sorted_ids.size());
         osm_ids.reserve(sorted_ids.size());
-        std::unordered_map<uint32_t, uint32_t> remap;
-        remap.reserve(sorted_ids.size());
+        std::vector<uint32_t> remap(max_poi_id, NO_DATA);
         for (uint32_t old_id : sorted_ids) {
             const auto& p = full.poi_records[old_id];
             if (polygon && !point_in_polygon(p.lat, p.lng, *polygon)) continue;
@@ -290,8 +289,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         std::vector<uint64_t> osm_ids;
         places.reserve(sorted_ids.size());
         osm_ids.reserve(sorted_ids.size());
-        std::unordered_map<uint32_t, uint32_t> remap;
-        remap.reserve(sorted_ids.size());
+        std::vector<uint32_t> remap(max_place_id, NO_DATA);
         for (uint32_t old_id : sorted_ids) {
             const auto& pn = full.place_nodes[old_id];
             if (polygon && !point_in_polygon(pn.lat, pn.lng, *polygon)) continue;
@@ -314,24 +312,24 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     // way_parent_ids: parallel to full.ways, values are old admin_poly_ids
     if (!full.way_parent_ids.empty()) {
         out.way_parent_ids.assign(out.ways.size(), NO_DATA);
-        for (const auto& [old_wid, new_wid] : way_remap) {
-            if (old_wid >= full.way_parent_ids.size()) continue;
+        for (uint32_t old_wid : used_way_ids) {
+            uint32_t new_wid = way_remap[old_wid];
+            if (new_wid == NO_DATA || old_wid >= full.way_parent_ids.size()) continue;
             uint32_t old_parent = full.way_parent_ids[old_wid];
             if (old_parent == NO_DATA) continue;
-            auto it = admin_remap.find(old_parent);
-            out.way_parent_ids[new_wid] = (it != admin_remap.end()) ? it->second : NO_DATA;
+            out.way_parent_ids[new_wid] = remap_id(admin_remap, old_parent);
         }
     }
 
     // admin_parent_ids: parallel to full.admin_polygons, values are old admin_poly_ids
     if (!full.admin_parent_ids.empty()) {
         out.admin_parent_ids.assign(out.admin_polygons.size(), NO_DATA);
-        for (const auto& [old_pid, new_pid] : admin_remap) {
+        for (uint32_t old_pid : used_admin_ids) {
+            uint32_t new_pid = admin_remap[old_pid];
             if (old_pid >= full.admin_parent_ids.size()) continue;
             uint32_t old_parent = full.admin_parent_ids[old_pid];
             if (old_parent == NO_DATA) continue;
-            auto it = admin_remap.find(old_parent);
-            out.admin_parent_ids[new_pid] = (it != admin_remap.end()) ? it->second : NO_DATA;
+            out.admin_parent_ids[new_pid] = remap_id(admin_remap, old_parent);
         }
     }
 
@@ -339,11 +337,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     // planet's id space. Project them into this continent's; a target
     // the continent split filtered out becomes NO_DATA (the server
     // treats a missing parent as unknown).
-    auto project = [](uint32_t& id, const std::unordered_map<uint32_t, uint32_t>& remap) {
-        if (id == NO_DATA) return;
-        auto it = remap.find(id);
-        id = (it != remap.end()) ? it->second : NO_DATA;
-    };
+    auto project = [&](uint32_t& id, const std::vector<uint32_t>& remap) { id = remap_id(remap, id); };
     for (auto& pn : out.place_nodes) project(pn.parent_poly_id, admin_remap);
     for (auto& pr : out.poi_records) project(pr.parent_poly_id, admin_remap);
     // Street-won housenumber refinement matches addr points to the
@@ -355,15 +349,17 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     // compaction below.
     if (!full.way_postcode_ids.empty()) {
         out.way_postcode_ids.assign(out.ways.size(), NO_DATA);
-        for (const auto& [old_wid, new_wid] : way_remap) {
-            if (old_wid >= full.way_postcode_ids.size()) continue;
+        for (uint32_t old_wid : used_way_ids) {
+            uint32_t new_wid = way_remap[old_wid];
+            if (new_wid == NO_DATA || old_wid >= full.way_postcode_ids.size()) continue;
             out.way_postcode_ids[new_wid] = full.way_postcode_ids[old_wid];
         }
     }
     if (!full.interp_postcode_ids.empty()) {
         out.interp_postcode_ids.assign(out.interp_ways.size(), NO_DATA);
         bool any_zip = false;
-        for (const auto& [old_iid, new_iid] : interp_remap) {
+        for (uint32_t old_iid : used_interp_ids) {
+            uint32_t new_iid = interp_remap[old_iid];
             if (old_iid >= full.interp_postcode_ids.size()) continue;
             out.interp_postcode_ids[new_iid] = full.interp_postcode_ids[old_iid];
             if (out.interp_postcode_ids[new_iid] != NO_DATA) any_zip = true;
@@ -374,8 +370,9 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     }
     if (!full.addr_postcode_ids.empty()) {
         out.addr_postcode_ids.assign(out.addr_points.size(), NO_DATA);
-        for (const auto& [old_aid, new_aid] : addr_remap) {
-            if (old_aid >= full.addr_postcode_ids.size()) continue;
+        for (uint32_t old_aid : used_addr_ids) {
+            uint32_t new_aid = addr_remap[old_aid];
+            if (new_aid == NO_DATA || old_aid >= full.addr_postcode_ids.size()) continue;
             out.addr_postcode_ids[new_aid] = full.addr_postcode_ids[old_aid];
         }
     }
@@ -402,7 +399,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     // --- Remap sorted cell arrays for all 5 types (preserving INTERIOR_FLAG) ---
     auto remap_sorted_masked = [&](const std::vector<CellItemPair>& sorted,
                                     const std::vector<uint8_t>& masks,
-                                    const std::unordered_map<uint32_t, uint32_t>& remap,
+                                    const std::vector<uint32_t>& remap,
                                     std::vector<CellItemPair>& dst) {
         if (sorted.empty()) return;
         const unsigned threads = pair_pass_threads();
@@ -413,9 +410,9 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
                 if (masks[i] & continent_bit) {
                     uint32_t raw   = sorted[i].item_id & ID_MASK;
                     uint32_t flags = sorted[i].item_id & INTERIOR_FLAG;
-                    auto it = remap.find(raw);
-                    if (it != remap.end())
-                        local.push_back({sorted[i].cell_id, it->second | flags});
+                    uint32_t id = remap_id(remap, raw);
+                    if (id != NO_DATA)
+                        local.push_back({sorted[i].cell_id, id | flags});
                 }
             }
         }, threads);
@@ -426,7 +423,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     };
 
     auto remap_cells_map = [&](const std::unordered_map<uint64_t, std::vector<uint32_t>>& src,
-                               const std::unordered_map<uint32_t, uint32_t>& remap,
+                               const std::vector<uint32_t>& remap,
                                std::unordered_map<uint64_t, std::vector<uint32_t>>& dst,
                                bool handle_flags = false) {
         for (const auto& [cell_id, ids] : src) {
@@ -435,8 +432,8 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
             for (uint32_t id : ids) {
                 uint32_t raw_id = handle_flags ? (id & ID_MASK) : id;
                 uint32_t flags = handle_flags ? (id & INTERIOR_FLAG) : 0;
-                auto it = remap.find(raw_id);
-                if (it != remap.end()) new_ids.push_back(it->second | flags);
+                uint32_t new_id = remap_id(remap, raw_id);
+                if (new_id != NO_DATA) new_ids.push_back(new_id | flags);
             }
             if (!new_ids.empty()) dst[cell_id] = std::move(new_ids);
         }
