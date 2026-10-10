@@ -169,6 +169,20 @@ cargo build --release --manifest-path server/Cargo.toml
 ./server/target/release/query-server output-dir --domain geocoder.example.com
 ```
 
+### Planet builds
+
+A full planet build (`--continents --multi-output --multi-quality`, the
+nightly's configuration) takes about 7 minutes on 64 cores and fits in
+128 GB of RAM: the write phase sizes how much it runs at once to the memory
+limit, the smaller of MemTotal and the process's cgroup limit. Set
+`GC_MEMORY_LIMIT_MIB` to cap it further when other work shares the host.
+Disk: the planet PBF (~95 GB) plus the output (~120 GB), and the previous
+day's output for `--prev-output`.
+
+`pbf-apply in.osm.pbf change.osc.gz... -o out.osm.pbf` applies replication
+diffs with the same result as `osmium apply-changes`, in a few minutes on a
+planet.
+
 ## Memory Footprint
 
 The server is designed to run inside memory-constrained deployments

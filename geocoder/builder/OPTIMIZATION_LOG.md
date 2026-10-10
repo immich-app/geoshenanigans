@@ -1,6 +1,45 @@
 # Build Optimization Log
 
-## Final Result: 54m → 12m 22s (77% faster)
+## October 2026: 1h 20m → 7m 06s, 188 → 117 GB peak
+
+Build: `--continents --multi-output --multi-quality` with TIGER, wikidata
+sitelinks and external postcodes, chained on the previous day
+(`--prev-output`, so strategy-2 runs). Machine: 64-core / 251 GB box, run on
+62 cores. Every change was gated on byte-identical output: oceania at 64 and
+8 reported CPUs, then a full planet day compared file by file with the
+reference build, plus all 126 patches compared byte for byte.
+
+| Phase | Before | After | What changed |
+|---|---|---|---|
+| Pass 1 | 129 s @1 core | 5 s | parallel blob-header scan |
+| Pass 2 (nodes) | 173 s | 71 s | sparse node index, parallel merge and interning |
+| Pass 2b (ways) | 222 s | 35 s | streams only way blobs, parallel merge, packed way geometries |
+| Admin assembly | 465 s | 12 s | ranked candidates, bbox reject, parallel TIGER/GeoNames loading |
+| S2 cell computation | 925 s | 91 s | per-cell linking, parallel interpolation endpoints |
+| Deterministic ordering | 699 s @1 core | 51 s | parallel sorts with a serial fallback when ties reach output |
+| All index writing | 2143 s @2 cores | 114 s | parallel postcode centroids and strategy-2, memory-budgeted stages |
+| **Total** | **1:19:42** | **7:06** | |
+
+Memory: the peak was 188 GiB in Pass 2b (a dense 111 GiB node index plus
+merge copies). Only nodes that a kept way references get coordinates now,
+thread data is freed as it merges, and the write phase schedules its regions
+and stages within the memory limit (min of MemTotal and the cgroup limit,
+capped by `GC_MEMORY_LIMIT_MIB`). Unconstrained peak 117 GB; inside a 128 GiB
+cgroup the planet build finishes in 7:17 at 112 GB with identical output.
+
+Pipeline around the builder (same box):
+- Applying the daily diff: `osmium apply-changes` 52 min → `pbf-apply` about
+  2 min (copies untouched blobs, re-encodes the rest in parallel; object
+  content identical to osmium's).
+- Patch generation, 126 variants: 23 min → 6 min (geocoder-diff memory and
+  parallelism; a diff's memory budget is released when its verify starts).
+- Compression: zstd 18 instead of 19 (+0.3% size, −21% CPU), identical files
+  compressed once (18% of a build), one worker per core sized by file, run
+  alongside patch generation.
+- Upload: cache copy alongside the Tigris upload, checksums on every core,
+  retention deletes batched.
+
+## Earlier result: 54m → 12m 22s (77% faster)
 
 Build: `--multi-output --continents --multi-quality`
 Output: 379 files, 91 GiB (planet + 8 continents × 3 modes × 7 quality levels)
