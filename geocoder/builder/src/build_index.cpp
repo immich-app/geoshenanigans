@@ -4540,62 +4540,12 @@ static int run(int argc, char* argv[]) {
         log_phase("S2 cell computation", _pt, _cpu);
         std::cerr << "Deduplicating + sorting for write..." << std::endl;
         {
-            // Convert addr hash map to sorted pairs.
-            // Sort cell IDs only (30M unique), then build pairs in sorted order.
-            // Much faster than sorting all 160M pairs.
-            auto f2 = std::async(std::launch::async, [&] {
-                auto _dt = std::chrono::steady_clock::now();
-                auto _dc = CpuTicks::now();
-
-                // Step 1: Extract cell IDs from hash map
-                std::vector<uint64_t> sorted_cells;
-                sorted_cells.reserve(data.cell_to_addrs.size());
-                for (auto& [cell_id, ids] : data.cell_to_addrs)
-                    sorted_cells.push_back(cell_id);
-                log_phase("    Dedup: extract cell IDs", _dt, _dc);
-
-                // Step 2: Sort cell IDs
-                std::sort(sorted_cells.begin(), sorted_cells.end());
-                log_phase("    Dedup: sort cell IDs", _dt, _dc);
-
-                // Step 3: Parallel dedup within each cell
-                {
-                    unsigned nthreads = std::thread::hardware_concurrency();
-                    size_t chunk = (sorted_cells.size() + nthreads - 1) / nthreads;
-                    std::vector<std::thread> threads;
-                    for (unsigned t = 0; t < nthreads; t++) {
-                        size_t start = t * chunk;
-                        size_t end = std::min(start + chunk, sorted_cells.size());
-                        if (start >= sorted_cells.size()) break;
-                        threads.emplace_back([&, start, end]() {
-                            for (size_t i = start; i < end; i++) {
-                                auto& ids = data.cell_to_addrs[sorted_cells[i]];
-                                std::sort(ids.begin(), ids.end());
-                                ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
-                            }
-                        });
-                    }
-                    for (auto& t : threads) t.join();
-                }
-                log_phase("    Dedup: per-cell sort+dedup", _dt, _dc);
-
-                // Step 4: Count total pairs
-                size_t total_pairs = 0;
-                for (auto& [_, ids] : data.cell_to_addrs) total_pairs += ids.size();
-                log_phase("    Dedup: count pairs", _dt, _dc);
-
-                // Step 5: Build sorted pairs
-                std::vector<CellItemPair> pairs;
-                pairs.reserve(total_pairs);
-                for (uint64_t cell_id : sorted_cells) {
-                    auto& ids = data.cell_to_addrs[cell_id];
-                    for (auto id : ids) pairs.push_back({cell_id, id});
-                }
-                data.sorted_addr_cells = std::move(pairs);
-                log_phase("    Dedup: build sorted pairs", _dt, _dc);
-            });
-            auto f4 = std::async(std::launch::async, [&]{ deduplicate(data.cell_to_admin); });
-            f2.get(); f4.get();
+            auto _dt = std::chrono::steady_clock::now();
+            auto _dc = CpuTicks::now();
+            data.sorted_addr_cells = sorted_cell_pairs(data.cell_to_addrs);
+            log_phase("    Dedup: addr cell pairs", _dt, _dc);
+            deduplicate(data.cell_to_admin);
+            log_phase("    Dedup: admin cells", _dt, _dc);
         }
 
         // Save cache if requested

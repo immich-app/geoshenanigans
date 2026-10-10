@@ -5,7 +5,9 @@
 
 #include <cstring>
 #include <limits>
+#include <map>
 #include <random>
+#include <set>
 #include <string>
 #include <utility>
 
@@ -435,4 +437,38 @@ TEST(partition_strings_handles_an_empty_pool) {
     ParsedData d;
     partition_strings_into_tiers(d);
     CHECK_EQ(d.strings_tier_bases[STR_TIER_COUNT], 0u);
+}
+
+// --- Cell maps ---
+
+TEST(sorted_cell_pairs_dedups_each_cell_and_orders_by_cell_then_item) {
+    using CellMap = std::unordered_map<uint64_t, std::vector<uint32_t>>;
+    auto new_map = [] {
+        Rng r(21);
+        CellMap m;
+        for (uint32_t c = 0; c < 50000; c++) {
+            auto& ids = m[r.g()];
+            for (uint32_t k = r.below(8); k > 0; k--) ids.push_back(r.below(6));
+        }
+        return m;
+    };
+    std::map<uint64_t, std::set<uint32_t>> want;
+    for (const auto& [cell, ids] : new_map()) want[cell].insert(ids.begin(), ids.end());
+    std::vector<std::pair<uint64_t, uint32_t>> want_pairs;
+    for (const auto& [cell, ids] : want)
+        for (uint32_t id : ids) want_pairs.push_back({cell, id});
+
+    for (unsigned threads : kThreadCounts) {
+        CellMap m = new_map();
+        auto pairs = sorted_cell_pairs(m, threads);
+        REQUIRE(pairs.size() == want_pairs.size());
+        bool same = true;
+        for (size_t i = 0; i < pairs.size(); i++)
+            same = same && pairs[i].cell_id == want_pairs[i].first && pairs[i].item_id == want_pairs[i].second;
+        CHECK(same);
+        bool deduped = true;
+        for (const auto& [cell, ids] : m)
+            deduped = deduped && ids == std::vector<uint32_t>(want[cell].begin(), want[cell].end());
+        CHECK(deduped);
+    }
 }

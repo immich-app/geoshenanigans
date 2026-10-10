@@ -617,10 +617,47 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
 
 // --- Deduplicate IDs per cell ---
 
+// Every cell of a cell map with its id list, in the map's iteration order.
 template<typename Map>
-inline void deduplicate(Map& cell_map) {
-    for (auto& [cell_id, ids] : cell_map) {
-        std::sort(ids.begin(), ids.end());
-        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
-    }
+inline std::vector<std::pair<uint64_t, std::vector<uint32_t>*>> cell_lists(Map& cell_map) {
+    std::vector<std::pair<uint64_t, std::vector<uint32_t>*>> cells;
+    cells.reserve(cell_map.size());
+    for (auto& [cell_id, ids] : cell_map) cells.push_back({cell_id, &ids});
+    return cells;
+}
+
+// Sorts and dedups each cell's ids, on every core.
+inline void deduplicate_lists(const std::vector<std::pair<uint64_t, std::vector<uint32_t>*>>& cells,
+                              unsigned threads = 0) {
+    parallel_for(cells.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t c = b; c < e; c++) {
+            auto& ids = *cells[c].second;
+            std::sort(ids.begin(), ids.end());
+            ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        }
+    }, threads);
+}
+
+template<typename Map>
+inline void deduplicate(Map& cell_map, unsigned threads = 0) {
+    deduplicate_lists(cell_lists(cell_map), threads);
+}
+
+// Dedups a cell map in place and flattens it into (cell_id, item_id) pairs
+// ordered by cell, then item.
+template<typename Map>
+inline std::vector<CellItemPair> sorted_cell_pairs(Map& cell_map, unsigned threads = 0) {
+    auto cells = cell_lists(cell_map);
+    deduplicate_lists(cells, threads);
+    // Map keys are unique, so the cell order is too.
+    parallel_sort(cells.begin(), cells.end(), [](const auto& a, const auto& b) { return a.first < b.first; }, threads);
+    auto at = parallel_offsets<size_t>(cells.size(), [&](size_t c) { return cells[c].second->size(); }, threads);
+    std::vector<CellItemPair> pairs(at.back());
+    parallel_for(cells.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t c = b; c < e; c++) {
+            size_t i = at[c];
+            for (uint32_t id : *cells[c].second) pairs[i++] = {cells[c].first, id};
+        }
+    }, threads);
+    return pairs;
 }

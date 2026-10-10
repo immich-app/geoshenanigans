@@ -535,11 +535,9 @@ inline void reorder_admin_polygons(ParsedData& data, unsigned threads = 0) {
         if (pid != NO_DATA && pid < n) pid = old_to_new[pid];
     });
     // Remap admin cell entries
-    std::vector<std::vector<uint32_t>*> cells;
-    cells.reserve(data.cell_to_admin.size());
-    for (auto& [cell_id, ids] : data.cell_to_admin) cells.push_back(&ids);
+    const auto cells = cell_lists(data.cell_to_admin);
     remap_each(cells.size(), [&](size_t c) {
-        auto& ids = *cells[c];
+        auto& ids = *cells[c].second;
         for (auto& id : ids) {
             uint32_t flags = id & INTERIOR_FLAG;
             uint32_t masked = id & ID_MASK;
