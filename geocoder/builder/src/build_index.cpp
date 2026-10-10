@@ -8,6 +8,7 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <numeric>
 #include <optional>
@@ -2088,9 +2089,26 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
         auto continent_polys = get_continent_polygons();
         std::cerr << "  Loaded " << continent_polys.size() << " continent boundary polygons" << std::endl;
 
+        // A point outside a polygon's bounding box, widened far past the ring
+        // test's rounding error, is outside the polygon: no ring test there.
+        struct Box { double min_lat, max_lat, min_lng, max_lng; };
+        std::vector<Box> boxes;
+        for (const auto& cp : continent_polys) {
+            constexpr double kMargin = 1e-9;
+            Box box{std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity(),
+                    std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity()};
+            for (const auto& [vlat, vlng] : cp.vertices) {
+                box.min_lat = std::min(box.min_lat, vlat - kMargin);
+                box.max_lat = std::max(box.max_lat, vlat + kMargin);
+                box.min_lng = std::min(box.min_lng, vlng - kMargin);
+                box.max_lng = std::max(box.max_lng, vlng + kMargin);
+            }
+            boxes.push_back(box);
+        }
+
         // For each sorted pair array, build a parallel array of continent bitmasks.
         // Since pairs are sorted by cell_id, consecutive entries share the same mask.
-        auto precompute_masks = [&continent_polys](const std::vector<CellItemPair>& sorted) -> std::vector<uint8_t> {
+        auto precompute_masks = [&continent_polys, &boxes](const std::vector<CellItemPair>& sorted) -> std::vector<uint8_t> {
             if (sorted.empty()) return {};
             std::vector<uint8_t> masks(sorted.size(), 0);
             parallel_for_runs(sorted.size(), same_cell(sorted), [&](size_t begin, size_t end, unsigned) {
@@ -2103,6 +2121,8 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                     uint8_t mask = 0;
                     // Test against continent polygons (not bboxes)
                     for (size_t ci = 0; ci < continent_polys.size() && ci < 8; ci++) {
+                        const Box& box = boxes[ci];
+                        if (lat < box.min_lat || lat > box.max_lat || lng < box.min_lng || lng > box.max_lng) continue;
                         if (point_in_polygon(lat, lng, continent_polys[ci].vertices))
                             mask |= (1u << ci);
                     }
