@@ -155,6 +155,26 @@ TEST(string_pool_append_new_pools_like_interning_each) {
     }
 }
 
+TEST(string_pool_intern_all_pools_like_interning_each_in_order) {
+    std::vector<std::string> strs = {"", "Elm St", std::string("a\0b", 3), "caf\xc3\xa9", "already pooled", "Elm St"};
+    for (int i = 0; i < 20000; i++) strs.push_back("street " + std::to_string(i * 7919 % 4001));
+    std::vector<std::string_view> views(strs.begin(), strs.end());
+    for (unsigned threads : {1u, 3u, 8u}) {
+        StringPool direct, bulk;
+        for (StringPool* p : {&direct, &bulk}) {
+            p->intern("already pooled");
+            p->intern("street 17");
+        }
+        std::vector<uint32_t> want;
+        for (const auto& s : strs) want.push_back(direct.intern(s));
+        CHECK(bulk.intern_all(views, threads) == want);
+        CHECK(bulk.data() == direct.data());
+        CHECK_EQ(bulk.intern("next"), direct.intern("next"));
+    }
+    StringPool empty;
+    CHECK(empty.intern_all({}).empty());
+}
+
 TEST(string_pool_mutable_data_is_same_buffer) {
     StringPool p;
     p.intern("zzz");

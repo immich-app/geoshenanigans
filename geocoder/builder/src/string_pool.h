@@ -77,6 +77,52 @@ public:
         return offsets;
     }
 
+    // The ids interning strs one by one, in order, would give, leaving the
+    // pool as that would, on every core: pooled strings are looked up, and
+    // the others appended (append_new) each once, in the order of their first
+    // use. strs must not point into the pool.
+    std::vector<uint32_t> intern_all(const std::vector<std::string_view>& strs, unsigned threads = 0) {
+        if (strs.size() > UINT32_MAX) throw std::length_error("StringPool::intern_all: too many strings");
+        std::vector<uint32_t> ids(strs.size());
+        parallel_for(strs.size(), [&](size_t b, size_t e, unsigned) {
+            std::string buf;
+            for (size_t i = b; i < e; i++) {
+                buf.assign(strs[i]);
+                ids[i] = find(buf);
+            }
+        }, threads);
+
+        // The uses of new strings, by string and then by use.
+        std::vector<uint32_t> uses =
+            parallel_filter(strs.size(), [&](size_t i) { return ids[i] == kAbsent; }, threads);
+        parallel_sort(uses.begin(), uses.end(), [&](uint32_t a, uint32_t b) {
+            if (int c = strs[a].compare(strs[b])) return c < 0;
+            return a < b;
+        }, threads);
+        std::vector<uint32_t> firsts = parallel_filter(uses.size(), [&](size_t u) {
+            return u == 0 || strs[uses[u - 1]] != strs[uses[u]];
+        }, threads);
+        std::vector<uint32_t> by_first_use = firsts;
+        parallel_sort(by_first_use.begin(), by_first_use.end(),
+                      [&](uint32_t a, uint32_t b) { return uses[a] < uses[b]; }, threads);
+        std::vector<std::string_view> fresh(by_first_use.size());
+        parallel_for(fresh.size(), [&](size_t b, size_t e, unsigned) {
+            for (size_t k = b; k < e; k++) fresh[k] = strs[uses[by_first_use[k]]];
+        }, threads);
+        const std::vector<uint32_t> offsets = append_new(fresh, threads);
+        parallel_for(fresh.size(), [&](size_t b, size_t e, unsigned) {
+            for (size_t k = b; k < e; k++) ids[uses[by_first_use[k]]] = offsets[k];
+        }, threads);
+        parallel_for(firsts.size(), [&](size_t b, size_t e, unsigned) {
+            for (size_t r = b; r < e; r++) {
+                const uint32_t id = ids[uses[firsts[r]]];
+                const size_t end = r + 1 < firsts.size() ? firsts[r + 1] : uses.size();
+                for (size_t u = firsts[r] + 1; u < end; u++) ids[uses[u]] = id;
+            }
+        }, threads);
+        return ids;
+    }
+
     // Ends interning and hands back the lookup table (GiBs on planet), for
     // the caller to free, off the critical path if it likes.
     Index release_index() {

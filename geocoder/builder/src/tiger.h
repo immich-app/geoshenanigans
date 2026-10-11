@@ -207,53 +207,20 @@ inline TigerCsv parse_tiger_csv(std::string_view text) {
 
 // Interns the files' strings and adds their postcode midpoints to
 // postcode_accum as loading file after file would; string_ids[f][k] is the
-// pool id of csvs[f].strings[k]. Strings the pool holds already are looked
-// up on every core: only the others go into the pool, each once, in the
-// order of their first use, where interning them use by use puts them, and
-// on every core too.
+// pool id of csvs[f].strings[k].
 inline std::vector<std::vector<uint32_t>> intern_tiger_csvs(ParsedData& data, const std::vector<TigerCsv>& csvs,
                                                             unsigned threads = 0) {
+    // Every file's strings, file after file, as a load meets them.
+    const std::vector<size_t> at =
+        parallel_offsets<size_t>(csvs.size(), [&](size_t f) { return csvs[f].strings.size(); }, threads);
+    std::vector<std::string_view> strs(at.back());
+    parallel_for_each(csvs.size(), [&](size_t f, unsigned) {
+        for (size_t k = 0; k < csvs[f].strings.size(); k++) strs[at[f] + k] = csvs[f].strings[k];
+    }, threads);
+    const std::vector<uint32_t> pooled = data.string_pool.intern_all(strs, threads);
     std::vector<std::vector<uint32_t>> ids(csvs.size());
     parallel_for_each(csvs.size(), [&](size_t f, unsigned) {
-        ids[f].resize(csvs[f].strings.size());
-        for (size_t k = 0; k < ids[f].size(); k++) ids[f][k] = data.string_pool.find(csvs[f].strings[k]);
-    }, threads);
-
-    // The uses of new strings, by string and then by use.
-    struct Use {
-        const std::string* text;
-        uint32_t file, index;
-    };
-    std::vector<Use> uses = parallel_collect<Use>(csvs.size(), [&](size_t f, std::vector<Use>& out) {
-        for (size_t k = 0; k < ids[f].size(); k++)
-            if (ids[f][k] == StringPool::kAbsent)
-                out.push_back({&csvs[f].strings[k], static_cast<uint32_t>(f), static_cast<uint32_t>(k)});
-    }, threads);
-    auto earlier = [](const Use& a, const Use& b) { return a.file != b.file ? a.file < b.file : a.index < b.index; };
-    parallel_sort(uses.begin(), uses.end(), [&](const Use& a, const Use& b) {
-        if (int c = a.text->compare(*b.text)) return c < 0;
-        return earlier(a, b);
-    }, threads);
-    std::vector<uint32_t> firsts = parallel_filter(uses.size(), [&](size_t u) {
-        return u == 0 || *uses[u - 1].text != *uses[u].text;
-    }, threads);
-    std::vector<uint32_t> by_first_use = firsts;
-    parallel_sort(by_first_use.begin(), by_first_use.end(),
-                  [&](uint32_t a, uint32_t b) { return earlier(uses[a], uses[b]); }, threads);
-    std::vector<std::string_view> fresh(by_first_use.size());
-    parallel_for(fresh.size(), [&](size_t b, size_t e, unsigned) {
-        for (size_t k = b; k < e; k++) fresh[k] = *uses[by_first_use[k]].text;
-    }, threads);
-    const std::vector<uint32_t> offsets = data.string_pool.append_new(fresh, threads);
-    parallel_for(fresh.size(), [&](size_t b, size_t e, unsigned) {
-        for (size_t k = b; k < e; k++) ids[uses[by_first_use[k]].file][uses[by_first_use[k]].index] = offsets[k];
-    }, threads);
-    parallel_for(firsts.size(), [&](size_t b, size_t e, unsigned) {
-        for (size_t r = b; r < e; r++) {
-            const uint32_t id = ids[uses[firsts[r]].file][uses[firsts[r]].index];
-            const size_t end = r + 1 < firsts.size() ? firsts[r + 1] : uses.size();
-            for (size_t u = firsts[r] + 1; u < end; u++) ids[uses[u].file][uses[u].index] = id;
-        }
+        ids[f].assign(pooled.begin() + at[f], pooled.begin() + at[f + 1]);
     }, threads);
 
     for (size_t f = 0; f < csvs.size(); f++) {

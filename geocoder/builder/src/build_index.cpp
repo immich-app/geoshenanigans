@@ -318,23 +318,9 @@ static void load_external_postcodes(ParsedData& data, const std::string& path,
     const ExternalPostcodes external = pending.get();
     const auto& rows = external.rows;
 
-    // The postcodes intern as interning them row by row would: those pooled
-    // already are looked up on every core, the others appended in the order
-    // of their first row.
-    std::vector<uint32_t> ids(rows.size());
-    parallel_for(rows.size(), [&](size_t b, size_t e, unsigned) {
-        for (size_t i = b; i < e; i++) ids[i] = data.string_pool.find(rows[i].postcode);
-    });
-    std::vector<std::string_view> fresh;
-    std::vector<uint32_t> fresh_of(rows.size());
-    std::unordered_map<std::string_view, uint32_t> fresh_index;
-    for (size_t i = 0; i < rows.size(); i++) {
-        if (ids[i] != StringPool::kAbsent) continue;
-        auto [it, added] = fresh_index.try_emplace(rows[i].postcode, static_cast<uint32_t>(fresh.size()));
-        if (added) fresh.push_back(rows[i].postcode);
-        fresh_of[i] = it->second;
-    }
-    const std::vector<uint32_t> fresh_ids = data.string_pool.append_new(fresh);
+    std::vector<std::string_view> postcodes(rows.size());
+    for (size_t i = 0; i < rows.size(); i++) postcodes[i] = rows[i].postcode;
+    const std::vector<uint32_t> ids = data.string_pool.intern_all(postcodes);
 
     uint64_t loaded = 0;
     for (size_t i = 0; i < rows.size(); i++) {
@@ -344,8 +330,7 @@ static void load_external_postcodes(ParsedData& data, const std::string& path,
         // provides wins; OSM pairs win at write time, as Nominatim's
         // _update_from_external adds external postcodes only when OSM has
         // none.
-        uint32_t id = ids[i] != StringPool::kAbsent ? ids[i] : fresh_ids[fresh_of[i]];
-        auto [it, added] = data.postcode_accum.try_emplace(postcode_key(rows[i].cc, id));
+        auto [it, added] = data.postcode_accum.try_emplace(postcode_key(rows[i].cc, ids[i]));
         if (added) {
             it->second.add(rows[i].lat, rows[i].lng);
             loaded++;
