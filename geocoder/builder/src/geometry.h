@@ -6,6 +6,7 @@
 #include <cstring>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
@@ -299,9 +300,10 @@ inline bool is_valid_postcode(const char* pc) {
 // Lowercase, strip common Latin accents, collapse whitespace,
 // remove apostrophes/hyphens. Good enough for matching
 // "Place de l'Hôtel de Ville" against "Place de l'Hotel de Ville".
-inline std::string normalise_for_matching(const char* s) {
-    if (!s) return "";
-    std::string out;
+// Writes into `out`, reusing its buffer.
+inline void normalise_for_matching_into(const char* s, std::string& out) {
+    out.clear();
+    if (!s) return;
     out.reserve(std::strlen(s));
     bool last_space = true; // trim leading
     const unsigned char* p = reinterpret_cast<const unsigned char*>(s);
@@ -364,41 +366,60 @@ inline std::string normalise_for_matching(const char* s) {
     }
     // Trim trailing space
     if (!out.empty() && out.back() == ' ') out.pop_back();
+}
+
+inline std::string normalise_for_matching(const char* s) {
+    std::string out;
+    normalise_for_matching_into(s, out);
     return out;
 }
 
-// Check if any normalised word token from string A appears in string B.
+// Whether any normalised word token of A appears among those of B.
 // Matches Nominatim's token_matches_street which uses PostgreSQL's
-// array overlap operator (&&) on tokenised name vectors.
-inline bool tokens_overlap(const char* a, const char* b) {
-    if (!a || !b || !a[0] || !b[0]) return false;
-    std::string na = normalise_for_matching(a);
-    std::string nb = normalise_for_matching(b);
-    if (na.empty() || nb.empty()) return false;
-    // Split A into tokens, check each against B's tokens
-    // For efficiency with typical street names (2-5 words),
-    // collect B's tokens into a set then check A's tokens.
-    std::unordered_set<std::string> b_tokens;
-    {
+// array overlap operator (&&) on tokenised name vectors. One A meets
+// many Bs: A is normalised once, and the buffers are reused.
+class TokenMatcher {
+public:
+    void reset(const char* a) {
+        has_a_ = a && a[0];
+        normalise_for_matching_into(has_a_ ? a : nullptr, na_);
+        split(na_, a_tokens_);
+    }
+
+    bool overlaps(const char* b) {
+        if (!has_a_ || !b || !b[0] || na_.empty()) return false;
+        normalise_for_matching_into(b, nb_);
+        if (nb_.empty()) return false;
+        split(nb_, b_tokens_);
+        // Street names run to a few words: pairwise beats hashing.
+        for (std::string_view ta : a_tokens_)
+            for (std::string_view tb : b_tokens_)
+                if (ta == tb) return true;
+        return false;
+    }
+
+private:
+    // The words of s between spaces, skipping tiny ones (under 2 bytes).
+    static void split(const std::string& s, std::vector<std::string_view>& out) {
+        out.clear();
         size_t pos = 0;
-        while (pos < nb.size()) {
-            size_t next = nb.find(' ', pos);
-            if (next == std::string::npos) next = nb.size();
-            std::string tok = nb.substr(pos, next - pos);
-            if (tok.size() >= 2) b_tokens.insert(std::move(tok)); // skip tiny words
+        while (pos < s.size()) {
+            size_t next = s.find(' ', pos);
+            if (next == std::string::npos) next = s.size();
+            if (next - pos >= 2) out.emplace_back(s.data() + pos, next - pos);
             pos = next + 1;
         }
     }
-    // Check A's tokens
-    size_t pos = 0;
-    while (pos < na.size()) {
-        size_t next = na.find(' ', pos);
-        if (next == std::string::npos) next = na.size();
-        std::string tok = na.substr(pos, next - pos);
-        if (tok.size() >= 2 && b_tokens.count(tok)) return true;
-        pos = next + 1;
-    }
-    return false;
+
+    bool has_a_ = false;
+    std::string na_, nb_;
+    std::vector<std::string_view> a_tokens_, b_tokens_;
+};
+
+inline bool tokens_overlap(const char* a, const char* b) {
+    TokenMatcher matcher;
+    matcher.reset(a);
+    return matcher.overlaps(b);
 }
 
 // Parse leading digits from a house number string

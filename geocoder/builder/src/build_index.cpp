@@ -715,6 +715,7 @@ struct NearbyStreets {
     // Hilbert curve walk.
     struct CellAt { uint64_t ij = ~uint64_t(0), cell = 0; };
     std::array<CellAt, 64> cell_at;
+    TokenMatcher street_tokens;  // a point's addr:street, for the backfill
 };
 
 // Every street's box, for gather_nearby_named_streets: computed once here,
@@ -894,9 +895,10 @@ static void backfill_addr_point_parent_streets(ParsedData& data, const BuildConf
                 }
                 // The streets come nearest first, so the first is the
                 // nearest and the match is the first whose original name
-                // shares a token with addr:street: tokens_overlap runs on
+                // shares a token with addr:street: the token match runs on
                 // no street beyond it.
                 bool first = true;
+                bool tokenised = false;
                 for_each_nearby_named_street(data, nearby, ap.lat, ap.lng,
                     [&](uint32_t way_id, const WayHeader& w, double d2, int64_t cand_osm) {
                         if (first && (d2 < best_d2 ||
@@ -914,7 +916,12 @@ static void backfill_addr_point_parent_streets(ParsedData& data, const BuildConf
                         if ((d2 < 1e18 || (d2 == 1e18 && cand_osm < INT64_MAX))
                             && way_id < data.way_orig_name_ids.size()) {
                             uint32_t orig_id = data.way_orig_name_ids[way_id];
-                            if (orig_id != NO_DATA && tokens_overlap(addr_street_str, pool_data.data() + orig_id)) {
+                            if (orig_id == NO_DATA) return true;
+                            if (!tokenised) {
+                                nearby.street_tokens.reset(addr_street_str);
+                                tokenised = true;
+                            }
+                            if (nearby.street_tokens.overlaps(pool_data.data() + orig_id)) {
                                 best_match_name = w.name_id;
                                 best_match_way = way_id;
                                 return false;
