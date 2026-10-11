@@ -36,12 +36,17 @@ flags+=" -ffile-prefix-map=$work/="
 unpack() {
   local files=https://launchpad.net/ubuntu/+archive/primary/+sourcefiles/$1/$2-$3
   local orig=$1_$2.orig.tar.gz deb=$1_$2-$3.debian.tar.xz
-  curl -sSL --fail --retry 5 --retry-delay 10 --retry-all-errors -o "$orig" "$files/$orig"
-  curl -sSL --fail --retry 5 --retry-delay 10 --retry-all-errors -o "$deb" "$files/$deb"
+  fetch "$orig" "$files/$orig"
+  fetch "$deb" "$files/$deb"
   printf '%s  %s\n%s  %s\n' "$4" "$orig" "$5" "$deb" | sha256sum -c --quiet
   tar xzf "$orig"
   tar xJf "$deb" -C "$1-$2"
   apply_series "$1-$2" "$1-$2/debian/patches"
+}
+
+# fetch <file> <url>: a stalled transfer times out and is retried.
+fetch() {
+  curl -sSL --fail --connect-timeout 30 --max-time 300 --retry 5 --retry-delay 10 --retry-all-errors -o "$1" "$2"
 }
 
 # apply_series <tree> <patch dir>: the patches quilt's series file lists, in
