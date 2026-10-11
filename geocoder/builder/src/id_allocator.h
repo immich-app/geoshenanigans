@@ -211,13 +211,23 @@ public:
                                   [&](size_t begin, size_t end, unsigned) {
                     // By value: the packed key is only 4-byte aligned, so
                     // lower_bound's const& must not bind to it.
+                    auto below = [](const KeyIdx& e, uint64_t key) { return e.key < key; };
                     uint64_t first_key = records[begin].key;
-                    auto p = std::lower_bound(prev.begin(), prev.end(), first_key,
-                                              [](const KeyIdx& e, uint64_t key) { return e.key < key; });
+                    auto p = std::lower_bound(prev.begin(), prev.end(), first_key, below);
                     for (size_t r = begin; r < end && p != prev.end(); r++) {
                         if (r > begin && records[r].key == records[r - 1].key) continue;
-                        while (p != prev.end() && p->key < records[r].key) ++p;
-                        if (p == prev.end() || p->key != records[r].key || claimed[p - prev.begin()]) continue;
+                        // The first previous key not below this one, galloping
+                        // from the last: a pass holds a share of the records,
+                        // so it lies some way on, and a step per key walks
+                        // every previous key once a pass.
+                        const uint64_t key = records[r].key;
+                        if (below(*p, key)) {
+                            const size_t left = static_cast<size_t>(prev.end() - p);
+                            size_t gap = 1;
+                            while (gap < left && below(p[gap], key)) gap *= 2;
+                            p = std::lower_bound(p + gap / 2 + 1, p + std::min(gap + 1, left), key, below);
+                        }
+                        if (p == prev.end() || p->key != key || claimed[p - prev.begin()]) continue;
                         out[records[r].idx] = p->idx;
                         claimed[p - prev.begin()] = 1;
                     }
