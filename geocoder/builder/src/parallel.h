@@ -170,15 +170,18 @@ void parallel_each(std::vector<T>& v, Fn fn, unsigned threads = 0) {
     }, threads);
 }
 
-// Faults in the pages v's next n elements will take, on every core, when
-// they span enough to matter: growing v zero-fills them on one core, which
-// otherwise takes a page fault per page. A store to each page of the spare
-// capacity faults it in (the grow then overwrites it), and unlike
-// MADV_POPULATE_WRITE, which takes the mmap lock, scales with the cores.
-// Capacity must already cover them.
+// Faults in the pages v's next n elements will take, on several threads,
+// when they span enough to matter: growing v zero-fills them on one core,
+// which otherwise takes a page fault per page. A store to each page of the
+// spare capacity faults it in (the grow then overwrites it), and unlike
+// MADV_POPULATE_WRITE, which takes the mmap lock, scales with the threads up
+// to kFaultThreads: past that the faults queue in the kernel, no sooner done
+// for many times the CPU (3.7 GB: 2 CPU-seconds on one thread, 2.5 in 0.3 s
+// on 8, 13 in 0.2 s on 62). Capacity must already cover them.
 template <class T>
 void prefault_for(std::vector<T>& v, size_t n) {
     constexpr size_t kMinBytes = size_t(64) << 20;
+    constexpr unsigned kFaultThreads = 8;
     const size_t bytes = n * sizeof(T);
     if (bytes < kMinBytes) return;
 
@@ -186,7 +189,7 @@ void prefault_for(std::vector<T>& v, size_t n) {
     volatile unsigned char* spare = reinterpret_cast<unsigned char*>(v.data() + v.size());
     parallel_for((bytes + page - 1) / page, [&](size_t b, size_t e, unsigned) {
         for (size_t p = b; p < e; p++) spare[p * page] = 0;
-    });
+    }, std::min(kFaultThreads, parallel_threads()));
 }
 
 // v.resize(n) or v.resize(n, value) with the new pages faulted in on every
