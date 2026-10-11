@@ -105,6 +105,16 @@ void renumber_cell_pairs(std::vector<CellItemPair>& pairs, Renumber renumber, un
         parallel_sort(pairs.begin(), pairs.end(), cell_item_less, threads);
 }
 
+// Whether the arrays a reorder step moves its records into (`bytes` of
+// them) fault in beside its sort of n Keys (the keys, the merge's copy of
+// them and the order): `headroom` holds both. Else each is made after the
+// sort, and the step's peak is its largest copy.
+template <class Key>
+bool beside_sort(size_t n, uint64_t bytes, uint64_t headroom) {
+    const uint64_t sort = n * (2 * sizeof(Key) + sizeof(uint32_t));
+    return headroom >= bytes && headroom - bytes >= sort;
+}
+
 template <class T>
 struct Repacked {
     std::vector<T> items;
@@ -154,8 +164,9 @@ inline std::vector<uint32_t> invert(const std::vector<uint32_t>& order, unsigned
 
 // Sorts addr_points by (street_id, housenumber_id, lat_bits, lng_bits, ...).
 // String offsets are already remapped to the sorted pool, so they order
-// deterministically; raw float bits break the remaining ties.
-inline void reorder_addr_points(ParsedData& data, unsigned threads = 0) {
+// deterministically; raw float bits break the remaining ties. `headroom`:
+// the bytes it may hold at once beyond its input arrays (see beside_sort).
+inline void reorder_addr_points(ParsedData& data, unsigned threads = 0, uint64_t headroom = UINT64_MAX) {
     if (data.sorted_addr_cells.empty()) return;
 
     const size_t n = data.addr_points.size();
@@ -213,20 +224,21 @@ inline void reorder_addr_points(ParsedData& data, unsigned threads = 0) {
         return p.vertex_count > 0 &&
                (p.vertex_offset == NO_DATA || (size_t)p.vertex_offset + p.vertex_count > vertices.size());
     }, threads);
-    // The arrays the sorted points and vertices move into fault in beside
-    // the sort, which leaves their sizes alone.
-    auto has_polygon = [](const AddrPoint& p) { return p.vertex_count > 0 && p.vertex_offset != NO_DATA; };
-    const size_t vertex_total = parallel_sum<size_t>(n, [&](size_t i) {
-        return has_polygon(points[i]) ? size_t(points[i].vertex_count) : 0;
-    }, threads);
-    auto at_buffer = vector_beside<size_t>(n + 1);
-    auto vertex_buffer = vector_beside<NodeCoord>(vertex_total);
-
     // The sort orders keys holding the fields that decide nearly every
     // comparison, rather than indices into the planet's addr_points.
     struct AddrKey {
         uint32_t street_id, housenumber_id, lat_bits, lng_bits, index;
     };
+    // The arrays the sorted points and vertices move into fault in beside
+    // the sort, which leaves their sizes alone, when there is room.
+    auto has_polygon = [](const AddrPoint& p) { return p.vertex_count > 0 && p.vertex_offset != NO_DATA; };
+    const size_t vertex_total = parallel_sum<size_t>(n, [&](size_t i) {
+        return has_polygon(points[i]) ? size_t(points[i].vertex_count) : 0;
+    }, threads);
+    const bool beside = beside_sort<AddrKey>(n, (n + 1) * sizeof(size_t) + vertex_total * sizeof(NodeCoord), headroom);
+    auto at_buffer = vector_beside<size_t>(beside ? n + 1 : 0);
+    auto vertex_buffer = vector_beside<NodeCoord>(beside ? vertex_total : 0);
+
     auto key_of = [&](size_t i) {
         const auto& p = points[i];
         return AddrKey{p.street_id, p.housenumber_id, float_bits(p.lat), float_bits(p.lng), static_cast<uint32_t>(i)};
@@ -257,7 +269,7 @@ inline void reorder_addr_points(ParsedData& data, unsigned threads = 0) {
     }, threads);
     const size_t kept = starts.size();
     const bool have_postcodes = data.addr_postcode_ids.size() == n;
-    auto sorted_buffer = vector_beside<AddrPoint>(kept);
+    auto sorted_buffer = vector_beside<AddrPoint>(beside ? kept : 0);
 
     // Reorder the vertex buffer alongside addr_points. Duplicates keep
     // their copy of the vertices too: the buffer is packed in sorted order
@@ -265,9 +277,13 @@ inline void reorder_addr_points(ParsedData& data, unsigned threads = 0) {
     Repacked<NodeCoord> repacked = repack(n, vertices,
         [&](size_t i) { const auto& p = points[order[i]]; return has_polygon(p) ? size_t(p.vertex_count) : 0; },
         [&](size_t i) { return points[order[i]].vertex_offset; }, threads, at_buffer.get(), vertex_buffer.get());
+    // The arrays these replace unmap beside the steps left, the old
+    // vertices before the sorted points come.
+    free_beside(std::move(data.addr_vertices));
     std::vector<AddrPoint> sorted = sorted_buffer.get();
-    auto osm_buffer = vector_beside<uint64_t>(have_osm ? kept : 0);
-    auto postcode_buffer = vector_beside<uint32_t>(have_postcodes ? kept : 0);
+    parallel_resize(sorted, kept);
+    auto osm_buffer = vector_beside<uint64_t>(have_osm && beside ? kept : 0);
+    auto postcode_buffer = vector_beside<uint32_t>(have_postcodes && beside ? kept : 0);
     parallel_for(kept, [&](size_t b, size_t e, unsigned) {
         for (size_t k = b; k < e; k++) {
             AddrPoint p = points[order[starts[k]]];
@@ -275,9 +291,7 @@ inline void reorder_addr_points(ParsedData& data, unsigned threads = 0) {
             sorted[k] = p;
         }
     }, threads);
-    // The arrays these replace unmap beside the steps left.
-    auto old_vertices_freed = free_beside(std::move(data.addr_vertices));
-    auto old_points_freed = free_beside(std::move(data.addr_points));
+    free_beside(std::move(data.addr_points));
     data.addr_vertices = std::move(repacked.items);
     repacked.at = {};
     data.addr_points = std::move(sorted);
@@ -306,7 +320,8 @@ inline void reorder_addr_points(ParsedData& data, unsigned threads = 0) {
 }
 
 // Sorts ways by (name, node_count, nodes) and reorders their nodes.
-inline void reorder_ways(ParsedData& data, unsigned threads = 0) {
+// `headroom` as for reorder_addr_points.
+inline void reorder_ways(ParsedData& data, unsigned threads = 0, uint64_t headroom = UINT64_MAX) {
     if (data.ways.empty()) return;
 
     const size_t n = data.ways.size();
@@ -343,14 +358,6 @@ inline void reorder_ways(ParsedData& data, unsigned threads = 0) {
                            reinterpret_cast<const char*>(&ways[b]) + kAfterOffset,
                            sizeof(WayHeader) - kAfterOffset) != 0;
     };
-    // The arrays the sorted ways and nodes move into fault in beside the
-    // sort, sized for every way: the dedup drops a handful.
-    auto node_buffer = vector_beside<NodeCoord>(parallel_sum<size_t>(n, [&](size_t i) {
-        return size_t(ways[i].node_count);
-    }, threads));
-    auto way_buffer = vector_beside<WayHeader>(n);
-    auto osm_buffer = vector_beside<int64_t>(have_osm ? n : 0);
-
     // The sort orders keys holding the fields that decide nearly every
     // comparison, rather than indices into the planet's ways and nodes.
     struct WayKey {
@@ -358,6 +365,16 @@ inline void reorder_ways(ParsedData& data, unsigned threads = 0) {
         uint16_t node_count;
         uint32_t lat_bits, lng_bits, index;  // of the first node; 0 for none
     };
+    // The arrays the sorted ways and nodes move into fault in beside the
+    // sort, sized for every way (the dedup drops a handful), when there is
+    // room.
+    const size_t node_total = parallel_sum<size_t>(n, [&](size_t i) { return size_t(ways[i].node_count); }, threads);
+    const bool beside = beside_sort<WayKey>(
+        n, node_total * sizeof(NodeCoord) + n * (sizeof(WayHeader) + (have_osm ? sizeof(int64_t) : 0)), headroom);
+    auto node_buffer = vector_beside<NodeCoord>(beside ? node_total : 0);
+    auto way_buffer = vector_beside<WayHeader>(beside ? n : 0);
+    auto osm_buffer = vector_beside<int64_t>(have_osm && beside ? n : 0);
+
     auto key_of = [&](size_t i) {
         const auto& w = ways[i];
         WayKey k{w.name_id, w.node_count, 0, 0, static_cast<uint32_t>(i)};
@@ -391,7 +408,7 @@ inline void reorder_ways(ParsedData& data, unsigned threads = 0) {
         [&](size_t k) { return size_t(ways[order[starts[k]]].node_count); },
         [&](size_t k) { return ways[order[starts[k]]].node_offset; }, threads, {}, node_buffer.get());
     std::vector<WayHeader> new_ways = way_buffer.get();
-    new_ways.resize(kept);
+    parallel_resize(new_ways, kept);
     parallel_for(kept, [&](size_t b, size_t e, unsigned) {
         for (size_t k = b; k < e; k++) {
             new_ways[k] = ways[order[starts[k]]];
@@ -406,7 +423,7 @@ inline void reorder_ways(ParsedData& data, unsigned threads = 0) {
     // data.ways[k].
     if (have_osm) {
         std::vector<int64_t> osm = osm_buffer.get();
-        osm.resize(kept);
+        parallel_resize(osm, kept);
         data.way_osm_ids = first_set_per_run(data.way_osm_ids, order, starts, int64_t(0), threads, std::move(osm));
     }
     // Remap way_parent_ids + way_postcode_ids: reorder + dedup. Each kept
@@ -439,8 +456,8 @@ inline void reorder_ways(ParsedData& data, unsigned threads = 0) {
     order = {};
     starts = {};
     // The arrays these replace unmap beside the steps left.
-    auto old_ways_freed = free_beside(std::move(data.ways));
-    auto old_nodes_freed = free_beside(std::move(data.street_nodes));
+    free_beside(std::move(data.ways));
+    free_beside(std::move(data.street_nodes));
     data.ways = std::move(new_ways);
     data.street_nodes = std::move(repacked.items);
     renumber_cell_pairs(data.sorted_way_cells, [&](uint32_t id) { return old_to_new[id]; }, threads);
@@ -681,7 +698,8 @@ inline void reorder_admin_polygons(ParsedData& data, unsigned threads = 0) {
 // their vertices and computes their importance.
 inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
                          std::vector<uint32_t>& poi_qids,
-                         const std::vector<QidSitelinks>& sitelinks_data, unsigned threads = 0) {
+                         const std::vector<QidSitelinks>& sitelinks_data, unsigned threads = 0,
+                         uint64_t headroom = UINT64_MAX) {
     auto lookup_sitelinks = [&sitelinks_data](uint32_t qid) -> uint16_t {
         auto it = std::lower_bound(sitelinks_data.begin(), sitelinks_data.end(), qid,
             [](const QidSitelinks& entry, uint32_t q) { return entry.qid < q; });
@@ -725,23 +743,27 @@ inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
         if (have_elevations && std::memcmp(&poi_elevations[a], &poi_elevations[b], sizeof(float)) != 0) return true;
         return have_qids && poi_qids[a] != poi_qids[b];
     };
-    // The arrays the sorted POIs move into fault in beside the sort, sized
-    // for every POI: the dedup drops few.
-    auto has_polygon = [](const PoiRecord& p) { return p.vertex_count > 0 && p.vertex_offset != NO_DATA; };
-    auto vertex_buffer = vector_beside<NodeCoord>(parallel_sum<size_t>(n, [&](size_t i) {
-        return has_polygon(pois[i]) ? size_t(pois[i].vertex_count) : 0;
-    }, threads));
-    auto poi_buffer = vector_beside<PoiRecord>(n);
-    auto elevation_buffer = vector_beside<float>(have_elevations ? n : 0);
-    auto qid_buffer = vector_beside<uint32_t>(have_qids ? n : 0);
-    auto osm_buffer = vector_beside<uint64_t>(have_osm ? n : 0);
-
     // The sort orders keys holding the fields that decide nearly every
     // comparison, rather than indices into the planet's poi_records.
     struct PoiKey {
         uint8_t category, tier;
         uint32_t name_id, lat_bits, lng_bits, index;
     };
+    // The arrays the sorted POIs move into fault in beside the sort, sized
+    // for every POI (the dedup drops few), when there is room.
+    auto has_polygon = [](const PoiRecord& p) { return p.vertex_count > 0 && p.vertex_offset != NO_DATA; };
+    const size_t vertex_total = parallel_sum<size_t>(n, [&](size_t i) {
+        return has_polygon(pois[i]) ? size_t(pois[i].vertex_count) : 0;
+    }, threads);
+    const uint64_t per_poi = sizeof(PoiRecord) + (have_elevations ? sizeof(float) : 0) +
+                             (have_qids ? sizeof(uint32_t) : 0) + (have_osm ? sizeof(uint64_t) : 0);
+    const bool beside = beside_sort<PoiKey>(n, vertex_total * sizeof(NodeCoord) + n * per_poi, headroom);
+    auto vertex_buffer = vector_beside<NodeCoord>(beside ? vertex_total : 0);
+    auto poi_buffer = vector_beside<PoiRecord>(beside ? n : 0);
+    auto elevation_buffer = vector_beside<float>(have_elevations && beside ? n : 0);
+    auto qid_buffer = vector_beside<uint32_t>(have_qids && beside ? n : 0);
+    auto osm_buffer = vector_beside<uint64_t>(have_osm && beside ? n : 0);
+
     auto key_of = [&](size_t i) {
         const auto& p = pois[i];
         return PoiKey{p.category, p.tier, p.name_id, float_bits(p.lat), float_bits(p.lng), static_cast<uint32_t>(i)};
@@ -773,12 +795,14 @@ inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
     Repacked<NodeCoord> repacked = repack(kept, vertices,
         [&](size_t k) { const auto& p = pois[order[starts[k]]]; return has_polygon(p) ? size_t(p.vertex_count) : 0; },
         [&](size_t k) { return pois[order[starts[k]]].vertex_offset; }, threads, {}, vertex_buffer.get());
+    // The old vertices go before the sorted records come.
+    free_beside(std::move(data.poi_vertices));
     std::vector<PoiRecord> new_pois = poi_buffer.get();
     std::vector<float> new_poi_elevations = elevation_buffer.get();
     std::vector<uint32_t> new_poi_qids = qid_buffer.get();
-    new_pois.resize(kept);
-    new_poi_elevations.resize(have_elevations ? kept : 0);
-    new_poi_qids.resize(have_qids ? kept : 0);
+    parallel_resize(new_pois, kept);
+    parallel_resize(new_poi_elevations, have_elevations ? kept : 0);
+    parallel_resize(new_poi_qids, have_qids ? kept : 0);
     parallel_for(kept, [&](size_t b, size_t e, unsigned) {
         for (size_t k = b; k < e; k++) {
             uint32_t oi = order[starts[k]];
@@ -792,15 +816,14 @@ inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
     // first non-zero osm id of its duplicates in SORT order.
     if (have_osm) {
         std::vector<uint64_t> osm = osm_buffer.get();
-        osm.resize(kept);
+        parallel_resize(osm, kept);
         data.poi_osm_ids = first_set_per_run(data.poi_osm_ids, order, starts, uint64_t(0), threads, std::move(osm));
     }
     const std::vector<uint32_t> old_to_new = renumber_runs(order, starts, threads);
     order = {};
     starts = {};
     // The arrays these replace unmap beside the steps left.
-    auto old_pois_freed = free_beside(std::move(data.poi_records));
-    auto old_vertices_freed = free_beside(std::move(data.poi_vertices));
+    free_beside(std::move(data.poi_records));
     data.poi_records = std::move(new_pois);
     data.poi_vertices = std::move(repacked.items);
     if (have_elevations) poi_elevations = std::move(new_poi_elevations);

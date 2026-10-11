@@ -267,22 +267,25 @@ void check_steps_match_reference(uint64_t seed, const Shape& s) {
     reorder_ref::reorder_pois(want, want_ele, want_qids, links);
     reorder_ref::reorder_place_nodes(want);
 
-    for (unsigned threads : kThreadCounts) {
-        ParsedData got;
-        std::vector<float> got_ele;
-        std::vector<uint32_t> got_qids;
-        fill_records(got, got_ele, got_qids, seed, s);
-        reorder_addr_points(got, threads);
-        reorder_ways(got, threads);
-        reorder_interps(got, threads);
-        reorder_admin_polygons(got, threads);
-        reorder_pois(got, got_ele, got_qids, links, threads);
-        reorder_place_nodes(got, threads);
+    // No headroom: each step makes its output arrays after its sort instead
+    // of beside it.
+    for (uint64_t headroom : {UINT64_MAX, uint64_t(0)})
+        for (unsigned threads : kThreadCounts) {
+            ParsedData got;
+            std::vector<float> got_ele;
+            std::vector<uint32_t> got_qids;
+            fill_records(got, got_ele, got_qids, seed, s);
+            reorder_addr_points(got, threads, headroom);
+            reorder_ways(got, threads, headroom);
+            reorder_interps(got, threads);
+            reorder_admin_polygons(got, threads);
+            reorder_pois(got, got_ele, got_qids, links, threads, headroom);
+            reorder_place_nodes(got, threads);
 
-        check_same_records(want, got);
-        CHECK(same_bytes(want_ele, got_ele));
-        CHECK(same_bytes(want_qids, got_qids));
-    }
+            check_same_records(want, got);
+            CHECK(same_bytes(want_ele, got_ele));
+            CHECK(same_bytes(want_qids, got_qids));
+        }
 }
 
 // --- String pool partition ---
@@ -378,6 +381,15 @@ void check_partition_matches_reference(uint64_t seed, size_t n_strings, size_t n
 }
 
 }  // namespace
+
+TEST(beside_sort_needs_room_for_the_arrays_and_the_sort) {
+    struct Key { uint32_t a, b; };
+    // 10 keys: 2 * 8 B of keys and merge copy plus a 4 B order entry each.
+    CHECK(beside_sort<Key>(10, 100, 100 + 200));
+    CHECK(!beside_sort<Key>(10, 100, 100 + 199));
+    CHECK(!beside_sort<Key>(10, 100, 50));
+    CHECK(beside_sort<Key>(10, 0, UINT64_MAX));
+}
 
 TEST(reorder_steps_match_the_serial_reference) {
     check_steps_match_reference(1, Shape{});

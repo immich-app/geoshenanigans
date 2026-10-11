@@ -2471,13 +2471,17 @@ static void reorder_deterministically(ParsedData& data, std::vector<float> poi_e
         reorder_interps(data);
         return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     });
-    reorder_addr_points(data);
+    // What each step may hold beyond its inputs: the memory the host allows
+    // past what the build holds as it starts.
+    const uint64_t memory_limit = memory_limit_bytes();
+    auto headroom = [&] { return write_budget(memory_limit, static_cast<uint64_t>(get_rss_mb()) << 20); };
+    reorder_addr_points(data, 0, headroom());
     log_phase("  Sort addr_points", _st, _sc);
-    reorder_ways(data);
+    reorder_ways(data, 0, headroom());
     log_phase("  Sort ways", _st, _sc);
     reorder_admin_polygons(data);
     log_phase("  Sort admin", _st, _sc);
-    reorder_pois(data, poi_elevations, poi_qids, sitelinks_data);
+    reorder_pois(data, poi_elevations, poi_qids, sitelinks_data, 0, headroom());
     log_phase("  Sort POIs", _st, _sc);
     reorder_place_nodes(data);
     log_phase("  Sort place nodes", _st, _sc);
