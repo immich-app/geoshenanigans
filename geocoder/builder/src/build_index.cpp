@@ -4126,6 +4126,18 @@ static int run(int argc, char* argv[]) {
                     };
 
                     std::vector<std::vector<AdminResult>> thread_admin_results(num_threads);
+                    // Relations are handed out largest first: the biggest
+                    // take a second or more, and started last they would
+                    // leave one core working alone.
+                    auto member_coords = [&](const auto& rel) {
+                        size_t n = 0;
+                        for (const auto& [way_id, role] : rel.members)
+                            if (const auto* way = data.way_geometries.find(way_id)) n += way->count;
+                        return n;
+                    };
+                    const std::vector<uint32_t> relations_largest_first = costliest_first(
+                        data.collected_relations.size(),
+                        [&](size_t i) { return member_coords(data.collected_relations[i]); }, num_threads);
                     std::atomic<size_t> rel_idx{0};
                     std::atomic<uint64_t> assembled_count{0};
                     std::atomic<uint64_t> wikidata_linked_count{0};
@@ -4140,8 +4152,9 @@ static int run(int argc, char* argv[]) {
                         admin_workers.emplace_back([&, t]() {
                             auto& local_results = thread_admin_results[t];
                             while (true) {
-                                size_t i = rel_idx.fetch_add(1);
-                                if (i >= data.collected_relations.size()) break;
+                                size_t k = rel_idx.fetch_add(1);
+                                if (k >= data.collected_relations.size()) break;
+                                size_t i = relations_largest_first[k];
 
                                 const auto& rel = data.collected_relations[i];
 
@@ -4325,13 +4338,16 @@ static int run(int argc, char* argv[]) {
                     };
                     std::vector<PreparedPolygon> prepared(total_admin_rings);
                     {
+                        const std::vector<uint32_t> rings_largest_first = costliest_first(total_admin_rings,
+                            [&](size_t i) { return all_admin_results[i].vertices.size(); }, num_threads);
                         std::atomic<size_t> prep_idx{0};
                         std::vector<std::thread> prep_workers;
                         for (unsigned int t = 0; t < num_threads; t++) {
                             prep_workers.emplace_back([&]() {
                                 while (true) {
-                                    size_t i = prep_idx.fetch_add(1);
-                                    if (i >= total_admin_rings) break;
+                                    size_t k = prep_idx.fetch_add(1);
+                                    if (k >= total_admin_rings) break;
+                                    size_t i = rings_largest_first[k];
                                     auto& ar = all_admin_results[i];
                                     auto& pp = prepared[i];
 
@@ -4444,6 +4460,9 @@ static int run(int argc, char* argv[]) {
                         };
 
                         std::vector<std::vector<PoiResult>> thread_poi_results(num_threads);
+                        const std::vector<uint32_t> poi_relations_largest_first = costliest_first(
+                            data.collected_poi_relations.size(),
+                            [&](size_t i) { return member_coords(data.collected_poi_relations[i]); }, num_threads);
                         std::atomic<size_t> poi_rel_idx{0};
                         std::atomic<uint64_t> poi_assembled_count{0};
 
@@ -4452,8 +4471,9 @@ static int run(int argc, char* argv[]) {
                             poi_workers.emplace_back([&, t]() {
                                 auto& local_results = thread_poi_results[t];
                                 while (true) {
-                                    size_t i = poi_rel_idx.fetch_add(1);
-                                    if (i >= data.collected_poi_relations.size()) break;
+                                    size_t k = poi_rel_idx.fetch_add(1);
+                                    if (k >= data.collected_poi_relations.size()) break;
+                                    size_t i = poi_relations_largest_first[k];
 
                                     const auto& rel = data.collected_poi_relations[i];
 
