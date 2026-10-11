@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -723,6 +724,11 @@ struct NearbyStreets {
     std::vector<StreetBox> boxes;  // parallel to ways
     std::vector<uint32_t> seen;
     LazyAscending<StreetKey> order;
+    // Street cell ids by (face, i, j), as met lately: the next few cells of
+    // a cell walk share most of a cell's neighbours, and an id costs a
+    // Hilbert curve walk.
+    struct CellAt { uint64_t ij = ~uint64_t(0), cell = 0; };
+    std::array<CellAt, 64> cell_at;
 };
 
 // Every street's box, for gather_nearby_named_streets: computed once here,
@@ -766,8 +772,11 @@ static void gather_nearby_named_streets(const ParsedData& data, const std::vecto
         cj - reach >= 0 && cj + reach < S2CellId::kMaxSize) {
         for (int a = -2; a <= 2; a++) {
             for (int b = -2; b <= 2; b++) {
-                cells_to_check.push_back(S2CellId::FromFaceIJ(face, ci + a * size, cj + b * size)
-                                             .parent(kStreetCellLevel).id());
+                const int i = ci + a * size, j = cj + b * size;
+                const uint64_t ij = (uint64_t(face) << 60) | (uint64_t(i) << 30) | uint64_t(j);
+                auto& at = nearby.cell_at[(ij * 0x9E3779B97F4A7C15ull) >> 58];
+                if (at.ij != ij) at = {ij, S2CellId::FromFaceIJ(face, i, j).parent(kStreetCellLevel).id()};
+                cells_to_check.push_back(at.cell);
             }
         }
     } else {
