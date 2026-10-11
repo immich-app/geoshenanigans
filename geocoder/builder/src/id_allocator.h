@@ -35,11 +35,16 @@
 // copying.
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <vector>
 #include <stdexcept>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "parallel.h"
 
@@ -136,20 +141,33 @@ public:
     IdAllocator() = default;
 
     // Load the previous build's slot table from its sidecar. Tombstone
-    // slots go onto the free-list so new records can reuse them.
+    // slots go onto the free-list so new records can reuse them. The slots
+    // are read a slice per thread: a planet table runs to 2 GiB.
     bool load_previous(const std::string& sidecar_path) {
-        std::ifstream f(sidecar_path, std::ios::binary);
-        if (!f) return false;
-        uint32_t magic = 0, version = 0, count = 0;
-        f.read(reinterpret_cast<char*>(&magic), 4);
-        f.read(reinterpret_cast<char*>(&version), 4);
-        f.read(reinterpret_cast<char*>(&count), 4);
-        if (!f || magic != SIDECAR_MAGIC || version != SIDECAR_VERSION) return false;
-        slots_.resize(count);
-        if (count > 0) {
-            f.read(reinterpret_cast<char*>(slots_.data()),
-                   static_cast<std::streamsize>(count) * sizeof(SidecarSlot));
-            if (!f) { slots_.clear(); return false; }
+        constexpr size_t kHeaderBytes = 3 * sizeof(uint32_t);
+        constexpr size_t kSliceBytes = size_t(64) << 20;
+        constexpr unsigned kReadThreads = 8;
+        const int fd = ::open(sidecar_path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return false;
+        struct Closer {
+            int fd;
+            ~Closer() { ::close(fd); }
+        } closer{fd};
+
+        uint32_t header[3] = {0, 0, 0};
+        if (!read_at(fd, header, kHeaderBytes, 0)) return false;
+        const uint32_t magic = header[0], version = header[1], count = header[2];
+        if (magic != SIDECAR_MAGIC || version != SIDECAR_VERSION) return false;
+        parallel_resize(slots_, count);
+        const size_t bytes = size_t(count) * sizeof(SidecarSlot);
+        std::atomic<bool> read{true};
+        parallel_for_each((bytes + kSliceBytes - 1) / kSliceBytes, [&](size_t k, unsigned) {
+            const size_t at = k * kSliceBytes, len = std::min(kSliceBytes, bytes - at);
+            if (!read_at(fd, reinterpret_cast<char*>(slots_.data()) + at, len, kHeaderBytes + at)) read = false;
+        }, kReadThreads);
+        if (!read) {
+            slots_.clear();
+            return false;
         }
         free_list_ = parallel_filter(count, [&](size_t i) { return !is_reclaimable(slots_[i]); });
         return true;
@@ -316,6 +334,21 @@ public:
     }
 
 private:
+    // Reads len bytes at offset `at` of fd into buf; false on an error or
+    // the end of the file first.
+    static bool read_at(int fd, void* buf, size_t len, size_t at) {
+        char* out = static_cast<char*>(buf);
+        while (len > 0) {
+            const ssize_t got = ::pread(fd, out, len, static_cast<off_t>(at));
+            if (got < 0 && errno == EINTR) continue;
+            if (got <= 0) return false;
+            out += got;
+            at += static_cast<size_t>(got);
+            len -= static_cast<size_t>(got);
+        }
+        return true;
+    }
+
     std::vector<SidecarSlot> slots_;
     std::vector<uint32_t> free_list_;
     // Previous-build slots whose identity no record of this build had.

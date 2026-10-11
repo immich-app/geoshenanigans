@@ -5,6 +5,8 @@
 // tombstoning, sidecar round-trip) so future refactors can't silently shift it.
 #include "id_allocator.h"
 
+#include <cstring>
+#include <filesystem>
 #include <random>
 #include <string>
 #include <unordered_map>
@@ -112,6 +114,35 @@ TEST(load_previous_missing_file_returns_false) {
     CHECK(!a.load_previous(dir.path() + "/does_not_exist.osm_ids"));
     // Falls back to fresh allocation.
     CHECK(allocate_list(a, {{ObjectType::OSM_NODE, 1}}) == std::vector<uint32_t>({0}));
+}
+
+TEST(load_previous_reads_a_table_of_many_slices) {
+    // Past the 64 MiB slices the table is read in, ending mid-slice.
+    ScratchDir dir("gctest-slices");
+    const std::string path = dir.path() + "/prev.osm_ids";
+    std::vector<SidecarSlot> slots((size_t(150) << 20) / sizeof(SidecarSlot) + 7);
+    for (size_t i = 0; i < slots.size(); i++)
+        slots[i] = i % 1000 == 0 ? SidecarSlot{uint8_t(ObjectType::NONE), SLOT_FLAG_TOMBSTONE, 0, 0, 0}
+                                 : SidecarSlot{uint8_t(ObjectType::OSM_NODE), 0, 0, 0, i};
+    IdAllocator::write_sidecar(path, slots);
+    IdAllocator a;
+    REQUIRE(a.load_previous(path));
+    CHECK(a.slots().size() == slots.size() &&
+          std::memcmp(a.slots().data(), slots.data(), slots.size() * sizeof(SidecarSlot)) == 0);
+    // The free list holds the dead slots, recycled from the back.
+    CHECK_EQ(allocate_list(a, {{ObjectType::OSM_NODE, uint64_t(1) << 40}})[0], uint32_t((slots.size() - 8) / 1000 * 1000));
+}
+
+TEST(load_previous_rejects_a_truncated_table) {
+    ScratchDir dir("gctest-truncated");
+    const std::string path = dir.path() + "/prev.osm_ids";
+    IdAllocator::write_sidecar(path, {{uint8_t(ObjectType::OSM_NODE), 0, 0, 0, 5}, {uint8_t(ObjectType::OSM_NODE), 0, 0, 0, 6}});
+    std::filesystem::resize_file(path, std::filesystem::file_size(path) - 1);
+    IdAllocator a;
+    CHECK(!a.load_previous(path));
+    CHECK(a.slots().empty());
+    std::filesystem::resize_file(path, 10);  // not even the header
+    CHECK(!a.load_previous(path));
 }
 
 TEST(unclaimed_live_none_slot_becomes_tombstone) {
