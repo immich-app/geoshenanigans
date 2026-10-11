@@ -156,3 +156,34 @@ TEST(poi_meta_categories_without_slot_table_counts_every_record) {
     CHECK(poi_meta_categories(records, {}, select_poi_tier(records, {}, ALL)) ==
           std::set<uint8_t>({uint8_t(PoiCategory::HOTEL), uint8_t(PoiCategory::ZOO)}));
 }
+
+TEST(select_poi_tier_and_categories_match_a_serial_walk_of_a_large_set) {
+    // Past the blocks the selection splits its work into.
+    std::vector<PoiRecord> records(300000);
+    std::vector<SidecarSlot> slots(records.size());
+    for (size_t i = 0; i < records.size(); i++) {
+        const uint8_t tier = static_cast<uint8_t>(1 + (i * 7919) % 4);
+        if (i % 13 == 0) {
+            slots[i] = tomb_slot(static_cast<uint8_t>((i / 13) % 5));
+        } else {
+            records[i] = poi(static_cast<PoiCategory>((i * 31) % 40), tier);
+            slots[i] = live_slot(tier);
+        }
+    }
+    for (uint8_t max_tier : {MAJOR, NOTABLE, ALL}) {
+        std::vector<uint32_t> indices;
+        size_t tombstones = 0;
+        std::set<uint8_t> cats;
+        for (size_t i = 0; i < records.size(); i++) {
+            if (gc::id_alloc::poi_shipped_tier(records[i].tier, &slots[i]) > max_tier) continue;
+
+            indices.push_back(static_cast<uint32_t>(i));
+            if (gc::id_alloc::is_tombstone(slots[i])) tombstones++;
+            else cats.insert(records[i].category);
+        }
+        const PoiTierSelection selection = select_poi_tier(records, slots, max_tier);
+        CHECK(selection.indices == indices);
+        CHECK_EQ(selection.tombstones, tombstones);
+        CHECK(poi_meta_categories(records, slots, selection) == cats);
+    }
+}

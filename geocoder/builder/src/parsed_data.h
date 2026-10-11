@@ -42,14 +42,15 @@ inline PoiTierSelection select_poi_tier(const std::vector<PoiRecord>& records,
     if (!slots.empty() && slots.size() != records.size())
         throw std::runtime_error("POI slot table not parallel to poi_records");
 
+    auto slot_of = [&](size_t i) { return slots.empty() ? nullptr : &slots[i]; };
     PoiTierSelection out;
-    for (size_t i = 0; i < records.size(); i++) {
-        const gc::id_alloc::SidecarSlot* slot = slots.empty() ? nullptr : &slots[i];
-        if (gc::id_alloc::poi_shipped_tier(records[i].tier, slot) > max_tier) continue;
-
-        if (slot && gc::id_alloc::is_tombstone(*slot)) out.tombstones++;
-        out.indices.push_back(static_cast<uint32_t>(i));
-    }
+    out.indices = parallel_filter(records.size(), [&](size_t i) {
+        return gc::id_alloc::poi_shipped_tier(records[i].tier, slot_of(i)) <= max_tier;
+    });
+    out.tombstones = parallel_count(out.indices.size(), [&](size_t k) {
+        const gc::id_alloc::SidecarSlot* slot = slot_of(out.indices[k]);
+        return slot && gc::id_alloc::is_tombstone(*slot);
+    });
     return out;
 }
 
@@ -59,12 +60,20 @@ inline PoiTierSelection select_poi_tier(const std::vector<PoiRecord>& records,
 inline std::set<uint8_t> poi_meta_categories(const std::vector<PoiRecord>& records,
                                              const std::vector<gc::id_alloc::SidecarSlot>& slots,
                                              const PoiTierSelection& selection) {
-    std::set<uint8_t> cats;
-    for (uint32_t i : selection.indices) {
-        if (!slots.empty() && gc::id_alloc::is_tombstone(slots[i])) continue;
+    constexpr size_t kCategories = 256;
+    std::vector<std::array<bool, kCategories>> seen(parallel_threads(), std::array<bool, kCategories>{});
+    const size_t blocks = parallel_blocks(selection.indices.size(), [&](size_t b, size_t begin, size_t end) {
+        for (size_t k = begin; k < end; k++) {
+            const uint32_t i = selection.indices[k];
+            if (!slots.empty() && gc::id_alloc::is_tombstone(slots[i])) continue;
 
-        cats.insert(records[i].category);
-    }
+            seen[b][records[i].category] = true;
+        }
+    });
+    std::set<uint8_t> cats;
+    for (size_t b = 0; b < blocks; b++)
+        for (size_t c = 0; c < kCategories; c++)
+            if (seen[b][c]) cats.insert(static_cast<uint8_t>(c));
     return cats;
 }
 

@@ -1997,9 +1997,11 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                     const PoiTierSelection selection =
                         select_poi_tier(d.poi_records, d.poi_sidecar_blob, tier_var.max_tier);
                     const auto& selected = selection.indices;
-                    std::vector<PoiRecord> filtered_records(selected.size());
+                    std::vector<PoiRecord> filtered_records;
                     std::vector<uint8_t> filtered_vertex_bytes;
-                    std::vector<uint32_t> id_remap(d.poi_records.size(), NO_DATA);
+                    std::vector<uint32_t> id_remap;
+                    parallel_resize(filtered_records, selected.size());
+                    parallel_resize(id_remap, d.poi_records.size(), NO_DATA);
                     // Point POI — no header / no vertices.
                     auto is_polygon = [](const PoiRecord& pr) { return pr.vertex_count > 0 && pr.vertex_offset != NO_DATA; };
                     parallel_prefix_fill(selected.size(),
@@ -2007,7 +2009,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                             const auto& pr = d.poi_records[selected[k]];
                             return is_polygon(pr) ? plan_polygon(&d.poi_vertices[pr.vertex_offset], pr.vertex_count).bytes : 0;
                         },
-                        [&](size_t total) { filtered_vertex_bytes.resize(total); },
+                        [&](size_t total) { parallel_resize(filtered_vertex_bytes, total); },
                         [&](size_t k, size_t offset) -> size_t {
                             id_remap[selected[k]] = static_cast<uint32_t>(k);
                             auto pr = d.poi_records[selected[k]];
@@ -2025,26 +2027,19 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
 
                     // Filtered cell index (preserving INTERIOR_FLAG). id_remap
                     // ascends and keeps the flag bit, so the filtered table stays
-                    // in canonical order and repeats sit side by side.
-                    std::vector<std::vector<CellItemPair>> worker_cells(parallel_threads());
-                    parallel_for_runs(d.sorted_poi_cells.size(), same_cell(d.sorted_poi_cells),
-                                      [&](size_t begin, size_t end, unsigned w) {
-                        auto& out = worker_cells[w];
-                        for (size_t i = begin; i < end; i++) {
-                            const auto& p = d.sorted_poi_cells[i];
+                    // in canonical order and repeats sit side by side. A repeat
+                    // maps from an equal pair (id_remap is one to one), so
+                    // comparing with the pair before finds it.
+                    const auto& poi_cells = d.sorted_poi_cells;
+                    std::vector<CellItemPair> filtered_cells = parallel_collect<CellItemPair>(poi_cells.size(),
+                        [&](size_t i, std::vector<CellItemPair>& out) {
+                            const auto& p = poi_cells[i];
                             uint32_t flags = p.item_id & INTERIOR_FLAG;
                             uint32_t raw_id = p.item_id & ID_MASK;
-                            if (raw_id >= id_remap.size() || id_remap[raw_id] == NO_DATA) continue;
-                            CellItemPair q{p.cell_id, id_remap[raw_id] | flags};
-                            if (!out.empty() && out.back().cell_id == q.cell_id && out.back().item_id == q.item_id) continue;
-                            out.push_back(q);
-                        }
-                    });
-                    std::vector<CellItemPair> filtered_cells;
-                    for (auto& part : worker_cells) {
-                        filtered_cells.insert(filtered_cells.end(), part.begin(), part.end());
-                        std::vector<CellItemPair>().swap(part);
-                    }
+                            if (raw_id >= id_remap.size() || id_remap[raw_id] == NO_DATA) return;
+                            if (i > 0 && poi_cells[i - 1].cell_id == p.cell_id && poi_cells[i - 1].item_id == p.item_id) return;
+                            out.push_back({p.cell_id, id_remap[raw_id] | flags});
+                        });
 
                     // Write files
                     {
