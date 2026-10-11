@@ -271,13 +271,8 @@ jobs:
           # The build reads yesterday's *.osm_ids sidecars (--prev-output),
           # so they come first. The rest of yesterday's files only feed
           # patch generation: fetch_previous_index.sh brings them in beside
-          # the PBF download (and the apply), detached so it outlives this
-          # step, rather than beside the build, whose write phase it slowed.
-          # Idle I/O class: whatever it still overlaps comes first.
+          # the build (Build geocoder index starts it).
           if [ "$HAS_PREVIOUS" = "true" ]; then
-            setsid nohup ionice -c3 nice -n 10 "$GITHUB_WORKSPACE/geocoder/builder/tools/fetch_previous_index.sh" \
-              "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY" "$WORKDIR/old-output" "$WORKDIR/old-output.status" \
-              > "$WORKDIR/old-output.log" 2>&1 < /dev/null &
             (
               START=$(date +%s)
               $S5 cp --concurrency 8 "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/*.osm_ids" "$WORKDIR/old-output/" > /dev/null
@@ -538,10 +533,12 @@ jobs:
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 4"
 
-          # Today's PBF goes to the cache for tomorrow's run beside the build
-          # (skipped if it came from there), detached so it outlives this
-          # step; it writes its exit status last, and Finalize waits for that,
-          # then frees the disk.
+          # Two transfers run beside the build, detached so they outlive this
+          # step; each writes its exit status last for the step that needs it.
+          # - Today's PBF goes to the cache for tomorrow's run (skipped if it
+          #   came from there); Finalize waits for it, then frees the disk.
+          # - Yesterday's client files come down and decompress for patch
+          #   generation, which waits for them.
           if [ "$PBF_SOURCE" != "today" ]; then
             echo "Caching today's PBF in background..."
             # The inner script expands its own arguments ($0 is the status file).
@@ -549,6 +546,14 @@ jobs:
             setsid nohup bash -c '"$@"; echo $? > "$0"' "$WORKDIR/pbf-cache.status" \
               $CACHE cp --concurrency 16 "$WORKDIR/planet.osm.pbf" "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" \
               > "$WORKDIR/pbf-cache.log" 2>&1 < /dev/null &
+          fi
+          if [ "$HAS_PREVIOUS" = "true" ]; then
+            echo "Fetching yesterday's index in background..."
+            # Idle I/O class: the build's write phase is disk-bound on the
+            # runner and comes first; the fetch fills the gaps around it.
+            setsid nohup ionice -c3 nice -n 10 "$GITHUB_WORKSPACE/geocoder/builder/tools/fetch_previous_index.sh" \
+              "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY" "$WORKDIR/old-output" "$WORKDIR/old-output.status" \
+              > "$WORKDIR/old-output.log" 2>&1 < /dev/null &
           fi
 
           # Build args
@@ -663,7 +668,7 @@ jobs:
           df -h "$WORKDIR"
 
           # Yesterday's client files came down and decompressed beside the
-          # downloads (fetch_previous_index.sh, started by the download step).
+          # build (fetch_previous_index.sh, started by the build step).
           WAIT_START=$(date +%s)
           until [ -s "$WORKDIR/old-output.status" ]; do
             if [ $(( $(date +%s) - WAIT_START )) -gt 3600 ]; then
