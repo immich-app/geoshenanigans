@@ -53,8 +53,12 @@
 // Untouched blobs next to each other are copied as one read of at most
 // this many bytes.
 constexpr size_t kCopySpanBytes = size_t(1) << 20;
-// Output pieces produced ahead of the writer, per thread.
-constexpr size_t kWritesAheadPerThread = 16;
+// Output pieces produced ahead of the writer, per thread. A copied span
+// holds nothing until its block is filled, so this bounds the encoded
+// blobs held: far enough ahead the encoders keep busy through stretches of
+// copies, which leave them idle when the input comes from disk (planet day
+// write 55 s with 16, 49 s with 1024 for 5 GB more; 48 and 43 s cached).
+constexpr size_t kWritesAheadPerThread = 1024;
 // How many blobs ahead a peek's first read is asked for: on a cold input
 // the reads then overlap instead of each peek waiting on its own (planet
 // scan 9.6 s, 8.0 s with these). More peek threads did as well, but took
