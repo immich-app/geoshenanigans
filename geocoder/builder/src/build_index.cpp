@@ -10,6 +10,7 @@
 #include <functional>
 #include <future>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <numeric>
@@ -2688,8 +2689,17 @@ static int run(int argc, char* argv[]) {
             std::vector<std::string> rel_wikidata; // parallel to data.collected_relations
             std::unordered_set<int64_t> wanted_label_nodes; // node IDs referenced as role=label
             {
-                std::mutex rel_mutex;
-                pbf.read_blocks([&](PbfBlock& block, unsigned) {
+                // What each reader thread collects, joined after: one shared
+                // lock held across the vectors' growth queued every thread.
+                struct Collected {
+                    std::vector<CollectedRelation> relations;
+                    std::vector<std::string> wikidata;  // parallel to relations
+                    std::vector<int64_t> label_nodes;
+                    std::vector<CollectedPoiRelation> poi_relations;
+                };
+                std::vector<Collected> collected(pbf.thread_count());
+                pbf.read_blocks([&](PbfBlock& block, unsigned thread) {
+                    Collected& mine = collected[thread];
                     for (auto& rel : block.relations) {
                         const char* boundary = rel.tag("boundary");
                         const char* rel_type = rel.tag("type");
@@ -2743,10 +2753,9 @@ static int run(int argc, char* argv[]) {
                                             }
                                         }
                                         if (!cr.members.empty()) {
-                                            std::lock_guard<std::mutex> lock(rel_mutex);
-                                            data.collected_relations.push_back(std::move(cr));
-                                            rel_wikidata.emplace_back(); // already has override, no wikidata needed
-                                            if (label_node_id >= 0) wanted_label_nodes.insert(label_node_id);
+                                            mine.relations.push_back(std::move(cr));
+                                            mine.wikidata.emplace_back(); // already has override, no wikidata needed
+                                            if (label_node_id >= 0) mine.label_nodes.push_back(label_node_id);
                                         }
                                     }
                                 }
@@ -2821,10 +2830,9 @@ static int run(int argc, char* argv[]) {
                             // to its place=city admin_centre node and drop out
                             // of the address hierarchy after Suginami wins.
                             std::string wd_str = wikidata_tag ? wikidata_tag : "";
-                            std::lock_guard<std::mutex> lock(rel_mutex);
-                            data.collected_relations.push_back(std::move(cr));
-                            rel_wikidata.push_back(std::move(wd_str));
-                            if (label_node_id >= 0) wanted_label_nodes.insert(label_node_id);
+                            mine.relations.push_back(std::move(cr));
+                            mine.wikidata.push_back(std::move(wd_str));
+                            if (label_node_id >= 0) mine.label_nodes.push_back(label_node_id);
                         }
                     }
                     // --- POI relation scanning (same pass) ---
@@ -2941,14 +2949,20 @@ static int run(int argc, char* argv[]) {
                                     }
                                 }
 
-                                if (!cpr.members.empty()) {
-                                    std::lock_guard<std::mutex> lock(rel_mutex);
-                                    data.collected_poi_relations.push_back(std::move(cpr));
-                                }
+                                if (!cpr.members.empty()) mine.poi_relations.push_back(std::move(cpr));
                             }
                         }
                     }
                 }, "r");
+                // Which thread read a block is down to timing, so this join
+                // order is as arbitrary as the shared lock's was.
+                for (auto& c : collected) {
+                    std::move(c.relations.begin(), c.relations.end(), std::back_inserter(data.collected_relations));
+                    std::move(c.wikidata.begin(), c.wikidata.end(), std::back_inserter(rel_wikidata));
+                    wanted_label_nodes.insert(c.label_nodes.begin(), c.label_nodes.end());
+                    std::move(c.poi_relations.begin(), c.poi_relations.end(),
+                              std::back_inserter(data.collected_poi_relations));
+                }
             }
             std::cerr << "  Collected " << data.collected_relations.size()
                       << " admin/postal relations for parallel assembly." << std::endl;
