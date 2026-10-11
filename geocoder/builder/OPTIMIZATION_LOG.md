@@ -30,6 +30,12 @@ static copies of the same package sources built with `-DNDEBUG`
 (`tools/build_s2.sh`); with the distro libraries, deadlock detection is
 switched off at startup.
 
+The PBF's blobs inflate through libdeflate: 2.46x faster than zlib over the
+planet's 1.52M blobs (99 GB in, 235 GB out), with the same bytes. That takes
+about 15 s off Pass 1, 2 and 2b, where inflate was 14.5% of the build's CPU.
+pbf-apply also deflates the blobs it re-encodes with libdeflate, 2.2x faster
+and 0.6% smaller. Every block still decodes to what zlib's run gave.
+
 Memory: the peak was 188 GiB in Pass 2b (a dense 111 GiB node index plus
 merge copies). Only nodes that a kept way references get coordinates now,
 thread data is freed as it merges, and the write phase schedules its regions

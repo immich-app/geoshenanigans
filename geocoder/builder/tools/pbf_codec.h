@@ -24,6 +24,7 @@
 #include "osm_objects.h"
 #include "pbf_format.h"
 #include "pbf_reader.h"
+#include "zlib_blob.h"
 
 // Most objects osmium's PBF writer puts in one block.
 constexpr size_t kMaxBlockObjects = 8000;
@@ -31,8 +32,8 @@ constexpr size_t kMaxBlockObjects = 8000;
 // is kept under when it can be split (the spec's recommended maximum).
 constexpr size_t kMaxBlockBytes = size_t(32) << 20;
 constexpr size_t kTargetBlockBytes = size_t(16) << 20;
-// zlib level of re-encoded blobs: osmium's default.
-constexpr int kBlobZlibLevel = Z_DEFAULT_COMPRESSION;
+// Compression level of re-encoded blobs: osmium's, zlib's default.
+constexpr int kBlobZlibLevel = 6;
 // What a blob peek reads first: enough for 61% of planet blobs; all of
 // them take 8 KiB on average (12.6 GiB read for 1.52M blobs).
 constexpr size_t kPeekFirstReadBytes = 4 * 1024;
@@ -602,16 +603,12 @@ inline void encode_block(OsmType type, const ObjectRef* objs, size_t n, std::str
 inline void append_blob(std::string& out, std::string_view type, std::string_view raw,
                         int level = kBlobZlibLevel) {
     if (raw.size() > kMaxBlockBytes) throw std::runtime_error("PBF block over 32 MiB");
-    uLongf zsize = compressBound(static_cast<uLong>(raw.size()));
-    std::string z(zsize, '\0');
-    if (compress2(reinterpret_cast<Bytef*>(z.data()), &zsize, reinterpret_cast<const Bytef*>(raw.data()),
-                  static_cast<uLong>(raw.size()), level) != Z_OK)
-        throw std::runtime_error("zlib compress failed");
+    const std::string z = zlib_deflate(raw, level);
     std::string blob;
     {
         protozero::pbf_writer b(blob);
         b.add_int32(BlobTag::RAW_SIZE, static_cast<int32_t>(raw.size()));
-        b.add_bytes(BlobTag::ZLIB, z.data(), zsize);
+        b.add_bytes(BlobTag::ZLIB, z.data(), z.size());
     }
     std::string header;
     {

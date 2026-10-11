@@ -14,13 +14,13 @@
 #include <string_view>
 #include <thread>
 #include <unistd.h>
-#include <zlib.h>
 
 #include <protozero/pbf_reader.hpp>
 #include <protozero/varint.hpp>
 
 #include "parallel.h"
 #include "pbf_format.h"
+#include "zlib_blob.h"
 
 // --- PBF file format constants ---
 // BlobHeader max size: 32 MiB (per spec), but typically <100 bytes
@@ -169,18 +169,6 @@ static void read_blob_into(int fd, const BlobInfo& info, std::string& blob_buf) 
     }
 }
 
-// A thread's inflate state, reset for each blob and ended with the thread.
-struct Inflater {
-    z_stream strm{};
-
-    Inflater() {
-        if (inflateInit(&strm) != Z_OK) throw std::runtime_error("inflateInit failed");
-    }
-    ~Inflater() { inflateEnd(&strm); }
-    Inflater(const Inflater&) = delete;
-    Inflater& operator=(const Inflater&) = delete;
-};
-
 // Decompresses the Blob message in blob_buf into `out`, reusing its capacity.
 static void inflate_blob_into(const std::string& blob_buf, std::string& out) {
     protozero::pbf_reader blob_pbf(blob_buf);
@@ -200,16 +188,7 @@ static void inflate_blob_into(const std::string& blob_buf, std::string& out) {
     }
     if (zlib_view.size() > 0) {
         out.resize(raw_size);
-        thread_local Inflater inflater;
-        z_stream& strm = inflater.strm;
-        if (inflateReset(&strm) != Z_OK) throw std::runtime_error("inflateReset failed");
-        strm.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(zlib_view.data()));
-        strm.avail_in = zlib_view.size();
-        strm.next_out = reinterpret_cast<Bytef*>(out.data());
-        strm.avail_out = out.size();
-        int ret = inflate(&strm, Z_FINISH);
-        if (ret != Z_STREAM_END) throw std::runtime_error("zlib inflate failed: " + std::to_string(ret));
-        out.resize(strm.total_out);
+        out.resize(zlib_inflate({zlib_view.data(), zlib_view.size()}, out.data(), out.size()));
         return;
     }
     throw std::runtime_error("blob has no data");
@@ -258,21 +237,7 @@ std::string read_and_decompress_blob(int fd, const BlobInfo& info) {
 
     if (!zlib_data.empty()) {
         std::string decompressed(raw_size, '\0');
-        z_stream strm{};
-        strm.next_in = reinterpret_cast<Bytef*>(zlib_data.data());
-        strm.avail_in = zlib_data.size();
-        strm.next_out = reinterpret_cast<Bytef*>(decompressed.data());
-        strm.avail_out = decompressed.size();
-
-        if (inflateInit(&strm) != Z_OK) {
-            throw std::runtime_error("inflateInit failed");
-        }
-        int ret = inflate(&strm, Z_FINISH);
-        inflateEnd(&strm);
-        if (ret != Z_STREAM_END) {
-            throw std::runtime_error("zlib inflate failed: " + std::to_string(ret));
-        }
-        decompressed.resize(strm.total_out);
+        decompressed.resize(zlib_inflate(zlib_data, decompressed.data(), decompressed.size()));
         return decompressed;
     }
 

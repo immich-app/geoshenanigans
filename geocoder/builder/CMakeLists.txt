@@ -9,6 +9,17 @@ find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(BZip2 REQUIRED)
 find_package(EXPAT REQUIRED)
+# libdeflate inflates the PBF's blobs, and pbf-apply deflates them, faster
+# than zlib (src/zlib_blob.h). Older packages ship no CMake config.
+find_path(LIBDEFLATE_INCLUDE_DIR libdeflate.h)
+find_library(LIBDEFLATE_LIBRARY NAMES deflate)
+if(NOT LIBDEFLATE_INCLUDE_DIR OR NOT LIBDEFLATE_LIBRARY)
+    message(FATAL_ERROR "libdeflate not found (Debian/Ubuntu: libdeflate-dev, Homebrew: libdeflate)")
+endif()
+add_library(libdeflate::libdeflate UNKNOWN IMPORTED)
+set_target_properties(libdeflate::libdeflate PROPERTIES
+    IMPORTED_LOCATION "${LIBDEFLATE_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${LIBDEFLATE_INCLUDE_DIR}")
 # GEOCODER_S2_PREFIX links the static S2 and abseil that tools/build_s2.sh
 # installed there (both without their debug checks, as CI builds them).
 # Without it the system S2 (and abseil) are used; they are only looked up
@@ -90,7 +101,7 @@ target_compile_definitions(geocoder-patch PRIVATE _FILE_OFFSET_BITS=64)
 
 # osmium apply-changes for the nightly planet update, blob by blob.
 add_executable(pbf-apply tools/pbf_apply.cpp src/pbf_reader.cpp)
-target_link_libraries(pbf-apply PRIVATE ZLIB::ZLIB EXPAT::EXPAT Threads::Threads)
+target_link_libraries(pbf-apply PRIVATE ZLIB::ZLIB libdeflate::libdeflate EXPAT::EXPAT Threads::Threads)
 target_include_directories(pbf-apply PRIVATE tools src)
 target_compile_definitions(pbf-apply PRIVATE _FILE_OFFSET_BITS=64)
 
@@ -119,7 +130,7 @@ else()
     target_link_libraries(build-index PRIVATE s2)
 endif()
 target_link_libraries(build-index PRIVATE
-    ZLIB::ZLIB
+    libdeflate::libdeflate
     BZip2::BZip2
     EXPAT::EXPAT
     Threads::Threads
@@ -154,7 +165,7 @@ target_include_directories(geocoder-tests PRIVATE src tools tests)
 target_compile_definitions(geocoder-tests PRIVATE
     GEOCODER_TEMPLATE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/configurations.template.json"
     _FILE_OFFSET_BITS=64)
-target_link_libraries(geocoder-tests PRIVATE ZLIB::ZLIB EXPAT::EXPAT Threads::Threads)
+target_link_libraries(geocoder-tests PRIVATE ZLIB::ZLIB libdeflate::libdeflate EXPAT::EXPAT Threads::Threads)
 add_test(NAME geocoder-tests COMMAND geocoder-tests)
 
 # GEOCODER_SANITIZE=ON builds the unit tests with ASan + UBSan, undefined
