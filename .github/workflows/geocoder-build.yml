@@ -509,7 +509,9 @@ jobs:
           fi
           if [ "$HAS_PREVIOUS" = "true" ]; then
             echo "Fetching yesterday's index in background..."
-            setsid nohup "$GITHUB_WORKSPACE/geocoder/builder/tools/fetch_previous_index.sh" \
+            # Idle I/O class: the build's write phase is disk-bound on the
+            # runner and comes first; the fetch fills the gaps around it.
+            setsid nohup ionice -c3 nice -n 10 "$GITHUB_WORKSPACE/geocoder/builder/tools/fetch_previous_index.sh" \
               "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY" "$WORKDIR/old-output" "$WORKDIR/old-output.status" \
               > "$WORKDIR/old-output.log" 2>&1 < /dev/null &
           fi
