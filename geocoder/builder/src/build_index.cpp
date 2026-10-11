@@ -1918,20 +1918,27 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                 //    Preserves the high-bit INTERIOR_FLAG used by the cell
                 //    index format (polys that fully contain a cell vs. just
                 //    intersect it).
+                using CellIds = std::pair<uint64_t, std::vector<uint32_t>>;
+                const auto& admin_cells = d.cell_to_admin;
+                std::vector<CellIds> kept_cells = parallel_collect<CellIds>(admin_cells.bucket_count(),
+                    [&](size_t b, std::vector<CellIds>& out) {
+                        for (auto it = admin_cells.begin(b); it != admin_cells.end(b); ++it) {
+                            std::vector<uint32_t> kept;
+                            kept.reserve(it->second.size());
+                            for (uint32_t flagged : it->second) {
+                                uint32_t poly_id = flagged & ID_MASK;
+                                uint32_t flags   = flagged & INTERIOR_FLAG;
+                                if (poly_id >= poly_remap.size()) continue;
+                                uint32_t new_id = poly_remap[poly_id];
+                                if (new_id == NO_DATA) continue;
+                                kept.push_back(new_id | flags);
+                            }
+                            if (!kept.empty()) out.emplace_back(it->first, std::move(kept));
+                        }
+                    });
                 std::unordered_map<uint64_t, std::vector<uint32_t>> filtered_admin_cells;
-                for (const auto& [cell_id, ids] : d.cell_to_admin) {
-                    std::vector<uint32_t> kept;
-                    kept.reserve(ids.size());
-                    for (uint32_t flagged : ids) {
-                        uint32_t poly_id = flagged & ID_MASK;
-                        uint32_t flags   = flagged & INTERIOR_FLAG;
-                        if (poly_id >= poly_remap.size()) continue;
-                        uint32_t new_id = poly_remap[poly_id];
-                        if (new_id == NO_DATA) continue;
-                        kept.push_back(new_id | flags);
-                    }
-                    if (!kept.empty()) filtered_admin_cells[cell_id] = std::move(kept);
-                }
+                filtered_admin_cells.reserve(kept_cells.size());
+                for (auto& [cell_id, kept] : kept_cells) filtered_admin_cells.emplace(cell_id, std::move(kept));
                 write_cell_index(mdir + "/admin_cells.bin", mdir + "/admin_entries.bin",
                                  filtered_admin_cells);
 
