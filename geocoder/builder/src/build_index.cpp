@@ -2666,6 +2666,8 @@ static int run(int argc, char* argv[]) {
         AdminCoverPool admin_pool(num_threads);
         // BuildHandler no longer used — parallel processing handles everything
 
+        // The last input's way geometries, freed beside the admin linking.
+        WayGeometries spent_geometries;
         for (const auto& input_file : input_files) {
             std::cerr << "Processing " << input_file << "..." << std::endl;
 
@@ -4629,20 +4631,29 @@ static int run(int argc, char* argv[]) {
                     data.collected_poi_relations.clear();
                     data.collected_poi_relations.shrink_to_fit();
 
-                    free_storage(data.way_geometries);
+                    // Each input's relations assemble from its own ways only.
+                    spent_geometries = std::exchange(data.way_geometries, {});
                 }
             }
         }
 
+        // The way geometries ring assembly read, a hash node per way, take
+        // one core a second to free. Then the parse threads' freed buffers
+        // sit in free chunks of their malloc arenas, between live chunks,
+        // where free() never hands the pages back; malloc_trim returns them
+        // to the OS for later phases, walking every arena on one core for
+        // seconds. Both run beside the admin sorting and linking below,
+        // which allocate little.
 #ifdef __GLIBC__
-        // The parse threads' freed buffers sit in free chunks of their
-        // malloc arenas, between live chunks, where free() never hands the
-        // pages back; malloc_trim returns them to the OS for later phases.
-        // It walks every arena on one core for seconds: that runs beside
-        // the admin sorting and linking below, which allocate little.
         const long rss_before_trim = get_rss_mb();
-        auto arenas_trimmed = std::async(std::launch::async, [] { malloc_trim(0); });
 #endif
+        auto arenas_trimmed = std::async(std::launch::async,
+            [geometries = std::move(spent_geometries)]() mutable {
+                free_storage(geometries);
+#ifdef __GLIBC__
+                malloc_trim(0);
+#endif
+            });
 
         // Memory breakdown — what's holding RSS now (before the strategy-2
         // and deterministic-ordering passes that follow). Identifies the
@@ -4791,8 +4802,8 @@ static int run(int argc, char* argv[]) {
         compute_way_parent_polygons(data, cfg);
 
         std::future<void> tiger_freed = external_data.get();
-#ifdef __GLIBC__
         arenas_trimmed.get();
+#ifdef __GLIBC__
         std::cerr << "Trimmed malloc arenas: " << rss_before_trim << " -> "
                   << get_rss_mb() << " MiB resident." << std::endl;
 #endif
