@@ -2193,6 +2193,17 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
     // run together; else one after another, to hold memory down while
     // continent subsets build alongside.
     const uint64_t planet_stages = stage_costs(record_bytes(data)).total();
+
+    // The planet's own write and each continent's split read the planet
+    // records; the last of them to finish frees them beside the work left,
+    // rather than the build's end freeing the lot on one core.
+    std::atomic<size_t> data_readers{1 + (generate_continents ? kContinentCount : 0)};
+    std::future<void> data_freed;
+    auto done_reading = [&] {
+        if (--data_readers == 0)
+            data_freed = std::async(std::launch::async, [&data] { ParsedData freed = std::move(data); });
+    };
+
     std::future<void> planet_future;
     auto write_planet = [&](uint64_t beside) {
         const RunOrder order = planet_stages + beside <= budget.capacity() ? RunOrder::Concurrent : RunOrder::Serial;
@@ -2201,6 +2212,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             timed_phase("    planet: write", [&] {
                 write_region(data, output_dir + "/planet", RegionRun::Planet, order, &budget);
             });
+            done_reading();
         });
     };
     if (!generate_continents) write_planet(0);
@@ -2373,6 +2385,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                 auto subset = filter_by_bbox_masked(data, continent, cbit,
                     way_continent_masks, addr_continent_masks, interp_continent_masks,
                     poi_continent_masks, place_continent_masks, poly);
+                done_reading();
                 log_phase(("  " + std::string(continent.name) + ": filter").c_str(), _ct, _cc);
                 write_region(subset, output_dir + "/" + continent.name, RegionRun::Continent, run.cost.order, nullptr);
                 log_phase(("  " + std::string(continent.name) + ": total").c_str(), _ct, _cc);
@@ -2392,6 +2405,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
 
     // Wait for planet write if not already done
     planet_future.get();
+    if (data_freed.valid()) data_freed.get();
     log_phase("All index writing (total)", _pt, _cpu);
 }
 
