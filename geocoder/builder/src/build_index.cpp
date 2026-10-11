@@ -2442,17 +2442,26 @@ static std::vector<size_t> local_offsets(const Locals& locals, SizeOf size_of) {
     return at;
 }
 
-// Appends each parse thread's buffer(local) to `out` in thread order, on
-// every core, then frees the buffers.
+// Copies each parse thread's buffer(local) into `out` from `base` on, in
+// thread order, on every core, then frees the buffers. `out` must hold them.
 template <class T, class Locals, class Buffer>
-static void append_locals(std::vector<T>& out, Locals& locals, Buffer buffer) {
+static void copy_locals(std::vector<T>& out, size_t base, Locals& locals, Buffer buffer) {
     const auto at = local_offsets(locals, [&](const auto& local) { return buffer(local).size(); });
-    const size_t base = grow_by(out, at.back());
     parallel_for_parts(at, kMergeGrain, [&](size_t k, size_t begin, size_t end, size_t to) {
         const auto& b = buffer(locals[k]);
         std::copy(b.begin() + begin, b.begin() + end, out.begin() + base + to);
     });
     parallel_for_each(locals.size(), [&](size_t k, unsigned) { free_storage(buffer(locals[k])); });
+}
+
+// Grows `out` by the parse threads' buffer(local) sizes on a thread of its
+// own: growing zero-fills on one core, seconds for the largest merge
+// targets, which then pass beside the merges before theirs. Returns `out`'s
+// size before, where copy_locals puts the buffers once get() returns.
+template <class T, class Locals, class Buffer>
+static std::pair<size_t, std::future<void>> grow_beside(std::vector<T>& out, const Locals& locals, Buffer buffer) {
+    const size_t n = local_offsets(locals, [&](const auto& local) { return buffer(local).size(); }).back();
+    return {out.size(), std::async(std::launch::async, [&out, n] { grow_by(out, n); })};
 }
 
 static int run(int argc, char* argv[]) {
@@ -3843,6 +3852,14 @@ static int run(int argc, char* argv[]) {
                 // Process areas/multipolygons — sequential fallback path
                 // Merge thread-local way/interp data into main ParsedData
                 std::cerr << "  Merging thread-local data..." << std::endl;
+                // The street nodes and building polygon vertices, ~10 GiB
+                // each on planet, grow while the strings and ways merge.
+                auto street_node_buffer = [](auto& l) -> auto& { return l.street_nodes; };
+                auto building_vertex_buffer = [](auto& l) -> auto& { return l.building_addr_poly_verts; };
+                auto street_nodes_grown = grow_beside(data.street_nodes, tld, street_node_buffer);
+                auto addr_vertices_grown = grow_beside(data.addr_vertices, tld, building_vertex_buffer);
+                const size_t node_base = street_nodes_grown.first;
+                const size_t bldg_vert_base = addr_vertices_grown.first;
                 // Pool ids per thread, interned in the order the merge below
                 // meets each thread's strings: its ways, building addresses,
                 // interpolations, then POI ways.
@@ -3896,7 +3913,6 @@ static int run(int argc, char* argv[]) {
                 const size_t way_base = grow_by(data.ways, way_at.back());
                 const size_t way_osm_base = grow_by(data.way_osm_ids, way_at.back());
                 const size_t way_orig_base = grow_by(data.way_orig_name_ids, way_at.back());
-                const size_t node_base = data.street_nodes.size();
                 parallel_for_parts(way_at, kMergeGrain, [&](size_t k, size_t begin, size_t end, size_t at) {
                     const auto& local = tld[k];
                     const auto& name_id = name_ids[k];
@@ -3934,7 +3950,8 @@ static int run(int argc, char* argv[]) {
                     free_storage(local.way_orig_names);
                     free_storage(local.deferred_ways);
                 });
-                append_locals(data.street_nodes, tld, [](auto& l) -> auto& { return l.street_nodes; });
+                street_nodes_grown.second.get();
+                copy_locals(data.street_nodes, node_base, tld, street_node_buffer);
                 log_phase("      Way merge: street ways", _mt, _mc);
 
                 // Merge building addresses. A thread's building polygons sit
@@ -3942,7 +3959,6 @@ static int run(int argc, char* argv[]) {
                 const auto bldg_at = local_offsets(tld, [](const auto& l) { return l.building_addrs.size(); });
                 const auto bldg_vert_at = local_offsets(tld, [](const auto& l) { return l.building_addr_poly_verts.size(); });
                 const size_t bldg_base = grow_addr_points(data, bldg_at.back());
-                const size_t bldg_vert_base = data.addr_vertices.size();
                 parallel_for_parts(bldg_at, kMergeGrain, [&](size_t k, size_t begin, size_t end, size_t at) {
                     const auto& local = tld[k];
                     const auto& name_id = name_ids[k];
@@ -3970,7 +3986,8 @@ static int run(int argc, char* argv[]) {
                     free_storage(local.addr_strings);
                     free_storage(local.addr_postcodes);
                 });
-                append_locals(data.addr_vertices, tld, [](auto& l) -> auto& { return l.building_addr_poly_verts; });
+                addr_vertices_grown.second.get();
+                copy_locals(data.addr_vertices, bldg_vert_base, tld, building_vertex_buffer);
                 log_phase("      Way merge: building addresses", _mt, _mc);
 
                 // Merge interpolation ways
