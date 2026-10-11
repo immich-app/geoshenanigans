@@ -109,22 +109,21 @@ jobs:
           KEY: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
           SECRET: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
 
+      # The tools compile beside Setup and the downloads, which don't use
+      # them, detached so the build outlives this step; Run builder tests
+      # waits for it before anything does.
       - name: Build tools
         env:
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
-          cd geocoder/builder && mkdir -p build && cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release -DGEOCODER_S2_PREFIX="$GITHUB_WORKSPACE/.s2-prefix"
-          make -j$(nproc) build-index geocoder-diff geocoder-patch pbf-apply geocoder-tests
+          mkdir -p geocoder/builder/build
+          cd geocoder/builder/build
           echo "$PWD" >> "$GITHUB_PATH"
-
-      - name: Run builder tests
-        run: |
-          # Unit tests gate the build: the suite locks in parity-critical
-          # pure functions (postcode validation, patch format, id
-          # allocator) that a broken toolchain or bad merge would corrupt
-          # long before the multi-hour planet build surfaces it.
-          cd geocoder/builder/build && ./geocoder-tests
+          # The inner script expands its own arguments.
+          # shellcheck disable=SC2016
+          setsid nohup bash -c 'cmake .. -DCMAKE_BUILD_TYPE=Release -DGEOCODER_S2_PREFIX="$1" \
+              && make -j"$(nproc)" build-index geocoder-diff geocoder-patch pbf-apply geocoder-tests; echo $? > "$2"' \
+            _ "$GITHUB_WORKSPACE/.s2-prefix" "$RUNNER_TEMP/tools.status" > "$RUNNER_TEMP/tools.log" 2>&1 < /dev/null &
 
       - name: Setup
         id: setup
@@ -432,6 +431,29 @@ jobs:
             wait $IDX_PID
           fi
           echo "All downloads complete in $(($(date +%s) - STEP_START))s"
+
+      - name: Run builder tests
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          WAIT_START=$(date +%s)
+          until [ -s "$RUNNER_TEMP/tools.status" ]; do
+            if [ $(( $(date +%s) - WAIT_START )) -gt 1800 ]; then
+              tail -50 "$RUNNER_TEMP/tools.log"
+              echo "::error::The tool build did not finish within 30 min"; exit 1
+            fi
+            sleep 5
+          done
+          echo "Waited $(( $(date +%s) - WAIT_START ))s for the tool build"
+          if [ "$(cat "$RUNNER_TEMP/tools.status")" != 0 ]; then
+            tail -50 "$RUNNER_TEMP/tools.log"
+            echo "::error::The tool build failed"; exit 1
+          fi
+          # Unit tests gate the build: the suite locks in parity-critical
+          # pure functions (postcode validation, patch format, id
+          # allocator) that a broken toolchain or bad merge would corrupt
+          # long before the multi-hour planet build surfaces it.
+          cd geocoder/builder/build && ./geocoder-tests
 
       # ── Apply replication diffs ───────────────────────────────────
       # Skipped when PBF source is already today's data.
