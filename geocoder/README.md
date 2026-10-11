@@ -172,16 +172,23 @@ cargo build --release --manifest-path server/Cargo.toml
 ### Planet builds
 
 A full planet build (`--continents --multi-output --multi-quality`, the
-nightly's configuration) takes about 7 minutes on 64 cores and fits in
-128 GB of RAM: the write phase sizes how much it runs at once to the memory
-limit, the smaller of MemTotal and the process's cgroup limit. Set
+nightly's configuration) takes about 5 minutes on 64 cores and fits in
+96 GB of RAM (6 minutes there): the write phase sizes how much it runs at
+once to the memory limit, the smaller of MemTotal and the process's cgroup
+limit. Set
 `GC_MEMORY_LIMIT_MIB` to cap it further when other work shares the host.
 Disk: the planet PBF (~95 GB) plus the output (~120 GB), and the previous
 day's output for `--prev-output`.
 
+The distro S2 and abseil packages keep their debug checks on. The nightly
+links static copies built from the same package sources without them
+(`tools/build_s2.sh <prefix>`, then `cmake -DGEOCODER_S2_PREFIX=<prefix>`).
+The indexes are identical either way; the release libraries are faster.
+
 `pbf-apply in.osm.pbf change.osc.gz... -o out.osm.pbf` applies replication
 diffs with the same result as `osmium apply-changes`, in a few minutes on a
-planet.
+planet. `--direct-io` writes the output around the page cache. That is faster
+on a fast NVMe, but the next reader of the output then finds none of it cached.
 
 ## Memory Footprint
 

@@ -1,6 +1,6 @@
 # Build Optimization Log
 
-## October 2026: 1h 20m → 7m 06s, 188 → 117 GB peak
+## October 2026: 1h 20m → 5m 03s, 188 → 122 GB peak (96 GB fits)
 
 Build: `--continents --multi-output --multi-quality` with TIGER, wikidata
 sitelinks and external postcodes, chained on the previous day
@@ -9,35 +9,52 @@ sitelinks and external postcodes, chained on the previous day
 8 reported CPUs, then a full planet day compared file by file with the
 reference build, plus all 126 patches compared byte for byte.
 
-| Phase | Before | After | What changed |
-|---|---|---|---|
-| Pass 1 | 129 s @1 core | 5 s | parallel blob-header scan |
-| Pass 2 (nodes) | 173 s | 71 s | sparse node index, parallel merge and interning |
-| Pass 2b (ways) | 222 s | 35 s | streams only way blobs, parallel merge, packed way geometries |
-| Admin assembly | 465 s | 12 s | ranked candidates, bbox reject, parallel TIGER/GeoNames loading |
-| S2 cell computation | 925 s | 91 s | per-cell linking, parallel interpolation endpoints |
-| Deterministic ordering | 699 s @1 core | 51 s | parallel sorts with a serial fallback when ties reach output |
-| All index writing | 2143 s @2 cores | 114 s | parallel postcode centroids and strategy-2, memory-budgeted stages |
-| **Total** | **1:19:42** | **7:06** | |
+| Phase | Before | Round 2 | Round 3 | What changed |
+|---|---|---|---|---|
+| Pass 1 | 129 s @1 core | 5 s | 5 s | parallel blob-header scan |
+| Pass 2 (nodes) | 173 s | 71 s | 50 s | sparse node index, parallel merge and interning; blobs inflated outside the read limit |
+| Pass 2b (ways) | 222 s | 35 s | 31 s | streams only way blobs, parallel merge, packed way geometries |
+| Admin assembly | 465 s | 12 s | 7 s | ranked candidates, bbox reject, parallel TIGER/GeoNames loading |
+| S2 cell computation | 925 s | 91 s | 42 s | per-cell linking, parallel interpolation endpoints; S2 and abseil without debug checks |
+| Deterministic ordering | 699 s @1 core | 51 s | 31 s | parallel sorts with a serial fallback when ties reach output; steps side by side |
+| All index writing | 2143 s @2 cores | 114 s | 112 s | parallel postcode centroids and strategy-2, memory-budgeted stages |
+| **Total** | **1:19:42** | **7:06** | **5:03** | |
+
+Round 3's S2 gain is mostly the libraries: the distro S2 and abseil are built
+without NDEBUG, so every S2 call ran its validity checks and every
+absl::Mutex its deadlock detection under one global lock. The nightly links
+static copies of the same package sources built with `-DNDEBUG`
+(`tools/build_s2.sh`); with the distro libraries, deadlock detection is
+switched off at startup.
 
 Memory: the peak was 188 GiB in Pass 2b (a dense 111 GiB node index plus
 merge copies). Only nodes that a kept way references get coordinates now,
 thread data is freed as it merges, and the write phase schedules its regions
 and stages within the memory limit (min of MemTotal and the cgroup limit,
-capped by `GC_MEMORY_LIMIT_MIB`). Unconstrained peak 117 GB; inside a 128 GiB
-cgroup the planet build finishes in 7:17 at 112 GB with identical output.
+capped by `GC_MEMORY_LIMIT_MIB`). Unconstrained it peaks at 122 GB, running
+more at once where memory allows. With identical output it finishes in 5:31
+at 114 GB inside a 128 GiB cgroup and in 6:19 at 94 GB inside 96 GiB.
 
 Pipeline around the builder (same box):
 - Applying the daily diff: `osmium apply-changes` 52 min → `pbf-apply` about
   2 min (copies untouched blobs, re-encodes the rest in parallel; object
-  content identical to osmium's).
+  content identical to osmium's). `--direct-io` cuts that to 48 s on the
+  NVMe, but reading the output back then takes 54 s instead of 11 s from the
+  page cache. With the disk throttled to the runner's 370 MB/s, apply plus
+  read-back takes 542 s direct against 285 s through the page cache
+  (writeback included), so the nightly leaves it off.
 - Patch generation, 126 variants: 23 min → 6 min (geocoder-diff memory and
   parallelism; a diff's memory budget is released when its verify starts).
 - Compression: zstd 18 instead of 19 (+0.3% size, −21% CPU), identical files
   compressed once (18% of a build), one worker per core sized by file, run
   alongside patch generation.
-- Upload: cache copy alongside the Tigris upload, checksums on every core,
-  retention deletes batched.
+- Upload: each file goes to Tigris as soon as it is compressed, checksums on
+  every core, retention deletes batched. The previous day's index downloads
+  while the planet builds.
+
+On the nightly runner (80 CPUs, ~1 Gbit/s network, ~370 MB/s disk) the whole
+run went from 3h 42m to 1h 08m (a re-run of a day whose PBF was cached, so
+without the diff apply); it is now bound by the network and the disk.
 
 ## Earlier result: 54m → 12m 22s (77% faster)
 
