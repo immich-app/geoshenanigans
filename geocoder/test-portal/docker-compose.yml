@@ -1,0 +1,40 @@
+services:
+  # Full dataset — q2.5 admin polygons + all POIs + postcodes + postal
+  # polygons.  Hosts the test portal HTML and acts as the "Ours" leg
+  # in the side-by-side comparison.
+  geocoder-full:
+    build:
+      context: ..
+      dockerfile: test-portal/Dockerfile
+    ports:
+      # 3002 because :3000 is normally claimed by `immich_web` in the
+      # local dev stack.  The test portal is served from this port; it
+      # cross-fetches the minimal server on :3001 for side-by-side.
+      - "3002:3000"
+    environment:
+      QUALITY: q2.5
+      POI_TIER: all
+      MINIMAL: "0"
+    volumes:
+      - geocoder-data-full:/data
+
+  # Minimal dataset — q2.5 admin polygons + place nodes + streets +
+  # addresses only.  No postcodes, no POIs.  Smallest deployable that
+  # still resolves admin + cities/towns/villages/hamlets at GeoNames
+  # cities500-equivalent detail.  The test portal queries this server
+  # at http://localhost:3001 for the side-by-side comparison.
+  geocoder-minimal:
+    build:
+      context: ..
+      dockerfile: test-portal/Dockerfile
+    ports:
+      - "3001:3000"
+    environment:
+      QUALITY: q2.5
+      MINIMAL: "1"
+    volumes:
+      - geocoder-data-minimal:/data
+
+volumes:
+  geocoder-data-full:
+  geocoder-data-minimal:

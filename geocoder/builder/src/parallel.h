@@ -1,0 +1,758 @@
+// Thread-parallel loop and sort for planet-scale arrays. The builder's output
+// must be byte-identical however many cores run it, so nothing here may let
+// the thread count leak into a result.
+#pragma once
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <deque>
+#include <exception>
+#include <future>
+#include <iterator>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <thread>
+#include <type_traits>
+#include <vector>
+
+inline unsigned parallel_threads() {
+    return std::max(1u, std::thread::hardware_concurrency());
+}
+
+// Empties a node container a batch of nodes at a time, pausing between
+// batches, for freeing one beside other work: its nodes go back to the
+// malloc arena they came from, and freed back to back they hold that
+// arena's lock against every other allocation from it, which can wait
+// seconds for its turn.
+template <class Container>
+void release_gently(Container& nodes) {
+    constexpr size_t kNodesPerBatch = 4096;
+    constexpr auto kPause = std::chrono::microseconds(20);
+    while (!nodes.empty()) {
+        for (size_t k = 0; k < kNodesPerBatch && !nodes.empty(); k++) nodes.erase(nodes.begin());
+        std::this_thread::sleep_for(kPause);
+    }
+    Container().swap(nodes);
+}
+
+// A vector of n value-initialized elements, made on a thread of its own:
+// faulting in a fresh planet-sized vector takes one core seconds, which then
+// pass beside other work. get() it where it is needed.
+template <class T>
+std::future<std::vector<T>> vector_beside(size_t n) {
+    return std::async(std::launch::async, [n] { return std::vector<T>(n); });
+}
+
+// Frees a vector on a thread of its own: unmapping a planet-sized vector
+// takes one core a second. The future's destructor waits for it.
+template <class T>
+std::future<void> free_beside(std::vector<T>&& v) {
+    return std::async(std::launch::async, [v = std::move(v)]() mutable { std::vector<T>().swap(v); });
+}
+
+// Runs fn(begin, end, worker) over at most `threads` contiguous ranges that
+// cover [0, n), one thread each (0 = every core). The ranges move with the
+// thread count, so fn must not let them shape its output. The first
+// exception a worker throws is rethrown here after all workers finish.
+template <class Fn>
+void parallel_for(size_t n, Fn&& fn, unsigned threads = 0) {
+    if (threads == 0) threads = parallel_threads();
+    size_t workers = std::min<size_t>(threads, n);
+    if (workers <= 1) {
+        if (n) fn(size_t(0), n, 0u);
+        return;
+    }
+    std::vector<std::exception_ptr> errors(workers);
+    std::vector<std::thread> pool;
+    pool.reserve(workers);
+    for (size_t w = 0; w < workers; w++) {
+        size_t begin = n * w / workers, end = n * (w + 1) / workers;
+        pool.emplace_back([&fn, &errors, begin, end, w] {
+            try {
+                fn(begin, end, static_cast<unsigned>(w));
+            } catch (...) {
+                errors[w] = std::current_exception();
+            }
+        });
+    }
+    for (auto& t : pool) t.join();
+    for (auto& e : errors)
+        if (e) std::rethrow_exception(e);
+}
+
+// fn(element) for every element of v, on every core.
+template <class T, class Fn>
+void parallel_each(std::vector<T>& v, Fn fn, unsigned threads = 0) {
+    parallel_for(v.size(), [&](size_t begin, size_t end, unsigned) {
+        for (size_t i = begin; i < end; i++) fn(v[i]);
+    }, threads);
+}
+
+// parallel_for for uneven per-element cost: workers take the next `grain`
+// elements as they free up. Which worker gets which range depends on timing,
+// so fn must not let it shape its output.
+template <class Fn>
+void parallel_for_dynamic(size_t n, size_t grain, Fn&& fn, unsigned threads = 0) {
+    if (threads == 0) threads = parallel_threads();
+    grain = std::max<size_t>(grain, 1);
+    size_t pieces = (n + grain - 1) / grain;
+    std::atomic<size_t> next{0};
+    parallel_for(std::min<size_t>(threads, pieces), [&](size_t, size_t, unsigned worker) {
+        for (size_t p = next++; p < pieces; p = next++)
+            fn(p * grain, std::min(n, (p + 1) * grain), worker);
+    }, threads);
+}
+
+// Runs fn(part, begin, end, at) over parts laid out back to back, on every
+// core: part p holds offsets[p + 1] - offsets[p] items, and its item i sits
+// at offsets[p] + i. Ranges of about `grain` items never cross a part; `at`
+// is where [begin, end) of `part` starts. Which worker gets a range varies
+// run to run, so fn must not let it shape its output.
+template <class Fn>
+void parallel_for_parts(const std::vector<size_t>& offsets, size_t grain, Fn&& fn, unsigned threads = 0) {
+    size_t n = offsets.empty() ? 0 : offsets.back();
+    parallel_for_dynamic(n, grain, [&](size_t begin, size_t end, unsigned) {
+        size_t p = static_cast<size_t>(std::upper_bound(offsets.begin(), offsets.end(), begin) - offsets.begin()) - 1;
+        for (; begin < end; p++) {
+            size_t part_end = std::min(end, offsets[p + 1]);
+            if (begin < part_end) fn(p, begin - offsets[p], part_end - offsets[p], begin);
+            begin = part_end;
+        }
+    }, threads);
+}
+
+// Lays n variable-size items out back to back on every core, in index
+// order: size(i) gives item i's size, alloc(total) runs once when the total
+// is known, then place(i, offset) writes item i at `offset` (the sizes of
+// the items before it) and returns its size, which must equal size(i).
+template <class Size, class Alloc, class Place>
+size_t parallel_prefix_fill(size_t n, Size size, Alloc alloc, Place place, unsigned threads = 0) {
+    if (threads == 0) threads = parallel_threads();
+    std::vector<size_t> base(threads, 0);
+    parallel_for(n, [&](size_t begin, size_t end, unsigned w) {
+        size_t sum = 0;
+        for (size_t i = begin; i < end; i++) sum += size(i);
+        base[w] = sum;
+    }, threads);
+    size_t total = 0;
+    for (auto& b : base) {
+        size_t range = b;
+        b = total;
+        total += range;
+    }
+    alloc(total);
+    parallel_for(n, [&](size_t begin, size_t end, unsigned w) {
+        size_t offset = base[w];
+        for (size_t i = begin; i < end; i++) offset += place(i, offset);
+    }, threads);
+    return total;
+}
+
+// parallel_for whose ranges never split a run: same_run(i) (i >= 1) says
+// element i continues the run of element i - 1. A range is cut at the first
+// run start at or after its even share, so fn(begin, end, worker) gets whole
+// runs; worker numbers ranges in order and stays below `threads`.
+template <class SameRun, class Fn>
+void parallel_for_runs(size_t n, SameRun same_run, Fn&& fn, unsigned threads = 0) {
+    if (threads == 0) threads = parallel_threads();
+    size_t workers = std::min<size_t>(threads, n);
+    std::vector<size_t> bounds{0};
+    for (size_t w = 1; w < workers; w++) {
+        size_t b = std::max(n * w / workers, bounds.back());
+        while (b < n && same_run(b)) b++;
+        if (b > bounds.back() && b < n) bounds.push_back(b);
+    }
+    bounds.push_back(n);
+    size_t ranges = bounds.size() - 1;
+    parallel_for(ranges, [&](size_t b, size_t e, unsigned) {
+        for (size_t r = b; r < e; r++)
+            if (bounds[r] < bounds[r + 1]) fn(bounds[r], bounds[r + 1], static_cast<unsigned>(r));
+    }, static_cast<unsigned>(ranges));
+}
+
+// Runs fn(i, worker) for every i in [0, n) on at most `threads` threads
+// (0 = every core), handing indices out one at a time so uneven items
+// balance. Which worker runs which i varies run to run. The first exception
+// a worker throws is rethrown here after all workers finish.
+template <class Fn>
+void parallel_for_each(size_t n, Fn&& fn, unsigned threads = 0) {
+    parallel_for_dynamic(n, 1, [&](size_t begin, size_t end, unsigned worker) {
+        for (size_t i = begin; i < end; i++) fn(i, worker);
+    }, threads);
+}
+
+// Runs produce(i) for every i in [0, n) on worker threads and consume(i, r)
+// with each result on the calling thread in index order, so the consumer
+// sees what a serial loop would. At most `window` results are produced ahead
+// of the consumer (0 = two per thread), which bounds their memory. An
+// exception from produce(i) or consume(i) stops the pipeline when the
+// consumer reaches i and is rethrown here.
+template <class Produce, class Consume>
+void parallel_ordered(size_t n, Produce&& produce, Consume&& consume, unsigned threads = 0,
+                      size_t window = 0) {
+    using R = std::decay_t<std::invoke_result_t<Produce&, size_t>>;
+    if (threads == 0) threads = parallel_threads();
+    if (window == 0) window = size_t(2) * threads;
+    size_t workers = std::min<size_t>(threads, n);
+    if (workers <= 1) {
+        for (size_t i = 0; i < n; i++) consume(i, produce(i));
+        return;
+    }
+
+    struct Slot {
+        std::optional<R> result;
+        std::exception_ptr error;
+        bool ready = false;
+    };
+    std::vector<Slot> slots(window);  // index i lives in slot i % window
+    std::mutex mtx;
+    std::condition_variable produced, consumed;
+    size_t next = 0, done = 0;
+    bool stop = false;
+
+    auto work = [&] {
+        for (;;) {
+            size_t i;
+            {
+                std::unique_lock<std::mutex> lock(mtx);
+                consumed.wait(lock, [&] { return stop || next >= n || next < done + window; });
+                if (stop || next >= n) return;
+                i = next++;
+            }
+            Slot out;
+            try {
+                out.result.emplace(produce(i));
+            } catch (...) {
+                out.error = std::current_exception();
+            }
+            bool awaited;  // the consumer waits for this one
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                slots[i % window] = std::move(out);
+                slots[i % window].ready = true;
+                awaited = i == done;
+            }
+            if (awaited) produced.notify_one();
+        }
+    };
+    std::vector<std::thread> pool;
+    pool.reserve(workers);
+    auto finish = [&] {
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            stop = true;
+        }
+        consumed.notify_all();
+        for (auto& t : pool) t.join();
+    };
+    try {
+        for (size_t w = 0; w < workers; w++) pool.emplace_back(work);
+        for (size_t i = 0; i < n; i++) {
+            Slot in;
+            {
+                std::unique_lock<std::mutex> lock(mtx);
+                produced.wait(lock, [&] { return slots[i % window].ready; });
+                in = std::move(slots[i % window]);
+                slots[i % window] = Slot{};
+            }
+            if (in.error) std::rethrow_exception(in.error);
+            consume(i, std::move(*in.result));
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                done = i + 1;
+            }
+            // One more index fits the window: one worker can take it.
+            consumed.notify_one();
+        }
+    } catch (...) {
+        finish();
+        throw;
+    }
+    finish();
+}
+
+// Runs next() on the calling thread until it returns an empty optional and
+// work(value, worker) for each value it returns on up to `threads` worker
+// threads (0 = every core): values are taken in order but finish in any,
+// at most `queued` of them waiting (0 = two per thread), which bounds their
+// memory. worker numbers the worker threads below `threads`. The first
+// exception from next or work stops the stream and is rethrown here once
+// the workers end.
+template <class T, class Next, class Work>
+void parallel_stream(Next&& next, Work&& work, unsigned threads = 0, size_t queued = 0) {
+    if (threads == 0) threads = parallel_threads();
+    if (queued == 0) queued = size_t(2) * threads;
+    std::deque<T> queue;
+    std::mutex mtx;
+    std::condition_variable ready, room;
+    bool closed = false;
+    std::exception_ptr error;
+    auto fail = [&](std::exception_ptr e) {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (!error) error = e;
+        closed = true;
+        queue.clear();
+    };
+    std::vector<std::thread> pool;
+    pool.reserve(threads);
+    for (unsigned w = 0; w < threads; w++) {
+        pool.emplace_back([&, w] {
+            for (;;) {
+                std::optional<T> item;
+                {
+                    std::unique_lock<std::mutex> lock(mtx);
+                    ready.wait(lock, [&] { return closed || !queue.empty(); });
+                    if (queue.empty()) return;
+                    item.emplace(std::move(queue.front()));
+                    queue.pop_front();
+                }
+                room.notify_one();
+                try {
+                    work(*item, w);
+                } catch (...) {
+                    fail(std::current_exception());
+                    ready.notify_all();
+                    room.notify_all();
+                    return;
+                }
+            }
+        });
+    }
+    try {
+        for (;;) {
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                if (closed) break;
+            }
+            std::optional<T> item = next();
+            if (!item) break;
+            std::unique_lock<std::mutex> lock(mtx);
+            room.wait(lock, [&] { return closed || queue.size() < queued; });
+            if (closed) break;
+            queue.push_back(std::move(*item));
+            lock.unlock();
+            ready.notify_one();
+        }
+    } catch (...) {
+        fail(std::current_exception());
+    }
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        closed = true;
+    }
+    ready.notify_all();
+    for (auto& t : pool) t.join();
+    if (error) std::rethrow_exception(error);
+}
+
+// parallel_prefix_fill for output streamed out in order instead of held
+// whole: items [0, n) go back to back in slices of `slice` items. size(i)
+// gives item i's size; build(begin, end, offset, bytes) lays out the slice
+// [begin, end), whose items take `bytes` from `offset` on, and returns it;
+// consume(result) gets the slices in order, at most `window` built ahead of
+// it (0 = two per thread). Returns the total size.
+template <class Size, class Build, class Consume>
+size_t parallel_prefix_stream(size_t n, size_t slice, Size size, Build build, Consume consume,
+                              unsigned threads = 0, size_t window = 0) {
+    slice = std::max<size_t>(slice, 1);
+    const size_t slices = (n + slice - 1) / slice;
+    std::vector<size_t> offset(slices + 1, 0);
+    parallel_for(slices, [&](size_t b, size_t e, unsigned) {
+        for (size_t k = b; k < e; k++)
+            for (size_t i = k * slice, end = std::min(n, i + slice); i < end; i++) offset[k + 1] += size(i);
+    }, threads);
+    for (size_t k = 0; k < slices; k++) offset[k + 1] += offset[k];
+    parallel_ordered(slices, [&](size_t k) {
+        return build(k * slice, std::min(n, (k + 1) * slice), offset[k], offset[k + 1] - offset[k]);
+    }, [&](size_t, auto&& result) { consume(std::move(result)); }, threads, window);
+    return offset[slices];
+}
+
+// Follows a chain of records over [0, size), each record giving where the
+// next starts, in `stripes` stripes walked in parallel. walk(offset, stop,
+// out) appends the records from `offset` that start before `stop` and
+// returns where the chain reaches (>= stop), throwing on a malformed record;
+// find_start(from, to) guesses the first record start in [from, to) (`to`
+// for none). A guess may be wrong, so a stripe's walk is kept only where the
+// chain from 0 lands exactly on its start, and the stripe is walked again in
+// order anywhere else: the records and any exception are exactly those of
+// walk(0, size, out).
+template <class Record, class FindStart, class Walk>
+std::vector<Record> parallel_chain_walk(size_t size, size_t stripes, FindStart&& find_start, Walk&& walk,
+                                        unsigned threads = 0) {
+    std::vector<Record> out;
+    if (threads == 0) threads = parallel_threads();
+    stripes = std::min(stripes, size);
+    if (threads <= 1 || stripes <= 1) {
+        walk(size_t(0), size, out);
+        return out;
+    }
+
+    std::vector<size_t> bounds(stripes + 1);
+    for (size_t k = 0; k < stripes; k++) bounds[k] = size / stripes * k;
+    bounds[stripes] = size;
+
+    struct Stripe {
+        size_t start = 0, end = 0;
+        bool walked = false;
+        std::vector<Record> records;
+    };
+    std::vector<Stripe> walks(stripes);
+    parallel_for_each(stripes, [&](size_t k, unsigned) {
+        Stripe& s = walks[k];
+        s.start = k == 0 ? 0 : find_start(bounds[k], bounds[k + 1]);
+        if (s.start < bounds[k] || s.start >= bounds[k + 1]) return;
+        try {
+            s.end = walk(s.start, bounds[k + 1], s.records);
+            s.walked = true;
+        } catch (...) {
+            std::vector<Record>().swap(s.records);
+        }
+    }, threads);
+
+    size_t total = 0;
+    for (const auto& s : walks) total += s.records.size();
+    out.reserve(total);
+    size_t offset = 0;
+    for (size_t k = 0; k < stripes; k++) {
+        Stripe& s = walks[k];
+        if (offset < bounds[k + 1]) {
+            if (s.walked && s.start == offset) {
+                out.insert(out.end(), std::make_move_iterator(s.records.begin()),
+                           std::make_move_iterator(s.records.end()));
+                offset = s.end;
+            } else {
+                offset = walk(offset, bounds[k + 1], out);
+            }
+        }
+        std::vector<Record>().swap(s.records);
+    }
+    return out;
+}
+
+// Merges sorted runs (pointer, length) into `out`, which has room for all
+// their elements, on every core: the runs are cut at shared splitters and
+// each slice of them merges on its own. Elements move out of the runs;
+// equivalent ones come out lower run first, as a stable merge of the runs in
+// order would put them. T must be default-constructible and movable.
+template <class T, class Cmp>
+void parallel_merge(const std::vector<std::pair<T*, size_t>>& runs, T* out, Cmp cmp, unsigned threads = 0) {
+    constexpr size_t kSamplesPerRun = 32;
+    const size_t k = runs.size();
+    std::vector<T> samples;
+    samples.reserve(k * kSamplesPerRun);
+    for (const auto& [data, len] : runs)
+        if (len > 0)
+            for (size_t s = 1; s <= kSamplesPerRun; s++) samples.push_back(data[len * s / (kSamplesPerRun + 1)]);
+    if (samples.empty()) return;
+    std::sort(samples.begin(), samples.end(), cmp);
+    std::vector<T> splitters;
+    splitters.reserve(k - 1);
+    for (size_t p = 1; p < k; p++) splitters.push_back(samples[p * samples.size() / k]);
+    const size_t slices = splitters.size() + 1;
+
+    // cuts[c * (slices + 1) + p]: where slice p starts in run c. Slice p
+    // holds the elements in [splitters[p-1], splitters[p]).
+    std::vector<size_t> cuts(k * (slices + 1));
+    parallel_for(k, [&](size_t b, size_t e, unsigned) {
+        for (size_t c = b; c < e; c++) {
+            const T* data = runs[c].first;
+            const size_t len = runs[c].second;
+            size_t* cut = &cuts[c * (slices + 1)];
+            cut[0] = 0;
+            for (size_t p = 1; p < slices; p++)
+                cut[p] = static_cast<size_t>(std::lower_bound(data + cut[p - 1], data + len, splitters[p - 1], cmp) - data);
+            cut[slices] = len;
+        }
+    }, threads);
+
+    std::vector<size_t> slice_start(slices + 1, 0);
+    for (size_t p = 0; p < slices; p++) {
+        size_t len = 0;
+        for (size_t c = 0; c < k; c++) len += cuts[c * (slices + 1) + p + 1] - cuts[c * (slices + 1) + p];
+        slice_start[p + 1] = slice_start[p] + len;
+    }
+
+    parallel_for(slices, [&](size_t b, size_t e, unsigned) {
+        struct Run { size_t pos, end, run; };
+        std::vector<Run> heap;
+        auto head = [&](const Run& r) -> T& { return runs[r.run].first[r.pos]; };
+        // Min-heap on the run heads; the lower run wins ties.
+        auto later = [&](const Run& x, const Run& y) {
+            if (cmp(head(y), head(x))) return true;
+            if (cmp(head(x), head(y))) return false;
+            return x.run > y.run;
+        };
+        for (size_t p = b; p < e; p++) {
+            heap.clear();
+            for (size_t c = 0; c < k; c++) {
+                size_t from = cuts[c * (slices + 1) + p], to = cuts[c * (slices + 1) + p + 1];
+                if (from < to) heap.push_back({from, to, c});
+            }
+            std::make_heap(heap.begin(), heap.end(), later);
+            T* dst = out + slice_start[p];
+            while (!heap.empty()) {
+                std::pop_heap(heap.begin(), heap.end(), later);
+                Run& r = heap.back();
+                *dst++ = std::move(head(r));
+                if (++r.pos == r.end) heap.pop_back();
+                else std::push_heap(heap.begin(), heap.end(), later);
+            }
+        }
+    }, threads);
+}
+
+// Sorts [first, last) (contiguous) by cmp on every core (sample sort: sort
+// chunks, then parallel_merge them). The sorted sequence is the one std::sort
+// gives whenever it is unique: cmp a strict total order, or equivalent
+// elements bitwise identical. Equivalent but different elements may land in
+// any order, so such callers must break ties first.
+// T must be default-constructible and movable.
+template <class It, class Cmp>
+void parallel_sort(It first, It last, Cmp cmp, unsigned threads = 0) {
+    using T = typename std::iterator_traits<It>::value_type;
+    constexpr size_t kMinPerChunk = size_t(1) << 16;
+
+    size_t n = static_cast<size_t>(last - first);
+    if (threads == 0) threads = parallel_threads();
+    size_t chunks = std::min<size_t>(threads, n / kMinPerChunk);
+    if (chunks <= 1) {
+        std::sort(first, last, cmp);
+        return;
+    }
+
+    // The merge's destination faults in beside the chunk sorts: faulted in
+    // by the merge, its pages would come one at a time on every core at once.
+    auto merged = vector_beside<T>(n);
+    std::vector<size_t> bounds(chunks + 1);
+    for (size_t c = 0; c <= chunks; c++) bounds[c] = n * c / chunks;
+    parallel_for(chunks, [&](size_t b, size_t e, unsigned) {
+        for (size_t c = b; c < e; c++) std::sort(first + bounds[c], first + bounds[c + 1], cmp);
+    }, threads);
+
+    std::vector<std::pair<T*, size_t>> runs(chunks);
+    for (size_t c = 0; c < chunks; c++) runs[c] = {&*(first + bounds[c]), bounds[c + 1] - bounds[c]};
+    std::vector<T> out = merged.get();
+    parallel_merge(runs, out.data(), cmp, threads);
+
+    parallel_for(n, [&](size_t b, size_t e, unsigned) {
+        std::move(out.begin() + b, out.begin() + e, first + b);
+    }, threads);
+}
+
+// The indices [0, n) by descending cost(i), ties by index: an order to hand
+// out uneven work in, so that the costliest items start first rather than
+// finish last. A NaN cost counts as 0.
+template <class Cost>
+std::vector<uint32_t> costliest_first(size_t n, Cost cost, unsigned threads = 0) {
+    struct Item {
+        float cost;
+        uint32_t index;
+    };
+    std::vector<Item> items(n);
+    parallel_for(n, [&](size_t b, size_t e, unsigned) {
+        for (size_t i = b; i < e; i++) {
+            float c = static_cast<float>(cost(i));
+            items[i] = {std::isnan(c) ? 0.0f : c, static_cast<uint32_t>(i)};
+        }
+    }, threads);
+    parallel_sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
+        return a.cost != b.cost ? a.cost > b.cost : a.index < b.index;
+    }, threads);
+    std::vector<uint32_t> order(n);
+    parallel_for(n, [&](size_t b, size_t e, unsigned) {
+        for (size_t k = b; k < e; k++) order[k] = items[k].index;
+    }, threads);
+    return order;
+}
+
+// Splits [0, n) into at most `threads` blocks and runs fn(block, begin, end)
+// for each on its own thread; returns the block count. The blocks depend
+// only on n and the thread count, so two calls see the same blocks.
+template <class Fn>
+size_t parallel_blocks(size_t n, Fn&& fn, unsigned threads = 0) {
+    constexpr size_t kMinPerBlock = size_t(1) << 14;
+    if (threads == 0) threads = parallel_threads();
+    size_t blocks = std::max<size_t>(1, std::min<size_t>(threads, n / kMinPerBlock));
+    parallel_for(blocks, [&](size_t b0, size_t b1, unsigned) {
+        for (size_t b = b0; b < b1; b++) fn(b, n * b / blocks, n * (b + 1) / blocks);
+    }, threads);
+    return blocks;
+}
+
+// Exclusive prefix sums of size_of(i) over [0, n), plus the total as entry
+// n. size_of runs once per index. Integer sums, so the blocking can't reach
+// the result. An `out` of n + 1 elements (see vector_beside) is filled in
+// place of a new one.
+template <class T, class SizeOf>
+std::vector<T> parallel_offsets(size_t n, SizeOf size_of, unsigned threads = 0, std::vector<T> out = {}) {
+    if (threads == 0) threads = parallel_threads();
+    if (out.size() != n + 1) out.assign(n + 1, T(0));
+    std::vector<T> block_base(threads + 1, T(0));
+    size_t blocks = parallel_blocks(n, [&](size_t b, size_t begin, size_t end) {
+        T sum = 0;
+        for (size_t i = begin; i < end; i++) {
+            out[i] = sum;
+            sum += size_of(i);
+        }
+        block_base[b + 1] = sum;
+    }, threads);
+    for (size_t b = 0; b < blocks; b++) block_base[b + 1] += block_base[b];
+    parallel_blocks(n, [&](size_t b, size_t begin, size_t end) {
+        if (T base = block_base[b])
+            for (size_t i = begin; i < end; i++) out[i] += base;
+    }, threads);
+    out[n] = block_base[blocks];
+    return out;
+}
+
+// What emit(i, out) appends to `out` for each i in [0, n), in index order,
+// gathered on every core: each block of indices fills its own vector and the
+// blocks join in order. emit runs once per index.
+template <class T, class Emit>
+std::vector<T> parallel_collect(size_t n, Emit emit, unsigned threads = 0) {
+    if (threads == 0) threads = parallel_threads();
+    std::vector<std::vector<T>> parts(threads);
+    size_t blocks = parallel_blocks(n, [&](size_t b, size_t begin, size_t end) {
+        for (size_t i = begin; i < end; i++) emit(i, parts[b]);
+    }, threads);
+    std::vector<size_t> at(blocks + 1, 0);
+    for (size_t b = 0; b < blocks; b++) at[b + 1] = at[b] + parts[b].size();
+    std::vector<T> out(at[blocks]);
+    parallel_for(blocks, [&](size_t b0, size_t b1, unsigned) {
+        for (size_t b = b0; b < b1; b++) {
+            std::move(parts[b].begin(), parts[b].end(), out.begin() + at[b]);
+            parts[b] = {};
+        }
+    }, threads);
+    return out;
+}
+
+// The indices i in [0, n) where keep(i), ascending, as Index values. keep
+// runs once per index.
+template <class Index = uint32_t, class Keep>
+std::vector<Index> parallel_filter(size_t n, Keep keep, unsigned threads = 0) {
+    return parallel_collect<Index>(n, [&](size_t i, std::vector<Index>& out) {
+        if (keep(i)) out.push_back(static_cast<Index>(i));
+    }, threads);
+}
+
+// The sum of value(i) over [0, n), added up per block on every core: one
+// shared total would bounce its cache line between them. Integer sums, so
+// the blocking can't reach the result.
+template <class T, class Value>
+T parallel_sum(size_t n, Value value, unsigned threads = 0) {
+    if (threads == 0) threads = parallel_threads();
+    std::vector<T> sums(threads, T(0));
+    size_t blocks = parallel_blocks(n, [&](size_t b, size_t begin, size_t end) {
+        T sum = 0;
+        for (size_t i = begin; i < end; i++) sum += value(i);
+        sums[b] = sum;
+    }, threads);
+    T total = 0;
+    for (size_t b = 0; b < blocks; b++) total += sums[b];
+    return total;
+}
+
+// How many i in [0, n) pred(i) holds for, tested on every core.
+template <class Pred>
+size_t parallel_count(size_t n, Pred pred, unsigned threads = 0) {
+    return parallel_sum<size_t>(n, [&](size_t i) { return pred(i) ? size_t(1) : size_t(0); }, threads);
+}
+
+// Whether pred(i) holds for any i in [0, n).
+template <class Pred>
+bool parallel_any(size_t n, Pred pred, unsigned threads = 0) {
+    std::atomic<bool> found{false};
+    parallel_for(n, [&](size_t begin, size_t end, unsigned) {
+        for (size_t i = begin; i < end && !found.load(std::memory_order_relaxed); i++)
+            if (pred(i)) found.store(true, std::memory_order_relaxed);
+    }, threads);
+    return found.load();
+}
+
+// The indices [0, n) in the order std::sort leaves them under less.
+template <class Less>
+std::vector<uint32_t> std_sort_indices(size_t n, Less less) {
+    std::vector<uint32_t> order(n);
+    for (size_t i = 0; i < n; i++) order[i] = static_cast<uint32_t>(i);
+    std::sort(order.begin(), order.end(), less);
+    return order;
+}
+
+struct SortedIndices {
+    std::vector<uint32_t> order;
+    bool serial = false;  // ties whose order matters: std::sort decided
+};
+
+// std_sort_indices on every core. Indices that tie under less (a strict weak
+// order) land in std::sort's own order only by luck, so when two adjacent
+// ones tie and tie_matters(a, b) says their order reaches the caller's
+// output, this falls back to std_sort_indices. tie_matters must be the
+// negation of an equivalence (e.g. "some output field differs"), so that
+// checking neighbours covers every tied pair.
+template <class Less, class TieMatters>
+SortedIndices parallel_sort_indices(size_t n, Less less, TieMatters tie_matters, unsigned threads = 0) {
+    std::vector<uint32_t> order(n);
+    parallel_for(n, [&](size_t b, size_t e, unsigned) {
+        for (size_t i = b; i < e; i++) order[i] = static_cast<uint32_t>(i);
+    }, threads);
+    parallel_sort(order.begin(), order.end(), less, threads);
+    bool ties = parallel_any(n ? n - 1 : 0, [&](size_t k) {
+        return !less(order[k], order[k + 1]) && tie_matters(order[k], order[k + 1]);
+    }, threads);
+    if (!ties) return {std::move(order), false};
+    return {std_sort_indices(n, less), true};
+}
+
+// parallel_sort_indices sorting keys instead of bare indices: key_of(i)
+// carries i as .index, and key_less on two keys must answer as less on
+// their indices would. std::sort's comparisons and moves depend only on the
+// comparator's answers, so the order, serial fallback included, is the same;
+// the fields compared first just sit together instead of behind an index.
+template <class KeyOf, class KeyLess, class TieMatters>
+SortedIndices parallel_sort_keys(size_t n, KeyOf key_of, KeyLess key_less, TieMatters tie_matters,
+                                 unsigned threads = 0) {
+    std::vector<decltype(key_of(size_t(0)))> keys(n);
+    auto fill = [&] {
+        parallel_for(n, [&](size_t b, size_t e, unsigned) {
+            for (size_t i = b; i < e; i++) keys[i] = key_of(i);
+        }, threads);
+    };
+    fill();
+    parallel_sort(keys.begin(), keys.end(), key_less, threads);
+    bool ties = parallel_any(n ? n - 1 : 0, [&](size_t k) {
+        return !key_less(keys[k], keys[k + 1]) && tie_matters(keys[k].index, keys[k + 1].index);
+    }, threads);
+    if (ties) {
+        fill();
+        std::sort(keys.begin(), keys.end(), key_less);
+    }
+    std::vector<uint32_t> order(n);
+    parallel_for(n, [&](size_t b, size_t e, unsigned) {
+        for (size_t i = b; i < e; i++) order[i] = keys[i].index;
+    }, threads);
+    return {std::move(order), ties};
+}
+
+// Sorts each run of [first, last) by less with std::sort, on every core. A
+// run is a maximal stretch whose neighbours same_run(prev, next) joins;
+// parallel_for_runs never cuts one, so the threads can't change it.
+template <class It, class SameRun, class Less>
+void parallel_sort_runs(It first, It last, SameRun same_run, Less less, unsigned threads = 0) {
+    auto joins = [&](size_t i) { return same_run(first[i - 1], first[i]); };
+    parallel_for_runs(static_cast<size_t>(last - first), joins, [&](size_t begin, size_t end, unsigned) {
+        for (size_t run = begin; run < end;) {
+            size_t next = run + 1;
+            while (next < end && joins(next)) next++;
+            std::sort(first + run, first + next, less);
+            run = next;
+        }
+    }, threads);
+}

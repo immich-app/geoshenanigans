@@ -1,0 +1,4756 @@
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <cstring>
+#include <deque>
+#include <fstream>
+#include <functional>
+#include <future>
+#include <iostream>
+#include <limits>
+#include <mutex>
+#include <numeric>
+#include <optional>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <unordered_set>
+#include <vector>
+
+#include <fcntl.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
+
+#include "pbf_reader.h"
+
+#include <s2/s2cell_id.h>
+#include <s2/s2latlng.h>
+
+#include "types.h"
+#include "string_pool.h"
+#include "geometry.h"
+#include "country_code.h"
+#include "postcode_validation.h"
+#include "id_allocator.h"
+#include "parsed_data.h"
+#include "reorder.h"
+
+#include "s2_helpers.h"
+#include "ring_assembly.h"
+#include "continent_boundaries.h"
+#include "interpolation.h"
+#include "cache.h"
+#include "continent_filter.h"
+#include "cell_index.h"
+#include "parent_linking.h"
+#include "admin_rank_config.h"
+#include "parallel.h"
+#include "scratch_dir.h"
+#include "tiger.h"
+#include "way_tags.h"
+#include "node_index.h"
+#include "string_dict.h"
+#include "vertex_pack.h"
+#include "memory_limit.h"
+#include "write_schedule.h"
+
+
+// --- Place type override classification ---
+
+struct PlaceOverride {
+    AdminPlaceType type;
+    bool tag_present;   // true when any relevant tag (linked_place/border_type/place) was set;
+                        // used to block wikidata linking for boundaries that Nominatim
+                        // treats as having an authoritative place tag (even if the place
+                        // value is state/country/... which we don't translate to an override).
+};
+
+static PlaceOverride classify_place_override(const char* linked_place, const char* /*border_type_unused*/, const char* place_tag) {
+    // Nominatim's get_label_tag (classtypes.py) only checks
+    //   extratags['place']  and  extratags['linked_place']
+    // to short-circuit ADMIN_LABELS; `border_type` is kept in extratags
+    // but NOT read by the labeller. So for Nominatim-parity we only honour
+    // `linked_place` and a direct `place` tag on the boundary.
+    const char* val = linked_place ? linked_place : place_tag;
+    bool present = (val != nullptr && val[0] != '\0');
+    if (!present) return {AdminPlaceType::NONE, false};
+    AdminPlaceType t = AdminPlaceType::NONE;
+    if (std::strcmp(val, "city") == 0) t = AdminPlaceType::CITY;
+    else if (std::strcmp(val, "town") == 0) t = AdminPlaceType::TOWN;
+    else if (std::strcmp(val, "village") == 0) t = AdminPlaceType::VILLAGE;
+    else if (std::strcmp(val, "hamlet") == 0) t = AdminPlaceType::HAMLET;
+    else if (std::strcmp(val, "borough") == 0) t = AdminPlaceType::BOROUGH;
+    else if (std::strcmp(val, "suburb") == 0) t = AdminPlaceType::SUBURB;
+    else if (std::strcmp(val, "neighbourhood") == 0) t = AdminPlaceType::NEIGHBOURHOOD;
+    else if (std::strcmp(val, "quarter") == 0) t = AdminPlaceType::QUARTER;
+    else if (std::strcmp(val, "state") == 0) t = AdminPlaceType::STATE;
+    else if (std::strcmp(val, "province") == 0) t = AdminPlaceType::PROVINCE;
+    else if (std::strcmp(val, "region") == 0) t = AdminPlaceType::REGION;
+    else if (std::strcmp(val, "county") == 0) t = AdminPlaceType::COUNTY;
+    else if (std::strcmp(val, "district") == 0) t = AdminPlaceType::DISTRICT;
+    else if (std::strcmp(val, "municipality") == 0) t = AdminPlaceType::MUNICIPALITY;
+    return {t, true};
+}
+
+// PlaceType (0=CITY, 1=TOWN, ...) → AdminPlaceType (0=NONE, 1=CITY, 2=TOWN, ...)
+// Used when linking an admin boundary to a label-role place node. Without this
+// conversion the enums disagree on zero (PlaceType::CITY=0 vs NONE=0) and any
+// place=city-linked boundary silently becomes unlinked.
+static uint8_t place_type_to_admin_override(uint8_t pt) {
+    switch (static_cast<PlaceType>(pt)) {
+        case PlaceType::CITY:          return static_cast<uint8_t>(AdminPlaceType::CITY);
+        case PlaceType::TOWN:          return static_cast<uint8_t>(AdminPlaceType::TOWN);
+        case PlaceType::VILLAGE:       return static_cast<uint8_t>(AdminPlaceType::VILLAGE);
+        case PlaceType::SUBURB:        return static_cast<uint8_t>(AdminPlaceType::SUBURB);
+        case PlaceType::HAMLET:        return static_cast<uint8_t>(AdminPlaceType::HAMLET);
+        case PlaceType::NEIGHBOURHOOD: return static_cast<uint8_t>(AdminPlaceType::NEIGHBOURHOOD);
+        case PlaceType::QUARTER:       return static_cast<uint8_t>(AdminPlaceType::QUARTER);
+        case PlaceType::BOROUGH:       return static_cast<uint8_t>(AdminPlaceType::BOROUGH);
+        // Non-settlement label-role targets. These match Nominatim's
+        // get_label_tag() which returns extratags['linked_place'] directly.
+        case PlaceType::STATE:         return static_cast<uint8_t>(AdminPlaceType::STATE);
+        case PlaceType::PROVINCE:      return static_cast<uint8_t>(AdminPlaceType::PROVINCE);
+        case PlaceType::REGION:        return static_cast<uint8_t>(AdminPlaceType::REGION);
+        case PlaceType::COUNTY:        return static_cast<uint8_t>(AdminPlaceType::COUNTY);
+        case PlaceType::DISTRICT:      return static_cast<uint8_t>(AdminPlaceType::DISTRICT);
+        default:                        return static_cast<uint8_t>(AdminPlaceType::NONE);
+    }
+}
+
+// --- TIGER address data loading ---
+
+// Reads a whole file into `out`; false when it can't be opened.
+static bool read_whole_file(const std::string& path, std::string& out) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) return false;
+    out.resize(static_cast<size_t>(f.tellg()));
+    f.seekg(0);
+    f.read(out.data(), static_cast<std::streamsize>(out.size()));
+    out.resize(static_cast<size_t>(f.gcount()));
+    return true;
+}
+
+// The TIGER CSVs to load, sorted: those in the directory given, or in the
+// tarball's extraction, which lives as long as this does.
+struct TigerCsvFiles {
+    std::unique_ptr<ScratchDir> extract;
+    std::vector<std::string> paths;
+};
+
+static TigerCsvFiles find_tiger_csvs(const std::string& path) {
+    TigerCsvFiles files;
+    std::string dir_path = path;
+    if (path.find(".tar.gz") != std::string::npos || path.find(".tgz") != std::string::npos) {
+        files.extract = std::make_unique<ScratchDir>("tiger-extract");
+        dir_path = files.extract->path();
+        std::string cmd = "tar xzf '" + path + "' -C '" + dir_path + "'";
+        if (system(cmd.c_str()) != 0) {
+            // --tiger-data was explicitly requested: a silently TIGER-less
+            // planet build would ship without US address ranges/ZIPs.
+            throw std::runtime_error("TIGER extraction failed (tar xzf " + path + ")");
+        }
+    }
+    DIR* dir = opendir(dir_path.c_str());
+    if (dir) {
+        struct dirent* ent;
+        while ((ent = readdir(dir)) != nullptr) {
+            std::string fname = ent->d_name;
+            if (fname.size() > 4 && fname.substr(fname.size()-4) == ".csv") {
+                files.paths.push_back(dir_path + "/" + fname);
+            }
+        }
+        closedir(dir);
+    }
+    std::sort(files.paths.begin(), files.paths.end());
+    return files;
+}
+
+// `pending` is find_tiger_csvs(path), started early so the extraction
+// overlaps the PBF passes.
+static void load_tiger_data(ParsedData& data, const std::string& path, std::future<TigerCsvFiles> pending) {
+    std::cerr << "Loading TIGER address data from " << path << "..." << std::endl;
+    auto _tt = std::chrono::steady_clock::now();
+    auto _tc = CpuTicks::now();
+
+    TigerCsvFiles csvs = pending.get();
+    const std::vector<std::string>& csv_files = csvs.paths;
+    log_phase("  TIGER: extract wait", _tt, _tc);
+    std::cerr << "  Found " << csv_files.size() << " TIGER CSV files" << std::endl;
+    if (csv_files.empty())
+        throw std::runtime_error("--tiger-data given but no .csv files found under " + path);
+
+    // Per-segment ZIP sidecar: cover every already-parsed OSM interpolation
+    // with NO_DATA, then record each TIGER row's postcode below. Stays empty
+    // (and interp_postcodes.bin unwritten) when no TIGER data is loaded.
+    data.interp_postcode_ids.resize(data.interp_ways.size(), NO_DATA);
+
+    // Files parse on every core; their strings intern as a serial load
+    // interns them, and their ranges are laid out after, every file at once.
+    // A file that can't be read stays empty.
+    std::vector<TigerCsv> parsed(csv_files.size());
+    parallel_for_each(csv_files.size(), [&](size_t i, unsigned) {
+        std::string text;
+        if (read_whole_file(csv_files[i], text)) parsed[i] = parse_tiger_csv(text);
+    });
+    uint64_t total_rows = 0;
+    uint64_t loaded_rows = 0;
+    for (const auto& csv : parsed) {
+        total_rows += csv.rows;
+        loaded_rows += csv.ranges.size();
+    }
+    // The arrays grow, seconds of page faults, while the strings intern.
+    auto layout = std::async(std::launch::async, [&] { return grow_tiger_arrays(data, parsed); });
+    const auto string_ids = intern_tiger_csvs(data, parsed);
+    fill_tiger_ranges(data, parsed, string_ids, layout.get());
+
+    // Sidecar exists iff it carries at least one real ZIP: an empty/ZIP-less
+    // TIGER path must not materialize an all-NO_DATA planet-sized file (nor a
+    // pointless patch section every day after).
+    bool any_zip = false;
+    for (uint32_t pc : data.interp_postcode_ids) if (pc != NO_DATA) { any_zip = true; break; }
+    if (!any_zip) data.interp_postcode_ids.clear();
+
+    if (loaded_rows == 0)
+        throw std::runtime_error("--tiger-data given but 0 address ranges loaded from " + path);
+
+    std::cerr << "  TIGER: loaded " << loaded_rows << "/" << total_rows << " address ranges from "
+              << csv_files.size() << " files" << std::endl;
+    std::cerr << "  Interp ways now: " << data.interp_ways.size()
+              << " (" << loaded_rows << " from TIGER)" << std::endl;
+    log_phase("  TIGER: parse", _tt, _tc);
+}
+
+// --- GeoNames postcode loading ---
+// Format: CSV with header "postcode,lat,lon,country_code"
+// Source: GeoNames GB_full (CI), the GB set Nominatim also supplements with
+// Merged into postcode_accum per country; they fill the (country, postcode)
+// pairs OSM has no centroid for (matching Nominatim's _update_from_external).
+
+// The GeoNames rows that pass their country's postcode pattern, in file order.
+struct ExternalPostcodes {
+    struct Row {
+        std::string postcode;
+        double lat, lng;
+        uint16_t cc;
+    };
+    std::vector<Row> rows;
+    uint64_t skipped = 0;  // rejected by the pattern
+};
+
+// Reads the file apart from ParsedData, so that it can overlap TIGER's load.
+static ExternalPostcodes read_external_postcodes(const std::string& path) {
+    std::string cmd;
+    std::string tmp_csv;
+    std::optional<ScratchDir> scratch;
+    if (path.find(".gz") != std::string::npos) {
+        scratch.emplace("external-postcodes");
+        tmp_csv = scratch->path() + "/postcodes.csv";
+        cmd = "gunzip -c '" + path + "' > '" + tmp_csv + "'";
+        if (system(cmd.c_str()) != 0) {
+            throw std::runtime_error("--external-postcodes: failed to gunzip " + path);
+        }
+    } else {
+        tmp_csv = path;
+    }
+
+    std::ifstream f(tmp_csv);
+    if (!f) throw std::runtime_error("--external-postcodes: failed to open " + tmp_csv);
+
+    std::string header;
+    std::getline(f, header); // skip header
+
+    ExternalPostcodes out;
+    std::string line;
+    while (std::getline(f, line)) {
+        // Parse: postcode,lat,lon,country_code
+        size_t p1 = line.find(',');
+        if (p1 == std::string::npos) continue;
+        size_t p2 = line.find(',', p1 + 1);
+        if (p2 == std::string::npos) continue;
+        size_t p3 = line.find(',', p2 + 1);
+        if (p3 == std::string::npos) continue;
+
+        std::string postcode = line.substr(0, p1);
+        double lat = std::strtod(line.c_str() + p1 + 1, nullptr);
+        double lng = std::strtod(line.c_str() + p2 + 1, nullptr);
+        std::string cc_str = line.substr(p3 + 1, 2);
+
+        if (postcode.empty() || cc_str.size() < 2) continue;
+        if (lat == 0 && lng == 0) continue;
+
+        // Validate against country pattern
+        char cc_lower[3] = {
+            static_cast<char>(std::tolower(static_cast<unsigned char>(cc_str[0]))),
+            static_cast<char>(std::tolower(static_cast<unsigned char>(cc_str[1]))),
+            0
+        };
+        if (!validate_postcode_for_country(cc_lower, postcode.c_str())) {
+            out.skipped++;
+            continue;
+        }
+
+        uint16_t cc = pack_country_code(static_cast<char>(std::toupper(static_cast<unsigned char>(cc_str[0]))),
+                                        static_cast<char>(std::toupper(static_cast<unsigned char>(cc_str[1]))));
+        out.rows.push_back({std::move(postcode), lat, lng, cc});
+    }
+    return out;
+}
+
+static void load_external_postcodes(ParsedData& data, const std::string& path,
+                std::future<ExternalPostcodes> pending) {
+    std::cerr << "Loading external postcode centroids from " << path << "..." << std::endl;
+    auto _gt = std::chrono::steady_clock::now();
+    auto _gc = CpuTicks::now();
+    const ExternalPostcodes external = pending.get();
+
+    uint64_t loaded = 0;
+    for (const auto& row : external.rows) {
+        // Keyed by the CSV's own country: GeoNames knows which country a
+        // postcode belongs to, where a centroid-based lookup mis-assigns
+        // border-strip entries. A (country, postcode) TIGER already
+        // provides wins; OSM pairs win at write time, as Nominatim's
+        // _update_from_external adds external postcodes only when OSM has
+        // none.
+        uint64_t key = postcode_key(row.cc, data.string_pool.intern(row.postcode));
+        if (data.postcode_accum.find(key) == data.postcode_accum.end()) {
+            data.postcode_accum[key].add(row.lat, row.lng);
+            loaded++;
+        }
+    }
+
+    std::cerr << "  GeoNames: loaded " << loaded << " new postcodes, "
+              << external.skipped << " rejected by pattern, "
+              << data.postcode_accum.size() << " total centroids" << std::endl;
+    log_phase("  GeoNames: load", _gt, _gc);
+}
+
+// --- Main ---
+
+#include "poi_classify.h"
+
+// Build configuration parsed from argv, threaded through the extracted pipeline
+// phases (decomposition seam: free functions taking ParsedData& data + const BuildConfig&).
+struct BuildConfig {
+    unsigned int num_threads = 1;
+    IndexMode mode = IndexMode::Full;
+    bool multi_output = false;
+    bool multi_quality = false;
+    std::string output_dir;
+    std::string prev_output_dir;
+};
+
+// Admin polygon containment with every ring's RingBox precomputed, so the ray
+// cast only runs where the exact box reject can't answer. Polygons whose
+// vertex range is out of bounds get the empty box; callers skip them anyway.
+class AdminRings {
+public:
+    AdminRings(const ParsedData& data, unsigned int threads)
+        : data_(data), boxes_(data.admin_polygons.size()), edges_(data.admin_polygons.size()) {
+        // The polygons come largest first: hand them out a few at a time.
+        parallel_for_dynamic(boxes_.size(), kRingsPerChunk, [&](size_t begin, size_t end, unsigned) {
+            for (size_t i = begin; i < end; i++) {
+                const auto& p = data.admin_polygons[i];
+                if (p.vertex_offset + p.vertex_count > data.admin_vertices.size()) {
+                    boxes_[i] = ring_box(nullptr, 0);
+                    continue;
+                }
+                const NodeCoord* verts = &data.admin_vertices[p.vertex_offset];
+                boxes_[i] = ring_box(verts, p.vertex_count);
+                if (p.vertex_count >= kMinIndexedRingVertices)
+                    edges_[i] = std::make_unique<RingEdgeIndex>(verts, p.vertex_count);
+            }
+        }, threads);
+    }
+
+    bool contains(uint32_t pid, float lat, float lng) const {
+        if (ring_box_excludes(boxes_[pid], lat, lng)) return false;
+        if (edges_[pid]) return edges_[pid]->contains(lat, lng);
+        const auto& p = data_.admin_polygons[pid];
+        return ring_contains(&data_.admin_vertices[p.vertex_offset], p.vertex_count, lat, lng);
+    }
+
+    // The first of `ranked` (see rank_candidates) containing the point, or NO_DATA.
+    uint32_t first_containing(const std::vector<uint32_t>& ranked, float lat, float lng) const {
+        for (uint32_t pid : ranked)
+            if (contains(pid, lat, lng)) return pid;
+        return NO_DATA;
+    }
+
+private:
+    // Rings this long cast their ray through a RingEdgeIndex, which answers
+    // as ring_contains does: the passes test millions of points against the
+    // same big rings, each a scan of thousands of edges.
+    static constexpr uint32_t kMinIndexedRingVertices = 64;
+    static constexpr size_t kRingsPerChunk = 16;
+
+    const ParsedData& data_;
+    std::vector<RingBox> boxes_;
+    std::vector<std::unique_ptr<RingEdgeIndex>> edges_;  // null below kMinIndexedRingVertices
+};
+
+// Calls visit(pid, polygon) for each in-bounds admin polygon listed in `cell`
+// or its neighbours, in the order the parent passes have always scanned them:
+// the cell, then AppendAllNeighbors order, each cell's list in order. An id
+// listed in several cells is visited once per listing.
+template <typename Visit>
+static void for_each_admin_candidate(const ParsedData& data, S2CellId cell,
+                std::vector<S2CellId>& nbrs, Visit visit) {
+    auto scan = [&](S2CellId c) {
+        auto it = data.cell_to_admin.find(c.id());
+        if (it == data.cell_to_admin.end()) return;
+        for (uint32_t raw_id : it->second) {
+            uint32_t pid = raw_id & ID_MASK;
+            if (pid >= data.admin_polygons.size()) continue;
+            const auto& p = data.admin_polygons[pid];
+            if (p.vertex_offset + p.vertex_count > data.admin_vertices.size()) continue;
+            visit(pid, p);
+        }
+    };
+    nbrs.clear();
+    cell.AppendAllNeighbors(kAdminCellLevel, &nbrs);
+    scan(cell);
+    for (S2CellId n : nbrs) scan(n);
+}
+
+// rank_candidates orders admin polygons by area, which needs a strict weak
+// order. The shoelace area of finite coordinates is never NaN.
+static void require_ordered_admin_areas(const ParsedData& data) {
+    for (const auto& p : data.admin_polygons)
+        if (std::isnan(p.area)) throw std::runtime_error("Admin polygon area is NaN");
+}
+
+// Items 0..n-1 as (cell_of(i), i) pairs sorted by cell then item, so a pass
+// that looks around each item's cell can walk a cell's items together and
+// share the lookup. cell_of returns 0 (never a valid cell id) to drop an item.
+template <typename CellOf>
+static std::vector<CellItemPair> items_by_cell(size_t n, unsigned int threads, CellOf cell_of) {
+    std::vector<CellItemPair> order(n);
+    parallel_for(n, [&](size_t begin, size_t end, unsigned) {
+        for (size_t i = begin; i < end; i++) order[i] = {cell_of(i), static_cast<uint32_t>(i)};
+    }, threads);
+    parallel_sort(order.begin(), order.end(), cell_item_less, threads);
+    order.erase(order.begin(), std::find_if(order.begin(), order.end(),
+                                            [](const CellItemPair& p) { return p.cell_id != 0; }));
+    return order;
+}
+
+// Items per chunk of a cell walk: small enough to spread dense cells over the
+// workers, large enough that chunk edges rarely repeat a cell's lookup.
+static constexpr size_t kCellWalkGrain = 1024;
+
+// Items per chunk when a pass hands items to whichever worker is free: one
+// shared counter bump per chunk instead of per item (the planet's 116M POIs
+// are mostly a single cell lookup each), small enough that a chunk of costly
+// items ends quickly.
+static constexpr size_t kItemGrain = 64;
+
+// Walks `order` (from items_by_cell) on every core: on_cell(cell, state) runs
+// on entering a cell, then on_item(item, state) for each of its items. Each
+// worker owns one State. A cell split across chunks is entered once per chunk,
+// so on_cell must rebuild the state from the cell alone.
+template <typename State, typename OnCell, typename OnItem>
+static void walk_items_by_cell(const std::vector<CellItemPair>& order, unsigned int threads,
+                OnCell on_cell, OnItem on_item) {
+    std::vector<State> states(std::max(1u, threads));
+    parallel_for_dynamic(order.size(), kCellWalkGrain, [&](size_t begin, size_t end, unsigned worker) {
+        State& state = states[worker];
+        for (size_t k = begin; k < end; k++) {
+            if (k == begin || order[k].cell_id != order[k - 1].cell_id)
+                on_cell(S2CellId(order[k].cell_id), state);
+            on_item(order[k].item_id, state);
+        }
+    }, threads);
+}
+
+// rank_candidates order of the admin parent-chain picks: highest admin_level
+// (the closest parent), then smallest area.
+static auto closest_parent_first(const ParsedData& data) {
+    return [&data](uint32_t a, uint32_t b) {
+        const auto& pa = data.admin_polygons[a];
+        const auto& pb = data.admin_polygons[b];
+        if (pa.admin_level != pb.admin_level) return pa.admin_level > pb.admin_level;
+        return pa.area < pb.area;
+    };
+}
+
+// Admin polygon parent chain: for each admin polygon, find the smallest containing
+// polygon with a lower admin_level so the server walks the chain without PIP.
+static void compute_admin_parent_chain(ParsedData& data, const BuildConfig& cfg) {
+    unsigned int num_threads = cfg.num_threads;
+    {
+        auto _ap_t = std::chrono::steady_clock::now();
+        auto _ap_cpu = CpuTicks::now();
+        data.admin_parent_ids.assign(data.admin_polygons.size(), NO_DATA);
+        require_ordered_admin_areas(data);
+        const AdminRings rings(data, num_threads);
+        auto closer = closest_parent_first(data);
+        struct Candidates {
+            std::vector<S2CellId> nbrs;
+            std::vector<uint32_t> parents;
+            std::vector<std::pair<uint32_t, uint32_t>> scratch;
+        };
+        std::vector<Candidates> scratch(std::max(1u, num_threads));
+        parallel_for_dynamic(data.admin_polygons.size(), 64, [&](size_t begin, size_t end, unsigned worker) {
+            Candidates& c = scratch[worker];
+            for (size_t i = begin; i < end; i++) {
+                const auto& self = data.admin_polygons[i];
+                if (self.vertex_count == 0 || self.admin_level <= 2) continue;
+                // Compute centroid
+                float sum_lat = 0, sum_lng = 0;
+                for (uint32_t v = 0; v < self.vertex_count; v++) {
+                    sum_lat += data.admin_vertices[self.vertex_offset + v].lat;
+                    sum_lng += data.admin_vertices[self.vertex_offset + v].lng;
+                }
+                float clat = sum_lat / self.vertex_count;
+                float clng = sum_lng / self.vertex_count;
+                S2CellId cell = S2CellId(S2LatLng::FromDegrees(clat, clng)).parent(kAdminCellLevel);
+
+                // Pick the closest parent: highest admin_level
+                // (most immediate), with smallest area as tiebreaker.
+                // This matches Nominatim's parent_place_id = closest
+                // containing by rank_address. A level-0 polygon must
+                // beat the old scan's starting best area.
+                c.parents.clear();
+                for_each_admin_candidate(data, cell, c.nbrs, [&](uint32_t pid, const AdminPolygon& p) {
+                    if (pid == i || p.admin_level >= self.admin_level) return;
+                    if (p.admin_level > 0 || p.area < 1e18f) c.parents.push_back(pid);
+                });
+                rank_candidates(c.parents, closer, c.scratch);
+                data.admin_parent_ids[i] = rings.first_containing(c.parents, clat, clng);
+            }
+        }, num_threads);
+        double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - _ap_t).count();
+        uint32_t linked = 0;
+        for (auto id : data.admin_parent_ids) if (id != NO_DATA) linked++;
+        std::cerr << "Admin parent chain: " << linked << "/" << data.admin_polygons.size()
+                  << " polygons linked in " << el << "s" << std::endl;
+        log_phase("    Admin: parent chain", _ap_t, _ap_cpu);
+    }
+}
+
+// Way parent polygon: for each street way, find the smallest admin polygon containing
+// its centroid (server walks the admin chain from a road).
+static void compute_way_parent_polygons(ParsedData& data, const BuildConfig& cfg) {
+    unsigned int num_threads = cfg.num_threads;
+    {
+        auto _wp_t = std::chrono::steady_clock::now();
+        auto _wp_cpu = CpuTicks::now();
+        data.way_parent_ids.assign(data.ways.size(), NO_DATA);
+        data.way_postcode_ids.assign(data.ways.size(), NO_DATA);
+        require_ordered_admin_areas(data);
+        const AdminRings rings(data, num_threads);
+        auto more_specific = closest_parent_first(data);
+
+        // Note: per-way postcode is set from postal boundary PIP only.
+        // The centroid fallback (get_nearest_postcode) is handled at
+        // query time by the server using the per-country-validated
+        // centroid index. Previously the way sweep also did centroid
+        // lookup, but that used the raw (non-per-country) accum which
+        // produced wrong results from cross-country contamination.
+
+        auto centroid = [&](const WayHeader& w) {
+            float sum_lat = 0, sum_lng = 0;
+            uint16_t cnt = w.node_count;
+            for (uint16_t k = 0; k < cnt; k++) {
+                sum_lat += data.street_nodes[w.node_offset + k].lat;
+                sum_lng += data.street_nodes[w.node_offset + k].lng;
+            }
+            return NodeCoord{sum_lat / cnt, sum_lng / cnt};
+        };
+        // Ways are walked per centroid admin cell, so each cell's
+        // candidates are gathered and ranked once.
+        auto order = items_by_cell(data.ways.size(), num_threads, [&](size_t i) -> uint64_t {
+            const auto& w = data.ways[i];
+            if (w.node_count < 1) return 0;
+            NodeCoord c = centroid(w);
+            return S2CellId(S2LatLng::FromDegrees(c.lat, c.lng)).parent(kAdminCellLevel).id();
+        });
+
+        struct PostalVote { uint32_t pid; uint32_t votes; float area; };
+        struct Candidates {
+            std::vector<S2CellId> nbrs;
+            std::vector<uint32_t> admins, postals;
+            std::vector<std::pair<uint32_t, uint32_t>> scratch;
+            std::vector<uint32_t> seen;
+            std::vector<PostalVote> postal_votes;
+        };
+        walk_items_by_cell<Candidates>(order, num_threads,
+            [&](S2CellId cell, Candidates& c) {
+                // Admin levels <= 10 compete for the parent chain, postal
+                // boundaries (11) for the postcode. A level-0 polygon must
+                // beat the old per-way scan's starting best area.
+                c.admins.clear();
+                c.postals.clear();
+                for_each_admin_candidate(data, cell, c.nbrs, [&](uint32_t pid, const AdminPolygon& p) {
+                    if (p.admin_level <= 10) {
+                        if (p.admin_level > 0 || p.area < 1e18f) c.admins.push_back(pid);
+                    } else if (p.admin_level == 11) {
+                        c.postals.push_back(pid);
+                    }
+                });
+                rank_candidates(c.admins, more_specific, c.scratch);
+                keep_first_occurrences(c.postals, c.seen);
+            },
+            [&](uint32_t i, Candidates& c) {
+                const auto& w = data.ways[i];
+                uint16_t cnt = w.node_count;
+                NodeCoord center = centroid(w);
+
+                // Pick the most specific containing polygon: highest
+                // admin_level, then smallest area. Parent-chain pick uses
+                // centroid PIP — admin hierarchy is fine-grained enough
+                // that centroid containment gives a stable result.
+                data.way_parent_ids[i] = rings.first_containing(c.admins, center.lat, center.lng);
+
+                // Nominatim's `getNearFeatures`
+                // (lib-sql/functions/partition-functions.sql:42)
+                // returns every postal polygon that intersects the
+                // street's LineString, ordered by
+                //   `min(ST_Distance(way_centroid, poly_geom))
+                //    + 0.00001 * ST_Distance(way, poly_centroid)`.
+                // The dominant term picks polygons containing the way's
+                // centroid; when multiple polygons overlap the way but
+                // only one contains its centroid, that one wins. For a
+                // long street crossing several postal polygons (Delhi's
+                // Kartavya Path traverses 110001 / 110004 / 110098),
+                // which polygon owns the centroid depends on the
+                // street's shape — centroid PIP alone can pick a polygon
+                // that covers only a small fraction of the way. We tally
+                // a per-polygon vertex-containment vote and pick the
+                // polygon that covers the most way vertices; ties break
+                // by smallest area. That matches the spirit of
+                // `ST_Distance(way, poly_centroid)` closer than pure
+                // centroid containment.
+                // Votes count sampled vertices (every step-th, to bound
+                // work on huge ways). Polygons holding at least one
+                // sample vote in first-listed order: std::sort breaks
+                // (votes, area) ties by input order.
+                auto& postal_votes = c.postal_votes;
+                postal_votes.clear();
+                uint8_t samples = cnt < 16 ? cnt : 16;
+                uint32_t step = cnt > samples ? cnt / samples : 1;
+                for (uint32_t pid : c.postals) {
+                    uint32_t votes = 0;
+                    for (uint32_t k = 0; k < cnt; k += step) {
+                        const auto& nd = data.street_nodes[w.node_offset + k];
+                        if (rings.contains(pid, nd.lat, nd.lng)) votes++;
+                    }
+                    if (votes > 0) postal_votes.push_back({pid, votes, data.admin_polygons[pid].area});
+                }
+                // Sort: highest votes first, tiebreak by smaller area
+                // (more specific).
+                std::sort(postal_votes.begin(), postal_votes.end(),
+                    [](const PostalVote& a, const PostalVote& b) {
+                        if (a.votes != b.votes) return a.votes > b.votes;
+                        return a.area < b.area;
+                    });
+                if (!postal_votes.empty()) {
+                    data.way_postcode_ids[i] = data.admin_polygons[postal_votes[0].pid].name_id;
+                }
+            });
+        // Counted afterwards: a shared per-way counter would bounce one
+        // cache line between every core.
+        size_t way_linked = parallel_count(data.ways.size(),
+            [&](size_t i) { return data.way_parent_ids[i] != NO_DATA; }, num_threads);
+        double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - _wp_t).count();
+        std::cerr << "Way parent polygon: " << way_linked << "/" << data.ways.size()
+                  << " ways linked in " << el << "s" << std::endl;
+        log_phase("    Admin: way parent polygons", _wp_t, _wp_cpu);
+    }
+}
+
+// Shared nearest-named-street sweep used by the addr backfill and the POI
+// parent-street pass: expand a 5x5 ring of street-level cells around the
+// point's cell — cell_to_ways is empty at this point (parallel_sort_and_build
+// skips the hash map), so binary-search sorted_way_cells instead — then visit
+// every named street listed there once, with the smallest local-flat
+// point-to-segment distance-squared over its segments. Callers keep their own
+// best-candidate selection, including the deterministic osm_id tie-break for
+// exact-distance ties. Visiting per listing and per segment would pick the
+// same streets: a repeat never beats the pick it already lost or set, and
+// only a street's smallest distance can win. Both passes walk their points
+// per street cell, so each cell's streets are gathered once.
+struct NearbyStreets {
+    std::vector<S2CellId> ring1, ring2;
+    std::vector<uint64_t> cells;
+    std::vector<uint32_t> ways;
+    std::vector<uint32_t> seen;
+};
+
+static uint64_t street_cell_of(float lat, float lng) {
+    return S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(kStreetCellLevel).id();
+}
+
+// Fills nearby.ways with the named streets listed around `center`, each once,
+// in the order the sweep has always met them: cells by id, each cell's ways
+// by index.
+static void gather_nearby_named_streets(const ParsedData& data, S2CellId center,
+                NearbyStreets& nearby) {
+    // Walk the centre plus a 5x5 ring of neighbours at kStreetCellLevel
+    // (~300m per cell) = ~1.5km coverage: enough to find the nearest named
+    // street, tight enough to avoid quadratic blow-up.
+    auto& cells_to_check = nearby.cells;
+    cells_to_check.clear();
+    // Two or more cells in from every cube-face edge, the neighbours of the
+    // neighbours are exactly the same-face block (i, j) +- 2 cells; build it
+    // directly. Nearer an edge they wrap onto other faces: expand through S2.
+    int ci, cj;
+    int face = center.ToFaceIJOrientation(&ci, &cj, nullptr);
+    int size = center.GetSizeIJ();
+    ci &= -size;
+    cj &= -size;
+    int64_t reach = 2 * int64_t(size);
+    if (ci - reach >= 0 && ci + reach < S2CellId::kMaxSize &&
+        cj - reach >= 0 && cj + reach < S2CellId::kMaxSize) {
+        for (int a = -2; a <= 2; a++) {
+            for (int b = -2; b <= 2; b++) {
+                cells_to_check.push_back(S2CellId::FromFaceIJ(face, ci + a * size, cj + b * size)
+                                             .parent(kStreetCellLevel).id());
+            }
+        }
+    } else {
+        cells_to_check.push_back(center.id());
+        auto& ring1 = nearby.ring1;
+        auto& ring2 = nearby.ring2;
+        ring1.clear();
+        center.AppendAllNeighbors(kStreetCellLevel, &ring1);
+        for (const auto& n : ring1) {
+            cells_to_check.push_back(n.id());
+            ring2.clear();
+            n.AppendAllNeighbors(kStreetCellLevel, &ring2);
+            for (const auto& n2 : ring2) {
+                cells_to_check.push_back(n2.id());
+            }
+        }
+    }
+    // De-duplicate expansion.
+    std::sort(cells_to_check.begin(), cells_to_check.end());
+    cells_to_check.erase(
+        std::unique(cells_to_check.begin(), cells_to_check.end()),
+        cells_to_check.end());
+
+    auto& ways = nearby.ways;
+    ways.clear();
+    const auto last = data.sorted_way_cells.end();
+    auto from = data.sorted_way_cells.begin();
+    for (size_t k = 0; k < cells_to_check.size(); k++) {
+        uint64_t cid = cells_to_check[k];
+        CellItemPair probe{cid, 0};
+        // The cells ascend, so each run starts past the previous one: gallop
+        // from there instead of searching the whole table again.
+        auto p = k == 0 ? std::lower_bound(from, last, probe, cell_item_less)
+                        : gallop_lower_bound(from, last, probe, cell_item_less);
+        for (; p != last && p->cell_id == cid; ++p) {
+            uint32_t way_id = p->item_id;
+            if (way_id >= data.ways.size()) continue;
+            const auto& w = data.ways[way_id];
+            // Only named streets matter for parent linking.
+            if (w.name_id == NO_DATA) continue;
+            if (w.node_count < 2) continue;
+            if (static_cast<size_t>(w.node_offset) + w.node_count > data.street_nodes.size()) continue;
+            ways.push_back(way_id);
+        }
+        from = p;
+    }
+    keep_first_occurrences(ways, nearby.seen);
+}
+
+// visit(way_id, way, d2, osm_id) for each of nearby.ways, gathered around the
+// street cell of (plat, plng).
+template <typename Visit>
+static void for_each_nearby_named_street(const ParsedData& data, const NearbyStreets& nearby,
+                float plat, float plng, Visit visit) {
+    const double cos_lat = std::cos(
+        plat * M_PI / 180.0);
+    for (uint32_t way_id : nearby.ways) {
+        const auto& w = data.ways[way_id];
+        uint32_t off = w.node_offset;
+        uint16_t cnt = w.node_count;
+        // Point-to-segment distance in local-flat approximation
+        // (good enough for nearest-street ranking).
+        double min_d2 = INFINITY;
+        for (uint16_t k = 0; k + 1 < cnt; k++) {
+            const auto& a = data.street_nodes[off + k];
+            const auto& b = data.street_nodes[off + k + 1];
+            double ax = (a.lng - plng) * cos_lat;
+            double ay = (a.lat - plat);
+            double bx = (b.lng - plng) * cos_lat;
+            double by = (b.lat - plat);
+            double dx = bx - ax;
+            double dy = by - ay;
+            double seg_len2 = dx * dx + dy * dy;
+            double d2;
+            if (seg_len2 < 1e-18) {
+                d2 = ax * ax + ay * ay;
+            } else {
+                double tt = -(ax * dx + ay * dy) / seg_len2;
+                if (tt < 0.0) tt = 0.0;
+                else if (tt > 1.0) tt = 1.0;
+                double qx = ax + tt * dx;
+                double qy = ay + tt * dy;
+                d2 = qx * qx + qy * qy;
+            }
+            if (d2 < min_d2) min_d2 = d2;
+        }
+        int64_t cand_osm = way_id < data.way_osm_ids.size()
+            ? data.way_osm_ids[way_id] : INT64_MAX;
+        visit(way_id, w, min_d2, cand_osm);
+    }
+}
+
+// Address-point parent-street backfill: link addr_points lacking addr:street to the
+// nearest named street's name_id (Nominatim parent_place_id parity).
+static void backfill_addr_point_parent_streets(ParsedData& data, const BuildConfig& cfg,
+                std::chrono::steady_clock::time_point& _s2t, CpuTicks& _s2cpu) {
+    unsigned int num_threads = cfg.num_threads;
+    if (!data.addr_points.empty() && !data.ways.empty()) {
+        auto _as_t = std::chrono::steady_clock::now();
+        size_t backfill_candidates = parallel_count(data.addr_points.size(),
+            [&](size_t i) { return data.addr_points[i].street_id == NO_DATA; }, num_threads);
+        std::cerr << "Backfilling addr_point parent streets ("
+                  << backfill_candidates << "/"
+                  << data.addr_points.size() << " need it)..."
+                  << std::endl;
+
+        const auto& pool_data = data.string_pool.data();
+        auto order = items_by_cell(data.addr_points.size(), num_threads, [&](size_t i) {
+            return street_cell_of(data.addr_points[i].lat, data.addr_points[i].lng);
+        });
+        // A street the token match may take: listed is its visit order.
+        struct MatchCandidate {
+            double d2;
+            int64_t osm;
+            uint32_t listed, way_id, name_id, orig_id;
+        };
+        auto nearer = [](const MatchCandidate& a, const MatchCandidate& b) {
+            if (a.d2 != b.d2) return a.d2 < b.d2;
+            if (a.osm != b.osm) return a.osm < b.osm;
+            return a.listed < b.listed;
+        };
+        struct Scratch {
+            NearbyStreets nearby;
+            std::vector<MatchCandidate> match_candidates;
+        };
+        walk_items_by_cell<Scratch>(order, num_threads,
+            [&](S2CellId cell, Scratch& scratch) { gather_nearby_named_streets(data, cell, scratch.nearby); },
+            [&](uint32_t i, Scratch& scratch) {
+                auto& ap = data.addr_points[i];
+                ap.parent_way_id = NO_DATA;
+
+                double best_d2 = 1e18;
+                uint32_t best_name = NO_DATA;
+                uint32_t best_way_idx = NO_DATA;
+                // Stable tie-break for EXACT-distance ties. The
+                // candidate iteration is ordered by sorted_way_cells
+                // item_id = the pre-sort way index, which is
+                // non-deterministic (parallel PBF parse order). When
+                // an addr point is exactly equidistant from two
+                // different (non-duplicate) ways — corners,
+                // intersections, shared nodes — a strict `d2 < best`
+                // pick lets the build-encounter order decide the
+                // winner, so parent_way_id flips between same-PBF
+                // builds. Since parent_way_id is part of the dedup
+                // key, those flips cascade into massive addr_points
+                // patch churn. Break exact ties by the way's osm_id
+                // (invariant across builds) for a deterministic pick.
+                int64_t best_osm = INT64_MAX;
+                // Token-matched resolution: track nearest
+                // way whose original name matches addr:street
+                uint32_t best_match_name = NO_DATA;
+                uint32_t best_match_way = NO_DATA;
+                const char* addr_street_str = nullptr;
+                if (ap.street_id != NO_DATA) {
+                    addr_street_str = pool_data.data() + ap.street_id;
+                }
+                auto& candidates = scratch.match_candidates;
+                candidates.clear();
+                for_each_nearby_named_street(data, scratch.nearby, ap.lat, ap.lng,
+                    [&](uint32_t way_id, const WayHeader& w, double d2, int64_t cand_osm) {
+                        if (d2 < best_d2 ||
+                            (d2 == best_d2 && cand_osm < best_osm)) {
+                            best_d2 = d2;
+                            best_name = w.name_id;
+                            best_way_idx = way_id;
+                            best_osm = cand_osm;
+                        }
+                        // Token-matched: a way whose original name may
+                        // match addr:street, within the (1e18, INT64_MAX)
+                        // bound the match starts from.
+                        if ((d2 < 1e18 || (d2 == 1e18 && cand_osm < INT64_MAX))
+                            && addr_street_str
+                            && way_id < data.way_orig_name_ids.size()) {
+                            uint32_t orig_id = data.way_orig_name_ids[way_id];
+                            if (orig_id != NO_DATA) {
+                                candidates.push_back({d2, cand_osm, static_cast<uint32_t>(candidates.size()),
+                                                      way_id, w.name_id, orig_id});
+                            }
+                        }
+                    });
+                // The match is the smallest (d2, osm_id) whose original
+                // name shares a token with addr:street, the first visited
+                // on exact ties: test candidates nearest first, sparing
+                // tokens_overlap on everything beyond the match.
+                const MatchCandidate* match = first_qualifying(candidates, nearer,
+                    [&](const MatchCandidate& c) {
+                        return tokens_overlap(addr_street_str, pool_data.data() + c.orig_id);
+                    });
+                if (match) {
+                    best_match_name = match->name_id;
+                    best_match_way = match->way_id;
+                }
+                if (best_way_idx != NO_DATA) {
+                    // Prefer token-matched way (matches
+                    // Nominatim's getNearestNamedRoadPlaceId
+                    // which finds the closest street whose
+                    // name tokens overlap with addr:street).
+                    if (best_match_way != NO_DATA) {
+                        ap.parent_way_id = best_match_way;
+                        ap.street_id = best_match_name;
+                    } else {
+                        ap.parent_way_id = best_way_idx;
+                        if (ap.street_id == NO_DATA && best_name != NO_DATA) {
+                            ap.street_id = best_name;
+                        }
+                    }
+                }
+            });
+        // Counted afterwards: a shared per-point counter would bounce one
+        // cache line between every core.
+        size_t ap_linked = parallel_count(data.addr_points.size(),
+            [&](size_t i) { return data.addr_points[i].parent_way_id != NO_DATA; }, num_threads);
+        double _ap_elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - _as_t).count();
+        std::cerr << "Addr parent-street backfill: "
+                  << ap_linked << "/"
+                  << backfill_candidates
+                  << " addr_points linked in "
+                  << _ap_elapsed << "s" << std::endl;
+        log_phase("  Addr: parent-street backfill", _s2t, _s2cpu);
+    }
+}
+
+// The (cell_id, item_id) pairs emit(i, scratch, out) appends for each item i
+// in [0, n), one list per worker, for parallel_sort_and_build. Items go out
+// in chunks of `grain` to whichever worker is free; each worker keeps its own
+// Scratch and list, off the other workers' cache lines.
+template <class Scratch, class Emit>
+static std::vector<std::vector<CellItemPair>> emit_item_cells(size_t n, size_t grain, unsigned int threads,
+                Emit emit) {
+    struct alignas(64) Worker {
+        Scratch scratch;
+        std::vector<CellItemPair> pairs;
+    };
+    std::vector<Worker> workers(std::max(1u, threads));
+    parallel_for_dynamic(n, grain, [&](size_t begin, size_t end, unsigned w) {
+        Worker& worker = workers[w];
+        for (size_t i = begin; i < end; i++) emit(i, worker.scratch, worker.pairs);
+    }, threads);
+    std::vector<std::vector<CellItemPair>> pairs(workers.size());
+    for (size_t w = 0; w < workers.size(); w++) pairs[w] = std::move(workers[w].pairs);
+    return pairs;
+}
+
+// Scratch for covering a polyline's edges with street-level cells.
+struct EdgeCellScratch {
+    std::vector<S2CellId> node_cells, edge_cells;
+    std::vector<uint64_t> cells;
+};
+
+// Appends (cell, item) for each street-level cell the polyline's edges cross,
+// once per cell, in cell order.
+static void emit_polyline_cells(const NodeCoord* nodes, uint16_t count, uint32_t item,
+                EdgeCellScratch& s, std::vector<CellItemPair>& out) {
+    s.cells.clear();
+    s.node_cells.clear();
+    if (count >= 2)
+        for (uint16_t j = 0; j < count; j++) s.node_cells.push_back(point_to_cell(nodes[j].lat, nodes[j].lng));
+    for (uint16_t j = 0; j + 1 < count; j++) {
+        cover_edge(s.node_cells[j], s.node_cells[j + 1], nodes[j].lat, nodes[j].lng, nodes[j + 1].lat,
+                   nodes[j + 1].lng, s.edge_cells);
+        for (const auto& c : s.edge_cells) s.cells.push_back(c.id());
+    }
+    std::sort(s.cells.begin(), s.cells.end());
+    s.cells.erase(std::unique(s.cells.begin(), s.cells.end()), s.cells.end());
+    for (uint64_t cell_id : s.cells) out.push_back({cell_id, item});
+}
+
+// Flat (cell_id,item_id) pair sort used by the S2 cell-computation phases
+// (street/interp ways and POIs/places): sorts each worker's pairs, then
+// merges them straight into sorted_out on every core, with no concatenated
+// copy and no scratch table. Pairs equal under cell_item_less are equal in
+// both fields, so the order is unique. sorted_out is used directly for
+// writing; the cell maps stay empty (only needed for cache/continent modes).
+// A sorted_out already holding as many pairs as the lists (made beside
+// earlier work) is filled as it is.
+static void parallel_sort_and_build(
+    std::vector<std::vector<CellItemPair>>& thread_pairs,
+    std::vector<CellItemPair>& sorted_out
+) {
+    size_t total = 0;
+    for (const auto& pairs : thread_pairs) total += pairs.size();
+    if (sorted_out.size() != total) sorted_out.assign(total, CellItemPair{});
+    parallel_for_each(thread_pairs.size(), [&](size_t t, unsigned) {
+        std::sort(thread_pairs[t].begin(), thread_pairs[t].end(), cell_item_less);
+    });
+    std::vector<std::pair<CellItemPair*, size_t>> runs;
+    for (auto& pairs : thread_pairs) runs.push_back({pairs.data(), pairs.size()});
+    parallel_merge(runs, sorted_out.data(), cell_item_less);
+    parallel_for_each(thread_pairs.size(), [&](size_t t, unsigned) { thread_pairs[t] = {}; });
+}
+
+// Place-node addressline containment: for each place node, record the smallest-area
+// admin polygon containing its centroid (gates the server's nearest-place fallback).
+static void compute_place_node_containment(ParsedData& data, const BuildConfig& cfg,
+                std::chrono::steady_clock::time_point& _pt, CpuTicks& _cpu) {
+    unsigned int num_threads = cfg.num_threads;
+    if (!data.place_nodes.empty() && !data.admin_polygons.empty()) {
+        auto _pn_t = std::chrono::steady_clock::now();
+        std::cerr << "Computing place-node parent admin polygons ("
+                  << data.place_nodes.size() << " nodes)..." << std::endl;
+
+        // Precompute candidate sets sorted by ascending area so we can
+        // pick the smallest containing polygon with a single PIP pass.
+        // The cell_to_admin map has (INTERIOR_FLAG | poly_id) values —
+        // strip the flag before indexing.
+        parallel_for_dynamic(data.place_nodes.size(), kItemGrain, [&](size_t begin, size_t end, unsigned) {
+            std::vector<uint32_t> cand;
+            for (size_t i = begin; i < end; i++) {
+                auto& pn = data.place_nodes[i];
+                pn.parent_poly_id = 0xFFFFFFFFu;
+                // Compute the node's S2 cell at the admin level
+                // and fetch candidate polygons covering it.
+                S2CellId cell = S2CellId(
+                    S2LatLng::FromDegrees(pn.lat, pn.lng))
+                    .parent(kAdminCellLevel);
+                auto it = data.cell_to_admin.find(cell.id());
+                if (it == data.cell_to_admin.end()) continue;
+                cand.clear();
+                cand.reserve(it->second.size());
+                for (uint32_t id : it->second) {
+                    cand.push_back(id & ID_MASK);
+                }
+                // Sort candidates by ascending area so the first
+                // PIP hit is the smallest containing polygon. Break
+                // exact-area ties by admin osm_id: AdminPolygon.area
+                // is float32, so distinct polygons routinely share an
+                // area value, and an area-only sort leaves their order
+                // to the (non-deterministic) cell_to_admin iteration
+                // order — making parent_poly_id flip between same-PBF
+                // builds (~33k place nodes / 1.1 MiB churn). osm_id is
+                // build-invariant and unique, giving a total order.
+                std::sort(cand.begin(), cand.end(),
+                          [&](uint32_t a, uint32_t b) {
+                    const auto& pa = data.admin_polygons[a];
+                    const auto& pb = data.admin_polygons[b];
+                    if (pa.area != pb.area) return pa.area < pb.area;
+                    // osm_id tiebreak (build-invariant total order); guard
+                    // the parallel-array access like every other site and
+                    // fall back to the (still-unique) poly index if the
+                    // sidecar isn't aligned.
+                    if (data.admin_osm_ids.size() == data.admin_polygons.size())
+                        return data.admin_osm_ids[a] < data.admin_osm_ids[b];
+                    return a < b;
+                });
+                // Pick the smallest containing admin polygon at
+                // a rank level matching this place node's type.
+                // Mirrors Nominatim's `current_boundary` cascading
+                // gate: a place=neighbourhood node must be inside
+                // the suburb-level boundary (admin_level >= 8),
+                // not just inside the country. This prevents a
+                // neighbourhood node 800m from the query (but
+                // in the same country/state) from being accepted
+                // when the query is in a different suburb.
+                //
+                // For city/town/village (pt 0-2): parent at L3+
+                // For suburb/hamlet (pt 3-4): parent at L6+
+                // For neighbourhood/quarter (pt 5-6): parent at L9+
+                uint8_t pt = pn.place_type;
+                uint8_t min_parent_al = (pt <= 2) ? 3 : (pt <= 4) ? 6 : 9;
+                for (uint32_t poly_id : cand) {
+                    const auto& p = data.admin_polygons[poly_id];
+                    if (p.admin_level < min_parent_al) continue;
+                    if (p.admin_level > 10) continue; // skip postcode/place markers
+                    const NodeCoord* verts =
+                        &data.admin_vertices[p.vertex_offset];
+                    if (point_in_polygon_nc(pn.lat, pn.lng,
+                                            verts, p.vertex_count)) {
+                        pn.parent_poly_id = poly_id;
+                        break;
+                    }
+                }
+            }
+
+        }, num_threads);
+        size_t contained_count = parallel_count(data.place_nodes.size(),
+            [&](size_t i) { return data.place_nodes[i].parent_poly_id != 0xFFFFFFFFu; }, num_threads);
+
+        double _pn_elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - _pn_t).count();
+        std::cerr << "Place-node containment: "
+                  << contained_count << "/"
+                  << data.place_nodes.size() << " nodes linked to a "
+                  << "parent admin polygon in " << _pn_elapsed << "s"
+                  << std::endl;
+        log_phase("Place-node containment", _pt, _cpu);
+    }
+}
+
+// find_linked_place step 4: name-based linking of admin boundaries to place nodes
+// (Nominatim find_linked_place name-match fallback).
+static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
+                std::chrono::steady_clock::time_point& _pt, CpuTicks& _cpu) {
+    unsigned int num_threads = cfg.num_threads;
+    if (!data.admin_polygons.empty() && !data.place_nodes.empty()) {
+        auto _nl_t = std::chrono::steady_clock::now();
+
+        // Normalised-name → place-node index for exact-match lookup.
+        // Nominatim's find_linked_place step 4 requires an exact name
+        // overlap via hstore `&&` (same language key, same value) —
+        // effectively a full-name identity match on at least one
+        // name:* tag. Our data only carries a single `name`, so we
+        // approximate by matching on the normalised primary name.
+        // Using exact-match avoids spurious token-overlap links like
+        // "1st District of Athens" → "Athens" or "Manhattan Community
+        // Board 3" → any "Manhattan" place node.
+        // Hide nodes claimed by the label/wikidata link steps (relation
+        // assembly and closed-way admins) before building the name index:
+        // Nominatim's find_linked_place only considers places without a
+        // linked_place_id, so an already-claimed node must neither match
+        // here nor surface in results.
+        if (!data.linked_place_node_ids.empty()) {
+            std::unordered_set<uint64_t> packed;
+            packed.reserve(data.linked_place_node_ids.size());
+            for (int64_t nid : data.linked_place_node_ids) {
+                packed.insert(pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, nid));
+            }
+            size_t hidden = 0;
+            size_t n = std::min(data.place_nodes.size(), data.place_osm_ids.size());
+            for (size_t i = 0; i < n; i++) {
+                if (data.place_nodes[i].name_id == NO_DATA) continue;
+                if (packed.count(data.place_osm_ids[i])) {
+                    data.place_nodes[i].name_id = NO_DATA;
+                    hidden++;
+                }
+            }
+            std::cerr << "find_linked_place label/wikidata: hid " << hidden
+                      << " linked place nodes (" << packed.size()
+                      << " claimed ids)" << std::endl;
+        }
+
+        std::unordered_map<std::string, std::vector<uint32_t>> name_to_places;
+        name_to_places.reserve(data.place_nodes.size());
+        const auto& pool_data = data.string_pool.data();
+        for (uint32_t i = 0; i < data.place_nodes.size(); i++) {
+            const auto& pn = data.place_nodes[i];
+            if (pn.name_id == NO_DATA) continue;
+            const char* nm = pool_data.data() + pn.name_id;
+            if (!nm[0]) continue;
+            std::string nn = normalise_for_matching(nm);
+            if (nn.empty()) continue;
+            name_to_places[std::move(nn)].push_back(i);
+        }
+
+        // PlaceType → rank_search. Matches Nominatim's
+        // address_levels.json defaults: place=city 16, town 18,
+        // village 19, suburb/hamlet 20, neighbourhood/quarter 22.
+        // Nominatim rank_address for place nodes (address-levels.json
+        // `place` map, second element): city 16, town [18,16], village
+        // [19,16], borough 18, suburb [19,20], hamlet 20, quarter [20,22],
+        // neighbourhood 24.
+        auto place_addr_rank = [](uint8_t pt) -> uint8_t {
+            switch (static_cast<PlaceType>(pt)) {
+                case PlaceType::CITY:          return 16;
+                case PlaceType::TOWN:          return 16;
+                case PlaceType::VILLAGE:       return 16;
+                case PlaceType::BOROUGH:       return 18;
+                case PlaceType::SUBURB:        return 20;
+                case PlaceType::HAMLET:        return 20;
+                case PlaceType::QUARTER:       return 22;
+                case PlaceType::NEIGHBOURHOOD: return 24;
+                default:                        return 255;
+            }
+        };
+
+        // Nominatim gates step 4 to boundaries with
+        // rank_address 16-23 (admin_level 8-11 under the default
+        // rank mapping al*2). Coarser boundaries never fall through
+        // to step 4 because steps 1-3 almost always catch them
+        // (country/state wikidata coverage is near-total).
+        std::atomic<size_t> pol_idx{0};
+        std::atomic<uint64_t> linked{0};
+        std::atomic<uint64_t> considered{0};
+        std::vector<std::thread> nl_workers;
+        // Node indices consumed by a link, per worker. Nominatim sets
+        // linked_place_id on the node when a boundary links it, hiding it
+        // from all results (the boundary represents it). We mirror that by
+        // clearing the node's name after the join below.
+        std::mutex linked_nodes_mutex;
+        std::vector<uint32_t> linked_nodes;
+        const double max_dist_deg = 0.5;
+        const double max_dist_sq = max_dist_deg * max_dist_deg;
+
+        for (unsigned int t = 0; t < num_threads; t++) {
+            nl_workers.emplace_back([&]() {
+                while (true) {
+                    size_t i = pol_idx.fetch_add(1);
+                    if (i >= data.admin_polygons.size()) break;
+                    auto& poly = data.admin_polygons[i];
+                    if (poly.place_type_override != 0) continue;
+                    // AL11 slots hold boundary=postal_code polygons (their
+                    // "name" is the postcode string) — Nominatim's
+                    // find_linked_place only runs for boundary=administrative,
+                    // so postal boundaries never link (or hide) place nodes.
+                    if (poly.admin_level < 8 || poly.admin_level > 10) continue;
+                    if (poly.vertex_count == 0) continue;
+                    if (poly.name_id == NO_DATA) continue;
+                    const char* bnd_name = pool_data.data() + poly.name_id;
+                    if (!bnd_name[0]) continue;
+                    considered.fetch_add(1);
+
+                    // Per-country rank_address (NL AL8 = 14, not the
+                    // default 16) — resolved from the boundary's country.
+                    // AL8+ boundaries don't carry country tags, so resolve
+                    // the country from the polygon centroid's admin cell.
+                    uint16_t bnd_cc = poly.country_code;
+
+                    double sum_lat = 0.0, sum_lng = 0.0;
+                    for (uint32_t v = 0; v < poly.vertex_count; v++) {
+                        sum_lat += data.admin_vertices[poly.vertex_offset + v].lat;
+                        sum_lng += data.admin_vertices[poly.vertex_offset + v].lng;
+                    }
+                    double clat = sum_lat / poly.vertex_count;
+                    double clng = sum_lng / poly.vertex_count;
+
+                    if (bnd_cc == 0) bnd_cc = country_code_at_point(data, clat, clng);
+                    uint8_t bnd_rank = admin_rank_address(bnd_cc, poly.admin_level);
+                    if (bnd_rank == 0) continue;  // not in this country's address chain
+
+                    std::string nb = normalise_for_matching(bnd_name);
+                    if (nb.empty()) continue;
+
+                    uint32_t best_idx = NO_DATA;
+                    double best_dist_sq = max_dist_sq;
+
+                    auto it = name_to_places.find(nb);
+                    if (it != name_to_places.end()) {
+                        for (uint32_t pidx : it->second) {
+                            const auto& pn = data.place_nodes[pidx];
+                            uint8_t pr = place_addr_rank(pn.place_type);
+                            if (pr == 255) continue;
+                            // Nominatim's name-match branch requires the
+                            // node's address rank to EQUAL the boundary's
+                            // rank_address (find_linked_place in
+                            // placex_triggers.sql). The previous ±2 window
+                            // on rank_search linked NL gemeentes (rank 14)
+                            // to their town nodes (16), relabelling
+                            // municipalities as towns.
+                            if (pr != bnd_rank) continue;
+                            double dlat = (double)pn.lat - clat;
+                            double dlng = (double)pn.lng - clng;
+                            double d2 = dlat * dlat + dlng * dlng;
+                            if (d2 > best_dist_sq) continue;
+                            if (d2 == best_dist_sq) {
+                                // Preserve the original `>=` reject at the
+                                // distance threshold (no real candidate yet:
+                                // best_dist_sq is still max_dist_sq), so this
+                                // only adds a tiebreak, not a behaviour change
+                                // at the 0.5° boundary.
+                                if (best_idx == NO_DATA) continue;
+                                // Break exact-distance ties by the place node's
+                                // stable osm_id (build-invariant, unique).
+                                // name_to_places[nb] is iterated in a non-
+                                // deterministic order, so equidistant same-
+                                // named place nodes otherwise flipped the
+                                // linked place type → place_type_override →
+                                // admin_polygons.bin between same-PBF builds.
+                                if (pidx >= data.place_osm_ids.size() ||
+                                    best_idx >= data.place_osm_ids.size() ||
+                                    data.place_osm_ids[pidx] >= data.place_osm_ids[best_idx])
+                                    continue;
+                            }
+                            best_dist_sq = d2;
+                            best_idx = pidx;
+                        }
+                    }
+
+                    if (best_idx != NO_DATA) {
+                        const auto& pn = data.place_nodes[best_idx];
+                        uint8_t pto = place_type_to_admin_override(pn.place_type);
+                        if (pto != 0) {
+                            poly.place_type_override = pto;
+                            linked.fetch_add(1);
+                            std::lock_guard<std::mutex> lk(linked_nodes_mutex);
+                            linked_nodes.push_back(best_idx);
+                        }
+                    }
+                }
+            });
+        }
+        for (auto& w : nl_workers) w.join();
+
+        // Hide linked nodes: clearing the name makes the server's
+        // place_node() accessor return None everywhere (find_places,
+        // containment, fallbacks) — the same observable effect as
+        // Nominatim's linked_place_id. Deterministic regardless of worker
+        // scheduling: the SET of linked nodes is order-independent.
+        std::sort(linked_nodes.begin(), linked_nodes.end());
+        linked_nodes.erase(std::unique(linked_nodes.begin(), linked_nodes.end()), linked_nodes.end());
+        for (uint32_t idx : linked_nodes) {
+            data.place_nodes[idx].name_id = NO_DATA;
+        }
+
+        double _nl_elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - _nl_t).count();
+        std::cerr << "find_linked_place step 4 (name match): "
+                  << linked.load() << "/" << considered.load()
+                  << " unlinked AL8-10 boundaries linked in "
+                  << _nl_elapsed << "s" << std::endl;
+        log_phase("find_linked_place step 4", _pt, _cpu);
+    }
+}
+
+// POI parent-street precomputation: store each POI's nearest named street name_id
+// (server populates `road` when the POI wins; Nominatim parent_place_id parity).
+// `order` holds the POIs by street cell (items_by_cell).
+static void compute_poi_parent_streets(ParsedData& data, const BuildConfig& cfg,
+                const std::vector<CellItemPair>& order,
+                std::chrono::steady_clock::time_point& _s2t, CpuTicks& _s2cpu) {
+    unsigned int num_threads = cfg.num_threads;
+    if (!data.poi_records.empty() && !data.ways.empty()) {
+        auto _ps_t = std::chrono::steady_clock::now();
+        std::cerr << "Computing POI parent-street links ("
+                  << data.poi_records.size() << " POIs)..." << std::endl;
+
+        walk_items_by_cell<NearbyStreets>(order, num_threads,
+            [&](S2CellId cell, NearbyStreets& nearby) { gather_nearby_named_streets(data, cell, nearby); },
+            [&](uint32_t i, NearbyStreets& nearby) {
+                auto& pr = data.poi_records[i];
+                pr.parent_street_id = 0xFFFFFFFFu;
+
+                double best_d2 = 1e18;
+                uint32_t best_name = 0xFFFFFFFFu;
+                // Stable tie-break for EXACT-distance ties, mirroring
+                // the addr parent_way_id pick: break exact ties by the
+                // way's osm_id so parent_street_id doesn't flip between
+                // same-PBF builds (~7k POIs of poi_records.bin churn).
+                int64_t best_street_osm = INT64_MAX;
+                // POI centroid: lat/lng for points, already-stored
+                // centroid lat/lng for polygons.
+                for_each_nearby_named_street(data, nearby, pr.lat, pr.lng,
+                    [&](uint32_t, const WayHeader& w, double d2, int64_t cand_osm) {
+                        if (d2 < best_d2 ||
+                            (d2 == best_d2 && cand_osm < best_street_osm)) {
+                            best_d2 = d2;
+                            best_name = w.name_id;
+                            best_street_osm = cand_osm;
+                        }
+                    });
+                pr.parent_street_id = best_name;
+            });
+        // Counted afterwards: a shared per-POI counter would bounce one
+        // cache line between every core.
+        size_t linked_count = parallel_count(data.poi_records.size(),
+            [&](size_t i) { return data.poi_records[i].parent_street_id != 0xFFFFFFFFu; }, num_threads);
+
+        double _elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - _ps_t).count();
+        std::cerr << "POI parent-street linking: "
+                  << linked_count << "/"
+                  << data.poi_records.size()
+                  << " POIs linked to a named street in "
+                  << _elapsed << "s" << std::endl;
+        log_phase("  POI: parent-street linking", _s2t, _s2cpu);
+    }
+}
+
+// POI parent polygons, the smallest containing the POI centroid (area as the
+// specificity proxy, lower = tighter; ties to the first one scanned):
+// - parent_postcode_id: the postal boundary's (11) postcode, Nominatim's
+//   placex.postcode chain approximation.
+// - parent_poly_id: the admin polygon (levels 2..10; place-area markers 15
+//   skipped) the server's chain-containment check walks up from.
+// POIs are walked per admin cell, so each cell's candidates are gathered and
+// ranked once for both. `order` holds the POIs by street cell (items_by_cell):
+// a POI's admin cell is an ancestor of its street cell, so the same order
+// keeps each admin cell's POIs together.
+static void compute_poi_parent_polygons(ParsedData& data, const BuildConfig& cfg,
+                std::vector<CellItemPair> order,
+                std::chrono::steady_clock::time_point& _s2t, CpuTicks& _s2cpu) {
+    unsigned int num_threads = cfg.num_threads;
+    if (!data.poi_records.empty() && !data.admin_polygons.empty()) {
+        auto _pp_t = std::chrono::steady_clock::now();
+        std::cerr << "Computing POI parent-postcode and parent-admin links ("
+                  << data.poi_records.size() << " POIs)..."
+                  << std::endl;
+
+        require_ordered_admin_areas(data);
+        const AdminRings rings(data, num_threads);
+        auto smaller = [&](uint32_t a, uint32_t b) {
+            return data.admin_polygons[a].area < data.admin_polygons[b].area;
+        };
+        // order holds each POI's street cell, whose parent is its admin cell
+        // unless --admin-level is the finer one; then the point decides.
+        const bool admin_from_street = kAdminCellLevel <= kStreetCellLevel;
+        parallel_for(order.size(), [&](size_t b, size_t e, unsigned) {
+            for (size_t k = b; k < e; k++) {
+                const auto& poi = data.poi_records[order[k].item_id];
+                S2CellId cell = admin_from_street ? S2CellId(order[k].cell_id)
+                                                  : S2CellId(S2LatLng::FromDegrees(poi.lat, poi.lng));
+                order[k].cell_id = cell.parent(kAdminCellLevel).id();
+            }
+        }, num_threads);
+
+        struct Candidates {
+            std::vector<S2CellId> nbrs;
+            std::vector<uint32_t> postal, admin;
+            std::vector<std::pair<uint32_t, uint32_t>> scratch;
+        };
+        walk_items_by_cell<Candidates>(order, num_threads,
+            [&](S2CellId cell, Candidates& c) {
+                c.postal.clear();
+                c.admin.clear();
+                // 1e18 is the old per-POI scan's starting best area.
+                for_each_admin_candidate(data, cell, c.nbrs, [&](uint32_t pid, const AdminPolygon& p) {
+                    if (!(p.area < 1e18f)) return;
+                    if (p.admin_level == 11) c.postal.push_back(pid);
+                    else if (p.admin_level >= 2 && p.admin_level <= 10) c.admin.push_back(pid);
+                });
+                rank_candidates(c.postal, smaller, c.scratch);
+                rank_candidates(c.admin, smaller, c.scratch);
+            },
+            [&](uint32_t i, Candidates& c) {
+                auto& pr = data.poi_records[i];
+                uint32_t postal = rings.first_containing(c.postal, pr.lat, pr.lng);
+                pr.parent_postcode_id = postal == NO_DATA ? NO_DATA : data.admin_polygons[postal].name_id;
+                pr.parent_poly_id = rings.first_containing(c.admin, pr.lat, pr.lng);
+            });
+        // Counted afterwards: shared per-POI counters would bounce one cache
+        // line between every core. Postal boundaries are named, so a POI
+        // has a postcode exactly when it found one.
+        size_t postcode_linked = parallel_count(data.poi_records.size(),
+            [&](size_t i) { return data.poi_records[i].parent_postcode_id != NO_DATA; }, num_threads);
+        size_t admin_linked = parallel_count(data.poi_records.size(),
+            [&](size_t i) { return data.poi_records[i].parent_poly_id != NO_DATA; }, num_threads);
+
+        double _pp_el = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - _pp_t).count();
+        std::cerr << "POI parent-postcode linking: "
+                  << postcode_linked << "/"
+                  << data.poi_records.size()
+                  << " POIs linked to a postal boundary" << std::endl;
+        std::cerr << "POI parent-admin linking: "
+                  << admin_linked << "/"
+                  << data.poi_records.size()
+                  << " POIs linked to an admin polygon in "
+                  << _pp_el << "s" << std::endl;
+        log_phase("  POI: parent-postcode + parent-admin linking", _s2t, _s2cpu);
+    }
+}
+
+// S2 + POI cell computation: builds the street/interp cell index, then the POI
+// parent links (street/postcode/admin) and the POI/place cell index. Owns the
+// section running timer (_s2t); takes the outer _pt/_cpu only for the opening
+// 'Admin assembly' transition log.
+// S2 cell index for street + interpolation ways: emit (cell,item) pairs in
+// parallel, then sort+group into the cell maps.
+static void compute_s2_cells_ways_interp(ParsedData& data, const BuildConfig& cfg,
+                std::chrono::steady_clock::time_point& _s2t, CpuTicks& _s2cpu) {
+    unsigned int num_threads = cfg.num_threads;
+    // Process streets: emit (cell_id, way_id) pairs. Longest first and one
+    // at a time: a way spanning thousands of km takes seconds to cover, and
+    // started last, or in a chunk with the next longest, it would leave one
+    // core working alone.
+    std::cerr << "  Processing " << data.deferred_ways.size() << " street ways..." << std::endl;
+    const std::vector<uint32_t> ways_longest_first = costliest_first(data.deferred_ways.size(), [&](size_t i) {
+        const auto& dw = data.deferred_ways[i];
+        const NodeCoord* n = data.street_nodes.data() + dw.node_offset;
+        float span = 0;
+        for (uint16_t j = 0; j + 1 < dw.node_count; j++)
+            span += std::max(std::abs(n[j + 1].lat - n[j].lat), std::abs(n[j + 1].lng - n[j].lng));
+        return span;
+    }, num_threads);
+    auto way_pairs = emit_item_cells<EdgeCellScratch>(data.deferred_ways.size(), 1, num_threads,
+        [&](size_t k, EdgeCellScratch& scratch, std::vector<CellItemPair>& out) {
+            const auto& dw = data.deferred_ways[ways_longest_first[k]];
+            emit_polyline_cells(data.street_nodes.data() + dw.node_offset, dw.node_count, dw.way_id, scratch, out);
+        });
+    log_phase("  S2: street ways (parallel)", _s2t, _s2cpu);
+    // The street table's pages take seconds to fault in on one core: that
+    // core takes them while the others cover the interps.
+    size_t way_pair_count = 0;
+    for (const auto& pairs : way_pairs) way_pair_count += pairs.size();
+    auto way_cells = std::async(std::launch::async, [way_pair_count] {
+        return std::vector<CellItemPair>(way_pair_count);
+    });
+
+    // Process interpolations: emit (cell_id, interp_id) pairs
+    std::cerr << "  Processing " << data.deferred_interps.size() << " interpolation ways..." << std::endl;
+    auto interp_pairs = emit_item_cells<EdgeCellScratch>(data.deferred_interps.size(), kItemGrain, num_threads,
+        [&](size_t i, EdgeCellScratch& scratch, std::vector<CellItemPair>& out) {
+            const auto& di = data.deferred_interps[i];
+            emit_polyline_cells(data.interp_nodes.data() + di.node_offset, di.node_count, di.interp_id, scratch, out);
+        });
+    log_phase("  S2: interp ways (parallel)", _s2t, _s2cpu);
+    data.sorted_way_cells = way_cells.get();
+
+    // Merge the per-worker pairs into single sorted tables.
+    std::cerr << "  Sorting and grouping cell pairs..." << std::endl;
+    auto f_ways = std::async(std::launch::async, [&] {
+        parallel_sort_and_build(way_pairs, data.sorted_way_cells);
+    });
+    auto f_interps = std::async(std::launch::async, [&] {
+        parallel_sort_and_build(interp_pairs, data.sorted_interp_cells);
+    });
+    f_ways.get();
+    f_interps.get();
+    log_phase("  S2: sort + group into cell maps", _s2t, _s2cpu);
+}
+
+// POI + place-node S2 cell index: emit (cell,item) pairs in parallel and
+// sort+group into the POI and place cell maps.
+static void compute_poi_s2_cells(ParsedData& data, const BuildConfig& cfg,
+                std::chrono::steady_clock::time_point& _s2t, CpuTicks& _s2cpu) {
+    unsigned int num_threads = cfg.num_threads;
+    if (!data.poi_records.empty()) {
+        std::cerr << "  Computing S2 cells for " << data.poi_records.size() << " POIs..." << std::endl;
+        auto poi_pairs = emit_item_cells<std::vector<std::pair<double, double>>>(
+            data.poi_records.size(), kItemGrain, num_threads,
+            [&](size_t i, std::vector<std::pair<double, double>>& verts, std::vector<CellItemPair>& out) {
+                const auto& pr = data.poi_records[i];
+                if (pr.vertex_count == 0) {
+                    // Point POI
+                    S2CellId cell = S2CellId(S2LatLng::FromDegrees(pr.lat, pr.lng)).parent(kAdminCellLevel);
+                    out.push_back({cell.id(), static_cast<uint32_t>(i)});
+                    return;
+                }
+                // Polygon POI — cover with S2 cells
+                verts.clear();
+                for (uint32_t j = 0; j < pr.vertex_count; j++) {
+                    const auto& v = data.poi_vertices[pr.vertex_offset + j];
+                    verts.emplace_back(v.lat, v.lng);
+                }
+                for (const auto& [cell_id, is_interior] : cover_polygon(verts)) {
+                    uint32_t id = static_cast<uint32_t>(i);
+                    if (is_interior) id |= INTERIOR_FLAG;
+                    out.push_back({cell_id.id(), id});
+                }
+            });
+        log_phase("  S2: POI cells (parallel)", _s2t, _s2cpu);
+
+        parallel_sort_and_build(poi_pairs, data.sorted_poi_cells);
+        log_phase("  S2: POI sort + group", _s2t, _s2cpu);
+    }
+
+    // Place node S2 cells
+    if (!data.place_nodes.empty()) {
+        std::cerr << "  Computing S2 cells for " << data.place_nodes.size() << " place nodes..." << std::endl;
+        struct NoScratch {};
+        auto place_pairs = emit_item_cells<NoScratch>(data.place_nodes.size(), kItemGrain, num_threads,
+            [&](size_t i, NoScratch&, std::vector<CellItemPair>& out) {
+                const auto& pn = data.place_nodes[i];
+                S2CellId cell = S2CellId(S2LatLng::FromDegrees(pn.lat, pn.lng)).parent(kAdminCellLevel);
+                out.push_back({cell.id(), static_cast<uint32_t>(i)});
+            });
+        parallel_sort_and_build(place_pairs, data.sorted_place_cells);
+        std::cerr << "  Place nodes: " << data.place_nodes.size() << " nodes, "
+                  << data.sorted_place_cells.size() << " cell pairs" << std::endl;
+        log_phase("  S2: place nodes", _s2t, _s2cpu);
+    }
+}
+
+static void compute_s2_and_poi_cells(ParsedData& data, const BuildConfig& cfg,
+                std::chrono::steady_clock::time_point& _pt, CpuTicks& _cpu) {
+    unsigned int num_threads = cfg.num_threads;
+    {
+        log_phase("Admin assembly", _pt, _cpu);
+        std::cerr << "Computing S2 cells for ways with " << num_threads << " threads..." << std::endl;
+
+        // Flat-array approach: threads emit (cell_id, item_id) pairs into
+        // thread-local vectors, then we sort globally and group by cell_id.
+        // This avoids hash maps entirely — sort is cache-friendly O(n log n).
+
+
+        auto _s2t = std::chrono::steady_clock::now();
+        auto _s2cpu = CpuTicks::now();
+
+        compute_s2_cells_ways_interp(data, cfg, _s2t, _s2cpu);
+
+        // The POIs by street cell, for both POI passes.
+        std::vector<CellItemPair> poi_order;
+        if (!data.poi_records.empty())
+            poi_order = items_by_cell(data.poi_records.size(), num_threads, [&](size_t i) {
+                return street_cell_of(data.poi_records[i].lat, data.poi_records[i].lng);
+            });
+
+        compute_poi_parent_streets(data, cfg, poi_order, _s2t, _s2cpu);
+
+        compute_poi_parent_polygons(data, cfg, std::move(poi_order), _s2t, _s2cpu);
+
+        backfill_addr_point_parent_streets(data, cfg, _s2t, _s2cpu);
+
+        // Free deferred work items
+        data.deferred_ways.clear();
+        data.deferred_ways.shrink_to_fit();
+        data.deferred_interps.clear();
+        data.deferred_interps.shrink_to_fit();
+
+        // The interpolation endpoints read the addr points the backfill is
+        // done with and touch nothing the POI and place cells read, so they
+        // resolve beside them.
+        auto endpoints = std::async(std::launch::async, [&data] {
+            std::cerr << "Resolving interpolation endpoints..." << std::endl;
+            resolve_interpolation_endpoints(data);
+        });
+
+        compute_poi_s2_cells(data, cfg, _s2t, _s2cpu);
+        endpoints.get();
+
+        std::cerr << "S2 cell computation complete." << std::endl;
+    }
+}
+
+// Rebuild cell->item hash maps from the sorted pairs (cache-save path only).
+static void rebuild_cell_maps_for_cache(ParsedData& data,
+                std::chrono::steady_clock::time_point& _pt, CpuTicks& _cpu) {
+    // Parallel rebuild: split sorted pairs into chunks, each thread builds
+    // a partial map, then merge. Sorted pairs are grouped by cell_id so we
+    // can split at cell boundaries for zero-conflict parallel insertion.
+    auto rebuild_map_parallel = [](const std::vector<CellItemPair>& sorted,
+                                    std::unordered_map<uint64_t, std::vector<uint32_t>>& map) {
+        if (sorted.empty() || !map.empty()) return;
+        // Each worker builds its own sub-map over whole cells
+        std::vector<std::unordered_map<uint64_t, std::vector<uint32_t>>> sub_maps(parallel_threads());
+        parallel_for_runs(sorted.size(), same_cell(sorted), [&](size_t begin, size_t end, unsigned w) {
+            auto& sub = sub_maps[w];
+            sub.reserve((end - begin) / 3); // rough estimate of unique cells
+            for (size_t i = begin; i < end; i++) {
+                sub[sorted[i].cell_id].push_back(sorted[i].item_id);
+            }
+        });
+
+        // Merge sub-maps into main map (no conflicts since splits are at cell boundaries)
+        size_t total_cells = 0;
+        for (auto& sub : sub_maps) total_cells += sub.size();
+        map.reserve(total_cells);
+        for (auto& sub : sub_maps) {
+            for (auto& [k, v] : sub) {
+                map[k] = std::move(v);
+            }
+        }
+    };
+
+    std::cerr << "Rebuilding cell maps for continent filtering..." << std::endl;
+    auto f1 = std::async(std::launch::async, [&]{ rebuild_map_parallel(data.sorted_way_cells, data.cell_to_ways); });
+    auto f2 = std::async(std::launch::async, [&]{ rebuild_map_parallel(data.sorted_interp_cells, data.cell_to_interps); });
+    f1.get(); f2.get();
+    log_phase("Rebuild cell maps", _pt, _cpu);
+}
+
+// Runs fn(ids) on every cell's list in cell_to_admin, lists spread over the
+// cores; fn must touch only the list it is given.
+template <typename Fn>
+static void for_each_admin_cell_list(ParsedData& data, unsigned int threads, Fn fn) {
+    const auto cells = cell_lists(data.cell_to_admin, threads);
+    parallel_for(cells.size(), [&](size_t begin, size_t end, unsigned) {
+        for (size_t i = begin; i < end; i++) fn(*cells[i].second);
+    }, threads);
+}
+
+// Write all index files (full + multi-output variants + qualities + continents).
+static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
+                const std::vector<double>& quality_scales, bool generate_continents,
+                std::chrono::steady_clock::time_point& _pt, CpuTicks& _cpu) {
+    const std::string& output_dir = cfg.output_dir;
+    const std::string& prev_output_dir = cfg.prev_output_dir;
+    bool multi_output = cfg.multi_output;
+    bool multi_quality = cfg.multi_quality;
+    IndexMode mode = cfg.mode;
+    constexpr double kAdminMinimalEpsilonScale = 2.5;
+    (void)output_dir; (void)prev_output_dir; (void)multi_output; (void)multi_quality; (void)mode;
+    log_phase("Deterministic ordering", _pt, _cpu);
+    std::cerr << "Writing index files to " << output_dir << "..." << std::endl;
+
+    auto quality_dir_name = [](double scale) -> std::string {
+        if (scale == 0) return "uncapped";
+        char buf[32]; snprintf(buf, sizeof(buf), "q%.4g", scale);
+        return buf;
+    };
+
+    // Write quality variants in parallel (bounded concurrency).
+    // Each variant does parallel simplification internally, so limit
+    // concurrency to avoid over-subscribing CPU.
+    auto write_qualities = [&](const ParsedData& d, const std::string& admin_dir) {
+        constexpr unsigned max_concurrent_qualities = 3;
+        std::atomic<unsigned> active{0};
+        std::mutex qmtx;
+        std::condition_variable qcv;
+        std::vector<std::future<void>> qfutures;
+
+        for (double scale : quality_scales) {
+            {
+                std::unique_lock<std::mutex> lock(qmtx);
+                qcv.wait(lock, [&]{ return active.load() < max_concurrent_qualities; });
+            }
+            active.fetch_add(1);
+
+            std::string qname = quality_dir_name(scale);
+            std::string qdir = admin_dir + "/" + qname;
+            qfutures.push_back(std::async(std::launch::async, [&, qdir, scale]() {
+                write_quality_variant(d, admin_dir, qdir, scale);
+                // Decrement under the mutex: an unlocked change + notify can
+                // fire between the waiter's predicate check and its block,
+                // losing the wakeup (deadlock when max_concurrent is 1).
+                {
+                    std::lock_guard<std::mutex> lk(qmtx);
+                    active.fetch_sub(1);
+                }
+                qcv.notify_one();
+            }));
+        }
+        for (auto& f : qfutures) f.get();
+    };
+
+    // Write one region: modes, quality variants, place files, admin-minimal
+    // and POI tiers. Takes ParsedData& (non-const) because
+    // apply_strategy2_remaps reorders the in-memory record arrays and
+    // rewrites every reference site; the stages after it only read.
+    //
+    // RegionRun::Planet: the planet hoists its remap to before the planet
+    // async launches — apply_strategy2_remaps mutates the shared
+    // ParsedData, and running it inside the async raced the continent
+    // filtering that reads the same arrays (UB; benign only by schedule
+    // timing). RegionRun::Continent remaps its own subset here.
+    //
+    // `order` runs the stages (and a continent's strategy-2 passes) at once
+    // or one after another. With a `budget`, each stage holds its estimated
+    // cost of it while it runs, beside whatever else holds the rest.
+    enum class RegionRun { Planet, Continent };
+    auto write_region = [&](ParsedData& d, const std::string& base_dir, RegionRun run, RunOrder order,
+                            MemoryBudget* budget) {
+        ensure_dir(base_dir);
+        const std::string region = base_dir.substr(base_dir.find_last_of('/') + 1);
+
+        // Locate this region's previous build dir under prev_output_dir
+        // (mirrors the layout we write under output_dir). Empty path
+        // is the "no prev / fresh start" signal — apply_strategy2_remaps
+        // becomes a no-op and IDs remain in collection order.
+        std::string region_prev;
+        if (!prev_output_dir.empty()) {
+            std::string rel = base_dir;
+            if (rel.rfind(output_dir, 0) == 0) rel = rel.substr(output_dir.size());
+            region_prev = prev_output_dir + rel;
+        }
+        if (run == RegionRun::Continent)
+            timed_phase("    " + region + ": strategy2 remap", [&] { apply_strategy2_remaps(d, region_prev, order); });
+
+        auto write_modes = [&] {
+            if (multi_output) {
+                // Write all 3 modes in parallel (they read shared data, write to separate dirs)
+                auto wf1 = std::async(std::launch::async, [&]{ write_index(d, base_dir + "/full", IndexMode::Full); });
+                auto wf2 = std::async(std::launch::async, [&]{ write_index(d, base_dir + "/no-addresses", IndexMode::NoAddresses); });
+                auto wf3 = std::async(std::launch::async, [&]{ write_index(d, base_dir + "/admin", IndexMode::AdminOnly); });
+                wf1.get(); wf2.get(); wf3.get();
+            } else {
+                write_index(d, base_dir, mode);
+            }
+        };
+        auto write_quality_dirs = [&] {
+            // Write quality variants (each gets admin_polygons + admin_vertices)
+            if (multi_quality) {
+                std::string quality_dir = multi_output ? base_dir + "/quality" : base_dir;
+                std::cerr << "  Writing quality variants for " << base_dir << "..." << std::endl;
+                write_qualities(d, quality_dir);
+            }
+
+        };
+        auto write_places = [&] {
+            // Write place node files into each mode directory (so diff/patch can find them)
+            if (!d.place_nodes.empty()) {
+                auto write_place_files = [&](const std::string& dir) {
+                    ensure_dir(dir);
+                    {
+                        std::ofstream f(dir + "/place_nodes.bin", std::ios::binary);
+                        f.write(reinterpret_cast<const char*>(d.place_nodes.data()),
+                                d.place_nodes.size() * sizeof(PlaceNode));
+                        f.flush();
+                        if (!f) throw std::runtime_error("failed to write " + dir + "/place_nodes.bin");
+                    }
+                    emit_strategy2_sidecar(dir + "/place_nodes.osm_ids",
+                                            d.place_sidecar_blob, d.place_osm_ids);
+                    write_cell_index_sorted(dir + "/place_cells.bin", dir + "/place_entries.bin",
+                                            d.sorted_place_cells);
+                };
+
+                if (multi_output) {
+                    write_place_files(base_dir + "/full");
+                    write_place_files(base_dir + "/no-addresses");
+                    write_place_files(base_dir + "/admin");
+                } else {
+                    write_place_files(base_dir);
+                }
+                std::cerr << "  Place nodes: " << d.place_nodes.size() << " nodes, "
+                          << count_cells(d.sorted_place_cells) << " cells" << std::endl;
+            }
+        };
+        auto write_admin_minimal = [&] {
+            // Write admin-minimal tier — smallest useful deployable. Drops:
+            //   - place_nodes with place_type ∈ {SUBURB=3, NEIGHBOURHOOD=5, QUARTER=6}
+            //   - admin polygons (and their vertex bytes) whose admin_level
+            //     falls outside [2, 8] (L9 borough, L10 quarter-area,
+            //     L11 admin-postal, L15 place-area markers are skipped).
+            // Re-simplifies the kept polygons at q2.5 and writes them to its
+            // own stable slots so the on-disk admin_polygons.bin / admin_vertices.bin
+            // are self-contained — admin-minimal does NOT share polygon
+            // files with quality/q2.5/. It also carries its own core strings
+            // and layout, so a client never needs another dir (or a patch for
+            // one) to resolve its names.
+            if (multi_output && !d.place_nodes.empty() && !d.admin_polygons.empty()) {
+                std::string mdir = base_dir + "/admin-minimal";
+                ensure_dir(mdir);
+
+                // 1. Filter + re-simplify + pack admin polygons. q2.5 only —
+                //    admin-minimal isn't tiered by quality. Returns a remap
+                //    from full polygon IDs to admin-minimal's own stable slots
+                //    (or NO_DATA for dropped polygons), used below to rewrite
+                //    the cell index.
+                std::vector<uint32_t> poly_remap;
+                write_admin_minimal_polygons(d, mdir, region_prev, kAdminMinimalEpsilonScale, poly_remap);
+
+                // 2. place_nodes filter + ID remap. Keep types 0=city, 1=town,
+                //    2=village, 4=hamlet.
+                std::vector<PlaceNode> filtered_places;
+                filtered_places.reserve(d.place_nodes.size());
+                std::vector<uint32_t> place_remap(d.place_nodes.size(), NO_DATA);
+                for (size_t i = 0; i < d.place_nodes.size(); i++) {
+                    uint8_t pt = d.place_nodes[i].place_type;
+                    if (pt == 0 || pt == 1 || pt == 2 || pt == 4) {
+                        place_remap[i] = static_cast<uint32_t>(filtered_places.size());
+                        PlaceNode pn = d.place_nodes[i];
+                        // Parents in this dir's own polygon slots (NO_DATA when
+                        // the parent polygon isn't kept), like every other id here.
+                        pn.parent_poly_id = pn.parent_poly_id < poly_remap.size() ? poly_remap[pn.parent_poly_id] : NO_DATA;
+                        filtered_places.push_back(pn);
+                    }
+                }
+                {
+                    std::ofstream f(mdir + "/place_nodes.bin", std::ios::binary);
+                    f.write(reinterpret_cast<const char*>(filtered_places.data()),
+                            filtered_places.size() * sizeof(PlaceNode));
+                    f.flush();
+                    if (!f) throw std::runtime_error("failed to write " + mdir + "/place_nodes.bin");
+                }
+
+                // 3. Rebuild place cell index with the place_remap (ascending,
+                //    so the filtered table stays in canonical order).
+                std::vector<CellItemPair> filtered_place_cells;
+                for (const auto& p : d.sorted_place_cells) {
+                    if (p.item_id < place_remap.size()
+                        && place_remap[p.item_id] != NO_DATA) {
+                        filtered_place_cells.push_back({p.cell_id, place_remap[p.item_id]});
+                    }
+                }
+                write_cell_index_sorted(mdir + "/place_cells.bin", mdir + "/place_entries.bin",
+                                        filtered_place_cells);
+
+                // 4. Rebuild admin cell index against the new polygon ID space.
+                //    Preserves the high-bit INTERIOR_FLAG used by the cell
+                //    index format (polys that fully contain a cell vs. just
+                //    intersect it).
+                std::unordered_map<uint64_t, std::vector<uint32_t>> filtered_admin_cells;
+                for (const auto& [cell_id, ids] : d.cell_to_admin) {
+                    std::vector<uint32_t> kept;
+                    kept.reserve(ids.size());
+                    for (uint32_t flagged : ids) {
+                        uint32_t poly_id = flagged & ID_MASK;
+                        uint32_t flags   = flagged & INTERIOR_FLAG;
+                        if (poly_id >= poly_remap.size()) continue;
+                        uint32_t new_id = poly_remap[poly_id];
+                        if (new_id == NO_DATA) continue;
+                        kept.push_back(new_id | flags);
+                    }
+                    if (!kept.empty()) filtered_admin_cells[cell_id] = std::move(kept);
+                }
+                write_cell_index(mdir + "/admin_cells.bin", mdir + "/admin_entries.bin",
+                                 filtered_admin_cells);
+
+                // 5. Core strings + layout: admin and place names all live in core.
+                {
+                    const auto& core = d.strings_tiers[0];
+                    std::ofstream f(mdir + "/" + STR_TIER_FILENAMES[0], std::ios::binary);
+                    f.write(core.data(), core.size());
+                    f.flush();
+                    if (!f) throw std::runtime_error("failed to write " + mdir + "/" + STR_TIER_FILENAMES[0]);
+                }
+                write_strings_layout(mdir, d);
+
+                std::cerr << "  Admin-minimal: " << filtered_places.size()
+                          << " place nodes (of " << d.place_nodes.size() << "), "
+                          << filtered_admin_cells.size() << " cells (of "
+                          << d.cell_to_admin.size() << ")" << std::endl;
+            }
+
+        };
+        auto write_poi_tiers = [&] {
+            // Write POI tier variants
+            if (!d.poi_records.empty()) {
+                struct PoiTierVariant {
+                    const char* name;
+                    uint8_t max_tier;
+                };
+                PoiTierVariant poi_tiers[] = {
+                    {"poi/major",   1},
+                    {"poi/notable", 2},
+                    {"poi/all",     POI_MAX_SHIPPED_TIER},
+                };
+
+                // Canonical FULL-set POI sidecar that apply_strategy2_pois
+                // reads as <prev>/poi/all/poi_records.osm_ids on the next
+                // build. This must contain ALL d.poi_records (not the
+                // tier-filtered subset) so the IdAllocator can stabilize
+                // every POI's idx — otherwise the lookup keys (osm_id) map
+                // to indices in tier-filtered space, not full-set space,
+                // and the next build assigns wrong slots to most POIs.
+                //
+                // Emit BEFORE the tier filter loop runs, into the canonical
+                // /poi/all/ subdir (which apply_strategy2_pois already
+                // looks for). The per-tier writes below do NOT emit their
+                // own sidecars — this canonical full-set one is the single
+                // source of truth.
+                ensure_dir(base_dir + "/poi/all");
+                emit_strategy2_sidecar(base_dir + "/poi/all/poi_records.osm_ids",
+                                        d.poi_sidecar_blob, d.poi_osm_ids);
+
+                for (const auto& tier_var : poi_tiers) {
+                    auto _pt = std::chrono::steady_clock::now();
+                    auto _pc = CpuTicks::now();
+                    std::string poi_dir = base_dir + "/" + tier_var.name;
+                    ensure_dir(poi_dir);
+
+                    // Filter records by tier; pack each polygon's vertices
+                    // into the variable-stride byte stream (per-record
+                    // VertexEncoding tag, byte_offset into vertex stream).
+                    // A tombstone keeps its bytes but only goes to the tiers
+                    // that held its record, so a death never touches the
+                    // files that never carried it.
+                    const PoiTierSelection selection =
+                        select_poi_tier(d.poi_records, d.poi_sidecar_blob, tier_var.max_tier);
+                    const auto& selected = selection.indices;
+                    std::vector<PoiRecord> filtered_records(selected.size());
+                    std::vector<uint8_t> filtered_vertex_bytes;
+                    std::vector<uint32_t> id_remap(d.poi_records.size(), NO_DATA);
+                    // Point POI — no header / no vertices.
+                    auto is_polygon = [](const PoiRecord& pr) { return pr.vertex_count > 0 && pr.vertex_offset != NO_DATA; };
+                    parallel_prefix_fill(selected.size(),
+                        [&](size_t k) -> size_t {
+                            const auto& pr = d.poi_records[selected[k]];
+                            return is_polygon(pr) ? plan_polygon(&d.poi_vertices[pr.vertex_offset], pr.vertex_count).bytes : 0;
+                        },
+                        [&](size_t total) { filtered_vertex_bytes.resize(total); },
+                        [&](size_t k, size_t offset) -> size_t {
+                            id_remap[selected[k]] = static_cast<uint32_t>(k);
+                            auto pr = d.poi_records[selected[k]];
+                            size_t bytes = 0;
+                            if (is_polygon(pr)) {
+                                bytes = pack_polygon_at(filtered_vertex_bytes.data() + offset,
+                                                        &d.poi_vertices[pr.vertex_offset], pr.vertex_count);
+                                pr.vertex_offset = static_cast<uint32_t>(offset);
+                            } else {
+                                pr.vertex_offset = NO_DATA;
+                            }
+                            filtered_records[k] = pr;
+                            return bytes;
+                        });
+
+                    // Filtered cell index (preserving INTERIOR_FLAG). id_remap
+                    // ascends and keeps the flag bit, so the filtered table stays
+                    // in canonical order and repeats sit side by side.
+                    std::vector<std::vector<CellItemPair>> worker_cells(parallel_threads());
+                    parallel_for_runs(d.sorted_poi_cells.size(), same_cell(d.sorted_poi_cells),
+                                      [&](size_t begin, size_t end, unsigned w) {
+                        auto& out = worker_cells[w];
+                        for (size_t i = begin; i < end; i++) {
+                            const auto& p = d.sorted_poi_cells[i];
+                            uint32_t flags = p.item_id & INTERIOR_FLAG;
+                            uint32_t raw_id = p.item_id & ID_MASK;
+                            if (raw_id >= id_remap.size() || id_remap[raw_id] == NO_DATA) continue;
+                            CellItemPair q{p.cell_id, id_remap[raw_id] | flags};
+                            if (!out.empty() && out.back().cell_id == q.cell_id && out.back().item_id == q.item_id) continue;
+                            out.push_back(q);
+                        }
+                    });
+                    std::vector<CellItemPair> filtered_cells;
+                    for (auto& part : worker_cells) {
+                        filtered_cells.insert(filtered_cells.end(), part.begin(), part.end());
+                        std::vector<CellItemPair>().swap(part);
+                    }
+
+                    // Write files
+                    {
+                        std::ofstream f(poi_dir + "/poi_records.bin", std::ios::binary);
+                        f.write(reinterpret_cast<const char*>(filtered_records.data()),
+                                filtered_records.size() * sizeof(PoiRecord));
+                    }
+                    {
+                        std::ofstream f(poi_dir + "/poi_vertices.bin", std::ios::binary);
+                        f.write(reinterpret_cast<const char*>(filtered_vertex_bytes.data()),
+                                filtered_vertex_bytes.size());
+                    }
+                    // No per-tier sidecar emission — the canonical sidecar
+                    // for apply_strategy2_pois lives at base_dir/poi/all/
+                    // and contains the FULL POI set (emitted above, before
+                    // this loop). Per-tier sidecars would represent
+                    // tier-filtered index spaces that don't match what
+                    // apply_strategy2_pois operates on (the full d.poi_records
+                    // array), so reading them at the next build's allocator
+                    // would put records at the wrong slots.
+                    write_cell_index_sorted(poi_dir + "/poi_cells.bin", poi_dir + "/poi_entries.bin",
+                                            filtered_cells);
+
+                    // POI tier strings — only clients opting in to POI get
+                    // these names. Layout file lets the server resolve
+                    // global offsets without needing the mode dir.
+                    {
+                        const auto& buf = d.strings_tiers[4];
+                        std::ofstream f(poi_dir + "/" + STR_TIER_FILENAMES[4], std::ios::binary);
+                        f.write(buf.data(), buf.size());
+                    }
+                    write_strings_layout(poi_dir, d);
+
+                    // Write poi_meta.json (category metadata for the server)
+                    {
+                        std::ofstream mf(poi_dir + "/poi_meta.json");
+                        mf << "{\n";
+                        bool first = true;
+                        for (uint8_t cat : poi_meta_categories(d.poi_records, d.poi_sidecar_blob,
+                                                               selection)) {
+                            if (!first) mf << ",\n";
+                            first = false;
+                            PoiCategory pc = static_cast<PoiCategory>(cat);
+                            mf << "  \"" << (int)cat << "\": {\"name\": \""
+                               << poi_category_label(pc) << "\", \"reference_distance\": "
+                               << category_reference_distance(pc) << ", \"max_distance\": "
+                               << category_max_distance(pc) << ", \"default_importance\": "
+                               << (int)category_base_importance(pc) << "}";
+                        }
+                        mf << "\n}\n";
+                    }
+
+                    std::cerr << "  POI " << tier_var.name << ": "
+                              << filtered_records.size() << " records ("
+                              << selection.tombstones << " tombstones), "
+                              << filtered_vertex_bytes.size() << " vertex bytes, "
+                              << count_cells(filtered_cells) << " cells" << std::endl;
+                    log_phase(("    " + region + ": " + tier_var.name).c_str(), _pt, _pc);
+                }
+            }
+        };
+
+        const StageCosts costs = stage_costs(record_bytes(d));
+        struct Stage {
+            const char* name;
+            std::function<void()> write;
+            uint64_t cost;
+        };
+        const Stage stages[] = {
+            {"modes", write_modes, costs.modes},
+            {"quality variants", write_quality_dirs, costs.quality},
+            {"place files", write_places, costs.places},
+            {"admin-minimal", write_admin_minimal, costs.admin_minimal},
+            {"poi tiers", write_poi_tiers, costs.poi_tiers},
+        };
+        auto run_stage = [&](const Stage& stage) {
+            std::optional<BudgetLease> lease;
+            if (budget) lease.emplace(*budget, stage.cost);
+            timed_phase(std::string("    ") + region + ": " + stage.name, stage.write);
+        };
+        if (order == RunOrder::Serial) {
+            for (const auto& stage : stages) run_stage(stage);
+            return;
+        }
+        std::vector<std::future<void>> running;
+        for (const auto& stage : stages)
+            running.push_back(std::async(std::launch::async, [&] { run_stage(stage); }));
+        for (auto& f : running) f.get();
+    };
+
+    // Strategy-2 remap for the planet region runs synchronously HERE — before
+    // the planet write launches and before continent filtering reads the
+    // record arrays. apply_strategy2_remaps mutates the shared ParsedData, so
+    // running it inside the planet async raced filter_by_bbox_masked /
+    // precompute_masks below. Continent subsets are also built from the
+    // post-remap arrays this way (the schedule the racy code effectively
+    // produced in practice).
+    {
+        std::string planet_prev;
+        if (!prev_output_dir.empty()) planet_prev = prev_output_dir + "/planet";
+        timed_phase("    planet: strategy2 remap", [&] { apply_strategy2_remaps(data, planet_prev); });
+    }
+    // Expose the prev-output root to write_index via env var so the
+    // postcode_centroids strategy-2 pass (which runs inside write_index after
+    // centroids materialize, and so doesn't get prev_dir as a parameter) can
+    // locate <prev_root>/<region>/full/postcode_centroids.osm_ids. Set ONCE
+    // here, single-threaded, before any writer thread can call getenv —
+    // setenv/unsetenv from inside concurrent write_region calls was unsafe.
+    // The value is the same for every region, so it stays set for the whole
+    // write phase.
+    if (!prev_output_dir.empty()) {
+        setenv("GC_PREV_OUTPUT_ROOT", prev_output_dir.c_str(), 1);
+    } else {
+        unsetenv("GC_PREV_OUTPUT_ROOT");
+    }
+
+    // Postcode centroids are final before the split: a continent that
+    // recomputed them from its own addr points put RU 430000 on two
+    // mis-tagged Moscow addresses (Saransk's 21 fall in the asia subset).
+    timed_phase("    planet: postcode centroids", [&] { collect_postcode_centroids(data); });
+
+#ifdef __GLIBC__
+    // The earlier phases' freed blocks sit in the malloc arenas; handed back,
+    // they leave the write phase and the page cache room.
+    timed_phase("    malloc trim", [] { malloc_trim(0); });
+#endif
+
+    // What runs beside what: the planet's stages (one after another) and the
+    // continents share the memory the host allows past what the build holds
+    // now (and the continent masks, a byte per cell pair, will), each
+    // holding its estimated cost while it runs.
+    const uint64_t memory_limit = memory_limit_bytes();
+    const uint64_t in_use = static_cast<uint64_t>(get_rss_mb()) << 20;
+    const KindValues planet_pairs = pair_counts(data);
+    const uint64_t masks_bytes = generate_continents ? sum(planet_pairs) : 0;
+    MemoryBudget budget(write_budget(memory_limit, in_use + masks_bytes));
+    std::cerr << "Write schedule: memory limit " << (memory_limit >> 20) << " MiB, " << (in_use >> 20)
+              << " MiB in use, budget " << (budget.capacity() >> 20) << " MiB" << std::endl;
+
+    // Write planet (async, beside the continents). Its stages run at once
+    // when the budget holds them beside the costliest continents that can
+    // run together; else one after another, to hold memory down while
+    // continent subsets build alongside.
+    const uint64_t planet_stages = stage_costs(record_bytes(data)).total();
+    std::future<void> planet_future;
+    auto write_planet = [&](uint64_t beside) {
+        const RunOrder order = planet_stages + beside <= budget.capacity() ? RunOrder::Concurrent : RunOrder::Serial;
+        std::cerr << "Planet: stages " << (order == RunOrder::Serial ? "one at a time" : "at once") << std::endl;
+        planet_future = std::async(std::launch::async, [&, order]() {
+            timed_phase("    planet: write", [&] {
+                write_region(data, output_dir + "/planet", RegionRun::Planet, order, &budget);
+            });
+        });
+    };
+    if (!generate_continents) write_planet(0);
+
+    // Process continents with bounded concurrency, largest first.
+    if (generate_continents) {
+        // Pre-compute continent membership for each unique cell in sorted pairs.
+        // One parallel scan replaces 8 × cell_in_bbox per cell during filtering.
+        auto _pct = std::chrono::steady_clock::now();
+        auto _pcc = CpuTicks::now();
+
+        // Load continent polygons for boundary-based filtering
+        auto continent_polys = get_continent_polygons();
+        std::cerr << "  Loaded " << continent_polys.size() << " continent boundary polygons" << std::endl;
+
+        // A point outside a polygon's bounding box, widened far past the ring
+        // test's rounding error, is outside the polygon: no ring test there.
+        struct Box { double min_lat, max_lat, min_lng, max_lng; };
+        std::vector<Box> boxes;
+        for (const auto& cp : continent_polys) {
+            constexpr double kMargin = 1e-9;
+            Box box{std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity(),
+                    std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity()};
+            for (const auto& [vlat, vlng] : cp.vertices) {
+                box.min_lat = std::min(box.min_lat, vlat - kMargin);
+                box.max_lat = std::max(box.max_lat, vlat + kMargin);
+                box.min_lng = std::min(box.min_lng, vlng - kMargin);
+                box.max_lng = std::max(box.max_lng, vlng + kMargin);
+            }
+            boxes.push_back(box);
+        }
+
+        // For each sorted pair array, build a parallel array of continent bitmasks.
+        // Since pairs are sorted by cell_id, consecutive entries share the same mask.
+        auto precompute_masks = [&continent_polys, &boxes](const std::vector<CellItemPair>& sorted) -> std::vector<uint8_t> {
+            if (sorted.empty()) return {};
+            std::vector<uint8_t> masks(sorted.size(), 0);
+            parallel_for_runs(sorted.size(), same_cell(sorted), [&](size_t begin, size_t end, unsigned) {
+                for (size_t i = begin; i < end; ) {
+                    uint64_t cell_id = sorted[i].cell_id;
+                    S2CellId cell(cell_id);
+                    S2LatLng center = cell.ToLatLng();
+                    double lat = center.lat().degrees();
+                    double lng = center.lng().degrees();
+                    uint8_t mask = 0;
+                    // Test against continent polygons (not bboxes)
+                    for (size_t ci = 0; ci < continent_polys.size() && ci < 8; ci++) {
+                        const Box& box = boxes[ci];
+                        if (lat < box.min_lat || lat > box.max_lat || lng < box.min_lng || lng > box.max_lng) continue;
+                        if (point_in_polygon(lat, lng, continent_polys[ci].vertices))
+                            mask |= (1u << ci);
+                    }
+                    while (i < end && sorted[i].cell_id == cell_id) {
+                        masks[i] = mask;
+                        i++;
+                    }
+                }
+            });
+            return masks;
+        };
+
+        // Precompute masks for every sorted-pair array we'll filter through
+        // filter_by_bbox_masked: ways, addrs, interps, POIs, and place nodes.
+        auto way_masks = std::async(std::launch::async, [&]{ return precompute_masks(data.sorted_way_cells); });
+        auto addr_masks = std::async(std::launch::async, [&]{ return precompute_masks(data.sorted_addr_cells); });
+        auto interp_masks = std::async(std::launch::async, [&]{ return precompute_masks(data.sorted_interp_cells); });
+        auto poi_masks = std::async(std::launch::async, [&]{ return precompute_masks(data.sorted_poi_cells); });
+        auto place_masks = std::async(std::launch::async, [&]{ return precompute_masks(data.sorted_place_cells); });
+        auto way_continent_masks = way_masks.get();
+        auto addr_continent_masks = addr_masks.get();
+        auto interp_continent_masks = interp_masks.get();
+        auto poi_continent_masks = poi_masks.get();
+        auto place_continent_masks = place_masks.get();
+
+        log_phase("Pre-compute continent masks", _pct, _pcc);
+
+        // Each continent's cell pairs by kind; most first, so the biggest
+        // subset (Europe, whose bbox is small) doesn't start last and finish
+        // alone.
+        std::vector<KindValues> continent_pairs(kContinentCount, KindValues{});
+        const std::pair<RecordKind, const std::vector<uint8_t>*> kind_masks[] = {
+            {RecordKind::Ways, &way_continent_masks}, {RecordKind::Addrs, &addr_continent_masks},
+            {RecordKind::Interps, &interp_continent_masks}, {RecordKind::Pois, &poi_continent_masks},
+            {RecordKind::Places, &place_continent_masks}};
+        for (const auto& [kind, masks] : kind_masks) {
+            std::vector<std::array<uint64_t, 8>> counts(parallel_threads(), std::array<uint64_t, 8>{});
+            parallel_for(masks->size(), [&](size_t begin, size_t end, unsigned w) {
+                for (size_t i = begin; i < end; i++)
+                    for (size_t c = 0; c < 8; c++) counts[w][c] += ((*masks)[i] >> c) & 1u;
+            });
+            for (const auto& per_worker : counts)
+                for (size_t c = 0; c < kContinentCount && c < 8; c++) at(continent_pairs[c], kind) += per_worker[c];
+        }
+        std::vector<size_t> continent_order(kContinentCount);
+        std::iota(continent_order.begin(), continent_order.end(), 0u);
+        std::stable_sort(continent_order.begin(), continent_order.end(), [&](size_t a, size_t b) {
+            return sum(continent_pairs[a]) > sum(continent_pairs[b]);
+        });
+
+        // Cap at 3 so the cores stay shared with the planet's stages; the
+        // budget may hold fewer. A continent whose cost doesn't fit beside
+        // what runs waits, and a later one that fits goes ahead of it; one
+        // that doesn't fit the budget even alone runs alone, its steps one
+        // after another.
+        unsigned max_concurrent = std::max(1u, std::min(3u,
+            std::thread::hardware_concurrency() / 8));
+        const KindValues planet_bytes = record_bytes(data);
+        const KindValues planet_counts = record_counts(data);
+        struct ContinentRun {
+            size_t continent;
+            RegionCost cost;
+        };
+        std::vector<ContinentRun> pending;
+        for (size_t c : continent_order) {
+            const KindValues bytes = continent_share(planet_bytes, planet_pairs, continent_pairs[c]);
+            const KindValues counts = continent_share(planet_counts, planet_pairs, continent_pairs[c]);
+            const uint64_t filter_bytes = filter_cost(planet_counts, continent_pairs[c], parallel_threads());
+            pending.push_back({c, continent_cost(bytes, counts, filter_bytes, budget.capacity())});
+        }
+        std::vector<uint64_t> costliest;
+        for (const auto& run : pending) costliest.push_back(run.cost.bytes);
+        std::sort(costliest.begin(), costliest.end(), std::greater<uint64_t>());
+        costliest.resize(std::min<size_t>(costliest.size(), max_concurrent));
+        write_planet(std::accumulate(costliest.begin(), costliest.end(), uint64_t(0)));
+        std::cerr << "Processing " << kContinentCount << " continents ("
+                  << max_concurrent << " concurrent, largest first)..." << std::endl;
+
+        std::atomic<unsigned> active{0};
+        std::mutex cv_mutex;
+        std::condition_variable cv;
+        std::vector<std::future<void>> futures;
+
+        while (!pending.empty()) {
+            {
+                std::unique_lock<std::mutex> lock(cv_mutex);
+                cv.wait(lock, [&]{ return active.load() < max_concurrent; });
+            }
+            std::vector<uint64_t> costs;
+            for (const auto& run : pending) costs.push_back(run.cost.bytes);
+            const size_t pick = budget.acquire_first(costs);
+            const ContinentRun run = pending[pick];
+            pending.erase(pending.begin() + static_cast<std::ptrdiff_t>(pick));
+            active.fetch_add(1);
+
+            auto launch = [&] { return std::async(std::launch::async, [&, run]() {
+                // Frees the slot and the budget however the continent ends,
+                // so the loop above never waits on a failed one.
+                struct Done {
+                    std::atomic<unsigned>& active;
+                    std::mutex& mtx;
+                    std::condition_variable& cv;
+                    ~Done() {
+                        {
+                            std::lock_guard<std::mutex> lk(mtx);
+                            active.fetch_sub(1);
+                        }
+                        cv.notify_one();
+                    }
+                } done{active, cv_mutex, cv};
+                BudgetLease lease(budget, run.cost.bytes, std::adopt_lock);
+                const auto& continent = kContinents[run.continent];
+                auto _ct = std::chrono::steady_clock::now();
+                auto _cc = CpuTicks::now();
+                std::cerr << "Continent: " << continent.name << " (start, "
+                          << (run.cost.order == RunOrder::Serial ? "steps one at a time" : "steps at once")
+                          << ", ~" << (run.cost.bytes >> 20) << " MiB)..." << std::endl;
+                uint8_t cbit = 1u << run.continent;
+                const auto* poly = (run.continent < continent_polys.size() && !continent_polys[run.continent].vertices.empty())
+                    ? &continent_polys[run.continent].vertices : nullptr;
+                auto subset = filter_by_bbox_masked(data, continent, cbit,
+                    way_continent_masks, addr_continent_masks, interp_continent_masks,
+                    poi_continent_masks, place_continent_masks, poly);
+                log_phase(("  " + std::string(continent.name) + ": filter").c_str(), _ct, _cc);
+                write_region(subset, output_dir + "/" + continent.name, RegionRun::Continent, run.cost.order, nullptr);
+                log_phase(("  " + std::string(continent.name) + ": total").c_str(), _ct, _cc);
+            }); };
+            try {
+                futures.push_back(launch());
+            } catch (...) {
+                // No thread holds the slot or the budget (std::async could not
+                // start one): hand both back, or later waits never end.
+                budget.release(run.cost.bytes);
+                active.fetch_sub(1);
+                throw;
+            }
+        }
+        for (auto& f : futures) f.get();
+    }
+
+    // Wait for planet write if not already done
+    planet_future.get();
+    log_phase("All index writing (total)", _pt, _cpu);
+}
+
+// Deterministically sort/reorder/dedup/remap all data so the same input yields
+// the same on-disk byte layout regardless of thread scheduling (enables patching).
+static void reorder_deterministically(ParsedData& data, std::vector<float>& poi_elevations,
+                std::vector<uint32_t>& poi_qids, const std::vector<QidSitelinks>& sitelinks_data) {
+    std::cerr << "Deterministic ordering..." << std::endl;
+    auto _st = std::chrono::steady_clock::now();
+    auto _sc = CpuTicks::now();
+
+    // 1. Partition the string pool into per-consumer tiers, sort
+    //    alphabetically within each tier, and rewrite all record
+    //    offsets to the new globally-contiguous layout.  Shared
+    //    helper so continent_filter can re-run this on per-continent
+    //    subsets with their own flat pool.
+    {
+        partition_strings_into_tiers(data);
+        std::cerr << "  String pool partitioned into tiers:" << std::endl;
+        for (size_t t = 0; t < STR_TIER_COUNT; t++) {
+            size_t tier_size = data.strings_tiers[t].size();
+            std::cerr << "    " << STR_TIER_NAMES[t] << ": "
+                      << (tier_size / (1024*1024)) << " MiB" << std::endl;
+        }
+    }
+    log_phase("  Sort strings", _st, _sc);
+
+    // Interps share no data with the other steps, and tied TIGER duplicates
+    // can force their sort onto one core, so they sort beside them.
+    auto interps_sorted = std::async(std::launch::async, [&data] {
+        auto start = std::chrono::steady_clock::now();
+        reorder_interps(data);
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    });
+    reorder_addr_points(data);
+    log_phase("  Sort addr_points", _st, _sc);
+    reorder_ways(data);
+    log_phase("  Sort ways", _st, _sc);
+    reorder_admin_polygons(data);
+    log_phase("  Sort admin", _st, _sc);
+    reorder_pois(data, poi_elevations, poi_qids, sitelinks_data);
+    log_phase("  Sort POIs", _st, _sc);
+    reorder_place_nodes(data);
+    log_phase("  Sort place nodes", _st, _sc);
+    double interps_seconds = interps_sorted.get();
+    std::cerr << "  Interps took " << std::fixed << std::setprecision(1) << interps_seconds
+              << "s beside the other steps" << std::endl;
+    log_phase("  Sort interps (wait)", _st, _sc);
+}
+
+// Records a parse merge copies per parallel_for_parts range.
+static constexpr size_t kMergeGrain = size_t(1) << 16;
+
+// Where each parse thread's records start once the merge lays the threads'
+// buffers back to back, in thread order, with the total last.
+template <class Locals, class SizeOf>
+static std::vector<size_t> local_offsets(const Locals& locals, SizeOf size_of) {
+    std::vector<size_t> at{0};
+    for (const auto& local : locals) at.push_back(at.back() + size_of(local));
+    return at;
+}
+
+// Appends each parse thread's buffer(local) to `out` in thread order, on
+// every core, then frees the buffers.
+template <class T, class Locals, class Buffer>
+static void append_locals(std::vector<T>& out, Locals& locals, Buffer buffer) {
+    const auto at = local_offsets(locals, [&](const auto& local) { return buffer(local).size(); });
+    const size_t base = grow_by(out, at.back());
+    parallel_for_parts(at, kMergeGrain, [&](size_t k, size_t begin, size_t end, size_t to) {
+        const auto& b = buffer(locals[k]);
+        std::copy(b.begin() + begin, b.begin() + end, out.begin() + base + to);
+    });
+    parallel_for_each(locals.size(), [&](size_t k, unsigned) { free_storage(buffer(locals[k])); });
+}
+
+static int run(int argc, char* argv[]) {
+    if (argc < 2) {
+        std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [options]" << std::endl;
+        std::cerr << "       build-index <output-dir> --load-cache <path> [options]" << std::endl;
+        std::cerr << std::endl;
+        std::cerr << "Options:" << std::endl;
+        std::cerr << "  --street-level N       S2 cell level for streets (default: 17)" << std::endl;
+        std::cerr << "  --admin-level N        S2 cell level for admin (default: 10)" << std::endl;
+        std::cerr << "  --max-admin-level N    Only include admin levels <= N" << std::endl;
+        std::cerr << "  --save-cache <path>    Save parsed data to cache file" << std::endl;
+        std::cerr << "  --load-cache <path>    Load from cache instead of PBF" << std::endl;
+        std::cerr << "  --multi-output         Write full, no-addresses, admin-only indexes" << std::endl;
+        std::cerr << "  --continents           Also generate per-continent indexes" << std::endl;
+        std::cerr << "  --mode <mode>          Index mode: full, no-addresses, admin-only (default: full)" << std::endl;
+        std::cerr << "  --admin-only           Shorthand for --mode admin-only" << std::endl;
+        std::cerr << "  --no-addresses         Shorthand for --mode no-addresses" << std::endl;
+        std::cerr << "  --simplify-epsilon     Use error-bounded simplification (per-level defaults)" << std::endl;
+        std::cerr << "  --simplify-epsilon N   Use fixed epsilon of N meters for all levels" << std::endl;
+        std::cerr << "  --epsilon-scale F      Multiply all per-level epsilons by F (e.g. 2.0 = 2x coarser)" << std::endl;
+        std::cerr << "  --epsilon-levels L2,L3,...,L8  Set epsilon in meters per level (7 values)" << std::endl;
+        std::cerr << "  --multi-quality [S,S,...]  Write quality variants at given scales (default: 0,0.2,0.5,1,1.5,2,2.5)" << std::endl;
+        std::cerr << "  --tiger-data <path>          Load TIGER address data (tar.gz or directory of CSVs)" << std::endl;
+        std::cerr << "  --external-postcodes <path>  Load GeoNames postcode centroids (CSV or .csv.gz)" << std::endl;
+        std::cerr << "  --wikidata-sitelinks <path>  Load QID→sitelinks binary for POI importance" << std::endl;
+        return 1;
+    }
+
+    std::string output_dir = argv[1];
+    std::vector<std::string> input_files;
+    std::string save_cache_path;
+    std::string load_cache_path;
+    std::string wikidata_sitelinks_path;
+    std::string tiger_data_path;
+    std::string external_postcodes_path;
+    // strategy-2: previous build's output root, used to read
+    // <prev_dir>/<region>/<variant>/*.osm_ids sidecars and assign
+    // the same dense IDs to records carried over from the previous
+    // build. Empty means "fresh start, no stable IDs".
+    std::string prev_output_dir;
+    bool multi_output = false;
+    bool generate_continents = false;
+    IndexMode mode = IndexMode::Full;
+    SimplifyMode simplify_mode = SimplifyMode::MaxVertices;
+    double simplify_epsilon_override = 0; // 0 = use per-level defaults
+    bool multi_quality = false;
+    std::vector<double> quality_scales;
+
+    // q2.5 — admin-minimal isn't tiered by quality, this is the
+    // single epsilon used when re-simplifying its polygon set.
+
+    for (int i = 2; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--street-level" && i + 1 < argc) {
+            kStreetCellLevel = std::atoi(argv[++i]);
+        } else if (arg == "--admin-level" && i + 1 < argc) {
+            kAdminCellLevel = std::atoi(argv[++i]);
+        } else if (arg == "--admin-only") {
+            mode = IndexMode::AdminOnly;
+        } else if (arg == "--no-addresses") {
+            mode = IndexMode::NoAddresses;
+        } else if (arg == "--max-admin-level" && i + 1 < argc) {
+            kMaxAdminLevel = std::atoi(argv[++i]);
+        } else if (arg == "--save-cache" && i + 1 < argc) {
+            save_cache_path = argv[++i];
+        } else if (arg == "--load-cache" && i + 1 < argc) {
+            load_cache_path = argv[++i];
+        } else if (arg == "--multi-output") {
+            multi_output = true;
+        } else if (arg == "--continents") {
+            generate_continents = true;
+        } else if (arg == "--simplify-epsilon") {
+            simplify_mode = SimplifyMode::ErrorBounded;
+            // Optional: next arg might be a number (fixed epsilon in meters)
+            if (i + 1 < argc) {
+                char* end;
+                double val = std::strtod(argv[i+1], &end);
+                if (*end == '\0' && val > 0) {
+                    simplify_epsilon_override = val;
+                    i++;
+                }
+            }
+        } else if (arg == "--epsilon-scale" && i + 1 < argc) {
+            kEpsilonScale = std::strtod(argv[++i], nullptr);
+        } else if (arg == "--multi-quality") {
+            multi_quality = true;
+            // Optional: next arg might be comma-separated scales
+            if (i + 1 < argc && argv[i+1][0] != '-') {
+                std::string vals = argv[++i];
+                size_t pos = 0;
+                while (pos < vals.size()) {
+                    size_t next = vals.find(',', pos);
+                    if (next == std::string::npos) next = vals.size();
+                    double v = std::strtod(vals.substr(pos, next - pos).c_str(), nullptr);
+                    quality_scales.push_back(v);
+                    pos = next + 1;
+                }
+            }
+            if (quality_scales.empty()) {
+                quality_scales = {0, 0.2, 0.5, 1.0, 1.5, 2.0, 2.5};
+            }
+            // Build with uncapped polygons — quality variants simplify at write time.
+            // We need full vertex detail to produce all quality levels accurately.
+            simplify_mode = SimplifyMode::ErrorBounded;
+            simplify_epsilon_override = 0.1; // effectively uncapped
+        } else if (arg == "--epsilon-levels" && i + 1 < argc) {
+            // Parse comma-separated values: L2,L3,L4,L5,L6,L7,L8
+            std::string vals = argv[++i];
+            int level = 2;
+            size_t pos = 0;
+            while (pos < vals.size() && level <= 8) {
+                size_t next = vals.find(',', pos);
+                if (next == std::string::npos) next = vals.size();
+                double v = std::strtod(vals.substr(pos, next - pos).c_str(), nullptr);
+                if (v > 0) kAdminEpsilonMeters[level] = v;
+                level++;
+                pos = next + 1;
+            }
+            // Also set levels 9-11 to same as level 8
+            for (int l = level; l <= 11; l++) kAdminEpsilonMeters[l] = kAdminEpsilonMeters[8];
+        } else if (arg == "--mode" && i + 1 < argc) {
+            std::string mode_str = argv[++i];
+            if (mode_str == "full") {
+                mode = IndexMode::Full;
+            } else if (mode_str == "no-addresses") {
+                mode = IndexMode::NoAddresses;
+            } else if (mode_str == "admin-only") {
+                mode = IndexMode::AdminOnly;
+            } else {
+                std::cerr << "Error: unknown mode '" << mode_str << "'" << std::endl;
+                return 1;
+            }
+        } else if (arg == "--wikidata-sitelinks" && i + 1 < argc) {
+            wikidata_sitelinks_path = argv[++i];
+        } else if (arg == "--tiger-data" && i + 1 < argc) {
+            tiger_data_path = argv[++i];
+        } else if (arg == "--external-postcodes" && i + 1 < argc) {
+            external_postcodes_path = argv[++i];
+        } else if (arg == "--prev-output" && i + 1 < argc) {
+            prev_output_dir = argv[++i];
+        } else {
+            input_files.push_back(arg);
+        }
+    }
+
+    // Set global simplification mode
+    kSimplifyMode = simplify_mode;
+    kSimplifyEpsilonOverride = simplify_epsilon_override;
+    if (simplify_mode == SimplifyMode::ErrorBounded) {
+        if (simplify_epsilon_override > 0) {
+            std::cerr << "Simplification: error-bounded, fixed " << simplify_epsilon_override << "m epsilon" << std::endl;
+        } else {
+            std::cerr << "Simplification: error-bounded, scale=" << kEpsilonScale
+                      << ", epsilons: L2=" << admin_epsilon_meters(2)
+                      << "m L4=" << admin_epsilon_meters(4)
+                      << "m L6=" << admin_epsilon_meters(6)
+                      << "m L8=" << admin_epsilon_meters(8) << "m" << std::endl;
+        }
+    }
+
+    ParsedData data;
+    auto _pt = std::chrono::steady_clock::now();
+    auto _cpu = CpuTicks::now();
+
+    std::vector<float> poi_elevations; // build-time only, not in ParsedData
+    std::vector<uint32_t> poi_qids; // build-time only: wikidata QID numbers
+
+    // Load wikidata sitelinks data (QID → sitelinks count).
+    // The file is PACKED 6-byte records — struct.pack('<IH', qid, count) in
+    // extract_wikidata_sitelinks.py — NOT sizeof(QidSitelinks)=8 with padding.
+    // The old 8-byte-stride read parsed record 0 correctly and garbage for
+    // every record after it, silently zeroing sitelink-based POI importance.
+    std::vector<QidSitelinks> sitelinks_data;
+    if (!wikidata_sitelinks_path.empty()) {
+        auto _wt = std::chrono::steady_clock::now();
+        auto _wc = CpuTicks::now();
+        std::ifstream sf(wikidata_sitelinks_path, std::ios::binary | std::ios::ate);
+        if (sf) {
+            size_t sz = sf.tellg();
+            sf.seekg(0);
+            if (sz % 6 != 0)
+                throw std::runtime_error("qid_sitelinks.bin size not a multiple of 6 bytes");
+            std::vector<char> raw(sz);
+            sf.read(raw.data(), sz);
+            if (!sf) throw std::runtime_error("short read on " + wikidata_sitelinks_path);
+            sitelinks_data.resize(sz / 6);
+            for (size_t i = 0; i < sitelinks_data.size(); i++) {
+                std::memcpy(&sitelinks_data[i].qid,   raw.data() + i * 6,     4);
+                std::memcpy(&sitelinks_data[i].count, raw.data() + i * 6 + 4, 2);
+            }
+            // lookup_sitelinks binary-searches by qid — enforce sortedness.
+            for (size_t i = 1; i < sitelinks_data.size(); i++) {
+                if (sitelinks_data[i].qid < sitelinks_data[i - 1].qid)
+                    throw std::runtime_error("qid_sitelinks.bin not sorted by qid");
+            }
+            std::cerr << "Loaded " << sitelinks_data.size() << " wikidata sitelinks entries." << std::endl;
+        }
+        log_phase("  Wikidata sitelinks: load", _wt, _wc);
+    }
+
+    // Helper to look up sitelinks count by QID (binary search since data is sorted)
+
+    unsigned int num_threads = std::max(1u, std::thread::hardware_concurrency() - 1);
+    BuildConfig cfg{num_threads, mode, multi_output, multi_quality, output_dir, prev_output_dir};
+    if (!load_cache_path.empty()) {
+        // Load from cache
+        if (!deserialize_cache(data, load_cache_path)) {
+            std::cerr << "Error: failed to load cache" << std::endl;
+            return 1;
+        }
+    } else {
+        // Parse PBF files (always collect everything)
+        if (input_files.empty()) {
+            std::cerr << "Error: no input files specified and no --load-cache" << std::endl;
+            return 1;
+        }
+
+        // The TIGER tarball extracts (a core and the disk) during the PBF passes.
+        std::future<TigerCsvFiles> tiger_csvs;
+        if (!tiger_data_path.empty())
+            tiger_csvs = std::async(std::launch::async, find_tiger_csvs, tiger_data_path);
+
+        // Create thread pool for concurrent admin polygon S2 covering
+        std::cerr << "Using " << num_threads << " worker threads." << std::endl;
+        AdminCoverPool admin_pool(num_threads);
+        // BuildHandler no longer used — parallel processing handles everything
+
+        for (const auto& input_file : input_files) {
+            std::cerr << "Processing " << input_file << "..." << std::endl;
+
+            // --- Pass 1: collect relation members for parallel admin assembly ---
+            std::cerr << "  Pass 1: scanning relations..." << std::endl;
+            auto _bt = std::chrono::steady_clock::now();
+            auto _bc = CpuTicks::now();
+            PbfFile pbf(input_file, num_threads);
+            log_phase("  Pass 1: blob scan", _bt, _bc);
+
+            std::vector<std::string> rel_wikidata; // parallel to data.collected_relations
+            std::unordered_set<int64_t> wanted_label_nodes; // node IDs referenced as role=label
+            {
+                std::mutex rel_mutex;
+                pbf.read_blocks([&](PbfBlock& block, unsigned) {
+                    for (auto& rel : block.relations) {
+                        const char* boundary = rel.tag("boundary");
+                        const char* rel_type = rel.tag("type");
+                        const char* rel_place = rel.tag("place");
+
+                        // type=multipolygon + place=city/town/… relations (e.g. Moscow
+                        // R2555133) are distinct placex rows in Nominatim at the
+                        // place type's rank. They exist alongside any matching
+                        // boundary=administrative relation at a different rank.
+                        bool is_multipolygon_place =
+                            !boundary && rel_type && rel_place &&
+                            std::strcmp(rel_type, "multipolygon") == 0 &&
+                            classify_place_override(nullptr, nullptr, rel_place).type != AdminPlaceType::NONE;
+
+                        if (!boundary && !is_multipolygon_place) continue;
+
+                        bool is_admin = boundary && std::strcmp(boundary, "administrative") == 0;
+                        bool is_postal = boundary && std::strcmp(boundary, "postal_code") == 0;
+                        bool is_place_boundary = boundary && std::strcmp(boundary, "place") == 0;
+                        if (!is_admin && !is_postal && !is_place_boundary && !is_multipolygon_place) continue;
+
+                        // Capture label member node (Nominatim's primary place-link lookup)
+                        int64_t label_node_id = -1;
+                        for (size_t mi = 0; mi < rel.members.size(); mi++) {
+                            if (rel.members[mi].type == 'n' && rel.member_role(mi) == "label") {
+                                label_node_id = rel.members[mi].ref;
+                                break;
+                            }
+                        }
+
+                        // Handle boundary=place (e.g., Washington DC) and
+                        // type=multipolygon+place=* (e.g., Moscow R2555133).
+                        if (is_place_boundary || is_multipolygon_place) {
+                            const char* place_tag = rel_place;
+                            if (place_tag) {
+                                AdminPlaceType pt = classify_place_override(nullptr, nullptr, place_tag).type;
+                                if (pt != AdminPlaceType::NONE) {
+                                    const char* name = rel.tag("name:en");
+                                    if (!name) name = rel.tag("name");
+                                    if (name) {
+                                        CollectedRelation cr;
+                                        cr.id = rel.id;
+                                        cr.label_node_id = label_node_id;
+                                        cr.admin_level = 15;  // special marker for boundary=place / place multipolygon
+                                        cr.name = name;
+                                        cr.is_postal = false;
+                                        cr.fallback_place_type = static_cast<uint8_t>(pt);
+                                        for (size_t mi = 0; mi < rel.members.size(); mi++) {
+                                            if (rel.members[mi].type == 'w') {
+                                                cr.members.emplace_back(rel.members[mi].ref, rel.member_role(mi));
+                                            }
+                                        }
+                                        if (!cr.members.empty()) {
+                                            std::lock_guard<std::mutex> lock(rel_mutex);
+                                            data.collected_relations.push_back(std::move(cr));
+                                            rel_wikidata.emplace_back(); // already has override, no wikidata needed
+                                            if (label_node_id >= 0) wanted_label_nodes.insert(label_node_id);
+                                        }
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+
+                        uint8_t admin_level = 0;
+                        if (is_admin) {
+                            const char* level_str = rel.tag("admin_level");
+                            if (!level_str) continue;
+                            admin_level = static_cast<uint8_t>(std::atoi(level_str));
+                            if (admin_level < 2 || admin_level > 10) continue;
+                        } else {
+                            admin_level = 11;
+                        }
+                        if (kMaxAdminLevel > 0 && admin_level > kMaxAdminLevel) continue;
+
+                        const char* name_en = rel.tag("name:en");
+                        const char* name = rel.tag("name");
+                        if (!name_en) name_en = name;
+                        if (!name_en && is_admin) continue;
+
+                        std::string name_str;
+                        if (is_postal) {
+                            const char* postal_code = rel.tag("postal_code");
+                            if (!postal_code) postal_code = name_en;
+                            if (!postal_code) continue;
+                            name_str = postal_code;
+                        } else {
+                            name_str = name_en;
+                        }
+
+                        std::string country_code;
+                        if (admin_level == 2) {
+                            const char* cc = rel.tag("ISO3166-1:alpha2");
+                            if (cc) country_code = cc;
+                        }
+
+                        const char* linked_place = rel.tag("linked_place");
+                        const char* border_type_tag = rel.tag("border_type");
+                        const char* wikidata_tag = rel.tag("wikidata");
+                        // place=* tag on boundary=administrative relations (e.g. Tokyo
+                        // has place=province, Suginami has place=city). Nominatim's
+                        // get_label_tag prefers extratags['place'] over the admin_level
+                        // → rank label, so we honour it as a place_type_override.
+                        const char* place_tag_on_admin = rel.tag("place");
+
+                        auto po = classify_place_override(linked_place, border_type_tag, place_tag_on_admin);
+                        CollectedRelation cr;
+                        cr.id = rel.id;
+                        cr.label_node_id = label_node_id;
+                        cr.admin_level = admin_level;
+                        cr.name = std::move(name_str);
+                        cr.country_code = std::move(country_code);
+                        cr.is_postal = is_postal;
+                        cr.fallback_place_type = static_cast<uint8_t>(po.type);
+
+                        for (size_t mi = 0; mi < rel.members.size(); mi++) {
+                            if (rel.members[mi].type == 'w') {
+                                cr.members.emplace_back(rel.members[mi].ref, rel.member_role(mi));
+                            }
+                        }
+
+                        if (!cr.members.empty()) {
+                            // Always store wikidata for relations. Nominatim's
+                            // find_linked_place (placex_triggers.sql) goes:
+                            // label role → wikidata → place type match → name
+                            // match. The wikidata step runs regardless of the
+                            // place=* tag on the boundary, and this is what
+                            // lets Tokyo (place=province + wikidata=Q1490) link
+                            // to its place=city admin_centre node and drop out
+                            // of the address hierarchy after Suginami wins.
+                            std::string wd_str = wikidata_tag ? wikidata_tag : "";
+                            std::lock_guard<std::mutex> lock(rel_mutex);
+                            data.collected_relations.push_back(std::move(cr));
+                            rel_wikidata.push_back(std::move(wd_str));
+                            if (label_node_id >= 0) wanted_label_nodes.insert(label_node_id);
+                        }
+                    }
+                    // --- POI relation scanning (same pass) ---
+                    for (auto& rel : block.relations) {
+                        const char* r_boundary = rel.tag("boundary");
+                        const char* r_leisure  = rel.tag("leisure");
+                        const char* r_tourism  = rel.tag("tourism");
+                        const char* r_natural  = rel.tag("natural");
+                        const char* r_aeroway  = rel.tag("aeroway");
+                        const char* r_place    = rel.tag("place");
+                        const char* r_office   = rel.tag("office");
+
+                        PoiCategory poi_cat = PoiCategory::UNKNOWN;
+                        // boundary
+                        if (r_boundary) {
+                            if (std::strcmp(r_boundary, "national_park") == 0) poi_cat = PoiCategory::NATIONAL_PARK;
+                            else if (std::strcmp(r_boundary, "protected_area") == 0) poi_cat = PoiCategory::PROTECTED_AREA;
+                        }
+                        // leisure
+                        if (poi_cat == PoiCategory::UNKNOWN && r_leisure) {
+                            if (std::strcmp(r_leisure, "park") == 0) poi_cat = PoiCategory::PARK;
+                            else if (std::strcmp(r_leisure, "nature_reserve") == 0) poi_cat = PoiCategory::NATURE_RESERVE;
+                            else if (std::strcmp(r_leisure, "stadium") == 0) poi_cat = PoiCategory::STADIUM;
+                            else if (std::strcmp(r_leisure, "sports_centre") == 0) poi_cat = PoiCategory::STADIUM;
+                            else if (std::strcmp(r_leisure, "water_park") == 0) poi_cat = PoiCategory::WATER_PARK;
+                            else if (std::strcmp(r_leisure, "golf_course") == 0) poi_cat = PoiCategory::GOLF_COURSE;
+                            else if (std::strcmp(r_leisure, "garden") == 0) poi_cat = PoiCategory::GARDEN;
+                            else if (std::strcmp(r_leisure, "marina") == 0) poi_cat = PoiCategory::MARINA;
+                        }
+                        // tourism
+                        if (poi_cat == PoiCategory::UNKNOWN && r_tourism) {
+                            if (std::strcmp(r_tourism, "theme_park") == 0) poi_cat = PoiCategory::THEME_PARK;
+                            else if (std::strcmp(r_tourism, "zoo") == 0) poi_cat = PoiCategory::ZOO;
+                            else if (std::strcmp(r_tourism, "museum") == 0) poi_cat = PoiCategory::MUSEUM;
+                            else if (std::strcmp(r_tourism, "attraction") == 0) poi_cat = PoiCategory::ATTRACTION;
+                            else if (std::strcmp(r_tourism, "aquarium") == 0) poi_cat = PoiCategory::AQUARIUM;
+                            else if (std::strcmp(r_tourism, "resort") == 0) poi_cat = PoiCategory::RESORT;
+                        }
+                        // natural
+                        if (poi_cat == PoiCategory::UNKNOWN && r_natural) {
+                            if (std::strcmp(r_natural, "bay") == 0) poi_cat = PoiCategory::BAY;
+                            else if (std::strcmp(r_natural, "island") == 0) poi_cat = PoiCategory::ISLAND;
+                            else if (std::strcmp(r_natural, "beach") == 0) poi_cat = PoiCategory::BEACH;
+                            else if (std::strcmp(r_natural, "glacier") == 0) poi_cat = PoiCategory::GLACIER;
+                            else if (std::strcmp(r_natural, "volcano") == 0) poi_cat = PoiCategory::VOLCANO;
+                        }
+                        // aeroway
+                        if (poi_cat == PoiCategory::UNKNOWN && r_aeroway) {
+                            if (std::strcmp(r_aeroway, "aerodrome") == 0) poi_cat = PoiCategory::AERODROME;
+                        }
+                        // place
+                        if (poi_cat == PoiCategory::UNKNOWN && r_place) {
+                            if (std::strcmp(r_place, "island") == 0 || std::strcmp(r_place, "islet") == 0)
+                                poi_cat = PoiCategory::ISLAND;
+                        }
+                        // office
+                        if (poi_cat == PoiCategory::UNKNOWN && r_office) {
+                            if (std::strcmp(r_office, "government") == 0) poi_cat = PoiCategory::GOVERNMENT;
+                        }
+
+                        if (poi_cat != PoiCategory::UNKNOWN) {
+                            const char* poi_name = rel.tag("name:en");
+                            if (!poi_name) poi_name = rel.tag("name");
+                            if (poi_name) {
+                                uint8_t flags = 0;
+                                if (rel.tag("wikipedia")) flags |= POI_FLAG_WIKIPEDIA;
+                                if (rel.tag("wikidata"))  flags |= POI_FLAG_WIKIDATA;
+                                // highway=pedestrian/footway/etc. relations
+                                // like Mexico City's "Constitution Square"
+                                // (r19430125, tourism=attraction AND
+                                // highway=pedestrian) land here because of
+                                // the tourism tag but are rank-26 in
+                                // nominatim. Flag so the server surfaces
+                                // the relation's own name as `road`.
+                                const char* r_highway = rel.tag("highway");
+                                if (r_highway && (
+                                        std::strcmp(r_highway, "pedestrian") == 0 ||
+                                        std::strcmp(r_highway, "footway") == 0 ||
+                                        std::strcmp(r_highway, "living_street") == 0 ||
+                                        std::strcmp(r_highway, "path") == 0 ||
+                                        std::strcmp(r_highway, "cycleway") == 0 ||
+                                        std::strcmp(r_highway, "service") == 0)) {
+                                    flags |= POI_FLAG_HIGHWAY;
+                                }
+                                uint8_t tier = poi_get_default_tier(poi_cat);
+                                if ((flags & (POI_FLAG_WIKIPEDIA | POI_FLAG_WIKIDATA)) && tier > 1) tier--;
+
+                                CollectedPoiRelation cpr;
+                                cpr.id = rel.id;
+                                cpr.category = poi_cat;
+                                cpr.tier = tier;
+                                cpr.flags = flags;
+                                cpr.qid = 0;
+                                const char* r_wd = rel.tag("wikidata");
+                                if (r_wd && r_wd[0] == 'Q') {
+                                    cpr.qid = static_cast<uint32_t>(std::strtoul(r_wd + 1, nullptr, 10));
+                                }
+                                cpr.name = poi_name;
+                                // Relation-level addr tags (see CollectedPoiRelation
+                                // header for rationale — rank-30 rows with
+                                // addr:housenumber become AddrPoints too).
+                                const char* r_hn = rel.tag("addr:housenumber");
+                                if (r_hn) {
+                                    cpr.addr_housenumber = r_hn;
+                                    const char* r_st = rel.tag("addr:street");
+                                    if (r_st) cpr.addr_street = r_st;
+                                    const char* r_pc = rel.tag("addr:postcode");
+                                    if (r_pc) cpr.addr_postcode = r_pc;
+                                }
+
+                                for (size_t mi = 0; mi < rel.members.size(); mi++) {
+                                    if (rel.members[mi].type == 'w') {
+                                        cpr.members.emplace_back(rel.members[mi].ref, rel.member_role(mi));
+                                    }
+                                }
+
+                                if (!cpr.members.empty()) {
+                                    std::lock_guard<std::mutex> lock(rel_mutex);
+                                    data.collected_poi_relations.push_back(std::move(cpr));
+                                }
+                            }
+                        }
+                    }
+                }, "r");
+            }
+            std::cerr << "  Collected " << data.collected_relations.size()
+                      << " admin/postal relations for parallel assembly." << std::endl;
+            std::cerr << "  Collected " << data.collected_poi_relations.size()
+                      << " POI relations for parallel assembly." << std::endl;
+            log_phase("Pass 1: relation scanning", _pt, _cpu);
+
+            // Build admin_way_ids as a bitset for O(1) lookup
+            // Max way ID ~1.3B → ~162 MiB bitset (much faster than unordered_set)
+            static constexpr size_t MAX_WAY_ID = 2000000000ULL; // 2B, ~250 MiB
+            std::vector<uint8_t> admin_way_bits(MAX_WAY_ID / 8 + 1, 0);
+            size_t admin_way_count = 0;
+            for (const auto& rel : data.collected_relations) {
+                for (const auto& [way_id, role] : rel.members) {
+                    if (way_id > 0 && static_cast<size_t>(way_id) < MAX_WAY_ID) {
+                        admin_way_bits[way_id / 8] |= (1 << (way_id % 8));
+                        admin_way_count++;
+                    }
+                }
+            }
+            auto is_admin_way = [&](int64_t id) -> bool {
+                if (id <= 0 || static_cast<size_t>(id) >= MAX_WAY_ID) return false;
+                return admin_way_bits[id / 8] & (1 << (id % 8));
+            };
+            std::cerr << "  Admin assembly needs " << admin_way_count << " way geometries." << std::endl;
+
+            // Build poi_way_bits for POI relation member ways
+            std::vector<uint8_t> poi_way_bits(MAX_WAY_ID / 8 + 1, 0);
+            size_t poi_way_count = 0;
+            for (const auto& rel : data.collected_poi_relations) {
+                for (const auto& [way_id, role] : rel.members) {
+                    if (way_id > 0 && static_cast<size_t>(way_id) < MAX_WAY_ID) {
+                        poi_way_bits[way_id / 8] |= (1 << (way_id % 8));
+                        poi_way_count++;
+                    }
+                }
+            }
+            auto is_poi_way = [&](int64_t id) -> bool {
+                if (id <= 0 || static_cast<size_t>(id) >= MAX_WAY_ID) return false;
+                return poi_way_bits[id / 8] & (1 << (id % 8));
+            };
+            std::cerr << "  POI assembly needs " << poi_way_count << " way geometries." << std::endl;
+
+            // --- Pass 2 pre-scan: mark the nodes the way pass looks up ---
+            // Only their coordinates are kept. The way pass applies the
+            // same way_needs_nodes rule to the same blobs, and a lookup of
+            // an unmarked id fails the build after it.
+            SparseNodeIndex index(MAX_NODE_ID_DEFAULT);
+            {
+                auto _mt = std::chrono::steady_clock::now();
+                auto _mc = CpuTicks::now();
+                pbf.read_ways_streaming([&](int64_t way_id,
+                    const int64_t* refs_data, size_t refs_size,
+                    const uint32_t* tag_keys, const uint32_t* tag_vals, size_t ntags,
+                    const std::vector<std::string>& st) {
+                    if (refs_size == 0) return;
+                    bool relation_member = is_admin_way(way_id) || is_poi_way(way_id);
+                    if (!way_needs_nodes(parse_way_tags(tag_keys, tag_vals, ntags, st), relation_member)) return;
+                    for (size_t ri = 0; ri < refs_size; ri++) index.mark(static_cast<uint64_t>(refs_data[ri]));
+                });
+                index.finalize();
+                std::cerr << "  Node index: " << index.marked() << " node ids looked up by ways ("
+                          << (index.bytes() >> 20) << " MiB)." << std::endl;
+                log_phase("    Pass 2: way node pre-scan", _mt, _mc);
+            }
+
+            // --- Pass 2: Node processing (streaming — no PbfNode objects) ---
+            // POI classification helper
+            // POI classification uses the classify_poi() free function (above main())
+            // and the PoiClassification struct from types.h.
+
+            std::cerr << "  Pass 2: processing nodes with " << num_threads << " threads..." << std::endl;
+            std::unordered_map<std::string, uint8_t> wikidata_to_place_type;
+            std::unordered_map<int64_t, uint8_t> label_node_to_place_type; // node_id → PlaceType
+            // node ids per QID, so wikidata links can hide the matched
+            // place node like Nominatim's linked_place_id does
+            std::unordered_map<std::string, std::vector<int64_t>> wikidata_place_node_ids;
+            {
+                struct NodeThreadLocal {
+                    // Strings below are codes into `strings` (kNone: none).
+                    StringDict strings;
+                    // Address locations as stored (float) and street cells of
+                    // the exact node locations, computed here in parallel.
+                    std::vector<NodeCoord> addr_coords;
+                    std::vector<uint64_t> addr_cells;
+                    std::vector<std::pair<uint32_t, uint32_t>> addr_strings; // {hn, street}
+                    std::vector<uint32_t> addr_postcodes; // parallel to addr_strings
+                    std::vector<int64_t> addr_osm_node_ids; // parallel to addr_coords; strategy-2 stable identity
+                    uint64_t count = 0;
+                    uint64_t nodes = 0;
+                    std::vector<std::pair<int64_t, uint8_t>> label_hits; // (node_id, PlaceType)
+                    // POI node data
+                    std::vector<PoiRecord> poi_records;
+                    std::vector<int64_t> poi_osm_node_ids; // parallel to poi_records; strategy-2 stable identity
+                    std::vector<uint32_t> poi_names;
+                    std::vector<float> poi_elevations;
+                    std::vector<uint32_t> poi_qids;
+                    uint64_t poi_count = 0;
+                    // Place node data
+                    std::vector<PlaceNode> place_nodes;
+                    std::vector<int64_t> place_osm_node_ids; // parallel to place_nodes; strategy-2 stable identity
+                    std::vector<uint32_t> place_names;
+                    std::vector<std::tuple<std::string, int64_t, uint8_t>> place_wikidata; // (wikidata_id, node_id, PlaceType)
+                };
+                // Use thread_local for streaming callback (no thread index available)
+                static thread_local NodeThreadLocal* tl_node_data = nullptr;
+                std::vector<NodeThreadLocal> ntld(num_threads);
+                std::atomic<unsigned> next_tl{0};
+                auto _st = std::chrono::steady_clock::now();
+                auto _sc = CpuTicks::now();
+
+                pbf.read_nodes_streaming([&](int64_t id, double lat, double lng,
+                    const uint32_t* tag_keys, const uint32_t* tag_vals, size_t ntags,
+                    const std::vector<std::string>& st) {
+
+                    // Lazy init thread-local pointer
+                    if (!tl_node_data) {
+                        unsigned idx = next_tl.fetch_add(1);
+                        tl_node_data = &ntld[idx % ntld.size()];
+                    }
+
+                    tl_node_data->nodes++;
+                    if (id > 0) {
+                        index.set(static_cast<uint64_t>(id), lat, lng);
+                    }
+
+                    // Check for address + POI tags (fast — no string copies for tagless nodes)
+                    if (ntags > 0) {
+                        const char* housenumber = nullptr;
+                        const char* street = nullptr;
+                        const char* postcode = nullptr;
+                        const char* n_tourism = nullptr;
+                        const char* n_historic = nullptr;
+                        const char* n_amenity = nullptr;
+                        const char* n_leisure = nullptr;
+                        const char* n_natural = nullptr;
+                        const char* n_aeroway = nullptr;
+                        const char* n_railway = nullptr;
+                        const char* n_man_made = nullptr;
+                        const char* n_building = nullptr;
+                        const char* n_craft = nullptr;
+                        const char* n_power = nullptr;
+                        const char* n_place = nullptr;
+                        const char* n_waterway = nullptr;
+                        const char* n_boundary = nullptr;
+                        const char* n_office = nullptr;
+                        const char* n_name = nullptr;
+                        const char* n_name_en = nullptr;
+                        const char* n_ref = nullptr;
+                        const char* n_wikipedia = nullptr;
+                        const char* n_wikidata = nullptr;
+                        const char* n_ele = nullptr;
+                        const char* n_highway = nullptr;
+                        const char* n_shop = nullptr;
+                        const char* n_landuse = nullptr;
+                        for (size_t i = 0; i < ntags; i++) {
+                            if (tag_keys[i] >= st.size()) continue;
+                            const auto& k = st[tag_keys[i]];
+                            const char* v = tag_vals[i] < st.size() ? st[tag_vals[i]].c_str() : nullptr;
+                            switch (k.size() > 0 ? k[0] : 0) {
+                                case 'a':
+                                    if (k == "addr:housenumber") housenumber = v;
+                                    else if (k == "addr:street") street = v;
+                                    else if (k == "addr:postcode") postcode = v;
+                                    else if (k == "amenity") n_amenity = v;
+                                    else if (k == "aeroway") n_aeroway = v;
+                                    break;
+                                case 'b':
+                                    if (k == "building") n_building = v;
+                                    else if (k == "boundary") n_boundary = v;
+                                    break;
+                                case 'c': if (k == "craft") n_craft = v; break;
+                                case 'e': if (k == "ele") n_ele = v; break;
+                                case 'h':
+                                    if (k == "historic") n_historic = v;
+                                    else if (k == "highway") n_highway = v;
+                                    break;
+                                case 'l':
+                                    if (k == "leisure") n_leisure = v;
+                                    else if (k == "landuse") n_landuse = v;
+                                    break;
+                                case 'm': if (k == "man_made") n_man_made = v; break;
+                                case 'n':
+                                    if (k == "name") n_name = v;
+                                    else if (k == "name:en") n_name_en = v;
+                                    else if (k == "natural") n_natural = v;
+                                    break;
+                                case 'o':
+                                    if (k == "office") n_office = v;
+                                    break;
+                                case 'p':
+                                    if (k == "place") n_place = v;
+                                    else if (k == "power") n_power = v;
+                                    break;
+                                case 'r':
+                                    if (k == "railway") n_railway = v;
+                                    else if (k == "ref") n_ref = v;
+                                    break;
+                                case 's': if (k == "shop") n_shop = v; break;
+                                case 't': if (k == "tourism") n_tourism = v; break;
+                                case 'w':
+                                    if (k == "waterway") n_waterway = v;
+                                    else if (k == "wikipedia") n_wikipedia = v;
+                                    else if (k == "wikidata") n_wikidata = v;
+                                    break;
+                            }
+                        }
+                        if (housenumber) {
+                            // Nominatim's IsAddressPoint accepts any
+                            // rank-30 row with a housenumber, even
+                            // without addr:street — it resolves the
+                            // street via parent_place_id. We index
+                            // the node regardless of addr:street and
+                            // backfill the street later via a
+                            // nearest-named-street sweep. Empty
+                            // street sentinel = "needs backfill".
+                            tl_node_data->addr_coords.push_back({static_cast<float>(lat), static_cast<float>(lng)});
+                            tl_node_data->addr_cells.push_back(point_to_cell(lat, lng).id());
+                            auto& strs = tl_node_data->strings;
+                            tl_node_data->addr_strings.push_back({strs.add(housenumber),
+                                (street && street[0]) ? strs.add(street) : StringDict::kNone});
+                            tl_node_data->addr_postcodes.push_back(
+                                (postcode && postcode[0]) ? strs.add(postcode) : StringDict::kNone);
+                            tl_node_data->addr_osm_node_ids.push_back(id);
+                            tl_node_data->count++;
+                        }
+
+                        // Prefer name:en when present (user-facing English-only mode)
+                        const char* best_name = (n_name_en && n_name_en[0]) ? n_name_en : n_name;
+
+                        // POI node extraction. Nominatim's rank-30 POI
+                        // set (reverse.py _find_closest_street_or_pois)
+                        // includes unnamed amenity/shop/tourism/etc.
+                        // nodes — we emit those as UNNAMED_RANK30 so
+                        // they compete for the primary contest.
+                        {
+                            auto cls = classify_poi(n_tourism, n_historic, n_boundary,
+                                n_amenity, n_leisure, n_natural, n_railway, n_aeroway,
+                                n_man_made, n_building, n_craft, n_power, n_place, n_waterway,
+                                n_office,
+                                n_wikipedia, n_wikidata,
+                                n_highway, n_shop, n_landuse);
+                            // Unnamed specific-category POIs are still
+                            // noise in the display path (e.g. unnamed
+                            // ATTRACTION / MONUMENT — no useful road to
+                            // surface). Only index unnamed rows when the
+                            // fallback UNNAMED_RANK30 is what hit, since
+                            // those are exactly the Nominatim-style
+                            // "unclassified rank-30" contenders.
+                            if (cls && (best_name || cls->category == PoiCategory::UNNAMED_RANK30)) {
+                                PoiRecord pr{};
+                                pr.lat = static_cast<float>(lat);
+                                pr.lng = static_cast<float>(lng);
+                                pr.vertex_offset = NO_DATA;
+                                pr.vertex_count = 0;
+                                pr.name_id = 0; // will be set during merge
+                                pr.category = static_cast<uint8_t>(cls->category);
+                                pr.tier = cls->tier;
+                                pr.flags = cls->flags;
+                                tl_node_data->poi_records.push_back(pr);
+                                tl_node_data->poi_osm_node_ids.push_back(id);
+                                tl_node_data->poi_names.push_back((best_name && best_name[0])
+                                    ? tl_node_data->strings.add(best_name) : StringDict::kNone);
+                                float ele_val = 0;
+                                if (n_ele) { char* end; ele_val = std::strtof(n_ele, &end); if (end == n_ele) ele_val = 0; }
+                                tl_node_data->poi_elevations.push_back(ele_val);
+                                uint32_t qid = 0;
+                                if (n_wikidata && n_wikidata[0] == 'Q') {
+                                    qid = static_cast<uint32_t>(std::strtoul(n_wikidata + 1, nullptr, 10));
+                                }
+                                tl_node_data->poi_qids.push_back(qid);
+                                tl_node_data->poi_count++;
+                            }
+                        }
+
+                        // Place nodes (settlements) + label-role higher-level place types.
+                        // Nominatim uses `ref` as the display name when
+                        // `name` is missing (see name_keys handling in
+                        // icu_tokenizer output builders) — most commonly
+                        // on numeric-ref quarter nodes like Moscow's
+                        // place=quarter ref=18 node. Fall back to ref
+                        // so these show up in the address walk.
+                        const char* place_name = best_name;
+                        if (!place_name && n_ref && n_ref[0]) place_name = n_ref;
+                        if (n_place && place_name) {
+                            // Settlement types that we store as searchable place_nodes
+                            PlaceType settlement_pt = PlaceType::UNKNOWN;
+                            if (std::strcmp(n_place, "city") == 0) settlement_pt = PlaceType::CITY;
+                            else if (std::strcmp(n_place, "town") == 0) settlement_pt = PlaceType::TOWN;
+                            else if (std::strcmp(n_place, "village") == 0) settlement_pt = PlaceType::VILLAGE;
+                            else if (std::strcmp(n_place, "suburb") == 0) settlement_pt = PlaceType::SUBURB;
+                            else if (std::strcmp(n_place, "hamlet") == 0) settlement_pt = PlaceType::HAMLET;
+                            else if (std::strcmp(n_place, "neighbourhood") == 0) settlement_pt = PlaceType::NEIGHBOURHOOD;
+                            else if (std::strcmp(n_place, "quarter") == 0) settlement_pt = PlaceType::QUARTER;
+
+                            bool is_label_member = wanted_label_nodes.count(id) > 0;
+
+                            if (settlement_pt != PlaceType::UNKNOWN) {
+                                PlaceNode pn{};
+                                pn.lat = static_cast<float>(lat);
+                                pn.lng = static_cast<float>(lng);
+                                pn.place_type = static_cast<uint8_t>(settlement_pt);
+                                tl_node_data->place_nodes.push_back(pn);
+                                tl_node_data->place_osm_node_ids.push_back(id);
+                                tl_node_data->place_names.push_back(tl_node_data->strings.add(place_name));
+                            }
+
+                            // For the label-role lookup, also recognise higher-level
+                            // place types. Nominatim's find_linked_place() matches
+                            // class='place' (any type), and get_label_tag() then uses
+                            // extratags['linked_place'] (which is the place type) as
+                            // the label. So an admin L5 Region linked to a place=state
+                            // label node should be labelled "state" in the address.
+                            PlaceType label_pt = settlement_pt;
+                            if (label_pt == PlaceType::UNKNOWN) {
+                                if (std::strcmp(n_place, "state") == 0) label_pt = PlaceType::STATE;
+                                else if (std::strcmp(n_place, "province") == 0) label_pt = PlaceType::PROVINCE;
+                                else if (std::strcmp(n_place, "region") == 0) label_pt = PlaceType::REGION;
+                                else if (std::strcmp(n_place, "county") == 0) label_pt = PlaceType::COUNTY;
+                                else if (std::strcmp(n_place, "district") == 0) label_pt = PlaceType::DISTRICT;
+                                else if (std::strcmp(n_place, "borough") == 0) label_pt = PlaceType::BOROUGH;
+                            }
+                            // Capture wikidata → place type for the
+                            // admin-boundary wikidata link step in
+                            // Nominatim's find_linked_place() chain.
+                            // This must include *all* place types —
+                            // not just settlements — because e.g.
+                            // Mexico City's Cuauhtémoc borough
+                            // relation links via wikidata (Q645293)
+                            // to an admin_centre node tagged
+                            // place=borough, and without that the
+                            // boundary falls through to the default
+                            // admin_level=6 → county mapping instead
+                            // of picking up rank_address=18 (borough).
+                            //
+                            // Skip label-role members: nominatim's
+                            // find_linked_place claims a place node
+                            // via label role first, so wikidata
+                            // linking only considers non-label nodes.
+                            if (n_wikidata && !is_label_member && label_pt != PlaceType::UNKNOWN) {
+                                tl_node_data->place_wikidata.push_back({n_wikidata, id, static_cast<uint8_t>(label_pt)});
+                            }
+                            if (is_label_member) {
+                                tl_node_data->label_hits.push_back({id, static_cast<uint8_t>(label_pt)});
+                            }
+                        }
+                    }
+                });
+
+                // Reset thread_local for next use
+                tl_node_data = nullptr;
+                uint64_t total_nodes = 0;
+                for (const auto& local : ntld) total_nodes += local.nodes;
+                std::cerr << "  Node index: kept " << index.marked() << " of "
+                          << total_nodes << " nodes." << std::endl;
+                log_phase("    Pass 2: node streaming", _st, _sc);
+
+                // Pool ids per thread, interned in the order the merges
+                // below meet each thread's strings: address points, POI
+                // nodes, then place nodes, thread by thread.
+                auto _mt = _st;
+                auto _mc = _sc;
+                const size_t n_tl = ntld.size();
+                std::vector<const StringDict*> dicts;
+                for (const auto& local : ntld) dicts.push_back(&local.strings);
+                std::vector<uint32_t> run_dict(3 * n_tl);
+                for (size_t r = 0; r < run_dict.size(); r++) run_dict[r] = static_cast<uint32_t>(r % n_tl);
+                const auto name_ids = intern_dicts(dicts, run_dict, [&](uint32_t r, auto&& emit) {
+                    const auto& local = ntld[r % n_tl];
+                    if (r < n_tl) {
+                        for (size_t j = 0; j < local.addr_strings.size(); j++) {
+                            emit(local.addr_strings[j].second);
+                            emit(local.addr_strings[j].first);
+                            emit(local.addr_postcodes[j]);
+                        }
+                    } else {
+                        for (uint32_t code : r < 2 * n_tl ? local.poi_names : local.place_names) emit(code);
+                    }
+                }, data.string_pool);
+                log_phase("      Node merge: strings", _mt, _mc);
+
+                // Merge address points
+                const auto addr_at = local_offsets(ntld, [](const auto& l) { return l.addr_coords.size(); });
+                const size_t addr_base = grow_addr_points(data, addr_at.back());
+                parallel_for_parts(addr_at, kMergeGrain, [&](size_t k, size_t begin, size_t end, size_t at) {
+                    const auto& local = ntld[k];
+                    const auto& ids = name_ids[k];
+                    for (size_t j = begin; j < end; j++, at++) {
+                        int64_t node_id = j < local.addr_osm_node_ids.size() ? local.addr_osm_node_ids[j] : 0;
+                        put_addr_point(data, addr_base + at, local.addr_coords[j].lat, local.addr_coords[j].lng,
+                                       ids(local.addr_strings[j].first), ids(local.addr_strings[j].second),
+                                       ids(local.addr_postcodes[j]), local.addr_cells[j],
+                                       pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, node_id));
+                    }
+                });
+                uint64_t total_addrs = 0;
+                for (const auto& local : ntld) total_addrs += local.count;
+                log_phase("      Node merge: address points", _mt, _mc);
+
+                // Merge POI node records
+                const auto poi_at = local_offsets(ntld, [](const auto& l) { return l.poi_records.size(); });
+                const size_t poi_base = grow_by(data.poi_records, poi_at.back());
+                const size_t poi_osm_base = grow_by(data.poi_osm_ids, poi_at.back());
+                const size_t poi_ele_base = grow_by(poi_elevations, poi_at.back());
+                const size_t poi_qid_base = grow_by(poi_qids, poi_at.back());
+                parallel_for_parts(poi_at, kMergeGrain, [&](size_t k, size_t begin, size_t end, size_t at) {
+                    const auto& local = ntld[k];
+                    for (size_t j = begin; j < end; j++, at++) {
+                        auto pr = local.poi_records[j];
+                        // Empty name → NO_DATA sentinel. UNNAMED_RANK30
+                        // POIs come in nameless; the server reads name_id
+                        // == NO_DATA to surface parent_street as `road`
+                        // instead of the POI's (missing) own name.
+                        pr.name_id = name_ids[k](local.poi_names[j]);
+                        data.poi_records[poi_base + at] = pr;
+                        // Strategy-2 stable identity: node-sourced POI.
+                        int64_t poi_node_id = j < local.poi_osm_node_ids.size() ? local.poi_osm_node_ids[j] : 0;
+                        data.poi_osm_ids[poi_osm_base + at] =
+                            pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, poi_node_id);
+                        poi_elevations[poi_ele_base + at] = local.poi_elevations[j];
+                        poi_qids[poi_qid_base + at] = local.poi_qids[j];
+                    }
+                });
+                uint64_t total_poi_nodes = 0;
+                for (const auto& local : ntld) total_poi_nodes += local.poi_count;
+                log_phase("      Node merge: POI nodes", _mt, _mc);
+
+                // Merge place nodes
+                const auto place_at = local_offsets(ntld, [](const auto& l) { return l.place_nodes.size(); });
+                const size_t place_base = grow_by(data.place_nodes, place_at.back());
+                const size_t place_osm_base = grow_by(data.place_osm_ids, place_at.back());
+                parallel_for_parts(place_at, kMergeGrain, [&](size_t k, size_t begin, size_t end, size_t at) {
+                    const auto& local = ntld[k];
+                    for (size_t j = begin; j < end; j++, at++) {
+                        auto pn = local.place_nodes[j];
+                        pn.name_id = name_ids[k](local.place_names[j]);
+                        data.place_nodes[place_base + at] = pn;
+                        // Strategy-2 stable identity: place_nodes are always
+                        // settlement nodes from the OSM node stream.
+                        int64_t place_node_id = j < local.place_osm_node_ids.size() ? local.place_osm_node_ids[j] : 0;
+                        data.place_osm_ids[place_osm_base + at] =
+                            pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, place_node_id);
+                    }
+                });
+                // Build wikidata → place type map for admin boundary linking.
+                // Deterministic conflict resolution: when two place nodes share
+                // a wikidata id but carry different place types, plain
+                // last-write-wins picks the value from whichever thread-local
+                // batch happened to be processed last — and work-stealing makes
+                // that order non-deterministic, so the admin's
+                // place_type_override (and thus admin_polygons.bin) varied
+                // between same-PBF builds, cascading a spurious admin id_remap
+                // into way_parents / admin_entries. Keep the smallest PlaceType,
+                // which is order-independent.
+                for (auto& local : ntld) {
+                    for (auto& [wd, nid, pt] : local.place_wikidata) {
+                        auto [it, ins] = wikidata_to_place_type.try_emplace(wd, pt);
+                        if (!ins && pt < it->second) it->second = pt;
+                        wikidata_place_node_ids[wd].push_back(nid);
+                    }
+                    local.place_wikidata.clear();
+                }
+                // Build label-node → place type map (Nominatim's primary link
+                // method). Same deterministic conflict resolution.
+                for (auto& local : ntld) {
+                    for (auto& [nid, pt] : local.label_hits) {
+                        auto [it, ins] = label_node_to_place_type.try_emplace(nid, pt);
+                        if (!ins && pt < it->second) it->second = pt;
+                    }
+                    local.label_hits.clear();
+                }
+                if (!wikidata_to_place_type.empty()) {
+                    std::cerr << "  Built wikidata→place_type map: "
+                              << wikidata_to_place_type.size() << " entries." << std::endl;
+                }
+                if (!label_node_to_place_type.empty()) {
+                    std::cerr << "  Built label-node→place_type map: "
+                              << label_node_to_place_type.size() << " entries." << std::endl;
+                }
+                std::cerr << "  Node processing complete: " << total_addrs
+                          << " address points, " << total_poi_nodes
+                          << " POI nodes, " << data.place_nodes.size()
+                          << " place nodes collected." << std::endl;
+                log_phase("    Pass 2: node merge", _st, _sc);
+            }
+            log_phase("Pass 2: node processing", _pt, _cpu);
+            // Nodes with ids past MAX_NODE_ID_DEFAULT were silently dropped
+            // (they'd resolve to lat/lng 0,0 in every way that references
+            // them). Fail loudly the day OSM ids outgrow the index capacity —
+            // the fix is bumping MAX_NODE_ID_DEFAULT.
+            if (uint64_t oc = index.over_capacity()) {
+                throw std::runtime_error("node index: " + std::to_string(oc) +
+                    " node ids exceed MAX_NODE_ID_DEFAULT capacity — bump MAX_NODE_ID_DEFAULT");
+            }
+            pbf.release_pages(); // free PBF mmap pages, will re-fault for way pass
+
+            // --- Pass 2b: Way processing (fully parallel) ---
+            std::cerr << "  Processing ways with " << num_threads << " threads..." << std::endl;
+            {
+                // Thread-local data for parallel way processing
+                struct ThreadLocalData {
+                    std::vector<WayHeader> ways;
+                    std::vector<int64_t> way_osm_ids;  // parallel to ways; stable identity for strategy-2 allocator
+                    std::vector<NodeCoord> street_nodes;
+                    std::vector<DeferredWay> deferred_ways;
+                    std::vector<InterpWay> interp_ways;
+                    std::vector<NodeCoord> interp_nodes;
+                    std::vector<DeferredInterp> deferred_interps;
+                    std::vector<NodeCoord> building_addrs;  // centroids
+                    std::vector<uint64_t> building_addr_cells;  // their street cells
+                    // Flat polygon storage, parallel to building_addrs via
+                    // (offset, count) into building_addr_poly_verts. Stored as
+                    // NodeCoord (2× float = 8 bytes/vertex) instead of
+                    // pair<double,double> (16 bytes/vertex), and flat rather
+                    // than vector<vector<...>>, to keep thread-local peak
+                    // memory bounded during parallel way parsing.
+                    std::vector<NodeCoord> building_addr_poly_verts;
+                    std::vector<uint32_t> building_addr_poly_off;   // NO_DATA = no polygon
+                    std::vector<uint32_t> building_addr_poly_cnt;   // 0 = no polygon
+                    std::vector<int64_t> building_addr_osm_way_ids; // parallel to building_addrs; strategy-2 stable identity
+                    std::vector<int64_t> interp_osm_way_ids;        // parallel to interp_ways; strategy-2 stable identity
+                    // Strings below are codes into `strings` (kNone: none).
+                    StringDict strings;
+                    std::vector<uint32_t> way_strings;      // way name (name:en ?: name)
+                    std::vector<uint32_t> way_orig_names;   // way original name (always name tag)
+                    std::vector<std::pair<uint32_t, uint32_t>> addr_strings; // building addr {hn, street}
+                    std::vector<uint32_t> addr_postcodes; // parallel to addr_strings
+                    std::vector<uint32_t> interp_strings;   // interp street name strings
+                    uint64_t way_count = 0;
+                    uint64_t building_addr_count = 0;
+                    uint64_t interp_count = 0;
+                    // Way geometries for parallel admin assembly. Locations
+                    // stay packed (8 B, not 16) until the merge decodes them.
+                    struct WayGeomEntry {
+                        int64_t way_id;
+                        std::vector<PackedLocation> locs;
+                        int64_t first_node_id;
+                        int64_t last_node_id;
+                    };
+                    std::vector<WayGeomEntry> way_geoms;
+                    // Closed-way admin polygons (ways with boundary=administrative)
+                    struct ClosedWayAdmin {
+                        std::vector<std::pair<double,double>> vertices;
+                        std::string name;
+                        uint8_t admin_level;
+                        std::string country_code;
+                        uint8_t fallback_place_type;  // from own place tag, used last
+                        std::string wikidata; // for place linking
+                        int64_t way_id;       // source closed-way id (strategy-2 stable identity)
+                    };
+                    std::vector<ClosedWayAdmin> closed_way_admins;
+                    // POI way data
+                    struct PoiWayEntry {
+                        PoiRecord record;
+                        uint32_t name;  // code into strings
+                        std::vector<NodeCoord> vertices;
+                        float elevation;
+                        uint32_t qid;
+                        int64_t osm_way_id; // strategy-2 stable identity
+                    };
+                    std::vector<PoiWayEntry> poi_ways;
+                    // POI way geometries for relation assembly
+                    std::vector<WayGeomEntry> poi_way_geoms;
+                };
+
+                static thread_local ThreadLocalData* tl_way_data = nullptr;
+                std::vector<ThreadLocalData> tld(num_threads);
+                std::atomic<unsigned> next_tl_way{0};
+                auto _st = std::chrono::steady_clock::now();
+                auto _sc = CpuTicks::now();
+
+                pbf.read_ways_streaming([&](int64_t way_id,
+                    const int64_t* refs_data, size_t refs_size,
+                    const uint32_t* tag_keys, const uint32_t* tag_vals, size_t ntags,
+                    const std::vector<std::string>& st) {
+
+                    if (!tl_way_data) {
+                        unsigned idx = next_tl_way.fetch_add(1);
+                        tl_way_data = &tld[idx % tld.size()];
+                    }
+                    auto& local = *tl_way_data;
+
+                    const WayTags t = parse_way_tags(tag_keys, tag_vals, ntags, st);
+                    const char* t_best_name = t.best_name();
+                    bool has_poi_tags = t.has_poi_tags();
+
+                    // Early exit: if no relevant tags, skip expensive node resolution
+                    bool relation_member = refs_size > 0 && (is_admin_way(way_id) || is_poi_way(way_id));
+                    if (!way_needs_nodes(t, relation_member)) return;
+
+                    // Pre-resolve all node locations
+                    thread_local std::vector<PackedLocation> resolved_locs;
+                    resolved_locs.clear();
+                    resolved_locs.reserve(refs_size);
+                    bool all_valid = true;
+                    for (size_t ri = 0; ri < refs_size; ri++) {
+                        auto loc = index.get(static_cast<uint64_t>(refs_data[ri]));
+                        resolved_locs.push_back(loc);
+                        if (!loc.valid()) all_valid = false;
+                    }
+
+                    // Address interpolation
+                    if (t.interpolation) {
+                        if (refs_size >= 2 && all_valid) {
+                            const char* street = t.street;
+                            if (street) {
+                                uint32_t interp_id = static_cast<uint32_t>(local.interp_ways.size());
+                                uint32_t node_offset = static_cast<uint32_t>(local.interp_nodes.size());
+                                for (const auto& loc : resolved_locs)
+                                    local.interp_nodes.push_back({static_cast<float>(loc.lat()), static_cast<float>(loc.lon())});
+                                uint8_t interp_type = 0;
+                                if (std::strcmp(t.interpolation, "even") == 0) interp_type = 1;
+                                else if (std::strcmp(t.interpolation, "odd") == 0) interp_type = 2;
+                                InterpWay iw{}; iw.node_offset = node_offset;
+                                iw.node_count = static_cast<uint16_t>(std::min(refs_size, size_t(MAX_NODE_COUNT)));
+                                iw.interpolation = interp_type;
+                                local.interp_ways.push_back(iw);
+                                local.interp_osm_way_ids.push_back(way_id);
+                                local.interp_strings.push_back(local.strings.add(street));
+                                local.deferred_interps.push_back({interp_id, node_offset, iw.node_count});
+                                local.interp_count++;
+                            }
+                        }
+                        return;
+                    }
+
+                    // Building addresses — index regardless of whether
+                    // addr:street is present. Missing streets are
+                    // backfilled via the nearest-named-street sweep
+                    // after way indexing, matching Nominatim's
+                    // parent_place_id resolution behaviour.
+                    const char* housenumber = t.housenumber;
+                    if (housenumber && refs_size > 0) {
+                        const char* street = t.street;
+                        double sum_lat = 0, sum_lng = 0; int valid = 0;
+                        for (const auto& loc : resolved_locs) {
+                            if (loc.valid()) { sum_lat += loc.lat(); sum_lng += loc.lon(); valid++; }
+                        }
+                        if (valid > 0) {
+                            double clat = sum_lat/valid, clng = sum_lng/valid;
+                            NodeCoord centroid{static_cast<float>(clat), static_cast<float>(clng)};
+                            local.building_addrs.push_back(centroid);
+                            local.building_addr_cells.push_back(point_to_cell(centroid.lat, centroid.lng).id());
+                            local.building_addr_osm_way_ids.push_back(way_id);
+                            local.addr_strings.push_back({local.strings.add(housenumber),
+                                (street && street[0]) ? local.strings.add(street) : StringDict::kNone});
+                            local.addr_postcodes.push_back(
+                                (t.postcode && t.postcode[0]) ? local.strings.add(t.postcode) : StringDict::kNone);
+                            // Polygon vertices for closed ways (buildings).
+                            // Lets the server compute exact distance-to-
+                            // polygon for Nominatim parity instead of the
+                            // centroid-minus-10m approximation. Cap at 20
+                            // vertices — addr-point distance only needs a
+                            // coarse shape, and tight caps bound thread-
+                            // local memory during parallel parse.
+                            uint32_t poly_off = NO_DATA;
+                            uint32_t poly_cnt = 0;
+                            if (refs_size >= 4 && refs_data[0] == refs_data[refs_size-1] && all_valid) {
+                                std::vector<std::pair<double,double>> poly_pts;
+                                poly_pts.reserve(refs_size);
+                                for (const auto& loc : resolved_locs)
+                                    poly_pts.push_back({loc.lat(), loc.lon()});
+                                constexpr size_t MAX_ADDR_POLY_VERTS = 20;
+                                if (poly_pts.size() > MAX_ADDR_POLY_VERTS) {
+                                    poly_pts = simplify_polygon(poly_pts, MAX_ADDR_POLY_VERTS);
+                                }
+                                poly_off = static_cast<uint32_t>(local.building_addr_poly_verts.size());
+                                poly_cnt = static_cast<uint32_t>(poly_pts.size());
+                                for (const auto& p : poly_pts)
+                                    local.building_addr_poly_verts.push_back({static_cast<float>(p.first), static_cast<float>(p.second)});
+                            }
+                            local.building_addr_poly_off.push_back(poly_off);
+                            local.building_addr_poly_cnt.push_back(poly_cnt);
+                            local.building_addr_count++;
+                        }
+                    }
+
+                    // Highway ways
+                    if (t.highway && is_included_highway_full(t.highway, t.footway, t.access, t.tunnel)) {
+                        if (t_best_name && refs_size >= 2 && all_valid) {
+                            uint32_t wid = static_cast<uint32_t>(local.ways.size());
+                            uint32_t noff = static_cast<uint32_t>(local.street_nodes.size());
+                            for (const auto& loc : resolved_locs)
+                                local.street_nodes.push_back({static_cast<float>(loc.lat()), static_cast<float>(loc.lon())});
+                            WayHeader header{}; header.node_offset = noff;
+                            header.node_count = static_cast<uint16_t>(std::min(refs_size, size_t(MAX_NODE_COUNT)));
+                            local.ways.push_back(header);
+                            local.way_osm_ids.push_back(way_id);
+                            const char* orig_name = t.name ? t.name : (t_best_name ? t_best_name : "");
+                            local.way_strings.push_back(local.strings.add(t_best_name));
+                            local.way_orig_names.push_back(orig_name[0] ? local.strings.add(orig_name) : StringDict::kNone);
+                            local.deferred_ways.push_back({wid, noff, header.node_count});
+                            local.way_count++;
+                        }
+                    }
+
+                    auto valid_locs = [&] {
+                        std::vector<PackedLocation> geom;
+                        geom.reserve(refs_size);
+                        for (const auto& loc : resolved_locs)
+                            if (loc.valid()) geom.push_back(loc);
+                        return geom;
+                    };
+
+                    // Admin boundary member ways
+                    if (refs_size > 0 && is_admin_way(way_id)) {
+                        auto geom = valid_locs();
+                        if (!geom.empty())
+                            local.way_geoms.push_back({way_id, std::move(geom), refs_data[0], refs_data[refs_size-1]});
+                    }
+
+                    // POI way geometries for relation assembly
+                    if (refs_size > 0 && is_poi_way(way_id)) {
+                        auto geom = valid_locs();
+                        if (!geom.empty())
+                            local.poi_way_geoms.push_back({way_id, std::move(geom), refs_data[0], refs_data[refs_size-1]});
+                    }
+
+                    // Closed way POI polygons
+                    if (has_poi_tags && t_best_name && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1] && all_valid) {
+                        auto cls = classify_poi(t.tourism, t.historic, t.boundary,
+                            t.amenity, t.leisure, t.natural, t.railway, t.aeroway,
+                            t.man_made, t.building, t.craft, t.power, t.place, t.waterway,
+                            t.office,
+                            t.wikipedia, t.wikidata,
+                            t.highway, t.shop, t.landuse);
+                        if (cls) {
+                            // Compute centroid
+                            double sum_lat = 0, sum_lng = 0;
+                            for (const auto& loc : resolved_locs) {
+                                sum_lat += loc.lat(); sum_lng += loc.lon();
+                            }
+                            float clat = static_cast<float>(sum_lat / refs_size);
+                            float clng = static_cast<float>(sum_lng / refs_size);
+
+                            // Build polygon vertices
+                            std::vector<std::pair<double,double>> poly_pts;
+                            poly_pts.reserve(refs_size);
+                            for (const auto& loc : resolved_locs)
+                                poly_pts.push_back({loc.lat(), loc.lon()});
+
+                            // Simplify large polygons with ~50m epsilon
+                            if (poly_pts.size() > MAX_POLYGON_VERTICES) {
+                                double lat0 = poly_pts.empty() ? 0.0 : poly_pts[0].first;
+                                double eps_deg = meters_to_degrees(50.0, lat0);
+                                poly_pts = simplify_polygon_epsilon(poly_pts, eps_deg);
+                            }
+
+                            std::vector<NodeCoord> verts;
+                            verts.reserve(poly_pts.size());
+                            for (const auto& [plat, plng] : poly_pts)
+                                verts.push_back({static_cast<float>(plat), static_cast<float>(plng)});
+
+                            PoiRecord pr{};
+                            pr.lat = clat;
+                            pr.lng = clng;
+                            pr.vertex_offset = 0; // set during merge
+                            pr.vertex_count = static_cast<uint32_t>(verts.size());
+                            pr.name_id = 0; // set during merge
+                            pr.category = static_cast<uint8_t>(cls->category);
+                            pr.tier = cls->tier;
+                            pr.flags = cls->flags;
+
+                            float way_ele = 0;
+                            if (t.ele) { char* end; way_ele = std::strtof(t.ele, &end); if (end == t.ele) way_ele = 0; }
+                            uint32_t way_qid = 0;
+                            if (t.wikidata && t.wikidata[0] == 'Q') {
+                                way_qid = static_cast<uint32_t>(std::strtoul(t.wikidata + 1, nullptr, 10));
+                            }
+                            local.poi_ways.push_back({pr, local.strings.add(t_best_name), std::move(verts), way_ele, way_qid, way_id});
+                        }
+                    }
+
+                    // Closed way admin boundaries
+                    const char* boundary = t.boundary;
+                    if (boundary) {
+                        bool is_admin = (std::strcmp(boundary, "administrative") == 0);
+                        bool is_postal = (std::strcmp(boundary, "postal_code") == 0);
+                        bool is_place_boundary = (std::strcmp(boundary, "place") == 0);
+                        if ((is_admin || is_postal) && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1]) {
+                            uint8_t al = 0;
+                            if (is_admin) { const char* ls = t.admin_level; if (ls) al = static_cast<uint8_t>(std::atoi(ls)); }
+                            else al = 11;
+                            int max_al = is_postal ? 11 : 10;
+                            if (al >= 2 && al <= max_al && (kMaxAdminLevel == 0 || al <= kMaxAdminLevel)) {
+                                const char* aname = t_best_name;
+                                if (aname || !is_admin) {
+                                    std::string name_str;
+                                    if (is_postal) { const char* pc = t.postal_code; if (!pc) pc = aname; if (pc) name_str = pc; }
+                                    else if (aname) name_str = aname;
+                                    if (!name_str.empty() && all_valid && resolved_locs.size() >= 3) {
+                                        std::vector<std::pair<double,double>> verts;
+                                        for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});
+                                        std::string cc; if (al == 2) { const char* iso = t.iso; if (iso) cc = iso; }
+                                        auto po = classify_place_override(t.linked_place, t.border_type, t.place);
+                                        uint8_t fallback = static_cast<uint8_t>(po.type);
+                                        std::string wd_str = t.wikidata ? t.wikidata : "";
+                                        local.closed_way_admins.push_back({std::move(verts), std::move(name_str), al, std::move(cc), fallback, std::move(wd_str), way_id});
+                                    }
+                                }
+                            }
+                        }
+                        // Closed way boundary=place (e.g., Washington DC)
+                        if (is_place_boundary && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1]) {
+                            const char* aname = t_best_name;
+                            if (aname && t.place) {
+                                AdminPlaceType pt = classify_place_override(nullptr, nullptr, t.place).type;
+                                if (pt != AdminPlaceType::NONE && all_valid && resolved_locs.size() >= 3) {
+                                    std::vector<std::pair<double,double>> verts;
+                                    for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});
+                                    std::string wd_str = t.wikidata ? t.wikidata : "";
+                                    local.closed_way_admins.push_back({std::move(verts), std::string(aname), uint8_t(15), std::string(), static_cast<uint8_t>(pt), std::move(wd_str), way_id});
+                                }
+                            }
+                        }
+                    }
+
+                    // Plain place=* closed ways (no boundary tag). OSM
+                    // commonly tags neighbourhoods, quarters, and
+                    // suburbs as closed ways with `place=*` + `name`
+                    // rather than as `boundary=place` + `place=*`.
+                    // nominatim indexes both forms via placex (class
+                    // = 'place' at import). we miss them if we gate
+                    // only on boundary=place. example: qasr al
+                    // doubara in cairo is a landuse=residential way
+                    // with place=neighbourhood + name:en, and nominatim
+                    // returns it as neighbourhood for queries inside
+                    // the polygon.
+                    if (!boundary && t.place && t_best_name
+                            && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1]) {
+                        AdminPlaceType pt = classify_place_override(nullptr, nullptr, t.place).type;
+                        // Only the rank-20+ place types (neighbourhood,
+                        // quarter, suburb, borough) — higher-level place
+                        // types on closed ways are rare and adding them
+                        // risks promoting a landuse polygon into the
+                        // city / state chain.
+                        bool want = (pt == AdminPlaceType::NEIGHBOURHOOD
+                                  || pt == AdminPlaceType::QUARTER
+                                  || pt == AdminPlaceType::SUBURB
+                                  || pt == AdminPlaceType::BOROUGH);
+                        if (want && all_valid && resolved_locs.size() >= 3) {
+                            std::vector<std::pair<double,double>> verts;
+                            for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});
+                            std::string wd_str = t.wikidata ? t.wikidata : "";
+                            local.closed_way_admins.push_back({
+                                std::move(verts),
+                                std::string(t_best_name),
+                                uint8_t(15),
+                                std::string(),
+                                static_cast<uint8_t>(pt),
+                                std::move(wd_str),
+                                way_id});
+                        }
+                    }
+                });
+                tl_way_data = nullptr;
+                std::cerr << "  Parallel way processing complete." << std::endl;
+                if (uint64_t miss = index.unmarked_lookups()) {
+                    throw std::runtime_error("node index: " + std::to_string(miss) +
+                        " way node lookups of ids the pre-scan did not mark");
+                }
+                // The way stream was the last reader of node coordinates:
+                // admin/POI ring assembly reads data.way_geometries. Free
+                // the index before the merge below copies the thread-local
+                // data into ParsedData.
+                index.release();
+                std::cerr << "Released node index." << std::endl;
+                log_phase("    Pass 2b: way streaming", _st, _sc);
+
+                // Process areas/multipolygons — sequential fallback path
+                // Merge thread-local way/interp data into main ParsedData
+                std::cerr << "  Merging thread-local data..." << std::endl;
+                // Pool ids per thread, interned in the order the merge below
+                // meets each thread's strings: its ways, building addresses,
+                // interpolations, then POI ways.
+                auto _mt = _st;
+                auto _mc = _sc;
+                std::vector<const StringDict*> dicts;
+                for (const auto& local : tld) dicts.push_back(&local.strings);
+                std::vector<uint32_t> run_dict(4 * tld.size());
+                for (size_t r = 0; r < run_dict.size(); r++) run_dict[r] = static_cast<uint32_t>(r / 4);
+                const auto name_ids = intern_dicts(dicts, run_dict, [&](uint32_t r, auto&& emit) {
+                    const auto& local = tld[r / 4];
+                    switch (r % 4) {
+                    case 0:
+                        for (size_t i = 0; i < local.ways.size(); i++) {
+                            emit(local.way_strings[i]);
+                            emit(local.way_orig_names[i]);
+                        }
+                        break;
+                    case 1:
+                        for (size_t i = 0; i < local.building_addrs.size(); i++) {
+                            emit(local.addr_strings[i].second);
+                            emit(local.addr_strings[i].first);
+                            emit(local.addr_postcodes[i]);
+                        }
+                        break;
+                    case 2:
+                        for (uint32_t code : local.interp_strings) emit(code);
+                        break;
+                    default:
+                        for (const auto& pw : local.poi_ways) emit(pw.name);
+                        break;
+                    }
+                }, data.string_pool);
+                log_phase("      Way merge: strings", _mt, _mc);
+                parallel_for_each(tld.size(), [&](size_t k, unsigned) { free_storage(tld[k].strings); });
+                uint64_t total_ways = 0, total_building_addrs = 0, total_interps = 0;
+                for (const auto& local : tld) {
+                    total_ways += local.way_count;
+                    total_building_addrs += local.building_addr_count;
+                    total_interps += local.interp_count;
+                }
+
+                // Each thread's buffers are freed as soon as they are merged
+                // rather than when tld goes out of scope after admin assembly:
+                // they hold tens of GiB on planet. Closed-way admins are
+                // merged below.
+
+                // Merge street ways
+                const auto way_at = local_offsets(tld, [](const auto& l) { return l.ways.size(); });
+                const auto node_at = local_offsets(tld, [](const auto& l) { return l.street_nodes.size(); });
+                const size_t way_base = grow_by(data.ways, way_at.back());
+                const size_t way_osm_base = grow_by(data.way_osm_ids, way_at.back());
+                const size_t way_orig_base = grow_by(data.way_orig_name_ids, way_at.back());
+                const size_t node_base = data.street_nodes.size();
+                parallel_for_parts(way_at, kMergeGrain, [&](size_t k, size_t begin, size_t end, size_t at) {
+                    const auto& local = tld[k];
+                    const auto& name_id = name_ids[k];
+                    const uint32_t node_offset = static_cast<uint32_t>(node_base + node_at[k]);
+                    for (size_t i = begin; i < end; i++, at++) {
+                        auto h = local.ways[i];
+                        h.node_offset += node_offset;
+                        h.name_id = name_id(local.way_strings[i]);
+                        data.ways[way_base + at] = h;
+                        data.way_osm_ids[way_osm_base + at] = i < local.way_osm_ids.size() ? local.way_osm_ids[i] : 0;
+                        // Store original name for token matching
+                        data.way_orig_name_ids[way_orig_base + at] = name_id(local.way_orig_names[i]);
+                    }
+                });
+
+                // Remap deferred ways
+                const auto deferred_at = local_offsets(tld, [](const auto& l) { return l.deferred_ways.size(); });
+                const size_t deferred_base = grow_by(data.deferred_ways, deferred_at.back());
+                parallel_for_parts(deferred_at, kMergeGrain, [&](size_t k, size_t begin, size_t end, size_t at) {
+                    const auto& local = tld[k];
+                    const uint32_t way_offset = static_cast<uint32_t>(way_base + way_at[k]);
+                    const uint32_t node_offset = static_cast<uint32_t>(node_base + node_at[k]);
+                    for (size_t i = begin; i < end; i++, at++) {
+                        auto dw = local.deferred_ways[i];
+                        dw.way_id += way_offset;
+                        dw.node_offset += node_offset;
+                        data.deferred_ways[deferred_base + at] = dw;
+                    }
+                });
+                parallel_for_each(tld.size(), [&](size_t k, unsigned) {
+                    auto& local = tld[k];
+                    free_storage(local.ways);
+                    free_storage(local.way_osm_ids);
+                    free_storage(local.way_strings);
+                    free_storage(local.way_orig_names);
+                    free_storage(local.deferred_ways);
+                });
+                append_locals(data.street_nodes, tld, [](auto& l) -> auto& { return l.street_nodes; });
+                log_phase("      Way merge: street ways", _mt, _mc);
+
+                // Merge building addresses. A thread's building polygons sit
+                // back to back in point order, as they do in addr_vertices.
+                const auto bldg_at = local_offsets(tld, [](const auto& l) { return l.building_addrs.size(); });
+                const auto bldg_vert_at = local_offsets(tld, [](const auto& l) { return l.building_addr_poly_verts.size(); });
+                const size_t bldg_base = grow_addr_points(data, bldg_at.back());
+                const size_t bldg_vert_base = data.addr_vertices.size();
+                parallel_for_parts(bldg_at, kMergeGrain, [&](size_t k, size_t begin, size_t end, size_t at) {
+                    const auto& local = tld[k];
+                    const auto& name_id = name_ids[k];
+                    for (size_t i = begin; i < end; i++, at++) {
+                        uint32_t poly_off = local.building_addr_poly_off[i];
+                        uint32_t poly_cnt = local.building_addr_poly_cnt[i];
+                        bool has_poly = poly_cnt > 0 && poly_off != NO_DATA;
+                        int64_t bldg_way_id = i < local.building_addr_osm_way_ids.size()
+                            ? local.building_addr_osm_way_ids[i] : 0;
+                        put_addr_point(data, bldg_base + at, local.building_addrs[i].lat, local.building_addrs[i].lng,
+                                       name_id(local.addr_strings[i].first), name_id(local.addr_strings[i].second),
+                                       name_id(local.addr_postcodes[i]), local.building_addr_cells[i],
+                                       pack_osm_id(gc::id_alloc::ObjectType::OSM_WAY, bldg_way_id),
+                                       has_poly ? static_cast<uint32_t>(bldg_vert_base + bldg_vert_at[k] + poly_off) : NO_DATA,
+                                       has_poly ? poly_cnt : 0);
+                    }
+                });
+                parallel_for_each(tld.size(), [&](size_t k, unsigned) {
+                    auto& local = tld[k];
+                    free_storage(local.building_addrs);
+                    free_storage(local.building_addr_cells);
+                    free_storage(local.building_addr_poly_off);
+                    free_storage(local.building_addr_poly_cnt);
+                    free_storage(local.building_addr_osm_way_ids);
+                    free_storage(local.addr_strings);
+                    free_storage(local.addr_postcodes);
+                });
+                append_locals(data.addr_vertices, tld, [](auto& l) -> auto& { return l.building_addr_poly_verts; });
+                log_phase("      Way merge: building addresses", _mt, _mc);
+
+                // Merge interpolation ways
+                for (size_t k = 0; k < tld.size(); k++) {
+                    auto& local = tld[k];
+                    const auto& name_id = name_ids[k];
+                    uint32_t interp_base = static_cast<uint32_t>(data.interp_ways.size());
+                    uint32_t interp_node_base = static_cast<uint32_t>(data.interp_nodes.size());
+                    for (size_t i = 0; i < local.interp_ways.size(); i++) {
+                        auto iw = local.interp_ways[i];
+                        iw.node_offset += interp_node_base;
+                        iw.street_id = name_id(local.interp_strings[i]);
+                        data.interp_ways.push_back(iw);
+                        // Strategy-2 stable identity: PBF-sourced interp_way is from a way.
+                        int64_t iw_osm_id = i < local.interp_osm_way_ids.size() ? local.interp_osm_way_ids[i] : 0;
+                        data.interp_osm_ids.push_back(
+                            pack_osm_id(gc::id_alloc::ObjectType::OSM_WAY, iw_osm_id));
+                    }
+                    data.interp_nodes.insert(data.interp_nodes.end(),
+                        local.interp_nodes.begin(), local.interp_nodes.end());
+
+                    // Remap deferred interps
+                    for (auto di : local.deferred_interps) {
+                        di.interp_id += interp_base;
+                        di.node_offset += interp_node_base;
+                        data.deferred_interps.push_back(di);
+                    }
+                }
+
+                // Merge POI ways (closed way polygons), a thread to a worker.
+                const auto poi_way_at = local_offsets(tld, [](const auto& l) { return l.poi_ways.size(); });
+                const auto poi_vert_at = local_offsets(tld, [](const auto& l) {
+                    size_t n = 0;
+                    for (const auto& pw : l.poi_ways) n += pw.vertices.size();
+                    return n;
+                });
+                const size_t poi_base = grow_by(data.poi_records, poi_way_at.back());
+                const size_t poi_osm_base = grow_by(data.poi_osm_ids, poi_way_at.back());
+                const size_t poi_ele_base = grow_by(poi_elevations, poi_way_at.back());
+                const size_t poi_qid_base = grow_by(poi_qids, poi_way_at.back());
+                const size_t poi_vert_base = grow_by(data.poi_vertices, poi_vert_at.back());
+                parallel_for_each(tld.size(), [&](size_t k, unsigned) {
+                    auto& local = tld[k];
+                    const auto& name_id = name_ids[k];
+                    size_t at = poi_way_at[k];
+                    size_t vertex_offset = poi_vert_base + poi_vert_at[k];
+                    for (auto& pw : local.poi_ways) {
+                        std::copy(pw.vertices.begin(), pw.vertices.end(), data.poi_vertices.begin() + vertex_offset);
+                        pw.record.vertex_offset = static_cast<uint32_t>(vertex_offset);
+                        pw.record.name_id = name_id(pw.name);
+                        data.poi_records[poi_base + at] = pw.record;
+                        // Strategy-2 stable identity: way-sourced POI.
+                        data.poi_osm_ids[poi_osm_base + at] =
+                            pack_osm_id(gc::id_alloc::ObjectType::OSM_WAY, pw.osm_way_id);
+                        poi_elevations[poi_ele_base + at] = pw.elevation;
+                        poi_qids[poi_qid_base + at] = pw.qid;
+                        vertex_offset += pw.vertices.size();
+                        at++;
+                    }
+                    free_storage(local.poi_ways);
+                });
+                log_phase("      Way merge: interpolations + POI ways", _mt, _mc);
+
+                // Merge way geometries for admin and POI relation assembly.
+                // Each thread's coordinates, its admin ways' then its POI
+                // ways', land after the previous thread's.
+                auto& geoms = data.way_geometries;
+                const auto geom_at = local_offsets(tld, [](const auto& l) {
+                    size_t n = 0;
+                    for (const auto& wg : l.way_geoms) n += wg.locs.size();
+                    for (const auto& wg : l.poi_way_geoms) n += wg.locs.size();
+                    return n;
+                });
+                const size_t coord_base = grow_by(geoms.coords, geom_at.back());
+                parallel_for_each(tld.size(), [&](size_t k, unsigned) {
+                    size_t at = coord_base + geom_at[k];
+                    for (const auto* list : {&tld[k].way_geoms, &tld[k].poi_way_geoms})
+                        for (const auto& wg : *list)
+                            for (const auto& loc : wg.locs) geoms.coords[at++] = {loc.lat(), loc.lon()};
+                });
+                size_t n_geoms = geoms.ways.size();
+                for (const auto& local : tld) n_geoms += local.way_geoms.size() + local.poi_way_geoms.size();
+                geoms.ways.reserve(n_geoms);
+                size_t geom_coord = coord_base;
+                for (const auto& local : tld) {
+                    for (const auto& wg : local.way_geoms) {
+                        geoms.ways[wg.way_id] = {geom_coord, static_cast<uint32_t>(wg.locs.size()),
+                                                 wg.first_node_id, wg.last_node_id};
+                        geom_coord += wg.locs.size();
+                    }
+                    // Stored with the admin ones (no conflict since IDs differ)
+                    for (const auto& wg : local.poi_way_geoms) {
+                        geoms.ways.try_emplace(wg.way_id, WayGeometries::Way{geom_coord, static_cast<uint32_t>(wg.locs.size()),
+                                                                            wg.first_node_id, wg.last_node_id});
+                        geom_coord += wg.locs.size();
+                    }
+                }
+                log_phase("      Way merge: way geometries", _mt, _mc);
+
+                parallel_for_each(tld.size(), [&](size_t k, unsigned) {
+                    auto& local = tld[k];
+                    auto closed_way_admins = std::move(local.closed_way_admins);
+                    local = ThreadLocalData{};
+                    local.closed_way_admins = std::move(closed_way_admins);
+                });
+                std::cerr << "  Merged: " << total_ways << " ways, "
+                          << total_building_addrs << " building addrs, "
+                          << total_interps << " interps from parallel processing." << std::endl;
+
+                // --- Merge closed-way admin polygons ---
+                {
+                    uint64_t closed_way_admin_count = 0;
+                    size_t cwa_wikidata_linked = 0;
+                    for (auto& local : tld) {
+                        for (auto& cwa : local.closed_way_admins) {
+                            // wikidata step first (Nominatim priority), then
+                            // fall back to the way's own place tag.
+                            uint8_t pto = 0;
+                            if (!cwa.wikidata.empty()) {
+                                auto it = wikidata_to_place_type.find(cwa.wikidata);
+                                if (it != wikidata_to_place_type.end()) {
+                                    pto = place_type_to_admin_override(it->second);
+                                    if (pto != 0) {
+                                        cwa_wikidata_linked++;
+                                        auto nit = wikidata_place_node_ids.find(cwa.wikidata);
+                                        if (nit != wikidata_place_node_ids.end()) {
+                                            data.linked_place_node_ids.insert(
+                                                data.linked_place_node_ids.end(),
+                                                nit->second.begin(), nit->second.end());
+                                        }
+                                    }
+                                }
+                            }
+                            if (pto == 0) pto = cwa.fallback_place_type;
+                            const char* cc = cwa.country_code.empty() ? nullptr : cwa.country_code.c_str();
+                            add_admin_polygon(data, cwa.vertices, cwa.name.c_str(),
+                                              cwa.admin_level, cc, &admin_pool, pto,
+                                              cwa.way_id);
+                            closed_way_admin_count++;
+                        }
+                        local.closed_way_admins.clear();
+                    }
+                    if (closed_way_admin_count > 0) {
+                        std::cerr << "  Added " << closed_way_admin_count
+                                  << " admin polygons from closed ways";
+                        if (cwa_wikidata_linked > 0)
+                            std::cerr << " (" << cwa_wikidata_linked << " wikidata-linked)";
+                        std::cerr << "." << std::endl;
+                    }
+                }
+
+                log_phase("    Pass 2b: way merge", _st, _sc);
+
+                // --- Parallel admin boundary assembly ---
+                {
+                    log_phase("Pass 2b: way processing", _pt, _cpu);
+                    pbf.unmap(); // release 86 GiB PBF mmap before admin/S2 phases
+                    std::cerr << "  Assembling admin polygons in parallel ("
+                              << data.collected_relations.size() << " relations, "
+                              << data.way_geometries.ways.size() << " way geometries)..." << std::endl;
+
+                    // Thread-local admin results (to avoid locking add_admin_polygon)
+                    struct AdminResult {
+                        std::vector<std::pair<double,double>> vertices;
+                        std::string name;
+                        uint8_t admin_level;
+                        std::string country_code;
+                        uint8_t place_type_override;
+                        // Strategy-2 stable identity. Together (relation_id,
+                        // ring_index) uniquely identifies one polygon ring
+                        // across builds: a relation can produce multiple
+                        // outer rings, and OSM ring order is deterministic.
+                        int64_t relation_id;
+                        uint16_t ring_index;
+                    };
+
+                    std::vector<std::vector<AdminResult>> thread_admin_results(num_threads);
+                    std::atomic<size_t> rel_idx{0};
+                    std::atomic<uint64_t> assembled_count{0};
+                    std::atomic<uint64_t> wikidata_linked_count{0};
+
+                    if (!wikidata_to_place_type.empty()) {
+                        std::cerr << "  Wikidata place linking: " << wikidata_to_place_type.size()
+                                  << " place nodes available for matching." << std::endl;
+                    }
+
+                    std::vector<std::thread> admin_workers;
+                    for (unsigned int t = 0; t < num_threads; t++) {
+                        admin_workers.emplace_back([&, t]() {
+                            auto& local_results = thread_admin_results[t];
+                            while (true) {
+                                size_t i = rel_idx.fetch_add(1);
+                                if (i >= data.collected_relations.size()) break;
+
+                                const auto& rel = data.collected_relations[i];
+
+                                // Skip level 2 border-line relations — these have names like
+                                // "Deutschland - Österreich" (two countries separated by
+                                // " - " or " — "). They are boundary lines, not country
+                                // polygons, and produce self-intersecting geometry.
+                                if (rel.admin_level == 2 && rel.country_code.empty() &&
+                                    (rel.name.find(" - ") != std::string::npos ||
+                                     rel.name.find(" \xe2\x80\x94 ") != std::string::npos)) { // " — " (em dash)
+                                    assembled_count.fetch_add(1);
+                                    continue;
+                                }
+
+                                // Skip relations with missing member ways —
+                                // these cross the extract boundary and would produce
+                                // incorrect partial polygons
+                                bool has_missing = false;
+                                for (const auto& [way_id, role] : rel.members) {
+                                    if (!data.way_geometries.find(way_id)) {
+                                        has_missing = true;
+                                        break;
+                                    }
+                                }
+                                if (has_missing) {
+                                    assembled_count.fetch_add(1);
+                                    continue;
+                                }
+
+                                auto rings = assemble_outer_rings(rel.members, data.way_geometries);
+                                // If outer-only assembly failed, retry with all ways.
+                                // Osmium ignores roles during assembly (check_roles=false) —
+                                // inner ways sometimes form the boundary or bridge gaps.
+                                // Filter retry results: discard rings with duplicate coords
+                                // (figure-8 shapes from merging holes with outer boundary).
+                                if (rings.empty()) {
+                                    auto retry = assemble_outer_rings(rel.members, data.way_geometries, true);
+                                    for (auto& ring : retry) {
+                                        if (!ring_has_duplicate_coords(ring)) {
+                                            rings.push_back(std::move(ring));
+                                        }
+                                    }
+                                }
+
+                                // Diagnostic: log relations with 0 rings produced
+                                if (rings.empty() && !rel.members.empty()) {
+                                    int total_ways = 0, found = 0, missing = 0;
+                                    for (const auto& [way_id, role] : rel.members) {
+                                        total_ways++;
+                                        const auto* way = data.way_geometries.find(way_id);
+                                        if (way && way->count > 0) {
+                                            found++;
+                                        } else {
+                                            missing++;
+                                        }
+                                    }
+                                    if (missing == 0 && found > 0) {
+                                        std::string detail = "  DEBUG '" + rel.name + "': ways:";
+                                        for (const auto& [way_id, role] : rel.members) {
+                                            const auto* way = data.way_geometries.find(way_id);
+                                            if (!way) continue;
+                                            detail += " [w" + std::to_string(way_id) +
+                                                      " first=" + std::to_string(way->first_node_id) +
+                                                      " last=" + std::to_string(way->last_node_id) +
+                                                      " n=" + std::to_string(way->count) + "]";
+                                        }
+                                        std::cerr << detail << std::endl;
+                                    }
+                                    std::cerr << "  WARN: relation '" << rel.name
+                                              << "' (level " << (int)rel.admin_level
+                                              << ", " << rel.members.size() << " members): "
+                                              << "0 rings from " << total_ways << " ways ("
+                                              << found << " found, " << missing << " missing)" << std::endl;
+                                }
+
+                                // Place linking, matching Nominatim's find_linked_place
+                                // priority order (placex_triggers.sql):
+                                //   1. label role (member with role=label, class=place)
+                                //   2. wikidata (place node with matching wikidata, inside
+                                //      the boundary, not already linked elsewhere)
+                                //   3. place type (boundary's own place=X tag with a
+                                //      matching-name place node — approximated here by
+                                //      the boundary's own place tag as a last resort)
+                                //   4. name match (not implemented)
+                                // An authoritative label-role match stops us falling
+                                // through — even if the label is a non-settlement
+                                // (state/province/country) Nominatim inherits its
+                                // rank_address from that node rather than trying wikidata.
+                                uint8_t pto = 0;
+                                bool label_checked = false;
+                                if (rel.label_node_id >= 0) {
+                                    auto it = label_node_to_place_type.find(rel.label_node_id);
+                                    if (it != label_node_to_place_type.end()) {
+                                        label_checked = true;
+                                        if (it->second != static_cast<uint8_t>(PlaceType::UNKNOWN)) {
+                                            pto = place_type_to_admin_override(it->second);
+                                            if (pto != 0) wikidata_linked_count.fetch_add(1);
+                                            // The boundary claims this node
+                                            // (Nominatim linked_place_id) —
+                                            // hide it from results.
+                                            std::lock_guard<std::mutex> lk(*data.linked_pn_mutex);
+                                            data.linked_place_node_ids.push_back(rel.label_node_id);
+                                        }
+                                    }
+                                }
+                                if (pto == 0 && !label_checked && !rel_wikidata[i].empty()) {
+                                    auto it = wikidata_to_place_type.find(rel_wikidata[i]);
+                                    if (it != wikidata_to_place_type.end()) {
+                                        pto = place_type_to_admin_override(it->second);
+                                        if (pto != 0) {
+                                            wikidata_linked_count.fetch_add(1);
+                                            auto nit = wikidata_place_node_ids.find(rel_wikidata[i]);
+                                            if (nit != wikidata_place_node_ids.end()) {
+                                                std::lock_guard<std::mutex> lk(*data.linked_pn_mutex);
+                                                data.linked_place_node_ids.insert(
+                                                    data.linked_place_node_ids.end(),
+                                                    nit->second.begin(), nit->second.end());
+                                            }
+                                        }
+                                    }
+                                }
+                                // Fallback: place tag on the boundary itself
+                                if (pto == 0 && rel.fallback_place_type != 0) {
+                                    pto = rel.fallback_place_type;
+                                }
+
+                                uint16_t ring_idx = 0;
+                                for (auto& ring : rings) {
+                                    if (ring.size() >= 3) {
+                                        AdminResult ar;
+                                        ar.vertices = std::move(ring);
+                                        ar.name = rel.name;
+                                        ar.admin_level = rel.admin_level;
+                                        ar.country_code = rel.country_code;
+                                        ar.place_type_override = pto;
+                                        ar.relation_id = rel.id;
+                                        ar.ring_index = ring_idx;
+                                        local_results.push_back(std::move(ar));
+                                    }
+                                    ring_idx++;
+                                }
+
+                                uint64_t done = assembled_count.fetch_add(1) + 1;
+                                if (done % 10000 == 0) {
+                                    std::cerr << "  Assembled " << done / 1000
+                                              << "K admin relations..." << std::endl;
+                                }
+                            }
+                        });
+                    }
+                    for (auto& w : admin_workers) w.join();
+                    if (wikidata_linked_count > 0) {
+                        std::cerr << "  Wikidata place linking: " << wikidata_linked_count
+                                  << " admin relations linked to place types." << std::endl;
+                    }
+                    rel_wikidata.clear();
+                    rel_wikidata.shrink_to_fit();
+                    log_phase("    Admin: ring assembly", _pt, _cpu);
+
+                    // Flatten all admin results into a single vector for parallel processing
+                    std::vector<AdminResult> all_admin_results;
+                    for (auto& local_results : thread_admin_results) {
+                        all_admin_results.insert(all_admin_results.end(),
+                            std::make_move_iterator(local_results.begin()),
+                            std::make_move_iterator(local_results.end()));
+                        local_results.clear();
+                    }
+                    uint64_t total_admin_rings = all_admin_results.size();
+
+                    // Parallel simplification: the expensive work (normalize, simplify,
+                    // compute area) is done per-polygon with no shared state.
+                    struct PreparedPolygon {
+                        std::vector<std::pair<double,double>> simplified;
+                        std::string name;
+                        uint8_t admin_level;
+                        std::string country_code;
+                        float area;
+                        uint8_t place_type_override;
+                        int64_t relation_id;
+                        uint16_t ring_index;
+                    };
+                    std::vector<PreparedPolygon> prepared(total_admin_rings);
+                    {
+                        std::atomic<size_t> prep_idx{0};
+                        std::vector<std::thread> prep_workers;
+                        for (unsigned int t = 0; t < num_threads; t++) {
+                            prep_workers.emplace_back([&]() {
+                                while (true) {
+                                    size_t i = prep_idx.fetch_add(1);
+                                    if (i >= total_admin_rings) break;
+                                    auto& ar = all_admin_results[i];
+                                    auto& pp = prepared[i];
+
+                                    // Normalize ring rotation
+                                    auto& vertices = ar.vertices;
+                                    canonicalize_ring_rotation(vertices);
+
+                                    pp.simplified = simplify_admin_polygon(vertices, ar.admin_level);
+                                    if (pp.simplified.size() >= 3) {
+                                        pp.area = polygon_area(pp.simplified);
+                                    }
+                                    pp.name = std::move(ar.name);
+                                    pp.admin_level = ar.admin_level;
+                                    pp.country_code = std::move(ar.country_code);
+                                    pp.place_type_override = ar.place_type_override;
+                                    pp.relation_id = ar.relation_id;
+                                    pp.ring_index = ar.ring_index;
+                                }
+                            });
+                        }
+                        for (auto& w : prep_workers) w.join();
+                    }
+                    all_admin_results.clear();
+                    log_phase("    Admin: parallel simplify", _pt, _cpu);
+
+                    // Sequential append + submit to S2 pool (cheap: just vector push + string intern)
+                    for (auto& pp : prepared) {
+                        if (pp.simplified.size() < 3) continue;
+
+                        uint32_t poly_id = static_cast<uint32_t>(data.admin_polygons.size());
+                        uint32_t vertex_offset = static_cast<uint32_t>(data.admin_vertices.size());
+
+                        for (const auto& [lat, lng] : pp.simplified) {
+                            data.admin_vertices.push_back({static_cast<float>(lat), static_cast<float>(lng)});
+                        }
+
+                        AdminPolygon poly{};
+                        poly.vertex_offset = vertex_offset;
+                        poly.vertex_count = static_cast<uint32_t>(pp.simplified.size());
+                        poly.name_id = data.string_pool.intern(pp.name);
+                        poly.admin_level = pp.admin_level;
+                        poly.place_type_override = pp.place_type_override;
+                        poly.area = pp.area;
+                        const char* cc = pp.country_code.empty() ? nullptr : pp.country_code.c_str();
+                        poly.country_code = (cc && cc[0] && cc[1])
+                            ? pack_country_code(cc[0], cc[1]) : 0;
+                        data.admin_polygons.push_back(poly);
+                        // Strategy-2 stable identity, packed like addr/poi:
+                        // top 8 bits = ObjectType, bottom 56 bits = the
+                        // stable id. For relation-sourced admin polygons the
+                        // stable id is (relation_id<<16 | ring_index) — ring
+                        // in the low 16 bits, relation_id above (OSM has
+                        // ~20M relations, so this fits 56 bits comfortably).
+                        // The type byte keeps relation ids from colliding
+                        // with closed-way ids (which use OSM_WAY + way_id).
+                        data.admin_osm_ids.push_back(
+                            (static_cast<uint64_t>(gc::id_alloc::ObjectType::OSM_RELATION) << 56) |
+                            ((((static_cast<uint64_t>(pp.relation_id) << 16) |
+                               static_cast<uint64_t>(pp.ring_index))) & 0x00FFFFFFFFFFFFFFull));
+
+                        admin_pool.submit(poly_id, std::move(pp.simplified));
+                    }
+
+                    std::cerr << "  Parallel admin assembly complete: "
+                              << total_admin_rings << " polygon rings from "
+                              << data.collected_relations.size() << " relations." << std::endl;
+                    log_phase("    Admin: append + submit S2", _pt, _cpu);
+
+                    // Free collected admin data
+                    data.collected_relations.clear();
+                    data.collected_relations.shrink_to_fit();
+
+                    // --- Parallel POI relation assembly ---
+                    if (!data.collected_poi_relations.empty()) {
+                        std::cerr << "  Assembling POI polygons in parallel ("
+                                  << data.collected_poi_relations.size() << " relations)..." << std::endl;
+
+                        struct PoiResult {
+                            std::vector<std::pair<double,double>> vertices;
+                            std::string name;
+                            PoiCategory category;
+                            uint8_t tier;
+                            uint8_t flags;
+                            uint32_t qid;
+                            // Relation-level addr tags carried through for
+                            // AddrPoint emission alongside the POI record.
+                            std::string addr_housenumber;
+                            std::string addr_street;
+                            std::string addr_postcode;
+                            // Strategy-2 stable identity: relation_id +
+                            // ring_index. A multi-ring POI relation produces
+                            // one PoiResult per ring; ring_index makes them
+                            // distinguishable across builds.
+                            int64_t relation_id;
+                            uint16_t ring_index;
+                        };
+
+                        std::vector<std::vector<PoiResult>> thread_poi_results(num_threads);
+                        std::atomic<size_t> poi_rel_idx{0};
+                        std::atomic<uint64_t> poi_assembled_count{0};
+
+                        std::vector<std::thread> poi_workers;
+                        for (unsigned int t = 0; t < num_threads; t++) {
+                            poi_workers.emplace_back([&, t]() {
+                                auto& local_results = thread_poi_results[t];
+                                while (true) {
+                                    size_t i = poi_rel_idx.fetch_add(1);
+                                    if (i >= data.collected_poi_relations.size()) break;
+
+                                    const auto& rel = data.collected_poi_relations[i];
+
+                                    // Skip relations with missing member ways
+                                    bool has_missing = false;
+                                    for (const auto& [way_id, role] : rel.members) {
+                                        if (!data.way_geometries.find(way_id)) {
+                                            has_missing = true;
+                                            break;
+                                        }
+                                    }
+                                    if (has_missing) {
+                                        poi_assembled_count.fetch_add(1);
+                                        continue;
+                                    }
+
+                                    auto rings = assemble_outer_rings(rel.members, data.way_geometries);
+                                    if (rings.empty()) {
+                                        auto retry = assemble_outer_rings(rel.members, data.way_geometries, true);
+                                        for (auto& ring : retry) {
+                                            if (!ring_has_duplicate_coords(ring))
+                                                rings.push_back(std::move(ring));
+                                        }
+                                    }
+
+                                    uint16_t poi_ring_idx = 0;
+                                    for (auto& ring : rings) {
+                                        if (ring.size() >= 3) {
+                                            // Normalize ring rotation
+                                            canonicalize_ring_rotation(ring);
+
+                                            // Simplify with ~50m epsilon
+                                            double lat0 = ring.empty() ? 0.0 : ring[0].first;
+                                            double eps_deg = meters_to_degrees(50.0, lat0);
+                                            ring = simplify_polygon_epsilon(ring, eps_deg);
+
+                                            if (ring.size() >= 3) {
+                                                PoiResult pr;
+                                                pr.vertices = std::move(ring);
+                                                pr.name = rel.name;
+                                                pr.category = rel.category;
+                                                pr.tier = rel.tier;
+                                                pr.flags = rel.flags;
+                                                pr.qid = rel.qid;
+                                                pr.addr_housenumber = rel.addr_housenumber;
+                                                pr.addr_street = rel.addr_street;
+                                                pr.addr_postcode = rel.addr_postcode;
+                                                pr.relation_id = rel.id;
+                                                pr.ring_index = poi_ring_idx;
+                                                local_results.push_back(std::move(pr));
+                                            }
+                                        }
+                                        poi_ring_idx++;
+                                    }
+
+                                    poi_assembled_count.fetch_add(1);
+                                }
+                            });
+                        }
+                        for (auto& w : poi_workers) w.join();
+                        log_phase("    POI: ring assembly", _pt, _cpu);
+
+                        // Merge POI relation results
+                        uint64_t total_poi_rings = 0;
+                        for (auto& local_results : thread_poi_results) {
+                            for (auto& pr : local_results) {
+                                // Compute centroid
+                                double sum_lat = 0, sum_lng = 0;
+                                for (const auto& [lat, lng] : pr.vertices) {
+                                    sum_lat += lat; sum_lng += lng;
+                                }
+                                float clat = static_cast<float>(sum_lat / pr.vertices.size());
+                                float clng = static_cast<float>(sum_lng / pr.vertices.size());
+
+                                uint32_t vertex_offset = static_cast<uint32_t>(data.poi_vertices.size());
+                                for (const auto& [lat, lng] : pr.vertices)
+                                    data.poi_vertices.push_back({static_cast<float>(lat), static_cast<float>(lng)});
+
+                                PoiRecord rec{};
+                                rec.lat = clat;
+                                rec.lng = clng;
+                                rec.vertex_offset = vertex_offset;
+                                rec.vertex_count = static_cast<uint32_t>(pr.vertices.size());
+                                rec.name_id = data.string_pool.intern(pr.name);
+                                rec.category = static_cast<uint8_t>(pr.category);
+                                rec.tier = pr.tier;
+                                rec.flags = pr.flags;
+                                data.poi_records.push_back(rec);
+                                // Strategy-2 stable identity: pack
+                                // (relation_id<<16 | ring_index) into the
+                                // 56-bit id payload, type=OSM_RELATION.
+                                uint64_t rel_payload =
+                                    (static_cast<uint64_t>(pr.relation_id) << 16) |
+                                    static_cast<uint64_t>(pr.ring_index);
+                                data.poi_osm_ids.push_back(
+                                    pack_osm_id(gc::id_alloc::ObjectType::OSM_RELATION,
+                                                static_cast<int64_t>(rel_payload)));
+                                poi_elevations.push_back(0); // relations don't have ele
+                                poi_qids.push_back(pr.qid);
+                                total_poi_rings++;
+
+                                // Relation-level AddrPoint. Mirrors Nominatim's rank-30
+                                // placex row for relations carrying addr:housenumber
+                                // (e.g. White House R19761182). Without this, even though
+                                // the POI wins as primary the road/house_number fields
+                                // would reflect the POI name, not the addr:street tag.
+                                if (!pr.addr_housenumber.empty()) {
+                                    uint64_t dummy = 0;
+                                    const char* bpc_ptr = pr.addr_postcode.empty() ? nullptr : pr.addr_postcode.c_str();
+                                    std::vector<NodeCoord> poly_verts;
+                                    poly_verts.reserve(pr.vertices.size());
+                                    for (const auto& [vlat, vlng] : pr.vertices) {
+                                        poly_verts.push_back({static_cast<float>(vlat), static_cast<float>(vlng)});
+                                    }
+                                    // Stable identity: this addr point is emitted by
+                                    // a POI RELATION, so reuse the relation's
+                                    // (relation_id<<16 | ring_index) key with type
+                                    // OSM_RELATION — the SAME scheme the POI record
+                                    // above uses. The previous synthetic 56-bit hash of
+                                    // (lat,lng,housenumber,street) COLLIDED for two
+                                    // relations sharing those fields but with different
+                                    // geometry; strategy-2 (which matches addr points by
+                                    // osm_id) then slotted the colliding pair non-
+                                    // deterministically — moving one record to the end
+                                    // and leaving a tombstone — which shifted
+                                    // addr_vertices packing and cascaded ~52M
+                                    // vertex_offset fixups (98.9 MiB) into the planet
+                                    // same-PBF patch. rel_payload is unique per
+                                    // (relation, ring), and addr_osm_ids is a separate
+                                    // sidecar from poi_osm_ids so sharing the key is safe.
+                                    add_addr_point(data, clat, clng,
+                                                   pr.addr_housenumber.c_str(),
+                                                   pr.addr_street.c_str(),
+                                                   bpc_ptr, dummy,
+                                                   pack_osm_id(gc::id_alloc::ObjectType::OSM_RELATION,
+                                                               static_cast<int64_t>(rel_payload)),
+                                                   poly_verts.data(),
+                                                   static_cast<uint32_t>(poly_verts.size()));
+                                }
+                            }
+                            local_results.clear();
+                        }
+                        std::cerr << "  POI relation assembly complete: "
+                                  << total_poi_rings << " polygon rings from "
+                                  << data.collected_poi_relations.size() << " relations." << std::endl;
+                        log_phase("    POI: merge results", _pt, _cpu);
+                    }
+                    data.collected_poi_relations.clear();
+                    data.collected_poi_relations.shrink_to_fit();
+
+                    free_storage(data.way_geometries);
+                }
+            }
+        }
+
+#ifdef __GLIBC__
+        // The parse threads' freed buffers sit in free chunks of their
+        // malloc arenas, between live chunks, where free() never hands the
+        // pages back; malloc_trim returns them to the OS for later phases.
+        long rss_before_trim = get_rss_mb();
+        malloc_trim(0);
+        std::cerr << "Trimmed malloc arenas: " << rss_before_trim << " -> "
+                  << get_rss_mb() << " MiB resident." << std::endl;
+#endif
+
+        // Memory breakdown — what's holding RSS now (before the strategy-2
+        // and deterministic-ordering passes that follow). Identifies the
+        // structures to target for further reduction. Approximate sizes
+        // (vector capacity * sizeof(T), an upper bound: capacity past the
+        // size was never written, so it costs no RSS); not exact for
+        // unordered_maps.
+        log_mem("data.ways (capacity)",              vec_bytes(data.ways));
+        log_mem("data.way_osm_ids",                  vec_bytes(data.way_osm_ids));
+        log_mem("data.way_orig_name_ids",            vec_bytes(data.way_orig_name_ids));
+        log_mem("data.street_nodes",                 vec_bytes(data.street_nodes));
+        log_mem("data.way_parent_ids",               vec_bytes(data.way_parent_ids));
+        log_mem("data.way_postcode_ids",             vec_bytes(data.way_postcode_ids));
+        log_mem("data.cell_to_ways (approx)",        map_bytes_approx(data.cell_to_ways));
+        log_mem("data.addr_points",                  vec_bytes(data.addr_points));
+        log_mem("data.addr_osm_ids",                 vec_bytes(data.addr_osm_ids));
+        log_mem("data.addr_vertices",                vec_bytes(data.addr_vertices));
+        log_mem("data.addr_postcode_ids",            vec_bytes(data.addr_postcode_ids));
+        log_mem("data.addr_cells",                   vec_bytes(data.addr_cells));
+        log_mem("data.admin_polygons",               vec_bytes(data.admin_polygons));
+        log_mem("data.admin_osm_ids",                vec_bytes(data.admin_osm_ids));
+        log_mem("data.admin_vertices",               vec_bytes(data.admin_vertices));
+        log_mem("data.cell_to_admin (approx)",       map_bytes_approx(data.cell_to_admin));
+        log_mem("data.admin_parent_ids",             vec_bytes(data.admin_parent_ids));
+        log_mem("data.poi_records",                  vec_bytes(data.poi_records));
+        log_mem("data.poi_osm_ids",                  vec_bytes(data.poi_osm_ids));
+        log_mem("data.poi_vertices",                 vec_bytes(data.poi_vertices));
+        log_mem("data.cell_to_pois (approx)",        map_bytes_approx(data.cell_to_pois));
+        log_mem("data.place_nodes",                  vec_bytes(data.place_nodes));
+        log_mem("data.place_osm_ids",                vec_bytes(data.place_osm_ids));
+        log_mem("data.interp_ways",                  vec_bytes(data.interp_ways));
+        log_mem("data.interp_osm_ids",               vec_bytes(data.interp_osm_ids));
+        log_mem("data.interp_nodes",                 vec_bytes(data.interp_nodes));
+        log_mem("data.deferred_ways",                vec_bytes(data.deferred_ways));
+        log_mem("data.deferred_interps",             vec_bytes(data.deferred_interps));
+        log_mem("data.collected_relations",          vec_bytes(data.collected_relations));
+        log_mem("data.collected_poi_relations",      vec_bytes(data.collected_poi_relations));
+        log_mem("data.string_pool",                  data.string_pool.data().size());
+
+        std::cerr << "Done reading:" << std::endl;
+        std::cerr << "  " << data.ways.size() << " street ways" << std::endl;
+        std::cerr << "  " << data.addr_points.size() << " address points" << std::endl;
+        std::cerr << "  " << data.interp_ways.size() << " interpolation ways" << std::endl;
+        std::cerr << "  " << data.admin_polygons.size() << " admin polygon rings" << std::endl;
+        std::cerr << "  " << data.poi_records.size() << " POI records ("
+                  << data.poi_vertices.size() << " polygon vertices)" << std::endl;
+        std::cerr << "  " << data.place_nodes.size() << " place nodes" << std::endl;
+
+        log_phase("    Release + shrink parsed data", _pt, _cpu);
+
+        // Drain admin polygon thread pool (may still be processing)
+        std::cerr << "Waiting for admin polygon S2 covering to complete..." << std::endl;
+        admin_pool.wait_idle();
+        log_phase("    Admin: S2 covering wait", _pt, _cpu);
+        // Nothing else fills cell_to_admin while parsing: take the map whole.
+        data.cell_to_admin = admin_pool.drain();
+        log_phase("    Admin: S2 covering merge", _pt, _cpu);
+        std::cerr << "Admin polygon S2 covering complete (" << data.cell_to_admin.size() << " cells)." << std::endl;
+
+        // Sort admin polygons largest-first (by vertex count descending).
+        // This ensures the work-stealing loops in S2 computation and quality
+        // variant simplification process expensive polygons first, avoiding
+        // stragglers at the end.
+        {
+            size_t n = data.admin_polygons.size();
+            std::vector<uint32_t> order(n);
+            std::iota(order.begin(), order.end(), 0u);
+            std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+                return data.admin_polygons[a].vertex_count > data.admin_polygons[b].vertex_count;
+            });
+
+            // Reorder polygons, vertices and admin_osm_ids in lockstep.
+            // admin_osm_ids is a parallel array (slot i is the stable
+            // osm-id of admin_polygons[i]); failing to permute it here
+            // leaves the sidecar misaligned from the polygon array, so the
+            // canonical sort below and strategy-2 (which match by osm-id)
+            // attach the wrong stable id to each polygon → non-deterministic
+            // sidecar + massive admin churn on chained builds.
+            // (admin_parent_ids / way_parent_ids / poi+place parent_poly_id
+            // are all computed AFTER this sort, so they need no remap here.)
+            const std::vector<uint32_t> old_to_new = permute_admin_polygons(data, order, num_threads);
+
+            // Remap poly_ids in cell_to_admin (preserving INTERIOR_FLAG)
+            for_each_admin_cell_list(data, num_threads, [&](std::vector<uint32_t>& ids) {
+                for (auto& id : ids) {
+                    uint32_t flags = id & INTERIOR_FLAG;
+                    uint32_t old_id = id & ID_MASK;
+                    id = old_to_new[old_id] | flags;
+                }
+            });
+            std::cerr << "Sorted admin polygons largest-first (" << n << " polygons)." << std::endl;
+        }
+
+        // Deterministic tie-break for the smallest-containing-admin parent
+        // computations below (way_parent / admin_parent / poi parent). Those
+        // pick the min-area containing polygon with a strict `area < best`,
+        // leaving exact-area ties to whichever candidate is iterated first.
+        // AdminPolygon.area is float32, so distinct polygons routinely share
+        // an area value, and cell_to_admin's in-memory order is
+        // non-deterministic (S2 cover drain + Sort #1 remap, never re-sorted),
+        // so the tie winner flipped between same-PBF builds (~33k way parents
+        // + ~33k place parents of churn). Sort each cell's candidate list by
+        // admin osm_id (build-invariant, unique, kept aligned by Sort #1) so
+        // the first-of-equal-area winner is stable. write_cell_index re-sorts
+        // by raw poly_id at write time, so the on-disk layout is unaffected;
+        // this order only governs the parent tie-breaks. (Place-node uses its
+        // own (area, osm_id) candidate sort.)
+        if (data.admin_osm_ids.size() == data.admin_polygons.size()) {
+            for_each_admin_cell_list(data, num_threads, [&](std::vector<uint32_t>& ids) {
+                std::sort(ids.begin(), ids.end(), [&](uint32_t x, uint32_t y) {
+                    return data.admin_osm_ids[x & ID_MASK] <
+                           data.admin_osm_ids[y & ID_MASK];
+                });
+            });
+        }
+
+        compute_place_node_containment(data, cfg, _pt, _cpu);
+
+        link_places_by_name(data, cfg, _pt, _cpu);
+
+        // TIGER and GeoNames write only the string pool, interpolations and
+        // postcode centroids, none of which the parent chains read, so they
+        // load alongside them. The GeoNames file is read meanwhile; its rows
+        // go in after TIGER's, as they always have.
+        std::future<ExternalPostcodes> external_postcodes;
+        if (!external_postcodes_path.empty())
+            external_postcodes = std::async(std::launch::async, read_external_postcodes, external_postcodes_path);
+        auto external_data = std::async(std::launch::async, [&] {
+            if (!tiger_data_path.empty()) {
+                load_tiger_data(data, tiger_data_path, std::move(tiger_csvs));
+            }
+            if (!external_postcodes_path.empty()) {
+                load_external_postcodes(data, external_postcodes_path, std::move(external_postcodes));
+            }
+        });
+
+        compute_admin_parent_chain(data, cfg);
+
+        compute_way_parent_polygons(data, cfg);
+
+        external_data.get();
+        // The loaders above made the last intern; the lookup table would
+        // otherwise ride through ordering and the write phase. Freeing its
+        // planet's worth of nodes takes one core many seconds, so that runs
+        // beside the S2 pass.
+        auto index_freed = std::async(std::launch::async,
+            [index = data.string_pool.release_index()]() mutable { for (auto& shard : index) release_gently(shard); });
+
+        compute_s2_and_poi_cells(data, cfg, _pt, _cpu);
+        index_freed.get();
+
+        // Deduplicate + convert to sorted pairs for fast writing
+        log_phase("S2 cell computation", _pt, _cpu);
+        std::cerr << "Deduplicating + sorting for write..." << std::endl;
+        {
+            auto _dt = std::chrono::steady_clock::now();
+            auto _dc = CpuTicks::now();
+            data.sorted_addr_cells = sorted_item_cells(data.addr_cells);
+            std::vector<uint64_t>().swap(data.addr_cells);
+            log_phase("    Sort: addr cell pairs", _dt, _dc);
+            deduplicate(data.cell_to_admin);
+            log_phase("    Dedup: admin cells", _dt, _dc);
+        }
+
+        // Save cache if requested
+        if (!save_cache_path.empty()) {
+            serialize_cache(data, save_cache_path);
+        }
+    }
+
+    // --- Rebuild hash maps from sorted pairs if needed for cache saving ---
+    if (!save_cache_path.empty()) {
+        rebuild_cell_maps_for_cache(data, _pt, _cpu);
+    }
+
+    // --- Deterministic ordering ---
+    reorder_deterministically(data, poi_elevations, poi_qids, sitelinks_data);
+
+    // --- Write index files ---
+    write_all_index_files(data, cfg, quality_scales, generate_continents, _pt, _cpu);
+
+    std::cerr << "Done." << std::endl;
+    return 0;
+}
+
+// The one error edge: a throw anywhere in run() unwinds its scratch dirs.
+int main(int argc, char* argv[]) {
+    try {
+        return run(argc, argv);
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
+}

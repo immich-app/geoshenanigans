@@ -1,0 +1,115 @@
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: planet-pbf
+  labels:
+    app: planet-server
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: planet-server
+  labels:
+    app: planet-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: planet-server
+  template:
+    metadata:
+      labels:
+        app: planet-server
+    spec:
+      containers:
+        - name: planet-server
+          image: debian:bookworm-slim
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+              apt-get update && apt-get install -y --no-install-recommends aria2 python3 ca-certificates curl
+
+              PBF=/data/planet-latest.osm.pbf
+              URL="https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf"
+
+              # Check if file exists and is complete
+              if [ -f "$PBF" ]; then
+                LOCAL_SIZE=$(stat -c%s "$PBF" 2>/dev/null || echo 0)
+                REMOTE_SIZE=$(curl -sI "$URL" -o /dev/null -w '%{size_download}' --max-time 10 2>/dev/null || \
+                              curl -sI "$URL" -L -o /dev/null -w '%{content_type}' --max-time 10 2>/dev/null | head -1)
+                # Try to get content-length from headers
+                REMOTE_SIZE=$(curl -sI -L "$URL" --max-time 10 2>/dev/null | grep -i content-length | tail -1 | awk '{print $2}' | tr -d '\r')
+
+                if [ -n "$REMOTE_SIZE" ] && [ "$LOCAL_SIZE" = "$REMOTE_SIZE" ]; then
+                  echo "Planet PBF already downloaded and complete ($LOCAL_SIZE bytes)"
+                else
+                  echo "Planet PBF exists but may be incomplete (local=$LOCAL_SIZE remote=$REMOTE_SIZE), resuming..."
+                  aria2c -x 16 -s 16 --max-connection-per-server=16 \
+                    --min-split-size=10M --split=16 --file-allocation=none \
+                    --continue=true --auto-file-renaming=false \
+                    -d /data -o planet-latest.osm.pbf "$URL"
+                fi
+              else
+                echo "Downloading planet PBF..."
+                aria2c -x 16 -s 16 --max-connection-per-server=16 \
+                  --min-split-size=10M --split=16 --file-allocation=none \
+                  -d /data -o planet-latest.osm.pbf "$URL"
+              fi
+
+              echo "Serving planet PBF on port 8080..."
+              cd /data && python3 -m http.server 8080
+          ports:
+            - containerPort: 8080
+              name: http
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "1"
+              memory: 512Mi
+            limits:
+              cpu: "4"
+              memory: 1Gi
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 600
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 600
+            periodSeconds: 30
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: planet-pbf
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: planet-server
+  labels:
+    app: planet-server
+spec:
+  selector:
+    app: planet-server
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
+      name: http
+  type: ClusterIP
