@@ -51,6 +51,41 @@ jobs:
           make -j$(nproc) geocoder-tests
           ./geocoder-tests
 
+  # The nightly links the static S2 and abseil tools/build_s2.sh builds; the
+  # cache is the nightly's, so a PR rebuilds them only when the script changes.
+  build-index-release-s2:
+    name: Build index (release S2)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake libzstd-dev zlib1g-dev libprotozero-dev \
+            libbz2-dev libexpat1-dev libssl-dev patch xz-utils
+      - name: Restore S2
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/s2
+          key: s2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('geocoder/builder/tools/build_s2.sh') }}
+      - name: Build S2
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          if (cd "$RUNNER_TEMP/s2" 2> /dev/null && sha256sum -c --quiet SHA256SUMS); then exit 0; fi
+          rm -rf "$RUNNER_TEMP/s2"
+          TMPDIR="$RUNNER_TEMP" geocoder/builder/tools/build_s2.sh "$RUNNER_TEMP/s2"
+      - name: Build index
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          cd geocoder/builder && mkdir -p build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DGEOCODER_S2_PREFIX="$RUNNER_TEMP/s2"
+          make -j$(nproc) build-index
+
   server-tests:
     name: Server unit tests
     runs-on: ubuntu-24.04
