@@ -19,6 +19,7 @@
 #include "id_allocator.h"
 #include "parallel.h"
 #include "postcode_validation.h"
+#include "ranked_bits.h"
 #include "ring_contains.h"
 #include "s2_helpers.h"
 #include "strategy2_remap.h"
@@ -577,27 +578,32 @@ static std::vector<std::unique_ptr<RingEdgeIndex>> index_border_rings(const Pars
         return pid < data.admin_polygons.size() && data.admin_polygons[pid].admin_level == 2
             && data.admin_polygons[pid].country_code != 0;
     };
-    std::vector<char> tested(data.admin_polygons.size(), 0);
-    for (const auto& [cell_id, ids] : data.cell_to_admin) {
-        uint16_t first_cc = 0;
-        bool border = false;
-        for (uint32_t raw_id : ids) {
-            if (!country_ring(raw_id)) continue;
-            uint16_t cc = data.admin_polygons[raw_id & ID_MASK].country_code;
-            if (first_cc == 0) first_cc = cc;
-            else if (cc != first_cc) border = true;
-        }
-        if (!border) continue;
-        for (uint32_t raw_id : ids)
-            if (country_ring(raw_id)) tested[raw_id & ID_MASK] = 1;
-    }
-    std::vector<uint32_t> pids;
-    for (uint32_t pid = 0; pid < tested.size(); pid++) {
+    const size_t polygons = data.admin_polygons.size();
+    std::vector<std::atomic<uint64_t>> tested(polygons / 64 + 1);
+    const auto& cells = data.cell_to_admin;
+    parallel_for(cells.bucket_count(), [&](size_t b0, size_t b1, unsigned) {
+        for (size_t b = b0; b < b1; b++)
+            for (auto it = cells.begin(b); it != cells.end(b); ++it) {
+                const auto& ids = it->second;
+                uint16_t first_cc = 0;
+                bool border = false;
+                for (uint32_t raw_id : ids) {
+                    if (!country_ring(raw_id)) continue;
+                    uint16_t cc = data.admin_polygons[raw_id & ID_MASK].country_code;
+                    if (first_cc == 0) first_cc = cc;
+                    else if (cc != first_cc) border = true;
+                }
+                if (!border) continue;
+                for (uint32_t raw_id : ids)
+                    if (country_ring(raw_id)) mark_bit(tested, raw_id & ID_MASK);
+            }
+    });
+    const RankedBits marked(polygons, tested);
+    const std::vector<uint32_t> pids = parallel_filter(polygons, [&](size_t pid) {
         const auto& poly = data.admin_polygons[pid];
-        if (tested[pid] && poly.vertex_offset + poly.vertex_count <= data.admin_vertices.size()
-            && poly.vertex_count >= 3)
-            pids.push_back(pid);
-    }
+        return marked.index(pid) != RankedBits::npos &&
+               poly.vertex_offset + poly.vertex_count <= data.admin_vertices.size() && poly.vertex_count >= 3;
+    });
     std::vector<std::unique_ptr<RingEdgeIndex>> rings(data.admin_polygons.size());
     parallel_for_dynamic(pids.size(), 1, [&](size_t begin, size_t end, unsigned) {
         for (size_t k = begin; k < end; k++) {
@@ -630,16 +636,22 @@ void collect_postcode_centroids(ParsedData& data) {
             parts[w][postcode_key(cc, pc_id)].add(ap.lat, ap.lng);
         }
     });
+    // The workers' maps summed a shard of the keys per thread.
+    constexpr size_t kShards = 64;
+    std::vector<Accums> shards(kShards);
+    parallel_for_each(kShards, [&](size_t s, unsigned) {
+        for (const auto& part : parts)
+            for (const auto& [key, acc] : part) {
+                if (key % kShards != s) continue;
+                auto& sum = shards[s][key];
+                sum.sum_lat_e7 += acc.sum_lat_e7;
+                sum.sum_lng_e7 += acc.sum_lng_e7;
+                sum.count += acc.count;
+            }
+    });
+    parallel_for_each(parts.size(), [&](size_t w, unsigned) { Accums().swap(parts[w]); });
     Accums osm;
-    for (auto& part : parts) {
-        for (const auto& [key, acc] : part) {
-            auto& sum = osm[key];
-            sum.sum_lat_e7 += acc.sum_lat_e7;
-            sum.sum_lng_e7 += acc.sum_lng_e7;
-            sum.count += acc.count;
-        }
-        Accums().swap(part);
-    }
+    for (auto& shard : shards) osm.merge(shard);
     // External centroids (TIGER, GeoNames) fill only the (country,
     // postcode) pairs OSM has none for, as Nominatim's
     // _update_from_external does.
