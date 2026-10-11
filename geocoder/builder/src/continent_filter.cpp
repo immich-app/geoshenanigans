@@ -54,18 +54,38 @@ static bool cell_in_continent(uint64_t cell_id, const ContinentBBox& bbox, const
     return polygon->contains(center.lat().degrees(), center.lng().degrees());
 }
 
-ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bbox,
+// Frees planet arrays a consuming split is done with.
+template <class T>
+static void release(std::vector<T>& v) {
+    free_beside(std::move(v));
+    v = {};
+}
+
+template <class K, class V>
+static void release(std::unordered_map<K, V>& m) {
+    std::unordered_map<K, V>().swap(m);
+}
+
+ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
     uint8_t continent_bit,
     const std::vector<uint8_t>& way_masks,
     const std::vector<uint8_t>& addr_masks,
     const std::vector<uint8_t>& interp_masks,
     const std::vector<uint8_t>& poi_masks,
     const std::vector<uint8_t>& place_masks,
-    const std::vector<std::pair<double,double>>* boundary) {
+    const std::vector<std::pair<double,double>>* boundary,
+    PlanetRecords records) {
 
     ParsedData out;
     auto _ft = std::chrono::steady_clock::now();
     auto _fc = CpuTicks::now();
+    const bool consume = records == PlanetRecords::Consume;
+    auto drop = [&](auto&... planet_arrays) {
+        if (consume) (release(planet_arrays), ...);
+    };
+    // The sidecars stay with the planet's own files, written by now.
+    drop(full.way_sidecar_blob, full.admin_sidecar_blob, full.addr_sidecar_blob, full.place_sidecar_blob,
+         full.poi_sidecar_blob, full.interp_sidecar_blob, full.postcode_sidecar_blob);
     std::optional<PolygonIndex> boundary_index;
     if (boundary) boundary_index.emplace(*boundary);
     const PolygonIndex* polygon = boundary ? &*boundary_index : nullptr;
@@ -142,7 +162,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     // Ways — with coordinate-level polygon refinement if provided.
     // Strategy-2: also forward osm_ids (parallel to ways) so the
     // continent's IdAllocator pass can run with stable identity.
-    auto f_remap_ways = std::async(std::launch::async, [&]() {
+    auto copy_ways = [&]() {
         way_remap = copy_subset(used_way_ids, full.ways, full.street_nodes,
             [&](uint32_t id) {
                 const auto& w = full.ways[id];
@@ -157,7 +177,8 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
             [](WayHeader& w, uint32_t offset, uint32_t) { w.node_offset = offset; },
             out.ways, out.street_nodes);
         out.way_osm_ids = subset_osm_ids(used_way_ids, way_remap, out.ways.size(), full.way_osm_ids);
-    });
+        drop(full.ways, full.street_nodes, full.way_osm_ids);
+    };
 
     // Addrs — coord polygon refinement.  Also carries through the
     // addr_vertices buffer for addr_points with building footprints,
@@ -165,7 +186,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     // continent's data.addr_vertices stays empty and any polygon-aware
     // downstream consumer (e.g. cell_index.cpp's addr_vertices packer
     // added in v15) crashes on out-of-bounds access.
-    auto f_remap_addrs = std::async(std::launch::async, [&]() {
+    auto copy_addrs = [&]() {
         addr_remap = copy_subset(used_addr_ids, full.addr_points, full.addr_vertices,
             [&](uint32_t id) {
                 const auto& a = full.addr_points[id];
@@ -183,20 +204,22 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
             },
             out.addr_points, out.addr_vertices);
         out.addr_osm_ids = subset_osm_ids(used_addr_ids, addr_remap, out.addr_points.size(), full.addr_osm_ids);
-    });
+        drop(full.addr_points, full.addr_vertices, full.addr_osm_ids);
+    };
 
     // Interps
-    auto f_remap_interps = std::async(std::launch::async, [&]() {
+    auto copy_interps = [&]() {
         interp_remap = copy_subset(used_interp_ids, full.interp_ways, full.interp_nodes,
             [](uint32_t) { return true; },
             [&](uint32_t id) { return CoordRun{full.interp_ways[id].node_offset, full.interp_ways[id].node_count}; },
             [](InterpWay& iw, uint32_t offset, uint32_t) { iw.node_offset = offset; },
             out.interp_ways, out.interp_nodes);
         out.interp_osm_ids = subset_osm_ids(used_interp_ids, interp_remap, out.interp_ways.size(), full.interp_osm_ids);
-    });
+        drop(full.interp_ways, full.interp_nodes, full.interp_osm_ids);
+    };
 
     // Admin
-    auto f_remap_admins = std::async(std::launch::async, [&]() {
+    auto copy_admins = [&]() {
         admin_remap = copy_subset(used_admin_ids, full.admin_polygons, full.admin_vertices,
             [](uint32_t) { return true; },
             [&](uint32_t id) {
@@ -205,12 +228,13 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
             [](AdminPolygon& ap, uint32_t offset, uint32_t) { ap.vertex_offset = offset; },
             out.admin_polygons, out.admin_vertices);
         out.admin_osm_ids = subset_osm_ids(used_admin_ids, admin_remap, out.admin_polygons.size(), full.admin_osm_ids);
-    });
+        drop(full.admin_polygons, full.admin_vertices, full.admin_osm_ids);
+    };
 
     // POIs — coord polygon refinement, preserve vertex arrays for polygon POIs
     // A point POI's vertex_offset also moves to the current end of the
     // vertex array, as it always has.
-    auto f_remap_pois = std::async(std::launch::async, [&]() {
+    auto copy_pois = [&]() {
         poi_remap = copy_subset(used_poi_ids, full.poi_records, full.poi_vertices,
             [&](uint32_t id) {
                 const auto& p = full.poi_records[id];
@@ -224,11 +248,12 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
             [](PoiRecord& p, uint32_t offset, uint32_t) { p.vertex_offset = offset; },
             out.poi_records, out.poi_vertices);
         out.poi_osm_ids = subset_osm_ids(used_poi_ids, poi_remap, out.poi_records.size(), full.poi_osm_ids);
-    });
+        drop(full.poi_records, full.poi_vertices, full.poi_osm_ids);
+    };
 
     // Place nodes — parent_poly_id remapped in a second pass below, after
     // admin_remap is ready. Keeps the async pipeline free of dependencies.
-    auto f_remap_places = std::async(std::launch::async, [&]() {
+    auto copy_places = [&]() {
         const std::vector<NodeCoord> no_coords;
         std::vector<NodeCoord> unused;
         place_remap = copy_subset(used_place_ids, full.place_nodes, no_coords,
@@ -240,14 +265,26 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
             [](PlaceNode&, uint32_t, uint32_t) {},
             out.place_nodes, unused);
         out.place_osm_ids = subset_osm_ids(used_place_ids, place_remap, out.place_nodes.size(), full.place_osm_ids);
-    });
+        drop(full.place_nodes, full.place_osm_ids);
+    };
 
-    f_remap_ways.get();
-    f_remap_addrs.get();
-    f_remap_interps.get();
-    f_remap_admins.get();
-    f_remap_pois.get();
-    f_remap_places.get();
+    if (consume) {
+        // One kind at a time, each freed as soon as copied, the ones the
+        // continent keeps most of last: the planet shrinks before the big
+        // copies grow.
+        copy_interps();
+        copy_admins();
+        copy_places();
+        copy_ways();
+        copy_pois();
+        copy_addrs();
+    } else {
+        std::future<void> copies[] = {
+            std::async(std::launch::async, copy_ways), std::async(std::launch::async, copy_addrs),
+            std::async(std::launch::async, copy_interps), std::async(std::launch::async, copy_admins),
+            std::async(std::launch::async, copy_pois), std::async(std::launch::async, copy_places)};
+        for (auto& f : copies) f.get();
+    }
     log_phase(("      " + std::string(bbox.name) + " filter: data remap (masked)").c_str(), _ft, _fc);
 
     // --- Project parent chains through admin_remap ---
@@ -344,6 +381,8 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         for (const Postcode* p : inside) out.postcode_accum.emplace(p->first, p->second);
     }
 
+    drop(full.way_parent_ids, full.admin_parent_ids, full.way_postcode_ids, full.interp_postcode_ids,
+         full.addr_postcode_ids, full.postcode_accum);
     log_phase(("      " + std::string(bbox.name) + " filter: parent + postcode projection").c_str(), _ft, _fc);
 
     // --- Remap sorted cell arrays for all 5 types (preserving INTERIOR_FLAG) ---
@@ -386,6 +425,8 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         auto f6 = std::async(std::launch::async, remap_admin_cells);
         f1.get(); f2.get(); f3.get(); f4.get(); f5.get(); f6.get();
     }
+    drop(full.sorted_way_cells, full.sorted_addr_cells, full.sorted_interp_cells, full.sorted_poi_cells,
+         full.sorted_place_cells, full.cell_to_admin);
     log_phase(("      " + std::string(bbox.name) + " filter: cell map remap (masked)").c_str(), _ft, _fc);
 
     // --- String pool compaction ---
@@ -460,6 +501,8 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         out.postcode_accum = std::move(remapped);
     }
 
+    drop(full.string_pool.mutable_data());
+    for (auto& tier : full.strings_tiers) drop(tier);
     log_phase(("      " + std::string(bbox.name) + " filter: string pool rebuild (masked)").c_str(), _ft, _fc);
 
     // Partition the continent's flat pool into the same 5 tier files

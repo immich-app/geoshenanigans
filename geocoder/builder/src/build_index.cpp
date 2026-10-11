@@ -2337,6 +2337,17 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             const uint64_t filter_bytes = filter_cost(planet_counts, continent_pairs[c], parallel_threads());
             pending.push_back({c, continent_cost(bytes, counts, filter_bytes, budget.capacity())});
         }
+        // A continent past the budget even with its steps one after another
+        // goes last, once nothing else reads the planet records: its split
+        // frees them kind by kind as it copies them, so the two never stand
+        // whole at once.
+        std::optional<ContinentRun> consumer;
+        auto costliest_run = std::max_element(pending.begin(), pending.end(),
+            [](const ContinentRun& a, const ContinentRun& b) { return a.cost.bytes < b.cost.bytes; });
+        if (costliest_run != pending.end() && costliest_run->cost.bytes > budget.capacity()) {
+            consumer = *costliest_run;
+            pending.erase(costliest_run);
+        }
         std::vector<uint64_t> costliest;
         for (const auto& run : pending) costliest.push_back(run.cost.bytes);
         std::sort(costliest.begin(), costliest.end(), std::greater<uint64_t>());
@@ -2344,6 +2355,26 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
         write_planet(std::accumulate(costliest.begin(), costliest.end(), uint64_t(0)));
         std::cerr << "Processing " << kContinentCount << " continents ("
                   << max_concurrent << " concurrent, largest first)..." << std::endl;
+
+        auto run_continent = [&](const ContinentRun& run, PlanetRecords records) {
+            const auto& continent = kContinents[run.continent];
+            auto _ct = std::chrono::steady_clock::now();
+            auto _cc = CpuTicks::now();
+            std::cerr << "Continent: " << continent.name << " (start, "
+                      << (run.cost.order == RunOrder::Serial ? "steps one at a time" : "steps at once")
+                      << (records == PlanetRecords::Consume ? ", last, freeing the planet records" : "")
+                      << ", ~" << (run.cost.bytes >> 20) << " MiB)..." << std::endl;
+            uint8_t cbit = 1u << run.continent;
+            const auto* poly = (run.continent < continent_polys.size() && !continent_polys[run.continent].vertices.empty())
+                ? &continent_polys[run.continent].vertices : nullptr;
+            auto subset = filter_by_bbox_masked(data, continent, cbit,
+                way_continent_masks, addr_continent_masks, interp_continent_masks,
+                poi_continent_masks, place_continent_masks, poly, records);
+            done_reading();
+            log_phase(("  " + std::string(continent.name) + ": filter").c_str(), _ct, _cc);
+            write_region(subset, output_dir + "/" + continent.name, RegionRun::Continent, run.cost.order, nullptr);
+            log_phase(("  " + std::string(continent.name) + ": total").c_str(), _ct, _cc);
+        };
 
         std::atomic<unsigned> active{0};
         std::mutex cv_mutex;
@@ -2378,22 +2409,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                     }
                 } done{active, cv_mutex, cv};
                 BudgetLease lease(budget, run.cost.bytes, std::adopt_lock);
-                const auto& continent = kContinents[run.continent];
-                auto _ct = std::chrono::steady_clock::now();
-                auto _cc = CpuTicks::now();
-                std::cerr << "Continent: " << continent.name << " (start, "
-                          << (run.cost.order == RunOrder::Serial ? "steps one at a time" : "steps at once")
-                          << ", ~" << (run.cost.bytes >> 20) << " MiB)..." << std::endl;
-                uint8_t cbit = 1u << run.continent;
-                const auto* poly = (run.continent < continent_polys.size() && !continent_polys[run.continent].vertices.empty())
-                    ? &continent_polys[run.continent].vertices : nullptr;
-                auto subset = filter_by_bbox_masked(data, continent, cbit,
-                    way_continent_masks, addr_continent_masks, interp_continent_masks,
-                    poi_continent_masks, place_continent_masks, poly);
-                done_reading();
-                log_phase(("  " + std::string(continent.name) + ": filter").c_str(), _ct, _cc);
-                write_region(subset, output_dir + "/" + continent.name, RegionRun::Continent, run.cost.order, nullptr);
-                log_phase(("  " + std::string(continent.name) + ": total").c_str(), _ct, _cc);
+                run_continent(run, PlanetRecords::Keep);
             }); };
             try {
                 futures.push_back(launch());
@@ -2406,6 +2422,14 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             }
         }
         for (auto& f : futures) f.get();
+        if (consumer) {
+            planet_future.wait();
+#ifdef __GLIBC__
+            // What the other regions freed sits in the malloc arenas.
+            timed_phase("    malloc trim", [] { malloc_trim(0); });
+#endif
+            run_continent(*consumer, PlanetRecords::Consume);
+        }
     }
 
     // Wait for planet write if not already done
