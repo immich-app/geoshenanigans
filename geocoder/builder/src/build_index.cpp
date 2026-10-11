@@ -725,6 +725,20 @@ struct NearbyStreets {
     LazyAscending<StreetKey> order;
 };
 
+// Every street's box, for gather_nearby_named_streets: computed once here,
+// not once for each street cell around the street.
+static std::vector<StreetBox> street_boxes_of(const ParsedData& data, unsigned int threads) {
+    std::vector<StreetBox> boxes(data.ways.size());
+    parallel_for(boxes.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t i = b; i < e; i++) {
+            const auto& w = data.ways[i];
+            if (static_cast<size_t>(w.node_offset) + w.node_count <= data.street_nodes.size())
+                boxes[i] = street_box(data.street_nodes.data() + w.node_offset, w.node_count);
+        }
+    }, threads);
+    return boxes;
+}
+
 static uint64_t street_cell_of(float lat, float lng) {
     return S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(kStreetCellLevel).id();
 }
@@ -732,8 +746,8 @@ static uint64_t street_cell_of(float lat, float lng) {
 // Fills nearby.ways with the named streets listed around `center`, each once,
 // in the order the sweep has always met them: cells by id, each cell's ways
 // by index.
-static void gather_nearby_named_streets(const ParsedData& data, S2CellId center,
-                NearbyStreets& nearby) {
+static void gather_nearby_named_streets(const ParsedData& data, const std::vector<StreetBox>& street_boxes,
+                S2CellId center, NearbyStreets& nearby) {
     // Walk the centre plus a 5x5 ring of neighbours at kStreetCellLevel
     // (~300m per cell) = ~1.5km coverage: enough to find the nearest named
     // street, tight enough to avoid quadratic blow-up.
@@ -802,10 +816,7 @@ static void gather_nearby_named_streets(const ParsedData& data, S2CellId center,
     }
     keep_first_occurrences(ways, nearby.seen);
     nearby.boxes.clear();
-    for (uint32_t way_id : ways) {
-        const auto& w = data.ways[way_id];
-        nearby.boxes.push_back(street_box(&data.street_nodes[w.node_offset], w.node_count));
-    }
+    for (uint32_t way_id : ways) nearby.boxes.push_back(street_boxes[way_id]);
 }
 
 // visit(way_id, way, d2, osm_id) for nearby.ways, gathered around the street
@@ -839,6 +850,7 @@ static void for_each_nearby_named_street(const ParsedData& data, NearbyStreets& 
 // Address-point parent-street backfill: link addr_points lacking addr:street to the
 // nearest named street's name_id (Nominatim parent_place_id parity).
 static void backfill_addr_point_parent_streets(ParsedData& data, const BuildConfig& cfg,
+                const std::vector<StreetBox>& street_boxes,
                 std::chrono::steady_clock::time_point& _s2t, CpuTicks& _s2cpu) {
     unsigned int num_threads = cfg.num_threads;
     if (!data.addr_points.empty() && !data.ways.empty()) {
@@ -855,7 +867,7 @@ static void backfill_addr_point_parent_streets(ParsedData& data, const BuildConf
             return street_cell_of(data.addr_points[i].lat, data.addr_points[i].lng);
         });
         walk_items_by_cell<NearbyStreets>(order, num_threads,
-            [&](S2CellId cell, NearbyStreets& nearby) { gather_nearby_named_streets(data, cell, nearby); },
+            [&](S2CellId cell, NearbyStreets& nearby) { gather_nearby_named_streets(data, street_boxes, cell, nearby); },
             [&](uint32_t i, NearbyStreets& nearby) {
                 auto& ap = data.addr_points[i];
                 ap.parent_way_id = NO_DATA;
@@ -1335,7 +1347,7 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
 // (server populates `road` when the POI wins; Nominatim parent_place_id parity).
 // `order` holds the POIs by street cell (items_by_cell).
 static void compute_poi_parent_streets(ParsedData& data, const BuildConfig& cfg,
-                const std::vector<CellItemPair>& order,
+                const std::vector<CellItemPair>& order, const std::vector<StreetBox>& street_boxes,
                 std::chrono::steady_clock::time_point& _s2t, CpuTicks& _s2cpu) {
     unsigned int num_threads = cfg.num_threads;
     if (!data.poi_records.empty() && !data.ways.empty()) {
@@ -1344,7 +1356,7 @@ static void compute_poi_parent_streets(ParsedData& data, const BuildConfig& cfg,
                   << data.poi_records.size() << " POIs)..." << std::endl;
 
         walk_items_by_cell<NearbyStreets>(order, num_threads,
-            [&](S2CellId cell, NearbyStreets& nearby) { gather_nearby_named_streets(data, cell, nearby); },
+            [&](S2CellId cell, NearbyStreets& nearby) { gather_nearby_named_streets(data, street_boxes, cell, nearby); },
             [&](uint32_t i, NearbyStreets& nearby) {
                 auto& pr = data.poi_records[i];
                 pr.parent_street_id = 0xFFFFFFFFu;
@@ -1606,11 +1618,14 @@ static void compute_s2_and_poi_cells(ParsedData& data, const BuildConfig& cfg,
                 return street_cell_of(data.poi_records[i].lat, data.poi_records[i].lng);
             });
 
-        compute_poi_parent_streets(data, cfg, poi_order, _s2t, _s2cpu);
+        std::vector<StreetBox> street_boxes = street_boxes_of(data, num_threads);
+
+        compute_poi_parent_streets(data, cfg, poi_order, street_boxes, _s2t, _s2cpu);
 
         compute_poi_parent_polygons(data, cfg, std::move(poi_order), _s2t, _s2cpu);
 
-        backfill_addr_point_parent_streets(data, cfg, _s2t, _s2cpu);
+        backfill_addr_point_parent_streets(data, cfg, street_boxes, _s2t, _s2cpu);
+        std::vector<StreetBox>().swap(street_boxes);
 
         // Free deferred work items
         data.deferred_ways.clear();
