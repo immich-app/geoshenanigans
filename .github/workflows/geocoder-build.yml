@@ -42,6 +42,10 @@ env:
   KEEP_PATCH_DAYS: 14
   # memwatch/<run id>.log, the build's memory samples (debugging only).
   KEEP_MEMWATCH_DAYS: 14
+  # Free space a run needs in its work dir: ~400 GB at the peak (PBF 95,
+  # today's index 113 + 41 compressed, yesterday's 113 + sidecars 11) plus
+  # patch verification's copies.
+  MIN_WORK_DISK_GIB: 500
 
 permissions:
   contents: read
@@ -130,10 +134,17 @@ jobs:
           WORKDIR="$RUNNER_TEMP/geocoder"
           mkdir -p "$WORKDIR"
           echo "workdir=$WORKDIR" >> "$GITHUB_OUTPUT"
-          # Scratch on disk for every later step: /tmp on the runner is a RAM
-          # disk that counts against the job's memory limit.
+          # Every later step's scratch goes in the work dir, on the runner's
+          # scratch volume.
           mkdir -p "$WORKDIR/tmp"
           echo "TMPDIR=$WORKDIR/tmp" >> "$GITHUB_ENV"
+          # At its peak the run holds the planet PBF, today's and yesterday's
+          # indexes and the compressed output: fail now rather than hours in.
+          AVAIL_GIB=$(df --output=avail -B1G "$WORKDIR" | tail -1 | tr -d ' ')
+          if [ "$AVAIL_GIB" -lt "$MIN_WORK_DISK_GIB" ]; then
+            echo "::error::$AVAIL_GIB GiB free in the work dir; a planet run needs $MIN_WORK_DISK_GIB GiB"
+            exit 1
+          fi
           echo "cache_endpoint=http://${BUCKET_HOST}:${BUCKET_PORT}" >> "$GITHUB_OUTPUT"
           echo "cache_bucket=$BUCKET_NAME" >> "$GITHUB_OUTPUT"
 
