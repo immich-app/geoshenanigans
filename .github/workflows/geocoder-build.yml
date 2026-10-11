@@ -283,54 +283,10 @@ jobs:
             IDX_PID=$!
           fi
 
-          # ── Foreground: download PBF ──
-          download_pbf_from_cache() {
-            local SRC="$1" DEST="$2" LABEL="$3"
-            echo "[pbf] Downloading $LABEL from cache..."
-            START=$(date +%s)
-            if retry 3 $CACHE cp --concurrency 16 "$SRC" "$DEST"; then
-              SIZE=$(stat -c%s "$DEST")
-              ELAPSED=$(($(date +%s) - START))
-              echo "[pbf] Done: $((SIZE/1024/1024)) MiB in ${ELAPSED}s ($((SIZE/1024/1024/(ELAPSED+1))) MB/s)"
-              return 0
-            fi
-            echo "[pbf] Cache download failed after retries"
-            rm -f "$DEST"
-            return 1
-          }
-
-          if cache_exists "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" "planet-"; then
-            if download_pbf_from_cache \
-                "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" \
-                "$WORKDIR/planet.osm.pbf" "today's PBF ($TODAY)"; then
-              echo "pbf_source=today" >> "$GITHUB_OUTPUT"
-            else
-              echo "[pbf] Falling back to yesterday's PBF..."
-              # Fall through to next check
-              :
-            fi
-          fi
-
-          if [ ! -f "$WORKDIR/planet.osm.pbf" ] && \
-             cache_exists "s3://$CACHE_BUCKET/geocoder-cache/planet-${YESTERDAY}.osm.pbf" "planet-"; then
-            if download_pbf_from_cache \
-                "s3://$CACHE_BUCKET/geocoder-cache/planet-${YESTERDAY}.osm.pbf" \
-                "$WORKDIR/planet.osm.pbf" "yesterday's PBF ($YESTERDAY)"; then
-              echo "pbf_source=yesterday" >> "$GITHUB_OUTPUT"
-            fi
-          fi
-
-          if [ ! -f "$WORKDIR/planet.osm.pbf" ]; then
-            echo "[pbf] No cached PBF available — downloading from mirrors..."
-            aria2c -x 16 -s 16 -j 16 --max-tries=3 \
-              -d "$WORKDIR" -o planet.osm.pbf \
-              "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
-              || true
-            SIZE=$(stat -c%s "$WORKDIR/planet.osm.pbf")
-            echo "[pbf] Done: $((SIZE/1024/1024)) MiB"
-            echo "pbf_source=mirror" >> "$GITHUB_OUTPUT"
-          fi
-
+          # ── Background: wikidata sitelinks, GeoNames postcodes, TIGER ──
+          # Small and independent of the PBF, so they come down beside it
+          # (~2 min one after another, against ~3 for the PBF).
+          (
           # Download wikidata sitelinks (if available). curl gets explicit
           # timeouts so a stalled connection can't hang the workflow.
           # --connect-timeout caps DNS+TCP handshake, --max-time caps the
@@ -424,12 +380,63 @@ jobs:
             echo "::error::[tiger] No TIGER data available at $S3_PUBLIC_URL/geocoder/tiger/latest.json — refusing to build a US-less planet index"
             exit 1
           fi
+          ) &
+          EXTRAS_PID=$!
 
-          # Wait for the sidecars
+          # ── Foreground: download PBF ──
+          download_pbf_from_cache() {
+            local SRC="$1" DEST="$2" LABEL="$3"
+            echo "[pbf] Downloading $LABEL from cache..."
+            START=$(date +%s)
+            if retry 3 $CACHE cp --concurrency 16 "$SRC" "$DEST"; then
+              SIZE=$(stat -c%s "$DEST")
+              ELAPSED=$(($(date +%s) - START))
+              echo "[pbf] Done: $((SIZE/1024/1024)) MiB in ${ELAPSED}s ($((SIZE/1024/1024/(ELAPSED+1))) MB/s)"
+              return 0
+            fi
+            echo "[pbf] Cache download failed after retries"
+            rm -f "$DEST"
+            return 1
+          }
+
+          if cache_exists "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" "planet-"; then
+            if download_pbf_from_cache \
+                "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" \
+                "$WORKDIR/planet.osm.pbf" "today's PBF ($TODAY)"; then
+              echo "pbf_source=today" >> "$GITHUB_OUTPUT"
+            else
+              echo "[pbf] Falling back to yesterday's PBF..."
+              # Fall through to next check
+              :
+            fi
+          fi
+
+          if [ ! -f "$WORKDIR/planet.osm.pbf" ] && \
+             cache_exists "s3://$CACHE_BUCKET/geocoder-cache/planet-${YESTERDAY}.osm.pbf" "planet-"; then
+            if download_pbf_from_cache \
+                "s3://$CACHE_BUCKET/geocoder-cache/planet-${YESTERDAY}.osm.pbf" \
+                "$WORKDIR/planet.osm.pbf" "yesterday's PBF ($YESTERDAY)"; then
+              echo "pbf_source=yesterday" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+          if [ ! -f "$WORKDIR/planet.osm.pbf" ]; then
+            echo "[pbf] No cached PBF available — downloading from mirrors..."
+            aria2c -x 16 -s 16 -j 16 --max-tries=3 \
+              -d "$WORKDIR" -o planet.osm.pbf \
+              "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
+              || true
+            SIZE=$(stat -c%s "$WORKDIR/planet.osm.pbf")
+            echo "[pbf] Done: $((SIZE/1024/1024)) MiB"
+            echo "pbf_source=mirror" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Wait for the sidecars and the small downloads (TIGER fails the step)
           if [ "$HAS_PREVIOUS" = "true" ]; then
             echo "Waiting for the sidecar download..."
             wait $IDX_PID
           fi
+          wait $EXTRAS_PID
           echo "All downloads complete in $(($(date +%s) - STEP_START))s"
 
       - name: Run builder tests
