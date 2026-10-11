@@ -107,6 +107,22 @@ It gallop_lower_bound(It first, It last, const T& value, Comp comp) {
     return std::lower_bound(first + lo, first + std::min(hi, n), value, comp);
 }
 
+// std::lower_bound(first, last, value, comp), found by galloping out from
+// hint (in [first, last]) toward value, either way: a lookup landing near an
+// earlier one costs a few nearby probes.
+template <class It, class T, class Comp>
+It lower_bound_near(It first, It last, It hint, const T& value, Comp comp) {
+    if (hint != last && comp(*hint, value)) return gallop_lower_bound(hint + 1, last, value, comp);
+    auto n = hint - first;
+    decltype(n) lo = 0, hi = 0, step = 1;  // distances back from hint
+    while (hi < n && !comp(hint[-(hi + 1)], value)) {
+        lo = hi + 1;
+        hi += step;
+        step *= 2;
+    }
+    return std::lower_bound(hint - std::min(hi + 1, n), hint - lo, value, comp);
+}
+
 // The smallest distance-squared from (plat, plng) to the polyline's segments,
 // in local-flat approximation (good enough for nearest-street ranking):
 // longitudes scale by cos_lat, the cosine of plat.

@@ -354,6 +354,21 @@ TEST(gallop_lower_bound_matches_lower_bound) {
     }
 }
 
+TEST(lower_bound_near_matches_lower_bound_from_any_hint) {
+    std::mt19937_64 rng(43);
+    for (int round = 0; round < 2000; round++) {
+        std::vector<uint32_t> v(rng() % 300);
+        for (auto& x : v) x = static_cast<uint32_t>(rng() % 50);
+        std::sort(v.begin(), v.end());
+        size_t hint = v.empty() ? 0 : rng() % (v.size() + 1);
+        for (uint32_t value = 0; value <= 51; value++) {
+            auto expect = std::lower_bound(v.begin(), v.end(), value);
+            auto got = lower_bound_near(v.begin(), v.end(), v.begin() + hint, value, std::less<uint32_t>());
+            CHECK(got == expect);
+        }
+    }
+}
+
 TEST(street_d2_is_zero_on_the_street_and_grows_off_it) {
     const std::vector<NodeCoord> street = {{0, 0}, {0, 1}, {1, 1}};
     const double cos_lat = std::cos(0.5 * M_PI / 180.0);

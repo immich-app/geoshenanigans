@@ -716,6 +716,9 @@ struct NearbyStreets {
     struct CellAt { uint64_t ij = ~uint64_t(0), cell = 0; };
     std::array<CellAt, 64> cell_at;
     TokenMatcher street_tokens;  // a point's addr:street, for the backfill
+    // Where the last cell's lookups began in sorted_way_cells: the next
+    // cell of the walk looks nearby.
+    size_t lookup_hint = 0;
 };
 
 // Every street's box, for gather_nearby_named_streets: computed once here,
@@ -789,15 +792,20 @@ static void gather_nearby_named_streets(const ParsedData& data, const std::vecto
 
     auto& ways = nearby.ways;
     ways.clear();
+    const auto first = data.sorted_way_cells.begin();
     const auto last = data.sorted_way_cells.end();
-    auto from = data.sorted_way_cells.begin();
+    auto from = first;
     for (size_t k = 0; k < cells_to_check.size(); k++) {
         uint64_t cid = cells_to_check[k];
         CellItemPair probe{cid, 0};
         // The cells ascend, so each run starts past the previous one: gallop
-        // from there instead of searching the whole table again.
-        auto p = k == 0 ? std::lower_bound(from, last, probe, cell_item_less)
-                        : gallop_lower_bound(from, last, probe, cell_item_less);
+        // from there instead of searching the whole table again, and for
+        // the first, from where the last cell's began.
+        auto p = k == 0
+            ? lower_bound_near(first, last, first + std::min(nearby.lookup_hint, data.sorted_way_cells.size()),
+                               probe, cell_item_less)
+            : gallop_lower_bound(from, last, probe, cell_item_less);
+        if (k == 0) nearby.lookup_hint = static_cast<size_t>(p - first);
         for (; p != last && p->cell_id == cid; ++p) {
             uint32_t way_id = p->item_id;
             if (way_id >= data.ways.size()) continue;
