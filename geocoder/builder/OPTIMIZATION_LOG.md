@@ -62,7 +62,12 @@ without the diff apply); it is now bound by the network and the disk. Round 3
 on the runner: the planet's compute phases took 165 s instead of 270 s, but
 its write phase is disk-bound, sharing the disk with the previous day's index
 as it decompresses (750 s, then 1062 s in a run whose fetch was slower too).
-The whole run took 1h 13m.
+The whole run took 1h 13m. Compressing each file while the build still
+wrote the rest, on the write phase's idle cores, did not pay off there. Four
+runs took 73.5 min compressing beside patch generation, 71.6 beside the
+build, 74.1 with its upload held back and 74.4 at the lowest priority. The
+compression's disk traffic slowed the build and the fetch of yesterday's
+index, or, deprioritised, it trailed past patch generation.
 
 ## Earlier result: 54m → 12m 22s (77% faster)
 
