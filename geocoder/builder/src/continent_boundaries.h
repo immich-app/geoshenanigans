@@ -6,10 +6,12 @@
 // These are rough boundaries — accurate enough for geocoding data
 // separation but not for cartographic purposes.
 
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <utility>
 
+#include "ring_contains.h"
 #include "types.h"
 
 struct ContinentPolygon {
@@ -38,6 +40,29 @@ inline bool point_in_polygon(double lat, double lng,
         if (polygon_edge_crosses(poly[i], poly[j], lat, lng)) inside = !inside;
     return inside;
 }
+
+// point_in_polygon for many points against one polygon (its ray runs along
+// longitude, so the edges are bucketed by latitude): the continent split
+// tests every record and cell against its polygon.
+class PolygonIndex {
+public:
+    // A bucket per vertex: continent polygons are a hundred-odd long edges.
+    // poly must outlive the index.
+    explicit PolygonIndex(const std::vector<std::pair<double,double>>& poly)
+        : poly_(poly),
+          buckets_(static_cast<uint32_t>(poly.size()), static_cast<uint32_t>(poly.size()),
+                   [&poly](uint32_t k) { return poly[k].first; }) {}
+
+    bool contains(double lat, double lng) const {
+        return buckets_.odd_crossings(lat, [&](uint32_t i, uint32_t j) {
+            return polygon_edge_crosses(poly_[i], poly_[j], lat, lng);
+        });
+    }
+
+private:
+    const std::vector<std::pair<double,double>>& poly_;
+    RingEdgeBuckets buckets_;
+};
 
 // NodeCoord-based overload — used by the build_index place-node
 // containment pass against packed admin polygon vertices.

@@ -2232,6 +2232,9 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
         // test's rounding error, is outside the polygon: no ring test there.
         struct Box { double min_lat, max_lat, min_lng, max_lng; };
         std::vector<Box> boxes;
+        std::vector<std::optional<PolygonIndex>> indexes(continent_polys.size());
+        for (size_t ci = 0; ci < continent_polys.size(); ci++)
+            if (!continent_polys[ci].vertices.empty()) indexes[ci].emplace(continent_polys[ci].vertices);
         for (const auto& cp : continent_polys) {
             constexpr double kMargin = 1e-9;
             Box box{std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity(),
@@ -2247,7 +2250,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
 
         // For each sorted pair array, build a parallel array of continent bitmasks.
         // Since pairs are sorted by cell_id, consecutive entries share the same mask.
-        auto precompute_masks = [&continent_polys, &boxes](const std::vector<CellItemPair>& sorted) -> std::vector<uint8_t> {
+        auto precompute_masks = [&continent_polys, &boxes, &indexes](const std::vector<CellItemPair>& sorted) -> std::vector<uint8_t> {
             if (sorted.empty()) return {};
             std::vector<uint8_t> masks(sorted.size(), 0);
             parallel_for_runs(sorted.size(), same_cell(sorted), [&](size_t begin, size_t end, unsigned) {
@@ -2262,7 +2265,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                     for (size_t ci = 0; ci < continent_polys.size() && ci < 8; ci++) {
                         const Box& box = boxes[ci];
                         if (lat < box.min_lat || lat > box.max_lat || lng < box.min_lng || lng > box.max_lng) continue;
-                        if (point_in_polygon(lat, lng, continent_polys[ci].vertices))
+                        if (indexes[ci] && indexes[ci]->contains(lat, lng))
                             mask |= (1u << ci);
                     }
                     while (i < end && sorted[i].cell_id == cell_id) {

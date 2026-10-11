@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstring>
 #include <future>
+#include <optional>
 #include <stdexcept>
 
 #include <s2/s2cell_id.h>
@@ -46,12 +47,11 @@ static bool cell_in_bbox(uint64_t cell_id, const ContinentBBox& bbox) {
 // record classes), hand-written bbox fallback otherwise. The bbox-only test
 // dropped admin data for zones the bboxes miss but the Geofabrik polygons
 // cover (Guam, Adak, the Azores, island territories).
-static bool cell_in_continent(uint64_t cell_id, const ContinentBBox& bbox,
-                              const std::vector<std::pair<double,double>>* polygon) {
+static bool cell_in_continent(uint64_t cell_id, const ContinentBBox& bbox, const PolygonIndex* polygon) {
     if (!polygon) return cell_in_bbox(cell_id, bbox);
     S2CellId cell(cell_id);
     S2LatLng center = cell.ToLatLng();
-    return point_in_polygon(center.lat().degrees(), center.lng().degrees(), *polygon);
+    return polygon->contains(center.lat().degrees(), center.lng().degrees());
 }
 
 ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bbox,
@@ -61,11 +61,14 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     const std::vector<uint8_t>& interp_masks,
     const std::vector<uint8_t>& poi_masks,
     const std::vector<uint8_t>& place_masks,
-    const std::vector<std::pair<double,double>>* polygon) {
+    const std::vector<std::pair<double,double>>* boundary) {
 
     ParsedData out;
     auto _ft = std::chrono::steady_clock::now();
     auto _fc = CpuTicks::now();
+    std::optional<PolygonIndex> boundary_index;
+    if (boundary) boundary_index.emplace(*boundary);
+    const PolygonIndex* polygon = boundary ? &*boundary_index : nullptr;
 
     // Ids of the records with a cell pair in the continent, ascending.
     // INTERIOR_FLAG is stripped so flagged items (e.g. POIs) are captured —
@@ -146,7 +149,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
                 if (!polygon || w.node_count == 0) return true;
                 for (uint16_t n = 0; n < w.node_count; n++) {
                     const auto& nd = full.street_nodes[w.node_offset + n];
-                    if (point_in_polygon(nd.lat, nd.lng, *polygon)) return true;
+                    if (polygon->contains(nd.lat, nd.lng)) return true;
                 }
                 return false;
             },
@@ -166,7 +169,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         addr_remap = copy_subset(used_addr_ids, full.addr_points, full.addr_vertices,
             [&](uint32_t id) {
                 const auto& a = full.addr_points[id];
-                return !polygon || point_in_polygon(a.lat, a.lng, *polygon);
+                return !polygon || polygon->contains(a.lat, a.lng);
             },
             [&](uint32_t id) {
                 const auto& a = full.addr_points[id];
@@ -211,7 +214,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         poi_remap = copy_subset(used_poi_ids, full.poi_records, full.poi_vertices,
             [&](uint32_t id) {
                 const auto& p = full.poi_records[id];
-                return !polygon || point_in_polygon(p.lat, p.lng, *polygon);
+                return !polygon || polygon->contains(p.lat, p.lng);
             },
             [&](uint32_t id) {
                 const auto& p = full.poi_records[id];
@@ -231,7 +234,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         place_remap = copy_subset(used_place_ids, full.place_nodes, no_coords,
             [&](uint32_t id) {
                 const auto& pn = full.place_nodes[id];
-                return !polygon || point_in_polygon(pn.lat, pn.lng, *polygon);
+                return !polygon || polygon->contains(pn.lat, pn.lng);
             },
             [](uint32_t) { return CoordRun{0, 0}; },
             [](PlaceNode&, uint32_t, uint32_t) {},
@@ -331,7 +334,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
                     if (acc.count == 0) continue;
                     double alat = acc.lat(), alng = acc.lng();
                     bool in = polygon
-                        ? point_in_polygon(alat, alng, *polygon)
+                        ? polygon->contains(alat, alng)
                         : (alat >= bbox.min_lat && alat <= bbox.max_lat &&
                            alng >= bbox.min_lng && alng <= bbox.max_lng);
                     if (in) found.push_back(&*it);

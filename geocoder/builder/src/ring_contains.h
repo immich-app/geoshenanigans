@@ -32,11 +32,11 @@ inline bool ring_contains(const NodeCoord* verts, uint32_t cnt, float plat, floa
 // crossings is the same in any order: the answer is the full scan's.
 class RingEdgeBuckets {
 public:
-    // axis(k): vertex k's coordinate on the bucket axis, k in [0, cnt), cnt
-    // at least 1; at most `buckets` buckets.
+    // axis(k): vertex k's coordinate on the bucket axis, k in [0, cnt); at
+    // most `buckets` buckets.
     template <class Axis>
     RingEdgeBuckets(uint32_t cnt, uint32_t buckets, Axis axis) : cnt_(cnt) {
-        double lo = axis(0), hi = lo;
+        double lo = cnt ? static_cast<double>(axis(0)) : 0, hi = lo;
         for (uint32_t k = 1; k < cnt; k++) {
             lo = std::min(lo, static_cast<double>(axis(k)));
             hi = std::max(hi, static_cast<double>(axis(k)));

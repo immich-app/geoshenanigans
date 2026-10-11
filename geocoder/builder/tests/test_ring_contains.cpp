@@ -1,5 +1,7 @@
-// RingEdgeIndex (ring_contains.h) answers point-in-ring tests from a subset
-// of the edges; it must give ring_contains's answer for every point.
+// RingEdgeIndex (ring_contains.h) and PolygonIndex (continent_boundaries.h)
+// answer point-in-ring tests from a subset of the edges; they must give the
+// full scan's answer for every point.
+#include "continent_boundaries.h"
 #include "ring_contains.h"
 
 #include <cmath>
@@ -43,6 +45,45 @@ TEST(ring_edge_index_matches_the_full_scan) {
         CHECK_EQ(index.contains(lat, nan), ring_contains(ring.data(), n, lat, nan));
     }
     CHECK(inside > 1000 && outside > 1000);
+}
+
+TEST(polygon_index_matches_point_in_polygon) {
+    std::mt19937 rng(9);
+    std::uniform_real_distribution<double> step(-3.0, 3.0);
+    size_t inside = 0, outside = 0;
+    for (int round = 0; round < 60; round++) {
+        uint32_t n = 3 + rng() % 150;
+        std::vector<std::pair<double, double>> poly(n);
+        double lat = 10, lng = 20;
+        for (auto& v : poly) {
+            lat += step(rng);
+            lng += step(rng);
+            v = {lat, lng};
+        }
+        // Closed like the continent polygons: the last vertex repeats the first.
+        if (round % 2) poly.push_back(poly.front());
+        PolygonIndex index(poly);
+        double lat_lo = poly[0].first, lat_hi = lat_lo, lng_lo = poly[0].second, lng_hi = lng_lo;
+        for (const auto& v : poly) {
+            lat_lo = std::min(lat_lo, v.first); lat_hi = std::max(lat_hi, v.first);
+            lng_lo = std::min(lng_lo, v.second); lng_hi = std::max(lng_hi, v.second);
+        }
+        std::uniform_real_distribution<double> plat(lat_lo - 1, lat_hi + 1), plng(lng_lo - 1, lng_hi + 1);
+        for (int q = 0; q < 3000; q++) {
+            double qlat = plat(rng), qlng = plng(rng);
+            if (q % 7 == 0) qlat = poly[rng() % poly.size()].first;  // on a vertex's latitude
+            if (q % 11 == 0) qlng = poly[rng() % poly.size()].second;
+            bool want = point_in_polygon(qlat, qlng, poly);
+            CHECK_EQ(index.contains(qlat, qlng), want);
+            (want ? inside : outside)++;
+        }
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        CHECK_EQ(index.contains(nan, lng), point_in_polygon(nan, lng, poly));
+        CHECK_EQ(index.contains(lat, nan), point_in_polygon(lat, nan, poly));
+    }
+    CHECK(inside > 1000 && outside > 1000);
+    const std::vector<std::pair<double, double>> none;
+    CHECK_EQ(PolygonIndex(none).contains(1, 2), point_in_polygon(1, 2, none));
 }
 
 TEST(ring_edge_index_handles_a_ring_of_one_longitude) {
