@@ -148,6 +148,44 @@ class CompressIndexTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.out, "gone.bin.zst")))
 
 
+class UploaderTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.log = os.path.join(self.tmp.name, "upload.log")
+        self.gate = os.path.join(self.tmp.name, "gate")
+        recorder = f"{sys.executable} -c \"import sys; open({self.log!r}, 'a').write(sys.stdin.read())\""
+        self.sut = sut.Uploader(self.tmp.name, "s3://bucket/day", recorder, self.gate)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def sent(self):
+        with open(self.log) as f:
+            return f.read().splitlines()
+
+    def test_holds_the_stream_until_its_gate_file_exists(self):
+        self.sut.send(os.path.join(self.tmp.name, "a.zst"))
+        self.assertEqual(len(self.sut.held), 1)
+
+        open(self.gate, "w").close()
+        self.sut.release()
+        self.assertEqual(self.sut.held, [])
+        self.sut.send(os.path.join(self.tmp.name, "b.zst"))
+        self.assertEqual(self.sut.held, [])
+        self.sut.finish()
+
+        self.assertEqual(self.sent(), ["cp " + os.path.join(self.tmp.name, "a.zst") + " s3://bucket/day/a.zst",
+                                       "cp " + os.path.join(self.tmp.name, "b.zst") + " s3://bucket/day/b.zst"])
+
+    def test_sends_anyway_when_the_gate_stays_shut_past_the_wait(self):
+        self.sut.send(os.path.join(self.tmp.name, "a.zst"))
+
+        with mock.patch.object(sut, "UPLOAD_GATE_SECONDS", 0.2):
+            self.sut.finish()
+
+        self.assertEqual(self.sent(), ["cp " + os.path.join(self.tmp.name, "a.zst") + " s3://bucket/day/a.zst"])
+
+
 class HeldByTest(unittest.TestCase):
     def test_lists_open_files_and_ends_when_the_process_does(self):
         with tempfile.NamedTemporaryFile() as f:

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Compresses a build's index files for publishing.
 
-Usage: compress_index.py <output dir> [--while-pid PID] [--upload DEST --upload-cmd CMD]
+Usage: compress_index.py <output dir> [--while-pid PID]
+                         [--upload DEST --upload-cmd CMD [--upload-after FILE]]
 
 Writes <file>.zst next to every .bin file and load sidecar under the output
 dir (files with identical content share one .zst through hard links, made in
@@ -23,7 +24,10 @@ one long-running CMD (an `s5cmd ... run` reading cp commands on stdin): the
 upload is network-bound and compression CPU-bound, so they overlap instead of
 the upload waiting for the last file. A .zst compressed again after its
 upload goes up once more when the stream is done. Upload failures only warn;
-the caller re-uploads whatever is missing.
+the caller re-uploads whatever is missing. --upload-after holds the stream
+until FILE exists (or an hour has passed once compression is done): the
+nightly's download of the previous day's index, which patch generation
+waits for, has the runner's link to itself until then.
 
 zstd level 18 compresses our structured binary data to within 0.3% of
 level 19 (itself within ~2% of --ultra -22) at 21% less CPU; level 17 and
@@ -55,6 +59,9 @@ MAX_THREADS_PER_FILE = 16
 SCAN_SECONDS = 10
 # Final passes before giving up on files that keep changing.
 MAX_SETTLE_PASSES = 3
+# How long a finished compression waits for --upload-after's file before
+# uploading anyway (the patch step's own wait for the previous index).
+UPLOAD_GATE_SECONDS = 3600
 
 # JSON sidecars the server's Index::load reads alongside the .bin files. They
 # go into configurations.files like any index file so the region downloader
@@ -137,11 +144,13 @@ def held_by(pid):
 
 
 class Uploader:
-    """Feeds `cp <file> <dest>/<path>` lines to a running `s5cmd run`."""
+    """Feeds `cp <file> <dest>/<path>` lines to a running `s5cmd run`, held
+    back until the file `after` exists, if one is given."""
 
-    def __init__(self, out, dest, cmd):
-        self.out, self.dest = out, dest.rstrip("/")
+    def __init__(self, out, dest, cmd, after=""):
+        self.out, self.dest, self.after = out, dest.rstrip("/"), after
         self.proc = subprocess.Popen(shlex.split(cmd), stdin=subprocess.PIPE, text=True) if dest else None
+        self.held = []
 
     def send(self, path):
         self.command(f"cp {path} {self.dest}/{os.path.relpath(path, self.out)}")
@@ -151,12 +160,27 @@ class Uploader:
 
     def command(self, line):
         if self.proc:
-            self.proc.stdin.write(line + "\n")
-            self.proc.stdin.flush()
+            self.held.append(line)
+            self.release()
+
+    def gate_open(self):
+        return not self.after or os.path.exists(self.after)
+
+    def release(self, force=False):
+        """Sends the held commands once the gate is open."""
+        if not self.held or not (force or self.gate_open()):
+            return
+        self.proc.stdin.write("".join(line + "\n" for line in self.held))
+        self.proc.stdin.flush()
+        self.held = []
 
     def finish(self):
         if not self.proc:
             return
+        deadline = time.time() + UPLOAD_GATE_SECONDS
+        while not self.gate_open() and time.time() < deadline:
+            time.sleep(1)
+        self.release(force=True)
         self.proc.stdin.close()
         if self.proc.wait() != 0:
             print("Warning: some streamed uploads failed; the caller re-uploads them", flush=True)
@@ -270,6 +294,7 @@ class Compressor:
             previous = scan
             self.start(ready)
             self.collect(block=False, tolerate=True)
+            self.uploader.release()
             time.sleep(SCAN_SECONDS)
         self.collect(block=True, tolerate=True)
         print(f"{len(self.done)} files compressed while the builder ran", flush=True)
@@ -305,10 +330,11 @@ def main():
     args.add_argument("--while-pid", type=int, default=0)
     args.add_argument("--upload", default="")
     args.add_argument("--upload-cmd", default="s5cmd run")
+    args.add_argument("--upload-after", default="")
     opts = args.parse_args()
     out = opts.out
 
-    uploader = Uploader(out, opts.upload, opts.upload_cmd)
+    uploader = Uploader(out, opts.upload, opts.upload_cmd, opts.upload_after)
     compressor = Compressor(out, uploader)
     try:
         if opts.while_pid:
@@ -319,7 +345,7 @@ def main():
         uploader.finish()
     if compressor.resend:
         # After the first stream: two uploads of one key could land in any order.
-        again = Uploader(out, opts.upload, opts.upload_cmd)
+        again = Uploader(out, opts.upload, opts.upload_cmd, opts.upload_after)
         for path in sorted(compressor.resend):
             again.send(path + ".zst")
         again.finish()
