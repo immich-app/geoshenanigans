@@ -239,16 +239,6 @@ inline double seconds_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 
-inline std::string read_span(int fd, uint64_t offset, size_t n) {
-    std::string buf(n, '\0');
-    for (size_t done = 0; done < n;) {
-        ssize_t r = pread(fd, buf.data() + done, n - done, static_cast<off_t>(offset + done));
-        if (r <= 0) throw std::runtime_error("pread failed on the input PBF");
-        done += size_t(r);
-    }
-    return buf;
-}
-
 }  // namespace pbf_apply_detail
 
 // Scans the input's blobs and finds each one's first object, checking the
@@ -406,10 +396,11 @@ inline PbfHeader output_header(const PbfHeader& in, const ApplyOptions& opt) {
     return out;
 }
 
-// The bytes an output item writes. Counts the blobs it encodes in `encoded`.
+// The bytes an output item encodes, none for a copy (the writer reads
+// those). Counts the blobs it encodes in `encoded`.
 inline std::string produce_item(const OutputItem& it, int fd, const InputLayout& in, const Winners& winners,
                                 const ApplyOptions& opt, std::atomic<size_t>& encoded) {
-    if (it.kind == OutputItem::Copy) return pbf_apply_detail::read_span(fd, it.offset, it.size);
+    if (it.kind == OutputItem::Copy) return {};
     thread_local ObjectStore input;
     thread_local std::vector<ObjectRef> objs;
     objs.clear();
@@ -499,12 +490,16 @@ inline ApplyStats apply_changes(const ApplyOptions& opt) {
         PbfHeader header = decode_header_block(read_and_decompress_blob(input.get(), in.blobs[0]));
         std::string bytes;
         append_blob(bytes, "OSMHeader", encode_header_block(output_header(header, opt)));
-        output.append(bytes);
+        output.append(std::move(bytes));
     }
     std::atomic<size_t> encoded{0};
     parallel_ordered(items.size(), [&](size_t k) { return produce_item(items[k], input.get(), in, winners, opt, encoded); },
-                     [&](size_t, std::string bytes) { output.append(bytes); }, threads,
-                     kWritesAheadPerThread * threads);
+                     [&](size_t k, std::string bytes) {
+                         const OutputItem& it = items[k];
+                         if (it.kind == OutputItem::Copy) output.append_from(input.get(), it.offset, it.size, opt.input);
+                         else output.append(std::move(bytes));
+                     },
+                     threads, kWritesAheadPerThread * threads);
     stats.output_bytes = output.finish();
     stats.encoded_blobs = encoded.load();
     log("wrote " + std::to_string(stats.output_bytes >> 20) + " MiB (" + std::to_string(stats.encoded_blobs) +
