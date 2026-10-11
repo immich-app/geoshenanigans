@@ -18,6 +18,7 @@
 #include <cstring>
 #include <ctime>
 #include <exception>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -564,67 +565,75 @@ inline void settle_sections(ChangeChunk* const* chunks, size_t n, const std::str
 
 }  // namespace osc
 
-// Reads change files into chunks, in file order and within a file in
-// reading order. A gzip file is inflated as it is read (osmium's gzip
-// decompressor also uses gzread, which reads plain files unchanged).
-inline std::vector<std::unique_ptr<ChangeChunk>> read_change_files(const std::vector<std::string>& paths,
-                                                                   size_t chunk_bytes = kOscChunkBytes,
-                                                                   unsigned threads = 0) {
-    if (threads == 0) threads = parallel_threads();
+// Reads change file number `file` into chunks, in reading order. A gzip
+// file is inflated as it is read (osmium's gzip decompressor also uses
+// gzread, which reads plain files unchanged).
+inline std::vector<std::unique_ptr<ChangeChunk>> read_change_file(const std::string& path, size_t file,
+                                                                  size_t chunk_bytes, unsigned threads) {
+    if (path.size() > 4 && path.compare(path.size() - 4, 4, ".bz2") == 0)
+        throw std::runtime_error(path + ": bzip2 change files are not supported");
+    gzFile gz = gzopen(path.c_str(), "rb");
+    if (!gz) throw std::runtime_error("cannot open " + path);
+    struct Close {
+        gzFile gz;
+        ~Close() { gzclose(gz); }
+    } closer{gz};
+    gzbuffer(gz, 1 << 20);
     std::vector<std::unique_ptr<ChangeChunk>> chunks;
     std::vector<std::unique_ptr<osc::RunParser>> parsers(threads);
     struct Task {
         ChangeChunk* chunk;
         std::string xml;
     };
-    for (size_t f = 0; f < paths.size(); f++) {
-        const std::string& path = paths[f];
-        if (path.size() > 4 && path.compare(path.size() - 4, 4, ".bz2") == 0)
-            throw std::runtime_error(path + ": bzip2 change files are not supported");
-        gzFile gz = gzopen(path.c_str(), "rb");
-        if (!gz) throw std::runtime_error("cannot open " + path);
-        struct Close {
-            gzFile gz;
-            ~Close() { gzclose(gz); }
-        } closer{gz};
-        gzbuffer(gz, 1 << 20);
-        size_t first_chunk = chunks.size();
-        size_t file_offset = 0;
-        std::string pending;
-        bool eof = false;
-        auto next = [&]() -> std::optional<Task> {
-            while (!eof) {
-                size_t have = pending.size();
-                pending.resize(have + chunk_bytes);
-                int got = gzread(gz, pending.data() + have, static_cast<unsigned>(chunk_bytes));
-                if (got < 0) {
-                    int err = 0;
-                    throw std::runtime_error(path + ": " + gzerror(gz, &err));
-                }
-                pending.resize(have + size_t(got));
-                eof = got == 0;
-                size_t cut = eof ? pending.size() : osc::last_object_start(pending.data(), pending.size());
-                if (cut == 0) continue;  // one element longer than a chunk: read on
-                std::string rest = pending.substr(cut);
-                pending.resize(cut);
-                chunks.push_back(std::make_unique<ChangeChunk>());
-                chunks.back()->file = f;
-                chunks.back()->file_offset = file_offset;
-                file_offset += cut;
-                Task t{chunks.back().get(), std::move(pending)};
-                pending = std::move(rest);
-                if (!t.xml.empty()) return t;
-                chunks.pop_back();
+    size_t file_offset = 0;
+    std::string pending;
+    bool eof = false;
+    auto next = [&]() -> std::optional<Task> {
+        while (!eof) {
+            size_t have = pending.size();
+            pending.resize(have + chunk_bytes);
+            int got = gzread(gz, pending.data() + have, static_cast<unsigned>(chunk_bytes));
+            if (got < 0) {
+                int err = 0;
+                throw std::runtime_error(path + ": " + gzerror(gz, &err));
             }
-            return std::nullopt;
-        };
-        parallel_stream<Task>(next, [&](Task& t, unsigned worker) {
-            if (!parsers[worker]) parsers[worker] = std::make_unique<osc::RunParser>();
-            osc::parse_chunk(t.xml, *parsers[worker], *t.chunk);
-        }, threads);
-        std::vector<ChangeChunk*> mine;
-        for (size_t c = first_chunk; c < chunks.size(); c++) mine.push_back(chunks[c].get());
-        osc::settle_sections(mine.data(), mine.size(), path);
+            pending.resize(have + size_t(got));
+            eof = got == 0;
+            size_t cut = eof ? pending.size() : osc::last_object_start(pending.data(), pending.size());
+            if (cut == 0) continue;  // one element longer than a chunk: read on
+            std::string rest = pending.substr(cut);
+            pending.resize(cut);
+            chunks.push_back(std::make_unique<ChangeChunk>());
+            chunks.back()->file = file;
+            chunks.back()->file_offset = file_offset;
+            file_offset += cut;
+            Task t{chunks.back().get(), std::move(pending)};
+            pending = std::move(rest);
+            if (!t.xml.empty()) return t;
+            chunks.pop_back();
+        }
+        return std::nullopt;
+    };
+    parallel_stream<Task>(next, [&](Task& t, unsigned worker) {
+        if (!parsers[worker]) parsers[worker] = std::make_unique<osc::RunParser>();
+        osc::parse_chunk(t.xml, *parsers[worker], *t.chunk);
+    }, threads);
+    std::vector<ChangeChunk*> mine;
+    for (const auto& c : chunks) mine.push_back(c.get());
+    osc::settle_sections(mine.data(), mine.size(), path);
+    return chunks;
+}
+
+// Reads change files into chunks, in file order and within a file in
+// reading order.
+inline std::vector<std::unique_ptr<ChangeChunk>> read_change_files(const std::vector<std::string>& paths,
+                                                                   size_t chunk_bytes = kOscChunkBytes,
+                                                                   unsigned threads = 0) {
+    if (threads == 0) threads = parallel_threads();
+    std::vector<std::unique_ptr<ChangeChunk>> chunks;
+    for (size_t f = 0; f < paths.size(); f++) {
+        auto mine = read_change_file(paths[f], f, chunk_bytes, threads);
+        std::move(mine.begin(), mine.end(), std::back_inserter(chunks));
     }
     return chunks;
 }
