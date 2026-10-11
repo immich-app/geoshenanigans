@@ -4613,10 +4613,10 @@ static int run(int argc, char* argv[]) {
         // The parse threads' freed buffers sit in free chunks of their
         // malloc arenas, between live chunks, where free() never hands the
         // pages back; malloc_trim returns them to the OS for later phases.
-        long rss_before_trim = get_rss_mb();
-        malloc_trim(0);
-        std::cerr << "Trimmed malloc arenas: " << rss_before_trim << " -> "
-                  << get_rss_mb() << " MiB resident." << std::endl;
+        // It walks every arena on one core for seconds: that runs beside
+        // the admin sorting and linking below, which allocate little.
+        const long rss_before_trim = get_rss_mb();
+        auto arenas_trimmed = std::async(std::launch::async, [] { malloc_trim(0); });
 #endif
 
         // Memory breakdown — what's holding RSS now (before the strategy-2
@@ -4766,6 +4766,11 @@ static int run(int argc, char* argv[]) {
         compute_way_parent_polygons(data, cfg);
 
         std::future<void> tiger_freed = external_data.get();
+#ifdef __GLIBC__
+        arenas_trimmed.get();
+        std::cerr << "Trimmed malloc arenas: " << rss_before_trim << " -> "
+                  << get_rss_mb() << " MiB resident." << std::endl;
+#endif
         // The loaders above made the last intern; the lookup table would
         // otherwise ride through ordering and the write phase. Freeing its
         // planet's worth of nodes takes one core many seconds, so that runs
