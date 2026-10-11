@@ -1005,14 +1005,17 @@ static void emit_polyline_cells(const NodeCoord* nodes, uint16_t count, uint32_t
 // both fields, so the order is unique. sorted_out is used directly for
 // writing; the cell maps stay empty (only needed for cache/continent modes).
 // A sorted_out already holding as many pairs as the lists (made beside
-// earlier work) is filled as it is.
+// earlier work) is filled as it is; any other is made on every core.
 static void parallel_sort_and_build(
     std::vector<std::vector<CellItemPair>>& thread_pairs,
     std::vector<CellItemPair>& sorted_out
 ) {
     size_t total = 0;
     for (const auto& pairs : thread_pairs) total += pairs.size();
-    if (sorted_out.size() != total) sorted_out.assign(total, CellItemPair{});
+    if (sorted_out.size() != total) {
+        sorted_out.clear();
+        grow_by(sorted_out, total);
+    }
     parallel_for_each(thread_pairs.size(), [&](size_t t, unsigned) {
         std::sort(thread_pairs[t].begin(), thread_pairs[t].end(), cell_item_less);
     });
@@ -1506,12 +1509,14 @@ static void compute_s2_cells_ways_interp(ParsedData& data, const BuildConfig& cf
             emit_polyline_cells(data.street_nodes.data() + dw.node_offset, dw.node_count, dw.way_id, scratch, out);
         });
     log_phase("  S2: street ways (parallel)", _s2t, _s2cpu);
-    // The street table's pages take seconds to fault in on one core: that
-    // core takes them while the others cover the interps.
+    // The street table's pages take seconds to fault in, even on every
+    // core: that happens while the interps are covered.
     size_t way_pair_count = 0;
     for (const auto& pairs : way_pairs) way_pair_count += pairs.size();
     auto way_cells = std::async(std::launch::async, [way_pair_count] {
-        return std::vector<CellItemPair>(way_pair_count);
+        std::vector<CellItemPair> cells;
+        grow_by(cells, way_pair_count);
+        return cells;
     });
 
     // Process interpolations: emit (cell_id, interp_id) pairs
