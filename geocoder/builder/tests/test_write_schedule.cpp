@@ -71,9 +71,8 @@ TEST(ordering_cost_copies_the_records_but_not_their_cell_pairs) {
 TEST(filter_cost_holds_the_planet_maps_and_half_the_subset_pairs) {
     const KindValues planet_counts = kinds(80, 160, 0, 0, 0, 0);
     const KindValues pairs = kinds(10, 0, 0, 0, 0, 0);
-    // 240 records: 4 B id maps, 30 B of bitset on each of 16 / 4 workers.
-    CHECK_EQ(filter_cost(planet_counts, pairs, 16), uint64_t(240 * 4 + 30 * 4 + 10 * 16 / 2));
-    CHECK_EQ(filter_cost(planet_counts, pairs, 1), uint64_t(240 * 4 + 30 + 10 * 16 / 2));
+    // 240 records: 4 B id maps and 3 bits of marks, whatever the workers.
+    CHECK_EQ(filter_cost(planet_counts, pairs), uint64_t(240 * 4 + 240 * 3 / 8 + 10 * 16 / 2));
 }
 
 TEST(continent_cost_runs_steps_one_at_a_time_only_past_the_budget) {

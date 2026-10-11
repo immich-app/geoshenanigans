@@ -99,10 +99,11 @@ constexpr uint64_t kReserveFraction = 16;
 constexpr uint64_t kStrategy2BytesPerRecord = 56;
 
 // The continent split's planet-sized scratch: an id map per record (4 B)
-// and, while ids are collected, a bitset per record on each worker; beside
-// it, the workers' copies of a share of the subset's cell pairs.
+// and, while ids are collected, 3 bits per record (the bit every worker
+// marks, and its RankedBits blocks of 16 B per 64 records); beside it, the
+// workers' copies of a share of the subset's cell pairs.
 constexpr uint64_t kFilterMapBytesPerRecord = 4;
-constexpr unsigned kFilterBitsetWorkerDivisor = 4;
+constexpr uint64_t kFilterMarkBitsPerRecord = 3;
 constexpr uint64_t kFilterPairCopyDivisor = 2;
 
 // Per mode dir, write_index's slices in flight (geo index and packed addr
@@ -172,10 +173,9 @@ inline uint64_t ordering_cost(const ParsedData& d) {
 }
 
 // What the continent split holds beyond the subset it builds.
-inline uint64_t filter_cost(const KindValues& planet_counts, const KindValues& continent_pairs, unsigned threads) {
+inline uint64_t filter_cost(const KindValues& planet_counts, const KindValues& continent_pairs) {
     const uint64_t records = sum(planet_counts);
-    const uint64_t bitset_workers = std::max(1u, threads / kFilterBitsetWorkerDivisor);
-    return records * kFilterMapBytesPerRecord + records / 8 * bitset_workers
+    return records * kFilterMapBytesPerRecord + records * kFilterMarkBitsPerRecord / 8
          + sum(continent_pairs) * sizeof(CellItemPair) / kFilterPairCopyDivisor;
 }
 
