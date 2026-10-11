@@ -319,10 +319,12 @@ inline void reorder_addr_points(ParsedData& data, unsigned threads = 0, uint64_t
     std::cerr << "  Addr points sorted: " << n << std::endl;
 }
 
-// Sorts ways by (name, node_count, nodes) and reorders their nodes.
-// `headroom` as for reorder_addr_points.
-inline void reorder_ways(ParsedData& data, unsigned threads = 0, uint64_t headroom = UINT64_MAX) {
-    if (data.ways.empty()) return;
+// Sorts ways by (name, node_count, nodes) and reorders their nodes; returns
+// old_to_new, which the addr points' parent ways still need (see
+// remap_parent_ways), empty when there are no ways. `headroom` as for
+// reorder_addr_points.
+inline std::vector<uint32_t> sort_ways(ParsedData& data, unsigned threads = 0, uint64_t headroom = UINT64_MAX) {
+    if (data.ways.empty()) return {};
 
     const size_t n = data.ways.size();
     const auto& ways = data.ways;
@@ -452,7 +454,7 @@ inline void reorder_ways(ParsedData& data, unsigned threads = 0, uint64_t headro
     };
     remap_way_vec(data.way_parent_ids);
     remap_way_vec(data.way_postcode_ids);
-    const std::vector<uint32_t> old_to_new = renumber_runs(order, starts, threads);
+    std::vector<uint32_t> old_to_new = renumber_runs(order, starts, threads);
     order = {};
     starts = {};
     // The arrays these replace unmap beside the steps left.
@@ -462,14 +464,24 @@ inline void reorder_ways(ParsedData& data, unsigned threads = 0, uint64_t headro
     data.street_nodes = std::move(repacked.items);
     renumber_cell_pairs(data.sorted_way_cells, [&](uint32_t id) { return old_to_new[id]; }, threads);
     data.cell_to_ways.clear();
-    // Remap addr_point parent_way_id references through way old_to_new
+    std::cerr << "  Ways sorted: " << n << " (" << (n - kept) << " duplicates removed)" << std::endl;
+    return old_to_new;
+}
+
+// Remaps the addr points' parent_way_id through sort_ways's old_to_new.
+inline void remap_parent_ways(ParsedData& data, const std::vector<uint32_t>& old_to_new, unsigned threads = 0) {
+    const size_t n = old_to_new.size();
     parallel_for(data.addr_points.size(), [&](size_t b, size_t e, unsigned) {
         for (size_t i = b; i < e; i++) {
             auto& a = data.addr_points[i];
             if (a.parent_way_id != NO_DATA && a.parent_way_id < n) a.parent_way_id = old_to_new[a.parent_way_id];
         }
     }, threads);
-    std::cerr << "  Ways sorted: " << n << " (" << (n - kept) << " duplicates removed)" << std::endl;
+}
+
+// sort_ways, then the addr points' parent ways.
+inline void reorder_ways(ParsedData& data, unsigned threads = 0, uint64_t headroom = UINT64_MAX) {
+    remap_parent_ways(data, sort_ways(data, threads, headroom), threads);
 }
 
 // Sorts interps by (street, start, end, type, nodes) and reorders their nodes.
