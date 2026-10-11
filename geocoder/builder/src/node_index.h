@@ -63,7 +63,18 @@ public:
         }, threads);
         for (size_t b = 0; b < blocks; b++) block_rank_[b + 1] += block_rank_[b];
         marked_ = block_rank_[blocks];
-        if (marked_) locs_ = static_cast<PackedLocation*>(map_zeroed(marked_ * sizeof(PackedLocation)));
+        if (marked_) {
+            locs_ = static_cast<PackedLocation*>(map_zeroed(marked_ * sizeof(PackedLocation)));
+            // Faulted in here, on a few threads: set() runs on every core,
+            // and faulting there had every core reclaim page cache at once,
+            // queued on its locks for much of the node pass.
+            const size_t bytes = marked_ * sizeof(PackedLocation);
+            constexpr size_t kPage = 4096;
+            auto* p = reinterpret_cast<volatile unsigned char*>(locs_);
+            parallel_for((bytes + kPage - 1) / kPage, [&](size_t b, size_t e, unsigned) {
+                for (size_t k = b; k < e; k++) p[k * kPage] = 0;
+            }, kPrefaultThreads);
+        }
     }
 
     // Any thread, one writer per id: stores a marked node's location and
@@ -110,6 +121,7 @@ public:
 private:
     // One rank entry per 512 ids: a block's 8 words share a cache line.
     static constexpr size_t kWordsPerBlock = 8;
+    static constexpr unsigned kPrefaultThreads = 8;
 
     // Anonymous zero-filled mapping: a page costs memory once written.
     static void* map_zeroed(size_t bytes) {
