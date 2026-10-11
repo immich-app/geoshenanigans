@@ -3335,6 +3335,17 @@ static int run(int argc, char* argv[]) {
                           << total_nodes << " nodes." << std::endl;
                 log_phase("    Pass 2: node streaming", _st, _sc);
 
+                // The address point and POI arrays, GiBs on planet, grow
+                // while the strings merge: growing zero-fills on one core.
+                const auto addr_at = local_offsets(ntld, [](const auto& l) { return l.addr_coords.size(); });
+                const auto poi_at = local_offsets(ntld, [](const auto& l) { return l.poi_records.size(); });
+                auto addrs_grown = std::async(std::launch::async, [&] { return grow_addr_points(data, addr_at.back()); });
+                auto pois_grown = std::async(std::launch::async, [&] {
+                    const size_t n = poi_at.back();
+                    return std::array<size_t, 4>{grow_by(data.poi_records, n), grow_by(data.poi_osm_ids, n),
+                                                 grow_by(poi_elevations, n), grow_by(poi_qids, n)};
+                });
+
                 // Pool ids per thread, interned in the order the merges
                 // below meet each thread's strings: address points, POI
                 // nodes, then place nodes, thread by thread.
@@ -3360,8 +3371,7 @@ static int run(int argc, char* argv[]) {
                 log_phase("      Node merge: strings", _mt, _mc);
 
                 // Merge address points
-                const auto addr_at = local_offsets(ntld, [](const auto& l) { return l.addr_coords.size(); });
-                const size_t addr_base = grow_addr_points(data, addr_at.back());
+                const size_t addr_base = addrs_grown.get();
                 parallel_for_parts(addr_at, kMergeGrain, [&](size_t k, size_t begin, size_t end, size_t at) {
                     const auto& local = ntld[k];
                     const auto& ids = name_ids[k];
@@ -3378,11 +3388,11 @@ static int run(int argc, char* argv[]) {
                 log_phase("      Node merge: address points", _mt, _mc);
 
                 // Merge POI node records
-                const auto poi_at = local_offsets(ntld, [](const auto& l) { return l.poi_records.size(); });
-                const size_t poi_base = grow_by(data.poi_records, poi_at.back());
-                const size_t poi_osm_base = grow_by(data.poi_osm_ids, poi_at.back());
-                const size_t poi_ele_base = grow_by(poi_elevations, poi_at.back());
-                const size_t poi_qid_base = grow_by(poi_qids, poi_at.back());
+                const std::array<size_t, 4> poi_bases = pois_grown.get();
+                const size_t poi_base = poi_bases[0];
+                const size_t poi_osm_base = poi_bases[1];
+                const size_t poi_ele_base = poi_bases[2];
+                const size_t poi_qid_base = poi_bases[3];
                 parallel_for_parts(poi_at, kMergeGrain, [&](size_t k, size_t begin, size_t end, size_t at) {
                     const auto& local = ntld[k];
                     for (size_t j = begin; j < end; j++, at++) {
