@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <deque>
 #include <exception>
+#include <functional>
 #include <future>
 #include <iterator>
 #include <memory>
@@ -58,6 +59,60 @@ std::future<void> free_beside(std::vector<T>&& v) {
     return std::async(std::launch::async, [v = std::move(v)]() mutable { std::vector<T>().swap(v); });
 }
 
+// Threads kept between tasks: a task runs on an idle one, or on a new one
+// when none is, so every task starts at once, as on a thread of its own.
+// Starting a thread per parallel_for range costs more than many ranges'
+// work, and threads starting and exiting by the hundred all queue on the
+// process's signal lock.
+class ThreadCache {
+public:
+    // Never destroyed: its idle threads end with the process.
+    static ThreadCache& instance() {
+        static ThreadCache* cache = new ThreadCache;
+        return *cache;
+    }
+
+    void run(std::function<void()> task) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (!idle_.empty()) {
+            Worker* w = idle_.back();
+            idle_.pop_back();
+            w->task = std::move(task);
+            w->wake.notify_one();
+            return;
+        }
+        auto w = std::make_unique<Worker>();
+        w->task = std::move(task);
+        Worker* serving = w.get();
+        std::thread([this, serving] { serve(serving); }).detach();
+        workers_.push_back(std::move(w));
+    }
+
+private:
+    struct Worker {
+        std::function<void()> task;
+        std::condition_variable wake;
+    };
+
+    void serve(Worker* w) {
+        std::unique_lock<std::mutex> lock(mtx_);
+        for (;;) {
+            w->wake.wait(lock, [&] { return static_cast<bool>(w->task); });
+            std::function<void()> task = std::move(w->task);
+            w->task = nullptr;
+            lock.unlock();
+            task();
+            task = nullptr;
+            lock.lock();
+            idle_.push_back(w);
+        }
+    }
+
+    std::mutex mtx_;
+    std::vector<std::unique_ptr<Worker>> workers_;
+    std::vector<Worker*> idle_;
+};
+
 // Runs fn(begin, end, worker) over at most `threads` contiguous ranges that
 // cover [0, n), one thread each (0 = every core). The ranges move with the
 // thread count, so fn must not let them shape its output. The first
@@ -70,21 +125,43 @@ void parallel_for(size_t n, Fn&& fn, unsigned threads = 0) {
         if (n) fn(size_t(0), n, 0u);
         return;
     }
-    std::vector<std::exception_ptr> errors(workers);
-    std::vector<std::thread> pool;
-    pool.reserve(workers);
-    for (size_t w = 0; w < workers; w++) {
-        size_t begin = n * w / workers, end = n * (w + 1) / workers;
-        pool.emplace_back([&fn, &errors, begin, end, w] {
-            try {
-                fn(begin, end, static_cast<unsigned>(w));
-            } catch (...) {
-                errors[w] = std::current_exception();
-            }
-        });
+    // Shared with the ranges, which may still hold it once the last one
+    // has counted itself done.
+    struct Batch {
+        std::mutex mtx;
+        std::condition_variable finished;
+        size_t done = 0;
+        std::vector<std::exception_ptr> errors;
+    };
+    auto batch = std::make_shared<Batch>();
+    batch->errors.resize(workers);
+    auto* body = &fn;
+    size_t started = 0;
+    std::exception_ptr start_error;
+    try {
+        for (; started < workers; started++) {
+            const size_t w = started, begin = n * w / workers, end = n * (w + 1) / workers;
+            ThreadCache::instance().run([batch, body, begin, end, w] {
+                std::exception_ptr error;
+                try {
+                    (*body)(begin, end, static_cast<unsigned>(w));
+                } catch (...) {
+                    error = std::current_exception();
+                }
+                std::lock_guard<std::mutex> lock(batch->mtx);
+                batch->errors[w] = error;
+                batch->done++;
+                batch->finished.notify_one();
+            });
+        }
+    } catch (...) {
+        // No thread to run the rest: the started ranges still hold fn.
+        start_error = std::current_exception();
     }
-    for (auto& t : pool) t.join();
-    for (auto& e : errors)
+    std::unique_lock<std::mutex> lock(batch->mtx);
+    batch->finished.wait(lock, [&] { return batch->done == started; });
+    if (start_error) std::rethrow_exception(start_error);
+    for (auto& e : batch->errors)
         if (e) std::rethrow_exception(e);
 }
 

@@ -114,6 +114,56 @@ TEST(parallel_for_rethrows_a_worker_exception) {
     CHECK(thrown);
 }
 
+TEST(parallel_for_runs_every_range_at_once) {
+    // Each range waits for all the others to arrive: it only returns when
+    // every range runs at the same time, however many are busy elsewhere.
+    for (unsigned threads : {2u, 8u, 64u}) {
+        std::mutex mtx;
+        std::condition_variable all_here;
+        unsigned here = 0;
+        bool met = true;
+        parallel_for(threads, [&](size_t, size_t, unsigned) {
+            std::unique_lock<std::mutex> lock(mtx);
+            if (++here == threads) all_here.notify_all();
+            if (!all_here.wait_for(lock, std::chrono::seconds(30), [&] { return here == threads; })) met = false;
+        }, threads);
+        CHECK(met);
+    }
+}
+
+TEST(parallel_for_reuses_its_threads_between_calls) {
+    auto ids = [] {
+        std::mutex mtx;
+        std::vector<std::thread::id> seen;
+        parallel_for(8, [&](size_t, size_t, unsigned) {
+            std::lock_guard<std::mutex> lock(mtx);
+            seen.push_back(std::this_thread::get_id());
+        }, 8);
+        std::sort(seen.begin(), seen.end());
+        return seen;
+    };
+    const auto first = ids();
+    const auto second = ids();
+    CHECK(std::any_of(second.begin(), second.end(), [&](std::thread::id t) {
+        return std::binary_search(first.begin(), first.end(), t);
+    }));
+}
+
+TEST(parallel_for_nests_and_runs_from_many_threads_at_once) {
+    std::vector<std::thread> callers;
+    std::atomic<size_t> total{0};
+    for (int c = 0; c < 8; c++)
+        callers.emplace_back([&] {
+            for (int round = 0; round < 50; round++)
+                parallel_for(16, [&](size_t b, size_t e, unsigned) {
+                    for (size_t i = b; i < e; i++)
+                        parallel_for(10, [&](size_t ib, size_t ie, unsigned) { total += ie - ib; }, 3);
+                }, 4);
+        });
+    for (auto& t : callers) t.join();
+    CHECK_EQ(total.load(), size_t(8 * 50 * 16 * 10));
+}
+
 TEST(parallel_for_each_visits_every_index_once) {
     for (unsigned threads : {1u, 2u, 3u, 8u, 64u}) {
         for (size_t n : {size_t(0), size_t(1), size_t(5), size_t(1000)}) {
