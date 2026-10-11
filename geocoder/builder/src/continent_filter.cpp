@@ -2,11 +2,14 @@
 #include "continent_boundaries.h"
 #include "parsed_data.h"
 #include "parallel.h"
+#include "ranked_bits.h"
 #include "subset_copy.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <future>
+#include <stdexcept>
 
 #include <s2/s2cell_id.h>
 #include <s2/s2latlng.h>
@@ -64,55 +67,46 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     auto _ft = std::chrono::steady_clock::now();
     auto _fc = CpuTicks::now();
 
-    // Fast mask-based filter: bitset indexed by raw item_id.
-    // INTERIOR_FLAG is stripped during indexing so flagged items (e.g. POIs)
-    // are captured — the flag is re-applied during sorted-pair remap below.
+    // Ids of the records with a cell pair in the continent, ascending.
+    // INTERIOR_FLAG is stripped so flagged items (e.g. POIs) are captured —
+    // the flag is re-applied during sorted-pair remap below.
     auto filter_sorted_masked = [&](const std::vector<CellItemPair>& sorted,
                                      const std::vector<uint8_t>& masks,
                                      uint32_t max_id) {
-        std::vector<uint32_t> result;
-        if (sorted.empty() || max_id == 0) return result;
+        if (sorted.empty() || max_id == 0) return std::vector<uint32_t>();
 
-        size_t bitset_bytes = (max_id + 8) / 8;
         const unsigned threads = pair_pass_threads();
-        std::vector<std::vector<uint8_t>> thread_bitsets(threads);
-        parallel_for_runs(sorted.size(), same_cell(sorted), [&](size_t begin, size_t end, unsigned w) {
-            auto& bs = thread_bitsets[w];
-            bs.resize(bitset_bytes, 0);
+        std::vector<std::atomic<uint64_t>> used(max_id / 64 + 1);
+        parallel_for(sorted.size(), [&](size_t begin, size_t end, unsigned) {
             for (size_t i = begin; i < end; i++) {
-                if (masks[i] & continent_bit) {
-                    uint32_t id = sorted[i].item_id & ID_MASK;
-                    if (id < max_id)
-                        bs[id / 8] |= (1 << (id % 8));
-                }
+                if (!(masks[i] & continent_bit)) continue;
+                uint32_t id = sorted[i].item_id & ID_MASK;
+                if (id < max_id) mark_bit(used, id);
             }
         }, threads);
-
-        std::vector<uint8_t> bitset(bitset_bytes, 0);
-        for (auto& bs : thread_bitsets) {
-            if (bs.empty()) continue;
-            for (size_t i = 0; i < bitset_bytes; i++) bitset[i] |= bs[i];
-        }
-
-        for (uint32_t id = 0; id < max_id; id++) {
-            if (bitset[id / 8] & (1 << (id % 8))) result.push_back(id);
-        }
-        return result;
+        return RankedBits(max_id, used, threads).ones(threads);
     };
 
-    // Admin ids of the continent's cells (admin has no precomputed masks),
-    // ascending.
+    // The continent's admin cells (admin has no precomputed masks), and the
+    // ids of the polygons they hold, ascending.
+    using AdminCell = std::unordered_map<uint64_t, std::vector<uint32_t>>::value_type;
+    std::vector<const AdminCell*> admin_cells;
     auto filter_admin_cells = [&](const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map) {
-        std::vector<char> used(full.admin_polygons.size(), 0);
-        for (const auto& [cell_id, cell_ids] : cell_map) {
-            if (cell_in_continent(cell_id, bbox, polygon)) {
-                for (uint32_t id : cell_ids) used.at(id & ID_MASK) = 1;
-            }
-        }
-        std::vector<uint32_t> ids;
-        for (uint32_t id = 0; id < used.size(); id++)
-            if (used[id]) ids.push_back(id);
-        return ids;
+        admin_cells = parallel_collect<const AdminCell*>(cell_map.bucket_count(),
+            [&](size_t b, std::vector<const AdminCell*>& inside) {
+                for (auto it = cell_map.begin(b); it != cell_map.end(b); ++it)
+                    if (cell_in_continent(it->first, bbox, polygon)) inside.push_back(&*it);
+            });
+        const size_t polygons = full.admin_polygons.size();
+        std::vector<std::atomic<uint64_t>> used(polygons / 64 + 1);
+        parallel_for(admin_cells.size(), [&](size_t begin, size_t end, unsigned) {
+            for (size_t c = begin; c < end; c++)
+                for (uint32_t id : admin_cells[c]->second) {
+                    if ((id & ID_MASK) >= polygons) throw std::out_of_range("admin cell entry past the polygons");
+                    mark_bit(used, id & ID_MASK);
+                }
+        });
+        return RankedBits(polygons, used).ones();
     };
 
     const uint32_t max_way_id = static_cast<uint32_t>(full.ways.size());
@@ -327,16 +321,24 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     // filter every continent would ship the full global centroid set (~4.5M
     // entries). Filter by centroid; the string part of each key is an offset
     // in the FULL pool — remapped via string_remap below.
-    out.postcode_accum.reserve(full.postcode_accum.size());
-    for (const auto& [key, acc] : full.postcode_accum) {
-        if (acc.count == 0) continue;
-        double alat = acc.lat(), alng = acc.lng();
-        bool inside = polygon
-            ? point_in_polygon(alat, alng, *polygon)
-            : (alat >= bbox.min_lat && alat <= bbox.max_lat &&
-               alng >= bbox.min_lng && alng <= bbox.max_lng);
-        if (!inside) continue;
-        out.postcode_accum.emplace(key, acc);
+    {
+        using Postcode = std::unordered_map<uint64_t, ParsedData::PostcodeAccum>::value_type;
+        const auto& accum = full.postcode_accum;
+        const auto inside = parallel_collect<const Postcode*>(accum.bucket_count(),
+            [&](size_t b, std::vector<const Postcode*>& found) {
+                for (auto it = accum.begin(b); it != accum.end(b); ++it) {
+                    const auto& acc = it->second;
+                    if (acc.count == 0) continue;
+                    double alat = acc.lat(), alng = acc.lng();
+                    bool in = polygon
+                        ? point_in_polygon(alat, alng, *polygon)
+                        : (alat >= bbox.min_lat && alat <= bbox.max_lat &&
+                           alng >= bbox.min_lng && alng <= bbox.max_lng);
+                    if (in) found.push_back(&*it);
+                }
+            });
+        out.postcode_accum.reserve(inside.size());
+        for (const Postcode* p : inside) out.postcode_accum.emplace(p->first, p->second);
     }
 
     log_phase(("      " + std::string(bbox.name) + " filter: parent + postcode projection").c_str(), _ft, _fc);
@@ -347,41 +349,29 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
                                     const std::vector<uint32_t>& remap,
                                     std::vector<CellItemPair>& dst) {
         if (sorted.empty()) return;
-        const unsigned threads = pair_pass_threads();
-        std::vector<std::vector<CellItemPair>> thread_pairs(threads);
-        parallel_for_runs(sorted.size(), same_cell(sorted), [&](size_t begin, size_t end, unsigned w) {
-            auto& local = thread_pairs[w];
-            for (size_t i = begin; i < end; i++) {
-                if (masks[i] & continent_bit) {
-                    uint32_t raw   = sorted[i].item_id & ID_MASK;
-                    uint32_t flags = sorted[i].item_id & INTERIOR_FLAG;
-                    uint32_t id = remap_id(remap, raw);
-                    if (id != NO_DATA)
-                        local.push_back({sorted[i].cell_id, id | flags});
-                }
-            }
-        }, threads);
-        size_t total = 0;
-        for (auto& v : thread_pairs) total += v.size();
-        dst.reserve(total);
-        for (auto& v : thread_pairs) dst.insert(dst.end(), v.begin(), v.end());
+        dst = parallel_collect<CellItemPair>(sorted.size(), [&](size_t i, std::vector<CellItemPair>& kept) {
+            if (!(masks[i] & continent_bit)) return;
+            uint32_t raw   = sorted[i].item_id & ID_MASK;
+            uint32_t flags = sorted[i].item_id & INTERIOR_FLAG;
+            uint32_t id = remap_id(remap, raw);
+            if (id != NO_DATA) kept.push_back({sorted[i].cell_id, id | flags});
+        }, pair_pass_threads());
     };
 
-    auto remap_cells_map = [&](const std::unordered_map<uint64_t, std::vector<uint32_t>>& src,
-                               const std::vector<uint32_t>& remap,
-                               std::unordered_map<uint64_t, std::vector<uint32_t>>& dst,
-                               bool handle_flags = false) {
-        for (const auto& [cell_id, ids] : src) {
-            if (!cell_in_continent(cell_id, bbox, polygon)) continue;
-            std::vector<uint32_t> new_ids;
-            for (uint32_t id : ids) {
-                uint32_t raw_id = handle_flags ? (id & ID_MASK) : id;
-                uint32_t flags = handle_flags ? (id & INTERIOR_FLAG) : 0;
-                uint32_t new_id = remap_id(remap, raw_id);
-                if (new_id != NO_DATA) new_ids.push_back(new_id | flags);
+    // The continent's admin cells with their polygons' continent ids (and
+    // INTERIOR_FLAG), cells left empty dropped.
+    auto remap_admin_cells = [&] {
+        using CellIds = std::pair<uint64_t, std::vector<uint32_t>>;
+        auto kept = parallel_collect<CellIds>(admin_cells.size(), [&](size_t c, std::vector<CellIds>& found) {
+            std::vector<uint32_t> ids;
+            for (uint32_t id : admin_cells[c]->second) {
+                uint32_t new_id = remap_id(admin_remap, id & ID_MASK);
+                if (new_id != NO_DATA) ids.push_back(new_id | (id & INTERIOR_FLAG));
             }
-            if (!new_ids.empty()) dst[cell_id] = std::move(new_ids);
-        }
+            if (!ids.empty()) found.emplace_back(admin_cells[c]->first, std::move(ids));
+        });
+        out.cell_to_admin.reserve(kept.size());
+        for (auto& [cell, ids] : kept) out.cell_to_admin.emplace(cell, std::move(ids));
     };
 
     {
@@ -390,7 +380,7 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
         auto f3 = std::async(std::launch::async, [&]{ remap_sorted_masked(full.sorted_interp_cells, interp_masks, interp_remap, out.sorted_interp_cells); });
         auto f4 = std::async(std::launch::async, [&]{ remap_sorted_masked(full.sorted_poi_cells,    poi_masks,    poi_remap,    out.sorted_poi_cells); });
         auto f5 = std::async(std::launch::async, [&]{ remap_sorted_masked(full.sorted_place_cells,  place_masks,  place_remap,  out.sorted_place_cells); });
-        auto f6 = std::async(std::launch::async, [&]{ remap_cells_map(full.cell_to_admin, admin_remap, out.cell_to_admin, true); });
+        auto f6 = std::async(std::launch::async, remap_admin_cells);
         f1.get(); f2.get(); f3.get(); f4.get(); f5.get(); f6.get();
     }
     log_phase(("      " + std::string(bbox.name) + " filter: cell map remap (masked)").c_str(), _ft, _fc);
@@ -400,40 +390,42 @@ ParsedData filter_by_bbox_masked(const ParsedData& full, const ContinentBBox& bb
     // place nodes, POI records, way/addr postcode arrays, and postcode_accum keys,
     // as bits over the planet pool: ascending set bits are the kept strings.
     const auto& old_sp = full.string_pool.data();
-    std::vector<uint64_t> used_bits(old_sp.size() / 64 + 1, 0);
+    std::vector<std::atomic<uint64_t>> used_bits(old_sp.size() / 64 + 1);
     auto add_used = [&](uint32_t off) {
-        if (off < old_sp.size()) used_bits[off / 64] |= uint64_t(1) << (off % 64);
+        if (off < old_sp.size()) mark_bit(used_bits, off);
     };
-    for (const auto& w : out.ways) add_used(w.name_id);
-    for (const auto& a : out.addr_points) { add_used(a.housenumber_id); add_used(a.street_id); }
-    for (const auto& iw : out.interp_ways) add_used(iw.street_id);
-    for (const auto& ap : out.admin_polygons) add_used(ap.name_id);
-    for (const auto& pn : out.place_nodes) add_used(pn.name_id);
-    for (const auto& pr : out.poi_records) { add_used(pr.name_id); add_used(pr.parent_street_id); add_used(pr.parent_postcode_id); }
-    for (uint32_t off : out.way_postcode_ids) add_used(off);
-    for (uint32_t off : out.interp_postcode_ids) add_used(off);
-    for (uint32_t off : out.addr_postcode_ids) add_used(off);
+    parallel_each(out.ways, [&](WayHeader& w) { add_used(w.name_id); });
+    parallel_each(out.addr_points, [&](AddrPoint& a) { add_used(a.housenumber_id); add_used(a.street_id); });
+    parallel_each(out.interp_ways, [&](InterpWay& iw) { add_used(iw.street_id); });
+    parallel_each(out.admin_polygons, [&](AdminPolygon& ap) { add_used(ap.name_id); });
+    parallel_each(out.place_nodes, [&](PlaceNode& pn) { add_used(pn.name_id); });
+    parallel_each(out.poi_records, [&](PoiRecord& pr) {
+        add_used(pr.name_id);
+        add_used(pr.parent_street_id);
+        add_used(pr.parent_postcode_id);
+    });
+    parallel_each(out.way_postcode_ids, add_used);
+    parallel_each(out.interp_postcode_ids, add_used);
+    parallel_each(out.addr_postcode_ids, add_used);
     for (const auto& [key, _acc] : out.postcode_accum) add_used(postcode_key_pc(key));
 
-    std::vector<uint32_t> kept_offsets;  // ascending planet offsets
-    std::vector<uint32_t> new_offsets;   // each one's offset in the continent pool
+    // The kept strings, ascending by planet offset, back to back.
+    const RankedBits kept(old_sp.size(), used_bits);
+    std::vector<std::atomic<uint64_t>>().swap(used_bits);
+    const std::vector<uint32_t> kept_offsets = kept.ones();
+    const std::vector<uint32_t> new_offsets = parallel_offsets<uint32_t>(kept_offsets.size(), [&](size_t k) {
+        return static_cast<uint32_t>(std::strlen(old_sp.data() + kept_offsets[k]) + 1);
+    });
     auto& new_sp = out.string_pool.mutable_data();
     new_sp.clear();
-    for (size_t word = 0; word < used_bits.size(); word++) {
-        for (uint64_t bits = used_bits[word]; bits; bits &= bits - 1) {
-            uint32_t old_off = static_cast<uint32_t>(word * 64 + __builtin_ctzll(bits));
-            kept_offsets.push_back(old_off);
-            new_offsets.push_back(static_cast<uint32_t>(new_sp.size()));
-            const char* str = old_sp.data() + old_off;
-            size_t len = std::strlen(str);
-            new_sp.insert(new_sp.end(), str, str + len + 1);
-        }
-    }
-    std::vector<uint64_t>().swap(used_bits);
+    parallel_resize(new_sp, new_offsets.back());
+    parallel_for(kept_offsets.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t k = b; k < e; k++)
+            std::memcpy(new_sp.data() + new_offsets[k], old_sp.data() + kept_offsets[k], new_offsets[k + 1] - new_offsets[k]);
+    });
     auto remap_or_sentinel = [&](uint32_t off) -> uint32_t {
-        auto it = std::lower_bound(kept_offsets.begin(), kept_offsets.end(), off);
-        if (it == kept_offsets.end() || *it != off) return NO_DATA;
-        return new_offsets[it - kept_offsets.begin()];
+        size_t k = kept.index(off);
+        return k == RankedBits::npos ? NO_DATA : new_offsets[k];
     };
     parallel_each(out.ways, [&](WayHeader& w) { w.name_id = remap_or_sentinel(w.name_id); });
     parallel_each(out.addr_points, [&](AddrPoint& a) {
