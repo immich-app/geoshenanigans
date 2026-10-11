@@ -278,8 +278,10 @@ inline void reorder_addr_points(ParsedData& data, unsigned threads = 0, uint64_t
         [&](size_t i) { const auto& p = points[order[i]]; return has_polygon(p) ? size_t(p.vertex_count) : 0; },
         [&](size_t i) { return points[order[i]].vertex_offset; }, threads, at_buffer.get(), vertex_buffer.get());
     // The arrays these replace unmap beside the steps left, the old
-    // vertices before the sorted points come.
-    free_beside(std::move(data.addr_vertices));
+    // vertices before the sorted points come: without room beside, the
+    // points wait for them.
+    auto vertices_freed = free_beside(std::move(data.addr_vertices));
+    if (!beside) vertices_freed.wait();
     std::vector<AddrPoint> sorted = sorted_buffer.get();
     parallel_resize(sorted, kept);
     auto osm_buffer = vector_beside<uint64_t>(have_osm && beside ? kept : 0);
@@ -807,8 +809,10 @@ inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
     Repacked<NodeCoord> repacked = repack(kept, vertices,
         [&](size_t k) { const auto& p = pois[order[starts[k]]]; return has_polygon(p) ? size_t(p.vertex_count) : 0; },
         [&](size_t k) { return pois[order[starts[k]]].vertex_offset; }, threads, {}, vertex_buffer.get());
-    // The old vertices go before the sorted records come.
-    free_beside(std::move(data.poi_vertices));
+    // The old vertices go before the sorted records come: without room
+    // beside, the records wait for them.
+    auto vertices_freed = free_beside(std::move(data.poi_vertices));
+    if (!beside) vertices_freed.wait();
     std::vector<PoiRecord> new_pois = poi_buffer.get();
     std::vector<float> new_poi_elevations = elevation_buffer.get();
     std::vector<uint32_t> new_poi_qids = qid_buffer.get();
