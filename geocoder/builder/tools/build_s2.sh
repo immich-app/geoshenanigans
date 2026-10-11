@@ -28,25 +28,34 @@ cd "$work"
 # so a rebuild gives the same bytes.
 flags+=" -ffile-prefix-map=$work/="
 
-# unpack <source> <version> <debian revision> <orig sha256> <debian sha256>:
+# unpack <pool dir> <source> <version> <debian revision> <orig sha256> <debian sha256>:
 # fetch a package's upstream and Debian tarballs, check them, apply the
-# Debian patches; leaves the tree in <source>-<version>. Launchpad keeps every
-# published version's files, where the archive pool drops a version once a
-# newer one supersedes it.
+# Debian patches; leaves the tree in <source>-<version>. The archive pool
+# serves a version until a newer one supersedes it; Launchpad keeps every
+# published version's files, but has turned the build runner away (502s).
 unpack() {
-  local files=https://launchpad.net/ubuntu/+archive/primary/+sourcefiles/$1/$2-$3
-  local orig=$1_$2.orig.tar.gz deb=$1_$2-$3.debian.tar.xz
-  fetch "$orig" "$files/$orig"
-  fetch "$deb" "$files/$deb"
-  printf '%s  %s\n%s  %s\n' "$4" "$orig" "$5" "$deb" | sha256sum -c --quiet
+  local pool=http://archive.ubuntu.com/ubuntu/pool/$1
+  local files=https://launchpad.net/ubuntu/+archive/primary/+sourcefiles/$2/$3-$4
+  local orig=$2_$3.orig.tar.gz deb=$2_$3-$4.debian.tar.xz
+  fetch "$orig" "$pool/$orig" "$files/$orig"
+  fetch "$deb" "$pool/$deb" "$files/$deb"
+  printf '%s  %s\n%s  %s\n' "$5" "$orig" "$6" "$deb" | sha256sum -c --quiet
   tar xzf "$orig"
-  tar xJf "$deb" -C "$1-$2"
-  apply_series "$1-$2" "$1-$2/debian/patches"
+  tar xJf "$deb" -C "$2-$3"
+  apply_series "$2-$3" "$2-$3/debian/patches"
 }
 
-# fetch <file> <url>: a stalled transfer times out and is retried.
+# fetch <file> <url>...: from the first URL that serves it. A stalled
+# transfer times out and is retried.
 fetch() {
-  curl -sSL --fail --connect-timeout 30 --max-time 300 --retry 5 --retry-delay 10 --retry-all-errors -o "$1" "$2"
+  local file=$1 url
+  shift
+  for url in "$@"; do
+    curl -sSL --fail --connect-timeout 30 --max-time 300 --retry 3 --retry-delay 10 --retry-all-errors \
+      -o "$file" "$url" && return 0
+    echo "could not fetch $url" >&2
+  done
+  return 1
 }
 
 # apply_series <tree> <patch dir>: the patches quilt's series file lists, in
@@ -70,12 +79,12 @@ build_static() {
   cmake --install "$1/build"
 }
 
-unpack abseil 20220623.1 3.1ubuntu3.2 \
+unpack main/a/abseil abseil 20220623.1 3.1ubuntu3.2 \
   abfe2897f3a30edaa74bc34365afe3c2a3cd012091a97dc7e008f7016adcd5fe \
   10cd95eb3664eeee653789488662aa9dfd8c185c1892fe759f073bfe15db055a
 build_static abseil-20220623.1 -DCMAKE_CXX_STANDARD=17 -DBUILD_TESTING=OFF
 
-unpack s2geometry 0.10.0 6.1build4 \
+unpack universe/s/s2geometry s2geometry 0.10.0 6.1build4 \
   1c17b04f1ea20ed09a67a83151ddd5d8529716f509dde49a8190618d70532a3d \
   aa64f747ec51e0773ec7ce28c2603bcfd265a8fe68b35874e87f0016a2ad34ae
 build_static s2geometry-0.10.0 -DBUILD_EXAMPLES=OFF -DWITH_PYTHON=OFF -Dabsl_DIR="$prefix/lib/cmake/absl"
