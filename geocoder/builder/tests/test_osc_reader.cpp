@@ -174,6 +174,44 @@ TEST(osc_reader_keeps_file_order_across_files) {
     CHECK(seen == (std::vector<std::pair<size_t, bool>>{{0, true}, {1, false}}));
 }
 
+TEST(osc_reader_reads_many_files_side_by_side_in_file_order) {
+    ScratchDir dir("osc-test");
+    std::vector<std::string> paths;
+    std::vector<std::string> expected;
+    for (int f = 0; f < 5; f++) {
+        std::string body;
+        for (int i = 0; i < 40; i++)
+            body += "<modify><node id=\"" + std::to_string(i) + "\" version=\"" + std::to_string(f + 2) +
+                    "\" lat=\"0\" lon=\"0\"/></modify>\n";
+        paths.push_back(write_file(dir, "c" + std::to_string(f) + ".osc.gz", wrap(body), f % 2 == 0));
+        auto alone = describe(read_change_files({paths.back()}, 97, 1));
+        expected.insert(expected.end(), alone.begin(), alone.end());
+    }
+    for (unsigned threads : {1u, 3u, 16u}) {
+        auto chunks = read_change_files(paths, 97, threads);
+        CHECK(describe(chunks) == expected);
+        bool ordered = true;
+        for (size_t c = 1; c < chunks.size(); c++) ordered &= chunks[c - 1]->file <= chunks[c]->file;
+        CHECK(ordered);
+    }
+}
+
+TEST(osc_reader_reports_the_first_bad_file_in_file_order) {
+    ScratchDir dir("osc-test");
+    std::string good = write_file(dir, "good.osc", kChange, false);
+    std::string bad1 = write_file(dir, "bad1.osc", "<osmChange version=\"0.5\"></osmChange>\n", false);
+    std::string bad2 = write_file(dir, "bad2.osc", "<osmChange version=\"0.6\"><create>\n", false);
+    for (unsigned threads : {1u, 4u}) {
+        std::string what;
+        try {
+            read_change_files({good, bad1, bad2}, kOscChunkBytes, threads);
+        } catch (const std::exception& e) {
+            what = e.what();
+        }
+        CHECK(what.find(bad1) == 0);
+    }
+}
+
 TEST(osc_reader_rejects_malformed_structure) {
     ScratchDir dir("osc-test");
     const char* bad[] = {

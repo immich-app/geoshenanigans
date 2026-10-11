@@ -11,6 +11,7 @@
 // in is settled afterwards by replaying the structural tags in file order.
 #pragma once
 
+#include <algorithm>
 #include <cctype>
 #include <climits>
 #include <cstdint>
@@ -625,15 +626,27 @@ inline std::vector<std::unique_ptr<ChangeChunk>> read_change_file(const std::str
 }
 
 // Reads change files into chunks, in file order and within a file in
-// reading order.
+// reading order. The files are read side by side, the cores shared out
+// among them: each inflates on one thread, which a file's parsing outruns.
+// An error is the first file's in file order that has one.
 inline std::vector<std::unique_ptr<ChangeChunk>> read_change_files(const std::vector<std::string>& paths,
                                                                    size_t chunk_bytes = kOscChunkBytes,
                                                                    unsigned threads = 0) {
     if (threads == 0) threads = parallel_threads();
+    const size_t files = paths.size();
+    const unsigned per_file = std::max(1u, unsigned(threads / std::max<size_t>(files, 1)));
+    std::vector<std::vector<std::unique_ptr<ChangeChunk>>> by_file(files);
+    std::vector<std::exception_ptr> errors(files);
+    parallel_for_each(files, [&](size_t f, unsigned) {
+        try {
+            by_file[f] = read_change_file(paths[f], f, chunk_bytes, per_file);
+        } catch (...) {
+            errors[f] = std::current_exception();
+        }
+    }, threads);
+    for (const auto& e : errors)
+        if (e) std::rethrow_exception(e);
     std::vector<std::unique_ptr<ChangeChunk>> chunks;
-    for (size_t f = 0; f < paths.size(); f++) {
-        auto mine = read_change_file(paths[f], f, chunk_bytes, threads);
-        std::move(mine.begin(), mine.end(), std::back_inserter(chunks));
-    }
+    for (auto& mine : by_file) std::move(mine.begin(), mine.end(), std::back_inserter(chunks));
     return chunks;
 }
