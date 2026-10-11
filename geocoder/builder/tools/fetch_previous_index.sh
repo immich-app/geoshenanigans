@@ -19,14 +19,19 @@ rm -f "$status"
 
 # fetch_one <key under src>
 fetch_one() {
-  local key=$1
+  local key=$1 out
+  local s5=(s5cmd --endpoint-url "$S3_ENDPOINT" --retry-count 5)
   mkdir -p "$dest/$(dirname "$key")"
   case "$key" in
     *.bin.zst)
-      s5cmd --endpoint-url "$S3_ENDPOINT" --retry-count 5 cat "$src/$key" \
-        | zstd -d -q -f -o "$dest/${key%.zst}" ;;
+      out=$dest/${key%.zst}
+      "${s5[@]}" cat "$src/$key" 2> /dev/null | zstd -d -q -f -o "$out" 2> /dev/null && return 0
+      # A stream cut mid-object can't be retried in the pipe: fetch the
+      # whole file (s5cmd retries that) and decompress it instead.
+      echo "[old-output] retrying $key as a download"
+      "${s5[@]}" cp "$src/$key" "$out.zst" > /dev/null && zstd -d -q -f --rm "$out.zst" ;;
     *)
-      s5cmd --endpoint-url "$S3_ENDPOINT" --retry-count 5 cp "$src/$key" "$dest/$key" > /dev/null ;;
+      "${s5[@]}" cp "$src/$key" "$dest/$key" > /dev/null ;;
   esac
 }
 export -f fetch_one
