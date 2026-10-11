@@ -3,7 +3,7 @@
 //
 // Usage: pbf-apply <in.osm.pbf> <change.osc[.gz]>... -o <out.osm.pbf>
 //            [--replication-timestamp ISO8601] [--replication-sequence N]
-//            [--replication-base-url URL]
+//            [--replication-base-url URL] [--direct-io]
 #include <climits>
 #include <cstdlib>
 #include <cstring>
@@ -16,7 +16,7 @@
 static const char* kUsage =
     "Usage: pbf-apply <in.osm.pbf> <change.osc[.gz]>... -o <out.osm.pbf>\n"
     "                 [--replication-timestamp ISO8601] [--replication-sequence N]\n"
-    "                 [--replication-base-url URL]";
+    "                 [--replication-base-url URL] [--direct-io]";
 
 static int run(int argc, char* argv[]) {
     ApplyOptions opt;
@@ -40,6 +40,8 @@ static int run(int argc, char* argv[]) {
             opt.replication_sequence = n;
         } else if (arg == "--replication-base-url") {
             opt.replication_base_url = value();
+        } else if (arg == "--direct-io") {
+            opt.direct_io = true;
         } else if (arg.size() > 1 && arg[0] == '-') {
             throw std::runtime_error("unknown option " + arg);
         } else {

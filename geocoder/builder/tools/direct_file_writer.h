@@ -30,10 +30,12 @@ constexpr size_t kDirectWriteBlocksInFlight = 8;
 // How far ahead of the writes the file is allocated.
 constexpr uint64_t kDirectWriteAllocateBytes = uint64_t(1) << 30;
 
-// Writes a new file front to back with O_DIRECT where the filesystem takes
-// it. Through the page cache a planet-sized file went at 0.9 GB/s on the
-// test box's NVMe whatever the write size, its writeback and page reclaim
-// the limit; direct writes of whole blocks went at 3.4 GB/s.
+// Writes a new file front to back, with O_DIRECT when asked and the
+// filesystem takes it. Through the page cache a planet-sized file went at
+// 0.9 GB/s on the test box's NVMe whatever the write size, its writeback and
+// page reclaim the limit; direct writes of whole blocks went at 3.4 GB/s. A
+// disk slower than the page cache gains nothing, and a reader right after
+// finds nothing cached.
 //
 // Appending only notes where the bytes of each block of the file come
 // from. A block once laid out is filled, from the strings handed over and

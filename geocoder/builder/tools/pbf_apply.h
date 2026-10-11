@@ -199,6 +199,9 @@ struct ApplyOptions {
     size_t change_chunk_bytes = kOscChunkBytes;
     unsigned threads = 0;
     bool verbose = true;
+    // Writes the output around the page cache: faster on a fast disk, but
+    // the output's next reader finds none of it cached.
+    bool direct_io = false;
 };
 
 struct ApplyStats {
@@ -495,7 +498,7 @@ inline ApplyStats apply_changes(const ApplyOptions& opt) {
 
     auto t_write = clock::now();
     FileDescriptor input(opt.input);
-    DirectFileWriter output(opt.output);
+    DirectFileWriter output(opt.output, opt.direct_io);
     {
         PbfHeader header = decode_header_block(read_and_decompress_blob(input.get(), in.blobs[0]));
         std::string bytes;
