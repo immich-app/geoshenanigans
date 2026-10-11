@@ -254,13 +254,18 @@ public:
         }
 
         // A matched record's slot already holds its {type, stable_id} from
-        // the load and is its alone: the tiers go in on every core. Only the
-        // others take slots in record order.
+        // the load and is its alone: the tiers go in on every core, unless
+        // neither the records nor the slots have one (every kind but POIs),
+        // when the stamp would only write each slot's 0 back at random. Only
+        // the others take slots in record order.
         const std::vector<uint32_t> unmatched = parallel_filter(n, [&](size_t i) { return out[i] == kUnmatched; });
-        parallel_for(n, [&](size_t begin, size_t end, unsigned) {
-            for (size_t i = begin; i < end; i++)
-                if (out[i] != kUnmatched) slots_[out[i]].tier = identity(i).tier;
-        });
+        const bool tiers = parallel_any(n, [&](size_t i) { return identity(i).tier != 0; }) ||
+                           parallel_any(slots_.size(), [&](size_t s) { return slots_[s].tier != 0; });
+        if (tiers)
+            parallel_for(n, [&](size_t begin, size_t end, unsigned) {
+                for (size_t i = begin; i < end; i++)
+                    if (out[i] != kUnmatched) slots_[out[i]].tier = identity(i).tier;
+            });
         if (unmatched.size() > free_list_.size()) slots_.reserve(slots_.size() + unmatched.size() - free_list_.size());
         for (uint32_t i : unmatched) {
             SlotIdentity id = identity(i);
