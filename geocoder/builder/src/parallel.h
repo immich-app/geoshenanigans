@@ -44,14 +44,6 @@ void release_gently(Container& nodes) {
     Container().swap(nodes);
 }
 
-// A vector of n value-initialized elements, made on a thread of its own:
-// faulting in a fresh planet-sized vector takes one core seconds, which then
-// pass beside other work. get() it where it is needed.
-template <class T>
-std::future<std::vector<T>> vector_beside(size_t n) {
-    return std::async(std::launch::async, [n] { return std::vector<T>(n); });
-}
-
 // Frees a vector on a thread of its own: unmapping a planet-sized vector
 // takes one core a second. The future's destructor waits for it.
 template <class T>
@@ -202,6 +194,18 @@ void parallel_resize(std::vector<T>& v, size_t n, const Value&... value) {
     if (n > v.capacity()) v.reserve(n);
     if (n > v.size()) prefault_for(v, n - v.size());
     v.resize(n, value...);
+}
+
+// A vector of n value-initialized elements, made beside other work, its
+// pages faulted in on every core (parallel_resize). get() it where it is
+// needed.
+template <class T>
+std::future<std::vector<T>> vector_beside(size_t n) {
+    return std::async(std::launch::async, [n] {
+        std::vector<T> v;
+        parallel_resize(v, n);
+        return v;
+    });
 }
 
 // parallel_for for uneven per-element cost: workers take the next `grain`
