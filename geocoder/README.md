@@ -173,7 +173,7 @@ cargo build --release --manifest-path server/Cargo.toml
 
 A full planet build (`--continents --multi-output --multi-quality`, the
 nightly's configuration) takes about 5 minutes on 64 cores and fits in
-96 GB of RAM (6 minutes there): the write phase sizes how much it runs at
+80 GB of RAM (6.5 minutes there): the write phase sizes how much it runs at
 once to the memory limit, the smaller of MemTotal and the process's cgroup
 limit. Set
 `GC_MEMORY_LIMIT_MIB` to cap it further when other work shares the host.

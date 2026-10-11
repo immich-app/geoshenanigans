@@ -1,6 +1,6 @@
 # Build Optimization Log
 
-## October 2026: 1h 20m → 5m 03s, 188 → 122 GB peak (96 GB fits)
+## October 2026: 1h 20m → about 5 min, 188 → 118 GB peak (80 GB fits)
 
 Build: `--continents --multi-output --multi-quality` with TIGER, wikidata
 sitelinks and external postcodes, chained on the previous day
@@ -20,6 +20,9 @@ reference build, plus all 126 patches compared byte for byte.
 | All index writing | 2143 s @2 cores | 114 s | 112 s | parallel postcode centroids and strategy-2, memory-budgeted stages |
 | **Total** | **1:19:42** | **7:06** | **5:03** | |
 
+Round 3's runs took 4:47 to 5:25, depending mostly on how much of the
+planet PBF the page cache still held from the run before (Pass 2).
+
 Round 3's S2 gain is mostly the libraries: the distro S2 and abseil are built
 without NDEBUG, so every S2 call ran its validity checks and every
 absl::Mutex its deadlock detection under one global lock. The nightly links
@@ -31,18 +34,19 @@ Memory: the peak was 188 GiB in Pass 2b (a dense 111 GiB node index plus
 merge copies). Only nodes that a kept way references get coordinates now,
 thread data is freed as it merges, and the write phase schedules its regions
 and stages within the memory limit (min of MemTotal and the cgroup limit,
-capped by `GC_MEMORY_LIMIT_MIB`). Unconstrained it peaks at 122 GB, running
+capped by `GC_MEMORY_LIMIT_MIB`). Unconstrained it peaks at 118 GB, running
 more at once where memory allows. With identical output it finishes in 5:31
-at 114 GB inside a 128 GiB cgroup and in 6:19 at 94 GB inside 96 GiB.
+at 114 GB inside a 128 GiB cgroup, in 5:48 at 93 GB inside 96 GiB and in
+6:31 at 76 GB inside 80 GiB.
 
 Pipeline around the builder (same box):
 - Applying the daily diff: `osmium apply-changes` 52 min → `pbf-apply` about
   2 min (copies untouched blobs, re-encodes the rest in parallel; object
   content identical to osmium's). `--direct-io` cuts that to 48 s on the
   NVMe, but reading the output back then takes 54 s instead of 11 s from the
-  page cache. With the disk throttled to the runner's 370 MB/s, apply plus
-  read-back takes 542 s direct against 285 s through the page cache
-  (writeback included), so the nightly leaves it off.
+  page cache. On the nightly runner (238 MB/s direct writes, 530 MB/s reads)
+  apply plus read-back took 620 s direct against 400-450 s through the page
+  cache, writeback included, so the nightly leaves it off.
 - Patch generation, 126 variants: 23 min → 6 min (geocoder-diff memory and
   parallelism; a diff's memory budget is released when its verify starts).
 - Compression: zstd 18 instead of 19 (+0.3% size, −21% CPU), identical files
@@ -52,9 +56,13 @@ Pipeline around the builder (same box):
   every core, retention deletes batched. The previous day's index downloads
   while the planet builds.
 
-On the nightly runner (80 CPUs, ~1 Gbit/s network, ~370 MB/s disk) the whole
+On the nightly runner (80 CPUs, ~1 Gbit/s network, 240-530 MB/s disk) the whole
 run went from 3h 42m to 1h 08m (a re-run of a day whose PBF was cached, so
-without the diff apply); it is now bound by the network and the disk.
+without the diff apply); it is now bound by the network and the disk. Round 3
+on the runner: the planet's compute phases took 165 s instead of 270 s, but
+its write phase is disk-bound, sharing the disk with the previous day's index
+as it decompresses (750 s, then 1062 s in a run whose fetch was slower too).
+The whole run took 1h 13m.
 
 ## Earlier result: 54m → 12m 22s (77% faster)
 
