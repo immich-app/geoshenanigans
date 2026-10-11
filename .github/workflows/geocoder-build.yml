@@ -621,16 +621,12 @@ jobs:
           # has finished, streaming its .zst to this date's (cleared) Tigris
           # prefix, and checks every file again once the build exits.
           # Detached so it outlives this step; the compress step waits for it.
-          # The upload holds back until yesterday's index is down: patch
-          # generation waits for that, and both share the runner's link.
-          UPLOAD_AFTER=()
-          if [ "$HAS_PREVIOUS" = "true" ]; then UPLOAD_AFTER=(--upload-after "$WORKDIR/old-output.status"); fi
           $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$TODAY/*" > /dev/null 2>&1 || true
           # shellcheck disable=SC2016
           setsid nohup bash -c '"$@"; echo $? > "$0"' "$WORKDIR/compress.status" \
-            ionice -c2 -n7 nice -n 10 python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output" \
+            nice -n 10 python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output" \
             --while-pid "$BUILD_PID" --upload "s3://$S3_BUCKET/$S3_PREFIX/builds/$TODAY" \
-            --upload-cmd "s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 16 run" "${UPLOAD_AFTER[@]}" \
+            --upload-cmd "s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 16 run" \
             > "$WORKDIR/compress.log" 2>&1 < /dev/null &
           COMPRESS_PID=$!
           echo "$COMPRESS_PID" > "$WORKDIR/compress.pid"
