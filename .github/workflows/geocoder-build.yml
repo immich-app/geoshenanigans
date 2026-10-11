@@ -621,10 +621,13 @@ jobs:
           # has finished, streaming its .zst to this date's (cleared) Tigris
           # prefix, and checks every file again once the build exits.
           # Detached so it outlives this step; the compress step waits for it.
+          # It comes last for the disk and the cores: yesterday's index,
+          # which patch generation waits for, shares the idle I/O class
+          # with it and runs at a higher priority.
           $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$TODAY/*" > /dev/null 2>&1 || true
           # shellcheck disable=SC2016
           setsid nohup bash -c '"$@"; echo $? > "$0"' "$WORKDIR/compress.status" \
-            nice -n 10 python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output" \
+            ionice -c3 nice -n 19 python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output" \
             --while-pid "$BUILD_PID" --upload "s3://$S3_BUCKET/$S3_PREFIX/builds/$TODAY" \
             --upload-cmd "s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 16 run" \
             > "$WORKDIR/compress.log" 2>&1 < /dev/null &
