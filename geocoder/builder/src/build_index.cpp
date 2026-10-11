@@ -4357,43 +4357,57 @@ static int run(int argc, char* argv[]) {
                     all_admin_results.clear();
                     log_phase("    Admin: parallel simplify", _pt, _cpu);
 
-                    // Sequential append + submit to S2 pool (cheap: just vector push + string intern)
-                    for (auto& pp : prepared) {
-                        if (pp.simplified.size() < 3) continue;
+                    // Append the rings of 3+ vertices, in order, on every core,
+                    // then hand them all to the S2 pool: a loop appending and
+                    // submitting them one by one took one core seconds.
+                    const std::vector<uint32_t> kept = parallel_filter(prepared.size(),
+                        [&](size_t i) { return prepared[i].simplified.size() >= 3; }, num_threads);
+                    std::vector<std::string_view> names(kept.size());
+                    for (size_t k = 0; k < kept.size(); k++) names[k] = prepared[kept[k]].name;
+                    const std::vector<uint32_t> name_ids = data.string_pool.intern_all(names, num_threads);
+                    const std::vector<size_t> vertex_at = parallel_offsets<size_t>(kept.size(),
+                        [&](size_t k) { return prepared[kept[k]].simplified.size(); }, num_threads);
+                    const size_t poly_base = grow_by(data.admin_polygons, kept.size());
+                    const size_t vertex_base = grow_by(data.admin_vertices, vertex_at.back());
+                    grow_by(data.admin_osm_ids, kept.size());
+                    std::vector<AdminCoverPool::WorkItem> cover(kept.size());
+                    parallel_for(kept.size(), [&](size_t begin, size_t end, unsigned) {
+                        for (size_t k = begin; k < end; k++) {
+                            auto& pp = prepared[kept[k]];
+                            uint32_t vertex_offset = static_cast<uint32_t>(vertex_base + vertex_at[k]);
+                            for (size_t v = 0; v < pp.simplified.size(); v++) {
+                                const auto& [lat, lng] = pp.simplified[v];
+                                data.admin_vertices[vertex_offset + v] = {static_cast<float>(lat), static_cast<float>(lng)};
+                            }
 
-                        uint32_t poly_id = static_cast<uint32_t>(data.admin_polygons.size());
-                        uint32_t vertex_offset = static_cast<uint32_t>(data.admin_vertices.size());
+                            AdminPolygon poly{};
+                            poly.vertex_offset = vertex_offset;
+                            poly.vertex_count = static_cast<uint32_t>(pp.simplified.size());
+                            poly.name_id = name_ids[k];
+                            poly.admin_level = pp.admin_level;
+                            poly.place_type_override = pp.place_type_override;
+                            poly.area = pp.area;
+                            const char* cc = pp.country_code.empty() ? nullptr : pp.country_code.c_str();
+                            poly.country_code = (cc && cc[0] && cc[1])
+                                ? pack_country_code(cc[0], cc[1]) : 0;
+                            data.admin_polygons[poly_base + k] = poly;
+                            // Strategy-2 stable identity, packed like addr/poi:
+                            // top 8 bits = ObjectType, bottom 56 bits = the
+                            // stable id. For relation-sourced admin polygons the
+                            // stable id is (relation_id<<16 | ring_index) — ring
+                            // in the low 16 bits, relation_id above (OSM has
+                            // ~20M relations, so this fits 56 bits comfortably).
+                            // The type byte keeps relation ids from colliding
+                            // with closed-way ids (which use OSM_WAY + way_id).
+                            data.admin_osm_ids[poly_base + k] =
+                                (static_cast<uint64_t>(gc::id_alloc::ObjectType::OSM_RELATION) << 56) |
+                                ((((static_cast<uint64_t>(pp.relation_id) << 16) |
+                                   static_cast<uint64_t>(pp.ring_index))) & 0x00FFFFFFFFFFFFFFull);
 
-                        for (const auto& [lat, lng] : pp.simplified) {
-                            data.admin_vertices.push_back({static_cast<float>(lat), static_cast<float>(lng)});
+                            cover[k] = {static_cast<uint32_t>(poly_base + k), std::move(pp.simplified)};
                         }
-
-                        AdminPolygon poly{};
-                        poly.vertex_offset = vertex_offset;
-                        poly.vertex_count = static_cast<uint32_t>(pp.simplified.size());
-                        poly.name_id = data.string_pool.intern(pp.name);
-                        poly.admin_level = pp.admin_level;
-                        poly.place_type_override = pp.place_type_override;
-                        poly.area = pp.area;
-                        const char* cc = pp.country_code.empty() ? nullptr : pp.country_code.c_str();
-                        poly.country_code = (cc && cc[0] && cc[1])
-                            ? pack_country_code(cc[0], cc[1]) : 0;
-                        data.admin_polygons.push_back(poly);
-                        // Strategy-2 stable identity, packed like addr/poi:
-                        // top 8 bits = ObjectType, bottom 56 bits = the
-                        // stable id. For relation-sourced admin polygons the
-                        // stable id is (relation_id<<16 | ring_index) — ring
-                        // in the low 16 bits, relation_id above (OSM has
-                        // ~20M relations, so this fits 56 bits comfortably).
-                        // The type byte keeps relation ids from colliding
-                        // with closed-way ids (which use OSM_WAY + way_id).
-                        data.admin_osm_ids.push_back(
-                            (static_cast<uint64_t>(gc::id_alloc::ObjectType::OSM_RELATION) << 56) |
-                            ((((static_cast<uint64_t>(pp.relation_id) << 16) |
-                               static_cast<uint64_t>(pp.ring_index))) & 0x00FFFFFFFFFFFFFFull));
-
-                        admin_pool.submit(poly_id, std::move(pp.simplified));
-                    }
+                    }, num_threads);
+                    admin_pool.submit_all(std::move(cover));
 
                     std::cerr << "  Parallel admin assembly complete: "
                               << total_admin_rings << " polygon rings from "

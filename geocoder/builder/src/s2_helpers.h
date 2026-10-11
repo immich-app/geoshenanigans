@@ -53,6 +53,8 @@ public:
     ~AdminCoverPool();
 
     void submit(uint32_t poly_id, std::vector<std::pair<double,double>>&& vertices);
+    // submit() for many polygons at once: one lock, one wake-up call.
+    void submit_all(std::vector<WorkItem>&& items);
     // Blocks until every submitted polygon is covered.
     void wait_idle();
     std::unordered_map<uint64_t, std::vector<uint32_t>> drain();

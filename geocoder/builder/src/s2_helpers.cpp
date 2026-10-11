@@ -229,6 +229,14 @@ void AdminCoverPool::submit(uint32_t poly_id, std::vector<std::pair<double,doubl
     cv_.notify_one();
 }
 
+void AdminCoverPool::submit_all(std::vector<WorkItem>&& items) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& item : items) queue_.push_back(std::move(item));
+    }
+    cv_.notify_all();
+}
+
 void AdminCoverPool::wait_idle() {
     std::unique_lock<std::mutex> lock(mutex_);
     done_cv_.wait(lock, [this]() { return queue_.empty() && active_workers_ == 0; });
