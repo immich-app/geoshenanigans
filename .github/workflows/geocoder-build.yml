@@ -227,46 +227,19 @@ jobs:
             return 1
           }
 
-          # ── Background: download previous indexes ──
+          # ── Background: previous strategy-2 sidecars ──
+          # The build reads yesterday's *.osm_ids sidecars (--prev-output),
+          # so they come first. The rest of yesterday's files only feed
+          # patch generation: fetch_previous_index.sh brings them in beside
+          # the build (Build geocoder index starts it).
           if [ "$HAS_PREVIOUS" = "true" ]; then
             (
               START=$(date +%s)
-              CACHE_BUILD="s3://$CACHE_BUCKET/geocoder-cache/builds/$YESTERDAY"
-
-              # Download only the compressed .bin.zst files — the patch step
-              # decompresses them locally. Excluding uncompressed .bin files
-              # is critical because older cache entries (backfilled before
-              # zstd compression was added) may still contain orphan .bin
-              # siblings that double the download size and can blow past
-              # the runner's disk quota during build-index.
-              if cache_exists "$CACHE_BUILD/.cache-complete" ".cache-complete"; then
-                echo "[indexes] Downloading $YESTERDAY from local cache..."
-                if ! retry 3 $CACHE cp --concurrency 16 --exclude "*.bin" "$CACHE_BUILD/*" "$WORKDIR/old-output/"; then
-                  echo "[indexes] Cache download failed — falling back to Tigris..."
-                  rm -rf "$WORKDIR/old-output"
-                  $S5 cp --concurrency 8 --exclude "*.bin" "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/*" "$WORKDIR/old-output/"
-                fi
-              else
-                echo "[indexes] Cache miss — downloading $YESTERDAY via Tigris S3..."
-                $S5 cp --concurrency 8 --exclude "*.bin" "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/*" "$WORKDIR/old-output/"
-
-                echo "[indexes] Backfilling local cache..."
-                $CACHE cp --concurrency 16 "$WORKDIR/old-output/*" "$CACHE_BUILD/" 2>/dev/null || true
-              fi
-
-              COUNT=$(find "$WORKDIR/old-output" -type f | wc -l)
+              $S5 cp --concurrency 8 "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY/*.osm_ids" "$WORKDIR/old-output/" > /dev/null
+              COUNT=$(find "$WORKDIR/old-output" -name "*.osm_ids" | wc -l)
               SIZE=$(du -sb "$WORKDIR/old-output" | cut -f1)
-              ELAPSED=$(($(date +%s) - START))
-              echo "[indexes] Done: $COUNT files ($((SIZE/1024/1024)) MiB) in ${ELAPSED}s ($((SIZE/1024/1024/(ELAPSED+1))) MB/s)"
-              if [ "$COUNT" -eq 0 ]; then echo "::error::Download produced 0 files"; exit 1; fi
-
-              # NOTE: old-output files are left COMPRESSED here. Decompression
-              # happens later, just before the patch step, because during the
-              # apply-replication-diffs step osmium writes a second copy of
-              # the 92 GB planet.osm.pbf which pushes peak disk usage to
-              # ~380+ GB when combined with decompressed old-output (~200 GB).
-              # By keeping old-output compressed (~89 GB) until after the PBF
-              # work is done, peak disk stays under ~280 GB.
+              echo "[sidecars] Done: $COUNT files ($((SIZE/1024/1024)) MiB) in $(($(date +%s) - START))s"
+              if [ "$COUNT" -eq 0 ]; then echo "::error::No strategy-2 sidecars for $YESTERDAY"; exit 1; fi
             ) &
             IDX_PID=$!
           fi
@@ -413,9 +386,9 @@ jobs:
             exit 1
           fi
 
-          # Wait for index download
+          # Wait for the sidecars
           if [ "$HAS_PREVIOUS" = "true" ]; then
-            echo "Waiting for index download..."
+            echo "Waiting for the sidecar download..."
             wait $IDX_PID
           fi
           echo "All downloads complete in $(($(date +%s) - STEP_START))s"
@@ -509,6 +482,8 @@ jobs:
           CACHE_ENDPOINT: ${{ steps.setup.outputs.cache_endpoint }}
           CACHE_BUCKET: ${{ steps.setup.outputs.cache_bucket }}
           TODAY: ${{ steps.setup.outputs.today }}
+          YESTERDAY: ${{ steps.setup.outputs.yesterday }}
+          HAS_PREVIOUS: ${{ steps.setup.outputs.has_previous }}
           PBF_SOURCE: ${{ steps.download.outputs.pbf_source }}
           WIKIDATA_FILE: ${{ steps.download.outputs.wikidata_sitelinks }}
           WIKIDATA_DATE: ${{ steps.download.outputs.wikidata_date }}
@@ -518,11 +493,25 @@ jobs:
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 4"
 
-          # Cache the up-to-date PBF in background (skip if today's was already cached)
+          # Two transfers run beside the build, detached so they outlive this
+          # step; each writes its exit status last for the step that needs it.
+          # - Today's PBF goes to the cache for tomorrow's run (skipped if it
+          #   came from there); Finalize waits for it, then frees the disk.
+          # - Yesterday's client files come down and decompress for patch
+          #   generation, which waits for them.
           if [ "$PBF_SOURCE" != "today" ]; then
             echo "Caching today's PBF in background..."
-            $CACHE cp --concurrency 16 "$WORKDIR/planet.osm.pbf" \
-              "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" &
+            # The inner script expands its own arguments ($0 is the status file).
+            # shellcheck disable=SC2016
+            setsid nohup bash -c '"$@"; echo $? > "$0"' "$WORKDIR/pbf-cache.status" \
+              $CACHE cp --concurrency 16 "$WORKDIR/planet.osm.pbf" "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" \
+              > "$WORKDIR/pbf-cache.log" 2>&1 < /dev/null &
+          fi
+          if [ "$HAS_PREVIOUS" = "true" ]; then
+            echo "Fetching yesterday's index in background..."
+            setsid nohup "$GITHUB_WORKSPACE/geocoder/builder/tools/fetch_previous_index.sh" \
+              "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY" "$WORKDIR/old-output" "$WORKDIR/old-output.status" \
+              > "$WORKDIR/old-output.log" 2>&1 < /dev/null &
           fi
 
           # Build args
@@ -598,9 +587,6 @@ jobs:
           cp "$GITHUB_WORKSPACE/geocoder/builder/configurations.template.json" \
              "$WORKDIR/output/configurations.json"
 
-          # Wait for background PBF cache upload, then free disk
-          wait
-          rm -f "$WORKDIR/planet.osm.pbf"
           df -h "$WORKDIR" | tee -a "$GITHUB_STEP_SUMMARY"
 
       # ── Generate patches + verify ─────────────────────────────────
@@ -608,32 +594,29 @@ jobs:
         if: steps.setup.outputs.has_previous == 'true'
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
-          CACHE_ENDPOINT: ${{ steps.setup.outputs.cache_endpoint }}
-          CACHE_BUCKET: ${{ steps.setup.outputs.cache_bucket }}
           OLD_DATE: ${{ steps.setup.outputs.yesterday }}
           NEW_DATE: ${{ steps.setup.outputs.today }}
         run: |
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
-          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
 
           echo "Disk at start of patch step:"
           df -h "$WORKDIR"
 
-          # Decompress old-output .bin.zst files now — deferred from the
-          # download step to avoid peak disk usage during apply-changes.
-          # At this point, PBF has been freed (end of build step) so we
-          # have plenty of headroom. `-f` overwrites any pre-existing .bin
-          # from a stale cache, `--rm` removes the .zst source after
-          # successful decompression.
-          DECOMP_START=$(date +%s)
-          ZST_COUNT=$(find "$WORKDIR/old-output" -name "*.bin.zst" | wc -l)
-          if [ "$ZST_COUNT" -gt 0 ]; then
-            echo "[old-output] Decompressing $ZST_COUNT .bin.zst files..."
-            find "$WORKDIR/old-output" -name "*.bin.zst" -print0 \
-              | xargs -0 -n1 -P8 zstd -d -T0 -f --rm --quiet
-            echo "[old-output] Decompressed in $(($(date +%s) - DECOMP_START))s"
-            df -h "$WORKDIR"
+          # Yesterday's client files came down and decompressed beside the
+          # build (fetch_previous_index.sh, started by the build step).
+          WAIT_START=$(date +%s)
+          until [ -s "$WORKDIR/old-output.status" ]; do
+            if [ $(( $(date +%s) - WAIT_START )) -gt 3600 ]; then
+              echo "::error::Yesterday's index fetch did not finish within an hour"; exit 1
+            fi
+            sleep 10
+          done
+          cat "$WORKDIR/old-output.log"
+          echo "[old-output] Waited $(( $(date +%s) - WAIT_START ))s for it"
+          if [ "$(cat "$WORKDIR/old-output.status")" != 0 ]; then
+            echo "::error::Fetching yesterday's index failed"; exit 1
           fi
+          df -h "$WORKDIR"
 
           # Compress the new index alongside the diffs, whose long tail
           # (planet/full) leaves most cores idle. It keeps the .bin files the
@@ -761,15 +744,12 @@ jobs:
       - name: Finalize upload and configurations.json
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
-          CACHE_ENDPOINT: ${{ steps.setup.outputs.cache_endpoint }}
-          CACHE_BUCKET: ${{ steps.setup.outputs.cache_bucket }}
           NEW_DATE: ${{ steps.setup.outputs.today }}
           OLD_DATE: ${{ steps.setup.outputs.yesterday }}
           HAS_PREVIOUS: ${{ steps.setup.outputs.has_previous }}
           WIKIDATA_DATE: ${{ steps.download.outputs.wikidata_date || 'null' }}
         run: |
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
-          CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
 
           # Upload the patches, json and sidecars, plus any .zst the
           # compression stream missed. Tigris occasionally fails multipart
@@ -785,10 +765,6 @@ jobs:
           # there breaks strategy-2 chaining and balloons the next
           # patch back to multi-GiB. The cleanup step further down
           # ages them out at the same rate as full builds (3 days).
-          # The in-cluster cache copy runs alongside the Tigris upload.
-          $CACHE cp --concurrency 16 \
-            "$WORKDIR/output/*" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/" > /dev/null 2>&1 &
-          CACHE_PID=$!
           # The .zst files streamed up during compression (the prefix was
           # cleared then): only what is missing or differs in size goes now.
           # The runner's ~1 Gbit/s link caps the rate; 16 workers reach it.
@@ -796,7 +772,6 @@ jobs:
             "$WORKDIR/output/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/" || \
             echo "::warning::Some files failed on first pass — verify loop will retry"
           echo "Tigris upload first pass complete in $(($(date +%s) - UPLOAD_START))s"
-          wait $CACHE_PID || true
 
           # ── Augment configurations.json with build metadata ─────────
           # Splices date / previous / built_at / wikidata_date into the
@@ -824,15 +799,9 @@ jobs:
           echo "$(wc -l < "$WORKDIR/output/checksums.sha256") file checksums generated"
 
           # Upload configurations.json + checksums (index files + patches
-          # already uploaded above). Note: checksums.sha256 is generated
-          # AFTER the bulk cache cp at the top of this step, so we
-          # re-upload it (and configurations.json) to cache here so the
-          # sentinel check sees the full file set — otherwise every build
-          # warns "Cache incomplete (N-1/N) — no sentinel".
+          # already uploaded above).
           $S5 cp "$WORKDIR/output/configurations.json" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/configurations.json"
           $S5 cp "$WORKDIR/output/checksums.sha256" "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/checksums.sha256"
-          $CACHE cp "$WORKDIR/output/configurations.json" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/configurations.json" 2>/dev/null || true
-          $CACHE cp "$WORKDIR/output/checksums.sha256" "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/checksums.sha256" 2>/dev/null || true
 
           # Verify upload completeness — walk local files and re-upload any that
           # failed to land on Tigris. Use serial single-file uploads for the retry
@@ -882,16 +851,6 @@ jobs:
               comm -23 /tmp/local.txt /tmp/remote2.txt
               exit 1
             fi
-          fi
-
-          # Cache sentinel
-          CACHE_COUNT=$($CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/*" 2>/dev/null | wc -l)
-          if [ "$CACHE_COUNT" -ge "$LOCAL_COUNT" ]; then
-            echo "{\"date\":\"$NEW_DATE\",\"files\":$LOCAL_COUNT,\"cached_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" \
-              | $CACHE pipe "s3://$CACHE_BUCKET/geocoder-cache/builds/$NEW_DATE/.cache-complete"
-            echo "Cache sentinel written"
-          else
-            echo "::warning::Cache incomplete ($CACHE_COUNT/$LOCAL_COUNT) — no sentinel"
           fi
 
           # ── Update latest.json ──
@@ -950,6 +909,17 @@ jobs:
           fi
 
           echo "Upload complete."
+
+          # Today's PBF went to the cache beside the build (tomorrow's run
+          # starts from it): let it finish before the job frees the disk.
+          if [ -f "$WORKDIR/pbf-cache.log" ]; then
+            until [ -s "$WORKDIR/pbf-cache.status" ]; do sleep 10; done
+            if [ "$(cat "$WORKDIR/pbf-cache.status")" != 0 ]; then
+              echo "::warning::Caching today's PBF failed; tomorrow downloads it from a mirror"
+              cat "$WORKDIR/pbf-cache.log"
+            fi
+          fi
+          rm -f "$WORKDIR/planet.osm.pbf"
 
       # ── Cleanup old Tigris builds ──────────────────────────────────────
       # Retention policy:
