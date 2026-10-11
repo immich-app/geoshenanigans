@@ -592,7 +592,8 @@ inline std::vector<uint32_t> permute_admin_polygons(ParsedData& data, const std:
     }, threads);
     if (data.admin_osm_ids.size() == n) data.admin_osm_ids = gather(data.admin_osm_ids, order, threads);
     data.admin_polygons = std::move(new_polys);
-    data.admin_vertices = std::move(repacked.items);
+    data.admin_vertices.swap(repacked.items);
+    free_beside(std::move(repacked.items));
     return old_to_new;
 }
 

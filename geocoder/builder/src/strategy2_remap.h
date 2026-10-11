@@ -39,7 +39,8 @@ void reorder_by_remap(std::vector<T>& values, const std::vector<uint32_t>& remap
     parallel_for(std::min(values.size(), remap.size()), [&](size_t begin, size_t end, unsigned) {
         for (size_t i = begin; i < end; i++) out[remap[i]] = values[i];
     });
-    values = std::move(out);
+    values.swap(out);
+    free_beside(std::move(out));
 }
 
 // Copies each record's nodes into a new array in record order and points the
@@ -68,7 +69,8 @@ void repack_nodes(std::vector<Record>& records, std::vector<NodeCoord>& nodes) {
             r.node_offset = static_cast<uint32_t>(offset);
             return r.node_count;
         });
-    nodes = std::move(packed);
+    nodes.swap(packed);
+    free_beside(std::move(packed));
 }
 
 // Remap every id of a cell → ids table and restore its canonical order (each

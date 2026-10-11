@@ -44,13 +44,6 @@ void release_gently(Container& nodes) {
     Container().swap(nodes);
 }
 
-// Frees a vector on a thread of its own: unmapping a planet-sized vector
-// takes one core a second. The future's destructor waits for it.
-template <class T>
-std::future<void> free_beside(std::vector<T>&& v) {
-    return std::async(std::launch::async, [v = std::move(v)]() mutable { std::vector<T>().swap(v); });
-}
-
 // Threads kept between tasks: a task runs on an idle one, or on a new one
 // when none is, so every task starts at once, as on a thread of its own.
 // Starting a thread per parallel_for range costs more than many ranges'
@@ -104,6 +97,18 @@ private:
     std::vector<std::unique_ptr<Worker>> workers_;
     std::vector<Worker*> idle_;
 };
+
+// Frees a vector on a thread of its own, beside whatever comes next:
+// unmapping a planet-sized vector takes one core a second. The future is
+// ready once it is freed; dropping it does not wait.
+template <class T>
+std::future<void> free_beside(std::vector<T>&& v) {
+    auto task = std::make_shared<std::packaged_task<void()>>(
+        [v = std::move(v)]() mutable { std::vector<T>().swap(v); });
+    std::future<void> freed = task->get_future();
+    ThreadCache::instance().run([task] { (*task)(); });
+    return freed;
+}
 
 // Runs fn(begin, end, worker) over at most `threads` contiguous ranges that
 // cover [0, n), one thread each (0 = every core). The ranges move with the
@@ -658,6 +663,7 @@ void parallel_sort(It first, It last, Cmp cmp, unsigned threads = 0) {
     parallel_for(n, [&](size_t b, size_t e, unsigned) {
         std::move(out.begin() + b, out.begin() + e, first + b);
     }, threads);
+    free_beside(std::move(out));
 }
 
 // The indices [0, n) by descending cost(i), ties by index: an order to hand
@@ -861,6 +867,7 @@ SortedIndices parallel_sort_keys(size_t n, KeyOf key_of, KeyLess key_less, TieMa
     parallel_for(n, [&](size_t b, size_t e, unsigned) {
         for (size_t i = b; i < e; i++) order[i] = keys[i].index;
     }, threads);
+    free_beside(std::move(keys));
     return {std::move(order), ties};
 }
 
