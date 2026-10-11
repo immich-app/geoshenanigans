@@ -13,6 +13,9 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "geometry.h"
@@ -230,6 +233,7 @@ static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir
 
     reorder_by_remap(data.admin_polygons, remap, n_new, admin_polygon_tombstone());
     reorder_by_remap(data.admin_osm_ids, remap, n_new, uint64_t(0));
+    if (!data.admin_planet_ids.empty()) reorder_by_remap(data.admin_planet_ids, remap, n_new, NO_DATA);
     if (!data.admin_parent_ids.empty()) reorder_by_remap(data.admin_parent_ids, remap, n_new, NO_DATA);
 
     // Apply remap to every reference site that points into admin_polygons[].
@@ -1101,8 +1105,61 @@ static void write_packed_polygons(const std::string& path, size_t n, BytesOf byt
     if (!f) throw std::runtime_error("failed to write " + path);
 }
 
+// A continent's polygons packed as in the planet's finished variant at the
+// same scale (planet_variant): the same vertices and level pack to the same
+// bytes, so each takes its planet polygon's record and bytes rather than
+// being simplified again. False when the planet's files can't be read.
+static bool copy_planet_polygons(const ParsedData& data, const std::string& planet_variant,
+                                 std::vector<PackedPolygon>& packed) {
+    std::ifstream records(planet_variant + "/admin_polygons.bin", std::ios::binary | std::ios::ate);
+    if (!records) return false;
+    const auto polygon_bytes = static_cast<size_t>(records.tellg());
+    if (polygon_bytes % sizeof(AdminPolygon) != 0) return false;
+    std::vector<AdminPolygon> planet(polygon_bytes / sizeof(AdminPolygon));
+    records.seekg(0);
+    records.read(reinterpret_cast<char*>(planet.data()), static_cast<std::streamsize>(polygon_bytes));
+    if (!records) return false;
+
+    const int fd = ::open((planet_variant + "/admin_vertices.bin").c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    struct stat st{};
+    const bool sized = ::fstat(fd, &st) == 0;
+    const size_t file_bytes = sized ? static_cast<size_t>(st.st_size) : 0;
+    // The records' 32-bit offsets locate bytes only in a file under 4 GiB.
+    const bool addressable = sized && file_bytes <= UINT32_MAX;
+    void* map = addressable && file_bytes ? ::mmap(nullptr, file_bytes, PROT_READ, MAP_PRIVATE, fd, 0) : nullptr;
+    ::close(fd);
+    if (!addressable || map == MAP_FAILED) return false;
+    const uint8_t* bytes = static_cast<const uint8_t*>(map);
+
+    // A polygon's bytes run to where the next packed one's start, or the
+    // file's end: the variant lays them back to back in id order.
+    std::vector<size_t> end(planet.size());
+    for (size_t p = planet.size(), next = file_bytes; p-- > 0;) {
+        end[p] = next;
+        if (planet[p].vertex_count > 0) next = planet[p].vertex_offset;
+    }
+    std::atomic<bool> fits{true};
+    parallel_for(packed.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t j = b; j < e; j++) {
+            const uint32_t p = data.admin_planet_ids[j];
+            if (p >= planet.size() || planet[p].vertex_count == 0) continue;
+            if (planet[p].vertex_offset > end[p] || end[p] > file_bytes) {
+                fits = false;
+                continue;
+            }
+            packed[j].bytes.assign(bytes + planet[p].vertex_offset, bytes + end[p]);
+            packed[j].vertex_count = planet[p].vertex_count;
+            packed[j].area = planet[p].area;
+        }
+    });
+    if (file_bytes) ::munmap(map, file_bytes);
+    return fits;
+}
+
 void write_quality_variant(const ParsedData& data, const std::string& source_dir,
-                           const std::string& output_dir, double epsilon_scale) {
+                           const std::string& output_dir, double epsilon_scale,
+                           const std::string& planet_variant) {
     ensure_dir(output_dir);
     const std::string label = "      " + dir_label(output_dir) + ": ";
     auto _qt = std::chrono::steady_clock::now();
@@ -1110,11 +1167,16 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
 
     const size_t n = data.admin_polygons.size();
     std::vector<PackedPolygon> packed(n);
-    parallel_for_dynamic(n, 1, [&](size_t begin, size_t end, unsigned) {
-        for (size_t i = begin; i < end; i++)
-            packed[i] = pack_admin_polygon(data, data.admin_polygons[i], epsilon_scale);
-    });
-    log_phase((label + "simplify").c_str(), _qt, _qc);
+    const bool copied = !planet_variant.empty() && data.admin_planet_ids.size() == n &&
+                        copy_planet_polygons(data, planet_variant, packed);
+    if (!copied) {
+        packed.assign(n, PackedPolygon{});
+        parallel_for_dynamic(n, 1, [&](size_t begin, size_t end, unsigned) {
+            for (size_t i = begin; i < end; i++)
+                packed[i] = pack_admin_polygon(data, data.admin_polygons[i], epsilon_scale);
+        });
+    }
+    log_phase((label + (copied ? "copy from the planet" : "simplify")).c_str(), _qt, _qc);
 
     // admin_polygons.bin MUST stay index-aligned with data.admin_polygons:
     // the cell index (admin_cells/admin_entries, written by the full/admin

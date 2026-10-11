@@ -52,8 +52,11 @@ void emit_strategy2_sidecar(const std::string& path,
 
 // Write admin polygon/vertex files with on-the-fly simplification at a given epsilon scale.
 // Scale 0 = uncapped (no simplification). Other files are symlinked/copied from source_dir.
+// A continent given the planet's finished variant at the same scale
+// (planet_variant) copies its polygons from it (see admin_planet_ids).
 void write_quality_variant(const ParsedData& data, const std::string& source_dir,
-                           const std::string& output_dir, double epsilon_scale);
+                           const std::string& output_dir, double epsilon_scale,
+                           const std::string& planet_variant = "");
 
 // Write a minimal admin polygon/vertex pair containing only polygons whose
 // admin_level falls in [2, 8] (drops L9/L10/L11/L15 sub-municipal levels).

@@ -1738,17 +1738,26 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
         return buf;
     };
 
+    enum class RegionRun { Planet, Continent };
+
+    // The planet's quality variants, each marked done once its files are
+    // written: a continent's variant at the same scale then copies its
+    // polygons from them rather than simplifying them again.
+    std::vector<std::atomic<bool>> planet_quality_done(quality_scales.size());
+    const std::string planet_quality_dir = output_dir + "/planet" + (multi_output ? "/quality" : "");
+
     // Write quality variants in parallel (bounded concurrency).
     // Each variant does parallel simplification internally, so limit
     // concurrency to avoid over-subscribing CPU.
-    auto write_qualities = [&](const ParsedData& d, const std::string& admin_dir) {
+    auto write_qualities = [&](const ParsedData& d, const std::string& admin_dir, RegionRun run) {
         constexpr unsigned max_concurrent_qualities = 3;
         std::atomic<unsigned> active{0};
         std::mutex qmtx;
         std::condition_variable qcv;
         std::vector<std::future<void>> qfutures;
 
-        for (double scale : quality_scales) {
+        for (size_t k = 0; k < quality_scales.size(); k++) {
+            const double scale = quality_scales[k];
             {
                 std::unique_lock<std::mutex> lock(qmtx);
                 qcv.wait(lock, [&]{ return active.load() < max_concurrent_qualities; });
@@ -1757,8 +1766,11 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
 
             std::string qname = quality_dir_name(scale);
             std::string qdir = admin_dir + "/" + qname;
-            qfutures.push_back(std::async(std::launch::async, [&, qdir, scale]() {
-                write_quality_variant(d, admin_dir, qdir, scale);
+            qfutures.push_back(std::async(std::launch::async, [&, qdir, qname, scale, k]() {
+                const bool from_planet =
+                    run == RegionRun::Continent && planet_quality_done[k].load(std::memory_order_acquire);
+                write_quality_variant(d, admin_dir, qdir, scale, from_planet ? planet_quality_dir + "/" + qname : "");
+                if (run == RegionRun::Planet) planet_quality_done[k].store(true, std::memory_order_release);
                 // Decrement under the mutex: an unlocked change + notify can
                 // fire between the waiter's predicate check and its block,
                 // losing the wakeup (deadlock when max_concurrent is 1).
@@ -1786,7 +1798,6 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
     // `order` runs the stages (and a continent's strategy-2 passes) at once
     // or one after another. With a `budget`, each stage holds its estimated
     // cost of it while it runs, beside whatever else holds the rest.
-    enum class RegionRun { Planet, Continent };
     auto write_region = [&](ParsedData& d, const std::string& base_dir, RegionRun run, RunOrder order,
                             MemoryBudget* budget) {
         ensure_dir(base_dir);
@@ -1821,7 +1832,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             if (multi_quality) {
                 std::string quality_dir = multi_output ? base_dir + "/quality" : base_dir;
                 std::cerr << "  Writing quality variants for " << base_dir << "..." << std::endl;
-                write_qualities(d, quality_dir);
+                write_qualities(d, quality_dir, run);
             }
 
         };

@@ -316,6 +316,10 @@ struct ParsedData {
     // polygons, OSM_WAY + way_id for closed-way polygons (stable ids since
     // #105). Strategy-2 IdAllocator keys on this.
     std::vector<uint64_t> admin_osm_ids;
+    // A continent's admin polygons' planet ids, parallel to admin_polygons
+    // (NO_DATA for a strategy-2 tombstone); empty for the planet. Its
+    // quality variants take each polygon from the planet's.
+    std::vector<uint32_t> admin_planet_ids;
     std::vector<gc::id_alloc::SidecarSlot> admin_sidecar_blob;
     std::vector<gc::id_alloc::SidecarSlot> addr_sidecar_blob;
     std::vector<gc::id_alloc::SidecarSlot> place_sidecar_blob;

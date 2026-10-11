@@ -228,6 +228,7 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
             [](AdminPolygon& ap, uint32_t offset, uint32_t) { ap.vertex_offset = offset; },
             out.admin_polygons, out.admin_vertices);
         out.admin_osm_ids = subset_osm_ids(used_admin_ids, admin_remap, out.admin_polygons.size(), full.admin_osm_ids);
+        out.admin_planet_ids = used_admin_ids;  // every one is kept
         drop(full.admin_polygons, full.admin_vertices, full.admin_osm_ids);
     };
 
