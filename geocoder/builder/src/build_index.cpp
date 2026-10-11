@@ -1019,25 +1019,33 @@ static void emit_polyline_cells(const NodeCoord* nodes, uint16_t count, uint32_t
 // copy and no scratch table. Pairs equal under cell_item_less are equal in
 // both fields, so the order is unique. sorted_out is used directly for
 // writing; the cell maps stay empty (only needed for cache/continent modes).
-// A sorted_out already holding as many pairs as the lists (made beside
-// earlier work) is filled as it is; any other is made on every core.
-static void parallel_sort_and_build(
-    std::vector<std::vector<CellItemPair>>& thread_pairs,
-    std::vector<CellItemPair>& sorted_out
-) {
+static void sort_pair_lists(std::vector<std::vector<CellItemPair>>& thread_pairs) {
+    parallel_for_each(thread_pairs.size(), [&](size_t t, unsigned) {
+        std::sort(thread_pairs[t].begin(), thread_pairs[t].end(), cell_item_less);
+    });
+}
+
+// The merge step, for lists sort_pair_lists sorted. A sorted_out already
+// holding as many pairs as the lists (made beside earlier work) is filled as
+// it is; any other is made on every core.
+static void merge_pair_lists(std::vector<std::vector<CellItemPair>>& thread_pairs,
+                             std::vector<CellItemPair>& sorted_out) {
     size_t total = 0;
     for (const auto& pairs : thread_pairs) total += pairs.size();
     if (sorted_out.size() != total) {
         sorted_out.clear();
         grow_by(sorted_out, total);
     }
-    parallel_for_each(thread_pairs.size(), [&](size_t t, unsigned) {
-        std::sort(thread_pairs[t].begin(), thread_pairs[t].end(), cell_item_less);
-    });
     std::vector<std::pair<CellItemPair*, size_t>> runs;
     for (auto& pairs : thread_pairs) runs.push_back({pairs.data(), pairs.size()});
     parallel_merge(runs, sorted_out.data(), cell_item_less);
     parallel_for_each(thread_pairs.size(), [&](size_t t, unsigned) { thread_pairs[t] = {}; });
+}
+
+static void parallel_sort_and_build(std::vector<std::vector<CellItemPair>>& thread_pairs,
+                                    std::vector<CellItemPair>& sorted_out) {
+    sort_pair_lists(thread_pairs);
+    merge_pair_lists(thread_pairs, sorted_out);
 }
 
 // Place-node addressline containment: for each place node, record the smallest-area
@@ -1524,15 +1532,14 @@ static void compute_s2_cells_ways_interp(ParsedData& data, const BuildConfig& cf
             emit_polyline_cells(data.street_nodes.data() + dw.node_offset, dw.node_count, dw.way_id, scratch, out);
         });
     log_phase("  S2: street ways (parallel)", _s2t, _s2cpu);
-    // The street table's pages take seconds to fault in, even on every
-    // core: that happens while the interps are covered.
+    // The street table's pages take seconds to fault in on one core: that
+    // core takes them while the others cover the interps and sort the
+    // street pairs. Faulting them on every core costs more than it saves
+    // there.
     size_t way_pair_count = 0;
     for (const auto& pairs : way_pairs) way_pair_count += pairs.size();
-    auto way_cells = std::async(std::launch::async, [way_pair_count] {
-        std::vector<CellItemPair> cells;
-        grow_by(cells, way_pair_count);
-        return cells;
-    });
+    auto way_cells = vector_beside<CellItemPair>(way_pair_count);
+    auto ways_sorted = std::async(std::launch::async, [&] { sort_pair_lists(way_pairs); });
 
     // Process interpolations: emit (cell_id, interp_id) pairs
     std::cerr << "  Processing " << data.deferred_interps.size() << " interpolation ways..." << std::endl;
@@ -1542,12 +1549,13 @@ static void compute_s2_cells_ways_interp(ParsedData& data, const BuildConfig& cf
             emit_polyline_cells(data.interp_nodes.data() + di.node_offset, di.node_count, di.interp_id, scratch, out);
         });
     log_phase("  S2: interp ways (parallel)", _s2t, _s2cpu);
+    ways_sorted.get();
     data.sorted_way_cells = way_cells.get();
 
     // Merge the per-worker pairs into single sorted tables.
     std::cerr << "  Sorting and grouping cell pairs..." << std::endl;
     auto f_ways = std::async(std::launch::async, [&] {
-        parallel_sort_and_build(way_pairs, data.sorted_way_cells);
+        merge_pair_lists(way_pairs, data.sorted_way_cells);
     });
     auto f_interps = std::async(std::launch::async, [&] {
         parallel_sort_and_build(interp_pairs, data.sorted_interp_cells);
