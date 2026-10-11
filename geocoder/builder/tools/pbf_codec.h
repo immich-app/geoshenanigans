@@ -5,8 +5,10 @@
 // and write the header block.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <fcntl.h>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -728,13 +730,23 @@ inline Parse first_object(const uint8_t* p, const uint8_t* end, bool complete, B
 
 }  // namespace pbf_peek_detail
 
+// Where the data (the Blob message) of blob `info` starts in its file.
+inline size_t blob_data_offset(const BlobInfo& info) { return info.offset + 4 + info.header_size; }
+
+// Asks for the bytes peek_first_object(fd, info, first_read) reads first,
+// without waiting for them. Advice only.
+inline void prefetch_peek(int fd, const BlobInfo& info, size_t first_read = kPeekFirstReadBytes) {
+    posix_fadvise(fd, static_cast<off_t>(blob_data_offset(info)),
+                  static_cast<off_t>(std::min(first_read, info.data_size)), POSIX_FADV_WILLNEED);
+}
+
 // The type and id of the first object in the data blob `info` of fd,
 // inflating only as much of it as that takes: reads `first_read` bytes,
 // then twice as many each time more are needed.
 inline BlobPeek peek_first_object(int fd, const BlobInfo& info, size_t first_read = kPeekFirstReadBytes) {
     using namespace pbf_peek_detail;
     BlobPeek out;
-    const size_t data_offset = info.offset + 4 + info.header_size;
+    const size_t data_offset = blob_data_offset(info);
     std::string buf;
     size_t have = 0;  // bytes of the blob read into buf
     auto read_to = [&](size_t want) {

@@ -55,6 +55,11 @@
 constexpr size_t kCopySpanBytes = size_t(1) << 20;
 // Output pieces produced ahead of the writer, per thread.
 constexpr size_t kWritesAheadPerThread = 16;
+// How many blobs ahead a peek's first read is asked for: on a cold input
+// the reads then overlap instead of each peek waiting on its own (planet
+// scan 9.6 s, 8.0 s with these). More peek threads did as well, but took
+// the cores from the thread inflating the change file when it is cached.
+constexpr size_t kPeekPrefetchBlobs = 256;
 
 // osmium's object_order_type_id_reverse_version on two objects of one type
 // and id: whether a sorts before b, newest first. Timestamps count only
@@ -254,6 +259,7 @@ inline InputLayout scan_input(const std::string& path, unsigned threads) {
     posix_fadvise(fd.get(), 0, 0, POSIX_FADV_RANDOM);
     in.peeks.resize(in.blobs.size());
     parallel_for_each(in.blobs.size() - 1, [&](size_t i, unsigned) {
+        if (i + 1 + kPeekPrefetchBlobs < in.blobs.size()) prefetch_peek(fd.get(), in.blobs[i + 1 + kPeekPrefetchBlobs]);
         in.peeks[i + 1] = peek_first_object(fd.get(), in.blobs[i + 1]);
     }, threads);
     for (size_t i = 1, prev = 0; i < in.blobs.size(); i++) {
