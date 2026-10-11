@@ -41,9 +41,20 @@ unpack() {
   printf '%s  %s\n%s  %s\n' "$4" "$orig" "$5" "$deb" | sha256sum -c --quiet
   tar xzf "$orig"
   tar xJf "$deb" -C "$1-$2"
-  while read -r p; do
-    [ -n "$p" ] && patch -s -d "$1-$2" -p1 < "$1-$2/debian/patches/$p"
-  done < "$1-$2/debian/patches/series"
+  apply_series "$1-$2" "$1-$2/debian/patches"
+}
+
+# apply_series <tree> <patch dir>: the patches quilt's series file lists, in
+# order. A line is a patch and its patch options (-p1 when none); # starts a
+# comment; the last line may lack its newline.
+apply_series() {
+  local line words
+  while IFS= read -r line || [ -n "$line" ]; do
+    read -r -a words <<< "${line%%#*}"
+    [ ${#words[@]} -gt 0 ] || continue
+    [ ${#words[@]} -gt 1 ] || words+=(-p1)
+    patch -s -d "$1" "${words[@]:1}" < "$2/${words[0]}"
+  done < "$2/series"
 }
 
 # build_static <source dir> [cmake args...]: build and install into <prefix>.
@@ -65,6 +76,7 @@ unpack s2geometry 0.10.0 6.1build4 \
 build_static s2geometry-0.10.0 -DBUILD_EXAMPLES=OFF -DWITH_PYTHON=OFF -Dabsl_DIR="$prefix/lib/cmake/absl"
 
 # A manifest of everything installed: a restored copy is checked against it.
-(cd "$prefix" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+(cd "$prefix" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > "$work/SHA256SUMS")
+mv "$work/SHA256SUMS" "$prefix/SHA256SUMS"
 
 echo "S2 and abseil (NDEBUG, static) installed in $prefix"
