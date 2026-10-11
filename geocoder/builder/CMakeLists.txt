@@ -12,8 +12,15 @@ find_package(EXPAT REQUIRED)
 # GEOCODER_S2_PREFIX links the static S2 and abseil that tools/build_s2.sh
 # installed there (both without their debug checks, as CI builds them).
 # Without it the system S2 (and abseil) are used; they are only looked up
-# then, so a system absl_DIR can't shadow the prefix's abseil.
+# then, so a system absl_DIR can't shadow the prefix's abseil. A build dir
+# switched between the two looks them up again: the cached absl_DIR would
+# link the other abseil beside this one.
 set(GEOCODER_S2_PREFIX "" CACHE PATH "Prefix of a static S2 and abseil from tools/build_s2.sh")
+if(NOT "${GEOCODER_S2_PREFIX}" STREQUAL "${GEOCODER_S2_PREFIX_CONFIGURED}")
+    unset(absl_DIR CACHE)
+    unset(s2_DIR CACHE)
+endif()
+set(GEOCODER_S2_PREFIX_CONFIGURED "${GEOCODER_S2_PREFIX}" CACHE INTERNAL "GEOCODER_S2_PREFIX at the last configure")
 if(NOT GEOCODER_S2_PREFIX)
     find_package(s2 QUIET)
     find_package(absl QUIET)
