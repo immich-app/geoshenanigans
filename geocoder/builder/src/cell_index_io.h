@@ -43,53 +43,83 @@ inline uint16_t checked_entry_count(size_t n, const std::string& path) {
     return static_cast<uint16_t>(n);
 }
 
+// Writes a cell index's two files, laid out on every core: cell c of
+// [0, cells) (cell_id(c) ascending) has a row in the cells file, its id and
+// where its entry starts in the entries file, and the entry: its item count,
+// size(c), then the items, which items(c, out) copies to `out`.
+template <class CellId, class Size, class Items>
+void write_cell_entries(const std::string& cells_path, const std::string& entries_path, size_t cells,
+                        CellId cell_id, Size size, Items items) {
+    constexpr size_t kRowBytes = sizeof(uint64_t) + sizeof(uint32_t);
+    std::vector<size_t> block_longest(parallel_threads(), 0);
+    const size_t blocks = parallel_blocks(cells, [&](size_t b, size_t begin, size_t end) {
+        for (size_t c = begin; c < end; c++) block_longest[b] = std::max(block_longest[b], size_t(size(c)));
+    });
+    const size_t longest = blocks ? *std::max_element(block_longest.begin(), block_longest.begin() + blocks) : 0;
+    checked_entry_count(longest, entries_path);
+
+    const std::vector<uint64_t> at = parallel_offsets<uint64_t>(cells, [&](size_t c) {
+        return uint64_t(sizeof(uint16_t) + size(c) * sizeof(uint32_t));
+    });
+    std::vector<char> rows, entries;
+    parallel_resize(rows, cells * kRowBytes);
+    parallel_resize(entries, at[cells]);
+    parallel_for(cells, [&](size_t b, size_t e, unsigned) {
+        for (size_t c = b; c < e; c++) {
+            const uint64_t id = cell_id(c);
+            // The entry offset field is 32 bits; it wraps as the serial writer's did.
+            const uint32_t offset = static_cast<uint32_t>(at[c]);
+            const uint16_t count = static_cast<uint16_t>(size(c));
+            std::memcpy(rows.data() + c * kRowBytes, &id, sizeof(id));
+            std::memcpy(rows.data() + c * kRowBytes + sizeof(id), &offset, sizeof(offset));
+            std::memcpy(entries.data() + at[c], &count, sizeof(count));
+            items(c, entries.data() + at[c] + sizeof(count));
+        }
+    });
+    write_binary_file(cells_path, rows.data(), rows.size());
+    write_binary_file(entries_path, entries.data(), entries.size());
+    std::cerr << "  " << entries_path << ": max entries/cell = " << longest << std::endl;
+}
+
 inline void write_cell_index(
     const std::string& cells_path,
     const std::string& entries_path,
     const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map
 ) {
-    std::vector<std::pair<uint64_t, std::vector<uint32_t>>> sorted(cell_map.begin(), cell_map.end());
-    std::sort(sorted.begin(), sorted.end(),
-              [](const auto& a, const auto& b) { return a.first < b.first; });
+    using Cell = std::pair<uint64_t, const std::vector<uint32_t>*>;
+    std::vector<Cell> sorted = parallel_collect<Cell>(cell_map.bucket_count(), [&](size_t b, std::vector<Cell>& out) {
+        for (auto it = cell_map.begin(b); it != cell_map.end(b); ++it) out.push_back({it->first, &it->second});
+    });
+    parallel_sort(sorted.begin(), sorted.end(), [](const Cell& a, const Cell& b) { return a.first < b.first; });
 
     // Determinism safety net: sort each cell's inner entry vector by
     // value. Callers that build the map from parallel workers can push
     // entries in thread-scheduling order, which leaks non-determinism
-    // into the on-disk layout and breaks incremental patching. Sorting
-    // here is cheap compared to the rest of the index write.
-    for (auto& [cell_id, ids] : sorted) {
-        std::sort(ids.begin(), ids.end());
-    }
-
-    { std::ofstream f(cells_path, std::ios::binary);
-      uint32_t current_offset = 0;
-      for (const auto& [cell_id, ids] : sorted) {
-          f.write(reinterpret_cast<const char*>(&cell_id), sizeof(cell_id));
-          f.write(reinterpret_cast<const char*>(&current_offset), sizeof(current_offset));
-          current_offset += sizeof(uint16_t) + ids.size() * sizeof(uint32_t);
-      }
-      f.flush();
-      if (!f) throw std::runtime_error("failed to write " + cells_path); }
-
-    { std::ofstream f(entries_path, std::ios::binary);
-      size_t max_count = 0;
-      for (const auto& [cell_id, ids] : sorted) {
-          uint16_t count = checked_entry_count(ids.size(), entries_path);
-          if (ids.size() > max_count) max_count = ids.size();
-          f.write(reinterpret_cast<const char*>(&count), sizeof(count));
-          f.write(reinterpret_cast<const char*>(ids.data()), ids.size() * sizeof(uint32_t));
-      }
-      f.flush();
-      if (!f) throw std::runtime_error("failed to write " + entries_path);
-      std::cerr << "  " << entries_path << ": max entries/cell = " << max_count << std::endl; }
+    // into the on-disk layout and breaks incremental patching. Sorted
+    // copies, back to back: the map stays as it is.
+    const std::vector<size_t> from = parallel_offsets<size_t>(sorted.size(), [&](size_t c) {
+        return sorted[c].second->size();
+    });
+    std::vector<uint32_t> ids;
+    parallel_resize(ids, from.back());
+    parallel_for(sorted.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t c = b; c < e; c++) {
+            std::copy(sorted[c].second->begin(), sorted[c].second->end(), ids.begin() + from[c]);
+            std::sort(ids.begin() + from[c], ids.begin() + from[c + 1]);
+        }
+    });
+    write_cell_entries(cells_path, entries_path, sorted.size(),
+        [&](size_t c) { return sorted[c].first; },
+        [&](size_t c) { return from[c + 1] - from[c]; },
+        [&](size_t c, char* out) {
+            // ids.data() is null when no cell has an id.
+            if (const size_t n = from[c + 1] - from[c]) std::memcpy(out, ids.data() + from[c], n * sizeof(uint32_t));
+        });
 }
 
 // Distinct cells of a cell-grouped table.
 inline size_t count_cells(const std::vector<CellItemPair>& pairs) {
-    size_t cells = 0;
-    for (size_t i = 0; i < pairs.size(); i++)
-        if (i == 0 || pairs[i].cell_id != pairs[i - 1].cell_id) cells++;
-    return cells;
+    return parallel_count(pairs.size(), [&](size_t i) { return i == 0 || pairs[i].cell_id != pairs[i - 1].cell_id; });
 }
 
 // write_cell_index for a table already in canonical order (by cell, then
@@ -100,34 +130,20 @@ inline void write_cell_index_sorted(
     const std::string& entries_path,
     const std::vector<CellItemPair>& pairs
 ) {
-    for (size_t i = 1; i < pairs.size(); i++)
-        if (cell_item_less(pairs[i], pairs[i - 1]))
-            throw std::logic_error("write_cell_index_sorted: table out of order for " + entries_path);
+    if (parallel_any(pairs.empty() ? 0 : pairs.size() - 1, [&](size_t i) { return cell_item_less(pairs[i + 1], pairs[i]); }))
+        throw std::logic_error("write_cell_index_sorted: table out of order for " + entries_path);
 
-    std::vector<char> cells, entries;
-    entries.reserve(pairs.size() * sizeof(uint32_t));
-    size_t max_count = 0;
-    for (size_t run = 0; run < pairs.size(); ) {
-        size_t run_end = run + 1;
-        while (run_end < pairs.size() && pairs[run_end].cell_id == pairs[run].cell_id) run_end++;
-        uint64_t cell_id = pairs[run].cell_id;
-        uint32_t offset = static_cast<uint32_t>(entries.size());
-        cells.insert(cells.end(), reinterpret_cast<const char*>(&cell_id),
-                     reinterpret_cast<const char*>(&cell_id) + sizeof(cell_id));
-        cells.insert(cells.end(), reinterpret_cast<const char*>(&offset),
-                     reinterpret_cast<const char*>(&offset) + sizeof(offset));
-        uint16_t count = checked_entry_count(run_end - run, entries_path);
-        max_count = std::max(max_count, run_end - run);
-        entries.insert(entries.end(), reinterpret_cast<const char*>(&count),
-                       reinterpret_cast<const char*>(&count) + sizeof(count));
-        for (size_t i = run; i < run_end; i++)
-            entries.insert(entries.end(), reinterpret_cast<const char*>(&pairs[i].item_id),
-                           reinterpret_cast<const char*>(&pairs[i].item_id) + sizeof(uint32_t));
-        run = run_end;
-    }
-    write_binary_file(cells_path, cells.data(), cells.size());
-    write_binary_file(entries_path, entries.data(), entries.size());
-    std::cerr << "  " << entries_path << ": max entries/cell = " << max_count << std::endl;
+    const std::vector<size_t> starts = parallel_filter<size_t>(pairs.size(), [&](size_t i) {
+        return i == 0 || pairs[i].cell_id != pairs[i - 1].cell_id;
+    });
+    auto end_of = [&](size_t c) { return c + 1 < starts.size() ? starts[c + 1] : pairs.size(); };
+    write_cell_entries(cells_path, entries_path, starts.size(),
+        [&](size_t c) { return pairs[starts[c]].cell_id; },
+        [&](size_t c) { return end_of(c) - starts[c]; },
+        [&](size_t c, char* out) {
+            for (size_t i = starts[c], end = end_of(c); i < end; i++, out += sizeof(uint32_t))
+                std::memcpy(out, &pairs[i].item_id, sizeof(uint32_t));
+        });
 }
 
 // The cell-grouped tables a mode's geo index draws on, in geo_cells.bin

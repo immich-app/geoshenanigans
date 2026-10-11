@@ -143,6 +143,53 @@ TEST(write_cell_index_sorted_matches_the_map_writer) {
     }
 }
 
+TEST(write_cell_index_writers_lay_out_cells_and_entries_back_to_back) {
+    // Past the blocks the writers split their work into: the files as a
+    // serial walk over the cells, ids sorted within each, lays them out.
+    ScratchDir dir("gctest-cellio");
+    std::mt19937_64 rng(6);
+    std::vector<CellItemPair> pairs;
+    for (uint64_t cell = 1; pairs.size() < 400000; cell += 1 + rng() % 3) {
+        size_t k = 1 + (rng() % 50 == 0 ? rng() % 300 : rng() % 4);
+        for (size_t j = 0; j < k; j++) pairs.push_back({cell << 10, static_cast<uint32_t>(rng() % 100000)});
+    }
+    std::sort(pairs.begin(), pairs.end(), cell_item_less);
+    std::string cells, entries;
+    for (size_t run = 0; run < pairs.size();) {
+        size_t end = run;
+        while (end < pairs.size() && pairs[end].cell_id == pairs[run].cell_id) end++;
+        append(cells, pairs[run].cell_id);
+        append(cells, static_cast<uint32_t>(entries.size()));
+        append(entries, static_cast<uint16_t>(end - run));
+        for (; run < end; run++) append(entries, pairs[run].item_id);
+    }
+    // The map holds each cell's ids in no particular order.
+    std::unordered_map<uint64_t, std::vector<uint32_t>> map;
+    for (const auto& p : pairs) map[p.cell_id].push_back(p.item_id);
+    for (auto& [cell, ids] : map) std::shuffle(ids.begin(), ids.end(), rng);
+
+    write_cell_index_sorted(dir.path() + "/cells.bin", dir.path() + "/entries.bin", pairs);
+    CHECK(read_file(dir.path() + "/cells.bin") == cells);
+    CHECK(read_file(dir.path() + "/entries.bin") == entries);
+    write_cell_index(dir.path() + "/map_cells.bin", dir.path() + "/map_entries.bin", map);
+    CHECK(read_file(dir.path() + "/map_cells.bin") == cells);
+    CHECK(read_file(dir.path() + "/map_entries.bin") == entries);
+}
+
+TEST(write_cell_index_writes_cells_without_ids) {
+    // No ids at all: the sorted copy is empty and has no storage to copy from.
+    ScratchDir dir("gctest-cellio");
+    std::unordered_map<uint64_t, std::vector<uint32_t>> map = {{3 << 10, {}}};
+    std::string cells, entries;
+    append(cells, uint64_t(3 << 10));
+    append(cells, uint32_t(0));
+    append(entries, uint16_t(0));
+
+    write_cell_index(dir.path() + "/cells.bin", dir.path() + "/entries.bin", map);
+    CHECK(read_file(dir.path() + "/cells.bin") == cells);
+    CHECK(read_file(dir.path() + "/entries.bin") == entries);
+}
+
 TEST(write_cell_index_sorted_rejects_a_table_out_of_order) {
     ScratchDir dir("gctest-cellio");
     bool thrown = false;
