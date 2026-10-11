@@ -54,6 +54,20 @@ TEST(strategy2_pass_costs_add_the_repacked_nodes_to_streets_and_interps) {
     CHECK_EQ(at(costs, RecordKind::Places), uint64_t(0));
 }
 
+TEST(ordering_cost_copies_the_records_but_not_their_cell_pairs) {
+    ParsedData d;
+    d.ways.resize(2);
+    d.street_nodes.resize(7);
+    d.addr_points.resize(3);
+    d.addr_vertices.resize(11);
+    d.poi_records.resize(4);
+    d.admin_polygons.resize(5);         // ordered on their own
+    d.sorted_addr_cells.resize(100);    // renumbered in place
+    const uint64_t copies = 2 * sizeof(WayHeader) + 7 * sizeof(NodeCoord) + 3 * sizeof(AddrPoint) +
+                            11 * sizeof(NodeCoord) + 4 * sizeof(PoiRecord);
+    CHECK_EQ(ordering_cost(d), copies + (2 + 3 + 4) * kReorderBytesPerRecord);
+}
+
 TEST(filter_cost_holds_the_planet_maps_and_half_the_subset_pairs) {
     const KindValues planet_counts = kinds(80, 160, 0, 0, 0, 0);
     const KindValues pairs = kinds(10, 0, 0, 0, 0, 0);

@@ -4,6 +4,7 @@
 #include "reorder.h"
 
 #include <cstring>
+#include <future>
 #include <limits>
 #include <map>
 #include <random>
@@ -288,6 +289,44 @@ void check_steps_match_reference(uint64_t seed, const Shape& s) {
         }
 }
 
+// The order reorder_deterministically runs the steps in when they fit side
+// by side: addrs, ways, POIs and places at once, then the addr points'
+// parent ways and the admins.
+void check_side_by_side_steps_match_reference(uint64_t seed, const Shape& s) {
+    const auto links = sitelinks();
+    ParsedData want;
+    std::vector<float> want_ele;
+    std::vector<uint32_t> want_qids;
+    fill_records(want, want_ele, want_qids, seed, s);
+    reorder_ref::reorder_addr_points(want);
+    reorder_ref::reorder_ways(want);
+    reorder_ref::reorder_interps(want);
+    reorder_ref::reorder_admin_polygons(want);
+    reorder_ref::reorder_pois(want, want_ele, want_qids, links);
+    reorder_ref::reorder_place_nodes(want);
+
+    ParsedData got;
+    std::vector<float> got_ele;
+    std::vector<uint32_t> got_qids;
+    fill_records(got, got_ele, got_qids, seed, s);
+    std::vector<uint32_t> way_old_to_new;
+    auto ways = std::async(std::launch::async, [&] { way_old_to_new = sort_ways(got, 4); });
+    auto pois = std::async(std::launch::async, [&] { reorder_pois(got, got_ele, got_qids, links, 4); });
+    auto places = std::async(std::launch::async, [&] { reorder_place_nodes(got, 4); });
+    auto interps = std::async(std::launch::async, [&] { reorder_interps(got, 4); });
+    reorder_addr_points(got, 4);
+    ways.get();
+    pois.get();
+    places.get();
+    interps.get();
+    remap_parent_ways(got, way_old_to_new, 4);
+    reorder_admin_polygons(got, 4);
+
+    check_same_records(want, got);
+    CHECK(same_bytes(want_ele, got_ele));
+    CHECK(same_bytes(want_qids, got_qids));
+}
+
 // --- String pool partition ---
 
 std::string random_string(Rng& r) {
@@ -419,6 +458,18 @@ TEST(reorder_steps_match_when_no_records_tie) {
     Shape s;
     s.unique_osm_ids = true;
     check_steps_match_reference(6, s);
+}
+
+TEST(reorder_steps_side_by_side_match_the_serial_reference) {
+    check_side_by_side_steps_match_reference(7, Shape{});
+    Shape s;
+    s.odd_vertices = true;
+    s.nan = true;
+    check_side_by_side_steps_match_reference(8, s);
+    Shape bare;
+    bare.osm_ids = false;
+    bare.side_arrays = false;
+    check_side_by_side_steps_match_reference(9, bare);
 }
 
 TEST(reorder_steps_match_on_tiny_inputs) {

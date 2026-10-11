@@ -2475,16 +2475,39 @@ static void reorder_deterministically(ParsedData& data, std::vector<float> poi_e
     // past what the build holds as it starts.
     const uint64_t memory_limit = memory_limit_bytes();
     auto headroom = [&] { return write_budget(memory_limit, static_cast<uint64_t>(get_rss_mb()) << 20); };
-    reorder_addr_points(data, 0, headroom());
-    log_phase("  Sort addr_points", _st, _sc);
-    reorder_ways(data, 0, headroom());
-    log_phase("  Sort ways", _st, _sc);
-    reorder_admin_polygons(data);
-    log_phase("  Sort admin", _st, _sc);
-    reorder_pois(data, poi_elevations, poi_qids, sitelinks_data, 0, headroom());
-    log_phase("  Sort POIs", _st, _sc);
-    reorder_place_nodes(data);
-    log_phase("  Sort place nodes", _st, _sc);
+    if (ordering_cost(data) <= headroom()) {
+        // The steps share only parents: the ways remap the addr points'
+        // parent ways once the addrs have sorted on them, and the admins
+        // remap the parents the ways, POIs and places hold, a value remap
+        // that commutes with their reorders and keeps the equalities their
+        // dedups test. With room for all their buffers at once, the addrs,
+        // ways, POIs and places sort side by side.
+        std::vector<uint32_t> way_old_to_new;
+        auto ways = std::async(std::launch::async, [&] { way_old_to_new = sort_ways(data); });
+        auto pois = std::async(std::launch::async, [&] {
+            reorder_pois(data, poi_elevations, poi_qids, sitelinks_data);
+        });
+        auto places = std::async(std::launch::async, [&] { reorder_place_nodes(data); });
+        reorder_addr_points(data);
+        ways.get();
+        pois.get();
+        places.get();
+        remap_parent_ways(data, way_old_to_new);
+        log_phase("  Sort addr_points, ways, POIs and place nodes at once", _st, _sc);
+        reorder_admin_polygons(data);
+        log_phase("  Sort admin", _st, _sc);
+    } else {
+        reorder_addr_points(data, 0, headroom());
+        log_phase("  Sort addr_points", _st, _sc);
+        reorder_ways(data, 0, headroom());
+        log_phase("  Sort ways", _st, _sc);
+        reorder_admin_polygons(data);
+        log_phase("  Sort admin", _st, _sc);
+        reorder_pois(data, poi_elevations, poi_qids, sitelinks_data, 0, headroom());
+        log_phase("  Sort POIs", _st, _sc);
+        reorder_place_nodes(data);
+        log_phase("  Sort place nodes", _st, _sc);
+    }
     double interps_seconds = interps_sorted.get();
     std::cerr << "  Interps took " << std::fixed << std::setprecision(1) << interps_seconds
               << "s beside the other steps" << std::endl;

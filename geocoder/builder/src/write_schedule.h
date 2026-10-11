@@ -149,6 +149,28 @@ inline KindValues strategy2_pass_costs(const ParsedData& d) {
     return c;
 }
 
+// The ordering steps' working set per record beside the copy of the records
+// they move them into: the sort's keys, its merge copy, the order, the run
+// starts and old_to_new.
+constexpr uint64_t kReorderBytesPerRecord = 48;
+
+// What the ordering steps of the addrs, ways, POIs, places and interps hold
+// running at once: a copy of each one's records, nodes and parallel arrays
+// (their cell pairs are renumbered in place), and kReorderBytesPerRecord a
+// record.
+inline uint64_t ordering_cost(const ParsedData& d) {
+    const uint64_t copies = vector_bytes(d.ways) + vector_bytes(d.street_nodes) + vector_bytes(d.way_osm_ids)
+        + vector_bytes(d.way_parent_ids) + vector_bytes(d.way_postcode_ids)
+        + vector_bytes(d.addr_points) + vector_bytes(d.addr_vertices) + vector_bytes(d.addr_osm_ids)
+        + vector_bytes(d.addr_postcode_ids)
+        + vector_bytes(d.poi_records) + vector_bytes(d.poi_vertices) + vector_bytes(d.poi_osm_ids)
+        + vector_bytes(d.place_nodes) + vector_bytes(d.place_osm_ids)
+        + vector_bytes(d.interp_ways) + vector_bytes(d.interp_nodes) + vector_bytes(d.interp_osm_ids)
+        + vector_bytes(d.interp_postcode_ids);
+    const KindValues counts = record_counts(d);
+    return copies + (sum(counts) - at(counts, RecordKind::Admins)) * kReorderBytesPerRecord;
+}
+
 // What the continent split holds beyond the subset it builds.
 inline uint64_t filter_cost(const KindValues& planet_counts, const KindValues& continent_pairs, unsigned threads) {
     const uint64_t records = sum(planet_counts);
