@@ -1602,13 +1602,13 @@ static int run(int argc, char* argv[]) {
     // of every old geo cell).
     unmap_file(old_geo_m); unmap_file(new_geo_m);
 
-    // --- Full-replacement sections for secondary files ---
-    // Files without record-level diff logic (parallel postcode/parent
-    // arrays, postal boundary index, postcode centroids). The patch
-    // tool's stride==0 path writes them byte-for-byte from the patch
-    // stream. Old-build size is looked up so the `old_size` header
-    // field is correct; missing old files (first-time addition) show
-    // 0. The whole patch is zstd-compressed at the end of the diff
+    // --- Full-replacement sections ---
+    // The fallback for a file the sections below can't delta (no old
+    // file, a layout the merge can't take) and for a newly shipped string
+    // tier. The patch tool's stride==0 path writes it byte-for-byte from
+    // the patch stream. Old-build size is looked up so the `old_size`
+    // header field is correct; missing old files (first-time addition)
+    // show 0. The whole patch is zstd-compressed at the end of the diff
     // tool, so embedding raw file bytes here does not inflate the
     // final .gcpatch much.
     auto emit_raw = [&](PatchFileId fid, const std::string& fname) {

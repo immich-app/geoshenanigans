@@ -22,17 +22,16 @@
 #include <unordered_set>
 #include <vector>
 
-#include "scratch_dir.h"
 #include "sequential_file_reader.h"
 #include "test_framework.h"
 
-// --- write_varint / read_varint round-trip ---
+// --- write_varint / read_varint_bounded round-trip ---
 
 static uint32_t varint_roundtrip(uint32_t value) {
     std::vector<char> buf;
     write_varint(buf, value);
     size_t pos = 0;
-    uint32_t got = read_varint(buf.data(), pos);
+    uint32_t got = read_varint_bounded(buf.data(), pos, buf.size(), "varint");
     // read must consume exactly the bytes that write produced.
     return (pos == buf.size()) ? got : 0xDEADBEEFu;
 }
@@ -109,7 +108,7 @@ TEST(patch_format_varint_sequence_in_one_buffer) {
     for (uint32_t v : vals) write_varint(buf, v);
     size_t pos = 0;
     for (uint32_t v : vals) {
-        CHECK_EQ(read_varint(buf.data(), pos), v);
+        CHECK_EQ(read_varint_bounded(buf.data(), pos, buf.size(), "varint"), v);
     }
     CHECK_EQ(pos, buf.size());
 }
@@ -172,24 +171,17 @@ TEST(patch_format_to_grid_rounding_half_away_from_zero) {
 
 // --- Stride sentinel constants ---
 
-TEST(patch_format_stride_sentinels_distinct) {
-    CHECK(SPARSE_DELTA_STRIDE != COPY_OLD_STRIDE);
-    CHECK(SPARSE_DELTA_STRIDE != LEGACY_SKIP_STRIDE);
-    CHECK(COPY_OLD_STRIDE != LEGACY_SKIP_STRIDE);
-    CHECK(CELL_LIST_DELTA_STRIDE != SPARSE_DELTA_STRIDE);
-    CHECK(CELL_LIST_DELTA_STRIDE != COPY_OLD_STRIDE);
-    CHECK(CELL_LIST_DELTA_STRIDE != LEGACY_SKIP_STRIDE);
-    // Current concrete values (locked in).
+TEST(patch_format_stride_sentinel_values) {
+    // Concrete values locked in (diff/patch wire contract), distinct.
     CHECK_EQ(SPARSE_DELTA_STRIDE, uint32_t(0xFC));
     CHECK_EQ(COPY_OLD_STRIDE, uint32_t(0xFD));
-    CHECK_EQ(LEGACY_SKIP_STRIDE, uint32_t(0xFE));
     CHECK_EQ(CELL_LIST_DELTA_STRIDE, uint32_t(0xFB));
 }
 
 TEST(patch_format_stride_sentinels_no_collision_with_real_strides) {
     // Real per-record strides used across the format (see read_* helpers and
     // the *_cells / entry structs). None may equal a sentinel, else a genuine
-    // record stride would be misread as a sparse/copy/skip section.
+    // record stride would be misread as a sparse/copy/cell list section.
     const uint32_t real_strides[] = {
         2,   // entry count prefix (u16)
         4,   // u32 id arrays (entries, parents, postcodes)
@@ -208,37 +200,14 @@ TEST(patch_format_stride_sentinels_no_collision_with_real_strides) {
     for (uint32_t s : real_strides) {
         CHECK(s != SPARSE_DELTA_STRIDE);
         CHECK(s != COPY_OLD_STRIDE);
-        CHECK(s != LEGACY_SKIP_STRIDE);
         CHECK(s != CELL_LIST_DELTA_STRIDE);
     }
 }
 
 // --- Section marker constants ---
 
-TEST(patch_format_section_markers_distinct) {
-    const uint32_t markers[] = {
-        FIXUP_MARKER,                 // 0xFFFFFFFD
-        CELL_CHANGES_GEO_MARKER,      // 0xFFFFFFFB
-        CELL_CHANGES_ADMIN_MARKER,    // 0xFFFFFFFA
-        CELL_CHANGES_POI_MARKER,      // 0xFFFFFFF5
-        CELL_CHANGES_PLACE_MARKER,    // 0xFFFFFFF4
-        ENTRY_CORRECTION_MARKER,      // 0xFFFFFFF8
-        GEO_ENTRY_DELTA_MARKER,       // 0xFFFFFFF0
-        CELL_INDEX_DELTA_MARKER,      // 0xFFFFFFF7
-        CELL_FLAGS_MARKER,            // 0xFFFFFFF9
-        SECONDARY_REMAP_MARKER,       // 0xFFFFFFF6
-        POI_PARENT_REMAP_MARKER,      // 0xFFFFFFF3
-        CLIENT_FILES_MARKER,          // 0xFFFFFFF2
-    };
-    const size_t n = sizeof(markers) / sizeof(markers[0]);
-    for (size_t i = 0; i < n; i++)
-        for (size_t j = i + 1; j < n; j++)
-            CHECK(markers[i] != markers[j]);
-}
-
 TEST(patch_format_section_marker_values) {
     // Concrete values locked in (diff/patch wire contract).
-    CHECK_EQ(FIXUP_MARKER, uint32_t(0xFFFFFFFD));
     CHECK_EQ(CELL_CHANGES_GEO_MARKER, uint32_t(0xFFFFFFFB));
     CHECK_EQ(CELL_CHANGES_ADMIN_MARKER, uint32_t(0xFFFFFFFA));
     CHECK_EQ(CELL_CHANGES_POI_MARKER, uint32_t(0xFFFFFFF5));
@@ -246,7 +215,6 @@ TEST(patch_format_section_marker_values) {
     CHECK_EQ(ENTRY_CORRECTION_MARKER, uint32_t(0xFFFFFFF8));
     CHECK_EQ(GEO_ENTRY_DELTA_MARKER, uint32_t(0xFFFFFFF0));
     CHECK_EQ(CELL_INDEX_DELTA_MARKER, uint32_t(0xFFFFFFF7));
-    CHECK_EQ(CELL_FLAGS_MARKER, uint32_t(0xFFFFFFF9));
     CHECK_EQ(SECONDARY_REMAP_MARKER, uint32_t(0xFFFFFFF6));
     CHECK_EQ(POI_PARENT_REMAP_MARKER, uint32_t(0xFFFFFFF3));
     CHECK_EQ(CLIENT_FILES_MARKER, uint32_t(0xFFFFFFF2));

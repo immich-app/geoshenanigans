@@ -1,6 +1,6 @@
 #pragma once
 // Shared definitions for the geocoder patch system.
-// Used by geocoder-canonicalize, geocoder-diff, and geocoder-patch.
+// Used by geocoder-diff and geocoder-patch.
 
 #include <algorithm>
 #include <array>
@@ -72,9 +72,8 @@ inline size_t detect_stride_from_file(const std::string& path, std::initializer_
     return detect_stride_from_file(path, candidates.begin(), candidates.size());
 }
 
-// --- Binary record structs (must match types.h and server) ---
+// --- Binary record layouts (must match types.h and server) ---
 
-#pragma pack(push, 1)
 // name_id byte offset within a street WayHeader record. The builder writes
 // the padded layout (stride 12, name_id at 8); legacy builds wrote it packed
 // (stride 9, name_id at 5). Pick by the detected stride.
@@ -82,14 +81,6 @@ static constexpr size_t WAY_HEADER_NAME_ID_OFF_PADDED = 8;
 static constexpr size_t WAY_HEADER_NAME_ID_OFF_PACKED = 5;
 static constexpr size_t WAY_HEADER_STRIDE_PACKED = 9;
 
-struct PatchAddrPoint {
-    float lat;
-    float lng;
-    uint32_t housenumber_id;
-    uint32_t street_id;
-    uint32_t parent_way_id;
-};
-static_assert(sizeof(PatchAddrPoint) == 20, "AddrPoint must be 20 bytes");
 // Byte offsets within an AddrPoint record (used by the patch tool's per-record
 // remap/fixup passes). housenumber_id/street_id are string-pool offsets;
 // parent_way_id is a WAY id (street id-space), NOT a string offset; the
@@ -98,16 +89,6 @@ static constexpr size_t ADDR_POINT_HOUSENUMBER_ID_OFF = 8;
 static constexpr size_t ADDR_POINT_STREET_ID_OFF = 12;
 static constexpr size_t ADDR_POINT_PARENT_WAY_ID_OFF = 16;
 static constexpr size_t ADDR_POINT_VERTEX_OFFSET_OFF = 20;
-
-struct PatchNodeCoord {
-    float lat;
-    float lng;
-};
-static_assert(sizeof(PatchNodeCoord) == 8, "NodeCoord must be 8 bytes");
-#pragma pack(pop)
-
-// InterpWay and AdminPolygon have compiler-dependent padding.
-// Read them field-by-field instead of struct-casting.
 
 // street_id byte offset within an InterpWay record. node_count is followed by
 // padding at stride>=20 (street_id at 8) or no padding at stride 18
@@ -125,29 +106,9 @@ inline uint32_t record_node_count(const char* rec, size_t stride, size_t packed_
     return n;
 }
 
-struct PatchAdminPolygon {
-    uint32_t vertex_offset;
-    uint32_t vertex_count;
-    uint32_t name_id;
-    uint8_t admin_level;
-    uint8_t place_type_override;
-    float area;
-    uint16_t country_code;
-};
 // name_id byte offset within an AdminPolygon record (string-pool offset).
 static constexpr size_t ADMIN_POLYGON_NAME_ID_OFF = 8;
 
-struct PatchPoiRecord {
-    float lat;
-    float lng;
-    uint32_t vertex_offset;
-    uint32_t vertex_count;
-    uint32_t name_id;
-    uint8_t category;
-    uint8_t tier;
-    uint8_t flags;
-    uint8_t importance;
-};
 // Byte offsets within a PoiRecord, keyed off the on-disk stride (which grew
 // across build versions). vertex_offset is the fixup target. name_id /
 // parent_street_id / parent_postcode_id are string-pool offsets; parent_poly_id
@@ -162,7 +123,7 @@ static constexpr size_t POI_RECORD_PARENT_STREET_ID_OFF = 24;
 static constexpr size_t POI_RECORD_PARENT_POSTCODE_ID_OFF = 28;
 static constexpr size_t POI_RECORD_PARENT_POLY_ID_OFF = 32;
 
-// PlaceNode byte offsets (no dedicated Patch struct — parsed by stride).
+// PlaceNode byte offsets, parsed by stride.
 // name_id is a string-pool offset; parent_poly_id (present at stride>=20) is an
 // admin polygon index.
 static constexpr size_t PLACE_NODE_NAME_ID_OFF = 8;
@@ -202,11 +163,6 @@ inline void require_old_file_size(const std::string& dir, const std::string& nam
         throw std::runtime_error("Old " + name + " is not the one the patch was made from (" +
                                  std::to_string(actual) + " bytes, the patch expects " +
                                  std::to_string(expected) + ")");
-}
-
-inline const char* get_string(const std::vector<char>& pool, uint32_t offset) {
-    if (offset >= pool.size()) return "";
-    return pool.data() + offset;
 }
 
 // --- Patch file format ---
@@ -250,10 +206,9 @@ enum class PatchFileId : uint32_t {
     PLACE_NODES = 18,
     PLACE_CELLS = 19,
     PLACE_ENTRIES = 20,
-    // Secondary parallel arrays + postcode/postal indexes. These don't
-    // have record-level diff logic yet — the diff tool emits them as
-    // full-replacement sections (stride=0) which the patch tool writes
-    // verbatim. Patch cost is only the size of the changed files.
+    // Secondary parallel arrays (SPARSE_DELTA_FILES), the postcode
+    // centroid index (a cell list delta) and the postal polygons, which
+    // merge like the admin ones.
     ADDR_POSTCODES = 21,
     ADMIN_PARENTS = 22,
     WAY_PARENTS = 23,
@@ -264,14 +219,13 @@ enum class PatchFileId : uint32_t {
     POSTAL_POLYGONS = 28,
     POSTAL_VERTICES = 29,
     // addr_points polygon footprints introduced by commit aaf050b
-    // (build_version bump 8→9). Emitted as a full-replacement section
-    // like the other secondary files — the diff tool doesn't yet have
-    // record-level logic for this file.
+    // (build_version bump 8→9), byte-merged along addr_points like the
+    // other vertex streams.
     ADDR_VERTICES = 30,
     // Per-tier strings files (build_version 14). Replaces the single
-    // STRINGS=0 slot. Each is a raw-replacement section — the pool
-    // contents are globally ordered so small changes produce small
-    // diffs in a single tier file even without record-level logic.
+    // STRINGS=0 slot. They travel in the strings section
+    // (STRINGS_TIERED_MARKER); a tier the old dir lacks comes whole in a
+    // full-replacement section.
     STRINGS_CORE = 31,
     STRINGS_STREET = 32,
     STRINGS_ADDR = 33,
@@ -360,13 +314,6 @@ inline size_t detect_record_stride(const std::string& dir, const StringRecordFil
     return detect_stride_from_file(dir + "/" + patch_file_names[(uint32_t)f.stride_from], f.strides, f.n_strides);
 }
 
-// Offset fixup section marker: 0xFFFFFFFD
-// Format: uint32_t marker, uint32_t file_id, uint32_t stride,
-//         uint32_t count, [(uint32_t record_index, uint32_t new_offset_value)] * count
-// Applied to byte offset 0 of each record (node_offset/vertex_offset field).
-
-static constexpr uint32_t FIXUP_MARKER = 0xFFFFFFFD;
-
 // Terminator written after the last patch section; the patcher breaks its
 // section loop when it reads this as a file_id and refuses a patch that ends
 // without it. Same bytes as NO_DATA, but a distinct concept.
@@ -408,13 +355,6 @@ static constexpr uint32_t CELL_INDEX_DELTA_MARKER = 0xFFFFFFF7;
 static constexpr uint32_t GEO_ENTRY_DELTA_MARKER = 0xFFFFFFF0;
 static constexpr uint16_t GEO_LIST_REPLACE = 0xFFFF;
 
-// Cell flag corrections marker: 0xFFFFFFF9
-// Format: marker, count(u32), [(cell_id:u64, flags:u8)] × count
-// flags: bit 0 = has_street, bit 1 = has_addr, bit 2 = has_interp
-// Retired in v6 (entry corrections already decide every flipped cell);
-// the value stays reserved.
-static constexpr uint32_t CELL_FLAGS_MARKER = 0xFFFFFFF9;
-
 // Secondary ID remap marker: 0xFFFFFFF6
 // Additional old→new ID mappings for modified records (recovered by relaxed key matching).
 // Both diff and patch tools must apply these to their derived remaps for consistent results.
@@ -444,8 +384,6 @@ static constexpr uint32_t SECONDARY_REMAP_MARKER = 0xFFFFFFF6;
 //     (sorted by old), for every old tier the dir ships or references.
 // A tier neither shipped nor referenced sends nothing: no lookup lands in it.
 static constexpr uint32_t STRINGS_TIERED_MARKER = 0xFFFFFFF6;
-// v6 sent the cross-tier pairs behind this marker; the value stays reserved.
-static constexpr uint32_t STRINGS_CROSS_TIER_REMAP_MARKER = 0xFFFFFFFE;
 
 // 64-bit content hash, 8 bytes per step. Not cryptographic: it proves a file
 // is the one the diff saw, against stale or mismatched inputs.
@@ -496,10 +434,6 @@ constexpr uint32_t SPARSE_DELTA_STRIDE = 0xFC;
 // fixup passes are skipped for identical files), so the patcher's identity
 // reconstruction matches.
 constexpr uint32_t COPY_OLD_STRIDE = 0xFD;
-
-// Legacy/reserved stride sentinel: skip the section (read header + data, write
-// nothing). Consumed by geocoder-patch; not emitted by the current diff.
-constexpr uint32_t LEGACY_SKIP_STRIDE = 0xFE;
 
 // Stride sentinel: a cell index (<name>_cells.bin + <name>_entries.bin)
 // patched per cell. Strategy-2 ids keep most lists unchanged day to day, so
@@ -1098,7 +1032,7 @@ inline void write_varint(std::vector<char>& buf, uint32_t value) {
     buf.push_back(static_cast<char>(value));
 }
 
-// read_varint that stays inside data[0, size): a truncated or overlong
+// Reads a varint that stays inside data[0, size): a truncated or overlong
 // value, or one of 2^32 or more, throws "Malformed <what>".
 inline uint32_t read_varint_bounded(const char* data, size_t& pos, size_t size, const char* what) {
     uint32_t result = 0;
@@ -1110,17 +1044,6 @@ inline uint32_t read_varint_bounded(const char* data, size_t& pos, size_t size, 
         if (!(byte & 0x80)) return result;
     }
     throw std::runtime_error(std::string("Malformed ") + what);
-}
-
-inline uint32_t read_varint(const char* data, size_t& pos) {
-    uint32_t result = 0, shift = 0;
-    while (true) {
-        uint8_t byte = static_cast<uint8_t>(data[pos++]);
-        result |= (uint32_t)(byte & 0x7F) << shift;
-        if (!(byte & 0x80)) break;
-        shift += 7;
-    }
-    return result;
 }
 
 inline uint32_t zigzag32(uint32_t v) { return (v << 1) ^ (0u - (v >> 31)); }
@@ -1258,7 +1181,6 @@ public:
     void finish() { std::sort(pairs_.begin(), pairs_.end()); }
     bool empty() const { return runs_.empty() && pairs_.empty(); }
     size_t run_count() const { return runs_.size(); }
-    size_t pair_count() const { return pairs_.size(); }
 
     uint32_t lookup(uint32_t off) const {
         if (!pairs_.empty()) {

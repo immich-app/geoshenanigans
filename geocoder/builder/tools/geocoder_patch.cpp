@@ -383,7 +383,7 @@ static int run(int argc, char* argv[]) {
         uint64_t old_size = ru64(), new_size = ru64();
         if (file_id >= (uint32_t)PatchFileId::COUNT) { std::cerr << "Unknown file " << file_id << std::endl; return 1; }
         const char* fname = patch_file_names[file_id];
-        if (stride != LEGACY_SKIP_STRIDE) require_old_file_size(cur_dir, fname, old_size);
+        require_old_file_size(cur_dir, fname, old_size);
 
         if (stride == 0) {
             // Full replacement — write directly from patch mmap
@@ -415,7 +415,6 @@ static int run(int argc, char* argv[]) {
                       << " bytes from old)" << section_io() << std::endl;
             continue;
         }
-        if (stride == LEGACY_SKIP_STRIDE) { uint32_t nf = ru32(); (void)nf; take(ru64(), "skipped section"); continue; }
         if (stride == CELL_LIST_DELTA_STRIDE) {
             // A cell index patched per cell; the paired entries file is
             // rebuilt from the same lists.
