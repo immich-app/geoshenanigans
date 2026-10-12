@@ -647,13 +647,23 @@ jobs:
           #   curl $S3_PUBLIC_URL/geocoder/memwatch/$RUN_ID.log
           # to see RSS right up to the disconnect.
           MEMWATCH_KEY="s3://$S3_BUCKET/$S3_PREFIX/memwatch/${GITHUB_RUN_ID}.log"
+          # The job's memory is its cgroup's, the nearest one up from this
+          # shell's with a limit (/proc/meminfo is the node's), shared by the
+          # build, the fetch beside it and the runner.
+          CGROUP=/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)
+          CGROUP=${CGROUP%/}
+          until [ "$CGROUP" = /sys/fs/cgroup ] || [ "$(cat "$CGROUP/memory.max" 2> /dev/null)" != max ]; do
+            CGROUP=${CGROUP%/*}
+          done
+          CGROUP_MAX_MIB=$(( $(cat "$CGROUP/memory.max" 2> /dev/null || echo 0) >> 20 ))
           : > "$WORKDIR/memwatch.log"
           (
             while true; do
               ts=$(date '+%H:%M:%S')
-              mem=$(awk '/^MemTotal:|^MemAvailable:/{printf "%s=%dMi ", $1, $2/1024}' /proc/meminfo)
-              rss=$(ps -C build-index -o rss= 2>/dev/null | awk '{s+=$1} END{printf "%dMi", s/1024}')
-              echo "[memwatch $ts] $mem build_index_rss=$rss" \
+              current=$(( $(cat "$CGROUP/memory.current" 2> /dev/null || echo 0) >> 20 ))
+              stat=$(awk '$1 ~ /^(anon|file|file_dirty|file_writeback)$/ {printf "%s=%dMi ", $1, $2 / 1048576}' "$CGROUP/memory.stat" 2> /dev/null)
+              rss=$(ps -e -o rss=,comm= | awk '$2 == "build-index" {b += $1; next} {o += $1} END {printf "build_index_rss=%dMi others_rss=%dMi", b / 1024, o / 1024}')
+              echo "[memwatch $ts] cgroup=${current}Mi/${CGROUP_MAX_MIB}Mi $stat$rss" \
                 | tee -a "$WORKDIR/memwatch.log"
               $S5 cp "$WORKDIR/memwatch.log" "$MEMWATCH_KEY" >/dev/null 2>&1 || true
               sleep 30
