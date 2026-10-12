@@ -730,7 +730,7 @@ jobs:
           COMPRESS_PID=$!
 
           # Patch generation runs against uncompressed .bin files (old was
-          # decompressed just above, new was just built).
+          # decompressed as it came down, new was just built).
           echo "Generating patches ($OLD_DATE → $NEW_DATE)..."
           START=$(date +%s)
 
@@ -857,12 +857,9 @@ jobs:
           UPLOAD_START=$(date +%s)
           # Strategy-2 sidecars (*.osm_ids) carry the osm_id ↔ dense-idx
           # mapping that the next build's IdAllocator reads as
-          # --prev-output. Clients never read them. We upload them to
-          # Tigris (the durable bucket) anyway because the cache bucket
-          # may be cleared between runs — losing yesterday's sidecars
-          # there breaks strategy-2 chaining and balloons the next
-          # patch back to multi-GiB. The cleanup step further down
-          # ages them out at the same rate as full builds (3 days).
+          # --prev-output. Clients never read them. The cleanup step
+          # further down ages them out at the same rate as full builds
+          # (3 days).
           # The .zst files streamed up during compression (the prefix was
           # cleared then): only what is missing or differs in size goes now.
           # The runner's ~1 Gbit/s link caps the rate; 16 workers reach it.
@@ -914,9 +911,8 @@ jobs:
             | sed "s|^s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/||" \
             | sort > /tmp/remote.txt
 
-          # List local files, strip the workdir prefix. Includes osm_ids
-          # sidecars now that they upload to Tigris too (for durable
-          # storage; the cache bucket may be cleared between runs).
+          # List local files, strip the workdir prefix. Includes the
+          # osm_ids sidecars, which upload to Tigris too.
           (cd "$WORKDIR/output" && find . -type f \( -name "*.zst" -o -name "*.gcpatch" -o -name "*.json" -o -name "*.sha256" -o -name "*.osm_ids" \)) \
             | sed 's|^\./||' | sort > /tmp/local.txt
 
