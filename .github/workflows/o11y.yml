@@ -26,8 +26,7 @@ permissions: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  # Never cancel a publish between `flux push` and `cosign sign`: that would
-  # leave :main pointing at an unsigned digest, which o11y's verify rejects.
+  # Publishes run one at a time, so :main moves in commit order.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -99,12 +98,16 @@ jobs:
       # Keyless: cosign gets a Fulcio certificate for this workflow's OIDC
       # identity (.../.github/workflows/o11y.yml@refs/heads/main), which is
       # exactly what o11y's OCIRepository verify.matchOIDCIdentity pins.
+      # Pushed under the commit's own tag and signed there; :main, the tag
+      # o11y verifies and applies, moves to it only once signed, so a failed
+      # signing leaves :main on the last signed bundle.
       - name: Push and sign
         run: |
           set -euo pipefail
-          digest_url=$(flux push artifact "oci://${IMAGE}:${GITHUB_REF_NAME}" \
+          digest_url=$(flux push artifact "oci://${IMAGE}:${GITHUB_SHA}" \
             --path=build/o11y \
             --source="https://github.com/${GITHUB_REPOSITORY}" \
             --revision="${GITHUB_REF_NAME}@sha1:${GITHUB_SHA}" \
             --output json | jq -r '.repository + "@" + .digest')
           cosign sign --yes "${digest_url}"
+          flux tag artifact "oci://${IMAGE}:${GITHUB_SHA}" --tag "${GITHUB_REF_NAME}"
