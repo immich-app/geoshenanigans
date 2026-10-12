@@ -22,7 +22,7 @@ Country overrides change these. Format in JSON: `[search_rank, address_rank]` wh
 
 ### Verified country overrides
 
-Our `admin_levels.json` matches Nominatim's `address-levels.json` exactly (verified programmatically). Countries with overrides: au, be, br, cz, de, es, id, jp, nl, no, ru, se, sk.
+Our `admin_levels.json` matches Nominatim's `address-levels.json` exactly (verified programmatically). Countries with overrides: au, be, br, cz, de, es, id, jp, nl, no, ru, se, sk, us.
 
 ## Step 2: Label determination — get_label_tag()
 
@@ -61,8 +61,10 @@ Country-specific overrides: Norway/Sweden have `(no/se, 3): State` and `(no/se, 
 
 The `place` and `linked_place` tags from OSM data end up in the `extratags` column. When present, they OVERRIDE the rank-based label. This is how:
 - NYC (admin_level=5, `linked_place=city`) → label "city" instead of "State District" (rank 10)
-- SF (admin_level=6, `border_type=city`) → label "city" instead of "County" (rank 12)
-- Manhattan (admin_level=7, `border_type=borough`) → label "borough" (TODO: verify this maps to suburb)
+- SF (admin_level=6, also tagged `border_type=city`) → label "city" instead of "County" (rank 12)
+- Manhattan (admin_level=7, also tagged `border_type=borough`) → label "borough", an address field of its own (not suburb); we output it as `borough`
+
+Neither label comes from `border_type`, which Nominatim never reads (see below).
 
 **VERIFIED**: Despite line 841 of placex_triggers.sql appearing to remove `linked_place` from extratags, empirical testing shows NYC's extratags still contain `linked_place=city` at query time. Both `place` and `linked_place` checks are active.
 
@@ -97,7 +99,7 @@ This ensures nested boundaries don't share the same address rank. Example:
 - If a level 5 boundary (rank 10) contains a level 6 boundary (also rank 12), no adjustment needed (12 > 10)
 - If a level 5 boundary (rank 12 via override) contains a level 6 boundary (rank 12), the level 6 gets bumped to 14
 
-**We do NOT implement this.** Our smallest-area-wins logic handles the output field collision instead (if two polygons both map to "county", the smaller one wins). This might produce slightly different results than Nominatim in edge cases.
+**We implement this at query time** (`server/src/lib.rs`, before field assignment), on the polygons that contain the point: the nested-admin, linked-place and place-area promotions, repeated so a bump can cascade. Containment between those polygons is judged by admin level and area. Smallest-area-wins then settles polygons that still map to the same output field (if two polygons both map to "county", the smaller one wins).
 
 ## Step 5: Competing polygons
 
@@ -130,38 +132,37 @@ In `get_label_tag()`, DC has `category=('place', 'city')` so it hits check 5 (li
 
 ### Our approach
 
-- At query time: for each output field (city, county, state, etc.), keep smallest-area polygon
-- This is simpler but functionally similar — when two polygons map to the same field, the more specific (smaller) one wins
-- We don't do rank adjustment at index time — edge cases where two levels map to the same rank range could produce different results than Nominatim
+- At query time: apply Nominatim's rank adjustment to the polygons containing the point (Nominatim runs it at index time)
+- Then for each output field (city, county, state, etc.), keep the smallest-area polygon, admin boundaries before place areas — when two polygons map to the same field, the more specific (smaller) one wins
 
 ### Difference impact
 
-For most cases, our smallest-area-wins approach produces the same result. Edge cases where Nominatim's rank adjustment matters:
+Where Nominatim's rank adjustment matters:
 - Two admin levels that both map to the same rank range (e.g., level 5 and 6 both → county in some countries)
-- Nominatim bumps the inner one; we pick the smaller one. Result is usually the same entity.
+- Nominatim bumps the inner one, and so do we. The difference left is that we only see the polygons containing the query point and judge containment between them by admin level and area, where Nominatim tests the geometry.
 
 ## How our implementation maps to Nominatim
 
 | Nominatim concept | Our implementation | Status |
 |---|---|---|
 | address-levels.json | admin_levels.json (exact match, verified programmatically) | ✅ Verified |
-| get_label_tag() check 2-3 (place/linked_place extratags) | place_type_override field on AdminPolygon (from linked_place, border_type, place tags) | ✅ Implemented |
+| get_label_tag() check 2-3 (place/linked_place extratags) | place_type_override field on AdminPolygon (from the linked place node, else the boundary's linked_place / place tags) | ✅ Implemented |
 | get_label_tag() check 4 (ADMIN_LABELS rank//2) | rank_to_field() function | ✅ Implemented |
 | get_label_tag() check 5 (category[1] for place=* entities) | place_type_override covers this — boundary=place entities get place_type set | ✅ Implemented |
-| find_linked_place() node linking | Not implemented — we use tags on the boundary directly | ⚠️ Different mechanism, same result for tagged boundaries. Untagged boundaries that link to place nodes by name/wikidata won't get overrides. **Future fix**: at build time, match admin boundary wikidata tags against place node wikidata tags to set place_type_override. Name-based fallback is expensive (geometric containment test). |
-| Rank adjustment for nested boundaries | Not implemented — we use smallest-area-wins per field | ⚠️ Different mechanism, similar result for most cases |
+| find_linked_place() node linking | Builder: label role member, wikidata match, the boundary's own place tag, then name match (`link_places_by_name`), in Nominatim's order; a linked place node is hidden from place results | ✅ Implemented |
+| Rank adjustment for nested boundaries | At query time on the polygons containing the point, then smallest-area-wins per field | ✅ Implemented — containment judged by admin level and area |
 | boundary=place entities (e.g., Washington DC) | Extracted in builder with admin_level=15 + place_type_override | ✅ Implemented |
-| Place node fallback (nearest city/town/village) | place_nodes.bin + find_places() with wide search | ✅ Implemented — uses L14→L17 child enumeration for city/suburb (~1.2km), L17 neighbors for neighbourhood. **TODO**: index at L10 in builder for better performance and coverage. |
+| Place node fallback (nearest city/town/village) | place_nodes.bin + find_places() with wide search | ✅ Implemented — place nodes are indexed at the admin cell level (L10); the query cell and its 8 neighbours cover ~30 km |
 | place_addressline pre-computed relationships | Not applicable — we do spatial lookup at query time | N/A — different architecture |
-| Postcodes from addr:postcode | Not implemented — only boundary-based postcodes | ❌ Deferred — see "Postcode handling" section below |
-| border_type tag | Extracted but Nominatim doesn't actually use this tag | ⚠️ We use it as a fallback after linked_place; harmless but unnecessary |
-| Wikidata-based place linking | Not implemented | ❌ Deferred — builder needs to match boundary wikidata tags against place node wikidata tags to set place_type_override. Name-based fallback requires geometric containment test. |
+| Postcodes from addr:postcode | addr_postcodes.bin (an address point's own addr:postcode) and postcode_centroids.bin (centroids of every addr:postcode, plus external ones) | ✅ Implemented — see "Postcode handling" section below |
+| border_type tag | Not used: Nominatim never reads this tag | ✅ Ignored, as in Nominatim |
+| Wikidata-based place linking | Part of find_linked_place() above: a boundary's wikidata matched against place node wikidata | ✅ Implemented |
 | Display name formatting | Ours is a clean formatted address; Nominatim dumps all address rows comma-separated | ℹ️ Ours is arguably better for end users. Nominatim's is more of a debug breadcrumb. Could add suburb fallback when city is missing. |
 | Street/road resolution | Minor differences in closest street selection | ℹ️ Our point-to-segment distance vs Nominatim's pre-computed parent streets. Causes occasional one-off differences at intersections. |
-| Suburb/neighbourhood rank adjustment | Not implemented — we use smallest-area-wins per field | ⚠️ Nominatim bumps child ranks to be > parent at index time. Could produce different suburb/neighbourhood assignments in edge cases with nested same-rank boundaries. |
-| TIGER address interpolation | Not implemented | ❌ Deferred — US TIGER data encodes address ranges in `tiger:*` tags on road ways (e.g., `tiger:zip_left`, `tiger:zip_right`). Nominatim interpolates house numbers from these. Affects rural/suburban US where addr:housenumber tags are sparse. Builder would need to extract TIGER ranges and store as interpolation data. |
+| Suburb/neighbourhood rank adjustment | Covered by the query-time rank adjustment above | ✅ Implemented |
+| TIGER address interpolation | `--tiger-data` loads Nominatim's TIGER export (address ranges, one CSV per county) as interpolation lines, with each line's ZIP in interp_postcodes.bin | ✅ Implemented — a US street that wins without an address point takes its house number from the nearest interpolation line of that street, as Nominatim's `_find_tiger_number_for_street` does |
 | Postal city names | Not implemented | ❌ Deferred — in the US, USPS assigns city names to ZIP codes that may differ from the actual municipal jurisdiction (e.g., "Cumming, GA" for unincorporated Forsyth County). Neither we nor Nominatim handle this — would require external USPS data or addr:city extraction. |
-| Name localisation | Not implemented — we always use the `name` tag | ❌ Deferred — Nominatim supports `accept-language` header to return locale-specific names (e.g., `name:en=Borough of Luton` instead of `name=Luton`). Builder would need to store `name:en`, `name:fr`, etc. in the string pool (or a separate name table), and server would need to select based on client language preference. |
+| Name localisation | Not implemented — we store one name per feature, `name:en` where present, else `name` | ❌ Deferred — Nominatim supports `accept-language` header to return locale-specific names (e.g., `name:en=Borough of Luton` instead of `name=Luton`). Builder would need to store `name:en`, `name:fr`, etc. in the string pool (or a separate name table), and server would need to select based on client language preference. |
 
 ## Postcode handling in Nominatim (traced from source)
 
@@ -171,7 +172,7 @@ Nominatim has THREE sources for postcodes, combined into the `location_postcodes
 - OSM `boundary=postal_code` relations with admin_level=11
 - These have actual polygon geometry
 - Stored with `osm_id IS NOT NULL` in location_postcodes
-- **We implement this** — our only current postcode source
+- **We use these at build time**: a street (way_postcodes.bin) and a POI (`parent_postcode_id`) inherit the postcode of the postal boundary containing them. Like Nominatim, which reads the stored `placex.postcode`, the server does no point-in-polygon on postal boundaries
 
 ### Source 2: addr:postcode tags on places (`placex` table)
 - Any OSM object with an `address->'postcode'` hstore entry
@@ -179,13 +180,13 @@ Nominatim has THREE sources for postcodes, combined into the `location_postcodes
 - These create **artificial postcode centroids** — computed as the average position of all objects sharing that postcode
 - Stored with `osm_id IS NULL` in location_postcodes
 - Only used for areas NOT already covered by postcode boundary polygons (line 342: `NOT EXISTS(SELECT * FROM _global_postcode_area ...)`)
-- **We don't implement this** — would require extracting addr:postcode from streets/buildings during PBF parsing and computing centroids
+- **We implement this**: the builder keeps each address point's addr:postcode (addr_postcodes.bin) and averages the address points of each (country, postcode) into postcode_centroids.bin
 
 ### Source 3: External postcode CSV files
 - Per-country CSV files (`{country}_postcodes.csv`) placed in the project directory
 - Format: `postcode,lat,lon`
 - Added to fill gaps where neither boundary polygons nor addr:postcode data exists
-- **We don't implement this** — would require downloading/maintaining external data
+- **We implement this**: `--external-postcodes` loads GeoNames postcode centroids, and `--tiger-data` adds the US ones. They fill only the (country, postcode) pairs OSM has none for, as Nominatim's `_update_from_external` does
 
 ### How postcodes are resolved at query time
 
@@ -195,8 +196,10 @@ Nominatim has THREE sources for postcodes, combined into the `location_postcodes
 
 The postcode is also populated from the `place_addressline` chain — if a street/building has addr:postcode, it appears in the address rows directly.
 
-### What we'd need to implement
+### What we implement
 
-**Minimum (covers most cases)**: During PBF parsing, capture `addr:postcode` from address points and street ways. Store the postcode alongside the address/street data. At query time, when the closest street/address has a postcode, include it in the result.
+`resolve_postcode()` in `server/src/lib.rs` follows Nominatim's stored `placex.postcode` chain for the feature that won the query:
 
-**Full (matching Nominatim)**: Additionally compute artificial postcode centroids from all addr:postcode occurrences and create a postcode spatial index. This is more complex but handles the case where you're near a road without addr:postcode but within a postcode area.
+0. An address point's own addr:postcode (addr_postcodes.bin)
+1. A street's or POI's postcode inherited from its postal boundary at build time (way_postcodes.bin, `parent_postcode_id`); for a US street, the ZIP of a TIGER line of that street within ~100 m (interp_postcodes.bin)
+2. The nearest postcode centroid of the same country within 0.05° (postcode_centroids.bin, as `get_nearest_postcode()`)

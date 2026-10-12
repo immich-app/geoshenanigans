@@ -25,10 +25,10 @@ The geocoder now includes a POI layer that tells you what notable places are nea
 
 ## Data Stats
 
-- **5.85 million** POIs extracted from OpenStreetMap
-- **55 categories** across tourism, historic, amenity, leisure, natural, transport, and more
-- **2.8 million** polygon POIs (parks, airports, islands) + **3.0 million** point POIs (peaks, viewpoints, monuments)
-- **~970K** POIs enriched with Wikipedia/Wikidata metadata
+Sizes and counts here are from the planet build of 2026-10-12.
+
+- **24.5 million** POI records in the `all` tier, from OSM nodes, closed ways and multipolygon relations
+- **205 categories** across tourism, historic, amenity, shop, leisure, natural, transport, and more
 
 ## Categories
 
@@ -53,9 +53,9 @@ Users choose how much POI data they want:
 
 | Tier | Records | Download Size | What's included |
 |---|---|---|---|
-| **Major** | 902K | 249 MiB | Airports, national parks, volcanoes, glaciers, islands, cathedrals, palaces, train stations, UNESCO sites |
-| **Notable** | 3.0M | 476 MiB | + museums, castles, stadiums, beaches, waterfalls, universities, viewpoints, lighthouses |
-| **All** | 5.9M | 643 MiB | + every named POI: places of worship, peaks, memorials, artwork, libraries, gardens, springs |
+| **Major** | 0.9M | 204 MiB | Airports, national parks, volcanoes, glaciers, islands, cathedrals, palaces, train stations, UNESCO sites |
+| **Notable** | 3.8M | 373 MiB | + museums, castles, stadiums, beaches, waterfalls, universities, viewpoints, lighthouses |
+| **All** | 24.5M | 1.04 GiB | + every named POI: places of worship, peaks, memorials, artwork, libraries, gardens, springs |
 
 Tiers are cumulative — Notable includes all Major POIs, All includes everything.
 
@@ -64,7 +64,7 @@ Tiers are cumulative — Notable includes all Major POIs, All includes everythin
 Each POI gets an importance score (0-255) computed at build time from:
 
 1. **Category base weight** — volcanoes (40) > airports (30) > museums (20) > parks (15) > peaks (10) > fountains (2)
-2. **Wikipedia/Wikidata multiplier** — POIs with both get 3x, Wikipedia only 2.5x, Wikidata only 1.5x
+2. **Wikipedia/Wikidata multiplier** — `1 + log2(1 + sitelinks) / 3` from the Wikidata item's sitelinks count; a POI without one falls back to its tags: both get 3x, Wikipedia only 2.5x, Wikidata only 1.5x
 3. **Elevation scaling** (peaks/volcanoes) — Mount Everest ~130, random 200m hill ~5
 4. **Polygon area scaling** — Central Park > neighborhood garden
 
@@ -87,50 +87,55 @@ A client picks: **region** + **mode** + **quality** + **POI tier** (all independ
 
 | Mode | Size | Description |
 |---|---|---|
-| Full | 15.7 GiB | Streets + addresses + interpolation + admin cells |
-| No-addresses | 12.3 GiB | Streets + interpolation + admin cells (no address points) |
-| Admin-only | 77 MiB | Admin boundary cell index + strings only |
+| Full | 9.0 GiB | Streets + addresses + interpolation + admin cells + place nodes + postcodes |
+| No-addresses | 3.8 GiB | Streets + admin cells + place nodes + postcodes (no address points or interpolation) |
+| Admin | 110 MiB | Admin boundary cell index + place nodes + postcodes |
+| Admin-minimal | 220 MiB | Admin levels 2-8 + place nodes, with its own q2.5 polygons (no quality dir needed) |
+
+Sizes are zstd downloads. Except for admin-minimal, a mode dir holds no
+boundary polygons: those come from the quality dir.
 
 ### By Quality (planet, admin boundary resolution)
 
-The vertex file (`admin_vertices.bin`) is what varies between quality
-variants — the rest of the admin-only deployable set (place_nodes,
-postcode_centroids, strings tiers, admin polygons, postal vertices,
-parents, etc.) adds **328 MiB raw / 118 MiB zstd** regardless of quality.
+The vertex file (`admin_vertices.bin`) is most of what varies between
+quality variants. The admin mode dir (place_nodes, postcode_centroids,
+string tiers, cell index, etc.) adds **305 MiB raw / 110 MiB zstd**
+regardless of quality; the quality dir also holds `admin_polygons.bin` and
+the postal boundaries.
 
-| Quality | `admin_vertices.bin` | Full admin-only set (raw) | (zstd download) | Boundary precision (L8) |
+| Quality | `admin_vertices.bin` | Admin mode + quality dir (raw) | (zstd download) | Boundary precision (L8) |
 |---|---|---|---|---|
-| Uncapped | 1.46 GiB | 1.87 GiB | 1.44 GiB | <1 m |
-| q0.2 | 765 MiB | 1.13 GiB | 865 MiB | ~3 m |
-| q0.5 | 519 MiB | 899 MiB | 635 MiB | ~7 m |
-| q1 | 369 MiB | 741 MiB | 489 MiB | ~15 m |
-| q1.5 | 297 MiB | 665 MiB | 419 MiB | ~22 m |
-| q2 | 253 MiB | 619 MiB | 375 MiB | ~30 m |
-| **q2.5** | **223 MiB** | **587 MiB** | **345 MiB** | **~37 m — default** |
+| Uncapped | 1.51 GiB | 1.93 GiB | 1.50 GiB | <1 m |
+| q0.2 | 789 MiB | 1.14 GiB | 893 MiB | ~3 m |
+| q0.5 | 534 MiB | 899 MiB | 649 MiB | ~7 m |
+| q1 | 379 MiB | 734 MiB | 497 MiB | ~15 m |
+| q1.5 | 305 MiB | 655 MiB | 424 MiB | ~22 m |
+| q2 | 260 MiB | 607 MiB | 378 MiB | ~30 m |
+| **q2.5** | **229 MiB** | **573 MiB** | **347 MiB** | **~37 m — default** |
 
 ### By POI Tier (planet)
 
 | Tier | Size | Records |
 |---|---|---|
-| Major | 249 MiB | 902K |
-| Notable | 476 MiB | 3.0M |
-| All | 643 MiB | 5.9M |
+| Major | 204 MiB | 0.9M |
+| Notable | 373 MiB | 3.8M |
+| All | 1.04 GiB | 24.5M |
 
 ### Total Download Examples
 
 | Configuration | Total Size | Use case |
 |---|---|---|
-| Full + uncapped + all POIs | 19.1 GiB | Maximum quality, all data |
-| Full + q1 + notable POIs | 16.9 GiB | Good balance for photo apps |
-| No-addresses + q1 + major POIs | 13.2 GiB | Streets + major landmarks |
-| Admin-only + q1 | 780 MiB | Minimal — just boundaries |
-| Admin-only + q2.5 | 522 MiB | Smallest useful configuration |
+| Full + uncapped + all POIs | 11.4 GiB | Maximum quality, all data |
+| Full + q1 + notable POIs | 9.7 GiB | Good balance for photo apps |
+| No-addresses + q1 + major POIs | 4.4 GiB | Streets + major landmarks |
+| Admin + q1 | 497 MiB | Minimal — just boundaries |
+| Admin + q2.5 | 347 MiB | Smallest useful configuration |
 
 ### Regional Extracts
 
 Available for: planet, europe, asia, north-america, south-america, africa, oceania, central-america, antarctica.
 
-Regional downloads are much smaller — Europe full + uncapped is ~1.3 GiB vs planet's 18.4 GiB.
+Regional downloads are smaller — Europe full + uncapped is 4.4 GiB vs planet's 10.4 GiB.
 
 ## Incremental Updates
 
@@ -140,7 +145,7 @@ The system supports daily incremental patching:
 2. Patches (`.gcpatch` files) are generated against the previous day's build
 3. Clients download and apply patches instead of re-downloading the full index
 4. Patches are verified byte-identical to a fresh build before upload
-5. Patches are typically 0.1-1% of the full index size
+5. Patches are well under 0.1% of the index: one day of planet full + q2.5 + all POIs is about 4.5 MiB (see `builder/PATCHING.md`)
 
 POI data is patched independently — each tier directory gets its own patch file.
 
@@ -150,23 +155,25 @@ POI data is patched independently — each tier directory gets its own patch fil
 - Parses OpenStreetMap PBF files in parallel
 - Extracts POIs from nodes (points), closed ways (polygons), and relations (multipolygons)
 - Indexes using S2 geometry cells at level 10 (~10km resolution)
-- Computes importance scores from category, wiki flags, elevation, area
+- Computes importance scores from category, Wikidata sitelinks (or wiki tags), elevation, area
 - Outputs deterministic binary files for efficient diff/patch
 
 ### Server (Rust)
 - Memory-maps all index files for zero-copy access
 - Sub-millisecond query latency
-- Loads category metadata from `poi_meta.json` (no hardcoded categories)
+- Loads category names and scoring parameters from `poi_meta.json`; the OSM class a landmark is reported under (tourism, historic, ...) is mapped from the category number in code
 - Scoring-based POI lookup with distance decay and max distance cutoffs
 
-### Binary Files (4 per POI tier)
+### Files (7 per POI tier)
 
 | File | Record Size | Description |
 |---|---|---|
-| `poi_records.bin` | 24 bytes | Name, category, tier, importance, coordinates, polygon reference |
-| `poi_vertices.bin` | 8 bytes | Polygon boundary vertices (lat/lng pairs) |
+| `poi_records.bin` | 36 bytes | Name, category, tier, importance, coordinates, polygon reference, parent street, postcode and admin polygon |
+| `poi_vertices.bin` | 10-byte header + 4 or 8 bytes per vertex | Polygon outlines: encoding and bounding box, then the packed vertices |
 | `poi_cells.bin` | 12 bytes | S2 cell spatial index |
 | `poi_entries.bin` | variable | Per-cell POI ID lists |
+| `strings_poi.bin` | variable | POI names |
+| `strings_layout.json` | — | String tier layout |
 | `poi_meta.json` | — | Category names, scoring parameters |
 
 ## Test Portal
@@ -183,5 +190,5 @@ Run with Docker:
 ```bash
 cd geocoder/test-portal
 docker compose up --build
-# Open http://localhost:3000/test
+# Open http://localhost:3002/test (the minimal-dataset server for comparison is on :3001)
 ```

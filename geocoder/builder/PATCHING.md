@@ -10,12 +10,9 @@ in sequence and arrive at output **byte-identical** to a fresh build.
 
 ### What Works
 - **Deterministic builds**: Same PBF always produces byte-identical output (verified on Germany, Europe, and Planet)
-- **Single-patch application**: Verified on both Europe and Planet — all 14 files byte-identical
+- **Single-patch application**: Verified on both Europe and Planet — every file byte-identical
 - **Sequential patching**: Verified on planet with 3 distinct weekly snapshots (Mar 9 → Mar 16 → Mar 23) — **PASS**; with the v5 tools on three daily planets (Oct 4 → 5 → 6), every variant applied stacked in a client-shaped tree — **PASS** (126/126)
 - **Custom patch format**: Merge sequences, string-level diffs, parent-aware coordinate merges, secondary ID matching, cell corrections — fully custom diff/apply logic (only zstd for transport compression)
-
-### What Needs Work
-- **Code cleanup**: Legacy dead code block in geocoder_patch.cpp, prototype files
 
 ## Tested Patch Sizes
 
@@ -135,24 +132,21 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
 4. For coordinate files (nodes/vertices): derive merge from parent way/polygon merge — verify node blocks match before COPY, INSERT if nodes changed
 5. Derive ID remaps from merge sequences (MATCH ops define old→new record correspondence)
 6. **Secondary matching**: For DELETE/INSERT records in merge sequences, match by relaxed key (name + node_count for ways, street + housenumber for addrs, etc.) to recover ID mappings for modified-but-same-entity records
-7. Rebuild entry files from enhanced ID remaps + cell changes
-8. Compare derived entries with new entries cell by cell — include differing cells as corrections
-9. Compare cell flags (has_street/has_addr/has_interp) between old and new — include differences
-10. Package everything, compress whole patch with zstd for transport
+7. Derive each cell's entry list from the old one (IDs remapped) and the cell changes, and compare it with the new one: street / addr / interp cells that differ go out as per-cell lost / gained ids (Geo Entry Deltas), the admin / POI / place cell indexes as a Cell Index Delta (whole-cell Entry Corrections where the new layout can't be rebuilt)
+8. Package everything, compress whole patch with zstd for transport
 
 **Patch tool:**
 1. Decompress zstd
 2. Read the strings section → rebuild each shipped tier from the dir's own old tier + additions/deletions and derive its remap runs; take the sent runs of unshipped tiers and the cross-tier pairs as they come
 3. For each data file: apply string remap + offset fixups to old, replay merge sequence → output file, track ID mapping from MATCH ops
 4. Read secondary ID remaps → merge into derived ID mappings
-5. Read cell changes (added/removed cell IDs) and flag corrections
-6. Rebuild entry files from enhanced ID mappings + cell changes
-7. Apply cell-level entry corrections (replace specific cells' data)
-8. Rebuild geo_cells/admin_cells from corrected entries + flag corrections
+5. Read cell changes (added/removed cell IDs) and the per-cell entry deltas
+6. Rebuild geo_cells and the street / addr / interp entry files in one pass over the old geo index: each cell's lists with their IDs remapped, corrected by the cell's delta
+7. Rebuild the admin / POI / place cell indexes from their ID remaps + cell changes, corrected by the Cell Index Delta (or Entry Corrections)
 
 ## Known Issues
 
-### 1. Cell correction overhead (PARTIALLY FIXED)
+### 1. Cell correction overhead (FIXED)
 
 **Impact**: ~29 MiB for planet (down from ~42 MiB), ~11 MiB for Europe (down from ~15 MiB).
 
@@ -160,7 +154,7 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
 - **Secondary ID matching** recovers 119K additional ID mappings on planet (55K ways, 59K addrs, 4.6K admin). Reduced street corrections 2.03M → 1.59M (22%), addr corrections 116K → 95K (18%).
 - **Admin hash bug fix** (was reading padding byte instead of country_code). Admin corrections 193K → 4.6K cells (**97% reduction**).
 
-**Remaining cause**: 1.59M street cells (25.7 MiB) still need corrections. These are from records that genuinely differ (geometry changes where name + node_count also changed, truly new/removed entities). Further reduction would require OSM-level entity tracking.
+**Remaining cause**: 1.59M street cells (25.7 MiB) still needed corrections. These are from records that genuinely differ (geometry changes where name + node_count also changed, truly new/removed entities). Further reduction needed OSM-level entity tracking, which strategy-2 stable IDs now provide: a record keeps its id from one build to the next (`<file>.osm_ids` sidecars, read through `build-index --prev-output`), and v6 sends what is left as per-cell lost / gained ids.
 
 ### 2. Way fixup table size (FIXED)
 
@@ -295,11 +289,13 @@ End marker: 0xFFFFFFFF (u32)
 
 | Operation | Europe | Planet |
 |-----------|--------|--------|
-| Build (deterministic) | ~12 min | ~14 min |
-| Diff generation | **3m40s** | **15m22s** |
 | Patch application, 1 core, cold cache (`full`, one day) | **81s** | **241s** |
 | Patch peak anonymous memory | **5 MiB** | **12 MiB** |
 | Patch memory limit tested (page cache included) | 1 GiB | 1 GiB |
+
+One deterministic `build-index` run writes the planet and every continent in
+about 5 minutes on 64 cores, and `geocoder-diff` makes the patches of all 126
+variant dirs in about 6 minutes on the same box (see `OPTIMIZATION_LOG.md`).
 
 ## TODO (Priority Order)
 
@@ -324,16 +320,16 @@ End marker: 0xFFFFFFFF (u32)
 
 ### Should Do (Patch Size)
 - ~~Run planet with secondary matching~~ — **DONE** (77→73 MiB, street corrections 2.03M→1.59M, admin corrections 193K→4.6K)
-- **Further reduce cell corrections** — Remaining 1.59M street corrections on planet (25.7 MiB). Would need OSM-level entity tracking for further improvement.
+- ~~Further reduce cell corrections~~ — **DONE** (strategy-2 stable IDs; per-cell lost / gained ids since v6)
 
 ### Nice to Have (Performance)
-- **Parallel merge building** — Currently sequential across files
+- ~~Parallel merge building~~ — **DONE** (geocoder-diff builds each file family on its own thread)
 - ~~Streaming patch application~~ — **DONE** (the decompressed patch is mmapped from scratch; records, cell indexes, remaps and deltas stream)
-- **Code cleanup** — Remove legacy dead code block in geocoder_patch.cpp, prototype files
+- ~~Code cleanup~~ — **DONE** (legacy patch paths and prototype tools removed)
 
 ### Future Consideration (Format Changes)
 - **Inline node storage** — Store way nodes inline instead of separate flat array. Eliminates coordinate cascade entirely. Requires server format change.
-- **Content-addressed record IDs** — Hash-based IDs instead of sequential indices. Makes entry files stable across builds. Requires server format change.
+- ~~Content-addressed record IDs~~ — superseded by strategy-2 stable IDs, which keep record IDs, and so entry files, stable across builds with no server format change
 - **Fixed-size cell slots** — Pre-allocate per cell. Analysis showed 2-6x space waste due to skewed distribution.
 
 ## File Inventory

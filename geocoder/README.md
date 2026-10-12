@@ -1,66 +1,51 @@
-# Traccar Geocoder
+# Reverse Geocoder
 
-A fast, self-hosted reverse geocoding service built from OpenStreetMap data. Given latitude and longitude coordinates, it returns the nearest street address including house number, street name, city, state, county, postcode, and country.
+A fast reverse geocoder built from OpenStreetMap data. Given latitude and longitude coordinates, it returns the nearest street address including house number, street name, city, state, county, postcode, and country, resolved the way Nominatim resolves them (see [NOMINATIM_REFERENCE.md](NOMINATIM_REFERENCE.md)), and the notable places nearby.
 
-Part of the [Traccar](https://www.traccar.org) open source GPS tracking platform. Also available as a [hosted service](https://www.traccar.org/product/geocoder/).
+Based on the open source [Traccar Geocoder](https://github.com/traccar/traccar-geocoder).
 
 ## Features
 
 - Street-level reverse geocoding from OSM data
-- Address point, street name, and address interpolation lookup
+- Address point, street name, and address interpolation lookup (TIGER ranges in the US)
 - Administrative boundary resolution (country, state, county, city, postcode)
+- Points of interest in three tiers ([POI_OVERVIEW.md](POI_OVERVIEW.md))
 - Sub-millisecond query latency with memory-mapped index files
+- Nightly indexes with daily patches ([PATCHING.md](PATCHING.md))
 - Automatic HTTPS with Let's Encrypt
-- Docker support with automatic PBF download and indexing
+
+## Published Indexes
+
+The nightly build (`.github/workflows/geocoder-build.yml`) builds the planet
+and eight continents from the day's OSM data and publishes every index
+variant, with a patch from the previous day, to Tigris:
+`https://geoshenanigans-reverse-geocoding.t3.tigrisfiles.io/geocoder/builds/latest.json`.
+[PATCHING.md](PATCHING.md) describes the layout, the variants (mode, boundary
+quality, POI tier) and how a client downloads and patches them.
 
 ## Quick Start
 
-### Docker Compose
-
-```yaml
-services:
-  geocoder:
-    image: traccar/traccar-geocoder
-    environment:
-      - PBF_URLS=https://download.geofabrik.de/europe/monaco-latest.osm.pbf
-    ports:
-      - "3000:3000"
-    volumes:
-      - geocoder-data:/data
-
-volumes:
-  geocoder-data:
-```
+Serve the published indexes:
 
 ```bash
-docker compose up
+cargo build --release --manifest-path server/Cargo.toml
+./server/target/release/query-server data
 ```
 
-### Docker
+The server downloads a continent from the latest build the first time a query
+lands in it: `admin` mode, `q2.5` boundaries and no POIs unless an admin sets
+another selection with `PUT /admin/configuration` (a JSON body of `base_url`,
+`mode`, `quality`, `poi_tier` and the regions to `preload`). Queries need an
+API key from the dashboard (see Authentication below).
+
+The test portal is a map page for checking answers, served by every query
+server at `/test`. Its compose file runs two servers on the latest published
+index, a full one and a minimal one, side by side:
 
 ```bash
-# All-in-one: download, build index, and serve
-docker run -e PBF_URLS="https://download.geofabrik.de/europe-latest.osm.pbf" \
-  -v geocoder-data:/data -p 3000:3000 traccar/traccar-geocoder
-
-# Build index only
-docker run -e PBF_URLS="https://download.geofabrik.de/europe-latest.osm.pbf" \
-  -v geocoder-data:/data traccar/traccar-geocoder build
-
-# Serve only (from pre-built index)
-docker run -v geocoder-data:/data -p 3000:3000 traccar/traccar-geocoder serve
-
-# Multiple PBF files
-docker run -e PBF_URLS="https://download.geofabrik.de/europe/france-latest.osm.pbf https://download.geofabrik.de/europe/germany-latest.osm.pbf" \
-  -v geocoder-data:/data -p 3000:3000 traccar/traccar-geocoder
-
-# With automatic HTTPS
-docker run -e PBF_URLS="https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf" \
-  -e DOMAIN=geocoder.example.com \
-  -v geocoder-data:/data -p 443:443 traccar/traccar-geocoder
+cd test-portal && docker compose up --build
+# open http://localhost:3002/test
 ```
-
-PBF files can be downloaded from [Geofabrik](https://download.geofabrik.de/).
 
 ## API
 
@@ -108,31 +93,38 @@ The server includes a web dashboard for managing API keys. On first launch, navi
 
 ## Architecture
 
-The project consists of two components:
+The project consists of four components:
 
-- **Builder** (C++) - Parses OSM PBF files and creates a compact binary index using S2 geometry cells for spatial lookup.
-- **Server** (Rust) - Memory-maps the index files and serves queries via HTTP/HTTPS with sub-millisecond latency.
+- **Builder** (`builder/`, C++) - `build-index` parses OSM PBF files and creates a compact binary index using S2 geometry cells for spatial lookup. `geocoder-diff` and `geocoder-patch` make and apply the daily patches ([builder/PATCHING.md](builder/PATCHING.md)), and `pbf-apply` applies OSM replication diffs to a PBF.
+- **Server** (`server/`, Rust) - Memory-maps the index files and serves queries via HTTP/HTTPS with sub-millisecond latency. It is also the `query_server` library the binding wraps.
+- **Node binding** (`node/`) - The native module Immich uses to geocode in-process: `Geocoder.load(dir)`, then `reverseGeocode(lat, lng)` resolves to the response JSON as a string.
+- **Test portal** (`test-portal/`) - The map page served at `/test`, and a compose file that runs it on the published index.
 
 ### Index Structure
 
-The builder produces 14 binary files:
+A full index holds the files below. The published variants split them
+between a mode dir, a quality dir and a POI dir; the files of each are listed
+in [PATCHING.md](PATCHING.md) and `builder/configurations.template.json`.
 
-| File | Description |
+| Files | Description |
 |------|-------------|
 | `geo_cells.bin` | Merged S2 cell index for streets, addresses, and interpolations |
-| `street_entries.bin` | Street way IDs per cell |
-| `street_ways.bin` | Street way headers (node offset, name) |
-| `street_nodes.bin` | Street node coordinates |
-| `addr_entries.bin` | Address point IDs per cell |
-| `addr_points.bin` | Address point data (coordinates, house number, street) |
-| `interp_entries.bin` | Interpolation way IDs per cell |
-| `interp_ways.bin` | Interpolation way headers |
-| `interp_nodes.bin` | Interpolation node coordinates |
-| `admin_cells.bin` | S2 cell index for admin boundaries |
-| `admin_entries.bin` | Admin polygon IDs per cell |
-| `admin_polygons.bin` | Admin polygon metadata |
-| `admin_vertices.bin` | Admin polygon vertices |
-| `strings.bin` | Deduplicated string pool |
+| `street_entries.bin`, `street_ways.bin`, `street_nodes.bin` | Street way IDs per cell, way headers (node offset, name), node coordinates |
+| `way_parents.bin`, `way_postcodes.bin` | Per street: smallest containing admin polygon, postcode from its postal boundary |
+| `addr_entries.bin`, `addr_points.bin`, `addr_vertices.bin` | Address point IDs per cell, point data (coordinates, house number, street), building outlines |
+| `addr_postcodes.bin` | Per address point: its own `addr:postcode` |
+| `interp_entries.bin`, `interp_ways.bin`, `interp_nodes.bin` | Interpolation way IDs per cell, way headers, node coordinates |
+| `interp_postcodes.bin` | Per interpolation way: its TIGER ZIP (TIGER regions only) |
+| `admin_cells.bin`, `admin_entries.bin` | S2 cell index for admin boundaries |
+| `admin_polygons.bin`, `admin_vertices.bin` | Admin polygon metadata and vertices (per quality variant) |
+| `admin_parents.bin` | Per admin polygon: the next larger polygon containing it |
+| `postal_polygons.bin`, `postal_vertices.bin` | Postal code boundaries (per quality variant, where they exist) |
+| `place_cells.bin`, `place_entries.bin`, `place_nodes.bin` | Place nodes (city, town, village, suburb, ...) and their cell index |
+| `postcode_centroids.bin`, `postcode_centroid_cells.bin`, `postcode_centroid_entries.bin` | Postcode centroids and their cell index |
+| `poi_records.bin`, `poi_vertices.bin`, `poi_cells.bin`, `poi_entries.bin` | Points of interest and their cell index |
+| `strings_core.bin`, `strings_street.bin`, `strings_addr.bin`, `strings_postcode.bin`, `strings_poi.bin` | Deduplicated string pool, in five tiers so each variant ships only the strings it uses |
+| `strings_layout.json` | Start and end of each string tier, which place every string offset |
+| `poi_meta.json` | POI category names and scoring parameters |
 
 ## Building from Source
 
@@ -141,7 +133,8 @@ The builder produces 14 binary files:
 **Builder (C++):**
 - CMake 3.16+
 - C++17 compiler
-- libosmium, protozero, s2geometry, zlib, libdeflate, bzip2, expat
+- protozero, s2geometry and abseil, libdeflate (`build-index`); zlib and expat (`pbf-apply`)
+- the `zstd` command, which `geocoder-diff` and `geocoder-patch` run on patches
 
 **Server (Rust):**
 - Rust toolchain
@@ -165,7 +158,7 @@ cargo build --release --manifest-path server/Cargo.toml
 # Start the server
 ./server/target/release/query-server output-dir [bind-address]
 
-# Start with automatic HTTPS
+# Start with automatic HTTPS (certificates cached in --cache, default acme-cache)
 ./server/target/release/query-server output-dir --domain geocoder.example.com
 ```
 
@@ -214,16 +207,12 @@ The server is designed to run inside memory-constrained deployments
 - `GET /health` returns `200 {"status":"ok","regions":N}` once the
   index is serving — wire it to container health checks.
 
-## Environment Variables (Docker)
+## Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `PBF_URLS` | Space-separated list of PBF download URLs | (required for auto/build) |
-| `DOMAIN` | Domain name for automatic HTTPS via Let's Encrypt | (disabled) |
-| `BIND_ADDR` | HTTP bind address | `0.0.0.0:3000` |
-| `DATA_DIR` | Data directory for PBF files and index | `/data` |
-| `CACHE_DIR` | ACME certificate cache directory | `acme-cache` |
 | `GEOCODER_WORKER_THREADS` | Async worker pool size | `min(cores, 8)` |
+| `GEOCODER_ALLOW_ANONYMOUS` | `true` accepts requests without an API key, configuration changes included, with no rate limit: only for a server on a private container network | (disabled) |
 
 ## License
 

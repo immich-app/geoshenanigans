@@ -202,8 +202,12 @@ the same date and swap the whole set in together.
 Quality changes don't require patching — just download the new quality files:
 
 ```
-1. Download builds/{current_date}/{region}/quality/{new_quality}/*.bin
-2. Replace local admin_polygons.bin and admin_vertices.bin
+1. Download the files the quality.{new_quality} component lists for
+   {current_date} (its `files` and the `optional_files` that appear in
+   `files`), each as <path>.zst, decompress, and check it against its sha256
+2. Replace the local quality dir with them: admin_polygons.bin and
+   admin_vertices.bin, plus postal_polygons.bin and postal_vertices.bin
+   where the region has postal boundaries
 ```
 
 ### Switching Region
