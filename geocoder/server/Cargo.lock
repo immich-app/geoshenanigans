@@ -1358,7 +1358,6 @@ dependencies = [
  "bytes",
  "futures-util",
  "getrandom 0.2.17",
- "js-sys",
  "memmap2",
  "reqwest",
  "rustls-acme",
@@ -1368,7 +1367,6 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-stream",
- "wasm-bindgen",
  "zstd",
 ]
 

@@ -1,116 +1,70 @@
-//! Reverse-geocoder library — extracted from main.rs so the wasm port
-//! and the existing HTTP server can share one implementation. The bin
-//! crate (main.rs) wires up axum + auth on top of this.
+//! Reverse-geocoder library, shared by the HTTP server and the napi
+//! binding (geocoder/node). The bin crate (main.rs) wires up axum +
+//! auth on top of this.
 
 use s2::cellid::CellID;
 use s2::latlng::LatLng;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
-#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 
-// Byte-source abstraction.  Two access patterns:
-//
-//   1. Small files (<4 GiB): the whole file is resident in process
-//      memory.  `as_slice()` returns the full contiguous bytes, and the
-//      typed-slice patterns (`from_raw_parts(buf.as_ptr() as *const T,
-//      ...)`) work directly on it.  Used for admin/place/poi/postcode
-//      tier files everywhere, and for large files on native (mmap is
-//      contiguous in process address space regardless of file size).
-//
-//   2. Large files (>4 GiB) on wasm32: can't fit in linear memory.
-//      Use `read_chunk(off, len)` to fetch only the bytes you need via
-//      a JS callback.  The chunked API works on any backing store, so
-//      methods written against it run on native + wasm uniformly.
-//
-// Index methods that touch >4 GiB files (query_geo, find_addr_on_way)
-// MUST use read_chunk.  Methods that don't (find_admin, find_pois,
-// find_places, resolve_postcode for centroids) can keep the
-// typed-slice pattern via as_slice().
+// Byte-source abstraction.  Index files are memory-mapped, so each one
+// is contiguous in process address space regardless of its size.
+// `as_slice()` returns the full contiguous bytes; `read_chunk(off, len)`
+// returns a window of them.
 
-#[cfg(not(target_arch = "wasm32"))]
 use memmap2::Mmap;
-#[cfg(not(target_arch = "wasm32"))]
 use std::fs::File;
 
-/// Backing storage for an indexed file.  All variants implement
-/// `as_slice()` for full-file access (zero-copy on Mmap/Bytes), and
-/// `read_chunk(off, len)` for windowed access (zero-copy on Mmap/Bytes,
-/// allocating on JsChunked).  The JsChunked variant is wasm-only and
-/// supports files larger than wasm's 4 GiB linear memory cap.
+/// Backing storage for an indexed file.  Both variants implement
+/// `as_slice()` for full-file access and `read_chunk(off, len)` for
+/// windowed access, both zero-copy.
 pub enum FileBytes {
-    /// Owned bytes resident in process memory.  Used for small files
-    /// on wasm and for any test data.
+    /// Owned bytes resident in process memory.  Used for test data.
     Owned(Vec<u8>),
-    /// Memory-mapped file.  Native only.  Zero-copy lazy page-faulting
-    /// from the OS page cache; works for files of any size.
-    #[cfg(not(target_arch = "wasm32"))]
+    /// Memory-mapped file.  Zero-copy lazy page-faulting from the OS
+    /// page cache; works for files of any size.
     Mmap(Mmap),
-    /// Wasm-only chunked access via a JS callback.  Each `read_chunk`
-    /// call invokes the JS function `read(file_handle, off, len) →
-    /// Uint8Array`.  An internal page cache reduces JS round-trips
-    /// for hot pages.  Used for files >4 GiB on wasm.
-    #[cfg(target_arch = "wasm32")]
-    JsChunked(crate::wasm_chunked::JsChunked),
 }
 
 impl FileBytes {
-    /// Total file length in bytes.  Returned as u64 because wasm32's
-    /// `usize` is 32 bits and would truncate any file over 4 GiB
-    /// (planet's geo_cells / addr_vertices etc. are >4 GiB).
+    /// Total file length in bytes.
     pub fn len(&self) -> u64 {
         match self {
             Self::Owned(v) => v.len() as u64,
-            #[cfg(not(target_arch = "wasm32"))]
             Self::Mmap(m) => m.len() as u64,
-            #[cfg(target_arch = "wasm32")]
-            Self::JsChunked(j) => j.len(),
         }
     }
 
     pub fn is_empty(&self) -> bool { self.len() == 0 }
 
-    /// Full-file slice access.  Cheap for Owned and Mmap.  Panics for
-    /// JsChunked since the file isn't resident — only chunked access is
-    /// available.  Callers operating on potentially-chunked files
-    /// should use `read_chunk` instead.  Also panics if the file is
-    /// >usize::MAX (only relevant on 32-bit native).
+    /// Full-file slice access.  Cheap for Owned and Mmap.
     pub fn as_slice(&self) -> &[u8] {
         match self {
             Self::Owned(v) => v,
-            #[cfg(not(target_arch = "wasm32"))]
             Self::Mmap(m) => m,
-            #[cfg(target_arch = "wasm32")]
-            Self::JsChunked(_) => panic!("FileBytes::as_slice on JsChunked — use read_chunk for chunked sources"),
         }
     }
 
-    /// Read `len` bytes starting at `off`.  Offsets are u64 so files
-    /// >4 GiB on wasm address correctly.  `len` stays usize because
+    /// Read `len` bytes starting at `off`.  `len` stays usize because
     /// individual reads are always tiny (max a few KiB of vertices).
-    /// Returns `Cow::Borrowed` for Owned/Mmap (zero-copy slice),
-    /// `Cow::Owned` for JsChunked (allocates from the chunk cache).
+    /// Returns `Cow::Borrowed` (zero-copy slice).
     pub fn read_chunk(&self, off: u64, len: usize) -> std::borrow::Cow<'_, [u8]> {
         match self {
             Self::Owned(v) => {
                 let off = off as usize;
                 std::borrow::Cow::Borrowed(&v[off..off + len])
             }
-            #[cfg(not(target_arch = "wasm32"))]
             Self::Mmap(m) => {
                 let off = off as usize;
                 std::borrow::Cow::Borrowed(&m[off..off + len])
             }
-            #[cfg(target_arch = "wasm32")]
-            Self::JsChunked(j) => std::borrow::Cow::Owned(j.read(off, len)),
         }
     }
 
-    /// Read a `Copy` record at index `idx` (byte offset = idx * sizeof T).
-    /// Index is u64 so >4 GiB files address correctly on wasm.
-    /// Native Mmap / Owned: pointer cast through read_unaligned.
-    /// JsChunked: fetches sizeof(T) bytes from the chunk cache.
+    /// Read a `Copy` record at index `idx` (byte offset = idx * sizeof T)
+    /// via a pointer cast through read_unaligned.
     pub fn read_at<T: Copy>(&self, idx: u64) -> T {
         let size = std::mem::size_of::<T>();
         let off = idx * size as u64;
@@ -122,8 +76,7 @@ impl FileBytes {
     }
 
     /// Read `count` consecutive records of type T starting at record-
-    /// index `idx`.  Borrowed for Owned/Mmap (zero-copy slice view),
-    /// owned Vec<T> for JsChunked.  Used to materialize a `&[T]` slice
+    /// index `idx` as a zero-copy slice view.  Used to materialize a `&[T]` slice
     /// over a polygon's vertices, a place-node array slice, etc. so
     /// callers can iterate without manual transmutes per call site.
     pub fn read_records<T: Copy>(&self, idx: u64, count: usize) -> std::borrow::Cow<'_, [T]> {
@@ -138,27 +91,12 @@ impl FileBytes {
                     std::slice::from_raw_parts(bytes.as_ptr() as *const T, count)
                 })
             }
-            #[cfg(not(target_arch = "wasm32"))]
             Self::Mmap(m) => {
                 let ob = off as usize;
                 let bytes = &m[ob..ob + total];
                 std::borrow::Cow::Borrowed(unsafe {
                     std::slice::from_raw_parts(bytes.as_ptr() as *const T, count)
                 })
-            }
-            #[cfg(target_arch = "wasm32")]
-            Self::JsChunked(j) => {
-                let bytes = j.read(off, total);
-                let mut out = Vec::<T>::with_capacity(count);
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        bytes.as_ptr() as *const T,
-                        out.as_mut_ptr(),
-                        count,
-                    );
-                    out.set_len(count);
-                }
-                std::borrow::Cow::Owned(out)
             }
         }
     }
@@ -245,14 +183,10 @@ pub fn decode_polygon_verts<'a>(
 }
 
 // Allow `&self.field[off..end]` indexing on Owned/Mmap-backed sources.
-// Panics on JsChunked — call read_chunk instead.
 impl std::ops::Deref for FileBytes {
     type Target = [u8];
     fn deref(&self) -> &[u8] { self.as_slice() }
 }
-
-#[cfg(target_arch = "wasm32")]
-pub mod wasm_chunked;
 
 // --- S2 helpers ---
 
@@ -478,8 +412,8 @@ pub fn default_ref_dist() -> f64 { 100.0 }
 pub fn default_importance() -> f64 { 5.0 }
 
 impl PoiMeta {
-    /// Parse poi_meta.json content directly. Wasm uses this to avoid
-    /// filesystem I/O. Native loaders use `load(dir)`.
+    /// Parse poi_meta.json content. `load(dir)` reads the file and
+    /// calls this.
     pub fn from_json(s: &str) -> Self {
         if let Ok(raw) = serde_json::from_str::<std::collections::HashMap<String, PoiCategoryMeta>>(s) {
             let categories = raw.into_iter()
@@ -490,7 +424,6 @@ impl PoiMeta {
         PoiMeta { categories: std::collections::HashMap::new() }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn load(dir: &str) -> Self {
         let path = format!("{}/poi_meta.json", dir);
         if let Ok(data) = std::fs::read_to_string(&path) {
@@ -730,30 +663,18 @@ pub const STR_TIER_FILENAMES: [&str; STR_TIER_COUNT] = [
 pub struct StringPool {
     pub tiers: [Option<FileBytes>; STR_TIER_COUNT],
     pub bases: [u32; STR_TIER_COUNT + 1],
-    /// Resolved-string cache for JsChunked tiers.  Box<str> contents
-    /// have stable heap addresses, so &str returned from a cached Box
-    /// stays valid across HashMap rehashes / further inserts (we
-    /// never remove entries).  Only used on wasm32; on native the
-    /// in-place mmap slice path is taken and the cache is empty.
-    /// Single-threaded wasm32 makes UnsafeCell sound.
-    #[cfg(target_arch = "wasm32")]
-    pub cache: std::cell::UnsafeCell<std::collections::HashMap<u32, Box<str>>>,
 }
 
 impl StringPool {
-    /// Construct directly from owned tier buffers + parsed bases.
-    /// Used by both the wasm port (caller passes Vec<u8>) and the
-    /// native loader (which mmaps then wraps).
+    /// Construct directly from tier buffers + parsed bases.  Used by
+    /// the loader (which mmaps then wraps).
     pub fn from_parts(tiers: [Option<FileBytes>; STR_TIER_COUNT], bases: [u32; STR_TIER_COUNT + 1]) -> Self {
         StringPool {
             tiers,
             bases,
-            #[cfg(target_arch = "wasm32")]
-            cache: std::cell::UnsafeCell::new(std::collections::HashMap::new()),
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn load(dir: &str) -> Result<Self, String> {
         let layout_path = format!("{}/strings_layout.json", dir);
         let layout_src = std::fs::read_to_string(&layout_path)
@@ -790,73 +711,26 @@ impl StringPool {
                 if offset < self.bases[t] { return ""; }
                 let local = (offset - self.bases[t]) as u64;
                 if local >= m.len() { return ""; }
-                return self.read_string(t, m, offset, local);
+                return self.read_string(m, local);
             }
         }
         ""
     }
 
-    /// Resolve a single string from a tier.  In-place borrow for
-    /// Owned/Mmap, cached Box<str> via interior-mutability for
-    /// JsChunked (so &self can return &str backed by a stable Box).
-    fn read_string<'a>(&'a self, _tier: usize, m: &'a FileBytes, _offset: u32, local: u64) -> &'a str {
+    /// Resolve a single string from a tier as an in-place borrow.
+    fn read_string<'a>(&'a self, m: &'a FileBytes, local: u64) -> &'a str {
         match m {
             FileBytes::Owned(v) => {
                 let bytes = &v[local as usize..];
                 let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
                 std::str::from_utf8(&bytes[..end]).unwrap_or("")
             }
-            #[cfg(not(target_arch = "wasm32"))]
             FileBytes::Mmap(mm) => {
                 let bytes = &mm[local as usize..];
                 let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
                 std::str::from_utf8(&bytes[..end]).unwrap_or("")
             }
-            #[cfg(target_arch = "wasm32")]
-            FileBytes::JsChunked(_) => self.read_chunked(_tier, _offset, local),
         }
-    }
-
-    /// Walk the chunked tier byte-by-page until a NUL terminator,
-    /// allocate a stable Box<str>, and return a reference borrowed
-    /// from the cache.  Subsequent calls for the same offset reuse
-    /// the cached Box.  Box bytes never move — HashMap rehash only
-    /// moves the Box value (a pointer + len), not the bytes it owns.
-    #[cfg(target_arch = "wasm32")]
-    fn read_chunked(&self, tier: usize, offset: u32, local: u64) -> &str {
-        // SAFETY: wasm32 is single-threaded; we never mutate the
-        // HashMap from a borrow held by a caller because each get()
-        // is a self-contained sequence of insert-then-return.  The
-        // returned &str is from the Box's stable heap allocation,
-        // which outlives all subsequent inserts.
-        let cache = unsafe { &mut *self.cache.get() };
-        if let Some(s) = cache.get(&offset) {
-            // Extend lifetime via raw pointer round-trip — sound
-            // because the Box's str data is at a stable heap address.
-            let p: *const str = &**s;
-            return unsafe { &*p };
-        }
-        let m = match self.tiers[tier].as_ref() { Some(m) => m, None => return "" };
-        let mut buf = Vec::<u8>::with_capacity(64);
-        let mut cur = local;
-        let total = m.len();
-        const CHUNK: u64 = 256;
-        loop {
-            if cur >= total { break; }
-            let want = std::cmp::min(CHUNK, total - cur) as usize;
-            let chunk = m.read_chunk(cur, want);
-            let mut found = false;
-            for &b in chunk.iter() {
-                if b == 0 { found = true; break; }
-                buf.push(b);
-            }
-            if found { break; }
-            cur += want as u64;
-        }
-        let s: Box<str> = String::from_utf8(buf).unwrap_or_default().into_boxed_str();
-        let p: *const str = &*s;
-        cache.insert(offset, s);
-        unsafe { &*p }
     }
 }
 
@@ -1104,7 +978,6 @@ pub struct GeoCellOffsets {
     pub interp: u32,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 pub fn mmap_file(path: &str) -> Result<FileBytes, String> {
     let file = File::open(path).map_err(|e| format!("Failed to open {}: {}", path, e))?;
     let mmap = unsafe { Mmap::map(&file).map_err(|e| format!("Failed to mmap {}: {}", path, e))? };
@@ -1118,7 +991,6 @@ pub fn mmap_file(path: &str) -> Result<FileBytes, String> {
     Ok(FileBytes::Mmap(mmap))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 pub fn mmap_file_optional(path: &str) -> Option<FileBytes> {
     let file = File::open(path).ok()?;
     let mmap = unsafe { Mmap::map(&file).ok() }?;
@@ -1132,7 +1004,6 @@ pub fn mmap_file_optional(path: &str) -> Option<FileBytes> {
 /// files). A half-present group means a corrupt or partially-synced index
 /// dir; loading it would silently disable the feature (or worse), so it is
 /// a hard load error instead.
-#[cfg(not(target_arch = "wasm32"))]
 fn mmap_group(dir: &str, names: &[&str]) -> Result<Vec<Option<FileBytes>>, String> {
     let maps: Vec<Option<FileBytes>> = names
         .iter()
@@ -1156,7 +1027,6 @@ fn mmap_group(dir: &str, names: &[&str]) -> Result<Vec<Option<FileBytes>>, Strin
 }
 
 impl Index {
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn load(dir: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Self, String> {
         // Distance budget used by the primary-feature selection. The
         // internal distances are stored in radians² (via `to_radians()`
@@ -1241,78 +1111,6 @@ impl Index {
             admin_cell_level,
             max_distance_sq,
         })
-    }
-
-    /// Construct an Index directly from owned byte buffers.  Used by
-    /// the wasm port — it can't mmap, so the caller (JS) reads files
-    /// into Uint8Array and the constructor copies them into the wasm
-    /// linear memory as Vec<u8> (which IS FileBytes on wasm32).
-    ///
-    /// On native, this is also available — caller can use it to build
-    /// an Index from data they already have in memory (tests, etc.).
-    /// `buffers` is a struct of all the file payloads the Index can
-    /// hold; only admin_cells/entries/polygons/vertices/strings are
-    /// strictly required, the rest are Optional.
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_buffers(
-        admin_cells: FileBytes,
-        admin_entries: FileBytes,
-        admin_polygons: FileBytes,
-        admin_vertices: FileBytes,
-        strings: StringPool,
-        place_nodes: Option<FileBytes>,
-        place_cells: Option<FileBytes>,
-        place_entries: Option<FileBytes>,
-        postcode_centroids: Option<FileBytes>,
-        postcode_centroid_cells: Option<FileBytes>,
-        postcode_centroid_entries: Option<FileBytes>,
-        poi_records: Option<FileBytes>,
-        poi_vertices: Option<FileBytes>,
-        poi_cells: Option<FileBytes>,
-        poi_entries: Option<FileBytes>,
-        poi_meta: PoiMeta,
-        geo_cells: Option<FileBytes>,
-        street_ways: Option<FileBytes>,
-        street_nodes: Option<FileBytes>,
-        street_entries: Option<FileBytes>,
-        addr_points: Option<FileBytes>,
-        addr_vertices: Option<FileBytes>,
-        addr_entries: Option<FileBytes>,
-        interp_ways: Option<FileBytes>,
-        interp_nodes: Option<FileBytes>,
-        interp_entries: Option<FileBytes>,
-        way_postcodes: Option<FileBytes>,
-        addr_postcodes: Option<FileBytes>,
-        admin_parents: Option<FileBytes>,
-        way_parents: Option<FileBytes>,
-        postal_polygons: Option<FileBytes>,
-        postal_vertices: Option<FileBytes>,
-        street_cell_level: u64,
-        admin_cell_level: u64,
-        search_distance: f64,
-    ) -> Self {
-        let radians = search_distance / 6_371_000.0;
-        let max_distance_sq = radians * radians;
-        Index {
-            admin_cells, admin_entries, admin_polygons, admin_vertices,
-            strings,
-            place_nodes, place_cells, place_entries,
-            postcode_centroids, postcode_centroid_cells, postcode_centroid_entries,
-            poi_records, poi_vertices, poi_cells, poi_entries, poi_meta,
-            geo_cells, street_ways, street_nodes, street_entries,
-            addr_points, addr_vertices, addr_entries,
-            interp_ways, interp_nodes,
-            // wasm-only constructor; the wasm port is being dropped, so the
-            // TIGER sidecar is not plumbed through here (tier 1c stays off).
-            interp_postcodes: None, interp_entries,
-            way_postcodes, addr_postcodes,
-            admin_parents, way_parents,
-            postal_polygons, postal_vertices,
-            admin_config: AdminLevelConfig::load(),
-            street_cell_level,
-            admin_cell_level,
-            max_distance_sq,
-        }
     }
 
     pub fn get_string(&self, offset: u32) -> &str {
@@ -1425,10 +1223,8 @@ impl Index {
         NO_DATA
     }
 
-    // geo_cells is a 20-byte-stride sorted index — use chunk-aware
-    // binary search so it works on JsChunked sources where the
-    // file isn't resident.  All offsets u64 so >4 GiB files
-    // address correctly on wasm32.  Chunked-aware twin of
+    // geo_cells is a 20-byte-stride sorted index — binary search it
+    // with read_chunk.  Chunked-aware twin of
     // `lookup_geo_cell` (which reads from a resident &[u8]).
     pub fn lookup_geo_cell_fb(geo_cells: &FileBytes, target: u64) -> GeoCellOffsets {
         let entry_size: u64 = 20;
@@ -3269,8 +3065,7 @@ impl Index {
         let admin_chain = (|| -> Option<AdminResult<'_>> {
             let wp = self.way_parents.as_ref()?;
             let (_, _, way_idx) = street?;
-            // way_parents is u32 per way; chunked-aware read so it
-            // works with JsChunked sources too.
+            // way_parents is u32 per way.
             let way_id = *way_idx as u64;
             let off = way_id * 4;
             if off + 4 > wp.len() { return None; }
@@ -3812,27 +3607,19 @@ pub struct ContinentSlot {
     /// files are loaded (or when load is asked but the dir is empty).
     /// Hot-add via `MultiIndex::install_region` swaps a fresh Arc in
     /// without locking out concurrent queries.
-    #[cfg(not(target_arch = "wasm32"))]
     pub index: arc_swap::ArcSwapOption<Index>,
-    #[cfg(target_arch = "wasm32")]
-    pub index: Option<Index>,
 }
 
 pub struct MultiIndex {
     pub continents: Vec<ContinentSlot>,
     /// Captured at construction so `install_region` knows where to
     /// look for newly-downloaded files.
-    #[cfg(not(target_arch = "wasm32"))]
     pub root_dir: String,
-    #[cfg(not(target_arch = "wasm32"))]
     pub street_cell_level: u64,
-    #[cfg(not(target_arch = "wasm32"))]
     pub admin_cell_level: u64,
-    #[cfg(not(target_arch = "wasm32"))]
     pub search_distance: f64,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl MultiIndex {
     /// Try per-continent subdirs first (`<root>/africa/`, `<root>/asia/`, …).
     /// Fall back to a single-region "world" Index if `<root>` itself looks
