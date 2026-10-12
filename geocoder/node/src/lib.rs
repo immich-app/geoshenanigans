@@ -46,13 +46,6 @@ impl Geocoder {
         Ok(Geocoder { inner: Arc::new(idx) })
     }
 
-    /// Blocking lookup on the calling thread. Sub-millisecond warm;
-    /// cold pages fault from disk. Returns the address JSON.
-    #[napi]
-    pub fn reverse_geocode_sync(&self, lat: f64, lng: f64) -> String {
-        self.inner.query_json(lat, lng)
-    }
-
     /// Lookup on the libuv worker pool — cold-cache page faults never
     /// block the event loop. Resolves to the address JSON.
     #[napi(ts_return_type = "Promise<string>")]

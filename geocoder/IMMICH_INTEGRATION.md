@@ -118,8 +118,8 @@ native prebuilds are an established part of their toolchain):
 #### Validated prototype
 
 `geocoder/node/` in this repo is a working napi-rs binding
-(`Geocoder.load` / `reverseGeocode` async on the libuv pool /
-`reverseGeocodeSync`), measured in Node v18 against the planet
+(`Geocoder.load` / `reverseGeocode` async on the libuv pool),
+measured in Node v18 against the planet
 `admin` dataset with a fully cold page cache:
 
 | Metric | Result |
