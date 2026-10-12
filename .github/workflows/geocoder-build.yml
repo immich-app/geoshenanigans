@@ -46,9 +46,6 @@ env:
   # today's index 113 + 41 compressed, yesterday's 113 + sidecars 11) plus
   # patch verification's copies.
   MIN_WORK_DISK_GIB: 500
-  # Memory the build leaves for the compressor running beside it: a zstd
-  # context per worker (~100 MiB each on 88 workers) plus its buffers.
-  COMPRESS_RESERVE_MIB: 16384
 
 permissions:
   contents: read
@@ -634,54 +631,29 @@ jobs:
             done
           ) &
           MEMWATCH_PID=$!
+          # pipefail so build-index crashes propagate (without it, the
+          # downstream tee/tail mask exit code and the workflow proceeds
+          # to compress with no configurations.json — see 24968665275).
+          set -o pipefail
+          # Don't `tail -30` here: we want full build-index output in the
+          # streamed step log so the last lines before a crash are visible.
+          build-index "$WORKDIR/output/" "$WORKDIR/planet.osm.pbf" \
+            $BUILD_ARGS 2>&1 | tee "$WORKDIR/build.log"
+          BUILD_RC=$?
+          kill $MEMWATCH_PID 2>/dev/null || true
+          if [ "$BUILD_RC" != "0" ]; then exit "$BUILD_RC"; fi
+          echo "Build completed in $(($(date +%s) - START))s"
+          echo "Build log kept at $WORKDIR/build.log ($(wc -l < "$WORKDIR/build.log") lines)"
+          echo "$(find "$WORKDIR/output" -name "*.bin" | wc -l) bin files produced"
+
           # Seed configurations.json from the static template. CI augments
           # it with the per-file size/sha256 table during the compress
           # step, then with date / previous / built_at / wikidata_date
           # during finalize. The C++ builder no longer writes any JSON
           # itself — the template is the single source of truth for the
           # axes/components/constraints/presets schema.
-          mkdir -p "$WORKDIR/output"
           cp "$GITHUB_WORKSPACE/geocoder/builder/configurations.template.json" \
              "$WORKDIR/output/configurations.json"
-
-          # The compressor below runs beside the build, outside its memory
-          # accounting: the build plans for the pod's limit less room for it.
-          LIMIT=$(cat /sys/fs/cgroup/memory.max 2> /dev/null || echo max)
-          if [[ "$LIMIT" =~ ^[0-9]+$ ]]; then
-            export GC_MEMORY_LIMIT_MIB=$(( LIMIT / 1048576 - COMPRESS_RESERVE_MIB ))
-          fi
-          # Full build-index output goes to the streamed step log (no tail)
-          # so the last lines before a crash are visible.
-          build-index "$WORKDIR/output/" "$WORKDIR/planet.osm.pbf" \
-            $BUILD_ARGS > >(tee "$WORKDIR/build.log") 2>&1 &
-          BUILD_PID=$!
-
-          # The build's write phase is disk-bound on the runner and leaves
-          # the cores idle: the compressor takes each index file the build
-          # has finished, streaming its .zst to this date's (cleared) Tigris
-          # prefix, and checks every file again once the build exits.
-          # Detached so it outlives this step; the compress step waits for it.
-          $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$TODAY/*" > /dev/null 2>&1 || true
-          # shellcheck disable=SC2016
-          setsid nohup bash -c '"$@"; echo $? > "$0"' "$WORKDIR/compress.status" \
-            nice -n 10 python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output" \
-            --while-pid "$BUILD_PID" --upload "s3://$S3_BUCKET/$S3_PREFIX/builds/$TODAY" \
-            --upload-cmd "s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 16 run" \
-            > "$WORKDIR/compress.log" 2>&1 < /dev/null &
-          COMPRESS_PID=$!
-          echo "$COMPRESS_PID" > "$WORKDIR/compress.pid"
-
-          BUILD_RC=0
-          wait "$BUILD_PID" || BUILD_RC=$?
-          kill $MEMWATCH_PID 2>/dev/null || true
-          if [ "$BUILD_RC" != "0" ]; then
-            # No upload of a failed build's files.
-            kill -- -"$COMPRESS_PID" 2> /dev/null || true
-            exit "$BUILD_RC"
-          fi
-          echo "Build completed in $(($(date +%s) - START))s"
-          echo "Build log kept at $WORKDIR/build.log ($(wc -l < "$WORKDIR/build.log") lines)"
-          echo "$(find "$WORKDIR/output" -name "*.bin" | wc -l) bin files produced"
 
           df -h "$WORKDIR" | tee -a "$GITHUB_STEP_SUMMARY"
 
@@ -693,6 +665,8 @@ jobs:
           OLD_DATE: ${{ steps.setup.outputs.yesterday }}
           NEW_DATE: ${{ steps.setup.outputs.today }}
         run: |
+          S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
+
           echo "Disk at start of patch step:"
           df -h "$WORKDIR"
 
@@ -711,6 +685,19 @@ jobs:
             echo "::error::Fetching yesterday's index failed"; exit 1
           fi
           df -h "$WORKDIR"
+
+          # Compress the new index alongside the diffs, whose long tail
+          # (planet/full) leaves most cores idle. It keeps the .bin files the
+          # diffs and verifies read; the compress step removes them. Each
+          # .zst streams to this date's (cleared) Tigris prefix as soon as it
+          # exists: the upload is network-bound, so it hides behind the
+          # compression. Finalize uploads whatever is still missing.
+          $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
+          nice -n 10 python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output" \
+            --upload "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE" \
+            --upload-cmd "s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 16 run" \
+            > "$WORKDIR/compress.log" 2>&1 < /dev/null &
+          COMPRESS_PID=$!
 
           # Patch generation runs against uncompressed .bin files (old was
           # decompressed just above, new was just built).
@@ -734,6 +721,13 @@ jobs:
             "$WORKDIR/old-output" "$WORKDIR/output" "$RESULTS_DIR" "$WORKDIR/diff-logs" \
             || echo "::error::generate_patches.sh exited $?"
           echo "Patch generation + verification completed in $(($(date +%s) - START))s"
+          if wait $COMPRESS_PID; then
+            touch "$WORKDIR/compress.done"
+            echo "Compression finished $(($(date +%s) - START))s after patch generation started"
+          else
+            echo "::warning::Background compression failed; the compress step retries"
+          fi
+          tail -1 "$WORKDIR/compress.log"
 
           # Collect results
           PASS=0; FAIL=0; SKIP=0
@@ -797,21 +791,12 @@ jobs:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
           NEW_DATE: ${{ steps.setup.outputs.today }}
         run: |
-          # The build step's compressor finishes beside patch generation; if
-          # it failed, compress here, streaming the upload the same way.
-          WAIT_START=$(date +%s)
-          until [ -s "$WORKDIR/compress.status" ] || [ $(( $(date +%s) - WAIT_START )) -gt 3600 ]; do
-            sleep 10
-          done
-          grep -E "while the builder ran|^Compressing|^Total" "$WORKDIR/compress.log" || true
-          echo "Waited $(( $(date +%s) - WAIT_START ))s for the compressor"
-          if [ "$(cat "$WORKDIR/compress.status" 2> /dev/null)" = 0 ]; then
-            echo "Compressed beside the build"
+          # Patch generation compresses alongside its diffs; a fresh build
+          # (or a failed background run) compresses here, streaming the
+          # upload the same way.
+          if [ -f "$WORKDIR/compress.done" ]; then
+            echo "Compressed during patch generation"
           else
-            echo "::warning::Compression beside the build failed; compressing again"
-            tail -20 "$WORKDIR/compress.log" || true
-            # Still running past the wait: it must not write beside this one.
-            kill -- -"$(cat "$WORKDIR/compress.pid")" 2> /dev/null || true
             COMPRESS_START=$(date +%s)
             s5cmd --endpoint-url "$S3_ENDPOINT" --numworkers 32 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
             python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output" \
