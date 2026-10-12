@@ -23,6 +23,41 @@ variant, with a patch from the previous day, to Tigris:
 [PATCHING.md](PATCHING.md) describes the layout, the variants (mode, boundary
 quality, POI tier) and how a client downloads and patches them.
 
+## Monitoring
+
+The nightly reports every run on `main` to FUTO o11y (project
+`geoshenanigans`), whatever its outcome; test dispatches from other branches
+don't report. Its last step, `builder/tools/o11y_report.py nightly`,
+pushes `geocoder_*` metrics: the outcome and duration, each step's and each
+build phase's duration, peak memory, the patch verify counts, each patch's
+size and the index size. It also logs every step's outcome, build.log, the
+memwatch samples and each variant's verify result. Every 2 hours the
+watchdog's `report` job pushes a heartbeat and the dates in the published
+`latest.json`.
+
+Both push straight to o11y's public gateway (`O11Y_URL` in the workflows,
+`https://vmauth.futostatus.com`), metrics to VictoriaMetrics and logs to
+VictoriaLogs, with every sample and log line labelled
+`project=geoshenanigans`, `cluster=geocoder`, `env=prod`, `provider=github`,
+`region=global`. The gateway's bearer token is read from 1Password
+(`op://tf_prod/O11Y_VICTORIAMETRICS_VMAUTH_PASSWORD/password`, with
+the `OP_TF_PROD_ENV` service account) inside the reporting step, which hands
+it to `o11y_report.py` as `$O11Y_TOKEN`; without one, nothing is sent.
+
+- Dashboard: `geoshenanigans-geocoder-nightly` in the Grafana folder
+  `geoshenanigans`.
+- Alerts, in the same folder, go to the Rootly project `geoshenanigans`:
+  critical when a run fails, a patch fails verify or nothing has been
+  published for 30 hours; warning when a run takes over an hour, the
+  planet/full patch passes 64 MiB, the data is over two days old or the
+  watchdog goes silent.
+- Logs, in VictoriaLogs (add `run_id:="<run id>"` for one run, or use
+  `app:="geocoder-watchdog"` for the watchdog's):
+  `project:="geoshenanigans" app:="geocoder-build"`
+
+`o11y_report.py nightly --dry-run` (or `watchdog --dry-run`) prints the
+metrics and log lines instead of sending them.
+
 ## Quick Start
 
 Serve the published indexes:

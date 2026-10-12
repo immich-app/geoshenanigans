@@ -54,9 +54,13 @@ env:
   # s5cmd | zstd pipes and their dirty pages) and the runner share that limit.
   # Without it a 96 GiB runner was OOM-killed mid-build.
   GC_MEMORY_RESERVE_MIB: 12288
+  # FUTO o11y's public gateway, which Report to o11y pushes the run's metrics
+  # and logs to (see geocoder/README.md, Monitoring).
+  O11Y_URL: https://vmauth.futostatus.com
 
 permissions:
   contents: read
+  actions: read # Report to o11y reads this job's steps
 
 jobs:
   build:
@@ -208,6 +212,9 @@ jobs:
           echo "today=$TARGET_DATE" >> "$GITHUB_OUTPUT"
           echo "yesterday=$PREV_DATE" >> "$GITHUB_OUTPUT"
           echo "today_seq=$TARGET_SEQ" >> "$GITHUB_OUTPUT"
+          # A day's diff runs to its midnight UTC: the replication timestamp
+          # of the data this run builds.
+          echo "data_timestamp=${TARGET_DATE}T00:00:00Z" >> "$GITHUB_OUTPUT"
 
           echo "Build date: $TARGET_DATE (seq $TARGET_SEQ)"
           echo "Previous:   $PREV_DATE"
@@ -1152,3 +1159,50 @@ jobs:
         run: |
           echo "::error::Patch verify reported failures — see Generate patches and verify step"
           exit 1
+
+      # For Report to o11y's token. A failed install doesn't fail the run:
+      # the report then warns and sends nothing.
+      - name: Install 1Password CLI
+        if: always() && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        uses: 1password/install-cli-action@8d006a0d0a4fd505af7f7ce589e7f768385ff5e4 # v3.0.0
+
+      # The run's metrics and logs to FUTO o11y, whatever its outcome (see
+      # geocoder/README.md, Monitoring). Last, so the steps it reports have
+      # finished; reporting never fails the run. Only main's runs (the
+      # schedule and the watchdog's retries): a test dispatch from another
+      # branch would otherwise page as a failed nightly. The token is read
+      # here and handed to the report alone, so no other step can see it.
+      - name: Report to o11y
+        if: always() && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
+          RUNNER_TEMP: ${{ runner.temp }}
+          WORKDIR: ${{ steps.setup.outputs.workdir }}
+          BUILD_DATE: ${{ steps.setup.outputs.today }}
+          DATA_TIMESTAMP: ${{ steps.setup.outputs.data_timestamp }}
+          JOB_STATUS: ${{ job.status }}
+          TRIGGER: ${{ github.event_name }}
+          SCALE_SET: ${{ inputs.runner || 'pokedex-giant' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+        run: |
+          if ! token=$(op read "op://tf_prod/O11Y_VICTORIAMETRICS_VMAUTH_PASSWORD/password"); then
+            echo "::warning::Could not read the o11y token from 1Password; reporting nothing"
+            exit 0
+          fi
+          echo "::add-mask::$token"
+          JOB_JSON="$RUNNER_TEMP/o11y-job.json"
+          # This job's steps so far: the run attempt's job on this runner.
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs" \
+            --jq '.jobs[] | select(.runner_name == env.RUNNER_NAME)' > "$JOB_JSON" \
+            || echo "::warning::Could not read this job's steps; reporting without them"
+          O11Y_TOKEN="$token" python3 geocoder/builder/tools/o11y_report.py nightly --base-url "$O11Y_URL" \
+            --job "$JOB_JSON" --job-status "$JOB_STATUS" \
+            --build-log "$WORKDIR/build.log" --memwatch-log "$WORKDIR/memwatch.log" \
+            --results-dir "$WORKDIR/results" --output-dir "$WORKDIR/output" \
+            --build-date "$BUILD_DATE" --data-timestamp "$DATA_TIMESTAMP" \
+            --trigger "$TRIGGER" --runner "$SCALE_SET" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --run-url "$RUN_URL"

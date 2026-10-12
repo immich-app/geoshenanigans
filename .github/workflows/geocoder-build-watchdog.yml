@@ -27,12 +27,14 @@ concurrency:
 
 permissions:
   contents: read
-  actions: write   # needs gh workflow run
 
 jobs:
   watchdog:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write   # needs gh workflow run
     steps:
       - name: Check and maybe retry today's build
         env:
@@ -125,3 +127,36 @@ jobs:
           gh workflow run "$WORKFLOW" \
             --ref "$BUILD_REF" \
             -f "build_date=$TODAY"
+
+  # The published build's age to FUTO o11y, with a heartbeat: its steady
+  # samples keep the project's metrics tenant visible to o11y's fleet queries
+  # on the days the nightly hasn't pushed yet (see geocoder/README.md,
+  # Monitoring).
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      # geocoder-build.yml's O11Y_URL.
+      O11Y_URL: https://vmauth.futostatus.com
+      LATEST_JSON_URL: https://geoshenanigans-reverse-geocoding.t3.tigrisfiles.io/geocoder/builds/latest.json
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install 1Password CLI
+        uses: 1password/install-cli-action@8d006a0d0a4fd505af7f7ce589e7f768385ff5e4 # v3.0.0
+
+      # The token is read here and handed to the report alone, as in
+      # geocoder-build.yml's Report to o11y.
+      - name: Report the published build
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
+        run: |
+          if ! token=$(op read "op://tf_prod/O11Y_VICTORIAMETRICS_VMAUTH_PASSWORD/password"); then
+            echo "::warning::Could not read the o11y token from 1Password; reporting nothing"
+            exit 0
+          fi
+          echo "::add-mask::$token"
+          O11Y_TOKEN="$token" python3 geocoder/builder/tools/o11y_report.py watchdog --base-url "$O11Y_URL" \
+            --latest-url "$LATEST_JSON_URL"
