@@ -16,8 +16,6 @@ struct WayTags {
     const char* postcode = nullptr;
     const char* highway = nullptr;
     const char* footway = nullptr;
-    const char* access = nullptr;
-    const char* tunnel = nullptr;
     const char* name = nullptr;
     const char* name_en = nullptr;
     const char* boundary = nullptr;
@@ -25,7 +23,6 @@ struct WayTags {
     const char* postal_code = nullptr;
     const char* iso = nullptr;
     const char* linked_place = nullptr;
-    const char* border_type = nullptr;
     // POI tags
     const char* tourism = nullptr;
     const char* historic = nullptr;
@@ -78,12 +75,10 @@ inline WayTags parse_way_tags(const uint32_t* tag_keys, const uint32_t* tag_vals
                 else if (k == "admin_level") t.admin_level = v;
                 else if (k == "amenity") t.amenity = v;
                 else if (k == "aeroway") t.aeroway = v;
-                else if (k == "access") t.access = v;
                 break;
             case 'b':
                 if (k == "boundary") t.boundary = v;
                 else if (k == "building") t.building = v;
-                else if (k == "border_type") t.border_type = v;
                 break;
             case 'c': if (k == "craft") t.craft = v; break;
             case 'e': if (k == "ele") t.ele = v; break;
@@ -113,10 +108,7 @@ inline WayTags parse_way_tags(const uint32_t* tag_keys, const uint32_t* tag_vals
                 break;
             case 'r': if (k == "railway") t.railway = v; break;
             case 's': if (k == "shop") t.shop = v; break;
-            case 't':
-                if (k == "tourism") t.tourism = v;
-                else if (k == "tunnel") t.tunnel = v;
-                break;
+            case 't': if (k == "tourism") t.tourism = v; break;
             case 'I': if (k == "ISO3166-1:alpha2") t.iso = v; break;
             case 'w':
                 if (k == "waterway") t.waterway = v;
@@ -135,7 +127,7 @@ inline WayTags parse_way_tags(const uint32_t* tag_keys, const uint32_t* tag_vals
 // landuse/shop never do.
 inline bool way_needs_nodes(const WayTags& t, bool relation_member) {
     return t.interpolation || t.housenumber ||
-        (t.highway && is_included_highway_full(t.highway, t.footway, t.access, t.tunnel) && t.name) ||
+        (t.highway && is_included_highway_full(t.highway, t.footway) && t.name) ||
         t.boundary ||
         relation_member ||
         (t.has_poi_tags() && t.name);

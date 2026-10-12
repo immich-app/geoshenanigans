@@ -731,7 +731,6 @@ inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
         }
         auto cmp = cell_item_less;
         std::sort(data.sorted_poi_cells.begin(), data.sorted_poi_cells.end(), cmp);
-        data.cell_to_pois.clear();
         std::cerr << "  POI records sorted: " << n << " (" << deduped << " duplicates removed)" << std::endl;
 
         // Compute importance

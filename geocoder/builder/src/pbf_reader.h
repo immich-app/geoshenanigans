@@ -28,26 +28,6 @@ struct PbfTags {
         }
         return nullptr;
     }
-
-    bool empty() const { return indices.empty(); }
-};
-
-struct PbfNode {
-    int64_t id;
-    double lat;
-    double lng;
-    PbfTags tags;
-
-    const char* tag(const char* key) const { return tags.get(key); }
-};
-
-struct PbfWay {
-    int64_t id;
-    uint32_t refs_offset; // offset into PbfBlock::way_refs
-    uint32_t refs_count;  // number of node refs
-    PbfTags tags;
-
-    const char* tag(const char* key) const { return tags.get(key); }
 };
 
 struct PbfRelation {
@@ -70,17 +50,11 @@ struct PbfRelation {
     }
 };
 
-// A decoded PBF block containing nodes, ways, and/or relations.
-// Owns the string table and flat ref arrays — structs reference via offsets.
+// A decoded PBF block's relations. Owns the string table their tags and
+// member roles index into.
 struct PbfBlock {
     std::vector<std::string> string_table;
-    std::vector<PbfNode> nodes;
-    std::vector<PbfWay> ways;
-    std::vector<int64_t> way_refs;  // flat array, PbfWay references via offset+count
     std::vector<PbfRelation> relations;
-
-    // Convenience: get node refs for a way
-    const int64_t* refs(const PbfWay& w) const { return way_refs.data() + w.refs_offset; }
 };
 
 // Blob location within the file
@@ -96,10 +70,8 @@ struct BlobInfo {
 // Scan the file to find all blob offsets, on `threads` threads (0 = every core)
 std::vector<BlobInfo> scan_pbf_blobs(const std::string& filename, unsigned threads = 0);
 
-// Decode a single blob from raw file data into a PbfBlock.
-PbfBlock decode_pbf_blob(const char* blob_data, size_t blob_size);
-
-// Decode into existing block (reuses vector capacity, avoids reallocation).
+// Decode a blob's relations into an existing block (reuses vector capacity,
+// avoids reallocation).
 void decode_pbf_blob_into(const char* blob_data, size_t blob_size, PbfBlock& block);
 
 // Streaming node decode — calls callback directly for each node during decode.
@@ -152,31 +124,19 @@ size_t decode_ways_streaming(const char* data, size_t size, const WayCallback& c
 // Returns the decompressed PrimitiveBlock data.
 std::string read_and_decompress_blob(int fd, const BlobInfo& info);
 
-// High-level parallel reader: scans file, decodes all blocks in parallel,
-// calls the callback for each decoded block (in arbitrary order).
-// `num_threads` controls parallelism (0 = hardware_concurrency).
-// `entity_filter` controls which entity types to parse: 'n' = nodes, 'w' = ways, 'r' = relations
-
 // Managed PBF file — opens once, provides phased parallel reading.
 class PbfFile {
 public:
     explicit PbfFile(const std::string& filename, unsigned num_threads = 0);
     ~PbfFile();
 
-    // No-ops (mmap removed — using pread for memory efficiency)
-    void release_pages() {}
-    void unmap() {}
-
-    // Read all blocks containing the specified entity types in parallel.
+    // Read the relation blocks in parallel.
     // Callback is called from worker threads with (block, thread_index).
     // The callback must be thread-safe OR use the thread_index for thread-local storage.
-    // (useful for nodes where sequential ID locality matters for mmap performance).
     // Callback receives a reference — block is reused across iterations.
     // Do NOT move from the block; it will be overwritten on next decode.
-    void read_blocks(std::function<void(PbfBlock&, unsigned thread_idx)> callback,
-                     const std::string& entity_filter = "nwr");
+    void read_blocks(std::function<void(PbfBlock&, unsigned thread_idx)> callback);
 
-    // Convenience: read only relations, only nodes, only ways
     unsigned thread_count() const { return num_threads_; }
 
     // Streaming readers — process entities directly during decode. Each
@@ -184,8 +144,6 @@ public:
     // blob of its class holds the other kind (a file not sorted by type).
     void read_nodes_streaming(const NodeCallback& callback);
     void read_ways_streaming(const WayCallback& callback);
-
-    const std::vector<BlobInfo>& blobs() const { return blobs_; }
 
 private:
     std::string filename_;

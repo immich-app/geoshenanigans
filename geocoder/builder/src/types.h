@@ -86,9 +86,8 @@ enum class VertexEncoding : uint8_t {
     U16_11M   = 1,  // u16 @ 1e-4° (11 m),  fits 730 km × 730 km     → states/regions
     U16_011M  = 2,  // u16 @ 1e-6° (11 cm), fits 7.3 km × 7.3 km     → POI buildings
     U32_1CM   = 3,  // u32 @ 1e-7° (1.1 cm), fits any polygon        → countries / fallback
-    F32       = 4,  // raw f32 lat/lng (legacy escape hatch)
 };
-static constexpr uint8_t VERTEX_STRIDE[5] = {4, 4, 4, 8, 8};
+static constexpr uint8_t VERTEX_STRIDE[4] = {4, 4, 4, 8};
 
 // admin_vertices.bin / poi_vertices.bin / addr_vertices.bin layout per
 // polygon (only present when vertex_count > 0):
@@ -176,9 +175,7 @@ static const uint64_t FNV1A_PRIME        = 1099511628211ULL;
 enum class SimplifyMode { MaxVertices, ErrorBounded };
 
 // Processing limits
-static constexpr size_t MAX_BLOCK_QUEUE         = 64;    // producer-consumer queue depth
 static constexpr int    MAX_NODE_COUNT          = 65535; // uint16_t node_count (OSM caps ways at 2000)
-static constexpr int    MAX_VERTEX_COUNT        = 0x7FFFFFFF; // uint32_t vertex_count
 static constexpr int    MAX_S2_CELLS_PER_POLY   = 200;   // S2RegionCoverer max_cells
 static constexpr int    BACKTRACK_CALL_BUDGET   = 100000; // per-ring backtracking limit
 static constexpr int    BACKTRACK_TOTAL_BUDGET  = 500000; // per-relation backtracking limit
@@ -925,10 +922,4 @@ struct CollectedPoiRelation {
     std::string addr_street;
     std::string addr_postcode;
     std::vector<std::pair<int64_t, std::string>> members; // (way_id, role)
-};
-
-struct DeferredPoi {
-    uint32_t poi_id;
-    uint32_t vertex_offset;
-    uint32_t vertex_count;
 };

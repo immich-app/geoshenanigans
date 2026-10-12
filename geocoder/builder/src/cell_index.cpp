@@ -337,7 +337,6 @@ static void apply_strategy2_places(ParsedData& data, const std::string& prev_dir
 
 // Strategy-2 stable IDs for poi_records.
 // Reference sites updated:
-//   - data.cell_to_pois (map values)
 //   - data.sorted_poi_cells (item_id)
 // poi_vertices.bin is byte-offset keyed (no remap needed).
 static void apply_strategy2_pois(ParsedData& data, const std::string& prev_dir) {
@@ -373,12 +372,11 @@ static void apply_strategy2_pois(ParsedData& data, const std::string& prev_dir) 
     reorder_by_remap(data.poi_records, remap, n_new, tomb_pr);
     reorder_by_remap(data.poi_osm_ids, remap, n_new, uint64_t(0));
 
-    // cell_to_pois and sorted_poi_cells item_ids carry the high-bit
+    // sorted_poi_cells item_ids carry the high-bit
     // INTERIOR_FLAG (set during POI cell covering at build_index.cpp). A
     // flagged value is ≥ 2^31, so a plain `v < remap.size()` guard would
     // skip it and leave a stale POI index after reorder. remap_index_flagged
     // masks, remaps, re-ORs — mirroring the deterministic-sort pass.
-    remap_cell_map(data.cell_to_pois, [&](uint32_t& v) { remap_index_flagged(v, remap); });
     remap_cell_pairs(data.sorted_poi_cells, [&](uint32_t& v) { remap_index_flagged(v, remap); });
 
     finalize_strategy2(alloc, n_new, n_old, data.poi_sidecar_blob, "pois", /*no_shifts=*/false);
@@ -945,8 +943,8 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                 // strategy-2 ran in apply_strategy2_remaps with a per-region
                 // dir. Use the canonical /full/ subdir of the same region's
                 // previous output. output_dir ends in "/<region>/<mode>"; we
-                // need "<prev>/<region>/full". Synthesize via env var the
-                // workflow sets.
+                // need "<prev>/<region>/full". Synthesize via the env var
+                // build-index sets from --prev-output.
                 if (const char* prev_root = std::getenv("GC_PREV_OUTPUT_ROOT")) {
                     // output_dir like ".../planet/full" → strip trailing
                     // mode segment to get region root.

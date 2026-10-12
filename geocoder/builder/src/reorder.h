@@ -846,7 +846,6 @@ inline void reorder_pois(ParsedData& data, std::vector<float>& poi_elevations,
     renumber_cell_pairs(data.sorted_poi_cells, [&](uint32_t id) {
         return old_to_new[id & ID_MASK] | (id & INTERIOR_FLAG);
     }, threads);
-    data.cell_to_pois.clear();
     std::cerr << "  POI records sorted: " << n << " (" << (n - kept) << " duplicates removed)" << std::endl;
 
     // Compute importance

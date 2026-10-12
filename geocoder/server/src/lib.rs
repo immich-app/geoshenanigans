@@ -1006,7 +1006,7 @@ pub struct Index {
 }
 
 /// Normalised street-name token overlap, mirroring the builder's
-/// tokens_overlap (geometry.h) / Nominatim's token_matches_street: lowercase,
+/// TokenMatcher (geometry.h) / Nominatim's token_matches_street: lowercase,
 /// non-alphanumerics become separators, then test whether any token of >= 2
 /// chars appears in both names. (The builder also folds Latin-1 accents; the
 /// TIGER context here is US ASCII names, where that folding is a no-op.)

@@ -1,4 +1,4 @@
-// Unit tests for tokens_overlap / TokenMatcher (src/geometry.h): the word
+// Unit tests for TokenMatcher (src/geometry.h): the word
 // match the addr parent-street backfill runs, checked against the hashed
 // version it replaced on names with accents, apostrophes, hyphens, tiny and
 // repeated words.
@@ -13,7 +13,7 @@
 
 namespace {
 
-// tokens_overlap as it was: a hash set of B's words.
+// The word match as it was: a hash set of B's words.
 bool hashed_tokens_overlap(const char* a, const char* b) {
     if (!a || !b || !a[0] || !b[0]) return false;
     std::string na = normalise_for_matching(a);
@@ -41,13 +41,18 @@ bool hashed_tokens_overlap(const char* a, const char* b) {
 
 }  // namespace
 
-TEST(tokens_overlap_matches_shared_words) {
-    CHECK(tokens_overlap("Main Street", "Main St"));
-    CHECK(tokens_overlap("Place de l'H\xc3\xb4tel de Ville", "place de lhotel"));
-    CHECK(!tokens_overlap("Elm Street", "Oak Avenue"));
-    CHECK(!tokens_overlap("A B", "A B"));  // one-letter words never count
-    CHECK(!tokens_overlap("", "Main"));
-    CHECK(!tokens_overlap("Main", nullptr));
+TEST(token_matcher_matches_shared_words) {
+    TokenMatcher matcher;
+    auto overlaps = [&](const char* a, const char* b) {
+        matcher.reset(a);
+        return matcher.overlaps(b);
+    };
+    CHECK(overlaps("Main Street", "Main St"));
+    CHECK(overlaps("Place de l'H\xc3\xb4tel de Ville", "place de lhotel"));
+    CHECK(!overlaps("Elm Street", "Oak Avenue"));
+    CHECK(!overlaps("A B", "A B"));  // one-letter words never count
+    CHECK(!overlaps("", "Main"));
+    CHECK(!overlaps("Main", nullptr));
 }
 
 TEST(token_matcher_matches_the_hashed_overlap_for_one_a_and_many_b) {
@@ -71,7 +76,6 @@ TEST(token_matcher_matches_the_hashed_overlap_for_one_a_and_many_b) {
         for (int k = 0; k < 8; k++) {
             const std::string b = name();
             CHECK_EQ(matcher.overlaps(b.c_str()), hashed_tokens_overlap(a.c_str(), b.c_str()));
-            CHECK_EQ(tokens_overlap(a.c_str(), b.c_str()), hashed_tokens_overlap(a.c_str(), b.c_str()));
         }
     }
 }

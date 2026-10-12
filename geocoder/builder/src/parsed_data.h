@@ -322,7 +322,6 @@ struct ParsedData {
     std::vector<gc::id_alloc::SidecarSlot> place_sidecar_blob;
     std::vector<gc::id_alloc::SidecarSlot> poi_sidecar_blob;
     std::vector<gc::id_alloc::SidecarSlot> interp_sidecar_blob;
-    std::vector<gc::id_alloc::SidecarSlot> postcode_sidecar_blob;
     std::vector<NodeCoord> admin_vertices;
     std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_admin;
 
@@ -352,9 +351,7 @@ struct ParsedData {
     // entity kinds. Strategy-2 IdAllocator uses this.
     std::vector<uint64_t> poi_osm_ids;
     std::vector<NodeCoord> poi_vertices;
-    std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_pois;
     std::vector<CellItemPair> sorted_poi_cells;
-    std::vector<DeferredPoi> deferred_pois;
     std::vector<CollectedPoiRelation> collected_poi_relations;
 
     // Parent chain: per-way and per-polygon parent IDs for the
@@ -389,7 +386,6 @@ struct ParsedData {
         double lng() const { return (sum_lng_e7 / 1e7) / static_cast<double>(count); }
     };
     std::unordered_map<uint64_t, PostcodeAccum> postcode_accum;
-    std::unique_ptr<std::mutex> postcode_mutex = std::make_unique<std::mutex>();
 
     // Place nodes claimed by label/wikidata boundary links (build-time only,
     // consumed by link_places_by_name to hide them like Nominatim's
@@ -401,8 +397,8 @@ struct ParsedData {
     // Post-canonical-sort: strings partitioned into per-consumer tiers.
     // Global offset space is contiguous: tier N occupies
     // [strings_tier_bases[N], strings_tier_bases[N+1]). Record name_ids
-    // are global offsets.  string_pool.data() is cleared after partition
-    // to free memory.
+    // are global offsets.  string_pool.data() is rebuilt as the tiers
+    // back to back, so a global offset still resolves into it.
     std::array<std::vector<char>, STR_TIER_COUNT> strings_tiers;
     std::array<uint32_t, STR_TIER_COUNT + 1> strings_tier_bases{};
 

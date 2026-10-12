@@ -10,6 +10,19 @@
 
 #include "test_framework.h"
 
+namespace {
+
+// The full scan: ray casting over every edge.
+bool reference_point_in_polygon(double lat, double lng, const std::vector<std::pair<double, double>>& poly) {
+    bool inside = false;
+    size_t n = poly.size();
+    for (size_t i = 0, j = n - 1; i < n; j = i++)
+        if (polygon_edge_crosses(poly[i], poly[j], lat, lng)) inside = !inside;
+    return inside;
+}
+
+}  // namespace
+
 TEST(ring_edge_index_matches_the_full_scan) {
     std::mt19937 rng(8);
     std::uniform_real_distribution<float> step(-0.02f, 0.02f);
@@ -73,17 +86,17 @@ TEST(polygon_index_matches_point_in_polygon) {
             double qlat = plat(rng), qlng = plng(rng);
             if (q % 7 == 0) qlat = poly[rng() % poly.size()].first;  // on a vertex's latitude
             if (q % 11 == 0) qlng = poly[rng() % poly.size()].second;
-            bool want = point_in_polygon(qlat, qlng, poly);
+            bool want = reference_point_in_polygon(qlat, qlng, poly);
             CHECK_EQ(index.contains(qlat, qlng), want);
             (want ? inside : outside)++;
         }
         const double nan = std::numeric_limits<double>::quiet_NaN();
-        CHECK_EQ(index.contains(nan, lng), point_in_polygon(nan, lng, poly));
-        CHECK_EQ(index.contains(lat, nan), point_in_polygon(lat, nan, poly));
+        CHECK_EQ(index.contains(nan, lng), reference_point_in_polygon(nan, lng, poly));
+        CHECK_EQ(index.contains(lat, nan), reference_point_in_polygon(lat, nan, poly));
     }
     CHECK(inside > 1000 && outside > 1000);
     const std::vector<std::pair<double, double>> none;
-    CHECK_EQ(PolygonIndex(none).contains(1, 2), point_in_polygon(1, 2, none));
+    CHECK_EQ(PolygonIndex(none).contains(1, 2), reference_point_in_polygon(1, 2, none));
 }
 
 TEST(ring_edge_index_handles_a_ring_of_one_longitude) {

@@ -236,16 +236,14 @@ inline double meters_to_degrees(double meters, double latitude_deg) {
     return meters / (111320.0 * cos_lat);
 }
 
-// Runtime-configurable epsilon table and scale factor.
-// Set by main() from CLI args. Scale multiplies all values uniformly.
-inline double kAdminEpsilonMeters[12] = {
+// Simplification epsilon in meters per admin level.
+inline constexpr double kAdminEpsilonMeters[12] = {
     15, 15, 500, 200, 100, 50, 30, 20, 15, 15, 15, 15
 };
-inline double kEpsilonScale = 1.0;
 
 inline double admin_epsilon_meters(uint8_t admin_level) {
     int idx = (admin_level <= 11) ? admin_level : 11;
-    return kAdminEpsilonMeters[idx] * kEpsilonScale;
+    return kAdminEpsilonMeters[idx];
 }
 
 // Validate a postcode string for the centroid index. Mirrors
@@ -416,12 +414,6 @@ private:
     std::vector<std::string_view> a_tokens_, b_tokens_;
 };
 
-inline bool tokens_overlap(const char* a, const char* b) {
-    TokenMatcher matcher;
-    matcher.reset(a);
-    return matcher.overlaps(b);
-}
-
 // Parse leading digits from a house number string
 inline uint32_t parse_house_number(const char* s) {
     if (!s) return 0;
@@ -493,12 +485,9 @@ inline bool is_included_highway(const char* value) {
     }
 }
 
-// Full filter including footway subtype and access checks.
-// Excludes footway=sidewalk/crossing (unnamed adjuncts) and
-// any highway with access=private + tunnel=yes (service tunnels
-// like Treasury Annex Tunnel near the White House).
-inline bool is_included_highway_full(const char* highway, const char* footway,
-                                      const char* access = nullptr, const char* tunnel = nullptr) {
+// Full filter including the footway subtype check.
+// Excludes footway=sidewalk/crossing (unnamed adjuncts).
+inline bool is_included_highway_full(const char* highway, const char* footway) {
     if (!is_included_highway(highway)) return false;
     // Exclude footway subtypes that are road adjuncts
     if (highway[0] == 'f' && std::strcmp(highway, "footway") == 0 && footway) {

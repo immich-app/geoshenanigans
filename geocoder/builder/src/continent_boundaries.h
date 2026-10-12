@@ -31,19 +31,9 @@ inline bool polygon_edge_crosses(const std::pair<double,double>& vi, const std::
     return ((yi > lat) != (yj > lat)) && (lng < (xj - xi) * (lat - yi) / (yj - yi) + xi);
 }
 
-// Point-in-polygon test (ray casting algorithm)
-inline bool point_in_polygon(double lat, double lng,
-                              const std::vector<std::pair<double,double>>& poly) {
-    bool inside = false;
-    size_t n = poly.size();
-    for (size_t i = 0, j = n - 1; i < n; j = i++)
-        if (polygon_edge_crosses(poly[i], poly[j], lat, lng)) inside = !inside;
-    return inside;
-}
-
-// point_in_polygon for many points against one polygon (its ray runs along
-// longitude, so the edges are bucketed by latitude): the continent split
-// tests every record and cell against its polygon.
+// Ray-casting point-in-polygon for many points against one polygon (its ray
+// runs along longitude, so the edges are bucketed by latitude): the continent
+// split tests every record and cell against its polygon.
 class PolygonIndex {
 public:
     // A bucket per vertex: continent polygons are a hundred-odd long edges.

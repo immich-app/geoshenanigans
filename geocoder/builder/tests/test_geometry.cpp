@@ -4,9 +4,9 @@
 // polygon_area shoelace magnitude/winding-insensitivity, and the
 // Douglas-Peucker simplify_polygon / simplify_polygon_epsilon variants.
 //
-// NOTE: point_in_polygon / point_in_polygon_nc are NOT defined in geometry.h
-// (they live in continent_boundaries.h), so they are intentionally not tested
-// here — this file covers the geometry.h module exactly.
+// NOTE: point_in_polygon_nc is NOT defined in geometry.h (it lives in
+// continent_boundaries.h), so it is intentionally not tested here — this file
+// covers the geometry.h module exactly.
 #include "geometry.h"
 
 #include <utility>
@@ -248,18 +248,11 @@ TEST(geometry_meters_to_degrees_equator) {
 }
 
 TEST(geometry_admin_epsilon_meters_table) {
-    // Default table values with scale 1.0 (the inline default).
-    double saved_scale = kEpsilonScale;
-    kEpsilonScale = 1.0;
     CHECK_NEAR(admin_epsilon_meters(2), 500.0, 1e-9);   // country
     CHECK_NEAR(admin_epsilon_meters(8), 15.0, 1e-9);    // city
     // Levels above 11 clamp to index 11.
     CHECK_NEAR(admin_epsilon_meters(11), 15.0, 1e-9);
     CHECK_NEAR(admin_epsilon_meters(200), admin_epsilon_meters(11), 1e-9);
-    // Scale multiplies uniformly.
-    kEpsilonScale = 2.0;
-    CHECK_NEAR(admin_epsilon_meters(2), 1000.0, 1e-9);
-    kEpsilonScale = saved_scale;
 }
 
 // --- is_included_highway allow-list ----------------------------------------
@@ -300,12 +293,4 @@ TEST(highway_full_filter_footway_subtypes) {
     CHECK(is_included_highway_full("footway", nullptr));
     // The subtype filter applies to footway only.
     CHECK(is_included_highway_full("residential", "sidewalk"));
-}
-
-TEST(highway_full_filter_ignores_access_and_tunnel) {
-    // Nominatim indexes highways regardless of access/tunnel — lock in that
-    // is_included_highway_full does NOT filter on them (the Treasury Annex
-    // Tunnel case is handled by the addr preference rule instead).
-    CHECK(is_included_highway_full("service", nullptr, "private", "yes"));
-    CHECK(is_included_highway_full("residential", nullptr, "no", "yes"));
 }

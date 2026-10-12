@@ -63,23 +63,14 @@
 
 // --- Place type override classification ---
 
-struct PlaceOverride {
-    AdminPlaceType type;
-    bool tag_present;   // true when any relevant tag (linked_place/border_type/place) was set;
-                        // used to block wikidata linking for boundaries that Nominatim
-                        // treats as having an authoritative place tag (even if the place
-                        // value is state/country/... which we don't translate to an override).
-};
-
-static PlaceOverride classify_place_override(const char* linked_place, const char* /*border_type_unused*/, const char* place_tag) {
+static AdminPlaceType classify_place_override(const char* linked_place, const char* place_tag) {
     // Nominatim's get_label_tag (classtypes.py) only checks
     //   extratags['place']  and  extratags['linked_place']
     // to short-circuit ADMIN_LABELS; `border_type` is kept in extratags
     // but NOT read by the labeller. So for Nominatim-parity we only honour
     // `linked_place` and a direct `place` tag on the boundary.
     const char* val = linked_place ? linked_place : place_tag;
-    bool present = (val != nullptr && val[0] != '\0');
-    if (!present) return {AdminPlaceType::NONE, false};
+    if (val == nullptr || val[0] == '\0') return AdminPlaceType::NONE;
     AdminPlaceType t = AdminPlaceType::NONE;
     if (std::strcmp(val, "city") == 0) t = AdminPlaceType::CITY;
     else if (std::strcmp(val, "town") == 0) t = AdminPlaceType::TOWN;
@@ -95,7 +86,7 @@ static PlaceOverride classify_place_override(const char* linked_place, const cha
     else if (std::strcmp(val, "county") == 0) t = AdminPlaceType::COUNTY;
     else if (std::strcmp(val, "district") == 0) t = AdminPlaceType::DISTRICT;
     else if (std::strcmp(val, "municipality") == 0) t = AdminPlaceType::MUNICIPALITY;
-    return {t, true};
+    return t;
 }
 
 // PlaceType (0=CITY, 1=TOWN, ...) → AdminPlaceType (0=NONE, 1=CITY, 2=TOWN, ...)
@@ -2531,12 +2522,6 @@ static int run(int argc, char* argv[]) {
         std::cerr << "  --multi-output         Write full, no-addresses, admin-only indexes" << std::endl;
         std::cerr << "  --continents           Also generate per-continent indexes" << std::endl;
         std::cerr << "  --mode <mode>          Index mode: full, no-addresses, admin-only (default: full)" << std::endl;
-        std::cerr << "  --admin-only           Shorthand for --mode admin-only" << std::endl;
-        std::cerr << "  --no-addresses         Shorthand for --mode no-addresses" << std::endl;
-        std::cerr << "  --simplify-epsilon     Use error-bounded simplification (per-level defaults)" << std::endl;
-        std::cerr << "  --simplify-epsilon N   Use fixed epsilon of N meters for all levels" << std::endl;
-        std::cerr << "  --epsilon-scale F      Multiply all per-level epsilons by F (e.g. 2.0 = 2x coarser)" << std::endl;
-        std::cerr << "  --epsilon-levels L2,L3,...,L8  Set epsilon in meters per level (7 values)" << std::endl;
         std::cerr << "  --multi-quality [S,S,...]  Write quality variants at given scales (default: 0,0.2,0.5,1,1.5,2,2.5)" << std::endl;
         std::cerr << "  --tiger-data <path>          Load TIGER address data (tar.gz or directory of CSVs)" << std::endl;
         std::cerr << "  --external-postcodes <path>  Load GeoNames postcode centroids (CSV or .csv.gz)" << std::endl;
@@ -2562,38 +2547,18 @@ static int run(int argc, char* argv[]) {
     bool multi_quality = false;
     std::vector<double> quality_scales;
 
-    // q2.5 — admin-minimal isn't tiered by quality, this is the
-    // single epsilon used when re-simplifying its polygon set.
-
     for (int i = 2; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--street-level" && i + 1 < argc) {
             kStreetCellLevel = std::atoi(argv[++i]);
         } else if (arg == "--admin-level" && i + 1 < argc) {
             kAdminCellLevel = std::atoi(argv[++i]);
-        } else if (arg == "--admin-only") {
-            mode = IndexMode::AdminOnly;
-        } else if (arg == "--no-addresses") {
-            mode = IndexMode::NoAddresses;
         } else if (arg == "--max-admin-level" && i + 1 < argc) {
             kMaxAdminLevel = std::atoi(argv[++i]);
         } else if (arg == "--multi-output") {
             multi_output = true;
         } else if (arg == "--continents") {
             generate_continents = true;
-        } else if (arg == "--simplify-epsilon") {
-            simplify_mode = SimplifyMode::ErrorBounded;
-            // Optional: next arg might be a number (fixed epsilon in meters)
-            if (i + 1 < argc) {
-                char* end;
-                double val = std::strtod(argv[i+1], &end);
-                if (*end == '\0' && val > 0) {
-                    simplify_epsilon_override = val;
-                    i++;
-                }
-            }
-        } else if (arg == "--epsilon-scale" && i + 1 < argc) {
-            kEpsilonScale = std::strtod(argv[++i], nullptr);
         } else if (arg == "--multi-quality") {
             multi_quality = true;
             // Optional: next arg might be comma-separated scales
@@ -2615,21 +2580,6 @@ static int run(int argc, char* argv[]) {
             // We need full vertex detail to produce all quality levels accurately.
             simplify_mode = SimplifyMode::ErrorBounded;
             simplify_epsilon_override = 0.1; // effectively uncapped
-        } else if (arg == "--epsilon-levels" && i + 1 < argc) {
-            // Parse comma-separated values: L2,L3,L4,L5,L6,L7,L8
-            std::string vals = argv[++i];
-            int level = 2;
-            size_t pos = 0;
-            while (pos < vals.size() && level <= 8) {
-                size_t next = vals.find(',', pos);
-                if (next == std::string::npos) next = vals.size();
-                double v = std::strtod(vals.substr(pos, next - pos).c_str(), nullptr);
-                if (v > 0) kAdminEpsilonMeters[level] = v;
-                level++;
-                pos = next + 1;
-            }
-            // Also set levels 9-11 to same as level 8
-            for (int l = level; l <= 11; l++) kAdminEpsilonMeters[l] = kAdminEpsilonMeters[8];
         } else if (arg == "--mode" && i + 1 < argc) {
             std::string mode_str = argv[++i];
             if (mode_str == "full") {
@@ -2659,15 +2609,7 @@ static int run(int argc, char* argv[]) {
     kSimplifyMode = simplify_mode;
     kSimplifyEpsilonOverride = simplify_epsilon_override;
     if (simplify_mode == SimplifyMode::ErrorBounded) {
-        if (simplify_epsilon_override > 0) {
-            std::cerr << "Simplification: error-bounded, fixed " << simplify_epsilon_override << "m epsilon" << std::endl;
-        } else {
-            std::cerr << "Simplification: error-bounded, scale=" << kEpsilonScale
-                      << ", epsilons: L2=" << admin_epsilon_meters(2)
-                      << "m L4=" << admin_epsilon_meters(4)
-                      << "m L6=" << admin_epsilon_meters(6)
-                      << "m L8=" << admin_epsilon_meters(8) << "m" << std::endl;
-        }
+        std::cerr << "Simplification: error-bounded, fixed " << simplify_epsilon_override << "m epsilon" << std::endl;
     }
 
     ParsedData data;
@@ -2710,8 +2652,6 @@ static int run(int argc, char* argv[]) {
         log_phase("  Wikidata sitelinks: load", _wt, _wc);
     }
 
-    // Helper to look up sitelinks count by QID (binary search since data is sorted)
-
     unsigned int num_threads = std::max(1u, std::thread::hardware_concurrency() - 1);
     BuildConfig cfg{num_threads, mode, multi_output, multi_quality, output_dir, prev_output_dir};
     {
@@ -2729,7 +2669,6 @@ static int run(int argc, char* argv[]) {
         // Create thread pool for concurrent admin polygon S2 covering
         std::cerr << "Using " << num_threads << " worker threads." << std::endl;
         AdminCoverPool admin_pool(num_threads);
-        // BuildHandler no longer used — parallel processing handles everything
 
         // The last input's way geometries, freed beside the admin linking.
         WayGeometries spent_geometries;
@@ -2769,7 +2708,7 @@ static int run(int argc, char* argv[]) {
                         bool is_multipolygon_place =
                             !boundary && rel_type && rel_place &&
                             std::strcmp(rel_type, "multipolygon") == 0 &&
-                            classify_place_override(nullptr, nullptr, rel_place).type != AdminPlaceType::NONE;
+                            classify_place_override(nullptr, rel_place) != AdminPlaceType::NONE;
 
                         if (!boundary && !is_multipolygon_place) continue;
 
@@ -2792,7 +2731,7 @@ static int run(int argc, char* argv[]) {
                         if (is_place_boundary || is_multipolygon_place) {
                             const char* place_tag = rel_place;
                             if (place_tag) {
-                                AdminPlaceType pt = classify_place_override(nullptr, nullptr, place_tag).type;
+                                AdminPlaceType pt = classify_place_override(nullptr, place_tag);
                                 if (pt != AdminPlaceType::NONE) {
                                     const char* name = rel.tag("name:en");
                                     if (!name) name = rel.tag("name");
@@ -2853,7 +2792,6 @@ static int run(int argc, char* argv[]) {
                         }
 
                         const char* linked_place = rel.tag("linked_place");
-                        const char* border_type_tag = rel.tag("border_type");
                         const char* wikidata_tag = rel.tag("wikidata");
                         // place=* tag on boundary=administrative relations (e.g. Tokyo
                         // has place=province, Suginami has place=city). Nominatim's
@@ -2861,7 +2799,7 @@ static int run(int argc, char* argv[]) {
                         // → rank label, so we honour it as a place_type_override.
                         const char* place_tag_on_admin = rel.tag("place");
 
-                        auto po = classify_place_override(linked_place, border_type_tag, place_tag_on_admin);
+                        AdminPlaceType po = classify_place_override(linked_place, place_tag_on_admin);
                         CollectedRelation cr;
                         cr.id = rel.id;
                         cr.label_node_id = label_node_id;
@@ -2869,7 +2807,7 @@ static int run(int argc, char* argv[]) {
                         cr.name = std::move(name_str);
                         cr.country_code = std::move(country_code);
                         cr.is_postal = is_postal;
-                        cr.fallback_place_type = static_cast<uint8_t>(po.type);
+                        cr.fallback_place_type = static_cast<uint8_t>(po);
 
                         for (size_t mi = 0; mi < rel.members.size(); mi++) {
                             if (rel.members[mi].type == 'w') {
@@ -3010,7 +2948,7 @@ static int run(int argc, char* argv[]) {
                             }
                         }
                     }
-                }, "r");
+                });
                 // Which thread read a block is down to timing, so this join
                 // order is as arbitrary as the shared lock's was.
                 for (auto& c : collected) {
@@ -3523,7 +3461,6 @@ static int run(int argc, char* argv[]) {
                 throw std::runtime_error("node index: " + std::to_string(oc) +
                     " node ids exceed MAX_NODE_ID_DEFAULT capacity — bump MAX_NODE_ID_DEFAULT");
             }
-            pbf.release_pages(); // free PBF mmap pages, will re-fault for way pass
 
             // --- Pass 2b: Way processing (fully parallel) ---
             std::cerr << "  Processing ways with " << num_threads << " threads..." << std::endl;
@@ -3709,7 +3646,7 @@ static int run(int argc, char* argv[]) {
                     }
 
                     // Highway ways
-                    if (t.highway && is_included_highway_full(t.highway, t.footway, t.access, t.tunnel)) {
+                    if (t.highway && is_included_highway_full(t.highway, t.footway)) {
                         if (t_best_name && refs_size >= 2 && all_valid) {
                             uint32_t wid = static_cast<uint32_t>(local.ways.size());
                             uint32_t noff = static_cast<uint32_t>(local.street_nodes.size());
@@ -3825,8 +3762,7 @@ static int run(int argc, char* argv[]) {
                                         std::vector<std::pair<double,double>> verts;
                                         for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});
                                         std::string cc; if (al == 2) { const char* iso = t.iso; if (iso) cc = iso; }
-                                        auto po = classify_place_override(t.linked_place, t.border_type, t.place);
-                                        uint8_t fallback = static_cast<uint8_t>(po.type);
+                                        uint8_t fallback = static_cast<uint8_t>(classify_place_override(t.linked_place, t.place));
                                         std::string wd_str = t.wikidata ? t.wikidata : "";
                                         local.closed_way_admins.push_back({std::move(verts), std::move(name_str), al, std::move(cc), fallback, std::move(wd_str), way_id});
                                     }
@@ -3837,7 +3773,7 @@ static int run(int argc, char* argv[]) {
                         if (is_place_boundary && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1]) {
                             const char* aname = t_best_name;
                             if (aname && t.place) {
-                                AdminPlaceType pt = classify_place_override(nullptr, nullptr, t.place).type;
+                                AdminPlaceType pt = classify_place_override(nullptr, t.place);
                                 if (pt != AdminPlaceType::NONE && all_valid && resolved_locs.size() >= 3) {
                                     std::vector<std::pair<double,double>> verts;
                                     for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});
@@ -3861,7 +3797,7 @@ static int run(int argc, char* argv[]) {
                     // the polygon.
                     if (!boundary && t.place && t_best_name
                             && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1]) {
-                        AdminPlaceType pt = classify_place_override(nullptr, nullptr, t.place).type;
+                        AdminPlaceType pt = classify_place_override(nullptr, t.place);
                         // Only the rank-20+ place types (neighbourhood,
                         // quarter, suburb, borough) — higher-level place
                         // types on closed ways are rare and adding them
@@ -4195,7 +4131,6 @@ static int run(int argc, char* argv[]) {
                 // --- Parallel admin boundary assembly ---
                 {
                     log_phase("Pass 2b: way processing", _pt, _cpu);
-                    pbf.unmap(); // release 86 GiB PBF mmap before admin/S2 phases
                     std::cerr << "  Assembling admin polygons in parallel ("
                               << data.collected_relations.size() << " relations, "
                               << data.way_geometries.ways.size() << " way geometries)..." << std::endl;
@@ -4763,7 +4698,6 @@ static int run(int argc, char* argv[]) {
         log_mem("data.poi_records",                  vec_bytes(data.poi_records));
         log_mem("data.poi_osm_ids",                  vec_bytes(data.poi_osm_ids));
         log_mem("data.poi_vertices",                 vec_bytes(data.poi_vertices));
-        log_mem("data.cell_to_pois (approx)",        map_bytes_approx(data.cell_to_pois));
         log_mem("data.place_nodes",                  vec_bytes(data.place_nodes));
         log_mem("data.place_osm_ids",                vec_bytes(data.place_osm_ids));
         log_mem("data.interp_ways",                  vec_bytes(data.interp_ways));

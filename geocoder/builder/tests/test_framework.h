@@ -22,7 +22,6 @@ namespace gctest {
 
 struct Test {
     const char* name;
-    const char* file;
     std::function<void()> fn;
 };
 
@@ -40,8 +39,8 @@ inline int& checks() {
 }
 
 struct Registrar {
-    Registrar(const char* name, const char* file, std::function<void()> fn) {
-        registry().push_back({name, file, std::move(fn)});
+    Registrar(const char* name, std::function<void()> fn) {
+        registry().push_back({name, std::move(fn)});
     }
 };
 
@@ -52,7 +51,7 @@ struct RequireFailed {};
 
 #define TEST(name)                                                          \
     static void name();                                                     \
-    static ::gctest::Registrar gc_reg_##name(#name, __FILE__, name);        \
+    static ::gctest::Registrar gc_reg_##name(#name, name);                  \
     static void name()
 
 // Like CHECK but aborts the current test on failure — use when later

@@ -8,7 +8,6 @@
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
-#include <sys/mman.h>
 #include <mutex>
 #include <stdexcept>
 #include <string_view>
@@ -258,225 +257,6 @@ static inline void decode_string_table(protozero::pbf_reader& pb, std::vector<st
 
 // --- PrimitiveBlock decoding ---
 
-PbfBlock decode_pbf_blob(const char* data, size_t size) {
-    PbfBlock block;
-
-    protozero::pbf_reader pb(data, size);
-    auto& string_table = block.string_table;
-    int32_t granularity = 100;
-    int64_t lat_offset = 0;
-    int64_t lon_offset = 0;
-
-    // First pass: extract string table and granularity
-    while (pb.next()) {
-        switch (pb.tag()) {
-            case PrimitiveBlockTag::STRINGTABLE: decode_string_table(pb, string_table); break;
-            case PrimitiveBlockTag::GRANULARITY:
-                granularity = pb.get_int32();
-                break;
-            case PrimitiveBlockTag::LAT_OFFSET:
-                lat_offset = pb.get_int64();
-                break;
-            case PrimitiveBlockTag::LON_OFFSET:
-                lon_offset = pb.get_int64();
-                break;
-            default:
-                pb.skip();
-        }
-    }
-
-    auto* st_ptr = &block.string_table; // for tag construction
-
-    // Second pass: decode primitive groups
-    protozero::pbf_reader pb2(data, size);
-    while (pb2.next()) {
-        if (pb2.tag() != PrimitiveBlockTag::PRIMITIVEGROUP) {
-            pb2.skip();
-            continue;
-        }
-
-        protozero::pbf_reader group = pb2.get_message();
-        while (group.next()) {
-            switch (group.tag()) {
-                case PrimitiveGroupTag::NODES:
-                    // Plain (non-dense) node groups are never produced by the
-                    // planet/Geofabrik toolchain; silently skipping them would
-                    // drop node coordinates. Fail loudly instead.
-                    throw std::runtime_error("PBF contains non-dense node groups — unsupported");
-                case PrimitiveGroupTag::DENSE: {
-                    protozero::pbf_reader dense = group.get_message();
-                    std::vector<int64_t> ids_vec, lats_vec, lons_vec;
-                    std::vector<int32_t> kv_vec;
-
-                    while (dense.next()) {
-                        switch (dense.tag()) {
-                            case DenseNodesTag::ID:
-                                for (auto v : dense.get_packed_sint64()) ids_vec.push_back(v);
-                                break;
-                            case DenseNodesTag::LAT:
-                                for (auto v : dense.get_packed_sint64()) lats_vec.push_back(v);
-                                break;
-                            case DenseNodesTag::LON:
-                                for (auto v : dense.get_packed_sint64()) lons_vec.push_back(v);
-                                break;
-                            case DenseNodesTag::KEYS_VALS:
-                                for (auto v : dense.get_packed_int32()) kv_vec.push_back(v);
-                                break;
-                            default:
-                                dense.skip();
-                        }
-                    }
-
-                    int64_t id = 0, lat = 0, lon = 0;
-                    size_t kv_pos = 0;
-
-                    for (size_t i = 0; i < ids_vec.size(); i++) {
-                        id += ids_vec[i];
-                        lat += (i < lats_vec.size()) ? lats_vec[i] : 0;
-                        lon += (i < lons_vec.size()) ? lons_vec[i] : 0;
-
-                        PbfNode node;
-                        node.id = id;
-                        node.lat = NANO_DEG * (lat_offset + (int64_t)granularity * lat);
-                        node.lng = NANO_DEG * (lon_offset + (int64_t)granularity * lon);
-
-                        // Only allocate tags if this node has any
-                        if (kv_pos < kv_vec.size() && kv_vec[kv_pos] != 0) {
-                            node.tags.string_table = st_ptr;
-                            while (kv_pos < kv_vec.size()) {
-                                int32_t key_idx = kv_vec[kv_pos++];
-                                if (key_idx == 0) break;
-                                int32_t val_idx = (kv_pos < kv_vec.size()) ? kv_vec[kv_pos++] : 0;
-                                node.tags.indices.emplace_back(key_idx, val_idx);
-                            }
-                        } else {
-                            if (kv_pos < kv_vec.size()) kv_pos++; // skip the 0 delimiter
-                        }
-
-                        block.nodes.push_back(std::move(node));
-                    }
-                    break;
-                }
-
-                case PrimitiveGroupTag::WAYS: {
-                    protozero::pbf_reader way_msg = group.get_message();
-                    PbfWay way;
-                    std::vector<uint32_t> keys, vals;
-
-                    while (way_msg.next()) {
-                        switch (way_msg.tag()) {
-                            case WayTag::ID:
-                                way.id = way_msg.get_int64();
-                                break;
-                            case WayTag::KEYS: {
-                                auto packed = way_msg.get_packed_uint32();
-                                for (auto v : packed) keys.push_back(v);
-                                break;
-                            }
-                            case WayTag::VALS: {
-                                auto packed = way_msg.get_packed_uint32();
-                                for (auto v : packed) vals.push_back(v);
-                                break;
-                            }
-                            case WayTag::REFS: {
-                                auto packed = way_msg.get_packed_sint64();
-                                way.refs_offset = static_cast<uint32_t>(block.way_refs.size());
-                                int64_t ref = 0;
-                                for (auto delta : packed) {
-                                    ref += delta;
-                                    block.way_refs.push_back(ref);
-                                }
-                                way.refs_count = static_cast<uint32_t>(block.way_refs.size()) - way.refs_offset;
-                                break;
-                            }
-                            default:
-                                way_msg.skip();
-                        }
-                    }
-
-                    way.tags.string_table = st_ptr;
-                    for (size_t i = 0; i < keys.size() && i < vals.size(); i++) {
-                        way.tags.indices.emplace_back(keys[i], vals[i]);
-                    }
-                    block.ways.push_back(std::move(way));
-                    break;
-                }
-
-                case PrimitiveGroupTag::RELATIONS: {
-                    protozero::pbf_reader rel_msg = group.get_message();
-                    PbfRelation rel;
-                    std::vector<uint32_t> keys, vals;
-                    std::vector<int32_t> roles_sid;
-                    std::vector<int64_t> memids_delta;
-                    std::vector<int32_t> types;
-
-                    while (rel_msg.next()) {
-                        switch (rel_msg.tag()) {
-                            case RelationTag::ID:
-                                rel.id = rel_msg.get_int64();
-                                break;
-                            case RelationTag::KEYS: {
-                                auto packed = rel_msg.get_packed_uint32();
-                                for (auto v : packed) keys.push_back(v);
-                                break;
-                            }
-                            case RelationTag::VALS: {
-                                auto packed = rel_msg.get_packed_uint32();
-                                for (auto v : packed) vals.push_back(v);
-                                break;
-                            }
-                            case RelationTag::ROLES_SID: {
-                                auto packed = rel_msg.get_packed_int32();
-                                for (auto v : packed) roles_sid.push_back(v);
-                                break;
-                            }
-                            case RelationTag::MEMIDS: {
-                                auto packed = rel_msg.get_packed_sint64();
-                                for (auto v : packed) memids_delta.push_back(v);
-                                break;
-                            }
-                            case RelationTag::TYPES: {
-                                auto packed = rel_msg.get_packed_int32();
-                                for (auto v : packed) types.push_back(v);
-                                break;
-                            }
-                            default:
-                                rel_msg.skip();
-                        }
-                    }
-
-                    rel.tags.string_table = st_ptr;
-                    for (size_t i = 0; i < keys.size() && i < vals.size(); i++) {
-                        rel.tags.indices.emplace_back(keys[i], vals[i]);
-                    }
-
-                    int64_t memid = 0;
-                    for (size_t i = 0; i < memids_delta.size(); i++) {
-                        memid += memids_delta[i];
-                        char type = '?';
-                        if (i < types.size()) {
-                            switch (types[i]) {
-                                case 0: type = 'n'; break;
-                                case 1: type = 'w'; break;
-                                case 2: type = 'r'; break;
-                            }
-                        }
-                        uint32_t role_sid = (i < roles_sid.size()) ? roles_sid[i] : 0;
-                        rel.members.push_back({type, memid, role_sid});
-                    }
-                    block.relations.push_back(std::move(rel));
-                    break;
-                }
-
-                default:
-                    group.skip();
-            }
-        }
-    }
-
-    return block;
-}
-
 size_t decode_nodes_streaming(const char* data, size_t size, const NodeCallback& callback) {
     // Single-pass decode: string table + dense nodes in one traversal
     std::vector<std::string> string_table;
@@ -646,23 +426,14 @@ size_t decode_ways_streaming(const char* data, size_t size, const WayCallback& c
 void decode_pbf_blob_into(const char* data, size_t size, PbfBlock& block) {
     // Clear vectors but keep capacity for reuse
     block.string_table.clear();
-    block.nodes.clear();
-    block.ways.clear();
-    block.way_refs.clear();
     block.relations.clear();
 
     protozero::pbf_reader pb(data, size);
     auto& string_table = block.string_table;
-    int32_t granularity = 100;
-    int64_t lat_offset = 0;
-    int64_t lon_offset = 0;
 
     while (pb.next()) {
         switch (pb.tag()) {
             case PrimitiveBlockTag::STRINGTABLE: decode_string_table(pb, string_table); break;
-            case PrimitiveBlockTag::GRANULARITY: granularity = pb.get_int32(); break;
-            case PrimitiveBlockTag::LAT_OFFSET: lat_offset = pb.get_int64(); break;
-            case PrimitiveBlockTag::LON_OFFSET: lon_offset = pb.get_int64(); break;
             default: pb.skip();
         }
     }
@@ -680,87 +451,6 @@ void decode_pbf_blob_into(const char* data, size_t size, PbfBlock& block) {
                     // planet/Geofabrik toolchain; silently skipping them would
                     // drop node coordinates. Fail loudly instead.
                     throw std::runtime_error("PBF contains non-dense node groups — unsupported");
-                case PrimitiveGroupTag::DENSE: {
-                    protozero::pbf_reader dense = group.get_message();
-                    // Save raw data views — iterate in lockstep without intermediate vectors
-                    protozero::data_view ids_data, lats_data, lons_data, kv_data;
-                    while (dense.next()) {
-                        switch (dense.tag()) {
-                            case DenseNodesTag::ID: ids_data = dense.get_view(); break;
-                            case DenseNodesTag::LAT: lats_data = dense.get_view(); break;
-                            case DenseNodesTag::LON: lons_data = dense.get_view(); break;
-                            case DenseNodesTag::KEYS_VALS: kv_data = dense.get_view(); break;
-                            default: dense.skip();
-                        }
-                    }
-
-                    // Raw varint pointers for zero-copy iteration
-                    const char* id_ptr = ids_data.data();
-                    const char* id_end = id_ptr + ids_data.size();
-                    const char* lat_ptr = lats_data.data();
-                    const char* lat_end = lat_ptr + lats_data.size();
-                    const char* lon_ptr = lons_data.data();
-                    const char* lon_end = lon_ptr + lons_data.size();
-                    const char* kv_ptr = kv_data.data();
-                    const char* kv_end = kv_ptr + kv_data.size();
-
-                    int64_t id = 0, lat = 0, lon = 0;
-
-                    while (id_ptr < id_end) {
-                        id += protozero::decode_zigzag64(protozero::decode_varint(&id_ptr, id_end));
-                        lat += protozero::decode_zigzag64(protozero::decode_varint(&lat_ptr, lat_end));
-                        lon += protozero::decode_zigzag64(protozero::decode_varint(&lon_ptr, lon_end));
-
-                        PbfNode node;
-                        node.id = id;
-                        node.lat = NANO_DEG * (lat_offset + (int64_t)granularity * lat);
-                        node.lng = NANO_DEG * (lon_offset + (int64_t)granularity * lon);
-
-                        // Parse tags (kv pairs terminated by 0)
-                        if (kv_ptr < kv_end) {
-                            uint32_t key_idx = static_cast<uint32_t>(protozero::decode_varint(&kv_ptr, kv_end));
-                            if (key_idx != 0) {
-                                node.tags.string_table = st_ptr;
-                                do {
-                                    uint32_t val_idx = (kv_ptr < kv_end)
-                                        ? static_cast<uint32_t>(protozero::decode_varint(&kv_ptr, kv_end)) : 0;
-                                    node.tags.indices.emplace_back(key_idx, val_idx);
-                                    if (kv_ptr >= kv_end) break;
-                                    key_idx = static_cast<uint32_t>(protozero::decode_varint(&kv_ptr, kv_end));
-                                } while (key_idx != 0);
-                            }
-                        }
-
-                        block.nodes.push_back(std::move(node));
-                    }
-                    break;
-                }
-                case PrimitiveGroupTag::WAYS: {
-                    protozero::pbf_reader way_msg = group.get_message();
-                    PbfWay way;
-                    std::vector<uint32_t> keys, vals;
-                    while (way_msg.next()) {
-                        switch (way_msg.tag()) {
-                            case WayTag::ID: way.id = way_msg.get_int64(); break;
-                            case WayTag::KEYS: for (auto v : way_msg.get_packed_uint32()) keys.push_back(v); break;
-                            case WayTag::VALS: for (auto v : way_msg.get_packed_uint32()) vals.push_back(v); break;
-                            case WayTag::REFS: {
-                                auto packed = way_msg.get_packed_sint64();
-                                way.refs_offset = static_cast<uint32_t>(block.way_refs.size());
-                                int64_t ref = 0;
-                                for (auto delta : packed) { ref += delta; block.way_refs.push_back(ref); }
-                                way.refs_count = static_cast<uint32_t>(block.way_refs.size()) - way.refs_offset;
-                                break;
-                            }
-                            default: way_msg.skip();
-                        }
-                    }
-                    way.tags.string_table = st_ptr;
-                    for (size_t i = 0; i < keys.size() && i < vals.size(); i++)
-                        way.tags.indices.emplace_back(keys[i], vals[i]);
-                    block.ways.push_back(std::move(way));
-                    break;
-                }
                 case PrimitiveGroupTag::RELATIONS: {
                     protozero::pbf_reader rel_msg = group.get_message();
                     PbfRelation rel;
@@ -1047,25 +737,13 @@ void PbfFile::classify_blobs() {
               << relation_blobs_.size() << " relation blocks" << std::endl;
 }
 
-void PbfFile::read_blocks(std::function<void(PbfBlock&, unsigned thread_idx)> callback,
-                           const std::string& entity_filter) {
-    // For read_blocks (used for relations), classify to avoid wasting work
-    // on 50K blobs when only 454 contain relations.
+void PbfFile::read_blocks(std::function<void(PbfBlock&, unsigned thread_idx)> callback) {
+    // Classify to avoid wasting work on 50K blobs when only 454 contain
+    // relations.
     classify_blobs();
 
-    std::vector<size_t> indices;
-    if (entity_filter.find('n') != std::string::npos)
-        indices.insert(indices.end(), node_blobs_.begin(), node_blobs_.end());
-    if (entity_filter.find('w') != std::string::npos)
-        indices.insert(indices.end(), way_blobs_.begin(), way_blobs_.end());
-    if (entity_filter.find('r') != std::string::npos)
-        indices.insert(indices.end(), relation_blobs_.begin(), relation_blobs_.end());
-
+    const std::vector<size_t>& indices = relation_blobs_;
     if (indices.empty()) return;
-
-    bool want_nodes = entity_filter.find('n') != std::string::npos;
-    bool want_ways = entity_filter.find('w') != std::string::npos;
-    bool want_rels = entity_filter.find('r') != std::string::npos;
 
 
     // Unordered mode: full parallel decode + callback
@@ -1102,10 +780,6 @@ void PbfFile::read_blocks(std::function<void(PbfBlock&, unsigned thread_idx)> ca
 
                 decode_pbf_blob_into(decomp.data(), decomp.size(), block);
                 auto t2 = std::chrono::steady_clock::now();
-
-                if (!want_nodes) block.nodes.clear();
-                if (!want_ways) block.ways.clear();
-                if (!want_rels) block.relations.clear();
 
                 callback(block, t);
                 auto t3 = std::chrono::steady_clock::now();

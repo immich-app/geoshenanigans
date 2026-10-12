@@ -7,7 +7,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
-find_package(BZip2 REQUIRED)
 find_package(EXPAT REQUIRED)
 # libdeflate inflates the PBF's blobs, and pbf-apply deflates them, faster
 # than zlib (src/zlib_blob.h). Older packages ship no CMake config.
@@ -130,8 +129,6 @@ else()
 endif()
 target_link_libraries(build-index PRIVATE
     libdeflate::libdeflate
-    BZip2::BZip2
-    EXPAT::EXPAT
     Threads::Threads
 )
 # main() switches off absl's Mutex deadlock detection, S2's dependency:
@@ -148,10 +145,9 @@ endif()
 # --- Unit tests (geocoder-tests) ---
 #
 # Unit tests for the builder's pure logic and the tools (no S2 needed — the
-# helpers under test need at most zlib, expat and protozero).
+# helpers under test need at most zlib, libdeflate, expat and protozero).
 # Every tests/*.cpp is auto-discovered; run with `ctest` or by executing the
-# geocoder-tests binary directly. Not in the default critical build path: build
-# explicitly with `make geocoder-tests`.
+# geocoder-tests binary directly.
 enable_testing()
 file(GLOB GEOCODER_TEST_SRCS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp")
 add_executable(geocoder-tests
