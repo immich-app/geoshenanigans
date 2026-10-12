@@ -360,7 +360,10 @@ const map = new maplibregl.Map({
   container: 'map',
   style: 'https://tiles.immich.cloud/v1/style/dark.json',
   center: [0, 40],
-  zoom: 3
+  zoom: 3,
+  // MapLibre cancels the tiles still loading for the levels a zoom passes
+  // through by default, so detail only appeared once the zoom settled.
+  cancelPendingTileRequestsWhileZooming: false
 });
 
 const markers = new Map(); // id -> {marker, popup}
