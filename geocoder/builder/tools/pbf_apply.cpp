@@ -2,8 +2,7 @@
 // does, copying untouched blobs verbatim (see pbf_apply.h).
 //
 // Usage: pbf-apply <in.osm.pbf> <change.osc[.gz]>... -o <out.osm.pbf>
-//            [--replication-timestamp ISO8601] [--replication-sequence N]
-//            [--replication-base-url URL] [--direct-io]
+//            [--replication-timestamp ISO8601] [--replication-sequence N] [--direct-io]
 #include <climits>
 #include <cstdlib>
 #include <cstring>
@@ -15,8 +14,7 @@
 
 static const char* kUsage =
     "Usage: pbf-apply <in.osm.pbf> <change.osc[.gz]>... -o <out.osm.pbf>\n"
-    "                 [--replication-timestamp ISO8601] [--replication-sequence N]\n"
-    "                 [--replication-base-url URL] [--direct-io]";
+    "                 [--replication-timestamp ISO8601] [--replication-sequence N] [--direct-io]";
 
 static int run(int argc, char* argv[]) {
     ApplyOptions opt;
@@ -38,8 +36,6 @@ static int run(int argc, char* argv[]) {
             if (v.empty() || *end != '\0' || n < 0 || n == LLONG_MAX)
                 throw std::runtime_error("bad --replication-sequence: " + v);
             opt.replication_sequence = n;
-        } else if (arg == "--replication-base-url") {
-            opt.replication_base_url = value();
         } else if (arg == "--direct-io") {
             opt.direct_io = true;
         } else if (arg.size() > 1 && arg[0] == '-') {

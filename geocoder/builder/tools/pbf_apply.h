@@ -194,7 +194,6 @@ struct ApplyOptions {
     std::string input, output;
     std::vector<std::string> changes;
     std::optional<int64_t> replication_timestamp, replication_sequence;
-    std::optional<std::string> replication_base_url;
     size_t max_block_objects = kMaxBlockObjects;
     size_t change_chunk_bytes = kOscChunkBytes;
     unsigned threads = 0;
@@ -405,7 +404,7 @@ inline PbfHeader output_header(const PbfHeader& in, const ApplyOptions& opt) {
     out.source = in.source;
     out.replication_timestamp = opt.replication_timestamp;
     out.replication_sequence = opt.replication_sequence;
-    out.replication_base_url = opt.replication_base_url.value_or(in.replication_base_url);
+    out.replication_base_url = in.replication_base_url;
     return out;
 }
 
