@@ -18,6 +18,7 @@
 #include <protozero/pbf_reader.hpp>
 #include <protozero/varint.hpp>
 
+#include "file_prefetcher.h"
 #include "parallel.h"
 #include "pbf_format.h"
 #include "zlib_blob.h"
@@ -833,6 +834,17 @@ struct IoSemaphore {
     }
 };
 
+// stream_blobs reads the blobs' bytes ahead of its workers in reads of
+// kStreamPrefetchChunk bytes, kStreamPrefetchThreads at once, at most
+// kStreamPrefetchWindow ahead. Blobs average ~65 KiB: read one per pread from
+// a cold network volume (the nightly's Ceph scratch, when the page cache can't
+// keep the PBF), each read was a round trip, and Pass 2 read the planet at
+// ~200 MB/s against the volume's 1.5 GB/s in large reads. The window is page
+// cache, not memory the build holds.
+constexpr uint64_t kStreamPrefetchWindow = uint64_t(4) << 30;
+constexpr size_t kStreamPrefetchChunk = size_t(8) << 20;
+constexpr unsigned kStreamPrefetchThreads = 16;
+
 // How many of `threads` stream_blobs workers may read the file at once:
 // BUILD_MAX_IO (0 = all of them), else half of them, at least 8. On fast
 // storage every thread gets through quickly; on slow storage the rest decode
@@ -864,6 +876,13 @@ static void stream_blobs(const std::string& filename, const std::vector<BlobInfo
     std::atomic<bool> open_failed{false};
     std::vector<std::thread> workers;
 
+    std::vector<uint64_t> offsets(indices.size());
+    for (size_t j = 0; j < indices.size(); j++) offsets[j] = blobs[indices[j]].offset;
+    FilePrefetcher prefetcher(filename, touching_ranges(offsets, [&](size_t j) {
+        const BlobInfo& b = blobs[indices[j]];
+        return uint64_t(4 + b.header_size + b.data_size);
+    }), kStreamPrefetchWindow, kStreamPrefetchChunk, kStreamPrefetchThreads);
+
     struct ThreadStats { double read_us = 0, inflate_us = 0, decode_us = 0; size_t count = 0; };
     std::vector<ThreadStats> stats(threads);
 
@@ -876,6 +895,7 @@ static void stream_blobs(const std::string& filename, const std::vector<BlobInfo
             while (true) {
                 size_t j = next_idx.fetch_add(1);
                 if (j >= indices.size()) break;
+                prefetcher.consumed(offsets[j]);
 
                 io_sem.acquire();
                 auto t0 = std::chrono::steady_clock::now();
