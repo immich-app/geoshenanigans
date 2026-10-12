@@ -1,0 +1,32 @@
+# Tools and tasks for the o11y bundle (o11y/render-manifests.sh,
+# .github/workflows/o11y.yml), loaded only with MISE_ENV=o11y and locked in
+# mise.o11y.lock.
+#   MISE_ENV=o11y mise run o11y:render
+#   MISE_ENV=o11y mise lock   # after changing a version here
+[tools]
+jq = "1.8.2"
+yq = "4.53.6"
+kustomize = "5.8.1"
+kubeconform = "0.8.0"
+flux2 = "2.9.5"
+# github backend: the aqua backend fails to verify cosign v3's sigstore bundles.
+"github:sigstore/cosign" = "v3.1.3"
+
+[tasks."o11y:render"]
+description = "Render the o11y bundle into build/o11y, check it assembles under kustomize and validate it against the CRD schemas"
+run = """
+set -eu
+bash o11y/render-manifests.sh build/o11y
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+cp -R build/o11y/. "$work"
+(cd "$work" && kustomize create --autodetect --recursive && kustomize build . >/dev/null)
+echo "build/o11y assembles cleanly"
+# CRD schemas (GrafanaFolder, GrafanaDashboard, GrafanaAlertRuleGroup) come from
+# home-operations' catalogue; -strict also rejects unknown fields.
+# raw/endraw keep mise's Tera templating off kubeconform's Go template.
+kubeconform -strict -summary \
+  -schema-location default \
+  -schema-location '{% raw %}https://k8s-schemas.home-operations.com/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json{% endraw %}' \
+  build/o11y
+"""

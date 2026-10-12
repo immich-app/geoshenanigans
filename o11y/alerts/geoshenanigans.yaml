@@ -1,0 +1,503 @@
+---
+# yaml-language-server: $schema=https://k8s-schemas.home-operations.com/grafana.integreatly.org/grafanaalertrulegroup_v1beta1.json
+#
+# Shipped as-is in the signed o11y bundle (o11y/render-manifests.sh).
+#
+# Every query uses VictoriaMetricsFleet, not the default VictoriaMetrics
+# datasource: that one only sees the o11y cluster's own tenant, so a rule on
+# geoshenanigans' series would sit at NoData -> OK through a real outage.
+#
+# `project: geoshenanigans` routes the alert to the rootly-geoshenanigans contact
+# point. Never add `heartbeat: rootly`: that label is o11y's own dead man's
+# switch route.
+#
+# The nightly's report step pushes one sample per series per run, so the build
+# rules read the last sample of the past 26h: a day, plus slack for a late cron
+# and the run itself.
+#
+# Fleet only sees this tenant once it has samples on the query's UTC day, so
+# every rule here reads NoData (OK) from 00:00 UTC until the watchdog's first
+# push of the day (cron 15 */2): a rule still firing at midnight resolves, and
+# fires again once that push lands.
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaAlertRuleGroup
+metadata:
+  name: geoshenanigans
+spec:
+  instanceSelector:
+    matchLabels:
+      dashboards: grafana
+  folderRef: geoshenanigans
+  interval: 1m
+  rules:
+    # Only the latest run counts: the watchdog retries a failed run with
+    # workflow_dispatch, which reports under its own `trigger` series, and the
+    # retry's success has to resolve the scheduled run's failure. `== bool 0`
+    # turns a failed run into 1, which the threshold sees, where `== 0` would
+    # return the bare 0.
+    - uid: geoshenanigans-build-failed
+      title: Geocoder nightly build failed
+      condition: B
+      for: 0m
+      labels:
+        project: geoshenanigans
+        severity: critical
+      annotations:
+        summary: The latest geocoder nightly build failed.
+        description: >-
+          The latest geocoder-build.yml run in the past 26h had a failed step
+          (geocoder_build_success 0). Find the failed step on the Geocoder Nightly dashboard (the
+          step lines and the run summary with its URL in the logs panel) and read its log in the
+          run. The watchdog retries up to 5 times a day and a successful retry resolves this,
+          but it does not retry Build tools, Run builder tests or a patch verify failure, which
+          fail the same way on every rerun and need a fix.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 93600
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              (last_over_time(geocoder_build_success{project="geoshenanigans"}[26h])
+                and on (trigger, runner)
+                topk(1, last_over_time(geocoder_build_last_run_timestamp_seconds{project="geoshenanigans"}[26h])))
+              == bool 0
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 93600
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    # The watchdog reads latest.json every 2 hours, so a 6h window holds the
+    # last reading through two missed runs; a silent watchdog leaves this empty,
+    # and geoshenanigans-watchdog-silent covers that.
+    - uid: geoshenanigans-build-stale
+      title: No geocoder build published for 30 hours
+      condition: B
+      for: 0m
+      labels:
+        project: geoshenanigans
+        severity: critical
+      annotations:
+        summary: No geocoder build has been published for over 30 hours.
+        description: >-
+          geocoder/builds/latest.json's updated_at, as the watchdog last read it, is more than 30h
+          old, so no nightly has published since. Check the latest geocoder-build.yml runs for a
+          failed step or a patch verify failure (Finalize skips the latest.json update on one),
+          and whether the watchdog gave up after 5 attempts or did not retry a step that fails on
+          every rerun.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 21600
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              time() - max(last_over_time(geocoder_published_updated_timestamp_seconds{project="geoshenanigans"}[6h]))
+              > 108000
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 21600
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    # The watchdog's report job pushes the heartbeat every 2 hours, so 5h empty
+    # means at least two missed runs. Deliberately unguarded, like
+    # immich-app/version's heartbeat: a "seen recently" guard would resolve at
+    # the next UTC midnight of a full outage. The same midnight blind spot makes
+    # this true from 00:00 UTC until the first heartbeat of the day lands, so
+    # `for` outlasts a dropped 00:15 run (GitHub drops scheduled runs under
+    # load) followed by a late 02:15 one.
+    - uid: geoshenanigans-watchdog-silent
+      title: Geocoder watchdog stopped reporting
+      condition: B
+      for: 3h
+      labels:
+        project: geoshenanigans
+        severity: warning
+      annotations:
+        summary: The geocoder watchdog has not reported for over 5 hours.
+        description: >-
+          No geocoder_watchdog_heartbeat_timestamp_seconds sample for 5h, so at least two
+          2-hourly geocoder-build-watchdog.yml runs did not report. Without it
+          geoshenanigans-build-stale cannot fire. Check the workflow's recent runs (GitHub
+          disables scheduled workflows after 60 days without repository activity) and the
+          report job's log for a warning from the 1Password token read or the push to
+          vmauth.futostatus.com.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 18000
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              absent_over_time(geocoder_watchdog_heartbeat_timestamp_seconds{project="geoshenanigans"}[5h])
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 18000
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    - uid: geoshenanigans-patch-verify-failed
+      title: Geocoder patch verification failed
+      condition: B
+      for: 0m
+      labels:
+        project: geoshenanigans
+        severity: critical
+      annotations:
+        summary: Patches from the latest geocoder nightly failed verification.
+        description: >-
+          generate_patches reported variants whose patch failed verification in the latest run.
+          Check the run's "Generate patches and verify" step, its per-variant diff log artifacts
+          and the per-variant result lines in the Geocoder Nightly dashboard's logs panel.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 93600
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              last_over_time(geocoder_patch_verify_variants{project="geoshenanigans", result="fail"}[26h]) > 0
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 93600
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    # Latest run only, as in geoshenanigans-build-failed: a slow retry must not
+    # keep this firing past a quick run after it.
+    - uid: geoshenanigans-build-slow
+      title: Geocoder nightly build took over an hour
+      condition: B
+      for: 0m
+      labels:
+        project: geoshenanigans
+        severity: warning
+      annotations:
+        summary: The latest geocoder nightly took over an hour.
+        description: >-
+          Job start to the report step took more than 1h. Compare the step durations, build
+          phases and peak memory with earlier runs on the Geocoder Nightly dashboard to find
+          the slow step: a slow download or replication apply, or a build phase that regressed.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 93600
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              (last_over_time(geocoder_build_duration_seconds{project="geoshenanigans"}[26h])
+                and on (trigger, runner)
+                topk(1, last_over_time(geocoder_build_last_run_timestamp_seconds{project="geoshenanigans"}[26h])))
+              > 3600
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 93600
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    - uid: geoshenanigans-patch-large
+      title: Geocoder planet patch over 64 MiB
+      condition: B
+      for: 0m
+      labels:
+        project: geoshenanigans
+        severity: warning
+      annotations:
+        summary: The latest planet/full patch is over 64 MiB.
+        description: >-
+          A one-day planet/full patch is normally about 18 MiB. A much larger one means the
+          build lost stable ids or ordering against the previous build (a builder change that
+          broke determinism), or the previous build is more than a day old. Check the run's
+          per-variant diff logs and the data age on the Geocoder Nightly dashboard.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 93600
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              last_over_time(geocoder_patch_bytes{project="geoshenanigans", variant="planet/full"}[26h]) > 67108864
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 93600
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    # tlast_over_time (MetricsQL) is the sample's own timestamp, the push time,
+    # so this is the data's age when the run built it, not now.
+    - uid: geoshenanigans-data-old
+      title: Geocoder nightly built OSM data over 48 hours old
+      condition: B
+      for: 0m
+      labels:
+        project: geoshenanigans
+        severity: warning
+      annotations:
+        summary: The latest geocoder nightly built OSM data more than 48 hours old.
+        description: >-
+          The OSM replication timestamp of the data the latest run built was over 48h old when
+          it reported, so replication diffs are not reaching the build. Check the run's
+          "Download PBF and previous indexes" and "Apply replication diffs" steps.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 93600
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              tlast_over_time(geocoder_build_data_timestamp_seconds{project="geoshenanigans"}[26h])
+              - last_over_time(geocoder_build_data_timestamp_seconds{project="geoshenanigans"}[26h])
+              > 172800
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 93600
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
