@@ -42,7 +42,6 @@ if [ -f "$INDEX_DIR/$SENTINEL" ]; then
 else
     echo "No index data found — downloading from Tigris (quality=$QUALITY, poi=$POI_TIER, minimal=$MINIMAL)..."
     mkdir -p "$INDEX_DIR"
-    apt-get update -qq && apt-get install -y -qq zstd >/dev/null 2>&1 || true
 
     LATEST_JSON=$(curl -sL "$TIGRIS_BASE/latest.json")
     # latest.json is multi-line pretty-printed JSON; flatten with tr
