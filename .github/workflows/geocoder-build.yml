@@ -126,23 +126,29 @@ jobs:
           KEY: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
           SECRET: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
 
-      # The tools compile, and their unit tests run, beside Setup and the
-      # downloads, which don't use them: detached so they outlive this step.
-      # Run builder tests (a step name the watchdog matches) waits for both
-      # before anything uses the tools.
+      # The tools for this builder source, and the libraries it builds against
+      # (build_s2.sh is under geocoder/builder too): a night with no change
+      # there restores them instead of compiling.
+      - name: Restore tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .tools-cache
+          key: tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('geocoder/builder/**') }}
+
+      # The tools compile or come from the cache, and their unit tests run,
+      # beside Setup and the downloads, which don't use them: detached so they
+      # outlive this step. Run builder tests (a step name the watchdog
+      # matches) waits for both before anything uses the tools.
       - name: Build tools
         env:
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
-          mkdir -p geocoder/builder/build
-          cd geocoder/builder/build
-          echo "$PWD" >> "$GITHUB_PATH"
-          # The inner script expands its own arguments.
+          echo "$GITHUB_WORKSPACE/geocoder/builder/build" >> "$GITHUB_PATH"
+          # The inner script expands its own arguments ($0 is the status file).
           # shellcheck disable=SC2016
-          setsid nohup bash -c 'cmake .. -DCMAKE_BUILD_TYPE=Release -DGEOCODER_S2_PREFIX="$1" \
-              && make -j"$(nproc)" build-index geocoder-diff geocoder-patch pbf-apply geocoder-tests \
-              && ./geocoder-tests; echo $? > "$2"' \
-            _ "$GITHUB_WORKSPACE/.s2-prefix" "$RUNNER_TEMP/tools.status" > "$RUNNER_TEMP/tools.log" 2>&1 < /dev/null &
+          setsid nohup bash -c '"$@"; echo $? > "$0"' "$RUNNER_TEMP/tools.status" \
+            geocoder/builder/tools/ci_build_tools.sh geocoder/builder/build .tools-cache "$GITHUB_WORKSPACE/.s2-prefix" \
+            > "$RUNNER_TEMP/tools.log" 2>&1 < /dev/null &
 
       - name: Setup
         id: setup
@@ -480,7 +486,7 @@ jobs:
             tail -20 "$RUNNER_TEMP/tools.log"
             echo "::error::The tool build or its unit tests failed"; exit 1
           fi
-          grep -E "tests passed" "$RUNNER_TEMP/tools.log"
+          grep -E "Tools from the cache|afresh|tests passed" "$RUNNER_TEMP/tools.log"
 
       # ── Apply replication diffs ───────────────────────────────────
       # Skipped when PBF source is already today's data.
