@@ -9,17 +9,14 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-// Byte-source abstraction.  Index files are memory-mapped, so each one
-// is contiguous in process address space regardless of its size.
-// `as_slice()` returns the full contiguous bytes; `read_chunk(off, len)`
-// returns a window of them.
+// Byte-source abstraction.  Index files are memory-mapped; readers go
+// through `read_chunk(off, len)` and `read_at::<T>(idx)`.
 
 use memmap2::Mmap;
 use std::fs::File;
 
 /// Backing storage for an indexed file.  Both variants implement
-/// `as_slice()` for full-file access and `read_chunk(off, len)` for
-/// windowed access, both zero-copy.
+/// `read_chunk(off, len)` for zero-copy windowed access.
 pub enum FileBytes {
     /// Owned bytes resident in process memory.  Used for test data.
     Owned(Vec<u8>),
@@ -38,14 +35,6 @@ impl FileBytes {
     }
 
     pub fn is_empty(&self) -> bool { self.len() == 0 }
-
-    /// Full-file slice access.  Cheap for Owned and Mmap.
-    pub fn as_slice(&self) -> &[u8] {
-        match self {
-            Self::Owned(v) => v,
-            Self::Mmap(m) => m,
-        }
-    }
 
     /// Read `len` bytes starting at `off`.  `len` stays usize because
     /// individual reads are always tiny (max a few KiB of vertices).
@@ -73,37 +62,6 @@ impl FileBytes {
         // `repr(C)` + `Copy`. read_unaligned is safe regardless of
         // source slice alignment.
         unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const T) }
-    }
-
-    /// Read `count` consecutive records of type T starting at record-
-    /// index `idx` as a zero-copy slice view.  Used to materialize a `&[T]` slice
-    /// over a polygon's vertices, a place-node array slice, etc. so
-    /// callers can iterate without manual transmutes per call site.
-    pub fn read_records<T: Copy>(&self, idx: u64, count: usize) -> std::borrow::Cow<'_, [T]> {
-        let size = std::mem::size_of::<T>();
-        let off = idx * size as u64;
-        let total = count * size;
-        match self {
-            Self::Owned(v) => {
-                let ob = off as usize;
-                let bytes = &v[ob..ob + total];
-                std::borrow::Cow::Borrowed(unsafe {
-                    std::slice::from_raw_parts(bytes.as_ptr() as *const T, count)
-                })
-            }
-            Self::Mmap(m) => {
-                let ob = off as usize;
-                let bytes = &m[ob..ob + total];
-                std::borrow::Cow::Borrowed(unsafe {
-                    std::slice::from_raw_parts(bytes.as_ptr() as *const T, count)
-                })
-            }
-        }
-    }
-
-    /// Number of records of type T this file holds.
-    pub fn record_count<T>(&self) -> usize {
-        (self.len() as usize) / std::mem::size_of::<T>()
     }
 }
 
@@ -182,12 +140,6 @@ pub fn decode_polygon_verts<'a>(
     }
 }
 
-// Allow `&self.field[off..end]` indexing on Owned/Mmap-backed sources.
-impl std::ops::Deref for FileBytes {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] { self.as_slice() }
-}
-
 // --- S2 helpers ---
 
 pub const DEFAULT_STREET_CELL_LEVEL: u64 = 17;
@@ -197,11 +149,6 @@ pub const DEFAULT_ADMIN_CELL_LEVEL: u64 = 10;
 // radius inside which we'll accept a street/addr/interp/POI as the
 // primary feature for the reverse result.
 pub const DEFAULT_SEARCH_DISTANCE: f64 = 660.0;
-
-// Matches PoiCategory::UNNAMED_RANK30 in builder/src/types.h — the
-// generic rank-30 amenity/tourism/etc. node emitted for unnamed
-// features that Nominatim still treats as primary-feature candidates.
-pub const POI_CAT_UNNAMED_RANK30: u8 = 170;
 
 // Matches POI_FLAG_HIGHWAY in builder/src/types.h — feature is a
 // highway-class polygon (highway=pedestrian/footway/etc.). Nominatim
@@ -253,21 +200,6 @@ pub struct InterpWay {
     pub interpolation: u8,
 }
 
-/// Vertex encoding tag for delta-quantized polygon storage.  Each
-/// AdminPolygon (and PoiRecord, AddrPoint) carries a per-record
-/// encoding picked by the builder to fit the polygon's bbox at the
-/// finest precision possible.  Reader decodes per-vertex via the
-/// inverse of the tag's scale.
-#[repr(u8)]
-#[allow(non_camel_case_types)]
-pub enum VertexEncoding {
-    U16_1M    = 0,  // u16 @ 1e-5° (1.1 m), fits 73 km × 73 km bbox
-    U16_11M   = 1,  // u16 @ 1e-4° (11 m),  fits 730 km × 730 km
-    U16_011M  = 2,  // u16 @ 1e-6° (11 cm), fits 7.3 km × 7.3 km — POI buildings
-    U32_1CM   = 3,  // u32 @ 1e-7° (1.1 cm), fits any polygon
-    F32       = 4,  // raw f32 lat/lng (legacy / escape hatch)
-}
-
 #[inline]
 pub fn vertex_stride(enc: u8) -> usize {
     match enc {
@@ -290,7 +222,7 @@ pub fn vertex_scale(enc: u8) -> f64 {
 
 /// Per-polygon header at the start of each polygon's vertex slice in
 /// admin_vertices.bin / poi_vertices.bin / addr_vertices.bin:
-///   byte 0     : VertexEncoding tag
+///   byte 0     : vertex encoding tag (VertexEncoding in builder/src/types.h)
 ///   byte 1     : padding
 ///   bytes 2..6 : bbox_min_lat (f32)
 ///   bytes 6..10: bbox_min_lng (f32)
@@ -357,9 +289,6 @@ pub struct PoiRecord {
     pub parent_poly_id: u32,
 }
 
-pub const POI_FLAG_WIKIPEDIA: u8 = 0x01;
-pub const POI_FLAG_WIKIDATA: u8 = 0x02;
-
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PostcodeCentroid {
@@ -403,9 +332,6 @@ pub struct PoiCategoryMeta {
     pub max_distance: f64,
     #[serde(default = "default_importance")]
     pub default_importance: f64,
-    // legacy field, ignored
-    #[serde(default)]
-    pub proximity: f64,
 }
 
 pub fn default_ref_dist() -> f64 { 100.0 }
@@ -1185,9 +1111,8 @@ impl Index {
         Some(ap)
     }
 
-    /// Chunked-aware version of for_each_entry (reads from FileBytes
-    /// instead of &[u8]).  Same wire format: u16 count, then count
-    /// u32 IDs.  Bulk-reads the entries into a Cow once so the inner
+    /// Call `f` for each ID in the cell-entry list at `offset`.  Wire
+    /// format: u16 count, then count u32 IDs.  Bulk-reads the entries into a Cow once so the inner
     /// loop doesn't pay per-id chunk-fetch overhead.
     pub fn for_each_entry_fb(entries: &FileBytes, offset: u32, mut f: impl FnMut(u32)) {
         if offset == NO_DATA { return; }
@@ -1224,8 +1149,7 @@ impl Index {
     }
 
     // geo_cells is a 20-byte-stride sorted index — binary search it
-    // with read_chunk.  Chunked-aware twin of
-    // `lookup_geo_cell` (which reads from a resident &[u8]).
+    // with read_chunk.
     pub fn lookup_geo_cell_fb(geo_cells: &FileBytes, target: u64) -> GeoCellOffsets {
         let entry_size: u64 = 20;
         let count = geo_cells.len() / entry_size;

@@ -269,12 +269,10 @@ fn decode_hash_write(
 
 #[derive(Debug, Clone, Default)]
 pub struct DownloadProgress {
-    pub region: String,
     pub files_done: usize,
     pub files_total: usize,
     pub bytes_done: u64,
     pub bytes_total: u64,
-    pub current_file: Option<String>,
 }
 
 /// Resolve and download every file for a single region. Files that
@@ -284,7 +282,7 @@ pub struct DownloadProgress {
 /// complete sha256 check happens on first download).
 ///
 /// `progress` fires after each file completes with the running total;
-/// the request handler uses it to surface "downloading 3/35" responses.
+/// the caller logs it.
 pub async fn download_region(
     client: &reqwest::Client,
     base_url: &str,
@@ -308,7 +306,6 @@ pub async fn download_region(
     let files_total = paths.len();
 
     progress(DownloadProgress {
-        region: sel.region.clone(),
         files_total,
         bytes_total,
         ..Default::default()
@@ -352,12 +349,10 @@ pub async fn download_region(
 
         bytes_done = bytes_done.saturating_add(entry.size_zst);
         progress(DownloadProgress {
-            region: sel.region.clone(),
             files_done: i + 1,
             files_total,
             bytes_done,
             bytes_total,
-            current_file: Some((*path).clone()),
         });
     }
 
@@ -398,8 +393,6 @@ mod tests {
         assert_eq!(std::fs::read(&tmp).unwrap(), raw);
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-    use super::*;
 
     fn component(files: &[&str], replaces: &[&str], extends: Option<&str>) -> Component {
         Component {

@@ -1,12 +1,12 @@
-// Region state coordinator: holds the current Immich-supplied
+// Region state coordinator: holds the current admin-supplied
 // configuration, the cached configurations.json from the build, and
 // the per-region download mutexes. Triggers downloads, installs
 // completed regions into the live MultiIndex via arc-swap.
 //
 // Two flows feed this:
 //
-// 1. Configuration push (from Immich): full snapshot of what regions
-//    the user wants, plus mode/quality/poi_tier. Server preloads
+// 1. Configuration push (PUT /admin/configuration): full snapshot of what
+//    regions the user wants, plus mode/quality/poi_tier. Server preloads
 //    regions in the snapshot that aren't already on disk.
 //
 // 2. Lazy on-demand: a /reverse request lands on a continent we don't
@@ -89,7 +89,7 @@ impl RegionState {
     pub fn new(multi_index: Arc<MultiIndex>, root_dir: PathBuf) -> Self {
         let config_path = root_dir.join("configuration.json");
         // Load persisted configuration if present; new deployments
-        // start from defaults until Immich pushes one.
+        // start from defaults until one is PUT to /admin/configuration.
         let config = match std::fs::read_to_string(&config_path) {
             Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
             Err(_) => Configuration::default(),

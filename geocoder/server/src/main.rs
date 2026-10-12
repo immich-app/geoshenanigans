@@ -265,8 +265,6 @@ async fn polygons_geojson(
     let lat = params.lat;
     let lng = params.lon;
 
-    const ID_MASK: u32 = 0x7FFFFFFF;
-
     let mut features: Vec<serde_json::Value> = Vec::new();
 
     // Iterate every loaded continent whose bbox covers the query.
@@ -407,7 +405,7 @@ async fn async_main() {
 
     // On startup, kick off any preload downloads from the persisted
     // configuration. Skipped silently if there's no persisted file —
-    // server starts empty and waits for an Immich PUT.
+    // server starts empty and waits for a PUT /admin/configuration.
     {
         let s = region_state.clone();
         let cfg = s.get_configuration().await;

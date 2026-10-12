@@ -319,7 +319,6 @@ async fn dashboard(
     };
 
     let html = DASHBOARD_HTML
-        .replace("{user}", &html_escape(&login))
         .replace("{rows}", &rows)
         .replace("{user_rows}", &user_rows)
         .replace("{daily_usage}", &daily_usage.to_string())
