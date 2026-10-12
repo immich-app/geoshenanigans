@@ -154,25 +154,6 @@ constexpr const char* GEO_ENTRY_FILENAMES[GEO_TABLE_COUNT] = {
     "street_entries.bin", "addr_entries.bin", "interp_entries.bin"};
 using GeoTables = std::array<const std::vector<CellItemPair>*, GEO_TABLE_COUNT>;
 
-// A cell map as a cell-grouped table: cells ascending, each cell's items in
-// its list's order (the order its entry lists them in).
-inline std::vector<CellItemPair> pairs_in_list_order(
-    const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map) {
-    std::vector<uint64_t> cells;
-    cells.reserve(cell_map.size());
-    size_t total = 0;
-    for (const auto& [cell_id, ids] : cell_map) {
-        cells.push_back(cell_id);
-        total += ids.size();
-    }
-    std::sort(cells.begin(), cells.end());
-    std::vector<CellItemPair> pairs;
-    pairs.reserve(total);
-    for (uint64_t cell_id : cells)
-        for (uint32_t id : cell_map.at(cell_id)) pairs.push_back({cell_id, id});
-    return pairs;
-}
-
 // Writes a mode's geo index into dir: geo_cells.bin has one row per cell any
 // table has items in, ascending: the cell id, then per table the byte offset
 // of the cell's entry (uint16 count, then its items in table order) in that

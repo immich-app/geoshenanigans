@@ -46,7 +46,6 @@
 #include "ring_assembly.h"
 #include "continent_boundaries.h"
 #include "interpolation.h"
-#include "cache.h"
 #include "continent_filter.h"
 #include "cell_index.h"
 #include "parent_linking.h"
@@ -680,8 +679,7 @@ static void compute_way_parent_polygons(ParsedData& data, const BuildConfig& cfg
 
 // Shared nearest-named-street sweep used by the addr backfill and the POI
 // parent-street pass: expand a 5x5 ring of street-level cells around the
-// point's cell — cell_to_ways is empty at this point (parallel_sort_and_build
-// skips the hash map), so binary-search sorted_way_cells instead — then visit
+// point's cell — binary-searching sorted_way_cells — then visit
 // the named streets listed there, each once, nearest first by the smallest
 // local-flat point-to-segment distance-squared over its segments. Callers
 // keep their own best-candidate selection, including the deterministic osm_id
@@ -1018,7 +1016,7 @@ static void emit_polyline_cells(const NodeCoord* nodes, uint16_t count, uint32_t
 // merges them straight into sorted_out on every core, with no concatenated
 // copy and no scratch table. Pairs equal under cell_item_less are equal in
 // both fields, so the order is unique. sorted_out is used directly for
-// writing; the cell maps stay empty (only needed for cache/continent modes).
+// writing.
 static void sort_pair_lists(std::vector<std::vector<CellItemPair>>& thread_pairs) {
     parallel_for_each(thread_pairs.size(), [&](size_t t, unsigned) {
         std::sort(thread_pairs[t].begin(), thread_pairs[t].end(), cell_item_less);
@@ -1669,43 +1667,6 @@ static void compute_s2_and_poi_cells(ParsedData& data, const BuildConfig& cfg,
 
         std::cerr << "S2 cell computation complete." << std::endl;
     }
-}
-
-// Rebuild cell->item hash maps from the sorted pairs (cache-save path only).
-static void rebuild_cell_maps_for_cache(ParsedData& data,
-                std::chrono::steady_clock::time_point& _pt, CpuTicks& _cpu) {
-    // Parallel rebuild: split sorted pairs into chunks, each thread builds
-    // a partial map, then merge. Sorted pairs are grouped by cell_id so we
-    // can split at cell boundaries for zero-conflict parallel insertion.
-    auto rebuild_map_parallel = [](const std::vector<CellItemPair>& sorted,
-                                    std::unordered_map<uint64_t, std::vector<uint32_t>>& map) {
-        if (sorted.empty() || !map.empty()) return;
-        // Each worker builds its own sub-map over whole cells
-        std::vector<std::unordered_map<uint64_t, std::vector<uint32_t>>> sub_maps(parallel_threads());
-        parallel_for_runs(sorted.size(), same_cell(sorted), [&](size_t begin, size_t end, unsigned w) {
-            auto& sub = sub_maps[w];
-            sub.reserve((end - begin) / 3); // rough estimate of unique cells
-            for (size_t i = begin; i < end; i++) {
-                sub[sorted[i].cell_id].push_back(sorted[i].item_id);
-            }
-        });
-
-        // Merge sub-maps into main map (no conflicts since splits are at cell boundaries)
-        size_t total_cells = 0;
-        for (auto& sub : sub_maps) total_cells += sub.size();
-        map.reserve(total_cells);
-        for (auto& sub : sub_maps) {
-            for (auto& [k, v] : sub) {
-                map[k] = std::move(v);
-            }
-        }
-    };
-
-    std::cerr << "Rebuilding cell maps for continent filtering..." << std::endl;
-    auto f1 = std::async(std::launch::async, [&]{ rebuild_map_parallel(data.sorted_way_cells, data.cell_to_ways); });
-    auto f2 = std::async(std::launch::async, [&]{ rebuild_map_parallel(data.sorted_interp_cells, data.cell_to_interps); });
-    f1.get(); f2.get();
-    log_phase("Rebuild cell maps", _pt, _cpu);
 }
 
 // Runs fn(ids) on every cell's list in cell_to_admin, lists spread over the
@@ -2562,14 +2523,11 @@ static std::pair<size_t, std::future<void>> grow_beside(std::vector<T>& out, con
 static int run(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [options]" << std::endl;
-        std::cerr << "       build-index <output-dir> --load-cache <path> [options]" << std::endl;
         std::cerr << std::endl;
         std::cerr << "Options:" << std::endl;
         std::cerr << "  --street-level N       S2 cell level for streets (default: 17)" << std::endl;
         std::cerr << "  --admin-level N        S2 cell level for admin (default: 10)" << std::endl;
         std::cerr << "  --max-admin-level N    Only include admin levels <= N" << std::endl;
-        std::cerr << "  --save-cache <path>    Save parsed data to cache file" << std::endl;
-        std::cerr << "  --load-cache <path>    Load from cache instead of PBF" << std::endl;
         std::cerr << "  --multi-output         Write full, no-addresses, admin-only indexes" << std::endl;
         std::cerr << "  --continents           Also generate per-continent indexes" << std::endl;
         std::cerr << "  --mode <mode>          Index mode: full, no-addresses, admin-only (default: full)" << std::endl;
@@ -2588,8 +2546,6 @@ static int run(int argc, char* argv[]) {
 
     std::string output_dir = argv[1];
     std::vector<std::string> input_files;
-    std::string save_cache_path;
-    std::string load_cache_path;
     std::string wikidata_sitelinks_path;
     std::string tiger_data_path;
     std::string external_postcodes_path;
@@ -2621,10 +2577,6 @@ static int run(int argc, char* argv[]) {
             mode = IndexMode::NoAddresses;
         } else if (arg == "--max-admin-level" && i + 1 < argc) {
             kMaxAdminLevel = std::atoi(argv[++i]);
-        } else if (arg == "--save-cache" && i + 1 < argc) {
-            save_cache_path = argv[++i];
-        } else if (arg == "--load-cache" && i + 1 < argc) {
-            load_cache_path = argv[++i];
         } else if (arg == "--multi-output") {
             multi_output = true;
         } else if (arg == "--continents") {
@@ -2762,16 +2714,10 @@ static int run(int argc, char* argv[]) {
 
     unsigned int num_threads = std::max(1u, std::thread::hardware_concurrency() - 1);
     BuildConfig cfg{num_threads, mode, multi_output, multi_quality, output_dir, prev_output_dir};
-    if (!load_cache_path.empty()) {
-        // Load from cache
-        if (!deserialize_cache(data, load_cache_path)) {
-            std::cerr << "Error: failed to load cache" << std::endl;
-            return 1;
-        }
-    } else {
+    {
         // Parse PBF files (always collect everything)
         if (input_files.empty()) {
-            std::cerr << "Error: no input files specified and no --load-cache" << std::endl;
+            std::cerr << "Error: no input files specified" << std::endl;
             return 1;
         }
 
@@ -4804,7 +4750,6 @@ static int run(int argc, char* argv[]) {
         log_mem("data.street_nodes",                 vec_bytes(data.street_nodes));
         log_mem("data.way_parent_ids",               vec_bytes(data.way_parent_ids));
         log_mem("data.way_postcode_ids",             vec_bytes(data.way_postcode_ids));
-        log_mem("data.cell_to_ways (approx)",        map_bytes_approx(data.cell_to_ways));
         log_mem("data.addr_points",                  vec_bytes(data.addr_points));
         log_mem("data.addr_osm_ids",                 vec_bytes(data.addr_osm_ids));
         log_mem("data.addr_vertices",                vec_bytes(data.addr_vertices));
@@ -4967,16 +4912,6 @@ static int run(int argc, char* argv[]) {
             deduplicate(data.cell_to_admin);
             log_phase("    Dedup: admin cells", _dt, _dc);
         }
-
-        // Save cache if requested
-        if (!save_cache_path.empty()) {
-            serialize_cache(data, save_cache_path);
-        }
-    }
-
-    // --- Rebuild hash maps from sorted pairs if needed for cache saving ---
-    if (!save_cache_path.empty()) {
-        rebuild_cell_maps_for_cache(data, _pt, _cpu);
     }
 
     // --- Deterministic ordering ---

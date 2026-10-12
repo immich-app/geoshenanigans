@@ -108,14 +108,6 @@ TEST(write_geo_index_rejects_a_cell_past_the_count_limit_before_writing) {
     CHECK(!std::ifstream(dir.path() + "/geo_cells.bin").good());
 }
 
-TEST(pairs_in_list_order_keeps_each_lists_order) {
-    std::unordered_map<uint64_t, std::vector<uint32_t>> map{{9, {5, 1}}, {2, {7}}, {4, {3, 3, 0}}};
-    std::vector<CellItemPair> pairs = pairs_in_list_order(map);
-    std::vector<std::pair<uint64_t, uint32_t>> got;
-    for (const auto& p : pairs) got.push_back({p.cell_id, p.item_id});
-    CHECK((got == std::vector<std::pair<uint64_t, uint32_t>>{{2, 7}, {4, 3}, {4, 3}, {4, 0}, {9, 5}, {9, 1}}));
-}
-
 TEST(write_cell_index_sorted_matches_the_map_writer) {
     ScratchDir dir("gctest-cellio");
     std::mt19937_64 rng(4);

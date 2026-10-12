@@ -299,7 +299,6 @@ inline void reorder_addr_points(ParsedData& data) {
             p.item_id = dedup_remap[old_to_new[p.item_id]];
         auto cmp = cell_item_less;
         std::sort(data.sorted_addr_cells.begin(), data.sorted_addr_cells.end(), cmp);
-        data.cell_to_addrs.clear();
         std::cerr << "  Addr points sorted: " << n << std::endl;
     }
 }
@@ -393,7 +392,6 @@ inline void reorder_ways(ParsedData& data) {
         for (auto& p : data.sorted_way_cells) p.item_id = old_to_new[p.item_id];
         auto cmp = cell_item_less;
         std::sort(data.sorted_way_cells.begin(), data.sorted_way_cells.end(), cmp);
-        data.cell_to_ways.clear();
         // Remap way_parent_ids + way_postcode_ids: reorder + dedup
         auto remap_way_vec = [&](std::vector<uint32_t>& vec) {
             if (vec.size() != n) return;
@@ -522,7 +520,6 @@ inline void reorder_interps(ParsedData& data) {
                             return a.cell_id == b.cell_id && a.item_id == b.item_id;
                         }),
             data.sorted_interp_cells.end());
-        data.cell_to_interps.clear();
         std::cerr << "  Interps sorted: " << data.interp_ways.size()
                   << " (" << interp_deduped << " duplicates removed)" << std::endl;
     }

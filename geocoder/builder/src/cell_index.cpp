@@ -68,7 +68,7 @@ static std::string dir_label(const std::string& dir) {
 // Loads <prev_dir>/full/street_ways.osm_ids (if it exists), allocates
 // a new idx for each current way preferring the previous build's slot,
 // reorders data.ways + parallel arrays, applies the resulting old→new
-// remap to every reference site (cell_to_ways, sorted_way_cells,
+// remap to every reference site (sorted_way_cells,
 // addr_points.parent_way_id, poi_records.parent_street_id), and stores
 // the new sidecar bytes on data.way_sidecar_blob for write_index to emit.
 //
@@ -169,7 +169,6 @@ static std::vector<uint32_t> apply_strategy2_streets(ParsedData& data, const std
     repack_nodes(data.ways, data.street_nodes);
 
     // Apply remap to every reference site that points into ways[].
-    remap_cell_map(data.cell_to_ways, [&](uint32_t& v) { remap_index(v, remap); });
     remap_cell_pairs(data.sorted_way_cells, [&](uint32_t& v) { remap_index(v, remap); });
     // NOTE: PoiRecord::parent_street_id is NOT a way index — it holds the
     // string offset of the nearest street's name (w.name_id, set at
@@ -258,7 +257,6 @@ static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir
 // Stable identity comes pre-packed in data.addr_osm_ids: top 8 bits
 // = ObjectType (NODE / WAY / SYNTHETIC), bottom 56 bits = the id.
 // Reference sites updated:
-//   - data.cell_to_addrs (map values)
 //   - data.sorted_addr_cells (item_id)
 //   - data.addr_postcode_ids (parallel array — reorder)
 // addr_vertices.bin is keyed by byte offset, not idx, so no remap.
@@ -292,7 +290,6 @@ static void apply_strategy2_addrs(ParsedData& data, const std::string& prev_dir)
     reorder_by_remap(data.addr_osm_ids, remap, n_new, uint64_t(0));
     if (!data.addr_postcode_ids.empty()) reorder_by_remap(data.addr_postcode_ids, remap, n_new, NO_DATA);
 
-    remap_cell_map(data.cell_to_addrs, [&](uint32_t& v) { remap_index(v, remap); });
     remap_cell_pairs(data.sorted_addr_cells, [&](uint32_t& v) { remap_index(v, remap); });
 
     finalize_strategy2(alloc, n_new, n_old, data.addr_sidecar_blob, "addrs", /*no_shifts=*/false);
@@ -388,7 +385,7 @@ static void apply_strategy2_pois(ParsedData& data, const std::string& prev_dir) 
 }
 
 // Strategy-2 stable IDs for interp_ways.
-// References: data.cell_to_interps + data.sorted_interp_cells.
+// References: data.sorted_interp_cells.
 static void apply_strategy2_interps(ParsedData& data, const std::string& prev_dir) {
     using namespace gc::id_alloc;
     if (data.interp_ways.empty()) return;
@@ -430,7 +427,6 @@ static void apply_strategy2_interps(ParsedData& data, const std::string& prev_di
     // byte 0.
     repack_nodes(data.interp_ways, data.interp_nodes);
 
-    remap_cell_map(data.cell_to_interps, [&](uint32_t& v) { remap_index(v, remap); });
     remap_cell_pairs(data.sorted_interp_cells, [&](uint32_t& v) { remap_index(v, remap); });
 
     finalize_strategy2(alloc, n_new, n_old, data.interp_sidecar_blob, "interps", /*no_shifts=*/false);
@@ -1034,18 +1030,10 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
 
     // The geo index goes last, beside the files above.
     if (write_streets) {
-        // The cell maps stand in for tables a cache load left empty.
-        std::array<std::vector<CellItemPair>, GEO_TABLE_COUNT> from_maps;
-        auto table = [&](size_t t, const std::vector<CellItemPair>& sorted,
-                         const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map) {
-            if (!sorted.empty() || cell_map.empty()) return &sorted;
-            from_maps[t] = pairs_in_list_order(cell_map);
-            return static_cast<const std::vector<CellItemPair>*>(&from_maps[t]);
-        };
-        GeoTables tables{table(0, data.sorted_way_cells, data.cell_to_ways), nullptr, nullptr};
+        GeoTables tables{&data.sorted_way_cells, nullptr, nullptr};
         if (write_addresses) {
-            tables[1] = table(1, data.sorted_addr_cells, data.cell_to_addrs);
-            tables[2] = table(2, data.sorted_interp_cells, data.cell_to_interps);
+            tables[1] = &data.sorted_addr_cells;
+            tables[2] = &data.sorted_interp_cells;
         }
         size_t cells = write_geo_index(output_dir, tables);
         std::cerr << "geo index: " << cells << " cells ("

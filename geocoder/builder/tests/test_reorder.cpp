@@ -86,7 +86,6 @@ void fill_records(ParsedData& d, std::vector<float>& elevations, std::vector<uin
         if (s.side_arrays) d.addr_postcode_ids.push_back(small_id(r, 5));
     }
     d.sorted_addr_cells = new_cell_pairs(r, n, static_cast<uint32_t>(n), false);
-    d.cell_to_addrs[1] = {1, 2, 3};
 
     for (uint32_t i = 0; i < n_ways; i++) {
         WayHeader w{};
@@ -229,7 +228,6 @@ void check_same_records(const ParsedData& a, const ParsedData& b) {
     CHECK(same_bytes(a.addr_postcode_ids, b.addr_postcode_ids));
     CHECK(same_bytes(a.addr_vertices, b.addr_vertices));
     CHECK(same_pairs(a.sorted_addr_cells, b.sorted_addr_cells));
-    CHECK_EQ(a.cell_to_addrs.size(), b.cell_to_addrs.size());
     CHECK(same_bytes(a.ways, b.ways));
     CHECK(same_bytes(a.way_osm_ids, b.way_osm_ids));
     CHECK(same_bytes(a.street_nodes, b.street_nodes));

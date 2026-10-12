@@ -288,7 +288,6 @@ struct ParsedData {
     // internal table with no copy. write_index emits this directly.
     std::vector<gc::id_alloc::SidecarSlot> way_sidecar_blob;
     std::vector<NodeCoord> street_nodes;
-    std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_ways;
     std::vector<AddrPoint> addr_points;
     // Parallel to addr_points. Packed: top 8 bits = ObjectType
     // (OSM_NODE for node-sourced, OSM_WAY for closed-way buildings,
@@ -297,9 +296,8 @@ struct ParsedData {
     std::vector<uint64_t> addr_osm_ids;
     std::vector<NodeCoord> addr_vertices;  // polygon vertices for building addr_points
     // Street cell of each addr point, parallel to addr_points until a parse
-    // turns it into sorted_addr_cells. Only a cache load fills cell_to_addrs.
+    // turns it into sorted_addr_cells.
     std::vector<uint64_t> addr_cells;
-    std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_addrs;
     std::vector<InterpWay> interp_ways;
     // Parallel to interp_ways: packed (OSM_WAY, osm_way_id).
     std::vector<uint64_t> interp_osm_ids;
@@ -309,7 +307,6 @@ struct ParsedData {
     // not written. Mirrors Nominatim's location_property_tiger.postcode.
     std::vector<uint32_t> interp_postcode_ids;
     std::vector<NodeCoord> interp_nodes;
-    std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_interps;
     std::vector<AdminPolygon> admin_polygons;
     // Parallel to admin_polygons. Packed (ObjectType<<56 | 56-bit id):
     // OSM_RELATION + (relation_id<<16 | ring_index) for relation-sourced
