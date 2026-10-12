@@ -1,4 +1,3 @@
 build/
 target/
-test-output/
 *.osm.pbf

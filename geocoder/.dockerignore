@@ -1,6 +1,3 @@
 build/
-target/
 server/target/
-test-output/
 *.osm.pbf
-.git/
