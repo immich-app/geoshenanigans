@@ -1,0 +1,113 @@
+---
+# Validates the o11y/ bundle on PRs and publishes it from main as a signed OCI
+# artifact (ghcr.io/immich-app/geoshenanigans/o11y-manifests:main) that the o11y
+# clusters consume with a Flux OCIRepository. See o11y/README.md.
+name: o11y
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'o11y/**'
+      - '.github/workflows/o11y.yml'
+      - '.mise/config.toml'
+      - '.mise/config.o11y.toml'
+      - '.mise/mise.o11y.lock'
+  pull_request:
+    paths:
+      - 'o11y/**'
+      - '.github/workflows/o11y.yml'
+      - '.mise/config.toml'
+      - '.mise/config.o11y.toml'
+      - '.mise/mise.o11y.lock'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Publishes run one at a time, so :main moves in commit order.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}/o11y-manifests
+  MISE_AUTO_INSTALL: 'false'
+  # Loads .mise/config.o11y.toml (the bundle's tools and o11y:render) and its
+  # lock, .mise/mise.o11y.lock.
+  MISE_ENV: o11y
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # jdx/mise-action directly, not immich-app/devtools/actions/use-mise: that
+      # one caches, and zizmor's cache-poisoning audit flags a cache in a
+      # workflow that publishes.
+      - name: Set up mise
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          version: 2026.9.12
+          install_args: --locked jq yq kustomize kubeconform
+          cache: false
+
+      - name: Render and check the bundle
+        run: mise run o11y:render
+
+  push:
+    name: Publish
+    needs: validate
+    # Only main may publish and sign; keeps workflow_dispatch on another branch
+    # from minting a tag (e.g. a branch named "latest").
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push the o11y-manifests artifact to GHCR
+      id-token: write # keyless cosign signing (Fulcio certificate from the GitHub OIDC token)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up mise
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          version: 2026.9.12
+          install_args: --locked jq yq kustomize kubeconform flux2 github:sigstore/cosign
+          cache: false
+
+      - name: Render
+        run: mise run o11y:render
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Keyless: cosign gets a Fulcio certificate for this workflow's OIDC
+      # identity (.../.github/workflows/o11y.yml@refs/heads/main), which is
+      # exactly what o11y's OCIRepository verify.matchOIDCIdentity pins.
+      # Pushed under the commit's own tag and signed there; :main, the tag
+      # o11y verifies and applies, moves to it only once signed, so a failed
+      # signing leaves :main on the last signed bundle.
+      - name: Push and sign
+        run: |
+          set -euo pipefail
+          digest_url=$(flux push artifact "oci://${IMAGE}:${GITHUB_SHA}" \
+            --path=build/o11y \
+            --source="https://github.com/${GITHUB_REPOSITORY}" \
+            --revision="${GITHUB_REF_NAME}@sha1:${GITHUB_SHA}" \
+            --output json | jq -r '.repository + "@" + .digest')
+          cosign sign --yes "${digest_url}"
+          flux tag artifact "oci://${IMAGE}:${GITHUB_SHA}" --tag "${GITHUB_REF_NAME}"
