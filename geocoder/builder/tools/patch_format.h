@@ -59,48 +59,34 @@ inline void unmap_file(MappedFileRW& f) {
     if (f.data) { munmap(f.data, f.size); f.data = nullptr; f.size = 0; }
 }
 
-// Detect stride from file size (avoids loading entire file)
-inline size_t detect_stride_from_file(const std::string& path, const size_t* candidates, size_t n) {
-    struct stat st;
-    if (stat(path.c_str(), &st) != 0) return candidates[0];
-    size_t sz = st.st_size;
-    for (size_t i = 0; i < n; i++)
-        if (sz % candidates[i] == 0 && sz / candidates[i] > 0) return candidates[i];
-    return candidates[0];
-}
-inline size_t detect_stride_from_file(const std::string& path, std::initializer_list<size_t> candidates) {
-    return detect_stride_from_file(path, candidates.begin(), candidates.size());
-}
-
 // --- Binary record layouts (must match types.h and server) ---
 
-// name_id byte offset within a street WayHeader record. The builder writes
-// the padded layout (stride 12, name_id at 8); legacy builds wrote it packed
-// (stride 9, name_id at 5). Pick by the detected stride.
-static constexpr size_t WAY_HEADER_NAME_ID_OFF_PADDED = 8;
-static constexpr size_t WAY_HEADER_NAME_ID_OFF_PACKED = 5;
-static constexpr size_t WAY_HEADER_STRIDE_PACKED = 9;
+// Strides of the record files the patch merges record by record.
+static constexpr size_t WAY_HEADER_STRIDE = 12;
+static constexpr size_t ADDR_POINT_STRIDE = 28;
+static constexpr size_t INTERP_WAY_STRIDE = 24;
+static constexpr size_t ADMIN_POLYGON_STRIDE = 24;
+static constexpr size_t POI_RECORD_STRIDE = 36;
+static constexpr size_t PLACE_NODE_STRIDE = 20;
+
+// name_id byte offset within a street WayHeader record.
+static constexpr size_t WAY_HEADER_NAME_ID_OFF = 8;
 
 // Byte offsets within an AddrPoint record (used by the patch tool's per-record
 // remap/fixup passes). housenumber_id/street_id are string-pool offsets;
-// parent_way_id is a WAY id (street id-space), NOT a string offset; the
-// vertex_offset (polygon footprint) lives after the record's 20 fixed bytes.
+// parent_way_id is a WAY id (street id-space), NOT a string offset;
+// vertex_offset points at the polygon footprint.
 static constexpr size_t ADDR_POINT_HOUSENUMBER_ID_OFF = 8;
 static constexpr size_t ADDR_POINT_STREET_ID_OFF = 12;
 static constexpr size_t ADDR_POINT_PARENT_WAY_ID_OFF = 16;
 static constexpr size_t ADDR_POINT_VERTEX_OFFSET_OFF = 20;
 
-// street_id byte offset within an InterpWay record. node_count is followed by
-// padding at stride>=20 (street_id at 8) or no padding at stride 18
-// (street_id at 5).
-static constexpr size_t INTERP_WAY_STREET_ID_OFF_PADDED = 8;
-static constexpr size_t INTERP_WAY_STREET_ID_OFF_PACKED = 5;
-static constexpr size_t INTERP_WAY_STRIDE_PACKED = 18;
+// street_id byte offset within an InterpWay record (after node_count and
+// its padding).
+static constexpr size_t INTERP_WAY_STREET_ID_OFF = 8;
 
-// node_count of a WayHeader / InterpWay record: u16 at byte 4 in the padded
-// layouts the builder writes, u8 in the legacy packed layouts (stride 9 / 18).
-inline uint32_t record_node_count(const char* rec, size_t stride, size_t packed_stride) {
-    if (stride == packed_stride) return static_cast<uint8_t>(rec[4]);
+// node_count of a WayHeader / InterpWay record: u16 at byte 4.
+inline uint32_t record_node_count(const char* rec) {
     uint16_t n;
     memcpy(&n, rec + 4, 2);
     return n;
@@ -109,23 +95,19 @@ inline uint32_t record_node_count(const char* rec, size_t stride, size_t packed_
 // name_id byte offset within an AdminPolygon record (string-pool offset).
 static constexpr size_t ADMIN_POLYGON_NAME_ID_OFF = 8;
 
-// Byte offsets within a PoiRecord, keyed off the on-disk stride (which grew
-// across build versions). vertex_offset is the fixup target. name_id /
-// parent_street_id / parent_postcode_id are string-pool offsets; parent_poly_id
-// is an admin polygon index (admin id-space).
-//   stride 24: lat,lng,vertex_offset,vertex_count,name_id,4×u8
-//   stride 28: + parent_street_id at 24
-//   stride 32: + parent_postcode_id at 28
-//   stride 36: + parent_poly_id at 32
+// Byte offsets within a PoiRecord (lat, lng, vertex_offset, vertex_count,
+// name_id, 4×u8, parent_street_id, parent_postcode_id, parent_poly_id).
+// vertex_offset is the fixup target. name_id / parent_street_id /
+// parent_postcode_id are string-pool offsets; parent_poly_id is an admin
+// polygon index (admin id-space).
 static constexpr size_t POI_RECORD_VERTEX_OFFSET_OFF = 8;
 static constexpr size_t POI_RECORD_NAME_ID_OFF = 16;
 static constexpr size_t POI_RECORD_PARENT_STREET_ID_OFF = 24;
 static constexpr size_t POI_RECORD_PARENT_POSTCODE_ID_OFF = 28;
 static constexpr size_t POI_RECORD_PARENT_POLY_ID_OFF = 32;
 
-// PlaceNode byte offsets, parsed by stride.
-// name_id is a string-pool offset; parent_poly_id (present at stride>=20) is an
-// admin polygon index.
+// PlaceNode byte offsets. name_id is a string-pool offset; parent_poly_id is
+// an admin polygon index.
 static constexpr size_t PLACE_NODE_NAME_ID_OFF = 8;
 static constexpr size_t PLACE_NODE_PARENT_POLY_ID_OFF = 16;
 
@@ -254,23 +236,17 @@ static const char* patch_file_names[] = {
 };
 
 // The string offset fields of a record file the patch merges, as byte
-// offsets in a record of the given stride; empty for files without any.
+// offsets in its record; empty for files without any.
 // AddrPoint byte 16 is parent_way_id, a way id, not a string offset.
-inline std::vector<size_t> string_field_offsets(PatchFileId fid, size_t stride) {
+inline std::vector<size_t> string_field_offsets(PatchFileId fid) {
     switch (fid) {
     case PatchFileId::ADDR_POINTS: return {ADDR_POINT_HOUSENUMBER_ID_OFF, ADDR_POINT_STREET_ID_OFF};
-    case PatchFileId::STREET_WAYS:
-        return {stride == 12 ? WAY_HEADER_NAME_ID_OFF_PADDED : WAY_HEADER_NAME_ID_OFF_PACKED};
-    case PatchFileId::INTERP_WAYS:
-        return {stride >= 20 ? INTERP_WAY_STREET_ID_OFF_PADDED : INTERP_WAY_STREET_ID_OFF_PACKED};
+    case PatchFileId::STREET_WAYS: return {WAY_HEADER_NAME_ID_OFF};
+    case PatchFileId::INTERP_WAYS: return {INTERP_WAY_STREET_ID_OFF};
     case PatchFileId::ADMIN_POLYGONS:
     case PatchFileId::POSTAL_POLYGONS: return {ADMIN_POLYGON_NAME_ID_OFF};
-    case PatchFileId::POI_RECORDS: {
-        std::vector<size_t> offs = {POI_RECORD_NAME_ID_OFF};
-        if (stride >= 28) offs.push_back(POI_RECORD_PARENT_STREET_ID_OFF);
-        if (stride >= 32) offs.push_back(POI_RECORD_PARENT_POSTCODE_ID_OFF);
-        return offs;
-    }
+    case PatchFileId::POI_RECORDS:
+        return {POI_RECORD_NAME_ID_OFF, POI_RECORD_PARENT_STREET_ID_OFF, POI_RECORD_PARENT_POSTCODE_ID_OFF};
     case PatchFileId::PLACE_NODES: return {PLACE_NODE_NAME_ID_OFF};
     default: return {};
     }
@@ -291,28 +267,22 @@ static constexpr SparseDeltaFile SPARSE_DELTA_FILES[] = {
 };
 static constexpr size_t POSTCODE_CENTROID_POSTCODE_ID_OFF = 8;
 
-// The record files with string fields (string_field_offsets), each with the
-// file its stride is detected from and the candidate strides, the way the
-// diff detects them for the sections it writes. Postal polygons are admin
-// polygons of admin_level 11, at the admin stride.
+// The record files with string fields (string_field_offsets) and their
+// strides. Postal polygons are admin polygons of admin_level 11, at the admin
+// stride.
 struct StringRecordFile {
-    PatchFileId fid, stride_from;
-    size_t strides[4];
-    size_t n_strides;
+    PatchFileId fid;
+    size_t stride;
 };
 static constexpr StringRecordFile STRING_RECORD_FILES[] = {
-    {PatchFileId::ADDR_POINTS, PatchFileId::ADDR_POINTS, {28, 20, 16}, 3},
-    {PatchFileId::STREET_WAYS, PatchFileId::STREET_WAYS, {12, 9}, 2},
-    {PatchFileId::INTERP_WAYS, PatchFileId::INTERP_WAYS, {24, 20, 18}, 3},
-    {PatchFileId::ADMIN_POLYGONS, PatchFileId::ADMIN_POLYGONS, {24, 20, 19}, 3},
-    {PatchFileId::POSTAL_POLYGONS, PatchFileId::ADMIN_POLYGONS, {24, 20, 19}, 3},
-    {PatchFileId::POI_RECORDS, PatchFileId::POI_RECORDS, {36, 32, 28, 24}, 4},
-    {PatchFileId::PLACE_NODES, PatchFileId::PLACE_NODES, {20, 16}, 2},
+    {PatchFileId::ADDR_POINTS, ADDR_POINT_STRIDE},
+    {PatchFileId::STREET_WAYS, WAY_HEADER_STRIDE},
+    {PatchFileId::INTERP_WAYS, INTERP_WAY_STRIDE},
+    {PatchFileId::ADMIN_POLYGONS, ADMIN_POLYGON_STRIDE},
+    {PatchFileId::POSTAL_POLYGONS, ADMIN_POLYGON_STRIDE},
+    {PatchFileId::POI_RECORDS, POI_RECORD_STRIDE},
+    {PatchFileId::PLACE_NODES, PLACE_NODE_STRIDE},
 };
-
-inline size_t detect_record_stride(const std::string& dir, const StringRecordFile& f) {
-    return detect_stride_from_file(dir + "/" + patch_file_names[(uint32_t)f.stride_from], f.strides, f.n_strides);
-}
 
 // Terminator written after the last patch section; the patcher breaks its
 // section loop when it reads this as a file_id and refuses a patch that ends

@@ -24,6 +24,7 @@
 
 #include "sequential_file_reader.h"
 #include "test_framework.h"
+#include "types.h"
 
 // --- write_varint / read_varint_bounded round-trip ---
 
@@ -179,23 +180,20 @@ TEST(patch_format_stride_sentinel_values) {
 }
 
 TEST(patch_format_stride_sentinels_no_collision_with_real_strides) {
-    // Real per-record strides used across the format (see read_* helpers and
-    // the *_cells / entry structs). None may equal a sentinel, else a genuine
+    // Real per-record strides used across the format (the record files, the
+    // *_cells and entry lists). None may equal a sentinel, else a genuine
     // record stride would be misread as a sparse/copy/cell list section.
     const uint32_t real_strides[] = {
+        1,   // vertex byte streams
         2,   // entry count prefix (u16)
         4,   // u32 id arrays (entries, parents, postcodes)
         8,   // NodeCoord, cell_id
-        9,   // packed WayHeader
-        12,  // padded WayHeader / admin_cells / poi_cells / place_cells
-        16,  // postcode_centroid value_stride
-        18,  // packed InterpWay
-        28,  // AddrPoint v15 (polygon footprint fields)
-        32,  // PoiRecord (build_version 10-14)
-        36,  // PoiRecord (current, parent ids)
-        19,  // raw AdminPolygon
-        20,  // padded InterpWay / legacy AddrPoint / current PlaceNode / geo_cell
-        24,  // padded AdminPolygon / PoiRecord
+        12,  // WayHeader / admin_cells / poi_cells / place_cells
+        16,  // postcode_centroid value_stride, empty addr_points
+        20,  // PlaceNode / geo_cell
+        24,  // InterpWay / AdminPolygon
+        28,  // AddrPoint
+        36,  // PoiRecord
     };
     for (uint32_t s : real_strides) {
         CHECK(s != SPARSE_DELTA_STRIDE);
@@ -256,21 +254,24 @@ TEST(patch_format_node_byte_offset_past_2_pow_29) {
     CHECK_EQ(node_byte_offset(0xFFFFFFFFu), (size_t)0xFFFFFFFFu * 8);
 }
 
-// --- record_node_count ---
+// --- record layouts ---
 
-TEST(patch_format_record_node_count_reads_u16_and_legacy_u8) {
-    // Padded layouts (stride 12 / 24): u16 at byte 4, so roads past 255
-    // nodes keep their full count.
+TEST(patch_format_record_strides_match_the_builder) {
+    CHECK_EQ(WAY_HEADER_STRIDE, sizeof(WayHeader));
+    CHECK_EQ(ADDR_POINT_STRIDE, sizeof(AddrPoint));
+    CHECK_EQ(INTERP_WAY_STRIDE, sizeof(InterpWay));
+    CHECK_EQ(ADMIN_POLYGON_STRIDE, sizeof(AdminPolygon));
+    CHECK_EQ(POI_RECORD_STRIDE, sizeof(PoiRecord));
+    CHECK_EQ(PLACE_NODE_STRIDE, sizeof(PlaceNode));
+}
+
+TEST(patch_format_record_node_count_reads_u16) {
+    // WayHeader / InterpWay: u16 at byte 4, so roads past 255 nodes keep
+    // their full count.
     char way[12] = {};
     uint16_t n = 1358;
     std::memcpy(way + 4, &n, 2);
-    CHECK_EQ(record_node_count(way, 12, WAY_HEADER_STRIDE_PACKED), 1358u);
-    CHECK_EQ(record_node_count(way, 24, INTERP_WAY_STRIDE_PACKED), 1358u);
-    // Legacy packed layouts (stride 9 / 18): u8 at byte 4, next byte is data.
-    char packed[9] = {};
-    packed[4] = static_cast<char>(200);
-    packed[5] = static_cast<char>(0x7F);
-    CHECK_EQ(record_node_count(packed, 9, WAY_HEADER_STRIDE_PACKED), 200u);
+    CHECK_EQ(record_node_count(way), 1358u);
 }
 
 TEST(patch_format_template_patch_version_matches_gcpatch_version) {
@@ -385,23 +386,16 @@ TEST(patch_format_content_hash_of_nothing_is_stable) {
 
 TEST(patch_format_string_fields_match_the_record_layouts) {
     using V = std::vector<size_t>;
-    CHECK(string_field_offsets(PatchFileId::ADDR_POINTS, 28) == V({8, 12}));  // not parent_way_id at 16
-    CHECK(string_field_offsets(PatchFileId::ADDR_POINTS, 20) == V({8, 12}));
-    CHECK(string_field_offsets(PatchFileId::STREET_WAYS, 12) == V({8}));
-    CHECK(string_field_offsets(PatchFileId::STREET_WAYS, 9) == V({5}));
-    CHECK(string_field_offsets(PatchFileId::INTERP_WAYS, 24) == V({8}));
-    CHECK(string_field_offsets(PatchFileId::INTERP_WAYS, 20) == V({8}));
-    CHECK(string_field_offsets(PatchFileId::INTERP_WAYS, 18) == V({5}));
-    CHECK(string_field_offsets(PatchFileId::ADMIN_POLYGONS, 24) == V({8}));
-    CHECK(string_field_offsets(PatchFileId::POSTAL_POLYGONS, 24) == V({8}));
-    CHECK(string_field_offsets(PatchFileId::POI_RECORDS, 36) == V({16, 24, 28}));  // not parent_poly_id at 32
-    CHECK(string_field_offsets(PatchFileId::POI_RECORDS, 32) == V({16, 24, 28}));
-    CHECK(string_field_offsets(PatchFileId::POI_RECORDS, 28) == V({16, 24}));
-    CHECK(string_field_offsets(PatchFileId::POI_RECORDS, 24) == V({16}));
-    CHECK(string_field_offsets(PatchFileId::PLACE_NODES, 20) == V({8}));  // not parent_poly_id at 16
-    CHECK(string_field_offsets(PatchFileId::STREET_NODES, 8).empty());
-    CHECK(string_field_offsets(PatchFileId::ADMIN_VERTICES, 1).empty());
-    CHECK(string_field_offsets(PatchFileId::POI_VERTICES, 1).empty());
+    CHECK(string_field_offsets(PatchFileId::ADDR_POINTS) == V({8, 12}));  // not parent_way_id at 16
+    CHECK(string_field_offsets(PatchFileId::STREET_WAYS) == V({8}));
+    CHECK(string_field_offsets(PatchFileId::INTERP_WAYS) == V({8}));
+    CHECK(string_field_offsets(PatchFileId::ADMIN_POLYGONS) == V({8}));
+    CHECK(string_field_offsets(PatchFileId::POSTAL_POLYGONS) == V({8}));
+    CHECK(string_field_offsets(PatchFileId::POI_RECORDS) == V({16, 24, 28}));  // not parent_poly_id at 32
+    CHECK(string_field_offsets(PatchFileId::PLACE_NODES) == V({8}));  // not parent_poly_id at 16
+    CHECK(string_field_offsets(PatchFileId::STREET_NODES).empty());
+    CHECK(string_field_offsets(PatchFileId::ADMIN_VERTICES).empty());
+    CHECK(string_field_offsets(PatchFileId::POI_VERTICES).empty());
 
     // Sparse files: string offsets are kind 2 (the u32 itself) and kind 3
     // (byte 8 of a postcode centroid); kind 1 holds admin polygon ids.
@@ -424,20 +418,13 @@ TEST(patch_format_string_record_files_cover_every_string_field) {
     std::unordered_set<uint32_t> listed;
     for (const auto& f : STRING_RECORD_FILES) {
         listed.insert((uint32_t)f.fid);
-        REQUIRE(f.n_strides >= 1 && f.n_strides <= 4);
-        for (size_t i = 0; i < f.n_strides; i++) {
-            const auto fields = string_field_offsets(f.fid, f.strides[i]);
-            CHECK(!fields.empty());
-            for (size_t off : fields) CHECK(off + 4 <= f.strides[i]);
-        }
+        const auto fields = string_field_offsets(f.fid);
+        CHECK(!fields.empty());
+        for (size_t off : fields) CHECK(off + 4 <= f.stride);
     }
     for (uint32_t fid = 0; fid < (uint32_t)PatchFileId::COUNT; fid++)
-        for (size_t stride = 1; stride <= 64; stride++)
-            if (!string_field_offsets((PatchFileId)fid, stride).empty()) CHECK(listed.count(fid) == 1);
+        if (!string_field_offsets((PatchFileId)fid).empty()) CHECK(listed.count(fid) == 1);
     CHECK_EQ(listed.size(), std::size(STRING_RECORD_FILES));
-    // Postal polygons sit at the admin stride.
-    for (const auto& f : STRING_RECORD_FILES)
-        if (f.fid == PatchFileId::POSTAL_POLYGONS) CHECK(f.stride_from == PatchFileId::ADMIN_POLYGONS);
 }
 
 // --- old file identity ---

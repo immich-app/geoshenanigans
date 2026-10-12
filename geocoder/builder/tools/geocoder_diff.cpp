@@ -101,7 +101,7 @@ static void remap_id_field(char* data, size_t size, size_t stride, size_t field,
 // The patcher rewrites the same fields (string_field_offsets) of the records
 // it copies from old.
 static void remap_string_fields(char* data, size_t size, PatchFileId fid, size_t stride, const SortedU32Map& rm) {
-    for (size_t off : string_field_offsets(fid, stride)) remap_field(data, size, stride, off, rm);
+    for (size_t off : string_field_offsets(fid)) remap_field(data, size, stride, off, rm);
 }
 
 // Content matching for ways (by name + nodes, ignoring node_offset)
@@ -144,14 +144,13 @@ static void fixup_way_offsets(char* old_ways, size_t old_ways_size,
         memcmp(old_ways, new_ways, old_ways_size) == 0 &&
         (old_nodes_size == 0 || memcmp(old_nodes, new_nodes, old_nodes_size) == 0))  // empty maps are null
         return;
-    size_t name_off = (stride == 12) ? 8 : 5;
     size_t old_n = old_ways_size / stride, new_n = new_ways_size / stride;
     size_t old_nc = old_nodes_size / 8, new_nc = new_nodes_size / 8;
 
     auto way_hash = [&](const char* w, const char* nodes, size_t max_n) -> uint64_t {
         uint32_t node_offset, name_id;
-        memcpy(&node_offset, w, 4); memcpy(&name_id, w + name_off, 4);
-        uint32_t node_count = record_node_count(w, stride, WAY_HEADER_STRIDE_PACKED);
+        memcpy(&node_offset, w, 4); memcpy(&name_id, w + WAY_HEADER_NAME_ID_OFF, 4);
+        uint32_t node_count = record_node_count(w);
         uint64_t h = 14695981039346656037ULL;
         h = fnv_mix(h, name_id); h = fnv_mix(h, node_count);
         for (uint32_t j = 0; j < node_count && (node_offset + j) < max_n; j++) {
@@ -267,17 +266,17 @@ static void fixup_interp_offsets(char* old_data, size_t old_size,
                                    const char* new_data, size_t new_size,
                                    const char* new_nodes, size_t new_nodes_size,
                                    size_t stride) {
-    size_t street_off = (stride >= 20) ? 8 : 5;
+    constexpr size_t street_off = INTERP_WAY_STREET_ID_OFF;
     size_t old_n = old_size / stride, new_n = new_size / stride;
     size_t old_nc = old_nodes_size / 8, new_nc = new_nodes_size / 8;
 
     auto ihash = [&](const char* p, const char* nodes, size_t max_n) -> uint64_t {
         uint32_t node_offset, street_id, start, end; uint8_t itype;
         memcpy(&node_offset, p, 4);
-        uint32_t count = record_node_count(p, stride, INTERP_WAY_STRIDE_PACKED);
+        uint32_t count = record_node_count(p);
         memcpy(&street_id, p + street_off, 4); memcpy(&start, p + street_off + 4, 4);
         memcpy(&end, p + street_off + 8, 4);
-        itype = (street_off + 12 < stride) ? (uint8_t)p[street_off + 12] : 0;
+        itype = (uint8_t)p[street_off + 12];
         uint64_t h = 14695981039346656037ULL;
         h = fnv_mix(h, street_id); h = fnv_mix(h, start); h = fnv_mix(h, end);
         h = fnv_mix(h, itype); h = fnv_mix(h, count);
@@ -527,10 +526,7 @@ static uint32_t referenced_string_tiers_of(const std::string& old_dir, const uin
         mask |= referenced_string_tiers(m.data, m.size, stride, fields, tier_ends, name);
         unmap_file(m);
     };
-    for (const auto& f : STRING_RECORD_FILES) {
-        size_t stride = detect_record_stride(old_dir, f);
-        scan(f.fid, stride, string_field_offsets(f.fid, stride));
-    }
+    for (const auto& f : STRING_RECORD_FILES) scan(f.fid, f.stride, string_field_offsets(f.fid));
     for (const auto& f : SPARSE_DELTA_FILES) {
         if (f.remap_kind == 2) scan(f.fid, f.value_stride, {0});
         if (f.remap_kind == 3) scan(f.fid, f.value_stride, {POSTCODE_CENTROID_POSTCODE_ID_OFF});
@@ -617,22 +613,11 @@ static int run(int argc, char* argv[]) {
                                                      string_tier_segments(new_tier_maps, new_concat)));
     }
 
-    // Detect strides (stat only, no data loaded)
-    auto detect = [](const std::string& path, std::initializer_list<size_t> cs) -> size_t {
-        return detect_stride_from_file(path, cs);
-    };
-    size_t way_stride = detect(old_dir + "/street_ways.bin", {12, 9});
-    size_t interp_stride = detect(old_dir + "/interp_ways.bin", {24, 20, 18});
-    size_t admin_stride = detect(old_dir + "/admin_polygons.bin", {24, 20, 19});
-    // PoiRecord: 24B (build_version<=3), 28B (build_version 4-9,
-    // added parent_street_id), 32B (build_version==10, added
-    // parent_postcode_id), 36B (build_version>=11, added
-    // parent_poly_id). Detect from file stride so old caches still
-    // work for diff generation.
-    size_t poi_stride = detect(old_dir + "/poi_records.bin", {36, 32, 28, 24});
-    // PlaceNode: 16B (build_version<=3) or 20B (build_version>=4,
-    // added parent_poly_id).
-    size_t place_stride = detect(old_dir + "/place_nodes.bin", {20, 16});
+    const size_t way_stride = WAY_HEADER_STRIDE;
+    const size_t interp_stride = INTERP_WAY_STRIDE;
+    const size_t admin_stride = ADMIN_POLYGON_STRIDE;
+    const size_t poi_stride = POI_RECORD_STRIDE;
+    const size_t place_stride = PLACE_NODE_STRIDE;
 
     // Build patch data (uncompressed, will be zstd-compressed at the end)
     std::vector<char> patch;
@@ -723,15 +708,14 @@ static int run(int argc, char* argv[]) {
     };
 
     // Node merge of street_ways / interp_ways from the parent way merge:
-    // node_count is read with record_node_count (u16 at byte 4; u8 in the
-    // legacy packed strides), off_field_pos is the byte offset of
-    // node_offset (0 for both).
+    // node_count is read with record_node_count (u16 at byte 4),
+    // off_field_pos is the byte offset of node_offset (0 for both).
     auto build_child_merge = [](const MergeSequence& parent_seq,
                                  const char* old_parent, size_t /*old_parent_size*/,
                                  const char* new_parent, size_t /*new_parent_size*/,
                                  const char* old_child, size_t old_child_size,
                                  const char* new_child, size_t new_child_size,
-                                 size_t parent_stride, size_t packed_stride,
+                                 size_t parent_stride,
                                  size_t off_field_pos = 0) -> MergeSequence {
         auto block_of = [=](const char* parent) {
             return [=](size_t i) -> ChildBlock {
@@ -739,7 +723,7 @@ static int run(int argc, char* argv[]) {
                 uint32_t off; memcpy(&off, rec + off_field_pos, 4);
                 // node_byte_offset widens before `* 8`: planet street_nodes
                 // passes 2^29 nodes, where 32-bit math wraps.
-                return {node_byte_offset(off), (size_t)record_node_count(rec, parent_stride, packed_stride) * 8};
+                return {node_byte_offset(off), (size_t)record_node_count(rec) * 8};
             };
         };
         return merge_child_blocks(parent_seq, parent_stride, 8, old_child, old_child_size,
@@ -773,14 +757,12 @@ static int run(int argc, char* argv[]) {
         double gs = now_ms();
         auto old_m = mmap_file_rw(old_dir + "/addr_points.bin");
         auto new_m = mmap_file(new_dir + "/addr_points.bin");
-        // Stride must be detected per-file. Known sizes: 16 (pre-postcode),
-        // 20 (+parent_way_id), 28 (+vertex_offset/count). We can only run
-        // the merge if old and new have the same stride; cross-stride
-        // patches are not supported (the manifest's build_version bump
-        // forces clients to fresh-install instead).
+        // An empty or absent addr_points.bin goes out as stride 16, as
+        // patches have always sent it. We can only run the merge if old
+        // and new have the same stride, so a dir that gains or loses its
+        // address points can't be patched.
         auto detect_addr_stride = [](size_t sz) -> size_t {
-            if (sz % 28 == 0 && sz > 0) return 28;
-            if (sz % 20 == 0 && sz > 0) return 20;
+            if (sz % ADDR_POINT_STRIDE == 0 && sz > 0) return ADDR_POINT_STRIDE;
             return 16;
         };
         size_t old_stride = detect_addr_stride(old_m.size);
@@ -834,7 +816,7 @@ static int run(int argc, char* argv[]) {
         // classify all 174M planet addr_points as DELETE+INSERT, which is
         // exactly what we observed (4.89 GB merge sequence on a 4.89 GB
         // file). Wait on t_street's id_remap and apply before merge_seq.
-        if (addr_stride >= 20 && old_m.size > 0) {
+        if (old_m.size > 0) {
             street_remap_future.wait();
             remap_id_field(old_m.data, old_m.size, addr_stride, 16, res_ways.id_remap);
         }
@@ -890,8 +872,8 @@ static int run(int argc, char* argv[]) {
                           old_av.size, new_av.size, std::move(av_seq), {}};
             log_merge(res_addr_v);
         } else {
-            // Pre-v15 (no inline polygon header) — addr_vertices is fixed-
-            // stride NodeCoord array. Fall through to emit_raw later.
+            // No address points: the dir's addr_vertices.bin, if any,
+            // goes whole (emit_raw) later.
             res_addr_v = {PatchFileId::ADDR_VERTICES, "addr_vertices.bin", 0,
                           0, 0, MergeSequence{}, {}};
         }
@@ -948,11 +930,10 @@ static int run(int argc, char* argv[]) {
                           new_w.data, new_w.size, new_n.data, new_n.size, way_stride);
         auto fixups = collect_offset_fixups(old_offsets, old_w.data, way_stride, 0);
         auto way_seq = build_merge_seq(old_w.data, old_w.size, new_w.data, new_w.size, way_stride);
-        size_t way_name_off = (way_stride == 12) ? 8 : 5;
         auto soft = secondary_match_from_merge(way_seq, old_w.data, old_w.size, new_w.data, new_w.size, way_stride,
-            [way_name_off, way_stride](const char* rec) -> uint64_t {
-                uint32_t name_id; memcpy(&name_id, rec + way_name_off, 4);
-                uint32_t nc = record_node_count(rec, way_stride, WAY_HEADER_STRIDE_PACKED);
+            [](const char* rec) -> uint64_t {
+                uint32_t name_id; memcpy(&name_id, rec + WAY_HEADER_NAME_ID_OFF, 4);
+                uint32_t nc = record_node_count(rec);
                 return ((uint64_t)name_id << 16) | nc;
             });
         auto id_rm = derive_id_remap_from_merge(way_seq, old_w.size / way_stride, way_stride);
@@ -968,8 +949,7 @@ static int run(int argc, char* argv[]) {
         for (size_t i = 0; i < wn; i++) memcpy(old_w.data + i * way_stride, &old_offsets[i], 4);
         if (old_n.data && new_n.data) {
             auto node_seq = build_child_merge(way_seq, old_w.data, old_w.size, new_w.data, new_w.size,
-                                               old_n.data, old_n.size, new_n.data, new_n.size, way_stride,
-                                               WAY_HEADER_STRIDE_PACKED);
+                                               old_n.data, old_n.size, new_n.data, new_n.size, way_stride);
             res_nodes = {PatchFileId::STREET_NODES, "street_nodes.bin", 8,
                          old_n.size, new_n.size, std::move(node_seq), {}};
         } else {
@@ -1009,12 +989,11 @@ static int run(int argc, char* argv[]) {
                              new_data.data, new_data.size, new_n.data, new_n.size, interp_stride);
         auto fixups = collect_offset_fixups(old_offsets, old_data.data, interp_stride, 0);
         auto iw_seq = build_merge_seq(old_data.data, old_data.size, new_data.data, new_data.size, interp_stride);
-        size_t ist_off = (interp_stride >= 20) ? 8 : 5;
         auto soft = secondary_match_from_merge(iw_seq, old_data.data, old_data.size, new_data.data, new_data.size, interp_stride,
-            [ist_off](const char* rec) -> uint64_t {
+            [](const char* rec) -> uint64_t {
                 uint32_t street_id, start;
-                memcpy(&street_id, rec + ist_off, 4);
-                memcpy(&start, rec + ist_off + 4, 4);
+                memcpy(&street_id, rec + INTERP_WAY_STREET_ID_OFF, 4);
+                memcpy(&start, rec + INTERP_WAY_STREET_ID_OFF + 4, 4);
                 return ((uint64_t)street_id << 32) | start;
             });
         auto id_rm = derive_id_remap_from_merge(iw_seq, old_data.size / interp_stride, interp_stride);
@@ -1024,8 +1003,7 @@ static int run(int argc, char* argv[]) {
         log_merge(res_interp_w);
         for (size_t i = 0; i < n; i++) memcpy(old_data.data + i * interp_stride, &old_offsets[i], 4);
         auto in_seq = build_child_merge(iw_seq, old_data.data, old_data.size, new_data.data, new_data.size,
-                                         old_n.data, old_n.size, new_n.data, new_n.size, interp_stride,
-                                         INTERP_WAY_STRIDE_PACKED);
+                                         old_n.data, old_n.size, new_n.data, new_n.size, interp_stride);
         res_interp_n = {PatchFileId::INTERP_NODES, "interp_nodes.bin", 8,
                         old_n.size, new_n.size, std::move(in_seq), {}};
         log_merge(res_interp_n);
@@ -1043,13 +1021,11 @@ static int run(int argc, char* argv[]) {
         auto [new_data, new_fb] = try_load_with_fallback_rw(new_dir, "admin_polygons.bin",
                                                              {"../../quality/q2.5/", "../quality/q2.5/"});
         admin_from_fallback = (old_fb || new_fb);
-        if (admin_stride == 24) {
-            // Zero only actual padding bytes (14-15), preserve place_type_override at byte 13
-            for (size_t i = 0; i + admin_stride <= old_data.size; i += admin_stride)
-                memset(old_data.data + i + 14, 0, 2);
-            for (size_t i = 0; i + admin_stride <= new_data.size; i += admin_stride)
-                memset(new_data.data + i + 14, 0, 2);
-        }
+        // Zero only actual padding bytes (14-15), preserve place_type_override at byte 13
+        for (size_t i = 0; i + admin_stride <= old_data.size; i += admin_stride)
+            memset(old_data.data + i + 14, 0, 2);
+        for (size_t i = 0; i + admin_stride <= new_data.size; i += admin_stride)
+            memset(new_data.data + i + 14, 0, 2);
         remap_string_fields(old_data.data, old_data.size, PatchFileId::ADMIN_POLYGONS, admin_stride, str_remap);
         // admin_vertices.bin lives next to admin_polygons.bin in every
         // build mode, so it follows the same fallback resolution.
@@ -1145,9 +1121,9 @@ static int run(int argc, char* argv[]) {
             return;
         }
         // String remap on the three string-offset fields:
-        //   byte 16 = name_id           (all strides)
-        //   byte 24 = parent_street_id  (string offset of nearest street name, v9+ / stride>=28)
-        //   byte 28 = parent_postcode_id(string offset of POI postcode, v10+ / stride>=32)
+        //   byte 16 = name_id
+        //   byte 24 = parent_street_id  (string offset of nearest street name)
+        //   byte 28 = parent_postcode_id(string offset of POI postcode)
         // All three are string-pool offsets and shift day-over-day exactly
         // like name_id, so they get the same str_remap. (Previously bytes
         // 24/28 were wrongly remapped via the way-index / postcode-centroid
@@ -1170,7 +1146,7 @@ static int run(int argc, char* argv[]) {
         // polygon index and must be remapped from the old build's admin
         // id-space into the new one. (Bytes 24/28 are string offsets,
         // handled by str_remap above — NOT here.)
-        if (old_data.size > 0 && poi_stride >= 36)
+        if (old_data.size > 0)
             remap_id_field(old_data.data, old_data.size, poi_stride, 32, res_admin_p.id_remap);
 
         auto old_v = mmap_file(old_dir + "/poi_vertices.bin");
@@ -1261,15 +1237,15 @@ static int run(int argc, char* argv[]) {
             log_time("  group:place (empty)", gs);
             return;
         }
-        // String remap on name_id field (offset 8 in 16-byte stride)
+        // String remap on name_id field (offset 8)
         if (old_data.size > 0)
             remap_string_fields(old_data.data, old_data.size, PatchFileId::PLACE_NODES, place_stride, str_remap);
-        // parent_poly_id (byte 16-19, only present in 20-byte stride) is a
+        // parent_poly_id (byte 16-19) is a
         // foreign id into admin_polygons.bin and shifts day-over-day with
         // the admin id-space. Without rewriting it the merge sees
         // byte-different records for every place_node whose containing
         // admin polygon's id moved.
-        if (place_stride >= 20 && old_data.size > 0) {
+        if (old_data.size > 0) {
             admin_remap_future.wait();
             remap_id_field(old_data.data, old_data.size, place_stride, 16, res_admin_p.id_remap);
         }
@@ -1375,8 +1351,8 @@ static int run(int argc, char* argv[]) {
 
     // Serialize merge results to patch in canonical order, freeing as we go.
     serialize_merge(patch, res_addr, old_dir, new_dir);
-    // res_addr_v is built in t_addr only when addr_stride >= 28 (v15+);
-    // older variants leave stride=0 and old/new sizes 0, which we treat as
+    // res_addr_v is built in t_addr only when the dir has address points;
+    // without them it keeps stride=0 and old/new sizes 0, which we treat as
     // "not built" → fall through to the emit_raw(ADDR_VERTICES) call later
     // in the section pipeline. stride=1 marks a byte-merge ready to ship.
     if (res_addr_v.stride == 1) {
@@ -1895,7 +1871,7 @@ static int run(int argc, char* argv[]) {
         auto old_v = mmap_file(old_dir + "/postal_vertices.bin");
         auto new_v = mmap_file(new_dir + "/postal_vertices.bin");
         const size_t stride = admin_stride;
-        bool mergeable = stride == 24 && old_p.size > 0 && new_p.size > 0 && old_v.size > 0 && new_v.size > 0
+        bool mergeable = old_p.size > 0 && new_p.size > 0 && old_v.size > 0 && new_v.size > 0
                          && old_p.size % stride == 0 && new_p.size % stride == 0;
         if (mergeable) {
             remap_string_fields(old_p.data, old_p.size, PatchFileId::POSTAL_POLYGONS, stride, str_remap);
@@ -1932,9 +1908,9 @@ static int run(int argc, char* argv[]) {
             emit_raw(PatchFileId::POSTAL_VERTICES, "postal_vertices.bin");
         }
     }
-    // ADDR_VERTICES was already serialized as a byte-merge for v15+
-    // (addr_stride >= 28) just after res_addr. Only fall back to FULL_REPLACE
-    // here for older variants where t_addr left res_addr_v.stride == 0.
+    // ADDR_VERTICES was already serialized as a byte-merge just after
+    // res_addr when the dir has address points. Only fall back to
+    // FULL_REPLACE here for a dir without them (res_addr_v.stride == 0).
     if (res_addr_v.stride != 1) {
         emit_raw(PatchFileId::ADDR_VERTICES, "addr_vertices.bin");
     }

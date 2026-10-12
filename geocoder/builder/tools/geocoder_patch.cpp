@@ -95,13 +95,6 @@ static void log_rewinds(const SequentialFileReader& r) {
     if (r.rewinds()) std::cerr << "  " << r.path() << ": read backwards " << r.rewinds() << " times" << std::endl;
 }
 
-// Detect stride from file size
-static size_t detect_stride(const std::string& path, std::initializer_list<size_t> candidates) {
-    struct stat st; if (stat(path.c_str(), &st) != 0) return *candidates.begin();
-    for (size_t s : candidates) if (st.st_size % s == 0 && st.st_size > 0) return s;
-    return *candidates.begin();
-}
-
 static int run(int argc, char* argv[]) {
     if (argc < 5 || std::string(argv[3]) != "-o") {
         std::cerr << "Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir>" << std::endl;
@@ -230,10 +223,6 @@ static int run(int argc, char* argv[]) {
     // Release patch pages read so far (string section)
     madvise(const_cast<char*>(patch_map.data), pos, MADV_DONTNEED);
     log_phase("Strings", t_start);
-
-    size_t way_stride = detect_stride(cur_dir + "/street_ways.bin", {12, 9});
-    size_t interp_stride = detect_stride(cur_dir + "/interp_ways.bin", {24, 20, 18});
-    size_t admin_stride = detect_stride(cur_dir + "/admin_polygons.bin", {24, 20, 19});
 
     auto str_remap_lookup = [&](uint32_t old_off) { return str_remap.lookup(old_off); };
 
@@ -515,12 +504,11 @@ static int run(int argc, char* argv[]) {
         }
 
         size_t actual_stride = stride;
-        if (file_id == (uint32_t)PatchFileId::STREET_WAYS) actual_stride = way_stride;
-        else if (file_id == (uint32_t)PatchFileId::INTERP_WAYS) actual_stride = interp_stride;
-        else if (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS) actual_stride = admin_stride;
 
         // Records with string offset fields are rewritten one at a time.
-        const std::vector<size_t> string_fields = string_field_offsets(static_cast<PatchFileId>(file_id), actual_stride);
+        const std::vector<size_t> string_fields = string_field_offsets(static_cast<PatchFileId>(file_id));
+        for (size_t off : string_fields)
+            if (off + 4 > actual_stride) throw std::runtime_error(std::string("Malformed record stride: ") + fname);
         bool needs_remap = !string_fields.empty();
         bool needs_padding = file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS && actual_stride == 24;
 
