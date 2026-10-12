@@ -31,8 +31,6 @@ jobs:
 
       - name: Configure credentials
         run: |
-          echo "::add-mask::$AWS_ACCESS_KEY_ID"
-          echo "::add-mask::$AWS_SECRET_ACCESS_KEY"
           echo "AWS_ACCESS_KEY_ID=$KEY" >> "$GITHUB_ENV"
           echo "AWS_SECRET_ACCESS_KEY=$SECRET" >> "$GITHUB_ENV"
         env:
