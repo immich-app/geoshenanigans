@@ -100,6 +100,30 @@ Tried on the runner, and reverted:
   212-217 s, mostly on CPU (~195 s user + sys); with the advice it took
   234-236 s. The nightly's 585 s comes from sharing the cores with
   compression, which ends after patch generation anyway.
+- Fetching yesterday's index once the build was done with the PBF (after
+  Pass 2b) instead of with it. On 128 GiB the PBF then stayed cached and
+  the build took 466 s against 541; but the fetch's writes landed on the
+  write phase instead, which is bound by the volume's write rate: 463
+  against 394 s on giant, 652 against 581 s on 96 GiB.
+
+Smaller runners, same day re-run (2026-10-12, no diff to apply):
+
+| Runner | Run | Build | Patches + compression |
+|---|---|---|---|
+| giant, 80 CPUs, 200 GiB | 30.8 min | 6.6 min | 18.9 min |
+| massive, 64 CPUs, 128 GiB | 37.9 min | 9.1 min | 22.1 min |
+| massive-96, 64 CPUs, 96 GiB | 38.5 min | 9.8 min | 22.4 min |
+
+Patches and compression scale with the cores. The build loses its page
+cache: below ~200 GiB the PBF and yesterday's index don't both fit, Pass 2
+and 2b read the PBF back from the volume, and the PBF prefetcher (8 MiB
+reads, 16 in flight) holds that to 119 + 88 s against 337 + 67 s without
+it. At 96 GiB the build also needs `GC_MEMORY_RESERVE_MIB` (12 GiB in the
+nightly): it sizes its write phase to the job's limit, and the fetch
+beside it (~4.6 GiB, plus dirty pages) shares that limit; without the
+reserve the pod was OOM-killed. Telling the build it had the CPU quota's
+46 cores instead of the host's 64 changed nothing (4:57-5:20 against
+5:09-5:12 on the box).
 
 ## Earlier result: 54m → 12m 22s (77% faster)
 
