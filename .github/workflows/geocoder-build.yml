@@ -126,9 +126,10 @@ jobs:
           KEY: ${{ secrets.TIGRIS_WRITE_KEY_ID }}
           SECRET: ${{ secrets.TIGRIS_WRITE_ACCESS_KEY }}
 
-      # The tools compile beside Setup and the downloads, which don't use
-      # them, detached so the build outlives this step; Run builder tests
-      # waits for it before anything does.
+      # The tools compile, and their unit tests run, beside Setup and the
+      # downloads, which don't use them: detached so they outlive this step.
+      # Run builder tests (a step name the watchdog matches) waits for both
+      # before anything uses the tools.
       - name: Build tools
         env:
           RUNNER_TEMP: ${{ runner.temp }}
@@ -139,7 +140,8 @@ jobs:
           # The inner script expands its own arguments.
           # shellcheck disable=SC2016
           setsid nohup bash -c 'cmake .. -DCMAKE_BUILD_TYPE=Release -DGEOCODER_S2_PREFIX="$1" \
-              && make -j"$(nproc)" build-index geocoder-diff geocoder-patch pbf-apply geocoder-tests; echo $? > "$2"' \
+              && make -j"$(nproc)" build-index geocoder-diff geocoder-patch pbf-apply geocoder-tests \
+              && ./geocoder-tests; echo $? > "$2"' \
             _ "$GITHUB_WORKSPACE/.s2-prefix" "$RUNNER_TEMP/tools.status" > "$RUNNER_TEMP/tools.log" 2>&1 < /dev/null &
 
       - name: Setup
@@ -468,16 +470,17 @@ jobs:
             fi
             sleep 5
           done
-          echo "Waited $(( $(date +%s) - WAIT_START ))s for the tool build"
-          if [ "$(cat "$RUNNER_TEMP/tools.status")" != 0 ]; then
-            tail -50 "$RUNNER_TEMP/tools.log"
-            echo "::error::The tool build failed"; exit 1
-          fi
+          echo "Waited $(( $(date +%s) - WAIT_START ))s for the tool build and tests"
           # Unit tests gate the build: the suite locks in parity-critical
           # pure functions (postcode validation, patch format, id
           # allocator) that a broken toolchain or bad merge would corrupt
           # long before the multi-hour planet build surfaces it.
-          cd geocoder/builder/build && ./geocoder-tests
+          if [ "$(cat "$RUNNER_TEMP/tools.status")" != 0 ]; then
+            grep -E "FAIL|error" "$RUNNER_TEMP/tools.log" | head -40
+            tail -20 "$RUNNER_TEMP/tools.log"
+            echo "::error::The tool build or its unit tests failed"; exit 1
+          fi
+          grep -E "tests passed" "$RUNNER_TEMP/tools.log"
 
       # ── Apply replication diffs ───────────────────────────────────
       # Skipped when PBF source is already today's data.
