@@ -1,0 +1,820 @@
+#include "pbf_reader.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <cstdlib>
+#include <condition_variable>
+#include <cstring>
+#include <fcntl.h>
+#include <iostream>
+#include <mutex>
+#include <stdexcept>
+#include <string_view>
+#include <thread>
+#include <unistd.h>
+
+#include <protozero/pbf_reader.hpp>
+#include <protozero/varint.hpp>
+
+#include "file_prefetcher.h"
+#include "parallel.h"
+#include "pbf_format.h"
+#include "zlib_blob.h"
+
+// --- PBF file format constants ---
+// BlobHeader max size: 32 MiB (per spec), but typically <100 bytes
+// Blob max size: 32 MiB (per spec)
+static constexpr size_t MAX_BLOB_HEADER_SIZE = 64 * 1024;
+static constexpr size_t MAX_BLOB_SIZE = 64 * 1024 * 1024;
+
+// scan_pbf_blobs walks the file in stripes, several per thread so uneven
+// blob densities balance, none so small that finding its first blob costs
+// more than walking it. A stripe's first blob is searched for in chunks.
+static constexpr size_t SCAN_STRIPES_PER_THREAD = 8;
+static constexpr size_t SCAN_MIN_STRIPE_BYTES = 16 * 1024 * 1024;
+static constexpr size_t SCAN_SEARCH_CHUNK = 128 * 1024;
+
+// Coordinate scale: OSM PBF stores lat/lon in nanodegree units.
+// Value is exactly 1e-9 == 0.000000001 (same nearest double).
+static constexpr double NANO_DEG = 1e-9;
+
+// --- File I/O helpers ---
+
+static std::string read_bytes(int fd, size_t offset, size_t count) {
+    std::string buf(count, '\0');
+    ssize_t n = pread(fd, buf.data(), count, offset);
+    if (n != (ssize_t)count) {
+        throw std::runtime_error("pread failed at offset " + std::to_string(offset) +
+                                 ": expected " + std::to_string(count) +
+                                 " got " + std::to_string(n));
+    }
+    return buf;
+}
+
+static uint32_t read_u32_be(int fd, size_t offset) {
+    uint8_t buf[4];
+    if (pread(fd, buf, 4, offset) != 4) {
+        throw std::runtime_error("failed to read 4 bytes at offset " + std::to_string(offset));
+    }
+    return (uint32_t(buf[0]) << 24) | (uint32_t(buf[1]) << 16) |
+           (uint32_t(buf[2]) << 8) | uint32_t(buf[3]);
+}
+
+// --- Blob scanning ---
+
+// Reads the BlobHeader of the blob whose length prefix starts at `offset`.
+static BlobInfo read_blob_header(int fd, size_t offset) {
+    // Read 4-byte big-endian BlobHeader size
+    uint32_t header_size = read_u32_be(fd, offset);
+    if (header_size > MAX_BLOB_HEADER_SIZE) {
+        throw std::runtime_error("BlobHeader too large: " + std::to_string(header_size));
+    }
+
+    // Read BlobHeader
+    std::string header_data = read_bytes(fd, offset + 4, header_size);
+    protozero::pbf_reader header_pbf(header_data);
+
+    std::string type;
+    int32_t data_size = 0;
+    while (header_pbf.next()) {
+        switch (header_pbf.tag()) {
+            case BlobHeaderTag::TYPE:
+                type = header_pbf.get_string();
+                break;
+            case BlobHeaderTag::DATASIZE:
+                data_size = header_pbf.get_int32();
+                break;
+            default:
+                header_pbf.skip();
+        }
+    }
+
+    if (data_size < 0 || (size_t)data_size > MAX_BLOB_SIZE) {
+        throw std::runtime_error("PBF blob datasize out of range: " + std::to_string(data_size));
+    }
+
+    BlobInfo info;
+    info.offset = offset;
+    info.header_size = header_size;
+    info.data_size = data_size;
+    info.type = type;
+    return info;
+}
+
+// Follows the blob chain from the blob at `offset`, appending every blob
+// that starts before `stop`. Returns the offset the chain reaches (>= stop).
+static size_t walk_blobs(int fd, size_t offset, size_t stop, std::vector<BlobInfo>& blobs) {
+    while (offset < stop) {
+        blobs.push_back(read_blob_header(fd, offset));
+        const BlobInfo& info = blobs.back();
+        // Advance past: 4 bytes length + header + blob data
+        offset += 4 + info.header_size + info.data_size;
+    }
+    return offset;
+}
+
+// The first offset in [from, to) that looks like the start of an OSMData
+// blob (a BlobHeader length under 64 KiB, then the type field), or `to` if
+// none does. Blob data can hold the same bytes, so this is only a hint.
+static size_t find_blob_candidate(int fd, size_t from, size_t to) {
+    static constexpr std::string_view kTypeField("\x0a\x07OSMData", 9);
+    std::string buf(SCAN_SEARCH_CHUNK + 4 + kTypeField.size(), '\0');
+    for (size_t pos = from; pos < to; pos += SCAN_SEARCH_CHUNK) {
+        ssize_t got = pread(fd, buf.data(), buf.size(), pos);
+        if (got <= 0) break;
+        std::string_view view(buf.data(), static_cast<size_t>(got));
+        for (size_t q = view.find(kTypeField, 4); q != std::string_view::npos; q = view.find(kTypeField, q + 1)) {
+            size_t p = q - 4;
+            if (p >= SCAN_SEARCH_CHUNK || pos + p >= to) break;
+            if (view[p] == 0 && view[p + 1] == 0) return pos + p;
+        }
+    }
+    return to;
+}
+
+// Walking the blob chain is one cold header read per blob, 1.5M on the
+// planet: minutes at queue depth one, so stripes of the file are walked in
+// parallel from the first blob-like offset in each.
+std::vector<BlobInfo> scan_pbf_blobs(const std::string& filename, unsigned threads) {
+    int fd = open(filename.c_str(), O_RDONLY);
+    if (fd < 0) throw std::runtime_error("cannot open " + filename + ": " + strerror(errno));
+
+    // Get file size
+    off_t file_size = lseek(fd, 0, SEEK_END);
+
+    if (threads == 0) threads = parallel_threads();
+    size_t stripes = file_size > 0
+        ? std::min<size_t>(size_t(threads) * SCAN_STRIPES_PER_THREAD, size_t(file_size) / SCAN_MIN_STRIPE_BYTES)
+        : 0;
+    std::vector<BlobInfo> blobs = parallel_chain_walk<BlobInfo>(
+        size_t(file_size), stripes,
+        [&](size_t from, size_t to) { return find_blob_candidate(fd, from, to); },
+        [&](size_t offset, size_t stop, std::vector<BlobInfo>& out) { return walk_blobs(fd, offset, stop, out); },
+        threads);
+
+    close(fd);
+    return blobs;
+}
+
+// --- Blob decompression ---
+
+// Reads a blob's Blob message into blob_buf, reusing its capacity.
+static void read_blob_into(int fd, const BlobInfo& info, std::string& blob_buf) {
+    size_t blob_offset = info.offset + 4 + info.header_size;
+    blob_buf.resize(info.data_size);
+    ssize_t n = pread(fd, blob_buf.data(), info.data_size, blob_offset);
+    if (n != (ssize_t)info.data_size) {
+        throw std::runtime_error("pread failed");
+    }
+}
+
+// Decompresses the Blob message in blob_buf into `out`, reusing its capacity.
+static void inflate_blob_into(const std::string& blob_buf, std::string& out) {
+    protozero::pbf_reader blob_pbf(blob_buf);
+    protozero::data_view raw_view{}, zlib_view{};
+    int32_t raw_size = 0;
+    while (blob_pbf.next()) {
+        switch (blob_pbf.tag()) {
+            case BlobTag::RAW: raw_view = blob_pbf.get_view(); break;
+            case BlobTag::RAW_SIZE: raw_size = blob_pbf.get_int32(); break;
+            case BlobTag::ZLIB: zlib_view = blob_pbf.get_view(); break;
+            default: blob_pbf.skip();
+        }
+    }
+    if (raw_view.size() > 0) {
+        out.assign(raw_view.data(), raw_view.size());
+        return;
+    }
+    if (zlib_view.size() > 0) {
+        out.resize(raw_size);
+        out.resize(zlib_inflate({zlib_view.data(), zlib_view.size()}, out.data(), out.size()));
+        return;
+    }
+    throw std::runtime_error("blob has no data");
+}
+
+// Reusable-buffer version: avoids allocation after warmup
+static void read_and_decompress_blob_into(int fd, const BlobInfo& info,
+                                            std::string& blob_buf, std::string& out) {
+    read_blob_into(fd, info, blob_buf);
+    inflate_blob_into(blob_buf, out);
+}
+
+std::string read_and_decompress_blob(int fd, const BlobInfo& info) {
+    // Read the blob data (after 4-byte header length + header)
+    size_t blob_offset = info.offset + 4 + info.header_size;
+    std::string blob_data = read_bytes(fd, blob_offset, info.data_size);
+
+    protozero::pbf_reader blob_pbf(blob_data);
+    std::string raw_data;
+    std::string zlib_data;
+    int32_t raw_size = 0;
+
+    while (blob_pbf.next()) {
+        switch (blob_pbf.tag()) {
+            case BlobTag::RAW: {
+                auto view = blob_pbf.get_view();
+                raw_data.assign(view.data(), view.size());
+                break;
+            }
+            case BlobTag::RAW_SIZE:
+                raw_size = blob_pbf.get_int32();
+                break;
+            case BlobTag::ZLIB: {
+                auto view = blob_pbf.get_view();
+                zlib_data.assign(view.data(), view.size());
+                break;
+            }
+            default:
+                blob_pbf.skip();
+        }
+    }
+
+    if (!raw_data.empty()) {
+        return raw_data;
+    }
+
+    if (!zlib_data.empty()) {
+        std::string decompressed(raw_size, '\0');
+        decompressed.resize(zlib_inflate(zlib_data, decompressed.data(), decompressed.size()));
+        return decompressed;
+    }
+
+    throw std::runtime_error("blob has neither raw nor zlib data");
+}
+
+// Extract a PrimitiveBlock string table (repeated `s` byte fields) into `out`.
+static inline void decode_string_table(protozero::pbf_reader& pb, std::vector<std::string>& out) {
+    protozero::pbf_reader st = pb.get_message();
+    while (st.next()) {
+        if (st.tag() == StringTableTag::S) {
+            auto view = st.get_view();
+            out.emplace_back(view.data(), view.size());
+        } else { st.skip(); }
+    }
+}
+
+// --- PrimitiveBlock decoding ---
+
+size_t decode_nodes_streaming(const char* data, size_t size, const NodeCallback& callback) {
+    // Single-pass decode: string table + dense nodes in one traversal
+    std::vector<std::string> string_table;
+    size_t way_groups = 0;
+    int32_t granularity = 100;
+    int64_t lat_offset = 0, lon_offset = 0;
+
+    // We need the string table before processing tags, but in PBF the string table
+    // comes before primitive groups, so a single pass works.
+    protozero::pbf_reader pb(data, size);
+    while (pb.next()) {
+        switch (pb.tag()) {
+            case PrimitiveBlockTag::STRINGTABLE: decode_string_table(pb, string_table); break;
+            case PrimitiveBlockTag::GRANULARITY: granularity = pb.get_int32(); break;
+            case PrimitiveBlockTag::LAT_OFFSET: lat_offset = pb.get_int64(); break;
+            case PrimitiveBlockTag::LON_OFFSET: lon_offset = pb.get_int64(); break;
+            case PrimitiveBlockTag::PRIMITIVEGROUP: {
+                protozero::pbf_reader group = pb.get_message();
+                while (group.next()) {
+                    if (group.tag() == PrimitiveGroupTag::NODES) {
+                        throw std::runtime_error("PBF contains non-dense node groups — unsupported");
+                    } else if (group.tag() == PrimitiveGroupTag::DENSE) {
+                        protozero::pbf_reader dense = group.get_message();
+                        protozero::data_view ids_data{}, lats_data{}, lons_data{}, kv_data{};
+                        while (dense.next()) {
+                            switch (dense.tag()) {
+                                case DenseNodesTag::ID: ids_data = dense.get_view(); break;
+                                case DenseNodesTag::LAT: lats_data = dense.get_view(); break;
+                                case DenseNodesTag::LON: lons_data = dense.get_view(); break;
+                                case DenseNodesTag::KEYS_VALS: kv_data = dense.get_view(); break;
+                                default: dense.skip();
+                            }
+                        }
+
+                        const char* id_ptr = ids_data.data();
+                        const char* id_end = id_ptr + ids_data.size();
+                        const char* lat_ptr = lats_data.data();
+                        const char* lat_end = lat_ptr + lats_data.size();
+                        const char* lon_ptr = lons_data.data();
+                        const char* lon_end = lon_ptr + lons_data.size();
+                        const char* kv_ptr = kv_data.data();
+                        const char* kv_end = kv_ptr + kv_data.size();
+
+                        // Reusable tag buffers (avoid allocation per node)
+                        thread_local std::vector<uint32_t> tag_keys, tag_vals;
+
+                        int64_t id = 0, lat = 0, lon = 0;
+                        while (id_ptr < id_end) {
+                            id += protozero::decode_zigzag64(protozero::decode_varint(&id_ptr, id_end));
+                            lat += protozero::decode_zigzag64(protozero::decode_varint(&lat_ptr, lat_end));
+                            lon += protozero::decode_zigzag64(protozero::decode_varint(&lon_ptr, lon_end));
+
+                            tag_keys.clear();
+                            tag_vals.clear();
+
+                            if (kv_ptr < kv_end) {
+                                uint32_t key_idx = static_cast<uint32_t>(protozero::decode_varint(&kv_ptr, kv_end));
+                                if (key_idx != 0) {
+                                    do {
+                                        uint32_t val_idx = (kv_ptr < kv_end)
+                                            ? static_cast<uint32_t>(protozero::decode_varint(&kv_ptr, kv_end)) : 0;
+                                        tag_keys.push_back(key_idx);
+                                        tag_vals.push_back(val_idx);
+                                        if (kv_ptr >= kv_end) break;
+                                        key_idx = static_cast<uint32_t>(protozero::decode_varint(&kv_ptr, kv_end));
+                                    } while (key_idx != 0);
+                                }
+                            }
+
+                            double dlat = NANO_DEG * (lat_offset + (int64_t)granularity * lat);
+                            double dlng = NANO_DEG * (lon_offset + (int64_t)granularity * lon);
+                            callback(id, dlat, dlng,
+                                     tag_keys.data(), tag_vals.data(), tag_keys.size(),
+                                     string_table);
+                        }
+                    } else {
+                        if (group.tag() == PrimitiveGroupTag::WAYS) way_groups++;
+                        group.skip();
+                    }
+                }
+                break;
+            }
+            default: pb.skip();
+        }
+    }
+    return way_groups;
+}
+
+const std::vector<int64_t>& WayRefs::get() const {
+    if (!decoded_) {
+        refs_.clear();
+        for (auto packed : packed_) {
+            const char* end = packed.data() + packed.size();
+            int64_t ref = 0;
+            for (auto delta : protozero::iterator_range<protozero::const_svarint_iterator<int64_t>>(
+                     {packed.data(), end}, {end, end})) {
+                ref += delta;
+                refs_.push_back(ref);
+            }
+        }
+        decoded_ = true;
+    }
+    return refs_;
+}
+
+size_t decode_ways_streaming(const char* data, size_t size, const WayCallback& callback) {
+    std::vector<std::string> string_table;
+    size_t node_groups = 0;
+    int32_t granularity = 100;
+    int64_t lat_offset = 0, lon_offset = 0;
+
+    // Reusable per-way buffers
+    thread_local WayRefs refs;
+    thread_local std::vector<uint32_t> keys, vals;
+
+    protozero::pbf_reader pb(data, size);
+    while (pb.next()) {
+        switch (pb.tag()) {
+            case PrimitiveBlockTag::STRINGTABLE: decode_string_table(pb, string_table); break;
+            case PrimitiveBlockTag::GRANULARITY: granularity = pb.get_int32(); break;
+            case PrimitiveBlockTag::LAT_OFFSET: lat_offset = pb.get_int64(); break;
+            case PrimitiveBlockTag::LON_OFFSET: lon_offset = pb.get_int64(); break;
+            case PrimitiveBlockTag::PRIMITIVEGROUP: {
+                protozero::pbf_reader group = pb.get_message();
+                while (group.next()) {
+                    if (group.tag() == PrimitiveGroupTag::WAYS) {
+                        protozero::pbf_reader way_msg = group.get_message();
+                        int64_t way_id = 0;
+                        refs.reset();
+                        keys.clear();
+                        vals.clear();
+
+                        while (way_msg.next()) {
+                            switch (way_msg.tag()) {
+                                case WayTag::ID: way_id = way_msg.get_int64(); break;
+                                case WayTag::KEYS:
+                                    for (auto v : way_msg.get_packed_uint32()) keys.push_back(v);
+                                    break;
+                                case WayTag::VALS:
+                                    for (auto v : way_msg.get_packed_uint32()) vals.push_back(v);
+                                    break;
+                                case WayTag::REFS: {
+                                    auto packed = way_msg.get_view();
+                                    refs.add_packed({packed.data(), packed.size()});
+                                    break;
+                                }
+                                default: way_msg.skip();
+                            }
+                        }
+
+                        size_t ntags = std::min(keys.size(), vals.size());
+                        callback(way_id, refs, keys.data(), vals.data(), ntags, string_table);
+                    } else {
+                        if (group.tag() == PrimitiveGroupTag::NODES ||
+                            group.tag() == PrimitiveGroupTag::DENSE) node_groups++;
+                        group.skip();
+                    }
+                }
+                break;
+            }
+            default: pb.skip();
+        }
+    }
+    return node_groups;
+}
+
+void decode_pbf_blob_into(const char* data, size_t size, PbfBlock& block) {
+    // Clear vectors but keep capacity for reuse
+    block.string_table.clear();
+    block.relations.clear();
+
+    protozero::pbf_reader pb(data, size);
+    auto& string_table = block.string_table;
+
+    while (pb.next()) {
+        switch (pb.tag()) {
+            case PrimitiveBlockTag::STRINGTABLE: decode_string_table(pb, string_table); break;
+            default: pb.skip();
+        }
+    }
+
+    auto* st_ptr = &block.string_table;
+
+    protozero::pbf_reader pb2(data, size);
+    while (pb2.next()) {
+        if (pb2.tag() != PrimitiveBlockTag::PRIMITIVEGROUP) { pb2.skip(); continue; }
+        protozero::pbf_reader group = pb2.get_message();
+        while (group.next()) {
+            switch (group.tag()) {
+                case PrimitiveGroupTag::NODES:
+                    // Plain (non-dense) node groups are never produced by the
+                    // planet/Geofabrik toolchain; silently skipping them would
+                    // drop node coordinates. Fail loudly instead.
+                    throw std::runtime_error("PBF contains non-dense node groups — unsupported");
+                case PrimitiveGroupTag::RELATIONS: {
+                    protozero::pbf_reader rel_msg = group.get_message();
+                    PbfRelation rel;
+                    std::vector<uint32_t> keys, vals;
+                    std::vector<int32_t> roles_sid;
+                    std::vector<int64_t> memids_delta;
+                    std::vector<int32_t> types;
+                    while (rel_msg.next()) {
+                        switch (rel_msg.tag()) {
+                            case RelationTag::ID: rel.id = rel_msg.get_int64(); break;
+                            case RelationTag::KEYS: for (auto v : rel_msg.get_packed_uint32()) keys.push_back(v); break;
+                            case RelationTag::VALS: for (auto v : rel_msg.get_packed_uint32()) vals.push_back(v); break;
+                            case RelationTag::ROLES_SID: for (auto v : rel_msg.get_packed_int32()) roles_sid.push_back(v); break;
+                            case RelationTag::MEMIDS: for (auto v : rel_msg.get_packed_sint64()) memids_delta.push_back(v); break;
+                            case RelationTag::TYPES: for (auto v : rel_msg.get_packed_int32()) types.push_back(v); break;
+                            default: rel_msg.skip();
+                        }
+                    }
+                    rel.tags.string_table = st_ptr;
+                    for (size_t i = 0; i < keys.size() && i < vals.size(); i++)
+                        rel.tags.indices.emplace_back(keys[i], vals[i]);
+                    int64_t memid = 0;
+                    for (size_t i = 0; i < memids_delta.size(); i++) {
+                        memid += memids_delta[i];
+                        char type = '?';
+                        if (i < types.size()) { switch(types[i]) { case 0: type='n'; break; case 1: type='w'; break; case 2: type='r'; break; } }
+                        uint32_t role_sid = (i < roles_sid.size()) ? roles_sid[i] : 0;
+                        rel.members.push_back({type, memid, role_sid});
+                    }
+                    block.relations.push_back(std::move(rel));
+                    break;
+                }
+                default: group.skip();
+            }
+        }
+    }
+}
+
+
+// --- PbfFile implementation ---
+
+PbfFile::PbfFile(const std::string& filename, unsigned num_threads)
+    : filename_(filename), num_threads_(num_threads) {
+    if (num_threads_ == 0) num_threads_ = std::thread::hardware_concurrency();
+    if (num_threads_ == 0) num_threads_ = 4;
+
+    blobs_ = scan_pbf_blobs(filename_, num_threads_);
+
+    size_t bytes = blobs_.empty() ? 0 : blobs_.back().offset + 4 + blobs_.back().header_size + blobs_.back().data_size;
+    std::cerr << "  PBF: " << blobs_.size() << " blobs, " << (bytes / (1024*1024)) << " MiB" << std::endl;
+}
+
+// Lightweight I/O semaphore — limits concurrent preads without queue overhead.
+// All threads still do their own read+inflate+decode+callback, but only max_io
+// threads can be in the pread phase simultaneously.
+struct IoSemaphore {
+    std::mutex mtx;
+    std::condition_variable cv;
+    unsigned max_concurrent;
+    unsigned active = 0;
+    IoSemaphore(unsigned max) : max_concurrent(max) {}
+    void acquire() {
+        std::unique_lock<std::mutex> lock(mtx);
+        cv.wait(lock, [&]{ return active < max_concurrent; });
+        active++;
+    }
+    void release() {
+        std::lock_guard<std::mutex> lock(mtx);
+        active--;
+        cv.notify_one();
+    }
+};
+
+// stream_blobs reads the blobs' bytes ahead of its workers in reads of
+// kStreamPrefetchChunk bytes, kStreamPrefetchThreads at once, at most
+// kStreamPrefetchWindow ahead. Blobs average ~65 KiB: read one per pread from
+// a cold network volume (the nightly's Ceph scratch, when the page cache can't
+// keep the PBF), each read was a round trip, and Pass 2 read the planet at
+// ~200 MB/s against the volume's 1.5 GB/s in large reads. The window is page
+// cache, not memory the build holds.
+constexpr uint64_t kStreamPrefetchWindow = uint64_t(4) << 30;
+constexpr size_t kStreamPrefetchChunk = size_t(8) << 20;
+constexpr unsigned kStreamPrefetchThreads = 16;
+
+// How many of `threads` stream_blobs workers may read the file at once:
+// BUILD_MAX_IO (0 = all of them), else half of them, at least 8. On fast
+// storage every thread gets through quickly; on slow storage the rest decode
+// while they wait.
+static unsigned max_concurrent_reads(unsigned threads) {
+    if (const char* env = getenv("BUILD_MAX_IO")) {
+        unsigned max_io = static_cast<unsigned>(std::atoi(env));
+        return max_io == 0 ? threads : max_io;
+    }
+    return std::min(threads, std::max(8u, threads / 2));
+}
+
+// Reads and decompresses the blobs `indices` names on `threads` threads,
+// each taking the next blob as it frees up, and runs decode(j, data, size) on
+// blob indices[j] in the thread that read it. Only the pread is limited:
+// inflating is most of a blob's cost when the file is cached, and limited
+// with it, half the cores would idle. Logs the time spent per stage under
+// `label`.
+template <class Decode>
+static void stream_blobs(const std::string& filename, const std::vector<BlobInfo>& blobs,
+                         const std::vector<size_t>& indices, unsigned threads, const char* label,
+                         Decode decode) {
+    if (indices.empty()) return;
+    const unsigned max_io = max_concurrent_reads(threads);
+    IoSemaphore io_sem(max_io);
+
+    std::atomic<size_t> next_idx{0};
+    std::atomic<size_t> blocks_done{0};
+    std::atomic<bool> open_failed{false};
+    std::vector<std::thread> workers;
+
+    std::vector<uint64_t> offsets(indices.size());
+    for (size_t j = 0; j < indices.size(); j++) offsets[j] = blobs[indices[j]].offset;
+    FilePrefetcher prefetcher(filename, touching_ranges(offsets, [&](size_t j) {
+        const BlobInfo& b = blobs[indices[j]];
+        return uint64_t(4 + b.header_size + b.data_size);
+    }), kStreamPrefetchWindow, kStreamPrefetchChunk, kStreamPrefetchThreads);
+
+    struct ThreadStats { double read_us = 0, inflate_us = 0, decode_us = 0; size_t count = 0; };
+    std::vector<ThreadStats> stats(threads);
+
+    for (unsigned t = 0; t < threads; t++) {
+        workers.emplace_back([&, t]() {
+            int local_fd = open(filename.c_str(), O_RDONLY);
+            if (local_fd < 0) { open_failed.store(true); return; }
+            std::string decomp, blob_buf;
+            auto& st = stats[t];
+            while (true) {
+                size_t j = next_idx.fetch_add(1);
+                if (j >= indices.size()) break;
+                prefetcher.consumed(offsets[j]);
+
+                io_sem.acquire();
+                auto t0 = std::chrono::steady_clock::now();
+                read_blob_into(local_fd, blobs[indices[j]], blob_buf);
+                auto t1 = std::chrono::steady_clock::now();
+                io_sem.release();
+
+                inflate_blob_into(blob_buf, decomp);
+                auto t2 = std::chrono::steady_clock::now();
+                decode(j, decomp.data(), decomp.size());
+                auto t3 = std::chrono::steady_clock::now();
+                st.read_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
+                st.inflate_us += std::chrono::duration<double, std::micro>(t2 - t1).count();
+                st.decode_us += std::chrono::duration<double, std::micro>(t3 - t2).count();
+                st.count++;
+                size_t done = blocks_done.fetch_add(1) + 1;
+                if (done % 5000 == 0)
+                    std::cerr << "  Processed " << done << "/" << indices.size() << " blocks..." << std::endl;
+            }
+            close(local_fd);
+        });
+    }
+    for (auto& w : workers) w.join();
+    if (open_failed.load()) throw std::runtime_error("cannot open " + filename + " in worker thread");
+
+    double total_read = 0, total_inflate = 0, total_decode = 0; size_t total_blocks = 0;
+    for (auto& s : stats) {
+        total_read += s.read_us;
+        total_inflate += s.inflate_us;
+        total_decode += s.decode_us;
+        total_blocks += s.count;
+    }
+    std::cerr << "  " << label << " (" << total_blocks << " blocks, " << threads << " threads, "
+              << max_io << " max_io): "
+              << "read=" << (total_read/1e6) << "s inflate=" << (total_inflate/1e6)
+              << "s decode+callback=" << (total_decode/1e6) << "s"
+              << " (per-thread avg: read=" << (total_read/1e6/threads)
+              << "s inflate=" << (total_inflate/1e6/threads)
+              << "s decode+cb=" << (total_decode/1e6/threads) << "s)" << std::endl;
+}
+
+void PbfFile::read_nodes_streaming(const NodeCallback& callback) {
+    // Skipping the way blobs saves decompressing them here. The
+    // classification trusts the file to be sorted by type, so a node blob
+    // holding ways (which the way pass would never see) fails the build.
+    classify_blobs();
+    std::vector<size_t> data_indices = node_blobs_;
+    data_indices.insert(data_indices.end(), relation_blobs_.begin(), relation_blobs_.end());
+    std::atomic<size_t> misplaced{0};
+    stream_blobs(filename_, blobs_, data_indices, num_threads_, "Node streaming",
+                 [&](size_t j, const char* data, size_t size) {
+        size_t foreign = decode_nodes_streaming(data, size, callback);
+        if (foreign && j < node_blobs_.size()) misplaced.fetch_add(foreign);
+    });
+    if (misplaced.load())
+        throw std::runtime_error(filename_ + ": way groups in node blobs, PBF not sorted by type");
+}
+
+void PbfFile::read_ways_streaming(const WayCallback& callback) {
+    // Way and relation blobs only; see read_nodes_streaming.
+    classify_blobs();
+    std::vector<size_t> data_indices = way_blobs_;
+    data_indices.insert(data_indices.end(), relation_blobs_.begin(), relation_blobs_.end());
+    std::atomic<size_t> misplaced{0};
+    stream_blobs(filename_, blobs_, data_indices, num_threads_, "Way streaming",
+                 [&](size_t j, const char* data, size_t size) {
+        size_t foreign = decode_ways_streaming(data, size, callback);
+        if (foreign && j < way_blobs_.size()) misplaced.fetch_add(foreign);
+    });
+    if (misplaced.load())
+        throw std::runtime_error(filename_ + ": node groups in way blobs, PBF not sorted by type");
+}
+
+PbfFile::~PbfFile() = default;
+
+// Peek at a single blob to determine its content type
+static int peek_blob_type(int fd, const BlobInfo& info) {
+    std::string data = read_and_decompress_blob(fd, info);
+    protozero::pbf_reader pb(data);
+    while (pb.next()) {
+        if (pb.tag() == PrimitiveBlockTag::PRIMITIVEGROUP) {
+            protozero::pbf_reader group = pb.get_message();
+            while (group.next()) {
+                switch (group.tag()) {
+                    case PrimitiveGroupTag::NODES:
+                    case PrimitiveGroupTag::DENSE: return 0; // nodes
+                    case PrimitiveGroupTag::WAYS: return 1;  // ways
+                    case PrimitiveGroupTag::RELATIONS: return 2; // relations
+                    default: group.skip();
+                }
+            }
+        } else { pb.skip(); }
+    }
+    return -1;
+}
+
+void PbfFile::classify_blobs() {
+    if (classified_) return;
+
+    // PBF files are ordered: node blocks → way blocks → relation blocks.
+    // Binary search for the boundaries instead of decompressing all 50K blobs.
+    std::vector<size_t> data_indices;
+    for (size_t i = 0; i < blobs_.size(); i++)
+        if (blobs_[i].type == "OSMData") data_indices.push_back(i);
+
+    if (data_indices.empty()) { classified_ = true; return; }
+
+    int fd = open(filename_.c_str(), O_RDONLY);
+    if (fd < 0) { classified_ = true; return; }
+
+    // Binary search for node→way boundary
+    size_t node_way_boundary = data_indices.size(); // default: all nodes
+    {
+        size_t lo = 0, hi = data_indices.size();
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo) / 2;
+            int type = peek_blob_type(fd, blobs_[data_indices[mid]]);
+            if (type == 0) lo = mid + 1; // nodes — boundary is after this
+            else hi = mid;               // ways or relations — boundary is at or before this
+        }
+        node_way_boundary = lo;
+    }
+
+    // Binary search for way→relation boundary
+    size_t way_rel_boundary = data_indices.size(); // default: no relations
+    {
+        size_t lo = node_way_boundary, hi = data_indices.size();
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo) / 2;
+            int type = peek_blob_type(fd, blobs_[data_indices[mid]]);
+            if (type <= 1) lo = mid + 1; // nodes or ways
+            else hi = mid;               // relations
+        }
+        way_rel_boundary = lo;
+    }
+
+    close(fd);
+
+    for (size_t j = 0; j < node_way_boundary; j++)
+        node_blobs_.push_back(data_indices[j]);
+    for (size_t j = node_way_boundary; j < way_rel_boundary; j++)
+        way_blobs_.push_back(data_indices[j]);
+    for (size_t j = way_rel_boundary; j < data_indices.size(); j++)
+        relation_blobs_.push_back(data_indices[j]);
+
+    classified_ = true;
+    std::cerr << "  PBF classified: " << node_blobs_.size() << " node blocks, "
+              << way_blobs_.size() << " way blocks, "
+              << relation_blobs_.size() << " relation blocks" << std::endl;
+}
+
+void PbfFile::read_blocks(std::function<void(PbfBlock&, unsigned thread_idx)> callback) {
+    // Classify to avoid wasting work on 50K blobs when only 454 contain
+    // relations.
+    classify_blobs();
+
+    const std::vector<size_t>& indices = relation_blobs_;
+    if (indices.empty()) return;
+
+
+    // Unordered mode: full parallel decode + callback
+    // Each thread reuses a local PbfBlock to avoid repeated allocation.
+
+    std::atomic<size_t> next_idx{0};
+    std::atomic<size_t> blocks_done{0};
+    std::atomic<bool> open_failed{false};
+    std::vector<std::thread> threads;
+
+    // Per-thread timing accumulators
+    struct ThreadStats {
+        double read_us = 0, decode_us = 0, callback_us = 0;
+        size_t count = 0;
+    };
+    std::vector<ThreadStats> stats(num_threads_);
+
+    for (unsigned t = 0; t < num_threads_; t++) {
+        threads.emplace_back([&, t]() {
+            int local_fd = open(filename_.c_str(), O_RDONLY);
+            if (local_fd < 0) { open_failed.store(true); return; }
+            PbfBlock block;
+            std::string decomp, blob_buf;
+            auto& st = stats[t];
+
+            while (true) {
+                size_t j = next_idx.fetch_add(1);
+                if (j >= indices.size()) break;
+
+                auto t0 = std::chrono::steady_clock::now();
+                size_t blob_idx = indices[j];
+                read_and_decompress_blob_into(local_fd, blobs_[blob_idx], blob_buf, decomp);
+                auto t1 = std::chrono::steady_clock::now();
+
+                decode_pbf_blob_into(decomp.data(), decomp.size(), block);
+                auto t2 = std::chrono::steady_clock::now();
+
+                callback(block, t);
+                auto t3 = std::chrono::steady_clock::now();
+
+                st.read_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
+                st.decode_us += std::chrono::duration<double, std::micro>(t2 - t1).count();
+                st.callback_us += std::chrono::duration<double, std::micro>(t3 - t2).count();
+                st.count++;
+
+                size_t done = blocks_done.fetch_add(1) + 1;
+                if (done % 1000 == 0) {
+                    std::cerr << "  Processed " << done << "/" << indices.size() << " blocks..." << std::endl;
+                }
+            }
+            close(local_fd);
+        });
+    }
+
+    for (auto& t : threads) t.join();
+    if (open_failed.load()) throw std::runtime_error("cannot open " + filename_ + " in worker thread");
+
+    // Report timing breakdown
+    double total_read = 0, total_decode = 0, total_callback = 0;
+    size_t total_blocks = 0;
+    for (auto& s : stats) {
+        total_read += s.read_us;
+        total_decode += s.decode_us;
+        total_callback += s.callback_us;
+        total_blocks += s.count;
+    }
+    std::cerr << "  Block timing (" << total_blocks << " blocks, " << num_threads_ << " threads): "
+              << "read=" << (total_read/1e6) << "s decode=" << (total_decode/1e6)
+              << "s callback=" << (total_callback/1e6) << "s"
+              << " (per-thread avg: read=" << (total_read/1e6/num_threads_)
+              << "s decode=" << (total_decode/1e6/num_threads_)
+              << "s callback=" << (total_callback/1e6/num_threads_) << "s)"
+              << std::endl;
+}
