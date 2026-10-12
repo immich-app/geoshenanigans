@@ -46,6 +46,11 @@ env:
   # today's index 113 + 41 compressed, yesterday's 113 + sidecars 11) plus
   # patch verification's copies.
   MIN_WORK_DISK_GIB: 500
+  # Memory the build leaves under the job's limit, which it otherwise sizes
+  # its write phase to fill: the fetch of yesterday's index beside it (16
+  # s5cmd | zstd pipes and their dirty pages) and the runner share that limit.
+  # Without it a 96 GiB runner was OOM-killed mid-build.
+  GC_MEMORY_RESERVE_MIB: 12288
 
 permissions:
   contents: read
