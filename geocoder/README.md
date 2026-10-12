@@ -176,7 +176,9 @@ nightly's configuration) takes about 5 minutes on 64 cores and fits in
 80 GB of RAM (6.5 minutes there): the write phase sizes how much it runs at
 once to the memory limit, the smaller of MemTotal and the process's cgroup
 limit. Set
-`GC_MEMORY_LIMIT_MIB` to cap it further when other work shares the host.
+`GC_MEMORY_LIMIT_MIB` to cap it further when other work shares the host,
+or `GC_MEMORY_RESERVE_MIB` to keep that much of the limit for other work
+under it (the nightly's fetch shares the job's cgroup).
 Disk: the planet PBF (~95 GB) plus the output (~120 GB), and the previous
 day's output for `--prev-output`.
 

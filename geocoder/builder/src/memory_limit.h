@@ -99,9 +99,9 @@ inline std::optional<std::string> read_text_file(const std::string& path) {
     return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
 }
 
-// A GC_MEMORY_LIMIT_MIB value in bytes; 0 unless it is a positive whole
-// number of MiB, so an unusable cap never lifts the detected limit.
-inline uint64_t memory_cap_bytes(const char* mib) {
+// A GC_MEMORY_*_MIB value in bytes; 0 unless it is a positive whole number
+// of MiB, so an unusable value never lifts the detected limit.
+inline uint64_t mib_bytes(const char* mib) {
     constexpr uint64_t kMaxMib = uint64_t(1) << 40;  // 1 EiB: past any real host
     if (!mib || !*mib) return 0;
     uint64_t v = 0;
@@ -113,19 +113,34 @@ inline uint64_t memory_cap_bytes(const char* mib) {
     return v << 20;
 }
 
-// memory_limit_bytes for this process, capped further by GC_MEMORY_LIMIT_MIB
-// when set (room kept for other work on the host).
-inline uint64_t memory_limit_bytes() {
-    uint64_t limit = memory_limit_bytes(read_text_file);
-    const char* env = std::getenv("GC_MEMORY_LIMIT_MIB");
-    if (!env) return limit;
+// The limit a build schedules against: `limit` (0 = unknown) capped at `cap`,
+// less `reserve` (each 0 for none). A reserve that takes the whole limit
+// leaves 1 byte, so the build holds as little as it can rather than reading
+// the limit as unknown.
+inline uint64_t usable_memory(uint64_t limit, uint64_t cap, uint64_t reserve) {
+    if (cap && (limit == 0 || cap < limit)) limit = cap;
+    if (limit == 0 || reserve == 0) return limit;
 
-    uint64_t cap = memory_cap_bytes(env);
-    if (cap == 0) {
-        std::cerr << "Ignoring GC_MEMORY_LIMIT_MIB=" << env << ": not a positive number of MiB" << std::endl;
-        return limit;
-    }
-    return limit == 0 || cap < limit ? cap : limit;
+    return limit > reserve ? limit - reserve : 1;
+}
+
+// An environment variable's mib_bytes, 0 when unset or unusable.
+inline uint64_t env_mib_bytes(const char* name) {
+    const char* env = std::getenv(name);
+    if (!env) return 0;
+
+    uint64_t bytes = mib_bytes(env);
+    if (bytes == 0) std::cerr << "Ignoring " << name << "=" << env << ": not a positive number of MiB" << std::endl;
+    return bytes;
+}
+
+// memory_limit_bytes for this process, capped further by GC_MEMORY_LIMIT_MIB
+// (room kept for other work on the host) and less GC_MEMORY_RESERVE_MIB
+// (room kept for other work under the same limit, like the nightly's fetch
+// in the job's cgroup).
+inline uint64_t memory_limit_bytes() {
+    return usable_memory(memory_limit_bytes(read_text_file), env_mib_bytes("GC_MEMORY_LIMIT_MIB"),
+                         env_mib_bytes("GC_MEMORY_RESERVE_MIB"));
 }
 
 // Bytes the write phase may hold beyond what it already uses, handed to the

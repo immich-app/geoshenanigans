@@ -70,16 +70,30 @@ TEST(memory_limit_bytes_takes_the_tightest_limit) {
     })), 256 * kGiB);
 }
 
-TEST(memory_cap_bytes_takes_only_a_positive_whole_mib) {
-    CHECK_EQ(memory_cap_bytes("131072"), uint64_t(131072) << 20);
-    CHECK_EQ(memory_cap_bytes("1"), uint64_t(1) << 20);
-    // Unset, empty, zero, junk, negative and overflowing caps are no cap.
-    CHECK_EQ(memory_cap_bytes(nullptr), uint64_t(0));
-    CHECK_EQ(memory_cap_bytes(""), uint64_t(0));
-    CHECK_EQ(memory_cap_bytes("0"), uint64_t(0));
-    CHECK_EQ(memory_cap_bytes("128G"), uint64_t(0));
-    CHECK_EQ(memory_cap_bytes("-5"), uint64_t(0));
-    CHECK_EQ(memory_cap_bytes("99999999999999999999999"), uint64_t(0));
+TEST(mib_bytes_takes_only_a_positive_whole_mib) {
+    CHECK_EQ(mib_bytes("131072"), uint64_t(131072) << 20);
+    CHECK_EQ(mib_bytes("1"), uint64_t(1) << 20);
+    // Unset, empty, zero, junk, negative and overflowing values are none.
+    CHECK_EQ(mib_bytes(nullptr), uint64_t(0));
+    CHECK_EQ(mib_bytes(""), uint64_t(0));
+    CHECK_EQ(mib_bytes("0"), uint64_t(0));
+    CHECK_EQ(mib_bytes("128G"), uint64_t(0));
+    CHECK_EQ(mib_bytes("-5"), uint64_t(0));
+    CHECK_EQ(mib_bytes("99999999999999999999999"), uint64_t(0));
+}
+
+TEST(usable_memory_caps_then_reserves) {
+    CHECK_EQ(usable_memory(96 * kGiB, 0, 0), 96 * kGiB);
+    CHECK_EQ(usable_memory(96 * kGiB, 80 * kGiB, 0), 80 * kGiB);
+    CHECK_EQ(usable_memory(96 * kGiB, 128 * kGiB, 0), 96 * kGiB);
+    CHECK_EQ(usable_memory(96 * kGiB, 0, 12 * kGiB), 84 * kGiB);
+    CHECK_EQ(usable_memory(96 * kGiB, 80 * kGiB, 12 * kGiB), 68 * kGiB);
+    // An unknown limit takes the cap, and no reserve makes it known.
+    CHECK_EQ(usable_memory(0, 80 * kGiB, 12 * kGiB), 68 * kGiB);
+    CHECK_EQ(usable_memory(0, 0, 12 * kGiB), uint64_t(0));
+    // A reserve at or past the limit leaves the least, not an unknown limit.
+    CHECK_EQ(usable_memory(8 * kGiB, 0, 12 * kGiB), uint64_t(1));
+    CHECK_EQ(usable_memory(12 * kGiB, 0, 12 * kGiB), uint64_t(1));
 }
 
 TEST(memory_budget_runs_a_request_past_capacity_alone) {
