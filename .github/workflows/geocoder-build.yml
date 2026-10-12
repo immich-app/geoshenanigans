@@ -42,6 +42,9 @@ env:
   KEEP_PATCH_DAYS: 14
   # memwatch/<run id>.log, the build's memory samples (debugging only).
   KEEP_MEMWATCH_DAYS: 14
+  # Planet PBFs in the cache bucket: today's and yesterday's, the only ones
+  # the download step reads.
+  KEEP_CACHE_PBF_DAYS: 2
   # Free space a run needs in its work dir: ~400 GB at the peak (PBF 95,
   # today's index 113 + 41 compressed, yesterday's 113 + sidecars 11) plus
   # patch verification's copies.
@@ -1105,23 +1108,18 @@ jobs:
           $S5 ls "$MEMWATCH_PREFIX/*" 2>/dev/null \
             | awk -v cutoff="$MEMWATCH_CUTOFF" -v prefix="$MEMWATCH_PREFIX" '$1 < cutoff {print "rm " prefix "/" $NF}' \
             | $S5 run >/dev/null 2>&1 || true
+          python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/abort_stale_uploads.py" "$S3_ENDPOINT" "$S3_BUCKET" auto \
+            || echo "::warning::Could not abort Tigris's stale multipart uploads"
           echo "Public bucket cleanup complete."
 
       # ── Cleanup old cache bucket entries ───────────────────────────────
-      # Cache bucket holds the *.osm_ids sidecars (strategy-2 ID-remap
-      # mappings) under geocoder-cache/builds/<DATE>/ AND the raw PBFs
-      # under geocoder-cache/planet-<DATE>.osm.pbf used to skip
-      # re-download on subsequent runs.
-      #
-      # Retention:
-      #   - geocoder-cache/builds/<DATE>/ : keep 7 days — only the most
-      #     recent is needed for --prev-output chaining, but 7 days
-      #     gives recovery headroom if a few daily builds fail.
-      #   - geocoder-cache/planet-<DATE>.osm.pbf : keep 3 days — only
-      #     yesterday/today are useful; older is dead weight at 93 GiB
-      #     each.
+      # The cache bucket holds the planet PBFs that save a run its download
+      # (geocoder-cache/planet-<DATE>.osm.pbf); the download step only ever
+      # reads today's and yesterday's. Pruning goes by date alone, so it runs
+      # after a failed build too: a run that fails once it has cached its
+      # PBF would otherwise leave ~99 GB behind each day.
       - name: Cleanup old cache bucket
-        if: env.PATCH_VERIFY_FAILED != '1'
+        if: ${{ !cancelled() && steps.setup.outputs.cache_bucket != '' }}
         env:
           CACHE_ENDPOINT: ${{ steps.setup.outputs.cache_endpoint }}
           CACHE_BUCKET: ${{ steps.setup.outputs.cache_bucket }}
@@ -1130,42 +1128,23 @@ jobs:
           set -eu
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
 
-          # ── Build dirs in cache (contain *.osm_ids sidecars) ──
-          BUILD_CUTOFF=$(date -u -d "$NEW_DATE -7 days +1 day" +%Y-%m-%d)
-          echo "Cache builds: keep ≥ $BUILD_CUTOFF"
-
-          CACHE_DATES=$($CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/builds/" 2>/dev/null \
-            | awk '/DIR/ {print $NF}' \
-            | tr -d '/' \
-            | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \
-            | sort)
-          for d in $CACHE_DATES; do
-            if [ "$d" \> "$BUILD_CUTOFF" ] || [ "$d" = "$BUILD_CUTOFF" ]; then
-              echo "  cache builds/$d: KEEP"
-            else
-              echo "  cache builds/$d: DELETE"
-              $CACHE rm "s3://$CACHE_BUCKET/geocoder-cache/builds/$d/*" >/dev/null 2>&1 || true
-            fi
-          done
-
-          # ── Cached PBFs (planet-YYYY-MM-DD.osm.pbf) ──
-          PBF_CUTOFF=$(date -u -d "$NEW_DATE -3 days +1 day" +%Y-%m-%d)
+          # Every planet-*.osm.pbf not dated from the cutoff on goes, an
+          # undated name too.
+          PBF_CUTOFF=$(date -u -d "$NEW_DATE -${KEEP_CACHE_PBF_DAYS} days +1 day" +%Y-%m-%d)
           echo "Cache PBFs: keep ≥ $PBF_CUTOFF"
-
-          CACHE_PBFS=$($CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/planet-*.osm.pbf" 2>/dev/null \
-            | awk '{print $NF}' \
-            | sed 's/^planet-//; s/\.osm\.pbf$//' \
-            | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \
-            | sort)
-          for d in $CACHE_PBFS; do
-            if [ "$d" \> "$PBF_CUTOFF" ] || [ "$d" = "$PBF_CUTOFF" ]; then
-              echo "  cache planet-$d.osm.pbf: KEEP"
+          for name in $($CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/planet-*.osm.pbf" 2>/dev/null | awk '{print $NF}'); do
+            d=$(echo "$name" | sed -n -E 's/^planet-([0-9]{4}-[0-9]{2}-[0-9]{2})\.osm\.pbf$/\1/p')
+            if [ -n "$d" ] && { [ "$d" \> "$PBF_CUTOFF" ] || [ "$d" = "$PBF_CUTOFF" ]; }; then
+              echo "  $name: KEEP"
             else
-              echo "  cache planet-$d.osm.pbf: DELETE"
-              $CACHE rm "s3://$CACHE_BUCKET/geocoder-cache/planet-$d.osm.pbf" >/dev/null 2>&1 || true
+              echo "  $name: DELETE"
+              $CACHE rm "s3://$CACHE_BUCKET/geocoder-cache/$name" >/dev/null 2>&1 || true
             fi
           done
 
+          env AWS_ACCESS_KEY_ID="$CACHE_AWS_KEY" AWS_SECRET_ACCESS_KEY="$CACHE_AWS_SECRET" \
+            python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/abort_stale_uploads.py" "$CACHE_ENDPOINT" "$CACHE_BUCKET" us-east-1 \
+            || echo "::warning::Could not abort the cache bucket's stale multipart uploads"
           echo "Cache cleanup complete."
 
       - name: Upload build log artifact

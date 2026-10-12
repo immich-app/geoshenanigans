@@ -216,7 +216,8 @@ Regions are independent. Download the new region's mode + quality directories.
 |------|-----------|-------|
 | Index files (`.bin`) | 3 days | Full index available for fresh downloads |
 | Patch files (`.gcpatch`) and `configurations.json` | 14 days | Small files, allow long catch-up windows; `configurations.json` stays so the chain walk works |
-| Cached PBFs | 3 days | Build server cache only, not client-facing |
+| Cached PBFs | 2 days | Build server cache only, not client-facing: today's and yesterday's, the only ones a run reads |
+| Incomplete multipart uploads | 1 day | Both buckets; left by a killed upload, invisible to listings |
 
 ## Patch Application
 
