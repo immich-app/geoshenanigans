@@ -68,8 +68,11 @@ bound by its network and disk. Both turned out to be infrastructure: the
 node's link had negotiated 1 Gbit/s (forced to 10G: 9 Gbit/s to Ceph and
 Tigris since), and its local disk did 240-530 MB/s. Its scratch now lives on
 a Ceph block volume, which does 650 MB/s of writes and 1.5 GB/s of reads,
-and both at once. One of the two Ceph RGW daemons is still on a 1 Gbit/s
-link.
+and both at once. One of the two Ceph RGW daemons was on a 1 Gbit/s node
+until both moved to 10G nodes (pokedex#129): 16-connection reads from the
+cache went from 0.46-0.72 GB/s to 1.24-1.51 GB/s, single connections from
+0.09-0.30 to 0.26-0.71 GB/s, and a 17 GB upload from 0.24-0.38 to 0.47-0.59
+GB/s. The PBF download now runs at the scratch volume's write rate (~680 MB/s).
 
 A real nightly (2026-10-12, diff applied) now takes 38 min:
 
