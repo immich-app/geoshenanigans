@@ -62,18 +62,44 @@ Pipeline around the builder (same box):
   every core, retention deletes batched. The previous day's index downloads
   while the planet builds.
 
-On the nightly runner (80 CPUs, ~1 Gbit/s network, 240-530 MB/s disk) the whole
-run went from 3h 42m to 1h 08m (a re-run of a day whose PBF was cached, so
-without the diff apply); it is now bound by the network and the disk. Round 3
-on the runner: the planet's compute phases took 165 s instead of 270 s, but
-its write phase is disk-bound, sharing the disk with the previous day's index
-as it decompresses (750 s, then 1062 s in a run whose fetch was slower too).
-The whole run took 1h 13m. Compressing each file while the build still
-wrote the rest, on the write phase's idle cores, did not pay off there. Four
-runs took 73.5 min compressing beside patch generation, 71.6 beside the
-build, 74.1 with its upload held back and 74.4 at the lowest priority. The
-compression's disk traffic slowed the build and the fetch of yesterday's
-index, or, deprioritised, it trailed past patch generation.
+On the nightly runner (80 CPUs) the whole run went from 3h 42m to 1h 08m, a
+re-run of a day whose PBF was cached, so without the diff apply. It was then
+bound by its network and disk. Both turned out to be infrastructure: the
+node's link had negotiated 1 Gbit/s (forced to 10G: 9 Gbit/s to Ceph and
+Tigris since), and its local disk did 240-530 MB/s. Its scratch now lives on
+a Ceph block volume, which does 650 MB/s of writes and 1.5 GB/s of reads,
+and both at once. One of the two Ceph RGW daemons is still on a 1 Gbit/s
+link.
+
+A real nightly (2026-10-12, diff applied) now takes 38 min:
+
+| Step | Time | |
+|---|---|---|
+| First download starts | 18 s in | tools compile, or come from a cache keyed on the builder source, and run their tests beside the downloads |
+| Downloads | 4.2 min | the PBF at ~590 MB/s; wikidata, GeoNames and TIGER beside it |
+| Apply the day's diff | 2.2 min | pbf-apply with libdeflate |
+| Build | 8.6 min | the write phase shares the scratch volume with yesterday's index as it decompresses |
+| Patches + compression | 20 min | zstd 1.5.7 at -18, ~100k core-seconds on 80 cores; patch generation beside it |
+| Finalize | under 1 min | Tigris upload at ~400-500 MB/s |
+
+zstd 1.5.7 at the same level, -18, compressed every planet file sampled
+smaller and in less CPU than Ubuntu's 1.5.5 (geo_cells 15% smaller in 17%
+less CPU), and the published build 2.4% smaller overall; any zstd
+decompresses it.
+
+Tried on the runner, and reverted:
+- Compressing each file while the build still wrote the rest, on the write
+  phase's idle cores. On the old disk and link it took 71.6-74.4 min against
+  73.5; on Ceph and 10G, 37.6 against 34.9. Compression is CPU-bound, and
+  overlapping it only moved the contention.
+- Fetching yesterday's index during the downloads instead of the build. Its
+  113 GB of writes pushed the downloaded PBF out of the page cache, and the
+  build's Pass 2 read it back from the volume: 157-277 s instead of 31 s.
+- Read-ahead advice in the patcher's file reader. Verifying planet/full
+  takes ~585 s in the nightly, but alone on the runner it applies in
+  212-217 s, mostly on CPU (~195 s user + sys); with the advice it took
+  234-236 s. The nightly's 585 s comes from sharing the cores with
+  compression, which ends after patch generation anyway.
 
 ## Earlier result: 54m → 12m 22s (77% faster)
 
