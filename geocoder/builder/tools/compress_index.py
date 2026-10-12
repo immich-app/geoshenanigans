@@ -18,7 +18,9 @@ re-uploads whatever is missing.
 zstd level 18 compresses our structured binary data to within 0.3% of
 level 19 (itself within ~2% of --ultra -22) at 21% less CPU; level 17 and
 below cost 25-30% in size (planet samples of geo_cells, addr_points,
-addr_vertices, street_nodes and strings_addr).
+addr_vertices, street_nodes and strings_addr). It runs the zstd first on
+PATH; the nightly puts 1.5.7 there (tools/build_zstd.sh), which at -18 is
+smaller and faster than Ubuntu 24.04's 1.5.5.
 
 Scheduling: one worker per core, largest file first, each file compressed
 with zstd threads in proportion to its size. zstd only splits a file into

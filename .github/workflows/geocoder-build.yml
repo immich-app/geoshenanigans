@@ -94,6 +94,26 @@ jobs:
           rm -rf .s2-prefix
           TMPDIR="$RUNNER_TEMP" geocoder/builder/tools/build_s2.sh .s2-prefix
 
+      # zstd 1.5.7 compresses the index at the same level smaller and in
+      # less CPU than Ubuntu's 1.5.5 (see tools/build_zstd.sh); it goes first
+      # on PATH for compress_index.py. Cached like S2, and checked the same way.
+      - name: Restore zstd
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zstd-prefix
+          key: zstd-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('geocoder/builder/tools/build_zstd.sh') }}
+
+      - name: Build zstd
+        timeout-minutes: 15
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          if ! (cd .zstd-prefix 2> /dev/null && sha256sum -c --quiet SHA256SUMS); then
+            rm -rf .zstd-prefix
+            TMPDIR="$RUNNER_TEMP" geocoder/builder/tools/build_zstd.sh .zstd-prefix
+          fi
+          echo "$GITHUB_WORKSPACE/.zstd-prefix/bin" >> "$GITHUB_PATH"
+
       - name: Configure credentials
         run: |
           echo "::add-mask::$AWS_ACCESS_KEY_ID"
