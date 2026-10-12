@@ -11,14 +11,12 @@
 # point. Never add `heartbeat: rootly`: that label is o11y's own dead man's
 # switch route.
 #
-# The nightly's report step pushes one sample per series per run, so the build
-# rules read the last sample of the past 26h: a day, plus slack for a late cron
-# and the run itself.
-#
-# Fleet only sees this tenant once it has samples on the query's UTC day, so
-# every rule here reads NoData (OK) from 00:00 UTC until the watchdog's first
-# push of the day (cron 15 */2): a rule still firing at midnight resolves, and
-# fires again once that push lands.
+# The build series hold one point per run: the nightly's report step pushes
+# what its runner has once, and the watchdog pushes the latest run's outcome,
+# steps and duration at the time the run finished (re-sent every 2 hours,
+# kept once). So the build rules read the last sample of the past 26h: a day,
+# plus slack for a late cron and the run itself. The series live in the immich
+# tenant (6:1), which pokedex fills all day, so Fleet sees them every day.
 apiVersion: grafana.integreatly.org/v1beta1
 kind: GrafanaAlertRuleGroup
 metadata:
@@ -104,8 +102,9 @@ spec:
                   type: last
                   params: []
     # The watchdog reads latest.json every 2 hours, so a 6h window holds the
-    # last reading through two missed runs; a silent watchdog leaves this empty,
-    # and geoshenanigans-watchdog-silent covers that.
+    # last reading through two missed runs. A silent watchdog leaves this
+    # empty, and so does one that cannot read latest.json (it sends no
+    # heartbeat then): geoshenanigans-watchdog-silent covers both.
     - uid: geoshenanigans-build-stale
       title: No geocoder build published for 30 hours
       condition: B
@@ -171,13 +170,12 @@ spec:
                 reducer:
                   type: last
                   params: []
-    # The watchdog's report job pushes the heartbeat every 2 hours, so 5h empty
-    # means at least two missed runs. Deliberately unguarded, like
-    # immich-app/version's heartbeat: a "seen recently" guard would resolve at
-    # the next UTC midnight of a full outage. The same midnight blind spot makes
-    # this true from 00:00 UTC until the first heartbeat of the day lands, so
-    # `for` outlasts a dropped 00:15 run (GitHub drops scheduled runs under
-    # load) followed by a late 02:15 one.
+    # The watchdog's report job pushes the heartbeat every 2 hours, once it has
+    # read latest.json, so 5h empty means at least two missed or blind runs.
+    # Unguarded, like immich-app/version's heartbeat: the bundle loads in
+    # production only, where the watchdog always reports. `for` outlasts a
+    # dropped run (GitHub drops scheduled runs under load) followed by a late
+    # one.
     - uid: geoshenanigans-watchdog-silent
       title: Geocoder watchdog stopped reporting
       condition: B
@@ -189,11 +187,11 @@ spec:
         summary: The geocoder watchdog has not reported for over 5 hours.
         description: >-
           No geocoder_watchdog_heartbeat_timestamp_seconds sample for 5h, so at least two
-          2-hourly geocoder-build-watchdog.yml runs did not report. Without it
-          geoshenanigans-build-stale cannot fire. Check the workflow's recent runs (GitHub
-          disables scheduled workflows after 60 days without repository activity) and the
-          report job's log for a warning from the 1Password token read or the push to
-          vmauth.futostatus.com.
+          2-hourly geocoder-build-watchdog.yml runs did not report or could not read
+          latest.json. Without it geoshenanigans-build-stale cannot fire. Check the
+          workflow's recent runs (GitHub disables scheduled workflows after 60 days without
+          repository activity) and the report job's log for a latest.json read error, or a
+          warning from the 1Password token read or the push to vmauth.futostatus.com.
       execErrState: Error
       noDataState: OK
       data:
@@ -317,7 +315,7 @@ spec:
       annotations:
         summary: The latest geocoder nightly took over an hour.
         description: >-
-          Job start to the report step took more than 1h. Compare the step durations, build
+          The job took more than 1h from start to finish. Compare the step durations, build
           phases and peak memory with earlier runs on the Geocoder Nightly dashboard to find
           the slow step: a slow download or replication apply, or a build phase that regressed.
       execErrState: Error

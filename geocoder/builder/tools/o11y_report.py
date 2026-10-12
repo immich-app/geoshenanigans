@@ -2,18 +2,21 @@
 """Reports the geocoder nightly to FUTO o11y.
 
 Usage:
-  o11y_report.py nightly --job FILE --job-status STATUS --build-log FILE
-      --memwatch-log FILE --results-dir DIR --output-dir DIR --build-date DATE
-      --data-timestamp TIME --trigger EVENT --runner SCALE_SET --run-id ID
-      --run-attempt N --run-url URL (--base-url URL | --dry-run)
-  o11y_report.py watchdog --latest-url URL (--base-url URL | --dry-run)
+  o11y_report.py nightly --build-log FILE --memwatch-log FILE --results-dir DIR
+      --output-dir DIR --build-date DATE --data-timestamp TIME --run-id ID
+      --run-attempt N (--base-url URL | --dry-run)
+  o11y_report.py watchdog --latest-url URL --run FILE --job FILE
+      (--base-url URL | --dry-run)
 
-nightly reports a run, whatever its outcome: geocoder_build_* and
-geocoder_patch_* / geocoder_index_* gauges from the job's steps (--job, the
-GitHub API's job object) and the files the run left in its work dir, and log
-lines for each step, the run, build.log, the memwatch samples and the patch
-verify results. An input a run never wrote leaves its metrics out. watchdog
-reports a heartbeat and the published build's dates from latest.json.
+nightly reports what only the build's runner has, from the files the run left
+in its work dir: the build phases, peak memory, patch verify counts, patch and
+index sizes and the data's age, and log lines for build.log, the memwatch
+samples and the patch verify results. An input a run never wrote leaves its
+metrics out. watchdog, every 2 hours on a GitHub-hosted runner, reports the
+published build's dates from latest.json with a heartbeat, and the outcome,
+duration and steps of the latest finished nightly (--run and --job, the GitHub
+API's run and job objects): a run whose runner died or that timed out never
+reaches its own report, so its outcome comes from here.
 
 Both push to o11y's gateway at --base-url, with the bearer token in
 $O11Y_TOKEN: the metrics as Prometheus text to VictoriaMetrics, the log lines
@@ -50,6 +53,9 @@ LOG_BATCH_BYTES = MIB
 HTTP_TIMEOUT_SECONDS = 10
 HTTP_RETRIES = 3
 HTTP_RETRY_DELAY_SECONDS = 5
+# How long after a nightly finishes the watchdog still logs it: its 2-hour
+# cadence plus GitHub's schedule delays. Its metrics are pushed on every tick.
+RUN_LOG_WINDOW_SECONDS = 9000
 
 # geocoder-build.yml step name -> `step` label. Other steps get no metrics.
 STEP_SLUGS = {
@@ -241,17 +247,9 @@ def step_samples(job, log):
 
 
 def nightly(opts, now):
-    """The run's samples and log."""
-    job = read_job(opts.job)
+    """The run's samples and log, from its work dir."""
     log = Log(app=NIGHTLY_APP, run_id=opts.run_id, run_attempt=opts.run_attempt, build_date=opts.build_date)
-    run = {"trigger": opts.trigger, "runner": opts.runner}
-    samples = [
-        ("geocoder_build_last_run_timestamp_seconds", run, int(now)),
-        ("geocoder_build_success", run, int(opts.job_status == "success")),
-    ]
-    duration = int(now) - unix_time(job["started_at"]) if job.get("started_at") else None
-    if duration is not None:
-        samples.append(("geocoder_build_duration_seconds", run, duration))
+    samples = []
     build_log, memwatch_log = read_lines(opts.build_log), read_lines(opts.memwatch_log)
     for line in build_log + memwatch_log:
         if line.strip():
@@ -265,32 +263,55 @@ def nightly(opts, now):
     samples += patch_samples(opts.results_dir, opts.output_dir, log)
     samples += [("geocoder_index_bytes", {"kind": kind}, size)
                 for kind, size in read_index_bytes(opts.output_dir).items()]
-    samples += step_samples(job, log)
-
-    took = f" in {duration}s" if duration is not None else ""
-    log.add(f"run {opts.job_status}{took}, {opts.trigger} on {opts.runner}: {opts.run_url}",
-            level="info" if opts.job_status == "success" else "error")
     return samples, log
 
 
+def outcome_samples(run, job, now, log):
+    """The finished nightly's outcome, duration and steps, from the GitHub API's
+    run and job objects, at the time it finished: every tick re-sends them, and
+    the store keeps one point per run. Logged on the first tick after it
+    finished only, into log's records under the run's own context."""
+    if not run.get("conclusion"):
+        return []
+    labels = {"trigger": run.get("event", ""), "runner": (job.get("labels") or [""])[0]}
+    finished = unix_time(job.get("completed_at") or run["updated_at"])
+    started = job.get("started_at") or run.get("run_started_at")
+    samples = [("geocoder_build_last_run_timestamp_seconds", labels, finished),
+               ("geocoder_build_success", labels, int(run["conclusion"] == "success"))]
+    if started:
+        samples.append(("geocoder_build_duration_seconds", labels, finished - unix_time(started)))
+    run_log = Log(app=NIGHTLY_APP, run_id=str(run.get("id", "")), run_attempt=str(run.get("run_attempt", "")))
+    samples += step_samples(job, run_log)
+    took = f" in {finished - unix_time(started)}s" if started else ""
+    run_log.add(f"run {run['conclusion']}{took}, {labels['trigger']} on {labels['runner']}: {run.get('html_url', '')}",
+                level="info" if run["conclusion"] == "success" else "error")
+    if now - finished <= RUN_LOG_WINDOW_SECONDS:
+        log.records += run_log.records
+    return [(name, labels, value, finished) for name, labels, value in samples]
+
+
 def watchdog(opts, now):
-    """The heartbeat and published build samples, and a log line on what latest.json said."""
+    """The published build's dates with the heartbeat, and the latest finished
+    nightly's outcome, with their log lines."""
     log = Log(app=WATCHDOG_APP)
-    samples = [("geocoder_watchdog_heartbeat_timestamp_seconds", {}, int(now))]
+    samples = []
     body, error = with_retries(lambda: fetch(opts.latest_url))
     if error is None:
         try:
             latest = json.loads(body)
-            published = [("geocoder_published_build_timestamp_seconds", {}, unix_time(latest["latest"])),
-                         ("geocoder_published_updated_timestamp_seconds", {}, unix_time(latest["updated_at"]))]
+            samples = [("geocoder_published_build_timestamp_seconds", {}, unix_time(latest["latest"])),
+                       ("geocoder_published_updated_timestamp_seconds", {}, unix_time(latest["updated_at"]))]
         except (ValueError, KeyError, TypeError, AttributeError) as e:
             error = f"unexpected content ({e!r})"
     if error:
+        # No heartbeat either: the stale-build alert reads the published dates
+        # and treats their absence as OK, so a watchdog that can't read them
+        # has to fall silent for watchdog-silent to page.
         log.add(f"could not read {opts.latest_url}: {error}", level="error")
-        return samples, log
-
-    log.add(f"published build {latest['latest']}, updated {latest['updated_at']}")
-    return samples + published, log
+    else:
+        samples.append(("geocoder_watchdog_heartbeat_timestamp_seconds", {}, int(now)))
+        log.add(f"published build {latest['latest']}, updated {latest['updated_at']}")
+    return samples + outcome_samples(read_job(opts.run), read_job(opts.job), now, log), log
 
 
 def escape(value):
@@ -298,13 +319,14 @@ def escape(value):
 
 
 def exposition(samples, timestamp_ms):
-    """Prometheus text, every sample at timestamp_ms with the identity labels.
-    It ends in a newline: VictoriaMetrics accepts a body without one and
-    stores nothing of its last line."""
+    """Prometheus text with the identity labels, each sample at its own time
+    (a fourth element, in seconds) or at timestamp_ms. It ends in a newline:
+    VictoriaMetrics accepts a body without one and stores nothing of its last
+    line."""
     lines = []
-    for name, labels, value in samples:
+    for name, labels, value, *at in samples:
         selector = ",".join(f'{key}="{escape(v)}"' for key, v in {**labels, **IDENTITY}.items())
-        lines.append(f"{name}{{{selector}}} {value} {timestamp_ms}\n")
+        lines.append(f"{name}{{{selector}}} {value} {at[0] * 1000 if at else timestamp_ms}\n")
     return "".join(lines)
 
 
@@ -391,22 +413,19 @@ def push_logs(url, lines, token):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Reports the geocoder nightly to FUTO o11y.")
     commands = parser.add_subparsers(dest="command", required=True)
-    night = commands.add_parser("nightly", help="a nightly run's metrics and logs")
-    night.add_argument("--job", default="", help="the job object from the GitHub API, as JSON")
-    night.add_argument("--job-status", default="", help="the job's status: success, failure or cancelled")
+    night = commands.add_parser("nightly", help="a nightly run's metrics and logs from its work dir")
     night.add_argument("--build-log", default="")
     night.add_argument("--memwatch-log", default="")
     night.add_argument("--results-dir", default="", help="generate_patches.sh's results dir")
     night.add_argument("--output-dir", default="", help="the build's output dir")
     night.add_argument("--build-date", default="")
     night.add_argument("--data-timestamp", default="", help="the data's OSM replication timestamp")
-    night.add_argument("--trigger", default="")
-    night.add_argument("--runner", default="", help="the runner scale set")
     night.add_argument("--run-id", default="")
     night.add_argument("--run-attempt", default="")
-    night.add_argument("--run-url", default="")
-    dog = commands.add_parser("watchdog", help="a heartbeat and the published build's age")
+    dog = commands.add_parser("watchdog", help="the published build's age, a heartbeat and the latest nightly's outcome")
     dog.add_argument("--latest-url", required=True)
+    dog.add_argument("--run", default="", help="the latest finished nightly's run object from the GitHub API, as JSON")
+    dog.add_argument("--job", default="", help="that run's job object from the GitHub API, as JSON")
     for command in (night, dog):
         command.add_argument("--base-url", default="", help="o11y's gateway, e.g. https://vmauth.futostatus.com")
         command.add_argument("--dry-run", action="store_true", help="print the metrics and log lines; send nothing")
@@ -431,12 +450,13 @@ def main(argv=None):
         return
 
     base_url = opts.base_url.rstrip("/")
-    _, error = with_retries(lambda: post(base_url + METRICS_PATH, metrics.encode(), "text/plain", token))
-    if error:
-        print(f"::warning::o11y metrics push failed: {error}", flush=True)
-        log.add(f"metrics push failed: {error}", level="error")
-    else:
-        print(f"Pushed {len(samples)} samples to o11y", flush=True)
+    if samples:
+        _, error = with_retries(lambda: post(base_url + METRICS_PATH, metrics.encode(), "text/plain", token))
+        if error:
+            print(f"::warning::o11y metrics push failed: {error}", flush=True)
+            log.add(f"metrics push failed: {error}", level="error")
+        else:
+            print(f"Pushed {len(samples)} samples to o11y", flush=True)
     lines = log_lines(log.records, now)
     sent, error = push_logs(base_url + LOGS_PATH, lines, token)
     if error:

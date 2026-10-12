@@ -46,7 +46,7 @@ def step(name, conclusion, started="2026-10-12T06:20:00Z", completed="2026-10-12
 
 
 def by_name(samples, name):
-    return {tuple(sorted(labels.items())): value for n, labels, value in samples if n == name}
+    return {tuple(sorted(labels.items())): value for n, labels, value, *_ in samples if n == name}
 
 
 class WorkDirTest(unittest.TestCase):
@@ -252,66 +252,34 @@ class NightlyTest(WorkDirTest):
         super().setUp()
         write(self.path("build.log"), BUILD_LOG)
         write(self.path("memwatch.log"), MEMWATCH_LOG)
-        job = {"started_at": "2026-10-12T06:17:30Z", "steps": [
-            step("Setup", "success"),
-            step("Download PBF and previous indexes", "success", "2026-10-12T06:18:00Z", "2026-10-12T06:20:28Z"),
-            step("Apply replication diffs", "skipped"),
-            step("Build geocoder index", "failure", "2026-10-12T06:20:28Z", "2026-10-12T06:28:11Z"),
-            step("Generate patches and verify", "skipped"),
-            step("Compress index files", "cancelled", started=None, completed=None),
-            step("Report to o11y", None, completed=None, status="in_progress"),
-        ]}
-        write(self.path("job.json"), json.dumps(job))
 
     def run_sut(self):
-        opts = sut.parse_args(["nightly", "--dry-run", "--job", self.path("job.json"), "--job-status", "failure",
-                               "--build-log", self.path("build.log"), "--memwatch-log", self.path("memwatch.log"),
-                               "--results-dir", self.path("results"), "--output-dir", self.path("output"),
-                               "--build-date", "2026-10-12", "--data-timestamp", "2026-10-12T00:00:00Z",
-                               "--trigger", "schedule", "--runner", "pokedex-giant", "--run-id", "38195429460",
-                               "--run-attempt", "2", "--run-url", "https://example.invalid/runs/38195429460"])
+        opts = sut.parse_args(["nightly", "--dry-run", "--build-log", self.path("build.log"),
+                               "--memwatch-log", self.path("memwatch.log"), "--results-dir", self.path("results"),
+                               "--output-dir", self.path("output"), "--build-date", "2026-10-12",
+                               "--data-timestamp", "2026-10-12T00:00:00Z", "--run-id", "38195429460",
+                               "--run-attempt", "2"])
         return sut.nightly(opts, NOW)
 
-    def test_reports_the_run_whatever_its_outcome(self):
+    def test_reports_the_data_age_the_build_phases_and_peak_memory(self):
         samples, _ = self.run_sut()
 
-        run = (("runner", "pokedex-giant"), ("trigger", "schedule"))
-        self.assertEqual(by_name(samples, "geocoder_build_last_run_timestamp_seconds"), {run: NOW})
-        self.assertEqual(by_name(samples, "geocoder_build_success"), {run: 0})
-        self.assertEqual(by_name(samples, "geocoder_build_duration_seconds"), {run: 42 * 60 + 30})
         self.assertEqual(by_name(samples, "geocoder_build_data_timestamp_seconds"), {(): NOW - 7 * 3600})
-
-    def test_reports_the_mapped_steps_that_ran(self):
-        samples, _ = self.run_sut()
-
-        self.assertEqual(by_name(samples, "geocoder_build_step_duration_seconds"), {
-            (("step", "download"),): 148, (("step", "build"),): 463, (("step", "compress"),): 0,
-        })
-        self.assertEqual(by_name(samples, "geocoder_build_step_success"), {
-            (("step", "download"),): 1, (("step", "build"),): 0, (("step", "compress"),): 0,
-        })
-
-    def test_reports_the_build_phases_and_peak_memory(self):
-        samples, _ = self.run_sut()
-
         self.assertEqual(len(by_name(samples, "geocoder_build_phase_duration_seconds")), 3)
         self.assertEqual(by_name(samples, "geocoder_build_peak_memory_bytes")[(("kind", "dirty"),)], 6478 * sut.MIB)
 
-    def test_logs_build_log_memwatch_each_finished_step_and_the_run_last(self):
+    def test_leaves_the_runs_outcome_to_the_watchdog(self):
+        samples, _ = self.run_sut()
+
+        self.assertEqual({name for name, *_ in samples} & {
+            "geocoder_build_success", "geocoder_build_duration_seconds", "geocoder_build_last_run_timestamp_seconds",
+            "geocoder_build_step_duration_seconds", "geocoder_build_step_success"}, set())
+
+    def test_logs_build_log_then_the_memwatch_samples(self):
         _, log = self.run_sut()
 
         lines = BUILD_LOG.splitlines() + MEMWATCH_LOG.splitlines()
-        self.assertEqual([(r["_msg"], r["step"]) for r in log.records[:len(lines)]], [(line, "build") for line in lines])
-        self.assertEqual([(r["_msg"], r.get("step"), r["level"]) for r in log.records[len(lines):]], [
-            ("Setup: success in 100s", None, "info"),
-            ("Download PBF and previous indexes: success in 148s", "download", "info"),
-            ("Apply replication diffs: skipped in 100s", "apply", "info"),
-            ("Build geocoder index: failure in 463s", "build", "error"),
-            ("Generate patches and verify: skipped in 100s", "patches", "info"),
-            ("Compress index files: cancelled in 0s", "compress", "error"),
-            ("run failure in 2550s, schedule on pokedex-giant: https://example.invalid/runs/38195429460",
-             None, "error"),
-        ])
+        self.assertEqual([(r["_msg"], r["step"]) for r in log.records], [(line, "build") for line in lines])
 
     def test_every_log_line_carries_the_app_the_run_and_the_identity_fields(self):
         _, log = self.run_sut()
@@ -321,17 +289,10 @@ class NightlyTest(WorkDirTest):
                              ("geocoder-build", "38195429460", "2", "2026-10-12"))
             self.assertEqual({key: record[key] for key in IDENTITY}, IDENTITY)
 
-    def test_a_run_that_failed_before_its_work_dir_reports_its_outcome_only(self):
-        opts = sut.parse_args(["nightly", "--dry-run", "--job-status", "cancelled", "--trigger", "workflow_dispatch",
-                               "--runner", "pokedex-giant", "--run-url", "https://example.invalid/runs/1"])
+    def test_a_run_that_failed_before_its_work_dir_reports_nothing(self):
+        samples, log = sut.nightly(sut.parse_args(["nightly", "--dry-run"]), NOW)
 
-        samples, log = sut.nightly(opts, NOW)
-
-        run = {"trigger": "workflow_dispatch", "runner": "pokedex-giant"}
-        self.assertEqual(samples, [("geocoder_build_last_run_timestamp_seconds", run, NOW),
-                                   ("geocoder_build_success", run, 0)])
-        self.assertEqual([r["_msg"] for r in log.records],
-                         ["run cancelled, workflow_dispatch on pokedex-giant: https://example.invalid/runs/1"])
+        self.assertEqual((samples, log.records), ([], []))
 
 
 class StepSlugsTest(unittest.TestCase):
@@ -342,32 +303,113 @@ class StepSlugsTest(unittest.TestCase):
         self.assertLessEqual(set(sut.STEP_SLUGS), names)
 
 
-class WatchdogTest(unittest.TestCase):
-    def run_sut(self, fetched):
-        opts = sut.parse_args(["watchdog", "--dry-run", "--latest-url", "https://example.invalid/latest.json"])
+LATEST = {"latest": "2026-10-12", "updated_at": "2026-10-12T06:45:24Z"}
+# The latest finished nightly, as the GitHub API returns its run and its job:
+# its runner was lost during the build.
+RUN = {"id": 38195429460, "run_attempt": 2, "event": "schedule", "conclusion": "failure",
+       "run_started_at": "2026-10-12T06:17:10Z", "updated_at": "2026-10-12T06:59:40Z",
+       "html_url": "https://example.invalid/runs/38195429460"}
+JOB = {"labels": ["pokedex-giant"], "started_at": "2026-10-12T06:17:30Z", "completed_at": "2026-10-12T06:58:30Z",
+       "steps": [
+           step("Setup", "success"),
+           step("Download PBF and previous indexes", "success", "2026-10-12T06:18:00Z", "2026-10-12T06:20:28Z"),
+           step("Apply replication diffs", "skipped"),
+           step("Build geocoder index", "failure", "2026-10-12T06:20:28Z", "2026-10-12T06:28:11Z"),
+           step("Generate patches and verify", "skipped"),
+           step("Compress index files", "cancelled", started=None, completed=None),
+       ]}
+FINISHED = sut.unix_time("2026-10-12T06:58:30Z")
+
+
+class WatchdogTest(WorkDirTest):
+    def run_sut(self, fetched, run=None, job=None, now=NOW):
+        args = ["watchdog", "--dry-run", "--latest-url", "https://example.invalid/latest.json"]
+        if run is not None:
+            write(self.path("run.json"), json.dumps(run))
+            write(self.path("job.json"), json.dumps(job or {}))
+            args += ["--run", self.path("run.json"), "--job", self.path("job.json")]
         with mock.patch.object(sut, "fetch", side_effect=fetched), mock.patch.object(sut.time, "sleep"):
-            return sut.watchdog(opts, NOW)
+            return sut.watchdog(sut.parse_args(args), now)
 
-    def test_reports_the_heartbeat_and_the_published_build(self):
-        latest = {"latest": "2026-10-12", "updated_at": "2026-10-12T06:45:24Z"}
-
-        samples, log = self.run_sut([json.dumps(latest).encode()])
+    def test_reports_the_published_build_with_the_heartbeat(self):
+        samples, log = self.run_sut([json.dumps(LATEST).encode()])
 
         self.assertEqual(samples, [
-            ("geocoder_watchdog_heartbeat_timestamp_seconds", {}, NOW),
             ("geocoder_published_build_timestamp_seconds", {}, NOW - 7 * 3600),
             ("geocoder_published_updated_timestamp_seconds", {}, NOW - 15 * 60 + 24),
+            ("geocoder_watchdog_heartbeat_timestamp_seconds", {}, NOW),
         ])
         self.assertEqual(log.records, [{"_msg": "published build 2026-10-12, updated 2026-10-12T06:45:24Z",
                                         "level": "info", "app": "geocoder-watchdog", **IDENTITY}])
 
-    def test_reports_the_heartbeat_alone_when_latest_json_is_unreadable(self):
+    def test_sends_no_heartbeat_when_latest_json_is_unreadable(self):
         for fetched in ([OSError("timed out")] * (sut.HTTP_RETRIES + 1), [b"<html>"], [b'{"latest": "2026-10-12"}']):
             with self.subTest(fetched=fetched[0]):
                 samples, log = self.run_sut(fetched)
 
-                self.assertEqual(samples, [("geocoder_watchdog_heartbeat_timestamp_seconds", {}, NOW)])
+                self.assertEqual(samples, [])
                 self.assertEqual([(r["app"], r["level"]) for r in log.records], [("geocoder-watchdog", "error")])
+
+    def test_reports_the_latest_nightlys_outcome_and_steps(self):
+        samples, _ = self.run_sut([json.dumps(LATEST).encode()], RUN, JOB)
+
+        run = (("runner", "pokedex-giant"), ("trigger", "schedule"))
+        self.assertEqual(by_name(samples, "geocoder_build_last_run_timestamp_seconds"), {run: FINISHED})
+        self.assertEqual(by_name(samples, "geocoder_build_success"), {run: 0})
+        self.assertEqual(by_name(samples, "geocoder_build_duration_seconds"), {run: 41 * 60})
+        self.assertEqual(by_name(samples, "geocoder_build_step_duration_seconds"), {
+            (("step", "download"),): 148, (("step", "build"),): 463, (("step", "compress"),): 0,
+        })
+        self.assertEqual(by_name(samples, "geocoder_build_step_success"), {
+            (("step", "download"),): 1, (("step", "build"),): 0, (("step", "compress"),): 0,
+        })
+
+    def test_stamps_the_outcome_with_the_time_the_run_finished(self):
+        samples, _ = self.run_sut([json.dumps(LATEST).encode()], RUN, JOB)
+
+        lines = sut.exposition(samples, NOW * 1000).splitlines()
+        self.assertTrue(all(line.endswith(f" {FINISHED * 1000}") for line in lines if line.startswith("geocoder_build_")))
+        self.assertTrue(all(line.endswith(f" {NOW * 1000}") for line in lines if not line.startswith("geocoder_build_")))
+
+    def test_reports_the_outcome_even_when_latest_json_is_unreadable(self):
+        samples, _ = self.run_sut([b"<html>"], RUN, JOB)
+
+        self.assertIn("geocoder_build_success", {name for name, *_ in samples})
+
+    def test_logs_a_run_on_the_first_tick_after_it_finished(self):
+        _, log = self.run_sut([json.dumps(LATEST).encode()], RUN, JOB)
+
+        self.assertEqual([(r["_msg"], r.get("step"), r["level"], r["app"]) for r in log.records], [
+            ("published build 2026-10-12, updated 2026-10-12T06:45:24Z", None, "info", "geocoder-watchdog"),
+            ("Setup: success in 100s", None, "info", "geocoder-build"),
+            ("Download PBF and previous indexes: success in 148s", "download", "info", "geocoder-build"),
+            ("Apply replication diffs: skipped in 100s", "apply", "info", "geocoder-build"),
+            ("Build geocoder index: failure in 463s", "build", "error", "geocoder-build"),
+            ("Generate patches and verify: skipped in 100s", "patches", "info", "geocoder-build"),
+            ("Compress index files: cancelled in 0s", "compress", "error", "geocoder-build"),
+            ("run failure in 2460s, schedule on pokedex-giant: https://example.invalid/runs/38195429460",
+             None, "error", "geocoder-build"),
+        ])
+        for record in log.records[1:]:
+            self.assertEqual((record["run_id"], record["run_attempt"]), ("38195429460", "2"))
+
+    def test_reports_but_does_not_log_a_run_an_earlier_tick_logged(self):
+        later = FINISHED + sut.RUN_LOG_WINDOW_SECONDS + 1
+
+        samples, log = self.run_sut([json.dumps(LATEST).encode()], RUN, JOB, now=later)
+
+        self.assertIn("geocoder_build_success", {name for name, *_ in samples})
+        self.assertEqual([r["app"] for r in log.records], ["geocoder-watchdog"])
+
+    def test_a_run_without_a_conclusion_or_no_run_reports_no_outcome(self):
+        for run in ({}, {**RUN, "conclusion": None}):
+            with self.subTest(run=run):
+                samples, log = self.run_sut([json.dumps(LATEST).encode()], run, JOB)
+
+                self.assertEqual([name for name, *_ in samples], [
+                    "geocoder_published_build_timestamp_seconds", "geocoder_published_updated_timestamp_seconds",
+                    "geocoder_watchdog_heartbeat_timestamp_seconds"])
+                self.assertEqual(len(log.records), 1)
 
 
 class Gateway(http.server.BaseHTTPRequestHandler):
@@ -439,7 +481,9 @@ class MainTest(GatewayTest, WorkDirTest):
     def setUp(self):
         GatewayTest.setUp(self)
         WorkDirTest.setUp(self)
-        write(self.path("build.log"), "".join(f"build line {i}\n" for i in range(5)))
+        write(self.path("build.log"), "build line 0\n  [3.7s 27.9/88cores 31% 2079MiB] Pass 1: relation scanning\n"
+                                      "build line 2\n  [35.3s 60.9/88cores 69% 36031MiB] Pass 2: node processing\n"
+                                      "build line 4\n")
 
     def tearDown(self):
         WorkDirTest.tearDown(self)
@@ -451,9 +495,7 @@ class MainTest(GatewayTest, WorkDirTest):
             os.environ.pop(sut.TOKEN_ENV, None)
             if token:
                 os.environ[sut.TOKEN_ENV] = token
-            sut.main(["nightly", "--job-status", "success", "--trigger", "schedule", "--runner", "pokedex-giant",
-                      "--build-log", self.path("build.log"), "--run-id", "7",
-                      "--run-url", "https://example.invalid/runs/7", *args])
+            sut.main(["nightly", "--build-log", self.path("build.log"), "--run-id", "7", *args])
         return stdout.getvalue()
 
     def requests_to(self, path):
@@ -468,27 +510,34 @@ class MainTest(GatewayTest, WorkDirTest):
         [(_, metrics_type, metrics_auth, metrics)] = self.requests_to("/insert/0/prometheus/api/v1/import/prometheus")
         self.assertEqual((metrics_type, metrics_auth), ("text/plain", "Bearer s3cret"))
         self.assertEqual([line.split(b"{")[0] for line in metrics.splitlines()],
-                         [b"geocoder_build_last_run_timestamp_seconds", b"geocoder_build_success"])
+                         [b"geocoder_build_phase_duration_seconds"] * 2)
         self.assertTrue(all(IDENTITY_LABELS.encode() + b"} " in line for line in metrics.splitlines()), metrics)
         self.assertEqual({(type_, auth) for _, type_, auth, _ in self.requests_to("/insert/jsonline")},
                          {("application/stream+json", "Bearer s3cret")})
         records = self.sent_records()
-        self.assertEqual([r["_msg"] for r in records], [f"build line {i}" for i in range(5)] + [
-            "run success, schedule on pokedex-giant: https://example.invalid/runs/7"])
+        self.assertEqual(len(records), 5)
         for record in records:
             self.assertEqual({key: record[key] for key in IDENTITY}, IDENTITY)
             self.assertEqual((record["app"], record["run_id"]), ("geocoder-build", "7"))
             self.assertRegex(record["_time"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z$")
         self.assertIn("Pushed 2 samples to o11y", out)
-        self.assertIn("Pushed 6 log lines to o11y", out)
+        self.assertIn("Pushed 5 log lines to o11y", out)
         self.assertNotIn("s3cret", out)
+
+    def test_sends_no_metrics_request_without_samples(self):
+        write(self.path("build.log"), "build line 0\n")
+
+        self.run_main("--base-url", self.base_url)
+
+        self.assertEqual(self.requests_to(sut.METRICS_PATH), [])
+        self.assertEqual(len(self.sent_records()), 1)
 
     def test_sends_the_log_lines_in_batches(self):
         with mock.patch.object(sut, "LOG_BATCH_LINES", 4):
             self.run_main("--base-url", self.base_url)
 
-        self.assertEqual([body.count(b"\n") for _, _, _, body in self.requests_to("/insert/jsonline")], [4, 2])
-        self.assertEqual(len(self.sent_records()), 6)
+        self.assertEqual([body.count(b"\n") for _, _, _, body in self.requests_to("/insert/jsonline")], [4, 1])
+        self.assertEqual(len(self.sent_records()), 5)
 
     def test_without_a_token_sends_nothing_and_warns(self):
         for token in ("", "  "):
@@ -517,22 +566,22 @@ class MainTest(GatewayTest, WorkDirTest):
 
         self.assertEqual(len(self.requests_to(sut.LOGS_PATH)), 2)
         self.sleep.assert_not_called()
-        self.assertIn("::warning::o11y logs push failed after 2 of 6 lines: HTTP 401: cannot parse line", out)
+        self.assertIn("::warning::o11y logs push failed after 2 of 5 lines: HTTP 401: cannot parse line", out)
 
     def test_an_unreachable_gateway_is_warned_and_not_raised(self):
         out = self.run_main("--base-url", "http://127.0.0.1:9")
 
         self.assertIn("::warning::o11y metrics push failed: ", out)
-        self.assertIn("::warning::o11y logs push failed after 0 of 7 lines: ", out)
+        self.assertIn("::warning::o11y logs push failed after 0 of 6 lines: ", out)
 
     def test_dry_run_prints_the_metrics_then_the_log_lines_and_sends_nothing(self):
         out = self.run_main("--dry-run", "--base-url", self.base_url).splitlines()
 
-        run = f'{{trigger="schedule",runner="pokedex-giant",{IDENTITY_LABELS}}}'
-        self.assertTrue(out[0].startswith(f"geocoder_build_last_run_timestamp_seconds{run} "), out[0])
-        self.assertTrue(out[1].startswith(f"geocoder_build_success{run} 1 "), out[1])
-        self.assertEqual([json.loads(line)["_msg"] for line in out[2:]], [f"build line {i}" for i in range(5)] + [
-            "run success, schedule on pokedex-giant: https://example.invalid/runs/7"])
+        phase = 'geocoder_build_phase_duration_seconds{phase="Pass 1: relation scanning",'
+        self.assertTrue(out[0].startswith(phase + IDENTITY_LABELS + "} 3.7 "), out[0])
+        self.assertEqual([json.loads(line)["_msg"] for line in out[2:]], [
+            "build line 0", "  [3.7s 27.9/88cores 31% 2079MiB] Pass 1: relation scanning", "build line 2",
+            "  [35.3s 60.9/88cores 69% 36031MiB] Pass 2: node processing", "build line 4"])
         self.assertEqual(self.server.requests, [])
 
     def test_needs_a_base_url_or_a_dry_run(self):

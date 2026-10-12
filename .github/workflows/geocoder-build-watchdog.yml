@@ -135,6 +135,9 @@ jobs:
   report:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read # the latest nightly's run and job
     env:
       # geocoder-build.yml's O11Y_URL.
       O11Y_URL: https://vmauth.futostatus.com
@@ -149,8 +152,11 @@ jobs:
 
       # The token is read here and handed to the report alone, as in
       # geocoder-build.yml's Report to o11y.
-      - name: Report the published build
+      # The latest finished nightly on main, whatever ended it: a run whose
+      # runner died or that timed out never reaches its own report step.
+      - name: Report the published build and the latest nightly
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
         run: |
           if ! token=$(op read "op://tf_prod/O11Y_VICTORIAMETRICS_VMAUTH_PASSWORD/password"); then
@@ -158,5 +164,15 @@ jobs:
             exit 0
           fi
           echo "::add-mask::$token"
+          RUN_JSON="$RUNNER_TEMP/o11y-run.json"
+          JOB_JSON="$RUNNER_TEMP/o11y-job.json"
+          if gh api "repos/$GITHUB_REPOSITORY/actions/workflows/geocoder-build.yml/runs?branch=main&status=completed&per_page=1" \
+               --jq '.workflow_runs[0] // {}' > "$RUN_JSON" \
+             && run_id=$(jq -r '.id // empty' "$RUN_JSON") && [ -n "$run_id" ]; then
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/attempts/$(jq -r .run_attempt "$RUN_JSON")/jobs" \
+              --jq '.jobs[0] // {}' > "$JOB_JSON" || echo "::warning::Could not read the nightly's job"
+          else
+            echo "::warning::No finished nightly on main to report"
+          fi
           O11Y_TOKEN="$token" python3 geocoder/builder/tools/o11y_report.py watchdog --base-url "$O11Y_URL" \
-            --latest-url "$LATEST_JSON_URL"
+            --latest-url "$LATEST_JSON_URL" --run "$RUN_JSON" --job "$JOB_JSON"

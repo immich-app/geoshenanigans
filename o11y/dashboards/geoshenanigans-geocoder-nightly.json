@@ -1148,7 +1148,7 @@
         "type": "victoriametrics-logs-datasource",
         "uid": "${logs}"
       },
-      "description": "What the report step pushes to VictoriaLogs: a line per step, the run summary with its URL, build.log, the per-variant patch results and the memwatch samples. Every line carries step, run_id, run_attempt, build_date and level; filter on a run_id from Log details to follow one run.",
+      "description": "The run's lines in VictoriaLogs: build.log, the per-variant patch results and the memwatch samples from its report step, then a line per step and the run summary with its URL from the watchdog's first tick after it finished. Every line carries run_id, run_attempt and level, the report step's also build_date; filter on a run_id from Log details to follow one run.",
       "gridPos": {
         "h": 16,
         "w": 24,
