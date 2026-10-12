@@ -53,7 +53,9 @@ jobs:
           # branch — that's the only branch GitHub fires scheduled
           # workflows from, so it's where the build workflow lives in
           # production. Derive it instead of hardcoding a branch name.
-          BUILD_REF=$(gh repo view --json defaultBranchRef --jq .defaultBranchRef.name)
+          # `gh repo view` ignores GH_REPO and, without an argument, reads
+          # the repo from a checkout this job doesn't have.
+          BUILD_REF=$(gh repo view "$GH_REPO" --json defaultBranchRef --jq .defaultBranchRef.name)
 
           # Fetch the last 30 runs of the build workflow and filter to
           # today's runs ON THE DEFAULT BRANCH. The headBranch filter
