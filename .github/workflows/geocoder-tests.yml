@@ -22,8 +22,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake libzstd-dev zlib1g-dev libprotozero-dev \
-            libbz2-dev libdeflate-dev libexpat1-dev libs2-dev zstd
+            build-essential cmake zlib1g-dev libprotozero-dev \
+            libbz2-dev libdeflate-dev libexpat1-dev zstd
       - name: Build + run tests
         run: |
           cd geocoder/builder && mkdir -p build && cd build
@@ -44,8 +44,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake libzstd-dev zlib1g-dev libprotozero-dev \
-            libbz2-dev libdeflate-dev libexpat1-dev libs2-dev
+            build-essential cmake zlib1g-dev libprotozero-dev \
+            libbz2-dev libdeflate-dev libexpat1-dev
       - name: Build + run tests
         run: |
           cd geocoder/builder && mkdir -p build && cd build
@@ -67,7 +67,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake libzstd-dev zlib1g-dev libprotozero-dev \
+            build-essential cmake zlib1g-dev libprotozero-dev \
             libbz2-dev libdeflate-dev libexpat1-dev libssl-dev patch xz-utils
       - name: Restore S2
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

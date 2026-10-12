@@ -72,9 +72,9 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq cmake g++ libz-dev libzstd-dev \
+          sudo apt-get install -y -qq cmake g++ libz-dev \
             libbz2-dev libdeflate-dev libexpat1-dev libssl-dev patch xz-utils \
-            libosmium2-dev aria2 jq osmium-tool
+            libprotozero-dev aria2 jq osmium-tool
           curl -sL "https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-64bit.tar.gz" \
             -o /tmp/s5cmd.tar.gz
           sudo tar xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd
