@@ -8,7 +8,7 @@ jq = "1.8.2"
 yq = "4.53.6"
 kustomize = "5.8.1"
 kubeconform = "0.8.0"
-flux2 = "2.9.5"
+flux2 = "2.9.6"
 # github backend: the aqua backend fails to verify cosign v3's sigstore bundles.
 "github:sigstore/cosign" = "v3.1.3"
 
