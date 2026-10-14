@@ -39,6 +39,11 @@ static constexpr size_t SCAN_SEARCH_CHUNK = 128 * 1024;
 // Value is exactly 1e-9 == 0.000000001 (same nearest double).
 static constexpr double NANO_DEG = 1e-9;
 
+// Dense node blocks whose locations aren't whole 1e-7 degrees (granularity
+// other than OSM's 100 nanodegrees, or nonzero offsets): the precision study
+// reads every location as an exact 1e-7 integer, which holds only without them.
+std::atomic<uint64_t> g_pbf_nonstandard_coord_blocks{0};
+
 // --- File I/O helpers ---
 
 static std::string read_bytes(int fd, size_t offset, size_t count) {
@@ -274,6 +279,8 @@ size_t decode_nodes_streaming(const char* data, size_t size, const NodeCallback&
             case PrimitiveBlockTag::LAT_OFFSET: lat_offset = pb.get_int64(); break;
             case PrimitiveBlockTag::LON_OFFSET: lon_offset = pb.get_int64(); break;
             case PrimitiveBlockTag::PRIMITIVEGROUP: {
+                if (granularity != 100 || lat_offset != 0 || lon_offset != 0)
+                    g_pbf_nonstandard_coord_blocks.fetch_add(1, std::memory_order_relaxed);
                 protozero::pbf_reader group = pb.get_message();
                 while (group.next()) {
                     if (group.tag() == PrimitiveGroupTag::NODES) {

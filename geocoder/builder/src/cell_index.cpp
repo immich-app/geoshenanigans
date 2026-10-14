@@ -798,6 +798,9 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                 if (!points_file) throw std::runtime_error("failed to write " + points_path);
                 bytes_file.flush();
                 if (!bytes_file) throw std::runtime_error("failed to write " + bytes_path);
+                if (const auto total = static_cast<uint64_t>(bytes_file.tellp()); total > UINT32_MAX)
+                    std::cerr << label << "WARNING: addr_vertices.bin is " << total
+                              << " bytes: AddrPoint's 32-bit vertex_offset wraps past 4 GiB" << std::endl;
                 emit_strategy2_sidecar(output_dir + "/addr_points.osm_ids",
                                         data.addr_sidecar_blob, data.addr_osm_ids);
                 log_phase((label + "addr points").c_str(), _at, _ac);

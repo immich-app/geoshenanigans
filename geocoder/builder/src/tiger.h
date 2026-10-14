@@ -14,6 +14,7 @@
 #include "country_code.h"
 #include "geometry.h"
 #include "parsed_data.h"
+#include "precision_dumps.h"
 #include "types.h"
 
 // TIGER covers the US and its territories; OSM (and so Nominatim) keeps the
@@ -55,6 +56,9 @@ struct TigerCsv {
 
 inline TigerCsv parse_tiger_csv(std::string_view text) {
     TigerCsv csv;
+    // Precision-study dump (off unless asked for): the CSV's own coordinates.
+    precision::DumpBuffer dump(precision::exact_file(&precision::Dumps::interps));
+    std::vector<PackedLocation> exact;
     std::unordered_map<std::string_view, uint32_t> string_ids;
     auto string_id = [&](std::string_view s) {
         auto [it, inserted] = string_ids.try_emplace(s, static_cast<uint32_t>(csv.strings.size()));
@@ -107,6 +111,7 @@ inline TigerCsv parse_tiger_csv(std::string_view text) {
 
         coords_str.assign(geometry.substr(paren_start + 1, paren_end - paren_start - 1));
         nodes.clear();
+        exact.clear();
 
         size_t cpos = 0;
         while (cpos < coords_str.size()) {
@@ -124,6 +129,7 @@ inline TigerCsv parse_tiger_csv(std::string_view text) {
 
             if (lat != 0 || lng != 0) {
                 nodes.push_back({static_cast<float>(lat), static_cast<float>(lng)});
+                if (dump.on()) exact.push_back({precision::e7(lat), precision::e7(lng)});
             }
         }
 
@@ -136,6 +142,7 @@ inline TigerCsv parse_tiger_csv(std::string_view text) {
         if (from_num > to_num) {
             std::swap(from_num, to_num);
             std::reverse(nodes.begin(), nodes.end());
+            std::reverse(exact.begin(), exact.end());
         }
         if ((interp_type == "odd" && from_num % 2 == 0) || (interp_type == "even" && from_num % 2 == 1)) {
             from_num++;
@@ -177,6 +184,8 @@ inline TigerCsv parse_tiger_csv(std::string_view text) {
             mix(static_cast<uint64_t>(gb));
         }
         range.synthetic_id = syn_h & 0x00FFFFFFFFFFFFFFull;
+        precision::put_line(dump, pack_osm_id(gc::id_alloc::ObjectType::SYNTHETIC, static_cast<int64_t>(range.synthetic_id)),
+                            exact);
 
         // Accumulate TIGER postcode centroids — TIGER has excellent
         // US zip code coverage that OSM addr:postcode mostly lacks.

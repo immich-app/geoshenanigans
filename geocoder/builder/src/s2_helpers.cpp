@@ -3,6 +3,7 @@
 #include "country_code.h"
 #include "parallel.h"
 #include "segment_rect.h"
+#include "precision_dumps.h"
 
 #include <algorithm>
 #include <cmath>
@@ -377,6 +378,14 @@ void add_admin_polygon(ParsedData& data,
     canonicalize_ring_rotation(vertices);
 
     auto simplified = simplify_admin_polygon(vertices, admin_level);
+    if (osm_way_id != 0) {
+        // Precision-study dump (off unless asked for), keyed as admin_osm_ids below.
+        precision::DumpBuffer dump(precision::exact_file(&precision::Dumps::admins));
+        precision::put_admin(dump,
+                             (static_cast<uint64_t>(gc::id_alloc::ObjectType::OSM_WAY) << 56) |
+                                 (static_cast<uint64_t>(osm_way_id) & 0x00FFFFFFFFFFFFFFull),
+                             admin_level, precision::AdminSource::ClosedWay, 0, osm_way_id, vertices, simplified);
+    }
     if (simplified.size() < 3) return;
 
     uint32_t poly_id = static_cast<uint32_t>(data.admin_polygons.size());

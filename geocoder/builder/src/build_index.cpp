@@ -59,6 +59,15 @@
 #include "vertex_pack.h"
 #include "memory_limit.h"
 #include "write_schedule.h"
+#include "precision_dumps.h"
+
+// Building outlines (addr points of closed ways) keep at most this many
+// vertices, Douglas-Peucker'd down to it; 0 keeps them whole.
+static size_t kBuildingOutlineCap = 20;
+
+// Dense node blocks whose granularity/offsets aren't OSM's 100 nanodegrees
+// at offset 0: their locations are not whole 1e-7 degrees (pbf_reader.cpp).
+extern std::atomic<uint64_t> g_pbf_nonstandard_coord_blocks;
 
 
 // --- Place type override classification ---
@@ -2511,6 +2520,88 @@ static std::pair<size_t, std::future<void>> grow_beside(std::vector<T>& out, con
     return {out.size(), std::async(std::launch::async, [&out, n] { grow_by(out, n); })};
 }
 
+// Closes the precision-study dumps once the last record is in (the TIGER
+// interps load after the PBF passes) and logs their sizes and, with
+// --name-dumps, the features looked at per class.
+static void finish_dumps(precision::Dumps& d) {
+    for (precision::DumpFile* f : {&d.streets, &d.interps, &d.addrs, &d.admins, &d.names}) {
+        if (!f->is_open()) continue;
+        std::cerr << "  Precision dump " << f->path() << ": " << f->records() << " records, "
+                  << (f->bytes() >> 20) << " MiB" << std::endl;
+        f->close();
+    }
+    if (d.names_dir.empty()) return;
+
+    std::ofstream counts(d.names_dir + "/feature_counts.tsv");
+    counts << "class\tfeatures_seen\tfeatures_with_name_tags\n";
+    for (size_t c = 0; c < precision::kNameClasses; c++) {
+        const char* label = precision::name_class_label(static_cast<precision::NameClass>(c));
+        counts << label << "\t" << d.name_seen[c] << "\t" << d.name_named[c] << "\n";
+        std::cerr << "  Name dump " << label << ": " << d.name_named[c] << " of " << d.name_seen[c]
+                  << " features carry name tags" << std::endl;
+    }
+}
+
+// A relation's tags for precision::NameDump::feature.
+static auto relation_tags(const PbfRelation& rel) {
+    return [&rel](auto&& emit) {
+        const auto* st = rel.tags.string_table;
+        if (!st) return;
+        for (const auto& [ki, vi] : rel.tags.indices)
+            if (ki < st->size() && vi < st->size()) emit(std::string_view((*st)[ki]), std::string_view((*st)[vi]));
+    };
+}
+
+// Logs and, with --exact-dumps, writes the building outline counters and the
+// per-worker sizes of the flat outline vertex arrays.
+static void report_outlines(const precision::OutlineStats& s, const std::vector<size_t>& worker_vertices,
+                            const std::vector<size_t>& worker_capacity) {
+    auto mib = [](double bytes) { return bytes / (1024.0 * 1024.0); };
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(1);
+    out << "  Building outlines (cap " << kBuildingOutlineCap << "): " << s.outlines << " outlines, "
+        << s.points_before << " vertices before the cap, " << s.points_after << " stored; "
+        << s.over_default << " outlines over 20 vertices (" << s.over_default_points << " vertices), "
+        << s.trimmed << " trimmed by the cap in force; largest " << s.max_points << " vertices\n";
+    out << "  outline_bucket\tmax_vertices\toutlines\tvertices_before\tvertices_stored\n";
+    for (size_t b = 0; b < precision::kOutlineBucketMax.size(); b++)
+        out << "  outline_bucket\t"
+            << (precision::kOutlineBucketMax[b] == UINT32_MAX ? std::string("inf")
+                                                              : std::to_string(precision::kOutlineBucketMax[b]))
+            << "\t" << s.bucket_outlines[b] << "\t" << s.bucket_points_before[b] << "\t" << s.bucket_points_after[b]
+            << "\n";
+    size_t sum = 0, sum_cap = 0, max_v = 0, max_c = 0, min_v = SIZE_MAX;
+    for (size_t k = 0; k < worker_vertices.size(); k++) {
+        sum += worker_vertices[k];
+        sum_cap += worker_capacity[k];
+        max_v = std::max(max_v, worker_vertices[k]);
+        max_c = std::max(max_c, worker_capacity[k]);
+        min_v = std::min(min_v, worker_vertices[k]);
+    }
+    out << "  Building vertex arrays at the end of the way pass, " << worker_vertices.size()
+        << " workers: sum " << sum << " vertices (" << mib(sum * sizeof(NodeCoord)) << " MiB, capacity "
+        << mib(sum_cap * sizeof(NodeCoord)) << " MiB), per worker max " << max_v << " ("
+        << mib(max_v * sizeof(NodeCoord)) << " MiB, capacity " << mib(max_c * sizeof(NodeCoord)) << " MiB), min "
+        << (worker_vertices.empty() ? 0 : min_v) << "\n";
+    std::cerr << out.str();
+    if (!precision::g_dumps || precision::g_dumps->exact_dir.empty()) return;
+
+    std::ofstream f(precision::g_dumps->exact_dir + "/building_outlines.tsv");
+    f << "cap\t" << kBuildingOutlineCap << "\noutlines\t" << s.outlines << "\nvertices_before\t" << s.points_before
+      << "\nvertices_stored\t" << s.points_after << "\noutlines_over_20\t" << s.over_default
+      << "\nvertices_of_outlines_over_20\t" << s.over_default_points << "\ntrimmed_by_cap\t" << s.trimmed
+      << "\nlargest\t" << s.max_points << "\n";
+    f << "\nbucket_max_vertices\toutlines\tvertices_before\tvertices_stored\n";
+    for (size_t b = 0; b < precision::kOutlineBucketMax.size(); b++)
+        f << (precision::kOutlineBucketMax[b] == UINT32_MAX ? std::string("inf")
+                                                           : std::to_string(precision::kOutlineBucketMax[b]))
+          << "\t" << s.bucket_outlines[b] << "\t" << s.bucket_points_before[b] << "\t" << s.bucket_points_after[b]
+          << "\n";
+    f << "\nworker\tvertices\tcapacity_vertices\n";
+    for (size_t k = 0; k < worker_vertices.size(); k++)
+        f << k << "\t" << worker_vertices[k] << "\t" << worker_capacity[k] << "\n";
+}
+
 static int run(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [options]" << std::endl;
@@ -2539,6 +2630,8 @@ static int run(int argc, char* argv[]) {
     // the same dense IDs to records carried over from the previous
     // build. Empty means "fresh start, no stable IDs".
     std::string prev_output_dir;
+    std::string exact_dumps_dir;
+    std::string name_dumps_dir;
     bool multi_output = false;
     bool generate_continents = false;
     IndexMode mode = IndexMode::Full;
@@ -2600,6 +2693,12 @@ static int run(int argc, char* argv[]) {
             external_postcodes_path = argv[++i];
         } else if (arg == "--prev-output" && i + 1 < argc) {
             prev_output_dir = argv[++i];
+        } else if (arg == "--building-outline-cap" && i + 1 < argc) {
+            kBuildingOutlineCap = static_cast<size_t>(std::strtoul(argv[++i], nullptr, 10));
+        } else if (arg == "--exact-dumps" && i + 1 < argc) {
+            exact_dumps_dir = argv[++i];
+        } else if (arg == "--name-dumps" && i + 1 < argc) {
+            name_dumps_dir = argv[++i];
         } else {
             input_files.push_back(arg);
         }
@@ -2611,6 +2710,33 @@ static int run(int argc, char* argv[]) {
     if (simplify_mode == SimplifyMode::ErrorBounded) {
         std::cerr << "Simplification: error-bounded, fixed " << simplify_epsilon_override << "m epsilon" << std::endl;
     }
+    std::cerr << "Building outline cap: "
+              << (kBuildingOutlineCap ? std::to_string(kBuildingOutlineCap) + " vertices" : std::string("none"))
+              << std::endl;
+
+    // Precision-study side outputs (never shipped; see precision_dumps.h).
+    precision::Dumps dumps;
+    if (!exact_dumps_dir.empty() || !name_dumps_dir.empty()) {
+        if (!exact_dumps_dir.empty() && !prev_output_dir.empty())
+            throw std::runtime_error("--exact-dumps keys records by a cold build's ids: drop --prev-output");
+        if (!exact_dumps_dir.empty()) {
+            ensure_dir(exact_dumps_dir);
+            dumps.exact_dir = exact_dumps_dir;
+            dumps.streets.open(exact_dumps_dir + "/streets.raw");
+            dumps.interps.open(exact_dumps_dir + "/interps.raw");
+            dumps.addrs.open(exact_dumps_dir + "/addrs.raw");
+            dumps.admins.open(exact_dumps_dir + "/admins.raw");
+        }
+        if (!name_dumps_dir.empty()) {
+            ensure_dir(name_dumps_dir);
+            dumps.names_dir = name_dumps_dir;
+            dumps.names.open(name_dumps_dir + "/names.tsv");
+        }
+        precision::g_dumps = &dumps;
+    }
+    struct DumpsOff {
+        ~DumpsOff() { precision::g_dumps = nullptr; }
+    } dumps_off;
 
     ParsedData data;
     auto _pt = std::chrono::steady_clock::now();
@@ -2694,8 +2820,26 @@ static int run(int argc, char* argv[]) {
                     std::vector<CollectedPoiRelation> poi_relations;
                 };
                 std::vector<Collected> collected(pbf.thread_count());
+                std::vector<precision::NameDump> rel_names(pbf.thread_count());
+                if (precision::g_dumps)
+                    for (auto& d : rel_names) d.buf.bind(&precision::g_dumps->names);
+                // Name dump line of one boundary-like relation, written when
+                // the relation's turn ends; `shipped` once it is collected.
+                struct AdminNameLine {
+                    precision::NameDump& dump;
+                    const PbfRelation& rel;
+                    std::string subtype;
+                    bool shipped = false;
+                    AdminNameLine(precision::NameDump& d, const PbfRelation& r, std::string s)
+                        : dump(d), rel(r), subtype(std::move(s)) {}
+                    AdminNameLine(const AdminNameLine&) = delete;
+                    ~AdminNameLine() {
+                        dump.feature(precision::NameClass::Admin, 'r', rel.id, subtype, shipped, relation_tags(rel));
+                    }
+                };
                 pbf.read_blocks([&](PbfBlock& block, unsigned thread) {
                     Collected& mine = collected[thread];
+                    precision::NameDump& names = rel_names[thread];
                     for (auto& rel : block.relations) {
                         const char* boundary = rel.tag("boundary");
                         const char* rel_type = rel.tag("type");
@@ -2716,6 +2860,15 @@ static int run(int argc, char* argv[]) {
                         bool is_postal = boundary && std::strcmp(boundary, "postal_code") == 0;
                         bool is_place_boundary = boundary && std::strcmp(boundary, "place") == 0;
                         if (!is_admin && !is_postal && !is_place_boundary && !is_multipolygon_place) continue;
+
+                        std::optional<AdminNameLine> name_line;
+                        if (names.on()) {
+                            const char* lvl = rel.tag("admin_level");
+                            name_line.emplace(names, rel,
+                                is_admin ? std::string("administrative:") + (lvl ? lvl : "")
+                                : is_postal ? std::string("postal_code")
+                                : std::string(is_place_boundary ? "place:" : "multipolygon:") + (rel_place ? rel_place : ""));
+                        }
 
                         // Capture label member node (Nominatim's primary place-link lookup)
                         int64_t label_node_id = -1;
@@ -2749,6 +2902,7 @@ static int run(int argc, char* argv[]) {
                                             }
                                         }
                                         if (!cr.members.empty()) {
+                                            if (name_line) name_line->shipped = true;
                                             mine.relations.push_back(std::move(cr));
                                             mine.wikidata.emplace_back(); // already has override, no wikidata needed
                                             if (label_node_id >= 0) mine.label_nodes.push_back(label_node_id);
@@ -2825,6 +2979,7 @@ static int run(int argc, char* argv[]) {
                             // to its place=city admin_centre node and drop out
                             // of the address hierarchy after Suginami wins.
                             std::string wd_str = wikidata_tag ? wikidata_tag : "";
+                            if (name_line) name_line->shipped = true;
                             mine.relations.push_back(std::move(cr));
                             mine.wikidata.push_back(std::move(wd_str));
                             if (label_node_id >= 0) mine.label_nodes.push_back(label_node_id);
@@ -2888,6 +3043,7 @@ static int run(int argc, char* argv[]) {
                             if (std::strcmp(r_office, "government") == 0) poi_cat = PoiCategory::GOVERNMENT;
                         }
 
+                        bool poi_shipped = false;
                         if (poi_cat != PoiCategory::UNKNOWN) {
                             const char* poi_name = rel.tag("name:en");
                             if (!poi_name) poi_name = rel.tag("name");
@@ -2944,11 +3100,20 @@ static int run(int argc, char* argv[]) {
                                     }
                                 }
 
-                                if (!cpr.members.empty()) mine.poi_relations.push_back(std::move(cpr));
+                                if (!cpr.members.empty()) {
+                                    poi_shipped = true;
+                                    mine.poi_relations.push_back(std::move(cpr));
+                                }
                             }
+                            names.feature(precision::NameClass::Poi, 'r', rel.id, poi_category_label(poi_cat),
+                                          poi_shipped, relation_tags(rel));
                         }
                     }
                 });
+                for (auto& d : rel_names) {
+                    d.buf.flush();
+                    if (precision::g_dumps) precision::g_dumps->add_name_counts(d);
+                }
                 // Which thread read a block is down to timing, so this join
                 // order is as arbitrary as the shared lock's was.
                 for (auto& c : collected) {
@@ -3060,10 +3225,19 @@ static int run(int argc, char* argv[]) {
                     std::vector<int64_t> place_osm_node_ids; // parallel to place_nodes; strategy-2 stable identity
                     std::vector<uint32_t> place_names;
                     std::vector<std::tuple<std::string, int64_t, uint8_t>> place_wikidata; // (wikidata_id, node_id, PlaceType)
+                    // Precision-study dumps (off unless asked for).
+                    precision::DumpBuffer addr_dump;
+                    precision::NameDump names;
                 };
                 // Use thread_local for streaming callback (no thread index available)
                 static thread_local NodeThreadLocal* tl_node_data = nullptr;
                 std::vector<NodeThreadLocal> ntld(num_threads);
+                if (precision::g_dumps) {
+                    for (auto& l : ntld) {
+                        l.addr_dump.bind(precision::exact_file(&precision::Dumps::addrs));
+                        l.names.buf.bind(&precision::g_dumps->names);
+                    }
+                }
                 std::atomic<unsigned> next_tl{0};
                 auto _st = std::chrono::steady_clock::now();
                 auto _sc = CpuTicks::now();
@@ -3182,6 +3356,12 @@ static int run(int argc, char* argv[]) {
                                 (postcode && postcode[0]) ? strs.add(postcode) : StringDict::kNone);
                             tl_node_data->addr_osm_node_ids.push_back(id);
                             tl_node_data->count++;
+                            if (tl_node_data->addr_dump.on()) {
+                                const PackedLocation exact = pack_location(lat, lng);
+                                precision::put_addr(tl_node_data->addr_dump,
+                                                    pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, id),
+                                                    precision::AddrKind::Node, exact.lat_e7, exact.lon_e7, nullptr, 0);
+                            }
                         }
 
                         // Prefer name:en when present (user-facing English-only mode)
@@ -3230,6 +3410,13 @@ static int run(int argc, char* argv[]) {
                                 tl_node_data->poi_qids.push_back(qid);
                                 tl_node_data->poi_count++;
                             }
+                            if (cls && tl_node_data->names.on()) {
+                                const bool shipped = (best_name || cls->category == PoiCategory::UNNAMED_RANK30) &&
+                                                     cls->tier <= POI_MAX_SHIPPED_TIER;
+                                tl_node_data->names.feature(precision::NameClass::Poi, 'n', id,
+                                                            poi_category_label(cls->category), shipped,
+                                                            precision::stream_tags(tag_keys, tag_vals, ntags, st));
+                            }
                         }
 
                         // Place nodes (settlements) + label-role higher-level place types.
@@ -3241,6 +3428,15 @@ static int run(int argc, char* argv[]) {
                         // so these show up in the address walk.
                         const char* place_name = best_name;
                         if (!place_name && n_ref && n_ref[0]) place_name = n_ref;
+                        if (n_place && tl_node_data->names.on()) {
+                            // Shipped: a settlement type place_nodes.bin stores.
+                            bool settlement = false;
+                            for (const char* type : {"city", "town", "village", "suburb", "hamlet", "neighbourhood", "quarter"})
+                                settlement = settlement || std::strcmp(n_place, type) == 0;
+                            tl_node_data->names.feature(precision::NameClass::Place, 'n', id, n_place,
+                                                        settlement && place_name,
+                                                        precision::stream_tags(tag_keys, tag_vals, ntags, st));
+                        }
                         if (n_place && place_name) {
                             // Settlement types that we store as searchable place_nodes
                             PlaceType settlement_pt = PlaceType::UNKNOWN;
@@ -3308,6 +3504,11 @@ static int run(int argc, char* argv[]) {
 
                 // Reset thread_local for next use
                 tl_node_data = nullptr;
+                for (auto& l : ntld) {
+                    l.addr_dump.flush();
+                    l.names.buf.flush();
+                    if (precision::g_dumps) precision::g_dumps->add_name_counts(l.names);
+                }
                 uint64_t total_nodes = 0;
                 for (const auto& local : ntld) total_nodes += local.nodes;
                 std::cerr << "  Node index: kept " << index.marked() << " of "
@@ -3529,10 +3730,22 @@ static int run(int argc, char* argv[]) {
                     std::vector<PoiWayEntry> poi_ways;
                     // POI way geometries for relation assembly
                     std::vector<WayGeomEntry> poi_way_geoms;
+                    // Precision-study dumps and counters (dumps off unless asked for).
+                    precision::DumpBuffer street_dump, interp_dump, addr_dump;
+                    precision::NameDump names;
+                    precision::OutlineStats outlines;
                 };
 
                 static thread_local ThreadLocalData* tl_way_data = nullptr;
                 std::vector<ThreadLocalData> tld(num_threads);
+                if (precision::g_dumps) {
+                    for (auto& l : tld) {
+                        l.street_dump.bind(precision::exact_file(&precision::Dumps::streets));
+                        l.interp_dump.bind(precision::exact_file(&precision::Dumps::interps));
+                        l.addr_dump.bind(precision::exact_file(&precision::Dumps::addrs));
+                        l.names.buf.bind(&precision::g_dumps->names);
+                    }
+                }
                 std::atomic<unsigned> next_tl_way{0};
                 auto _st = std::chrono::steady_clock::now();
                 auto _sc = CpuTicks::now();
@@ -3589,6 +3802,8 @@ static int run(int argc, char* argv[]) {
                                 local.interp_strings.push_back(local.strings.add(street));
                                 local.deferred_interps.push_back({interp_id, node_offset, iw.node_count});
                                 local.interp_count++;
+                                precision::put_line(local.interp_dump, pack_osm_id(gc::id_alloc::ObjectType::OSM_WAY, way_id),
+                                                    resolved_locs);
                             }
                         }
                         return;
@@ -3619,10 +3834,11 @@ static int run(int argc, char* argv[]) {
                             // Polygon vertices for closed ways (buildings).
                             // Lets the server compute exact distance-to-
                             // polygon for Nominatim parity instead of the
-                            // centroid-minus-10m approximation. Cap at 20
-                            // vertices — addr-point distance only needs a
-                            // coarse shape, and tight caps bound thread-
-                            // local memory during parallel parse.
+                            // centroid-minus-10m approximation. Capped at
+                            // kBuildingOutlineCap vertices (20 unless the
+                            // flag says otherwise) — addr-point distance only
+                            // needs a coarse shape, and tight caps bound
+                            // thread-local memory during parallel parse.
                             uint32_t poly_off = NO_DATA;
                             uint32_t poly_cnt = 0;
                             if (refs_size >= 4 && refs_data[0] == refs_data[refs_size-1] && all_valid) {
@@ -3630,10 +3846,11 @@ static int run(int argc, char* argv[]) {
                                 poly_pts.reserve(refs_size);
                                 for (const auto& loc : resolved_locs)
                                     poly_pts.push_back({loc.lat(), loc.lon()});
-                                constexpr size_t MAX_ADDR_POLY_VERTS = 20;
-                                if (poly_pts.size() > MAX_ADDR_POLY_VERTS) {
-                                    poly_pts = simplify_polygon(poly_pts, MAX_ADDR_POLY_VERTS);
+                                const size_t outline_vertices = poly_pts.size();
+                                if (kBuildingOutlineCap && poly_pts.size() > kBuildingOutlineCap) {
+                                    poly_pts = simplify_polygon(poly_pts, kBuildingOutlineCap);
                                 }
+                                local.outlines.add(outline_vertices, poly_pts.size());
                                 poly_off = static_cast<uint32_t>(local.building_addr_poly_verts.size());
                                 poly_cnt = static_cast<uint32_t>(poly_pts.size());
                                 for (const auto& p : poly_pts)
@@ -3642,6 +3859,14 @@ static int run(int argc, char* argv[]) {
                             local.building_addr_poly_off.push_back(poly_off);
                             local.building_addr_poly_cnt.push_back(poly_cnt);
                             local.building_addr_count++;
+                            if (local.addr_dump.on()) {
+                                // The whole outline (closing node included) when
+                                // one is stored, however the cap trimmed it.
+                                const bool outline = poly_cnt > 0;
+                                precision::put_addr(local.addr_dump, pack_osm_id(gc::id_alloc::ObjectType::OSM_WAY, way_id),
+                                                    precision::AddrKind::Building, precision::e7(clat), precision::e7(clng),
+                                                    outline ? resolved_locs.data() : nullptr, outline ? refs_size : 0);
+                            }
                         }
                     }
 
@@ -3661,6 +3886,8 @@ static int run(int argc, char* argv[]) {
                             local.way_orig_names.push_back(orig_name[0] ? local.strings.add(orig_name) : StringDict::kNone);
                             local.deferred_ways.push_back({wid, noff, header.node_count});
                             local.way_count++;
+                            precision::put_line(local.street_dump, pack_osm_id(gc::id_alloc::ObjectType::OSM_WAY, way_id),
+                                                resolved_locs);
                         }
                     }
 
@@ -3738,8 +3965,30 @@ static int run(int argc, char* argv[]) {
                                 way_qid = static_cast<uint32_t>(std::strtoul(t.wikidata + 1, nullptr, 10));
                             }
                             local.poi_ways.push_back({pr, local.strings.add(t_best_name), std::move(verts), way_ele, way_qid, way_id});
+                            local.names.feature(precision::NameClass::Poi, 'w', way_id, poi_category_label(cls->category),
+                                                cls->tier <= POI_MAX_SHIPPED_TIER,
+                                                precision::stream_tags(tag_keys, tag_vals, ntags, st));
                         }
                     }
+                    // Closed POI ways named only in other keys (name:xx, alt_name, ...): not shipped.
+                    if (local.names.on() && has_poi_tags && !t_best_name && refs_size >= 4 &&
+                        refs_data[0] == refs_data[refs_size-1] && all_valid) {
+                        auto cls = classify_poi(t.tourism, t.historic, t.boundary,
+                            t.amenity, t.leisure, t.natural, t.railway, t.aeroway,
+                            t.man_made, t.building, t.craft, t.power, t.place, t.waterway,
+                            t.office,
+                            t.wikipedia, t.wikidata,
+                            t.highway, t.shop, t.landuse);
+                        if (cls)
+                            local.names.feature(precision::NameClass::Poi, 'w', way_id, poi_category_label(cls->category),
+                                                false, precision::stream_tags(tag_keys, tag_vals, ntags, st));
+                    }
+
+                    // Name dump of boundary-like closed ways, shipped when they
+                    // become an admin polygon candidate below.
+                    const bool closed_way = refs_size >= 4 && refs_data[0] == refs_data[refs_size-1];
+                    std::string admin_way_subtype;
+                    bool admin_way_shipped = false;
 
                     // Closed way admin boundaries
                     const char* boundary = t.boundary;
@@ -3765,6 +4014,7 @@ static int run(int argc, char* argv[]) {
                                         uint8_t fallback = static_cast<uint8_t>(classify_place_override(t.linked_place, t.place));
                                         std::string wd_str = t.wikidata ? t.wikidata : "";
                                         local.closed_way_admins.push_back({std::move(verts), std::move(name_str), al, std::move(cc), fallback, std::move(wd_str), way_id});
+                                        admin_way_shipped = true;
                                     }
                                 }
                             }
@@ -3779,6 +4029,7 @@ static int run(int argc, char* argv[]) {
                                     for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});
                                     std::string wd_str = t.wikidata ? t.wikidata : "";
                                     local.closed_way_admins.push_back({std::move(verts), std::string(aname), uint8_t(15), std::string(), static_cast<uint8_t>(pt), std::move(wd_str), way_id});
+                                    admin_way_shipped = true;
                                 }
                             }
                         }
@@ -3819,11 +4070,44 @@ static int run(int argc, char* argv[]) {
                                 static_cast<uint8_t>(pt),
                                 std::move(wd_str),
                                 way_id});
+                            admin_way_shipped = true;
                         }
+                    }
+                    if (local.names.on() && closed_way) {
+                        const char* b = t.boundary;
+                        if (b && std::strcmp(b, "administrative") == 0)
+                            admin_way_subtype = std::string("administrative:") + (t.admin_level ? t.admin_level : "");
+                        else if (b && std::strcmp(b, "postal_code") == 0)
+                            admin_way_subtype = "postal_code";
+                        else if (b && std::strcmp(b, "place") == 0)
+                            admin_way_subtype = std::string("place:") + (t.place ? t.place : "");
+                        else if (!b && t.place)
+                            admin_way_subtype = std::string("way-place:") + t.place;
+                        if (!admin_way_subtype.empty())
+                            local.names.feature(precision::NameClass::Admin, 'w', way_id, admin_way_subtype,
+                                                admin_way_shipped, precision::stream_tags(tag_keys, tag_vals, ntags, st));
                     }
                 });
                 tl_way_data = nullptr;
                 std::cerr << "  Parallel way processing complete." << std::endl;
+                {
+                    // Every way's outline is in its worker's flat array now,
+                    // the arrays' high-water mark (they only grow until the
+                    // merge below frees them).
+                    precision::OutlineStats outlines;
+                    std::vector<size_t> worker_vertices, worker_capacity;
+                    for (auto& l : tld) {
+                        l.street_dump.flush();
+                        l.interp_dump.flush();
+                        l.addr_dump.flush();
+                        l.names.buf.flush();
+                        if (precision::g_dumps) precision::g_dumps->add_name_counts(l.names);
+                        outlines.merge(l.outlines);
+                        worker_vertices.push_back(l.building_addr_poly_verts.size());
+                        worker_capacity.push_back(l.building_addr_poly_verts.capacity());
+                    }
+                    report_outlines(outlines, worker_vertices, worker_capacity);
+                }
                 if (uint64_t miss = index.unmarked_lookups()) {
                     throw std::runtime_error("node index: " + std::to_string(miss) +
                         " way node lookups of ids the pre-scan did not mark");
@@ -3975,6 +4259,11 @@ static int run(int argc, char* argv[]) {
                 });
                 addr_vertices_grown.second.get();
                 copy_locals(data.addr_vertices, bldg_vert_base, tld, building_vertex_buffer);
+                std::cerr << "  Building outline vertices merged: " << data.addr_vertices.size() << " ("
+                          << (vec_bytes(data.addr_vertices) >> 20) << " MiB)" << std::endl;
+                if (data.addr_vertices.size() > UINT32_MAX)
+                    std::cerr << "  WARNING: " << data.addr_vertices.size()
+                              << " building outline vertices overflow AddrPoint's 32-bit vertex_offset" << std::endl;
                 log_phase("      Way merge: building addresses", _mt, _mc);
 
                 // Merge interpolation ways
@@ -4369,6 +4658,7 @@ static int run(int argc, char* argv[]) {
                         std::vector<std::thread> prep_workers;
                         for (unsigned int t = 0; t < num_threads; t++) {
                             prep_workers.emplace_back([&]() {
+                                precision::DumpBuffer admin_dump(precision::exact_file(&precision::Dumps::admins));
                                 while (true) {
                                     size_t k = prep_idx.fetch_add(1);
                                     if (k >= total_admin_rings) break;
@@ -4381,6 +4671,16 @@ static int run(int argc, char* argv[]) {
                                     canonicalize_ring_rotation(vertices);
 
                                     pp.simplified = simplify_admin_polygon(vertices, ar.admin_level);
+                                    if (admin_dump.on()) {
+                                        // Keyed as admin_osm_ids below keys the polygon.
+                                        const uint64_t key =
+                                            (static_cast<uint64_t>(gc::id_alloc::ObjectType::OSM_RELATION) << 56) |
+                                            (((static_cast<uint64_t>(ar.relation_id) << 16) |
+                                              static_cast<uint64_t>(ar.ring_index)) & 0x00FFFFFFFFFFFFFFull);
+                                        precision::put_admin(admin_dump, key, ar.admin_level,
+                                                             precision::AdminSource::RelationRing, ar.ring_index,
+                                                             ar.relation_id, vertices, pp.simplified);
+                                    }
                                     if (pp.simplified.size() >= 3) {
                                         pp.area = polygon_area(pp.simplified);
                                     }
@@ -4606,6 +4906,15 @@ static int run(int argc, char* argv[]) {
                                 // the POI wins as primary the road/house_number fields
                                 // would reflect the POI name, not the addr:street tag.
                                 if (!pr.addr_housenumber.empty()) {
+                                    if (precision::exact_file(&precision::Dumps::addrs)) {
+                                        precision::DumpBuffer addr_dump(precision::exact_file(&precision::Dumps::addrs));
+                                        precision::put_addr(addr_dump,
+                                                            pack_osm_id(gc::id_alloc::ObjectType::OSM_RELATION,
+                                                                        static_cast<int64_t>(rel_payload)),
+                                                            precision::AddrKind::PoiRelation,
+                                                            precision::e7(sum_lat / pr.vertices.size()),
+                                                            precision::e7(sum_lng / pr.vertices.size()), pr.vertices);
+                                    }
                                     uint64_t dummy = 0;
                                     const char* bpc_ptr = pr.addr_postcode.empty() ? nullptr : pr.addr_postcode.c_str();
                                     std::vector<NodeCoord> poly_verts;
@@ -4847,6 +5156,10 @@ static int run(int argc, char* argv[]) {
             log_phase("    Dedup: admin cells", _dt, _dc);
         }
     }
+
+    if (precision::g_dumps) finish_dumps(*precision::g_dumps);
+    std::cerr << "PBF dense node blocks off OSM's 1e-7 grid (granularity != 100 or offsets != 0): "
+              << g_pbf_nonstandard_coord_blocks.load() << std::endl;
 
     // --- Deterministic ordering ---
     reorder_deterministically(data, std::move(poi_elevations), std::move(poi_qids), std::move(sitelinks_data));
