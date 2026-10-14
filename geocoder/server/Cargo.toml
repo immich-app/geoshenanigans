@@ -29,7 +29,7 @@ bcrypt = "0.15"
 getrandom = "0.2"
 arc-swap = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
-zstd = "0.13"
+zstd = "0.14"
 sha2 = "0.10"
 futures-util = "0.3"
 bytes = "1"
