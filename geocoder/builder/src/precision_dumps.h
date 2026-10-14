@@ -11,6 +11,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -339,7 +340,7 @@ struct OutlineStats {
 // The open dumps of a build; g_dumps is null when none were asked for.
 struct Dumps {
     std::string exact_dir, names_dir;
-    DumpFile streets, interps, addrs, admins, names;
+    DumpFile streets, interps, addrs, admins, names, links;
     std::mutex totals_mtx;
     std::array<uint64_t, kNameClasses> name_seen{};
     std::array<uint64_t, kNameClasses> name_named{};
@@ -353,6 +354,24 @@ struct Dumps {
     }
 };
 inline Dumps* g_dumps = nullptr;
+
+// --link-dumps: one line per place node a boundary claims (the builder's
+// linked_place_node_ids / step-4 hides):
+//   method \t boundary type (r|w) \t boundary osm id \t node osm id \t place_type_override
+// boundary_packed is an admin_osm_ids-style key: relations carry
+// (relation id << 16 | ring) under type 3, closed ways the way id under type 2.
+inline void link_event(const char* method, uint64_t boundary_packed, int64_t node_id, unsigned pto) {
+    if (!g_dumps || !g_dumps->links.is_open()) return;
+    const unsigned type = static_cast<unsigned>(boundary_packed >> 56);
+    uint64_t id = boundary_packed & 0x00FFFFFFFFFFFFFFull;
+    char kind = '?';
+    if (type == 3) { kind = 'r'; id >>= 16; }
+    if (type == 2) kind = 'w';
+    char line[128];
+    const int n = std::snprintf(line, sizeof line, "%s\t%c\t%llu\t%lld\t%u\n", method, kind,
+                                static_cast<unsigned long long>(id), static_cast<long long>(node_id), pto);
+    g_dumps->links.write(line, static_cast<size_t>(n), 1);
+}
 
 inline DumpFile* exact_file(DumpFile Dumps::*member) {
     return g_dumps && (g_dumps->*member).is_open() ? &(g_dumps->*member) : nullptr;

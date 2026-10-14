@@ -1334,6 +1334,9 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
                             linked.fetch_add(1);
                             std::lock_guard<std::mutex> lk(linked_nodes_mutex);
                             linked_nodes.push_back(best_idx);
+                            if (i < data.admin_osm_ids.size() && best_idx < data.place_osm_ids.size())
+                                precision::link_event("name", data.admin_osm_ids[i],
+                                    static_cast<int64_t>(data.place_osm_ids[best_idx] & 0x00FFFFFFFFFFFFFFull), pto);
                         }
                     }
                 }
@@ -2524,7 +2527,7 @@ static std::pair<size_t, std::future<void>> grow_beside(std::vector<T>& out, con
 // interps load after the PBF passes) and logs their sizes and, with
 // --name-dumps, the features looked at per class.
 static void finish_dumps(precision::Dumps& d) {
-    for (precision::DumpFile* f : {&d.streets, &d.interps, &d.addrs, &d.admins, &d.names}) {
+    for (precision::DumpFile* f : {&d.streets, &d.interps, &d.addrs, &d.admins, &d.names, &d.links}) {
         if (!f->is_open()) continue;
         std::cerr << "  Precision dump " << f->path() << ": " << f->records() << " records, "
                   << (f->bytes() >> 20) << " MiB" << std::endl;
@@ -2632,6 +2635,7 @@ static int run(int argc, char* argv[]) {
     std::string prev_output_dir;
     std::string exact_dumps_dir;
     std::string name_dumps_dir;
+    std::string link_dumps_dir;
     bool multi_output = false;
     bool generate_continents = false;
     IndexMode mode = IndexMode::Full;
@@ -2699,6 +2703,8 @@ static int run(int argc, char* argv[]) {
             exact_dumps_dir = argv[++i];
         } else if (arg == "--name-dumps" && i + 1 < argc) {
             name_dumps_dir = argv[++i];
+        } else if (arg == "--link-dumps" && i + 1 < argc) {
+            link_dumps_dir = argv[++i];
         } else {
             input_files.push_back(arg);
         }
@@ -2716,7 +2722,7 @@ static int run(int argc, char* argv[]) {
 
     // Precision-study side outputs (never shipped; see precision_dumps.h).
     precision::Dumps dumps;
-    if (!exact_dumps_dir.empty() || !name_dumps_dir.empty()) {
+    if (!exact_dumps_dir.empty() || !name_dumps_dir.empty() || !link_dumps_dir.empty()) {
         if (!exact_dumps_dir.empty() && !prev_output_dir.empty())
             throw std::runtime_error("--exact-dumps keys records by a cold build's ids: drop --prev-output");
         if (!exact_dumps_dir.empty()) {
@@ -2731,6 +2737,10 @@ static int run(int argc, char* argv[]) {
             ensure_dir(name_dumps_dir);
             dumps.names_dir = name_dumps_dir;
             dumps.names.open(name_dumps_dir + "/names.tsv");
+        }
+        if (!link_dumps_dir.empty()) {
+            ensure_dir(link_dumps_dir);
+            dumps.links.open(link_dumps_dir + "/links.tsv");
         }
         precision::g_dumps = &dumps;
     }
@@ -4390,6 +4400,8 @@ static int run(int argc, char* argv[]) {
                                         cwa_wikidata_linked++;
                                         auto nit = wikidata_place_node_ids.find(cwa.wikidata);
                                         if (nit != wikidata_place_node_ids.end()) {
+                                            for (int64_t nid : nit->second)
+                                                precision::link_event("way-wikidata", (static_cast<uint64_t>(gc::id_alloc::ObjectType::OSM_WAY) << 56) | (static_cast<uint64_t>(cwa.way_id) & 0x00FFFFFFFFFFFFFFull), nid, pto);
                                             data.linked_place_node_ids.insert(
                                                 data.linked_place_node_ids.end(),
                                                 nit->second.begin(), nit->second.end());
@@ -4571,6 +4583,7 @@ static int run(int argc, char* argv[]) {
                                             // hide it from results.
                                             std::lock_guard<std::mutex> lk(*data.linked_pn_mutex);
                                             data.linked_place_node_ids.push_back(rel.label_node_id);
+                                            precision::link_event("rel-label", (static_cast<uint64_t>(gc::id_alloc::ObjectType::OSM_RELATION) << 56) | ((static_cast<uint64_t>(rel.id) << 16) & 0x00FFFFFFFFFFFFFFull), rel.label_node_id, pto);
                                         }
                                     }
                                 }
@@ -4583,6 +4596,8 @@ static int run(int argc, char* argv[]) {
                                             auto nit = wikidata_place_node_ids.find(rel_wikidata[i]);
                                             if (nit != wikidata_place_node_ids.end()) {
                                                 std::lock_guard<std::mutex> lk(*data.linked_pn_mutex);
+                                                for (int64_t nid : nit->second)
+                                                    precision::link_event("rel-wikidata", (static_cast<uint64_t>(gc::id_alloc::ObjectType::OSM_RELATION) << 56) | ((static_cast<uint64_t>(rel.id) << 16) & 0x00FFFFFFFFFFFFFFull), nid, pto);
                                                 data.linked_place_node_ids.insert(
                                                     data.linked_place_node_ids.end(),
                                                     nit->second.begin(), nit->second.end());
