@@ -10,6 +10,7 @@
 #include <optional>
 #include <stdexcept>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -21,6 +22,7 @@
 #include "geometry.h"
 #include "id_allocator.h"
 #include "parallel.h"
+#include "polygon_rings.h"
 #include "postcode_validation.h"
 #include "ranked_bits.h"
 #include "ring_contains.h"
@@ -1055,19 +1057,35 @@ struct PackedPolygon {
     std::vector<uint8_t> bytes;
     uint32_t vertex_count = 0;
     float area = 0;
+    uint16_t hole_count = 0;
 };
 static PackedPolygon pack_admin_polygon(const ParsedData& data, const AdminPolygon& ap,
                                         double epsilon_scale) {
+    if (ap.vertex_count < 3) return {};  // tombstone, or no area to draw
+    const NodeCoord* verts = data.admin_vertices.data() + ap.vertex_offset;
+    auto points = [&](const RingSpan& r) {
+        std::vector<std::pair<double,double>> pts;
+        pts.reserve(r.count);
+        for (uint32_t j = 0; j < r.count; j++) pts.emplace_back(verts[r.begin + j].lat, verts[r.begin + j].lng);
+        return pts;
+    };
+    std::vector<RingSpan> rings;
+    const bool parsed = split_rings(verts, ap.vertex_count, ap.hole_count, rings);
     std::vector<std::pair<double,double>> pts;
-    pts.reserve(ap.vertex_count);
-    for (uint32_t j = 0; j < ap.vertex_count; j++) {
-        const auto& v = data.admin_vertices[ap.vertex_offset + j];
-        pts.emplace_back(v.lat, v.lng);
-    }
+    uint16_t holes = parsed ? ap.hole_count : 0;
     if (epsilon_scale > 0) {
+        // Each ring on its own: simplifying the keyhole range as one ring
+        // would cut its connectors.
         double eps_m = admin_epsilon_meters(ap.admin_level) * epsilon_scale;
-        double lat = pts.empty() ? 0.0 : pts[0].first;
-        pts = simplify_polygon_epsilon(pts, meters_to_degrees(eps_m, lat));
+        std::vector<std::vector<std::pair<double,double>>> hole_rings;
+        for (size_t r = 1; r < rings.size(); r++) hole_rings.push_back(points(rings[r]));
+        std::tie(pts, holes) = simplify_rings(points(rings[0]), hole_rings,
+            [&](const std::vector<std::pair<double,double>>& ring) {
+                double lat = ring.empty() ? 0.0 : ring[0].first;
+                return simplify_polygon_epsilon(ring, meters_to_degrees(eps_m, lat));
+            });
+    } else {
+        pts = points(RingSpan{0, ap.vertex_count});
     }
     PackedPolygon out;
     if (pts.size() < 3) return out;
@@ -1076,6 +1094,7 @@ static PackedPolygon pack_admin_polygon(const ParsedData& data, const AdminPolyg
     pack_polygon_at(out.bytes.data(), pts.data(), pts.size());
     out.vertex_count = static_cast<uint32_t>(pts.size());
     out.area = polygon_area(pts);
+    out.hole_count = holes;
     return out;
 }
 
@@ -1137,6 +1156,7 @@ static bool copy_planet_polygons(const ParsedData& data, const std::string& plan
             packed[j].bytes.assign(bytes + planet[p].vertex_offset, bytes + end[p]);
             packed[j].vertex_count = planet[p].vertex_count;
             packed[j].area = planet[p].area;
+            packed[j].hole_count = planet[p].hole_count;
         }
     });
     if (file_bytes) ::munmap(map, file_bytes);
@@ -1190,6 +1210,7 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
         np.vertex_offset = static_cast<uint32_t>(vertex_bytes);
         np.vertex_count = pp.vertex_count;
         np.area = pp.area;
+        np.hole_count = pp.hole_count;
         new_polys[i] = np;
         vertex_bytes += pp.bytes.size();
         if (np.admin_level != 11) continue;
@@ -1297,6 +1318,7 @@ void write_admin_minimal_polygons(const ParsedData& data,
         np.vertex_offset = static_cast<uint32_t>(vertex_bytes);
         np.vertex_count = packed[k].vertex_count;
         np.area = packed[k].area;
+        np.hole_count = packed[k].hole_count;
         id_remap[kept_idx[k]] = static_cast<uint32_t>(slot);
         new_polys[slot] = np;
         vertex_bytes += packed[k].bytes.size();
