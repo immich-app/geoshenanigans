@@ -1,0 +1,249 @@
+// The patcher's side of the in-process codecs: when the current dir is an encoded installed set
+// (it has a gc.manifest), every today's-format file of an encoded family is a virtual old file
+// (a SequentialFileReader reads it from the family's decoder) and a virtual output (open_out hands
+// back a FILE* whose bytes go to the family's encoder). The new dir gets the encoded files and the
+// merged gc.manifest; no today's-format file of an encoded family touches the disk.
+#pragma once
+#include <malloc.h>
+#include <set>
+#include <stdio.h>
+#include "gcs_codec.h"
+#include "sequential_file_reader.h"
+
+namespace gcs {
+
+struct FamilyDesc {
+    const char* name;
+    std::vector<const char*> today;
+};
+// gc.cpp's family order (gc.families lists them in it).
+static const std::vector<FamilyDesc>& families() {
+    static const std::vector<FamilyDesc> f = {
+        {"streets", {"street_ways.bin", "street_nodes.bin"}},
+        {"interps", {"interp_ways.bin", "interp_nodes.bin"}},
+        {"way_parents", {"way_parents.bin"}},
+        {"way_postcodes", {"way_postcodes.bin"}},
+        {"interp_postcodes", {"interp_postcodes.bin"}},
+        {"gxc", {"geo_cells.bin", "street_entries.bin", "addr_entries.bin", "interp_entries.bin"}},
+        {"addr", {"addr_points.bin", "addr_vertices.bin"}},
+        {"admin", {"admin_vertices.bin"}},
+        {"poi", {"poi_records.bin", "poi_vertices.bin"}},
+    };
+    return f;
+}
+
+// Heap bytes in use (glibc), for the phase lines.
+inline size_t heap_in_use() {
+    struct mallinfo2 mi = mallinfo2();
+    return mi.uordblks + mi.hblkhd;
+}
+
+struct Store {
+    bool active = false;
+    std::string cur_dir, out_dir;
+    Manifest old_m, new_m;
+    std::vector<int> fam_on;  // per family: encoded in the installed set
+    std::map<std::string, std::pair<int, int>> file_port;  // today's name -> (family, port)
+    std::vector<std::unique_ptr<Decoder>> dec;
+    std::vector<std::unique_ptr<Encoder>> enc;
+    std::map<std::string, uint64_t> expect_out, got_out;  // today's name -> bytes (client list / encoder)
+    std::vector<std::string> report;                      // per family: queue peaks
+    std::string sink_error;
+
+    void init(const std::string& cur, const std::string& out) {
+        cur_dir = cur;
+        out_dir = out;
+        struct stat st;
+        if (stat((cur + "/gc.manifest").c_str(), &st) != 0) return;
+        active = true;
+        old_m.load(cur + "/gc.manifest");
+        std::set<std::string> on;
+        {
+            const std::string fl = old_m.get("gc.families");
+            size_t a = 0;
+            while (a <= fl.size()) {
+                size_t b = fl.find(',', a);
+                if (b == std::string::npos) b = fl.size();
+                if (b > a) on.insert(fl.substr(a, b - a));
+                a = b + 1;
+            }
+        }
+        const auto& F = families();
+        fam_on.assign(F.size(), 0);
+        dec.resize(F.size());
+        enc.resize(F.size());
+        for (size_t fi = 0; fi < F.size(); fi++) {
+            if (!on.count(F[fi].name)) continue;
+            fam_on[fi] = 1;
+            for (size_t p = 0; p < F[fi].today.size(); p++) file_port[F[fi].today[p]] = {int(fi), int(p)};
+        }
+        for (const auto& n : on) {
+            bool known = false;
+            for (const auto& f : F) known |= n == f.name;
+            if (!known) die("unknown family %s in gc.manifest", n.c_str());
+        }
+    }
+    bool is_encoded(const std::string& name) const { return active && file_port.count(name); }
+    std::string path_of(const std::string& name) const { return cur_dir + "/" + name; }
+    // Decoders and encoders are made on first use and freed when their last port closes.
+    Decoder* decoder(int fi) {
+        if (!dec[size_t(fi)]) {
+            const std::string f = families()[size_t(fi)].name;
+            const std::string& s = cur_dir;
+            Decoder* d;
+            if (f == "streets") d = new ways::Dec(s, true, old_m);
+            else if (f == "interps") d = new ways::Dec(s, false, old_m);
+            else if (f == "way_parents") d = new side::U24Dec(s, old_m);
+            else if (f == "way_postcodes" || f == "interp_postcodes") d = new side::DictDec(s, f, old_m);
+            else if (f == "gxc") d = new gxc::Dec(s, old_m);
+            else if (f == "addr") d = new addr::Dec(s, old_m);
+            else if (f == "admin") d = new poly::AdminDec(s);
+            else if (f == "poi") d = new poly::PoiDec(s, old_m);
+            else die("no decoder for %s", f.c_str());
+            dec[size_t(fi)].reset(d);
+        }
+        return dec[size_t(fi)].get();
+    }
+    Encoder* encoder(int fi) {
+        if (!enc[size_t(fi)]) {
+            const auto& F = families()[size_t(fi)];
+            const std::string f = F.name;
+            const std::string& o = out_dir;
+            Encoder* e;
+            if (f == "streets") e = new ways::Enc(o, true);
+            else if (f == "interps") e = new ways::Enc(o, false);
+            else if (f == "way_parents") e = new side::U24Enc(o);
+            else if (f == "way_postcodes" || f == "interp_postcodes") e = new side::DictEnc(o, f);
+            else if (f == "gxc") e = new gxc::Enc(o);
+            else if (f == "addr") {
+                auto it = expect_out.find("addr_points.bin");
+                if (it == expect_out.end()) die("addr: the patch lists no addr_points.bin size");
+                e = new addr::Enc(o, it->second);
+            } else if (f == "admin") e = new poly::AdminEnc(o);
+            else if (f == "poi") e = new poly::PoiEnc(o);
+            else die("no encoder for %s", f.c_str());
+            for (size_t p = 0; p < F.today.size(); p++) {
+                auto it = expect_out.find(F.today[p]);
+                if (it != expect_out.end()) e->expect[p] = it->second;
+            }
+            enc[size_t(fi)].reset(e);
+        }
+        return enc[size_t(fi)].get();
+    }
+
+    // --- old side ---
+    // The decoded size check for require_old_file_size: the manifest's size when it gives one.
+    void check_old_size(const std::string& name, uint64_t expected) {
+        auto [fi, port] = file_port.at(name);
+        const uint64_t ds = decoder(fi)->decoded_size(port);
+        if (ds != ~0ull && ds != expected)
+            die("old %s decodes to %llu bytes, the patch expects %llu", name.c_str(), (unsigned long long)ds, (unsigned long long)expected);
+    }
+    struct PortSource : StreamSource {
+        Store* s;
+        int fi, port;
+        PortSource(Store* st, int f, int p) : s(st), fi(f), port(p) {}
+        size_t read(char* dst, size_t max) override { return s->decoder(fi)->read(port, dst, max); }
+        ~PortSource() override { s->close_source(fi, port); }
+    };
+    std::unique_ptr<StreamSource> open_source(const std::string& path) {
+        if (!active || path.compare(0, cur_dir.size() + 1, cur_dir + "/") != 0) return nullptr;
+        const std::string name = path.substr(cur_dir.size() + 1);
+        auto it = file_port.find(name);
+        if (it == file_port.end()) return nullptr;
+        Decoder* d = decoder(it->second.first);
+        if (d->state[size_t(it->second.second)] != 0) die("old %s opened twice", name.c_str());
+        d->state[size_t(it->second.second)] = 1;
+        return std::unique_ptr<StreamSource>(new PortSource(this, it->second.first, it->second.second));
+    }
+    void close_source(int fi, int port) {
+        Decoder* d = dec[size_t(fi)].get();
+        if (!d) return;
+        d->state[size_t(port)] = 2;
+        d->out[size_t(port)].reset();
+        bool all = true;
+        for (int st : d->state) all &= st == 2;
+        if (!all) return;
+        std::string r = std::string("decode ") + families()[size_t(fi)].name + ": queue peaks";
+        for (size_t p = 0; p < d->out.size(); p++) r += " " + std::to_string(d->peak(int(p)));
+        report.push_back(r + " B");
+        dec[size_t(fi)].reset();
+    }
+
+    // --- new side ---
+    struct Cookie {
+        Store* s;
+        int fi, port;
+        std::vector<char> buf;
+    };
+    static ssize_t cookie_write(void* c, const char* p, size_t n) {
+        Cookie* k = static_cast<Cookie*>(c);
+        try {
+            k->s->encoder(k->fi)->write(k->port, p, n);
+        } catch (const std::exception& e) {
+            if (k->s->sink_error.empty()) k->s->sink_error = e.what();
+            errno = EIO;
+            return -1;
+        }
+        return ssize_t(n);
+    }
+    static int cookie_close(void* c) {
+        Cookie* k = static_cast<Cookie*>(c);
+        Store* s = k->s;
+        int rc = 0;
+        try {
+            s->close_sink(k->fi, k->port);
+        } catch (const std::exception& e) {
+            if (s->sink_error.empty()) s->sink_error = e.what();
+            rc = EOF;
+        }
+        delete k;
+        return rc;
+    }
+    static const size_t SINK_BUF = size_t(32) << 10;
+    FILE* open_sink(const std::string& name) {
+        auto [fi, port] = file_port.at(name);
+        Encoder* e = encoder(fi);
+        if (e->state[size_t(port)] != 0) die("new %s opened twice", name.c_str());
+        e->state[size_t(port)] = 1;
+        Cookie* c = new Cookie{this, fi, port, std::vector<char>(SINK_BUF)};
+        cookie_io_functions_t io = {nullptr, cookie_write, nullptr, cookie_close};
+        FILE* f = fopencookie(c, "w", io);
+        if (!f) die("fopencookie %s", name.c_str());
+        setvbuf(f, c->buf.data(), _IOFBF, c->buf.size());
+        return f;
+    }
+    void close_sink(int fi, int port) {
+        Encoder* e = enc[size_t(fi)].get();
+        e->state[size_t(port)] = 2;
+        e->pump();
+        const auto& F = families()[size_t(fi)];
+        got_out[F.today[size_t(port)]] = e->got[size_t(port)];
+        if (!e->all_closed()) return;
+        e->finish(new_m);
+        std::string r = std::string("encode ") + F.name + ": queue peaks";
+        for (size_t p = 0; p < e->in.size(); p++) r += " " + std::to_string(e->peak(int(p)));
+        report.push_back(r + " B");
+        enc[size_t(fi)].reset();
+    }
+    // The merged manifest: every family's keys, gc.families and gc.version, as gc writes it.
+    void save_manifest() {
+        std::string fl;
+        const auto& F = families();
+        for (size_t fi = 0; fi < F.size(); fi++) {
+            if (!fam_on[fi]) continue;
+            if (enc[fi]) die("family %s: an output was never closed", F[fi].name);
+            fl += (fl.empty() ? "" : ",") + std::string(F[fi].name);
+        }
+        new_m.set("gc.version", 1);
+        new_m.set("gc.families", fl);
+        new_m.save(out_dir + "/gc.manifest");
+    }
+};
+
+inline Store& store() {
+    static Store s;
+    return s;
+}
+
+}  // namespace gcs

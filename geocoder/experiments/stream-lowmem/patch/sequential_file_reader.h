@@ -7,6 +7,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <iterator>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -93,6 +94,27 @@ inline std::unordered_map<std::string, uint64_t>& stream_sizes() {
     static std::unordered_map<std::string, uint64_t> m;
     return m;
 }
+// Low-memory client update: an old file may also be produced in process (an encoded family's
+// decoder). A StreamSource reads like a FIFO, front to back; read() returns at least one byte
+// unless the stream is done. stream_source_factory(), when set, hands one back for a virtual path
+// (nullptr for a real file).
+struct StreamSource {
+    virtual ~StreamSource() = default;
+    virtual size_t read(char* dst, size_t max) = 0;
+};
+inline std::unique_ptr<StreamSource> (*&stream_source_factory())(const std::string&) {
+    static std::unique_ptr<StreamSource> (*f)(const std::string&) = nullptr;
+    return f;
+}
+// Set with the factory: true when dir/name is a virtual old file (after checking its decoded size
+// against `expected`, when the decoder knows it).
+inline bool (*&virtual_size_hook())(const std::string& dir, const std::string& name, uint64_t expected) {
+    static bool (*f)(const std::string&, const std::string&, uint64_t) = nullptr;
+    return f;
+}
+// The read window of a virtual old file (grows when a view needs more).
+static constexpr size_t SOURCE_READ_BUFFER_BYTES = 64 << 10;
+
 inline bool is_fifo_path(const std::string& path) {
     struct stat st;
     return stat(path.c_str(), &st) == 0 && S_ISFIFO(st.st_mode);
@@ -107,6 +129,16 @@ class SequentialFileReader {
 public:
     explicit SequentialFileReader(const std::string& path, size_t capacity = SEQUENTIAL_READ_BUFFER_BYTES)
         : path_(path), capacity_(std::max<size_t>(capacity, 1)) {
+        if (stream_source_factory()) src_ = stream_source_factory()(path);
+        if (src_) {
+            auto it = stream_sizes().find(path);
+            if (it == stream_sizes().end()) throw std::runtime_error("No size registered for stream " + path);
+            size_ = it->second;
+            fifo_ = true;
+            copy_unsupported_ = true;
+            capacity_ = std::min(capacity_, SOURCE_READ_BUFFER_BYTES);
+            return;
+        }
         fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (fd_ < 0) return;
         struct stat st;
@@ -133,6 +165,7 @@ public:
         // The window is an anonymous mapping, not the heap: glibc moves its
         // mmap and trim thresholds after large frees, which changes how the
         // rest of the patcher's memory is laid out.
+        src_.reset();  // a virtual file needs no drain: its decoder drops what nobody reads
         if (fifo_ && fd_ >= 0) {
             // Drain what the writer still sends (a trailing DELETE run is never read).
             char sink[1 << 16];
@@ -150,7 +183,7 @@ public:
     SequentialFileReader& operator=(const SequentialFileReader&) = delete;
 
     // open() succeeded; an empty file is open with size 0.
-    bool is_open() const { return fd_ >= 0; }
+    bool is_open() const { return fd_ >= 0 || src_ != nullptr; }
     uint64_t size() const { return size_; }
     const std::string& path() const { return path_; }
     // Views that started before the window: still correct, but each one
@@ -275,7 +308,7 @@ private:
             if (off < sp_) throw std::runtime_error("Backward read of stream " + path_);
             uint64_t skip = off - sp_;
             while (skip > 0) {
-                ssize_t r = ::read(fd_, buf_, static_cast<size_t>(std::min<uint64_t>(skip, capacity_)));
+                ssize_t r = read_some(buf_, static_cast<size_t>(std::min<uint64_t>(skip, capacity_)));
                 if (r < 0 && errno == EINTR) continue;
                 if (r <= 0) throw std::runtime_error("Unexpected end of " + path_);
                 skip -= static_cast<uint64_t>(r);
@@ -285,7 +318,7 @@ private:
         size_t have = keep;
         const size_t want_max = static_cast<size_t>(std::min<uint64_t>(capacity_, size_ - off));
         while (have < n) {
-            ssize_t r = ::read(fd_, buf_ + have, want_max - have);
+            ssize_t r = read_some(buf_ + have, want_max - have);
             if (r < 0 && errno == EINTR) continue;
             if (r <= 0) throw std::runtime_error("Unexpected end of " + path_);
             have += static_cast<size_t>(r);
@@ -296,6 +329,12 @@ private:
         return buf_;
     }
 
+    ssize_t read_some(char* dst, size_t n) {
+        if (src_) return static_cast<ssize_t>(src_->read(dst, n));
+        return ::read(fd_, dst, n);
+    }
+
+    std::unique_ptr<StreamSource> src_;
     std::string path_;
     int fd_ = -1;
     uint64_t size_ = 0, win_off_ = 0, rewinds_ = 0;

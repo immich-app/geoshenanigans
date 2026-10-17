@@ -142,6 +142,11 @@ inline bool write_file(const std::string& path, const std::vector<char>& data) {
 // (quality dirs): every other read clamps to what is there.
 inline void require_old_file_size(const std::string& dir, const std::string& name, uint64_t expected) {
     struct stat st;
+    // Low-memory client update: an encoded family's today's file is decoded in process.
+    if (virtual_size_hook() && virtual_size_hook()(dir, name, expected)) {
+        stream_sizes()[dir + "/" + name] = expected;
+        return;
+    }
     // End-to-end prototype: an old file streamed through a FIFO (a decoder
     // writes it) has no size to check; the reader takes the patch's.
     if (stat((dir + "/" + name).c_str(), &st) == 0 && S_ISFIFO(st.st_mode)) {
