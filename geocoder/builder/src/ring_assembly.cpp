@@ -4,10 +4,24 @@
 #include <unordered_map>
 #include <unordered_set>
 
-std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
+namespace {
+
+// Which member ways a ring assembly stitches, by role.
+enum class RingRoles { Outer, Inner, All };
+
+bool takes_role(RingRoles roles, const std::string& role) {
+    switch (roles) {
+        case RingRoles::Outer: return role == "outer" || role.empty();
+        case RingRoles::Inner: return role == "inner";
+        case RingRoles::All: return true;
+    }
+    return false;
+}
+
+std::vector<std::vector<std::pair<double,double>>> assemble_rings(
     const std::vector<std::pair<int64_t, std::string>>& members,
     const WayGeometries& way_geoms,
-    bool include_all_roles)
+    RingRoles roles)
 {
     // Coordinate-based ring assembly: split ways at shared internal nodes,
     // then stitch sub-ways at endpoints with backtracking.
@@ -16,7 +30,7 @@ std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
     std::unordered_map<int64_t, int> coord_count;
     std::vector<CoordSpan> way_coords;
     for (const auto& [way_id, role] : members) {
-        if (!include_all_roles && role != "outer" && !role.empty()) continue;
+        if (!takes_role(roles, role)) continue;
         const auto* way = way_geoms.find(way_id);
         if (!way || way->count == 0) continue;
         way_coords.push_back(way_geoms.coords_of(*way));
@@ -205,4 +219,19 @@ std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
     }
 
     return rings;
+}
+
+}  // namespace
+
+std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
+    const std::vector<std::pair<int64_t, std::string>>& members,
+    const WayGeometries& way_geoms,
+    bool include_all_roles) {
+    return assemble_rings(members, way_geoms, include_all_roles ? RingRoles::All : RingRoles::Outer);
+}
+
+std::vector<std::vector<std::pair<double,double>>> assemble_inner_rings(
+    const std::vector<std::pair<int64_t, std::string>>& members,
+    const WayGeometries& way_geoms) {
+    return assemble_rings(members, way_geoms, RingRoles::Inner);
 }

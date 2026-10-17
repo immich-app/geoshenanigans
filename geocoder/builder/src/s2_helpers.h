@@ -37,8 +37,11 @@ void cover_edge(S2CellId c1, S2CellId c2, double lat1, double lng1, double lat2,
 
 S2CellId point_to_cell(double lat, double lng);
 
+// The kAdminCellLevel cells covering a polygon, each flagged when it lies
+// wholly inside. `vertices` is a closed ring, or a keyhole range with
+// `holes` holes (polygon_rings.h) whose cells inside a hole are left out.
 std::vector<std::pair<S2CellId, bool>> cover_polygon(
-    const std::vector<std::pair<double,double>>& vertices);
+    const std::vector<std::pair<double,double>>& vertices, uint16_t holes = 0);
 
 // --- Thread pool for concurrent admin polygon S2 covering ---
 
@@ -47,6 +50,7 @@ public:
     struct WorkItem {
         uint32_t poly_id;
         std::vector<std::pair<double,double>> vertices;
+        uint16_t holes = 0;  // keyhole-encoded holes in `vertices`
     };
 
     explicit AdminCoverPool(size_t num_threads);

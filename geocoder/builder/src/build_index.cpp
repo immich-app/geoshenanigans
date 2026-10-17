@@ -19,6 +19,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_set>
 #include <vector>
 
@@ -49,6 +50,7 @@
 #include "continent_filter.h"
 #include "cell_index.h"
 #include "parent_linking.h"
+#include "polygon_rings.h"
 #include "admin_rank_config.h"
 #include "parallel.h"
 #include "scratch_dir.h"
@@ -1258,13 +1260,16 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
                     // the country from the polygon centroid's admin cell.
                     uint16_t bnd_cc = poly.country_code;
 
+                    // The outer ring's vertex average (holes follow it).
+                    const NodeCoord* ring = &data.admin_vertices[poly.vertex_offset];
+                    const uint32_t ring_count = outer_ring_count(ring, poly.vertex_count, poly.hole_count);
                     double sum_lat = 0.0, sum_lng = 0.0;
-                    for (uint32_t v = 0; v < poly.vertex_count; v++) {
-                        sum_lat += data.admin_vertices[poly.vertex_offset + v].lat;
-                        sum_lng += data.admin_vertices[poly.vertex_offset + v].lng;
+                    for (uint32_t v = 0; v < ring_count; v++) {
+                        sum_lat += ring[v].lat;
+                        sum_lng += ring[v].lng;
                     }
-                    double clat = sum_lat / poly.vertex_count;
-                    double clng = sum_lng / poly.vertex_count;
+                    double clat = sum_lat / ring_count;
+                    double clng = sum_lng / ring_count;
 
                     if (bnd_cc == 0) bnd_cc = country_code_at_point(data, clat, clng);
                     uint8_t bnd_rank = admin_rank_address(bnd_cc, poly.admin_level);
@@ -4138,6 +4143,8 @@ static int run(int argc, char* argv[]) {
                     // Thread-local admin results (to avoid locking add_admin_polygon)
                     struct AdminResult {
                         std::vector<std::pair<double,double>> vertices;
+                        // The relation's inner rings inside this outer ring.
+                        std::vector<std::vector<std::pair<double,double>>> holes;
                         std::string name;
                         uint8_t admin_level;
                         std::string country_code;
@@ -4215,12 +4222,26 @@ static int run(int argc, char* argv[]) {
                                 // inner ways sometimes form the boundary or bridge gaps.
                                 // Filter retry results: discard rings with duplicate coords
                                 // (figure-8 shapes from merging holes with outer boundary).
+                                const bool from_outer_ways = !rings.empty();
                                 if (rings.empty()) {
                                     auto retry = assemble_outer_rings(rel.members, data.way_geometries, true);
                                     for (auto& ring : retry) {
                                         if (!ring_has_duplicate_coords(ring)) {
                                             rings.push_back(std::move(ring));
                                         }
+                                    }
+                                }
+                                // Holes: the inner ways' rings, each in the outer ring
+                                // holding it (an all-roles retry has stitched the inner
+                                // ways into its rings already).
+                                std::vector<std::vector<std::vector<std::pair<double,double>>>> holes_of;
+                                if (from_outer_ways) {
+                                    auto inners = assemble_inner_rings(rel.members, data.way_geometries);
+                                    if (!inners.empty()) {
+                                        holes_of.resize(rings.size());
+                                        const std::vector<int> owner = assign_holes(rings, inners);
+                                        for (size_t h = 0; h < inners.size(); h++)
+                                            if (owner[h] >= 0) holes_of[owner[h]].push_back(std::move(inners[h]));
                                     }
                                 }
 
@@ -4311,6 +4332,7 @@ static int run(int argc, char* argv[]) {
                                     if (ring.size() >= 3) {
                                         AdminResult ar;
                                         ar.vertices = std::move(ring);
+                                        if (ring_idx < holes_of.size()) ar.holes = std::move(holes_of[ring_idx]);
                                         ar.name = rel.name;
                                         ar.admin_level = rel.admin_level;
                                         ar.country_code = rel.country_code;
@@ -4352,7 +4374,8 @@ static int run(int argc, char* argv[]) {
                     // Parallel simplification: the expensive work (normalize, simplify,
                     // compute area) is done per-polygon with no shared state.
                     struct PreparedPolygon {
-                        std::vector<std::pair<double,double>> simplified;
+                        std::vector<std::pair<double,double>> simplified;  // keyhole range
+                        uint16_t hole_count = 0;
                         std::string name;
                         uint8_t admin_level;
                         std::string country_code;
@@ -4379,8 +4402,12 @@ static int run(int argc, char* argv[]) {
                                     // Normalize ring rotation
                                     auto& vertices = ar.vertices;
                                     canonicalize_ring_rotation(vertices);
+                                    for (auto& hole : ar.holes) canonicalize_ring_rotation(hole);
 
-                                    pp.simplified = simplify_admin_polygon(vertices, ar.admin_level);
+                                    std::tie(pp.simplified, pp.hole_count) = simplify_rings(vertices, ar.holes,
+                                        [&](const std::vector<std::pair<double,double>>& ring) {
+                                            return simplify_admin_polygon(ring, ar.admin_level);
+                                        });
                                     if (pp.simplified.size() >= 3) {
                                         pp.area = polygon_area(pp.simplified);
                                     }
@@ -4428,6 +4455,7 @@ static int run(int argc, char* argv[]) {
                             poly.admin_level = pp.admin_level;
                             poly.place_type_override = pp.place_type_override;
                             poly.area = pp.area;
+                            poly.hole_count = pp.hole_count;
                             const char* cc = pp.country_code.empty() ? nullptr : pp.country_code.c_str();
                             poly.country_code = (cc && cc[0] && cc[1])
                                 ? pack_country_code(cc[0], cc[1]) : 0;
@@ -4445,7 +4473,7 @@ static int run(int argc, char* argv[]) {
                                 ((((static_cast<uint64_t>(pp.relation_id) << 16) |
                                    static_cast<uint64_t>(pp.ring_index))) & 0x00FFFFFFFFFFFFFFull);
 
-                            cover[k] = {static_cast<uint32_t>(poly_base + k), std::move(pp.simplified)};
+                            cover[k] = {static_cast<uint32_t>(poly_base + k), std::move(pp.simplified), pp.hole_count};
                         }
                     }, num_threads);
                     admin_pool.submit_all(std::move(cover));

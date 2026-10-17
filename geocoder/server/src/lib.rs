@@ -241,9 +241,14 @@ pub struct AdminPolygon {
     pub place_type_override: u8,  // 0=none, 1=city, 2=town, 3=village, 4=suburb, 5=neighbourhood, 6=quarter
     pub _pad2: u8,
     pub _pad3: u8,
-    pub area: f32,
+    pub area: f32,                // shoelace, holes subtracted
     pub country_code: u16,
-    pub _pad4: u16,
+    /// Holes appended to the outer ring in the vertex range. They are
+    /// keyhole-encoded (builder/src/polygon_rings.h): each is reached from
+    /// the outer ring's first vertex by axis-aligned connector edges walked
+    /// both ways, which cancel in `point_in_polygon`, so the plain crossing
+    /// test over all `vertex_count` vertices already leaves holes out.
+    pub hole_count: u16,
 }
 
 #[repr(C)]
@@ -4761,6 +4766,29 @@ mod pure_helper_tests {
         assert!(!point_in_polygon(0.5, -0.5, &sq));
         assert!(!point_in_polygon(1.5, 0.5, &sq));
         assert!(!point_in_polygon(-0.5, 0.5, &sq));
+    }
+
+    #[test]
+    fn point_in_polygon_leaves_out_keyhole_holes() {
+        // Outer square 0..10 with holes 2..4 and (6..7, 5..8), each reached
+        // from v0 = (0, 0) through c = (v0.lat, h0.lng) and back, as the
+        // builder writes them (polygon_rings.h encode_rings).
+        let mut v = vec![nc(0.0, 0.0), nc(0.0, 10.0), nc(10.0, 10.0), nc(10.0, 0.0), nc(0.0, 0.0)];
+        for (lat0, lng0, lat1, lng1) in [(2.0, 2.0, 4.0, 4.0), (6.0, 5.0, 7.0, 8.0)] {
+            let c = nc(0.0, lng0);
+            v.extend([nc(0.0, 0.0), c]);
+            v.extend([nc(lat0, lng0), nc(lat1, lng0), nc(lat1, lng1), nc(lat0, lng1), nc(lat0, lng0)]);
+            v.push(c);
+        }
+        assert!(point_in_polygon(1.0, 1.0, &v));
+        assert!(point_in_polygon(5.0, 9.0, &v));
+        assert!(!point_in_polygon(3.0, 3.0, &v));
+        assert!(!point_in_polygon(6.5, 6.0, &v));
+        assert!(!point_in_polygon(11.0, 5.0, &v));
+        // On the connector lines (v0's latitude, the holes' first longitudes).
+        assert!(point_in_polygon(0.5, 2.0, &v));
+        assert!(point_in_polygon(5.0, 2.0, &v));
+        assert!(point_in_polygon(1.0, 5.0, &v));
     }
 
     #[test]
