@@ -484,8 +484,12 @@ static auto closest_parent_first(const ParsedData& data) {
     };
 }
 
-// Admin polygon parent chain: for each admin polygon, find the smallest containing
+// Admin polygon parent chain: for each admin polygon, find the closest containing
 // polygon with a lower admin_level so the server walks the chain without PIP.
+// "Containing" is judged at a point inside the polygon, as Nominatim computes a
+// boundary's address from its get_center_point (ST_PointOnSurface): the vertex
+// average lies outside concave rings (West Bengal's fell in Bangladesh,
+// Karakalpakstan's in Turkmenistan), which handed them a foreign parent.
 static void compute_admin_parent_chain(ParsedData& data, const BuildConfig& cfg) {
     unsigned int num_threads = cfg.num_threads;
     {
@@ -506,14 +510,10 @@ static void compute_admin_parent_chain(ParsedData& data, const BuildConfig& cfg)
             for (size_t i = begin; i < end; i++) {
                 const auto& self = data.admin_polygons[i];
                 if (self.vertex_count == 0 || self.admin_level <= 2) continue;
-                // Compute centroid
-                float sum_lat = 0, sum_lng = 0;
-                for (uint32_t v = 0; v < self.vertex_count; v++) {
-                    sum_lat += data.admin_vertices[self.vertex_offset + v].lat;
-                    sum_lng += data.admin_vertices[self.vertex_offset + v].lng;
-                }
-                float clat = sum_lat / self.vertex_count;
-                float clng = sum_lng / self.vertex_count;
+                const auto [ilat, ilng] = polygon_interior_point(
+                    &data.admin_vertices[self.vertex_offset], self.vertex_count, self.hole_count);
+                const float clat = static_cast<float>(ilat);
+                const float clng = static_cast<float>(ilng);
                 S2CellId cell = S2CellId(S2LatLng::FromDegrees(clat, clng)).parent(kAdminCellLevel);
 
                 // Pick the closest parent: highest admin_level
