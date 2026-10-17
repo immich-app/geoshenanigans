@@ -79,4 +79,8 @@ pub const CONTEXT_TYPO_MIN_CHARS: usize = 5;
 pub const CONTEXT_WORD_MIN_CHARS: usize = 4;
 /// Results with the same folded name closer than this are one place.
 pub const DEDUPE_KM: f64 = 25.0;
+/// Place types that are areas; one of them yields to a same-named settlement in its state
+/// among the first AREA_CHECK_TOP candidates.
+pub const AREA_TYPES: [&str; 5] = ["country", "state", "province", "region", "county"];
+pub const AREA_CHECK_TOP: usize = 40;
 pub const DEFAULT_LIMIT: usize = 20;

@@ -2,7 +2,8 @@
 """Search corpus, step 2: context by reverse geocoding every label point with grid_query on the
 recommended set (2026-10-13), plus the context alias table.
 
-  corpus_noctx.tsv -> corpus.tsv: the same columns + cc country state county city
+  corpus_noctx.tsv -> corpus.tsv: the same columns + cc country state(state|province) county
+  city(city|town|village|municipality|hamlet) region district(state_district|district|municipality)
   iso3166.opl (osmium tags-filter r/ISO3166-1 r/ISO3166-1:alpha2 r/ISO3166-2 of planet-261006)
     -> context_aliases.tsv: cc  level(country|state)  aliases joined by \x1f
        aliases = every searchable name tag of one relation and its ISO code (alpha-2/alpha-3
@@ -54,7 +55,10 @@ CITY_KEYS = ("city", "town", "village", "municipality", "hamlet")
 def ctx_of(js):
     a = json.loads(js).get("address", {})
     city = next((a[k] for k in CITY_KEYS if a.get(k)), "")
-    return [a.get("country_code", ""), a.get("country", ""), a.get("state", ""), a.get("county", ""), city]
+    state = a.get("state") or a.get("province", "")
+    district = next((a[k] for k in ("state_district", "district", "municipality") if a.get(k) and a[k] != city), "")
+    return [a.get("country_code", ""), a.get("country", ""), state, a.get("county", ""), city, a.get("region", ""),
+            district]
 
 
 def clean(s):
