@@ -294,3 +294,19 @@ TEST(highway_full_filter_footway_subtypes) {
     // The subtype filter applies to footway only.
     CHECK(is_included_highway_full("residential", "sidewalk"));
 }
+
+// --- ring_tolerance_degrees ---
+
+TEST(geometry_ring_tolerance_is_the_level_tolerance_for_large_rings) {
+    // A 1 x 1 degree ring at the equator: 1250 m is far below a tenth of it.
+    const std::vector<std::pair<double, double>> ring = {{0, 0}, {0, 1}, {1, 1}, {1, 0}, {0, 0}};
+    CHECK_NEAR(ring_tolerance_degrees(ring, 1250), meters_to_degrees(1250, 0), 1e-12);
+}
+
+TEST(geometry_ring_tolerance_is_capped_by_a_small_ring) {
+    // A Vatican-sized ring (0.008 degrees across): q2.5's level-2 tolerance
+    // (1250 m, ~0.011 degrees) would exceed the whole ring.
+    const std::vector<std::pair<double, double>> ring = {
+        {41.900, 12.446}, {41.900, 12.454}, {41.908, 12.454}, {41.908, 12.446}, {41.900, 12.446}};
+    CHECK_NEAR(ring_tolerance_degrees(ring, 1250), kRingToleranceFraction * 0.008, 1e-6);
+}

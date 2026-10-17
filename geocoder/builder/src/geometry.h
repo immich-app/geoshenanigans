@@ -275,6 +275,19 @@ inline double admin_epsilon_meters(uint8_t admin_level) {
     return kAdminEpsilonMeters[idx];
 }
 
+// The most a quality variant's tolerance may be, as a fraction of a ring's
+// size (the square root of its area): a level's tolerance can exceed a whole
+// enclave (q2.5 allows 1250 m at level 2 and the Vatican spans 1 km), and
+// Douglas-Peucker then leaves a sliver that misses most of it.
+inline constexpr double kRingToleranceFraction = 0.1;
+
+// The tolerance, in degrees, a quality variant simplifies `ring` (closed)
+// with: eps_m at the ring's first latitude, capped by its size.
+inline double ring_tolerance_degrees(const std::vector<std::pair<double,double>>& ring, double eps_m) {
+    double lat = ring.empty() ? 0.0 : ring[0].first;
+    return std::min(meters_to_degrees(eps_m, lat), kRingToleranceFraction * std::sqrt(polygon_area(ring)));
+}
+
 // Validate a postcode string for the centroid index. Mirrors
 // Nominatim's clean_postcodes sanitizer — rejects values that
 // don't conform to any known postcode pattern. The builder

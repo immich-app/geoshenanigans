@@ -1081,8 +1081,7 @@ static PackedPolygon pack_admin_polygon(const ParsedData& data, const AdminPolyg
         for (size_t r = 1; r < rings.size(); r++) hole_rings.push_back(points(rings[r]));
         std::tie(pts, holes) = simplify_rings(points(rings[0]), hole_rings,
             [&](const std::vector<std::pair<double,double>>& ring) {
-                double lat = ring.empty() ? 0.0 : ring[0].first;
-                return simplify_polygon_epsilon(ring, meters_to_degrees(eps_m, lat));
+                return simplify_polygon_epsilon(ring, ring_tolerance_degrees(ring, eps_m));
             });
     } else {
         pts = points(RingSpan{0, ap.vertex_count});
