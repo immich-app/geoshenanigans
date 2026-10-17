@@ -193,6 +193,8 @@ impl<'q> Context<'q> {
             | self.string_mask(idx, e.state)
             | self.string_mask(idx, e.county)
             | self.string_mask(idx, e.city)
+            | self.string_mask(idx, e.region)
+            | self.string_mask(idx, e.district)
             | self.mask_of(cc);
         let all = (1u64 << self.words.len()) - 1;
         m & PHRASE_BIT != 0 || m & all == all
@@ -415,6 +417,7 @@ impl<'a> Searcher<'a> {
         }
         let mut hits: Vec<Hit> = pool.best.into_values().collect();
         hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.entity.cmp(&b.entity)));
+        self.place_before_its_area(&mut hits);
         let mut out: Vec<Found> = Vec::new();
         let mut kept: Vec<(String, (f32, f32))> = Vec::new();
         for h in hits {
@@ -435,6 +438,35 @@ impl<'a> Searcher<'a> {
             eprintln!("  done {:.0}us", t0.elapsed().as_secs_f64() * 1e6);
         }
         out
+    }
+
+    /// "Dubai" the city before "Dubai" the emirate: an area (state, county, country, unlinked
+    /// boundary) drops just below a settlement of the same name in the same state, the city a
+    /// searcher means and a better point for a photo than the area's label point.
+    fn place_before_its_area(&self, hits: &mut [Hit]) {
+        let idx = self.idx;
+        let is_area = |h: &Hit| {
+            let e = &idx.entities[h.entity as usize];
+            e.kind == b'A' || AREA_TYPES.contains(&idx.types[e.type_id as usize].as_str())
+        };
+        let label = |h: &Hit| crate::normalize::normalize(idx.primary_name(h.entity));
+        let mut changed = false;
+        for i in 0..hits.len().min(AREA_CHECK_TOP) {
+            if !is_area(&hits[i]) {
+                continue;
+            }
+            let (area_label, area_state) = (label(&hits[i]), idx.entities[hits[i].entity as usize].state);
+            let place = hits[i + 1..].iter().take(AREA_CHECK_TOP).find(|s| {
+                !is_area(s) && idx.entities[s.entity as usize].state == area_state && label(s) == area_label
+            });
+            if let Some(s) = place {
+                hits[i].score = s.score * 0.999;
+                changed = true;
+            }
+        }
+        if changed {
+            hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.entity.cmp(&b.entity)));
+        }
     }
 
     /// The first of `name`, `name:en` and the matched name that starts with what was typed (the

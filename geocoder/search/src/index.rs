@@ -40,6 +40,8 @@ pub struct Entity {
     pub state: u32,
     pub county: u32,
     pub city: u32,
+    pub region: u32,
+    pub district: u32,
     /// Context alias groups (NONE when the printed name matched no ISO3166 relation).
     pub country_grp: u32,
     pub state_grp: u32,
@@ -146,7 +148,7 @@ fn type_base(kind: u8, typ: &str, level: u32) -> f32 {
 }
 
 /// Row columns: kind osm type lat lon population sitelinks capital admin_level poi_importance
-/// poi_flags names cc country state county city (see corpus.py / ctx.py).
+/// poi_flags names cc country state county city region district (see corpus.py / ctx.py).
 fn importance(c: &[&str]) -> f32 {
     let kind = c[0].as_bytes()[0];
     if kind == b'O' {
@@ -349,6 +351,8 @@ impl Index {
                 state: strings.id(c[14]),
                 county: strings.id(c[15]),
                 city: strings.id(c[16]),
+                region: strings.id(c.get(17).copied().unwrap_or("")),
+                district: strings.id(c.get(18).copied().unwrap_or("")),
                 country_grp: grp("country", c[13]),
                 state_grp: grp("state", c[14]),
                 osm: osm_key(c[1]),

@@ -100,7 +100,7 @@ fn main() {
                     "latitude": e.lat,
                     "longitude": e.lon,
                     "admin1name": idx.strings[e.state as usize],
-                    "admin2name": idx.strings[e.county as usize],
+                    "admin2name": idx.strings[if e.county != 0 { e.county } else { e.district } as usize],
                     "country": idx.strings[e.country as usize],
                     "city": idx.strings[e.city as usize],
                     "kind": (e.kind as char).to_string(),

@@ -6,8 +6,9 @@ point. GeoNames' own names and coordinates, so the set leans towards the baselin
   heldout_ctx  150 places with 1000 <= population < 100000, query = "name, admin1 name",
                tolerance 8 km
   make_heldout.py [seed] [out]  (defaults: 20261018, /ssd/search/qset/queries_heldout.tsv;
-  the second sample, seed 20261019 -> queries_heldout2.tsv, was drawn after the tuning that
-  looked at the first one)."""
+  seed 20261019 -> queries_heldout2.tsv was drawn after the tuning that looked at the first
+  sample, seed 20261020 -> queries_heldout3.tsv after the context fix that looked at the
+  second)."""
 import random
 import sys
 
@@ -38,7 +39,8 @@ for line in open(GEO + "cities500.txt", encoding="utf-8"):
     elif pop >= 1000 and row[4]:
         small.append(row)
 rng = random.Random(SEED)
-TAG = "" if SEED == 20261018 else "h2_"
+# category prefix per sample: "" (seed 20261018), "h2_" (20261019), "h3_" (20261020)
+TAG = "" if SEED == 20261018 else f"h{SEED - 20261017}_"
 with open(OUT, "w", encoding="utf-8") as o:
     o.write("# category\tquery\texpected\tlat\tlon\ttol_km\talternates\n")
     for name, lat, lon, cc, adm in rng.sample(big, N):
