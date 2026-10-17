@@ -26,8 +26,14 @@ static const uint32_t NO = 0xFFFFFFFFu;
 // Default buffer sizes (bytes).
 static const size_t READ_BUF = size_t(64) << 10, WRITE_BUF = size_t(64) << 10, PLANE_BUF = size_t(16) << 10;
 // A polygon block up to this size is transformed in memory; a larger one plane by plane through
-// positional readers / writers, so no block is ever held whole.
-static const size_t BIG_BLOCK = size_t(256) << 10;
+// positional readers / writers, so no block is ever held whole. GCS_BIG_BLOCK overrides it (tests).
+inline size_t big_block() {
+    static const size_t b = [] {
+        const char* e = getenv("GCS_BIG_BLOCK");
+        return e ? size_t(strtoull(e, nullptr, 10)) : (size_t(256) << 10);
+    }();
+    return b;
+}
 
 [[noreturn]] inline void die(const char* fmt, ...) {
     char msg[1024];
@@ -168,10 +174,10 @@ struct Writer {
     std::vector<uint8_t> buf;
     size_t len = 0, cap;
 
-    // A fresh inode (unlink first).
-    explicit Writer(const std::string& p, size_t cap_ = WRITE_BUF) : path(p), cap(cap_) {
+    // A fresh inode (unlink first). rw: also readable (a writer that rereads what it wrote).
+    explicit Writer(const std::string& p, size_t cap_ = WRITE_BUF, bool rw = false) : path(p), cap(cap_) {
         if (unlink(p.c_str()) && errno != ENOENT) die("unlink %s: %s", p.c_str(), strerror(errno));
-        fd = open(p.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+        fd = open(p.c_str(), (rw ? O_RDWR : O_WRONLY) | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
         if (fd < 0) die("create %s: %s", p.c_str(), strerror(errno));
         buf.resize(cap);
     }
@@ -183,6 +189,11 @@ struct Writer {
     Writer(const Writer&) = delete;
     ~Writer() noexcept(false) { finish(); }
     uint64_t tell() const { return written + len; }
+    // Moves the write position forward to `at` (what lies between was written positionally).
+    void skip_to(uint64_t at) {
+        flush();
+        written = at - base;
+    }
     void flush() {
         size_t off = 0;
         while (off < len) {
@@ -249,6 +260,15 @@ struct ByteQueue {
     ByteQueue(ByteQueue&& o) noexcept : b(o.b), cap(o.cap), head(o.head), tail(o.tail), peak(o.peak), cap_peak(o.cap_peak) {
         o.b = nullptr;
         o.cap = o.head = o.tail = 0;
+    }
+    ByteQueue& operator=(ByteQueue&& o) noexcept {
+        if (this != &o) {
+            free(b);
+            b = o.b; cap = o.cap; head = o.head; tail = o.tail; peak = std::max(peak, o.peak); cap_peak = std::max(cap_peak, o.cap_peak);
+            o.b = nullptr;
+            o.cap = o.head = o.tail = 0;
+        }
+        return *this;
     }
     ~ByteQueue() { free(b); }
     size_t size() const { return tail - head; }

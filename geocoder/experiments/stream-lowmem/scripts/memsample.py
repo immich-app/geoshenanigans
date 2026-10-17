@@ -63,7 +63,27 @@ def mstat():
     return d
 
 
+def smaps_breakdown(pid):
+    """Anonymous KiB by mapping kind: heap, stack, anon mmap, file (COW pages of binaries / libs)."""
+    out = {"heap": 0, "stack": 0, "anon_mmap": 0, "file_cow": 0}
+    kind = None
+    try:
+        for line in open(f"/proc/{pid}/smaps"):
+            parts = line.split()
+            if not parts:
+                continue
+            if "-" in parts[0] and len(parts) >= 5 and not parts[0].endswith(":"):
+                name = parts[5] if len(parts) > 5 else ""
+                kind = "heap" if name == "[heap]" else "stack" if name.startswith("[stack") else "anon_mmap" if name == "" or name.startswith("[anon") else "file_cow"
+            elif parts[0] == "Anonymous:" and kind:
+                out[kind] += int(parts[1])
+    except OSError:
+        return None
+    return out
+
+
 procs = {}  # pid -> [peak_anon, hwm, role, comm, first_t, last_t]
+breakdown = {}  # pid -> smaps breakdown at its anon peak (patcher processes)
 series = open(out + ".series", "w")
 series.write("t tool_anon_kib cg_anon_kib cg_kernel_kib cg_file_kib cg_current_kib nproc\n")
 t0 = time.time()
@@ -92,6 +112,10 @@ while not os.path.exists(out + ".stop"):
             if comm is None:
                 continue
             e = procs[p] = [0, 0, r, comm, t, t]
+        if e[3].startswith("geocoder-patch") and s.get("RssAnon", 0) > e[0]:
+            b = smaps_breakdown(p)
+            if b:
+                breakdown[p] = (t, s.get("RssAnon", 0), b)
         e[0] = max(e[0], s.get("RssAnon", 0))
         e[1] = max(e[1], s.get("VmHWM", 0))
         e[5] = t
@@ -110,6 +134,9 @@ with open(out + ".procs", "w") as f:
     f.write("pid peak_anon_kib hwm_kib first_s last_s role\n")
     for p, e in sorted(procs.items(), key=lambda kv: -kv[1][0]):
         f.write(f"{p} {e[0]} {e[1]} {e[4]:.1f} {e[5]:.1f} {e[2]}\n")
+with open(out + ".smaps", "w") as f:
+    for p, (t, a, b) in breakdown.items():
+        f.write(f"{p} t={t:.1f} anon_kib={a} " + " ".join(f"{k}_kib={v}" for k, v in b.items()) + f" role={procs[p][2]}\n")
 with open(out + ".peaks", "w") as f:
     f.write(" ".join(f"{k}_kib={v}" for k, v in peak.items()) + "\n")
 print(" ".join(f"{k}_mib={v / 1024:.1f}" for k, v in peak.items()))

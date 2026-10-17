@@ -8,7 +8,7 @@ sv=${v//\//_}
 O=$M/smoke/$sv
 rm -rf "$O"; mkdir -p "$O" $M/tmp
 export TMPDIR=$M/tmp PATH=/ssd/shrink/zstd157/bin:$PATH
-/usr/bin/time -f "wall=%e user=%U sys=%S maxrss_kib=%M" taskset -c 40 "$BIN" "$I/$v" "$P/$sv/patch.gcpatch" -o "$O/" 2> "$M/logs/smoke.$sv.log"
+/usr/bin/time -f "wall=%e user=%U sys=%S maxrss_kib=%M" taskset -c ${CORES:-40} "$BIN" "$I/$v" "$P/$sv/patch.gcpatch" -o "$O/" ${EXTRA:-} 2> "$M/logs/smoke.$sv.log"
 echo "rc=$?"; tail -3 "$M/logs/smoke.$sv.log"
 bad=0; n=0
 for f in $(cd "$REF/$v" && ls); do n=$((n+1)); cmp -s "$REF/$v/$f" "$O/$f" || { echo "DIFFERS $f"; bad=1; }; done
