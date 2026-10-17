@@ -7,6 +7,8 @@
 #include <malloc.h>
 #include <set>
 #include <stdio.h>
+#include <stdio_ext.h>
+#include "gcs_async.h"
 #include "gcs_codec.h"
 #include "sequential_file_reader.h"
 
@@ -39,16 +41,19 @@ inline size_t heap_in_use() {
 }
 
 struct Store {
-    bool active = false;
+    bool active = false, threads = false;
     std::string cur_dir, out_dir;
     Manifest old_m, new_m;
     std::vector<int> fam_on;  // per family: encoded in the installed set
     std::map<std::string, std::pair<int, int>> file_port;  // today's name -> (family, port)
     std::vector<std::unique_ptr<Decoder>> dec;
     std::vector<std::unique_ptr<Encoder>> enc;
+    std::vector<std::unique_ptr<AsyncDec>> adec;  // --threads: the codec's worker
+    std::vector<std::unique_ptr<AsyncEnc>> aenc;
     std::map<std::string, uint64_t> expect_out, got_out;  // today's name -> bytes (client list / encoder)
     std::vector<std::string> report;                      // per family: queue peaks
     std::string sink_error;
+    std::set<std::string> opened_old, opened_new;
 
     void init(const std::string& cur, const std::string& out) {
         cur_dir = cur;
@@ -72,6 +77,8 @@ struct Store {
         fam_on.assign(F.size(), 0);
         dec.resize(F.size());
         enc.resize(F.size());
+        adec.resize(F.size());
+        aenc.resize(F.size());
         for (size_t fi = 0; fi < F.size(); fi++) {
             if (!on.count(F[fi].name)) continue;
             fam_on[fi] = 1;
@@ -101,6 +108,7 @@ struct Store {
             else if (f == "poi") d = new poly::PoiDec(s, old_m);
             else die("no decoder for %s", f.c_str());
             dec[size_t(fi)].reset(d);
+            if (threads) adec[size_t(fi)].reset(new AsyncDec(d));
         }
         return dec[size_t(fi)].get();
     }
@@ -127,6 +135,7 @@ struct Store {
                 if (it != expect_out.end()) e->expect[p] = it->second;
             }
             enc[size_t(fi)].reset(e);
+            if (threads) aenc[size_t(fi)].reset(new AsyncEnc(e));
         }
         return enc[size_t(fi)].get();
     }
@@ -143,7 +152,11 @@ struct Store {
         Store* s;
         int fi, port;
         PortSource(Store* st, int f, int p) : s(st), fi(f), port(p) {}
-        size_t read(char* dst, size_t max) override { return s->decoder(fi)->read(port, dst, max); }
+        size_t read(char* dst, size_t max) override {
+            Decoder* d = s->decoder(fi);
+            if (AsyncDec* a = s->adec[size_t(fi)].get()) return a->read(port, dst, max);
+            return d->read(port, dst, max);
+        }
         ~PortSource() override { s->close_source(fi, port); }
     };
     std::unique_ptr<StreamSource> open_source(const std::string& path) {
@@ -152,19 +165,32 @@ struct Store {
         auto it = file_port.find(name);
         if (it == file_port.end()) return nullptr;
         Decoder* d = decoder(it->second.first);
-        if (d->state[size_t(it->second.second)] != 0) die("old %s opened twice", name.c_str());
-        d->state[size_t(it->second.second)] = 1;
+        if (!opened_old.insert(name).second) die("old %s opened twice", name.c_str());
+        if (!adec[size_t(it->second.first)]) d->state[size_t(it->second.second)] = 1;
         return std::unique_ptr<StreamSource>(new PortSource(this, it->second.first, it->second.second));
     }
     void close_source(int fi, int port) {
         Decoder* d = dec[size_t(fi)].get();
         if (!d) return;
+        std::string r = std::string("decode ") + families()[size_t(fi)].name;
+        if (AsyncDec* a = adec[size_t(fi)].get()) {
+            if (!a->close(port)) return;
+            a->shutdown();
+            r += ": thread cpu " + std::to_string(a->cpu_s) + " s, ring peaks";
+            for (size_t p = 0; p < a->ring.size(); p++) r += " " + std::to_string(a->peak(int(p)));
+            r += " B, queue peaks";
+            for (size_t p = 0; p < d->out.size(); p++) r += " " + std::to_string(d->peak(int(p)));
+            report.push_back(r + " B");
+            adec[size_t(fi)].reset();
+            dec[size_t(fi)].reset();
+            return;
+        }
         d->state[size_t(port)] = 2;
         d->out[size_t(port)].reset();
         bool all = true;
         for (int st : d->state) all &= st == 2;
         if (!all) return;
-        std::string r = std::string("decode ") + families()[size_t(fi)].name + ": queue peaks";
+        r += ": queue peaks";
         for (size_t p = 0; p < d->out.size(); p++) r += " " + std::to_string(d->peak(int(p)));
         report.push_back(r + " B");
         dec[size_t(fi)].reset();
@@ -179,7 +205,9 @@ struct Store {
     static ssize_t cookie_write(void* c, const char* p, size_t n) {
         Cookie* k = static_cast<Cookie*>(c);
         try {
-            k->s->encoder(k->fi)->write(k->port, p, n);
+            Encoder* e = k->s->encoder(k->fi);
+            if (AsyncEnc* a = k->s->aenc[size_t(k->fi)].get()) a->write(k->port, p, n);
+            else e->write(k->port, p, n);
         } catch (const std::exception& e) {
             if (k->s->sink_error.empty()) k->s->sink_error = e.what();
             errno = EIO;
@@ -204,24 +232,39 @@ struct Store {
     FILE* open_sink(const std::string& name) {
         auto [fi, port] = file_port.at(name);
         Encoder* e = encoder(fi);
-        if (e->state[size_t(port)] != 0) die("new %s opened twice", name.c_str());
-        e->state[size_t(port)] = 1;
+        if (!opened_new.insert(name).second) die("new %s opened twice", name.c_str());
+        if (!aenc[size_t(fi)]) e->state[size_t(port)] = 1;
         Cookie* c = new Cookie{this, fi, port, std::vector<char>(SINK_BUF)};
         cookie_io_functions_t io = {nullptr, cookie_write, nullptr, cookie_close};
         FILE* f = fopencookie(c, "w", io);
         if (!f) die("fopencookie %s", name.c_str());
         setvbuf(f, c->buf.data(), _IOFBF, c->buf.size());
+        __fsetlocking(f, FSETLOCKING_BYCALLER);
         return f;
     }
     void close_sink(int fi, int port) {
         Encoder* e = enc[size_t(fi)].get();
+        const auto& F = families()[size_t(fi)];
+        std::string r = std::string("encode ") + F.name;
+        if (AsyncEnc* a = aenc[size_t(fi)].get()) {
+            got_out[F.today[size_t(port)]] = a->got[size_t(port)];
+            if (!a->close(port)) return;  // (the last close joins the worker)
+            e->finish(new_m);
+            r += ": thread cpu " + std::to_string(a->cpu_s) + " s, ring peaks";
+            for (size_t p = 0; p < a->ring.size(); p++) r += " " + std::to_string(a->peak(int(p)));
+            r += " B, queue peaks";
+            for (size_t p = 0; p < e->in.size(); p++) r += " " + std::to_string(e->peak(int(p)));
+            report.push_back(r + " B");
+            aenc[size_t(fi)].reset();
+            enc[size_t(fi)].reset();
+            return;
+        }
         e->state[size_t(port)] = 2;
         e->pump();
-        const auto& F = families()[size_t(fi)];
         got_out[F.today[size_t(port)]] = e->got[size_t(port)];
         if (!e->all_closed()) return;
         e->finish(new_m);
-        std::string r = std::string("encode ") + F.name + ": queue peaks";
+        r += ": queue peaks";
         for (size_t p = 0; p < e->in.size(); p++) r += " " + std::to_string(e->peak(int(p)));
         report.push_back(r + " B");
         enc[size_t(fi)].reset();

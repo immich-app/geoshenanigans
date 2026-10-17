@@ -58,11 +58,29 @@ esac
 case $STYLE in
   base) inner=(bash /ssd/shrink/sortpatch/e2e/supdate.sh stream "$cores") ;;
   basepar) inner=(bash /ssd/shrink/sortpatch/e2e/supdate.sh streampar "$cores") ;;
-  new) inner=(bash $M/scripts/inproc.sh seq "$cores") ;;
-  newpar) inner=(bash $M/scripts/inproc.sh par "$cores") ;;
+  new) inner=(env PATCHX=$M/bin/geocoder-patch-m bash $M/scripts/inproc.sh seq "$cores") ;;
+  newpar) inner=(env PATCHX=$M/bin/geocoder-patch-m bash $M/scripts/inproc.sh par "$cores") ;;
+  new2) inner=(env PATCHX=$M/bin/geocoder-patch-m2 bash $M/scripts/inproc.sh seq "$cores") ;;
+  new2par) inner=(env PATCHX=$M/bin/geocoder-patch-m2 bash $M/scripts/inproc.sh par "$cores") ;;
+  new2t) inner=(env PATCHX=$M/bin/geocoder-patch-m2 PATCH_ARGS=--threads bash $M/scripts/inproc.sh seq "$cores") ;;
+  new2tpar) inner=(env PATCHX=$M/bin/geocoder-patch-m2 PATCH_ARGS=--threads bash $M/scripts/inproc.sh par "$cores") ;;
   *) echo "unknown style $STYLE"; exit 1 ;;
 esac
+# Waits (up to 2 h) until the SMT siblings of the timing cores (24-31) are under 10% busy.
+wait_quiet_siblings() {
+  local waited=0 a b pct
+  while [ $waited -lt 7200 ]; do
+    a=$(sib_snapshot); sleep 3; b=$(sib_snapshot)
+    pct=$(sib_busy_pct "$a" "$b")
+    [ "$pct" -lt 10 ] && return 0
+    [ $((waited % 300)) -eq 0 ] && echo "  [$(ts)] waiting for quiet siblings 24-31 (${pct}% busy)"
+    sleep 27; waited=$((waited + 30))
+  done
+  echo "  [$(ts)] siblings still busy after 2 h, timing anyway"
+}
+wait_quiet_siblings
 lock_acquire "memory: update $PROFILE $STYLE $OLD->$NEW"
+wait_quiet_siblings
 rm -rf "$W" "$N"
 if [ $PROFILE = p8w ]; then
   sync

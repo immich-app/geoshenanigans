@@ -43,6 +43,10 @@
 #include "scratch_dir.h"
 #include "sequential_file_reader.h"
 #include "gcs_patch.h"
+#ifdef GCS_LIBZSTD
+#define ZSTD_STATIC_LINKING_ONLY
+#include <zstd.h>
+#endif
 
 
 // --- Helpers ---
@@ -102,6 +106,29 @@ static void log_phase(const char* label, double start) {
 static void log_rewinds(const SequentialFileReader& r) {
     if (r.rewinds()) std::cerr << "  " << r.path() << ": read backwards " << r.rewinds() << " times" << std::endl;
 }
+
+#ifdef GCS_LIBZSTD
+// The patch, decompressed in one shot straight into a mapped file: the decoder's history is the
+// output itself, so no window buffer (the zstd CLI holds the 8 MiB window in anonymous memory).
+static bool decompress_to_file(const std::string& src, const std::string& dst) {
+    MappedFile in = mmap_file(src);
+    if (!in.data) return false;
+    const unsigned long long bound = ZSTD_decompressBound(in.data, in.size);
+    if (bound == ZSTD_CONTENTSIZE_ERROR || bound == 0) { unmap_file(in); return false; }
+    int fd = open(dst.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0 || ftruncate(fd, (off_t)bound) != 0) { if (fd >= 0) close(fd); unmap_file(in); return false; }
+    void* out = mmap(nullptr, (size_t)bound, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (out == MAP_FAILED) { close(fd); unmap_file(in); return false; }
+    ZSTD_DCtx* dctx = ZSTD_createDCtx();
+    const size_t n = ZSTD_decompressDCtx(dctx, out, (size_t)bound, in.data, in.size);
+    ZSTD_freeDCtx(dctx);
+    munmap(out, (size_t)bound);
+    unmap_file(in);
+    const bool ok = !ZSTD_isError(n) && ftruncate(fd, (off_t)n) == 0;
+    close(fd);
+    return ok;
+}
+#endif
 
 // The child stream replayed along a parent record file (UINT32_MAX: none).
 static uint32_t joint_child_of(uint32_t fid) {
@@ -244,6 +271,11 @@ static int run(int argc, char* argv[]) {
         return 1;
     }
     std::string cur_dir = argv[1], patch_path = argv[2], out_dir = argv[4];
+    // Fixed thresholds: a buffer of 128 KiB or more is its own mapping and goes back to the kernel
+    // when freed (glibc's dynamic threshold otherwise moves such buffers onto the heap after the
+    // first one is freed, and the heap keeps their pages), and the heap top is trimmed early.
+    mallopt(M_MMAP_THRESHOLD, 128 << 10);
+    mallopt(M_TRIM_THRESHOLD, 256 << 10);
     // End-to-end prototype, --only: build just these output files (a staged
     // apply, one family at a time). Every other section is parsed, and the
     // record remaps the listed files need are derived from its merge runs, but
@@ -252,6 +284,11 @@ static int run(int argc, char* argv[]) {
     std::unordered_set<std::string> only;
     for (int i = 5; i < argc; i++) {
         std::string a = argv[i];
+        if (a == "--threads") {
+            gcs::store().threads = true;
+            mallopt(M_ARENA_MAX, 1);  // one heap for the codec threads too
+            continue;
+        }
         if (a == "--only" && i + 1 < argc) {
             std::string l = argv[++i];
             size_t s = 0;
@@ -304,10 +341,14 @@ static int run(int argc, char* argv[]) {
 
     // --- Phase 1: Decompress + mmap patch ---
     std::string raw_path = tmpdir + "/patch.raw";
+#ifdef GCS_LIBZSTD
+    if (!decompress_to_file(patch_path, raw_path)) { std::cerr << "Failed to decompress" << std::endl; return 1; }
+#else
     {
         std::string cmd = "zstd -d '" + patch_path + "' -o '" + raw_path + "' -f --quiet 2>/dev/null";
         if (system(cmd.c_str()) != 0) { std::cerr << "Failed to decompress" << std::endl; return 1; }
     }
+#endif
     MappedFile patch_map = mmap_file(raw_path);
     if (!patch_map.data) { std::cerr << "Failed to mmap patch" << std::endl; return 1; }
     // Don't remove temp file yet (mmap needs backing file for page eviction under memory pressure)
@@ -378,6 +419,7 @@ static int run(int argc, char* argv[]) {
         FILE* f = fopen(p.c_str(), "wb");
         if (!f) throw std::runtime_error("Cannot write " + p);
         widen_pipe(f);
+        __fsetlocking(f, FSETLOCKING_BYCALLER);  // one thread writes each output: no lock per fwrite
         return f;
     };
 
@@ -718,7 +760,7 @@ static int run(int argc, char* argv[]) {
             SequentialFileReader old(cur_dir + "/" + std::string(fname));
             FILE* out = open_out(fname);
             std::vector<uint32_t> buf;
-            buf.reserve(1 << 18);
+            buf.reserve(1 << 14);  // 64 KiB
             uint64_t ni = 0, oi = 0;
             uint32_t ci = 0, ii = 0;
             uint32_t next_change = n_changes ? 0 : NO_DATA_VAL;
@@ -810,7 +852,7 @@ static int run(int argc, char* argv[]) {
             const size_t field = value_stride == 16 ? POSTCODE_CENTROID_POSTCODE_ID_OFF : 0;
 
             FILE* out = open_out(fname);
-            constexpr size_t CHUNK = 1 << 20;  // a multiple of both value strides
+            constexpr size_t CHUNK = 64 << 10;  // a multiple of both value strides
             std::vector<char> buf(CHUNK);
             uint32_t ci = 0;
             uint64_t prev_pos = 0;

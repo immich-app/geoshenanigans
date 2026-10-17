@@ -7,6 +7,7 @@
 set -u
 STYLE=$1 CORES=$2 OLDENC=$3 PDIR=$4 NEWENC=$5 WORK=$6 RES=$7
 PATCHX=${PATCHX:-/ssd/memory/bin/geocoder-patch-m}
+PATCH_ARGS=${PATCH_ARGS:-}
 VARIANTS=${SVARIANTS:-"planet/full planet/quality/uncapped planet/poi/all"}
 export PATH=/ssd/shrink/zstd157/bin:$PATH
 mkdir -p "$WORK/tmp" "$NEWENC" "$RES"
@@ -21,11 +22,11 @@ safe() { echo "${1//\//_}"; }
 one_variant() {  # variant
   local v=$1 sv=$(safe $1)
   mkdir -p "$NEWENC/$v"
-  /usr/bin/time -f "%e %U %S %M" -o "$RES/patch.$sv.time" "$PATCHX" "$OLDENC/$v" "$PDIR/$sv/patch.gcpatch" -o "$NEWENC/$v/" \
+  /usr/bin/time -f "%e %U %S %M" -o "$RES/patch.$sv.time" "$PATCHX" "$OLDENC/$v" "$PDIR/$sv/patch.gcpatch" -o "$NEWENC/$v/" ${PATCH_ARGS:-} \
     2> "$RES/patch.$sv.log"
 }
 export -f one_variant safe
-export OLDENC PDIR NEWENC RES PATCHX
+export OLDENC PDIR NEWENC RES PATCHX PATCH_ARGS
 
 TOT_W=0 PEAK_DISK=0
 declare -A SC

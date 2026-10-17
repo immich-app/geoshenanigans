@@ -1143,7 +1143,7 @@ struct AdminDec : Decoder {
         const int w = e == 3 ? 4 : 2;
         const size_t size = 10 + size_t(cnt) * 2 * size_t(w);
         pos += size;
-        if (size <= BIG_BLOCK) {
+        if (size <= big_block()) {
             const uint8_t* s = R->take(size);
             uint8_t* o = emit_reserve(0, size);
             memcpy(o, s, 10);
@@ -1199,7 +1199,7 @@ struct AdminEnc : Encoder {
                 in_poly = true;
                 k = 0;
             }
-            if (size <= BIG_BLOCK) {
+            if (size <= big_block()) {
                 if (q.size() < size) return;
                 blk.resize(size);
                 memcpy(blk.data(), q.data(), 10);
@@ -1239,16 +1239,13 @@ struct AdminEnc : Encoder {
         }
     }
     // The block writer: sequential at pos (a big block's planes go around it).
-    uint64_t w_written = 0;
-    std::vector<uint8_t> wbuf;
     void W_put(const uint8_t* p, size_t n) {
         if (!W) W.reset(new Writer(fd, path, 0, WRITE_BUF));
         W->put(p, n);
     }
     void W_skip_to(uint64_t at) {
         if (!W) W.reset(new Writer(fd, path, 0, WRITE_BUF));
-        W->flush();
-        W->written = at;
+        W->skip_to(at);
     }
     void finish(Manifest& m) override {
         require_empty();
@@ -1262,22 +1259,59 @@ struct AdminEnc : Encoder {
     }
 };
 
-// Ports: 0 = poi_records (36 B), 1 = poi_vertices. A step: one record and its block (a block is
-// taken whole: the largest POI polygon is 92,951 vertices on the 2026-10-13 planet, 744 KB).
+// Ports: 0 = poi_records (36 B), 1 = poi_vertices. A step: one record and its block, or a piece of a
+// big block (read plane by plane).
 struct PoiDec : Decoder {
     uint64_t n, i = 0, total, vt = 0;
     std::unique_ptr<Reader> R, V;
     uint8_t cur[32], nxt[32];
+    std::string vpath;
+    // big block in progress
+    std::vector<std::unique_ptr<Reader>> pl;
+    uint64_t big_c2 = 0, big_k = 0, big_end = 0;
+    int big_w = 0;
+    bool big_flag = false;
+    uint8_t big_first[8];
+    uint32_t prev[2] = {0, 0};
     PoiDec(const std::string& src, const Manifest& m) : Decoder("poi", 2) {
         n = m.num("poi.n");
+        vpath = src + "/poi_vertices.bopen";
         R.reset(new Reader(src + "/poi_records.r3", 32 << 10));
-        V.reset(new Reader(src + "/poi_vertices.bopen"));
+        V.reset(new Reader(vpath));
         if (R->size() != 32 * n) die("poi_records.r3 size");
         total = V->size();
         if (n) memcpy(cur, R->take(32), 32);
     }
     uint64_t decoded_size(int port) const override { return port == 0 ? 36 * n : ~0ull; }
+    void next_record() {
+        memcpy(cur, nxt, 32);
+        i++;
+    }
     bool step() override {
+        if (!pl.empty()) {
+            const int w = big_w;
+            const size_t vs = 2 * size_t(w);
+            const uint64_t k = std::min<uint64_t>(VERTS_PER_STEP, big_c2 - big_k);
+            const uint64_t mask = wmask(w);
+            uint8_t* o = emit_reserve(1, size_t(k) * vs);
+            for (uint64_t j = 0; j < k; j++)
+                for (int comp = 0; comp < 2; comp++) {
+                    uint32_t z = 0;
+                    for (int b = 0; b < w; b++) z |= uint32_t(pl[size_t(comp * w + b)]->u8()) << (8 * b);
+                    const uint32_t q = uint32_t((uint64_t(prev[comp]) + unzz(z)) & mask);
+                    for (int b = 0; b < w; b++) o[j * vs + size_t(comp * w + b)] = uint8_t(q >> (8 * b));
+                    prev[comp] = q;
+                }
+            if (big_k == 0 && k) memcpy(big_first, o, vs);
+            big_k += k;
+            if (big_k == big_c2) {
+                if (big_flag) emit(1, big_first, vs);
+                pl.clear();
+                V->seek(big_end);
+                next_record();
+            }
+            return true;
+        }
         if (i == n) {
             if (!V->eof() || !R->eof()) die("poi: streams not fully consumed");
             return false;
@@ -1291,51 +1325,150 @@ struct PoiDec : Decoder {
         uint8_t rec[36];
         memcpy(rec, cur, 8);
         memcpy(rec + 16, cur + 12, 20);
-        if (mono_next != mono) {
-            if (mono != V->tell() || mono_next < mono) die("poi %llu: block offset %llu is not the stream position", (unsigned long long)i,
-                                                           (unsigned long long)mono);
-            const uint64_t bsize = mono_next - mono;
-            const uint8_t* h = V->take(size_t(bsize));
-            const uint8_t e = h[0], flag = h[1];
-            if (e > 3 || flag > 1) die("poi %llu: bad block header", (unsigned long long)i);
-            const int w = e == 3 ? 4 : 2;
-            if (bsize < 10 || (bsize - 10) % (2 * size_t(w))) die("poi %llu: bad block size", (unsigned long long)i);
-            const uint64_t c2 = (bsize - 10) / (2 * size_t(w)), vc = c2 + flag;
-            if (vt >= 0xFFFFFFFFull) die("poi_vertices offset overflow");
-            wr32(rec + 8, uint32_t(vt));
-            wr32(rec + 12, uint32_t(vc));
-            const size_t osz = 10 + size_t(vc) * 2 * size_t(w);
-            vt += osz;
+        if (mono_next == mono) {
+            wr32(rec + 8, NO);
+            wr32(rec + 12, 0);
             emit(0, rec, 36);
+            next_record();
+            return true;
+        }
+        if (mono != V->tell() || mono_next < mono) die("poi %llu: block offset %llu is not the stream position", (unsigned long long)i,
+                                                       (unsigned long long)mono);
+        const uint64_t bsize = mono_next - mono;
+        if (bsize < 10) die("poi %llu: bad block size", (unsigned long long)i);
+        const uint8_t* h = V->need(10);
+        const uint8_t e = h[0], flag = h[1];
+        if (e > 3 || flag > 1) die("poi %llu: bad block header", (unsigned long long)i);
+        const int w = e == 3 ? 4 : 2;
+        if ((bsize - 10) % (2 * size_t(w))) die("poi %llu: bad block size", (unsigned long long)i);
+        const uint64_t c2 = (bsize - 10) / (2 * size_t(w)), vc = c2 + flag;
+        if (vt >= 0xFFFFFFFFull) die("poi_vertices offset overflow");
+        wr32(rec + 8, uint32_t(vt));
+        wr32(rec + 12, uint32_t(vc));
+        const size_t osz = 10 + size_t(vc) * 2 * size_t(w);
+        vt += osz;
+        emit(0, rec, 36);
+        if (bsize <= big_block()) {
+            h = V->take(size_t(bsize));
             uint8_t* o = emit_reserve(1, osz);
             memcpy(o, h, 10);
             o[1] = 0;
             planes_dec(h + 10, o + 10, c2, w);
             if (flag) memcpy(o + 10 + c2 * 2 * size_t(w), o + 10, 2 * size_t(w));
-        } else {
-            wr32(rec + 8, NO);
-            wr32(rec + 12, 0);
-            emit(0, rec, 36);
+            next_record();
+            return true;
         }
-        memcpy(cur, nxt, 32);
-        i++;
+        uint8_t hdr[10];
+        memcpy(hdr, V->take(10), 10);
+        hdr[1] = 0;
+        emit(1, hdr, 10);
+        const uint64_t base = V->tell();
+        for (int j = 0; j < 2 * w; j++) pl.emplace_back(new Reader(vpath, PLANE_BUF, base + uint64_t(j) * c2, base + uint64_t(j + 1) * c2));
+        big_c2 = c2;
+        big_k = 0;
+        big_w = w;
+        big_flag = flag != 0;
+        big_end = base + 2 * uint64_t(w) * c2;
+        prev[0] = prev[1] = 0;
+        if (c2 == 0) {  // (a block of only its closing vertex can't be: the flag needs 2 vertices)
+            pl.clear();
+            V->seek(big_end);
+            next_record();
+        }
         return true;
     }
 };
 
 // Ports as the decoder's. One pass: a polygon's R3 offset is where its block starts, a point's is
-// where the next block will start, which is the B-open file's position at that record.
+// where the next block will start, which is the B-open file's position at that record. A big block
+// goes plane by plane as its vertices arrive, laid out as if its ring were closed (the closing
+// vertex dropped, as on every POI polygon of the planet); if the last vertex turns out to differ
+// from the first, the planes are moved to the open layout in the file.
 struct PoiEnc : Encoder {
     std::unique_ptr<Writer> O, RW;
     std::vector<uint8_t> blk;
     uint64_t n = 0, vexp = 0;
+    std::string opath;
+    // big block in progress
+    std::vector<std::unique_ptr<Writer>> pl;
+    bool big = false;
+    uint64_t big_vc = 0, big_k = 0, big_start = 0, big_size = 0;
+    int big_w = 0;
+    uint8_t big_hdr[10], big_first[8];
+    uint32_t prev[2] = {0, 0};
     explicit PoiEnc(const std::string& od) : Encoder("poi", od, 2) {
-        O.reset(new Writer(od + "/poi_vertices.bopen"));
+        opath = od + "/poi_vertices.bopen";
+        O.reset(new Writer(opath, WRITE_BUF, true));
         RW.reset(new Writer(od + "/poi_records.r3", 32 << 10));
+    }
+    void plane_vertex(const uint8_t* v, uint64_t k_at) {
+        const int w = big_w;
+        const uint64_t mask = wmask(w);
+        (void)k_at;
+        for (int comp = 0; comp < 2; comp++) {
+            const uint32_t q = getw(v + size_t(comp * w), w);
+            const uint32_t z = zzw(uint32_t((uint64_t(q) - prev[comp]) & mask), 8 * w);
+            for (int b = 0; b < w; b++) pl[size_t(comp * w + b)]->u8(uint8_t(z >> (8 * b)));
+            prev[comp] = q;
+        }
+    }
+    // The block's last vertex is in: closed (dropped) or open (the planes move to stride vc).
+    void finish_big(const uint8_t* last) {
+        const int w = big_w;
+        const size_t vs = 2 * size_t(w);
+        const uint64_t vc = big_vc, base = big_start + 10;
+        const bool closed = vc > 1 && memcmp(last, big_first, vs) == 0;
+        for (auto& x : pl) x->flush();
+        pl.clear();
+        uint64_t c2 = vc - 1;
+        if (!closed) {
+            c2 = vc;
+            std::vector<uint8_t> tmp(size_t(64) << 10);
+            for (int j = 2 * w - 1; j >= 1; j--) {  // plane j: from base + j (vc - 1) to base + j vc
+                const uint64_t src = base + uint64_t(j) * (vc - 1), dst = base + uint64_t(j) * vc;
+                uint64_t left = vc - 1;
+                while (left) {
+                    const size_t c = size_t(std::min<uint64_t>(left, tmp.size()));
+                    left -= c;
+                    if (pread(O->fd, tmp.data(), c, off_t(src + left)) != ssize_t(c)) die("poi_vertices.bopen: reread");
+                    if (pwrite(O->fd, tmp.data(), c, off_t(dst + left)) != ssize_t(c)) die("poi_vertices.bopen: write");
+                }
+            }
+            const uint64_t mask = wmask(w);
+            for (int comp = 0; comp < 2; comp++) {
+                const uint32_t q = getw(last + size_t(comp * w), w);
+                const uint32_t z = zzw(uint32_t((uint64_t(q) - prev[comp]) & mask), 8 * w);
+                for (int b = 0; b < w; b++) {
+                    const uint8_t byte = uint8_t(z >> (8 * b));
+                    if (pwrite(O->fd, &byte, 1, off_t(base + uint64_t(comp * w + b) * vc + (vc - 1))) != 1) die("poi_vertices.bopen: write");
+                }
+            }
+        }
+        big_hdr[1] = closed ? 1 : 0;
+        if (pwrite(O->fd, big_hdr, 10, off_t(big_start)) != 10) die("poi_vertices.bopen: write");
+        O->skip_to(base + vs * c2);
+        vexp += big_size;
+        big = false;
     }
     void pump() override {
         ByteQueue &R = in[0], &V = in[1];
-        while (R.size() >= 36) {
+        for (;;) {
+            if (big) {
+                const size_t vs = 2 * size_t(big_w);
+                while (V.size() >= vs && big_k + 1 < big_vc) {
+                    if (big_k == 0) memcpy(big_first, V.data(), vs);
+                    plane_vertex(V.data(), big_k);
+                    V.pop(vs);
+                    big_k++;
+                }
+                if (V.size() < vs) return;
+                uint8_t last[8];
+                memcpy(last, V.data(), vs);
+                V.pop(vs);
+                finish_big(last);
+                continue;
+            }
+            if (R.size() < 36) return;
             const uint8_t* r = R.data();
             const uint32_t vo = rd32(r + 8), vc = rd32(r + 12);
             if ((vc == 0) != (vo == NO)) die("poi_records %llu: vertex_count %u with vertex_offset %u", (unsigned long long)n, vc, vo);
@@ -1347,7 +1480,7 @@ struct PoiEnc : Encoder {
                 if (e > 3) die("poi_vertices: bad encoding %u", e);
                 w = e == 3 ? 4 : 2;
                 size = 10 + size_t(vc) * 2 * size_t(w);
-                if (V.size() < size) return;
+                if (size <= big_block() ? V.size() < size : V.size() < 10 + 2 * size_t(w)) return;
             }
             if (O->tell() >= 0xFFFFFFFFull) die("poi_vertices.bopen offset overflow");
             uint8_t rec[32];
@@ -1355,10 +1488,13 @@ struct PoiEnc : Encoder {
             wr32(rec + 8, uint32_t(O->tell()));
             memcpy(rec + 12, r + 16, 20);
             RW->put(rec, 32);
-            if (vc) {
-                if (vo != vexp) die("poi_records %llu: polygons not back to back in record order", (unsigned long long)n);
-                const uint8_t* s = V.data();
-                if (s[1] != 0) die("poi_vertices: non-zero pad byte at %llu", (unsigned long long)vexp);
+            R.pop(36);
+            n++;
+            if (!vc) continue;
+            if (vo != vexp) die("poi_records %llu: polygons not back to back in record order", (unsigned long long)(n - 1));
+            const uint8_t* s = V.data();
+            if (s[1] != 0) die("poi_vertices: non-zero pad byte at %llu", (unsigned long long)vexp);
+            if (size <= big_block()) {
                 const bool closed = vc > 1 && memcmp(s + 10, s + 10 + size_t(vc - 1) * 2 * size_t(w), 2 * size_t(w)) == 0;
                 const uint64_t c2 = vc - (closed ? 1 : 0);
                 blk.resize(10 + size_t(c2) * 2 * size_t(w));
@@ -1368,14 +1504,26 @@ struct PoiEnc : Encoder {
                 O->put(blk);
                 V.pop(size);
                 vexp += size;
-                if (blk.capacity() > BIG_BLOCK) std::vector<uint8_t>().swap(blk);
+                continue;
             }
-            R.pop(36);
-            n++;
+            // big block: header kept for the end, plane writers laid out for vc - 1 vertices
+            memcpy(big_hdr, s, 10);
+            V.pop(10);
+            big = true;
+            big_vc = vc;
+            big_k = 0;
+            big_w = w;
+            big_size = size;
+            big_start = O->tell();
+            O->flush();
+            for (int j = 0; j < 2 * w; j++)
+                pl.emplace_back(new Writer(O->fd, opath, big_start + 10 + uint64_t(j) * (vc - 1), PLANE_BUF));
+            prev[0] = prev[1] = 0;
         }
     }
     void finish(Manifest& m) override {
         require_empty();
+        if (big) die("poi_vertices: stream ends inside a block");
         m.set("poi.bopen_bytes", O->tell());
         m.set("poi.n", n);
         O.reset();

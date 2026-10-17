@@ -20,7 +20,7 @@ static_assert(sizeof(off_t) >= 8, "pread offsets must reach past 4 GiB");
 
 // Window of a forward stream. Holds the largest cell list (2 + 65535 * 4 =
 // 262,142 bytes) in one view.
-static constexpr size_t SEQUENTIAL_READ_BUFFER_BYTES = 256 << 10;
+static constexpr size_t SEQUENTIAL_READ_BUFFER_BYTES = 64 << 10;  // a larger view grows it
 // Runs shorter than a window go through it: a copy_file_range would cost a
 // flush of the output's buffer and a syscall for less than one pread.
 static constexpr uint64_t COPY_RANGE_MIN_BYTES = SEQUENTIAL_READ_BUFFER_BYTES;
