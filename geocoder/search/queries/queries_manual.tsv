@@ -1,0 +1,356 @@
+# category	query	expected	lat	lon	tol_km	alternates (lat,lon,tol;...)
+# Hand-written (2026-10-17) before any ranking tuning; coordinates from memory, verified
+# against both systems' result lists and the corpus (verify_eval.py), corrected where noted.
+city	Tokyo	Tokyo	35.6812	139.7671	25
+city	Delhi	Delhi	28.6519	77.2315	25
+city	Shanghai	Shanghai	31.2304	121.4737	30
+city	São Paulo	São Paulo	-23.5505	-46.6333	25
+city	Mexico City	Mexico City	19.4326	-99.1332	25
+city	Cairo	Cairo	30.0444	31.2357	25
+city	Mumbai	Mumbai	19.0760	72.8777	25
+city	Beijing	Beijing	39.9042	116.4074	30
+city	Dhaka	Dhaka	23.8103	90.4125	20
+city	Osaka	Osaka	34.6937	135.5023	20
+city	New York	New York City	40.7128	-74.0060	25
+city	Karachi	Karachi	24.8607	67.0011	25
+city	Buenos Aires	Buenos Aires	-34.6037	-58.3816	25
+city	Istanbul	Istanbul	41.0082	28.9784	30
+city	Kolkata	Kolkata	22.5726	88.3639	20
+city	Manila	Manila	14.5995	120.9842	20
+city	Lagos	Lagos (Nigeria)	6.5244	3.3792	30
+city	Rio de Janeiro	Rio de Janeiro	-22.9068	-43.1729	25
+city	Kinshasa	Kinshasa	-4.4419	15.2663	25
+city	Los Angeles	Los Angeles	34.0522	-118.2437	25
+city	Moscow	Moscow	55.7558	37.6173	25
+city	Lima	Lima (Peru)	-12.0464	-77.0428	20
+city	Bangkok	Bangkok	13.7563	100.5018	25
+city	London	London	51.5074	-0.1278	20
+city	Seoul	Seoul	37.5665	126.9780	20
+city	Jakarta	Jakarta	-6.2088	106.8456	25
+city	Tehran	Tehran	35.6892	51.3890	20
+city	Bogota	Bogotá	4.7110	-74.0721	20
+city	Lahore	Lahore	31.5204	74.3587	20
+city	Chicago	Chicago	41.8781	-87.6298	25
+city	Madrid	Madrid	40.4168	-3.7038	15
+city	Berlin	Berlin	52.5200	13.4050	15
+city	Rome	Rome	41.9028	12.4964	15
+city	Nairobi	Nairobi	-1.2921	36.8219	15
+city	Addis Ababa	Addis Ababa	9.0300	38.7400	15
+city	Canberra	Canberra	-35.2809	149.1300	15
+city	Ottawa	Ottawa	45.4215	-75.6972	15
+city	Brasilia	Brasília	-15.7975	-47.8919	25
+city	Wellington	Wellington (NZ)	-41.2865	174.7762	15
+city	Reykjavik	Reykjavík	64.1466	-21.9426	10
+city	Oslo	Oslo	59.9139	10.7522	10
+city	Stockholm	Stockholm	59.3293	18.0686	15
+city	Helsinki	Helsinki	60.1699	24.9384	10
+city	Copenhagen	Copenhagen	55.6761	12.5683	10
+city	Amsterdam	Amsterdam	52.3676	4.9041	10
+city	Brussels	Brussels	50.8503	4.3517	10
+city	Vienna	Vienna	48.2082	16.3738	10
+city	Warsaw	Warsaw	52.2297	21.0122	15
+city	Prague	Prague	50.0755	14.4378	10
+city	Budapest	Budapest	47.4979	19.0402	15
+city	Athens	Athens (Greece)	37.9838	23.7275	15
+city	Lisbon	Lisbon	38.7223	-9.1393	10
+city	Dublin	Dublin (Ireland)	53.3498	-6.2603	10
+city	Ankara	Ankara	39.9334	32.8597	15
+city	Riyadh	Riyadh	24.7136	46.6753	25
+city	Dubai	Dubai	25.2048	55.2708	25
+city	Singapore	Singapore	1.3521	103.8198	20
+city	Kuala Lumpur	Kuala Lumpur	3.1390	101.6869	15
+city	Hanoi	Hanoi	21.0285	105.8542	15
+city	Ho Chi Minh City	Ho Chi Minh City	10.8231	106.6297	20
+city	Sydney	Sydney	-33.8688	151.2093	25
+city	Melbourne	Melbourne (AU)	-37.8136	144.9631	25
+city	Toronto	Toronto	43.6532	-79.3832	20
+city	Johannesburg	Johannesburg	-26.2041	28.0473	20
+city	Cape Town	Cape Town	-33.9249	18.4241	20
+city	Havana	Havana	23.1136	-82.3666	15
+city	Kyiv	Kyiv	50.4501	30.5234	15
+city	Bucharest	Bucharest	44.4268	26.1025	15
+city	Baghdad	Baghdad	33.3152	44.3661	15
+city	Kabul	Kabul	34.5553	69.2075	15
+city	Tashkent	Tashkent	41.2995	69.2401	15
+city	Accra	Accra	5.6037	-0.1870	15
+city	Dakar	Dakar	14.7167	-17.4677	15
+city	Montevideo	Montevideo	-34.9011	-56.1645	15
+city	Quito	Quito	-0.1807	-78.4678	15
+city	Caracas	Caracas	10.4806	-66.9036	15
+city	Ulaanbaatar	Ulaanbaatar	47.8864	106.9057	15
+city	Kathmandu	Kathmandu	27.7172	85.3240	10
+city	Taipei	Taipei	25.0330	121.5654	15
+city	Hong Kong	Hong Kong	22.3193	114.1694	25
+city	San Francisco	San Francisco	37.7749	-122.4194	15
+city	Munich	Munich	48.1351	11.5820	15
+city	Milan	Milan	45.4642	9.1900	15
+city	Hamburg	Hamburg	53.5511	9.9937	15
+city	Zurich	Zürich	47.3769	8.5417	10
+city	Edinburgh	Edinburgh	55.9533	-3.1883	10
+city	Seattle	Seattle	47.6062	-122.3321	15
+city	Montreal	Montréal	45.5017	-73.5673	15
+ambiguous	Paris	Paris (France)	48.8566	2.3522	15
+ambiguous	Springfield	Springfield (IL, MO or MA)	39.7817	-89.6501	15	37.2090,-93.2923,15;42.1015,-72.5898,15
+ambiguous	Newtown	Newtown (Powys, CT, NSW or PA)	52.5132	-3.3141	5	41.4140,-73.3035,8;-33.8970,151.1790,3;40.2290,-74.9368,8
+ambiguous	Victoria	Victoria (BC, Australian state or Seychelles)	48.4284	-123.3656	15	-36.9,144.3,400;-4.6191,55.4513,10
+ambiguous	San José	San José (Costa Rica) or San Jose (CA)	9.9281	-84.0907	15	37.3382,-121.8863,20
+ambiguous	Santiago	Santiago (Chile, Compostela or DR)	-33.4489	-70.6693	25	42.8782,-8.5448,10;19.4517,-70.6970,15
+ambiguous	Cambridge	Cambridge (UK or MA)	52.2053	0.1218	10	42.3736,-71.1097,8
+ambiguous	Portland	Portland (OR or ME)	45.5152	-122.6784	15	43.6591,-70.2568,10
+ambiguous	Birmingham	Birmingham (UK or AL)	52.4862	-1.8904	15	33.5186,-86.8104,15
+ambiguous	Córdoba	Córdoba (Argentina or Spain)	-31.4201	-64.1888	20	37.8882,-4.7794,10
+ambiguous	Valencia	Valencia (Spain or Venezuela)	39.4699	-0.3763	15	10.1620,-68.0077,20
+ambiguous	Alexandria	Alexandria (Egypt or VA)	31.2001	29.9187	20	38.8048,-77.0469,10
+ambiguous	Frankfurt	Frankfurt (Main or Oder)	50.1109	8.6821	15	52.3471,14.5506,10
+ambiguous	Hyderabad	Hyderabad (India or Pakistan)	17.3850	78.4867	25	25.3960,68.3578,15
+ambiguous	Kingston	Kingston (Jamaica, ON or upon Thames)	17.9714	-76.7920	15	44.2312,-76.4860,10;51.4123,-0.3007,5
+ambiguous	Georgetown	Georgetown (Guyana, Penang or DC)	6.8013	-58.1551	10	5.4141,100.3288,10;38.9097,-77.0654,3
+ambiguous	Tripoli	Tripoli (Libya or Lebanon)	32.8872	13.1913	20	34.4367,35.8497,10
+ambiguous	Perth	Perth (Australia or Scotland)	-31.9505	115.8605	25	56.3950,-3.4308,8
+ambiguous	Hamilton	Hamilton (ON, NZ or Bermuda)	43.2557	-79.8711	15	-37.7870,175.2793,15;32.2949,-64.7814,5
+ambiguous	Richmond	Richmond (VA, BC or London)	37.5407	-77.4360	15	49.1666,-123.1336,10;51.4613,-0.3037,5
+context	Paris Texas	Paris, Texas	33.6609	-95.5555	10
+context	Paris, Tennessee	Paris, Tennessee	36.3020	-88.3267	10
+context	Springfield, Illinois	Springfield, Illinois	39.7817	-89.6501	15
+context	Springfield Missouri	Springfield, Missouri	37.2090	-93.2923	15
+context	Springfield MA	Springfield, Massachusetts	42.1015	-72.5898	15
+context	Springfield, Oregon	Springfield, Oregon	44.0462	-123.0220	10
+context	Portland Maine	Portland, Maine	43.6591	-70.2568	10
+context	Portland, OR	Portland, Oregon	45.5152	-122.6784	15
+context	Cambridge MA	Cambridge, Massachusetts	42.3736	-71.1097	8
+context	Cambridge, England	Cambridge, England	52.2053	0.1218	10
+context	London Ontario	London, Ontario	42.9849	-81.2453	15
+context	Birmingham Alabama	Birmingham, Alabama	33.5186	-86.8104	15
+context	Victoria BC	Victoria, British Columbia	48.4284	-123.3656	15
+context	Victoria, Australia	Victoria (state)	-36.9	144.3	400
+context	Victoria Seychelles	Victoria, Seychelles	-4.6191	55.4513	10
+context	San José, Costa Rica	San José, Costa Rica	9.9281	-84.0907	15
+context	San Jose California	San Jose, California	37.3382	-121.8863	20
+context	Córdoba, Argentina	Córdoba, Argentina	-31.4201	-64.1888	20
+context	Cordoba Spain	Córdoba, Spain	37.8882	-4.7794	10
+context	Valencia, Venezuela	Valencia, Venezuela	10.1620	-68.0077	20
+context	Newtown, Powys	Newtown, Powys	52.5132	-3.3141	5
+context	Newtown Connecticut	Newtown, Connecticut	41.4140	-73.3035	8
+context	Newtown NSW	Newtown, New South Wales	-33.8970	151.1790	3
+context	Newtown PA	Newtown, Pennsylvania	40.2290	-74.9368	10
+context	Alexandria, Virginia	Alexandria, Virginia	38.8048	-77.0469	10
+context	Frankfurt Oder	Frankfurt (Oder)	52.3471	14.5506	10
+context	Hyderabad Pakistan	Hyderabad, Pakistan	25.3960	68.3578	15
+context	Kingston, Jamaica	Kingston, Jamaica	17.9714	-76.7920	15
+context	Kingston Ontario	Kingston, Ontario	44.2312	-76.4860	10
+context	Perth Scotland	Perth, Scotland	56.3950	-3.4308	8
+context	Hamilton New Zealand	Hamilton, New Zealand	-37.7870	175.2793	15
+context	Richmond, Virginia	Richmond, Virginia	37.5407	-77.4360	15
+context	Athens Georgia	Athens, Georgia	33.9519	-83.3576	15
+context	Washington DC	Washington, D.C.	38.9072	-77.0369	15
+context	Moscow Idaho	Moscow, Idaho	46.7324	-117.0002	10
+context	Dublin, Ohio	Dublin, Ohio	40.0992	-83.1141	8
+context	Toledo Spain	Toledo, Spain	39.8628	-4.0273	8
+context	Manchester NH	Manchester, New Hampshire	42.9956	-71.4548	10
+context	Florence, Italy	Florence, Italy	43.7696	11.2558	10
+context	Florence Alabama	Florence, Alabama	34.7998	-87.6773	10
+context	Lafayette Indiana	Lafayette, Indiana	40.4167	-86.8753	10
+context	Berlin, New Hampshire	Berlin, New Hampshire	44.4687	-71.1851	8
+context	Rome Georgia	Rome, Georgia	34.2570	-85.1647	10
+context	Naples Florida	Naples, Florida	26.1420	-81.7948	10
+context	Santiago de Compostela	Santiago de Compostela	42.8782	-8.5448	10
+context	London, UK	London	51.5074	-0.1278	20
+context	Paris France	Paris (France)	48.8566	2.3522	15
+nonenglish	München	Munich	48.1351	11.5820	15
+nonenglish	Москва	Moscow	55.7558	37.6173	25
+nonenglish	東京	Tokyo	35.6812	139.7671	25
+nonenglish	Lisboa	Lisbon	38.7223	-9.1393	10
+nonenglish	Wien	Vienna	48.2082	16.3738	10
+nonenglish	Praha	Prague	50.0755	14.4378	10
+nonenglish	Köln	Cologne	50.9375	6.9603	12
+nonenglish	Firenze	Florence	43.7696	11.2558	10
+nonenglish	Roma	Rome	41.9028	12.4964	15
+nonenglish	Venezia	Venice	45.4408	12.3155	12
+nonenglish	Napoli	Naples	40.8518	14.2681	12
+nonenglish	Torino	Turin	45.0703	7.6869	12
+nonenglish	Milano	Milan	45.4642	9.1900	15
+nonenglish	Warszawa	Warsaw	52.2297	21.0122	15
+nonenglish	Kraków	Kraków	50.0647	19.9450	12
+nonenglish	København	Copenhagen	55.6761	12.5683	10
+nonenglish	Bruxelles	Brussels	50.8503	4.3517	10
+nonenglish	Genève	Geneva	46.2044	6.1432	10
+nonenglish	Den Haag	The Hague	52.0705	4.3007	10
+nonenglish	Sevilla	Seville	37.3891	-5.9845	12
+nonenglish	北京	Beijing	39.9042	116.4074	30
+nonenglish	上海	Shanghai	31.2304	121.4737	30
+nonenglish	서울	Seoul	37.5665	126.9780	20
+nonenglish	부산	Busan	35.1796	129.0756	25
+nonenglish	大阪	Osaka	34.6937	135.5023	20
+nonenglish	京都	Kyoto	35.0116	135.7681	15
+nonenglish	Αθήνα	Athens	37.9838	23.7275	15
+nonenglish	القاهرة	Cairo	30.0444	31.2357	25
+nonenglish	Санкт-Петербург	Saint Petersburg	59.9311	30.3609	20
+nonenglish	Київ	Kyiv	50.4501	30.5234	15
+nonenglish	Beograd	Belgrade	44.7866	20.4489	12
+nonenglish	București	Bucharest	44.4268	26.1025	15
+nonenglish	İstanbul	Istanbul	41.0082	28.9784	30
+nonenglish	दिल्ली	Delhi	28.6519	77.2315	25
+nonenglish	मुंबई	Mumbai	19.0760	72.8777	25
+nonenglish	กรุงเทพมหานคร	Bangkok	13.7563	100.5018	25
+nonenglish	תל אביב	Tel Aviv	32.0853	34.7818	10
+nonenglish	ירושלים	Jerusalem	31.7683	35.2137	10
+nonenglish	تهران	Tehran	35.6892	51.3890	20
+nonenglish	Ciudad de México	Mexico City	19.4326	-99.1332	25
+nonenglish	Nueva York	New York City	40.7128	-74.0060	25
+nonenglish	Londres	London	51.5074	-0.1278	20
+nonenglish	Pékin	Beijing	39.9042	116.4074	30
+nonenglish	Moskau	Moscow	55.7558	37.6173	25
+nonenglish	Mailand	Milan	45.4642	9.1900	15
+nonenglish	Lissabon	Lisbon	38.7223	-9.1393	10
+nonenglish	Breslau	Wrocław	51.1079	17.0385	12
+nonenglish	Danzig	Gdańsk	54.3520	18.6466	12
+nonenglish	Aix-la-Chapelle	Aachen	50.7753	6.0839	10
+nonenglish	Moskva	Moscow	55.7558	37.6173	25
+nonenglish	Tokio	Tokyo	35.6812	139.7671	25
+nonenglish	Nürnberg	Nuremberg	49.4521	11.0767	12
+nonenglish	Göteborg	Gothenburg	57.7089	11.9746	12
+nonenglish	Tromsø	Tromsø	69.6492	18.9553	10
+nonenglish	Łódź	Łódź	51.7592	19.4560	12
+nonenglish	Munchen	Munich (no umlaut)	48.1351	11.5820	15
+nonenglish	Koln	Cologne (no umlaut)	50.9375	6.9603	12
+nonenglish	Malmo	Malmö (no umlaut)	55.6050	13.0038	10
+typo	Amsterdm	Amsterdam	52.3676	4.9041	10
+typo	Barcelna	Barcelona	41.3874	2.1686	12
+typo	Lodnon	London	51.5074	-0.1278	20
+typo	Pariss	Paris	48.8566	2.3522	15
+typo	Philadelpia	Philadelphia	39.9526	-75.1652	20
+typo	Sydny	Sydney	-33.8688	151.2093	25
+typo	Mosow	Moscow	55.7558	37.6173	25
+typo	Edinbrugh	Edinburgh	55.9533	-3.1883	10
+typo	Copenhagn	Copenhagen	55.6761	12.5683	10
+typo	Stokholm	Stockholm	59.3293	18.0686	15
+typo	Bejing	Beijing	39.9042	116.4074	30
+typo	Shangai	Shanghai	31.2304	121.4737	30
+typo	Rio de Janiero	Rio de Janeiro	-22.9068	-43.1729	25
+typo	Buenos Aries	Buenos Aires	-34.6037	-58.3816	25
+typo	Johannesberg	Johannesburg	-26.2041	28.0473	20
+typo	Pitsburgh	Pittsburgh	40.4406	-79.9959	15
+typo	Cincinatti	Cincinnati	39.1031	-84.5120	15
+typo	Albuquerqe	Albuquerque	35.0844	-106.6504	15
+typo	Pheonix	Phoenix	33.4484	-112.0740	20
+typo	Tuscon	Tucson	32.2226	-110.9747	15
+typo	Los Angelos	Los Angeles	34.0522	-118.2437	25
+typo	San Fransisco	San Francisco	37.7749	-122.4194	15
+typo	Las Vagas	Las Vegas	36.1699	-115.1398	15
+typo	Brisbaine	Brisbane	-27.4698	153.0251	20
+typo	Adelaid	Adelaide	-34.9285	138.6007	20
+typo	Aukland	Auckland	-36.8485	174.7633	20
+typo	Christchruch	Christchurch	-43.5321	172.6362	15
+typo	Budapets	Budapest	47.4979	19.0402	15
+typo	Helsinky	Helsinki	60.1699	24.9384	10
+typo	Dubrovnic	Dubrovnik	42.6507	18.0944	8
+typo	Marakesh	Marrakesh	31.6295	-7.9811	12
+typo	Hiroshma	Hiroshima	34.3853	132.4553	15
+typo	Singapure	Singapore	1.3521	103.8198	20
+typo	Strasbourgh	Strasbourg	48.5734	7.7521	10
+typo	Bordeux	Bordeaux	44.8378	-0.5792	12
+typo	Marseile	Marseille	43.2965	5.3698	15
+typo	Toulose	Toulouse	43.6047	1.4442	12
+typo	Frankfrut	Frankfurt am Main	50.1109	8.6821	15
+typo	Dusseldorff	Düsseldorf	51.2277	6.7735	12
+typo	Rotterdm	Rotterdam	51.9244	4.4777	12
+typo	Bangalor	Bangalore	12.9716	77.5946	20
+typo	Chenai	Chennai	13.0827	80.2707	20
+typo	Islamabd	Islamabad	33.6844	73.0479	15
+typo	Jakarata	Jakarta	-6.2088	106.8456	25
+prefix	ams	Amsterdam	52.3676	4.9041	10
+prefix	amste	Amsterdam	52.3676	4.9041	10
+prefix	amsterd	Amsterdam	52.3676	4.9041	10
+prefix	lon	London	51.5074	-0.1278	20
+prefix	lond	London	51.5074	-0.1278	20
+prefix	londo	London	51.5074	-0.1278	20
+prefix	ber	Berlin	52.5200	13.4050	15
+prefix	berl	Berlin	52.5200	13.4050	15
+prefix	tok	Tokyo	35.6812	139.7671	25
+prefix	toky	Tokyo	35.6812	139.7671	25
+prefix	par	Paris	48.8566	2.3522	15
+prefix	pari	Paris	48.8566	2.3522	15
+prefix	san f	San Francisco	37.7749	-122.4194	15
+prefix	san fra	San Francisco	37.7749	-122.4194	15
+prefix	san franc	San Francisco	37.7749	-122.4194	15
+prefix	new y	New York City	40.7128	-74.0060	25
+prefix	new yo	New York City	40.7128	-74.0060	25
+prefix	barc	Barcelona	41.3874	2.1686	12
+prefix	barce	Barcelona	41.3874	2.1686	12
+prefix	mel	Melbourne	-37.8136	144.9631	25
+prefix	melb	Melbourne	-37.8136	144.9631	25
+prefix	syd	Sydney	-33.8688	151.2093	25
+prefix	rom	Rome	41.9028	12.4964	15
+prefix	mosc	Moscow	55.7558	37.6173	25
+prefix	vien	Vienna	48.2082	16.3738	10
+prefix	mun	Munich	48.1351	11.5820	15
+prefix	muni	Munich	48.1351	11.5820	15
+prefix	chic	Chicago	41.8781	-87.6298	25
+prefix	los a	Los Angeles	34.0522	-118.2437	25
+prefix	los ang	Los Angeles	34.0522	-118.2437	25
+prefix	rio de	Rio de Janeiro	-22.9068	-43.1729	25
+prefix	buen	Buenos Aires	-34.6037	-58.3816	25
+prefix	cop	Copenhagen	55.6761	12.5683	10
+prefix	copen	Copenhagen	55.6761	12.5683	10
+prefix	stock	Stockholm	59.3293	18.0686	15
+prefix	edin	Edinburgh	55.9533	-3.1883	10
+prefix	mad	Madrid	40.4168	-3.7038	15
+prefix	madr	Madrid	40.4168	-3.7038	15
+prefix	lis	Lisbon	38.7223	-9.1393	10
+prefix	lisb	Lisbon	38.7223	-9.1393	10
+prefix	prag	Prague	50.0755	14.4378	10
+prefix	zur	Zürich	47.3769	8.5417	10
+prefix	ista	Istanbul	41.0082	28.9784	30
+prefix	singa	Singapore	1.3521	103.8198	20
+prefix	toro	Toronto	43.6532	-79.3832	20
+landmark	Eiffel Tower	Eiffel Tower	48.8584	2.2945	1
+landmark	Tour Eiffel	Eiffel Tower	48.8584	2.2945	1
+landmark	Statue of Liberty	Statue of Liberty	40.6892	-74.0445	1
+landmark	Golden Gate Bridge	Golden Gate Bridge	37.8199	-122.4783	2
+landmark	Colosseum	Colosseum	41.8902	12.4922	1
+landmark	Big Ben	Big Ben	51.5007	-0.1246	1
+landmark	Tower Bridge	Tower Bridge	51.5055	-0.0754	1
+landmark	Buckingham Palace	Buckingham Palace	51.5014	-0.1419	1
+landmark	Louvre	Louvre Museum	48.8606	2.3376	1
+landmark	Sagrada Familia	Sagrada Família	41.4036	2.1744	1
+landmark	Neuschwanstein Castle	Neuschwanstein Castle	47.5576	10.7498	1
+landmark	Brandenburg Gate	Brandenburg Gate	52.5163	13.3777	1
+landmark	Taj Mahal	Taj Mahal	27.1751	78.0421	1
+landmark	Machu Picchu	Machu Picchu	-13.1631	-72.5450	3
+landmark	Stonehenge	Stonehenge	51.1789	-1.8262	1
+landmark	Sydney Opera House	Sydney Opera House	-33.8568	151.2153	1
+landmark	Burj Khalifa	Burj Khalifa	25.1972	55.2744	1
+landmark	Angkor Wat	Angkor Wat	13.4125	103.8670	2
+landmark	Petra	Petra (Jordan)	30.3285	35.4444	5
+landmark	Chichen Itza	Chichén Itzá	20.6843	-88.5678	2
+landmark	Christ the Redeemer	Christ the Redeemer	-22.9519	-43.2105	1
+landmark	Acropolis	Acropolis of Athens	37.9715	23.7257	1
+landmark	Mount Fuji	Mount Fuji	35.3606	138.7274	3
+landmark	Mount Everest	Mount Everest	27.9881	86.9250	3
+landmark	Matterhorn	Matterhorn	45.9763	7.6586	3
+landmark	Niagara Falls	Niagara Falls	43.0828	-79.0742	6
+landmark	Grand Canyon	Grand Canyon	36.1069	-112.1129	40
+landmark	Uluru	Uluru	-25.3444	131.0369	5
+landmark	Alhambra	Alhambra	37.1761	-3.5881	1
+landmark	Hagia Sophia	Hagia Sophia	41.0086	28.9802	1
+landmark	Forbidden City	Forbidden City	39.9163	116.3972	2
+landmark	Kremlin	Moscow Kremlin	55.7520	37.6175	1.5
+landmark	Red Square	Red Square	55.7539	37.6208	1
+landmark	Times Square	Times Square	40.7580	-73.9855	1
+landmark	Central Park	Central Park (NYC)	40.7829	-73.9654	3
+landmark	Empire State Building	Empire State Building	40.7484	-73.9857	1
+landmark	Space Needle	Space Needle	47.6205	-122.3493	1
+landmark	Mont Saint-Michel	Mont-Saint-Michel	48.6361	-1.5115	2
+landmark	Palace of Versailles	Palace of Versailles	48.8049	2.1204	1.5
+landmark	Leaning Tower of Pisa	Leaning Tower of Pisa	43.7230	10.3966	1
+landmark	Trevi Fountain	Trevi Fountain	41.9009	12.4833	1
+landmark	Great Pyramid of Giza	Great Pyramid of Giza	29.9792	31.1342	2
+landmark	Kinkaku-ji	Kinkaku-ji	35.0394	135.7292	1
+landmark	Atomium	Atomium	50.8949	4.3415	1
+landmark	Charles Bridge	Charles Bridge	50.0865	14.4114	1
+landmark	Cologne Cathedral	Cologne Cathedral	50.9413	6.9583	1
+landmark	Heathrow Airport	Heathrow Airport	51.4700	-0.4543	3
+landmark	JFK Airport	John F. Kennedy International Airport	40.6413	-73.7781	3
+landmark	Yosemite National Park	Yosemite National Park	37.8651	-119.5383	40
+landmark	Table Mountain	Table Mountain	-33.9628	18.4098	3
+landmark	Gardens by the Bay	Gardens by the Bay	1.2816	103.8636	1
