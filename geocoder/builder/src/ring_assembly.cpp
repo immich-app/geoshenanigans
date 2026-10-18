@@ -1,21 +1,106 @@
 #include "ring_assembly.h"
 #include "geometry.h"
 
+#include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
 
 namespace {
 
+using Coords = std::vector<std::pair<double,double>>;
+
+struct SubWay {
+    Coords coords;
+    uint8_t roles = 0;  // RingRole bit of the member way it comes from
+};
+
+int64_t key_of(const std::pair<double,double>& p) { return coord_key(p.first, p.second); }
+
+uint8_t role_bit(const std::string& role) {
+    if (role == "outer" || role.empty()) return kRoleOuter;
+    if (role == "inner") return kRoleInner;
+    return kRoleOther;
+}
+
+// The ways cut at their endpoints and at every coordinate more than one way
+// (or one way twice) passes through, so sub-ways only meet at their ends.
+std::vector<SubWay> split_sub_ways(const std::vector<CoordSpan>& way_coords, const std::vector<uint8_t>& way_roles) {
+    std::unordered_map<int64_t, int> coord_count;
+    for (const CoordSpan& coords : way_coords)
+        for (const auto& p : coords) coord_count[key_of(p)]++;
+
+    std::unordered_set<int64_t> split_points;
+    for (const CoordSpan& coords : way_coords) {
+        split_points.insert(key_of(coords.front()));
+        split_points.insert(key_of(coords.back()));
+    }
+    for (auto& [ck, cnt] : coord_count) {
+        if (cnt > 1) split_points.insert(ck);
+    }
+
+    std::vector<SubWay> sub_ways;
+    for (size_t w = 0; w < way_coords.size(); w++) {
+        const CoordSpan& coords = way_coords[w];
+        size_t seg_start = 0;
+        for (size_t i = 1; i < coords.size(); i++) {
+            if (split_points.count(key_of(coords[i])) && i > seg_start) {
+                sub_ways.push_back({Coords(coords.begin() + seg_start, coords.begin() + i + 1), way_roles[w]});
+                seg_start = i;
+            }
+        }
+        if (seg_start < coords.size() - 1) {
+            sub_ways.push_back({Coords(coords.begin() + seg_start, coords.end()), way_roles[w]});
+        }
+    }
+    return sub_ways;
+}
+
+// Sub-ways running over the same coordinates (either way round) cancel in
+// pairs, as osmium's erase_duplicate_segments drops duplicate segments: a way
+// listed twice, or two ways mapped on top of each other, leaves no edge.
+uint32_t cancel_duplicate_sub_ways(std::vector<SubWay>& sub_ways) {
+    auto same = [](const Coords& a, const Coords& b) {
+        if (a.size() != b.size()) return false;
+        if (std::equal(a.begin(), a.end(), b.begin())) return true;
+        return std::equal(a.begin(), a.end(), b.rbegin());
+    };
+    // Group by the unordered pair of end coordinates and the length.
+    std::unordered_map<uint64_t, std::vector<uint32_t>> groups;
+    for (uint32_t i = 0; i < sub_ways.size(); i++) {
+        const Coords& c = sub_ways[i].coords;
+        const int64_t a = key_of(c.front()), b = key_of(c.back());
+        const uint64_t lo = static_cast<uint64_t>(std::min(a, b)), hi = static_cast<uint64_t>(std::max(a, b));
+        groups[(lo * 0x9E3779B97F4A7C15ull) ^ hi ^ (static_cast<uint64_t>(c.size()) << 1)].push_back(i);
+    }
+    std::vector<char> cancelled(sub_ways.size(), 0);
+    uint32_t count = 0;
+    for (auto& [hash, members] : groups) {
+        for (size_t a = 0; a < members.size(); a++) {
+            if (cancelled[members[a]]) continue;
+            for (size_t b = a + 1; b < members.size(); b++) {
+                if (cancelled[members[b]] || !same(sub_ways[members[a]].coords, sub_ways[members[b]].coords)) continue;
+                cancelled[members[a]] = cancelled[members[b]] = 1;
+                count += 2;
+                break;
+            }
+        }
+    }
+    if (count == 0) return 0;
+    size_t kept = 0;
+    for (size_t k = 0; k < sub_ways.size(); k++) {
+        if (cancelled[k]) continue;
+        if (kept != k) sub_ways[kept] = std::move(sub_ways[k]);
+        kept++;
+    }
+    sub_ways.resize(kept);
+    return count;
+}
+
 // Which member ways a ring assembly stitches, by role.
-enum class RingRoles { Outer, Inner, All };
+enum class RingRoles { Outer, All };
 
 bool takes_role(RingRoles roles, const std::string& role) {
-    switch (roles) {
-        case RingRoles::Outer: return role == "outer" || role.empty();
-        case RingRoles::Inner: return role == "inner";
-        case RingRoles::All: return true;
-    }
-    return false;
+    return roles == RingRoles::All || role_bit(role) == kRoleOuter;
 }
 
 std::vector<std::vector<std::pair<double,double>>> assemble_rings(
@@ -27,52 +112,14 @@ std::vector<std::vector<std::pair<double,double>>> assemble_rings(
     // then stitch sub-ways at endpoints with backtracking.
     // coord_key() from geometry.h provides coordinate hashing.
 
-    std::unordered_map<int64_t, int> coord_count;
     std::vector<CoordSpan> way_coords;
     for (const auto& [way_id, role] : members) {
         if (!takes_role(roles, role)) continue;
         const auto* way = way_geoms.find(way_id);
         if (!way || way->count == 0) continue;
         way_coords.push_back(way_geoms.coords_of(*way));
-        for (const auto& [lat, lng] : way_coords.back()) {
-            coord_count[coord_key(lat, lng)]++;
-        }
     }
-
-    std::unordered_set<int64_t> split_points;
-    for (const CoordSpan& coords : way_coords) {
-        split_points.insert(coord_key(coords.front().first, coords.front().second));
-        split_points.insert(coord_key(coords.back().first, coords.back().second));
-    }
-    for (auto& [ck, cnt] : coord_count) {
-        if (cnt > 1) split_points.insert(ck);
-    }
-
-    struct SubWay {
-        std::vector<std::pair<double,double>> coords;
-    };
-    std::vector<SubWay> sub_ways;
-    for (const CoordSpan& coords : way_coords) {
-        size_t seg_start = 0;
-        for (size_t i = 1; i < coords.size(); i++) {
-            int64_t ck = coord_key(coords[i].first, coords[i].second);
-            if (split_points.count(ck) && i > seg_start) {
-                SubWay sw;
-                sw.coords.assign(coords.begin() + seg_start, coords.begin() + i + 1);
-                if (sw.coords.size() >= 2) {
-                    sub_ways.push_back(std::move(sw));
-                }
-                seg_start = i;
-            }
-        }
-        if (seg_start < coords.size() - 1) {
-            SubWay sw;
-            sw.coords.assign(coords.begin() + seg_start, coords.end());
-            if (sw.coords.size() >= 2) {
-                sub_ways.push_back(std::move(sw));
-            }
-        }
-    }
+    const std::vector<SubWay> sub_ways = split_sub_ways(way_coords, std::vector<uint8_t>(way_coords.size(), 0));
 
     std::unordered_map<int64_t, std::vector<std::pair<size_t, bool>>> coord_adj;
     for (size_t i = 0; i < sub_ways.size(); i++) {
@@ -230,8 +277,107 @@ std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
     return assemble_rings(members, way_geoms, include_all_roles ? RingRoles::All : RingRoles::Outer);
 }
 
-std::vector<std::vector<std::pair<double,double>>> assemble_inner_rings(
-    const std::vector<std::pair<int64_t, std::string>>& members,
-    const WayGeometries& way_geoms) {
-    return assemble_rings(members, way_geoms, RingRoles::Inner);
+AreaRings assemble_area_rings(const std::vector<std::pair<int64_t, std::string>>& members,
+                              const WayGeometries& way_geoms) {
+    AreaRings out;
+    std::vector<CoordSpan> way_coords;
+    std::vector<uint8_t> way_roles;
+    for (const auto& [way_id, role] : members) {
+        const auto* way = way_geoms.find(way_id);
+        if (!way || way->count == 0) continue;
+        way_coords.push_back(way_geoms.coords_of(*way));
+        way_roles.push_back(role_bit(role));
+    }
+    std::vector<SubWay> sub_ways = split_sub_ways(way_coords, way_roles);
+    out.cancelled_sub_ways = cancel_duplicate_sub_ways(sub_ways);
+
+    // Sub-ways by end coordinate, in sub-way order (a closed one twice).
+    std::unordered_map<int64_t, std::vector<uint32_t>> ends;
+    for (uint32_t i = 0; i < sub_ways.size(); i++) {
+        ends[key_of(sub_ways[i].coords.front())].push_back(i);
+        ends[key_of(sub_ways[i].coords.back())].push_back(i);
+    }
+    // osmium gives up on an area whose rings don't all close (a coordinate
+    // with an odd number of segment ends) or with more than 100 coordinates
+    // where rings touch (BasicAssembler::create_rings); Nominatim then has
+    // no geometry for the relation, and neither has this.
+    uint32_t touching = 0;
+    for (const auto& [at, subs] : ends) {
+        if (subs.size() % 2) {
+            out.failure = AreaFailure::OpenRing;
+            return out;
+        }
+        touching += subs.size() > 2;
+    }
+    if (touching > MAX_TOUCHING_LOCATIONS) {
+        out.failure = AreaFailure::TooManyTouches;
+        return out;
+    }
+
+    // Walk unused sub-ways end to end. Arriving back at a coordinate the walk
+    // has passed closes a ring there, so every ring is simple at its vertices
+    // (rings touching at a node come out separate, as osmium splits them at
+    // such locations). Every coordinate joins an even number of ends, so a
+    // walk can always go on until it closes.
+    std::vector<char> used(sub_ways.size(), 0);
+    auto unused_at = [&](int64_t v) -> int64_t {
+        for (uint32_t i : ends[v])
+            if (!used[i]) return i;
+        return -1;
+    };
+    struct Step {
+        uint32_t sub_way;
+        bool reversed;
+    };
+    std::vector<int64_t> trail;  // trail[k] -> trail[k + 1] along steps[k]
+    std::vector<Step> steps;
+    std::unordered_map<int64_t, size_t> trail_index;
+    for (uint32_t start = 0; start < sub_ways.size(); start++) {
+        if (used[start]) continue;
+        trail.assign(1, key_of(sub_ways[start].coords.front()));
+        steps.clear();
+        trail_index.clear();
+        trail_index[trail[0]] = 0;
+        int64_t next = start;
+        while (true) {
+            const int64_t at = trail.back();
+            if (next < 0) next = unused_at(at);
+            if (next < 0) break;
+            const Coords& c = sub_ways[next].coords;
+            const bool reversed = key_of(c.front()) != at;
+            const int64_t to = key_of(reversed ? c.front() : c.back());
+            used[next] = 1;
+            steps.push_back({static_cast<uint32_t>(next), reversed});
+            next = -1;
+            const auto seen = trail_index.find(to);
+            if (seen == trail_index.end()) {
+                trail_index[to] = trail.size();
+                trail.push_back(to);
+                continue;
+            }
+            const size_t from = seen->second;
+            Coords ring;
+            uint8_t roles = 0;
+            for (size_t k = from; k < steps.size(); k++) {
+                const SubWay& sw = sub_ways[steps[k].sub_way];
+                roles |= sw.roles;
+                const size_t skip = ring.empty() ? 0 : 1;
+                if (!steps[k].reversed) ring.insert(ring.end(), sw.coords.begin() + skip, sw.coords.end());
+                else ring.insert(ring.end(), sw.coords.rbegin() + skip, sw.coords.rend());
+            }
+            for (size_t k = from + 1; k < trail.size(); k++) trail_index.erase(trail[k]);
+            trail.resize(from + 1);
+            steps.resize(from);
+            if (ring.size() < 4) continue;
+            out.rings.push_back(std::move(ring));
+            out.roles.push_back(roles);
+        }
+    }
+    // Nor does osmium take an area whose segments cross.
+    if (rings_cross(out.rings)) {
+        out.rings.clear();
+        out.roles.clear();
+        out.failure = AreaFailure::Crossing;
+    }
+    return out;
 }
