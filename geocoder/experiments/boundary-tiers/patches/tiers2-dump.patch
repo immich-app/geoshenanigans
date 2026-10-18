@@ -1,0 +1,35 @@
+From 77c010aae4e66c72fc31bc9b784620b0e017655e Mon Sep 17 00:00:00 2001
+From: Zack <zack@futo.org>
+Date: Sun, 18 Oct 2026 10:43:06 +0200
+Subject: [PATCH] chore(builder): tiers2 admin dump hook
+
+---
+ geocoder/builder/src/build_index.cpp | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/geocoder/builder/src/build_index.cpp b/geocoder/builder/src/build_index.cpp
+index 451664f..026c10a 100644
+--- a/geocoder/builder/src/build_index.cpp
++++ b/geocoder/builder/src/build_index.cpp
+@@ -1785,6 +1785,21 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
+             }
+         };
+         auto write_quality_dirs = [&] {
++            // tiers2 study: the planet's final admin arrays, raw (GC_TIER_DUMP=<dir>).
++            if (run == RegionRun::Planet) {
++                if (const char* dump = std::getenv("GC_TIER_DUMP")) {
++                    ensure_dir(dump);
++                    auto put = [&](const char* name, const void* p, size_t bytes) {
++                        write_binary_file(std::string(dump) + "/" + name, static_cast<const char*>(p), bytes);
++                    };
++                    put("admin_polygons.raw", d.admin_polygons.data(), d.admin_polygons.size() * sizeof(AdminPolygon));
++                    put("admin_vertices.raw", d.admin_vertices.data(), d.admin_vertices.size() * sizeof(NodeCoord));
++                    put("admin_osm_ids.raw", d.admin_osm_ids.data(), d.admin_osm_ids.size() * sizeof(uint64_t));
++                    put("admin_parent_ids.raw", d.admin_parent_ids.data(), d.admin_parent_ids.size() * sizeof(uint32_t));
++                    std::cerr << "tiers2 dump: " << d.admin_polygons.size() << " polygons, " << d.admin_vertices.size()
++                              << " vertices -> " << dump << std::endl;
++                }
++            }
+             // Write quality variants (each gets admin_polygons + admin_vertices)
+             if (multi_quality) {
+                 std::string quality_dir = multi_output ? base_dir + "/quality" : base_dir;

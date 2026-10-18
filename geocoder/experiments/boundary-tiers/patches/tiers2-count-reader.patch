@@ -1,0 +1,45 @@
+From 3fc18c9fc27d54ecd2b830adb79aa631c1c902c2 Mon Sep 17 00:00:00 2001
+From: Zack <zack@futo.org>
+Date: Sun, 18 Oct 2026 12:37:27 +0200
+Subject: [PATCH] chore(server): tiers2 admin decode counters
+
+---
+ geocoder/server/examples/grid_query.rs | 3 +++
+ geocoder/server/src/lib.rs             | 5 +++++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/geocoder/server/examples/grid_query.rs b/geocoder/server/examples/grid_query.rs
+index 9b2b2ec..33e0550 100644
+--- a/geocoder/server/examples/grid_query.rs
++++ b/geocoder/server/examples/grid_query.rs
+@@ -41,4 +41,7 @@ fn main() {
+         // Print coords with fixed precision so two runs key identically.
+         writeln!(out, "{:.6} {:.6} {}", lat, lng, idx.query_json(lat, lng)).unwrap();
+     }
++    eprintln!("admin_decodes {} admin_decoded_verts {}",
++              query_server::ADMIN_DECODES.load(std::sync::atomic::Ordering::Relaxed),
++              query_server::ADMIN_DECODED_VERTS.load(std::sync::atomic::Ordering::Relaxed));
+ }
+diff --git a/geocoder/server/src/lib.rs b/geocoder/server/src/lib.rs
+index 1b1b8f0..5a23c3b 100644
+--- a/geocoder/server/src/lib.rs
++++ b/geocoder/server/src/lib.rs
+@@ -901,6 +901,9 @@ pub const NO_DATA: u32 = 0xFFFFFFFF;
+ // "interior" entry (cell fully inside the polygon, a fast path for PIP),
+ // and the low 31 bits carry the polygon/POI index.
+ pub const INTERIOR_FLAG: u32 = 0x80000000;
++/// tiers2 study counters: admin_verts calls and the vertices they decode.
++pub static ADMIN_DECODES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++pub static ADMIN_DECODED_VERTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+ pub const ID_MASK: u32 = 0x7FFFFFFF;
+ 
+ pub struct GeoCellOffsets {
+@@ -1052,6 +1055,8 @@ impl Index {
+     /// Reads the inline 10-byte polygon header (encoding + bbox_min)
+     /// at `poly.vertex_offset`, then decodes the following vertices.
+     pub fn admin_verts(&self, poly: &AdminPolygon) -> Option<std::borrow::Cow<'_, [NodeCoord]>> {
++        ADMIN_DECODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        ADMIN_DECODED_VERTS.fetch_add(poly.vertex_count as u64, std::sync::atomic::Ordering::Relaxed);
+         decode_polygon_verts(&self.admin_vertices, poly.vertex_offset, poly.vertex_count)
+     }
+ 

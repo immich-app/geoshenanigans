@@ -1,0 +1,69 @@
+From e9d2928732d28f7763cd1c50a26cd2341745b6b6 Mon Sep 17 00:00:00 2001
+From: Zack <zack@futo.org>
+Date: Sun, 18 Oct 2026 10:53:04 +0200
+Subject: [PATCH] chore(server): tiers2 chain admin reader (GC_CHAIN_ADMIN)
+
+---
+ geocoder/server/src/lib.rs | 35 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/geocoder/server/src/lib.rs b/geocoder/server/src/lib.rs
+index 02a3e9e..1b1b8f0 100644
+--- a/geocoder/server/src/lib.rs
++++ b/geocoder/server/src/lib.rs
+@@ -2978,6 +2978,32 @@ impl Index {
+ 
+     // --- Combined query ---
+ 
++    // tiers2 candidate (g): the finest admin polygon (admin_level 3..=10)
++    // whose ring contains the point, smallest area within a level, as the
++    // chain walk's start.
++    fn finest_admin_polygon(&self, lat: f64, lng: f64) -> Option<u32> {
++        let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
++        let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
++        let mut best: [Option<(f32, u32)>; 11] = [None; 11];
++        let mut seen: Vec<u32> = Vec::new();
++        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
++            Self::for_each_entry_fb(&self.admin_entries, Self::lookup_admin_cell_fb(&self.admin_cells, c), |id| {
++                let poly_id = id & ID_MASK;
++                if seen.contains(&poly_id) { return; }
++                seen.push(poly_id);
++                let Some(poly) = self.admin_polygon(poly_id) else { return; };
++                let level = poly.admin_level as usize;
++                if !(3..=10).contains(&level) || poly.area <= 0.0 { return; }
++                if let Some((a, _)) = best[level] { if poly.area >= a { return; } }
++                let Some(verts) = self.admin_verts(&poly) else { return; };
++                if point_in_polygon(lat as f32, lng as f32, &verts) {
++                    best[level] = Some((poly.area, poly_id));
++                }
++            });
++        }
++        (3..=10).rev().find_map(|l| best[l].map(|(_, id)| id))
++    }
++
+     fn resolve_admin(&self, lat: f64, lng: f64, street: Option<&(f64, WayHeader, u32)>) -> AdminResult<'_> {
+         // Hybrid admin resolution: when the primary is a street with a
+         // pre-computed parent polygon, walk its admin_parents chain for
+@@ -2991,7 +3017,7 @@ impl Index {
+         // than the query point — chain walk would then pick the
+         // centroid-containing suburb rather than the query's suburb.
+         let admin_pip = self.find_admin(lat, lng);
+-        let admin_chain = (|| -> Option<AdminResult<'_>> {
++        let street_chain = (|| -> Option<AdminResult<'_>> {
+             let wp = self.way_parents.as_ref()?;
+             let (_, _, way_idx) = street?;
+             // way_parents is u32 per way.
+@@ -3003,6 +3029,13 @@ impl Index {
+             if start == NO_DATA { return None; }
+             Some(self.find_admin_from_chain(start, lat, lng))
+         })();
++        static CHAIN_ADMIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        let chain_mode = *CHAIN_ADMIN.get_or_init(|| std::env::var("GC_CHAIN_ADMIN").map(|v| v == "1").unwrap_or(false));
++        let admin_chain = street_chain.or_else(|| {
++            if !chain_mode || self.admin_parents.is_none() { return None; }
++            let start = self.finest_admin_polygon(lat, lng)?;
++            Some(self.find_admin_from_chain(start, lat, lng))
++        });
+         match admin_chain {
+             Some(chain) => AdminResult {
+                 // Only country/state/region/province replace PIP from
