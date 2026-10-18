@@ -4121,24 +4121,27 @@ pub fn point_in_encoded_polygon(src: &FileBytes, vertex_offset: u32, vertex_coun
     if verts_off + (n * stride) as u64 > src.len() { return None; }
     let bytes = src.read_chunk(verts_off, n * stride);
     let scale = vertex_scale(encoding);
-    let at = |i: usize| -> (f32, f32) {
-        let b = &bytes[i * stride..i * stride + stride];
-        match encoding {
-            4 => (f32::from_le_bytes(b[0..4].try_into().unwrap()), f32::from_le_bytes(b[4..8].try_into().unwrap())),
-            3 => (
-                (bmin_lat + u32::from_le_bytes(b[0..4].try_into().unwrap()) as f64 * scale) as f32,
-                (bmin_lng + u32::from_le_bytes(b[4..8].try_into().unwrap()) as f64 * scale) as f32,
-            ),
-            _ => (
-                (bmin_lat + u16::from_le_bytes(b[0..2].try_into().unwrap()) as f64 * scale) as f32,
-                (bmin_lng + u16::from_le_bytes(b[2..4].try_into().unwrap()) as f64 * scale) as f32,
-            ),
-        }
-    };
+    let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[i], b[i + 1]]) as f64;
+    let u32_at = |b: &[u8], i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+    Some(match encoding {
+        4 => pip_vertices(&bytes, 8, lat, lng, |b| (f32::from_bits(u32_at(b, 0)), f32::from_bits(u32_at(b, 4)))),
+        3 => pip_vertices(&bytes, 8, lat, lng, |b| {
+            ((bmin_lat + u32_at(b, 0) as f64 * scale) as f32, (bmin_lng + u32_at(b, 4) as f64 * scale) as f32)
+        }),
+        _ => pip_vertices(&bytes, 4, lat, lng, |b| {
+            ((bmin_lat + u16_at(b, 0) * scale) as f32, (bmin_lng + u16_at(b, 2) * scale) as f32)
+        }),
+    })
+}
+
+/// The `point_in_polygon` ray cast over packed vertices of one encoding (`at` decodes one).
+#[inline]
+fn pip_vertices(bytes: &[u8], stride: usize, lat: f32, lng: f32, at: impl Fn(&[u8]) -> (f32, f32)) -> bool {
+    let n = bytes.len() / stride;
     let mut inside = false;
-    let (mut vj_lat, mut vj_lng) = at(n - 1);
-    for i in 0..n {
-        let (vi_lat, vi_lng) = at(i);
+    let (mut vj_lat, mut vj_lng) = at(&bytes[(n - 1) * stride..]);
+    for c in bytes.chunks_exact(stride) {
+        let (vi_lat, vi_lng) = at(c);
         if ((vi_lng > lng) != (vj_lng > lng))
             && (lat < (vj_lat - vi_lat) * (lng - vi_lng) / (vj_lng - vi_lng) + vi_lat)
         {
@@ -4147,7 +4150,7 @@ pub fn point_in_encoded_polygon(src: &FileBytes, vertex_offset: u32, vertex_coun
         vj_lat = vi_lat;
         vj_lng = vi_lng;
     }
-    Some(inside)
+    inside
 }
 
 // --- API types ---
