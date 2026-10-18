@@ -41,7 +41,7 @@ struct Decoder {
     // refill takes many small units at once; a coupled family's other queues grow by as much.
     // It stops early, once the port has something, when another open port already holds SKEW_SOFT
     // (its reader is behind: decoding further would only grow that queue).
-    static const size_t READ_AHEAD = size_t(8) << 10, SKEW_SOFT = size_t(64) << 10;
+    static constexpr size_t READ_AHEAD = size_t(8) << 10, SKEW_SOFT = size_t(64) << 10;
     bool others_full(int port) const {
         for (size_t p = 0; p < out.size(); p++)
             if (int(p) != port && state[p] != 2 && out[p].size() >= SKEW_SOFT) return true;
@@ -459,30 +459,48 @@ struct DictDec : Decoder {
 // One pass: each value is written as its first-seen index; at the end the dictionary is sorted and
 // the .u16 file is renumbered in place (a sequential read and write of it, no memory per value).
 struct DictEnc : Encoder {
-    static const size_t SLOTS = 1 << 17;  // twice the most distinct values a u16 index allows
+    size_t slots = 1 << 12;  // doubles to keep the load under a half (at most 2^17 for 65535 values)
     std::vector<uint32_t> keys;
     std::vector<uint16_t> vals;
     std::vector<uint32_t> dict;  // first-seen order
     std::unique_ptr<Writer> w;
     uint64_t n = 0, nd = 0;
     double renumber_s = 0;
-    DictEnc(const std::string& od, const std::string& nm) : Encoder(nm, od, 1), keys(SLOTS, NO), vals(SLOTS, 0) {
+    DictEnc(const std::string& od, const std::string& nm) : Encoder(nm, od, 1), keys(slots, NO), vals(slots, 0) {
         w.reset(new Writer(od + "/" + nm + ".u16", 32 << 10));
     }
     static inline size_t h(uint32_t k) { return size_t((uint64_t(k) * 0x9E3779B97F4A7C15ull) >> 32); }
+    // Doubles the table and reinserts every value but the newest (the caller places it).
+    void grow() {
+        slots *= 2;
+        keys.assign(slots, NO);
+        vals.assign(slots, 0);
+        for (size_t j = 0; j + 1 < dict.size(); j++) {
+            size_t s = h(dict[j]) & (slots - 1);
+            while (keys[s] != NO) s = (s + 1) & (slots - 1);
+            keys[s] = dict[j];
+            vals[s] = uint16_t(j);
+        }
+    }
     void pump() override { in[0].pop(consume(0, in[0].data(), in[0].size())); }
     size_t consume(int, const uint8_t* p, size_t bytes) override {
         const size_t k = bytes / 4;
         for (size_t j = 0; j < k; j++) {
             const uint32_t v = rd32(p + 4 * j);
             if (v == NO) { w->u16(0xFFFF); nd++; continue; }
-            size_t s = h(v) & (SLOTS - 1);
-            while (keys[s] != NO && keys[s] != v) s = (s + 1) & (SLOTS - 1);
+            size_t s = h(v) & (slots - 1);
+            while (keys[s] != NO && keys[s] != v) s = (s + 1) & (slots - 1);
             if (keys[s] == NO) {
                 if (dict.size() >= 0xFFFF) die("%s: too many distinct values for a u16 index", name.c_str());
-                keys[s] = v;
-                vals[s] = uint16_t(dict.size());
+                const uint16_t id = uint16_t(dict.size());
                 dict.push_back(v);
+                if (2 * dict.size() > slots) {
+                    grow();
+                    s = h(v) & (slots - 1);
+                    while (keys[s] != NO) s = (s + 1) & (slots - 1);
+                }
+                keys[s] = v;
+                vals[s] = id;
             }
             w->u16(vals[s]);
         }
