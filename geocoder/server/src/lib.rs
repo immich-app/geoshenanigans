@@ -546,6 +546,15 @@ pub fn rank_to_field(rank: u8) -> Option<&'static str> {
     }
 }
 
+/// Whether a place area (class=place polygon) only repeats an address entry
+/// already found: a polygon of the same name and rank_address, no larger.
+/// Nominatim keeps one entry per rank (address_havelevel); a namesake of
+/// another rank is an entry of its own (Singapore's place=city area has the
+/// country's name and outline, and Nominatim names it as the city).
+pub fn place_area_repeats<'a>(found: impl IntoIterator<Item = (&'a str, u8, f32)>, name: &str, rank: u8, area: f32) -> bool {
+    found.into_iter().any(|(n, r, a)| n == name && r == rank && a <= area)
+}
+
 // Map an AdminPlaceType override to its Nominatim rank_address equivalent.
 // Drives the nested-boundary rank adjustment so linked / place=tagged
 // boundaries sit in the same rank hierarchy as admin_level-based ones.
@@ -1810,15 +1819,14 @@ impl Index {
         // neighbourhood / quarter / suburb fields. Fixes cairo
         // qasr al doubara (place=neighbourhood closed way).
         //
-        // Pick the smallest polygon per name to avoid duplicates
-        // when multiple overlapping place areas share a name.
+        // Pick the smallest polygon per name and rank to avoid duplicates
+        // when overlapping place areas share a name.
         for (_pid, poly) in &place_area_polygons {
             if poly.place_type_override == 0 { continue; }
             let r = place_type_to_rank(poly.place_type_override);
             if r == 0 { continue; }
-            // Skip if a smaller polygon with the same name already exists.
             let name = self.get_string(poly.name_id);
-            if ranked.iter().any(|p| p.name == name && p.area <= poly.area) {
+            if place_area_repeats(ranked.iter().map(|p| (p.name, p.rank_address, p.area)), name, r, poly.area) {
                 continue;
             }
             ranked.push(RankedPoly {
@@ -4431,6 +4439,23 @@ mod pure_helper_tests {
         // GeoNames puts many PO-box ZIPs at one post office: equal distance.
         assert!(nearer_postcode(2.0, "60454", Some((2.0, "60680"))));
         assert!(!nearer_postcode(2.0, "60680", Some((2.0, "60454"))));
+    }
+
+    // -- place areas ----------------------------------------------------------
+
+    #[test]
+    fn place_area_repeats_only_a_namesake_of_its_rank_no_larger() {
+        // found (name, rank, area); the place area's name, rank, area; repeats
+        let cases = [
+            (("Singapore", 4, 0.1155), "Singapore", 16, 0.1155, false), // the country around the city area
+            (("Mitte", 20, 0.5), "Mitte", 20, 0.7, true),
+            (("Mitte", 20, 0.7), "Mitte", 20, 0.7, true),
+            (("Mitte", 20, 0.9), "Mitte", 20, 0.7, false), // a larger namesake doesn't hide it
+            (("Wedding", 20, 0.5), "Mitte", 20, 0.7, false),
+        ];
+        for (found, name, rank, area, repeats) in cases {
+            assert_eq!(place_area_repeats([found], name, rank, area), repeats, "{found:?} {name} {rank}");
+        }
     }
 
     // -- POI ordering ---------------------------------------------------------
