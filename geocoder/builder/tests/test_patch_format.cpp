@@ -222,10 +222,10 @@ TEST(patch_format_section_marker_values) {
 
 TEST(patch_format_magic_and_version) {
     // GCPATCH_VERSION is bound to the value actually emitted/checked by the
-    // diff/patch tools. v7 = every variant dir patches from its own files;
-    // v6 patches need ../full's string tiers, so they are unreadable
-    // (MIN_READ_VERSION).
-    CHECK_EQ(GCPATCH_VERSION, uint32_t(7));
+    // diff/patch tools. v8 = identity-matched merges (REPLACE, derived street
+    // remap, parallel side-file deltas); v7 patches stay readable; v6 patches
+    // need ../full's string tiers, so they are unreadable (MIN_READ_VERSION).
+    CHECK_EQ(GCPATCH_VERSION, uint32_t(8));
     CHECK_EQ(GCPATCH_MIN_READ_VERSION, uint32_t(7));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
     for (int i = 0; i < 8; i++) CHECK_EQ(GCPATCH_MAGIC[i], expect[i]);
@@ -1246,6 +1246,45 @@ TEST(patch_format_record_remap_matches_and_secondary_pairs) {
     for (uint32_t i = 0; i < 10; i++) CHECK_EQ(rm[i], want[i]);
     CHECK_EQ(rm[10], N);
     CHECK_EQ(RecordRemap()[0], N);
+}
+
+TEST(patch_format_record_remap_lookup_with_a_hint_matches_the_index) {
+    // The hinted lookup the v8 address replay uses must answer like
+    // operator[] whatever hint it starts from, pairs taking precedence.
+    RecordRemap rm(40);
+    rm.add_match(0, 5, 10);
+    rm.add_match(12, 20, 8);
+    rm.add_match(30, 2, 3);
+    rm.add_pair(3, 99);
+    rm.add_pair(25, 7);
+    rm.finish();
+    CHECK(!rm.empty());
+    for (size_t start : {size_t(0), size_t(1), size_t(2), size_t(50)}) {
+        size_t hint = start;
+        for (uint32_t i = 0; i < 45; i++) CHECK_EQ(rm.lookup(i, hint), rm[i]);
+    }
+    CHECK(RecordRemap(5).empty());
+}
+
+TEST(patch_format_parallel_delta_files_follow_their_parent) {
+    // v8 side files: one u32 per parent record, remapped like their sparse
+    // delta (admin ids for way_parents, string offsets for postcodes).
+    const ParallelDeltaFile* f = parallel_delta_file(PatchFileId::WAY_PARENTS);
+    REQUIRE(f != nullptr);
+    CHECK(f->parent == PatchFileId::STREET_WAYS);
+    CHECK_EQ(f->remap_kind, 1u);
+    f = parallel_delta_file(PatchFileId::ADDR_POSTCODES);
+    REQUIRE(f != nullptr);
+    CHECK(f->parent == PatchFileId::ADDR_POINTS);
+    CHECK_EQ(f->remap_kind, 2u);
+    for (const auto& p : PARALLEL_DELTA_FILES) {
+        CHECK_EQ(p.value_stride, 4u);
+        bool sparse = false;
+        for (const auto& s : SPARSE_DELTA_FILES)
+            if (s.fid == p.fid) sparse = s.value_stride == p.value_stride && s.remap_kind == p.remap_kind;
+        CHECK(sparse);
+    }
+    CHECK(parallel_delta_file(PatchFileId::POI_RECORDS) == nullptr);
 }
 
 // --- geo entry list deltas ---

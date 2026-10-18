@@ -161,7 +161,16 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // shift runs instead of string diffs (see STRINGS_TIERED_MARKER).
 // Version-gated so older appliers reject the whole patch upfront ("Bad
 // version").
-static constexpr uint32_t GCPATCH_VERSION = 7;
+// v8: street / addr / interp records can match across days by a server-side
+// identity sidecar (geocoder-diff --identity) instead of by content, which
+// suits both stable-slot days and days kept in a canonical content order; the
+// merge gains REPLACE (identity kept, new bytes); the street leg of the
+// parent-id remap and the secondary remap carry only the moved records' pairs
+// (everything else is derived from the replays, streets replayed before
+// addresses); old ids the remap doesn't map drop out of the street / addr /
+// interp cell lists; and the per-record side files follow their parent's
+// merge (PARALLEL_DELTA_STRIDE).
+static constexpr uint32_t GCPATCH_VERSION = 8;
 // A v6 patch needs the string tiers of ../full, which a v7 patcher no longer
 // reads.
 static constexpr uint32_t GCPATCH_MIN_READ_VERSION = 7;
@@ -413,6 +422,31 @@ constexpr uint32_t COPY_OLD_STRIDE = 0xFD;
 //   old_size(u64), new_size(u64) of the cells file,
 //   payload_size(u64), new entries size(u64), append_cell_list_delta bytes.
 constexpr uint32_t CELL_LIST_DELTA_STRIDE = 0xFB;
+
+// Stride sentinel (v8): a per-record side file (one value per record of a
+// parent file: way_parents / way_postcodes per street way, addr_postcodes per
+// address, interp_postcodes per interpolation) rebuilt along the parent's
+// merge sequence: MATCH and REPLACE copy the old record's value (remapped like
+// the sparse delta's remap_kind), INSERT takes the next inline value, DELETE
+// skips one; then (pos, value) pairs at new positions overwrite the values
+// that changed. A parent sent unchanged counts as one MATCH of every record.
+//   file_id(u32), stride = PARALLEL_DELTA_STRIDE (u32), old_size(u64), new_size(u64),
+//   parent_file_id(u32), value_stride(u32) = 4, remap_kind(u32),
+//   n_inserted(u32) + [value:u32] x n_inserted,
+//   n_changes(u32) + [(pos:u32, value:u32)] x n_changes (pos ascending)
+constexpr uint32_t PARALLEL_DELTA_STRIDE = 0xFA;
+struct ParallelDeltaFile { PatchFileId fid, parent; uint32_t value_stride, remap_kind; };
+static constexpr ParallelDeltaFile PARALLEL_DELTA_FILES[] = {
+    {PatchFileId::ADDR_POSTCODES, PatchFileId::ADDR_POINTS, 4, 2},
+    {PatchFileId::WAY_PARENTS, PatchFileId::STREET_WAYS, 4, 1},
+    {PatchFileId::WAY_POSTCODES, PatchFileId::STREET_WAYS, 4, 2},
+    {PatchFileId::INTERP_POSTCODES, PatchFileId::INTERP_WAYS, 4, 2},
+};
+inline const ParallelDeltaFile* parallel_delta_file(PatchFileId fid) {
+    for (const auto& f : PARALLEL_DELTA_FILES)
+        if (f.fid == fid) return &f;
+    return nullptr;
+}
 
 // POI parent-id remap marker: 0xFFFFFFF3
 // Carries the full primary+secondary admin-polygon, street-way, and
@@ -969,6 +1003,26 @@ public:
     }
 
     size_t size() const { return n_old_; }
+    bool empty() const { return runs_.empty() && pairs_.empty(); }
+    // operator[] with a run hint: consecutive lookups that land in the same
+    // run (spatially sorted references) skip the binary search.
+    uint32_t lookup(uint32_t o, size_t& hint) const {
+        if (o >= n_old_) return NONE;
+        if (!pairs_.empty()) {
+            auto p = std::lower_bound(pairs_.begin(), pairs_.end(), std::make_pair(o, 0u),
+                                      [](const auto& a, const auto& b) { return a.first < b.first; });
+            if (p != pairs_.end() && p->first == o) return p->second;
+        }
+        if (hint < runs_.size() && o >= runs_[hint].old_start && o < runs_[hint].old_start + runs_[hint].count)
+            return runs_[hint].new_start + (o - runs_[hint].old_start);
+        auto it = std::upper_bound(runs_.begin(), runs_.end(), o,
+                                   [](uint32_t v, const Run& r) { return v < r.old_start; });
+        if (it == runs_.begin()) return NONE;
+        --it;
+        if (o >= it->old_start + it->count) return NONE;
+        hint = static_cast<size_t>(it - runs_.begin());
+        return it->new_start + (o - it->old_start);
+    }
     // The new id of old record `old`, or NONE when it wasn't kept.
     uint32_t operator[](size_t old) const {
         if (old >= n_old_) return NONE;
