@@ -1605,8 +1605,9 @@ impl Index {
     }
 
     pub fn find_admin(&self, lat: f64, lng: f64) -> AdminResult<'_> {
+        // A polygon containing the point always lists the point's own cell in its covering, so
+        // only that cell's polygons can contain it (the neighbours used to be scanned too).
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
-        let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
 
         // For each admin level, find the smallest-area polygon actually containing
         // the point. Interior flags are used as a fast path for uncontested cells,
@@ -1620,7 +1621,7 @@ impl Index {
         // pointer-equality dedup doesn't survive owned copies).
         let mut place_area_polygons: Vec<(u32, AdminPolygon)> = Vec::new();
 
-        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+        for c in std::iter::once(cell) {
             Self::for_each_entry_fb(&self.admin_entries, Self::lookup_admin_cell_fb(&self.admin_cells, c), |id| {
                 // The interior flag on a (cell, polygon) entry proves
                 // containment only for queries INSIDE that cell. Neighbor
@@ -1700,8 +1701,7 @@ impl Index {
         // second-nested-check rule (placex_triggers.sql lines 944-963) —
         // Nominatim uses only these, not admin boundaries with linked_place
         // tags. Kept in a separate vec so we don't disturb best_by_level[].
-        let neighbors2 = cell_neighbors_at_level(cell, self.admin_cell_level);
-        for c in std::iter::once(cell).chain(neighbors2.into_iter()) {
+        for c in std::iter::once(cell) {
             Self::for_each_entry_fb(&self.admin_entries, Self::lookup_admin_cell_fb(&self.admin_cells, c), |id| {
                 let poly_id = id & ID_MASK;
                 let Some(poly) = self.admin_polygon(poly_id) else { return; };
