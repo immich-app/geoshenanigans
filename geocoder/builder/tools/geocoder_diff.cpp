@@ -11,9 +11,9 @@
 //
 // GCPATCH v8: with --identity, street / interp / addr records match across
 // days by the server-side identity sidecars <META>/{street,interp,addr}.slot.u32
-// (record id -> stable entity key), not by content; see
-// build_identity_merge_seq and PARALLEL_DELTA_STRIDE. Without --identity the
-// families merge by content.
+// (record id -> stable entity key; tools/gen_identity_sidecar.py writes them
+// for stable-slot days), not by content; see build_identity_merge_seq and
+// PARALLEL_DELTA_STRIDE. Without --identity the families merge by content.
 
 #include <algorithm>
 #include <array>
