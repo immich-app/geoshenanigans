@@ -1,16 +1,20 @@
-//! place-search <corpus.tsv> <context_aliases.tsv> [--bench <repeats>] [--limit <n>] [--dump <dir>]
-//!
-//! Builds the index from the corpus, prints build stats (stderr), then reads one query per
-//! stdin line. Default: one JSON line per query with the results and the query's latency.
-//! --bench: runs the whole query list <repeats> times and prints latency percentiles.
-//! --dump: writes the index parts (fst, postings, entity table, names) to <dir> for sizing.
-use place_search::index::Index;
+//! place-search build <set dir> <index dir> [--sub places|poi|all] [--threads N] [--mem-mb M]
+//!                    [--tmp DIR] [--no-inline] [--extras extra_names.bin] [--imp DIR] [--area-proxy]
+//! place-search pack-extras <extra_names.tsv> <extra_names.bin>
+//! place-search query <set dir> <index dir> [--extras F] [--iso F] [--limit N]
+//!                    [--bench REPEATS [--no-warmup]]
+//!   one query per stdin line; default one JSON line per query, --bench latency percentiles
+//! place-search ctxbench <set dir> < "lat lng" lines   (reverse-lookup cost per point)
+use place_search::build::{build, BuildOpts};
+use place_search::reader::SearchIndex;
 use place_search::query::Searcher;
+use query_server::{Index, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL};
 use serde_json::json;
 use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-fn rss_kb(field: &str) -> u64 {
+fn status_kb(field: &str) -> u64 {
     std::fs::read_to_string("/proc/self/status")
         .unwrap_or_default()
         .lines()
@@ -19,102 +23,184 @@ fn rss_kb(field: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn dump(idx: &Index, dir: &str) {
-    std::fs::create_dir_all(dir).unwrap();
-    let w = |name: &str, bytes: &[u8]| std::fs::write(format!("{dir}/{name}"), bytes).unwrap();
-    let as_bytes = |p: *const u8, n: usize| unsafe { std::slice::from_raw_parts(p, n) };
-    w("keys.fst", idx.map.as_fst().as_bytes());
-    w("postings.bin", as_bytes(idx.postings.as_ptr() as *const u8, std::mem::size_of_val(&idx.postings[..])));
-    w("post_off.bin", as_bytes(idx.post_off.as_ptr() as *const u8, idx.post_off.len() * 4));
-    w("entities.bin", as_bytes(idx.entities.as_ptr() as *const u8, std::mem::size_of_val(&idx.entities[..])));
-    w("names.txt", idx.name_text.as_bytes());
-    w("name_off.bin", as_bytes(idx.name_off.as_ptr() as *const u8, idx.name_off.len() * 4));
-    w("names_start.bin", as_bytes(idx.names_start.as_ptr() as *const u8, idx.names_start.len() * 4));
-    w("name_class.bin", &idx.name_class);
+fn mem_json() -> serde_json::Value {
+    json!({"RssAnon_kB": status_kb("RssAnon:"), "RssFile_kB": status_kb("RssFile:"), "VmRSS_kB": status_kb("VmRSS:"),
+           "VmHWM_kB": status_kb("VmHWM:")})
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let corpus = &args[1];
-    let aliases = &args[2];
-    let opt = |name: &str| args.iter().position(|a| a == name).map(|i| args[i + 1].clone());
-    let limit: usize = opt("--limit").map(|v| v.parse().unwrap()).unwrap_or(place_search::constants::DEFAULT_LIMIT);
-    let bench: Option<usize> = opt("--bench").map(|v| v.parse().unwrap());
+fn load_geo(dir: &str) -> Index {
+    Index::load(dir, DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).expect("geocoder index")
+}
 
-    let rss0 = rss_kb("VmRSS:");
-    let idx = Index::build(corpus, aliases);
-    extern "C" {
-        fn malloc_trim(pad: usize) -> i32;
+fn opt(args: &[String], name: &str) -> Option<String> {
+    args.iter().position(|a| a == name).map(|i| args[i + 1].clone())
+}
+
+fn flag(args: &[String], name: &str) -> bool {
+    args.iter().any(|a| a == name)
+}
+
+fn cmd_build(args: &[String]) {
+    let (set, out) = (&args[2], PathBuf::from(&args[3]));
+    let geo = load_geo(set);
+    let sub = opt(args, "--sub").unwrap_or_else(|| "all".into());
+    let opts = BuildOpts {
+        threads: opt(args, "--threads").map(|v| v.parse().unwrap()).unwrap_or(1),
+        mem_mb: opt(args, "--mem-mb").map(|v| v.parse().unwrap()).unwrap_or(place_search::constants::DEFAULT_RUN_BUDGET_MB),
+        tmp: opt(args, "--tmp").map(PathBuf::from).unwrap_or_else(|| out.join("tmp")),
+        inline: !flag(args, "--no-inline"),
+        extras: opt(args, "--extras"),
+        imp_dir: opt(args, "--imp"),
+        area_proxy: flag(args, "--area-proxy"),
+    };
+    let meta_path = out.join("search_meta.json");
+    let mut meta: serde_json::Value = std::fs::read_to_string(&meta_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    let n_place_nodes = geo.place_nodes.as_ref().map(|m| m.len() / 20).unwrap_or(0);
+    meta["n_place_nodes"] = json!(n_place_nodes);
+    meta["extras"] = json!(opts.extras.is_some());
+    meta["inline"] = json!(opts.inline);
+    meta["imp"] = json!(opts.imp_dir.is_some());
+    meta["area_proxy"] = json!(opts.area_proxy);
+    let mut subs = vec![];
+    if sub == "places" || sub == "all" {
+        subs.push("places");
     }
-    // Hand the build's freed scratch back so VmRSS shows what the index holds.
-    unsafe { malloc_trim(0) };
-    for (k, v) in &idx.stats {
-        eprintln!("{k}: {v}");
+    if (sub == "poi" || sub == "all") && geo.poi_records.is_some() {
+        subs.push("poi");
     }
-    eprintln!("rss after build: {} MB (peak {} MB, before {} MB)", rss_kb("VmRSS:") / 1024, rss_kb("VmHWM:") / 1024, rss0 / 1024);
-    if let Some(dir) = opt("--dump") {
-        dump(&idx, &dir);
+    for s in subs {
+        let st = build(&geo, s, &out, &opts).unwrap_or_else(|e| panic!("build {s}: {e}"));
+        let mut o = serde_json::Map::new();
+        for (k, v) in &st.lines {
+            eprintln!("{s}: {k}: {v}");
+            o.insert(k.clone(), json!(v));
+        }
+        meta[s] = serde_json::Value::Object(o);
     }
+    let _ = std::fs::remove_dir(&opts.tmp);
+    std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+    eprintln!("build memory: {}", mem_json());
+}
+
+fn cmd_query(args: &[String]) {
+    let (set, dir) = (&args[2], Path::new(&args[3]));
+    let limit: usize = opt(args, "--limit").map(|v| v.parse().unwrap()).unwrap_or(place_search::constants::DEFAULT_LIMIT);
     let t = Instant::now();
+    let geo = load_geo(set);
+    let extras = opt(args, "--extras");
+    let iso = opt(args, "--iso");
+    let idx = SearchIndex::open(&geo, dir, extras.as_deref(), iso.as_deref()).expect("search index");
     let s = Searcher::new(&idx);
-    eprintln!("levenshtein builders: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
-
-    let queries: Vec<String> = std::io::stdin().lock().lines().map_while(Result::ok).collect();
-    if let Some(rep) = bench {
-        for q in &queries {
-            s.search(q, limit);
+    eprintln!("load: {:.1} ms, memory {}", t.elapsed().as_secs_f64() * 1e3, mem_json());
+    let queries: Vec<String> = std::io::stdin().lock().lines().map_while(Result::ok).filter(|l| !l.is_empty()).collect();
+    if let Some(rep) = opt(args, "--bench").map(|v| v.parse::<usize>().unwrap()) {
+        if !flag(args, "--no-warmup") {
+            for q in &queries {
+                std::hint::black_box(s.search(q, limit));
+            }
         }
         let mut lat: Vec<f64> = Vec::with_capacity(queries.len() * rep);
+        let mut lookups = 0usize;
+        let t_all = Instant::now();
         for _ in 0..rep {
             for q in &queries {
                 let t = Instant::now();
-                std::hint::black_box(s.search(q, limit));
+                let (r, st) = s.search(q, limit);
+                std::hint::black_box(r);
                 lat.push(t.elapsed().as_secs_f64() * 1e6);
+                lookups += st.reverse_lookups;
             }
         }
+        let wall = t_all.elapsed().as_secs_f64();
         lat.sort_by(|a, b| a.total_cmp(b));
         let p = |q: f64| lat[((lat.len() as f64 - 1.0) * q).round() as usize];
         let mean = lat.iter().sum::<f64>() / lat.len() as f64;
         println!(
             "{}",
-            json!({"queries": queries.len(), "runs": lat.len(), "mean_us": mean, "p50_us": p(0.5),
-                   "p90_us": p(0.9), "p99_us": p(0.99), "max_us": p(1.0)})
+            json!({"queries": queries.len(), "runs": lat.len(), "wall_s": wall, "mean_us": mean, "p50_us": p(0.5),
+                   "p90_us": p(0.9), "p99_us": p(0.99), "max_us": p(1.0),
+                   "reverse_lookups_per_query": lookups as f64 / lat.len() as f64, "memory": mem_json()})
         );
-        eprintln!("rss after bench: {} MB", rss_kb("VmRSS:") / 1024);
         return;
     }
     let out = std::io::stdout();
     let mut out = out.lock();
     for q in &queries {
         let t = Instant::now();
-        let found = s.search(q, limit);
+        let (found, st) = s.search(q, limit);
         let us = t.elapsed().as_secs_f64() * 1e6;
         let results: Vec<_> = found
             .iter()
             .map(|f| {
-                let h = &f.hit;
-                let e = &idx.entities[h.entity as usize];
-                let osm_t = (e.osm >> 56) as u8 as char;
+                let c = &f.ctx;
                 json!({
                     "name": f.name,
-                    "latitude": e.lat,
-                    "longitude": e.lon,
-                    "admin1name": idx.strings[e.state as usize],
-                    "admin2name": idx.strings[if e.county != 0 { e.county } else { e.district } as usize],
-                    "country": idx.strings[e.country as usize],
-                    "city": idx.strings[e.city as usize],
-                    "kind": (e.kind as char).to_string(),
-                    "type": idx.types[e.type_id as usize],
-                    "osm": format!("{}{}", osm_t, e.osm & ((1u64 << 56) - 1)),
-                    "score": h.score,
-                    "text": h.text,
-                    "importance": e.imp,
-                    "context": h.context,
-                    "matched": idx.name(h.entity, h.ord).0,
-                    "matched_class": idx.name(h.entity, h.ord).1,
+                    "latitude": f.lat,
+                    "longitude": f.lng,
+                    "admin1name": c.state,
+                    "admin2name": if !c.county.is_empty() { c.county } else { c.district },
+                    "country": c.country,
+                    "country_code": std::str::from_utf8(&c.cc).unwrap_or(""),
+                    "kind": f.kind.letter().to_string(),
+                    "type": f.typ,
+                    "score": f.hit.score,
+                    "text": f.hit.text,
+                    "context": f.hit.context,
+                    "class": f.hit.class,
+                    "entity": f.hit.entity,
                 })
             })
             .collect();
-        writeln!(out, "{}", json!({"q": q, "us": us, "results": results})).unwrap();
+        writeln!(
+            out,
+            "{}",
+            json!({"q": q, "us": us, "reverse_lookups": st.reverse_lookups, "context_checks": st.context_checks, "keys": st.keys_matched,
+                   "postings": st.postings_read, "results": results})
+        )
+        .unwrap();
+    }
+    eprintln!("after queries: memory {}", mem_json());
+}
+
+fn cmd_ctxbench(args: &[String]) {
+    let geo = load_geo(&args[2]);
+    let dir = Path::new(&args[3]);
+    let idx = SearchIndex::open(&geo, dir, None, None).expect("search index");
+    let s = Searcher::new(&idx);
+    let pts: Vec<(f32, f32)> = std::io::stdin()
+        .lock()
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+        })
+        .collect();
+    let mut lat = Vec::with_capacity(pts.len());
+    for &(a, b) in &pts {
+        let t = Instant::now();
+        std::hint::black_box(s.context_at(a, b));
+        lat.push(t.elapsed().as_secs_f64() * 1e6);
+    }
+    lat.sort_by(|a, b| a.total_cmp(b));
+    let p = |q: f64| lat[((lat.len() as f64 - 1.0) * q).round() as usize];
+    println!("{}", json!({"points": pts.len(), "p50_us": p(0.5), "p90_us": p(0.9), "p99_us": p(0.99),
+                          "mean_us": lat.iter().sum::<f64>() / lat.len() as f64, "memory": mem_json()}));
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(|s| s.as_str()) {
+        Some("build") => cmd_build(&args),
+        Some("pack-extras") => {
+            let (n, k) = place_search::extras::pack(&args[2], &args[3]).expect("pack");
+            eprintln!("records {n}, names {k}");
+        }
+        Some("query") => cmd_query(&args),
+        Some("ctxbench") => cmd_ctxbench(&args),
+        _ => eprintln!("usage: see the header of main.rs"),
     }
 }
