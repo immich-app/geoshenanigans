@@ -49,7 +49,25 @@ Most of the old bytes were bookkeeping the patcher can derive:
 - far merge jumps need a run of matches behind them (duplicates no longer
   re-send thousands of records); POI entries remap their interior flag
 
-The tables below predate these changes.
+### GCPATCH v8 on planet (2026-10-11 → 12 and 10-12 → 13)
+
+v8 matches street / interp / addr records across days by a server-side
+identity sidecar instead of by content (`geocoder-diff --identity`; on the
+published stable-slot days the key is the slot, see
+`tools/gen_identity_sidecar.py`). Measured 2026-10-14 on planet/full of the
+published days against the nightly's v7 patches (cold cache, `geocoder-patch`
+on 1 core, every apply byte-identical to the new day):
+
+| planet/full | v7 patch | v8 patch | v7 apply CPU | v8 apply CPU | v7 diff CPU / RSS | v8 diff CPU / RSS |
+|-------------|----------|----------|--------------|--------------|-------------------|-------------------|
+| 10-12 → 13 | 3.73 MiB | **3.29 MiB** (−11.8%) | 212 s | **167 s** (−21%) | 388 s / 39.5 GiB | 221 s / 24.9 GiB |
+| 10-11 → 12 | 2.78 MiB | **2.46 MiB** (−11.6%) | 209 s | **165 s** (−21%) | 390 s / 36.7 GiB | 211 s / 24.9 GiB |
+
+planet/quality/uncapped and planet/poi/all patch to within a few bytes of v7
+(no street / interp / addr records). Without `--identity` the families merge
+by content as in v7, with the rest of the v8 format.
+
+The tables below predate all of these changes.
 
 ### Europe (7 GiB dataset)
 
