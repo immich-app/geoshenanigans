@@ -97,6 +97,35 @@ inline bool ring_has_self_intersection(const std::vector<std::pair<double,double
     return false;
 }
 
+// Whether any two segments of the rings cross (properly, as
+// segments_intersect: segments that only touch don't count), checked as
+// osmium's SegmentList::find_intersections does before it builds an area:
+// segments sorted by their least longitude, each against those that start
+// within its longitude span.
+inline bool rings_cross(const std::vector<std::vector<std::pair<double,double>>>& rings) {
+    struct Seg { double lng_lo, lng_hi, lat_lo, lat_hi; const std::pair<double,double>* a; };
+    std::vector<Seg> segs;
+    for (const auto& r : rings)
+        for (size_t i = 0; i + 1 < r.size(); i++) {
+            const auto& p = r[i];
+            const auto& q = r[i + 1];
+            segs.push_back({std::min(p.second, q.second), std::max(p.second, q.second),
+                            std::min(p.first, q.first), std::max(p.first, q.first), &p});
+        }
+    std::sort(segs.begin(), segs.end(), [](const Seg& x, const Seg& y) { return x.lng_lo < y.lng_lo; });
+    for (size_t i = 0; i < segs.size(); i++) {
+        const Seg& s = segs[i];
+        for (size_t j = i + 1; j < segs.size() && segs[j].lng_lo <= s.lng_hi; j++) {
+            const Seg& t = segs[j];
+            if (t.lat_lo > s.lat_hi || t.lat_hi < s.lat_lo) continue;
+            if (segments_intersect(s.a[0].first, s.a[0].second, s.a[1].first, s.a[1].second,
+                                   t.a[0].first, t.a[0].second, t.a[1].first, t.a[1].second))
+                return true;
+        }
+    }
+    return false;
+}
+
 // Check if a ring has duplicate coordinates (spikes/figure-8 from merged holes).
 // A valid simple polygon visits each coordinate exactly once (except closing point).
 inline bool ring_has_duplicate_coords(const std::vector<std::pair<double,double>>& ring) {

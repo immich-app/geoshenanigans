@@ -216,3 +216,106 @@ TEST(ring_assembly_backtrack_closes_after_greedy_dead_end) {
     REQUIRE(rings.size() >= size_t(1));
     CHECK(ring_is_closed(rings[0]));
 }
+
+// assemble_area_rings: every member way, whatever its role, as osmium's
+// assembler takes them.
+
+TEST(area_rings_ignore_roles) {
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {0.0, 10.0}, {10.0, 10.0}, {10.0, 0.0}, {0.0, 0.0}});
+    add_way(geoms, 2, {{2.0, 2.0}, {2.0, 4.0}, {4.0, 4.0}});
+    add_way(geoms, 3, {{4.0, 4.0}, {4.0, 2.0}, {2.0, 2.0}});
+    // Roles swapped: the outline tagged inner, the enclave's halves outer and unset.
+    const std::vector<std::pair<int64_t, std::string>> members = {{1, "inner"}, {2, "outer"}, {3, ""}};
+    const AreaRings a = assemble_area_rings(members, geoms);
+    REQUIRE(a.rings.size() == size_t(2));
+    CHECK(ring_is_closed(a.rings[0]));
+    CHECK_EQ(a.rings[0].size(), size_t(5));
+    CHECK(ring_is_closed(a.rings[1]));
+    CHECK_EQ(a.rings[1].size(), size_t(5));
+    CHECK(a.roles == std::vector<uint8_t>({kRoleInner, kRoleOuter}));
+}
+
+// The enclave touches the outline at a node, and the walk along the outline
+// reaches that node before the outline closes: it comes back to a coordinate
+// it has passed, so the enclave closes there as its own ring instead of
+// making a figure eight with the outline.
+TEST(area_rings_split_rings_touching_at_a_node) {
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {0.0, 10.0}, {10.0, 10.0}, {10.0, 0.0}, {5.0, 0.0}});
+    add_way(geoms, 2, {{5.0, 0.0}, {7.0, 3.0}, {3.0, 3.0}, {5.0, 0.0}});
+    add_way(geoms, 3, {{5.0, 0.0}, {0.0, 0.0}});
+    const std::vector<std::pair<int64_t, std::string>> members = {{1, "outer"}, {2, "inner"}, {3, "outer"}};
+    const AreaRings a = assemble_area_rings(members, geoms);
+    REQUIRE(a.rings.size() == size_t(2));
+    CHECK_EQ(a.rings[0].size(), size_t(4));  // the enclave, closed first
+    CHECK_EQ(a.rings[1].size(), size_t(6));
+    for (const auto& r : a.rings) {
+        CHECK(ring_is_closed(r));
+        for (size_t i = 1; i + 1 < r.size(); i++) CHECK(!coord_eq(r[i], r.front()));
+    }
+}
+
+// A spur hanging off the ring leaves a coordinate with an odd number of ends:
+// osmium builds no area at all then, so neither does this.
+TEST(area_rings_fail_on_an_open_ring) {
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {0.0, 1.0}, {1.0, 1.0}});
+    add_way(geoms, 3, {{1.0, 1.0}, {2.0, 2.0}});
+    add_way(geoms, 2, {{1.0, 1.0}, {1.0, 0.0}, {0.0, 0.0}});
+    const std::vector<std::pair<int64_t, std::string>> members = {{1, "outer"}, {3, "outer"}, {2, "outer"}};
+    const AreaRings a = assemble_area_rings(members, geoms);
+    CHECK(a.rings.empty());
+    CHECK(a.failure == AreaFailure::OpenRing);
+}
+
+// A way listed twice cancels out, as osmium drops duplicate segments in
+// pairs: two squares sharing a side, with the shared side in the relation
+// twice, are one rectangle.
+TEST(area_rings_cancel_ways_listed_twice) {
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 1.0}, {0.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}});
+    add_way(geoms, 2, {{0.0, 1.0}, {0.0, 2.0}, {1.0, 2.0}, {1.0, 1.0}});
+    add_way(geoms, 3, {{0.0, 1.0}, {1.0, 1.0}});
+    const std::vector<std::pair<int64_t, std::string>> members = {{1, "outer"}, {3, "outer"}, {2, "outer"}, {3, "outer"}};
+    const AreaRings a = assemble_area_rings(members, geoms);
+    REQUIRE(a.rings.size() == size_t(1));
+    CHECK_EQ(a.rings[0].size(), size_t(7));
+    CHECK_EQ(a.cancelled_sub_ways, 2u);
+}
+
+// Crossing segments fail the area too, whether in one ring (stitched or a
+// closed way) or between two rings.
+TEST(area_rings_fail_when_segments_cross) {
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {1.0, 1.0}, {1.0, 0.0}});
+    add_way(geoms, 2, {{1.0, 0.0}, {0.0, 1.0}, {0.0, 0.0}});
+    add_way(geoms, 3, {{5.0, 5.0}, {6.0, 6.0}, {6.0, 5.0}, {5.0, 6.0}, {5.0, 5.0}});
+    add_way(geoms, 4, {{10.0, 10.0}, {10.0, 12.0}, {12.0, 12.0}, {12.0, 10.0}, {10.0, 10.0}});
+    add_way(geoms, 5, {{11.0, 11.0}, {11.0, 13.0}, {13.0, 13.0}, {13.0, 11.0}, {11.0, 11.0}});
+    for (const auto& members : std::vector<std::vector<std::pair<int64_t, std::string>>>{
+             {{1, "outer"}, {2, "outer"}}, {{3, "outer"}}, {{4, "outer"}, {5, "outer"}}}) {
+        const AreaRings a = assemble_area_rings(members, geoms);
+        CHECK(a.rings.empty());
+        CHECK(a.failure == AreaFailure::Crossing);
+    }
+}
+
+// Rings may touch at up to 100 coordinates (osmium's max_split_locations): a
+// chain of squares corner to corner.
+TEST(area_rings_fail_past_100_touching_coordinates) {
+    WayGeometries geoms;
+    std::vector<std::pair<int64_t, std::string>> members;
+    for (int i = 0; i < 102; i++) {
+        const double d = i;
+        add_way(geoms, i + 1, {{d, d}, {d, d + 1}, {d + 1, d + 1}, {d + 1, d}, {d, d}});
+        members.emplace_back(i + 1, "outer");
+    }
+    const AreaRings all = assemble_area_rings(members, geoms);
+    CHECK(all.rings.empty());
+    CHECK(all.failure == AreaFailure::TooManyTouches);
+    members.pop_back();
+    const AreaRings fewer = assemble_area_rings(members, geoms);
+    CHECK_EQ(fewer.rings.size(), size_t(101));
+    CHECK(fewer.failure == AreaFailure::None);
+}

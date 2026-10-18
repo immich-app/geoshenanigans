@@ -8,7 +8,6 @@
 
 #include "continent_boundaries.h"
 #include "geometry.h"
-#include "ring_assembly.h"
 #include "ring_contains.h"
 #include "test_framework.h"
 
@@ -145,17 +144,48 @@ TEST(interior_point_of_a_degenerate_ring_is_its_first_vertex) {
     CHECK(p == LatLng(1, 1));
 }
 
-TEST(assign_holes_picks_the_smallest_outer_ring_larger_than_the_hole) {
-    // The Netherlands' main ring holds a Belgian enclave; a Dutch
-    // counter-enclave inside that enclave is a smaller outer ring and must
-    // not take the hole.
-    const std::vector<Ring> outers = {square(0, 0, 10, 10), square(2.5, 2.5, 3.5, 3.5), square(20, 20, 21, 21)};
-    const std::vector<Ring> inners = {square(2, 2, 4, 4), square(20.2, 20.2, 20.4, 20.4), square(50, 50, 51, 51)};
-    const std::vector<int> owner = assign_holes(outers, inners);
-    CHECK_EQ(owner.size(), 3u);
-    CHECK_EQ(owner[0], 0);
-    CHECK_EQ(owner[1], 2);
-    CHECK_EQ(owner[2], -1);  // inside no outer ring
+// Baarle: the Netherlands' main ring holds a Belgian enclave (a hole), and a
+// Dutch counter-enclave inside that is an outer ring again; an island with a
+// lake, and a ring apart.
+const std::vector<Ring> kBaarle = {square(0, 0, 10, 10), square(2, 2, 4, 4), square(2.5, 2.5, 3.5, 3.5),
+                                   square(20, 20, 21, 21), square(20.2, 20.2, 20.4, 20.4), square(50, 50, 51, 51)};
+
+TEST(enclosing_rings_finds_the_ring_immediately_around_each) {
+    const std::vector<int> around = enclosing_rings(kBaarle);
+    CHECK(around == std::vector<int>({-1, 0, 1, -1, 3, -1}));
+    CHECK(ring_depths(around) == std::vector<int>({0, 1, 2, 0, 1, 0}));
+}
+
+TEST(enclosing_rings_ignores_ring_order) {
+    const std::vector<Ring> rings = {kBaarle[2], kBaarle[4], kBaarle[1], kBaarle[5], kBaarle[0], kBaarle[3]};
+    CHECK(enclosing_rings(rings) == std::vector<int>({2, 5, 4, -1, -1, -1}));
+}
+
+TEST(enclosing_rings_needs_the_interior_point_inside_not_just_the_box) {
+    // A small square in the notch of a C: inside the C's box, outside the C.
+    const Ring c = {{0, 0}, {0, 10}, {2, 10}, {2, 2}, {8, 2}, {8, 10}, {10, 10}, {10, 0}, {0, 0}};
+    CHECK(enclosing_rings({c, square(4, 5, 6, 7)}) == std::vector<int>({-1, -1}));
+}
+
+TEST(enclosing_rings_nests_a_hole_touching_its_outer_ring) {
+    // The enclave's corner sits on the outer ring (the rings share a node).
+    const Ring outer = {{0, 0}, {0, 10}, {10, 10}, {10, 0}, {5, 0}, {0, 0}};
+    const Ring touching = {{5, 0}, {7, 3}, {3, 3}, {5, 0}};
+    CHECK(enclosing_rings({outer, touching}) == std::vector<int>({-1, 0}));
+}
+
+TEST(nest_rings_makes_even_depths_outer_rings_and_odd_depths_their_holes) {
+    const std::vector<int> around = enclosing_rings(kBaarle);
+    const std::vector<NestedPolygon> polygons = nest_rings(kBaarle, around, ring_depths(around));
+    CHECK_EQ(polygons.size(), 4u);
+    CHECK(polygons[0].outer == kBaarle[0]);
+    CHECK(polygons[0].holes == std::vector<Ring>({kBaarle[1]}));
+    CHECK(polygons[1].outer == kBaarle[2]);  // the counter-enclave
+    CHECK(polygons[1].holes.empty());
+    CHECK(polygons[2].outer == kBaarle[3]);
+    CHECK(polygons[2].holes == std::vector<Ring>({kBaarle[4]}));
+    CHECK(polygons[3].outer == kBaarle[5]);
+    CHECK(polygons[3].holes.empty());
 }
 
 TEST(simplify_rings_turns_holes_against_the_outer_ring_and_drops_collapsed_ones) {
@@ -183,23 +213,4 @@ TEST(simplify_rings_orders_holes_by_first_vertex) {
     const auto [range, count] = simplify_rings(kOuter, holes, identity);
     CHECK_EQ(count, 2u);
     CHECK(range == encode_rings(kOuter, kHoles));
-}
-
-TEST(assemble_inner_rings_takes_only_inner_ways) {
-    WayGeometries geoms;
-    auto add = [&](int64_t id, const Ring& coords) {
-        geoms.ways[id] = {geoms.coords.size(), static_cast<uint32_t>(coords.size()), 0, 0};
-        geoms.coords.insert(geoms.coords.end(), coords.begin(), coords.end());
-    };
-    add(1, square(0, 0, 10, 10));
-    // The enclave's boundary in two halves.
-    add(2, {{2, 2}, {2, 4}, {4, 4}});
-    add(3, {{4, 4}, {4, 2}, {2, 2}});
-    const std::vector<std::pair<int64_t, std::string>> members = {{1, "outer"}, {2, "inner"}, {3, "inner"}};
-    const auto inners = assemble_inner_rings(members, geoms);
-    CHECK_EQ(inners.size(), 1u);
-    CHECK_NEAR(polygon_area(inners[0]), 4.0, 1e-6);
-    const auto outers = assemble_outer_rings(members, geoms);
-    CHECK_EQ(outers.size(), 1u);
-    CHECK_NEAR(polygon_area(outers[0]), 100.0, 1e-6);
 }

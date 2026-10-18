@@ -4173,6 +4173,28 @@ static int run(int argc, char* argv[]) {
                     std::atomic<size_t> rel_idx{0};
                     std::atomic<uint64_t> assembled_count{0};
                     std::atomic<uint64_t> wikidata_linked_count{0};
+                    // How the rings nested (logged), and where that disagrees
+                    // with the member roles.
+                    struct RingNesting {
+                        std::atomic<uint64_t> rings{0}, holes{0}, islands_in_holes{0}, inner_ways_outer{0},
+                            outer_ways_hole{0}, mixed_roles{0}, cancelled{0}, open{0}, touching{0}, crossing{0};
+                        void count(const AreaRings& a, const std::vector<int>& depth) {
+                            for (size_t r = 0; r < depth.size(); r++) {
+                                const bool hole = depth[r] % 2;
+                                const uint8_t roles = a.roles[r];
+                                rings++;
+                                holes += hole;
+                                islands_in_holes += !hole && depth[r] > 0;
+                                inner_ways_outer += !hole && roles == kRoleInner;
+                                outer_ways_hole += hole && roles == kRoleOuter;
+                                mixed_roles += (roles & (roles - 1)) != 0;
+                            }
+                            cancelled += a.cancelled_sub_ways;
+                            open += a.failure == AreaFailure::OpenRing;
+                            touching += a.failure == AreaFailure::TooManyTouches;
+                            crossing += a.failure == AreaFailure::Crossing;
+                        }
+                    } nesting;
 
                     if (!wikidata_to_place_type.empty()) {
                         std::cerr << "  Wikidata place linking: " << wikidata_to_place_type.size()
@@ -4216,37 +4238,19 @@ static int run(int argc, char* argv[]) {
                                     continue;
                                 }
 
-                                auto rings = assemble_outer_rings(rel.members, data.way_geometries);
-                                // If outer-only assembly failed, retry with all ways.
-                                // Osmium ignores roles during assembly (check_roles=false) —
-                                // inner ways sometimes form the boundary or bridge gaps.
-                                // Filter retry results: discard rings with duplicate coords
-                                // (figure-8 shapes from merging holes with outer boundary).
-                                const bool from_outer_ways = !rings.empty();
-                                if (rings.empty()) {
-                                    auto retry = assemble_outer_rings(rel.members, data.way_geometries, true);
-                                    for (auto& ring : retry) {
-                                        if (!ring_has_duplicate_coords(ring)) {
-                                            rings.push_back(std::move(ring));
-                                        }
-                                    }
-                                }
-                                // Holes: the inner ways' rings, each in the outer ring
-                                // holding it (an all-roles retry has stitched the inner
-                                // ways into its rings already).
-                                std::vector<std::vector<std::vector<std::pair<double,double>>>> holes_of;
-                                if (from_outer_ways) {
-                                    auto inners = assemble_inner_rings(rel.members, data.way_geometries);
-                                    if (!inners.empty()) {
-                                        holes_of.resize(rings.size());
-                                        const std::vector<int> owner = assign_holes(rings, inners);
-                                        for (size_t h = 0; h < inners.size(); h++)
-                                            if (owner[h] >= 0) holes_of[owner[h]].push_back(std::move(inners[h]));
-                                    }
-                                }
+                                // Rings from every member way and nested by geometry,
+                                // as osmium builds Nominatim's boundaries: roles play
+                                // no part, a ring inside an odd number of others is a
+                                // hole, an island in a hole an outer ring again.
+                                AreaRings assembled = assemble_area_rings(rel.members, data.way_geometries);
+                                const std::vector<int> around = enclosing_rings(assembled.rings);
+                                const std::vector<int> depth = ring_depths(around);
+                                nesting.count(assembled, depth);
+                                std::vector<NestedPolygon> polygons =
+                                    nest_rings(std::move(assembled.rings), around, depth);
 
                                 // Diagnostic: log relations with 0 rings produced
-                                if (rings.empty() && !rel.members.empty()) {
+                                if (polygons.empty() && !rel.members.empty()) {
                                     int total_ways = 0, found = 0, missing = 0;
                                     for (const auto& [way_id, role] : rel.members) {
                                         total_ways++;
@@ -4328,11 +4332,11 @@ static int run(int argc, char* argv[]) {
                                 }
 
                                 uint16_t ring_idx = 0;
-                                for (auto& ring : rings) {
-                                    if (ring.size() >= 3) {
+                                for (auto& polygon : polygons) {
+                                    if (polygon.outer.size() >= 3) {
                                         AdminResult ar;
-                                        ar.vertices = std::move(ring);
-                                        if (ring_idx < holes_of.size()) ar.holes = std::move(holes_of[ring_idx]);
+                                        ar.vertices = std::move(polygon.outer);
+                                        ar.holes = std::move(polygon.holes);
                                         ar.name = rel.name;
                                         ar.admin_level = rel.admin_level;
                                         ar.country_code = rel.country_code;
@@ -4353,6 +4357,14 @@ static int run(int argc, char* argv[]) {
                         });
                     }
                     for (auto& w : admin_workers) w.join();
+                    std::cerr << "  Ring nesting: " << nesting.rings << " rings, " << nesting.holes << " holes, "
+                              << nesting.islands_in_holes << " islands in holes; " << nesting.inner_ways_outer
+                              << " rings of inner ways are outer, " << nesting.outer_ways_hole
+                              << " rings of outer ways are holes, " << nesting.mixed_roles
+                              << " mix roles; " << nesting.cancelled << " duplicate sub-ways dropped; relations"
+                              << " without an area as osmium: " << nesting.open << " open, " << nesting.touching
+                              << " touching over " << MAX_TOUCHING_LOCATIONS << " times, " << nesting.crossing
+                              << " crossing" << std::endl;
                     if (wikidata_linked_count > 0) {
                         std::cerr << "  Wikidata place linking: " << wikidata_linked_count
                                   << " admin relations linked to place types." << std::endl;
