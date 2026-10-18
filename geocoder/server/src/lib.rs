@@ -1046,6 +1046,12 @@ impl Index {
     /// Decode a polygon's quantized vertex slice from `admin_vertices`.
     /// Reads the inline 10-byte polygon header (encoding + bbox_min)
     /// at `poly.vertex_offset`, then decodes the following vertices.
+    /// Point-in-polygon on an admin ring without decoding it into memory (false where
+    /// `admin_verts` is None).
+    pub fn admin_pip(&self, poly: &AdminPolygon, lat: f64, lng: f64) -> bool {
+        point_in_encoded_polygon(&self.admin_vertices, poly.vertex_offset, poly.vertex_count, lat as f32, lng as f32).unwrap_or(false)
+    }
+
     pub fn admin_verts(&self, poly: &AdminPolygon) -> Option<std::borrow::Cow<'_, [NodeCoord]>> {
         decode_polygon_verts(&self.admin_vertices, poly.vertex_offset, poly.vertex_count)
     }
@@ -1636,9 +1642,7 @@ impl Index {
                 // Decode the ring only when a point-in-polygon test needs it
                 // (admin_verts is None exactly for these, on valid data).
                 if poly.vertex_count == 0 || poly.vertex_offset == NO_DATA { return; }
-                let pip_now = || self.admin_verts(&poly)
-                    .map(|v| point_in_polygon(lat as f32, lng as f32, &v))
-                    .unwrap_or(false);
+                let pip_now = || self.admin_pip(&poly, lat, lng);
 
                 if let Some((best_area, _, best_verified)) = best_by_level[level] {
                     if poly.area >= best_area {
@@ -1647,8 +1651,7 @@ impl Index {
                         if !best_verified {
                             // Current best only passed via interior flag — verify it now
                             let (_, best_poly, _) = best_by_level[level].unwrap();
-                            let bverts = self.admin_verts(&best_poly);
-                            let best_inside = bverts.as_deref().map(|b| point_in_polygon(lat as f32, lng as f32, b)).unwrap_or(false);
+                            let best_inside = self.admin_pip(&best_poly, lat, lng);
                             if best_inside {
                                 best_by_level[level] = Some((best_area, best_poly, true));
                             } else {
@@ -1683,9 +1686,7 @@ impl Index {
         // Verify any uncontested winners that only passed via interior flag
         for level in 0..12 {
             if let Some((area, poly, false)) = best_by_level[level] {
-                let inside = self.admin_verts(&poly)
-                    .map(|v| point_in_polygon(lat as f32, lng as f32, &v))
-                    .unwrap_or(false);
+                let inside = self.admin_pip(&poly, lat, lng);
                 if inside {
                     best_by_level[level] = Some((area, poly, true));
                 } else {
@@ -1706,8 +1707,7 @@ impl Index {
                 let Some(poly) = self.admin_polygon(poly_id) else { return; };
                 if poly.admin_level != 15 { return; }
                 if poly.area <= 0.0 { return; }
-                let Some(verts) = self.admin_verts(&poly) else { return; };
-                if !point_in_polygon(lat as f32, lng as f32, &verts) { return; }
+                if !self.admin_pip(&poly, lat, lng) { return; }
                 if !place_area_polygons.iter().any(|(pid, _)| *pid == poly_id) {
                     place_area_polygons.push((poly_id, poly));
                 }
@@ -2666,8 +2666,7 @@ impl Index {
                 let Some(poly) = self.admin_polygon(poly_id) else { return; };
                 if poly.admin_level != 15 { return; }
                 if poly.area <= 0.0 { return; }
-                let Some(verts) = self.admin_verts(&poly) else { return; };
-                if !point_in_polygon(lat as f32, lng as f32, &verts) { return; }
+                if !self.admin_pip(&poly, lat, lng) { return; }
                 place_area_polygons.push(poly);
             });
         }
@@ -4055,6 +4054,53 @@ pub fn point_in_polygon(lat: f32, lng: f32, vertices: &[NodeCoord]) -> bool {
     }
 
     inside
+}
+
+/// `point_in_polygon` over a polygon's encoded vertices (the layout `decode_polygon_verts`
+/// reads), decoding one vertex at a time to the same f32 values: no allocation, one pass. None
+/// exactly where `decode_polygon_verts` is None.
+pub fn point_in_encoded_polygon(src: &FileBytes, vertex_offset: u32, vertex_count: u32, lat: f32, lng: f32) -> Option<bool> {
+    if vertex_count == 0 || vertex_offset == NO_DATA { return None; }
+    let off = vertex_offset as u64;
+    if off + POLY_HEADER_BYTES > src.len() { return None; }
+    let header = src.read_chunk(off, POLY_HEADER_BYTES as usize);
+    let encoding = header[0];
+    let bmin_lat = f32::from_le_bytes(header[2..6].try_into().unwrap()) as f64;
+    let bmin_lng = f32::from_le_bytes(header[6..10].try_into().unwrap()) as f64;
+    drop(header);
+    let stride = vertex_stride(encoding);
+    let n = vertex_count as usize;
+    let verts_off = off + POLY_HEADER_BYTES;
+    if verts_off + (n * stride) as u64 > src.len() { return None; }
+    let bytes = src.read_chunk(verts_off, n * stride);
+    let scale = vertex_scale(encoding);
+    let at = |i: usize| -> (f32, f32) {
+        let b = &bytes[i * stride..i * stride + stride];
+        match encoding {
+            4 => (f32::from_le_bytes(b[0..4].try_into().unwrap()), f32::from_le_bytes(b[4..8].try_into().unwrap())),
+            3 => (
+                (bmin_lat + u32::from_le_bytes(b[0..4].try_into().unwrap()) as f64 * scale) as f32,
+                (bmin_lng + u32::from_le_bytes(b[4..8].try_into().unwrap()) as f64 * scale) as f32,
+            ),
+            _ => (
+                (bmin_lat + u16::from_le_bytes(b[0..2].try_into().unwrap()) as f64 * scale) as f32,
+                (bmin_lng + u16::from_le_bytes(b[2..4].try_into().unwrap()) as f64 * scale) as f32,
+            ),
+        }
+    };
+    let mut inside = false;
+    let (mut vj_lat, mut vj_lng) = at(n - 1);
+    for i in 0..n {
+        let (vi_lat, vi_lng) = at(i);
+        if ((vi_lng > lng) != (vj_lng > lng))
+            && (lat < (vj_lat - vi_lat) * (lng - vi_lng) / (vj_lng - vi_lng) + vi_lat)
+        {
+            inside = !inside;
+        }
+        vj_lat = vi_lat;
+        vj_lng = vi_lng;
+    }
+    Some(inside)
 }
 
 // --- API types ---
