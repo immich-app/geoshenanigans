@@ -1633,8 +1633,12 @@ impl Index {
                 // boundary closed ways) can never name a country.
                 if level == 2 && poly.country_code == 0 { return; }
                 if poly.area <= 0.0 { return; }
-
-                let Some(verts) = self.admin_verts(&poly) else { return; };
+                // Decode the ring only when a point-in-polygon test needs it
+                // (admin_verts is None exactly for these, on valid data).
+                if poly.vertex_count == 0 || poly.vertex_offset == NO_DATA { return; }
+                let pip_now = || self.admin_verts(&poly)
+                    .map(|v| point_in_polygon(lat as f32, lng as f32, &v))
+                    .unwrap_or(false);
 
                 if let Some((best_area, _, best_verified)) = best_by_level[level] {
                     if poly.area >= best_area {
@@ -1649,7 +1653,7 @@ impl Index {
                                 best_by_level[level] = Some((best_area, best_poly, true));
                             } else {
                                 // Best was wrong — try this polygon instead
-                                let pip = point_in_polygon(lat as f32, lng as f32, &verts);
+                                let pip = pip_now();
                                 if is_interior || pip {
                                     best_by_level[level] = Some((poly.area, poly, pip));
                                 } else {
@@ -1660,7 +1664,7 @@ impl Index {
                         return;
                     }
                     // This polygon is smaller — must verify with PIP
-                    let pip = point_in_polygon(lat as f32, lng as f32, &verts);
+                    let pip = pip_now();
                     if pip {
                         best_by_level[level] = Some((poly.area, poly, true));
                     }
@@ -1669,7 +1673,7 @@ impl Index {
                     // No existing candidate — accept with interior flag, verify later if contested
                     if is_interior {
                         best_by_level[level] = Some((poly.area, poly, false));
-                    } else if point_in_polygon(lat as f32, lng as f32, &verts) {
+                    } else if pip_now() {
                         best_by_level[level] = Some((poly.area, poly, true));
                     }
                 }
