@@ -1203,7 +1203,8 @@ impl Index {
         let total = m.len() / std::mem::size_of::<PlaceNode>() as u64;
         if (idx as u64) >= total { return None; }
         let pn = m.read_at::<PlaceNode>(idx as u64);
-        if pn.name_id == NO_DATA { return None; }
+        // _pad1 bit 1: a node a boundary claims (hidden, keeps its name for search)
+        if pn.name_id == NO_DATA || pn._pad1 & 0x02 != 0 { return None; }
         Some(pn)
     }
 
