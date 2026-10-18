@@ -26,7 +26,7 @@ std::vector<Op> ops_of(const MergeSequence& s, size_t stride) {
         Op o{static_cast<uint8_t>(s.data[pos]), 0, {}};
         std::memcpy(&o.count, s.data.data() + pos + 1, 4);
         pos += 5;
-        if (o.op == OP_INSERT_RUN) {
+        if (o.op == OP_INSERT_RUN || o.op == OP_REPLACE_RUN) {
             o.data.assign(s.data.data() + pos, o.count * stride);
             pos += o.count * stride;
         }
@@ -147,6 +147,63 @@ TEST(build_merge_seq_jumps_over_inserted_records) {
     auto got = record_merge(body, "ABCDEFGHIJKLMNOPQRST" + body);
     std::vector<Op> want = {{OP_INSERT_RUN, 20, records("ABCDEFGHIJKLMNOPQRST")}, {OP_MATCH_RUN, 30, ""}};
     CHECK(got == want);
+}
+
+TEST(for_each_merge_op_steps_over_inline_records) {
+    std::string rec = records("pqr");
+    MergeSequence s;
+    s.add_match(2);
+    s.add_insert(rec.data(), 1, 12);
+    s.add_replace(rec.data() + 12, 2, 12);
+    s.add_delete(3);
+    std::vector<Op> got;
+    for_each_merge_op(s, 12, [&](uint8_t op, uint32_t count, const char* recs) {
+        got.push_back({op, count, recs ? std::string(recs, count * 12) : std::string()});
+    });
+    std::vector<Op> want = {{OP_MATCH_RUN, 2, ""}, {OP_INSERT_RUN, 1, records("p")},
+                            {OP_REPLACE_RUN, 2, records("qr")}, {OP_DELETE_RUN, 3, ""}};
+    CHECK(got == want);
+}
+
+TEST(identity_in_order_keeps_the_longest_increasing_run) {
+    // New record 1 holds old entity 3 ahead of entities 1 and 2: the run
+    // 0, 1, 2, 4 stays in order and entity 3 is the move.
+    const uint32_t N = UINT32_MAX;
+    auto got = identity_in_order({0, 3, 1, 2, N, 4});
+    CHECK(got == std::vector<uint8_t>({1, 0, 1, 1, 0, 1}));
+    CHECK(identity_in_order({}).empty());
+    CHECK(identity_in_order({N, N}) == std::vector<uint8_t>({0, 0}));
+}
+
+TEST(build_identity_merge_seq_matches_replaces_inserts_and_deletes_by_identity) {
+    // old a b c d e; new a d b C X e: d moved forward (INSERT plus a moved
+    // pair), c changed in place (REPLACE), X is new, d's old slot is DELETEd.
+    const uint32_t N = UINT32_MAX;
+    std::string o = records("abcde"), n = records("adbCXe");
+    std::vector<uint32_t> old_of_new = {0, 3, 1, 2, N, 4};
+    auto in_order = identity_in_order(old_of_new);
+    auto r = build_identity_merge_seq(o.data(), o.size(), n.data(), n.size(), 12, old_of_new, in_order);
+    std::vector<Op> want = {{OP_MATCH_RUN, 1, ""},          {OP_INSERT_RUN, 1, records("d")},
+                            {OP_MATCH_RUN, 1, ""},          {OP_REPLACE_RUN, 1, records("C")},
+                            {OP_INSERT_RUN, 1, records("X")}, {OP_DELETE_RUN, 1, ""},
+                            {OP_MATCH_RUN, 1, ""}};
+    CHECK(ops_of(r.seq, 12) == want);
+    CHECK(r.moved == (std::vector<std::pair<uint32_t, uint32_t>>{{3, 1}}));
+    CHECK(r.matched_old == std::vector<uint8_t>({1, 1, 0, 0, 1}));
+    CHECK_EQ(r.n_match, size_t(3));
+    CHECK_EQ(r.n_replace, size_t(1));
+    CHECK_EQ(r.n_insert, size_t(2));
+    CHECK_EQ(r.n_delete, size_t(1));
+}
+
+TEST(build_identity_merge_seq_deletes_trailing_old_records) {
+    std::string o = records("abc"), n = records("a");
+    std::vector<uint32_t> old_of_new = {0};
+    auto r = build_identity_merge_seq(o.data(), o.size(), n.data(), n.size(), 12, old_of_new,
+                                      identity_in_order(old_of_new));
+    std::vector<Op> want = {{OP_MATCH_RUN, 1, ""}, {OP_DELETE_RUN, 2, ""}};
+    CHECK(ops_of(r.seq, 12) == want);
+    CHECK(r.moved.empty());
 }
 
 TEST(merge_child_blocks_match_keeps_equal_blocks_and_resends_changed_ones) {

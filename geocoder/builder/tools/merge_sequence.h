@@ -1,6 +1,9 @@
 // Merge sequences: how geocoder-diff tells geocoder-patch to rebuild a file
 // from its old copy. MATCH(n) copies n records from old, INSERT(n, data)
 // appends n new records, DELETE(n) skips n old records.
+// GCPATCH v8 adds REPLACE(n, data): n old records are replaced by n new ones
+// that keep their identity, so the patcher's derived id remap maps old to new
+// across them like a MATCH while the bytes come from the patch like an INSERT.
 #pragma once
 
 #include <algorithm>
@@ -12,7 +15,7 @@
 
 #include "parallel.h"
 
-enum MergeOp : uint8_t { OP_MATCH_RUN = 0, OP_INSERT_RUN = 1, OP_DELETE_RUN = 2 };
+enum MergeOp : uint8_t { OP_MATCH_RUN = 0, OP_INSERT_RUN = 1, OP_DELETE_RUN = 2, OP_REPLACE_RUN = 3 };
 
 struct MergeSequence {
     std::vector<char> data; // serialized ops
@@ -33,7 +36,121 @@ struct MergeSequence {
         data.insert(data.end(), (char*)&count, (char*)&count + 4);
         data.insert(data.end(), records, records + count * stride);
     }
+    void add_replace(const char* records, uint32_t count, size_t stride) {
+        uint8_t op = OP_REPLACE_RUN;
+        data.insert(data.end(), (char*)&op, (char*)&op + 1);
+        data.insert(data.end(), (char*)&count, (char*)&count + 4);
+        data.insert(data.end(), records, records + count * stride);
+    }
 };
+
+// Calls fn(op, count, inline_records) for every op of a merge sequence;
+// inline_records is null for MATCH and DELETE.
+template <class Fn>
+void for_each_merge_op(const MergeSequence& seq, size_t stride, Fn fn) {
+    size_t pos = 0;
+    while (pos < seq.data.size()) {
+        uint8_t op = static_cast<uint8_t>(seq.data[pos]); pos++;
+        uint32_t count; memcpy(&count, seq.data.data() + pos, 4); pos += 4;
+        const char* recs = nullptr;
+        if (op == OP_INSERT_RUN || op == OP_REPLACE_RUN) { recs = seq.data.data() + pos; pos += (size_t)count * stride; }
+        fn(op, count, recs);
+    }
+}
+
+// --- Identity merge (v8) ---
+// old_of_new[j]: the old index of new record j's entity (server-side identity
+// sidecar), or UINT32_MAX for a new entity. The kept entities that can stay
+// in order are the longest increasing run of their old indices (canonical
+// content order keeps unchanged records in order, so only records whose sort
+// key changed fall out of it); the rest are moves.
+// Returns in_order[j] = 1 for new records on that run.
+inline std::vector<uint8_t> identity_in_order(const std::vector<uint32_t>& old_of_new) {
+    constexpr uint32_t NONE = UINT32_MAX;
+    const size_t n = old_of_new.size();
+    // Patience LIS over the kept records: tails[k] = new index ending the
+    // best run of length k + 1; prev[j] = predecessor on j's run.
+    std::vector<uint32_t> tails, prev(n, NONE);
+    for (size_t j = 0; j < n; j++) {
+        uint32_t o = old_of_new[j];
+        if (o == NONE) continue;
+        size_t k;
+        if (tails.empty() || old_of_new[tails.back()] < o) {
+            k = tails.size();
+            tails.push_back(static_cast<uint32_t>(j));
+        } else {
+            k = static_cast<size_t>(std::lower_bound(tails.begin(), tails.end(), o,
+                [&](uint32_t t, uint32_t v) { return old_of_new[t] < v; }) - tails.begin());
+            tails[k] = static_cast<uint32_t>(j);
+        }
+        prev[j] = k > 0 ? tails[k - 1] : NONE;
+    }
+    std::vector<uint8_t> in_order(n, 0);
+    for (uint32_t j = tails.empty() ? NONE : tails.back(); j != NONE; j = prev[j]) in_order[j] = 1;
+    return in_order;
+}
+
+// The merge of an identity-matched file: walking new records in order, an
+// in-order kept record is a MATCH when its old bytes (remapped and fixed up
+// by the caller) equal the new ones, else a REPLACE; any other new record is
+// an INSERT, and a moved one also yields an (old, new) pair the patcher can't
+// derive. Old records no in-order record takes are DELETEd. kept_old[i] = 1
+// for old records replayed as MATCH (their offset fixups apply).
+struct IdentityMerge {
+    MergeSequence seq;
+    std::vector<std::pair<uint32_t, uint32_t>> moved;  // (old, new), new ascending
+    std::vector<uint8_t> matched_old;
+    size_t n_match = 0, n_replace = 0, n_insert = 0, n_delete = 0;
+};
+
+inline IdentityMerge build_identity_merge_seq(const char* old_data, size_t old_size, const char* new_data,
+                                              size_t new_size, size_t stride,
+                                              const std::vector<uint32_t>& old_of_new,
+                                              const std::vector<uint8_t>& in_order) {
+    constexpr uint32_t NONE = UINT32_MAX;
+    const size_t old_n = old_size / stride, new_n = new_size / stride;
+    IdentityMerge r;
+    r.matched_old.assign(old_n, 0);
+    enum Kind { NONE_K, MATCH_K, REPLACE_K, INSERT_K, DELETE_K };
+    Kind cur = NONE_K;
+    uint32_t run = 0;
+    size_t run_start = 0;  // new index of the first record of an INSERT / REPLACE run
+    auto flush = [&]() {
+        if (run == 0) return;
+        switch (cur) {
+        case MATCH_K: r.seq.add_match(run); break;
+        case DELETE_K: r.seq.add_delete(run); break;
+        case INSERT_K: r.seq.add_insert(new_data + run_start * stride, run, stride); break;
+        case REPLACE_K: r.seq.add_replace(new_data + run_start * stride, run, stride); break;
+        default: break;
+        }
+        run = 0;
+    };
+    auto push = [&](Kind k, size_t new_idx) {
+        if (k != cur || run == UINT32_MAX) { flush(); cur = k; run_start = new_idx; }
+        run++;
+    };
+    size_t oi = 0;
+    for (size_t j = 0; j < new_n; j++) {
+        uint32_t o = j < old_of_new.size() ? old_of_new[j] : NONE;
+        if (o != NONE && o < old_n && in_order[j]) {
+            for (; oi < o; oi++) { push(DELETE_K, j); r.n_delete++; }
+            if (memcmp(old_data + (size_t)o * stride, new_data + j * stride, stride) == 0) {
+                push(MATCH_K, j); r.n_match++;
+                r.matched_old[o] = 1;
+            } else {
+                push(REPLACE_K, j); r.n_replace++;
+            }
+            oi = (size_t)o + 1;
+        } else {
+            push(INSERT_K, j); r.n_insert++;
+            if (o != NONE && o < old_n) r.moved.push_back({o, static_cast<uint32_t>(j)});
+        }
+    }
+    for (; oi < old_n; oi++) { push(DELETE_K, new_n); r.n_delete++; }
+    flush();
+    return r;
+}
 
 // The non-zero records of a file by content hash, for build_merge_seq's jumps:
 // (hash << 32 | index) sorted, 8 bytes a record where an unordered_multimap
@@ -321,6 +438,12 @@ MergeSequence merge_child_blocks(const MergeSequence& parent_seq, size_t parent_
         uint32_t count; memcpy(&count, parent_seq.data.data() + pos, 4); pos += 4;
         if (op == OP_MATCH_RUN) {
             for (uint32_t k = 0; k < count; k++) keep_or_replace(old_block(oi + k), new_block(ni + k));
+            oi += count; ni += count;
+        } else if (op == OP_REPLACE_RUN) {
+            // The same entity with new record bytes: its block is kept,
+            // edited (head / tail kept) or replaced like a matched one's.
+            for (uint32_t k = 0; k < count; k++) keep_or_replace(old_block(oi + k), new_block(ni + k));
+            pos += (size_t)count * parent_stride;
             oi += count; ni += count;
         } else if (op == OP_INSERT_RUN) {
             for (uint32_t k = 0; k < count; k++) append(new_block(ni + k));
