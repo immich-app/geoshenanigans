@@ -165,6 +165,20 @@ pub fn decode_inline(v: u64) -> Posting {
     }
 }
 
+/// fst value of a key with a posting list: the list's byte offset and its best importance (so
+/// ranking keys never touches the postings file).
+pub fn list_value(offset: u64, top_imp: u8) -> u64 {
+    (offset << 9) | ((top_imp as u64) << 1)
+}
+
+pub fn list_offset(v: u64) -> usize {
+    (v >> 9) as usize
+}
+
+pub fn value_top_imp(v: u64) -> u8 {
+    ((v >> 1) & 0xFF) as u8
+}
+
 /// A key's list: count, then per posting entity<<1|partial, the importance drop from the
 /// previous posting (lists are best importance first), and with extra names a class/ordinal byte.
 pub fn encode_list(out: &mut Vec<u8>, list: &[Posting], with_names: bool) {

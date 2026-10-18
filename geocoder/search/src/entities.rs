@@ -106,9 +106,21 @@ pub struct Entities<'a> {
 }
 
 impl<'a> Entities<'a> {
-    pub fn slot(&self, s: u32) -> BoundarySlot {
-        let at = s as usize * SLOT_BYTES;
-        BoundarySlot::from_bytes(&self.bnd.as_ref().expect("places.bnd")[at..at + SLOT_BYTES])
+    /// Slot of boundary entity `n_place_nodes + poly` (entity ids are record ids, stable across
+    /// daily builds; the slot table is sorted by polygon).
+    pub fn slot(&self, poly: u32) -> BoundarySlot {
+        let b = &self.bnd.as_ref().expect("places.bnd")[..];
+        let (mut lo, mut hi) = (0usize, b.len() / SLOT_BYTES);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let p = u32::from_le_bytes(b[mid * SLOT_BYTES..mid * SLOT_BYTES + 4].try_into().unwrap());
+            if p < poly {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        BoundarySlot::from_bytes(&b[lo * SLOT_BYTES..lo * SLOT_BYTES + SLOT_BYTES])
     }
 
     pub fn is_poi(e: u32) -> bool {

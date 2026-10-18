@@ -29,6 +29,8 @@ pub struct BuildOpts {
     /// Directory with imp_places.u8 / imp_polys.u8 / imp_poi.u8 (the shipped importance bytes).
     pub imp_dir: Option<String>,
     pub area_proxy: bool,
+    /// POIs of tiers above this are left out (3 = all).
+    pub poi_max_tier: u8,
 }
 
 #[derive(Default, Debug)]
@@ -123,9 +125,11 @@ impl<'a> PlacesSource<'a> {
         }
         let mut slots = Vec::new();
         let mut label_used = vec![false; n_place_nodes as usize];
+        // Sets built without the search flags: every named ring is its own boundary entity.
+        let flagged = (0..n_poly).any(|p| polygon_raw(geo, p)._pad2 & POLY_FLAG_PRIMARY_RING != 0);
         for p in 0..n_poly {
             let ap = polygon_raw(geo, p);
-            if ap.name_id == NO_DATA || ap._pad2 & POLY_FLAG_PRIMARY_RING == 0 {
+            if ap.name_id == NO_DATA || (flagged && ap._pad2 & POLY_FLAG_PRIMARY_RING == 0) {
                 continue;
             }
             if link[p as usize] != NO_DATA {
@@ -173,7 +177,7 @@ impl<'a> PlacesSource<'a> {
             let node = (self.link[s.poly as usize] != NO_DATA).then(|| place_node_raw(geo, self.link[s.poly as usize]));
             let kind = if s.linked() { Kind::Linked } else { Kind::Area };
             let typ = boundary_type(&ap, node.as_ref());
-            e.id = self.n_place_nodes + pos;
+            e.id = self.n_place_nodes + s.poly;
             e.imp = W_TYPE * type_base(kind, &typ, ap.admin_level) + extra_importance(byte_at(&self.imp_polys, s.poly));
             if self.area_proxy {
                 e.imp += W_AREA_PROXY * area_proxy(ap.area, s.lat);
@@ -208,6 +212,7 @@ impl<'a> PlacesSource<'a> {
 pub struct PoiSource<'a> {
     geo: &'a Index,
     n: u32,
+    max_tier: u8,
     imp_poi: Option<Mmap>,
     extras: Option<&'a Extras>,
 }
@@ -215,13 +220,13 @@ pub struct PoiSource<'a> {
 impl<'a> PoiSource<'a> {
     pub fn new(geo: &'a Index, opts: &BuildOpts, extras: Option<&'a Extras>) -> Self {
         let n = record_count::<PoiRecord>(geo.poi_records.as_ref().expect("poi_records"));
-        PoiSource { geo, n, imp_poi: map_opt(opts.imp_dir.as_ref().map(|d| format!("{d}/imp_poi.u8"))), extras }
+        PoiSource { geo, n, max_tier: opts.poi_max_tier, imp_poi: map_opt(opts.imp_dir.as_ref().map(|d| format!("{d}/imp_poi.u8"))), extras }
     }
 
     fn fill(&self, pos: u32, e: &mut EntityBuf) -> bool {
         e.names.clear();
         let r = poi_raw(self.geo, pos);
-        if r.name_id == NO_DATA || r.flags & POI_FLAG_SECONDARY_RING != 0 {
+        if r.name_id == NO_DATA || r.flags & POI_FLAG_SECONDARY_RING != 0 || r.tier > self.max_tier {
             return false;
         }
         e.id = pos;
@@ -443,6 +448,10 @@ struct PrefixSlot {
     chars: usize,
     keys: usize,
     hits: Vec<(f32, PrefixHit)>,
+    /// flushed prefixes of this length, in key order: u16 length, prefix, u32 length, hit blob
+    out: BufWriter<File>,
+    path: PathBuf,
+    flushed: u64,
 }
 
 pub fn prefix_text(typed: usize, key_len: usize, edits: u8) -> f32 {
@@ -458,7 +467,6 @@ struct Writer {
     inline: bool,
     with_names: bool,
     slots: Vec<PrefixSlot>,
-    table: Vec<(String, Vec<PrefixHit>)>,
     keys: u64,
     postings: u64,
     inline_keys: u64,
@@ -485,7 +493,7 @@ impl Writer {
         } else {
             self.scratch.clear();
             encode_list(&mut self.scratch, group, self.with_names);
-            let v = self.post_len << 1;
+            let v = list_value(self.post_len, group[0].imp_q);
             self.post.write_all(&self.scratch).map_err(|e| e.to_string())?;
             self.post_len += self.scratch.len() as u64;
             v
@@ -507,7 +515,7 @@ impl Writer {
             let n = n + 1;
             if self.slots[n - 1].prefix != pfx {
                 let slot = &mut self.slots[n - 1];
-                flush_slot(&mut self.table, slot);
+                flush_slot(slot, self.with_names).expect("prefix temp file");
                 slot.prefix = pfx.clone();
             }
             let slot = &mut self.slots[n - 1];
@@ -526,16 +534,36 @@ impl Writer {
     }
 }
 
-fn flush_slot(table: &mut Vec<(String, Vec<PrefixHit>)>, slot: &mut PrefixSlot) {
+fn flush_slot(slot: &mut PrefixSlot, with_names: bool) -> std::io::Result<()> {
     let mut v = std::mem::take(&mut slot.hits);
     let keys = std::mem::take(&mut slot.keys);
     if slot.prefix.is_empty() || (slot.chars > PREFIX_TABLE_ALL_CHARS && keys < HEAVY_PREFIX_MIN_KEYS) {
-        return;
+        return Ok(());
     }
     v.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.entity.cmp(&b.1.entity)));
     let mut seen = HashSet::new();
     let hits: Vec<PrefixHit> = v.into_iter().filter(|(_, h)| seen.insert(h.entity)).take(PREFIX_TABLE_TOP).map(|x| x.1).collect();
-    table.push((slot.prefix.clone(), hits));
+    let mut blob = Vec::new();
+    encode_prefix_hits(&mut blob, &hits, with_names);
+    slot.out.write_all(&(slot.prefix.len() as u16).to_le_bytes())?;
+    slot.out.write_all(slot.prefix.as_bytes())?;
+    slot.out.write_all(&(blob.len() as u32).to_le_bytes())?;
+    slot.out.write_all(&blob)?;
+    slot.flushed += 1;
+    Ok(())
+}
+
+/// Next (prefix, blob) of one per-length prefix file.
+fn read_prefix(r: &mut BufReader<File>) -> Option<(Vec<u8>, Vec<u8>)> {
+    let mut l2 = [0u8; 2];
+    r.read_exact(&mut l2).ok()?;
+    let mut k = vec![0u8; u16::from_le_bytes(l2) as usize];
+    r.read_exact(&mut k).ok()?;
+    let mut l4 = [0u8; 4];
+    r.read_exact(&mut l4).ok()?;
+    let mut b = vec![0u8; u32::from_le_bytes(l4) as usize];
+    r.read_exact(&mut b).ok()?;
+    Some((k, b))
 }
 
 fn vm_hwm_kb() -> u64 {
@@ -633,8 +661,13 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
         scratch: Vec::new(),
         inline: opts.inline,
         with_names,
-        slots: (1..=PREFIX_TABLE_MAX_CHARS).map(|chars| PrefixSlot { prefix: String::new(), chars, keys: 0, hits: Vec::new() }).collect(),
-        table: Vec::new(),
+        slots: (1..=PREFIX_TABLE_MAX_CHARS)
+            .map(|chars| -> Result<PrefixSlot, String> {
+                let path = opts.tmp.join(format!("{name}-pfx{chars}.tmp"));
+                let out = BufWriter::new(File::create(&path).map_err(|e| e.to_string())?);
+                Ok(PrefixSlot { prefix: String::new(), chars, keys: 0, hits: Vec::new(), out, path, flushed: 0 })
+            })
+            .collect::<Result<Vec<_>, String>>()?,
         keys: 0,
         postings: 0,
         inline_keys: 0,
@@ -674,23 +707,34 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
     for f in &files {
         let _ = std::fs::remove_file(f);
     }
-    let Writer { fst, mut post, mut slots, mut table, keys, postings, inline_keys, longest, .. } = w;
+    let Writer { fst, mut post, mut slots, keys, postings, inline_keys, longest, with_names, .. } = w;
     fst.finish().map_err(|e| e.to_string())?;
     post.flush().map_err(|e| e.to_string())?;
-    for s in slots.iter_mut() {
-        flush_slot(&mut table, s);
+    let mut n_prefixes = 0u64;
+    let mut pfx_readers = Vec::new();
+    for sl in slots.iter_mut() {
+        flush_slot(sl, with_names).map_err(|e| e.to_string())?;
+        sl.out.flush().map_err(|e| e.to_string())?;
+        n_prefixes += sl.flushed;
+        pfx_readers.push(BufReader::new(File::open(&sl.path).map_err(|e| e.to_string())?));
     }
-    table.sort_by(|a, b| a.0.cmp(&b.0));
+    // Merge the per-length files: each is sorted, and a prefix occurs in one length only.
+    let mut heads: Vec<Option<(Vec<u8>, Vec<u8>)>> = pfx_readers.iter_mut().map(read_prefix).collect();
     let mut pf = fst::MapBuilder::new(BufWriter::new(mk("pfx.fst")?)).map_err(|e| e.to_string())?;
     let mut pb = BufWriter::new(mk("pfx")?);
-    let mut blob = Vec::new();
     let mut off = 0u64;
-    for (k, hits) in &table {
-        blob.clear();
-        encode_prefix_hits(&mut blob, hits, with_names);
-        pf.insert(k.as_bytes(), off).map_err(|e| e.to_string())?;
+    loop {
+        let Some(i) = (0..heads.len()).filter(|&i| heads[i].is_some()).min_by(|&a, &b| heads[a].as_ref().unwrap().0.cmp(&heads[b].as_ref().unwrap().0)) else {
+            break;
+        };
+        let (k, blob) = heads[i].take().unwrap();
+        pf.insert(&k, off).map_err(|e| e.to_string())?;
         pb.write_all(&blob).map_err(|e| e.to_string())?;
         off += blob.len() as u64;
+        heads[i] = read_prefix(&mut pfx_readers[i]);
+    }
+    for sl in &slots {
+        let _ = std::fs::remove_file(&sl.path);
     }
     pf.finish().map_err(|e| e.to_string())?;
     pb.flush().map_err(|e| e.to_string())?;
@@ -703,7 +747,7 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
     st.add("postings", postings);
     st.add("inline keys", inline_keys);
     st.add("longest list", longest);
-    st.add("prefix table prefixes", table.len());
+    st.add("prefix table prefixes", n_prefixes);
     st.add("sort runs", files.len());
     st.add("run bytes spilled", spilled);
     st.add("bytes fst", size("fst"));
