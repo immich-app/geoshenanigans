@@ -1,5 +1,6 @@
 //! place-search build <set dir> <index dir> [--sub places|poi|all] [--threads N] [--mem-mb M]
 //!                    [--tmp DIR] [--no-inline] [--extras extra_names.bin] [--imp DIR] [--area-proxy]
+//!                    [--poi-max-tier 1|2|3]
 //! place-search pack-extras <extra_names.tsv> <extra_names.bin>
 //! place-search query <set dir> <index dir> [--extras F] [--iso F] [--limit N]
 //!                    [--bench REPEATS [--no-warmup]]
@@ -52,6 +53,7 @@ fn cmd_build(args: &[String]) {
         extras: opt(args, "--extras"),
         imp_dir: opt(args, "--imp"),
         area_proxy: flag(args, "--area-proxy"),
+        poi_max_tier: opt(args, "--poi-max-tier").map(|v| v.parse().unwrap()).unwrap_or(3),
     };
     let meta_path = out.join("search_meta.json");
     let mut meta: serde_json::Value = std::fs::read_to_string(&meta_path)
@@ -64,6 +66,7 @@ fn cmd_build(args: &[String]) {
     meta["inline"] = json!(opts.inline);
     meta["imp"] = json!(opts.imp_dir.is_some());
     meta["area_proxy"] = json!(opts.area_proxy);
+    meta["poi_max_tier"] = json!(opts.poi_max_tier);
     let mut subs = vec![];
     if sub == "places" || sub == "all" {
         subs.push("places");
@@ -115,6 +118,10 @@ fn cmd_query(args: &[String]) {
             }
         }
         let wall = t_all.elapsed().as_secs_f64();
+        if let Some(path) = opt(args, "--lat-out") {
+            let text: Vec<String> = lat.iter().map(|v| format!("{v:.1}")).collect();
+            std::fs::write(path, text.join("\n") + "\n").unwrap();
+        }
         lat.sort_by(|a, b| a.total_cmp(b));
         let p = |q: f64| lat[((lat.len() as f64 - 1.0) * q).round() as usize];
         let mean = lat.iter().sum::<f64>() / lat.len() as f64;
@@ -191,6 +198,45 @@ fn cmd_ctxbench(args: &[String]) {
                           "mean_us": lat.iter().sum::<f64>() / lat.len() as f64, "memory": mem_json()}));
 }
 
+/// Key-level churn between two builds of one sub-index: keys only in A, only in B, in both with
+/// the same / a different posting list.
+fn cmd_diff(args: &[String]) {
+    use fst::{IntoStreamer, Streamer};
+    let (a, b, name) = (Path::new(&args[2]), Path::new(&args[3]), &args[4]);
+    let with_names = |d: &Path| -> bool {
+        std::fs::read_to_string(d.join("search_meta.json")).ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|m| m["extras"].as_bool()).unwrap_or(false)
+    };
+    let sa = place_search::reader::SubIndex::open(a, name, with_names(a)).expect("A");
+    let sb = place_search::reader::SubIndex::open(b, name, with_names(b)).expect("B");
+    let mut ia = sa.map.stream();
+    let mut ib = sb.map.into_stream();
+    let (mut only_a, mut only_b, mut same, mut changed) = (0u64, 0u64, 0u64, 0u64);
+    let (mut pa, mut pb) = (Vec::new(), Vec::new());
+    let mut na = ia.next().map(|(k, v)| (k.to_vec(), v));
+    let mut nb = ib.next().map(|(k, v)| (k.to_vec(), v));
+    loop {
+        match (&na, &nb) {
+            (None, None) => break,
+            (Some(_), None) => { only_a += 1; na = ia.next().map(|(k, v)| (k.to_vec(), v)); }
+            (None, Some(_)) => { only_b += 1; nb = ib.next().map(|(k, v)| (k.to_vec(), v)); }
+            (Some((ka, va)), Some((kb, vb))) => match ka.cmp(kb) {
+                std::cmp::Ordering::Less => { only_a += 1; na = ia.next().map(|(k, v)| (k.to_vec(), v)); }
+                std::cmp::Ordering::Greater => { only_b += 1; nb = ib.next().map(|(k, v)| (k.to_vec(), v)); }
+                std::cmp::Ordering::Equal => {
+                    sa.postings(*va, &mut pa);
+                    sb.postings(*vb, &mut pb);
+                    if pa == pb { same += 1 } else { changed += 1 }
+                    na = ia.next().map(|(k, v)| (k.to_vec(), v));
+                    nb = ib.next().map(|(k, v)| (k.to_vec(), v));
+                }
+            },
+        }
+    }
+    println!("{}", json!({"sub": name, "keys_only_a": only_a, "keys_only_b": only_b, "keys_same": same, "keys_changed_postings": changed}));
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
@@ -201,6 +247,7 @@ fn main() {
         }
         Some("query") => cmd_query(&args),
         Some("ctxbench") => cmd_ctxbench(&args),
+        Some("diff") => cmd_diff(&args),
         _ => eprintln!("usage: see the header of main.rs"),
     }
 }

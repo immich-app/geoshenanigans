@@ -53,8 +53,9 @@ pub const PREFIX_TABLE_ALL_CHARS: usize = 2;
 pub const PREFIX_TABLE_MAX_CHARS: usize = 4;
 pub const HEAVY_PREFIX_MIN_KEYS: usize = 2_000;
 pub const PREFIX_TABLE_TOP: usize = 40;
-/// A lookup stops streaming keys after this many (bounds the worst case).
-pub const MAX_KEYS_STREAMED: usize = 400_000;
+/// A lookup stops streaming keys after this many (bounds the worst case and the per-query
+/// memory; the most any evaluation query matched is 13,424).
+pub const MAX_KEYS_STREAMED: usize = 50_000;
 /// Extra names of one entity a posting can point at (more get ordinal 15: shown by the base name).
 pub const MAX_NAME_ORD: u8 = 15;
 pub const MAX_EXTRA_ORD: u8 = 13;
@@ -91,3 +92,6 @@ pub const DEFAULT_LIMIT: usize = 20;
 pub const CONTEXT_CUTOFF_FACTOR: usize = 2;
 /// At most this many context checks per query (candidates past it count as misses).
 pub const MAX_CONTEXT_CHECKS: usize = 2_000;
+/// Candidates waiting for a context check are cut back to the best 2 x MAX_CONTEXT_CHECKS
+/// whenever they pass 4 x (bounds per-query memory).
+pub const MAX_PENDING_CANDIDATES: usize = 4 * MAX_CONTEXT_CHECKS;

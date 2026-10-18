@@ -54,14 +54,15 @@ impl SubIndex {
             out.push(self.tag(decode_inline(v)));
             return;
         }
-        out.extend(ListReader::new(&self.post, (v >> 1) as usize, self.with_names).map(|p| self.tag(p)));
+        out.extend(ListReader::new(&self.post, list_offset(v), self.with_names).map(|p| self.tag(p)));
     }
 
+    /// Best importance under a key, from the fst value alone.
     pub fn first_imp(&self, v: u64) -> u8 {
         if v & 1 == 1 {
             return decode_inline(v).imp_q;
         }
-        ListReader::new(&self.post, (v >> 1) as usize, self.with_names).next().map(|p| p.imp_q).unwrap_or(0)
+        value_top_imp(v)
     }
 
     pub fn prefix_hits(&self, phrase: &str) -> Option<Vec<PrefixHit>> {
