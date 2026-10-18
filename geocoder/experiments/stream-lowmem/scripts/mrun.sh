@@ -64,6 +64,12 @@ case $STYLE in
   new2par) inner=(env PATCHX=$M/bin/geocoder-patch-m2 bash $M/scripts/inproc.sh par "$cores") ;;
   new2t) inner=(env PATCHX=$M/bin/geocoder-patch-m2 PATCH_ARGS=--threads bash $M/scripts/inproc.sh seq "$cores") ;;
   new2tpar) inner=(env PATCHX=$M/bin/geocoder-patch-m2 PATCH_ARGS=--threads bash $M/scripts/inproc.sh par "$cores") ;;
+  new3) inner=(env PATCHX=$M/bin/geocoder-patch-m3 bash $M/scripts/inproc.sh seq "$cores") ;;
+  new3t) inner=(env PATCHX=$M/bin/geocoder-patch-m3 PATCH_ARGS=--threads bash $M/scripts/inproc.sh seq "$cores") ;;
+  new3tpar) inner=(env PATCHX=$M/bin/geocoder-patch-m3 PATCH_ARGS=--threads bash $M/scripts/inproc.sh par "$cores") ;;
+  new4) inner=(env PATCHX=$M/bin/geocoder-patch-m4 bash $M/scripts/inproc.sh seq "$cores") ;;
+  new4t) inner=(env PATCHX=$M/bin/geocoder-patch-m4 PATCH_ARGS=--threads bash $M/scripts/inproc.sh seq "$cores") ;;
+  new4tpar) inner=(env PATCHX=$M/bin/geocoder-patch-m4 PATCH_ARGS=--threads bash $M/scripts/inproc.sh par "$cores") ;;
   *) echo "unknown style $STYLE"; exit 1 ;;
 esac
 # Waits (up to 2 h) until the SMT siblings of the timing cores (24-31) are under 10% busy.

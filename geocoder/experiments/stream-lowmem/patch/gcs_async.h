@@ -31,11 +31,11 @@ struct AsyncDec {
     std::condition_variable cv_reader, cv_worker;
     std::thread worker;
     bool started = false, eof = false, stop = false;
-    int starving = 0;  // readers waiting on an empty ring
+    std::vector<int> starving;  // per file: readers waiting on its empty ring
     std::string error;
     double cpu_s = 0;  // the worker's CPU time
 
-    explicit AsyncDec(Decoder* d) : inner(d), ring(d->out.size()), closed(d->out.size(), 0) {
+    explicit AsyncDec(Decoder* d) : inner(d), ring(d->out.size()), closed(d->out.size(), 0), starving(d->out.size(), 0) {
         for (auto& s : inner->state) s = 1;  // the worker keeps every file's bytes; closed ones are dropped here
     }
     ~AsyncDec() { shutdown(); }
@@ -44,13 +44,19 @@ struct AsyncDec {
             if (!closed[p] && ring[p].size() >= RING_CAP) return true;
         return false;
     }
+    // A reader waits on a ring that is still empty: decode on, whatever the other rings hold.
+    bool starving_locked() const {
+        for (size_t p = 0; p < ring.size(); p++)
+            if (starving[p] && ring[p].size() == 0) return true;
+        return false;
+    }
     void run() {
         struct Cpu { double& out; ~Cpu() { out = thread_cpu_s(); } } cpu{cpu_s};
         try {
             for (;;) {
                 {
                     std::unique_lock<std::mutex> lk(mu);
-                    cv_worker.wait(lk, [&] { return stop || starving > 0 || !full_locked(); });
+                    cv_worker.wait(lk, [&] { return stop || starving_locked() || !full_locked(); });
                     if (stop) return;
                 }
                 size_t produced = 0;
@@ -86,13 +92,15 @@ struct AsyncDec {
         }
         ByteQueue& q = ring[size_t(port)];
         while (q.size() == 0 && !eof) {
-            starving++;
+            starving[size_t(port)]++;
             cv_worker.notify_one();
             cv_reader.wait(lk);
-            starving--;
+            starving[size_t(port)]--;
         }
         if (!error.empty()) die("%s (decoder thread)", error.c_str());
-        const size_t k = std::min(max, q.size());
+        // A coupled family's reader takes little at a time: whatever its window holds ahead of the
+        // replay, the decoder has to hold the other files' share of in their rings.
+        const size_t k = std::min(std::min(max, q.size()), ring.size() > 1 ? Decoder::READ_AHEAD : ~size_t(0));
         if (k) memcpy(dst, q.data(), k);
         q.pop(k);
         if (q.size() < RING_CAP) cv_worker.notify_one();
