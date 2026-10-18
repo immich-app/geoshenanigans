@@ -1,0 +1,186 @@
+--- /ssd/precision/repo/geocoder/server/src/lib.rs	2026-10-14 13:31:31.040644287 +0200
++++ gc64/geocoder/server/src/lib.rs	2026-10-14 15:47:01.155851523 +0200
+@@ -771,6 +771,11 @@
+     pub interp_entries: Option<FileBytes>,
+     pub interp_ways: Option<FileBytes>,
+     pub interp_nodes: Option<FileBytes>,
++    // PRECISION STUDY: optional f64 (lat, lng) sidecars that override the f32 coordinates of
++    // street_nodes / interp_nodes / addr_points in the street, interpolation and address lookups.
++    pub street_nodes64: Option<FileBytes>,
++    pub interp_nodes64: Option<FileBytes>,
++    pub addr_points64: Option<FileBytes>,
+     // TIGER per-segment ZIP sidecar: u32 postcode string offset per interp
+     // way (NO_DATA for OSM interpolations). Absent on builds without TIGER
+     // data and on pre-sidecar indexes — individually optional.
+@@ -846,10 +851,15 @@
+ /// the fraction along it, by length, of the closest point. None for a line
+ /// without length.
+ fn interp_position(nodes: &[NodeCoord], lat: f64, lng: f64, cos_lat: f64) -> Option<(f64, f64)> {
++    let v: Vec<(f64, f64)> = nodes.iter().map(|n| (n.lat as f64, n.lng as f64)).collect();
++    interp_position64(&v, lat, lng, cos_lat)
++}
++
++fn interp_position64(nodes: &[(f64, f64)], lat: f64, lng: f64, cos_lat: f64) -> Option<(f64, f64)> {
+     if nodes.len() < 2 { return None; }
+     let seg_len = |i: usize| {
+-        let dlat = (nodes[i + 1].lat as f64 - nodes[i].lat as f64).to_radians();
+-        let dlng = (nodes[i + 1].lng as f64 - nodes[i].lng as f64).to_radians();
++        let dlat = (nodes[i + 1].0 - nodes[i].0).to_radians();
++        let dlng = (nodes[i + 1].1 - nodes[i].1).to_radians();
+         // sqrt: dist_sq is squared length; accumulating squares
+         // skews the along-way fraction toward long segments.
+         dist_sq(dlat, dlng, cos_lat).sqrt()
+@@ -864,8 +874,8 @@
+         let len = seg_len(i);
+         let (dist, seg_t) = point_to_segment_with_t(
+             lat, lng,
+-            nodes[i].lat as f64, nodes[i].lng as f64,
+-            nodes[i + 1].lat as f64, nodes[i + 1].lng as f64,
++            nodes[i].0, nodes[i].1,
++            nodes[i + 1].0, nodes[i + 1].1,
+             cos_lat,
+         );
+         if dist < best_dist {
+@@ -1009,6 +1019,9 @@
+             interp_entries,
+             interp_ways,
+             interp_nodes,
++            street_nodes64: mmap_file_optional(&format!("{}/street_nodes.f64", dir)),
++            interp_nodes64: mmap_file_optional(&format!("{}/interp_nodes.f64", dir)),
++            addr_points64: mmap_file_optional(&format!("{}/addr_points.f64", dir)),
+             interp_postcodes: mmap_file_optional(&format!("{}/interp_postcodes.bin", dir)),
+             admin_cells: mmap_file(&format!("{}/admin_cells.bin", dir))?,
+             admin_entries: mmap_file(&format!("{}/admin_entries.bin", dir))?,
+@@ -1043,6 +1056,21 @@
+         self.strings.get(offset)
+     }
+ 
++    // PRECISION STUDY: coordinates in f64, from the sidecar when present.
++    fn ll64(side: &Option<FileBytes>, idx: u64, lat: f32, lng: f32) -> (f64, f64) {
++        match side {
++            Some(f) => f.read_at::<(f64, f64)>(idx),
++            None => (lat as f64, lng as f64),
++        }
++    }
++    fn addr_ll(&self, idx: u64, a: &AddrPoint) -> (f64, f64) { Self::ll64(&self.addr_points64, idx, a.lat, a.lng) }
++    fn nodes64(side: &Option<FileBytes>, nodes: &FileBytes, off: u64, cnt: usize) -> Vec<(f64, f64)> {
++        (0..cnt as u64).map(|i| {
++            let n: NodeCoord = nodes.read_at(off + i);
++            Self::ll64(side, off + i, n.lat, n.lng)
++        }).collect()
++    }
++
+     /// Decode a polygon's quantized vertex slice from `admin_vertices`.
+     /// Reads the inline 10-byte polygon header (encoding + bbox_min)
+     /// at `poly.vertex_offset`, then decodes the following vertices.
+@@ -1216,13 +1244,15 @@
+         let neighbors = cell_neighbors_at_level(cell, self.street_cell_level);
+ 
+         let cos_lat = lat.to_radians().cos();
+-        let addr_key = |a: &AddrPoint| {
+-            let d = dist_sq((a.lat as f64 - lat).to_radians(), (a.lng as f64 - lng).to_radians(), cos_lat);
++        let addr_key = |a: &AddrPoint, id: u32| {
++            let (alat, alng) = self.addr_ll(id as u64, a);
++            let d = dist_sq((alat - lat).to_radians(), (alng - lng).to_radians(), cos_lat);
+             (d, self.get_string(a.housenumber_id), self.get_string(a.street_id))
+         };
+         let street_key = |w: &WayHeader| {
+             let first: NodeCoord = street_nodes.read_at(w.node_offset as u64);
+-            (self.get_string(w.name_id), first.lat, first.lng)
++            let (flat, flng) = Self::ll64(&self.street_nodes64, w.node_offset as u64, first.lat, first.lng);
++            (self.get_string(w.name_id), flat, flng)
+         };
+ 
+         let mut best_addr_dist = f64::MAX;
+@@ -1250,13 +1280,14 @@
+                     let idx = id as u64;
+                     if idx >= total_addr { continue; }
+                     let point: AddrPoint = addr_points.read_at(idx);
+-                    let dlat = (point.lat as f64 - lat).to_radians();
+-                    let dlng = (point.lng as f64 - lng).to_radians();
++                    let (plat, plng) = self.addr_ll(idx, &point);
++                    let dlat = (plat - lat).to_radians();
++                    let dlng = (plng - lng).to_radians();
+                     let mut dist = dist_sq(dlat, dlng, cos_lat);
+                     if let Some(verts) = self.addr_polygon_verts(&point) {
+                         dist = polygon_distance_sq(lat, lng, &verts, cos_lat);
+                     }
+-                    if beats(dist, best_addr_dist, || best_addr.as_ref().map(|b| (addr_key(&point), addr_key(b)))) {
++                    if beats(dist, best_addr_dist, || best_addr.as_ref().map(|b| (addr_key(&point, id), addr_key(b, best_addr_id)))) {
+                         best_addr_dist = dist;
+                         best_addr = Some(point);
+                         best_addr_id = id;
+@@ -1278,16 +1309,12 @@
+                 let off = way.node_offset as u64;
+                 let cnt = way.node_count as usize;
+                 if cnt < 2 || off + cnt as u64 > total_street_nodes { continue; }
+-                let nbytes = street_nodes.read_chunk(off * std::mem::size_of::<NodeCoord>() as u64,
+-                                                     cnt * std::mem::size_of::<NodeCoord>());
+-                let nodes: &[NodeCoord] = unsafe {
+-                    std::slice::from_raw_parts(nbytes.as_ptr() as *const NodeCoord, cnt)
+-                };
++                let nodes = Self::nodes64(&self.street_nodes64, street_nodes, off, cnt);
+                 for i in 0..nodes.len() - 1 {
+                     let dist = point_to_segment_distance(
+                         lat, lng,
+-                        nodes[i].lat as f64, nodes[i].lng as f64,
+-                        nodes[i + 1].lat as f64, nodes[i + 1].lng as f64,
++                        nodes[i].0, nodes[i].1,
++                        nodes[i + 1].0, nodes[i + 1].1,
+                         cos_lat,
+                     );
+                     if beats(dist, best_street_dist, || best_street.as_ref().map(|b| (street_key(&way), street_key(b)))) {
+@@ -1346,13 +1373,15 @@
+         let cell = cell_id_at_level(lat, lng, self.street_cell_level);
+         let neighbors = cell_neighbors_at_level(cell, self.street_cell_level);
+         let cos_lat = lat.to_radians().cos();
+-        let addr_key = |a: &AddrPoint| {
+-            let d = dist_sq((a.lat as f64 - lat).to_radians(), (a.lng as f64 - lng).to_radians(), cos_lat);
++        let addr_key = |a: &AddrPoint, id: u32| {
++            let (alat, alng) = self.addr_ll(id as u64, a);
++            let d = dist_sq((alat - lat).to_radians(), (alng - lng).to_radians(), cos_lat);
+             (d, self.get_string(a.housenumber_id), self.get_string(a.street_id))
+         };
+ 
+         let mut best_dist = max_dist_sq;
+         let mut best: Option<AddrPoint> = None;
++        let mut best_id: u32 = NO_DATA;
+         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+             let offsets = Self::lookup_geo_cell_fb(geo_cells, c);
+             for id in Self::read_entries_fb(addr_entries, offsets.addr) {
+@@ -1360,15 +1389,17 @@
+                 if idx >= total_addr { continue; }
+                 let point: AddrPoint = addr_points.read_at(idx);
+                 if point.parent_way_id != parent_way_idx { continue; }
+-                let dlat = (point.lat as f64 - lat).to_radians();
+-                let dlng = (point.lng as f64 - lng).to_radians();
++                let (plat, plng) = self.addr_ll(idx, &point);
++                let dlat = (plat - lat).to_radians();
++                let dlng = (plng - lng).to_radians();
+                 let mut dist = dist_sq(dlat, dlng, cos_lat);
+                 if let Some(verts) = self.addr_polygon_verts(&point) {
+                     dist = polygon_distance_sq(lat, lng, &verts, cos_lat);
+                 }
+-                if beats(dist, best_dist, || best.as_ref().map(|b| (addr_key(&point), addr_key(b)))) {
++                if beats(dist, best_dist, || best.as_ref().map(|b| (addr_key(&point, id), addr_key(b, best_id)))) {
+                     best_dist = dist;
+                     best = Some(point);
++                    best_id = id;
+                 }
+             }
+         }
+@@ -1383,12 +1414,8 @@
+         let off = iw.node_offset as u64;
+         let cnt = iw.node_count as usize;
+         if cnt < 2 || off + cnt as u64 > total_nodes { return None; }
+-        let bytes = interp_nodes.read_chunk(off * std::mem::size_of::<NodeCoord>() as u64,
+-                                            cnt * std::mem::size_of::<NodeCoord>());
+-        let nodes: &[NodeCoord] = unsafe {
+-            std::slice::from_raw_parts(bytes.as_ptr() as *const NodeCoord, cnt)
+-        };
+-        interp_position(nodes, lat, lng, cos_lat)
++        let nodes = Self::nodes64(&self.interp_nodes64, interp_nodes, off, cnt);
++        interp_position64(&nodes, lat, lng, cos_lat)
+     }
+ 
+     /// Nominatim's `_find_tiger_number_for_street` (reverse.py): when a US
