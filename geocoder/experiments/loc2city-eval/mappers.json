@@ -1,0 +1,12 @@
+{
+ "A":  {"region": ["state", "province"], "city": ["city", "town", "village", "hamlet", "municipality"]},
+ "B":  {"region": ["state", "province", "region", "county"], "city": ["city", "town", "village", "hamlet", "municipality"]},
+ "B+dep": {"dep": true, "region": ["state", "province", "region", "county"], "city": ["city", "town", "village", "hamlet", "municipality"]},
+ "B+regfill": {"region": ["state", "province", "region", "county", "municipality", "city"], "city": ["city", "town", "village", "hamlet", "municipality"]},
+ "B+cityCounty": {"region": ["state", "province", "region", "county"], "city": ["city", "town", "village", "hamlet", "municipality", "county"]},
+ "B+cityState": {"region": ["state", "province", "region", "county"], "city": ["city", "town", "village", "hamlet", "municipality", "county", "state_district", "state"]},
+ "B+clean": {"clean": true, "region": ["state", "province", "region", "county"], "city": ["city", "town", "village", "hamlet", "municipality"]},
+ "B+dep+regfill": {"dep": true, "region": ["state", "province", "region", "county", "municipality", "city"], "city": ["city", "town", "village", "hamlet", "municipality"]},
+ "B+dep+regfill+cityCounty": {"dep": true, "region": ["state", "province", "region", "county", "municipality", "city"], "city": ["city", "town", "village", "hamlet", "municipality", "county"]},
+ "B+dep+regfill+cityCounty+clean": {"dep": true, "clean": true, "region": ["state", "province", "region", "county", "municipality", "city"], "city": ["city", "town", "village", "hamlet", "municipality", "county"]}
+}

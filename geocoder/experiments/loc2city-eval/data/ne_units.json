@@ -1,0 +1,2241 @@
+[
+{
+"iso": "ID",
+"sov": "IDN",
+"pop": 270625568,
+"names": [
+"Indonesia",
+"Republic of Indonesia"
+]
+},
+{
+"iso": "MY",
+"sov": "MYS",
+"pop": 31949777,
+"names": [
+"Malaysia"
+]
+},
+{
+"iso": "CL",
+"sov": "CHL",
+"pop": 18952038,
+"names": [
+"Chile",
+"Republic of Chile"
+]
+},
+{
+"iso": "BO",
+"sov": "BOL",
+"pop": 11513100,
+"names": [
+"Bolivia",
+"Plurinational State of Bolivia"
+]
+},
+{
+"iso": "PE",
+"sov": "PER",
+"pop": 32510453,
+"names": [
+"Peru",
+"Republic of Peru"
+]
+},
+{
+"iso": "AR",
+"sov": "ARG",
+"pop": 44938712,
+"names": [
+"Argentina",
+"Argentine Republic"
+]
+},
+{
+"iso": "CY",
+"sov": "CYP",
+"pop": 1198575,
+"names": [
+"Cyprus",
+"Republic of Cyprus"
+]
+},
+{
+"iso": "IN",
+"sov": "IND",
+"pop": 1366417754,
+"names": [
+"India",
+"Republic of India"
+]
+},
+{
+"iso": "CN",
+"sov": "CH1",
+"pop": 1397715000,
+"names": [
+"China",
+"People's Republic of China"
+]
+},
+{
+"iso": "IL",
+"sov": "IS1",
+"pop": 9053300,
+"names": [
+"Israel",
+"State of Israel"
+]
+},
+{
+"iso": "PS",
+"sov": "IS1",
+"pop": 4685306,
+"names": [
+"Palestine",
+"Palestine (West Bank and Gaza)",
+"West Bank and Gaza"
+]
+},
+{
+"iso": "LB",
+"sov": "LBN",
+"pop": 6855713,
+"names": [
+"Lebanese Republic",
+"Lebanon"
+]
+},
+{
+"iso": "ET",
+"sov": "ETH",
+"pop": 112078730,
+"names": [
+"Ethiopia",
+"Federal Democratic Republic of Ethiopia"
+]
+},
+{
+"iso": "SS",
+"sov": "SDS",
+"pop": 11062113,
+"names": [
+"Republic of South Sudan",
+"S. Sudan",
+"South Sudan"
+]
+},
+{
+"iso": "SO",
+"sov": "SOM",
+"pop": 10192317.3,
+"names": [
+"Federal Republic of Somalia",
+"Somalia"
+]
+},
+{
+"iso": "KE",
+"sov": "KEN",
+"pop": 52573973,
+"names": [
+"Kenya",
+"Republic of Kenya"
+]
+},
+{
+"iso": "MW",
+"sov": "MWI",
+"pop": 18628747,
+"names": [
+"Malawi",
+"Republic of Malawi"
+]
+},
+{
+"iso": "TZ",
+"sov": "TZA",
+"pop": 58005463,
+"names": [
+"Tanzania",
+"United Republic of Tanzania"
+]
+},
+{
+"iso": "SY",
+"sov": "SYR",
+"pop": 17070135,
+"names": [
+"Syria",
+"Syrian Arab Republic"
+]
+},
+{
+"iso": "FR",
+"sov": "FR1",
+"pop": 67059887,
+"names": [
+"France",
+"French Republic"
+]
+},
+{
+"iso": "SR",
+"sov": "SUR",
+"pop": 581363,
+"names": [
+"Republic of Suriname",
+"Suriname"
+]
+},
+{
+"iso": "GY",
+"sov": "GUY",
+"pop": 782766,
+"names": [
+"Co-operative Republic of Guyana",
+"Guyana"
+]
+},
+{
+"iso": "KR",
+"sov": "KOR",
+"pop": 51709098,
+"names": [
+"Korea, Rep.",
+"Republic of Korea",
+"South Korea"
+]
+},
+{
+"iso": "KP",
+"sov": "PRK",
+"pop": 25666161,
+"names": [
+"Dem. Rep. Korea",
+"Democratic People's Republic of Korea",
+"Korea, Dem. Rep.",
+"North Korea"
+]
+},
+{
+"iso": "MA",
+"sov": "MAR",
+"pop": 36471769,
+"names": [
+"Kingdom of Morocco",
+"Morocco"
+]
+},
+{
+"iso": "EH",
+"sov": "SAH",
+"pop": 603253,
+"names": [
+"Sahrawi Arab Democratic Republic",
+"W. Sahara",
+"Western Sahara"
+]
+},
+{
+"iso": "CR",
+"sov": "CRI",
+"pop": 5047561,
+"names": [
+"Costa Rica",
+"Republic of Costa Rica"
+]
+},
+{
+"iso": "NI",
+"sov": "NIC",
+"pop": 6545502,
+"names": [
+"Nicaragua",
+"Republic of Nicaragua"
+]
+},
+{
+"iso": "CG",
+"sov": "COG",
+"pop": 5380508,
+"names": [
+"Congo",
+"Congo, Rep.",
+"Republic of the Congo"
+]
+},
+{
+"iso": "CD",
+"sov": "COD",
+"pop": 86790567,
+"names": [
+"Congo, Dem. Rep.",
+"Dem. Rep. Congo",
+"Democratic Republic of the Congo"
+]
+},
+{
+"iso": "BT",
+"sov": "BTN",
+"pop": 763092,
+"names": [
+"Bhutan",
+"Kingdom of Bhutan"
+]
+},
+{
+"iso": "UA",
+"sov": "UKR",
+"pop": 44385155,
+"names": [
+"Ukraine"
+]
+},
+{
+"iso": "BY",
+"sov": "BLR",
+"pop": 9466856,
+"names": [
+"Belarus",
+"Republic of Belarus"
+]
+},
+{
+"iso": "NA",
+"sov": "NAM",
+"pop": 2494530,
+"names": [
+"Namibia",
+"Republic of Namibia"
+]
+},
+{
+"iso": "ZA",
+"sov": "ZAF",
+"pop": 58558270,
+"names": [
+"Republic of South Africa",
+"South Africa"
+]
+},
+{
+"iso": "MF",
+"sov": "FR1",
+"pop": 38002,
+"names": [
+"Saint Martin",
+"Saint-Martin",
+"Saint-Martin (French part)",
+"St-Martin",
+"St. Martin (French part)"
+]
+},
+{
+"iso": "SX",
+"sov": "NL1",
+"pop": 40733,
+"names": [
+"Sint Maarten",
+"Sint Maarten (Dutch part)",
+"St. Maarten (Dutch part)"
+]
+},
+{
+"iso": "OM",
+"sov": "OMN",
+"pop": 4974986,
+"names": [
+"Oman",
+"Sultanate of Oman"
+]
+},
+{
+"iso": "UZ",
+"sov": "UZB",
+"pop": 33580650,
+"names": [
+"Republic of Uzbekistan",
+"Uzbekistan"
+]
+},
+{
+"iso": "KZ",
+"sov": "KA1",
+"pop": 18513930,
+"names": [
+"Kazakhstan",
+"Republic of Kazakhstan"
+]
+},
+{
+"iso": "TJ",
+"sov": "TJK",
+"pop": 9321018,
+"names": [
+"Republic of Tajikistan",
+"Tajikistan"
+]
+},
+{
+"iso": "LT",
+"sov": "LTU",
+"pop": 2786844,
+"names": [
+"Lithuania",
+"Republic of Lithuania"
+]
+},
+{
+"iso": "BR",
+"sov": "BRA",
+"pop": 211049527,
+"names": [
+"Brazil",
+"Federative Republic of Brazil"
+]
+},
+{
+"iso": "UY",
+"sov": "URY",
+"pop": 3461734,
+"names": [
+"Oriental Republic of Uruguay",
+"Uruguay"
+]
+},
+{
+"iso": "MN",
+"sov": "MNG",
+"pop": 3225167,
+"names": [
+"Mongolia"
+]
+},
+{
+"iso": "RU",
+"sov": "RUS",
+"pop": 144373535,
+"names": [
+"Russia",
+"Russian Federation"
+]
+},
+{
+"iso": "CZ",
+"sov": "CZE",
+"pop": 10669709,
+"names": [
+"Czech Republic",
+"Czechia",
+"Česko"
+]
+},
+{
+"iso": "DE",
+"sov": "DEU",
+"pop": 83132799,
+"names": [
+"Federal Republic of Germany",
+"Germany"
+]
+},
+{
+"iso": "EE",
+"sov": "EST",
+"pop": 1326590,
+"names": [
+"Estonia",
+"Republic of Estonia"
+]
+},
+{
+"iso": "LV",
+"sov": "LVA",
+"pop": 1912789,
+"names": [
+"Latvia",
+"Republic of Latvia"
+]
+},
+{
+"iso": "NO",
+"sov": "NOR",
+"pop": 5347896,
+"names": [
+"Kingdom of Norway",
+"Norway"
+]
+},
+{
+"iso": "SE",
+"sov": "SWE",
+"pop": 10285453,
+"names": [
+"Kingdom of Sweden",
+"Sweden"
+]
+},
+{
+"iso": "FI",
+"sov": "FI1",
+"pop": 5520314,
+"names": [
+"Finland",
+"Republic of Finland"
+]
+},
+{
+"iso": "VN",
+"sov": "VNM",
+"pop": 96462106,
+"names": [
+"Socialist Republic of Vietnam",
+"Vietnam"
+]
+},
+{
+"iso": "KH",
+"sov": "KHM",
+"pop": 16486542,
+"names": [
+"Cambodia",
+"Kingdom of Cambodia"
+]
+},
+{
+"iso": "LU",
+"sov": "LUX",
+"pop": 619896,
+"names": [
+"Grand Duchy of Luxembourg",
+"Luxembourg"
+]
+},
+{
+"iso": "AE",
+"sov": "ARE",
+"pop": 9770529,
+"names": [
+"United Arab Emirates"
+]
+},
+{
+"iso": "BE",
+"sov": "BEL",
+"pop": 11484055,
+"names": [
+"Belgium",
+"Kingdom of Belgium"
+]
+},
+{
+"iso": "GE",
+"sov": "GEO",
+"pop": 3720382,
+"names": [
+"Georgia"
+]
+},
+{
+"iso": "MK",
+"sov": "MKD",
+"pop": 2083459,
+"names": [
+"North Macedonia",
+"Republic of North Macedonia"
+]
+},
+{
+"iso": "AL",
+"sov": "ALB",
+"pop": 2854191,
+"names": [
+"Albania",
+"Republic of Albania"
+]
+},
+{
+"iso": "AZ",
+"sov": "AZE",
+"pop": 10023318,
+"names": [
+"Azerbaijan",
+"Republic of Azerbaijan"
+]
+},
+{
+"iso": "XK",
+"sov": "KOS",
+"pop": 1794248,
+"names": [
+"Kosovo",
+"Republic of Kosovo"
+]
+},
+{
+"iso": "TR",
+"sov": "TUR",
+"pop": 83429615,
+"names": [
+"Republic of Turkey",
+"Turkey"
+]
+},
+{
+"iso": "ES",
+"sov": "ESP",
+"pop": 47076781,
+"names": [
+"Kingdom of Spain",
+"Spain"
+]
+},
+{
+"iso": "LA",
+"sov": "LAO",
+"pop": 7169455,
+"names": [
+"Lao PDR",
+"Lao People's Democratic Republic",
+"Laos"
+]
+},
+{
+"iso": "KG",
+"sov": "KGZ",
+"pop": 6456900,
+"names": [
+"Kyrgyz Republic",
+"Kyrgyzstan"
+]
+},
+{
+"iso": "AM",
+"sov": "ARM",
+"pop": 2957731,
+"names": [
+"Armenia",
+"Republic of Armenia"
+]
+},
+{
+"iso": "DK",
+"sov": "DN1",
+"pop": 5818553,
+"names": [
+"Denmark",
+"Kingdom of Denmark"
+]
+},
+{
+"iso": "LY",
+"sov": "LBY",
+"pop": 6777452,
+"names": [
+"Libya"
+]
+},
+{
+"iso": "TN",
+"sov": "TUN",
+"pop": 11694719,
+"names": [
+"Republic of Tunisia",
+"Tunisia"
+]
+},
+{
+"iso": "RO",
+"sov": "ROU",
+"pop": 19356544,
+"names": [
+"Romania"
+]
+},
+{
+"iso": "HU",
+"sov": "HUN",
+"pop": 9769949,
+"names": [
+"Hungary",
+"Republic of Hungary"
+]
+},
+{
+"iso": "SK",
+"sov": "SVK",
+"pop": 5454073,
+"names": [
+"Slovak Republic",
+"Slovakia"
+]
+},
+{
+"iso": "PL",
+"sov": "POL",
+"pop": 37970874,
+"names": [
+"Poland",
+"Republic of Poland"
+]
+},
+{
+"iso": "IE",
+"sov": "IRL",
+"pop": 4941444,
+"names": [
+"Ireland"
+]
+},
+{
+"iso": "GB",
+"sov": "GB1",
+"pop": 66834405,
+"names": [
+"United Kingdom",
+"United Kingdom of Great Britain and Northern Ireland"
+]
+},
+{
+"iso": "GR",
+"sov": "GRC",
+"pop": 10716322,
+"names": [
+"Greece",
+"Hellenic Republic"
+]
+},
+{
+"iso": "ZM",
+"sov": "ZMB",
+"pop": 17861030,
+"names": [
+"Republic of Zambia",
+"Zambia"
+]
+},
+{
+"iso": "SL",
+"sov": "SLE",
+"pop": 7813215,
+"names": [
+"Republic of Sierra Leone",
+"Sierra Leone"
+]
+},
+{
+"iso": "GN",
+"sov": "GIN",
+"pop": 12771246,
+"names": [
+"Guinea",
+"Republic of Guinea"
+]
+},
+{
+"iso": "LR",
+"sov": "LBR",
+"pop": 4937374,
+"names": [
+"Liberia",
+"Republic of Liberia"
+]
+},
+{
+"iso": "CF",
+"sov": "CAF",
+"pop": 4745185,
+"names": [
+"Central African Rep.",
+"Central African Republic"
+]
+},
+{
+"iso": "SD",
+"sov": "SDN",
+"pop": 42813238,
+"names": [
+"Republic of the Sudan",
+"Sudan"
+]
+},
+{
+"iso": "DJ",
+"sov": "DJI",
+"pop": 973560,
+"names": [
+"Djibouti",
+"Republic of Djibouti"
+]
+},
+{
+"iso": "ER",
+"sov": "ERI",
+"pop": 6081196,
+"names": [
+"Eritrea",
+"State of Eritrea"
+]
+},
+{
+"iso": "AT",
+"sov": "AUT",
+"pop": 8877067,
+"names": [
+"Austria",
+"Republic of Austria"
+]
+},
+{
+"iso": "IQ",
+"sov": "IRQ",
+"pop": 39309783,
+"names": [
+"Iraq",
+"Republic of Iraq"
+]
+},
+{
+"iso": "IT",
+"sov": "ITA",
+"pop": 60297396,
+"names": [
+"Italian Republic",
+"Italy"
+]
+},
+{
+"iso": "CH",
+"sov": "CHE",
+"pop": 8574832,
+"names": [
+"Swiss Confederation",
+"Switzerland"
+]
+},
+{
+"iso": "IR",
+"sov": "IRN",
+"pop": 82913906,
+"names": [
+"Iran",
+"Iran, Islamic Rep.",
+"Islamic Republic of Iran"
+]
+},
+{
+"iso": "NL",
+"sov": "NL1",
+"pop": 17332850,
+"names": [
+"Kingdom of the Netherlands",
+"Netherlands"
+]
+},
+{
+"iso": "LI",
+"sov": "LIE",
+"pop": 38019,
+"names": [
+"Liechtenstein",
+"Principality of Liechtenstein"
+]
+},
+{
+"iso": "CI",
+"sov": "CIV",
+"pop": 25716544,
+"names": [
+"Côte d'Ivoire",
+"Ivory Coast",
+"Republic of Ivory Coast"
+]
+},
+{
+"iso": "RS",
+"sov": "SRB",
+"pop": 6944975,
+"names": [
+"Republic of Serbia",
+"Serbia"
+]
+},
+{
+"iso": "ML",
+"sov": "MLI",
+"pop": 19658031,
+"names": [
+"Mali",
+"Republic of Mali"
+]
+},
+{
+"iso": "SN",
+"sov": "SEN",
+"pop": 16296364,
+"names": [
+"Republic of Senegal",
+"Senegal"
+]
+},
+{
+"iso": "NG",
+"sov": "NGA",
+"pop": 200963599,
+"names": [
+"Federal Republic of Nigeria",
+"Nigeria"
+]
+},
+{
+"iso": "BJ",
+"sov": "BEN",
+"pop": 11801151,
+"names": [
+"Benin",
+"Republic of Benin"
+]
+},
+{
+"iso": "AO",
+"sov": "AGO",
+"pop": 31825295,
+"names": [
+"Angola",
+"People's Republic of Angola"
+]
+},
+{
+"iso": "HR",
+"sov": "HRV",
+"pop": 4067500,
+"names": [
+"Croatia",
+"Republic of Croatia"
+]
+},
+{
+"iso": "SI",
+"sov": "SVN",
+"pop": 2087946,
+"names": [
+"Republic of Slovenia",
+"Slovenia"
+]
+},
+{
+"iso": "QA",
+"sov": "QAT",
+"pop": 2832067,
+"names": [
+"Qatar",
+"State of Qatar"
+]
+},
+{
+"iso": "SA",
+"sov": "SAU",
+"pop": 34268528,
+"names": [
+"Kingdom of Saudi Arabia",
+"Saudi Arabia"
+]
+},
+{
+"iso": "BW",
+"sov": "BWA",
+"pop": 2303697,
+"names": [
+"Botswana",
+"Republic of Botswana"
+]
+},
+{
+"iso": "ZW",
+"sov": "ZWE",
+"pop": 14645468,
+"names": [
+"Republic of Zimbabwe",
+"Zimbabwe"
+]
+},
+{
+"iso": "PK",
+"sov": "PAK",
+"pop": 216565318,
+"names": [
+"Islamic Republic of Pakistan",
+"Pakistan"
+]
+},
+{
+"iso": "BG",
+"sov": "BGR",
+"pop": 6975761,
+"names": [
+"Bulgaria",
+"Republic of Bulgaria"
+]
+},
+{
+"iso": "TH",
+"sov": "THA",
+"pop": 69625582,
+"names": [
+"Kingdom of Thailand",
+"Thailand"
+]
+},
+{
+"iso": "SM",
+"sov": "SMR",
+"pop": 33860,
+"names": [
+"Republic of San Marino",
+"San Marino"
+]
+},
+{
+"iso": "HT",
+"sov": "HTI",
+"pop": 11263077,
+"names": [
+"Haiti",
+"Republic of Haiti"
+]
+},
+{
+"iso": "DO",
+"sov": "DOM",
+"pop": 10738958,
+"names": [
+"Dominican Rep.",
+"Dominican Republic"
+]
+},
+{
+"iso": "TD",
+"sov": "TCD",
+"pop": 15946876,
+"names": [
+"Chad",
+"Republic of Chad"
+]
+},
+{
+"iso": "KW",
+"sov": "KWT",
+"pop": 4207083,
+"names": [
+"Kuwait",
+"State of Kuwait"
+]
+},
+{
+"iso": "SV",
+"sov": "SLV",
+"pop": 6453553,
+"names": [
+"El Salvador",
+"Republic of El Salvador"
+]
+},
+{
+"iso": "GT",
+"sov": "GTM",
+"pop": 16604026,
+"names": [
+"Guatemala",
+"Republic of Guatemala"
+]
+},
+{
+"iso": "TL",
+"sov": "TLS",
+"pop": 1293119,
+"names": [
+"Democratic Republic of Timor-Leste",
+"East Timor",
+"Timor-Leste"
+]
+},
+{
+"iso": "BN",
+"sov": "BRN",
+"pop": 433285,
+"names": [
+"Brunei",
+"Brunei Darussalam",
+"Negara Brunei Darussalam"
+]
+},
+{
+"iso": "MC",
+"sov": "MCO",
+"pop": 38964,
+"names": [
+"Monaco",
+"Principality of Monaco"
+]
+},
+{
+"iso": "DZ",
+"sov": "DZA",
+"pop": 43053054,
+"names": [
+"Algeria",
+"People's Democratic Republic of Algeria"
+]
+},
+{
+"iso": "MZ",
+"sov": "MOZ",
+"pop": 30366036,
+"names": [
+"Mozambique",
+"Republic of Mozambique"
+]
+},
+{
+"iso": "SZ",
+"sov": "SWZ",
+"pop": 1148130,
+"names": [
+"Eswatini",
+"Kingdom of eSwatini",
+"Swaziland",
+"eSwatini"
+]
+},
+{
+"iso": "BI",
+"sov": "BDI",
+"pop": 11530580,
+"names": [
+"Burundi",
+"Republic of Burundi"
+]
+},
+{
+"iso": "RW",
+"sov": "RWA",
+"pop": 12626950,
+"names": [
+"Republic of Rwanda",
+"Rwanda"
+]
+},
+{
+"iso": "MM",
+"sov": "MMR",
+"pop": 54045420,
+"names": [
+"Myanmar",
+"Republic of the Union of Myanmar"
+]
+},
+{
+"iso": "BD",
+"sov": "BGD",
+"pop": 163046161,
+"names": [
+"Bangladesh",
+"People's Republic of Bangladesh"
+]
+},
+{
+"iso": "AD",
+"sov": "AND",
+"pop": 77142,
+"names": [
+"Andorra",
+"Principality of Andorra"
+]
+},
+{
+"iso": "AF",
+"sov": "AFG",
+"pop": 38041754,
+"names": [
+"Afghanistan",
+"Islamic State of Afghanistan"
+]
+},
+{
+"iso": "ME",
+"sov": "MNE",
+"pop": 622137,
+"names": [
+"Montenegro"
+]
+},
+{
+"iso": "BA",
+"sov": "BIH",
+"pop": 3301000,
+"names": [
+"Bosnia and Herz.",
+"Bosnia and Herzegovina"
+]
+},
+{
+"iso": "UG",
+"sov": "UGA",
+"pop": 44269594,
+"names": [
+"Republic of Uganda",
+"Uganda"
+]
+},
+{
+"iso": "CU",
+"sov": "CU1",
+"pop": 11333483,
+"names": [
+"Cuba",
+"Republic of Cuba"
+]
+},
+{
+"iso": "HN",
+"sov": "HND",
+"pop": 9746117,
+"names": [
+"Honduras",
+"Republic of Honduras"
+]
+},
+{
+"iso": "EC",
+"sov": "ECU",
+"pop": 17373662,
+"names": [
+"Ecuador",
+"Republic of Ecuador"
+]
+},
+{
+"iso": "CO",
+"sov": "COL",
+"pop": 50339443,
+"names": [
+"Colombia",
+"Republic of Colombia"
+]
+},
+{
+"iso": "PY",
+"sov": "PRY",
+"pop": 7044636,
+"names": [
+"Paraguay",
+"Republic of Paraguay"
+]
+},
+{
+"iso": "BR",
+"sov": "BRI",
+"pop": 0,
+"names": [
+"Brazil (Brazilian I.)",
+"Brazilian I.",
+"Brazilian Island"
+]
+},
+{
+"iso": "PT",
+"sov": "PRT",
+"pop": 10269417,
+"names": [
+"Portugal",
+"Portuguese Republic"
+]
+},
+{
+"iso": "MD",
+"sov": "MDA",
+"pop": 2657637,
+"names": [
+"Moldova",
+"Republic of Moldova"
+]
+},
+{
+"iso": "TM",
+"sov": "TKM",
+"pop": 5942089,
+"names": [
+"Turkmenistan"
+]
+},
+{
+"iso": "JO",
+"sov": "JOR",
+"pop": 10101694,
+"names": [
+"Hashemite Kingdom of Jordan",
+"Jordan"
+]
+},
+{
+"iso": "NP",
+"sov": "NPL",
+"pop": 28608710,
+"names": [
+"Nepal"
+]
+},
+{
+"iso": "LS",
+"sov": "LSO",
+"pop": 2125268,
+"names": [
+"Kingdom of Lesotho",
+"Lesotho"
+]
+},
+{
+"iso": "CM",
+"sov": "CMR",
+"pop": 25876380,
+"names": [
+"Cameroon",
+"Republic of Cameroon"
+]
+},
+{
+"iso": "GA",
+"sov": "GAB",
+"pop": 2172579,
+"names": [
+"Gabon",
+"Gabonese Republic"
+]
+},
+{
+"iso": "NE",
+"sov": "NER",
+"pop": 23310715,
+"names": [
+"Niger",
+"Republic of Niger"
+]
+},
+{
+"iso": "BF",
+"sov": "BFA",
+"pop": 20321378,
+"names": [
+"Burkina Faso"
+]
+},
+{
+"iso": "TG",
+"sov": "TGO",
+"pop": 8082366,
+"names": [
+"Togo",
+"Togolese Republic"
+]
+},
+{
+"iso": "GH",
+"sov": "GHA",
+"pop": 30417856,
+"names": [
+"Ghana",
+"Republic of Ghana"
+]
+},
+{
+"iso": "GW",
+"sov": "GNB",
+"pop": 1920922,
+"names": [
+"Guinea-Bissau",
+"Republic of Guinea-Bissau"
+]
+},
+{
+"iso": "GI",
+"sov": "GB1",
+"pop": 33701,
+"names": [
+"Gibraltar"
+]
+},
+{
+"iso": "US",
+"sov": "US1",
+"pop": 328239523,
+"names": [
+"United States",
+"United States of America"
+]
+},
+{
+"iso": "CA",
+"sov": "CAN",
+"pop": 37589262,
+"names": [
+"Canada"
+]
+},
+{
+"iso": "MX",
+"sov": "MEX",
+"pop": 127575529,
+"names": [
+"Mexico",
+"United Mexican States"
+]
+},
+{
+"iso": "BZ",
+"sov": "BLZ",
+"pop": 390353,
+"names": [
+"Belize"
+]
+},
+{
+"iso": "PA",
+"sov": "PAN",
+"pop": 4246439,
+"names": [
+"Panama",
+"Republic of Panama"
+]
+},
+{
+"iso": "VE",
+"sov": "VEN",
+"pop": 28515829,
+"names": [
+"Bolivarian Republic of Venezuela",
+"Venezuela",
+"Venezuela, RB"
+]
+},
+{
+"iso": "PG",
+"sov": "PNG",
+"pop": 8776109,
+"names": [
+"Independent State of Papua New Guinea",
+"Papua New Guinea"
+]
+},
+{
+"iso": "EG",
+"sov": "EGY",
+"pop": 100388073,
+"names": [
+"Arab Republic of Egypt",
+"Egypt",
+"Egypt, Arab Rep."
+]
+},
+{
+"iso": "YE",
+"sov": "YEM",
+"pop": 29161922,
+"names": [
+"Republic of Yemen",
+"Yemen",
+"Yemen, Rep."
+]
+},
+{
+"iso": "MR",
+"sov": "MRT",
+"pop": 4525696,
+"names": [
+"Islamic Republic of Mauritania",
+"Mauritania"
+]
+},
+{
+"iso": "GQ",
+"sov": "GNQ",
+"pop": 1355986,
+"names": [
+"Eq. Guinea",
+"Equatorial Guinea",
+"Republic of Equatorial Guinea"
+]
+},
+{
+"iso": "GM",
+"sov": "GMB",
+"pop": 2347706,
+"names": [
+"Gambia",
+"Gambia, The",
+"Republic of the Gambia",
+"The Gambia"
+]
+},
+{
+"iso": "HK",
+"sov": "CH1",
+"pop": 7507400,
+"names": [
+"Hong Kong",
+"Hong Kong S.A.R.",
+"Hong Kong SAR, China",
+"Hong Kong Special Administrative Region, PRC"
+]
+},
+{
+"iso": "VA",
+"sov": "VAT",
+"pop": 825,
+"names": [
+"Holy See",
+"State of the Vatican City",
+"Vatican",
+"Vatican (Holy See)",
+"Vatican City"
+]
+},
+{
+"iso": "KZ",
+"sov": "KA1",
+"pop": 36175,
+"names": [
+"Baikonur",
+"Baikonur Cosmodrome",
+"Baykonur",
+"Baykonur Cosmodrome"
+]
+},
+{
+"iso": "AQ",
+"sov": "ATA",
+"pop": 4490,
+"names": [
+"Antarctica"
+]
+},
+{
+"iso": "AU",
+"sov": "AU1",
+"pop": 25364307,
+"names": [
+"Australia",
+"Commonwealth of Australia"
+]
+},
+{
+"iso": "GL",
+"sov": "DN1",
+"pop": 56225,
+"names": [
+"Greenland"
+]
+},
+{
+"iso": "FJ",
+"sov": "FJI",
+"pop": 889953,
+"names": [
+"Fiji",
+"Republic of Fiji"
+]
+},
+{
+"iso": "NZ",
+"sov": "NZ1",
+"pop": 4917000,
+"names": [
+"New Zealand"
+]
+},
+{
+"iso": "NC",
+"sov": "FR1",
+"pop": 287800,
+"names": [
+"New Caledonia"
+]
+},
+{
+"iso": "MG",
+"sov": "MDG",
+"pop": 26969307,
+"names": [
+"Madagascar",
+"Republic of Madagascar"
+]
+},
+{
+"iso": "PH",
+"sov": "PHL",
+"pop": 108116615,
+"names": [
+"Philippines",
+"Republic of the Philippines"
+]
+},
+{
+"iso": "LK",
+"sov": "LKA",
+"pop": 21803000,
+"names": [
+"Democratic Socialist Republic of Sri Lanka",
+"Sri Lanka"
+]
+},
+{
+"iso": "CW",
+"sov": "NL1",
+"pop": 157538,
+"names": [
+"Curaçao"
+]
+},
+{
+"iso": "AW",
+"sov": "NL1",
+"pop": 106314,
+"names": [
+"Aruba"
+]
+},
+{
+"iso": "BS",
+"sov": "BHS",
+"pop": 389482,
+"names": [
+"Bahamas",
+"Bahamas, The",
+"Commonwealth of the Bahamas",
+"The Bahamas"
+]
+},
+{
+"iso": "TC",
+"sov": "GB1",
+"pop": 38191,
+"names": [
+"Turks and Caicos Is.",
+"Turks and Caicos Islands"
+]
+},
+{
+"iso": "TW",
+"sov": "TWN",
+"pop": 23568378,
+"names": [
+"Taiwan"
+]
+},
+{
+"iso": "JP",
+"sov": "JPN",
+"pop": 126264931,
+"names": [
+"Japan"
+]
+},
+{
+"iso": "PM",
+"sov": "FR1",
+"pop": 5997,
+"names": [
+"Saint Pierre and Miquelon",
+"St. Pierre and Miquelon"
+]
+},
+{
+"iso": "IS",
+"sov": "ISL",
+"pop": 361313,
+"names": [
+"Iceland",
+"Republic of Iceland"
+]
+},
+{
+"iso": "PN",
+"sov": "GB1",
+"pop": 54,
+"names": [
+"Pitcairn Is.",
+"Pitcairn Islands",
+"Pitcairn, Henderson, Ducie and Oeno Islands"
+]
+},
+{
+"iso": "PF",
+"sov": "FR1",
+"pop": 279287,
+"names": [
+"Fr. Polynesia",
+"French Polynesia"
+]
+},
+{
+"iso": "TF",
+"sov": "FR1",
+"pop": 140,
+"names": [
+"Fr. S. Antarctic Lands",
+"Fr. S. and Antarctic Lands",
+"French Southern and Antarctic Lands",
+"Territory of the French Southern and Antarctic Lands"
+]
+},
+{
+"iso": "SC",
+"sov": "SYC",
+"pop": 97625,
+"names": [
+"Republic of Seychelles",
+"Seychelles"
+]
+},
+{
+"iso": "KI",
+"sov": "KIR",
+"pop": 117606,
+"names": [
+"Kiribati",
+"Republic of Kiribati"
+]
+},
+{
+"iso": "MH",
+"sov": "MHL",
+"pop": 58791,
+"names": [
+"Marshall Is.",
+"Marshall Islands",
+"Republic of the Marshall Islands"
+]
+},
+{
+"iso": "TT",
+"sov": "TTO",
+"pop": 1394973,
+"names": [
+"Republic of Trinidad and Tobago",
+"Trinidad and Tobago"
+]
+},
+{
+"iso": "GD",
+"sov": "GRD",
+"pop": 112003,
+"names": [
+"Grenada"
+]
+},
+{
+"iso": "VC",
+"sov": "VCT",
+"pop": 110589,
+"names": [
+"Saint Vincent and the Grenadines",
+"St. Vin. and Gren.",
+"St. Vincent and the Grenadines"
+]
+},
+{
+"iso": "BB",
+"sov": "BRB",
+"pop": 287025,
+"names": [
+"Barbados"
+]
+},
+{
+"iso": "LC",
+"sov": "LCA",
+"pop": 182790,
+"names": [
+"Saint Lucia",
+"St. Lucia"
+]
+},
+{
+"iso": "DM",
+"sov": "DMA",
+"pop": 71808,
+"names": [
+"Commonwealth of Dominica",
+"Dominica"
+]
+},
+{
+"iso": "UM",
+"sov": "US1",
+"pop": 300,
+"names": [
+"U.S. Minor Outlying Is.",
+"United States Minor Outlying Islands"
+]
+},
+{
+"iso": "MS",
+"sov": "GB1",
+"pop": 4649,
+"names": [
+"Montserrat"
+]
+},
+{
+"iso": "AG",
+"sov": "ATG",
+"pop": 97118,
+"names": [
+"Antigua and Barb.",
+"Antigua and Barbuda"
+]
+},
+{
+"iso": "KN",
+"sov": "KNA",
+"pop": 52834,
+"names": [
+"Federation of Saint Kitts and Nevis",
+"Saint Kitts and Nevis",
+"St. Kitts and Nevis"
+]
+},
+{
+"iso": "VI",
+"sov": "US1",
+"pop": 106631,
+"names": [
+"U.S. Virgin Is.",
+"United States Virgin Islands",
+"Virgin Islands (U.S.)",
+"Virgin Islands of the United States"
+]
+},
+{
+"iso": "BL",
+"sov": "FR1",
+"pop": 9961,
+"names": [
+"Saint Barthelemy",
+"Saint Barthélemy",
+"Saint-Barthélemy",
+"St-Barthélemy"
+]
+},
+{
+"iso": "PR",
+"sov": "US1",
+"pop": 3193694,
+"names": [
+"Commonwealth of Puerto Rico",
+"Puerto Rico"
+]
+},
+{
+"iso": "AI",
+"sov": "GB1",
+"pop": 14731,
+"names": [
+"Anguilla"
+]
+},
+{
+"iso": "VG",
+"sov": "GB1",
+"pop": 30030,
+"names": [
+"British Virgin Is.",
+"British Virgin Islands"
+]
+},
+{
+"iso": "JM",
+"sov": "JAM",
+"pop": 2948279,
+"names": [
+"Jamaica"
+]
+},
+{
+"iso": "KY",
+"sov": "GB1",
+"pop": 64948,
+"names": [
+"Cayman Is.",
+"Cayman Islands"
+]
+},
+{
+"iso": "BM",
+"sov": "GB1",
+"pop": 63918,
+"names": [
+"Bermuda",
+"The Bermudas or Somers Isles"
+]
+},
+{
+"iso": "HM",
+"sov": "AU1",
+"pop": 0,
+"names": [
+"Heard I. and McDonald Is.",
+"Heard I. and McDonald Islands",
+"Heard Island and McDonald Islands",
+"Territory of Heard Island and McDonald Islands"
+]
+},
+{
+"iso": "SH",
+"sov": "GB1",
+"pop": 4534,
+"names": [
+"Saint Helena",
+"St. Helena"
+]
+},
+{
+"iso": "MU",
+"sov": "MUS",
+"pop": 1265711,
+"names": [
+"Mauritius",
+"Republic of Mauritius"
+]
+},
+{
+"iso": "KM",
+"sov": "COM",
+"pop": 850886,
+"names": [
+"Comoros",
+"Union of the Comoros"
+]
+},
+{
+"iso": "ST",
+"sov": "STP",
+"pop": 215056,
+"names": [
+"Democratic Republic of São Tomé and Principe",
+"Sao Tome and Principe",
+"São Tomé and Principe",
+"São Tomé and Príncipe"
+]
+},
+{
+"iso": "CV",
+"sov": "CPV",
+"pop": 549935,
+"names": [
+"Cabo Verde",
+"Cape Verde",
+"Republic of Cabo Verde"
+]
+},
+{
+"iso": "MT",
+"sov": "MLT",
+"pop": 502653,
+"names": [
+"Malta",
+"Republic of Malta"
+]
+},
+{
+"iso": "JE",
+"sov": "GB1",
+"pop": 107800,
+"names": [
+"Bailiwick of Jersey",
+"Jersey"
+]
+},
+{
+"iso": "GG",
+"sov": "GB1",
+"pop": 62792,
+"names": [
+"Bailiwick of Guernsey",
+"Guernsey"
+]
+},
+{
+"iso": "IM",
+"sov": "GB1",
+"pop": 84584,
+"names": [
+"Isle of Man"
+]
+},
+{
+"iso": "AX",
+"sov": "FI1",
+"pop": 29884,
+"names": [
+"Aland",
+"Åland",
+"Åland Islands"
+]
+},
+{
+"iso": "FO",
+"sov": "DN1",
+"pop": 48678,
+"names": [
+"Faeroe Is.",
+"Faeroe Islands",
+"Faroe Islands",
+"Føroyar Is. (Faeroe Is.)"
+]
+},
+{
+"iso": "AU",
+"sov": "AU1",
+"pop": 2387,
+"names": [
+"Australian Indian Ocean Territories",
+"Indian Ocean Ter.",
+"Indian Ocean Territories"
+]
+},
+{
+"iso": "IO",
+"sov": "GB1",
+"pop": 3000,
+"names": [
+"Br. Indian Ocean Ter.",
+"British Indian Ocean Territory"
+]
+},
+{
+"iso": "SG",
+"sov": "SGP",
+"pop": 5703569,
+"names": [
+"Republic of Singapore",
+"Singapore"
+]
+},
+{
+"iso": "NF",
+"sov": "AU1",
+"pop": 2169,
+"names": [
+"Norfolk Island",
+"Territory of Norfolk Island"
+]
+},
+{
+"iso": "CK",
+"sov": "NZ1",
+"pop": 17459,
+"names": [
+"Cook Is.",
+"Cook Islands"
+]
+},
+{
+"iso": "TO",
+"sov": "TON",
+"pop": 104494,
+"names": [
+"Kingdom of Tonga",
+"Tonga"
+]
+},
+{
+"iso": "WF",
+"sov": "FR1",
+"pop": 11558,
+"names": [
+"Wallis and Futuna",
+"Wallis and Futuna Is.",
+"Wallis and Futuna Islands"
+]
+},
+{
+"iso": "WS",
+"sov": "WSM",
+"pop": 197097,
+"names": [
+"Independent State of Samoa",
+"Samoa"
+]
+},
+{
+"iso": "SB",
+"sov": "SLB",
+"pop": 669823,
+"names": [
+"Solomon Is.",
+"Solomon Islands"
+]
+},
+{
+"iso": "TV",
+"sov": "TUV",
+"pop": 11646,
+"names": [
+"Tuvalu"
+]
+},
+{
+"iso": "MV",
+"sov": "MDV",
+"pop": 530953,
+"names": [
+"Maldives",
+"Republic of Maldives"
+]
+},
+{
+"iso": "NR",
+"sov": "NRU",
+"pop": 12581,
+"names": [
+"Nauru",
+"Republic of Nauru"
+]
+},
+{
+"iso": "FM",
+"sov": "FSM",
+"pop": 113815,
+"names": [
+"Federated States of Micronesia",
+"Micronesia",
+"Micronesia, Federated States of"
+]
+},
+{
+"iso": "GS",
+"sov": "GB1",
+"pop": 30,
+"names": [
+"S. Geo. and the Is.",
+"South Georgia and the Islands",
+"South Georgia and the South Sandwich Islands"
+]
+},
+{
+"iso": "FK",
+"sov": "GB1",
+"pop": 3398,
+"names": [
+"Falkland Is.",
+"Falkland Islands",
+"Falkland Islands / Malvinas",
+"Islas Malvinas"
+]
+},
+{
+"iso": "VU",
+"sov": "VUT",
+"pop": 299882,
+"names": [
+"Republic of Vanuatu",
+"Vanuatu"
+]
+},
+{
+"iso": "NU",
+"sov": "NZ1",
+"pop": 1620,
+"names": [
+"Niue"
+]
+},
+{
+"iso": "AS",
+"sov": "US1",
+"pop": 55312,
+"names": [
+"American Samoa"
+]
+},
+{
+"iso": "PW",
+"sov": "PLW",
+"pop": 18008,
+"names": [
+"Palau",
+"Republic of Palau"
+]
+},
+{
+"iso": "GU",
+"sov": "US1",
+"pop": 167294,
+"names": [
+"Guam",
+"Territory of Guam"
+]
+},
+{
+"iso": "MP",
+"sov": "US1",
+"pop": 57216,
+"names": [
+"Commonwealth of the Northern Mariana Islands",
+"N. Mariana Is.",
+"Northern Mariana Islands"
+]
+},
+{
+"iso": "BH",
+"sov": "BHR",
+"pop": 1641172,
+"names": [
+"Bahrain",
+"Kingdom of Bahrain"
+]
+},
+{
+"iso": "AU",
+"sov": "AU1",
+"pop": 4,
+"names": [
+"Coral Sea Is.",
+"Coral Sea Islands",
+"Coral Sea Islands Territory"
+]
+},
+{
+"iso": "FR",
+"sov": "FR1",
+"pop": 0,
+"names": [
+"Clipperton I.",
+"Clipperton Island"
+]
+},
+{
+"iso": "MO",
+"sov": "CH1",
+"pop": 640445,
+"names": [
+"Macao",
+"Macao S.A.R",
+"Macao SAR, China",
+"Macao Special Administrative Region, PRC",
+"Macau"
+]
+},
+{
+"iso": "AU",
+"sov": "AU1",
+"pop": 0,
+"names": [
+"Ashmore and Cartier Is.",
+"Ashmore and Cartier Islands",
+"Territory of Ashmore and Cartier Islands"
+]
+}
+]
