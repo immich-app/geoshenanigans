@@ -1,24 +1,19 @@
-//! Every tunable of the prototype. Importance is in (0, ~1.1]; text scores in (0, 1].
+//! Every tunable. Importance is in (0, ~1.1]; text scores in (0, 1].
 
-// ---- importance of places (corpus kinds P, B, M, A)
+// ---- importance of places: W_TYPE x type base (derived from the records) + the optional
+// shipped byte (population, sitelinks, capital: the part the records cannot derive)
 pub const W_TYPE: f32 = 0.40;
-pub const W_POPULATION: f32 = 0.30;
-pub const W_SITELINKS: f32 = 0.30;
-/// log10(population) that scores 1.0 (10 million).
-pub const POPULATION_LOG_FULL: f32 = 7.0;
-/// log10(1 + sitelinks) that scores 1.0 (~316 sitelinks).
-pub const SITELINKS_LOG_FULL: f32 = 2.5;
-pub const CAPITAL_NATIONAL_BONUS: f32 = 0.12;
-pub const CAPITAL_REGIONAL_BONUS: f32 = 0.05;
-/// Population counts this much for areas (states, counties, countries, unlinked admin
-/// boundaries): their totals dwarf the city a searcher usually means ("New York").
-pub const AREA_POPULATION_FACTOR: f32 = 0.5;
+/// The shipped importance byte's 255 means this much importance.
+pub const EXTRA_IMPORTANCE_MAX: f32 = 0.75;
+/// Without the shipped byte: a boundary's own area stands in for its population
+/// (log10 of the area in km², scaled so 10^AREA_LOG_FULL km² scores 1.0).
+pub const W_AREA_PROXY: f32 = 0.15;
+pub const AREA_LOG_FULL: f32 = 6.0;
 
-// ---- importance of major-tier POIs (corpus kind O): the builder's importance byte (category,
-// area, elevation, sitelinks) and the sitelinks themselves
+// ---- importance of POIs: the builder's importance byte (category, area, elevation,
+// sitelinks) and the optional shipped sitelinks byte
 pub const POI_IMPORTANCE_FLOOR: f32 = 0.10;
 pub const W_POI_BUILDER: f32 = 0.25;
-pub const W_POI_SITELINKS: f32 = 0.45;
 
 // ---- text match
 /// Query length (chars) up to which a whole-name lookup allows no edit, then one edit.
@@ -41,13 +36,8 @@ pub const PREFIX_TYPO: f32 = 0.60;
 pub const PARTIAL_TEXT: f32 = 0.80;
 /// Name classes: name, name:en, a major language, alternates, old names, any other language.
 pub const CLASS_MULT: [f32; 6] = [1.0, 1.0, 0.95, 0.90, 0.80, 0.60];
-/// Languages whose names count as class 2 (a name:<lang> or <alt>:<lang> in any other language
-/// is class 5): the UI languages a photo library's users mostly type in.
-pub const MAJOR_LANGUAGES: [&str; 41] = [
-    "en", "de", "fr", "es", "it", "pt", "nl", "ru", "uk", "pl", "cs", "sk", "sv", "da", "no", "nb", "nn", "fi",
-    "el", "tr", "ar", "he", "fa", "hi", "bn", "zh", "ja", "ko", "vi", "th", "id", "ms", "hu", "ro", "bg", "hr",
-    "sr", "ca", "eu", "gl", "et",
-];
+/// Class of a transliterated name (an alternate).
+pub const TRANSLITERATION_CLASS: u8 = 3;
 /// score = text^2 * (IMPORTANCE_FLOOR + importance) * class * context
 pub const IMPORTANCE_FLOOR: f32 = 0.05;
 
@@ -65,6 +55,20 @@ pub const HEAVY_PREFIX_MIN_KEYS: usize = 2_000;
 pub const PREFIX_TABLE_TOP: usize = 40;
 /// A lookup stops streaming keys after this many (bounds the worst case).
 pub const MAX_KEYS_STREAMED: usize = 400_000;
+/// Extra names of one entity a posting can point at (more get ordinal 15: shown by the base name).
+pub const MAX_NAME_ORD: u8 = 15;
+pub const MAX_EXTRA_ORD: u8 = 13;
+/// Ordinal of a labelled boundary's own name (its primary name is its label node's).
+pub const ORD_BOUNDARY_NAME: u8 = 14;
+/// Admin levels whose boundaries are searchable without a label node (country .. municipality).
+pub const BOUNDARY_MIN_LEVEL: u8 = 2;
+pub const BOUNDARY_MAX_LEVEL: u8 = 8;
+
+// ---- build
+/// Default memory for sort runs (all threads together).
+pub const DEFAULT_RUN_BUDGET_MB: usize = 64;
+/// Read buffer per sort run during the merge.
+pub const RUN_READ_BUFFER: usize = 64 * 1024;
 
 // ---- query
 /// Candidates kept while scoring (before de-duplication and the result limit).
@@ -79,8 +83,11 @@ pub const CONTEXT_TYPO_MIN_CHARS: usize = 5;
 pub const CONTEXT_WORD_MIN_CHARS: usize = 4;
 /// Results with the same folded name closer than this are one place.
 pub const DEDUPE_KM: f64 = 25.0;
-/// Place types that are areas; one of them yields to a same-named settlement in its state
-/// among the first AREA_CHECK_TOP candidates.
+/// Area entities yield to a same-named settlement in their state among the first AREA_CHECK_TOP.
 pub const AREA_TYPES: [&str; 5] = ["country", "state", "province", "region", "county"];
 pub const AREA_CHECK_TOP: usize = 40;
 pub const DEFAULT_LIMIT: usize = 20;
+/// Context checks run while a candidate can still beat the (limit x this)-th best score.
+pub const CONTEXT_CUTOFF_FACTOR: usize = 2;
+/// At most this many context checks per query (candidates past it count as misses).
+pub const MAX_CONTEXT_CHECKS: usize = 2_000;

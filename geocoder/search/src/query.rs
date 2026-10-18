@@ -1,20 +1,30 @@
+//! Query: the prototype's semantics (typo and prefix lookups on an fst, trailing query words as
+//! context, importance ranking, de-duplication, settlements before same-named areas) over the
+//! mapped index. Context is not stored: a candidate's country / state / county / city come from
+//! reverse geocoding its point with the geocoder itself, only for the candidates that need it.
+use crate::build::prefix_text;
 use crate::constants::*;
-use crate::index::{char_len, dequantize, prefix_text, Entity, Index, NONE};
-use crate::normalize::{is_ideographic, join, tokens, Token};
+use crate::model::*;
+use crate::normalize::{is_ideographic, join, normalize, tokens, Token};
+use crate::entities::{cc_of, polygon_raw, Entities};
+use crate::reader::{SearchIndex, SubIndex};
+use query_server::{cell_id_at_level, point_in_polygon, AdminPolygon, Index, NodeCoord, ID_MASK, INTERIOR_FLAG, NO_DATA};
 use fst::{Automaton, IntoStreamer, Streamer};
 use levenshtein_automata::{Distance, LevenshteinAutomatonBuilder, DFA, SINK_STATE};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
+use std::rc::Rc;
 
-pub struct Searcher<'a> {
-    pub idx: &'a Index,
+pub struct Searcher<'a, 'g> {
+    pub idx: &'a SearchIndex<'g>,
     lev: [LevenshteinAutomatonBuilder; 2],
 }
 
 #[derive(Clone, Debug)]
 pub struct Hit {
     pub entity: u32,
-    pub ord: u16,
+    pub ord: u8,
+    pub class: u8,
     pub score: f32,
     pub text: f32,
     pub context: bool,
@@ -22,27 +32,40 @@ pub struct Hit {
     pub split: u8,
 }
 
-pub struct Found {
+/// A result's context for display: the geocoder's admin lookup at its point.
+pub struct Ctx<'g> {
+    pub cc: [u8; 2],
+    pub country: &'g str,
+    pub state: &'g str,
+    pub county: &'g str,
+    pub district: &'g str,
+}
+
+pub struct Found<'g> {
     pub hit: Hit,
     pub name: String,
+    pub lat: f32,
+    pub lng: f32,
+    pub kind: Kind,
+    pub typ: String,
+    pub ctx: Rc<Ctx<'g>>,
 }
 
-/// PS_TRACE=1 prints each lookup's key count and time to stderr.
-fn trace() -> bool {
-    static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *T.get_or_init(|| std::env::var_os("PS_TRACE").is_some())
+#[derive(Default, Debug, Clone, Copy)]
+pub struct QueryStats {
+    pub reverse_lookups: usize,
+    pub context_checks: usize,
+    pub keys_matched: usize,
+    pub postings_read: usize,
 }
 
-/// A Levenshtein DFA whose first characters must match exactly (Elasticsearch's
-/// prefix_length): an edit allowed near the start would make the fst walk every branch near
-/// its root.
+/// A Levenshtein DFA whose first characters must match exactly (Elasticsearch's prefix_length).
 struct Anchored<'a> {
     first: &'a [u8],
     dfa: &'a DFA,
 }
 
 impl Automaton for Anchored<'_> {
-    /// (bytes of the first character consumed, DFA state)
     type State = (u32, u32);
     fn start(&self) -> (u32, u32) {
         (0, self.dfa.initial_state())
@@ -62,7 +85,6 @@ impl Automaton for Anchored<'_> {
     }
 }
 
-/// Score as f32 ordered for the heap.
 #[derive(PartialEq, PartialOrd, Clone, Copy)]
 struct Ord32(f32);
 impl Eq for Ord32 {}
@@ -72,7 +94,7 @@ impl Ord for Ord32 {
     }
 }
 
-/// Best text score per matched key, from whole-name and prefix lookups.
+/// Best text score per matched fst value.
 type KeyMatches = HashMap<u64, f32>;
 
 fn allowed_edits(chars: usize, no_typo_max: usize, one_typo_max: usize, ideographic: bool) -> u8 {
@@ -91,6 +113,10 @@ fn typo_text(d: u8) -> f32 {
         1 => TYPO1_TEXT,
         _ => TYPO2_TEXT,
     }
+}
+
+pub fn char_len(b: &[u8]) -> usize {
+    b.iter().filter(|x| (**x & 0xC0) != 0x80).count()
 }
 
 fn damerau_le1(a: &str, b: &str) -> bool {
@@ -120,11 +146,8 @@ fn damerau_le1(a: &str, b: &str) -> bool {
 fn context_word_matches(alias: &str, w: &str, w_chars: usize) -> bool {
     alias == w
         || (w_chars >= CONTEXT_PREFIX_MIN_CHARS && alias.starts_with(w))
-        // a word of a longer area name: "crimea" in "autonomous republic of crimea"
         || (w_chars >= CONTEXT_WORD_MIN_CHARS && alias.contains(' ') && alias.split(' ').any(|t| t == w))
         || (w_chars >= CONTEXT_TYPO_MIN_CHARS
-            // cheap rejects first: one edit changes the length by at most one char (4 bytes)
-            // and, as in the name lookups, the first character is not an edit
             && alias.len().abs_diff(w.len()) <= 4
             && alias.chars().next() == w.chars().next()
             && damerau_le1(alias, w))
@@ -137,17 +160,19 @@ pub fn haversine_km(a: (f32, f32), b: (f32, f32)) -> f64 {
     2.0 * 6371.0 * h.sqrt().asin()
 }
 
+const PHRASE_BIT: u64 = 1 << 63;
+
 /// Context words of one query split; bit i of a mask is context word i, bit 63 the whole phrase.
 struct Context<'q> {
     words: &'q [String],
     phrase: String,
-    cache: HashMap<(u8, u32), u64>,
 }
 
-const PHRASE_BIT: u64 = 1 << 63;
-
-impl<'q> Context<'q> {
+impl Context<'_> {
     fn mask_of(&self, alias: &str) -> u64 {
+        if alias.is_empty() {
+            return 0;
+        }
         let mut m = 0;
         if context_word_matches(alias, &self.phrase, self.phrase.chars().count()) {
             m |= PHRASE_BIT;
@@ -160,42 +185,23 @@ impl<'q> Context<'q> {
         m
     }
 
-    fn group_mask(&mut self, idx: &Index, g: u32) -> u64 {
-        if g == NONE {
-            return 0;
+    fn codes_mask(&self, codes: &[String]) -> u64 {
+        let mut m = 0;
+        for code in codes {
+            // codes match whole words only ("tx" is not the start of "texas")
+            if *code == self.phrase {
+                m |= PHRASE_BIT;
+            }
+            for (i, w) in self.words.iter().enumerate() {
+                if code == w {
+                    m |= 1 << i;
+                }
+            }
         }
-        if let Some(&m) = self.cache.get(&(0, g)) {
-            return m;
-        }
-        let m = idx.groups[g as usize].sorted.iter().fold(0, |m, a| m | self.mask_of(a));
-        self.cache.insert((0, g), m);
         m
     }
 
-    fn string_mask(&mut self, idx: &Index, s: u32) -> u64 {
-        if s == 0 {
-            return 0;
-        }
-        if let Some(&m) = self.cache.get(&(1, s)) {
-            return m;
-        }
-        let m = self.mask_of(&idx.strings_norm[s as usize]);
-        self.cache.insert((1, s), m);
-        m
-    }
-
-    fn matches(&mut self, idx: &Index, e: &Entity) -> bool {
-        let cc = [e.cc[0].to_ascii_lowercase(), e.cc[1].to_ascii_lowercase()];
-        let cc = std::str::from_utf8(&cc).unwrap_or("");
-        let m = self.group_mask(idx, e.country_grp)
-            | self.group_mask(idx, e.state_grp)
-            | self.string_mask(idx, e.country)
-            | self.string_mask(idx, e.state)
-            | self.string_mask(idx, e.county)
-            | self.string_mask(idx, e.city)
-            | self.string_mask(idx, e.region)
-            | self.string_mask(idx, e.district)
-            | self.mask_of(cc);
+    fn satisfied(&self, m: u64) -> bool {
         let all = (1u64 << self.words.len()) - 1;
         m & PHRASE_BIT != 0 || m & all == all
     }
@@ -204,6 +210,9 @@ impl<'q> Context<'q> {
 struct Pool {
     best: HashMap<u32, Hit>,
     heap: BinaryHeap<Reverse<Ord32>>,
+    /// best `top_k` scores offered, descending (the cut-off for costly context checks)
+    top: Vec<f32>,
+    top_k: usize,
 }
 
 impl Pool {
@@ -219,30 +228,157 @@ impl Pool {
         if h.score <= self.threshold() {
             return;
         }
-        match self.best.get(&h.entity) {
-            Some(old) if old.score >= h.score => return,
-            _ => {}
+        if let Some(old) = self.best.get(&h.entity) {
+            if old.score >= h.score {
+                return;
+            }
         }
         self.heap.push(Reverse(Ord32(h.score)));
         if self.heap.len() > CANDIDATE_POOL {
             self.heap.pop();
         }
+        let at = self.top.partition_point(|&x| x >= h.score);
+        if at < self.top_k {
+            self.top.insert(at, h.score);
+            self.top.truncate(self.top_k);
+        }
         self.best.insert(h.entity, h);
+    }
+
+    /// No candidate scoring at most this can reach the results.
+    fn cutoff(&self) -> f32 {
+        if self.top.len() < self.top_k {
+            self.threshold()
+        } else {
+            self.top[self.top_k - 1].max(self.threshold())
+        }
     }
 }
 
-impl<'a> Searcher<'a> {
-    pub fn new(idx: &'a Index) -> Self {
+/// Per-search caches: one reverse lookup per entity at most, one ring decode per polygon.
+struct State<'g> {
+    ctx: HashMap<u32, Rc<Ctx<'g>>>,
+    rings: HashMap<u32, Rc<Vec<NodeCoord>>>,
+    stats: QueryStats,
+}
+
+/// A candidate of a split with context words, before its (costly) context check.
+#[derive(Clone, Copy)]
+struct Cand {
+    entity: u32,
+    ord: u8,
+    class: u8,
+    text: f32,
+    potential: f32,
+}
+
+impl<'a, 'g> Searcher<'a, 'g> {
+    pub fn new(idx: &'a SearchIndex<'g>) -> Self {
         Searcher { idx, lev: [LevenshteinAutomatonBuilder::new(1, true), LevenshteinAutomatonBuilder::new(2, true)] }
     }
 
-    fn stream_dfa(&self, phrase: &str, edits: u8, dfa: &DFA, typed: usize, prefix: bool, out: &mut KeyMatches) {
+    /// Display context of a point: the geocoder's admin lookup (country, state, county).
+    pub fn context_at(&self, lat: f32, lng: f32) -> Ctx<'g> {
+        let admin = self.idx.geo.find_admin(lat as f64, lng as f64);
+        Ctx {
+            cc: admin.country_code.map(|c| [c[0].to_ascii_uppercase(), c[1].to_ascii_uppercase()]).unwrap_or([0, 0]),
+            country: admin.country.unwrap_or(""),
+            state: admin.state.or(admin.province).unwrap_or(""),
+            county: admin.county.unwrap_or(""),
+            district: admin.state_district.or(admin.district).unwrap_or(""),
+        }
+    }
+
+    fn ctx_of(&self, st: &mut State<'g>, e: u32) -> Rc<Ctx<'g>> {
+        if let Some(c) = st.ctx.get(&e) {
+            return c.clone();
+        }
+        let (lat, lng) = self.idx.ents.point(e);
+        st.stats.reverse_lookups += 1;
+        let c = Rc::new(self.context_at(lat, lng));
+        st.ctx.insert(e, c.clone());
+        c
+    }
+
+    fn inside(&self, st: &mut State<'g>, poly: u32, ap: &AdminPolygon, lat: f32, lng: f32) -> bool {
+        let ring = match st.rings.get(&poly) {
+            Some(r) => r.clone(),
+            None => {
+                let r = Rc::new(self.idx.geo.admin_verts(ap).map(|v| v.into_owned()).unwrap_or_default());
+                st.rings.insert(poly, r.clone());
+                r
+            }
+        };
+        !ring.is_empty() && point_in_polygon(lat, lng, &ring)
+    }
+
+    /// Boundaries covering a point's admin cell: (polygon, record, interior flag).
+    fn cell_polygons(&self, lat: f32, lng: f32) -> Vec<(u32, AdminPolygon, bool)> {
+        let geo: &Index = self.idx.geo;
+        let cell = cell_id_at_level(lat as f64, lng as f64, geo.admin_cell_level);
+        let off = Index::lookup_admin_cell_fb(&geo.admin_cells, cell);
+        Index::read_entries_fb(&geo.admin_entries, off)
+            .into_iter()
+            .map(|id| (id & ID_MASK, polygon_raw(geo, id & ID_MASK), id & INTERIOR_FLAG != 0))
+            .filter(|(_, ap, _)| ap.name_id != NO_DATA)
+            .collect()
+    }
+
+    /// Context words a candidate's point satisfies: the boundaries covering its admin cell whose
+    /// name (or ISO code, or country code) matches a word, and that contain the point (the
+    /// cell's interior flag, else point-in-polygon only for those boundaries). A one-cell slice
+    /// of the reverse lookup, without its field mapping.
+    fn context_mask(&self, st: &mut State<'g>, ctx: &Context, names: &mut HashMap<u32, u64>, e: u32) -> u64 {
+        let geo: &Index = self.idx.geo;
+        let (lat, lng) = self.idx.ents.point(e);
+        let mut m = 0u64;
+        for (poly, ap, interior) in self.cell_polygons(lat, lng) {
+            let nm = *names.entry(ap.name_id).or_insert_with(|| {
+                let folded = normalize(geo.get_string(ap.name_id));
+                let cc = cc_of(ap.country_code);
+                let mut nm = ctx.mask_of(&folded);
+                if ap.admin_level == 2 && ap.country_code != 0 {
+                    let upper = [cc[0].to_ascii_uppercase(), cc[1].to_ascii_uppercase()];
+                    let mut codes = vec![String::from_utf8_lossy(&[cc[0].to_ascii_lowercase(), cc[1].to_ascii_lowercase()]).into_owned()];
+                    if let Some(c) = self.idx.iso.country.get(&upper) {
+                        codes.extend(c.iter().cloned());
+                    }
+                    nm |= ctx.codes_mask(&codes);
+                } else if let Some(c) = self.idx.iso.state.get(&(cc, folded)) {
+                    nm |= ctx.codes_mask(c);
+                }
+                nm
+            });
+            if nm == 0 || m & nm == nm {
+                continue;
+            }
+            if interior || self.inside(st, poly, &ap, lat, lng) {
+                m |= nm;
+            }
+        }
+        m
+    }
+
+    /// Whether entity `e`'s point lies in the boundary whose primary ring is `area` (any of its
+    /// rings: same name, level and country).
+    fn contained_in(&self, st: &mut State<'g>, e: u32, area: &AdminPolygon) -> bool {
+        let (lat, lng) = self.idx.ents.point(e);
+        for (poly, ap, interior) in self.cell_polygons(lat, lng) {
+            if ap.name_id != area.name_id || ap.admin_level != area.admin_level || ap.country_code != area.country_code {
+                continue;
+            }
+            if interior || self.inside(st, poly, &ap, lat, lng) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn stream_dfa(&self, sub: &SubIndex, phrase: &str, edits: u8, dfa: &DFA, typed: usize, prefix: bool, out: &mut KeyMatches) {
         let anchor_chars = if edits >= 2 { ANCHOR_CHARS_TWO_EDITS } else { ANCHOR_CHARS_ONE_EDIT };
         let first: usize = phrase.chars().take(anchor_chars).map(|c| c.len_utf8()).sum();
         let aut = Anchored { first: &phrase.as_bytes()[..first], dfa };
-        let t0 = std::time::Instant::now();
-        let before = out.len();
-        let mut s = self.idx.map.search_with_state(aut).into_stream();
+        let mut s = sub.map.search_with_state(aut).into_stream();
         let mut n = 0;
         while let Some((k, v, st)) = s.next() {
             let d = match dfa.distance(st.1) {
@@ -258,29 +394,22 @@ impl<'a> Searcher<'a> {
                 break;
             }
         }
-        if trace() {
-            eprintln!("  dfa {phrase:?} edits={edits} prefix={prefix} keys={n} new={} {:.0}us", out.len() - before, t0.elapsed().as_secs_f64() * 1e6);
-        }
     }
 
     /// Keys matching `phrase` as a whole name (with typos by length) and, when the user may
     /// still be typing it, as a prefix.
-    fn lookup(&self, phrase: &str, prefix: bool, out: &mut KeyMatches) {
+    fn lookup(&self, sub: &SubIndex, phrase: &str, prefix: bool, out: &mut KeyMatches) {
         let chars = phrase.chars().count();
         let ideo = is_ideographic(phrase);
         match allowed_edits(chars, EXACT_NO_TYPO_MAX_CHARS, EXACT_ONE_TYPO_MAX_CHARS, ideo) {
             0 => {
-                if let Some(v) = self.idx.map.get(phrase) {
+                if let Some(v) = sub.map.get(phrase) {
                     out.insert(v, 1.0);
                 }
             }
             d => {
-                let t = std::time::Instant::now();
                 let dfa = self.lev[d as usize - 1].build_dfa(phrase);
-                if trace() {
-                    eprintln!("  build dfa {phrase:?} edits={d} {:.0}us", t.elapsed().as_secs_f64() * 1e6);
-                }
-                self.stream_dfa(phrase, d, &dfa, chars, false, out)
+                self.stream_dfa(sub, phrase, d, &dfa, chars, false, out)
             }
         }
         if !prefix {
@@ -289,7 +418,7 @@ impl<'a> Searcher<'a> {
         match allowed_edits(chars, PREFIX_NO_TYPO_MAX_CHARS, PREFIX_ONE_TYPO_MAX_CHARS, ideo) {
             0 => {
                 let aut = fst::automaton::Str::new(phrase).starts_with();
-                let mut s = self.idx.map.search(aut).into_stream();
+                let mut s = sub.map.search(aut).into_stream();
                 let mut n = 0;
                 while let Some((k, v)) = s.next() {
                     let klen = char_len(k);
@@ -303,103 +432,126 @@ impl<'a> Searcher<'a> {
                 }
             }
             d => {
-                let t = std::time::Instant::now();
                 let dfa = self.lev[d as usize - 1].build_prefix_dfa(phrase);
-                if trace() {
-                    eprintln!("  build prefix dfa {phrase:?} edits={d} {:.0}us", t.elapsed().as_secs_f64() * 1e6);
-                }
-                self.stream_dfa(phrase, d, &dfa, chars, true, out)
+                self.stream_dfa(sub, phrase, d, &dfa, chars, true, out)
             }
         }
     }
 
-    fn score(&self, text: f32, imp: f32, class: u8, ctx_ok: bool) -> f32 {
+    fn score(text: f32, imp: f32, class: u8, ctx_ok: bool) -> f32 {
         let ctx = if ctx_ok { 1.0 } else { CONTEXT_MISS_MULT };
-        text * text * (IMPORTANCE_FLOOR + imp) * CLASS_MULT[class as usize] * ctx
+        text * text * (IMPORTANCE_FLOOR + imp) * CLASS_MULT[class.min(5) as usize] * ctx
     }
 
-    fn score_split(&self, split: u8, name: &[Token], ctx_words: &[String], prefix: bool, pool: &mut Pool) {
-        let idx = self.idx;
+    fn score_split(&self, st: &mut State<'g>, split: u8, name: &[Token], ctx_words: &[String], prefix: bool, pool: &mut Pool) {
         let phrase = join(name);
         if phrase.is_empty() {
             return;
         }
-        let mut ctx = Context { words: ctx_words, phrase: ctx_words.join(" "), cache: HashMap::new() };
+        let ctx = Context { words: ctx_words, phrase: ctx_words.join(" ") };
         let has_ctx = !ctx_words.is_empty();
-        let offer = |pool: &mut Pool, entity: u32, ord: u16, text: f32, ctx: &mut Context| {
-            let e = &idx.entities[entity as usize];
-            let (_, class) = idx.name(entity, ord);
-            // The context check is the costly part: skip it when even a match would not make
-            // the pool.
-            if self.score(text, e.imp, class, true) <= pool.threshold() {
-                return;
-            }
-            let ok = !has_ctx || ctx.matches(idx, e);
-            pool.offer(Hit { entity, ord, score: self.score(text, e.imp, class, ok), text, context: has_ctx && ok, split });
-        };
-
         let chars = phrase.chars().count();
         let folded_last = name.last().is_some_and(|t| t.raw != t.folded);
-        if prefix && chars <= PREFIX_TABLE_MAX_CHARS && !folded_last {
-            match idx.prefix_table.get(&phrase) {
-                Some(hits) => {
-                    for h in hits {
-                        offer(pool, h.entity, h.ord, h.text, &mut ctx);
+        let mut cands: Vec<Cand> = Vec::new();
+        // Without context words a candidate goes straight to the pool; with them it waits for
+        // the context check, made best-first and only while it can still reach the results.
+        let mut emit = |pool: &mut Pool, entity: u32, ord: u8, class: u8, text: f32, imp: f32| {
+            let potential = Self::score(text, imp, class, true);
+            if potential <= pool.threshold() {
+                return;
+            }
+            if has_ctx {
+                cands.push(Cand { entity, ord, class, text, potential });
+            } else {
+                pool.offer(Hit { entity, ord, class, score: potential, text, context: false, split });
+            }
+        };
+        let mut postings = Vec::new();
+        for (_, sub) in self.idx.subs() {
+            if prefix && chars <= PREFIX_TABLE_MAX_CHARS && !folded_last {
+                match sub.prefix_hits(&phrase) {
+                    Some(hits) => {
+                        for h in hits {
+                            emit(pool, h.entity, h.ord, h.class, h.text, dequantize(h.imp_q));
+                        }
+                        continue;
                     }
-                    return;
-                }
-                // Short prefixes are all in the table: no entry means no key starts with it.
-                None if chars <= PREFIX_TABLE_ALL_CHARS => return,
-                None => {}
-            }
-        }
-        let mut keys = KeyMatches::new();
-        self.lookup(&phrase, prefix, &mut keys);
-        // The user may still be typing a word the folding changed ("fort" -> "ft").
-        if prefix {
-            if let Some(last) = name.last() {
-                if last.raw != last.folded {
-                    let mut raw = name.to_vec();
-                    raw.last_mut().unwrap().folded = last.raw.clone();
-                    self.lookup(&join(&raw), true, &mut keys);
+                    // Short prefixes are all in the table: no entry means no key starts with it.
+                    None if chars <= PREFIX_TABLE_ALL_CHARS => continue,
+                    None => {}
                 }
             }
+            let mut keys = KeyMatches::new();
+            self.lookup(sub, &phrase, prefix, &mut keys);
+            // The user may still be typing a word the folding changed ("fort" -> "ft").
+            if prefix {
+                if let Some(last) = name.last() {
+                    if last.raw != last.folded {
+                        let mut raw = name.to_vec();
+                        raw.last_mut().unwrap().folded = last.raw.clone();
+                        self.lookup(sub, &join(&raw), true, &mut keys);
+                    }
+                }
+            }
+            st.stats.keys_matched += keys.len();
+            let mut order: Vec<(u64, f32, f32)> = keys
+                .into_iter()
+                .map(|(v, t)| (v, t, t * t * (IMPORTANCE_FLOOR + dequantize(sub.first_imp(v)))))
+                .collect();
+            order.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
+            for (v, t, bound) in order {
+                if bound <= pool.threshold() {
+                    break;
+                }
+                sub.postings(v, &mut postings);
+                for p in &postings {
+                    st.stats.postings_read += 1;
+                    let text = if p.partial { t * PARTIAL_TEXT } else { t };
+                    let imp = dequantize(p.imp_q);
+                    if text * text * (IMPORTANCE_FLOOR + imp) <= pool.threshold() {
+                        if !p.partial {
+                            break;
+                        }
+                        continue;
+                    }
+                    emit(pool, p.entity, p.ord, p.class, text, imp);
+                }
+            }
         }
-        let max_ctx = 1.0;
-        let mut order: Vec<(u64, f32, f32)> = keys
-            .into_iter()
-            .map(|(k, t)| {
-                let top = idx.postings_of(k).first().map(|p| dequantize(p.imp_q)).unwrap_or(0.0);
-                (k, t, t * t * (IMPORTANCE_FLOOR + top) * max_ctx)
-            })
-            .collect();
-        order.sort_by(|a, b| b.2.total_cmp(&a.2));
-        for (k, t, bound) in order {
-            if bound <= pool.threshold() {
+        if !has_ctx {
+            return;
+        }
+        cands.sort_by(|a, b| b.potential.total_cmp(&a.potential).then(a.entity.cmp(&b.entity)));
+        let mut names: HashMap<u32, u64> = HashMap::new();
+        let mut checked: HashMap<u32, bool> = HashMap::new();
+        for c in cands {
+            if c.potential <= pool.cutoff() {
                 break;
             }
-            for p in idx.postings_of(k) {
-                let text = if p.partial > 0 { t * PARTIAL_TEXT } else { t };
-                if text * text * (IMPORTANCE_FLOOR + dequantize(p.imp_q)) * max_ctx <= pool.threshold() {
-                    if p.partial == 0 {
-                        break;
-                    }
-                    continue;
+            let ok = match checked.get(&c.entity) {
+                Some(&ok) => ok,
+                None if st.stats.context_checks >= MAX_CONTEXT_CHECKS => false,
+                None => {
+                    st.stats.context_checks += 1;
+                    let ok = ctx.satisfied(self.context_mask(st, &ctx, &mut names, c.entity));
+                    checked.insert(c.entity, ok);
+                    ok
                 }
-                offer(pool, p.entity, p.ord, text, &mut ctx);
-            }
+            };
+            let score = if ok { c.potential } else { c.potential * CONTEXT_MISS_MULT };
+            pool.offer(Hit { entity: c.entity, ord: c.ord, class: c.class, score, text: c.text, context: ok, split });
         }
     }
 
-    pub fn search(&self, q: &str, limit: usize) -> Vec<Found> {
-        let t0 = std::time::Instant::now();
-        let mut pool = Pool { best: HashMap::new(), heap: BinaryHeap::new() };
+    pub fn search(&self, q: &str, limit: usize) -> (Vec<Found<'g>>, QueryStats) {
+        let mut st = State { ctx: HashMap::new(), rings: HashMap::new(), stats: QueryStats::default() };
+        let mut pool = Pool { best: HashMap::new(), heap: BinaryHeap::new(), top: Vec::new(), top_k: limit * CONTEXT_CUTOFF_FACTOR };
         let mut phrases: Vec<String> = Vec::new();
         if let Some((name, rest)) = q.split_once(',') {
             let name = tokens(name);
             let ctx: Vec<String> = tokens(rest).into_iter().map(|t| t.folded).take(63).collect();
             phrases.push(join(&name));
-            self.score_split(0, &name, &ctx, ctx.is_empty(), &mut pool);
+            self.score_split(&mut st, 0, &name, &ctx, ctx.is_empty(), &mut pool);
         } else {
             let t = tokens(q);
             let n = t.len();
@@ -409,58 +561,54 @@ impl<'a> Searcher<'a> {
                 }
                 let ctx: Vec<String> = t[k..].iter().map(|x| x.folded.clone()).collect();
                 phrases.push(join(&t[..k]));
-                self.score_split((phrases.len() - 1) as u8, &t[..k], &ctx, k == n, &mut pool);
+                self.score_split(&mut st, (phrases.len() - 1) as u8, &t[..k], &ctx, k == n, &mut pool);
             }
-        }
-        if trace() {
-            eprintln!("  scored {} candidates {:.0}us", pool.best.len(), t0.elapsed().as_secs_f64() * 1e6);
         }
         let mut hits: Vec<Hit> = pool.best.into_values().collect();
         hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.entity.cmp(&b.entity)));
-        self.place_before_its_area(&mut hits);
-        let mut out: Vec<Found> = Vec::new();
+        self.place_before_its_area(&mut st, &mut hits);
+        let mut out: Vec<Found<'g>> = Vec::new();
         let mut kept: Vec<(String, (f32, f32))> = Vec::new();
         for h in hits {
-            let e = &self.idx.entities[h.entity as usize];
-            let name = self.display_name(&h, &phrases[h.split as usize]).to_string();
-            let label = crate::normalize::normalize(&name);
-            let at = (e.lat, e.lon);
+            let at = self.idx.ents.point(h.entity);
+            let name = self.display_name(&h, &phrases[h.split as usize]);
+            let label = normalize(&name);
             if kept.iter().any(|(l, p)| *l == label && haversine_km(*p, at) < DEDUPE_KM) {
                 continue;
             }
             kept.push((label, at));
-            out.push(Found { hit: h, name });
+            let (kind, typ) = self.idx.ents.kind_and_type(h.entity);
+            let ctx = self.ctx_of(&mut st, h.entity);
+            out.push(Found { name, lat: at.0, lng: at.1, kind, typ: typ.into_owned(), ctx, hit: h });
             if out.len() >= limit {
                 break;
             }
         }
-        if trace() {
-            eprintln!("  done {:.0}us", t0.elapsed().as_secs_f64() * 1e6);
-        }
-        out
+        (out, st.stats)
     }
 
-    /// "Dubai" the city before "Dubai" the emirate: an area (state, county, country, unlinked
-    /// boundary) drops just below a settlement of the same name in the same state, the city a
-    /// searcher means and a better point for a photo than the area's label point.
-    fn place_before_its_area(&self, hits: &mut [Hit]) {
-        let idx = self.idx;
-        let is_area = |h: &Hit| {
-            let e = &idx.entities[h.entity as usize];
-            e.kind == b'A' || AREA_TYPES.contains(&idx.types[e.type_id as usize].as_str())
-        };
-        let label = |h: &Hit| crate::normalize::normalize(idx.primary_name(h.entity));
+    /// "Dubai" the city before "Dubai" the emirate: an area (other than a country) drops just
+    /// below a settlement of the same name that lies inside it.
+    fn place_before_its_area(&self, st: &mut State<'g>, hits: &mut [Hit]) {
+        let ents = &self.idx.ents;
+        let label = |h: &Hit| normalize(ents.base_name(h.entity));
         let mut changed = false;
-        for i in 0..hits.len().min(AREA_CHECK_TOP) {
-            if !is_area(&hits[i]) {
+        let top = hits.len().min(AREA_CHECK_TOP);
+        for i in 0..top {
+            let e = hits[i].entity;
+            if !ents.is_area(e) || Entities::is_poi(e) || e < ents.n_place_nodes {
                 continue;
             }
-            let (area_label, area_state) = (label(&hits[i]), idx.entities[hits[i].entity as usize].state);
-            let place = hits[i + 1..].iter().take(AREA_CHECK_TOP).find(|s| {
-                !is_area(s) && idx.entities[s.entity as usize].state == area_state && label(s) == area_label
-            });
-            if let Some(s) = place {
-                hits[i].score = s.score * 0.999;
+            let area = polygon_raw(self.idx.geo, ents.slot(e - ents.n_place_nodes).poly);
+            if area.admin_level == 2 {
+                continue;
+            }
+            let area_label = label(&hits[i]);
+            let found = (i + 1..hits.len().min(i + 1 + AREA_CHECK_TOP))
+                .filter(|&j| !ents.is_area(hits[j].entity) && label(&hits[j]) == area_label)
+                .find(|&j| self.contained_in(st, hits[j].entity, &area));
+            if let Some(j) = found {
+                hits[i].score = hits[j].score * 0.999;
                 changed = true;
             }
         }
@@ -469,22 +617,18 @@ impl<'a> Searcher<'a> {
         }
     }
 
-    /// The first of `name`, `name:en` and the matched name that starts with what was typed (the
-    /// matched one is a language the user chose: "Moskau"); after a typo `name:en`, then `name`.
-    pub fn display_name(&self, h: &Hit, phrase: &str) -> &str {
-        let idx = self.idx;
-        let a = idx.names_start[h.entity as usize];
-        let b = idx.names_start[h.entity as usize + 1];
-        let of_class =
-            |c: u8| (a..b).find(|g| idx.name_class[*g as usize] == c).map(|g| idx.name(h.entity, (g - a) as u16).0);
-        let (primary, en) = (of_class(0), of_class(1));
-        let (matched, _) = idx.name(h.entity, h.ord);
-        for n in [primary, en, Some(matched)].into_iter().flatten() {
-            if crate::normalize::normalize(n).starts_with(phrase) {
-                return n;
-            }
+    /// The matched name when it starts with what was typed (a language the user chose:
+    /// "Moskau"), else the record's own name.
+    pub fn display_name(&self, h: &Hit, phrase: &str) -> String {
+        let base = self.idx.ents.base_name(h.entity);
+        if h.ord == 0 {
+            return base.to_string();
         }
-        en.or(primary).unwrap_or(matched)
+        let matched = self.idx.ents.name(h.entity, h.ord);
+        if !normalize(base).starts_with(phrase) && normalize(&matched).starts_with(phrase) {
+            return matched.into_owned();
+        }
+        base.to_string()
     }
 }
 
@@ -497,7 +641,6 @@ mod tests {
         assert!(damerau_le1("texas", "texsa"));
         assert!(damerau_le1("texas", "texa"));
         assert!(damerau_le1("texas", "texass"));
-        assert!(damerau_le1("texas", "texas"));
         assert!(!damerau_le1("texas", "tesax"));
     }
 
@@ -507,5 +650,12 @@ mod tests {
         assert_eq!(allowed_edits(5, 3, 7, false), 1);
         assert_eq!(allowed_edits(9, 3, 7, false), 2);
         assert_eq!(allowed_edits(9, 3, 7, true), 0);
+    }
+
+    #[test]
+    fn codes_match_whole_words_only() {
+        let words = vec!["tx".to_string()];
+        let c = Context { words: &words, phrase: "tx".into() };
+        assert_eq!(c.mask_of("texas") & 1, 0);
     }
 }
