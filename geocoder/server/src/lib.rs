@@ -4245,17 +4245,51 @@ pub fn point_in_encoded_polygon(src: &FileBytes, vertex_offset: u32, vertex_coun
     let (bmin_lat, bmin_lng) = (bmin_lat32 as f64, bmin_lng32 as f64);
     let bytes = src.read_chunk(verts_off, n * stride);
     let scale = vertex_scale(encoding);
-    let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[i], b[i + 1]]) as f64;
+    let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[i], b[i + 1]]) as i64;
     let u32_at = |b: &[u8], i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
     Some(match encoding {
         4 => pip_vertices(&bytes, 8, lat, lng, |b| (f32::from_bits(u32_at(b, 0)), f32::from_bits(u32_at(b, 4)))),
-        3 => pip_vertices(&bytes, 8, lat, lng, |b| {
-            ((bmin_lat + u32_at(b, 0) as f64 * scale) as f32, (bmin_lng + u32_at(b, 4) as f64 * scale) as f32)
-        }),
-        _ => pip_vertices(&bytes, 4, lat, lng, |b| {
-            ((bmin_lat + u16_at(b, 0) * scale) as f32, (bmin_lng + u16_at(b, 2) * scale) as f32)
-        }),
+        3 => pip_grid(&bytes, 8, lat, lng, bmin_lat, bmin_lng, scale, |b| (u32_at(b, 0) as i64, u32_at(b, 4) as i64)),
+        _ => pip_grid(&bytes, 4, lat, lng, bmin_lat, bmin_lng, scale, |b| (u16_at(b, 0), u16_at(b, 2))),
     })
+}
+
+/// Largest k with `(base + k * scale) as f32 <= x`. The decoded value is monotone in k (every
+/// step rounds monotonically), so a vertex decodes above x exactly when its k is above this.
+#[inline]
+pub fn grid_threshold(x: f32, base: f64, scale: f64) -> i64 {
+    let decode = |k: i64| (base + k as f64 * scale) as f32;
+    let mut k = ((x as f64 - base) / scale).floor() as i64;
+    while decode(k) > x { k -= 1; }
+    while decode(k + 1) <= x { k += 1; }
+    k
+}
+
+/// `pip_vertices` over quantized vertices (k_lat, k_lng) that decode to `(bmin + k * scale) as
+/// f32`: the straddle test compares integers against `grid_threshold` of the point's longitude,
+/// and only the straddling edges decode, to the same values, so the answer is the same.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn pip_grid(bytes: &[u8], stride: usize, lat: f32, lng: f32, bmin_lat: f64, bmin_lng: f64, scale: f64,
+            at: impl Fn(&[u8]) -> (i64, i64)) -> bool {
+    let t = grid_threshold(lng, bmin_lng, scale);
+    let decode = |k_lat: i64, k_lng: i64| ((bmin_lat + k_lat as f64 * scale) as f32, (bmin_lng + k_lng as f64 * scale) as f32);
+    let n = bytes.len() / stride;
+    let mut inside = false;
+    let (mut kj_lat, mut kj_lng) = at(&bytes[(n - 1) * stride..]);
+    for c in bytes.chunks_exact(stride) {
+        let (ki_lat, ki_lng) = at(c);
+        if (ki_lng > t) != (kj_lng > t) {
+            let (vi_lat, vi_lng) = decode(ki_lat, ki_lng);
+            let (vj_lat, vj_lng) = decode(kj_lat, kj_lng);
+            if lat < (vj_lat - vi_lat) * (lng - vi_lng) / (vj_lng - vi_lng) + vi_lat {
+                inside = !inside;
+            }
+        }
+        kj_lat = ki_lat;
+        kj_lng = ki_lng;
+    }
+    inside
 }
 
 /// True when `point_in_polygon` on a ring of encoding `enc` with header bbox minimum
@@ -6589,6 +6623,28 @@ mod encoded_pip_tests {
         assert!(!ring_bounds_exclude(3, 10.0, -1.0, 9.0, 1e-35));
         // The longitude test holds everywhere.
         assert!(ring_bounds_exclude(3, 10.0, 1e-30, 9.0, 0.0));
+    }
+
+    #[test]
+    fn grid_threshold_splits_the_decoded_values_at_the_point() {
+        let mut rng = Rng::new(31);
+        for enc in 0u8..=3 {
+            let scale = vertex_scale(enc);
+            for _ in 0..5000 {
+                // Near 180 degrees an f32 step spans many grid steps (enc 3: about 150).
+                let base = rng.range(-180.0, 179.9) as f32 as f64;
+                let decode = |k: i64| (base + k as f64 * scale) as f32;
+                let k = (rng.next() % 70_000) as i64 - 1_000;
+                let x = match rng.next() % 4 {
+                    0 => decode(k),
+                    1 => (decode(k) as f64 - scale / 3.0) as f32,
+                    2 => (decode(k) as f64 + scale / 3.0) as f32,
+                    _ => (base + rng.range(-0.1, 70_000.0 * scale)) as f32,
+                };
+                let t = grid_threshold(x, base, scale);
+                assert!(decode(t) <= x && decode(t + 1) > x, "enc {enc} base {base} x {x} t {t}");
+            }
+        }
     }
 
     #[test]
