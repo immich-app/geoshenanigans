@@ -53,6 +53,7 @@
 #include "polygon_rings.h"
 #include "admin_rank_config.h"
 #include "parallel.h"
+#include "relation_import.h"
 #include "scratch_dir.h"
 #include "tiger.h"
 #include "way_tags.h"
@@ -2697,6 +2698,10 @@ static int run(int argc, char* argv[]) {
                     std::vector<std::string> wikidata;  // parallel to relations
                     std::vector<int64_t> label_nodes;
                     std::vector<CollectedPoiRelation> poi_relations;
+                    // Relations whose tags make an area kind (RelationKind)
+                    // or a POI, left out for not being multipolygon/boundary.
+                    std::array<size_t, 4> not_area_type{};
+                    size_t poi_not_area_type = 0;
                 };
                 std::vector<Collected> collected(pbf.thread_count());
                 pbf.read_blocks([&](PbfBlock& block, unsigned thread) {
@@ -2706,21 +2711,20 @@ static int run(int argc, char* argv[]) {
                         const char* rel_type = rel.tag("type");
                         const char* rel_place = rel.tag("place");
 
-                        // type=multipolygon + place=city/town/… relations (e.g. Moscow
-                        // R2555133) are distinct placex rows in Nominatim at the
-                        // place type's rank. They exist alongside any matching
-                        // boundary=administrative relation at a different rank.
-                        bool is_multipolygon_place =
-                            !boundary && rel_type && rel_place &&
-                            std::strcmp(rel_type, "multipolygon") == 0 &&
-                            classify_place_override(nullptr, rel_place) != AdminPlaceType::NONE;
+                        // Place relations (e.g. Moscow R2555133, type=multipolygon
+                        // + place=city) are placex rows of their own at the place
+                        // type's rank, beside any boundary=administrative relation.
+                        const RelationKind kind = area_relation_kind(
+                            boundary, rel_place && classify_place_override(nullptr, rel_place) != AdminPlaceType::NONE);
+                        if (kind == RelationKind::NONE) continue;
+                        if (!is_area_relation_type(rel_type)) {
+                            mine.not_area_type[static_cast<size_t>(kind)]++;
+                            continue;
+                        }
 
-                        if (!boundary && !is_multipolygon_place) continue;
-
-                        bool is_admin = boundary && std::strcmp(boundary, "administrative") == 0;
-                        bool is_postal = boundary && std::strcmp(boundary, "postal_code") == 0;
-                        bool is_place_boundary = boundary && std::strcmp(boundary, "place") == 0;
-                        if (!is_admin && !is_postal && !is_place_boundary && !is_multipolygon_place) continue;
+                        bool is_admin = kind == RelationKind::ADMIN;
+                        bool is_postal = kind == RelationKind::POSTAL;
+                        bool is_place_area = kind == RelationKind::PLACE;
 
                         // Capture label member node (Nominatim's primary place-link lookup)
                         int64_t label_node_id = -1;
@@ -2731,9 +2735,9 @@ static int run(int argc, char* argv[]) {
                             }
                         }
 
-                        // Handle boundary=place (e.g., Washington DC) and
-                        // type=multipolygon+place=* (e.g., Moscow R2555133).
-                        if (is_place_boundary || is_multipolygon_place) {
+                        // Place areas: boundary=place (e.g., Washington DC) and
+                        // multipolygons with place=* (e.g., Moscow R2555133).
+                        if (is_place_area) {
                             const char* place_tag = rel_place;
                             if (place_tag) {
                                 AdminPlaceType pt = classify_place_override(nullptr, place_tag);
@@ -2837,6 +2841,7 @@ static int run(int argc, char* argv[]) {
                     }
                     // --- POI relation scanning (same pass) ---
                     for (auto& rel : block.relations) {
+                        const bool area_type = is_area_relation_type(rel.tag("type"));
                         const char* r_boundary = rel.tag("boundary");
                         const char* r_leisure  = rel.tag("leisure");
                         const char* r_tourism  = rel.tag("tourism");
@@ -2893,6 +2898,10 @@ static int run(int argc, char* argv[]) {
                             if (std::strcmp(r_office, "government") == 0) poi_cat = PoiCategory::GOVERNMENT;
                         }
 
+                        if (poi_cat != PoiCategory::UNKNOWN && !area_type) {
+                            mine.poi_not_area_type++;
+                            continue;
+                        }
                         if (poi_cat != PoiCategory::UNKNOWN) {
                             const char* poi_name = rel.tag("name:en");
                             if (!poi_name) poi_name = rel.tag("name");
@@ -2956,13 +2965,22 @@ static int run(int argc, char* argv[]) {
                 });
                 // Which thread read a block is down to timing, so this join
                 // order is as arbitrary as the shared lock's was.
+                std::array<size_t, 4> not_area_type{};
+                size_t poi_not_area_type = 0;
                 for (auto& c : collected) {
                     std::move(c.relations.begin(), c.relations.end(), std::back_inserter(data.collected_relations));
                     std::move(c.wikidata.begin(), c.wikidata.end(), std::back_inserter(rel_wikidata));
                     wanted_label_nodes.insert(c.label_nodes.begin(), c.label_nodes.end());
                     std::move(c.poi_relations.begin(), c.poi_relations.end(),
                               std::back_inserter(data.collected_poi_relations));
+                    for (size_t k = 0; k < not_area_type.size(); k++) not_area_type[k] += c.not_area_type[k];
+                    poi_not_area_type += c.poi_not_area_type;
                 }
+                std::cerr << "  Relations not of type multipolygon/boundary, left out: "
+                          << not_area_type[static_cast<size_t>(RelationKind::ADMIN)] << " admin, "
+                          << not_area_type[static_cast<size_t>(RelationKind::POSTAL)] << " postal, "
+                          << not_area_type[static_cast<size_t>(RelationKind::PLACE)] << " place, "
+                          << poi_not_area_type << " POI." << std::endl;
             }
             std::cerr << "  Collected " << data.collected_relations.size()
                       << " admin/postal relations for parallel assembly." << std::endl;
