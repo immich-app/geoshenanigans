@@ -95,13 +95,32 @@ struct EntityBuf {
     names: Vec<(u8, u8, bool, String)>,
 }
 
+/// One bit per record.
+struct Bits(Vec<u64>);
+
+impl Bits {
+    fn new(n: usize) -> Self {
+        Bits(vec![0; n.div_ceil(64)])
+    }
+
+    fn set(&mut self, i: u32) {
+        self.0[i as usize / 64] |= 1 << (i % 64);
+    }
+
+    fn get(&self, i: u32) -> bool {
+        self.0[i as usize / 64] >> (i % 64) & 1 == 1
+    }
+}
+
 pub struct PlacesSource<'a> {
     geo: &'a Index,
     n_place_nodes: u32,
-    slots: Vec<BoundarySlot>,
-    link: Vec<u32>,
+    /// The boundary slots, read back from the `places.bnd` just written (paged, not held).
+    bnd: Mmap,
+    n_slots: u32,
+    n_linked: u32,
     /// label nodes that name a boundary slot (indexed through the boundary, not on their own)
-    label_used: Vec<bool>,
+    label_used: Bits,
     imp_places: Option<Mmap>,
     imp_polys: Option<Mmap>,
     extras: Option<&'a Extras>,
@@ -109,7 +128,8 @@ pub struct PlacesSource<'a> {
 }
 
 impl<'a> PlacesSource<'a> {
-    pub fn new(geo: &'a Index, opts: &BuildOpts, extras: Option<&'a Extras>) -> Self {
+    /// Derives the boundary slots and writes them to `bnd_path` (sorted by polygon).
+    pub fn new(geo: &'a Index, opts: &BuildOpts, extras: Option<&'a Extras>, bnd_path: &Path) -> std::io::Result<Self> {
         let n_place_nodes = record_count::<PlaceNode>(geo.place_nodes.as_ref().expect("place_nodes"));
         let n_poly = record_count::<AdminPolygon>(&geo.admin_polygons);
         // A hidden node that names its claiming boundary is that boundary's label point.
@@ -123,8 +143,9 @@ impl<'a> PlacesSource<'a> {
                 }
             }
         }
-        let mut slots = Vec::new();
-        let mut label_used = vec![false; n_place_nodes as usize];
+        let mut label_used = Bits::new(n_place_nodes as usize);
+        let mut w = BufWriter::with_capacity(WRITE_BUFFER, File::create(bnd_path)?);
+        let (mut n_slots, mut n_linked) = (0u32, 0u32);
         // Sets built without the search flags: every named ring is its own boundary entity.
         let flagged = (0..n_poly).any(|p| polygon_raw(geo, p)._pad2 & POLY_FLAG_PRIMARY_RING != 0);
         for p in 0..n_poly {
@@ -132,49 +153,55 @@ impl<'a> PlacesSource<'a> {
             if ap.name_id == NO_DATA || (flagged && ap._pad2 & POLY_FLAG_PRIMARY_RING == 0) {
                 continue;
             }
-            if link[p as usize] != NO_DATA {
-                let pn = place_node_raw(geo, link[p as usize]);
-                label_used[link[p as usize] as usize] = true;
-                slots.push(BoundarySlot { poly: p, node: link[p as usize], lat: pn.lat, lng: pn.lng });
+            let node = link[p as usize];
+            let slot = if node != NO_DATA {
+                let pn = place_node_raw(geo, node);
+                label_used.set(node);
+                BoundarySlot { poly: p, node, lat: pn.lat, lng: pn.lng }
             } else if (BOUNDARY_MIN_LEVEL..=BOUNDARY_MAX_LEVEL).contains(&ap.admin_level) && ap.area > 0.0 {
                 let Some(v) = geo.admin_verts(&ap) else { continue };
                 let (lat, lng) = ring_centroid(&v);
-                slots.push(BoundarySlot { poly: p, node: NO_DATA, lat, lng });
-            }
+                BoundarySlot { poly: p, node: NO_DATA, lat, lng }
+            } else {
+                continue;
+            };
+            w.write_all(&slot.to_bytes())?;
+            n_slots += 1;
+            n_linked += slot.linked() as u32;
         }
+        w.into_inner().map_err(|e| e.into_error())?;
+        drop(link);
+        let bnd = unsafe { Mmap::map(&File::open(bnd_path)?) }?;
         let dir = opts.imp_dir.clone();
-        PlacesSource {
+        Ok(PlacesSource {
             geo,
             n_place_nodes,
-            slots,
-            link,
+            bnd,
+            n_slots,
+            n_linked,
             label_used,
             imp_places: map_opt(dir.as_ref().map(|d| format!("{d}/imp_places.u8"))),
             imp_polys: map_opt(dir.as_ref().map(|d| format!("{d}/imp_polys.u8"))),
             extras,
             area_proxy: opts.area_proxy,
-        }
+        })
     }
 
-    pub fn write_slots(&self, path: &Path) -> std::io::Result<()> {
-        let mut w = BufWriter::new(File::create(path)?);
-        for s in &self.slots {
-            w.write_all(&s.to_bytes())?;
-        }
-        w.flush()
+    fn slot(&self, pos: u32) -> BoundarySlot {
+        BoundarySlot::from_bytes(&self.bnd[pos as usize * SLOT_BYTES..][..SLOT_BYTES])
     }
 
     fn len(&self) -> u32 {
-        self.slots.len() as u32 + self.n_place_nodes
+        self.n_slots + self.n_place_nodes
     }
 
     fn fill(&self, pos: u32, e: &mut EntityBuf) -> bool {
         e.names.clear();
         let geo = self.geo;
-        let (rref, base_id) = if pos < self.slots.len() as u32 {
-            let s = self.slots[pos as usize];
+        let (rref, base_id) = if pos < self.n_slots {
+            let s = self.slot(pos);
             let ap = polygon_raw(geo, s.poly);
-            let node = (self.link[s.poly as usize] != NO_DATA).then(|| place_node_raw(geo, self.link[s.poly as usize]));
+            let node = s.linked().then(|| place_node_raw(geo, s.node));
             let kind = if s.linked() { Kind::Linked } else { Kind::Area };
             let typ = boundary_type(&ap, node.as_ref());
             e.id = self.n_place_nodes + s.poly;
@@ -192,10 +219,10 @@ impl<'a> PlacesSource<'a> {
             }
             (record_ref(KIND_POLYGON, s.poly), primary)
         } else {
-            let i = pos - self.slots.len() as u32;
+            let i = pos - self.n_slots;
             let pn = place_node_raw(geo, i);
             // A hidden node is searchable on its own only when no boundary of this set claims it.
-            if pn.name_id == NO_DATA || self.label_used[i as usize] {
+            if pn.name_id == NO_DATA || self.label_used.get(i) {
                 return false;
             }
             let kind = place_node_kind(pn.place_type);
@@ -588,11 +615,10 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
     let src = if name == "poi" {
         Source::Poi(PoiSource::new(geo, opts, extras.as_ref()))
     } else {
-        let s = PlacesSource::new(geo, opts, extras.as_ref());
-        s.write_slots(&out.join("places.bnd")).map_err(|e| e.to_string())?;
+        let s = PlacesSource::new(geo, opts, extras.as_ref(), &out.join("places.bnd")).map_err(|e| e.to_string())?;
         st.add("place nodes", s.n_place_nodes);
-        st.add("boundary slots", s.slots.len());
-        st.add("boundary slots linked", s.slots.iter().filter(|x| x.linked()).count());
+        st.add("boundary slots", s.n_slots);
+        st.add("boundary slots linked", s.n_linked);
         Source::Places(s)
     };
     let t_src = t0.elapsed();
@@ -649,6 +675,7 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
         spilled += runs.spilled_bytes;
         files.extend(runs.files);
     }
+    drop(src);
     let t_runs = t0.elapsed();
 
     // ---- merge -> fst + postings + prefix table

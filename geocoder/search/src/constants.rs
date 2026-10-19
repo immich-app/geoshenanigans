@@ -70,6 +70,8 @@ pub const BOUNDARY_MAX_LEVEL: u8 = 8;
 pub const DEFAULT_RUN_BUDGET_MB: usize = 64;
 /// Read buffer per sort run during the merge.
 pub const RUN_READ_BUFFER: usize = 64 * 1024;
+/// Write buffer of each file the build writes.
+pub const WRITE_BUFFER: usize = 64 * 1024;
 
 // ---- query
 /// Candidates kept while scoring (before de-duplication and the result limit).
