@@ -19,6 +19,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "admin_tolerance.h"
 #include "geometry.h"
 #include "id_allocator.h"
 #include "parallel.h"
@@ -1076,12 +1077,13 @@ static PackedPolygon pack_admin_polygon(const ParsedData& data, const AdminPolyg
     if (epsilon_scale > 0) {
         // Each ring on its own: simplifying the keyhole range as one ring
         // would cut its connectors.
-        double eps_m = admin_epsilon_meters(ap.admin_level) * epsilon_scale;
+        const AdminTolerance tol = admin_tolerance(ap, epsilon_scale);
         std::vector<std::vector<std::pair<double,double>>> hole_rings;
         for (size_t r = 1; r < rings.size(); r++) hole_rings.push_back(points(rings[r]));
         std::tie(pts, holes) = simplify_rings(points(rings[0]), hole_rings,
             [&](const std::vector<std::pair<double,double>>& ring) {
-                return simplify_polygon_epsilon(ring, ring_tolerance_degrees(ring, eps_m));
+                if (tol.isotropic) return simplify_ring_isotropic(ring, tol.meters, kRingToleranceFraction);
+                return simplify_polygon_epsilon(ring, ring_tolerance_degrees(ring, tol.meters));
             });
     } else {
         pts = points(RingSpan{0, ap.vertex_count});

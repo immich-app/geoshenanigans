@@ -288,6 +288,48 @@ inline double ring_tolerance_degrees(const std::vector<std::pair<double,double>>
     return std::min(meters_to_degrees(eps_m, lat), kRingToleranceFraction * std::sqrt(polygon_area(ring)));
 }
 
+// Douglas-Peucker with the tolerance eps_m in metres in every direction. simplify_polygon_epsilon
+// measures raw degrees, so a tolerance converted at the ring's latitude as a longitude distance
+// allows 1 / cos(lat) of it north-south (twice it at 60 degrees). Here the closed ring is measured
+// in a frame where a degree of longitude is cos(lat0) of a degree of latitude; the kept vertices
+// are the ring's own. The tolerance is at most cap_fraction of the ring's size in that frame (the
+// square root of its area), as ring_tolerance_degrees caps it.
+inline std::vector<std::pair<double,double>> simplify_ring_isotropic(
+    const std::vector<std::pair<double,double>>& ring, double eps_m, double cap_fraction,
+    size_t min_vertices = 4) {
+    if (ring.size() <= min_vertices) return ring;
+    double k = std::cos(ring[0].first * M_PI / 180.0);
+    if (k < 0.01) k = 0.01;  // clamp near poles, as meters_to_degrees
+    std::vector<std::pair<double,double>> q(ring.size());
+    for (size_t i = 0; i < ring.size(); i++) q[i] = {ring[i].first, ring[i].second * k};
+    const double eps = std::min(eps_m / 111320.0, cap_fraction * std::sqrt(polygon_area(ring) * k));
+    auto keep_at = [&](double e) {
+        std::vector<bool> keep(q.size(), false);
+        keep[0] = keep[q.size() - 1] = true;
+        dp_simplify(q, 0, q.size() - 1, e, keep);
+        return keep;
+    };
+    std::vector<bool> keep = keep_at(eps);
+    // Below min_vertices, the largest tolerance that keeps enough (as simplify_polygon_epsilon).
+    if (static_cast<size_t>(std::count(keep.begin(), keep.end(), true)) < min_vertices) {
+        double lo = 0, hi = eps;
+        for (int iter = 0; iter < 20; iter++) {
+            const double mid = (lo + hi) / 2;
+            std::vector<bool> tried = keep_at(mid);
+            if (static_cast<size_t>(std::count(tried.begin(), tried.end(), true)) >= min_vertices) {
+                lo = mid;
+                keep = std::move(tried);
+            } else {
+                hi = mid;
+            }
+        }
+    }
+    std::vector<std::pair<double,double>> out;
+    for (size_t i = 0; i < ring.size(); i++)
+        if (keep[i]) out.push_back(ring[i]);
+    return out;
+}
+
 // Validate a postcode string for the centroid index. Mirrors
 // Nominatim's clean_postcodes sanitizer — rejects values that
 // don't conform to any known postcode pattern. The builder

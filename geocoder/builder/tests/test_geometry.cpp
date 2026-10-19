@@ -310,3 +310,29 @@ TEST(geometry_ring_tolerance_is_capped_by_a_small_ring) {
         {41.900, 12.446}, {41.900, 12.454}, {41.908, 12.454}, {41.908, 12.446}, {41.900, 12.446}};
     CHECK_NEAR(ring_tolerance_degrees(ring, 1250), kRingToleranceFraction * 0.008, 1e-6);
 }
+
+// --- simplify_ring_isotropic ---
+
+TEST(geometry_isotropic_simplify_is_degree_dp_at_the_equator) {
+    // cos(0) = 1: the isotropic frame is the degree frame.
+    const std::vector<Pt> ring = {{0, 0}, {0.004, 0.5}, {0, 1}, {1, 1}, {1.003, 0.5}, {1, 0}, {0.5, -0.02}, {0, 0}};
+    CHECK(simplify_ring_isotropic(ring, 1000, 1e9) == simplify_polygon_epsilon(ring, meters_to_degrees(1000, 0)));
+}
+
+TEST(geometry_isotropic_simplify_keeps_a_north_south_bump_degree_dp_drops) {
+    // At 60 degrees a 1 km tolerance spans 0.009 degrees of latitude but degree DP allows
+    // 0.018 (1 km as a longitude distance): a 1.5 km (0.0135 degree) bump survives only here.
+    const double bump = 1500.0 / 111320.0;
+    const std::vector<Pt> ring = {{60, 0}, {60 - bump, 0.1}, {60, 0.2}, {60.2, 0.2}, {60.2, 0}, {60, 0}};
+    CHECK_EQ(simplify_ring_isotropic(ring, 1000, 1e9).size(), ring.size());
+    CHECK_EQ(simplify_polygon_epsilon(ring, meters_to_degrees(1000, 60)).size(), ring.size() - 1);
+}
+
+TEST(geometry_isotropic_simplify_is_capped_by_a_small_ring) {
+    // A Vatican-sized ring with a 1250 m tolerance: the cap (a tenth of its size, about 77 m) keeps
+    // its 110 m notch, which the uncapped tolerance would cut.
+    const std::vector<Pt> ring = {{41.900, 12.446}, {41.900, 12.450}, {41.901, 12.4502}, {41.900, 12.4504},
+                                  {41.900, 12.454}, {41.908, 12.454}, {41.908, 12.446}, {41.900, 12.446}};
+    CHECK_EQ(simplify_ring_isotropic(ring, 1250, kRingToleranceFraction).size(), ring.size());
+    CHECK(simplify_ring_isotropic(ring, 1250, 1e9).size() < ring.size());
+}
