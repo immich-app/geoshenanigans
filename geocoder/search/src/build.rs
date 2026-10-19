@@ -133,7 +133,11 @@ impl<'a> PlacesSource<'a> {
         let n_place_nodes = record_count::<PlaceNode>(geo.place_nodes.as_ref().expect("place_nodes"));
         let n_poly = record_count::<AdminPolygon>(&geo.admin_polygons);
         // A hidden node that names its claiming boundary is that boundary's label point.
-        let mut link = vec![NO_DATA; n_poly as usize];
+        let mut link_buf = MapVec::with_capacity(n_poly as usize)?;
+        for _ in 0..n_poly {
+            link_buf.push(NO_DATA);
+        }
+        let link = link_buf.as_mut_slice();
         for i in 0..n_place_nodes {
             let pn = place_node_raw(geo, i);
             if is_hidden(&pn) && pn._pad1 & PLACE_FLAG_LABEL_OF != 0 && pn.parent_poly_id < n_poly {
@@ -170,7 +174,7 @@ impl<'a> PlacesSource<'a> {
             n_linked += slot.linked() as u32;
         }
         w.into_inner().map_err(|e| e.into_error())?;
-        drop(link);
+        drop(link_buf);
         let bnd = unsafe { Mmap::map(&File::open(bnd_path)?) }?;
         let dir = opts.imp_dir.clone();
         Ok(PlacesSource {
@@ -342,6 +346,63 @@ fn keys_of(e: &EntityBuf, out: &mut Vec<(String, u8, bool, u8)>) {
 
 // ------------------------------------------------------------------ sort runs
 
+/// A fixed-capacity array in its own anonymous mapping. Dropping it unmaps it, so a phase's
+/// buffers go back to the system before the next phase: glibc keeps freed heap memory for reuse
+/// once a block this large has been freed, and the next phase's buffers came on top of it.
+struct MapVec<T: Copy> {
+    map: memmap2::MmapMut,
+    len: usize,
+    cap: usize,
+    _t: std::marker::PhantomData<T>,
+}
+
+impl<T: Copy> MapVec<T> {
+    fn with_capacity(cap: usize) -> std::io::Result<Self> {
+        let map = memmap2::MmapOptions::new().len((cap * std::mem::size_of::<T>()).max(1)).map_anon()?;
+        Ok(MapVec { map, len: 0, cap, _t: std::marker::PhantomData })
+    }
+
+    fn capacity(&self) -> usize {
+        self.cap
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    fn push(&mut self, v: T) {
+        assert!(self.len < self.cap, "MapVec full");
+        // SAFETY: in bounds of the mapping, which is page-aligned (so aligned for T).
+        unsafe { (self.map.as_mut_ptr() as *mut T).add(self.len).write(v) };
+        self.len += 1;
+    }
+
+    fn extend_from_slice(&mut self, s: &[T]) {
+        assert!(self.len + s.len() <= self.cap, "MapVec full");
+        // SAFETY: in bounds (checked above); a fresh mapping never overlaps `s`.
+        unsafe { std::ptr::copy_nonoverlapping(s.as_ptr(), (self.map.as_mut_ptr() as *mut T).add(self.len), s.len()) };
+        self.len += s.len();
+    }
+
+    fn as_slice(&self) -> &[T] {
+        // SAFETY: the first `len` elements were written by push.
+        unsafe { std::slice::from_raw_parts(self.map.as_ptr() as *const T, self.len) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [T] {
+        // SAFETY: as in as_slice.
+        unsafe { std::slice::from_raw_parts_mut(self.map.as_mut_ptr() as *mut T, self.len) }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Item {
     off: u32,
@@ -353,8 +414,8 @@ struct Item {
 }
 
 struct Runs {
-    arena: Vec<u8>,
-    items: Vec<Item>,
+    arena: MapVec<u8>,
+    items: MapVec<Item>,
     files: Vec<PathBuf>,
     dir: PathBuf,
     tag: String,
@@ -362,18 +423,18 @@ struct Runs {
 }
 
 impl Runs {
-    fn new(budget: usize, dir: &Path, tag: String) -> Self {
+    fn new(budget: usize, dir: &Path, tag: String) -> std::io::Result<Self> {
         // Fixed capacities: a run spills when either fills, so memory never exceeds the budget.
         let arena_cap = budget * 6 / 10;
         let items_cap = (budget - arena_cap) / std::mem::size_of::<Item>();
-        Runs {
-            arena: Vec::with_capacity(arena_cap),
-            items: Vec::with_capacity(items_cap.max(1024)),
+        Ok(Runs {
+            arena: MapVec::with_capacity(arena_cap)?,
+            items: MapVec::with_capacity(items_cap.max(1024))?,
             files: Vec::new(),
             dir: dir.to_path_buf(),
             tag,
             spilled_bytes: 0,
-        }
+        })
     }
 
     fn push(&mut self, key: &[u8], p: Posting) -> std::io::Result<()> {
@@ -393,16 +454,22 @@ impl Runs {
         Ok(())
     }
 
+    /// Spills the last run and frees the buffers: the run files and the bytes spilled.
+    fn finish(mut self) -> std::io::Result<(Vec<PathBuf>, u64)> {
+        self.spill()?;
+        Ok((self.files, self.spilled_bytes))
+    }
+
     fn spill(&mut self) -> std::io::Result<()> {
         if self.items.is_empty() {
             return Ok(());
         }
-        let arena = &self.arena;
+        let arena = self.arena.as_slice();
         let key = |it: &Item| &arena[it.off as usize..it.off as usize + it.len as usize];
-        self.items.sort_unstable_by(|a, b| key(a).cmp(key(b)).then(a.entity.cmp(&b.entity)));
+        self.items.as_mut_slice().sort_unstable_by(|a, b| key(a).cmp(key(b)).then(a.entity.cmp(&b.entity)));
         let path = self.dir.join(format!("{}-{}.run", self.tag, self.files.len()));
         let mut w = BufWriter::with_capacity(RUN_READ_BUFFER, File::create(&path)?);
-        for it in &self.items {
+        for it in self.items.as_slice() {
             let k = key(it);
             w.write_all(&it.len.to_le_bytes())?;
             w.write_all(k)?;
@@ -627,16 +694,17 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
     let threads = opts.threads.max(1);
     let budget = (opts.mem_mb << 20) / threads;
     let n = src.len();
-    let results: Vec<Result<(Runs, u64, u64), String>> = std::thread::scope(|sc| {
+    type RunsOut = (Vec<PathBuf>, u64, u64, u64);
+    let results: Vec<Result<RunsOut, String>> = std::thread::scope(|sc| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
                 let src = &src;
                 let tmp = &opts.tmp;
                 let tag = format!("{name}-{t}");
-                sc.spawn(move || -> Result<(Runs, u64, u64), String> {
+                sc.spawn(move || -> Result<RunsOut, String> {
                     let lo = (n as u64 * t as u64 / threads as u64) as u32;
                     let hi = (n as u64 * (t as u64 + 1) / threads as u64) as u32;
-                    let mut runs = Runs::new(budget, tmp, tag);
+                    let mut runs = Runs::new(budget, tmp, tag).map_err(|x| x.to_string())?;
                     let mut e = EntityBuf::default();
                     let mut keys = Vec::new();
                     let (mut ents, mut entries) = (0u64, 0u64);
@@ -656,11 +724,9 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
                             entries += 1;
                         }
                     }
-                    runs.spill().map_err(|x| x.to_string())?;
-                    // Hand the run memory back before the merge.
-                    runs.arena = Vec::new();
-                    runs.items = Vec::new();
-                    Ok((runs, ents, entries))
+                    // Hands the run memory back before the merge.
+                    let (files, spilled) = runs.finish().map_err(|x| x.to_string())?;
+                    Ok((files, spilled, ents, entries))
                 })
             })
             .collect();
@@ -669,11 +735,11 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
     let mut files = Vec::new();
     let (mut ents, mut entries, mut spilled) = (0u64, 0u64, 0u64);
     for r in results {
-        let (runs, e, k) = r?;
+        let (f, s, e, k) = r?;
         ents += e;
         entries += k;
-        spilled += runs.spilled_bytes;
-        files.extend(runs.files);
+        spilled += s;
+        files.extend(f);
     }
     drop(src);
     let t_runs = t0.elapsed();
