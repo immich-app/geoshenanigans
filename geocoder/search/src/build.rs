@@ -90,7 +90,9 @@ fn ring_centroid(v: &[NodeCoord]) -> (f32, f32) {
 struct EntityBuf {
     id: u32,
     imp: f32,
-    cc: [u8; 2],
+    /// Polygon that holds the entity's country code (read only to transliterate a name: country
+    /// codes are random reads into admin_polygons).
+    cc_poly: u32,
     /// (class, ord, transliterate?, name)
     names: Vec<(u8, u8, bool, String)>,
 }
@@ -213,7 +215,7 @@ impl<'a> PlacesSource<'a> {
             if self.area_proxy {
                 e.imp += W_AREA_PROXY * area_proxy(ap.area, s.lat);
             }
-            e.cc = cc_of(ap.country_code);
+            e.cc_poly = s.poly;
             let (primary, own) = slot_name_ids(geo, &s);
             if let Some(own) = own {
                 let n = geo.get_string(own);
@@ -233,7 +235,7 @@ impl<'a> PlacesSource<'a> {
             let typ = PLACE_NODE_TYPES.get(pn.place_type as usize).copied().unwrap_or("place");
             e.id = i;
             e.imp = W_TYPE * type_base(kind, typ, 0) + extra_importance(byte_at(&self.imp_places, i));
-            e.cc = parent_cc(geo, pn.parent_poly_id);
+            e.cc_poly = pn.parent_poly_id;
             (record_ref(KIND_PLACE_NODE, i), pn.name_id)
         };
         fill_names(geo, self.extras, rref, base_id, e)
@@ -262,7 +264,7 @@ impl<'a> PoiSource<'a> {
         }
         e.id = pos;
         e.imp = poi_importance(r.importance, byte_at(&self.imp_poi, pos));
-        e.cc = parent_cc(self.geo, r.parent_poly_id);
+        e.cc_poly = r.parent_poly_id;
         fill_names(self.geo, self.extras, record_ref(KIND_POI, pos), r.name_id, e)
     }
 }
@@ -305,9 +307,9 @@ impl Source<'_> {
 
 /// Keys of one entity: each name whole (best class first), then its trailing words
 /// ("york" of "new york"); a key belongs to the entity's best claim on it.
-fn keys_of(e: &EntityBuf, out: &mut Vec<(String, u8, bool, u8)>) {
+fn keys_of(geo: &Index, e: &EntityBuf, out: &mut Vec<(String, u8, bool, u8)>) {
     out.clear();
-    let cc = cc_str(&e.cc).to_string();
+    let mut cc: Option<String> = None;
     let mut by_class: Vec<(u8, u8, Vec<crate::normalize::Token>)> = Vec::with_capacity(e.names.len() + 1);
     for (class, ord, tr, name) in &e.names {
         let t = tokens(name);
@@ -315,7 +317,7 @@ fn keys_of(e: &EntityBuf, out: &mut Vec<(String, u8, bool, u8)>) {
             by_class.push((*class, *ord, t));
         }
         if *tr {
-            if let Some(latin) = transliterate(name, &cc) {
+            if let Some(latin) = transliterate(name, || cc.get_or_insert_with(|| cc_str(&parent_cc(geo, e.cc_poly)).to_string()).clone()) {
                 let t = tokens(&latin);
                 if !t.is_empty() {
                     by_class.push((TRANSLITERATION_CLASS, *ord, t));
@@ -889,7 +891,7 @@ pub fn sort_keys(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Resul
                         if !src.fill(pos, &mut e) {
                             continue;
                         }
-                        keys_of(&e, &mut keys);
+                        keys_of(geo, &e, &mut keys);
                         if keys.is_empty() {
                             continue;
                         }
