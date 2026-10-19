@@ -1629,7 +1629,7 @@ impl Index {
                 "suburb": place.suburb, "hamlet": place.hamlet,
                 "neighbourhood": place.neighbourhood, "quarter": place.quarter,
             },
-            "current_boundary": CurrentBoundaries::RANKS.iter().zip(current_boundaries.0.iter())
+            "current_boundary": CurrentBoundaries::RANKS.iter().zip(current_boundaries.gates.iter())
                 .map(|(rank, p)| (rank.to_string(), p.as_ref().map(|p| self.get_string(p.name_id)).into()))
                 .collect::<serde_json::Map<String, serde_json::Value>>(),
             "nearby_nodes": nearby,
@@ -2094,8 +2094,8 @@ impl Index {
         // against the current boundary for its rank_address
         // (find_current_boundaries). This is the correct Nominatim
         // check: the NODE must be inside the boundary, not the query.
-        let node_inside_boundary = |pn: &PlaceNode| -> bool {
-            match current_boundaries.for_rank(PLACE_NODE_RANK[pn.place_type as usize]) {
+        let node_inside_boundary = |pn: &PlaceNode, rank: u8| -> bool {
+            match current_boundaries.for_rank(rank) {
                 None => true, // no admin boundary found — accept all
                 Some(poly) => {
                     let Some(verts) = self.admin_verts(&poly) else { return true; };
@@ -2105,10 +2105,15 @@ impl Index {
             }
         };
 
-        let nodes: Vec<(usize, f64, f32, f32)> = candidates.iter()
-            .map(|(pn, dist_sq)| (pn.place_type as usize, *dist_sq, pn.lat, pn.lng))
+        // The promoting polygons, decoded once, of the ranks candidates have.
+        let promoting: Vec<(u8, Cow<'_, [NodeCoord]>)> = current_boundaries.promoting.iter()
+            .filter(|(rank, _)| candidates.iter().any(|(pn, _)| PLACE_NODE_RANK[pn.place_type as usize] == *rank))
+            .filter_map(|(rank, poly)| self.admin_verts(poly).map(|verts| (*rank, verts)))
             .collect();
-        let accepted = accept_place_nodes(&nodes, chain_has_rank16, |k| node_inside_boundary(&candidates[k].0));
+        let nodes: Vec<(usize, u8, f64, f32, f32)> = candidates.iter()
+            .map(|(pn, dist_sq)| (pn.place_type as usize, place_node_rank(pn, &promoting), *dist_sq, pn.lat, pn.lng))
+            .collect();
+        let accepted = accept_place_nodes(&nodes, chain_has_rank16, |k| node_inside_boundary(&candidates[k].0, nodes[k].1));
         for (pt, slot) in [&mut result.city, &mut result.town, &mut result.village, &mut result.suburb,
                            &mut result.hamlet, &mut result.neighbourhood, &mut result.quarter].into_iter().enumerate() {
             if let Some(k) = accepted[pt] {
@@ -4091,22 +4096,27 @@ pub fn place_node_covering(pn: &PlaceNode, feature: PlaceFeature<'_>, cos_lat: f
 
 /// Nominatim's address walk over place nodes (insert_addresslines,
 /// placex_triggers.sql:596-670). `nodes` holds every place node covering the
-/// point as (PlaceNode type, squared distance, lat, lng). The walk takes them
-/// by rank_address, then by distance times PLACE_NODE_DISTANCE_WEIGHT, and
-/// passes over a node outside the current boundary of its rank
-/// (`in_boundary(index)`) or outside the last accepted node's
-/// place_node_fuzzy_area; the first that passes is its rank's one entry
-/// (address_havelevel). Without the fuzzy-area cascade, spurious sub-city
-/// place nodes (White House "The West End", SF "Hayes Valley") leak in where
-/// Nominatim's walk rejects them. When a boundary already holds rank 16
-/// (e.g. a linked place boundary), no city, town or village node is
-/// considered: hiding a linked city node otherwise let the town slot latch
-/// onto a *different* far-away town (Nelson NZ picked Richmond across the
-/// bay), and the cascade then rejected the correct suburb/quarter. Returns
-/// the accepted node's index per type.
-pub fn accept_place_nodes(nodes: &[(usize, f64, f32, f32)], rank16_taken: bool, mut in_boundary: impl FnMut(usize) -> bool) -> [Option<usize>; 7] {
-    let rank = |k: usize| PLACE_NODE_RANK[nodes[k].0];
-    let weighed = |k: usize| nodes[k].1.sqrt() * PLACE_NODE_DISTANCE_WEIGHT[nodes[k].0];
+/// point as (PlaceNode type, rank_address, squared distance, lat, lng). The
+/// walk takes them by rank_address, then by distance times
+/// PLACE_NODE_DISTANCE_WEIGHT at rank 16, and passes over a node outside the
+/// current boundary of its rank (`in_boundary(index)`) or outside the last
+/// accepted node's place_node_fuzzy_area; the first that passes is its
+/// rank's one entry (address_havelevel). Without the fuzzy-area cascade,
+/// spurious sub-city place nodes (White House "The West End", SF "Hayes
+/// Valley") leak in where Nominatim's walk rejects them. When a boundary
+/// already holds rank 16 (e.g. a linked place boundary), no city, town or
+/// village node of rank 16 is considered: hiding a linked city node
+/// otherwise let the town slot latch onto a *different* far-away town
+/// (Nelson NZ picked Richmond across the bay), and the cascade then rejected
+/// the correct suburb/quarter. Returns the accepted node's index per type,
+/// of the highest rank when a type has entries at two: the address keeps a
+/// label's first row, finest first (v1/format_json.py:31-34).
+pub fn accept_place_nodes(nodes: &[(usize, u8, f64, f32, f32)], rank16_taken: bool, mut in_boundary: impl FnMut(usize) -> bool) -> [Option<usize>; 7] {
+    let rank = |k: usize| nodes[k].1;
+    let weighed = |k: usize| {
+        let (pt, rank, dist_sq, _, _) = nodes[k];
+        dist_sq.sqrt() * if rank == CurrentBoundaries::CITY { PLACE_NODE_DISTANCE_WEIGHT[pt] } else { 1.0 }
+    };
     let mut order: Vec<usize> = (0..nodes.len())
         .filter(|&k| !(rank16_taken && rank(k) == CurrentBoundaries::CITY))
         .collect();
@@ -4115,8 +4125,8 @@ pub fn accept_place_nodes(nodes: &[(usize, f64, f32, f32)], rank16_taken: bool, 
         rank(a).cmp(&rank(b))
             .then(weighed(a).total_cmp(&weighed(b)))
             .then(nodes[a].0.cmp(&nodes[b].0))
-            .then(nodes[a].2.total_cmp(&nodes[b].2))
             .then(nodes[a].3.total_cmp(&nodes[b].3))
+            .then(nodes[a].4.total_cmp(&nodes[b].4))
     });
 
     let mut accepted = [None; 7];
@@ -4124,7 +4134,7 @@ pub fn accept_place_nodes(nodes: &[(usize, f64, f32, f32)], rank16_taken: bool, 
     // The last accepted node's fuzzy area: (lat, lng, half side in metres).
     let mut fuzzy: Option<(f32, f32, f64)> = None;
     for k in order {
-        let (pt, _, lat, lng) = nodes[k];
+        let (pt, _, _, lat, lng) = nodes[k];
         if rank(k) == last_rank { continue; }
         let in_fuzzy = fuzzy.map_or(true, |(lat0, lng0, half_m)| fuzzy_area_holds(lat0, lng0, half_m, lat as f64, lng as f64));
         if !in_fuzzy || !in_boundary(k) { continue; }
@@ -4136,22 +4146,47 @@ pub fn accept_place_nodes(nodes: &[(usize, f64, f32, f32)], rank16_taken: bool, 
     accepted
 }
 
+/// The rank_address range of place nodes that a boundary of their own rank
+/// promotes (placex_triggers.sql:961-962: rank_address between 16 and 23).
+pub const PROMOTABLE_RANKS: std::ops::RangeInclusive<u8> = 16..=23;
+/// What the promotion adds to the node's rank_address (placex_triggers.sql:980).
+pub const PLACE_NODE_PROMOTION: u8 = 2;
+
+/// A place node's rank_address: its type's, two more when a polygon of
+/// `promoting`, (rank, vertices) holding the query point, has that rank
+/// and holds the node (placex_triggers.sql:961-981): a village in a city
+/// boundary ranks 18, a hamlet in a district linked to a suburb 22.
+pub fn place_node_rank(pn: &PlaceNode, promoting: &[(u8, Cow<'_, [NodeCoord]>)]) -> u8 {
+    let rank = PLACE_NODE_RANK[pn.place_type as usize];
+    let promoted = PROMOTABLE_RANKS.contains(&rank)
+        && promoting.iter().any(|(r, verts)| *r == rank && point_in_polygon(pn.lat, pn.lng, verts));
+    if promoted { rank + PLACE_NODE_PROMOTION } else { rank }
+}
+
 /// Nominatim's `current_boundary` (find_current_boundaries) for the place
-/// nodes find_places gates, one per rank_address in RANKS.
-#[derive(Clone, Copy, Default)]
-pub struct CurrentBoundaries(pub [Option<AdminPolygon>; 4]);
+/// nodes find_places gates, one per rank_address in RANKS, and the polygons
+/// holding the point that promote place nodes.
+#[derive(Clone, Default)]
+pub struct CurrentBoundaries {
+    pub gates: [Option<AdminPolygon>; 5],
+    /// (rank_address, polygon) of the boundaries, and (place rank, polygon)
+    /// of the place areas, holding the point at a PROMOTABLE_RANKS rank.
+    pub promoting: Vec<(u8, AdminPolygon)>,
+}
 
 impl CurrentBoundaries {
     /// rank_address of place=city, town and village (address-levels.json)
     pub const CITY: u8 = 16;
+    /// rank_address of a city, town or village node promoted in a city
+    pub const CITY_PART: u8 = Self::CITY + PLACE_NODE_PROMOTION;
     /// rank_address of place=suburb and place=hamlet
     pub const SUBURB: u8 = 20;
     pub const QUARTER: u8 = 22;
     pub const NEIGHBOURHOOD: u8 = 24;
-    pub const RANKS: [u8; 4] = [Self::CITY, Self::SUBURB, Self::QUARTER, Self::NEIGHBOURHOOD];
+    pub const RANKS: [u8; 5] = [Self::CITY, Self::CITY_PART, Self::SUBURB, Self::QUARTER, Self::NEIGHBOURHOOD];
 
     pub fn for_rank(&self, rank: u8) -> Option<&AdminPolygon> {
-        Self::RANKS.iter().position(|&r| r == rank).and_then(|g| self.0[g].as_ref())
+        Self::RANKS.iter().position(|&r| r == rank).and_then(|g| self.gates[g].as_ref())
     }
 
     /// Each rank's boundary from the boundaries holding the point at their
@@ -4160,10 +4195,14 @@ impl CurrentBoundaries {
     /// boundary in a level 6 one linked to a suburb is ranked 22, not 14),
     /// then `pick` takes the smallest of rank <= each rank.
     pub fn from_ranked<'a>(mut ranked: Vec<RankedPoly>, place_areas: impl Iterator<Item = &'a AdminPolygon> + Clone) -> Self {
-        promote_nested_ranks(&mut ranked, place_areas);
+        promote_nested_ranks(&mut ranked, place_areas.clone());
         ranked.sort_by(|a, b| a.poly.area.total_cmp(&b.poly.area));
+        let promoting = ranked.iter().map(|r| (r.rank_address, r.poly))
+            .chain(place_areas.map(|p| (place_type_to_rank(p.place_type_override), *p)))
+            .filter(|(rank, _)| PROMOTABLE_RANKS.contains(rank))
+            .collect();
         let gating = ranked.into_iter().filter(|r| !matches!(r.rank_address, 0 | 5 | 11));
-        Self::pick(gating.map(|r| (r.rank_address, r.poly)))
+        Self { promoting, ..Self::pick(gating.map(|r| (r.rank_address, r.poly))) }
     }
 
     /// Each rank's boundary from (rank_address, polygon) candidates holding
@@ -4171,10 +4210,10 @@ impl CurrentBoundaries {
     pub fn pick(candidates: impl IntoIterator<Item = (u8, AdminPolygon)>) -> Self {
         let mut found = Self::default();
         for (rank, poly) in candidates {
-            let open: [bool; 4] = std::array::from_fn(|g| found.0[g].is_none() && rank <= Self::RANKS[g]);
+            let open: [bool; 5] = std::array::from_fn(|g| found.gates[g].is_none() && rank <= Self::RANKS[g]);
             if !open.contains(&true) { continue; }
-            for (slot, _) in found.0.iter_mut().zip(open).filter(|(_, open)| *open) { *slot = Some(poly); }
-            if found.0.iter().all(Option::is_some) { break; }
+            for (slot, _) in found.gates.iter_mut().zip(open).filter(|(_, open)| *open) { *slot = Some(poly); }
+            if found.gates.iter().all(Option::is_some) { break; }
         }
         found
     }
@@ -4926,8 +4965,8 @@ mod pure_helper_tests {
         }
     }
 
-    fn names(found: &CurrentBoundaries) -> [Option<u32>; 4] {
-        found.0.map(|p| p.map(|p| p.name_id))
+    fn names(found: &CurrentBoundaries) -> [Option<u32>; 5] {
+        found.gates.map(|p| p.map(|p| p.name_id))
     }
 
     fn ranked(admin_level: u8, rank_address: u8, area: f32, place_type_override: u8) -> RankedPoly {
@@ -4963,7 +5002,7 @@ mod pure_helper_tests {
         // A Vatican point: Rome's boundaries are near but leave it out; the
         // country holds it and gates every place rank.
         let found = CurrentBoundaries::pick([(4, boundary(3, 2))]);
-        assert_eq!(names(&found), [Some(3), Some(3), Some(3), Some(3)]);
+        assert_eq!(names(&found), [Some(3); 5]);
     }
 
     #[test]
@@ -4972,7 +5011,7 @@ mod pure_helper_tests {
         // neighbourhoods, while suburbs see the municipality around it.
         let candidates = [(22, boundary(1, 10)), (16, boundary(2, 8)), (4, boundary(3, 2))];
         let found = CurrentBoundaries::pick(candidates);
-        assert_eq!(names(&found), [Some(2), Some(2), Some(1), Some(1)]);
+        assert_eq!(names(&found), [Some(2), Some(2), Some(2), Some(1), Some(1)]);
     }
 
     #[test]
@@ -4989,7 +5028,7 @@ mod pure_helper_tests {
             RankedPoly { poly: country, rank_address: 4 },
         ];
         let found = CurrentBoundaries::from_ranked(ranked, [].iter());
-        assert_eq!(names(&found), [Some(3), Some(1), Some(2), Some(2)]);
+        assert_eq!(names(&found), [Some(3), Some(3), Some(1), Some(2), Some(2)]);
     }
 
     #[test]
@@ -5002,7 +5041,7 @@ mod pure_helper_tests {
         let nairobi = AdminPolygon { area: 100.0, place_type_override: 1, ..boundary(3, 15) };
         let ranked = vec![RankedPoly { poly: starehe, rank_address: 12 }, RankedPoly { poly: country, rank_address: 4 }];
         let found = CurrentBoundaries::from_ranked(ranked, [nairobi].iter());
-        assert_eq!(names(&found), [Some(2), Some(1), Some(1), Some(1)]);
+        assert_eq!(names(&found), [Some(2), Some(1), Some(1), Some(1), Some(1)]);
     }
 
     #[test]
@@ -5012,14 +5051,20 @@ mod pure_helper_tests {
         // outside it, is no candidate.
         let candidates = [(12, boundary(1, 6)), (10, boundary(2, 5)), (8, boundary(3, 4)), (4, boundary(4, 2))];
         let found = CurrentBoundaries::pick(candidates);
-        assert_eq!(names(&found), [Some(1), Some(1), Some(1), Some(1)]);
+        assert_eq!(names(&found), [Some(1); 5]);
         assert_eq!(found.for_rank(CurrentBoundaries::CITY).map(|p| p.admin_level), Some(6));
     }
 
     // A node of PlaceNode type `pt` `east_m` metres east of (0, 0),
     // `dist_sq` from the query.
-    fn node_at(pt: usize, east_m: f64, dist_sq: f64) -> (usize, f64, f32, f32) {
-        (pt, dist_sq, 0.0, (east_m / 111320.0) as f32)
+    fn node_at(pt: usize, east_m: f64, dist_sq: f64) -> (usize, u8, f64, f32, f32) {
+        (pt, PLACE_NODE_RANK[pt], dist_sq, 0.0, (east_m / METRES_PER_DEGREE) as f32)
+    }
+
+    // The same, promoted two ranks.
+    fn promoted_node_at(pt: usize, east_m: f64, dist_sq: f64) -> (usize, u8, f64, f32, f32) {
+        let (pt, rank, dist_sq, lat, lng) = node_at(pt, east_m, dist_sq);
+        (pt, rank + PLACE_NODE_PROMOTION, dist_sq, lat, lng)
     }
 
     fn place_node(place_type: u8, lat_m: f64, lng_m: f64) -> PlaceNode {
@@ -5161,14 +5206,64 @@ mod pure_helper_tests {
         assert!((metres(&north) - 200.0).abs() < 1.0, "{}", metres(&north));
         assert!((metres(&east) - 900.0).abs() < 2.0, "{}", metres(&east));
         let walk = |feature| {
-            let nodes: Vec<(usize, f64, f32, f32)> = [north, east].iter()
-                .filter_map(|pn| place_node_covering(pn, feature, 1.0).map(|d| (4, d, pn.lat, pn.lng)))
+            let nodes: Vec<(usize, u8, f64, f32, f32)> = [north, east].iter()
+                .filter_map(|pn| place_node_covering(pn, feature, 1.0).map(|d| (4, CurrentBoundaries::SUBURB, d, pn.lat, pn.lng)))
                 .collect();
             let accepted = accept_place_nodes(&nodes, false, |_| true)[4];
-            accepted.map(|k| nodes[k].3)
+            accepted.map(|k| nodes[k].4)
         };
         assert_eq!(walk(line), Some(north.lng));
         assert_eq!(walk(point), Some(east.lng));
+    }
+
+    #[test]
+    fn place_nodes_rank_two_up_inside_a_polygon_of_their_rank() {
+        let square = unit_square();
+        let promoting = [(CurrentBoundaries::CITY, Cow::Borrowed(&square[..]))];
+        let village = PlaceNode { lat: 0.5, lng: 0.5, ..place_node(2, 0.0, 0.0) };
+        assert_eq!(place_node_rank(&village, &promoting), CurrentBoundaries::CITY_PART);
+        assert_eq!(place_node_rank(&PlaceNode { lat: 1.5, ..village }, &promoting), CurrentBoundaries::CITY);
+        // Only a polygon of the node's own rank promotes it.
+        assert_eq!(place_node_rank(&PlaceNode { place_type: 4, ..village }, &promoting), CurrentBoundaries::SUBURB);
+        // A neighbourhood (24) is past the promotable ranks.
+        let neighbourhoods = [(CurrentBoundaries::NEIGHBOURHOOD, Cow::Borrowed(&square[..]))];
+        assert_eq!(place_node_rank(&PlaceNode { place_type: 5, ..village }, &neighbourhoods), CurrentBoundaries::NEIGHBOURHOOD);
+    }
+
+    #[test]
+    fn place_nodes_promoted_walk_at_their_new_rank() {
+        // Taipei: the city is a rank-16 boundary and the village node inside
+        // it ranks 18, so the boundary leaves it in; Nominatim's answer has
+        // city=Taipei and village=Xingya.
+        let nodes = [node_at(1, 0.0, 1.0), promoted_node_at(2, 100.0, 4.0)];
+        assert_eq!(accept_place_nodes(&nodes, true, |_| true), [None, None, Some(1), None, None, None, None]);
+        assert_eq!(accept_place_nodes(&nodes, false, |_| true), [None, Some(0), Some(1), None, None, None, None]);
+        // The rank_search weights apply at rank 16 only: at 18 a city 2 away
+        // loses to a village 1 away.
+        let nodes = [promoted_node_at(0, 0.0, 4.0), promoted_node_at(2, 100.0, 1.0)];
+        assert_eq!(accept_place_nodes(&nodes, false, |_| true), [None, None, Some(1), None, None, None, None]);
+        // A hamlet at 20 and a promoted one at 22: the finer one names it.
+        let nodes = [node_at(4, 0.0, 1.0), promoted_node_at(4, 100.0, 2.0)];
+        assert_eq!(accept_place_nodes(&nodes, false, |_| true)[4], Some(1));
+    }
+
+    #[test]
+    fn current_boundaries_keep_the_polygons_that_promote() {
+        // A rank-16 city and a rank-20 suburb area promote; the country, a
+        // rank-24 neighbourhood area and a rank-12 county don't.
+        let city = AdminPolygon { area: 10.0, ..boundary(1, 8) };
+        let county = AdminPolygon { area: 100.0, ..boundary(2, 6) };
+        let country = AdminPolygon { area: 1000.0, ..boundary(3, 2) };
+        let suburb = AdminPolygon { area: 1.0, place_type_override: 4, ..boundary(4, 15) };
+        let neighbourhood = AdminPolygon { area: 0.5, place_type_override: 5, ..boundary(5, 15) };
+        let ranked = vec![
+            RankedPoly { poly: city, rank_address: 16 },
+            RankedPoly { poly: county, rank_address: 12 },
+            RankedPoly { poly: country, rank_address: 4 },
+        ];
+        let found = CurrentBoundaries::from_ranked(ranked, [suburb, neighbourhood].iter());
+        let promoting: Vec<(u8, u32)> = found.promoting.iter().map(|(r, p)| (*r, p.name_id)).collect();
+        assert_eq!(promoting, [(16, 1), (20, 4)]);
     }
 
     #[test]
@@ -5189,7 +5284,7 @@ mod pure_helper_tests {
     #[test]
     fn current_boundaries_are_empty_without_a_containing_boundary() {
         let found = CurrentBoundaries::pick([]);
-        assert_eq!(names(&found), [None, None, None, None]);
+        assert_eq!(names(&found), [None; 5]);
         assert!(found.for_rank(CurrentBoundaries::SUBURB).is_none());
     }
 
