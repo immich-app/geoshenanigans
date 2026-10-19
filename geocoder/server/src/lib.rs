@@ -231,6 +231,18 @@ pub fn vertex_scale(enc: u8) -> f64 {
 /// vertex_offset == NO_DATA).
 pub const POLY_HEADER_BYTES: u64 = 10;
 
+/// Largest vertex delta (in scale steps) the u16 encodings 0-2 can store.
+const U16_VERTEX_MAX_STEPS: f64 = u16::MAX as f64;
+/// Margin of the latitude bounds test in `ring_bounds_exclude`. `point_in_polygon` computes an
+/// edge's crossing latitude in f32; while the edge's longitude span is a normal f32 it lands
+/// within about 7e-5 degrees of the edge's latitude span (five roundings relative to a span of at
+/// most 180 degrees, plus the final addition), so a point 1e-3 degrees beyond every vertex is
+/// beyond every crossing.
+const PIP_LAT_BOUND_SLACK_DEG: f32 = 1e-3;
+/// 2^-100 (f32 biased exponent 27). At or above this |lng| the longitudes of an edge straddling
+/// the point differ by at least 2^-124, a normal f32; closer to 0 the latitude test is skipped.
+const PIP_LAT_BOUND_MIN_ABS_LNG: f32 = f32::from_bits(27 << 23);
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct AdminPolygon {
@@ -4058,20 +4070,23 @@ pub fn point_in_polygon(lat: f32, lng: f32, vertices: &[NodeCoord]) -> bool {
 
 /// `point_in_polygon` over a polygon's encoded vertices (the layout `decode_polygon_verts`
 /// reads), decoding one vertex at a time to the same f32 values: no allocation, one pass. None
-/// exactly where `decode_polygon_verts` is None.
+/// exactly where `decode_polygon_verts` is None. A point the header's bounds already exclude is
+/// answered without reading the vertices.
 pub fn point_in_encoded_polygon(src: &FileBytes, vertex_offset: u32, vertex_count: u32, lat: f32, lng: f32) -> Option<bool> {
     if vertex_count == 0 || vertex_offset == NO_DATA { return None; }
     let off = vertex_offset as u64;
     if off + POLY_HEADER_BYTES > src.len() { return None; }
     let header = src.read_chunk(off, POLY_HEADER_BYTES as usize);
     let encoding = header[0];
-    let bmin_lat = f32::from_le_bytes(header[2..6].try_into().unwrap()) as f64;
-    let bmin_lng = f32::from_le_bytes(header[6..10].try_into().unwrap()) as f64;
+    let bmin_lat32 = f32::from_le_bytes(header[2..6].try_into().unwrap());
+    let bmin_lng32 = f32::from_le_bytes(header[6..10].try_into().unwrap());
     drop(header);
     let stride = vertex_stride(encoding);
     let n = vertex_count as usize;
     let verts_off = off + POLY_HEADER_BYTES;
     if verts_off + (n * stride) as u64 > src.len() { return None; }
+    if ring_bounds_exclude(encoding, bmin_lat32, bmin_lng32, lat, lng) { return Some(false); }
+    let (bmin_lat, bmin_lng) = (bmin_lat32 as f64, bmin_lng32 as f64);
     let bytes = src.read_chunk(verts_off, n * stride);
     let scale = vertex_scale(encoding);
     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[i], b[i + 1]]) as f64;
@@ -4085,6 +4100,23 @@ pub fn point_in_encoded_polygon(src: &FileBytes, vertex_offset: u32, vertex_coun
             ((bmin_lat + u16_at(b, 0) * scale) as f32, (bmin_lng + u16_at(b, 2) * scale) as f32)
         }),
     })
+}
+
+/// True when `point_in_polygon` on a ring of encoding `enc` with header bbox minimum
+/// (`bmin_lat`, `bmin_lng`) is false at (`lat`, `lng`) whatever the vertices. Encodings 0-3 decode
+/// every vertex to `(bmin + k * scale) as f32` with k >= 0, so no vertex is below the minimum; the
+/// u16 encodings 0-2 also bound k by 65535. Outside the bounds in longitude, no edge straddles the
+/// point's meridian. Outside them in latitude, every straddling edge crosses north of the point
+/// (or none does), and a closed ring has an even number of straddling edges.
+fn ring_bounds_exclude(enc: u8, bmin_lat: f32, bmin_lng: f32, lat: f32, lng: f32) -> bool {
+    if enc > 3 { return false; }
+    if lng < bmin_lng { return true; }
+    let latitude_test = lng.abs() >= PIP_LAT_BOUND_MIN_ABS_LNG;
+    if latitude_test && lat < bmin_lat - PIP_LAT_BOUND_SLACK_DEG { return true; }
+    if enc == 3 { return false; }
+    let span = U16_VERTEX_MAX_STEPS * vertex_scale(enc);
+    let (bmax_lat, bmax_lng) = ((bmin_lat as f64 + span) as f32, (bmin_lng as f64 + span) as f32);
+    lng > bmax_lng || (latitude_test && lat > bmax_lat + PIP_LAT_BOUND_SLACK_DEG)
 }
 
 /// The `point_in_polygon` ray cast over packed vertices of one encoding (`at` decodes one).
@@ -5116,6 +5148,60 @@ mod encoded_pip_tests {
             // Both answers are exercised.
             assert!(inside > 1000 && inside < 11000, "enc {enc}: {inside} of 12000 inside");
         }
+    }
+
+    #[test]
+    fn ring_bounds_exclude_only_points_the_ray_cast_puts_outside() {
+        let mut rng = Rng::new(7);
+        let mut excluded = [0usize; 4];
+        for enc in 0u8..=3 {
+            let scale = vertex_scale(enc);
+            // Nearly every u16 step (the f32 bbox minimum sits up to a few steps below the ring),
+            // so the extent bound is exercised at its limit.
+            let width = if enc == 3 { 5.0 } else { (u16::MAX - 20) as f64 * scale };
+            for _ in 0..200 {
+                let (lat0, lng0) = (rng.range(-80.0, 75.0), rng.range(-175.0, 170.0));
+                // A square spanning the full width, each side's midpoint pushed in a little.
+                let (lat1, lng1) = (lat0 + width, lng0 + width);
+                let (mid_lat, mid_lng) = (lat0 + width / 2.0, lng0 + width / 2.0);
+                let mut dent = || rng.range(0.0, 0.1) * width;
+                let ring = vec![
+                    (lat0, lng0), (lat0 + dent(), mid_lng), (lat0, lng1), (mid_lat, lng1 - dent()),
+                    (lat1, lng1), (lat1 - dent(), mid_lng), (lat1, lng0), (mid_lat, lng0 + dent()),
+                ];
+                let src = FileBytes::Owned(pack_ring(enc, &ring));
+                let verts = decode_polygon_verts(&src, 0, ring.len() as u32).unwrap();
+                let h = src.read_chunk(0, POLY_HEADER_BYTES as usize);
+                let (bmin_lat, bmin_lng) = (f32::from_le_bytes(h[2..6].try_into().unwrap()), f32::from_le_bytes(h[6..10].try_into().unwrap()));
+                for _ in 0..50 {
+                    // Points within 0.01 degrees of a bbox side, in both directions.
+                    let near = |rng: &mut Rng, lo: f64, hi: f64| if rng.next() % 2 == 0 { lo + rng.range(-0.01, 0.01) } else { hi + rng.range(-0.01, 0.01) };
+                    let (lat, lng) = match rng.next() % 3 {
+                        0 => (near(&mut rng, lat0, lat0 + width), rng.range(lng0, lng0 + width)),
+                        1 => (rng.range(lat0, lat0 + width), near(&mut rng, lng0, lng0 + width)),
+                        _ => (near(&mut rng, lat0, lat0 + width), near(&mut rng, lng0, lng0 + width)),
+                    };
+                    let (lat, lng) = (lat as f32, lng as f32);
+                    if ring_bounds_exclude(enc, bmin_lat, bmin_lng, lat, lng) {
+                        excluded[enc as usize] += 1;
+                        assert!(!point_in_polygon(lat, lng, &verts), "enc {enc} excluded a point inside: {lat} {lng}");
+                        assert_eq!(point_in_encoded_polygon(&src, 0, ring.len() as u32, lat, lng), Some(false));
+                    }
+                }
+            }
+        }
+        assert!(excluded.iter().all(|&n| n > 1000), "{excluded:?}");
+        // The legacy f32 encoding carries no usable bounds.
+        assert!(!ring_bounds_exclude(4, 10.0, 10.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn ring_bounds_exclude_skips_the_latitude_test_at_the_zero_meridian() {
+        assert!(ring_bounds_exclude(3, 10.0, -1.0, 9.0, 0.5));
+        assert!(!ring_bounds_exclude(3, 10.0, -1.0, 9.0, 0.0));
+        assert!(!ring_bounds_exclude(3, 10.0, -1.0, 9.0, 1e-35));
+        // The longitude test holds everywhere.
+        assert!(ring_bounds_exclude(3, 10.0, 1e-30, 9.0, 0.0));
     }
 
     #[test]
