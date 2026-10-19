@@ -2702,6 +2702,7 @@ static int run(int argc, char* argv[]) {
                     // or a POI, left out for not being multipolygon/boundary.
                     std::array<size_t, 4> not_area_type{};
                     size_t poi_not_area_type = 0;
+                    size_t postal_without_code = 0;
                 };
                 std::vector<Collected> collected(pbf.thread_count());
                 pbf.read_blocks([&](PbfBlock& block, unsigned thread) {
@@ -2786,9 +2787,11 @@ static int run(int argc, char* argv[]) {
 
                         std::string name_str;
                         if (is_postal) {
-                            const char* postal_code = rel.tag("postal_code");
-                            if (!postal_code) postal_code = name_en;
-                            if (!postal_code) continue;
+                            const char* postal_code = postal_area_code([&](const char* key) { return rel.tag(key); });
+                            if (!postal_code) {
+                                mine.postal_without_code++;
+                                continue;
+                            }
                             name_str = postal_code;
                         } else {
                             name_str = name_en;
@@ -2967,6 +2970,7 @@ static int run(int argc, char* argv[]) {
                 // order is as arbitrary as the shared lock's was.
                 std::array<size_t, 4> not_area_type{};
                 size_t poi_not_area_type = 0;
+                size_t postal_without_code = 0;
                 for (auto& c : collected) {
                     std::move(c.relations.begin(), c.relations.end(), std::back_inserter(data.collected_relations));
                     std::move(c.wikidata.begin(), c.wikidata.end(), std::back_inserter(rel_wikidata));
@@ -2975,12 +2979,15 @@ static int run(int argc, char* argv[]) {
                               std::back_inserter(data.collected_poi_relations));
                     for (size_t k = 0; k < not_area_type.size(); k++) not_area_type[k] += c.not_area_type[k];
                     poi_not_area_type += c.poi_not_area_type;
+                    postal_without_code += c.postal_without_code;
                 }
                 std::cerr << "  Relations not of type multipolygon/boundary, left out: "
                           << not_area_type[static_cast<size_t>(RelationKind::ADMIN)] << " admin, "
                           << not_area_type[static_cast<size_t>(RelationKind::POSTAL)] << " postal, "
                           << not_area_type[static_cast<size_t>(RelationKind::PLACE)] << " place, "
                           << poi_not_area_type << " POI." << std::endl;
+                std::cerr << "  Postal relations without a postcode tag, left out: "
+                          << postal_without_code << "." << std::endl;
             }
             std::cerr << "  Collected " << data.collected_relations.size()
                       << " admin/postal relations for parallel assembly." << std::endl;
@@ -3768,19 +3775,17 @@ static int run(int argc, char* argv[]) {
                     const char* boundary = t.boundary;
                     if (boundary) {
                         bool is_admin = (std::strcmp(boundary, "administrative") == 0);
-                        bool is_postal = (std::strcmp(boundary, "postal_code") == 0);
                         bool is_place_boundary = (std::strcmp(boundary, "place") == 0);
-                        if ((is_admin || is_postal) && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1]) {
+                        // A boundary=postal_code way is no postcode area:
+                        // Nominatim's postcode_area makes one from relations
+                        // only (init.lua process_tags).
+                        if (is_admin && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1]) {
                             uint8_t al = 0;
-                            if (is_admin) { const char* ls = t.admin_level; if (ls) al = static_cast<uint8_t>(std::atoi(ls)); }
-                            else al = 11;
-                            int max_al = is_postal ? 11 : 10;
-                            if (al >= 2 && al <= max_al && (kMaxAdminLevel == 0 || al <= kMaxAdminLevel)) {
+                            { const char* ls = t.admin_level; if (ls) al = static_cast<uint8_t>(std::atoi(ls)); }
+                            if (al >= 2 && al <= 10 && (kMaxAdminLevel == 0 || al <= kMaxAdminLevel)) {
                                 const char* aname = t_best_name;
-                                if (aname || !is_admin) {
-                                    std::string name_str;
-                                    if (is_postal) { const char* pc = t.postal_code; if (!pc) pc = aname; if (pc) name_str = pc; }
-                                    else if (aname) name_str = aname;
+                                if (aname) {
+                                    std::string name_str = aname;
                                     if (!name_str.empty() && all_valid && resolved_locs.size() >= 3) {
                                         std::vector<std::pair<double,double>> verts;
                                         for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});
