@@ -2825,16 +2825,7 @@ impl Index {
         if cnt < 2 || off + cnt as u64 > total { return None; }
         let bytes = street_nodes.read_chunk(off * std::mem::size_of::<NodeCoord>() as u64, cnt * std::mem::size_of::<NodeCoord>());
         let nodes: &[NodeCoord] = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const NodeCoord, cnt) };
-        let cos_lat = lat.to_radians().cos();
-        let mut best: Option<(f64, f64, f64)> = None;
-        for w in nodes.windows(2) {
-            let (a, b) = ((w[0].lat as f64, w[0].lng as f64), (w[1].lat as f64, w[1].lng as f64));
-            let (d, t) = point_to_segment_with_t(lat, lng, a.0, a.1, b.0, b.1, cos_lat);
-            if best.map_or(true, |(bd, _, _)| d < bd) {
-                best = Some((d, a.0 + t * (b.0 - a.0), a.1 + t * (b.1 - a.1)));
-            }
-        }
-        best.map(|(_, plat, plng)| (plat, plng))
+        closest_point_on_line(nodes, lat, lng)
     }
 
     // Collect the most-specific surfaceable landmark name plus the
@@ -3771,6 +3762,22 @@ pub fn point_to_segment_with_t(
     let dlat = (px - proj_x).to_radians();
     let dlng = (py - proj_y).to_radians();
     (dist_sq(dlat, dlng, cos_lat), t)
+}
+
+/// The point of a line nearest (lat, lng), as (lat, lng): planar in degrees,
+/// as PostGIS ST_ClosestPoint is on placex's lon/lat geometry (reverse.py:46),
+/// so a longitude degree counts as much as a latitude degree at any latitude.
+pub fn closest_point_on_line(nodes: &[NodeCoord], lat: f64, lng: f64) -> Option<(f64, f64)> {
+    const PLANAR: f64 = 1.0; // no cos(lat) scaling of longitude
+    let mut best: Option<(f64, f64, f64)> = None;
+    for w in nodes.windows(2) {
+        let (a, b) = ((w[0].lat as f64, w[0].lng as f64), (w[1].lat as f64, w[1].lng as f64));
+        let (d, t) = point_to_segment_with_t(lat, lng, a.0, a.1, b.0, b.1, PLANAR);
+        if best.map_or(true, |(bd, _, _)| d < bd) {
+            best = Some((d, a.0 + t * (b.0 - a.0), a.1 + t * (b.1 - a.1)));
+        }
+    }
+    best.map(|(_, plat, plng)| (plat, plng))
 }
 
 pub fn point_to_segment_distance(
@@ -4855,6 +4862,17 @@ mod pure_helper_tests {
         assert_eq!(coarse_fields(chain, query, || None), chain);
         // Agreement never looks at the street.
         assert_eq!(coarse_fields(chain, chain, || panic!("looked")), chain);
+    }
+
+    #[test]
+    fn closest_point_on_line_is_planar_in_degrees() {
+        // At 60°N a segment 0.015° east is 0.0075° away in metres-true terms,
+        // nearer than one 0.01° north; in plain degrees, as ST_ClosestPoint
+        // measures, the northern one is nearer.
+        let line = [nc(59.99, 0.015), nc(60.01, 0.015), nc(60.01, -0.02)];
+        let (lat, lng) = closest_point_on_line(&line, 60.0, 0.0).unwrap();
+        assert!((lat - 60.01f32 as f64).abs() < 1e-9 && lng.abs() < 1e-6, "({lat}, {lng})");
+        assert_eq!(closest_point_on_line(&line[..1], 60.0, 0.0), None);
     }
 
     #[test]
