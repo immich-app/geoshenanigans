@@ -29,6 +29,16 @@ TEST(admin_minimal_keeps_place_areas_down_to_rank_16) {
     CHECK(!admin_minimal_keeps(15, pt(AdminPlaceType::NONE)));
 }
 
+TEST(place_areas_of_rank_0_are_no_address_areas) {
+    CHECK(is_address_place_type(AdminPlaceType::CITY));
+    CHECK(is_address_place_type(AdminPlaceType::COUNTY));
+    CHECK(is_address_place_type(AdminPlaceType::NEIGHBOURHOOD));
+    CHECK(!is_address_place_type(AdminPlaceType::STATE));
+    CHECK(!is_address_place_type(AdminPlaceType::PROVINCE));
+    CHECK(!is_address_place_type(AdminPlaceType::REGION));  // e.g. Mashriq
+    CHECK(!is_address_place_type(AdminPlaceType::NONE));
+}
+
 TEST(place_area_ranks_follow_address_levels) {
     CHECK_EQ(place_area_rank_address(pt(AdminPlaceType::CITY)), uint8_t(16));
     CHECK_EQ(place_area_rank_address(pt(AdminPlaceType::QUARTER)), uint8_t(22));

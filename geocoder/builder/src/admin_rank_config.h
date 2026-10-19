@@ -79,6 +79,14 @@ inline uint8_t place_area_rank_address(uint8_t place_type) {
     }
 }
 
+// Whether a place area of this type is part of addresses at all: Nominatim
+// makes an address area only of a place with rank_address > 0 (placex_update,
+// placex_triggers.sql:1254) and links no place node to one of rank 0
+// (find_linked_place, :285). place=state, province and region rank 0.
+inline bool is_address_place_type(AdminPlaceType place_type) {
+    return place_area_rank_address(static_cast<uint8_t>(place_type)) > 0;
+}
+
 // Admin-minimal carries addresses down to rank 16, the cities, towns and
 // villages its place nodes also reach: boundaries of admin_level 2..8 and the
 // place areas (admin_level 15) of those ranks. Singapore's city is its

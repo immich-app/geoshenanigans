@@ -2705,6 +2705,7 @@ static int run(int argc, char* argv[]) {
                     std::array<size_t, 4> not_area_type{};
                     size_t poi_not_area_type = 0;
                     size_t postal_without_code = 0;
+                    size_t place_rank0 = 0;
                 };
                 std::vector<Collected> collected(pbf.thread_count());
                 pbf.read_blocks([&](PbfBlock& block, unsigned thread) {
@@ -2717,9 +2718,14 @@ static int run(int argc, char* argv[]) {
                         // Place relations (e.g. Moscow R2555133, type=multipolygon
                         // + place=city) are placex rows of their own at the place
                         // type's rank, beside any boundary=administrative relation.
-                        const RelationKind kind = area_relation_kind(
-                            boundary, rel_place && classify_place_override(nullptr, rel_place) != AdminPlaceType::NONE);
-                        if (kind == RelationKind::NONE) continue;
+                        // A place type of address rank 0 (state, province, region)
+                        // makes no address area.
+                        const AdminPlaceType rel_pt = rel_place ? classify_place_override(nullptr, rel_place) : AdminPlaceType::NONE;
+                        const RelationKind kind = area_relation_kind(boundary, is_address_place_type(rel_pt));
+                        if (kind == RelationKind::NONE) {
+                            if (rel_pt != AdminPlaceType::NONE && is_area_relation_type(rel_type)) mine.place_rank0++;
+                            continue;
+                        }
                         if (!is_area_relation_type(rel_type)) {
                             mine.not_area_type[static_cast<size_t>(kind)]++;
                             continue;
@@ -2973,6 +2979,7 @@ static int run(int argc, char* argv[]) {
                 std::array<size_t, 4> not_area_type{};
                 size_t poi_not_area_type = 0;
                 size_t postal_without_code = 0;
+                size_t place_rank0 = 0;
                 for (auto& c : collected) {
                     std::move(c.relations.begin(), c.relations.end(), std::back_inserter(data.collected_relations));
                     std::move(c.wikidata.begin(), c.wikidata.end(), std::back_inserter(rel_wikidata));
@@ -2982,6 +2989,7 @@ static int run(int argc, char* argv[]) {
                     for (size_t k = 0; k < not_area_type.size(); k++) not_area_type[k] += c.not_area_type[k];
                     poi_not_area_type += c.poi_not_area_type;
                     postal_without_code += c.postal_without_code;
+                    place_rank0 += c.place_rank0;
                 }
                 std::cerr << "  Relations not of type multipolygon/boundary, left out: "
                           << not_area_type[static_cast<size_t>(RelationKind::ADMIN)] << " admin, "
@@ -2990,6 +2998,8 @@ static int run(int argc, char* argv[]) {
                           << poi_not_area_type << " POI." << std::endl;
                 std::cerr << "  Postal relations without a postcode tag, left out: "
                           << postal_without_code << "." << std::endl;
+                std::cerr << "  Place relations of address rank 0 (state, province, region), left out: "
+                          << place_rank0 << "." << std::endl;
             }
             std::cerr << "  Collected " << data.collected_relations.size()
                       << " admin/postal relations for parallel assembly." << std::endl;
@@ -3804,7 +3814,7 @@ static int run(int argc, char* argv[]) {
                             const char* aname = t_best_name;
                             if (aname && t.place) {
                                 AdminPlaceType pt = classify_place_override(nullptr, t.place);
-                                if (pt != AdminPlaceType::NONE && all_valid && resolved_locs.size() >= 3) {
+                                if (is_address_place_type(pt) && all_valid && resolved_locs.size() >= 3) {
                                     std::vector<std::pair<double,double>> verts;
                                     for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});
                                     std::string wd_str = t.wikidata ? t.wikidata : "";
