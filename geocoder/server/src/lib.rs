@@ -5538,3 +5538,292 @@ mod pure_helper_tests {
         assert!(decode_polygon_verts(&src, 0, 5).is_none());
     }
 }
+
+/// Query-path tests: a small index in the builder's file layout, written by
+/// TestIndex, loaded by Index::load and asked through Index::query. They pin
+/// how find_admin, find_current_boundaries and find_places are wired together,
+/// which the helper tests cannot see.
+#[cfg(test)]
+mod query_path_tests {
+    use super::*;
+    use s2::cell::Cell;
+    use s2::rect::Rect;
+    use s2::region::RegionCoverer;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The fixtures' origin: everything sits metres north and east of it.
+    const ORIGIN: (f64, f64) = (10.0, 20.0);
+    const COUNTRY_CODE: u16 = (b'x' as u16) << 8 | b'x' as u16;
+    /// Raw f32 vertices (VertexEncoding in builder/src/types.h).
+    const RAW_F32_VERTICES: u8 = 4;
+
+    /// A rectangle in metres from the origin: (south, west, north, east).
+    type Span = (f64, f64, f64, f64);
+
+    fn at(north_m: f64, east_m: f64) -> NodeCoord {
+        let metres_per_lng = METRES_PER_DEGREE * ORIGIN.0.to_radians().cos();
+        NodeCoord {
+            lat: (ORIGIN.0 + north_m / METRES_PER_DEGREE) as f32,
+            lng: (ORIGIN.1 + east_m / metres_per_lng) as f32,
+        }
+    }
+
+    /// (lat_lo, lng_lo, lat_hi, lng_hi) of the points, in degrees.
+    fn bounds(points: &[NodeCoord]) -> (f64, f64, f64, f64) {
+        points.iter().fold((f64::MAX, f64::MAX, f64::MIN, f64::MIN), |(a, b, c, d), p| {
+            (a.min(p.lat as f64), b.min(p.lng as f64), c.max(p.lat as f64), d.max(p.lng as f64))
+        })
+    }
+
+    /// The cells of `level` meeting the box of `points`, widened by a hair so
+    /// a line along a meridian still has width.
+    fn cells_meeting(points: &[NodeCoord], level: u64) -> Vec<u64> {
+        const HAIR: f64 = 1e-6;
+        let (lat_lo, lng_lo, lat_hi, lng_hi) = bounds(points);
+        let rect = Rect::from_degrees(lat_lo - HAIR, lng_lo - HAIR, lat_hi + HAIR, lng_hi + HAIR);
+        let coverer = RegionCoverer { min_level: level as u8, max_level: level as u8, level_mod: 1, max_cells: 1 << 16 };
+        coverer.covering(&rect).0.iter().map(|c| c.0).collect()
+    }
+
+    /// A cell file (u64 cell id, u32 entry offset; sorted) and its entry
+    /// file (u16 count, then the u32 ids) for `cells`.
+    fn cell_files(cells: &BTreeMap<u64, Vec<u32>>) -> (Vec<u8>, Vec<u8>) {
+        let (mut index, mut entries) = (Vec::new(), Vec::new());
+        for (cell, ids) in cells {
+            index.extend_from_slice(&cell.to_le_bytes());
+            index.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+            entries.extend_from_slice(&(ids.len() as u16).to_le_bytes());
+            ids.iter().for_each(|id| entries.extend_from_slice(&id.to_le_bytes()));
+        }
+        (index, entries)
+    }
+
+    #[derive(Default)]
+    struct TestIndex {
+        strings: Vec<u8>,
+        polygons: Vec<(AdminPolygon, Vec<NodeCoord>)>,
+        place_nodes: Vec<PlaceNode>,
+        streets: Vec<(u32, Vec<NodeCoord>)>,
+    }
+
+    impl TestIndex {
+        /// Testland, a country (rank 4) 100 km across around the origin.
+        fn new() -> Self {
+            let mut index = Self::default();
+            index.boundary("Testland", 2, 0, (-50_000.0, -50_000.0, 50_000.0, 50_000.0));
+            index
+        }
+
+        fn string(&mut self, s: &str) -> u32 {
+            let offset = self.strings.len() as u32;
+            self.strings.extend_from_slice(s.as_bytes());
+            self.strings.push(0);
+            offset
+        }
+
+        /// A rectangular boundary; admin_level 15 makes it a place area.
+        fn boundary(&mut self, name: &str, admin_level: u8, place_type_override: u8, (s, w, n, e): Span) -> &mut Self {
+            let ring = vec![at(s, w), at(s, e), at(n, e), at(n, w), at(s, w)];
+            let (lat_lo, lng_lo, lat_hi, lng_hi) = bounds(&ring);
+            let poly = AdminPolygon {
+                vertex_offset: 0, vertex_count: ring.len() as u32, name_id: self.string(name), admin_level,
+                place_type_override, _pad2: 0, _pad3: 0, area: ((lat_hi - lat_lo) * (lng_hi - lng_lo)) as f32,
+                country_code: COUNTRY_CODE, hole_count: 0,
+            };
+            self.polygons.push((poly, ring));
+            self
+        }
+
+        /// A place node of PlaceNode type `place_type`.
+        fn place(&mut self, name: &str, place_type: u8, north_m: f64, east_m: f64) -> &mut Self {
+            let NodeCoord { lat, lng } = at(north_m, east_m);
+            let name_id = self.string(name);
+            self.place_nodes.push(PlaceNode { lat, lng, name_id, place_type, _pad1: 0, _pad2: 0, parent_poly_id: NO_DATA });
+            self
+        }
+
+        /// A named street through points given as (north, east) metres.
+        fn street(&mut self, name: &str, points_m: &[(f64, f64)]) -> &mut Self {
+            let name_id = self.string(name);
+            self.streets.push((name_id, points_m.iter().map(|&(n, e)| at(n, e)).collect()));
+            self
+        }
+
+        /// The files as the builder writes them, by name. A boundary is
+        /// listed in every admin cell meeting its box, flagged interior where
+        /// the cell lies inside it; a place node in its own cell; a street in
+        /// the street cells along it.
+        fn files(&self) -> Vec<(&'static str, Vec<u8>)> {
+            let (mut polygons, mut vertices) = (Vec::new(), Vec::new());
+            let mut admin_cells: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
+            for (id, (poly, ring)) in self.polygons.iter().enumerate() {
+                let (lat_lo, lng_lo, lat_hi, lng_hi) = bounds(ring);
+                polygons.extend_from_slice(&(vertices.len() as u32).to_le_bytes());
+                polygons.extend_from_slice(&poly.vertex_count.to_le_bytes());
+                polygons.extend_from_slice(&poly.name_id.to_le_bytes());
+                polygons.extend_from_slice(&[poly.admin_level, poly.place_type_override, 0, 0]);
+                polygons.extend_from_slice(&poly.area.to_le_bytes());
+                polygons.extend_from_slice(&poly.country_code.to_le_bytes());
+                polygons.extend_from_slice(&poly.hole_count.to_le_bytes());
+                vertices.extend_from_slice(&[RAW_F32_VERTICES, 0]);
+                vertices.extend_from_slice(&(lat_lo as f32).to_le_bytes());
+                vertices.extend_from_slice(&(lng_lo as f32).to_le_bytes());
+                for v in ring {
+                    vertices.extend_from_slice(&v.lat.to_le_bytes());
+                    vertices.extend_from_slice(&v.lng.to_le_bytes());
+                }
+                for cell in cells_meeting(ring, DEFAULT_ADMIN_CELL_LEVEL) {
+                    let b = Cell::from(CellID(cell)).rect_bound();
+                    let interior = b.lat_lo().deg() > lat_lo && b.lat_hi().deg() < lat_hi
+                        && b.lng_lo().deg() > lng_lo && b.lng_hi().deg() < lng_hi;
+                    admin_cells.entry(cell).or_default().push(id as u32 | if interior { INTERIOR_FLAG } else { 0 });
+                }
+            }
+            assert_eq!(polygons.len(), self.polygons.len() * std::mem::size_of::<AdminPolygon>());
+            let (cells, entries) = cell_files(&admin_cells);
+            let mut files = vec![
+                ("admin_polygons.bin", polygons), ("admin_vertices.bin", vertices),
+                ("admin_cells.bin", cells), ("admin_entries.bin", entries),
+            ];
+
+            if !self.place_nodes.is_empty() {
+                let mut nodes = Vec::new();
+                let mut place_cells: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
+                for (id, pn) in self.place_nodes.iter().enumerate() {
+                    nodes.extend_from_slice(&pn.lat.to_le_bytes());
+                    nodes.extend_from_slice(&pn.lng.to_le_bytes());
+                    nodes.extend_from_slice(&pn.name_id.to_le_bytes());
+                    nodes.extend_from_slice(&[pn.place_type, 0, 0, 0]);
+                    nodes.extend_from_slice(&pn.parent_poly_id.to_le_bytes());
+                    let cell = cell_id_at_level(pn.lat as f64, pn.lng as f64, DEFAULT_ADMIN_CELL_LEVEL);
+                    place_cells.entry(cell).or_default().push(id as u32);
+                }
+                assert_eq!(nodes.len(), self.place_nodes.len() * std::mem::size_of::<PlaceNode>());
+                let (cells, entries) = cell_files(&place_cells);
+                files.extend([("place_nodes.bin", nodes), ("place_cells.bin", cells), ("place_entries.bin", entries)]);
+            }
+
+            if !self.streets.is_empty() {
+                let (mut ways, mut nodes) = (Vec::new(), Vec::new());
+                let mut street_cells: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
+                for (id, (name_id, line)) in self.streets.iter().enumerate() {
+                    ways.extend_from_slice(&((nodes.len() / std::mem::size_of::<NodeCoord>()) as u32).to_le_bytes());
+                    ways.extend_from_slice(&(line.len() as u16).to_le_bytes());
+                    ways.extend_from_slice(&[0, 0]);
+                    ways.extend_from_slice(&name_id.to_le_bytes());
+                    for v in line {
+                        nodes.extend_from_slice(&v.lat.to_le_bytes());
+                        nodes.extend_from_slice(&v.lng.to_le_bytes());
+                    }
+                    for segment in line.windows(2) {
+                        for cell in cells_meeting(segment, DEFAULT_STREET_CELL_LEVEL) {
+                            let ids = street_cells.entry(cell).or_default();
+                            if !ids.contains(&(id as u32)) { ids.push(id as u32); }
+                        }
+                    }
+                }
+                assert_eq!(ways.len(), self.streets.len() * std::mem::size_of::<WayHeader>());
+                let (mut geo_cells, mut entries) = (Vec::new(), Vec::new());
+                for (cell, ids) in &street_cells {
+                    geo_cells.extend_from_slice(&cell.to_le_bytes());
+                    geo_cells.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+                    geo_cells.extend_from_slice(&NO_DATA.to_le_bytes());
+                    geo_cells.extend_from_slice(&NO_DATA.to_le_bytes());
+                    entries.extend_from_slice(&(ids.len() as u16).to_le_bytes());
+                    ids.iter().for_each(|id| entries.extend_from_slice(&id.to_le_bytes()));
+                }
+                files.extend([("geo_cells.bin", geo_cells), ("street_entries.bin", entries),
+                              ("street_ways.bin", ways), ("street_nodes.bin", nodes)]);
+            }
+
+            let end = self.strings.len();
+            let tiers: Vec<String> = (0..STR_TIER_COUNT)
+                .map(|t| format!("{{\"start\": {}, \"end\": {}}}", if t == 0 { 0 } else { end }, end))
+                .collect();
+            files.push(("strings_layout.json", format!("{{\"tiers\": [{}]}}", tiers.join(", ")).into_bytes()));
+            files.push(("strings_core.bin", self.strings.clone()));
+            files
+        }
+
+        /// Writes the files into a fresh directory and loads them. The
+        /// directory is removed once loaded; the maps keep the bytes.
+        fn load(&self) -> Index {
+            static DIRS: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir()
+                .join(format!("gc_query_path_{}_{}", std::process::id(), DIRS.fetch_add(1, Ordering::Relaxed)));
+            std::fs::create_dir_all(&dir).unwrap();
+            for (name, bytes) in self.files() {
+                std::fs::write(dir.join(name), bytes).unwrap();
+            }
+            let index = Index::load(dir.to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL,
+                                    DEFAULT_SEARCH_DISTANCE);
+            std::fs::remove_dir_all(&dir).unwrap();
+            index.unwrap()
+        }
+    }
+
+    /// The address dict of the answer at `north_m`, `east_m` from the origin.
+    fn address_at(index: &Index, north_m: f64, east_m: f64) -> serde_json::Value {
+        let p = at(north_m, east_m);
+        serde_json::to_value(index.query(p.lat as f64, p.lng as f64)).unwrap()["address"].clone()
+    }
+
+    #[test]
+    fn query_gates_place_nodes_by_the_promoted_ranks_of_boundaries() {
+        // A level 6 boundary linked to a suburb ranks 20, so its level 7
+        // child ranks 22: the country, not the child, gates the village node
+        // east of the child.
+        let index = TestIndex::new()
+            .boundary("Suburbia", 6, 4, (-5000.0, -5000.0, 5000.0, 5000.0))
+            .boundary("Inner", 7, 0, (-1000.0, -1000.0, 1000.0, 1000.0))
+            .place("Outer Village", 2, 0.0, 1500.0)
+            .load();
+        let address = address_at(&index, 0.0, 0.0);
+        assert_eq!(address["suburb"], "Suburbia");
+        assert_eq!(address["village"], "Outer Village");
+    }
+
+    #[test]
+    fn query_takes_the_nearest_place_node_that_passes_its_boundary() {
+        // Both neighbourhoods' squares cover the point; the nearer lies
+        // outside the town, so the farther one inside it names the point.
+        let index = TestIndex::new()
+            .boundary("Town", 8, 0, (-2000.0, -2000.0, 2000.0, 300.0))
+            .place("Across", 5, 0.0, 350.0)
+            .place("Within", 5, 0.0, -450.0)
+            .load();
+        let address = address_at(&index, 0.0, 0.0);
+        assert_eq!(address["city"], "Town");
+        assert_eq!(address["neighbourhood"], "Within");
+    }
+
+    #[test]
+    fn query_matches_place_nodes_against_the_address_street() {
+        // The hamlet's 1000 m square crosses the street 3 km north of the
+        // point but leaves the point out.
+        let index = TestIndex::new()
+            .street("Long Road", &[(-1000.0, 0.0), (5000.0, 0.0)])
+            .place("Justice", 4, 3000.0, 200.0)
+            .load();
+        let address = address_at(&index, 0.0, 20.0);
+        assert_eq!(address["road"], "Long Road");
+        assert_eq!(address["hamlet"], "Justice");
+    }
+
+    #[test]
+    fn query_leaves_the_ranks_its_boundaries_hold_to_them() {
+        // The district, linked to a suburb, ranks 20 and promotes the hamlet
+        // inside it to 22, the rank its level 7 ward holds: the ward takes the
+        // rank and the hamlet names nothing (Zhongpo in Taipei).
+        let index = TestIndex::new()
+            .boundary("Daan", 6, 4, (-3000.0, -3000.0, 3000.0, 3000.0))
+            .boundary("Ward", 7, 0, (-1500.0, -1500.0, 1500.0, 1500.0))
+            .place("Zhongpo", 4, 0.0, 400.0)
+            .load();
+        let address = address_at(&index, 0.0, 0.0);
+        assert_eq!(address["suburb"], "Daan");
+        assert_eq!(address["neighbourhood"], "Ward");
+        assert_eq!(address.get("hamlet"), None);
+    }
+}
