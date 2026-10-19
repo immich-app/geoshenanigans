@@ -53,6 +53,24 @@ impl FileBytes {
         }
     }
 
+    /// Hints that the byte at `off` is read soon, so its cache miss can overlap other work. Never
+    /// changes what a read returns; a no-op past the end and on targets other than x86_64.
+    #[inline]
+    pub fn prefetch(&self, off: u64) {
+        let bytes: &[u8] = match self {
+            Self::Owned(v) => v,
+            Self::Mmap(m) => m,
+        };
+        let Some(byte) = bytes.get(off as usize) else { return };
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: a prefetch reads nothing back and never faults.
+        unsafe {
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>((byte as *const u8).cast())
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = byte;
+    }
+
     /// Read a `Copy` record at index `idx` (byte offset = idx * sizeof T)
     /// via a pointer cast through read_unaligned.
     pub fn read_at<T: Copy>(&self, idx: u64) -> T {
@@ -915,12 +933,24 @@ impl AdminScan {
         let cells: Vec<u64> = std::iter::once(cell).chain(cell_neighbors_at_level(cell, index.admin_cell_level)).collect();
         let mut lists = vec![NO_DATA; cells.len()];
         Index::lookup_admin_cells_fb(&index.admin_cells, &cells, &mut lists);
+        // Each list, each record and most ring headers are read below wherever the point is, so
+        // they are requested before the first one is needed: their cache misses overlap.
+        for &list in &lists {
+            if list != NO_DATA { index.admin_entries.prefetch(list as u64); }
+        }
+        let record_bytes = std::mem::size_of::<AdminPolygon>() as u64;
+        for &list in &lists {
+            Index::for_each_entry_fb(&index.admin_entries, list, |id| index.admin_polygons.prefetch((id & ID_MASK) as u64 * record_bytes));
+        }
         let (mut rings, mut own_cell_rings) = (Vec::new(), 0);
         for (k, &list) in lists.iter().enumerate() {
             Index::for_each_entry_fb(&index.admin_entries, list, |id| {
                 if let Some(poly) = index.admin_polygon(id & ID_MASK) { rings.push((id, poly)); }
             });
             if k == 0 { own_cell_rings = rings.len(); }
+        }
+        for (_, poly) in &rings {
+            if poly.vertex_offset != NO_DATA { index.admin_vertices.prefetch(poly.vertex_offset as u64); }
         }
         AdminScan { rings, own_cell_rings, pip: PipMemo::new(lat, lng) }
     }
@@ -6854,6 +6884,35 @@ mod admin_scan_tests {
         // No admin_parents: the chain lookup falls back to find_admin over the same scan.
         let c = idx.find_admin_from_chain_in(0, &mut scan);
         assert_eq!((c.country, c.state, c.neighbourhood), (Some("Egypt"), Some("New Valley"), Some("Bir Tarfawi")));
+    }
+
+    #[test]
+    fn admin_scan_keeps_the_own_cells_rings_first() {
+        let new_valley = (22.0, 25.0, 27.7, 32.7);
+        let scan = AdminScan::new(&admin_index(&[ring("Egypt", 2, 97.0, EGYPT, &[(0, true)])]), Q.0, Q.1);
+        assert_eq!((scan.own_cell_rings, scan.rings.len()), (1, 1));
+        // The own cell absent from the index.
+        let scan = AdminScan::new(&admin_index(&[ring("Egypt", 2, 97.0, EGYPT, &[(3, true), (5, false)])]), Q.0, Q.1);
+        assert_eq!((scan.own_cell_rings, scan.rings.len()), (0, 2));
+        let idx = admin_index(&[
+            ring("Egypt", 2, 97.0, EGYPT, &[(5, false), (0, true)]),
+            ring("New Valley", 4, 38.8, new_valley, &[(8, false), (0, false)]),
+        ]);
+        let scan = AdminScan::new(&idx, Q.0, Q.1);
+        assert_eq!((scan.own_cell_rings, scan.rings.len()), (2, 4));
+        let names: Vec<&str> = scan.rings.iter().map(|(_, p)| idx.get_string(p.name_id)).collect();
+        // A cell's entries in value order (the interior flag is the high bit), cells in visiting order.
+        assert_eq!(names, ["New Valley", "Egypt", "Egypt", "New Valley"]);
+    }
+
+    #[test]
+    fn prefetch_reads_nothing_and_accepts_any_offset() {
+        for src in [FileBytes::Owned(Vec::new()), FileBytes::Owned(vec![1, 2, 3])] {
+            for off in [0, 2, 3, u64::MAX] { src.prefetch(off); }
+        }
+        let src = FileBytes::Owned(vec![1, 2, 3]);
+        src.prefetch(1);
+        assert_eq!(&src.read_chunk(0, 3)[..], &[1, 2, 3]);
     }
 
     #[test]
