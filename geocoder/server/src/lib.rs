@@ -4007,17 +4007,18 @@ pub fn poi_order(a: &PoiMatch<'_>, b: &PoiMatch<'_>) -> std::cmp::Ordering {
 ///   rank_search ≤ 19 (village): 2000 m  (place=suburb default too)
 ///   rank_search ≤ 20 (hamlet):  1000 m  (neighbourhood / quarter)
 ///   default:                     500 m
-/// The envelope is a bbox over two geodesic points at 45° / 225° from the
-/// centre, so the half-side = radius/√2.
+/// The area is expand_by_meters: the envelope of ST_Buffer(geography, radius,
+/// 1), a square whose corners lie on the axes at the radius, so the half-side
+/// is the radius. (Lambton is 726 m east of the quarter Paekākā in Wellington
+/// and Nominatim's answer has both.)
 pub fn place_fuzzy_half_side_m(pt: usize) -> f64 {
-    let r = match pt {
+    match pt {
         0 => 15000.0,              // city
         1 => 4000.0,               // town
         2 | 3 => 2000.0,           // village / suburb (rank_search ≤ 19)
         4 | 5 | 6 => 1000.0,       // hamlet / neighbourhood / quarter
         _ => 500.0,
-    };
-    r / std::f64::consts::SQRT_2
+    }
 }
 
 /// Nominatim's address walk over place nodes (insert_addresslines): ranks in
@@ -4870,13 +4871,16 @@ mod pure_helper_tests {
 
     #[test]
     fn place_nodes_neighbourhood_must_sit_in_the_quarter_fuzzy_area() {
-        // 1000 m / √2 is the quarter's half side: 800 m east is outside.
+        // 1000 m is the quarter's half side: 1100 m east is outside.
         let mut nodes = [None; 7];
         nodes[6] = node_at(0.0, 1.0);
-        nodes[5] = node_at(800.0, 2.0);
+        nodes[5] = node_at(1100.0, 2.0);
         assert_eq!(accept_place_nodes(&nodes, false, |_| true), [false, false, false, false, false, false, true]);
         // Without an admissible quarter nothing holds the neighbourhood.
         assert_eq!(accept_place_nodes(&nodes, false, |pt| pt != 6), [false, false, false, false, false, true, false]);
+        // 900 m east is inside: the half side is the radius, not radius / √2.
+        nodes[5] = node_at(900.0, 2.0);
+        assert_eq!(accept_place_nodes(&nodes, false, |_| true), [false, false, false, false, false, true, true]);
     }
 
     #[test]
@@ -4894,13 +4898,13 @@ mod pure_helper_tests {
 
     #[test]
     fn place_nodes_rank_16_node_holds_the_suburb() {
-        // A village's fuzzy half side is 2000 m / √2: a suburb 1500 m away
-        // stays out, one 1000 m away comes in.
+        // A village's fuzzy half side is 2000 m: a suburb 2100 m away stays
+        // out, one 1500 m away comes in.
         let mut nodes = [None; 7];
         nodes[2] = node_at(0.0, 1.0);
-        nodes[3] = node_at(1500.0, 1.0);
+        nodes[3] = node_at(2100.0, 1.0);
         assert_eq!(accept_place_nodes(&nodes, false, |_| true), [false, false, true, false, false, false, false]);
-        nodes[3] = node_at(1000.0, 1.0);
+        nodes[3] = node_at(1500.0, 1.0);
         assert_eq!(accept_place_nodes(&nodes, false, |_| true), [false, false, true, true, false, false, false]);
     }
 
