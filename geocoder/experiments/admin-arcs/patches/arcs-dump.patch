@@ -1,0 +1,243 @@
+From d3ad25b3c5b140fc7cda3e044db84e10f7a1646e Mon Sep 17 00:00:00 2001
+From: Zack <zack@futo.org>
+Date: Mon, 19 Oct 2026 01:19:29 +0200
+Subject: [PATCH] chore(builder): arcs study dump hooks
+
+---
+ geocoder/builder/src/build_index.cpp   | 80 ++++++++++++++++++++++++++
+ geocoder/builder/src/ring_assembly.cpp | 18 ++++--
+ geocoder/builder/src/ring_assembly.h   |  1 +
+ 3 files changed, 95 insertions(+), 4 deletions(-)
+
+diff --git a/geocoder/builder/src/build_index.cpp b/geocoder/builder/src/build_index.cpp
+index c2a61f0..a928f81 100644
+--- a/geocoder/builder/src/build_index.cpp
++++ b/geocoder/builder/src/build_index.cpp
+@@ -45,6 +45,33 @@
+ 
+ #include "s2_helpers.h"
+ #include "ring_assembly.h"
++
++// arcs study (GC_ARC_DUMP): rings as assembled, with the member way of each edge.
++namespace arcdump {
++inline const char* dir() {
++    static const char* d = std::getenv("GC_ARC_DUMP");
++    return d;
++}
++template <class T>
++inline void put(std::vector<uint8_t>& b, T v) {
++    const size_t o = b.size();
++    b.resize(o + sizeof(T));
++    std::memcpy(&b[o], &v, sizeof(T));
++}
++inline void ring(std::vector<uint8_t>& b, const std::vector<std::pair<double, double>>& r,
++                 const std::vector<int64_t>& ways) {
++    put<uint32_t>(b, static_cast<uint32_t>(r.size()));
++    for (const auto& p : r) put<int32_t>(b, static_cast<int32_t>(std::lround(p.first * 1e7)));
++    for (const auto& p : r) put<int32_t>(b, static_cast<int32_t>(std::lround(p.second * 1e7)));
++    for (size_t k = 0; k + 1 < r.size(); k++) put<int64_t>(b, k < ways.size() ? ways[k] : 0);
++}
++inline void flush(std::vector<uint8_t>& b, const std::string& name) {
++    if (b.empty()) return;
++    std::ofstream f(std::string(dir()) + "/" + name, std::ios::binary | std::ios::app);
++    f.write(reinterpret_cast<const char*>(b.data()), static_cast<std::streamsize>(b.size()));
++    b.clear();
++}
++}  // namespace arcdump
+ #include "continent_boundaries.h"
+ #include "interpolation.h"
+ #include "continent_filter.h"
+@@ -1785,6 +1812,21 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
+             }
+         };
+         auto write_quality_dirs = [&] {
++            // arcs study: the planet's final admin arrays, raw (GC_TIER_DUMP=<dir>).
++            if (run == RegionRun::Planet) {
++                if (const char* dump = std::getenv("GC_TIER_DUMP")) {
++                    ensure_dir(dump);
++                    auto put = [&](const char* name, const void* p, size_t bytes) {
++                        write_binary_file(std::string(dump) + "/" + name, static_cast<const char*>(p), bytes);
++                    };
++                    put("admin_polygons.raw", d.admin_polygons.data(), d.admin_polygons.size() * sizeof(AdminPolygon));
++                    put("admin_vertices.raw", d.admin_vertices.data(), d.admin_vertices.size() * sizeof(NodeCoord));
++                    put("admin_osm_ids.raw", d.admin_osm_ids.data(), d.admin_osm_ids.size() * sizeof(uint64_t));
++                    put("admin_parent_ids.raw", d.admin_parent_ids.data(), d.admin_parent_ids.size() * sizeof(uint32_t));
++                    std::cerr << "tier dump: " << d.admin_polygons.size() << " polygons, " << d.admin_vertices.size()
++                              << " vertices -> " << dump << std::endl;
++                }
++            }
+             // Write quality variants (each gets admin_polygons + admin_vertices)
+             if (multi_quality) {
+                 std::string quality_dir = multi_output ? base_dir + "/quality" : base_dir;
+@@ -4115,6 +4157,16 @@ static int run(int argc, char* argv[]) {
+                             }
+                             if (pto == 0) pto = cwa.fallback_place_type;
+                             const char* cc = cwa.country_code.empty() ? nullptr : cwa.country_code.c_str();
++                            if (arcdump::dir()) {
++                                std::vector<uint8_t> b;
++                                arcdump::put<uint8_t>(b, 2);
++                                arcdump::put<int64_t>(b, cwa.way_id);
++                                arcdump::put<uint16_t>(b, 0);
++                                arcdump::put<uint8_t>(b, cwa.admin_level);
++                                arcdump::put<uint16_t>(b, 0);
++                                arcdump::ring(b, cwa.vertices, std::vector<int64_t>(cwa.vertices.size(), cwa.way_id));
++                                arcdump::flush(b, "rings.way.bin");
++                            }
+                             add_admin_polygon(data, cwa.vertices, cwa.name.c_str(),
+                                               cwa.admin_level, cc, &admin_pool, pto,
+                                               cwa.way_id);
+@@ -4205,6 +4257,8 @@ static int run(int argc, char* argv[]) {
+                     for (unsigned int t = 0; t < num_threads; t++) {
+                         admin_workers.emplace_back([&, t]() {
+                             auto& local_results = thread_admin_results[t];
++                            std::vector<uint8_t> arc_buf;
++                            const std::string arc_file = "rings.rel." + std::to_string(t) + ".bin";
+                             while (true) {
+                                 size_t k = rel_idx.fetch_add(1);
+                                 if (k >= data.collected_relations.size()) break;
+@@ -4246,6 +4300,19 @@ static int run(int argc, char* argv[]) {
+                                 const std::vector<int> around = enclosing_rings(assembled.rings);
+                                 const std::vector<int> depth = ring_depths(around);
+                                 nesting.count(assembled, depth);
++                                std::vector<std::vector<int64_t>> arc_outer_ways;
++                                std::vector<std::vector<std::vector<int64_t>>> arc_hole_ways;
++                                if (arcdump::dir()) {
++                                    std::vector<int> pof(depth.size(), -1);
++                                    for (size_t r = 0; r < depth.size(); r++) {
++                                        if (depth[r] % 2) continue;
++                                        pof[r] = static_cast<int>(arc_outer_ways.size());
++                                        arc_outer_ways.push_back(assembled.ring_ways[r]);
++                                        arc_hole_ways.emplace_back();
++                                    }
++                                    for (size_t r = 0; r < depth.size(); r++)
++                                        if (depth[r] % 2) arc_hole_ways[pof[around[r]]].push_back(assembled.ring_ways[r]);
++                                }
+                                 std::vector<NestedPolygon> polygons =
+                                     nest_rings(std::move(assembled.rings), around, depth);
+ 
+@@ -4335,6 +4402,18 @@ static int run(int argc, char* argv[]) {
+                                 for (auto& polygon : polygons) {
+                                     if (polygon.outer.size() >= 3) {
+                                         AdminResult ar;
++                                        if (arcdump::dir()) {
++                                            const size_t pi = &polygon - polygons.data();
++                                            arcdump::put<uint8_t>(arc_buf, 3);
++                                            arcdump::put<int64_t>(arc_buf, rel.id);
++                                            arcdump::put<uint16_t>(arc_buf, ring_idx);
++                                            arcdump::put<uint8_t>(arc_buf, rel.admin_level);
++                                            arcdump::put<uint16_t>(arc_buf, static_cast<uint16_t>(polygon.holes.size()));
++                                            arcdump::ring(arc_buf, polygon.outer, arc_outer_ways[pi]);
++                                            for (size_t h = 0; h < polygon.holes.size(); h++)
++                                                arcdump::ring(arc_buf, polygon.holes[h], arc_hole_ways[pi][h]);
++                                            if (arc_buf.size() > (64u << 20)) arcdump::flush(arc_buf, arc_file);
++                                        }
+                                         ar.vertices = std::move(polygon.outer);
+                                         ar.holes = std::move(polygon.holes);
+                                         ar.name = rel.name;
+@@ -4354,6 +4433,7 @@ static int run(int argc, char* argv[]) {
+                                               << "K admin relations..." << std::endl;
+                                 }
+                             }
++                            if (arcdump::dir()) arcdump::flush(arc_buf, arc_file);
+                         });
+                     }
+                     for (auto& w : admin_workers) w.join();
+diff --git a/geocoder/builder/src/ring_assembly.cpp b/geocoder/builder/src/ring_assembly.cpp
+index f4d6f85..011425f 100644
+--- a/geocoder/builder/src/ring_assembly.cpp
++++ b/geocoder/builder/src/ring_assembly.cpp
+@@ -12,6 +12,7 @@ using Coords = std::vector<std::pair<double,double>>;
+ struct SubWay {
+     Coords coords;
+     uint8_t roles = 0;  // RingRole bit of the member way it comes from
++    int64_t way_id = 0;  // arcs study
+ };
+ 
+ int64_t key_of(const std::pair<double,double>& p) { return coord_key(p.first, p.second); }
+@@ -24,7 +25,8 @@ uint8_t role_bit(const std::string& role) {
+ 
+ // The ways cut at their endpoints and at every coordinate more than one way
+ // (or one way twice) passes through, so sub-ways only meet at their ends.
+-std::vector<SubWay> split_sub_ways(const std::vector<CoordSpan>& way_coords, const std::vector<uint8_t>& way_roles) {
++std::vector<SubWay> split_sub_ways(const std::vector<CoordSpan>& way_coords, const std::vector<uint8_t>& way_roles,
++                                   const std::vector<int64_t>& way_ids = {}) {
+     std::unordered_map<int64_t, int> coord_count;
+     for (const CoordSpan& coords : way_coords)
+         for (const auto& p : coords) coord_count[key_of(p)]++;
+@@ -44,12 +46,14 @@ std::vector<SubWay> split_sub_ways(const std::vector<CoordSpan>& way_coords, con
+         size_t seg_start = 0;
+         for (size_t i = 1; i < coords.size(); i++) {
+             if (split_points.count(key_of(coords[i])) && i > seg_start) {
+-                sub_ways.push_back({Coords(coords.begin() + seg_start, coords.begin() + i + 1), way_roles[w]});
++                sub_ways.push_back({Coords(coords.begin() + seg_start, coords.begin() + i + 1), way_roles[w],
++                                    way_ids.empty() ? 0 : way_ids[w]});
+                 seg_start = i;
+             }
+         }
+         if (seg_start < coords.size() - 1) {
+-            sub_ways.push_back({Coords(coords.begin() + seg_start, coords.end()), way_roles[w]});
++            sub_ways.push_back({Coords(coords.begin() + seg_start, coords.end()), way_roles[w],
++                                way_ids.empty() ? 0 : way_ids[w]});
+         }
+     }
+     return sub_ways;
+@@ -282,13 +286,15 @@ AreaRings assemble_area_rings(const std::vector<std::pair<int64_t, std::string>>
+     AreaRings out;
+     std::vector<CoordSpan> way_coords;
+     std::vector<uint8_t> way_roles;
++    std::vector<int64_t> way_ids;
+     for (const auto& [way_id, role] : members) {
+         const auto* way = way_geoms.find(way_id);
+         if (!way || way->count == 0) continue;
+         way_coords.push_back(way_geoms.coords_of(*way));
+         way_roles.push_back(role_bit(role));
++        way_ids.push_back(way_id);
+     }
+-    std::vector<SubWay> sub_ways = split_sub_ways(way_coords, way_roles);
++    std::vector<SubWay> sub_ways = split_sub_ways(way_coords, way_roles, way_ids);
+     out.cancelled_sub_ways = cancel_duplicate_sub_ways(sub_ways);
+ 
+     // Sub-ways by end coordinate, in sub-way order (a closed one twice).
+@@ -357,10 +363,12 @@ AreaRings assemble_area_rings(const std::vector<std::pair<int64_t, std::string>>
+             }
+             const size_t from = seen->second;
+             Coords ring;
++            std::vector<int64_t> ring_way;
+             uint8_t roles = 0;
+             for (size_t k = from; k < steps.size(); k++) {
+                 const SubWay& sw = sub_ways[steps[k].sub_way];
+                 roles |= sw.roles;
++                ring_way.insert(ring_way.end(), sw.coords.size() - 1, sw.way_id);
+                 const size_t skip = ring.empty() ? 0 : 1;
+                 if (!steps[k].reversed) ring.insert(ring.end(), sw.coords.begin() + skip, sw.coords.end());
+                 else ring.insert(ring.end(), sw.coords.rbegin() + skip, sw.coords.rend());
+@@ -371,12 +379,14 @@ AreaRings assemble_area_rings(const std::vector<std::pair<int64_t, std::string>>
+             if (ring.size() < 4) continue;
+             out.rings.push_back(std::move(ring));
+             out.roles.push_back(roles);
++            out.ring_ways.push_back(std::move(ring_way));
+         }
+     }
+     // Nor does osmium take an area whose segments cross.
+     if (rings_cross(out.rings)) {
+         out.rings.clear();
+         out.roles.clear();
++        out.ring_ways.clear();
+         out.failure = AreaFailure::Crossing;
+     }
+     return out;
+diff --git a/geocoder/builder/src/ring_assembly.h b/geocoder/builder/src/ring_assembly.h
+index 0d5b0f8..8638bb8 100644
+--- a/geocoder/builder/src/ring_assembly.h
++++ b/geocoder/builder/src/ring_assembly.h
+@@ -22,6 +22,7 @@ struct AreaRings {
+     std::vector<uint8_t> roles;      // per ring: RingRole bits of the ways it runs along
+     uint32_t cancelled_sub_ways = 0; // duplicates dropped in pairs
+     AreaFailure failure = AreaFailure::None;  // set: no rings
++    std::vector<std::vector<int64_t>> ring_ways;  // arcs study: per ring, the member way of each edge
+ };
+ 
+ // Every closed ring a relation's member ways form, whatever their roles, or
+-- 
+2.43.0
+

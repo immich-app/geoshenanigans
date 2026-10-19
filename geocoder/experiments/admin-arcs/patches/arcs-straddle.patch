@@ -1,0 +1,202 @@
+From 626a56874c4fb3f9edfbe4ce1421f58dbfe02eea Mon Sep 17 00:00:00 2001
+From: Zack <zack@futo.org>
+Date: Mon, 19 Oct 2026 04:57:41 +0200
+Subject: [PATCH] perf(geocoder): integer straddle test in point-in-polygon
+
+A vertex decodes to f32(base + k * scale), monotone in k, so the straddle test is an integer compare against the point threshold; only straddling edges decode. Same answers on 419,221 points x 2 sets, per-polygon and arc files.
+---
+ geocoder/server/src/lib.rs | 95 ++++++++++++++++++++++++++++----------
+ 1 file changed, 70 insertions(+), 25 deletions(-)
+
+diff --git a/geocoder/server/src/lib.rs b/geocoder/server/src/lib.rs
+index 40a1fb6..4cafd8a 100644
+--- a/geocoder/server/src/lib.rs
++++ b/geocoder/server/src/lib.rs
+@@ -4093,17 +4093,55 @@ pub fn point_in_encoded_polygon(src: &FileBytes, vertex_offset: u32, vertex_coun
+     let scale = vertex_scale(encoding);
+     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[i], b[i + 1]]) as f64;
+     let u32_at = |b: &[u8], i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
++    let _ = u16_at;
+     Some(match encoding {
+         4 => pip_vertices(&bytes, 8, lat, lng, |b| (f32::from_bits(u32_at(b, 0)), f32::from_bits(u32_at(b, 4)))),
+-        3 => pip_vertices(&bytes, 8, lat, lng, |b| {
+-            ((bmin_lat + u32_at(b, 0) as f64 * scale) as f32, (bmin_lng + u32_at(b, 4) as f64 * scale) as f32)
+-        }),
+-        _ => pip_vertices(&bytes, 4, lat, lng, |b| {
+-            ((bmin_lat + u16_at(b, 0) * scale) as f32, (bmin_lng + u16_at(b, 2) * scale) as f32)
++        3 => pip_grid(&bytes, 8, lat, lng, bmin_lat, bmin_lng, scale, |b| (u32_at(b, 0) as i64, u32_at(b, 4) as i64)),
++        _ => pip_grid(&bytes, 4, lat, lng, bmin_lat, bmin_lng, scale, |b| {
++            (u16::from_le_bytes([b[0], b[1]]) as i64, u16::from_le_bytes([b[2], b[3]]) as i64)
+         }),
+     })
+ }
+ 
++/// Largest k with (base + k * scale) as f32 <= x. The decoded value is monotone in k, so a vertex
++/// decodes above x exactly when its k is above this threshold.
++#[inline]
++pub fn grid_threshold(x: f32, base: f64, scale: f64) -> i64 {
++    let mut k = ((x as f64 - base) / scale).floor() as i64;
++    while ((base + k as f64 * scale) as f32) > x { k -= 1; }
++    while ((base + (k + 1) as f64 * scale) as f32) <= x { k += 1; }
++    k
++}
++
++/// `pip_vertices` over quantized vertices (k_lat, k_lng) decoding to f32(bmin + k * scale): the
++/// straddle test runs on the integers, only straddling edges decode (same answers).
++#[inline]
++fn pip_grid(bytes: &[u8], stride: usize, lat: f32, lng: f32, bmin_lat: f64, bmin_lng: f64, scale: f64,
++            at: impl Fn(&[u8]) -> (i64, i64)) -> bool {
++    let t = grid_threshold(lng, bmin_lng, scale);
++    let n = bytes.len() / stride;
++    let mut inside = false;
++    let (mut kj_lat, mut kj_lng) = at(&bytes[(n - 1) * stride..]);
++    let mut j_above = kj_lng > t;
++    for c in bytes.chunks_exact(stride) {
++        let (ki_lat, ki_lng) = at(c);
++        let i_above = ki_lng > t;
++        if i_above != j_above {
++            let vi_lat = (bmin_lat + ki_lat as f64 * scale) as f32;
++            let vi_lng = (bmin_lng + ki_lng as f64 * scale) as f32;
++            let vj_lat = (bmin_lat + kj_lat as f64 * scale) as f32;
++            let vj_lng = (bmin_lng + kj_lng as f64 * scale) as f32;
++            if lat < (vj_lat - vi_lat) * (lng - vi_lng) / (vj_lng - vi_lng) + vi_lat {
++                inside = !inside;
++            }
++        }
++        kj_lat = ki_lat;
++        kj_lng = ki_lng;
++        j_above = i_above;
++    }
++    inside
++}
++
+ /// The `point_in_polygon` ray cast over packed vertices of one encoding (`at` decodes one).
+ #[inline]
+ fn pip_vertices(bytes: &[u8], stride: usize, lat: f32, lng: f32, at: impl Fn(&[u8]) -> (f32, f32)) -> bool {
+@@ -4148,6 +4186,7 @@ struct ArcCache {
+     point: (u32, u32),
+     slots: Vec<(u32, u32, bool)>, // (generation, arc, parity)
+     stats: [u64; 4],              // arcs decoded, bbox skips, cache hits, vertices decoded
++    t_lng: i64,                   // grid_threshold of the point's lng on the arc grid
+ }
+ 
+ thread_local! {
+@@ -4156,6 +4195,7 @@ thread_local! {
+         point: (u32::MAX, u32::MAX),
+         slots: vec![(0, 0, false); ARC_CACHE_SLOTS],
+         stats: [0; 4],
++        t_lng: 0,
+     });
+ }
+ 
+@@ -4181,7 +4221,7 @@ impl ArcData {
+     /// Crossing parity of one arc's edges for the ray from (lat, lng) towards +lat, with
+     /// point_in_polygon's edge test (vi = this vertex, vj = the previous one).
+     /// Returns the parity and the vertices decoded (0: skipped by the bbox).
+-    fn arc_parity(&self, arc: u32, lat: f32, lng: f32) -> (bool, usize) {
++    fn arc_parity(&self, arc: u32, lat: f32, lng: f32, t_lng: i64) -> (bool, usize) {
+         let ix = self.index.read_chunk(arc as u64 * 4, 8);
+         let off = Self::u32_at(&ix, 0) as u64;
+         let end = Self::u32_at(&ix, 4) as u64;
+@@ -4193,11 +4233,12 @@ impl ArcData {
+         let f = |x: i32| (x as f64 * q) as f32;
+         let mut hdr = 9;
+         if flags & 0x80 != 0 {
+-            let min_lng = f(Self::u32_at(&blk, 17) as i32);
+-            let max_lng = f(Self::u32_at(&blk, 21) as i32);
++            let min_lng = Self::u32_at(&blk, 17) as i32 as i64;
++            let max_lng = Self::u32_at(&blk, 21) as i32 as i64;
+             let max_lat = f(Self::u32_at(&blk, 13) as i32);
+-            // No edge straddles the point's longitude, or every crossing is below the point.
+-            if lng < min_lng || lng >= max_lng || lat > max_lat + 1e-4 {
++            // No edge straddles the point's longitude (every vertex on one side of it), or every
++            // crossing is below the point.
++            if t_lng < min_lng || t_lng >= max_lng || lat > max_lat + 1e-4 {
+                 return (false, 0);
+             }
+             hdr = 25;
+@@ -4205,9 +4246,9 @@ impl ArcData {
+         let m = (blk.len() - hdr) / (2 * w);
+         let q0 = (Self::u32_at(&blk, 1) as i32, Self::u32_at(&blk, 5) as i32);
+         let p = match w {
+-            1 => arc_scan::<1>(&blk, hdr, m, q0, q, lat, lng),
+-            2 => arc_scan::<2>(&blk, hdr, m, q0, q, lat, lng),
+-            _ => arc_scan::<4>(&blk, hdr, m, q0, q, lat, lng),
++            1 => arc_scan::<1>(&blk, hdr, m, q0, q, lat, lng, t_lng),
++            2 => arc_scan::<2>(&blk, hdr, m, q0, q, lat, lng, t_lng),
++            _ => arc_scan::<4>(&blk, hdr, m, q0, q, lat, lng, t_lng),
+         };
+         (p, m + 1)
+     }
+@@ -4225,6 +4266,7 @@ impl ArcData {
+             let key = (lat.to_bits(), lng.to_bits());
+             if c.point != key {
+                 c.point = key;
++                c.t_lng = grid_threshold(lng, 0.0, self.q);
+                 c.generation = c.generation.wrapping_add(1);
+                 if c.generation == 0 {
+                     c.slots.iter_mut().for_each(|s| s.0 = 0);
+@@ -4232,6 +4274,7 @@ impl ArcData {
+                 }
+             }
+             let gen = c.generation;
++            let t_lng = c.t_lng;
+             let mut inside = false;
+             let mut pos = 0;
+             for _ in 0..rings {
+@@ -4246,7 +4289,7 @@ impl ArcData {
+                         c.stats[2] += 1;
+                         s.2
+                     } else {
+-                        let (p, n) = self.arc_parity(arc, lat, lng);
++                        let (p, n) = self.arc_parity(arc, lat, lng, t_lng);
+                         if n == 0 { c.stats[1] += 1; } else { c.stats[0] += 1; c.stats[3] += n as u64; }
+                         c.slots[slot] = (gen, arc, p);
+                         p
+@@ -4260,12 +4303,11 @@ impl ArcData {
+ }
+ 
+ #[inline]
+-fn arc_scan<const W: usize>(blk: &[u8], hdr: usize, m: usize, q0: (i32, i32), q: f64, lat: f32, lng: f32) -> bool {
++fn arc_scan<const W: usize>(blk: &[u8], hdr: usize, m: usize, q0: (i32, i32), q: f64, lat: f32, lng: f32, t_lng: i64) -> bool {
+     let unzz = |z: u64| -> i64 { ((z >> 1) as i64) ^ -((z & 1) as i64) };
+     let mut ql = q0.0 as i64;
+     let mut qg = q0.1 as i64;
+-    let mut vj_lat = (ql as f64 * q) as f32;
+-    let mut vj_lng = (qg as f64 * q) as f32;
++    let mut j_above = qg > t_lng;
+     let lat_planes = &blk[hdr..hdr + W * m];
+     let lng_planes = &blk[hdr + W * m..hdr + 2 * W * m];
+     let mut inside = false;
+@@ -4276,17 +4318,20 @@ fn arc_scan<const W: usize>(blk: &[u8], hdr: usize, m: usize, q0: (i32, i32), q:
+             zl |= (lat_planes[b * m + i] as u64) << (8 * b);
+             zg |= (lng_planes[b * m + i] as u64) << (8 * b);
+         }
++        let (pl, pg) = (ql, qg);
+         ql += unzz(zl);
+         qg += unzz(zg);
+-        let vi_lat = (ql as f64 * q) as f32;
+-        let vi_lng = (qg as f64 * q) as f32;
+-        if ((vi_lng > lng) != (vj_lng > lng))
+-            && (lat < (vj_lat - vi_lat) * (lng - vi_lng) / (vj_lng - vi_lng) + vi_lat)
+-        {
+-            inside = !inside;
++        let i_above = qg > t_lng;
++        if i_above != j_above {
++            let vi_lat = (ql as f64 * q) as f32;
++            let vi_lng = (qg as f64 * q) as f32;
++            let vj_lat = (pl as f64 * q) as f32;
++            let vj_lng = (pg as f64 * q) as f32;
++            if lat < (vj_lat - vi_lat) * (lng - vi_lng) / (vj_lng - vi_lng) + vi_lat {
++                inside = !inside;
++            }
+         }
+-        vj_lat = vi_lat;
+-        vj_lng = vi_lng;
++        j_above = i_above;
+     }
+     inside
+ }
+-- 
+2.43.0
+

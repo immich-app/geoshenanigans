@@ -1,0 +1,78 @@
+From 7c7cecff14648c0476afb64b839d155ad62794fb Mon Sep 17 00:00:00 2001
+From: Zack <zack@futo.org>
+Date: Mon, 19 Oct 2026 05:48:42 +0200
+Subject: [PATCH] perf(geocoder): chunk bboxes in arc refs
+
+A ring of more than G refs carries the union bbox of each run of G arcs; runs the point cannot cross are skipped without touching their arcs. Same answers on 419,221 points x 2 sets.
+---
+ geocoder/server/src/lib.rs | 31 +++++++++++++++++++++++++++----
+ 1 file changed, 27 insertions(+), 4 deletions(-)
+
+diff --git a/geocoder/server/src/lib.rs b/geocoder/server/src/lib.rs
+index 4cafd8a..282978b 100644
+--- a/geocoder/server/src/lib.rs
++++ b/geocoder/server/src/lib.rs
+@@ -4177,6 +4177,7 @@ pub struct ArcData {
+     pub index: FileBytes,
+     pub refs: FileBytes,
+     pub q: f64,
++    pub chunk: usize,
+ }
+ 
+ const ARC_CACHE_SLOTS: usize = 1 << 12;
+@@ -4211,7 +4212,8 @@ impl ArcData {
+         let refs = mmap_file_optional(&format!("{}/poly_arcs.bin", dir))?;
+         let meta = std::fs::read_to_string(format!("{}/arc_meta.json", dir)).ok()?;
+         let v: serde_json::Value = serde_json::from_str(&meta).ok()?;
+-        Some(ArcData { vertices, index, refs, q: v["q"].as_f64()? })
++        let chunk = v["chunk"].as_u64().unwrap_or(0) as usize;
++        Some(ArcData { vertices, index, refs, q: v["q"].as_f64()?, chunk })
+     }
+ 
+     fn u32_at(b: &[u8], i: usize) -> u32 {
+@@ -4257,10 +4259,15 @@ impl ArcData {
+     pub fn contains(&self, poly: &AdminPolygon, lat: f32, lng: f32) -> bool {
+         if poly.vertex_count == 0 || poly.vertex_offset == NO_DATA { return false; }
+         let rings = poly.hole_count as usize + 1;
+-        let len = (rings + poly.vertex_count as usize) * 4;
++        let nrefs = poly.vertex_count as usize;
++        let mut len = (rings + nrefs) * 4;
++        if self.chunk > 0 { len += 12 * (nrefs / self.chunk + rings); }
+         let off = poly.vertex_offset as u64;
+-        if off + len as u64 > self.refs.len() { return false; }
++        if off >= self.refs.len() { return false; }
++        let len = len.min((self.refs.len() - off) as usize);
+         let refs = self.refs.read_chunk(off, len);
++        let chunk = self.chunk;
++        let q = self.q;
+         ARC_CACHE.with(|c| {
+             let mut c = c.borrow_mut();
+             let key = (lat.to_bits(), lng.to_bits());
+@@ -4280,7 +4287,23 @@ impl ArcData {
+             for _ in 0..rings {
+                 let cnt = Self::u32_at(&refs, pos) as usize;
+                 pos += 4;
+-                for _ in 0..cnt {
++                let chunked = chunk > 0 && cnt > chunk;
++                let mut j = 0;
++                while j < cnt {
++                    if chunked && j % chunk == 0 {
++                        let min_lng = Self::u32_at(&refs, pos) as i32 as i64;
++                        let max_lng = Self::u32_at(&refs, pos + 4) as i32 as i64;
++                        let max_lat = ((Self::u32_at(&refs, pos + 8) as i32) as f64 * q) as f32;
++                        pos += 12;
++                        if t_lng < min_lng || t_lng >= max_lng || lat > max_lat + 1e-4 {
++                            let k = chunk.min(cnt - j);
++                            pos += 4 * k;
++                            j += k;
++                            c.stats[1] += k as u64;
++                            continue;
++                        }
++                    }
++                    j += 1;
+                     let arc = Self::u32_at(&refs, pos) >> 1;
+                     pos += 4;
+                     let slot = (arc.wrapping_mul(0x9E37_79B1) >> 20) as usize & (ARC_CACHE_SLOTS - 1);
+-- 
+2.43.0
+

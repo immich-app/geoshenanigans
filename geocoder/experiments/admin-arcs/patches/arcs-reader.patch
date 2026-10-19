@@ -1,0 +1,334 @@
+From 372a27beb23adac126dd1fafcc7694a2664279c7 Mon Sep 17 00:00:00 2001
+From: Zack <zack@futo.org>
+Date: Mon, 19 Oct 2026 01:40:24 +0200
+Subject: [PATCH] feat(geocoder): arcs study reader prototype
+
+---
+ geocoder/server/examples/grid_query.rs |   5 +
+ geocoder/server/src/lib.rs             | 215 +++++++++++++++++++++++--
+ 2 files changed, 208 insertions(+), 12 deletions(-)
+
+diff --git a/geocoder/server/examples/grid_query.rs b/geocoder/server/examples/grid_query.rs
+index 9b2b2ec..20de435 100644
+--- a/geocoder/server/examples/grid_query.rs
++++ b/geocoder/server/examples/grid_query.rs
+@@ -41,4 +41,9 @@ fn main() {
+         // Print coords with fixed precision so two runs key identically.
+         writeln!(out, "{:.6} {:.6} {}", lat, lng, idx.query_json(lat, lng)).unwrap();
+     }
++    if std::env::var_os("GC_ARC_STATS").is_some() {
++        let a = query_server::arc_stats();
++        let p = query_server::PIP_STATS.with(|c| c.get());
++        eprintln!("ARC_STATS decoded {} skipped {} hits {} vertices {} | PIP calls {} vertices {}", a[0], a[1], a[2], a[3], p[0], p[1]);
++    }
+ }
+diff --git a/geocoder/server/src/lib.rs b/geocoder/server/src/lib.rs
+index afb54b2..d4fa431 100644
+--- a/geocoder/server/src/lib.rs
++++ b/geocoder/server/src/lib.rs
+@@ -793,6 +793,8 @@ pub struct Index {
+     pub admin_entries: FileBytes,
+     pub admin_polygons: FileBytes,
+     pub admin_vertices: FileBytes,
++    /// arcs study: shared-arc admin geometry (None = per-polygon admin_vertices).
++    pub arcs: Option<ArcData>,
+     pub poi_cells: Option<FileBytes>,
+     pub poi_entries: Option<FileBytes>,
+     pub poi_records: Option<FileBytes>,
+@@ -1028,6 +1030,7 @@ impl Index {
+             admin_entries: mmap_file(&format!("{}/admin_entries.bin", dir))?,
+             admin_polygons: mmap_file(&format!("{}/admin_polygons.bin", dir))?,
+             admin_vertices: mmap_file(&format!("{}/admin_vertices.bin", dir))?,
++            arcs: ArcData::load(dir),
+             poi_cells,
+             poi_entries,
+             poi_records,
+@@ -1063,10 +1066,24 @@ impl Index {
+     /// Point-in-polygon on an admin ring without decoding it into memory (false where
+     /// `admin_verts` is None).
+     pub fn admin_pip(&self, poly: &AdminPolygon, lat: f64, lng: f64) -> bool {
+-        point_in_encoded_polygon(&self.admin_vertices, poly.vertex_offset, poly.vertex_count, lat as f32, lng as f32).unwrap_or(false)
++        self.admin_pip_f32(poly, lat as f32, lng as f32)
++    }
++
++    /// `admin_pip` at an f32 point (place-node checks).
++    pub fn admin_pip_f32(&self, poly: &AdminPolygon, lat: f32, lng: f32) -> bool {
++        if let Some(a) = &self.arcs {
++            return a.contains(poly, lat, lng);
++        }
++        point_in_encoded_polygon(&self.admin_vertices, poly.vertex_offset, poly.vertex_count, lat, lng).unwrap_or(false)
++    }
++
++    /// Whether a polygon has geometry (`admin_verts` would be Some on valid data).
++    fn admin_has_geometry(poly: &AdminPolygon) -> bool {
++        poly.vertex_count != 0 && poly.vertex_offset != NO_DATA
+     }
+ 
+     pub fn admin_verts(&self, poly: &AdminPolygon) -> Option<std::borrow::Cow<'_, [NodeCoord]>> {
++        if self.arcs.is_some() { return None; }
+         decode_polygon_verts(&self.admin_vertices, poly.vertex_offset, poly.vertex_count)
+     }
+ 
+@@ -1577,8 +1594,8 @@ impl Index {
+                 if level == 2 && poly.country_code == 0 { return; }
+                 if poly.area <= 0.0 { return; }
+ 
+-                let Some(verts) = self.admin_verts(&poly) else { return; };
+-                let pip = point_in_polygon(lat as f32, lng as f32, &verts);
++                if !Self::admin_has_geometry(&poly) { return; }
++                let pip = self.admin_pip(&poly, lat, lng);
+ 
+                 seen_in_level[level].push(serde_json::json!({
+                     "name": self.get_string(poly.name_id),
+@@ -2064,7 +2081,7 @@ impl Index {
+         candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+         candidates.dedup_by_key(|c| c.1);
+         CurrentBoundaries::pick(candidates.into_iter().map(|(_, _, rank, poly)| (rank, poly)), |poly| {
+-            self.admin_verts(poly).is_some_and(|verts| point_in_polygon(lat as f32, lng as f32, &verts))
++            self.admin_pip(poly, lat, lng)
+         })
+     }
+ 
+@@ -2098,8 +2115,8 @@ impl Index {
+                 let Some(poly) = self.admin_polygon(poly_id) else { return; };
+                 if poly.admin_level < 7 || poly.admin_level > 8 { return; }
+                 if poly.area >= best_area { return; }
+-                let Some(verts) = self.admin_verts(&poly) else { return; };
+-                if point_in_polygon(lat as f32, lng as f32, &verts) {
++                if !Self::admin_has_geometry(&poly) { return; }
++                if self.admin_pip(&poly, lat, lng) {
+                     best_area = poly.area;
+                     best = Some(poly);
+                 }
+@@ -2181,9 +2198,9 @@ impl Index {
+             match current_boundaries.for_rank(rank) {
+                 None => true, // no admin boundary found — accept all
+                 Some(poly) => {
+-                    let Some(verts) = self.admin_verts(&poly) else { return true; };
++                    if !Self::admin_has_geometry(&poly) { return true; }
+                     // PIP test the PLACE NODE's centroid, not the query point
+-                    point_in_polygon(pn.lat, pn.lng, &verts)
++                    self.admin_pip_f32(&poly, pn.lat, pn.lng)
+                 }
+             }
+         };
+@@ -2198,8 +2215,8 @@ impl Index {
+             match municipality_boundary {
+                 None => true,
+                 Some(poly) => {
+-                    let Some(verts) = self.admin_verts(&poly) else { return true; };
+-                    point_in_polygon(pn.lat, pn.lng, &verts)
++                    if !Self::admin_has_geometry(&poly) { return true; }
++                    self.admin_pip_f32(&poly, pn.lat, pn.lng)
+                 }
+             }
+         };
+@@ -2363,8 +2380,8 @@ impl Index {
+     pub fn poi_chain_contains_query(&self, poi: &PoiRecord, lat: f64, lng: f64) -> bool {
+         if poi.parent_poly_id == NO_DATA { return true; }
+         let Some(poly) = self.admin_polygon(poi.parent_poly_id) else { return true; };
+-        let Some(verts) = self.admin_verts(&poly) else { return true; };
+-        point_in_polygon(lat as f32, lng as f32, &verts)
++        if !Self::admin_has_geometry(&poly) { return true; }
++        self.admin_pip(&poly, lat, lng)
+     }
+ 
+     // --- POI primary-feature lookup ---
+@@ -4050,6 +4067,11 @@ pub fn point_in_polygon(lat: f32, lng: f32, vertices: &[NodeCoord]) -> bool {
+     inside
+ }
+ 
++thread_local! {
++    /// arcs study: point_in_encoded_polygon calls and vertices on this thread.
++    pub static PIP_STATS: std::cell::Cell<[u64; 2]> = const { std::cell::Cell::new([0; 2]) };
++}
++
+ /// `point_in_polygon` over a polygon's encoded vertices (the layout `decode_polygon_verts`
+ /// reads), decoding one vertex at a time to the same f32 values: no allocation, one pass. None
+ /// exactly where `decode_polygon_verts` is None.
+@@ -4067,6 +4089,7 @@ pub fn point_in_encoded_polygon(src: &FileBytes, vertex_offset: u32, vertex_coun
+     let verts_off = off + POLY_HEADER_BYTES;
+     if verts_off + (n * stride) as u64 > src.len() { return None; }
+     let bytes = src.read_chunk(verts_off, n * stride);
++    PIP_STATS.with(|c| { let mut v = c.get(); v[0] += 1; v[1] += n as u64; c.set(v); });
+     let scale = vertex_scale(encoding);
+     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[i], b[i + 1]]) as f64;
+     let u32_at = |b: &[u8], i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+@@ -4100,6 +4123,174 @@ fn pip_vertices(bytes: &[u8], stride: usize, lat: f32, lng: f32, at: impl Fn(&[u
+     inside
+ }
+ 
++
++// ---------------------------------------------------------------------------
++// arcs study: shared-arc admin geometry (prototype).
++//
++// arc_vertices.bin: per arc u8 flags (bits 0-1: delta width 1/2/4 bytes, bit 7: bbox follows),
++// i32 lat, i32 lng of the first vertex in grid units (arc_meta.json "q" degrees), optional bbox
++// (i32 min_lat, max_lat, min_lng, max_lng), then n-1 zigzag deltas as byte planes
++// (lat b0 | lat b1 .. | lng b0 | ..). arc_index.bin: u32 byte offset per arc + the end.
++// poly_arcs.bin: per polygon, per ring a u32 count then u32 refs (arc << 1 | reversed); the
++// polygon record's vertex_offset is its byte offset there, vertex_count its refs, hole_count its
++// rings - 1. A vertex decodes to ((q_units as f64) * q) as f32, as the arcs tool's decoded files.
++pub struct ArcData {
++    pub vertices: FileBytes,
++    pub index: FileBytes,
++    pub refs: FileBytes,
++    pub q: f64,
++}
++
++const ARC_CACHE_SLOTS: usize = 1 << 12;
++
++struct ArcCache {
++    generation: u32,
++    point: (u32, u32),
++    slots: Vec<(u32, u32, bool)>, // (generation, arc, parity)
++    stats: [u64; 4],              // arcs decoded, bbox skips, cache hits, vertices decoded
++}
++
++thread_local! {
++    static ARC_CACHE: std::cell::RefCell<ArcCache> = std::cell::RefCell::new(ArcCache {
++        generation: 0,
++        point: (u32::MAX, u32::MAX),
++        slots: vec![(0, 0, false); ARC_CACHE_SLOTS],
++        stats: [0; 4],
++    });
++}
++
++/// This thread's arc counters: arcs decoded, bbox skips, cache hits, vertices decoded.
++pub fn arc_stats() -> [u64; 4] {
++    ARC_CACHE.with(|c| c.borrow().stats)
++}
++
++impl ArcData {
++    pub fn load(dir: &str) -> Option<ArcData> {
++        let vertices = mmap_file_optional(&format!("{}/arc_vertices.bin", dir))?;
++        let index = mmap_file_optional(&format!("{}/arc_index.bin", dir))?;
++        let refs = mmap_file_optional(&format!("{}/poly_arcs.bin", dir))?;
++        let meta = std::fs::read_to_string(format!("{}/arc_meta.json", dir)).ok()?;
++        let v: serde_json::Value = serde_json::from_str(&meta).ok()?;
++        Some(ArcData { vertices, index, refs, q: v["q"].as_f64()? })
++    }
++
++    fn u32_at(b: &[u8], i: usize) -> u32 {
++        u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
++    }
++
++    /// Crossing parity of one arc's edges for the ray from (lat, lng) towards +lat, with
++    /// point_in_polygon's edge test (vi = this vertex, vj = the previous one).
++    /// Returns the parity and the vertices decoded (0: skipped by the bbox).
++    fn arc_parity(&self, arc: u32, lat: f32, lng: f32) -> (bool, usize) {
++        let ix = self.index.read_chunk(arc as u64 * 4, 8);
++        let off = Self::u32_at(&ix, 0) as u64;
++        let end = Self::u32_at(&ix, 4) as u64;
++        drop(ix);
++        let blk = self.vertices.read_chunk(off, (end - off) as usize);
++        let flags = blk[0];
++        let w = 1usize << (flags & 3);
++        let q = self.q;
++        let f = |x: i32| (x as f64 * q) as f32;
++        let mut hdr = 9;
++        if flags & 0x80 != 0 {
++            let min_lng = f(Self::u32_at(&blk, 17) as i32);
++            let max_lng = f(Self::u32_at(&blk, 21) as i32);
++            let max_lat = f(Self::u32_at(&blk, 13) as i32);
++            // No edge straddles the point's longitude, or every crossing is below the point.
++            if lng < min_lng || lng >= max_lng || lat > max_lat + 1e-4 {
++                return (false, 0);
++            }
++            hdr = 25;
++        }
++        let m = (blk.len() - hdr) / (2 * w);
++        let q0 = (Self::u32_at(&blk, 1) as i32, Self::u32_at(&blk, 5) as i32);
++        let p = match w {
++            1 => arc_scan::<1>(&blk, hdr, m, q0, q, lat, lng),
++            2 => arc_scan::<2>(&blk, hdr, m, q0, q, lat, lng),
++            _ => arc_scan::<4>(&blk, hdr, m, q0, q, lat, lng),
++        };
++        (p, m + 1)
++    }
++
++    /// Point-in-polygon of an arc-referenced polygon: XOR of its arcs' parities.
++    pub fn contains(&self, poly: &AdminPolygon, lat: f32, lng: f32) -> bool {
++        if poly.vertex_count == 0 || poly.vertex_offset == NO_DATA { return false; }
++        let rings = poly.hole_count as usize + 1;
++        let len = (rings + poly.vertex_count as usize) * 4;
++        let off = poly.vertex_offset as u64;
++        if off + len as u64 > self.refs.len() { return false; }
++        let refs = self.refs.read_chunk(off, len);
++        ARC_CACHE.with(|c| {
++            let mut c = c.borrow_mut();
++            let key = (lat.to_bits(), lng.to_bits());
++            if c.point != key {
++                c.point = key;
++                c.generation = c.generation.wrapping_add(1);
++                if c.generation == 0 {
++                    c.slots.iter_mut().for_each(|s| s.0 = 0);
++                    c.generation = 1;
++                }
++            }
++            let gen = c.generation;
++            let mut inside = false;
++            let mut pos = 0;
++            for _ in 0..rings {
++                let cnt = Self::u32_at(&refs, pos) as usize;
++                pos += 4;
++                for _ in 0..cnt {
++                    let arc = Self::u32_at(&refs, pos) >> 1;
++                    pos += 4;
++                    let slot = (arc.wrapping_mul(0x9E37_79B1) >> 20) as usize & (ARC_CACHE_SLOTS - 1);
++                    let s = c.slots[slot];
++                    let parity = if s.0 == gen && s.1 == arc {
++                        c.stats[2] += 1;
++                        s.2
++                    } else {
++                        let (p, n) = self.arc_parity(arc, lat, lng);
++                        if n == 0 { c.stats[1] += 1; } else { c.stats[0] += 1; c.stats[3] += n as u64; }
++                        c.slots[slot] = (gen, arc, p);
++                        p
++                    };
++                    inside ^= parity;
++                }
++            }
++            inside
++        })
++    }
++}
++
++#[inline]
++fn arc_scan<const W: usize>(blk: &[u8], hdr: usize, m: usize, q0: (i32, i32), q: f64, lat: f32, lng: f32) -> bool {
++    let unzz = |z: u64| -> i64 { ((z >> 1) as i64) ^ -((z & 1) as i64) };
++    let mut ql = q0.0 as i64;
++    let mut qg = q0.1 as i64;
++    let mut vj_lat = (ql as f64 * q) as f32;
++    let mut vj_lng = (qg as f64 * q) as f32;
++    let lat_planes = &blk[hdr..hdr + W * m];
++    let lng_planes = &blk[hdr + W * m..hdr + 2 * W * m];
++    let mut inside = false;
++    for i in 0..m {
++        let mut zl = 0u64;
++        let mut zg = 0u64;
++        for b in 0..W {
++            zl |= (lat_planes[b * m + i] as u64) << (8 * b);
++            zg |= (lng_planes[b * m + i] as u64) << (8 * b);
++        }
++        ql += unzz(zl);
++        qg += unzz(zg);
++        let vi_lat = (ql as f64 * q) as f32;
++        let vi_lng = (qg as f64 * q) as f32;
++        if ((vi_lng > lng) != (vj_lng > lng))
++            && (lat < (vj_lat - vi_lat) * (lng - vi_lng) / (vj_lng - vi_lng) + vi_lat)
++        {
++            inside = !inside;
++        }
++        vj_lat = vi_lat;
++        vj_lng = vi_lng;
++    }
++    inside
++}
++
+ // --- API types ---
+ 
+ pub struct PoiMatch<'a> {
+-- 
+2.43.0
+
