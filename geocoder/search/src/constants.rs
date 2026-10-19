@@ -66,8 +66,9 @@ pub const BOUNDARY_MIN_LEVEL: u8 = 2;
 pub const BOUNDARY_MAX_LEVEL: u8 = 8;
 
 // ---- build
-/// Default memory for sort runs (all threads together).
-pub const DEFAULT_RUN_BUDGET_MB: usize = 64;
+/// Default memory for sort runs (all threads together). At 16 the build fits a 32 MiB cgroup for
+/// every set (peak anonymous 13-24 MiB, minimal to max); 64 measured no faster on one core.
+pub const DEFAULT_RUN_BUDGET_MB: usize = 16;
 /// Read buffer per sort run during the merge.
 pub const RUN_READ_BUFFER: usize = 64 * 1024;
 /// Sort runs merged at once; more are first merged in groups of this many into longer runs
