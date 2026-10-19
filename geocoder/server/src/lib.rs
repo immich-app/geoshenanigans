@@ -1580,7 +1580,7 @@ impl Index {
 
     pub fn debug_places(&self, lat: f64, lng: f64) -> serde_json::Value {
         let current_boundaries = self.find_current_boundaries(lat, lng, self.find_admin(lat, lng).country_code);
-        let place = self.find_places(lat, lng, &current_boundaries, false);
+        let place = self.find_places(lat, lng, PlaceFeature::Point(lat, lng), &current_boundaries, false);
 
         let place_cells = match &self.place_cells {
             Some(c) => c,
@@ -2053,7 +2053,7 @@ impl Index {
         CurrentBoundaries::from_ranked(ranked, holding(place_areas).iter())
     }
 
-    pub fn find_places(&self, lat: f64, lng: f64, current_boundaries: &CurrentBoundaries, chain_has_rank16: bool) -> PlaceResult<'_> {
+    pub fn find_places(&self, lat: f64, lng: f64, feature: PlaceFeature<'_>, current_boundaries: &CurrentBoundaries, chain_has_rank16: bool) -> PlaceResult<'_> {
         let place_cells = match &self.place_cells {
             Some(c) => c,
             None => return PlaceResult::default(),
@@ -2069,7 +2069,7 @@ impl Index {
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
 
-        // Every node whose fuzzy area covers the point, with its squared
+        // Every node whose fuzzy area covers the feature, with its squared
         // distance (owned copies so the place_nodes file can be a chunked
         // source).
         let cos_lat = lat.to_radians().cos();
@@ -2077,7 +2077,7 @@ impl Index {
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
             Self::for_each_entry_fb(place_entries, Self::lookup_admin_cell_fb(place_cells, c), |id| {
                 let Some(pn) = self.place_node(id) else { return; };
-                if let Some(dist_sq) = place_node_covering(&pn, lat, lng, cos_lat) {
+                if let Some(dist_sq) = place_node_covering(&pn, feature, cos_lat) {
                     candidates.push((pn, dist_sq));
                 }
             });
@@ -2816,6 +2816,22 @@ impl Index {
         }
     }
 
+    /// The street way at `idx` in street_ways.bin, None for NO_DATA or out of range.
+    fn street_way(&self, idx: u32) -> Option<WayHeader> {
+        let ways = self.street_ways.as_ref()?;
+        let total = ways.len() / std::mem::size_of::<WayHeader>() as u64;
+        (idx != NO_DATA && (idx as u64) < total).then(|| ways.read_at::<WayHeader>(idx as u64))
+    }
+
+    /// A street way's nodes (owned, so street_nodes can be a chunked source).
+    fn way_nodes(&self, way: &WayHeader) -> Option<Vec<NodeCoord>> {
+        let street_nodes = self.street_nodes.as_ref()?;
+        let total = street_nodes.len() / std::mem::size_of::<NodeCoord>() as u64;
+        let (off, cnt) = (way.node_offset as u64, way.node_count as u64);
+        if cnt < 2 || off + cnt > total { return None; }
+        Some((off..off + cnt).map(|i| street_nodes.read_at::<NodeCoord>(i)).collect())
+    }
+
     /// The point of a street way nearest (lat, lng), planar in degrees like
     /// PostGIS ST_ClosestPoint on placex geometry.
     fn closest_point_on_way(&self, way: &WayHeader, lat: f64, lng: f64) -> Option<(f64, f64)> {
@@ -2885,7 +2901,6 @@ impl Index {
         // (or fuzzy-anchor on) a competing rank-16 candidate.
         let chain_has_rank16 =
             admin.city.is_some() || admin.town.is_some() || admin.village.is_some();
-        let place = self.find_places(lat, lng, &current_boundaries, chain_has_rank16);
 
         // Primary-feature selection: match Nominatim's reverse flow —
         // pick the closest rank-26+ feature (road OR addressable POI),
@@ -3133,6 +3148,32 @@ impl Index {
                 }
             }
         }
+
+        // Place nodes are matched against the street the address hangs from:
+        // Nominatim takes a rank-30 answer's address from its parent street
+        // (results.py _get_address_lookup_id). That is the street that won,
+        // the address point's parent way, or for a POI the nearest street
+        // when it carries the POI's parent street name (POIs keep only the
+        // name). Without one, the query point stands in.
+        let address_street: Option<WayHeader> = if closest_feature_dist >= max_dist {
+            None
+        } else if poi_won_primary {
+            let (_, poi) = poi_primary.unwrap();
+            street.as_ref().map(|(_, w, _)| *w).filter(|w| {
+                poi.parent_street_id != NO_DATA && w.name_id != NO_DATA
+                    && self.get_string(w.name_id) == self.get_string(poi.parent_street_id)
+            })
+        } else if addr_won_primary {
+            addr.and_then(|(_, point, _)| self.street_way(point.parent_way_id))
+        } else {
+            street.as_ref().map(|(_, w, _)| *w)
+        };
+        let street_line = address_street.and_then(|w| self.way_nodes(&w));
+        let feature = match street_line.as_deref() {
+            Some(line) => PlaceFeature::Line(line),
+            None => PlaceFeature::Point(lat, lng),
+        };
+        let place = self.find_places(lat, lng, feature, &current_boundaries, chain_has_rank16);
 
         // Resolve postcode: mirror Nominatim's stored placex.postcode chain
         // (Tier 0 addr / Tier 1 primary feature's calculated_postcode /
@@ -3951,12 +3992,16 @@ pub fn place_fuzzy_half_side_m(pt: usize) -> f64 {
     }
 }
 
+/// Metres per degree of latitude (and of longitude at the equator) in the
+/// fuzzy-area squares.
+pub const METRES_PER_DEGREE: f64 = 111320.0;
+
 /// Whether the place_node_fuzzy_area of a node at (centre_lat, centre_lng)
 /// with this half side in metres holds the point.
 pub fn fuzzy_area_holds(centre_lat: f32, centre_lng: f32, half_m: f64, lat: f64, lng: f64) -> bool {
     let (lat0, lng0) = (centre_lat as f64, centre_lng as f64);
-    let dlat_m = ((lat - lat0) * 111320.0).abs();
-    let dlng_m = ((lng - lng0) * 111320.0 * lat0.to_radians().cos()).abs();
+    let dlat_m = ((lat - lat0) * METRES_PER_DEGREE).abs();
+    let dlng_m = ((lng - lng0) * METRES_PER_DEGREE * lat0.to_radians().cos()).abs();
     dlat_m <= half_m && dlng_m <= half_m
 }
 
@@ -3984,19 +4029,64 @@ pub const PLACE_NODE_RANK: [u8; 7] = [16, 16, 16, 20, 20, 24, 22];
 /// here carry no capital flag.)
 pub const PLACE_NODE_DISTANCE_WEIGHT: [f64; 7] = [0.25, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0];
 
-/// The squared distance of a place node whose place_node_fuzzy_area holds
-/// (lat, lng), None when it doesn't: Nominatim stores the node with that
+/// What place nodes are matched against (getNearFeatures' `feature`): the
+/// street an answer's address hangs from, Nominatim computing a street's
+/// address lines on its whole geometry (placex_triggers.sql:1216-1220), or
+/// the query point where the answer has no street.
+#[derive(Clone, Copy)]
+pub enum PlaceFeature<'a> {
+    Point(f64, f64),
+    Line(&'a [NodeCoord]),
+}
+
+/// Whether a line crosses the place_node_fuzzy_area of a node at
+/// (centre_lat, centre_lng) along a stretch of positive length: getNearFeatures
+/// takes an area for a line feature when ST_NPoints(ST_Intersection) > 1
+/// (partition-functions.sql:44), so a line only touching it doesn't count.
+pub fn line_crosses_fuzzy_area(line: &[NodeCoord], centre_lat: f32, centre_lng: f32, half_m: f64) -> bool {
+    let (lat0, lng0) = (centre_lat as f64, centre_lng as f64);
+    let m_per_lng = METRES_PER_DEGREE * lat0.to_radians().cos();
+    let to_xy = |p: &NodeCoord| ((p.lng as f64 - lng0) * m_per_lng, (p.lat as f64 - lat0) * METRES_PER_DEGREE);
+    line.windows(2).any(|w| {
+        let ((x0, y0), (x1, y1)) = (to_xy(&w[0]), to_xy(&w[1]));
+        let (dx, dy) = (x1 - x0, y1 - y0);
+        // Liang-Barsky: clip the segment's parameter range to each side.
+        let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
+        for (p, q) in [(-dx, x0 + half_m), (dx, half_m - x0), (-dy, y0 + half_m), (dy, half_m - y0)] {
+            if p == 0.0 {
+                if q < 0.0 { return false; }
+            } else if p < 0.0 {
+                t0 = t0.max(q / p);
+            } else {
+                t1 = t1.min(q / p);
+            }
+        }
+        t1 > t0
+    })
+}
+
+/// The squared distance of a place node whose place_node_fuzzy_area covers
+/// the feature, None when it doesn't: Nominatim stores the node with that
 /// area in location_area_large, and getNearFeatures takes only the rows
-/// covering the feature (partition-functions.sql:39-44).
-pub fn place_node_covering(pn: &PlaceNode, lat: f64, lng: f64, cos_lat: f64) -> Option<f64> {
+/// covering the feature (partition-functions.sql:39-44), each at its
+/// distance from the feature (partition-functions.sql:32).
+pub fn place_node_covering(pn: &PlaceNode, feature: PlaceFeature<'_>, cos_lat: f64) -> Option<f64> {
     let pt = pn.place_type as usize;
-    if pt >= PLACE_NODE_RANK.len() || !fuzzy_area_holds(pn.lat, pn.lng, place_fuzzy_half_side_m(pt), lat, lng) {
+    if pt >= PLACE_NODE_RANK.len() {
         return None;
     }
 
-    let dlat = (lat - pn.lat as f64).to_radians();
-    let dlng = (lng - pn.lng as f64).to_radians();
-    Some(dist_sq(dlat, dlng, cos_lat))
+    let half_m = place_fuzzy_half_side_m(pt);
+    match feature {
+        PlaceFeature::Point(lat, lng) => fuzzy_area_holds(pn.lat, pn.lng, half_m, lat, lng)
+            .then(|| dist_sq((lat - pn.lat as f64).to_radians(), (lng - pn.lng as f64).to_radians(), cos_lat)),
+        PlaceFeature::Line(line) => line_crosses_fuzzy_area(line, pn.lat, pn.lng, half_m).then(|| {
+            line.windows(2)
+                .map(|w| point_to_segment_distance(pn.lat as f64, pn.lng as f64, w[0].lat as f64, w[0].lng as f64,
+                                                   w[1].lat as f64, w[1].lng as f64, cos_lat))
+                .fold(f64::MAX, f64::min)
+        }),
+    }
 }
 
 /// Nominatim's address walk over place nodes (insert_addresslines,
@@ -5031,8 +5121,54 @@ mod pure_helper_tests {
         // east, but only the latter's 500 m square covers the point.
         let east = place_node(5, 0.0, 510.0);
         let north_east = place_node(5, 490.0, 490.0);
-        assert_eq!(place_node_covering(&east, 0.0, 0.0, 1.0), None);
-        assert!(place_node_covering(&north_east, 0.0, 0.0, 1.0).is_some());
+        let query = PlaceFeature::Point(0.0, 0.0);
+        assert_eq!(place_node_covering(&east, query, 1.0), None);
+        assert!(place_node_covering(&north_east, query, 1.0).is_some());
+    }
+
+    // A line through points given in metres (north, east) from (0, 0).
+    fn line_m(points: &[(f64, f64)]) -> Vec<NodeCoord> {
+        points.iter().map(|&(n, e)| nc((n / METRES_PER_DEGREE) as f32, (e / METRES_PER_DEGREE) as f32)).collect()
+    }
+
+    #[test]
+    fn line_crosses_fuzzy_area_along_a_stretch() {
+        // A 500 m square around (0, 0).
+        let crosses = |pts: &[(f64, f64)]| line_crosses_fuzzy_area(&line_m(pts), 0.0, 0.0, 500.0);
+        assert!(crosses(&[(-2000.0, 300.0), (2000.0, 300.0)]));
+        assert!(!crosses(&[(-2000.0, 600.0), (2000.0, 600.0)]));
+        // Ending inside the square, or just short of it.
+        assert!(crosses(&[(0.0, 2000.0), (0.0, 400.0)]));
+        assert!(!crosses(&[(0.0, 2000.0), (0.0, 600.0)]));
+        // Its second segment crosses.
+        assert!(crosses(&[(-2000.0, 900.0), (0.0, 900.0), (0.0, -900.0)]));
+    }
+
+    #[test]
+    fn place_nodes_cover_and_measure_from_the_street() {
+        // The street runs north along longitude 0 from 1 km south to 5 km
+        // north of the query. A hamlet 3 km north and 200 m east is no
+        // candidate at the query point, but its 1000 m square crosses the
+        // street, 200 m away; one 900 m east of the query is 900 m away. The
+        // street's walk takes the northern one (Bégard: Nominatim's hamlet
+        // Justice is 40 m from the street and far from the query).
+        let street = line_m(&[(-1000.0, 0.0), (5000.0, 0.0)]);
+        let north = place_node(4, 3000.0, 200.0);
+        let east = place_node(4, 0.0, 900.0);
+        let (point, line) = (PlaceFeature::Point(0.0, 0.0), PlaceFeature::Line(&street));
+        assert_eq!(place_node_covering(&north, point, 1.0), None);
+        let metres = |pn: &PlaceNode| place_node_covering(pn, line, 1.0).unwrap().sqrt() * 6_371_000.0;
+        assert!((metres(&north) - 200.0).abs() < 1.0, "{}", metres(&north));
+        assert!((metres(&east) - 900.0).abs() < 2.0, "{}", metres(&east));
+        let walk = |feature| {
+            let nodes: Vec<(usize, f64, f32, f32)> = [north, east].iter()
+                .filter_map(|pn| place_node_covering(pn, feature, 1.0).map(|d| (4, d, pn.lat, pn.lng)))
+                .collect();
+            let accepted = accept_place_nodes(&nodes, false, |_| true)[4];
+            accepted.map(|k| nodes[k].3)
+        };
+        assert_eq!(walk(line), Some(north.lng));
+        assert_eq!(walk(point), Some(east.lng));
     }
 
     #[test]
