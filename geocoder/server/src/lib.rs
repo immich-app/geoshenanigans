@@ -2067,23 +2067,38 @@ impl Index {
         };
         if self.place_nodes.is_none() { return PlaceResult::default(); }
 
-        // Place nodes are indexed at admin cell level (L10, ~10km cells).
-        // Cell + 8 neighbors covers ~30km — sufficient for all place types.
-        let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
-        let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
-
         // Every node whose fuzzy area covers the feature, with its squared
         // distance (owned copies so the place_nodes file can be a chunked
         // source).
         let cos_lat = lat.to_radians().cos();
         let mut candidates: Vec<(PlaceNode, f64)> = Vec::new();
-        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            Self::for_each_entry_fb(place_entries, Self::lookup_admin_cell_fb(place_cells, c), |id| {
-                let Some(pn) = self.place_node(id) else { return; };
-                if let Some(dist_sq) = place_node_covering(&pn, feature, cos_lat) {
-                    candidates.push((pn, dist_sq));
+        let mut consider = |id: u32| {
+            let Some(pn) = self.place_node(id) else { return; };
+            if let Some(dist_sq) = place_node_covering(&pn, feature, cos_lat) {
+                candidates.push((pn, dist_sq));
+            }
+        };
+        // A node is listed in the admin cell (L10, ~10km) of its centroid only.
+        match feature {
+            // Around a point: its cell and the 8 neighbours.
+            PlaceFeature::Point(..) => {
+                let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
+                for c in std::iter::once(cell).chain(cell_neighbors_at_level(cell, self.admin_cell_level)) {
+                    Self::for_each_entry_fb(place_entries, Self::lookup_admin_cell_fb(place_cells, c), &mut consider);
                 }
-            });
+            }
+            // Along a street: every cell a node whose area crosses some stretch
+            // of it can sit in, so the street's labels don't depend on where
+            // along it the query falls.
+            PlaceFeature::Line(line) => {
+                let mut ids: Vec<u32> = Vec::new();
+                for c in cells_under_line(line, MAX_PLACE_FUZZY_HALF_SIDE_M, self.admin_cell_level) {
+                    Self::for_each_entry_fb(place_entries, Self::lookup_admin_cell_fb(place_cells, c), |id| ids.push(id));
+                }
+                ids.sort_unstable();
+                ids.dedup();
+                ids.into_iter().for_each(consider);
+            }
         }
 
         let mut result = PlaceResult::default();
@@ -3996,7 +4011,7 @@ pub fn poi_order(a: &PoiMatch<'_>, b: &PoiMatch<'_>) -> std::cmp::Ordering {
 /// and Nominatim's answer has both.)
 pub fn place_fuzzy_half_side_m(pt: usize) -> f64 {
     match pt {
-        0 => 15000.0,              // city
+        0 => MAX_PLACE_FUZZY_HALF_SIDE_M, // city
         1 => 4000.0,               // town
         2 | 3 => 2000.0,           // village / suburb (rank_search ≤ 19)
         4 | 6 => 1000.0,           // hamlet / quarter (rank_search 20)
@@ -4004,9 +4019,36 @@ pub fn place_fuzzy_half_side_m(pt: usize) -> f64 {
     }
 }
 
+/// The largest half side a place node's fuzzy area has, a city's (rank_search
+/// <= 16, utils.sql:344-345): no node farther than this from a feature along
+/// either axis covers it.
+pub const MAX_PLACE_FUZZY_HALF_SIDE_M: f64 = 15000.0;
+
 /// Metres per degree of latitude (and of longitude at the equator) in the
 /// fuzzy-area squares.
 pub const METRES_PER_DEGREE: f64 = 111320.0;
+
+/// The cells of `level` under the lat/lng box of `line` grown by `margin_m`
+/// along each axis, longitude metres taken at the latitude in the grown box
+/// farthest from the equator, as fuzzy_area_holds measures them from a node.
+/// The box stops at ±90° and ±180° without wrapping: the fuzzy-area tests
+/// compare plain degrees, so no node across the antimeridian covers the line.
+pub fn cells_under_line(line: &[NodeCoord], margin_m: f64, level: u64) -> Vec<u64> {
+    let (lat_lo, lng_lo, lat_hi, lng_hi) = line.iter().fold((f64::MAX, f64::MAX, f64::MIN, f64::MIN), |(a, b, c, d), p| {
+        (a.min(p.lat as f64), b.min(p.lng as f64), c.max(p.lat as f64), d.max(p.lng as f64))
+    });
+    if lat_lo > lat_hi {
+        return Vec::new();
+    }
+
+    let dlat = margin_m / METRES_PER_DEGREE;
+    let (lat_lo, lat_hi) = ((lat_lo - dlat).max(-90.0), (lat_hi + dlat).min(90.0));
+    let metres_per_lng = METRES_PER_DEGREE * lat_lo.abs().max(lat_hi.abs()).to_radians().cos();
+    let dlng = if metres_per_lng > margin_m / 360.0 { margin_m / metres_per_lng } else { 360.0 };
+    let rect = s2::rect::Rect::from_degrees(lat_lo, (lng_lo - dlng).max(-180.0), lat_hi, (lng_hi + dlng).min(180.0));
+    let coverer = s2::region::RegionCoverer { min_level: level as u8, max_level: level as u8, level_mod: 1, max_cells: usize::MAX };
+    coverer.covering(&rect).0.into_iter().map(|c| c.0).collect()
+}
 
 /// Whether the place_node_fuzzy_area of a node at (centre_lat, centre_lng)
 /// with this half side in metres holds the point.
@@ -5133,6 +5175,30 @@ mod pure_helper_tests {
     }
 
     #[test]
+    fn max_place_fuzzy_half_side_is_the_largest_of_any_type() {
+        let largest = (0..PLACE_NODE_RANK.len()).map(place_fuzzy_half_side_m).fold(0.0, f64::max);
+        assert_eq!(largest, MAX_PLACE_FUZZY_HALF_SIDE_M);
+    }
+
+    #[test]
+    fn cells_under_line_hold_a_city_beyond_each_corner_of_the_street() {
+        // A street at 60°N; a city just inside reach of each end, diagonally
+        // out, covers that end and sits in one of the cells.
+        let line = [nc(60.0, 10.0), nc(60.1, 10.0)];
+        let cells = cells_under_line(&line, MAX_PLACE_FUZZY_HALF_SIDE_M, DEFAULT_ADMIN_CELL_LEVEL);
+        let reach = MAX_PLACE_FUZZY_HALF_SIDE_M - 100.0;
+        for (end_lat, north) in [(60.1, 1.0), (60.0, -1.0)] {
+            let lat = end_lat + north * reach / METRES_PER_DEGREE;
+            for east in [1.0, -1.0] {
+                let lng = 10.0 + east * reach / (METRES_PER_DEGREE * lat.to_radians().cos());
+                assert!(fuzzy_area_holds(lat as f32, lng as f32, MAX_PLACE_FUZZY_HALF_SIDE_M, end_lat, 10.0));
+                assert!(cells.contains(&cell_id_at_level(lat, lng, DEFAULT_ADMIN_CELL_LEVEL)), "({lat}, {lng})");
+            }
+        }
+        assert!(cells_under_line(&[], MAX_PLACE_FUZZY_HALF_SIDE_M, DEFAULT_ADMIN_CELL_LEVEL).is_empty());
+    }
+
+    #[test]
     fn place_nodes_fill_quarter_and_neighbourhood_both() {
         // Taguig: Nominatim's answer has a quarter and a neighbourhood.
         let nodes = [node_at(6, 0.0, 2.0), node_at(5, 500.0, 1.0)];
@@ -5809,6 +5875,19 @@ mod query_path_tests {
         let address = address_at(&index, 0.0, 20.0);
         assert_eq!(address["road"], "Long Road");
         assert_eq!(address["hamlet"], "Justice");
+    }
+
+    #[test]
+    fn query_finds_place_nodes_along_the_whole_street() {
+        // The hamlet's square crosses the street 38 km north of the point,
+        // cells away from the point's own: it names the street wherever along
+        // it the query falls.
+        let index = TestIndex::new()
+            .street("Long Road", &[(-1000.0, 0.0), (40_000.0, 0.0)])
+            .place("Far End", 4, 38_000.0, 200.0)
+            .load();
+        assert_eq!(address_at(&index, 37_500.0, 20.0)["hamlet"], "Far End");
+        assert_eq!(address_at(&index, 0.0, 20.0)["hamlet"], "Far End");
     }
 
     #[test]
