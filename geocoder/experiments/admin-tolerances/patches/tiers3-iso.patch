@@ -1,0 +1,88 @@
+From fafc695262a2403edf78d306d3d21fd58f741bfc Mon Sep 17 00:00:00 2001
+From: Zack <zack@futo.org>
+Date: Mon, 19 Oct 2026 01:43:37 +0200
+Subject: [PATCH] chore(builder): tiers3 isotropic simplification option
+
+---
+ geocoder/builder/src/cell_index.cpp |  3 +++
+ geocoder/builder/src/geometry.h     | 36 +++++++++++++++++++++++++++++
+ 2 files changed, 39 insertions(+)
+
+diff --git a/geocoder/builder/src/cell_index.cpp b/geocoder/builder/src/cell_index.cpp
+index b28912f..6ae2c4f 100644
+--- a/geocoder/builder/src/cell_index.cpp
++++ b/geocoder/builder/src/cell_index.cpp
+@@ -1066,6 +1066,7 @@ struct TierScheme {
+     bool set = false;
+     double level_m[16];
+     double cap = kRingToleranceFraction;
++    bool iso = false;
+ };
+ static const TierScheme& tier_scheme() {
+     static const TierScheme scheme = [] {
+@@ -1087,6 +1088,7 @@ static const TierScheme& tier_scheme() {
+             std::string k = kv.substr(0, eq);
+             double v = std::stod(kv.substr(eq + 1));
+             if (k == "cap") t.cap = v;
++            else if (k == "iso") t.iso = v != 0;
+             else if (k.size() > 1 && k[0] == 't') {
+                 int l = std::stoi(k.substr(1));
+                 if (l < 0 || l > 15) throw std::runtime_error("GC_TIER_SCHEME: bad level " + k);
+@@ -1125,6 +1127,7 @@ static PackedPolygon pack_admin_polygon(const ParsedData& data, const AdminPolyg
+         for (size_t r = 1; r < rings.size(); r++) hole_rings.push_back(points(rings[r]));
+         std::tie(pts, holes) = simplify_rings(points(rings[0]), hole_rings,
+             [&](const std::vector<std::pair<double,double>>& ring) {
++                if (tiered && scheme.iso) return simplify_ring_isotropic(ring, eps_m, cap);
+                 return simplify_polygon_epsilon(ring, ring_tolerance_degrees(ring, eps_m, cap));
+             });
+     } else {
+diff --git a/geocoder/builder/src/geometry.h b/geocoder/builder/src/geometry.h
+index b962d59..fa8cac8 100644
+--- a/geocoder/builder/src/geometry.h
++++ b/geocoder/builder/src/geometry.h
+@@ -289,6 +289,42 @@ inline double ring_tolerance_degrees(const std::vector<std::pair<double,double>>
+     return std::min(meters_to_degrees(eps_m, lat), fraction * std::sqrt(polygon_area(ring)));
+ }
+ 
++// Douglas-Peucker with the tolerance eps_m in metres in every direction: the closed ring is
++// measured in a local frame where a degree of longitude is cos(lat0) of a degree of latitude
++// (simplify_polygon_epsilon measures raw degrees, so a tolerance converted at lat0 as a longitude
++// distance allows 1 / cos(lat0) of it north-south). The tolerance is at most cap_fraction of the
++// ring's size in that frame (the square root of its area). Kept vertices come from the ring itself.
++inline std::vector<std::pair<double,double>> simplify_ring_isotropic(
++    const std::vector<std::pair<double,double>>& ring, double eps_m, double cap_fraction,
++    size_t min_vertices = 4) {
++    if (ring.size() <= min_vertices) return ring;
++    double k = std::cos((ring.empty() ? 0.0 : ring[0].first) * M_PI / 180.0);
++    if (k < 0.01) k = 0.01;  // as meters_to_degrees
++    std::vector<std::pair<double,double>> q(ring.size());
++    for (size_t i = 0; i < ring.size(); i++) q[i] = {ring[i].first, ring[i].second * k};
++    double eps = std::min(eps_m / 111320.0, cap_fraction * std::sqrt(polygon_area(ring) * k));
++    auto run = [&](double e) {
++        std::vector<bool> keep(q.size(), false);
++        keep[0] = keep[q.size() - 1] = true;
++        dp_simplify(q, 0, q.size() - 1, e, keep);
++        return keep;
++    };
++    std::vector<bool> keep = run(eps);
++    size_t count = static_cast<size_t>(std::count(keep.begin(), keep.end(), true));
++    if (count < min_vertices) {  // as simplify_polygon_epsilon
++        double lo = 0, hi = eps;
++        for (int iter = 0; iter < 20; iter++) {
++            double mid = (lo + hi) / 2;
++            std::vector<bool> try_keep = run(mid);
++            size_t c = static_cast<size_t>(std::count(try_keep.begin(), try_keep.end(), true));
++            if (c >= min_vertices) { lo = mid; keep = try_keep; } else hi = mid;
++        }
++    }
++    std::vector<std::pair<double,double>> out;
++    for (size_t i = 0; i < ring.size(); i++) if (keep[i]) out.push_back(ring[i]);
++    return out;
++}
++
+ // Validate a postcode string for the centroid index. Mirrors
+ // Nominatim's clean_postcodes sanitizer — rejects values that
+ // don't conform to any known postcode pattern. The builder
+-- 
+2.43.0
+

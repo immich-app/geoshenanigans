@@ -1,0 +1,12 @@
+B2 /ssd/tiers3/pts/B2.txt
+B3 /ssd/tiers3/pts/B3.txt
+B4 /ssd/tiers3/pts/B4.txt
+B5 /ssd/tiers3/pts/B5.txt
+B6 /ssd/tiers3/pts/B6.txt
+B7 /ssd/tiers3/pts/B7.txt
+B8 /ssd/tiers3/pts/B8.txt
+B9 /ssd/tiers3/pts/B9.txt
+B10 /ssd/tiers3/pts/B10.txt
+photo /ssd/tiers3/pts/photo300k.txt
+vborder /ssd/tiers2-verify/pts/border10k.txt
+vphoto /ssd/tiers2-verify/pts/photo10k.txt

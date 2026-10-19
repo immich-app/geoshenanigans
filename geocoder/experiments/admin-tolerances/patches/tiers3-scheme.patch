@@ -1,0 +1,121 @@
+From 81f5767485f7143e3ea3e1d34202b538454c4028 Mon Sep 17 00:00:00 2001
+From: Zack <zack@futo.org>
+Date: Mon, 19 Oct 2026 01:20:35 +0200
+Subject: [PATCH] chore(builder): tiers3 tolerance scheme override and minimal
+ remap dump
+
+---
+ geocoder/builder/src/build_index.cpp |  8 +++++
+ geocoder/builder/src/cell_index.cpp  | 48 ++++++++++++++++++++++++++--
+ geocoder/builder/src/geometry.h      |  5 +--
+ 3 files changed, 57 insertions(+), 4 deletions(-)
+
+diff --git a/geocoder/builder/src/build_index.cpp b/geocoder/builder/src/build_index.cpp
+index 488c8db..b1642dd 100644
+--- a/geocoder/builder/src/build_index.cpp
++++ b/geocoder/builder/src/build_index.cpp
+@@ -1860,6 +1860,14 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
+                 //    the cell index.
+                 std::vector<uint32_t> poly_remap;
+                 write_admin_minimal_polygons(d, mdir, region_prev, kAdminMinimalEpsilonScale, poly_remap);
++                // tiers3 study: admin-minimal's slot of every full polygon (warm slots).
++                if (run == RegionRun::Planet)
++                    if (const char* dump = std::getenv("GC_TIER_DUMP")) {
++                        ensure_dir(dump);
++                        write_binary_file(std::string(dump) + "/admin_minimal_remap.raw",
++                                          reinterpret_cast<const char*>(poly_remap.data()),
++                                          poly_remap.size() * sizeof(uint32_t));
++                    }
+ 
+                 // 2. place_nodes filter + ID remap. Keep types 0=city, 1=town,
+                 //    2=village, 4=hamlet.
+diff --git a/geocoder/builder/src/cell_index.cpp b/geocoder/builder/src/cell_index.cpp
+index 578c7a3..b28912f 100644
+--- a/geocoder/builder/src/cell_index.cpp
++++ b/geocoder/builder/src/cell_index.cpp
+@@ -1059,6 +1059,46 @@ struct PackedPolygon {
+     float area = 0;
+     uint16_t hole_count = 0;
+ };
++// tiers3 study: GC_TIER_SCHEME="t2=75;t3=75;...;t8=37.5;cap=0.1" gives the q2.5 variants
++// (epsilon_scale 2.5: quality/q2.5 and admin-minimal) per-level tolerances in metres (levels left
++// out keep 2.5 x kAdminEpsilonMeters) and a ring cap fraction (default kRingToleranceFraction).
++struct TierScheme {
++    bool set = false;
++    double level_m[16];
++    double cap = kRingToleranceFraction;
++};
++static const TierScheme& tier_scheme() {
++    static const TierScheme scheme = [] {
++        TierScheme t;
++        for (int l = 0; l < 16; l++) t.level_m[l] = admin_epsilon_meters(static_cast<uint8_t>(l)) * 2.5;
++        const char* env = std::getenv("GC_TIER_SCHEME");
++        if (!env || !*env) return t;
++        t.set = true;
++        std::string text(env);
++        size_t pos = 0;
++        while (pos <= text.size()) {
++            size_t end = text.find(';', pos);
++            if (end == std::string::npos) end = text.size();
++            std::string kv = text.substr(pos, end - pos);
++            pos = end + 1;
++            if (kv.empty()) continue;
++            size_t eq = kv.find('=');
++            if (eq == std::string::npos) throw std::runtime_error("GC_TIER_SCHEME: bad item " + kv);
++            std::string k = kv.substr(0, eq);
++            double v = std::stod(kv.substr(eq + 1));
++            if (k == "cap") t.cap = v;
++            else if (k.size() > 1 && k[0] == 't') {
++                int l = std::stoi(k.substr(1));
++                if (l < 0 || l > 15) throw std::runtime_error("GC_TIER_SCHEME: bad level " + k);
++                t.level_m[l] = v;
++            } else throw std::runtime_error("GC_TIER_SCHEME: unknown key " + k);
++        }
++        std::cerr << "GC_TIER_SCHEME: " << text << std::endl;
++        return t;
++    }();
++    return scheme;
++}
++
+ static PackedPolygon pack_admin_polygon(const ParsedData& data, const AdminPolygon& ap,
+                                         double epsilon_scale) {
+     if (ap.vertex_count < 3) return {};  // tombstone, or no area to draw
+@@ -1076,12 +1116,16 @@ static PackedPolygon pack_admin_polygon(const ParsedData& data, const AdminPolyg
+     if (epsilon_scale > 0) {
+         // Each ring on its own: simplifying the keyhole range as one ring
+         // would cut its connectors.
+-        double eps_m = admin_epsilon_meters(ap.admin_level) * epsilon_scale;
++        const TierScheme& scheme = tier_scheme();
++        const bool tiered = scheme.set && epsilon_scale == 2.5;
++        double eps_m = tiered ? scheme.level_m[std::min<int>(ap.admin_level, 15)]
++                              : admin_epsilon_meters(ap.admin_level) * epsilon_scale;
++        const double cap = tiered ? scheme.cap : kRingToleranceFraction;
+         std::vector<std::vector<std::pair<double,double>>> hole_rings;
+         for (size_t r = 1; r < rings.size(); r++) hole_rings.push_back(points(rings[r]));
+         std::tie(pts, holes) = simplify_rings(points(rings[0]), hole_rings,
+             [&](const std::vector<std::pair<double,double>>& ring) {
+-                return simplify_polygon_epsilon(ring, ring_tolerance_degrees(ring, eps_m));
++                return simplify_polygon_epsilon(ring, ring_tolerance_degrees(ring, eps_m, cap));
+             });
+     } else {
+         pts = points(RingSpan{0, ap.vertex_count});
+diff --git a/geocoder/builder/src/geometry.h b/geocoder/builder/src/geometry.h
+index f9d740c..b962d59 100644
+--- a/geocoder/builder/src/geometry.h
++++ b/geocoder/builder/src/geometry.h
+@@ -283,9 +283,10 @@ inline constexpr double kRingToleranceFraction = 0.1;
+ 
+ // The tolerance, in degrees, a quality variant simplifies `ring` (closed)
+ // with: eps_m at the ring's first latitude, capped by its size.
+-inline double ring_tolerance_degrees(const std::vector<std::pair<double,double>>& ring, double eps_m) {
++inline double ring_tolerance_degrees(const std::vector<std::pair<double,double>>& ring, double eps_m,
++                                     double fraction = kRingToleranceFraction) {
+     double lat = ring.empty() ? 0.0 : ring[0].first;
+-    return std::min(meters_to_degrees(eps_m, lat), kRingToleranceFraction * std::sqrt(polygon_area(ring)));
++    return std::min(meters_to_degrees(eps_m, lat), fraction * std::sqrt(polygon_area(ring)));
+ }
+ 
+ // Validate a postcode string for the centroid index. Mirrors
+-- 
+2.43.0
+

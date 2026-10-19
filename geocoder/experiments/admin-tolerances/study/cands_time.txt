@@ -1,0 +1,12 @@
+q25_min=/ssd/tiers3/sets6/q25/smallest
+q25_rec=/ssd/tiers3/sets6/q25/recommended
+cap10_min=/ssd/tiers3/sets6/cap10/smallest
+cap10_rec=/ssd/tiers3/sets6/cap10/recommended
+f50_min=/ssd/tiers3/sets6/f50/smallest
+f50_rec=/ssd/tiers3/sets6/f50/recommended
+f75_min=/ssd/tiers3/sets6/f75/smallest
+f75_rec=/ssd/tiers3/sets6/f75/recommended
+d1_min=/ssd/tiers3/sets6/d1/smallest
+d1_rec=/ssd/tiers3/sets6/d1/recommended
+s5i_min=/ssd/tiers3/sets6/s5i/smallest
+s5i_rec=/ssd/tiers3/sets6/s5i/recommended
