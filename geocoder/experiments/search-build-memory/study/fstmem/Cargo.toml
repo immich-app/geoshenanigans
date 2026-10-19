@@ -1,0 +1,12 @@
+[package]
+name = "fstmem"
+version = "0.1.0"
+edition = "2021"
+
+# Experiment only: rebuild an fst key by key and report the builder's live heap.
+[dependencies]
+fst = "0.4"
+memmap2 = "0.9"
+
+[profile.release]
+opt-level = 3
