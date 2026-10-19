@@ -2146,23 +2146,19 @@ impl Index {
         // Convert to result — find best city-like place (city > town > village)
         let mut result = PlaceResult::default();
 
-        // Max search radii. Nominatim's `reverse_place_diameter`
-        // (lib-sql/functions/ranking.sql) is an import-time bound
-        // for the addressline trigger. At query time it filters by
-        // parent_place_id chain membership, which is much stricter
-        // than the bare radius. We can't emulate that so we use
-        // tighter radii — wide enough for the correct quarter/
-        // neighbourhood to win, tight enough to not inject extras.
-        // Per-rank search radii matching Nominatim's
+        // City/town/village search radii, from Nominatim's
         // reverse_place_diameter (lib-sql/functions/ranking.sql):
         //   rank_search ≤ 17 (city):  0.16 deg
         //   rank_search = 18 (town):  0.08 deg
         //   rank_search = 19 (village): 0.04 deg
-        //   rank_search ≥ 20 (suburb/hamlet/quarter/neighbourhood): 0.02 deg
         let max_city = (0.16_f64).to_radians().powi(2);
         let max_town = (0.08_f64).to_radians().powi(2);
         let max_village = (0.04_f64).to_radians().powi(2);
-        let max_rank20 = (0.02_f64).to_radians().powi(2);
+        // A suburb, hamlet, quarter or neighbourhood node is an address
+        // candidate only where its place_node_fuzzy_area reaches: Nominatim
+        // stores the node with that area in location_area_large, and
+        // getNearFeatures picks the areas that cover the feature.
+        let in_own_area = |pt: usize, pn: &PlaceNode| fuzzy_area_holds(pn.lat, pn.lng, place_fuzzy_half_side_m(pt), lat, lng);
 
         // Nominatim's cascading containment gate (placex_triggers.sql
         // lines 597-600): place nodes (isguess=true) are rejected if
@@ -2200,8 +2196,8 @@ impl Index {
             }
         };
 
-        // Each type's nearest node passes when inside its rank's search
-        // radius and gate: the municipality for city/town/village, the
+        // Each type's nearest node passes when inside its search radius or
+        // fuzzy area and gate: the municipality for city/town/village, the
         // current boundary of its rank_address for the others.
         let admissible = |pt: usize| -> bool {
             let Some((d, pn)) = best[pt] else { return false; };
@@ -2209,9 +2205,9 @@ impl Index {
                 0 => d <= max_city && node_inside_municipality(&pn),    // city: 0.16 deg
                 1 => d <= max_town && node_inside_municipality(&pn),    // town: 0.08 deg
                 2 => d <= max_village && node_inside_municipality(&pn), // village: 0.04 deg
-                3 | 4 => d <= max_rank20 && node_inside_boundary(&pn, CurrentBoundaries::SUBURB),
-                5 => d <= max_rank20 && node_inside_boundary(&pn, CurrentBoundaries::NEIGHBOURHOOD),
-                _ => d <= max_rank20 && node_inside_boundary(&pn, CurrentBoundaries::QUARTER),
+                3 | 4 => in_own_area(pt, &pn) && node_inside_boundary(&pn, CurrentBoundaries::SUBURB),
+                5 => in_own_area(pt, &pn) && node_inside_boundary(&pn, CurrentBoundaries::NEIGHBOURHOOD),
+                _ => in_own_area(pt, &pn) && node_inside_boundary(&pn, CurrentBoundaries::QUARTER),
             }
         };
         let nodes = best.map(|b| b.map(|(d, pn)| (d, pn.lat, pn.lng)));
@@ -4005,8 +4001,8 @@ pub fn poi_order(a: &PoiMatch<'_>, b: &PoiMatch<'_>) -> std::cmp::Ordering {
 ///   rank_search ≤ 16 (city):   15000 m
 ///   rank_search ≤ 18 (town):    4000 m
 ///   rank_search ≤ 19 (village): 2000 m  (place=suburb default too)
-///   rank_search ≤ 20 (hamlet):  1000 m  (neighbourhood / quarter)
-///   default:                     500 m
+///   rank_search ≤ 20 (hamlet):  1000 m  (place=quarter too)
+///   default:                     500 m  (place=neighbourhood, rank_search 24)
 /// The area is expand_by_meters: the envelope of ST_Buffer(geography, radius,
 /// 1), a square whose corners lie on the axes at the radius, so the half-side
 /// is the radius. (Lambton is 726 m east of the quarter Paekākā in Wellington
@@ -4016,9 +4012,18 @@ pub fn place_fuzzy_half_side_m(pt: usize) -> f64 {
         0 => 15000.0,              // city
         1 => 4000.0,               // town
         2 | 3 => 2000.0,           // village / suburb (rank_search ≤ 19)
-        4 | 5 | 6 => 1000.0,       // hamlet / neighbourhood / quarter
-        _ => 500.0,
+        4 | 6 => 1000.0,           // hamlet / quarter (rank_search 20)
+        _ => 500.0,                // neighbourhood
     }
+}
+
+/// Whether the place_node_fuzzy_area of a node at (centre_lat, centre_lng)
+/// with this half side in metres holds the point.
+pub fn fuzzy_area_holds(centre_lat: f32, centre_lng: f32, half_m: f64, lat: f64, lng: f64) -> bool {
+    let (lat0, lng0) = (centre_lat as f64, centre_lng as f64);
+    let dlat_m = ((lat - lat0) * 111320.0).abs();
+    let dlng_m = ((lng - lng0) * 111320.0 * lat0.to_radians().cos()).abs();
+    dlat_m <= half_m && dlng_m <= half_m
 }
 
 /// Nominatim's address walk over place nodes (insert_addresslines): ranks in
@@ -4034,22 +4039,18 @@ pub fn place_fuzzy_half_side_m(pt: usize) -> f64 {
 pub fn accept_place_nodes(nodes: &[Option<(f64, f32, f32)>; 7], rank16_taken: bool, mut admissible: impl FnMut(usize) -> bool) -> [bool; 7] {
     let mut accepted = [false; 7];
     // The last accepted node's fuzzy area: (lat, lng, half side in metres).
-    let mut fuzzy: Option<(f64, f64, f64)> = None;
-    let inside_fuzzy = |fuzzy: Option<(f64, f64, f64)>, (lat, lng): (f32, f32)| match fuzzy {
+    let mut fuzzy: Option<(f32, f32, f64)> = None;
+    let inside_fuzzy = |fuzzy: Option<(f32, f32, f64)>, (lat, lng): (f32, f32)| match fuzzy {
         None => true,
-        Some((lat0, lng0, half_m)) => {
-            let dlat_m = ((lat as f64 - lat0) * 111320.0).abs();
-            let dlng_m = ((lng as f64 - lng0) * 111320.0 * lat0.to_radians().cos()).abs();
-            dlat_m <= half_m && dlng_m <= half_m
-        }
+        Some((lat0, lng0, half_m)) => fuzzy_area_holds(lat0, lng0, half_m, lat as f64, lng as f64),
     };
-    let mut passes = |pt: usize, fuzzy: Option<(f64, f64, f64)>| {
+    let mut passes = |pt: usize, fuzzy: Option<(f32, f32, f64)>| {
         nodes[pt].is_some_and(|(_, lat, lng)| inside_fuzzy(fuzzy, (lat, lng)) && admissible(pt))
     };
     let accept = |pt: usize, accepted: &mut [bool; 7]| {
         accepted[pt] = true;
         let (_, lat, lng) = nodes[pt].unwrap();
-        Some((lat as f64, lng as f64, place_fuzzy_half_side_m(pt)))
+        Some((lat, lng, place_fuzzy_half_side_m(pt)))
     };
 
     // Rank 16: the first of city, town, village. When a boundary already
@@ -4857,6 +4858,22 @@ mod pure_helper_tests {
     // A node `east_m` metres east of (0, 0), `dist_sq` from the query.
     fn node_at(east_m: f64, dist_sq: f64) -> Option<(f64, f32, f32)> {
         Some((dist_sq, 0.0, (east_m / 111320.0) as f32))
+    }
+
+    #[test]
+    fn fuzzy_area_is_a_square_of_the_half_side() {
+        let east = |m: f64| m / 111320.0;
+        // A neighbourhood reaches 500 m along each axis, corners included.
+        let neighbourhood = place_fuzzy_half_side_m(5);
+        assert!(fuzzy_area_holds(0.0, 0.0, neighbourhood, 0.0, east(490.0)));
+        assert!(fuzzy_area_holds(0.0, 0.0, neighbourhood, east(490.0), east(490.0)));
+        assert!(!fuzzy_area_holds(0.0, 0.0, neighbourhood, 0.0, east(510.0)));
+        // A quarter reaches 1000 m.
+        assert!(fuzzy_area_holds(0.0, 0.0, place_fuzzy_half_side_m(6), east(990.0), 0.0));
+        assert!(!fuzzy_area_holds(0.0, 0.0, place_fuzzy_half_side_m(6), east(1010.0), 0.0));
+        // East-west metres shrink with the cosine of the node's latitude.
+        assert!(fuzzy_area_holds(60.0, 0.0, 500.0, 60.0, 2.0 * east(490.0)));
+        assert!(!fuzzy_area_holds(60.0, 0.0, 500.0, 60.0, 2.0 * east(510.0)));
     }
 
     #[test]
