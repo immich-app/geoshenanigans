@@ -1826,9 +1826,9 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
         auto write_admin_minimal = [&] {
             // Write admin-minimal tier — smallest useful deployable. Drops:
             //   - place_nodes with place_type ∈ {SUBURB=3, NEIGHBOURHOOD=5, QUARTER=6}
-            //   - admin polygons (and their vertex bytes) whose admin_level
-            //     falls outside [2, 8] (L9 borough, L10 quarter-area,
-            //     L11 admin-postal, L15 place-area markers are skipped).
+            //   - admin polygons (and their vertex bytes) admin_minimal_keeps
+            //     leaves out: L9 borough, L10 quarter-area, L11 admin-postal,
+            //     and L15 place areas ranked below 16.
             // Re-simplifies the kept polygons at q2.5 and writes them to its
             // own stable slots so the on-disk admin_polygons.bin / admin_vertices.bin
             // are self-contained — admin-minimal does NOT share polygon
