@@ -440,19 +440,17 @@ impl Runs {
     }
 
     fn push(&mut self, key: &[u8], p: Posting) -> std::io::Result<()> {
+        let fits = MAX_KEY_BYTES.min(self.arena.capacity());
+        if key.len() > fits {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("Key too long: {} bytes, a run holds {fits}", key.len())));
+        }
+
         if self.arena.len() + key.len() > self.arena.capacity() || self.items.len() == self.items.capacity() {
             self.spill()?;
         }
         let off = self.arena.len() as u32;
         self.arena.extend_from_slice(key);
-        self.items.push(Item {
-            off,
-            len: key.len().min(u16::MAX as usize) as u16,
-            flags: entry_flags(&p),
-            ord: p.ord,
-            entity: p.entity,
-            imp: p.imp_q,
-        });
+        self.items.push(Item { off, len: key.len() as u16, flags: entry_flags(&p), ord: p.ord, entity: p.entity, imp: p.imp_q });
         Ok(())
     }
 
@@ -480,6 +478,17 @@ impl Runs {
         self.arena.clear();
         Ok(())
     }
+}
+
+/// Sort-run memory of each of `threads` workers sharing `mem_mb`; an error below
+/// MIN_RUN_BUDGET_BYTES, where the longest key would not fit a run.
+fn run_budget(mem_mb: usize, threads: usize) -> Result<usize, String> {
+    let budget = (mem_mb << 20) / threads;
+    if budget < MIN_RUN_BUDGET_BYTES {
+        return Err(format!("Sort budget too small: {budget} bytes per thread, at least {MIN_RUN_BUDGET_BYTES}"));
+    }
+
+    Ok(budget)
 }
 
 /// One run entry: u16 key length, key, u32 entity, importance, partial | class << 1, ordinal.
@@ -850,6 +859,9 @@ pub struct KeyRuns {
 /// Key phase of one sub-index: its entities' normalized keys, sorted in bounded runs spilled to
 /// `opts.tmp` (places also writes `places.bnd` to `out`).
 pub fn sort_keys(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<KeyRuns, String> {
+    let threads = opts.threads.max(1);
+    let budget = run_budget(opts.mem_mb, threads)?;
+
     let t0 = Instant::now();
     let mut st = Stats::default();
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
@@ -870,8 +882,6 @@ pub fn sort_keys(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Resul
     let t_src = t0.elapsed();
 
     // ---- keys -> sorted runs, one worker per contiguous range of entities
-    let threads = opts.threads.max(1);
-    let budget = (opts.mem_mb << 20) / threads;
     let n = src.len();
     type RunsOut = (Vec<PathBuf>, u64, u64, u64);
     let results: Vec<Result<RunsOut, String>> = std::thread::scope(|sc| {
@@ -1131,6 +1141,43 @@ mod tests {
     fn map_vec_refuses_to_grow() {
         let mut v: MapVec<u8> = MapVec::with_capacity(2).unwrap();
         v.extend_from_slice(b"abc");
+    }
+
+    #[test]
+    fn run_budget_refuses_less_than_the_longest_key_needs() {
+        for (mem_mb, threads, want) in
+            [(0, 1, None), (1, 16, None), (1, 9, Some((1 << 20) / 9)), (DEFAULT_RUN_BUDGET_MB, 1, Some(DEFAULT_RUN_BUDGET_MB << 20))]
+        {
+            assert_eq!(run_budget(mem_mb, threads).ok(), want, "{mem_mb} MiB, {threads} threads");
+        }
+        assert_eq!(run_budget(0, 1), Err(format!("Sort budget too small: 0 bytes per thread, at least {MIN_RUN_BUDGET_BYTES}")));
+    }
+
+    #[test]
+    fn runs_hold_the_longest_key_at_the_least_budget() {
+        let dir = tmp_dir("runs-longest");
+        let longest = vec![b'z'; MAX_KEY_BYTES];
+        let mut sut = Runs::new(MIN_RUN_BUDGET_BYTES, &dir, "t".into()).unwrap();
+        sut.push(b"a", posting(1, 0, false, 0)).unwrap();
+        sut.push(&longest, posting(2, 0, false, 0)).unwrap();
+        sut.push(b"b", posting(3, 0, false, 0)).unwrap();
+        let (files, _) = sut.finish().unwrap();
+        let keys: Vec<Vec<u8>> = read_all(&files).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec(), longest]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn runs_refuse_a_key_they_cannot_hold() {
+        for (budget, key_len) in [(0, 1), (MIN_RUN_BUDGET_BYTES - 1, MAX_KEY_BYTES), (2 * MIN_RUN_BUDGET_BYTES, MAX_KEY_BYTES + 1)] {
+            let dir = tmp_dir(&format!("runs-refuse-{budget}"));
+            let mut sut = Runs::new(budget, &dir, "t".into()).unwrap();
+            let err = sut.push(&vec![b'z'; key_len], posting(1, 0, false, 0)).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "budget {budget}, key {key_len}");
+            let (files, _) = sut.finish().unwrap();
+            assert!(files.is_empty());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
