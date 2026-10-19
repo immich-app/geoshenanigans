@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
 
 // Which OSM relations Nominatim turns into places, and so which ones become
 // admin, postal or place areas here.
@@ -35,4 +36,15 @@ inline RelationKind area_relation_kind(const char* boundary, bool has_place) {
     if (has_place) return RelationKind::PLACE;
 
     return RelationKind::NONE;
+}
+
+// The postcode of a boundary=postal_code relation, from the address tags
+// Nominatim reads it from (presets.lua, ADDRESS_TAGS.core postcode keys).
+// Null when it has none: Nominatim then makes no postcode area, and the name
+// never stands in.
+template <typename GetTag>
+inline const char* postal_area_code(GetTag tag) {
+    for (const char* key : {"postal_code", "postcode", "addr:postcode"})
+        if (const char* value = tag(key)) return value;
+    return nullptr;
 }
