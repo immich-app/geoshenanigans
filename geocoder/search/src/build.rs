@@ -427,7 +427,7 @@ struct Runs {
 impl Runs {
     fn new(budget: usize, dir: &Path, tag: String) -> std::io::Result<Self> {
         // Fixed capacities: a run spills when either fills, so memory never exceeds the budget.
-        let arena_cap = budget * 6 / 10;
+        let arena_cap = budget * RUN_ARENA_PERCENT / 100;
         let items_cap = (budget - arena_cap) / std::mem::size_of::<Item>();
         Ok(Runs {
             arena: MapVec::with_capacity(arena_cap)?,
