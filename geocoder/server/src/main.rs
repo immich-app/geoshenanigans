@@ -291,10 +291,11 @@ async fn polygons_geojson(
             // raw [NodeCoord] cast (which produces nonsense floats).
             let Some(verts) = idx.admin_verts(&poly) else { continue; };
             if !point_in_polygon(lat as f32, lng as f32, &verts) { continue; }
-            let coords: Vec<[f64; 2]> = verts.iter().map(|v| [v.lng as f64, v.lat as f64]).collect();
+            // Keyhole ranges: the outer ring and each hole as rings of their own.
+            let rings = geojson_rings(&verts, poly.hole_count);
             features.push(serde_json::json!({
                 "type": "Feature",
-                "geometry": { "type": "Polygon", "coordinates": [coords] },
+                "geometry": { "type": "Polygon", "coordinates": rings },
                 "properties": {
                     "name": idx.get_string(poly.name_id),
                     "admin_level": poly.admin_level,
@@ -313,10 +314,10 @@ async fn polygons_geojson(
                     poly.vertex_offset, poly.vertex_count
                 ) else { continue; };
                 if !point_in_polygon(lat as f32, lng as f32, &verts) { continue; }
-                let coords: Vec<[f64; 2]> = verts.iter().map(|v| [v.lng as f64, v.lat as f64]).collect();
+                let rings = geojson_rings(&verts, poly.hole_count);
                 features.push(serde_json::json!({
                     "type": "Feature",
-                    "geometry": { "type": "Polygon", "coordinates": [coords] },
+                    "geometry": { "type": "Polygon", "coordinates": rings },
                     "properties": {
                         "name": idx.get_string(poly.name_id),
                         "admin_level": 99,
