@@ -17,7 +17,7 @@ use std::collections::{BinaryHeap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub struct BuildOpts {
     pub threads: usize,
@@ -816,8 +816,38 @@ fn vm_hwm_kb() -> u64 {
         .unwrap_or(0)
 }
 
-/// Build one sub-index ("places" or "poi") of the flat set `geo` into `out`.
-pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<Stats, String> {
+/// Builds the sub-indexes `names` ("places", "poi") of the flat set `geo` into `out`: every key
+/// phase first, then every merge, so a merge's heap (the fst builder) is never held beside a key
+/// phase's sort buffers.
+pub fn build(geo: &Index, names: &[&str], out: &Path, opts: &BuildOpts) -> Result<Vec<(String, Stats)>, String> {
+    let mut runs = Vec::with_capacity(names.len());
+    for name in names {
+        runs.push(sort_keys(geo, name, out, opts)?);
+    }
+    let mut stats = Vec::with_capacity(runs.len());
+    for r in runs {
+        let name = r.name.clone();
+        stats.push((name, merge(r, out, opts)?));
+    }
+    Ok(stats)
+}
+
+/// One sub-index between its two phases: its sorted runs on disk.
+pub struct KeyRuns {
+    name: String,
+    files: Vec<PathBuf>,
+    with_names: bool,
+    st: Stats,
+    ents: u64,
+    entries: u64,
+    spilled: u64,
+    t_src: Duration,
+    t_keys: Duration,
+}
+
+/// Key phase of one sub-index: its entities' normalized keys, sorted in bounded runs spilled to
+/// `opts.tmp` (places also writes `places.bnd` to `out`).
+pub fn sort_keys(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<KeyRuns, String> {
     let t0 = Instant::now();
     let mut st = Stats::default();
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
@@ -889,12 +919,17 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
         files.extend(f);
     }
     drop(src);
-    let t_runs = t0.elapsed();
+    let t_keys = t0.elapsed() - t_src;
+    Ok(KeyRuns { name: name.to_string(), files, with_names: extras.is_some(), st, ents, entries, spilled, t_src, t_keys })
+}
 
-    // ---- merge -> fst + postings + prefix table
+/// Merge phase of one sub-index: its runs -> `<name>.fst`, `.post`, `.pfx.fst` and `.pfx` in `out`.
+pub fn merge(runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, String> {
+    let t0 = Instant::now();
+    let KeyRuns { name, files, with_names, mut st, ents, entries, spilled, t_src, t_keys } = runs;
+    let name = name.as_str();
     let n_runs = files.len();
     let (files, rewritten) = reduce_runs(files, &opts.tmp, name).map_err(|e| e.to_string())?;
-    let with_names = extras.is_some();
     let mk = |ext: &str| File::create(out.join(format!("{name}.{ext}"))).map_err(|e| e.to_string());
     let mut w = Writer {
         fst: fst::MapBuilder::new(BufWriter::with_capacity(WRITE_BUFFER, mk("fst")?)).map_err(|e| e.to_string())?,
@@ -990,9 +1025,9 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
         st.add("bytes bnd", std::fs::metadata(out.join("places.bnd")).map(|m| m.len()).unwrap_or(0));
     }
     st.add("time sources s", format!("{:.2}", t_src.as_secs_f64()));
-    st.add("time keys+runs s", format!("{:.2}", (t_runs - t_src).as_secs_f64()));
-    st.add("time merge+write s", format!("{:.2}", (t_merge - t_runs).as_secs_f64()));
-    st.add("time total s", format!("{:.2}", t_merge.as_secs_f64()));
+    st.add("time keys+runs s", format!("{:.2}", t_keys.as_secs_f64()));
+    st.add("time merge+write s", format!("{:.2}", t_merge.as_secs_f64()));
+    st.add("time total s", format!("{:.2}", (t_src + t_keys + t_merge).as_secs_f64()));
     st.add("VmHWM MiB", format!("{:.1}", vm_hwm_kb() as f64 / 1024.0));
     Ok(st)
 }

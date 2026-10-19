@@ -74,14 +74,13 @@ fn cmd_build(args: &[String]) {
     if (sub == "poi" || sub == "all") && geo.poi_records.is_some() {
         subs.push("poi");
     }
-    for s in subs {
-        let st = build(&geo, s, &out, &opts).unwrap_or_else(|e| panic!("build {s}: {e}"));
+    for (s, st) in build(&geo, &subs, &out, &opts).unwrap_or_else(|e| panic!("build: {e}")) {
         let mut o = serde_json::Map::new();
         for (k, v) in &st.lines {
             eprintln!("{s}: {k}: {v}");
             o.insert(k.clone(), json!(v));
         }
-        meta[s] = serde_json::Value::Object(o);
+        meta[s.as_str()] = serde_json::Value::Object(o);
     }
     let _ = std::fs::remove_dir(&opts.tmp);
     std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
