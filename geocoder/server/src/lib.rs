@@ -2146,18 +2146,10 @@ impl Index {
         // Convert to result — find best city-like place (city > town > village)
         let mut result = PlaceResult::default();
 
-        // City/town/village search radii, from Nominatim's
-        // reverse_place_diameter (lib-sql/functions/ranking.sql):
-        //   rank_search ≤ 17 (city):  0.16 deg
-        //   rank_search = 18 (town):  0.08 deg
-        //   rank_search = 19 (village): 0.04 deg
-        let max_city = (0.16_f64).to_radians().powi(2);
-        let max_town = (0.08_f64).to_radians().powi(2);
-        let max_village = (0.04_f64).to_radians().powi(2);
-        // A suburb, hamlet, quarter or neighbourhood node is an address
-        // candidate only where its place_node_fuzzy_area reaches: Nominatim
-        // stores the node with that area in location_area_large, and
-        // getNearFeatures picks the areas that cover the feature.
+        // A place node is an address candidate only where its
+        // place_node_fuzzy_area reaches: Nominatim stores the node with that
+        // area in location_area_large, and getNearFeatures picks the areas
+        // that cover the feature.
         let in_own_area = |pt: usize, pn: &PlaceNode| fuzzy_area_holds(pn.lat, pn.lng, place_fuzzy_half_side_m(pt), lat, lng);
 
         // Nominatim's cascading containment gate (placex_triggers.sql
@@ -2196,15 +2188,13 @@ impl Index {
             }
         };
 
-        // Each type's nearest node passes when inside its search radius or
-        // fuzzy area and gate: the municipality for city/town/village, the
-        // current boundary of its rank_address for the others.
+        // Each type's nearest node passes when inside its fuzzy area and gate:
+        // the municipality for city/town/village, the current boundary of its
+        // rank_address for the others.
         let admissible = |pt: usize| -> bool {
-            let Some((d, pn)) = best[pt] else { return false; };
+            let Some((_, pn)) = best[pt] else { return false; };
             match pt {
-                0 => d <= max_city && node_inside_municipality(&pn),    // city: 0.16 deg
-                1 => d <= max_town && node_inside_municipality(&pn),    // town: 0.08 deg
-                2 => d <= max_village && node_inside_municipality(&pn), // village: 0.04 deg
+                0..=2 => in_own_area(pt, &pn) && node_inside_municipality(&pn),
                 3 | 4 => in_own_area(pt, &pn) && node_inside_boundary(&pn, CurrentBoundaries::SUBURB),
                 5 => in_own_area(pt, &pn) && node_inside_boundary(&pn, CurrentBoundaries::NEIGHBOURHOOD),
                 _ => in_own_area(pt, &pn) && node_inside_boundary(&pn, CurrentBoundaries::QUARTER),
@@ -4053,13 +4043,17 @@ pub fn accept_place_nodes(nodes: &[Option<(f64, f32, f32)>; 7], rank16_taken: bo
         Some((lat, lng, place_fuzzy_half_side_m(pt)))
     };
 
-    // Rank 16: the first of city, town, village. When a boundary already
-    // holds the rank (e.g. a linked place boundary), no node is considered:
-    // hiding a linked city node otherwise let the town slot latch onto a
-    // *different* far-away town (Nelson NZ picked Richmond across the bay),
-    // and the cascade then rejected the correct suburb/quarter.
+    // Rank 16: the nearest of city, town and village, their distances
+    // weighed by rank_search as insert_addresslines orders them (city 16:
+    // 0.25, town 18: 0.5, village 19: 1). When a boundary already holds the
+    // rank (e.g. a linked place boundary), no node is considered: hiding a
+    // linked city node otherwise let the town slot latch onto a *different*
+    // far-away town (Nelson NZ picked Richmond across the bay), and the
+    // cascade then rejected the correct suburb/quarter.
     if !rank16_taken {
-        if let Some(pt) = [0, 1, 2].into_iter().find(|&pt| passes(pt, None)) {
+        let weighed = |pt: usize| nodes[pt].map_or(f64::MAX, |(d, _, _)| d.sqrt() * [0.25, 0.5, 1.0][pt]);
+        let passing: Vec<usize> = [0, 1, 2].into_iter().filter(|&pt| passes(pt, None)).collect();
+        if let Some(pt) = passing.into_iter().min_by(|&a, &b| weighed(a).total_cmp(&weighed(b))) {
             fuzzy = accept(pt, &mut accepted);
         }
     }
@@ -4904,12 +4898,17 @@ mod pure_helper_tests {
     fn place_nodes_one_entry_at_rank_16_and_20() {
         let mut nodes = [None; 7];
         nodes[0] = node_at(0.0, 9.0);
-        nodes[1] = node_at(100.0, 1.0);
+        nodes[1] = node_at(100.0, 2.0);
+        nodes[2] = node_at(150.0, 1.0);
         nodes[3] = node_at(200.0, 2.0);
         nodes[4] = node_at(300.0, 1.0);
-        // City before town however near; the nearer of suburb and hamlet.
+        // A city 3 away weighs 0.75, a town 1.41 away 0.71, a village 1 away
+        // 1: the town; the nearer of suburb and hamlet.
+        assert_eq!(accept_place_nodes(&nodes, false, |_| true), [false, true, false, false, true, false, false]);
+        // A city 2 away (0.5) beats the town.
+        nodes[0] = node_at(0.0, 4.0);
         assert_eq!(accept_place_nodes(&nodes, false, |_| true), [true, false, false, false, true, false, false]);
-        // A boundary at rank 16 leaves city and town out.
+        // A boundary at rank 16 leaves city, town and village out.
         assert_eq!(accept_place_nodes(&nodes, true, |_| true), [false, false, false, false, true, false, false]);
     }
 
