@@ -908,10 +908,9 @@ pub struct AdminScan {
 impl AdminScan {
     pub fn new(index: &Index, lat: f64, lng: f64) -> Self {
         let cell = cell_id_at_level(lat, lng, index.admin_cell_level);
-        let lists = std::iter::once(cell)
-            .chain(cell_neighbors_at_level(cell, index.admin_cell_level))
-            .map(|c| Index::lookup_admin_cell_fb(&index.admin_cells, c))
-            .collect();
+        let cells: Vec<u64> = std::iter::once(cell).chain(cell_neighbors_at_level(cell, index.admin_cell_level)).collect();
+        let mut lists = vec![NO_DATA; cells.len()];
+        Index::lookup_admin_cells_fb(&index.admin_cells, &cells, &mut lists);
         AdminScan { lists, pip: PipMemo::new(lat, lng) }
     }
 
@@ -1370,6 +1369,43 @@ impl Index {
             } else if mid_id < cell_id { lo = mid + 1; } else { hi = mid; }
         }
         NO_DATA
+    }
+
+    /// `lookup_admin_cell_fb` for each of `ids` (NO_DATA where absent). Cells next to each other
+    /// on the map mostly sit close together in the index, so after one binary search each further
+    /// cell, in id order, is found by galloping forward from the previous one.
+    pub fn lookup_admin_cells_fb(cells: &FileBytes, ids: &[u64], out: &mut [u32]) {
+        const STRIDE: u64 = 12;
+        let count = cells.len() / STRIDE;
+        let key = |i: u64| u64::from_le_bytes(cells.read_chunk(i * STRIDE, 8)[..].try_into().unwrap());
+        let mut order: Vec<usize> = (0..ids.len()).collect();
+        order.sort_unstable_by_key(|&k| ids[k]);
+        // Every id not yet looked up has its lower bound at or after `base`.
+        let mut base = 0;
+        for (n, &k) in order.iter().enumerate() {
+            let id = ids[k];
+            let mut end = count;
+            if n > 0 {
+                // Gallop: widen [base, end) until key(end - 1) >= id.
+                let mut step = 1;
+                end = base;
+                loop {
+                    end = (end + step).min(count);
+                    if end == count || key(end - 1) >= id { break; }
+                    base = end;
+                    step *= 2;
+                }
+            }
+            while base < end {
+                let mid = base + (end - base) / 2;
+                if key(mid) < id { base = mid + 1; } else { end = mid; }
+            }
+            out[k] = if base < count && key(base) == id {
+                u32::from_le_bytes(cells.read_chunk(base * STRIDE + 8, 4)[..].try_into().unwrap())
+            } else {
+                NO_DATA
+            };
+        }
     }
 
     // geo_cells is a 20-byte-stride sorted index — binary search it
@@ -6754,6 +6790,37 @@ mod admin_scan_tests {
         // No admin_parents: the chain lookup falls back to find_admin over the same scan.
         let c = idx.find_admin_from_chain_in(0, &mut scan);
         assert_eq!((c.country, c.state, c.neighbourhood), (Some("Egypt"), Some("New Valley"), Some("Bir Tarfawi")));
+    }
+
+    #[test]
+    fn lookup_admin_cells_fb_finds_what_one_by_one_lookups_find() {
+        let mut rng = super::encoded_pip_tests::Rng::new(11);
+        for size in [0usize, 1, 2, 3, 10, 1000] {
+            // A sorted index of distinct cell ids with gaps; offsets are the ids' ranks.
+            let mut ids: Vec<u64> = (0..size).map(|_| rng.next() % 5000 * 2).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            let mut index = Vec::new();
+            for (rank, id) in ids.iter().enumerate() {
+                index.extend_from_slice(&id.to_le_bytes());
+                index.extend_from_slice(&(rank as u32 * 7).to_le_bytes());
+            }
+            let cells = FileBytes::Owned(index);
+            for _ in 0..200 {
+                // Present, absent (odd), duplicated and out-of-range ids, in any order.
+                let n = 1 + (rng.next() % 9) as usize;
+                let near = rng.next() % 10_000;
+                let query: Vec<u64> = (0..n).map(|_| match rng.next() % 4 {
+                    0 if !ids.is_empty() => ids[(rng.next() % ids.len() as u64) as usize],
+                    1 => u64::MAX - rng.next() % 3,
+                    _ => near + rng.next() % 40,
+                }).collect();
+                let mut got = vec![0u32; n];
+                Index::lookup_admin_cells_fb(&cells, &query, &mut got);
+                let want: Vec<u32> = query.iter().map(|&c| Index::lookup_admin_cell_fb(&cells, c)).collect();
+                assert_eq!(got, want, "index of {} cells, query {query:?}", ids.len());
+            }
+        }
     }
 
     #[test]
