@@ -779,8 +779,12 @@ pub fn continents() -> &'static [Continent] {
 /// ring can contain the point without listing its cell (Egypt's 660 km edge on 22°N bows 3.3 km
 /// north of the parallel).
 pub struct AdminScan {
-    /// Entry-list offsets: the point's own cell first, then `cell_neighbors_at_level` order.
-    lists: Vec<u32>,
+    /// The entries of the point's own cell, then of its neighbours in `cell_neighbors_at_level`
+    /// order, each with its polygon record (entries whose record `Index::admin_polygon` rejects
+    /// are left out).
+    rings: Vec<(u32, AdminPolygon)>,
+    /// How many of `rings` come from the own cell.
+    own_cell_rings: usize,
     pip: PipMemo,
 }
 
@@ -790,13 +794,20 @@ impl AdminScan {
         let cells: Vec<u64> = std::iter::once(cell).chain(cell_neighbors_at_level(cell, index.admin_cell_level)).collect();
         let mut lists = vec![NO_DATA; cells.len()];
         Index::lookup_admin_cells_fb(&index.admin_cells, &cells, &mut lists);
-        AdminScan { lists, pip: PipMemo::new(lat, lng) }
+        let (mut rings, mut own_cell_rings) = (Vec::new(), 0);
+        for (k, &list) in lists.iter().enumerate() {
+            Index::for_each_entry_fb(&index.admin_entries, list, |id| {
+                if let Some(poly) = index.admin_polygon(id & ID_MASK) { rings.push((id, poly)); }
+            });
+            if k == 0 { own_cell_rings = rings.len(); }
+        }
+        AdminScan { rings, own_cell_rings, pip: PipMemo::new(lat, lng) }
     }
 
-    /// Calls `f(pip, in_own_cell, entry)` for every entry of every list, in visiting order.
-    fn for_each_entry(&mut self, entries: &FileBytes, mut f: impl FnMut(&mut PipMemo, bool, u32)) {
-        for (k, &list) in self.lists.iter().enumerate() {
-            Index::for_each_entry_fb(entries, list, |id| f(&mut self.pip, k == 0, id));
+    /// Calls `f(pip, in_own_cell, entry, polygon)` for every ring, in visiting order.
+    fn for_each_entry(&mut self, mut f: impl FnMut(&mut PipMemo, bool, u32, AdminPolygon)) {
+        for (i, &(id, poly)) in self.rings.iter().enumerate() {
+            f(&mut self.pip, i < self.own_cell_rings, id, poly);
         }
     }
 }
@@ -1755,14 +1766,13 @@ impl Index {
         // best_by_level[]. Stored as (poly_id, AdminPolygon) so we can dedup by id.
         let mut place_area_polygons: Vec<(u32, AdminPolygon)> = Vec::new();
 
-        scan.for_each_entry(&self.admin_entries, |pip, in_own_cell, id| {
+        scan.for_each_entry(|pip, in_own_cell, id, poly| {
             // The interior flag on a (cell, polygon) entry proves
             // containment only for queries INSIDE that cell; honoring a
             // neighbour's flag claimed containment for points up to a full
             // cell away (a Dutch query 'inside' a German naturpark).
             let is_interior = in_own_cell && (id & INTERIOR_FLAG) != 0;
             let poly_id = id & ID_MASK;
-            let Some(poly) = self.admin_polygon(poly_id) else { return; };
             if poly.admin_level == 15 {
                 if poly.area <= 0.0 { return; }
                 if !pip.admin_pip(self, poly_id, &poly) { return; }
@@ -2146,9 +2156,8 @@ impl Index {
     fn smallest_containing(&self, scan: &mut AdminScan, levels: std::ops::RangeInclusive<u8>) -> Option<AdminPolygon> {
         let mut best: Option<AdminPolygon> = None;
         let mut best_area: f32 = f32::MAX;
-        scan.for_each_entry(&self.admin_entries, |pip, _, id| {
+        scan.for_each_entry(|pip, _, id, poly| {
             let poly_id = id & ID_MASK;
-            let Some(poly) = self.admin_polygon(poly_id) else { return; };
             if !levels.contains(&poly.admin_level) { return; }
             if poly.area >= best_area { return; }
             if pip.admin_pip(self, poly_id, &poly) {
@@ -2763,9 +2772,8 @@ impl Index {
         // PIP from the query point — these aren't in the parent chain
         // but provide place-area rank promotions.
         let mut place_area_polygons: Vec<AdminPolygon> = Vec::new();
-        scan.for_each_entry(&self.admin_entries, |pip, _, id| {
+        scan.for_each_entry(|pip, _, id, poly| {
             let poly_id = id & ID_MASK;
-            let Some(poly) = self.admin_polygon(poly_id) else { return; };
             if poly.admin_level != 15 { return; }
             if poly.area <= 0.0 { return; }
             if !pip.admin_pip(self, poly_id, &poly) { return; }
