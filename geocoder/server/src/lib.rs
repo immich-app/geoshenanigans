@@ -1579,7 +1579,8 @@ impl Index {
     }
 
     pub fn debug_places(&self, lat: f64, lng: f64) -> serde_json::Value {
-        let current_boundaries = self.find_current_boundaries(lat, lng, self.find_admin(lat, lng).country_code);
+        let mut admin = self.find_admin(lat, lng);
+        let current_boundaries = self.find_current_boundaries(&mut admin.containment, admin.country_code);
         let place = self.find_places(lat, lng, PlaceFeature::Point(lat, lng), &current_boundaries, 0);
 
         let place_cells = match &self.place_cells {
@@ -1716,14 +1717,15 @@ impl Index {
     pub fn find_admin(&self, lat: f64, lng: f64) -> AdminResult<'_> {
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
+        let mut containment = Containment::at(lat, lng);
 
         // For each admin level, find the smallest-area polygon actually containing
         // the point. Interior flags are used as a fast path for uncontested cells,
         // but PIP is always run when a polygon would win the smallest-area contest
         // (interior flags can be wrong at polygon borders, e.g. NJ/NY).
-        // (area, poly, pip_verified) — owned AdminPolygon values so the
+        // (area, id, poly, pip_verified) — owned AdminPolygon values so the
         // backing admin_polygons file can be a chunked source.
-        let mut best_by_level: [Option<(f32, AdminPolygon, bool)>; 12] = [None; 12];
+        let mut best_by_level: [Option<(f32, u32, AdminPolygon, bool)>; 12] = [None; 12];
         // Class='place' polygons (admin_level=15 marker).  Stored as
         // (poly_id, AdminPolygon) so we can dedup by id (the original
         // pointer-equality dedup doesn't survive owned copies).
@@ -1749,26 +1751,19 @@ impl Index {
                 if level == 2 && poly.country_code == 0 { return; }
                 if poly.area <= 0.0 { return; }
 
-                // Decoded only when the polygon is tested; one that doesn't
-                // decode holds nothing.
-                let holds = || self.admin_verts(&poly).is_some_and(|verts| point_in_polygon(lat as f32, lng as f32, &verts));
-
-                if let Some((best_area, _, best_verified)) = best_by_level[level] {
+                if let Some((best_area, best_id, best_poly, best_verified)) = best_by_level[level] {
                     if poly.area >= best_area {
                         // Larger than current best — skip unless current best is unverified
                         // and this one can be verified
                         if !best_verified {
                             // Current best only passed via interior flag — verify it now
-                            let (_, best_poly, _) = best_by_level[level].unwrap();
-                            let bverts = self.admin_verts(&best_poly);
-                            let best_inside = bverts.as_deref().map(|b| point_in_polygon(lat as f32, lng as f32, b)).unwrap_or(false);
-                            if best_inside {
-                                best_by_level[level] = Some((best_area, best_poly, true));
+                            if containment.holds(self, best_id, &best_poly) {
+                                best_by_level[level] = Some((best_area, best_id, best_poly, true));
                             } else {
                                 // Best was wrong — try this polygon instead
-                                let pip = holds();
+                                let pip = containment.holds(self, poly_id, &poly);
                                 if is_interior || pip {
-                                    best_by_level[level] = Some((poly.area, poly, pip));
+                                    best_by_level[level] = Some((poly.area, poly_id, poly, pip));
                                 } else {
                                     best_by_level[level] = None;
                                 }
@@ -1777,17 +1772,16 @@ impl Index {
                         return;
                     }
                     // This polygon is smaller — must verify with PIP
-                    let pip = holds();
-                    if pip {
-                        best_by_level[level] = Some((poly.area, poly, true));
+                    if containment.holds(self, poly_id, &poly) {
+                        best_by_level[level] = Some((poly.area, poly_id, poly, true));
                     }
                     // If PIP fails, keep existing best
                 } else {
                     // No existing candidate — accept with interior flag, verify later if contested
                     if is_interior {
-                        best_by_level[level] = Some((poly.area, poly, false));
-                    } else if holds() {
-                        best_by_level[level] = Some((poly.area, poly, true));
+                        best_by_level[level] = Some((poly.area, poly_id, poly, false));
+                    } else if containment.holds(self, poly_id, &poly) {
+                        best_by_level[level] = Some((poly.area, poly_id, poly, true));
                     }
                 }
             });
@@ -1795,15 +1789,8 @@ impl Index {
 
         // Verify any uncontested winners that only passed via interior flag
         for level in 0..12 {
-            if let Some((area, poly, false)) = best_by_level[level] {
-                let inside = self.admin_verts(&poly)
-                    .map(|v| point_in_polygon(lat as f32, lng as f32, &v))
-                    .unwrap_or(false);
-                if inside {
-                    best_by_level[level] = Some((area, poly, true));
-                } else {
-                    best_by_level[level] = None;
-                }
+            if let Some((area, id, poly, false)) = best_by_level[level] {
+                best_by_level[level] = containment.holds(self, id, &poly).then_some((area, id, poly, true));
             }
         }
 
@@ -1819,8 +1806,7 @@ impl Index {
                 let Some(poly) = self.admin_polygon(poly_id) else { return; };
                 if poly.admin_level != 15 { return; }
                 if poly.area <= 0.0 { return; }
-                let Some(verts) = self.admin_verts(&poly) else { return; };
-                if !point_in_polygon(lat as f32, lng as f32, &verts) { return; }
+                if !containment.holds(self, poly_id, &poly) { return; }
                 if !place_area_polygons.iter().any(|(pid, _)| *pid == poly_id) {
                     place_area_polygons.push((poly_id, poly));
                 }
@@ -1831,7 +1817,7 @@ impl Index {
 
         // Get country code from level 2 polygon
         let country_code_str: String = best_by_level[2]
-            .and_then(|(_, poly, _)| {
+            .and_then(|(_, _, poly, _)| {
                 if poly.country_code != 0 {
                     Some(format!("{}{}",
                         (poly.country_code >> 8) as u8 as char,
@@ -1885,7 +1871,7 @@ impl Index {
         // promote_nested_ranks then gives them their effective one.
         let mut ranked: Vec<RankedPoly> = Vec::new();
         for level in 0..12 {
-            if let Some((_, poly, _)) = best_by_level[level] {
+            if let Some((_, _, poly, _)) = best_by_level[level] {
                 if poly.admin_level == 11 { continue; } // postal code, handled separately
 
                 let initial_rank = self.admin_config.to_rank(&country_code_str, poly.admin_level);
@@ -2000,6 +1986,7 @@ impl Index {
         result.quarter        = best_by_field[15].as_ref().map(|c| c.name);
         result.neighbourhood  = best_by_field[16].as_ref().map(|c| c.name);
         result.city_block     = best_by_field[17].as_ref().map(|c| c.name);
+        result.containment = containment;
 
         result
     }
@@ -2016,11 +2003,13 @@ impl Index {
     // Rome's neighbourhood nodes out. The smallest containing polygon stands
     // in for the most specific accepted boundary. The rank is placex's
     // rank_address, after the nested-boundary promotions (CurrentBoundaries::
-    // from_ranked).
-    pub fn find_current_boundaries(&self, lat: f64, lng: f64, country_code: Option<[u8; 2]>) -> CurrentBoundaries {
+    // from_ranked). They are found at the point of `containment`, which keeps
+    // the polygons find_admin tested there from being decoded again.
+    pub fn find_current_boundaries(&self, containment: &mut Containment, country_code: Option<[u8; 2]>) -> CurrentBoundaries {
         let cc: String = country_code
             .map(|c| c.iter().map(|b| b.to_ascii_uppercase() as char).collect())
             .unwrap_or_default();
+        let (lat, lng) = containment.point;
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
 
@@ -2041,13 +2030,10 @@ impl Index {
                 }
             });
         }
-        let holds = |poly: &AdminPolygon| {
-            self.admin_verts(poly).is_some_and(|verts| point_in_polygon(lat as f32, lng as f32, &verts))
-        };
-        let holding = |mut polys: Vec<(f32, u32, AdminPolygon)>| -> Vec<AdminPolygon> {
+        let mut holding = |mut polys: Vec<(f32, u32, AdminPolygon)>| -> Vec<AdminPolygon> {
             polys.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
             polys.dedup_by_key(|p| p.1);
-            polys.into_iter().map(|(_, _, poly)| poly).filter(|poly| holds(poly)).collect()
+            polys.into_iter().filter(|(_, id, poly)| containment.holds(self, *id, poly)).map(|(_, _, poly)| poly).collect()
         };
         let ranked: Vec<RankedPoly> = holding(boundaries).into_iter()
             .map(|poly| RankedPoly { poly, rank_address: self.admin_config.to_rank(&cc, poly.admin_level) })
@@ -2837,6 +2823,7 @@ impl Index {
                 city_block: admin_pip.city_block,
                 // The place-node ranks (16 and up) are PIP's.
                 boundary_ranks: admin_pip.boundary_ranks,
+                containment: admin_pip.containment,
             },
             None => admin_pip,
         }
@@ -2918,10 +2905,10 @@ impl Index {
         // Run geo lookups first so we know the primary street
         let (addr, interp, street) = self.query_geo(lat, lng);
 
-        let admin = self.resolve_admin(lat, lng, street.as_ref());
+        let mut admin = self.resolve_admin(lat, lng, street.as_ref());
         // The boundaries place nodes must sit inside to be accepted in the
         // address walk (Nominatim's `current_boundary`).
-        let current_boundaries = self.find_current_boundaries(lat, lng, admin.country_code);
+        let current_boundaries = self.find_current_boundaries(&mut admin.containment, admin.country_code);
         // address_havelevel: the ranks the address's boundaries hold take no
         // place node. A boundary-derived city/town/village covers rank 16
         // whatever its rank, so place nodes must not fill (or fuzzy-anchor
@@ -4304,6 +4291,39 @@ pub struct AdminResult<'a> {
     /// rank_address of the boundaries in the address, a bit per rank: the
     /// ranks they take before any place node (address_havelevel).
     pub boundary_ranks: u32,
+    /// The admin polygons find_admin tested at its point.
+    pub containment: Containment,
+}
+
+/// Which admin polygons hold one point, each decoded and ray-cast once:
+/// find_admin and find_current_boundaries test the same polygons near the
+/// same point.
+#[derive(Default)]
+pub struct Containment {
+    /// (lat, lng) of the point.
+    pub point: (f64, f64),
+    /// (polygon id, holds the point) of the polygons tested so far, by id.
+    tested: Vec<(u32, bool)>,
+}
+
+impl Containment {
+    pub fn at(lat: f64, lng: f64) -> Self {
+        Self { point: (lat, lng), tested: Vec::new() }
+    }
+
+    /// Whether admin polygon `id` holds the point; a polygon that doesn't
+    /// decode holds nothing.
+    pub fn holds(&mut self, index: &Index, id: u32, poly: &AdminPolygon) -> bool {
+        let slot = match self.tested.binary_search_by_key(&id, |&(tested, _)| tested) {
+            Ok(k) => return self.tested[k].1,
+            Err(k) => k,
+        };
+
+        let (lat, lng) = self.point;
+        let holds = index.admin_verts(poly).is_some_and(|verts| point_in_polygon(lat as f32, lng as f32, &verts));
+        self.tested.insert(slot, (id, holds));
+        holds
+    }
 }
 
 /// The rank_address bits of the polygons in an address (AdminResult::boundary_ranks).
@@ -5888,6 +5908,38 @@ mod query_path_tests {
             .load();
         assert_eq!(address_at(&index, 37_500.0, 20.0)["hamlet"], "Far End");
         assert_eq!(address_at(&index, 0.0, 20.0)["hamlet"], "Far End");
+    }
+
+    #[test]
+    fn containment_tests_each_polygon_once() {
+        let index = TestIndex::new().boundary("Town", 8, 0, (-1000.0, -1000.0, 1000.0, 1000.0)).load();
+        let town = index.admin_polygon(1).unwrap();
+        let vertexless = AdminPolygon { vertex_count: 0, ..town };
+        let p = at(0.0, 0.0);
+        let mut containment = Containment::at(p.lat as f64, p.lng as f64);
+        assert!(containment.holds(&index, 1, &town));
+        // Asked again, the first answer stands: nothing is decoded.
+        assert!(containment.holds(&index, 1, &vertexless));
+        assert!(!Containment::at(p.lat as f64, p.lng as f64).holds(&index, 1, &vertexless));
+    }
+
+    #[test]
+    fn current_boundaries_reuse_what_find_admin_tested() {
+        // The boundaries at the point are the same with find_admin's
+        // containment as with a fresh one.
+        let index = TestIndex::new()
+            .boundary("Suburbia", 6, 4, (-5000.0, -5000.0, 5000.0, 5000.0))
+            .boundary("Inner", 7, 0, (-1000.0, -1000.0, 1000.0, 1000.0))
+            .boundary("Quarter", 15, 6, (-3000.0, -3000.0, 500.0, 500.0))
+            .load();
+        let names = |found: CurrentBoundaries| found.gates.map(|g| g.map(|p| index.get_string(p.name_id)));
+        for (north, east) in [(0.0, 0.0), (2000.0, 0.0), (0.0, 4000.0), (-2000.0, -2000.0)] {
+            let p = at(north, east);
+            let mut admin = index.find_admin(p.lat as f64, p.lng as f64);
+            let shared = index.find_current_boundaries(&mut admin.containment, admin.country_code);
+            let fresh = index.find_current_boundaries(&mut Containment::at(p.lat as f64, p.lng as f64), admin.country_code);
+            assert_eq!(names(shared), names(fresh), "({north}, {east})");
+        }
     }
 
     #[test]
