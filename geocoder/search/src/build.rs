@@ -1031,3 +1031,183 @@ pub fn merge(runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, Strin
     st.add("VmHWM MiB", format!("{:.1}", vm_hwm_kb() as f64 / 1024.0));
     Ok(st)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// xorshift: deterministic test values without a dependency.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    fn posting(entity: u32, imp_q: u8, partial: bool, class: u8) -> Posting {
+        Posting { entity, imp_q, partial, class, ord: (entity % 16) as u8 }
+    }
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("place-search-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Writes one sorted run of `entries` and returns its path.
+    fn write_run(dir: &Path, name: &str, entries: &mut [(Vec<u8>, Posting)]) -> PathBuf {
+        entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.entity.cmp(&b.1.entity)));
+        let path = dir.join(name);
+        let mut w = BufWriter::new(File::create(&path).unwrap());
+        for (k, p) in entries.iter() {
+            write_entry(&mut w, k, p.entity, p.imp_q, entry_flags(p), p.ord).unwrap();
+        }
+        w.flush().unwrap();
+        path
+    }
+
+    fn read_all(files: &[PathBuf]) -> Vec<(Vec<u8>, Posting)> {
+        let mut m = Merge::open(files).unwrap();
+        let (mut key, mut p) = (Vec::new(), posting(0, 0, false, 0));
+        let mut out = Vec::new();
+        while m.next(&mut key, &mut p) {
+            out.push((key.clone(), p));
+        }
+        out
+    }
+
+    /// `n` runs of random entries; returns the run files and every entry in merge order.
+    fn random_runs(dir: &Path, n: usize, rng: &mut Rng) -> (Vec<PathBuf>, Vec<(Vec<u8>, Posting)>) {
+        let mut all = Vec::new();
+        let mut files = Vec::new();
+        let mut entity = 0u32;
+        for r in 0..n {
+            let mut run: Vec<(Vec<u8>, Posting)> = (0..(1 + rng.next() % 40))
+                .map(|_| {
+                    entity += 1;
+                    let key = format!("k{}", rng.next() % 50).into_bytes();
+                    (key, posting(entity, (rng.next() % 200) as u8, rng.next() % 2 == 0, (rng.next() % 6) as u8))
+                })
+                .collect();
+            files.push(write_run(dir, &format!("t-{r}.run"), &mut run));
+            all.extend(run);
+        }
+        all.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.entity.cmp(&b.1.entity)));
+        (files, all)
+    }
+
+    #[test]
+    fn bits_set_and_get_across_words() {
+        let mut b = Bits::new(130);
+        for i in [0, 63, 64, 129] {
+            b.set(i);
+        }
+        let set: Vec<u32> = (0..130).filter(|&i| b.get(i)).collect();
+        assert_eq!(set, vec![0, 63, 64, 129]);
+    }
+
+    #[test]
+    fn map_vec_holds_what_was_pushed() {
+        let mut v: MapVec<Item> = MapVec::with_capacity(4).unwrap();
+        let item = |entity| Item { off: 0, len: 0, flags: 0, ord: 0, entity, imp: 0 };
+        v.push(item(3));
+        v.extend_from_slice(&[item(1), item(2)]);
+        v.as_mut_slice().sort_unstable_by_key(|it| it.entity);
+        assert_eq!(v.as_slice().iter().map(|it| it.entity).collect::<Vec<_>>(), vec![1, 2, 3]);
+        v.clear();
+        assert!(v.is_empty());
+        assert_eq!(v.capacity(), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "MapVec full")]
+    fn map_vec_refuses_to_grow() {
+        let mut v: MapVec<u8> = MapVec::with_capacity(2).unwrap();
+        v.extend_from_slice(b"abc");
+    }
+
+    #[test]
+    fn merge_streams_runs_in_key_then_entity_order() {
+        let dir = tmp_dir("merge");
+        let (files, all) = random_runs(&dir, 5, &mut Rng(7));
+        assert_eq!(read_all(&files), all);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reduce_runs_merges_only_the_runs_over_the_fan_in() {
+        let dir = tmp_dir("reduce-excess");
+        let (files, all) = random_runs(&dir, MERGE_FAN_IN + 1, &mut Rng(11));
+        let last_two: u64 = files[MERGE_FAN_IN - 1..].iter().map(|f| std::fs::metadata(f).unwrap().len()).sum();
+        let (left, rewritten) = reduce_runs(files.clone(), &dir, "t").unwrap();
+        assert_eq!(left.len(), MERGE_FAN_IN);
+        assert_eq!(left[..MERGE_FAN_IN - 1], files[..MERGE_FAN_IN - 1]);
+        assert_eq!(rewritten, last_two);
+        assert!(!files[MERGE_FAN_IN].exists());
+        assert_eq!(read_all(&left), all);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reduce_runs_takes_passes_until_the_fan_in_is_left() {
+        for n in [MERGE_FAN_IN, 3 * MERGE_FAN_IN + 5, MERGE_FAN_IN * MERGE_FAN_IN + 3] {
+            let dir = tmp_dir(&format!("reduce-{n}"));
+            let (files, all) = random_runs(&dir, n, &mut Rng(n as u64));
+            let (left, rewritten) = reduce_runs(files, &dir, "t").unwrap();
+            assert!(left.len() <= MERGE_FAN_IN);
+            assert_eq!(rewritten == 0, n <= MERGE_FAN_IN);
+            assert_eq!(read_all(&left), all);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// What the index kept before postings were capped while streaming: the whole group sorted,
+    /// one posting per entity, every whole-name posting and the PARTIAL_CAP best trailing-word ones.
+    fn kept_by_sorting(mut group: Vec<Posting>) -> Vec<Posting> {
+        group.sort_unstable_by(|a, b| a.entity.cmp(&b.entity).then((a.partial, a.class).cmp(&(b.partial, b.class))));
+        group.dedup_by_key(|p| p.entity);
+        group.sort_unstable_by(|a, b| b.imp_q.cmp(&a.imp_q).then(a.partial.cmp(&b.partial)).then(a.entity.cmp(&b.entity)));
+        let mut partial_kept = 0;
+        group.retain(|p| {
+            if !p.partial {
+                return true;
+            }
+            partial_kept += 1;
+            partial_kept <= PARTIAL_CAP
+        });
+        group
+    }
+
+    #[test]
+    fn group_keeps_what_sorting_the_whole_group_kept() {
+        let mut rng = Rng(3);
+        for n in [1, 5, PARTIAL_CAP, PARTIAL_CAP + 1, 3 * PARTIAL_CAP + 17] {
+            let postings: Vec<Posting> =
+                (0..n as u32).map(|e| posting(e * 3, (rng.next() % 40) as u8, rng.next() % 4 != 0, (rng.next() % 6) as u8)).collect();
+            let mut sut = Group::default();
+            for p in &postings {
+                sut.push(*p);
+            }
+            let mut got = Vec::new();
+            sut.take(&mut got);
+            assert_eq!(got, kept_by_sorting(postings));
+            assert!(sut.is_empty());
+        }
+    }
+
+    #[test]
+    fn group_keeps_an_entitys_whole_name_claim_over_a_trailing_word() {
+        let mut sut = Group::default();
+        sut.push(posting(9, 10, true, 0));
+        sut.push(posting(9, 10, false, 3));
+        sut.push(posting(12, 50, true, 1));
+        let mut got = Vec::new();
+        sut.take(&mut got);
+        assert_eq!(got, vec![posting(12, 50, true, 1), posting(9, 10, false, 3)]);
+    }
+}
