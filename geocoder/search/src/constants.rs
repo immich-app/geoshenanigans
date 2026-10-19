@@ -71,6 +71,12 @@ pub const BOUNDARY_MAX_LEVEL: u8 = 8;
 pub const DEFAULT_RUN_BUDGET_MB: usize = 16;
 /// Percent of a sort run's memory that holds key bytes; the rest holds its entries.
 pub const RUN_ARENA_PERCENT: usize = 60;
+/// Longest key a sort run holds: a run entry stores the key length as a u16. Folding sets no
+/// length of its own, so the names do: OSM tag values are at most 255 characters and one
+/// character folds to at most 33 bytes (U+FDFA), so a name's key is at most 8,415 bytes.
+pub const MAX_KEY_BYTES: usize = u16::MAX as usize;
+/// Least sort-run memory per thread: its arena share holds a key of MAX_KEY_BYTES.
+pub const MIN_RUN_BUDGET_BYTES: usize = (MAX_KEY_BYTES * 100).div_ceil(RUN_ARENA_PERCENT);
 /// Read buffer per sort run during the merge.
 pub const RUN_READ_BUFFER: usize = 64 * 1024;
 /// Sort runs merged at once; more are first merged in groups of this many into longer runs
