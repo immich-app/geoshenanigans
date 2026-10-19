@@ -446,7 +446,7 @@ impl Runs {
         self.items.push(Item {
             off,
             len: key.len().min(u16::MAX as usize) as u16,
-            flags: (p.partial as u8) | (p.class << 1),
+            flags: entry_flags(&p),
             ord: p.ord,
             entity: p.entity,
             imp: p.imp_q,
@@ -468,14 +468,9 @@ impl Runs {
         let key = |it: &Item| &arena[it.off as usize..it.off as usize + it.len as usize];
         self.items.as_mut_slice().sort_unstable_by(|a, b| key(a).cmp(key(b)).then(a.entity.cmp(&b.entity)));
         let path = self.dir.join(format!("{}-{}.run", self.tag, self.files.len()));
-        let mut w = BufWriter::with_capacity(RUN_READ_BUFFER, File::create(&path)?);
+        let mut w = BufWriter::with_capacity(WRITE_BUFFER, File::create(&path)?);
         for it in self.items.as_slice() {
-            let k = key(it);
-            w.write_all(&it.len.to_le_bytes())?;
-            w.write_all(k)?;
-            w.write_all(&it.entity.to_le_bytes())?;
-            w.write_all(&[it.imp, it.flags, it.ord])?;
-            self.spilled_bytes += 2 + k.len() as u64 + 7;
+            self.spilled_bytes += write_entry(&mut w, key(it), it.entity, it.imp, it.flags, it.ord)?;
         }
         w.flush()?;
         self.files.push(path);
@@ -483,6 +478,94 @@ impl Runs {
         self.arena.clear();
         Ok(())
     }
+}
+
+/// One run entry: u16 key length, key, u32 entity, importance, partial | class << 1, ordinal.
+/// Returns the bytes written.
+fn write_entry(w: &mut impl Write, key: &[u8], entity: u32, imp: u8, flags: u8, ord: u8) -> std::io::Result<u64> {
+    w.write_all(&(key.len() as u16).to_le_bytes())?;
+    w.write_all(key)?;
+    w.write_all(&entity.to_le_bytes())?;
+    w.write_all(&[imp, flags, ord])?;
+    Ok(2 + key.len() as u64 + 7)
+}
+
+fn entry_flags(p: &Posting) -> u8 {
+    (p.partial as u8) | (p.class << 1)
+}
+
+/// The entries of several sorted runs in (key, entity, run) order.
+struct Merge {
+    readers: Vec<RunReader>,
+    heap: BinaryHeap<Head>,
+}
+
+impl Merge {
+    fn open(files: &[PathBuf]) -> std::io::Result<Self> {
+        let mut readers = Vec::with_capacity(files.len());
+        for f in files {
+            readers.push(RunReader { r: BufReader::with_capacity(RUN_READ_BUFFER, File::open(f)?) });
+        }
+        let mut heap = BinaryHeap::with_capacity(readers.len());
+        for (i, r) in readers.iter_mut().enumerate() {
+            let mut h = Head { key: Vec::new(), p: Posting { entity: 0, imp_q: 0, partial: false, class: 0, ord: 0 }, run: i };
+            if r.read_into(&mut h) {
+                heap.push(h);
+            }
+        }
+        Ok(Merge { readers, heap })
+    }
+
+    /// Copies the next entry into `key` and `p`; false after the last.
+    fn next(&mut self, key: &mut Vec<u8>, p: &mut Posting) -> bool {
+        let Some(mut top) = self.heap.peek_mut() else { return false };
+        key.clear();
+        key.extend_from_slice(&top.key);
+        *p = top.p;
+        let run = top.run;
+        if !self.readers[run].read_into(&mut top) {
+            std::collections::binary_heap::PeekMut::pop(top);
+        }
+        true
+    }
+}
+
+/// Merges groups of at most MERGE_FAN_IN consecutive runs into longer runs until at most
+/// MERGE_FAN_IN are left (consecutive, so entries that compare equal keep their run order).
+/// Each pass merges every run while more than MERGE_FAN_IN² are left, then only as many of the
+/// last runs as it takes to leave MERGE_FAN_IN. Returns the runs left and the bytes rewritten.
+fn reduce_runs(mut files: Vec<PathBuf>, dir: &Path, tag: &str) -> std::io::Result<(Vec<PathBuf>, u64)> {
+    let mut rewritten = 0u64;
+    let mut pass = 0;
+    while files.len() > MERGE_FAN_IN {
+        let n = files.len();
+        let excess = n - MERGE_FAN_IN;
+        let merged = if n > MERGE_FAN_IN * MERGE_FAN_IN { n } else { excess + excess.div_ceil(MERGE_FAN_IN - 1) };
+        let mut next = files[..n - merged].to_vec();
+        for (i, group) in files[n - merged..].chunks(MERGE_FAN_IN).enumerate() {
+            if group.len() == 1 {
+                next.push(group[0].clone());
+                continue;
+            }
+            let path = dir.join(format!("{tag}-m{pass}-{i}.run"));
+            let mut w = BufWriter::with_capacity(WRITE_BUFFER, File::create(&path)?);
+            let mut m = Merge::open(group)?;
+            let mut key = Vec::new();
+            let mut p = Posting { entity: 0, imp_q: 0, partial: false, class: 0, ord: 0 };
+            while m.next(&mut key, &mut p) {
+                rewritten += write_entry(&mut w, &key, p.entity, p.imp_q, entry_flags(&p), p.ord)?;
+            }
+            w.flush()?;
+            drop(m);
+            for f in group {
+                let _ = std::fs::remove_file(f);
+            }
+            next.push(path);
+        }
+        files = next;
+        pass += 1;
+    }
+    Ok((files, rewritten))
 }
 
 struct Head {
@@ -745,11 +828,13 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
     let t_runs = t0.elapsed();
 
     // ---- merge -> fst + postings + prefix table
+    let n_runs = files.len();
+    let (files, rewritten) = reduce_runs(files, &opts.tmp, name).map_err(|e| e.to_string())?;
     let with_names = extras.is_some();
     let mk = |ext: &str| File::create(out.join(format!("{name}.{ext}"))).map_err(|e| e.to_string());
     let mut w = Writer {
-        fst: fst::MapBuilder::new(BufWriter::with_capacity(1 << 20, mk("fst")?)).map_err(|e| e.to_string())?,
-        post: BufWriter::with_capacity(1 << 20, mk("post")?),
+        fst: fst::MapBuilder::new(BufWriter::with_capacity(WRITE_BUFFER, mk("fst")?)).map_err(|e| e.to_string())?,
+        post: BufWriter::with_capacity(WRITE_BUFFER, mk("post")?),
         post_len: 0,
         scratch: Vec::new(),
         inline: opts.inline,
@@ -766,37 +851,25 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
         inline_keys: 0,
         longest: 0,
     };
-    let mut readers: Vec<RunReader> = Vec::with_capacity(files.len());
-    for f in &files {
-        readers.push(RunReader { r: BufReader::with_capacity(RUN_READ_BUFFER, File::open(f).map_err(|e| e.to_string())?) });
-    }
-    let mut heap = BinaryHeap::with_capacity(readers.len());
-    for (i, r) in readers.iter_mut().enumerate() {
-        let mut h = Head { key: Vec::new(), p: Posting { entity: 0, imp_q: 0, partial: false, class: 0, ord: 0 }, run: i };
-        if r.read_into(&mut h) {
-            heap.push(h);
-        }
-    }
+    let mut m = Merge::open(&files).map_err(|e| e.to_string())?;
     let mut cur: Vec<u8> = Vec::new();
+    let mut key: Vec<u8> = Vec::new();
+    let mut p = Posting { entity: 0, imp_q: 0, partial: false, class: 0, ord: 0 };
     let mut group: Vec<Posting> = Vec::new();
-    while let Some(mut h) = heap.pop() {
-        if h.key != cur {
+    while m.next(&mut key, &mut p) {
+        if key != cur {
             if !group.is_empty() {
                 w.add(&cur, &mut group)?;
                 group.clear();
             }
-            cur.clear();
-            cur.extend_from_slice(&h.key);
+            std::mem::swap(&mut cur, &mut key);
         }
-        group.push(h.p);
-        if readers[h.run].read_into(&mut h) {
-            heap.push(h);
-        }
+        group.push(p);
     }
     if !group.is_empty() {
         w.add(&cur, &mut group)?;
     }
-    drop(readers);
+    drop(m);
     for f in &files {
         let _ = std::fs::remove_file(f);
     }
@@ -841,8 +914,9 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
     st.add("inline keys", inline_keys);
     st.add("longest list", longest);
     st.add("prefix table prefixes", n_prefixes);
-    st.add("sort runs", files.len());
+    st.add("sort runs", n_runs);
     st.add("run bytes spilled", spilled);
+    st.add("run bytes rewritten", rewritten);
     st.add("bytes fst", size("fst"));
     st.add("bytes post", size("post"));
     st.add("bytes pfx", size("pfx.fst") + size("pfx"));
