@@ -606,8 +606,8 @@ pub struct RankedPoly {
 ///   2. Linked place override: if the linked place's rank >
 ///      parent_address_level (the same "parent" computed above),
 ///      replace self rank with the linked place rank.
-///   3. Place area containment: if a class='place' area (e.g.
-///      R9185096 "Nairobi" with place=city) with rank >= self
+///   3. Place area containment, from rank 10 (:922): if a class='place'
+///      area (e.g. R9185096 "Nairobi" with place=city) with rank >= self
 ///      contains self, push self to place_area_rank + 2.
 ///
 /// `place_areas` are the class='place' polygons (admin_level 15) holding
@@ -669,7 +669,7 @@ pub fn promote_nested_ranks<'a>(ranked: &mut [RankedPoly], place_areas: impl Ite
             // with linked_place tags (Nairobi L3, BA L8, Paris L6)
             // are NOT used here — Nominatim's SQL explicitly
             // restricts this loop to class='place'.
-            if self_override == 0 {
+            if self_override == 0 && ranked[i].rank_address >= PLACE_AREA_MIN_RANK {
                 let mut place_parent_rank: u8 = 0;
                 for pa in place_areas.clone() {
                     if pa.place_type_override == 0 { continue; }
@@ -687,6 +687,10 @@ pub fn promote_nested_ranks<'a>(ranked: &mut [RankedPoly], place_areas: impl Ite
         }
     }
 }
+
+/// The lowest rank_address the place-area step promotes a boundary from
+/// (placex_triggers.sql:922).
+pub const PLACE_AREA_MIN_RANK: u8 = 10;
 
 // --- String pool (tiered) ---
 //
@@ -5075,6 +5079,16 @@ mod pure_helper_tests {
         let mut polys = [ranked(9, 18, 1.0, 0), ranked(6, 12, 10.0, 1)];
         promote_nested_ranks(&mut polys, [area].iter());
         assert_eq!(levels_and_ranks(&polys), [(6, 16), (9, 18)]);
+    }
+
+    #[test]
+    fn nested_ranks_keep_boundaries_below_rank_10_out_of_place_areas() {
+        // A state (level 4, rank 8) inside a larger suburb area keeps its
+        // rank; a county (level 6, rank 12) in it ranks 22.
+        let area = AdminPolygon { area: 100.0, place_type_override: 4, ..boundary(0, 15) };
+        let mut polys = [ranked(6, 12, 1.0, 0), ranked(4, 8, 10.0, 0)];
+        promote_nested_ranks(&mut polys, [area].iter());
+        assert_eq!(levels_and_ranks(&polys), [(4, 8), (6, 22)]);
     }
 
     #[test]
