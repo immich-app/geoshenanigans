@@ -144,12 +144,15 @@ fn greek(c: char) -> Option<&'static str> {
 
 /// Latin spelling of a Cyrillic or Greek name (GeoNames' asciiname, roughly BGN/PCGN and
 /// ELOT 743), with the country's own letter values for UA/BY/BG and the South Slavic
-/// countries; None when the name has neither script.
-pub fn transliterate(s: &str, cc: &str) -> Option<String> {
+/// countries; None when the name has neither script. `cc` (the country code) is asked for only
+/// then.
+pub fn transliterate(s: &str, cc: impl FnOnce() -> String) -> Option<String> {
     let lower: String = normalize_marks_lower(s);
     if !lower.chars().any(|c| ('\u{0370}'..='\u{04FF}').contains(&c)) {
         return None;
     }
+    let cc = cc();
+    let cc = cc.as_str();
     let mut out = String::with_capacity(lower.len());
     let mut it = lower.chars().peekable();
     while let Some(c) = it.next() {
@@ -183,13 +186,14 @@ mod tests {
 
     #[test]
     fn transliterates_cyrillic_and_greek() {
-        assert_eq!(transliterate("Первомайка", "KZ").as_deref(), Some("pervomayka"));
-        assert_eq!(transliterate("Широке", "UA").as_deref(), Some("shyroke"));
-        assert_eq!(transliterate("Москва", "RU").as_deref(), Some("moskva"));
-        assert_eq!(transliterate("Чачак", "RS").as_deref(), Some("cacak"));
-        assert_eq!(transliterate("Αθήνα", "GR").as_deref(), Some("athina"));
-        assert_eq!(transliterate("Θεσσαλονίκη", "GR").as_deref(), Some("thessaloniki"));
-        assert_eq!(transliterate("Paris", "FR"), None);
+        assert_eq!(transliterate("Первомайка", || "KZ".into()).as_deref(), Some("pervomayka"));
+        assert_eq!(transliterate("Широке", || "UA".into()).as_deref(), Some("shyroke"));
+        assert_eq!(transliterate("Москва", || "RU".into()).as_deref(), Some("moskva"));
+        assert_eq!(transliterate("Чачак", || "RS".into()).as_deref(), Some("cacak"));
+        assert_eq!(transliterate("Αθήνα", || "GR".into()).as_deref(), Some("athina"));
+        assert_eq!(transliterate("Θεσσαλονίκη", || "GR".into()).as_deref(), Some("thessaloniki"));
+        assert_eq!(transliterate("Paris", || "FR".into()), None);
+        assert_eq!(transliterate("Paris", || panic!("country asked for a Latin name")), None);
     }
 
     #[test]
