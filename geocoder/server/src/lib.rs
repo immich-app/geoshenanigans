@@ -1605,9 +1605,8 @@ impl Index {
     }
 
     pub fn find_admin(&self, lat: f64, lng: f64) -> AdminResult<'_> {
-        // A polygon containing the point always lists the point's own cell in its covering, so
-        // only that cell's polygons can contain it (the neighbours used to be scanned too).
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
+        let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
 
         // For each admin level, find the smallest-area polygon actually containing
         // the point. Interior flags are used as a fast path for uncontested cells,
@@ -1621,7 +1620,7 @@ impl Index {
         // pointer-equality dedup doesn't survive owned copies).
         let mut place_area_polygons: Vec<(u32, AdminPolygon)> = Vec::new();
 
-        for c in std::iter::once(cell) {
+        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
             Self::for_each_entry_fb(&self.admin_entries, Self::lookup_admin_cell_fb(&self.admin_cells, c), |id| {
                 // The interior flag on a (cell, polygon) entry proves
                 // containment only for queries INSIDE that cell. Neighbor
@@ -1701,7 +1700,8 @@ impl Index {
         // second-nested-check rule (placex_triggers.sql lines 944-963) —
         // Nominatim uses only these, not admin boundaries with linked_place
         // tags. Kept in a separate vec so we don't disturb best_by_level[].
-        for c in std::iter::once(cell) {
+        let neighbors2 = cell_neighbors_at_level(cell, self.admin_cell_level);
+        for c in std::iter::once(cell).chain(neighbors2.into_iter()) {
             Self::for_each_entry_fb(&self.admin_entries, Self::lookup_admin_cell_fb(&self.admin_cells, c), |id| {
                 let poly_id = id & ID_MASK;
                 let Some(poly) = self.admin_polygon(poly_id) else { return; };
@@ -5137,5 +5137,170 @@ mod encoded_pip_tests {
         assert_eq!(point_in_encoded_polygon(&src, 0, 4, 0.5, 0.5), Some(true));
         assert_eq!(point_in_encoded_polygon(&src, a.len() as u32, 4, 0.5, 0.5), Some(false));
         assert_eq!(point_in_encoded_polygon(&src, a.len() as u32, 4, 5.005, 5.005), Some(true));
+    }
+}
+
+#[cfg(test)]
+mod admin_scan_tests {
+    use super::encoded_pip_tests::pack_ring;
+    use super::*;
+
+    // A query point on Egypt's side of its 22°N border with Sudan. The builder's S2 covering
+    // follows the great circle between the border's end points, which bows 3.3 km north of the
+    // parallel, so the point's own level-10 cell lists Sudan but not Egypt.
+    const Q: (f64, f64) = (22.002, 27.57);
+
+    struct Ring {
+        name: &'static str,
+        level: u8,
+        country: &'static [u8; 2],
+        place_type: u8,
+        area: f32,
+        verts: Vec<(f64, f64)>,
+        /// (index into `cells()`, interior flag) of every cell the ring is listed in.
+        cells: Vec<(usize, bool)>,
+    }
+
+    fn ring(name: &'static str, level: u8, area: f32, (lat0, lng0, lat1, lng1): (f64, f64, f64, f64), cells: &[(usize, bool)]) -> Ring {
+        let verts = vec![(lat0, lng0), (lat0, lng1), (lat1, lng1), (lat1, lng0)];
+        Ring { name, level, country: b"eg", place_type: 0, area, verts, cells: cells.to_vec() }
+    }
+
+    /// The query's cell, then its neighbours in the order find_admin visits them.
+    fn cells() -> Vec<u64> {
+        let own = cell_id_at_level(Q.0, Q.1, DEFAULT_ADMIN_CELL_LEVEL);
+        std::iter::once(own).chain(cell_neighbors_at_level(own, DEFAULT_ADMIN_CELL_LEVEL)).collect()
+    }
+
+    /// An Index holding only the admin files, laid out as the builder writes them.
+    fn admin_index(rings: &[Ring]) -> Index {
+        let cell_ids = cells();
+        let mut strings = vec![0u8];
+        let mut vertices = Vec::new();
+        let mut polygons = Vec::new();
+        let mut by_cell: std::collections::BTreeMap<u64, Vec<u32>> = Default::default();
+        for (id, r) in rings.iter().enumerate() {
+            let name_id = strings.len() as u32;
+            strings.extend_from_slice(r.name.as_bytes());
+            strings.push(0);
+            let vertex_offset = vertices.len() as u32;
+            vertices.extend(pack_ring(3, &r.verts));
+            polygons.extend_from_slice(&vertex_offset.to_le_bytes());
+            polygons.extend_from_slice(&(r.verts.len() as u32).to_le_bytes());
+            polygons.extend_from_slice(&name_id.to_le_bytes());
+            polygons.extend_from_slice(&[r.level, r.place_type, 0, 0]);
+            polygons.extend_from_slice(&r.area.to_le_bytes());
+            polygons.extend_from_slice(&u16::from_be_bytes(*r.country).to_le_bytes());
+            polygons.extend_from_slice(&[0, 0]);
+            for &(k, interior) in &r.cells {
+                by_cell.entry(cell_ids[k]).or_default().push(id as u32 | if interior { INTERIOR_FLAG } else { 0 });
+            }
+        }
+        assert_eq!(polygons.len(), rings.len() * std::mem::size_of::<AdminPolygon>());
+        let (mut cells, mut entries) = (Vec::new(), Vec::new());
+        for (cell, mut ids) in by_cell {
+            ids.sort_unstable(); // the builder sorts each cell's entries by value
+            cells.extend_from_slice(&cell.to_le_bytes());
+            cells.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+            entries.extend_from_slice(&(ids.len() as u16).to_le_bytes());
+            for id in ids { entries.extend_from_slice(&id.to_le_bytes()); }
+        }
+        let len = strings.len() as u32;
+        Index {
+            geo_cells: None, street_entries: None, street_ways: None, street_nodes: None,
+            addr_entries: None, addr_points: None, addr_vertices: None,
+            interp_entries: None, interp_ways: None, interp_nodes: None, interp_postcodes: None,
+            admin_cells: FileBytes::Owned(cells),
+            admin_entries: FileBytes::Owned(entries),
+            admin_polygons: FileBytes::Owned(polygons),
+            admin_vertices: FileBytes::Owned(vertices),
+            poi_cells: None, poi_entries: None, poi_records: None, poi_vertices: None,
+            poi_meta: PoiMeta { categories: HashMap::new() },
+            place_nodes: None, place_cells: None, place_entries: None,
+            way_parents: None, admin_parents: None, addr_postcodes: None, way_postcodes: None,
+            postal_polygons: None, postal_vertices: None,
+            postcode_centroids: None, postcode_centroid_cells: None, postcode_centroid_entries: None,
+            admin_config: AdminLevelConfig::load(),
+            strings: StringPool::from_parts([Some(FileBytes::Owned(strings)), None, None, None, None], [0, len, len, len, len, len]),
+            street_cell_level: DEFAULT_STREET_CELL_LEVEL,
+            admin_cell_level: DEFAULT_ADMIN_CELL_LEVEL,
+            max_distance_sq: 1.0,
+        }
+    }
+
+    // Egypt north of 22°N; Sudan south of it.
+    const EGYPT: (f64, f64, f64, f64) = (22.0, 25.0, 31.6, 36.9);
+    const SUDAN: (f64, f64, f64, f64) = (8.7, 21.8, 22.0, 38.6);
+
+    #[test]
+    fn find_admin_finds_a_ring_listed_only_in_a_neighbour_cell() {
+        let idx = admin_index(&[
+            Ring { country: b"sd", ..ring("Sudan", 2, 190.0, SUDAN, &[(0, true), (3, true)]) },
+            ring("Egypt", 2, 97.0, EGYPT, &[(3, false), (5, false)]),
+            ring("New Valley", 4, 38.8, (22.0, 25.0, 27.7, 32.7), &[(5, false)]),
+        ]);
+        let a = idx.find_admin(Q.0, Q.1);
+        assert_eq!(a.country, Some("Egypt"));
+        assert_eq!(a.state, Some("New Valley"));
+    }
+
+    #[test]
+    fn a_neighbour_cells_interior_flag_does_not_prove_containment() {
+        let idx = admin_index(&[
+            ring("Egypt", 2, 97.0, EGYPT, &[(0, false)]),
+            Ring { country: b"sd", ..ring("Sudan", 2, 9.0, SUDAN, &[(1, true), (2, true)]) },
+        ]);
+        assert_eq!(idx.find_admin(Q.0, Q.1).country, Some("Egypt"));
+    }
+
+    #[test]
+    fn a_place_area_listed_only_in_a_neighbour_cell_fills_its_field() {
+        let idx = admin_index(&[
+            ring("Egypt", 2, 97.0, EGYPT, &[(0, true)]),
+            Ring { place_type: 4, ..ring("Bir Tarfawi", 15, 0.01, (21.99, 27.5, 22.05, 27.6), &[(6, false), (7, false)]) },
+        ]);
+        assert_eq!(idx.find_admin(Q.0, Q.1).suburb, Some("Bir Tarfawi"));
+    }
+
+    #[test]
+    fn equal_area_rings_resolve_in_cell_visiting_order() {
+        let around_q = (21.99, 27.5, 22.05, 27.6);
+        // Own cell before any neighbour.
+        let idx = admin_index(&[
+            ring("Egypt", 2, 97.0, EGYPT, &[(0, true)]),
+            ring("Listed in neighbour 1", 4, 1.0, around_q, &[(1, false)]),
+            ring("Listed in own cell", 4, 1.0, around_q, &[(0, false)]),
+        ]);
+        assert_eq!(idx.find_admin(Q.0, Q.1).state, Some("Listed in own cell"));
+        // Then neighbours in cell_neighbors_at_level order.
+        let idx = admin_index(&[
+            ring("Egypt", 2, 97.0, EGYPT, &[(0, true)]),
+            ring("Listed in neighbour 4", 4, 1.0, around_q, &[(4, false)]),
+            ring("Listed in neighbour 2", 4, 1.0, around_q, &[(2, false)]),
+        ]);
+        assert_eq!(idx.find_admin(Q.0, Q.1).state, Some("Listed in neighbour 2"));
+    }
+
+    #[test]
+    fn smaller_rings_that_miss_the_point_do_not_displace_the_containing_one() {
+        let idx = admin_index(&[
+            ring("Egypt", 2, 97.0, EGYPT, &[(0, true)]),
+            ring("New Valley", 4, 38.8, (22.0, 25.0, 27.7, 32.7), &[(0, true), (1, true)]),
+            ring("Aswan", 4, 6.0, (22.0, 31.0, 24.5, 33.6), &[(1, false), (0, false)]),
+            ring("Red Sea", 4, 12.0, (22.0, 33.6, 28.0, 36.9), &[(2, false)]),
+        ]);
+        assert_eq!(idx.find_admin(Q.0, Q.1).state, Some("New Valley"));
+    }
+
+    #[test]
+    fn boundaries_listed_only_in_a_neighbour_cell_gate_place_nodes() {
+        let idx = admin_index(&[
+            ring("Egypt", 2, 97.0, EGYPT, &[(0, true)]),
+            ring("Paris", 8, 2.0, (21.9, 27.4, 22.1, 27.7), &[(8, false)]),
+            ring("Balat", 8, 0.5, (21.9, 27.4, 21.95, 27.7), &[(0, false)]),
+            ring("Mut", 10, 0.3, (21.99, 27.5, 22.05, 27.6), &[(2, false)]),
+        ]);
+        assert_eq!(idx.find_municipality_boundary(Q.0, Q.1).map(|p| idx.get_string(p.name_id)), Some("Paris"));
+        assert_eq!(idx.find_current_boundary(Q.0, Q.1).map(|p| idx.get_string(p.name_id)), Some("Mut"));
     }
 }
