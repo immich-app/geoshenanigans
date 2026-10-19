@@ -4279,30 +4279,51 @@ pub fn point_in_encoded_polygon(src: &FileBytes, vertex_offset: u32, vertex_coun
     let u32_at = |b: &[u8], i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
     Some(match encoding {
         4 => pip_vertices(&bytes, 8, lat, lng, |b| (f32::from_bits(u32_at(b, 0)), f32::from_bits(u32_at(b, 4)))),
-        3 => pip_grid(&bytes, 8, lat, lng, bmin_lat, bmin_lng, scale, |b| (u32_at(b, 0) as i64, u32_at(b, 4) as i64)),
-        _ => pip_grid(&bytes, 4, lat, lng, bmin_lat, bmin_lng, scale, |b| (u16_at(b, 0), u16_at(b, 2))),
+        3 => pip_grid(&bytes, 8, lat, lng, bmin_lat, bmin_lng, scale, u32::MAX as i64, |b| (u32_at(b, 0) as i64, u32_at(b, 4) as i64)),
+        _ => pip_grid(&bytes, 4, lat, lng, bmin_lat, bmin_lng, scale, u16::MAX as i64, |b| (u16_at(b, 0), u16_at(b, 2))),
     })
 }
 
-/// Largest k with `(base + k * scale) as f32 <= x`. The decoded value is monotone in k (every
-/// step rounds monotonically), so a vertex decodes above x exactly when its k is above this.
+/// Largest k in -1..=k_max with `(base + k * scale) as f32 <= x`; -1 when even k = 0 decodes
+/// above x. The decoded value is monotone in k (every step rounds monotonically), so a vertex
+/// whose k is in 0..=k_max decodes above x exactly when its k is above this. Comparisons with NaN
+/// are false: a NaN x or base gives k_max, no vertex above x. The search gallops out from the
+/// estimate, so any x (±inf, NaN, far off the grid) takes a few dozen steps at most.
 #[inline]
-pub fn grid_threshold(x: f32, base: f64, scale: f64) -> i64 {
-    let decode = |k: i64| (base + k as f64 * scale) as f32;
-    let mut k = ((x as f64 - base) / scale).floor() as i64;
-    while decode(k) > x { k -= 1; }
-    while decode(k + 1) <= x { k += 1; }
-    k
+pub fn grid_threshold(x: f32, base: f64, scale: f64, k_max: i64) -> i64 {
+    let above = |k: i64| (base + k as f64 * scale) as f32 > x;
+    let estimate = ((x as f64 - base) / scale).floor();
+    // `as` saturates to the i64 range, and would turn NaN into 0.
+    let start = if estimate.is_nan() { k_max } else { (estimate as i64).clamp(-1, k_max) };
+    // Bracket the answer: lo is -1 or not above x, hi is above x or k_max + 1.
+    let (mut lo, mut hi) = (start, start + 1);
+    let mut step = 1;
+    while lo >= 0 && above(lo) {
+        hi = lo;
+        lo = (lo - step).max(-1);
+        step *= 2;
+    }
+    step = 1;
+    while hi <= k_max && !above(hi) {
+        lo = hi;
+        hi = (hi + step).min(k_max + 1);
+        step *= 2;
+    }
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if above(mid) { hi = mid } else { lo = mid }
+    }
+    lo
 }
 
-/// `pip_vertices` over quantized vertices (k_lat, k_lng) that decode to `(bmin + k * scale) as
-/// f32`: the straddle test compares integers against `grid_threshold` of the point's longitude,
-/// and only the straddling edges decode, to the same values, so the answer is the same.
+/// `pip_vertices` over quantized vertices (k_lat, k_lng) in 0..=k_max that decode to `(bmin + k *
+/// scale) as f32`: the straddle test compares integers against `grid_threshold` of the point's
+/// longitude, and only the straddling edges decode, to the same values, so the answer is the same.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn pip_grid(bytes: &[u8], stride: usize, lat: f32, lng: f32, bmin_lat: f64, bmin_lng: f64, scale: f64,
+fn pip_grid(bytes: &[u8], stride: usize, lat: f32, lng: f32, bmin_lat: f64, bmin_lng: f64, scale: f64, k_max: i64,
             at: impl Fn(&[u8]) -> (i64, i64)) -> bool {
-    let t = grid_threshold(lng, bmin_lng, scale);
+    let t = grid_threshold(lng, bmin_lng, scale, k_max);
     let decode = |k_lat: i64, k_lng: i64| ((bmin_lat + k_lat as f64 * scale) as f32, (bmin_lng + k_lng as f64 * scale) as f32);
     let n = bytes.len() / stride;
     let mut inside = false;
@@ -6659,7 +6680,7 @@ mod encoded_pip_tests {
     fn grid_threshold_splits_the_decoded_values_at_the_point() {
         let mut rng = Rng::new(31);
         for enc in 0u8..=3 {
-            let scale = vertex_scale(enc);
+            let (scale, k_max) = (vertex_scale(enc), k_max(enc));
             for _ in 0..5000 {
                 // Near 180 degrees an f32 step spans many grid steps (enc 3: about 150).
                 let base = rng.range(-180.0, 179.9) as f32 as f64;
@@ -6671,10 +6692,99 @@ mod encoded_pip_tests {
                     2 => (decode(k) as f64 + scale / 3.0) as f32,
                     _ => (base + rng.range(-0.1, 70_000.0 * scale)) as f32,
                 };
-                let t = grid_threshold(x, base, scale);
-                assert!(decode(t) <= x && decode(t + 1) > x, "enc {enc} base {base} x {x} t {t}");
+                let t = grid_threshold(x, base, scale, k_max);
+                assert!((-1..=k_max).contains(&t), "enc {enc} base {base} x {x} t {t}");
+                assert!((t < 0 || decode(t) <= x) && (t == k_max || decode(t + 1) > x), "enc {enc} base {base} x {x} t {t}");
             }
         }
+    }
+
+    /// The largest delta of an encoding: u32 for 3, u16 for 0-2 and the tags `pip_grid` reads as u16.
+    fn k_max(enc: u8) -> i64 {
+        if enc == 3 { u32::MAX as i64 } else { u16::MAX as i64 }
+    }
+
+    /// f32 coordinates a caller can hand `query_json` (it narrows f64 input with `as f32`): NaN,
+    /// the infinities, the largest finite values, values past the enc 3 grid's i64 range (beyond
+    /// 9.22e11 degrees) or on its widest f32 plateaus, the edges of the valid range, signed zeros
+    /// and subnormals.
+    const EXTREME: [f32; 26] = [
+        f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::MAX, -f32::MAX, 1_099_511_627_776.0, -1_099_511_627_776.0,
+        1e12, -1e12, 9.3e11, 1e9, -1e9, 1e6, -1e6, 360.0, -360.0, 180.0, -180.0, 90.0, -90.0, 0.0, -0.0,
+        f32::MIN_POSITIVE, -f32::MIN_POSITIVE, 1e-45, -1e-45,
+    ];
+
+    #[test]
+    fn grid_threshold_splits_the_decoded_values_for_any_input() {
+        let mut rng = Rng::new(5);
+        // Scale 0.0 is what `vertex_scale` gives a tag other than 0-4; the bases include ones only
+        // a damaged header holds.
+        let scales = [vertex_scale(0), vertex_scale(1), vertex_scale(2), vertex_scale(3), 0.0];
+        let bases = [-180.0, -0.5, 0.0, 25.0, 179.9, f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::MAX, 1e30];
+        for (s, &scale) in scales.iter().enumerate() {
+            let k_max = k_max(s as u8);
+            for &base in &bases {
+                let base = base as f64;
+                for &x in EXTREME.iter().chain(&[base as f32, (base + 1e-3) as f32, (base + 0.25) as f32]) {
+                    let t = grid_threshold(x, base, scale, k_max);
+                    assert!((-1..=k_max).contains(&t), "scale {scale} base {base} x {x} t {t}");
+                    let probes = [0, 1, k_max - 1, k_max, t, t + 1, (rng.next() % (k_max as u64 + 1)) as i64];
+                    for k in probes.into_iter().filter(|k| (0..=k_max).contains(k)) {
+                        let decoded = (base + k as f64 * scale) as f32;
+                        assert_eq!(decoded > x, k > t, "scale {scale} base {base} x {x} t {t} k {k}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn point_in_encoded_polygon_matches_the_decoded_ray_cast_at_extreme_coordinates() {
+        let mut rng = Rng::new(20261020);
+        let mut rings: Vec<(u8, Vec<u8>, u32)> = Vec::new();
+        for enc in 0u8..=4 {
+            let w = WIDTH_BY_ENCODING[enc as usize].min(1.0);
+            let mut shapes = vec![
+                // The unit square at the origin (as wide as the encoding holds).
+                vec![(0.0, 0.0), (0.0, w), (w, w), (w, 0.0)],
+                // At the antimeridian, from either side, and at the poles.
+                vec![(-w / 2.0, 180.0 - w), (w / 2.0, 180.0 - w), (0.0, 180.0)],
+                vec![(-w / 2.0, -180.0), (0.0, -180.0 + w), (w / 2.0, -180.0)],
+                vec![(90.0 - w, 180.0 - w), (90.0, 180.0 - w), (90.0, 180.0)],
+                vec![(-90.0, -180.0), (-90.0, -180.0 + w), (-90.0 + w, -180.0 + w)],
+            ];
+            for _ in 0..20 {
+                let (lat, lng) = (rng.range(-80.0, 80.0), rng.range(-170.0, 170.0));
+                shapes.push(star_ring(&mut rng, lat, lng, w / 2.0));
+            }
+            rings.extend(shapes.iter().map(|s| (enc, pack_ring(enc, s), s.len() as u32)));
+        }
+        // A tag the reader does not know (vertex_scale 0.0): every vertex decodes to the minimum.
+        let mut unknown = vec![7, 0];
+        unknown.extend_from_slice(&0.5f32.to_le_bytes());
+        unknown.extend_from_slice(&0.5f32.to_le_bytes());
+        unknown.extend((0..4 * 8).map(|_| rng.next() as u8));
+        rings.push((7, unknown, 4));
+
+        let mut inside = [0usize; 8];
+        for (enc, ring, n) in &rings {
+            let src = FileBytes::Owned(ring.clone());
+            let verts = decode_polygon_verts(&src, 0, *n).unwrap();
+            let shape: Vec<(f32, f32)> = verts.iter().map(|v| (v.lat, v.lng)).collect();
+            // A vertex and the vertex centroid of the ring, next to every extreme value.
+            let centre = |f: fn(&NodeCoord) -> f32| verts.iter().map(f).sum::<f32>() / verts.len() as f32;
+            let lats: Vec<f32> = EXTREME.iter().copied().chain([verts[0].lat, centre(|v| v.lat)]).collect();
+            let lngs: Vec<f32> = EXTREME.iter().copied().chain([verts[0].lng, centre(|v| v.lng)]).collect();
+            for &lat in &lats {
+                for &lng in &lngs {
+                    let want = point_in_polygon(lat, lng, &verts);
+                    assert_eq!(point_in_encoded_polygon(&src, 0, *n, lat, lng), Some(want), "enc {enc} ring {shape:?} point {lat} {lng}");
+                    inside[*enc as usize] += want as usize;
+                }
+            }
+        }
+        // Each known encoding has points inside some ring (the centroids of the convex ones).
+        assert!(inside[..5].iter().all(|&n| n > 0), "{inside:?}");
     }
 
     #[test]
@@ -6801,6 +6911,21 @@ mod admin_scan_tests {
         let a = idx.find_admin(Q.0, Q.1);
         assert_eq!(a.country, Some("Egypt"));
         assert_eq!(a.state, Some("New Valley"));
+    }
+
+    #[test]
+    fn a_longitude_whole_turns_away_is_in_no_ring() {
+        // S2 wraps the longitude back into Q's cell; point-in-polygon tests the f32 longitude
+        // itself, 9.7e11 degrees east of every ring (past the i64 range of the enc 3 grid).
+        let far = Q.1 + 360.0 * 2.7e9;
+        assert_eq!(cell_id_at_level(Q.0, far, DEFAULT_ADMIN_CELL_LEVEL), cell_id_at_level(Q.0, Q.1, DEFAULT_ADMIN_CELL_LEVEL));
+        let idx = admin_index(&[
+            ring("Egypt", 2, 97.0, EGYPT, &[(0, false)]),
+            ring("New Valley", 4, 38.8, (22.0, 25.0, 27.7, 32.7), &[(0, false)]),
+        ]);
+        assert_eq!(idx.find_admin(Q.0, Q.1).country, Some("Egypt"));
+        let a = idx.find_admin(Q.0, far);
+        assert_eq!((a.country, a.state), (None, None));
     }
 
     #[test]
