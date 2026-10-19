@@ -3809,6 +3809,60 @@ pub fn polygon_distance_sq(lat: f64, lng: f64, vertices: &[NodeCoord], cos_lat: 
     best
 }
 
+/// A ring inside a polygon's keyhole vertex range: `count` vertices from
+/// `begin`, the last repeating the first (builder/src/polygon_rings.h).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RingSpan {
+    pub begin: usize,
+    pub count: usize,
+}
+
+/// Vertices of one keyhole excursion beyond its hole ring: v0, c before it
+/// and c after (polygon_rings.h kExcursionConnectors).
+const EXCURSION_CONNECTORS: usize = 3;
+/// A closed ring's fewest vertices: a triangle and its closing vertex.
+const MIN_CLOSED_RING: usize = 4;
+
+/// The outer ring (first) and the holes of a keyhole vertex range with
+/// `holes` excursions, as polygon_rings.h split_rings finds them: each
+/// excursion is v0, c, h0 ... h0, c, peeled off the end, the hole ring
+/// starting at the last h0 that follows v0 and c. A range that doesn't parse
+/// as that is one ring.
+pub fn split_rings(v: &[NodeCoord], holes: u16) -> Vec<RingSpan> {
+    let same = |a: &NodeCoord, b: &NodeCoord| a.lat == b.lat && a.lng == b.lng;
+    let whole = vec![RingSpan { begin: 0, count: v.len() }];
+    let mut spans = Vec::with_capacity(holes as usize + 1);
+    let mut end = v.len();
+    for _ in 0..holes {
+        if end < MIN_CLOSED_RING + EXCURSION_CONNECTORS + MIN_CLOSED_RING {
+            return whole;
+        }
+        let (c, h0) = (&v[end - 1], &v[end - 2]);
+        let Some(j) = (MIN_CLOSED_RING + 2..=end - 1 - MIN_CLOSED_RING).rev()
+            .find(|&j| same(&v[j], h0) && same(&v[j - 1], c) && same(&v[j - 2], &v[0]))
+        else {
+            return whole;
+        };
+        spans.push(RingSpan { begin: j, count: end - 1 - j });
+        end = j - 2;
+    }
+    if end < MIN_CLOSED_RING || !same(&v[end - 1], &v[0]) {
+        return whole;
+    }
+
+    spans.push(RingSpan { begin: 0, count: end });
+    spans.reverse();
+    spans
+}
+
+/// A polygon's rings for GeoJSON: outer ring first, then its holes, each a
+/// closed ring of [lng, lat] positions.
+pub fn geojson_rings(verts: &[NodeCoord], holes: u16) -> Vec<Vec<[f64; 2]>> {
+    split_rings(verts, holes).iter()
+        .map(|r| verts[r.begin..r.begin + r.count].iter().map(|p| [p.lng as f64, p.lat as f64]).collect())
+        .collect()
+}
+
 // Ray casting point-in-polygon test
 pub fn point_in_polygon(lat: f32, lng: f32, vertices: &[NodeCoord]) -> bool {
     let mut inside = false;
@@ -4718,18 +4772,52 @@ mod pure_helper_tests {
         assert!(!point_in_polygon(-0.5, 0.5, &sq));
     }
 
-    #[test]
-    fn point_in_polygon_leaves_out_keyhole_holes() {
-        // Outer square 0..10 with holes 2..4 and (6..7, 5..8), each reached
-        // from v0 = (0, 0) through c = (v0.lat, h0.lng) and back, as the
-        // builder writes them (polygon_rings.h encode_rings).
-        let mut v = vec![nc(0.0, 0.0), nc(0.0, 10.0), nc(10.0, 10.0), nc(10.0, 0.0), nc(0.0, 0.0)];
-        for (lat0, lng0, lat1, lng1) in [(2.0, 2.0, 4.0, 4.0), (6.0, 5.0, 7.0, 8.0)] {
-            let c = nc(0.0, lng0);
-            v.extend([nc(0.0, 0.0), c]);
-            v.extend([nc(lat0, lng0), nc(lat1, lng0), nc(lat1, lng1), nc(lat0, lng1), nc(lat0, lng0)]);
+    // The keyhole range of a closed outer ring and closed holes, laid out as
+    // polygon_rings.h encode_rings writes it: the outer ring, then per hole
+    // v0, c = (v0.lat, h0.lng), the hole ring, c.
+    fn keyhole(outer: &[NodeCoord], holes: &[Vec<NodeCoord>]) -> Vec<NodeCoord> {
+        let mut v = outer.to_vec();
+        for h in holes {
+            let c = nc(outer[0].lat, h[0].lng);
+            v.extend([outer[0], c]);
+            v.extend_from_slice(h);
             v.push(c);
         }
+        v
+    }
+
+    // Outer square 0..10 with holes 2..4 and (6..7, 5..8), all closed.
+    fn square_with_two_holes() -> (Vec<NodeCoord>, Vec<Vec<NodeCoord>>) {
+        let outer = vec![nc(0.0, 0.0), nc(0.0, 10.0), nc(10.0, 10.0), nc(10.0, 0.0), nc(0.0, 0.0)];
+        let holes = [(2.0, 2.0, 4.0, 4.0), (6.0, 5.0, 7.0, 8.0)].map(|(lat0, lng0, lat1, lng1)| {
+            vec![nc(lat0, lng0), nc(lat1, lng0), nc(lat1, lng1), nc(lat0, lng1), nc(lat0, lng0)]
+        });
+        (outer, holes.to_vec())
+    }
+
+    #[test]
+    fn split_rings_recovers_the_keyhole_rings() {
+        let (outer, holes) = square_with_two_holes();
+        let v = keyhole(&outer, &holes);
+        let span = |begin, count| RingSpan { begin, count };
+        assert_eq!(split_rings(&v, 2), [span(0, 5), span(7, 5), span(15, 5)]);
+        // GeoJSON gets the outer ring and each hole as a closed ring of its
+        // own, without the connector edges.
+        let lnglat = |ring: &[NodeCoord]| ring.iter().map(|p| [p.lng as f64, p.lat as f64]).collect::<Vec<_>>();
+        let want: Vec<Vec<[f64; 2]>> = std::iter::once(&outer).chain(&holes).map(|r| lnglat(r)).collect();
+        assert_eq!(geojson_rings(&v, 2), want);
+        // Without holes, or a range that doesn't parse: the whole range.
+        assert_eq!(split_rings(&outer, 0), [span(0, 5)]);
+        assert_eq!(split_rings(&outer, 1), [span(0, 5)]);
+        assert_eq!(split_rings(&v[..v.len() - 1], 2), [span(0, v.len() - 1)]);
+        assert_eq!(split_rings(&v, 3), [span(0, v.len())]);
+        assert_eq!(geojson_rings(&outer, 0), [lnglat(&outer)]);
+    }
+
+    #[test]
+    fn point_in_polygon_leaves_out_keyhole_holes() {
+        let (outer, holes) = square_with_two_holes();
+        let v = keyhole(&outer, &holes);
         assert!(point_in_polygon(1.0, 1.0, &v));
         assert!(point_in_polygon(5.0, 9.0, &v));
         assert!(!point_in_polygon(3.0, 3.0, &v));
