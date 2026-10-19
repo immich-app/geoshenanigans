@@ -2917,6 +2917,26 @@ impl Index {
             if start == NO_DATA { return None; }
             Some(self.find_admin_from_chain(start, lat, lng))
         })();
+        // Nominatim's answer puts, at each rank, a boundary holding the
+        // result's centroid (for a street its ST_ClosestPoint to the query)
+        // before the street's own address line (complete_address_details).
+        // Where the parent chain and the query point name another state,
+        // region or province, the boundaries at that point decide: a path
+        // along the Bern-Valais ridge is Kandersteg's in Nominatim, but
+        // its point nearest Leukerbad answers Valais.
+        let admin_chain = admin_chain.map(|chain| {
+            let [state, region, province] = coarse_fields(
+                [chain.state, chain.region, chain.province],
+                [admin_pip.state, admin_pip.region, admin_pip.province],
+                || {
+                    let (_, way, _) = street?;
+                    let (plat, plng) = self.closest_point_on_way(way, lat, lng)?;
+                    let at = self.find_admin(plat, plng);
+                    Some([at.state, at.region, at.province])
+                },
+            );
+            AdminResult { state, region, province, ..chain }
+        });
         match admin_chain {
             Some(chain) => AdminResult {
                 // Only country/state/region/province replace PIP from
@@ -2951,6 +2971,27 @@ impl Index {
             },
             None => admin_pip,
         }
+    }
+
+    /// The point of a street way nearest (lat, lng), planar in degrees like
+    /// PostGIS ST_ClosestPoint on placex geometry.
+    fn closest_point_on_way(&self, way: &WayHeader, lat: f64, lng: f64) -> Option<(f64, f64)> {
+        let street_nodes = self.street_nodes.as_ref()?;
+        let total = street_nodes.len() / std::mem::size_of::<NodeCoord>() as u64;
+        let (off, cnt) = (way.node_offset as u64, way.node_count as usize);
+        if cnt < 2 || off + cnt as u64 > total { return None; }
+        let bytes = street_nodes.read_chunk(off * std::mem::size_of::<NodeCoord>() as u64, cnt * std::mem::size_of::<NodeCoord>());
+        let nodes: &[NodeCoord] = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const NodeCoord, cnt) };
+        let cos_lat = lat.to_radians().cos();
+        let mut best: Option<(f64, f64, f64)> = None;
+        for w in nodes.windows(2) {
+            let (a, b) = ((w[0].lat as f64, w[0].lng as f64), (w[1].lat as f64, w[1].lng as f64));
+            let (d, t) = point_to_segment_with_t(lat, lng, a.0, a.1, b.0, b.1, cos_lat);
+            if best.map_or(true, |(bd, _, _)| d < bd) {
+                best = Some((d, a.0 + t * (b.0 - a.0), a.1 + t * (b.1 - a.1)));
+            }
+        }
+        best.map(|(_, plat, plng)| (plat, plng))
     }
 
     // Collect the most-specific surfaceable landmark name plus the
@@ -4016,6 +4057,19 @@ pub fn fuzzy_area_holds(centre_lat: f32, centre_lng: f32, half_m: f64, lat: f64,
     dlat_m <= half_m && dlng_m <= half_m
 }
 
+/// A street answer's [state, region, province]: the parent chain's, unless
+/// the query point names others; then the boundaries at the street's point
+/// nearest the query (`at_street`), the chain's where those have none.
+pub fn coarse_fields<'a>(chain: [Option<&'a str>; 3], query: [Option<&'a str>; 3],
+                         at_street: impl FnOnce() -> Option<[Option<&'a str>; 3]>) -> [Option<&'a str>; 3] {
+    if chain == query {
+        return chain;
+    }
+    let Some(at) = at_street() else { return chain; };
+
+    std::array::from_fn(|k| at[k].or(chain[k]))
+}
+
 /// Nominatim's address walk over place nodes (insert_addresslines): ranks in
 /// ascending order, one entry per rank_address (`address_havelevel`), and
 /// each accepted node's `place_node_fuzzy_area` holding the next one.
@@ -4852,6 +4906,19 @@ mod pure_helper_tests {
     // A node `east_m` metres east of (0, 0), `dist_sq` from the query.
     fn node_at(east_m: f64, dist_sq: f64) -> Option<(f64, f32, f32)> {
         Some((dist_sq, 0.0, (east_m / 111320.0) as f32))
+    }
+
+    #[test]
+    fn coarse_fields_follow_the_street_point_when_chain_and_query_differ() {
+        // Leukerbad: the chain says Bern, the query and the street point Valais.
+        let chain = [Some("Bern"), None, None];
+        let query = [Some("Valais"), None, None];
+        assert_eq!(coarse_fields(chain, query, || Some([Some("Valais"), None, None])), query);
+        // The street point outside every state keeps the chain's.
+        assert_eq!(coarse_fields(chain, query, || Some([None, None, None])), chain);
+        assert_eq!(coarse_fields(chain, query, || None), chain);
+        // Agreement never looks at the street.
+        assert_eq!(coarse_fields(chain, chain, || panic!("looked")), chain);
     }
 
     #[test]
