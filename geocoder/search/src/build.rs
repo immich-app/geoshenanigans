@@ -620,6 +620,81 @@ impl RunReader {
 
 // ------------------------------------------------------------------ writer
 
+/// The postings of one key as the merge streams them (entity order), cut down while they arrive
+/// to what the index keeps: one posting per entity (a whole-name match over a trailing-word one,
+/// then the better name class), every whole-name posting, and the PARTIAL_CAP best trailing-word
+/// postings (importance, then entity). A common trailing word ("church") never piles up.
+#[derive(Default)]
+struct Group {
+    whole: Vec<Posting>,
+    partial: BinaryHeap<WorstFirst>,
+    last: Option<Posting>,
+}
+
+/// Trailing-word posting ordered worst first: lower importance, then higher entity.
+struct WorstFirst(Posting);
+
+impl PartialEq for WorstFirst {
+    fn eq(&self, o: &Self) -> bool {
+        self.cmp(o) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for WorstFirst {}
+impl PartialOrd for WorstFirst {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for WorstFirst {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        o.0.imp_q.cmp(&self.0.imp_q).then(self.0.entity.cmp(&o.0.entity))
+    }
+}
+
+impl Group {
+    fn is_empty(&self) -> bool {
+        self.last.is_none()
+    }
+
+    fn push(&mut self, p: Posting) {
+        match self.last {
+            Some(l) if l.entity == p.entity => {
+                if (p.partial, p.class) < (l.partial, l.class) {
+                    self.last = Some(p);
+                }
+            }
+            Some(l) => {
+                self.keep(l);
+                self.last = Some(p);
+            }
+            None => self.last = Some(p),
+        }
+    }
+
+    fn keep(&mut self, p: Posting) {
+        if !p.partial {
+            self.whole.push(p);
+            return;
+        }
+        self.partial.push(WorstFirst(p));
+        if self.partial.len() > PARTIAL_CAP {
+            self.partial.pop();
+        }
+    }
+
+    /// The kept postings into `out`, best importance first (then whole-name, then entity);
+    /// leaves the group empty.
+    fn take(&mut self, out: &mut Vec<Posting>) {
+        if let Some(l) = self.last.take() {
+            self.keep(l);
+        }
+        out.clear();
+        out.append(&mut self.whole);
+        out.extend(self.partial.drain().map(|w| w.0));
+        out.sort_unstable_by(|a, b| b.imp_q.cmp(&a.imp_q).then(a.partial.cmp(&b.partial)).then(a.entity.cmp(&b.entity)));
+    }
+}
+
 struct PrefixSlot {
     prefix: String,
     chars: usize,
@@ -651,19 +726,8 @@ struct Writer {
 }
 
 impl Writer {
-    fn add(&mut self, key: &[u8], group: &mut Vec<Posting>) -> Result<(), String> {
-        // One posting per entity: whole-name match over trailing words, then name class.
-        group.sort_unstable_by(|a, b| a.entity.cmp(&b.entity).then((a.partial, a.class).cmp(&(b.partial, b.class))));
-        group.dedup_by_key(|p| p.entity);
-        group.sort_unstable_by(|a, b| b.imp_q.cmp(&a.imp_q).then(a.partial.cmp(&b.partial)).then(a.entity.cmp(&b.entity)));
-        let mut partial_kept = 0;
-        group.retain(|p| {
-            if !p.partial {
-                return true;
-            }
-            partial_kept += 1;
-            partial_kept <= PARTIAL_CAP
-        });
+    /// Writes one key with its kept postings (`Group::take`).
+    fn add(&mut self, key: &[u8], group: &[Posting]) -> Result<(), String> {
         let value = if self.inline && group.len() == 1 {
             self.inline_keys += 1;
             inline_value(&group[0])
@@ -855,19 +919,21 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
     let mut cur: Vec<u8> = Vec::new();
     let mut key: Vec<u8> = Vec::new();
     let mut p = Posting { entity: 0, imp_q: 0, partial: false, class: 0, ord: 0 };
-    let mut group: Vec<Posting> = Vec::new();
+    let mut group = Group::default();
+    let mut list: Vec<Posting> = Vec::new();
     while m.next(&mut key, &mut p) {
         if key != cur {
             if !group.is_empty() {
-                w.add(&cur, &mut group)?;
-                group.clear();
+                group.take(&mut list);
+                w.add(&cur, &list)?;
             }
             std::mem::swap(&mut cur, &mut key);
         }
         group.push(p);
     }
     if !group.is_empty() {
-        w.add(&cur, &mut group)?;
+        group.take(&mut list);
+        w.add(&cur, &list)?;
     }
     drop(m);
     for f in &files {
