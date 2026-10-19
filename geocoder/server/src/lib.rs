@@ -5026,3 +5026,116 @@ mod pure_helper_tests {
         assert!(decode_polygon_verts(&src, 0, 5).is_none());
     }
 }
+
+#[cfg(test)]
+mod encoded_pip_tests {
+    use super::*;
+
+    /// xorshift64*: deterministic test values without a dependency.
+    pub(crate) struct Rng(u64);
+    impl Rng {
+        pub(crate) fn new(seed: u64) -> Self { Rng(seed.max(1)) }
+        pub(crate) fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        /// Uniform in [lo, hi).
+        pub(crate) fn range(&mut self, lo: f64, hi: f64) -> f64 {
+            lo + (self.next() >> 11) as f64 / (1u64 << 53) as f64 * (hi - lo)
+        }
+    }
+
+    /// One ring packed as the builder lays it out in admin_vertices.bin: the 10-byte header
+    /// (encoding, pad, bbox minimum as f32) and the vertices at the encoding's stride.
+    pub(crate) fn pack_ring(enc: u8, ring: &[(f64, f64)]) -> Vec<u8> {
+        let scale = vertex_scale(enc);
+        let min = |f: fn(&(f64, f64)) -> f64| ring.iter().map(f).fold(f64::MAX, f64::min);
+        // One step below the minimum keeps every delta non-negative after f32 rounding.
+        let (bmin_lat, bmin_lng) = if enc == 4 { (0.0, 0.0) } else { ((min(|v| v.0) - scale) as f32, (min(|v| v.1) - scale) as f32) };
+        let mut buf = vec![enc, 0];
+        buf.extend_from_slice(&bmin_lat.to_le_bytes());
+        buf.extend_from_slice(&bmin_lng.to_le_bytes());
+        for &(lat, lng) in ring {
+            let step = |v: f64, b: f32| ((v - b as f64) / scale).round();
+            match enc {
+                4 => {
+                    buf.extend_from_slice(&(lat as f32).to_le_bytes());
+                    buf.extend_from_slice(&(lng as f32).to_le_bytes());
+                }
+                3 => {
+                    buf.extend_from_slice(&(step(lat, bmin_lat) as u32).to_le_bytes());
+                    buf.extend_from_slice(&(step(lng, bmin_lng) as u32).to_le_bytes());
+                }
+                _ => {
+                    assert!(step(lat, bmin_lat).max(step(lng, bmin_lng)) <= u16::MAX as f64, "ring too wide for encoding {enc}");
+                    buf.extend_from_slice(&(step(lat, bmin_lat) as u16).to_le_bytes());
+                    buf.extend_from_slice(&(step(lng, bmin_lng) as u16).to_le_bytes());
+                }
+            }
+        }
+        buf
+    }
+
+    /// A random simple ring: vertices at increasing angles around a centre, random radii.
+    fn star_ring(rng: &mut Rng, lat: f64, lng: f64, radius: f64) -> Vec<(f64, f64)> {
+        let n = 3 + (rng.next() % 30) as usize;
+        let mut angles: Vec<f64> = (0..n).map(|_| rng.range(0.0, std::f64::consts::TAU)).collect();
+        angles.sort_by(f64::total_cmp);
+        angles.iter().map(|a| (lat + radius * rng.range(0.2, 1.0) * a.sin(), lng + radius * rng.range(0.2, 1.0) * a.cos())).collect()
+    }
+
+    // Ring widths (degrees) each encoding can hold: u16 deltas cap the encodings 0-2.
+    const WIDTH_BY_ENCODING: [f64; 5] = [0.3, 3.0, 0.03, 20.0, 20.0];
+
+    #[test]
+    fn point_in_encoded_polygon_matches_the_decoded_ray_cast() {
+        let mut rng = Rng::new(20261019);
+        for enc in 0u8..=4 {
+            let radius = WIDTH_BY_ENCODING[enc as usize] / 2.0;
+            let mut inside = 0;
+            for _ in 0..300 {
+                let (clat, clng) = (rng.range(-80.0, 80.0), rng.range(-170.0, 170.0));
+                let ring = star_ring(&mut rng, clat, clng, radius);
+                let src = FileBytes::Owned(pack_ring(enc, &ring));
+                let n = ring.len() as u32;
+                let verts = decode_polygon_verts(&src, 0, n).unwrap();
+                for k in 0..40 {
+                    // Mostly points around the ring; some on a vertex's latitude or longitude.
+                    let mut lat = rng.range(clat - 1.5 * radius, clat + 1.5 * radius);
+                    let mut lng = rng.range(clng - 1.5 * radius, clng + 1.5 * radius);
+                    let v = verts[k % verts.len()];
+                    if k % 5 == 1 { lat = v.lat as f64; }
+                    if k % 5 == 2 { lng = v.lng as f64; }
+                    let want = point_in_polygon(lat as f32, lng as f32, &verts);
+                    assert_eq!(point_in_encoded_polygon(&src, 0, n, lat as f32, lng as f32), Some(want), "enc {enc} ring {ring:?} point {lat} {lng}");
+                    inside += want as usize;
+                }
+            }
+            // Both answers are exercised.
+            assert!(inside > 1000 && inside < 11000, "enc {enc}: {inside} of 12000 inside");
+        }
+    }
+
+    #[test]
+    fn point_in_encoded_polygon_is_none_where_decoding_is() {
+        let ring = [(10.0, 10.0), (10.0, 10.1), (10.1, 10.05)];
+        let src = FileBytes::Owned(pack_ring(0, &ring));
+        assert_eq!(point_in_encoded_polygon(&src, 0, 0, 10.05, 10.05), None);
+        assert_eq!(point_in_encoded_polygon(&src, NO_DATA, 3, 10.05, 10.05), None);
+        assert_eq!(point_in_encoded_polygon(&src, 1000, 3, 10.05, 10.05), None);
+        assert_eq!(point_in_encoded_polygon(&src, 0, 4, 10.05, 10.05), None);
+        assert_eq!(point_in_encoded_polygon(&src, 0, 3, 10.03, 10.05), Some(true));
+    }
+
+    #[test]
+    fn point_in_encoded_polygon_reads_the_ring_at_its_offset() {
+        let a = pack_ring(3, &[(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)]);
+        let b = pack_ring(2, &[(5.0, 5.0), (5.0, 5.01), (5.01, 5.01), (5.01, 5.0)]);
+        let src = FileBytes::Owned([a.clone(), b].concat());
+        assert_eq!(point_in_encoded_polygon(&src, 0, 4, 0.5, 0.5), Some(true));
+        assert_eq!(point_in_encoded_polygon(&src, a.len() as u32, 4, 0.5, 0.5), Some(false));
+        assert_eq!(point_in_encoded_polygon(&src, a.len() as u32, 4, 5.005, 5.005), Some(true));
+    }
+}
