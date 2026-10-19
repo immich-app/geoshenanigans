@@ -721,14 +721,14 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                                   data.way_parent_ids.size() * sizeof(uint32_t));
             }));
         }
-        // Admin parent chain (parallel array indexed by polygon_id)
-        if (!data.admin_parent_ids.empty()) {
-            write_futures.push_back(std::async(std::launch::async, [&] {
-                write_binary_file(output_dir + "/admin_parents.bin",
-                                  reinterpret_cast<const char*>(data.admin_parent_ids.data()),
-                                  data.admin_parent_ids.size() * sizeof(uint32_t));
-            }));
-        }
+        // Admin parent chain (parallel array indexed by polygon_id), empty
+        // for a region without admin polygons: the full and no-addresses
+        // configurations list it for every region.
+        write_futures.push_back(std::async(std::launch::async, [&] {
+            write_binary_file(output_dir + "/admin_parents.bin",
+                              reinterpret_cast<const char*>(data.admin_parent_ids.data()),
+                              data.admin_parent_ids.size() * sizeof(uint32_t));
+        }));
         // Per-way postcode (parallel array indexed by way_id)
         if (!data.way_postcode_ids.empty()) {
             write_futures.push_back(std::async(std::launch::async, [&] {

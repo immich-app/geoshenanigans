@@ -1835,7 +1835,9 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             // files with quality/q2.5/. It also carries its own core strings
             // and layout, so a client never needs another dir (or a patch for
             // one) to resolve its names.
-            if (multi_output && !d.place_nodes.empty() && !d.admin_polygons.empty()) {
+            // Written for a region without admin polygons too: every
+            // configuration of the region lists the tier's files.
+            if (multi_output && !d.place_nodes.empty()) {
                 std::string mdir = base_dir + "/admin-minimal";
                 ensure_dir(mdir);
 
