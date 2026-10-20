@@ -4,6 +4,7 @@
 
 use s2::cellid::CellID;
 use s2::latlng::LatLng;
+use s2::region::Region;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -4019,26 +4020,135 @@ pub const MAX_PLACE_FUZZY_HALF_SIDE_M: f64 = 15000.0;
 /// fuzzy-area squares.
 pub const METRES_PER_DEGREE: f64 = 111320.0;
 
-/// The cells of `level` under the lat/lng box of `line` grown by `margin_m`
-/// along each axis, longitude metres taken at the latitude in the grown box
-/// farthest from the equator, as fuzzy_area_holds measures them from a node.
-/// The box stops at ±90° and ±180° without wrapping: the fuzzy-area tests
-/// compare plain degrees, so no node across the antimeridian covers the line.
+/// The cells of `level` a node within `margin_m` of `line` along each axis
+/// can sit in, ascending: the cells under the union over stretches of the line
+/// of each stretch's lat/lng box grown by `margin_m` (grown_rect). A node's
+/// fuzzy area crosses the line only where it crosses a segment, so the node
+/// lies in that segment's grown box. Consecutive segments share a box while it
+/// spans at most twice `margin_m` either way, and a longer segment is cut into
+/// pieces that don't: a compact street costs one box, a long or diagonal one
+/// a strip of boxes along it instead of its whole bounding box.
 pub fn cells_under_line(line: &[NodeCoord], margin_m: f64, level: u64) -> Vec<u64> {
-    let (lat_lo, lng_lo, lat_hi, lng_hi) = line.iter().fold((f64::MAX, f64::MAX, f64::MIN, f64::MIN), |(a, b, c, d), p| {
-        (a.min(p.lat as f64), b.min(p.lng as f64), c.max(p.lat as f64), d.max(p.lng as f64))
-    });
-    if lat_lo > lat_hi {
-        return Vec::new();
+    let span_m = 2.0 * margin_m;
+    let points = cut_to_span(line, span_m);
+    let mut boxes = Vec::new();
+    let mut start = 0;
+    while start < points.len() {
+        // At least one segment, then more while the box stays small.
+        let mut end = (start + 2).min(points.len());
+        let mut bounds = points[start..end].iter().fold(LatLngBox::at(points[start]), |b, &p| b.union(LatLngBox::at(p)));
+        while end < points.len() {
+            let grown = bounds.union(LatLngBox::at(points[end]));
+            if grown.extent_m() > span_m { break; }
+            bounds = grown;
+            end += 1;
+        }
+        boxes.push(grown_rect(bounds, margin_m));
+        if end == points.len() { break; }
+        start = end - 1;
+    }
+    cells_under_rects(boxes, level)
+}
+
+/// The line's points as (lat, lng) degrees, with points added along every
+/// segment whose box spans more than `span_m` either way, evenly in degrees:
+/// the fuzzy-area tests map degrees linearly to metres, so the pieces cover
+/// the segment exactly.
+fn cut_to_span(line: &[NodeCoord], span_m: f64) -> Vec<(f64, f64)> {
+    let mut points: Vec<(f64, f64)> = Vec::with_capacity(line.len());
+    for p in line {
+        let b = (p.lat as f64, p.lng as f64);
+        if let Some(&a) = points.last() {
+            let pieces = (LatLngBox::at(a).union(LatLngBox::at(b)).extent_m() / span_m).ceil().max(1.0) as usize;
+            for k in 1..pieces {
+                let t = k as f64 / pieces as f64;
+                points.push((a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t));
+            }
+        }
+        points.push(b);
+    }
+    points
+}
+
+/// A lat/lng box in degrees: (lat_lo, lng_lo, lat_hi, lng_hi).
+#[derive(Clone, Copy)]
+struct LatLngBox(f64, f64, f64, f64);
+
+impl LatLngBox {
+    fn at((lat, lng): (f64, f64)) -> LatLngBox {
+        LatLngBox(lat, lng, lat, lng)
     }
 
+    fn union(self, o: LatLngBox) -> LatLngBox {
+        LatLngBox(self.0.min(o.0), self.1.min(o.1), self.2.max(o.2), self.3.max(o.3))
+    }
+
+    /// The larger of the box's height and width in metres, the width at its
+    /// middle latitude.
+    fn extent_m(self) -> f64 {
+        let mid_lat = (self.0 + self.2) / 2.0;
+        ((self.2 - self.0) * METRES_PER_DEGREE).max((self.3 - self.1) * METRES_PER_DEGREE * mid_lat.to_radians().cos())
+    }
+}
+
+/// `bounds` grown by `margin_m` along each axis, longitude metres taken at the
+/// latitude in the grown box farthest from the equator, as fuzzy_area_holds
+/// measures them from a node. The box stops at ±90° and ±180° without
+/// wrapping: the fuzzy-area tests compare plain degrees, so no node across the
+/// antimeridian covers the line.
+fn grown_rect(bounds: LatLngBox, margin_m: f64) -> s2::rect::Rect {
+    let LatLngBox(lat_lo, lng_lo, lat_hi, lng_hi) = bounds;
     let dlat = margin_m / METRES_PER_DEGREE;
     let (lat_lo, lat_hi) = ((lat_lo - dlat).max(-90.0), (lat_hi + dlat).min(90.0));
     let metres_per_lng = METRES_PER_DEGREE * lat_lo.abs().max(lat_hi.abs()).to_radians().cos();
     let dlng = if metres_per_lng > margin_m / 360.0 { margin_m / metres_per_lng } else { 360.0 };
-    let rect = s2::rect::Rect::from_degrees(lat_lo, (lng_lo - dlng).max(-180.0), lat_hi, (lng_hi + dlng).min(180.0));
+    s2::rect::Rect::from_degrees(lat_lo, (lng_lo - dlng).max(-180.0), lat_hi, (lng_hi + dlng).min(180.0))
+}
+
+/// The cells of `level` meeting any of `rects`, ascending: one covering of
+/// their union, so a cell under several of them is tested once.
+fn cells_under_rects(rects: Vec<s2::rect::Rect>, level: u64) -> Vec<u64> {
+    if rects.is_empty() {
+        return Vec::new();
+    }
+
     let coverer = s2::region::RegionCoverer { min_level: level as u8, max_level: level as u8, level_mod: 1, max_cells: usize::MAX };
-    coverer.covering(&rect).0.into_iter().map(|c| c.0).collect()
+    coverer.covering(&RectUnion::new(rects)).0.into_iter().map(|c| c.0).collect()
+}
+
+/// A union of lat/lng rects as an S2 region.
+struct RectUnion {
+    rects: Vec<s2::rect::Rect>,
+    bound: s2::rect::Rect,
+}
+
+impl RectUnion {
+    fn new(rects: Vec<s2::rect::Rect>) -> Self {
+        let bound = rects.iter().fold(s2::rect::Rect::empty(), |b, r| b.union(r));
+        RectUnion { rects, bound }
+    }
+}
+
+impl Region for RectUnion {
+    fn cap_bound(&self) -> s2::cap::Cap {
+        self.bound.cap_bound()
+    }
+
+    fn rect_bound(&self) -> s2::rect::Rect {
+        self.bound.clone()
+    }
+
+    fn contains_cell(&self, cell: &s2::cell::Cell) -> bool {
+        self.rects.iter().any(|r| r.contains_cell(cell))
+    }
+
+    /// Whether the cell's lat/lng bounds meet one of the rects: true for every
+    /// cell that meets one, and for a few cells just outside them, whose
+    /// candidates the fuzzy-area test then leaves out.
+    fn intersects_cell(&self, cell: &s2::cell::Cell) -> bool {
+        let bound = cell.rect_bound();
+        self.rects.iter().any(|r| r.intersects(&bound))
+    }
 }
 
 /// Whether the place_node_fuzzy_area of a node at (centre_lat, centre_lng)
@@ -5230,6 +5340,33 @@ mod pure_helper_tests {
             }
         }
         assert!(cells_under_line(&[], MAX_PLACE_FUZZY_HALF_SIDE_M, DEFAULT_ADMIN_CELL_LEVEL).is_empty());
+    }
+
+    #[test]
+    fn cells_under_line_follow_a_diagonal_street() {
+        // A 270 km street running north-east from 45°N, drawn with a point
+        // every 1.4 km and as one segment: a city within reach of any point of
+        // it, diagonally out, sits in one of the cells, and the cells are a
+        // strip along the street, far fewer than under its bounding box grown
+        // by the same reach.
+        let points: Vec<NodeCoord> = (0..=200).map(|k| nc(45.0 + k as f32 * 0.01, 10.0 + k as f32 * 0.01)).collect();
+        let margin = MAX_PLACE_FUZZY_HALF_SIDE_M;
+        let corners = LatLngBox::at((45.0, 10.0)).union(LatLngBox::at((47.0, 12.0)));
+        let bbox = cells_under_rects(vec![grown_rect(corners, margin)], DEFAULT_ADMIN_CELL_LEVEL);
+        let reach = margin - 100.0;
+        for line in [points.clone(), vec![points[0], points[200]]] {
+            let cells = cells_under_line(&line, margin, DEFAULT_ADMIN_CELL_LEVEL);
+            for p in points.iter().step_by(7) {
+                let (lat0, lng0) = (p.lat as f64, p.lng as f64);
+                for (north, east) in [(1.0, -1.0), (-1.0, 1.0), (1.0, 1.0), (-1.0, -1.0)] {
+                    let lat = lat0 + north * reach / METRES_PER_DEGREE;
+                    let lng = lng0 + east * reach / (METRES_PER_DEGREE * lat.to_radians().cos());
+                    assert!(fuzzy_area_holds(lat as f32, lng as f32, margin, lat0, lng0));
+                    assert!(cells.contains(&cell_id_at_level(lat, lng, DEFAULT_ADMIN_CELL_LEVEL)), "{} points: ({lat}, {lng})", line.len());
+                }
+            }
+            assert!(cells.len() * 2 < bbox.len(), "{} points: {} cells, {} under the bounding box", line.len(), cells.len(), bbox.len());
+        }
     }
 
     #[test]
