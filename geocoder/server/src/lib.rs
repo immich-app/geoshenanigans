@@ -888,9 +888,11 @@ impl Continent {
         inside
     }
 
-    /// The builder assigns admin cells by cell centre and a query reads
-    /// its admin cell plus the 8 neighbours, so this continent can hold
-    /// data for the query when it contains any of those 9 centres.
+    /// The builder assigns cells to continents by cell centre and a query's
+    /// place and street lookups read its cell plus the 8 neighbours, so this
+    /// continent can hold data for the query when it contains any of those 9
+    /// centres (its admin cells reach one cell past it, for the admin scan's
+    /// own cell).
     pub fn covers_query(&self, lat: f64, lng: f64, admin_cell_level: u64) -> bool {
         let cell = cell_id_at_level(lat, lng, admin_cell_level);
         std::iter::once(cell)
@@ -911,54 +913,39 @@ pub fn continents() -> &'static [Continent] {
 
 // --- Admin cell scan ---
 
-/// The admin rings one reverse lookup can return: the entry lists of the point's level-10 cell
-/// and its neighbours, in the order every admin scan visits them, and the point-in-polygon answers
-/// computed so far. The neighbours are needed: S2 covers the great-circle edges of a ring before
-/// it is re-simplified, while containment is the straight lat/lng test on the stored ring, so a
-/// ring can contain the point without listing its cell (Egypt's 660 km edge on 22°N bows 3.3 km
-/// north of the parallel).
+/// The admin rings one reverse lookup can return: the entry list of the point's level-10 cell, in
+/// the order every admin scan visits them, and the point-in-polygon answers computed so far. The
+/// builder lists a ring in every cell that holds a point the ring's straight lat/lng edges contain
+/// (builder admin_cover.h), so no neighbour cell can add one.
 pub struct AdminScan {
-    /// The entries of the point's own cell, then of its neighbours in `cell_neighbors_at_level`
-    /// order, each with its polygon record (entries whose record `Index::admin_polygon` rejects
-    /// are left out).
+    /// The entries of the point's own cell, each with its polygon record (entries whose record
+    /// `Index::admin_polygon` rejects are left out).
     rings: Vec<(u32, AdminPolygon)>,
-    /// How many of `rings` come from the own cell.
-    own_cell_rings: usize,
     pip: PipMemo,
 }
 
 impl AdminScan {
     pub fn new(index: &Index, lat: f64, lng: f64) -> Self {
-        let cell = cell_id_at_level(lat, lng, index.admin_cell_level);
-        let cells: Vec<u64> = std::iter::once(cell).chain(cell_neighbors_at_level(cell, index.admin_cell_level)).collect();
-        let mut lists = vec![NO_DATA; cells.len()];
-        Index::lookup_admin_cells_fb(&index.admin_cells, &cells, &mut lists);
-        // Each list, each record and most ring headers are read below wherever the point is, so
+        let list = Index::lookup_admin_cell_fb(&index.admin_cells, cell_id_at_level(lat, lng, index.admin_cell_level));
+        // The list, each record and most ring headers are read below wherever the point is, so
         // they are requested before the first one is needed: their cache misses overlap.
-        for &list in &lists {
-            if list != NO_DATA { index.admin_entries.prefetch(list as u64); }
-        }
+        if list != NO_DATA { index.admin_entries.prefetch(list as u64); }
         let record_bytes = std::mem::size_of::<AdminPolygon>() as u64;
-        for &list in &lists {
-            Index::for_each_entry_fb(&index.admin_entries, list, |id| index.admin_polygons.prefetch((id & ID_MASK) as u64 * record_bytes));
-        }
-        let (mut rings, mut own_cell_rings) = (Vec::new(), 0);
-        for (k, &list) in lists.iter().enumerate() {
-            Index::for_each_entry_fb(&index.admin_entries, list, |id| {
-                if let Some(poly) = index.admin_polygon(id & ID_MASK) { rings.push((id, poly)); }
-            });
-            if k == 0 { own_cell_rings = rings.len(); }
-        }
+        Index::for_each_entry_fb(&index.admin_entries, list, |id| index.admin_polygons.prefetch((id & ID_MASK) as u64 * record_bytes));
+        let mut rings = Vec::new();
+        Index::for_each_entry_fb(&index.admin_entries, list, |id| {
+            if let Some(poly) = index.admin_polygon(id & ID_MASK) { rings.push((id, poly)); }
+        });
         for (_, poly) in &rings {
             if poly.vertex_offset != NO_DATA { index.admin_vertices.prefetch(poly.vertex_offset as u64); }
         }
-        AdminScan { rings, own_cell_rings, pip: PipMemo::new(lat, lng) }
+        AdminScan { rings, pip: PipMemo::new(lat, lng) }
     }
 
-    /// Calls `f(pip, in_own_cell, entry, polygon)` for every ring, in visiting order.
-    fn for_each_entry(&mut self, mut f: impl FnMut(&mut PipMemo, bool, u32, AdminPolygon)) {
-        for (i, &(id, poly)) in self.rings.iter().enumerate() {
-            f(&mut self.pip, i < self.own_cell_rings, id, poly);
+    /// Calls `f(pip, entry, polygon)` for every ring, in visiting order.
+    fn for_each_entry(&mut self, mut f: impl FnMut(&mut PipMemo, u32, AdminPolygon)) {
+        for &(id, poly) in &self.rings {
+            f(&mut self.pip, id, poly);
         }
     }
 }
@@ -1410,43 +1397,6 @@ impl Index {
             } else if mid_id < cell_id { lo = mid + 1; } else { hi = mid; }
         }
         NO_DATA
-    }
-
-    /// `lookup_admin_cell_fb` for each of `ids` (NO_DATA where absent). Cells next to each other
-    /// on the map mostly sit close together in the index, so after one binary search each further
-    /// cell, in id order, is found by galloping forward from the previous one.
-    pub fn lookup_admin_cells_fb(cells: &FileBytes, ids: &[u64], out: &mut [u32]) {
-        const STRIDE: u64 = 12;
-        let count = cells.len() / STRIDE;
-        let key = |i: u64| u64::from_le_bytes(cells.read_chunk(i * STRIDE, 8)[..].try_into().unwrap());
-        let mut order: Vec<usize> = (0..ids.len()).collect();
-        order.sort_unstable_by_key(|&k| ids[k]);
-        // Every id not yet looked up has its lower bound at or after `base`.
-        let mut base = 0;
-        for (n, &k) in order.iter().enumerate() {
-            let id = ids[k];
-            let mut end = count;
-            if n > 0 {
-                // Gallop: widen [base, end) until key(end - 1) >= id.
-                let mut step = 1;
-                end = base;
-                loop {
-                    end = (end + step).min(count);
-                    if end == count || key(end - 1) >= id { break; }
-                    base = end;
-                    step *= 2;
-                }
-            }
-            while base < end {
-                let mid = base + (end - base) / 2;
-                if key(mid) < id { base = mid + 1; } else { end = mid; }
-            }
-            out[k] = if base < count && key(base) == id {
-                u32::from_le_bytes(cells.read_chunk(base * STRIDE + 8, 4)[..].try_into().unwrap())
-            } else {
-                NO_DATA
-            };
-        }
     }
 
     // geo_cells is a 20-byte-stride sorted index — binary search it
@@ -1919,12 +1869,10 @@ impl Index {
         // best_by_level[]. Stored as (poly_id, AdminPolygon) so we can dedup by id.
         let mut place_area_polygons: Vec<(u32, AdminPolygon)> = Vec::new();
 
-        scan.for_each_entry(|pip, in_own_cell, id, poly| {
+        scan.for_each_entry(|pip, id, poly| {
             // The interior flag on a (cell, polygon) entry proves
-            // containment only for queries INSIDE that cell; honoring a
-            // neighbour's flag claimed containment for points up to a full
-            // cell away (a Dutch query 'inside' a German naturpark).
-            let is_interior = in_own_cell && (id & INTERIOR_FLAG) != 0;
+            // containment for queries inside that cell, the scan's only one.
+            let is_interior = (id & INTERIOR_FLAG) != 0;
             let poly_id = id & ID_MASK;
             if poly.admin_level == 15 {
                 if poly.area <= 0.0 { return; }
@@ -2182,7 +2130,7 @@ impl Index {
         // (area, id, polygon) of every boundary and place area near the point.
         let mut boundaries: Vec<(f32, u32, AdminPolygon)> = Vec::new();
         let mut place_areas: Vec<(f32, u32, AdminPolygon)> = Vec::new();
-        scan.for_each_entry(|_, _, id, poly| {
+        scan.for_each_entry(|_, id, poly| {
             let poly_id = id & ID_MASK;
             if poly.area <= 0.0 { return; }
             match poly.admin_level {
@@ -2655,7 +2603,7 @@ impl Index {
         // PIP from the query point — these aren't in the parent chain
         // but provide place-area rank promotions.
         let mut place_area_polygons: Vec<AdminPolygon> = Vec::new();
-        scan.for_each_entry(|pip, _, id, poly| {
+        scan.for_each_entry(|pip, id, poly| {
             let poly_id = id & ID_MASK;
             if poly.admin_level != 15 { return; }
             if poly.area <= 0.0 { return; }
@@ -6814,9 +6762,9 @@ mod admin_scan_tests {
     use super::encoded_pip_tests::pack_ring;
     use super::*;
 
-    // A query point on Egypt's side of its 22°N border with Sudan. The builder's S2 covering
-    // follows the great circle between the border's end points, which bows 3.3 km north of the
-    // parallel, so the point's own level-10 cell lists Sudan but not Egypt.
+    // A query point on Egypt's side of its 22°N border with Sudan. An S2 covering of the great
+    // circle between the border's end points, which bows 3.3 km north of the parallel, leaves Egypt
+    // out of the point's own level-10 cell; the builder covers the straight edge instead.
     const Q: (f64, f64) = (22.002, 27.57);
 
     struct Ring {
@@ -6902,15 +6850,23 @@ mod admin_scan_tests {
     const SUDAN: (f64, f64, f64, f64) = (8.7, 21.8, 22.0, 38.6);
 
     #[test]
-    fn find_admin_finds_a_ring_listed_only_in_a_neighbour_cell() {
+    fn find_admin_reads_only_the_points_own_cell() {
+        // Rings listed only in neighbour cells: the builder lists a ring in the cell of every point
+        // it contains, so these contain no point of Q's cell.
         let idx = admin_index(&[
             Ring { country: b"sd", ..ring("Sudan", 2, 190.0, SUDAN, &[(0, true), (3, true)]) },
             ring("Egypt", 2, 97.0, EGYPT, &[(3, false), (5, false)]),
             ring("New Valley", 4, 38.8, (22.0, 25.0, 27.7, 32.7), &[(5, false)]),
         ]);
         let a = idx.find_admin(Q.0, Q.1);
-        assert_eq!(a.country, Some("Egypt"));
-        assert_eq!(a.state, Some("New Valley"));
+        assert_eq!((a.country, a.state), (None, None));
+        let idx = admin_index(&[
+            Ring { country: b"sd", ..ring("Sudan", 2, 190.0, SUDAN, &[(0, false), (3, true)]) },
+            ring("Egypt", 2, 97.0, EGYPT, &[(0, false), (5, false)]),
+            ring("New Valley", 4, 38.8, (22.0, 25.0, 27.7, 32.7), &[(0, false)]),
+        ]);
+        let a = idx.find_admin(Q.0, Q.1);
+        assert_eq!((a.country, a.state), (Some("Egypt"), Some("New Valley")));
     }
 
     #[test]
@@ -6938,31 +6894,31 @@ mod admin_scan_tests {
     }
 
     #[test]
-    fn a_place_area_listed_only_in_a_neighbour_cell_fills_its_field() {
+    fn a_place_area_fills_its_field() {
         let idx = admin_index(&[
             ring("Egypt", 2, 97.0, EGYPT, &[(0, true)]),
-            Ring { place_type: 4, ..ring("Bir Tarfawi", 15, 0.01, (21.99, 27.5, 22.05, 27.6), &[(6, false), (7, false)]) },
+            Ring { place_type: 4, ..ring("Bir Tarfawi", 15, 0.01, (21.99, 27.5, 22.05, 27.6), &[(0, false), (7, false)]) },
         ]);
         assert_eq!(idx.find_admin(Q.0, Q.1).suburb, Some("Bir Tarfawi"));
     }
 
     #[test]
-    fn equal_area_rings_resolve_in_cell_visiting_order() {
+    fn equal_area_rings_resolve_in_entry_order() {
         let around_q = (21.99, 27.5, 22.05, 27.6);
-        // Own cell before any neighbour.
+        // By polygon id.
         let idx = admin_index(&[
             ring("Egypt", 2, 97.0, EGYPT, &[(0, true)]),
-            ring("Listed in neighbour 1", 4, 1.0, around_q, &[(1, false)]),
-            ring("Listed in own cell", 4, 1.0, around_q, &[(0, false)]),
+            ring("First", 4, 1.0, around_q, &[(0, false)]),
+            ring("Second", 4, 1.0, around_q, &[(0, false)]),
         ]);
-        assert_eq!(idx.find_admin(Q.0, Q.1).state, Some("Listed in own cell"));
-        // Then neighbours in cell_neighbors_at_level order.
+        assert_eq!(idx.find_admin(Q.0, Q.1).state, Some("First"));
+        // The interior flag is the entry's high bit.
         let idx = admin_index(&[
             ring("Egypt", 2, 97.0, EGYPT, &[(0, true)]),
-            ring("Listed in neighbour 4", 4, 1.0, around_q, &[(4, false)]),
-            ring("Listed in neighbour 2", 4, 1.0, around_q, &[(2, false)]),
+            ring("First, interior", 4, 1.0, around_q, &[(0, true)]),
+            ring("Second", 4, 1.0, around_q, &[(0, false)]),
         ]);
-        assert_eq!(idx.find_admin(Q.0, Q.1).state, Some("Listed in neighbour 2"));
+        assert_eq!(idx.find_admin(Q.0, Q.1).state, Some("Second"));
     }
 
     #[test]
@@ -6977,12 +6933,12 @@ mod admin_scan_tests {
     }
 
     #[test]
-    fn boundaries_listed_only_in_a_neighbour_cell_gate_place_nodes() {
+    fn the_smallest_containing_boundaries_gate_place_nodes() {
         let idx = admin_index(&[
             ring("Egypt", 2, 97.0, EGYPT, &[(0, true)]),
-            ring("Paris", 8, 2.0, (21.9, 27.4, 22.1, 27.7), &[(8, false)]),
+            ring("Paris", 8, 2.0, (21.9, 27.4, 22.1, 27.7), &[(0, false)]),
             ring("Balat", 8, 0.5, (21.9, 27.4, 21.95, 27.7), &[(0, false)]),
-            ring("Mut", 10, 0.3, (21.99, 27.5, 22.05, 27.6), &[(2, false)]),
+            ring("Mut", 10, 0.3, (21.99, 27.5, 22.05, 27.6), &[(0, false)]),
         ]);
         let gates = idx.find_current_boundaries(&mut AdminScan::new(&idx, Q.0, Q.1), Some(*b"eg"));
         let name = |rank| gates.for_rank(rank).map(|p| idx.get_string(p.name_id));
@@ -6993,11 +6949,11 @@ mod admin_scan_tests {
     #[test]
     fn one_scan_serves_every_admin_lookup_of_the_point() {
         let idx = admin_index(&[
-            ring("Egypt", 2, 97.0, EGYPT, &[(3, false)]),
+            ring("Egypt", 2, 97.0, EGYPT, &[(0, false)]),
             ring("New Valley", 4, 38.8, (22.0, 25.0, 27.7, 32.7), &[(0, false), (5, false)]),
-            ring("Paris", 8, 2.0, (21.9, 27.4, 22.1, 27.7), &[(8, false)]),
-            ring("Mut", 10, 0.3, (21.99, 27.5, 22.05, 27.6), &[(2, false)]),
-            Ring { place_type: 5, ..ring("Bir Tarfawi", 15, 0.01, (21.99, 27.5, 22.05, 27.6), &[(6, false)]) },
+            ring("Paris", 8, 2.0, (21.9, 27.4, 22.1, 27.7), &[(0, false)]),
+            ring("Mut", 10, 0.3, (21.99, 27.5, 22.05, 27.6), &[(0, false)]),
+            Ring { place_type: 5, ..ring("Bir Tarfawi", 15, 0.01, (21.99, 27.5, 22.05, 27.6), &[(0, false)]) },
         ]);
         let mut scan = AdminScan::new(&idx, Q.0, Q.1);
         let gates = idx.find_current_boundaries(&mut scan, Some(*b"eg"));
@@ -7012,22 +6968,21 @@ mod admin_scan_tests {
     }
 
     #[test]
-    fn admin_scan_keeps_the_own_cells_rings_first() {
+    fn admin_scan_reads_the_own_cells_entries_in_value_order() {
         let new_valley = (22.0, 25.0, 27.7, 32.7);
         let scan = AdminScan::new(&admin_index(&[ring("Egypt", 2, 97.0, EGYPT, &[(0, true)])]), Q.0, Q.1);
-        assert_eq!((scan.own_cell_rings, scan.rings.len()), (1, 1));
+        assert_eq!(scan.rings.len(), 1);
         // The own cell absent from the index.
         let scan = AdminScan::new(&admin_index(&[ring("Egypt", 2, 97.0, EGYPT, &[(3, true), (5, false)])]), Q.0, Q.1);
-        assert_eq!((scan.own_cell_rings, scan.rings.len()), (0, 2));
+        assert!(scan.rings.is_empty());
         let idx = admin_index(&[
             ring("Egypt", 2, 97.0, EGYPT, &[(5, false), (0, true)]),
             ring("New Valley", 4, 38.8, new_valley, &[(8, false), (0, false)]),
         ]);
         let scan = AdminScan::new(&idx, Q.0, Q.1);
-        assert_eq!((scan.own_cell_rings, scan.rings.len()), (2, 4));
         let names: Vec<&str> = scan.rings.iter().map(|(_, p)| idx.get_string(p.name_id)).collect();
-        // A cell's entries in value order (the interior flag is the high bit), cells in visiting order.
-        assert_eq!(names, ["New Valley", "Egypt", "Egypt", "New Valley"]);
+        // The interior flag is the high bit.
+        assert_eq!(names, ["New Valley", "Egypt"]);
     }
 
     #[test]
@@ -7038,37 +6993,6 @@ mod admin_scan_tests {
         let src = FileBytes::Owned(vec![1, 2, 3]);
         src.prefetch(1);
         assert_eq!(&src.read_chunk(0, 3)[..], &[1, 2, 3]);
-    }
-
-    #[test]
-    fn lookup_admin_cells_fb_finds_what_one_by_one_lookups_find() {
-        let mut rng = super::encoded_pip_tests::Rng::new(11);
-        for size in [0usize, 1, 2, 3, 10, 1000] {
-            // A sorted index of distinct cell ids with gaps; offsets are the ids' ranks.
-            let mut ids: Vec<u64> = (0..size).map(|_| rng.next() % 5000 * 2).collect();
-            ids.sort_unstable();
-            ids.dedup();
-            let mut index = Vec::new();
-            for (rank, id) in ids.iter().enumerate() {
-                index.extend_from_slice(&id.to_le_bytes());
-                index.extend_from_slice(&(rank as u32 * 7).to_le_bytes());
-            }
-            let cells = FileBytes::Owned(index);
-            for _ in 0..200 {
-                // Present, absent (odd), duplicated and out-of-range ids, in any order.
-                let n = 1 + (rng.next() % 9) as usize;
-                let near = rng.next() % 10_000;
-                let query: Vec<u64> = (0..n).map(|_| match rng.next() % 4 {
-                    0 if !ids.is_empty() => ids[(rng.next() % ids.len() as u64) as usize],
-                    1 => u64::MAX - rng.next() % 3,
-                    _ => near + rng.next() % 40,
-                }).collect();
-                let mut got = vec![0u32; n];
-                Index::lookup_admin_cells_fb(&cells, &query, &mut got);
-                let want: Vec<u32> = query.iter().map(|&c| Index::lookup_admin_cell_fb(&cells, c)).collect();
-                assert_eq!(got, want, "index of {} cells, query {query:?}", ids.len());
-            }
-        }
     }
 
     #[test]
