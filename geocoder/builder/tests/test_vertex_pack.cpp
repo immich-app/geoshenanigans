@@ -94,3 +94,29 @@ TEST(plan_polygon_sizes_the_header_and_vertex_stride) {
     CHECK(p.enc == VertexEncoding::U32_1CM);
     CHECK_EQ(p.bytes, POLY_HEADER_BYTES + 3 * 8);
 }
+
+TEST(unpack_polygon_decodes_each_vertex_to_its_grid_point) {
+    std::mt19937_64 rng(11);
+    std::uniform_real_distribution<float> lat0(-80, 40), lng0(-179, 139);
+    const double spans[] = {0.03, 0.3, 4.0, 40.0};  // one per encoding
+    for (int round = 0; round < 200; round++) {
+        const double span = spans[round % 4];
+        std::uniform_real_distribution<double> step(0, span);
+        const size_t n = 1 + rng() % 40;
+        const float base_lat = lat0(rng), base_lng = lng0(rng);
+        std::vector<NodeCoord> nodes(n);
+        for (auto& v : nodes) v = {static_cast<float>(base_lat + step(rng)), static_cast<float>(base_lng + step(rng))};
+        const PolygonPacking p = plan_polygon(nodes.data(), n);
+        std::vector<uint8_t> bytes(p.bytes);
+        pack_polygon(bytes.data(), p, nodes.data(), n);
+        CHECK_EQ(VERTEX_SCALE[static_cast<uint8_t>(p.enc)], p.scale);
+        const std::vector<NodeCoord> got = unpack_polygon(bytes.data(), n);
+        REQUIRE(got.size() == n);
+        // Half a grid step, plus the f32 rounding of the minimum and of the result.
+        const double tolerance = p.scale / 2 + 4e-5;
+        for (size_t k = 0; k < n; k++) {
+            CHECK(std::abs(got[k].lat - nodes[k].lat) <= tolerance);
+            CHECK(std::abs(got[k].lng - nodes[k].lng) <= tolerance);
+        }
+    }
+}

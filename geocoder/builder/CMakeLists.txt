@@ -78,6 +78,7 @@ add_executable(build-index
     src/build_index.cpp
     src/pbf_reader.cpp
     src/s2_helpers.cpp
+    src/admin_cover.cpp
     src/ring_assembly.cpp
     src/continent_filter.cpp
     src/continent_boundaries.cpp
@@ -167,6 +168,19 @@ target_compile_definitions(geocoder-tests PRIVATE
     _FILE_OFFSET_BITS=64)
 target_link_libraries(geocoder-tests PRIVATE ZLIB::ZLIB libdeflate::libdeflate EXPAT::EXPAT Threads::Threads)
 add_test(NAME geocoder-tests COMMAND geocoder-tests)
+
+# Unit tests of the builder code that runs on S2 (tests/s2/*.cpp), linked
+# like build-index: geocoder-tests stays free of S2 for the sanitizer job.
+file(GLOB GEOCODER_S2_TEST_SRCS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/s2/*.cpp")
+add_executable(geocoder-s2-tests
+    tests/test_main.cpp
+    ${GEOCODER_S2_TEST_SRCS}
+    src/admin_cover.cpp
+)
+target_include_directories(geocoder-s2-tests PRIVATE src tests)
+geocoder_link_s2(geocoder-s2-tests)
+target_link_libraries(geocoder-s2-tests PRIVATE Threads::Threads)
+add_test(NAME geocoder-s2-tests COMMAND geocoder-s2-tests)
 
 # GEOCODER_SANITIZE=ON builds the unit tests with ASan + UBSan, undefined
 # behaviour failing the run (CI's sanitizer job). Tests only: build-index

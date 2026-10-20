@@ -92,3 +92,30 @@ size_t pack_polygon_at(uint8_t* dst, const Vertex* verts, size_t n) {
     pack_polygon(dst, p, verts, n);
     return p.bytes;
 }
+
+// The n vertices a reader decodes from one packed polygon at src: each delta
+// on the encoding's grid from the f32 bbox_min, in double, rounded to f32 (the
+// server's decode_polygon_verts).
+inline std::vector<NodeCoord> unpack_polygon(const uint8_t* src, size_t n) {
+    const uint8_t enc = src[0];
+    float min_lat, min_lng;
+    std::memcpy(&min_lat, src + 2, 4);
+    std::memcpy(&min_lng, src + 6, 4);
+    const double scale = VERTEX_SCALE[enc];
+    const uint8_t* at = src + POLY_HEADER_BYTES;
+    std::vector<NodeCoord> out(n);
+    for (size_t k = 0; k < n; k++, at += VERTEX_STRIDE[enc]) {
+        double dlat, dlng;
+        if (enc == static_cast<uint8_t>(VertexEncoding::U32_1CM)) {
+            uint32_t q[2];
+            std::memcpy(q, at, 8);
+            dlat = q[0], dlng = q[1];
+        } else {
+            uint16_t q[2];
+            std::memcpy(q, at, 4);
+            dlat = q[0], dlng = q[1];
+        }
+        out[k] = {static_cast<float>(min_lat + dlat * scale), static_cast<float>(min_lng + dlng * scale)};
+    }
+    return out;
+}
