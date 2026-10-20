@@ -323,7 +323,16 @@ struct ParsedData {
     std::vector<gc::id_alloc::SidecarSlot> poi_sidecar_blob;
     std::vector<gc::id_alloc::SidecarSlot> interp_sidecar_blob;
     std::vector<NodeCoord> admin_vertices;
+    // The builder's own admin candidates per cell: the S2 covering of each
+    // polygon's ring, which the parent and country passes (and the continent
+    // split's polygon set) read.
     std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_admin;
+    // The admin cell index the reader reads (admin_cells.bin), in canonical
+    // order: (cell, poly_id | INTERIOR_FLAG) for every cell from which any
+    // written variant's ring of the polygon contains a point (see
+    // compute_admin_index_cells), and admin-minimal's alike for its rings.
+    std::vector<CellItemPair> admin_index_cells;
+    std::vector<CellItemPair> admin_minimal_index_cells;
 
     // Deferred work for parallel S2 computation (ways + interps)
     std::vector<DeferredWay> deferred_ways;

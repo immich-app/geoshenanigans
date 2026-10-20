@@ -1877,33 +1877,20 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                 write_cell_index_sorted(mdir + "/place_cells.bin", mdir + "/place_entries.bin",
                                         filtered_place_cells);
 
-                // 4. Rebuild admin cell index against the new polygon ID space.
-                //    Preserves the high-bit INTERIOR_FLAG used by the cell
-                //    index format (polys that fully contain a cell vs. just
-                //    intersect it).
-                using CellIds = std::pair<uint64_t, std::vector<uint32_t>>;
-                const auto& admin_cells = d.cell_to_admin;
-                std::vector<CellIds> kept_cells = parallel_collect<CellIds>(admin_cells.bucket_count(),
-                    [&](size_t b, std::vector<CellIds>& out) {
-                        for (auto it = admin_cells.begin(b); it != admin_cells.end(b); ++it) {
-                            std::vector<uint32_t> kept;
-                            kept.reserve(it->second.size());
-                            for (uint32_t flagged : it->second) {
-                                uint32_t poly_id = flagged & ID_MASK;
-                                uint32_t flags   = flagged & INTERIOR_FLAG;
-                                if (poly_id >= poly_remap.size()) continue;
-                                uint32_t new_id = poly_remap[poly_id];
-                                if (new_id == NO_DATA) continue;
-                                kept.push_back(new_id | flags);
-                            }
-                            if (!kept.empty()) out.emplace_back(it->first, std::move(kept));
-                        }
+                // 4. Its own admin cell index (compute_admin_index_cells),
+                //    against the new polygon ID space. Preserves the
+                //    high-bit INTERIOR_FLAG used by the cell index format
+                //    (polys that fully contain a cell vs. just intersect it).
+                std::vector<CellItemPair> kept_cells = parallel_collect<CellItemPair>(d.admin_minimal_index_cells.size(),
+                    [&](size_t k, std::vector<CellItemPair>& out) {
+                        const CellItemPair& p = d.admin_minimal_index_cells[k];
+                        const uint32_t poly_id = p.item_id & ID_MASK;
+                        const uint32_t new_id = poly_id < poly_remap.size() ? poly_remap[poly_id] : NO_DATA;
+                        if (new_id != NO_DATA) out.push_back({p.cell_id, new_id | (p.item_id & INTERIOR_FLAG)});
                     });
-                std::unordered_map<uint64_t, std::vector<uint32_t>> filtered_admin_cells;
-                filtered_admin_cells.reserve(kept_cells.size());
-                for (auto& [cell_id, kept] : kept_cells) filtered_admin_cells.emplace(cell_id, std::move(kept));
-                write_cell_index(mdir + "/admin_cells.bin", mdir + "/admin_entries.bin",
-                                 filtered_admin_cells);
+                // The slots renumber: each cell's ids back in canonical order.
+                parallel_sort(kept_cells.begin(), kept_cells.end(), cell_item_less);
+                write_cell_index_sorted(mdir + "/admin_cells.bin", mdir + "/admin_entries.bin", kept_cells);
 
                 // 5. Core strings + layout: admin and place names all live in core.
                 {
@@ -1917,8 +1904,8 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
 
                 std::cerr << "  Admin-minimal: " << filtered_places.size()
                           << " place nodes (of " << d.place_nodes.size() << "), "
-                          << filtered_admin_cells.size() << " cells (of "
-                          << d.cell_to_admin.size() << ")" << std::endl;
+                          << count_cells(kept_cells) << " cells (of "
+                          << count_cells(d.admin_index_cells) << ")" << std::endl;
             }
 
         };
@@ -2135,6 +2122,14 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
     // recomputed them from its own addr points put RU 430000 on two
     // mis-tagged Moscow addresses (Saransk's 21 fall in the asia subset).
     timed_phase("    planet: postcode centroids", [&] { collect_postcode_centroids(data); });
+
+    // The reader's admin cell indexes, once the polygon ids are final: from
+    // the rings the quality variants (or, in one dir, the uncapped rings) and
+    // admin-minimal write. The continents take their part of them.
+    timed_phase("    planet: admin index cells", [&] {
+        compute_admin_index_cells(data, multi_quality ? quality_scales : std::vector<double>{0},
+                                  multi_output ? std::optional<double>(kAdminMinimalEpsilonScale) : std::nullopt);
+    });
 
 #ifdef __GLIBC__
     // The earlier phases' freed blocks sit in the malloc arenas; handed back,

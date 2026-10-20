@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -10,6 +11,17 @@
 #include "memory_limit.h"
 
 void write_index(const ParsedData& data, const std::string& output_dir, IndexMode mode);
+
+// Fills the admin cell indexes the reader reads (data.admin_index_cells,
+// data.admin_minimal_index_cells) from the rings the variants write, as
+// pack_admin_polygon packs them at each epsilon scale: the shared index gets
+// each polygon's cells of its ring in every one of `scales` (the variants that
+// read it), interior where interior in all; with a minimal_scale,
+// admin-minimal's gets its levels' cells of the ring at that scale. Runs once
+// the polygon ids are final; strategy-2 and the continent split carry the
+// tables on from there.
+void compute_admin_index_cells(ParsedData& data, const std::vector<double>& scales,
+                               std::optional<double> minimal_scale);
 
 // strings_layout.json: each tier's [start, end) in the global string-offset
 // space, identical in every dir that resolves strings.

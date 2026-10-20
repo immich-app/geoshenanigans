@@ -18,6 +18,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "admin_cover.h"
 #include "geometry.h"
 #include "id_allocator.h"
 #include "parallel.h"
@@ -242,6 +243,8 @@ static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir
     // guard would skip it and leave a stale polygon index after reorder, so
     // use remap_index_flagged which masks the flag, remaps, then re-ORs.
     remap_cell_map(data.cell_to_admin, [&](uint32_t& v) { remap_index_flagged(v, remap); });
+    remap_cell_pairs(data.admin_index_cells, [&](uint32_t& v) { remap_index_flagged(v, remap); });
+    remap_cell_pairs(data.admin_minimal_index_cells, [&](uint32_t& v) { remap_index_flagged(v, remap); });
     // admin_parent_ids and way_parent_ids hold admin polygon IDs (parent chain).
     // admin_parent_ids was reordered above; now value-remap each entry.
     // These are plain indices (no INTERIOR_FLAG), so plain remap_index is correct.
@@ -675,9 +678,10 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
 
     auto admin_future = std::async(std::launch::async, [&] {
         timed_phase(label + "admin cells", [&] {
-            write_cell_index(output_dir + "/admin_cells.bin", output_dir + "/admin_entries.bin", data.cell_to_admin);
+            write_cell_index_sorted(output_dir + "/admin_cells.bin", output_dir + "/admin_entries.bin",
+                                    data.admin_index_cells);
         });
-        std::cerr << "admin index: " << data.cell_to_admin.size() << " cells, " << data.admin_polygons.size() << " polygons" << std::endl;
+        std::cerr << "admin index: " << count_cells(data.admin_index_cells) << " cells, " << data.admin_polygons.size() << " polygons" << std::endl;
     });
 
     std::vector<std::future<void>> write_futures;
@@ -1079,6 +1083,97 @@ static PackedPolygon pack_admin_polygon(const ParsedData& data, const AdminPolyg
     return out;
 }
 
+// The admin levels admin-minimal keeps (L9 borough, L10 quarter-area, L11
+// admin-postal and L15 place-area markers are left out).
+static bool in_admin_minimal(uint8_t admin_level) { return admin_level >= 2 && admin_level <= 8; }
+
+using RingCells = std::vector<std::pair<uint64_t, bool>>;
+
+// The cells of either of two rings of one polygon (admin_ring_cells, both
+// ascending), interior where interior for both.
+static RingCells either_ring(const RingCells& x, const RingCells& y) {
+    RingCells out;
+    out.reserve(std::max(x.size(), y.size()));
+    for (size_t i = 0, j = 0; i < x.size() || j < y.size();) {
+        if (j == y.size() || (i < x.size() && x[i].first < y[j].first)) {
+            out.emplace_back(x[i++].first, false);
+        } else if (i == x.size() || y[j].first < x[i].first) {
+            out.emplace_back(y[j++].first, false);
+        } else {
+            out.emplace_back(x[i].first, x[i].second && y[j].second);
+            i++, j++;
+        }
+    }
+    return out;
+}
+
+void compute_admin_index_cells(ParsedData& data, const std::vector<double>& scales,
+                               std::optional<double> minimal_scale) {
+    const unsigned threads = parallel_threads();
+    struct Found {
+        std::vector<CellItemPair> shared, minimal;
+    };
+    std::vector<Found> found(threads);
+    parallel_for_dynamic(data.admin_polygons.size(), 1, [&](size_t begin, size_t end, unsigned worker) {
+        Found& out = found[worker];
+        for (size_t i = begin; i < end; i++) {
+            const AdminPolygon& ap = data.admin_polygons[i];
+            if (ap.vertex_count == 0 || ap.vertex_offset == NO_DATA) continue;
+            // The cells of the ring a variant at `scale` writes, none when it
+            // writes no ring.
+            auto ring_cells = [&](double scale) {
+                const PackedPolygon pp = pack_admin_polygon(data, ap, scale);
+                if (pp.bytes.empty()) return RingCells();
+                const std::vector<NodeCoord> ring = unpack_polygon(pp.bytes.data(), pp.vertex_count);
+                return admin_ring_cells(ring.data(), pp.vertex_count, kAdminCellLevel);
+            };
+            const bool minimal = minimal_scale && in_admin_minimal(ap.admin_level);
+            std::optional<RingCells> shared, own_minimal;
+            for (double scale : scales) {
+                RingCells cells = ring_cells(scale);
+                if (minimal && scale == *minimal_scale) own_minimal = cells;
+                if (cells.empty()) continue;
+                shared = shared ? either_ring(*shared, cells) : std::move(cells);
+            }
+            if (minimal && !own_minimal) own_minimal = ring_cells(*minimal_scale);
+            const uint32_t id = static_cast<uint32_t>(i);
+            if (shared)
+                for (const auto& [cell, interior] : *shared) out.shared.push_back({cell, interior ? id | INTERIOR_FLAG : id});
+            if (own_minimal)
+                for (const auto& [cell, interior] : *own_minimal) out.minimal.push_back({cell, interior ? id | INTERIOR_FLAG : id});
+        }
+    }, threads);
+
+    auto gather = [&](std::vector<CellItemPair> Found::*part) {
+        std::vector<size_t> at(threads + 1, 0);
+        for (unsigned w = 0; w < threads; w++) at[w + 1] = at[w] + (found[w].*part).size();
+        std::vector<CellItemPair> pairs;
+        parallel_resize(pairs, at[threads]);
+        parallel_for(threads, [&](size_t b, size_t e, unsigned) {
+            for (size_t w = b; w < e; w++) {
+                std::copy((found[w].*part).begin(), (found[w].*part).end(), pairs.begin() + at[w]);
+                found[w].*part = {};
+            }
+        });
+        // Each (cell, polygon) once: the order is the workers' schedule's
+        // until sorted.
+        parallel_sort(pairs.begin(), pairs.end(), cell_item_less);
+        return pairs;
+    };
+    data.admin_index_cells = gather(&Found::shared);
+    data.admin_minimal_index_cells = gather(&Found::minimal);
+
+    auto interior = [](const std::vector<CellItemPair>& pairs) {
+        return parallel_count(pairs.size(), [&](size_t k) { return (pairs[k].item_id & INTERIOR_FLAG) != 0; });
+    };
+    std::cerr << "Admin index cells: " << count_cells(data.admin_index_cells) << " cells, "
+              << data.admin_index_cells.size() << " entries (" << interior(data.admin_index_cells)
+              << " interior) over " << scales.size() << " variants; admin-minimal "
+              << count_cells(data.admin_minimal_index_cells) << " cells, "
+              << data.admin_minimal_index_cells.size() << " entries ("
+              << interior(data.admin_minimal_index_cells) << " interior)" << std::endl;
+}
+
 // Writes packed polygons back to back: bytes_of(j) for j in [0, n), null to
 // skip one.
 template <class BytesOf>
@@ -1256,8 +1351,7 @@ void write_admin_minimal_polygons(const ParsedData& data,
     std::vector<uint32_t> kept_idx;
     kept_idx.reserve(data.admin_polygons.size() / 2);
     for (size_t i = 0; i < data.admin_polygons.size(); i++) {
-        uint8_t lvl = data.admin_polygons[i].admin_level;
-        if (lvl >= 2 && lvl <= 8) kept_idx.push_back(static_cast<uint32_t>(i));
+        if (in_admin_minimal(data.admin_polygons[i].admin_level)) kept_idx.push_back(static_cast<uint32_t>(i));
     }
 
     // Parallel simplification of just the kept polygons.

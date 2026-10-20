@@ -1,4 +1,5 @@
 #include "continent_filter.h"
+#include "admin_cover.h"
 #include "continent_boundaries.h"
 #include "parsed_data.h"
 #include "parallel.h"
@@ -8,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <functional>
 #include <future>
 #include <optional>
 #include <stdexcept>
@@ -110,8 +112,38 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
         return RankedBits(max_id, used, threads).ones(threads);
     };
 
+    // The cells of a reader's admin cell index (admin_index_cells) the
+    // continent keeps: every cell a query routed here reads
+    // (admin_cell_routed), its own cells and the ring of cells around them.
+    // kept[c] is 0, or 1 for a cell of the continent, 2 for one around it.
+    struct IndexCells {
+        std::vector<size_t> starts;  // each cell's first pair
+        std::vector<uint8_t> kept;
+        size_t end(const std::vector<CellItemPair>& pairs, size_t c) const {
+            return c + 1 < starts.size() ? starts[c + 1] : pairs.size();
+        }
+    };
+    const std::function<bool(uint64_t)> holds = [&](uint64_t c) { return cell_in_continent(c, bbox, polygon); };
+    auto routed_cells = [&](const std::vector<CellItemPair>& pairs) {
+        IndexCells r;
+        r.starts = parallel_filter<size_t>(pairs.size(), [&](size_t i) {
+            return i == 0 || pairs[i].cell_id != pairs[i - 1].cell_id;
+        });
+        r.kept.assign(r.starts.size(), 0);
+        parallel_for(r.starts.size(), [&](size_t begin, size_t end, unsigned) {
+            for (size_t c = begin; c < end; c++) {
+                const uint64_t cell = pairs[r.starts[c]].cell_id;
+                r.kept[c] = holds(cell) ? 1 : admin_cell_routed(cell, holds) ? 2 : 0;
+            }
+        });
+        return r;
+    };
+    IndexCells index_cells, minimal_index_cells;
+
     // The continent's admin cells (admin has no precomputed masks), and the
-    // ids of the polygons they hold, ascending.
+    // ids of the polygons they hold, ascending: those of its own cells in the
+    // builder's covering, and every polygon its reader's admin cell indexes
+    // list.
     using AdminCell = std::unordered_map<uint64_t, std::vector<uint32_t>>::value_type;
     std::vector<const AdminCell*> admin_cells;
     auto filter_admin_cells = [&](const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map) {
@@ -129,6 +161,21 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
                     mark_bit(used, id & ID_MASK);
                 }
         });
+        index_cells = routed_cells(full.admin_index_cells);
+        minimal_index_cells = routed_cells(full.admin_minimal_index_cells);
+        auto mark_index = [&](const std::vector<CellItemPair>& pairs, const IndexCells& cells) {
+            parallel_for(cells.starts.size(), [&](size_t begin, size_t end, unsigned) {
+                for (size_t c = begin; c < end; c++) {
+                    if (!cells.kept[c]) continue;
+                    for (size_t i = cells.starts[c]; i < cells.end(pairs, c); i++) {
+                        if ((pairs[i].item_id & ID_MASK) >= polygons) throw std::out_of_range("admin index entry past the polygons");
+                        mark_bit(used, pairs[i].item_id & ID_MASK);
+                    }
+                }
+            });
+        };
+        mark_index(full.admin_index_cells, index_cells);
+        mark_index(full.admin_minimal_index_cells, minimal_index_cells);
         return RankedBits(polygons, used).ones();
     };
 
@@ -417,6 +464,25 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
         for (auto& [cell, ids] : kept) out.cell_to_admin.emplace(cell, std::move(ids));
     };
 
+    // The reader's admin cell indexes cut to the cells they keep, with their
+    // polygons' continent ids (the continent keeps every polygon they list).
+    auto remap_index_cells = [&](const std::vector<CellItemPair>& planet, const IndexCells& cells,
+                                 std::vector<CellItemPair>& kept, const char* name) {
+        std::atomic<size_t> missing{0};
+        kept = parallel_collect<CellItemPair>(cells.starts.size(), [&](size_t c, std::vector<CellItemPair>& found) {
+            if (!cells.kept[c]) return;
+            for (size_t i = cells.starts[c]; i < cells.end(planet, c); i++) {
+                const uint32_t id = remap_id(admin_remap, planet[i].item_id & ID_MASK);
+                if (id != NO_DATA) found.push_back({planet[i].cell_id, id | (planet[i].item_id & INTERIOR_FLAG)});
+                else missing.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+        if (missing.load()) throw std::logic_error(std::string(bbox.name) + " " + name + ": a kept cell lists a dropped polygon");
+        const size_t around = static_cast<size_t>(std::count(cells.kept.begin(), cells.kept.end(), 2));
+        std::cerr << "      " << bbox.name << " " << name << ": " << kept.size() << " entries, "
+                  << around << " cells around the continent" << std::endl;
+    };
+
     {
         auto f1 = std::async(std::launch::async, [&]{ remap_sorted_masked(full.sorted_way_cells,    way_masks,    way_remap,    out.sorted_way_cells); });
         auto f2 = std::async(std::launch::async, [&]{ remap_sorted_masked(full.sorted_addr_cells,   addr_masks,   addr_remap,   out.sorted_addr_cells); });
@@ -424,10 +490,17 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
         auto f4 = std::async(std::launch::async, [&]{ remap_sorted_masked(full.sorted_poi_cells,    poi_masks,    poi_remap,    out.sorted_poi_cells); });
         auto f5 = std::async(std::launch::async, [&]{ remap_sorted_masked(full.sorted_place_cells,  place_masks,  place_remap,  out.sorted_place_cells); });
         auto f6 = std::async(std::launch::async, remap_admin_cells);
-        f1.get(); f2.get(); f3.get(); f4.get(); f5.get(); f6.get();
+        auto f7 = std::async(std::launch::async, [&]{
+            remap_index_cells(full.admin_index_cells, index_cells, out.admin_index_cells, "admin index");
+        });
+        auto f8 = std::async(std::launch::async, [&]{
+            remap_index_cells(full.admin_minimal_index_cells, minimal_index_cells, out.admin_minimal_index_cells,
+                              "admin-minimal index");
+        });
+        f1.get(); f2.get(); f3.get(); f4.get(); f5.get(); f6.get(); f7.get(); f8.get();
     }
     drop(full.sorted_way_cells, full.sorted_addr_cells, full.sorted_interp_cells, full.sorted_poi_cells,
-         full.sorted_place_cells, full.cell_to_admin);
+         full.sorted_place_cells, full.cell_to_admin, full.admin_index_cells, full.admin_minimal_index_cells);
     log_phase(("      " + std::string(bbox.name) + " filter: cell map remap (masked)").c_str(), _ft, _fc);
 
     // --- String pool compaction ---
