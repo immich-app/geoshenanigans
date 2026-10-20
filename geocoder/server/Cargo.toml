@@ -25,7 +25,7 @@ tokio-stream = "0.1"
 memmap2 = "0.9"
 rustls-acme = { version = "0.14", features = ["axum"] }
 axum-server = "0.7"
-bcrypt = "0.15"
+bcrypt = "0.19"
 getrandom = "0.2"
 arc-swap = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
