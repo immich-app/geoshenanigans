@@ -145,12 +145,12 @@ jobs:
       O11Y_URL: https://vmauth.futostatus.com
       LATEST_JSON_URL: https://geoshenanigans-reverse-geocoding.t3.tigrisfiles.io/geocoder/builds/latest.json
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Install 1Password CLI
-        uses: 1password/install-cli-action@8d006a0d0a4fd505af7f7ce589e7f768385ff5e4 # v3.0.0
+        uses: 1password/install-cli-action@1a3160d5e9de1ae0803eaa08a88746f5ae3daa50 # v4.1.0
 
       # The token is read here and handed to the report alone, as in
       # geocoder-build.yml's Report to o11y.
