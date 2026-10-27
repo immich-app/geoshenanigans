@@ -6,7 +6,7 @@
 //!                    [--bench REPEATS [--no-warmup]]
 //!   one query per stdin line; default one JSON line per query, --bench latency percentiles
 //! place-search ctxbench <set dir> <index dir> < "lat lng" lines   (reverse-lookup cost per point)
-use place_search::build::{build, BuildOpts};
+use place_search::build::{build_all, BuildOpts};
 use place_search::reader::SearchIndex;
 use place_search::query::Searcher;
 use query_server::{Index, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL};
@@ -41,10 +41,24 @@ fn flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
 
+/// The sub-indexes a --sub value selects; an error for any other value.
+fn selected_subs(sub: &str) -> Result<&'static [&'static str], String> {
+    match sub {
+        "places" => Ok(&["places"]),
+        "poi" => Ok(&["poi"]),
+        "all" => Ok(&["places", "poi"]),
+        _ => Err(format!("--sub {sub:?}: expected places, poi or all")),
+    }
+}
+
 fn cmd_build(args: &[String]) {
     let (set, out) = (&args[2], PathBuf::from(&args[3]));
-    let geo = load_geo(set);
     let sub = opt(args, "--sub").unwrap_or_else(|| "all".into());
+    let selected = selected_subs(&sub).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
+    let geo = load_geo(set);
     let opts = BuildOpts {
         threads: opt(args, "--threads").map(|v| v.parse().unwrap()).unwrap_or(1),
         mem_mb: opt(args, "--mem-mb").map(|v| v.parse().unwrap()).unwrap_or(place_search::constants::DEFAULT_RUN_BUDGET_MB),
@@ -55,40 +69,30 @@ fn cmd_build(args: &[String]) {
         area_proxy: flag(args, "--area-proxy"),
         poi_max_tier: opt(args, "--poi-max-tier").map(|v| v.parse().unwrap()).unwrap_or(3),
     };
-    let mut subs = vec![];
-    if sub == "places" || sub == "all" {
-        subs.push("places");
-    }
-    if (sub == "poi" || sub == "all") && geo.poi_records.is_some() {
-        subs.push("poi");
-    }
+    let subs: Vec<&str> = selected.iter().copied().filter(|&s| s != "poi" || geo.poi_records.is_some()).collect();
     let mut replacing = subs.clone();
     if geo.poi_records.is_none() { replacing.push("poi"); }
-    place_search::build::check_retained_names(&out, &replacing, opts.extras.is_some())
-        .unwrap_or_else(|e| panic!("{e}"));
-    let meta_path = out.join("search_meta.json");
-    let mut meta: serde_json::Value = std::fs::read_to_string(&meta_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| json!({}));
-    let n_place_nodes = geo.place_nodes.as_ref().map(|m| m.len() / 20).unwrap_or(0);
-    meta["n_place_nodes"] = json!(n_place_nodes);
-    meta["extras"] = json!(opts.extras.is_some());
-    meta["inline"] = json!(opts.inline);
-    meta["imp"] = json!(opts.imp_dir.is_some());
-    meta["area_proxy"] = json!(opts.area_proxy);
-    meta["poi_max_tier"] = json!(opts.poi_max_tier);
-    for s in subs {
-        let st = build(&geo, s, &out, &opts).unwrap_or_else(|e| panic!("build {s}: {e}"));
-        let mut o = serde_json::Map::new();
+    let meta = || {
+        place_search::build::check_retained_names(&out, &replacing, opts.extras.is_some())?;
+        let mut meta: serde_json::Value = std::fs::read_to_string(out.join("search_meta.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| json!({}));
+        let n_place_nodes = geo.place_nodes.as_ref().map(|m| m.len() / 20).unwrap_or(0);
+        meta["n_place_nodes"] = json!(n_place_nodes);
+        meta["extras"] = json!(opts.extras.is_some());
+        meta["inline"] = json!(opts.inline);
+        meta["imp"] = json!(opts.imp_dir.is_some());
+        meta["area_proxy"] = json!(opts.area_proxy);
+        meta["poi_max_tier"] = json!(opts.poi_max_tier);
+        Ok(meta)
+    };
+    let stats = build_all(&geo, &subs, &out, &opts, meta).unwrap_or_else(|e| panic!("{e}"));
+    for (s, st) in &stats {
         for (k, v) in &st.lines {
             eprintln!("{s}: {k}: {v}");
-            o.insert(k.clone(), json!(v));
         }
-        meta[s] = serde_json::Value::Object(o);
     }
-    let _ = std::fs::remove_dir(&opts.tmp);
-    std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
     eprintln!("build memory: {}", mem_json());
 }
 
@@ -280,6 +284,16 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn an_unknown_sub_index_is_refused() {
+        assert_eq!(selected_subs("all"), Ok(&["places", "poi"][..]));
+        assert_eq!(selected_subs("places"), Ok(&["places"][..]));
+        assert_eq!(selected_subs("poi"), Ok(&["poi"][..]));
+        for typo in ["place", "pois", "", "ALL"] {
+            assert!(selected_subs(typo).is_err(), "{typo:?}");
+        }
+    }
 
     #[test]
     fn empty_latency_samples_have_no_summary() {
