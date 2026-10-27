@@ -41,6 +41,7 @@
 
 #include "cell_id_diff.h"
 #include "geo_corrections.h"
+#include "identity_sidecar.h"
 #include "merge_sequence.h"
 #include "parallel.h"
 #include "patch_format.h"
@@ -397,31 +398,11 @@ static std::vector<uint32_t> derive_id_remap_from_merge(
 
 // --- Identity matching (v8) ---
 
-// A family's identity sidecar: one stable entity key (u32) per record.
-static std::vector<uint32_t> load_identity(const std::string& meta_dir, const char* family) {
+// A family's identity sidecar: one stable entity key (u32) per record, or
+// empty (see identity_keys).
+static std::vector<uint32_t> load_identity(const std::string& meta_dir, const char* family, size_t n_records) {
     if (meta_dir.empty()) return {};
-    auto bytes = read_file(meta_dir + "/" + family + ".slot.u32");
-    std::vector<uint32_t> v(bytes.size() / 4);
-    if (!v.empty()) memcpy(v.data(), bytes.data(), v.size() * 4);
-    return v;
-}
-
-// old_of_new[j]: the old record holding new record j's entity, or NO_DATA.
-// Key NO_DATA marks a record without an entity (a tombstone) and never matches.
-static std::vector<uint32_t> old_index_of_new(const std::vector<uint32_t>& old_key, const std::vector<uint32_t>& new_key) {
-    uint32_t max_key = 0;
-    for (uint32_t k : old_key) if (k != NO_DATA) max_key = std::max(max_key, k);
-    std::vector<uint32_t> by_key((size_t)max_key + 1, NO_DATA);
-    for (uint32_t i = 0; i < old_key.size(); i++) {
-        if (old_key[i] == NO_DATA) continue;
-        if (by_key[old_key[i]] != NO_DATA) throw std::runtime_error("Identity sidecar repeats a key");
-        by_key[old_key[i]] = i;
-    }
-    std::vector<uint32_t> o(new_key.size());
-    parallel_for(new_key.size(), [&](size_t b, size_t e, unsigned) {
-        for (size_t j = b; j < e; j++) o[j] = new_key[j] <= max_key ? by_key[new_key[j]] : NO_DATA;
-    });
-    return o;
+    return identity_keys(read_file(meta_dir + "/" + family + ".slot.u32"), n_records);
 }
 
 // The old record of every in-order kept entity takes its new record's offset
@@ -659,8 +640,8 @@ static int run(int argc, char* argv[]) {
     // A family's identity sidecars when both days have one per record.
     auto identity_of = [&](const char* family, size_t old_n, size_t new_n)
             -> std::pair<std::vector<uint32_t>, std::vector<uint32_t>> {
-        auto ok = load_identity(id_old_meta, family), nk = load_identity(id_new_meta, family);
-        if (ok.size() != old_n || nk.size() != new_n || old_n == 0 || new_n == 0) return {};
+        auto ok = load_identity(id_old_meta, family, old_n), nk = load_identity(id_new_meta, family, new_n);
+        if (ok.empty() || nk.empty()) return {};
         return {std::move(ok), std::move(nk)};
     };
 
