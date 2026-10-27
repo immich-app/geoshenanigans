@@ -1167,6 +1167,12 @@ impl Index {
     /// Decode a polygon's quantized vertex slice from `admin_vertices`.
     /// Reads the inline 10-byte polygon header (encoding + bbox_min)
     /// at `poly.vertex_offset`, then decodes the following vertices.
+    /// Point-in-polygon on an admin ring without decoding it into memory (false where
+    /// `admin_verts` is None).
+    pub fn admin_pip(&self, poly: &AdminPolygon, lat: f64, lng: f64) -> bool {
+        point_in_encoded_polygon(&self.admin_vertices, poly.vertex_offset, poly.vertex_count, lat as f32, lng as f32).unwrap_or(false)
+    }
+
     pub fn admin_verts(&self, poly: &AdminPolygon) -> Option<std::borrow::Cow<'_, [NodeCoord]>> {
         decode_polygon_verts(&self.admin_vertices, poly.vertex_offset, poly.vertex_count)
     }
@@ -1203,7 +1209,8 @@ impl Index {
         let total = m.len() / std::mem::size_of::<PlaceNode>() as u64;
         if (idx as u64) >= total { return None; }
         let pn = m.read_at::<PlaceNode>(idx as u64);
-        if pn.name_id == NO_DATA { return None; }
+        // _pad1 bit 1: a node a boundary claims (hidden, keeps its name for search)
+        if pn.name_id == NO_DATA || pn._pad1 & 0x02 != 0 { return None; }
         Some(pn)
     }
 
@@ -1718,8 +1725,9 @@ impl Index {
     }
 
     pub fn find_admin(&self, lat: f64, lng: f64) -> AdminResult<'_> {
+        // A polygon containing the point always lists the point's own cell in its covering, so
+        // only that cell's polygons can contain it (the neighbours used to be scanned too).
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
-        let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
         let mut containment = Containment::at(lat, lng);
 
         // For each admin level, find the smallest-area polygon actually containing
@@ -1734,7 +1742,7 @@ impl Index {
         // pointer-equality dedup doesn't survive owned copies).
         let mut place_area_polygons: Vec<(u32, AdminPolygon)> = Vec::new();
 
-        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+        for c in std::iter::once(cell) {
             Self::for_each_entry_fb(&self.admin_entries, Self::lookup_admin_cell_fb(&self.admin_cells, c), |id| {
                 // The interior flag on a (cell, polygon) entry proves
                 // containment only for queries INSIDE that cell. Neighbor
@@ -1802,8 +1810,7 @@ impl Index {
         // second-nested-check rule (placex_triggers.sql lines 944-963) —
         // Nominatim uses only these, not admin boundaries with linked_place
         // tags. Kept in a separate vec so we don't disturb best_by_level[].
-        let neighbors2 = cell_neighbors_at_level(cell, self.admin_cell_level);
-        for c in std::iter::once(cell).chain(neighbors2.into_iter()) {
+        for c in std::iter::once(cell) {
             Self::for_each_entry_fb(&self.admin_entries, Self::lookup_admin_cell_fb(&self.admin_cells, c), |id| {
                 let poly_id = id & ID_MASK;
                 let Some(poly) = self.admin_polygon(poly_id) else { return; };
@@ -2499,8 +2506,7 @@ impl Index {
                 let Some(poly) = self.admin_polygon(poly_id) else { return; };
                 if poly.admin_level != 15 { return; }
                 if poly.area <= 0.0 { return; }
-                let Some(verts) = self.admin_verts(&poly) else { return; };
-                if !point_in_polygon(lat as f32, lng as f32, &verts) { return; }
+                if !self.admin_pip(&poly, lat, lng) { return; }
                 place_area_polygons.push(poly);
             });
         }
@@ -3748,6 +3754,24 @@ mod query_tests {
     }
 
     #[test]
+    fn a_hidden_place_node_answers_like_a_nameless_one() {
+        // A node a boundary claims keeps its name for search and is flagged
+        // hidden (PlaceNode._pad1 bit 1) where the builder used to clear it.
+        let with = |offset: usize, bytes: &[u8]| {
+            let mut idx = index(&[], &[MCMURDO, SCOTT_BASE]);
+            let Some(FileBytes::Owned(records)) = idx.place_nodes.as_mut() else { unreachable!() };
+            records[offset..offset + bytes.len()].copy_from_slice(bytes);
+            idx
+        };
+        let (hidden, nameless) = (with(13, &[0x02]), with(8, &NO_DATA.to_le_bytes()));
+
+        let got = answer(&hidden, -77.8494, 166.768);
+
+        assert_eq!(got["address"], serde_json::json!({"hamlet": "Scott Base"}));
+        assert_eq!(got, answer(&nameless, -77.8494, 166.768));
+    }
+
+    #[test]
     fn a_boundary_without_a_country_city_or_state_has_no_answer() {
         let idx = index(&[SHOALS], &[SHOALS_VILLAGE]);
 
@@ -4092,6 +4116,56 @@ pub fn point_in_polygon(lat: f32, lng: f32, vertices: &[NodeCoord]) -> bool {
         j = i;
     }
 
+    inside
+}
+
+/// `point_in_polygon` over a polygon's encoded vertices (the layout `decode_polygon_verts`
+/// reads), decoding one vertex at a time to the same f32 values: no allocation, one pass. None
+/// exactly where `decode_polygon_verts` is None.
+pub fn point_in_encoded_polygon(src: &FileBytes, vertex_offset: u32, vertex_count: u32, lat: f32, lng: f32) -> Option<bool> {
+    if vertex_count == 0 || vertex_offset == NO_DATA { return None; }
+    let off = vertex_offset as u64;
+    if off + POLY_HEADER_BYTES > src.len() { return None; }
+    let header = src.read_chunk(off, POLY_HEADER_BYTES as usize);
+    let encoding = header[0];
+    let bmin_lat = f32::from_le_bytes(header[2..6].try_into().unwrap()) as f64;
+    let bmin_lng = f32::from_le_bytes(header[6..10].try_into().unwrap()) as f64;
+    drop(header);
+    let stride = vertex_stride(encoding);
+    let n = vertex_count as usize;
+    let verts_off = off + POLY_HEADER_BYTES;
+    if verts_off + (n * stride) as u64 > src.len() { return None; }
+    let bytes = src.read_chunk(verts_off, n * stride);
+    let scale = vertex_scale(encoding);
+    let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[i], b[i + 1]]) as f64;
+    let u32_at = |b: &[u8], i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+    Some(match encoding {
+        4 => pip_vertices(&bytes, 8, lat, lng, |b| (f32::from_bits(u32_at(b, 0)), f32::from_bits(u32_at(b, 4)))),
+        3 => pip_vertices(&bytes, 8, lat, lng, |b| {
+            ((bmin_lat + u32_at(b, 0) as f64 * scale) as f32, (bmin_lng + u32_at(b, 4) as f64 * scale) as f32)
+        }),
+        _ => pip_vertices(&bytes, 4, lat, lng, |b| {
+            ((bmin_lat + u16_at(b, 0) * scale) as f32, (bmin_lng + u16_at(b, 2) * scale) as f32)
+        }),
+    })
+}
+
+/// The `point_in_polygon` ray cast over packed vertices of one encoding (`at` decodes one).
+#[inline]
+fn pip_vertices(bytes: &[u8], stride: usize, lat: f32, lng: f32, at: impl Fn(&[u8]) -> (f32, f32)) -> bool {
+    let n = bytes.len() / stride;
+    let mut inside = false;
+    let (mut vj_lat, mut vj_lng) = at(&bytes[(n - 1) * stride..]);
+    for c in bytes.chunks_exact(stride) {
+        let (vi_lat, vi_lng) = at(c);
+        if ((vi_lng > lng) != (vj_lng > lng))
+            && (lat < (vj_lat - vi_lat) * (lng - vi_lng) / (vj_lng - vi_lng) + vi_lat)
+        {
+            inside = !inside;
+        }
+        vj_lat = vi_lat;
+        vj_lng = vi_lng;
+    }
     inside
 }
 
@@ -4669,7 +4743,7 @@ pub struct AdminResult<'a> {
     pub containment: Containment,
 }
 
-/// Which admin polygons hold one point, each decoded and ray-cast once:
+/// Which admin polygons hold one point, each ray-cast once:
 /// find_admin and find_current_boundaries test the same polygons near the
 /// same point.
 #[derive(Default)]
@@ -4694,7 +4768,7 @@ impl Containment {
         };
 
         let (lat, lng) = self.point;
-        let holds = index.admin_verts(poly).is_some_and(|verts| point_in_polygon(lat as f32, lng as f32, &verts));
+        let holds = index.admin_pip(poly, lat, lng);
         self.tested.insert(slot, (id, holds));
         holds
     }
@@ -6202,6 +6276,79 @@ mod pure_helper_tests {
         assert!(decode_polygon_verts(&src, 1000, 1).is_none());
         // Declared more vertices than the buffer holds -> None.
         assert!(decode_polygon_verts(&src, 0, 5).is_none());
+    }
+
+    // A polygon buffer of `verts` in encoding `enc`, the bbox minimum as the delta base.
+    fn encode_poly(enc: u8, verts: &[NodeCoord]) -> Vec<u8> {
+        let bmin_lat = verts.iter().map(|v| v.lat).fold(f32::MAX, f32::min);
+        let bmin_lng = verts.iter().map(|v| v.lng).fold(f32::MAX, f32::min);
+        let delta = |x: f32, min: f32| ((x - min) as f64 / vertex_scale(enc)).round() as u64;
+        let mut packed = Vec::new();
+        for v in verts {
+            match enc {
+                4 => [v.lat.to_le_bytes(), v.lng.to_le_bytes()].iter().for_each(|b| packed.extend_from_slice(b)),
+                3 => [delta(v.lat, bmin_lat), delta(v.lng, bmin_lng)]
+                    .iter()
+                    .for_each(|&d| packed.extend_from_slice(&u32::try_from(d).unwrap().to_le_bytes())),
+                _ => [delta(v.lat, bmin_lat), delta(v.lng, bmin_lng)]
+                    .iter()
+                    .for_each(|&d| packed.extend_from_slice(&u16::try_from(d).unwrap().to_le_bytes())),
+            }
+        }
+        build_poly_buf(enc, bmin_lat, bmin_lng, &packed)
+    }
+
+    #[test]
+    fn point_in_encoded_polygon_matches_the_decoded_ray_cast() {
+        // The keyhole square with two holes, scaled into each encoding's delta range.
+        let (outer, holes) = square_with_two_holes();
+        let unit = keyhole(&outer, &holes);
+        // Inside, in each hole, outside on three sides, on the keyhole connectors.
+        let probes = [
+            ((1.0, 1.0), true), ((5.0, 9.0), true), ((3.0, 3.0), false), ((6.5, 6.0), false), ((11.0, 5.0), false),
+            ((5.0, -1.0), false), ((-1.0, 5.0), false), ((0.5, 2.0), true), ((5.0, 2.0), true), ((1.0, 5.0), true),
+        ];
+        for (enc, extent) in [(0u8, 0.5f32), (1, 5.0), (2, 0.05), (3, 10.0), (4, 10.0)] {
+            let k = extent / 10.0;
+            let at = |lat: f32, lng: f32| nc(40.0 + lat * k, -3.0 + lng * k);
+            let verts: Vec<NodeCoord> = unit.iter().map(|p| at(p.lat, p.lng)).collect();
+            // At an odd byte offset, behind another record's bytes.
+            let mut buf = vec![0xAB; 7];
+            let off = buf.len() as u32;
+            buf.extend(encode_poly(enc, &verts));
+            let src = FileBytes::Owned(buf);
+            let n = verts.len() as u32;
+            let decoded = decode_polygon_verts(&src, off, n).unwrap();
+            let mut points: Vec<(NodeCoord, Option<bool>)> =
+                probes.iter().map(|&((lat, lng), inside)| (at(lat, lng), Some(inside))).collect();
+            // On the boundary: every decoded vertex and edge midpoint.
+            for (i, v) in decoded.iter().enumerate() {
+                let w = decoded[(i + 1) % decoded.len()];
+                points.extend([(*v, None), (nc((v.lat + w.lat) / 2.0, (v.lng + w.lng) / 2.0), None)]);
+            }
+
+            for (p, inside) in points {
+                let got = point_in_encoded_polygon(&src, off, n, p.lat, p.lng);
+
+                assert_eq!(got, Some(point_in_polygon(p.lat, p.lng, &decoded)), "enc {enc} at ({}, {})", p.lat, p.lng);
+                if let Some(inside) = inside {
+                    assert_eq!(got, Some(inside), "enc {enc} at ({}, {})", p.lat, p.lng);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn point_in_encoded_polygon_is_none_where_the_decoder_is() {
+        let square = unit_square();
+        let src = FileBytes::Owned(encode_poly(1, &square));
+        let len = src.len() as u32;
+        assert_eq!(point_in_encoded_polygon(&src, 0, 4, 0.5, 0.5), Some(true));
+        // No vertices, no record, a header past the end, more vertices than the buffer holds.
+        for (off, n) in [(0, 0), (NO_DATA, 1), (len - 5, 1), (0, 5)] {
+            assert_eq!(point_in_encoded_polygon(&src, off, n, 0.5, 0.5), None, "offset {off} count {n}");
+            assert!(decode_polygon_verts(&src, off, n).is_none(), "offset {off} count {n}");
+        }
     }
 }
 
