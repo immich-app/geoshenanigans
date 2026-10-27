@@ -542,7 +542,10 @@ static int run(int argc, char* argv[]) {
             uint32_t value_stride = ru32();
             uint32_t remap_kind = ru32();
             uint32_t n_changes = ru32();
-            if (value_stride != 4 && value_stride != 16) throw std::runtime_error("Malformed sparse delta");
+            // Whole records only: a change writes its record whole, so one in
+            // a part record would write past the file.
+            if ((value_stride != 4 && value_stride != 16) || new_size % value_stride)
+                throw std::runtime_error("Malformed sparse delta");
             const size_t change_size = 4 + value_stride;
             const char* changes = take((size_t)n_changes * change_size, "sparse changes");
 
@@ -594,6 +597,7 @@ static int run(int argc, char* argv[]) {
                 fwrite(buf.data(), 1, n, out);
             }
             close_patch_output(out, fname);
+            if (ci != n_changes) throw std::runtime_error(std::string("Malformed sparse delta: changes past the end of ") + fname);
 
             std::cerr << "  " << fname << ": sparse delta " << n_changes
                       << " changes (" << new_size << " bytes)" << section_io() << std::endl;
