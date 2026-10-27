@@ -8,7 +8,7 @@ use crate::model::*;
 use crate::normalize::{is_ideographic, join, normalize, tokens, Token};
 use crate::entities::{cc_of, polygon_raw, Entities};
 use crate::reader::{SearchIndex, SubIndex};
-use query_server::{cell_id_at_level, AdminPolygon, Index, ID_MASK, INTERIOR_FLAG, NO_DATA};
+use query_server::{cell_id_at_level, AdminPoint, AdminPolygon, Index, ID_MASK, INTERIOR_FLAG, NO_DATA};
 use fst::{Automaton, IntoStreamer, Streamer};
 use levenshtein_automata::{Distance, LevenshteinAutomatonBuilder, DFA, SINK_STATE};
 use std::collections::{BTreeSet, HashMap};
@@ -330,10 +330,6 @@ impl<'a, 'g> Searcher<'a, 'g> {
         c
     }
 
-    fn inside(&self, ap: &AdminPolygon, lat: f32, lng: f32) -> bool {
-        self.idx.geo.admin_pip(ap, lat as f64, lng as f64)
-    }
-
     /// Boundaries covering a point's admin cell: (polygon, record, interior flag).
     fn cell_polygons(&self, lat: f32, lng: f32) -> Vec<(u32, AdminPolygon, bool)> {
         let geo: &Index = self.idx.geo;
@@ -353,6 +349,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
     fn context_mask(&self, ctx: &Context, names: &mut HashMap<(u32, u16, bool), u64>, e: u32) -> u64 {
         let geo: &Index = self.idx.geo;
         let (lat, lng) = self.idx.ents.point(e);
+        let point = AdminPoint::new(lat as f64, lng as f64);
         let mut m = 0u64;
         for (_, ap, interior) in self.cell_polygons(lat, lng) {
             let nm = *names.entry(context_mask_key(ap.name_id, ap.country_code, ap.admin_level)).or_insert_with(|| {
@@ -374,7 +371,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
             if nm == 0 || m & nm == nm {
                 continue;
             }
-            if interior || self.inside(&ap, lat, lng) {
+            if interior || geo.admin_geometry.contains_once(&ap, point) {
                 m |= nm;
             }
         }
@@ -385,11 +382,12 @@ impl<'a, 'g> Searcher<'a, 'g> {
     /// rings: same name, level and country).
     fn contained_in(&self, e: u32, area: &AdminPolygon) -> bool {
         let (lat, lng) = self.idx.ents.point(e);
+        let point = AdminPoint::new(lat as f64, lng as f64);
         for (_, ap, interior) in self.cell_polygons(lat, lng) {
             if ap.name_id != area.name_id || ap.admin_level != area.admin_level || ap.country_code != area.country_code {
                 continue;
             }
-            if interior || self.inside(&ap, lat, lng) {
+            if interior || self.idx.geo.admin_geometry.contains_once(&ap, point) {
                 return true;
             }
         }

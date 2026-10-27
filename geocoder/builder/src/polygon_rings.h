@@ -38,6 +38,7 @@
 #include <utility>
 #include <vector>
 
+#include "packed_location.h"
 #include "types.h"
 
 using LatLng = std::pair<double, double>;
@@ -46,6 +47,8 @@ inline double ring_lat(const LatLng& p) { return p.first; }
 inline double ring_lng(const LatLng& p) { return p.second; }
 inline double ring_lat(const NodeCoord& p) { return p.lat; }
 inline double ring_lng(const NodeCoord& p) { return p.lng; }
+inline double ring_lat(const PackedLocation& p) { return p.lat(); }
+inline double ring_lng(const PackedLocation& p) { return p.lon(); }
 
 template <class P>
 inline bool same_vertex(const P& a, const P& b) {
@@ -128,10 +131,11 @@ uint32_t outer_ring_count(const P* v, uint32_t n, uint16_t holes) {
 }
 
 // Twice the signed shoelace area of a closed ring, in degrees squared.
-inline double signed_area2(const std::vector<LatLng>& ring) {
+template <class P>
+double signed_area2(const std::vector<P>& ring) {
     double a = 0;
     for (size_t i = 0, j = ring.size() - 1; i < ring.size(); j = i++)
-        a += ring[j].first * ring[i].second - ring[i].first * ring[j].second;
+        a += ring_lat(ring[j]) * ring_lng(ring[i]) - ring_lat(ring[i]) * ring_lng(ring[j]);
     return a;
 }
 
@@ -213,7 +217,8 @@ LatLng polygon_interior_point(const P* v, uint32_t n, uint16_t holes) {
 // interior point and larger than it is around it. This is the nesting osmium's
 // assembler finds (its find_enclosing_ring counts the rings below a ring's
 // lowest point) without looking at member roles.
-inline std::vector<int> enclosing_rings(const std::vector<std::vector<LatLng>>& rings) {
+template <class P>
+std::vector<int> enclosing_rings(const std::vector<std::vector<P>>& rings) {
     struct Box { double lat_lo, lat_hi, lng_lo, lng_hi; };
     const size_t n = rings.size();
     std::vector<Box> boxes(n);
@@ -222,8 +227,10 @@ inline std::vector<int> enclosing_rings(const std::vector<std::vector<LatLng>>& 
     std::vector<RingSpan> whole(1);
     for (size_t i = 0; i < n; i++) {
         Box b{INFINITY, -INFINITY, INFINITY, -INFINITY};
-        for (const auto& [lat, lng] : rings[i])
+        for (const P& p : rings[i]) {
+            const double lat = ring_lat(p), lng = ring_lng(p);
             b = {std::min(b.lat_lo, lat), std::max(b.lat_hi, lat), std::min(b.lng_lo, lng), std::max(b.lng_hi, lng)};
+        }
         boxes[i] = b;
         areas[i] = std::fabs(signed_area2(rings[i]));
         whole[0] = {0, static_cast<uint32_t>(rings[i].size())};
@@ -264,13 +271,13 @@ inline std::vector<int> enclosing_rings(const std::vector<std::vector<LatLng>>& 
                                     [&](uint32_t i, double x) { return inner_point[i].second < x; }) - candidates.begin();
         };
         for (size_t k = 1; k < ring.size(); k++) {
-            const LatLng& va = ring[k];
-            const LatLng& vb = ring[k - 1];
-            const auto [x0, x1] = std::minmax(va.second, vb.second);
+            const double a_lat = ring_lat(ring[k]), a_lng = ring_lng(ring[k]);
+            const double b_lat = ring_lat(ring[k - 1]), b_lng = ring_lng(ring[k - 1]);
+            const auto [x0, x1] = std::minmax(a_lng, b_lng);
             if (x0 == x1) continue;
             for (auto c = lng_lower(x0), end = lng_lower(x1); c < end; c++) {
                 const auto [lat, lng] = inner_point[candidates[c]];
-                if (lat < (vb.first - va.first) * (lng - va.second) / (vb.second - va.second) + va.first) odd[c] ^= 1;
+                if (lat < (b_lat - a_lat) * (lng - a_lng) / (b_lng - a_lng) + a_lat) odd[c] ^= 1;
             }
         }
         for (size_t c = 0; c < candidates.size(); c++)
@@ -288,17 +295,19 @@ inline std::vector<int> ring_depths(const std::vector<int>& around) {
 }
 
 // One outer ring of a relation with the holes in it.
+template <class P>
 struct NestedPolygon {
-    std::vector<LatLng> outer;
-    std::vector<std::vector<LatLng>> holes;
+    std::vector<P> outer;
+    std::vector<std::vector<P>> holes;
 };
 
 // The rings as polygons, nested as osmium nests them: each ring at even depth
 // is an outer ring (an island in a lake in an island is one again), in ring
 // order, and each ring at odd depth a hole in the ring around it.
-inline std::vector<NestedPolygon> nest_rings(std::vector<std::vector<LatLng>> rings, const std::vector<int>& around,
-                                             const std::vector<int>& depth) {
-    std::vector<NestedPolygon> polygons;
+template <class P>
+std::vector<NestedPolygon<P>> nest_rings(std::vector<std::vector<P>> rings, const std::vector<int>& around,
+                                         const std::vector<int>& depth) {
+    std::vector<NestedPolygon<P>> polygons;
     std::vector<int> polygon_of(rings.size(), -1);
     for (size_t i = 0; i < rings.size(); i++) {
         if (depth[i] % 2) continue;

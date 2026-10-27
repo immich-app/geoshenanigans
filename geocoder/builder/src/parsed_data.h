@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+#include "packed_location.h"
 #include "types.h"
 #include "string_pool.h"
 #include "id_allocator.h"
@@ -236,15 +237,15 @@ inline uint8_t string_home_tier(uint8_t mask) {
 
 // Coordinates of one way within a shared buffer.
 struct CoordSpan {
-    const std::pair<double,double>* first = nullptr;
+    const PackedLocation* first = nullptr;
     size_t count = 0;
 
-    const std::pair<double,double>* begin() const { return first; }
-    const std::pair<double,double>* end() const { return first + count; }
+    const PackedLocation* begin() const { return first; }
+    const PackedLocation* end() const { return first + count; }
     size_t size() const { return count; }
-    const std::pair<double,double>& front() const { return first[0]; }
-    const std::pair<double,double>& back() const { return first[count - 1]; }
-    const std::pair<double,double>& operator[](size_t i) const { return first[i]; }
+    const PackedLocation& front() const { return first[0]; }
+    const PackedLocation& back() const { return first[count - 1]; }
+    const PackedLocation& operator[](size_t i) const { return first[i]; }
 };
 
 // The admin and POI relation member ways ring assembly reads, by way id,
@@ -256,7 +257,7 @@ struct WayGeometries {
         int64_t first_node_id;
         int64_t last_node_id;
     };
-    std::vector<std::pair<double,double>> coords;
+    std::vector<PackedLocation> coords;
     std::unordered_map<int64_t, Way> ways;
 
     const Way* find(int64_t way_id) const {

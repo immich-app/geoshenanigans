@@ -12,7 +12,7 @@ use crate::extras::{record_ref, Extras, KIND_PLACE_NODE, KIND_POI};
 use crate::model::*;
 use crate::normalize::{join, tokens, transliterate};
 use memmap2::Mmap;
-use query_server::{point_on_surface, AdminPolygon, Index, PlaceNode, PoiRecord, NO_DATA};
+use query_server::{AdminPolygon, Index, PlaceNode, PoiRecord, NO_DATA};
 use serde_json::json;
 use std::collections::{BinaryHeap, HashSet};
 use std::fs::File;
@@ -171,7 +171,7 @@ impl<'a> PlacesSource<'a> {
             } else if (BOUNDARY_MIN_LEVEL..=BOUNDARY_MAX_LEVEL).contains(&ap.admin_level) && ap.area > 0.0 {
                 // The builder's interior_point (ST_PointOnSurface, Nominatim's centre of an area):
                 // an area centroid can fall outside a concave ring or in a hole.
-                let Some((lat, lng)) = geo.admin_verts(&ap).and_then(|v| point_on_surface(&v, ap.hole_count)) else { continue };
+                let Some((lat, lng)) = geo.admin_geometry.point_on_surface(&ap) else { continue };
                 BoundarySlot { poly: p, node: NO_DATA, lat, lng }
             } else {
                 continue;
@@ -1857,6 +1857,7 @@ mod tests {
         use crate::fixture::{build_search, Geo, TempDir};
         use crate::query::Searcher;
         use crate::reader::SearchIndex;
+        use query_server::AdminPoint;
         let at = |lat: f32, lng: f32| (10.0 + lat / 10.0, 20.0 + lng / 10.0);
         let rect = |s: f32, w: f32, n: f32, e: f32| [at(s, w).0, at(s, w).1, at(n, e).0, at(n, e).1];
         let mut g = Geo::default();
@@ -1882,7 +1883,8 @@ mod tests {
             // No place nodes: the boundary is entity 0 + its polygon.
             let f = &found[0];
             assert_eq!(f.hit.entity, poly, "{q}");
-            assert!(geo.admin_pip(&polygon_raw(&geo, poly), f.lat as f64, f.lng as f64), "{q} at {} {}", f.lat, f.lng);
+            let label = AdminPoint::new(f.lat as f64, f.lng as f64);
+            assert!(geo.admin_geometry.contains_once(&polygon_raw(&geo, poly), label), "{q} at {} {}", f.lat, f.lng);
             assert_eq!(f.ctx.county, q);
         }
     }

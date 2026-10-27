@@ -3527,7 +3527,7 @@ static int run(int argc, char* argv[]) {
                     uint64_t building_addr_count = 0;
                     uint64_t interp_count = 0;
                     // Way geometries for parallel admin assembly. Locations
-                    // stay packed (8 B, not 16) until the merge decodes them.
+                    // stay packed (8 B, not 16) through ring assembly.
                     struct WayGeomEntry {
                         int64_t way_id;
                         std::vector<PackedLocation> locs;
@@ -3537,7 +3537,7 @@ static int run(int argc, char* argv[]) {
                     std::vector<WayGeomEntry> way_geoms;
                     // Closed-way admin polygons (ways with boundary=administrative)
                     struct ClosedWayAdmin {
-                        std::vector<std::pair<double,double>> vertices;
+                        std::vector<PackedLocation> vertices;
                         std::string name;
                         uint8_t admin_level;
                         std::string country_code;
@@ -3786,8 +3786,7 @@ static int run(int argc, char* argv[]) {
                                 if (aname) {
                                     std::string name_str = aname;
                                     if (!name_str.empty() && all_valid && resolved_locs.size() >= 3) {
-                                        std::vector<std::pair<double,double>> verts;
-                                        for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});
+                                        std::vector<PackedLocation> verts(resolved_locs.begin(), resolved_locs.end());
                                         std::string cc; if (al == 2) { const char* iso = t.iso; if (iso) cc = iso; }
                                         uint8_t fallback = static_cast<uint8_t>(classify_place_override(t.linked_place, t.place));
                                         std::string wd_str = t.wikidata ? t.wikidata : "";
@@ -3802,8 +3801,7 @@ static int run(int argc, char* argv[]) {
                             if (aname && t.place) {
                                 AdminPlaceType pt = classify_place_override(nullptr, t.place);
                                 if (is_address_place_type(pt) && all_valid && resolved_locs.size() >= 3) {
-                                    std::vector<std::pair<double,double>> verts;
-                                    for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});
+                                    std::vector<PackedLocation> verts(resolved_locs.begin(), resolved_locs.end());
                                     std::string wd_str = t.wikidata ? t.wikidata : "";
                                     local.closed_way_admins.push_back({std::move(verts), std::string(aname), uint8_t(15), std::string(), static_cast<uint8_t>(pt), std::move(wd_str), way_id});
                                 }
@@ -3835,8 +3833,7 @@ static int run(int argc, char* argv[]) {
                                   || pt == AdminPlaceType::SUBURB
                                   || pt == AdminPlaceType::BOROUGH);
                         if (want && all_valid && resolved_locs.size() >= 3) {
-                            std::vector<std::pair<double,double>> verts;
-                            for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});
+                            std::vector<PackedLocation> verts(resolved_locs.begin(), resolved_locs.end());
                             std::string wd_str = t.wikidata ? t.wikidata : "";
                             local.closed_way_admins.push_back({
                                 std::move(verts),
@@ -4080,7 +4077,7 @@ static int run(int argc, char* argv[]) {
                     size_t at = coord_base + geom_at[k];
                     for (const auto* list : {&tld[k].way_geoms, &tld[k].poi_way_geoms})
                         for (const auto& wg : *list)
-                            for (const auto& loc : wg.locs) geoms.coords[at++] = {loc.lat(), loc.lon()};
+                            at = std::copy(wg.locs.begin(), wg.locs.end(), geoms.coords.begin() + at) - geoms.coords.begin();
                 });
                 size_t n_geoms = geoms.ways.size();
                 for (const auto& local : tld) n_geoms += local.way_geoms.size() + local.poi_way_geoms.size();
@@ -4165,9 +4162,9 @@ static int run(int argc, char* argv[]) {
 
                     // Thread-local admin results (to avoid locking add_admin_polygon)
                     struct AdminResult {
-                        std::vector<std::pair<double,double>> vertices;
+                        std::vector<PackedLocation> vertices;
                         // The relation's inner rings inside this outer ring.
-                        std::vector<std::vector<std::pair<double,double>>> holes;
+                        std::vector<std::vector<PackedLocation>> holes;
                         std::string name;
                         uint8_t admin_level;
                         std::string country_code;
@@ -4277,7 +4274,7 @@ static int run(int argc, char* argv[]) {
                                                   std::to_string(assembled.crossing_coordinates) + " nodes, " +
                                                   (assembled.failure == AreaFailure::None ? "re-paired" : "no area") + "\n");
                                 }
-                                std::vector<NestedPolygon> polygons =
+                                std::vector<NestedPolygon<PackedLocation>> polygons =
                                     nest_rings(std::move(assembled.rings), around, depth);
 
                                 // Diagnostic: log relations with 0 rings produced
@@ -4449,11 +4446,15 @@ static int run(int argc, char* argv[]) {
                                     auto& pp = prepared[i];
 
                                     // Normalize ring rotation
-                                    auto& vertices = ar.vertices;
-                                    canonicalize_ring_rotation(vertices);
-                                    for (auto& hole : ar.holes) canonicalize_ring_rotation(hole);
+                                    canonicalize_ring_rotation(ar.vertices);
+                                    std::vector<std::vector<LatLng>> holes;
+                                    holes.reserve(ar.holes.size());
+                                    for (auto& hole : ar.holes) {
+                                        canonicalize_ring_rotation(hole);
+                                        holes.push_back(unpack_ring(hole));
+                                    }
 
-                                    SimplifiedRings s = simplify_rings(vertices, ar.holes,
+                                    SimplifiedRings s = simplify_rings(unpack_ring(ar.vertices), holes,
                                         [&](const std::vector<std::pair<double,double>>& ring, double scale) {
                                             return simplify_admin_polygon(ring, ar.admin_level, scale);
                                         });
@@ -4614,13 +4615,13 @@ static int run(int argc, char* argv[]) {
                                             canonicalize_ring_rotation(ring);
 
                                             // Simplify with ~50m epsilon
-                                            double lat0 = ring.empty() ? 0.0 : ring[0].first;
+                                            double lat0 = ring.empty() ? 0.0 : ring[0].lat();
                                             double eps_deg = meters_to_degrees(50.0, lat0);
-                                            ring = simplify_polygon_epsilon(ring, eps_deg);
+                                            std::vector<LatLng> simplified = simplify_polygon_epsilon(unpack_ring(ring), eps_deg);
 
-                                            if (ring.size() >= 3) {
+                                            if (simplified.size() >= 3) {
                                                 PoiResult pr;
-                                                pr.vertices = std::move(ring);
+                                                pr.vertices = std::move(simplified);
                                                 pr.name = rel.name;
                                                 pr.category = rel.category;
                                                 pr.tier = rel.tier;

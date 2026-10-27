@@ -11,6 +11,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include "packed_location.h"
+
 // Coordinate key matching osmium's Location (int32_t nanodegrees).
 // Two points at the same geographic location always produce the same key,
 // regardless of their OSM node IDs (handles split/replaced nodes).
@@ -19,6 +21,20 @@ inline int64_t coord_key(double lat, double lng) {
     int32_t ilng = static_cast<int32_t>(lng * 1e7 + (lng >= 0 ? 0.5 : -0.5));
     // Shift the unsigned bit pattern: a negative int64 left shift is UB.
     return static_cast<int64_t>((uint64_t(static_cast<uint32_t>(ilat)) << 32) | static_cast<uint32_t>(ilng));
+}
+
+// coord_key(p.lat(), p.lon()): rounding lat_e7 / 1e7 * 1e7 gives lat_e7 back.
+inline int64_t coord_key(PackedLocation p) {
+    return static_cast<int64_t>((uint64_t(static_cast<uint32_t>(p.lat_e7)) << 32) | static_cast<uint32_t>(p.lon_e7));
+}
+
+// A packed ring's vertices as (lat, lng) doubles, for the passes that
+// compute in degrees (simplification, area, covering).
+inline std::vector<std::pair<double,double>> unpack_ring(const std::vector<PackedLocation>& ring) {
+    std::vector<std::pair<double,double>> out;
+    out.reserve(ring.size());
+    for (const PackedLocation& p : ring) out.emplace_back(p.lat(), p.lon());
+    return out;
 }
 
 // Approximate polygon area in square degrees (shoelace formula)
@@ -52,20 +68,20 @@ inline bool segments_intersect(double ax1, double ay1, double ax2, double ay2,
 
 // Sweep-line inspired self-intersection check for rings.
 // Brute force for small rings (<=32 segments), sweep-line pruning for large ones.
-inline bool ring_has_self_intersection(const std::vector<std::pair<double,double>>& ring) {
+inline bool ring_has_self_intersection(const std::vector<PackedLocation>& ring) {
     static constexpr size_t BRUTE_FORCE_THRESHOLD = 32;
     size_t n = ring.size();
     if (n < 4) return false;
+    auto segments_cross = [&](size_t i, size_t j) {
+        return segments_intersect(ring[i].lat(), ring[i].lon(), ring[i+1].lat(), ring[i+1].lon(),
+                                  ring[j].lat(), ring[j].lon(), ring[j+1].lat(), ring[j+1].lon());
+    };
 
     if (n <= BRUTE_FORCE_THRESHOLD) {
         for (size_t i = 0; i + 1 < n; i++) {
             for (size_t j = i + 2; j + 1 < n; j++) {
                 if (j == i + 1 || (i == 0 && j == n - 2)) continue;
-                if (segments_intersect(ring[i].first, ring[i].second,
-                                       ring[i+1].first, ring[i+1].second,
-                                       ring[j].first, ring[j].second,
-                                       ring[j+1].first, ring[j+1].second))
-                    return true;
+                if (segments_cross(i, j)) return true;
             }
         }
         return false;
@@ -75,7 +91,7 @@ inline bool ring_has_self_intersection(const std::vector<std::pair<double,double
     struct Seg { double min_x, max_x; size_t idx; };
     std::vector<Seg> segs(n - 1);
     for (size_t i = 0; i + 1 < n; i++) {
-        double x1 = ring[i].second, x2 = ring[i+1].second; // use lng as x
+        double x1 = ring[i].lon(), x2 = ring[i+1].lon(); // use lng as x
         segs[i] = {std::min(x1,x2), std::max(x1,x2), i};
     }
     std::sort(segs.begin(), segs.end(), [](const Seg& a, const Seg& b) {
@@ -88,27 +104,21 @@ inline bool ring_has_self_intersection(const std::vector<std::pair<double,double
             size_t i = segs[a].idx, j = segs[b].idx;
             if (j == i + 1 || i == j + 1) continue;
             if ((i == 0 && j == n - 2) || (j == 0 && i == n - 2)) continue;
-            if (segments_intersect(ring[i].first, ring[i].second,
-                                   ring[i+1].first, ring[i+1].second,
-                                   ring[j].first, ring[j].second,
-                                   ring[j+1].first, ring[j+1].second))
-                return true;
+            if (segments_cross(i, j)) return true;
         }
     }
     return false;
 }
 
 // A point in 1e-7 degrees, as osmium's Location: x the longitude, y the
-// latitude, each rounded as coord_key rounds it.
+// latitude.
 struct E7Point {
     int64_t x = 0, y = 0;
     bool operator==(const E7Point& o) const { return x == o.x && y == o.y; }
     bool operator<(const E7Point& o) const { return x != o.x ? x < o.x : y < o.y; }
 };
 
-inline int64_t e7(double v) { return static_cast<int32_t>(v * 1e7 + (v >= 0 ? 0.5 : -0.5)); }
-
-inline E7Point e7_point(const std::pair<double,double>& latlng) { return {e7(latlng.second), e7(latlng.first)}; }
+inline E7Point e7_point(PackedLocation p) { return {p.lon_e7, p.lat_e7}; }
 
 // Whether segments p0-p1 and q0-q1 intersect as osmium's area assembler has
 // it (calculate_intersection, area/detail/node_ref_segment.hpp): wherever
@@ -143,7 +153,7 @@ inline bool area_segments_intersect(E7Point p0, E7Point p1, E7Point q0, E7Point 
 // checked as osmium's SegmentList::find_intersections does before it builds
 // an area: segments sorted by their least longitude, each against those that
 // start within its longitude span.
-inline bool rings_cross(const std::vector<std::vector<std::pair<double,double>>>& rings) {
+inline bool rings_cross(const std::vector<std::vector<PackedLocation>>& rings) {
     struct Seg { E7Point lo, hi; };  // hi.x >= lo.x
     std::vector<Seg> segs;
     for (const auto& r : rings)
@@ -167,10 +177,10 @@ inline bool rings_cross(const std::vector<std::vector<std::pair<double,double>>>
 
 // Check if a ring has duplicate coordinates (spikes/figure-8 from merged holes).
 // A valid simple polygon visits each coordinate exactly once (except closing point).
-inline bool ring_has_duplicate_coords(const std::vector<std::pair<double,double>>& ring) {
+inline bool ring_has_duplicate_coords(const std::vector<PackedLocation>& ring) {
     std::unordered_set<int64_t> seen;
     for (size_t i = 0; i + 1 < ring.size(); i++) {
-        int64_t k = coord_key(ring[i].first, ring[i].second);
+        int64_t k = coord_key(ring[i]);
         if (!seen.insert(k).second) return true;
     }
     return false;
@@ -574,10 +584,11 @@ inline bool is_included_highway_full(const char* highway, const char* footway) {
 // Canonicalize a closed ring's vertex order: drop the duplicate closing
 // point, rotate so the lexicographically-smallest vertex leads, then re-close.
 // Makes ring serialization independent of the input's starting rotation.
-inline void canonicalize_ring_rotation(std::vector<std::pair<double,double>>& ring) {
-    if (ring.size() >= 4 &&
-        std::fabs(ring.front().first - ring.back().first) < 1e-7 &&
-        std::fabs(ring.front().second - ring.back().second) < 1e-7) {
+// Closed means both ends are the same e7 location. Every ring the builder
+// passes in is closed that way: the ring assemblers close a ring on equal
+// coord_key, and a closed way starts and ends at the same node.
+inline void canonicalize_ring_rotation(std::vector<PackedLocation>& ring) {
+    if (ring.size() >= 4 && ring.front() == ring.back()) {
         ring.pop_back();
         auto min_it = std::min_element(ring.begin(), ring.end());
         std::rotate(ring.begin(), min_it, ring.end());

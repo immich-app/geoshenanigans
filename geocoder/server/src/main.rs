@@ -264,6 +264,7 @@ async fn polygons_geojson(
 
     let lat = params.lat;
     let lng = params.lon;
+    let point = AdminPoint::new(lat, lng);
 
     let mut features: Vec<serde_json::Value> = Vec::new();
 
@@ -286,13 +287,8 @@ async fn polygons_geojson(
         }
         for poly_id in hits {
             let Some(poly) = idx.admin_polygon(poly_id) else { continue; };
-            // v15 vertices are per-polygon delta-encoded with a 10-byte
-            // inline header — must decode through admin_verts(), not a
-            // raw [NodeCoord] cast (which produces nonsense floats).
-            let Some(verts) = idx.admin_verts(&poly) else { continue; };
-            if !point_in_polygon(lat as f32, lng as f32, &verts) { continue; }
-            // Keyhole ranges: the outer ring and each hole as rings of their own.
-            let rings = geojson_rings(&verts, poly.hole_count);
+            if !idx.admin_geometry.contains_once(&poly, point) { continue; }
+            let rings = idx.admin_geometry.rings(&poly);
             features.push(serde_json::json!({
                 "type": "Feature",
                 "geometry": { "type": "Polygon", "coordinates": rings },
@@ -305,16 +301,12 @@ async fn polygons_geojson(
             }));
         }
 
-        if let Some(ref pp) = &idx.postal_polygons {
+        if let (Some(pp), Some(postal)) = (&idx.postal_polygons, &idx.postal_geometry) {
             let total = pp.len() / std::mem::size_of::<AdminPolygon>() as u64;
             for i in 0..total {
                 let poly: AdminPolygon = pp.read_at::<AdminPolygon>(i);
-                let Some(verts) = decode_polygon_verts(
-                    idx.postal_vertices.as_ref().unwrap(),
-                    poly.vertex_offset, poly.vertex_count
-                ) else { continue; };
-                if !point_in_polygon(lat as f32, lng as f32, &verts) { continue; }
-                let rings = geojson_rings(&verts, poly.hole_count);
+                if !postal.contains_once(&poly, point) { continue; }
+                let rings = postal.rings(&poly);
                 features.push(serde_json::json!({
                     "type": "Feature",
                     "geometry": { "type": "Polygon", "coordinates": rings },

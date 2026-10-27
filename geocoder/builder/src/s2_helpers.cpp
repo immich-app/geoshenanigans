@@ -400,16 +400,16 @@ void append_addr_point(ParsedData& data, double lat, double lng,
 // --- add_admin_polygon ---
 
 void add_admin_polygon(ParsedData& data,
-                       const std::vector<std::pair<double,double>>& vertices_in,
+                       const std::vector<PackedLocation>& ring,
                        const char* name, uint8_t admin_level,
                        const char* country_code,
                        AdminCoverPool* admin_pool,
                        uint8_t place_type_override,
                        int64_t osm_way_id) {
-    auto vertices = vertices_in;
+    auto vertices = ring;
     canonicalize_ring_rotation(vertices);
 
-    auto simplified = simplify_admin_polygon(vertices, admin_level);
+    auto simplified = simplify_admin_polygon(unpack_ring(vertices), admin_level);
     if (simplified.size() < 3) return;
 
     uint32_t poly_id = static_cast<uint32_t>(data.admin_polygons.size());

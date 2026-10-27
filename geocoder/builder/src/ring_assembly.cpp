@@ -7,20 +7,18 @@
 
 namespace {
 
-using Coords = std::vector<std::pair<double,double>>;
+using Coords = std::vector<PackedLocation>;
 
 struct SubWay {
     Coords coords;
     uint8_t roles = 0;  // RingRole bit of the member way it comes from
 };
 
-int64_t key_of(const std::pair<double,double>& p) { return coord_key(p.first, p.second); }
-
 // Whether a coordinate follows itself somewhere along the way (a node listed
 // twice in a row, or two nodes at one location).
 bool repeats_a_coordinate(const CoordSpan& coords) {
     for (size_t i = 1; i < coords.size(); i++)
-        if (key_of(coords[i]) == key_of(coords[i - 1])) return true;
+        if (coord_key(coords[i]) == coord_key(coords[i - 1])) return true;
     return false;
 }
 
@@ -28,7 +26,7 @@ Coords without_repeats(const CoordSpan& coords) {
     Coords out;
     out.reserve(coords.size());
     for (const auto& p : coords)
-        if (out.empty() || key_of(out.back()) != key_of(p)) out.push_back(p);
+        if (out.empty() || coord_key(out.back()) != coord_key(p)) out.push_back(p);
     return out;
 }
 
@@ -43,12 +41,12 @@ uint8_t role_bit(const std::string& role) {
 std::vector<SubWay> split_sub_ways(const std::vector<CoordSpan>& way_coords, const std::vector<uint8_t>& way_roles) {
     std::unordered_map<int64_t, int> coord_count;
     for (const CoordSpan& coords : way_coords)
-        for (const auto& p : coords) coord_count[key_of(p)]++;
+        for (const auto& p : coords) coord_count[coord_key(p)]++;
 
     std::unordered_set<int64_t> split_points;
     for (const CoordSpan& coords : way_coords) {
-        split_points.insert(key_of(coords.front()));
-        split_points.insert(key_of(coords.back()));
+        split_points.insert(coord_key(coords.front()));
+        split_points.insert(coord_key(coords.back()));
     }
     for (auto& [ck, cnt] : coord_count) {
         if (cnt > 1) split_points.insert(ck);
@@ -59,7 +57,7 @@ std::vector<SubWay> split_sub_ways(const std::vector<CoordSpan>& way_coords, con
         const CoordSpan& coords = way_coords[w];
         size_t seg_start = 0;
         for (size_t i = 1; i < coords.size(); i++) {
-            if (split_points.count(key_of(coords[i])) && i > seg_start) {
+            if (split_points.count(coord_key(coords[i])) && i > seg_start) {
                 sub_ways.push_back({Coords(coords.begin() + seg_start, coords.begin() + i + 1), way_roles[w]});
                 seg_start = i;
             }
@@ -88,7 +86,7 @@ uint32_t cancel_duplicate_sub_ways(std::vector<SubWay>& sub_ways) {
     std::unordered_map<uint64_t, std::vector<uint32_t>> groups;
     for (uint32_t i = 0; i < sub_ways.size(); i++) {
         const Coords& c = sub_ways[i].coords;
-        const int64_t a = key_of(c.front()), b = key_of(c.back());
+        const int64_t a = coord_key(c.front()), b = coord_key(c.back());
         const uint64_t lo = static_cast<uint64_t>(std::min(a, b)), hi = static_cast<uint64_t>(std::max(a, b));
         groups[(lo * 0x9E3779B97F4A7C15ull) ^ hi ^ (static_cast<uint64_t>(c.size()) << 1)].push_back(i);
     }
@@ -123,7 +121,7 @@ bool takes_role(RingRoles roles, const std::string& role) {
     return roles == RingRoles::All || role_bit(role) == kRoleOuter;
 }
 
-std::vector<std::vector<std::pair<double,double>>> assemble_rings(
+std::vector<Coords> assemble_rings(
     const std::vector<std::pair<int64_t, std::string>>& members,
     const WayGeometries& way_geoms,
     RingRoles roles)
@@ -145,12 +143,12 @@ std::vector<std::vector<std::pair<double,double>>> assemble_rings(
     for (size_t i = 0; i < sub_ways.size(); i++) {
         auto& first = sub_ways[i].coords.front();
         auto& last = sub_ways[i].coords.back();
-        coord_adj[coord_key(first.first, first.second)].push_back({i, false});
-        coord_adj[coord_key(last.first, last.second)].push_back({i, true});
+        coord_adj[coord_key(first)].push_back({i, false});
+        coord_adj[coord_key(last)].push_back({i, true});
     }
 
     std::vector<bool> used(sub_ways.size(), false);
-    std::vector<std::vector<std::pair<double,double>>> rings;
+    std::vector<Coords> rings;
 
     struct BacktrackState {
         const std::vector<SubWay>& sways;
@@ -170,7 +168,7 @@ std::vector<std::vector<std::pair<double,double>>> assemble_rings(
             for (const auto& [wi, is_last] : it->second) {
                 if (used[wi]) continue;
                 auto& endpoint = is_last ? sways[wi].coords.front() : sways[wi].coords.back();
-                int64_t new_key = coord_key(endpoint.first, endpoint.second);
+                int64_t new_key = coord_key(endpoint);
 
                 used[wi] = true;
                 path.push_back({wi, is_last});
@@ -191,8 +189,8 @@ std::vector<std::vector<std::pair<double,double>>> assemble_rings(
         if (used[start_idx]) continue;
 
         const auto& sg = sub_ways[start_idx];
-        int64_t first_key = coord_key(sg.coords.front().first, sg.coords.front().second);
-        int64_t last_key = coord_key(sg.coords.back().first, sg.coords.back().second);
+        int64_t first_key = coord_key(sg.coords.front());
+        int64_t last_key = coord_key(sg.coords.back());
 
         if (sg.coords.size() >= 4 && first_key == last_key) {
             used[start_idx] = true;
@@ -202,7 +200,7 @@ std::vector<std::vector<std::pair<double,double>>> assemble_rings(
 
         used[start_idx] = true;
         std::vector<size_t> attempt_used = {start_idx};
-        std::vector<std::pair<double,double>> ring = sg.coords;
+        Coords ring = sg.coords;
         int64_t current_last = last_key;
         bool extended = true;
         while (extended && current_last != first_key) {
@@ -218,7 +216,7 @@ std::vector<std::vector<std::pair<double,double>>> assemble_rings(
                 attempt_used.push_back(wi);
                 if (!reversed) ring.insert(ring.end(), sw.coords.begin() + 1, sw.coords.end());
                 else for (auto rit = sw.coords.rbegin() + 1; rit != sw.coords.rend(); ++rit) ring.push_back(*rit);
-                current_last = coord_key(endpoint.first, endpoint.second);
+                current_last = coord_key(endpoint);
                 extended = true;
                 break;
             }
@@ -239,7 +237,7 @@ std::vector<std::vector<std::pair<double,double>>> assemble_rings(
         }
         if (any_unused && sub_ways.size() <= MAX_SUBWAYS_FOR_RETRY) {
             std::vector<bool> bt_used(sub_ways.size(), false);
-            std::vector<std::vector<std::pair<double,double>>> bt_rings;
+            std::vector<Coords> bt_rings;
 
             BacktrackState bt2{sub_ways, coord_adj, bt_used, 0};
             int total_bt_calls = 0;
@@ -249,8 +247,8 @@ std::vector<std::vector<std::pair<double,double>>> assemble_rings(
                 if (bt_used[si]) continue;
                 if (total_bt_calls >= MAX_TOTAL_BT_CALLS) break;
                 const auto& sg = sub_ways[si];
-                int64_t fk = coord_key(sg.coords.front().first, sg.coords.front().second);
-                int64_t lk = coord_key(sg.coords.back().first, sg.coords.back().second);
+                int64_t fk = coord_key(sg.coords.front());
+                int64_t lk = coord_key(sg.coords.back());
                 if (sg.coords.size() >= 4 && fk == lk) {
                     bt_used[si] = true;
                     bt_rings.push_back(sg.coords);
@@ -260,7 +258,7 @@ std::vector<std::vector<std::pair<double,double>>> assemble_rings(
                 bt2.calls = 0;
                 std::vector<std::pair<size_t, bool>> path;
                 if (bt2.try_close(fk, lk, path, 0)) {
-                    std::vector<std::pair<double,double>> r = sg.coords;
+                    Coords r = sg.coords;
                     for (const auto& [wi, rev] : path) {
                         const auto& c = sub_ways[wi].coords;
                         if (!rev) r.insert(r.end(), c.begin() + 1, c.end());
@@ -304,7 +302,7 @@ Heading heading_of(const Coords& c, bool back) {
     const auto& at = back ? c.back() : c.front();
     for (size_t k = 1; k < c.size(); k++) {
         const auto& p = back ? c[c.size() - 1 - k] : c[k];
-        const Heading h{e7(p.second) - e7(at.second), e7(p.first) - e7(at.first)};
+        const Heading h{int64_t(p.lon_e7) - at.lon_e7, int64_t(p.lat_e7) - at.lat_e7};
         if (h.x != 0 || h.y != 0) return h;
     }
     return {};
@@ -333,7 +331,7 @@ std::unordered_map<int64_t, std::vector<End>> turn_orders(
         for (size_t k = 0; k < subs.size(); k++) {
             // A closed sub-way is listed twice in a row: front, then back.
             const Coords& c = sub_ways[subs[k]].coords;
-            const bool back = key_of(c.front()) != at || (k > 0 && subs[k - 1] == subs[k]);
+            const bool back = coord_key(c.front()) != at || (k > 0 && subs[k - 1] == subs[k]);
             around.push_back({heading_of(c, back), end_of(subs[k], back)});
         }
         std::sort(around.begin(), around.end(), [](const auto& a, const auto& b) {
@@ -404,7 +402,7 @@ Walk walk_rings(const std::vector<SubWay>& sub_ways, const std::unordered_map<in
     std::unordered_map<int64_t, size_t> trail_index;
     for (uint32_t start = 0; start < sub_ways.size(); start++) {
         if (used[start]) continue;
-        trail.assign(1, key_of(sub_ways[start].coords.front()));
+        trail.assign(1, coord_key(sub_ways[start].coords.front()));
         steps.clear();
         trail_index.clear();
         trail_index[trail[0]] = 0;
@@ -424,11 +422,11 @@ Walk walk_rings(const std::vector<SubWay>& sub_ways, const std::unordered_map<in
                 } else {
                     next = unused_at(at);
                     if (next < 0) break;
-                    reversed = key_of(sub_ways[next].coords.front()) != at;
+                    reversed = coord_key(sub_ways[next].coords.front()) != at;
                 }
             }
             const Coords& c = sub_ways[next].coords;
-            const int64_t to = key_of(reversed ? c.front() : c.back());
+            const int64_t to = coord_key(reversed ? c.front() : c.back());
             used[next] = 1;
             steps.push_back({static_cast<uint32_t>(next), reversed});
             arrived = end_of(static_cast<uint32_t>(next), !reversed);
@@ -464,7 +462,7 @@ Walk walk_rings(const std::vector<SubWay>& sub_ways, const std::unordered_map<in
 
 }  // namespace
 
-std::vector<std::vector<std::pair<double,double>>> assemble_outer_rings(
+std::vector<std::vector<PackedLocation>> assemble_outer_rings(
     const std::vector<std::pair<int64_t, std::string>>& members,
     const WayGeometries& way_geoms,
     bool include_all_roles) {
@@ -500,8 +498,8 @@ AreaRings assemble_area_rings(const std::vector<std::pair<int64_t, std::string>>
     // Sub-ways by end coordinate, in sub-way order (a closed one twice).
     std::unordered_map<int64_t, std::vector<uint32_t>> ends;
     for (uint32_t i = 0; i < sub_ways.size(); i++) {
-        ends[key_of(sub_ways[i].coords.front())].push_back(i);
-        ends[key_of(sub_ways[i].coords.back())].push_back(i);
+        ends[coord_key(sub_ways[i].coords.front())].push_back(i);
+        ends[coord_key(sub_ways[i].coords.back())].push_back(i);
     }
     // osmium gives up on an area whose rings don't all close (a coordinate
     // with an odd number of segment ends) or with more than 100 coordinates
