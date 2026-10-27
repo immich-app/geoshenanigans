@@ -885,8 +885,17 @@ pub fn build_all(geo: &Index, subs: &[&str], out: &Path, opts: &BuildOpts, meta:
     let _ = std::fs::remove_dir_all(&stage);
     let built = build_staged(geo, subs, &stage, opts, meta)
         .and_then(|stats| publish(&stage, out, |from, to| std::fs::rename(from, to)).map(|_| stats).map_err(|e| format!("publish {}: {e}", out.display())));
-    let _ = std::fs::remove_dir_all(&stage);
+    clear_stage(&stage);
     built
+}
+
+/// Removes the staging directory, unless a publish that failed to put files back left the files
+/// they replaced in it.
+fn clear_stage(stage: &Path) {
+    if std::fs::read_dir(stage.join(BUILD_ASIDE_DIR)).is_ok_and(|mut d| d.next().is_some()) {
+        return;
+    }
+    let _ = std::fs::remove_dir_all(stage);
 }
 
 fn build_staged(geo: &Index, subs: &[&str], stage: &Path, opts: &BuildOpts, mut meta: serde_json::Value) -> Result<Vec<(String, Stats)>, String> {
@@ -903,7 +912,8 @@ fn build_staged(geo: &Index, subs: &[&str], stage: &Path, opts: &BuildOpts, mut 
 }
 
 /// Moves every file of `stage` into `out` with `rename`, search_meta.json last. Each file it
-/// replaces is moved aside first; when a move fails, the files moved so far are put back.
+/// replaces is moved aside first; when a move fails, the files moved so far are put back, and
+/// a file that cannot be put back stays aside (the error names the directory).
 fn publish(stage: &Path, out: &Path, rename: impl Fn(&Path, &Path) -> std::io::Result<()>) -> std::io::Result<()> {
     let mut names = std::fs::read_dir(stage)?.map(|e| e.map(|e| e.file_name())).collect::<std::io::Result<Vec<_>>>()?;
     names.sort_by_key(|n| (n == "search_meta.json", n.clone()));
@@ -923,12 +933,21 @@ fn publish(stage: &Path, out: &Path, rename: impl Fn(&Path, &Path) -> std::io::R
             rename(&stage.join(n), &to)
         });
         if let Err(e) = step {
+            let mut stuck = Vec::new();
             for (n, replaced) in moved.into_iter().rev() {
-                let _ = if replaced { rename(&aside.join(n), &out.join(n)) } else { std::fs::remove_file(out.join(n)) };
+                let back = if replaced { rename(&aside.join(n), &out.join(n)) } else { std::fs::remove_file(out.join(n)) };
+                if back.is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound) {
+                    stuck.push(n.to_string_lossy());
+                }
             }
-            return Err(e);
+            if stuck.is_empty() {
+                return Err(e);
+            }
+            let e = format!("{e}; could not put back {}: the files they replaced are in {}", stuck.join(", "), aside.display());
+            return Err(std::io::Error::other(e));
         }
     }
+    let _ = std::fs::remove_dir_all(&aside);
     Ok(())
 }
 
@@ -1351,9 +1370,36 @@ mod tests {
         };
 
         let result = publish(&stage, &out, rename);
+        clear_stage(&stage);
 
         assert!(result.is_err());
         assert_eq!(contents(&out), before);
+        assert!(!stage.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_put_back_keeps_the_replaced_files() {
+        let dir = tmp_dir("put-back");
+        let (stage, out) = (dir.join("stage"), dir.join("out"));
+        for (d, file, text) in [(&stage, "a", "new a"), (&stage, "b", "new b"), (&out, "a", "old a")] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join(file), text).unwrap();
+        }
+        // Moving b in fails once a has moved, and so does putting the old a back.
+        let rename = |from: &Path, to: &Path| {
+            if from.ends_with("stage/b") || from.ends_with(Path::new(BUILD_ASIDE_DIR).join("a")) {
+                return Err(std::io::Error::other("injected"));
+            }
+            std::fs::rename(from, to)
+        };
+
+        let err = publish(&stage, &out, rename).unwrap_err();
+        clear_stage(&stage);
+
+        let aside = stage.join(BUILD_ASIDE_DIR);
+        assert!(err.to_string().contains(aside.to_str().unwrap()), "{err}");
+        assert_eq!(std::fs::read_to_string(aside.join("a")).ok().as_deref(), Some("old a"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
