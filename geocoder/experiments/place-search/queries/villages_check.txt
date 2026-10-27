@@ -1,0 +1,77 @@
+famous	Gásadalur	ok	geonames_near=0	corpus_near=[(62.109738, -7.4360093, 'B', 'village')]
+famous	Saksun	ok	geonames_near=0	corpus_near=[(62.2442303, -7.1712467, 'B', 'village')]
+famous	Gjógv	ok	geonames_near=0	corpus_near=[(62.3257427, -6.9430295, 'B', 'village')]
+famous	Kirkjubøur	ok	geonames_near=0	corpus_near=[(61.9537078, -6.7934063, 'B', 'village')]
+famous	Manarola	ok	geonames_near=0	corpus_near=[(44.1063262, 9.7274815, 'P', 'village'), (44.1049232, 9.7292051, 'O', 'station')]
+famous	Corniglia	ok	geonames_near=0	corpus_near=[(44.1199606, 9.7086874, 'P', 'village'), (44.1185379, 9.7163057, 'O', 'station')]
+famous	Vernazza	in GeoNames	geonames_near=2	corpus_near=[(44.1349412, 9.6827757, 'B', 'village'), (44.1350288, 9.6845446, 'O', 'station')]
+famous	Riomaggiore	in GeoNames	geonames_near=2	corpus_near=[(44.0989747, 9.7386704, 'B', 'village'), (44.1006165, 9.7361422, 'O', 'station')]
+famous	Reine	in GeoNames	geonames_near=1	corpus_near=[(67.9324675, 13.0887684, 'P', 'village')]
+famous	Hamnøy	NOT IN CORPUS near point	geonames_near=0	corpus_near=[]
+famous	Grise Fiord	NOT IN CORPUS near point	geonames_near=0	corpus_near=[]
+famous	Supai	ok	geonames_near=0	corpus_near=[(36.2367074, -112.689549, 'P', 'village')]
+famous	Castle Combe	ok	geonames_near=0	corpus_near=[(51.4933703, -2.2289671, 'B', 'village')]
+famous	Bibury	ok	geonames_near=0	corpus_near=[(51.7583795, -1.8321036, 'B', 'village')]
+famous	Clovelly	ok	geonames_near=0	corpus_near=[(50.998028, -4.3987551, 'P', 'village')]
+famous	Polperro	in GeoNames	geonames_near=2	corpus_near=[(50.3315086, -4.5190177, 'B', 'village')]
+famous	Mousehole	in GeoNames	geonames_near=1	corpus_near=[(50.0839943, -5.5389614, 'P', 'village')]
+famous	Port Isaac	in GeoNames	geonames_near=2	corpus_near=[(50.5938787, -4.8299895, 'P', 'village')]
+famous	Staithes	in GeoNames	geonames_near=1	corpus_near=[(54.5591979, -0.7922654, 'P', 'village')]
+famous	Robin Hood's Bay	ok	geonames_near=0	corpus_near=[(54.433222, -0.5344748, 'P', 'village'), (54.426548, -0.5275208, 'O', 'bay')]
+famous	Aberdaron	ok	geonames_near=0	corpus_near=[(52.8050969, -4.7126197, 'P', 'village')]
+famous	Plockton	ok	geonames_near=0	corpus_near=[(57.338081, -5.6518941, 'P', 'village'), (57.3335915, -5.6658916, 'O', 'station')]
+famous	Grasmere	ok	geonames_near=0	corpus_near=[(54.4593879, -3.0243657, 'P', 'village')]
+famous	Hawkshead	ok	geonames_near=0	corpus_near=[(54.3747648, -2.9987873, 'B', 'village')]
+famous	Lacock	in GeoNames	geonames_near=2	corpus_near=[(51.413844, -2.1208721, 'P', 'village')]
+famous	Portmeirion	ok	geonames_near=0	corpus_near=[(52.9134519, -4.0993545, 'P', 'village')]
+famous	Kinderdijk	in GeoNames	geonames_near=1	corpus_near=[(51.8886955, 4.6356972, 'B', 'village')]
+famous	Giethoorn	in GeoNames	geonames_near=1	corpus_near=[(52.741105, 6.077431, 'B', 'village')]
+famous	Hallstatt	in GeoNames	geonames_near=2	corpus_near=[(47.5621698, 13.6486697, 'B', 'village')]
+famous	Gimmelwald	ok	geonames_near=0	corpus_near=[(46.5468623, 7.8940031, 'P', 'village')]
+famous	Mürren	ok	geonames_near=0	corpus_near=[(46.5591404, 7.8928785, 'P', 'village'), (46.5636902, 7.8971186, 'O', 'station')]
+famous	Wengen	ok	geonames_near=0	corpus_near=[(46.6054411, 7.9217237, 'P', 'village'), (46.6050072, 7.9208651, 'O', 'station')]
+famous	Ushguli	NOT IN CORPUS near point	geonames_near=0	corpus_near=[]
+famous	Perast	in GeoNames	geonames_near=2	corpus_near=[(42.4862681, 18.6988592, 'P', 'town')]
+famous	Sveti Stefan	ok	geonames_near=0	corpus_near=[(42.2558977, 18.8911779, 'B', 'town'), (42.2569885, 18.8926868, 'O', 'beach')]
+famous	Ittoqqortoormiit	ok	geonames_near=0	corpus_near=[(70.4856214, -21.961726, 'P', 'town')]
+famous	Edinburgh of the Seven Seas	in GeoNames	geonames_near=2	corpus_near=[(-37.0675708, -12.3110702, 'P', 'village')]
+famous	Ny-Ålesund	ok	geonames_near=0	corpus_near=[(78.9255303, 11.9291656, 'P', 'village')]
+famous	Whittier	ok	geonames_near=0	corpus_near=[(60.7730556, -148.6838889, 'B', 'town'), (60.7768669, -148.6968384, 'O', 'station')]
+famous	Milford Sound	ok	geonames_near=0	corpus_near=[(-44.67184, 167.9254592, 'P', 'hamlet')]
+famous	Oia	in GeoNames	geonames_near=3	corpus_near=[]
+famous	Göreme	in GeoNames	geonames_near=3	corpus_near=[]
+famous	Ogimachi	NOT IN CORPUS near point	geonames_near=0	corpus_near=[]
+famous	Vík í Mýrdal	in GeoNames	geonames_near=3	corpus_near=[]
+famous	Oymyakon	in GeoNames	geonames_near=2	corpus_near=[]
+famous	Tórshavn	in GeoNames	geonames_near=3	corpus_near=[(62.0101396, -6.7715709, 'B', 'town')]
+random	Cabladan	PH	10.79538,122.16844
+random	Ihubulu	NG	5.08814,6.60420
+random	Тяпугино	RU	58.77922,55.72408
+random	Malongi	CD	1.89895,21.75117
+random	Anan Salla	PE	-15.69849,-72.13897
+random	Klin Wara Settlement	PG	-7.29683,146.71137
+random	Siete de Septiembre	CU	20.91453,-76.20115
+random	Kherli Banda	IN	25.43614,76.15120
+random	Le Triou	FR	46.54083,1.15584
+random	Cililin Tonggoh	ID	-6.51781,106.56983
+random	Stora Matsbo	SE	60.02849,16.20961
+random	Alto do Consolo	BR	-9.59287,-43.12198
+random	Etaba I	CG	-0.08499,14.43613
+random	Piskowce	PL	50.98031,21.00849
+random	El Mghara	MA	30.17855,-9.43244
+random	Джегенды	KG	40.65840,72.84838
+random	Teryet	UG	1.33743,34.48308
+random	Kunstgraben	AT	47.62267,16.11904
+random	Monte de Yáñez	MX	21.44710,-102.78750
+random	Moisés del Bosque	EC	-2.86354,-78.34411
+random	Sobédaga	ML	13.61165,-4.10474
+random	Kampung Parit Kadir	MY	1.77998,103.10704
+random	Zamedveje	SI	46.05073,13.58640
+random	Bagmari	NP	29.72329,82.07499
+random	Leimgrub	DE	48.26358,12.93532
+random	特漠沁浩雅日格日嘎查	CN	43.36358,123.17208
+random	Lerinnes	BE	50.62946,4.72448
+random	Abujop	SS	9.36859,31.46565
+random	Chulumaloxib	GT	14.97998,-91.10434
+random	Bài Nha	VN	21.17422,105.46145
+famous kept 28 of 46; random 30

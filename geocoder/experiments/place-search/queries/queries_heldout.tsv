@@ -1,0 +1,301 @@
+# category	query	expected	lat	lon	tol_km	alternates
+heldout_big	Hannover	Hannover (DE, GeoNames)	52.37052	9.73322	15	
+heldout_big	Kalaburagi	Kalaburagi (IN, GeoNames)	17.33583	76.83757	15	
+heldout_big	Campo Grande	Campo Grande (BR, GeoNames)	-20.44278	-54.64639	15	
+heldout_big	San Cristóbal de las Casas	San Cristóbal de las Casas (MX, GeoNames)	16.73006	-92.63825	15	
+heldout_big	Bergen	Bergen (NO, GeoNames)	60.39299	5.32415	15	
+heldout_big	Lublin	Lublin (PL, GeoNames)	51.25058	22.57009	15	
+heldout_big	Jinfeng	Jinfeng (CN, GeoNames)	28.2385	116.60054	15	
+heldout_big	Al Maḩallah al Kubrá	Al Maḩallah al Kubrá (EG, GeoNames)	30.97063	31.1669	15	
+heldout_big	Itapevi	Itapevi (BR, GeoNames)	-23.54889	-46.93417	15	
+heldout_big	Arnavutköy	Arnavutköy (TR, GeoNames)	41.18355	28.7402	15	
+heldout_big	Yogyakarta	Yogyakarta (ID, GeoNames)	-7.80139	110.36472	15	
+heldout_big	Tema	Tema (GH, GeoNames)	5.6698	-0.01657	15	
+heldout_big	Seversk	Seversk (RU, GeoNames)	56.60056	84.88639	15	
+heldout_big	Sincelejo	Sincelejo (CO, GeoNames)	9.3045	-75.3905	15	
+heldout_big	Ghotki	Ghotki (PK, GeoNames)	28.00437	69.31569	15	
+heldout_big	Tacna	Tacna (PE, GeoNames)	-18.01465	-70.25362	15	
+heldout_big	Piraquara	Piraquara (BR, GeoNames)	-25.44227	-49.06795	15	
+heldout_big	Lyon	Lyon (FR, GeoNames)	45.74906	4.84789	15	
+heldout_big	Changsha	Changsha (CN, GeoNames)	22.38124	112.68492	15	
+heldout_big	Lexington-Fayette	Lexington-Fayette (US, GeoNames)	38.0498	-84.45855	15	
+heldout_big	Yantai	Yantai (CN, GeoNames)	37.47649	121.44081	15	
+heldout_big	Brantford	Brantford (CA, GeoNames)	43.1334	-80.26636	15	
+heldout_big	Bo	Bo (SL, GeoNames)	7.96472	-11.73833	15	
+heldout_big	Abū Kabīr	Abū Kabīr (EG, GeoNames)	30.72508	31.67148	15	
+heldout_big	Sivas	Sivas (TR, GeoNames)	39.74833	37.01611	15	
+heldout_big	Riobamba	Riobamba (EC, GeoNames)	-1.66506	-78.65887	15	
+heldout_big	Legnica	Legnica (PL, GeoNames)	51.21006	16.1619	15	
+heldout_big	Amsterdam	Amsterdam (NL, GeoNames)	52.37403	4.88969	15	
+heldout_big	Cariacica	Cariacica (BR, GeoNames)	-20.26389	-40.42	15	
+heldout_big	Curicó	Curicó (CL, GeoNames)	-34.98279	-71.23943	15	
+heldout_big	Los Rastrojos	Los Rastrojos (VE, GeoNames)	10.02588	-69.24166	15	
+heldout_big	Việt Yên	Việt Yên (VN, GeoNames)	21.26667	106.13333	15	
+heldout_big	Uromi	Uromi (NG, GeoNames)	6.7	6.33333	15	
+heldout_big	Dubai	Dubai (AE, GeoNames)	25.07725	55.30927	15	
+heldout_big	Gatineau	Gatineau (CA, GeoNames)	45.47723	-75.70164	15	
+heldout_big	Kragujevac	Kragujevac (RS, GeoNames)	44.01667	20.91667	15	
+heldout_big	Korla	Korla (CN, GeoNames)	41.76055	86.15231	15	
+heldout_big	Tây Hồ	Tây Hồ (VN, GeoNames)	21.06895	105.81053	15	
+heldout_big	Hailun	Hailun (CN, GeoNames)	47.44663	126.92475	15	
+heldout_big	Bern	Bern (CH, GeoNames)	46.94809	7.44744	15	
+heldout_big	Ifakara	Ifakara (TZ, GeoNames)	-8.13333	36.68333	15	
+heldout_big	Atbara	Atbara (SD, GeoNames)	17.70217	33.98638	15	
+heldout_big	Sertãozinho	Sertãozinho (BR, GeoNames)	-21.13778	-47.99028	15	
+heldout_big	Kirov	Kirov (RU, GeoNames)	58.59809	49.65783	15	
+heldout_big	São Lourenço da Mata	São Lourenço da Mata (BR, GeoNames)	-8.00222	-35.01833	15	
+heldout_big	Chitradurga	Chitradurga (IN, GeoNames)	14.22262	76.40038	15	
+heldout_big	Kraków	Kraków (PL, GeoNames)	50.06143	19.93658	15	
+heldout_big	Motherwell	Motherwell (ZA, GeoNames)	-33.7943	25.5858	15	
+heldout_big	Xigang	Xigang (CN, GeoNames)	38.55258	106.34805	15	
+heldout_big	Visakhapatnam	Visakhapatnam (IN, GeoNames)	17.68009	83.20161	15	
+heldout_big	Arica	Arica (CL, GeoNames)	-18.47552	-70.30058	15	
+heldout_big	Novocherkassk	Novocherkassk (RU, GeoNames)	47.4222	40.09373	15	
+heldout_big	Guarulhos	Guarulhos (BR, GeoNames)	-23.46278	-46.53333	15	
+heldout_big	Milton	Milton (CA, GeoNames)	43.51681	-79.88294	15	
+heldout_big	Mbombela	Mbombela (ZA, GeoNames)	-25.47512	30.96935	15	
+heldout_big	Iztapalapa	Iztapalapa (MX, GeoNames)	19.35529	-99.06224	15	
+heldout_big	Malolos	Malolos (PH, GeoNames)	14.8443	120.81039	15	
+heldout_big	Pamplona	Pamplona (ES, GeoNames)	42.81687	-1.64323	15	
+heldout_big	Sandakan	Sandakan (MY, GeoNames)	5.8402	118.1179	15	
+heldout_big	Irewe	Irewe (NG, GeoNames)	6.41692	3.14058	15	
+heldout_big	Santa Cruz	Santa Cruz (PH, GeoNames)	14.2814	121.4161	15	
+heldout_big	Ansan-si	Ansan-si (KR, GeoNames)	37.32361	126.82194	15	
+heldout_big	Legaspi	Legaspi (PH, GeoNames)	13.14125	123.74073	15	
+heldout_big	Oberhausen	Oberhausen (DE, GeoNames)	51.47805	6.8625	15	
+heldout_big	Cotonou	Cotonou (BJ, GeoNames)	6.36536	2.41833	15	
+heldout_big	Ado-Ekiti	Ado-Ekiti (NG, GeoNames)	7.62329	5.22087	15	
+heldout_big	Yekaterinburg	Yekaterinburg (RU, GeoNames)	56.85733	60.61529	15	
+heldout_big	Chust	Chust (UZ, GeoNames)	41.00329	71.23791	15	
+heldout_big	Kiel	Kiel (DE, GeoNames)	54.32133	10.13489	15	
+heldout_big	Bagerhat	Bagerhat (BD, GeoNames)	22.65657	89.79123	15	
+heldout_big	Macheng	Macheng (CN, GeoNames)	31.18013	115.02213	15	
+heldout_big	Calasiao	Calasiao (PH, GeoNames)	16.0111	120.36	15	
+heldout_big	Wuhan	Wuhan (CN, GeoNames)	30.58333	114.26667	15	
+heldout_big	Rāj-Nāndgaon	Rāj-Nāndgaon (IN, GeoNames)	21.09687	81.0289	15	
+heldout_big	Fukuoka	Fukuoka (JP, GeoNames)	33.6	130.41667	15	
+heldout_big	Breves	Breves (BR, GeoNames)	-1.68222	-50.48028	15	
+heldout_big	Mulenvos	Mulenvos (AO, GeoNames)	-8.86695	13.3344	15	
+heldout_big	Moḩammad Shahr	Moḩammad Shahr (IR, GeoNames)	35.763	50.9171	15	
+heldout_big	Ahvaz	Ahvaz (IR, GeoNames)	31.31901	48.6842	15	
+heldout_big	Sanaa	Sanaa (YE, GeoNames)	15.35452	44.20646	15	
+heldout_big	Mahajanga	Mahajanga (MG, GeoNames)	-15.71667	46.31667	15	
+heldout_big	Bielefeld	Bielefeld (DE, GeoNames)	52.03333	8.53333	15	
+heldout_big	Xianyang	Xianyang (CN, GeoNames)	34.33778	108.70261	15	
+heldout_big	Tivaouane	Tivaouane (SN, GeoNames)	14.95186	-16.8152	15	
+heldout_big	Burnaby	Burnaby (CA, GeoNames)	49.26636	-122.95263	15	
+heldout_big	Keelung	Keelung (TW, GeoNames)	25.13089	121.74094	15	
+heldout_big	Shashamane	Shashamane (ET, GeoNames)	7.2	38.6	15	
+heldout_big	Gaomi	Gaomi (CN, GeoNames)	36.38333	119.75278	15	
+heldout_big	Girón	Girón (CO, GeoNames)	7.0682	-73.16981	15	
+heldout_big	As Suwayq	As Suwayq (OM, GeoNames)	23.84944	57.43861	15	
+heldout_big	Bornova	Bornova (TR, GeoNames)	38.47921	27.2399	15	
+heldout_big	Ottawa	Ottawa (CA, GeoNames)	45.41117	-75.69812	15	
+heldout_big	Caloocan	Caloocan (PH, GeoNames)	14.64953	120.96788	15	
+heldout_big	Barinas	Barinas (VE, GeoNames)	8.62064	-70.23105	15	
+heldout_big	Karbala	Karbala (IQ, GeoNames)	32.61603	44.02488	15	
+heldout_big	Izhevsk	Izhevsk (RU, GeoNames)	56.85225	53.19862	15	
+heldout_big	Tuyên Quang	Tuyên Quang (VN, GeoNames)	21.82356	105.21424	15	
+heldout_big	Fāqūs	Fāqūs (EG, GeoNames)	30.72816	31.79697	15	
+heldout_big	Otaru	Otaru (JP, GeoNames)	43.18944	141.00222	15	
+heldout_big	San Francisco De Borja	San Francisco De Borja (PE, GeoNames)	-12.08911	-76.99876	15	
+heldout_big	Kanoya	Kanoya (JP, GeoNames)	31.38333	130.85	15	
+heldout_big	Zhu Cheng City	Zhu Cheng City (CN, GeoNames)	35.99502	119.40259	15	
+heldout_big	Hua Hin	Hua Hin (TH, GeoNames)	12.57065	99.95876	15	
+heldout_big	Tulancingo	Tulancingo (MX, GeoNames)	20.08055	-98.36831	15	
+heldout_big	Chisinau	Chisinau (MD, GeoNames)	47.00902	28.85938	15	
+heldout_big	Malambo	Malambo (CO, GeoNames)	10.85953	-74.77386	15	
+heldout_big	Viseu	Viseu (PT, GeoNames)	40.66165	-7.90905	15	
+heldout_big	Obuase	Obuase (GH, GeoNames)	6.20228	-1.66796	15	
+heldout_big	Naperville	Naperville (US, GeoNames)	41.78586	-88.14729	15	
+heldout_big	Modena	Modena (IT, GeoNames)	44.64783	10.92539	15	
+heldout_big	Fresnillo	Fresnillo (MX, GeoNames)	23.1749	-102.86785	15	
+heldout_big	Khanna	Khanna (IN, GeoNames)	30.70547	76.22196	15	
+heldout_big	Hamilton	Hamilton (CA, GeoNames)	43.25011	-79.84963	15	
+heldout_big	Dhaka	Dhaka (BD, GeoNames)	23.7104	90.40744	15	
+heldout_big	Barcelona	Barcelona (ES, GeoNames)	41.38879	2.15899	15	
+heldout_big	Toulouse	Toulouse (FR, GeoNames)	43.60426	1.44367	15	
+heldout_big	Taboão da Serra	Taboão da Serra (BR, GeoNames)	-23.62611	-46.79167	15	
+heldout_big	Rosario	Rosario (PH, GeoNames)	13.6323	121.2207	15	
+heldout_big	Miass	Miass (RU, GeoNames)	55.04552	60.10756	15	
+heldout_big	Ploieşti	Ploieşti (RO, GeoNames)	44.95	26.01667	15	
+heldout_big	Katihar	Katihar (IN, GeoNames)	25.53852	87.57044	15	
+heldout_big	Maba	Maba (CN, GeoNames)	24.68413	113.59839	15	
+heldout_big	Győr	Győr (HU, GeoNames)	47.68333	17.63512	15	
+heldout_big	Amman	Amman (JO, GeoNames)	31.95522	35.94503	15	
+heldout_big	São Caetano do Sul	São Caetano do Sul (BR, GeoNames)	-23.62306	-46.55111	15	
+heldout_big	Nijmegen	Nijmegen (NL, GeoNames)	51.8425	5.85278	15	
+heldout_big	Kot Addu	Kot Addu (PK, GeoNames)	30.46907	70.96699	15	
+heldout_big	Kumamoto	Kumamoto (JP, GeoNames)	32.80589	130.69181	15	
+heldout_big	Moro	Moro (PK, GeoNames)	26.66317	68.00016	15	
+heldout_big	Matsuyama	Matsuyama (JP, GeoNames)	33.83916	132.76574	15	
+heldout_big	Trento	Trento (IT, GeoNames)	46.06787	11.12108	15	
+heldout_big	Hamilton	Hamilton (NZ, GeoNames)	-37.78333	175.28333	15	
+heldout_big	Bahir Dar	Bahir Dar (ET, GeoNames)	11.59364	37.39077	15	
+heldout_big	Āsansol	Āsansol (IN, GeoNames)	23.68333	86.98333	15	
+heldout_big	Zhangzhou	Zhangzhou (CN, GeoNames)	24.51333	117.65556	15	
+heldout_big	Toliara	Toliara (MG, GeoNames)	-23.35	43.66667	15	
+heldout_big	Orihuela	Orihuela (ES, GeoNames)	38.08483	-0.94401	15	
+heldout_big	Dalian	Dalian (CN, GeoNames)	38.91222	121.60222	15	
+heldout_big	Leiyang	Leiyang (CN, GeoNames)	26.40238	112.85908	15	
+heldout_big	Dunhuang	Dunhuang (CN, GeoNames)	40.16667	94.68333	15	
+heldout_big	Sangju	Sangju (KR, GeoNames)	36.41528	128.16056	15	
+heldout_big	Düsseldorf	Düsseldorf (DE, GeoNames)	51.22319	6.77927	15	
+heldout_big	Huayin	Huayin (CN, GeoNames)	34.56528	110.06639	15	
+heldout_big	Liaozhong	Liaozhong (CN, GeoNames)	41.50611	122.72417	15	
+heldout_big	Aksaray	Aksaray (TR, GeoNames)	38.37255	34.02537	15	
+heldout_big	Cochabamba	Cochabamba (BO, GeoNames)	-17.38195	-66.15995	15	
+heldout_big	Apopa	Apopa (SV, GeoNames)	13.80722	-89.17917	15	
+heldout_big	Porto Alegre	Porto Alegre (BR, GeoNames)	-30.03283	-51.23019	15	
+heldout_big	Lak Si	Lak Si (TH, GeoNames)	13.88724	100.5792	15	
+heldout_big	Komatsu	Komatsu (JP, GeoNames)	36.40263	136.45088	15	
+heldout_ctx	Oletta, Corsica	Oletta, Corsica (FR, GeoNames)	42.62991	9.35431	8	
+heldout_ctx	Villa San Giuseppe, The Marches	Villa San Giuseppe, The Marches (IT, GeoNames)	42.86862	13.74481	8	
+heldout_ctx	Āsopās, Fars	Āsopās, Fars (IR, GeoNames)	30.6427	52.3995	8	
+heldout_ctx	Toteşti, Hunedoara County	Toteşti, Hunedoara County (RO, GeoNames)	45.56667	22.88333	8	
+heldout_ctx	Uken, Kagoshima	Uken, Kagoshima (JP, GeoNames)	28.3	129.23333	8	
+heldout_ctx	Suplac, Mureș County	Suplac, Mureș County (RO, GeoNames)	46.38333	24.51667	8	
+heldout_ctx	Bergharen, Gelderland	Bergharen, Gelderland (NL, GeoNames)	51.85083	5.66944	8	
+heldout_ctx	Sântimbru, Alba County	Sântimbru, Alba County (RO, GeoNames)	46.13333	23.65	8	
+heldout_ctx	Maniitsoq, Qeqqata	Maniitsoq, Qeqqata (GL, GeoNames)	65.41506	-52.89822	8	
+heldout_ctx	Presidente Juscelino, Maranhão	Presidente Juscelino, Maranhão (BR, GeoNames)	-2.9275	-44.065	8	
+heldout_ctx	Falck, Grand Est	Falck, Grand Est (FR, GeoNames)	49.22695	6.63373	8	
+heldout_ctx	Sisoguichi, Chihuahua	Sisoguichi, Chihuahua (MX, GeoNames)	27.78454	-107.49749	8	
+heldout_ctx	Skoura, Fes-Meknes	Skoura, Fes-Meknes (MA, GeoNames)	33.51935	-4.54351	8	
+heldout_ctx	Pendências, Rio Grande do Norte	Pendências, Rio Grande do Norte (BR, GeoNames)	-5.26	-36.72222	8	
+heldout_ctx	Creel, Chihuahua	Creel, Chihuahua (MX, GeoNames)	27.75281	-107.63472	8	
+heldout_ctx	Catanduvas, Paraná	Catanduvas, Paraná (BR, GeoNames)	-25.20306	-53.15667	8	
+heldout_ctx	Taylorville, Illinois	Taylorville, Illinois (US, GeoNames)	39.54894	-89.29453	8	
+heldout_ctx	Póros, Ionian Islands	Póros, Ionian Islands (GR, GeoNames)	38.15369	20.7712	8	
+heldout_ctx	San Luis de Planes, Santa Bárbara Department	San Luis de Planes, Santa Bárbara Department (HN, GeoNames)	14.97603	-88.1251	8	
+heldout_ctx	Furth, Bavaria	Furth, Bavaria (DE, GeoNames)	48.40616	12.38121	8	
+heldout_ctx	Betūl Bazār, Madhya Pradesh	Betūl Bazār, Madhya Pradesh (IN, GeoNames)	21.85572	77.92913	8	
+heldout_ctx	Ilihan, Central Visayas	Ilihan, Central Visayas (PH, GeoNames)	10.9054	123.9704	8	
+heldout_ctx	Bechet, Dolj	Bechet, Dolj (RO, GeoNames)	43.78188	23.95706	8	
+heldout_ctx	Tefé, Amazonas	Tefé, Amazonas (BR, GeoNames)	-3.36841	-64.72054	8	
+heldout_ctx	Fadhigaradle, Somali	Fadhigaradle, Somali (ET, GeoNames)	6.17559	45.29866	8	
+heldout_ctx	Treviso, Veneto	Treviso, Veneto (IT, GeoNames)	45.66673	12.2416	8	
+heldout_ctx	Avetrana, Apulia	Avetrana, Apulia (IT, GeoNames)	40.3507	17.7326	8	
+heldout_ctx	Santa Clara de Juárez, México	Santa Clara de Juárez, México (MX, GeoNames)	19.71909	-99.60695	8	
+heldout_ctx	Mapachapa, Veracruz	Mapachapa, Veracruz (MX, GeoNames)	18.02821	-94.56664	8	
+heldout_ctx	Kamuli, Eastern Region	Kamuli, Eastern Region (UG, GeoNames)	0.94722	33.11972	8	
+heldout_ctx	Lewisville, New Brunswick	Lewisville, New Brunswick (CA, GeoNames)	46.10437	-64.7532	8	
+heldout_ctx	Venice, Veneto	Venice, Veneto (IT, GeoNames)	45.43713	12.33265	8	
+heldout_ctx	Wachtebeke, Flanders	Wachtebeke, Flanders (BE, GeoNames)	51.16852	3.87183	8	
+heldout_ctx	Sompeta, Andhra Pradesh	Sompeta, Andhra Pradesh (IN, GeoNames)	18.94419	84.58449	8	
+heldout_ctx	Outeiro de Rei, Galicia	Outeiro de Rei, Galicia (ES, GeoNames)	43.10198	-7.61497	8	
+heldout_ctx	Gračanica, Pristina	Gračanica, Pristina (XK, GeoNames)	42.60111	21.19583	8	
+heldout_ctx	Buritinópolis, Goiás	Buritinópolis, Goiás (BR, GeoNames)	-14.45722	-46.43722	8	
+heldout_ctx	Émines, Wallonia	Émines, Wallonia (BE, GeoNames)	50.51304	4.84411	8	
+heldout_ctx	Yangjiaying, Shanxi	Yangjiaying, Shanxi (CN, GeoNames)	39.48055	111.69301	8	
+heldout_ctx	General Guido, Buenos Aires	General Guido, Buenos Aires (AR, GeoNames)	-36.64168	-57.79213	8	
+heldout_ctx	Torreselle, Veneto	Torreselle, Veneto (IT, GeoNames)	45.63026	12.0225	8	
+heldout_ctx	Delianuova, Calabria	Delianuova, Calabria (IT, GeoNames)	38.23587	15.91714	8	
+heldout_ctx	Bechtsrieth, Bavaria	Bechtsrieth, Bavaria (DE, GeoNames)	49.64487	12.20997	8	
+heldout_ctx	Siachoque, Boyacá	Siachoque, Boyacá (CO, GeoNames)	5.51238	-73.24436	8	
+heldout_ctx	Repatriación, Caaguazú Department	Repatriación, Caaguazú Department (PY, GeoNames)	-25.53515	-55.99242	8	
+heldout_ctx	Birchiş, Arad County	Birchiş, Arad County (RO, GeoNames)	45.96667	22.16667	8	
+heldout_ctx	Shuyskoye, Vologda Oblast	Shuyskoye, Vologda Oblast (RU, GeoNames)	59.37356	41.03047	8	
+heldout_ctx	La Méaugon, Brittany	La Méaugon, Brittany (FR, GeoNames)	48.49827	-2.84151	8	
+heldout_ctx	Villenoy, Île-de-France	Villenoy, Île-de-France (FR, GeoNames)	48.94112	2.8602	8	
+heldout_ctx	Romhány, Nógrád	Romhány, Nógrád (HU, GeoNames)	47.92618	19.25723	8	
+heldout_ctx	Ghimbav, Brașov County	Ghimbav, Brașov County (RO, GeoNames)	45.66667	25.5	8	
+heldout_ctx	els Banys d'Arles, Occitanie	els Banys d'Arles, Occitanie (FR, GeoNames)	42.47289	2.66916	8	
+heldout_ctx	Flöthe, Lower Saxony	Flöthe, Lower Saxony (DE, GeoNames)	52.08333	10.48333	8	
+heldout_ctx	Ryslinge, South Denmark	Ryslinge, South Denmark (DK, GeoNames)	55.2416	10.53675	8	
+heldout_ctx	Redan, Victoria	Redan, Victoria (AU, GeoNames)	-37.57649	143.83862	8	
+heldout_ctx	Dachne, Crimea	Dachne, Crimea (UA, GeoNames)	44.88448	34.98333	8	
+heldout_ctx	Kosova Hora, Central Bohemia	Kosova Hora, Central Bohemia (CZ, GeoNames)	49.65414	14.47173	8	
+heldout_ctx	Ilion, New York	Ilion, New York (US, GeoNames)	43.01507	-75.03543	8	
+heldout_ctx	Gararu, Sergipe	Gararu, Sergipe (BR, GeoNames)	-9.9675	-37.08333	8	
+heldout_ctx	Kleinwenden, Thuringia	Kleinwenden, Thuringia (DE, GeoNames)	51.41611	10.65902	8	
+heldout_ctx	Danlugan, Zamboanga Peninsula	Danlugan, Zamboanga Peninsula (PH, GeoNames)	7.8922	123.3712	8	
+heldout_ctx	Garden City, Kansas	Garden City, Kansas (US, GeoNames)	37.97169	-100.87266	8	
+heldout_ctx	Jarny, Grand Est	Jarny, Grand Est (FR, GeoNames)	49.15873	5.8764	8	
+heldout_ctx	Theisseil, Bavaria	Theisseil, Bavaria (DE, GeoNames)	49.69034	12.22744	8	
+heldout_ctx	Daragutan, Cagayan Valley	Daragutan, Cagayan Valley (PH, GeoNames)	17.0	122.03333	8	
+heldout_ctx	San Miguel del Valle, Oaxaca	San Miguel del Valle, Oaxaca (MX, GeoNames)	17.02083	-96.41727	8	
+heldout_ctx	Dekan, Madhya Pradesh	Dekan, Madhya Pradesh (IN, GeoNames)	24.70638	75.1044	8	
+heldout_ctx	Stadum, Schleswig-Holstein	Stadum, Schleswig-Holstein (DE, GeoNames)	54.73333	9.05	8	
+heldout_ctx	Fountainhead-Orchard Hills, Maryland	Fountainhead-Orchard Hills, Maryland (US, GeoNames)	39.68636	-77.71901	8	
+heldout_ctx	Prudnik, Opole Voivodeship	Prudnik, Opole Voivodeship (PL, GeoNames)	50.32124	17.57461	8	
+heldout_ctx	Albania, Caquetá	Albania, Caquetá (CO, GeoNames)	1.32866	-75.87824	8	
+heldout_ctx	Zlatopil, Kharkiv	Zlatopil, Kharkiv (UA, GeoNames)	49.37646	36.21848	8	
+heldout_ctx	Armutlu, Aksaray	Armutlu, Aksaray (TR, GeoNames)	38.19417	33.8951	8	
+heldout_ctx	Grovedale, Victoria	Grovedale, Victoria (AU, GeoNames)	-38.2	144.35	8	
+heldout_ctx	Hicksville, New York	Hicksville, New York (US, GeoNames)	40.76843	-73.52513	8	
+heldout_ctx	Hampton, England	Hampton, England (GB, GeoNames)	51.41334	-0.36701	8	
+heldout_ctx	Obenheim, Grand Est	Obenheim, Grand Est (FR, GeoNames)	48.35975	7.692	8	
+heldout_ctx	Fārsīyān, Qazvin Province	Fārsīyān, Qazvin Province (IR, GeoNames)	36.16018	49.93391	8	
+heldout_ctx	San Rafael, Alajuela Province	San Rafael, Alajuela Province (CR, GeoNames)	10.06441	-84.47361	8	
+heldout_ctx	Esparragal, Murcia	Esparragal, Murcia (ES, GeoNames)	38.03333	-1.08333	8	
+heldout_ctx	Pervomayka, Almaty	Pervomayka, Almaty (KZ, GeoNames)	43.37361	76.94	8	
+heldout_ctx	Delgado de Arriba, Guanajuato	Delgado de Arriba, Guanajuato (MX, GeoNames)	20.72282	-100.90304	8	
+heldout_ctx	Capão do Cipó, Rio Grande do Sul	Capão do Cipó, Rio Grande do Sul (BR, GeoNames)	-28.93428	-54.55564	8	
+heldout_ctx	Sainte-Geneviève, Hauts-de-France	Sainte-Geneviève, Hauts-de-France (FR, GeoNames)	49.2892	2.19904	8	
+heldout_ctx	Armbouts-Cappel, Hauts-de-France	Armbouts-Cappel, Hauts-de-France (FR, GeoNames)	50.97682	2.35352	8	
+heldout_ctx	Las Lajas, Neuquen	Las Lajas, Neuquen (AR, GeoNames)	-38.52447	-70.36516	8	
+heldout_ctx	Shuangjinhui, Guangdong	Shuangjinhui, Guangdong (CN, GeoNames)	22.68552	113.79331	8	
+heldout_ctx	Petru Vodă, Neamț County	Petru Vodă, Neamț County (RO, GeoNames)	47.11913	26.00117	8	
+heldout_ctx	Jacareacanga, Pará	Jacareacanga, Pará (BR, GeoNames)	-6.22222	-57.75278	8	
+heldout_ctx	Plouër-sur-Rance, Brittany	Plouër-sur-Rance, Brittany (FR, GeoNames)	48.5275	-2.00325	8	
+heldout_ctx	Chiusa, Trentino-Alto Adige	Chiusa, Trentino-Alto Adige (IT, GeoNames)	46.64001	11.56573	8	
+heldout_ctx	Hakkila, Uusimaa	Hakkila, Uusimaa (FI, GeoNames)	60.29238	25.07346	8	
+heldout_ctx	Korobchyne, Kirovohrad	Korobchyne, Kirovohrad (UA, GeoNames)	48.7652	31.49344	8	
+heldout_ctx	Toudu, Chongqing	Toudu, Chongqing (CN, GeoNames)	28.93767	107.18203	8	
+heldout_ctx	Les Deux Alpes, Auvergne-Rhône-Alpes	Les Deux Alpes, Auvergne-Rhône-Alpes (FR, GeoNames)	45.0116	6.12548	8	
+heldout_ctx	Barhiya, Bihar	Barhiya, Bihar (IN, GeoNames)	25.28814	86.02055	8	
+heldout_ctx	Shar’ya, Kostroma Oblast	Shar’ya, Kostroma Oblast (RU, GeoNames)	58.36848	45.51622	8	
+heldout_ctx	Waggum, Lower Saxony	Waggum, Lower Saxony (DE, GeoNames)	52.32632	10.55803	8	
+heldout_ctx	Eumemmerring, Victoria	Eumemmerring, Victoria (AU, GeoNames)	-37.9978	145.24821	8	
+heldout_ctx	Złotniki, Greater Poland	Złotniki, Greater Poland (PL, GeoNames)	52.49407	16.84496	8	
+heldout_ctx	Velence, Fejér	Velence, Fejér (HU, GeoNames)	47.23855	18.65484	8	
+heldout_ctx	Manning, Western Australia	Manning, Western Australia (AU, GeoNames)	-32.01594	115.86714	8	
+heldout_ctx	Sint-Lievens-Esse, Flanders	Sint-Lievens-Esse, Flanders (BE, GeoNames)	50.8566	3.88792	8	
+heldout_ctx	Pa Thi, Yangon	Pa Thi, Yangon (MM, GeoNames)	16.67728	95.87461	8	
+heldout_ctx	Druzhba, Ternopil	Druzhba, Ternopil (UA, GeoNames)	49.36996	25.6381	8	
+heldout_ctx	Six Cross Roads, Christ Church	Six Cross Roads, Christ Church (BB, GeoNames)	13.11772	-59.477	8	
+heldout_ctx	Olyshivka, Chernihiv Oblast	Olyshivka, Chernihiv Oblast (UA, GeoNames)	51.21862	31.33582	8	
+heldout_ctx	Euratsfeld, Lower Austria	Euratsfeld, Lower Austria (AT, GeoNames)	48.08181	14.93154	8	
+heldout_ctx	Arafo, Canary Islands	Arafo, Canary Islands (ES, GeoNames)	28.33971	-16.42244	8	
+heldout_ctx	Nashville, Illinois	Nashville, Illinois (US, GeoNames)	38.34366	-89.38064	8	
+heldout_ctx	La Loma, Coclé	La Loma, Coclé (PA, GeoNames)	8.1664	-80.63617	8	
+heldout_ctx	Saint-Nazaire-d'Aude, Occitanie	Saint-Nazaire-d'Aude, Occitanie (FR, GeoNames)	43.24451	2.89441	8	
+heldout_ctx	Kovernino, Nizhny Novgorod Oblast	Kovernino, Nizhny Novgorod Oblast (RU, GeoNames)	57.128	43.81462	8	
+heldout_ctx	Holmesville, New South Wales	Holmesville, New South Wales (AU, GeoNames)	-32.91667	151.58333	8	
+heldout_ctx	Saint-Lumine-de-Clisson, Pays de la Loire	Saint-Lumine-de-Clisson, Pays de la Loire (FR, GeoNames)	47.08284	-1.33716	8	
+heldout_ctx	Stueng Chhay, Koh Kong	Stueng Chhay, Koh Kong (KH, GeoNames)	10.94238	103.79716	8	
+heldout_ctx	Pindoretama, Ceará	Pindoretama, Ceará (BR, GeoNames)	-4.02694	-38.305	8	
+heldout_ctx	Bonifay, Florida	Bonifay, Florida (US, GeoNames)	30.79186	-85.67965	8	
+heldout_ctx	Pedalino, Sicily	Pedalino, Sicily (IT, GeoNames)	37.0232	14.58116	8	
+heldout_ctx	Şerbăneşti, Olt	Şerbăneşti, Olt (RO, GeoNames)	44.33333	24.7	8	
+heldout_ctx	Hudson, Quebec	Hudson, Quebec (CA, GeoNames)	45.45008	-74.14922	8	
+heldout_ctx	Turnu Măgurele, Teleorman County	Turnu Măgurele, Teleorman County (RO, GeoNames)	43.7469	24.86846	8	
+heldout_ctx	Lázaro Cárdenas, Hidalgo	Lázaro Cárdenas, Hidalgo (MX, GeoNames)	20.70264	-99.34231	8	
+heldout_ctx	Yanxi, Chongqing	Yanxi, Chongqing (CN, GeoNames)	30.29705	108.12682	8	
+heldout_ctx	Suslovo, Kuzbass	Suslovo, Kuzbass (RU, GeoNames)	56.21667	88.11667	8	
+heldout_ctx	Apizaco, Tlaxcala	Apizaco, Tlaxcala (MX, GeoNames)	19.41333	-98.14358	8	
+heldout_ctx	Castano Primo, Lombardy	Castano Primo, Lombardy (IT, GeoNames)	45.55175	8.77562	8	
+heldout_ctx	Hudson, Texas	Hudson, Texas (US, GeoNames)	31.32268	-94.77826	8	
+heldout_ctx	Akori, Lori	Akori, Lori (AM, GeoNames)	41.08976	44.6173	8	
+heldout_ctx	Novaci, Novaci	Novaci, Novaci (MK, GeoNames)	41.04197	21.45866	8	
+heldout_ctx	Toholampi, Central Ostrobothnia	Toholampi, Central Ostrobothnia (FI, GeoNames)	63.76667	24.25	8	
+heldout_ctx	Monteviale, Veneto	Monteviale, Veneto (IT, GeoNames)	45.5592	11.45715	8	
+heldout_ctx	Oosterhesselen, Drenthe	Oosterhesselen, Drenthe (NL, GeoNames)	52.75417	6.72222	8	
+heldout_ctx	Ardales, Andalusia	Ardales, Andalusia (ES, GeoNames)	36.87804	-4.84694	8	
+heldout_ctx	Perivóli, Ionian Islands	Perivóli, Ionian Islands (GR, GeoNames)	39.41936	20.01469	8	
+heldout_ctx	Aleksandrovskoye, Stavropol Kray	Aleksandrovskoye, Stavropol Kray (RU, GeoNames)	44.71417	43.00083	8	
+heldout_ctx	Settūr, Tamil Nadu	Settūr, Tamil Nadu (IN, GeoNames)	9.40564	77.47841	8	
+heldout_ctx	Arroyos y Esteros, Cordillera Department	Arroyos y Esteros, Cordillera Department (PY, GeoNames)	-25.05505	-57.09728	8	
+heldout_ctx	Lalibela, Amhara	Lalibela, Amhara (ET, GeoNames)	12.03219	39.04756	8	
+heldout_ctx	Shyroke, Zaporizhzhia	Shyroke, Zaporizhzhia (UA, GeoNames)	48.09556	35.64948	8	
+heldout_ctx	Santa Cruz, El Paraíso Department	Santa Cruz, El Paraíso Department (HN, GeoNames)	13.86667	-86.63333	8	
+heldout_ctx	Toulépleu, Montagnes	Toulépleu, Montagnes (CI, GeoNames)	6.57974	-8.41091	8	
+heldout_ctx	Desert View Highlands, California	Desert View Highlands, California (US, GeoNames)	34.59082	-118.15257	8	
+heldout_ctx	Voineşti, Dâmbovița County	Voineşti, Dâmbovița County (RO, GeoNames)	45.06667	25.25	8	
+heldout_ctx	Pallevāda, Andhra Pradesh	Pallevāda, Andhra Pradesh (IN, GeoNames)	16.5779	81.29463	8	
+heldout_ctx	Rosedale, Mississippi	Rosedale, Mississippi (US, GeoNames)	33.85344	-91.02789	8	
+heldout_ctx	Želiezovce, Nitra Region	Želiezovce, Nitra Region (SK, GeoNames)	48.05075	18.65421	8	
+heldout_ctx	Yoshinogawa, Tokushima	Yoshinogawa, Tokushima (JP, GeoNames)	34.03858	134.29207	8	
+heldout_ctx	Olivella, Catalonia	Olivella, Catalonia (ES, GeoNames)	41.31667	1.81667	8	
+heldout_ctx	Verbivka, Ivano-Frankivsk	Verbivka, Ivano-Frankivsk (UA, GeoNames)	48.89772	24.26136	8	
