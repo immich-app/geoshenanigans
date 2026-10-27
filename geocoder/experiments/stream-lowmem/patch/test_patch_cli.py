@@ -1,9 +1,11 @@
-"""Run against a built geocoder-patch (the experiment's): command-line checks that need no patch data.
+"""Run against a built geocoder-patch (the experiment's, with libzstd or the zstd CLI fallback):
+command-line checks that need no patch data. zstd must be on PATH.
 
 --only on an encoded installed set (a gc.manifest in the current dir) is refused before anything is
 written: a staged apply would leave a gc.manifest naming every family with only one stage's keys.
 
-The output dir is created as named, quotes and all, and no part of its name runs as a command."""
+The output dir is created as named, quotes and all, and no part of its name runs as a command; the
+same for the patch path, which is decompressed as named."""
 import os
 from pathlib import Path
 import subprocess
@@ -37,4 +39,17 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as scratch:
             errors.append(f'output dir {name!r} was not created: rc={r.returncode} {r.stderr.decode()[-300:]}')
         if (root / 'pwned').exists():
             errors.append(f'output dir {name!r} ran a command (pwned exists)')
+
+    def compressed(payload):
+        return subprocess.run(['zstd', '-q', '-c'], input=payload, capture_output=True, check=True).stdout
+
+    for i, name in enumerate(["user's patch.gcpatch", "x'; touch pwned; 'y.gcpatch"]):
+        named = root / name
+        named.write_bytes(compressed(b'NOT A GCPATCH'))
+        r = subprocess.run([binary, str(plain), str(named), '-o', str(root / f'named{i}')], capture_output=True, cwd=root)
+        err = r.stderr.decode()
+        if 'Bad magic' not in err:
+            errors.append(f'patch {name!r} was not decompressed as named: rc={r.returncode} {err[-300:]}')
+        if (root / 'pwned').exists():
+            errors.append(f'patch {name!r} ran a command (pwned exists)')
 assert not errors, '\n'.join(errors)

@@ -27,12 +27,14 @@
 #include <iterator>
 #include <malloc.h>
 #include <memory>
+#include <spawn.h>
 #include <stdio_ext.h>
 #include <stdexcept>
 #include <string>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <unistd.h>
@@ -127,6 +129,22 @@ static bool decompress_to_file(const std::string& src, const std::string& dst) {
     const bool ok = !ZSTD_isError(n) && ftruncate(fd, (off_t)n) == 0;
     close(fd);
     return ok;
+}
+#else
+// The zstd CLI, run without a shell: the patch path is one argument, whatever its characters.
+static bool decompress_to_file(const std::string& src, const std::string& dst) {
+    const char* argv[] = {"zstd", "-d", "-f", "--quiet", "-o", dst.c_str(), "--", src.c_str(), nullptr};
+    posix_spawn_file_actions_t quiet;
+    if (posix_spawn_file_actions_init(&quiet)) return false;
+    posix_spawn_file_actions_addopen(&quiet, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+    pid_t pid;
+    const int err = posix_spawnp(&pid, "zstd", &quiet, nullptr, const_cast<char* const*>(argv), environ);
+    posix_spawn_file_actions_destroy(&quiet);
+    if (err) return false;
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0)
+        if (errno != EINTR) return false;
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 #endif
 
@@ -427,14 +445,7 @@ static int run(int argc, char* argv[]) {
 
     // --- Phase 1: Decompress + mmap patch ---
     std::string raw_path = tmpdir + "/patch.raw";
-#ifdef GCS_LIBZSTD
     if (!decompress_to_file(patch_path, raw_path)) { std::cerr << "Failed to decompress" << std::endl; return 1; }
-#else
-    {
-        std::string cmd = "zstd -d '" + patch_path + "' -o '" + raw_path + "' -f --quiet 2>/dev/null";
-        if (system(cmd.c_str()) != 0) { std::cerr << "Failed to decompress" << std::endl; return 1; }
-    }
-#endif
     MappedFile patch_map = mmap_file(raw_path);
     if (!patch_map.data) { std::cerr << "Failed to mmap patch" << std::endl; return 1; }
     // Don't remove temp file yet (mmap needs backing file for page eviction under memory pressure)
