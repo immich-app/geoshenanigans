@@ -76,6 +76,20 @@ def unprivileged():
         os.setuid(65534)
 
 
+def pipe_growth_refusal():
+    """Why a pipe of this process can't grow to the 1 MiB a FIFO output needs ('' when it can). The
+    patcher runs with this process's credentials, so its pipes are under the same limits."""
+    r, w = os.pipe()
+    try:
+        got = fcntl.fcntl(w, 1031, 1 << 20)  # F_SETPIPE_SZ
+        return '' if got >= 1 << 20 else f'it grows to {got} B'
+    except OSError as e:
+        return os.strerror(e.errno)
+    finally:
+        os.close(r)
+        os.close(w)
+
+
 def narrow_pipes():
     """preexec_fn: unprivileged() holding pipes of up to 1 MiB until it is past its pipe page limit
     (fs.pipe-user-pages-soft), where a new pipe gets the minimum size and none can grow: the patcher's
@@ -269,21 +283,26 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as scratch:
     # A streamed output whose reader goes away fails the run (the entry pipeline's four outputs were
     # closed unchecked): geo_cells.bin is a FIFO whose reader closes at once, the patch rewrites 4 MiB
     # of rows (more than the pipe and the stdio buffer hold), SIGPIPE is ignored.
+    # Where this user's pipes can't grow to 1 MiB the patcher refuses the FIFO before it writes: a SKIP
+    # (the narrow-pipe case below checks that refusal).
     flat = [(k, []) for k in range(200000)]
     geo_dir(root / 'flat', flat)
     r = run([DIFF, str(root / 'flat'), str(root / 'flat'), '-o', str(root / 'flat.gcpatch')])
-    out = root / 'fifo.out'
-    out.mkdir()
-    fifo = out / 'geo_cells.bin'
-    os.mkfifo(fifo)
-    reader = threading.Thread(target=lambda: os.close(os.open(fifo, os.O_RDONLY)), daemon=True)
-    reader.start()
-    r = run([PATCHER, str(root / 'flat'), str(root / 'flat.gcpatch'), '-o', str(out)], restore_signals=False, timeout=120)
-    if reader.is_alive():
-        os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
-    err = r.stderr.decode()
-    if r.returncode == 0 or 'Cannot write geo_cells.bin' not in err:
-        errors.append(f'fifo-output: a failed geo_cells.bin was not reported: rc={r.returncode} {err[-300:]}')
+    if refusal := pipe_growth_refusal():
+        print(f"fifo-output: SKIP, this user's pipes can't grow to 1 MiB ({refusal})")
+    else:
+        out = root / 'fifo.out'
+        out.mkdir()
+        fifo = out / 'geo_cells.bin'
+        os.mkfifo(fifo)
+        reader = threading.Thread(target=lambda: os.close(os.open(fifo, os.O_RDONLY)), daemon=True)
+        reader.start()
+        r = run([PATCHER, str(root / 'flat'), str(root / 'flat.gcpatch'), '-o', str(out)], restore_signals=False, timeout=120)
+        if reader.is_alive():
+            os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        err = r.stderr.decode()
+        if r.returncode == 0 or 'Cannot write geo_cells.bin' not in err:
+            errors.append(f'fifo-output: a failed geo_cells.bin was not reported: rc={r.returncode} {err[-300:]}')
 
     # A FIFO output whose pipe can't grow to 1 MiB fails the run up front (the entry pipeline's group
     # flush needs it; it went on with a 64 KiB or 8 KiB pipe): the patcher runs as a user past its
