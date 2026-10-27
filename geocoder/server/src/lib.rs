@@ -2010,13 +2010,14 @@ impl Index {
     // rank_address, boundaries before place nodes within a rank, and each
     // boundary it accepts (rank_address other than 5 and 11) becomes the
     // geometry later place nodes must sit in. A place node of rank R is so
-    // gated by the last boundary accepted before it, the one of the highest
-    // rank <= R, whatever its admin_level: on a Vatican point that is the
-    // Vatican itself, which keeps Rome's neighbourhood nodes out. Within a
-    // rank the walk accepts the first boundary only; the smallest containing
-    // polygon of the rank stands in for it. The rank is placex's
-    // rank_address, after the nested-boundary promotions (CurrentBoundaries::
-    // from_ranked).
+    // gated by the last boundary accepted before it, whatever its
+    // admin_level: on a Vatican point that is the Vatican itself, which keeps
+    // Rome's neighbourhood nodes out. The walk accepts one boundary per rank,
+    // and only one whose centroid lies in the boundary accepted before it
+    // (CurrentBoundaries::walk); the smallest containing polygon of a rank is
+    // tried first, and a polygon's point on surface stands in for its
+    // centroid. The rank is placex's rank_address, after the nested-boundary
+    // promotions (CurrentBoundaries::from_ranked).
     pub fn find_current_boundaries(&self, lat: f64, lng: f64, country_code: Option<[u8; 2]>) -> CurrentBoundaries {
         let cc: String = country_code
             .map(|c| c.iter().map(|b| b.to_ascii_uppercase() as char).collect())
@@ -2053,7 +2054,12 @@ impl Index {
             .map(|poly| RankedPoly { poly, rank_address: self.admin_config.to_rank(&cc, poly.admin_level) })
             .filter(|r| r.rank_address != 0 || r.poly.place_type_override != 0)
             .collect();
-        CurrentBoundaries::from_ranked(ranked, holding(place_areas).iter())
+        let inside = |poly: &AdminPolygon, current: &AdminPolygon| {
+            self.admin_verts(poly)
+                .and_then(|verts| point_on_surface(&verts, poly.hole_count))
+                .is_some_and(|(lat, lng)| self.admin_verts(current).is_some_and(|verts| point_in_polygon(lat, lng, &verts)))
+        };
+        CurrentBoundaries::from_ranked(ranked, holding(place_areas).iter(), inside)
     }
 
     // Smallest containing admin polygon at "municipality rank" — the
@@ -4029,6 +4035,43 @@ pub fn point_in_polygon(lat: f32, lng: f32, vertices: &[NodeCoord]) -> bool {
     inside
 }
 
+/// A point inside a polygon's keyhole vertex range, found as GEOS's
+/// InteriorPointArea finds one (PostGIS ST_PointOnSurface, which Nominatim's
+/// boundary centroids are): on the line of latitude halfway between the
+/// outer ring's latitudes nearest above and below its bounding box's middle,
+/// the middle of the widest run inside the polygon. (lat, lng); None when no
+/// run is found.
+pub fn point_on_surface(verts: &[NodeCoord], holes: u16) -> Option<(f32, f32)> {
+    let spans = split_rings(verts, holes);
+    let ring_of = |span: &RingSpan| &verts[span.begin..span.begin + span.count];
+    let ring = ring_of(&spans[0]);
+    let (min, max) = ring.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.lat as f64), hi.max(p.lat as f64)));
+    let middle = (min + max) / 2.0;
+    let (mut below, mut above) = (min, max);
+    for p in ring {
+        let lat = p.lat as f64;
+        if lat <= middle { below = below.max(lat); } else { above = above.min(lat); }
+    }
+    let lat = (below + above) / 2.0;
+    // Where the edges of the outer ring and the holes (not the keyhole
+    // connectors) cross the line.
+    let mut crossings: Vec<f64> = Vec::new();
+    for ring in spans.iter().map(ring_of) {
+        for (a, b) in ring.iter().zip(ring.iter().cycle().skip(1)) {
+            let (a_lat, b_lat) = (a.lat as f64, b.lat as f64);
+            if (a_lat > lat) != (b_lat > lat) {
+                crossings.push(a.lng as f64 + (lat - a_lat) / (b_lat - a_lat) * (b.lng as f64 - a.lng as f64));
+            }
+        }
+    }
+    crossings.sort_by(|a, b| a.total_cmp(b));
+    let mut widest: Option<&[f64]> = None;
+    for run in crossings.chunks_exact(2) {
+        if widest.is_none_or(|w| run[1] - run[0] > w[1] - w[0]) { widest = Some(run); }
+    }
+    widest.map(|run| (lat as f32, ((run[0] + run[1]) / 2.0) as f32))
+}
+
 // --- API types ---
 
 pub struct PoiMatch<'a> {
@@ -4095,26 +4138,44 @@ impl CurrentBoundaries {
     /// initial rank_address and the place areas holding it: the nested-
     /// boundary promotions give each its rank_address (an admin_level 7
     /// boundary in a level 6 one linked to a suburb is ranked 22, not 14),
-    /// then `pick` chooses among those of rank <= each rank.
-    pub fn from_ranked<'a>(mut ranked: Vec<RankedPoly>, place_areas: impl Iterator<Item = &'a AdminPolygon> + Clone) -> Self {
+    /// then `walk` takes them as Nominatim's address walk does.
+    pub fn from_ranked<'a>(
+        mut ranked: Vec<RankedPoly>,
+        place_areas: impl Iterator<Item = &'a AdminPolygon> + Clone,
+        inside: impl Fn(&AdminPolygon, &AdminPolygon) -> bool,
+    ) -> Self {
         promote_nested_ranks(&mut ranked, place_areas);
         let gating = ranked.into_iter().filter(|r| !matches!(r.rank_address, 0 | 5 | 11));
-        Self::pick(gating.map(|r| (r.rank_address, r.poly)))
+        Self::walk(gating.map(|r| (r.rank_address, r.poly)), inside)
     }
 
-    /// Each rank's boundary from (rank_address, polygon) candidates holding
-    /// the point: the one of the highest rank <= it, which Nominatim's walk
-    /// (by rank_address) accepts last before a place node of that rank, and
-    /// the smallest of that rank where several have it.
-    pub fn pick(candidates: impl IntoIterator<Item = (u8, AdminPolygon)>) -> Self {
+    /// Each rank's boundary as Nominatim's address walk (insert_addresslines)
+    /// leaves it, from (rank_address, polygon) candidates holding the point:
+    /// taken by rank, the smallest first within a rank, a boundary is accepted
+    /// when none is yet at its rank and its centroid lies in the boundary
+    /// accepted before it. A rank's boundary is the last accepted at or below
+    /// it. A boundary smaller than the current one is taken to lie in it, as
+    /// nested boundaries do; a larger one is tested (`inside(boundary,
+    /// current)`), so it gates only when it is round the current one (a
+    /// suburb-linked boundary round a city-linked one), not beside it.
+    /// Simplified polygons overlap at shared borders, and testing a smaller
+    /// boundary there would reject the one the point is really in.
+    pub fn walk(
+        candidates: impl IntoIterator<Item = (u8, AdminPolygon)>,
+        inside: impl Fn(&AdminPolygon, &AdminPolygon) -> bool,
+    ) -> Self {
         let mut candidates: Vec<(u8, AdminPolygon)> = candidates.into_iter().collect();
-        candidates.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.area.total_cmp(&b.1.area)));
+        candidates.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.area.total_cmp(&b.1.area)));
         let mut found = Self::default();
+        let mut current: Option<(u8, AdminPolygon)> = None;
         for (rank, poly) in candidates {
-            let open: [bool; 3] = std::array::from_fn(|g| found.0[g].is_none() && rank <= Self::RANKS[g]);
-            if !open.contains(&true) { continue; }
-            for (slot, _) in found.0.iter_mut().zip(open).filter(|(_, open)| *open) { *slot = Some(poly); }
-            if found.0.iter().all(Option::is_some) { break; }
+            if let Some((current_rank, current_poly)) = &current {
+                if *current_rank == rank || (poly.area > current_poly.area && !inside(&poly, current_poly)) { continue; }
+            }
+            current = Some((rank, poly));
+            for (slot, gate) in found.0.iter_mut().zip(Self::RANKS) {
+                if rank <= gate { *slot = Some(poly); }
+            }
         }
         found
     }
@@ -4902,7 +4963,7 @@ mod pure_helper_tests {
     fn current_boundaries_fall_back_to_the_country() {
         // A Vatican point: Rome's boundaries are near but leave it out; the
         // country holds it and gates every place rank.
-        let found = CurrentBoundaries::pick([(4, boundary(3, 2))]);
+        let found = CurrentBoundaries::walk([(4, boundary(3, 2))], |_, _| true);
         assert_eq!(names(&found), [Some(3), Some(3), Some(3)]);
     }
 
@@ -4911,7 +4972,7 @@ mod pure_helper_tests {
         // Spain's admin_level 10 ranks 22: it gates quarters and
         // neighbourhoods, while suburbs see the municipality around it.
         let candidates = [(22, boundary(1, 10)), (16, boundary(2, 8)), (4, boundary(3, 2))];
-        let found = CurrentBoundaries::pick(candidates);
+        let found = CurrentBoundaries::walk(candidates, |_, _| true);
         assert_eq!(names(&found), [Some(2), Some(1), Some(1)]);
     }
 
@@ -4928,7 +4989,7 @@ mod pure_helper_tests {
             RankedPoly { poly: suburb, rank_address: 12 },
             RankedPoly { poly: country, rank_address: 4 },
         ];
-        let found = CurrentBoundaries::from_ranked(ranked, [].iter());
+        let found = CurrentBoundaries::from_ranked(ranked, [].iter(), |_, _| true);
         assert_eq!(names(&found), [Some(1), Some(2), Some(2)]);
     }
 
@@ -4941,7 +5002,7 @@ mod pure_helper_tests {
         let country = AdminPolygon { area: 1000.0, ..boundary(2, 2) };
         let nairobi = AdminPolygon { area: 100.0, place_type_override: 1, ..boundary(3, 15) };
         let ranked = vec![RankedPoly { poly: starehe, rank_address: 12 }, RankedPoly { poly: country, rank_address: 4 }];
-        let found = CurrentBoundaries::from_ranked(ranked, [nairobi].iter());
+        let found = CurrentBoundaries::from_ranked(ranked, [nairobi].iter(), |_, _| true);
         assert_eq!(names(&found), [Some(1), Some(1), Some(1)]);
     }
 
@@ -4959,7 +5020,7 @@ mod pure_helper_tests {
             level(10, 20, 1.0, 0), level(9, 18, 2.0, 0), level(8, 16, 4.0, 0),
             level(7, 14, 8.0, 0), level(6, 12, 16.0, 1), level(2, 4, 1000.0, 0),
         ];
-        let found = CurrentBoundaries::from_ranked(ranked, [].iter());
+        let found = CurrentBoundaries::from_ranked(ranked, [].iter(), |_, _| true);
         let gate = |rank| found.for_rank(rank).map(|p| p.admin_level);
         assert_eq!(gate(CurrentBoundaries::SUBURB), Some(8));
         assert_eq!(gate(CurrentBoundaries::QUARTER), Some(9));
@@ -4967,30 +5028,74 @@ mod pure_helper_tests {
     }
 
     #[test]
-    fn current_boundaries_take_the_highest_rank_before_the_smallest_area() {
-        // Concentric admin_level 6 boundaries: the larger, linked to a
-        // suburb, ranks 20, the smaller, linked to a city, 16. Nominatim's
-        // walk accepts the city at rank 16 and then the suburb at 20, which
-        // gates suburbs, quarters and neighbourhoods. Within a rank the
-        // smaller boundary gates.
+    fn current_boundaries_are_the_last_the_walk_accepts() {
+        // Admin_level 6 boundaries round the point, the larger linked to a
+        // suburb (rank 20), the smaller to a city (rank 16). Nominatim's walk
+        // accepts the city at rank 16, then the suburb at rank 20 when its
+        // centroid lies in the city (concentric): the suburb gates suburbs,
+        // quarters and neighbourhoods. Otherwise (overlapping) the city does.
         let suburb = AdminPolygon { area: 10.0, place_type_override: 4, ..boundary(1, 6) };
         let city = AdminPolygon { area: 1.0, place_type_override: 1, ..boundary(2, 6) };
         let country = AdminPolygon { area: 1000.0, ..boundary(3, 2) };
-        let ranked = vec![
+        let ranked = || vec![
             RankedPoly { poly: city, rank_address: 12 },
             RankedPoly { poly: suburb, rank_address: 12 },
             RankedPoly { poly: country, rank_address: 4 },
         ];
-        let found = CurrentBoundaries::from_ranked(ranked, [].iter());
-        assert_eq!(names(&found), [Some(1), Some(1), Some(1)]);
+        let concentric = CurrentBoundaries::from_ranked(ranked(), [].iter(), |_, _| true);
+        assert_eq!(names(&concentric), [Some(1), Some(1), Some(1)]);
+        let overlapping = CurrentBoundaries::from_ranked(ranked(), [].iter(), |poly, _| poly.name_id != 1);
+        assert_eq!(names(&overlapping), [Some(2), Some(2), Some(2)]);
+    }
+
+    #[test]
+    fn current_boundaries_take_smaller_boundaries_as_inside() {
+        // A county, then a town, each smaller than the boundary before: both
+        // are accepted without testing their centroids.
+        let candidates = [(4, boundary(3, 2)), (12, AdminPolygon { area: 0.5, ..boundary(5, 6) }), (16, AdminPolygon { area: 0.1, ..boundary(6, 8) })];
+        let found = CurrentBoundaries::walk(candidates, |_, _| false);
+        assert_eq!(names(&found), [Some(6), Some(6), Some(6)]);
+    }
+
+    #[test]
+    fn current_boundaries_try_the_smallest_of_a_rank_first() {
+        // Two rank 20 boundaries: the smaller is accepted and the larger
+        // skipped; where the smaller lies outside the current boundary, the
+        // larger is tried next.
         let wider = AdminPolygon { area: 20.0, ..boundary(4, 8) };
-        let found = CurrentBoundaries::pick([(20, wider), (20, suburb), (16, city)]);
+        let suburb = AdminPolygon { area: 10.0, ..boundary(1, 8) };
+        let city = AdminPolygon { area: 1.0, ..boundary(2, 6) };
+        let candidates = [(20, wider), (20, suburb), (16, city)];
+        let found = CurrentBoundaries::walk(candidates, |_, _| true);
         assert_eq!(names(&found), [Some(1), Some(1), Some(1)]);
+        let found = CurrentBoundaries::walk(candidates, |poly, _| poly.name_id != 1);
+        assert_eq!(names(&found), [Some(4), Some(4), Some(4)]);
+    }
+
+    #[test]
+    fn point_on_surface_is_in_the_widest_run_inside() {
+        // A square: its middle. An L whose bounding box's middle is outside
+        // it: on the line between the latitudes round the middle (1 and 4,
+        // so 2.5), the middle of the run inside (lng 0 to 2).
+        let square = [nc(0.0, 0.0), nc(0.0, 2.0), nc(2.0, 2.0), nc(2.0, 0.0), nc(0.0, 0.0)];
+        assert_eq!(point_on_surface(&square, 0), Some((1.0, 1.0)));
+        let l = [nc(0.0, 0.0), nc(0.0, 8.0), nc(1.0, 8.0), nc(1.0, 2.0), nc(4.0, 2.0), nc(4.0, 0.0), nc(0.0, 0.0)];
+        assert_eq!(point_on_surface(&l, 0), Some((2.5, 1.0)));
+        // Holes split the runs, keyhole connectors don't: the line at lat 5
+        // runs inside from 0 to 10 past the second hole's connector, and from
+        // 6 to 10 right of a hole from lng 1 to 6.
+        let (outer, holes) = square_with_two_holes();
+        assert_eq!(point_on_surface(&keyhole(&outer, &holes), 2), Some((5.0, 5.0)));
+        let wide_hole = vec![nc(2.0, 1.0), nc(8.0, 1.0), nc(8.0, 6.0), nc(2.0, 6.0), nc(2.0, 1.0)];
+        let v = keyhole(&outer, &[wide_hole]);
+        assert_eq!(point_on_surface(&v, 1), Some((5.0, 8.0)));
+        assert!(point_in_polygon(5.0, 8.0, &v));
+        assert_eq!(point_on_surface(&[], 0), None);
     }
 
     #[test]
     fn current_boundaries_are_empty_without_a_containing_boundary() {
-        let found = CurrentBoundaries::pick([]);
+        let found = CurrentBoundaries::walk([], |_, _| true);
         assert_eq!(names(&found), [None, None, None]);
         assert!(found.for_rank(CurrentBoundaries::SUBURB).is_none());
     }
