@@ -85,8 +85,14 @@ impl Automaton for Anchored<'_> {
     }
 }
 
-#[derive(PartialEq, PartialOrd, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct Ord32(f32);
+impl PartialEq for Ord32 {
+    fn eq(&self, other: &Self) -> bool { self.cmp(other).is_eq() }
+}
+impl PartialOrd for Ord32 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+}
 impl Eq for Ord32 {}
 impl Ord for Ord32 {
     fn cmp(&self, o: &Self) -> std::cmp::Ordering {
@@ -676,6 +682,16 @@ mod tests {
         assert_eq!(*names.entry(state).or_insert(2), 2);
         assert_ne!(context_mask_key(10, 0, 2), context_mask_key(10, 0, 4));
         assert_ne!(context_mask_key(10, 1, 4), context_mask_key(10, 2, 4));
+    }
+
+    #[test]
+    fn float_order_is_consistent_for_nan_and_signed_zero() {
+        for value in [f32::NAN, -0.0, 0.0, 1.0] {
+            let a = Ord32(value);
+            assert!(a == a);
+            assert_eq!(a.partial_cmp(&a), Some(a.cmp(&a)));
+        }
+        assert!(Ord32(-0.0) != Ord32(0.0));
     }
 
 }
