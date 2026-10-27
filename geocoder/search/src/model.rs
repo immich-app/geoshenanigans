@@ -298,6 +298,7 @@ mod tests {
             let mut b = vec![0xAA];
             encode_list(&mut b, &list, with_names);
             let got: Vec<Posting> = ListReader::new(&b, 1, with_names).collect();
+            assert_eq!(got.len(), list.len());
             for (g, w) in got.iter().zip(&list) {
                 assert_eq!((g.entity, g.imp_q, g.partial), (w.entity, w.imp_q, w.partial));
                 if with_names {
