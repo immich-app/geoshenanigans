@@ -30,7 +30,7 @@ pub enum Kind {
     Minor,
     /// boundary that claims a place node (label point = the node)
     Linked,
-    /// boundary without a label node (label point = its largest ring's centroid)
+    /// boundary without a label node (label point = its ring's point on surface)
     Area,
     Poi,
 }
