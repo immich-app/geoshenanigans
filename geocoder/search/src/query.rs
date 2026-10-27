@@ -11,8 +11,7 @@ use crate::reader::{SearchIndex, SubIndex};
 use query_server::{cell_id_at_level, AdminPolygon, Index, ID_MASK, INTERIOR_FLAG, NO_DATA};
 use fst::{Automaton, IntoStreamer, Streamer};
 use levenshtein_automata::{Distance, LevenshteinAutomatonBuilder, DFA, SINK_STATE};
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
 pub struct Searcher<'a, 'g> {
@@ -219,18 +218,23 @@ impl Context<'_> {
 
 struct Pool {
     best: HashMap<u32, Hit>,
-    heap: BinaryHeap<Reverse<Ord32>>,
-    /// best `top_k` scores offered, descending (the cut-off for costly context checks)
-    top: Vec<f32>,
+    /// (current score, entity) of the best `CANDIDATE_POOL` distinct entities offered: an
+    /// entity's improved score replaces its old one, so each counts once in both bounds
+    scores: BTreeSet<(Ord32, u32)>,
+    /// results the context cut-off keeps reachable (limit * CONTEXT_CUTOFF_FACTOR)
     top_k: usize,
 }
 
 impl Pool {
+    fn new(top_k: usize) -> Self {
+        Pool { best: HashMap::new(), scores: BTreeSet::new(), top_k }
+    }
+
     fn threshold(&self) -> f32 {
-        if self.heap.len() < CANDIDATE_POOL {
+        if self.scores.len() < CANDIDATE_POOL {
             0.0
         } else {
-            self.heap.peek().map(|r| r.0 .0).unwrap_or(0.0)
+            self.scores.first().map(|s| s.0 .0).unwrap_or(0.0)
         }
     }
 
@@ -242,26 +246,22 @@ impl Pool {
             if old.score >= h.score {
                 return;
             }
+            self.scores.remove(&(Ord32(old.score), h.entity));
         }
-        self.heap.push(Reverse(Ord32(h.score)));
-        if self.heap.len() > CANDIDATE_POOL {
-            self.heap.pop();
-        }
-        let at = self.top.partition_point(|&x| x >= h.score);
-        if at < self.top_k {
-            self.top.insert(at, h.score);
-            self.top.truncate(self.top_k);
+        self.scores.insert((Ord32(h.score), h.entity));
+        if self.scores.len() > CANDIDATE_POOL {
+            self.scores.pop_first();
         }
         self.best.insert(h.entity, h);
     }
 
-    /// No candidate scoring at most this can reach the results.
+    /// No candidate scoring at most this can reach the results: the `top_k`-th best distinct
+    /// entity's score.
     fn cutoff(&self) -> f32 {
         if self.top_k == 0 { return f32::INFINITY; }
-        if self.top.len() < self.top_k {
-            self.threshold()
-        } else {
-            self.top[self.top_k - 1].max(self.threshold())
+        match self.scores.iter().nth_back(self.top_k - 1) {
+            Some(s) => s.0 .0.max(self.threshold()),
+            None => self.threshold(),
         }
     }
 }
@@ -552,7 +552,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
     pub fn search(&self, q: &str, limit: usize) -> (Vec<Found<'g>>, QueryStats) {
         if limit == 0 { return (Vec::new(), QueryStats::default()); }
         let mut st = State { ctx: HashMap::new(), stats: QueryStats::default() };
-        let mut pool = Pool { best: HashMap::new(), heap: BinaryHeap::new(), top: Vec::new(), top_k: limit * CONTEXT_CUTOFF_FACTOR };
+        let mut pool = Pool::new(limit * CONTEXT_CUTOFF_FACTOR);
         let mut phrases: Vec<String> = Vec::new();
         if let Some((name, rest)) = q.split_once(',') {
             let name = tokens(name);
@@ -665,12 +665,41 @@ mod tests {
         let c = Context { words: &words, phrase: "tx".into() };
         assert_eq!(c.mask_of("texas") & 1, 0);
     }
+    fn hit(entity: u32, score: f32) -> Hit {
+        Hit { entity, ord: 0, class: 0, score, text: 1.0, context: false, split: 0 }
+    }
+
     #[test]
     fn zero_limit_has_no_reachable_candidate() {
-        let mut pool = Pool { best: HashMap::new(), heap: BinaryHeap::new(), top: Vec::new(), top_k: 0 };
+        let mut pool = Pool::new(0);
         assert_eq!(pool.cutoff(), f32::INFINITY);
-        pool.top.push(1.0);
+        pool.offer(hit(1, 1.0));
         assert_eq!(pool.cutoff(), f32::INFINITY);
+    }
+
+    #[test]
+    fn pool_counts_each_entity_once() {
+        // One entity improving 0.8 -> 0.9 is one candidate: with top_k 2 a context candidate at
+        // 0.7 can still reach the results until a second entity is in.
+        let mut pool = Pool::new(2);
+        pool.offer(hit(1, 0.8));
+        pool.offer(hit(1, 0.9));
+        assert_eq!(pool.cutoff(), 0.0);
+        pool.offer(hit(2, 0.7));
+        assert_eq!(pool.cutoff(), 0.7);
+        assert_eq!(pool.best.len(), 2);
+        // CANDIDATE_POOL improvements of one entity leave the pool open to everyone else.
+        let mut pool = Pool::new(2);
+        for k in 0..CANDIDATE_POOL {
+            pool.offer(hit(1, 0.1 + k as f32 / 1000.0));
+        }
+        assert_eq!(pool.threshold(), 0.0);
+        for e in 2..CANDIDATE_POOL as u32 + 1 {
+            pool.offer(hit(e, 0.05));
+        }
+        assert_eq!(pool.threshold(), 0.05);
+        pool.offer(hit(1000, 0.04));
+        assert!(!pool.best.contains_key(&1000));
     }
 
     #[test]
