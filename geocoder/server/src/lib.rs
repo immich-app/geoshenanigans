@@ -53,6 +53,24 @@ impl FileBytes {
         }
     }
 
+    /// Hints that the byte at `off` is read soon, so its cache miss can overlap other work. Never
+    /// changes what a read returns; a no-op past the end and on targets other than x86_64.
+    #[inline]
+    pub fn prefetch(&self, off: u64) {
+        let bytes: &[u8] = match self {
+            Self::Owned(v) => v,
+            Self::Mmap(m) => m,
+        };
+        let Some(byte) = bytes.get(off as usize) else { return };
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: a prefetch reads nothing back and never faults.
+        unsafe {
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>((byte as *const u8).cast())
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = byte;
+    }
+
     /// Read a `Copy` record at index `idx` (byte offset = idx * sizeof T)
     /// via a pointer cast through read_unaligned.
     pub fn read_at<T: Copy>(&self, idx: u64) -> T {
@@ -231,6 +249,18 @@ pub fn vertex_scale(enc: u8) -> f64 {
 /// Header is omitted for vertex_count == 0 (point-only records,
 /// vertex_offset == NO_DATA).
 pub const POLY_HEADER_BYTES: u64 = 10;
+
+/// Largest vertex delta (in scale steps) the u16 encodings 0-2 can store.
+const U16_VERTEX_MAX_STEPS: f64 = u16::MAX as f64;
+/// Margin of the latitude bounds test in `ring_bounds_exclude`. `point_in_polygon` computes an
+/// edge's crossing latitude in f32; while the edge's longitude span is a normal f32 it lands
+/// within about 7e-5 degrees of the edge's latitude span (five roundings relative to a span of at
+/// most 180 degrees, plus the final addition), so a point 1e-3 degrees beyond every vertex is
+/// beyond every crossing.
+const PIP_LAT_BOUND_SLACK_DEG: f32 = 1e-3;
+/// 2^-100 (f32 biased exponent 27). At or above this |lng| the longitudes of an edge straddling
+/// the point differ by at least 2^-124, a normal f32; closer to 0 the latitude test is skipped.
+const PIP_LAT_BOUND_MIN_ABS_LNG: f32 = f32::from_bits(27 << 23);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -879,6 +909,112 @@ pub fn continents() -> &'static [Continent] {
     })
 }
 
+// --- Admin cell scan ---
+
+/// The admin rings one reverse lookup can return: the entry lists of the point's level-10 cell
+/// and its neighbours, in the order every admin scan visits them, and the point-in-polygon answers
+/// computed so far. The neighbours are needed: S2 covers the great-circle edges of a ring before
+/// it is re-simplified, while containment is the straight lat/lng test on the stored ring, so a
+/// ring can contain the point without listing its cell (Egypt's 660 km edge on 22°N bows 3.3 km
+/// north of the parallel).
+pub struct AdminScan {
+    /// The entries of the point's own cell, then of its neighbours in `cell_neighbors_at_level`
+    /// order, each with its polygon record (entries whose record `Index::admin_polygon` rejects
+    /// are left out).
+    rings: Vec<(u32, AdminPolygon)>,
+    /// How many of `rings` come from the own cell.
+    own_cell_rings: usize,
+    pip: PipMemo,
+}
+
+impl AdminScan {
+    pub fn new(index: &Index, lat: f64, lng: f64) -> Self {
+        let cell = cell_id_at_level(lat, lng, index.admin_cell_level);
+        let cells: Vec<u64> = std::iter::once(cell).chain(cell_neighbors_at_level(cell, index.admin_cell_level)).collect();
+        let mut lists = vec![NO_DATA; cells.len()];
+        Index::lookup_admin_cells_fb(&index.admin_cells, &cells, &mut lists);
+        // Each list, each record and most ring headers are read below wherever the point is, so
+        // they are requested before the first one is needed: their cache misses overlap.
+        for &list in &lists {
+            if list != NO_DATA { index.admin_entries.prefetch(list as u64); }
+        }
+        let record_bytes = std::mem::size_of::<AdminPolygon>() as u64;
+        for &list in &lists {
+            Index::for_each_entry_fb(&index.admin_entries, list, |id| index.admin_polygons.prefetch((id & ID_MASK) as u64 * record_bytes));
+        }
+        let (mut rings, mut own_cell_rings) = (Vec::new(), 0);
+        for (k, &list) in lists.iter().enumerate() {
+            Index::for_each_entry_fb(&index.admin_entries, list, |id| {
+                if let Some(poly) = index.admin_polygon(id & ID_MASK) { rings.push((id, poly)); }
+            });
+            if k == 0 { own_cell_rings = rings.len(); }
+        }
+        for (_, poly) in &rings {
+            if poly.vertex_offset != NO_DATA { index.admin_vertices.prefetch(poly.vertex_offset as u64); }
+        }
+        AdminScan { rings, own_cell_rings, pip: PipMemo::new(lat, lng) }
+    }
+
+    /// Calls `f(pip, in_own_cell, entry, polygon)` for every ring, in visiting order.
+    fn for_each_entry(&mut self, mut f: impl FnMut(&mut PipMemo, bool, u32, AdminPolygon)) {
+        for (i, &(id, poly)) in self.rings.iter().enumerate() {
+            f(&mut self.pip, i < self.own_cell_rings, id, poly);
+        }
+    }
+}
+
+/// `Index::admin_pip` answers for one point, by polygon id (open addressing, linear probing).
+struct PipMemo {
+    lat: f32,
+    lng: f32,
+    ids: Vec<u32>,
+    inside: Vec<bool>,
+    len: usize,
+}
+
+impl PipMemo {
+    /// Marks a free slot; polygon ids fit in ID_MASK.
+    const FREE: u32 = u32::MAX;
+    const START_SLOTS: usize = 64;
+
+    fn new(lat: f64, lng: f64) -> Self {
+        PipMemo { lat: lat as f32, lng: lng as f32, ids: vec![Self::FREE; Self::START_SLOTS], inside: vec![false; Self::START_SLOTS], len: 0 }
+    }
+
+    fn slot(&self, poly_id: u32) -> usize {
+        let mask = self.ids.len() - 1;
+        // Fibonacci hashing; the high bits of the product mix every bit of the id.
+        let mut i = (poly_id.wrapping_mul(0x9E37_79B9) >> 16) as usize & mask;
+        while self.ids[i] != Self::FREE && self.ids[i] != poly_id {
+            i = (i + 1) & mask;
+        }
+        i
+    }
+
+    fn admin_pip(&mut self, index: &Index, poly_id: u32, poly: &AdminPolygon) -> bool {
+        let i = self.slot(poly_id);
+        if self.ids[i] == poly_id { return self.inside[i]; }
+        let inside = point_in_encoded_polygon(&index.admin_vertices, poly.vertex_offset, poly.vertex_count, self.lat, self.lng).unwrap_or(false);
+        self.ids[i] = poly_id;
+        self.inside[i] = inside;
+        self.len += 1;
+        if self.len * 2 > self.ids.len() { self.grow(); }
+        inside
+    }
+
+    fn grow(&mut self) {
+        let slots = self.ids.len() * 2;
+        let bigger = PipMemo { lat: self.lat, lng: self.lng, ids: vec![Self::FREE; slots], inside: vec![false; slots], len: self.len };
+        let old = std::mem::replace(self, bigger);
+        for (&id, &inside) in old.ids.iter().zip(&old.inside) {
+            if id == Self::FREE { continue; }
+            let i = self.slot(id);
+            self.ids[i] = id;
+            self.inside[i] = inside;
+        }
+    }
+}
+
 // --- Index data ---
 
 pub struct Index {
@@ -1276,6 +1412,43 @@ impl Index {
         NO_DATA
     }
 
+    /// `lookup_admin_cell_fb` for each of `ids` (NO_DATA where absent). Cells next to each other
+    /// on the map mostly sit close together in the index, so after one binary search each further
+    /// cell, in id order, is found by galloping forward from the previous one.
+    pub fn lookup_admin_cells_fb(cells: &FileBytes, ids: &[u64], out: &mut [u32]) {
+        const STRIDE: u64 = 12;
+        let count = cells.len() / STRIDE;
+        let key = |i: u64| u64::from_le_bytes(cells.read_chunk(i * STRIDE, 8)[..].try_into().unwrap());
+        let mut order: Vec<usize> = (0..ids.len()).collect();
+        order.sort_unstable_by_key(|&k| ids[k]);
+        // Every id not yet looked up has its lower bound at or after `base`.
+        let mut base = 0;
+        for (n, &k) in order.iter().enumerate() {
+            let id = ids[k];
+            let mut end = count;
+            if n > 0 {
+                // Gallop: widen [base, end) until key(end - 1) >= id.
+                let mut step = 1;
+                end = base;
+                loop {
+                    end = (end + step).min(count);
+                    if end == count || key(end - 1) >= id { break; }
+                    base = end;
+                    step *= 2;
+                }
+            }
+            while base < end {
+                let mid = base + (end - base) / 2;
+                if key(mid) < id { base = mid + 1; } else { end = mid; }
+            }
+            out[k] = if base < count && key(base) == id {
+                u32::from_le_bytes(cells.read_chunk(base * STRIDE + 8, 4)[..].try_into().unwrap())
+            } else {
+                NO_DATA
+            };
+        }
+    }
+
     // geo_cells is a 20-byte-stride sorted index — binary search it
     // with read_chunk.
     pub fn lookup_geo_cell_fb(geo_cells: &FileBytes, target: u64) -> GeoCellOffsets {
@@ -1591,8 +1764,9 @@ impl Index {
     }
 
     pub fn debug_places(&self, lat: f64, lng: f64) -> serde_json::Value {
-        let mut admin = self.find_admin(lat, lng);
-        let current_boundaries = self.find_current_boundaries(&mut admin.containment, admin.country_code);
+        let mut admin_scan = AdminScan::new(self, lat, lng);
+        let admin = self.find_admin_in(&mut admin_scan);
+        let current_boundaries = self.find_current_boundaries(&mut admin_scan, admin.country_code);
         let place = self.find_places(PlaceFeature::Point(lat, lng), &current_boundaries, 0);
 
         let place_cells = match &self.place_cells {
@@ -1725,11 +1899,11 @@ impl Index {
     }
 
     pub fn find_admin(&self, lat: f64, lng: f64) -> AdminResult<'_> {
-        // A polygon containing the point always lists the point's own cell in its covering, so
-        // only that cell's polygons can contain it (the neighbours used to be scanned too).
-        let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
-        let mut containment = Containment::at(lat, lng);
+        self.find_admin_in(&mut AdminScan::new(self, lat, lng))
+    }
 
+    /// `find_admin` over a scan the caller may share with the other admin lookups of the point.
+    pub fn find_admin_in(&self, scan: &mut AdminScan) -> AdminResult<'_> {
         // For each admin level, find the smallest-area polygon actually containing
         // the point. Interior flags are used as a fast path for uncontested cells,
         // but PIP is always run when a polygon would win the smallest-area contest
@@ -1737,90 +1911,74 @@ impl Index {
         // (area, id, poly, pip_verified) — owned AdminPolygon values so the
         // backing admin_polygons file can be a chunked source.
         let mut best_by_level: [Option<(f32, u32, AdminPolygon, bool)>; 12] = [None; 12];
-        // Class='place' polygons (admin_level=15 marker).  Stored as
-        // (poly_id, AdminPolygon) so we can dedup by id (the original
-        // pointer-equality dedup doesn't survive owned copies).
+        // Class='place' polygons (admin_level=15 marker) that cover the query point. These
+        // drive the second-nested-check rule (placex_triggers.sql lines 944-963) — Nominatim
+        // uses only these, not admin boundaries with linked_place tags. Kept apart from
+        // best_by_level[]. Stored as (poly_id, AdminPolygon) so we can dedup by id.
         let mut place_area_polygons: Vec<(u32, AdminPolygon)> = Vec::new();
 
-        for c in std::iter::once(cell) {
-            Self::for_each_entry_fb(&self.admin_entries, Self::lookup_admin_cell_fb(&self.admin_cells, c), |id| {
-                // The interior flag on a (cell, polygon) entry proves
-                // containment only for queries INSIDE that cell. Neighbor
-                // cells are iterated for near-miss distance work; honoring
-                // their interior flags claimed containment for points up to
-                // a full cell away (a Dutch query 'inside' a German
-                // naturpark). A polygon truly containing the query always
-                // has the query's own cell in its covering, so this loses
-                // no true positives.
-                let is_interior = c == cell && (id & INTERIOR_FLAG) != 0;
-                let poly_id = id & ID_MASK;
-                let Some(poly) = self.admin_polygon(poly_id) else { return; };
-                let level = poly.admin_level as usize;
-                if level >= 12 { return; }
-                // See debug_admin: ISO-less level-2 polygons (maritime
-                // boundary closed ways) can never name a country.
-                if level == 2 && poly.country_code == 0 { return; }
+        scan.for_each_entry(|pip, in_own_cell, id, poly| {
+            // The interior flag on a (cell, polygon) entry proves
+            // containment only for queries INSIDE that cell; honoring a
+            // neighbour's flag claimed containment for points up to a full
+            // cell away (a Dutch query 'inside' a German naturpark).
+            let is_interior = in_own_cell && (id & INTERIOR_FLAG) != 0;
+            let poly_id = id & ID_MASK;
+            if poly.admin_level == 15 {
                 if poly.area <= 0.0 { return; }
+                if !pip.admin_pip(self, poly_id, &poly) { return; }
+                if !place_area_polygons.iter().any(|(pid, _)| *pid == poly_id) {
+                    place_area_polygons.push((poly_id, poly));
+                }
+                return;
+            }
+            let level = poly.admin_level as usize;
+            if level >= 12 { return; }
+            // See debug_admin: ISO-less level-2 polygons (maritime
+            // boundary closed ways) can never name a country.
+            if level == 2 && poly.country_code == 0 { return; }
+            if poly.area <= 0.0 { return; }
 
-                if let Some((best_area, best_id, best_poly, best_verified)) = best_by_level[level] {
-                    if poly.area >= best_area {
-                        // Larger than current best — skip unless current best is unverified
-                        // and this one can be verified
-                        if !best_verified {
-                            // Current best only passed via interior flag — verify it now
-                            if containment.holds(self, best_id, &best_poly) {
-                                best_by_level[level] = Some((best_area, best_id, best_poly, true));
+            if let Some((best_area, best_id, best_poly, best_verified)) = best_by_level[level] {
+                if poly.area >= best_area {
+                    // Larger than current best — skip unless current best is unverified
+                    // and this one can be verified
+                    if !best_verified {
+                        // Current best only passed via interior flag — verify it now
+                        if pip.admin_pip(self, best_id, &best_poly) {
+                            best_by_level[level] = Some((best_area, best_id, best_poly, true));
+                        } else {
+                            // Best was wrong — try this polygon instead
+                            let inside = pip.admin_pip(self, poly_id, &poly);
+                            if is_interior || inside {
+                                best_by_level[level] = Some((poly.area, poly_id, poly, inside));
                             } else {
-                                // Best was wrong — try this polygon instead
-                                let pip = containment.holds(self, poly_id, &poly);
-                                if is_interior || pip {
-                                    best_by_level[level] = Some((poly.area, poly_id, poly, pip));
-                                } else {
-                                    best_by_level[level] = None;
-                                }
+                                best_by_level[level] = None;
                             }
                         }
-                        return;
                     }
-                    // This polygon is smaller — must verify with PIP
-                    if containment.holds(self, poly_id, &poly) {
-                        best_by_level[level] = Some((poly.area, poly_id, poly, true));
-                    }
-                    // If PIP fails, keep existing best
-                } else {
-                    // No existing candidate — accept with interior flag, verify later if contested
-                    if is_interior {
-                        best_by_level[level] = Some((poly.area, poly_id, poly, false));
-                    } else if containment.holds(self, poly_id, &poly) {
-                        best_by_level[level] = Some((poly.area, poly_id, poly, true));
-                    }
+                    return;
                 }
-            });
-        }
+                // This polygon is smaller — must verify with PIP
+                if pip.admin_pip(self, poly_id, &poly) {
+                    best_by_level[level] = Some((poly.area, poly_id, poly, true));
+                }
+                // If PIP fails, keep existing best
+            } else {
+                // No existing candidate — accept with interior flag, verify later if contested
+                if is_interior {
+                    best_by_level[level] = Some((poly.area, poly_id, poly, false));
+                } else if pip.admin_pip(self, poly_id, &poly) {
+                    best_by_level[level] = Some((poly.area, poly_id, poly, true));
+                }
+            }
+        });
 
         // Verify any uncontested winners that only passed via interior flag
         for level in 0..12 {
             if let Some((area, id, poly, false)) = best_by_level[level] {
-                best_by_level[level] = containment.holds(self, id, &poly).then_some((area, id, poly, true));
+                best_by_level[level] = scan.pip.admin_pip(self, id, &poly).then_some((area, id, poly, true));
             }
-        }
-
-        // Second pass: collect class='place' polygons (admin_level=15 in our
-        // builder's schema) that cover the query point. These drive the
-        // second-nested-check rule (placex_triggers.sql lines 944-963) —
-        // Nominatim uses only these, not admin boundaries with linked_place
-        // tags. Kept in a separate vec so we don't disturb best_by_level[].
-        for c in std::iter::once(cell) {
-            Self::for_each_entry_fb(&self.admin_entries, Self::lookup_admin_cell_fb(&self.admin_cells, c), |id| {
-                let poly_id = id & ID_MASK;
-                let Some(poly) = self.admin_polygon(poly_id) else { return; };
-                if poly.admin_level != 15 { return; }
-                if poly.area <= 0.0 { return; }
-                if !containment.holds(self, poly_id, &poly) { return; }
-                if !place_area_polygons.iter().any(|(pid, _)| *pid == poly_id) {
-                    place_area_polygons.push((poly_id, poly));
-                }
-            });
         }
 
         let mut result = AdminResult::default();
@@ -1996,7 +2154,6 @@ impl Index {
         result.quarter        = best_by_field[15].as_ref().map(|c| c.name);
         result.neighbourhood  = best_by_field[16].as_ref().map(|c| c.name);
         result.city_block     = best_by_field[17].as_ref().map(|c| c.name);
-        result.containment = containment;
 
         result
     }
@@ -2016,37 +2173,31 @@ impl Index {
     // tried first, and a polygon's point on surface stands in for its
     // centroid. The rank is placex's rank_address, after the nested-boundary
     // promotions (CurrentBoundaries::from_ranked). They are found at the
-    // point of `containment`, which keeps the polygons find_admin tested
-    // there from being decoded again.
-    pub fn find_current_boundaries(&self, containment: &mut Containment, country_code: Option<[u8; 2]>) -> CurrentBoundaries {
+    // point of `scan`, which keeps the polygons find_admin tested there from
+    // being tested again.
+    pub fn find_current_boundaries(&self, scan: &mut AdminScan, country_code: Option<[u8; 2]>) -> CurrentBoundaries {
         let cc: String = country_code
             .map(|c| c.iter().map(|b| b.to_ascii_uppercase() as char).collect())
             .unwrap_or_default();
-        let (lat, lng) = containment.point;
-        let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
-        let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
 
         // (area, id, polygon) of every boundary and place area near the point.
         let mut boundaries: Vec<(f32, u32, AdminPolygon)> = Vec::new();
         let mut place_areas: Vec<(f32, u32, AdminPolygon)> = Vec::new();
-        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            Self::for_each_entry_fb(&self.admin_entries, Self::lookup_admin_cell_fb(&self.admin_cells, c), |id| {
-                let poly_id = id & ID_MASK;
-                let Some(poly) = self.admin_polygon(poly_id) else { return; };
-                if poly.area <= 0.0 { return; }
-                match poly.admin_level {
-                    // ISO-less level-2 polygons are maritime lines, not countries.
-                    2 if poly.country_code == 0 => {}
-                    2..=10 => boundaries.push((poly.area, poly_id, poly)),
-                    15 if poly.place_type_override != 0 => place_areas.push((poly.area, poly_id, poly)),
-                    _ => {}
-                }
-            });
-        }
+        scan.for_each_entry(|_, _, id, poly| {
+            let poly_id = id & ID_MASK;
+            if poly.area <= 0.0 { return; }
+            match poly.admin_level {
+                // ISO-less level-2 polygons are maritime lines, not countries.
+                2 if poly.country_code == 0 => {}
+                2..=10 => boundaries.push((poly.area, poly_id, poly)),
+                15 if poly.place_type_override != 0 => place_areas.push((poly.area, poly_id, poly)),
+                _ => {}
+            }
+        });
         let mut holding = |mut polys: Vec<(f32, u32, AdminPolygon)>| -> Vec<AdminPolygon> {
             polys.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
             polys.dedup_by_key(|p| p.1);
-            polys.into_iter().filter(|(_, id, poly)| containment.holds(self, *id, poly)).map(|(_, _, poly)| poly).collect()
+            polys.into_iter().filter(|(_, id, poly)| scan.pip.admin_pip(self, *id, poly)).map(|(_, _, poly)| poly).collect()
         };
         let ranked: Vec<RankedPoly> = holding(boundaries).into_iter()
             .map(|poly| RankedPoly { poly, rank_address: self.admin_config.to_rank(&cc, poly.admin_level) })
@@ -2477,9 +2628,13 @@ impl Index {
     // in the result, avoiding the false-positive EXTRAs from
     // the pure PIP approach.
     pub fn find_admin_from_chain(&self, start_poly_id: u32, lat: f64, lng: f64) -> AdminResult<'_> {
+        self.find_admin_from_chain_in(start_poly_id, &mut AdminScan::new(self, lat, lng))
+    }
+
+    pub fn find_admin_from_chain_in(&self, start_poly_id: u32, scan: &mut AdminScan) -> AdminResult<'_> {
         let admin_parents = match &self.admin_parents {
             Some(m) => m,
-            None => return self.find_admin(lat, lng),
+            None => return self.find_admin_in(scan),
         };
         let parents_count = admin_parents.len() / 4;
         let total_polys = self.admin_polygons.len() / std::mem::size_of::<AdminPolygon>() as u64;
@@ -2497,19 +2652,14 @@ impl Index {
         // Also collect class='place' polygons (admin_level=15) via
         // PIP from the query point — these aren't in the parent chain
         // but provide place-area rank promotions.
-        let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
-        let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
         let mut place_area_polygons: Vec<AdminPolygon> = Vec::new();
-        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            Self::for_each_entry_fb(&self.admin_entries, Self::lookup_admin_cell_fb(&self.admin_cells, c), |id| {
-                let poly_id = id & 0x7FFFFFFF;
-                let Some(poly) = self.admin_polygon(poly_id) else { return; };
-                if poly.admin_level != 15 { return; }
-                if poly.area <= 0.0 { return; }
-                if !self.admin_pip(&poly, lat, lng) { return; }
-                place_area_polygons.push(poly);
-            });
-        }
+        scan.for_each_entry(|pip, _, id, poly| {
+            let poly_id = id & ID_MASK;
+            if poly.admin_level != 15 { return; }
+            if poly.area <= 0.0 { return; }
+            if !pip.admin_pip(self, poly_id, &poly) { return; }
+            place_area_polygons.push(poly);
+        });
 
         // Now build the same ranked structure as find_admin
         let mut result = AdminResult::default();
@@ -2754,7 +2904,7 @@ impl Index {
 
     // --- Combined query ---
 
-    fn resolve_admin(&self, lat: f64, lng: f64, street: Option<&(f64, WayHeader, u32)>) -> AdminResult<'_> {
+    fn resolve_admin(&self, scan: &mut AdminScan, lat: f64, lng: f64, street: Option<&(f64, WayHeader, u32)>) -> AdminResult<'_> {
         // Hybrid admin resolution: when the primary is a street with a
         // pre-computed parent polygon, walk its admin_parents chain for
         // coarse ranks (country → city) and use PIP for finer ranks
@@ -2766,7 +2916,7 @@ impl Index {
         // street's centroid often sits in a different suburb polygon
         // than the query point — chain walk would then pick the
         // centroid-containing suburb rather than the query's suburb.
-        let admin_pip = self.find_admin(lat, lng);
+        let admin_pip = self.find_admin_in(scan);
         let admin_chain = (|| -> Option<AdminResult<'_>> {
             let wp = self.way_parents.as_ref()?;
             let (_, _, way_idx) = street?;
@@ -2777,7 +2927,7 @@ impl Index {
             let pbytes = wp.read_chunk(off, 4);
             let start = u32::from_le_bytes(pbytes[..].try_into().unwrap());
             if start == NO_DATA { return None; }
-            Some(self.find_admin_from_chain(start, lat, lng))
+            Some(self.find_admin_from_chain_in(start, scan))
         })();
         // Nominatim's answer puts, at each rank, a boundary holding the
         // result's centroid (for a street its ST_ClosestPoint to the query)
@@ -2832,7 +2982,6 @@ impl Index {
                 city_block: admin_pip.city_block,
                 // The place-node ranks (16 and up) are PIP's.
                 boundary_ranks: admin_pip.boundary_ranks,
-                containment: admin_pip.containment,
             },
             None => admin_pip,
         }
@@ -2914,10 +3063,12 @@ impl Index {
         // Run geo lookups first so we know the primary street
         let (addr, interp, street) = self.query_geo(lat, lng);
 
-        let mut admin = self.resolve_admin(lat, lng, street.as_ref());
+        // One admin cell scan serves every admin lookup at the point.
+        let mut admin_scan = AdminScan::new(self, lat, lng);
+        let admin = self.resolve_admin(&mut admin_scan, lat, lng, street.as_ref());
         // The boundaries place nodes must sit inside to be accepted in the
         // address walk (Nominatim's `current_boundary`).
-        let current_boundaries = self.find_current_boundaries(&mut admin.containment, admin.country_code);
+        let current_boundaries = self.find_current_boundaries(&mut admin_scan, admin.country_code);
         // address_havelevel: the ranks the address's boundaries hold take no
         // place node. A boundary-derived city/town/village covers rank 16
         // whatever its rank, so place nodes must not fill (or fuzzy-anchor
@@ -4121,33 +4272,108 @@ pub fn point_in_polygon(lat: f32, lng: f32, vertices: &[NodeCoord]) -> bool {
 
 /// `point_in_polygon` over a polygon's encoded vertices (the layout `decode_polygon_verts`
 /// reads), decoding one vertex at a time to the same f32 values: no allocation, one pass. None
-/// exactly where `decode_polygon_verts` is None.
+/// exactly where `decode_polygon_verts` is None. A point the header's bounds already exclude is
+/// answered without reading the vertices.
 pub fn point_in_encoded_polygon(src: &FileBytes, vertex_offset: u32, vertex_count: u32, lat: f32, lng: f32) -> Option<bool> {
     if vertex_count == 0 || vertex_offset == NO_DATA { return None; }
     let off = vertex_offset as u64;
     if off + POLY_HEADER_BYTES > src.len() { return None; }
     let header = src.read_chunk(off, POLY_HEADER_BYTES as usize);
     let encoding = header[0];
-    let bmin_lat = f32::from_le_bytes(header[2..6].try_into().unwrap()) as f64;
-    let bmin_lng = f32::from_le_bytes(header[6..10].try_into().unwrap()) as f64;
+    let bmin_lat32 = f32::from_le_bytes(header[2..6].try_into().unwrap());
+    let bmin_lng32 = f32::from_le_bytes(header[6..10].try_into().unwrap());
     drop(header);
     let stride = vertex_stride(encoding);
     let n = vertex_count as usize;
     let verts_off = off + POLY_HEADER_BYTES;
     if verts_off + (n * stride) as u64 > src.len() { return None; }
+    if ring_bounds_exclude(encoding, bmin_lat32, bmin_lng32, lat, lng) { return Some(false); }
+    let (bmin_lat, bmin_lng) = (bmin_lat32 as f64, bmin_lng32 as f64);
     let bytes = src.read_chunk(verts_off, n * stride);
     let scale = vertex_scale(encoding);
-    let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[i], b[i + 1]]) as f64;
+    let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[i], b[i + 1]]) as i64;
     let u32_at = |b: &[u8], i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
     Some(match encoding {
         4 => pip_vertices(&bytes, 8, lat, lng, |b| (f32::from_bits(u32_at(b, 0)), f32::from_bits(u32_at(b, 4)))),
-        3 => pip_vertices(&bytes, 8, lat, lng, |b| {
-            ((bmin_lat + u32_at(b, 0) as f64 * scale) as f32, (bmin_lng + u32_at(b, 4) as f64 * scale) as f32)
-        }),
-        _ => pip_vertices(&bytes, 4, lat, lng, |b| {
-            ((bmin_lat + u16_at(b, 0) * scale) as f32, (bmin_lng + u16_at(b, 2) * scale) as f32)
-        }),
+        3 => pip_grid(&bytes, 8, lat, lng, bmin_lat, bmin_lng, scale, u32::MAX as i64, |b| (u32_at(b, 0) as i64, u32_at(b, 4) as i64)),
+        _ => pip_grid(&bytes, 4, lat, lng, bmin_lat, bmin_lng, scale, u16::MAX as i64, |b| (u16_at(b, 0), u16_at(b, 2))),
     })
+}
+
+/// Largest k in -1..=k_max with `(base + k * scale) as f32 <= x`; -1 when even k = 0 decodes
+/// above x. The decoded value is monotone in k (every step rounds monotonically), so a vertex
+/// whose k is in 0..=k_max decodes above x exactly when its k is above this. Comparisons with NaN
+/// are false: a NaN x or base gives k_max, no vertex above x. The search gallops out from the
+/// estimate, so any x (±inf, NaN, far off the grid) takes a few dozen steps at most.
+#[inline]
+pub fn grid_threshold(x: f32, base: f64, scale: f64, k_max: i64) -> i64 {
+    let above = |k: i64| (base + k as f64 * scale) as f32 > x;
+    let estimate = ((x as f64 - base) / scale).floor();
+    // `as` saturates to the i64 range, and would turn NaN into 0.
+    let start = if estimate.is_nan() { k_max } else { (estimate as i64).clamp(-1, k_max) };
+    // Bracket the answer: lo is -1 or not above x, hi is above x or k_max + 1.
+    let (mut lo, mut hi) = (start, start + 1);
+    let mut step = 1;
+    while lo >= 0 && above(lo) {
+        hi = lo;
+        lo = (lo - step).max(-1);
+        step *= 2;
+    }
+    step = 1;
+    while hi <= k_max && !above(hi) {
+        lo = hi;
+        hi = (hi + step).min(k_max + 1);
+        step *= 2;
+    }
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if above(mid) { hi = mid } else { lo = mid }
+    }
+    lo
+}
+
+/// `pip_vertices` over quantized vertices (k_lat, k_lng) in 0..=k_max that decode to `(bmin + k *
+/// scale) as f32`: the straddle test compares integers against `grid_threshold` of the point's
+/// longitude, and only the straddling edges decode, to the same values, so the answer is the same.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn pip_grid(bytes: &[u8], stride: usize, lat: f32, lng: f32, bmin_lat: f64, bmin_lng: f64, scale: f64, k_max: i64,
+            at: impl Fn(&[u8]) -> (i64, i64)) -> bool {
+    let t = grid_threshold(lng, bmin_lng, scale, k_max);
+    let decode = |k_lat: i64, k_lng: i64| ((bmin_lat + k_lat as f64 * scale) as f32, (bmin_lng + k_lng as f64 * scale) as f32);
+    let n = bytes.len() / stride;
+    let mut inside = false;
+    let (mut kj_lat, mut kj_lng) = at(&bytes[(n - 1) * stride..]);
+    for c in bytes.chunks_exact(stride) {
+        let (ki_lat, ki_lng) = at(c);
+        if (ki_lng > t) != (kj_lng > t) {
+            let (vi_lat, vi_lng) = decode(ki_lat, ki_lng);
+            let (vj_lat, vj_lng) = decode(kj_lat, kj_lng);
+            if lat < (vj_lat - vi_lat) * (lng - vi_lng) / (vj_lng - vi_lng) + vi_lat {
+                inside = !inside;
+            }
+        }
+        kj_lat = ki_lat;
+        kj_lng = ki_lng;
+    }
+    inside
+}
+
+/// True when `point_in_polygon` on a ring of encoding `enc` with header bbox minimum
+/// (`bmin_lat`, `bmin_lng`) is false at (`lat`, `lng`) whatever the vertices. Encodings 0-3 decode
+/// every vertex to `(bmin + k * scale) as f32` with k >= 0, so no vertex is below the minimum; the
+/// u16 encodings 0-2 also bound k by 65535. Outside the bounds in longitude, no edge straddles the
+/// point's meridian. Outside them in latitude, every straddling edge crosses north of the point
+/// (or none does), and a closed ring has an even number of straddling edges.
+fn ring_bounds_exclude(enc: u8, bmin_lat: f32, bmin_lng: f32, lat: f32, lng: f32) -> bool {
+    if enc > 3 { return false; }
+    if lng < bmin_lng { return true; }
+    let latitude_test = lng.abs() >= PIP_LAT_BOUND_MIN_ABS_LNG;
+    if latitude_test && lat < bmin_lat - PIP_LAT_BOUND_SLACK_DEG { return true; }
+    if enc == 3 { return false; }
+    let span = U16_VERTEX_MAX_STEPS * vertex_scale(enc);
+    let (bmax_lat, bmax_lng) = ((bmin_lat as f64 + span) as f32, (bmin_lng as f64 + span) as f32);
+    lng > bmax_lng || (latitude_test && lat > bmax_lat + PIP_LAT_BOUND_SLACK_DEG)
 }
 
 /// The `point_in_polygon` ray cast over packed vertices of one encoding (`at` decodes one).
@@ -4739,39 +4965,6 @@ pub struct AdminResult<'a> {
     /// rank_address of the boundaries in the address, a bit per rank: the
     /// ranks they take before any place node (address_havelevel).
     pub boundary_ranks: u32,
-    /// The admin polygons find_admin tested at its point.
-    pub containment: Containment,
-}
-
-/// Which admin polygons hold one point, each ray-cast once:
-/// find_admin and find_current_boundaries test the same polygons near the
-/// same point.
-#[derive(Default)]
-pub struct Containment {
-    /// (lat, lng) of the point.
-    pub point: (f64, f64),
-    /// (polygon id, holds the point) of the polygons tested so far, by id.
-    tested: Vec<(u32, bool)>,
-}
-
-impl Containment {
-    pub fn at(lat: f64, lng: f64) -> Self {
-        Self { point: (lat, lng), tested: Vec::new() }
-    }
-
-    /// Whether admin polygon `id` holds the point; a polygon that doesn't
-    /// decode holds nothing.
-    pub fn holds(&mut self, index: &Index, id: u32, poly: &AdminPolygon) -> bool {
-        let slot = match self.tested.binary_search_by_key(&id, |&(tested, _)| tested) {
-            Ok(k) => return self.tested[k].1,
-            Err(k) => k,
-        };
-
-        let (lat, lng) = self.point;
-        let holds = index.admin_pip(poly, lat, lng);
-        self.tested.insert(slot, (id, holds));
-        holds
-    }
 }
 
 impl AdminResult<'_> {
@@ -6701,22 +6894,22 @@ mod query_path_tests {
     }
 
     #[test]
-    fn containment_tests_each_polygon_once() {
+    fn pip_memo_tests_each_polygon_once() {
         let index = TestIndex::new().boundary("Town", 8, 0, (-1000.0, -1000.0, 1000.0, 1000.0)).load();
         let town = index.admin_polygon(1).unwrap();
         let vertexless = AdminPolygon { vertex_count: 0, ..town };
         let p = at(0.0, 0.0);
-        let mut containment = Containment::at(p.lat as f64, p.lng as f64);
-        assert!(containment.holds(&index, 1, &town));
+        let mut memo = PipMemo::new(p.lat as f64, p.lng as f64);
+        assert!(memo.admin_pip(&index, 1, &town));
         // Asked again, the first answer stands: nothing is decoded.
-        assert!(containment.holds(&index, 1, &vertexless));
-        assert!(!Containment::at(p.lat as f64, p.lng as f64).holds(&index, 1, &vertexless));
+        assert!(memo.admin_pip(&index, 1, &vertexless));
+        assert!(!PipMemo::new(p.lat as f64, p.lng as f64).admin_pip(&index, 1, &vertexless));
     }
 
     #[test]
     fn current_boundaries_reuse_what_find_admin_tested() {
-        // The boundaries at the point are the same with find_admin's
-        // containment as with a fresh one.
+        // The boundaries at the point are the same over find_admin's scan
+        // as over a fresh one.
         let index = TestIndex::new()
             .boundary("Suburbia", 6, 4, (-5000.0, -5000.0, 5000.0, 5000.0))
             .boundary("Inner", 7, 0, (-1000.0, -1000.0, 1000.0, 1000.0))
@@ -6725,9 +6918,10 @@ mod query_path_tests {
         let names = |found: CurrentBoundaries| found.gates.map(|g| g.map(|p| index.get_string(p.name_id)));
         for (north, east) in [(0.0, 0.0), (2000.0, 0.0), (0.0, 4000.0), (-2000.0, -2000.0)] {
             let p = at(north, east);
-            let mut admin = index.find_admin(p.lat as f64, p.lng as f64);
-            let shared = index.find_current_boundaries(&mut admin.containment, admin.country_code);
-            let fresh = index.find_current_boundaries(&mut Containment::at(p.lat as f64, p.lng as f64), admin.country_code);
+            let mut scan = AdminScan::new(&index, p.lat as f64, p.lng as f64);
+            let admin = index.find_admin_in(&mut scan);
+            let shared = index.find_current_boundaries(&mut scan, admin.country_code);
+            let fresh = index.find_current_boundaries(&mut AdminScan::new(&index, p.lat as f64, p.lng as f64), admin.country_code);
             assert_eq!(names(shared), names(fresh), "({north}, {east})");
         }
     }
@@ -6746,5 +6940,568 @@ mod query_path_tests {
         assert_eq!(address["suburb"], "Daan");
         assert_eq!(address["neighbourhood"], "Ward");
         assert_eq!(address.get("hamlet"), None);
+    }
+}
+
+#[cfg(test)]
+mod encoded_pip_tests {
+    use super::*;
+
+    /// xorshift64*: deterministic test values without a dependency.
+    pub(crate) struct Rng(u64);
+    impl Rng {
+        pub(crate) fn new(seed: u64) -> Self { Rng(seed.max(1)) }
+        pub(crate) fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        /// Uniform in [lo, hi).
+        pub(crate) fn range(&mut self, lo: f64, hi: f64) -> f64 {
+            lo + (self.next() >> 11) as f64 / (1u64 << 53) as f64 * (hi - lo)
+        }
+    }
+
+    /// One ring packed as the builder lays it out in admin_vertices.bin: the 10-byte header
+    /// (encoding, pad, bbox minimum as f32) and the vertices at the encoding's stride.
+    pub(crate) fn pack_ring(enc: u8, ring: &[(f64, f64)]) -> Vec<u8> {
+        let scale = vertex_scale(enc);
+        let min = |f: fn(&(f64, f64)) -> f64| ring.iter().map(f).fold(f64::MAX, f64::min);
+        // One step below the minimum keeps every delta non-negative after f32 rounding.
+        let (bmin_lat, bmin_lng) = if enc == 4 { (0.0, 0.0) } else { ((min(|v| v.0) - scale) as f32, (min(|v| v.1) - scale) as f32) };
+        let mut buf = vec![enc, 0];
+        buf.extend_from_slice(&bmin_lat.to_le_bytes());
+        buf.extend_from_slice(&bmin_lng.to_le_bytes());
+        for &(lat, lng) in ring {
+            let step = |v: f64, b: f32| ((v - b as f64) / scale).round();
+            match enc {
+                4 => {
+                    buf.extend_from_slice(&(lat as f32).to_le_bytes());
+                    buf.extend_from_slice(&(lng as f32).to_le_bytes());
+                }
+                3 => {
+                    buf.extend_from_slice(&(step(lat, bmin_lat) as u32).to_le_bytes());
+                    buf.extend_from_slice(&(step(lng, bmin_lng) as u32).to_le_bytes());
+                }
+                _ => {
+                    assert!(step(lat, bmin_lat).max(step(lng, bmin_lng)) <= u16::MAX as f64, "ring too wide for encoding {enc}");
+                    buf.extend_from_slice(&(step(lat, bmin_lat) as u16).to_le_bytes());
+                    buf.extend_from_slice(&(step(lng, bmin_lng) as u16).to_le_bytes());
+                }
+            }
+        }
+        buf
+    }
+
+    /// A random simple ring: vertices at increasing angles around a centre, random radii.
+    fn star_ring(rng: &mut Rng, lat: f64, lng: f64, radius: f64) -> Vec<(f64, f64)> {
+        let n = 3 + (rng.next() % 30) as usize;
+        let mut angles: Vec<f64> = (0..n).map(|_| rng.range(0.0, std::f64::consts::TAU)).collect();
+        angles.sort_by(f64::total_cmp);
+        angles.iter().map(|a| (lat + radius * rng.range(0.2, 1.0) * a.sin(), lng + radius * rng.range(0.2, 1.0) * a.cos())).collect()
+    }
+
+    // Ring widths (degrees) each encoding can hold: u16 deltas cap the encodings 0-2.
+    const WIDTH_BY_ENCODING: [f64; 5] = [0.3, 3.0, 0.03, 20.0, 20.0];
+
+    #[test]
+    fn point_in_encoded_polygon_matches_the_decoded_ray_cast() {
+        let mut rng = Rng::new(20261019);
+        for enc in 0u8..=4 {
+            let radius = WIDTH_BY_ENCODING[enc as usize] / 2.0;
+            let mut inside = 0;
+            for _ in 0..300 {
+                let (clat, clng) = (rng.range(-80.0, 80.0), rng.range(-170.0, 170.0));
+                let ring = star_ring(&mut rng, clat, clng, radius);
+                let src = FileBytes::Owned(pack_ring(enc, &ring));
+                let n = ring.len() as u32;
+                let verts = decode_polygon_verts(&src, 0, n).unwrap();
+                for k in 0..40 {
+                    // Mostly points around the ring; some on a vertex's latitude or longitude.
+                    let mut lat = rng.range(clat - 1.5 * radius, clat + 1.5 * radius);
+                    let mut lng = rng.range(clng - 1.5 * radius, clng + 1.5 * radius);
+                    let v = verts[k % verts.len()];
+                    if k % 5 == 1 { lat = v.lat as f64; }
+                    if k % 5 == 2 { lng = v.lng as f64; }
+                    let want = point_in_polygon(lat as f32, lng as f32, &verts);
+                    assert_eq!(point_in_encoded_polygon(&src, 0, n, lat as f32, lng as f32), Some(want), "enc {enc} ring {ring:?} point {lat} {lng}");
+                    inside += want as usize;
+                }
+            }
+            // Both answers are exercised.
+            assert!(inside > 1000 && inside < 11000, "enc {enc}: {inside} of 12000 inside");
+        }
+    }
+
+    #[test]
+    fn ring_bounds_exclude_only_points_the_ray_cast_puts_outside() {
+        let mut rng = Rng::new(7);
+        let mut excluded = [0usize; 4];
+        for enc in 0u8..=3 {
+            let scale = vertex_scale(enc);
+            // Nearly every u16 step (the f32 bbox minimum sits up to a few steps below the ring),
+            // so the extent bound is exercised at its limit.
+            let width = if enc == 3 { 5.0 } else { (u16::MAX - 20) as f64 * scale };
+            for _ in 0..200 {
+                let (lat0, lng0) = (rng.range(-80.0, 75.0), rng.range(-175.0, 170.0));
+                // A square spanning the full width, each side's midpoint pushed in a little.
+                let (lat1, lng1) = (lat0 + width, lng0 + width);
+                let (mid_lat, mid_lng) = (lat0 + width / 2.0, lng0 + width / 2.0);
+                let mut dent = || rng.range(0.0, 0.1) * width;
+                let ring = vec![
+                    (lat0, lng0), (lat0 + dent(), mid_lng), (lat0, lng1), (mid_lat, lng1 - dent()),
+                    (lat1, lng1), (lat1 - dent(), mid_lng), (lat1, lng0), (mid_lat, lng0 + dent()),
+                ];
+                let src = FileBytes::Owned(pack_ring(enc, &ring));
+                let verts = decode_polygon_verts(&src, 0, ring.len() as u32).unwrap();
+                let h = src.read_chunk(0, POLY_HEADER_BYTES as usize);
+                let (bmin_lat, bmin_lng) = (f32::from_le_bytes(h[2..6].try_into().unwrap()), f32::from_le_bytes(h[6..10].try_into().unwrap()));
+                for _ in 0..50 {
+                    // Points within 0.01 degrees of a bbox side, in both directions.
+                    let near = |rng: &mut Rng, lo: f64, hi: f64| if rng.next() % 2 == 0 { lo + rng.range(-0.01, 0.01) } else { hi + rng.range(-0.01, 0.01) };
+                    let (lat, lng) = match rng.next() % 3 {
+                        0 => (near(&mut rng, lat0, lat0 + width), rng.range(lng0, lng0 + width)),
+                        1 => (rng.range(lat0, lat0 + width), near(&mut rng, lng0, lng0 + width)),
+                        _ => (near(&mut rng, lat0, lat0 + width), near(&mut rng, lng0, lng0 + width)),
+                    };
+                    let (lat, lng) = (lat as f32, lng as f32);
+                    if ring_bounds_exclude(enc, bmin_lat, bmin_lng, lat, lng) {
+                        excluded[enc as usize] += 1;
+                        assert!(!point_in_polygon(lat, lng, &verts), "enc {enc} excluded a point inside: {lat} {lng}");
+                        assert_eq!(point_in_encoded_polygon(&src, 0, ring.len() as u32, lat, lng), Some(false));
+                    }
+                }
+            }
+        }
+        assert!(excluded.iter().all(|&n| n > 1000), "{excluded:?}");
+        // The legacy f32 encoding carries no usable bounds.
+        assert!(!ring_bounds_exclude(4, 10.0, 10.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn ring_bounds_exclude_skips_the_latitude_test_at_the_zero_meridian() {
+        assert!(ring_bounds_exclude(3, 10.0, -1.0, 9.0, 0.5));
+        assert!(!ring_bounds_exclude(3, 10.0, -1.0, 9.0, 0.0));
+        assert!(!ring_bounds_exclude(3, 10.0, -1.0, 9.0, 1e-35));
+        // The longitude test holds everywhere.
+        assert!(ring_bounds_exclude(3, 10.0, 1e-30, 9.0, 0.0));
+    }
+
+    #[test]
+    fn grid_threshold_splits_the_decoded_values_at_the_point() {
+        let mut rng = Rng::new(31);
+        for enc in 0u8..=3 {
+            let (scale, k_max) = (vertex_scale(enc), k_max(enc));
+            for _ in 0..5000 {
+                // Near 180 degrees an f32 step spans many grid steps (enc 3: about 150).
+                let base = rng.range(-180.0, 179.9) as f32 as f64;
+                let decode = |k: i64| (base + k as f64 * scale) as f32;
+                let k = (rng.next() % 70_000) as i64 - 1_000;
+                let x = match rng.next() % 4 {
+                    0 => decode(k),
+                    1 => (decode(k) as f64 - scale / 3.0) as f32,
+                    2 => (decode(k) as f64 + scale / 3.0) as f32,
+                    _ => (base + rng.range(-0.1, 70_000.0 * scale)) as f32,
+                };
+                let t = grid_threshold(x, base, scale, k_max);
+                assert!((-1..=k_max).contains(&t), "enc {enc} base {base} x {x} t {t}");
+                assert!((t < 0 || decode(t) <= x) && (t == k_max || decode(t + 1) > x), "enc {enc} base {base} x {x} t {t}");
+            }
+        }
+    }
+
+    /// The largest delta of an encoding: u32 for 3, u16 for 0-2 and the tags `pip_grid` reads as u16.
+    fn k_max(enc: u8) -> i64 {
+        if enc == 3 { u32::MAX as i64 } else { u16::MAX as i64 }
+    }
+
+    /// f32 coordinates a caller can hand `query_json` (it narrows f64 input with `as f32`): NaN,
+    /// the infinities, the largest finite values, values past the enc 3 grid's i64 range (beyond
+    /// 9.22e11 degrees) or on its widest f32 plateaus, the edges of the valid range, signed zeros
+    /// and subnormals.
+    const EXTREME: [f32; 26] = [
+        f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::MAX, -f32::MAX, 1_099_511_627_776.0, -1_099_511_627_776.0,
+        1e12, -1e12, 9.3e11, 1e9, -1e9, 1e6, -1e6, 360.0, -360.0, 180.0, -180.0, 90.0, -90.0, 0.0, -0.0,
+        f32::MIN_POSITIVE, -f32::MIN_POSITIVE, 1e-45, -1e-45,
+    ];
+
+    #[test]
+    fn grid_threshold_splits_the_decoded_values_for_any_input() {
+        let mut rng = Rng::new(5);
+        // Scale 0.0 is what `vertex_scale` gives a tag other than 0-4; the bases include ones only
+        // a damaged header holds.
+        let scales = [vertex_scale(0), vertex_scale(1), vertex_scale(2), vertex_scale(3), 0.0];
+        let bases = [-180.0, -0.5, 0.0, 25.0, 179.9, f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::MAX, 1e30];
+        for (s, &scale) in scales.iter().enumerate() {
+            let k_max = k_max(s as u8);
+            for &base in &bases {
+                let base = base as f64;
+                for &x in EXTREME.iter().chain(&[base as f32, (base + 1e-3) as f32, (base + 0.25) as f32]) {
+                    let t = grid_threshold(x, base, scale, k_max);
+                    assert!((-1..=k_max).contains(&t), "scale {scale} base {base} x {x} t {t}");
+                    let probes = [0, 1, k_max - 1, k_max, t, t + 1, (rng.next() % (k_max as u64 + 1)) as i64];
+                    for k in probes.into_iter().filter(|k| (0..=k_max).contains(k)) {
+                        let decoded = (base + k as f64 * scale) as f32;
+                        assert_eq!(decoded > x, k > t, "scale {scale} base {base} x {x} t {t} k {k}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn point_in_encoded_polygon_matches_the_decoded_ray_cast_at_extreme_coordinates() {
+        let mut rng = Rng::new(20261020);
+        let mut rings: Vec<(u8, Vec<u8>, u32)> = Vec::new();
+        for enc in 0u8..=4 {
+            let w = WIDTH_BY_ENCODING[enc as usize].min(1.0);
+            let mut shapes = vec![
+                // The unit square at the origin (as wide as the encoding holds).
+                vec![(0.0, 0.0), (0.0, w), (w, w), (w, 0.0)],
+                // At the antimeridian, from either side, and at the poles.
+                vec![(-w / 2.0, 180.0 - w), (w / 2.0, 180.0 - w), (0.0, 180.0)],
+                vec![(-w / 2.0, -180.0), (0.0, -180.0 + w), (w / 2.0, -180.0)],
+                vec![(90.0 - w, 180.0 - w), (90.0, 180.0 - w), (90.0, 180.0)],
+                vec![(-90.0, -180.0), (-90.0, -180.0 + w), (-90.0 + w, -180.0 + w)],
+            ];
+            for _ in 0..20 {
+                let (lat, lng) = (rng.range(-80.0, 80.0), rng.range(-170.0, 170.0));
+                shapes.push(star_ring(&mut rng, lat, lng, w / 2.0));
+            }
+            rings.extend(shapes.iter().map(|s| (enc, pack_ring(enc, s), s.len() as u32)));
+        }
+        // A tag the reader does not know (vertex_scale 0.0): every vertex decodes to the minimum.
+        let mut unknown = vec![7, 0];
+        unknown.extend_from_slice(&0.5f32.to_le_bytes());
+        unknown.extend_from_slice(&0.5f32.to_le_bytes());
+        unknown.extend((0..4 * 8).map(|_| rng.next() as u8));
+        rings.push((7, unknown, 4));
+
+        let mut inside = [0usize; 8];
+        for (enc, ring, n) in &rings {
+            let src = FileBytes::Owned(ring.clone());
+            let verts = decode_polygon_verts(&src, 0, *n).unwrap();
+            let shape: Vec<(f32, f32)> = verts.iter().map(|v| (v.lat, v.lng)).collect();
+            // A vertex and the vertex centroid of the ring, next to every extreme value.
+            let centre = |f: fn(&NodeCoord) -> f32| verts.iter().map(f).sum::<f32>() / verts.len() as f32;
+            let lats: Vec<f32> = EXTREME.iter().copied().chain([verts[0].lat, centre(|v| v.lat)]).collect();
+            let lngs: Vec<f32> = EXTREME.iter().copied().chain([verts[0].lng, centre(|v| v.lng)]).collect();
+            for &lat in &lats {
+                for &lng in &lngs {
+                    let want = point_in_polygon(lat, lng, &verts);
+                    assert_eq!(point_in_encoded_polygon(&src, 0, *n, lat, lng), Some(want), "enc {enc} ring {shape:?} point {lat} {lng}");
+                    inside[*enc as usize] += want as usize;
+                }
+            }
+        }
+        // Each known encoding has points inside some ring (the centroids of the convex ones).
+        assert!(inside[..5].iter().all(|&n| n > 0), "{inside:?}");
+    }
+
+    #[test]
+    fn point_in_encoded_polygon_is_none_where_decoding_is() {
+        let ring = [(10.0, 10.0), (10.0, 10.1), (10.1, 10.05)];
+        let src = FileBytes::Owned(pack_ring(0, &ring));
+        assert_eq!(point_in_encoded_polygon(&src, 0, 0, 10.05, 10.05), None);
+        assert_eq!(point_in_encoded_polygon(&src, NO_DATA, 3, 10.05, 10.05), None);
+        assert_eq!(point_in_encoded_polygon(&src, 1000, 3, 10.05, 10.05), None);
+        assert_eq!(point_in_encoded_polygon(&src, 0, 4, 10.05, 10.05), None);
+        assert_eq!(point_in_encoded_polygon(&src, 0, 3, 10.03, 10.05), Some(true));
+    }
+
+    #[test]
+    fn point_in_encoded_polygon_reads_the_ring_at_its_offset() {
+        let a = pack_ring(3, &[(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)]);
+        let b = pack_ring(2, &[(5.0, 5.0), (5.0, 5.01), (5.01, 5.01), (5.01, 5.0)]);
+        let src = FileBytes::Owned([a.clone(), b].concat());
+        assert_eq!(point_in_encoded_polygon(&src, 0, 4, 0.5, 0.5), Some(true));
+        assert_eq!(point_in_encoded_polygon(&src, a.len() as u32, 4, 0.5, 0.5), Some(false));
+        assert_eq!(point_in_encoded_polygon(&src, a.len() as u32, 4, 5.005, 5.005), Some(true));
+    }
+}
+
+#[cfg(test)]
+mod admin_scan_tests {
+    use super::encoded_pip_tests::pack_ring;
+    use super::*;
+
+    // A query point on Egypt's side of its 22°N border with Sudan. The builder's S2 covering
+    // follows the great circle between the border's end points, which bows 3.3 km north of the
+    // parallel, so the point's own level-10 cell lists Sudan but not Egypt.
+    const Q: (f64, f64) = (22.002, 27.57);
+
+    struct Ring {
+        name: &'static str,
+        level: u8,
+        country: &'static [u8; 2],
+        place_type: u8,
+        area: f32,
+        verts: Vec<(f64, f64)>,
+        /// (index into `cells()`, interior flag) of every cell the ring is listed in.
+        cells: Vec<(usize, bool)>,
+    }
+
+    fn ring(name: &'static str, level: u8, area: f32, (lat0, lng0, lat1, lng1): (f64, f64, f64, f64), cells: &[(usize, bool)]) -> Ring {
+        let verts = vec![(lat0, lng0), (lat0, lng1), (lat1, lng1), (lat1, lng0)];
+        Ring { name, level, country: b"eg", place_type: 0, area, verts, cells: cells.to_vec() }
+    }
+
+    /// The query's cell, then its neighbours in the order find_admin visits them.
+    fn cells() -> Vec<u64> {
+        let own = cell_id_at_level(Q.0, Q.1, DEFAULT_ADMIN_CELL_LEVEL);
+        std::iter::once(own).chain(cell_neighbors_at_level(own, DEFAULT_ADMIN_CELL_LEVEL)).collect()
+    }
+
+    /// An Index holding only the admin files, laid out as the builder writes them.
+    fn admin_index(rings: &[Ring]) -> Index {
+        let cell_ids = cells();
+        let mut strings = vec![0u8];
+        let mut vertices = Vec::new();
+        let mut polygons = Vec::new();
+        let mut by_cell: std::collections::BTreeMap<u64, Vec<u32>> = Default::default();
+        for (id, r) in rings.iter().enumerate() {
+            let name_id = strings.len() as u32;
+            strings.extend_from_slice(r.name.as_bytes());
+            strings.push(0);
+            let vertex_offset = vertices.len() as u32;
+            vertices.extend(pack_ring(3, &r.verts));
+            polygons.extend_from_slice(&vertex_offset.to_le_bytes());
+            polygons.extend_from_slice(&(r.verts.len() as u32).to_le_bytes());
+            polygons.extend_from_slice(&name_id.to_le_bytes());
+            polygons.extend_from_slice(&[r.level, r.place_type, 0, 0]);
+            polygons.extend_from_slice(&r.area.to_le_bytes());
+            polygons.extend_from_slice(&u16::from_be_bytes(*r.country).to_le_bytes());
+            polygons.extend_from_slice(&[0, 0]);
+            for &(k, interior) in &r.cells {
+                by_cell.entry(cell_ids[k]).or_default().push(id as u32 | if interior { INTERIOR_FLAG } else { 0 });
+            }
+        }
+        assert_eq!(polygons.len(), rings.len() * std::mem::size_of::<AdminPolygon>());
+        let (mut cells, mut entries) = (Vec::new(), Vec::new());
+        for (cell, mut ids) in by_cell {
+            ids.sort_unstable(); // the builder sorts each cell's entries by value
+            cells.extend_from_slice(&cell.to_le_bytes());
+            cells.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+            entries.extend_from_slice(&(ids.len() as u16).to_le_bytes());
+            for id in ids { entries.extend_from_slice(&id.to_le_bytes()); }
+        }
+        let len = strings.len() as u32;
+        Index {
+            geo_cells: None, street_entries: None, street_ways: None, street_nodes: None,
+            addr_entries: None, addr_points: None, addr_vertices: None,
+            interp_entries: None, interp_ways: None, interp_nodes: None, interp_postcodes: None,
+            admin_cells: FileBytes::Owned(cells),
+            admin_entries: FileBytes::Owned(entries),
+            admin_polygons: FileBytes::Owned(polygons),
+            admin_vertices: FileBytes::Owned(vertices),
+            poi_cells: None, poi_entries: None, poi_records: None, poi_vertices: None,
+            poi_meta: PoiMeta { categories: HashMap::new() },
+            place_nodes: None, place_cells: None, place_entries: None,
+            way_parents: None, admin_parents: None, addr_postcodes: None, way_postcodes: None,
+            postal_polygons: None, postal_vertices: None,
+            postcode_centroids: None, postcode_centroid_cells: None, postcode_centroid_entries: None,
+            admin_config: AdminLevelConfig::load(),
+            strings: StringPool::from_parts([Some(FileBytes::Owned(strings)), None, None, None, None], [0, len, len, len, len, len]),
+            street_cell_level: DEFAULT_STREET_CELL_LEVEL,
+            admin_cell_level: DEFAULT_ADMIN_CELL_LEVEL,
+            max_distance_sq: 1.0,
+        }
+    }
+
+    // Egypt north of 22°N; Sudan south of it.
+    const EGYPT: (f64, f64, f64, f64) = (22.0, 25.0, 31.6, 36.9);
+    const SUDAN: (f64, f64, f64, f64) = (8.7, 21.8, 22.0, 38.6);
+
+    #[test]
+    fn find_admin_finds_a_ring_listed_only_in_a_neighbour_cell() {
+        let idx = admin_index(&[
+            Ring { country: b"sd", ..ring("Sudan", 2, 190.0, SUDAN, &[(0, true), (3, true)]) },
+            ring("Egypt", 2, 97.0, EGYPT, &[(3, false), (5, false)]),
+            ring("New Valley", 4, 38.8, (22.0, 25.0, 27.7, 32.7), &[(5, false)]),
+        ]);
+        let a = idx.find_admin(Q.0, Q.1);
+        assert_eq!(a.country, Some("Egypt"));
+        assert_eq!(a.state, Some("New Valley"));
+    }
+
+    #[test]
+    fn a_longitude_whole_turns_away_is_in_no_ring() {
+        // S2 wraps the longitude back into Q's cell; point-in-polygon tests the f32 longitude
+        // itself, 9.7e11 degrees east of every ring (past the i64 range of the enc 3 grid).
+        let far = Q.1 + 360.0 * 2.7e9;
+        assert_eq!(cell_id_at_level(Q.0, far, DEFAULT_ADMIN_CELL_LEVEL), cell_id_at_level(Q.0, Q.1, DEFAULT_ADMIN_CELL_LEVEL));
+        let idx = admin_index(&[
+            ring("Egypt", 2, 97.0, EGYPT, &[(0, false)]),
+            ring("New Valley", 4, 38.8, (22.0, 25.0, 27.7, 32.7), &[(0, false)]),
+        ]);
+        assert_eq!(idx.find_admin(Q.0, Q.1).country, Some("Egypt"));
+        let a = idx.find_admin(Q.0, far);
+        assert_eq!((a.country, a.state), (None, None));
+    }
+
+    #[test]
+    fn a_neighbour_cells_interior_flag_does_not_prove_containment() {
+        let idx = admin_index(&[
+            ring("Egypt", 2, 97.0, EGYPT, &[(0, false)]),
+            Ring { country: b"sd", ..ring("Sudan", 2, 9.0, SUDAN, &[(1, true), (2, true)]) },
+        ]);
+        assert_eq!(idx.find_admin(Q.0, Q.1).country, Some("Egypt"));
+    }
+
+    #[test]
+    fn a_place_area_listed_only_in_a_neighbour_cell_fills_its_field() {
+        let idx = admin_index(&[
+            ring("Egypt", 2, 97.0, EGYPT, &[(0, true)]),
+            Ring { place_type: 4, ..ring("Bir Tarfawi", 15, 0.01, (21.99, 27.5, 22.05, 27.6), &[(6, false), (7, false)]) },
+        ]);
+        assert_eq!(idx.find_admin(Q.0, Q.1).suburb, Some("Bir Tarfawi"));
+    }
+
+    #[test]
+    fn equal_area_rings_resolve_in_cell_visiting_order() {
+        let around_q = (21.99, 27.5, 22.05, 27.6);
+        // Own cell before any neighbour.
+        let idx = admin_index(&[
+            ring("Egypt", 2, 97.0, EGYPT, &[(0, true)]),
+            ring("Listed in neighbour 1", 4, 1.0, around_q, &[(1, false)]),
+            ring("Listed in own cell", 4, 1.0, around_q, &[(0, false)]),
+        ]);
+        assert_eq!(idx.find_admin(Q.0, Q.1).state, Some("Listed in own cell"));
+        // Then neighbours in cell_neighbors_at_level order.
+        let idx = admin_index(&[
+            ring("Egypt", 2, 97.0, EGYPT, &[(0, true)]),
+            ring("Listed in neighbour 4", 4, 1.0, around_q, &[(4, false)]),
+            ring("Listed in neighbour 2", 4, 1.0, around_q, &[(2, false)]),
+        ]);
+        assert_eq!(idx.find_admin(Q.0, Q.1).state, Some("Listed in neighbour 2"));
+    }
+
+    #[test]
+    fn smaller_rings_that_miss_the_point_do_not_displace_the_containing_one() {
+        let idx = admin_index(&[
+            ring("Egypt", 2, 97.0, EGYPT, &[(0, true)]),
+            ring("New Valley", 4, 38.8, (22.0, 25.0, 27.7, 32.7), &[(0, true), (1, true)]),
+            ring("Aswan", 4, 6.0, (22.0, 31.0, 24.5, 33.6), &[(1, false), (0, false)]),
+            ring("Red Sea", 4, 12.0, (22.0, 33.6, 28.0, 36.9), &[(2, false)]),
+        ]);
+        assert_eq!(idx.find_admin(Q.0, Q.1).state, Some("New Valley"));
+    }
+
+    #[test]
+    fn boundaries_listed_only_in_a_neighbour_cell_gate_place_nodes() {
+        let idx = admin_index(&[
+            ring("Egypt", 2, 97.0, EGYPT, &[(0, true)]),
+            ring("Paris", 8, 2.0, (21.9, 27.4, 22.1, 27.7), &[(8, false)]),
+            ring("Balat", 8, 0.5, (21.9, 27.4, 21.95, 27.7), &[(0, false)]),
+            ring("Mut", 10, 0.3, (21.99, 27.5, 22.05, 27.6), &[(2, false)]),
+        ]);
+        let gates = idx.find_current_boundaries(&mut AdminScan::new(&idx, Q.0, Q.1), Some(*b"eg"));
+        let name = |rank| gates.for_rank(rank).map(|p| idx.get_string(p.name_id));
+        assert_eq!(name(CurrentBoundaries::CITY), Some("Paris"));
+        assert_eq!(name(CurrentBoundaries::SUBURB), Some("Mut"));
+    }
+
+    #[test]
+    fn one_scan_serves_every_admin_lookup_of_the_point() {
+        let idx = admin_index(&[
+            ring("Egypt", 2, 97.0, EGYPT, &[(3, false)]),
+            ring("New Valley", 4, 38.8, (22.0, 25.0, 27.7, 32.7), &[(0, false), (5, false)]),
+            ring("Paris", 8, 2.0, (21.9, 27.4, 22.1, 27.7), &[(8, false)]),
+            ring("Mut", 10, 0.3, (21.99, 27.5, 22.05, 27.6), &[(2, false)]),
+            Ring { place_type: 5, ..ring("Bir Tarfawi", 15, 0.01, (21.99, 27.5, 22.05, 27.6), &[(6, false)]) },
+        ]);
+        let mut scan = AdminScan::new(&idx, Q.0, Q.1);
+        let gates = idx.find_current_boundaries(&mut scan, Some(*b"eg"));
+        let name = |rank| gates.for_rank(rank).map(|p| idx.get_string(p.name_id));
+        assert_eq!(name(CurrentBoundaries::CITY), Some("Paris"));
+        assert_eq!(name(CurrentBoundaries::SUBURB), Some("Mut"));
+        let a = idx.find_admin_in(&mut scan);
+        assert_eq!((a.country, a.state, a.neighbourhood), (Some("Egypt"), Some("New Valley"), Some("Bir Tarfawi")));
+        // No admin_parents: the chain lookup falls back to find_admin over the same scan.
+        let c = idx.find_admin_from_chain_in(0, &mut scan);
+        assert_eq!((c.country, c.state, c.neighbourhood), (Some("Egypt"), Some("New Valley"), Some("Bir Tarfawi")));
+    }
+
+    #[test]
+    fn admin_scan_keeps_the_own_cells_rings_first() {
+        let new_valley = (22.0, 25.0, 27.7, 32.7);
+        let scan = AdminScan::new(&admin_index(&[ring("Egypt", 2, 97.0, EGYPT, &[(0, true)])]), Q.0, Q.1);
+        assert_eq!((scan.own_cell_rings, scan.rings.len()), (1, 1));
+        // The own cell absent from the index.
+        let scan = AdminScan::new(&admin_index(&[ring("Egypt", 2, 97.0, EGYPT, &[(3, true), (5, false)])]), Q.0, Q.1);
+        assert_eq!((scan.own_cell_rings, scan.rings.len()), (0, 2));
+        let idx = admin_index(&[
+            ring("Egypt", 2, 97.0, EGYPT, &[(5, false), (0, true)]),
+            ring("New Valley", 4, 38.8, new_valley, &[(8, false), (0, false)]),
+        ]);
+        let scan = AdminScan::new(&idx, Q.0, Q.1);
+        assert_eq!((scan.own_cell_rings, scan.rings.len()), (2, 4));
+        let names: Vec<&str> = scan.rings.iter().map(|(_, p)| idx.get_string(p.name_id)).collect();
+        // A cell's entries in value order (the interior flag is the high bit), cells in visiting order.
+        assert_eq!(names, ["New Valley", "Egypt", "Egypt", "New Valley"]);
+    }
+
+    #[test]
+    fn prefetch_reads_nothing_and_accepts_any_offset() {
+        for src in [FileBytes::Owned(Vec::new()), FileBytes::Owned(vec![1, 2, 3])] {
+            for off in [0, 2, 3, u64::MAX] { src.prefetch(off); }
+        }
+        let src = FileBytes::Owned(vec![1, 2, 3]);
+        src.prefetch(1);
+        assert_eq!(&src.read_chunk(0, 3)[..], &[1, 2, 3]);
+    }
+
+    #[test]
+    fn lookup_admin_cells_fb_finds_what_one_by_one_lookups_find() {
+        let mut rng = super::encoded_pip_tests::Rng::new(11);
+        for size in [0usize, 1, 2, 3, 10, 1000] {
+            // A sorted index of distinct cell ids with gaps; offsets are the ids' ranks.
+            let mut ids: Vec<u64> = (0..size).map(|_| rng.next() % 5000 * 2).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            let mut index = Vec::new();
+            for (rank, id) in ids.iter().enumerate() {
+                index.extend_from_slice(&id.to_le_bytes());
+                index.extend_from_slice(&(rank as u32 * 7).to_le_bytes());
+            }
+            let cells = FileBytes::Owned(index);
+            for _ in 0..200 {
+                // Present, absent (odd), duplicated and out-of-range ids, in any order.
+                let n = 1 + (rng.next() % 9) as usize;
+                let near = rng.next() % 10_000;
+                let query: Vec<u64> = (0..n).map(|_| match rng.next() % 4 {
+                    0 if !ids.is_empty() => ids[(rng.next() % ids.len() as u64) as usize],
+                    1 => u64::MAX - rng.next() % 3,
+                    _ => near + rng.next() % 40,
+                }).collect();
+                let mut got = vec![0u32; n];
+                Index::lookup_admin_cells_fb(&cells, &query, &mut got);
+                let want: Vec<u32> = query.iter().map(|&c| Index::lookup_admin_cell_fb(&cells, c)).collect();
+                assert_eq!(got, want, "index of {} cells, query {query:?}", ids.len());
+            }
+        }
+    }
+
+    #[test]
+    fn pip_memo_keeps_its_answers_as_it_grows() {
+        // 300 rings, every third containing Q: the memo grows from 64 slots past 512.
+        let rings: Vec<Ring> = (0..300)
+            .map(|i| {
+                let lat0 = if i % 3 == 0 { 21.9 } else { 22.1 } + i as f64 * 1e-4;
+                ring("r", 8, 1.0, (lat0, 27.0, lat0 + 0.5, 28.0), &[(0, false)])
+            })
+            .collect();
+        let idx = admin_index(&rings);
+        let mut memo = PipMemo::new(Q.0, Q.1);
+        for pass in 0..2 {
+            for id in 0..300u32 {
+                let poly = idx.admin_polygon(id).unwrap();
+                assert_eq!(memo.admin_pip(&idx, id, &poly), idx.admin_pip(&poly, Q.0, Q.1), "pass {pass} ring {id}");
+                assert_eq!(memo.admin_pip(&idx, id, &poly), id % 3 == 0);
+            }
+        }
+        assert_eq!(memo.len, 300);
+        assert!(memo.ids.len() >= 600);
     }
 }
