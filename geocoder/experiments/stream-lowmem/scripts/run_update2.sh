@@ -83,3 +83,4 @@ rm -rf "$W" "$N"
 lock_release
 echo "UPDATE $PROFILE $STYLE $OLD->$NEW rc=$rc sib_busy=$(sib_busy_pct "$s0" "$s1")% verify=\"$(tail -1 $R/verify.txt)\"" | tee "$R/result.txt"
 grep -E '^(KIND|ROLE|TOTAL)' "$R/update.out" | tee -a "$R/result.txt"
+[ $rc = 0 ] && [ $verdict = PASS ]  # the exit status: the update ran and every file matched
