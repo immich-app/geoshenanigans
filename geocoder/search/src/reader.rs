@@ -85,9 +85,11 @@ pub struct Iso {
 }
 
 impl Iso {
-    pub fn load(path: &Path, geo: &Index) -> Iso {
+    /// The ISO code list at `path` (lines "<polygon>\t<code>;<code>..."); a file that cannot be
+    /// read is an error.
+    pub fn load(path: &Path, geo: &Index) -> Result<Iso, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut iso = Iso::default();
-        let Ok(text) = std::fs::read_to_string(path) else { return iso };
         for line in text.lines() {
             let Some((poly, codes)) = line.split_once('\t') else { continue };
             let Ok(poly) = poly.parse::<u32>() else { continue };
@@ -100,7 +102,7 @@ impl Iso {
                 iso.state.entry((cc, normalize(geo.get_string(ap.name_id)))).or_default().extend(codes);
             }
         }
-        iso
+        Ok(iso)
     }
 }
 
@@ -137,7 +139,10 @@ impl<'g> SearchIndex<'g> {
             places: SubIndex::open(dir, "places")?,
             poi,
             ents: Entities { geo, n_place_nodes, bnd: Some(map(&dir.join("places.bnd"))?), extras },
-            iso: iso.map(|p| Iso::load(Path::new(p), geo)).unwrap_or_default(),
+            iso: match iso {
+                Some(p) => Iso::load(Path::new(p), geo)?,
+                None => Iso::default(),
+            },
         })
     }
 
@@ -181,5 +186,23 @@ mod tests {
         assert!(idx.poi.is_some());
         let (found, _) = Searcher::new(&idx).search("alpha", 5);
         assert_eq!(found.iter().map(|f| (f.hit.entity, f.name.as_str())).collect::<Vec<_>>(), [(0, "Alpha")]);
+    }
+
+    #[test]
+    fn an_unreadable_iso_file_fails_the_open() {
+        let mut g = Geo::default();
+        g.place("Alpha", 1, 10.0, 20.0);
+        let dir = TempDir::new("iso");
+        let geo = g.load(&dir.0.join("geo"));
+        let out = dir.0.join("idx");
+        build_search(&geo, &out, None);
+        let iso = dir.0.join("iso_codes.tsv");
+
+        let err = SearchIndex::open(&geo, &out, None, Some(iso.to_str().unwrap())).err();
+
+        assert!(err.as_deref().is_some_and(|e| e.contains("iso_codes.tsv")), "{err:?}");
+        std::fs::write(&iso, "").unwrap();
+        assert!(SearchIndex::open(&geo, &out, None, Some(iso.to_str().unwrap())).is_ok());
+        assert!(SearchIndex::open(&geo, &out, None, None).is_ok());
     }
 }
