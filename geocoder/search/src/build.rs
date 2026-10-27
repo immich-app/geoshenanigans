@@ -1206,6 +1206,14 @@ impl HeldIndexDir {
     }
 }
 
+/// Whether a publish into `out` did not finish: one cut off while it moved its files in, or that
+/// failed to put back the files it replaced, leaves its aside dir (made before its first move,
+/// removed after its last). `out` may then hold some of its files beside some of the index it
+/// replaced, under the META_FILE of either.
+pub fn has_unfinished_publish(out: &Path) -> bool {
+    out.join(BUILD_STAGE_DIR).join(BUILD_ASIDE_DIR).exists()
+}
+
 /// Whether a publish that failed to put files back left the files they replaced in `stage`.
 fn holds_replaced(stage: &Path) -> bool {
     std::fs::read_dir(stage.join(BUILD_ASIDE_DIR)).is_ok_and(|mut d| d.next().is_some())
@@ -1981,6 +1989,28 @@ mod tests {
         assert_eq!(contents(&out), before);
         assert!(!stage.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_publish_is_unfinished_from_its_first_move_to_its_last() {
+        let out = tmp_dir("unfinished");
+        let stage = out.join(BUILD_STAGE_DIR);
+        for (d, file) in [(&stage, "a"), (&stage, "b"), (&stage, META_FILE), (&out, "a"), (&out, META_FILE)] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join(file), file).unwrap();
+        }
+        // Whether the publish reads as unfinished at each of its moves.
+        let seen = std::cell::RefCell::new(Vec::new());
+        let rename = |from: &Path, to: &Path| {
+            seen.borrow_mut().push(has_unfinished_publish(&out));
+            std::fs::rename(from, to)
+        };
+
+        publish(&stage, &out, rename).unwrap();
+
+        assert_eq!(*seen.borrow(), [true; 6]);
+        assert!(!has_unfinished_publish(&out));
+        let _ = std::fs::remove_dir_all(&out);
     }
 
     #[test]

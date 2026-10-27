@@ -5,7 +5,7 @@
 //! from before a patch, is built again from the files instead of being read. The files hashed
 //! must be the ones the geocoder index was loaded from (`load`): one replaced under a loaded
 //! index would have the index built from the old files but recorded as built from the new.
-use crate::build::{self, build_held, held_subs, BuildOpts, Contended, HeldIndexDir};
+use crate::build::{self, build_held, has_unfinished_publish, held_subs, BuildOpts, Contended, HeldIndexDir};
 use crate::constants::*;
 use crate::reader::SearchIndex;
 use query_server::Index;
@@ -222,12 +222,13 @@ fn is_complete(geo: &Index, index: &Path) -> bool {
 }
 
 /// Opens the place search index in `index` of the dataset in `dir` (loaded as `geo` from files
-/// stamped `loaded`, by `load`): the one there when it is whole (`is_complete`) and was built
-/// from these files, else one built from them first by `build_held` (staged in `index`, every
-/// file moved in only once all are complete). Fails when the files are no longer the ones
-/// loaded. The open holds `index` (`HeldIndexDir`, which every build takes) until the index is
-/// mapped, waiting while another open or a build has it: a second open finds the first's index
-/// current, and no build moves files in while one is read, or has its stage cleared.
+/// stamped `loaded`, by `load`): the one there when it is whole (`is_complete`), no publish into
+/// it was left unfinished and it was built from these files, else one built from them first by
+/// `build_held` (staged in `index`, every file moved in only once all are complete). Fails when
+/// the files are no longer the ones loaded. The open holds `index` (`HeldIndexDir`, which every
+/// build takes) until the index is mapped, waiting while another open or a build has it: a
+/// second open finds the first's index current, and no build moves files in while one is read,
+/// or has its stage cleared.
 pub fn open<'g>(geo: &'g Index, loaded: &Stamps, dir: &Path, index: &Path, on_device: &BuildOnDevice) -> Result<(SearchIndex<'g>, Origin), String> {
     let io = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
     let held = HeldIndexDir::take(index, Contended::Wait)?;
@@ -244,12 +245,14 @@ pub fn open<'g>(geo: &'g Index, loaded: &Stamps, dir: &Path, index: &Path, on_de
     let have = hashes.fingerprint(dir, loaded).map_err(|e| io(dir, e))?;
     unchanged()?;
 
-    let origin = if is_complete(geo, index) && built_from(index).as_ref() == Some(&have) {
+    // Held, so an unfinished publish is a dead build's: some files there may be its own and some
+    // the index's before it, whose META_FILE matches whenever both were built from these files.
+    let origin = if !has_unfinished_publish(index) && is_complete(geo, index) && built_from(index).as_ref() == Some(&have) {
         Origin::Current
     } else {
-        // Held, so a stage here is a dead build's. One cut off while it moved its files in leaves
-        // the ones it replaced aside there, which a build refuses to start over. They are files
-        // of an index no open uses again: its META_FILE, moved in last, does not name these files.
+        // Held, so a stage here is a dead build's, with any files a publish it did not finish
+        // replaced still aside (which a build refuses to start over). Every file is built
+        // again, so none of those is read.
         let _ = std::fs::remove_dir_all(index.join(BUILD_STAGE_DIR));
         let opts = BuildOpts { threads: on_device.threads, mem_mb: on_device.mem_mb, ..BuildOpts::new(index.join("tmp")) };
         let meta = index_meta(geo, &opts, &have);
@@ -438,6 +441,33 @@ mod tests {
         assert_eq!(origin, Origin::Built);
         assert_eq!(names(&idx, "nestville"), vec!["Nestville"]);
         assert!(!index.join(BUILD_STAGE_DIR).exists());
+    }
+
+    #[test]
+    fn a_publish_cut_off_over_an_index_of_the_same_files_is_built_again() {
+        let ds = TempDir::new("cut-same");
+        dataset(["Testville", "Otherton"]).write(&ds.0);
+        let (geo, stamps) = load_dataset(&ds.0);
+        let index = ds.0.join("search");
+        drop(open(&geo, &stamps, &ds.0, &index, &BuildOnDevice::default()).unwrap());
+        // `place-search build --no-inline` of the same files, killed between moving in its
+        // places.fst and its places.post: the old places.post and META_FILE are still in place.
+        let stage = index.join(BUILD_STAGE_DIR);
+        let opts = BuildOpts { inline: false, ..BuildOpts::new(ds.0.join("tmp")) };
+        let meta = index_meta(&geo, &opts, &fingerprint(&ds.0).unwrap());
+        build_all(&geo, &held_subs(&geo, SUB_INDEXES), &stage, &opts, || Ok(meta.into())).unwrap();
+        let aside = stage.join(BUILD_ASIDE_DIR);
+        std::fs::create_dir(&aside).unwrap();
+        for f in ["places.bnd", "places.fst"] {
+            std::fs::rename(index.join(f), aside.join(f)).unwrap();
+            std::fs::rename(stage.join(f), index.join(f)).unwrap();
+        }
+
+        let (idx, origin) = open(&geo, &stamps, &ds.0, &index, &BuildOnDevice::default()).unwrap();
+
+        assert_eq!(origin, Origin::Built);
+        assert_eq!(names(&idx, "testville"), vec!["Testville"]);
+        assert!(!stage.exists());
     }
 
     #[test]
