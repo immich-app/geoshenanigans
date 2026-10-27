@@ -5,9 +5,10 @@
 //   Encoder: consumes today's-format bytes as the patcher writes them, one queue per today's file,
 //            and processes every unit whose bytes are all there (pump()).
 // Nothing is held beyond the buffers, the unit in flight and the queues' skew. A unit held whole is
-// bounded by the format (a way <= 65535 nodes, an address footprint <= 69999 vertices) or, for POI
-// polygons, by the data (the encoder needs the closing vertex before it can lay out the planes);
-// admin polygons, which are uncapped, go plane by plane through positional readers / writers.
+// bounded by the format (a way <= 65535 nodes, an address footprint <= 69999 vertices) or, for a
+// polygon block, by big_block() (256 KiB): larger admin and POI blocks go plane by plane through
+// positional readers / writers (a POI encoder lays the planes out for a closed ring and moves them
+// in the file when the last vertex shows the ring is open).
 #pragma once
 #include <cmath>
 #include <memory>
