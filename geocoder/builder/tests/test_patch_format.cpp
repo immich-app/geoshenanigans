@@ -450,6 +450,27 @@ TEST(patch_format_old_file_must_be_the_size_the_patch_was_made_from) {
     CHECK(message("absent.bin", 24) != "");
 }
 
+TEST(patch_format_old_file_size_of_a_virtual_file_comes_from_the_hook) {
+    // Low-memory mode: an encoded family's old file isn't on disk; the hook
+    // checks its decoded size and the reader takes the patch's.
+    ScratchDir dir("old-size");
+    virtual_size_hook() = [](const std::string&, const std::string& name, uint64_t expected) -> bool {
+        if (name != "street_ways.bin") return false;
+        if (expected != 120) throw std::runtime_error("decodes to 120 bytes");
+        return true;
+    };
+    require_old_file_size(dir.path(), "street_ways.bin", 120);
+    CHECK_EQ(virtual_file_sizes()[dir.path() + "/street_ways.bin"], uint64_t(120));
+    bool threw_decoded = false, threw_disk = false;
+    try { require_old_file_size(dir.path(), "street_ways.bin", 96); } catch (const std::runtime_error&) { threw_decoded = true; }
+    try { require_old_file_size(dir.path(), "admin_cells.bin", 12); } catch (const std::runtime_error&) { threw_disk = true; }
+    CHECK(threw_decoded);
+    CHECK(threw_disk);  // not virtual: checked on disk, where it is absent
+    CHECK(!virtual_file_sizes().count(dir.path() + "/admin_cells.bin"));
+    virtual_size_hook() = nullptr;
+    virtual_file_sizes().clear();
+}
+
 TEST(patch_format_old_file_sizes_cover_the_files_no_section_names) {
     ScratchDir old_dir("old-sizes");
     REQUIRE(write_file(old_dir.path() + "/geo_cells.bin", std::vector<char>(40, 'g')));
@@ -1307,17 +1328,36 @@ TEST(patch_format_geo_list_delta_round_trip) {
     uint64_t cid = 10;
     for (const auto& c : cases) append_geo_list_delta(buf, cid++, c.derived, c.target);
     size_t pos = 0;
-    auto deltas = parse_geo_list_deltas(buf.data(), buf.size(), pos, 7);
+    scan_geo_list_deltas(buf.data(), buf.size(), pos, 7);
     CHECK_EQ(pos, buf.size());
-    REQUIRE(deltas.size() == 7);
+    GeoListDeltaCursor sut(buf.data(), 0, 7);
     std::vector<uint32_t> scratch;
+    CHECK(!sut.at(9));
     for (size_t i = 0; i < 7; i++) {
-        CHECK_EQ(deltas[i].cell_id, uint64_t(10 + i));
-        CHECK_EQ(deltas[i].replace, cases[i].replace);
+        REQUIRE(sut.at(10 + i));
+        CHECK_EQ(sut.replaces(), cases[i].replace);
         std::vector<uint32_t> ids = cases[i].derived;
-        deltas[i].apply(ids, scratch);
+        sut.apply(ids, scratch);
         CHECK(ids == cases[i].target);
     }
+    CHECK(!sut.at(17));
+}
+
+TEST(patch_format_geo_list_delta_cursor_skips_cells_the_walk_passes) {
+    std::vector<char> buf;
+    append_geo_list_delta(buf, 3, {1}, {2});
+    append_geo_list_delta(buf, 5, {}, {7});
+    append_geo_list_delta(buf, 8, {4}, {});
+    GeoListDeltaCursor sut(buf.data(), 0, 3);
+    CHECK(!sut.at(1));
+    CHECK(sut.at(5));  // 3 passed unread
+    CHECK(sut.at(5));
+    CHECK(!sut.at(6));
+    CHECK(sut.at(8));
+    CHECK(!sut.at(9));
+    GeoListDeltaCursor none;
+    CHECK(!none.at(0));
+    CHECK(!none.at(UINT64_MAX));
 }
 
 TEST(patch_format_geo_list_delta_rejects_truncation_and_disorder) {
@@ -1327,7 +1367,7 @@ TEST(patch_format_geo_list_delta_rejects_truncation_and_disorder) {
     for (size_t cut = 0; cut < buf.size(); cut++) {
         size_t pos = 0;
         bool threw = false;
-        try { parse_geo_list_deltas(buf.data(), cut, pos, 2); } catch (const std::runtime_error&) { threw = true; }
+        try { scan_geo_list_deltas(buf.data(), cut, pos, 2); } catch (const std::runtime_error&) { threw = true; }
         CHECK(threw);
     }
     std::vector<char> back;
@@ -1335,7 +1375,7 @@ TEST(patch_format_geo_list_delta_rejects_truncation_and_disorder) {
     append_geo_list_delta(back, 7, {1}, {2});
     size_t pos = 0;
     bool threw = false;
-    try { parse_geo_list_deltas(back.data(), back.size(), pos, 2); } catch (const std::runtime_error&) { threw = true; }
+    try { scan_geo_list_deltas(back.data(), back.size(), pos, 2); } catch (const std::runtime_error&) { threw = true; }
     CHECK(threw);
 }
 
@@ -1390,9 +1430,30 @@ TEST(patch_output_reports_final_flush_failure) {
     CHECK_EQ(fwrite("test", 1, 4, out), size_t(4));
     CHECK_EQ(ferror(out), 0);
     bool threw = false;
-    try { close_patch_output(out, "test"); }
+    try { close_patch_outputs({{out, "test"}}); }
     catch (const std::runtime_error&) { threw = true; }
     CHECK(threw);
+}
+
+TEST(patch_outputs_close_every_one_and_name_the_failed) {
+    // The full device's flush fails; the file after it is still flushed and
+    // closed, and only the failed one is named.
+    ScratchDir dir("close-outputs");
+    const std::string kept = dir.path() + "/kept.bin";
+    FILE* full = fopen("/dev/full", "wb");
+    FILE* file = fopen(kept.c_str(), "wb");
+    REQUIRE(full != nullptr);
+    REQUIRE(file != nullptr);
+    char full_buf[8192], file_buf[8192];
+    setvbuf(full, full_buf, _IOFBF, sizeof(full_buf));
+    setvbuf(file, file_buf, _IOFBF, sizeof(file_buf));
+    fwrite("lost", 1, 4, full);
+    fwrite("kept", 1, 4, file);
+    std::string message;
+    try { close_patch_outputs({{full, "full.bin"}, {file, "kept.bin"}}); }
+    catch (const std::runtime_error& e) { message = e.what(); }
+    CHECK_EQ(message, std::string("Cannot write full.bin"));
+    CHECK_EQ(std::filesystem::file_size(kept), uintmax_t(4));
 }
 
 TEST(patch_format_ensure_dir_creates_the_path_as_named) {

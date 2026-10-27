@@ -1,8 +1,7 @@
-// test_gxc_counts: malformed list and address counts in a gxc row fail through die() in both gxc
-// decoders (gc's and the patcher's), before any list is sized or filled from them. Each case is a
-// one-row encoded set decoded in a child process.
-#include "gcs_codec.h"
-#include "../gc/fam_gxc.h"
+// test_gxc_counts: malformed list and address counts in a gxc row fail through die() in gc's gxc
+// decoder, before any list is sized or filled from them. Each case is a one-row encoded set decoded
+// in a child process. (The patcher's decoder: geocoder/builder/tests/test_gcs_codec.cpp.)
+#include "fam_gxc.h"
 #include <filesystem>
 #include <fstream>
 #include <sys/resource.h>
@@ -49,9 +48,9 @@ int main() {
         const std::string src = root + "/" + std::to_string(n++), out = src + "/out";
         std::filesystem::create_directories(out);
         uint8_t top[32] = {};
-        gcs::wr64(top, uint64_t(1) << 40);
-        gcs::wr32(top + 12, gcs::NO);  // no street / interp list in effect at the block start
-        gcs::wr32(top + 16, gcs::NO);
+        wr64(top, uint64_t(1) << 40);
+        wr32(top + 12, 0xFFFFFFFFu);  // no street / interp list in effect at the block start
+        wr32(top + 16, 0xFFFFFFFFu);
         write_bytes(src + "/gxc_top.bin", std::vector<uint8_t>(top, top + 32));
         std::vector<uint8_t> rows{uint8_t(c.s | c.a << 2)}, street;
         for (uint64_t v : c.addr) uv(rows, v);
@@ -59,44 +58,27 @@ int main() {
         write_bytes(src + "/gxc_rows.bin", rows);
         write_bytes(src + "/gxc_street.bin", street);
         write_bytes(src + "/gxc_interp.bin", {});
-        for (int which = 0; which < 2; which++) {  // 0: gc's decoder, 1: the patcher's
-            const pid_t child = fork();
-            if (child < 0) return 1;
-            if (!child) {
-                alarm(20);
+        const pid_t child = fork();
+        if (child < 0) return 1;
+        if (!child) {
+            alarm(20);
 #ifndef __SANITIZE_ADDRESS__
-                struct rlimit as{size_t(4) << 30, size_t(4) << 30};  // an unchecked count runs out here
-                setrlimit(RLIMIT_AS, &as);
+            struct rlimit as{size_t(4) << 30, size_t(4) << 30};  // an unchecked count runs out here
+            setrlimit(RLIMIT_AS, &as);
 #endif
-                if (which == 0) {
-                    Manifest m;
-                    m.set("gxc.rows", 1);
-                    m.set("gxc.B", 128);
-                    m.set("gxc.addr_ids", c.addr_ids);
-                    gxc::decode(src, out, m);  // gc's die() exits 2
-                    _exit(0);
-                }
-                try {
-                    gcs::Manifest m;
-                    m.set("gxc.rows", 1);
-                    m.set("gxc.B", 128);
-                    m.set("gxc.addr_ids", c.addr_ids);
-                    for (const char* e : gcs::gxc::ENTRY) m.set(std::string("gxc.") + e, 0);
-                    gcs::gxc::Dec dec(src, m);
-                    for (auto& st : dec.state) st = 1;
-                    while (dec.step()) {}
-                } catch (const std::runtime_error& e) {
-                    _exit(c.error && std::string(e.what()).find(c.error) != std::string::npos ? 2 : 3);
-                }
-                _exit(0);
-            }
-            int status = 0;
-            waitpid(child, &status, 0);
-            const int want = c.error ? 2 : 0;
-            if (!WIFEXITED(status) || WEXITSTATUS(status) != want) {
-                fprintf(stderr, "FAIL %s (%s decoder): status %d, want exit %d\n", c.name, which ? "patcher" : "gc", status, want);
-                ok = false;
-            }
+            Manifest m;
+            m.set("gxc.rows", 1);
+            m.set("gxc.B", 128);
+            m.set("gxc.addr_ids", c.addr_ids);
+            gxc::decode(src, out, m);  // gc's die() exits 2
+            _exit(0);
+        }
+        int status = 0;
+        waitpid(child, &status, 0);
+        const int want = c.error ? 2 : 0;
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != want) {
+            fprintf(stderr, "FAIL %s: status %d, want exit %d\n", c.name, status, want);
+            ok = false;
         }
     }
     std::filesystem::remove_all(root);

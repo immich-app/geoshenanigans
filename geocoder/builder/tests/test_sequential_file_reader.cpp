@@ -318,6 +318,165 @@ TEST(read_fully_throws_on_an_early_end_or_an_error) {
     CHECK(throws_runtime([&] { read_fully(dst, 8, 0, io_error, "fake"); }, "Cannot read fake"));
 }
 
-TEST(sequential_reader_window_holds_the_largest_cell_list) {
-    CHECK(SEQUENTIAL_READ_BUFFER_BYTES >= 2 + 0xFFFF * 4);
+TEST(sequential_reader_grows_its_default_window_for_the_largest_cell_list) {
+    const size_t list = 2 + 0xFFFF * 4;
+    ByteFile file(3 * list);
+    SequentialFileReader sut(file.path);
+    CHECK(SEQUENTIAL_READ_BUFFER_BYTES < list);
+    CHECK(file.same(sut.at(10, 100), 10, 100));
+    CHECK(file.same(sut.at(110, list), 110, list));
+    CHECK(file.same(sut.at(110 + list, list), 110 + list, list));
+    CHECK_EQ(sut.rewinds(), uint64_t(0));
+}
+
+// --- stream sources (the low-memory mode's in-process decoders) ---
+
+namespace {
+
+// Serves bytes [0, n) of a ByteFile's pattern in reads of at most `piece`
+// bytes, as a decoder does. A skippable one drops skipped bytes unread, as a
+// shared decoder does.
+struct PatternSource : StreamSource {
+    const std::vector<char>& bytes;
+    size_t at = 0, piece, read_bytes = 0, skipped = 0;
+    bool skippable;
+    PatternSource(const std::vector<char>& b, size_t p, bool s) : bytes(b), piece(p), skippable(s) {}
+    size_t read(char* dst, size_t max) override {
+        const size_t k = std::min({max, piece, bytes.size() - at});
+        std::memcpy(dst, bytes.data() + at, k);
+        at += k;
+        read_bytes += k;
+        return k;
+    }
+    bool skip(uint64_t n) override {
+        if (!skippable) return false;
+        at += n;
+        skipped += n;
+        return true;
+    }
+};
+
+// One virtual file for the test's scope: its path gets a PatternSource and,
+// when `registered`, the size require_old_file_size would have registered.
+// `source` is the one the last reader opened.
+struct VirtualFile {
+    std::string path = "/virtual/old.bin";
+    static const std::vector<char>* bytes;
+    static size_t piece;
+    static bool skippable;
+    static PatternSource* source;
+    VirtualFile(const std::vector<char>& b, size_t p, bool registered = true, bool can_skip = false) {
+        bytes = &b;
+        piece = p;
+        skippable = can_skip;
+        stream_source_factory() = [](const std::string& path) -> std::unique_ptr<StreamSource> {
+            if (path != "/virtual/old.bin") return nullptr;
+            source = new PatternSource(*bytes, piece, skippable);
+            return std::unique_ptr<StreamSource>(source);
+        };
+        if (registered) virtual_file_sizes()[path] = b.size();
+    }
+    ~VirtualFile() {
+        stream_source_factory() = nullptr;
+        virtual_file_sizes().erase(path);
+    }
+};
+const std::vector<char>* VirtualFile::bytes = nullptr;
+size_t VirtualFile::piece = 0;
+bool VirtualFile::skippable = false;
+PatternSource* VirtualFile::source = nullptr;
+
+}  // namespace
+
+TEST(sequential_reader_reads_a_stream_source_forward_in_any_read_sizes) {
+    ByteFile file(1000);
+    for (size_t piece : {size_t(1), size_t(7), size_t(64), size_t(5000)}) {
+        VirtualFile v(file.bytes, piece);
+        SequentialFileReader sut(v.path, 64);
+        CHECK(sut.is_open());
+        CHECK_EQ(sut.size(), uint64_t(1000));
+        CHECK(!sut.copy_supported());
+        CHECK(file.same(sut.at(0, 10), 0, 10));
+        CHECK(file.same(sut.at(5, 40), 5, 40));      // overlaps the window
+        CHECK(file.same(sut.at(300, 100), 300, 100));  // skips forward, grows the window
+        std::vector<char> copy(200);
+        sut.read(500, copy.data(), copy.size());
+        CHECK(file.same(copy.data(), 500, copy.size()));
+        CHECK(file.same(sut.at(990, 10), 990, 10));
+    }
+}
+
+TEST(sequential_reader_stream_source_reads_only_forward) {
+    ByteFile file(1000);
+    VirtualFile v(file.bytes, 64);
+    SequentialFileReader sut(v.path, 64);
+    sut.at(500, 10);
+    CHECK(throws_runtime([&] { sut.at(100, 10); }, "Backward read of stream /virtual/old.bin"));
+}
+
+TEST(sequential_reader_stream_source_throws_when_it_ends_early) {
+    ByteFile file(100);
+    VirtualFile v(file.bytes, 64, false);
+    virtual_file_sizes()[v.path] = 200;  // the patch expects more than the decoder has
+    SequentialFileReader sut(v.path, 64);
+    CHECK(file.same(sut.at(0, 100), 0, 100));
+    CHECK(throws_runtime([&] { sut.at(100, 50); }, "Unexpected end of /virtual/old.bin"));
+}
+
+TEST(sequential_reader_stream_source_needs_a_registered_size) {
+    ByteFile file(100);
+    VirtualFile v(file.bytes, 64, false);
+    CHECK(throws_runtime([&] { SequentialFileReader sut(v.path); }, "No size registered for stream /virtual/old.bin"));
+}
+
+TEST(sequential_reader_appends_a_stream_source_range_through_its_window) {
+    ByteFile file(1 << 20);
+    VirtualFile v(file.bytes, 4096);
+    SequentialFileReader old(v.path);
+    ScratchDir dir("reader-test");
+    const std::string out_path = dir.path() + "/out.bin";
+    FILE* out = std::fopen(out_path.c_str(), "wb");
+    REQUIRE(out != nullptr);
+    append_old_range(old, out, 100, COPY_RANGE_MIN_BYTES * 3, "out.bin");
+    std::fclose(out);
+    std::FILE* f = std::fopen(out_path.c_str(), "rb");
+    std::vector<char> got(COPY_RANGE_MIN_BYTES * 3);
+    REQUIRE(std::fread(got.data(), 1, got.size(), f) == got.size());
+    std::fclose(f);
+    CHECK(file.same(got.data(), 100, got.size()));
+}
+
+TEST(sequential_reader_skip_to_drops_a_stream_source_s_bytes_unread) {
+    ByteFile file(1000);
+    VirtualFile v(file.bytes, 16, true, true);
+    SequentialFileReader sut(v.path, 64);
+    CHECK(file.same(sut.at(0, 10), 0, 10));
+    const size_t consumed = VirtualFile::source->read_bytes;
+    sut.skip_to(700);
+    CHECK_EQ(VirtualFile::source->skipped, 700 - consumed);
+    CHECK(file.same(sut.at(700, 50), 700, 50));
+    CHECK(VirtualFile::source->read_bytes - consumed <= 64);  // nothing between 64 and 700 was read
+    sut.skip_to(600);  // behind the stream: nothing to drop
+    CHECK_EQ(VirtualFile::source->skipped, 700 - consumed);
+    CHECK(throws_runtime([&] { sut.skip_to(1001); }, "Read past end of /virtual/old.bin"));
+}
+
+TEST(sequential_reader_skip_to_reads_past_bytes_a_source_cannot_drop) {
+    ByteFile file(1000);
+    VirtualFile v(file.bytes, 16);
+    SequentialFileReader sut(v.path, 64);
+    sut.at(0, 10);
+    sut.skip_to(700);
+    CHECK_EQ(VirtualFile::source->skipped, size_t(0));
+    CHECK(file.same(sut.at(700, 50), 700, 50));
+    CHECK(VirtualFile::source->read_bytes >= 750);
+}
+
+TEST(sequential_reader_skip_to_leaves_a_real_file_readable_anywhere) {
+    ByteFile file(1000);
+    SequentialFileReader sut(file.path, 64);
+    CHECK(file.same(sut.at(500, 10), 500, 10));
+    sut.skip_to(900);
+    CHECK(file.same(sut.at(100, 10), 100, 10));
+    CHECK(file.same(sut.at(950, 50), 950, 50));
 }

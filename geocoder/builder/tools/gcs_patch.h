@@ -18,7 +18,7 @@ struct FamilyDesc {
     const char* name;
     std::vector<const char*> today;
 };
-// gc.cpp's family order (gc.families lists them in it).
+// gc's family order (experiments/stream-lowmem/gc/gc.cpp; gc.families lists them in it).
 static const std::vector<FamilyDesc>& families() {
     static const std::vector<FamilyDesc> f = {
         {"streets", {"street_ways.bin", "street_nodes.bin"}},

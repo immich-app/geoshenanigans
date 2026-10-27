@@ -1,5 +1,5 @@
 // In-process incremental codecs for the low-memory client update. The same formats as gc
-// (sortpatch/codecs, e2e gcx) byte for byte, restructured so the patcher drives them:
+// (geocoder/experiments/stream-lowmem/gc) byte for byte, restructured so the patcher drives them:
 //   Decoder: produces today's-format bytes on demand, one unit (way, row, record, block piece) per
 //            step(), into one queue per today's file (a coupled family fills several queues).
 //   Encoder: consumes today's-format bytes as the patcher writes them, one queue per today's file,

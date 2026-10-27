@@ -1,8 +1,8 @@
-"""Run against a built geocoder-patch (the experiment's, with libzstd or the zstd CLI fallback):
-command-line checks that need no patch data. zstd must be on PATH.
+"""Run against a built geocoder-patch (geocoder/builder, with GEOCODER_PATCH_LIBZSTD or the zstd CLI
+fallback): command-line checks that need no patch data. zstd must be on PATH.
 
---only on an encoded installed set (a gc.manifest in the current dir) is refused before anything is
-written: a staged apply would leave a gc.manifest naming every family with only one stage's keys.
+An option other than --threads (a staged apply's --only, on an encoded installed set: a gc.manifest
+in the current dir) is refused before anything is written.
 
 The output dir is created as named, quotes and all, and no part of its name runs as a command; the
 same for the patch path, which is decompressed as named.
@@ -33,10 +33,10 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as scratch:
     r = subprocess.run([binary, str(cur), str(patch), '-o', str(out), '--only', 'street_ways.bin,street_nodes.bin'],
                        capture_output=True)
     err = r.stderr.decode()
-    if r.returncode == 0 or '--only' not in err or 'encoded installed set' not in err:
-        errors.append(f'--only on an encoded set was not refused: rc={r.returncode} {err[-300:]}')
-    if out.exists() and any(out.iterdir()):
-        errors.append(f'--only on an encoded set wrote {sorted(p.name for p in out.iterdir())}')
+    if r.returncode == 0 or 'Unknown option --only' not in err:
+        errors.append(f'--only was not refused: rc={r.returncode} {err[-300:]}')
+    if out.exists():
+        errors.append(f'--only made the output dir: {sorted(p.name for p in out.iterdir())}')
 
     plain = root / 'plain'
     plain.mkdir()

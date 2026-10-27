@@ -1,12 +1,10 @@
-"""test_patch_e2e.py PATCHER GC DIFF: end-to-end applies of small synthetic sets.
+"""test_patch_e2e.py PATCHER GC DIFF: end-to-end applies of small synthetic sets in geocoder-patch's
+low-memory mode.
 
-PATCHER: the experiment's geocoder-patch; GC: gc; DIFF: a geocoder-diff (v7 or v8; the REPLACE run
-case needs v8). Each case makes an old and a new today's-format dir, diffs them, encodes the old one
-with gc, applies the patch to it (sync and --threads) and compares the new encoded set byte for byte
-with gc's encoding of the new dir.
+PATCHER and DIFF: geocoder-patch and geocoder-diff (geocoder/builder); GC: gc. Each case makes an old
+and a new today's-format dir, diffs them, encodes the old one with gc, applies the patch to it (sync
+and --threads) and compares the new encoded set byte for byte with gc's encoding of the new dir.
 """
-import errno
-import fcntl
 import os
 from pathlib import Path
 import random
@@ -15,7 +13,6 @@ import struct
 import subprocess
 import sys
 import tempfile
-import threading
 
 PATCHER, GC, DIFF = (str(Path(a).resolve()) for a in sys.argv[1:4])
 NO = 0xFFFFFFFF
@@ -65,43 +62,6 @@ def ways_dir(d, names):
     meta = d.with_name(d.name + '.meta')
     meta.mkdir()
     (meta / 'street.slot.u32').write_bytes(struct.pack(f'<{len(names)}I', *range(len(names))))
-
-
-def unprivileged():
-    """preexec_fn: nobody, when run as root (a FIFO's pipe counts against its first opener's limit)."""
-    if os.geteuid() == 0:
-        os.setgroups([])
-        os.setgid(65534)
-        os.setuid(65534)
-
-
-def narrow_pipes():
-    """preexec_fn: unprivileged() holding pipes of up to 1 MiB until it is past its pipe page limit
-    (fs.pipe-user-pages-soft), where a new pipe gets the minimum size and none can grow: the patcher's
-    own pipes can't grow. (Stopping at the first refused 1 MiB leaves up to 1 MiB minus a page free.)
-    A descriptor limit reached first is a SKIP: the pipes are closed and the patcher runs as is."""
-    unprivileged()
-    held = []
-    for _ in range(4096):
-        try:
-            r, w = os.pipe()
-        except OSError as e:
-            if e.errno not in (errno.EMFILE, errno.ENFILE):
-                raise
-            for fd in held:
-                os.close(fd)
-            os.write(2, b'SKIP: the descriptor limit comes before the pipe page limit\n')
-            return
-        held += [r, w]
-        os.set_inheritable(r, True)
-        os.set_inheritable(w, True)
-        if fcntl.fcntl(w, 1032) < 65536:  # F_GETPIPE_SZ below the default: past the limit
-            return
-        try:
-            fcntl.fcntl(w, 1031, 1 << 20)  # F_SETPIPE_SZ
-        except OSError:
-            pass
-    os.write(2, b'SKIP: no pipe page limit reached\n')
 
 
 def block(rng, vc):
@@ -206,58 +166,13 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as scratch:
         (root / d / 'addr_points.bin').write_bytes(b'')
         (root / d / 'addr_vertices.bin').write_bytes(b'')
     apply_case(root, 'empty-addresses', root / 'noaddr.a', root / 'noaddr.b')
-    # A parent's REPLACE run (v8: the same street ways, renamed) whose children stay one MATCH run: the
+    # A parent's REPLACE run (the same street ways, renamed) whose children stay one MATCH run: the
     # old records are dropped as the node reads make the shared decoder produce them, not queued for
     # the whole run (2.4 MB of them).
-    if '--identity' in run([DIFF]).stderr.decode():
-        names = list(range(200000))
-        ways_dir(root / 'named.a', names)
-        ways_dir(root / 'named.b', [n + 1000000 for n in names])
-        apply_case(root, 'replaced-parents', root / 'named.a', root / 'named.b', decoder_peaks_at_most('streets', 1 << 20),
-                   identity=True)
-    else:
-        print('replaced-parents: SKIP, a v7 diff writes no REPLACE runs')
-
-    # A streamed output whose reader goes away fails the run (the entry pipeline's four outputs were
-    # closed unchecked): geo_cells.bin is a FIFO whose reader closes at once, the patch rewrites 4 MiB
-    # of rows (more than the pipe and the stdio buffer hold), SIGPIPE is ignored.
-    flat = [(k, []) for k in range(200000)]
-    geo_dir(root / 'flat', flat)
-    r = run([DIFF, str(root / 'flat'), str(root / 'flat'), '-o', str(root / 'flat.gcpatch')])
-    out = root / 'fifo.out'
-    out.mkdir()
-    fifo = out / 'geo_cells.bin'
-    os.mkfifo(fifo)
-    reader = threading.Thread(target=lambda: os.close(os.open(fifo, os.O_RDONLY)), daemon=True)
-    reader.start()
-    r = run([PATCHER, str(root / 'flat'), str(root / 'flat.gcpatch'), '-o', str(out)], restore_signals=False, timeout=120)
-    if reader.is_alive():
-        os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
-    err = r.stderr.decode()
-    if r.returncode == 0 or 'Cannot write geo_cells.bin' not in err:
-        errors.append(f'fifo-output: a failed geo_cells.bin was not reported: rc={r.returncode} {err[-300:]}')
-
-    # A FIFO output whose pipe can't grow to 1 MiB fails the run up front (the entry pipeline's group
-    # flush needs it; it went on with a 64 KiB or 8 KiB pipe): the patcher runs as a user past its
-    # pipe page limit, geo_cells.bin is a FIFO the same user drains.
-    os.chmod(root, 0o777)
-    out = root / 'narrow.out'
-    out.mkdir()
-    os.chmod(out, 0o777)
-    fifo = out / 'geo_cells.bin'
-    os.mkfifo(fifo)
-    os.chmod(fifo, 0o666)
-    reader = subprocess.Popen(['cat', str(fifo)], stdout=subprocess.DEVNULL, preexec_fn=unprivileged)
-    try:
-        r = run([PATCHER, str(root / 'flat'), str(root / 'flat.gcpatch'), '-o', str(out)], preexec_fn=narrow_pipes,
-                close_fds=False, timeout=120, env=dict(ENV, TMPDIR=str(root)))
-    finally:
-        reader.kill()
-        reader.wait()
-    err = r.stderr.decode()
-    if 'SKIP' in err:
-        print('narrow-pipe:', next(line for line in err.splitlines() if 'SKIP' in line))
-    elif r.returncode == 0 or "pipe can't hold 1 MiB" not in err:
-        errors.append(f'narrow-pipe: a FIFO output on a small pipe was not refused: rc={r.returncode} {err[-300:]}')
+    names = list(range(200000))
+    ways_dir(root / 'named.a', names)
+    ways_dir(root / 'named.b', [n + 1000000 for n in names])
+    apply_case(root, 'replaced-parents', root / 'named.a', root / 'named.b', decoder_peaks_at_most('streets', 1 << 20),
+               identity=True)
 
 assert not errors, '\n'.join(errors)

@@ -1,9 +1,10 @@
 // test_addr_big: address footprints of more than 69999 vertices (abs2's bound, which the decoders
 // hold to) round trip through the raw escape, byte for byte: gc's encoder in one pass (both layouts)
 // and in its two streaming passes, gc's decoders (whole, points only, vertices only), and the
-// patcher's Enc and Dec.
+// patcher's Enc and Dec (geocoder/builder/tools/gcs_codec.h, on the include path), which must write
+// and read gc's files.
 #include "gcs_codec.h"
-#include "../gc/fam_addr.h"
+#include "fam_addr.h"
 #include <filesystem>
 #include <fstream>
 #include <iterator>

@@ -1,10 +1,10 @@
 // test_ways_columns: an encoded street or interpolation set with bytes past the end of any one of its
-// columns fails in every ways decoder (gc's full and ways-only decodes, the patcher's), instead of
-// decoding and dropping them. Each case appends a byte to one column of a 40-way set and decodes it
-// in a child process; the unchanged set decodes in all three. (A streets ways-only decode doesn't
-// read street.code: the nodes-only decode it runs beside does, and checks it.)
-#include "gcs_codec.h"
-#include "../gc/fam_ways.h"
+// columns fails in gc's ways decoders (the full and the ways-only decode), instead of decoding and
+// dropping them. Each case appends a byte to one column of a 40-way set and decodes it in a child
+// process; the unchanged set decodes in both. (A streets ways-only decode doesn't read street.code:
+// the nodes-only decode it runs beside does, and checks it. The patcher's decoder:
+// geocoder/builder/tests/test_gcs_codec.cpp.)
+#include "fam_ways.h"
 #include <filesystem>
 #include <fstream>
 #include <sys/wait.h>
@@ -47,30 +47,16 @@ static void today_set(const std::string& dir, bool street) {
     write_bytes(dir + (street ? "/street_nodes.bin" : "/interp_nodes.bin"), nodes);
 }
 
-// 0: gc's full decode, 1: gc's ways-only decode (--files <ways>), 2: the patcher's decoder.
-static const char* const DECODERS[] = {"gc", "gc ways-only", "patcher"};
+// 0: gc's full decode, 1: gc's ways-only decode (--files <ways>).
+static const char* const DECODERS[] = {"gc", "gc ways-only"};
 
 static int decode_in_child(int which, bool street, const std::string& enc, const std::string& out, const Manifest& m) {
     const pid_t child = fork();
     if (child < 0) return -1;
     if (!child) {
         alarm(20);
-        if (which < 2) {
-            if (which == 1) want_files() = {street ? "street_ways.bin" : "interp_ways.bin"};
-            ways::decode(enc, out, street, m);  // gc's die() exits 2
-            _exit(0);
-        }
-        try {
-            gcs::Manifest gm;
-            for (const auto& [k, v] : m.kv) gm.set(k, v);
-            gcs::ways::Dec dec(enc, street, gm);
-            for (auto& st : dec.state) st = 1;
-            while (dec.step()) {
-                for (auto& q : dec.out) q.pop(q.size());
-            }
-        } catch (const std::runtime_error& e) {
-            _exit(std::string(e.what()).find("not fully consumed") != std::string::npos ? 2 : 3);
-        }
+        if (which == 1) want_files() = {street ? "street_ways.bin" : "interp_ways.bin"};
+        ways::decode(enc, out, street, m);  // gc's die() exits 2
         _exit(0);
     }
     int status = 0;
@@ -101,7 +87,7 @@ int main() {
                 std::ofstream f(bad + "/" + fam + "." + column, std::ios::binary | std::ios::app);
                 f.put('\x5a');
             }
-            for (int which = 0; which < 3; which++) {
+            for (int which = 0; which < 2; which++) {
                 if (which == 1 && street && column == "code") continue;
                 const std::string out = bad + ".out" + std::to_string(which);
                 std::filesystem::create_directories(out);

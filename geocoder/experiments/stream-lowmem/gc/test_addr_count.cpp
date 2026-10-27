@@ -1,5 +1,8 @@
-#include "gcs_codec.h"
-#include "../gc/fam_addr.h"
+// test_addr_count: an address footprint count that does not fit the record's u32 fails through
+// die() in gc's address decoders (whole and points only), before anything is sized from it. Each
+// case is a one-record encoded set decoded in a child process. (The patcher's decoder:
+// geocoder/builder/tests/test_gcs_codec.cpp.)
+#include "fam_addr.h"
 #include <filesystem>
 #include <fstream>
 #include <sys/wait.h>
@@ -31,24 +34,14 @@ int main() {
         do { const uint8_t part = value & 127; value >>= 7; bytes.push_back(part | (value ? 128 : 0)); } while (value);
         bytes.resize(bytes.size() + (tag == 0x20 ? 30 : 28));
         write_bytes(src + "/addr_vertices.abs2", bytes);
-        for (int mode = 0; mode < 3; mode++) {
+        for (int mode = 0; mode < 2; mode++) {  // 0: points only, 1: whole
             const pid_t child = fork();
             if (child < 0) return 1;
             if (child == 0) {
                 alarm(5);
-                if (mode < 2) {
-                    Manifest m; m.set("addr.n", 1); m.set("addr.layout", "col");
-                    if (mode == 0) addr::decode_points_only(src, m, out);
-                    else addr::decode(src, out, m);
-                } else {
-                    try {
-                        gcs::Manifest m; m.set("addr.n", 1); m.set("addr.layout", "col");
-                        gcs::addr::Dec dec(src, m);
-                        while (dec.step()) {}
-                    } catch (const std::runtime_error& e) {
-                        _exit(std::string(e.what()).find("bad count") != std::string::npos ? 2 : 3);
-                    }
-                }
+                Manifest m; m.set("addr.n", 1); m.set("addr.layout", "col");
+                if (mode == 0) addr::decode_points_only(src, m, out);
+                else addr::decode(src, out, m);
                 _exit(0);
             }
             int status = 0; waitpid(child, &status, 0);

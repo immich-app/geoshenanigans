@@ -1,6 +1,7 @@
-Low-memory streaming client update: patch/ holds the patcher that applies a GCPATCH to an encoded installed set in process (its files go over geocoder/builder/tools), gc/ the encoder and decoder of those sets. The Python tests take the built binaries as arguments (see each file's docstring). The C++ tests take no arguments, except test_admin and test_poi, which take an output directory: run each twice, once plain and once with GCS_BIG_BLOCK=64, into two directories, and compare the two with diff -r (the big block path must give the same files):
+Low-memory streaming client update. The patcher that applies a GCPATCH to an encoded installed set in process is geocoder-patch's low-memory mode (geocoder/builder/tools/geocoder_patch.cpp and gcs_*.h, tested in geocoder/builder/tests). gc/ holds the encoder and decoder of those sets, and patch/ the end-to-end tests of the low-memory mode, which need gc.
 
-    ./test_admin out/admin && GCS_BIG_BLOCK=64 ./test_admin out/admin-big && diff -r out/admin out/admin-big
-    ./test_poi out/poi && GCS_BIG_BLOCK=64 ./test_poi out/poi-big && diff -r out/poi out/poi-big
+The Python tests take the built binaries as arguments (see each file's docstring). gc's C++ tests take no arguments; test_addr_big also checks the patcher's address codec against gc's files, so it builds with geocoder/builder/tools on the include path:
+
+    g++ -std=c++17 -O2 -ffp-contract=off -I ../../builder/tools -o test_addr_big gc/test_addr_big.cpp
 
 The measurement harness of this experiment (the timed update runners, the memory sampler, the real-data smoke check and the benchmark queues) lives on the research/geocoder-experiments branch, under geocoder/experiments/stream-lowmem/scripts/.

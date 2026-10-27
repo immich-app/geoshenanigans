@@ -97,6 +97,23 @@ target_link_libraries(geocoder-patch PRIVATE Threads::Threads)
 target_include_directories(geocoder-patch PRIVATE tools src)
 # pread offsets past 4 GiB on 32-bit glibc too (sequential_file_reader.h).
 target_compile_definitions(geocoder-patch PRIVATE _FILE_OFFSET_BITS=64)
+# The encoded-set codecs (gcs_codec.h) round floats and must give the server
+# encoder's bytes on every architecture: no fused multiply-adds.
+target_compile_options(geocoder-patch PRIVATE -ffp-contract=off)
+# GEOCODER_PATCH_LIBZSTD=ON decompresses the patch with libzstd in process
+# (no zstd CLI process and its window buffer: the low-memory mode's figures);
+# off, the patcher runs the zstd on PATH.
+option(GEOCODER_PATCH_LIBZSTD "Link libzstd into geocoder-patch" OFF)
+if(GEOCODER_PATCH_LIBZSTD)
+    find_path(GEOCODER_ZSTD_INCLUDE_DIR zstd.h)
+    find_library(GEOCODER_ZSTD_LIBRARY NAMES libzstd.a zstd)
+    if(NOT GEOCODER_ZSTD_INCLUDE_DIR OR NOT GEOCODER_ZSTD_LIBRARY)
+        message(FATAL_ERROR "GEOCODER_PATCH_LIBZSTD: libzstd not found (Debian/Ubuntu: libzstd-dev)")
+    endif()
+    target_include_directories(geocoder-patch PRIVATE "${GEOCODER_ZSTD_INCLUDE_DIR}")
+    target_link_libraries(geocoder-patch PRIVATE "${GEOCODER_ZSTD_LIBRARY}")
+    target_compile_definitions(geocoder-patch PRIVATE GEOCODER_PATCH_LIBZSTD)
+endif()
 
 # osmium apply-changes for the nightly planet update, blob by blob.
 add_executable(pbf-apply tools/pbf_apply.cpp src/pbf_reader.cpp)
@@ -167,6 +184,9 @@ target_compile_definitions(geocoder-tests PRIVATE
     GEOCODER_TEMPLATE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/configurations.template.json"
     _FILE_OFFSET_BITS=64)
 target_link_libraries(geocoder-tests PRIVATE ZLIB::ZLIB libdeflate::libdeflate EXPAT::EXPAT Threads::Threads)
+# As geocoder-patch compiles the codecs.
+set_source_files_properties(tests/test_gcs_codec.cpp tests/test_gcs_patch.cpp tests/test_gcs_poi_io.cpp
+    PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
 add_test(NAME geocoder-tests COMMAND geocoder-tests)
 
 # Unit tests of the builder code that runs on S2 (tests/s2/*.cpp), linked

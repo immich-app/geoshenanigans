@@ -140,6 +140,11 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
 - **geocoder-diff** (`tools/geocoder_diff.cpp`): Compares two builds, produces `.gcpatch`
 - **geocoder-patch** (`tools/geocoder_patch.cpp`): Applies patch, produces new build
 - **patch_format.h** (`tools/patch_format.h`): Shared format definitions + rebuild functions
+- **gcs_\*.h** (`tools/gcs_patch.h`, `gcs_codec.h`, `gcs_io.h`, `gcs_async.h`): geocoder-patch's
+  low-memory mode. When the old dir is an encoded installed set (a `gc.manifest` beside the files,
+  as `experiments/stream-lowmem/gc` writes it), the encoded families' old files are decoded and
+  their new files encoded in process, a family's records and their child stream replay together,
+  and the output is the new encoded set; `--threads` gives each codec a thread
 
 ### How Patching Works
 

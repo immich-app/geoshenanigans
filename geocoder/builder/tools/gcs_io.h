@@ -26,9 +26,10 @@ static const uint32_t NO = 0xFFFFFFFFu;
 // Default buffer sizes (bytes).
 static const size_t READ_BUF = size_t(64) << 10, WRITE_BUF = size_t(64) << 10, PLANE_BUF = size_t(16) << 10;
 // A polygon block up to this size is transformed in memory; a larger one plane by plane through
-// positional readers / writers, so no block is ever held whole. GCS_BIG_BLOCK overrides it (tests).
-inline size_t big_block() {
-    static const size_t b = [] {
+// positional readers / writers, so no block is ever held whole. GCS_BIG_BLOCK overrides it, and a
+// test may set it.
+inline size_t& big_block() {
+    static size_t b = [] {
         const char* e = getenv("GCS_BIG_BLOCK");
         return e ? size_t(strtoull(e, nullptr, 10)) : (size_t(256) << 10);
     }();
