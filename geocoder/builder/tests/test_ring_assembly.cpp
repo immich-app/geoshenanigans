@@ -432,3 +432,27 @@ TEST(area_rings_rings_touching_at_a_node_stay_as_they_are) {
         CHECK_EQ(polygons_holding(polygons, 8.0, 8.0), 1);
     }
 }
+
+// A node listed twice in a row (or two nodes at one location) makes no
+// segment in osmium, so its coordinate is no place where rings touch: an
+// outline repeating each of its 160 coordinates is one ring, not 160
+// touching coordinates past osmium's limit of 100.
+TEST(area_rings_drop_coordinates_repeated_in_a_row) {
+    std::vector<Coord> outline;
+    for (int i = 0; i < 40; i++) outline.push_back({0.0, double(i)});
+    for (int i = 0; i < 40; i++) outline.push_back({double(i), 40.0});
+    for (int i = 40; i > 0; i--) outline.push_back({40.0, double(i)});
+    for (int i = 40; i > 0; i--) outline.push_back({double(i), 0.0});
+    std::vector<Coord> repeated;
+    for (const Coord& c : outline) repeated.insert(repeated.end(), {c, c});
+    repeated.push_back(outline.front());
+    WayGeometries geoms;
+    add_way(geoms, 1, repeated);
+    const AreaRings a = assemble_area_rings({{1, "outer"}}, geoms);
+    CHECK(a.failure == AreaFailure::None);
+    REQUIRE(a.rings.size() == size_t(1));
+    CHECK_EQ(a.rings[0].size(), outline.size() + 1);
+    const std::vector<NestedPolygon> polygons = nested(a);
+    CHECK_EQ(polygons_holding(polygons, 20.0, 20.0), 1);
+    CHECK_EQ(polygons_holding(polygons, 50.0, 50.0), 0);
+}

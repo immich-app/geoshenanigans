@@ -16,6 +16,22 @@ struct SubWay {
 
 int64_t key_of(const std::pair<double,double>& p) { return coord_key(p.first, p.second); }
 
+// Whether a coordinate follows itself somewhere along the way (a node listed
+// twice in a row, or two nodes at one location).
+bool repeats_a_coordinate(const CoordSpan& coords) {
+    for (size_t i = 1; i < coords.size(); i++)
+        if (key_of(coords[i]) == key_of(coords[i - 1])) return true;
+    return false;
+}
+
+Coords without_repeats(const CoordSpan& coords) {
+    Coords out;
+    out.reserve(coords.size());
+    for (const auto& p : coords)
+        if (out.empty() || key_of(out.back()) != key_of(p)) out.push_back(p);
+    return out;
+}
+
 uint8_t role_bit(const std::string& role) {
     if (role == "outer" || role.empty()) return kRoleOuter;
     if (role == "inner") return kRoleInner;
@@ -459,10 +475,22 @@ AreaRings assemble_area_rings(const std::vector<std::pair<int64_t, std::string>>
     AreaRings out;
     std::vector<CoordSpan> way_coords;
     std::vector<uint8_t> way_roles;
+    // osmium makes no segment of a coordinate and its repeat straight after
+    // it (SegmentList::extract_segments_from_way_impl), so such repeats are
+    // no coordinates rings touch at: the ways that have them are copied
+    // without them, and way_coords points at the copies.
+    std::vector<Coords> repeats_dropped;
+    repeats_dropped.reserve(members.size());
     for (const auto& [way_id, role] : members) {
         const auto* way = way_geoms.find(way_id);
-        if (!way || way->count == 0) continue;
-        way_coords.push_back(way_geoms.coords_of(*way));
+        if (!way) continue;
+        CoordSpan coords = way_geoms.coords_of(*way);
+        if (repeats_a_coordinate(coords)) {
+            repeats_dropped.push_back(without_repeats(coords));
+            coords = {repeats_dropped.back().data(), repeats_dropped.back().size()};
+        }
+        if (coords.size() < 2) continue;  // no segment
+        way_coords.push_back(coords);
         way_roles.push_back(role_bit(role));
     }
     std::vector<SubWay> sub_ways = split_sub_ways(way_coords, way_roles);
