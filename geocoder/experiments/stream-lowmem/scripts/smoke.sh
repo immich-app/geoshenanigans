@@ -8,7 +8,7 @@ M=${M:-/ssd/memory} I=${I:-/ssd/memory/inst/enc/2026-10-12} REF=${REF:-/ssd/shri
 P=${P:-/ssd/shrink/sortpatch/patch/out/v8/2026-10-13}
 sv=${v//\//_}
 O=$M/smoke/$sv
-rm -rf "$O"; mkdir -p "$O" $M/tmp
+rm -rf "$O"; mkdir -p "$O" $M/tmp $M/logs
 export TMPDIR=$M/tmp PATH=/ssd/shrink/zstd157/bin:$PATH
 /usr/bin/time -f "wall=%e user=%U sys=%S maxrss_kib=%M" taskset -c ${CORES:-40} "$BIN" "$I/$v" "$P/$sv/patch.gcpatch" -o "$O/" ${EXTRA:-} 2> "$M/logs/smoke.$sv.log"
 echo "rc=$?"; tail -3 "$M/logs/smoke.$sv.log"
