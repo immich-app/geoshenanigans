@@ -153,3 +153,33 @@ impl<'g> SearchIndex<'g> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fixture::{build_search, Geo, TempDir};
+    use crate::query::Searcher;
+
+    #[test]
+    fn opens_an_index_with_empty_data_files() {
+        // Place nodes only, one posting per key (all inline), no boundary slot, and a POI
+        // sub-index without a named POI: places.post, places.bnd, poi.post and poi.pfx are empty.
+        let mut g = Geo::default();
+        g.place("Alpha", 1, 10.0, 20.0);
+        g.place("Bravo", 2, 10.1, 20.1);
+        g.poi("", 10.0, 20.0, 0);
+        let dir = TempDir::new("empty-files");
+        let geo = g.load(&dir.0.join("geo"));
+        let out = dir.0.join("idx");
+        build_search(&geo, &out, None);
+        for f in ["places.post", "places.bnd", "poi.post", "poi.pfx"] {
+            assert_eq!(std::fs::metadata(out.join(f)).unwrap().len(), 0, "{f}");
+        }
+
+        let idx = SearchIndex::open(&geo, &out, None, None).unwrap();
+
+        assert!(idx.poi.is_some());
+        let (found, _) = Searcher::new(&idx).search("alpha", 5);
+        assert_eq!(found.iter().map(|f| (f.hit.entity, f.name.as_str())).collect::<Vec<_>>(), [(0, "Alpha")]);
+    }
+}
