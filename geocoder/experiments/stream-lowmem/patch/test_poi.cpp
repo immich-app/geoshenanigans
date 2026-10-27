@@ -1,7 +1,9 @@
 // test_poi DIR: encodes a synthetic POI set (points, small and big polygons, closed and open rings,
 // both vertex widths) with PoiEnc, fed in odd-sized pieces, decodes it with PoiDec and checks the
-// round trip byte for byte. Run it with and without GCS_BIG_BLOCK=64 and cmp the two DIRs: the big
-// block path (planes through positional writers, the open-ring relayout) must give the same files.
+// round trip byte for byte. Polygons of 9000 to 70000 vertices span several decoder steps
+// (VERTS_PER_STEP) and, when open, several 64 KiB pieces of the encoder's plane relayout. Run it
+// with and without GCS_BIG_BLOCK=64 and cmp the two DIRs: the big block path (planes through
+// positional writers, the open-ring relayout) must give the same files.
 #include <random>
 #include <sys/stat.h>
 #include "gcs_codec.h"
@@ -15,8 +17,10 @@ int main(int argc, char** argv) {
     std::mt19937 rng(20261018);
     std::vector<uint8_t> recs, verts;
     struct Spec { uint32_t vc; int w; bool closed; };
-    const Spec specs[] = {{0, 0, false}, {3000, 2, false}, {5, 2, true}, {2000, 4, true}, {0, 0, false},
-                          {7, 4, false}, {4096, 2, true}, {1, 2, false}, {2500, 4, false}, {0, 0, false}, {2, 2, true}};
+    const Spec specs[] = {{0, 0, false},      {3000, 2, false},  {5, 2, true},       {2000, 4, true},   {0, 0, false},
+                          {7, 4, false},      {4096, 2, true},   {1, 2, false},      {2500, 4, false},  {0, 0, false},
+                          {2, 2, true},       {70000, 2, false}, {17000, 2, true},   {70000, 4, false}, {17000, 4, true},
+                          {9000, 2, false},   {65538, 2, false}, {65537, 4, false},  {65536, 2, false}};
     for (const Spec& sp : specs) {
         uint8_t r[36];
         for (auto& b : r) b = uint8_t(rng());
