@@ -472,8 +472,8 @@ static bool same_bytes(const char* a, size_t an, const char* b, size_t bn) {
 // on the raw bytes): the patcher copies it, so every record keeps its id
 // whatever the string remap makes of its fields. Its merge is then one MATCH
 // of every record with no id remap and no secondary pairs, so the entry
-// corrections, the street remap of the addresses and the side files start
-// from the ids the patcher keeps.
+// corrections, the street remap of the addresses, the side files and the
+// POI / place cell indexes start from the ids the patcher keeps.
 static bool sent_unchanged(const char* a, size_t an, const char* b, size_t bn) {
     return an > 0 && same_bytes(a, an, b, bn);
 }
@@ -1308,6 +1308,7 @@ static int run(int argc, char* argv[]) {
         // like name_id, so they get the same str_remap. (Previously bytes
         // 24/28 were wrongly remapped via the way-index / postcode-centroid
         // tables — see the parent-id block below, now removed.)
+        const bool unchanged = sent_unchanged(old_data.data, old_data.size, new_data.data, new_data.size);
         if (old_data.size > 0)
             remap_string_fields(old_data.data, old_data.size, PatchFileId::POI_RECORDS, poi_stride, str_remap);
 
@@ -1338,7 +1339,7 @@ static int run(int argc, char* argv[]) {
         for (size_t i = 0; i < n; i++) memcpy(&old_offsets[i], old_data.data + i * poi_stride + 8, 4);
         // v15-aware fixup: PoiRecord's vertex_offset lives at byte 8.
         // Same byte-block hash strategy as admin polygons.
-        if (old_data.size > 0 && new_data.size > 0) {
+        if (old_data.size > 0 && new_data.size > 0 && !unchanged) {
             fixup_v15_offsets(old_data.data, old_data.size, old_v.data, old_v.size,
                               new_data.data, new_data.size, new_v.data, new_v.size,
                               poi_stride, /*off_field_pos=*/8,
@@ -1350,8 +1351,8 @@ static int run(int argc, char* argv[]) {
                               });
         }
         auto fixups = collect_offset_fixups(old_offsets, old_data.data, poi_stride, POI_RECORD_VERTEX_OFFSET_OFF);
-        auto pr_seq = build_merge_seq(old_data.data, old_data.size,
-                                       new_data.data, new_data.size, poi_stride);
+        auto pr_seq = unchanged ? match_all(n)
+                                : build_merge_seq(old_data.data, old_data.size, new_data.data, new_data.size, poi_stride);
         auto soft = secondary_match_from_merge(pr_seq, old_data.data, old_data.size,
             new_data.data, new_data.size, poi_stride,
             [](const char* rec) -> uint64_t {
@@ -1417,6 +1418,7 @@ static int run(int argc, char* argv[]) {
             log_time("  group:place (empty)", gs);
             return;
         }
+        const bool unchanged = sent_unchanged(old_data.data, old_data.size, new_data.data, new_data.size);
         // String remap on name_id field (offset 8)
         if (old_data.size > 0)
             remap_string_fields(old_data.data, old_data.size, PatchFileId::PLACE_NODES, place_stride, str_remap);
@@ -1433,8 +1435,8 @@ static int run(int argc, char* argv[]) {
         // files are in slot order, not (type, name, lat, lng) order. The
         // key-sorted merge this replaced re-sent nearly the whole file daily
         // (planet: 3.1M of 4.1M places secondary-matched).
-        auto pn_seq = build_merge_seq(old_data.data, old_data.size,
-                                      new_data.data, new_data.size, place_stride);
+        auto pn_seq = unchanged ? match_all(old_data.size / place_stride)
+                                : build_merge_seq(old_data.data, old_data.size, new_data.data, new_data.size, place_stride);
         auto soft = secondary_match_from_merge(pn_seq, old_data.data, old_data.size,
             new_data.data, new_data.size, place_stride,
             [](const char* rec) -> uint64_t {

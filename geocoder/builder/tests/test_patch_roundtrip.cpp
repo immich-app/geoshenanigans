@@ -70,6 +70,13 @@ void put_geo_cell(BuildDir& d, const std::vector<uint32_t>& streets, const std::
     d["geo_cells.bin"] = geo;
 }
 
+// <prefix>_cells.bin and <prefix>_entries.bin holding CELL, which lists ids.
+void put_cell_index(BuildDir& d, const std::string& prefix, const std::vector<uint32_t>& ids) {
+    auto [cells, entries] = write_cell_lists({{CELL, ids}});
+    d[prefix + "_cells.bin"] = cells;
+    d[prefix + "_entries.bin"] = entries;
+}
+
 bool write_dir(const std::string& path, const BuildDir& files) {
     std::filesystem::create_directories(path);
     for (const auto& [name, bytes] : files)
@@ -126,6 +133,26 @@ AddrPoint addr_point(uint32_t name, uint32_t parent_way) {
     return {48.0f, 11.0f, name, name, parent_way, NO_DATA, 0};
 }
 
+PoiRecord poi(uint32_t name) {
+    PoiRecord p{};
+    p.lat = 48.0f;
+    p.lng = 11.0f;
+    p.vertex_offset = NO_DATA;
+    p.name_id = name;
+    p.category = 1;
+    p.tier = 1;
+    return p;
+}
+
+PlaceNode place(uint32_t name) {
+    PlaceNode p{};
+    p.lat = 48.0f;
+    p.lng = 11.0f;
+    p.name_id = name;
+    p.place_type = 1;
+    return p;
+}
+
 }  // namespace
 
 TEST(patch_round_trip_keeps_the_street_ids_of_unchanged_street_ways) {
@@ -164,6 +191,24 @@ TEST(patch_round_trip_keeps_the_interp_ids_of_unchanged_interp_ways) {
     old_d["interp_nodes.bin"] = new_d["interp_nodes.bin"] = bytes_of(std::vector<NodeCoord>{node, node});
     put_geo_cell(old_d, {}, {}, {0, 1});
     put_geo_cell(new_d, {}, {}, {0, 1});
+
+    CHECK(round_trip_mismatches(old_d, new_d).empty());
+}
+
+TEST(patch_round_trip_keeps_the_poi_ids_of_unchanged_poi_records) {
+    BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(NEW_POOL);
+    old_d["poi_records.bin"] = new_d["poi_records.bin"] = bytes_of(std::vector<PoiRecord>{poi(NAME_2), poi(NAME_4)});
+    put_cell_index(old_d, "poi", {0, 1});
+    put_cell_index(new_d, "poi", {0, 1});
+
+    CHECK(round_trip_mismatches(old_d, new_d).empty());
+}
+
+TEST(patch_round_trip_keeps_the_place_ids_of_unchanged_place_nodes) {
+    BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(NEW_POOL);
+    old_d["place_nodes.bin"] = new_d["place_nodes.bin"] = bytes_of(std::vector<PlaceNode>{place(NAME_2), place(NAME_4)});
+    put_cell_index(old_d, "place", {0, 1});
+    put_cell_index(new_d, "place", {0, 1});
 
     CHECK(round_trip_mismatches(old_d, new_d).empty());
 }
