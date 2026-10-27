@@ -88,6 +88,7 @@ enum class VertexEncoding : uint8_t {
     U32_1CM   = 3,  // u32 @ 1e-7° (1.1 cm), fits any polygon        → countries / fallback
 };
 static constexpr uint8_t VERTEX_STRIDE[4] = {4, 4, 4, 8};
+static constexpr double VERTEX_SCALE[4] = {1e-5, 1e-4, 1e-6, 1e-7};  // degrees per delta step
 
 // admin_vertices.bin / poi_vertices.bin / addr_vertices.bin layout per
 // polygon (only present when vertex_count > 0):
