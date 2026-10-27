@@ -671,17 +671,21 @@ fn flush_slot(slot: &mut PrefixSlot) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Next (prefix, blob) of one per-length prefix file.
-fn read_prefix(r: &mut BufReader<File>) -> Option<(Vec<u8>, Vec<u8>)> {
+/// Next (prefix, blob) of one per-length prefix file: None at the file's end (nothing left before
+/// an entry), an error for a failed read or an entry cut short.
+fn read_prefix(r: &mut BufReader<File>) -> std::io::Result<Option<(Vec<u8>, Vec<u8>)>> {
+    if r.fill_buf()?.is_empty() {
+        return Ok(None);
+    }
     let mut l2 = [0u8; 2];
-    r.read_exact(&mut l2).ok()?;
+    r.read_exact(&mut l2)?;
     let mut k = vec![0u8; u16::from_le_bytes(l2) as usize];
-    r.read_exact(&mut k).ok()?;
+    r.read_exact(&mut k)?;
     let mut l4 = [0u8; 4];
-    r.read_exact(&mut l4).ok()?;
+    r.read_exact(&mut l4)?;
     let mut b = vec![0u8; u32::from_le_bytes(l4) as usize];
-    r.read_exact(&mut b).ok()?;
-    Some((k, b))
+    r.read_exact(&mut b)?;
+    Ok(Some((k, b)))
 }
 
 fn vm_hwm_kb() -> u64 {
@@ -825,7 +829,9 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
         pfx_readers.push(BufReader::new(File::open(&sl.path).map_err(|e| e.to_string())?));
     }
     // Merge the per-length files: each is sorted, and a prefix occurs in one length only.
-    let mut heads: Vec<Option<(Vec<u8>, Vec<u8>)>> = pfx_readers.iter_mut().map(read_prefix).collect();
+    let prefix_error = |i: usize, e: std::io::Error| format!("prefix temp file {}: {e}", slots[i].path.display());
+    let mut heads: Vec<Option<(Vec<u8>, Vec<u8>)>> =
+        pfx_readers.iter_mut().enumerate().map(|(i, r)| read_prefix(r).map_err(|e| prefix_error(i, e))).collect::<Result<_, _>>()?;
     let mut pf = fst::MapBuilder::new(BufWriter::new(mk("pfx.fst")?)).map_err(|e| e.to_string())?;
     let mut pb = BufWriter::new(mk("pfx")?);
     let mut off = 0u64;
@@ -837,7 +843,7 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
         pf.insert(&k, off).map_err(|e| e.to_string())?;
         pb.write_all(&blob).map_err(|e| e.to_string())?;
         off += blob.len() as u64;
-        heads[i] = read_prefix(&mut pfx_readers[i]);
+        heads[i] = read_prefix(&mut pfx_readers[i]).map_err(|e| prefix_error(i, e))?;
     }
     for sl in &slots {
         let _ = std::fs::remove_file(&sl.path);
@@ -1028,7 +1034,7 @@ mod tests {
         let slot = &mut w.slots[0];
         flush_slot(slot).unwrap();
         slot.out.flush().unwrap();
-        let (k, blob) = read_prefix(&mut BufReader::new(File::open(&slot.path).unwrap())).unwrap();
+        let (k, blob) = read_prefix(&mut BufReader::new(File::open(&slot.path).unwrap())).unwrap().unwrap();
         let mut hits = Vec::new();
         decode_prefix_hits(&blob, 0, &mut hits);
         std::fs::remove_dir_all(&dir).ok();
@@ -1061,6 +1067,30 @@ mod tests {
     }
 
     #[test]
+    fn prefix_reader_tells_the_end_from_a_cut_entry() {
+        // u16 prefix length, prefix, u32 blob length, blob (flush_slot).
+        let entry = [&2u16.to_le_bytes()[..], b"ab", &3u32.to_le_bytes(), &[1, 2, 3]].concat();
+        let path = std::env::temp_dir().join(format!("pfx-cut-{}.tmp", std::process::id()));
+        let read_all = |bytes: &[u8]| -> std::io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+            std::fs::write(&path, bytes).unwrap();
+            let mut r = BufReader::new(File::open(&path).unwrap());
+            let mut entries = Vec::new();
+            while let Some(e) = read_prefix(&mut r)? {
+                entries.push(e);
+            }
+            Ok(entries)
+        };
+        assert!(read_all(&[]).unwrap().is_empty());
+        assert_eq!(read_all(&entry).unwrap(), vec![(b"ab".to_vec(), vec![1, 2, 3])]);
+        // The next entry cut in its prefix length, its prefix, its blob length and its blob.
+        for cut in [1, 3, 5, entry.len() - 1] {
+            let bytes = [&entry[..], &entry[..cut]].concat();
+            assert_eq!(read_all(&bytes).map_err(|e| e.kind()), Err(std::io::ErrorKind::UnexpectedEof), "cut at {cut}");
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn prefix_table_takes_a_keys_best_scores() {
         // Forty class-5 postings come first by importance; the class-0 one after them scores best.
         let dir = std::env::temp_dir().join(format!("pfx-score-{}", std::process::id()));
@@ -1073,7 +1103,7 @@ mod tests {
         let slot = &mut w.slots[0];
         flush_slot(slot).unwrap();
         slot.out.flush().unwrap();
-        let (k, blob) = read_prefix(&mut BufReader::new(File::open(&slot.path).unwrap())).unwrap();
+        let (k, blob) = read_prefix(&mut BufReader::new(File::open(&slot.path).unwrap())).unwrap().unwrap();
         let mut hits = Vec::new();
         decode_prefix_hits(&blob, 0, &mut hits);
         std::fs::remove_dir_all(&dir).ok();
