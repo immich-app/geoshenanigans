@@ -9,6 +9,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -815,6 +816,13 @@ inline void order_poi_strings_by_record(ParsedData& data, unsigned threads = 0) 
     tier = std::move(laid);
     for (size_t t = 0; t < POI_MAX_SHIPPED_TIER; t++) data.poi_tier_string_ends[t] = at[group_end[t]];
     data.poi_tier_string_ends[POI_MAX_SHIPPED_TIER] = static_cast<uint32_t>(tier.size());
+}
+
+// The POI string tier as the dir of the POIs of tier <= max_tier ships it:
+// the head that holds their names.
+inline std::string_view poi_dir_strings(const ParsedData& data, uint8_t max_tier) {
+    const std::vector<char>& tier = data.strings_tiers[STR_TIER_POI];
+    return {tier.data(), std::min<size_t>(data.poi_tier_string_ends.at(max_tier), tier.size())};
 }
 
 // --- Deduplicate IDs per cell ---

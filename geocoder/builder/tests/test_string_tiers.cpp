@@ -220,6 +220,40 @@ TEST(order_poi_strings_matches_a_serial_walk_for_any_thread_count) {
     }
 }
 
+TEST(poi_dir_strings_hold_the_names_of_the_dirs_pois) {
+    // Each POI dir's head of the tier holds every name its records use, and
+    // the major dir's holds no name only a less important POI uses.
+    uint64_t seed = 37;
+    auto rnd = [&](uint32_t n) { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return (uint32_t)(seed >> 33) % n; };
+    std::vector<std::pair<std::string, uint8_t>> names;
+    for (int i = 0; i < 20000; i++) names.push_back({"poi " + std::to_string(rnd(5000)), static_cast<uint8_t>(rnd(5))});
+    ParsedData d = poi_build(names);
+    // Before the ordering every dir ships the whole tier.
+    CHECK_EQ(poi_dir_strings(d, 1).size(), d.strings_tiers[STR_TIER_POI].size());
+    order_poi_strings_by_record(d);
+    const uint32_t base = d.strings_tier_bases[STR_TIER_POI];
+    std::unordered_map<uint32_t, uint8_t> home;
+    for (const auto& pr : d.poi_records)
+        if (pr.tier <= POI_MAX_SHIPPED_TIER) {
+            auto [it, fresh] = home.emplace(pr.name_id, pr.tier);
+            if (!fresh) it->second = std::min(it->second, pr.tier);
+        }
+    for (uint8_t t = 0; t <= POI_MAX_SHIPPED_TIER; t++) {
+        const std::string_view head = poi_dir_strings(d, t);
+        CHECK(std::string_view(d.strings_tiers[STR_TIER_POI].data(), head.size()) == head);
+        bool in = true, out = true;
+        for (const auto& [name_id, h] : home) {
+            const uint32_t local = name_id - base;
+            const bool inside = local < head.size() && local + strlen(head.data() + local) < head.size();
+            if (h <= t) in = in && inside;
+            else out = out && !inside;
+        }
+        CHECK(in);
+        CHECK(out);
+    }
+    CHECK_EQ(poi_dir_strings(d, POI_MAX_SHIPPED_TIER).size(), d.strings_tiers[STR_TIER_POI].size());
+}
+
 TEST(order_poi_strings_puts_names_no_shipped_record_uses_last) {
     // Partitioning never leaves such a name; the order stays a permutation.
     ParsedData d;
