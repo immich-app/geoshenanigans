@@ -8,7 +8,7 @@
 //
 // Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir>
 //
-// Reads GCPATCH v8 ( REPLACE runs, street remap derived from the
+// Reads GCPATCH v9 ( REPLACE runs, street remap derived from the
 // street_ways replay, PARALLEL_DELTA_STRIDE side files, unmapped ids dropped
 // from street / addr / interp cell lists).
 
@@ -231,14 +231,13 @@ static int run(int argc, char* argv[]) {
             MappedFile new_pool = mmap_file(out_path(name));
             if (new_pool.size != strings.new_size(t) || content_hash(new_pool.data, new_pool.size) != diff.new_hash)
                 throw std::runtime_error(std::string("Rebuilt ") + name + " does not match the new build");
-            str_remap.add_tier(old_pool.data, old_pool.size, strings.old_base[t],
-                               new_pool.data, new_pool.size, strings.new_base[t]);
+            str_remap.add_tier(old_pool.data, old_pool.size, strings.old_base[t], strings.new_base[t], diff);
             old_str_pools.push_back(old_pool);
             unmap_file(new_pool);
         });
         malloc_trim(0);
         std::cerr << "  Strings: +" << total_added << " -" << total_deleted << ", "
-                  << str_remap.run_count() << " remap runs, " << strings.pairs.size() << " cross-tier pairs" << std::endl;
+                  << str_remap.run_count() << " remap runs, " << strings.pairs.size() << " moved-string pairs" << std::endl;
     }
     // Release patch pages read so far (string section)
     madvise(const_cast<char*>(patch_map.data), pos, MADV_DONTNEED);
