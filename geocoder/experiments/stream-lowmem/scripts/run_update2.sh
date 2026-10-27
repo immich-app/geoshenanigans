@@ -27,11 +27,13 @@ if [ ! -f "$I.done" ]; then
   need_free_gb 40
   lock_acquire "e2e copy installed $kind $OLD (untimed)"
   rm -rf "$I"
+  copied=1
   for v in $VARIANTS; do
-    mkdir -p "$I/$v"
-    find "$SRC/$v" -maxdepth 1 -type f ! -name '.*' ! -name '*.osm_ids' ! -name '*.gcpatch' ! -name '*.zst' \
-      -exec cp --reflink=never {} "$I/$v/" \;
+    mkdir -p "$I/$v" && find "$SRC/$v" -maxdepth 1 -type f ! -name '.*' ! -name '*.osm_ids' ! -name '*.gcpatch' ! -name '*.zst' \
+      -exec cp --reflink=never -t "$I/$v/" {} + || copied=0
   done
+  # (a set marked done is reused by every later run)
+  [ $copied = 1 ] || { echo "copying the installed set $SRC failed"; rm -rf "$I"; exit 1; }
   sync; touch "$I.done"
   lock_release
 fi
