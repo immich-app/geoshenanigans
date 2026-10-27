@@ -1105,23 +1105,6 @@ static PackedPolygon pack_admin_polygon(const ParsedData& data, const AdminPolyg
 
 using RingCells = std::vector<std::pair<uint64_t, bool>>;
 
-// The cells of either of two rings of one polygon (admin_ring_cells, both
-// ascending), interior where interior for both.
-static RingCells either_ring(const RingCells& x, const RingCells& y) {
-    RingCells out;
-    out.reserve(std::max(x.size(), y.size()));
-    for (size_t i = 0, j = 0; i < x.size() || j < y.size();) {
-        if (j == y.size() || (i < x.size() && x[i].first < y[j].first)) {
-            out.emplace_back(x[i++].first, false);
-        } else if (i == x.size() || y[j].first < x[i].first) {
-            out.emplace_back(y[j++].first, false);
-        } else {
-            out.emplace_back(x[i].first, x[i].second && y[j].second);
-            i++, j++;
-        }
-    }
-    return out;
-}
 
 void compute_admin_index_cells(ParsedData& data, const std::vector<double>& scales,
                                std::optional<double> minimal_scale) {
@@ -1149,7 +1132,7 @@ void compute_admin_index_cells(ParsedData& data, const std::vector<double>& scal
                 RingCells cells = ring_cells(scale);
                 if (minimal && scale == *minimal_scale) own_minimal = cells;
                 if (cells.empty()) continue;
-                shared = shared ? either_ring(*shared, cells) : std::move(cells);
+                shared = shared ? merge_admin_ring_cells(*shared, cells) : std::move(cells);
             }
             if (minimal && !own_minimal) own_minimal = ring_cells(*minimal_scale);
             const uint32_t id = static_cast<uint32_t>(i);

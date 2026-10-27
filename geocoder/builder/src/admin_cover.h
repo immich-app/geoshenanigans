@@ -43,3 +43,8 @@ std::vector<std::pair<uint64_t, bool>> admin_ring_cells(const NodeCoord* verts, 
 // S2CellId::AppendAllNeighbors at the cell's level), and its admin scan then
 // reads the query's own cell there.
 bool admin_cell_routed(uint64_t cell, const std::function<bool(uint64_t)>& holds);
+
+using AdminRingCells = std::vector<std::pair<uint64_t, bool>>;
+
+// Cover either geometry variant, marking a cell interior only if both do.
+AdminRingCells merge_admin_ring_cells(const AdminRingCells& x, const AdminRingCells& y);

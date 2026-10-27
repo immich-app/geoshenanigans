@@ -186,3 +186,22 @@ bool admin_cell_routed(uint64_t cell, const std::function<bool(uint64_t)>& holds
     id.AppendAllNeighbors(id.level(), &neighbours);
     return std::any_of(neighbours.begin(), neighbours.end(), [&](S2CellId n) { return holds(n.id()); });
 }
+
+// The cells of either of two rings of one polygon (admin_ring_cells, both
+// ascending), interior where interior for both.
+AdminRingCells merge_admin_ring_cells(const AdminRingCells& x, const AdminRingCells& y) {
+    AdminRingCells out;
+    out.reserve(std::max(x.size(), y.size()));
+    for (size_t i = 0, j = 0; i < x.size() || j < y.size();) {
+        if (j == y.size() || (i < x.size() && x[i].first < y[j].first)) {
+            out.emplace_back(x[i++].first, false);
+        } else if (i == x.size() || y[j].first < x[i].first) {
+            out.emplace_back(y[j++].first, false);
+        } else {
+            out.emplace_back(x[i].first, x[i].second && y[j].second);
+            i++, j++;
+        }
+    }
+    return out;
+}
+
