@@ -142,6 +142,11 @@ int main(int argc, char** argv) {
         } else usage();
     }
     if (mkdir(out.c_str(), 0755) && errno != EEXIST) die("mkdir %s: %s", out.c_str(), strerror(errno));
+    struct stat source_stat{}, output_stat{};
+    if (stat(src.c_str(), &source_stat)) die("stat %s: %s", src.c_str(), strerror(errno));
+    if (stat(out.c_str(), &output_stat)) die("stat %s: %s", out.c_str(), strerror(errno));
+    if (source_stat.st_dev == output_stat.st_dev && source_stat.st_ino == output_stat.st_ino)
+        die("OUT_DIR %s is SRC_DIR %s", out.c_str(), src.c_str());
     const std::vector<Family> fams = families(pax);
     const double t0 = wall_now(), c0 = cpu_now();
     std::set<std::string> consumed;  // files of SRC not to hardlink

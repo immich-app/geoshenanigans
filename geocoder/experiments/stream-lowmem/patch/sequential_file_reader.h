@@ -101,6 +101,9 @@ inline std::unordered_map<std::string, uint64_t>& stream_sizes() {
 struct StreamSource {
     virtual ~StreamSource() = default;
     virtual size_t read(char* dst, size_t max) = 0;
+    // Drops the next n bytes unread (a coupled decoder then doesn't queue them for this reader while
+    // another one drives it); false when the source can't, and the reader reads past them later.
+    virtual bool skip(uint64_t) { return false; }
 };
 inline std::unique_ptr<StreamSource> (*&stream_source_factory())(const std::string&) {
     static std::unique_ptr<StreamSource> (*f)(const std::string&) = nullptr;
@@ -246,6 +249,16 @@ public:
     uint64_t buffered_from(uint64_t off) const {
         const uint64_t win_end = win_off_ + win_len_;
         return off >= win_off_ && off < win_end ? win_end - off : 0;
+    }
+
+    // Nothing before `off` is read again. A virtual stream drops those bytes in its decoder now,
+    // instead of queueing them until the next view reads past them; other files: nothing to do.
+    void skip_to(uint64_t off) {
+        if (!src_ || off <= sp_) return;
+        require_in_file(off, 0);
+        if (!src_->skip(off - sp_)) return;
+        sp_ = off;
+        win_len_ = 0;  // the window ended at the old stream position, before off
     }
 
     // Hands [off, off + n) to sink(bytes, len) in pieces of at most one window.

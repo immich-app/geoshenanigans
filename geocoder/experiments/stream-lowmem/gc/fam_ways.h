@@ -64,6 +64,8 @@ static inline size_t block_size(uint16_t cnt, uint16_t code) {
     const size_t wl = code & 63, wg = (code >> 6) & 63, wf = (code >> 13) & 7;
     return 2 * wf + ((size_t(cnt) - 1) * (wl + wg) + 7) / 8;
 }
+// The widths an encoder writes: the first node in at most 4 bytes, the deltas in at most 32 bits.
+static inline bool valid_code(uint16_t code) { return (code & 63) <= 32 && ((code >> 6) & 63) <= 32 && (code >> 13) <= 4; }
 
 struct Names {
     const char *ways, *nodes, *pre;
@@ -389,6 +391,7 @@ inline void decode(const std::string& src, const std::string& out, bool street, 
         }
         wr16(rec + 4, cnt);
         if (cnt) {
+            if (!valid_code(code)) die("%s: way %llu has a bad code %#x", nm.pre, (unsigned long long)i, unsigned(code));
             wr32(rec, uint32_t(node_off));
             const size_t bs = block_size(cnt, code);
             const uint8_t* q = nodes2.need(bs + 8, true);

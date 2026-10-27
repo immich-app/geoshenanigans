@@ -24,6 +24,7 @@
 #include "types.h"
 #include "string_pool.h"
 #include "id_allocator.h"
+#include "place_claims.h"
 #include "parallel.h"
 #include "ranked_bits.h"
 
@@ -396,11 +397,11 @@ struct ParsedData {
     };
     std::unordered_map<uint64_t, PostcodeAccum> postcode_accum;
 
-    // Place nodes claimed by label/wikidata boundary links (build-time only,
-    // consumed by link_places_by_name to hide them like Nominatim's
-    // linked_place_id). Raw OSM node ids; filled from parallel relation
-    // workers under the mutex.
-    std::vector<int64_t> linked_place_node_ids;
+    // Boundaries' label/wikidata claims on place nodes (build-time only,
+    // consumed by link_places_by_name to hide the nodes like Nominatim's
+    // linked_place_id and name their claimant); filled from parallel
+    // relation workers under the mutex.
+    std::vector<PlaceClaim> place_claims;
     std::unique_ptr<std::mutex> linked_pn_mutex = std::make_unique<std::mutex>();
 
     // Post-canonical-sort: strings partitioned into per-consumer tiers.

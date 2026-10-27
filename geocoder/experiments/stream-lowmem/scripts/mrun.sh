@@ -40,10 +40,12 @@ sib_busy_pct() { read b0 t0 <<< "$1"; read b1 t1 <<< "$2"; awk -v b=$((b1 - b0))
 if [ ! -f "$I.done" ]; then
   lock_acquire "memory: copy installed enc $OLD (untimed)"
   rm -rf "$I"
+  copied=1
   for v in $VARIANTS; do
-    mkdir -p "$I/$v"
-    find "$ENC/$OLD/$v" -maxdepth 1 -type f ! -name '.*' -exec cp --reflink=never {} "$I/$v/" \;
+    mkdir -p "$I/$v" && find "$ENC/$OLD/$v" -maxdepth 1 -type f ! -name '.*' -exec cp --reflink=never -t "$I/$v/" {} + || copied=0
   done
+  # (a set marked done is reused by every later run)
+  [ $copied = 1 ] || { echo "copying the installed set $ENC/$OLD failed"; rm -rf "$I"; exit 1; }
   sync; touch "$I.done"
   lock_release
 fi
@@ -122,3 +124,4 @@ lock_release
 echo "UPDATE $PROFILE $STYLE $OLD->$NEW rc=$rc sib_busy=$(sib_busy_pct "$s0" "$s1")% verify=\"$(tail -1 $R/verify.txt)\"" | tee "$R/result.txt"
 echo "MEM $(cat $R/mem.out)" | tee -a "$R/result.txt"
 grep -E '^(STAGE|ROLE|TOTAL)' "$R/update.out" | tee -a "$R/result.txt"
+[ $rc = 0 ] && [ $verdict = PASS ]  # the exit status: the update ran and every file matched

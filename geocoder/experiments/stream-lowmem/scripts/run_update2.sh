@@ -27,11 +27,13 @@ if [ ! -f "$I.done" ]; then
   need_free_gb 40
   lock_acquire "e2e copy installed $kind $OLD (untimed)"
   rm -rf "$I"
+  copied=1
   for v in $VARIANTS; do
-    mkdir -p "$I/$v"
-    find "$SRC/$v" -maxdepth 1 -type f ! -name '.*' ! -name '*.osm_ids' ! -name '*.gcpatch' ! -name '*.zst' \
-      -exec cp --reflink=never {} "$I/$v/" \;
+    mkdir -p "$I/$v" && find "$SRC/$v" -maxdepth 1 -type f ! -name '.*' ! -name '*.osm_ids' ! -name '*.gcpatch' ! -name '*.zst' \
+      -exec cp --reflink=never -t "$I/$v/" {} + || copied=0
   done
+  # (a set marked done is reused by every later run)
+  [ $copied = 1 ] || { echo "copying the installed set $SRC failed"; rm -rf "$I"; exit 1; }
   sync; touch "$I.done"
   lock_release
 fi
@@ -81,3 +83,4 @@ rm -rf "$W" "$N"
 lock_release
 echo "UPDATE $PROFILE $STYLE $OLD->$NEW rc=$rc sib_busy=$(sib_busy_pct "$s0" "$s1")% verify=\"$(tail -1 $R/verify.txt)\"" | tee "$R/result.txt"
 grep -E '^(KIND|ROLE|TOTAL)' "$R/update.out" | tee -a "$R/result.txt"
+[ $rc = 0 ] && [ $verdict = PASS ]  # the exit status: the update ran and every file matched

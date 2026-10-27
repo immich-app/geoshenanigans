@@ -5,7 +5,7 @@
 //! place-search query <set dir> <index dir> [--extras F] [--iso F] [--limit N]
 //!                    [--bench REPEATS [--no-warmup]]
 //!   one query per stdin line; default one JSON line per query, --bench latency percentiles
-//! place-search ctxbench <set dir> < "lat lng" lines   (reverse-lookup cost per point)
+//! place-search ctxbench <set dir> <index dir> < "lat lng" lines   (reverse-lookup cost per point)
 use place_search::build::{build, BuildOpts};
 use place_search::reader::SearchIndex;
 use place_search::query::Searcher;
@@ -55,6 +55,17 @@ fn cmd_build(args: &[String]) {
         area_proxy: flag(args, "--area-proxy"),
         poi_max_tier: opt(args, "--poi-max-tier").map(|v| v.parse().unwrap()).unwrap_or(3),
     };
+    let mut subs = vec![];
+    if sub == "places" || sub == "all" {
+        subs.push("places");
+    }
+    if (sub == "poi" || sub == "all") && geo.poi_records.is_some() {
+        subs.push("poi");
+    }
+    let mut replacing = subs.clone();
+    if geo.poi_records.is_none() { replacing.push("poi"); }
+    place_search::build::check_retained_names(&out, &replacing, opts.extras.is_some())
+        .unwrap_or_else(|e| panic!("{e}"));
     let meta_path = out.join("search_meta.json");
     let mut meta: serde_json::Value = std::fs::read_to_string(&meta_path)
         .ok()
@@ -67,13 +78,6 @@ fn cmd_build(args: &[String]) {
     meta["imp"] = json!(opts.imp_dir.is_some());
     meta["area_proxy"] = json!(opts.area_proxy);
     meta["poi_max_tier"] = json!(opts.poi_max_tier);
-    let mut subs = vec![];
-    if sub == "places" || sub == "all" {
-        subs.push("places");
-    }
-    if (sub == "poi" || sub == "all") && geo.poi_records.is_some() {
-        subs.push("poi");
-    }
     for (s, st) in build(&geo, &subs, &out, &opts).unwrap_or_else(|e| panic!("build: {e}")) {
         let mut o = serde_json::Map::new();
         for (k, v) in &st.lines {
@@ -87,6 +91,25 @@ fn cmd_build(args: &[String]) {
     eprintln!("build memory: {}", mem_json());
 }
 
+fn latency_summary(lat: &mut [f64]) -> Option<serde_json::Value> {
+    if lat.is_empty() { return None; }
+    lat.sort_by(f64::total_cmp);
+    let p = |q: f64| lat[((lat.len() - 1) as f64 * q).round() as usize];
+    Some(json!({"mean_us": lat.iter().sum::<f64>() / lat.len() as f64,
+                "p50_us": p(0.5), "p90_us": p(0.9), "p99_us": p(0.99), "max_us": p(1.0)}))
+}
+
+fn answer_lines(input: impl BufRead, out: &mut impl Write,
+                mut answer: impl FnMut(&str) -> serde_json::Value) -> std::io::Result<()> {
+    for line in input.lines() {
+        let q = line?;
+        if q.is_empty() { continue; }
+        writeln!(out, "{}", answer(&q))?;
+        out.flush()?;
+    }
+    Ok(())
+}
+
 fn cmd_query(args: &[String]) {
     let (set, dir) = (&args[2], Path::new(&args[3]));
     let limit: usize = opt(args, "--limit").map(|v| v.parse().unwrap()).unwrap_or(place_search::constants::DEFAULT_LIMIT);
@@ -97,8 +120,11 @@ fn cmd_query(args: &[String]) {
     let idx = SearchIndex::open(&geo, dir, extras.as_deref(), iso.as_deref()).expect("search index");
     let s = Searcher::new(&idx);
     eprintln!("load: {:.1} ms, memory {}", t.elapsed().as_secs_f64() * 1e3, mem_json());
-    let queries: Vec<String> = std::io::stdin().lock().lines().map_while(Result::ok).filter(|l| !l.is_empty()).collect();
     if let Some(rep) = opt(args, "--bench").map(|v| v.parse::<usize>().unwrap()) {
+        if rep == 0 { eprintln!("--bench needs at least 1 repeat"); std::process::exit(2); }
+        let queries: Vec<String> = std::io::stdin().lock().lines().collect::<Result<Vec<_>, _>>()
+            .expect("read queries").into_iter().filter(|l| !l.is_empty()).collect();
+        if queries.is_empty() { eprintln!("no queries on stdin"); std::process::exit(2); }
         if !flag(args, "--no-warmup") {
             for q in &queries {
                 std::hint::black_box(s.search(q, limit));
@@ -121,20 +147,19 @@ fn cmd_query(args: &[String]) {
             let text: Vec<String> = lat.iter().map(|v| format!("{v:.1}")).collect();
             std::fs::write(path, text.join("\n") + "\n").unwrap();
         }
-        lat.sort_by(|a, b| a.total_cmp(b));
-        let p = |q: f64| lat[((lat.len() as f64 - 1.0) * q).round() as usize];
-        let mean = lat.iter().sum::<f64>() / lat.len() as f64;
-        println!(
-            "{}",
-            json!({"queries": queries.len(), "runs": lat.len(), "wall_s": wall, "mean_us": mean, "p50_us": p(0.5),
-                   "p90_us": p(0.9), "p99_us": p(0.99), "max_us": p(1.0),
-                   "reverse_lookups_per_query": lookups as f64 / lat.len() as f64, "memory": mem_json()})
-        );
+        let mut summary = latency_summary(&mut lat).unwrap();
+        let obj = summary.as_object_mut().unwrap();
+        obj.insert("queries".into(), json!(queries.len()));
+        obj.insert("runs".into(), json!(lat.len()));
+        obj.insert("wall_s".into(), json!(wall));
+        obj.insert("reverse_lookups_per_query".into(), json!(lookups as f64 / lat.len() as f64));
+        obj.insert("memory".into(), mem_json());
+        println!("{summary}");
         return;
     }
     let out = std::io::stdout();
     let mut out = out.lock();
-    for q in &queries {
+    answer_lines(std::io::stdin().lock(), &mut out, |q| {
         let t = Instant::now();
         let (found, st) = s.search(q, limit);
         let us = t.elapsed().as_secs_f64() * 1e6;
@@ -160,15 +185,24 @@ fn cmd_query(args: &[String]) {
                 })
             })
             .collect();
-        writeln!(
-            out,
-            "{}",
-            json!({"q": q, "us": us, "reverse_lookups": st.reverse_lookups, "context_checks": st.context_checks, "keys": st.keys_matched,
-                   "postings": st.postings_read, "results": results})
-        )
-        .unwrap();
-    }
+        json!({"q": q, "us": us, "reverse_lookups": st.reverse_lookups, "context_checks": st.context_checks,
+               "keys": st.keys_matched, "postings": st.postings_read, "results": results})
+    }).expect("query input/output");
     eprintln!("after queries: memory {}", mem_json());
+}
+
+/// The "lat lng" points of `input`, one per line (other lines are skipped); an error for a failed
+/// read.
+fn read_points(input: impl BufRead) -> std::io::Result<Vec<(f32, f32)>> {
+    let mut pts = Vec::new();
+    for line in input.lines() {
+        let line = line?;
+        let mut it = line.split_whitespace();
+        if let (Some(Ok(lat)), Some(Ok(lng))) = (it.next().map(str::parse), it.next().map(str::parse)) {
+            pts.push((lat, lng));
+        }
+    }
+    Ok(pts)
 }
 
 fn cmd_ctxbench(args: &[String]) {
@@ -176,25 +210,19 @@ fn cmd_ctxbench(args: &[String]) {
     let dir = Path::new(&args[3]);
     let idx = SearchIndex::open(&geo, dir, None, None).expect("search index");
     let s = Searcher::new(&idx);
-    let pts: Vec<(f32, f32)> = std::io::stdin()
-        .lock()
-        .lines()
-        .map_while(Result::ok)
-        .filter_map(|l| {
-            let mut it = l.split_whitespace();
-            Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
-        })
-        .collect();
+    let pts = read_points(std::io::stdin().lock()).expect("read points");
     let mut lat = Vec::with_capacity(pts.len());
     for &(a, b) in &pts {
         let t = Instant::now();
         std::hint::black_box(s.context_at(a, b));
         lat.push(t.elapsed().as_secs_f64() * 1e6);
     }
-    lat.sort_by(|a, b| a.total_cmp(b));
-    let p = |q: f64| lat[((lat.len() as f64 - 1.0) * q).round() as usize];
-    println!("{}", json!({"points": pts.len(), "p50_us": p(0.5), "p90_us": p(0.9), "p99_us": p(0.99),
-                          "mean_us": lat.iter().sum::<f64>() / lat.len() as f64, "memory": mem_json()}));
+    let Some(mut summary) = latency_summary(&mut lat) else {
+        eprintln!("no 'lat lng' points parsed from stdin"); std::process::exit(2);
+    };
+    summary["points"] = json!(pts.len());
+    summary["memory"] = mem_json();
+    println!("{summary}");
 }
 
 /// Key-level churn between two builds of one sub-index: keys only in A, only in B, in both with
@@ -202,13 +230,8 @@ fn cmd_ctxbench(args: &[String]) {
 fn cmd_diff(args: &[String]) {
     use fst::{IntoStreamer, Streamer};
     let (a, b, name) = (Path::new(&args[2]), Path::new(&args[3]), &args[4]);
-    let with_names = |d: &Path| -> bool {
-        std::fs::read_to_string(d.join("search_meta.json")).ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|m| m["extras"].as_bool()).unwrap_or(false)
-    };
-    let sa = place_search::reader::SubIndex::open(a, name, with_names(a)).expect("A");
-    let sb = place_search::reader::SubIndex::open(b, name, with_names(b)).expect("B");
+    let sa = place_search::reader::SubIndex::open(a, name).expect("A");
+    let sb = place_search::reader::SubIndex::open(b, name).expect("B");
     let mut ia = sa.map.stream();
     let mut ib = sb.map.into_stream();
     let (mut only_a, mut only_b, mut same, mut changed) = (0u64, 0u64, 0u64, 0u64);
@@ -248,5 +271,70 @@ fn main() {
         Some("ctxbench") => cmd_ctxbench(&args),
         Some("diff") => cmd_diff(&args),
         _ => eprintln!("usage: see the header of main.rs"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[test]
+    fn empty_latency_samples_have_no_summary() {
+        assert!(latency_summary(&mut []).is_none());
+        let summary = latency_summary(&mut [5.0]).unwrap();
+        for key in ["mean_us", "p50_us", "p90_us", "p99_us", "max_us"] {
+            assert_eq!(summary[key], json!(5.0));
+        }
+    }
+
+    #[test]
+    fn queries_are_answered_and_flushed_before_reading_the_next_line() {
+        struct Input { first: bool, out: Rc<RefCell<Vec<u8>>> }
+        impl std::io::Read for Input {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.first { self.first = false; buf[..2].copy_from_slice(b"a\n"); Ok(2) }
+                else { assert_eq!(&*self.out.borrow(), b"{\"q\":\"a\"}\n"); Ok(0) }
+            }
+        }
+        struct Output(Rc<RefCell<Vec<u8>>>, usize);
+        impl Write for Output {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(buf); Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { self.1 += 1; Ok(()) }
+        }
+        let bytes = Rc::new(RefCell::new(Vec::new()));
+        let input = std::io::BufReader::new(Input { first: true, out: bytes.clone() });
+        let mut out = Output(bytes, 0);
+        answer_lines(input, &mut out, |q| json!({"q": q})).unwrap();
+        assert_eq!(out.1, 1);
+    }
+
+    #[test]
+    fn query_input_errors_are_reported() {
+        struct Broken;
+        impl std::io::Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("input failed"))
+            }
+        }
+        assert!(answer_lines(std::io::BufReader::new(Broken), &mut Vec::new(), |_| json!(null)).is_err());
+    }
+
+    #[test]
+    fn ctxbench_input_errors_are_reported() {
+        // One point line, then a failed read.
+        struct Broken(bool);
+        impl std::io::Read for Broken {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if std::mem::take(&mut self.0) { buf[..8].copy_from_slice(b"1.5 2.5\n"); return Ok(8); }
+                Err(std::io::Error::other("input failed"))
+            }
+        }
+        let points = read_points(std::io::BufReader::new(&b"1.5 2.5\nnot a point\n3 4\n"[..])).unwrap();
+        assert_eq!(points, vec![(1.5, 2.5), (3.0, 4.0)]);
+        assert!(read_points(std::io::BufReader::new(Broken(true))).is_err());
     }
 }

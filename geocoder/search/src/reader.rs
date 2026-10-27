@@ -23,20 +23,18 @@ pub struct SubIndex {
     pub post: Mmap,
     pub pfx_map: fst::Map<Mmap>,
     pub pfx: Mmap,
-    pub with_names: bool,
     /// Entity ids of this sub-index carry POI_BIT.
     pub poi: bool,
 }
 
 impl SubIndex {
-    pub fn open(dir: &Path, name: &str, with_names: bool) -> Result<Self, String> {
+    pub fn open(dir: &Path, name: &str) -> Result<Self, String> {
         let m = |ext: &str| map(&dir.join(format!("{name}.{ext}")));
         Ok(SubIndex {
             map: fst::Map::new(m("fst")?).map_err(|e| e.to_string())?,
             post: m("post")?,
             pfx_map: fst::Map::new(m("pfx.fst")?).map_err(|e| e.to_string())?,
             pfx: m("pfx")?,
-            with_names,
             poi: name == "poi",
         })
     }
@@ -54,7 +52,7 @@ impl SubIndex {
             out.push(self.tag(decode_inline(v)));
             return;
         }
-        out.extend(ListReader::new(&self.post, list_offset(v), self.with_names).map(|p| self.tag(p)));
+        out.extend(ListReader::new(&self.post, list_offset(v)).map(|p| self.tag(p)));
     }
 
     /// Best importance under a key, from the fst value alone.
@@ -68,7 +66,7 @@ impl SubIndex {
     pub fn prefix_hits(&self, phrase: &str) -> Option<Vec<PrefixHit>> {
         let off = self.pfx_map.get(phrase)?;
         let mut out = Vec::new();
-        decode_prefix_hits(&self.pfx, off as usize, self.with_names, &mut out);
+        decode_prefix_hits(&self.pfx, off as usize, &mut out);
         if self.poi {
             for h in out.iter_mut() {
                 h.entity |= POI_BIT;
@@ -87,9 +85,11 @@ pub struct Iso {
 }
 
 impl Iso {
-    pub fn load(path: &Path, geo: &Index) -> Iso {
+    /// The ISO code list at `path` (lines "<polygon>\t<code>;<code>..."); a file that cannot be
+    /// read is an error.
+    pub fn load(path: &Path, geo: &Index) -> Result<Iso, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut iso = Iso::default();
-        let Ok(text) = std::fs::read_to_string(path) else { return iso };
         for line in text.lines() {
             let Some((poly, codes)) = line.split_once('\t') else { continue };
             let Ok(poly) = poly.parse::<u32>() else { continue };
@@ -102,7 +102,7 @@ impl Iso {
                 iso.state.entry((cc, normalize(geo.get_string(ap.name_id)))).or_default().extend(codes);
             }
         }
-        iso
+        Ok(iso)
     }
 }
 
@@ -130,16 +130,19 @@ impl<'g> SearchIndex<'g> {
         };
         let n_place_nodes = meta["n_place_nodes"].as_u64().unwrap_or(0) as u32;
         let poi = if dir.join("poi.fst").exists() && geo.poi_records.is_some() {
-            Some(SubIndex::open(dir, "poi", with_names)?)
+            Some(SubIndex::open(dir, "poi")?)
         } else {
             None
         };
         Ok(SearchIndex {
             geo,
-            places: SubIndex::open(dir, "places", with_names)?,
+            places: SubIndex::open(dir, "places")?,
             poi,
             ents: Entities { geo, n_place_nodes, bnd: Some(map(&dir.join("places.bnd"))?), extras },
-            iso: iso.map(|p| Iso::load(Path::new(p), geo)).unwrap_or_default(),
+            iso: match iso {
+                Some(p) => Iso::load(Path::new(p), geo)?,
+                None => Iso::default(),
+            },
         })
     }
 
@@ -153,5 +156,53 @@ impl<'g> SearchIndex<'g> {
         } else {
             self.poi.as_ref().unwrap()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fixture::{build_search, Geo, TempDir};
+    use crate::query::Searcher;
+
+    #[test]
+    fn opens_an_index_with_empty_data_files() {
+        // Place nodes only, one posting per key (all inline), no boundary slot, and a POI
+        // sub-index without a named POI: places.post, places.bnd, poi.post and poi.pfx are empty.
+        let mut g = Geo::default();
+        g.place("Alpha", 1, 10.0, 20.0);
+        g.place("Bravo", 2, 10.1, 20.1);
+        g.poi("", 10.0, 20.0, 0);
+        let dir = TempDir::new("empty-files");
+        let geo = g.load(&dir.0.join("geo"));
+        let out = dir.0.join("idx");
+        build_search(&geo, &out, None);
+        for f in ["places.post", "places.bnd", "poi.post", "poi.pfx"] {
+            assert_eq!(std::fs::metadata(out.join(f)).unwrap().len(), 0, "{f}");
+        }
+
+        let idx = SearchIndex::open(&geo, &out, None, None).unwrap();
+
+        assert!(idx.poi.is_some());
+        let (found, _) = Searcher::new(&idx).search("alpha", 5);
+        assert_eq!(found.iter().map(|f| (f.hit.entity, f.name.as_str())).collect::<Vec<_>>(), [(0, "Alpha")]);
+    }
+
+    #[test]
+    fn an_unreadable_iso_file_fails_the_open() {
+        let mut g = Geo::default();
+        g.place("Alpha", 1, 10.0, 20.0);
+        let dir = TempDir::new("iso");
+        let geo = g.load(&dir.0.join("geo"));
+        let out = dir.0.join("idx");
+        build_search(&geo, &out, None);
+        let iso = dir.0.join("iso_codes.tsv");
+
+        let err = SearchIndex::open(&geo, &out, None, Some(iso.to_str().unwrap())).err();
+
+        assert!(err.as_deref().is_some_and(|e| e.contains("iso_codes.tsv")), "{err:?}");
+        std::fs::write(&iso, "").unwrap();
+        assert!(SearchIndex::open(&geo, &out, None, Some(iso.to_str().unwrap())).is_ok());
+        assert!(SearchIndex::open(&geo, &out, None, None).is_ok());
     }
 }

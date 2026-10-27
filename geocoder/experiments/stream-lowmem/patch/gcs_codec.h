@@ -5,9 +5,11 @@
 //   Encoder: consumes today's-format bytes as the patcher writes them, one queue per today's file,
 //            and processes every unit whose bytes are all there (pump()).
 // Nothing is held beyond the buffers, the unit in flight and the queues' skew. A unit held whole is
-// bounded by the format (a way <= 65535 nodes, an address footprint <= 69999 vertices) or, for POI
-// polygons, by the data (the encoder needs the closing vertex before it can lay out the planes);
-// admin polygons, which are uncapped, go plane by plane through positional readers / writers.
+// bounded by the format (a way <= 65535 nodes), by the source (an address footprint, as large as
+// the builder made it: abs2 holds up to 69999 vertices, a larger one is escaped raw) or, for a
+// polygon block, by big_block() (256 KiB): larger admin and POI blocks go plane by plane through
+// positional readers / writers (a POI encoder lays the planes out for a closed ring and moves them
+// in the file when the last vertex shows the ring is open).
 #pragma once
 #include <cmath>
 #include <memory>
@@ -19,9 +21,12 @@ namespace gcs {
 struct Decoder {
     std::vector<ByteQueue> out;
     std::vector<int> state;  // 0 not opened yet (kept), 1 open, 2 closed (dropped)
+    std::vector<uint64_t> drop;  // per port: bytes its reader skips, dropped as they are decoded
+    size_t dropping = 0;         // ports with bytes to drop
     std::string name;
     std::vector<uint8_t> scratch;
-    explicit Decoder(const std::string& n, int ports) : out(size_t(ports)), state(size_t(ports), 0), name(n) {}
+    explicit Decoder(const std::string& n, int ports)
+        : out(size_t(ports)), state(size_t(ports), 0), drop(size_t(ports), 0), name(n) {}
     virtual ~Decoder() = default;
     virtual bool step() = 0;  // emits the next unit; false at the end
     // The decoded file's size when the manifest gives it, else ~0.
@@ -53,12 +58,34 @@ struct Decoder {
         while (q.size() < want) {
             if (q.size() && out.size() > 1 && others_full(port)) break;
             if (!step()) break;
+            if (dropping) apply_drops();
         }
         if (q.size() == 0) return 0;
         const size_t k = std::min(max, q.size());
         memcpy(dst, q.data(), k);
         q.pop(k);
         return k;
+    }
+    // The port's reader skips its next n bytes: queued ones go now, the rest as they are decoded
+    // (a reader of a coupled family that skips, e.g. the child of deleted parents, holds nothing
+    // while the other reader drives the decoder through them).
+    void skip(int port, uint64_t n) {
+        ByteQueue& q = out[size_t(port)];
+        const size_t k = size_t(std::min<uint64_t>(n, q.size()));
+        q.pop(k);
+        if (n > k) {
+            if (!drop[size_t(port)]) dropping++;
+            drop[size_t(port)] += n - k;
+        }
+    }
+    void apply_drops() {
+        for (size_t p = 0; p < out.size(); p++) {
+            if (!drop[p] || !out[p].size()) continue;
+            const size_t k = size_t(std::min<uint64_t>(drop[p], out[p].size()));
+            out[p].pop(k);
+            drop[p] -= k;
+            if (!drop[p]) dropping--;
+        }
     }
     size_t peak(int port) const { return out[size_t(port)].peak; }
 };
@@ -142,6 +169,8 @@ static inline size_t block_size(uint16_t cnt, uint16_t code) {
     const size_t wl = code & 63, wg = (code >> 6) & 63, wf = (code >> 13) & 7;
     return 2 * wf + ((size_t(cnt) - 1) * (wl + wg) + 7) / 8;
 }
+// The widths an encoder writes: the first node in at most 4 bytes, the deltas in at most 32 bits.
+static inline bool valid_code(uint16_t code) { return (code & 63) <= 32 && ((code >> 6) & 63) <= 32 && (code >> 13) <= 4; }
 struct Names { const char *ways, *nodes, *pre; size_t stride; };
 static Names names(bool street) {
     return street ? Names{"street_ways.bin", "street_nodes.bin", "street", 12} : Names{"interp_ways.bin", "interp_nodes.bin", "interp", 24};
@@ -232,6 +261,7 @@ struct Dec : Decoder {
         }
         wr16(rec + 4, cnt);
         if (cnt) {
+            if (!valid_code(code)) die("%s: way %llu has a bad code %#x", nm.pre, (unsigned long long)i, unsigned(code));
             wr32(rec, uint32_t(node_off));
             const size_t bs = block_size(cnt, code);
             const uint8_t* q = nodes2->need(bs + 8, true);
@@ -367,6 +397,8 @@ struct Enc : Encoder {
         m.set(k + ".nodes", nodes);
         m.set(k + ".G", G);
         m.set(k + ".nodes2_bytes", nodes2->tell());
+        for (Writer* x : {groups.get(), nodes2.get(), c0.get(), c1.get(), c2.get(), c3.get(), c4.get()})
+            if (x) x->finish();
         groups.reset(); nodes2.reset(); c0.reset(); c1.reset(); c2.reset(); c3.reset(); c4.reset();
     }
 };
@@ -421,6 +453,7 @@ struct U24Enc : Encoder {
     void finish(Manifest& m) override {
         require_empty();
         m.set("way_parents.n", n);
+        w->finish();
         w.reset();
     }
 };
@@ -523,6 +556,7 @@ struct DictEnc : Encoder {
         {
             Writer d(out_dir + "/" + name + ".dict", 16 << 10);
             for (uint32_t j : order) d.u32(dict[j]);
+            d.finish();
         }
         if (!identity) {
             const std::string p = out_dir + "/" + name + ".u16";
@@ -532,22 +566,10 @@ struct DictEnc : Encoder {
             std::vector<uint16_t> b(16 << 10);
             for (uint64_t at = 0; at < 2 * n;) {
                 const size_t want = size_t(std::min<uint64_t>(2 * b.size(), 2 * n - at));
-                size_t got_b = 0;
-                while (got_b < want) {
-                    const ssize_t r = pread(fd, reinterpret_cast<char*>(b.data()) + got_b, want - got_b, off_t(at + got_b));
-                    if (r < 0 && errno == EINTR) continue;
-                    if (r <= 0) die("read %s", p.c_str());
-                    got_b += size_t(r);
-                }
+                pread_all(fd, b.data(), want, at, p);
                 for (size_t j = 0; j < want / 2; j++)
                     if (b[j] != 0xFFFF) b[j] = final_of[b[j]];
-                size_t put_b = 0;
-                while (put_b < want) {
-                    const ssize_t r = pwrite(fd, reinterpret_cast<char*>(b.data()) + put_b, want - put_b, off_t(at + put_b));
-                    if (r < 0 && errno == EINTR) continue;
-                    if (r <= 0) die("write %s", p.c_str());
-                    put_b += size_t(r);
-                }
+                pwrite_all(fd, b.data(), want, at, p);
                 at += want;
             }
             if (close(fd)) die("close %s", p.c_str());
@@ -588,10 +610,12 @@ struct Dec : Decoder {
         if (top->size() != 32 * ((R + B - 1) / B)) die("gxc_top.bin size");
     }
     uint64_t decoded_size(int port) const override { return port == 0 ? 20 * R : esize[port - 1]; }
+    // A list holds 1 to 65535 ids (today's u16 count); every count is checked before it is used.
     static void decode_list(Reader& s, bool strict, uint32_t prev_first, std::vector<uint32_t>& l) {
-        const uint64_t c = s.uv() + 1;
-        if (c > 0xFFFF) die("gxc: list too long");
-        l.resize(size_t(c));
+        const uint64_t cm1 = s.uv();  // count - 1
+        if (cm1 >= 0xFFFF) die("gxc: list too long");
+        const size_t c = size_t(cm1) + 1;
+        l.resize(c);
         l[0] = uint32_t(int64_t(prev_first) + unzz64(s.uv()));
         for (size_t j = 1; j < c; j++) l[j] = l[j - 1] + uint32_t(s.uv()) + (strict ? 1 : 0);
     }
@@ -630,26 +654,32 @@ struct Dec : Decoder {
         const int as = (h >> 2) & 3;
         if (as) {
             list.clear();
+            auto bad = [&] { die("gxc: bad address list at row %llu", (unsigned long long)r); };
             if (as == 1) {
                 const uint64_t k = rows->uv();
+                if (k == 0 || k > 0xFFFF) bad();
                 for (uint64_t j = 0; j < k; j++) list.push_back(uint32_t(next + j));
                 next += k;
             } else if (as == 2) {
                 const uint64_t K = rows->uv(), D = rows->uv();
-                int64_t pj = -1;
-                uint64_t j = 0;
+                if (K == 0 || K > 0xFFFF || D > K) bad();
+                uint64_t pj = 0, j = 0;  // pj: one past the previous repeated index
                 for (uint64_t x = 0; x < D; x++) {
-                    const int64_t idx = pj + 1 + int64_t(rows->uv());
-                    const uint64_t copies = rows->uv() + 2;
-                    for (; j < uint64_t(idx); j++) list.push_back(uint32_t(next + j));
+                    const uint64_t gap = rows->uv(), cm2 = rows->uv();  // copies - 2
+                    if (gap >= K - pj || cm2 >= 0xFFFF) bad();
+                    const uint64_t idx = pj + gap, copies = cm2 + 2;
+                    if (list.size() + (idx - j) + copies > 0xFFFF) bad();
+                    for (; j < idx; j++) list.push_back(uint32_t(next + j));
                     for (uint64_t c = 0; c < copies; c++) list.push_back(uint32_t(next + j));
                     j++;
-                    pj = idx;
+                    pj = idx + 1;
                 }
                 for (; j < K; j++) list.push_back(uint32_t(next + j));
                 next += K;
             } else {
-                const uint64_t k = rows->uv(), c = rows->uv() + 1;
+                const uint64_t k = rows->uv(), cm1 = rows->uv();  // count - 1
+                if (cm1 >= 0xFFFF) bad();
+                const uint64_t c = cm1 + 1;
                 list.push_back(uint32_t(int64_t(next) + unzz64(rows->uv())));
                 for (uint64_t j = 1; j < c; j++) list.push_back(list.back() + uint32_t(rows->uv()));
                 next += k;
@@ -825,6 +855,7 @@ struct Enc : Encoder {
         m.set("gxc.B", B);
         m.set("gxc.addr_ids", next);
         for (int t = 0; t < 3; t++) m.set(std::string("gxc.") + ENTRY[t], eoff[t]);
+        for (Writer* x : {top.get(), rows.get(), st[0].get(), st[1].get()}) x->finish();
         top.reset(); rows.reset(); st[0].reset(); st[1].reset();
     }
 };
@@ -833,6 +864,8 @@ struct Enc : Encoder {
 // ------------------------------------------------------------------ address points + footprints
 namespace addr {
 static const double SCALE[3] = {1e-5, 1e-4, 1e-6};
+// The most vertices (closing vertex included) an abs2 blob holds; a larger footprint is escaped.
+static const uint32_t ABS2_MAX_VERTICES = 69999;
 static inline int64_t fkey(uint32_t b) { return (b & 0x80000000u) ? int64_t(0xFFFFFFFFu) - b : int64_t(b ^ 0x80000000u); }
 static inline uint32_t unfkey(int64_t k) { return (k & 0x80000000) ? uint32_t(k ^ 0x80000000) : uint32_t(0xFFFFFFFFu - k); }
 static inline uint32_t pred_bits(uint32_t point_bits, int64_t sum_q, uint32_t n, int enc) {
@@ -889,6 +922,7 @@ struct Dec : Decoder {
         const uint8_t tag = A->u8();
         if (tag == 0x20) {
             const uint64_t vcnt = A->uv();
+            if (!vcnt || vcnt > 0xFFFFFFFFull) die("addr %llu: bad count", (unsigned long long)i);
             const uint8_t enc = *A->need(1);
             const size_t size = 10 + size_t(vcnt) * (enc == 3 ? 8 : 4);
             rec[6] = uint32_t(vcnt);
@@ -901,8 +935,8 @@ struct Dec : Decoder {
         const int enc = tag & 3, wide = (tag >> 2) & 1, small = (tag >> 3) & 1, closed = (tag >> 4) & 1;
         if (enc > 2 || (tag & 0xE0)) die("addr %llu: bad tag", (unsigned long long)i);
         const uint64_t cnt = A->uv();
+        if (cnt > ABS2_MAX_VERTICES - uint64_t(closed) || (closed && !cnt)) die("addr %llu: bad count", (unsigned long long)i);
         const uint32_t full = uint32_t(cnt) + uint32_t(closed);
-        if (full > 69999 || (closed && !cnt)) die("addr %llu: bad count", (unsigned long long)i);
         rec[6] = full;
         emit(0, rec, 28);
         const size_t bsz = 10 + 4 * size_t(full);
@@ -959,6 +993,9 @@ struct Enc : Encoder {
         for (int k = 0; k < 15; k++) w.emplace_back(new Writer(fd, cp, col_region(k, N), region_buf(k)));
         A.reset(new Writer(od + "/addr_vertices.abs2"));
     }
+    ~Enc() override {
+        if (fd >= 0) close(fd);
+    }
     void put_po(uint32_t v) { for (int b = 0; b < 4; b++) w[size_t(11 + b)]->u8(uint8_t(v >> (8 * b))); }
     void pump() override {
         ByteQueue &P = in[0], &V = in[1];
@@ -993,7 +1030,7 @@ struct Enc : Encoder {
             const uint8_t* b = V.data();
             const uint8_t enc = b[0];
             vexp += size;
-            if (enc == 3 || b[1] != 0) {
+            if (enc == 3 || b[1] != 0 || vcnt > ABS2_MAX_VERTICES) {
                 A->u8(0x20);
                 A->uv(vcnt);
                 A->put(b, size);
@@ -1038,11 +1075,15 @@ struct Enc : Encoder {
     void finish(Manifest& m) override {
         require_empty();
         if (i != N) die("addr: %llu records, addr_points.bin's size gives %llu", (unsigned long long)i, (unsigned long long)N);
+        for (auto& x : w) x->finish();
         w.clear();
-        if (close(fd)) die("close addr_points.col");
+        const int f = fd;
+        fd = -1;
+        if (close(f)) die("close addr_points.col");
         m.set("addr.n", N);
         m.set("addr.layout", "col");
         m.set("addr.abs2_bytes", A->tell());
+        A->finish();
         A.reset();
     }
 };
@@ -1200,6 +1241,9 @@ struct AdminEnc : Encoder {
         fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
         if (fd < 0) die("create %s", path.c_str());
     }
+    ~AdminEnc() override {
+        if (fd >= 0) close(fd);
+    }
     void pump() override {
         if (!pc) pc.reset(new PolyCursor(out_dir + "/admin_polygons.bin"));
         ByteQueue& q = in[0];
@@ -1250,6 +1294,7 @@ struct AdminEnc : Encoder {
             q.pop(size_t(avail) * vs);
             k += avail;
             if (k < cnt) return;
+            for (auto& x : pl) x->finish();
             pl.clear();
             pos += size;
             in_poly = false;
@@ -1271,8 +1316,11 @@ struct AdminEnc : Encoder {
         if (in_poly) die("admin_vertices: stream ends inside a polygon");
         uint64_t off, c;
         if (pc->next(off, c)) die("admin_vertices: stream ends before the last polygon");
+        if (W) W->finish();
         W.reset();
-        if (close(fd)) die("close %s", path.c_str());
+        const int f = fd;
+        fd = -1;
+        if (close(f)) die("close %s", path.c_str());
         m.set("admin.polygons", pc->n);
     }
 };
@@ -1436,7 +1484,7 @@ struct PoiEnc : Encoder {
         const size_t vs = 2 * size_t(w);
         const uint64_t vc = big_vc, base = big_start + 10;
         const bool closed = vc > 1 && memcmp(last, big_first, vs) == 0;
-        for (auto& x : pl) x->flush();
+        for (auto& x : pl) x->finish();
         pl.clear();
         uint64_t c2 = vc - 1;
         if (!closed) {
@@ -1448,8 +1496,8 @@ struct PoiEnc : Encoder {
                 while (left) {
                     const size_t c = size_t(std::min<uint64_t>(left, tmp.size()));
                     left -= c;
-                    if (pread(O->fd, tmp.data(), c, off_t(src + left)) != ssize_t(c)) die("poi_vertices.bopen: reread");
-                    if (pwrite(O->fd, tmp.data(), c, off_t(dst + left)) != ssize_t(c)) die("poi_vertices.bopen: write");
+                    pread_all(O->fd, tmp.data(), c, src + left, opath);
+                    pwrite_all(O->fd, tmp.data(), c, dst + left, opath);
                 }
             }
             const uint64_t mask = wmask(w);
@@ -1458,12 +1506,12 @@ struct PoiEnc : Encoder {
                 const uint32_t z = zzw(uint32_t((uint64_t(q) - prev[comp]) & mask), 8 * w);
                 for (int b = 0; b < w; b++) {
                     const uint8_t byte = uint8_t(z >> (8 * b));
-                    if (pwrite(O->fd, &byte, 1, off_t(base + uint64_t(comp * w + b) * vc + (vc - 1))) != 1) die("poi_vertices.bopen: write");
+                    pwrite_all(O->fd, &byte, 1, base + uint64_t(comp * w + b) * vc + (vc - 1), opath);
                 }
             }
         }
         big_hdr[1] = closed ? 1 : 0;
-        if (pwrite(O->fd, big_hdr, 10, off_t(big_start)) != 10) die("poi_vertices.bopen: write");
+        pwrite_all(O->fd, big_hdr, 10, big_start, opath);
         O->skip_to(base + vs * c2);
         vexp += big_size;
         big = false;
@@ -1544,6 +1592,8 @@ struct PoiEnc : Encoder {
         if (big) die("poi_vertices: stream ends inside a block");
         m.set("poi.bopen_bytes", O->tell());
         m.set("poi.n", n);
+        O->finish();
+        RW->finish();
         O.reset();
         RW.reset();
     }

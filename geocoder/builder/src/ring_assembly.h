@@ -21,6 +21,7 @@ struct AreaRings {
     std::vector<std::vector<std::pair<double,double>>> rings;  // closed
     std::vector<uint8_t> roles;      // per ring: RingRole bits of the ways it runs along
     uint32_t cancelled_sub_ways = 0; // duplicates dropped in pairs
+    uint32_t crossing_coordinates = 0;  // where rings walked in member order crossed (re-paired)
     AreaFailure failure = AreaFailure::None;  // set: no rings
 };
 

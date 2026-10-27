@@ -44,6 +44,31 @@ inline size_t big_block() {
     throw std::runtime_error(std::string("gcs: ") + msg);
 }
 
+// Exactly n bytes at `at`: interrupted and short transfers go on where they stopped; an error, or a
+// transfer of nothing (a read past the end), fails.
+inline void pread_all(int fd, void* p, size_t n, uint64_t at, const std::string& path) {
+    uint8_t* b = static_cast<uint8_t*>(p);
+    while (n) {
+        const ssize_t r = pread(fd, b, n, off_t(at));
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) die("read %s: %s", path.c_str(), r ? strerror(errno) : "unexpected end of file");
+        b += r;
+        n -= size_t(r);
+        at += uint64_t(r);
+    }
+}
+inline void pwrite_all(int fd, const void* p, size_t n, uint64_t at, const std::string& path) {
+    const uint8_t* b = static_cast<const uint8_t*>(p);
+    while (n) {
+        const ssize_t w = pwrite(fd, b, n, off_t(at));
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) die("write %s: %s", path.c_str(), w ? strerror(errno) : "nothing written");
+        b += w;
+        n -= size_t(w);
+        at += uint64_t(w);
+    }
+}
+
 static inline uint16_t rd16(const uint8_t* p) { uint16_t v; memcpy(&v, p, 2); return v; }
 static inline uint32_t rd32(const uint8_t* p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static inline uint64_t rd64(const uint8_t* p) { uint64_t v; memcpy(&v, p, 8); return v; }
@@ -187,7 +212,12 @@ struct Writer {
         buf.resize(cap);
     }
     Writer(const Writer&) = delete;
-    ~Writer() noexcept(false) { finish(); }
+    // Cleanup only: what finish() has not written is dropped. A destructor runs inside
+    // unique_ptr::reset() and vector::clear() (noexcept) and while an error unwinds, where a failed
+    // write could only terminate the process; so every writer's last bytes go out through finish().
+    ~Writer() {
+        if (fd >= 0 && own) close(fd);
+    }
     uint64_t tell() const { return written + len; }
     // Moves the write position forward to `at` (what lies between was written positionally).
     void skip_to(uint64_t at) {
@@ -195,38 +225,24 @@ struct Writer {
         written = at - base;
     }
     void flush() {
-        size_t off = 0;
-        while (off < len) {
-            const ssize_t w = pwrite(fd, &buf[off], len - off, off_t(base + written + off));
-            if (w < 0) {
-                if (errno == EINTR) continue;
-                die("write %s: %s", path.c_str(), strerror(errno));
-            }
-            off += size_t(w);
-        }
+        pwrite_all(fd, buf.data(), len, base + written, path);
         written += len;
         len = 0;
     }
+    // Writes the buffered bytes and closes the file (a region writer leaves the shared fd open).
+    // A failed write leaves the descriptor to the destructor, which closes it without retrying.
     void finish() {
         if (fd < 0) return;
         flush();
-        if (own && close(fd)) die("close %s: %s", path.c_str(), strerror(errno));
+        const int f = fd;
         fd = -1;
+        if (own && close(f)) die("close %s: %s", path.c_str(), strerror(errno));
     }
     inline void put(const void* p, size_t n) {
         if (len + n > cap) {
             flush();
             if (n > cap) {  // larger than the buffer: straight through
-                const uint8_t* q = static_cast<const uint8_t*>(p);
-                size_t off = 0;
-                while (off < n) {
-                    const ssize_t w = pwrite(fd, q + off, n - off, off_t(base + written + off));
-                    if (w < 0) {
-                        if (errno == EINTR) continue;
-                        die("write %s: %s", path.c_str(), strerror(errno));
-                    }
-                    off += size_t(w);
-                }
+                pwrite_all(fd, p, n, base + written, path);
                 written += n;
                 return;
             }
@@ -336,6 +352,7 @@ struct Manifest {
         for (auto& [k, v] : kv) s += k + " " + v + "\n";
         Writer w(path, 1 << 12);
         w.put(s.data(), s.size());
+        w.finish();
     }
     void load(const std::string& path) {
         FILE* f = fopen(path.c_str(), "r");

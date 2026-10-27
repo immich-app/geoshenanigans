@@ -8,7 +8,8 @@
 //       then count q_lat values, then count q_lng values, u8 (wide = 0) or u16 LE (wide = 1).
 //       closed (count >= 2 and first == last in q): the closing vertex is dropped and re-appended.
 //       Escape (tag 0x20, never hit on the planet days): LEB128(vertex_count), today's blob verbatim,
-//       for encodings or header bytes abs2 does not model (enc 3, non-zero pad byte).
+//       for encodings or header bytes abs2 does not model (enc 3, non-zero pad byte) and footprints
+//       of more than ABS2_MAX_VERTICES (the decoders' bound).
 //   addr_points.col     six u32 columns of N: lat | lng | housenumber | street | parent_way | poly_offset
 //       (byte offset of the record's blob in addr_vertices.abs2, NO_DATA = none); lat, lng and
 //       poly_offset as 4 byte planes each (b0 of every record, then b1, ...), the rest plain u32.
@@ -25,6 +26,8 @@ namespace addr {
 
 static const double SCALE[3] = {1e-5, 1e-4, 1e-6};
 static const size_t PAX = 170;
+// The most vertices (closing vertex included) an abs2 blob holds; a larger footprint is escaped.
+static const uint32_t ABS2_MAX_VERTICES = 69999;
 
 static inline int64_t fkey(uint32_t b) { return (b & 0x80000000u) ? int64_t(0xFFFFFFFFu) - b : int64_t(b ^ 0x80000000u); }
 static inline uint32_t unfkey(int64_t k) { return (k & 0x80000000) ? uint32_t(k ^ 0x80000000) : uint32_t(0xFFFFFFFFu - k); }
@@ -235,7 +238,7 @@ inline void encode_vertices_pass(const std::string& src, const std::string& out,
         const uint8_t* b = V.take(size);
         polys++;
         vexp += size;
-        if (enc == 3 || b[1] != 0) {
+        if (enc == 3 || b[1] != 0 || vcnt > ABS2_MAX_VERTICES) {
             nraw++;
             A.u8(0x20);
             A.uv(vcnt);
@@ -321,7 +324,7 @@ inline void encode(const std::string& src, const std::string& out, bool pax, Man
         polys++;
         verts += vcnt;
         vexp += size;
-        if (enc == 3 || b[1] != 0) {
+        if (enc == 3 || b[1] != 0 || vcnt > ABS2_MAX_VERTICES) {
             nraw++;
             A.u8(0x20);
             A.uv(vcnt);
@@ -394,6 +397,7 @@ inline void decode_points_only(const std::string& src, const Manifest& m, const 
             const uint8_t tag = A.u8();
             if (tag == 0x20) {
                 const uint64_t vcnt = A.uv();
+                if (!vcnt || vcnt > 0xFFFFFFFFull) die("addr %llu: bad count", (unsigned long long)i);
                 const uint8_t enc = *A.need(1);
                 const size_t size = 10 + size_t(vcnt) * (enc == 3 ? 8 : 4);
                 A.skip(size);
@@ -403,8 +407,8 @@ inline void decode_points_only(const std::string& src, const Manifest& m, const 
                 const int enc = tag & 3, wide = (tag >> 2) & 1, small = (tag >> 3) & 1, closed = (tag >> 4) & 1;
                 if (enc > 2 || (tag & 0xE0)) die("addr %llu: bad tag", (unsigned long long)i);
                 const uint64_t cnt = A.uv();
+                if (cnt > ABS2_MAX_VERTICES - uint64_t(closed) || (closed && !cnt)) die("addr %llu: bad count", (unsigned long long)i);
                 const uint32_t full = uint32_t(cnt) + uint32_t(closed);
-                if (full > 69999 || (closed && !cnt)) die("addr %llu: bad count", (unsigned long long)i);
                 A.skip((small ? 2 : 8) + 2 * size_t(cnt) * (wide ? 2 : 1));
                 rec[6] = full;
                 raw += 10 + 4 * uint64_t(full);
@@ -434,7 +438,7 @@ inline void decode(const std::string& src, const std::string& out, const Manifes
     Reader A(src + "/addr_vertices.abs2");
     Writer* P = write_points ? new Writer(out + "/addr_points.bin") : nullptr;
     Writer V(out + "/addr_vertices.bin");
-    std::vector<uint32_t> ql(70000), qg(70000);
+    std::vector<uint32_t> ql(ABS2_MAX_VERTICES + 1), qg(ABS2_MAX_VERTICES + 1);
     std::vector<uint8_t> blob;
     for (uint64_t i = 0; i < N; i++) {
         uint32_t v[6] = {0, 0, 0, 0, 0, 0};
@@ -453,6 +457,7 @@ inline void decode(const std::string& src, const std::string& out, const Manifes
             const uint8_t tag = A.u8();
             if (tag == 0x20) {
                 const uint64_t vcnt = A.uv();
+                if (!vcnt || vcnt > 0xFFFFFFFFull) die("addr %llu: bad count", (unsigned long long)i);
                 const uint8_t enc = *A.need(1);
                 const size_t size = 10 + size_t(vcnt) * (enc == 3 ? 8 : 4);
                 V.put(A.take(size), size);
@@ -461,8 +466,8 @@ inline void decode(const std::string& src, const std::string& out, const Manifes
                 const int enc = tag & 3, wide = (tag >> 2) & 1, small = (tag >> 3) & 1, closed = (tag >> 4) & 1;
                 if (enc > 2 || (tag & 0xE0)) die("addr %llu: bad tag", (unsigned long long)i);
                 const uint64_t cnt = A.uv();
+                if (cnt > ABS2_MAX_VERTICES - uint64_t(closed) || (closed && !cnt)) die("addr %llu: bad count", (unsigned long long)i);
                 const uint32_t full = uint32_t(cnt) + uint32_t(closed);
-                if (full > 69999 || (closed && !cnt)) die("addr %llu: bad count", (unsigned long long)i);
                 uint8_t bm[8];
                 memcpy(bm, A.take(small ? 2 : 8), small ? 2 : 8);
                 int64_t sl = 0, sg = 0;

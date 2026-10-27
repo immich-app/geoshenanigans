@@ -32,10 +32,12 @@ struct AsyncDec {
     std::thread worker;
     bool started = false, eof = false, stop = false;
     std::vector<int> starving;  // per file: readers waiting on its empty ring
+    std::vector<uint64_t> drop; // per file: bytes its reader skips, dropped as the worker hands them over
     std::string error;
     double cpu_s = 0;  // the worker's CPU time
 
-    explicit AsyncDec(Decoder* d) : inner(d), ring(d->out.size()), closed(d->out.size(), 0), starving(d->out.size(), 0) {
+    explicit AsyncDec(Decoder* d)
+        : inner(d), ring(d->out.size()), closed(d->out.size(), 0), starving(d->out.size(), 0), drop(d->out.size(), 0) {
         for (auto& s : inner->state) s = 1;  // the worker keeps every file's bytes; closed ones are dropped here
     }
     ~AsyncDec() { shutdown(); }
@@ -69,7 +71,9 @@ struct AsyncDec {
                     std::lock_guard<std::mutex> lk(mu);
                     for (size_t p = 0; p < ring.size(); p++) {
                         ByteQueue& q = inner->out[p];
-                        if (!closed[p] && q.size()) ring[p].push(q.data(), q.size());
+                        const size_t k = size_t(std::min<uint64_t>(drop[p], q.size()));
+                        drop[p] -= k;
+                        if (!closed[p] && q.size() > k) ring[p].push(q.data() + k, q.size() - k);
                         q.pop(q.size());
                     }
                     if (!more) eof = true;
@@ -106,6 +110,15 @@ struct AsyncDec {
         if (q.size() < RING_CAP) cv_worker.notify_one();
         return k;
     }
+    // The reader of `port` skips its next n bytes: the ring's go now, the rest as they are decoded.
+    void skip(int port, uint64_t n) {
+        std::lock_guard<std::mutex> lk(mu);
+        ByteQueue& q = ring[size_t(port)];
+        const size_t k = size_t(std::min<uint64_t>(n, q.size()));
+        q.pop(k);
+        drop[size_t(port)] += n - k;
+        cv_worker.notify_one();
+    }
     // Returns true when every file is closed (the decoder can go).
     bool close(int port) {
         std::lock_guard<std::mutex> lk(mu);
@@ -135,12 +148,18 @@ struct AsyncEnc {
     std::mutex mu;
     std::condition_variable cv_writer, cv_worker;
     std::thread worker;
-    bool started = false, done = false;
+    bool started = false, done = false, cancel = false;
     std::string error;
     double cpu_s = 0;
 
     explicit AsyncEnc(Encoder* e) : inner(e), ring(e->in.size()), closed(e->in.size(), 0), closed_seen(e->in.size(), 0), got(e->in.size(), 0) {}
+    // A run that fails with a file still open: the worker stops without draining.
     ~AsyncEnc() {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            cancel = true;
+        }
+        cv_worker.notify_all();
         if (worker.joinable()) worker.join();
     }
     void run() {
@@ -153,10 +172,12 @@ struct AsyncEnc {
                 {
                     std::unique_lock<std::mutex> lk(mu);
                     cv_worker.wait(lk, [&] {
+                        if (cancel) return true;
                         for (size_t p = 0; p < ring.size(); p++)
                             if (ring[p].size() || (closed[p] && !closed_seen[p])) return true;
                         return false;
                     });
+                    if (cancel) break;
                     for (size_t p = 0; p < ring.size(); p++) {
                         std::swap(take[p], ring[p]);  // the ring's bytes, without a copy
                         if (closed[p] && !closed_seen[p]) { closed_seen[p] = 1; newly[p] = 1; }

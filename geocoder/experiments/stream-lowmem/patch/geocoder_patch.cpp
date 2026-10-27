@@ -27,12 +27,14 @@
 #include <iterator>
 #include <malloc.h>
 #include <memory>
+#include <spawn.h>
 #include <stdio_ext.h>
 #include <stdexcept>
 #include <string>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <unistd.h>
@@ -108,25 +110,69 @@ static void log_rewinds(const SequentialFileReader& r) {
 }
 
 #ifdef GCS_LIBZSTD
-// The patch, decompressed in one shot straight into a mapped file: the decoder's history is the
+// How far ahead of the decoder the decompressed patch's storage is reserved.
+static constexpr size_t PATCH_RESERVE_STEP = 1 << 20;
+
+// The patch, decompressed block by block straight into a mapped file: the decoder's history is the
 // output itself, so no window buffer (the zstd CLI holds the 8 MiB window in anonymous memory).
+// Each block's dst capacity ends where posix_fallocate has reserved storage, so a full TMPDIR is
+// an error here, never a SIGBUS from a mapped page with nothing behind it. Only the mapping spans
+// the bound: a frame without a content size bounds every block at 128 KiB, which puts the
+// 2026-10-13 patches' bounds at 4.9x to 19x their size.
 static bool decompress_to_file(const std::string& src, const std::string& dst) {
     MappedFile in = mmap_file(src);
     if (!in.data) return false;
     const unsigned long long bound = ZSTD_decompressBound(in.data, in.size);
     if (bound == ZSTD_CONTENTSIZE_ERROR || bound == 0) { unmap_file(in); return false; }
     int fd = open(dst.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (fd < 0 || ftruncate(fd, (off_t)bound) != 0) { if (fd >= 0) close(fd); unmap_file(in); return false; }
-    void* out = mmap(nullptr, (size_t)bound, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (fd < 0) { unmap_file(in); return false; }
+    char* out = static_cast<char*>(mmap(nullptr, (size_t)bound, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
     if (out == MAP_FAILED) { close(fd); unmap_file(in); return false; }
     ZSTD_DCtx* dctx = ZSTD_createDCtx();
-    const size_t n = ZSTD_decompressDCtx(dctx, out, (size_t)bound, in.data, in.size);
+    size_t at = 0, n = 0, reserved = 0;
+    bool ok = dctx != nullptr;
+    // A frame per pass, concatenated and skippable ones as ZSTD_decompressDCtx takes them.
+    while (ok && at < in.size) {
+        ok = !ZSTD_isError(ZSTD_decompressBegin(dctx));
+        for (size_t want; ok && (want = ZSTD_nextSrcSizeToDecompress(dctx)) != 0;) {
+            if (want > in.size - at) { ok = false; break; }
+            if (reserved - n < ZSTD_BLOCKSIZE_MAX && reserved < bound) {
+                const size_t to = (size_t)std::min<unsigned long long>(bound, n + PATCH_RESERVE_STEP);
+                if (const int err = posix_fallocate(fd, (off_t)reserved, (off_t)(to - reserved))) {
+                    std::cerr << "Cannot reserve " << to << " bytes for " << dst << ": " << strerror(err) << std::endl;
+                    ok = false;
+                    break;
+                }
+                reserved = to;
+            }
+            const size_t r = ZSTD_decompressContinue(dctx, out + n, reserved - n, in.data + at, want);
+            if (ZSTD_isError(r)) { ok = false; break; }
+            at += want;
+            n += r;
+        }
+    }
     ZSTD_freeDCtx(dctx);
     munmap(out, (size_t)bound);
     unmap_file(in);
-    const bool ok = !ZSTD_isError(n) && ftruncate(fd, (off_t)n) == 0;
+    ok = ok && ftruncate(fd, (off_t)n) == 0;
     close(fd);
     return ok;
+}
+#else
+// The zstd CLI, run without a shell: the patch path is one argument, whatever its characters.
+static bool decompress_to_file(const std::string& src, const std::string& dst) {
+    const char* argv[] = {"zstd", "-d", "-f", "--quiet", "-o", dst.c_str(), "--", src.c_str(), nullptr};
+    posix_spawn_file_actions_t quiet;
+    if (posix_spawn_file_actions_init(&quiet)) return false;
+    posix_spawn_file_actions_addopen(&quiet, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+    pid_t pid;
+    const int err = posix_spawnp(&pid, "zstd", &quiet, nullptr, const_cast<char* const*>(argv), environ);
+    posix_spawn_file_actions_destroy(&quiet);
+    if (err) return false;
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0)
+        if (errno != EINTR) return false;
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 #endif
 
@@ -139,6 +185,18 @@ static uint32_t joint_child_of(uint32_t fid) {
     case PatchFileId::POI_RECORDS: return (uint32_t)PatchFileId::POI_VERTICES;
     default: return UINT32_MAX;
     }
+}
+
+// Closes outputs, every one even when another fails, then throws naming those whose writes or
+// close failed. The close's own flush is the last write: on a FIFO no size check follows it, and an
+// encoded output's encoder takes its last bytes there.
+static void close_outputs(std::initializer_list<std::pair<FILE*, const char*>> outs) {
+    std::string bad;
+    for (const auto& [f, name] : outs) {
+        const bool ok = !ferror(f);
+        if (fclose(f) != 0 || !ok) bad += (bad.empty() ? "" : ", ") + std::string(name);
+    }
+    if (!bad.empty()) throw std::runtime_error("Cannot write " + bad);
 }
 
 // A child section (the one right after its parent's) replayed on demand: produce(n) writes the
@@ -159,6 +217,8 @@ struct JointChild {
     uint8_t op = 0xFF;
     uint64_t left = 0, old_bytes = 0, written = 0;
     bool started = false;
+    size_t scan_q = 0;    // hint(): the sequence position past the next MATCH op found
+    uint64_t scan_t = 0;  // and that op's old offset
 
     void parse(const char* p, size_t size, size_t at, uint32_t want_fid, bool is_v8) {
         P = p;
@@ -257,6 +317,40 @@ struct JointChild {
         while (left == 0 && fetch()) {}
         if (left) throw std::runtime_error(name + " has bytes past its last record");
     }
+    // Called before the parent reads an old record: the old child bytes this replay will never read
+    // (those of deleted or replaced parents, DELETE and REPLACE runs) are dropped as the shared
+    // decoder produces them, so the parent's read doesn't queue them for the child. Everything
+    // before the next MATCH op's start is such: MATCH runs read the old file in order.
+    void hint() {
+        if (kind == COPY_OLD) return;  // every old byte is read, in order
+        if (kind == FULL) { old->skip_to(old->size()); return; }
+        if (left && op == OP_MATCH_RUN) return;  // reading at old_bytes now
+        if (q >= scan_q) {  // the MATCH op of the last scan has been fetched: scan on from here
+            uint64_t t = old_bytes + (left && op == OP_REPLACE_RUN ? left : 0);
+            size_t s = q;
+            while (s < seq_end) {
+                if (s + 5 > seq_end) throw std::runtime_error("Malformed merge sequence: " + name);
+                const uint8_t o = (uint8_t)P[s];
+                uint32_t count; memcpy(&count, P + s + 1, 4);
+                s += 5;
+                const uint64_t bytes = (uint64_t)count * stride;
+                if (o == OP_MATCH_RUN) {
+                    if (bytes) break;
+                } else if (o == OP_DELETE_RUN) {
+                    t += bytes;
+                } else if (o == OP_INSERT_RUN || (o == OP_REPLACE_RUN && v8)) {
+                    if (s + bytes > seq_end) throw std::runtime_error("Malformed merge sequence: " + name);
+                    s += bytes;
+                    if (o == OP_REPLACE_RUN) t += bytes;
+                } else {
+                    throw std::runtime_error("Malformed merge sequence: " + name);
+                }
+            }
+            scan_q = s;
+            scan_t = std::min<uint64_t>(t, old->size());
+        }
+        old->skip_to(scan_t);
+    }
     // Before the parent's buffer flushes, the child's goes out: the encoder then always has the
     // child bytes of every record it is handed (else a run of records without children, which
     // never fills the child's buffer, piles up behind the last record that has one).
@@ -264,6 +358,37 @@ struct JointChild {
         if (__fpending(parent) + n > gcs::Store::SINK_BUF) fflush(out);
     }
 };
+
+// A joint parent's record size (the stride its merge sections give).
+static size_t joint_parent_stride(uint32_t fid) {
+    switch ((PatchFileId)fid) {
+    case PatchFileId::STREET_WAYS: return WAY_HEADER_STRIDE;
+    case PatchFileId::INTERP_WAYS: return INTERP_WAY_STRIDE;
+    case PatchFileId::ADDR_POINTS: return ADDR_POINT_STRIDE;
+    case PatchFileId::POI_RECORDS: return POI_RECORD_STRIDE;
+    default: throw std::runtime_error("No child stream");
+    }
+}
+
+// The child bytes a new parent record owns: its nodes, its footprint or its vertex block (whose
+// size depends on the block's encoding byte, the next child byte to write).
+static uint64_t child_bytes_of(uint32_t fid, const char* rec, JointChild& jc) {
+    switch ((PatchFileId)fid) {
+    case PatchFileId::STREET_WAYS:
+    case PatchFileId::INTERP_WAYS: return (uint64_t)record_node_count(rec) * 8;
+    case PatchFileId::ADDR_POINTS: {
+        uint32_t vc; memcpy(&vc, rec + 24, 4);
+        if (!vc) return 0;
+        return 10 + (uint64_t)vc * (jc.peek() == 3 ? 8 : 4);
+    }
+    case PatchFileId::POI_RECORDS: {
+        uint32_t vc; memcpy(&vc, rec + 12, 4);
+        if (!vc) return 0;
+        return 10 + (uint64_t)vc * 2 * (jc.peek() == 3 ? 4 : 2);
+    }
+    default: throw std::runtime_error("No child stream");
+    }
+}
 
 static int run(int argc, char* argv[]) {
     if (argc < 5 || std::string(argv[3]) != "-o") {
@@ -325,6 +450,13 @@ static int run(int argc, char* argv[]) {
     // Low-memory client update: an encoded installed set (gc.manifest) is decoded and the new set
     // encoded in process.
     gcs::store().init(cur_dir, out_dir);
+    // A staged apply writes part of the new set; its gc.manifest would list every encoded family
+    // with only this stage's keys.
+    if (gcs::store().active && !only.empty()) {
+        std::cerr << "--only does not apply to an encoded installed set (" << cur_dir << "/gc.manifest): apply the whole patch"
+                  << std::endl;
+        return 1;
+    }
     if (gcs::store().active) {
         stream_source_factory() = [](const std::string& p) { return gcs::store().open_source(p); };
         virtual_size_hook() = [](const std::string& dir, const std::string& name, uint64_t expected) -> bool {
@@ -341,14 +473,7 @@ static int run(int argc, char* argv[]) {
 
     // --- Phase 1: Decompress + mmap patch ---
     std::string raw_path = tmpdir + "/patch.raw";
-#ifdef GCS_LIBZSTD
     if (!decompress_to_file(patch_path, raw_path)) { std::cerr << "Failed to decompress" << std::endl; return 1; }
-#else
-    {
-        std::string cmd = "zstd -d '" + patch_path + "' -o '" + raw_path + "' -f --quiet 2>/dev/null";
-        if (system(cmd.c_str()) != 0) { std::cerr << "Failed to decompress" << std::endl; return 1; }
-    }
-#endif
     MappedFile patch_map = mmap_file(raw_path);
     if (!patch_map.data) { std::cerr << "Failed to mmap patch" << std::endl; return 1; }
     // Don't remove temp file yet (mmap needs backing file for page eviction under memory pressure)
@@ -380,8 +505,7 @@ static int run(int argc, char* argv[]) {
     };
 
     // Header
-    if (memcmp(P, GCPATCH_MAGIC, 8) != 0) { std::cerr << "Bad magic" << std::endl; return 1; }
-    pos = 8;
+    if (memcmp(take(8, "magic"), GCPATCH_MAGIC, 8) != 0) { std::cerr << "Bad magic" << std::endl; return 1; }
     uint32_t ver = ru32(); if (ver < GCPATCH_MIN_READ_VERSION || ver > GCPATCH_VERSION) { std::cerr << "Bad version" << std::endl; return 1; }
     const bool v8 = ver >= 8;
     ru32(); // flags
@@ -406,10 +530,15 @@ static int run(int argc, char* argv[]) {
     // group ahead of the reader without blocking. The buffers live as long
     // as the run.
     std::vector<std::unique_ptr<char[]>> fifo_bufs;
-    auto widen_pipe = [&fifo_bufs](FILE* f) {
+    // (The pipe must grow: the entry pipeline's group flush runs 128 KiB plus a list ahead on one
+    // FIFO while its encoder waits on another.)
+    auto widen_pipe = [&fifo_bufs](FILE* f, const std::string& p) {
         struct stat st;
         if (fstat(fileno(f), &st) != 0 || !S_ISFIFO(st.st_mode)) return;
-        fcntl(fileno(f), F_SETPIPE_SZ, 1 << 20);
+        const int got = fcntl(fileno(f), F_SETPIPE_SZ, 1 << 20);
+        if (got < (1 << 20))
+            throw std::runtime_error(p + ": the pipe can't hold 1 MiB (" + (got < 0 ? std::strerror(errno) : "smaller") +
+                                     "); streamed outputs need it (fs.pipe-max-size, fs.pipe-user-pages-soft)");
         fifo_bufs.emplace_back(new char[1 << 20]);
         setvbuf(f, fifo_bufs.back().get(), _IOFBF, 1 << 20);
     };
@@ -418,7 +547,7 @@ static int run(int argc, char* argv[]) {
         std::string p = out_path(name);
         FILE* f = fopen(p.c_str(), "wb");
         if (!f) throw std::runtime_error("Cannot write " + p);
-        widen_pipe(f);
+        widen_pipe(f, p);
         __fsetlocking(f, FSETLOCKING_BYCALLER);  // one thread writes each output: no lock per fwrite
         return f;
     };
@@ -525,6 +654,35 @@ static int run(int argc, char* argv[]) {
     // files replay along it).
     struct SeqRef { size_t start, size; size_t stride; };
     std::unordered_map<uint32_t, SeqRef> merge_seqs;
+
+    // Low-memory client update: an encoded family's records and their child stream (ways and
+    // their nodes, address points and their footprints, POI records and their vertices) come
+    // from one decoder and go to one encoder, so the two sections replay together: each new
+    // record, then its child bytes. The child section (at `at`) must follow the parent's.
+    auto open_joint_child = [&](uint32_t parent_fid, FILE* parent_out, size_t at) {
+        std::unique_ptr<JointChild> jc(new JointChild());
+        jc->parse(P, patch_size, at, joint_child_of(parent_fid), v8);
+        const char* cname = patch_file_names[jc->fid];
+        require_old_file_size(cur_dir, cname, jc->old_size);
+        jc->old.reset(new SequentialFileReader(cur_dir + "/" + cname));
+        jc->out = open_out(cname);
+        jc->parent = parent_out;
+        jc->name = cname;
+        return jc;
+    };
+    // After the parent's output is closed: the child's last bytes, its checks, and the patch
+    // position moves past its section.
+    auto close_joint_child = [&](std::unique_ptr<JointChild>& jc, const char* parent_name) {
+        jc->finish();
+        bool cok = !ferror(jc->out);
+        if (fclose(jc->out) != 0 || !cok) throw std::runtime_error(std::string("Cannot write ") + jc->name);
+        if (jc->written != jc->new_size)
+            throw std::runtime_error(std::string("Rebuilt ") + jc->name + " does not match the new build");
+        if (jc->kind == JointChild::MERGE) merge_seqs[jc->fid] = {jc->seq, jc->seq_end - jc->seq, jc->stride};
+        std::cerr << "  " << jc->name << ": " << jc->written << " bytes, replayed with " << parent_name << std::endl;
+        pos = jc->section_end;
+        jc.reset();
+    };
 
     bool saw_end = false;
     while (pos < patch_size) {
@@ -686,8 +844,6 @@ static int run(int argc, char* argv[]) {
             // data. Reproduce by copying the old (current) file verbatim.
             uint32_t nf = ru32(); (void)nf; take(ru64(), "copy-old payload"); // empty
             if (!want) continue;
-            if (gcs::store().is_encoded(fname) && joint_child_of(file_id) != UINT32_MAX)
-                throw std::runtime_error(std::string("Encoded set: an unchanged ") + fname + " is not replayed with its child yet");
             SequentialFileReader in(cur_dir + "/" + fname);
             if (!in.is_open()) {
                 // The diff only emits COPY_OLD for a file that existed (and was
@@ -698,6 +854,25 @@ static int run(int argc, char* argv[]) {
                 return 1;
             }
             FILE* out = open_out(fname);
+            if (gcs::store().is_encoded(fname) && joint_child_of(file_id) != UINT32_MAX) {
+                // An unchanged parent of an encoded family: one MATCH of every record, each followed
+                // by its child bytes (from the child section, which may still change them).
+                const size_t rs = joint_parent_stride(file_id);
+                if (in.size() % rs) throw std::runtime_error(std::string("Old ") + fname + " is not whole records");
+                std::unique_ptr<JointChild> jc = open_joint_child(file_id, out, pos);
+                for (uint64_t off = 0; off < in.size(); off += rs) {
+                    jc->hint();
+                    const char* rec = in.at(off, rs);
+                    jc->before_parent_write(out, rs);
+                    fwrite(rec, 1, rs, out);
+                    jc->produce(child_bytes_of(file_id, rec, *jc));
+                }
+                bool ok = !ferror(out);
+                if (fclose(out) != 0 || !ok) throw std::runtime_error(std::string("Cannot write ") + fname);
+                std::cerr << "  " << fname << ": unchanged (copied " << in.size() << " bytes from old)" << section_io() << std::endl;
+                close_joint_child(jc, fname);
+                continue;
+            }
             append_old_range(in, out, 0, in.size(), fname);
             bool ok = !ferror(out);
             if (fclose(out) != 0 || !ok) throw std::runtime_error(std::string("Cannot write ") + fname);
@@ -728,11 +903,9 @@ static int run(int argc, char* argv[]) {
                 old_c, old_e, payload + 8, payload_size - 8,
                 [&](const char* p, size_t n) { fwrite(p, 1, n, fc); cells_written += n; },
                 [&](const char* p, size_t n) { fwrite(p, 1, n, fe); });
-            bool ok = !ferror(fc) && !ferror(fe);
-            fclose(fc); fclose(fe);
+            close_outputs({{fc, cells_name.c_str()}, {fe, entries_name.c_str()}});
             log_rewinds(old_c);
             log_rewinds(old_e);
-            if (!ok) throw std::runtime_error("Cannot write " + cells_name);
             if (cells_written != new_size || entries_written != new_entries_size)
                 throw std::runtime_error("Rebuilt " + cells_name + " does not match the new build");
             std::cerr << "  " << cells_name << " + " << entries_name << ": cell list delta, "
@@ -807,9 +980,7 @@ static int run(int argc, char* argv[]) {
                 }
             }
             if (!buf.empty()) fwrite(buf.data(), 4, buf.size(), out);
-            bool ok = !ferror(out);
-            fclose(out);
-            if (!ok) throw std::runtime_error(std::string("Cannot write ") + fname);
+            close_outputs({{out, fname}});
             if (ni * 4 != new_size || ci != n_changes || ii != n_ins)
                 throw std::runtime_error(std::string("Parallel delta does not match the new build: ") + fname);
             log_rewinds(old);
@@ -878,9 +1049,7 @@ static int run(int argc, char* argv[]) {
                 }
                 fwrite(buf.data(), 1, n, out);
             }
-            bool ok = !ferror(out);
-            fclose(out);
-            if (!ok) throw std::runtime_error(std::string("Cannot write ") + fname);
+            close_outputs({{out, fname}});
 
             std::cerr << "  " << fname << ": sparse delta " << n_changes
                       << " changes (" << new_size << " bytes)" << section_io() << std::endl;
@@ -968,38 +1137,10 @@ static int run(int argc, char* argv[]) {
         merge_seqs[file_id] = {pos, (size_t)seq_size, actual_stride};
         FILE* outf = open_out(fname);
 
-        // Low-memory client update: an encoded family's records and their child stream (ways and
-        // their nodes, address points and their footprints, POI records and their vertices) come
-        // from one decoder and go to one encoder, so the two sections replay together: each new
-        // record, then its child bytes. The child section must follow the parent's.
+        // An encoded family's parent: its child section replays along (open_joint_child).
         std::unique_ptr<JointChild> jc;
-        if (gcs::store().is_encoded(fname) && joint_child_of(file_id) != UINT32_MAX) {
-            jc.reset(new JointChild());
-            jc->parse(P, patch_size, seq_end, joint_child_of(file_id), v8);
-            const char* cname = patch_file_names[jc->fid];
-            require_old_file_size(cur_dir, cname, jc->old_size);
-            jc->old.reset(new SequentialFileReader(cur_dir + "/" + cname));
-            jc->out = open_out(cname);
-            jc->parent = outf;
-            jc->name = cname;
-        }
-        auto child_bytes = [&](const char* rec) -> uint64_t {
-            switch ((PatchFileId)file_id) {
-            case PatchFileId::STREET_WAYS:
-            case PatchFileId::INTERP_WAYS: return (uint64_t)record_node_count(rec) * 8;
-            case PatchFileId::ADDR_POINTS: {
-                uint32_t vc; memcpy(&vc, rec + 24, 4);
-                if (!vc) return 0;
-                return 10 + (uint64_t)vc * (jc->peek() == 3 ? 8 : 4);
-            }
-            case PatchFileId::POI_RECORDS: {
-                uint32_t vc; memcpy(&vc, rec + 12, 4);
-                if (!vc) return 0;
-                return 10 + (uint64_t)vc * 2 * (jc->peek() == 3 ? 4 : 2);
-            }
-            default: throw std::runtime_error("No child stream");
-            }
-        };
+        if (gcs::store().is_encoded(fname) && joint_child_of(file_id) != UINT32_MAX) jc = open_joint_child(file_id, outf, seq_end);
+        auto child_bytes = [&](const char* rec) { return child_bytes_of(file_id, rec, *jc); };
 
         // Record the old → new record ids of the files whose remap the entry
         // pipeline reads back (geo, POI and place indexes).
@@ -1040,6 +1181,7 @@ static int run(int argc, char* argv[]) {
                 for (uint32_t k = 0; k < count; k++) {
                     size_t rec_off = old_bytes + k * actual_stride;
                     if (rec_off + actual_stride > old.size()) break;
+                    if (jc) jc->hint();
                     const char* rec = old.at(rec_off, actual_stride);
 
                     bool modified = false;
@@ -1149,10 +1291,14 @@ static int run(int argc, char* argv[]) {
                 written += bytes; pos += bytes; new_rec += count;
             } else if (op == OP_DELETE_RUN) {
                 old_rec += count; old_bytes += count * actual_stride;
+                old.skip_to(old_bytes);  // an encoded family's decoder drops them
             } else if (op == OP_REPLACE_RUN && v8) {
                 // Same entities, new bytes: written like an INSERT, mapped like a MATCH.
                 size_t bytes = count * actual_stride;
                 if (pos + bytes > seq_end) throw std::runtime_error(std::string("Malformed merge sequence: ") + fname);
+                // The old records are never read: an encoded family's decoder drops them as the
+                // children's MATCH reads below make it produce them.
+                old.skip_to(old_bytes + bytes);
                 if (jc) {
                     for (uint32_t k = 0; k < count; k++) {
                         jc->before_parent_write(outf, actual_stride);
@@ -1172,17 +1318,7 @@ static int run(int argc, char* argv[]) {
         bool out_ok = !ferror(outf);
         if (fclose(outf) != 0 || !out_ok) throw std::runtime_error(std::string("Cannot write ") + fname);
         log_rewinds(old);
-        if (jc) {
-            jc->finish();
-            bool cok = !ferror(jc->out);
-            if (fclose(jc->out) != 0 || !cok) throw std::runtime_error(std::string("Cannot write ") + jc->name);
-            if (jc->written != jc->new_size)
-                throw std::runtime_error(std::string("Rebuilt ") + jc->name + " does not match the new build");
-            if (jc->kind == JointChild::MERGE) merge_seqs[jc->fid] = {jc->seq, jc->seq_end - jc->seq, jc->stride};
-            std::cerr << "  " << jc->name << ": " << jc->written << " bytes, replayed with " << fname << std::endl;
-            pos = jc->section_end;
-            jc.reset();
-        }
+        if (jc) close_joint_child(jc, fname);
 
         if (track && v8 && file_id == (uint32_t)PatchFileId::STREET_WAYS) {
             // The moved ways' pairs (parent-id remap, street leg) complete
@@ -1393,8 +1529,16 @@ static int run(int argc, char* argv[]) {
             if (add_i < geo_added.size()) add_cid = geo_added[add_i];
 
             if (old_cid <= add_cid) {
-                if (!is_removed(old_cid))
+                if (!is_removed(old_cid)) {
                     process_cell(old_cid, old_offs);
+                } else {
+                    // An encoded set's lists come in row order: those before a removed row's are
+                    // never read, and the gxc decoder drops them instead of queueing a removed
+                    // stretch's lists for the next row kept.
+                    SequentialFileReader* es[3] = {&old_se, &old_ae, &old_ie};
+                    for (int t = 0; t < 3; t++)
+                        if (old_offs[size_t(t)] != NO) es[t]->skip_to(old_offs[size_t(t)]);
+                }
                 old_i++;
                 if (old_cid == add_cid) add_i++; // skip duplicate add
             } else {
@@ -1408,7 +1552,8 @@ static int run(int argc, char* argv[]) {
             }
         }
 
-        fclose(f_geo); fclose(o_se.f); fclose(o_ae.f); fclose(o_ie.f);
+        close_outputs({{f_geo, "geo_cells.bin"}, {o_se.f, "street_entries.bin"}, {o_ae.f, "addr_entries.bin"},
+                       {o_ie.f, "interp_entries.bin"}});
         for (const SequentialFileReader* r : {&old_geo, &old_se, &old_ae, &old_ie}) log_rewinds(*r);
         std::cerr << "  Geo: " << cells_written << " cells written" << std::endl;
         malloc_trim(0);
@@ -1424,8 +1569,8 @@ static int run(int argc, char* argv[]) {
             size_t n = cells.size() / 12;
             auto ecit = entry_corrections.find((uint32_t)entries_fid);
             if (ecit == entry_corrections.end()) {
-                write_file(out_path(cells_name), cells);
-                write_file(out_path(entries_name), entries);
+                if (!write_file(out_path(cells_name), cells) || !write_file(out_path(entries_name), entries))
+                    throw std::runtime_error("Cannot write " + cells_name);
                 std::cerr << "  " << label << ": " << n << " cells rebuilt" << std::endl;
                 return;
             }
@@ -1458,7 +1603,7 @@ static int run(int argc, char* argv[]) {
                     }
                 }
             }
-            fclose(fc); fclose(fe);
+            close_outputs({{fc, cells_name.c_str()}, {fe, entries_name.c_str()}});
             std::cerr << "  " << label << ": " << n << " cells, " << corr.size() << " corrections" << std::endl;
         };
 
@@ -1481,11 +1626,9 @@ static int run(int argc, char* argv[]) {
                               dit->second.data(), dit->second.size(),
                               [&](const char* p, size_t len) { fwrite(p, 1, len, fc); n_out += len; },
                               [&](const char* p, size_t len) { fwrite(p, 1, len, fe); });
-            bool ok = !ferror(fc) && !ferror(fe);
-            fclose(fc); fclose(fe);
+            close_outputs({{fc, (prefix + "_cells.bin").c_str()}, {fe, (prefix + "_entries.bin").c_str()}});
             log_rewinds(old_c);
             log_rewinds(old_e);
-            if (!ok) throw std::runtime_error("Cannot write " + prefix + "_cells.bin");
             std::cerr << "  " << label << ": " << n_out / 12 << " cells, cell index delta" << std::endl;
             return true;
         };

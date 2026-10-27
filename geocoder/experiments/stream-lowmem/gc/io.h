@@ -58,6 +58,16 @@ inline bool want(const std::string& name) { return want_files().empty() || want_
     exit(2);
 }
 
+// Every FIFO's pipe is enlarged to FIFO_PIPE: a FlushGroup writer runs FIFO_GROUP_FLUSH plus a row
+// ahead on one stream while its reader waits on another, and a default (or, past the user's pipe
+// page limit, 8 KiB) pipe can't hold that, so the two would wait on each other for ever.
+inline void widen_fifo(int fd, const std::string& p) {
+    const int got = fcntl(fd, F_SETPIPE_SZ, int(FIFO_PIPE));
+    if (got < int(FIFO_PIPE))
+        die("%s: the pipe can't hold %zu bytes (%s); streamed files need it (fs.pipe-max-size, fs.pipe-user-pages-soft)",
+            p.c_str(), FIFO_PIPE, got < 0 ? strerror(errno) : "smaller");
+}
+
 inline bool exists(const std::string& p) {
     struct stat st;
     return stat(p.c_str(), &st) == 0;
@@ -105,7 +115,7 @@ struct Reader {
         if (S_ISFIFO(st.st_mode)) {
             if (start != 0) die("%s: a FIFO can't be read from an offset", p.c_str());
             fifo = true;
-            fcntl(fd, F_SETPIPE_SZ, int(FIFO_PIPE));
+            widen_fifo(fd, p);
             end = std::min<uint64_t>(file_size(p), stop);
         } else {
             end = std::min<uint64_t>(uint64_t(st.st_size), stop);
@@ -220,7 +230,7 @@ struct Writer {
         if (is_fifo(p)) {  // a FIFO the reader opened or will open: write() through FIFO_BUF
             fd = open(p.c_str(), O_WRONLY | O_CLOEXEC);
             if (fd < 0) die("open %s: %s", p.c_str(), strerror(errno));
-            fcntl(fd, F_SETPIPE_SZ, int(FIFO_PIPE));
+            widen_fifo(fd, p);
             fifo = true;
             cap = FIFO_BUF;
             buf.resize(cap);

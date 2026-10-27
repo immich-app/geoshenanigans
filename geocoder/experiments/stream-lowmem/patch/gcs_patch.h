@@ -54,6 +54,26 @@ struct Store {
     std::vector<std::string> report;                      // per family: queue peaks
     std::string sink_error;
     std::set<std::string> opened_old, opened_new;
+    struct Cookie;
+    std::map<Cookie*, FILE*> sinks;  // sinks not closed yet
+    bool abandoned = false;
+
+    // A failed run (exit after main's catch, or any other way out): the sinks still open are closed
+    // with their buffered bytes dropped and the codec threads stopped, before the encoders go. Else
+    // exit's flush of the open streams would write into the destroyed Store, and a worker waiting
+    // for a close that never comes would be joined forever.
+    void abandon() {
+        abandoned = true;
+        std::vector<FILE*> open;
+        for (auto& kv : sinks) open.push_back(kv.second);
+        for (FILE* f : open) fclose(f);
+        sinks.clear();
+        aenc.clear();
+        adec.clear();
+        enc.clear();
+        dec.clear();
+    }
+    ~Store() { abandon(); }
 
     void init(const std::string& cur, const std::string& out) {
         cur_dir = cur;
@@ -157,6 +177,12 @@ struct Store {
             if (AsyncDec* a = s->adec[size_t(fi)].get()) return a->read(port, dst, max);
             return d->read(port, dst, max);
         }
+        bool skip(uint64_t n) override {
+            Decoder* d = s->decoder(fi);
+            if (AsyncDec* a = s->adec[size_t(fi)].get()) a->skip(port, n);
+            else d->skip(port, n);
+            return true;
+        }
         ~PortSource() override { s->close_source(fi, port); }
     };
     std::unique_ptr<StreamSource> open_source(const std::string& path) {
@@ -204,6 +230,7 @@ struct Store {
     };
     static ssize_t cookie_write(void* c, const char* p, size_t n) {
         Cookie* k = static_cast<Cookie*>(c);
+        if (k->s->abandoned) return ssize_t(n);  // dropped
         try {
             Encoder* e = k->s->encoder(k->fi);
             if (AsyncEnc* a = k->s->aenc[size_t(k->fi)].get()) a->write(k->port, p, n);
@@ -218,9 +245,10 @@ struct Store {
     static int cookie_close(void* c) {
         Cookie* k = static_cast<Cookie*>(c);
         Store* s = k->s;
+        s->sinks.erase(k);
         int rc = 0;
         try {
-            s->close_sink(k->fi, k->port);
+            if (!s->abandoned) s->close_sink(k->fi, k->port);
         } catch (const std::exception& e) {
             if (s->sink_error.empty()) s->sink_error = e.what();
             rc = EOF;
@@ -237,7 +265,11 @@ struct Store {
         Cookie* c = new Cookie{this, fi, port, std::vector<char>(SINK_BUF)};
         cookie_io_functions_t io = {nullptr, cookie_write, nullptr, cookie_close};
         FILE* f = fopencookie(c, "w", io);
-        if (!f) die("fopencookie %s", name.c_str());
+        if (!f) {
+            delete c;
+            die("fopencookie %s", name.c_str());
+        }
+        sinks[c] = f;
         setvbuf(f, c->buf.data(), _IOFBF, c->buf.size());
         __fsetlocking(f, FSETLOCKING_BYCALLER);
         return f;
