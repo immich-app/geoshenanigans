@@ -337,7 +337,12 @@ impl Runs {
         }
     }
 
+    /// Adds one key entry; an error for a key longer than a run entry's u16 length holds.
     fn push(&mut self, key: &[u8], p: Posting) -> std::io::Result<()> {
+        let Ok(len) = u16::try_from(key.len()) else {
+            let e = format!("entity {}: a key of {} bytes, over the {} bytes a sort run entry holds", p.entity, key.len(), u16::MAX);
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, e));
+        };
         if self.arena.len() + key.len() > self.arena.capacity() || self.items.len() == self.items.capacity() {
             self.spill()?;
         }
@@ -345,7 +350,7 @@ impl Runs {
         self.arena.extend_from_slice(key);
         self.items.push(Item {
             off,
-            len: key.len().min(u16::MAX as usize) as u16,
+            len,
             flags: entry_flags(&p),
             ord: p.ord,
             entity: p.entity,
@@ -984,6 +989,43 @@ mod tests {
             assert_eq!(read_all(&left), all);
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn runs_refuse_keys_over_the_length_limit() {
+        let dir = tmp_dir("long-key");
+        let mut runs = Runs::new(1 << 20, &dir, "t".into());
+        let p = posting(1, 9, false, 0);
+        let longest = vec![b'a'; u16::MAX as usize];
+        assert!(runs.push(&longest, p).is_ok());
+
+        // One byte over: ASCII, and a two-byte character across the limit.
+        for key in [vec![b'a'; u16::MAX as usize + 1], [&longest[1..], "ж".as_bytes()].concat()] {
+            assert_eq!(runs.push(&key, p).map_err(|e| e.kind()), Err(std::io::ErrorKind::InvalidInput), "{} bytes", key.len());
+        }
+        runs.spill().unwrap();
+        assert_eq!(read_all(&runs.files), [(longest, p)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_build_fails_on_a_name_over_the_key_limit() {
+        use crate::fixture::{Geo, TempDir};
+        let mut g = Geo::default();
+        g.place("Testville", 1, 10.1, 20.1);
+        let dir = TempDir::new("long-name");
+        let (tsv, bin) = (dir.0.join("extra_names.tsv"), dir.0.join("extra_names.bin"));
+        std::fs::write(&tsv, format!("p\t0\t2\tname:ru\t{}\n", "ж".repeat(u16::MAX as usize / 2 + 1))).unwrap();
+        crate::extras::pack(tsv.to_str().unwrap(), bin.to_str().unwrap()).unwrap();
+        let geo = g.load(&dir.0.join("geo"));
+        let opts = BuildOpts {
+            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"), inline: true,
+            extras: Some(bin.to_str().unwrap().into()), imp_dir: None, area_proxy: false, poi_max_tier: 3,
+        };
+
+        let err = build(&geo, "places", &dir.0.join("idx"), &opts).err();
+
+        assert!(err.as_deref().is_some_and(|e| e.contains("65536 bytes")), "{err:?}");
     }
 
     fn writer(dir: &Path) -> Writer {
