@@ -3,7 +3,7 @@
 PATCHER: the experiment's geocoder-patch; GC: gc; DIFF: a geocoder-diff (v7 or v8; the REPLACE run
 case needs v8). Each case makes an old and a new today's-format dir, diffs them, encodes the old one
 with gc, applies the patch to it (sync and --threads) and compares the new encoded set byte for byte
-with gc's encoding of the new dir.
+with gc's encoding of the new dir. The later cases apply patches that must fail. zstd must be on PATH.
 """
 import errno
 import fcntl
@@ -126,6 +126,10 @@ def block(rng, vc):
 def run(cmd, **kw):
     kw.setdefault('env', ENV)
     return subprocess.run(cmd, capture_output=True, **kw)
+
+
+def zstd(args, data):
+    return subprocess.run(['zstd', '-q', '-c'] + args, input=data, capture_output=True, check=True).stdout
 
 
 def same_dirs(a, b):
@@ -279,6 +283,49 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as scratch:
             errors.append(f'alias ({case}): an output that is a current file was not refused: rc={r.returncode} {err[-300:]}')
         if {p.name: p.read_bytes() for p in (root / cur).iterdir()} != before:
             errors.append(f'alias ({case}): the current set changed')
+
+    # A MATCH run longer than what is left of the old file is refused before any of it is written (the
+    # replay stopped at the old file's end and went on as if the run was whole, and a FIFO output has
+    # no size check after): the last run of POI records (a record by record replay) and of their
+    # vertices (a byte stream, copied a run at a time), 5 longer, into a file and into a FIFO.
+    match_blocks = [(i, block(rng, 3)) for i in range(300)]
+    poi_dir(root / 'match.a', match_blocks)
+    poi_dir(root / 'match.b', match_blocks[:100] + match_blocks[101:])
+    r = run([DIFF, str(root / 'match.a'), str(root / 'match.b'), '-o', str(root / 'match.gcpatch')])
+    r = run([PATCHER, str(root / 'match.a'), str(root / 'match.gcpatch'), '-o', str(root / 'match.out')])
+    if r.returncode or same_dirs(root / 'match.b', root / 'match.out'):
+        errors.append(f'match-past-end: the unedited patch does not apply: rc={r.returncode} {r.stderr.decode()[-300:]}')
+    raw = zstd(['-d'], (root / 'match.gcpatch').read_bytes())
+    refusal = pipe_growth_refusal()
+    for name, kept, gone, rest in (('poi_records.bin', 100, 1, 199), ('poi_vertices.bin', 2200, 22, 4378)):
+        runs = struct.pack('<BIBIBI', 0, kept, 2, gone, 0, rest)  # MATCH, DELETE, MATCH
+        at = raw.find(runs)
+        if at < 0 or raw.find(runs, at + 1) >= 0:
+            errors.append(f'match-past-end ({name}): no single MATCH {kept}, DELETE {gone}, MATCH {rest} in the patch')
+            continue
+        bad = bytearray(raw)
+        struct.pack_into('<I', bad, at + 11, rest + 5)
+        patch = root / f'match.{name}.gcpatch'
+        patch.write_bytes(zstd(['-3'], bytes(bad)))
+        for fifo in (False, True):
+            if fifo and refusal:
+                print(f"match-past-end ({name}, fifo): SKIP, this user's pipes can't grow to 1 MiB ({refusal})")
+                continue
+            out = root / f'match.{name}.{"fifo" if fifo else "file"}'
+            out.mkdir()
+            reader = None
+            if fifo:
+                os.mkfifo(out / name)
+                reader = subprocess.Popen(['cat', str(out / name)], stdout=subprocess.DEVNULL)
+            try:
+                r = run([PATCHER, str(root / 'match.a'), str(patch), '-o', str(out)], timeout=120)
+            finally:
+                if reader:
+                    reader.kill()
+                    reader.wait()
+            err = r.stderr.decode()
+            if r.returncode == 0 or f'Malformed merge sequence: {name}' not in err:
+                errors.append(f'match-past-end ({name}{", fifo" if fifo else ""}): not refused: rc={r.returncode} {err[-300:]}')
 
     # A streamed output whose reader goes away fails the run (the entry pipeline's four outputs were
     # closed unchecked): geo_cells.bin is a FIFO whose reader closes at once, the patch rewrites 4 MiB

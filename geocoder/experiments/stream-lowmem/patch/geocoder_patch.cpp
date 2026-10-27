@@ -1208,8 +1208,10 @@ static int run(int argc, char* argv[]) {
                 // planet/full's 3.4 GiB addr_vertices, one per node of its
                 // 600M street_nodes.
                 size_t run_bytes = (size_t)count * actual_stride;
-                if (!jc && !needs_remap && !needs_padding && remap_offs.empty() && !has_fixups
-                    && old_bytes + run_bytes <= old.size()) {
+                // Every record of the run is an old one, whole range checked before any is written.
+                if (old_bytes > old.size() || run_bytes > old.size() - old_bytes)
+                    throw std::runtime_error(std::string("Malformed merge sequence: ") + fname + " (a MATCH run past the old file)");
+                if (!jc && !needs_remap && !needs_padding && remap_offs.empty() && !has_fixups) {
                     append_old_range(old, outf, old_bytes, run_bytes, fname);
                     written += run_bytes;
                     old_rec += count; new_rec += count; old_bytes += run_bytes;
@@ -1217,7 +1219,6 @@ static int run(int argc, char* argv[]) {
                 }
                 for (uint32_t k = 0; k < count; k++) {
                     size_t rec_off = old_bytes + k * actual_stride;
-                    if (rec_off + actual_stride > old.size()) break;
                     if (jc) jc->hint();
                     const char* rec = old.at(rec_off, actual_stride);
 
