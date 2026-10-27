@@ -6,7 +6,8 @@
 //!                    [--bench REPEATS [--no-warmup]]
 //!   one query per stdin line; default one JSON line per query, --bench latency percentiles
 //! place-search ctxbench <set dir> <index dir> < "lat lng" lines   (reverse-lookup cost per point)
-use place_search::build::{build_all, BuildOpts};
+use place_search::build::{build_all, held_subs, index_meta, BuildOpts};
+use place_search::constants::{META_FILE, SUB_INDEXES};
 use place_search::reader::SearchIndex;
 use place_search::query::Searcher;
 use query_server::{Index, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL};
@@ -46,7 +47,7 @@ fn selected_subs(sub: &str) -> Result<&'static [&'static str], String> {
     match sub {
         "places" => Ok(&["places"]),
         "poi" => Ok(&["poi"]),
-        "all" => Ok(&["places", "poi"]),
+        "all" => Ok(SUB_INDEXES),
         _ => Err(format!("--sub {sub:?}: expected places, poi or all")),
     }
 }
@@ -59,32 +60,30 @@ fn cmd_build(args: &[String]) {
         std::process::exit(2)
     });
     let geo = load_geo(set);
+    let base = BuildOpts::new(opt(args, "--tmp").map(PathBuf::from).unwrap_or_else(|| out.join("tmp")));
     let opts = BuildOpts {
-        threads: opt(args, "--threads").map(|v| v.parse().unwrap()).unwrap_or(1),
-        mem_mb: opt(args, "--mem-mb").map(|v| v.parse().unwrap()).unwrap_or(place_search::constants::DEFAULT_RUN_BUDGET_MB),
-        tmp: opt(args, "--tmp").map(PathBuf::from).unwrap_or_else(|| out.join("tmp")),
+        threads: opt(args, "--threads").map(|v| v.parse().unwrap()).unwrap_or(base.threads),
+        mem_mb: opt(args, "--mem-mb").map(|v| v.parse().unwrap()).unwrap_or(base.mem_mb),
         inline: !flag(args, "--no-inline"),
         extras: opt(args, "--extras"),
         imp_dir: opt(args, "--imp"),
         area_proxy: flag(args, "--area-proxy"),
-        poi_max_tier: opt(args, "--poi-max-tier").map(|v| v.parse().unwrap()).unwrap_or(3),
+        poi_max_tier: opt(args, "--poi-max-tier").map(|v| v.parse().unwrap()).unwrap_or(base.poi_max_tier),
+        ..base
     };
-    let subs: Vec<&str> = selected.iter().copied().filter(|&s| s != "poi" || geo.poi_records.is_some()).collect();
+    let subs = held_subs(&geo, selected);
     let mut replacing = subs.clone();
     if geo.poi_records.is_none() { replacing.push("poi"); }
     let meta = || {
         place_search::build::check_retained_names(&out, &replacing, opts.extras.is_some())?;
-        let mut meta: serde_json::Value = std::fs::read_to_string(out.join("search_meta.json"))
+        // Merged into the one there, so sub-indexes can be built one at a time.
+        let mut meta: serde_json::Value = std::fs::read_to_string(out.join(META_FILE))
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_else(|| json!({}));
-        let n_place_nodes = geo.place_nodes.as_ref().map(|m| m.len() / 20).unwrap_or(0);
-        meta["n_place_nodes"] = json!(n_place_nodes);
-        meta["extras"] = json!(opts.extras.is_some());
-        meta["inline"] = json!(opts.inline);
-        meta["imp"] = json!(opts.imp_dir.is_some());
-        meta["area_proxy"] = json!(opts.area_proxy);
-        meta["poi_max_tier"] = json!(opts.poi_max_tier);
+        for (k, v) in index_meta(&geo, &opts) {
+            meta[k] = v;
+        }
         Ok(meta)
     };
     let stats = build_all(&geo, &subs, &out, &opts, meta).unwrap_or_else(|e| panic!("{e}"));

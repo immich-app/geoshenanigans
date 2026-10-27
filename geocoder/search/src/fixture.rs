@@ -1,8 +1,8 @@
 //! Test fixture: a small geocoder index (rectangular boundaries, place nodes, point POIs) in the
 //! builder's file layout, and the place-search index built from it the way `place-search build`
 //! builds one.
-use crate::build::{build_all, BuildOpts};
-use crate::constants::DEFAULT_RUN_BUDGET_MB;
+use crate::build::{build_all, held_subs, index_meta, BuildOpts};
+use crate::constants::SUB_INDEXES;
 use crate::model::{PLACE_FLAG_HIDDEN, PLACE_FLAG_LABEL_OF};
 use query_server::{
     cell_id_at_level, AdminPolygon, Index, PlaceNode, PoiRecord, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE,
@@ -169,14 +169,9 @@ impl Geo {
 /// Builds every sub-index of `geo` into `out` with the default options and `extras`, and the
 /// search_meta.json fields `SearchIndex::open` reads.
 pub fn build_search(geo: &Index, out: &Path, extras: Option<&Path>) {
-    let opts = BuildOpts {
-        threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: out.join("tmp"), inline: true,
-        extras: extras.map(|p| p.to_str().unwrap().to_string()), imp_dir: None, area_proxy: false, poi_max_tier: 3,
-    };
-    let subs: &[&str] = if geo.poi_records.is_some() { &["places", "poi"] } else { &["places"] };
-    let n_place_nodes = geo.place_nodes.as_ref().map_or(0, |m| m.len() / std::mem::size_of::<PlaceNode>() as u64);
-    let meta = serde_json::json!({"n_place_nodes": n_place_nodes, "extras": extras.is_some()});
-    build_all(geo, subs, out, &opts, || Ok(meta)).unwrap();
+    let opts = BuildOpts { extras: extras.map(|p| p.to_str().unwrap().to_string()), ..BuildOpts::new(out.join("tmp")) };
+    let meta = index_meta(geo, &opts).into();
+    build_all(geo, &held_subs(geo, SUB_INDEXES), out, &opts, || Ok(meta)).unwrap();
 }
 
 /// A `*_cells.bin` (u64 cell, u32 entry offset; sorted) and its `*_entries.bin` (u16 count, then

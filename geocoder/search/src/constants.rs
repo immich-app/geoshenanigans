@@ -65,6 +65,12 @@ pub const ORD_BOUNDARY_NAME: u8 = 14;
 pub const BOUNDARY_MIN_LEVEL: u8 = 2;
 pub const BOUNDARY_MAX_LEVEL: u8 = 8;
 
+// ---- files
+/// What an index was built from (options, sub-index stats); written last.
+pub const META_FILE: &str = "search_meta.json";
+/// The sub-indexes an index can hold, in build order.
+pub const SUB_INDEXES: &[&str] = &["places", "poi"];
+
 // ---- build
 /// Default memory for sort runs (all threads together). At 16 the build fits a 32 MiB cgroup for
 /// every set (peak anonymous 13-24 MiB, minimal to max); 64 measured no faster on one core.
