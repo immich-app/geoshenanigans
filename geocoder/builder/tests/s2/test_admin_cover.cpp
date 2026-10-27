@@ -3,6 +3,11 @@
 // ring listed in that cell, and an interior flag must hold for every point of
 // its cell.
 #include "admin_cover.h"
+#include "cell_index.h"
+#include "geometry.h"
+#include "admin_rank_config.h"
+#include "s2_helpers.h"
+#include <map>
 
 #include <algorithm>
 #include <cmath>
@@ -27,11 +32,15 @@ constexpr int kLevel = 10;
 
 using Cells = std::vector<std::pair<uint64_t, bool>>;
 
+// The entry of `cell` in `cells`, or null.
+const std::pair<uint64_t, bool>* cell_entry(const Cells& cells, uint64_t cell) {
+    auto it = std::lower_bound(cells.begin(), cells.end(), std::make_pair(cell, false));
+    return it != cells.end() && it->first == cell ? &*it : nullptr;
+}
+
 // The entry of the cell the reader looks (lat, lng) up in, or null.
 const std::pair<uint64_t, bool>* own_cell_entry(const Cells& cells, double lat, double lng, int level) {
-    const uint64_t own = S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(level).id();
-    auto it = std::lower_bound(cells.begin(), cells.end(), std::make_pair(own, false));
-    return it != cells.end() && it->first == own ? &*it : nullptr;
+    return cell_entry(cells, S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(level).id());
 }
 
 // The reader's answer: the f32 ray cast at the f32 point.
@@ -246,4 +255,122 @@ TEST(straight_edge_pieces_keep_each_chord_within_the_tolerance) {
     CHECK_EQ(straight_edge_pieces(10, 20, 30, 20), 35u);   // 20° in pieces of at most 0.01 rad
     // 358° the long way round, not the 2° across the antimeridian.
     CHECK(straight_edge_pieces(10, 179, 10, -179) >= 625u);
+}
+
+TEST(admin_cover_union_marks_only_common_interiors) {
+    AdminRingCells a{{1, true}, {3, true}, {4, false}, {5, true}};
+    AdminRingCells b{{2, true}, {3, false}, {4, true}, {5, true}};
+    AdminRingCells expected{{1, false}, {2, false}, {3, false}, {4, false}, {5, true}};
+    CHECK(merge_admin_ring_cells(a, b) == expected);
+    CHECK(merge_admin_ring_cells(b, a) == expected);
+}
+
+namespace {
+Cells variant_cells(const std::vector<NodeCoord>& ring, uint8_t level, double scale) {
+    std::vector<std::pair<double, double>> pts;
+    for (auto v : ring) pts.emplace_back(v.lat, v.lng);
+    if (scale > 0) pts = simplify_polygon_epsilon(pts, meters_to_degrees(admin_epsilon_meters(level) * scale, pts[0].first));
+    std::vector<uint8_t> bytes(plan_polygon(pts.data(), pts.size()).bytes);
+    pack_polygon_at(bytes.data(), pts.data(), pts.size());
+    auto decoded = unpack_polygon(bytes.data(), pts.size());
+    return admin_ring_cells(decoded.data(), decoded.size(), kAdminCellLevel);
+}
+
+Cells indexed_cells(const std::vector<CellItemPair>& pairs) {
+    Cells cells;
+    for (const auto& pair : pairs) {
+        CHECK_EQ(pair.item_id & ~INTERIOR_FLAG, 0u);
+        cells.emplace_back(pair.cell_id, (pair.item_id & INTERIOR_FLAG) != 0);
+    }
+    return cells;
+}
+
+// Whether `a` lists a cell `b` does not.
+bool lists_more(const Cells& a, const Cells& b) {
+    return std::any_of(a.begin(), a.end(), [&](const auto& entry) { return !cell_entry(b, entry.first); });
+}
+
+// Whether a cell both list is interior in only one.
+bool interior_differs(const Cells& a, const Cells& b) {
+    return std::any_of(a.begin(), a.end(), [&](const auto& entry) {
+        const auto* other = cell_entry(b, entry.first);
+        return other && other->second != entry.second;
+    });
+}
+
+// Every cell either variant lists, interior where both are.
+Cells shared_covering(const Cells& a, const Cells& b) {
+    std::map<uint64_t, int> interior_in;
+    for (const Cells* variant : {&a, &b})
+        for (const auto& [cell, interior] : *variant) interior_in[cell] += interior;
+    Cells out;
+    for (const auto& [cell, n] : interior_in) out.emplace_back(cell, n == 2);
+    return out;
+}
+
+// The shared index of the level-8 polygon `ring` over q0 and q2.5, in either
+// order, is the shared covering of its two variants.
+void check_shared_index(const std::vector<NodeCoord>& ring, const Cells& original, const Cells& simplified) {
+    const Cells want = shared_covering(original, simplified);
+    ParsedData data;
+    data.admin_vertices = ring;
+    AdminPolygon ap{};
+    ap.vertex_count = ring.size(); ap.vertex_offset = 0; ap.admin_level = 8;
+    data.admin_polygons.push_back(ap);
+    compute_admin_index_cells(data, {0, 2.5}, std::nullopt);
+    CHECK(indexed_cells(data.admin_index_cells) == want);
+    compute_admin_index_cells(data, {2.5, 0}, std::nullopt);
+    CHECK(indexed_cells(data.admin_index_cells) == want);
+}
+}
+
+TEST(admin_cover_shared_index_covers_both_quality_geometries) {
+    // A shallow spike near an S2 edge is dropped by q2.5; uncapped must still
+    // contribute the cells it reaches. Try adjacent offsets to avoid relying
+    // on the particular rounding of an S2 edge's floating point coordinate.
+    std::vector<NodeCoord> ring;
+    Cells original, simplified;
+    for (int shift = 1; shift <= 50 && !lists_more(original, simplified); shift++) {
+        float edge = shift * 0.00001f;
+        ring = {{edge, 0.1f}, {edge, 0.3f}, {edge - 0.0003f, 0.30001f},
+                {edge, 0.30002f}, {edge, 0.5f}, {0.4f, 0.5f}, {0.4f, 0.1f}, {edge, 0.1f}};
+        original = variant_cells(ring, 8, 0);
+        simplified = variant_cells(ring, 8, 2.5);
+    }
+    REQUIRE(lists_more(original, simplified));
+    check_shared_index(ring, original, simplified);
+}
+
+TEST(admin_cover_shared_index_flags_interior_only_where_both_geometries_do) {
+    // A shallow notch across an S2 edge is dropped by q2.5, which leaves the
+    // cell past the edge interior there; uncapped still reaches into that
+    // cell, so the shared index must not flag it.
+    std::vector<NodeCoord> ring;
+    Cells original, simplified;
+    for (int shift = 1; shift <= 50 && !interior_differs(original, simplified); shift++) {
+        float edge = -shift * 0.00001f;
+        ring = {{edge, 0.1f}, {edge, 0.3f}, {edge + 0.0003f, 0.30001f},
+                {edge, 0.30002f}, {edge, 0.5f}, {0.4f, 0.5f}, {0.4f, 0.1f}, {edge, 0.1f}};
+        original = variant_cells(ring, 8, 0);
+        simplified = variant_cells(ring, 8, 2.5);
+    }
+    REQUIRE(interior_differs(original, simplified));
+    check_shared_index(ring, original, simplified);
+}
+
+TEST(admin_cover_minimal_keeps_rank_sixteen_city_areas) {
+    ParsedData data;
+    data.admin_vertices = {{1.0f, 1.0f}, {1.0f, 1.2f}, {1.2f, 1.2f}, {1.2f, 1.0f}, {1.0f, 1.0f}};
+    AdminPolygon ap{};
+    ap.vertex_count = data.admin_vertices.size(); ap.vertex_offset = 0;
+    ap.admin_level = 15; ap.place_type_override = uint8_t(AdminPlaceType::CITY);
+    REQUIRE(admin_minimal_keeps(ap.admin_level, ap.place_type_override));
+    data.admin_polygons.push_back(ap);
+    const Cells want = variant_cells(data.admin_vertices, ap.admin_level, 2.5);
+    REQUIRE(!want.empty());
+    compute_admin_index_cells(data, {0}, 2.5);
+    CHECK(indexed_cells(data.admin_minimal_index_cells) == want);
+    data.admin_polygons[0].place_type_override = 0;
+    compute_admin_index_cells(data, {0}, 2.5);
+    CHECK(data.admin_minimal_index_cells.empty());
 }

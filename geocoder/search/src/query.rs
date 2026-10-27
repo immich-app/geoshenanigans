@@ -11,8 +11,7 @@ use crate::reader::{SearchIndex, SubIndex};
 use query_server::{cell_id_at_level, AdminPolygon, Index, ID_MASK, INTERIOR_FLAG, NO_DATA};
 use fst::{Automaton, IntoStreamer, Streamer};
 use levenshtein_automata::{Distance, LevenshteinAutomatonBuilder, DFA, SINK_STATE};
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
 pub struct Searcher<'a, 'g> {
@@ -85,13 +84,23 @@ impl Automaton for Anchored<'_> {
     }
 }
 
-#[derive(PartialEq, PartialOrd, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct Ord32(f32);
+impl PartialEq for Ord32 {
+    fn eq(&self, other: &Self) -> bool { self.cmp(other).is_eq() }
+}
+impl PartialOrd for Ord32 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+}
 impl Eq for Ord32 {}
 impl Ord for Ord32 {
     fn cmp(&self, o: &Self) -> std::cmp::Ordering {
         self.0.total_cmp(&o.0)
     }
+}
+
+fn context_mask_key(name_id: u32, country_code: u16, admin_level: u8) -> (u32, u16, bool) {
+    (name_id, country_code, admin_level == 2)
 }
 
 /// Best text score per matched fst value.
@@ -209,18 +218,23 @@ impl Context<'_> {
 
 struct Pool {
     best: HashMap<u32, Hit>,
-    heap: BinaryHeap<Reverse<Ord32>>,
-    /// best `top_k` scores offered, descending (the cut-off for costly context checks)
-    top: Vec<f32>,
+    /// (current score, entity) of the best `CANDIDATE_POOL` distinct entities offered: an
+    /// entity's improved score replaces its old one, so each counts once in both bounds
+    scores: BTreeSet<(Ord32, u32)>,
+    /// results the context cut-off keeps reachable (limit * CONTEXT_CUTOFF_FACTOR)
     top_k: usize,
 }
 
 impl Pool {
+    fn new(top_k: usize) -> Self {
+        Pool { best: HashMap::new(), scores: BTreeSet::new(), top_k }
+    }
+
     fn threshold(&self) -> f32 {
-        if self.heap.len() < CANDIDATE_POOL {
+        if self.scores.len() < CANDIDATE_POOL {
             0.0
         } else {
-            self.heap.peek().map(|r| r.0 .0).unwrap_or(0.0)
+            self.scores.first().map(|s| s.0 .0).unwrap_or(0.0)
         }
     }
 
@@ -232,25 +246,22 @@ impl Pool {
             if old.score >= h.score {
                 return;
             }
+            self.scores.remove(&(Ord32(old.score), h.entity));
         }
-        self.heap.push(Reverse(Ord32(h.score)));
-        if self.heap.len() > CANDIDATE_POOL {
-            self.heap.pop();
-        }
-        let at = self.top.partition_point(|&x| x >= h.score);
-        if at < self.top_k {
-            self.top.insert(at, h.score);
-            self.top.truncate(self.top_k);
+        self.scores.insert((Ord32(h.score), h.entity));
+        if self.scores.len() > CANDIDATE_POOL {
+            self.scores.pop_first();
         }
         self.best.insert(h.entity, h);
     }
 
-    /// No candidate scoring at most this can reach the results.
+    /// No candidate scoring at most this can reach the results: the `top_k`-th best distinct
+    /// entity's score.
     fn cutoff(&self) -> f32 {
-        if self.top.len() < self.top_k {
-            self.threshold()
-        } else {
-            self.top[self.top_k - 1].max(self.threshold())
+        if self.top_k == 0 { return f32::INFINITY; }
+        match self.scores.iter().nth_back(self.top_k - 1) {
+            Some(s) => s.0 .0.max(self.threshold()),
+            None => self.threshold(),
         }
     }
 }
@@ -319,12 +330,12 @@ impl<'a, 'g> Searcher<'a, 'g> {
     /// name (or ISO code, or country code) matches a word, and that contain the point (the
     /// cell's interior flag, else point-in-polygon only for those boundaries). A one-cell slice
     /// of the reverse lookup, without its field mapping.
-    fn context_mask(&self, ctx: &Context, names: &mut HashMap<u32, u64>, e: u32) -> u64 {
+    fn context_mask(&self, ctx: &Context, names: &mut HashMap<(u32, u16, bool), u64>, e: u32) -> u64 {
         let geo: &Index = self.idx.geo;
         let (lat, lng) = self.idx.ents.point(e);
         let mut m = 0u64;
         for (_, ap, interior) in self.cell_polygons(lat, lng) {
-            let nm = *names.entry(ap.name_id).or_insert_with(|| {
+            let nm = *names.entry(context_mask_key(ap.name_id, ap.country_code, ap.admin_level)).or_insert_with(|| {
                 let folded = normalize(geo.get_string(ap.name_id));
                 let cc = cc_of(ap.country_code);
                 let mut nm = ctx.mask_of(&folded);
@@ -517,7 +528,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
             return;
         }
         cands.sort_by(|a, b| b.potential.total_cmp(&a.potential).then(a.entity.cmp(&b.entity)));
-        let mut names: HashMap<u32, u64> = HashMap::new();
+        let mut names: HashMap<(u32, u16, bool), u64> = HashMap::new();
         let mut checked: HashMap<u32, bool> = HashMap::new();
         for c in cands {
             if c.potential <= pool.cutoff() {
@@ -539,8 +550,9 @@ impl<'a, 'g> Searcher<'a, 'g> {
     }
 
     pub fn search(&self, q: &str, limit: usize) -> (Vec<Found<'g>>, QueryStats) {
+        if limit == 0 { return (Vec::new(), QueryStats::default()); }
         let mut st = State { ctx: HashMap::new(), stats: QueryStats::default() };
-        let mut pool = Pool { best: HashMap::new(), heap: BinaryHeap::new(), top: Vec::new(), top_k: limit * CONTEXT_CUTOFF_FACTOR };
+        let mut pool = Pool::new(limit * CONTEXT_CUTOFF_FACTOR);
         let mut phrases: Vec<String> = Vec::new();
         if let Some((name, rest)) = q.split_once(',') {
             let name = tokens(name);
@@ -653,4 +665,62 @@ mod tests {
         let c = Context { words: &words, phrase: "tx".into() };
         assert_eq!(c.mask_of("texas") & 1, 0);
     }
+    fn hit(entity: u32, score: f32) -> Hit {
+        Hit { entity, ord: 0, class: 0, score, text: 1.0, context: false, split: 0 }
+    }
+
+    #[test]
+    fn zero_limit_has_no_reachable_candidate() {
+        let mut pool = Pool::new(0);
+        assert_eq!(pool.cutoff(), f32::INFINITY);
+        pool.offer(hit(1, 1.0));
+        assert_eq!(pool.cutoff(), f32::INFINITY);
+    }
+
+    #[test]
+    fn pool_counts_each_entity_once() {
+        // One entity improving 0.8 -> 0.9 is one candidate: with top_k 2 a context candidate at
+        // 0.7 can still reach the results until a second entity is in.
+        let mut pool = Pool::new(2);
+        pool.offer(hit(1, 0.8));
+        pool.offer(hit(1, 0.9));
+        assert_eq!(pool.cutoff(), 0.0);
+        pool.offer(hit(2, 0.7));
+        assert_eq!(pool.cutoff(), 0.7);
+        assert_eq!(pool.best.len(), 2);
+        // CANDIDATE_POOL improvements of one entity leave the pool open to everyone else.
+        let mut pool = Pool::new(2);
+        for k in 0..CANDIDATE_POOL {
+            pool.offer(hit(1, 0.1 + k as f32 / 1000.0));
+        }
+        assert_eq!(pool.threshold(), 0.0);
+        for e in 2..CANDIDATE_POOL as u32 + 1 {
+            pool.offer(hit(e, 0.05));
+        }
+        assert_eq!(pool.threshold(), 0.05);
+        pool.offer(hit(1000, 0.04));
+        assert!(!pool.best.contains_key(&1000));
+    }
+
+    #[test]
+    fn context_masks_distinguish_country_and_state_codes() {
+        let mut names = HashMap::new();
+        let country = context_mask_key(10, u16::from_le_bytes(*b"GE"), 2);
+        let state = context_mask_key(10, 0, 4);
+        names.insert(country, 1);
+        assert_eq!(*names.entry(state).or_insert(2), 2);
+        assert_ne!(context_mask_key(10, 0, 2), context_mask_key(10, 0, 4));
+        assert_ne!(context_mask_key(10, 1, 4), context_mask_key(10, 2, 4));
+    }
+
+    #[test]
+    fn float_order_is_consistent_for_nan_and_signed_zero() {
+        for value in [f32::NAN, -0.0, 0.0, 1.0] {
+            let a = Ord32(value);
+            assert!(a == a);
+            assert_eq!(a.partial_cmp(&a), Some(a.cmp(&a)));
+        }
+        assert!(Ord32(-0.0) != Ord32(0.0));
+    }
+
 }

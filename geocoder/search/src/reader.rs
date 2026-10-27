@@ -23,20 +23,18 @@ pub struct SubIndex {
     pub post: Mmap,
     pub pfx_map: fst::Map<Mmap>,
     pub pfx: Mmap,
-    pub with_names: bool,
     /// Entity ids of this sub-index carry POI_BIT.
     pub poi: bool,
 }
 
 impl SubIndex {
-    pub fn open(dir: &Path, name: &str, with_names: bool) -> Result<Self, String> {
+    pub fn open(dir: &Path, name: &str) -> Result<Self, String> {
         let m = |ext: &str| map(&dir.join(format!("{name}.{ext}")));
         Ok(SubIndex {
             map: fst::Map::new(m("fst")?).map_err(|e| e.to_string())?,
             post: m("post")?,
             pfx_map: fst::Map::new(m("pfx.fst")?).map_err(|e| e.to_string())?,
             pfx: m("pfx")?,
-            with_names,
             poi: name == "poi",
         })
     }
@@ -54,7 +52,7 @@ impl SubIndex {
             out.push(self.tag(decode_inline(v)));
             return;
         }
-        out.extend(ListReader::new(&self.post, list_offset(v), self.with_names).map(|p| self.tag(p)));
+        out.extend(ListReader::new(&self.post, list_offset(v)).map(|p| self.tag(p)));
     }
 
     /// Best importance under a key, from the fst value alone.
@@ -68,7 +66,7 @@ impl SubIndex {
     pub fn prefix_hits(&self, phrase: &str) -> Option<Vec<PrefixHit>> {
         let off = self.pfx_map.get(phrase)?;
         let mut out = Vec::new();
-        decode_prefix_hits(&self.pfx, off as usize, self.with_names, &mut out);
+        decode_prefix_hits(&self.pfx, off as usize, &mut out);
         if self.poi {
             for h in out.iter_mut() {
                 h.entity |= POI_BIT;
@@ -130,13 +128,13 @@ impl<'g> SearchIndex<'g> {
         };
         let n_place_nodes = meta["n_place_nodes"].as_u64().unwrap_or(0) as u32;
         let poi = if dir.join("poi.fst").exists() && geo.poi_records.is_some() {
-            Some(SubIndex::open(dir, "poi", with_names)?)
+            Some(SubIndex::open(dir, "poi")?)
         } else {
             None
         };
         Ok(SearchIndex {
             geo,
-            places: SubIndex::open(dir, "places", with_names)?,
+            places: SubIndex::open(dir, "places")?,
             poi,
             ents: Entities { geo, n_place_nodes, bnd: Some(map(&dir.join("places.bnd"))?), extras },
             iso: iso.map(|p| Iso::load(Path::new(p), geo)).unwrap_or_default(),

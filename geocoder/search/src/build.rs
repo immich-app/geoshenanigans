@@ -739,7 +739,6 @@ struct Writer {
     post_len: u64,
     scratch: Vec<u8>,
     inline: bool,
-    with_names: bool,
     slots: Vec<PrefixSlot>,
     keys: u64,
     postings: u64,
@@ -755,7 +754,7 @@ impl Writer {
             inline_value(&group[0])
         } else {
             self.scratch.clear();
-            encode_list(&mut self.scratch, group, self.with_names);
+            encode_list(&mut self.scratch, group);
             let v = list_value(self.post_len, group[0].imp_q);
             self.post.write_all(&self.scratch).map_err(|e| e.to_string())?;
             self.post_len += self.scratch.len() as u64;
@@ -778,7 +777,7 @@ impl Writer {
             let n = n + 1;
             if self.slots[n - 1].prefix != pfx {
                 let slot = &mut self.slots[n - 1];
-                flush_slot(slot, self.with_names).expect("prefix temp file");
+                flush_slot(slot).expect("prefix temp file");
                 slot.prefix = pfx.clone();
             }
             let slot = &mut self.slots[n - 1];
@@ -790,24 +789,29 @@ impl Writer {
                 slot.hits.push((s, PrefixHit { entity: p.entity, partial: p.partial, text: t, imp_q: p.imp_q, class: p.class, ord: p.ord }));
             }
             if slot.hits.len() > PREFIX_TABLE_TOP * 64 {
-                slot.hits.sort_by(|a, b| b.0.total_cmp(&a.0));
-                slot.hits.truncate(PREFIX_TABLE_TOP * 4);
+                best_entities(&mut slot.hits, PREFIX_TABLE_TOP * 4);
             }
         }
     }
 }
 
-fn flush_slot(slot: &mut PrefixSlot, with_names: bool) -> std::io::Result<()> {
+fn best_entities(hits: &mut Vec<(f32, PrefixHit)>, n: usize) {
+    hits.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.entity.cmp(&b.1.entity)));
+    let mut seen = HashSet::new();
+    hits.retain(|(_, h)| seen.insert(h.entity));
+    hits.truncate(n);
+}
+
+fn flush_slot(slot: &mut PrefixSlot) -> std::io::Result<()> {
     let mut v = std::mem::take(&mut slot.hits);
     let keys = std::mem::take(&mut slot.keys);
     if slot.prefix.is_empty() || (slot.chars > PREFIX_TABLE_ALL_CHARS && keys < HEAVY_PREFIX_MIN_KEYS) {
         return Ok(());
     }
-    v.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.entity.cmp(&b.1.entity)));
-    let mut seen = HashSet::new();
-    let hits: Vec<PrefixHit> = v.into_iter().filter(|(_, h)| seen.insert(h.entity)).take(PREFIX_TABLE_TOP).map(|x| x.1).collect();
+    best_entities(&mut v, PREFIX_TABLE_TOP);
+    let hits: Vec<PrefixHit> = v.into_iter().map(|x| x.1).collect();
     let mut blob = Vec::new();
-    encode_prefix_hits(&mut blob, &hits, with_names);
+    encode_prefix_hits(&mut blob, &hits);
     slot.out.write_all(&(slot.prefix.len() as u16).to_le_bytes())?;
     slot.out.write_all(slot.prefix.as_bytes())?;
     slot.out.write_all(&(blob.len() as u32).to_le_bytes())?;
@@ -858,7 +862,6 @@ pub fn build(geo: &Index, names: &[&str], out: &Path, opts: &BuildOpts) -> Resul
 pub struct KeyRuns {
     name: String,
     files: Vec<PathBuf>,
-    with_names: bool,
     st: Stats,
     ents: u64,
     entries: u64,
@@ -943,13 +946,13 @@ pub fn sort_keys(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Resul
     }
     drop(src);
     let t_keys = t0.elapsed() - t_src;
-    Ok(KeyRuns { name: name.to_string(), files, with_names: extras.is_some(), st, ents, entries, spilled, t_src, t_keys })
+    Ok(KeyRuns { name: name.to_string(), files, st, ents, entries, spilled, t_src, t_keys })
 }
 
 /// Merge phase of one sub-index: its runs -> `<name>.fst`, `.post`, `.pfx.fst` and `.pfx` in `out`.
 pub fn merge(runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, String> {
     let t0 = Instant::now();
-    let KeyRuns { name, files, with_names, mut st, ents, entries, spilled, t_src, t_keys } = runs;
+    let KeyRuns { name, files, mut st, ents, entries, spilled, t_src, t_keys } = runs;
     let name = name.as_str();
     let n_runs = files.len();
     let (files, rewritten) = reduce_runs(files, &opts.tmp, name).map_err(|e| e.to_string())?;
@@ -960,7 +963,6 @@ pub fn merge(runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, Strin
         post_len: 0,
         scratch: Vec::new(),
         inline: opts.inline,
-        with_names,
         slots: (1..=PREFIX_TABLE_MAX_CHARS)
             .map(|chars| -> Result<PrefixSlot, String> {
                 let path = opts.tmp.join(format!("{name}-pfx{chars}.tmp"));
@@ -997,13 +999,13 @@ pub fn merge(runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, Strin
     for f in &files {
         let _ = std::fs::remove_file(f);
     }
-    let Writer { fst, mut post, mut slots, keys, postings, inline_keys, longest, with_names, .. } = w;
+    let Writer { fst, mut post, mut slots, keys, postings, inline_keys, longest, .. } = w;
     fst.finish().map_err(|e| e.to_string())?;
     post.flush().map_err(|e| e.to_string())?;
     let mut n_prefixes = 0u64;
     let mut pfx_readers = Vec::new();
     for sl in slots.iter_mut() {
-        flush_slot(sl, with_names).map_err(|e| e.to_string())?;
+        flush_slot(sl).map_err(|e| e.to_string())?;
         sl.out.flush().map_err(|e| e.to_string())?;
         n_prefixes += sl.flushed;
         pfx_readers.push(BufReader::new(File::open(&sl.path).map_err(|e| e.to_string())?));
@@ -1053,6 +1055,23 @@ pub fn merge(runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, Strin
     st.add("time total s", format!("{:.2}", (t_src + t_keys + t_merge).as_secs_f64()));
     st.add("VmHWM MiB", format!("{:.1}", vm_hwm_kb() as f64 / 1024.0));
     Ok(st)
+}
+
+/// A partial rebuild must keep the extra-name source required by retained sub-indexes.
+pub fn check_retained_names(out: &Path, building: &[&str], with_extras: bool) -> Result<(), String> {
+    let text = match std::fs::read_to_string(out.join("search_meta.json")) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let meta: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    for name in ["places", "poi"] {
+        if !building.contains(&name) && out.join(format!("{name}.fst")).exists()
+            && meta["extras"].as_bool().unwrap_or(false) != with_extras {
+            return Err(format!("retained {name} sub-index uses a different extra-name setting; rebuild with --sub all or the same --extras setting"));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1297,5 +1316,64 @@ mod tests {
         let mut got = Vec::new();
         sut.take(&mut got);
         assert_eq!(got, vec![posting(12, 50, true, 1), posting(9, 10, false, 3)]);
+    }
+
+    fn writer(dir: &Path) -> Writer {
+        std::fs::create_dir_all(dir).unwrap();
+        let mk = |n: &str| BufWriter::new(File::create(dir.join(n)).unwrap());
+        Writer {
+            fst: fst::MapBuilder::new(mk("fst")).unwrap(),
+            post: mk("post"),
+            post_len: 0,
+            scratch: Vec::new(),
+            inline: false,
+            slots: (1..=PREFIX_TABLE_MAX_CHARS)
+                .map(|chars| PrefixSlot { prefix: String::new(), chars, keys: 0, hits: Vec::new(), out: mk(&format!("pfx{chars}")), path: dir.join(format!("pfx{chars}")), flushed: 0 })
+                .collect(),
+            keys: 0,
+            postings: 0,
+            inline_keys: 0,
+            longest: 0,
+        }
+    }
+
+    #[test]
+    fn prefix_table_keeps_distinct_entities() {
+        // 30 minor entities under "a", then 10 major ones with many names each: pruning hits rather
+        // than entities leaves only the 10 major ones in the table.
+        let dir = std::env::temp_dir().join(format!("pfx-distinct-{}", std::process::id()));
+        let mut w = writer(&dir);
+        let post = |entity, imp_q| Posting { entity, imp_q, partial: false, class: 0, ord: 0 };
+        for e in 0..30u32 {
+            w.prefix_add(format!("aa{e:03}").as_bytes(), &[post(1000 + e, 10)]);
+        }
+        let major: Vec<Posting> = (0..10).map(|e| post(e, 250)).collect();
+        for k in 0..300 {
+            w.prefix_add(format!("ab{k:03}").as_bytes(), &major);
+        }
+        let slot = &mut w.slots[0];
+        flush_slot(slot).unwrap();
+        slot.out.flush().unwrap();
+        let (k, blob) = read_prefix(&mut BufReader::new(File::open(&slot.path).unwrap())).unwrap();
+        let mut hits = Vec::new();
+        decode_prefix_hits(&blob, 0, &mut hits);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(k, b"a");
+        assert_eq!(hits.len(), PREFIX_TABLE_TOP);
+    }
+    #[test]
+    fn partial_build_retains_extra_name_requirements() {
+        let dir = std::env::temp_dir().join(format!("retained-names-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("places.fst"), []).unwrap();
+        std::fs::write(dir.join("poi.fst"), []).unwrap();
+        for old in [false, true] {
+            std::fs::write(dir.join("search_meta.json"), format!("{{\"extras\":{old}}}")).unwrap();
+            assert!(check_retained_names(&dir, &["poi"], !old).is_err());
+            assert!(check_retained_names(&dir, &["places"], !old).is_err());
+            assert!(check_retained_names(&dir, &["poi"], old).is_ok());
+            assert!(check_retained_names(&dir, &["places", "poi"], !old).is_ok());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

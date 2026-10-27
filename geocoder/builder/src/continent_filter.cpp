@@ -363,9 +363,10 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
     // Foreign ids copied from the planet records still point into the
     // planet's id space. Project them into this continent's; a target
     // the continent split filtered out becomes NO_DATA (the server
-    // treats a missing parent as unknown).
+    // treats a missing parent as unknown; a place node whose claiming
+    // boundary is filtered out names none).
     auto project = [&](uint32_t& id, const std::vector<uint32_t>& remap) { id = remap_id(remap, id); };
-    parallel_each(out.place_nodes, [&](PlaceNode& pn) { project(pn.parent_poly_id, admin_remap); });
+    parallel_each(out.place_nodes, [&](PlaceNode& pn) { remap_place_parent(pn, admin_remap); });
     parallel_each(out.poi_records, [&](PoiRecord& pr) { project(pr.parent_poly_id, admin_remap); });
     // Street-won housenumber refinement matches addr points to the
     // winning way by this id.
