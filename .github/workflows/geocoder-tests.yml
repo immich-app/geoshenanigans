@@ -82,11 +82,12 @@ jobs:
           if (cd .s2-prefix 2> /dev/null && sha256sum -c --quiet SHA256SUMS); then exit 0; fi
           rm -rf .s2-prefix
           TMPDIR="$RUNNER_TEMP" geocoder/builder/tools/build_s2.sh .s2-prefix
-      - name: Build index
+      - name: Build index + run S2 tests
         run: |
           cd geocoder/builder && mkdir -p build && cd build
           cmake .. -DCMAKE_BUILD_TYPE=Release -DGEOCODER_S2_PREFIX="$GITHUB_WORKSPACE/.s2-prefix"
-          make -j$(nproc) build-index
+          make -j$(nproc) build-index geocoder-s2-tests
+          ./geocoder-s2-tests
 
   server-tests:
     name: Server unit tests
