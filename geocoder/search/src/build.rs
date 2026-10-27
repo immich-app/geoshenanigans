@@ -17,7 +17,7 @@ use std::collections::{BinaryHeap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub struct BuildOpts {
     pub threads: usize,
@@ -76,18 +76,39 @@ fn byte_at(m: &Option<Mmap>, i: u32) -> u8 {
 struct EntityBuf {
     id: u32,
     imp: f32,
-    cc: [u8; 2],
+    /// Polygon that holds the entity's country code (read only to transliterate a name: country
+    /// codes are random reads into admin_polygons).
+    cc_poly: u32,
     /// (class, ord, transliterate?, name)
     names: Vec<(u8, u8, bool, String)>,
+}
+
+/// One bit per record.
+struct Bits(Vec<u64>);
+
+impl Bits {
+    fn new(n: usize) -> Self {
+        Bits(vec![0; n.div_ceil(64)])
+    }
+
+    fn set(&mut self, i: u32) {
+        self.0[i as usize / 64] |= 1 << (i % 64);
+    }
+
+    fn get(&self, i: u32) -> bool {
+        self.0[i as usize / 64] >> (i % 64) & 1 == 1
+    }
 }
 
 pub struct PlacesSource<'a> {
     geo: &'a Index,
     n_place_nodes: u32,
-    slots: Vec<BoundarySlot>,
-    link: Vec<u32>,
+    /// The boundary slots, read back from the `places.bnd` just written (paged, not held).
+    bnd: Mmap,
+    n_slots: u32,
+    n_linked: u32,
     /// label nodes that name a boundary slot (indexed through the boundary, not on their own)
-    label_used: Vec<bool>,
+    label_used: Bits,
     imp_places: Option<Mmap>,
     imp_polys: Option<Mmap>,
     extras: Option<&'a Extras>,
@@ -95,11 +116,16 @@ pub struct PlacesSource<'a> {
 }
 
 impl<'a> PlacesSource<'a> {
-    pub fn new(geo: &'a Index, opts: &BuildOpts, extras: Option<&'a Extras>) -> std::io::Result<Self> {
+    /// Derives the boundary slots and writes them to `bnd_path` (sorted by polygon).
+    pub fn new(geo: &'a Index, opts: &BuildOpts, extras: Option<&'a Extras>, bnd_path: &Path) -> std::io::Result<Self> {
         let n_place_nodes = record_count::<PlaceNode>(geo.place_nodes.as_ref().expect("place_nodes"));
         let n_poly = record_count::<AdminPolygon>(&geo.admin_polygons);
         // A hidden node that names its claiming boundary is that boundary's label point.
-        let mut link = vec![NO_DATA; n_poly as usize];
+        let mut link_buf = MapVec::with_capacity(n_poly as usize)?;
+        for _ in 0..n_poly {
+            link_buf.push(NO_DATA);
+        }
+        let link = link_buf.as_mut_slice();
         for i in 0..n_place_nodes {
             let pn = place_node_raw(geo, i);
             if is_hidden(&pn) && pn._pad1 & PLACE_FLAG_LABEL_OF != 0 && pn.parent_poly_id < n_poly {
@@ -109,8 +135,9 @@ impl<'a> PlacesSource<'a> {
                 }
             }
         }
-        let mut slots = Vec::new();
-        let mut label_used = vec![false; n_place_nodes as usize];
+        let mut label_used = Bits::new(n_place_nodes as usize);
+        let mut w = BufWriter::with_capacity(WRITE_BUFFER, File::create(bnd_path)?);
+        let (mut n_slots, mut n_linked) = (0u32, 0u32);
         // Sets built without the search flags: every named ring is its own boundary entity.
         let flagged = (0..n_poly).any(|p| polygon_raw(geo, p)._pad2 & POLY_FLAG_PRIMARY_RING != 0);
         for p in 0..n_poly {
@@ -118,23 +145,33 @@ impl<'a> PlacesSource<'a> {
             if ap.name_id == NO_DATA || (flagged && ap._pad2 & POLY_FLAG_PRIMARY_RING == 0) {
                 continue;
             }
-            if link[p as usize] != NO_DATA {
-                let pn = place_node_raw(geo, link[p as usize]);
-                label_used[link[p as usize] as usize] = true;
-                slots.push(BoundarySlot { poly: p, node: link[p as usize], lat: pn.lat, lng: pn.lng });
+            let node = link[p as usize];
+            let slot = if node != NO_DATA {
+                let pn = place_node_raw(geo, node);
+                label_used.set(node);
+                BoundarySlot { poly: p, node, lat: pn.lat, lng: pn.lng }
             } else if (BOUNDARY_MIN_LEVEL..=BOUNDARY_MAX_LEVEL).contains(&ap.admin_level) && ap.area > 0.0 {
                 // The builder's interior_point (ST_PointOnSurface, Nominatim's centre of an area):
                 // an area centroid can fall outside a concave ring or in a hole.
                 let Some((lat, lng)) = geo.admin_verts(&ap).and_then(|v| point_on_surface(&v, ap.hole_count)) else { continue };
-                slots.push(BoundarySlot { poly: p, node: NO_DATA, lat, lng });
-            }
+                BoundarySlot { poly: p, node: NO_DATA, lat, lng }
+            } else {
+                continue;
+            };
+            w.write_all(&slot.to_bytes())?;
+            n_slots += 1;
+            n_linked += slot.linked() as u32;
         }
+        w.into_inner().map_err(|e| e.into_error())?;
+        drop(link_buf);
+        let bnd = unsafe { Mmap::map(&File::open(bnd_path)?) }?;
         let dir = opts.imp_dir.as_deref();
         Ok(PlacesSource {
             geo,
             n_place_nodes,
-            slots,
-            link,
+            bnd,
+            n_slots,
+            n_linked,
             label_used,
             imp_places: map_importance(dir, "imp_places.u8", n_place_nodes)?,
             imp_polys: map_importance(dir, "imp_polys.u8", n_poly)?,
@@ -143,25 +180,21 @@ impl<'a> PlacesSource<'a> {
         })
     }
 
-    pub fn write_slots(&self, path: &Path) -> std::io::Result<()> {
-        let mut w = BufWriter::new(File::create(path)?);
-        for s in &self.slots {
-            w.write_all(&s.to_bytes())?;
-        }
-        w.flush()
+    fn slot(&self, pos: u32) -> BoundarySlot {
+        BoundarySlot::from_bytes(&self.bnd[pos as usize * SLOT_BYTES..][..SLOT_BYTES])
     }
 
     fn len(&self) -> u32 {
-        self.slots.len() as u32 + self.n_place_nodes
+        self.n_slots + self.n_place_nodes
     }
 
     fn fill(&self, pos: u32, e: &mut EntityBuf) -> bool {
         e.names.clear();
         let geo = self.geo;
-        let (rrefs, base_id) = if pos < self.slots.len() as u32 {
-            let s = self.slots[pos as usize];
+        let (rrefs, base_id) = if pos < self.n_slots {
+            let s = self.slot(pos);
             let ap = polygon_raw(geo, s.poly);
-            let node = (self.link[s.poly as usize] != NO_DATA).then(|| place_node_raw(geo, self.link[s.poly as usize]));
+            let node = s.linked().then(|| place_node_raw(geo, s.node));
             let kind = if s.linked() { Kind::Linked } else { Kind::Area };
             let typ = boundary_type(&ap, node.as_ref());
             e.id = self.n_place_nodes + s.poly;
@@ -169,7 +202,7 @@ impl<'a> PlacesSource<'a> {
             if self.area_proxy {
                 e.imp += W_AREA_PROXY * area_proxy(ap.area, s.lat);
             }
-            e.cc = cc_of(ap.country_code);
+            e.cc_poly = s.poly;
             let (primary, own) = slot_name_ids(geo, &s);
             if let Some(own) = own {
                 let n = geo.get_string(own);
@@ -179,17 +212,17 @@ impl<'a> PlacesSource<'a> {
             }
             (s.record_refs(), primary)
         } else {
-            let i = pos - self.slots.len() as u32;
+            let i = pos - self.n_slots;
             let pn = place_node_raw(geo, i);
             // A hidden node is searchable on its own only when no boundary of this set claims it.
-            if pn.name_id == NO_DATA || self.label_used[i as usize] {
+            if pn.name_id == NO_DATA || self.label_used.get(i) {
                 return false;
             }
             let kind = place_node_kind(pn.place_type);
             let typ = PLACE_NODE_TYPES.get(pn.place_type as usize).copied().unwrap_or("place");
             e.id = i;
             e.imp = W_TYPE * type_base(kind, typ, 0) + extra_importance(byte_at(&self.imp_places, i));
-            e.cc = parent_cc(geo, pn.parent_poly_id);
+            e.cc_poly = pn.parent_poly_id;
             (vec![record_ref(KIND_PLACE_NODE, i)], pn.name_id)
         };
         fill_names(geo, self.extras, &rrefs, base_id, e)
@@ -219,7 +252,7 @@ impl<'a> PoiSource<'a> {
         }
         e.id = pos;
         e.imp = poi_importance(r.importance, byte_at(&self.imp_poi, pos));
-        e.cc = parent_cc(self.geo, r.parent_poly_id);
+        e.cc_poly = r.parent_poly_id;
         fill_names(self.geo, self.extras, &[record_ref(KIND_POI, pos)], r.name_id, e)
     }
 }
@@ -262,9 +295,9 @@ impl Source<'_> {
 
 /// Keys of one entity: each name whole (best class first), then its trailing words
 /// ("york" of "new york"); a key belongs to the entity's best claim on it.
-fn keys_of(e: &EntityBuf, out: &mut Vec<(String, u8, bool, u8)>) {
+fn keys_of(geo: &Index, e: &EntityBuf, out: &mut Vec<(String, u8, bool, u8)>) {
     out.clear();
-    let cc = cc_str(&e.cc).to_string();
+    let mut cc: Option<String> = None;
     let mut by_class: Vec<(u8, u8, Vec<crate::normalize::Token>)> = Vec::with_capacity(e.names.len() + 1);
     for (class, ord, tr, name) in &e.names {
         let t = tokens(name);
@@ -272,7 +305,7 @@ fn keys_of(e: &EntityBuf, out: &mut Vec<(String, u8, bool, u8)>) {
             by_class.push((*class, *ord, t));
         }
         if *tr {
-            if let Some(latin) = transliterate(name, &cc) {
+            if let Some(latin) = transliterate(name, || cc.get_or_insert_with(|| cc_str(&parent_cc(geo, e.cc_poly)).to_string()).clone()) {
                 let t = tokens(&latin);
                 if !t.is_empty() {
                     by_class.push((TRANSLITERATION_CLASS, *ord, t));
@@ -303,6 +336,63 @@ fn keys_of(e: &EntityBuf, out: &mut Vec<(String, u8, bool, u8)>) {
 
 // ------------------------------------------------------------------ sort runs
 
+/// A fixed-capacity array in its own anonymous mapping. Dropping it unmaps it, so a phase's
+/// buffers go back to the system before the next phase: glibc keeps freed heap memory for reuse
+/// once a block this large has been freed, and the next phase's buffers came on top of it.
+struct MapVec<T: Copy> {
+    map: memmap2::MmapMut,
+    len: usize,
+    cap: usize,
+    _t: std::marker::PhantomData<T>,
+}
+
+impl<T: Copy> MapVec<T> {
+    fn with_capacity(cap: usize) -> std::io::Result<Self> {
+        let map = memmap2::MmapOptions::new().len((cap * std::mem::size_of::<T>()).max(1)).map_anon()?;
+        Ok(MapVec { map, len: 0, cap, _t: std::marker::PhantomData })
+    }
+
+    fn capacity(&self) -> usize {
+        self.cap
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    fn push(&mut self, v: T) {
+        assert!(self.len < self.cap, "MapVec full");
+        // SAFETY: in bounds of the mapping, which is page-aligned (so aligned for T).
+        unsafe { (self.map.as_mut_ptr() as *mut T).add(self.len).write(v) };
+        self.len += 1;
+    }
+
+    fn extend_from_slice(&mut self, s: &[T]) {
+        assert!(self.len + s.len() <= self.cap, "MapVec full");
+        // SAFETY: in bounds (checked above); a fresh mapping never overlaps `s`.
+        unsafe { std::ptr::copy_nonoverlapping(s.as_ptr(), (self.map.as_mut_ptr() as *mut T).add(self.len), s.len()) };
+        self.len += s.len();
+    }
+
+    fn as_slice(&self) -> &[T] {
+        // SAFETY: the first `len` elements were written by push.
+        unsafe { std::slice::from_raw_parts(self.map.as_ptr() as *const T, self.len) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [T] {
+        // SAFETY: as in as_slice.
+        unsafe { std::slice::from_raw_parts_mut(self.map.as_mut_ptr() as *mut T, self.len) }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Item {
     off: u32,
@@ -314,8 +404,8 @@ struct Item {
 }
 
 struct Runs {
-    arena: Vec<u8>,
-    items: Vec<Item>,
+    arena: MapVec<u8>,
+    items: MapVec<Item>,
     files: Vec<PathBuf>,
     dir: PathBuf,
     tag: String,
@@ -323,52 +413,58 @@ struct Runs {
 }
 
 impl Runs {
-    fn new(budget: usize, dir: &Path, tag: String) -> Self {
+    fn new(budget: usize, dir: &Path, tag: String) -> std::io::Result<Self> {
+        Self::with_arena_limit(budget, MAX_RUN_ARENA_BYTES, dir, tag)
+    }
+
+    /// `new` with at most `arena_limit` key bytes per run.
+    fn with_arena_limit(budget: usize, arena_limit: usize, dir: &Path, tag: String) -> std::io::Result<Self> {
         // Fixed capacities: a run spills when either fills, so memory never exceeds the budget.
-        let arena_cap = budget * 6 / 10;
-        let items_cap = (budget - arena_cap) / std::mem::size_of::<Item>();
-        Runs {
-            arena: Vec::with_capacity(arena_cap),
-            items: Vec::with_capacity(items_cap.max(1024)),
+        let (arena_cap, items_cap) = run_capacities(budget, arena_limit);
+        Ok(Runs {
+            arena: MapVec::with_capacity(arena_cap)?,
+            items: MapVec::with_capacity(items_cap.max(1024))?,
             files: Vec::new(),
             dir: dir.to_path_buf(),
             tag,
             spilled_bytes: 0,
-        }
+        })
     }
 
-    /// Adds one key entry; an error for a key longer than a run entry's u16 length holds.
+    /// Adds one key entry; an error for a key longer than a run holds: MAX_KEY_BYTES (a run entry's
+    /// u16 length), or the run's key arena when that is smaller.
     fn push(&mut self, key: &[u8], p: Posting) -> std::io::Result<()> {
-        let Ok(len) = u16::try_from(key.len()) else {
-            let e = format!("entity {}: a key of {} bytes, over the {} bytes a sort run entry holds", p.entity, key.len(), u16::MAX);
+        let fits = MAX_KEY_BYTES.min(self.arena.capacity());
+        if key.len() > fits {
+            let e = format!("entity {}: a key of {} bytes, over the {fits} bytes a sort run holds", p.entity, key.len());
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, e));
-        };
+        }
+
         if self.arena.len() + key.len() > self.arena.capacity() || self.items.len() == self.items.capacity() {
             self.spill()?;
         }
         let off = self.arena.len() as u32;
         self.arena.extend_from_slice(key);
-        self.items.push(Item {
-            off,
-            len,
-            flags: entry_flags(&p),
-            ord: p.ord,
-            entity: p.entity,
-            imp: p.imp_q,
-        });
+        self.items.push(Item { off, len: key.len() as u16, flags: entry_flags(&p), ord: p.ord, entity: p.entity, imp: p.imp_q });
         Ok(())
+    }
+
+    /// Spills the last run and frees the buffers: the run files and the bytes spilled.
+    fn finish(mut self) -> std::io::Result<(Vec<PathBuf>, u64)> {
+        self.spill()?;
+        Ok((self.files, self.spilled_bytes))
     }
 
     fn spill(&mut self) -> std::io::Result<()> {
         if self.items.is_empty() {
             return Ok(());
         }
-        let arena = &self.arena;
+        let arena = self.arena.as_slice();
         let key = |it: &Item| &arena[it.off as usize..it.off as usize + it.len as usize];
-        self.items.sort_unstable_by(|a, b| key(a).cmp(key(b)).then(a.entity.cmp(&b.entity)));
+        self.items.as_mut_slice().sort_unstable_by(|a, b| key(a).cmp(key(b)).then(a.entity.cmp(&b.entity)));
         let path = self.dir.join(format!("{}-{}.run", self.tag, self.files.len()));
-        let mut w = BufWriter::with_capacity(RUN_READ_BUFFER, File::create(&path)?);
-        for it in &self.items {
+        let mut w = BufWriter::with_capacity(WRITE_BUFFER, File::create(&path)?);
+        for it in self.items.as_slice() {
             self.spilled_bytes += write_entry(&mut w, key(it), it.entity, it.imp, it.flags, it.ord)?;
         }
         w.flush()?;
@@ -377,6 +473,24 @@ impl Runs {
         self.arena.clear();
         Ok(())
     }
+}
+
+/// (key bytes, entries) one sort run of `budget` bytes holds: RUN_ARENA_PERCENT of the budget for
+/// keys, at most `arena_limit` of it, and the rest for entries.
+fn run_capacities(budget: usize, arena_limit: usize) -> (usize, usize) {
+    let arena_share = budget * RUN_ARENA_PERCENT / 100;
+    (arena_share.min(arena_limit), (budget - arena_share) / std::mem::size_of::<Item>())
+}
+
+/// Sort-run memory of each of `threads` workers sharing `mem_mb`; an error below
+/// MIN_RUN_BUDGET_BYTES, where the longest key would not fit a run.
+fn run_budget(mem_mb: usize, threads: usize) -> Result<usize, String> {
+    let budget = (mem_mb << 20) / threads;
+    if budget < MIN_RUN_BUDGET_BYTES {
+        return Err(format!("Sort budget too small: {budget} bytes per thread, at least {MIN_RUN_BUDGET_BYTES}"));
+    }
+
+    Ok(budget)
 }
 
 /// One run entry: u16 key length, key, u32 entity, importance, partial | class << 1, ordinal.
@@ -454,7 +568,7 @@ fn reduce_runs(mut files: Vec<PathBuf>, dir: &Path, tag: &str) -> std::io::Resul
                 continue;
             }
             let path = dir.join(format!("{tag}-m{pass}-{i}.run"));
-            let mut w = BufWriter::with_capacity(RUN_READ_BUFFER, File::create(&path)?);
+            let mut w = BufWriter::with_capacity(WRITE_BUFFER, File::create(&path)?);
             let mut m = Merge::open(group)?;
             let mut key = Vec::new();
             let mut p = Posting { entity: 0, imp_q: 0, partial: false, class: 0, ord: 0 };
@@ -529,6 +643,82 @@ impl RunReader {
 
 // ------------------------------------------------------------------ writer
 
+/// The postings of one key as the merge streams them (entity order), cut down while they arrive
+/// to what the index keeps: one posting per entity (a whole-name match over a trailing-word one,
+/// then the better name class), every whole-name posting, and the PARTIAL_CAP best trailing-word
+/// postings (importance, then entity). A common trailing word ("church") never piles up.
+#[derive(Default)]
+struct Group {
+    whole: Vec<Posting>,
+    partial: BinaryHeap<WorstFirst>,
+    last: Option<Posting>,
+}
+
+/// Trailing-word posting ordered worst first: lower importance, then higher entity.
+struct WorstFirst(Posting);
+
+impl PartialEq for WorstFirst {
+    fn eq(&self, o: &Self) -> bool {
+        self.cmp(o) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for WorstFirst {}
+impl PartialOrd for WorstFirst {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for WorstFirst {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        o.0.imp_q.cmp(&self.0.imp_q).then(self.0.entity.cmp(&o.0.entity))
+    }
+}
+
+impl Group {
+    fn is_empty(&self) -> bool {
+        self.last.is_none()
+    }
+
+    fn push(&mut self, p: Posting) {
+        match self.last {
+            Some(l) if l.entity == p.entity => {
+                if (p.partial, p.class) < (l.partial, l.class) {
+                    self.last = Some(p);
+                }
+            }
+            Some(l) => {
+                self.keep(l);
+                self.last = Some(p);
+            }
+            None => self.last = Some(p),
+        }
+    }
+
+    fn keep(&mut self, p: Posting) {
+        if !p.partial {
+            self.whole.push(p);
+            return;
+        }
+        self.partial.push(WorstFirst(p));
+        if self.partial.len() > PARTIAL_CAP {
+            self.partial.pop();
+        }
+    }
+
+    /// Hands the kept postings to `write`, best importance first (then whole-name, then entity),
+    /// sorted in the group's own buffer so a key's postings are held once; leaves the group empty.
+    fn take<R>(&mut self, write: impl FnOnce(&[Posting]) -> R) -> R {
+        if let Some(l) = self.last.take() {
+            self.keep(l);
+        }
+        self.whole.extend(self.partial.drain().map(|w| w.0));
+        self.whole.sort_unstable_by(|a, b| b.imp_q.cmp(&a.imp_q).then(a.partial.cmp(&b.partial)).then(a.entity.cmp(&b.entity)));
+        let r = write(&self.whole);
+        self.whole.clear();
+        r
+    }
+}
+
 struct PrefixSlot {
     prefix: String,
     chars: usize,
@@ -566,19 +756,8 @@ struct Writer {
 }
 
 impl Writer {
-    fn add(&mut self, key: &[u8], group: &mut Vec<Posting>) -> Result<(), String> {
-        // One posting per entity: whole-name match over trailing words, then name class.
-        group.sort_unstable_by(|a, b| a.entity.cmp(&b.entity).then((a.partial, a.class).cmp(&(b.partial, b.class))));
-        group.dedup_by_key(|p| p.entity);
-        group.sort_unstable_by(|a, b| b.imp_q.cmp(&a.imp_q).then(a.partial.cmp(&b.partial)).then(a.entity.cmp(&b.entity)));
-        let mut partial_kept = 0;
-        group.retain(|p| {
-            if !p.partial {
-                return true;
-            }
-            partial_kept += 1;
-            partial_kept <= PARTIAL_CAP
-        });
+    /// Writes one key with its kept postings (`Group::take`).
+    fn add(&mut self, key: &[u8], group: &[Posting]) -> Result<(), String> {
         let value = if self.inline && group.len() == 1 {
             self.inline_keys += 1;
             inline_value(&group[0])
@@ -697,8 +876,50 @@ fn vm_hwm_kb() -> u64 {
         .unwrap_or(0)
 }
 
-/// Build one sub-index ("places" or "poi") of the flat set `geo` into `out`.
-pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<Stats, String> {
+/// Builds the sub-indexes `names` ("places", "poi") of the flat set `geo` into `out`: every key
+/// phase first, then every merge, so a merge's heap (the fst builder) is never held beside a key
+/// phase's sort buffers.
+pub fn build(geo: &Index, names: &[&str], out: &Path, opts: &BuildOpts) -> Result<Vec<(String, Stats)>, String> {
+    let mut runs = Vec::with_capacity(names.len());
+    for name in names {
+        runs.push(sort_keys(geo, name, out, opts).map_err(|e| format!("build {name}: {e}"))?);
+    }
+    let mut stats = Vec::with_capacity(runs.len());
+    for r in runs {
+        let name = r.name.clone();
+        let st = merge(r, out, opts).map_err(|e| format!("build {name}: {e}"))?;
+        stats.push((name, st));
+    }
+    Ok(stats)
+}
+
+/// One sub-index between its two phases: its sorted runs on disk.
+pub struct KeyRuns {
+    name: String,
+    files: Vec<PathBuf>,
+    st: Stats,
+    ents: u64,
+    entries: u64,
+    spilled: u64,
+    t_src: Duration,
+    t_keys: Duration,
+}
+
+impl Drop for KeyRuns {
+    /// Removes the runs no merge took: a failed build leaves none of a sub-index it never merged.
+    fn drop(&mut self) {
+        for f in &self.files {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+}
+
+/// Key phase of one sub-index: its entities' normalized keys, sorted in bounded runs spilled to
+/// `opts.tmp` (places also writes `places.bnd` to `out`).
+pub fn sort_keys(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<KeyRuns, String> {
+    let threads = opts.threads.max(1);
+    let budget = run_budget(opts.mem_mb, threads)?;
+
     let t0 = Instant::now();
     let mut st = Stats::default();
     std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
@@ -710,29 +931,27 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
     let src = if name == "poi" {
         Source::Poi(PoiSource::new(geo, opts, extras.as_ref()).map_err(|e| e.to_string())?)
     } else {
-        let s = PlacesSource::new(geo, opts, extras.as_ref()).map_err(|e| e.to_string())?;
-        s.write_slots(&out.join("places.bnd")).map_err(|e| e.to_string())?;
+        let s = PlacesSource::new(geo, opts, extras.as_ref(), &out.join("places.bnd")).map_err(|e| e.to_string())?;
         st.add("place nodes", s.n_place_nodes);
-        st.add("boundary slots", s.slots.len());
-        st.add("boundary slots linked", s.slots.iter().filter(|x| x.linked()).count());
+        st.add("boundary slots", s.n_slots);
+        st.add("boundary slots linked", s.n_linked);
         Source::Places(s)
     };
     let t_src = t0.elapsed();
 
     // ---- keys -> sorted runs, one worker per contiguous range of entities
-    let threads = opts.threads.max(1);
-    let budget = (opts.mem_mb << 20) / threads;
     let n = src.len();
-    let results: Vec<Result<(Runs, u64, u64), String>> = std::thread::scope(|sc| {
+    type RunsOut = (Vec<PathBuf>, u64, u64, u64);
+    let results: Vec<Result<RunsOut, String>> = std::thread::scope(|sc| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
                 let src = &src;
                 let tmp = &opts.tmp;
                 let tag = format!("{name}-{t}");
-                sc.spawn(move || -> Result<(Runs, u64, u64), String> {
+                sc.spawn(move || -> Result<RunsOut, String> {
                     let lo = (n as u64 * t as u64 / threads as u64) as u32;
                     let hi = (n as u64 * (t as u64 + 1) / threads as u64) as u32;
-                    let mut runs = Runs::new(budget, tmp, tag);
+                    let mut runs = Runs::new(budget, tmp, tag).map_err(|x| x.to_string())?;
                     let mut e = EntityBuf::default();
                     let mut keys = Vec::new();
                     let (mut ents, mut entries) = (0u64, 0u64);
@@ -740,7 +959,7 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
                         if !src.fill(pos, &mut e) {
                             continue;
                         }
-                        keys_of(&e, &mut keys);
+                        keys_of(geo, &e, &mut keys);
                         if keys.is_empty() {
                             continue;
                         }
@@ -752,11 +971,9 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
                             entries += 1;
                         }
                     }
-                    runs.spill().map_err(|x| x.to_string())?;
-                    // Hand the run memory back before the merge.
-                    runs.arena = Vec::new();
-                    runs.items = Vec::new();
-                    Ok((runs, ents, entries))
+                    // Hands the run memory back before the merge.
+                    let (files, spilled) = runs.finish().map_err(|x| x.to_string())?;
+                    Ok((files, spilled, ents, entries))
                 })
             })
             .collect();
@@ -765,21 +982,29 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
     let mut files = Vec::new();
     let (mut ents, mut entries, mut spilled) = (0u64, 0u64, 0u64);
     for r in results {
-        let (runs, e, k) = r?;
+        let (f, s, e, k) = r?;
         ents += e;
         entries += k;
-        spilled += runs.spilled_bytes;
-        files.extend(runs.files);
+        spilled += s;
+        files.extend(f);
     }
-    let t_runs = t0.elapsed();
+    drop(src);
+    let t_keys = t0.elapsed() - t_src;
+    Ok(KeyRuns { name: name.to_string(), files, st, ents, entries, spilled, t_src, t_keys })
+}
 
-    // ---- merge -> fst + postings + prefix table
+/// Merge phase of one sub-index: its runs -> `<name>.fst`, `.post`, `.pfx.fst` and `.pfx` in `out`.
+pub fn merge(mut runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, String> {
+    let t0 = Instant::now();
+    let (files, mut st) = (std::mem::take(&mut runs.files), std::mem::take(&mut runs.st));
+    let (ents, entries, spilled, t_src, t_keys) = (runs.ents, runs.entries, runs.spilled, runs.t_src, runs.t_keys);
+    let name = runs.name.as_str();
     let n_runs = files.len();
     let (files, rewritten) = reduce_runs(files, &opts.tmp, name).map_err(|e| e.to_string())?;
     let mk = |ext: &str| File::create(out.join(format!("{name}.{ext}"))).map_err(|e| e.to_string());
     let mut w = Writer {
-        fst: fst::MapBuilder::new(BufWriter::with_capacity(1 << 20, mk("fst")?)).map_err(|e| e.to_string())?,
-        post: BufWriter::with_capacity(1 << 20, mk("post")?),
+        fst: fst::MapBuilder::new(BufWriter::with_capacity(WRITE_BUFFER, mk("fst")?)).map_err(|e| e.to_string())?,
+        post: BufWriter::with_capacity(WRITE_BUFFER, mk("post")?),
         post_len: 0,
         scratch: Vec::new(),
         inline: opts.inline,
@@ -799,19 +1024,18 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
     let mut cur: Vec<u8> = Vec::new();
     let mut key: Vec<u8> = Vec::new();
     let mut p = Posting { entity: 0, imp_q: 0, partial: false, class: 0, ord: 0 };
-    let mut group: Vec<Posting> = Vec::new();
+    let mut group = Group::default();
     while m.next(&mut key, &mut p).map_err(|e| e.to_string())? {
         if key != cur {
             if !group.is_empty() {
-                w.add(&cur, &mut group)?;
-                group.clear();
+                group.take(|list| w.add(&cur, list))?;
             }
             std::mem::swap(&mut cur, &mut key);
         }
         group.push(p);
     }
     if !group.is_empty() {
-        w.add(&cur, &mut group)?;
+        group.take(|list| w.add(&cur, list))?;
     }
     drop(m);
     for f in &files {
@@ -869,9 +1093,9 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
         st.add("bytes bnd", std::fs::metadata(out.join("places.bnd")).map(|m| m.len()).unwrap_or(0));
     }
     st.add("time sources s", format!("{:.2}", t_src.as_secs_f64()));
-    st.add("time keys+runs s", format!("{:.2}", (t_runs - t_src).as_secs_f64()));
-    st.add("time merge+write s", format!("{:.2}", (t_merge - t_runs).as_secs_f64()));
-    st.add("time total s", format!("{:.2}", t_merge.as_secs_f64()));
+    st.add("time keys+runs s", format!("{:.2}", t_keys.as_secs_f64()));
+    st.add("time merge+write s", format!("{:.2}", t_merge.as_secs_f64()));
+    st.add("time total s", format!("{:.2}", (t_src + t_keys + t_merge).as_secs_f64()));
     st.add("VmHWM MiB", format!("{:.1}", vm_hwm_kb() as f64 / 1024.0));
     Ok(st)
 }
@@ -930,11 +1154,9 @@ fn clear_stage(stage: &Path) {
 
 fn build_staged(geo: &Index, subs: &[&str], stage: &Path, opts: &BuildOpts, mut meta: serde_json::Value) -> Result<Vec<(String, Stats)>, String> {
     std::fs::create_dir_all(stage).map_err(|e| format!("{}: {e}", stage.display()))?;
-    let mut stats = Vec::new();
-    for &s in subs {
-        let st = build(geo, s, stage, opts).map_err(|e| format!("build {s}: {e}"))?;
-        meta[s] = st.lines.iter().map(|(k, v)| (k.clone(), serde_json::json!(v))).collect::<serde_json::Map<_, _>>().into();
-        stats.push((s.to_string(), st));
+    let stats = build(geo, subs, stage, opts)?;
+    for (s, st) in &stats {
+        meta[s.as_str()] = st.lines.iter().map(|(k, v)| (k.clone(), serde_json::json!(v))).collect::<serde_json::Map<_, _>>().into();
     }
     let text = serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?;
     std::fs::write(stage.join("search_meta.json"), text).map_err(|e| e.to_string())?;
@@ -1068,6 +1290,101 @@ mod tests {
     }
 
     #[test]
+    fn bits_set_and_get_across_words() {
+        let mut b = Bits::new(130);
+        for i in [0, 63, 64, 129] {
+            b.set(i);
+        }
+        let set: Vec<u32> = (0..130).filter(|&i| b.get(i)).collect();
+        assert_eq!(set, vec![0, 63, 64, 129]);
+    }
+
+    #[test]
+    fn map_vec_holds_what_was_pushed() {
+        let mut v: MapVec<Item> = MapVec::with_capacity(4).unwrap();
+        let item = |entity| Item { off: 0, len: 0, flags: 0, ord: 0, entity, imp: 0 };
+        v.push(item(3));
+        v.extend_from_slice(&[item(1), item(2)]);
+        v.as_mut_slice().sort_unstable_by_key(|it| it.entity);
+        assert_eq!(v.as_slice().iter().map(|it| it.entity).collect::<Vec<_>>(), vec![1, 2, 3]);
+        v.clear();
+        assert!(v.is_empty());
+        assert_eq!(v.capacity(), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "MapVec full")]
+    fn map_vec_refuses_to_grow() {
+        let mut v: MapVec<u8> = MapVec::with_capacity(2).unwrap();
+        v.extend_from_slice(b"abc");
+    }
+
+    #[test]
+    fn run_budget_refuses_less_than_the_longest_key_needs() {
+        for (mem_mb, threads, want) in
+            [(0, 1, None), (1, 16, None), (1, 9, Some((1 << 20) / 9)), (DEFAULT_RUN_BUDGET_MB, 1, Some(DEFAULT_RUN_BUDGET_MB << 20))]
+        {
+            assert_eq!(run_budget(mem_mb, threads).ok(), want, "{mem_mb} MiB, {threads} threads");
+        }
+        assert_eq!(run_budget(0, 1), Err(format!("Sort budget too small: 0 bytes per thread, at least {MIN_RUN_BUDGET_BYTES}")));
+    }
+
+    #[test]
+    fn runs_hold_the_longest_key_at_the_least_budget() {
+        let dir = tmp_dir("runs-longest");
+        let longest = vec![b'z'; MAX_KEY_BYTES];
+        let mut sut = Runs::new(MIN_RUN_BUDGET_BYTES, &dir, "t".into()).unwrap();
+        sut.push(b"a", posting(1, 0, false, 0)).unwrap();
+        sut.push(&longest, posting(2, 0, false, 0)).unwrap();
+        sut.push(b"b", posting(3, 0, false, 0)).unwrap();
+        let (files, _) = sut.finish().unwrap();
+        let keys: Vec<Vec<u8>> = read_all(&files).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec(), longest]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_keys_stay_addressable_at_any_budget() {
+        // An entry addresses its key by a u32 offset into the run's arena.
+        for mem_mb in [DEFAULT_RUN_BUDGET_MB, 6_826, 6_827, 6_828, 1 << 20] {
+            let budget = run_budget(mem_mb, 1).unwrap();
+            let (arena, items) = run_capacities(budget, MAX_RUN_ARENA_BYTES);
+            assert!(arena <= u32::MAX as usize, "{mem_mb} MiB: {arena} key bytes");
+            assert_eq!(items, (budget - budget * RUN_ARENA_PERCENT / 100) / std::mem::size_of::<Item>());
+        }
+    }
+
+    #[test]
+    fn runs_spill_at_the_arena_limit() {
+        let dir = tmp_dir("runs-arena-limit");
+        let mut sut = Runs::with_arena_limit(1 << 20, 64, &dir, "t".into()).unwrap();
+        let keys: Vec<Vec<u8>> = (0..40).rev().map(|k: u32| format!("key{k:03}").into_bytes()).collect();
+        for (entity, key) in keys.iter().enumerate() {
+            sut.push(key, posting(entity as u32, 0, false, 0)).unwrap();
+        }
+        let (files, _) = sut.finish().unwrap();
+        // 6-byte keys, 10 to a 64-byte arena.
+        assert_eq!(files.len(), 4);
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(read_all(&files).into_iter().map(|(k, _)| k).collect::<Vec<_>>(), sorted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn runs_refuse_a_key_they_cannot_hold() {
+        for (budget, key_len) in [(0, 1), (MIN_RUN_BUDGET_BYTES - 1, MAX_KEY_BYTES), (2 * MIN_RUN_BUDGET_BYTES, MAX_KEY_BYTES + 1)] {
+            let dir = tmp_dir(&format!("runs-refuse-{budget}"));
+            let mut sut = Runs::new(budget, &dir, "t".into()).unwrap();
+            let err = sut.push(&vec![b'z'; key_len], posting(1, 0, false, 0)).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "budget {budget}, key {key_len}");
+            let (files, _) = sut.finish().unwrap();
+            assert!(files.is_empty());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
     fn merge_streams_runs_in_key_then_entity_order() {
         let dir = tmp_dir("merge");
         let (files, all) = random_runs(&dir, 5, &mut Rng(7));
@@ -1102,10 +1419,172 @@ mod tests {
         }
     }
 
+    /// What the index kept before postings were capped while streaming: the whole group sorted,
+    /// one posting per entity, every whole-name posting and the PARTIAL_CAP best trailing-word ones.
+    fn kept_by_sorting(mut group: Vec<Posting>) -> Vec<Posting> {
+        group.sort_unstable_by(|a, b| a.entity.cmp(&b.entity).then((a.partial, a.class).cmp(&(b.partial, b.class))));
+        group.dedup_by_key(|p| p.entity);
+        group.sort_unstable_by(|a, b| b.imp_q.cmp(&a.imp_q).then(a.partial.cmp(&b.partial)).then(a.entity.cmp(&b.entity)));
+        let mut partial_kept = 0;
+        group.retain(|p| {
+            if !p.partial {
+                return true;
+            }
+            partial_kept += 1;
+            partial_kept <= PARTIAL_CAP
+        });
+        group
+    }
+
+    #[test]
+    fn group_keeps_what_sorting_the_whole_group_kept() {
+        let mut rng = Rng(3);
+        for n in [1, 5, PARTIAL_CAP, PARTIAL_CAP + 1, 3 * PARTIAL_CAP + 17] {
+            let postings: Vec<Posting> =
+                (0..n as u32).map(|e| posting(e * 3, (rng.next() % 40) as u8, !rng.next().is_multiple_of(4), (rng.next() % 6) as u8)).collect();
+            let mut sut = Group::default();
+            for p in &postings {
+                sut.push(*p);
+            }
+            let got = sut.take(|list| list.to_vec());
+            assert_eq!(got, kept_by_sorting(postings));
+            assert!(sut.is_empty());
+        }
+    }
+
+    #[test]
+    fn group_keeps_an_entitys_whole_name_claim_over_a_trailing_word() {
+        let mut sut = Group::default();
+        sut.push(posting(9, 10, true, 0));
+        sut.push(posting(9, 10, false, 3));
+        sut.push(posting(12, 50, true, 1));
+        let got = sut.take(|list| list.to_vec());
+        assert_eq!(got, vec![posting(12, 50, true, 1), posting(9, 10, false, 3)]);
+    }
+
+    #[test]
+    fn group_holds_only_the_next_keys_postings_after_a_take() {
+        let mut sut = Group::default();
+        sut.push(posting(3, 20, false, 0));
+        sut.push(posting(5, 30, true, 0));
+        sut.take(|_| ());
+        sut.push(posting(7, 10, false, 1));
+        let got = sut.take(|list| list.to_vec());
+        assert_eq!(got, vec![posting(7, 10, false, 1)]);
+    }
+
+    /// Heap the calling thread holds, counted by the test binary's allocator (per thread, so tests
+    /// running beside one another do not count).
+    mod heap {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static LIVE: Cell<isize> = const { Cell::new(0) };
+            static PEAK: Cell<isize> = const { Cell::new(0) };
+        }
+
+        fn note(delta: isize) {
+            let live = LIVE.get() + delta;
+            LIVE.set(live);
+            PEAK.set(PEAK.get().max(live));
+        }
+
+        struct Counting;
+
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+                let p = unsafe { System.alloc(l) };
+                if !p.is_null() {
+                    note(l.size() as isize);
+                }
+                p
+            }
+
+            unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+                let p = unsafe { System.alloc_zeroed(l) };
+                if !p.is_null() {
+                    note(l.size() as isize);
+                }
+                p
+            }
+
+            unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+                unsafe { System.dealloc(p, l) };
+                note(-(l.size() as isize));
+            }
+
+            unsafe fn realloc(&self, p: *mut u8, l: Layout, size: usize) -> *mut u8 {
+                let q = unsafe { System.realloc(p, l, size) };
+                if !q.is_null() {
+                    note(size as isize - l.size() as isize);
+                }
+                q
+            }
+        }
+
+        #[global_allocator]
+        static COUNTING: Counting = Counting;
+
+        /// `f`'s result and the most heap this thread held above its level at the call while `f` ran.
+        pub fn peak_during<R>(f: impl FnOnce() -> R) -> (R, usize) {
+            let base = LIVE.get();
+            PEAK.set(base);
+            let r = f();
+            (r, (PEAK.get() - base) as usize)
+        }
+    }
+
+    /// Merges one key named in full by `n` entities: the merge's peak heap and the key's encoded
+    /// list bytes (`.post`).
+    fn merge_one_key(n: u32) -> (usize, usize) {
+        let dir = tmp_dir(&format!("merge-heap-{n}"));
+        let mut run: Vec<(Vec<u8>, Posting)> =
+            (0..n).map(|entity| (b"church".to_vec(), Posting { entity, imp_q: 100, partial: false, class: 0, ord: 0 })).collect();
+        let files = vec![write_run(&dir, "k.run", &mut run)];
+        let runs = KeyRuns {
+            name: "poi".into(),
+            files,
+            st: Stats::default(),
+            ents: 0,
+            entries: 0,
+            spilled: 0,
+            t_src: Duration::ZERO,
+            t_keys: Duration::ZERO,
+        };
+        let opts = BuildOpts {
+            threads: 1,
+            mem_mb: DEFAULT_RUN_BUDGET_MB,
+            tmp: dir.clone(),
+            inline: false,
+            extras: None,
+            imp_dir: None,
+            area_proxy: false,
+            poi_max_tier: 3,
+        };
+        let (r, peak) = heap::peak_during(|| merge(runs, &dir, &opts));
+        r.unwrap();
+        let post = std::fs::metadata(dir.join("poi.post")).unwrap().len() as usize;
+        let _ = std::fs::remove_dir_all(&dir);
+        (peak, post)
+    }
+
+    #[test]
+    fn merge_holds_a_keys_whole_name_postings_once() {
+        // Over a one-posting key, the heap grows by one buffer of the postings and the list encoded
+        // from them; a second copy of the postings takes it to two copies plus the list.
+        let n = 1 << 16;
+        let (base, _) = merge_one_key(1);
+        let (peak, post) = merge_one_key(n);
+        let copy = n as usize * std::mem::size_of::<Posting>();
+        let growth = peak - base;
+        assert!(growth < 2 * copy + post, "heap grew {growth} bytes: postings {copy} bytes, encoded list {post} bytes");
+    }
+
     #[test]
     fn runs_refuse_keys_over_the_length_limit() {
         let dir = tmp_dir("long-key");
-        let mut runs = Runs::new(1 << 20, &dir, "t".into());
+        let mut runs = Runs::new(1 << 20, &dir, "t".into()).unwrap();
         let p = posting(1, 9, false, 0);
         let longest = vec![b'a'; u16::MAX as usize];
         assert!(runs.push(&longest, p).is_ok());
@@ -1134,7 +1613,7 @@ mod tests {
             extras: Some(bin.to_str().unwrap().into()), imp_dir: None, area_proxy: false, poi_max_tier: 3,
         };
 
-        let err = build(&geo, "places", &dir.0.join("idx"), &opts).err();
+        let err = build(&geo, &["places"], &dir.0.join("idx"), &opts).err();
 
         assert!(err.as_deref().is_some_and(|e| e.contains("65536 bytes")), "{err:?}");
     }
@@ -1167,9 +1646,9 @@ mod tests {
         let full = PathBuf::from("/dev/full");
         w.slots[0].out = BufWriter::with_capacity(0, File::options().write(true).open(&full).unwrap());
         w.slots[0].path = full;
-        w.add(b"a", &mut vec![posting(1, 9, false, 0)]).unwrap();
+        w.add(b"a", &[posting(1, 9, false, 0)]).unwrap();
 
-        let err = w.add(b"b", &mut vec![posting(2, 9, false, 0)]).err();
+        let err = w.add(b"b", &[posting(2, 9, false, 0)]).err();
 
         assert!(err.as_deref().is_some_and(|e| e.contains("/dev/full")), "{err:?}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1377,6 +1856,36 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_build_leaves_no_sort_runs_behind() {
+        use crate::fixture::{Geo, TempDir};
+        let mut g = Geo::default();
+        g.boundary("Testville", 8, [10.0, 20.0, 10.2, 20.2]);
+        g.place("Testburg", 1, 10.1, 20.1);
+        g.poi("Test Hall", 10.05, 20.05, 0);
+        let dir = TempDir::new("failed-runs");
+        let geo = g.load(&dir.0.join("geo"));
+        let out = dir.0.join("idx");
+        // The places keys are sorted into runs before the POI build fails on an importance file
+        // of the wrong size.
+        let imp = dir.0.join("imp");
+        std::fs::create_dir_all(&imp).unwrap();
+        for (file, n) in [("imp_places.u8", 1), ("imp_polys.u8", 1), ("imp_poi.u8", 2)] {
+            std::fs::write(imp.join(file), vec![200u8; n]).unwrap();
+        }
+        let opts = BuildOpts {
+            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: out.join("tmp"), inline: true, extras: None,
+            imp_dir: Some(imp.to_str().unwrap().into()), area_proxy: false, poi_max_tier: 3,
+        };
+
+        let err = build_all(&geo, &["places", "poi"], &out, &opts, || Ok(serde_json::json!({}))).err();
+
+        assert!(err.as_deref().is_some_and(|e| e.contains("imp_poi.u8")), "{err:?}");
+        let left: Vec<_> = std::fs::read_dir(&opts.tmp).into_iter().flatten().map(|e| e.unwrap().file_name()).collect();
+        assert!(left.is_empty(), "left in the temp directory: {left:?}");
+        assert!(!opts.tmp.exists());
+    }
+
+    #[test]
     fn a_failed_publish_puts_back_what_it_replaced() {
         let dir = tmp_dir("publish");
         let (stage, out) = (dir.join("stage"), dir.join("out"));
@@ -1558,12 +2067,12 @@ mod tests {
         for (file, n) in [("imp_places.u8", 2), ("imp_polys.u8", 1), ("imp_poi.u8", 1)] {
             std::fs::write(imp.join(file), vec![0u8; n]).unwrap();
         }
-        assert!(build(&geo, "places", &out, &opts).is_ok());
-        assert!(build(&geo, "poi", &out, &opts).is_ok());
+        assert!(build(&geo, &["places"], &out, &opts).is_ok());
+        assert!(build(&geo, &["poi"], &out, &opts).is_ok());
 
         for (file, n, sub) in [("imp_places.u8", 2, "places"), ("imp_polys.u8", 1, "places"), ("imp_poi.u8", 1, "poi")] {
             std::fs::write(imp.join(file), vec![0u8; n + 1]).unwrap();
-            let err = build(&geo, sub, &out, &opts).unwrap_err();
+            let err = build(&geo, &[sub], &out, &opts).unwrap_err();
             assert!(err.contains(file), "{err}");
             std::fs::write(imp.join(file), vec![0u8; n]).unwrap();
         }
