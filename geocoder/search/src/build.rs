@@ -878,13 +878,13 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
 
 /// Builds the sub-indexes `subs` of `geo` for the index directory `out`, `meta` with each one's
 /// stats becoming its search_meta.json. Every file is written into a staging directory and moved
-/// into `out` only once all of them are complete, search_meta.json last: a failed build leaves
-/// `out` as it was. Returns the stats.
+/// into `out` only once all of them are complete, search_meta.json last (`publish`): a failed
+/// build or move leaves `out` as it was. Returns the stats.
 pub fn build_all(geo: &Index, subs: &[&str], out: &Path, opts: &BuildOpts, meta: serde_json::Value) -> Result<Vec<(String, Stats)>, String> {
     let stage = out.join(BUILD_STAGE_DIR);
     let _ = std::fs::remove_dir_all(&stage);
     let built = build_staged(geo, subs, &stage, opts, meta)
-        .and_then(|stats| publish(&stage, out).map(|_| stats).map_err(|e| format!("publish {}: {e}", out.display())));
+        .and_then(|stats| publish(&stage, out, |from, to| std::fs::rename(from, to)).map(|_| stats).map_err(|e| format!("publish {}: {e}", out.display())));
     let _ = std::fs::remove_dir_all(&stage);
     built
 }
@@ -902,12 +902,32 @@ fn build_staged(geo: &Index, subs: &[&str], stage: &Path, opts: &BuildOpts, mut 
     Ok(stats)
 }
 
-/// Moves every file of `stage` into `out`, search_meta.json last.
-fn publish(stage: &Path, out: &Path) -> std::io::Result<()> {
+/// Moves every file of `stage` into `out` with `rename`, search_meta.json last. Each file it
+/// replaces is moved aside first; when a move fails, the files moved so far are put back.
+fn publish(stage: &Path, out: &Path, rename: impl Fn(&Path, &Path) -> std::io::Result<()>) -> std::io::Result<()> {
     let mut names = std::fs::read_dir(stage)?.map(|e| e.map(|e| e.file_name())).collect::<std::io::Result<Vec<_>>>()?;
-    names.sort_by_key(|n| n == "search_meta.json");
+    names.sort_by_key(|n| (n == "search_meta.json", n.clone()));
+    let aside = stage.join(BUILD_ASIDE_DIR);
+    std::fs::create_dir(&aside)?;
+    // (name, whether it replaced a file of `out`)
+    let mut moved = Vec::new();
     for n in &names {
-        std::fs::rename(stage.join(n), out.join(n))?;
+        let (to, old) = (out.join(n), aside.join(n));
+        let replaced = match rename(&to, &old) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        };
+        let step = replaced.and_then(|r| {
+            moved.push((n, r));
+            rename(&stage.join(n), &to)
+        });
+        if let Err(e) = step {
+            for (n, replaced) in moved.into_iter().rev() {
+                let _ = if replaced { rename(&aside.join(n), &out.join(n)) } else { std::fs::remove_file(out.join(n)) };
+            }
+            return Err(e);
+        }
     }
     Ok(())
 }
@@ -1305,6 +1325,36 @@ mod tests {
         let idx = SearchIndex::open(&geo, &out, None, None).unwrap();
         let (found, _) = Searcher::new(&idx).search("Testburg", 5);
         assert_eq!(found.iter().map(|f| f.hit.entity).collect::<Vec<_>>(), [0]);
+    }
+
+    #[test]
+    fn a_failed_publish_puts_back_what_it_replaced() {
+        let dir = tmp_dir("publish");
+        let (stage, out) = (dir.join("stage"), dir.join("out"));
+        for (d, file, text) in [(&stage, "a", "new a"), (&stage, "b", "new b"), (&stage, "search_meta.json", "new meta"),
+                                (&out, "a", "old a"), (&out, "search_meta.json", "old meta")] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join(file), text).unwrap();
+        }
+        let contents = |d: &Path| {
+            let mut v: Vec<_> = std::fs::read_dir(d).unwrap().map(|e| e.unwrap().path()).map(|p| (std::fs::read_to_string(&p).ok(), p)).collect();
+            v.sort();
+            v
+        };
+        let before = contents(&out);
+        // Moving b in fails once a has moved.
+        let rename = |from: &Path, to: &Path| {
+            if from.ends_with("stage/b") {
+                return Err(std::io::Error::other("injected"));
+            }
+            std::fs::rename(from, to)
+        };
+
+        let result = publish(&stage, &out, rename);
+
+        assert!(result.is_err());
+        assert_eq!(contents(&out), before);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
