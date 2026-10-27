@@ -12,6 +12,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 
 PATCHER, GC, DIFF = (str(Path(a).resolve()) for a in sys.argv[1:4])
 NO = 0xFFFFFFFF
@@ -42,8 +43,9 @@ def geo_dir(d, cells, ways=1000):
     (d / 'street_nodes.bin').write_bytes(b'')
     rows, entries = [], bytearray()
     for k, ids in cells:
-        rows.append(struct.pack('<QIII', (k + 1) << 27, len(entries), NO, NO))
-        entries += struct.pack('<H', len(ids)) + struct.pack(f'<{len(ids)}I', *ids)
+        rows.append(struct.pack('<QIII', (k + 1) << 27, len(entries) if ids else NO, NO, NO))
+        if ids:
+            entries += struct.pack('<H', len(ids)) + struct.pack(f'<{len(ids)}I', *ids)
     (d / 'geo_cells.bin').write_bytes(b''.join(rows))
     (d / 'street_entries.bin').write_bytes(bytes(entries))
     (d / 'addr_entries.bin').write_bytes(b'')
@@ -140,5 +142,24 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as scratch:
     geo_dir(root / 'geo.a', cells)
     geo_dir(root / 'geo.b', cells[:1000] + cells[19000:])
     apply_case(root, 'removed-cells', root / 'geo.a', root / 'geo.b', decoder_peaks_at_most('gxc', 1 << 20))
+
+    # A streamed output whose reader goes away fails the run (the entry pipeline's four outputs were
+    # closed unchecked): geo_cells.bin is a FIFO whose reader closes at once, the patch rewrites 4 MiB
+    # of rows (more than the pipe and the stdio buffer hold), SIGPIPE is ignored.
+    flat = [(k, []) for k in range(200000)]
+    geo_dir(root / 'flat', flat)
+    r = run([DIFF, str(root / 'flat'), str(root / 'flat'), '-o', str(root / 'flat.gcpatch')])
+    out = root / 'fifo.out'
+    out.mkdir()
+    fifo = out / 'geo_cells.bin'
+    os.mkfifo(fifo)
+    reader = threading.Thread(target=lambda: os.close(os.open(fifo, os.O_RDONLY)), daemon=True)
+    reader.start()
+    r = run([PATCHER, str(root / 'flat'), str(root / 'flat.gcpatch'), '-o', str(out)], restore_signals=False, timeout=120)
+    if reader.is_alive():
+        os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+    err = r.stderr.decode()
+    if r.returncode == 0 or 'Cannot write geo_cells.bin' not in err:
+        errors.append(f'fifo-output: a failed geo_cells.bin was not reported: rc={r.returncode} {err[-300:]}')
 
 assert not errors, '\n'.join(errors)

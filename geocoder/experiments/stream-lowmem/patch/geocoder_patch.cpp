@@ -141,6 +141,18 @@ static uint32_t joint_child_of(uint32_t fid) {
     }
 }
 
+// Closes outputs, every one even when another fails, then throws naming those whose writes or
+// close failed. The close's own flush is the last write: on a FIFO no size check follows it, and an
+// encoded output's encoder takes its last bytes there.
+static void close_outputs(std::initializer_list<std::pair<FILE*, const char*>> outs) {
+    std::string bad;
+    for (const auto& [f, name] : outs) {
+        const bool ok = !ferror(f);
+        if (fclose(f) != 0 || !ok) bad += (bad.empty() ? "" : ", ") + std::string(name);
+    }
+    if (!bad.empty()) throw std::runtime_error("Cannot write " + bad);
+}
+
 // A child section (the one right after its parent's) replayed on demand: produce(n) writes the
 // next n bytes of the new child file, taking MATCH bytes from the old child file, INSERT / REPLACE
 // bytes from the patch, and skipping DELETE runs as it meets them.
@@ -848,11 +860,9 @@ static int run(int argc, char* argv[]) {
                 old_c, old_e, payload + 8, payload_size - 8,
                 [&](const char* p, size_t n) { fwrite(p, 1, n, fc); cells_written += n; },
                 [&](const char* p, size_t n) { fwrite(p, 1, n, fe); });
-            bool ok = !ferror(fc) && !ferror(fe);
-            fclose(fc); fclose(fe);
+            close_outputs({{fc, cells_name.c_str()}, {fe, entries_name.c_str()}});
             log_rewinds(old_c);
             log_rewinds(old_e);
-            if (!ok) throw std::runtime_error("Cannot write " + cells_name);
             if (cells_written != new_size || entries_written != new_entries_size)
                 throw std::runtime_error("Rebuilt " + cells_name + " does not match the new build");
             std::cerr << "  " << cells_name << " + " << entries_name << ": cell list delta, "
@@ -927,9 +937,7 @@ static int run(int argc, char* argv[]) {
                 }
             }
             if (!buf.empty()) fwrite(buf.data(), 4, buf.size(), out);
-            bool ok = !ferror(out);
-            fclose(out);
-            if (!ok) throw std::runtime_error(std::string("Cannot write ") + fname);
+            close_outputs({{out, fname}});
             if (ni * 4 != new_size || ci != n_changes || ii != n_ins)
                 throw std::runtime_error(std::string("Parallel delta does not match the new build: ") + fname);
             log_rewinds(old);
@@ -998,9 +1006,7 @@ static int run(int argc, char* argv[]) {
                 }
                 fwrite(buf.data(), 1, n, out);
             }
-            bool ok = !ferror(out);
-            fclose(out);
-            if (!ok) throw std::runtime_error(std::string("Cannot write ") + fname);
+            close_outputs({{out, fname}});
 
             std::cerr << "  " << fname << ": sparse delta " << n_changes
                       << " changes (" << new_size << " bytes)" << section_io() << std::endl;
@@ -1501,7 +1507,8 @@ static int run(int argc, char* argv[]) {
             }
         }
 
-        fclose(f_geo); fclose(o_se.f); fclose(o_ae.f); fclose(o_ie.f);
+        close_outputs({{f_geo, "geo_cells.bin"}, {o_se.f, "street_entries.bin"}, {o_ae.f, "addr_entries.bin"},
+                       {o_ie.f, "interp_entries.bin"}});
         for (const SequentialFileReader* r : {&old_geo, &old_se, &old_ae, &old_ie}) log_rewinds(*r);
         std::cerr << "  Geo: " << cells_written << " cells written" << std::endl;
         malloc_trim(0);
@@ -1517,8 +1524,8 @@ static int run(int argc, char* argv[]) {
             size_t n = cells.size() / 12;
             auto ecit = entry_corrections.find((uint32_t)entries_fid);
             if (ecit == entry_corrections.end()) {
-                write_file(out_path(cells_name), cells);
-                write_file(out_path(entries_name), entries);
+                if (!write_file(out_path(cells_name), cells) || !write_file(out_path(entries_name), entries))
+                    throw std::runtime_error("Cannot write " + cells_name);
                 std::cerr << "  " << label << ": " << n << " cells rebuilt" << std::endl;
                 return;
             }
@@ -1551,7 +1558,7 @@ static int run(int argc, char* argv[]) {
                     }
                 }
             }
-            fclose(fc); fclose(fe);
+            close_outputs({{fc, cells_name.c_str()}, {fe, entries_name.c_str()}});
             std::cerr << "  " << label << ": " << n << " cells, " << corr.size() << " corrections" << std::endl;
         };
 
@@ -1574,11 +1581,9 @@ static int run(int argc, char* argv[]) {
                               dit->second.data(), dit->second.size(),
                               [&](const char* p, size_t len) { fwrite(p, 1, len, fc); n_out += len; },
                               [&](const char* p, size_t len) { fwrite(p, 1, len, fe); });
-            bool ok = !ferror(fc) && !ferror(fe);
-            fclose(fc); fclose(fe);
+            close_outputs({{fc, (prefix + "_cells.bin").c_str()}, {fe, (prefix + "_entries.bin").c_str()}});
             log_rewinds(old_c);
             log_rewinds(old_e);
-            if (!ok) throw std::runtime_error("Cannot write " + prefix + "_cells.bin");
             std::cerr << "  " << label << ": " << n_out / 12 << " cells, cell index delta" << std::endl;
             return true;
         };
