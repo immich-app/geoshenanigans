@@ -566,22 +566,10 @@ struct DictEnc : Encoder {
             std::vector<uint16_t> b(16 << 10);
             for (uint64_t at = 0; at < 2 * n;) {
                 const size_t want = size_t(std::min<uint64_t>(2 * b.size(), 2 * n - at));
-                size_t got_b = 0;
-                while (got_b < want) {
-                    const ssize_t r = pread(fd, reinterpret_cast<char*>(b.data()) + got_b, want - got_b, off_t(at + got_b));
-                    if (r < 0 && errno == EINTR) continue;
-                    if (r <= 0) die("read %s", p.c_str());
-                    got_b += size_t(r);
-                }
+                pread_all(fd, b.data(), want, at, p);
                 for (size_t j = 0; j < want / 2; j++)
                     if (b[j] != 0xFFFF) b[j] = final_of[b[j]];
-                size_t put_b = 0;
-                while (put_b < want) {
-                    const ssize_t r = pwrite(fd, reinterpret_cast<char*>(b.data()) + put_b, want - put_b, off_t(at + put_b));
-                    if (r < 0 && errno == EINTR) continue;
-                    if (r <= 0) die("write %s", p.c_str());
-                    put_b += size_t(r);
-                }
+                pwrite_all(fd, b.data(), want, at, p);
                 at += want;
             }
             if (close(fd)) die("close %s", p.c_str());
@@ -1508,8 +1496,8 @@ struct PoiEnc : Encoder {
                 while (left) {
                     const size_t c = size_t(std::min<uint64_t>(left, tmp.size()));
                     left -= c;
-                    if (pread(O->fd, tmp.data(), c, off_t(src + left)) != ssize_t(c)) die("poi_vertices.bopen: reread");
-                    if (pwrite(O->fd, tmp.data(), c, off_t(dst + left)) != ssize_t(c)) die("poi_vertices.bopen: write");
+                    pread_all(O->fd, tmp.data(), c, src + left, opath);
+                    pwrite_all(O->fd, tmp.data(), c, dst + left, opath);
                 }
             }
             const uint64_t mask = wmask(w);
@@ -1518,12 +1506,12 @@ struct PoiEnc : Encoder {
                 const uint32_t z = zzw(uint32_t((uint64_t(q) - prev[comp]) & mask), 8 * w);
                 for (int b = 0; b < w; b++) {
                     const uint8_t byte = uint8_t(z >> (8 * b));
-                    if (pwrite(O->fd, &byte, 1, off_t(base + uint64_t(comp * w + b) * vc + (vc - 1))) != 1) die("poi_vertices.bopen: write");
+                    pwrite_all(O->fd, &byte, 1, base + uint64_t(comp * w + b) * vc + (vc - 1), opath);
                 }
             }
         }
         big_hdr[1] = closed ? 1 : 0;
-        if (pwrite(O->fd, big_hdr, 10, off_t(big_start)) != 10) die("poi_vertices.bopen: write");
+        pwrite_all(O->fd, big_hdr, 10, big_start, opath);
         O->skip_to(base + vs * c2);
         vexp += big_size;
         big = false;
