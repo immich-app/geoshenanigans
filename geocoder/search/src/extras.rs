@@ -205,5 +205,18 @@ pub fn pack(tsv: &str, out: &str) -> Result<(usize, usize), String> {
         put(&o.to_le_bytes())?;
     }
     put(&blob)?;
+    w.flush().map_err(|e| e.to_string())?;
     Ok((refs.len(), rows.len()))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    #[test]
+    fn pack_reports_final_flush_failure() {
+        let tsv = std::env::temp_dir().join(format!("ps-extra-flush-{}.tsv", std::process::id()));
+        std::fs::write(&tsv, "p\t1\t0\tname:de\tBerlin\no\t7\t1\talt_name\tTor\n").unwrap();
+        let result = super::pack(tsv.to_str().unwrap(), "/dev/full");
+        std::fs::remove_file(tsv).unwrap();
+        assert!(result.is_err());
+    }
 }
