@@ -265,6 +265,37 @@ struct JointChild {
     }
 };
 
+// A joint parent's record size (the stride its merge sections give).
+static size_t joint_parent_stride(uint32_t fid) {
+    switch ((PatchFileId)fid) {
+    case PatchFileId::STREET_WAYS: return WAY_HEADER_STRIDE;
+    case PatchFileId::INTERP_WAYS: return INTERP_WAY_STRIDE;
+    case PatchFileId::ADDR_POINTS: return ADDR_POINT_STRIDE;
+    case PatchFileId::POI_RECORDS: return POI_RECORD_STRIDE;
+    default: throw std::runtime_error("No child stream");
+    }
+}
+
+// The child bytes a new parent record owns: its nodes, its footprint or its vertex block (whose
+// size depends on the block's encoding byte, the next child byte to write).
+static uint64_t child_bytes_of(uint32_t fid, const char* rec, JointChild& jc) {
+    switch ((PatchFileId)fid) {
+    case PatchFileId::STREET_WAYS:
+    case PatchFileId::INTERP_WAYS: return (uint64_t)record_node_count(rec) * 8;
+    case PatchFileId::ADDR_POINTS: {
+        uint32_t vc; memcpy(&vc, rec + 24, 4);
+        if (!vc) return 0;
+        return 10 + (uint64_t)vc * (jc.peek() == 3 ? 8 : 4);
+    }
+    case PatchFileId::POI_RECORDS: {
+        uint32_t vc; memcpy(&vc, rec + 12, 4);
+        if (!vc) return 0;
+        return 10 + (uint64_t)vc * 2 * (jc.peek() == 3 ? 4 : 2);
+    }
+    default: throw std::runtime_error("No child stream");
+    }
+}
+
 static int run(int argc, char* argv[]) {
     if (argc < 5 || std::string(argv[3]) != "-o") {
         std::cerr << "Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir> [--only file,file,...]" << std::endl;
@@ -533,6 +564,35 @@ static int run(int argc, char* argv[]) {
     struct SeqRef { size_t start, size; size_t stride; };
     std::unordered_map<uint32_t, SeqRef> merge_seqs;
 
+    // Low-memory client update: an encoded family's records and their child stream (ways and
+    // their nodes, address points and their footprints, POI records and their vertices) come
+    // from one decoder and go to one encoder, so the two sections replay together: each new
+    // record, then its child bytes. The child section (at `at`) must follow the parent's.
+    auto open_joint_child = [&](uint32_t parent_fid, FILE* parent_out, size_t at) {
+        std::unique_ptr<JointChild> jc(new JointChild());
+        jc->parse(P, patch_size, at, joint_child_of(parent_fid), v8);
+        const char* cname = patch_file_names[jc->fid];
+        require_old_file_size(cur_dir, cname, jc->old_size);
+        jc->old.reset(new SequentialFileReader(cur_dir + "/" + cname));
+        jc->out = open_out(cname);
+        jc->parent = parent_out;
+        jc->name = cname;
+        return jc;
+    };
+    // After the parent's output is closed: the child's last bytes, its checks, and the patch
+    // position moves past its section.
+    auto close_joint_child = [&](std::unique_ptr<JointChild>& jc, const char* parent_name) {
+        jc->finish();
+        bool cok = !ferror(jc->out);
+        if (fclose(jc->out) != 0 || !cok) throw std::runtime_error(std::string("Cannot write ") + jc->name);
+        if (jc->written != jc->new_size)
+            throw std::runtime_error(std::string("Rebuilt ") + jc->name + " does not match the new build");
+        if (jc->kind == JointChild::MERGE) merge_seqs[jc->fid] = {jc->seq, jc->seq_end - jc->seq, jc->stride};
+        std::cerr << "  " << jc->name << ": " << jc->written << " bytes, replayed with " << parent_name << std::endl;
+        pos = jc->section_end;
+        jc.reset();
+    };
+
     bool saw_end = false;
     while (pos < patch_size) {
         uint32_t file_id = ru32();
@@ -693,8 +753,6 @@ static int run(int argc, char* argv[]) {
             // data. Reproduce by copying the old (current) file verbatim.
             uint32_t nf = ru32(); (void)nf; take(ru64(), "copy-old payload"); // empty
             if (!want) continue;
-            if (gcs::store().is_encoded(fname) && joint_child_of(file_id) != UINT32_MAX)
-                throw std::runtime_error(std::string("Encoded set: an unchanged ") + fname + " is not replayed with its child yet");
             SequentialFileReader in(cur_dir + "/" + fname);
             if (!in.is_open()) {
                 // The diff only emits COPY_OLD for a file that existed (and was
@@ -705,6 +763,24 @@ static int run(int argc, char* argv[]) {
                 return 1;
             }
             FILE* out = open_out(fname);
+            if (gcs::store().is_encoded(fname) && joint_child_of(file_id) != UINT32_MAX) {
+                // An unchanged parent of an encoded family: one MATCH of every record, each followed
+                // by its child bytes (from the child section, which may still change them).
+                const size_t rs = joint_parent_stride(file_id);
+                if (in.size() % rs) throw std::runtime_error(std::string("Old ") + fname + " is not whole records");
+                std::unique_ptr<JointChild> jc = open_joint_child(file_id, out, pos);
+                for (uint64_t off = 0; off < in.size(); off += rs) {
+                    const char* rec = in.at(off, rs);
+                    jc->before_parent_write(out, rs);
+                    fwrite(rec, 1, rs, out);
+                    jc->produce(child_bytes_of(file_id, rec, *jc));
+                }
+                bool ok = !ferror(out);
+                if (fclose(out) != 0 || !ok) throw std::runtime_error(std::string("Cannot write ") + fname);
+                std::cerr << "  " << fname << ": unchanged (copied " << in.size() << " bytes from old)" << section_io() << std::endl;
+                close_joint_child(jc, fname);
+                continue;
+            }
             append_old_range(in, out, 0, in.size(), fname);
             bool ok = !ferror(out);
             if (fclose(out) != 0 || !ok) throw std::runtime_error(std::string("Cannot write ") + fname);
@@ -975,38 +1051,10 @@ static int run(int argc, char* argv[]) {
         merge_seqs[file_id] = {pos, (size_t)seq_size, actual_stride};
         FILE* outf = open_out(fname);
 
-        // Low-memory client update: an encoded family's records and their child stream (ways and
-        // their nodes, address points and their footprints, POI records and their vertices) come
-        // from one decoder and go to one encoder, so the two sections replay together: each new
-        // record, then its child bytes. The child section must follow the parent's.
+        // An encoded family's parent: its child section replays along (open_joint_child).
         std::unique_ptr<JointChild> jc;
-        if (gcs::store().is_encoded(fname) && joint_child_of(file_id) != UINT32_MAX) {
-            jc.reset(new JointChild());
-            jc->parse(P, patch_size, seq_end, joint_child_of(file_id), v8);
-            const char* cname = patch_file_names[jc->fid];
-            require_old_file_size(cur_dir, cname, jc->old_size);
-            jc->old.reset(new SequentialFileReader(cur_dir + "/" + cname));
-            jc->out = open_out(cname);
-            jc->parent = outf;
-            jc->name = cname;
-        }
-        auto child_bytes = [&](const char* rec) -> uint64_t {
-            switch ((PatchFileId)file_id) {
-            case PatchFileId::STREET_WAYS:
-            case PatchFileId::INTERP_WAYS: return (uint64_t)record_node_count(rec) * 8;
-            case PatchFileId::ADDR_POINTS: {
-                uint32_t vc; memcpy(&vc, rec + 24, 4);
-                if (!vc) return 0;
-                return 10 + (uint64_t)vc * (jc->peek() == 3 ? 8 : 4);
-            }
-            case PatchFileId::POI_RECORDS: {
-                uint32_t vc; memcpy(&vc, rec + 12, 4);
-                if (!vc) return 0;
-                return 10 + (uint64_t)vc * 2 * (jc->peek() == 3 ? 4 : 2);
-            }
-            default: throw std::runtime_error("No child stream");
-            }
-        };
+        if (gcs::store().is_encoded(fname) && joint_child_of(file_id) != UINT32_MAX) jc = open_joint_child(file_id, outf, seq_end);
+        auto child_bytes = [&](const char* rec) { return child_bytes_of(file_id, rec, *jc); };
 
         // Record the old → new record ids of the files whose remap the entry
         // pipeline reads back (geo, POI and place indexes).
@@ -1179,17 +1227,7 @@ static int run(int argc, char* argv[]) {
         bool out_ok = !ferror(outf);
         if (fclose(outf) != 0 || !out_ok) throw std::runtime_error(std::string("Cannot write ") + fname);
         log_rewinds(old);
-        if (jc) {
-            jc->finish();
-            bool cok = !ferror(jc->out);
-            if (fclose(jc->out) != 0 || !cok) throw std::runtime_error(std::string("Cannot write ") + jc->name);
-            if (jc->written != jc->new_size)
-                throw std::runtime_error(std::string("Rebuilt ") + jc->name + " does not match the new build");
-            if (jc->kind == JointChild::MERGE) merge_seqs[jc->fid] = {jc->seq, jc->seq_end - jc->seq, jc->stride};
-            std::cerr << "  " << jc->name << ": " << jc->written << " bytes, replayed with " << fname << std::endl;
-            pos = jc->section_end;
-            jc.reset();
-        }
+        if (jc) close_joint_child(jc, fname);
 
         if (track && v8 && file_id == (uint32_t)PatchFileId::STREET_WAYS) {
             // The moved ways' pairs (parent-id remap, street leg) complete
