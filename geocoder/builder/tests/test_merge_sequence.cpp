@@ -283,3 +283,15 @@ TEST(merge_child_blocks_counts_in_units) {
                                   [&](size_t i) { return none[i]; }, [&](size_t i) { return one[i]; });
     CHECK(ops_of(seq, 8) == std::vector<Op>({{OP_INSERT_RUN, 2, nodes}}));
 }
+
+TEST(merge_child_blocks_replace_keeps_blocks_like_a_match) {
+    MergeSequence parent;
+    parent.add_replace(PARENT, 2, PARENT_STRIDE);
+    parent.add_insert(PARENT, 1, PARENT_STRIDE);
+    Stream old_s{"AAAAheadXXtail", {{0, 4}, {4, 10}}};
+    Stream new_s{"AAAAheadYYYtailZZ", {{0, 4}, {4, 11}, {15, 2}}};
+    auto got = ops_of(merge(parent, old_s, new_s), 1);
+    std::vector<Op> want = {{OP_MATCH_RUN, 8, ""}, {OP_DELETE_RUN, 2, ""}, {OP_INSERT_RUN, 3, "YYY"},
+                            {OP_MATCH_RUN, 4, ""}, {OP_INSERT_RUN, 2, "ZZ"}};
+    CHECK(got == want);
+}
