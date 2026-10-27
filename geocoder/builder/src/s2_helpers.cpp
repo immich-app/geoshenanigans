@@ -2,6 +2,7 @@
 #include "geometry.h"
 #include "country_code.h"
 #include "parallel.h"
+#include "polygon_rings.h"
 #include "segment_rect.h"
 
 #include <algorithm>
@@ -124,37 +125,69 @@ S2CellId point_to_cell(double lat, double lng) {
 
 // --- cover_polygon ---
 
-std::vector<std::pair<S2CellId, bool>> cover_polygon(
-    const std::vector<std::pair<double,double>>& vertices) {
+// A closed ring's S2 loop, normalized to enclose less than half the sphere;
+// null below 3 distinct vertices.
+static std::unique_ptr<S2Loop> ring_loop(const std::pair<double,double>* ring, size_t count) {
     std::vector<S2Point> points;
-    points.reserve(vertices.size());
-    for (const auto& [lat, lng] : vertices) {
-        S2Point p = S2LatLng::FromDegrees(lat, lng).ToPoint();
+    points.reserve(count);
+    for (size_t k = 0; k < count; k++) {
+        S2Point p = S2LatLng::FromDegrees(ring[k].first, ring[k].second).ToPoint();
         if (!points.empty() && points.back() == p) continue;
         points.push_back(p);
     }
     if (points.size() > 1 && points.front() == points.back()) {
         points.pop_back();
     }
-    if (points.size() < 3) return {};
-
-    S2Error error;
+    if (points.size() < 3) return nullptr;
     auto loop = std::make_unique<S2Loop>(points, S2Debug::DISABLE);
     loop->Normalize();
+    return loop;
+}
+
+std::vector<std::pair<S2CellId, bool>> cover_polygon(
+    const std::vector<std::pair<double,double>>& vertices, uint16_t holes) {
+    std::vector<RingSpan> rings;
+    split_rings(vertices.data(), static_cast<uint32_t>(vertices.size()), holes, rings);
+    auto outer = ring_loop(vertices.data() + rings[0].begin, rings[0].count);
+    if (!outer) return {};
+
+    S2Error error;
+    // Holes nest in the outer loop (simplify_rings keeps them nesting in the
+    // plane wherever the source rings do). A polygon S2 rejects even so
+    // (rings sharing an edge, nesting only in the plane, S2's geodesic edges
+    // bowing across, or source rings that don't nest) takes its interior
+    // flags from its outer loop alone; the reader's ring test still has the
+    // last word on a flagged cell.
+    std::unique_ptr<S2Polygon> holed;
+    if (rings.size() > 1) {
+        std::vector<std::unique_ptr<S2Loop>> loops;
+        loops.emplace_back(outer->Clone());
+        for (size_t r = 1; r < rings.size(); r++)
+            if (auto hole = ring_loop(vertices.data() + rings[r].begin, rings[r].count))
+                loops.push_back(std::move(hole));
+        holed = std::make_unique<S2Polygon>();
+        holed->set_s2debug_override(S2Debug::DISABLE);
+        holed->InitNested(std::move(loops));
+        if (holed->FindValidationError(&error)) holed.reset();
+    }
     // Validate through the polygon: for one loop of 3+ vertices
     // S2Polygon::FindValidationError runs exactly S2Loop's checks (the
     // empty-loop, orientation and nesting checks cannot fire), on the shape
     // index the coverer reuses instead of a second index for the loop alone.
-    S2Polygon polygon(std::move(loop), S2Debug::DISABLE);
+    const S2Polygon polygon(std::move(outer), S2Debug::DISABLE);
     if (polygon.FindValidationError(&error)) return {};
 
     S2RegionCoverer::Options options;
     options.set_max_level(kAdminCellLevel);
     options.set_max_cells(MAX_S2_CELLS_PER_POLY);
 
+    // The cells are the outer loop's, holes and all: every quality variant
+    // and admin-minimal read this one index but simplify each hole their own
+    // way, so a hole's edge can give way to the polygon up to a tolerance
+    // inside the hole. Only the interior flags leave the holes out.
     S2RegionCoverer coverer(options);
     S2CellUnion covering = coverer.GetCovering(polygon);
-    S2CellUnion interior = coverer.GetInteriorCovering(polygon);
+    S2CellUnion interior = coverer.GetInteriorCovering(holed ? *holed : polygon);
 
     std::unordered_set<uint64_t> interior_set;
     for (const auto& cell : interior.cell_ids()) {
@@ -306,7 +339,7 @@ void AdminCoverPool::worker_loop() {
             active_workers_++;
         }
 
-        auto cell_ids = cover_polygon(item.vertices);
+        auto cell_ids = cover_polygon(item.vertices, item.holes);
         auto& local = thread_results_[my_idx];
         for (const auto& [cell_id, is_interior] : cell_ids) {
             uint32_t entry = is_interior ? (item.poly_id | INTERIOR_FLAG) : item.poly_id;

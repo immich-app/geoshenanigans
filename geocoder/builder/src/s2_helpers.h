@@ -37,8 +37,12 @@ void cover_edge(S2CellId c1, S2CellId c2, double lat1, double lng1, double lat2,
 
 S2CellId point_to_cell(double lat, double lng);
 
+// The kAdminCellLevel cells covering a polygon, each flagged when it lies
+// wholly inside. `vertices` is a closed ring, or a keyhole range with
+// `holes` holes (polygon_rings.h): the cells cover its outer ring, and only
+// those wholly outside the holes are flagged.
 std::vector<std::pair<S2CellId, bool>> cover_polygon(
-    const std::vector<std::pair<double,double>>& vertices);
+    const std::vector<std::pair<double,double>>& vertices, uint16_t holes = 0);
 
 // --- Thread pool for concurrent admin polygon S2 covering ---
 
@@ -47,6 +51,7 @@ public:
     struct WorkItem {
         uint32_t poly_id;
         std::vector<std::pair<double,double>> vertices;
+        uint16_t holes = 0;  // keyhole-encoded holes in `vertices`
     };
 
     explicit AdminCoverPool(size_t num_threads);
@@ -77,18 +82,20 @@ private:
 // Simplify a polygon using the current global mode, taking admin_level into account.
 // In MaxVertices mode: caps at MAX_POLYGON_VERTICES (500).
 // In ErrorBounded mode: uses per-level epsilon in meters, converted to degrees.
+// tolerance_scale (0, 1] tightens either: epsilon times it, or the vertex cap
+// over it (simplify_rings retrying rings that stopped nesting).
 inline std::vector<std::pair<double,double>> simplify_admin_polygon(
-    const std::vector<std::pair<double,double>>& pts, uint8_t admin_level) {
+    const std::vector<std::pair<double,double>>& pts, uint8_t admin_level, double tolerance_scale = 1) {
     if (kSimplifyMode == SimplifyMode::ErrorBounded) {
         double eps_m = kSimplifyEpsilonOverride > 0
             ? kSimplifyEpsilonOverride
             : admin_epsilon_meters(admin_level);
         // Estimate latitude from first vertex for degree conversion
         double lat = pts.empty() ? 0.0 : pts[0].first;
-        double eps_deg = meters_to_degrees(eps_m, lat);
+        double eps_deg = meters_to_degrees(eps_m * tolerance_scale, lat);
         return simplify_polygon_epsilon(pts, eps_deg);
     }
-    return simplify_polygon(pts);
+    return simplify_polygon(pts, static_cast<size_t>(MAX_POLYGON_VERTICES / tolerance_scale));
 }
 
 // --- Helper functions that depend on S2 ---

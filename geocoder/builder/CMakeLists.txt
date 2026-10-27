@@ -105,42 +105,47 @@ target_compile_definitions(pbf-apply PRIVATE _FILE_OFFSET_BITS=64)
 
 target_include_directories(build-index PRIVATE "${EMBEDDED_POLY_DIR}")
 
-if(EXISTS /opt/homebrew/include)
-    target_include_directories(build-index PRIVATE /opt/homebrew/include)
-endif()
-
 if(GEOCODER_S2_PREFIX)
     find_package(absl REQUIRED PATHS "${GEOCODER_S2_PREFIX}" NO_DEFAULT_PATH)
     find_package(OpenSSL REQUIRED)
-    target_include_directories(build-index PRIVATE "${GEOCODER_S2_PREFIX}/include")
-    target_link_libraries(build-index PRIVATE
-        "${GEOCODER_S2_PREFIX}/lib/libs2.a"
-        absl::flat_hash_map
-        absl::str_format
-        absl::strings
-        absl::synchronization
-        OpenSSL::Crypto
-    )
-elseif(s2_FOUND)
-    target_link_libraries(build-index PRIVATE s2::s2)
-else()
-    target_include_directories(build-index PRIVATE /usr/include/s2)
-    target_link_libraries(build-index PRIVATE s2)
 endif()
+# Links S2 (and abseil) into a target, the prefix's or the system's.
+function(geocoder_link_s2 target)
+    if(EXISTS /opt/homebrew/include)
+        target_include_directories(${target} PRIVATE /opt/homebrew/include)
+    endif()
+    if(GEOCODER_S2_PREFIX)
+        target_include_directories(${target} PRIVATE "${GEOCODER_S2_PREFIX}/include")
+        target_link_libraries(${target} PRIVATE
+            "${GEOCODER_S2_PREFIX}/lib/libs2.a"
+            absl::flat_hash_map
+            absl::str_format
+            absl::strings
+            absl::synchronization
+            OpenSSL::Crypto
+        )
+    elseif(s2_FOUND)
+        target_link_libraries(${target} PRIVATE s2::s2)
+    else()
+        target_include_directories(${target} PRIVATE /usr/include/s2)
+        target_link_libraries(${target} PRIVATE s2)
+    endif()
+    # main() switches off absl's Mutex deadlock detection, S2's dependency:
+    # the distro abseil is built without NDEBUG (the prefix's is a release
+    # build and already links absl::synchronization).
+    if(NOT GEOCODER_S2_PREFIX)
+        if(absl_FOUND)
+            target_link_libraries(${target} PRIVATE absl::synchronization)
+        else()
+            target_link_libraries(${target} PRIVATE absl_synchronization)
+        endif()
+    endif()
+endfunction()
+geocoder_link_s2(build-index)
 target_link_libraries(build-index PRIVATE
     libdeflate::libdeflate
     Threads::Threads
 )
-# main() switches off absl's Mutex deadlock detection, S2's dependency:
-# the distro abseil is built without NDEBUG (the prefix's is a release build
-# and already links absl::synchronization).
-if(NOT GEOCODER_S2_PREFIX)
-    if(absl_FOUND)
-        target_link_libraries(build-index PRIVATE absl::synchronization)
-    else()
-        target_link_libraries(build-index PRIVATE absl_synchronization)
-    endif()
-endif()
 
 # --- Unit tests (geocoder-tests) ---
 #
@@ -162,6 +167,20 @@ target_compile_definitions(geocoder-tests PRIVATE
     _FILE_OFFSET_BITS=64)
 target_link_libraries(geocoder-tests PRIVATE ZLIB::ZLIB libdeflate::libdeflate EXPAT::EXPAT Threads::Threads)
 add_test(NAME geocoder-tests COMMAND geocoder-tests)
+
+# Unit tests of the builder code that runs on S2 (tests/s2/*.cpp), linked
+# like build-index: geocoder-tests stays free of S2 for the sanitizer job.
+file(GLOB GEOCODER_S2_TEST_SRCS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/s2/*.cpp")
+add_executable(geocoder-s2-tests
+    tests/test_main.cpp
+    ${GEOCODER_S2_TEST_SRCS}
+    src/cell_index.cpp
+    src/s2_helpers.cpp
+)
+target_include_directories(geocoder-s2-tests PRIVATE src tests)
+geocoder_link_s2(geocoder-s2-tests)
+target_link_libraries(geocoder-s2-tests PRIVATE Threads::Threads)
+add_test(NAME geocoder-s2-tests COMMAND geocoder-s2-tests)
 
 # GEOCODER_SANITIZE=ON builds the unit tests with ASan + UBSan, undefined
 # behaviour failing the run (CI's sanitizer job). Tests only: build-index

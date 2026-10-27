@@ -88,6 +88,7 @@ enum class VertexEncoding : uint8_t {
     U32_1CM   = 3,  // u32 @ 1e-7° (1.1 cm), fits any polygon        → countries / fallback
 };
 static constexpr uint8_t VERTEX_STRIDE[4] = {4, 4, 4, 8};
+static constexpr double VERTEX_SCALE[4] = {1e-5, 1e-4, 1e-6, 1e-7};  // degrees per delta step
 
 // admin_vertices.bin / poi_vertices.bin / addr_vertices.bin layout per
 // polygon (only present when vertex_count > 0):
@@ -112,9 +113,11 @@ struct AdminPolygon {
     uint8_t admin_level;
     uint8_t place_type_override = 0; // AdminPlaceType — overrides admin_level for field mapping
     uint8_t _pad2 = 0, _pad3 = 0;
-    float area;
+    float area;                   // shoelace, holes subtracted
     uint16_t country_code;
-    uint16_t _pad4 = 0;
+    // Holes appended to the outer ring in the vertex range, keyhole-encoded
+    // so a crossing-number test honours them (polygon_rings.h).
+    uint16_t hole_count = 0;
 };
 static_assert(sizeof(AdminPolygon) == 24, "AdminPolygon must be 24 bytes");
 
