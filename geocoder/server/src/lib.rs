@@ -2054,10 +2054,9 @@ impl Index {
             .map(|poly| RankedPoly { poly, rank_address: self.admin_config.to_rank(&cc, poly.admin_level) })
             .filter(|r| r.rank_address != 0 || r.poly.place_type_override != 0)
             .collect();
-        let inside = |poly: &AdminPolygon, current: &AdminPolygon| {
-            self.admin_verts(poly)
-                .and_then(|verts| point_on_surface(&verts, poly.hole_count))
-                .is_some_and(|(lat, lng)| self.admin_verts(current).is_some_and(|verts| point_in_polygon(lat, lng, &verts)))
+        let inside = |poly: &AdminPolygon, current: &AdminPolygon| match (self.admin_verts(poly), self.admin_verts(current)) {
+            (Some(verts), Some(current_verts)) => point_on_surface_in(&verts, poly.hole_count, &current_verts),
+            _ => false,
         };
         CurrentBoundaries::from_ranked(ranked, holding(place_areas).iter(), inside)
     }
@@ -4035,41 +4034,55 @@ pub fn point_in_polygon(lat: f32, lng: f32, vertices: &[NodeCoord]) -> bool {
     inside
 }
 
-/// A point inside a polygon's keyhole vertex range, found as GEOS's
-/// InteriorPointArea finds one (PostGIS ST_PointOnSurface, which Nominatim's
-/// boundary centroids are): on the line of latitude halfway between the
-/// outer ring's latitudes nearest above and below its bounding box's middle,
-/// the middle of the widest run inside the polygon. (lat, lng); None when no
-/// run is found.
+/// A point inside a polygon's keyhole vertex range as GEOS's
+/// InteriorPointArea finds it (PostGIS ST_PointOnSurface, which Nominatim's
+/// get_center_point uses for areas), the same as the builder's
+/// interior_point (polygon_rings.h): the midpoint of the widest inside
+/// stretch of the line of latitude half-way between the vertex latitudes of
+/// all rings nearest the middle of the outer ring's latitude range. The
+/// first vertex where no stretch has width; None for no vertices.
+/// (lat, lng).
 pub fn point_on_surface(verts: &[NodeCoord], holes: u16) -> Option<(f32, f32)> {
-    let spans = split_rings(verts, holes);
-    let ring_of = |span: &RingSpan| &verts[span.begin..span.begin + span.count];
-    let ring = ring_of(&spans[0]);
-    let (min, max) = ring.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.lat as f64), hi.max(p.lat as f64)));
-    let middle = (min + max) / 2.0;
-    let (mut below, mut above) = (min, max);
-    for p in ring {
-        let lat = p.lat as f64;
-        if lat <= middle { below = below.max(lat); } else { above = above.min(lat); }
+    let first = verts.first()?;
+    let rings: Vec<&[NodeCoord]> = split_rings(verts, holes).iter().map(|r| &verts[r.begin..r.begin + r.count]).collect();
+    let (mut lo, mut hi) = rings[0].iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p.lat as f64), hi.max(p.lat as f64)));
+    let centre = (lo + hi) / 2.0;
+    for p in rings.iter().flat_map(|r| r.iter()) {
+        let y = p.lat as f64;
+        if y <= centre {
+            if y > lo { lo = y; }
+        } else if y < hi {
+            hi = y;
+        }
     }
-    let lat = (below + above) / 2.0;
-    // Where the edges of the outer ring and the holes (not the keyhole
-    // connectors) cross the line.
+    let scan = (lo + hi) / 2.0;
     let mut crossings: Vec<f64> = Vec::new();
-    for ring in spans.iter().map(ring_of) {
-        for (a, b) in ring.iter().zip(ring.iter().cycle().skip(1)) {
-            let (a_lat, b_lat) = (a.lat as f64, b.lat as f64);
-            if (a_lat > lat) != (b_lat > lat) {
-                crossings.push(a.lng as f64 + (lat - a_lat) / (b_lat - a_lat) * (b.lng as f64 - a.lng as f64));
-            }
+    for ring in &rings {
+        for edge in ring.windows(2) {
+            let (y0, y1) = (edge[0].lat as f64, edge[1].lat as f64);
+            let (x0, x1) = (edge[0].lng as f64, edge[1].lng as f64);
+            if (y0 > scan && y1 > scan) || (y0 < scan && y1 < scan) || y0 == y1 { continue; }
+            if y0 == scan && y1 < scan { continue; }  // a downward edge leaves out its start
+            if y1 == scan && y0 < scan { continue; }  // an upward edge leaves out its end
+            crossings.push(if x0 == x1 { x0 } else { x0 + (scan - y0) / ((y1 - y0) / (x1 - x0)) });
         }
     }
     crossings.sort_by(|a, b| a.total_cmp(b));
-    let mut widest: Option<&[f64]> = None;
+    let mut best = (first.lat, first.lng);
+    let mut best_width = 0.0;
     for run in crossings.chunks_exact(2) {
-        if widest.is_none_or(|w| run[1] - run[0] > w[1] - w[0]) { widest = Some(run); }
+        if run[1] - run[0] > best_width {
+            best_width = run[1] - run[0];
+            best = (scan as f32, ((run[0] + run[1]) / 2.0) as f32);
+        }
     }
-    widest.map(|run| (lat as f32, ((run[0] + run[1]) / 2.0) as f32))
+    Some(best)
+}
+
+/// Whether a polygon's point on surface lies in another polygon: Nominatim's
+/// test of a boundary's centroid against the current boundary.
+pub fn point_on_surface_in(verts: &[NodeCoord], holes: u16, other: &[NodeCoord]) -> bool {
+    !other.is_empty() && point_on_surface(verts, holes).is_some_and(|(lat, lng)| point_in_polygon(lat, lng, other))
 }
 
 // --- API types ---
@@ -4155,9 +4168,9 @@ impl CurrentBoundaries {
     /// when none is yet at its rank and its centroid lies in the boundary
     /// accepted before it. A rank's boundary is the last accepted at or below
     /// it. A boundary smaller than the current one is taken to lie in it, as
-    /// nested boundaries do; a larger one is tested (`inside(boundary,
-    /// current)`), so it gates only when it is round the current one (a
-    /// suburb-linked boundary round a city-linked one), not beside it.
+    /// nested boundaries do; one as large or larger is tested (`inside(
+    /// boundary, current)`), so it gates only when it is round the current
+    /// one (a suburb-linked boundary round a city-linked one), not beside it.
     /// Simplified polygons overlap at shared borders, and testing a smaller
     /// boundary there would reject the one the point is really in.
     pub fn walk(
@@ -4170,7 +4183,7 @@ impl CurrentBoundaries {
         let mut current: Option<(u8, AdminPolygon)> = None;
         for (rank, poly) in candidates {
             if let Some((current_rank, current_poly)) = &current {
-                if *current_rank == rank || (poly.area > current_poly.area && !inside(&poly, current_poly)) { continue; }
+                if *current_rank == rank || (poly.area >= current_poly.area && !inside(&poly, current_poly)) { continue; }
             }
             current = Some((rank, poly));
             for (slot, gate) in found.0.iter_mut().zip(Self::RANKS) {
@@ -5049,6 +5062,31 @@ mod pure_helper_tests {
     }
 
     #[test]
+    fn current_boundaries_test_the_point_on_surface_of_larger_and_equal_boundaries() {
+        // A city square (rank 16) and a rank 20 boundary holding the point
+        // (1.75, 1.75): round the city, beside it, and beside it with the
+        // same area. Only the one round it has its point on surface in the
+        // city.
+        let square = |lat0: f32, lng0: f32, lat1: f32, lng1: f32| {
+            vec![nc(lat0, lng0), nc(lat0, lng1), nc(lat1, lng1), nc(lat1, lng0), nc(lat0, lng0)]
+        };
+        let verts = [
+            (2, square(0.0, 0.0, 2.0, 2.0)),
+            (11, square(-1.0, -1.0, 3.0, 3.0)),
+            (12, square(1.5, 1.5, 3.5, 9.5)),
+            (13, square(1.5, 1.5, 3.5, 3.5)),
+        ];
+        let of = |poly: &AdminPolygon| &verts.iter().find(|(id, _)| *id == poly.name_id).unwrap().1;
+        let inside = |poly: &AdminPolygon, current: &AdminPolygon| point_on_surface_in(of(poly), 0, of(current));
+        let city = AdminPolygon { area: 4.0, ..boundary(2, 8) };
+        for (id, area, gate) in [(11, 16.0, 11), (12, 16.0, 2), (13, 4.0, 2)] {
+            let other = AdminPolygon { area, ..boundary(id, 9) };
+            let found = CurrentBoundaries::walk([(16, city), (20, other)], inside);
+            assert_eq!(names(&found), [Some(gate), Some(gate), Some(gate)], "rank 20 boundary {id}");
+        }
+    }
+
+    #[test]
     fn current_boundaries_take_smaller_boundaries_as_inside() {
         // A county, then a town, each smaller than the boundary before: both
         // are accepted without testing their centroids.
@@ -5090,6 +5128,12 @@ mod pure_helper_tests {
         let v = keyhole(&outer, &[wide_hole]);
         assert_eq!(point_on_surface(&v, 1), Some((5.0, 8.0)));
         assert!(point_in_polygon(5.0, 8.0, &v));
+        // Hole latitudes choose the line too: a hole from lat 4 to 8 moves it
+        // from 5 to half-way between 4 and 8.
+        let high_hole = vec![nc(4.0, 1.0), nc(8.0, 1.0), nc(8.0, 6.0), nc(4.0, 6.0), nc(4.0, 1.0)];
+        assert_eq!(point_on_surface(&keyhole(&outer, &[high_hole]), 1), Some((6.0, 8.0)));
+        // A ring with no width gives its first vertex; no vertices, none.
+        assert_eq!(point_on_surface(&[nc(1.0, 0.0), nc(1.0, 2.0), nc(1.0, 1.0), nc(1.0, 0.0)], 0), Some((1.0, 0.0)));
         assert_eq!(point_on_surface(&[], 0), None);
     }
 
