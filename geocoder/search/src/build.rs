@@ -426,9 +426,13 @@ struct Runs {
 
 impl Runs {
     fn new(budget: usize, dir: &Path, tag: String) -> std::io::Result<Self> {
+        Self::with_arena_limit(budget, MAX_RUN_ARENA_BYTES, dir, tag)
+    }
+
+    /// `new` with at most `arena_limit` key bytes per run.
+    fn with_arena_limit(budget: usize, arena_limit: usize, dir: &Path, tag: String) -> std::io::Result<Self> {
         // Fixed capacities: a run spills when either fills, so memory never exceeds the budget.
-        let arena_cap = budget * RUN_ARENA_PERCENT / 100;
-        let items_cap = (budget - arena_cap) / std::mem::size_of::<Item>();
+        let (arena_cap, items_cap) = run_capacities(budget, arena_limit);
         Ok(Runs {
             arena: MapVec::with_capacity(arena_cap)?,
             items: MapVec::with_capacity(items_cap.max(1024))?,
@@ -478,6 +482,13 @@ impl Runs {
         self.arena.clear();
         Ok(())
     }
+}
+
+/// (key bytes, entries) one sort run of `budget` bytes holds: RUN_ARENA_PERCENT of the budget for
+/// keys, at most `arena_limit` of it, and the rest for entries.
+fn run_capacities(budget: usize, arena_limit: usize) -> (usize, usize) {
+    let arena_share = budget * RUN_ARENA_PERCENT / 100;
+    (arena_share.min(arena_limit), (budget - arena_share) / std::mem::size_of::<Item>())
 }
 
 /// Sort-run memory of each of `threads` workers sharing `mem_mb`; an error below
@@ -1164,6 +1175,34 @@ mod tests {
         let (files, _) = sut.finish().unwrap();
         let keys: Vec<Vec<u8>> = read_all(&files).into_iter().map(|(k, _)| k).collect();
         assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec(), longest]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_keys_stay_addressable_at_any_budget() {
+        // An entry addresses its key by a u32 offset into the run's arena.
+        for mem_mb in [DEFAULT_RUN_BUDGET_MB, 6_826, 6_827, 6_828, 1 << 20] {
+            let budget = run_budget(mem_mb, 1).unwrap();
+            let (arena, items) = run_capacities(budget, MAX_RUN_ARENA_BYTES);
+            assert!(arena <= u32::MAX as usize, "{mem_mb} MiB: {arena} key bytes");
+            assert_eq!(items, (budget - budget * RUN_ARENA_PERCENT / 100) / std::mem::size_of::<Item>());
+        }
+    }
+
+    #[test]
+    fn runs_spill_at_the_arena_limit() {
+        let dir = tmp_dir("runs-arena-limit");
+        let mut sut = Runs::with_arena_limit(1 << 20, 64, &dir, "t".into()).unwrap();
+        let keys: Vec<Vec<u8>> = (0..40).rev().map(|k: u32| format!("key{k:03}").into_bytes()).collect();
+        for (entity, key) in keys.iter().enumerate() {
+            sut.push(key, posting(entity as u32, 0, false, 0)).unwrap();
+        }
+        let (files, _) = sut.finish().unwrap();
+        // 6-byte keys, 10 to a 64-byte arena.
+        assert_eq!(files.len(), 4);
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(read_all(&files).into_iter().map(|(k, _)| k).collect::<Vec<_>>(), sorted);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

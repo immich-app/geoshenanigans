@@ -77,6 +77,9 @@ pub const RUN_ARENA_PERCENT: usize = 60;
 pub const MAX_KEY_BYTES: usize = u16::MAX as usize;
 /// Least sort-run memory per thread: its arena share holds a key of MAX_KEY_BYTES.
 pub const MIN_RUN_BUDGET_BYTES: usize = (MAX_KEY_BYTES * 100).div_ceil(RUN_ARENA_PERCENT);
+/// Most key bytes a sort run holds: an entry addresses its key by a u32 offset, so the arena share
+/// past 4 GiB (above 6,826 MiB of budget per thread) stays unused.
+pub const MAX_RUN_ARENA_BYTES: usize = u32::MAX as usize;
 /// Read buffer per sort run during the merge.
 pub const RUN_READ_BUFFER: usize = 64 * 1024;
 /// Sort runs merged at once; more are first merged in groups of this many into longer runs
