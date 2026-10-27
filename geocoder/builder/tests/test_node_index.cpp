@@ -10,12 +10,6 @@
 
 #include "test_framework.h"
 
-namespace {
-
-bool same(PackedLocation a, PackedLocation b) { return a.lat_e7 == b.lat_e7 && a.lon_e7 == b.lon_e7; }
-
-}  // namespace
-
 TEST(pack_location_rounds_to_nearest_e7) {
     CHECK_EQ(pack_location(-33.86882, 151.20929).lat_e7, -338688200);
     CHECK_EQ(pack_location(-33.86882, 151.20929).lon_e7, 1512092900);
@@ -35,7 +29,7 @@ TEST(sparse_node_index_round_trips_marked_ids_across_blocks) {
     idx.finalize();
     CHECK_EQ(idx.marked(), ids.size());
     for (uint64_t id : ids) idx.set(id, id * 1e-4, -(id * 1e-4));
-    for (uint64_t id : ids) CHECK(same(idx.get(id), pack_location(id * 1e-4, -(id * 1e-4))));
+    for (uint64_t id : ids) CHECK(idx.get(id) == pack_location(id * 1e-4, -(id * 1e-4)));
     CHECK_EQ(idx.unmarked_lookups(), 0u);
 }
 
@@ -53,7 +47,7 @@ TEST(sparse_node_index_unset_unmarked_and_out_of_range_ids_are_invalid) {
     idx.set(uint64_t(-7), 5.5, 6.5);
     CHECK_EQ(idx.over_capacity(), 2u);
 
-    CHECK(same(idx.get(10), pack_location(1.5, 2.5)));
+    CHECK(idx.get(10) == pack_location(1.5, 2.5));
     CHECK(!idx.get(11).valid());  // marked, never set
     CHECK_EQ(idx.unmarked_lookups(), 0u);
     CHECK(!idx.get(5000).valid());  // past capacity: not an unmarked lookup
@@ -86,7 +80,7 @@ TEST(sparse_node_index_matches_a_dense_array) {
         dense[id] = pack_location(lat, lng);
         idx.set(id, lat, lng);
     }
-    for (uint64_t id : wanted) CHECK(same(idx.get(id), dense[id]));
+    for (uint64_t id : wanted) CHECK(idx.get(id) == dense[id]);
     CHECK_EQ(idx.unmarked_lookups(), 0u);
     CHECK_EQ(idx.over_capacity(), 0u);
 }
