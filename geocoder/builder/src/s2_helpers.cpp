@@ -159,10 +159,11 @@ std::vector<std::pair<S2CellId, bool>> cover_polygon(
     std::unique_ptr<S2Polygon> polygon;
     if (rings.size() > 1) {
         // Holes nest in the outer loop (simplify_rings keeps them nesting
-        // in the plane). A polygon S2 rejects even so (rings sharing an
-        // edge, or nesting only in the plane, S2's geodesic edges bowing
-        // across) is covered by its outer loop alone, a superset the
-        // reader's ring test narrows.
+        // in the plane wherever the source rings do). A polygon S2 rejects
+        // even so (rings sharing an edge, nesting only in the plane, S2's
+        // geodesic edges bowing across, or source rings that don't nest)
+        // is covered by its outer loop alone, a superset the reader's ring
+        // test narrows.
         std::vector<std::unique_ptr<S2Loop>> loops;
         loops.emplace_back(outer->Clone());
         for (size_t r = 1; r < rings.size(); r++)

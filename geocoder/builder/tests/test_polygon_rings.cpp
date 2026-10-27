@@ -252,18 +252,31 @@ TEST(simplify_rings_keeps_the_rings_as_given_when_no_tolerance_nests_them) {
     CHECK(s.range == encode_rings(kOuter, {hole}));
 }
 
-TEST(simplify_rings_reports_rings_that_do_not_nest_even_as_given) {
-    const auto identity = [](const Ring& r, double) { return r; };
-    const SimplifiedRings s = simplify_rings(kOuter, {reversed(square(9, 2, 11, 4))}, identity);
-    CHECK_EQ(s.halvings, kKeptUnsimplified);
+TEST(simplify_rings_leaves_rings_that_do_not_nest_as_given_at_the_smallest_tolerance) {
+    // The hole crosses the outer ring as given, so no tolerance nests them.
+    // Kept as given they'd keep the outer ring's spare vertex (10, 5), which
+    // the smallest tolerance drops.
+    const Ring outer = {{0, 0}, {0, 10}, {10, 10}, {10, 5}, {10, 0}, {0, 0}};
+    const Ring hole = reversed(square(9, 2, 11, 4));
+    CHECK(dp(0.3)(outer, std::ldexp(1.0, -kToleranceHalvings)) == kOuter);
+    const SimplifiedRings s = simplify_rings(outer, {hole}, dp(0.3));
+    CHECK_EQ(s.halvings, kToleranceHalvings);
     CHECK(!s.nests);
     CHECK_EQ(s.holes, 1u);
+    CHECK(s.range == encode_rings(kOuter, {hole}));
+}
+
+TEST(hole_topology_counts_tells_retried_kept_and_not_nesting_polygons_apart) {
     HoleTopologyCounts counts;
-    counts.add(s.halvings, s.nests);
+    counts.add(kToleranceHalvings, false);
+    counts.add(kKeptUnsimplified, true);
     counts.add(2, true);
+    counts.add(2, true);
+    counts.add(kToleranceHalvings, true);
     counts.add(0, true);
     CHECK(counts.summary() ==
-          "1 polygons simplified again (tolerance/2 0, /4 1, /8 0, /16 0), 1 kept unsimplified (1 not nesting even so)");
+          "3 polygons simplified again (tolerance/2 0, /4 2, /8 0, /16 0, /32 0, /64 0, /128 0, /256 1), "
+          "1 kept unsimplified, 1 not nesting as given (at tolerance/256)");
 }
 
 TEST(rings_nest_takes_holes_inside_the_outer_ring) {

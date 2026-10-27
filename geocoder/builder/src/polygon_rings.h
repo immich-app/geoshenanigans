@@ -504,9 +504,10 @@ inline bool rings_nest(const std::vector<LatLng>& outer, const std::vector<std::
 }
 
 // simplify_rings simplifies rings that don't nest again with the tolerance
-// halved, up to this many times, before keeping them as given.
-static constexpr uint8_t kToleranceHalvings = 4;
-// SimplifiedRings::halvings when no tolerance nested the rings.
+// halved, up to this many times.
+static constexpr uint8_t kToleranceHalvings = 8;
+// SimplifiedRings::halvings when no tolerance nested the rings and they were
+// kept as given.
 static constexpr uint8_t kKeptUnsimplified = kToleranceHalvings + 1;
 
 // A polygon's keyhole range as simplify_rings made it.
@@ -516,8 +517,9 @@ struct SimplifiedRings {
     // Halvings of the tolerance it took for the simplified rings to nest, or
     // kKeptUnsimplified.
     uint8_t halvings = 0;
-    // False when even the rings as given don't nest: the source geometry's
-    // own fault, which no tolerance can repair.
+    // False when the rings don't nest as given either, so no tolerance can
+    // keep them nesting; the range then holds them at the smallest tolerance
+    // tried (halvings is kToleranceHalvings).
     bool nests = true;
 };
 
@@ -554,10 +556,14 @@ std::pair<std::vector<LatLng>, std::vector<std::vector<LatLng>>> simplified_ring
 // ring, the scale a factor on the caller's tolerance. Rings simplified on
 // their own can stop nesting (rings_nest); the polygon is then simplified
 // again from its given rings at half the tolerance, up to kToleranceHalvings
-// times, and failing that kept as given. A tolerance small enough leaves
-// every vertex the rings had, so the halvings converge on the given rings;
-// each step depends on the rings alone, so the result is deterministic.
-// Without holes the range is just the simplified outer ring.
+// times, and failing that kept as given, so the range nests whenever the
+// given rings do. Given rings that don't nest (a hole across its outer ring
+// in the source, or touching rings rounded a little apart) can't be kept
+// nesting by any tolerance: they're left at the smallest tolerance tried,
+// each ring within tolerance / 2^kToleranceHalvings of its given self,
+// rather than at full size. Each step depends on the rings alone, so the
+// result is deterministic. Without holes the range is just the simplified
+// outer ring.
 template <class Simplify>
 SimplifiedRings simplify_rings(const std::vector<LatLng>& outer, const std::vector<std::vector<LatLng>>& holes,
                                Simplify simplify) {
@@ -567,9 +573,12 @@ SimplifiedRings simplify_rings(const std::vector<LatLng>& outer, const std::vect
     auto rings = simplified_rings(outer, holes, at_scale);
     while (!rings_nest(rings.first, rings.second)) {
         if (result.halvings == kToleranceHalvings) {
-            result.halvings = kKeptUnsimplified;
-            rings = simplified_rings(outer, holes, [](const std::vector<LatLng>& ring) { return ring; });
-            result.nests = rings_nest(rings.first, rings.second);
+            auto given = simplified_rings(outer, holes, [](const std::vector<LatLng>& ring) { return ring; });
+            result.nests = rings_nest(given.first, given.second);
+            if (result.nests) {
+                result.halvings = kKeptUnsimplified;
+                rings = std::move(given);
+            }
             break;
         }
         result.halvings++;
@@ -597,22 +606,19 @@ SimplifiedRings simplify_rings(const std::vector<LatLng>& outer, const std::vect
 struct HoleTopologyCounts {
     uint64_t halved[kToleranceHalvings + 1] = {};  // [k]: nested after k halvings, k > 0
     uint64_t unsimplified = 0;                      // kept as given
-    uint64_t not_nesting = 0;                       // of those, not nesting as given either
+    uint64_t not_nesting = 0;                       // not nesting as given either
 
     void add(uint8_t halvings, bool nests) {
-        if (halvings == kKeptUnsimplified) {
+        if (!nests) {
+            not_nesting++;
+        } else if (halvings == kKeptUnsimplified) {
             unsimplified++;
-            not_nesting += !nests;
         } else if (halvings > 0) {
             halved[halvings]++;
         }
     }
-    void add(const HoleTopologyCounts& o) {
-        for (size_t k = 0; k <= kToleranceHalvings; k++) halved[k] += o.halved[k];
-        unsimplified += o.unsimplified;
-        not_nesting += o.not_nesting;
-    }
-    // "<n> simplified again (tolerance/2 a, /4 b, ...), <m> kept unsimplified (<k> not nesting even so)"
+    // "<n> polygons simplified again (tolerance/2 a, /4 b, ...), <m> kept unsimplified, <k> not nesting as
+    // given (at tolerance/<2^kToleranceHalvings>)"
     std::string summary() const {
         uint64_t again = 0;
         std::string by_halving;
@@ -621,7 +627,7 @@ struct HoleTopologyCounts {
             by_halving += (k == 1 ? "tolerance/" : ", /") + std::to_string(1u << k) + " " + std::to_string(halved[k]);
         }
         return std::to_string(again) + " polygons simplified again (" + by_halving + "), " +
-               std::to_string(unsimplified) + " kept unsimplified (" + std::to_string(not_nesting) +
-               " not nesting even so)";
+               std::to_string(unsimplified) + " kept unsimplified, " + std::to_string(not_nesting) +
+               " not nesting as given (at tolerance/" + std::to_string(1u << kToleranceHalvings) + ")";
     }
 };
