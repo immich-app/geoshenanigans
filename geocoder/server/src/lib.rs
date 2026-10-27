@@ -2013,7 +2013,9 @@ impl Index {
     // gated by the most specific boundary of rank <= R, whatever its
     // admin_level: on a Vatican point that is the Vatican itself, which keeps
     // Rome's neighbourhood nodes out. The smallest containing polygon stands
-    // in for the most specific accepted boundary.
+    // in for the most specific accepted boundary. The rank is placex's
+    // rank_address, after the nested-boundary promotions (CurrentBoundaries::
+    // from_ranked).
     pub fn find_current_boundaries(&self, lat: f64, lng: f64, country_code: Option<[u8; 2]>) -> CurrentBoundaries {
         let cc: String = country_code
             .map(|c| c.iter().map(|b| b.to_ascii_uppercase() as char).collect())
@@ -2021,26 +2023,36 @@ impl Index {
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
 
-        // (area, id, rank_address, polygon) of every boundary near the point.
-        let mut candidates: Vec<(f32, u32, u8, AdminPolygon)> = Vec::new();
+        // (area, id, polygon) of every boundary and place area near the point.
+        let mut boundaries: Vec<(f32, u32, AdminPolygon)> = Vec::new();
+        let mut place_areas: Vec<(f32, u32, AdminPolygon)> = Vec::new();
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
             Self::for_each_entry_fb(&self.admin_entries, Self::lookup_admin_cell_fb(&self.admin_cells, c), |id| {
                 let poly_id = id & ID_MASK;
                 let Some(poly) = self.admin_polygon(poly_id) else { return; };
-                if poly.admin_level < 2 || poly.admin_level > 10 || poly.area <= 0.0 { return; }
-                // ISO-less level-2 polygons are maritime lines, not countries.
-                if poly.admin_level == 2 && poly.country_code == 0 { return; }
-                let rank = self.admin_config.to_rank(&cc, poly.admin_level)
-                    .max(place_type_to_rank(poly.place_type_override));
-                if rank == 0 || rank == 5 || rank == 11 { return; }
-                candidates.push((poly.area, poly_id, rank, poly));
+                if poly.area <= 0.0 { return; }
+                match poly.admin_level {
+                    // ISO-less level-2 polygons are maritime lines, not countries.
+                    2 if poly.country_code == 0 => {}
+                    2..=10 => boundaries.push((poly.area, poly_id, poly)),
+                    15 if poly.place_type_override != 0 => place_areas.push((poly.area, poly_id, poly)),
+                    _ => {}
+                }
             });
         }
-        candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-        candidates.dedup_by_key(|c| c.1);
-        CurrentBoundaries::pick(candidates.into_iter().map(|(_, _, rank, poly)| (rank, poly)), |poly| {
+        let holds = |poly: &AdminPolygon| {
             self.admin_verts(poly).is_some_and(|verts| point_in_polygon(lat as f32, lng as f32, &verts))
-        })
+        };
+        let holding = |mut polys: Vec<(f32, u32, AdminPolygon)>| -> Vec<AdminPolygon> {
+            polys.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            polys.dedup_by_key(|p| p.1);
+            polys.into_iter().map(|(_, _, poly)| poly).filter(|poly| holds(poly)).collect()
+        };
+        let ranked: Vec<RankedPoly> = holding(boundaries).into_iter()
+            .map(|poly| RankedPoly { poly, rank_address: self.admin_config.to_rank(&cc, poly.admin_level) })
+            .filter(|r| r.rank_address != 0 || r.poly.place_type_override != 0)
+            .collect();
+        CurrentBoundaries::from_ranked(ranked, holding(place_areas).iter())
     }
 
     // Smallest containing admin polygon at "municipality rank" — the
@@ -4024,14 +4036,25 @@ impl CurrentBoundaries {
         Self::RANKS.iter().position(|&r| r == rank).and_then(|g| self.0[g].as_ref())
     }
 
-    /// Each rank's boundary from (rank_address, polygon) candidates, most
-    /// specific first: the first of rank <= it that `contains` the point.
-    /// `contains` runs only on candidates that could still fill a rank.
-    pub fn pick(candidates: impl IntoIterator<Item = (u8, AdminPolygon)>, mut contains: impl FnMut(&AdminPolygon) -> bool) -> Self {
+    /// Each rank's boundary from the boundaries holding the point at their
+    /// initial rank_address and the place areas holding it: the nested-
+    /// boundary promotions give each its rank_address (an admin_level 7
+    /// boundary in a level 6 one linked to a suburb is ranked 22, not 14),
+    /// then `pick` takes the smallest of rank <= each rank.
+    pub fn from_ranked<'a>(mut ranked: Vec<RankedPoly>, place_areas: impl Iterator<Item = &'a AdminPolygon> + Clone) -> Self {
+        promote_nested_ranks(&mut ranked, place_areas);
+        ranked.sort_by(|a, b| a.poly.area.total_cmp(&b.poly.area));
+        let gating = ranked.into_iter().filter(|r| !matches!(r.rank_address, 0 | 5 | 11));
+        Self::pick(gating.map(|r| (r.rank_address, r.poly)))
+    }
+
+    /// Each rank's boundary from (rank_address, polygon) candidates holding
+    /// the point, most specific first: the first of rank <= it.
+    pub fn pick(candidates: impl IntoIterator<Item = (u8, AdminPolygon)>) -> Self {
         let mut found = Self::default();
         for (rank, poly) in candidates {
             let open: [bool; 3] = std::array::from_fn(|g| found.0[g].is_none() && rank <= Self::RANKS[g]);
-            if !open.contains(&true) || !contains(&poly) { continue; }
+            if !open.contains(&true) { continue; }
             for (slot, _) in found.0.iter_mut().zip(open).filter(|(_, open)| *open) { *slot = Some(poly); }
             if found.0.iter().all(Option::is_some) { break; }
         }
@@ -4787,8 +4810,7 @@ mod pure_helper_tests {
     fn current_boundaries_fall_back_to_the_country() {
         // A Vatican point: Rome's boundaries are near but leave it out; the
         // country holds it and gates every place rank.
-        let candidates = [(16, boundary(1, 8)), (12, boundary(2, 6)), (4, boundary(3, 2))];
-        let found = CurrentBoundaries::pick(candidates, |p| p.name_id == 3);
+        let found = CurrentBoundaries::pick([(4, boundary(3, 2))]);
         assert_eq!(names(&found), [Some(3), Some(3), Some(3)]);
     }
 
@@ -4797,18 +4819,43 @@ mod pure_helper_tests {
         // Spain's admin_level 10 ranks 22: it gates quarters and
         // neighbourhoods, while suburbs see the municipality around it.
         let candidates = [(22, boundary(1, 10)), (16, boundary(2, 8)), (4, boundary(3, 2))];
-        let mut tested = Vec::new();
-        let found = CurrentBoundaries::pick(candidates, |p| {
-            tested.push(p.name_id);
-            true
-        });
+        let found = CurrentBoundaries::pick(candidates);
         assert_eq!(names(&found), [Some(2), Some(1), Some(1)]);
-        assert_eq!(tested, [1, 2]); // the country is never tested
+    }
+
+    #[test]
+    fn current_boundaries_rank_boundaries_by_their_promoted_rank() {
+        // An admin_level 6 boundary linked to a suburb has rank 20, so its
+        // level 7 child is promoted from 14 to 22: suburb nodes are gated by
+        // the level 6 boundary, quarters and neighbourhoods by the child.
+        let suburb = AdminPolygon { area: 10.0, place_type_override: 4, ..boundary(1, 6) };
+        let child = AdminPolygon { area: 1.0, ..boundary(2, 7) };
+        let country = AdminPolygon { area: 1000.0, ..boundary(3, 2) };
+        let ranked = vec![
+            RankedPoly { poly: child, rank_address: 14 },
+            RankedPoly { poly: suburb, rank_address: 12 },
+            RankedPoly { poly: country, rank_address: 4 },
+        ];
+        let found = CurrentBoundaries::from_ranked(ranked, [].iter());
+        assert_eq!(names(&found), [Some(1), Some(2), Some(2)]);
+    }
+
+    #[test]
+    fn current_boundaries_rank_boundaries_inside_a_place_area() {
+        // Starehe (admin_level 6, rank 12) inside Nairobi's place=city area
+        // ranks 18, after the city's 16: it gates suburbs, quarters and
+        // neighbourhoods.
+        let starehe = AdminPolygon { area: 10.0, ..boundary(1, 6) };
+        let country = AdminPolygon { area: 1000.0, ..boundary(2, 2) };
+        let nairobi = AdminPolygon { area: 100.0, place_type_override: 1, ..boundary(3, 15) };
+        let ranked = vec![RankedPoly { poly: starehe, rank_address: 12 }, RankedPoly { poly: country, rank_address: 4 }];
+        let found = CurrentBoundaries::from_ranked(ranked, [nairobi].iter());
+        assert_eq!(names(&found), [Some(1), Some(1), Some(1)]);
     }
 
     #[test]
     fn current_boundaries_are_empty_without_a_containing_boundary() {
-        let found = CurrentBoundaries::pick([(16, boundary(1, 8))], |_| false);
+        let found = CurrentBoundaries::pick([]);
         assert_eq!(names(&found), [None, None, None]);
         assert!(found.for_rank(CurrentBoundaries::SUBURB).is_none());
     }
