@@ -283,6 +283,30 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as scratch:
             errors.append(f'alias ({case}): an output that is a current file was not refused: rc={r.returncode} {err[-300:]}')
         if {p.name: p.read_bytes() for p in (root / cur).iterdir()} != before:
             errors.append(f'alias ({case}): the current set changed')
+    # The same with a current dir the patcher's user can't list (execute only; the patcher runs as
+    # nobody when this runs as root): it can't tell which files an output may be, so it fails first.
+    os.chmod(root, 0o777)
+    cur, out = root / 'xonly.cur', root / 'xonly.out'
+    cur.mkdir()
+    out.mkdir()
+    for f in ('way_parents.bin', 'meta.json'):
+        (cur / f).write_bytes((root / 'wp.a' / f).read_bytes())
+    os.link(cur / 'meta.json', out / 'meta.json')
+    if os.geteuid() == 0:
+        for p in (cur, out, cur / 'way_parents.bin', cur / 'meta.json'):
+            os.chown(p, 65534, 65534)
+    before = {p.name: p.read_bytes() for p in cur.iterdir()}
+    cur.chmod(0o111)
+    try:
+        r = run([PATCHER, str(cur), str(root / 'wp.gcpatch'), '-o', str(out), '--only', 'meta.json'], preexec_fn=unprivileged,
+                env=dict(ENV, TMPDIR=str(root)))
+    finally:
+        cur.chmod(0o755)
+    err = r.stderr.decode()
+    if r.returncode == 0 or 'Cannot list the current dir' not in err:
+        errors.append(f'alias (unlistable current dir): not refused: rc={r.returncode} {err[-300:]}')
+    if {p.name: p.read_bytes() for p in cur.iterdir()} != before:
+        errors.append('alias (unlistable current dir): the current set changed')
 
     # A MATCH run longer than what is left of the old file is refused before any of it is written (the
     # replay stopped at the old file's end and went on as if the run was whole, and a FIFO output has

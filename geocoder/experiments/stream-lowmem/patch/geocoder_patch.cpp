@@ -393,15 +393,21 @@ static uint64_t child_bytes_of(uint32_t fid, const char* rec, JointChild& jc) {
 // The current set's files by identity (device and inode, symlinks followed). Outputs are truncated
 // while these are still read as the patch base, so an output that is one of them (a hard link or a
 // symlink to it, as a staged apply's existing output may be) is refused before it is truncated.
-// (A current dir that doesn't exist has no files.)
+// A current dir that can't be listed, or a file in it that can't be looked at, fails the run: it
+// could hide the file an output is. (One that doesn't exist has no files.)
 struct CurrentFiles {
     std::map<std::pair<dev_t, ino_t>, std::string> names;
     explicit CurrentFiles(const std::string& dir) {
         std::error_code ec;
-        for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        std::filesystem::directory_iterator it(dir, ec), end;
+        if (ec == std::errc::no_such_file_or_directory) return;
+        for (; !ec && it != end; it.increment(ec)) {
             struct stat st;
             if (stat(it->path().c_str(), &st) == 0) names[{st.st_dev, st.st_ino}] = it->path().filename().string();
+            else if (errno != ENOENT)  // (a dangling symlink is no file)
+                throw std::runtime_error("Cannot stat " + it->path().string() + ": " + std::strerror(errno));
         }
+        if (ec) throw std::runtime_error("Cannot list the current dir " + dir + ": " + ec.message());
     }
     void require_not(const std::string& path) const {
         struct stat st;
