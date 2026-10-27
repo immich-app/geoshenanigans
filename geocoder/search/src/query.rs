@@ -660,6 +660,16 @@ mod tests {
     }
 
     #[test]
+    fn korean_queries_allow_no_edits() {
+        // 서울특별시 is 13 Jamo once normalized: long enough for two edits in a Latin script.
+        let q = normalize("서울특별시");
+        assert_eq!(q.chars().count(), 13);
+        for (no_typo, one_typo) in [(EXACT_NO_TYPO_MAX_CHARS, EXACT_ONE_TYPO_MAX_CHARS), (PREFIX_NO_TYPO_MAX_CHARS, PREFIX_ONE_TYPO_MAX_CHARS)] {
+            assert_eq!(allowed_edits(q.chars().count(), no_typo, one_typo, is_ideographic(&q)), 0);
+        }
+    }
+
+    #[test]
     fn codes_match_whole_words_only() {
         let words = vec!["tx".to_string()];
         let c = Context { words: &words, phrase: "tx".into() };
