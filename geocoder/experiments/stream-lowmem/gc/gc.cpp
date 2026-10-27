@@ -141,6 +141,9 @@ int main(int argc, char** argv) {
             manifest_out = argv[++i];
         } else usage();
     }
+    // An encoded dir's families have no today's-format files left to encode: its encoded files would
+    // be linked across and its gc.manifest replaced by one that names none of them.
+    if (encode && exists(src + "/gc.manifest")) die("SRC_DIR %s is already encoded (it has a gc.manifest)", src.c_str());
     if (mkdir(out.c_str(), 0755) && errno != EEXIST) die("mkdir %s: %s", out.c_str(), strerror(errno));
     struct stat source_stat{}, output_stat{};
     if (stat(src.c_str(), &source_stat)) die("stat %s: %s", src.c_str(), strerror(errno));
