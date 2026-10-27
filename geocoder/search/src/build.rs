@@ -905,6 +905,15 @@ pub struct KeyRuns {
     t_keys: Duration,
 }
 
+impl Drop for KeyRuns {
+    /// Removes the runs no merge took: a failed build leaves none of a sub-index it never merged.
+    fn drop(&mut self) {
+        for f in &self.files {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+}
+
 /// Key phase of one sub-index: its entities' normalized keys, sorted in bounded runs spilled to
 /// `opts.tmp` (places also writes `places.bnd` to `out`).
 pub fn sort_keys(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<KeyRuns, String> {
@@ -985,10 +994,11 @@ pub fn sort_keys(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Resul
 }
 
 /// Merge phase of one sub-index: its runs -> `<name>.fst`, `.post`, `.pfx.fst` and `.pfx` in `out`.
-pub fn merge(runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, String> {
+pub fn merge(mut runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, String> {
     let t0 = Instant::now();
-    let KeyRuns { name, files, mut st, ents, entries, spilled, t_src, t_keys } = runs;
-    let name = name.as_str();
+    let (files, mut st) = (std::mem::take(&mut runs.files), std::mem::take(&mut runs.st));
+    let (ents, entries, spilled, t_src, t_keys) = (runs.ents, runs.entries, runs.spilled, runs.t_src, runs.t_keys);
+    let name = runs.name.as_str();
     let n_runs = files.len();
     let (files, rewritten) = reduce_runs(files, &opts.tmp, name).map_err(|e| e.to_string())?;
     let mk = |ext: &str| File::create(out.join(format!("{name}.{ext}"))).map_err(|e| e.to_string());
@@ -1843,6 +1853,36 @@ mod tests {
         let idx = SearchIndex::open(&geo, &out, None, None).unwrap();
         let (found, _) = Searcher::new(&idx).search("Testburg", 5);
         assert_eq!(found.iter().map(|f| f.hit.entity).collect::<Vec<_>>(), [0]);
+    }
+
+    #[test]
+    fn a_failed_build_leaves_no_sort_runs_behind() {
+        use crate::fixture::{Geo, TempDir};
+        let mut g = Geo::default();
+        g.boundary("Testville", 8, [10.0, 20.0, 10.2, 20.2]);
+        g.place("Testburg", 1, 10.1, 20.1);
+        g.poi("Test Hall", 10.05, 20.05, 0);
+        let dir = TempDir::new("failed-runs");
+        let geo = g.load(&dir.0.join("geo"));
+        let out = dir.0.join("idx");
+        // The places keys are sorted into runs before the POI build fails on an importance file
+        // of the wrong size.
+        let imp = dir.0.join("imp");
+        std::fs::create_dir_all(&imp).unwrap();
+        for (file, n) in [("imp_places.u8", 1), ("imp_polys.u8", 1), ("imp_poi.u8", 2)] {
+            std::fs::write(imp.join(file), vec![200u8; n]).unwrap();
+        }
+        let opts = BuildOpts {
+            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: out.join("tmp"), inline: true, extras: None,
+            imp_dir: Some(imp.to_str().unwrap().into()), area_proxy: false, poi_max_tier: 3,
+        };
+
+        let err = build_all(&geo, &["places", "poi"], &out, &opts, || Ok(serde_json::json!({}))).err();
+
+        assert!(err.as_deref().is_some_and(|e| e.contains("imp_poi.u8")), "{err:?}");
+        let left: Vec<_> = std::fs::read_dir(&opts.tmp).into_iter().flatten().map(|e| e.unwrap().file_name()).collect();
+        assert!(left.is_empty(), "left in the temp directory: {left:?}");
+        assert!(!opts.tmp.exists());
     }
 
     #[test]
