@@ -4,6 +4,7 @@
 //! geocoding. Built from the installed files (or shipped), memory-mapped at query time.
 pub mod build;
 pub mod constants;
+pub mod dataset;
 pub mod entities;
 pub mod extras;
 #[cfg(test)]

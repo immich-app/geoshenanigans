@@ -1,13 +1,15 @@
 //! place-search build <set dir> <index dir> [--sub places|poi|all] [--threads N] [--mem-mb M]
 //!                    [--tmp DIR] [--no-inline] [--extras extra_names.bin] [--imp DIR] [--area-proxy]
 //!                    [--poi-max-tier 1|2|3]
+//!   search_meta.json records the set's files (dataset.rs): the index belongs to that set alone,
+//!   so --sub builds only over an index of the same files
 //! place-search pack-extras <extra_names.tsv> <extra_names.bin>
 //! place-search query <set dir> <index dir> [--extras F] [--iso F] [--limit N]
 //!                    [--bench REPEATS [--no-warmup]]
 //!   one query per stdin line; default one JSON line per query, --bench latency percentiles
 //! place-search ctxbench <set dir> <index dir> < "lat lng" lines   (reverse-lookup cost per point)
-use place_search::build::{build_all, held_subs, index_meta, BuildOpts};
-use place_search::constants::{META_FILE, SUB_INDEXES};
+use place_search::build::{build_all, held_subs, BuildOpts};
+use place_search::constants::SUB_INDEXES;
 use place_search::reader::SearchIndex;
 use place_search::query::Searcher;
 use query_server::{Index, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL};
@@ -72,20 +74,7 @@ fn cmd_build(args: &[String]) {
         ..base
     };
     let subs = held_subs(&geo, selected);
-    let mut replacing = subs.clone();
-    if geo.poi_records.is_none() { replacing.push("poi"); }
-    let meta = || {
-        place_search::build::check_retained_names(&out, &replacing, opts.extras.is_some())?;
-        // Merged into the one there, so sub-indexes can be built one at a time.
-        let mut meta: serde_json::Value = std::fs::read_to_string(out.join(META_FILE))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_else(|| json!({}));
-        for (k, v) in index_meta(&geo, &opts) {
-            meta[k] = v;
-        }
-        Ok(meta)
-    };
+    let meta = || place_search::dataset::merged_meta(&geo, &opts, Path::new(set), &out, &subs);
     let stats = build_all(&geo, &subs, &out, &opts, meta).unwrap_or_else(|e| panic!("{e}"));
     for (s, st) in &stats {
         for (k, v) in &st.lines {

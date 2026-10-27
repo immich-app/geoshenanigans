@@ -1144,12 +1144,18 @@ pub fn index_meta(geo: &Index, opts: &BuildOpts) -> serde_json::Map<String, serd
 /// with each one's stats becoming its search_meta.json. Every file is written into a staging
 /// directory and moved into `out` only once all of them are complete, search_meta.json last
 /// (`publish`): a failed build or move leaves `out` as it was. The build holds `out` from before
-/// `meta` runs until it has cleaned up (`lock_index_dir`). Returns the stats; an error, before
-/// anything is built, while another build holds `out`, when `meta` fails, or while files a failed
-/// publish could not put back are still aside.
+/// `meta` runs until it has cleaned up (`HeldIndexDir`). Returns the stats; an error, before
+/// anything is built, while another build or an open holds `out`, when `meta` fails, or while
+/// files a failed publish could not put back are still aside.
 pub fn build_all(geo: &Index, subs: &[&str], out: &Path, opts: &BuildOpts,
                  meta: impl FnOnce() -> Result<serde_json::Value, String>) -> Result<Vec<(String, Stats)>, String> {
-    let _held = lock_index_dir(out)?;
+    build_held(geo, subs, &HeldIndexDir::take(out, Contended::Fail)?, opts, meta)
+}
+
+/// `build_all` into an index directory already held.
+pub fn build_held(geo: &Index, subs: &[&str], out: &HeldIndexDir, opts: &BuildOpts,
+                  meta: impl FnOnce() -> Result<serde_json::Value, String>) -> Result<Vec<(String, Stats)>, String> {
+    let out = out.path.as_path();
     let meta = meta()?;
     let stage = out.join(BUILD_STAGE_DIR);
     if holds_replaced(&stage) {
@@ -1166,17 +1172,37 @@ pub fn build_all(geo: &Index, subs: &[&str], out: &Path, opts: &BuildOpts,
     built
 }
 
-/// An exclusive lock on the directory `out` itself (no lock file is left in the index), held
-/// until the returned handle is dropped or the process exits. Every build takes it, so builds
-/// into one index directory never share its search_meta.json, staging or temp directories. An
-/// error, at once, while another build holds it.
-fn lock_index_dir(out: &Path) -> Result<File, String> {
-    std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
-    let dir = File::open(out).map_err(|e| format!("{}: {e}", out.display()))?;
-    match dir.try_lock() {
-        Ok(()) => Ok(dir),
-        Err(std::fs::TryLockError::WouldBlock) => Err(format!("{}: another build is using this index directory", out.display())),
-        Err(std::fs::TryLockError::Error(e)) => Err(format!("lock {}: {e}", out.display())),
+/// What taking an index directory does while another holder has it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Contended {
+    /// Fails at once.
+    Fail,
+    /// Waits until it is released.
+    Wait,
+}
+
+/// An index directory held: an exclusive lock on the directory itself (no lock file is left in
+/// the index), released when dropped or when the process exits. Every build takes it, and
+/// `dataset::open` through its open, so builds into one index directory never share its
+/// search_meta.json, staging or temp directories, and no open reads or clears files a build
+/// is writing.
+pub struct HeldIndexDir {
+    path: PathBuf,
+    _lock: File,
+}
+
+impl HeldIndexDir {
+    pub fn take(path: &Path, contended: Contended) -> Result<HeldIndexDir, String> {
+        std::fs::create_dir_all(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let dir = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        match contended {
+            Contended::Fail => dir.try_lock().map_err(|e| match e {
+                std::fs::TryLockError::WouldBlock => format!("{}: another build or open is using this index directory", path.display()),
+                std::fs::TryLockError::Error(e) => format!("lock {}: {e}", path.display()),
+            }),
+            Contended::Wait => dir.lock().map_err(|e| format!("lock {}: {e}", path.display())),
+        }?;
+        Ok(HeldIndexDir { path: path.to_path_buf(), _lock: dir })
     }
 }
 

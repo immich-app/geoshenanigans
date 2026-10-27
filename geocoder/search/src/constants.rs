@@ -66,10 +66,16 @@ pub const BOUNDARY_MIN_LEVEL: u8 = 2;
 pub const BOUNDARY_MAX_LEVEL: u8 = 8;
 
 // ---- files
-/// What an index was built from (options, sub-index stats); written last.
+/// What an index was built from (options, sub-index stats, the dataset's file hashes); written last.
 pub const META_FILE: &str = "search_meta.json";
+/// The META_FILE field that holds the dataset's file hashes (dataset.rs).
+pub const META_DATASET_KEY: &str = "dataset";
 /// The sub-indexes an index can hold, in build order.
 pub const SUB_INDEXES: &[&str] = &["places", "poi"];
+/// Hashes of the dataset files beside an index, with the stat each was taken at (not shipped).
+pub const HASH_CACHE_FILE: &str = "dataset_hashes.json";
+/// Read buffer for hashing a dataset file.
+pub const HASH_READ_BUFFER: usize = 256 * 1024;
 
 // ---- build
 /// Default memory for sort runs (all threads together). At 16 the build fits a 32 MiB cgroup for

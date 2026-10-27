@@ -155,12 +155,19 @@ impl Geo {
         files
     }
 
-    /// Writes the files into `dir` and loads them.
-    pub fn load(&self, dir: &Path) -> Index {
+    /// Writes the files into `dir` the way a patch replaces one: a new file renamed over it.
+    pub fn write(&self, dir: &Path) {
         std::fs::create_dir_all(dir).unwrap();
         for (name, bytes) in self.files() {
-            std::fs::write(dir.join(name), bytes).unwrap();
+            let new = dir.join(format!("{name}.new"));
+            std::fs::write(&new, bytes).unwrap();
+            std::fs::rename(&new, dir.join(name)).unwrap();
         }
+    }
+
+    /// Writes the files into `dir` and loads them.
+    pub fn load(&self, dir: &Path) -> Index {
+        self.write(dir);
         Index::load(dir.to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE)
             .unwrap()
     }

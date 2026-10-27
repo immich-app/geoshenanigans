@@ -1331,6 +1331,7 @@ dependencies = [
  "memmap2",
  "query-server",
  "serde_json",
+ "sha2",
  "unicode-normalization",
 ]
 
