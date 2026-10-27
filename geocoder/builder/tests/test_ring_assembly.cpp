@@ -270,19 +270,33 @@ TEST(area_rings_fail_on_an_open_ring) {
     CHECK(a.failure == AreaFailure::OpenRing);
 }
 
-// A way listed twice cancels out, as osmium drops duplicate segments in
-// pairs: two squares sharing a side, with the shared side in the relation
-// twice, are one rectangle.
+// A way listed twice cancels out, as in osm2pgsql, which gives osmium the
+// way once for each member listing it, so its segments are duplicates
+// dropped in pairs. Two squares sharing a side, with the shared side in the
+// relation twice (or two ways mapped on it), are one rectangle; a closed way
+// listed twice leaves no ring, and half an outline listed twice leaves the
+// other half open.
 TEST(area_rings_cancel_ways_listed_twice) {
     WayGeometries geoms;
     add_way(geoms, 1, {{0.0, 1.0}, {0.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}});
     add_way(geoms, 2, {{0.0, 1.0}, {0.0, 2.0}, {1.0, 2.0}, {1.0, 1.0}});
     add_way(geoms, 3, {{0.0, 1.0}, {1.0, 1.0}});
-    const std::vector<std::pair<int64_t, std::string>> members = {{1, "outer"}, {3, "outer"}, {2, "outer"}, {3, "outer"}};
-    const AreaRings a = assemble_area_rings(members, geoms);
-    REQUIRE(a.rings.size() == size_t(1));
-    CHECK_EQ(a.rings[0].size(), size_t(7));
-    CHECK_EQ(a.cancelled_sub_ways, 2u);
+    add_way(geoms, 4, {{1.0, 1.0}, {0.0, 1.0}});
+    add_way(geoms, 5, {{5.0, 5.0}, {5.0, 6.0}, {6.0, 6.0}, {6.0, 5.0}, {5.0, 5.0}});
+    using Members = std::vector<std::pair<int64_t, std::string>>;
+    for (const Members& members : {Members{{1, "outer"}, {3, "outer"}, {2, "outer"}, {3, "outer"}},
+                                   Members{{1, "outer"}, {3, "outer"}, {2, "outer"}, {4, "outer"}}}) {
+        const AreaRings a = assemble_area_rings(members, geoms);
+        REQUIRE(a.rings.size() == size_t(1));
+        CHECK_EQ(a.rings[0].size(), size_t(7));
+        CHECK_EQ(a.cancelled_sub_ways, 2u);
+    }
+    const AreaRings square = assemble_area_rings({{5, "outer"}, {5, "outer"}}, geoms);
+    CHECK(square.failure == AreaFailure::None);
+    CHECK(square.rings.empty());
+    const AreaRings half = assemble_area_rings({{1, "outer"}, {2, "outer"}, {1, "outer"}}, geoms);
+    CHECK(half.rings.empty());
+    CHECK(half.failure == AreaFailure::OpenRing);
 }
 
 // Crossing segments fail the area too, whether in one ring (stitched or a
@@ -296,6 +310,26 @@ TEST(area_rings_fail_when_segments_cross) {
     add_way(geoms, 5, {{11.0, 11.0}, {11.0, 13.0}, {13.0, 13.0}, {13.0, 11.0}, {11.0, 11.0}});
     for (const auto& members : std::vector<std::vector<std::pair<int64_t, std::string>>>{
              {{1, "outer"}, {2, "outer"}}, {{3, "outer"}}, {{4, "outer"}, {5, "outer"}}}) {
+        const AreaRings a = assemble_area_rings(members, geoms);
+        CHECK(a.rings.empty());
+        CHECK(a.failure == AreaFailure::Crossing);
+    }
+}
+
+// osmium counts two segments as intersecting wherever they meet but at an
+// end both have (calculate_intersection), and builds no area then: an
+// enclave whose corner lies on the outline between two of its nodes, two
+// outlines in line along part of a side with no node in common there, and an
+// outline doubling back on itself in line.
+TEST(area_rings_fail_when_segments_meet_between_nodes) {
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {0.0, 10.0}, {10.0, 10.0}, {10.0, 0.0}, {0.0, 0.0}});
+    add_way(geoms, 2, {{5.0, 0.0}, {7.0, 3.0}, {3.0, 3.0}, {5.0, 0.0}});
+    add_way(geoms, 3, {{10.0, 2.0}, {10.0, 6.0}, {14.0, 6.0}, {14.0, 2.0}, {10.0, 2.0}});
+    add_way(geoms, 4, {{20.0, 20.0}, {20.0, 22.0}, {20.0, 21.0}, {20.0, 20.0}});
+    using Members = std::vector<std::pair<int64_t, std::string>>;
+    for (const Members& members : {Members{{1, "outer"}, {2, "inner"}}, Members{{1, "outer"}, {3, "outer"}},
+                                   Members{{4, "outer"}}}) {
         const AreaRings a = assemble_area_rings(members, geoms);
         CHECK(a.rings.empty());
         CHECK(a.failure == AreaFailure::Crossing);
@@ -431,4 +465,28 @@ TEST(area_rings_rings_touching_at_a_node_stay_as_they_are) {
         CHECK_EQ(polygons_holding(polygons, 3.0, 5.0), 0);
         CHECK_EQ(polygons_holding(polygons, 8.0, 8.0), 1);
     }
+}
+
+// A node listed twice in a row (or two nodes at one location) makes no
+// segment in osmium, so its coordinate is no place where rings touch: an
+// outline repeating each of its 160 coordinates is one ring, not 160
+// touching coordinates past osmium's limit of 100.
+TEST(area_rings_drop_coordinates_repeated_in_a_row) {
+    std::vector<Coord> outline;
+    for (int i = 0; i < 40; i++) outline.push_back({0.0, double(i)});
+    for (int i = 0; i < 40; i++) outline.push_back({double(i), 40.0});
+    for (int i = 40; i > 0; i--) outline.push_back({40.0, double(i)});
+    for (int i = 40; i > 0; i--) outline.push_back({double(i), 0.0});
+    std::vector<Coord> repeated;
+    for (const Coord& c : outline) repeated.insert(repeated.end(), {c, c});
+    repeated.push_back(outline.front());
+    WayGeometries geoms;
+    add_way(geoms, 1, repeated);
+    const AreaRings a = assemble_area_rings({{1, "outer"}}, geoms);
+    CHECK(a.failure == AreaFailure::None);
+    REQUIRE(a.rings.size() == size_t(1));
+    CHECK_EQ(a.rings[0].size(), outline.size() + 1);
+    const std::vector<NestedPolygon> polygons = nested(a);
+    CHECK_EQ(polygons_holding(polygons, 20.0, 20.0), 1);
+    CHECK_EQ(polygons_holding(polygons, 50.0, 50.0), 0);
 }
