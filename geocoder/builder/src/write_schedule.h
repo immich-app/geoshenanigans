@@ -53,7 +53,8 @@ inline KindValues record_bytes(const ParsedData& d) {
     for (const auto& tier : d.strings_tiers) strings += tier.size();
     at(b, RecordKind::Admins) = vector_bytes(d.admin_polygons) + vector_bytes(d.admin_osm_ids)
         + vector_bytes(d.admin_sidecar_blob) + vector_bytes(d.admin_parent_ids) + vector_bytes(d.admin_vertices)
-        + map_bytes_approx(d.cell_to_admin) + map_bytes_approx(d.postcode_accum) + strings;
+        + map_bytes_approx(d.cell_to_admin) + vector_bytes(d.admin_index_cells)
+        + vector_bytes(d.admin_minimal_index_cells) + map_bytes_approx(d.postcode_accum) + strings;
     for (const auto& [cell, ids] : d.cell_to_admin) at(b, RecordKind::Admins) += vector_bytes(ids);
     return b;
 }

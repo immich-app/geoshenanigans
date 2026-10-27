@@ -78,6 +78,7 @@ add_executable(build-index
     src/build_index.cpp
     src/pbf_reader.cpp
     src/s2_helpers.cpp
+    src/admin_cover.cpp
     src/ring_assembly.cpp
     src/continent_filter.cpp
     src/continent_boundaries.cpp
@@ -174,6 +175,7 @@ file(GLOB GEOCODER_S2_TEST_SRCS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/t
 add_executable(geocoder-s2-tests
     tests/test_main.cpp
     ${GEOCODER_S2_TEST_SRCS}
+    src/admin_cover.cpp
     src/cell_index.cpp
     src/s2_helpers.cpp
 )

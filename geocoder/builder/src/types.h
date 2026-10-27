@@ -187,6 +187,19 @@ static constexpr size_t MAX_SUBWAYS_FOR_RETRY   = 30;     // only retry small re
 static constexpr uint32_t MAX_TOUCHING_LOCATIONS = 100;   // osmium BasicAssembler::max_split_locations
 static constexpr size_t MAX_NODE_ID_DEFAULT     = 15000000000ULL; // node index capacity (ids)
 
+// Admin cell index covering (admin_cover.h). Each straight lat/lng ring edge
+// is followed in pieces whose great-circle chords lie within the chord
+// tolerance (6.4 m) of them and which span at most the max piece (64 km) of
+// latitude or longitude; every cell within the reach of a piece is listed.
+// The reach adds the reader's own error to the tolerance: its query point
+// rounds to f32 by at most 8.5e-6 deg, and its f32 ray cast puts a crossing
+// at most 5 * 2^-24 * 180 + 3.8e-6 = 5.8e-5 deg off the edge.
+static constexpr double ADMIN_COVER_CHORD_TOLERANCE_RAD = 1e-6;
+static constexpr double ADMIN_COVER_MAX_PIECE_RAD       = 0.01;
+static constexpr double ADMIN_COVER_READER_SLACK_DEG    = 1e-4;
+static constexpr double ADMIN_COVER_REACH_RAD =
+    ADMIN_COVER_CHORD_TOLERANCE_RAD + ADMIN_COVER_READER_SLACK_DEG * (3.14159265358979323846 / 180.0);
+
 // --- Index mode ---
 
 enum class IndexMode { Full, NoAddresses, AdminOnly };
