@@ -5,7 +5,8 @@
 //   Encoder: consumes today's-format bytes as the patcher writes them, one queue per today's file,
 //            and processes every unit whose bytes are all there (pump()).
 // Nothing is held beyond the buffers, the unit in flight and the queues' skew. A unit held whole is
-// bounded by the format (a way <= 65535 nodes, an address footprint <= 69999 vertices) or, for a
+// bounded by the format (a way <= 65535 nodes), by the source (an address footprint, as large as
+// the builder made it: abs2 holds up to 69999 vertices, a larger one is escaped raw) or, for a
 // polygon block, by big_block() (256 KiB): larger admin and POI blocks go plane by plane through
 // positional readers / writers (a POI encoder lays the planes out for a closed ring and moves them
 // in the file when the last vertex shows the ring is open).
@@ -872,6 +873,8 @@ struct Enc : Encoder {
 // ------------------------------------------------------------------ address points + footprints
 namespace addr {
 static const double SCALE[3] = {1e-5, 1e-4, 1e-6};
+// The most vertices (closing vertex included) an abs2 blob holds; a larger footprint is escaped.
+static const uint32_t ABS2_MAX_VERTICES = 69999;
 static inline int64_t fkey(uint32_t b) { return (b & 0x80000000u) ? int64_t(0xFFFFFFFFu) - b : int64_t(b ^ 0x80000000u); }
 static inline uint32_t unfkey(int64_t k) { return (k & 0x80000000) ? uint32_t(k ^ 0x80000000) : uint32_t(0xFFFFFFFFu - k); }
 static inline uint32_t pred_bits(uint32_t point_bits, int64_t sum_q, uint32_t n, int enc) {
@@ -928,6 +931,7 @@ struct Dec : Decoder {
         const uint8_t tag = A->u8();
         if (tag == 0x20) {
             const uint64_t vcnt = A->uv();
+            if (!vcnt || vcnt > 0xFFFFFFFFull) die("addr %llu: bad count", (unsigned long long)i);
             const uint8_t enc = *A->need(1);
             const size_t size = 10 + size_t(vcnt) * (enc == 3 ? 8 : 4);
             rec[6] = uint32_t(vcnt);
@@ -940,7 +944,7 @@ struct Dec : Decoder {
         const int enc = tag & 3, wide = (tag >> 2) & 1, small = (tag >> 3) & 1, closed = (tag >> 4) & 1;
         if (enc > 2 || (tag & 0xE0)) die("addr %llu: bad tag", (unsigned long long)i);
         const uint64_t cnt = A->uv();
-        if (cnt > 69999 - uint64_t(closed) || (closed && !cnt)) die("addr %llu: bad count", (unsigned long long)i);
+        if (cnt > ABS2_MAX_VERTICES - uint64_t(closed) || (closed && !cnt)) die("addr %llu: bad count", (unsigned long long)i);
         const uint32_t full = uint32_t(cnt) + uint32_t(closed);
         rec[6] = full;
         emit(0, rec, 28);
@@ -1035,7 +1039,7 @@ struct Enc : Encoder {
             const uint8_t* b = V.data();
             const uint8_t enc = b[0];
             vexp += size;
-            if (enc == 3 || b[1] != 0) {
+            if (enc == 3 || b[1] != 0 || vcnt > ABS2_MAX_VERTICES) {
                 A->u8(0x20);
                 A->uv(vcnt);
                 A->put(b, size);
