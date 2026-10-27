@@ -247,6 +247,7 @@ impl Pool {
 
     /// No candidate scoring at most this can reach the results.
     fn cutoff(&self) -> f32 {
+        if self.top_k == 0 { return f32::INFINITY; }
         if self.top.len() < self.top_k {
             self.threshold()
         } else {
@@ -539,6 +540,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
     }
 
     pub fn search(&self, q: &str, limit: usize) -> (Vec<Found<'g>>, QueryStats) {
+        if limit == 0 { return (Vec::new(), QueryStats::default()); }
         let mut st = State { ctx: HashMap::new(), stats: QueryStats::default() };
         let mut pool = Pool { best: HashMap::new(), heap: BinaryHeap::new(), top: Vec::new(), top_k: limit * CONTEXT_CUTOFF_FACTOR };
         let mut phrases: Vec<String> = Vec::new();
@@ -653,4 +655,12 @@ mod tests {
         let c = Context { words: &words, phrase: "tx".into() };
         assert_eq!(c.mask_of("texas") & 1, 0);
     }
+    #[test]
+    fn zero_limit_has_no_reachable_candidate() {
+        let mut pool = Pool { best: HashMap::new(), heap: BinaryHeap::new(), top: Vec::new(), top_k: 0 };
+        assert_eq!(pool.cutoff(), f32::INFINITY);
+        pool.top.push(1.0);
+        assert_eq!(pool.cutoff(), f32::INFINITY);
+    }
+
 }
