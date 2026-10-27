@@ -1,7 +1,7 @@
 //! Test fixture: a small geocoder index (rectangular boundaries, place nodes, point POIs) in the
 //! builder's file layout, and the place-search index built from it the way `place-search build`
 //! builds one.
-use crate::build::{build, BuildOpts};
+use crate::build::{build_all, BuildOpts};
 use crate::constants::DEFAULT_RUN_BUDGET_MB;
 use crate::model::{PLACE_FLAG_HIDDEN, PLACE_FLAG_LABEL_OF};
 use query_server::{
@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Raw f32 vertices (VertexEncoding in builder/src/types.h).
 const RAW_F32_VERTICES: u8 = 4;
+/// Grid steps per side of a boundary's bounding box whose points list it in their admin cells.
+const GRID: u32 = 32;
 
 /// A fresh directory under the temp dir, removed on drop.
 pub struct TempDir(pub PathBuf);
@@ -37,8 +39,8 @@ impl Drop for TempDir {
 #[derive(Default)]
 pub struct Geo {
     strings: Vec<u8>,
-    /// (record, [south, west, north, east] in degrees)
-    polygons: Vec<(AdminPolygon, [f32; 4])>,
+    /// (record, keyhole vertex range as (lat, lng) in degrees)
+    polygons: Vec<(AdminPolygon, Vec<(f32, f32)>)>,
     nodes: Vec<PlaceNode>,
     pois: Vec<PoiRecord>,
 }
@@ -54,11 +56,27 @@ impl Geo {
     /// A rectangular boundary ([south, west, north, east]); returns its polygon id.
     pub fn boundary(&mut self, name: &str, admin_level: u8, rect: [f32; 4]) -> u32 {
         let [s, w, n, e] = rect;
+        self.shaped_boundary(name, admin_level, &[(s, w), (s, e), (n, e), (n, w), (s, w)], &[])
+    }
+
+    /// A boundary of closed (lat, lng) rings, `outer` around `holes`, packed into one keyhole
+    /// vertex range as the builder packs them; returns its polygon id.
+    pub fn shaped_boundary(&mut self, name: &str, admin_level: u8, outer: &[(f32, f32)], holes: &[&[(f32, f32)]]) -> u32 {
+        let mut verts = outer.to_vec();
+        for h in holes {
+            let c = (outer[0].0, h[0].1);
+            verts.extend([outer[0], c]);
+            verts.extend_from_slice(h);
+            verts.push(c);
+        }
+        let ring_area = |r: &[(f32, f32)]| r.windows(2).map(|e| e[0].1 * e[1].0 - e[1].1 * e[0].0).sum::<f32>().abs() / 2.0;
         let poly = AdminPolygon {
-            vertex_offset: 0, vertex_count: 5, name_id: self.string(name), admin_level, place_type_override: 0,
-            _pad2: 0, _pad3: 0, area: (n - s) * (e - w), country_code: 0, hole_count: 0,
+            vertex_offset: 0, vertex_count: verts.len() as u32, name_id: self.string(name), admin_level,
+            place_type_override: 0, _pad2: 0, _pad3: 0,
+            area: ring_area(outer) - holes.iter().map(|h| ring_area(h)).sum::<f32>(),
+            country_code: 0, hole_count: holes.len() as u16,
         };
-        self.polygons.push((poly, rect));
+        self.polygons.push((poly, verts));
         self.polygons.len() as u32 - 1
     }
 
@@ -86,22 +104,27 @@ impl Geo {
         self.pois.len() as u32 - 1
     }
 
-    /// The files as the builder writes them, by name. A boundary is listed in the admin cell of
-    /// its centre and of each place node and POI inside it.
+    /// The files as the builder writes them, by name. A boundary is listed in the admin cells of
+    /// a grid of points over its bounding box and of each place node and POI inside the box.
     fn files(&self) -> Vec<(&'static str, Vec<u8>)> {
         let cell = |lat: f32, lng: f32| cell_id_at_level(lat as f64, lng as f64, DEFAULT_ADMIN_CELL_LEVEL);
         let points: Vec<(f32, f32)> =
             self.nodes.iter().map(|p| (p.lat, p.lng)).chain(self.pois.iter().map(|p| (p.lat, p.lng))).collect();
         let (mut polygons, mut vertices, mut admin) = (Vec::new(), Vec::new(), Vec::new());
-        for (id, (poly, [s, w, n, e])) in self.polygons.iter().enumerate() {
+        for (id, (poly, verts)) in self.polygons.iter().enumerate() {
             polygons.extend(polygon_bytes(&AdminPolygon { vertex_offset: vertices.len() as u32, ..*poly }));
+            let min = |f: fn(&(f32, f32)) -> f32| verts.iter().map(f).fold(f32::INFINITY, f32::min);
+            let max = |f: fn(&(f32, f32)) -> f32| verts.iter().map(f).fold(f32::NEG_INFINITY, f32::max);
+            let ([s, w], [n, e]) = ([min(|v| v.0), min(|v| v.1)], [max(|v| v.0), max(|v| v.1)]);
             vertices.extend([RAW_F32_VERTICES, 0]);
-            for v in [s, w, s, w, s, e, n, e, n, w, s, w] {
+            for v in [s, w].into_iter().chain(verts.iter().flat_map(|v| [v.0, v.1])) {
                 vertices.extend(v.to_le_bytes());
             }
-            let centre = ((s + n) / 2.0, (w + e) / 2.0);
-            for (lat, lng) in points.iter().copied().chain([centre]) {
-                if (*s..=*n).contains(&lat) && (*w..=*e).contains(&lng) {
+            let grid = (0..=GRID).flat_map(|i| {
+                (0..=GRID).map(move |j| (s + (n - s) * i as f32 / GRID as f32, w + (e - w) * j as f32 / GRID as f32))
+            });
+            for (lat, lng) in points.iter().copied().chain(grid) {
+                if (s..=n).contains(&lat) && (w..=e).contains(&lng) {
                     admin.push((cell(lat, lng), id as u32));
                 }
             }
@@ -150,11 +173,10 @@ pub fn build_search(geo: &Index, out: &Path, extras: Option<&Path>) {
         threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: out.join("tmp"), inline: true,
         extras: extras.map(|p| p.to_str().unwrap().to_string()), imp_dir: None, area_proxy: false, poi_max_tier: 3,
     };
-    let names: &[&str] = if geo.poi_records.is_some() { &["places", "poi"] } else { &["places"] };
-    build(geo, names, out, &opts).unwrap();
+    let subs: &[&str] = if geo.poi_records.is_some() { &["places", "poi"] } else { &["places"] };
     let n_place_nodes = geo.place_nodes.as_ref().map_or(0, |m| m.len() / std::mem::size_of::<PlaceNode>() as u64);
     let meta = serde_json::json!({"n_place_nodes": n_place_nodes, "extras": extras.is_some()});
-    std::fs::write(out.join("search_meta.json"), meta.to_string()).unwrap();
+    build_all(geo, subs, out, &opts, || Ok(meta)).unwrap();
 }
 
 /// A `*_cells.bin` (u64 cell, u32 entry offset; sorted) and its `*_entries.bin` (u16 count, then

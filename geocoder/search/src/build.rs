@@ -12,7 +12,7 @@ use crate::extras::{record_ref, Extras, KIND_PLACE_NODE, KIND_POI};
 use crate::model::*;
 use crate::normalize::{join, tokens, transliterate};
 use memmap2::Mmap;
-use query_server::{AdminPolygon, Index, NodeCoord, PlaceNode, PoiRecord, NO_DATA};
+use query_server::{point_on_surface, AdminPolygon, Index, PlaceNode, PoiRecord, NO_DATA};
 use std::collections::{BinaryHeap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
@@ -67,35 +67,6 @@ fn map_importance(dir: Option<&str>, file: &str, records: u32) -> std::io::Resul
 
 fn byte_at(m: &Option<Mmap>, i: u32) -> u8 {
     m.as_ref().and_then(|m| m.get(i as usize).copied()).unwrap_or(0)
-}
-
-fn ring_centroid(v: &[NodeCoord]) -> (f32, f32) {
-    let n = v.len();
-    let mean = || {
-        let (mut a, mut b) = (0f64, 0f64);
-        for p in v {
-            a += p.lat as f64;
-            b += p.lng as f64;
-        }
-        ((a / n as f64) as f32, (b / n as f64) as f32)
-    };
-    if n < 3 {
-        return mean();
-    }
-    let (mut area, mut cx, mut cy) = (0f64, 0f64, 0f64);
-    for i in 0..n {
-        let (x0, y0) = (v[i].lng as f64, v[i].lat as f64);
-        let (x1, y1) = (v[(i + 1) % n].lng as f64, v[(i + 1) % n].lat as f64);
-        let cr = x0 * y1 - x1 * y0;
-        area += cr;
-        cx += (x0 + x1) * cr;
-        cy += (y0 + y1) * cr;
-    }
-    area /= 2.0;
-    if area.abs() < 1e-12 {
-        return mean();
-    }
-    ((cy / (6.0 * area)) as f32, (cx / (6.0 * area)) as f32)
 }
 
 // ------------------------------------------------------------------ entity sources
@@ -180,8 +151,9 @@ impl<'a> PlacesSource<'a> {
                 label_used.set(node);
                 BoundarySlot { poly: p, node, lat: pn.lat, lng: pn.lng }
             } else if (BOUNDARY_MIN_LEVEL..=BOUNDARY_MAX_LEVEL).contains(&ap.admin_level) && ap.area > 0.0 {
-                let Some(v) = geo.admin_verts(&ap) else { continue };
-                let (lat, lng) = ring_centroid(&v);
+                // The builder's interior_point (ST_PointOnSurface, Nominatim's centre of an area):
+                // an area centroid can fall outside a concave ring or in a hole.
+                let Some((lat, lng)) = geo.admin_verts(&ap).and_then(|v| point_on_surface(&v, ap.hole_count)) else { continue };
                 BoundarySlot { poly: p, node: NO_DATA, lat, lng }
             } else {
                 continue;
@@ -459,10 +431,13 @@ impl Runs {
         })
     }
 
+    /// Adds one key entry; an error for a key longer than a run holds: MAX_KEY_BYTES (a run entry's
+    /// u16 length), or the run's key arena when that is smaller.
     fn push(&mut self, key: &[u8], p: Posting) -> std::io::Result<()> {
         let fits = MAX_KEY_BYTES.min(self.arena.capacity());
         if key.len() > fits {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("Key too long: {} bytes, a run holds {fits}", key.len())));
+            let e = format!("entity {}: a key of {} bytes, over the {fits} bytes a sort run holds", p.entity, key.len());
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, e));
         }
 
         if self.arena.len() + key.len() > self.arena.capacity() || self.items.len() == self.items.capacity() {
@@ -755,6 +730,13 @@ struct PrefixSlot {
     flushed: u64,
 }
 
+impl PrefixSlot {
+    /// An error of this length's prefix temp file, naming it.
+    fn error(&self, e: std::io::Error) -> String {
+        format!("prefix temp file {}: {e}", self.path.display())
+    }
+}
+
 pub fn prefix_text(typed: usize, key_len: usize, edits: u8) -> f32 {
     let r = (typed as f32 / key_len.max(1) as f32).min(1.0);
     (PREFIX_BASE + PREFIX_COMPLETION * r) * PREFIX_TYPO.powi(edits as i32)
@@ -791,12 +773,11 @@ impl Writer {
         self.keys += 1;
         self.postings += group.len() as u64;
         self.longest = self.longest.max(group.len());
-        self.prefix_add(key, group);
-        Ok(())
+        self.prefix_add(key, group)
     }
 
-    fn prefix_add(&mut self, key: &[u8], list: &[Posting]) {
-        let Ok(key) = std::str::from_utf8(key) else { return };
+    fn prefix_add(&mut self, key: &[u8], list: &[Posting]) -> Result<(), String> {
+        let Ok(key) = std::str::from_utf8(key) else { return Ok(()) };
         let klen = key.chars().count();
         let top = best_postings(list, PREFIX_TABLE_TOP);
         let mut pfx = String::new();
@@ -805,7 +786,7 @@ impl Writer {
             let n = n + 1;
             if self.slots[n - 1].prefix != pfx {
                 let slot = &mut self.slots[n - 1];
-                flush_slot(slot).expect("prefix temp file");
+                flush_slot(slot).map_err(|e| slot.error(e))?;
                 slot.prefix = pfx.clone();
             }
             let slot = &mut self.slots[n - 1];
@@ -820,6 +801,7 @@ impl Writer {
                 best_entities(&mut slot.hits, PREFIX_TABLE_TOP * 4);
             }
         }
+        Ok(())
     }
 }
 
@@ -900,12 +882,13 @@ fn vm_hwm_kb() -> u64 {
 pub fn build(geo: &Index, names: &[&str], out: &Path, opts: &BuildOpts) -> Result<Vec<(String, Stats)>, String> {
     let mut runs = Vec::with_capacity(names.len());
     for name in names {
-        runs.push(sort_keys(geo, name, out, opts)?);
+        runs.push(sort_keys(geo, name, out, opts).map_err(|e| format!("build {name}: {e}"))?);
     }
     let mut stats = Vec::with_capacity(runs.len());
     for r in runs {
         let name = r.name.clone();
-        stats.push((name, merge(r, out, opts)?));
+        let st = merge(r, out, opts).map_err(|e| format!("build {name}: {e}"))?;
+        stats.push((name, st));
     }
     Ok(stats)
 }
@@ -1054,15 +1037,14 @@ pub fn merge(runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, Strin
     let mut n_prefixes = 0u64;
     let mut pfx_readers = Vec::new();
     for sl in slots.iter_mut() {
-        flush_slot(sl).map_err(|e| e.to_string())?;
-        sl.out.flush().map_err(|e| e.to_string())?;
+        flush_slot(sl).map_err(|e| sl.error(e))?;
+        sl.out.flush().map_err(|e| sl.error(e))?;
         n_prefixes += sl.flushed;
-        pfx_readers.push(BufReader::new(File::open(&sl.path).map_err(|e| e.to_string())?));
+        pfx_readers.push(BufReader::new(File::open(&sl.path).map_err(|e| sl.error(e))?));
     }
     // Merge the per-length files: each is sorted, and a prefix occurs in one length only.
-    let prefix_error = |i: usize, e: std::io::Error| format!("prefix temp file {}: {e}", slots[i].path.display());
     let mut heads: Vec<Option<(Vec<u8>, Vec<u8>)>> =
-        pfx_readers.iter_mut().enumerate().map(|(i, r)| read_prefix(r).map_err(|e| prefix_error(i, e))).collect::<Result<_, _>>()?;
+        pfx_readers.iter_mut().enumerate().map(|(i, r)| read_prefix(r).map_err(|e| slots[i].error(e))).collect::<Result<_, _>>()?;
     let mut pf = fst::MapBuilder::new(BufWriter::new(mk("pfx.fst")?)).map_err(|e| e.to_string())?;
     let mut pb = BufWriter::new(mk("pfx")?);
     let mut off = 0u64;
@@ -1074,7 +1056,7 @@ pub fn merge(runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, Strin
         pf.insert(&k, off).map_err(|e| e.to_string())?;
         pb.write_all(&blob).map_err(|e| e.to_string())?;
         off += blob.len() as u64;
-        heads[i] = read_prefix(&mut pfx_readers[i]).map_err(|e| prefix_error(i, e))?;
+        heads[i] = read_prefix(&mut pfx_readers[i]).map_err(|e| slots[i].error(e))?;
     }
     for sl in &slots {
         let _ = std::fs::remove_file(&sl.path);
@@ -1106,6 +1088,109 @@ pub fn merge(runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, Strin
     st.add("time total s", format!("{:.2}", (t_src + t_keys + t_merge).as_secs_f64()));
     st.add("VmHWM MiB", format!("{:.1}", vm_hwm_kb() as f64 / 1024.0));
     Ok(st)
+}
+
+/// Builds the sub-indexes `subs` of `geo` for the index directory `out`, the value `meta` gives
+/// with each one's stats becoming its search_meta.json. Every file is written into a staging
+/// directory and moved into `out` only once all of them are complete, search_meta.json last
+/// (`publish`): a failed build or move leaves `out` as it was. The build holds `out` from before
+/// `meta` runs until it has cleaned up (`lock_index_dir`). Returns the stats; an error, before
+/// anything is built, while another build holds `out`, when `meta` fails, or while files a failed
+/// publish could not put back are still aside.
+pub fn build_all(geo: &Index, subs: &[&str], out: &Path, opts: &BuildOpts,
+                 meta: impl FnOnce() -> Result<serde_json::Value, String>) -> Result<Vec<(String, Stats)>, String> {
+    let _held = lock_index_dir(out)?;
+    let meta = meta()?;
+    let stage = out.join(BUILD_STAGE_DIR);
+    if holds_replaced(&stage) {
+        let aside = stage.join(BUILD_ASIDE_DIR);
+        return Err(format!("{}: files a failed publish replaced; move them back into {} or remove them", aside.display(), out.display()));
+    }
+    let _ = std::fs::remove_dir_all(&stage);
+    let built = build_staged(geo, subs, &stage, opts, meta)
+        .and_then(|stats| publish(&stage, out, |from, to| std::fs::rename(from, to)).map(|_| stats).map_err(|e| format!("publish {}: {e}", out.display())));
+    clear_stage(&stage);
+    // While `out` is still held: the temp directory is by default inside it, and removing it
+    // after would race the next build's.
+    let _ = std::fs::remove_dir(&opts.tmp);
+    built
+}
+
+/// An exclusive lock on the directory `out` itself (no lock file is left in the index), held
+/// until the returned handle is dropped or the process exits. Every build takes it, so builds
+/// into one index directory never share its search_meta.json, staging or temp directories. An
+/// error, at once, while another build holds it.
+fn lock_index_dir(out: &Path) -> Result<File, String> {
+    std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
+    let dir = File::open(out).map_err(|e| format!("{}: {e}", out.display()))?;
+    match dir.try_lock() {
+        Ok(()) => Ok(dir),
+        Err(std::fs::TryLockError::WouldBlock) => Err(format!("{}: another build is using this index directory", out.display())),
+        Err(std::fs::TryLockError::Error(e)) => Err(format!("lock {}: {e}", out.display())),
+    }
+}
+
+/// Whether a publish that failed to put files back left the files they replaced in `stage`.
+fn holds_replaced(stage: &Path) -> bool {
+    std::fs::read_dir(stage.join(BUILD_ASIDE_DIR)).is_ok_and(|mut d| d.next().is_some())
+}
+
+/// Removes the staging directory, unless it holds files a failed publish replaced.
+fn clear_stage(stage: &Path) {
+    if !holds_replaced(stage) {
+        let _ = std::fs::remove_dir_all(stage);
+    }
+}
+
+fn build_staged(geo: &Index, subs: &[&str], stage: &Path, opts: &BuildOpts, mut meta: serde_json::Value) -> Result<Vec<(String, Stats)>, String> {
+    std::fs::create_dir_all(stage).map_err(|e| format!("{}: {e}", stage.display()))?;
+    let stats = build(geo, subs, stage, opts)?;
+    for (s, st) in &stats {
+        meta[s.as_str()] = st.lines.iter().map(|(k, v)| (k.clone(), serde_json::json!(v))).collect::<serde_json::Map<_, _>>().into();
+    }
+    let text = serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?;
+    std::fs::write(stage.join("search_meta.json"), text).map_err(|e| e.to_string())?;
+    Ok(stats)
+}
+
+/// Moves every file of `stage` into `out` with `rename`, search_meta.json last. Each file it
+/// replaces is moved aside first; when a move fails, the files moved so far are put back, and
+/// a file that cannot be put back stays aside (the error names the directory).
+fn publish(stage: &Path, out: &Path, rename: impl Fn(&Path, &Path) -> std::io::Result<()>) -> std::io::Result<()> {
+    let mut names = std::fs::read_dir(stage)?.map(|e| e.map(|e| e.file_name())).collect::<std::io::Result<Vec<_>>>()?;
+    names.sort_by_key(|n| (n == "search_meta.json", n.clone()));
+    let aside = stage.join(BUILD_ASIDE_DIR);
+    std::fs::create_dir(&aside)?;
+    // (name, whether it replaced a file of `out`)
+    let mut moved = Vec::new();
+    for n in &names {
+        let (to, old) = (out.join(n), aside.join(n));
+        let replaced = match rename(&to, &old) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        };
+        let step = replaced.and_then(|r| {
+            moved.push((n, r));
+            rename(&stage.join(n), &to)
+        });
+        if let Err(e) = step {
+            let mut stuck = Vec::new();
+            for (n, replaced) in moved.into_iter().rev() {
+                let back = if replaced { rename(&aside.join(n), &out.join(n)) } else { std::fs::remove_file(out.join(n)) };
+                if back.is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound) {
+                    stuck.push(n.to_string_lossy());
+                }
+            }
+            if stuck.is_empty() {
+                return Err(e);
+            }
+            let e = format!("{e}; could not put back {}: the files they replaced are in {}", stuck.join(", "), aside.display());
+            return Err(std::io::Error::other(e));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&aside);
+    Ok(())
 }
 
 /// A partial rebuild must keep the extra-name source required by retained sub-indexes.
@@ -1486,6 +1571,43 @@ mod tests {
         assert!(growth < 2 * copy + post, "heap grew {growth} bytes: postings {copy} bytes, encoded list {post} bytes");
     }
 
+    #[test]
+    fn runs_refuse_keys_over_the_length_limit() {
+        let dir = tmp_dir("long-key");
+        let mut runs = Runs::new(1 << 20, &dir, "t".into()).unwrap();
+        let p = posting(1, 9, false, 0);
+        let longest = vec![b'a'; u16::MAX as usize];
+        assert!(runs.push(&longest, p).is_ok());
+
+        // One byte over: ASCII, and a two-byte character across the limit.
+        for key in [vec![b'a'; u16::MAX as usize + 1], [&longest[1..], "ж".as_bytes()].concat()] {
+            assert_eq!(runs.push(&key, p).map_err(|e| e.kind()), Err(std::io::ErrorKind::InvalidInput), "{} bytes", key.len());
+        }
+        runs.spill().unwrap();
+        assert_eq!(read_all(&runs.files), [(longest, p)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_build_fails_on_a_name_over_the_key_limit() {
+        use crate::fixture::{Geo, TempDir};
+        let mut g = Geo::default();
+        g.place("Testville", 1, 10.1, 20.1);
+        let dir = TempDir::new("long-name");
+        let (tsv, bin) = (dir.0.join("extra_names.tsv"), dir.0.join("extra_names.bin"));
+        std::fs::write(&tsv, format!("p\t0\t2\tname:ru\t{}\n", "ж".repeat(u16::MAX as usize / 2 + 1))).unwrap();
+        crate::extras::pack(tsv.to_str().unwrap(), bin.to_str().unwrap()).unwrap();
+        let geo = g.load(&dir.0.join("geo"));
+        let opts = BuildOpts {
+            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"), inline: true,
+            extras: Some(bin.to_str().unwrap().into()), imp_dir: None, area_proxy: false, poi_max_tier: 3,
+        };
+
+        let err = build(&geo, &["places"], &dir.0.join("idx"), &opts).err();
+
+        assert!(err.as_deref().is_some_and(|e| e.contains("65536 bytes")), "{err:?}");
+    }
+
     fn writer(dir: &Path) -> Writer {
         std::fs::create_dir_all(dir).unwrap();
         let mk = |n: &str| BufWriter::new(File::create(dir.join(n)).unwrap());
@@ -1505,6 +1627,23 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_prefix_spill_fails_the_add() {
+        let dir = tmp_dir("pfx-full");
+        let mut w = writer(&dir);
+        // Unbuffered onto a full device: flushing prefix "a" when "b" starts fails to write.
+        let full = PathBuf::from("/dev/full");
+        w.slots[0].out = BufWriter::with_capacity(0, File::options().write(true).open(&full).unwrap());
+        w.slots[0].path = full;
+        w.add(b"a", &[posting(1, 9, false, 0)]).unwrap();
+
+        let err = w.add(b"b", &[posting(2, 9, false, 0)]).err();
+
+        assert!(err.as_deref().is_some_and(|e| e.contains("/dev/full")), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn prefix_table_keeps_distinct_entities() {
         // 30 minor entities under "a", then 10 major ones with many names each: pruning hits rather
@@ -1513,11 +1652,11 @@ mod tests {
         let mut w = writer(&dir);
         let post = |entity, imp_q| Posting { entity, imp_q, partial: false, class: 0, ord: 0 };
         for e in 0..30u32 {
-            w.prefix_add(format!("aa{e:03}").as_bytes(), &[post(1000 + e, 10)]);
+            w.prefix_add(format!("aa{e:03}").as_bytes(), &[post(1000 + e, 10)]).unwrap();
         }
         let major: Vec<Posting> = (0..10).map(|e| post(e, 250)).collect();
         for k in 0..300 {
-            w.prefix_add(format!("ab{k:03}").as_bytes(), &major);
+            w.prefix_add(format!("ab{k:03}").as_bytes(), &major).unwrap();
         }
         let slot = &mut w.slots[0];
         flush_slot(slot).unwrap();
@@ -1587,7 +1726,7 @@ mod tests {
             .map(|entity| Posting { entity, imp_q: 200, partial: false, class: 5, ord: 1 })
             .collect();
         list.push(Posting { entity: 99, imp_q: 190, partial: false, class: 0, ord: 0 });
-        w.prefix_add(b"abc", &list);
+        w.prefix_add(b"abc", &list).unwrap();
         let slot = &mut w.slots[0];
         flush_slot(slot).unwrap();
         slot.out.flush().unwrap();
@@ -1627,6 +1766,206 @@ mod tests {
             let got: Vec<(u32, &str)> = found.iter().map(|f| (f.hit.entity, f.name.as_str())).collect();
             assert_eq!(got, [(1, q)], "{q}");
         }
+    }
+
+    #[test]
+    fn an_unlinked_boundary_is_found_at_a_point_inside_it() {
+        use crate::fixture::{build_search, Geo, TempDir};
+        use crate::query::Searcher;
+        use crate::reader::SearchIndex;
+        let at = |lat: f32, lng: f32| (10.0 + lat / 10.0, 20.0 + lng / 10.0);
+        let rect = |s: f32, w: f32, n: f32, e: f32| [at(s, w).0, at(s, w).1, at(n, e).0, at(n, e).1];
+        let mut g = Geo::default();
+        // A county open to the north: its area centroid falls in its notch, where another county lies.
+        let u = [(0.0, 0.0), (0.0, 3.0), (3.0, 3.0), (3.0, 2.0), (1.0, 2.0), (1.0, 1.0), (3.0, 1.0), (3.0, 0.0), (0.0, 0.0)];
+        let hook = g.shaped_boundary("Hookcounty", 6, &u.map(|(a, b)| at(a, b)), &[]);
+        g.boundary("Notchcounty", 6, rect(1.0, 1.0, 3.0, 2.0));
+        // A county around a hole another county fills: its area centroid falls in the hole.
+        let outer = [(0.0, 4.0), (0.0, 7.0), (3.0, 7.0), (3.0, 4.0), (0.0, 4.0)].map(|(a, b)| at(a, b));
+        let hole = [(1.0, 5.0), (2.0, 5.0), (2.0, 6.0), (1.0, 6.0), (1.0, 5.0)].map(|(a, b)| at(a, b));
+        let ring = g.shaped_boundary("Ringcounty", 6, &outer, &[&hole]);
+        g.boundary("Holecounty", 6, rect(1.0, 5.0, 2.0, 6.0));
+        let dir = TempDir::new("label-point");
+        let geo = g.load(&dir.0.join("geo"));
+        let out = dir.0.join("idx");
+        build_search(&geo, &out, None);
+        let idx = SearchIndex::open(&geo, &out, None, None).unwrap();
+        let s = Searcher::new(&idx);
+
+        for (q, poly) in [("Hookcounty", hook), ("Ringcounty", ring)] {
+            let (found, _) = s.search(q, 5);
+
+            // No place nodes: the boundary is entity 0 + its polygon.
+            let f = &found[0];
+            assert_eq!(f.hit.entity, poly, "{q}");
+            assert!(geo.admin_pip(&polygon_raw(&geo, poly), f.lat as f64, f.lng as f64), "{q} at {} {}", f.lat, f.lng);
+            assert_eq!(f.ctx.county, q);
+        }
+    }
+
+    #[test]
+    fn a_failed_rebuild_leaves_the_index_as_it_was() {
+        use crate::fixture::{build_search, Geo, TempDir};
+        use crate::query::Searcher;
+        use crate::reader::SearchIndex;
+        let mut g = Geo::default();
+        g.boundary("Testville", 8, [10.0, 20.0, 10.2, 20.2]);
+        g.place("Testburg", 1, 10.1, 20.1);
+        g.poi("Test Hall", 10.05, 20.05, 0);
+        let dir = TempDir::new("rebuild");
+        let geo = g.load(&dir.0.join("geo"));
+        let out = dir.0.join("idx");
+        build_search(&geo, &out, None);
+        let entries = |d: &Path| {
+            let mut v: Vec<_> = std::fs::read_dir(d).unwrap().map(|e| e.unwrap().path()).map(|p| (std::fs::read(&p).ok(), p)).collect();
+            v.sort();
+            v
+        };
+        let before = entries(&out);
+        // Importance bytes change the places postings; the POI build after them fails on an
+        // importance file of the wrong size.
+        let imp = dir.0.join("imp");
+        std::fs::create_dir_all(&imp).unwrap();
+        for (file, n) in [("imp_places.u8", 1), ("imp_polys.u8", 1), ("imp_poi.u8", 2)] {
+            std::fs::write(imp.join(file), vec![200u8; n]).unwrap();
+        }
+        let opts = BuildOpts {
+            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"), inline: true, extras: None,
+            imp_dir: Some(imp.to_str().unwrap().into()), area_proxy: false, poi_max_tier: 3,
+        };
+
+        let err = build_all(&geo, &["places", "poi"], &out, &opts, || Ok(serde_json::json!({}))).err();
+
+        assert!(err.as_deref().is_some_and(|e| e.contains("imp_poi.u8")), "{err:?}");
+        let after = entries(&out);
+        let changed: Vec<_> = before.iter().filter(|e| !after.contains(e)).chain(after.iter().filter(|e| !before.contains(e))).map(|e| &e.1).collect();
+        assert!(changed.is_empty(), "changed: {changed:?}");
+        let idx = SearchIndex::open(&geo, &out, None, None).unwrap();
+        let (found, _) = Searcher::new(&idx).search("Testburg", 5);
+        assert_eq!(found.iter().map(|f| f.hit.entity).collect::<Vec<_>>(), [0]);
+    }
+
+    #[test]
+    fn a_failed_publish_puts_back_what_it_replaced() {
+        let dir = tmp_dir("publish");
+        let (stage, out) = (dir.join("stage"), dir.join("out"));
+        for (d, file, text) in [(&stage, "a", "new a"), (&stage, "b", "new b"), (&stage, "search_meta.json", "new meta"),
+                                (&out, "a", "old a"), (&out, "search_meta.json", "old meta")] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join(file), text).unwrap();
+        }
+        let contents = |d: &Path| {
+            let mut v: Vec<_> = std::fs::read_dir(d).unwrap().map(|e| e.unwrap().path()).map(|p| (std::fs::read_to_string(&p).ok(), p)).collect();
+            v.sort();
+            v
+        };
+        let before = contents(&out);
+        // Moving b in fails once a has moved.
+        let rename = |from: &Path, to: &Path| {
+            if from.ends_with("stage/b") {
+                return Err(std::io::Error::other("injected"));
+            }
+            std::fs::rename(from, to)
+        };
+
+        let result = publish(&stage, &out, rename);
+        clear_stage(&stage);
+
+        assert!(result.is_err());
+        assert_eq!(contents(&out), before);
+        assert!(!stage.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_put_back_keeps_the_replaced_files() {
+        let dir = tmp_dir("put-back");
+        let (stage, out) = (dir.join("stage"), dir.join("out"));
+        for (d, file, text) in [(&stage, "a", "new a"), (&stage, "b", "new b"), (&out, "a", "old a")] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join(file), text).unwrap();
+        }
+        // Moving b in fails once a has moved, and so does putting the old a back.
+        let rename = |from: &Path, to: &Path| {
+            if from.ends_with("stage/b") || from.ends_with(Path::new(BUILD_ASIDE_DIR).join("a")) {
+                return Err(std::io::Error::other("injected"));
+            }
+            std::fs::rename(from, to)
+        };
+
+        let err = publish(&stage, &out, rename).unwrap_err();
+        clear_stage(&stage);
+
+        let aside = stage.join(BUILD_ASIDE_DIR);
+        assert!(err.to_string().contains(aside.to_str().unwrap()), "{err}");
+        assert_eq!(std::fs::read_to_string(aside.join("a")).ok().as_deref(), Some("old a"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_build_keeps_the_files_a_failed_publish_could_not_put_back() {
+        use crate::fixture::{build_search, Geo, TempDir};
+        let mut g = Geo::default();
+        g.place("Testburg", 1, 10.1, 20.1);
+        let dir = TempDir::new("kept-replaced");
+        let geo = g.load(&dir.0.join("geo"));
+        let out = dir.0.join("idx");
+        build_search(&geo, &out, None);
+        let kept = out.join(BUILD_STAGE_DIR).join(BUILD_ASIDE_DIR).join("places.fst");
+        std::fs::create_dir_all(kept.parent().unwrap()).unwrap();
+        std::fs::write(&kept, "old places.fst").unwrap();
+        let opts = BuildOpts {
+            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"), inline: true, extras: None,
+            imp_dir: None, area_proxy: false, poi_max_tier: 3,
+        };
+
+        let err = build_all(&geo, &["places"], &out, &opts, || Ok(serde_json::json!({}))).err();
+
+        assert!(err.as_deref().is_some_and(|e| e.contains(BUILD_ASIDE_DIR)), "{err:?}");
+        assert_eq!(std::fs::read_to_string(&kept).ok().as_deref(), Some("old places.fst"));
+    }
+
+    #[test]
+    fn a_build_is_refused_while_another_build_holds_the_index_directory() {
+        use crate::fixture::{build_search, Geo, TempDir};
+        let mut g = Geo::default();
+        g.place("Testburg", 1, 10.1, 20.1);
+        g.poi("Test Hall", 10.05, 20.05, 0);
+        let dir = TempDir::new("held");
+        let geo = g.load(&dir.0.join("geo"));
+        let out = dir.0.join("idx");
+        build_search(&geo, &out, None);
+        // A places build holds `out` and has staged a file.
+        let other = File::open(&out).unwrap();
+        other.try_lock().unwrap();
+        let staged = out.join(BUILD_STAGE_DIR).join("places.fst");
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&staged, "staged by the other build").unwrap();
+        let entries = |d: &Path| {
+            let mut v: Vec<_> = std::fs::read_dir(d).unwrap().map(|e| e.unwrap().path()).map(|p| (std::fs::read(&p).ok(), p)).collect();
+            v.sort();
+            v
+        };
+        let before = entries(&out);
+        let opts = BuildOpts {
+            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"), inline: true, extras: None,
+            imp_dir: None, area_proxy: false, poi_max_tier: 3,
+        };
+        let mut read_meta = false;
+
+        let err = build_all(&geo, &["poi"], &out, &opts, || {
+            read_meta = true;
+            Ok(serde_json::json!({}))
+        }).err();
+
+        assert!(err.as_deref().is_some_and(|e| e.contains("another build")), "{err:?}");
+        assert!(!read_meta);
+        assert_eq!(std::fs::read_to_string(&staged).ok().as_deref(), Some("staged by the other build"));
+        assert_eq!(entries(&out), before);
+        drop(other);
+        build_all(&geo, &["places"], &out, &opts, || Ok(serde_json::json!({}))).unwrap();
+        assert!(!out.join(BUILD_STAGE_DIR).exists());
+        assert!(!opts.tmp.exists());
     }
 
     #[test]
