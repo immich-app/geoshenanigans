@@ -390,6 +390,27 @@ static uint64_t child_bytes_of(uint32_t fid, const char* rec, JointChild& jc) {
     }
 }
 
+// The current set's files by identity (device and inode, symlinks followed). Outputs are truncated
+// while these are still read as the patch base, so an output that is one of them (a hard link or a
+// symlink to it, as a staged apply's existing output may be) is refused before it is truncated.
+// (A current dir that doesn't exist has no files.)
+struct CurrentFiles {
+    std::map<std::pair<dev_t, ino_t>, std::string> names;
+    explicit CurrentFiles(const std::string& dir) {
+        std::error_code ec;
+        for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+            struct stat st;
+            if (stat(it->path().c_str(), &st) == 0) names[{st.st_dev, st.st_ino}] = it->path().filename().string();
+        }
+    }
+    void require_not(const std::string& path) const {
+        struct stat st;
+        if (stat(path.c_str(), &st) != 0) return;
+        auto it = names.find({st.st_dev, st.st_ino});
+        if (it != names.end()) throw std::runtime_error("Output " + path + " is the current set's " + it->second);
+    }
+};
+
 static int run(int argc, char* argv[]) {
     if (argc < 5 || std::string(argv[3]) != "-o") {
         std::cerr << "Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir> [--only file,file,...]" << std::endl;
@@ -440,6 +461,12 @@ static int run(int argc, char* argv[]) {
             return 1;
         }
     }
+    // (And no file the output dir holds already, see CurrentFiles.)
+    const CurrentFiles current(cur_dir);
+    auto write_out = [&current](const std::string& p, const char* data, size_t n) {
+        current.require_not(p);
+        return write_file(p, data, n);
+    };
     // The output is exactly the patch's file set, so stale files can't stay.
     // (A staged apply's later stages add to the dir; streamed outputs are
     // FIFOs made beforehand.)
@@ -521,7 +548,7 @@ static int run(int argc, char* argv[]) {
     }
     gcs::store().plan_outputs();
     for (const auto& f : client_files)
-        if (is_inline_client_file(f.name) && wanted(f.name) && !write_file(out_dir + "/" + f.name, f.bytes))
+        if (is_inline_client_file(f.name) && wanted(f.name) && !write_out(out_dir + "/" + f.name, f.bytes.data(), f.bytes.size()))
             throw std::runtime_error("Cannot write " + f.name);
     auto out_path = [&](const std::string& name) {
         return (listed.count(name) ? out_dir : tmpdir) + "/" + name;
@@ -547,6 +574,7 @@ static int run(int argc, char* argv[]) {
     auto open_out = [&](const std::string& name) -> FILE* {
         if (gcs::store().is_encoded(name) && listed.count(name)) return gcs::store().open_sink(name);
         std::string p = out_path(name);
+        current.require_not(p);
         FILE* f = fopen(p.c_str(), "wb");
         if (!f) throw std::runtime_error("Cannot write " + p);
         widen_pipe(f, p);
@@ -837,7 +865,7 @@ static int run(int argc, char* argv[]) {
                 fwrite(data, 1, ds, f);
                 bool ok = !ferror(f);
                 if (fclose(f) != 0 || !ok) throw std::runtime_error(std::string("Cannot write ") + fname);
-            } else if (!write_file(out_path(fname), data, ds)) throw std::runtime_error(std::string("Cannot write ") + fname);
+            } else if (!write_out(out_path(fname), data, ds)) throw std::runtime_error(std::string("Cannot write ") + fname);
             std::cerr << "  " << fname << ": full replace " << ds << " bytes" << std::endl;
             continue;
         }
@@ -1578,7 +1606,8 @@ static int run(int argc, char* argv[]) {
             size_t n = cells.size() / 12;
             auto ecit = entry_corrections.find((uint32_t)entries_fid);
             if (ecit == entry_corrections.end()) {
-                if (!write_file(out_path(cells_name), cells) || !write_file(out_path(entries_name), entries))
+                if (!write_out(out_path(cells_name), cells.data(), cells.size()) ||
+                    !write_out(out_path(entries_name), entries.data(), entries.size()))
                     throw std::runtime_error("Cannot write " + cells_name);
                 std::cerr << "  " << label << ": " << n << " cells rebuilt" << std::endl;
                 return;
@@ -1699,7 +1728,7 @@ static int run(int argc, char* argv[]) {
         struct stat st;
         if (stat(p.c_str(), &st) == 0 && S_ISFIFO(st.st_mode)) continue;  // streamed to an encoder
         if (stat(p.c_str(), &st) != 0) {
-            if (f.size == 0 && write_file(p, nullptr, 0)) continue;
+            if (f.size == 0 && write_out(p, nullptr, 0)) continue;
             throw std::runtime_error("Patch did not produce " + f.name);
         }
         if (static_cast<uint64_t>(st.st_size) != f.size)

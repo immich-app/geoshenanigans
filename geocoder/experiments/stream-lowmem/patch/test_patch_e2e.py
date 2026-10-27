@@ -242,6 +242,30 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as scratch:
     else:
         print('replaced-parents: SKIP, a v7 diff writes no REPLACE runs')
 
+    # A staged apply (--only) writes into a dir that may hold files already. One there that is a
+    # current file (a hard link, or a symlink to it) is refused before it is truncated, and the current
+    # set keeps its bytes: an inline client file, a stage's own output, and an output its stage writes
+    # with it (an entries file of the geo index).
+    for d, vals in (('wp.a', range(4096)), ('wp.b', [v + (v == 2000) for v in range(4096)])):
+        (root / d).mkdir()
+        (root / d / 'way_parents.bin').write_bytes(struct.pack('<4096I', *vals))
+        (root / d / 'meta.json').write_text(f'{{"set": "{d}"}}\n')
+    r = run([DIFF, str(root / 'wp.a'), str(root / 'wp.b'), '-o', str(root / 'wp.gcpatch')])
+    for case, cur, patch, only, name, link in (
+            ('inline hard link', 'wp.a', 'wp.gcpatch', 'meta.json', 'meta.json', os.link),
+            ('output symlink', 'wp.a', 'wp.gcpatch', 'way_parents.bin', 'way_parents.bin', os.symlink),
+            ('coupled output hard link', 'geo.a', 'removed-cells.gcpatch', 'geo_cells.bin', 'street_entries.bin', os.link)):
+        out = root / f'alias.{case.replace(" ", "-")}'
+        out.mkdir()
+        link(root / cur / name, out / name)
+        before = {p.name: p.read_bytes() for p in (root / cur).iterdir()}
+        r = run([PATCHER, str(root / cur), str(root / patch), '-o', str(out), '--only', only])
+        err = r.stderr.decode()
+        if r.returncode == 0 or f'is the current set\'s {name}' not in err:
+            errors.append(f'alias ({case}): an output that is a current file was not refused: rc={r.returncode} {err[-300:]}')
+        if {p.name: p.read_bytes() for p in (root / cur).iterdir()} != before:
+            errors.append(f'alias ({case}): the current set changed')
+
     # A streamed output whose reader goes away fails the run (the entry pipeline's four outputs were
     # closed unchecked): geo_cells.bin is a FIFO whose reader closes at once, the patch rewrites 4 MiB
     # of rows (more than the pipe and the stdio buffer hold), SIGPIPE is ignored.
