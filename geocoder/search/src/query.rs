@@ -85,13 +85,23 @@ impl Automaton for Anchored<'_> {
     }
 }
 
-#[derive(PartialEq, PartialOrd, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct Ord32(f32);
+impl PartialEq for Ord32 {
+    fn eq(&self, other: &Self) -> bool { self.cmp(other).is_eq() }
+}
+impl PartialOrd for Ord32 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+}
 impl Eq for Ord32 {}
 impl Ord for Ord32 {
     fn cmp(&self, o: &Self) -> std::cmp::Ordering {
         self.0.total_cmp(&o.0)
     }
+}
+
+fn context_mask_key(name_id: u32, country_code: u16, admin_level: u8) -> (u32, u16, bool) {
+    (name_id, country_code, admin_level == 2)
 }
 
 /// Best text score per matched fst value.
@@ -247,6 +257,7 @@ impl Pool {
 
     /// No candidate scoring at most this can reach the results.
     fn cutoff(&self) -> f32 {
+        if self.top_k == 0 { return f32::INFINITY; }
         if self.top.len() < self.top_k {
             self.threshold()
         } else {
@@ -319,12 +330,12 @@ impl<'a, 'g> Searcher<'a, 'g> {
     /// name (or ISO code, or country code) matches a word, and that contain the point (the
     /// cell's interior flag, else point-in-polygon only for those boundaries). A one-cell slice
     /// of the reverse lookup, without its field mapping.
-    fn context_mask(&self, ctx: &Context, names: &mut HashMap<u32, u64>, e: u32) -> u64 {
+    fn context_mask(&self, ctx: &Context, names: &mut HashMap<(u32, u16, bool), u64>, e: u32) -> u64 {
         let geo: &Index = self.idx.geo;
         let (lat, lng) = self.idx.ents.point(e);
         let mut m = 0u64;
         for (_, ap, interior) in self.cell_polygons(lat, lng) {
-            let nm = *names.entry(ap.name_id).or_insert_with(|| {
+            let nm = *names.entry(context_mask_key(ap.name_id, ap.country_code, ap.admin_level)).or_insert_with(|| {
                 let folded = normalize(geo.get_string(ap.name_id));
                 let cc = cc_of(ap.country_code);
                 let mut nm = ctx.mask_of(&folded);
@@ -517,7 +528,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
             return;
         }
         cands.sort_by(|a, b| b.potential.total_cmp(&a.potential).then(a.entity.cmp(&b.entity)));
-        let mut names: HashMap<u32, u64> = HashMap::new();
+        let mut names: HashMap<(u32, u16, bool), u64> = HashMap::new();
         let mut checked: HashMap<u32, bool> = HashMap::new();
         for c in cands {
             if c.potential <= pool.cutoff() {
@@ -539,6 +550,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
     }
 
     pub fn search(&self, q: &str, limit: usize) -> (Vec<Found<'g>>, QueryStats) {
+        if limit == 0 { return (Vec::new(), QueryStats::default()); }
         let mut st = State { ctx: HashMap::new(), stats: QueryStats::default() };
         let mut pool = Pool { best: HashMap::new(), heap: BinaryHeap::new(), top: Vec::new(), top_k: limit * CONTEXT_CUTOFF_FACTOR };
         let mut phrases: Vec<String> = Vec::new();
@@ -653,4 +665,33 @@ mod tests {
         let c = Context { words: &words, phrase: "tx".into() };
         assert_eq!(c.mask_of("texas") & 1, 0);
     }
+    #[test]
+    fn zero_limit_has_no_reachable_candidate() {
+        let mut pool = Pool { best: HashMap::new(), heap: BinaryHeap::new(), top: Vec::new(), top_k: 0 };
+        assert_eq!(pool.cutoff(), f32::INFINITY);
+        pool.top.push(1.0);
+        assert_eq!(pool.cutoff(), f32::INFINITY);
+    }
+
+    #[test]
+    fn context_masks_distinguish_country_and_state_codes() {
+        let mut names = HashMap::new();
+        let country = context_mask_key(10, u16::from_le_bytes(*b"GE"), 2);
+        let state = context_mask_key(10, 0, 4);
+        names.insert(country, 1);
+        assert_eq!(*names.entry(state).or_insert(2), 2);
+        assert_ne!(context_mask_key(10, 0, 2), context_mask_key(10, 0, 4));
+        assert_ne!(context_mask_key(10, 1, 4), context_mask_key(10, 2, 4));
+    }
+
+    #[test]
+    fn float_order_is_consistent_for_nan_and_signed_zero() {
+        for value in [f32::NAN, -0.0, 0.0, 1.0] {
+            let a = Ord32(value);
+            assert!(a == a);
+            assert_eq!(a.partial_cmp(&a), Some(a.cmp(&a)));
+        }
+        assert!(Ord32(-0.0) != Ord32(0.0));
+    }
+
 }
