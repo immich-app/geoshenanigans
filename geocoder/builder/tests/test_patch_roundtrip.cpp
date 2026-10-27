@@ -1,10 +1,12 @@
 // Round trips through the geocoder-diff and geocoder-patch tools: two small
 // build dirs, the patch between them, and the patched dir compared with the
-// new one file by file.
+// new one file by file. Then patch files the patcher must take as named or
+// refuse: a patch is untrusted input.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <iterator>
 #include <map>
 #include <string>
 #include <vector>
@@ -104,12 +106,39 @@ std::string quoted(const std::string& s) {
     return out + "'";
 }
 
-// Runs the words with their output appended to log; true on exit status 0.
-bool run(const std::vector<std::string>& words, const std::string& log) {
-    std::string cmd;
+// Runs the words (in dir cwd when given) with their output appended to log;
+// true on exit status 0. Stdin is /dev/null: after a usage error zstd waits
+// for Enter at a console.
+bool run(const std::vector<std::string>& words, const std::string& log, const std::string& cwd = "") {
+    std::string cmd = cwd.empty() ? "" : "cd " + quoted(cwd) + " && ";
     for (const auto& w : words) cmd += quoted(w) + " ";
-    return std::system((cmd + ">> " + quoted(log) + " 2>&1").c_str()) == 0;
+    return std::system((cmd + "< /dev/null >> " + quoted(log) + " 2>&1").c_str()) == 0;
 }
+
+// payload compressed as the diff compresses a patch, at path.
+bool write_patch(const std::string& path, const std::vector<char>& payload, const std::string& log) {
+    const std::string raw = path + ".raw";
+    return write_file(raw, payload) && run({"zstd", "-q", "-f", raw, "-o", path}, log);
+}
+
+// A geocoder-patch run: exit status 0, and its log.
+struct PatchRun {
+    bool ok;
+    std::string log;
+};
+
+// Applies patch to root/old into out, both paths relative to root (the
+// patcher's current dir).
+PatchRun run_patch(const std::string& root, const std::string& patch, const std::string& out) {
+    const std::string log = root + "/" + out + ".log";
+    PatchRun r;
+    r.ok = run({GEOCODER_PATCH_BIN, "old", patch, "-o", out}, log, root);
+    auto text = read_file(log);
+    r.log.assign(text.begin(), text.end());
+    return r;
+}
+
+bool logged(const PatchRun& r, const std::string& line) { return r.log.find(line) != std::string::npos; }
 
 // A day's identity sidecars by family ("street", "interp", "addr"): one
 // entity key per record (tools/identity_sidecar.h).
@@ -403,4 +432,27 @@ TEST(patch_round_trip_by_identity_rebuilds_interp_ways) {
 
     CHECK(r.mismatches.empty());
     CHECK(logged(r, "interp_ways identity: match=1 replace=1 insert=2 delete=2 moved=1"));
+}
+
+// The patch path is one argument to the decompressor whatever its
+// characters: a compressed non-patch under each name is decompressed as
+// named (the patcher gets as far as its magic), and no part of a name runs
+// as a command.
+TEST(patch_decompresses_the_patch_path_as_named) {
+    ScratchDir dir("patch-named");
+    const std::string& root = dir.path();
+    const std::string not_a_patch = "NOT A GCPATCH";
+    REQUIRE(write_dir(root + "/old", {}));
+    REQUIRE(write_patch(root + "/not-a-patch.gcpatch", std::vector<char>(not_a_patch.begin(), not_a_patch.end()),
+                        root + "/zstd.log"));
+    const std::string names[] = {"user's patch.gcpatch", "x'; touch pwned; 'y.gcpatch", "-patch.gcpatch"};
+    for (size_t i = 0; i < std::size(names); i++) {
+        std::filesystem::copy_file(root + "/not-a-patch.gcpatch", root + "/" + names[i]);
+
+        auto r = run_patch(root, names[i], "out" + std::to_string(i));
+
+        CHECK(!r.ok);
+        CHECK(logged(r, "Bad magic"));
+    }
+    CHECK(!std::filesystem::exists(root + "/pwned"));
 }
