@@ -879,9 +879,14 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
 /// Builds the sub-indexes `subs` of `geo` for the index directory `out`, `meta` with each one's
 /// stats becoming its search_meta.json. Every file is written into a staging directory and moved
 /// into `out` only once all of them are complete, search_meta.json last (`publish`): a failed
-/// build or move leaves `out` as it was. Returns the stats.
+/// build or move leaves `out` as it was. Returns the stats; an error, before anything is built,
+/// while files a failed publish could not put back are still aside.
 pub fn build_all(geo: &Index, subs: &[&str], out: &Path, opts: &BuildOpts, meta: serde_json::Value) -> Result<Vec<(String, Stats)>, String> {
     let stage = out.join(BUILD_STAGE_DIR);
+    if holds_replaced(&stage) {
+        let aside = stage.join(BUILD_ASIDE_DIR);
+        return Err(format!("{}: files a failed publish replaced; move them back into {} or remove them", aside.display(), out.display()));
+    }
     let _ = std::fs::remove_dir_all(&stage);
     let built = build_staged(geo, subs, &stage, opts, meta)
         .and_then(|stats| publish(&stage, out, |from, to| std::fs::rename(from, to)).map(|_| stats).map_err(|e| format!("publish {}: {e}", out.display())));
@@ -889,13 +894,16 @@ pub fn build_all(geo: &Index, subs: &[&str], out: &Path, opts: &BuildOpts, meta:
     built
 }
 
-/// Removes the staging directory, unless a publish that failed to put files back left the files
-/// they replaced in it.
+/// Whether a publish that failed to put files back left the files they replaced in `stage`.
+fn holds_replaced(stage: &Path) -> bool {
+    std::fs::read_dir(stage.join(BUILD_ASIDE_DIR)).is_ok_and(|mut d| d.next().is_some())
+}
+
+/// Removes the staging directory, unless it holds files a failed publish replaced.
 fn clear_stage(stage: &Path) {
-    if std::fs::read_dir(stage.join(BUILD_ASIDE_DIR)).is_ok_and(|mut d| d.next().is_some()) {
-        return;
+    if !holds_replaced(stage) {
+        let _ = std::fs::remove_dir_all(stage);
     }
-    let _ = std::fs::remove_dir_all(stage);
 }
 
 fn build_staged(geo: &Index, subs: &[&str], stage: &Path, opts: &BuildOpts, mut meta: serde_json::Value) -> Result<Vec<(String, Stats)>, String> {
@@ -1401,6 +1409,29 @@ mod tests {
         assert!(err.to_string().contains(aside.to_str().unwrap()), "{err}");
         assert_eq!(std::fs::read_to_string(aside.join("a")).ok().as_deref(), Some("old a"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_build_keeps_the_files_a_failed_publish_could_not_put_back() {
+        use crate::fixture::{build_search, Geo, TempDir};
+        let mut g = Geo::default();
+        g.place("Testburg", 1, 10.1, 20.1);
+        let dir = TempDir::new("kept-replaced");
+        let geo = g.load(&dir.0.join("geo"));
+        let out = dir.0.join("idx");
+        build_search(&geo, &out, None);
+        let kept = out.join(BUILD_STAGE_DIR).join(BUILD_ASIDE_DIR).join("places.fst");
+        std::fs::create_dir_all(kept.parent().unwrap()).unwrap();
+        std::fs::write(&kept, "old places.fst").unwrap();
+        let opts = BuildOpts {
+            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"), inline: true, extras: None,
+            imp_dir: None, area_proxy: false, poi_max_tier: 3,
+        };
+
+        let err = build_all(&geo, &["places"], &out, &opts, serde_json::json!({})).err();
+
+        assert!(err.as_deref().is_some_and(|e| e.contains(BUILD_ASIDE_DIR)), "{err:?}");
+        assert_eq!(std::fs::read_to_string(&kept).ok().as_deref(), Some("old places.fst"));
     }
 
     #[test]
