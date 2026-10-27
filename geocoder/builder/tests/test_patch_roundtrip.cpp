@@ -1,10 +1,13 @@
 // Round trips through the geocoder-diff and geocoder-patch tools: two small
 // build dirs, the patch between them, and the patched dir compared with the
-// new one file by file.
+// new one file by file. Then patch files the patcher must take as named or
+// refuse: a patch is untrusted input.
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <iterator>
 #include <map>
 #include <string>
 #include <vector>
@@ -104,12 +107,39 @@ std::string quoted(const std::string& s) {
     return out + "'";
 }
 
-// Runs the words with their output appended to log; true on exit status 0.
-bool run(const std::vector<std::string>& words, const std::string& log) {
-    std::string cmd;
+// Runs the words (in dir cwd when given) with their output appended to log;
+// true on exit status 0. Stdin is /dev/null: after a usage error zstd waits
+// for Enter at a console.
+bool run(const std::vector<std::string>& words, const std::string& log, const std::string& cwd = "") {
+    std::string cmd = cwd.empty() ? "" : "cd " + quoted(cwd) + " && ";
     for (const auto& w : words) cmd += quoted(w) + " ";
-    return std::system((cmd + ">> " + quoted(log) + " 2>&1").c_str()) == 0;
+    return std::system((cmd + "< /dev/null >> " + quoted(log) + " 2>&1").c_str()) == 0;
 }
+
+// payload compressed as the diff compresses a patch, at path.
+bool write_patch(const std::string& path, const std::vector<char>& payload, const std::string& log) {
+    const std::string raw = path + ".raw";
+    return write_file(raw, payload) && run({"zstd", "-q", "-f", raw, "-o", path}, log);
+}
+
+// A geocoder-patch run: exit status 0, and its log.
+struct PatchRun {
+    bool ok;
+    std::string log;
+};
+
+// Applies patch to root/old into out, both paths relative to root (the
+// patcher's current dir).
+PatchRun run_patch(const std::string& root, const std::string& patch, const std::string& out) {
+    const std::string log = root + "/" + out + ".log";
+    PatchRun r;
+    r.ok = run({GEOCODER_PATCH_BIN, "old", patch, "-o", out}, log, root);
+    auto text = read_file(log);
+    r.log.assign(text.begin(), text.end());
+    return r;
+}
+
+bool logged(const PatchRun& r, const std::string& line) { return r.log.find(line) != std::string::npos; }
 
 // A day's identity sidecars by family ("street", "interp", "addr"): one
 // entity key per record (tools/identity_sidecar.h).
@@ -288,6 +318,95 @@ void put_identity_interps(BuildDir& old_d, BuildDir& new_d, Identity& ids) {
     new_d["interp_postcodes.bin"] = bytes_of(std::vector<uint32_t>{NEW_C, NEW_B, NEW_D, NO_DATA});
 }
 
+// way_parents.bin of SPARSE_RECORDS admin ids, the SPARSE_CHANGES (position,
+// id) changed on the new day. With no street ways to follow, the diff sends
+// the new file as a sparse delta.
+constexpr uint32_t SPARSE_RECORDS = 4096;
+constexpr std::pair<uint32_t, uint32_t> SPARSE_CHANGES[] = {{10, 7777}, {2000, 8888}, {4000, 9999}};
+
+std::vector<uint32_t> old_way_parents() {
+    std::vector<uint32_t> ids(SPARSE_RECORDS);
+    for (uint32_t i = 0; i < SPARSE_RECORDS; i++) ids[i] = i % 1000;
+    return ids;
+}
+
+std::vector<uint32_t> new_way_parents() {
+    auto ids = old_way_parents();
+    for (const auto& [pos, id] : SPARSE_CHANGES) ids[pos] = id;
+    return ids;
+}
+
+template <typename T>
+void put_at(std::vector<char>& out, size_t at, T v) {
+    memcpy(out.data() + at, &v, sizeof v);
+}
+
+// The offset of needle in hay, or npos unless it occurs exactly once.
+size_t find_once(const std::vector<char>& hay, const std::vector<char>& needle) {
+    auto at = std::search(hay.begin(), hay.end(), needle.begin(), needle.end());
+    if (at == hay.end() || std::search(at + 1, hay.end(), needle.begin(), needle.end()) != hay.end())
+        return std::string::npos;
+    return static_cast<size_t>(at - hay.begin());
+}
+
+// The diff of old_way_parents() -> new_way_parents(), uncompressed, and
+// where it holds the fields a test edits. raw is empty when a tool failed or
+// the patch holds no single way_parents sparse delta.
+struct SparsePatch {
+    std::vector<char> raw;
+    size_t new_size_at = 0, last_pos_at = 0, listed_size_at = 0;
+
+    // The client file list is kept in step, so only the section is wrong.
+    void set_new_size(uint64_t size) {
+        put_at(raw, new_size_at, size);
+        put_at(raw, listed_size_at, size);
+    }
+    void set_last_pos(uint32_t pos) { put_at(raw, last_pos_at, pos); }
+};
+
+// Writes root/old and root/new and diffs them.
+SparsePatch diff_way_parents(const std::string& root) {
+    const std::string patch = root + "/p.gcpatch", raw = root + "/p.raw", log = root + "/tools.log";
+    const uint64_t size = uint64_t{SPARSE_RECORDS} * 4;
+    SparsePatch p;
+    if (!write_dir(root + "/old", {{"way_parents.bin", bytes_of(old_way_parents())}}) ||
+        !write_dir(root + "/new", {{"way_parents.bin", bytes_of(new_way_parents())}}) ||
+        !run({GEOCODER_DIFF_BIN, root + "/old", root + "/new", "-o", patch}, log) ||
+        !run({"zstd", "-d", "-q", "-f", patch, "-o", raw}, log))
+        return p;
+    auto bytes = read_file(raw);
+    // file_id, stride, old_size, new_size, value_stride, remap_kind, n_changes
+    std::vector<char> section;
+    append(section, static_cast<uint32_t>(PatchFileId::WAY_PARENTS));
+    append(section, SPARSE_DELTA_STRIDE);
+    append(section, size);
+    append(section, size);
+    append(section, uint32_t{4});
+    append(section, uint32_t{1});
+    append(section, static_cast<uint32_t>(std::size(SPARSE_CHANGES)));
+    // name_len, name, size, inline
+    const std::string name = "way_parents.bin";
+    std::vector<char> listed;
+    append(listed, static_cast<uint16_t>(name.size()));
+    listed.insert(listed.end(), name.begin(), name.end());
+    append(listed, size);
+    append(listed, uint8_t{0});
+    const size_t section_at = find_once(bytes, section), listed_at = find_once(bytes, listed);
+    if (section_at == std::string::npos || listed_at == std::string::npos) return p;
+    p.new_size_at = section_at + 16;
+    p.last_pos_at = section_at + section.size() + (std::size(SPARSE_CHANGES) - 1) * 8;
+    p.listed_size_at = listed_at + 2 + name.size();
+    p.raw = std::move(bytes);
+    return p;
+}
+
+// raw compressed to root/<name>.gcpatch and applied to root/old into
+// root/<name>.
+PatchRun apply_raw(const std::string& root, const std::vector<char>& raw, const std::string& name) {
+    if (!write_patch(root + "/" + name + ".gcpatch", raw, root + "/zstd.log")) return {false, "patch not written"};
+    return run_patch(root, name + ".gcpatch", name);
+}
+
 }  // namespace
 
 TEST(patch_round_trip_keeps_the_street_ids_of_unchanged_street_ways) {
@@ -403,4 +522,89 @@ TEST(patch_round_trip_by_identity_rebuilds_interp_ways) {
 
     CHECK(r.mismatches.empty());
     CHECK(logged(r, "interp_ways identity: match=1 replace=1 insert=2 delete=2 moved=1"));
+}
+
+// The patch path is one argument to the decompressor whatever its
+// characters: a compressed non-patch under each name is decompressed as
+// named (the patcher gets as far as its magic), and no part of a name runs
+// as a command.
+TEST(patch_decompresses_the_patch_path_as_named) {
+    ScratchDir dir("patch-named");
+    const std::string& root = dir.path();
+    const std::string not_a_patch = "NOT A GCPATCH";
+    REQUIRE(write_dir(root + "/old", {}));
+    REQUIRE(write_patch(root + "/not-a-patch.gcpatch", std::vector<char>(not_a_patch.begin(), not_a_patch.end()),
+                        root + "/zstd.log"));
+    const std::string names[] = {"user's patch.gcpatch", "x'; touch pwned; 'y.gcpatch", "-patch.gcpatch"};
+    for (size_t i = 0; i < std::size(names); i++) {
+        std::filesystem::copy_file(root + "/not-a-patch.gcpatch", root + "/" + names[i]);
+
+        auto r = run_patch(root, names[i], "out" + std::to_string(i));
+
+        CHECK(!r.ok);
+        CHECK(logged(r, "Bad magic"));
+    }
+    CHECK(!std::filesystem::exists(root + "/pwned"));
+}
+
+// A patch shorter than its 8-byte magic is refused as truncated: the magic
+// is read through the bounds check like every later field.
+TEST(patch_refuses_a_patch_shorter_than_its_magic) {
+    ScratchDir dir("patch-short");
+    const std::string& root = dir.path();
+    REQUIRE(write_dir(root + "/old", {}));
+    REQUIRE(write_patch(root + "/short.gcpatch", std::vector<char>(GCPATCH_MAGIC, GCPATCH_MAGIC + 7),
+                        root + "/zstd.log"));
+
+    auto r = run_patch(root, "short.gcpatch", "out");
+
+    CHECK(!r.ok);
+    CHECK(logged(r, "Truncated patch: need 8 bytes for magic"));
+}
+
+// A sparse delta's change at its file's last record applies: the patcher
+// refuses records past the end, not the last one.
+TEST(patch_applies_a_sparse_delta_change_at_the_last_record) {
+    ScratchDir dir("patch-sparse");
+    SparsePatch p = diff_way_parents(dir.path());
+    REQUIRE(!p.raw.empty());
+    p.set_last_pos(SPARSE_RECORDS - 1);
+
+    auto r = apply_raw(dir.path(), p.raw, "out");
+
+    auto want = new_way_parents();
+    const auto [last_pos, last_id] = SPARSE_CHANGES[std::size(SPARSE_CHANGES) - 1];
+    want[last_pos] = old_way_parents()[last_pos];
+    want[SPARSE_RECORDS - 1] = last_id;
+    CHECK(r.ok);
+    CHECK(read_file(dir.path() + "/out/way_parents.bin") == bytes_of(want));
+}
+
+// A change writes its record whole, so a sparse delta whose new size ends in
+// part of a record is refused.
+TEST(patch_refuses_a_sparse_delta_ending_in_part_of_a_record) {
+    ScratchDir dir("patch-sparse");
+    SparsePatch p = diff_way_parents(dir.path());
+    REQUIRE(!p.raw.empty());
+    p.set_new_size(uint64_t{SPARSE_RECORDS} * 4 - 1);
+    p.set_last_pos(SPARSE_RECORDS - 1);
+
+    auto r = apply_raw(dir.path(), p.raw, "out");
+
+    CHECK(!r.ok);
+    CHECK(logged(r, "Malformed sparse delta"));
+}
+
+// A sparse delta's change past its file's last record is refused, not
+// dropped unread.
+TEST(patch_refuses_a_sparse_delta_change_past_the_last_record) {
+    ScratchDir dir("patch-sparse");
+    SparsePatch p = diff_way_parents(dir.path());
+    REQUIRE(!p.raw.empty());
+    p.set_last_pos(SPARSE_RECORDS);
+
+    auto r = apply_raw(dir.path(), p.raw, "out");
+
+    CHECK(!r.ok);
+    CHECK(logged(r, "Malformed sparse delta"));
 }
