@@ -176,7 +176,7 @@ pub fn build_search(geo: &Index, out: &Path, extras: Option<&Path>) {
     let subs: &[&str] = if geo.poi_records.is_some() { &["places", "poi"] } else { &["places"] };
     let n_place_nodes = geo.place_nodes.as_ref().map_or(0, |m| m.len() / std::mem::size_of::<PlaceNode>() as u64);
     let meta = serde_json::json!({"n_place_nodes": n_place_nodes, "extras": extras.is_some()});
-    build_all(geo, subs, out, &opts, meta).unwrap();
+    build_all(geo, subs, out, &opts, || Ok(meta)).unwrap();
 }
 
 /// A `*_cells.bin` (u64 cell, u32 entry offset; sorted) and its `*_entries.bin` (u16 count, then

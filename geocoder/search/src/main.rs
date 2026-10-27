@@ -72,20 +72,21 @@ fn cmd_build(args: &[String]) {
     let subs: Vec<&str> = selected.iter().copied().filter(|&s| s != "poi" || geo.poi_records.is_some()).collect();
     let mut replacing = subs.clone();
     if geo.poi_records.is_none() { replacing.push("poi"); }
-    place_search::build::check_retained_names(&out, &replacing, opts.extras.is_some())
-        .unwrap_or_else(|e| panic!("{e}"));
-    let meta_path = out.join("search_meta.json");
-    let mut meta: serde_json::Value = std::fs::read_to_string(&meta_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| json!({}));
-    let n_place_nodes = geo.place_nodes.as_ref().map(|m| m.len() / 20).unwrap_or(0);
-    meta["n_place_nodes"] = json!(n_place_nodes);
-    meta["extras"] = json!(opts.extras.is_some());
-    meta["inline"] = json!(opts.inline);
-    meta["imp"] = json!(opts.imp_dir.is_some());
-    meta["area_proxy"] = json!(opts.area_proxy);
-    meta["poi_max_tier"] = json!(opts.poi_max_tier);
+    let meta = || {
+        place_search::build::check_retained_names(&out, &replacing, opts.extras.is_some())?;
+        let mut meta: serde_json::Value = std::fs::read_to_string(out.join("search_meta.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| json!({}));
+        let n_place_nodes = geo.place_nodes.as_ref().map(|m| m.len() / 20).unwrap_or(0);
+        meta["n_place_nodes"] = json!(n_place_nodes);
+        meta["extras"] = json!(opts.extras.is_some());
+        meta["inline"] = json!(opts.inline);
+        meta["imp"] = json!(opts.imp_dir.is_some());
+        meta["area_proxy"] = json!(opts.area_proxy);
+        meta["poi_max_tier"] = json!(opts.poi_max_tier);
+        Ok(meta)
+    };
     let stats = build_all(&geo, &subs, &out, &opts, meta).unwrap_or_else(|e| panic!("{e}"));
     for (s, st) in &stats {
         for (k, v) in &st.lines {

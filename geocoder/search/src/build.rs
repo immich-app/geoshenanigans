@@ -876,12 +876,15 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
     Ok(st)
 }
 
-/// Builds the sub-indexes `subs` of `geo` for the index directory `out`, `meta` with each one's
-/// stats becoming its search_meta.json. Every file is written into a staging directory and moved
-/// into `out` only once all of them are complete, search_meta.json last (`publish`): a failed
-/// build or move leaves `out` as it was. Returns the stats; an error, before anything is built,
-/// while files a failed publish could not put back are still aside.
-pub fn build_all(geo: &Index, subs: &[&str], out: &Path, opts: &BuildOpts, meta: serde_json::Value) -> Result<Vec<(String, Stats)>, String> {
+/// Builds the sub-indexes `subs` of `geo` for the index directory `out`, the value `meta` gives
+/// with each one's stats becoming its search_meta.json. Every file is written into a staging
+/// directory and moved into `out` only once all of them are complete, search_meta.json last
+/// (`publish`): a failed build or move leaves `out` as it was. Returns the stats; an error, before
+/// anything is built, when `meta` fails or while files a failed publish could not put back are
+/// still aside.
+pub fn build_all(geo: &Index, subs: &[&str], out: &Path, opts: &BuildOpts,
+                 meta: impl FnOnce() -> Result<serde_json::Value, String>) -> Result<Vec<(String, Stats)>, String> {
+    let meta = meta()?;
     let stage = out.join(BUILD_STAGE_DIR);
     if holds_replaced(&stage) {
         let aside = stage.join(BUILD_ASIDE_DIR);
@@ -1343,7 +1346,7 @@ mod tests {
             imp_dir: Some(imp.to_str().unwrap().into()), area_proxy: false, poi_max_tier: 3,
         };
 
-        let err = build_all(&geo, &["places", "poi"], &out, &opts, serde_json::json!({})).err();
+        let err = build_all(&geo, &["places", "poi"], &out, &opts, || Ok(serde_json::json!({}))).err();
 
         assert!(err.as_deref().is_some_and(|e| e.contains("imp_poi.u8")), "{err:?}");
         let after = entries(&out);
@@ -1428,7 +1431,7 @@ mod tests {
             imp_dir: None, area_proxy: false, poi_max_tier: 3,
         };
 
-        let err = build_all(&geo, &["places"], &out, &opts, serde_json::json!({})).err();
+        let err = build_all(&geo, &["places"], &out, &opts, || Ok(serde_json::json!({}))).err();
 
         assert!(err.as_deref().is_some_and(|e| e.contains(BUILD_ASIDE_DIR)), "{err:?}");
         assert_eq!(std::fs::read_to_string(&kept).ok().as_deref(), Some("old places.fst"));
