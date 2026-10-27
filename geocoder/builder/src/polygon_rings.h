@@ -33,6 +33,8 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -246,19 +248,291 @@ inline std::vector<int> assign_holes(const std::vector<std::vector<LatLng>>& out
     return owner;
 }
 
-// The keyhole range of a closed outer ring and its closed holes once
-// `simplify` (closed ring in, closed ring out) has run on each, and how many
-// holes it holds: holes that collapse below a triangle are dropped, the rest
-// are put in a canonical order (by first vertex) and turned against the
-// outer ring. Without holes the range is just the simplified outer ring.
+// --- Ring topology ---
+//
+// The crossing-number test counts a point inside when an odd number of the
+// range's rings hold it. That is the outer ring minus the holes only while
+// every hole lies inside the outer ring and no two holes overlap: the part of
+// a hole outside the outer ring counts as inside, and so does the overlap of
+// two holes. Simplifying each ring on its own can break this near a boundary
+// (the outer ring cut short across an enclave beside it, or two enclaves
+// sharing a border each straightened their own way); rings_nest finds it.
+
+// Twice the signed area of the triangle a, b, c with lng as x and lat as y:
+// > 0 when c is left of a -> b, 0 when the three are collinear.
+inline double orientation(const LatLng& a, const LatLng& b, const LatLng& c) {
+    return (b.second - a.second) * (c.first - a.first) - (b.first - a.first) * (c.second - a.second);
+}
+
+// Whether c lies on the closed segment a-b.
+inline bool on_segment(const LatLng& a, const LatLng& b, const LatLng& c) {
+    return orientation(a, b, c) == 0 &&
+           std::min(a.first, b.first) <= c.first && c.first <= std::max(a.first, b.first) &&
+           std::min(a.second, b.second) <= c.second && c.second <= std::max(a.second, b.second);
+}
+
+// Where points lie against one closed ring: on one of its edges, else inside
+// or outside by ring_contains_latlng's crossing rule. Edges are bucketed by
+// longitude band, so a point reads only the edges at its own longitude, the
+// only ones it can lie on or count a crossing with.
+class RingLocator {
+public:
+    enum Side { kOutside, kOn, kInside };
+
+    explicit RingLocator(const std::vector<LatLng>& ring) : ring_(ring) {
+        for (const LatLng& p : ring) {
+            lo_ = std::min(lo_, p.second);
+            hi_ = std::max(hi_, p.second);
+        }
+        const size_t edges = ring.size() > 1 ? ring.size() - 1 : 0;
+        bands_.resize(std::clamp<size_t>(edges / 4, 1, size_t{1} << 14));
+        width_ = (hi_ - lo_) / static_cast<double>(bands_.size());
+        for (uint32_t k = 0; k < edges; k++) {
+            const size_t last = band(std::max(ring[k].second, ring[k + 1].second));
+            for (size_t b = band(std::min(ring[k].second, ring[k + 1].second)); b <= last; b++)
+                bands_[b].push_back(k);
+        }
+    }
+
+    Side locate(const LatLng& p) const {
+        if (!(p.second >= lo_ && p.second <= hi_)) return kOutside;
+        bool inside = false;
+        for (uint32_t k : bands_[band(p.second)]) {
+            const LatLng& a = ring_[k];
+            const LatLng& b = ring_[k + 1];
+            if (on_segment(a, b, p)) return kOn;
+            if (((a.second > p.second) != (b.second > p.second)) &&
+                (p.first < (b.first - a.first) * (p.second - a.second) / (b.second - a.second) + a.first))
+                inside = !inside;
+        }
+        return inside ? kInside : kOutside;
+    }
+
+private:
+    // Monotonic in lng, so an edge's bands run from its low end's to its high end's.
+    size_t band(double lng) const {
+        if (!(width_ > 0)) return 0;
+        const double x = std::floor((lng - lo_) / width_);
+        return x <= 0 ? 0 : std::min(static_cast<size_t>(x), bands_.size() - 1);
+    }
+
+    const std::vector<LatLng>& ring_;
+    double lo_ = std::numeric_limits<double>::infinity();
+    double hi_ = -std::numeric_limits<double>::infinity();
+    double width_ = 0;
+    std::vector<std::vector<uint32_t>> bands_;
+};
+
+// Whether a crossing-number test over the keyhole range of these closed
+// rings gives the outer ring minus the holes: no edge of one ring crosses an
+// edge of another, every hole lies inside the outer ring, and no hole inside
+// (or on top of) another. Rings may touch, at a vertex or along an edge they
+// share, as OSM's enclaves do.
+//
+// A sweep by longitude meets every edge with the edges of other rings whose
+// ranges overlap it, failing at a crossing. With none, each hole edge lies
+// wholly inside, outside or along another ring between the points where
+// that ring touches it, so the hole's vertices and the middle of each such
+// stretch place the whole hole. The doubles are taken as exact; the one
+// rounding that matters (a point collinear with a slanted edge it lies on,
+// read as just off it) can only turn a yes into a no.
+inline bool rings_nest(const std::vector<LatLng>& outer, const std::vector<std::vector<LatLng>>& holes) {
+    if (holes.empty()) return true;
+    std::vector<const std::vector<LatLng>*> rings{&outer};
+    for (const auto& h : holes) rings.push_back(&h);
+
+    struct Edge {
+        double lng_lo, lng_hi, lat_lo, lat_hi;
+        uint32_t ring, k;  // from vertex k to k + 1 of rings[ring]
+    };
+    std::vector<Edge> edges;
+    for (uint32_t r = 0; r < rings.size(); r++) {
+        const auto& ring = *rings[r];
+        for (uint32_t k = 0; k + 1 < ring.size(); k++) {
+            const LatLng& a = ring[k];
+            const LatLng& b = ring[k + 1];
+            if (same_vertex(a, b)) continue;
+            edges.push_back({std::min(a.second, b.second), std::max(a.second, b.second),
+                             std::min(a.first, b.first), std::max(a.first, b.first), r, k});
+        }
+    }
+    std::sort(edges.begin(), edges.end(), [](const Edge& x, const Edge& y) {
+        if (x.lng_lo != y.lng_lo) return x.lng_lo < y.lng_lo;
+        return x.ring != y.ring ? x.ring < y.ring : x.k < y.k;
+    });
+
+    // Per hole edge: whether another ring has the same edge, and the vertices
+    // of other rings inside it, where they touch it.
+    std::vector<std::vector<char>> shared(rings.size());
+    for (uint32_t r = 0; r < rings.size(); r++) shared[r].assign(rings[r]->size(), 0);
+    struct Touch {
+        uint32_t ring, k;
+        LatLng p;
+    };
+    std::vector<Touch> touches;
+    auto inside_edge = [](const LatLng& a, const LatLng& b, const LatLng& p) {
+        return on_segment(a, b, p) && !same_vertex(p, a) && !same_vertex(p, b);
+    };
+    // Meets two edges of different rings; false when they cross.
+    auto meet = [&](const Edge& e, const Edge& f) {
+        if (e.lat_hi < f.lat_lo || f.lat_hi < e.lat_lo) return true;
+        const LatLng& a = (*rings[e.ring])[e.k];
+        const LatLng& b = (*rings[e.ring])[e.k + 1];
+        const LatLng& c = (*rings[f.ring])[f.k];
+        const LatLng& d = (*rings[f.ring])[f.k + 1];
+        const double o1 = orientation(a, b, c), o2 = orientation(a, b, d);
+        const double o3 = orientation(c, d, a), o4 = orientation(c, d, b);
+        if (((o1 > 0 && o2 < 0) || (o1 < 0 && o2 > 0)) && ((o3 > 0 && o4 < 0) || (o3 < 0 && o4 > 0))) return false;
+        if ((same_vertex(a, c) && same_vertex(b, d)) || (same_vertex(a, d) && same_vertex(b, c))) {
+            shared[e.ring][e.k] = shared[f.ring][f.k] = 1;
+            return true;
+        }
+        for (const LatLng* p : {&c, &d})
+            if (e.ring > 0 && inside_edge(a, b, *p)) touches.push_back({e.ring, e.k, *p});
+        for (const LatLng* p : {&a, &b})
+            if (f.ring > 0 && inside_edge(c, d, *p)) touches.push_back({f.ring, f.k, *p});
+        return true;
+    };
+    // Meets edge e with the edges in `active` still reaching its longitude,
+    // dropping those that end before it.
+    auto sweep = [&](const Edge& e, std::vector<uint32_t>& active) {
+        for (size_t j = 0; j < active.size();) {
+            const Edge& f = edges[active[j]];
+            if (f.lng_hi < e.lng_lo) {
+                active[j] = active.back();
+                active.pop_back();
+                continue;
+            }
+            if (f.ring != e.ring && !meet(e, f)) return false;
+            j++;
+        }
+        return true;
+    };
+    // The outer ring's edges meet hole edges only: an outer ring of a
+    // million vertices costs its sort and nothing per pair of its own edges.
+    std::vector<uint32_t> outer_active, hole_active;
+    for (uint32_t i = 0; i < edges.size(); i++) {
+        const Edge& e = edges[i];
+        if (!sweep(e, hole_active)) return false;
+        if (e.ring == 0) {
+            outer_active.push_back(i);
+        } else {
+            if (!sweep(e, outer_active)) return false;
+            hole_active.push_back(i);
+        }
+    }
+
+    // Each hole's sample points: its vertices and the middle of every
+    // stretch of its edges between touching vertices, edges another ring
+    // shares left out.
+    std::sort(touches.begin(), touches.end(), [](const Touch& x, const Touch& y) {
+        if (x.ring != y.ring) return x.ring < y.ring;
+        return x.k != y.k ? x.k < y.k : x.p < y.p;
+    });
+    std::vector<std::vector<LatLng>> samples(rings.size());
+    size_t t = 0;
+    std::vector<LatLng> stops;
+    for (uint32_t r = 1; r < rings.size(); r++) {
+        const auto& ring = *rings[r];
+        for (uint32_t k = 0; k + 1 < ring.size(); k++) {
+            samples[r].push_back(ring[k]);
+            stops.assign({ring[k], ring[k + 1]});
+            for (; t < touches.size() && touches[t].ring == r && touches[t].k == k; t++) stops.push_back(touches[t].p);
+            if (shared[r][k] || same_vertex(ring[k], ring[k + 1])) continue;
+            // Points on a segment sort along it.
+            std::sort(stops.begin(), stops.end());
+            stops.erase(std::unique(stops.begin(), stops.end()), stops.end());
+            for (size_t j = 0; j + 1 < stops.size(); j++)
+                samples[r].push_back({(stops[j].first + stops[j + 1].first) / 2,
+                                      (stops[j].second + stops[j + 1].second) / 2});
+        }
+    }
+
+    const RingLocator outer_at(outer);
+    for (uint32_t r = 1; r < rings.size(); r++)
+        for (const LatLng& p : samples[r])
+            if (outer_at.locate(p) == RingLocator::kOutside) return false;
+
+    // Holes whose boxes overlap, found by a sweep by longitude: whether a
+    // sample of hole r lies inside hole q, or every one on it (r is q again).
+    std::vector<std::unique_ptr<RingLocator>> at(rings.size());
+    auto overlaps = [&](uint32_t r, uint32_t q) {
+        if (!at[q]) at[q] = std::make_unique<RingLocator>(*rings[q]);
+        bool off = false;
+        for (const LatLng& p : samples[r]) {
+            const RingLocator::Side side = at[q]->locate(p);
+            if (side == RingLocator::kInside) return true;
+            off |= side == RingLocator::kOutside;
+        }
+        return !off;
+    };
+    struct Box {
+        double lng_lo, lng_hi, lat_lo, lat_hi;
+        uint32_t ring;
+    };
+    std::vector<Box> boxes;
+    for (uint32_t r = 1; r < rings.size(); r++) {
+        Box b{INFINITY, -INFINITY, INFINITY, -INFINITY, r};
+        for (const LatLng& p : *rings[r]) {
+            b.lng_lo = std::min(b.lng_lo, p.second);
+            b.lng_hi = std::max(b.lng_hi, p.second);
+            b.lat_lo = std::min(b.lat_lo, p.first);
+            b.lat_hi = std::max(b.lat_hi, p.first);
+        }
+        boxes.push_back(b);
+    }
+    std::sort(boxes.begin(), boxes.end(), [](const Box& x, const Box& y) {
+        return x.lng_lo != y.lng_lo ? x.lng_lo < y.lng_lo : x.ring < y.ring;
+    });
+    std::vector<uint32_t> open;
+    for (uint32_t i = 0; i < boxes.size(); i++) {
+        const Box& b = boxes[i];
+        for (size_t j = 0; j < open.size();) {
+            const Box& o = boxes[open[j]];
+            if (o.lng_hi < b.lng_lo) {
+                open[j] = open.back();
+                open.pop_back();
+                continue;
+            }
+            if (!(o.lat_hi < b.lat_lo || b.lat_hi < o.lat_lo) && (overlaps(b.ring, o.ring) || overlaps(o.ring, b.ring)))
+                return false;
+            j++;
+        }
+        open.push_back(i);
+    }
+    return true;
+}
+
+// simplify_rings simplifies rings that don't nest again with the tolerance
+// halved, up to this many times, before keeping them as given.
+static constexpr uint8_t kToleranceHalvings = 4;
+// SimplifiedRings::halvings when no tolerance nested the rings.
+static constexpr uint8_t kKeptUnsimplified = kToleranceHalvings + 1;
+
+// A polygon's keyhole range as simplify_rings made it.
+struct SimplifiedRings {
+    std::vector<LatLng> range;
+    uint16_t holes = 0;  // excursions in the range
+    // Halvings of the tolerance it took for the simplified rings to nest, or
+    // kKeptUnsimplified.
+    uint8_t halvings = 0;
+    // False when even the rings as given don't nest: the source geometry's
+    // own fault, which no tolerance can repair.
+    bool nests = true;
+};
+
+// The outer ring and the holes `simplify` (closed ring in, closed ring out)
+// leaves: holes that collapse below a triangle are dropped, the rest turned
+// against the outer ring, at most 65535 (the largest), put in a canonical
+// order (by first vertex). No holes when the outer ring collapses.
 template <class Simplify>
-std::pair<std::vector<LatLng>, uint16_t> simplify_rings(const std::vector<LatLng>& outer,
-                                                        const std::vector<std::vector<LatLng>>& holes,
-                                                        Simplify simplify) {
-    std::vector<LatLng> out = simplify(outer);
-    if (holes.empty() || out.size() < kMinClosedRing) return {std::move(out), 0};
+std::pair<std::vector<LatLng>, std::vector<std::vector<LatLng>>> simplified_rings(
+    const std::vector<LatLng>& outer, const std::vector<std::vector<LatLng>>& holes, Simplify simplify) {
+    std::pair<std::vector<LatLng>, std::vector<std::vector<LatLng>>> rings{simplify(outer), {}};
+    const std::vector<LatLng>& out = rings.first;
+    std::vector<std::vector<LatLng>>& kept = rings.second;
+    if (holes.empty() || out.size() < kMinClosedRing) return rings;
     const bool outer_ccw = signed_area2(out) > 0;
-    std::vector<std::vector<LatLng>> kept;
     for (const auto& h : holes) {
         std::vector<LatLng> s = simplify(h);
         if (s.size() < kMinClosedRing || !same_vertex(s.front(), s.back())) continue;
@@ -271,15 +545,83 @@ std::pair<std::vector<LatLng>, uint16_t> simplify_rings(const std::vector<LatLng
         });
         kept.resize(std::numeric_limits<uint16_t>::max());
     }
-    if (kept.empty()) return {std::move(out), 0};
     std::stable_sort(kept.begin(), kept.end(), [](const auto& a, const auto& b) { return a.front() < b.front(); });
-    std::vector<LatLng> range = encode_rings(out, kept);
+    return rings;
+}
+
+// The keyhole range of a closed outer ring and its closed holes once each
+// has been simplified on its own by `simplify` (ring, tolerance scale) ->
+// ring, the scale a factor on the caller's tolerance. Rings simplified on
+// their own can stop nesting (rings_nest); the polygon is then simplified
+// again from its given rings at half the tolerance, up to kToleranceHalvings
+// times, and failing that kept as given. A tolerance small enough leaves
+// every vertex the rings had, so the halvings converge on the given rings;
+// each step depends on the rings alone, so the result is deterministic.
+// Without holes the range is just the simplified outer ring.
+template <class Simplify>
+SimplifiedRings simplify_rings(const std::vector<LatLng>& outer, const std::vector<std::vector<LatLng>>& holes,
+                               Simplify simplify) {
+    SimplifiedRings result;
+    double scale = 1;
+    auto at_scale = [&](const std::vector<LatLng>& ring) { return simplify(ring, scale); };
+    auto rings = simplified_rings(outer, holes, at_scale);
+    while (!rings_nest(rings.first, rings.second)) {
+        if (result.halvings == kToleranceHalvings) {
+            result.halvings = kKeptUnsimplified;
+            rings = simplified_rings(outer, holes, [](const std::vector<LatLng>& ring) { return ring; });
+            result.nests = rings_nest(rings.first, rings.second);
+            break;
+        }
+        result.halvings++;
+        scale /= 2;
+        rings = simplified_rings(outer, holes, at_scale);
+    }
+
+    auto& [out, kept] = rings;
+    result.range = std::move(out);
+    if (kept.empty()) return result;
+    std::vector<LatLng> range = encode_rings(result.range, kept);
     const auto count = static_cast<uint16_t>(kept.size());
     // The excursions must peel off again as the same rings.
     std::vector<RingSpan> spans;
     bool round_trip = split_rings(range.data(), static_cast<uint32_t>(range.size()), count, spans) &&
-                      spans[0].count == out.size();
+                      spans[0].count == result.range.size();
     for (size_t k = 0; round_trip && k < kept.size(); k++) round_trip = spans[k + 1].count == kept[k].size();
-    if (!round_trip) return {std::move(out), 0};
-    return {std::move(range), count};
+    if (!round_trip) return result;
+    result.range = std::move(range);
+    result.holes = count;
+    return result;
 }
+
+// How simplify_rings fared over many polygons, for the build log.
+struct HoleTopologyCounts {
+    uint64_t halved[kToleranceHalvings + 1] = {};  // [k]: nested after k halvings, k > 0
+    uint64_t unsimplified = 0;                      // kept as given
+    uint64_t not_nesting = 0;                       // of those, not nesting as given either
+
+    void add(uint8_t halvings, bool nests) {
+        if (halvings == kKeptUnsimplified) {
+            unsimplified++;
+            not_nesting += !nests;
+        } else if (halvings > 0) {
+            halved[halvings]++;
+        }
+    }
+    void add(const HoleTopologyCounts& o) {
+        for (size_t k = 0; k <= kToleranceHalvings; k++) halved[k] += o.halved[k];
+        unsimplified += o.unsimplified;
+        not_nesting += o.not_nesting;
+    }
+    // "<n> simplified again (tolerance/2 a, /4 b, ...), <m> kept unsimplified (<k> not nesting even so)"
+    std::string summary() const {
+        uint64_t again = 0;
+        std::string by_halving;
+        for (size_t k = 1; k <= kToleranceHalvings; k++) {
+            again += halved[k];
+            by_halving += (k == 1 ? "tolerance/" : ", /") + std::to_string(1u << k) + " " + std::to_string(halved[k]);
+        }
+        return std::to_string(again) + " polygons simplified again (" + by_halving + "), " +
+               std::to_string(unsimplified) + " kept unsimplified (" + std::to_string(not_nesting) +
+               " not nesting even so)";
+    }
+};
