@@ -169,7 +169,7 @@ inline void encode_poi(const std::string& src, const std::string& out, Manifest&
         if (!V.eof()) die("poi_vertices.bin: bytes not covered by any record");
         m.set("poi.bopen_bytes", O.tell());
     }
-    const uint32_t total = uint32_t(m.num("poi.bopen_bytes"));
+    const uint64_t total = m.num("poi.bopen_bytes");
     Reader R(rp);
     Writer O(out + "/poi_records.r3");
     size_t j = 0;
@@ -177,9 +177,12 @@ inline void encode_poi(const std::string& src, const std::string& out, Manifest&
     for (uint64_t i = 0; i < n; i++) {
         const uint8_t* r = R.take(36);
         const bool isp = rd32(r + 12) != 0;
-        const uint32_t mono = isp ? polyoff[j++] : (j < polyoff.size() ? polyoff[j] : total);
+        const uint64_t mono = isp ? polyoff[j++] : (j < polyoff.size() ? polyoff[j] : total);
+        // A point after the last polygon holds the file size, which the 32-bit field must hold too
+        // (as the patcher's PoiEnc checks before every record).
+        if (mono >= 0xFFFFFFFFull) die("poi_vertices.bopen offset overflow at record %llu", (unsigned long long)i);
         memcpy(rec, r, 8);
-        wr32(rec + 8, mono);
+        wr32(rec + 8, uint32_t(mono));
         memcpy(rec + 12, r + 16, 20);
         O.put(rec, 32);
     }
