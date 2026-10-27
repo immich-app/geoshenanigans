@@ -2010,10 +2010,11 @@ impl Index {
     // rank_address, boundaries before place nodes within a rank, and each
     // boundary it accepts (rank_address other than 5 and 11) becomes the
     // geometry later place nodes must sit in. A place node of rank R is so
-    // gated by the most specific boundary of rank <= R, whatever its
-    // admin_level: on a Vatican point that is the Vatican itself, which keeps
-    // Rome's neighbourhood nodes out. The smallest containing polygon stands
-    // in for the most specific accepted boundary. The rank is placex's
+    // gated by the last boundary accepted before it, the one of the highest
+    // rank <= R, whatever its admin_level: on a Vatican point that is the
+    // Vatican itself, which keeps Rome's neighbourhood nodes out. Within a
+    // rank the walk accepts the first boundary only; the smallest containing
+    // polygon of the rank stands in for it. The rank is placex's
     // rank_address, after the nested-boundary promotions (CurrentBoundaries::
     // from_ranked).
     pub fn find_current_boundaries(&self, lat: f64, lng: f64, country_code: Option<[u8; 2]>) -> CurrentBoundaries {
@@ -4094,17 +4095,20 @@ impl CurrentBoundaries {
     /// initial rank_address and the place areas holding it: the nested-
     /// boundary promotions give each its rank_address (an admin_level 7
     /// boundary in a level 6 one linked to a suburb is ranked 22, not 14),
-    /// then `pick` takes the smallest of rank <= each rank.
+    /// then `pick` chooses among those of rank <= each rank.
     pub fn from_ranked<'a>(mut ranked: Vec<RankedPoly>, place_areas: impl Iterator<Item = &'a AdminPolygon> + Clone) -> Self {
         promote_nested_ranks(&mut ranked, place_areas);
-        ranked.sort_by(|a, b| a.poly.area.total_cmp(&b.poly.area));
         let gating = ranked.into_iter().filter(|r| !matches!(r.rank_address, 0 | 5 | 11));
         Self::pick(gating.map(|r| (r.rank_address, r.poly)))
     }
 
     /// Each rank's boundary from (rank_address, polygon) candidates holding
-    /// the point, most specific first: the first of rank <= it.
+    /// the point: the one of the highest rank <= it, which Nominatim's walk
+    /// (by rank_address) accepts last before a place node of that rank, and
+    /// the smallest of that rank where several have it.
     pub fn pick(candidates: impl IntoIterator<Item = (u8, AdminPolygon)>) -> Self {
+        let mut candidates: Vec<(u8, AdminPolygon)> = candidates.into_iter().collect();
+        candidates.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.area.total_cmp(&b.1.area)));
         let mut found = Self::default();
         for (rank, poly) in candidates {
             let open: [bool; 3] = std::array::from_fn(|g| found.0[g].is_none() && rank <= Self::RANKS[g]);
@@ -4960,6 +4964,28 @@ mod pure_helper_tests {
         assert_eq!(gate(CurrentBoundaries::SUBURB), Some(8));
         assert_eq!(gate(CurrentBoundaries::QUARTER), Some(9));
         assert_eq!(gate(CurrentBoundaries::NEIGHBOURHOOD), Some(10));
+    }
+
+    #[test]
+    fn current_boundaries_take_the_highest_rank_before_the_smallest_area() {
+        // Concentric admin_level 6 boundaries: the larger, linked to a
+        // suburb, ranks 20, the smaller, linked to a city, 16. Nominatim's
+        // walk accepts the city at rank 16 and then the suburb at 20, which
+        // gates suburbs, quarters and neighbourhoods. Within a rank the
+        // smaller boundary gates.
+        let suburb = AdminPolygon { area: 10.0, place_type_override: 4, ..boundary(1, 6) };
+        let city = AdminPolygon { area: 1.0, place_type_override: 1, ..boundary(2, 6) };
+        let country = AdminPolygon { area: 1000.0, ..boundary(3, 2) };
+        let ranked = vec![
+            RankedPoly { poly: city, rank_address: 12 },
+            RankedPoly { poly: suburb, rank_address: 12 },
+            RankedPoly { poly: country, rank_address: 4 },
+        ];
+        let found = CurrentBoundaries::from_ranked(ranked, [].iter());
+        assert_eq!(names(&found), [Some(1), Some(1), Some(1)]);
+        let wider = AdminPolygon { area: 20.0, ..boundary(4, 8) };
+        let found = CurrentBoundaries::pick([(20, wider), (20, suburb), (16, city)]);
+        assert_eq!(names(&found), [Some(1), Some(1), Some(1)]);
     }
 
     #[test]
