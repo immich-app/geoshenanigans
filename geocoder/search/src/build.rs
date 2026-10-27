@@ -730,16 +730,17 @@ impl Group {
         }
     }
 
-    /// The kept postings into `out`, best importance first (then whole-name, then entity);
-    /// leaves the group empty.
-    fn take(&mut self, out: &mut Vec<Posting>) {
+    /// Hands the kept postings to `write`, best importance first (then whole-name, then entity),
+    /// sorted in the group's own buffer so a key's postings are held once; leaves the group empty.
+    fn take<R>(&mut self, write: impl FnOnce(&[Posting]) -> R) -> R {
         if let Some(l) = self.last.take() {
             self.keep(l);
         }
-        out.clear();
-        out.append(&mut self.whole);
-        out.extend(self.partial.drain().map(|w| w.0));
-        out.sort_unstable_by(|a, b| b.imp_q.cmp(&a.imp_q).then(a.partial.cmp(&b.partial)).then(a.entity.cmp(&b.entity)));
+        self.whole.extend(self.partial.drain().map(|w| w.0));
+        self.whole.sort_unstable_by(|a, b| b.imp_q.cmp(&a.imp_q).then(a.partial.cmp(&b.partial)).then(a.entity.cmp(&b.entity)));
+        let r = write(&self.whole);
+        self.whole.clear();
+        r
     }
 }
 
@@ -1031,20 +1032,17 @@ pub fn merge(runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, Strin
     let mut key: Vec<u8> = Vec::new();
     let mut p = Posting { entity: 0, imp_q: 0, partial: false, class: 0, ord: 0 };
     let mut group = Group::default();
-    let mut list: Vec<Posting> = Vec::new();
     while m.next(&mut key, &mut p).map_err(|e| e.to_string())? {
         if key != cur {
             if !group.is_empty() {
-                group.take(&mut list);
-                w.add(&cur, &list)?;
+                group.take(|list| w.add(&cur, list))?;
             }
             std::mem::swap(&mut cur, &mut key);
         }
         group.push(p);
     }
     if !group.is_empty() {
-        group.take(&mut list);
-        w.add(&cur, &list)?;
+        group.take(|list| w.add(&cur, list))?;
     }
     drop(m);
     for f in &files {
@@ -1353,8 +1351,7 @@ mod tests {
             for p in &postings {
                 sut.push(*p);
             }
-            let mut got = Vec::new();
-            sut.take(&mut got);
+            let got = sut.take(|list| list.to_vec());
             assert_eq!(got, kept_by_sorting(postings));
             assert!(sut.is_empty());
         }
@@ -1366,9 +1363,127 @@ mod tests {
         sut.push(posting(9, 10, true, 0));
         sut.push(posting(9, 10, false, 3));
         sut.push(posting(12, 50, true, 1));
-        let mut got = Vec::new();
-        sut.take(&mut got);
+        let got = sut.take(|list| list.to_vec());
         assert_eq!(got, vec![posting(12, 50, true, 1), posting(9, 10, false, 3)]);
+    }
+
+    #[test]
+    fn group_holds_only_the_next_keys_postings_after_a_take() {
+        let mut sut = Group::default();
+        sut.push(posting(3, 20, false, 0));
+        sut.push(posting(5, 30, true, 0));
+        sut.take(|_| ());
+        sut.push(posting(7, 10, false, 1));
+        let got = sut.take(|list| list.to_vec());
+        assert_eq!(got, vec![posting(7, 10, false, 1)]);
+    }
+
+    /// Heap the calling thread holds, counted by the test binary's allocator (per thread, so tests
+    /// running beside one another do not count).
+    mod heap {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static LIVE: Cell<isize> = const { Cell::new(0) };
+            static PEAK: Cell<isize> = const { Cell::new(0) };
+        }
+
+        fn note(delta: isize) {
+            let live = LIVE.get() + delta;
+            LIVE.set(live);
+            PEAK.set(PEAK.get().max(live));
+        }
+
+        struct Counting;
+
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+                let p = unsafe { System.alloc(l) };
+                if !p.is_null() {
+                    note(l.size() as isize);
+                }
+                p
+            }
+
+            unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+                let p = unsafe { System.alloc_zeroed(l) };
+                if !p.is_null() {
+                    note(l.size() as isize);
+                }
+                p
+            }
+
+            unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+                unsafe { System.dealloc(p, l) };
+                note(-(l.size() as isize));
+            }
+
+            unsafe fn realloc(&self, p: *mut u8, l: Layout, size: usize) -> *mut u8 {
+                let q = unsafe { System.realloc(p, l, size) };
+                if !q.is_null() {
+                    note(size as isize - l.size() as isize);
+                }
+                q
+            }
+        }
+
+        #[global_allocator]
+        static COUNTING: Counting = Counting;
+
+        /// `f`'s result and the most heap this thread held above its level at the call while `f` ran.
+        pub fn peak_during<R>(f: impl FnOnce() -> R) -> (R, usize) {
+            let base = LIVE.get();
+            PEAK.set(base);
+            let r = f();
+            (r, (PEAK.get() - base) as usize)
+        }
+    }
+
+    /// Merges one key named in full by `n` entities: the merge's peak heap and the key's encoded
+    /// list bytes (`.post`).
+    fn merge_one_key(n: u32) -> (usize, usize) {
+        let dir = tmp_dir(&format!("merge-heap-{n}"));
+        let mut run: Vec<(Vec<u8>, Posting)> =
+            (0..n).map(|entity| (b"church".to_vec(), Posting { entity, imp_q: 100, partial: false, class: 0, ord: 0 })).collect();
+        let files = vec![write_run(&dir, "k.run", &mut run)];
+        let runs = KeyRuns {
+            name: "poi".into(),
+            files,
+            st: Stats::default(),
+            ents: 0,
+            entries: 0,
+            spilled: 0,
+            t_src: Duration::ZERO,
+            t_keys: Duration::ZERO,
+        };
+        let opts = BuildOpts {
+            threads: 1,
+            mem_mb: DEFAULT_RUN_BUDGET_MB,
+            tmp: dir.clone(),
+            inline: false,
+            extras: None,
+            imp_dir: None,
+            area_proxy: false,
+            poi_max_tier: 3,
+        };
+        let (r, peak) = heap::peak_during(|| merge(runs, &dir, &opts));
+        r.unwrap();
+        let post = std::fs::metadata(dir.join("poi.post")).unwrap().len() as usize;
+        let _ = std::fs::remove_dir_all(&dir);
+        (peak, post)
+    }
+
+    #[test]
+    fn merge_holds_a_keys_whole_name_postings_once() {
+        // Over a one-posting key, the heap grows by one buffer of the postings and the list encoded
+        // from them; a second copy of the postings takes it to two copies plus the list.
+        let n = 1 << 16;
+        let (base, _) = merge_one_key(1);
+        let (peak, post) = merge_one_key(n);
+        let copy = n as usize * std::mem::size_of::<Posting>();
+        let growth = peak - base;
+        assert!(growth < 2 * copy + post, "heap grew {growth} bytes: postings {copy} bytes, encoded list {post} bytes");
     }
 
     fn writer(dir: &Path) -> Writer {
