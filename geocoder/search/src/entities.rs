@@ -208,4 +208,11 @@ impl<'a> Entities<'a> {
         let (k, t) = self.kind_and_type(e);
         k == Kind::Area || crate::constants::AREA_TYPES.contains(&t.as_ref())
     }
+
+    /// A settlement: a visible place node of a settlement type (city, town, village, hamlet) or a
+    /// boundary a place node labels, of no area type; not a suburb-like node and not a POI.
+    pub fn is_settlement(&self, e: u32) -> bool {
+        let (k, t) = self.kind_and_type(e);
+        matches!(k, Kind::Place | Kind::Linked) && !crate::constants::AREA_TYPES.contains(&t.as_ref())
+    }
 }

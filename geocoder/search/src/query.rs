@@ -614,7 +614,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
             }
             let area_label = label(&hits[i]);
             let found = (i + 1..hits.len().min(i + 1 + AREA_CHECK_TOP))
-                .filter(|&j| !ents.is_area(hits[j].entity) && label(&hits[j]) == area_label)
+                .filter(|&j| ents.is_settlement(hits[j].entity) && label(&hits[j]) == area_label)
                 .find(|&j| self.contained_in(hits[j].entity, &area));
             if let Some(j) = found {
                 hits[i].score = hits[j].score * 0.999;
@@ -725,6 +725,30 @@ mod tests {
         let mut kept: Vec<u32> = pool.best.keys().copied().collect();
         kept.sort();
         assert_eq!(kept, (50..n).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn only_a_settlement_inside_an_area_ranks_above_it() {
+        use crate::fixture::{build_search, Geo, TempDir};
+        let mut g = Geo::default();
+        // Two level-6 areas a degree across; same-named features inside them, 60 km from their label points.
+        let village = g.place("Barham", 2, 10.1, 30.1);
+        let foxton = g.boundary("Foxton", 6, [10.0, 20.0, 11.0, 21.0]);
+        let barham = g.boundary("Barham", 6, [10.0, 30.0, 11.0, 31.0]);
+        let poi = g.poi("Foxton", 10.1, 20.1, 0) | POI_BIT;
+        let dir = TempDir::new("area-order");
+        let geo = g.load(&dir.0.join("geo"));
+        let out = dir.0.join("idx");
+        build_search(&geo, &out, None);
+        let idx = SearchIndex::open(&geo, &out, None, None).unwrap();
+        let s = Searcher::new(&idx);
+        let area = |poly: u32| 1 + poly;
+
+        for (q, want) in [("Foxton", [area(foxton), poi]), ("Barham", [village, area(barham)])] {
+            let (found, _) = s.search(q, 5);
+
+            assert_eq!(found.iter().map(|f| f.hit.entity).collect::<Vec<_>>(), want, "{q}");
+        }
     }
 
     #[test]
