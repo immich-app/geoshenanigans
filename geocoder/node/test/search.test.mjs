@@ -2,7 +2,7 @@
 // shipped for other files is rebuilt, a missing one is built on the device, and files replaced
 // under a loaded geocoder are refused.
 //
-//   cargo build --release && node --test test/
+//   cargo build --release && node --test test/*.test.mjs
 //
 // GEOCODER_NODE overrides the addon path (default: this crate's release build).
 import assert from 'node:assert/strict';
