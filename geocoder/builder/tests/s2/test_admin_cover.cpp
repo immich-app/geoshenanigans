@@ -3,6 +3,11 @@
 // ring listed in that cell, and an interior flag must hold for every point of
 // its cell.
 #include "admin_cover.h"
+#include "cell_index.h"
+#include "geometry.h"
+#include "admin_rank_config.h"
+#include "s2_helpers.h"
+#include <map>
 
 #include <algorithm>
 #include <cmath>
@@ -246,4 +251,87 @@ TEST(straight_edge_pieces_keep_each_chord_within_the_tolerance) {
     CHECK_EQ(straight_edge_pieces(10, 20, 30, 20), 35u);   // 20° in pieces of at most 0.01 rad
     // 358° the long way round, not the 2° across the antimeridian.
     CHECK(straight_edge_pieces(10, 179, 10, -179) >= 625u);
+}
+
+TEST(admin_cover_union_marks_only_common_interiors) {
+    AdminRingCells a{{1, true}, {3, true}, {4, false}, {5, true}};
+    AdminRingCells b{{2, true}, {3, false}, {4, true}, {5, true}};
+    AdminRingCells expected{{1, false}, {2, false}, {3, false}, {4, false}, {5, true}};
+    CHECK(merge_admin_ring_cells(a, b) == expected);
+    CHECK(merge_admin_ring_cells(b, a) == expected);
+}
+
+namespace {
+Cells variant_cells(const std::vector<NodeCoord>& ring, uint8_t level, double scale) {
+    std::vector<std::pair<double, double>> pts;
+    for (auto v : ring) pts.emplace_back(v.lat, v.lng);
+    if (scale > 0) pts = simplify_polygon_epsilon(pts, meters_to_degrees(admin_epsilon_meters(level) * scale, pts[0].first));
+    std::vector<uint8_t> bytes(plan_polygon(pts.data(), pts.size()).bytes);
+    pack_polygon_at(bytes.data(), pts.data(), pts.size());
+    auto decoded = unpack_polygon(bytes.data(), pts.size());
+    return admin_ring_cells(decoded.data(), decoded.size(), kAdminCellLevel);
+}
+
+Cells indexed_cells(const std::vector<CellItemPair>& pairs) {
+    Cells cells;
+    for (const auto& pair : pairs) {
+        CHECK_EQ(pair.item_id & ~INTERIOR_FLAG, 0u);
+        cells.emplace_back(pair.cell_id, (pair.item_id & INTERIOR_FLAG) != 0);
+    }
+    return cells;
+}
+}
+
+TEST(admin_cover_shared_index_covers_both_quality_geometries) {
+    // A shallow spike near an S2 edge is dropped by q2.5; uncapped must still
+    // contribute the cells it reaches. Try adjacent offsets to avoid relying
+    // on the particular rounding of an S2 edge's floating point coordinate.
+    std::vector<NodeCoord> ring;
+    Cells original, simplified;
+    for (int shift = 1; shift <= 50 && original == simplified; shift++) {
+        float edge = shift * 0.00001f;
+        ring = {{edge, 0.1f}, {edge, 0.3f}, {edge - 0.0003f, 0.30001f},
+                {edge, 0.30002f}, {edge, 0.5f}, {0.4f, 0.5f}, {0.4f, 0.1f}, {edge, 0.1f}};
+        original = variant_cells(ring, 8, 0);
+        simplified = variant_cells(ring, 8, 2.5);
+    }
+    REQUIRE(original != simplified);
+    std::map<uint64_t, bool> expected;
+    for (auto [cell, inside] : original) expected[cell] = inside;
+    for (auto [cell, inside] : simplified) {
+        auto it = expected.find(cell);
+        if (it == expected.end()) expected[cell] = false;
+        else it->second = it->second && inside;
+    }
+    for (auto& [cell, inside] : expected) {
+        auto present = std::lower_bound(simplified.begin(), simplified.end(), std::make_pair(cell, false));
+        if (present == simplified.end() || present->first != cell) inside = false;
+    }
+    const Cells want(expected.begin(), expected.end());
+    ParsedData data;
+    data.admin_vertices = ring;
+    AdminPolygon ap{};
+    ap.vertex_count = ring.size(); ap.vertex_offset = 0; ap.admin_level = 8;
+    data.admin_polygons.push_back(ap);
+    compute_admin_index_cells(data, {0, 2.5}, std::nullopt);
+    CHECK(indexed_cells(data.admin_index_cells) == want);
+    compute_admin_index_cells(data, {2.5, 0}, std::nullopt);
+    CHECK(indexed_cells(data.admin_index_cells) == want);
+}
+
+TEST(admin_cover_minimal_keeps_rank_sixteen_city_areas) {
+    ParsedData data;
+    data.admin_vertices = {{1.0f, 1.0f}, {1.0f, 1.2f}, {1.2f, 1.2f}, {1.2f, 1.0f}, {1.0f, 1.0f}};
+    AdminPolygon ap{};
+    ap.vertex_count = data.admin_vertices.size(); ap.vertex_offset = 0;
+    ap.admin_level = 15; ap.place_type_override = uint8_t(AdminPlaceType::CITY);
+    REQUIRE(admin_minimal_keeps(ap.admin_level, ap.place_type_override));
+    data.admin_polygons.push_back(ap);
+    const Cells want = variant_cells(data.admin_vertices, ap.admin_level, 2.5);
+    REQUIRE(!want.empty());
+    compute_admin_index_cells(data, {0}, 2.5);
+    CHECK(indexed_cells(data.admin_minimal_index_cells) == want);
+    data.admin_polygons[0].place_type_override = 0;
+    compute_admin_index_cells(data, {0}, 2.5);
+    CHECK(data.admin_minimal_index_cells.empty());
 }

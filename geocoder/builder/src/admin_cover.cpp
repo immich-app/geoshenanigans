@@ -204,4 +204,3 @@ AdminRingCells merge_admin_ring_cells(const AdminRingCells& x, const AdminRingCe
     }
     return out;
 }
-
