@@ -15,7 +15,7 @@ use memmap2::Mmap;
 use query_server::{AdminPolygon, Index, NodeCoord, PlaceNode, PoiRecord, NO_DATA};
 use std::collections::{BinaryHeap, HashSet};
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -420,16 +420,19 @@ struct RunReader {
 }
 
 impl RunReader {
-    fn read_into(&mut self, h: &mut Head) -> bool {
-        let mut len = [0u8; 2];
-        if self.r.read_exact(&mut len).is_err() {
-            return false;
+    /// The run's next record into `h`: false at the run's end (nothing left before a record), an
+    /// error for a failed read or a record cut short.
+    fn read_into(&mut self, h: &mut Head) -> std::io::Result<bool> {
+        if self.r.fill_buf()?.is_empty() {
+            return Ok(false);
         }
+        let mut len = [0u8; 2];
+        self.r.read_exact(&mut len)?;
         let n = u16::from_le_bytes(len) as usize;
         h.key.resize(n, 0);
-        self.r.read_exact(&mut h.key).expect("run key");
+        self.r.read_exact(&mut h.key)?;
         let mut rest = [0u8; 7];
-        self.r.read_exact(&mut rest).expect("run posting");
+        self.r.read_exact(&mut rest)?;
         h.p = Posting {
             entity: u32::from_le_bytes(rest[0..4].try_into().unwrap()),
             imp_q: rest[4],
@@ -437,7 +440,7 @@ impl RunReader {
             class: rest[5] >> 1,
             ord: rest[6],
         };
-        true
+        Ok(true)
     }
 }
 
@@ -679,10 +682,11 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
     for f in &files {
         readers.push(RunReader { r: BufReader::with_capacity(RUN_READ_BUFFER, File::open(f).map_err(|e| e.to_string())?) });
     }
+    let run_error = |i: usize, e: std::io::Error| format!("sort run {}: {e}", files[i].display());
     let mut heap = BinaryHeap::with_capacity(readers.len());
     for (i, r) in readers.iter_mut().enumerate() {
         let mut h = Head { key: Vec::new(), p: Posting { entity: 0, imp_q: 0, partial: false, class: 0, ord: 0 }, run: i };
-        if r.read_into(&mut h) {
+        if r.read_into(&mut h).map_err(|e| run_error(i, e))? {
             heap.push(h);
         }
     }
@@ -698,7 +702,7 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
             cur.extend_from_slice(&h.key);
         }
         group.push(h.p);
-        if readers[h.run].read_into(&mut h) {
+        if readers[h.run].read_into(&mut h).map_err(|e| run_error(h.run, e))? {
             heap.push(h);
         }
     }
@@ -830,6 +834,31 @@ mod tests {
         assert_eq!(k, b"a");
         assert_eq!(hits.len(), PREFIX_TABLE_TOP);
     }
+    #[test]
+    fn run_reader_tells_the_end_from_a_cut_record() {
+        // u16 key length, key, u32 entity, importance, flags, ordinal (Runs::spill).
+        let record = [&2u16.to_le_bytes()[..], b"ab", &7u32.to_le_bytes(), &[9, 3, 1]].concat();
+        let path = std::env::temp_dir().join(format!("run-cut-{}.run", std::process::id()));
+        let read_all = |bytes: &[u8]| -> std::io::Result<Vec<u32>> {
+            std::fs::write(&path, bytes).unwrap();
+            let mut r = RunReader { r: BufReader::new(File::open(&path).unwrap()) };
+            let mut h = Head { key: Vec::new(), p: Posting { entity: 0, imp_q: 0, partial: false, class: 0, ord: 0 }, run: 0 };
+            let mut entities = Vec::new();
+            while r.read_into(&mut h)? {
+                entities.push(h.p.entity);
+            }
+            Ok(entities)
+        };
+        assert!(read_all(&[]).unwrap().is_empty());
+        assert_eq!(read_all(&record).unwrap(), vec![7u32]);
+        // The next record cut in its length, its key and its posting.
+        for cut in [1, 3, record.len() - 1] {
+            let bytes = [&record[..], &record[..cut]].concat();
+            assert_eq!(read_all(&bytes).map_err(|e| e.kind()), Err(std::io::ErrorKind::UnexpectedEof), "cut at {cut}");
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+
     #[test]
     fn partial_build_retains_extra_name_requirements() {
         let dir = std::env::temp_dir().join(format!("retained-names-{}", std::process::id()));
