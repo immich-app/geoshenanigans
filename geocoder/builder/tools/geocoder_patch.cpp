@@ -450,7 +450,7 @@ static int run(int argc, char* argv[]) {
             // v8 side file: the parent's merge replayed at one value per
             // record, then the changed values (see PARALLEL_DELTA_STRIDE).
             uint32_t parent_fid = ru32(), value_stride = ru32(), remap_kind = ru32();
-            if (value_stride != 4) throw std::runtime_error("Malformed parallel delta");
+            check_parallel_delta_header(file_id, parent_fid, value_stride, remap_kind);
             uint32_t n_ins = ru32();
             const char* ins = take((size_t)n_ins * 4, "parallel values");
             uint32_t n_changes = ru32();

@@ -1365,3 +1365,21 @@ TEST(patch_format_read_entry_list_reads_bad_offsets_as_empty) {
         CHECK(ids.empty());
     }
 }
+
+TEST(patch_parallel_delta_rejects_invalid_headers) {
+    for (const auto& f : PARALLEL_DELTA_FILES)
+        check_parallel_delta_header(uint32_t(f.fid), uint32_t(f.parent), f.value_stride, f.remap_kind);
+    auto rejects = [](PatchFileId fid, uint32_t parent, uint32_t stride, uint32_t remap) {
+        bool threw = false;
+        try { check_parallel_delta_header(uint32_t(fid), parent, stride, remap); }
+        catch (const std::runtime_error&) { threw = true; }
+        CHECK(threw);
+    };
+    rejects(PatchFileId::WAY_PARENTS, uint32_t(PatchFileId::COUNT), 4, 1);
+    rejects(PatchFileId::WAY_PARENTS, 0xFFFFFFFFu, 4, 1);
+    rejects(PatchFileId::WAY_PARENTS, uint32_t(PatchFileId::ADDR_POINTS), 4, 1);
+    rejects(PatchFileId::WAY_PARENTS, uint32_t(PatchFileId::STREET_WAYS), 4, 3);
+    rejects(PatchFileId::WAY_PARENTS, uint32_t(PatchFileId::STREET_WAYS), 16, 1);
+    rejects(PatchFileId::POI_RECORDS, uint32_t(PatchFileId::POI_RECORDS), 4, 0);
+}
+

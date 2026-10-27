@@ -448,6 +448,16 @@ inline const ParallelDeltaFile* parallel_delta_file(PatchFileId fid) {
     return nullptr;
 }
 
+// Validate a side-file section before using its parent as an array index.
+inline void check_parallel_delta_header(uint32_t fid, uint32_t parent_fid,
+                                       uint32_t value_stride, uint32_t remap_kind) {
+    const auto* file = fid < uint32_t(PatchFileId::COUNT)
+        ? parallel_delta_file(static_cast<PatchFileId>(fid)) : nullptr;
+    if (!file || parent_fid != uint32_t(file->parent) || value_stride != file->value_stride ||
+        remap_kind != file->remap_kind)
+        throw std::runtime_error("Malformed parallel delta");
+}
+
 // POI parent-id remap marker: 0xFFFFFFF3
 // Carries the full primary+secondary admin-polygon, street-way, and
 // postcode-centroid old→new ID remap that the diff side applied to old
