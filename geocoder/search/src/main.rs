@@ -41,10 +41,24 @@ fn flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
 
+/// The sub-indexes a --sub value selects; an error for any other value.
+fn selected_subs(sub: &str) -> Result<&'static [&'static str], String> {
+    match sub {
+        "places" => Ok(&["places"]),
+        "poi" => Ok(&["poi"]),
+        "all" => Ok(&["places", "poi"]),
+        _ => Err(format!("--sub {sub:?}: expected places, poi or all")),
+    }
+}
+
 fn cmd_build(args: &[String]) {
     let (set, out) = (&args[2], PathBuf::from(&args[3]));
-    let geo = load_geo(set);
     let sub = opt(args, "--sub").unwrap_or_else(|| "all".into());
+    let selected = selected_subs(&sub).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
+    let geo = load_geo(set);
     let opts = BuildOpts {
         threads: opt(args, "--threads").map(|v| v.parse().unwrap()).unwrap_or(1),
         mem_mb: opt(args, "--mem-mb").map(|v| v.parse().unwrap()).unwrap_or(place_search::constants::DEFAULT_RUN_BUDGET_MB),
@@ -55,13 +69,7 @@ fn cmd_build(args: &[String]) {
         area_proxy: flag(args, "--area-proxy"),
         poi_max_tier: opt(args, "--poi-max-tier").map(|v| v.parse().unwrap()).unwrap_or(3),
     };
-    let mut subs = vec![];
-    if sub == "places" || sub == "all" {
-        subs.push("places");
-    }
-    if (sub == "poi" || sub == "all") && geo.poi_records.is_some() {
-        subs.push("poi");
-    }
+    let subs: Vec<&str> = selected.iter().copied().filter(|&s| s != "poi" || geo.poi_records.is_some()).collect();
     let mut replacing = subs.clone();
     if geo.poi_records.is_none() { replacing.push("poi"); }
     place_search::build::check_retained_names(&out, &replacing, opts.extras.is_some())
@@ -276,6 +284,16 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn an_unknown_sub_index_is_refused() {
+        assert_eq!(selected_subs("all"), Ok(&["places", "poi"][..]));
+        assert_eq!(selected_subs("places"), Ok(&["places"][..]));
+        assert_eq!(selected_subs("poi"), Ok(&["poi"][..]));
+        for typo in ["place", "pois", "", "ALL"] {
+            assert!(selected_subs(typo).is_err(), "{typo:?}");
+        }
+    }
 
     #[test]
     fn empty_latency_samples_have_no_summary() {
