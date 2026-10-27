@@ -93,7 +93,6 @@ fn cmd_build(args: &[String]) {
             eprintln!("{s}: {k}: {v}");
         }
     }
-    let _ = std::fs::remove_dir(&opts.tmp);
     eprintln!("build memory: {}", mem_json());
 }
 

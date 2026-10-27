@@ -879,11 +879,13 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
 /// Builds the sub-indexes `subs` of `geo` for the index directory `out`, the value `meta` gives
 /// with each one's stats becoming its search_meta.json. Every file is written into a staging
 /// directory and moved into `out` only once all of them are complete, search_meta.json last
-/// (`publish`): a failed build or move leaves `out` as it was. Returns the stats; an error, before
-/// anything is built, when `meta` fails or while files a failed publish could not put back are
-/// still aside.
+/// (`publish`): a failed build or move leaves `out` as it was. The build holds `out` from before
+/// `meta` runs until it has cleaned up (`lock_index_dir`). Returns the stats; an error, before
+/// anything is built, while another build holds `out`, when `meta` fails, or while files a failed
+/// publish could not put back are still aside.
 pub fn build_all(geo: &Index, subs: &[&str], out: &Path, opts: &BuildOpts,
                  meta: impl FnOnce() -> Result<serde_json::Value, String>) -> Result<Vec<(String, Stats)>, String> {
+    let _held = lock_index_dir(out)?;
     let meta = meta()?;
     let stage = out.join(BUILD_STAGE_DIR);
     if holds_replaced(&stage) {
@@ -894,7 +896,24 @@ pub fn build_all(geo: &Index, subs: &[&str], out: &Path, opts: &BuildOpts,
     let built = build_staged(geo, subs, &stage, opts, meta)
         .and_then(|stats| publish(&stage, out, |from, to| std::fs::rename(from, to)).map(|_| stats).map_err(|e| format!("publish {}: {e}", out.display())));
     clear_stage(&stage);
+    // While `out` is still held: the temp directory is by default inside it, and removing it
+    // after would race the next build's.
+    let _ = std::fs::remove_dir(&opts.tmp);
     built
+}
+
+/// An exclusive lock on the directory `out` itself (no lock file is left in the index), held
+/// until the returned handle is dropped or the process exits. Every build takes it, so builds
+/// into one index directory never share its search_meta.json, staging or temp directories. An
+/// error, at once, while another build holds it.
+fn lock_index_dir(out: &Path) -> Result<File, String> {
+    std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
+    let dir = File::open(out).map_err(|e| format!("{}: {e}", out.display()))?;
+    match dir.try_lock() {
+        Ok(()) => Ok(dir),
+        Err(std::fs::TryLockError::WouldBlock) => Err(format!("{}: another build is using this index directory", out.display())),
+        Err(std::fs::TryLockError::Error(e)) => Err(format!("lock {}: {e}", out.display())),
+    }
 }
 
 /// Whether a publish that failed to put files back left the files they replaced in `stage`.
@@ -1435,6 +1454,49 @@ mod tests {
 
         assert!(err.as_deref().is_some_and(|e| e.contains(BUILD_ASIDE_DIR)), "{err:?}");
         assert_eq!(std::fs::read_to_string(&kept).ok().as_deref(), Some("old places.fst"));
+    }
+
+    #[test]
+    fn a_build_is_refused_while_another_build_holds_the_index_directory() {
+        use crate::fixture::{build_search, Geo, TempDir};
+        let mut g = Geo::default();
+        g.place("Testburg", 1, 10.1, 20.1);
+        g.poi("Test Hall", 10.05, 20.05, 0);
+        let dir = TempDir::new("held");
+        let geo = g.load(&dir.0.join("geo"));
+        let out = dir.0.join("idx");
+        build_search(&geo, &out, None);
+        // A places build holds `out` and has staged a file.
+        let other = File::open(&out).unwrap();
+        other.try_lock().unwrap();
+        let staged = out.join(BUILD_STAGE_DIR).join("places.fst");
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&staged, "staged by the other build").unwrap();
+        let entries = |d: &Path| {
+            let mut v: Vec<_> = std::fs::read_dir(d).unwrap().map(|e| e.unwrap().path()).map(|p| (std::fs::read(&p).ok(), p)).collect();
+            v.sort();
+            v
+        };
+        let before = entries(&out);
+        let opts = BuildOpts {
+            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"), inline: true, extras: None,
+            imp_dir: None, area_proxy: false, poi_max_tier: 3,
+        };
+        let mut read_meta = false;
+
+        let err = build_all(&geo, &["poi"], &out, &opts, || {
+            read_meta = true;
+            Ok(serde_json::json!({}))
+        }).err();
+
+        assert!(err.as_deref().is_some_and(|e| e.contains("another build")), "{err:?}");
+        assert!(!read_meta);
+        assert_eq!(std::fs::read_to_string(&staged).ok().as_deref(), Some("staged by the other build"));
+        assert_eq!(entries(&out), before);
+        drop(other);
+        build_all(&geo, &["places"], &out, &opts, || Ok(serde_json::json!({}))).unwrap();
+        assert!(!out.join(BUILD_STAGE_DIR).exists());
+        assert!(!opts.tmp.exists());
     }
 
     #[test]
