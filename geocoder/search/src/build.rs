@@ -511,6 +511,7 @@ impl Writer {
     fn prefix_add(&mut self, key: &[u8], list: &[Posting]) {
         let Ok(key) = std::str::from_utf8(key) else { return };
         let klen = key.chars().count();
+        let top = best_postings(list, PREFIX_TABLE_TOP);
         let mut pfx = String::new();
         for (n, c) in key.chars().take(PREFIX_TABLE_MAX_CHARS).enumerate() {
             pfx.push(c);
@@ -523,7 +524,7 @@ impl Writer {
             let slot = &mut self.slots[n - 1];
             slot.keys += 1;
             let text = if n == klen { 1.0 } else { prefix_text(n, klen, 0) };
-            for p in list.iter().take(PREFIX_TABLE_TOP) {
+            for p in &top {
                 let t = if p.partial { text * PARTIAL_TEXT } else { text };
                 let s = t * t * (IMPORTANCE_FLOOR + dequantize(p.imp_q)) * CLASS_MULT[p.class.min(5) as usize];
                 slot.hits.push((s, PrefixHit { entity: p.entity, partial: p.partial, text: t, imp_q: p.imp_q, class: p.class, ord: p.ord }));
@@ -533,6 +534,26 @@ impl Writer {
             }
         }
     }
+}
+
+/// A key's `n` best postings by prefix score, best first. Every posting of a key has the key's
+/// text score, so they rank by trailing-word match, importance and name class.
+fn best_postings(list: &[Posting], n: usize) -> Vec<Posting> {
+    let rank = |p: &Posting| {
+        let t = if p.partial { PARTIAL_TEXT } else { 1.0 };
+        (t * t * (IMPORTANCE_FLOOR + dequantize(p.imp_q)) * CLASS_MULT[p.class.min(5) as usize], p.entity)
+    };
+    let before = |a: &(f32, u32), b: &(f32, u32)| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).is_lt();
+    let mut top: Vec<((f32, u32), Posting)> = Vec::with_capacity(n + 1);
+    for p in list {
+        let r = rank(p);
+        let at = top.partition_point(|(t, _)| before(t, &r));
+        if at < n {
+            top.insert(at, (r, *p));
+            top.truncate(n);
+        }
+    }
+    top.into_iter().map(|(_, p)| p).collect()
 }
 
 fn best_entities(hits: &mut Vec<(f32, PrefixHit)>, n: usize) {
@@ -857,6 +878,28 @@ mod tests {
             assert_eq!(read_all(&bytes).map_err(|e| e.kind()), Err(std::io::ErrorKind::UnexpectedEof), "cut at {cut}");
         }
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn prefix_table_takes_a_keys_best_scores() {
+        // Forty class-5 postings come first by importance; the class-0 one after them scores best.
+        let dir = std::env::temp_dir().join(format!("pfx-score-{}", std::process::id()));
+        let mut w = writer(&dir);
+        let mut list: Vec<Posting> = (0..PREFIX_TABLE_TOP as u32)
+            .map(|entity| Posting { entity, imp_q: 200, partial: false, class: 5, ord: 1 })
+            .collect();
+        list.push(Posting { entity: 99, imp_q: 190, partial: false, class: 0, ord: 0 });
+        w.prefix_add(b"abc", &list);
+        let slot = &mut w.slots[0];
+        flush_slot(slot).unwrap();
+        slot.out.flush().unwrap();
+        let (k, blob) = read_prefix(&mut BufReader::new(File::open(&slot.path).unwrap())).unwrap();
+        let mut hits = Vec::new();
+        decode_prefix_hits(&blob, 0, &mut hits);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(k, b"a");
+        assert_eq!(hits.len(), PREFIX_TABLE_TOP);
+        assert_eq!(hits[0].entity, 99);
     }
 
     #[test]
