@@ -3217,7 +3217,15 @@ impl Index {
             admin.country_code,
         );
 
-        if road.is_none() && admin.country.is_none() && admin.city.is_none() && admin.state.is_none() {
+        // Where no boundary holds the point, its place nodes are the whole
+        // address: Nominatim has no country in Antarctica (no `aq` in
+        // settings/country_settings.yaml) and answers a station with its
+        // place nodes alone. Boundaries without a country, city or state
+        // still give no answer: they are mostly a coast or border our
+        // country polygon misses.
+        let anchored = road.is_some() || admin.country.is_some() || admin.city.is_some() || admin.state.is_some();
+        let place_nodes_only = admin.is_empty() && !place.is_empty();
+        if !anchored && !place_nodes_only {
             return Address::default();
         }
 
@@ -3608,6 +3616,151 @@ mod multi_index_tests {
         populated.address.country = Some("France");
         populated.address.city = Some("Paris");
         assert!(address_score(&populated) > address_score(&empty));
+    }
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::*;
+
+    /// (lat, lng, name, place type: 1 town, 2 village, 4 hamlet).
+    type Node<'a> = (f32, f32, &'a str, u8);
+    /// (name, admin_level, [south, west, north, east]), no country code.
+    type Boundary<'a> = (&'a str, u8, [f32; 4]);
+
+    // N515065315 place=town and N560153667 place=hamlet.
+    const MCMURDO: Node<'static> = (-77.8463, 166.668, "McMurdo Station", 1);
+    const SCOTT_BASE: Node<'static> = (-77.8494, 166.768, "Scott Base", 4);
+    // R12823139, admin_level 5, outside every country, and a village inside.
+    const SHOALS: Boundary<'static> = ("Beting Patinggi Ali Shoals", 5, [5.0, 112.6, 5.1, 112.7]);
+    const SHOALS_VILLAGE: Node<'static> = (5.05, 112.65, "Shoals Village", 2);
+
+    fn u32s(out: &mut Vec<u8>, values: &[u32]) {
+        for v in values {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+
+    /// The `*_cells.bin` and `*_entries.bin` of (cell, id) pairs.
+    fn cell_index(mut pairs: Vec<(u64, u32)>) -> (FileBytes, FileBytes) {
+        pairs.sort();
+        let (mut cells, mut entries) = (Vec::new(), Vec::new());
+        for group in pairs.chunk_by(|a, b| a.0 == b.0) {
+            cells.extend_from_slice(&group[0].0.to_le_bytes());
+            u32s(&mut cells, &[entries.len() as u32]);
+            entries.extend_from_slice(&(group.len() as u16).to_le_bytes());
+            u32s(&mut entries, &group.iter().map(|p| p.1).collect::<Vec<_>>());
+        }
+        (FileBytes::Owned(cells), FileBytes::Owned(entries))
+    }
+
+    /// An index of boundaries (in the admin cell of their centre) and place
+    /// nodes only, without streets, POIs or countries, like Antarctica's.
+    fn index(boundaries: &[Boundary<'_>], nodes: &[Node<'_>]) -> Index {
+        let cell = |lat: f32, lng: f32| cell_id_at_level(lat as f64, lng as f64, DEFAULT_ADMIN_CELL_LEVEL);
+        let mut strings = Vec::new();
+        let mut name = |s: &str| {
+            let id = strings.len() as u32;
+            strings.extend_from_slice(s.as_bytes());
+            strings.push(0);
+            id
+        };
+        let (mut polygons, mut vertices, mut admin_pairs) = (Vec::new(), Vec::new(), Vec::new());
+        for (id, &(boundary, admin_level, [s, w, n, e])) in boundaries.iter().enumerate() {
+            let ring = [s, w, s, e, n, e, n, w, s, w];
+            u32s(&mut polygons, &[vertices.len() as u32, ring.len() as u32 / 2, name(boundary)]);
+            polygons.extend_from_slice(&[admin_level, 0, 0, 0]);
+            polygons.extend_from_slice(&((n - s) * (e - w)).to_le_bytes());
+            polygons.extend_from_slice(&[0; 4]); // country_code, hole_count
+            vertices.extend_from_slice(&[4, 0]); // raw f32 vertices, then the bbox minimum
+            for v in [s, w].iter().chain(&ring) {
+                vertices.extend_from_slice(&v.to_le_bytes());
+            }
+            admin_pairs.push((cell((s + n) / 2.0, (w + e) / 2.0), id as u32));
+        }
+        let (mut records, mut place_pairs) = (Vec::new(), Vec::new());
+        for (id, &(lat, lng, node, place_type)) in nodes.iter().enumerate() {
+            records.extend_from_slice(&lat.to_le_bytes());
+            records.extend_from_slice(&lng.to_le_bytes());
+            u32s(&mut records, &[name(node)]);
+            records.extend_from_slice(&[place_type, 0, 0, 0]);
+            u32s(&mut records, &[NO_DATA]);
+            place_pairs.push((cell(lat, lng), id as u32));
+        }
+        assert_eq!(polygons.len(), boundaries.len() * std::mem::size_of::<AdminPolygon>());
+        assert_eq!(records.len(), nodes.len() * std::mem::size_of::<PlaceNode>());
+        let (admin_cells, admin_entries) = cell_index(admin_pairs);
+        let (place_cells, place_entries) = cell_index(place_pairs);
+        let end = strings.len() as u32;
+        Index {
+            geo_cells: None,
+            street_entries: None,
+            street_ways: None,
+            street_nodes: None,
+            addr_entries: None,
+            addr_points: None,
+            addr_vertices: None,
+            interp_entries: None,
+            interp_ways: None,
+            interp_nodes: None,
+            interp_postcodes: None,
+            admin_cells,
+            admin_entries,
+            admin_polygons: FileBytes::Owned(polygons),
+            admin_vertices: FileBytes::Owned(vertices),
+            poi_cells: None,
+            poi_entries: None,
+            poi_records: None,
+            poi_vertices: None,
+            poi_meta: PoiMeta::from_json("{}"),
+            place_nodes: Some(FileBytes::Owned(records)),
+            place_cells: Some(place_cells),
+            place_entries: Some(place_entries),
+            way_parents: None,
+            admin_parents: None,
+            addr_postcodes: None,
+            way_postcodes: None,
+            postal_polygons: None,
+            postal_vertices: None,
+            postcode_centroids: None,
+            postcode_centroid_cells: None,
+            postcode_centroid_entries: None,
+            admin_config: AdminLevelConfig::load(),
+            strings: StringPool::from_parts([Some(FileBytes::Owned(strings)), None, None, None, None], [0, end, end, end, end, end]),
+            street_cell_level: DEFAULT_STREET_CELL_LEVEL,
+            admin_cell_level: DEFAULT_ADMIN_CELL_LEVEL,
+            max_distance_sq: (DEFAULT_SEARCH_DISTANCE / 6_371_000.0).powi(2),
+        }
+    }
+
+    fn answer(idx: &Index, lat: f64, lng: f64) -> serde_json::Value {
+        serde_json::to_value(idx.query(lat, lng)).unwrap()
+    }
+
+    #[test]
+    fn place_nodes_answer_where_no_boundary_holds_the_point() {
+        // Nominatim at Scott Base: hamlet=Scott Base, town=McMurdo Station.
+        let idx = index(&[], &[MCMURDO, SCOTT_BASE]);
+
+        let got = answer(&idx, -77.8494, 166.768);
+
+        assert_eq!(got["address"], serde_json::json!({"town": "McMurdo Station", "hamlet": "Scott Base"}));
+    }
+
+    #[test]
+    fn a_boundary_without_a_country_city_or_state_has_no_answer() {
+        let idx = index(&[SHOALS], &[SHOALS_VILLAGE]);
+
+        assert_eq!(answer(&idx, 5.05, 112.65), serde_json::json!({"address": {}}));
+    }
+
+    #[test]
+    fn a_point_nothing_holds_has_no_answer() {
+        let idx = index(&[SHOALS], &[MCMURDO]);
+
+        for (lat, lng) in [(-82.0, 60.0), (5.2, 112.65)] {
+            assert_eq!(answer(&idx, lat, lng), serde_json::json!({"address": {}}), "({}, {})", lat, lng);
+        }
     }
 }
 
@@ -4480,6 +4633,14 @@ pub struct PlaceResult<'a> {
     pub neighbourhood: Option<&'a str>,
 }
 
+impl PlaceResult<'_> {
+    /// Whether no place node fills a field.
+    pub fn is_empty(&self) -> bool {
+        [self.city, self.town, self.village, self.hamlet, self.suburb, self.quarter, self.neighbourhood]
+            .iter().all(Option::is_none)
+    }
+}
+
 #[derive(Default)]
 pub struct AdminResult<'a> {
     pub country: Option<&'a str>,
@@ -4536,6 +4697,16 @@ impl Containment {
         let holds = index.admin_verts(poly).is_some_and(|verts| point_in_polygon(lat as f32, lng as f32, &verts));
         self.tested.insert(slot, (id, holds));
         holds
+    }
+}
+
+impl AdminResult<'_> {
+    /// Whether no polygon fills a field.
+    pub fn is_empty(&self) -> bool {
+        [self.country, self.state, self.province, self.region, self.state_district, self.county,
+         self.district, self.municipality, self.city, self.town, self.village, self.hamlet,
+         self.city_district, self.borough, self.suburb, self.quarter, self.neighbourhood, self.city_block]
+            .iter().all(Option::is_none)
     }
 }
 
