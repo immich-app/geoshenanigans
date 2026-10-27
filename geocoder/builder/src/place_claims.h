@@ -66,6 +66,12 @@ inline std::vector<std::pair<uint64_t, uint32_t>> boundary_polygons(const std::v
     return out;
 }
 
+// The polygon of `boundary` in boundary_polygons' list; NO_DATA when it has none.
+inline uint32_t boundary_polygon(const std::vector<std::pair<uint64_t, uint32_t>>& boundaries, uint64_t boundary) {
+    auto it = std::lower_bound(boundaries.begin(), boundaries.end(), std::make_pair(boundary, uint32_t(0)));
+    return it != boundaries.end() && it->first == boundary ? it->second : NO_DATA;
+}
+
 // One boundary's claim on a node, for choosing between claimants.
 struct ClaimRank {
     bool label;
@@ -101,10 +107,6 @@ inline size_t hide_claimed_place_nodes(std::vector<PlaceNode>& nodes, const std:
                                        const std::vector<uint64_t>& polygon_ids, unsigned threads = 0) {
     if (claims.empty()) return 0;
     const auto boundaries = boundary_polygons(polygons, polygon_ids);
-    auto polygon_of = [&](uint64_t boundary) {
-        auto it = std::lower_bound(boundaries.begin(), boundaries.end(), std::make_pair(boundary, uint32_t(0)));
-        return it != boundaries.end() && it->first == boundary ? it->second : NO_DATA;
-    };
     std::sort(claims.begin(), claims.end(), [](const PlaceClaim& a, const PlaceClaim& b) { return a.node < b.node; });
     std::atomic<size_t> hidden{0};
     parallel_for(std::min(nodes.size(), node_ids.size()), [&](size_t begin, size_t end, unsigned) {
@@ -116,7 +118,7 @@ inline size_t hide_claimed_place_nodes(std::vector<PlaceNode>& nodes, const std:
             uint32_t best = NO_DATA;
             ClaimRank best_rank{};
             for (; it != claims.end() && it->node == node_ids[i]; ++it) {
-                const uint32_t p = polygon_of(it->boundary);
+                const uint32_t p = boundary_polygon(boundaries, it->boundary);
                 if (p == NO_DATA) continue;
                 const ClaimRank rank{it->label, polygons[p].admin_level, it->boundary};
                 if (best == NO_DATA || claim_wins(rank, best_rank)) {
@@ -134,10 +136,19 @@ inline size_t hide_claimed_place_nodes(std::vector<PlaceNode>& nodes, const std:
 
 // Flags the place nodes the name match links (find_linked_place's last
 // step): `links` holds (node, polygon) for each boundary ring and its best
-// node; a node several rings pick names the one claim_wins picks.
+// node. A node names its boundary's largest ring whichever ring matched, as
+// a label or wikidata claim does; a node several boundaries pick names the
+// one claim_wins picks.
 inline size_t hide_name_linked_place_nodes(std::vector<PlaceNode>& nodes, std::vector<std::pair<uint32_t, uint32_t>> links,
                                            const std::vector<AdminPolygon>& polygons,
                                            const std::vector<uint64_t>& polygon_ids) {
+    const auto boundaries = boundary_polygons(polygons, polygon_ids);
+    if (!boundaries.empty()) {
+        for (auto& link : links) {
+            if (polygon_ids[link.second] != 0)
+                link.second = boundary_polygon(boundaries, admin_boundary_id(polygon_ids[link.second]));
+        }
+    }
     auto rank = [&](uint32_t p) {
         return ClaimRank{false, polygons[p].admin_level, polygon_ids.size() == polygons.size() ? polygon_ids[p] : p};
     };

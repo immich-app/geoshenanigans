@@ -125,21 +125,30 @@ TEST(place_claims_name_links_keep_the_name_and_pick_the_lowest_level) {
     Boundaries b;
     std::vector<PlaceNode> nodes{place(10, 2), place(11, 2), place(12, 2)};
     // Node 0: L8 relation 500 and L6 relation 400; node 1: both rings of
-    // relation 100 (equal levels, the lower ring id).
+    // relation 100.
     std::vector<std::pair<uint32_t, uint32_t>> links{{0, 5}, {1, 1}, {0, 4}, {1, 0}};
     CHECK_EQ(hide_name_linked_place_nodes(nodes, links, b.polygons, b.ids), 2u);
     CHECK_EQ(nodes[0].name_id, 10u);
     CHECK_EQ(nodes[0]._pad1, PLACE_FLAG_HIDDEN | PLACE_FLAG_LABEL_OF);
     CHECK_EQ(nodes[0].parent_poly_id, 4u);
     CHECK_EQ(nodes[1].name_id, 11u);
-    CHECK_EQ(nodes[1].parent_poly_id, 0u);
+    CHECK_EQ(nodes[1].parent_poly_id, 1u);  // relation 100's largest ring
     CHECK_EQ(nodes[2]._pad1, 0);
     CHECK_EQ(nodes[2].parent_poly_id, 2u);
     std::reverse(links.begin(), links.end());
     std::vector<PlaceNode> again{place(10, 2), place(11, 2), place(12, 2)};
     hide_name_linked_place_nodes(again, links, b.polygons, b.ids);
     CHECK_EQ(again[0].parent_poly_id, 4u);
-    CHECK_EQ(again[1].parent_poly_id, 0u);
+    CHECK_EQ(again[1].parent_poly_id, 1u);
+}
+
+TEST(place_claims_a_name_link_names_the_largest_ring_whichever_ring_matched) {
+    Boundaries b;
+    std::vector<PlaceNode> nodes{place(10, 2)};
+    // Only relation 100's smaller ring matched the node.
+    CHECK_EQ(hide_name_linked_place_nodes(nodes, {{0, 0}}, b.polygons, b.ids), 1u);
+    CHECK_EQ(nodes[0]._pad1, PLACE_FLAG_HIDDEN | PLACE_FLAG_LABEL_OF);
+    CHECK_EQ(nodes[0].parent_poly_id, 1u);
 }
 
 TEST(place_claims_subset_without_the_claimant_names_no_boundary) {
