@@ -3756,6 +3756,24 @@ mod query_tests {
     }
 
     #[test]
+    fn a_hidden_place_node_answers_like_a_nameless_one() {
+        // A node a boundary claims keeps its name for search and is flagged
+        // hidden (PlaceNode._pad1 bit 1) where the builder used to clear it.
+        let with = |offset: usize, bytes: &[u8]| {
+            let mut idx = index(&[], &[MCMURDO, SCOTT_BASE]);
+            let Some(FileBytes::Owned(records)) = idx.place_nodes.as_mut() else { unreachable!() };
+            records[offset..offset + bytes.len()].copy_from_slice(bytes);
+            idx
+        };
+        let (hidden, nameless) = (with(13, &[0x02]), with(8, &NO_DATA.to_le_bytes()));
+
+        let got = answer(&hidden, -77.8494, 166.768);
+
+        assert_eq!(got["address"], serde_json::json!({"hamlet": "Scott Base"}));
+        assert_eq!(got, answer(&nameless, -77.8494, 166.768));
+    }
+
+    #[test]
     fn a_boundary_without_a_country_city_or_state_has_no_answer() {
         let idx = index(&[SHOALS], &[SHOALS_VILLAGE]);
 
