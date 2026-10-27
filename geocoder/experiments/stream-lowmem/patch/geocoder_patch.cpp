@@ -1141,9 +1141,12 @@ static int run(int argc, char* argv[]) {
         merge_seqs[file_id] = {pos, (size_t)seq_size, actual_stride};
         FILE* outf = open_out(fname);
 
-        // An encoded family's parent: its child section replays along (open_joint_child).
+        // An encoded family's parent: its child section replays along (open_joint_child). A parent
+        // without records, old or new, has no child bytes to replay with it: the diff sends an empty
+        // addr_points.bin's addr_vertices.bin later, as a section of its own.
         std::unique_ptr<JointChild> jc;
-        if (gcs::store().is_encoded(fname) && joint_child_of(file_id) != UINT32_MAX) jc = open_joint_child(file_id, outf, seq_end);
+        if (gcs::store().is_encoded(fname) && joint_child_of(file_id) != UINT32_MAX && (old_size || new_size))
+            jc = open_joint_child(file_id, outf, seq_end);
         auto child_bytes = [&](const char* rec) { return child_bytes_of(file_id, rec, *jc); };
 
         // Record the old → new record ids of the files whose remap the entry

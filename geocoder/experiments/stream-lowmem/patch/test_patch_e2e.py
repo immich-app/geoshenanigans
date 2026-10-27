@@ -197,6 +197,15 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as scratch:
     geo_dir(root / 'geo.a', cells)
     geo_dir(root / 'geo.b', cells[:1000] + cells[19000:])
     apply_case(root, 'removed-cells', root / 'geo.a', root / 'geo.b', decoder_peaks_at_most('gxc', 1 << 20))
+    # An encoded set whose two address files are empty: the diff sends addr_points.bin's (empty) merge
+    # with the streets after it and addr_vertices.bin later, as a full replacement. An empty parent
+    # has no child bytes to replay with it.
+    cells = [(k, [k % 10]) for k in range(50)]
+    for d, rows in (('noaddr.a', cells), ('noaddr.b', cells[:40] + [(60, [3])])):
+        geo_dir(root / d, rows)
+        (root / d / 'addr_points.bin').write_bytes(b'')
+        (root / d / 'addr_vertices.bin').write_bytes(b'')
+    apply_case(root, 'empty-addresses', root / 'noaddr.a', root / 'noaddr.b')
     # A parent's REPLACE run (v8: the same street ways, renamed) whose children stay one MATCH run: the
     # old records are dropped as the node reads make the shared decoder produce them, not queued for
     # the whole run (2.4 MB of them).
