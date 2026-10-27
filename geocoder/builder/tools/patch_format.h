@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -1580,7 +1581,9 @@ inline size_t node_byte_offset(uint32_t node_index) {
 }
 
 // --- Directory creation ---
+// Creates the directory and its missing parents; the path is never shell text.
 inline void ensure_dir(const std::string& path) {
-    std::string cmd = "mkdir -p '" + path + "'";
-    system(cmd.c_str());
+    std::error_code ec;
+    std::filesystem::create_directories(path, ec);
+    if (ec) throw std::runtime_error("Cannot create directory " + path + ": " + ec.message());
 }

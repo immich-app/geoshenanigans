@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iterator>
@@ -1325,4 +1326,30 @@ TEST(patch_format_read_entry_list_reads_bad_offsets_as_empty) {
         read_entry_list(sut, off, ids);
         CHECK(ids.empty());
     }
+}
+
+TEST(patch_format_ensure_dir_creates_the_path_as_named) {
+    // Quotes and shell syntax are part of the name: nothing runs, every level is created.
+    ScratchDir dir("ensure-dir");
+    for (const std::string name : {"user's update/new", "x'; touch pwned; 'y/new"}) {
+        const std::string path = dir.path() + "/" + name;
+        ensure_dir(path);
+        CHECK(std::filesystem::is_directory(path));
+        ensure_dir(path);  // an existing directory is fine
+    }
+    CHECK(!std::filesystem::exists("pwned"));
+    CHECK(!std::filesystem::exists(dir.path() + "/pwned"));
+}
+
+TEST(patch_format_ensure_dir_throws_when_it_cannot_create) {
+    ScratchDir dir("ensure-dir-file");
+    const std::string file = dir.path() + "/a-file";
+    std::ofstream(file) << "x";
+    bool threw = false;
+    try {
+        ensure_dir(file + "/sub");
+    } catch (const std::runtime_error& e) {
+        threw = std::string(e.what()).find("Cannot create directory " + file + "/sub") == 0;
+    }
+    CHECK(threw);
 }
