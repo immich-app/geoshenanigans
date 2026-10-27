@@ -592,10 +592,12 @@ struct Dec : Decoder {
         if (top->size() != 32 * ((R + B - 1) / B)) die("gxc_top.bin size");
     }
     uint64_t decoded_size(int port) const override { return port == 0 ? 20 * R : esize[port - 1]; }
+    // A list holds 1 to 65535 ids (today's u16 count); every count is checked before it is used.
     static void decode_list(Reader& s, bool strict, uint32_t prev_first, std::vector<uint32_t>& l) {
-        const uint64_t c = s.uv() + 1;
-        if (c > 0xFFFF) die("gxc: list too long");
-        l.resize(size_t(c));
+        const uint64_t cm1 = s.uv();  // count - 1
+        if (cm1 >= 0xFFFF) die("gxc: list too long");
+        const size_t c = size_t(cm1) + 1;
+        l.resize(c);
         l[0] = uint32_t(int64_t(prev_first) + unzz64(s.uv()));
         for (size_t j = 1; j < c; j++) l[j] = l[j - 1] + uint32_t(s.uv()) + (strict ? 1 : 0);
     }
@@ -634,26 +636,32 @@ struct Dec : Decoder {
         const int as = (h >> 2) & 3;
         if (as) {
             list.clear();
+            auto bad = [&] { die("gxc: bad address list at row %llu", (unsigned long long)r); };
             if (as == 1) {
                 const uint64_t k = rows->uv();
+                if (k == 0 || k > 0xFFFF) bad();
                 for (uint64_t j = 0; j < k; j++) list.push_back(uint32_t(next + j));
                 next += k;
             } else if (as == 2) {
                 const uint64_t K = rows->uv(), D = rows->uv();
-                int64_t pj = -1;
-                uint64_t j = 0;
+                if (K == 0 || K > 0xFFFF || D > K) bad();
+                uint64_t pj = 0, j = 0;  // pj: one past the previous repeated index
                 for (uint64_t x = 0; x < D; x++) {
-                    const int64_t idx = pj + 1 + int64_t(rows->uv());
-                    const uint64_t copies = rows->uv() + 2;
-                    for (; j < uint64_t(idx); j++) list.push_back(uint32_t(next + j));
+                    const uint64_t gap = rows->uv(), cm2 = rows->uv();  // copies - 2
+                    if (gap >= K - pj || cm2 >= 0xFFFF) bad();
+                    const uint64_t idx = pj + gap, copies = cm2 + 2;
+                    if (list.size() + (idx - j) + copies > 0xFFFF) bad();
+                    for (; j < idx; j++) list.push_back(uint32_t(next + j));
                     for (uint64_t c = 0; c < copies; c++) list.push_back(uint32_t(next + j));
                     j++;
-                    pj = idx;
+                    pj = idx + 1;
                 }
                 for (; j < K; j++) list.push_back(uint32_t(next + j));
                 next += K;
             } else {
-                const uint64_t k = rows->uv(), c = rows->uv() + 1;
+                const uint64_t k = rows->uv(), cm1 = rows->uv();  // count - 1
+                if (cm1 >= 0xFFFF) bad();
+                const uint64_t c = cm1 + 1;
                 list.push_back(uint32_t(int64_t(next) + unzz64(rows->uv())));
                 for (uint64_t j = 1; j < c; j++) list.push_back(list.back() + uint32_t(rows->uv()));
                 next += k;
