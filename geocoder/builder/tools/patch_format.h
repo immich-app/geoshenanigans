@@ -171,9 +171,6 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // interp cell lists; and the per-record side files follow their parent's
 // merge (PARALLEL_DELTA_STRIDE).
 static constexpr uint32_t GCPATCH_VERSION = 8;
-// A v6 patch needs the string tiers of ../full, which a v7 patcher no longer
-// reads.
-static constexpr uint32_t GCPATCH_MIN_READ_VERSION = 7;
 
 enum class PatchFileId : uint32_t {
     STRINGS = 0,

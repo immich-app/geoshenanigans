@@ -223,10 +223,8 @@ TEST(patch_format_section_marker_values) {
 TEST(patch_format_magic_and_version) {
     // GCPATCH_VERSION is bound to the value actually emitted/checked by the
     // diff/patch tools. v8 = identity-matched merges (REPLACE, derived street
-    // remap, parallel side-file deltas); v7 patches stay readable; v6 patches
-    // need ../full's string tiers, so they are unreadable (MIN_READ_VERSION).
+    // remap, parallel side-file deltas). The patcher accepts this version only.
     CHECK_EQ(GCPATCH_VERSION, uint32_t(8));
-    CHECK_EQ(GCPATCH_MIN_READ_VERSION, uint32_t(7));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
     for (int i = 0; i < 8; i++) CHECK_EQ(GCPATCH_MAGIC[i], expect[i]);
 }

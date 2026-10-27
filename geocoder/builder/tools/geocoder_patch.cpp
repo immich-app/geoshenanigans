@@ -8,7 +8,7 @@
 //
 // Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir>
 //
-// Reads GCPATCH v7 and v8 (v8: REPLACE runs, street remap derived from the
+// Reads GCPATCH v8 ( REPLACE runs, street remap derived from the
 // street_ways replay, PARALLEL_DELTA_STRIDE side files, unmapped ids dropped
 // from street / addr / interp cell lists).
 
@@ -161,8 +161,7 @@ static int run(int argc, char* argv[]) {
     // Header
     if (memcmp(P, GCPATCH_MAGIC, 8) != 0) { std::cerr << "Bad magic" << std::endl; return 1; }
     pos = 8;
-    uint32_t ver = ru32(); if (ver < GCPATCH_MIN_READ_VERSION || ver > GCPATCH_VERSION) { std::cerr << "Bad version" << std::endl; return 1; }
-    const bool v8 = ver >= 8;
+    uint32_t ver = ru32(); if (ver != GCPATCH_VERSION) { std::cerr << "Bad version" << std::endl; return 1; }
     ru32(); // flags
 
     // The exact file set out_dir must hold after the apply. Outputs the
@@ -634,7 +633,7 @@ static int run(int argc, char* argv[]) {
         // v8: addresses' parent_way_id moves by the street replay's remap
         // (MATCH / REPLACE runs plus the parent-id remap's moved pairs).
         const RecordRemap* street_rm = nullptr;
-        if (v8 && file_id == (uint32_t)PatchFileId::ADDR_POINTS) {
+        if (file_id == (uint32_t)PatchFileId::ADDR_POINTS) {
             auto it = record_remaps.find((uint32_t)PatchFileId::STREET_WAYS);
             if (it != record_remaps.end()) street_rm = &it->second;
         }
@@ -763,7 +762,7 @@ static int run(int argc, char* argv[]) {
                 written += bytes; pos += bytes; new_rec += count;
             } else if (op == OP_DELETE_RUN) {
                 old_rec += count; old_bytes += count * actual_stride;
-            } else if (op == OP_REPLACE_RUN && v8) {
+            } else if (op == OP_REPLACE_RUN) {
                 // Same entities, new bytes: written like an INSERT, mapped like a MATCH.
                 size_t bytes = count * actual_stride;
                 if (pos + bytes > seq_end) throw std::runtime_error(std::string("Malformed merge sequence: ") + fname);
@@ -779,7 +778,7 @@ static int run(int argc, char* argv[]) {
         if (fclose(outf) != 0 || !out_ok) throw std::runtime_error(std::string("Cannot write ") + fname);
         log_rewinds(old);
 
-        if (track && v8 && file_id == (uint32_t)PatchFileId::STREET_WAYS) {
+        if (track && file_id == (uint32_t)PatchFileId::STREET_WAYS) {
             // The moved ways' pairs (parent-id remap, street leg) complete
             // the street remap the address replay reads.
             for (const auto& [o, n] : poi_street_remap) remap.add_pair(o, n);
@@ -878,7 +877,7 @@ static int run(int argc, char* argv[]) {
 
         auto remap = [&](std::vector<uint32_t>& ids, const RecordRemap& rm) {
             constexpr uint32_t NO2 = 0xFFFFFFFF;
-            if (v8 && &rm != &no_remap) {
+            if (&rm != &no_remap) {
                 // v8: an old id the replay doesn't map is a deleted record.
                 size_t w = 0;
                 for (uint32_t id : ids) { uint32_t n = rm[id]; if (n != NO2) ids[w++] = n; }
