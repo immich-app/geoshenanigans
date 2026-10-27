@@ -8,7 +8,7 @@
 //! (boundary slots). Nothing else is stored: names, points and types stay in the geocoder files.
 use crate::constants::*;
 use crate::entities::*;
-use crate::extras::{record_ref, Extras, KIND_PLACE_NODE, KIND_POI, KIND_POLYGON};
+use crate::extras::{record_ref, Extras, KIND_PLACE_NODE, KIND_POI};
 use crate::model::*;
 use crate::normalize::{join, tokens, transliterate};
 use memmap2::Mmap;
@@ -171,7 +171,7 @@ impl<'a> PlacesSource<'a> {
     fn fill(&self, pos: u32, e: &mut EntityBuf) -> bool {
         e.names.clear();
         let geo = self.geo;
-        let (rref, base_id) = if pos < self.slots.len() as u32 {
+        let (rrefs, base_id) = if pos < self.slots.len() as u32 {
             let s = self.slots[pos as usize];
             let ap = polygon_raw(geo, s.poly);
             let node = (self.link[s.poly as usize] != NO_DATA).then(|| place_node_raw(geo, self.link[s.poly as usize]));
@@ -190,7 +190,7 @@ impl<'a> PlacesSource<'a> {
                     e.names.push((0, ORD_BOUNDARY_NAME, true, n.to_string()));
                 }
             }
-            (record_ref(KIND_POLYGON, s.poly), primary)
+            (s.record_refs(), primary)
         } else {
             let i = pos - self.slots.len() as u32;
             let pn = place_node_raw(geo, i);
@@ -203,9 +203,9 @@ impl<'a> PlacesSource<'a> {
             e.id = i;
             e.imp = W_TYPE * type_base(kind, typ, 0) + extra_importance(byte_at(&self.imp_places, i));
             e.cc = parent_cc(geo, pn.parent_poly_id);
-            (record_ref(KIND_PLACE_NODE, i), pn.name_id)
+            (vec![record_ref(KIND_PLACE_NODE, i)], pn.name_id)
         };
-        fill_names(geo, self.extras, rref, base_id, e)
+        fill_names(geo, self.extras, &rrefs, base_id, e)
     }
 }
 
@@ -232,21 +232,21 @@ impl<'a> PoiSource<'a> {
         e.id = pos;
         e.imp = poi_importance(r.importance, byte_at(&self.imp_poi, pos));
         e.cc = parent_cc(self.geo, r.parent_poly_id);
-        fill_names(self.geo, self.extras, record_ref(KIND_POI, pos), r.name_id, e)
+        fill_names(self.geo, self.extras, &[record_ref(KIND_POI, pos)], r.name_id, e)
     }
 }
 
-fn fill_names(geo: &Index, extras: Option<&Extras>, rref: u32, base_id: u32, e: &mut EntityBuf) -> bool {
+/// An entity's names: its base name, then the extra names of its records (`rrefs`, in the order
+/// `Entities::record_refs` gives them, which numbers the ordinals).
+fn fill_names(geo: &Index, extras: Option<&Extras>, rrefs: &[u32], base_id: u32, e: &mut EntityBuf) -> bool {
     let base = geo.get_string(base_id);
     if !base.is_empty() {
         e.names.insert(0, (0, 0, true, base.to_string()));
     }
     if let Some(x) = extras {
-        if let Some(row) = x.find(rref) {
-            for (k, n) in x.names(row).into_iter().enumerate() {
-                let ord = if k < MAX_EXTRA_ORD as usize { k as u8 + 1 } else { MAX_NAME_ORD };
-                e.names.push((n.class, ord, n.key == "name", n.name.to_string()));
-            }
+        for (k, n) in x.names_of(rrefs).into_iter().enumerate() {
+            let ord = if k < MAX_EXTRA_ORD as usize { k as u8 + 1 } else { MAX_NAME_ORD };
+            e.names.push((n.class, ord, n.key == "name", n.name.to_string()));
         }
     }
     !e.names.is_empty()
@@ -900,6 +900,35 @@ mod tests {
         assert_eq!(k, b"a");
         assert_eq!(hits.len(), PREFIX_TABLE_TOP);
         assert_eq!(hits[0].entity, 99);
+    }
+
+    #[test]
+    fn a_claimed_label_nodes_extra_names_find_its_boundary() {
+        use crate::fixture::{build_search, Geo, TempDir};
+        use crate::query::Searcher;
+        use crate::reader::SearchIndex;
+        let mut g = Geo::default();
+        let poly = g.boundary("Testville", 8, [10.0, 20.0, 10.2, 20.2]);
+        let node = g.place("Testville", 1, 10.1, 20.1);
+        g.claim(poly, node);
+        let dir = TempDir::new("label-extras");
+        let (tsv, bin) = (dir.0.join("extra_names.tsv"), dir.0.join("extra_names.bin"));
+        // The polygon's French name is the boundary's extra name 1, its label node's German one 2.
+        std::fs::write(&tsv, "b\t0\t2\tname:fr\tVille-Essai\np\t0\t2\tname:de\tPrüfstadt\n").unwrap();
+        crate::extras::pack(tsv.to_str().unwrap(), bin.to_str().unwrap()).unwrap();
+        let geo = g.load(&dir.0.join("geo"));
+        let out = dir.0.join("idx");
+        build_search(&geo, &out, Some(&bin));
+        let idx = SearchIndex::open(&geo, &out, Some(bin.to_str().unwrap()), None).unwrap();
+        let s = Searcher::new(&idx);
+
+        for q in ["Prüfstadt", "Ville-Essai"] {
+            let (found, _) = s.search(q, 5);
+
+            // The boundary is entity n_place_nodes (1) + its polygon (0); its node is not its own.
+            let got: Vec<(u32, &str)> = found.iter().map(|f| (f.hit.entity, f.name.as_str())).collect();
+            assert_eq!(got, [(1, q)], "{q}");
+        }
     }
 
     #[test]

@@ -3,6 +3,7 @@
 //! builds one.
 use crate::build::{build, BuildOpts};
 use crate::constants::DEFAULT_RUN_BUDGET_MB;
+use crate::model::{PLACE_FLAG_HIDDEN, PLACE_FLAG_LABEL_OF};
 use query_server::{
     cell_id_at_level, AdminPolygon, Index, PlaceNode, PoiRecord, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE,
     DEFAULT_STREET_CELL_LEVEL, NO_DATA, STR_TIER_COUNT,
@@ -50,11 +51,29 @@ impl Geo {
         id
     }
 
+    /// A rectangular boundary ([south, west, north, east]); returns its polygon id.
+    pub fn boundary(&mut self, name: &str, admin_level: u8, rect: [f32; 4]) -> u32 {
+        let [s, w, n, e] = rect;
+        let poly = AdminPolygon {
+            vertex_offset: 0, vertex_count: 5, name_id: self.string(name), admin_level, place_type_override: 0,
+            _pad2: 0, _pad3: 0, area: (n - s) * (e - w), country_code: 0, hole_count: 0,
+        };
+        self.polygons.push((poly, rect));
+        self.polygons.len() as u32 - 1
+    }
+
     /// A place node of PlaceNode type `place_type` (0 city .. 6 quarter); returns its index.
     pub fn place(&mut self, name: &str, place_type: u8, lat: f32, lng: f32) -> u32 {
         let name_id = self.string(name);
         self.nodes.push(PlaceNode { lat, lng, name_id, place_type, _pad1: 0, _pad2: 0, parent_poly_id: NO_DATA });
         self.nodes.len() as u32 - 1
+    }
+
+    /// Node `node` hidden as the label of boundary `poly`, as the builder flags a claimed node.
+    pub fn claim(&mut self, poly: u32, node: u32) {
+        let pn = &mut self.nodes[node as usize];
+        pn._pad1 |= PLACE_FLAG_LABEL_OF | PLACE_FLAG_HIDDEN;
+        pn.parent_poly_id = poly;
     }
 
     /// A point POI with the builder's importance byte; returns its record index.

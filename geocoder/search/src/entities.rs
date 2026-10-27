@@ -37,6 +37,15 @@ impl BoundarySlot {
         let u = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
         BoundarySlot { poly: u(0), node: u(4), lat: f32::from_bits(u(8)), lng: f32::from_bits(u(12)) }
     }
+
+    /// The records whose extra names are the slot's: its polygon, then its label node.
+    pub fn record_refs(&self) -> Vec<u32> {
+        let mut refs = vec![record_ref(KIND_POLYGON, self.poly)];
+        if self.linked() {
+            refs.push(record_ref(KIND_PLACE_NODE, self.node));
+        }
+        refs
+    }
 }
 
 /// A labelled boundary's primary name: its label node's (when the node kept it), else its own.
@@ -140,14 +149,15 @@ impl<'a> Entities<'a> {
         (s.lat, s.lng)
     }
 
-    pub fn record_ref(&self, e: u32) -> u32 {
+    /// The records whose extra names are entity `e`'s.
+    pub fn record_refs(&self, e: u32) -> Vec<u32> {
         if Self::is_poi(e) {
-            return record_ref(KIND_POI, e & !POI_BIT);
+            return vec![record_ref(KIND_POI, e & !POI_BIT)];
         }
         if e < self.n_place_nodes {
-            return record_ref(KIND_PLACE_NODE, e);
+            return vec![record_ref(KIND_PLACE_NODE, e)];
         }
-        record_ref(KIND_POLYGON, self.slot(e - self.n_place_nodes).poly)
+        self.slot(e - self.n_place_nodes).record_refs()
     }
 
     pub fn base_name(&self, e: u32) -> &'a str {
@@ -173,7 +183,7 @@ impl<'a> Entities<'a> {
             }
             return Cow::Borrowed(self.base_name(e));
         }
-        match self.extras.as_ref().and_then(|x| x.name_at(self.record_ref(e), ord)) {
+        match self.extras.as_ref().and_then(|x| x.name_at(&self.record_refs(e), ord)) {
             Some((n, _)) => Cow::Owned(n.to_string()),
             None => Cow::Borrowed(self.base_name(e)),
         }
