@@ -28,6 +28,12 @@ int main() {
             fprintf(stderr, "FAIL ~AsyncEnc hangs with an open file\n");
             _exit(1);
         }
+        try {  // (ready is not done: a throw in the task is only seen here)
+            f.get();
+        } catch (const std::exception& x) {
+            fprintf(stderr, "FAIL the open-file case threw: %s\n", x.what());
+            return 1;
+        }
     }
     fprintf(stderr, "PASS\n");
     return 0;
