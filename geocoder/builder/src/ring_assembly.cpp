@@ -492,6 +492,12 @@ AreaRings assemble_area_rings(const std::vector<std::pair<int64_t, std::string>>
     }
 
     Walk walk = walk_rings(sub_ways, ends, nullptr);
+    // Nor does osmium take an area whose segments cross: it looks for those
+    // (SegmentList::find_intersections) before it joins any rings.
+    if (rings_cross(walk.rings)) {
+        out.failure = AreaFailure::Crossing;
+        return out;
+    }
     // Walked in member order, two rings can cross at a coordinate they share
     // (two ways overlapping, noded where their outlines meet), and nesting
     // rings needs them not to. osmium joins the sub-ways at such coordinates
@@ -519,11 +525,5 @@ AreaRings assemble_area_rings(const std::vector<std::pair<int64_t, std::string>>
     }
     out.rings = std::move(walk.rings);
     out.roles = std::move(walk.roles);
-    // Nor does osmium take an area whose segments cross.
-    if (rings_cross(out.rings)) {
-        out.rings.clear();
-        out.roles.clear();
-        out.failure = AreaFailure::Crossing;
-    }
     return out;
 }

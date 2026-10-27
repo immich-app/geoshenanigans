@@ -367,6 +367,20 @@ TEST(area_rings_rings_crossing_at_shared_nodes_take_the_even_odd_area) {
     }
 }
 
+// Segments that cross fail the area before rings crossing at shared nodes
+// are looked at, as osmium finds intersections before it joins rings (The
+// Ledges, r19640968): no area, and no node counted as re-paired.
+TEST(area_rings_crossing_segments_fail_before_rings_are_re_paired) {
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {0.0, 2.0}, {1.0, 2.0}, {2.0, 2.0}, {2.0, 1.0}, {2.0, 0.0}, {0.0, 0.0}});
+    add_way(geoms, 2, {{1.0, 1.0}, {1.0, 2.0}, {1.0, 3.0}, {3.0, 3.0}, {3.0, 1.0}, {2.0, 1.0}, {1.0, 1.0}});
+    add_way(geoms, 3, {{5.0, 5.0}, {6.0, 6.0}, {6.0, 5.0}, {5.0, 6.0}, {5.0, 5.0}});
+    const AreaRings a = assemble_area_rings({{1, "outer"}, {2, "outer"}, {3, "outer"}}, geoms);
+    CHECK(a.rings.empty());
+    CHECK(a.failure == AreaFailure::Crossing);
+    CHECK_EQ(a.crossing_coordinates, 0u);
+}
+
 // Two enclaves overlapping each other, crossing at two shared nodes
 // (Louisville, r1804307): their overlap is in an odd number of rings, so it
 // is part of the area again, an island as osmium builds it.
