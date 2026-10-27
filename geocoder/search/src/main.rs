@@ -192,20 +192,26 @@ fn cmd_query(args: &[String]) {
     eprintln!("after queries: memory {}", mem_json());
 }
 
+/// The "lat lng" points of `input`, one per line (other lines are skipped); an error for a failed
+/// read.
+fn read_points(input: impl BufRead) -> std::io::Result<Vec<(f32, f32)>> {
+    let mut pts = Vec::new();
+    for line in input.lines() {
+        let line = line?;
+        let mut it = line.split_whitespace();
+        if let (Some(Ok(lat)), Some(Ok(lng))) = (it.next().map(str::parse), it.next().map(str::parse)) {
+            pts.push((lat, lng));
+        }
+    }
+    Ok(pts)
+}
+
 fn cmd_ctxbench(args: &[String]) {
     let geo = load_geo(&args[2]);
     let dir = Path::new(&args[3]);
     let idx = SearchIndex::open(&geo, dir, None, None).expect("search index");
     let s = Searcher::new(&idx);
-    let pts: Vec<(f32, f32)> = std::io::stdin()
-        .lock()
-        .lines()
-        .map_while(Result::ok)
-        .filter_map(|l| {
-            let mut it = l.split_whitespace();
-            Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
-        })
-        .collect();
+    let pts = read_points(std::io::stdin().lock()).expect("read points");
     let mut lat = Vec::with_capacity(pts.len());
     for &(a, b) in &pts {
         let t = Instant::now();
@@ -316,5 +322,20 @@ mod tests {
             }
         }
         assert!(answer_lines(std::io::BufReader::new(Broken), &mut Vec::new(), |_| json!(null)).is_err());
+    }
+
+    #[test]
+    fn ctxbench_input_errors_are_reported() {
+        // One point line, then a failed read.
+        struct Broken(bool);
+        impl std::io::Read for Broken {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if std::mem::take(&mut self.0) { buf[..8].copy_from_slice(b"1.5 2.5\n"); return Ok(8); }
+                Err(std::io::Error::other("input failed"))
+            }
+        }
+        let points = read_points(std::io::BufReader::new(&b"1.5 2.5\nnot a point\n3 4\n"[..])).unwrap();
+        assert_eq!(points, vec![(1.5, 2.5), (3.0, 4.0)]);
+        assert!(read_points(std::io::BufReader::new(Broken(true))).is_err());
     }
 }
