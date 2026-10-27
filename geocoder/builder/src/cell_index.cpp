@@ -1063,7 +1063,16 @@ struct PackedPolygon {
     uint32_t vertex_count = 0;
     float area = 0;
     uint16_t hole_count = 0;
+    uint8_t halvings = 0;  // SimplifiedRings::halvings
+    bool nests = true;
 };
+
+// The build log line of how simplify_rings fared over packed polygons.
+static std::string hole_topology(const std::vector<PackedPolygon>& packed) {
+    HoleTopologyCounts counts;
+    for (const PackedPolygon& p : packed) counts.add(p.halvings, p.nests);
+    return counts.summary();
+}
 static PackedPolygon pack_admin_polygon(const ParsedData& data, const AdminPolygon& ap,
                                         double epsilon_scale) {
     if (ap.vertex_count < 3) return {};  // tombstone, or no area to draw
@@ -1078,21 +1087,25 @@ static PackedPolygon pack_admin_polygon(const ParsedData& data, const AdminPolyg
     const bool parsed = split_rings(verts, ap.vertex_count, ap.hole_count, rings);
     std::vector<std::pair<double,double>> pts;
     uint16_t holes = parsed ? ap.hole_count : 0;
+    PackedPolygon out;
     if (epsilon_scale > 0) {
         // Each ring on its own: simplifying the keyhole range as one ring
         // would cut its connectors.
         double eps_m = admin_epsilon_meters(ap.admin_level) * epsilon_scale;
         std::vector<std::vector<std::pair<double,double>>> hole_rings;
         for (size_t r = 1; r < rings.size(); r++) hole_rings.push_back(points(rings[r]));
-        std::tie(pts, holes) = simplify_rings(points(rings[0]), hole_rings,
-            [&](const std::vector<std::pair<double,double>>& ring) {
+        SimplifiedRings s = simplify_rings(points(rings[0]), hole_rings,
+            [&](const std::vector<std::pair<double,double>>& ring, double scale) {
                 double lat = ring.empty() ? 0.0 : ring[0].first;
-                return simplify_polygon_epsilon(ring, meters_to_degrees(eps_m, lat));
+                return simplify_polygon_epsilon(ring, meters_to_degrees(eps_m * scale, lat));
             });
+        pts = std::move(s.range);
+        holes = s.holes;
+        out.halvings = s.halvings;
+        out.nests = s.nests;
     } else {
         pts = points(RingSpan{0, ap.vertex_count});
     }
-    PackedPolygon out;
     if (pts.size() < 3) return out;
 
     out.bytes.resize(plan_polygon(pts.data(), pts.size()).bytes);
@@ -1258,6 +1271,9 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
         });
     }
     log_phase((label + (copied ? "copy from the planet" : "simplify")).c_str(), _qt, _qc);
+    if (!copied)
+        std::cerr << "Quality " << epsilon_scale << "x hole topology (" << output_dir << "): " << hole_topology(packed)
+                  << std::endl;
 
     // admin_polygons.bin MUST stay index-aligned with data.admin_polygons:
     // the cell index (admin_cells/admin_entries, written by the full/admin
@@ -1362,6 +1378,7 @@ void write_admin_minimal_polygons(const ParsedData& data,
         for (size_t k = begin; k < end; k++)
             packed[k] = pack_admin_polygon(data, data.admin_polygons[kept_idx[k]], epsilon_scale);
     });
+    std::cerr << "  Admin-minimal hole topology (" << output_dir << "): " << hole_topology(packed) << std::endl;
 
     // Survivors keep stable slots in admin-minimal's own numbering and
     // sidecar, like the full set's (apply_strategy2_admins). A dense
