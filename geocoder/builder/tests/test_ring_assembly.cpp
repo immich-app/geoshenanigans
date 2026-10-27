@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include "polygon_rings.h"
 #include "test_framework.h"
 
 namespace {
@@ -318,4 +319,102 @@ TEST(area_rings_fail_past_100_touching_coordinates) {
     const AreaRings fewer = assemble_area_rings(members, geoms);
     CHECK_EQ(fewer.rings.size(), size_t(101));
     CHECK(fewer.failure == AreaFailure::None);
+}
+
+namespace {
+
+// The polygons nest_rings makes of a relation's rings, nested as the builder
+// nests them, and how many of them hold a point (inside the outer ring and
+// outside its holes).
+std::vector<NestedPolygon> nested(const AreaRings& a) {
+    const std::vector<int> around = enclosing_rings(a.rings);
+    return nest_rings(a.rings, around, ring_depths(around));
+}
+
+int polygons_holding(const std::vector<NestedPolygon>& polygons, double lat, double lng) {
+    int n = 0;
+    for (const auto& p : polygons) {
+        bool in = ring_contains_latlng(p.outer, lat, lng);
+        for (const auto& h : p.holes) in = in && !ring_contains_latlng(h, lat, lng);
+        n += in;
+    }
+    return n;
+}
+
+}  // namespace
+
+// Two squares overlapping, each closed way noded at the two points where
+// their outlines meet: no segments cross, but walked in member order the
+// rings are the two squares, which cross at those nodes. osmium joins the
+// ways' halves into rings that don't cross (two L-shapes), so the overlap is
+// in neither: the area is the even-odd one of the outlines.
+TEST(area_rings_rings_crossing_at_shared_nodes_take_the_even_odd_area) {
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {0.0, 2.0}, {1.0, 2.0}, {2.0, 2.0}, {2.0, 1.0}, {2.0, 0.0}, {0.0, 0.0}});
+    add_way(geoms, 2, {{1.0, 1.0}, {1.0, 2.0}, {1.0, 3.0}, {3.0, 3.0}, {3.0, 1.0}, {2.0, 1.0}, {1.0, 1.0}});
+    for (const auto& members : std::vector<std::vector<std::pair<int64_t, std::string>>>{
+             {{1, "outer"}, {2, "outer"}}, {{2, "outer"}, {1, "inner"}}}) {
+        const AreaRings a = assemble_area_rings(members, geoms);
+        CHECK(a.failure == AreaFailure::None);
+        CHECK_EQ(a.rings.size(), size_t(2));
+        const std::vector<NestedPolygon> polygons = nested(a);
+        CHECK_EQ(polygons_holding(polygons, 1.5, 1.5), 0);  // the overlap
+        CHECK_EQ(polygons_holding(polygons, 0.5, 0.5), 1);
+        CHECK_EQ(polygons_holding(polygons, 0.5, 1.5), 1);
+        CHECK_EQ(polygons_holding(polygons, 2.5, 2.5), 1);
+        CHECK_EQ(polygons_holding(polygons, 2.5, 1.5), 1);
+        CHECK_EQ(polygons_holding(polygons, 3.5, 3.5), 0);
+    }
+}
+
+// Two enclaves overlapping each other, crossing at two shared nodes
+// (Louisville, r1804307): their overlap is in an odd number of rings, so it
+// is part of the area again, an island as osmium builds it.
+TEST(area_rings_enclaves_crossing_at_shared_nodes_leave_their_overlap_in) {
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {0.0, 10.0}, {10.0, 10.0}, {10.0, 0.0}, {0.0, 0.0}});
+    add_way(geoms, 2, {{2.0, 2.0}, {2.0, 6.0}, {4.0, 6.0}, {6.0, 6.0}, {6.0, 4.0}, {6.0, 2.0}, {2.0, 2.0}});
+    add_way(geoms, 3, {{4.0, 4.0}, {4.0, 6.0}, {4.0, 8.0}, {8.0, 8.0}, {8.0, 4.0}, {6.0, 4.0}, {4.0, 4.0}});
+    const AreaRings a = assemble_area_rings({{1, "outer"}, {2, "inner"}, {3, "inner"}}, geoms);
+    CHECK(a.failure == AreaFailure::None);
+    const std::vector<NestedPolygon> polygons = nested(a);
+    CHECK_EQ(polygons_holding(polygons, 5.0, 5.0), 1);  // the overlap
+    CHECK_EQ(polygons_holding(polygons, 3.0, 3.0), 0);
+    CHECK_EQ(polygons_holding(polygons, 7.0, 7.0), 0);
+    CHECK_EQ(polygons_holding(polygons, 1.0, 1.0), 1);
+    CHECK_EQ(polygons_holding(polygons, 9.0, 1.0), 1);
+}
+
+// Rings that only touch at a node keep their own rings, in either member
+// order: two squares corner to corner are two polygons, and an enclave
+// touching the outline from inside is a hole in it.
+TEST(area_rings_rings_touching_at_a_node_stay_as_they_are) {
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {0.0, 1.0}, {1.0, 1.0}, {1.0, 0.0}, {0.0, 0.0}});
+    add_way(geoms, 2, {{1.0, 1.0}, {1.0, 2.0}, {2.0, 2.0}, {2.0, 1.0}, {1.0, 1.0}});
+    add_way(geoms, 3, {{0.0, 0.0}, {0.0, 5.0}, {0.0, 10.0}, {10.0, 10.0}, {10.0, 0.0}, {0.0, 0.0}});
+    add_way(geoms, 4, {{0.0, 5.0}, {3.0, 7.0}, {6.0, 5.0}, {3.0, 3.0}, {0.0, 5.0}});
+    using Members = std::vector<std::pair<int64_t, std::string>>;
+    for (const Members& members : {Members{{1, "outer"}, {2, "outer"}}, Members{{2, "outer"}, {1, "outer"}}}) {
+        const AreaRings a = assemble_area_rings(members, geoms);
+        CHECK(a.failure == AreaFailure::None);
+        REQUIRE(a.rings.size() == size_t(2));
+        CHECK_EQ(a.rings[0].size(), size_t(5));
+        CHECK_EQ(a.rings[1].size(), size_t(5));
+        const std::vector<NestedPolygon> polygons = nested(a);
+        CHECK_EQ(polygons.size(), size_t(2));
+        CHECK_EQ(polygons_holding(polygons, 0.5, 0.5), 1);
+        CHECK_EQ(polygons_holding(polygons, 1.5, 1.5), 1);
+        CHECK_EQ(polygons_holding(polygons, 0.5, 1.5), 0);
+    }
+    for (const Members& members : {Members{{3, "outer"}, {4, "inner"}}, Members{{4, "inner"}, {3, "outer"}}}) {
+        const AreaRings a = assemble_area_rings(members, geoms);
+        CHECK(a.failure == AreaFailure::None);
+        REQUIRE(a.rings.size() == size_t(2));
+        const std::vector<NestedPolygon> polygons = nested(a);
+        REQUIRE(polygons.size() == size_t(1));
+        CHECK_EQ(polygons[0].holes.size(), size_t(1));
+        CHECK_EQ(polygons_holding(polygons, 3.0, 5.0), 0);
+        CHECK_EQ(polygons_holding(polygons, 8.0, 8.0), 1);
+    }
 }

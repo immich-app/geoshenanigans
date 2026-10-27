@@ -4177,7 +4177,8 @@ static int run(int argc, char* argv[]) {
                     // with the member roles.
                     struct RingNesting {
                         std::atomic<uint64_t> rings{0}, holes{0}, islands_in_holes{0}, inner_ways_outer{0},
-                            outer_ways_hole{0}, mixed_roles{0}, cancelled{0}, open{0}, touching{0}, crossing{0};
+                            outer_ways_hole{0}, mixed_roles{0}, cancelled{0}, open{0}, touching{0}, crossing{0},
+                            re_paired{0};
                         void count(const AreaRings& a, const std::vector<int>& depth) {
                             for (size_t r = 0; r < depth.size(); r++) {
                                 const bool hole = depth[r] % 2;
@@ -4193,6 +4194,7 @@ static int run(int argc, char* argv[]) {
                             open += a.failure == AreaFailure::OpenRing;
                             touching += a.failure == AreaFailure::TooManyTouches;
                             crossing += a.failure == AreaFailure::Crossing;
+                            re_paired += a.crossing_coordinates > 0 && a.failure == AreaFailure::None;
                         }
                     } nesting;
 
@@ -4246,6 +4248,12 @@ static int run(int argc, char* argv[]) {
                                 const std::vector<int> around = enclosing_rings(assembled.rings);
                                 const std::vector<int> depth = ring_depths(around);
                                 nesting.count(assembled, depth);
+                                if (assembled.crossing_coordinates > 0) {
+                                    std::cerr << ("  Rings crossing at shared nodes: relation " + std::to_string(rel.id) +
+                                                  " '" + rel.name + "' (level " + std::to_string(rel.admin_level) + "), " +
+                                                  std::to_string(assembled.crossing_coordinates) + " nodes, " +
+                                                  (assembled.failure == AreaFailure::None ? "re-paired" : "no area") + "\n");
+                                }
                                 std::vector<NestedPolygon> polygons =
                                     nest_rings(std::move(assembled.rings), around, depth);
 
@@ -4364,7 +4372,8 @@ static int run(int argc, char* argv[]) {
                               << " mix roles; " << nesting.cancelled << " duplicate sub-ways dropped; relations"
                               << " without an area as osmium: " << nesting.open << " open, " << nesting.touching
                               << " touching over " << MAX_TOUCHING_LOCATIONS << " times, " << nesting.crossing
-                              << " crossing" << std::endl;
+                              << " crossing; " << nesting.re_paired
+                              << " with rings crossing at shared nodes re-paired by turn order" << std::endl;
                     if (wikidata_linked_count > 0) {
                         std::cerr << "  Wikidata place linking: " << wikidata_linked_count
                                   << " admin relations linked to place types." << std::endl;
