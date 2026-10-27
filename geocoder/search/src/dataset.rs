@@ -251,8 +251,14 @@ pub fn open<'g>(geo: &'g Index, loaded: &Stamps, dir: &Path, index: &Path, on_de
         Origin::Current
     } else {
         // Held, so a stage here is a dead build's, with any files a publish it did not finish
-        // replaced still aside (which a build refuses to start over). Every file is built
-        // again, so none of those is read.
+        // replaced still aside (which a build refuses to start over). The META_FILE goes first:
+        // until a build over them completes, the files there are no index of these files, even
+        // once the stage that showed a publish unfinished is gone.
+        let meta_file = index.join(META_FILE);
+        match std::fs::remove_file(&meta_file) {
+            Err(e) if e.kind() != ErrorKind::NotFound => return Err(io(&meta_file, e)),
+            _ => {}
+        }
         let _ = std::fs::remove_dir_all(index.join(BUILD_STAGE_DIR));
         let opts = BuildOpts { threads: on_device.threads, mem_mb: on_device.mem_mb, ..BuildOpts::new(index.join("tmp")) };
         let meta = index_meta(geo, &opts, &have);
@@ -443,6 +449,22 @@ mod tests {
         assert!(!index.join(BUILD_STAGE_DIR).exists());
     }
 
+    /// Over the index `open` built in `index` of the dataset in `dir` (loaded as `geo`): a
+    /// `place-search build --no-inline` of the same files, killed between moving in its
+    /// places.fst and its places.post. The old places.post and META_FILE are still in place.
+    fn cut_off_publish(geo: &Index, dir: &Path, index: &Path) {
+        let stage = index.join(BUILD_STAGE_DIR);
+        let opts = BuildOpts { inline: false, ..BuildOpts::new(dir.join("tmp")) };
+        let meta = index_meta(geo, &opts, &fingerprint(dir).unwrap());
+        build_all(geo, &held_subs(geo, SUB_INDEXES), &stage, &opts, || Ok(meta.into())).unwrap();
+        let aside = stage.join(BUILD_ASIDE_DIR);
+        std::fs::create_dir(&aside).unwrap();
+        for f in ["places.bnd", "places.fst"] {
+            std::fs::rename(index.join(f), aside.join(f)).unwrap();
+            std::fs::rename(stage.join(f), index.join(f)).unwrap();
+        }
+    }
+
     #[test]
     fn a_publish_cut_off_over_an_index_of_the_same_files_is_built_again() {
         let ds = TempDir::new("cut-same");
@@ -450,24 +472,31 @@ mod tests {
         let (geo, stamps) = load_dataset(&ds.0);
         let index = ds.0.join("search");
         drop(open(&geo, &stamps, &ds.0, &index, &BuildOnDevice::default()).unwrap());
-        // `place-search build --no-inline` of the same files, killed between moving in its
-        // places.fst and its places.post: the old places.post and META_FILE are still in place.
-        let stage = index.join(BUILD_STAGE_DIR);
-        let opts = BuildOpts { inline: false, ..BuildOpts::new(ds.0.join("tmp")) };
-        let meta = index_meta(&geo, &opts, &fingerprint(&ds.0).unwrap());
-        build_all(&geo, &held_subs(&geo, SUB_INDEXES), &stage, &opts, || Ok(meta.into())).unwrap();
-        let aside = stage.join(BUILD_ASIDE_DIR);
-        std::fs::create_dir(&aside).unwrap();
-        for f in ["places.bnd", "places.fst"] {
-            std::fs::rename(index.join(f), aside.join(f)).unwrap();
-            std::fs::rename(stage.join(f), index.join(f)).unwrap();
-        }
+        cut_off_publish(&geo, &ds.0, &index);
 
         let (idx, origin) = open(&geo, &stamps, &ds.0, &index, &BuildOnDevice::default()).unwrap();
 
         assert_eq!(origin, Origin::Built);
         assert_eq!(names(&idx, "testville"), vec!["Testville"]);
-        assert!(!stage.exists());
+        assert!(!index.join(BUILD_STAGE_DIR).exists());
+    }
+
+    #[test]
+    fn a_publish_cut_off_stays_unread_after_a_failed_build_over_it() {
+        let ds = TempDir::new("cut-failed");
+        dataset(["Testville", "Otherton"]).write(&ds.0);
+        let (geo, stamps) = load_dataset(&ds.0);
+        let index = ds.0.join("search");
+        drop(open(&geo, &stamps, &ds.0, &index, &BuildOnDevice::default()).unwrap());
+        cut_off_publish(&geo, &ds.0, &index);
+        // A sort budget no build can run with: the build over the cut-off publish fails.
+        let failing = BuildOnDevice { threads: 1, mem_mb: 0 };
+        assert!(open(&geo, &stamps, &ds.0, &index, &failing).is_err());
+
+        let (idx, origin) = open(&geo, &stamps, &ds.0, &index, &BuildOnDevice::default()).unwrap();
+
+        assert_eq!(origin, Origin::Built);
+        assert_eq!(names(&idx, "testville"), vec!["Testville"]);
     }
 
     #[test]
