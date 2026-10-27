@@ -1,7 +1,7 @@
 //! Test fixture: a small geocoder index (rectangular boundaries, place nodes, point POIs) in the
 //! builder's file layout, and the place-search index built from it the way `place-search build`
 //! builds one.
-use crate::build::{build, BuildOpts};
+use crate::build::{build_all, BuildOpts};
 use crate::constants::DEFAULT_RUN_BUDGET_MB;
 use crate::model::{PLACE_FLAG_HIDDEN, PLACE_FLAG_LABEL_OF};
 use query_server::{
@@ -173,13 +173,10 @@ pub fn build_search(geo: &Index, out: &Path, extras: Option<&Path>) {
         threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: out.join("tmp"), inline: true,
         extras: extras.map(|p| p.to_str().unwrap().to_string()), imp_dir: None, area_proxy: false, poi_max_tier: 3,
     };
-    build(geo, "places", out, &opts).unwrap();
-    if geo.poi_records.is_some() {
-        build(geo, "poi", out, &opts).unwrap();
-    }
+    let subs: &[&str] = if geo.poi_records.is_some() { &["places", "poi"] } else { &["places"] };
     let n_place_nodes = geo.place_nodes.as_ref().map_or(0, |m| m.len() / std::mem::size_of::<PlaceNode>() as u64);
     let meta = serde_json::json!({"n_place_nodes": n_place_nodes, "extras": extras.is_some()});
-    std::fs::write(out.join("search_meta.json"), meta.to_string()).unwrap();
+    build_all(geo, subs, out, &opts, meta).unwrap();
 }
 
 /// A `*_cells.bin` (u64 cell, u32 entry offset; sorted) and its `*_entries.bin` (u16 count, then

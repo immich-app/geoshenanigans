@@ -876,6 +876,42 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
     Ok(st)
 }
 
+/// Builds the sub-indexes `subs` of `geo` for the index directory `out`, `meta` with each one's
+/// stats becoming its search_meta.json. Every file is written into a staging directory and moved
+/// into `out` only once all of them are complete, search_meta.json last: a failed build leaves
+/// `out` as it was. Returns the stats.
+pub fn build_all(geo: &Index, subs: &[&str], out: &Path, opts: &BuildOpts, meta: serde_json::Value) -> Result<Vec<(String, Stats)>, String> {
+    let stage = out.join(BUILD_STAGE_DIR);
+    let _ = std::fs::remove_dir_all(&stage);
+    let built = build_staged(geo, subs, &stage, opts, meta)
+        .and_then(|stats| publish(&stage, out).map(|_| stats).map_err(|e| format!("publish {}: {e}", out.display())));
+    let _ = std::fs::remove_dir_all(&stage);
+    built
+}
+
+fn build_staged(geo: &Index, subs: &[&str], stage: &Path, opts: &BuildOpts, mut meta: serde_json::Value) -> Result<Vec<(String, Stats)>, String> {
+    std::fs::create_dir_all(stage).map_err(|e| format!("{}: {e}", stage.display()))?;
+    let mut stats = Vec::new();
+    for &s in subs {
+        let st = build(geo, s, stage, opts).map_err(|e| format!("build {s}: {e}"))?;
+        meta[s] = st.lines.iter().map(|(k, v)| (k.clone(), serde_json::json!(v))).collect::<serde_json::Map<_, _>>().into();
+        stats.push((s.to_string(), st));
+    }
+    let text = serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?;
+    std::fs::write(stage.join("search_meta.json"), text).map_err(|e| e.to_string())?;
+    Ok(stats)
+}
+
+/// Moves every file of `stage` into `out`, search_meta.json last.
+fn publish(stage: &Path, out: &Path) -> std::io::Result<()> {
+    let mut names = std::fs::read_dir(stage)?.map(|e| e.map(|e| e.file_name())).collect::<std::io::Result<Vec<_>>>()?;
+    names.sort_by_key(|n| n == "search_meta.json");
+    for n in &names {
+        std::fs::rename(stage.join(n), out.join(n))?;
+    }
+    Ok(())
+}
+
 /// A partial rebuild must keep the extra-name source required by retained sub-indexes.
 pub fn check_retained_names(out: &Path, building: &[&str], with_extras: bool) -> Result<(), String> {
     let text = match std::fs::read_to_string(out.join("search_meta.json")) {
@@ -1227,6 +1263,48 @@ mod tests {
             assert!(geo.admin_pip(&polygon_raw(&geo, poly), f.lat as f64, f.lng as f64), "{q} at {} {}", f.lat, f.lng);
             assert_eq!(f.ctx.county, q);
         }
+    }
+
+    #[test]
+    fn a_failed_rebuild_leaves_the_index_as_it_was() {
+        use crate::fixture::{build_search, Geo, TempDir};
+        use crate::query::Searcher;
+        use crate::reader::SearchIndex;
+        let mut g = Geo::default();
+        g.boundary("Testville", 8, [10.0, 20.0, 10.2, 20.2]);
+        g.place("Testburg", 1, 10.1, 20.1);
+        g.poi("Test Hall", 10.05, 20.05, 0);
+        let dir = TempDir::new("rebuild");
+        let geo = g.load(&dir.0.join("geo"));
+        let out = dir.0.join("idx");
+        build_search(&geo, &out, None);
+        let entries = |d: &Path| {
+            let mut v: Vec<_> = std::fs::read_dir(d).unwrap().map(|e| e.unwrap().path()).map(|p| (std::fs::read(&p).ok(), p)).collect();
+            v.sort();
+            v
+        };
+        let before = entries(&out);
+        // Importance bytes change the places postings; the POI build after them fails on an
+        // importance file of the wrong size.
+        let imp = dir.0.join("imp");
+        std::fs::create_dir_all(&imp).unwrap();
+        for (file, n) in [("imp_places.u8", 1), ("imp_polys.u8", 1), ("imp_poi.u8", 2)] {
+            std::fs::write(imp.join(file), vec![200u8; n]).unwrap();
+        }
+        let opts = BuildOpts {
+            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"), inline: true, extras: None,
+            imp_dir: Some(imp.to_str().unwrap().into()), area_proxy: false, poi_max_tier: 3,
+        };
+
+        let err = build_all(&geo, &["places", "poi"], &out, &opts, serde_json::json!({})).err();
+
+        assert!(err.as_deref().is_some_and(|e| e.contains("imp_poi.u8")), "{err:?}");
+        let after = entries(&out);
+        let changed: Vec<_> = before.iter().filter(|e| !after.contains(e)).chain(after.iter().filter(|e| !before.contains(e))).map(|e| &e.1).collect();
+        assert!(changed.is_empty(), "changed: {changed:?}");
+        let idx = SearchIndex::open(&geo, &out, None, None).unwrap();
+        let (found, _) = Searcher::new(&idx).search("Testburg", 5);
+        assert_eq!(found.iter().map(|f| f.hit.entity).collect::<Vec<_>>(), [0]);
     }
 
     #[test]

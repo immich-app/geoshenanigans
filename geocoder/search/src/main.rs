@@ -6,7 +6,7 @@
 //!                    [--bench REPEATS [--no-warmup]]
 //!   one query per stdin line; default one JSON line per query, --bench latency percentiles
 //! place-search ctxbench <set dir> <index dir> < "lat lng" lines   (reverse-lookup cost per point)
-use place_search::build::{build, BuildOpts};
+use place_search::build::{build_all, BuildOpts};
 use place_search::reader::SearchIndex;
 use place_search::query::Searcher;
 use query_server::{Index, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL};
@@ -78,17 +78,13 @@ fn cmd_build(args: &[String]) {
     meta["imp"] = json!(opts.imp_dir.is_some());
     meta["area_proxy"] = json!(opts.area_proxy);
     meta["poi_max_tier"] = json!(opts.poi_max_tier);
-    for s in subs {
-        let st = build(&geo, s, &out, &opts).unwrap_or_else(|e| panic!("build {s}: {e}"));
-        let mut o = serde_json::Map::new();
+    let stats = build_all(&geo, &subs, &out, &opts, meta).unwrap_or_else(|e| panic!("{e}"));
+    for (s, st) in &stats {
         for (k, v) in &st.lines {
             eprintln!("{s}: {k}: {v}");
-            o.insert(k.clone(), json!(v));
         }
-        meta[s] = serde_json::Value::Object(o);
     }
     let _ = std::fs::remove_dir(&opts.tmp);
-    std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
     eprintln!("build memory: {}", mem_json());
 }
 
