@@ -358,7 +358,7 @@ impl Runs {
         self.items.push(Item {
             off,
             len: key.len().min(u16::MAX as usize) as u16,
-            flags: (p.partial as u8) | (p.class << 1),
+            flags: entry_flags(&p),
             ord: p.ord,
             entity: p.entity,
             imp: p.imp_q,
@@ -376,12 +376,7 @@ impl Runs {
         let path = self.dir.join(format!("{}-{}.run", self.tag, self.files.len()));
         let mut w = BufWriter::with_capacity(RUN_READ_BUFFER, File::create(&path)?);
         for it in &self.items {
-            let k = key(it);
-            w.write_all(&it.len.to_le_bytes())?;
-            w.write_all(k)?;
-            w.write_all(&it.entity.to_le_bytes())?;
-            w.write_all(&[it.imp, it.flags, it.ord])?;
-            self.spilled_bytes += 2 + k.len() as u64 + 7;
+            self.spilled_bytes += write_entry(&mut w, key(it), it.entity, it.imp, it.flags, it.ord)?;
         }
         w.flush()?;
         self.files.push(path);
@@ -389,6 +384,101 @@ impl Runs {
         self.arena.clear();
         Ok(())
     }
+}
+
+/// One run entry: u16 key length, key, u32 entity, importance, partial | class << 1, ordinal.
+/// Returns the bytes written.
+fn write_entry(w: &mut impl Write, key: &[u8], entity: u32, imp: u8, flags: u8, ord: u8) -> std::io::Result<u64> {
+    w.write_all(&(key.len() as u16).to_le_bytes())?;
+    w.write_all(key)?;
+    w.write_all(&entity.to_le_bytes())?;
+    w.write_all(&[imp, flags, ord])?;
+    Ok(2 + key.len() as u64 + 7)
+}
+
+fn entry_flags(p: &Posting) -> u8 {
+    (p.partial as u8) | (p.class << 1)
+}
+
+/// The entries of several sorted runs in (key, entity, run) order.
+struct Merge {
+    files: Vec<PathBuf>,
+    readers: Vec<RunReader>,
+    heap: BinaryHeap<Head>,
+}
+
+impl Merge {
+    fn open(files: &[PathBuf]) -> std::io::Result<Self> {
+        let mut readers = Vec::with_capacity(files.len());
+        for f in files {
+            readers.push(RunReader { r: BufReader::with_capacity(RUN_READ_BUFFER, File::open(f).map_err(|e| run_error(f, e))?) });
+        }
+        let mut heap = BinaryHeap::with_capacity(readers.len());
+        for (i, r) in readers.iter_mut().enumerate() {
+            let mut h = Head { key: Vec::new(), p: Posting { entity: 0, imp_q: 0, partial: false, class: 0, ord: 0 }, run: i };
+            if r.read_into(&mut h).map_err(|e| run_error(&files[i], e))? {
+                heap.push(h);
+            }
+        }
+        Ok(Merge { files: files.to_vec(), readers, heap })
+    }
+
+    /// Copies the next entry into `key` and `p`; false after the last, an error for a run that
+    /// fails to read or is cut short.
+    fn next(&mut self, key: &mut Vec<u8>, p: &mut Posting) -> std::io::Result<bool> {
+        let Some(mut top) = self.heap.peek_mut() else { return Ok(false) };
+        key.clear();
+        key.extend_from_slice(&top.key);
+        *p = top.p;
+        let run = top.run;
+        if !self.readers[run].read_into(&mut top).map_err(|e| run_error(&self.files[run], e))? {
+            std::collections::binary_heap::PeekMut::pop(top);
+        }
+        Ok(true)
+    }
+}
+
+/// A sort run's open or read error, naming the run.
+fn run_error(path: &Path, e: std::io::Error) -> std::io::Error {
+    std::io::Error::new(e.kind(), format!("sort run {}: {e}", path.display()))
+}
+
+/// Merges groups of at most MERGE_FAN_IN consecutive runs into longer runs until at most
+/// MERGE_FAN_IN are left (consecutive, so entries that compare equal keep their run order).
+/// Each pass merges every run while more than MERGE_FAN_IN² are left, then only as many of the
+/// last runs as it takes to leave MERGE_FAN_IN. Returns the runs left and the bytes rewritten.
+fn reduce_runs(mut files: Vec<PathBuf>, dir: &Path, tag: &str) -> std::io::Result<(Vec<PathBuf>, u64)> {
+    let mut rewritten = 0u64;
+    let mut pass = 0;
+    while files.len() > MERGE_FAN_IN {
+        let n = files.len();
+        let excess = n - MERGE_FAN_IN;
+        let merged = if n > MERGE_FAN_IN * MERGE_FAN_IN { n } else { excess + excess.div_ceil(MERGE_FAN_IN - 1) };
+        let mut next = files[..n - merged].to_vec();
+        for (i, group) in files[n - merged..].chunks(MERGE_FAN_IN).enumerate() {
+            if group.len() == 1 {
+                next.push(group[0].clone());
+                continue;
+            }
+            let path = dir.join(format!("{tag}-m{pass}-{i}.run"));
+            let mut w = BufWriter::with_capacity(RUN_READ_BUFFER, File::create(&path)?);
+            let mut m = Merge::open(group)?;
+            let mut key = Vec::new();
+            let mut p = Posting { entity: 0, imp_q: 0, partial: false, class: 0, ord: 0 };
+            while m.next(&mut key, &mut p)? {
+                rewritten += write_entry(&mut w, &key, p.entity, p.imp_q, entry_flags(&p), p.ord)?;
+            }
+            w.flush()?;
+            drop(m);
+            for f in group {
+                let _ = std::fs::remove_file(f);
+            }
+            next.push(path);
+        }
+        files = next;
+        pass += 1;
+    }
+    Ok((files, rewritten))
 }
 
 struct Head {
@@ -680,6 +770,8 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
     let t_runs = t0.elapsed();
 
     // ---- merge -> fst + postings + prefix table
+    let n_runs = files.len();
+    let (files, rewritten) = reduce_runs(files, &opts.tmp, name).map_err(|e| e.to_string())?;
     let mk = |ext: &str| File::create(out.join(format!("{name}.{ext}"))).map_err(|e| e.to_string());
     let mut w = Writer {
         fst: fst::MapBuilder::new(BufWriter::with_capacity(1 << 20, mk("fst")?)).map_err(|e| e.to_string())?,
@@ -699,38 +791,25 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
         inline_keys: 0,
         longest: 0,
     };
-    let mut readers: Vec<RunReader> = Vec::with_capacity(files.len());
-    for f in &files {
-        readers.push(RunReader { r: BufReader::with_capacity(RUN_READ_BUFFER, File::open(f).map_err(|e| e.to_string())?) });
-    }
-    let run_error = |i: usize, e: std::io::Error| format!("sort run {}: {e}", files[i].display());
-    let mut heap = BinaryHeap::with_capacity(readers.len());
-    for (i, r) in readers.iter_mut().enumerate() {
-        let mut h = Head { key: Vec::new(), p: Posting { entity: 0, imp_q: 0, partial: false, class: 0, ord: 0 }, run: i };
-        if r.read_into(&mut h).map_err(|e| run_error(i, e))? {
-            heap.push(h);
-        }
-    }
+    let mut m = Merge::open(&files).map_err(|e| e.to_string())?;
     let mut cur: Vec<u8> = Vec::new();
+    let mut key: Vec<u8> = Vec::new();
+    let mut p = Posting { entity: 0, imp_q: 0, partial: false, class: 0, ord: 0 };
     let mut group: Vec<Posting> = Vec::new();
-    while let Some(mut h) = heap.pop() {
-        if h.key != cur {
+    while m.next(&mut key, &mut p).map_err(|e| e.to_string())? {
+        if key != cur {
             if !group.is_empty() {
                 w.add(&cur, &mut group)?;
                 group.clear();
             }
-            cur.clear();
-            cur.extend_from_slice(&h.key);
+            std::mem::swap(&mut cur, &mut key);
         }
-        group.push(h.p);
-        if readers[h.run].read_into(&mut h).map_err(|e| run_error(h.run, e))? {
-            heap.push(h);
-        }
+        group.push(p);
     }
     if !group.is_empty() {
         w.add(&cur, &mut group)?;
     }
-    drop(readers);
+    drop(m);
     for f in &files {
         let _ = std::fs::remove_file(f);
     }
@@ -775,8 +854,9 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
     st.add("inline keys", inline_keys);
     st.add("longest list", longest);
     st.add("prefix table prefixes", n_prefixes);
-    st.add("sort runs", files.len());
+    st.add("sort runs", n_runs);
     st.add("run bytes spilled", spilled);
+    st.add("run bytes rewritten", rewritten);
     st.add("bytes fst", size("fst"));
     st.add("bytes post", size("post"));
     st.add("bytes pfx", size("pfx.fst") + size("pfx"));
@@ -811,6 +891,106 @@ pub fn check_retained_names(out: &Path, building: &[&str], with_extras: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// xorshift: deterministic test values without a dependency.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    fn posting(entity: u32, imp_q: u8, partial: bool, class: u8) -> Posting {
+        Posting { entity, imp_q, partial, class, ord: (entity % 16) as u8 }
+    }
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("place-search-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Writes one sorted run of `entries` and returns its path.
+    fn write_run(dir: &Path, name: &str, entries: &mut [(Vec<u8>, Posting)]) -> PathBuf {
+        entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.entity.cmp(&b.1.entity)));
+        let path = dir.join(name);
+        let mut w = BufWriter::new(File::create(&path).unwrap());
+        for (k, p) in entries.iter() {
+            write_entry(&mut w, k, p.entity, p.imp_q, entry_flags(p), p.ord).unwrap();
+        }
+        w.flush().unwrap();
+        path
+    }
+
+    fn read_all(files: &[PathBuf]) -> Vec<(Vec<u8>, Posting)> {
+        let mut m = Merge::open(files).unwrap();
+        let (mut key, mut p) = (Vec::new(), posting(0, 0, false, 0));
+        let mut out = Vec::new();
+        while m.next(&mut key, &mut p).unwrap() {
+            out.push((key.clone(), p));
+        }
+        out
+    }
+
+    /// `n` runs of random entries; returns the run files and every entry in merge order.
+    fn random_runs(dir: &Path, n: usize, rng: &mut Rng) -> (Vec<PathBuf>, Vec<(Vec<u8>, Posting)>) {
+        let mut all = Vec::new();
+        let mut files = Vec::new();
+        let mut entity = 0u32;
+        for r in 0..n {
+            let mut run: Vec<(Vec<u8>, Posting)> = (0..(1 + rng.next() % 40))
+                .map(|_| {
+                    entity += 1;
+                    let key = format!("k{}", rng.next() % 50).into_bytes();
+                    (key, posting(entity, (rng.next() % 200) as u8, rng.next().is_multiple_of(2), (rng.next() % 6) as u8))
+                })
+                .collect();
+            files.push(write_run(dir, &format!("t-{r}.run"), &mut run));
+            all.extend(run);
+        }
+        all.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.entity.cmp(&b.1.entity)));
+        (files, all)
+    }
+
+    #[test]
+    fn merge_streams_runs_in_key_then_entity_order() {
+        let dir = tmp_dir("merge");
+        let (files, all) = random_runs(&dir, 5, &mut Rng(7));
+        assert_eq!(read_all(&files), all);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reduce_runs_merges_only_the_runs_over_the_fan_in() {
+        let dir = tmp_dir("reduce-excess");
+        let (files, all) = random_runs(&dir, MERGE_FAN_IN + 1, &mut Rng(11));
+        let last_two: u64 = files[MERGE_FAN_IN - 1..].iter().map(|f| std::fs::metadata(f).unwrap().len()).sum();
+        let (left, rewritten) = reduce_runs(files.clone(), &dir, "t").unwrap();
+        assert_eq!(left.len(), MERGE_FAN_IN);
+        assert_eq!(left[..MERGE_FAN_IN - 1], files[..MERGE_FAN_IN - 1]);
+        assert_eq!(rewritten, last_two);
+        assert!(!files[MERGE_FAN_IN].exists());
+        assert_eq!(read_all(&left), all);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reduce_runs_takes_passes_until_the_fan_in_is_left() {
+        for n in [MERGE_FAN_IN, 3 * MERGE_FAN_IN + 5, MERGE_FAN_IN * MERGE_FAN_IN + 3] {
+            let dir = tmp_dir(&format!("reduce-{n}"));
+            let (files, all) = random_runs(&dir, n, &mut Rng(n as u64));
+            let (left, rewritten) = reduce_runs(files, &dir, "t").unwrap();
+            assert!(left.len() <= MERGE_FAN_IN);
+            assert_eq!(rewritten == 0, n <= MERGE_FAN_IN);
+            assert_eq!(read_all(&left), all);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 
     fn writer(dir: &Path) -> Writer {
         std::fs::create_dir_all(dir).unwrap();
