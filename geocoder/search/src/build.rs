@@ -540,6 +540,13 @@ struct PrefixSlot {
     flushed: u64,
 }
 
+impl PrefixSlot {
+    /// An error of this length's prefix temp file, naming it.
+    fn error(&self, e: std::io::Error) -> String {
+        format!("prefix temp file {}: {e}", self.path.display())
+    }
+}
+
 pub fn prefix_text(typed: usize, key_len: usize, edits: u8) -> f32 {
     let r = (typed as f32 / key_len.max(1) as f32).min(1.0);
     (PREFIX_BASE + PREFIX_COMPLETION * r) * PREFIX_TYPO.powi(edits as i32)
@@ -587,12 +594,11 @@ impl Writer {
         self.keys += 1;
         self.postings += group.len() as u64;
         self.longest = self.longest.max(group.len());
-        self.prefix_add(key, group);
-        Ok(())
+        self.prefix_add(key, group)
     }
 
-    fn prefix_add(&mut self, key: &[u8], list: &[Posting]) {
-        let Ok(key) = std::str::from_utf8(key) else { return };
+    fn prefix_add(&mut self, key: &[u8], list: &[Posting]) -> Result<(), String> {
+        let Ok(key) = std::str::from_utf8(key) else { return Ok(()) };
         let klen = key.chars().count();
         let top = best_postings(list, PREFIX_TABLE_TOP);
         let mut pfx = String::new();
@@ -601,7 +607,7 @@ impl Writer {
             let n = n + 1;
             if self.slots[n - 1].prefix != pfx {
                 let slot = &mut self.slots[n - 1];
-                flush_slot(slot).expect("prefix temp file");
+                flush_slot(slot).map_err(|e| slot.error(e))?;
                 slot.prefix = pfx.clone();
             }
             let slot = &mut self.slots[n - 1];
@@ -616,6 +622,7 @@ impl Writer {
                 best_entities(&mut slot.hits, PREFIX_TABLE_TOP * 4);
             }
         }
+        Ok(())
     }
 }
 
@@ -816,15 +823,14 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
     let mut n_prefixes = 0u64;
     let mut pfx_readers = Vec::new();
     for sl in slots.iter_mut() {
-        flush_slot(sl).map_err(|e| e.to_string())?;
-        sl.out.flush().map_err(|e| e.to_string())?;
+        flush_slot(sl).map_err(|e| sl.error(e))?;
+        sl.out.flush().map_err(|e| sl.error(e))?;
         n_prefixes += sl.flushed;
-        pfx_readers.push(BufReader::new(File::open(&sl.path).map_err(|e| e.to_string())?));
+        pfx_readers.push(BufReader::new(File::open(&sl.path).map_err(|e| sl.error(e))?));
     }
     // Merge the per-length files: each is sorted, and a prefix occurs in one length only.
-    let prefix_error = |i: usize, e: std::io::Error| format!("prefix temp file {}: {e}", slots[i].path.display());
     let mut heads: Vec<Option<(Vec<u8>, Vec<u8>)>> =
-        pfx_readers.iter_mut().enumerate().map(|(i, r)| read_prefix(r).map_err(|e| prefix_error(i, e))).collect::<Result<_, _>>()?;
+        pfx_readers.iter_mut().enumerate().map(|(i, r)| read_prefix(r).map_err(|e| slots[i].error(e))).collect::<Result<_, _>>()?;
     let mut pf = fst::MapBuilder::new(BufWriter::new(mk("pfx.fst")?)).map_err(|e| e.to_string())?;
     let mut pb = BufWriter::new(mk("pfx")?);
     let mut off = 0u64;
@@ -836,7 +842,7 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
         pf.insert(&k, off).map_err(|e| e.to_string())?;
         pb.write_all(&blob).map_err(|e| e.to_string())?;
         off += blob.len() as u64;
-        heads[i] = read_prefix(&mut pfx_readers[i]).map_err(|e| prefix_error(i, e))?;
+        heads[i] = read_prefix(&mut pfx_readers[i]).map_err(|e| slots[i].error(e))?;
     }
     for sl in &slots {
         let _ = std::fs::remove_file(&sl.path);
@@ -1047,6 +1053,23 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_prefix_spill_fails_the_add() {
+        let dir = tmp_dir("pfx-full");
+        let mut w = writer(&dir);
+        // Unbuffered onto a full device: flushing prefix "a" when "b" starts fails to write.
+        let full = PathBuf::from("/dev/full");
+        w.slots[0].out = BufWriter::with_capacity(0, File::options().write(true).open(&full).unwrap());
+        w.slots[0].path = full;
+        w.add(b"a", &mut vec![posting(1, 9, false, 0)]).unwrap();
+
+        let err = w.add(b"b", &mut vec![posting(2, 9, false, 0)]).err();
+
+        assert!(err.as_deref().is_some_and(|e| e.contains("/dev/full")), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn prefix_table_keeps_distinct_entities() {
         // 30 minor entities under "a", then 10 major ones with many names each: pruning hits rather
@@ -1055,11 +1078,11 @@ mod tests {
         let mut w = writer(&dir);
         let post = |entity, imp_q| Posting { entity, imp_q, partial: false, class: 0, ord: 0 };
         for e in 0..30u32 {
-            w.prefix_add(format!("aa{e:03}").as_bytes(), &[post(1000 + e, 10)]);
+            w.prefix_add(format!("aa{e:03}").as_bytes(), &[post(1000 + e, 10)]).unwrap();
         }
         let major: Vec<Posting> = (0..10).map(|e| post(e, 250)).collect();
         for k in 0..300 {
-            w.prefix_add(format!("ab{k:03}").as_bytes(), &major);
+            w.prefix_add(format!("ab{k:03}").as_bytes(), &major).unwrap();
         }
         let slot = &mut w.slots[0];
         flush_slot(slot).unwrap();
@@ -1129,7 +1152,7 @@ mod tests {
             .map(|entity| Posting { entity, imp_q: 200, partial: false, class: 5, ord: 1 })
             .collect();
         list.push(Posting { entity: 99, imp_q: 190, partial: false, class: 0, ord: 0 });
-        w.prefix_add(b"abc", &list);
+        w.prefix_add(b"abc", &list).unwrap();
         let slot = &mut w.slots[0];
         flush_slot(slot).unwrap();
         slot.out.flush().unwrap();
