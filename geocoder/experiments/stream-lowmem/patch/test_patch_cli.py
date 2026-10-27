@@ -5,7 +5,9 @@ command-line checks that need no patch data. zstd must be on PATH.
 written: a staged apply would leave a gc.manifest naming every family with only one stage's keys.
 
 The output dir is created as named, quotes and all, and no part of its name runs as a command; the
-same for the patch path, which is decompressed as named."""
+same for the patch path, which is decompressed as named.
+
+A patch shorter than its 8-byte magic is refused as truncated."""
 import os
 from pathlib import Path
 import subprocess
@@ -52,4 +54,11 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as scratch:
             errors.append(f'patch {name!r} was not decompressed as named: rc={r.returncode} {err[-300:]}')
         if (root / 'pwned').exists():
             errors.append(f'patch {name!r} ran a command (pwned exists)')
+
+    short = root / 'short.gcpatch'
+    short.write_bytes(compressed(b'GCPATCH'))
+    r = subprocess.run([binary, str(plain), str(short), '-o', str(root / 'short')], capture_output=True)
+    err = r.stderr.decode()
+    if r.returncode == 0 or 'Truncated patch' not in err or 'magic' not in err:
+        errors.append(f'a 7-byte patch was not refused as truncated: rc={r.returncode} {err[-300:]}')
 assert not errors, '\n'.join(errors)
