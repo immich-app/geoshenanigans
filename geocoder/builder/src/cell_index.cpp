@@ -19,6 +19,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "admin_rank_config.h"
 #include "geometry.h"
 #include "id_allocator.h"
 #include "keyhole_pack.h"
@@ -721,14 +722,14 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                                   data.way_parent_ids.size() * sizeof(uint32_t));
             }));
         }
-        // Admin parent chain (parallel array indexed by polygon_id)
-        if (!data.admin_parent_ids.empty()) {
-            write_futures.push_back(std::async(std::launch::async, [&] {
-                write_binary_file(output_dir + "/admin_parents.bin",
-                                  reinterpret_cast<const char*>(data.admin_parent_ids.data()),
-                                  data.admin_parent_ids.size() * sizeof(uint32_t));
-            }));
-        }
+        // Admin parent chain (parallel array indexed by polygon_id), empty
+        // for a region without admin polygons: the full and no-addresses
+        // configurations list it for every region.
+        write_futures.push_back(std::async(std::launch::async, [&] {
+            write_binary_file(output_dir + "/admin_parents.bin",
+                              reinterpret_cast<const char*>(data.admin_parent_ids.data()),
+                              data.admin_parent_ids.size() * sizeof(uint32_t));
+        }));
         // Per-way postcode (parallel array indexed by way_id)
         if (!data.way_postcode_ids.empty()) {
             write_futures.push_back(std::async(std::launch::async, [&] {
@@ -1296,13 +1297,13 @@ void write_admin_minimal_polygons(const ParsedData& data,
                                   std::vector<uint32_t>& id_remap) {
     ensure_dir(output_dir);
 
-    // Collect old indices we want to keep (admin_level in [2, 8]).
+    // Collect old indices we want to keep (admin_minimal_keeps).
     id_remap.assign(data.admin_polygons.size(), NO_DATA);
     std::vector<uint32_t> kept_idx;
     kept_idx.reserve(data.admin_polygons.size() / 2);
     for (size_t i = 0; i < data.admin_polygons.size(); i++) {
-        uint8_t lvl = data.admin_polygons[i].admin_level;
-        if (lvl >= 2 && lvl <= 8) kept_idx.push_back(static_cast<uint32_t>(i));
+        const auto& p = data.admin_polygons[i];
+        if (admin_minimal_keeps(p.admin_level, p.place_type_override)) kept_idx.push_back(static_cast<uint32_t>(i));
     }
 
     // Parallel simplification of just the kept polygons.

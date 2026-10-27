@@ -53,6 +53,7 @@
 #include "polygon_rings.h"
 #include "admin_rank_config.h"
 #include "parallel.h"
+#include "relation_import.h"
 #include "scratch_dir.h"
 #include "tiger.h"
 #include "way_tags.h"
@@ -1825,16 +1826,18 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
         auto write_admin_minimal = [&] {
             // Write admin-minimal tier — smallest useful deployable. Drops:
             //   - place_nodes with place_type ∈ {SUBURB=3, NEIGHBOURHOOD=5, QUARTER=6}
-            //   - admin polygons (and their vertex bytes) whose admin_level
-            //     falls outside [2, 8] (L9 borough, L10 quarter-area,
-            //     L11 admin-postal, L15 place-area markers are skipped).
+            //   - admin polygons (and their vertex bytes) admin_minimal_keeps
+            //     leaves out: L9 borough, L10 quarter-area, L11 admin-postal,
+            //     and L15 place areas ranked below 16.
             // Re-simplifies the kept polygons at q2.5 and writes them to its
             // own stable slots so the on-disk admin_polygons.bin / admin_vertices.bin
             // are self-contained — admin-minimal does NOT share polygon
             // files with quality/q2.5/. It also carries its own core strings
             // and layout, so a client never needs another dir (or a patch for
             // one) to resolve its names.
-            if (multi_output && !d.place_nodes.empty() && !d.admin_polygons.empty()) {
+            // Written for a region without admin polygons too: every
+            // configuration of the region lists the tier's files.
+            if (multi_output && !d.place_nodes.empty()) {
                 std::string mdir = base_dir + "/admin-minimal";
                 ensure_dir(mdir);
 
@@ -2697,6 +2700,12 @@ static int run(int argc, char* argv[]) {
                     std::vector<std::string> wikidata;  // parallel to relations
                     std::vector<int64_t> label_nodes;
                     std::vector<CollectedPoiRelation> poi_relations;
+                    // Relations whose tags make an area kind (RelationKind)
+                    // or a POI, left out for not being multipolygon/boundary.
+                    std::array<size_t, 4> not_area_type{};
+                    size_t poi_not_area_type = 0;
+                    size_t postal_without_code = 0;
+                    size_t place_rank0 = 0;
                 };
                 std::vector<Collected> collected(pbf.thread_count());
                 pbf.read_blocks([&](PbfBlock& block, unsigned thread) {
@@ -2706,21 +2715,25 @@ static int run(int argc, char* argv[]) {
                         const char* rel_type = rel.tag("type");
                         const char* rel_place = rel.tag("place");
 
-                        // type=multipolygon + place=city/town/… relations (e.g. Moscow
-                        // R2555133) are distinct placex rows in Nominatim at the
-                        // place type's rank. They exist alongside any matching
-                        // boundary=administrative relation at a different rank.
-                        bool is_multipolygon_place =
-                            !boundary && rel_type && rel_place &&
-                            std::strcmp(rel_type, "multipolygon") == 0 &&
-                            classify_place_override(nullptr, rel_place) != AdminPlaceType::NONE;
+                        // Place relations (e.g. Moscow R2555133, type=multipolygon
+                        // + place=city) are placex rows of their own at the place
+                        // type's rank, beside any boundary=administrative relation.
+                        // A place type of address rank 0 (state, province, region)
+                        // makes no address area.
+                        const AdminPlaceType rel_pt = rel_place ? classify_place_override(nullptr, rel_place) : AdminPlaceType::NONE;
+                        const RelationKind kind = area_relation_kind(boundary, is_address_place_type(rel_pt));
+                        if (kind == RelationKind::NONE) {
+                            if (rel_pt != AdminPlaceType::NONE && is_area_relation_type(rel_type)) mine.place_rank0++;
+                            continue;
+                        }
+                        if (!is_area_relation_type(rel_type)) {
+                            mine.not_area_type[static_cast<size_t>(kind)]++;
+                            continue;
+                        }
 
-                        if (!boundary && !is_multipolygon_place) continue;
-
-                        bool is_admin = boundary && std::strcmp(boundary, "administrative") == 0;
-                        bool is_postal = boundary && std::strcmp(boundary, "postal_code") == 0;
-                        bool is_place_boundary = boundary && std::strcmp(boundary, "place") == 0;
-                        if (!is_admin && !is_postal && !is_place_boundary && !is_multipolygon_place) continue;
+                        bool is_admin = kind == RelationKind::ADMIN;
+                        bool is_postal = kind == RelationKind::POSTAL;
+                        bool is_place_area = kind == RelationKind::PLACE;
 
                         // Capture label member node (Nominatim's primary place-link lookup)
                         int64_t label_node_id = -1;
@@ -2731,9 +2744,9 @@ static int run(int argc, char* argv[]) {
                             }
                         }
 
-                        // Handle boundary=place (e.g., Washington DC) and
-                        // type=multipolygon+place=* (e.g., Moscow R2555133).
-                        if (is_place_boundary || is_multipolygon_place) {
+                        // Place areas: boundary=place (e.g., Washington DC) and
+                        // multipolygons with place=* (e.g., Moscow R2555133).
+                        if (is_place_area) {
                             const char* place_tag = rel_place;
                             if (place_tag) {
                                 AdminPlaceType pt = classify_place_override(nullptr, place_tag);
@@ -2782,9 +2795,11 @@ static int run(int argc, char* argv[]) {
 
                         std::string name_str;
                         if (is_postal) {
-                            const char* postal_code = rel.tag("postal_code");
-                            if (!postal_code) postal_code = name_en;
-                            if (!postal_code) continue;
+                            const char* postal_code = postal_area_code([&](const char* key) { return rel.tag(key); });
+                            if (!postal_code) {
+                                mine.postal_without_code++;
+                                continue;
+                            }
                             name_str = postal_code;
                         } else {
                             name_str = name_en;
@@ -2837,6 +2852,7 @@ static int run(int argc, char* argv[]) {
                     }
                     // --- POI relation scanning (same pass) ---
                     for (auto& rel : block.relations) {
+                        const bool area_type = is_area_relation_type(rel.tag("type"));
                         const char* r_boundary = rel.tag("boundary");
                         const char* r_leisure  = rel.tag("leisure");
                         const char* r_tourism  = rel.tag("tourism");
@@ -2893,6 +2909,10 @@ static int run(int argc, char* argv[]) {
                             if (std::strcmp(r_office, "government") == 0) poi_cat = PoiCategory::GOVERNMENT;
                         }
 
+                        if (poi_cat != PoiCategory::UNKNOWN && !area_type) {
+                            mine.poi_not_area_type++;
+                            continue;
+                        }
                         if (poi_cat != PoiCategory::UNKNOWN) {
                             const char* poi_name = rel.tag("name:en");
                             if (!poi_name) poi_name = rel.tag("name");
@@ -2956,13 +2976,30 @@ static int run(int argc, char* argv[]) {
                 });
                 // Which thread read a block is down to timing, so this join
                 // order is as arbitrary as the shared lock's was.
+                std::array<size_t, 4> not_area_type{};
+                size_t poi_not_area_type = 0;
+                size_t postal_without_code = 0;
+                size_t place_rank0 = 0;
                 for (auto& c : collected) {
                     std::move(c.relations.begin(), c.relations.end(), std::back_inserter(data.collected_relations));
                     std::move(c.wikidata.begin(), c.wikidata.end(), std::back_inserter(rel_wikidata));
                     wanted_label_nodes.insert(c.label_nodes.begin(), c.label_nodes.end());
                     std::move(c.poi_relations.begin(), c.poi_relations.end(),
                               std::back_inserter(data.collected_poi_relations));
+                    for (size_t k = 0; k < not_area_type.size(); k++) not_area_type[k] += c.not_area_type[k];
+                    poi_not_area_type += c.poi_not_area_type;
+                    postal_without_code += c.postal_without_code;
+                    place_rank0 += c.place_rank0;
                 }
+                std::cerr << "  Relations not of type multipolygon/boundary, left out: "
+                          << not_area_type[static_cast<size_t>(RelationKind::ADMIN)] << " admin, "
+                          << not_area_type[static_cast<size_t>(RelationKind::POSTAL)] << " postal, "
+                          << not_area_type[static_cast<size_t>(RelationKind::PLACE)] << " place, "
+                          << poi_not_area_type << " POI." << std::endl;
+                std::cerr << "  Postal relations without a postcode tag, left out: "
+                          << postal_without_code << "." << std::endl;
+                std::cerr << "  Place relations of address rank 0 (state, province, region), left out: "
+                          << place_rank0 << "." << std::endl;
             }
             std::cerr << "  Collected " << data.collected_relations.size()
                       << " admin/postal relations for parallel assembly." << std::endl;
@@ -3750,19 +3787,17 @@ static int run(int argc, char* argv[]) {
                     const char* boundary = t.boundary;
                     if (boundary) {
                         bool is_admin = (std::strcmp(boundary, "administrative") == 0);
-                        bool is_postal = (std::strcmp(boundary, "postal_code") == 0);
                         bool is_place_boundary = (std::strcmp(boundary, "place") == 0);
-                        if ((is_admin || is_postal) && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1]) {
+                        // A boundary=postal_code way is no postcode area:
+                        // Nominatim's postcode_area makes one from relations
+                        // only (init.lua process_tags).
+                        if (is_admin && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1]) {
                             uint8_t al = 0;
-                            if (is_admin) { const char* ls = t.admin_level; if (ls) al = static_cast<uint8_t>(std::atoi(ls)); }
-                            else al = 11;
-                            int max_al = is_postal ? 11 : 10;
-                            if (al >= 2 && al <= max_al && (kMaxAdminLevel == 0 || al <= kMaxAdminLevel)) {
+                            { const char* ls = t.admin_level; if (ls) al = static_cast<uint8_t>(std::atoi(ls)); }
+                            if (al >= 2 && al <= 10 && (kMaxAdminLevel == 0 || al <= kMaxAdminLevel)) {
                                 const char* aname = t_best_name;
-                                if (aname || !is_admin) {
-                                    std::string name_str;
-                                    if (is_postal) { const char* pc = t.postal_code; if (!pc) pc = aname; if (pc) name_str = pc; }
-                                    else if (aname) name_str = aname;
+                                if (aname) {
+                                    std::string name_str = aname;
                                     if (!name_str.empty() && all_valid && resolved_locs.size() >= 3) {
                                         std::vector<std::pair<double,double>> verts;
                                         for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});
@@ -3779,7 +3814,7 @@ static int run(int argc, char* argv[]) {
                             const char* aname = t_best_name;
                             if (aname && t.place) {
                                 AdminPlaceType pt = classify_place_override(nullptr, t.place);
-                                if (pt != AdminPlaceType::NONE && all_valid && resolved_locs.size() >= 3) {
+                                if (is_address_place_type(pt) && all_valid && resolved_locs.size() >= 3) {
                                     std::vector<std::pair<double,double>> verts;
                                     for (const auto& loc : resolved_locs) verts.push_back({loc.lat(), loc.lon()});
                                     std::string wd_str = t.wikidata ? t.wikidata : "";

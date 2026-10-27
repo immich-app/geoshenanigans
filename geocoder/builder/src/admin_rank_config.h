@@ -14,6 +14,7 @@
 #include <cstdint>
 
 #include "country_code.h"
+#include "types.h"
 
 inline uint8_t admin_rank_address(uint16_t cc, uint8_t admin_level) {
     // Country overrides (packed uppercase 'XY').
@@ -56,4 +57,43 @@ inline uint8_t admin_rank_address(uint16_t cc, uint8_t admin_level) {
     if (admin_level >= 2 && admin_level <= 12)
         return static_cast<uint8_t>(admin_level * 2);
     return 0;
+}
+
+// rank_address of a place area by its place type: the default "place" ranks
+// of Nominatim's settings/address-levels.json (state, province and region
+// rank 0, outside addresses). Mirrors the server's place_type_to_rank.
+inline uint8_t place_area_rank_address(uint8_t place_type) {
+    switch (static_cast<AdminPlaceType>(place_type)) {
+        case AdminPlaceType::CITY:
+        case AdminPlaceType::TOWN:
+        case AdminPlaceType::VILLAGE: return 16;
+        case AdminPlaceType::SUBURB:
+        case AdminPlaceType::HAMLET: return 20;
+        case AdminPlaceType::QUARTER: return 22;
+        case AdminPlaceType::NEIGHBOURHOOD: return 24;
+        case AdminPlaceType::COUNTY:
+        case AdminPlaceType::DISTRICT: return 12;
+        case AdminPlaceType::BOROUGH: return 18;
+        case AdminPlaceType::MUNICIPALITY: return 14;
+        default: return 0;
+    }
+}
+
+// Whether a place area of this type is part of addresses at all: Nominatim
+// makes an address area only of a place with rank_address > 0 (placex_update,
+// placex_triggers.sql:1254) and links no place node to one of rank 0
+// (find_linked_place, :285). place=state, province and region rank 0.
+inline bool is_address_place_type(AdminPlaceType place_type) {
+    return place_area_rank_address(static_cast<uint8_t>(place_type)) > 0;
+}
+
+// Admin-minimal carries addresses down to rank 16, the cities, towns and
+// villages its place nodes also reach: boundaries of admin_level 2..8 and the
+// place areas (admin_level 15) of those ranks. Singapore's city is its
+// place=city area (R17140517), not a boundary.
+inline bool admin_minimal_keeps(uint8_t admin_level, uint8_t place_type) {
+    if (admin_level >= 2 && admin_level <= 8) return true;
+    const uint8_t rank = place_area_rank_address(place_type);
+
+    return admin_level == 15 && rank > 0 && rank <= 16;
 }
