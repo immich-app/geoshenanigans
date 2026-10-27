@@ -26,7 +26,8 @@ pub struct BuildOpts {
     /// Single-posting keys carry their posting in the fst value.
     pub inline: bool,
     pub extras: Option<String>,
-    /// Directory with imp_places.u8 / imp_polys.u8 / imp_poi.u8 (the shipped importance bytes).
+    /// Directory with imp_places.u8 / imp_polys.u8 / imp_poi.u8 (the shipped importance bytes, one
+    /// per record); a file left out leaves its records without them.
     pub imp_dir: Option<String>,
     pub area_proxy: bool,
     /// POIs of tiers above this are left out (3 = all).
@@ -44,10 +45,24 @@ impl Stats {
     }
 }
 
-fn map_opt(path: Option<String>) -> Option<Mmap> {
-    let f = File::open(path?).ok()?;
-    let m = unsafe { Mmap::map(&f) }.ok()?;
-    Some(m)
+/// One importance file of `dir` for `records` records: None without a directory or when the
+/// directory leaves the file out; an error for a missing directory, a file that fails to open or
+/// map, or one that does not hold one byte per record.
+fn map_importance(dir: Option<&str>, file: &str, records: u32) -> std::io::Result<Option<Mmap>> {
+    let Some(dir) = dir else { return Ok(None) };
+    let path = Path::new(dir).join(file);
+    let with_path = |e: std::io::Error| std::io::Error::new(e.kind(), format!("{}: {e}", path.display()));
+    let f = match File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && Path::new(dir).is_dir() => return Ok(None),
+        Err(e) => return Err(with_path(e)),
+    };
+    let m = unsafe { Mmap::map(&f) }.map_err(with_path)?;
+    if m.len() != records as usize {
+        let e = format!("{}: {} bytes for {records} records", path.display(), m.len());
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+    }
+    Ok(Some(m))
 }
 
 fn byte_at(m: &Option<Mmap>, i: u32) -> u8 {
@@ -109,7 +124,7 @@ pub struct PlacesSource<'a> {
 }
 
 impl<'a> PlacesSource<'a> {
-    pub fn new(geo: &'a Index, opts: &BuildOpts, extras: Option<&'a Extras>) -> Self {
+    pub fn new(geo: &'a Index, opts: &BuildOpts, extras: Option<&'a Extras>) -> std::io::Result<Self> {
         let n_place_nodes = record_count::<PlaceNode>(geo.place_nodes.as_ref().expect("place_nodes"));
         let n_poly = record_count::<AdminPolygon>(&geo.admin_polygons);
         // A hidden node that names its claiming boundary is that boundary's label point.
@@ -142,18 +157,18 @@ impl<'a> PlacesSource<'a> {
                 slots.push(BoundarySlot { poly: p, node: NO_DATA, lat, lng });
             }
         }
-        let dir = opts.imp_dir.clone();
-        PlacesSource {
+        let dir = opts.imp_dir.as_deref();
+        Ok(PlacesSource {
             geo,
             n_place_nodes,
             slots,
             link,
             label_used,
-            imp_places: map_opt(dir.as_ref().map(|d| format!("{d}/imp_places.u8"))),
-            imp_polys: map_opt(dir.as_ref().map(|d| format!("{d}/imp_polys.u8"))),
+            imp_places: map_importance(dir, "imp_places.u8", n_place_nodes)?,
+            imp_polys: map_importance(dir, "imp_polys.u8", n_poly)?,
             extras,
             area_proxy: opts.area_proxy,
-        }
+        })
     }
 
     pub fn write_slots(&self, path: &Path) -> std::io::Result<()> {
@@ -218,9 +233,10 @@ pub struct PoiSource<'a> {
 }
 
 impl<'a> PoiSource<'a> {
-    pub fn new(geo: &'a Index, opts: &BuildOpts, extras: Option<&'a Extras>) -> Self {
+    pub fn new(geo: &'a Index, opts: &BuildOpts, extras: Option<&'a Extras>) -> std::io::Result<Self> {
         let n = record_count::<PoiRecord>(geo.poi_records.as_ref().expect("poi_records"));
-        PoiSource { geo, n, max_tier: opts.poi_max_tier, imp_poi: map_opt(opts.imp_dir.as_ref().map(|d| format!("{d}/imp_poi.u8"))), extras }
+        let imp_poi = map_importance(opts.imp_dir.as_deref(), "imp_poi.u8", n)?;
+        Ok(PoiSource { geo, n, max_tier: opts.poi_max_tier, imp_poi, extras })
     }
 
     fn fill(&self, pos: u32, e: &mut EntityBuf) -> bool {
@@ -708,9 +724,9 @@ pub fn build(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Result<St
         None => None,
     };
     let src = if name == "poi" {
-        Source::Poi(PoiSource::new(geo, opts, extras.as_ref()))
+        Source::Poi(PoiSource::new(geo, opts, extras.as_ref()).map_err(|e| e.to_string())?)
     } else {
-        let s = PlacesSource::new(geo, opts, extras.as_ref());
+        let s = PlacesSource::new(geo, opts, extras.as_ref()).map_err(|e| e.to_string())?;
         s.write_slots(&out.join("places.bnd")).map_err(|e| e.to_string())?;
         st.add("place nodes", s.n_place_nodes);
         st.add("boundary slots", s.slots.len());
@@ -1157,4 +1173,57 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn importance_files_hold_one_byte_per_record() {
+        use std::io::ErrorKind::{InvalidData, NotFound};
+        let dir = tmp_dir("imp");
+        std::fs::write(dir.join("imp_places.u8"), [7, 8, 9]).unwrap();
+        std::fs::create_dir(dir.join("imp_polys.u8")).unwrap();
+        let (d, missing) = (dir.to_str().unwrap(), dir.join("missing"));
+        let got = |dir: Option<&str>, file: &str, records: u32| {
+            map_importance(dir, file, records).map(|m| m.map(|m| m.to_vec())).map_err(|e| e.kind())
+        };
+        assert_eq!(got(None, "imp_places.u8", 3), Ok(None));
+        assert_eq!(got(Some(d), "imp_places.u8", 3), Ok(Some(vec![7, 8, 9])));
+        // The directory leaves imp_poi.u8 out.
+        assert_eq!(got(Some(d), "imp_poi.u8", 3), Ok(None));
+        assert_eq!(got(Some(missing.to_str().unwrap()), "imp_places.u8", 3), Err(NotFound));
+        for records in [2, 4] {
+            assert_eq!(got(Some(d), "imp_places.u8", records), Err(InvalidData), "{records} records");
+        }
+        // A directory opens but does not map.
+        assert!(got(Some(d), "imp_polys.u8", 0).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_build_refuses_importance_files_of_another_set() {
+        use crate::fixture::{Geo, TempDir};
+        let mut g = Geo::default();
+        g.boundary("Testville", 8, [10.0, 20.0, 10.2, 20.2]);
+        g.place("Testville", 1, 10.1, 20.1);
+        g.place("Testburg", 2, 10.15, 20.15);
+        g.poi("Test Hall", 10.05, 20.05, 0);
+        let dir = TempDir::new("imp-build");
+        let geo = g.load(&dir.0.join("geo"));
+        let (imp, out) = (dir.0.join("imp"), dir.0.join("idx"));
+        std::fs::create_dir_all(&imp).unwrap();
+        let opts = BuildOpts {
+            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"), inline: true, extras: None,
+            imp_dir: Some(imp.to_str().unwrap().into()), area_proxy: false, poi_max_tier: 3,
+        };
+        // One byte per place node, polygon and POI record.
+        for (file, n) in [("imp_places.u8", 2), ("imp_polys.u8", 1), ("imp_poi.u8", 1)] {
+            std::fs::write(imp.join(file), vec![0u8; n]).unwrap();
+        }
+        assert!(build(&geo, "places", &out, &opts).is_ok());
+        assert!(build(&geo, "poi", &out, &opts).is_ok());
+
+        for (file, n, sub) in [("imp_places.u8", 2, "places"), ("imp_polys.u8", 1, "places"), ("imp_poi.u8", 1, "poi")] {
+            std::fs::write(imp.join(file), vec![0u8; n + 1]).unwrap();
+            let err = build(&geo, sub, &out, &opts).unwrap_err();
+            assert!(err.contains(file), "{err}");
+            std::fs::write(imp.join(file), vec![0u8; n]).unwrap();
+        }
+    }
 }
