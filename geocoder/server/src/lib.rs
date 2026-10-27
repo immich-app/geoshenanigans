@@ -1586,7 +1586,7 @@ impl Index {
     pub fn debug_places(&self, lat: f64, lng: f64) -> serde_json::Value {
         let mut admin = self.find_admin(lat, lng);
         let current_boundaries = self.find_current_boundaries(&mut admin.containment, admin.country_code);
-        let place = self.find_places(lat, lng, PlaceFeature::Point(lat, lng), &current_boundaries, 0);
+        let place = self.find_places(lat, PlaceFeature::Point(lat, lng), &current_boundaries, 0);
 
         let place_cells = match &self.place_cells {
             Some(c) => c,
@@ -1601,11 +1601,9 @@ impl Index {
         let cos_lat = lat.to_radians().cos();
         let type_names = ["city", "town", "village", "suburb", "hamlet", "neighbourhood", "quarter"];
 
-        let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
-        let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
-
+        // The cells find_places looks in around the point.
         let mut nearby: Vec<serde_json::Value> = Vec::new();
-        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
+        for c in cells_near_point(lat, lng, MAX_PLACE_FUZZY_HALF_SIDE_M, self.admin_cell_level) {
             Self::for_each_entry_fb(place_entries, Self::lookup_admin_cell_fb(place_cells, c), |id| {
                 let Some(pn) = self.place_node(id) else { return; };
                 let pt = pn.place_type as usize;
@@ -2047,7 +2045,7 @@ impl Index {
         CurrentBoundaries::from_ranked(ranked, holding(place_areas).iter())
     }
 
-    pub fn find_places(&self, lat: f64, lng: f64, feature: PlaceFeature<'_>, current_boundaries: &CurrentBoundaries, held_ranks: u32) -> PlaceResult<'_> {
+    pub fn find_places(&self, lat: f64, feature: PlaceFeature<'_>, current_boundaries: &CurrentBoundaries, held_ranks: u32) -> PlaceResult<'_> {
         let place_cells = match &self.place_cells {
             Some(c) => c,
             None => return PlaceResult::default(),
@@ -2063,34 +2061,28 @@ impl Index {
         // source).
         let cos_lat = lat.to_radians().cos();
         let mut candidates: Vec<(PlaceNode, f64)> = Vec::new();
-        let mut consider = |id: u32| {
+        let consider = |id: u32| {
             let Some(pn) = self.place_node(id) else { return; };
             if let Some(dist_sq) = place_node_covering(&pn, feature, cos_lat) {
                 candidates.push((pn, dist_sq));
             }
         };
-        // A node is listed in the admin cell (L10, ~10km) of its centroid only.
-        match feature {
-            // Around a point: its cell and the 8 neighbours.
-            PlaceFeature::Point(..) => {
-                let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
-                for c in std::iter::once(cell).chain(cell_neighbors_at_level(cell, self.admin_cell_level)) {
-                    Self::for_each_entry_fb(place_entries, Self::lookup_admin_cell_fb(place_cells, c), &mut consider);
-                }
-            }
-            // Along a street: every cell a node whose area crosses some stretch
-            // of it can sit in, so the street's labels don't depend on where
-            // along it the query falls.
-            PlaceFeature::Line(line) => {
-                let mut ids: Vec<u32> = Vec::new();
-                for c in cells_under_line(line, MAX_PLACE_FUZZY_HALF_SIDE_M, self.admin_cell_level) {
-                    Self::for_each_entry_fb(place_entries, Self::lookup_admin_cell_fb(place_cells, c), |id| ids.push(id));
-                }
-                ids.sort_unstable();
-                ids.dedup();
-                ids.into_iter().for_each(consider);
-            }
+        // A node is listed in the admin cell (L10, ~10km) of its centroid
+        // only: look in every cell a node whose area covers the feature can
+        // sit in. Around a point that is the point's box grown by the largest
+        // fuzzy half side, a city's; along a street, a strip along it, so the
+        // street's labels don't depend on where along it the query falls.
+        let cells = match feature {
+            PlaceFeature::Point(lat, lng) => cells_near_point(lat, lng, MAX_PLACE_FUZZY_HALF_SIDE_M, self.admin_cell_level),
+            PlaceFeature::Line(line) => cells_under_line(line, MAX_PLACE_FUZZY_HALF_SIDE_M, self.admin_cell_level),
+        };
+        let mut ids: Vec<u32> = Vec::new();
+        for c in cells {
+            Self::for_each_entry_fb(place_entries, Self::lookup_admin_cell_fb(place_cells, c), |id| ids.push(id));
         }
+        ids.sort_unstable();
+        ids.dedup();
+        ids.into_iter().for_each(consider);
 
         let mut result = PlaceResult::default();
 
@@ -3192,7 +3184,7 @@ impl Index {
             Some(line) => PlaceFeature::Line(line),
             None => PlaceFeature::Point(lat, lng),
         };
-        let place = self.find_places(lat, lng, feature, &current_boundaries, held_ranks);
+        let place = self.find_places(lat, feature, &current_boundaries, held_ranks);
 
         // Resolve postcode: mirror Nominatim's stored placex.postcode chain
         // (Tier 0 addr / Tier 1 primary feature's calculated_postcode /
@@ -4048,6 +4040,13 @@ pub fn cells_under_line(line: &[NodeCoord], margin_m: f64, level: u64) -> Vec<u6
         start = end - 1;
     }
     cells_under_rects(boxes, level)
+}
+
+/// The cells of `level` a node within `margin_m` of the point along each axis
+/// can sit in, ascending: the cells under the point grown by `margin_m`
+/// (grown_rect).
+pub fn cells_near_point(lat: f64, lng: f64, margin_m: f64, level: u64) -> Vec<u64> {
+    cells_under_rects(vec![grown_rect(LatLngBox::at((lat, lng)), margin_m)], level)
 }
 
 /// The line's points as (lat, lng) degrees, with points added along every
@@ -5370,6 +5369,22 @@ mod pure_helper_tests {
     }
 
     #[test]
+    fn cells_near_point_hold_a_city_at_each_corner_of_its_reach() {
+        // A city just inside reach diagonally out from the point, at 10°N and
+        // at 60°N, covers the point and sits in one of the cells.
+        for (lat0, lng0) in [(10.0, 20.0), (60.0, 10.0)] {
+            let cells = cells_near_point(lat0, lng0, MAX_PLACE_FUZZY_HALF_SIDE_M, DEFAULT_ADMIN_CELL_LEVEL);
+            let reach = MAX_PLACE_FUZZY_HALF_SIDE_M - 100.0;
+            for (north, east) in [(1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)] {
+                let lat = lat0 + north * reach / METRES_PER_DEGREE;
+                let lng = lng0 + east * reach / (METRES_PER_DEGREE * lat.to_radians().cos());
+                assert!(fuzzy_area_holds(lat as f32, lng as f32, MAX_PLACE_FUZZY_HALF_SIDE_M, lat0, lng0));
+                assert!(cells.contains(&cell_id_at_level(lat, lng, DEFAULT_ADMIN_CELL_LEVEL)), "({lat}, {lng})");
+            }
+        }
+    }
+
+    #[test]
     fn place_nodes_fill_quarter_and_neighbourhood_both() {
         // Taguig: Nominatim's answer has a quarter and a neighbourhood.
         let nodes = [node_at(6, 0.0, 2.0), node_at(5, 500.0, 1.0)];
@@ -6059,6 +6074,19 @@ mod query_path_tests {
             .load();
         assert_eq!(address_at(&index, 37_500.0, 20.0)["hamlet"], "Far End");
         assert_eq!(address_at(&index, 0.0, 20.0)["hamlet"], "Far End");
+    }
+
+    #[test]
+    fn query_finds_a_city_covering_the_point_from_cells_away() {
+        // The city's 15 km square covers the streetless point, but its node,
+        // 14.5 km north, sits two cells up, past the point's cell and that
+        // cell's neighbours: it names the point all the same.
+        let (point, city) = (at(8000.0, 0.0), at(22_500.0, 0.0));
+        let cell = cell_id_at_level(point.lat as f64, point.lng as f64, DEFAULT_ADMIN_CELL_LEVEL);
+        let city_cell = cell_id_at_level(city.lat as f64, city.lng as f64, DEFAULT_ADMIN_CELL_LEVEL);
+        assert!(city_cell != cell && !cell_neighbors_at_level(cell, DEFAULT_ADMIN_CELL_LEVEL).contains(&city_cell));
+        let index = TestIndex::new().place("Metropolis", 0, 22_500.0, 0.0).load();
+        assert_eq!(address_at(&index, 8000.0, 0.0)["city"], "Metropolis");
     }
 
     #[test]
