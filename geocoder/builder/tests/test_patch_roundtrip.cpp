@@ -173,6 +173,15 @@ TEST(patch_round_trip_keeps_the_street_ids_of_unchanged_street_ways) {
     CHECK(round_trip_mismatches(old_d, new_d).empty());
 }
 
+TEST(patch_round_trip_walks_the_side_files_of_unchanged_street_ways_as_kept) {
+    BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(NEW_POOL);
+    put_shifted_streets(old_d, new_d);
+    old_d["way_postcodes.bin"] = bytes_of(std::vector<uint32_t>{NAME_2, NAME_4});
+    new_d["way_postcodes.bin"] = bytes_of(std::vector<uint32_t>{NAME_4, NAME_2});
+
+    CHECK(round_trip_mismatches(old_d, new_d).empty());
+}
+
 TEST(patch_round_trip_keeps_the_parent_ways_of_unchanged_street_ways) {
     BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(NEW_POOL);
     put_shifted_streets(old_d, new_d);
