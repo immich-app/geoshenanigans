@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include "polygon_rings.h"
 #include "test_framework.h"
 
 namespace {
@@ -215,4 +216,277 @@ TEST(ring_assembly_backtrack_closes_after_greedy_dead_end) {
     auto rings = assemble_outer_rings(members, geoms);
     REQUIRE(rings.size() >= size_t(1));
     CHECK(ring_is_closed(rings[0]));
+}
+
+// assemble_area_rings: every member way, whatever its role, as osmium's
+// assembler takes them.
+
+TEST(area_rings_ignore_roles) {
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {0.0, 10.0}, {10.0, 10.0}, {10.0, 0.0}, {0.0, 0.0}});
+    add_way(geoms, 2, {{2.0, 2.0}, {2.0, 4.0}, {4.0, 4.0}});
+    add_way(geoms, 3, {{4.0, 4.0}, {4.0, 2.0}, {2.0, 2.0}});
+    // Roles swapped: the outline tagged inner, the enclave's halves outer and unset.
+    const std::vector<std::pair<int64_t, std::string>> members = {{1, "inner"}, {2, "outer"}, {3, ""}};
+    const AreaRings a = assemble_area_rings(members, geoms);
+    REQUIRE(a.rings.size() == size_t(2));
+    CHECK(ring_is_closed(a.rings[0]));
+    CHECK_EQ(a.rings[0].size(), size_t(5));
+    CHECK(ring_is_closed(a.rings[1]));
+    CHECK_EQ(a.rings[1].size(), size_t(5));
+    CHECK(a.roles == std::vector<uint8_t>({kRoleInner, kRoleOuter}));
+}
+
+// The enclave touches the outline at a node, and the walk along the outline
+// reaches that node before the outline closes: it comes back to a coordinate
+// it has passed, so the enclave closes there as its own ring instead of
+// making a figure eight with the outline.
+TEST(area_rings_split_rings_touching_at_a_node) {
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {0.0, 10.0}, {10.0, 10.0}, {10.0, 0.0}, {5.0, 0.0}});
+    add_way(geoms, 2, {{5.0, 0.0}, {7.0, 3.0}, {3.0, 3.0}, {5.0, 0.0}});
+    add_way(geoms, 3, {{5.0, 0.0}, {0.0, 0.0}});
+    const std::vector<std::pair<int64_t, std::string>> members = {{1, "outer"}, {2, "inner"}, {3, "outer"}};
+    const AreaRings a = assemble_area_rings(members, geoms);
+    REQUIRE(a.rings.size() == size_t(2));
+    CHECK_EQ(a.rings[0].size(), size_t(4));  // the enclave, closed first
+    CHECK_EQ(a.rings[1].size(), size_t(6));
+    for (const auto& r : a.rings) {
+        CHECK(ring_is_closed(r));
+        for (size_t i = 1; i + 1 < r.size(); i++) CHECK(!coord_eq(r[i], r.front()));
+    }
+}
+
+// A spur hanging off the ring leaves a coordinate with an odd number of ends:
+// osmium builds no area at all then, so neither does this.
+TEST(area_rings_fail_on_an_open_ring) {
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {0.0, 1.0}, {1.0, 1.0}});
+    add_way(geoms, 3, {{1.0, 1.0}, {2.0, 2.0}});
+    add_way(geoms, 2, {{1.0, 1.0}, {1.0, 0.0}, {0.0, 0.0}});
+    const std::vector<std::pair<int64_t, std::string>> members = {{1, "outer"}, {3, "outer"}, {2, "outer"}};
+    const AreaRings a = assemble_area_rings(members, geoms);
+    CHECK(a.rings.empty());
+    CHECK(a.failure == AreaFailure::OpenRing);
+}
+
+// A way listed twice cancels out, as in osm2pgsql, which gives osmium the
+// way once for each member listing it, so its segments are duplicates
+// dropped in pairs. Two squares sharing a side, with the shared side in the
+// relation twice (or two ways mapped on it), are one rectangle; a closed way
+// listed twice leaves no ring, and half an outline listed twice leaves the
+// other half open.
+TEST(area_rings_cancel_ways_listed_twice) {
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 1.0}, {0.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}});
+    add_way(geoms, 2, {{0.0, 1.0}, {0.0, 2.0}, {1.0, 2.0}, {1.0, 1.0}});
+    add_way(geoms, 3, {{0.0, 1.0}, {1.0, 1.0}});
+    add_way(geoms, 4, {{1.0, 1.0}, {0.0, 1.0}});
+    add_way(geoms, 5, {{5.0, 5.0}, {5.0, 6.0}, {6.0, 6.0}, {6.0, 5.0}, {5.0, 5.0}});
+    using Members = std::vector<std::pair<int64_t, std::string>>;
+    for (const Members& members : {Members{{1, "outer"}, {3, "outer"}, {2, "outer"}, {3, "outer"}},
+                                   Members{{1, "outer"}, {3, "outer"}, {2, "outer"}, {4, "outer"}}}) {
+        const AreaRings a = assemble_area_rings(members, geoms);
+        REQUIRE(a.rings.size() == size_t(1));
+        CHECK_EQ(a.rings[0].size(), size_t(7));
+        CHECK_EQ(a.cancelled_sub_ways, 2u);
+    }
+    const AreaRings square = assemble_area_rings({{5, "outer"}, {5, "outer"}}, geoms);
+    CHECK(square.failure == AreaFailure::None);
+    CHECK(square.rings.empty());
+    const AreaRings half = assemble_area_rings({{1, "outer"}, {2, "outer"}, {1, "outer"}}, geoms);
+    CHECK(half.rings.empty());
+    CHECK(half.failure == AreaFailure::OpenRing);
+}
+
+// Crossing segments fail the area too, whether in one ring (stitched or a
+// closed way) or between two rings.
+TEST(area_rings_fail_when_segments_cross) {
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {1.0, 1.0}, {1.0, 0.0}});
+    add_way(geoms, 2, {{1.0, 0.0}, {0.0, 1.0}, {0.0, 0.0}});
+    add_way(geoms, 3, {{5.0, 5.0}, {6.0, 6.0}, {6.0, 5.0}, {5.0, 6.0}, {5.0, 5.0}});
+    add_way(geoms, 4, {{10.0, 10.0}, {10.0, 12.0}, {12.0, 12.0}, {12.0, 10.0}, {10.0, 10.0}});
+    add_way(geoms, 5, {{11.0, 11.0}, {11.0, 13.0}, {13.0, 13.0}, {13.0, 11.0}, {11.0, 11.0}});
+    for (const auto& members : std::vector<std::vector<std::pair<int64_t, std::string>>>{
+             {{1, "outer"}, {2, "outer"}}, {{3, "outer"}}, {{4, "outer"}, {5, "outer"}}}) {
+        const AreaRings a = assemble_area_rings(members, geoms);
+        CHECK(a.rings.empty());
+        CHECK(a.failure == AreaFailure::Crossing);
+    }
+}
+
+// osmium counts two segments as intersecting wherever they meet but at an
+// end both have (calculate_intersection), and builds no area then: an
+// enclave whose corner lies on the outline between two of its nodes, two
+// outlines in line along part of a side with no node in common there, and an
+// outline doubling back on itself in line.
+TEST(area_rings_fail_when_segments_meet_between_nodes) {
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {0.0, 10.0}, {10.0, 10.0}, {10.0, 0.0}, {0.0, 0.0}});
+    add_way(geoms, 2, {{5.0, 0.0}, {7.0, 3.0}, {3.0, 3.0}, {5.0, 0.0}});
+    add_way(geoms, 3, {{10.0, 2.0}, {10.0, 6.0}, {14.0, 6.0}, {14.0, 2.0}, {10.0, 2.0}});
+    add_way(geoms, 4, {{20.0, 20.0}, {20.0, 22.0}, {20.0, 21.0}, {20.0, 20.0}});
+    using Members = std::vector<std::pair<int64_t, std::string>>;
+    for (const Members& members : {Members{{1, "outer"}, {2, "inner"}}, Members{{1, "outer"}, {3, "outer"}},
+                                   Members{{4, "outer"}}}) {
+        const AreaRings a = assemble_area_rings(members, geoms);
+        CHECK(a.rings.empty());
+        CHECK(a.failure == AreaFailure::Crossing);
+    }
+}
+
+// Rings may touch at up to 100 coordinates (osmium's max_split_locations): a
+// chain of squares corner to corner.
+TEST(area_rings_fail_past_100_touching_coordinates) {
+    WayGeometries geoms;
+    std::vector<std::pair<int64_t, std::string>> members;
+    for (int i = 0; i < 102; i++) {
+        const double d = i;
+        add_way(geoms, i + 1, {{d, d}, {d, d + 1}, {d + 1, d + 1}, {d + 1, d}, {d, d}});
+        members.emplace_back(i + 1, "outer");
+    }
+    const AreaRings all = assemble_area_rings(members, geoms);
+    CHECK(all.rings.empty());
+    CHECK(all.failure == AreaFailure::TooManyTouches);
+    members.pop_back();
+    const AreaRings fewer = assemble_area_rings(members, geoms);
+    CHECK_EQ(fewer.rings.size(), size_t(101));
+    CHECK(fewer.failure == AreaFailure::None);
+}
+
+namespace {
+
+// The polygons nest_rings makes of a relation's rings, nested as the builder
+// nests them, and how many of them hold a point (inside the outer ring and
+// outside its holes).
+std::vector<NestedPolygon> nested(const AreaRings& a) {
+    const std::vector<int> around = enclosing_rings(a.rings);
+    return nest_rings(a.rings, around, ring_depths(around));
+}
+
+int polygons_holding(const std::vector<NestedPolygon>& polygons, double lat, double lng) {
+    int n = 0;
+    for (const auto& p : polygons) {
+        bool in = ring_contains_latlng(p.outer, lat, lng);
+        for (const auto& h : p.holes) in = in && !ring_contains_latlng(h, lat, lng);
+        n += in;
+    }
+    return n;
+}
+
+}  // namespace
+
+// Two squares overlapping, each closed way noded at the two points where
+// their outlines meet: no segments cross, but walked in member order the
+// rings are the two squares, which cross at those nodes. osmium joins the
+// ways' halves into rings that don't cross (two L-shapes), so the overlap is
+// in neither: the area is the even-odd one of the outlines.
+TEST(area_rings_rings_crossing_at_shared_nodes_take_the_even_odd_area) {
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {0.0, 2.0}, {1.0, 2.0}, {2.0, 2.0}, {2.0, 1.0}, {2.0, 0.0}, {0.0, 0.0}});
+    add_way(geoms, 2, {{1.0, 1.0}, {1.0, 2.0}, {1.0, 3.0}, {3.0, 3.0}, {3.0, 1.0}, {2.0, 1.0}, {1.0, 1.0}});
+    for (const auto& members : std::vector<std::vector<std::pair<int64_t, std::string>>>{
+             {{1, "outer"}, {2, "outer"}}, {{2, "outer"}, {1, "inner"}}}) {
+        const AreaRings a = assemble_area_rings(members, geoms);
+        CHECK(a.failure == AreaFailure::None);
+        CHECK_EQ(a.rings.size(), size_t(2));
+        const std::vector<NestedPolygon> polygons = nested(a);
+        CHECK_EQ(polygons_holding(polygons, 1.5, 1.5), 0);  // the overlap
+        CHECK_EQ(polygons_holding(polygons, 0.5, 0.5), 1);
+        CHECK_EQ(polygons_holding(polygons, 0.5, 1.5), 1);
+        CHECK_EQ(polygons_holding(polygons, 2.5, 2.5), 1);
+        CHECK_EQ(polygons_holding(polygons, 2.5, 1.5), 1);
+        CHECK_EQ(polygons_holding(polygons, 3.5, 3.5), 0);
+    }
+}
+
+// Segments that cross fail the area before rings crossing at shared nodes
+// are looked at, as osmium finds intersections before it joins rings (The
+// Ledges, r19640968): no area, and no node counted as re-paired.
+TEST(area_rings_crossing_segments_fail_before_rings_are_re_paired) {
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {0.0, 2.0}, {1.0, 2.0}, {2.0, 2.0}, {2.0, 1.0}, {2.0, 0.0}, {0.0, 0.0}});
+    add_way(geoms, 2, {{1.0, 1.0}, {1.0, 2.0}, {1.0, 3.0}, {3.0, 3.0}, {3.0, 1.0}, {2.0, 1.0}, {1.0, 1.0}});
+    add_way(geoms, 3, {{5.0, 5.0}, {6.0, 6.0}, {6.0, 5.0}, {5.0, 6.0}, {5.0, 5.0}});
+    const AreaRings a = assemble_area_rings({{1, "outer"}, {2, "outer"}, {3, "outer"}}, geoms);
+    CHECK(a.rings.empty());
+    CHECK(a.failure == AreaFailure::Crossing);
+    CHECK_EQ(a.crossing_coordinates, 0u);
+}
+
+// Two enclaves overlapping each other, crossing at two shared nodes
+// (Louisville, r1804307): their overlap is in an odd number of rings, so it
+// is part of the area again, an island as osmium builds it.
+TEST(area_rings_enclaves_crossing_at_shared_nodes_leave_their_overlap_in) {
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {0.0, 10.0}, {10.0, 10.0}, {10.0, 0.0}, {0.0, 0.0}});
+    add_way(geoms, 2, {{2.0, 2.0}, {2.0, 6.0}, {4.0, 6.0}, {6.0, 6.0}, {6.0, 4.0}, {6.0, 2.0}, {2.0, 2.0}});
+    add_way(geoms, 3, {{4.0, 4.0}, {4.0, 6.0}, {4.0, 8.0}, {8.0, 8.0}, {8.0, 4.0}, {6.0, 4.0}, {4.0, 4.0}});
+    const AreaRings a = assemble_area_rings({{1, "outer"}, {2, "inner"}, {3, "inner"}}, geoms);
+    CHECK(a.failure == AreaFailure::None);
+    const std::vector<NestedPolygon> polygons = nested(a);
+    CHECK_EQ(polygons_holding(polygons, 5.0, 5.0), 1);  // the overlap
+    CHECK_EQ(polygons_holding(polygons, 3.0, 3.0), 0);
+    CHECK_EQ(polygons_holding(polygons, 7.0, 7.0), 0);
+    CHECK_EQ(polygons_holding(polygons, 1.0, 1.0), 1);
+    CHECK_EQ(polygons_holding(polygons, 9.0, 1.0), 1);
+}
+
+// Rings that only touch at a node keep their own rings, in either member
+// order: two squares corner to corner are two polygons, and an enclave
+// touching the outline from inside is a hole in it.
+TEST(area_rings_rings_touching_at_a_node_stay_as_they_are) {
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {0.0, 1.0}, {1.0, 1.0}, {1.0, 0.0}, {0.0, 0.0}});
+    add_way(geoms, 2, {{1.0, 1.0}, {1.0, 2.0}, {2.0, 2.0}, {2.0, 1.0}, {1.0, 1.0}});
+    add_way(geoms, 3, {{0.0, 0.0}, {0.0, 5.0}, {0.0, 10.0}, {10.0, 10.0}, {10.0, 0.0}, {0.0, 0.0}});
+    add_way(geoms, 4, {{0.0, 5.0}, {3.0, 7.0}, {6.0, 5.0}, {3.0, 3.0}, {0.0, 5.0}});
+    using Members = std::vector<std::pair<int64_t, std::string>>;
+    for (const Members& members : {Members{{1, "outer"}, {2, "outer"}}, Members{{2, "outer"}, {1, "outer"}}}) {
+        const AreaRings a = assemble_area_rings(members, geoms);
+        CHECK(a.failure == AreaFailure::None);
+        REQUIRE(a.rings.size() == size_t(2));
+        CHECK_EQ(a.rings[0].size(), size_t(5));
+        CHECK_EQ(a.rings[1].size(), size_t(5));
+        const std::vector<NestedPolygon> polygons = nested(a);
+        CHECK_EQ(polygons.size(), size_t(2));
+        CHECK_EQ(polygons_holding(polygons, 0.5, 0.5), 1);
+        CHECK_EQ(polygons_holding(polygons, 1.5, 1.5), 1);
+        CHECK_EQ(polygons_holding(polygons, 0.5, 1.5), 0);
+    }
+    for (const Members& members : {Members{{3, "outer"}, {4, "inner"}}, Members{{4, "inner"}, {3, "outer"}}}) {
+        const AreaRings a = assemble_area_rings(members, geoms);
+        CHECK(a.failure == AreaFailure::None);
+        REQUIRE(a.rings.size() == size_t(2));
+        const std::vector<NestedPolygon> polygons = nested(a);
+        REQUIRE(polygons.size() == size_t(1));
+        CHECK_EQ(polygons[0].holes.size(), size_t(1));
+        CHECK_EQ(polygons_holding(polygons, 3.0, 5.0), 0);
+        CHECK_EQ(polygons_holding(polygons, 8.0, 8.0), 1);
+    }
+}
+
+// A node listed twice in a row (or two nodes at one location) makes no
+// segment in osmium, so its coordinate is no place where rings touch: an
+// outline repeating each of its 160 coordinates is one ring, not 160
+// touching coordinates past osmium's limit of 100.
+TEST(area_rings_drop_coordinates_repeated_in_a_row) {
+    std::vector<Coord> outline;
+    for (int i = 0; i < 40; i++) outline.push_back({0.0, double(i)});
+    for (int i = 0; i < 40; i++) outline.push_back({double(i), 40.0});
+    for (int i = 40; i > 0; i--) outline.push_back({40.0, double(i)});
+    for (int i = 40; i > 0; i--) outline.push_back({double(i), 0.0});
+    std::vector<Coord> repeated;
+    for (const Coord& c : outline) repeated.insert(repeated.end(), {c, c});
+    repeated.push_back(outline.front());
+    WayGeometries geoms;
+    add_way(geoms, 1, repeated);
+    const AreaRings a = assemble_area_rings({{1, "outer"}}, geoms);
+    CHECK(a.failure == AreaFailure::None);
+    REQUIRE(a.rings.size() == size_t(1));
+    CHECK_EQ(a.rings[0].size(), outline.size() + 1);
+    const std::vector<NestedPolygon> polygons = nested(a);
+    CHECK_EQ(polygons_holding(polygons, 20.0, 20.0), 1);
+    CHECK_EQ(polygons_holding(polygons, 50.0, 50.0), 0);
 }

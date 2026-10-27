@@ -207,45 +207,107 @@ LatLng polygon_interior_point(const P* v, uint32_t n, uint16_t holes) {
     return interior_point(v, spans);
 }
 
-// For each of a relation's inner rings (closed), the index of the outer ring
-// it is a hole of, or -1: the smallest outer ring larger than it that holds
-// its interior point. An enclave inside an enclave (Baarle's Dutch pieces in
-// the Belgian ones) is an outer ring inside a hole; being smaller than the
-// hole it can't claim it.
-inline std::vector<int> assign_holes(const std::vector<std::vector<LatLng>>& outers,
-                                     const std::vector<std::vector<LatLng>>& inners) {
+// For each closed ring of a relation, the index of the ring immediately
+// around it, or -1: the smallest larger ring that holds its interior point.
+// Rings that don't cross either nest or lie apart, so a ring holding another's
+// interior point and larger than it is around it. This is the nesting osmium's
+// assembler finds (its find_enclosing_ring counts the rings below a ring's
+// lowest point) without looking at member roles.
+inline std::vector<int> enclosing_rings(const std::vector<std::vector<LatLng>>& rings) {
     struct Box { double lat_lo, lat_hi, lng_lo, lng_hi; };
-    auto box_of = [](const std::vector<LatLng>& r) {
-        Box b{INFINITY, -INFINITY, INFINITY, -INFINITY};
-        for (const auto& [lat, lng] : r)
-            b = {std::min(b.lat_lo, lat), std::max(b.lat_hi, lat), std::min(b.lng_lo, lng), std::max(b.lng_hi, lng)};
-        return b;
-    };
-    std::vector<Box> boxes;
-    std::vector<double> areas;
-    for (const auto& o : outers) {
-        boxes.push_back(box_of(o));
-        areas.push_back(std::fabs(signed_area2(o)));
-    }
-    std::vector<int> owner(inners.size(), -1);
+    const size_t n = rings.size();
+    std::vector<Box> boxes(n);
+    std::vector<double> areas(n);
+    std::vector<LatLng> inner_point(n);
     std::vector<RingSpan> whole(1);
-    for (size_t i = 0; i < inners.size(); i++) {
-        const auto& in = inners[i];
-        if (in.size() < kMinClosedRing) continue;
-        whole[0] = {0, static_cast<uint32_t>(in.size())};
-        const auto [lat, lng] = interior_point(in.data(), whole);
-        const double area = std::fabs(signed_area2(in));
-        double best = INFINITY;
-        for (size_t o = 0; o < outers.size(); o++) {
-            const Box& b = boxes[o];
-            if (areas[o] <= area || areas[o] >= best) continue;
-            if (lat < b.lat_lo || lat > b.lat_hi || lng < b.lng_lo || lng > b.lng_hi) continue;
-            if (!ring_contains_latlng(outers[o], lat, lng)) continue;
-            best = areas[o];
-            owner[i] = static_cast<int>(o);
-        }
+    for (size_t i = 0; i < n; i++) {
+        Box b{INFINITY, -INFINITY, INFINITY, -INFINITY};
+        for (const auto& [lat, lng] : rings[i])
+            b = {std::min(b.lat_lo, lat), std::max(b.lat_hi, lat), std::min(b.lng_lo, lng), std::max(b.lng_hi, lng)};
+        boxes[i] = b;
+        areas[i] = std::fabs(signed_area2(rings[i]));
+        whole[0] = {0, static_cast<uint32_t>(rings[i].size())};
+        if (rings[i].size() >= kMinClosedRing) inner_point[i] = interior_point(rings[i].data(), whole);
     }
-    return owner;
+    std::vector<uint32_t> by_lat(n);
+    for (uint32_t i = 0; i < n; i++) by_lat[i] = i;
+    std::sort(by_lat.begin(), by_lat.end(), [&](uint32_t a, uint32_t b) { return inner_point[a].first < inner_point[b].first; });
+
+    std::vector<int> around(n, -1);
+    std::vector<uint32_t> candidates;
+    std::vector<char> odd;
+    for (size_t j = 0; j < n; j++) {
+        const auto& ring = rings[j];
+        if (ring.size() < kMinClosedRing) continue;
+        const Box& b = boxes[j];
+        // Smaller rings whose interior point is in ring j's box and that have
+        // no smaller ring around them yet.
+        candidates.clear();
+        auto lo = std::lower_bound(by_lat.begin(), by_lat.end(), b.lat_lo,
+                                   [&](uint32_t i, double lat) { return inner_point[i].first < lat; });
+        for (auto it = lo; it != by_lat.end() && inner_point[*it].first <= b.lat_hi; ++it) {
+            const uint32_t i = *it;
+            if (i == j || rings[i].size() < kMinClosedRing || areas[i] >= areas[j]) continue;
+            if (inner_point[i].second < b.lng_lo || inner_point[i].second > b.lng_hi) continue;
+            if (around[i] >= 0 && areas[around[i]] <= areas[j]) continue;
+            candidates.push_back(i);
+        }
+        if (candidates.empty()) continue;
+        // One pass over ring j's edges counts the crossings for all of them
+        // (ring_contains_latlng's rule), the points sorted by longitude so
+        // each edge visits only those in its longitude span.
+        std::sort(candidates.begin(), candidates.end(),
+                  [&](uint32_t a, uint32_t c) { return inner_point[a].second < inner_point[c].second; });
+        odd.assign(candidates.size(), 0);
+        auto lng_lower = [&](double lng) {
+            return std::lower_bound(candidates.begin(), candidates.end(), lng,
+                                    [&](uint32_t i, double x) { return inner_point[i].second < x; }) - candidates.begin();
+        };
+        for (size_t k = 1; k < ring.size(); k++) {
+            const LatLng& va = ring[k];
+            const LatLng& vb = ring[k - 1];
+            const auto [x0, x1] = std::minmax(va.second, vb.second);
+            if (x0 == x1) continue;
+            for (auto c = lng_lower(x0), end = lng_lower(x1); c < end; c++) {
+                const auto [lat, lng] = inner_point[candidates[c]];
+                if (lat < (vb.first - va.first) * (lng - va.second) / (vb.second - va.second) + va.first) odd[c] ^= 1;
+            }
+        }
+        for (size_t c = 0; c < candidates.size(); c++)
+            if (odd[c]) around[candidates[c]] = static_cast<int>(j);
+    }
+    return around;
+}
+
+// How many rings are around each ring, following enclosing_rings' chains.
+inline std::vector<int> ring_depths(const std::vector<int>& around) {
+    std::vector<int> depth(around.size(), 0);
+    for (size_t i = 0; i < around.size(); i++)
+        for (int r = around[i]; r >= 0; r = around[r]) depth[i]++;
+    return depth;
+}
+
+// One outer ring of a relation with the holes in it.
+struct NestedPolygon {
+    std::vector<LatLng> outer;
+    std::vector<std::vector<LatLng>> holes;
+};
+
+// The rings as polygons, nested as osmium nests them: each ring at even depth
+// is an outer ring (an island in a lake in an island is one again), in ring
+// order, and each ring at odd depth a hole in the ring around it.
+inline std::vector<NestedPolygon> nest_rings(std::vector<std::vector<LatLng>> rings, const std::vector<int>& around,
+                                             const std::vector<int>& depth) {
+    std::vector<NestedPolygon> polygons;
+    std::vector<int> polygon_of(rings.size(), -1);
+    for (size_t i = 0; i < rings.size(); i++) {
+        if (depth[i] % 2) continue;
+        polygon_of[i] = static_cast<int>(polygons.size());
+        polygons.push_back({std::move(rings[i]), {}});
+    }
+    for (size_t i = 0; i < rings.size(); i++)
+        if (depth[i] % 2) polygons[polygon_of[around[i]]].holes.push_back(std::move(rings[i]));
+    return polygons;
 }
 
 // --- Ring topology ---
