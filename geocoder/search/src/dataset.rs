@@ -5,7 +5,7 @@
 //! from before a patch, is built again from the files instead of being read. The files hashed
 //! must be the ones the geocoder index was loaded from (`load`): one replaced under a loaded
 //! index would have the index built from the old files but recorded as built from the new.
-use crate::build::{self, build_held, has_unfinished_publish, held_subs, BuildOpts, Contended, HeldIndexDir};
+use crate::build::{self, build_held, has_extra_names, has_unfinished_publish, held_subs, BuildOpts, Contended, HeldIndexDir};
 use crate::constants::*;
 use crate::reader::SearchIndex;
 use query_server::Index;
@@ -145,9 +145,14 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
     Ok(format!("{:x}", sha.finalize()))
 }
 
+/// The META_FILE of the index in `index` (None without a readable one).
+fn meta_of(index: &Path) -> Option<Value> {
+    serde_json::from_str(&std::fs::read_to_string(index.join(META_FILE)).ok()?).ok()
+}
+
 /// The fingerprint of the dataset the index in `index` was built from (None without one).
 pub fn built_from(index: &Path) -> Option<Fingerprint> {
-    let meta: Value = serde_json::from_str(&std::fs::read_to_string(index.join(META_FILE)).ok()?).ok()?;
+    let meta = meta_of(index)?;
     let files = meta[META_DATASET_KEY].as_object()?;
     files.iter().map(|(name, sha)| Some((name.clone(), sha.as_str()?.to_string()))).collect()
 }
@@ -223,8 +228,9 @@ fn is_complete(geo: &Index, index: &Path) -> bool {
 
 /// Opens the place search index in `index` of the dataset in `dir` (loaded as `geo` from files
 /// stamped `loaded`, by `load`): the one there when it is whole (`is_complete`), no publish into
-/// it was left unfinished and it was built from these files, else one built from them first by
-/// `build_held` (staged in `index`, every file moved in only once all are complete). Fails when
+/// it was left unfinished and it was built from these files without extra names (it has no
+/// extra-names file to read them with), else one built from them first by `build_held` with the
+/// default options (staged in `index`, every file moved in only once all are complete). Fails when
 /// the files are no longer the ones loaded. The open holds `index` (`HeldIndexDir`, which every
 /// build takes) until the index is mapped, waiting while another open or a build has it: a
 /// second open finds the first's index current, and no build moves files in while one is read,
@@ -247,7 +253,11 @@ pub fn open<'g>(geo: &'g Index, loaded: &Stamps, dir: &Path, index: &Path, on_de
 
     // Held, so an unfinished publish is a dead build's: some files there may be its own and some
     // the index's before it, whose META_FILE matches whenever both were built from these files.
-    let origin = if !has_unfinished_publish(index) && is_complete(geo, index) && built_from(index).as_ref() == Some(&have) {
+    let reusable = !has_unfinished_publish(index)
+        && is_complete(geo, index)
+        && meta_of(index).is_some_and(|m| !has_extra_names(&m))
+        && built_from(index).as_ref() == Some(&have);
+    let origin = if reusable {
         Origin::Current
     } else {
         // Held, so a stage here is a dead build's, with any files a publish it did not finish
@@ -654,6 +664,28 @@ mod tests {
             assert_eq!(origin, Origin::Built, "{file}");
             assert_eq!((names(&idx, "testville"), names(&idx, "old mill")), (vec!["Testville".to_string()], vec!["Old Mill".to_string()]), "{file}");
         }
+    }
+
+    #[test]
+    fn an_index_built_with_extra_names_is_built_again_without_them() {
+        let ds = TempDir::new("extras");
+        dataset(["Testville", "Otherton"]).write(&ds.0);
+        let index = ds.0.join("search");
+        // `place-search build --extras` of these files: read only with an extra-names file.
+        let (tsv, bin) = (ds.0.join("extra_names.tsv"), ds.0.join("extra_names.bin"));
+        std::fs::write(&tsv, "p\t0\t2\tname:de\tPrüfdorf\n").unwrap();
+        crate::extras::pack(tsv.to_str().unwrap(), bin.to_str().unwrap()).unwrap();
+        let (geo, stamps) = load_dataset(&ds.0);
+        let opts = BuildOpts { extras: Some(bin.to_str().unwrap().into()), ..BuildOpts::new(ds.0.join("tmp")) };
+        let meta = index_meta(&geo, &opts, &fingerprint(&ds.0).unwrap());
+        build_all(&geo, &held_subs(&geo, SUB_INDEXES), &index, &opts, || Ok(meta.into())).unwrap();
+
+        let (idx, origin) = open(&geo, &stamps, &ds.0, &index, &BuildOnDevice::default()).unwrap();
+
+        assert_eq!(origin, Origin::Built);
+        assert_eq!((names(&idx, "testville"), names(&idx, "prüfdorf")), (vec!["Testville".to_string()], vec![]));
+        drop(idx);
+        assert_eq!(open(&geo, &stamps, &ds.0, &index, &BuildOnDevice::default()).unwrap().1, Origin::Current);
     }
 
     #[test]

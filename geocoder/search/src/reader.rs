@@ -1,6 +1,7 @@
 //! Memory-mapped search index: the fst and postings of each sub-index (places, optional POI),
 //! the boundary slots, and the geocoder index it points into. Loading reads only a small
 //! meta file and the ISO code list; everything else is mapped and paged in by queries.
+use crate::build::has_extra_names;
 use crate::constants::{BOUNDARY_FILE, META_FILE};
 use crate::entities::Entities;
 use crate::extras::Extras;
@@ -123,8 +124,7 @@ impl<'g> SearchIndex<'g> {
             &std::fs::read_to_string(dir.join(META_FILE)).map_err(|e| format!("{META_FILE}: {e}"))?,
         )
         .map_err(|e| e.to_string())?;
-        let with_names = meta["extras"].as_bool().unwrap_or(false);
-        let extras = match (with_names, extras) {
+        let extras = match (has_extra_names(&meta), extras) {
             (true, Some(p)) => Some(Extras::open(p)?),
             (true, None) => return Err("index was built with extra names: pass the extra-names file".into()),
             _ => None,

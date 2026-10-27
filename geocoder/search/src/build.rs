@@ -1140,6 +1140,12 @@ pub fn index_meta(geo: &Index, opts: &BuildOpts) -> serde_json::Map<String, serd
     .collect()
 }
 
+/// Whether the index whose META_FILE is `meta` was built with extra names (`index_meta`): one
+/// `SearchIndex::open` reads only with their file.
+pub fn has_extra_names(meta: &serde_json::Value) -> bool {
+    meta["extras"].as_bool().unwrap_or(false)
+}
+
 /// Builds the sub-indexes `subs` of `geo` for the index directory `out`, the value `meta` gives
 /// with each one's stats becoming its search_meta.json. Every file is written into a staging
 /// directory and moved into `out` only once all of them are complete, search_meta.json last
@@ -1287,7 +1293,7 @@ pub fn check_retained_names(out: &Path, building: &[&str], with_extras: bool) ->
     let meta: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     for name in ["places", "poi"] {
         if !building.contains(&name) && out.join(format!("{name}.fst")).exists()
-            && meta["extras"].as_bool().unwrap_or(false) != with_extras {
+            && has_extra_names(&meta) != with_extras {
             return Err(format!("retained {name} sub-index uses a different extra-name setting; rebuild with --sub all or the same --extras setting"));
         }
     }
