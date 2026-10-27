@@ -4,6 +4,7 @@ PATCHER: the experiment's geocoder-patch; GC: gc; DIFF: a geocoder-diff (v7 or v
 an old and a new today's-format dir, diffs them, encodes the old one with gc, applies the patch to it
 (sync and --threads) and compares the new encoded set byte for byte with gc's encoding of the new dir.
 """
+import fcntl
 import os
 from pathlib import Path
 import random
@@ -52,12 +53,39 @@ def geo_dir(d, cells, ways=1000):
     (d / 'interp_entries.bin').write_bytes(b'')
 
 
+def unprivileged():
+    """preexec_fn: nobody, when run as root (a FIFO's pipe counts against its first opener's limit)."""
+    if os.geteuid() == 0:
+        os.setgroups([])
+        os.setgid(65534)
+        os.setuid(65534)
+
+
+def narrow_pipes():
+    """preexec_fn: unprivileged() holding pipes of up to 1 MiB until it is past its pipe page limit
+    (fs.pipe-user-pages-soft), where a new pipe gets the minimum size and none can grow: the patcher's
+    own pipes can't grow. (Stopping at the first refused 1 MiB leaves up to 1 MiB minus a page free.)"""
+    unprivileged()
+    for _ in range(4096):
+        r, w = os.pipe()
+        os.set_inheritable(r, True)
+        os.set_inheritable(w, True)
+        if fcntl.fcntl(w, 1032) < 65536:  # F_GETPIPE_SZ below the default: past the limit
+            return
+        try:
+            fcntl.fcntl(w, 1031, 1 << 20)  # F_SETPIPE_SZ
+        except OSError:
+            pass
+    os.write(2, b'SKIP: no pipe page limit reached\n')
+
+
 def block(rng, vc):
     return bytes(10) + bytes(rng.randrange(256) for _ in range(4 * vc))
 
 
 def run(cmd, **kw):
-    return subprocess.run(cmd, capture_output=True, env=ENV, **kw)
+    kw.setdefault('env', ENV)
+    return subprocess.run(cmd, capture_output=True, **kw)
 
 
 def same_dirs(a, b):
@@ -161,5 +189,26 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as scratch:
     err = r.stderr.decode()
     if r.returncode == 0 or 'Cannot write geo_cells.bin' not in err:
         errors.append(f'fifo-output: a failed geo_cells.bin was not reported: rc={r.returncode} {err[-300:]}')
+
+    # A FIFO output whose pipe can't grow to 1 MiB fails the run up front (the entry pipeline's group
+    # flush needs it; it went on with a 64 KiB or 8 KiB pipe): the patcher runs as a user past its
+    # pipe page limit, geo_cells.bin is a FIFO the same user drains.
+    os.chmod(root, 0o777)
+    out = root / 'narrow.out'
+    out.mkdir()
+    os.chmod(out, 0o777)
+    fifo = out / 'geo_cells.bin'
+    os.mkfifo(fifo)
+    os.chmod(fifo, 0o666)
+    reader = subprocess.Popen(['cat', str(fifo)], stdout=subprocess.DEVNULL, preexec_fn=unprivileged)
+    r = run([PATCHER, str(root / 'flat'), str(root / 'flat.gcpatch'), '-o', str(out)], preexec_fn=narrow_pipes,
+            close_fds=False, timeout=120, env=dict(ENV, TMPDIR=str(root)))
+    reader.kill()
+    reader.wait()
+    err = r.stderr.decode()
+    if 'SKIP' in err:
+        print('narrow-pipe: SKIP, this user may enlarge every pipe')
+    elif r.returncode == 0 or "pipe can't hold 1 MiB" not in err:
+        errors.append(f'narrow-pipe: a FIFO output on a small pipe was not refused: rc={r.returncode} {err[-300:]}')
 
 assert not errors, '\n'.join(errors)

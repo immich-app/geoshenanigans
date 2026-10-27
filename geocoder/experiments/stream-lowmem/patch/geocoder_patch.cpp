@@ -492,10 +492,15 @@ static int run(int argc, char* argv[]) {
     // group ahead of the reader without blocking. The buffers live as long
     // as the run.
     std::vector<std::unique_ptr<char[]>> fifo_bufs;
-    auto widen_pipe = [&fifo_bufs](FILE* f) {
+    // (The pipe must grow: the entry pipeline's group flush runs 128 KiB plus a list ahead on one
+    // FIFO while its encoder waits on another.)
+    auto widen_pipe = [&fifo_bufs](FILE* f, const std::string& p) {
         struct stat st;
         if (fstat(fileno(f), &st) != 0 || !S_ISFIFO(st.st_mode)) return;
-        fcntl(fileno(f), F_SETPIPE_SZ, 1 << 20);
+        const int got = fcntl(fileno(f), F_SETPIPE_SZ, 1 << 20);
+        if (got < (1 << 20))
+            throw std::runtime_error(p + ": the pipe can't hold 1 MiB (" + (got < 0 ? std::strerror(errno) : "smaller") +
+                                     "); streamed outputs need it (fs.pipe-max-size, fs.pipe-user-pages-soft)");
         fifo_bufs.emplace_back(new char[1 << 20]);
         setvbuf(f, fifo_bufs.back().get(), _IOFBF, 1 << 20);
     };
@@ -504,7 +509,7 @@ static int run(int argc, char* argv[]) {
         std::string p = out_path(name);
         FILE* f = fopen(p.c_str(), "wb");
         if (!f) throw std::runtime_error("Cannot write " + p);
-        widen_pipe(f);
+        widen_pipe(f, p);
         __fsetlocking(f, FSETLOCKING_BYCALLER);  // one thread writes each output: no lock per fwrite
         return f;
     };
