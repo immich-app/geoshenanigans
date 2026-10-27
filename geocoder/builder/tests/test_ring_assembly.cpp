@@ -302,6 +302,26 @@ TEST(area_rings_fail_when_segments_cross) {
     }
 }
 
+// osmium counts two segments as intersecting wherever they meet but at an
+// end both have (calculate_intersection), and builds no area then: an
+// enclave whose corner lies on the outline between two of its nodes, two
+// outlines in line along part of a side with no node in common there, and an
+// outline doubling back on itself in line.
+TEST(area_rings_fail_when_segments_meet_between_nodes) {
+    WayGeometries geoms;
+    add_way(geoms, 1, {{0.0, 0.0}, {0.0, 10.0}, {10.0, 10.0}, {10.0, 0.0}, {0.0, 0.0}});
+    add_way(geoms, 2, {{5.0, 0.0}, {7.0, 3.0}, {3.0, 3.0}, {5.0, 0.0}});
+    add_way(geoms, 3, {{10.0, 2.0}, {10.0, 6.0}, {14.0, 6.0}, {14.0, 2.0}, {10.0, 2.0}});
+    add_way(geoms, 4, {{20.0, 20.0}, {20.0, 22.0}, {20.0, 21.0}, {20.0, 20.0}});
+    using Members = std::vector<std::pair<int64_t, std::string>>;
+    for (const Members& members : {Members{{1, "outer"}, {2, "inner"}}, Members{{1, "outer"}, {3, "outer"}},
+                                   Members{{4, "outer"}}}) {
+        const AreaRings a = assemble_area_rings(members, geoms);
+        CHECK(a.rings.empty());
+        CHECK(a.failure == AreaFailure::Crossing);
+    }
+}
+
 // Rings may touch at up to 100 coordinates (osmium's max_split_locations): a
 // chain of squares corner to corner.
 TEST(area_rings_fail_past_100_touching_coordinates) {

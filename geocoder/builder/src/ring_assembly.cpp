@@ -289,9 +289,6 @@ using End = uint32_t;
 
 End end_of(uint32_t sub_way, bool back) { return sub_way * 2 + (back ? 1 : 0); }
 
-// A coordinate in 1e-7 degrees, rounded as coord_key rounds it.
-int64_t e7(double v) { return static_cast<int32_t>(v * 1e7 + (v >= 0 ? 0.5 : -0.5)); }
-
 // The way a sub-way leaves one of its end coordinates: (longitude, latitude)
 // steps of 1e-7 degrees to its nearest coordinate that differs from the end's
 // (zero when none does).
@@ -520,7 +517,8 @@ AreaRings assemble_area_rings(const std::vector<std::pair<int64_t, std::string>>
     }
 
     Walk walk = walk_rings(sub_ways, ends, nullptr);
-    // Nor does osmium take an area whose segments cross: it looks for those
+    // Nor does osmium take an area whose segments intersect (cross, or meet
+    // other than at an end both have): it looks for those
     // (SegmentList::find_intersections) before it joins any rings.
     if (rings_cross(walk.rings)) {
         out.failure = AreaFailure::Crossing;
