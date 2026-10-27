@@ -25,8 +25,9 @@ errors = []
 
 def poi_dir(d, blocks):
     """blocks: per record, (id, None) for a point or (id, bytes of its vertex block: enc 0 to 2, 4-byte
-    vertices). The id fills the record's first 8 bytes, so a record kept in the new set matches."""
-    d.mkdir(parents=True)
+    vertices). The id fills the record's first 8 bytes, so a record kept in the new set matches.
+    d may hold other files already."""
+    d.mkdir(parents=True, exist_ok=True)
     recs, verts = [], bytearray()
     for rid, b in blocks:
         if b is None:
@@ -206,6 +207,29 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as scratch:
         (root / d / 'addr_points.bin').write_bytes(b'')
         (root / d / 'addr_vertices.bin').write_bytes(b'')
     apply_case(root, 'empty-addresses', root / 'noaddr.a', root / 'noaddr.b')
+    # A new set without an encoded family's files (the POI family, both files gone): its gc.manifest
+    # names only the families it ships, as gc's encoding of the new dir does, and it decodes to the
+    # new dir. A new set with part of the family (one of its two files) is refused before the replay.
+    geo_dir(root / 'fam.a', cells)
+    poi_dir(root / 'fam.a', blocks[:40])
+    geo_dir(root / 'fam.b', cells)
+    apply_case(root, 'removed-family', root / 'fam.a', root / 'fam.b')
+    r = run([GC, 'decode', str(root / 'removed-family.out'), str(root / 'removed-family.dec')])
+    if r.returncode or same_dirs(root / 'fam.b', root / 'removed-family.dec'):
+        errors.append(f'removed-family: the new set does not decode to the new dir: rc={r.returncode} {r.stderr.decode()[-300:]}')
+    for kept in ('poi_records.bin', 'poi_vertices.bin'):
+        new = root / f'fam.{kept}'
+        geo_dir(new, cells)
+        poi_dir(new, blocks[:40])
+        next(p for p in new.iterdir() if p.name.startswith('poi_') and p.name != kept).unlink()
+        r = run([DIFF, str(root / 'fam.a'), str(new), '-o', str(root / f'{new.name}.gcpatch')])
+        for threads in ([], ['--threads']):
+            r = run([PATCHER, str(root / 'removed-family.old.enc'), str(root / f'{new.name}.gcpatch'), '-o',
+                     str(root / f'{new.name}.out{len(threads)}')] + threads)
+            err = r.stderr.decode()
+            if r.returncode == 0 or 'family poi: the patch ships 1 of its 2 files' not in err:
+                errors.append(f'partial-family (only {kept}{", threads" if threads else ""}): not refused up front: '
+                              f'rc={r.returncode} {err[-300:]}')
     # A parent's REPLACE run (v8: the same street ways, renamed) whose children stay one MATCH run: the
     # old records are dropped as the node reads make the shared decoder produce them, not queued for
     # the whole run (2.4 MB of them).

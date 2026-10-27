@@ -44,7 +44,8 @@ struct Store {
     bool active = false, threads = false;
     std::string cur_dir, out_dir;
     Manifest old_m, new_m;
-    std::vector<int> fam_on;  // per family: encoded in the installed set
+    std::vector<int> fam_on;   // per family: encoded in the installed set
+    std::vector<int> fam_out;  // per family: encoded in the new set (plan_outputs)
     std::map<std::string, std::pair<int, int>> file_port;  // today's name -> (family, port)
     std::vector<std::unique_ptr<Decoder>> dec;
     std::vector<std::unique_ptr<Encoder>> enc;
@@ -108,6 +109,21 @@ struct Store {
             bool known = false;
             for (const auto& f : F) known |= n == f.name;
             if (!known) die("unknown family %s in gc.manifest", n.c_str());
+        }
+    }
+    // Once expect_out holds the patch's client list: an encoded family the new set drops whole (it
+    // lists none of its today's files) leaves gc.families, and one it ships in part can't be encoded.
+    void plan_outputs() {
+        if (!active) return;
+        const auto& F = families();
+        fam_out.assign(F.size(), 0);
+        for (size_t fi = 0; fi < F.size(); fi++) {
+            if (!fam_on[fi]) continue;
+            size_t listed = 0;
+            for (const char* t : F[fi].today) listed += expect_out.count(t);
+            if (listed && listed < F[fi].today.size())
+                die("family %s: the patch ships %zu of its %zu files", F[fi].name, listed, F[fi].today.size());
+            fam_out[fi] = listed != 0;
         }
     }
     bool is_encoded(const std::string& name) const { return active && file_port.count(name); }
@@ -301,12 +317,12 @@ struct Store {
         report.push_back(r + " B");
         enc[size_t(fi)].reset();
     }
-    // The merged manifest: every family's keys, gc.families and gc.version, as gc writes it.
+    // The merged manifest: every new family's keys, gc.families and gc.version, as gc writes it.
     void save_manifest() {
         std::string fl;
         const auto& F = families();
         for (size_t fi = 0; fi < F.size(); fi++) {
-            if (!fam_on[fi]) continue;
+            if (!fam_out[fi]) continue;
             if (enc[fi]) die("family %s: an output was never closed", F[fi].name);
             fl += (fl.empty() ? "" : ",") + std::string(F[fi].name);
         }
