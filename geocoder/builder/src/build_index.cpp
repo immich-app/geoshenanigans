@@ -4212,7 +4212,8 @@ static int run(int argc, char* argv[]) {
                     // with the member roles.
                     struct RingNesting {
                         std::atomic<uint64_t> rings{0}, holes{0}, islands_in_holes{0}, inner_ways_outer{0},
-                            outer_ways_hole{0}, mixed_roles{0}, cancelled{0}, open{0}, touching{0}, crossing{0};
+                            outer_ways_hole{0}, mixed_roles{0}, cancelled{0}, open{0}, touching{0}, crossing{0},
+                            re_paired{0};
                         void count(const AreaRings& a, const std::vector<int>& depth) {
                             for (size_t r = 0; r < depth.size(); r++) {
                                 const bool hole = depth[r] % 2;
@@ -4228,6 +4229,7 @@ static int run(int argc, char* argv[]) {
                             open += a.failure == AreaFailure::OpenRing;
                             touching += a.failure == AreaFailure::TooManyTouches;
                             crossing += a.failure == AreaFailure::Crossing;
+                            re_paired += a.crossing_coordinates > 0 && a.failure == AreaFailure::None;
                         }
                     } nesting;
 
@@ -4281,6 +4283,12 @@ static int run(int argc, char* argv[]) {
                                 const std::vector<int> around = enclosing_rings(assembled.rings);
                                 const std::vector<int> depth = ring_depths(around);
                                 nesting.count(assembled, depth);
+                                if (assembled.crossing_coordinates > 0) {
+                                    std::cerr << ("  Rings crossing at shared nodes: relation " + std::to_string(rel.id) +
+                                                  " '" + rel.name + "' (level " + std::to_string(rel.admin_level) + "), " +
+                                                  std::to_string(assembled.crossing_coordinates) + " nodes, " +
+                                                  (assembled.failure == AreaFailure::None ? "re-paired" : "no area") + "\n");
+                                }
                                 std::vector<NestedPolygon> polygons =
                                     nest_rings(std::move(assembled.rings), around, depth);
 
@@ -4399,7 +4407,8 @@ static int run(int argc, char* argv[]) {
                               << " mix roles; " << nesting.cancelled << " duplicate sub-ways dropped; relations"
                               << " without an area as osmium: " << nesting.open << " open, " << nesting.touching
                               << " touching over " << MAX_TOUCHING_LOCATIONS << " times, " << nesting.crossing
-                              << " crossing" << std::endl;
+                              << " crossing; " << nesting.re_paired
+                              << " with rings crossing at shared nodes re-paired by turn order" << std::endl;
                     if (wikidata_linked_count > 0) {
                         std::cerr << "  Wikidata place linking: " << wikidata_linked_count
                                   << " admin relations linked to place types." << std::endl;
@@ -4423,6 +4432,8 @@ static int run(int argc, char* argv[]) {
                     struct PreparedPolygon {
                         std::vector<std::pair<double,double>> simplified;  // keyhole range
                         uint16_t hole_count = 0;
+                        uint8_t halvings = 0;  // SimplifiedRings::halvings
+                        bool nests = true;
                         std::string name;
                         uint8_t admin_level;
                         std::string country_code;
@@ -4451,10 +4462,14 @@ static int run(int argc, char* argv[]) {
                                     canonicalize_ring_rotation(vertices);
                                     for (auto& hole : ar.holes) canonicalize_ring_rotation(hole);
 
-                                    std::tie(pp.simplified, pp.hole_count) = simplify_rings(vertices, ar.holes,
-                                        [&](const std::vector<std::pair<double,double>>& ring) {
-                                            return simplify_admin_polygon(ring, ar.admin_level);
+                                    SimplifiedRings s = simplify_rings(vertices, ar.holes,
+                                        [&](const std::vector<std::pair<double,double>>& ring, double scale) {
+                                            return simplify_admin_polygon(ring, ar.admin_level, scale);
                                         });
+                                    pp.simplified = std::move(s.range);
+                                    pp.hole_count = s.holes;
+                                    pp.halvings = s.halvings;
+                                    pp.nests = s.nests;
                                     if (pp.simplified.size() >= 3) {
                                         pp.area = polygon_area(pp.simplified);
                                     }
@@ -4470,6 +4485,11 @@ static int run(int argc, char* argv[]) {
                         for (auto& w : prep_workers) w.join();
                     }
                     all_admin_results.clear();
+                    {
+                        HoleTopologyCounts topology;
+                        for (const auto& pp : prepared) topology.add(pp.halvings, pp.nests);
+                        std::cerr << "  Admin hole topology: " << topology.summary() << std::endl;
+                    }
                     log_phase("    Admin: parallel simplify", _pt, _cpu);
 
                     // Append the rings of 3+ vertices, in order, on every core,
