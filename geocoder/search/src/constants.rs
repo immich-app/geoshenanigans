@@ -66,6 +66,8 @@ pub const BOUNDARY_MIN_LEVEL: u8 = 2;
 pub const BOUNDARY_MAX_LEVEL: u8 = 8;
 
 // ---- files
+/// The index's dir inside the dataset dir it belongs to (where packs that ship one put it).
+pub const DATASET_SEARCH_DIR: &str = "search";
 /// What an index was built from (options, sub-index stats, the dataset's file hashes); written last.
 pub const META_FILE: &str = "search_meta.json";
 /// The META_FILE field that holds the dataset's file hashes (dataset.rs).
