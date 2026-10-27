@@ -1383,3 +1383,15 @@ TEST(patch_parallel_delta_rejects_invalid_headers) {
     rejects(PatchFileId::POI_RECORDS, uint32_t(PatchFileId::POI_RECORDS), 4, 0);
 }
 
+TEST(patch_output_reports_final_flush_failure) {
+    FILE* out = fopen("/dev/full", "wb");
+    REQUIRE(out != nullptr);
+    char buf[8192];
+    setvbuf(out, buf, _IOFBF, sizeof(buf));
+    CHECK_EQ(fwrite("test", 1, 4, out), size_t(4));
+    CHECK_EQ(ferror(out), 0);
+    bool threw = false;
+    try { close_patch_output(out, "test"); }
+    catch (const std::runtime_error&) { threw = true; }
+    CHECK(threw);
+}

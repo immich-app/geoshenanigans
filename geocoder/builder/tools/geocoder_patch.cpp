@@ -512,9 +512,7 @@ static int run(int argc, char* argv[]) {
                 }
             }
             if (!buf.empty()) fwrite(buf.data(), 4, buf.size(), out);
-            bool ok = !ferror(out);
-            fclose(out);
-            if (!ok) throw std::runtime_error(std::string("Cannot write ") + fname);
+            close_patch_output(out, fname);
             if (ni * 4 != new_size || ci != n_changes || ii != n_ins)
                 throw std::runtime_error(std::string("Parallel delta does not match the new build: ") + fname);
             log_rewinds(old);
@@ -580,9 +578,7 @@ static int run(int argc, char* argv[]) {
                 }
                 fwrite(buf.data(), 1, n, out);
             }
-            bool ok = !ferror(out);
-            fclose(out);
-            if (!ok) throw std::runtime_error(std::string("Cannot write ") + fname);
+            close_patch_output(out, fname);
 
             std::cerr << "  " << fname << ": sparse delta " << n_changes
                       << " changes (" << new_size << " bytes)" << section_io() << std::endl;

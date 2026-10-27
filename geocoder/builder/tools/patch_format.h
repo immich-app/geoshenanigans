@@ -458,6 +458,12 @@ inline void check_parallel_delta_header(uint32_t fid, uint32_t parent_fid,
         throw std::runtime_error("Malformed parallel delta");
 }
 
+// A buffered write can succeed even when the final flush fails.
+inline void close_patch_output(FILE* out, const std::string& name) {
+    bool ok = !ferror(out);
+    if (fclose(out) != 0 || !ok) throw std::runtime_error("Cannot write " + name);
+}
+
 // POI parent-id remap marker: 0xFFFFFFF3
 // Carries the full primary+secondary admin-polygon, street-way, and
 // postcode-centroid old→new ID remap that the diff side applied to old
