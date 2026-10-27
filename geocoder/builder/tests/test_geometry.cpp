@@ -9,6 +9,10 @@
 // covers the geometry.h module exactly.
 #include "geometry.h"
 
+#include <cmath>
+#include <cstdint>
+#include <limits>
+#include <random>
 #include <utility>
 #include <vector>
 
@@ -80,6 +84,89 @@ TEST(geometry_coord_key_packs_lat_high_lng_low) {
     int64_t k = coord_key(0.0, -1.0);
     CHECK_EQ(static_cast<uint32_t>(k & 0xFFFFFFFFull),
              static_cast<uint32_t>(-10000000));
+}
+
+// Ring assembly keys packed coordinates directly: the key must be the one
+// their doubles (lat(), lon()) had, at the int32 extremes too.
+TEST(geometry_coord_key_of_a_packed_location_is_the_key_of_its_doubles) {
+    const int32_t edges[] = {0, 1, -1, 2, -2, 5, -5, 900000000, -900000000, 1800000000, -1800000000,
+                             std::numeric_limits<int32_t>::max(), std::numeric_limits<int32_t>::min()};
+    size_t differ = 0;
+    for (int32_t lat : edges)
+        for (int32_t lon : edges) {
+            const PackedLocation p{lat, lon};
+            differ += coord_key(p) != coord_key(p.lat(), p.lon());
+        }
+    std::mt19937 rng(1);
+    std::uniform_int_distribution<int32_t> any(std::numeric_limits<int32_t>::min(), std::numeric_limits<int32_t>::max());
+    for (int i = 0; i < 1000000; i++) {
+        const PackedLocation p{any(rng), any(rng)};
+        differ += coord_key(p) != coord_key(p.lat(), p.lon());
+    }
+    CHECK_EQ(differ, size_t(0));
+}
+
+// ---------------------------------------------------------------------------
+// packed rings
+// ---------------------------------------------------------------------------
+
+TEST(geometry_unpack_ring_makes_the_doubles_of_each_vertex) {
+    const std::vector<PackedLocation> ring = {{-338688200, 1512092900}, {3, -3}, {0, 0}};
+    const std::vector<Pt> doubles = unpack_ring(ring);
+    REQUIRE(doubles.size() == ring.size());
+    for (size_t i = 0; i < ring.size(); i++) CHECK(doubles[i] == Pt(ring[i].lat(), ring[i].lon()));
+    CHECK(doubles[0] == Pt(-33.86882, 151.20929));
+}
+
+TEST(geometry_canonicalize_ring_rotation_leads_with_the_smallest_vertex) {
+    std::vector<PackedLocation> ring = {{5, 1}, {3, 9}, {3, 2}, {7, 7}, {5, 1}};
+    canonicalize_ring_rotation(ring);
+    CHECK(ring == std::vector<PackedLocation>({{3, 2}, {7, 7}, {5, 1}, {3, 9}, {3, 2}}));
+    // An open ring is left as it is.
+    std::vector<PackedLocation> open = {{5, 1}, {3, 9}, {3, 2}, {7, 7}};
+    canonicalize_ring_rotation(open);
+    CHECK(open == std::vector<PackedLocation>({{5, 1}, {3, 9}, {3, 2}, {7, 7}}));
+    // So is one whose ends are one e7 unit apart, even though their doubles
+    // are less than 1e-7 apart: the ring assemblers would not close it either.
+    const std::vector<PackedLocation> near = {
+        {-338688200, 1512092900}, {-338680000, 1512100000}, {-338690000, 1512100000}, {-338688200, 1512092901}};
+    REQUIRE(std::fabs(near.front().lon() - near.back().lon()) < 1e-7);
+    REQUIRE(coord_key(near.front()) != coord_key(near.back()));
+    std::vector<PackedLocation> kept = near;
+    canonicalize_ring_rotation(kept);
+    CHECK(kept == near);
+}
+
+TEST(geometry_ring_has_duplicate_coords_ignores_the_closing_vertex) {
+    CHECK(!ring_has_duplicate_coords({{0, 0}, {0, 1}, {1, 1}, {0, 0}}));
+    CHECK(ring_has_duplicate_coords({{0, 0}, {0, 1}, {1, 1}, {0, 1}, {0, 0}}));
+}
+
+namespace {
+
+// A closed ring of n vertices around (0, 0), radius 1 degree.
+std::vector<PackedLocation> circle(int n) {
+    std::vector<PackedLocation> ring;
+    for (int k = 0; k < n; k++) {
+        const double a = 2 * M_PI * k / n;
+        ring.push_back(pack_location(std::sin(a), std::cos(a)));
+    }
+    ring.push_back(ring.front());
+    return ring;
+}
+
+}  // namespace
+
+// Both branches: brute force up to 32 vertices, the longitude sweep above.
+TEST(geometry_ring_has_self_intersection_finds_crossing_edges) {
+    const std::vector<PackedLocation> square = {{0, 0}, {0, 10000000}, {10000000, 10000000}, {10000000, 0}, {0, 0}};
+    const std::vector<PackedLocation> bowtie = {{0, 0}, {10000000, 10000000}, {10000000, 0}, {0, 10000000}, {0, 0}};
+    CHECK(!ring_has_self_intersection(square));
+    CHECK(ring_has_self_intersection(bowtie));
+    std::vector<PackedLocation> ring = circle(40);
+    CHECK(!ring_has_self_intersection(ring));
+    std::swap(ring[5], ring[20]);
+    CHECK(ring_has_self_intersection(ring));
 }
 
 // ---------------------------------------------------------------------------
@@ -293,6 +380,15 @@ TEST(highway_full_filter_footway_subtypes) {
     CHECK(is_included_highway_full("footway", nullptr));
     // The subtype filter applies to footway only.
     CHECK(is_included_highway_full("residential", "sidewalk"));
+}
+
+// A packed location is osmium's Location as it is: x the longitude, y the
+// latitude, both the e7 values coord_key keys it by.
+TEST(geometry_e7_point_of_a_packed_location_is_its_osmium_location) {
+    const PackedLocation p{-338688200, 1512092900};
+    const E7Point e = e7_point(p);
+    CHECK_EQ(e.x, int64_t(1512092900));
+    CHECK_EQ(e.y, int64_t(-338688200));
 }
 
 // area_segments_intersect is osmium's calculate_intersection: segments

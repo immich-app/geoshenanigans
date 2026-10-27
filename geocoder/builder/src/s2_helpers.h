@@ -11,6 +11,7 @@
 
 #include <s2/s2cell_id.h>
 
+#include "packed_location.h"
 #include "types.h"
 #include "geometry.h"
 #include "parsed_data.h"
@@ -120,7 +121,7 @@ void append_addr_point(ParsedData& data, double lat, double lng,
                        uint32_t polygon_vertex_count = 0);
 
 void add_admin_polygon(ParsedData& data,
-                       const std::vector<std::pair<double,double>>& vertices_in,
+                       const std::vector<PackedLocation>& ring,
                        const char* name, uint8_t admin_level,
                        const char* country_code,
                        AdminCoverPool* admin_pool = nullptr,

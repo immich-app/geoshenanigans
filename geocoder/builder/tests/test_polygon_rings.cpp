@@ -164,19 +164,19 @@ TEST(enclosing_rings_ignores_ring_order) {
 TEST(enclosing_rings_needs_the_interior_point_inside_not_just_the_box) {
     // A small square in the notch of a C: inside the C's box, outside the C.
     const Ring c = {{0, 0}, {0, 10}, {2, 10}, {2, 2}, {8, 2}, {8, 10}, {10, 10}, {10, 0}, {0, 0}};
-    CHECK(enclosing_rings({c, square(4, 5, 6, 7)}) == std::vector<int>({-1, -1}));
+    CHECK(enclosing_rings(std::vector<Ring>{c, square(4, 5, 6, 7)}) == std::vector<int>({-1, -1}));
 }
 
 TEST(enclosing_rings_nests_a_hole_touching_its_outer_ring) {
     // The enclave's corner sits on the outer ring (the rings share a node).
     const Ring outer = {{0, 0}, {0, 10}, {10, 10}, {10, 0}, {5, 0}, {0, 0}};
     const Ring touching = {{5, 0}, {7, 3}, {3, 3}, {5, 0}};
-    CHECK(enclosing_rings({outer, touching}) == std::vector<int>({-1, 0}));
+    CHECK(enclosing_rings(std::vector<Ring>{outer, touching}) == std::vector<int>({-1, 0}));
 }
 
 TEST(nest_rings_makes_even_depths_outer_rings_and_odd_depths_their_holes) {
     const std::vector<int> around = enclosing_rings(kBaarle);
-    const std::vector<NestedPolygon> polygons = nest_rings(kBaarle, around, ring_depths(around));
+    const std::vector<NestedPolygon<LatLng>> polygons = nest_rings(kBaarle, around, ring_depths(around));
     CHECK_EQ(polygons.size(), 4u);
     CHECK(polygons[0].outer == kBaarle[0]);
     CHECK(polygons[0].holes == std::vector<Ring>({kBaarle[1]}));
@@ -186,6 +186,40 @@ TEST(nest_rings_makes_even_depths_outer_rings_and_odd_depths_their_holes) {
     CHECK(polygons[2].holes == std::vector<Ring>({kBaarle[4]}));
     CHECK(polygons[3].outer == kBaarle[5]);
     CHECK(polygons[3].holes.empty());
+}
+
+// The builder nests packed rings; every double it computes with is lat() or
+// lon() of a vertex, so the answers are those of the rings' doubles.
+TEST(packed_rings_nest_and_measure_as_their_doubles) {
+    std::mt19937 rng(7);
+    std::uniform_int_distribution<int32_t> jitter(-50000, 50000);
+    std::vector<std::vector<PackedLocation>> packed;
+    for (const Ring& r : kBaarle) {
+        std::vector<PackedLocation> p;
+        for (const auto& [lat, lng] : r) p.push_back(pack_location(lat, lng));
+        for (size_t i = 0; i + 1 < p.size(); i++) {
+            p[i].lat_e7 += jitter(rng);
+            p[i].lon_e7 += jitter(rng);
+        }
+        p.back() = p.front();
+        packed.push_back(std::move(p));
+    }
+    std::vector<Ring> doubles;
+    for (const auto& p : packed) doubles.push_back(unpack_ring(p));
+
+    const std::vector<int> around = enclosing_rings(packed);
+    CHECK(around == std::vector<int>({-1, 0, 1, -1, 3, -1}));
+    CHECK(around == enclosing_rings(doubles));
+    const std::vector<RingSpan> whole = {{0, 5}};
+    for (size_t i = 0; i < packed.size(); i++) {
+        CHECK(signed_area2(packed[i]) == signed_area2(doubles[i]));
+        CHECK(interior_point(packed[i].data(), whole) == interior_point(doubles[i].data(), whole));
+    }
+    const std::vector<NestedPolygon<PackedLocation>> polygons = nest_rings(packed, around, ring_depths(around));
+    REQUIRE(polygons.size() == 4u);
+    CHECK(polygons[0].outer == packed[0]);
+    CHECK(polygons[0].holes == std::vector<std::vector<PackedLocation>>({packed[1]}));
+    CHECK(polygons[2].holes == std::vector<std::vector<PackedLocation>>({packed[4]}));
 }
 
 TEST(simplify_rings_turns_holes_against_the_outer_ring_and_drops_collapsed_ones) {

@@ -13,30 +13,31 @@
 #include <utility>
 #include <vector>
 
+#include "geometry.h"
 #include "polygon_rings.h"
 #include "test_framework.h"
 
 namespace {
 
 using Coord = std::pair<double, double>;
-using Ring = std::vector<Coord>;
+using Ring = std::vector<PackedLocation>;
 
-// Adds a way from a coordinate list. The node-id fields are not used by
-// assemble_outer_rings (it works purely on coordinates), so any value is
-// fine; we set them deterministically anyway.
+// Adds a way from a coordinate list, packed as the way pass stores it. The
+// node-id fields are not used by assemble_outer_rings (it works purely on
+// coordinates), so any value is fine; we set them deterministically anyway.
 void add_way(WayGeometries& geoms, int64_t way_id, const std::vector<Coord>& coords) {
     geoms.ways[way_id] = {geoms.coords.size(), static_cast<uint32_t>(coords.size()), 0, 0};
-    geoms.coords.insert(geoms.coords.end(), coords.begin(), coords.end());
+    for (const auto& [lat, lng] : coords) geoms.coords.push_back(pack_location(lat, lng));
 }
 
-// Are two coordinates equal to within float tolerance?
-bool coord_eq(const Coord& a, const Coord& b) {
-    return std::fabs(a.first - b.first) < 1e-9 &&
-           std::fabs(a.second - b.second) < 1e-9;
+// Is a ring vertex at this coordinate (to within float tolerance)?
+bool coord_eq(const PackedLocation& a, const Coord& b) {
+    return std::fabs(a.lat() - b.first) < 1e-9 &&
+           std::fabs(a.lon() - b.second) < 1e-9;
 }
 
 bool ring_is_closed(const Ring& r) {
-    return r.size() >= 4 && coord_eq(r.front(), r.back());
+    return r.size() >= 4 && r.front() == r.back();
 }
 
 }  // namespace
@@ -253,7 +254,7 @@ TEST(area_rings_split_rings_touching_at_a_node) {
     CHECK_EQ(a.rings[1].size(), size_t(6));
     for (const auto& r : a.rings) {
         CHECK(ring_is_closed(r));
-        for (size_t i = 1; i + 1 < r.size(); i++) CHECK(!coord_eq(r[i], r.front()));
+        for (size_t i = 1; i + 1 < r.size(); i++) CHECK(r[i] != r.front());
     }
 }
 
@@ -360,16 +361,16 @@ namespace {
 // The polygons nest_rings makes of a relation's rings, nested as the builder
 // nests them, and how many of them hold a point (inside the outer ring and
 // outside its holes).
-std::vector<NestedPolygon> nested(const AreaRings& a) {
+std::vector<NestedPolygon<PackedLocation>> nested(const AreaRings& a) {
     const std::vector<int> around = enclosing_rings(a.rings);
     return nest_rings(a.rings, around, ring_depths(around));
 }
 
-int polygons_holding(const std::vector<NestedPolygon>& polygons, double lat, double lng) {
+int polygons_holding(const std::vector<NestedPolygon<PackedLocation>>& polygons, double lat, double lng) {
     int n = 0;
     for (const auto& p : polygons) {
-        bool in = ring_contains_latlng(p.outer, lat, lng);
-        for (const auto& h : p.holes) in = in && !ring_contains_latlng(h, lat, lng);
+        bool in = ring_contains_latlng(unpack_ring(p.outer), lat, lng);
+        for (const auto& h : p.holes) in = in && !ring_contains_latlng(unpack_ring(h), lat, lng);
         n += in;
     }
     return n;
@@ -391,7 +392,7 @@ TEST(area_rings_rings_crossing_at_shared_nodes_take_the_even_odd_area) {
         const AreaRings a = assemble_area_rings(members, geoms);
         CHECK(a.failure == AreaFailure::None);
         CHECK_EQ(a.rings.size(), size_t(2));
-        const std::vector<NestedPolygon> polygons = nested(a);
+        const std::vector<NestedPolygon<PackedLocation>> polygons = nested(a);
         CHECK_EQ(polygons_holding(polygons, 1.5, 1.5), 0);  // the overlap
         CHECK_EQ(polygons_holding(polygons, 0.5, 0.5), 1);
         CHECK_EQ(polygons_holding(polygons, 0.5, 1.5), 1);
@@ -425,7 +426,7 @@ TEST(area_rings_enclaves_crossing_at_shared_nodes_leave_their_overlap_in) {
     add_way(geoms, 3, {{4.0, 4.0}, {4.0, 6.0}, {4.0, 8.0}, {8.0, 8.0}, {8.0, 4.0}, {6.0, 4.0}, {4.0, 4.0}});
     const AreaRings a = assemble_area_rings({{1, "outer"}, {2, "inner"}, {3, "inner"}}, geoms);
     CHECK(a.failure == AreaFailure::None);
-    const std::vector<NestedPolygon> polygons = nested(a);
+    const std::vector<NestedPolygon<PackedLocation>> polygons = nested(a);
     CHECK_EQ(polygons_holding(polygons, 5.0, 5.0), 1);  // the overlap
     CHECK_EQ(polygons_holding(polygons, 3.0, 3.0), 0);
     CHECK_EQ(polygons_holding(polygons, 7.0, 7.0), 0);
@@ -449,7 +450,7 @@ TEST(area_rings_rings_touching_at_a_node_stay_as_they_are) {
         REQUIRE(a.rings.size() == size_t(2));
         CHECK_EQ(a.rings[0].size(), size_t(5));
         CHECK_EQ(a.rings[1].size(), size_t(5));
-        const std::vector<NestedPolygon> polygons = nested(a);
+        const std::vector<NestedPolygon<PackedLocation>> polygons = nested(a);
         CHECK_EQ(polygons.size(), size_t(2));
         CHECK_EQ(polygons_holding(polygons, 0.5, 0.5), 1);
         CHECK_EQ(polygons_holding(polygons, 1.5, 1.5), 1);
@@ -459,7 +460,7 @@ TEST(area_rings_rings_touching_at_a_node_stay_as_they_are) {
         const AreaRings a = assemble_area_rings(members, geoms);
         CHECK(a.failure == AreaFailure::None);
         REQUIRE(a.rings.size() == size_t(2));
-        const std::vector<NestedPolygon> polygons = nested(a);
+        const std::vector<NestedPolygon<PackedLocation>> polygons = nested(a);
         REQUIRE(polygons.size() == size_t(1));
         CHECK_EQ(polygons[0].holes.size(), size_t(1));
         CHECK_EQ(polygons_holding(polygons, 3.0, 5.0), 0);
@@ -486,7 +487,7 @@ TEST(area_rings_drop_coordinates_repeated_in_a_row) {
     CHECK(a.failure == AreaFailure::None);
     REQUIRE(a.rings.size() == size_t(1));
     CHECK_EQ(a.rings[0].size(), outline.size() + 1);
-    const std::vector<NestedPolygon> polygons = nested(a);
+    const std::vector<NestedPolygon<PackedLocation>> polygons = nested(a);
     CHECK_EQ(polygons_holding(polygons, 20.0, 20.0), 1);
     CHECK_EQ(polygons_holding(polygons, 50.0, 50.0), 0);
 }
