@@ -204,9 +204,12 @@ the tier sizes before it, which the patch carries.
 - **Shipped tier**: a `strings_<tier>.bin` the old and new dir both hold
   (empty files count). The patch sends its string diff and size and hash
   stamps; the patcher rebuilds it and derives its remap runs from the same
-  walk, checking each looked-up offset is a string start. A string a tier's
-  order moves past others is deleted and added, and its offset travels as a
-  pair. A tier
+  walk, checking each looked-up offset is a string start. The tiers are
+  sorted alphabetically except the POI tier, which is in POI record order
+  (the names of POI tier 0, 1, 2, 3 in turn, each at its first record of
+  that tier, so a reader walking the records reads the names front to
+  back). A string a tier's order moves past others is deleted and added,
+  and its offset travels as a pair. A tier
   only the new dir holds is newly shipped: it counts as unshipped in the
   strings section, and its file comes whole in a full-replacement section.
 - **Referenced tier**: a tier that some string field of the dir's own old

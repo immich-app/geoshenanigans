@@ -1763,8 +1763,10 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             if (rel.rfind(output_dir, 0) == 0) rel = rel.substr(output_dir.size());
             region_prev = prev_output_dir + rel;
         }
-        if (run == RegionRun::Continent)
+        if (run == RegionRun::Continent) {
             timed_phase("    " + region + ": strategy2 remap", [&] { apply_strategy2_remaps(d, region_prev, order); });
+            timed_phase("    " + region + ": poi names in record order", [&] { order_poi_strings_by_record(d); });
+        }
 
         auto write_modes = [&] {
             if (multi_output) {
@@ -2103,6 +2105,9 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
         timed_phase("    planet: strategy2 remap", [&] {
             apply_strategy2_remaps(data, planet_prev, RunOrder::Concurrent, &remap_budget);
         });
+        // Like the remap, before the planet write and the continent filters
+        // read the records and the pool.
+        timed_phase("    planet: poi names in record order", [&] { order_poi_strings_by_record(data); });
     }
     // Expose the prev-output root to write_index via env var so the
     // postcode_centroids strategy-2 pass (which runs inside write_index after

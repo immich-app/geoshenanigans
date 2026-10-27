@@ -219,6 +219,9 @@ constexpr const char* STR_TIER_FILENAMES[STR_TIER_COUNT] = {
 constexpr const char* STR_TIER_NAMES[STR_TIER_COUNT] = {
     "core", "street", "addr", "postcode", "poi"
 };
+// The POI names' tier, the one tier not in alphabetical order (see
+// order_poi_strings_by_record).
+constexpr size_t STR_TIER_POI = 4;
 
 // Home tier of a string from its consumer mask. The mode tiers nest by who
 // downloads them (core: every mode; postcode: admin and up; street:
@@ -412,6 +415,10 @@ struct ParsedData {
     // back to back, so a global offset still resolves into it.
     std::array<std::vector<char>, STR_TIER_COUNT> strings_tiers;
     std::array<uint32_t, STR_TIER_COUNT + 1> strings_tier_bases{};
+    // Per POI tier t, the bytes at the head of the POI string tier that hold
+    // every name a POI of tier <= t uses (order_poi_strings_by_record puts
+    // them first; the whole tier until it runs).
+    std::array<uint32_t, POI_MAX_SHIPPED_TIER + 1> poi_tier_string_ends{};
 
     // Look up a string by its global offset (post-partition).  Returns
     // nullptr if the offset is NO_DATA or out of range.
@@ -494,7 +501,8 @@ inline RankedBits string_starts(const std::vector<char>& pool, unsigned threads 
 }
 
 // Partition the string pool in `data` into 5 per-consumer tiers, sorting
-// alphabetically within each, and remap all record name_id fields to the
+// alphabetically within each (order_poi_strings_by_record later lays the POI
+// tier out by record), and remap all record name_id fields to the
 // new globally-contiguous offset space. Used by both the canonical sort
 // step (applied to the full planet pool) and continent filter (applied
 // per-continent subset after a flat pool is rebuilt).  Each string goes
@@ -643,6 +651,7 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
 
     data.strings_tiers = std::move(tier_bufs);
     data.strings_tier_bases = bases;
+    data.poi_tier_string_ends.fill(static_cast<uint32_t>(data.strings_tiers[STR_TIER_POI].size()));
 
     // Rebuild pool_data as concat-of-tiers so legacy reads (pool_data.data()
     // + global_offset) still resolve correctly. Cheap vs. updating every
@@ -708,6 +717,104 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
         }
         accum = std::move(remapped);
     }
+}
+
+// Lays the POI tier out in POI record order, so a reader walking the records
+// (the place search build) reads their names front to back instead of all
+// over the tier. A name's home is the lowest POI tier of a shipped record
+// using it; the names of each home tier sit together, lowest tier first, each
+// where the first record of its home tier using it sits in the records'
+// final order. So the names of the POIs of tier <= t are the head of the
+// tier (poi_tier_string_ends[t]). Run once the records stop moving (strategy
+// 2). Each name keeps its one copy and the tier its size, so no offset outside
+// the tier moves; a name no shipped record uses (none in a build) goes last,
+// in its old order.
+inline void order_poi_strings_by_record(ParsedData& data, unsigned threads = 0) {
+    std::vector<char>& tier = data.strings_tiers[STR_TIER_POI];
+    if (tier.empty()) return;
+
+    const uint32_t base = data.strings_tier_bases[STR_TIER_POI];
+    std::vector<char>& pool = data.string_pool.mutable_data();
+    if (pool.size() != data.strings_tier_bases[STR_TIER_COUNT] ||
+        base + tier.size() != data.strings_tier_bases[STR_TIER_POI + 1])
+        throw std::logic_error("order_poi_strings_by_record: the pool is not the tiers back to back");
+
+    const RankedBits starts = string_starts(tier, threads);
+    const size_t n = starts.count();
+    auto name_of = [&](uint32_t off) {
+        return off == NO_DATA || off < base ? RankedBits::npos : starts.index(off - base);
+    };
+    std::vector<PoiRecord>& records = data.poi_records;
+
+    std::vector<std::atomic<uint8_t>> home(n);
+    std::vector<std::atomic<uint32_t>> first(n);
+    parallel_for(n, [&](size_t b, size_t e, unsigned) {
+        for (size_t s = b; s < e; s++) {
+            home[s].store(0xFF, std::memory_order_relaxed);
+            first[s].store(NO_DATA, std::memory_order_relaxed);
+        }
+    }, threads);
+    auto shipped_name = [&](size_t i) {
+        return records[i].tier <= POI_MAX_SHIPPED_TIER ? name_of(records[i].name_id) : RankedBits::npos;
+    };
+    parallel_for(records.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t i = b; i < e; i++) {
+            const size_t s = shipped_name(i);
+            if (s == RankedBits::npos) continue;
+            uint8_t seen = home[s].load(std::memory_order_relaxed);
+            while (records[i].tier < seen && !home[s].compare_exchange_weak(seen, records[i].tier, std::memory_order_relaxed)) {}
+        }
+    }, threads);
+    parallel_for(records.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t i = b; i < e; i++) {
+            const size_t s = shipped_name(i);
+            if (s == RankedBits::npos || records[i].tier != home[s].load(std::memory_order_relaxed)) continue;
+            uint32_t seen = first[s].load(std::memory_order_relaxed);
+            while (i < seen && !first[s].compare_exchange_weak(seen, static_cast<uint32_t>(i), std::memory_order_relaxed)) {}
+        }
+    }, threads);
+    std::vector<uint32_t> order;
+    std::array<size_t, POI_MAX_SHIPPED_TIER + 1> group_end{};
+    for (uint8_t t = 0; t <= POI_MAX_SHIPPED_TIER; t++) {
+        const std::vector<uint32_t> group = parallel_collect<uint32_t>(records.size(), [&](size_t i, std::vector<uint32_t>& out) {
+            const size_t s = name_of(records[i].name_id);
+            if (s != RankedBits::npos && first[s].load(std::memory_order_relaxed) == i &&
+                home[s].load(std::memory_order_relaxed) == t)
+                out.push_back(static_cast<uint32_t>(s));
+        }, threads);
+        order.insert(order.end(), group.begin(), group.end());
+        group_end[t] = order.size();
+    }
+    const std::vector<uint32_t> unused =
+        parallel_filter(n, [&](size_t s) { return first[s].load(std::memory_order_relaxed) == NO_DATA; }, threads);
+    order.insert(order.end(), unused.begin(), unused.end());
+    free_storage(first);
+    free_storage(home);
+
+    const std::vector<uint32_t> old_at = starts.ones(threads);
+    const std::vector<uint32_t> at = parallel_offsets<uint32_t>(n, [&](size_t k) {
+        const uint32_t s = order[k];
+        return (s + 1 < n ? old_at[s + 1] : static_cast<uint32_t>(tier.size())) - old_at[s];
+    }, threads);
+    std::vector<char> laid;
+    parallel_resize(laid, tier.size());
+    std::vector<uint32_t> new_off(n);
+    parallel_for(n, [&](size_t b, size_t e, unsigned) {
+        for (size_t k = b; k < e; k++) {
+            std::memcpy(laid.data() + at[k], tier.data() + old_at[order[k]], at[k + 1] - at[k]);
+            new_off[order[k]] = base + at[k];
+        }
+    }, threads);
+    parallel_for(records.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t i = b; i < e; i++) {
+            const size_t s = name_of(records[i].name_id);
+            if (s != RankedBits::npos) records[i].name_id = new_off[s];
+        }
+    }, threads);
+    std::memcpy(pool.data() + base, laid.data(), laid.size());
+    tier = std::move(laid);
+    for (size_t t = 0; t < POI_MAX_SHIPPED_TIER; t++) data.poi_tier_string_ends[t] = at[group_end[t]];
+    data.poi_tier_string_ends[POI_MAX_SHIPPED_TIER] = static_cast<uint32_t>(tier.size());
 }
 
 // --- Deduplicate IDs per cell ---
