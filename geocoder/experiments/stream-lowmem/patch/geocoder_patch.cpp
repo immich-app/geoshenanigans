@@ -1268,6 +1268,9 @@ static int run(int argc, char* argv[]) {
                 // Same entities, new bytes: written like an INSERT, mapped like a MATCH.
                 size_t bytes = count * actual_stride;
                 if (pos + bytes > seq_end) throw std::runtime_error(std::string("Malformed merge sequence: ") + fname);
+                // The old records are never read: an encoded family's decoder drops them as the
+                // children's MATCH reads below make it produce them.
+                old.skip_to(old_bytes + bytes);
                 if (jc) {
                     for (uint32_t k = 0; k < count; k++) {
                         jc->before_parent_write(outf, actual_stride);
@@ -1280,7 +1283,6 @@ static int run(int argc, char* argv[]) {
                 if (track) remap.add_match(static_cast<uint32_t>(old_rec), static_cast<uint32_t>(new_rec), count);
                 written += bytes; pos += bytes;
                 old_rec += count; new_rec += count; old_bytes += bytes;
-                old.skip_to(old_bytes);
             } else {
                 throw std::runtime_error(std::string("Malformed merge sequence: ") + fname);
             }

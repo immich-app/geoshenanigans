@@ -1,8 +1,9 @@
 """test_patch_e2e.py PATCHER GC DIFF: end-to-end applies of small synthetic sets.
 
-PATCHER: the experiment's geocoder-patch; GC: gc; DIFF: a geocoder-diff (v7 or v8). Each case makes
-an old and a new today's-format dir, diffs them, encodes the old one with gc, applies the patch to it
-(sync and --threads) and compares the new encoded set byte for byte with gc's encoding of the new dir.
+PATCHER: the experiment's geocoder-patch; GC: gc; DIFF: a geocoder-diff (v7 or v8; the REPLACE run
+case needs v8). Each case makes an old and a new today's-format dir, diffs them, encodes the old one
+with gc, applies the patch to it (sync and --threads) and compares the new encoded set byte for byte
+with gc's encoding of the new dir.
 """
 import fcntl
 import os
@@ -51,6 +52,18 @@ def geo_dir(d, cells, ways=1000):
     (d / 'street_entries.bin').write_bytes(bytes(entries))
     (d / 'addr_entries.bin').write_bytes(b'')
     (d / 'interp_entries.bin').write_bytes(b'')
+
+
+def ways_dir(d, names):
+    """Street ways of two nodes each, named by `names`, in one geo cell; and the identity sidecar
+    (record i is entity i) in d.meta, for a v8 diff's --identity."""
+    geo_dir(d, [(0, [0])], ways=len(names))
+    (d / 'street_ways.bin').write_bytes(b''.join(struct.pack('<IHHI', 2 * w, 2, 0, n) for w, n in enumerate(names)))
+    (d / 'street_nodes.bin').write_bytes(
+        b''.join(struct.pack('<4f', 47 + w * 1e-5, 8 + w * 1e-5, 47.001 + w * 1e-5, 8.001 + w * 1e-5) for w in range(len(names))))
+    meta = d.with_name(d.name + '.meta')
+    meta.mkdir()
+    (meta / 'street.slot.u32').write_bytes(struct.pack(f'<{len(names)}I', *range(len(names))))
 
 
 def unprivileged():
@@ -109,10 +122,12 @@ def decoder_peaks_at_most(family, limit):
     return check
 
 
-def apply_case(root, name, old, new, check=None):
+def apply_case(root, name, old, new, check=None, identity=False):
     """Diff old -> new, apply to gc's encoding of old in both modes, compare with gc's encoding of new.
-    check(stderr, threads): extra checks on the patcher's log, returning an error or ''."""
-    r = run([DIFF, str(old), str(new), '-o', str(root / f'{name}.gcpatch')])
+    check(stderr, threads): extra checks on the patcher's log, returning an error or ''. identity: diff
+    with ways_dir's sidecars."""
+    ids = ['--identity', str(old.with_name(old.name + '.meta')), str(new.with_name(new.name + '.meta'))] if identity else []
+    r = run([DIFF, str(old), str(new), '-o', str(root / f'{name}.gcpatch')] + ids)
     if r.returncode:
         errors.append(f'{name}: diff failed: {r.stderr.decode()[-500:]}')
         return
@@ -170,6 +185,17 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as scratch:
     geo_dir(root / 'geo.a', cells)
     geo_dir(root / 'geo.b', cells[:1000] + cells[19000:])
     apply_case(root, 'removed-cells', root / 'geo.a', root / 'geo.b', decoder_peaks_at_most('gxc', 1 << 20))
+    # A parent's REPLACE run (v8: the same street ways, renamed) whose children stay one MATCH run: the
+    # old records are dropped as the node reads make the shared decoder produce them, not queued for
+    # the whole run (2.4 MB of them).
+    if '--identity' in run([DIFF]).stderr.decode():
+        names = list(range(200000))
+        ways_dir(root / 'named.a', names)
+        ways_dir(root / 'named.b', [n + 1000000 for n in names])
+        apply_case(root, 'replaced-parents', root / 'named.a', root / 'named.b', decoder_peaks_at_most('streets', 1 << 20),
+                   identity=True)
+    else:
+        print('replaced-parents: SKIP, a v7 diff writes no REPLACE runs')
 
     # A streamed output whose reader goes away fails the run (the entry pipeline's four outputs were
     # closed unchecked): geo_cells.bin is a FIFO whose reader closes at once, the patch rewrites 4 MiB
