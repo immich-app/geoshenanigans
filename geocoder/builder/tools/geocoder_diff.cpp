@@ -565,6 +565,13 @@ static void serialize_merge(std::vector<char>& patch, const FileMergeResult& r,
 }
 
 static std::mutex log_mutex;
+// The RSS once `after` is done. Written under log_mutex like every line the
+// merge threads log, so lines of threads running at once never split.
+static void log_rss(const char* after) {
+    const size_t mb = get_rss_mb();
+    std::lock_guard<std::mutex> lock(log_mutex);
+    std::cerr << "  RSS after " << after << ": " << mb << " MiB" << std::endl;
+}
 static void log_merge(const FileMergeResult& r) {
     // Ops and records per op kind (MATCH / INSERT / DELETE / REPLACE).
     uint64_t ops[4] = {}, recs[4] = {};
@@ -1024,7 +1031,7 @@ static int run(int argc, char* argv[]) {
         if (new_av.data) unmap_file(new_av);
         unmap_file(old_m); unmap_file(new_m);
         log_time("  group:addr_points", gs);
-        std::cerr << "  RSS after addr_points: " << get_rss_mb() << " MiB" << std::endl;
+        log_rss("addr_points");
     });
 
     // Group 2: street_ways → street_nodes
@@ -1058,7 +1065,7 @@ static int run(int argc, char* argv[]) {
             street_remap_ready.set_value();
             unmap_file(old_w); unmap_file(new_w);
             log_time("  group:streets (fallback)", gs);
-            std::cerr << "  RSS after streets: " << get_rss_mb() << " MiB" << std::endl;
+            log_rss("streets");
             return;
         }
 
@@ -1133,7 +1140,7 @@ static int run(int argc, char* argv[]) {
         }
         unmap_file(old_w); unmap_file(new_w); unmap_file(old_n); unmap_file(new_n);
         log_time("  group:streets", gs);
-        std::cerr << "  RSS after streets: " << get_rss_mb() << " MiB" << std::endl;
+        log_rss("streets");
     });
 
     // Group 3: interp_ways → interp_nodes
@@ -1189,7 +1196,7 @@ static int run(int argc, char* argv[]) {
         log_merge(res_interp_n);
         unmap_file(old_data); unmap_file(new_data); unmap_file(old_n); unmap_file(new_n);
         log_time("  group:interp", gs);
-        std::cerr << "  RSS after interp: " << get_rss_mb() << " MiB" << std::endl;
+        log_rss("interp");
     });
 
     // Group 4: admin_polygons → admin_vertices
@@ -1283,7 +1290,7 @@ static int run(int argc, char* argv[]) {
         }
         unmap_file(old_data); unmap_file(new_data); unmap_file(old_v); unmap_file(new_v);
         log_time("  group:admin", gs);
-        std::cerr << "  RSS after admin: " << get_rss_mb() << " MiB" << std::endl;
+        log_rss("admin");
     });
 
     // Group 5: poi_records → poi_vertices (may not exist in old builds)
@@ -1382,7 +1389,7 @@ static int run(int argc, char* argv[]) {
         if (old_v.data) unmap_file(old_v);
         if (new_v.data) unmap_file(new_v);
         log_time("  group:poi", gs);
-        std::cerr << "  RSS after poi: " << get_rss_mb() << " MiB" << std::endl;
+        log_rss("poi");
     });
 
     // Group 6: cell changes
@@ -1452,7 +1459,7 @@ static int run(int argc, char* argv[]) {
         if (old_data.data) unmap_file(old_data);
         if (new_data.data) unmap_file(new_data);
         log_time("  group:place", gs);
-        std::cerr << "  RSS after place: " << get_rss_mb() << " MiB" << std::endl;
+        log_rss("place");
     });
 
     t_addr.join(); t_street.join(); t_interp.join(); t_admin.join(); t_poi.join(); t_place.join(); t_cells.join();
@@ -1464,7 +1471,7 @@ static int run(int argc, char* argv[]) {
     // see an empty map → no remap applied during diff, patch applied the
     // full remap → verify mismatch (e.g. oceania/full addr_postcodes.bin
     // first_diff=267889).
-    std::cerr << "  RSS after merge phase: " << get_rss_mb() << " MiB" << std::endl;
+    log_rss("merge phase");
 
     // Parent-id remap section. Emitted FIRST so it's loaded before any
     // merge section that consumes it during MATCH replay:
@@ -1572,7 +1579,7 @@ static int run(int argc, char* argv[]) {
     { std::vector<char>().swap(res_poi_v.seq.data); }
     serialize_merge(patch, res_place_n, old_dir, new_dir);
     malloc_trim(0); // return freed heap to OS
-    std::cerr << "  RSS after serialize: " << get_rss_mb() << " MiB" << std::endl;
+    log_rss("serialize");
     double t0 = now_ms();
 
     // ID remaps were pre-computed in the parallel merge groups.
@@ -1721,7 +1728,7 @@ static int run(int argc, char* argv[]) {
     unmap_file(new_se_m); unmap_file(new_ae_m); unmap_file(new_ie_m);
     malloc_trim(0);
     log_time("Streaming entry corrections", t1);
-    std::cerr << "  RSS after geo corrections: " << get_rss_mb() << " MiB" << std::endl;
+    log_rss("geo corrections");
 
     // Corrections for a cell index the patcher rebuilds from an id remap
     // (admin / POI / place): a per-cell delta from the rebuilt lists, or, for
