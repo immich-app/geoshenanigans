@@ -6,6 +6,8 @@ pub mod build;
 pub mod constants;
 pub mod entities;
 pub mod extras;
+#[cfg(test)]
+mod fixture;
 pub mod model;
 pub mod normalize;
 pub mod query;

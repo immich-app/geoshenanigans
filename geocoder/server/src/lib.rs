@@ -6072,6 +6072,79 @@ mod pure_helper_tests {
         // Declared more vertices than the buffer holds -> None.
         assert!(decode_polygon_verts(&src, 0, 5).is_none());
     }
+
+    // A polygon buffer of `verts` in encoding `enc`, the bbox minimum as the delta base.
+    fn encode_poly(enc: u8, verts: &[NodeCoord]) -> Vec<u8> {
+        let bmin_lat = verts.iter().map(|v| v.lat).fold(f32::MAX, f32::min);
+        let bmin_lng = verts.iter().map(|v| v.lng).fold(f32::MAX, f32::min);
+        let delta = |x: f32, min: f32| ((x - min) as f64 / vertex_scale(enc)).round() as u64;
+        let mut packed = Vec::new();
+        for v in verts {
+            match enc {
+                4 => [v.lat.to_le_bytes(), v.lng.to_le_bytes()].iter().for_each(|b| packed.extend_from_slice(b)),
+                3 => [delta(v.lat, bmin_lat), delta(v.lng, bmin_lng)]
+                    .iter()
+                    .for_each(|&d| packed.extend_from_slice(&u32::try_from(d).unwrap().to_le_bytes())),
+                _ => [delta(v.lat, bmin_lat), delta(v.lng, bmin_lng)]
+                    .iter()
+                    .for_each(|&d| packed.extend_from_slice(&u16::try_from(d).unwrap().to_le_bytes())),
+            }
+        }
+        build_poly_buf(enc, bmin_lat, bmin_lng, &packed)
+    }
+
+    #[test]
+    fn point_in_encoded_polygon_matches_the_decoded_ray_cast() {
+        // The keyhole square with two holes, scaled into each encoding's delta range.
+        let (outer, holes) = square_with_two_holes();
+        let unit = keyhole(&outer, &holes);
+        // Inside, in each hole, outside on three sides, on the keyhole connectors.
+        let probes = [
+            ((1.0, 1.0), true), ((5.0, 9.0), true), ((3.0, 3.0), false), ((6.5, 6.0), false), ((11.0, 5.0), false),
+            ((5.0, -1.0), false), ((-1.0, 5.0), false), ((0.5, 2.0), true), ((5.0, 2.0), true), ((1.0, 5.0), true),
+        ];
+        for (enc, extent) in [(0u8, 0.5f32), (1, 5.0), (2, 0.05), (3, 10.0), (4, 10.0)] {
+            let k = extent / 10.0;
+            let at = |lat: f32, lng: f32| nc(40.0 + lat * k, -3.0 + lng * k);
+            let verts: Vec<NodeCoord> = unit.iter().map(|p| at(p.lat, p.lng)).collect();
+            // At an odd byte offset, behind another record's bytes.
+            let mut buf = vec![0xAB; 7];
+            let off = buf.len() as u32;
+            buf.extend(encode_poly(enc, &verts));
+            let src = FileBytes::Owned(buf);
+            let n = verts.len() as u32;
+            let decoded = decode_polygon_verts(&src, off, n).unwrap();
+            let mut points: Vec<(NodeCoord, Option<bool>)> =
+                probes.iter().map(|&((lat, lng), inside)| (at(lat, lng), Some(inside))).collect();
+            // On the boundary: every decoded vertex and edge midpoint.
+            for (i, v) in decoded.iter().enumerate() {
+                let w = decoded[(i + 1) % decoded.len()];
+                points.extend([(*v, None), (nc((v.lat + w.lat) / 2.0, (v.lng + w.lng) / 2.0), None)]);
+            }
+
+            for (p, inside) in points {
+                let got = point_in_encoded_polygon(&src, off, n, p.lat, p.lng);
+
+                assert_eq!(got, Some(point_in_polygon(p.lat, p.lng, &decoded)), "enc {enc} at ({}, {})", p.lat, p.lng);
+                if let Some(inside) = inside {
+                    assert_eq!(got, Some(inside), "enc {enc} at ({}, {})", p.lat, p.lng);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn point_in_encoded_polygon_is_none_where_the_decoder_is() {
+        let square = unit_square();
+        let src = FileBytes::Owned(encode_poly(1, &square));
+        let len = src.len() as u32;
+        assert_eq!(point_in_encoded_polygon(&src, 0, 4, 0.5, 0.5), Some(true));
+        // No vertices, no record, a header past the end, more vertices than the buffer holds.
+        for (off, n) in [(0, 0), (NO_DATA, 1), (len - 5, 1), (0, 5)] {
+            assert_eq!(point_in_encoded_polygon(&src, off, n, 0.5, 0.5), None, "offset {off} count {n}");
+            assert!(decode_polygon_verts(&src, off, n).is_none(), "offset {off} count {n}");
+        }
+    }
 }
 
 /// Query-path tests: a small index in the builder's file layout, written by
