@@ -4854,6 +4854,27 @@ mod pure_helper_tests {
     }
 
     #[test]
+    fn current_boundaries_gate_suburbs_by_the_promoted_rank_20_boundary() {
+        // An admin_level 6 boundary linked to a city ranks 16, so levels 7
+        // to 10 below it rank 18, 20, 22 and 24 (default ranks 14 to 20):
+        // suburb nodes are gated by level 8, not by level 10 at its default
+        // rank 20; quarters by level 9, neighbourhoods by level 10.
+        let level = |admin_level: u8, rank_address: u8, area: f32, place_type_override: u8| RankedPoly {
+            poly: AdminPolygon { area, place_type_override, ..boundary(admin_level as u32, admin_level) },
+            rank_address,
+        };
+        let ranked = vec![
+            level(10, 20, 1.0, 0), level(9, 18, 2.0, 0), level(8, 16, 4.0, 0),
+            level(7, 14, 8.0, 0), level(6, 12, 16.0, 1), level(2, 4, 1000.0, 0),
+        ];
+        let found = CurrentBoundaries::from_ranked(ranked, [].iter());
+        let gate = |rank| found.for_rank(rank).map(|p| p.admin_level);
+        assert_eq!(gate(CurrentBoundaries::SUBURB), Some(8));
+        assert_eq!(gate(CurrentBoundaries::QUARTER), Some(9));
+        assert_eq!(gate(CurrentBoundaries::NEIGHBOURHOOD), Some(10));
+    }
+
+    #[test]
     fn current_boundaries_are_empty_without_a_containing_boundary() {
         let found = CurrentBoundaries::pick([]);
         assert_eq!(names(&found), [None, None, None]);
