@@ -84,9 +84,18 @@ bool write_dir(const std::string& path, const BuildDir& files) {
     return true;
 }
 
-// Runs cmd with its output appended to log; true on exit status 0.
-bool run(const std::string& cmd, const std::string& log) {
-    return std::system((cmd + " >> '" + log + "' 2>&1").c_str()) == 0;
+// s as one shell word.
+std::string quoted(const std::string& s) {
+    std::string out = "'";
+    for (char c : s) out += c == '\'' ? std::string("'\\''") : std::string(1, c);
+    return out + "'";
+}
+
+// Runs the words with their output appended to log; true on exit status 0.
+bool run(const std::vector<std::string>& words, const std::string& log) {
+    std::string cmd;
+    for (const auto& w : words) cmd += quoted(w) + " ";
+    return std::system((cmd + ">> " + quoted(log) + " 2>&1").c_str()) == 0;
 }
 
 // Diffs old -> new, applies the patch to old and lists every file of the
@@ -99,9 +108,9 @@ std::vector<std::string> round_trip_mismatches(const BuildDir& old_files, const 
     const std::string patch = dir.path() + "/p.gcpatch", log = dir.path() + "/tools.log";
     std::vector<std::string> bad;
     if (!write_dir(old_dir, old_files) || !write_dir(new_dir, new_files)) bad.push_back("fixture not written");
-    else if (!run(std::string(GEOCODER_DIFF_BIN) + " '" + old_dir + "' '" + new_dir + "' -o '" + patch + "'", log))
+    else if (!run({GEOCODER_DIFF_BIN, old_dir, new_dir, "-o", patch}, log))
         bad.push_back("diff failed");
-    else if (!run(std::string(GEOCODER_PATCH_BIN) + " '" + old_dir + "' '" + patch + "' -o '" + out_dir + "'", log))
+    else if (!run({GEOCODER_PATCH_BIN, old_dir, patch, "-o", out_dir}, log))
         bad.push_back("patch failed");
     else {
         for (const auto& [name, bytes] : new_files)
