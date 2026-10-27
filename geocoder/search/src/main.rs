@@ -171,23 +171,14 @@ fn cmd_query(args: &[String]) {
         let results: Vec<_> = found
             .iter()
             .map(|f| {
-                let c = &f.ctx;
-                json!({
-                    "name": f.name,
-                    "latitude": f.lat,
-                    "longitude": f.lng,
-                    "admin1name": c.state,
-                    "admin2name": if !c.county.is_empty() { c.county } else { c.district },
-                    "country": c.country,
-                    "country_code": std::str::from_utf8(&c.cc).unwrap_or(""),
-                    "kind": f.kind.letter().to_string(),
-                    "type": f.typ,
-                    "score": f.hit.score,
-                    "text": f.hit.text,
-                    "context": f.hit.context,
-                    "class": f.hit.class,
-                    "entity": f.hit.entity,
-                })
+                let mut r = f.to_json();
+                r["kind"] = json!(f.kind.letter().to_string());
+                r["score"] = json!(f.hit.score);
+                r["text"] = json!(f.hit.text);
+                r["context"] = json!(f.hit.context);
+                r["class"] = json!(f.hit.class);
+                r["entity"] = json!(f.hit.entity);
+                r
             })
             .collect();
         json!({"q": q, "us": us, "reverse_lookups": st.reverse_lookups, "context_checks": st.context_checks,
