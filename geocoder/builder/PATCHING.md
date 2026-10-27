@@ -49,7 +49,25 @@ Most of the old bytes were bookkeeping the patcher can derive:
 - far merge jumps need a run of matches behind them (duplicates no longer
   re-send thousands of records); POI entries remap their interior flag
 
-The tables below predate these changes.
+### GCPATCH v8 on planet (2026-10-11 → 12 and 10-12 → 13)
+
+v8 matches street / interp / addr records across days by a server-side
+identity sidecar instead of by content (`geocoder-diff --identity`; on the
+published stable-slot days the key is the slot, see
+`tools/gen_identity_sidecar.py`). Measured 2026-10-14 on planet/full of the
+published days against the nightly's v7 patches (cold cache, `geocoder-patch`
+on 1 core, every apply byte-identical to the new day):
+
+| planet/full | v7 patch | v8 patch | v7 apply CPU | v8 apply CPU | v7 diff CPU / RSS | v8 diff CPU / RSS |
+|-------------|----------|----------|--------------|--------------|-------------------|-------------------|
+| 10-12 → 13 | 3.73 MiB | **3.29 MiB** (−11.8%) | 212 s | **167 s** (−21%) | 388 s / 39.5 GiB | 221 s / 24.9 GiB |
+| 10-11 → 12 | 2.78 MiB | **2.46 MiB** (−11.6%) | 209 s | **165 s** (−21%) | 390 s / 36.7 GiB | 211 s / 24.9 GiB |
+
+planet/quality/uncapped and planet/poi/all patch to within a few bytes of v7
+(no street / interp / addr records). Without `--identity` the families merge
+by content as in v7, with the rest of the v8 format.
+
+The tables below predate all of these changes.
 
 ### Europe (7 GiB dataset)
 
@@ -203,14 +221,15 @@ Dirs patched on different days don't fit together: the server combines a
 mode dir with a quality or poi dir by global string offsets, so the selected
 dirs must all be patched to the same date and swapped in together.
 
-## Patch Format (.gcpatch, version 7)
+## Patch Format (.gcpatch, version 8)
 
 Whole file is zstd-compressed for transport. Internal structure (all integers
 little-endian; the header, client files, old file sizes and strings sections
 are read by position, everything after them by marker):
 
 ```
-Header: "GCPATCH\0" (8) + version=7 (u32) + flags=0 (u32)
+Header: "GCPATCH\0" (8) + version=8 (u32) + flags=0 (u32)
+  (a v8 patcher accepts only v8 patches; the v8 changes are marked below)
 
 Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
   + n × {name_len:u16, name, size:u64, inline:u8, [bytes] if inline}
@@ -242,18 +261,33 @@ Strings: marker 0xFFFFFFF6 (u32)
 Parent-id remap: marker 0xFFFFFFF3 (u32)
   + n_admin (u32) + [(old:u32, new:u32)] × n_admin
   + n_street (u32) + [(old:u32, new:u32)] × n_street + 0 (u32, reserved)
+  (v8: the street pairs are only the ways no MATCH / REPLACE run maps, the
+  moved and secondary-matched ones; the patcher derives the rest of the
+  street remap from the street_ways replay)
 
 Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64) + ...
   (the patcher refuses an old file of another size, 0 meaning absent)
   stride=0: full replacement (n_fixups=0 u32, size u64, data)
   stride=0xFD: unchanged, copy from cur_dir
   stride=0xFC: sparse delta (value_stride, remap_kind, n, [(pos, value)] × n)
+  stride=0xFA (v8): parallel delta for a per-record side file (way_parents,
+    way_postcodes, addr_postcodes, interp_postcodes), rebuilt along its
+    parent's merge: parent_file_id u32, value_stride u32 = 4, remap_kind u32,
+    n_inserted u32 + [value u32], n_changes u32 + [(pos u32, value u32)].
+    MATCH / REPLACE copy the old value (remapped), INSERT takes the next
+    inserted value, DELETE skips one; then the changes overwrite positions
+    of the new file. A parent sent unchanged counts as one MATCH.
   stride=0xFB: cell list delta for <name>_cells.bin + <name>_entries.bin
     (payload_size u64, new entries size u64, n_removed u32 + [cell u64],
     n_set u32 + [cell u64, n_lost u32, n_gained u32, lost ids, gained ids])
   otherwise: n_runs (u32) + n_values (u32) + runs_size (u32) + values_size (u32)
     + runs + values + seq_size (u64) + merge ops
   Ops: MATCH(count:u32) | INSERT(count:u32, data) | DELETE(count:u32)
+    | REPLACE(count:u32, data) (v8: the same entities with new bytes, written
+    like an INSERT, mapped old → new like a MATCH)
+  Order (v8): street ways and nodes, interp ways and nodes, then addr
+  points, whose parent_way_id the patcher moves through the street replay's
+  remap.
   Offset fixups (node_offset / vertex_offset of MATCH records, see
   OffsetFixups in tools/patch_format.h): runs of varint (records skipped since
   the previous run, run length, zigzag change of the shift); the patcher adds
@@ -266,13 +300,16 @@ Cell Changes: marker 0xFFFFFFFB/FA/F5/F4 (geo/admin/poi/place) + n_added (u32)
 Secondary ID Remap: marker 0xFFFFFFF6 (u32) + n_files (u32)
   per file: file_id (u32) + n_pairs (u32) + [(old_id:u32, new_id:u32)] × n_pairs
   Recovers old→new mappings for modified records (matched by relaxed key)
+  (v8: the street_ways list is empty when its pairs went in the parent-id
+  remap)
 
 Geo Entry Deltas (street / addr / interp entries): marker 0xFFFFFFF0 (u32)
   + file_id (u32) + count (u32), then per cell in cell order:
   cell_id (u64) + n_lost (u16) + n_gained (u16) + [id:u32] × n_lost
   + [id:u32] × n_gained, turning the list the patcher derives (old list,
   ids remapped) into the new one. n_lost 0xFFFF: the gained ids are the
-  whole new list.
+  whole new list. v8: an old id the remap doesn't map is a deleted record
+  and drops out of the derived list.
 
 Entry Corrections: marker 0xFFFFFFF8 (u32) + file_id (u32) + count (u32)
   + [(cell_id:u64, entry_count:u16, [id:u32] × entry_count)] × count

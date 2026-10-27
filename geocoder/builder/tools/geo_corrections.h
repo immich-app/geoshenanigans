@@ -38,12 +38,21 @@ inline GeoEntryCorrections geo_entry_corrections(uint32_t file_id, GeoCells old_
                                                  const std::vector<uint64_t>& added,
                                                  const std::vector<uint64_t>& removed,
                                                  ByteSpan old_entries, ByteSpan new_entries, size_t geo_off_pos,
-                                                 const std::vector<uint32_t>& id_rm, unsigned threads = 0) {
+                                                 const std::vector<uint32_t>& id_rm, unsigned threads = 0,
+                                                 bool drop_unmapped = false) {
     constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
-    // Remap IDs in-place using vector remap (O(1) per ID)
-    auto remap_ids_vec = [](std::vector<uint32_t>& ids, const std::vector<uint32_t>& rm) {
-        for (auto& id : ids)
-            if (id < rm.size() && rm[id] != NO_DATA) id = rm[id];
+    // Remap IDs in-place using vector remap (O(1) per ID). v8: an id the
+    // remap doesn't map (a deleted record) drops out of the derived list.
+    auto remap_ids_vec = [drop_unmapped](std::vector<uint32_t>& ids, const std::vector<uint32_t>& rm) {
+        if (drop_unmapped) {
+            size_t w = 0;
+            for (uint32_t id : ids)
+                if (id < rm.size() && rm[id] != NO_DATA) ids[w++] = rm[id];
+            ids.resize(w);
+        } else {
+            for (auto& id : ids)
+                if (id < rm.size() && rm[id] != NO_DATA) id = rm[id];
+        }
         std::sort(ids.begin(), ids.end());
     };
     std::vector<uint64_t> removed_sorted(removed);

@@ -7,7 +7,13 @@
 //
 // Patch format: custom binary, zstd-compressed as a whole for transport.
 //
-// Usage: geocoder-diff <old-dir> <new-dir> -o <patch-file>
+// Usage: geocoder-diff <old-dir> <new-dir> -o <patch-file> [--identity OLD_META NEW_META]
+//
+// GCPATCH v8: with --identity, street / interp / addr records match across
+// days by the server-side identity sidecars <META>/{street,interp,addr}.slot.u32
+// (record id -> stable entity key; tools/gen_identity_sidecar.py writes them
+// for stable-slot days), not by content; see build_identity_merge_seq and
+// PARALLEL_DELTA_STRIDE. Without --identity the families merge by content.
 
 #include <algorithm>
 #include <array>
@@ -35,6 +41,7 @@
 
 #include "cell_id_diff.h"
 #include "geo_corrections.h"
+#include "identity_sidecar.h"
 #include "merge_sequence.h"
 #include "parallel.h"
 #include "patch_format.h"
@@ -44,6 +51,13 @@
 // Sentinel meaning "no offset / no data / unmapped id" in cell offset fields
 // and id-remap tables. Emitted/compared as a raw uint32_t.
 static constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
+
+// Section offset probes for the section-size breakdown (built with -DSEC_PROBES).
+#ifdef SEC_PROBES
+#define SEC(label) (std::cerr << "SEC " << label << " " << patch.size() << std::endl)
+#else
+#define SEC(label) ((void)0)
+#endif
 
 static size_t get_rss_mb() {
     FILE* f = fopen("/proc/self/statm", "r");
@@ -320,23 +334,20 @@ static std::unordered_map<uint32_t, uint32_t> secondary_match_from_merge(
     KeyFn key_fn)
 {
     std::vector<uint32_t> del_indices, ins_indices;
-    size_t pos = 0, old_rec = 0, new_rec = 0;
-    while (pos < seq.data.size()) {
-        uint8_t op = static_cast<uint8_t>(seq.data[pos]); pos++;
-        uint32_t count; memcpy(&count, seq.data.data() + pos, 4); pos += 4;
-        if (op == OP_MATCH_RUN) {
+    size_t old_rec = 0, new_rec = 0;
+    for_each_merge_op(seq, stride, [&](uint8_t op, uint32_t count, const char*) {
+        if (op == OP_MATCH_RUN || op == OP_REPLACE_RUN) {
             old_rec += count; new_rec += count;
         } else if (op == OP_INSERT_RUN) {
             for (uint32_t k = 0; k < count; k++)
                 ins_indices.push_back(static_cast<uint32_t>(new_rec + k));
-            pos += count * stride;
             new_rec += count;
         } else if (op == OP_DELETE_RUN) {
             for (uint32_t k = 0; k < count; k++)
                 del_indices.push_back(static_cast<uint32_t>(old_rec + k));
             old_rec += count;
         }
-    }
+    });
 
     std::unordered_map<uint64_t, std::vector<uint32_t>> del_by_key, ins_by_key;
     for (uint32_t di : del_indices) {
@@ -368,23 +379,108 @@ static std::vector<uint32_t> derive_id_remap_from_merge(
     const MergeSequence& seq, size_t old_count, size_t stride)
 {
     std::vector<uint32_t> id_map(old_count, NO_DATA);
-    size_t pos = 0, old_rec = 0, new_rec = 0;
-    while (pos < seq.data.size()) {
-        uint8_t op = static_cast<uint8_t>(seq.data[pos]); pos++;
-        uint32_t count; memcpy(&count, seq.data.data() + pos, 4); pos += 4;
-        if (op == OP_MATCH_RUN) {
+    size_t old_rec = 0, new_rec = 0;
+    // REPLACE keeps the entity, so it maps like MATCH (v8).
+    for_each_merge_op(seq, stride, [&](uint8_t op, uint32_t count, const char*) {
+        if (op == OP_MATCH_RUN || op == OP_REPLACE_RUN) {
             for (uint32_t k = 0; k < count; k++)
                 if (old_rec + k < id_map.size())
                     id_map[old_rec + k] = static_cast<uint32_t>(new_rec + k);
             old_rec += count; new_rec += count;
         } else if (op == OP_INSERT_RUN) {
-            pos += count * stride;
             new_rec += count;
         } else if (op == OP_DELETE_RUN) {
             old_rec += count;
         }
-    }
+    });
     return id_map;
+}
+
+// --- Identity matching (v8) ---
+
+// A family's identity sidecar: one stable entity key (u32) per record, or
+// empty (see identity_keys).
+static std::vector<uint32_t> load_identity(const std::string& meta_dir, const char* family, size_t n_records) {
+    if (meta_dir.empty()) return {};
+    return identity_keys(read_file(meta_dir + "/" + family + ".slot.u32"), n_records);
+}
+
+// The old record of every in-order kept entity takes its new record's offset
+// field, so an unchanged record compares equal (the content-hash fixup
+// passes, without the hashing).
+static void fixup_offsets_by_identity(char* old_recs, const char* new_recs, size_t stride, size_t field,
+                                      const std::vector<uint32_t>& o, const std::vector<uint8_t>& in_order) {
+    parallel_for(o.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t j = b; j < e; j++)
+            if (in_order[j] && o[j] != NO_DATA) memcpy(old_recs + (size_t)o[j] * stride + field, new_recs + j * stride + field, 4);
+    });
+}
+
+// Offset fixups of an identity merge: only MATCH records' values matter to
+// the patcher, so every other record continues the current shift and never
+// splits a run.
+static OffsetFixups identity_offset_fixups(const std::vector<uint32_t>& old_offsets, const char* fixed_recs, size_t stride,
+                                           size_t field, const std::vector<uint8_t>& matched_old) {
+    std::vector<uint32_t> fixed(old_offsets.size());
+    uint32_t last = 0;
+    for (size_t i = 0; i < old_offsets.size(); i++) {
+        uint32_t old = old_offsets[i], cur;
+        memcpy(&cur, fixed_recs + i * stride + field, 4);
+        if (matched_old[i]) {
+            fixed[i] = cur;
+            if (old != NO_DATA && cur != NO_DATA) last = cur - old;
+        } else {
+            fixed[i] = old == NO_DATA ? NO_DATA : old + last;
+        }
+    }
+    return encode_offset_fixups(old_offsets, [&](uint32_t i) { return fixed[i]; });
+}
+
+// The identity merge of one record family: the merge, the moved records'
+// pairs and the offset fixups. old_recs must already hold the caller's
+// string / foreign-id remaps; its offset field is rewritten (restore it from
+// old_offsets for a child merge).
+struct IdentityFamily {
+    MergeSequence seq;
+    OffsetFixups fixups;
+    std::unordered_map<uint32_t, uint32_t> moved;
+    std::string stats;
+};
+static IdentityFamily identity_family(char* old_recs, size_t old_size, const char* new_recs, size_t new_size, size_t stride,
+                                      size_t offset_field, const std::vector<uint32_t>& old_offsets,
+                                      const std::vector<uint32_t>& old_key, const std::vector<uint32_t>& new_key) {
+    auto o = old_index_of_new(old_key, new_key);
+    auto in_order = identity_in_order(o);
+    fixup_offsets_by_identity(old_recs, new_recs, stride, offset_field, o, in_order);
+    auto im = build_identity_merge_seq(old_recs, old_size, new_recs, new_size, stride, o, in_order);
+    IdentityFamily f;
+    f.fixups = identity_offset_fixups(old_offsets, old_recs, stride, offset_field, im.matched_old);
+    f.seq = std::move(im.seq);
+    for (auto& [a, b] : im.moved) f.moved[a] = b;
+    f.stats = "match=" + std::to_string(im.n_match) + " replace=" + std::to_string(im.n_replace) +
+              " insert=" + std::to_string(im.n_insert) + " delete=" + std::to_string(im.n_delete) +
+              " moved=" + std::to_string(im.moved.size());
+    return f;
+}
+
+// Both files byte-identical (the patcher then copies old and derives no remap).
+static bool same_bytes(const char* a, size_t an, const char* b, size_t bn) {
+    return an == bn && (an == 0 || memcmp(a, b, an) == 0);
+}
+
+// A record file serialize_merge sends as COPY_OLD (try_emit_copy_old's test,
+// on the raw bytes): the patcher copies it, so every record keeps its id
+// whatever the string remap makes of its fields. Its merge is then one MATCH
+// of every record with no id remap and no secondary pairs, so the entry
+// corrections, the street remap of the addresses, the side files and the
+// POI / place cell indexes start from the ids the patcher keeps.
+static bool sent_unchanged(const char* a, size_t an, const char* b, size_t bn) {
+    return an > 0 && same_bytes(a, an, b, bn);
+}
+static MergeSequence match_all(size_t n_records) {
+    MergeSequence seq;
+    if (n_records) seq.add_match(static_cast<uint32_t>(n_records));
+    return seq;
 }
 
 // --- Per-file merge result (computed in parallel, serialized sequentially) ---
@@ -407,9 +503,9 @@ struct FileMergeResult {
 // returns null → same=false), so the patcher's copy from cur_dir always has a
 // real source. memcmp via mmap is cheap relative to the bytes saved.
 //
-// Safe even for data files that feed entry corrections: byte-identity of the
-// source forces an identity id_remap (the fixup passes are skipped for identical
-// files), so the patcher reconstructs dependents with the same identity remap.
+// A record file that feeds entry corrections merges as itself when unchanged
+// (sent_unchanged), so the diff derives its dependents with the ids the
+// patcher keeps.
 static bool try_emit_copy_old(std::vector<char>& patch, uint32_t fid,
                               const std::string& old_path, const std::string& new_path,
                               uint64_t old_size, uint64_t new_size, const char* log_name) {
@@ -439,6 +535,7 @@ static void serialize_merge(std::vector<char>& patch, const FileMergeResult& r,
     auto wv = [&](const void* data, size_t size) {
         patch.insert(patch.end(), (const char*)data, (const char*)data + size);
     };
+    SEC("merge:" << r.name);
     // Unchanged short-circuit: emit a copy-old marker instead of the merge
     // sequence when the file is byte-identical to old. The merge runs after
     // upstream fixups (string-pool remap, vertex_offset rewrites) that can
@@ -468,12 +565,28 @@ static void serialize_merge(std::vector<char>& patch, const FileMergeResult& r,
 }
 
 static std::mutex log_mutex;
+// The RSS once `after` is done. Written under log_mutex like every line the
+// merge threads log, so lines of threads running at once never split.
+static void log_rss(const char* after) {
+    const size_t mb = get_rss_mb();
+    std::lock_guard<std::mutex> lock(log_mutex);
+    std::cerr << "  RSS after " << after << ": " << mb << " MiB" << std::endl;
+}
 static void log_merge(const FileMergeResult& r) {
+    // Ops and records per op kind (MATCH / INSERT / DELETE / REPLACE).
+    uint64_t ops[4] = {}, recs[4] = {};
+    if (r.stride > 0)
+        for_each_merge_op(r.seq, r.stride, [&](uint8_t op, uint32_t count, const char*) {
+            if (op < 4) { ops[op]++; recs[op] += count; }
+        });
     std::lock_guard<std::mutex> lock(log_mutex);
     std::cerr << "  " << r.name << ": seq=" << r.seq.data.size()
               << " fixup_runs=" << r.fixups.n_runs << " fixup_values=" << r.fixups.n_values
+              << " fixup_bytes=" << r.fixups.runs.size() + r.fixups.values.size()
               << " (" << std::fixed << std::setprecision(2)
-              << (r.new_size > 0 ? r.seq.data.size() * 100.0 / r.new_size : 0) << "%)" << std::endl;
+              << (r.new_size > 0 ? r.seq.data.size() * 100.0 / r.new_size : 0) << "%)"
+              << " ops m/i/d/r=" << ops[0] << "/" << ops[1] << "/" << ops[2] << "/" << ops[3]
+              << " recs m/i/d/r=" << recs[0] << "/" << recs[1] << "/" << recs[2] << "/" << recs[3] << std::endl;
 }
 
 // --- Write helpers ---
@@ -536,10 +649,22 @@ static uint32_t referenced_string_tiers_of(const std::string& old_dir, const uin
 
 static int run(int argc, char* argv[]) {
     if (argc < 5 || std::string(argv[3]) != "-o") {
-        std::cerr << "Usage: geocoder-diff <old-dir> <new-dir> -o <patch-file>" << std::endl;
+        std::cerr << "Usage: geocoder-diff <old-dir> <new-dir> -o <patch-file> [--identity OLD_META NEW_META]" << std::endl;
         return 1;
     }
     std::string old_dir = argv[1], new_dir = argv[2], patch_path = argv[4];
+    std::string id_old_meta, id_new_meta;
+    for (int a = 5; a < argc; a++) {
+        if (std::string(argv[a]) == "--identity" && a + 2 < argc) { id_old_meta = argv[a + 1]; id_new_meta = argv[a + 2]; a += 2; }
+        else { std::cerr << "Unknown argument " << argv[a] << std::endl; return 1; }
+    }
+    // A family's identity sidecars when both days have one per record.
+    auto identity_of = [&](const char* family, size_t old_n, size_t new_n)
+            -> std::pair<std::vector<uint32_t>, std::vector<uint32_t>> {
+        auto ok = load_identity(id_old_meta, family, old_n), nk = load_identity(id_new_meta, family, new_n);
+        if (ok.empty() || nk.empty()) return {};
+        return {std::move(ok), std::move(nk)};
+    };
 
     // Build string remap (mmap each tier's pool — read-only sequential
     // scan) over the global-offset layout that record name_ids point into.
@@ -621,6 +746,7 @@ static int run(int argc, char* argv[]) {
 
     // Build patch data (uncompressed, will be zstd-compressed at the end)
     std::vector<char> patch;
+    if (!id_old_meta.empty()) std::cerr << "Identity sidecars: " << id_old_meta << " -> " << id_new_meta << std::endl;
     patch.insert(patch.end(), GCPATCH_MAGIC, GCPATCH_MAGIC + 8);
     uint32_t ver = GCPATCH_VERSION, flags = 0; // custom merge-sequence format
     wval(patch, &ver, 4); wval(patch, &flags, 4);
@@ -637,6 +763,7 @@ static int run(int argc, char* argv[]) {
     // The strings section (STRINGS_TIERED_MARKER). Unshipped tiers the dir's
     // own old files reference send their shift runs; scanning is skipped when
     // every non-empty tier is shipped (the full variants).
+    SEC("strings");
     {
         std::array<StringTierPools, STRING_TIER_COUNT> tiers;
         uint32_t tier_ends[STRING_TIER_COUNT];
@@ -664,6 +791,7 @@ static int run(int argc, char* argv[]) {
         unmap_file(new_tier_maps[t]);
     }
 
+    SEC("after_strings");
     // Build merge sequences for all data files in parallel (4 groups)
     // Group 1: addr_points (independent)
     // Group 2: street_ways → street_nodes (sequential within group)
@@ -773,6 +901,13 @@ static int run(int argc, char* argv[]) {
             std::exit(2);
         }
         size_t addr_stride = new_stride;
+        // Identity matching (v8) unless the files are byte-identical (the
+        // patcher then copies old and derives no remap).
+        std::pair<std::vector<uint32_t>, std::vector<uint32_t>> addr_ids;
+        if (addr_stride >= 28 && !same_bytes(old_m.data, old_m.size, new_m.data, new_m.size))
+            addr_ids = identity_of("addr", old_m.size / addr_stride, new_m.size / addr_stride);
+        const bool addr_identity = !addr_ids.first.empty();
+        const bool unchanged = sent_unchanged(old_m.data, old_m.size, new_m.data, new_m.size);
         remap_addr_points(old_m.data, old_m.size, str_remap);
         // Identify polygon-bearing addr_points across builds by polygon
         // VERTEX BYTE CONTENT (purely content-hash; key_fn returns 0 so
@@ -803,10 +938,11 @@ static int run(int argc, char* argv[]) {
             for (size_t i = 0; i < n_old; i++)
                 memcpy(&old_vert_offsets[i],
                        old_m.data + i * addr_stride + 20, 4);
-            addr_keys = v15_fixup_keys(old_m.data, old_m.size, old_av_data, old_av.size,
-                                       new_m.data, new_m.size, new_av_data, new_av.size,
-                                       addr_stride, /*off_field_pos*/ 20,
-                                       /*key_fn*/ [](const char*) -> uint64_t { return 0; });
+            if (!addr_identity && !unchanged)
+                addr_keys = v15_fixup_keys(old_m.data, old_m.size, old_av_data, old_av.size,
+                                           new_m.data, new_m.size, new_av_data, new_av.size,
+                                           addr_stride, /*off_field_pos*/ 20,
+                                           /*key_fn*/ [](const char*) -> uint64_t { return 0; });
         }
         // parent_way_id (byte 16-19) is a foreign id into street_ways.bin.
         // It shifts day-over-day whenever the way ordering changes (which
@@ -820,28 +956,42 @@ static int run(int argc, char* argv[]) {
             street_remap_future.wait();
             remap_id_field(old_m.data, old_m.size, addr_stride, 16, res_ways.id_remap);
         }
-        if (addr_stride >= 28 &&
-            !v15_fixup_skipped(old_m.data, old_m.size, old_av_data, old_av.size, new_m.data, new_m.size,
-                               new_av_data, new_av.size))
-            copy_paired_offsets(addr_keys, old_m.data, new_m.data, addr_stride, /*off_field_pos*/ 20);
-        addr_keys = {};
+        MergeSequence seq;
+        std::unordered_map<uint32_t, uint32_t> soft;
+        OffsetFixups addr_fixups;
+        if (unchanged) {
+            seq = match_all(old_m.size / addr_stride);
+        } else if (addr_identity) {
+            auto f = identity_family(old_m.data, old_m.size, new_m.data, new_m.size, addr_stride,
+                                     ADDR_POINT_VERTEX_OFFSET_OFF, old_vert_offsets, addr_ids.first, addr_ids.second);
+            seq = std::move(f.seq); addr_fixups = std::move(f.fixups); soft = std::move(f.moved);
+            std::lock_guard<std::mutex> lock(log_mutex);
+            std::cerr << "  addr_points identity: " << f.stats << std::endl;
+        } else {
+            if (addr_stride >= 28 &&
+                !v15_fixup_skipped(old_m.data, old_m.size, old_av_data, old_av.size, new_m.data, new_m.size,
+                                   new_av_data, new_av.size))
+                copy_paired_offsets(addr_keys, old_m.data, new_m.data, addr_stride, /*off_field_pos*/ 20);
+            addr_keys = {};
 
-        auto seq = build_merge_seq(old_m.data, old_m.size, new_m.data, new_m.size, addr_stride);
-        auto soft = secondary_match_from_merge(seq, old_m.data, old_m.size, new_m.data, new_m.size, addr_stride,
-            [](const char* rec) -> uint64_t {
-                uint32_t hn_id, st_id;
-                memcpy(&hn_id, rec + 8, 4); memcpy(&st_id, rec + 12, 4);
-                return ((uint64_t)st_id << 32) | hn_id;
-            });
-        auto id_rm = derive_id_remap_from_merge(seq, old_m.size / addr_stride, addr_stride);
+            seq = build_merge_seq(old_m.data, old_m.size, new_m.data, new_m.size, addr_stride);
+            soft = secondary_match_from_merge(seq, old_m.data, old_m.size, new_m.data, new_m.size, addr_stride,
+                [](const char* rec) -> uint64_t {
+                    uint32_t hn_id, st_id;
+                    memcpy(&hn_id, rec + 8, 4); memcpy(&st_id, rec + 12, 4);
+                    return ((uint64_t)st_id << 32) | hn_id;
+                });
+            // Capture vertex_offset (byte 20) fixups for the merge so the
+            // patch tool can rewrite byte 20 of each MATCH-replayed record
+            // (it reads raw OLD from disk; without the fixup the reconstructed
+            // bytes would carry OLD's vertex_offset instead of NEW's, mismatching
+            // the new file).
+            addr_fixups = collect_offset_fixups(old_vert_offsets, old_m.data, addr_stride,
+                                                ADDR_POINT_VERTEX_OFFSET_OFF);
+        }
+        auto id_rm = unchanged ? std::vector<uint32_t>{}
+                               : derive_id_remap_from_merge(seq, old_m.size / addr_stride, addr_stride);
         for (auto& [o,n] : soft) if (o < id_rm.size()) id_rm[o] = n;
-        // Capture vertex_offset (byte 20) fixups for the merge so the
-        // patch tool can rewrite byte 20 of each MATCH-replayed record
-        // (it reads raw OLD from disk; without the fixup the reconstructed
-        // bytes would carry OLD's vertex_offset instead of NEW's, mismatching
-        // the new file).
-        auto addr_fixups = collect_offset_fixups(old_vert_offsets, old_m.data, addr_stride,
-                                                 ADDR_POINT_VERTEX_OFFSET_OFF);
         res_addr = {PatchFileId::ADDR_POINTS, "addr_points.bin", addr_stride,
                     old_m.size, new_m.size, std::move(seq), std::move(addr_fixups),
                     std::move(soft), std::move(id_rm)};
@@ -881,7 +1031,7 @@ static int run(int argc, char* argv[]) {
         if (new_av.data) unmap_file(new_av);
         unmap_file(old_m); unmap_file(new_m);
         log_time("  group:addr_points", gs);
-        std::cerr << "  RSS after addr_points: " << get_rss_mb() << " MiB" << std::endl;
+        log_rss("addr_points");
     });
 
     // Group 2: street_ways → street_nodes
@@ -895,6 +1045,10 @@ static int run(int argc, char* argv[]) {
         auto [new_w, nw_fb] = try_load_with_fallback(new_dir, "street_ways.bin",
                                                       {"../full/", "../../full/"});
         street_from_fallback = (ow_fb || nw_fb);
+        const bool unchanged = !street_from_fallback && sent_unchanged(old_w.data, old_w.size, new_w.data, new_w.size);
+        std::pair<std::vector<uint32_t>, std::vector<uint32_t>> street_ids;
+        if (!street_from_fallback && !same_bytes(old_w.data, old_w.size, new_w.data, new_w.size))
+            street_ids = identity_of("street", old_w.size / way_stride, new_w.size / way_stride);
 
         // Variants without their own street_ways (admin, admin-minimal,
         // poi tiers) borrow the sibling /full/ copy. They emit no street
@@ -911,7 +1065,7 @@ static int run(int argc, char* argv[]) {
             street_remap_ready.set_value();
             unmap_file(old_w); unmap_file(new_w);
             log_time("  group:streets (fallback)", gs);
-            std::cerr << "  RSS after streets: " << get_rss_mb() << " MiB" << std::endl;
+            log_rss("streets");
             return;
         }
 
@@ -926,17 +1080,32 @@ static int run(int argc, char* argv[]) {
         size_t wn = old_w.size / way_stride;
         std::vector<uint32_t> old_offsets(wn);
         for (size_t i = 0; i < wn; i++) memcpy(&old_offsets[i], old_w.data + i * way_stride, 4);
-        fixup_way_offsets(old_w.data, old_w.size, old_n.data, old_n.size,
-                          new_w.data, new_w.size, new_n.data, new_n.size, way_stride);
-        auto fixups = collect_offset_fixups(old_offsets, old_w.data, way_stride, 0);
-        auto way_seq = build_merge_seq(old_w.data, old_w.size, new_w.data, new_w.size, way_stride);
-        auto soft = secondary_match_from_merge(way_seq, old_w.data, old_w.size, new_w.data, new_w.size, way_stride,
-            [](const char* rec) -> uint64_t {
-                uint32_t name_id; memcpy(&name_id, rec + WAY_HEADER_NAME_ID_OFF, 4);
-                uint32_t nc = record_node_count(rec);
-                return ((uint64_t)name_id << 16) | nc;
-            });
-        auto id_rm = derive_id_remap_from_merge(way_seq, old_w.size / way_stride, way_stride);
+        MergeSequence way_seq;
+        OffsetFixups fixups;
+        std::unordered_map<uint32_t, uint32_t> soft;
+        if (unchanged) {
+            way_seq = match_all(wn);
+        } else if (!street_ids.first.empty()) {
+            auto f = identity_family(old_w.data, old_w.size, new_w.data, new_w.size, way_stride, 0, old_offsets,
+                                     street_ids.first, street_ids.second);
+            way_seq = std::move(f.seq); fixups = std::move(f.fixups); soft = std::move(f.moved);
+            std::lock_guard<std::mutex> lock(log_mutex);
+            std::cerr << "  street_ways identity: " << f.stats << std::endl;
+        } else {
+            fixup_way_offsets(old_w.data, old_w.size, old_n.data, old_n.size,
+                              new_w.data, new_w.size, new_n.data, new_n.size, way_stride);
+            fixups = collect_offset_fixups(old_offsets, old_w.data, way_stride, 0);
+            way_seq = build_merge_seq(old_w.data, old_w.size, new_w.data, new_w.size, way_stride);
+            soft = secondary_match_from_merge(way_seq, old_w.data, old_w.size, new_w.data, new_w.size, way_stride,
+                [](const char* rec) -> uint64_t {
+                    uint32_t name_id; memcpy(&name_id, rec + WAY_HEADER_NAME_ID_OFF, 4);
+                    uint32_t nc = record_node_count(rec);
+                    return ((uint64_t)name_id << 16) | nc;
+                });
+        }
+        // Published to t_addr, which remaps parent_way_id by it.
+        auto id_rm = unchanged ? std::vector<uint32_t>{}
+                               : derive_id_remap_from_merge(way_seq, old_w.size / way_stride, way_stride);
         for (auto& [o,n] : soft) if (o < id_rm.size()) id_rm[o] = n;
         res_ways = {PatchFileId::STREET_WAYS, "street_ways.bin", way_stride,
                     old_w.size, new_w.size, way_seq, std::move(fixups), std::move(soft), std::move(id_rm)};
@@ -971,7 +1140,7 @@ static int run(int argc, char* argv[]) {
         }
         unmap_file(old_w); unmap_file(new_w); unmap_file(old_n); unmap_file(new_n);
         log_time("  group:streets", gs);
-        std::cerr << "  RSS after streets: " << get_rss_mb() << " MiB" << std::endl;
+        log_rss("streets");
     });
 
     // Group 3: interp_ways → interp_nodes
@@ -979,24 +1148,42 @@ static int run(int argc, char* argv[]) {
         double gs = now_ms();
         auto old_data = mmap_file_rw(old_dir + "/interp_ways.bin");
         auto new_data = mmap_file_rw(new_dir + "/interp_ways.bin");
+        std::pair<std::vector<uint32_t>, std::vector<uint32_t>> interp_ids;
+        if (!same_bytes(old_data.data, old_data.size, new_data.data, new_data.size))
+            interp_ids = identity_of("interp", old_data.size / interp_stride, new_data.size / interp_stride);
+        const bool unchanged = sent_unchanged(old_data.data, old_data.size, new_data.data, new_data.size);
         remap_string_fields(old_data.data, old_data.size, PatchFileId::INTERP_WAYS, interp_stride, str_remap);
         auto old_n = mmap_file(old_dir + "/interp_nodes.bin");
         auto new_n = mmap_file(new_dir + "/interp_nodes.bin");
         size_t n = old_data.size / interp_stride;
         std::vector<uint32_t> old_offsets(n);
         for (size_t i = 0; i < n; i++) memcpy(&old_offsets[i], old_data.data + i * interp_stride, 4);
-        fixup_interp_offsets(old_data.data, old_data.size, old_n.data, old_n.size,
-                             new_data.data, new_data.size, new_n.data, new_n.size, interp_stride);
-        auto fixups = collect_offset_fixups(old_offsets, old_data.data, interp_stride, 0);
-        auto iw_seq = build_merge_seq(old_data.data, old_data.size, new_data.data, new_data.size, interp_stride);
-        auto soft = secondary_match_from_merge(iw_seq, old_data.data, old_data.size, new_data.data, new_data.size, interp_stride,
-            [](const char* rec) -> uint64_t {
-                uint32_t street_id, start;
-                memcpy(&street_id, rec + INTERP_WAY_STREET_ID_OFF, 4);
-                memcpy(&start, rec + INTERP_WAY_STREET_ID_OFF + 4, 4);
-                return ((uint64_t)street_id << 32) | start;
-            });
-        auto id_rm = derive_id_remap_from_merge(iw_seq, old_data.size / interp_stride, interp_stride);
+        MergeSequence iw_seq;
+        OffsetFixups fixups;
+        std::unordered_map<uint32_t, uint32_t> soft;
+        if (unchanged) {
+            iw_seq = match_all(n);
+        } else if (!interp_ids.first.empty()) {
+            auto f = identity_family(old_data.data, old_data.size, new_data.data, new_data.size, interp_stride, 0,
+                                     old_offsets, interp_ids.first, interp_ids.second);
+            iw_seq = std::move(f.seq); fixups = std::move(f.fixups); soft = std::move(f.moved);
+            std::lock_guard<std::mutex> lock(log_mutex);
+            std::cerr << "  interp_ways identity: " << f.stats << std::endl;
+        } else {
+            fixup_interp_offsets(old_data.data, old_data.size, old_n.data, old_n.size,
+                                 new_data.data, new_data.size, new_n.data, new_n.size, interp_stride);
+            fixups = collect_offset_fixups(old_offsets, old_data.data, interp_stride, 0);
+            iw_seq = build_merge_seq(old_data.data, old_data.size, new_data.data, new_data.size, interp_stride);
+            soft = secondary_match_from_merge(iw_seq, old_data.data, old_data.size, new_data.data, new_data.size, interp_stride,
+                [](const char* rec) -> uint64_t {
+                    uint32_t street_id, start;
+                    memcpy(&street_id, rec + INTERP_WAY_STREET_ID_OFF, 4);
+                    memcpy(&start, rec + INTERP_WAY_STREET_ID_OFF + 4, 4);
+                    return ((uint64_t)street_id << 32) | start;
+                });
+        }
+        auto id_rm = unchanged ? std::vector<uint32_t>{}
+                               : derive_id_remap_from_merge(iw_seq, old_data.size / interp_stride, interp_stride);
         for (auto& [o,n] : soft) if (o < id_rm.size()) id_rm[o] = n;
         res_interp_w = {PatchFileId::INTERP_WAYS, "interp_ways.bin", interp_stride,
                         old_data.size, new_data.size, iw_seq, std::move(fixups), std::move(soft), std::move(id_rm)};
@@ -1009,7 +1196,7 @@ static int run(int argc, char* argv[]) {
         log_merge(res_interp_n);
         unmap_file(old_data); unmap_file(new_data); unmap_file(old_n); unmap_file(new_n);
         log_time("  group:interp", gs);
-        std::cerr << "  RSS after interp: " << get_rss_mb() << " MiB" << std::endl;
+        log_rss("interp");
     });
 
     // Group 4: admin_polygons → admin_vertices
@@ -1103,7 +1290,7 @@ static int run(int argc, char* argv[]) {
         }
         unmap_file(old_data); unmap_file(new_data); unmap_file(old_v); unmap_file(new_v);
         log_time("  group:admin", gs);
-        std::cerr << "  RSS after admin: " << get_rss_mb() << " MiB" << std::endl;
+        log_rss("admin");
     });
 
     // Group 5: poi_records → poi_vertices (may not exist in old builds)
@@ -1128,6 +1315,7 @@ static int run(int argc, char* argv[]) {
         // like name_id, so they get the same str_remap. (Previously bytes
         // 24/28 were wrongly remapped via the way-index / postcode-centroid
         // tables — see the parent-id block below, now removed.)
+        const bool unchanged = sent_unchanged(old_data.data, old_data.size, new_data.data, new_data.size);
         if (old_data.size > 0)
             remap_string_fields(old_data.data, old_data.size, PatchFileId::POI_RECORDS, poi_stride, str_remap);
 
@@ -1158,7 +1346,7 @@ static int run(int argc, char* argv[]) {
         for (size_t i = 0; i < n; i++) memcpy(&old_offsets[i], old_data.data + i * poi_stride + 8, 4);
         // v15-aware fixup: PoiRecord's vertex_offset lives at byte 8.
         // Same byte-block hash strategy as admin polygons.
-        if (old_data.size > 0 && new_data.size > 0) {
+        if (old_data.size > 0 && new_data.size > 0 && !unchanged) {
             fixup_v15_offsets(old_data.data, old_data.size, old_v.data, old_v.size,
                               new_data.data, new_data.size, new_v.data, new_v.size,
                               poi_stride, /*off_field_pos=*/8,
@@ -1170,8 +1358,8 @@ static int run(int argc, char* argv[]) {
                               });
         }
         auto fixups = collect_offset_fixups(old_offsets, old_data.data, poi_stride, POI_RECORD_VERTEX_OFFSET_OFF);
-        auto pr_seq = build_merge_seq(old_data.data, old_data.size,
-                                       new_data.data, new_data.size, poi_stride);
+        auto pr_seq = unchanged ? match_all(n)
+                                : build_merge_seq(old_data.data, old_data.size, new_data.data, new_data.size, poi_stride);
         auto soft = secondary_match_from_merge(pr_seq, old_data.data, old_data.size,
             new_data.data, new_data.size, poi_stride,
             [](const char* rec) -> uint64_t {
@@ -1201,7 +1389,7 @@ static int run(int argc, char* argv[]) {
         if (old_v.data) unmap_file(old_v);
         if (new_v.data) unmap_file(new_v);
         log_time("  group:poi", gs);
-        std::cerr << "  RSS after poi: " << get_rss_mb() << " MiB" << std::endl;
+        log_rss("poi");
     });
 
     // Group 6: cell changes
@@ -1237,6 +1425,7 @@ static int run(int argc, char* argv[]) {
             log_time("  group:place (empty)", gs);
             return;
         }
+        const bool unchanged = sent_unchanged(old_data.data, old_data.size, new_data.data, new_data.size);
         // String remap on name_id field (offset 8)
         if (old_data.size > 0)
             remap_string_fields(old_data.data, old_data.size, PatchFileId::PLACE_NODES, place_stride, str_remap);
@@ -1253,8 +1442,8 @@ static int run(int argc, char* argv[]) {
         // files are in slot order, not (type, name, lat, lng) order. The
         // key-sorted merge this replaced re-sent nearly the whole file daily
         // (planet: 3.1M of 4.1M places secondary-matched).
-        auto pn_seq = build_merge_seq(old_data.data, old_data.size,
-                                      new_data.data, new_data.size, place_stride);
+        auto pn_seq = unchanged ? match_all(old_data.size / place_stride)
+                                : build_merge_seq(old_data.data, old_data.size, new_data.data, new_data.size, place_stride);
         auto soft = secondary_match_from_merge(pn_seq, old_data.data, old_data.size,
             new_data.data, new_data.size, place_stride,
             [](const char* rec) -> uint64_t {
@@ -1270,7 +1459,7 @@ static int run(int argc, char* argv[]) {
         if (old_data.data) unmap_file(old_data);
         if (new_data.data) unmap_file(new_data);
         log_time("  group:place", gs);
-        std::cerr << "  RSS after place: " << get_rss_mb() << " MiB" << std::endl;
+        log_rss("place");
     });
 
     t_addr.join(); t_street.join(); t_interp.join(); t_admin.join(); t_poi.join(); t_place.join(); t_cells.join();
@@ -1282,7 +1471,7 @@ static int run(int argc, char* argv[]) {
     // see an empty map → no remap applied during diff, patch applied the
     // full remap → verify mismatch (e.g. oceania/full addr_postcodes.bin
     // first_diff=267889).
-    std::cerr << "  RSS after merge phase: " << get_rss_mb() << " MiB" << std::endl;
+    log_rss("merge phase");
 
     // Parent-id remap section. Emitted FIRST so it's loaded before any
     // merge section that consumes it during MATCH replay:
@@ -1319,7 +1508,9 @@ static int run(int argc, char* argv[]) {
         sparse_file_present("admin_parents.bin")  ||
         sparse_file_present("postcode_centroids.bin");
     bool has_admin_entries = sparse_file_present("admin_entries.bin");
+    bool street_pairs_in_parent_remap = false;
     if (has_poi || has_place || has_addr || has_sparse_delta_files || has_admin_entries) {
+        SEC("poi_parent_remap");
         uint32_t marker = POI_PARENT_REMAP_MARKER;
         wval(patch, &marker, 4);
         auto emit_pairs = [&](const std::vector<uint32_t>& rm) {
@@ -1337,8 +1528,20 @@ static int run(int argc, char* argv[]) {
             return n_pairs;
         };
         uint32_t na = emit_pairs(res_admin_p.id_remap);
-        // The patcher applies street pairs only to AddrPoint.parent_way_id.
-        uint32_t ns = emit_pairs(has_addr ? res_ways.id_remap : std::vector<uint32_t>{});
+        // v8: the patcher derives the street remap from the street_ways
+        // replay (sent before addr_points) and gets only the pairs no MATCH /
+        // REPLACE run gives: the moved (or secondary-matched) ways.
+        uint32_t ns = 0;
+        if (has_addr) {
+            std::vector<std::pair<uint32_t, uint32_t>> sp(res_ways.secondary_matches.begin(), res_ways.secondary_matches.end());
+            std::sort(sp.begin(), sp.end());
+            ns = static_cast<uint32_t>(sp.size());
+            wval(patch, &ns, 4);
+            for (auto& [o, n] : sp) { wval(patch, &o, 4); wval(patch, &n, 4); }
+            street_pairs_in_parent_remap = true;
+        } else {
+            wval(patch, &ns, 4);
+        }
         // Reserved postcode leg: never populated (parent_postcode_id holds a
         // string offset, remapped via str_remap, not a centroid index). Kept
         // as a literal 0 on the wire for format compatibility.
@@ -1350,6 +1553,15 @@ static int run(int argc, char* argv[]) {
     }
 
     // Serialize merge results to patch in canonical order, freeing as we go.
+    // v8: street ways go before addresses, whose parent_way_id the patcher
+    // remaps through the street replay's remap. The parent seqs stay alive
+    // for the side files (PARALLEL_DELTA_STRIDE).
+    serialize_merge(patch, res_ways, old_dir, new_dir);
+    serialize_merge(patch, res_nodes, old_dir, new_dir);
+    { std::vector<char>().swap(res_nodes.seq.data); }
+    serialize_merge(patch, res_interp_w, old_dir, new_dir);
+    serialize_merge(patch, res_interp_n, old_dir, new_dir);
+    { std::vector<char>().swap(res_interp_n.seq.data); }
     serialize_merge(patch, res_addr, old_dir, new_dir);
     // res_addr_v is built in t_addr only when the dir has address points;
     // without them it keeps stride=0 and old/new sizes 0, which we treat as
@@ -1359,12 +1571,6 @@ static int run(int argc, char* argv[]) {
         serialize_merge(patch, res_addr_v, old_dir, new_dir);
         { std::vector<char>().swap(res_addr_v.seq.data); }
     }
-    serialize_merge(patch, res_ways, old_dir, new_dir);
-    serialize_merge(patch, res_nodes, old_dir, new_dir);
-    { std::vector<char>().swap(res_nodes.seq.data); }
-    serialize_merge(patch, res_interp_w, old_dir, new_dir);
-    serialize_merge(patch, res_interp_n, old_dir, new_dir);
-    { std::vector<char>().swap(res_interp_n.seq.data); }
     serialize_merge(patch, res_admin_p, old_dir, new_dir);
     serialize_merge(patch, res_admin_v, old_dir, new_dir);
     { std::vector<char>().swap(res_admin_v.seq.data); }
@@ -1373,7 +1579,7 @@ static int run(int argc, char* argv[]) {
     { std::vector<char>().swap(res_poi_v.seq.data); }
     serialize_merge(patch, res_place_n, old_dir, new_dir);
     malloc_trim(0); // return freed heap to OS
-    std::cerr << "  RSS after serialize: " << get_rss_mb() << " MiB" << std::endl;
+    log_rss("serialize");
     double t0 = now_ms();
 
     // ID remaps were pre-computed in the parallel merge groups.
@@ -1415,6 +1621,7 @@ static int run(int argc, char* argv[]) {
     // old_geo no longer needed as a vector — streaming corrections use mmap directly
 
     // Emit cell changes
+    SEC("cell_changes");
     { uint32_t marker = CELL_CHANGES_GEO_MARKER, na = g_added.size(), nr = g_removed.size();
       wval(patch, &marker, 4); wval(patch, &na, 4); wval(patch, &nr, 4);
       for (auto c : g_added) wval(patch, &c, 8); for (auto c : g_removed) wval(patch, &c, 8);
@@ -1439,6 +1646,7 @@ static int run(int argc, char* argv[]) {
               << " admin=" << res_admin_p.secondary_matches.size()
               << " poi=" << res_poi_r.secondary_matches.size()
               << " place=" << res_place_n.secondary_matches.size() << std::endl;
+    SEC("secondary_remap");
     { uint32_t marker = SECONDARY_REMAP_MARKER; wval(patch, &marker, 4);
       auto emit_remap = [&](PatchFileId fid, const std::unordered_map<uint32_t,uint32_t>& rm) {
           uint32_t file = static_cast<uint32_t>(fid), count = rm.size();
@@ -1447,7 +1655,9 @@ static int run(int argc, char* argv[]) {
       };
       // Admin pairs travel in the parent-id remap instead.
       uint32_t n_files = 5; wval(patch, &n_files, 4);
-      emit_remap(PatchFileId::STREET_WAYS, res_ways.secondary_matches);
+      // v8: street pairs already went in the parent-id remap.
+      emit_remap(PatchFileId::STREET_WAYS, street_pairs_in_parent_remap ? std::unordered_map<uint32_t,uint32_t>{}
+                                                                         : res_ways.secondary_matches);
       emit_remap(PatchFileId::ADDR_POINTS, res_addr.secondary_matches);
       emit_remap(PatchFileId::INTERP_WAYS, res_interp_w.secondary_matches);
       emit_remap(PatchFileId::POI_RECORDS, res_poi_r.secondary_matches);
@@ -1461,8 +1671,7 @@ static int run(int argc, char* argv[]) {
     double t1 = now_ms();
 
     // Free merge sequences (already serialized to patch)
-    { std::vector<char>().swap(res_addr.seq.data); std::vector<char>().swap(res_ways.seq.data);
-      std::vector<char>().swap(res_interp_w.seq.data); std::vector<char>().swap(res_admin_p.seq.data);
+    { std::vector<char>().swap(res_admin_p.seq.data);
       std::vector<char>().swap(res_nodes.seq.data); std::vector<char>().swap(res_interp_n.seq.data);
       std::vector<char>().swap(res_admin_v.seq.data);
       std::vector<char>().swap(res_poi_r.seq.data); std::vector<char>().swap(res_poi_v.seq.data);
@@ -1497,9 +1706,14 @@ static int run(int argc, char* argv[]) {
                                       const MappedFile& old_entries, size_t geo_off_pos,
                                       const MappedFile& new_entries,
                                       const std::vector<uint32_t>& id_rm) {
+        SEC("geodelta:" << fname);
+        // v8: an old id the remap doesn't map is a deleted record and drops
+        // out (the patcher does the same when it replayed the file). A file
+        // sent unchanged has no remap and keeps every id, as its copy does.
         auto c = geo_entry_corrections(static_cast<uint32_t>(fid), {old_geo_m.data, old_nc}, {new_geo_m.data, new_nc},
                                        g_added, g_removed, {old_entries.data, old_entries.size},
-                                       {new_entries.data, new_entries.size}, geo_off_pos, id_rm);
+                                       {new_entries.data, new_entries.size}, geo_off_pos, id_rm, 0,
+                                       /*drop_unmapped*/ !id_rm.empty());
         std::cerr << "  " << fname << ": " << c.cells << " cell corrections (" << c.section.size() - 12 << " bytes)" << std::endl;
         patch.insert(patch.end(), c.section.begin(), c.section.end());
     };
@@ -1514,7 +1728,7 @@ static int run(int argc, char* argv[]) {
     unmap_file(new_se_m); unmap_file(new_ae_m); unmap_file(new_ie_m);
     malloc_trim(0);
     log_time("Streaming entry corrections", t1);
-    std::cerr << "  RSS after geo corrections: " << get_rss_mb() << " MiB" << std::endl;
+    log_rss("geo corrections");
 
     // Corrections for a cell index the patcher rebuilds from an id remap
     // (admin / POI / place): a per-cell delta from the rebuilt lists, or, for
@@ -1532,6 +1746,7 @@ static int run(int argc, char* argv[]) {
         if (write_cell_lists(new_lists) == std::make_pair(new_c, new_e)) {
             std::vector<char> payload;
             append_cell_list_delta(payload, parse_cell_lists(derived.cells_data, derived.entries_data), new_lists);
+            SEC("celldelta:" << prefix);
             uint32_t marker = CELL_INDEX_DELTA_MARKER, file = static_cast<uint32_t>(entries_fid);
             uint64_t size = payload.size();
             wval(patch, &marker, 4); wval(patch, &file, 4); wval(patch, &size, 8);
@@ -1560,6 +1775,7 @@ static int run(int argc, char* argv[]) {
                 if (!nids.empty()) buf.insert(buf.end(), (const char*)nids.data(), (const char*)nids.data()+nids.size()*4); dc++; }
         }
         for (auto& [cid, dids] : dm) { if (!nm.count(cid) && !dids.empty()) { wval(buf, &cid, 8); uint16_t c = 0; wval(buf, &c, 2); dc++; } }
+        SEC("corr:" << prefix);
         uint32_t marker = ENTRY_CORRECTION_MARKER, file = static_cast<uint32_t>(entries_fid);
         memcpy(buf.data(), &marker, 4); memcpy(buf.data()+4, &file, 4); memcpy(buf.data()+8, &dc, 4);
         patch.insert(patch.end(), buf.begin(), buf.end());
@@ -1588,6 +1804,7 @@ static int run(int argc, char* argv[]) {
     // tool, so embedding raw file bytes here does not inflate the
     // final .gcpatch much.
     auto emit_raw = [&](PatchFileId fid, const std::string& fname) {
+        SEC("raw:" << fname);
         std::string new_path = new_dir + "/" + fname;
         std::string old_path = old_dir + "/" + fname;
         struct stat nst;
@@ -1649,6 +1866,7 @@ static int run(int argc, char* argv[]) {
     //   3 = postcode_centroid     (16B struct, str_remap on bytes 8-11 only)
     auto emit_sparse_delta = [&](PatchFileId fid, const char* fname,
                                   uint32_t value_stride, uint32_t remap_kind) {
+        SEC("sparse:" << fname);
         std::string new_path = new_dir + "/" + std::string(fname);
         std::string old_path = old_dir + "/" + std::string(fname);
         struct stat nst;
@@ -1823,8 +2041,85 @@ static int run(int argc, char* argv[]) {
                   << " rle_payload=" << rle_payload_bytes << ")" << std::endl;
     };
 
-    for (const auto& f : SPARSE_DELTA_FILES)
-        emit_sparse_delta(f.fid, patch_file_names[(uint32_t)f.fid], f.value_stride, f.remap_kind);
+    // v8: a per-record side file follows its parent's merge (old values of
+    // kept records copied and remapped, inserted records' values inline),
+    // then the values that changed. Falls back to the positional sparse
+    // delta when the parent wasn't merged.
+    auto emit_parallel_delta = [&](const ParallelDeltaFile& f) {
+        const char* fname = patch_file_names[(uint32_t)f.fid];
+        std::string new_path = new_dir + "/" + fname, old_path = old_dir + "/" + fname;
+        struct stat nst, ost;
+        if (stat(new_path.c_str(), &nst) != 0) return;
+        uint64_t new_size = (uint64_t)nst.st_size;
+        uint64_t old_size = stat(old_path.c_str(), &ost) == 0 ? (uint64_t)ost.st_size : 0;
+        const FileMergeResult& parent = f.parent == PatchFileId::STREET_WAYS ? res_ways
+                                      : f.parent == PatchFileId::ADDR_POINTS ? res_addr : res_interp_w;
+        const size_t ps = parent.stride;
+        const size_t p_old = ps ? parent.old_size / ps : 0, p_new = ps ? parent.new_size / ps : 0;
+        if (ps == 0 || p_old == 0 || old_size != p_old * f.value_stride || new_size != p_new * f.value_stride) {
+            emit_sparse_delta(f.fid, fname, f.value_stride, f.remap_kind);
+            return;
+        }
+        SEC("parallel:" << fname);
+        if (try_emit_copy_old(patch, static_cast<uint32_t>(f.fid), old_path, new_path, old_size, new_size, fname))
+            return;
+        auto old_m = mmap_file(old_path);
+        auto new_m = mmap_file(new_path);
+        auto val = [](const MappedFile& m, size_t i) { uint32_t v; memcpy(&v, m.data + i * 4, 4); return v; };
+        auto remap_value = [&](uint32_t v) -> uint32_t {
+            if (v == NO_DATA) return v;
+            if (f.remap_kind == 1) {
+                if (v < res_admin_p.id_remap.size() && res_admin_p.id_remap[v] != NO_DATA) return res_admin_p.id_remap[v];
+                return v;
+            }
+            if (f.remap_kind == 2) return str_remap.map(v);
+            return v;
+        };
+        std::vector<uint32_t> ins;
+        std::vector<char> changes;
+        uint32_t n_changes = 0;
+        size_t oi = 0, ni = 0;
+        auto walk = [&](uint8_t op, uint32_t count) {
+            if (op == OP_MATCH_RUN || op == OP_REPLACE_RUN) {
+                for (uint32_t k = 0; k < count; k++) {
+                    uint32_t nv = val(new_m, ni + k);
+                    if (remap_value(val(old_m, oi + k)) != nv) {
+                        uint32_t pos32 = static_cast<uint32_t>(ni + k);
+                        changes.insert(changes.end(), (const char*)&pos32, (const char*)&pos32 + 4);
+                        changes.insert(changes.end(), (const char*)&nv, (const char*)&nv + 4);
+                        n_changes++;
+                    }
+                }
+                oi += count; ni += count;
+            } else if (op == OP_INSERT_RUN) {
+                for (uint32_t k = 0; k < count; k++) ins.push_back(val(new_m, ni + k));
+                ni += count;
+            } else if (op == OP_DELETE_RUN) {
+                oi += count;
+            }
+        };
+        // An unchanged parent's merge is one MATCH (sent_unchanged), as the
+        // patcher walks a parent it copied.
+        for_each_merge_op(parent.seq, ps, [&](uint8_t op, uint32_t count, const char*) { walk(op, count); });
+        if (oi != p_old || ni != p_new) throw std::runtime_error(std::string("Parallel delta walk mismatch: ") + fname);
+        uint32_t fid_u = (uint32_t)f.fid, stride = PARALLEL_DELTA_STRIDE, pfid = (uint32_t)f.parent;
+        uint32_t vs = f.value_stride, rk = f.remap_kind, n_ins = static_cast<uint32_t>(ins.size());
+        wval(patch, &fid_u, 4); wval(patch, &stride, 4); wval(patch, &old_size, 8); wval(patch, &new_size, 8);
+        wval(patch, &pfid, 4); wval(patch, &vs, 4); wval(patch, &rk, 4);
+        wval(patch, &n_ins, 4);
+        if (n_ins) wval(patch, ins.data(), (size_t)n_ins * 4);
+        wval(patch, &n_changes, 4);
+        patch.insert(patch.end(), changes.begin(), changes.end());
+        unmap_file(old_m); unmap_file(new_m);
+        std::cerr << "  " << fname << ": parallel delta along " << patch_file_names[pfid] << ", " << n_ins
+                  << " inserted values, " << n_changes << " changes of " << p_new << std::endl;
+    };
+    for (const auto& f : SPARSE_DELTA_FILES) {
+        if (const ParallelDeltaFile* pf = parallel_delta_file(f.fid)) emit_parallel_delta(*pf);
+        else emit_sparse_delta(f.fid, patch_file_names[(uint32_t)f.fid], f.value_stride, f.remap_kind);
+    }
+    { std::vector<char>().swap(res_addr.seq.data); std::vector<char>().swap(res_ways.seq.data);
+      std::vector<char>().swap(res_interp_w.seq.data); }
     // A cell index whose ids are strategy-2 slots barely changes day to day:
     // send the cells that lost or gained ids instead of both files.
     // Full-replacing postcode_centroid_* cost ~3.7 MiB per planet mode dir.
@@ -1846,6 +2141,7 @@ static int run(int argc, char* argv[]) {
                 uint64_t new_entries_size = new_e.size();
                 payload.insert(payload.end(), (const char*)&new_entries_size, (const char*)&new_entries_size + 8);
                 append_cell_list_delta(payload, parse_cell_lists(old_c, old_e), new_lists);
+                SEC("celllist:" << cells_name);
                 uint32_t fid = static_cast<uint32_t>(cells_fid), stride = CELL_LIST_DELTA_STRIDE;
                 uint64_t old_size = old_c.size(), new_size = new_c.size(), payload_size = payload.size();
                 wval(patch, &fid, 4); wval(patch, &stride, 4);
@@ -1923,6 +2219,7 @@ static int run(int argc, char* argv[]) {
     str_remap = SortedU32Map();
 
     // End marker
+    SEC("end");
     uint32_t end_marker = SECTION_END_MARKER;
     wval(patch, &end_marker, 4);
 

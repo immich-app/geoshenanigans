@@ -7,6 +7,10 @@
 // pipeline goes cell-by-cell. Target: <1 GiB peak RSS for planet.
 //
 // Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir>
+//
+// Reads GCPATCH v8 ( REPLACE runs, street remap derived from the
+// street_ways replay, PARALLEL_DELTA_STRIDE side files, unmapped ids dropped
+// from street / addr / interp cell lists).
 
 #include <algorithm>
 #include <array>
@@ -157,7 +161,7 @@ static int run(int argc, char* argv[]) {
     // Header
     if (memcmp(P, GCPATCH_MAGIC, 8) != 0) { std::cerr << "Bad magic" << std::endl; return 1; }
     pos = 8;
-    uint32_t ver = ru32(); if (ver < GCPATCH_MIN_READ_VERSION || ver > GCPATCH_VERSION) { std::cerr << "Bad version" << std::endl; return 1; }
+    uint32_t ver = ru32(); if (ver != GCPATCH_VERSION) { std::cerr << "Bad version" << std::endl; return 1; }
     ru32(); // flags
 
     // The exact file set out_dir must hold after the apply. Outputs the
@@ -250,6 +254,11 @@ static int run(int argc, char* argv[]) {
         if (it != v.end() && it->first == old_id) return it->second;
         return old_id;
     };
+
+    // Where each replayed file's merge sequence sits in the patch (v8 side
+    // files replay along it).
+    struct SeqRef { size_t start, size; size_t stride; };
+    std::unordered_map<uint32_t, SeqRef> merge_seqs;
 
     bool saw_end = false;
     while (pos < patch_size) {
@@ -436,6 +445,80 @@ static int run(int argc, char* argv[]) {
                       << cells_written / 12 << " cells" << section_io() << std::endl;
             continue;
         }
+        if (stride == PARALLEL_DELTA_STRIDE) {
+            // v8 side file: the parent's merge replayed at one value per
+            // record, then the changed values (see PARALLEL_DELTA_STRIDE).
+            uint32_t parent_fid = ru32(), value_stride = ru32(), remap_kind = ru32();
+            check_parallel_delta_header(file_id, parent_fid, value_stride, remap_kind);
+            uint32_t n_ins = ru32();
+            const char* ins = take((size_t)n_ins * 4, "parallel values");
+            uint32_t n_changes = ru32();
+            const char* changes = take((size_t)n_changes * 8, "parallel changes");
+            constexpr uint32_t NO_DATA_VAL = 0xFFFFFFFFu;
+            auto remap_value = [&](uint32_t v) -> uint32_t {
+                if (v == NO_DATA_VAL) return v;
+                if (remap_kind == 1) return poi_remap_lookup(poi_admin_remap, v);
+                if (remap_kind == 2) return str_remap_lookup(v);
+                return v;
+            };
+            SequentialFileReader old(cur_dir + "/" + std::string(fname));
+            FILE* out = open_out(fname);
+            std::vector<uint32_t> buf;
+            buf.reserve(1 << 18);
+            uint64_t ni = 0, oi = 0;
+            uint32_t ci = 0, ii = 0;
+            uint32_t next_change = n_changes ? 0 : NO_DATA_VAL;
+            if (n_changes) memcpy(&next_change, changes, 4);
+            auto put = [&](uint32_t v) {
+                if (ni == next_change && ci < n_changes) {
+                    memcpy(&v, changes + (size_t)ci * 8 + 4, 4);
+                    ci++;
+                    next_change = NO_DATA_VAL;
+                    if (ci < n_changes) memcpy(&next_change, changes + (size_t)ci * 8, 4);
+                }
+                buf.push_back(v);
+                ni++;
+                if (buf.size() == buf.capacity()) { fwrite(buf.data(), 4, buf.size(), out); buf.clear(); }
+            };
+            auto walk = [&](uint8_t op, uint32_t count) {
+                if (op == OP_MATCH_RUN || op == OP_REPLACE_RUN) {
+                    if ((oi + count) * 4 > old.size()) throw std::runtime_error("Malformed parallel delta");
+                    for (uint32_t k = 0; k < count; k++) {
+                        uint32_t v; memcpy(&v, old.at((oi + k) * 4, 4), 4);
+                        put(remap_value(v));
+                    }
+                    oi += count;
+                } else if (op == OP_INSERT_RUN) {
+                    if ((uint64_t)ii + count > n_ins) throw std::runtime_error("Malformed parallel delta");
+                    for (uint32_t k = 0; k < count; k++) { uint32_t v; memcpy(&v, ins + (size_t)(ii + k) * 4, 4); put(v); }
+                    ii += count;
+                } else if (op == OP_DELETE_RUN) {
+                    oi += count;
+                } else {
+                    throw std::runtime_error("Malformed parallel delta");
+                }
+            };
+            auto sit = merge_seqs.find(parent_fid);
+            if (sit == merge_seqs.end()) {
+                walk(OP_MATCH_RUN, static_cast<uint32_t>(new_size / 4));  // parent sent unchanged
+            } else {
+                size_t q = sit->second.start, qend = q + sit->second.size;
+                while (q < qend) {
+                    uint8_t op = P[q++];
+                    uint32_t count; memcpy(&count, P + q, 4); q += 4;
+                    if (op == OP_INSERT_RUN || op == OP_REPLACE_RUN) q += (size_t)count * sit->second.stride;
+                    walk(op, count);
+                }
+            }
+            if (!buf.empty()) fwrite(buf.data(), 4, buf.size(), out);
+            close_patch_output(out, fname);
+            if (ni * 4 != new_size || ci != n_changes || ii != n_ins)
+                throw std::runtime_error(std::string("Parallel delta does not match the new build: ") + fname);
+            log_rewinds(old);
+            std::cerr << "  " << fname << ": parallel delta along " << patch_file_names[parent_fid] << ", "
+                      << n_ins << " inserted, " << n_changes << " changes (" << new_size << " bytes)" << section_io() << std::endl;
+            continue;
+        }
         if (stride == SPARSE_DELTA_STRIDE) {
             // SPARSE_DELTA: position-keyed delta. Format already decoded
             // old_size + new_size above; next fields are value_stride,
@@ -494,9 +577,7 @@ static int run(int argc, char* argv[]) {
                 }
                 fwrite(buf.data(), 1, n, out);
             }
-            bool ok = !ferror(out);
-            fclose(out);
-            if (!ok) throw std::runtime_error(std::string("Cannot write ") + fname);
+            close_patch_output(out, fname);
 
             std::cerr << "  " << fname << ": sparse delta " << n_changes
                       << " changes (" << new_size << " bytes)" << section_io() << std::endl;
@@ -538,6 +619,7 @@ static int run(int argc, char* argv[]) {
         uint64_t seq_size = ru64();
         require_bytes(seq_size, "merge sequence");
         size_t seq_end = pos + seq_size;
+        merge_seqs[file_id] = {pos, (size_t)seq_size, actual_stride};
         FILE* outf = open_out(fname);
 
         // Record the old → new record ids of the files whose remap the entry
@@ -548,6 +630,14 @@ static int run(int argc, char* argv[]) {
                      file_id == (uint32_t)PatchFileId::POI_RECORDS ||
                      file_id == (uint32_t)PatchFileId::PLACE_NODES;
         RecordRemap remap(track ? static_cast<uint32_t>(n_old_records) : 0);
+        // v8: addresses' parent_way_id moves by the street replay's remap
+        // (MATCH / REPLACE runs plus the parent-id remap's moved pairs).
+        const RecordRemap* street_rm = nullptr;
+        if (file_id == (uint32_t)PatchFileId::ADDR_POINTS) {
+            auto it = record_remaps.find((uint32_t)PatchFileId::STREET_WAYS);
+            if (it != record_remaps.end()) street_rm = &it->second;
+        }
+        size_t street_hint = 0;
 
         // Per-record buffer for applying remap/fixups inline (avoid copying entire file)
         std::vector<char> rec_buf(actual_stride);
@@ -593,7 +683,7 @@ static int run(int argc, char* argv[]) {
                         modified = true;
                     // AddrPoint parent_way_id (byte 16) shifts with street id-space.
                     if (file_id == (uint32_t)PatchFileId::ADDR_POINTS &&
-                        actual_stride >= 20 && !poi_street_remap.empty())
+                        actual_stride >= 20 && (street_rm || !poi_street_remap.empty()))
                         modified = true;
                     uint32_t old_off = 0, new_off = 0;
                     if (has_fixups) {
@@ -641,11 +731,17 @@ static int run(int argc, char* argv[]) {
                         }
                         // AddrPoint parent_way_id at byte 16 (20+ stride).
                         if (file_id == (uint32_t)PatchFileId::ADDR_POINTS &&
-                            actual_stride >= 20 && !poi_street_remap.empty()) {
+                            actual_stride >= 20 && (street_rm || !poi_street_remap.empty())) {
                             constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
                             uint32_t pw; memcpy(&pw, rec_buf.data() + ADDR_POINT_PARENT_WAY_ID_OFF, 4);
                             if (pw != NO_DATA) {
-                                uint32_t npw = poi_remap_lookup(poi_street_remap, pw);
+                                uint32_t npw;
+                                if (street_rm) {
+                                    npw = street_rm->lookup(pw, street_hint);
+                                    if (npw == RecordRemap::NONE) npw = pw;
+                                } else {
+                                    npw = poi_remap_lookup(poi_street_remap, pw);
+                                }
                                 if (npw != pw) memcpy(rec_buf.data() + ADDR_POINT_PARENT_WAY_ID_OFF, &npw, 4);
                             }
                         }
@@ -666,6 +762,14 @@ static int run(int argc, char* argv[]) {
                 written += bytes; pos += bytes; new_rec += count;
             } else if (op == OP_DELETE_RUN) {
                 old_rec += count; old_bytes += count * actual_stride;
+            } else if (op == OP_REPLACE_RUN) {
+                // Same entities, new bytes: written like an INSERT, mapped like a MATCH.
+                size_t bytes = count * actual_stride;
+                if (pos + bytes > seq_end) throw std::runtime_error(std::string("Malformed merge sequence: ") + fname);
+                fwrite(P+pos, 1, bytes, outf);
+                if (track) remap.add_match(static_cast<uint32_t>(old_rec), static_cast<uint32_t>(new_rec), count);
+                written += bytes; pos += bytes;
+                old_rec += count; new_rec += count; old_bytes += bytes;
             } else {
                 throw std::runtime_error(std::string("Malformed merge sequence: ") + fname);
             }
@@ -674,6 +778,12 @@ static int run(int argc, char* argv[]) {
         if (fclose(outf) != 0 || !out_ok) throw std::runtime_error(std::string("Cannot write ") + fname);
         log_rewinds(old);
 
+        if (track && file_id == (uint32_t)PatchFileId::STREET_WAYS) {
+            // The moved ways' pairs (parent-id remap, street leg) complete
+            // the street remap the address replay reads.
+            for (const auto& [o, n] : poi_street_remap) remap.add_pair(o, n);
+            remap.finish();
+        }
         if (track) {
             record_remaps[file_id] = std::move(remap);
             std::cerr << "  " << fname << ": " << written << " bytes (remap of " << n_old_records << " records)"
@@ -765,9 +875,16 @@ static int run(int argc, char* argv[]) {
         std::vector<uint32_t> buf;
         buf.reserve(4096);
 
-        auto remap = [](std::vector<uint32_t>& ids, const RecordRemap& rm) {
+        auto remap = [&](std::vector<uint32_t>& ids, const RecordRemap& rm) {
             constexpr uint32_t NO2 = 0xFFFFFFFF;
-            for (auto& id : ids) if (id < rm.size() && rm[id] != NO2) id = rm[id];
+            if (&rm != &no_remap) {
+                // v8: an old id the replay doesn't map is a deleted record.
+                size_t w = 0;
+                for (uint32_t id : ids) { uint32_t n = rm[id]; if (n != NO2) ids[w++] = n; }
+                ids.resize(w);
+            } else {
+                for (auto& id : ids) if (id < rm.size() && rm[id] != NO2) id = rm[id];
+            }
             std::sort(ids.begin(), ids.end());
         };
         // Write entry and return offset, or NO if empty. Offsets come from a

@@ -160,6 +160,30 @@ TEST(geo_entry_corrections_ranges_tolerate_inconsistent_cell_changes) {
     }
 }
 
+TEST(geo_entry_corrections_drop_unmapped_ids_when_asked) {
+    // Old cell 5 lists ids 1 and 2; the new one lists 7. Id 1 was deleted
+    // (unmapped) and id 2 became 7: dropping unmapped ids derives the new
+    // list exactly, keeping them (v7) leaves a stale 1 to correct.
+    auto side = [](std::vector<uint32_t> ids) {
+        std::string entries, cells(20, '\0');
+        uint16_t cnt = static_cast<uint16_t>(ids.size());
+        entries.append(reinterpret_cast<const char*>(&cnt), 2);
+        for (uint32_t v : ids) entries.append(reinterpret_cast<const char*>(&v), 4);
+        uint64_t cell = 5;
+        uint32_t off = 0;
+        memcpy(&cells[0], &cell, 8);
+        memcpy(&cells[8], &off, 4);
+        return std::make_pair(cells, entries);
+    };
+    auto [oc, oe] = side({1, 2});
+    auto [nc, ne] = side({7});
+    GeoCells og{oc.data(), 1}, ng{nc.data(), 1};
+    ByteSpan oes{oe.data(), oe.size()}, nes{ne.data(), ne.size()};
+    std::vector<uint32_t> id_rm = {0xFFFFFFFFu, 0xFFFFFFFFu, 7};
+    CHECK_EQ(geo_entry_corrections(9, og, ng, {}, {}, oes, nes, 8, id_rm, 1, true).cells, 0u);
+    CHECK_EQ(geo_entry_corrections(9, og, ng, {}, {}, oes, nes, 8, id_rm, 1, false).cells, 1u);
+}
+
 TEST(geo_entry_corrections_empty_sides) {
     std::mt19937_64 rng(2);
     Side n = random_side(rng, 300, 1000, 20, false);
