@@ -235,6 +235,8 @@ struct Dec : Decoder {
     bool step() override {
         if (i == nw) {
             if (!nodes2->eof() || node_off != nn) die("%s: nodes2 not fully consumed", nm.pre);
+            if (!c0->eof() || !c1->eof() || !c2->eof() || (c3 && !c3->eof()) || (c4 && !c4->eof()))
+                die("%s: columns not fully consumed", nm.pre);
             return false;
         }
         if (i % G == 0) {
