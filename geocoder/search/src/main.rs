@@ -5,7 +5,7 @@
 //! place-search query <set dir> <index dir> [--extras F] [--iso F] [--limit N]
 //!                    [--bench REPEATS [--no-warmup]]
 //!   one query per stdin line; default one JSON line per query, --bench latency percentiles
-//! place-search ctxbench <set dir> < "lat lng" lines   (reverse-lookup cost per point)
+//! place-search ctxbench <set dir> <index dir> < "lat lng" lines   (reverse-lookup cost per point)
 use place_search::build::{build, BuildOpts};
 use place_search::reader::SearchIndex;
 use place_search::query::Searcher;
