@@ -176,8 +176,7 @@ static int run(int argc, char* argv[]) {
     };
 
     // Header
-    if (memcmp(P, GCPATCH_MAGIC, 8) != 0) { std::cerr << "Bad magic" << std::endl; return 1; }
-    pos = 8;
+    if (memcmp(take(8, "magic"), GCPATCH_MAGIC, 8) != 0) { std::cerr << "Bad magic" << std::endl; return 1; }
     uint32_t ver = ru32(); if (ver != GCPATCH_VERSION) { std::cerr << "Bad version" << std::endl; return 1; }
     ru32(); // flags
 

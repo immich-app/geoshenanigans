@@ -456,3 +456,18 @@ TEST(patch_decompresses_the_patch_path_as_named) {
     }
     CHECK(!std::filesystem::exists(root + "/pwned"));
 }
+
+// A patch shorter than its 8-byte magic is refused as truncated: the magic
+// is read through the bounds check like every later field.
+TEST(patch_refuses_a_patch_shorter_than_its_magic) {
+    ScratchDir dir("patch-short");
+    const std::string& root = dir.path();
+    REQUIRE(write_dir(root + "/old", {}));
+    REQUIRE(write_patch(root + "/short.gcpatch", std::vector<char>(GCPATCH_MAGIC, GCPATCH_MAGIC + 7),
+                        root + "/zstd.log"));
+
+    auto r = run_patch(root, "short.gcpatch", "out");
+
+    CHECK(!r.ok);
+    CHECK(logged(r, "Truncated patch: need 8 bytes for magic"));
+}
