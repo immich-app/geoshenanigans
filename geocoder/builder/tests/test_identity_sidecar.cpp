@@ -69,6 +69,15 @@ TEST(identity_keys_need_one_key_per_record) {
     CHECK(identity_keys({}, 0).empty());
 }
 
+TEST(identity_keys_reject_a_partial_key) {
+    // 4N+1..4N+3 bytes for N records: N whole keys and a part of one more.
+    for (size_t extra = 1; extra <= 3; extra++) {
+        auto bytes = sidecar_bytes({7, NO_DATA, 2});
+        bytes.resize(bytes.size() + extra, 0);
+        CHECK(identity_keys(bytes, 3).empty());
+    }
+}
+
 TEST(old_index_of_new_finds_the_old_record_of_each_key) {
     CHECK(old_index_of_new({3, 0, NO_DATA, 2}, {2, 3, 5, NO_DATA, 0}) ==
           std::vector<uint32_t>({3, 0, NO_DATA, NO_DATA, 1}));

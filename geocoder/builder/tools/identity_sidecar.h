@@ -14,12 +14,12 @@
 #include "parallel.h"
 
 // A family's keys from its sidecar's bytes: one per record, or empty when
-// the sidecar holds another number of keys (the family then merges by
+// the sidecar is not exactly one u32 per record (the family then merges by
 // content).
 inline std::vector<uint32_t> identity_keys(const std::vector<char>& bytes, size_t n_records) {
-    std::vector<uint32_t> v(bytes.size() / 4);
-    if (!v.empty()) memcpy(v.data(), bytes.data(), v.size() * 4);
-    if (n_records == 0 || v.size() != n_records) return {};
+    if (n_records == 0 || bytes.size() != n_records * sizeof(uint32_t)) return {};
+    std::vector<uint32_t> v(n_records);
+    memcpy(v.data(), bytes.data(), bytes.size());
     return v;
 }
 
