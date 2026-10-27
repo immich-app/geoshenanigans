@@ -5,6 +5,7 @@ case needs v8). Each case makes an old and a new today's-format dir, diffs them,
 with gc, applies the patch to it (sync and --threads) and compares the new encoded set byte for byte
 with gc's encoding of the new dir.
 """
+import errno
 import fcntl
 import os
 from pathlib import Path
@@ -77,10 +78,21 @@ def unprivileged():
 def narrow_pipes():
     """preexec_fn: unprivileged() holding pipes of up to 1 MiB until it is past its pipe page limit
     (fs.pipe-user-pages-soft), where a new pipe gets the minimum size and none can grow: the patcher's
-    own pipes can't grow. (Stopping at the first refused 1 MiB leaves up to 1 MiB minus a page free.)"""
+    own pipes can't grow. (Stopping at the first refused 1 MiB leaves up to 1 MiB minus a page free.)
+    A descriptor limit reached first is a SKIP: the pipes are closed and the patcher runs as is."""
     unprivileged()
+    held = []
     for _ in range(4096):
-        r, w = os.pipe()
+        try:
+            r, w = os.pipe()
+        except OSError as e:
+            if e.errno not in (errno.EMFILE, errno.ENFILE):
+                raise
+            for fd in held:
+                os.close(fd)
+            os.write(2, b'SKIP: the descriptor limit comes before the pipe page limit\n')
+            return
+        held += [r, w]
         os.set_inheritable(r, True)
         os.set_inheritable(w, True)
         if fcntl.fcntl(w, 1032) < 65536:  # F_GETPIPE_SZ below the default: past the limit
@@ -227,13 +239,15 @@ with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as scratch:
     os.mkfifo(fifo)
     os.chmod(fifo, 0o666)
     reader = subprocess.Popen(['cat', str(fifo)], stdout=subprocess.DEVNULL, preexec_fn=unprivileged)
-    r = run([PATCHER, str(root / 'flat'), str(root / 'flat.gcpatch'), '-o', str(out)], preexec_fn=narrow_pipes,
-            close_fds=False, timeout=120, env=dict(ENV, TMPDIR=str(root)))
-    reader.kill()
-    reader.wait()
+    try:
+        r = run([PATCHER, str(root / 'flat'), str(root / 'flat.gcpatch'), '-o', str(out)], preexec_fn=narrow_pipes,
+                close_fds=False, timeout=120, env=dict(ENV, TMPDIR=str(root)))
+    finally:
+        reader.kill()
+        reader.wait()
     err = r.stderr.decode()
     if 'SKIP' in err:
-        print('narrow-pipe: SKIP, this user may enlarge every pipe')
+        print('narrow-pipe:', next(line for line in err.splitlines() if 'SKIP' in line))
     elif r.returncode == 0 or "pipe can't hold 1 MiB" not in err:
         errors.append(f'narrow-pipe: a FIFO output on a small pipe was not refused: rc={r.returncode} {err[-300:]}')
 
