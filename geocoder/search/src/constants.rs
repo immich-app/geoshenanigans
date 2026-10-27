@@ -87,6 +87,10 @@ pub const RUN_READ_BUFFER: usize = 64 * 1024;
 pub const MERGE_FAN_IN: usize = 16;
 /// Write buffer of each file the build writes.
 pub const WRITE_BUFFER: usize = 64 * 1024;
+/// Directory inside the index directory a build writes into before moving its files over.
+pub const BUILD_STAGE_DIR: &str = ".stage";
+/// Directory inside the staging directory the files a build replaces are moved to until it is done.
+pub const BUILD_ASIDE_DIR: &str = ".replaced";
 
 // ---- query
 /// Candidates kept while scoring (before de-duplication and the result limit).

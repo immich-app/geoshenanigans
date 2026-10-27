@@ -201,7 +201,9 @@ impl<'a> Entities<'a> {
         }
         let s = self.slot(e - self.n_place_nodes);
         let ap = polygon_raw(self.geo, s.poly);
-        (if s.linked() { Kind::Linked } else { Kind::Area }, boundary_type(&ap, None))
+        // Typed as the build typed it for ranking (PlacesSource::fill): by its label node.
+        let node = s.linked().then(|| place_node_raw(self.geo, s.node));
+        (if s.linked() { Kind::Linked } else { Kind::Area }, boundary_type(&ap, node.as_ref()))
     }
 
     pub fn is_area(&self, e: u32) -> bool {
@@ -214,5 +216,33 @@ impl<'a> Entities<'a> {
     pub fn is_settlement(&self, e: u32) -> bool {
         let (k, t) = self.kind_and_type(e);
         matches!(k, Kind::Place | Kind::Linked) && !crate::constants::AREA_TYPES.contains(&t.as_ref())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::fixture::{build_search, Geo, TempDir};
+    use crate::model::Kind;
+    use crate::query::Searcher;
+    use crate::reader::SearchIndex;
+
+    #[test]
+    fn a_labelled_boundary_has_its_label_nodes_type() {
+        let mut g = Geo::default();
+        // An admin8 boundary without a place type override, labelled by a town node.
+        let poly = g.boundary("Testville", 8, [10.0, 20.0, 10.2, 20.2]);
+        let node = g.place("Testville", 1, 10.1, 20.1);
+        g.claim(poly, node);
+        let dir = TempDir::new("label-type");
+        let geo = g.load(&dir.0.join("geo"));
+        let out = dir.0.join("idx");
+        build_search(&geo, &out, None);
+        let idx = SearchIndex::open(&geo, &out, None, None).unwrap();
+
+        let (found, _) = Searcher::new(&idx).search("Testville", 5);
+
+        // The boundary is entity n_place_nodes (1) + its polygon; its node is not its own.
+        let got: Vec<_> = found.iter().map(|f| (f.hit.entity, f.kind, f.typ.as_str())).collect();
+        assert_eq!(got, [(1 + poly, Kind::Linked, "town")]);
     }
 }
