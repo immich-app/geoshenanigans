@@ -250,7 +250,9 @@ impl Pool {
         }
         self.scores.insert((Ord32(h.score), h.entity));
         if self.scores.len() > CANDIDATE_POOL {
-            self.scores.pop_first();
+            if let Some((_, evicted)) = self.scores.pop_first() {
+                self.best.remove(&evicted);
+            }
         }
         self.best.insert(h.entity, h);
     }
@@ -710,6 +712,19 @@ mod tests {
         assert_eq!(pool.threshold(), 0.05);
         pool.offer(hit(1000, 0.04));
         assert!(!pool.best.contains_key(&1000));
+    }
+
+    #[test]
+    fn pool_keeps_only_the_best_candidates() {
+        let mut pool = Pool::new(2);
+        let n = CANDIDATE_POOL as u32 + 50;
+        for e in 0..n {
+            pool.offer(hit(e, 0.1 + e as f32 / 1000.0));
+        }
+        assert_eq!(pool.scores.len(), CANDIDATE_POOL);
+        let mut kept: Vec<u32> = pool.best.keys().copied().collect();
+        kept.sort();
+        assert_eq!(kept, (50..n).collect::<Vec<_>>());
     }
 
     #[test]
