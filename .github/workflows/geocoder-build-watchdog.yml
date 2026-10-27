@@ -113,7 +113,8 @@ jobs:
             [.jobs[].steps[]
              | select(.conclusion == "cancelled"
                       or (.conclusion == "failure"
-                          and (.name == "Build tools" or .name == "Run builder tests" or .name == "Fail run on patch verify failure")))
+                          and (.name == "Build tools" or .name == "Run builder tests" or .name == "Fail run on patch verify failure"
+                               or .name == "Fail run on place search index failure")))
              | .name] | first // ""')
           if [ -n "$STOPPED_AT" ]; then
             echo "::notice::Run $LAST_ID stopped at '$STOPPED_AT', which a retry would repeat — not retrying. Investigate manually."

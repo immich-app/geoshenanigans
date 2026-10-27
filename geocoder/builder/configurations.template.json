@@ -414,5 +414,35 @@
       }
     }
   ],
+  "search_index": {
+    "description": "Place search index of one selection. The selections in `shipped` (those it adds at most 5% to on planet, zstd; builder/PATCHING.md) publish it in every region under `dir` (download each file into <dataset>/search/); any other selection builds it on the device from its own files.",
+    "dir": "{region}/search/{mode}/{quality}/{poi_tier}",
+    "files": [
+      "places.fst",
+      "places.post",
+      "places.pfx.fst",
+      "places.pfx",
+      "places.bnd",
+      "search_meta.json"
+    ],
+    "optional_files": [
+      "poi.fst",
+      "poi.post",
+      "poi.pfx.fst",
+      "poi.pfx"
+    ],
+    "shipped": [
+      {
+        "mode": "full",
+        "quality": "q2.5",
+        "poi_tier": "all"
+      },
+      {
+        "mode": "full",
+        "quality": "uncapped",
+        "poi_tier": "all"
+      }
+    ]
+  },
   "files": {}
 }
