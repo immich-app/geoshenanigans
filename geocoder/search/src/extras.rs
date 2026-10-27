@@ -132,11 +132,15 @@ impl Extras {
         out
     }
 
-    /// The `ord`-th (1-based) extra name of a record.
-    pub fn name_at(&self, rref: u32, ord: u8) -> Option<(&str, u8)> {
-        let row = self.find(rref)?;
-        let n = self.names(row);
-        n.into_iter().nth(ord as usize - 1).map(|x| (x.name, x.class))
+    /// Extra names of an entity's records in order (a labelled boundary's polygon, then its label
+    /// node): a posting's ordinal k is the k-th of them.
+    pub fn names_of(&self, rrefs: &[u32]) -> Vec<ExtraName<'_>> {
+        rrefs.iter().filter_map(|&r| self.find(r)).flat_map(|row| self.names(row)).collect()
+    }
+
+    /// The `ord`-th (1-based) extra name of an entity's records.
+    pub fn name_at(&self, rrefs: &[u32], ord: u8) -> Option<(&str, u8)> {
+        self.names_of(rrefs).into_iter().nth(ord as usize - 1).map(|x| (x.name, x.class))
     }
 }
 
@@ -205,5 +209,18 @@ pub fn pack(tsv: &str, out: &str) -> Result<(usize, usize), String> {
         put(&o.to_le_bytes())?;
     }
     put(&blob)?;
+    w.flush().map_err(|e| e.to_string())?;
     Ok((refs.len(), rows.len()))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    #[test]
+    fn pack_reports_final_flush_failure() {
+        let tsv = std::env::temp_dir().join(format!("ps-extra-flush-{}.tsv", std::process::id()));
+        std::fs::write(&tsv, "p\t1\t0\tname:de\tBerlin\no\t7\t1\talt_name\tTor\n").unwrap();
+        let result = super::pack(tsv.to_str().unwrap(), "/dev/full");
+        std::fs::remove_file(tsv).unwrap();
+        assert!(result.is_err());
+    }
 }

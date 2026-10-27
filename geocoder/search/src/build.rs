@@ -8,14 +8,14 @@
 //! (boundary slots). Nothing else is stored: names, points and types stay in the geocoder files.
 use crate::constants::*;
 use crate::entities::*;
-use crate::extras::{record_ref, Extras, KIND_PLACE_NODE, KIND_POI, KIND_POLYGON};
+use crate::extras::{record_ref, Extras, KIND_PLACE_NODE, KIND_POI};
 use crate::model::*;
 use crate::normalize::{join, tokens, transliterate};
 use memmap2::Mmap;
 use query_server::{AdminPolygon, Index, NodeCoord, PlaceNode, PoiRecord, NO_DATA};
 use std::collections::{BinaryHeap, HashSet};
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -26,7 +26,8 @@ pub struct BuildOpts {
     /// Single-posting keys carry their posting in the fst value.
     pub inline: bool,
     pub extras: Option<String>,
-    /// Directory with imp_places.u8 / imp_polys.u8 / imp_poi.u8 (the shipped importance bytes).
+    /// Directory with imp_places.u8 / imp_polys.u8 / imp_poi.u8 (the shipped importance bytes, one
+    /// per record); a file left out leaves its records without them.
     pub imp_dir: Option<String>,
     pub area_proxy: bool,
     /// POIs of tiers above this are left out (3 = all).
@@ -44,10 +45,24 @@ impl Stats {
     }
 }
 
-fn map_opt(path: Option<String>) -> Option<Mmap> {
-    let f = File::open(path?).ok()?;
-    let m = unsafe { Mmap::map(&f) }.ok()?;
-    Some(m)
+/// One importance file of `dir` for `records` records: None without a directory or when the
+/// directory leaves the file out; an error for a missing directory, a file that fails to open or
+/// map, or one that does not hold one byte per record.
+fn map_importance(dir: Option<&str>, file: &str, records: u32) -> std::io::Result<Option<Mmap>> {
+    let Some(dir) = dir else { return Ok(None) };
+    let path = Path::new(dir).join(file);
+    let with_path = |e: std::io::Error| std::io::Error::new(e.kind(), format!("{}: {e}", path.display()));
+    let f = match File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && Path::new(dir).is_dir() => return Ok(None),
+        Err(e) => return Err(with_path(e)),
+    };
+    let m = unsafe { Mmap::map(&f) }.map_err(with_path)?;
+    if m.len() != records as usize {
+        let e = format!("{}: {} bytes for {records} records", path.display(), m.len());
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+    }
+    Ok(Some(m))
 }
 
 fn byte_at(m: &Option<Mmap>, i: u32) -> u8 {
@@ -178,7 +193,7 @@ impl<'a> PlacesSource<'a> {
         w.into_inner().map_err(|e| e.into_error())?;
         drop(link_buf);
         let bnd = unsafe { Mmap::map(&File::open(bnd_path)?) }?;
-        let dir = opts.imp_dir.clone();
+        let dir = opts.imp_dir.as_deref();
         Ok(PlacesSource {
             geo,
             n_place_nodes,
@@ -186,8 +201,8 @@ impl<'a> PlacesSource<'a> {
             n_slots,
             n_linked,
             label_used,
-            imp_places: map_opt(dir.as_ref().map(|d| format!("{d}/imp_places.u8"))),
-            imp_polys: map_opt(dir.as_ref().map(|d| format!("{d}/imp_polys.u8"))),
+            imp_places: map_importance(dir, "imp_places.u8", n_place_nodes)?,
+            imp_polys: map_importance(dir, "imp_polys.u8", n_poly)?,
             extras,
             area_proxy: opts.area_proxy,
         })
@@ -204,7 +219,7 @@ impl<'a> PlacesSource<'a> {
     fn fill(&self, pos: u32, e: &mut EntityBuf) -> bool {
         e.names.clear();
         let geo = self.geo;
-        let (rref, base_id) = if pos < self.n_slots {
+        let (rrefs, base_id) = if pos < self.n_slots {
             let s = self.slot(pos);
             let ap = polygon_raw(geo, s.poly);
             let node = s.linked().then(|| place_node_raw(geo, s.node));
@@ -223,7 +238,7 @@ impl<'a> PlacesSource<'a> {
                     e.names.push((0, ORD_BOUNDARY_NAME, true, n.to_string()));
                 }
             }
-            (record_ref(KIND_POLYGON, s.poly), primary)
+            (s.record_refs(), primary)
         } else {
             let i = pos - self.n_slots;
             let pn = place_node_raw(geo, i);
@@ -236,9 +251,9 @@ impl<'a> PlacesSource<'a> {
             e.id = i;
             e.imp = W_TYPE * type_base(kind, typ, 0) + extra_importance(byte_at(&self.imp_places, i));
             e.cc_poly = pn.parent_poly_id;
-            (record_ref(KIND_PLACE_NODE, i), pn.name_id)
+            (vec![record_ref(KIND_PLACE_NODE, i)], pn.name_id)
         };
-        fill_names(geo, self.extras, rref, base_id, e)
+        fill_names(geo, self.extras, &rrefs, base_id, e)
     }
 }
 
@@ -251,9 +266,10 @@ pub struct PoiSource<'a> {
 }
 
 impl<'a> PoiSource<'a> {
-    pub fn new(geo: &'a Index, opts: &BuildOpts, extras: Option<&'a Extras>) -> Self {
+    pub fn new(geo: &'a Index, opts: &BuildOpts, extras: Option<&'a Extras>) -> std::io::Result<Self> {
         let n = record_count::<PoiRecord>(geo.poi_records.as_ref().expect("poi_records"));
-        PoiSource { geo, n, max_tier: opts.poi_max_tier, imp_poi: map_opt(opts.imp_dir.as_ref().map(|d| format!("{d}/imp_poi.u8"))), extras }
+        let imp_poi = map_importance(opts.imp_dir.as_deref(), "imp_poi.u8", n)?;
+        Ok(PoiSource { geo, n, max_tier: opts.poi_max_tier, imp_poi, extras })
     }
 
     fn fill(&self, pos: u32, e: &mut EntityBuf) -> bool {
@@ -265,21 +281,21 @@ impl<'a> PoiSource<'a> {
         e.id = pos;
         e.imp = poi_importance(r.importance, byte_at(&self.imp_poi, pos));
         e.cc_poly = r.parent_poly_id;
-        fill_names(self.geo, self.extras, record_ref(KIND_POI, pos), r.name_id, e)
+        fill_names(self.geo, self.extras, &[record_ref(KIND_POI, pos)], r.name_id, e)
     }
 }
 
-fn fill_names(geo: &Index, extras: Option<&Extras>, rref: u32, base_id: u32, e: &mut EntityBuf) -> bool {
+/// An entity's names: its base name, then the extra names of its records (`rrefs`, in the order
+/// `Entities::record_refs` gives them, which numbers the ordinals).
+fn fill_names(geo: &Index, extras: Option<&Extras>, rrefs: &[u32], base_id: u32, e: &mut EntityBuf) -> bool {
     let base = geo.get_string(base_id);
     if !base.is_empty() {
         e.names.insert(0, (0, 0, true, base.to_string()));
     }
     if let Some(x) = extras {
-        if let Some(row) = x.find(rref) {
-            for (k, n) in x.names(row).into_iter().enumerate() {
-                let ord = if k < MAX_EXTRA_ORD as usize { k as u8 + 1 } else { MAX_NAME_ORD };
-                e.names.push((n.class, ord, n.key == "name", n.name.to_string()));
-            }
+        for (k, n) in x.names_of(rrefs).into_iter().enumerate() {
+            let ord = if k < MAX_EXTRA_ORD as usize { k as u8 + 1 } else { MAX_NAME_ORD };
+            e.names.push((n.class, ord, n.key == "name", n.name.to_string()));
         }
     }
     !e.names.is_empty()
@@ -518,6 +534,7 @@ fn entry_flags(p: &Posting) -> u8 {
 
 /// The entries of several sorted runs in (key, entity, run) order.
 struct Merge {
+    files: Vec<PathBuf>,
     readers: Vec<RunReader>,
     heap: BinaryHeap<Head>,
 }
@@ -526,30 +543,36 @@ impl Merge {
     fn open(files: &[PathBuf]) -> std::io::Result<Self> {
         let mut readers = Vec::with_capacity(files.len());
         for f in files {
-            readers.push(RunReader { r: BufReader::with_capacity(RUN_READ_BUFFER, File::open(f)?) });
+            readers.push(RunReader { r: BufReader::with_capacity(RUN_READ_BUFFER, File::open(f).map_err(|e| run_error(f, e))?) });
         }
         let mut heap = BinaryHeap::with_capacity(readers.len());
         for (i, r) in readers.iter_mut().enumerate() {
             let mut h = Head { key: Vec::new(), p: Posting { entity: 0, imp_q: 0, partial: false, class: 0, ord: 0 }, run: i };
-            if r.read_into(&mut h) {
+            if r.read_into(&mut h).map_err(|e| run_error(&files[i], e))? {
                 heap.push(h);
             }
         }
-        Ok(Merge { readers, heap })
+        Ok(Merge { files: files.to_vec(), readers, heap })
     }
 
-    /// Copies the next entry into `key` and `p`; false after the last.
-    fn next(&mut self, key: &mut Vec<u8>, p: &mut Posting) -> bool {
-        let Some(mut top) = self.heap.peek_mut() else { return false };
+    /// Copies the next entry into `key` and `p`; false after the last, an error for a run that
+    /// fails to read or is cut short.
+    fn next(&mut self, key: &mut Vec<u8>, p: &mut Posting) -> std::io::Result<bool> {
+        let Some(mut top) = self.heap.peek_mut() else { return Ok(false) };
         key.clear();
         key.extend_from_slice(&top.key);
         *p = top.p;
         let run = top.run;
-        if !self.readers[run].read_into(&mut top) {
+        if !self.readers[run].read_into(&mut top).map_err(|e| run_error(&self.files[run], e))? {
             std::collections::binary_heap::PeekMut::pop(top);
         }
-        true
+        Ok(true)
     }
+}
+
+/// A sort run's open or read error, naming the run.
+fn run_error(path: &Path, e: std::io::Error) -> std::io::Error {
+    std::io::Error::new(e.kind(), format!("sort run {}: {e}", path.display()))
 }
 
 /// Merges groups of at most MERGE_FAN_IN consecutive runs into longer runs until at most
@@ -574,7 +597,7 @@ fn reduce_runs(mut files: Vec<PathBuf>, dir: &Path, tag: &str) -> std::io::Resul
             let mut m = Merge::open(group)?;
             let mut key = Vec::new();
             let mut p = Posting { entity: 0, imp_q: 0, partial: false, class: 0, ord: 0 };
-            while m.next(&mut key, &mut p) {
+            while m.next(&mut key, &mut p)? {
                 rewritten += write_entry(&mut w, &key, p.entity, p.imp_q, entry_flags(&p), p.ord)?;
             }
             w.flush()?;
@@ -619,16 +642,19 @@ struct RunReader {
 }
 
 impl RunReader {
-    fn read_into(&mut self, h: &mut Head) -> bool {
-        let mut len = [0u8; 2];
-        if self.r.read_exact(&mut len).is_err() {
-            return false;
+    /// The run's next record into `h`: false at the run's end (nothing left before a record), an
+    /// error for a failed read or a record cut short.
+    fn read_into(&mut self, h: &mut Head) -> std::io::Result<bool> {
+        if self.r.fill_buf()?.is_empty() {
+            return Ok(false);
         }
+        let mut len = [0u8; 2];
+        self.r.read_exact(&mut len)?;
         let n = u16::from_le_bytes(len) as usize;
         h.key.resize(n, 0);
-        self.r.read_exact(&mut h.key).expect("run key");
+        self.r.read_exact(&mut h.key)?;
         let mut rest = [0u8; 7];
-        self.r.read_exact(&mut rest).expect("run posting");
+        self.r.read_exact(&mut rest)?;
         h.p = Posting {
             entity: u32::from_le_bytes(rest[0..4].try_into().unwrap()),
             imp_q: rest[4],
@@ -636,7 +662,7 @@ impl RunReader {
             class: rest[5] >> 1,
             ord: rest[6],
         };
-        true
+        Ok(true)
     }
 }
 
@@ -739,7 +765,6 @@ struct Writer {
     post_len: u64,
     scratch: Vec<u8>,
     inline: bool,
-    with_names: bool,
     slots: Vec<PrefixSlot>,
     keys: u64,
     postings: u64,
@@ -755,7 +780,7 @@ impl Writer {
             inline_value(&group[0])
         } else {
             self.scratch.clear();
-            encode_list(&mut self.scratch, group, self.with_names);
+            encode_list(&mut self.scratch, group);
             let v = list_value(self.post_len, group[0].imp_q);
             self.post.write_all(&self.scratch).map_err(|e| e.to_string())?;
             self.post_len += self.scratch.len() as u64;
@@ -772,42 +797,68 @@ impl Writer {
     fn prefix_add(&mut self, key: &[u8], list: &[Posting]) {
         let Ok(key) = std::str::from_utf8(key) else { return };
         let klen = key.chars().count();
+        let top = best_postings(list, PREFIX_TABLE_TOP);
         let mut pfx = String::new();
         for (n, c) in key.chars().take(PREFIX_TABLE_MAX_CHARS).enumerate() {
             pfx.push(c);
             let n = n + 1;
             if self.slots[n - 1].prefix != pfx {
                 let slot = &mut self.slots[n - 1];
-                flush_slot(slot, self.with_names).expect("prefix temp file");
+                flush_slot(slot).expect("prefix temp file");
                 slot.prefix = pfx.clone();
             }
             let slot = &mut self.slots[n - 1];
             slot.keys += 1;
             let text = if n == klen { 1.0 } else { prefix_text(n, klen, 0) };
-            for p in list.iter().take(PREFIX_TABLE_TOP) {
+            for p in &top {
                 let t = if p.partial { text * PARTIAL_TEXT } else { text };
                 let s = t * t * (IMPORTANCE_FLOOR + dequantize(p.imp_q)) * CLASS_MULT[p.class.min(5) as usize];
                 slot.hits.push((s, PrefixHit { entity: p.entity, partial: p.partial, text: t, imp_q: p.imp_q, class: p.class, ord: p.ord }));
             }
             if slot.hits.len() > PREFIX_TABLE_TOP * 64 {
-                slot.hits.sort_by(|a, b| b.0.total_cmp(&a.0));
-                slot.hits.truncate(PREFIX_TABLE_TOP * 4);
+                best_entities(&mut slot.hits, PREFIX_TABLE_TOP * 4);
             }
         }
     }
 }
 
-fn flush_slot(slot: &mut PrefixSlot, with_names: bool) -> std::io::Result<()> {
+/// A key's `n` best postings by prefix score, best first. Every posting of a key has the key's
+/// text score, so they rank by trailing-word match, importance and name class.
+fn best_postings(list: &[Posting], n: usize) -> Vec<Posting> {
+    let rank = |p: &Posting| {
+        let t = if p.partial { PARTIAL_TEXT } else { 1.0 };
+        (t * t * (IMPORTANCE_FLOOR + dequantize(p.imp_q)) * CLASS_MULT[p.class.min(5) as usize], p.entity)
+    };
+    let before = |a: &(f32, u32), b: &(f32, u32)| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)).is_lt();
+    let mut top: Vec<((f32, u32), Posting)> = Vec::with_capacity(n + 1);
+    for p in list {
+        let r = rank(p);
+        let at = top.partition_point(|(t, _)| before(t, &r));
+        if at < n {
+            top.insert(at, (r, *p));
+            top.truncate(n);
+        }
+    }
+    top.into_iter().map(|(_, p)| p).collect()
+}
+
+fn best_entities(hits: &mut Vec<(f32, PrefixHit)>, n: usize) {
+    hits.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.entity.cmp(&b.1.entity)));
+    let mut seen = HashSet::new();
+    hits.retain(|(_, h)| seen.insert(h.entity));
+    hits.truncate(n);
+}
+
+fn flush_slot(slot: &mut PrefixSlot) -> std::io::Result<()> {
     let mut v = std::mem::take(&mut slot.hits);
     let keys = std::mem::take(&mut slot.keys);
     if slot.prefix.is_empty() || (slot.chars > PREFIX_TABLE_ALL_CHARS && keys < HEAVY_PREFIX_MIN_KEYS) {
         return Ok(());
     }
-    v.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.entity.cmp(&b.1.entity)));
-    let mut seen = HashSet::new();
-    let hits: Vec<PrefixHit> = v.into_iter().filter(|(_, h)| seen.insert(h.entity)).take(PREFIX_TABLE_TOP).map(|x| x.1).collect();
+    best_entities(&mut v, PREFIX_TABLE_TOP);
+    let hits: Vec<PrefixHit> = v.into_iter().map(|x| x.1).collect();
     let mut blob = Vec::new();
-    encode_prefix_hits(&mut blob, &hits, with_names);
+    encode_prefix_hits(&mut blob, &hits);
     slot.out.write_all(&(slot.prefix.len() as u16).to_le_bytes())?;
     slot.out.write_all(slot.prefix.as_bytes())?;
     slot.out.write_all(&(blob.len() as u32).to_le_bytes())?;
@@ -816,17 +867,21 @@ fn flush_slot(slot: &mut PrefixSlot, with_names: bool) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Next (prefix, blob) of one per-length prefix file.
-fn read_prefix(r: &mut BufReader<File>) -> Option<(Vec<u8>, Vec<u8>)> {
+/// Next (prefix, blob) of one per-length prefix file: None at the file's end (nothing left before
+/// an entry), an error for a failed read or an entry cut short.
+fn read_prefix(r: &mut BufReader<File>) -> std::io::Result<Option<(Vec<u8>, Vec<u8>)>> {
+    if r.fill_buf()?.is_empty() {
+        return Ok(None);
+    }
     let mut l2 = [0u8; 2];
-    r.read_exact(&mut l2).ok()?;
+    r.read_exact(&mut l2)?;
     let mut k = vec![0u8; u16::from_le_bytes(l2) as usize];
-    r.read_exact(&mut k).ok()?;
+    r.read_exact(&mut k)?;
     let mut l4 = [0u8; 4];
-    r.read_exact(&mut l4).ok()?;
+    r.read_exact(&mut l4)?;
     let mut b = vec![0u8; u32::from_le_bytes(l4) as usize];
-    r.read_exact(&mut b).ok()?;
-    Some((k, b))
+    r.read_exact(&mut b)?;
+    Ok(Some((k, b)))
 }
 
 fn vm_hwm_kb() -> u64 {
@@ -858,7 +913,6 @@ pub fn build(geo: &Index, names: &[&str], out: &Path, opts: &BuildOpts) -> Resul
 pub struct KeyRuns {
     name: String,
     files: Vec<PathBuf>,
-    with_names: bool,
     st: Stats,
     ents: u64,
     entries: u64,
@@ -882,7 +936,7 @@ pub fn sort_keys(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Resul
         None => None,
     };
     let src = if name == "poi" {
-        Source::Poi(PoiSource::new(geo, opts, extras.as_ref()))
+        Source::Poi(PoiSource::new(geo, opts, extras.as_ref()).map_err(|e| e.to_string())?)
     } else {
         let s = PlacesSource::new(geo, opts, extras.as_ref(), &out.join("places.bnd")).map_err(|e| e.to_string())?;
         st.add("place nodes", s.n_place_nodes);
@@ -943,13 +997,13 @@ pub fn sort_keys(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Resul
     }
     drop(src);
     let t_keys = t0.elapsed() - t_src;
-    Ok(KeyRuns { name: name.to_string(), files, with_names: extras.is_some(), st, ents, entries, spilled, t_src, t_keys })
+    Ok(KeyRuns { name: name.to_string(), files, st, ents, entries, spilled, t_src, t_keys })
 }
 
 /// Merge phase of one sub-index: its runs -> `<name>.fst`, `.post`, `.pfx.fst` and `.pfx` in `out`.
 pub fn merge(runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, String> {
     let t0 = Instant::now();
-    let KeyRuns { name, files, with_names, mut st, ents, entries, spilled, t_src, t_keys } = runs;
+    let KeyRuns { name, files, mut st, ents, entries, spilled, t_src, t_keys } = runs;
     let name = name.as_str();
     let n_runs = files.len();
     let (files, rewritten) = reduce_runs(files, &opts.tmp, name).map_err(|e| e.to_string())?;
@@ -960,7 +1014,6 @@ pub fn merge(runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, Strin
         post_len: 0,
         scratch: Vec::new(),
         inline: opts.inline,
-        with_names,
         slots: (1..=PREFIX_TABLE_MAX_CHARS)
             .map(|chars| -> Result<PrefixSlot, String> {
                 let path = opts.tmp.join(format!("{name}-pfx{chars}.tmp"));
@@ -979,7 +1032,7 @@ pub fn merge(runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, Strin
     let mut p = Posting { entity: 0, imp_q: 0, partial: false, class: 0, ord: 0 };
     let mut group = Group::default();
     let mut list: Vec<Posting> = Vec::new();
-    while m.next(&mut key, &mut p) {
+    while m.next(&mut key, &mut p).map_err(|e| e.to_string())? {
         if key != cur {
             if !group.is_empty() {
                 group.take(&mut list);
@@ -997,19 +1050,21 @@ pub fn merge(runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, Strin
     for f in &files {
         let _ = std::fs::remove_file(f);
     }
-    let Writer { fst, mut post, mut slots, keys, postings, inline_keys, longest, with_names, .. } = w;
+    let Writer { fst, mut post, mut slots, keys, postings, inline_keys, longest, .. } = w;
     fst.finish().map_err(|e| e.to_string())?;
     post.flush().map_err(|e| e.to_string())?;
     let mut n_prefixes = 0u64;
     let mut pfx_readers = Vec::new();
     for sl in slots.iter_mut() {
-        flush_slot(sl, with_names).map_err(|e| e.to_string())?;
+        flush_slot(sl).map_err(|e| e.to_string())?;
         sl.out.flush().map_err(|e| e.to_string())?;
         n_prefixes += sl.flushed;
         pfx_readers.push(BufReader::new(File::open(&sl.path).map_err(|e| e.to_string())?));
     }
     // Merge the per-length files: each is sorted, and a prefix occurs in one length only.
-    let mut heads: Vec<Option<(Vec<u8>, Vec<u8>)>> = pfx_readers.iter_mut().map(read_prefix).collect();
+    let prefix_error = |i: usize, e: std::io::Error| format!("prefix temp file {}: {e}", slots[i].path.display());
+    let mut heads: Vec<Option<(Vec<u8>, Vec<u8>)>> =
+        pfx_readers.iter_mut().enumerate().map(|(i, r)| read_prefix(r).map_err(|e| prefix_error(i, e))).collect::<Result<_, _>>()?;
     let mut pf = fst::MapBuilder::new(BufWriter::new(mk("pfx.fst")?)).map_err(|e| e.to_string())?;
     let mut pb = BufWriter::new(mk("pfx")?);
     let mut off = 0u64;
@@ -1021,7 +1076,7 @@ pub fn merge(runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, Strin
         pf.insert(&k, off).map_err(|e| e.to_string())?;
         pb.write_all(&blob).map_err(|e| e.to_string())?;
         off += blob.len() as u64;
-        heads[i] = read_prefix(&mut pfx_readers[i]);
+        heads[i] = read_prefix(&mut pfx_readers[i]).map_err(|e| prefix_error(i, e))?;
     }
     for sl in &slots {
         let _ = std::fs::remove_file(&sl.path);
@@ -1053,6 +1108,23 @@ pub fn merge(runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, Strin
     st.add("time total s", format!("{:.2}", (t_src + t_keys + t_merge).as_secs_f64()));
     st.add("VmHWM MiB", format!("{:.1}", vm_hwm_kb() as f64 / 1024.0));
     Ok(st)
+}
+
+/// A partial rebuild must keep the extra-name source required by retained sub-indexes.
+pub fn check_retained_names(out: &Path, building: &[&str], with_extras: bool) -> Result<(), String> {
+    let text = match std::fs::read_to_string(out.join("search_meta.json")) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let meta: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    for name in ["places", "poi"] {
+        if !building.contains(&name) && out.join(format!("{name}.fst")).exists()
+            && meta["extras"].as_bool().unwrap_or(false) != with_extras {
+            return Err(format!("retained {name} sub-index uses a different extra-name setting; rebuild with --sub all or the same --extras setting"));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1098,7 +1170,7 @@ mod tests {
         let mut m = Merge::open(files).unwrap();
         let (mut key, mut p) = (Vec::new(), posting(0, 0, false, 0));
         let mut out = Vec::new();
-        while m.next(&mut key, &mut p) {
+        while m.next(&mut key, &mut p).unwrap() {
             out.push((key.clone(), p));
         }
         out
@@ -1297,5 +1369,218 @@ mod tests {
         let mut got = Vec::new();
         sut.take(&mut got);
         assert_eq!(got, vec![posting(12, 50, true, 1), posting(9, 10, false, 3)]);
+    }
+
+    fn writer(dir: &Path) -> Writer {
+        std::fs::create_dir_all(dir).unwrap();
+        let mk = |n: &str| BufWriter::new(File::create(dir.join(n)).unwrap());
+        Writer {
+            fst: fst::MapBuilder::new(mk("fst")).unwrap(),
+            post: mk("post"),
+            post_len: 0,
+            scratch: Vec::new(),
+            inline: false,
+            slots: (1..=PREFIX_TABLE_MAX_CHARS)
+                .map(|chars| PrefixSlot { prefix: String::new(), chars, keys: 0, hits: Vec::new(), out: mk(&format!("pfx{chars}")), path: dir.join(format!("pfx{chars}")), flushed: 0 })
+                .collect(),
+            keys: 0,
+            postings: 0,
+            inline_keys: 0,
+            longest: 0,
+        }
+    }
+
+    #[test]
+    fn prefix_table_keeps_distinct_entities() {
+        // 30 minor entities under "a", then 10 major ones with many names each: pruning hits rather
+        // than entities leaves only the 10 major ones in the table.
+        let dir = std::env::temp_dir().join(format!("pfx-distinct-{}", std::process::id()));
+        let mut w = writer(&dir);
+        let post = |entity, imp_q| Posting { entity, imp_q, partial: false, class: 0, ord: 0 };
+        for e in 0..30u32 {
+            w.prefix_add(format!("aa{e:03}").as_bytes(), &[post(1000 + e, 10)]);
+        }
+        let major: Vec<Posting> = (0..10).map(|e| post(e, 250)).collect();
+        for k in 0..300 {
+            w.prefix_add(format!("ab{k:03}").as_bytes(), &major);
+        }
+        let slot = &mut w.slots[0];
+        flush_slot(slot).unwrap();
+        slot.out.flush().unwrap();
+        let (k, blob) = read_prefix(&mut BufReader::new(File::open(&slot.path).unwrap())).unwrap().unwrap();
+        let mut hits = Vec::new();
+        decode_prefix_hits(&blob, 0, &mut hits);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(k, b"a");
+        assert_eq!(hits.len(), PREFIX_TABLE_TOP);
+    }
+    #[test]
+    fn run_reader_tells_the_end_from_a_cut_record() {
+        // u16 key length, key, u32 entity, importance, flags, ordinal (Runs::spill).
+        let record = [&2u16.to_le_bytes()[..], b"ab", &7u32.to_le_bytes(), &[9, 3, 1]].concat();
+        let path = std::env::temp_dir().join(format!("run-cut-{}.run", std::process::id()));
+        let read_all = |bytes: &[u8]| -> std::io::Result<Vec<u32>> {
+            std::fs::write(&path, bytes).unwrap();
+            let mut r = RunReader { r: BufReader::new(File::open(&path).unwrap()) };
+            let mut h = Head { key: Vec::new(), p: Posting { entity: 0, imp_q: 0, partial: false, class: 0, ord: 0 }, run: 0 };
+            let mut entities = Vec::new();
+            while r.read_into(&mut h)? {
+                entities.push(h.p.entity);
+            }
+            Ok(entities)
+        };
+        assert!(read_all(&[]).unwrap().is_empty());
+        assert_eq!(read_all(&record).unwrap(), vec![7u32]);
+        // The next record cut in its length, its key and its posting.
+        for cut in [1, 3, record.len() - 1] {
+            let bytes = [&record[..], &record[..cut]].concat();
+            assert_eq!(read_all(&bytes).map_err(|e| e.kind()), Err(std::io::ErrorKind::UnexpectedEof), "cut at {cut}");
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn prefix_reader_tells_the_end_from_a_cut_entry() {
+        // u16 prefix length, prefix, u32 blob length, blob (flush_slot).
+        let entry = [&2u16.to_le_bytes()[..], b"ab", &3u32.to_le_bytes(), &[1, 2, 3]].concat();
+        let path = std::env::temp_dir().join(format!("pfx-cut-{}.tmp", std::process::id()));
+        let read_all = |bytes: &[u8]| -> std::io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+            std::fs::write(&path, bytes).unwrap();
+            let mut r = BufReader::new(File::open(&path).unwrap());
+            let mut entries = Vec::new();
+            while let Some(e) = read_prefix(&mut r)? {
+                entries.push(e);
+            }
+            Ok(entries)
+        };
+        assert!(read_all(&[]).unwrap().is_empty());
+        assert_eq!(read_all(&entry).unwrap(), vec![(b"ab".to_vec(), vec![1, 2, 3])]);
+        // The next entry cut in its prefix length, its prefix, its blob length and its blob.
+        for cut in [1, 3, 5, entry.len() - 1] {
+            let bytes = [&entry[..], &entry[..cut]].concat();
+            assert_eq!(read_all(&bytes).map_err(|e| e.kind()), Err(std::io::ErrorKind::UnexpectedEof), "cut at {cut}");
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn prefix_table_takes_a_keys_best_scores() {
+        // Forty class-5 postings come first by importance; the class-0 one after them scores best.
+        let dir = std::env::temp_dir().join(format!("pfx-score-{}", std::process::id()));
+        let mut w = writer(&dir);
+        let mut list: Vec<Posting> = (0..PREFIX_TABLE_TOP as u32)
+            .map(|entity| Posting { entity, imp_q: 200, partial: false, class: 5, ord: 1 })
+            .collect();
+        list.push(Posting { entity: 99, imp_q: 190, partial: false, class: 0, ord: 0 });
+        w.prefix_add(b"abc", &list);
+        let slot = &mut w.slots[0];
+        flush_slot(slot).unwrap();
+        slot.out.flush().unwrap();
+        let (k, blob) = read_prefix(&mut BufReader::new(File::open(&slot.path).unwrap())).unwrap().unwrap();
+        let mut hits = Vec::new();
+        decode_prefix_hits(&blob, 0, &mut hits);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(k, b"a");
+        assert_eq!(hits.len(), PREFIX_TABLE_TOP);
+        assert_eq!(hits[0].entity, 99);
+    }
+
+    #[test]
+    fn a_claimed_label_nodes_extra_names_find_its_boundary() {
+        use crate::fixture::{build_search, Geo, TempDir};
+        use crate::query::Searcher;
+        use crate::reader::SearchIndex;
+        let mut g = Geo::default();
+        let poly = g.boundary("Testville", 8, [10.0, 20.0, 10.2, 20.2]);
+        let node = g.place("Testville", 1, 10.1, 20.1);
+        g.claim(poly, node);
+        let dir = TempDir::new("label-extras");
+        let (tsv, bin) = (dir.0.join("extra_names.tsv"), dir.0.join("extra_names.bin"));
+        // The polygon's French name is the boundary's extra name 1, its label node's German one 2.
+        std::fs::write(&tsv, "b\t0\t2\tname:fr\tVille-Essai\np\t0\t2\tname:de\tPrüfstadt\n").unwrap();
+        crate::extras::pack(tsv.to_str().unwrap(), bin.to_str().unwrap()).unwrap();
+        let geo = g.load(&dir.0.join("geo"));
+        let out = dir.0.join("idx");
+        build_search(&geo, &out, Some(&bin));
+        let idx = SearchIndex::open(&geo, &out, Some(bin.to_str().unwrap()), None).unwrap();
+        let s = Searcher::new(&idx);
+
+        for q in ["Prüfstadt", "Ville-Essai"] {
+            let (found, _) = s.search(q, 5);
+
+            // The boundary is entity n_place_nodes (1) + its polygon (0); its node is not its own.
+            let got: Vec<(u32, &str)> = found.iter().map(|f| (f.hit.entity, f.name.as_str())).collect();
+            assert_eq!(got, [(1, q)], "{q}");
+        }
+    }
+
+    #[test]
+    fn partial_build_retains_extra_name_requirements() {
+        let dir = std::env::temp_dir().join(format!("retained-names-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("places.fst"), []).unwrap();
+        std::fs::write(dir.join("poi.fst"), []).unwrap();
+        for old in [false, true] {
+            std::fs::write(dir.join("search_meta.json"), format!("{{\"extras\":{old}}}")).unwrap();
+            assert!(check_retained_names(&dir, &["poi"], !old).is_err());
+            assert!(check_retained_names(&dir, &["places"], !old).is_err());
+            assert!(check_retained_names(&dir, &["poi"], old).is_ok());
+            assert!(check_retained_names(&dir, &["places", "poi"], !old).is_ok());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn importance_files_hold_one_byte_per_record() {
+        use std::io::ErrorKind::{InvalidData, NotFound};
+        let dir = tmp_dir("imp");
+        std::fs::write(dir.join("imp_places.u8"), [7, 8, 9]).unwrap();
+        std::fs::create_dir(dir.join("imp_polys.u8")).unwrap();
+        let (d, missing) = (dir.to_str().unwrap(), dir.join("missing"));
+        let got = |dir: Option<&str>, file: &str, records: u32| {
+            map_importance(dir, file, records).map(|m| m.map(|m| m.to_vec())).map_err(|e| e.kind())
+        };
+        assert_eq!(got(None, "imp_places.u8", 3), Ok(None));
+        assert_eq!(got(Some(d), "imp_places.u8", 3), Ok(Some(vec![7, 8, 9])));
+        // The directory leaves imp_poi.u8 out.
+        assert_eq!(got(Some(d), "imp_poi.u8", 3), Ok(None));
+        assert_eq!(got(Some(missing.to_str().unwrap()), "imp_places.u8", 3), Err(NotFound));
+        for records in [2, 4] {
+            assert_eq!(got(Some(d), "imp_places.u8", records), Err(InvalidData), "{records} records");
+        }
+        // A directory opens but does not map.
+        assert!(got(Some(d), "imp_polys.u8", 0).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_build_refuses_importance_files_of_another_set() {
+        use crate::fixture::{Geo, TempDir};
+        let mut g = Geo::default();
+        g.boundary("Testville", 8, [10.0, 20.0, 10.2, 20.2]);
+        g.place("Testville", 1, 10.1, 20.1);
+        g.place("Testburg", 2, 10.15, 20.15);
+        g.poi("Test Hall", 10.05, 20.05, 0);
+        let dir = TempDir::new("imp-build");
+        let geo = g.load(&dir.0.join("geo"));
+        let (imp, out) = (dir.0.join("imp"), dir.0.join("idx"));
+        std::fs::create_dir_all(&imp).unwrap();
+        let opts = BuildOpts {
+            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"), inline: true, extras: None,
+            imp_dir: Some(imp.to_str().unwrap().into()), area_proxy: false, poi_max_tier: 3,
+        };
+        // One byte per place node, polygon and POI record.
+        for (file, n) in [("imp_places.u8", 2), ("imp_polys.u8", 1), ("imp_poi.u8", 1)] {
+            std::fs::write(imp.join(file), vec![0u8; n]).unwrap();
+        }
+        assert!(build(&geo, &["places"], &out, &opts).is_ok());
+        assert!(build(&geo, &["poi"], &out, &opts).is_ok());
+
+        for (file, n, sub) in [("imp_places.u8", 2, "places"), ("imp_polys.u8", 1, "places"), ("imp_poi.u8", 1, "poi")] {
+            std::fs::write(imp.join(file), vec![0u8; n + 1]).unwrap();
+            let err = build(&geo, &[sub], &out, &opts).unwrap_err();
+            assert!(err.contains(file), "{err}");
+            std::fs::write(imp.join(file), vec![0u8; n]).unwrap();
+        }
     }
 }
