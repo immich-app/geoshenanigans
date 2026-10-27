@@ -91,11 +91,16 @@ pub fn join(t: &[Token]) -> String {
 }
 
 /// Scripts written without spaces whose characters carry a syllable or word each: typo
-/// tolerance stays off for them.
+/// tolerance stays off for them. Hangul counts in the Jamo that `tokens` (NFKD) decomposes its
+/// syllables into, as well as precomposed.
 pub fn is_ideographic(s: &str) -> bool {
     s.chars().any(|c| {
         let u = c as u32;
-        (0x2E80..0xA000).contains(&u) || (0xAC00..0xD7B0).contains(&u) || (0xF900..0xFB00).contains(&u)
+        (0x1100..0x1200).contains(&u)
+            || (0x2E80..0xA000).contains(&u)
+            || (0xA960..0xA980).contains(&u)
+            || (0xAC00..0xD800).contains(&u)
+            || (0xF900..0xFB00).contains(&u)
     })
 }
 
@@ -219,6 +224,14 @@ mod tests {
     fn keeps_vowel_marks_outside_alphabetic_scripts() {
         assert_eq!(normalize("दिल्ली"), "दिल्ली");
         assert_ne!(normalize("กรุงเทพ"), "");
+    }
+
+    #[test]
+    fn decomposed_hangul_is_ideographic() {
+        let seoul = normalize("서울");
+        assert!(seoul.chars().all(|c| ('\u{1100}'..'\u{1200}').contains(&c)), "{seoul:?}");
+        assert!(is_ideographic(&seoul));
+        assert!(is_ideographic("서울"));
     }
 
     #[test]

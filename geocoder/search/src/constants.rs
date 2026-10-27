@@ -70,6 +70,9 @@ pub const BOUNDARY_MAX_LEVEL: u8 = 8;
 pub const DEFAULT_RUN_BUDGET_MB: usize = 64;
 /// Read buffer per sort run during the merge.
 pub const RUN_READ_BUFFER: usize = 64 * 1024;
+/// Sort runs merged at once; more are first merged in groups of this many into longer runs
+/// (bounds the merge's read buffers, and the readahead it keeps in the page cache).
+pub const MERGE_FAN_IN: usize = 16;
 
 // ---- query
 /// Candidates kept while scoring (before de-duplication and the result limit).
