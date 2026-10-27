@@ -10,6 +10,9 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+mod admin_geometry;
+pub use admin_geometry::{AdminGeometry, AdminPoint, PipMemo};
+
 // Byte-source abstraction.  Index files are memory-mapped; readers go
 // through `read_chunk(off, len)` and `read_at::<T>(idx)`.
 
@@ -84,31 +87,43 @@ impl FileBytes {
     }
 }
 
+/// A polygon's encoded vertices as `decode_polygon_verts` reads them: the inline 10-byte header
+/// (encoding tag, bbox minimum) at `vertex_offset` and where its `vertex_count` vertices start.
+pub(crate) struct EncodedPolygon {
+    encoding: u8,
+    bmin_lat: f32,
+    bmin_lng: f32,
+    verts_off: u64,
+}
+
+/// The polygon at `vertex_offset`, or None where it has none: no vertices, or the header or
+/// vertices past the end of `src`.
+pub(crate) fn encoded_polygon(src: &FileBytes, vertex_offset: u32, vertex_count: u32) -> Option<EncodedPolygon> {
+    if vertex_count == 0 || vertex_offset == NO_DATA { return None; }
+    let off = vertex_offset as u64;
+    if off + POLY_HEADER_BYTES > src.len() { return None; }
+    let header = src.read_chunk(off, POLY_HEADER_BYTES as usize);
+    let encoding = header[0];
+    let bmin_lat = f32::from_le_bytes(header[2..6].try_into().unwrap());
+    let bmin_lng = f32::from_le_bytes(header[6..10].try_into().unwrap());
+    let verts_off = off + POLY_HEADER_BYTES;
+    if verts_off + vertex_count as u64 * vertex_stride(encoding) as u64 > src.len() { return None; }
+    Some(EncodedPolygon { encoding, bmin_lat, bmin_lng, verts_off })
+}
+
 /// Decode a polygon's quantized vertices into NodeCoord values.
 /// Reads the inline 10-byte polygon header (encoding tag + bbox_min)
 /// at vertex_offset, then `vertex_count` vertices that follow.  Used
-/// by Index::admin_verts, Index::poi_verts, Index::addr_polygon_verts
+/// by AdminGeometry, Index::poi_verts, Index::addr_polygon_verts
 /// — keeping the encoding logic in one place.
 pub fn decode_polygon_verts<'a>(
     src: &'a FileBytes,
     vertex_offset: u32,
     vertex_count: u32,
 ) -> Option<std::borrow::Cow<'a, [NodeCoord]>> {
-    if vertex_count == 0 || vertex_offset == NO_DATA { return None; }
-    let off = vertex_offset as u64;
-    if off + POLY_HEADER_BYTES > src.len() { return None; }
-
-    // Read 10-byte header
-    let header = src.read_chunk(off, POLY_HEADER_BYTES as usize);
-    let encoding = header[0];
-    let bbox_min_lat = f32::from_le_bytes(header[2..6].try_into().unwrap());
-    let bbox_min_lng = f32::from_le_bytes(header[6..10].try_into().unwrap());
-    drop(header);
-
-    let stride = vertex_stride(encoding) as u64;
-    let verts_off = off + POLY_HEADER_BYTES;
-    let total_bytes = (vertex_count as u64) * stride;
-    if verts_off + total_bytes > src.len() { return None; }
+    let EncodedPolygon { encoding, bmin_lat: bbox_min_lat, bmin_lng: bbox_min_lng, verts_off } =
+        encoded_polygon(src, vertex_offset, vertex_count)?;
+    let total_bytes = (vertex_count as u64) * vertex_stride(encoding) as u64;
     let bytes = src.read_chunk(verts_off, total_bytes as usize);
 
     if encoding == 4 {
@@ -921,7 +936,7 @@ pub struct AdminScan {
     /// The entries of the point's own cell, each with its polygon record (entries whose record
     /// `Index::admin_polygon` rejects are left out).
     rings: Vec<(u32, AdminPolygon)>,
-    pip: PipMemo,
+    pip: ScanPip,
 }
 
 impl AdminScan {
@@ -937,68 +952,28 @@ impl AdminScan {
             if let Some(poly) = index.admin_polygon(id & ID_MASK) { rings.push((id, poly)); }
         });
         for (_, poly) in &rings {
-            if poly.vertex_offset != NO_DATA { index.admin_vertices.prefetch(poly.vertex_offset as u64); }
+            index.admin_geometry.prefetch(poly);
         }
-        AdminScan { rings, pip: PipMemo::new(lat, lng) }
+        AdminScan { rings, pip: ScanPip { point: AdminPoint::new(lat, lng), memo: PipMemo::new() } }
     }
 
     /// Calls `f(pip, entry, polygon)` for every ring, in visiting order.
-    fn for_each_entry(&mut self, mut f: impl FnMut(&mut PipMemo, u32, AdminPolygon)) {
+    fn for_each_entry(&mut self, mut f: impl FnMut(&mut ScanPip, u32, AdminPolygon)) {
         for &(id, poly) in &self.rings {
             f(&mut self.pip, id, poly);
         }
     }
 }
 
-/// `Index::admin_pip` answers for one point, by polygon id (open addressing, linear probing).
-struct PipMemo {
-    lat: f32,
-    lng: f32,
-    ids: Vec<u32>,
-    inside: Vec<bool>,
-    len: usize,
+/// An admin scan's point and the `AdminGeometry::contains` answers computed there so far.
+struct ScanPip {
+    point: AdminPoint,
+    memo: PipMemo,
 }
 
-impl PipMemo {
-    /// Marks a free slot; polygon ids fit in ID_MASK.
-    const FREE: u32 = u32::MAX;
-    const START_SLOTS: usize = 64;
-
-    fn new(lat: f64, lng: f64) -> Self {
-        PipMemo { lat: lat as f32, lng: lng as f32, ids: vec![Self::FREE; Self::START_SLOTS], inside: vec![false; Self::START_SLOTS], len: 0 }
-    }
-
-    fn slot(&self, poly_id: u32) -> usize {
-        let mask = self.ids.len() - 1;
-        // Fibonacci hashing; the high bits of the product mix every bit of the id.
-        let mut i = (poly_id.wrapping_mul(0x9E37_79B9) >> 16) as usize & mask;
-        while self.ids[i] != Self::FREE && self.ids[i] != poly_id {
-            i = (i + 1) & mask;
-        }
-        i
-    }
-
-    fn admin_pip(&mut self, index: &Index, poly_id: u32, poly: &AdminPolygon) -> bool {
-        let i = self.slot(poly_id);
-        if self.ids[i] == poly_id { return self.inside[i]; }
-        let inside = point_in_encoded_polygon(&index.admin_vertices, poly.vertex_offset, poly.vertex_count, self.lat, self.lng).unwrap_or(false);
-        self.ids[i] = poly_id;
-        self.inside[i] = inside;
-        self.len += 1;
-        if self.len * 2 > self.ids.len() { self.grow(); }
-        inside
-    }
-
-    fn grow(&mut self) {
-        let slots = self.ids.len() * 2;
-        let bigger = PipMemo { lat: self.lat, lng: self.lng, ids: vec![Self::FREE; slots], inside: vec![false; slots], len: self.len };
-        let old = std::mem::replace(self, bigger);
-        for (&id, &inside) in old.ids.iter().zip(&old.inside) {
-            if id == Self::FREE { continue; }
-            let i = self.slot(id);
-            self.ids[i] = id;
-            self.inside[i] = inside;
-        }
+impl ScanPip {
+    fn contains(&mut self, index: &Index, poly: &AdminPolygon) -> bool {
+        index.admin_geometry.contains(poly, self.point, &mut self.memo)
     }
 }
 
@@ -1022,7 +997,7 @@ pub struct Index {
     pub admin_cells: FileBytes,
     pub admin_entries: FileBytes,
     pub admin_polygons: FileBytes,
-    pub admin_vertices: FileBytes,
+    pub admin_geometry: AdminGeometry,
     pub poi_cells: Option<FileBytes>,
     pub poi_entries: Option<FileBytes>,
     pub poi_records: Option<FileBytes>,
@@ -1038,7 +1013,7 @@ pub struct Index {
     pub way_postcodes: Option<FileBytes>,  // u32 per way → postcode string from postal boundary
     // Separate postcode files (optional — postcodes omitted when absent)
     pub postal_polygons: Option<FileBytes>,
-    pub postal_vertices: Option<FileBytes>,
+    pub postal_geometry: Option<AdminGeometry>,
     pub postcode_centroids: Option<FileBytes>,
     pub postcode_centroid_cells: Option<FileBytes>,
     pub postcode_centroid_entries: Option<FileBytes>,
@@ -1257,7 +1232,7 @@ impl Index {
             admin_cells: mmap_file(&format!("{}/admin_cells.bin", dir))?,
             admin_entries: mmap_file(&format!("{}/admin_entries.bin", dir))?,
             admin_polygons: mmap_file(&format!("{}/admin_polygons.bin", dir))?,
-            admin_vertices: mmap_file(&format!("{}/admin_vertices.bin", dir))?,
+            admin_geometry: AdminGeometry::new(mmap_file(&format!("{}/admin_vertices.bin", dir))?),
             poi_cells,
             poi_entries,
             poi_records,
@@ -1271,7 +1246,7 @@ impl Index {
             addr_postcodes: mmap_file_optional(&format!("{}/addr_postcodes.bin", dir)),
             way_postcodes: mmap_file_optional(&format!("{}/way_postcodes.bin", dir)),
             postal_polygons,
-            postal_vertices,
+            postal_geometry: postal_vertices.map(AdminGeometry::new),
             postcode_centroids,
             postcode_centroid_cells,
             postcode_centroid_entries,
@@ -1287,20 +1262,9 @@ impl Index {
         self.strings.get(offset)
     }
 
-    /// Decode a polygon's quantized vertex slice from `admin_vertices`.
-    /// Reads the inline 10-byte polygon header (encoding + bbox_min)
-    /// at `poly.vertex_offset`, then decodes the following vertices.
-    /// Point-in-polygon on an admin ring without decoding it into memory (false where
-    /// `admin_verts` is None).
-    pub fn admin_pip(&self, poly: &AdminPolygon, lat: f64, lng: f64) -> bool {
-        point_in_encoded_polygon(&self.admin_vertices, poly.vertex_offset, poly.vertex_count, lat as f32, lng as f32).unwrap_or(false)
-    }
-
-    pub fn admin_verts(&self, poly: &AdminPolygon) -> Option<std::borrow::Cow<'_, [NodeCoord]>> {
-        decode_polygon_verts(&self.admin_vertices, poly.vertex_offset, poly.vertex_count)
-    }
-
-    /// Same shape as `admin_verts` but for `poi_vertices` (optional file).
+    /// Decode a POI polygon's quantized vertex slice from `poi_vertices` (optional file): the
+    /// inline 10-byte polygon header (encoding + bbox_min) at `poly.vertex_offset`, then the
+    /// vertices that follow.
     pub fn poi_verts(&self, poly: &PoiRecord) -> Option<std::borrow::Cow<'_, [NodeCoord]>> {
         let v = self.poi_vertices.as_ref()?;
         decode_polygon_verts(v, poly.vertex_offset, poly.vertex_count)
@@ -1779,6 +1743,7 @@ impl Index {
 
         let mut best_by_level: [Option<(f32, AdminPolygon, bool)>; 12] = [None; 12];
         let mut seen_in_level: [Vec<serde_json::Value>; 12] = Default::default();
+        let (point, mut memo) = (AdminPoint::new(lat, lng), PipMemo::new());
 
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
             Self::for_each_entry_fb(&self.admin_entries, Self::lookup_admin_cell_fb(&self.admin_cells, c), |id| {
@@ -1806,8 +1771,8 @@ impl Index {
                 if level == 2 && poly.country_code == 0 { return; }
                 if poly.area <= 0.0 { return; }
 
-                let Some(verts) = self.admin_verts(&poly) else { return; };
-                let pip = point_in_polygon(lat as f32, lng as f32, &verts);
+                if !self.admin_geometry.has_rings(&poly) { return; }
+                let pip = self.admin_geometry.contains(&poly, point, &mut memo);
 
                 seen_in_level[level].push(serde_json::json!({
                     "name": self.get_string(poly.name_id),
@@ -1874,7 +1839,7 @@ impl Index {
             let poly_id = id & ID_MASK;
             if poly.admin_level == 15 {
                 if poly.area <= 0.0 { return; }
-                if !pip.admin_pip(self, poly_id, &poly) { return; }
+                if !pip.contains(self, &poly) { return; }
                 if !place_area_polygons.iter().any(|(pid, _)| *pid == poly_id) {
                     place_area_polygons.push((poly_id, poly));
                 }
@@ -1893,11 +1858,11 @@ impl Index {
                     // and this one can be verified
                     if !best_verified {
                         // Current best only passed via interior flag — verify it now
-                        if pip.admin_pip(self, best_id, &best_poly) {
+                        if pip.contains(self, &best_poly) {
                             best_by_level[level] = Some((best_area, best_id, best_poly, true));
                         } else {
                             // Best was wrong — try this polygon instead
-                            let inside = pip.admin_pip(self, poly_id, &poly);
+                            let inside = pip.contains(self, &poly);
                             if is_interior || inside {
                                 best_by_level[level] = Some((poly.area, poly_id, poly, inside));
                             } else {
@@ -1908,7 +1873,7 @@ impl Index {
                     return;
                 }
                 // This polygon is smaller — must verify with PIP
-                if pip.admin_pip(self, poly_id, &poly) {
+                if pip.contains(self, &poly) {
                     best_by_level[level] = Some((poly.area, poly_id, poly, true));
                 }
                 // If PIP fails, keep existing best
@@ -1916,7 +1881,7 @@ impl Index {
                 // No existing candidate — accept with interior flag, verify later if contested
                 if is_interior {
                     best_by_level[level] = Some((poly.area, poly_id, poly, false));
-                } else if pip.admin_pip(self, poly_id, &poly) {
+                } else if pip.contains(self, &poly) {
                     best_by_level[level] = Some((poly.area, poly_id, poly, true));
                 }
             }
@@ -1925,7 +1890,7 @@ impl Index {
         // Verify any uncontested winners that only passed via interior flag
         for level in 0..12 {
             if let Some((area, id, poly, false)) = best_by_level[level] {
-                best_by_level[level] = scan.pip.admin_pip(self, id, &poly).then_some((area, id, poly, true));
+                best_by_level[level] = scan.pip.contains(self, &poly).then_some((area, id, poly, true));
             }
         }
 
@@ -2145,16 +2110,13 @@ impl Index {
         let mut holding = |mut polys: Vec<(f32, u32, AdminPolygon)>| -> Vec<AdminPolygon> {
             polys.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
             polys.dedup_by_key(|p| p.1);
-            polys.into_iter().filter(|(_, id, poly)| scan.pip.admin_pip(self, *id, poly)).map(|(_, _, poly)| poly).collect()
+            polys.into_iter().filter(|(_, _, poly)| scan.pip.contains(self, poly)).map(|(_, _, poly)| poly).collect()
         };
         let ranked: Vec<RankedPoly> = holding(boundaries).into_iter()
             .map(|poly| RankedPoly { poly, rank_address: self.admin_config.to_rank(&cc, poly.admin_level) })
             .filter(|r| r.rank_address != 0 || r.poly.place_type_override != 0)
             .collect();
-        let inside = |poly: &AdminPolygon, current: &AdminPolygon| match (self.admin_verts(poly), self.admin_verts(current)) {
-            (Some(verts), Some(current_verts)) => point_on_surface_in(&verts, poly.hole_count, &current_verts, current.hole_count),
-            _ => false,
-        };
+        let inside = |poly: &AdminPolygon, current: &AdminPolygon| self.admin_geometry.point_on_surface_in(poly, current);
         CurrentBoundaries::from_ranked(ranked, holding(place_areas).iter(), inside)
     }
 
@@ -2207,24 +2169,23 @@ impl Index {
         // against the current boundary for its rank_address
         // (find_current_boundaries). This is the correct Nominatim
         // check: the NODE must be inside the boundary, not the query.
+        let geometry = &self.admin_geometry;
+        let holds_node = |poly: &AdminPolygon, pn: &PlaceNode| {
+            geometry.contains_once(poly, AdminPoint::new(pn.lat as f64, pn.lng as f64))
+        };
         let node_inside_boundary = |pn: &PlaceNode, rank: u8| -> bool {
             match current_boundaries.for_rank(rank) {
                 None => true, // no admin boundary found — accept all
-                Some(poly) => {
-                    let Some(verts) = self.admin_verts(&poly) else { return true; };
-                    // PIP test the PLACE NODE's centroid, not the query point
-                    point_in_polygon(pn.lat, pn.lng, &verts)
-                }
+                // A boundary without rings accepts all too.
+                Some(poly) => !geometry.has_rings(poly) || holds_node(poly, pn),
             }
         };
 
-        // The promoting polygons, decoded once, of the ranks candidates have.
-        let promoting: Vec<(u8, Cow<'_, [NodeCoord]>)> = current_boundaries.promoting.iter()
-            .filter(|(rank, _)| candidates.iter().any(|(pn, _)| PLACE_NODE_RANK[pn.place_type as usize] == *rank))
-            .filter_map(|(rank, poly)| self.admin_verts(poly).map(|verts| (*rank, verts)))
-            .collect();
         let nodes: Vec<(usize, u8, f64, f32, f32)> = candidates.iter()
-            .map(|(pn, dist_sq)| (pn.place_type as usize, place_node_rank(pn, &promoting), *dist_sq, pn.lat, pn.lng))
+            .map(|(pn, dist_sq)| {
+                let rank = place_node_rank(pn, &current_boundaries.promoting, |poly| holds_node(poly, pn));
+                (pn.place_type as usize, rank, *dist_sq, pn.lat, pn.lng)
+            })
             .collect();
         let accepted = accept_place_nodes(&nodes, held_ranks, |k| node_inside_boundary(&candidates[k].0, nodes[k].1));
         for (pt, slot) in [&mut result.city, &mut result.town, &mut result.village, &mut result.suburb,
@@ -2277,8 +2238,8 @@ impl Index {
     pub fn poi_chain_contains_query(&self, poi: &PoiRecord, lat: f64, lng: f64) -> bool {
         if poi.parent_poly_id == NO_DATA { return true; }
         let Some(poly) = self.admin_polygon(poi.parent_poly_id) else { return true; };
-        let Some(verts) = self.admin_verts(&poly) else { return true; };
-        point_in_polygon(lat as f32, lng as f32, &verts)
+        if !self.admin_geometry.has_rings(&poly) { return true; }
+        self.admin_geometry.contains_once(&poly, AdminPoint::new(lat, lng))
     }
 
     // --- POI primary-feature lookup ---
@@ -2601,11 +2562,10 @@ impl Index {
         // PIP from the query point — these aren't in the parent chain
         // but provide place-area rank promotions.
         let mut place_area_polygons: Vec<AdminPolygon> = Vec::new();
-        scan.for_each_entry(|pip, id, poly| {
-            let poly_id = id & ID_MASK;
+        scan.for_each_entry(|pip, _, poly| {
             if poly.admin_level != 15 { return; }
             if poly.area <= 0.0 { return; }
-            if !pip.admin_pip(self, poly_id, &poly) { return; }
+            if !pip.contains(self, &poly) { return; }
             place_area_polygons.push(poly);
         });
 
@@ -3812,7 +3772,7 @@ mod query_tests {
             admin_cells,
             admin_entries,
             admin_polygons: FileBytes::Owned(polygons),
-            admin_vertices: FileBytes::Owned(vertices),
+            admin_geometry: AdminGeometry::new(FileBytes::Owned(vertices)),
             poi_cells: None,
             poi_entries: None,
             poi_records: None,
@@ -3826,7 +3786,7 @@ mod query_tests {
             addr_postcodes: None,
             way_postcodes: None,
             postal_polygons: None,
-            postal_vertices: None,
+            postal_geometry: None,
             postcode_centroids: None,
             postcode_centroid_cells: None,
             postcode_centroid_entries: None,
@@ -3884,6 +3844,19 @@ mod query_tests {
         for (lat, lng) in [(-82.0, 60.0), (5.2, 112.65)] {
             assert_eq!(answer(&idx, lat, lng), serde_json::json!({"address": {}}), "({}, {})", lat, lng);
         }
+    }
+
+    #[test]
+    fn a_place_node_gate_without_rings_accepts_every_node() {
+        let idx = index(&[SHOALS, ("Elsewhere", 8, [0.0, 0.0, 0.1, 0.1])], &[SHOALS_VILLAGE]);
+        let elsewhere = idx.admin_polygon(1).unwrap();
+        let village = |gate: AdminPolygon| {
+            let gates = CurrentBoundaries::walk([(CurrentBoundaries::CITY, gate)], |_, _| true);
+            idx.find_places(PlaceFeature::Point(5.05, 112.65), &gates, 0).village
+        };
+
+        assert_eq!(village(elsewhere), None);
+        assert_eq!(village(AdminPolygon { vertex_count: 0, ..elsewhere }), Some("Shoals Village"));
     }
 }
 
@@ -4222,19 +4195,16 @@ pub fn point_in_polygon(lat: f32, lng: f32, vertices: &[NodeCoord]) -> bool {
 /// reads), decoding one vertex at a time to the same f32 values: no allocation, one pass. None
 /// exactly where `decode_polygon_verts` is None. A point the header's bounds already exclude is
 /// answered without reading the vertices.
+///
+/// Never inlined, so the per-vertex loops get registers of their own: inlined into
+/// `AdminGeometry::contains`, whose memo values stay live across the test, the u32 grid loop
+/// reloaded its vertex pointer from the stack, 15 instructions a vertex instead of 13.
+#[inline(never)]
 pub fn point_in_encoded_polygon(src: &FileBytes, vertex_offset: u32, vertex_count: u32, lat: f32, lng: f32) -> Option<bool> {
-    if vertex_count == 0 || vertex_offset == NO_DATA { return None; }
-    let off = vertex_offset as u64;
-    if off + POLY_HEADER_BYTES > src.len() { return None; }
-    let header = src.read_chunk(off, POLY_HEADER_BYTES as usize);
-    let encoding = header[0];
-    let bmin_lat32 = f32::from_le_bytes(header[2..6].try_into().unwrap());
-    let bmin_lng32 = f32::from_le_bytes(header[6..10].try_into().unwrap());
-    drop(header);
+    let EncodedPolygon { encoding, bmin_lat: bmin_lat32, bmin_lng: bmin_lng32, verts_off } =
+        encoded_polygon(src, vertex_offset, vertex_count)?;
     let stride = vertex_stride(encoding);
     let n = vertex_count as usize;
-    let verts_off = off + POLY_HEADER_BYTES;
-    if verts_off + (n * stride) as u64 > src.len() { return None; }
     if ring_bounds_exclude(encoding, bmin_lat32, bmin_lng32, lat, lng) { return Some(false); }
     let (bmin_lat, bmin_lng) = (bmin_lat32 as f64, bmin_lng32 as f64);
     let bytes = src.read_chunk(verts_off, n * stride);
@@ -4782,13 +4752,13 @@ pub const PROMOTABLE_RANKS: std::ops::RangeInclusive<u8> = 16..=23;
 pub const PLACE_NODE_PROMOTION: u8 = 2;
 
 /// A place node's rank_address: its type's, two more when a polygon of
-/// `promoting`, (rank, vertices) holding the query point, has that rank
-/// and holds the node (placex_triggers.sql:961-981): a village in a city
+/// `promoting`, (rank, polygon) holding the query point, has that rank
+/// and `holds` the node (placex_triggers.sql:961-981): a village in a city
 /// boundary ranks 18, a hamlet in a district linked to a suburb 22.
-pub fn place_node_rank(pn: &PlaceNode, promoting: &[(u8, Cow<'_, [NodeCoord]>)]) -> u8 {
+pub fn place_node_rank(pn: &PlaceNode, promoting: &[(u8, AdminPolygon)], mut holds: impl FnMut(&AdminPolygon) -> bool) -> u8 {
     let rank = PLACE_NODE_RANK[pn.place_type as usize];
     let promoted = PROMOTABLE_RANKS.contains(&rank)
-        && promoting.iter().any(|(r, verts)| *r == rank && point_in_polygon(pn.lat, pn.lng, verts));
+        && promoting.iter().any(|(r, poly)| *r == rank && holds(poly));
     if promoted { rank + PLACE_NODE_PROMOTION } else { rank }
 }
 
@@ -6118,15 +6088,18 @@ mod pure_helper_tests {
     #[test]
     fn place_nodes_rank_two_up_inside_a_polygon_of_their_rank() {
         let square = unit_square();
-        let promoting = [(CurrentBoundaries::CITY, Cow::Borrowed(&square[..]))];
+        let in_square = |pn: &PlaceNode, promoting: &[(u8, AdminPolygon)]| {
+            place_node_rank(pn, promoting, |_| point_in_polygon(pn.lat, pn.lng, &square))
+        };
+        let city = [(CurrentBoundaries::CITY, boundary(1, 8))];
         let village = PlaceNode { lat: 0.5, lng: 0.5, ..place_node(2, 0.0, 0.0) };
-        assert_eq!(place_node_rank(&village, &promoting), CurrentBoundaries::CITY_PART);
-        assert_eq!(place_node_rank(&PlaceNode { lat: 1.5, ..village }, &promoting), CurrentBoundaries::CITY);
-        // Only a polygon of the node's own rank promotes it.
-        assert_eq!(place_node_rank(&PlaceNode { place_type: 4, ..village }, &promoting), CurrentBoundaries::SUBURB);
+        assert_eq!(in_square(&village, &city), CurrentBoundaries::CITY_PART);
+        assert_eq!(in_square(&PlaceNode { lat: 1.5, ..village }, &city), CurrentBoundaries::CITY);
+        // Only a polygon of the node's own rank promotes it; no other is tested.
+        assert_eq!(place_node_rank(&PlaceNode { place_type: 4, ..village }, &city, |_| panic!("tested")), CurrentBoundaries::SUBURB);
         // A neighbourhood (24) is past the promotable ranks.
-        let neighbourhoods = [(CurrentBoundaries::NEIGHBOURHOOD, Cow::Borrowed(&square[..]))];
-        assert_eq!(place_node_rank(&PlaceNode { place_type: 5, ..village }, &neighbourhoods), CurrentBoundaries::NEIGHBOURHOOD);
+        let neighbourhoods = [(CurrentBoundaries::NEIGHBOURHOOD, boundary(1, 10))];
+        assert_eq!(place_node_rank(&PlaceNode { place_type: 5, ..village }, &neighbourhoods, |_| panic!("tested")), CurrentBoundaries::NEIGHBOURHOOD);
     }
 
     #[test]
@@ -6842,19 +6815,6 @@ mod query_path_tests {
     }
 
     #[test]
-    fn pip_memo_tests_each_polygon_once() {
-        let index = TestIndex::new().boundary("Town", 8, 0, (-1000.0, -1000.0, 1000.0, 1000.0)).load();
-        let town = index.admin_polygon(1).unwrap();
-        let vertexless = AdminPolygon { vertex_count: 0, ..town };
-        let p = at(0.0, 0.0);
-        let mut memo = PipMemo::new(p.lat as f64, p.lng as f64);
-        assert!(memo.admin_pip(&index, 1, &town));
-        // Asked again, the first answer stands: nothing is decoded.
-        assert!(memo.admin_pip(&index, 1, &vertexless));
-        assert!(!PipMemo::new(p.lat as f64, p.lng as f64).admin_pip(&index, 1, &vertexless));
-    }
-
-    #[test]
     fn current_boundaries_reuse_what_find_admin_tested() {
         // The boundaries at the point are the same over find_admin's scan
         // as over a fresh one.
@@ -7242,12 +7202,12 @@ mod admin_scan_tests {
             admin_cells: FileBytes::Owned(cells),
             admin_entries: FileBytes::Owned(entries),
             admin_polygons: FileBytes::Owned(polygons),
-            admin_vertices: FileBytes::Owned(vertices),
+            admin_geometry: AdminGeometry::new(FileBytes::Owned(vertices)),
             poi_cells: None, poi_entries: None, poi_records: None, poi_vertices: None,
             poi_meta: PoiMeta { categories: HashMap::new() },
             place_nodes: None, place_cells: None, place_entries: None,
             way_parents: None, admin_parents: None, addr_postcodes: None, way_postcodes: None,
-            postal_polygons: None, postal_vertices: None,
+            postal_polygons: None, postal_geometry: None,
             postcode_centroids: None, postcode_centroid_cells: None, postcode_centroid_entries: None,
             admin_config: AdminLevelConfig::load(),
             strings: StringPool::from_parts([Some(FileBytes::Owned(strings)), None, None, None, None], [0, len, len, len, len, len]),
@@ -7407,25 +7367,31 @@ mod admin_scan_tests {
         assert_eq!(&src.read_chunk(0, 3)[..], &[1, 2, 3]);
     }
 
+    /// A ring a tier simplified away: its record keeps its name, its vertex range is empty.
+    fn ringless(name: &'static str, level: u8, cells: &[(usize, bool)]) -> Ring {
+        Ring { verts: Vec::new(), ..ring(name, level, 1.0, EGYPT, cells) }
+    }
+
     #[test]
-    fn pip_memo_keeps_its_answers_as_it_grows() {
-        // 300 rings, every third containing Q: the memo grows from 64 slots past 512.
-        let rings: Vec<Ring> = (0..300)
-            .map(|i| {
-                let lat0 = if i % 3 == 0 { 21.9 } else { 22.1 } + i as f64 * 1e-4;
-                ring("r", 8, 1.0, (lat0, 27.0, lat0 + 0.5, 28.0), &[(0, false)])
-            })
-            .collect();
-        let idx = admin_index(&rings);
-        let mut memo = PipMemo::new(Q.0, Q.1);
-        for pass in 0..2 {
-            for id in 0..300u32 {
-                let poly = idx.admin_polygon(id).unwrap();
-                assert_eq!(memo.admin_pip(&idx, id, &poly), idx.admin_pip(&poly, Q.0, Q.1), "pass {pass} ring {id}");
-                assert_eq!(memo.admin_pip(&idx, id, &poly), id % 3 == 0);
-            }
-        }
-        assert_eq!(memo.len, 300);
-        assert!(memo.ids.len() >= 600);
+    fn a_poi_whose_parent_has_no_rings_passes_the_chain_check() {
+        let idx = admin_index(&[ring("Sudan", 2, 97.0, SUDAN, &[]), ringless("Ringless", 8, &[])]);
+        let poi = |parent_poly_id: u32| PoiRecord {
+            lat: 0.0, lng: 0.0, vertex_offset: NO_DATA, vertex_count: 0, name_id: 0, category: 0, tier: 0, flags: 0,
+            importance: 0, parent_street_id: NO_DATA, parent_postcode_id: NO_DATA, parent_poly_id,
+        };
+
+        assert!(!idx.poi_chain_contains_query(&poi(0), Q.0, Q.1));
+        assert!(idx.poi_chain_contains_query(&poi(1), Q.0, Q.1));
+    }
+
+    #[test]
+    fn debug_admin_leaves_out_polygons_without_rings() {
+        let idx = admin_index(&[ring("Egypt", 2, 97.0, EGYPT, &[(0, false)]), ringless("Ringless", 8, &[(0, false)])]);
+
+        let seen = &idx.debug_admin(Q.0, Q.1)["seen_per_level"];
+
+        assert_eq!(seen[2][0]["name"], "Egypt");
+        assert_eq!(seen[2][0]["pip"], true);
+        assert_eq!(seen[8], serde_json::json!([]));
     }
 }
