@@ -1586,7 +1586,7 @@ impl Index {
     pub fn debug_places(&self, lat: f64, lng: f64) -> serde_json::Value {
         let mut admin = self.find_admin(lat, lng);
         let current_boundaries = self.find_current_boundaries(&mut admin.containment, admin.country_code);
-        let place = self.find_places(lat, PlaceFeature::Point(lat, lng), &current_boundaries, 0);
+        let place = self.find_places(PlaceFeature::Point(lat, lng), &current_boundaries, 0);
 
         let place_cells = match &self.place_cells {
             Some(c) => c,
@@ -2045,7 +2045,7 @@ impl Index {
         CurrentBoundaries::from_ranked(ranked, holding(place_areas).iter())
     }
 
-    pub fn find_places(&self, lat: f64, feature: PlaceFeature<'_>, current_boundaries: &CurrentBoundaries, held_ranks: u32) -> PlaceResult<'_> {
+    pub fn find_places(&self, feature: PlaceFeature<'_>, current_boundaries: &CurrentBoundaries, held_ranks: u32) -> PlaceResult<'_> {
         let place_cells = match &self.place_cells {
             Some(c) => c,
             None => return PlaceResult::default(),
@@ -2059,11 +2059,10 @@ impl Index {
         // Every node whose fuzzy area covers the feature, with its squared
         // distance (owned copies so the place_nodes file can be a chunked
         // source).
-        let cos_lat = lat.to_radians().cos();
         let mut candidates: Vec<(PlaceNode, f64)> = Vec::new();
         let consider = |id: u32| {
             let Some(pn) = self.place_node(id) else { return; };
-            if let Some(dist_sq) = place_node_covering(&pn, feature, cos_lat) {
+            if let Some(dist_sq) = place_node_covering(&pn, feature) {
                 candidates.push((pn, dist_sq));
             }
         };
@@ -3184,7 +3183,7 @@ impl Index {
             Some(line) => PlaceFeature::Line(line),
             None => PlaceFeature::Point(lat, lng),
         };
-        let place = self.find_places(lat, feature, &current_boundaries, held_ranks);
+        let place = self.find_places(feature, &current_boundaries, held_ranks);
 
         // Resolve postcode: mirror Nominatim's stored placex.postcode chain
         // (Tier 0 addr / Tier 1 primary feature's calculated_postcode /
@@ -4223,8 +4222,12 @@ pub fn line_crosses_fuzzy_area(line: &[NodeCoord], centre_lat: f32, centre_lng: 
 /// the feature, None when it doesn't: Nominatim stores the node with that
 /// area in location_area_large, and getNearFeatures takes only the rows
 /// covering the feature (partition-functions.sql:39-44), each at its
-/// distance from the feature (partition-functions.sql:32).
-pub fn place_node_covering(pn: &PlaceNode, feature: PlaceFeature<'_>, cos_lat: f64) -> Option<f64> {
+/// distance from the feature (partition-functions.sql:32). That distance is
+/// ST_Distance on lon/lat geometry, planar in degrees, so a longitude degree
+/// counts as much as a latitude degree at any latitude; only the fuzzy area
+/// is measured in metres.
+pub fn place_node_covering(pn: &PlaceNode, feature: PlaceFeature<'_>) -> Option<f64> {
+    const PLANAR: f64 = 1.0; // no cos(lat) scaling of longitude
     let pt = pn.place_type as usize;
     if pt >= PLACE_NODE_RANK.len() {
         return None;
@@ -4233,11 +4236,11 @@ pub fn place_node_covering(pn: &PlaceNode, feature: PlaceFeature<'_>, cos_lat: f
     let half_m = place_fuzzy_half_side_m(pt);
     match feature {
         PlaceFeature::Point(lat, lng) => fuzzy_area_holds(pn.lat, pn.lng, half_m, lat, lng)
-            .then(|| dist_sq((lat - pn.lat as f64).to_radians(), (lng - pn.lng as f64).to_radians(), cos_lat)),
+            .then(|| dist_sq((lat - pn.lat as f64).to_radians(), (lng - pn.lng as f64).to_radians(), PLANAR)),
         PlaceFeature::Line(line) => line_crosses_fuzzy_area(line, pn.lat, pn.lng, half_m).then(|| {
             line.windows(2)
                 .map(|w| point_to_segment_distance(pn.lat as f64, pn.lng as f64, w[0].lat as f64, w[0].lng as f64,
-                                                   w[1].lat as f64, w[1].lng as f64, cos_lat))
+                                                   w[1].lat as f64, w[1].lng as f64, PLANAR))
                 .fold(f64::MAX, f64::min)
         }),
     }
@@ -5437,8 +5440,8 @@ mod pure_helper_tests {
         let east = place_node(5, 0.0, 510.0);
         let north_east = place_node(5, 490.0, 490.0);
         let query = PlaceFeature::Point(0.0, 0.0);
-        assert_eq!(place_node_covering(&east, query, 1.0), None);
-        assert!(place_node_covering(&north_east, query, 1.0).is_some());
+        assert_eq!(place_node_covering(&east, query), None);
+        assert!(place_node_covering(&north_east, query).is_some());
     }
 
     // A line through points given in metres (north, east) from (0, 0).
@@ -5471,19 +5474,33 @@ mod pure_helper_tests {
         let north = place_node(4, 3000.0, 200.0);
         let east = place_node(4, 0.0, 900.0);
         let (point, line) = (PlaceFeature::Point(0.0, 0.0), PlaceFeature::Line(&street));
-        assert_eq!(place_node_covering(&north, point, 1.0), None);
-        let metres = |pn: &PlaceNode| place_node_covering(pn, line, 1.0).unwrap().sqrt() * 6_371_000.0;
+        assert_eq!(place_node_covering(&north, point), None);
+        let metres = |pn: &PlaceNode| place_node_covering(pn, line).unwrap().sqrt() * 6_371_000.0;
         assert!((metres(&north) - 200.0).abs() < 1.0, "{}", metres(&north));
         assert!((metres(&east) - 900.0).abs() < 2.0, "{}", metres(&east));
         let walk = |feature| {
             let nodes: Vec<(usize, u8, f64, f32, f32)> = [north, east].iter()
-                .filter_map(|pn| place_node_covering(pn, feature, 1.0).map(|d| (4, CurrentBoundaries::SUBURB, d, pn.lat, pn.lng)))
+                .filter_map(|pn| place_node_covering(pn, feature).map(|d| (4, CurrentBoundaries::SUBURB, d, pn.lat, pn.lng)))
                 .collect();
             let accepted = accept_place_nodes(&nodes, 0, |_| true)[4];
             accepted.map(|k| nodes[k].4)
         };
         assert_eq!(walk(line), Some(north.lng));
         assert_eq!(walk(point), Some(east.lng));
+    }
+
+    #[test]
+    fn place_nodes_measure_in_plain_degrees() {
+        // At 60°N, 0.0075° east of the point and of a street ending there is
+        // farther than 0.005° north, though nearer in metres.
+        let hamlet = |lat: f32, lng: f32| PlaceNode { lat, lng, ..place_node(4, 0.0, 0.0) };
+        let (east, north) = (hamlet(60.0, 10.0075), hamlet(60.005, 10.0));
+        let street = [nc(60.0, 9.997), nc(60.0, 10.0)];
+        for feature in [PlaceFeature::Point(60.0, 10.0), PlaceFeature::Line(&street)] {
+            let degrees = |pn: &PlaceNode| place_node_covering(pn, feature).unwrap().sqrt().to_degrees();
+            assert!((degrees(&east) - 0.0075).abs() < 1e-5, "{}", degrees(&east));
+            assert!((degrees(&north) - 0.005).abs() < 1e-5, "{}", degrees(&north));
+        }
     }
 
     #[test]
@@ -5804,7 +5821,8 @@ mod query_path_tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// The fixtures' origin: everything sits metres north and east of it.
+    /// The fixtures' origin unless one is given: everything sits metres
+    /// north and east of it.
     const ORIGIN: (f64, f64) = (10.0, 20.0);
     const COUNTRY_CODE: u16 = (b'x' as u16) << 8 | b'x' as u16;
     /// Raw f32 vertices (VertexEncoding in builder/src/types.h).
@@ -5814,10 +5832,15 @@ mod query_path_tests {
     type Span = (f64, f64, f64, f64);
 
     fn at(north_m: f64, east_m: f64) -> NodeCoord {
-        let metres_per_lng = METRES_PER_DEGREE * ORIGIN.0.to_radians().cos();
+        at_from(ORIGIN, north_m, east_m)
+    }
+
+    /// The point `north_m` north and `east_m` east of `origin`.
+    fn at_from((lat0, lng0): (f64, f64), north_m: f64, east_m: f64) -> NodeCoord {
+        let metres_per_lng = METRES_PER_DEGREE * lat0.to_radians().cos();
         NodeCoord {
-            lat: (ORIGIN.0 + north_m / METRES_PER_DEGREE) as f32,
-            lng: (ORIGIN.1 + east_m / metres_per_lng) as f32,
+            lat: (lat0 + north_m / METRES_PER_DEGREE) as f32,
+            lng: (lng0 + east_m / metres_per_lng) as f32,
         }
     }
 
@@ -5853,6 +5876,7 @@ mod query_path_tests {
 
     #[derive(Default)]
     struct TestIndex {
+        origin: (f64, f64),
         strings: Vec<u8>,
         polygons: Vec<(AdminPolygon, Vec<NodeCoord>)>,
         place_nodes: Vec<PlaceNode>,
@@ -5862,7 +5886,12 @@ mod query_path_tests {
     impl TestIndex {
         /// Testland, a country (rank 4) 100 km across around the origin.
         fn new() -> Self {
-            let mut index = Self::default();
+            Self::around(ORIGIN)
+        }
+
+        /// Testland around `origin`, which everything is placed from.
+        fn around(origin: (f64, f64)) -> Self {
+            let mut index = Self { origin, ..Self::default() };
             index.boundary("Testland", 2, 0, (-50_000.0, -50_000.0, 50_000.0, 50_000.0));
             index
         }
@@ -5876,6 +5905,7 @@ mod query_path_tests {
 
         /// A rectangular boundary; admin_level 15 makes it a place area.
         fn boundary(&mut self, name: &str, admin_level: u8, place_type_override: u8, (s, w, n, e): Span) -> &mut Self {
+            let at = |north_m, east_m| at_from(self.origin, north_m, east_m);
             let ring = vec![at(s, w), at(s, e), at(n, e), at(n, w), at(s, w)];
             let (lat_lo, lng_lo, lat_hi, lng_hi) = bounds(&ring);
             let poly = AdminPolygon {
@@ -5889,7 +5919,7 @@ mod query_path_tests {
 
         /// A place node of PlaceNode type `place_type`.
         fn place(&mut self, name: &str, place_type: u8, north_m: f64, east_m: f64) -> &mut Self {
-            let NodeCoord { lat, lng } = at(north_m, east_m);
+            let NodeCoord { lat, lng } = at_from(self.origin, north_m, east_m);
             let name_id = self.string(name);
             self.place_nodes.push(PlaceNode { lat, lng, name_id, place_type, _pad1: 0, _pad2: 0, parent_poly_id: NO_DATA });
             self
@@ -5898,7 +5928,8 @@ mod query_path_tests {
         /// A named street through points given as (north, east) metres.
         fn street(&mut self, name: &str, points_m: &[(f64, f64)]) -> &mut Self {
             let name_id = self.string(name);
-            self.streets.push((name_id, points_m.iter().map(|&(n, e)| at(n, e)).collect()));
+            let line = points_m.iter().map(|&(n, e)| at_from(self.origin, n, e)).collect();
+            self.streets.push((name_id, line));
             self
         }
 
@@ -6017,7 +6048,12 @@ mod query_path_tests {
 
     /// The address dict of the answer at `north_m`, `east_m` from the origin.
     fn address_at(index: &Index, north_m: f64, east_m: f64) -> serde_json::Value {
-        let p = at(north_m, east_m);
+        address_from(index, ORIGIN, north_m, east_m)
+    }
+
+    /// The address dict of the answer at `north_m`, `east_m` from `origin`.
+    fn address_from(index: &Index, origin: (f64, f64), north_m: f64, east_m: f64) -> serde_json::Value {
+        let p = at_from(origin, north_m, east_m);
         serde_json::to_value(index.query(p.lat as f64, p.lng as f64)).unwrap()["address"].clone()
     }
 
@@ -6087,6 +6123,37 @@ mod query_path_tests {
         assert!(city_cell != cell && !cell_neighbors_at_level(cell, DEFAULT_ADMIN_CELL_LEVEL).contains(&city_cell));
         let index = TestIndex::new().place("Metropolis", 0, 22_500.0, 0.0).load();
         assert_eq!(address_at(&index, 8000.0, 0.0)["city"], "Metropolis");
+    }
+
+    /// At 60°N: a hamlet 0.0075° east is 417 m away, one 0.005° north 557 m.
+    const HIGH_LATITUDE: (f64, f64) = (60.0, 10.0);
+    const EAST_M: f64 = 0.0075 * METRES_PER_DEGREE * 0.5;
+    const NORTH_M: f64 = 0.005 * METRES_PER_DEGREE;
+
+    #[test]
+    fn query_orders_place_nodes_in_plain_degrees() {
+        // The eastern hamlet is nearer in metres, and both squares cover the
+        // point; Nominatim orders them by ST_Distance on lon/lat geometry, in
+        // plain degrees, so the northern one names the point.
+        let index = TestIndex::around(HIGH_LATITUDE)
+            .place("East", 4, 0.0, EAST_M)
+            .place("North", 4, NORTH_M, 0.0)
+            .load();
+        assert_eq!(address_from(&index, HIGH_LATITUDE, 0.0, 0.0)["hamlet"], "North");
+    }
+
+    #[test]
+    fn query_orders_place_nodes_along_the_street_in_plain_degrees() {
+        // The same measured from a street ending at (0, 0): the northern
+        // hamlet is 0.005° from it, the eastern one 0.0075°.
+        let index = TestIndex::around(HIGH_LATITUDE)
+            .street("West Road", &[(0.0, -300.0), (0.0, 0.0)])
+            .place("East", 4, 0.0, EAST_M)
+            .place("North", 4, NORTH_M, -150.0)
+            .load();
+        let address = address_from(&index, HIGH_LATITUDE, 0.0, -150.0);
+        assert_eq!(address["road"], "West Road");
+        assert_eq!(address["hamlet"], "North");
     }
 
     #[test]
