@@ -94,6 +94,10 @@ impl Ord for Ord32 {
     }
 }
 
+fn context_mask_key(name_id: u32, country_code: u16, admin_level: u8) -> (u32, u16, bool) {
+    (name_id, country_code, admin_level == 2)
+}
+
 /// Best text score per matched fst value.
 type KeyMatches = HashMap<u64, f32>;
 
@@ -320,12 +324,12 @@ impl<'a, 'g> Searcher<'a, 'g> {
     /// name (or ISO code, or country code) matches a word, and that contain the point (the
     /// cell's interior flag, else point-in-polygon only for those boundaries). A one-cell slice
     /// of the reverse lookup, without its field mapping.
-    fn context_mask(&self, ctx: &Context, names: &mut HashMap<u32, u64>, e: u32) -> u64 {
+    fn context_mask(&self, ctx: &Context, names: &mut HashMap<(u32, u16, bool), u64>, e: u32) -> u64 {
         let geo: &Index = self.idx.geo;
         let (lat, lng) = self.idx.ents.point(e);
         let mut m = 0u64;
         for (_, ap, interior) in self.cell_polygons(lat, lng) {
-            let nm = *names.entry(ap.name_id).or_insert_with(|| {
+            let nm = *names.entry(context_mask_key(ap.name_id, ap.country_code, ap.admin_level)).or_insert_with(|| {
                 let folded = normalize(geo.get_string(ap.name_id));
                 let cc = cc_of(ap.country_code);
                 let mut nm = ctx.mask_of(&folded);
@@ -518,7 +522,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
             return;
         }
         cands.sort_by(|a, b| b.potential.total_cmp(&a.potential).then(a.entity.cmp(&b.entity)));
-        let mut names: HashMap<u32, u64> = HashMap::new();
+        let mut names: HashMap<(u32, u16, bool), u64> = HashMap::new();
         let mut checked: HashMap<u32, bool> = HashMap::new();
         for c in cands {
             if c.potential <= pool.cutoff() {
@@ -661,6 +665,17 @@ mod tests {
         assert_eq!(pool.cutoff(), f32::INFINITY);
         pool.top.push(1.0);
         assert_eq!(pool.cutoff(), f32::INFINITY);
+    }
+
+    #[test]
+    fn context_masks_distinguish_country_and_state_codes() {
+        let mut names = HashMap::new();
+        let country = context_mask_key(10, u16::from_le_bytes(*b"GE"), 2);
+        let state = context_mask_key(10, 0, 4);
+        names.insert(country, 1);
+        assert_eq!(*names.entry(state).or_insert(2), 2);
+        assert_ne!(context_mask_key(10, 0, 2), context_mask_key(10, 0, 4));
+        assert_ne!(context_mask_key(10, 1, 4), context_mask_key(10, 2, 4));
     }
 
 }
