@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -97,30 +98,68 @@ inline bool ring_has_self_intersection(const std::vector<std::pair<double,double
     return false;
 }
 
-// Whether any two segments of the rings cross (properly, as
-// segments_intersect: segments that only touch don't count), checked as
-// osmium's SegmentList::find_intersections does before it builds an area:
-// segments sorted by their least longitude, each against those that start
-// within its longitude span.
+// A point in 1e-7 degrees, as osmium's Location: x the longitude, y the
+// latitude, each rounded as coord_key rounds it.
+struct E7Point {
+    int64_t x = 0, y = 0;
+    bool operator==(const E7Point& o) const { return x == o.x && y == o.y; }
+    bool operator<(const E7Point& o) const { return x != o.x ? x < o.x : y < o.y; }
+};
+
+inline int64_t e7(double v) { return static_cast<int32_t>(v * 1e7 + (v >= 0 ? 0.5 : -0.5)); }
+
+inline E7Point e7_point(const std::pair<double,double>& latlng) { return {e7(latlng.second), e7(latlng.first)}; }
+
+// Whether segments p0-p1 and q0-q1 intersect as osmium's area assembler has
+// it (calculate_intersection, area/detail/node_ref_segment.hpp): wherever
+// they meet but at an end both have. An end on the other segment's inside
+// counts, and so do segments in line that overlap; the same segment twice,
+// and segments in line meeting end to end, don't.
+inline bool area_segments_intersect(E7Point p0, E7Point p1, E7Point q0, E7Point q1) {
+    if ((p0 == q0 && p1 == q1) || (p0 == q1 && p1 == q0)) return false;
+    const auto minus = [](E7Point a, E7Point b) { return E7Point{a.x - b.x, a.y - b.y}; };
+    const auto cross = [](E7Point a, E7Point b) {
+        return static_cast<__int128>(a.x) * b.y - static_cast<__int128>(a.y) * b.x;
+    };
+    const E7Point pd = minus(p1, p0);
+    const __int128 d = cross(pd, minus(q1, q0));
+    if (d != 0) {
+        if (p0 == q0 || p0 == q1 || p1 == q0 || p1 == q1) return false;
+        const __int128 na = cross(minus(q1, q0), minus(p0, q0));
+        const __int128 nb = cross(pd, minus(p0, q0));
+        return d > 0 ? na >= 0 && na <= d && nb >= 0 && nb <= d
+                     : na <= 0 && na >= d && nb <= 0 && nb >= d;
+    }
+    if (cross(pd, minus(q0, p0)) != 0) return false;  // parallel, on two lines
+    // In line: they overlap where the two least ends are of different
+    // segments, unless the middle two ends are one point.
+    std::array<std::pair<E7Point, int>, 4> ends{{{p0, 0}, {p1, 0}, {q0, 1}, {q1, 1}}};
+    std::sort(ends.begin(), ends.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    if (ends[1].first == ends[2].first) return false;
+    return ends[0].second != ends[1].second;
+}
+
+// Whether any two segments of the rings intersect (area_segments_intersect),
+// checked as osmium's SegmentList::find_intersections does before it builds
+// an area: segments sorted by their least longitude, each against those that
+// start within its longitude span.
 inline bool rings_cross(const std::vector<std::vector<std::pair<double,double>>>& rings) {
-    struct Seg { double lng_lo, lng_hi, lat_lo, lat_hi; const std::pair<double,double>* a; };
+    struct Seg { E7Point lo, hi; };  // hi.x >= lo.x
     std::vector<Seg> segs;
     for (const auto& r : rings)
         for (size_t i = 0; i + 1 < r.size(); i++) {
-            const auto& p = r[i];
-            const auto& q = r[i + 1];
-            segs.push_back({std::min(p.second, q.second), std::max(p.second, q.second),
-                            std::min(p.first, q.first), std::max(p.first, q.first), &p});
+            E7Point a = e7_point(r[i]), b = e7_point(r[i + 1]);
+            if (b < a) std::swap(a, b);
+            segs.push_back({a, b});
         }
-    std::sort(segs.begin(), segs.end(), [](const Seg& x, const Seg& y) { return x.lng_lo < y.lng_lo; });
+    std::sort(segs.begin(), segs.end(), [](const Seg& s, const Seg& t) { return s.lo.x < t.lo.x; });
     for (size_t i = 0; i < segs.size(); i++) {
         const Seg& s = segs[i];
-        for (size_t j = i + 1; j < segs.size() && segs[j].lng_lo <= s.lng_hi; j++) {
+        const auto [s_y_lo, s_y_hi] = std::minmax(s.lo.y, s.hi.y);
+        for (size_t j = i + 1; j < segs.size() && segs[j].lo.x <= s.hi.x; j++) {
             const Seg& t = segs[j];
-            if (t.lat_lo > s.lat_hi || t.lat_hi < s.lat_lo) continue;
-            if (segments_intersect(s.a[0].first, s.a[0].second, s.a[1].first, s.a[1].second,
-                                   t.a[0].first, t.a[0].second, t.a[1].first, t.a[1].second))
-                return true;
+            if (std::min(t.lo.y, t.hi.y) > s_y_hi || std::max(t.lo.y, t.hi.y) < s_y_lo) continue;
+            if (area_segments_intersect(s.lo, s.hi, t.lo, t.hi)) return true;
         }
     }
     return false;
