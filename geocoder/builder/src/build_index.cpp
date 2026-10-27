@@ -1158,25 +1158,15 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
         // assembly and closed-way admins) before building the name index:
         // Nominatim's find_linked_place only considers places without a
         // linked_place_id, so an already-claimed node must neither match
-        // here nor surface in results.
-        if (!data.linked_place_node_ids.empty()) {
-            std::unordered_set<uint64_t> packed;
-            packed.reserve(data.linked_place_node_ids.size());
-            for (int64_t nid : data.linked_place_node_ids) {
-                packed.insert(pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, nid));
-            }
-            size_t hidden = 0;
-            size_t n = std::min(data.place_nodes.size(), data.place_osm_ids.size());
-            for (size_t i = 0; i < n; i++) {
-                if (data.place_nodes[i].name_id == NO_DATA) continue;
-                if (packed.count(data.place_osm_ids[i])) {
-                    data.place_nodes[i].name_id = NO_DATA;
-                    hidden++;
-                }
-            }
+        // here nor surface in results. A hidden node keeps its name and
+        // names its claimant's polygon (place_claims.h).
+        if (!data.place_claims.empty()) {
+            const size_t claims = data.place_claims.size();
+            const size_t hidden = hide_claimed_place_nodes(data.place_nodes, data.place_osm_ids,
+                std::move(data.place_claims), data.admin_polygons, data.admin_osm_ids, num_threads);
+            std::vector<PlaceClaim>().swap(data.place_claims);
             std::cerr << "find_linked_place label/wikidata: hid " << hidden
-                      << " linked place nodes (" << packed.size()
-                      << " claimed ids)" << std::endl;
+                      << " linked place nodes (" << claims << " claims)" << std::endl;
         }
 
         // (normalised name, node) of every named node, sorted on every core:
@@ -1186,7 +1176,7 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
         std::vector<NamedPlace> named = parallel_collect<NamedPlace>(data.place_nodes.size(),
             [&](size_t i, std::vector<NamedPlace>& out) {
                 const auto& pn = data.place_nodes[i];
-                if (pn.name_id == NO_DATA) return;
+                if (place_node_hidden(pn)) return;
                 const char* nm = pool_data.data() + pn.name_id;
                 if (!nm[0]) return;
                 std::string nn = normalise_for_matching(nm);
@@ -1228,12 +1218,12 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
         std::atomic<uint64_t> linked{0};
         std::atomic<uint64_t> considered{0};
         std::vector<std::thread> nl_workers;
-        // Node indices consumed by a link, per worker. Nominatim sets
-        // linked_place_id on the node when a boundary links it, hiding it
-        // from all results (the boundary represents it). We mirror that by
-        // clearing the node's name after the join below.
+        // (node, polygon) of each link. Nominatim sets linked_place_id on
+        // the node when a boundary links it, hiding it from all results
+        // (the boundary represents it). We mirror that by flagging the node
+        // after the join below.
         std::mutex linked_nodes_mutex;
-        std::vector<uint32_t> linked_nodes;
+        std::vector<std::pair<uint32_t, uint32_t>> linked_nodes;
         const double max_dist_deg = 0.5;
         const double max_dist_sq = max_dist_deg * max_dist_deg;
 
@@ -1330,7 +1320,7 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
                             poly.place_type_override = pto;
                             linked.fetch_add(1);
                             std::lock_guard<std::mutex> lk(linked_nodes_mutex);
-                            linked_nodes.push_back(best_idx);
+                            linked_nodes.push_back({best_idx, static_cast<uint32_t>(i)});
                         }
                     }
                 }
@@ -1338,16 +1328,18 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
         }
         for (auto& w : nl_workers) w.join();
 
-        // Hide linked nodes: clearing the name makes the server's
+        // Hide linked nodes: PLACE_FLAG_HIDDEN makes the server's
         // place_node() accessor return None everywhere (find_places,
         // containment, fallbacks) — the same observable effect as
         // Nominatim's linked_place_id. Deterministic regardless of worker
-        // scheduling: the SET of linked nodes is order-independent.
-        std::sort(linked_nodes.begin(), linked_nodes.end());
-        linked_nodes.erase(std::unique(linked_nodes.begin(), linked_nodes.end()), linked_nodes.end());
-        for (uint32_t idx : linked_nodes) {
-            data.place_nodes[idx].name_id = NO_DATA;
-        }
+        // scheduling: the set of links is order-independent, and a node
+        // several boundaries link names the one claim_wins picks.
+        const size_t name_hidden = hide_name_linked_place_nodes(data.place_nodes, std::move(linked_nodes),
+                                                                data.admin_polygons, data.admin_osm_ids);
+        const size_t labelled = parallel_count(data.place_nodes.size(),
+            [&](size_t i) { return (data.place_nodes[i]._pad1 & PLACE_FLAG_LABEL_OF) != 0; }, num_threads);
+        std::cerr << "Hidden place nodes: " << name_hidden << " linked by name; " << labelled
+                  << " name their claiming polygon" << std::endl;
 
         double _nl_elapsed = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - _nl_t).count();
@@ -1861,7 +1853,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                         PlaceNode pn = d.place_nodes[i];
                         // Parents in this dir's own polygon slots (NO_DATA when
                         // the parent polygon isn't kept), like every other id here.
-                        pn.parent_poly_id = pn.parent_poly_id < poly_remap.size() ? poly_remap[pn.parent_poly_id] : NO_DATA;
+                        remap_place_parent(pn, poly_remap);
                         filtered_places.push_back(pn);
                     }
                 }
@@ -4141,9 +4133,10 @@ static int run(int argc, char* argv[]) {
                                         cwa_wikidata_linked++;
                                         auto nit = wikidata_place_node_ids.find(cwa.wikidata);
                                         if (nit != wikidata_place_node_ids.end()) {
-                                            data.linked_place_node_ids.insert(
-                                                data.linked_place_node_ids.end(),
-                                                nit->second.begin(), nit->second.end());
+                                            for (int64_t nid : nit->second)
+                                                data.place_claims.push_back(
+                                                    {pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, nid),
+                                                     way_boundary_id(cwa.way_id), false});
                                         }
                                     }
                                 }
@@ -4341,7 +4334,9 @@ static int run(int argc, char* argv[]) {
                                             // (Nominatim linked_place_id) —
                                             // hide it from results.
                                             std::lock_guard<std::mutex> lk(*data.linked_pn_mutex);
-                                            data.linked_place_node_ids.push_back(rel.label_node_id);
+                                            data.place_claims.push_back(
+                                                {pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, rel.label_node_id),
+                                                 relation_boundary_id(rel.id), true});
                                         }
                                     }
                                 }
@@ -4354,9 +4349,10 @@ static int run(int argc, char* argv[]) {
                                             auto nit = wikidata_place_node_ids.find(rel_wikidata[i]);
                                             if (nit != wikidata_place_node_ids.end()) {
                                                 std::lock_guard<std::mutex> lk(*data.linked_pn_mutex);
-                                                data.linked_place_node_ids.insert(
-                                                    data.linked_place_node_ids.end(),
-                                                    nit->second.begin(), nit->second.end());
+                                                for (int64_t nid : nit->second)
+                                                    data.place_claims.push_back(
+                                                        {pack_osm_id(gc::id_alloc::ObjectType::OSM_NODE, nid),
+                                                         relation_boundary_id(rel.id), false});
                                             }
                                         }
                                     }
@@ -4515,10 +4511,7 @@ static int run(int argc, char* argv[]) {
                             // ~20M relations, so this fits 56 bits comfortably).
                             // The type byte keeps relation ids from colliding
                             // with closed-way ids (which use OSM_WAY + way_id).
-                            data.admin_osm_ids[poly_base + k] =
-                                (static_cast<uint64_t>(gc::id_alloc::ObjectType::OSM_RELATION) << 56) |
-                                ((((static_cast<uint64_t>(pp.relation_id) << 16) |
-                                   static_cast<uint64_t>(pp.ring_index))) & 0x00FFFFFFFFFFFFFFull);
+                            data.admin_osm_ids[poly_base + k] = admin_ring_id(pp.relation_id, pp.ring_index);
 
                             cover[k] = {static_cast<uint32_t>(poly_base + k), std::move(pp.simplified), pp.hole_count};
                         }

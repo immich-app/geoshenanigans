@@ -239,12 +239,20 @@ enum class PlaceType : uint8_t {
     UNKNOWN = 255
 };
 
+// PlaceNode._pad1 bits (place_claims.h; read by the server's place_node()
+// and geocoder/search/src/model.rs).
+// A boundary claims the node (Nominatim's linked_place_id): every reverse
+// lookup skips it, as it skips a nameless node; it keeps its name for search.
+static constexpr uint8_t PLACE_FLAG_HIDDEN = 0x02;
+// parent_poly_id is the claiming boundary's polygon, not the containing one.
+static constexpr uint8_t PLACE_FLAG_LABEL_OF = 0x01;
+
 struct PlaceNode {
     float lat;
     float lng;
     uint32_t name_id;       // into strings.bin
     uint8_t place_type;     // PlaceType
-    uint8_t _pad1 = 0;
+    uint8_t _pad1 = 0;      // PLACE_FLAG_* bits
     uint16_t _pad2 = 0;
     // Smallest admin polygon (by area) that contains this place node's
     // centroid. Used to gate nearest-place fallback lookups at query
@@ -252,6 +260,8 @@ struct PlaceNode {
     // query point is inside the polygon referenced here. Mirrors
     // Nominatim's insert_addresslines containment check at indexing.
     // NO_DATA means "unknown / no containing admin polygon".
+    // With PLACE_FLAG_LABEL_OF: the polygon of the boundary that claims
+    // the node instead.
     uint32_t parent_poly_id = NO_DATA;
 };  // 20 bytes
 static_assert(sizeof(PlaceNode) == 20, "PlaceNode must be 20 bytes");
