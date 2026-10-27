@@ -72,8 +72,12 @@ std::vector<SubWay> split_sub_ways(const std::vector<CoordSpan>& way_coords, con
 }
 
 // Sub-ways running over the same coordinates (either way round) cancel in
-// pairs, as osmium's erase_duplicate_segments drops duplicate segments: a way
-// listed twice, or two ways mapped on top of each other, leaves no edge.
+// pairs, as osmium's erase_duplicate_segments drops duplicate segments: two
+// ways mapped on top of each other leave no edge, and nor does a way listed
+// twice. osm2pgsql hands its area assembler a copy of the way for each
+// member listing it (middle rel_members_get) and takes the segments of every
+// copy (geom::area_assembler_t), where osmium's own multipolygon Assembler
+// would skip the repeated way id (SegmentList::extract_segments_from_ways).
 uint32_t cancel_duplicate_sub_ways(std::vector<SubWay>& sub_ways) {
     auto same = [](const Coords& a, const Coords& b) {
         if (a.size() != b.size()) return false;

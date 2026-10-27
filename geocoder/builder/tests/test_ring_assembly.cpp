@@ -270,19 +270,33 @@ TEST(area_rings_fail_on_an_open_ring) {
     CHECK(a.failure == AreaFailure::OpenRing);
 }
 
-// A way listed twice cancels out, as osmium drops duplicate segments in
-// pairs: two squares sharing a side, with the shared side in the relation
-// twice, are one rectangle.
+// A way listed twice cancels out, as in osm2pgsql, which gives osmium the
+// way once for each member listing it, so its segments are duplicates
+// dropped in pairs. Two squares sharing a side, with the shared side in the
+// relation twice (or two ways mapped on it), are one rectangle; a closed way
+// listed twice leaves no ring, and half an outline listed twice leaves the
+// other half open.
 TEST(area_rings_cancel_ways_listed_twice) {
     WayGeometries geoms;
     add_way(geoms, 1, {{0.0, 1.0}, {0.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}});
     add_way(geoms, 2, {{0.0, 1.0}, {0.0, 2.0}, {1.0, 2.0}, {1.0, 1.0}});
     add_way(geoms, 3, {{0.0, 1.0}, {1.0, 1.0}});
-    const std::vector<std::pair<int64_t, std::string>> members = {{1, "outer"}, {3, "outer"}, {2, "outer"}, {3, "outer"}};
-    const AreaRings a = assemble_area_rings(members, geoms);
-    REQUIRE(a.rings.size() == size_t(1));
-    CHECK_EQ(a.rings[0].size(), size_t(7));
-    CHECK_EQ(a.cancelled_sub_ways, 2u);
+    add_way(geoms, 4, {{1.0, 1.0}, {0.0, 1.0}});
+    add_way(geoms, 5, {{5.0, 5.0}, {5.0, 6.0}, {6.0, 6.0}, {6.0, 5.0}, {5.0, 5.0}});
+    using Members = std::vector<std::pair<int64_t, std::string>>;
+    for (const Members& members : {Members{{1, "outer"}, {3, "outer"}, {2, "outer"}, {3, "outer"}},
+                                   Members{{1, "outer"}, {3, "outer"}, {2, "outer"}, {4, "outer"}}}) {
+        const AreaRings a = assemble_area_rings(members, geoms);
+        REQUIRE(a.rings.size() == size_t(1));
+        CHECK_EQ(a.rings[0].size(), size_t(7));
+        CHECK_EQ(a.cancelled_sub_ways, 2u);
+    }
+    const AreaRings square = assemble_area_rings({{5, "outer"}, {5, "outer"}}, geoms);
+    CHECK(square.failure == AreaFailure::None);
+    CHECK(square.rings.empty());
+    const AreaRings half = assemble_area_rings({{1, "outer"}, {2, "outer"}, {1, "outer"}}, geoms);
+    CHECK(half.rings.empty());
+    CHECK(half.failure == AreaFailure::OpenRing);
 }
 
 // Crossing segments fail the area too, whether in one ring (stitched or a
