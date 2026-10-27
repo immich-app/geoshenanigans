@@ -39,7 +39,8 @@ S2CellId point_to_cell(double lat, double lng);
 
 // The kAdminCellLevel cells covering a polygon, each flagged when it lies
 // wholly inside. `vertices` is a closed ring, or a keyhole range with
-// `holes` holes (polygon_rings.h) whose cells inside a hole are left out.
+// `holes` holes (polygon_rings.h): the cells cover its outer ring, and only
+// those wholly outside the holes are flagged.
 std::vector<std::pair<S2CellId, bool>> cover_polygon(
     const std::vector<std::pair<double,double>>& vertices, uint16_t holes = 0);
 
