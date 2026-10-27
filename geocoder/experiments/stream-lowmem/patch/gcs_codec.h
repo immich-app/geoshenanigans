@@ -901,8 +901,8 @@ struct Dec : Decoder {
         const int enc = tag & 3, wide = (tag >> 2) & 1, small = (tag >> 3) & 1, closed = (tag >> 4) & 1;
         if (enc > 2 || (tag & 0xE0)) die("addr %llu: bad tag", (unsigned long long)i);
         const uint64_t cnt = A->uv();
+        if (cnt > 69999 - uint64_t(closed) || (closed && !cnt)) die("addr %llu: bad count", (unsigned long long)i);
         const uint32_t full = uint32_t(cnt) + uint32_t(closed);
-        if (full > 69999 || (closed && !cnt)) die("addr %llu: bad count", (unsigned long long)i);
         rec[6] = full;
         emit(0, rec, 28);
         const size_t bsz = 10 + 4 * size_t(full);

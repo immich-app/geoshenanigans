@@ -403,8 +403,8 @@ inline void decode_points_only(const std::string& src, const Manifest& m, const 
                 const int enc = tag & 3, wide = (tag >> 2) & 1, small = (tag >> 3) & 1, closed = (tag >> 4) & 1;
                 if (enc > 2 || (tag & 0xE0)) die("addr %llu: bad tag", (unsigned long long)i);
                 const uint64_t cnt = A.uv();
+                if (cnt > 69999 - uint64_t(closed) || (closed && !cnt)) die("addr %llu: bad count", (unsigned long long)i);
                 const uint32_t full = uint32_t(cnt) + uint32_t(closed);
-                if (full > 69999 || (closed && !cnt)) die("addr %llu: bad count", (unsigned long long)i);
                 A.skip((small ? 2 : 8) + 2 * size_t(cnt) * (wide ? 2 : 1));
                 rec[6] = full;
                 raw += 10 + 4 * uint64_t(full);
@@ -461,8 +461,8 @@ inline void decode(const std::string& src, const std::string& out, const Manifes
                 const int enc = tag & 3, wide = (tag >> 2) & 1, small = (tag >> 3) & 1, closed = (tag >> 4) & 1;
                 if (enc > 2 || (tag & 0xE0)) die("addr %llu: bad tag", (unsigned long long)i);
                 const uint64_t cnt = A.uv();
+                if (cnt > 69999 - uint64_t(closed) || (closed && !cnt)) die("addr %llu: bad count", (unsigned long long)i);
                 const uint32_t full = uint32_t(cnt) + uint32_t(closed);
-                if (full > 69999 || (closed && !cnt)) die("addr %llu: bad count", (unsigned long long)i);
                 uint8_t bm[8];
                 memcpy(bm, A.take(small ? 2 : 8), small ? 2 : 8);
                 int64_t sl = 0, sg = 0;
