@@ -325,6 +325,13 @@ static int run(int argc, char* argv[]) {
     // Low-memory client update: an encoded installed set (gc.manifest) is decoded and the new set
     // encoded in process.
     gcs::store().init(cur_dir, out_dir);
+    // A staged apply writes part of the new set; its gc.manifest would list every encoded family
+    // with only this stage's keys.
+    if (gcs::store().active && !only.empty()) {
+        std::cerr << "--only does not apply to an encoded installed set (" << cur_dir << "/gc.manifest): apply the whole patch"
+                  << std::endl;
+        return 1;
+    }
     if (gcs::store().active) {
         stream_source_factory() = [](const std::string& p) { return gcs::store().open_source(p); };
         virtual_size_hook() = [](const std::string& dir, const std::string& name, uint64_t expected) -> bool {
