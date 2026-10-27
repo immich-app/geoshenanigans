@@ -229,7 +229,7 @@ are read by position, everything after them by marker):
 
 ```
 Header: "GCPATCH\0" (8) + version=8 (u32) + flags=0 (u32)
-  (a v8 patcher still applies v7 patches; the v8 changes are marked below)
+  (a v8 patcher accepts only v8 patches; the v8 changes are marked below)
 
 Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
   + n × {name_len:u16, name, size:u64, inline:u8, [bytes] if inline}
