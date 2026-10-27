@@ -15,7 +15,8 @@ static std::vector<uint32_t> values() {
     return v;
 }
 
-// 0: the error reached the catch; 3: an error without the file's path; 4: no error at all.
+// 0: the error reached the catch (mode 3: every byte is in the file); 3: an error without the file's
+// path; 4: no error at all; 8: an error in mode 3, which has no limit.
 static int run_case(int mode, const std::string& dir) {
     try {
         if (mode == 0 || mode == 3) {  // U24Enc: its last buffer goes out in finish()
@@ -42,6 +43,10 @@ static int run_case(int mode, const std::string& dir) {
             w.finish();
         }
     } catch (const std::runtime_error& e) {
+        if (mode == 3) {
+            fprintf(stderr, "mode 3: %s\n", e.what());
+            return 8;
+        }
         return std::string(e.what()).find(dir) != std::string::npos ? 0 : 3;
     }
     return 4;
