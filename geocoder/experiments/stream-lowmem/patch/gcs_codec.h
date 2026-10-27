@@ -367,6 +367,8 @@ struct Enc : Encoder {
         m.set(k + ".nodes", nodes);
         m.set(k + ".G", G);
         m.set(k + ".nodes2_bytes", nodes2->tell());
+        for (Writer* x : {groups.get(), nodes2.get(), c0.get(), c1.get(), c2.get(), c3.get(), c4.get()})
+            if (x) x->finish();
         groups.reset(); nodes2.reset(); c0.reset(); c1.reset(); c2.reset(); c3.reset(); c4.reset();
     }
 };
@@ -421,6 +423,7 @@ struct U24Enc : Encoder {
     void finish(Manifest& m) override {
         require_empty();
         m.set("way_parents.n", n);
+        w->finish();
         w.reset();
     }
 };
@@ -523,6 +526,7 @@ struct DictEnc : Encoder {
         {
             Writer d(out_dir + "/" + name + ".dict", 16 << 10);
             for (uint32_t j : order) d.u32(dict[j]);
+            d.finish();
         }
         if (!identity) {
             const std::string p = out_dir + "/" + name + ".u16";
@@ -825,6 +829,7 @@ struct Enc : Encoder {
         m.set("gxc.B", B);
         m.set("gxc.addr_ids", next);
         for (int t = 0; t < 3; t++) m.set(std::string("gxc.") + ENTRY[t], eoff[t]);
+        for (Writer* x : {top.get(), rows.get(), st[0].get(), st[1].get()}) x->finish();
         top.reset(); rows.reset(); st[0].reset(); st[1].reset();
     }
 };
@@ -959,6 +964,9 @@ struct Enc : Encoder {
         for (int k = 0; k < 15; k++) w.emplace_back(new Writer(fd, cp, col_region(k, N), region_buf(k)));
         A.reset(new Writer(od + "/addr_vertices.abs2"));
     }
+    ~Enc() override {
+        if (fd >= 0) close(fd);
+    }
     void put_po(uint32_t v) { for (int b = 0; b < 4; b++) w[size_t(11 + b)]->u8(uint8_t(v >> (8 * b))); }
     void pump() override {
         ByteQueue &P = in[0], &V = in[1];
@@ -1038,11 +1046,15 @@ struct Enc : Encoder {
     void finish(Manifest& m) override {
         require_empty();
         if (i != N) die("addr: %llu records, addr_points.bin's size gives %llu", (unsigned long long)i, (unsigned long long)N);
+        for (auto& x : w) x->finish();
         w.clear();
-        if (close(fd)) die("close addr_points.col");
+        const int f = fd;
+        fd = -1;
+        if (close(f)) die("close addr_points.col");
         m.set("addr.n", N);
         m.set("addr.layout", "col");
         m.set("addr.abs2_bytes", A->tell());
+        A->finish();
         A.reset();
     }
 };
@@ -1200,6 +1212,9 @@ struct AdminEnc : Encoder {
         fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
         if (fd < 0) die("create %s", path.c_str());
     }
+    ~AdminEnc() override {
+        if (fd >= 0) close(fd);
+    }
     void pump() override {
         if (!pc) pc.reset(new PolyCursor(out_dir + "/admin_polygons.bin"));
         ByteQueue& q = in[0];
@@ -1250,6 +1265,7 @@ struct AdminEnc : Encoder {
             q.pop(size_t(avail) * vs);
             k += avail;
             if (k < cnt) return;
+            for (auto& x : pl) x->finish();
             pl.clear();
             pos += size;
             in_poly = false;
@@ -1271,8 +1287,11 @@ struct AdminEnc : Encoder {
         if (in_poly) die("admin_vertices: stream ends inside a polygon");
         uint64_t off, c;
         if (pc->next(off, c)) die("admin_vertices: stream ends before the last polygon");
+        if (W) W->finish();
         W.reset();
-        if (close(fd)) die("close %s", path.c_str());
+        const int f = fd;
+        fd = -1;
+        if (close(f)) die("close %s", path.c_str());
         m.set("admin.polygons", pc->n);
     }
 };
@@ -1436,7 +1455,7 @@ struct PoiEnc : Encoder {
         const size_t vs = 2 * size_t(w);
         const uint64_t vc = big_vc, base = big_start + 10;
         const bool closed = vc > 1 && memcmp(last, big_first, vs) == 0;
-        for (auto& x : pl) x->flush();
+        for (auto& x : pl) x->finish();
         pl.clear();
         uint64_t c2 = vc - 1;
         if (!closed) {
@@ -1544,6 +1563,8 @@ struct PoiEnc : Encoder {
         if (big) die("poi_vertices: stream ends inside a block");
         m.set("poi.bopen_bytes", O->tell());
         m.set("poi.n", n);
+        O->finish();
+        RW->finish();
         O.reset();
         RW.reset();
     }

@@ -187,7 +187,12 @@ struct Writer {
         buf.resize(cap);
     }
     Writer(const Writer&) = delete;
-    ~Writer() noexcept(false) { finish(); }
+    // Cleanup only: what finish() has not written is dropped. A destructor runs inside
+    // unique_ptr::reset() and vector::clear() (noexcept) and while an error unwinds, where a failed
+    // write could only terminate the process; so every writer's last bytes go out through finish().
+    ~Writer() {
+        if (fd >= 0 && own) close(fd);
+    }
     uint64_t tell() const { return written + len; }
     // Moves the write position forward to `at` (what lies between was written positionally).
     void skip_to(uint64_t at) {
@@ -207,11 +212,14 @@ struct Writer {
         written += len;
         len = 0;
     }
+    // Writes the buffered bytes and closes the file (a region writer leaves the shared fd open).
+    // A failed write leaves the descriptor to the destructor, which closes it without retrying.
     void finish() {
         if (fd < 0) return;
         flush();
-        if (own && close(fd)) die("close %s: %s", path.c_str(), strerror(errno));
+        const int f = fd;
         fd = -1;
+        if (own && close(f)) die("close %s: %s", path.c_str(), strerror(errno));
     }
     inline void put(const void* p, size_t n) {
         if (len + n > cap) {
@@ -336,6 +344,7 @@ struct Manifest {
         for (auto& [k, v] : kv) s += k + " " + v + "\n";
         Writer w(path, 1 << 12);
         w.put(s.data(), s.size());
+        w.finish();
     }
     void load(const std::string& path) {
         FILE* f = fopen(path.c_str(), "r");
