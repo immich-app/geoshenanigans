@@ -133,7 +133,8 @@ pub const MAJOR_LANGUAGES: [&str; 41] = [
 
 // ------------------------------------------------------------------ postings
 
-/// One entity under one key. `ord` 0 is the record's own name, k the k-th extra name.
+/// One entity under one key. `ord` 0 is the record's own name, k the k-th extra name of the
+/// entity's records (`Entities::record_refs`: a labelled boundary has its label node's too).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Posting {
     pub entity: u32,
