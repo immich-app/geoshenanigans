@@ -1114,7 +1114,7 @@ mod tests {
                 .map(|_| {
                     entity += 1;
                     let key = format!("k{}", rng.next() % 50).into_bytes();
-                    (key, posting(entity, (rng.next() % 200) as u8, rng.next() % 2 == 0, (rng.next() % 6) as u8))
+                    (key, posting(entity, (rng.next() % 200) as u8, rng.next().is_multiple_of(2), (rng.next() % 6) as u8))
                 })
                 .collect();
             files.push(write_run(dir, &format!("t-{r}.run"), &mut run));
@@ -1276,7 +1276,7 @@ mod tests {
         let mut rng = Rng(3);
         for n in [1, 5, PARTIAL_CAP, PARTIAL_CAP + 1, 3 * PARTIAL_CAP + 17] {
             let postings: Vec<Posting> =
-                (0..n as u32).map(|e| posting(e * 3, (rng.next() % 40) as u8, rng.next() % 4 != 0, (rng.next() % 6) as u8)).collect();
+                (0..n as u32).map(|e| posting(e * 3, (rng.next() % 40) as u8, !rng.next().is_multiple_of(4), (rng.next() % 6) as u8)).collect();
             let mut sut = Group::default();
             for p in &postings {
                 sut.push(*p);
