@@ -165,7 +165,11 @@ add_executable(geocoder-tests
 target_include_directories(geocoder-tests PRIVATE src tools tests)
 target_compile_definitions(geocoder-tests PRIVATE
     GEOCODER_TEMPLATE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/configurations.template.json"
+    GEOCODER_DIFF_BIN="$<TARGET_FILE:geocoder-diff>"
+    GEOCODER_PATCH_BIN="$<TARGET_FILE:geocoder-patch>"
     _FILE_OFFSET_BITS=64)
+# tests/test_patch_roundtrip.cpp runs the two tools.
+add_dependencies(geocoder-tests geocoder-diff geocoder-patch)
 target_link_libraries(geocoder-tests PRIVATE ZLIB::ZLIB libdeflate::libdeflate EXPAT::EXPAT Threads::Threads)
 add_test(NAME geocoder-tests COMMAND geocoder-tests)
 

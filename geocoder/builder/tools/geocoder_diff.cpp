@@ -468,6 +468,21 @@ static bool same_bytes(const char* a, size_t an, const char* b, size_t bn) {
     return an == bn && (an == 0 || memcmp(a, b, an) == 0);
 }
 
+// A record file serialize_merge sends as COPY_OLD (try_emit_copy_old's test,
+// on the raw bytes): the patcher copies it, so every record keeps its id
+// whatever the string remap makes of its fields. Its merge is then one MATCH
+// of every record with no id remap and no secondary pairs, so the entry
+// corrections, the street remap of the addresses and the side files start
+// from the ids the patcher keeps.
+static bool sent_unchanged(const char* a, size_t an, const char* b, size_t bn) {
+    return an > 0 && same_bytes(a, an, b, bn);
+}
+static MergeSequence match_all(size_t n_records) {
+    MergeSequence seq;
+    if (n_records) seq.add_match(static_cast<uint32_t>(n_records));
+    return seq;
+}
+
 // --- Per-file merge result (computed in parallel, serialized sequentially) ---
 struct FileMergeResult {
     PatchFileId id;
@@ -488,9 +503,9 @@ struct FileMergeResult {
 // returns null → same=false), so the patcher's copy from cur_dir always has a
 // real source. memcmp via mmap is cheap relative to the bytes saved.
 //
-// Safe even for data files that feed entry corrections: byte-identity of the
-// source forces an identity id_remap (the fixup passes are skipped for identical
-// files), so the patcher reconstructs dependents with the same identity remap.
+// A record file that feeds entry corrections merges as itself when unchanged
+// (sent_unchanged), so the diff derives its dependents with the ids the
+// patcher keeps.
 static bool try_emit_copy_old(std::vector<char>& patch, uint32_t fid,
                               const std::string& old_path, const std::string& new_path,
                               uint64_t old_size, uint64_t new_size, const char* log_name) {
@@ -514,7 +529,7 @@ static bool try_emit_copy_old(std::vector<char>& patch, uint32_t fid,
 }
 
 // Serialize a pre-computed merge result into the patch buffer
-static bool serialize_merge(std::vector<char>& patch, const FileMergeResult& r,
+static void serialize_merge(std::vector<char>& patch, const FileMergeResult& r,
                             const std::string& old_dir = "",
                             const std::string& new_dir = "") {
     auto wv = [&](const void* data, size_t size) {
@@ -534,7 +549,7 @@ static bool serialize_merge(std::vector<char>& patch, const FileMergeResult& r,
         try_emit_copy_old(patch, static_cast<uint32_t>(r.id),
                           old_dir + "/" + r.name, new_dir + "/" + r.name,
                           r.old_size, r.new_size, r.name.c_str()))
-        return true;
+        return;
     uint32_t fid = static_cast<uint32_t>(r.id);
     uint32_t st = static_cast<uint32_t>(r.stride);
     const OffsetFixups& f = r.fixups;
@@ -547,7 +562,6 @@ static bool serialize_merge(std::vector<char>& patch, const FileMergeResult& r,
     uint64_t ss = r.seq.data.size();
     wv(&ss, 8);
     patch.insert(patch.end(), r.seq.data.begin(), r.seq.data.end());
-    return false;
 }
 
 static std::mutex log_mutex;
@@ -886,6 +900,7 @@ static int run(int argc, char* argv[]) {
         if (addr_stride >= 28 && !same_bytes(old_m.data, old_m.size, new_m.data, new_m.size))
             addr_ids = identity_of("addr", old_m.size / addr_stride, new_m.size / addr_stride);
         const bool addr_identity = !addr_ids.first.empty();
+        const bool unchanged = sent_unchanged(old_m.data, old_m.size, new_m.data, new_m.size);
         remap_addr_points(old_m.data, old_m.size, str_remap);
         // Identify polygon-bearing addr_points across builds by polygon
         // VERTEX BYTE CONTENT (purely content-hash; key_fn returns 0 so
@@ -916,7 +931,7 @@ static int run(int argc, char* argv[]) {
             for (size_t i = 0; i < n_old; i++)
                 memcpy(&old_vert_offsets[i],
                        old_m.data + i * addr_stride + 20, 4);
-            if (!addr_identity)
+            if (!addr_identity && !unchanged)
                 addr_keys = v15_fixup_keys(old_m.data, old_m.size, old_av_data, old_av.size,
                                            new_m.data, new_m.size, new_av_data, new_av.size,
                                            addr_stride, /*off_field_pos*/ 20,
@@ -937,7 +952,9 @@ static int run(int argc, char* argv[]) {
         MergeSequence seq;
         std::unordered_map<uint32_t, uint32_t> soft;
         OffsetFixups addr_fixups;
-        if (addr_identity) {
+        if (unchanged) {
+            seq = match_all(old_m.size / addr_stride);
+        } else if (addr_identity) {
             auto f = identity_family(old_m.data, old_m.size, new_m.data, new_m.size, addr_stride,
                                      ADDR_POINT_VERTEX_OFFSET_OFF, old_vert_offsets, addr_ids.first, addr_ids.second);
             seq = std::move(f.seq); addr_fixups = std::move(f.fixups); soft = std::move(f.moved);
@@ -965,7 +982,8 @@ static int run(int argc, char* argv[]) {
             addr_fixups = collect_offset_fixups(old_vert_offsets, old_m.data, addr_stride,
                                                 ADDR_POINT_VERTEX_OFFSET_OFF);
         }
-        auto id_rm = derive_id_remap_from_merge(seq, old_m.size / addr_stride, addr_stride);
+        auto id_rm = unchanged ? std::vector<uint32_t>{}
+                               : derive_id_remap_from_merge(seq, old_m.size / addr_stride, addr_stride);
         for (auto& [o,n] : soft) if (o < id_rm.size()) id_rm[o] = n;
         res_addr = {PatchFileId::ADDR_POINTS, "addr_points.bin", addr_stride,
                     old_m.size, new_m.size, std::move(seq), std::move(addr_fixups),
@@ -1020,6 +1038,7 @@ static int run(int argc, char* argv[]) {
         auto [new_w, nw_fb] = try_load_with_fallback(new_dir, "street_ways.bin",
                                                       {"../full/", "../../full/"});
         street_from_fallback = (ow_fb || nw_fb);
+        const bool unchanged = !street_from_fallback && sent_unchanged(old_w.data, old_w.size, new_w.data, new_w.size);
         std::pair<std::vector<uint32_t>, std::vector<uint32_t>> street_ids;
         if (!street_from_fallback && !same_bytes(old_w.data, old_w.size, new_w.data, new_w.size))
             street_ids = identity_of("street", old_w.size / way_stride, new_w.size / way_stride);
@@ -1057,7 +1076,9 @@ static int run(int argc, char* argv[]) {
         MergeSequence way_seq;
         OffsetFixups fixups;
         std::unordered_map<uint32_t, uint32_t> soft;
-        if (!street_ids.first.empty()) {
+        if (unchanged) {
+            way_seq = match_all(wn);
+        } else if (!street_ids.first.empty()) {
             auto f = identity_family(old_w.data, old_w.size, new_w.data, new_w.size, way_stride, 0, old_offsets,
                                      street_ids.first, street_ids.second);
             way_seq = std::move(f.seq); fixups = std::move(f.fixups); soft = std::move(f.moved);
@@ -1075,7 +1096,9 @@ static int run(int argc, char* argv[]) {
                     return ((uint64_t)name_id << 16) | nc;
                 });
         }
-        auto id_rm = derive_id_remap_from_merge(way_seq, old_w.size / way_stride, way_stride);
+        // Published to t_addr, which remaps parent_way_id by it.
+        auto id_rm = unchanged ? std::vector<uint32_t>{}
+                               : derive_id_remap_from_merge(way_seq, old_w.size / way_stride, way_stride);
         for (auto& [o,n] : soft) if (o < id_rm.size()) id_rm[o] = n;
         res_ways = {PatchFileId::STREET_WAYS, "street_ways.bin", way_stride,
                     old_w.size, new_w.size, way_seq, std::move(fixups), std::move(soft), std::move(id_rm)};
@@ -1121,6 +1144,7 @@ static int run(int argc, char* argv[]) {
         std::pair<std::vector<uint32_t>, std::vector<uint32_t>> interp_ids;
         if (!same_bytes(old_data.data, old_data.size, new_data.data, new_data.size))
             interp_ids = identity_of("interp", old_data.size / interp_stride, new_data.size / interp_stride);
+        const bool unchanged = sent_unchanged(old_data.data, old_data.size, new_data.data, new_data.size);
         remap_string_fields(old_data.data, old_data.size, PatchFileId::INTERP_WAYS, interp_stride, str_remap);
         auto old_n = mmap_file(old_dir + "/interp_nodes.bin");
         auto new_n = mmap_file(new_dir + "/interp_nodes.bin");
@@ -1130,7 +1154,9 @@ static int run(int argc, char* argv[]) {
         MergeSequence iw_seq;
         OffsetFixups fixups;
         std::unordered_map<uint32_t, uint32_t> soft;
-        if (!interp_ids.first.empty()) {
+        if (unchanged) {
+            iw_seq = match_all(n);
+        } else if (!interp_ids.first.empty()) {
             auto f = identity_family(old_data.data, old_data.size, new_data.data, new_data.size, interp_stride, 0,
                                      old_offsets, interp_ids.first, interp_ids.second);
             iw_seq = std::move(f.seq); fixups = std::move(f.fixups); soft = std::move(f.moved);
@@ -1149,7 +1175,8 @@ static int run(int argc, char* argv[]) {
                     return ((uint64_t)street_id << 32) | start;
                 });
         }
-        auto id_rm = derive_id_remap_from_merge(iw_seq, old_data.size / interp_stride, interp_stride);
+        auto id_rm = unchanged ? std::vector<uint32_t>{}
+                               : derive_id_remap_from_merge(iw_seq, old_data.size / interp_stride, interp_stride);
         for (auto& [o,n] : soft) if (o < id_rm.size()) id_rm[o] = n;
         res_interp_w = {PatchFileId::INTERP_WAYS, "interp_ways.bin", interp_stride,
                         old_data.size, new_data.size, iw_seq, std::move(fixups), std::move(soft), std::move(id_rm)};
@@ -1519,15 +1546,14 @@ static int run(int argc, char* argv[]) {
     // Serialize merge results to patch in canonical order, freeing as we go.
     // v8: street ways go before addresses, whose parent_way_id the patcher
     // remaps through the street replay's remap. The parent seqs stay alive
-    // for the side files (PARALLEL_DELTA_STRIDE); `*_copied` = sent
-    // unchanged, i.e. one MATCH of every record.
-    bool ways_copied = serialize_merge(patch, res_ways, old_dir, new_dir);
+    // for the side files (PARALLEL_DELTA_STRIDE).
+    serialize_merge(patch, res_ways, old_dir, new_dir);
     serialize_merge(patch, res_nodes, old_dir, new_dir);
     { std::vector<char>().swap(res_nodes.seq.data); }
-    bool interp_copied = serialize_merge(patch, res_interp_w, old_dir, new_dir);
+    serialize_merge(patch, res_interp_w, old_dir, new_dir);
     serialize_merge(patch, res_interp_n, old_dir, new_dir);
     { std::vector<char>().swap(res_interp_n.seq.data); }
-    bool addr_copied = serialize_merge(patch, res_addr, old_dir, new_dir);
+    serialize_merge(patch, res_addr, old_dir, new_dir);
     // res_addr_v is built in t_addr only when the dir has address points;
     // without them it keeps stride=0 and old/new sizes 0, which we treat as
     // "not built" → fall through to the emit_raw(ADDR_VERTICES) call later
@@ -1673,7 +1699,8 @@ static int run(int argc, char* argv[]) {
                                       const std::vector<uint32_t>& id_rm) {
         SEC("geodelta:" << fname);
         // v8: an old id the remap doesn't map is a deleted record and drops
-        // out (the patcher does the same when it replayed the file).
+        // out (the patcher does the same when it replayed the file). A file
+        // sent unchanged has no remap and keeps every id, as its copy does.
         auto c = geo_entry_corrections(static_cast<uint32_t>(fid), {old_geo_m.data, old_nc}, {new_geo_m.data, new_nc},
                                        g_added, g_removed, {old_entries.data, old_entries.size},
                                        {new_entries.data, new_entries.size}, geo_off_pos, id_rm, 0,
@@ -2018,8 +2045,6 @@ static int run(int argc, char* argv[]) {
         uint64_t old_size = stat(old_path.c_str(), &ost) == 0 ? (uint64_t)ost.st_size : 0;
         const FileMergeResult& parent = f.parent == PatchFileId::STREET_WAYS ? res_ways
                                       : f.parent == PatchFileId::ADDR_POINTS ? res_addr : res_interp_w;
-        const bool parent_copied = f.parent == PatchFileId::STREET_WAYS ? ways_copied
-                                 : f.parent == PatchFileId::ADDR_POINTS ? addr_copied : interp_copied;
         const size_t ps = parent.stride;
         const size_t p_old = ps ? parent.old_size / ps : 0, p_new = ps ? parent.new_size / ps : 0;
         if (ps == 0 || p_old == 0 || old_size != p_old * f.value_stride || new_size != p_new * f.value_stride) {
@@ -2064,8 +2089,9 @@ static int run(int argc, char* argv[]) {
                 oi += count;
             }
         };
-        if (parent_copied) walk(OP_MATCH_RUN, static_cast<uint32_t>(p_new));
-        else for_each_merge_op(parent.seq, ps, [&](uint8_t op, uint32_t count, const char*) { walk(op, count); });
+        // An unchanged parent's merge is one MATCH (sent_unchanged), as the
+        // patcher walks a parent it copied.
+        for_each_merge_op(parent.seq, ps, [&](uint8_t op, uint32_t count, const char*) { walk(op, count); });
         if (oi != p_old || ni != p_new) throw std::runtime_error(std::string("Parallel delta walk mismatch: ") + fname);
         uint32_t fid_u = (uint32_t)f.fid, stride = PARALLEL_DELTA_STRIDE, pfid = (uint32_t)f.parent;
         uint32_t vs = f.value_stride, rk = f.remap_kind, n_ins = static_cast<uint32_t>(ins.size());
