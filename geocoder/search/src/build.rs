@@ -12,7 +12,7 @@ use crate::extras::{record_ref, Extras, KIND_PLACE_NODE, KIND_POI};
 use crate::model::*;
 use crate::normalize::{join, tokens, transliterate};
 use memmap2::Mmap;
-use query_server::{AdminPolygon, Index, NodeCoord, PlaceNode, PoiRecord, NO_DATA};
+use query_server::{point_on_surface, AdminPolygon, Index, PlaceNode, PoiRecord, NO_DATA};
 use std::collections::{BinaryHeap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
@@ -69,35 +69,6 @@ fn byte_at(m: &Option<Mmap>, i: u32) -> u8 {
     m.as_ref().and_then(|m| m.get(i as usize).copied()).unwrap_or(0)
 }
 
-fn ring_centroid(v: &[NodeCoord]) -> (f32, f32) {
-    let n = v.len();
-    let mean = || {
-        let (mut a, mut b) = (0f64, 0f64);
-        for p in v {
-            a += p.lat as f64;
-            b += p.lng as f64;
-        }
-        ((a / n as f64) as f32, (b / n as f64) as f32)
-    };
-    if n < 3 {
-        return mean();
-    }
-    let (mut area, mut cx, mut cy) = (0f64, 0f64, 0f64);
-    for i in 0..n {
-        let (x0, y0) = (v[i].lng as f64, v[i].lat as f64);
-        let (x1, y1) = (v[(i + 1) % n].lng as f64, v[(i + 1) % n].lat as f64);
-        let cr = x0 * y1 - x1 * y0;
-        area += cr;
-        cx += (x0 + x1) * cr;
-        cy += (y0 + y1) * cr;
-    }
-    area /= 2.0;
-    if area.abs() < 1e-12 {
-        return mean();
-    }
-    ((cy / (6.0 * area)) as f32, (cx / (6.0 * area)) as f32)
-}
-
 // ------------------------------------------------------------------ entity sources
 
 /// One entity's index input.
@@ -152,8 +123,9 @@ impl<'a> PlacesSource<'a> {
                 label_used[link[p as usize] as usize] = true;
                 slots.push(BoundarySlot { poly: p, node: link[p as usize], lat: pn.lat, lng: pn.lng });
             } else if (BOUNDARY_MIN_LEVEL..=BOUNDARY_MAX_LEVEL).contains(&ap.admin_level) && ap.area > 0.0 {
-                let Some(v) = geo.admin_verts(&ap) else { continue };
-                let (lat, lng) = ring_centroid(&v);
+                // The builder's interior_point (ST_PointOnSurface, Nominatim's centre of an area):
+                // an area centroid can fall outside a concave ring or in a hole.
+                let Some((lat, lng)) = geo.admin_verts(&ap).and_then(|v| point_on_surface(&v, ap.hole_count)) else { continue };
                 slots.push(BoundarySlot { poly: p, node: NO_DATA, lat, lng });
             }
         }
@@ -1154,6 +1126,41 @@ mod tests {
             // The boundary is entity n_place_nodes (1) + its polygon (0); its node is not its own.
             let got: Vec<(u32, &str)> = found.iter().map(|f| (f.hit.entity, f.name.as_str())).collect();
             assert_eq!(got, [(1, q)], "{q}");
+        }
+    }
+
+    #[test]
+    fn an_unlinked_boundary_is_found_at_a_point_inside_it() {
+        use crate::fixture::{build_search, Geo, TempDir};
+        use crate::query::Searcher;
+        use crate::reader::SearchIndex;
+        let at = |lat: f32, lng: f32| (10.0 + lat / 10.0, 20.0 + lng / 10.0);
+        let rect = |s: f32, w: f32, n: f32, e: f32| [at(s, w).0, at(s, w).1, at(n, e).0, at(n, e).1];
+        let mut g = Geo::default();
+        // A county open to the north: its area centroid falls in its notch, where another county lies.
+        let u = [(0.0, 0.0), (0.0, 3.0), (3.0, 3.0), (3.0, 2.0), (1.0, 2.0), (1.0, 1.0), (3.0, 1.0), (3.0, 0.0), (0.0, 0.0)];
+        let hook = g.shaped_boundary("Hookcounty", 6, &u.map(|(a, b)| at(a, b)), &[]);
+        g.boundary("Notchcounty", 6, rect(1.0, 1.0, 3.0, 2.0));
+        // A county around a hole another county fills: its area centroid falls in the hole.
+        let outer = [(0.0, 4.0), (0.0, 7.0), (3.0, 7.0), (3.0, 4.0), (0.0, 4.0)].map(|(a, b)| at(a, b));
+        let hole = [(1.0, 5.0), (2.0, 5.0), (2.0, 6.0), (1.0, 6.0), (1.0, 5.0)].map(|(a, b)| at(a, b));
+        let ring = g.shaped_boundary("Ringcounty", 6, &outer, &[&hole]);
+        g.boundary("Holecounty", 6, rect(1.0, 5.0, 2.0, 6.0));
+        let dir = TempDir::new("label-point");
+        let geo = g.load(&dir.0.join("geo"));
+        let out = dir.0.join("idx");
+        build_search(&geo, &out, None);
+        let idx = SearchIndex::open(&geo, &out, None, None).unwrap();
+        let s = Searcher::new(&idx);
+
+        for (q, poly) in [("Hookcounty", hook), ("Ringcounty", ring)] {
+            let (found, _) = s.search(q, 5);
+
+            // No place nodes: the boundary is entity 0 + its polygon.
+            let f = &found[0];
+            assert_eq!(f.hit.entity, poly, "{q}");
+            assert!(geo.admin_pip(&polygon_raw(&geo, poly), f.lat as f64, f.lng as f64), "{q} at {} {}", f.lat, f.lng);
+            assert_eq!(f.ctx.county, q);
         }
     }
 
