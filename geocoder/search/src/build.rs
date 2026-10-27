@@ -949,7 +949,7 @@ pub fn sort_keys(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Resul
     let src = if name == "poi" {
         Source::Poi(PoiSource::new(geo, opts, extras.as_ref()).map_err(|e| e.to_string())?)
     } else {
-        let s = PlacesSource::new(geo, opts, extras.as_ref(), &out.join("places.bnd")).map_err(|e| e.to_string())?;
+        let s = PlacesSource::new(geo, opts, extras.as_ref(), &out.join(BOUNDARY_FILE)).map_err(|e| e.to_string())?;
         st.add("place nodes", s.n_place_nodes);
         st.add("boundary slots", s.n_slots);
         st.add("boundary slots linked", s.n_linked);
@@ -1108,7 +1108,7 @@ pub fn merge(mut runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, S
     st.add("bytes post", size("post"));
     st.add("bytes pfx", size("pfx.fst") + size("pfx"));
     if name != "poi" {
-        st.add("bytes bnd", std::fs::metadata(out.join("places.bnd")).map(|m| m.len()).unwrap_or(0));
+        st.add("bytes bnd", std::fs::metadata(out.join(BOUNDARY_FILE)).map(|m| m.len()).unwrap_or(0));
     }
     st.add("time sources s", format!("{:.2}", t_src.as_secs_f64()));
     st.add("time keys+runs s", format!("{:.2}", t_keys.as_secs_f64()));

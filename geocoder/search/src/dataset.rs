@@ -214,13 +214,20 @@ impl Default for BuildOnDevice {
     }
 }
 
+/// Whether `index` holds every file `SearchIndex::open` maps for `geo`: a `place-search build
+/// --sub` into an empty directory records the whole dataset, but holds only what it built.
+fn is_complete(geo: &Index, index: &Path) -> bool {
+    let sub_files = held_subs(geo, SUB_INDEXES).into_iter().flat_map(|s| SUB_INDEX_EXTS.map(|ext| format!("{s}.{ext}")));
+    sub_files.chain([BOUNDARY_FILE.to_string()]).all(|f| index.join(f).is_file())
+}
+
 /// Opens the place search index in `index` of the dataset in `dir` (loaded as `geo` from files
-/// stamped `loaded`, by `load`): the one there when it was built from these files, else one
-/// built from them first by `build_held` (staged in `index`, every file moved in only once all
-/// are complete). Fails when the files are no longer the ones loaded. The open holds `index`
-/// (`HeldIndexDir`, which every build takes) until the index is mapped, waiting while another
-/// open or a build has it: a second open finds the first's index current, and no build moves
-/// files in while one is read, or has its stage cleared.
+/// stamped `loaded`, by `load`): the one there when it is whole (`is_complete`) and was built
+/// from these files, else one built from them first by `build_held` (staged in `index`, every
+/// file moved in only once all are complete). Fails when the files are no longer the ones
+/// loaded. The open holds `index` (`HeldIndexDir`, which every build takes) until the index is
+/// mapped, waiting while another open or a build has it: a second open finds the first's index
+/// current, and no build moves files in while one is read, or has its stage cleared.
 pub fn open<'g>(geo: &'g Index, loaded: &Stamps, dir: &Path, index: &Path, on_device: &BuildOnDevice) -> Result<(SearchIndex<'g>, Origin), String> {
     let io = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
     let held = HeldIndexDir::take(index, Contended::Wait)?;
@@ -237,7 +244,7 @@ pub fn open<'g>(geo: &'g Index, loaded: &Stamps, dir: &Path, index: &Path, on_de
     let have = hashes.fingerprint(dir, loaded).map_err(|e| io(dir, e))?;
     unchanged()?;
 
-    let origin = if built_from(index).as_ref() == Some(&have) {
+    let origin = if is_complete(geo, index) && built_from(index).as_ref() == Some(&have) {
         Origin::Current
     } else {
         // Held, so a stage here is a dead build's. One cut off while it moved its files in leaves
@@ -550,6 +557,44 @@ mod tests {
         assert_eq!(origin, Origin::Current);
         assert_eq!(Stamp::of(&std::fs::metadata(index.join("poi.fst")).unwrap()), poi);
         assert_eq!((names(&idx, "testville"), names(&idx, "old mill")), (vec!["Testville".to_string()], vec!["Old Mill".to_string()]));
+    }
+
+    #[test]
+    fn an_index_of_some_sub_indexes_is_built_whole() {
+        // `place-search build --sub` into an empty directory records the whole dataset.
+        for &sub in SUB_INDEXES {
+            let ds = TempDir::new("some-subs");
+            let index = ds.0.join("search");
+            with_poi(["Testville", "Otherton"], "Old Mill").write(&ds.0);
+            build_subs(&ds.0, &index, &[sub]).unwrap();
+            let (geo, stamps) = load_dataset(&ds.0);
+
+            let opened = open(&geo, &stamps, &ds.0, &index, &BuildOnDevice::default());
+
+            let (idx, origin) = opened.unwrap_or_else(|e| panic!("{sub}: {e}"));
+            assert_eq!(origin, Origin::Built, "{sub}");
+            assert_eq!((names(&idx, "testville"), names(&idx, "old mill")), (vec!["Testville".to_string()], vec!["Old Mill".to_string()]), "{sub}");
+        }
+    }
+
+    #[test]
+    fn an_index_missing_a_file_is_built_again() {
+        let files = ["places.fst", "places.post", "places.pfx.fst", "places.pfx", "places.bnd", "poi.fst", "poi.post", "poi.pfx.fst", "poi.pfx"];
+        for file in files {
+            let ds = TempDir::new("missing-file");
+            let index = ds.0.join("search");
+            with_poi(["Testville", "Otherton"], "Old Mill").write(&ds.0);
+            build_subs(&ds.0, &index, SUB_INDEXES).unwrap();
+            // A download cut short, or a file removed by hand.
+            std::fs::remove_file(index.join(file)).unwrap();
+            let (geo, stamps) = load_dataset(&ds.0);
+
+            let opened = open(&geo, &stamps, &ds.0, &index, &BuildOnDevice::default());
+
+            let (idx, origin) = opened.unwrap_or_else(|e| panic!("{file}: {e}"));
+            assert_eq!(origin, Origin::Built, "{file}");
+            assert_eq!((names(&idx, "testville"), names(&idx, "old mill")), (vec!["Testville".to_string()], vec!["Old Mill".to_string()]), "{file}");
+        }
     }
 
     #[test]

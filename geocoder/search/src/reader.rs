@@ -1,7 +1,7 @@
 //! Memory-mapped search index: the fst and postings of each sub-index (places, optional POI),
 //! the boundary slots, and the geocoder index it points into. Loading reads only a small
 //! meta file and the ISO code list; everything else is mapped and paged in by queries.
-use crate::constants::META_FILE;
+use crate::constants::{BOUNDARY_FILE, META_FILE};
 use crate::entities::Entities;
 use crate::extras::Extras;
 use crate::model::*;
@@ -139,7 +139,7 @@ impl<'g> SearchIndex<'g> {
             geo,
             places: SubIndex::open(dir, "places")?,
             poi,
-            ents: Entities { geo, n_place_nodes, bnd: Some(map(&dir.join("places.bnd"))?), extras },
+            ents: Entities { geo, n_place_nodes, bnd: Some(map(&dir.join(BOUNDARY_FILE))?), extras },
             iso: match iso {
                 Some(p) => Iso::load(Path::new(p), geo)?,
                 None => Iso::default(),

@@ -74,6 +74,10 @@ pub const META_FILE: &str = "search_meta.json";
 pub const META_DATASET_KEY: &str = "dataset";
 /// The sub-indexes an index can hold, in build order.
 pub const SUB_INDEXES: &[&str] = &["places", "poi"];
+/// The files `<sub>.<ext>` of each sub-index: its keys, their postings and its prefix table.
+pub const SUB_INDEX_EXTS: [&str; 4] = ["fst", "post", "pfx.fst", "pfx"];
+/// The boundary slots of the places sub-index.
+pub const BOUNDARY_FILE: &str = "places.bnd";
 /// Hashes of the dataset files beside an index, with the stat each was taken at (not shipped).
 pub const HASH_CACHE_FILE: &str = "dataset_hashes.json";
 /// Read buffer for hashing a dataset file.
