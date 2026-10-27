@@ -159,6 +159,8 @@ struct JointChild {
     uint8_t op = 0xFF;
     uint64_t left = 0, old_bytes = 0, written = 0;
     bool started = false;
+    size_t scan_q = 0;    // hint(): the sequence position past the next MATCH op found
+    uint64_t scan_t = 0;  // and that op's old offset
 
     void parse(const char* p, size_t size, size_t at, uint32_t want_fid, bool is_v8) {
         P = p;
@@ -256,6 +258,40 @@ struct JointChild {
     void finish() {
         while (left == 0 && fetch()) {}
         if (left) throw std::runtime_error(name + " has bytes past its last record");
+    }
+    // Called before the parent reads an old record: the old child bytes this replay will never read
+    // (those of deleted or replaced parents, DELETE and REPLACE runs) are dropped as the shared
+    // decoder produces them, so the parent's read doesn't queue them for the child. Everything
+    // before the next MATCH op's start is such: MATCH runs read the old file in order.
+    void hint() {
+        if (kind == COPY_OLD) return;  // every old byte is read, in order
+        if (kind == FULL) { old->skip_to(old->size()); return; }
+        if (left && op == OP_MATCH_RUN) return;  // reading at old_bytes now
+        if (q >= scan_q) {  // the MATCH op of the last scan has been fetched: scan on from here
+            uint64_t t = old_bytes + (left && op == OP_REPLACE_RUN ? left : 0);
+            size_t s = q;
+            while (s < seq_end) {
+                if (s + 5 > seq_end) throw std::runtime_error("Malformed merge sequence: " + name);
+                const uint8_t o = (uint8_t)P[s];
+                uint32_t count; memcpy(&count, P + s + 1, 4);
+                s += 5;
+                const uint64_t bytes = (uint64_t)count * stride;
+                if (o == OP_MATCH_RUN) {
+                    if (bytes) break;
+                } else if (o == OP_DELETE_RUN) {
+                    t += bytes;
+                } else if (o == OP_INSERT_RUN || (o == OP_REPLACE_RUN && v8)) {
+                    if (s + bytes > seq_end) throw std::runtime_error("Malformed merge sequence: " + name);
+                    s += bytes;
+                    if (o == OP_REPLACE_RUN) t += bytes;
+                } else {
+                    throw std::runtime_error("Malformed merge sequence: " + name);
+                }
+            }
+            scan_q = s;
+            scan_t = std::min<uint64_t>(t, old->size());
+        }
+        old->skip_to(scan_t);
     }
     // Before the parent's buffer flushes, the child's goes out: the encoder then always has the
     // child bytes of every record it is handed (else a run of records without children, which
@@ -770,6 +806,7 @@ static int run(int argc, char* argv[]) {
                 if (in.size() % rs) throw std::runtime_error(std::string("Old ") + fname + " is not whole records");
                 std::unique_ptr<JointChild> jc = open_joint_child(file_id, out, pos);
                 for (uint64_t off = 0; off < in.size(); off += rs) {
+                    jc->hint();
                     const char* rec = in.at(off, rs);
                     jc->before_parent_write(out, rs);
                     fwrite(rec, 1, rs, out);
@@ -1095,6 +1132,7 @@ static int run(int argc, char* argv[]) {
                 for (uint32_t k = 0; k < count; k++) {
                     size_t rec_off = old_bytes + k * actual_stride;
                     if (rec_off + actual_stride > old.size()) break;
+                    if (jc) jc->hint();
                     const char* rec = old.at(rec_off, actual_stride);
 
                     bool modified = false;
@@ -1204,6 +1242,7 @@ static int run(int argc, char* argv[]) {
                 written += bytes; pos += bytes; new_rec += count;
             } else if (op == OP_DELETE_RUN) {
                 old_rec += count; old_bytes += count * actual_stride;
+                old.skip_to(old_bytes);  // an encoded family's decoder drops them
             } else if (op == OP_REPLACE_RUN && v8) {
                 // Same entities, new bytes: written like an INSERT, mapped like a MATCH.
                 size_t bytes = count * actual_stride;
@@ -1220,6 +1259,7 @@ static int run(int argc, char* argv[]) {
                 if (track) remap.add_match(static_cast<uint32_t>(old_rec), static_cast<uint32_t>(new_rec), count);
                 written += bytes; pos += bytes;
                 old_rec += count; new_rec += count; old_bytes += bytes;
+                old.skip_to(old_bytes);
             } else {
                 throw std::runtime_error(std::string("Malformed merge sequence: ") + fname);
             }
@@ -1438,8 +1478,16 @@ static int run(int argc, char* argv[]) {
             if (add_i < geo_added.size()) add_cid = geo_added[add_i];
 
             if (old_cid <= add_cid) {
-                if (!is_removed(old_cid))
+                if (!is_removed(old_cid)) {
                     process_cell(old_cid, old_offs);
+                } else {
+                    // An encoded set's lists come in row order: those before a removed row's are
+                    // never read, and the gxc decoder drops them instead of queueing a removed
+                    // stretch's lists for the next row kept.
+                    SequentialFileReader* es[3] = {&old_se, &old_ae, &old_ie};
+                    for (int t = 0; t < 3; t++)
+                        if (old_offs[size_t(t)] != NO) es[t]->skip_to(old_offs[size_t(t)]);
+                }
                 old_i++;
                 if (old_cid == add_cid) add_i++; // skip duplicate add
             } else {

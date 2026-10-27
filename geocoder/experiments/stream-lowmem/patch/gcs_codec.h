@@ -19,9 +19,12 @@ namespace gcs {
 struct Decoder {
     std::vector<ByteQueue> out;
     std::vector<int> state;  // 0 not opened yet (kept), 1 open, 2 closed (dropped)
+    std::vector<uint64_t> drop;  // per port: bytes its reader skips, dropped as they are decoded
+    size_t dropping = 0;         // ports with bytes to drop
     std::string name;
     std::vector<uint8_t> scratch;
-    explicit Decoder(const std::string& n, int ports) : out(size_t(ports)), state(size_t(ports), 0), name(n) {}
+    explicit Decoder(const std::string& n, int ports)
+        : out(size_t(ports)), state(size_t(ports), 0), drop(size_t(ports), 0), name(n) {}
     virtual ~Decoder() = default;
     virtual bool step() = 0;  // emits the next unit; false at the end
     // The decoded file's size when the manifest gives it, else ~0.
@@ -53,12 +56,34 @@ struct Decoder {
         while (q.size() < want) {
             if (q.size() && out.size() > 1 && others_full(port)) break;
             if (!step()) break;
+            if (dropping) apply_drops();
         }
         if (q.size() == 0) return 0;
         const size_t k = std::min(max, q.size());
         memcpy(dst, q.data(), k);
         q.pop(k);
         return k;
+    }
+    // The port's reader skips its next n bytes: queued ones go now, the rest as they are decoded
+    // (a reader of a coupled family that skips, e.g. the child of deleted parents, holds nothing
+    // while the other reader drives the decoder through them).
+    void skip(int port, uint64_t n) {
+        ByteQueue& q = out[size_t(port)];
+        const size_t k = size_t(std::min<uint64_t>(n, q.size()));
+        q.pop(k);
+        if (n > k) {
+            if (!drop[size_t(port)]) dropping++;
+            drop[size_t(port)] += n - k;
+        }
+    }
+    void apply_drops() {
+        for (size_t p = 0; p < out.size(); p++) {
+            if (!drop[p] || !out[p].size()) continue;
+            const size_t k = size_t(std::min<uint64_t>(drop[p], out[p].size()));
+            out[p].pop(k);
+            drop[p] -= k;
+            if (!drop[p]) dropping--;
+        }
     }
     size_t peak(int port) const { return out[size_t(port)].peak; }
 };

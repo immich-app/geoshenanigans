@@ -32,10 +32,12 @@ struct AsyncDec {
     std::thread worker;
     bool started = false, eof = false, stop = false;
     std::vector<int> starving;  // per file: readers waiting on its empty ring
+    std::vector<uint64_t> drop; // per file: bytes its reader skips, dropped as the worker hands them over
     std::string error;
     double cpu_s = 0;  // the worker's CPU time
 
-    explicit AsyncDec(Decoder* d) : inner(d), ring(d->out.size()), closed(d->out.size(), 0), starving(d->out.size(), 0) {
+    explicit AsyncDec(Decoder* d)
+        : inner(d), ring(d->out.size()), closed(d->out.size(), 0), starving(d->out.size(), 0), drop(d->out.size(), 0) {
         for (auto& s : inner->state) s = 1;  // the worker keeps every file's bytes; closed ones are dropped here
     }
     ~AsyncDec() { shutdown(); }
@@ -69,7 +71,9 @@ struct AsyncDec {
                     std::lock_guard<std::mutex> lk(mu);
                     for (size_t p = 0; p < ring.size(); p++) {
                         ByteQueue& q = inner->out[p];
-                        if (!closed[p] && q.size()) ring[p].push(q.data(), q.size());
+                        const size_t k = size_t(std::min<uint64_t>(drop[p], q.size()));
+                        drop[p] -= k;
+                        if (!closed[p] && q.size() > k) ring[p].push(q.data() + k, q.size() - k);
                         q.pop(q.size());
                     }
                     if (!more) eof = true;
@@ -105,6 +109,15 @@ struct AsyncDec {
         q.pop(k);
         if (q.size() < RING_CAP) cv_worker.notify_one();
         return k;
+    }
+    // The reader of `port` skips its next n bytes: the ring's go now, the rest as they are decoded.
+    void skip(int port, uint64_t n) {
+        std::lock_guard<std::mutex> lk(mu);
+        ByteQueue& q = ring[size_t(port)];
+        const size_t k = size_t(std::min<uint64_t>(n, q.size()));
+        q.pop(k);
+        drop[size_t(port)] += n - k;
+        cv_worker.notify_one();
     }
     // Returns true when every file is closed (the decoder can go).
     bool close(int port) {

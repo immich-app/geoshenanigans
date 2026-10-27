@@ -177,6 +177,12 @@ struct Store {
             if (AsyncDec* a = s->adec[size_t(fi)].get()) return a->read(port, dst, max);
             return d->read(port, dst, max);
         }
+        bool skip(uint64_t n) override {
+            Decoder* d = s->decoder(fi);
+            if (AsyncDec* a = s->adec[size_t(fi)].get()) a->skip(port, n);
+            else d->skip(port, n);
+            return true;
+        }
         ~PortSource() override { s->close_source(fi, port); }
     };
     std::unique_ptr<StreamSource> open_source(const std::string& path) {
