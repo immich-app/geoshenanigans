@@ -1,0 +1,1 @@
+Benchmark queue drivers of the low-memory streaming update (rounds 1 to 6, run from /ssd/memory on the box), preserved unchanged from PR #428 before removal; they call that PR's scripts/mrun.sh, smoke.sh and perf_run.sh.
