@@ -179,16 +179,16 @@ pub fn value_top_imp(v: u64) -> u8 {
     ((v >> 1) & 0xFF) as u8
 }
 
-/// A key's list: count, then per posting entity<<1|partial, the importance drop from the
-/// previous posting (lists are best importance first), and with extra names a class/ordinal byte.
-pub fn encode_list(out: &mut Vec<u8>, list: &[Posting], with_names: bool) {
+/// A key's list: count, then per posting entity<<2|has_class_ordinal<<1|partial, the importance drop from the
+/// previous posting (lists are best importance first), and an optional class/ordinal byte.
+pub fn encode_list(out: &mut Vec<u8>, list: &[Posting]) {
     varint::put(out, list.len() as u64);
     let mut prev = u8::MAX;
     for p in list {
-        varint::put(out, ((p.entity as u64) << 1) | p.partial as u64);
+        varint::put(out, ((p.entity as u64) << 2) | ((p.class_ord() != 0) as u64) << 1 | p.partial as u64);
         varint::put(out, (prev - p.imp_q) as u64);
         prev = p.imp_q;
-        if with_names {
+        if p.class_ord() != 0 {
             out.push(p.class_ord());
         }
     }
@@ -199,14 +199,13 @@ pub struct ListReader<'a> {
     pos: usize,
     left: usize,
     prev: u8,
-    with_names: bool,
 }
 
 impl<'a> ListReader<'a> {
-    pub fn new(buf: &'a [u8], off: usize, with_names: bool) -> Self {
+    pub fn new(buf: &'a [u8], off: usize) -> Self {
         let mut pos = off;
         let left = varint::get(buf, &mut pos) as usize;
-        ListReader { buf, pos, left, prev: u8::MAX, with_names }
+        ListReader { buf, pos, left, prev: u8::MAX }
     }
 }
 
@@ -220,18 +219,18 @@ impl Iterator for ListReader<'_> {
         let ep = varint::get(self.buf, &mut self.pos);
         let drop = varint::get(self.buf, &mut self.pos) as u8;
         self.prev -= drop;
-        let co = if self.with_names {
+        let co = if ep & 2 != 0 {
             self.pos += 1;
             self.buf[self.pos - 1]
         } else {
             0
         };
-        Some(Posting { entity: (ep >> 1) as u32, imp_q: self.prev, partial: ep & 1 == 1, class: co >> 4, ord: co & 0x0F })
+        Some(Posting { entity: (ep >> 2) as u32, imp_q: self.prev, partial: ep & 1 == 1, class: co >> 4, ord: co & 0x0F })
     }
 }
 
-/// Prefix-table hit: entity<<1|partial, the text score as a byte, the importance byte, and with
-/// extra names the class/ordinal byte.
+/// Prefix-table hit: entity<<2|has_class_ordinal<<1|partial, the text score as a byte, the importance byte, and an
+/// optional class/ordinal byte.
 #[derive(Clone, Copy, Debug)]
 pub struct PrefixHit {
     pub entity: u32,
@@ -242,19 +241,20 @@ pub struct PrefixHit {
     pub ord: u8,
 }
 
-pub fn encode_prefix_hits(out: &mut Vec<u8>, hits: &[PrefixHit], with_names: bool) {
+pub fn encode_prefix_hits(out: &mut Vec<u8>, hits: &[PrefixHit]) {
     varint::put(out, hits.len() as u64);
     for h in hits {
-        varint::put(out, ((h.entity as u64) << 1) | h.partial as u64);
+        let co = (h.class << 4) | h.ord.min(MAX_NAME_ORD);
+        varint::put(out, ((h.entity as u64) << 2) | ((co != 0) as u64) << 1 | h.partial as u64);
         out.push((h.text.clamp(0.0, 1.0) * 255.0).round() as u8);
         out.push(h.imp_q);
-        if with_names {
-            out.push((h.class << 4) | h.ord.min(MAX_NAME_ORD));
+        if co != 0 {
+            out.push(co);
         }
     }
 }
 
-pub fn decode_prefix_hits(buf: &[u8], off: usize, with_names: bool, out: &mut Vec<PrefixHit>) {
+pub fn decode_prefix_hits(buf: &[u8], off: usize, out: &mut Vec<PrefixHit>) {
     let mut pos = off;
     let n = varint::get(buf, &mut pos) as usize;
     for _ in 0..n {
@@ -262,13 +262,13 @@ pub fn decode_prefix_hits(buf: &[u8], off: usize, with_names: bool, out: &mut Ve
         let text = buf[pos] as f32 / 255.0;
         let imp_q = buf[pos + 1];
         pos += 2;
-        let co = if with_names {
+        let co = if ep & 2 != 0 {
             pos += 1;
             buf[pos - 1]
         } else {
             0
         };
-        out.push(PrefixHit { entity: (ep >> 1) as u32, partial: ep & 1 == 1, text, imp_q, class: co >> 4, ord: co & 0x0F });
+        out.push(PrefixHit { entity: (ep >> 2) as u32, partial: ep & 1 == 1, text, imp_q, class: co >> 4, ord: co & 0x0F });
     }
 }
 
@@ -294,16 +294,14 @@ mod tests {
             Posting { entity: 7, imp_q: 200, partial: true, class: 2, ord: 3 },
             Posting { entity: 123_456, imp_q: 4, partial: false, class: 5, ord: 15 },
         ];
-        for with_names in [false, true] {
+        {
             let mut b = vec![0xAA];
-            encode_list(&mut b, &list, with_names);
-            let got: Vec<Posting> = ListReader::new(&b, 1, with_names).collect();
+            encode_list(&mut b, &list);
+            let got: Vec<Posting> = ListReader::new(&b, 1).collect();
             assert_eq!(got.len(), list.len());
             for (g, w) in got.iter().zip(&list) {
                 assert_eq!((g.entity, g.imp_q, g.partial), (w.entity, w.imp_q, w.partial));
-                if with_names {
-                    assert_eq!((g.class, g.ord), (w.class, w.ord));
-                }
+                assert_eq!((g.class, g.ord), (w.class, w.ord));
             }
         }
     }
@@ -314,4 +312,22 @@ mod tests {
         assert_eq!(decode_inline(inline_value(&p)), p);
         assert_eq!(inline_value(&p) & 1, 1);
     }
+    #[test]
+    fn prefix_hits_keep_name_metadata_without_extras() {
+        let hits = [
+            PrefixHit { entity: 10, partial: false, text: 1.0, imp_q: 255, class: 3, ord: 0 },
+            PrefixHit { entity: 20, partial: true, text: 1.0, imp_q: 200, class: 0, ord: 14 },
+            PrefixHit { entity: u32::MAX, partial: false, text: 1.0, imp_q: 100, class: 0, ord: 0 },
+        ];
+        let mut blob = vec![0xAA];
+        encode_prefix_hits(&mut blob, &hits);
+        let mut got = Vec::new();
+        decode_prefix_hits(&blob, 1, &mut got);
+        assert_eq!(got.len(), hits.len());
+        for (g, h) in got.iter().zip(hits) {
+            assert_eq!((g.entity, g.partial, g.class, g.ord), (h.entity, h.partial, h.class, h.ord));
+            assert_eq!((g.text, g.imp_q), (h.text, h.imp_q));
+        }
+    }
+
 }

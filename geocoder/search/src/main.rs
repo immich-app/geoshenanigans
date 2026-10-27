@@ -55,6 +55,17 @@ fn cmd_build(args: &[String]) {
         area_proxy: flag(args, "--area-proxy"),
         poi_max_tier: opt(args, "--poi-max-tier").map(|v| v.parse().unwrap()).unwrap_or(3),
     };
+    let mut subs = vec![];
+    if sub == "places" || sub == "all" {
+        subs.push("places");
+    }
+    if (sub == "poi" || sub == "all") && geo.poi_records.is_some() {
+        subs.push("poi");
+    }
+    let mut replacing = subs.clone();
+    if geo.poi_records.is_none() { replacing.push("poi"); }
+    place_search::build::check_retained_names(&out, &replacing, opts.extras.is_some())
+        .unwrap_or_else(|e| panic!("{e}"));
     let meta_path = out.join("search_meta.json");
     let mut meta: serde_json::Value = std::fs::read_to_string(&meta_path)
         .ok()
@@ -67,13 +78,6 @@ fn cmd_build(args: &[String]) {
     meta["imp"] = json!(opts.imp_dir.is_some());
     meta["area_proxy"] = json!(opts.area_proxy);
     meta["poi_max_tier"] = json!(opts.poi_max_tier);
-    let mut subs = vec![];
-    if sub == "places" || sub == "all" {
-        subs.push("places");
-    }
-    if (sub == "poi" || sub == "all") && geo.poi_records.is_some() {
-        subs.push("poi");
-    }
     for s in subs {
         let st = build(&geo, s, &out, &opts).unwrap_or_else(|e| panic!("build {s}: {e}"));
         let mut o = serde_json::Map::new();
@@ -221,13 +225,8 @@ fn cmd_ctxbench(args: &[String]) {
 fn cmd_diff(args: &[String]) {
     use fst::{IntoStreamer, Streamer};
     let (a, b, name) = (Path::new(&args[2]), Path::new(&args[3]), &args[4]);
-    let with_names = |d: &Path| -> bool {
-        std::fs::read_to_string(d.join("search_meta.json")).ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|m| m["extras"].as_bool()).unwrap_or(false)
-    };
-    let sa = place_search::reader::SubIndex::open(a, name, with_names(a)).expect("A");
-    let sb = place_search::reader::SubIndex::open(b, name, with_names(b)).expect("B");
+    let sa = place_search::reader::SubIndex::open(a, name).expect("A");
+    let sb = place_search::reader::SubIndex::open(b, name).expect("B");
     let mut ia = sa.map.stream();
     let mut ib = sb.map.into_stream();
     let (mut only_a, mut only_b, mut same, mut changed) = (0u64, 0u64, 0u64, 0u64);
