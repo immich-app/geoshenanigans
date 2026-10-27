@@ -2055,7 +2055,7 @@ impl Index {
             .filter(|r| r.rank_address != 0 || r.poly.place_type_override != 0)
             .collect();
         let inside = |poly: &AdminPolygon, current: &AdminPolygon| match (self.admin_verts(poly), self.admin_verts(current)) {
-            (Some(verts), Some(current_verts)) => point_on_surface_in(&verts, poly.hole_count, &current_verts),
+            (Some(verts), Some(current_verts)) => point_on_surface_in(&verts, poly.hole_count, &current_verts, current.hole_count),
             _ => false,
         };
         CurrentBoundaries::from_ranked(ranked, holding(place_areas).iter(), inside)
@@ -4079,10 +4079,27 @@ pub fn point_on_surface(verts: &[NodeCoord], holes: u16) -> Option<(f32, f32)> {
     Some(best)
 }
 
-/// Whether a polygon's point on surface lies in another polygon: Nominatim's
-/// test of a boundary's centroid against the current boundary.
-pub fn point_on_surface_in(verts: &[NodeCoord], holes: u16, other: &[NodeCoord]) -> bool {
-    !other.is_empty() && point_on_surface(verts, holes).is_some_and(|(lat, lng)| point_in_polygon(lat, lng, other))
+/// Whether a polygon's point on surface lies inside another polygon, not on
+/// its edges (ST_Contains): Nominatim's test of a boundary's centroid
+/// against the current boundary.
+pub fn point_on_surface_in(verts: &[NodeCoord], holes: u16, other: &[NodeCoord], other_holes: u16) -> bool {
+    !other.is_empty()
+        && point_on_surface(verts, holes)
+            .is_some_and(|(lat, lng)| point_in_polygon(lat, lng, other) && !on_ring_edge(lat, lng, other, other_holes))
+}
+
+/// Whether a point lies on an edge of a polygon's outer ring or holes (not
+/// on a keyhole connector).
+fn on_ring_edge(lat: f32, lng: f32, verts: &[NodeCoord], holes: u16) -> bool {
+    let (y, x) = (lat as f64, lng as f64);
+    split_rings(verts, holes).iter().any(|r| {
+        verts[r.begin..r.begin + r.count].windows(2).any(|e| {
+            let (y0, x0, y1, x1) = (e[0].lat as f64, e[0].lng as f64, e[1].lat as f64, e[1].lng as f64);
+            (x1 - x0) * (y - y0) == (y1 - y0) * (x - x0)
+                && (x0.min(x1)..=x0.max(x1)).contains(&x)
+                && (y0.min(y1)..=y0.max(y1)).contains(&y)
+        })
+    })
 }
 
 // --- API types ---
@@ -5063,10 +5080,10 @@ mod pure_helper_tests {
 
     #[test]
     fn current_boundaries_test_the_point_on_surface_of_larger_and_equal_boundaries() {
-        // A city square (rank 16) and a rank 20 boundary holding the point
-        // (1.75, 1.75): round the city, beside it, and beside it with the
-        // same area. Only the one round it has its point on surface in the
-        // city.
+        // A city square (rank 16) and a rank 20 boundary holding a point in
+        // the city: round the city, beside it, beside it with the same area,
+        // and with its point on surface on the city's edge. Only the one round
+        // it has its point on surface inside the city.
         let square = |lat0: f32, lng0: f32, lat1: f32, lng1: f32| {
             vec![nc(lat0, lng0), nc(lat0, lng1), nc(lat1, lng1), nc(lat1, lng0), nc(lat0, lng0)]
         };
@@ -5075,11 +5092,13 @@ mod pure_helper_tests {
             (11, square(-1.0, -1.0, 3.0, 3.0)),
             (12, square(1.5, 1.5, 3.5, 9.5)),
             (13, square(1.5, 1.5, 3.5, 3.5)),
+            // Its point on surface (0, 1) is on the city's edge.
+            (14, square(-1.0, -1.0, 1.0, 3.0)),
         ];
         let of = |poly: &AdminPolygon| &verts.iter().find(|(id, _)| *id == poly.name_id).unwrap().1;
-        let inside = |poly: &AdminPolygon, current: &AdminPolygon| point_on_surface_in(of(poly), 0, of(current));
+        let inside = |poly: &AdminPolygon, current: &AdminPolygon| point_on_surface_in(of(poly), 0, of(current), 0);
         let city = AdminPolygon { area: 4.0, ..boundary(2, 8) };
-        for (id, area, gate) in [(11, 16.0, 11), (12, 16.0, 2), (13, 4.0, 2)] {
+        for (id, area, gate) in [(11, 16.0, 11), (12, 16.0, 2), (13, 4.0, 2), (14, 8.0, 2)] {
             let other = AdminPolygon { area, ..boundary(id, 9) };
             let found = CurrentBoundaries::walk([(16, city), (20, other)], inside);
             assert_eq!(names(&found), [Some(gate), Some(gate), Some(gate)], "rank 20 boundary {id}");
@@ -5132,6 +5151,14 @@ mod pure_helper_tests {
         // from 5 to half-way between 4 and 8.
         let high_hole = vec![nc(4.0, 1.0), nc(8.0, 1.0), nc(8.0, 6.0), nc(4.0, 6.0), nc(4.0, 1.0)];
         assert_eq!(point_on_surface(&keyhole(&outer, &[high_hole]), 1), Some((6.0, 8.0)));
+        // The square's point on surface (1, 1) is inside the 0..10 square,
+        // but not when it is on the top edge of a hole there (which ray
+        // casting counts as inside).
+        assert!(point_on_surface_in(&square, 0, &outer, 0));
+        let low_hole = vec![nc(0.5, 0.5), nc(1.0, 0.5), nc(1.0, 4.0), nc(0.5, 4.0), nc(0.5, 0.5)];
+        let holed = keyhole(&outer, &[low_hole]);
+        assert!(point_in_polygon(1.0, 1.0, &holed));
+        assert!(!point_on_surface_in(&square, 0, &holed, 1));
         // A ring with no width gives its first vertex; no vertices, none.
         assert_eq!(point_on_surface(&[nc(1.0, 0.0), nc(1.0, 2.0), nc(1.0, 1.0), nc(1.0, 0.0)], 0), Some((1.0, 0.0)));
         assert_eq!(point_on_surface(&[], 0), None);
