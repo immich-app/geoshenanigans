@@ -135,12 +135,18 @@ struct AsyncEnc {
     std::mutex mu;
     std::condition_variable cv_writer, cv_worker;
     std::thread worker;
-    bool started = false, done = false;
+    bool started = false, done = false, cancel = false;
     std::string error;
     double cpu_s = 0;
 
     explicit AsyncEnc(Encoder* e) : inner(e), ring(e->in.size()), closed(e->in.size(), 0), closed_seen(e->in.size(), 0), got(e->in.size(), 0) {}
+    // A run that fails with a file still open: the worker stops without draining.
     ~AsyncEnc() {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            cancel = true;
+        }
+        cv_worker.notify_all();
         if (worker.joinable()) worker.join();
     }
     void run() {
@@ -153,10 +159,12 @@ struct AsyncEnc {
                 {
                     std::unique_lock<std::mutex> lk(mu);
                     cv_worker.wait(lk, [&] {
+                        if (cancel) return true;
                         for (size_t p = 0; p < ring.size(); p++)
                             if (ring[p].size() || (closed[p] && !closed_seen[p])) return true;
                         return false;
                     });
+                    if (cancel) break;
                     for (size_t p = 0; p < ring.size(); p++) {
                         std::swap(take[p], ring[p]);  // the ring's bytes, without a copy
                         if (closed[p] && !closed_seen[p]) { closed_seen[p] = 1; newly[p] = 1; }
