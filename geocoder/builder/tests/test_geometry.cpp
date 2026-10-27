@@ -294,3 +294,29 @@ TEST(highway_full_filter_footway_subtypes) {
     // The subtype filter applies to footway only.
     CHECK(is_included_highway_full("residential", "sidewalk"));
 }
+
+// area_segments_intersect is osmium's calculate_intersection: segments
+// intersect wherever they meet but at an end both have. Each case is checked
+// with the segments and their ends either way round.
+TEST(geometry_area_segments_intersect_as_osmium) {
+    struct Case { E7Point p0, p1, q0, q1; bool meet; };
+    const Case cases[] = {
+        {{0, 0}, {2, 2}, {0, 2}, {2, 0}, true},   // crossing
+        {{0, 0}, {2, 0}, {1, 0}, {1, 1}, true},   // an end inside the other
+        {{0, 0}, {2, 0}, {1, 1}, {1, 3}, false},  // apart
+        {{0, 0}, {1, 0}, {1, 0}, {1, 1}, false},  // at a shared end
+        {{0, 0}, {2, 0}, {1, 0}, {3, 0}, true},   // in line, overlapping
+        {{0, 0}, {3, 0}, {1, 0}, {2, 0}, true},   // in line, one inside the other
+        {{0, 0}, {2, 0}, {0, 0}, {1, 0}, true},   // in line from a shared end
+        {{0, 0}, {1, 0}, {1, 0}, {2, 0}, false},  // in line, end to end
+        {{0, 0}, {1, 0}, {2, 0}, {3, 0}, false},  // in line, apart
+        {{0, 0}, {2, 0}, {0, 1}, {2, 1}, false},  // parallel
+        {{0, 0}, {1, 1}, {1, 1}, {0, 0}, false},  // the same segment
+    };
+    for (const Case& c : cases) {
+        CHECK_EQ(area_segments_intersect(c.p0, c.p1, c.q0, c.q1), c.meet);
+        CHECK_EQ(area_segments_intersect(c.p1, c.p0, c.q0, c.q1), c.meet);
+        CHECK_EQ(area_segments_intersect(c.q0, c.q1, c.p0, c.p1), c.meet);
+        CHECK_EQ(area_segments_intersect(c.q1, c.q0, c.p1, c.p0), c.meet);
+    }
+}

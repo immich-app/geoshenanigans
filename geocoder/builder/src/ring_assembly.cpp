@@ -16,6 +16,22 @@ struct SubWay {
 
 int64_t key_of(const std::pair<double,double>& p) { return coord_key(p.first, p.second); }
 
+// Whether a coordinate follows itself somewhere along the way (a node listed
+// twice in a row, or two nodes at one location).
+bool repeats_a_coordinate(const CoordSpan& coords) {
+    for (size_t i = 1; i < coords.size(); i++)
+        if (key_of(coords[i]) == key_of(coords[i - 1])) return true;
+    return false;
+}
+
+Coords without_repeats(const CoordSpan& coords) {
+    Coords out;
+    out.reserve(coords.size());
+    for (const auto& p : coords)
+        if (out.empty() || key_of(out.back()) != key_of(p)) out.push_back(p);
+    return out;
+}
+
 uint8_t role_bit(const std::string& role) {
     if (role == "outer" || role.empty()) return kRoleOuter;
     if (role == "inner") return kRoleInner;
@@ -56,8 +72,12 @@ std::vector<SubWay> split_sub_ways(const std::vector<CoordSpan>& way_coords, con
 }
 
 // Sub-ways running over the same coordinates (either way round) cancel in
-// pairs, as osmium's erase_duplicate_segments drops duplicate segments: a way
-// listed twice, or two ways mapped on top of each other, leaves no edge.
+// pairs, as osmium's erase_duplicate_segments drops duplicate segments: two
+// ways mapped on top of each other leave no edge, and nor does a way listed
+// twice. osm2pgsql hands its area assembler a copy of the way for each
+// member listing it (middle rel_members_get) and takes the segments of every
+// copy (geom::area_assembler_t), where osmium's own multipolygon Assembler
+// would skip the repeated way id (SegmentList::extract_segments_from_ways).
 uint32_t cancel_duplicate_sub_ways(std::vector<SubWay>& sub_ways) {
     auto same = [](const Coords& a, const Coords& b) {
         if (a.size() != b.size()) return false;
@@ -273,9 +293,6 @@ using End = uint32_t;
 
 End end_of(uint32_t sub_way, bool back) { return sub_way * 2 + (back ? 1 : 0); }
 
-// A coordinate in 1e-7 degrees, rounded as coord_key rounds it.
-int64_t e7(double v) { return static_cast<int32_t>(v * 1e7 + (v >= 0 ? 0.5 : -0.5)); }
-
 // The way a sub-way leaves one of its end coordinates: (longitude, latitude)
 // steps of 1e-7 degrees to its nearest coordinate that differs from the end's
 // (zero when none does).
@@ -459,10 +476,22 @@ AreaRings assemble_area_rings(const std::vector<std::pair<int64_t, std::string>>
     AreaRings out;
     std::vector<CoordSpan> way_coords;
     std::vector<uint8_t> way_roles;
+    // osmium makes no segment of a coordinate and its repeat straight after
+    // it (SegmentList::extract_segments_from_way_impl), so such repeats are
+    // no coordinates rings touch at: the ways that have them are copied
+    // without them, and way_coords points at the copies.
+    std::vector<Coords> repeats_dropped;
+    repeats_dropped.reserve(members.size());
     for (const auto& [way_id, role] : members) {
         const auto* way = way_geoms.find(way_id);
-        if (!way || way->count == 0) continue;
-        way_coords.push_back(way_geoms.coords_of(*way));
+        if (!way) continue;
+        CoordSpan coords = way_geoms.coords_of(*way);
+        if (repeats_a_coordinate(coords)) {
+            repeats_dropped.push_back(without_repeats(coords));
+            coords = {repeats_dropped.back().data(), repeats_dropped.back().size()};
+        }
+        if (coords.size() < 2) continue;  // no segment
+        way_coords.push_back(coords);
         way_roles.push_back(role_bit(role));
     }
     std::vector<SubWay> sub_ways = split_sub_ways(way_coords, way_roles);
@@ -492,7 +521,8 @@ AreaRings assemble_area_rings(const std::vector<std::pair<int64_t, std::string>>
     }
 
     Walk walk = walk_rings(sub_ways, ends, nullptr);
-    // Nor does osmium take an area whose segments cross: it looks for those
+    // Nor does osmium take an area whose segments intersect (cross, or meet
+    // other than at an end both have): it looks for those
     // (SegmentList::find_intersections) before it joins any rings.
     if (rings_cross(walk.rings)) {
         out.failure = AreaFailure::Crossing;

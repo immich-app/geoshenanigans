@@ -995,7 +995,10 @@ static int run(int argc, char* argv[]) {
             uint32_t value_stride = ru32();
             uint32_t remap_kind = ru32();
             uint32_t n_changes = ru32();
-            if (value_stride != 4 && value_stride != 16) throw std::runtime_error("Malformed sparse delta");
+            // Whole records only: a change writes its record whole, so one that ends past the file would
+            // write past it.
+            if ((value_stride != 4 && value_stride != 16) || new_size % value_stride)
+                throw std::runtime_error("Malformed sparse delta");
             const size_t change_size = 4 + value_stride;
             const char* changes = take((size_t)n_changes * change_size, "sparse changes");
             if (!want) continue;
@@ -1050,6 +1053,7 @@ static int run(int argc, char* argv[]) {
                 fwrite(buf.data(), 1, n, out);
             }
             close_outputs({{out, fname}});
+            if (ci != n_changes) throw std::runtime_error(std::string("Malformed sparse delta: changes past the end of ") + fname);
 
             std::cerr << "  " << fname << ": sparse delta " << n_changes
                       << " changes (" << new_size << " bytes)" << section_io() << std::endl;
@@ -1137,9 +1141,12 @@ static int run(int argc, char* argv[]) {
         merge_seqs[file_id] = {pos, (size_t)seq_size, actual_stride};
         FILE* outf = open_out(fname);
 
-        // An encoded family's parent: its child section replays along (open_joint_child).
+        // An encoded family's parent: its child section replays along (open_joint_child). A parent
+        // without records, old or new, has no child bytes to replay with it: the diff sends an empty
+        // addr_points.bin's addr_vertices.bin later, as a section of its own.
         std::unique_ptr<JointChild> jc;
-        if (gcs::store().is_encoded(fname) && joint_child_of(file_id) != UINT32_MAX) jc = open_joint_child(file_id, outf, seq_end);
+        if (gcs::store().is_encoded(fname) && joint_child_of(file_id) != UINT32_MAX && (old_size || new_size))
+            jc = open_joint_child(file_id, outf, seq_end);
         auto child_bytes = [&](const char* rec) { return child_bytes_of(file_id, rec, *jc); };
 
         // Record the old → new record ids of the files whose remap the entry

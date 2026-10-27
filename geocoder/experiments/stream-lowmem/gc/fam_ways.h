@@ -335,7 +335,8 @@ inline void decode_ways_only(const std::string& src, const std::string& out, boo
         }
         W.put(rec, nm.stride);
     }
-    if (node_off != nn || !c0.eof() || !c2.eof()) die("%s: columns not fully consumed", nm.pre);
+    if (node_off != nn || !c0.eof() || (c1 && !c1->eof()) || !c2.eof() || (c3 && !c3->eof()) || (c4 && !c4->eof()))
+        die("%s: columns not fully consumed", nm.pre);
     delete c1;
     delete c3;
     delete c4;
@@ -440,7 +441,8 @@ inline void decode(const std::string& src, const std::string& out, bool street, 
         if (W) W->put(rec, nm.stride);
     }
     if (!nodes2.eof() || node_off != nn) die("%s: nodes2 not fully consumed", nm.pre);
-    if (!c0.eof() || (c1 && !c1->eof()) || (c2 && !c2->eof())) die("%s: columns not fully consumed", nm.pre);
+    if (!c0.eof() || (c1 && !c1->eof()) || (c2 && !c2->eof()) || (c3 && !c3->eof()) || (c4 && !c4->eof()))
+        die("%s: columns not fully consumed", nm.pre);
     delete W;
     delete c1;
     delete c2;

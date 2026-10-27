@@ -23,6 +23,7 @@
 #include "admin_rank_config.h"
 #include "geometry.h"
 #include "id_allocator.h"
+#include "keyhole_pack.h"
 #include "parallel.h"
 #include "polygon_rings.h"
 #include "postcode_validation.h"
@@ -1065,13 +1066,19 @@ struct PackedPolygon {
     uint16_t hole_count = 0;
     uint8_t halvings = 0;  // SimplifiedRings::halvings
     bool nests = true;
+    KeyholeGrid grid = KeyholeGrid::Planned;  // pack_keyhole's
 };
 
-// The build log line of how simplify_rings fared over packed polygons.
+// The build log line of how simplify_rings and pack_keyhole fared over
+// packed polygons.
 static std::string hole_topology(const std::vector<PackedPolygon>& packed) {
     HoleTopologyCounts counts;
-    for (const PackedPolygon& p : packed) counts.add(p.halvings, p.nests);
-    return counts.summary();
+    KeyholeGridCounts grids;
+    for (const PackedPolygon& p : packed) {
+        counts.add(p.halvings, p.nests);
+        grids.add(p.grid);
+    }
+    return counts.summary() + "; " + grids.summary();
 }
 static PackedPolygon pack_admin_polygon(const ParsedData& data, const AdminPolygon& ap,
                                         double epsilon_scale) {
@@ -1108,8 +1115,9 @@ static PackedPolygon pack_admin_polygon(const ParsedData& data, const AdminPolyg
     }
     if (pts.size() < 3) return out;
 
-    out.bytes.resize(plan_polygon(pts.data(), pts.size()).bytes);
-    pack_polygon_at(out.bytes.data(), pts.data(), pts.size());
+    PackedKeyhole keyhole = pack_keyhole(pts, holes);
+    out.bytes = std::move(keyhole.bytes);
+    out.grid = keyhole.grid;
     out.vertex_count = static_cast<uint32_t>(pts.size());
     out.area = polygon_area(pts);
     out.hole_count = holes;
