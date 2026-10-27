@@ -4397,6 +4397,8 @@ static int run(int argc, char* argv[]) {
                     struct PreparedPolygon {
                         std::vector<std::pair<double,double>> simplified;  // keyhole range
                         uint16_t hole_count = 0;
+                        uint8_t halvings = 0;  // SimplifiedRings::halvings
+                        bool nests = true;
                         std::string name;
                         uint8_t admin_level;
                         std::string country_code;
@@ -4425,10 +4427,14 @@ static int run(int argc, char* argv[]) {
                                     canonicalize_ring_rotation(vertices);
                                     for (auto& hole : ar.holes) canonicalize_ring_rotation(hole);
 
-                                    std::tie(pp.simplified, pp.hole_count) = simplify_rings(vertices, ar.holes,
-                                        [&](const std::vector<std::pair<double,double>>& ring) {
-                                            return simplify_admin_polygon(ring, ar.admin_level);
+                                    SimplifiedRings s = simplify_rings(vertices, ar.holes,
+                                        [&](const std::vector<std::pair<double,double>>& ring, double scale) {
+                                            return simplify_admin_polygon(ring, ar.admin_level, scale);
                                         });
+                                    pp.simplified = std::move(s.range);
+                                    pp.hole_count = s.holes;
+                                    pp.halvings = s.halvings;
+                                    pp.nests = s.nests;
                                     if (pp.simplified.size() >= 3) {
                                         pp.area = polygon_area(pp.simplified);
                                     }
@@ -4444,6 +4450,11 @@ static int run(int argc, char* argv[]) {
                         for (auto& w : prep_workers) w.join();
                     }
                     all_admin_results.clear();
+                    {
+                        HoleTopologyCounts topology;
+                        for (const auto& pp : prepared) topology.add(pp.halvings, pp.nests);
+                        std::cerr << "  Admin hole topology: " << topology.summary() << std::endl;
+                    }
                     log_phase("    Admin: parallel simplify", _pt, _cpu);
 
                     // Append the rings of 3+ vertices, in order, on every core,
