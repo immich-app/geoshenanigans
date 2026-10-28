@@ -91,6 +91,9 @@ add_executable(build-index
 add_executable(geocoder-diff tools/geocoder_diff.cpp)
 target_link_libraries(geocoder-diff PRIVATE Threads::Threads)
 target_include_directories(geocoder-diff PRIVATE tools src)
+# patch_format.h includes sequential_file_reader.h, whose pread offsets must
+# pass 4 GiB on 32-bit glibc too.
+target_compile_definitions(geocoder-diff PRIVATE _FILE_OFFSET_BITS=64)
 
 add_executable(geocoder-patch tools/geocoder_patch.cpp)
 target_link_libraries(geocoder-patch PRIVATE Threads::Threads)
