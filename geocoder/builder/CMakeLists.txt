@@ -218,12 +218,15 @@ geocoder_link_s2(geocoder-s2-tests)
 target_link_libraries(geocoder-s2-tests PRIVATE Threads::Threads)
 add_test(NAME geocoder-s2-tests COMMAND geocoder-s2-tests)
 
-# GEOCODER_SANITIZE=ON builds the unit tests with ASan + UBSan, undefined
-# behaviour failing the run (CI's sanitizer job). Tests only: build-index
-# links the prebuilt S2, whose absl containers change layout under ASan.
-option(GEOCODER_SANITIZE "Build geocoder-tests with ASan and UBSan" OFF)
+# GEOCODER_SANITIZE=ON builds the unit tests and the tools they run with ASan
+# + UBSan, undefined behaviour failing the run (CI's sanitizer job). Not
+# build-index: it links the prebuilt S2, whose absl containers change layout
+# under ASan.
+option(GEOCODER_SANITIZE "Build geocoder-tests and its tools with ASan and UBSan" OFF)
 if(GEOCODER_SANITIZE)
     set(GEOCODER_SANITIZE_FLAGS -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer)
-    target_compile_options(geocoder-tests PRIVATE ${GEOCODER_SANITIZE_FLAGS})
-    target_link_options(geocoder-tests PRIVATE ${GEOCODER_SANITIZE_FLAGS})
+    foreach(target geocoder-tests geocoder-diff geocoder-patch geocoder-gc)
+        target_compile_options(${target} PRIVATE ${GEOCODER_SANITIZE_FLAGS})
+        target_link_options(${target} PRIVATE ${GEOCODER_SANITIZE_FLAGS})
+    endforeach()
 endif()
