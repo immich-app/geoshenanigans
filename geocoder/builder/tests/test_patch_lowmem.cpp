@@ -278,6 +278,21 @@ std::vector<std::string> patch_words(const LowMemCase& c, const std::string& mod
     return words;
 }
 
+// patch (an edit of c's, named name) applied in each of modes: every mode in
+// which the patcher doesn't refuse it with `refusal`, and what it did instead,
+// printed.
+std::vector<std::string> not_refused(const LowMemCase& c, const std::vector<std::string>& modes, const std::string& patch,
+                                     const std::string& name, const std::string& refusal) {
+    std::vector<std::string> bad;
+    for (const std::string& mode : modes) {
+        const ToolRun r = run_tool(patch_words(c, mode, patch, c.dir(name + ".out." + mode)), c.log());
+        if (!r.ok && logged(r, refusal)) continue;
+        bad.push_back(name + " (" + mode + "): " + (r.ok ? "applied" : r.log));
+        std::printf("    %s\n", bad.back().c_str());
+    }
+    return bad;
+}
+
 // A case's patch applied in some modes: every mismatch, and the patcher's
 // heap peak by mode where the heap shim measured one.
 struct Applied {
@@ -696,12 +711,8 @@ TEST(patch_lowmem_refuses_a_new_set_with_part_of_a_family) {
         new_d.erase(gone);
         const LowMemCase c{dir.path(), "without-" + gone};
         REQUIRE(prepare(c, old_d, new_d).empty());
-        for (const std::string& mode : ENCODED_MODES) {
-            auto r = run_tool(patch_words(c, mode, c.patch(), c.dir("out." + mode)), c.log());
 
-            CHECK(!r.ok);
-            CHECK(logged(r, "family poi: the patch ships 1 of its 2 files"));
-        }
+        CHECK(not_refused(c, ENCODED_MODES, c.patch(), "part", "family poi: the patch ships 1 of its 2 files").empty());
     }
 }
 
@@ -740,12 +751,8 @@ TEST(patch_lowmem_refuses_a_match_run_past_the_old_file) {
         put_at(longer, at + runs.size() - 4, e.rest + 5);
         const std::string patch = c.dir(e.name + ".gcpatch");
         REQUIRE(write_patch(c, patch, longer));
-        for (const std::string& mode : ENCODED_MODES) {
-            auto r = run_tool(patch_words(c, mode, patch, c.dir(e.name + ".out." + mode)), c.log());
 
-            CHECK(!r.ok);
-            CHECK(logged(r, e.refusal));
-        }
+        CHECK(not_refused(c, ENCODED_MODES, patch, e.name, e.refusal).empty());
     }
     CHECK(apply_both_modes(c).empty());
 }
@@ -797,12 +804,8 @@ TEST(patch_lowmem_refuses_a_parent_stride_other_than_its_records) {
         put_at(edited, at + 4, e.wrong);
         const std::string patch = c.dir(name + ".gcpatch");
         REQUIRE(write_patch(c, patch, edited));
-        for (const std::string& mode : ENCODED_MODES) {
-            auto r = run_tool(patch_words(c, mode, patch, c.dir(name + ".out." + mode)), c.log());
 
-            CHECK(!r.ok);
-            CHECK(logged(r, "Malformed record stride: " + name));
-        }
+        CHECK(not_refused(c, ENCODED_MODES, patch, name, "Malformed record stride: " + name).empty());
     }
     CHECK(apply_both_modes(c).empty());
 }
@@ -873,13 +876,8 @@ TEST(patch_lowmem_refuses_counts_and_lengths_that_wrap_32_bits) {
         else put_at(edited, e.at, static_cast<uint32_t>(u32_at(e.at) + e.add));
         const std::string patch = c.dir(e.name + ".gcpatch");
         REQUIRE(write_patch(c, patch, edited));
-        for (const std::string& mode : ENCODED_MODES) {
-            auto r = run_tool(patch_words(c, mode, patch, c.dir(e.name + ".out." + mode)), c.log());
 
-            if (r.ok || !logged(r, e.refusal)) std::printf("    %s (%s): %s\n", e.name.c_str(), mode.c_str(), r.log.c_str());
-            CHECK(!r.ok);
-            CHECK(logged(r, e.refusal));
-        }
+        CHECK(not_refused(c, ENCODED_MODES, patch, e.name, e.refusal).empty());
     }
     CHECK(apply_both_modes(c).empty());
 }
@@ -970,13 +968,8 @@ TEST(patch_refuses_cell_changes_out_of_order_and_a_second_or_foreign_delta) {
         e.edit(edited);
         const std::string patch = c.dir(e.name + ".gcpatch");
         REQUIRE(write_patch(c, patch, edited));
-        for (const std::string& mode : ALL_MODES) {
-            auto r = run_tool(patch_words(c, mode, patch, c.dir(e.name + ".out." + mode)), c.log());
 
-            if (r.ok || !logged(r, e.refusal)) std::printf("    %s (%s): %s\n", e.name.c_str(), mode.c_str(), r.ok ? "applied" : r.log.c_str());
-            CHECK(!r.ok);
-            CHECK(logged(r, e.refusal));
-        }
+        CHECK(not_refused(c, ALL_MODES, patch, e.name, e.refusal).empty());
     }
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }

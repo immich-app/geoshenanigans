@@ -27,6 +27,16 @@
 #include "test_framework.h"
 #include "types.h"
 
+// What the call threw as a runtime_error, or "" when it returned.
+static std::string refusal_of(const std::function<void()>& call) {
+    try {
+        call();
+    } catch (const std::runtime_error& e) {
+        return e.what();
+    }
+    return "";
+}
+
 // --- write_varint / read_varint_bounded round-trip ---
 
 static uint32_t varint_roundtrip(uint32_t value) {
@@ -120,20 +130,14 @@ TEST(patch_format_bounded_varint_rejects_truncated_and_overlong_values) {
     write_varint(buf, 300000u);
     for (size_t cut = 0; cut < buf.size(); cut++) {
         size_t pos = 0;
-        bool threw = false;
-        try { read_varint_bounded(buf.data(), pos, cut, "runs"); } catch (const std::runtime_error& e) {
-            threw = std::string(e.what()) == "Malformed runs";
-        }
-        CHECK(threw);
+        CHECK_EQ(refusal_of([&] { read_varint_bounded(buf.data(), pos, cut, "runs"); }), std::string("Malformed runs"));
     }
     size_t pos = 0;
     CHECK_EQ(read_varint_bounded(buf.data(), pos, buf.size(), "runs"), 300000u);
     CHECK_EQ(pos, buf.size());
     const char overlong[6] = {'\x80', '\x80', '\x80', '\x80', '\x80', '\x01'};
     pos = 0;
-    bool threw = false;
-    try { read_varint_bounded(overlong, pos, sizeof(overlong), "runs"); } catch (const std::runtime_error&) { threw = true; }
-    CHECK(threw);
+    CHECK_EQ(refusal_of([&] { read_varint_bounded(overlong, pos, sizeof(overlong), "runs"); }), std::string("Malformed runs"));
 }
 
 TEST(patch_format_bounded_varint_rejects_bits_past_32) {
@@ -141,9 +145,7 @@ TEST(patch_format_bounded_varint_rejects_bits_past_32) {
     // must not wrap to a small value (5 + 2^32 would read as 5).
     const char too_big[5] = {'\x85', '\x80', '\x80', '\x80', '\x10'};
     size_t pos = 0;
-    bool threw = false;
-    try { read_varint_bounded(too_big, pos, sizeof(too_big), "runs"); } catch (const std::runtime_error&) { threw = true; }
-    CHECK(threw);
+    CHECK_EQ(refusal_of([&] { read_varint_bounded(too_big, pos, sizeof(too_big), "runs"); }), std::string("Malformed runs"));
     std::vector<char> max;
     write_varint(max, 0xFFFFFFFFu);
     pos = 0;
@@ -340,10 +342,10 @@ TEST(patch_format_client_files_round_trip_an_empty_inline_file) {
     CHECK(got[0].bytes.empty());
 }
 
-static bool parse_throws(const std::vector<char>& buf) {
+// What parse_client_files refused buf with, or "".
+static std::string client_files_refusal(const std::vector<char>& buf) {
     size_t pos = 0;
-    try { parse_client_files(buf.data(), buf.size(), pos); } catch (const std::runtime_error&) { return true; }
-    return false;
+    return refusal_of([&] { parse_client_files(buf.data(), buf.size(), pos); });
 }
 
 TEST(patch_format_client_files_rejects_missing_truncated_and_bad_names) {
@@ -352,14 +354,14 @@ TEST(patch_format_client_files_rejects_missing_truncated_and_bad_names) {
 
     std::vector<char> no_marker(good);
     no_marker[0] ^= 1;
-    CHECK(parse_throws(no_marker));
-    CHECK(parse_throws(std::vector<char>(good.begin(), good.end() - 1)));
+    CHECK_EQ(client_files_refusal(no_marker), std::string("Patch has no client file list"));
+    CHECK_EQ(client_files_refusal(std::vector<char>(good.begin(), good.end() - 1)), std::string("Truncated client file list"));
 
     std::vector<char> escape;
     append_client_files(escape, {ClientFile{"x.bin", 0, {}}});
     const size_t name_at = 4 + 4 + 2;  // marker, n, name_len
     escape[name_at] = '/';
-    CHECK(parse_throws(escape));
+    CHECK_EQ(client_files_refusal(escape), std::string("Bad client file name: /.bin"));
 }
 
 // --- content_hash ---
@@ -433,13 +435,8 @@ TEST(patch_format_old_file_must_be_the_size_the_patch_was_made_from) {
     ScratchDir dir("old-size");
     REQUIRE(write_file(dir.path() + "/admin_polygons.bin", std::vector<char>(48, 'x')));
     REQUIRE(write_file(dir.path() + "/postal_polygons.bin", std::vector<char>()));
-    auto message = [&](const std::string& name, uint64_t expected) -> std::string {
-        try {
-            require_old_file_size(dir.path(), name, expected);
-        } catch (const std::runtime_error& e) {
-            return e.what();
-        }
-        return "";
+    auto message = [&](const std::string& name, uint64_t expected) {
+        return refusal_of([&] { require_old_file_size(dir.path(), name, expected); });
     };
     CHECK_EQ(message("admin_polygons.bin", 48), std::string());
     CHECK_EQ(message("postal_polygons.bin", 0), std::string());
@@ -462,11 +459,10 @@ TEST(patch_format_old_file_size_of_a_virtual_file_comes_from_the_hook) {
     };
     require_old_file_size(dir.path(), "street_ways.bin", 120);
     CHECK_EQ(virtual_file_sizes()[dir.path() + "/street_ways.bin"], uint64_t(120));
-    bool threw_decoded = false, threw_disk = false;
-    try { require_old_file_size(dir.path(), "street_ways.bin", 96); } catch (const std::runtime_error&) { threw_decoded = true; }
-    try { require_old_file_size(dir.path(), "admin_cells.bin", 12); } catch (const std::runtime_error&) { threw_disk = true; }
-    CHECK(threw_decoded);
-    CHECK(threw_disk);  // not virtual: checked on disk, where it is absent
+    CHECK_EQ(refusal_of([&] { require_old_file_size(dir.path(), "street_ways.bin", 96); }), std::string("decodes to 120 bytes"));
+    // Not virtual: checked on disk, where it is absent.
+    CHECK_EQ(refusal_of([&] { require_old_file_size(dir.path(), "admin_cells.bin", 12); }),
+             std::string("Old admin_cells.bin is not the one the patch was made from (0 bytes, the patch expects 12)"));
     CHECK(!virtual_file_sizes().count(dir.path() + "/admin_cells.bin"));
     virtual_size_hook() = nullptr;
     virtual_file_sizes().clear();
@@ -479,14 +475,10 @@ TEST(patch_format_old_file_sizes_cover_the_files_no_section_names) {
     std::vector<char> buf;
     append_old_file_sizes(buf, old_dir.path());
     CHECK_EQ(buf.size(), 4 + std::size(UNSECTIONED_OLD_FILES) * 12);
-    auto check_in = [&](const std::string& dir, const std::vector<char>& b) -> std::string {
+    auto check_in = [&](const std::string& dir, const std::vector<char>& b) {
         size_t pos = 0;
-        try {
-            check_old_file_sizes(b.data(), b.size(), pos, dir);
-        } catch (const std::runtime_error& e) {
-            return e.what();
-        }
-        return pos == b.size() ? "" : "pos";
+        const std::string refusal = refusal_of([&] { check_old_file_sizes(b.data(), b.size(), pos, dir); });
+        return refusal.empty() && pos != b.size() ? std::string("pos") : refusal;
     };
     CHECK_EQ(check_in(old_dir.path(), buf), std::string());
     // Another day's index: same name, another size.
@@ -576,27 +568,14 @@ TEST(patch_format_offset_fixups_one_edit_is_one_run) {
 TEST(patch_format_offset_fixups_reject_truncated_runs) {
     auto f = encode_fixed({0, 5, 9}, {3, 5, 12});
     f.runs.pop_back();
-    bool threw = false;
-    try {
+    auto walk = [&] {
         auto reader = reader_of(f);
         for (uint32_t i = 0; i < 3; i++) reader.apply(i, 0);
-    } catch (const std::runtime_error&) {
-        threw = true;
-    }
-    CHECK(threw);
+    };
+    CHECK_EQ(refusal_of(walk), std::string("Malformed fixups"));
 }
 
 // --- ascending ids, sections by entries file ---
-
-// What the walk threw as a runtime_error, or "".
-static std::string refusal_of(const std::function<void()>& walk) {
-    try {
-        walk();
-    } catch (const std::runtime_error& e) {
-        return e.what();
-    }
-    return "";
-}
 
 // The ids of v where they sit, as the patcher reads a cell change list.
 static AscendingIds ascending(const std::vector<uint64_t>& v) {
@@ -893,11 +872,8 @@ TEST(patch_format_cell_list_delta_rejects_truncation) {
     std::vector<char> delta;
     append_cell_list_delta(delta, {{1, {10}}}, {{1, {11}}, {2, {5}}});
     auto old_index = write_cell_lists({{1, {10}}});
-    for (size_t cut = 0; cut < delta.size(); cut++) {
-        bool threw = false;
-        try { apply_delta(old_index, delta, cut); } catch (const std::runtime_error&) { threw = true; }
-        CHECK(threw);
-    }
+    for (size_t cut = 0; cut < delta.size(); cut++)
+        CHECK_EQ(refusal_of([&] { apply_delta(old_index, delta, cut); }), std::string("Malformed cell list delta"));
 }
 
 // --- string remap runs ---
@@ -1001,11 +977,6 @@ std::vector<uint32_t> starts_of(const std::string& pool, uint32_t base) {
     return out;
 }
 
-bool throws_runtime_error(const std::function<void()>& f) {
-    try { f(); } catch (const std::runtime_error&) { return true; }
-    return false;
-}
-
 }  // namespace
 
 TEST(patch_format_sent_string_runs_map_every_string_start) {
@@ -1035,33 +1006,35 @@ TEST(patch_format_sent_string_runs_reject_malformed_input) {
     auto runs = encode_string_tier_runs(o.data(), o.size(), 100, 100, tier_edit(o, n).kept);
     REQUIRE(runs.n_runs == 2);
     const uint32_t end = 100 + (uint32_t)o.size();
+    // What add_sent_tier refused the runs with, or "".
     auto add = [](const std::vector<char>& bytes, uint32_t n_runs, uint32_t tier_start, uint32_t tier_end) {
         StringRemap remap;
-        remap.add_sent_tier(bytes.data(), bytes.size(), n_runs, tier_start, tier_end);
+        return refusal_of([&] { remap.add_sent_tier(bytes.data(), bytes.size(), n_runs, tier_start, tier_end); });
     };
-    CHECK(!throws_runtime_error([&] { add(runs.bytes, 2, 100, end); }));
+    const std::string malformed = "Malformed string runs";
+    CHECK_EQ(add(runs.bytes, 2, 100, end), std::string());
     for (size_t cut = 0; cut < runs.bytes.size(); cut++) {
         std::vector<char> short_bytes(runs.bytes.begin(), runs.bytes.begin() + cut);
-        CHECK(throws_runtime_error([&] { add(short_bytes, 2, 100, end); }));
+        CHECK_EQ(add(short_bytes, 2, 100, end), malformed);
     }
     std::vector<char> extra = runs.bytes;
     extra.push_back(0);
-    CHECK(throws_runtime_error([&] { add(extra, 2, 100, end); }));      // leftover bytes
-    CHECK(throws_runtime_error([&] { add(runs.bytes, 1, 100, end); }));  // fewer runs than bytes
-    CHECK(throws_runtime_error([&] { add(runs.bytes, 2, 100, end - 1); }));  // past the tier
-    CHECK(throws_runtime_error([&] { add(runs.bytes, 1000, 100, end); }));   // more runs than bytes allow
+    CHECK_EQ(add(extra, 2, 100, end), malformed);           // leftover bytes
+    CHECK_EQ(add(runs.bytes, 1, 100, end), malformed);      // fewer runs than bytes
+    CHECK_EQ(add(runs.bytes, 2, 100, end - 1), malformed);  // past the tier
+    CHECK_EQ(add(runs.bytes, 1000, 100, end), malformed);   // more runs than bytes allow
     auto encode = [](std::vector<uint32_t> values) {
         std::vector<char> out;
         for (uint32_t v : values) write_varint(out, v);
         return out;
     };
-    CHECK(throws_runtime_error([&] { add(encode({0, 0, 2}), 1, 100, end); }));  // empty run
+    CHECK_EQ(add(encode({0, 0, 2}), 1, 100, end), malformed);  // empty run
     // A start past 2^32 must not wrap back into the tier.
-    CHECK(throws_runtime_error([&] { add(encode({0xFFFFFFF0u, 4, 2}), 1, 100, end); }));
+    CHECK_EQ(add(encode({0xFFFFFFF0u, 4, 2}), 1, 100, end), malformed);
     // Tiers are added in offset order; a tier below earlier runs is refused.
     StringRemap remap;
     remap.add_sent_tier(runs.bytes.data(), runs.bytes.size(), 2, 100, end);
-    CHECK(throws_runtime_error([&] { remap.add_sent_tier(runs.bytes.data(), runs.bytes.size(), 2, 50, end); }));
+    CHECK_EQ(refusal_of([&] { remap.add_sent_tier(runs.bytes.data(), runs.bytes.size(), 2, 50, end); }), malformed);
 }
 
 TEST(patch_format_string_remap_maps_shipped_and_sent_tiers_and_tier_moves) {
@@ -1160,9 +1133,8 @@ TEST(patch_format_referenced_string_tiers_reads_the_listed_fields) {
     CHECK_EQ(mask_of(records({{0, 9, 10}, {0, 0xFFFFFFFFu, 39}})), 0b1011u);
     CHECK_EQ(mask_of(records({{0, 30, 49}})), 0b11000u);  // 30 opens postcode: addr is empty
     CHECK_EQ(mask_of(records({})), 0u);
-    std::string what;
-    try { mask_of(records({{0, 1, 50}})); } catch (const std::runtime_error& e) { what = e.what(); }
-    CHECK_EQ(what, std::string("test.bin references string offset 50 past the old pool (50 bytes)"));
+    CHECK_EQ(refusal_of([&] { mask_of(records({{0, 1, 50}})); }),
+             std::string("test.bin references string offset 50 past the old pool (50 bytes)"));
 }
 
 namespace {
@@ -1317,7 +1289,7 @@ size_t check_strings_section_round_trip(uint64_t seed, PoolOrder order) {
         // Every cut of the section is refused.
         for (size_t cut = 0; cut < buf.size(); cut += 1 + buf.size() / 50) {
             size_t pos = 0;
-            CHECK(throws_runtime_error([&] { parse_strings_section(buf.data(), cut, pos); }));
+            CHECK(!refusal_of([&] { parse_strings_section(buf.data(), cut, pos); }).empty());
         }
     }
     return order_moves;
@@ -1364,7 +1336,7 @@ TEST(patch_format_string_tier_edit_moves_a_string_out_of_order) {
 TEST(patch_format_rebuild_refuses_a_diff_the_old_pool_cannot_place) {
     const std::string o = pool_in_order({"a", "b"});
     auto rebuilds = [&](StringTierDiff d) {
-        return !throws_runtime_error([&] { rebuild_string_tier(o.data(), o.size(), d, [](const char*, size_t) {}); });
+        return refusal_of([&] { rebuild_string_tier(o.data(), o.size(), d, [](const char*, size_t) {}); }).empty();
     };
     const char* x = "x";
     CHECK(rebuilds({0, 0, false, {x}, {2}, {}}));          // after both old strings
@@ -1423,9 +1395,7 @@ TEST(patch_format_strings_section_refuses_indices_out_of_order) {
         const uint32_t descending[2] = {1, 0};
         memcpy(bad.data() + list_at, descending, 8);
         pos = 0;
-        std::string what;
-        try { parse_strings_section(bad.data(), bad.size(), pos); } catch (const std::runtime_error& e) { what = e.what(); }
-        CHECK_EQ(what, std::string("Malformed strings section"));
+        CHECK_EQ(refusal_of([&] { parse_strings_section(bad.data(), bad.size(), pos); }), std::string("Malformed strings section"));
     }
     // A sorted tier's added strings must ascend: "a b" → "c d" sends c, d
     // before deleted (8 bytes) and n_pairs (4); swapped, they are refused.
@@ -1438,7 +1408,8 @@ TEST(patch_format_strings_section_refuses_indices_out_of_order) {
     REQUIRE(std::string(sorted_buf.data() + sorted_buf.size() - 16, 4) == std::string("c\0d\0", 4));
     memcpy(sorted_buf.data() + sorted_buf.size() - 16, "d\0c\0", 4);
     pos = 0;
-    CHECK(throws_runtime_error([&] { parse_strings_section(sorted_buf.data(), sorted_buf.size(), pos); }));
+    CHECK_EQ(refusal_of([&] { parse_strings_section(sorted_buf.data(), sorted_buf.size(), pos); }),
+             std::string("Malformed strings section"));
 }
 
 TEST(patch_format_strings_section_rejects_bad_masks) {
@@ -1454,8 +1425,7 @@ TEST(patch_format_strings_section_rejects_bad_masks) {
     };
     auto parses = [](const std::vector<char>& b) {
         size_t pos = 0;
-        try { parse_strings_section(b.data(), b.size(), pos); } catch (const std::runtime_error& e) { return std::string(e.what()); }
-        return std::string();
+        return refusal_of([&] { parse_strings_section(b.data(), b.size(), pos); });
     };
     CHECK_EQ(parses(buf), std::string());
     CHECK_EQ(parses(with_masks(1u << STRING_TIER_COUNT, 0)), std::string("Malformed strings section"));
@@ -1507,10 +1477,9 @@ TEST(patch_format_newly_shipped_tier_is_sent_and_arrives_whole) {
     // The patcher: a shipped tier must be listed; a listed one without the
     // bit (postcode) is fine, its per-file section writes it.
     const std::unordered_set<std::string> listed = {"strings_core.bin", "strings_postcode.bin", "strings_layout.json"};
-    CHECK(!throws_runtime_error([&] { require_shipped_tiers_listed(dec.section.shipped, listed); }));
-    std::string what;
-    try { require_shipped_tiers_listed(0b1001, {"strings_core.bin"}); } catch (const std::runtime_error& e) { what = e.what(); }
-    CHECK_EQ(what, std::string("Strings section ships strings_postcode.bin, which the client files don't list"));
+    CHECK_EQ(refusal_of([&] { require_shipped_tiers_listed(dec.section.shipped, listed); }), std::string());
+    CHECK_EQ(refusal_of([&] { require_shipped_tiers_listed(0b1001, {"strings_core.bin"}); }),
+             std::string("Strings section ships strings_postcode.bin, which the client files don't list"));
 }
 
 // The builder's STR_TIER_FILENAMES (test_string_tiers.cpp: parsed_data.h
@@ -1698,19 +1667,16 @@ TEST(patch_format_geo_list_delta_rejects_truncation_and_disorder) {
     std::vector<char> buf;
     append_geo_list_delta(buf, 7, {1}, {2});
     append_geo_list_delta(buf, 9, {}, {3});
+    const std::string malformed = "Malformed geo entry delta";
     for (size_t cut = 0; cut < buf.size(); cut++) {
         size_t pos = 0;
-        bool threw = false;
-        try { scan_geo_list_deltas(buf.data(), cut, pos, 2); } catch (const std::runtime_error&) { threw = true; }
-        CHECK(threw);
+        CHECK_EQ(refusal_of([&] { scan_geo_list_deltas(buf.data(), cut, pos, 2); }), malformed);
     }
     std::vector<char> back;
     append_geo_list_delta(back, 9, {}, {3});
     append_geo_list_delta(back, 7, {1}, {2});
     size_t pos = 0;
-    bool threw = false;
-    try { scan_geo_list_deltas(back.data(), back.size(), pos, 2); } catch (const std::runtime_error&) { threw = true; }
-    CHECK(threw);
+    CHECK_EQ(refusal_of([&] { scan_geo_list_deltas(back.data(), back.size(), pos, 2); }), malformed);
 }
 
 // --- read_entry_list ---
@@ -1743,10 +1709,8 @@ TEST(patch_parallel_delta_rejects_invalid_headers) {
     for (const auto& f : PARALLEL_DELTA_FILES)
         check_parallel_delta_header(uint32_t(f.fid), uint32_t(f.parent), f.value_stride, f.remap_kind);
     auto rejects = [](PatchFileId fid, uint32_t parent, uint32_t stride, uint32_t remap) {
-        bool threw = false;
-        try { check_parallel_delta_header(uint32_t(fid), parent, stride, remap); }
-        catch (const std::runtime_error&) { threw = true; }
-        CHECK(threw);
+        CHECK_EQ(refusal_of([&] { check_parallel_delta_header(uint32_t(fid), parent, stride, remap); }),
+                 std::string("Malformed parallel delta"));
     };
     rejects(PatchFileId::WAY_PARENTS, uint32_t(PatchFileId::COUNT), 4, 1);
     rejects(PatchFileId::WAY_PARENTS, 0xFFFFFFFFu, 4, 1);
@@ -1763,10 +1727,7 @@ TEST(patch_output_reports_final_flush_failure) {
     setvbuf(out, buf, _IOFBF, sizeof(buf));
     CHECK_EQ(fwrite("test", 1, 4, out), size_t(4));
     CHECK_EQ(ferror(out), 0);
-    bool threw = false;
-    try { close_patch_outputs({{out, "test"}}); }
-    catch (const std::runtime_error&) { threw = true; }
-    CHECK(threw);
+    CHECK_EQ(refusal_of([&] { close_patch_outputs({{out, "test"}}); }), std::string("Cannot write test"));
 }
 
 TEST(patch_outputs_close_every_one_and_name_the_failed) {
@@ -1783,10 +1744,7 @@ TEST(patch_outputs_close_every_one_and_name_the_failed) {
     setvbuf(file, file_buf, _IOFBF, sizeof(file_buf));
     fwrite("lost", 1, 4, full);
     fwrite("kept", 1, 4, file);
-    std::string message;
-    try { close_patch_outputs({{full, "full.bin"}, {file, "kept.bin"}}); }
-    catch (const std::runtime_error& e) { message = e.what(); }
-    CHECK_EQ(message, std::string("Cannot write full.bin"));
+    CHECK_EQ(refusal_of([&] { close_patch_outputs({{full, "full.bin"}, {file, "kept.bin"}}); }), std::string("Cannot write full.bin"));
     CHECK_EQ(std::filesystem::file_size(kept), uintmax_t(4));
 }
 
@@ -1807,11 +1765,5 @@ TEST(patch_format_ensure_dir_throws_when_it_cannot_create) {
     ScratchDir dir("ensure-dir-file");
     const std::string file = dir.path() + "/a-file";
     std::ofstream(file) << "x";
-    bool threw = false;
-    try {
-        ensure_dir(file + "/sub");
-    } catch (const std::runtime_error& e) {
-        threw = std::string(e.what()).find("Cannot create directory " + file + "/sub") == 0;
-    }
-    CHECK(threw);
+    CHECK_EQ(refusal_of([&] { ensure_dir(file + "/sub"); }).find("Cannot create directory " + file + "/sub"), size_t(0));
 }
