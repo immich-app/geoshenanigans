@@ -26,7 +26,14 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake zlib1g-dev libprotozero-dev \
             libbz2-dev libdeflate-dev libexpat1-dev zstd
+      # The patcher's too-small-TMPDIR cases mount a tmpfs in a private user
+      # namespace (unshare), which the image's AppArmor policy forbids; here
+      # they must run (GEOCODER_TESTS_NEED_PRIVATE_TMPFS fails them if not).
+      - name: Allow user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Build + run tests
+        env:
+          GEOCODER_TESTS_NEED_PRIVATE_TMPFS: "1"
         run: |
           cd geocoder/builder && mkdir -p build && cd build
           cmake .. -DCMAKE_BUILD_TYPE=Release
@@ -50,7 +57,12 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake zlib1g-dev libprotozero-dev \
             libbz2-dev libdeflate-dev libexpat1-dev libzstd-dev zstd
+      # As in the job above: the private tmpfs cases run, or fail.
+      - name: Allow user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Build + run tests
+        env:
+          GEOCODER_TESTS_NEED_PRIVATE_TMPFS: "1"
         run: |
           cd geocoder/builder && mkdir -p build && cd build
           cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGEOCODER_SANITIZE=ON -DGEOCODER_PATCH_LIBZSTD=ON

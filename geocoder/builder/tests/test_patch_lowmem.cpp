@@ -5,6 +5,7 @@
 // command lines the patcher must refuse.
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <functional>
@@ -649,8 +650,12 @@ TEST(patch_refuses_an_output_dir_holding_files) {
 // decompression bound (a frame without a content size bounds every block at
 // 128 KiB) still decompresses it. TMPDIR there is a size-limited tmpfs in a
 // private mount namespace (unshare), gone with the run; skipped where user
-// namespaces are unavailable.
+// namespaces are unavailable, except under
+// GEOCODER_TESTS_NEED_PRIVATE_TMPFS=1 (CI, which allows them), where that
+// fails.
 TEST(patch_fails_cleanly_on_a_tmpdir_too_small_for_the_patch) {
+    const char* need = std::getenv("GEOCODER_TESTS_NEED_PRIVATE_TMPFS");
+    const bool needed = need && std::string(need) == "1";
     ScratchDir dir("patch-tmpfs");
     const std::string& root = dir.path();
     REQUIRE(write_dir(root + "/plain", {}));
@@ -688,7 +693,9 @@ TEST(patch_fails_cleanly_on_a_tmpdir_too_small_for_the_patch) {
         r.left = said.find('\n') == std::string::npos ? "" : said.substr(said.find('\n') + 1);
         auto err = read_file(root + "/" + name + ".err");
         r.err.assign(err.begin(), err.end());
-        if (!r.namespaced) std::printf("    SKIP %s: no private tmpfs (%s)\n", name.c_str(), said.substr(0, 200).c_str());
+        if (!r.namespaced)
+            std::printf("    %s %s: no private tmpfs (%s)\n", needed ? "FAIL" : "SKIP", name.c_str(), said.substr(0, 200).c_str());
+        CHECK(r.namespaced || !needed);
         return r;
     };
 
