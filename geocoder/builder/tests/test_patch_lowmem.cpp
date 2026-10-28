@@ -390,6 +390,54 @@ TEST(patch_lowmem_rebuilds_a_string_tier_in_any_order) {
     CHECK(read_dir(c.dir("out.dec")) == read_dir(c.dir("new")));
 }
 
+// A new set without an encoded family's files (the POI family, both files
+// gone) gets a gc.manifest naming only the families it ships, as gc's
+// encoding of the new dir does, and decodes to the new dir.
+TEST(patch_lowmem_new_manifest_names_only_the_families_the_patch_ships) {
+    ScratchDir dir("lowmem-family");
+    std::mt19937 rng(20261027);
+    std::vector<GeoRow> rows;
+    for (uint32_t k = 0; k < 50; k++) rows.push_back({k, {k % 10}});
+    BuildDir old_d, new_d;
+    put_geo(old_d, rows);
+    put_pois(old_d, pois_of(rng, 40, 0, true));
+    put_geo(new_d, rows);
+    const LowMemCase c{dir.path(), "removed-family"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+
+    CHECK(apply_both_modes(c).empty());
+    auto r = run_tool({GEOCODER_GC_BIN, "decode", c.dir("out.sync"), c.dir("out.dec")}, c.log());
+    CHECK(r.ok);
+    CHECK(r.ok && read_dir(c.dir("out.dec")) == new_d);
+}
+
+// A new set with part of an encoded family (one of the POI family's two
+// files) is refused before the replay.
+TEST(patch_lowmem_refuses_a_new_set_with_part_of_a_family) {
+    ScratchDir dir("lowmem-part");
+    std::mt19937 rng(20261027);
+    std::vector<GeoRow> rows;
+    for (uint32_t k = 0; k < 50; k++) rows.push_back({k, {k % 10}});
+    BuildDir old_d;
+    put_geo(old_d, rows);
+    put_pois(old_d, pois_of(rng, 40, 0, true));
+    for (const std::string gone : {"poi_vertices.bin", "poi_records.bin"}) {
+        BuildDir new_d = old_d;
+        new_d.erase(gone);
+        const LowMemCase c{dir.path(), "without-" + gone};
+        REQUIRE(prepare(c, old_d, new_d).empty());
+        for (const bool threads : {false, true}) {
+            std::vector<std::string> words = {GEOCODER_PATCH_BIN, c.dir("old.enc"), c.patch(), "-o", c.dir(threads ? "out.t" : "out")};
+            if (threads) words.push_back("--threads");
+
+            auto r = run_tool(words, c.log());
+
+            CHECK(!r.ok);
+            CHECK(logged(r, "family poi: the patch ships 1 of its 2 files"));
+        }
+    }
+}
+
 // An encoded set whose addresses are in geocoder-gc's pax170 layout, which
 // the address codec doesn't stream, is refused before anything is written
 // (meta.json, an inline client file, was written first).
