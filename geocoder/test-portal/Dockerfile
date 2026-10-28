@@ -1,5 +1,5 @@
 # Build Rust server (includes embedded test portal HTML)
-FROM rust:bookworm AS builder
+FROM rust:bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
@@ -12,7 +12,7 @@ COPY builder/data/ builder/data/
 RUN cargo build --release --manifest-path server/Cargo.toml
 
 # Runtime
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates zstd \
