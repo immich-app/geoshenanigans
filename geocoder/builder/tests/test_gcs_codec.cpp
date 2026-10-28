@@ -926,6 +926,47 @@ TEST(gcs_ways_decoder_rejects_bytes_past_the_end_of_a_column) {
     }
 }
 
+TEST(gcs_ways_decoder_rejects_a_way_starting_past_node_u32) {
+    // A way's node_offset is a u32: counts that sum past it, while the total
+    // matches the manifest's node count, are rejected at the first way that
+    // starts past node 2^32 - 1 (narrowed, it read as a small offset). The 40
+    // street ways of 0 to 3 nodes decoded from node 2^32 - 1: the first way
+    // with nodes starts there, the next one past it.
+    const WaySet s = way_set(true);
+    ScratchDir dir("gcs-test");
+    Manifest m;
+    {
+        std::mt19937 rng(5);
+        ways::Enc enc(dir.path(), true);
+        enc.state = {1, 1};
+        size_t np = 0;
+        for (size_t w = 0; w < s.ways.size() / 12; w++) {
+            write_in_pieces(enc, 0, &s.ways[12 * w], 12, rng, 5);
+            const size_t nb = 8 * size_t(rd16(&s.ways[12 * w + 4]));
+            if (nb) write_in_pieces(enc, 1, &s.nodes[np], nb, rng, 7);
+            np += nb;
+        }
+        m = finish_all(enc);
+    }
+    m.set("street.nodes", UINT32_MAX + m.num("street.nodes"));
+
+    const int status = exit_status_in_child(
+        [&] {
+            return error_code(
+                [&] {
+                    ways::Dec dec(dir.path(), true, m);
+                    dec.node_off = UINT32_MAX;
+                    for (auto& st : dec.state) st = 1;
+                    while (dec.step())
+                        for (auto& q : dec.out) q.pop(q.size());
+                },
+                "starts past node");
+        },
+        20);
+
+    CHECK_EQ(status, 2);
+}
+
 namespace {
 
 std::vector<uint32_t> u24_values() {

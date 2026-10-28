@@ -278,6 +278,8 @@ struct Dec : Decoder {
         wr16(rec + 4, cnt);
         if (cnt) {
             if (!valid_code(code)) die("%s: way %llu has a bad code %#x", nm.pre, (unsigned long long)i, unsigned(code));
+            // node_offset is a u32: the counts can sum past it while the total matches the manifest's.
+            if (node_off > UINT32_MAX) die("%s: way %llu starts past node %u", nm.pre, (unsigned long long)i, UINT32_MAX);
             wr32(rec, uint32_t(node_off));
             const size_t bs = block_size(cnt, code);
             const uint8_t* q = nodes2->need(bs + 8, true);

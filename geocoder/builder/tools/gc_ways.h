@@ -66,6 +66,12 @@ static inline size_t block_size(uint16_t cnt, uint16_t code) {
 }
 // The widths an encoder writes: the first node in at most 4 bytes, the deltas in at most 32 bits.
 static inline bool valid_code(uint16_t code) { return (code & 63) <= 32 && ((code >> 6) & 63) <= 32 && (code >> 13) <= 4; }
+// A way's node_offset, the nodes before it, in the record's u32: refused past it (the counts can sum
+// to any size; the manifest's node count bounds where the last way ends, not where it starts).
+inline uint32_t node_offset(uint64_t node_off, const char* pre, uint64_t i) {
+    if (node_off > UINT32_MAX) die("%s: way %llu starts past node %u", pre, (unsigned long long)i, UINT32_MAX);
+    return uint32_t(node_off);
+}
 
 struct Names {
     const char *ways, *nodes, *pre;
@@ -330,7 +336,7 @@ inline void decode_ways_only(const std::string& src, const std::string& out, boo
         }
         wr16(rec + 4, cnt);
         if (cnt) {
-            wr32(rec, uint32_t(node_off));
+            wr32(rec, node_offset(node_off, nm.pre, i));
             node_off += cnt;
         }
         W.put(rec, nm.stride);
@@ -393,7 +399,7 @@ inline void decode(const std::string& src, const std::string& out, bool street, 
         wr16(rec + 4, cnt);
         if (cnt) {
             if (!valid_code(code)) die("%s: way %llu has a bad code %#x", nm.pre, (unsigned long long)i, unsigned(code));
-            wr32(rec, uint32_t(node_off));
+            wr32(rec, node_offset(node_off, nm.pre, i));
             const size_t bs = block_size(cnt, code);
             const uint8_t* q = nodes2.need(bs + 8, true);
             const int wl = code & 63, wg = (code >> 6) & 63, wf = (code >> 13) & 7;

@@ -622,6 +622,48 @@ TEST(gc_ways_decoders_refuse_bytes_past_a_column) {
     }
 }
 
+// A way's node_offset is a u32: street counts that sum past it, while the
+// total matches the manifest's node count, are refused at the first way that
+// starts past node 2^32 - 1 (narrowed, it read as a small offset). 65538 ways
+// of 65535 nodes decode, the last starting at node 2^32 - 1; a 65539th is
+// refused. Through the ways-only decode (the full decode's nodes would be 32
+// GiB), whose offset check the full decode shares.
+TEST(gc_ways_decoders_refuse_a_way_starting_past_node_u32) {
+    for (const uint32_t ways : {65538u, 65539u}) {
+        ScratchDir dir("gc-ways-offset");
+        const std::string src = dir.path() + "/in", out = dir.path() + "/out";
+        std::filesystem::create_directories(src);
+        std::filesystem::create_directories(out);
+        std::vector<uint8_t> cnt, name;
+        for (uint32_t w = 0; w < ways; w++) {
+            for (uint8_t b : le(65535, 2)) cnt.push_back(b);
+            put32(name, w);
+        }
+        write_bytes(src + "/street.cnt", cnt);
+        write_bytes(src + "/street.name", name);
+
+        const int status = exit_status_in_child(
+            [&] {
+                gcset::Manifest m;
+                m.set("street.ways", ways);
+                m.set("street.nodes", uint64_t(ways) * 65535);
+                m.set("street.G", 16);
+                gcset::want_files() = {"street_ways.bin"};
+                gcset::ways::decode(src, out, true, m);
+                return 0;
+            },
+            20);
+
+        if (status != (ways == 65538 ? 0 : 2)) std::printf("    %u ways: exit %d\n", ways, status);
+        CHECK_EQ(status, ways == 65538 ? 0 : 2);
+        if (ways == 65538) {
+            const std::vector<uint8_t> recs = read_bytes(out + "/street_ways.bin");
+            REQUIRE(recs.size() == size_t(12) * ways);
+            CHECK_EQ(gcset::rd32(&recs[recs.size() - 12]), UINT32_MAX);
+        }
+    }
+}
+
 // Footprints past abs2's bound round trip through the raw escape, byte for
 // byte: the encoder in one pass and in its two streamed passes, and the
 // decoders whole, points only and vertices only.
