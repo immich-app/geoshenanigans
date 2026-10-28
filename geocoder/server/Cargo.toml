@@ -30,7 +30,7 @@ getrandom = "0.2"
 arc-swap = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 zstd = "0.13"
-sha2 = "0.10"
+sha2 = "0.11"
 futures-util = "0.3"
 bytes = "1"
 
