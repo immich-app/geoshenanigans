@@ -30,6 +30,7 @@ namespace gcset::gxc {
 
 static const uint64_t B = 128;
 static const int CELL_SHIFT = 27;  // level-17 cell id step
+static const uint64_t ADDR_ID_SPACE = uint64_t(1) << 32;  // address ids are u32s
 static const char* ENTRY[3] = {"street_entries.bin", "addr_entries.bin", "interp_entries.bin"};
 static const char* STREAM[2] = {"gxc_street.bin", "gxc_interp.bin"};
 
@@ -179,19 +180,29 @@ inline void encode(const std::string& src, const std::string& out, Manifest& m) 
     delete st[1];
 }
 
-// A list holds 1 to 65535 ids (today's u16 count); every count is checked before it is used.
+// A list holds 1 to 65535 ids (today's u16 count); every count is checked before it is used, and
+// every id against the u32 range before it is stored.
 static void decode_list(Reader& s, bool strict, uint32_t prev_first, std::vector<uint32_t>& list) {
     const uint64_t cm1 = s.uv();  // count - 1
     if (cm1 >= 0xFFFF) die("gxc: list too long");
     const size_t c = size_t(cm1) + 1;
     list.resize(c);
-    list[0] = uint32_t(int64_t(prev_first) + unzz64(s.uv()));
-    for (size_t j = 1; j < c; j++) list[j] = list[j - 1] + uint32_t(s.uv()) + (strict ? 1 : 0);
+    const auto first = checked_id(prev_first, unzz64(s.uv()));
+    if (!first) die("gxc: list id past u32");
+    list[0] = *first;
+    for (size_t j = 1; j < c; j++) {
+        const auto id = checked_id(uint64_t(list[j - 1]) + strict, s.uv());
+        if (!id) die("gxc: list id past u32");
+        list[j] = *id;
+    }
 }
 
 inline void decode(const std::string& src, const std::string& out, const Manifest& m) {
     const uint64_t R = m.num("gxc.rows");
     if (m.num("gxc.B") != B) die("unsupported B");
+    // Address ids are u32s: the rows list ids below it, and next never passes it.
+    const uint64_t ids = m.num("gxc.addr_ids");
+    if (ids > ADDR_ID_SPACE) die("gxc: address id count");
     Reader top(src + "/gxc_top.bin", 1 << 20), rows(src + "/gxc_rows.bin");
     Reader* st[2] = {new Reader(src + "/" + STREAM[0]), new Reader(src + "/" + STREAM[1])};
     if (top.size() != 32 * ((R + B - 1) / B)) die("gxc_top.bin size");
@@ -236,14 +247,15 @@ inline void decode(const std::string& src, const std::string& out, const Manifes
         if (as) {
             list.clear();
             auto bad = [&] { die("gxc: bad address list at row %llu", (unsigned long long)r); };
+            // The row's new ids (next onwards) stay below the set's address id count.
             if (as == 1) {
                 const uint64_t k = rows.uv();
-                if (k == 0 || k > 0xFFFF) bad();
+                if (k == 0 || k > 0xFFFF || k > ids - next) bad();
                 for (uint64_t j = 0; j < k; j++) list.push_back(uint32_t(next + j));
                 next += k;
             } else if (as == 2) {
                 const uint64_t K = rows.uv(), D = rows.uv();
-                if (K == 0 || K > 0xFFFF || D > K) bad();
+                if (K == 0 || K > 0xFFFF || K > ids - next || D > K) bad();
                 uint64_t pj = 0, j = 0;  // pj: one past the previous repeated index
                 for (uint64_t x = 0; x < D; x++) {
                     const uint64_t gap = rows.uv(), cm2 = rows.uv();  // copies - 2
@@ -259,11 +271,18 @@ inline void decode(const std::string& src, const std::string& out, const Manifes
                 next += K;
             } else {
                 const uint64_t k = rows.uv(), cm1 = rows.uv();  // count - 1
-                if (cm1 >= 0xFFFF) bad();
+                if (cm1 >= 0xFFFF || k > ids - next) bad();
                 const uint64_t c = cm1 + 1;
-                list.push_back(uint32_t(int64_t(next) + unzz64(rows.uv())));
-                for (uint64_t j = 1; j < c; j++) list.push_back(list.back() + uint32_t(rows.uv()));
+                const auto first = checked_id(next, unzz64(rows.uv()));
+                if (!first) bad();
+                list.push_back(*first);
+                for (uint64_t j = 1; j < c; j++) {
+                    const auto id = checked_id(list.back(), rows.uv());
+                    if (!id) bad();
+                    list.push_back(*id);
+                }
                 next += k;
+                if (list.back() >= next) bad();  // past the ids listed so far and the row's own
             }
             if (list.empty() || list.size() > 0xFFFF) die("gxc: bad address list at row %llu", (unsigned long long)r);
             off[1] = emit(1, list);
@@ -289,7 +308,7 @@ inline void decode(const std::string& src, const std::string& out, const Manifes
         fg.row_done();
     }
     if (!rows.eof() || !st[0]->eof() || !st[1]->eof() || !top.eof()) die("gxc: streams not fully consumed");
-    if (next != m.num("gxc.addr_ids")) die("gxc: address id count");
+    if (next != ids) die("gxc: address id count");
     for (int t = 0; t < 3; t++) delete E[t];
     delete st[0];
     delete st[1];

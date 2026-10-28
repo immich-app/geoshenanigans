@@ -1,6 +1,7 @@
 // checked_size (tools/checked_size.h): the size of a unit a count in an input
 // file sizes, computed in 64 bits and checked against what the input has left
-// and the size type. Size = uint32_t stands for a 32-bit build's size_t.
+// and the size type. Size = uint32_t stands for a 32-bit build's size_t. And
+// checked_id: an id from a delta in an input file, checked against u32.
 #include "checked_size.h"
 
 #include <cstdint>
@@ -34,4 +35,22 @@ TEST(checked_size_refuses_a_unit_past_64_bits) {
     CHECK(!checked_size<uint64_t>(10, uint64_t(1) << 62, 4, UINT64_MAX));
     CHECK(!checked_size<uint64_t>(10, UINT64_MAX / 4, 4, UINT64_MAX));
     CHECK(checked_size<uint64_t>(3, UINT64_MAX / 4, 4, UINT64_MAX) == UINT64_MAX);
+}
+
+// An id from a delta or a gap stays a u32: 0 and 2^32 - 1 are reached, one
+// past either is refused (no signed overflow, no narrowing), and so is any id
+// from a base past u32 but one a negative delta brings back into it.
+TEST(checked_id_keeps_ids_in_u32) {
+    CHECK(checked_id(1, int64_t(-1)) == 0u);
+    CHECK(checked_id(0, int64_t(UINT32_MAX)) == UINT32_MAX);
+    CHECK(checked_id(uint64_t(1) << 32, int64_t(-1)) == UINT32_MAX);
+    CHECK(!checked_id(0, int64_t(-1)));
+    CHECK(!checked_id(0, int64_t(1) << 32));
+    CHECK(!checked_id(1, INT64_MAX));
+    CHECK(!checked_id(5, INT64_MIN));
+    CHECK(!checked_id(UINT32_MAX, int64_t(1)));
+    CHECK(checked_id(UINT32_MAX - 3, uint64_t(3)) == UINT32_MAX);
+    CHECK(!checked_id(UINT32_MAX, uint64_t(1)));
+    CHECK(!checked_id(0, ~uint64_t(0)));
+    CHECK(!checked_id(uint64_t(1) << 32, uint64_t(0)));
 }

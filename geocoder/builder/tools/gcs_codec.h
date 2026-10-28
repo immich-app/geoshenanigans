@@ -602,6 +602,7 @@ struct DictEnc : Encoder {
 namespace gxc {
 static const uint64_t B = 128;
 static const int CELL_SHIFT = 27;
+static const uint64_t ADDR_ID_SPACE = uint64_t(1) << 32;  // address ids are u32s
 struct __attribute__((packed)) Top { uint64_t cell; uint32_t roff, s, i, afirst, sprev, iprev; };
 static_assert(sizeof(Top) == 32, "Top");
 static const char* ENTRY[3] = {"street_entries.bin", "addr_entries.bin", "interp_entries.bin"};
@@ -616,7 +617,9 @@ struct Dec : Decoder {
     uint64_t esize[3];
     Dec(const std::string& src, const Manifest& m) : Decoder("gxc", 4) {
         R = m.num("gxc.rows");
+        // Address ids are u32s: the rows list ids below it, and next never passes it.
         ids = m.num("gxc.addr_ids");
+        if (ids > ADDR_ID_SPACE) die("gxc: address id count");
         if (m.num("gxc.B") != B) die("unsupported B");
         for (int t = 0; t < 3; t++) esize[t] = m.num(std::string("gxc.") + ENTRY[t]);
         top.reset(new Reader(src + "/gxc_top.bin", 4 << 10));
@@ -626,14 +629,21 @@ struct Dec : Decoder {
         if (top->size() != 32 * ((R + B - 1) / B)) die("gxc_top.bin size");
     }
     uint64_t decoded_size(int port) const override { return port == 0 ? 20 * R : esize[port - 1]; }
-    // A list holds 1 to 65535 ids (today's u16 count); every count is checked before it is used.
+    // A list holds 1 to 65535 ids (today's u16 count); every count is checked before it is used,
+    // and every id against the u32 range before it is stored.
     static void decode_list(Reader& s, bool strict, uint32_t prev_first, std::vector<uint32_t>& l) {
         const uint64_t cm1 = s.uv();  // count - 1
         if (cm1 >= 0xFFFF) die("gxc: list too long");
         const size_t c = size_t(cm1) + 1;
         l.resize(c);
-        l[0] = uint32_t(int64_t(prev_first) + unzz64(s.uv()));
-        for (size_t j = 1; j < c; j++) l[j] = l[j - 1] + uint32_t(s.uv()) + (strict ? 1 : 0);
+        const auto first = checked_id(prev_first, unzz64(s.uv()));
+        if (!first) die("gxc: list id past u32");
+        l[0] = *first;
+        for (size_t j = 1; j < c; j++) {
+            const auto id = checked_id(uint64_t(l[j - 1]) + strict, s.uv());
+            if (!id) die("gxc: list id past u32");
+            l[j] = *id;
+        }
     }
     uint32_t emit_list(int t, const std::vector<uint32_t>& l) {
         if (eoff[t] > 0xFFFFFFFFull) die("gxc: entries offset overflow");
@@ -671,14 +681,15 @@ struct Dec : Decoder {
         if (as) {
             list.clear();
             auto bad = [&] { die("gxc: bad address list at row %llu", (unsigned long long)r); };
+            // The row's new ids (next onwards) stay below the set's address id count.
             if (as == 1) {
                 const uint64_t k = rows->uv();
-                if (k == 0 || k > 0xFFFF) bad();
+                if (k == 0 || k > 0xFFFF || k > ids - next) bad();
                 for (uint64_t j = 0; j < k; j++) list.push_back(uint32_t(next + j));
                 next += k;
             } else if (as == 2) {
                 const uint64_t K = rows->uv(), D = rows->uv();
-                if (K == 0 || K > 0xFFFF || D > K) bad();
+                if (K == 0 || K > 0xFFFF || K > ids - next || D > K) bad();
                 uint64_t pj = 0, j = 0;  // pj: one past the previous repeated index
                 for (uint64_t x = 0; x < D; x++) {
                     const uint64_t gap = rows->uv(), cm2 = rows->uv();  // copies - 2
@@ -694,11 +705,18 @@ struct Dec : Decoder {
                 next += K;
             } else {
                 const uint64_t k = rows->uv(), cm1 = rows->uv();  // count - 1
-                if (cm1 >= 0xFFFF) bad();
+                if (cm1 >= 0xFFFF || k > ids - next) bad();
                 const uint64_t c = cm1 + 1;
-                list.push_back(uint32_t(int64_t(next) + unzz64(rows->uv())));
-                for (uint64_t j = 1; j < c; j++) list.push_back(list.back() + uint32_t(rows->uv()));
+                const auto first = checked_id(next, unzz64(rows->uv()));
+                if (!first) bad();
+                list.push_back(*first);
+                for (uint64_t j = 1; j < c; j++) {
+                    const auto id = checked_id(list.back(), rows->uv());
+                    if (!id) bad();
+                    list.push_back(*id);
+                }
                 next += k;
+                if (list.back() >= next) bad();  // past the ids listed so far and the row's own
             }
             if (list.empty() || list.size() > 0xFFFF) die("gxc: bad address list at row %llu", (unsigned long long)r);
             off[1] = emit_list(1, list);

@@ -651,7 +651,7 @@ TEST(gcs_gxc_decoder_rejects_list_and_address_counts_before_using_them) {
         {1, 1, {1, 4, 0}, {2}, 2, nullptr},                                                    // a valid row
         {1, 0, {MAX, 0}, {}, 0, "list too long"},                                              // street count - 1 = 2^64 - 1
         {3, 0, {0xFFFF, 0}, {}, 0, "list too long"},                                           // street count 65536
-        {0, 1, {}, {uint64_t(1) << 40}, uint64_t(1) << 40, "bad address list"},                // state 1, 2^40 ids
+        {0, 1, {}, {uint64_t(1) << 40}, 0, "bad address list"},                                // state 1, 2^40 ids
         {0, 1, {}, {0}, 0, "bad address list"},                                                // state 1, no ids
         {0, 2, {}, {3, 1, uint64_t(1) << 40, 0}, 3, "bad address list"},                       // state 2, index gap 2^40
         {0, 2, {}, {1, 1, 0, uint64_t(1) << 40}, 1, "bad address list"},                       // state 2, 2^40 copies
@@ -688,6 +688,98 @@ TEST(gcs_gxc_decoder_rejects_list_and_address_counts_before_using_them) {
                     c.error ? c.error : "");
             },
             20);
+        CHECK_EQ(status, c.error ? 2 : 0);
+    }
+}
+
+namespace {
+
+// A gxc row: its header byte (list states, address state, cell step) and the
+// varints after it (an escaped step, then the address payload).
+struct GxcRow {
+    uint8_t h;
+    std::vector<uint64_t> after;
+};
+
+// An encoded geo index of rows at dir: blocks of 128 rows starting at cells
+// (2^40 by default), no list in effect at a block's start (a later block's
+// rows list nothing before it), street: gxc_street.bin's varints.
+void write_gxc(const std::string& dir, const std::vector<GxcRow>& rows, const std::vector<uint64_t>& street,
+               const std::vector<uint64_t>& cells = {uint64_t(1) << 40}) {
+    std::vector<uint8_t> top, r, s;
+    for (size_t i = 0; i < rows.size(); i++) {
+        if (i % 128 == 0) {
+            uint8_t t[32] = {};
+            wr64(t, cells[i / 128]);
+            wr32(t + 8, uint32_t(r.size()));
+            wr32(t + 12, NO);
+            wr32(t + 16, NO);
+            top.insert(top.end(), t, t + 32);
+        }
+        r.push_back(rows[i].h);
+        for (uint64_t v : rows[i].after) uv(r, v);
+    }
+    for (uint64_t v : street) uv(s, v);
+    write_bytes(dir + "/gxc_top.bin", top);
+    write_bytes(dir + "/gxc_rows.bin", r);
+    write_bytes(dir + "/gxc_street.bin", s);
+    write_bytes(dir + "/gxc_interp.bin", {});
+}
+
+// Decodes the set at dir to the end in a child: 0 when it decodes, 2 when it
+// fails with error, 3 with another.
+int gxc_decode_error(const std::string& dir, uint64_t rows, uint64_t addr_ids, const char* error) {
+    return exit_status_in_child(
+        [&] {
+            return error_code(
+                [&] {
+                    Manifest m;
+                    m.set("gxc.rows", rows);
+                    m.set("gxc.B", 128);
+                    m.set("gxc.addr_ids", addr_ids);
+                    for (const char* e : gxc::ENTRY) m.set(std::string("gxc.") + e, 0);
+                    gxc::Dec dec(dir, m);
+                    for (auto& st : dec.state) st = 1;
+                    while (dec.step()) {}
+                },
+                error);
+        },
+        20);
+}
+
+}  // namespace
+
+TEST(gcs_gxc_decoder_rejects_ids_past_u32_and_the_id_count) {
+    // List and address ids that leave the u32 range, or pass the set's address
+    // id count, are rejected, each case a one- or two-row encoded set (street
+    // list state 1 or address state 1 or 3 in each row): a first id 2^32
+    // (narrowed to 0), 1 + (2^63 - 1) (a signed overflow), a gap from 2^32 - 1
+    // (wrapped to 0), an address advance of 2^64 - 1 (next wrapped to 0 by the
+    // next row), an id at or past the count, a count past 2^32. Ids up to
+    // 2^32 - 1 decode.
+    struct Case {
+        std::vector<GxcRow> rows;
+        std::vector<uint64_t> street;
+        uint64_t addr_ids;
+        const char* error;  // nullptr: decodes
+    };
+    const uint64_t MAX = ~uint64_t(0), U32 = uint64_t(1) << 32;
+    const Case cases[] = {
+        {{{1 | 1 << 2, {2}}, {1 | 3 << 2, {0, 0, zz64(-1)}}}, {0, zz64(1), 1, zz64(0xFFFFFFFC), 1}, 2, nullptr},  // valid ids
+        {{{1, {}}}, {0, zz64(int64_t(U32))}, 0, "list id past u32"},                             // street first id 2^32
+        {{{1, {}}, {1, {}}}, {0, zz64(1), 0, zz64(INT64_MAX)}, 0, "list id past u32"},           // 1 + 2^63 - 1
+        {{{1, {}}}, {1, zz64(int64_t(U32 - 1)), 0}, 0, "list id past u32"},                      // 2^32 - 1 + 1
+        {{{3 << 2, {MAX, 0, zz64(0)}}, {1 << 2, {1}}}, {}, 0, "bad address list"},               // advance 2^64 - 1
+        {{{3 << 2, {1, 0, zz64(int64_t(U32))}}}, {}, 1, "bad address list"},                     // first id 2^32
+        {{{3 << 2, {0, 0, zz64(5)}}}, {}, 0, "bad address list"},                                // past the count
+        {{{3 << 2, {U32 + 1, 0, zz64(0)}}}, {}, U32 + 1, "address id count"},                    // count 2^32 + 1
+    };
+    for (const Case& c : cases) {
+        ScratchDir dir("gcs-test");
+        write_gxc(dir.path(), c.rows, c.street);
+
+        const int status = gxc_decode_error(dir.path(), c.rows.size(), c.addr_ids, c.error ? c.error : "");
+
         CHECK_EQ(status, c.error ? 2 : 0);
     }
 }
