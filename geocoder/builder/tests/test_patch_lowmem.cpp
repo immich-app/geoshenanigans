@@ -483,6 +483,26 @@ TEST(run_with_heap_peak_measures_the_process_it_runs_and_not_its_children) {
     CHECK(parent < (uint64_t{1} << 20));
 }
 
+// The tools build with _FILE_OFFSET_BITS=64, which links their mmap() calls
+// (SequentialFileReader's read windows) to mmap64: heap-peak-probe, built the
+// same way, mapping 16 MiB peaks at least 15 MiB above it mapping 1 MiB.
+TEST(run_with_heap_peak_counts_the_mappings_of_a_program_built_as_the_tools_are) {
+#ifndef GEOCODER_HEAP_PEAK_PROBE
+    std::printf("    SKIP heap peaks of heap-peak-probe: no heap shim under the sanitizers\n");
+#else
+    ScratchDir dir("heap-peak-probe");
+    auto peak_of = [&](const std::string& mib) {
+        const auto [ok, heap_peak] = gctest::run_with_heap_peak({GEOCODER_HEAP_PEAK_PROBE, mib}, dir.path() + "/log");
+        REQUIRE(ok && heap_peak);
+        return *heap_peak;
+    };
+
+    const uint64_t one = peak_of("1"), sixteen = peak_of("16");
+
+    CHECK(sixteen >= one + (uint64_t{15} << 20));
+#endif
+}
+
 // n geo cells whose street lists all change (each cell's street becomes the
 // next one) over street ways that stay: n street entry corrections, which the
 // patcher reads where they sit in the patch.

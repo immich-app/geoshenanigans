@@ -1,8 +1,9 @@
 // LD_PRELOAD heap peak of one process, for the patcher's memory tests
 // (tests/tool_runs.h run_with_heap_peak): the live bytes of every block the
 // malloc family hands out (malloc_usable_size, so glibc's own mmapped blocks
-// count here) plus the anonymous mappings made through mmap(), whose peak
-// exit() writes to $GEOCODER_HEAP_PEAK_OUT as one line of decimal bytes.
+// count here) plus the anonymous mappings made through mmap() or mmap64(),
+// whose peak exit() writes to $GEOCODER_HEAP_PEAK_OUT as one line of decimal
+// bytes.
 // The process's children run unmeasured: the zstd CLI the patcher spawns
 // sizes its window by the patch.
 #define _GNU_SOURCE
@@ -96,7 +97,7 @@ static long page_rounded(size_t n) {
     return (long)((n + page - 1) / page * page);
 }
 
-void* mmap(void* addr, size_t len, int prot, int flags, int fd, off_t off) {
+static void* counted_mmap(void* addr, size_t len, int prot, int flags, int fd, long off) {
     void* p = (void*)syscall(SYS_mmap, addr, len, prot, flags, fd, off);
     if (p == MAP_FAILED || !(flags & MAP_ANONYMOUS)) return p;
     const long bytes = page_rounded(len);
@@ -110,6 +111,11 @@ void* mmap(void* addr, size_t len, int prot, int flags, int fd, off_t off) {
     add(bytes);
     return p;
 }
+
+void* mmap(void* addr, size_t len, int prot, int flags, int fd, off_t off) { return counted_mmap(addr, len, prot, flags, fd, off); }
+
+// What mmap() links to in a _FILE_OFFSET_BITS=64 build, such as the tools'.
+void* mmap64(void* addr, size_t len, int prot, int flags, int fd, off64_t off) { return counted_mmap(addr, len, prot, flags, fd, off); }
 
 int munmap(void* addr, size_t len) {
     for (int i = 0; i < MAPPINGS; i++)

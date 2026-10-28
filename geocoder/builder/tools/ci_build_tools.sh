@@ -11,7 +11,7 @@ set -euo pipefail
 build=$(realpath -m "$1")
 cache=$(realpath -m "$2")
 s2_prefix=$3
-tools=(build-index geocoder-diff geocoder-patch geocoder-gc pbf-apply heap-peak-shim geocoder-tests)
+tools=(build-index geocoder-diff geocoder-patch geocoder-gc pbf-apply heap-peak-shim heap-peak-probe geocoder-tests)
 source_dir=$(cd "$(dirname "$0")/.." && pwd)
 
 compile() {
