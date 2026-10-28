@@ -236,10 +236,36 @@ std::string prepare(const LowMemCase& c, const BuildDir& old_d, const BuildDir& 
     return "";
 }
 
+// c's patch decompressed, as the patcher reads it; nothing when zstd fails.
+std::vector<char> raw_patch(const LowMemCase& c) {
+    if (!run({"zstd", "-d", "-q", "-f", c.patch(), "-o", c.dir("raw")}, c.log())) return {};
+    return read_file(c.dir("raw"));
+}
+
+// raw compressed into the patch file `patch`: whether it was written.
+bool write_patch(const LowMemCase& c, const std::string& patch, const std::vector<char>& raw) {
+    return write_file(patch + ".raw", raw) && run({"zstd", "-q", "-f", patch + ".raw", "-o", patch}, c.log());
+}
+
+// A heap test's check that its case holds the structure it varies: "" when
+// c's patch holds `head` (a section's first bytes) exactly once, else that
+// it has no `what`.
+std::string patch_holds(const LowMemCase& c, const std::vector<char>& head, const std::string& what) {
+    return find_once(raw_patch(c), head) == std::string::npos ? "no " + what : "";
+}
+
 // The modes a patch applies in: to the old dir, and to its encoded set (the
 // low-memory mode) in sync and with --threads.
 const std::vector<std::string> ENCODED_MODES = {"sync", "threads"};
 const std::vector<std::string> ALL_MODES = {"plain", "sync", "threads"};
+
+// The patcher's command line applying patch to c's old dir ("plain") or
+// encoded set ("sync", "threads") into out.
+std::vector<std::string> patch_words(const LowMemCase& c, const std::string& mode, const std::string& patch, const std::string& out) {
+    std::vector<std::string> words = {GEOCODER_PATCH_BIN, c.dir(mode == "plain" ? "old" : "old.enc"), patch, "-o", out};
+    if (mode == "threads") words.push_back("--threads");
+    return words;
+}
 
 // A case's patch applied in some modes: every mismatch, and the patcher's
 // heap peak by mode where the heap shim measured one.
@@ -257,10 +283,8 @@ Applied apply_modes(const LowMemCase& c, const std::vector<std::string>& modes, 
     for (const std::string& mode : modes) {
         const bool plain = mode == "plain";
         const std::string out = c.dir("out." + mode);
-        std::vector<std::string> words = {GEOCODER_PATCH_BIN, c.dir(plain ? "old" : "old.enc"), c.patch(), "-o", out};
-        if (mode == "threads") words.push_back("--threads");
         std::filesystem::remove(c.log());
-        const auto [ok, heap_peak] = gctest::run_with_heap_peak(words, c.log());
+        const auto [ok, heap_peak] = gctest::run_with_heap_peak(patch_words(c, mode, c.patch(), out), c.log());
         const std::vector<char> text = read_file(c.log());
         const std::string log(text.begin(), text.end());
         if (heap_peak) a.heap_peaks[mode] = *heap_peak;
@@ -517,13 +541,11 @@ TEST(patch_heap_stays_flat_as_geo_entry_deltas_grow) {
         put_geo(old_d, rows);
         put_geo(new_d, changed);
         if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
-        if (!run({"zstd", "-d", "-q", "-f", c.patch(), "-o", c.dir("raw")}, c.log())) return std::string("patch not decompressed");
         std::vector<char> corrections;
         append(corrections, GEO_ENTRY_DELTA_MARKER);
         append(corrections, static_cast<uint32_t>(PatchFileId::STREET_ENTRIES));
         append(corrections, n);
-        return find_once(read_file(c.dir("raw")), corrections) == std::string::npos ? "no " + std::to_string(n) + " street entry corrections"
-                                                                                    : std::string();
+        return patch_holds(c, corrections, std::to_string(n) + " street entry corrections");
     }, 20000).empty());
 }
 
@@ -588,11 +610,8 @@ TEST(patch_lowmem_refuses_a_new_set_with_part_of_a_family) {
         new_d.erase(gone);
         const LowMemCase c{dir.path(), "without-" + gone};
         REQUIRE(prepare(c, old_d, new_d).empty());
-        for (const bool threads : {false, true}) {
-            std::vector<std::string> words = {GEOCODER_PATCH_BIN, c.dir("old.enc"), c.patch(), "-o", c.dir(threads ? "out.t" : "out")};
-            if (threads) words.push_back("--threads");
-
-            auto r = run_tool(words, c.log());
+        for (const std::string& mode : ENCODED_MODES) {
+            auto r = run_tool(patch_words(c, mode, c.patch(), c.dir("out." + mode)), c.log());
 
             CHECK(!r.ok);
             CHECK(logged(r, "family poi: the patch ships 1 of its 2 files"));
@@ -615,8 +634,8 @@ TEST(patch_lowmem_refuses_a_match_run_past_the_old_file) {
     put_pois(new_d, dropped);
     const LowMemCase c{dir.path(), "match"};
     REQUIRE(prepare(c, old_d, new_d).empty());
-    REQUIRE(run({"zstd", "-d", "-q", "-f", c.patch(), "-o", c.dir("raw")}, c.log()));
-    const std::vector<char> raw = read_file(c.dir("raw"));
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
     struct Edit {
         std::string name;
         uint32_t kept, gone, rest;
@@ -634,13 +653,9 @@ TEST(patch_lowmem_refuses_a_match_run_past_the_old_file) {
         std::vector<char> longer = raw;
         put_at(longer, at + runs.size() - 4, e.rest + 5);
         const std::string patch = c.dir(e.name + ".gcpatch");
-        REQUIRE(write_file(patch + ".raw", longer));
-        REQUIRE(run({"zstd", "-q", "-f", patch + ".raw", "-o", patch}, c.log()));
-        for (const bool threads : {false, true}) {
-            std::vector<std::string> words = {GEOCODER_PATCH_BIN, c.dir("old.enc"), patch, "-o", c.dir(e.name + ".out" + (threads ? ".t" : ""))};
-            if (threads) words.push_back("--threads");
-
-            auto r = run_tool(words, c.log());
+        REQUIRE(write_patch(c, patch, longer));
+        for (const std::string& mode : ENCODED_MODES) {
+            auto r = run_tool(patch_words(c, mode, patch, c.dir(e.name + ".out." + mode)), c.log());
 
             CHECK(!r.ok);
             CHECK(logged(r, e.refusal));
@@ -677,8 +692,8 @@ TEST(patch_lowmem_refuses_a_parent_stride_other_than_its_records) {
     put_pois(new_d, fewer_pois);
     const LowMemCase c{dir.path(), "stride"};
     REQUIRE(prepare(c, old_d, new_d).empty());
-    REQUIRE(run({"zstd", "-d", "-q", "-f", c.patch(), "-o", c.dir("raw")}, c.log()));
-    const std::vector<char> raw = read_file(c.dir("raw"));
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
     struct Edit {
         PatchFileId fid;
         uint32_t stride, records, wrong;
@@ -695,13 +710,9 @@ TEST(patch_lowmem_refuses_a_parent_stride_other_than_its_records) {
         std::vector<char> edited = raw;
         put_at(edited, at + 4, e.wrong);
         const std::string patch = c.dir(name + ".gcpatch");
-        REQUIRE(write_file(patch + ".raw", edited));
-        REQUIRE(run({"zstd", "-q", "-f", patch + ".raw", "-o", patch}, c.log()));
-        for (const bool threads : {false, true}) {
-            std::vector<std::string> words = {GEOCODER_PATCH_BIN, c.dir("old.enc"), patch, "-o", c.dir(name + ".out" + (threads ? ".t" : ""))};
-            if (threads) words.push_back("--threads");
-
-            auto r = run_tool(words, c.log());
+        REQUIRE(write_patch(c, patch, edited));
+        for (const std::string& mode : ENCODED_MODES) {
+            auto r = run_tool(patch_words(c, mode, patch, c.dir(name + ".out." + mode)), c.log());
 
             CHECK(!r.ok);
             CHECK(logged(r, "Malformed record stride: " + name));
@@ -728,8 +739,8 @@ TEST(patch_lowmem_refuses_counts_and_lengths_that_wrap_32_bits) {
     put_named_ways(new_d, new_meta, renamed);
     const LowMemCase c{dir.path(), "wrap"};
     REQUIRE(prepare(c, old_d, new_d, old_meta, new_meta).empty());
-    REQUIRE(run({"zstd", "-d", "-q", "-f", c.patch(), "-o", c.dir("raw")}, c.log()));
-    const std::vector<char> raw = read_file(c.dir("raw"));
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
     std::vector<char> header;
     append(header, static_cast<uint32_t>(PatchFileId::STREET_WAYS));
     append(header, static_cast<uint32_t>(WAY_HEADER_STRIDE));
@@ -775,15 +786,11 @@ TEST(patch_lowmem_refuses_counts_and_lengths_that_wrap_32_bits) {
         if (e.wide) put_at(edited, e.at, u64_at(e.at) + e.add);
         else put_at(edited, e.at, static_cast<uint32_t>(u32_at(e.at) + e.add));
         const std::string patch = c.dir(e.name + ".gcpatch");
-        REQUIRE(write_file(patch + ".raw", edited));
-        REQUIRE(run({"zstd", "-q", "-f", patch + ".raw", "-o", patch}, c.log()));
-        for (const bool threads : {false, true}) {
-            std::vector<std::string> words = {GEOCODER_PATCH_BIN, c.dir("old.enc"), patch, "-o", c.dir(e.name + ".out" + (threads ? ".t" : ""))};
-            if (threads) words.push_back("--threads");
+        REQUIRE(write_patch(c, patch, edited));
+        for (const std::string& mode : ENCODED_MODES) {
+            auto r = run_tool(patch_words(c, mode, patch, c.dir(e.name + ".out." + mode)), c.log());
 
-            auto r = run_tool(words, c.log());
-
-            if (r.ok || !logged(r, e.refusal)) std::printf("    %s%s: %s\n", e.name.c_str(), threads ? " (threads)" : "", r.log.c_str());
+            if (r.ok || !logged(r, e.refusal)) std::printf("    %s (%s): %s\n", e.name.c_str(), mode.c_str(), r.log.c_str());
             CHECK(!r.ok);
             CHECK(logged(r, e.refusal));
         }
