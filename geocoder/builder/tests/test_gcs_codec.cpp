@@ -448,7 +448,8 @@ TEST(gcs_poi_decoder_rejects_blocks_the_encoder_never_writes) {
     // header without a stored vertex, with the closing flag (whose closing
     // vertex would be copied from a vertex never decoded) or without it, and
     // 2^32 stored vertices (a sparse file), more than the record's u32
-    // vertex_count holds. Rejected before the record is emitted; a block of
+    // vertex_count holds (and, on a 32-bit build, its size_t). Rejected by
+    // the header before the block is sized or the record emitted; a block of
     // one vertex decodes.
     struct Case {
         uint8_t flag;

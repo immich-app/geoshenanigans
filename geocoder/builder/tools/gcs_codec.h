@@ -1448,7 +1448,6 @@ struct PoiDec : Decoder {
                                                        (unsigned long long)mono);
         const uint64_t bsize = mono_next - mono;
         if (bsize < 10) die("poi %llu: bad block size", (unsigned long long)i);
-        const size_t block = V->unit_size(bsize);
         const uint8_t* h = V->need(10);
         const uint8_t e = h[0], flag = h[1];
         if (e > 3 || flag > 1) die("poi %llu: bad block header", (unsigned long long)i);
@@ -1459,6 +1458,9 @@ struct PoiDec : Decoder {
         // more), so a block stores at least one, and vertex_count is a u32.
         if (c2 == 0) die("poi %llu: block with no stored vertex", (unsigned long long)i);
         if (vc > 0xFFFFFFFFull) die("poi %llu: block of more vertices than a record holds", (unsigned long long)i);
+        // Sized once its header passes, as gc's decoder does: a block the record can't hold is refused
+        // as such, also where a 32-bit size_t can't hold it either.
+        const size_t block = V->unit_size(bsize);
         if (vt >= 0xFFFFFFFFull) die("poi_vertices offset overflow");
         wr32(rec + 8, uint32_t(vt));
         wr32(rec + 12, uint32_t(vc));
