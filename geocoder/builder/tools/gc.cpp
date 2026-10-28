@@ -4,6 +4,7 @@
 //
 //   geocoder-gc encode SRC_DIR OUT_DIR [--addr col|pax170] [--only fam,fam...]
 //   geocoder-gc decode SRC_DIR OUT_DIR [--only fam,fam...]
+// (geocoder-patch updates sets in the col address layout, the default, only.)
 // Streamed passes: --files f,f... (the today's files to read (encode) or write (decode); a family
 // with two files then runs one pass of a two-pass stream), --size NAME=BYTES (a FIFO input's
 // length), --no-link (don't hardlink the other files), --manifest-out FILE (write the manifest

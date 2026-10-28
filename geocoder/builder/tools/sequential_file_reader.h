@@ -7,8 +7,10 @@
 #include <cstring>
 #include <fcntl.h>
 #include <iterator>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -16,9 +18,9 @@
 
 static_assert(sizeof(off_t) >= 8, "pread offsets must reach past 4 GiB");
 
-// Window of a forward stream. Holds the largest cell list (2 + 65535 * 4 =
-// 262,142 bytes) in one view.
-static constexpr size_t SEQUENTIAL_READ_BUFFER_BYTES = 256 << 10;
+// Window of a forward stream. A larger view (a cell list holds up to
+// 2 + 65535 * 4 = 262,142 bytes) grows it.
+static constexpr size_t SEQUENTIAL_READ_BUFFER_BYTES = 64 << 10;
 // Runs shorter than a window go through it: a copy_file_range would cost a
 // flush of the output's buffer and a syscall for less than one pread.
 static constexpr uint64_t COPY_RANGE_MIN_BYTES = SEQUENTIAL_READ_BUFFER_BYTES;
@@ -83,6 +85,35 @@ KernelCopy copy_in_kernel(uint64_t off, uint64_t n, CopyAt copy_at, const std::s
     return c;
 }
 
+// Low-memory mode (an encoded installed set): an old file may be produced in
+// process by its family's decoder. A StreamSource reads front to back;
+// read() returns at least one byte unless the stream is done.
+// stream_source_factory(), when set, hands one back for a virtual path
+// (nullptr for a real file).
+struct StreamSource {
+    virtual ~StreamSource() = default;
+    virtual size_t read(char* dst, size_t max) = 0;
+    // Drops the next n bytes unread (a coupled decoder then doesn't queue them for this reader while
+    // another one drives it); false when the source can't, and the reader reads past them later.
+    virtual bool skip(uint64_t) { return false; }
+};
+inline std::unique_ptr<StreamSource> (*&stream_source_factory())(const std::string&) {
+    static std::unique_ptr<StreamSource> (*f)(const std::string&) = nullptr;
+    return f;
+}
+// Set with the factory: true when dir/name is a virtual old file (after
+// checking its decoded size against `expected`, when the decoder knows it).
+inline bool (*&virtual_size_hook())(const std::string& dir, const std::string& name, uint64_t expected) {
+    static bool (*f)(const std::string&, const std::string&, uint64_t) = nullptr;
+    return f;
+}
+// A virtual old file has no size to stat: require_old_file_size registers
+// the one the patch expects under its path, and the reader takes it.
+inline std::unordered_map<std::string, uint64_t>& virtual_file_sizes() {
+    static std::unordered_map<std::string, uint64_t> m;
+    return m;
+}
+
 // Reads one file front to back through pread into a bounded window, with
 // sequential readahead advice. With mmap the old-file reads happened inside
 // page faults, whose size depended on how the faults arrived (it swung with
@@ -92,6 +123,14 @@ class SequentialFileReader {
 public:
     explicit SequentialFileReader(const std::string& path, size_t capacity = SEQUENTIAL_READ_BUFFER_BYTES)
         : path_(path), capacity_(std::max<size_t>(capacity, 1)) {
+        if (stream_source_factory()) src_ = stream_source_factory()(path);
+        if (src_) {
+            auto it = virtual_file_sizes().find(path);
+            if (it == virtual_file_sizes().end()) throw std::runtime_error("No size registered for stream " + path);
+            size_ = it->second;
+            copy_unsupported_ = true;
+            return;
+        }
         fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (fd_ < 0) return;
         struct stat st;
@@ -110,6 +149,7 @@ public:
         // The window is an anonymous mapping, not the heap: glibc moves its
         // mmap and trim thresholds after large frees, which changes how the
         // rest of the patcher's memory is laid out.
+        src_.reset();  // a virtual file needs no drain: its decoder drops what nobody reads
         if (buf_) munmap(buf_, capacity_);
         if (fd_ >= 0) ::close(fd_);
     }
@@ -117,7 +157,7 @@ public:
     SequentialFileReader& operator=(const SequentialFileReader&) = delete;
 
     // open() succeeded; an empty file is open with size 0.
-    bool is_open() const { return fd_ >= 0; }
+    bool is_open() const { return fd_ >= 0 || src_ != nullptr; }
     uint64_t size() const { return size_; }
     const std::string& path() const { return path_; }
     // Views that started before the window: still correct, but each one
@@ -138,6 +178,14 @@ public:
     void read(uint64_t off, char* dst, size_t n) {
         if (n == 0) return;
         require_in_file(off, n);
+        if (src_) {
+            while (n > 0) {
+                size_t k = std::min(n, capacity_);
+                memcpy(dst, at(off, k), k);
+                dst += k; off += k; n -= k;
+            }
+            return;
+        }
         read_fully(dst, n, off, pread_fn(), path_);
     }
 
@@ -172,6 +220,16 @@ public:
     uint64_t buffered_from(uint64_t off) const {
         const uint64_t win_end = win_off_ + win_len_;
         return off >= win_off_ && off < win_end ? win_end - off : 0;
+    }
+
+    // Nothing before `off` is read again. A virtual stream drops those bytes in its decoder now,
+    // instead of queueing them until the next view reads past them; other files: nothing to do.
+    void skip_to(uint64_t off) {
+        if (!src_ || off <= sp_) return;
+        require_in_file(off, 0);
+        if (!src_->skip(off - sp_)) return;
+        sp_ = off;
+        win_len_ = 0;  // the window ended at the old stream position, before off
     }
 
     // Hands [off, off + n) to sink(bytes, len) in pieces of at most one window.
@@ -219,13 +277,41 @@ private:
         } else if (keep) {
             memmove(buf_, buf_ + (off - win_off_), keep);
         }
+        if (src_) return refill_stream(off, n, keep);
         const size_t len = static_cast<size_t>(std::min<uint64_t>(capacity_, size_ - off));
         read_fully(buf_ + keep, len - keep, off + keep, pread_fn(), path_);
         win_off_ = off;
         win_len_ = len;
         return buf_;
     }
+    // A stream is at sp_ (bytes consumed so far). Skips forward to off by
+    // reading and discarding, then reads until n bytes from off are in the
+    // window, taking whatever more is already available (never waiting for it).
+    const char* refill_stream(uint64_t off, size_t n, size_t keep) {
+        if (keep == 0) {
+            if (off < sp_) throw std::runtime_error("Backward read of stream " + path_);
+            uint64_t skip = off - sp_;
+            while (skip > 0) {
+                size_t r = src_->read(buf_, static_cast<size_t>(std::min<uint64_t>(skip, capacity_)));
+                if (r == 0) throw std::runtime_error("Unexpected end of " + path_);
+                skip -= r;
+                sp_ += r;
+            }
+        }
+        size_t have = keep;
+        const size_t want_max = static_cast<size_t>(std::min<uint64_t>(capacity_, size_ - off));
+        while (have < n) {
+            size_t r = src_->read(buf_ + have, want_max - have);
+            if (r == 0) throw std::runtime_error("Unexpected end of " + path_);
+            have += r;
+            sp_ += r;
+        }
+        win_off_ = off;
+        win_len_ = have;
+        return buf_;
+    }
 
+    std::unique_ptr<StreamSource> src_;
     std::string path_;
     int fd_ = -1;
     uint64_t size_ = 0, win_off_ = 0, rewinds_ = 0;
@@ -233,6 +319,7 @@ private:
     char* buf_ = nullptr;  // mapped on the first view
     char empty_ = 0;
     bool copy_unsupported_ = false;
+    uint64_t sp_ = 0;  // a stream: bytes read from it so far
 };
 
 // Appends [off, off + n) of an old file to `out`. Bytes already in the

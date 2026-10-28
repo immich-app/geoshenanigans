@@ -97,6 +97,23 @@ target_link_libraries(geocoder-patch PRIVATE Threads::Threads)
 target_include_directories(geocoder-patch PRIVATE tools src)
 # pread offsets past 4 GiB on 32-bit glibc too (sequential_file_reader.h).
 target_compile_definitions(geocoder-patch PRIVATE _FILE_OFFSET_BITS=64)
+# The encoded-set codecs (gcs_codec.h) round floats and must give geocoder-gc's
+# bytes on every architecture: no fused multiply-adds.
+target_compile_options(geocoder-patch PRIVATE -ffp-contract=off)
+# GEOCODER_PATCH_LIBZSTD=ON decompresses the patch with libzstd in process
+# (no zstd CLI process and its window buffer: the low-memory mode's figures);
+# off, the patcher runs the zstd on PATH.
+option(GEOCODER_PATCH_LIBZSTD "Link libzstd into geocoder-patch" OFF)
+if(GEOCODER_PATCH_LIBZSTD)
+    find_path(GEOCODER_ZSTD_INCLUDE_DIR zstd.h)
+    find_library(GEOCODER_ZSTD_LIBRARY NAMES libzstd.a zstd)
+    if(NOT GEOCODER_ZSTD_INCLUDE_DIR OR NOT GEOCODER_ZSTD_LIBRARY)
+        message(FATAL_ERROR "GEOCODER_PATCH_LIBZSTD: libzstd not found (Debian/Ubuntu: libzstd-dev)")
+    endif()
+    target_include_directories(geocoder-patch PRIVATE "${GEOCODER_ZSTD_INCLUDE_DIR}")
+    target_link_libraries(geocoder-patch PRIVATE "${GEOCODER_ZSTD_LIBRARY}")
+    target_compile_definitions(geocoder-patch PRIVATE GEOCODER_PATCH_LIBZSTD)
+endif()
 
 # Encodes a published variant dir into the compact installed set that
 # geocoder-patch's low-memory mode updates, and decodes one back to today's
@@ -178,11 +195,12 @@ target_compile_definitions(geocoder-tests PRIVATE
     GEOCODER_PATCH_BIN="$<TARGET_FILE:geocoder-patch>"
     GEOCODER_GC_BIN="$<TARGET_FILE:geocoder-gc>"
     _FILE_OFFSET_BITS=64)
-# tests/test_patch_roundtrip.cpp and tests/test_gc.cpp run the tools.
+# tests/test_patch_roundtrip.cpp, test_gc.cpp and test_patch_lowmem.cpp run the tools.
 add_dependencies(geocoder-tests geocoder-diff geocoder-patch geocoder-gc)
 target_link_libraries(geocoder-tests PRIVATE ZLIB::ZLIB libdeflate::libdeflate EXPAT::EXPAT Threads::Threads)
-# As geocoder-gc compiles the codecs.
-set_source_files_properties(tests/test_gc.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
+# As geocoder-gc and geocoder-patch compile the codecs.
+set_source_files_properties(tests/test_gc.cpp tests/test_gcs_codec.cpp tests/test_gcs_patch.cpp tests/test_gcs_poi_io.cpp
+    PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
 add_test(NAME geocoder-tests COMMAND geocoder-tests)
 
 # Unit tests of the builder code that runs on S2 (tests/s2/*.cpp), linked
