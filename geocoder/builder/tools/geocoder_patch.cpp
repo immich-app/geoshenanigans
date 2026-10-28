@@ -47,6 +47,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include "checked_size.h"
 #include "merge_sequence.h"
 #include "patch_format.h"
 #include "scratch_dir.h"
@@ -125,12 +126,13 @@ static constexpr size_t PATCH_RESERVE_STEP = 1 << 20;
 // Each block's dst capacity ends where posix_fallocate has reserved storage, so a full TMPDIR is
 // an error here, never a SIGBUS from a mapped page with nothing behind it. Only the mapping spans
 // the bound: a frame without a content size bounds every block at 128 KiB, which puts the
-// 2026-10-13 patches' bounds at 4.9x to 19x their size.
+// 2026-10-13 patches' bounds at 4.9x to 19x their size. A bound past size_t (a 32-bit build's) is
+// refused: narrowed, the mapping would end before the capacities handed to the decoder.
 static bool decompress_to_file(const std::string& src, const std::string& dst) {
     MappedFile in = mmap_file(src);
     if (!in.data) return false;
     const unsigned long long bound = ZSTD_decompressBound(in.data, in.size);
-    if (bound == ZSTD_CONTENTSIZE_ERROR || bound == 0) { unmap_file(in); return false; }
+    if (bound == ZSTD_CONTENTSIZE_ERROR || bound == 0 || uint64_t(bound) > uint64_t(SIZE_MAX)) { unmap_file(in); return false; }
     int fd = open(dst.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0) { unmap_file(in); return false; }
     char* out = static_cast<char*>(mmap(nullptr, (size_t)bound, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
@@ -217,7 +219,8 @@ struct JointChild {
 
     void parse(const char* p, size_t size, size_t at, uint32_t want_fid) {
         P = p;
-        auto need = [&](size_t n) { if (n > size - at) throw std::runtime_error("Truncated patch: child section"); };
+        // Lengths in 64 bits: narrowed to a 32-bit size_t first, one past the patch would pass.
+        auto need = [&](uint64_t n) { if (n > size - at) throw std::runtime_error("Truncated patch: child section"); };
         auto u32 = [&]() { need(4); uint32_t v; memcpy(&v, P + at, 4); at += 4; return v; };
         auto u64 = [&]() { need(8); uint64_t v; memcpy(&v, P + at, 8); at += 8; return v; };
         fid = u32();
@@ -232,7 +235,7 @@ struct JointChild {
             need(ds);
             kind = stride == 0 ? FULL : COPY_OLD;
             data = at;
-            at += ds;
+            at += size_t(ds);
             if (kind == FULL && ds != new_size) throw std::runtime_error("Malformed child full replacement");
             stride = 1;
         } else if (stride == SPARSE_DELTA_STRIDE || stride == CELL_LIST_DELTA_STRIDE || stride == PARALLEL_DELTA_STRIDE) {
@@ -240,13 +243,13 @@ struct JointChild {
         } else {
             const uint32_t n_runs = u32(), n_values = u32(), runs_size = u32(), values_size = u32();
             if (n_runs || n_values) throw std::runtime_error("Encoded set: a child stream with offset fixups");
-            need((size_t)runs_size + values_size);
-            at += (size_t)runs_size + values_size;
+            need(uint64_t(runs_size) + values_size);
+            at += size_t(uint64_t(runs_size) + values_size);
             const uint64_t ss = u64();
             need(ss);
             seq = q = at;
-            seq_end = at + ss;
-            at += ss;
+            seq_end = at + size_t(ss);
+            at = seq_end;
         }
         section_end = at;
     }
@@ -452,7 +455,7 @@ static int run(int argc, char* argv[]) {
     // (rather than reading past the mmap) if a malformed/truncated patch would
     // run the cursor off the end. On the success path pos+n <= patch_size
     // always holds, so this never fires and the read bytes are unchanged.
-    auto require_bytes = [&](size_t n, const char* what) {
+    auto require_bytes = [&](uint64_t n, const char* what) {
         if (n > patch_size - pos)
             throw std::runtime_error("Truncated patch: need " + std::to_string(n) + " bytes for " +
                                      what + " at offset " + std::to_string(pos) +
@@ -1021,7 +1024,8 @@ static int run(int argc, char* argv[]) {
         // Per-record buffer for applying remap/fixups inline (avoid copying entire file)
         std::vector<char> rec_buf(actual_stride);
 
-        size_t old_rec = 0, new_rec = 0, old_bytes = 0, written = 0;
+        size_t old_rec = 0, new_rec = 0;
+        uint64_t old_bytes = 0, written = 0;
         while (pos < seq_end) {
             if (pos + 5 > seq_end) throw std::runtime_error(std::string("Malformed merge sequence: ") + fname);
             uint8_t op = P[pos++];
@@ -1033,10 +1037,13 @@ static int run(int argc, char* argv[]) {
                 // below costs one fwrite per record: one per byte of
                 // planet/full's 3.4 GiB addr_vertices, one per node of its
                 // 600M street_nodes.
-                size_t run_bytes = (size_t)count * actual_stride;
-                // Every record of the run is an old one, whole range checked before any is written.
-                if (old_bytes > old.size() || run_bytes > old.size() - old_bytes)
+                // Every record of the run is an old one, whole range checked before any is written
+                // (in 64 bits: a 32-bit size_t wraps count * stride into a run that fits).
+                const auto run = old_bytes <= old.size() ? checked_size<uint64_t>(0, count, actual_stride, old.size() - old_bytes)
+                                                         : std::nullopt;
+                if (!run)
                     throw std::runtime_error(std::string("Malformed merge sequence: ") + fname + " (a MATCH run past the old file)");
+                const uint64_t run_bytes = *run;
                 if (!jc && !needs_remap && !needs_padding && remap_offs.empty() && !has_fixups) {
                     append_old_range(old, outf, old_bytes, run_bytes, fname);
                     written += run_bytes;
@@ -1044,7 +1051,7 @@ static int run(int argc, char* argv[]) {
                     continue;
                 }
                 for (uint32_t k = 0; k < count; k++) {
-                    size_t rec_off = old_bytes + k * actual_stride;
+                    const uint64_t rec_off = old_bytes + uint64_t(k) * actual_stride;
                     if (jc) jc->hint();
                     const char* rec = old.at(rec_off, actual_stride);
 
@@ -1138,11 +1145,12 @@ static int run(int argc, char* argv[]) {
                     }
                 }
                 if (track) remap.add_match(static_cast<uint32_t>(old_rec), static_cast<uint32_t>(new_rec), count);
-                written += count * actual_stride;
-                old_rec += count; new_rec += count; old_bytes += count * actual_stride;
+                written += run_bytes;
+                old_rec += count; new_rec += count; old_bytes += run_bytes;
             } else if (op == OP_INSERT_RUN) {
-                size_t bytes = count * actual_stride;
-                if (pos + bytes > seq_end) throw std::runtime_error(std::string("Malformed merge sequence: ") + fname);
+                const auto run = checked_size(0, count, actual_stride, seq_end - pos);
+                if (!run) throw std::runtime_error(std::string("Malformed merge sequence: ") + fname);
+                const size_t bytes = *run;
                 if (jc) {
                     for (uint32_t k = 0; k < count; k++) {
                         jc->before_parent_write(outf, actual_stride);
@@ -1154,12 +1162,13 @@ static int run(int argc, char* argv[]) {
                 }
                 written += bytes; pos += bytes; new_rec += count;
             } else if (op == OP_DELETE_RUN) {
-                old_rec += count; old_bytes += count * actual_stride;
+                old_rec += count; old_bytes += uint64_t(count) * actual_stride;
                 old.skip_to(old_bytes);  // an encoded family's decoder drops them
             } else if (op == OP_REPLACE_RUN) {
                 // Same entities, new bytes: written like an INSERT, mapped like a MATCH.
-                size_t bytes = count * actual_stride;
-                if (pos + bytes > seq_end) throw std::runtime_error(std::string("Malformed merge sequence: ") + fname);
+                const auto run = checked_size(0, count, actual_stride, seq_end - pos);
+                if (!run) throw std::runtime_error(std::string("Malformed merge sequence: ") + fname);
+                const size_t bytes = *run;
                 // The old records are never read: an encoded family's decoder drops them as the
                 // children's MATCH reads below make it produce them.
                 old.skip_to(old_bytes + bytes);

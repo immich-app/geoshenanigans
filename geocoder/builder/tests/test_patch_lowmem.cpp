@@ -9,6 +9,7 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <random>
 #include <regex>
 #include <string>
@@ -568,6 +569,106 @@ TEST(patch_lowmem_refuses_a_parent_stride_other_than_its_records) {
         }
     }
     CHECK(apply_both_modes(c).empty());
+}
+
+// The street ways' merge (MATCH, REPLACE and INSERT runs, replayed with their
+// nodes) with a run's count 2^30 past the patch's, or the merge sequence's or
+// the nodes section's length 2^32 past it, is refused, in sync and --threads.
+// A 32-bit size_t wraps 12 x 2^30 and 2^32 to nothing: the lengths read as the
+// patch's, and a run sized as the patch's replayed its records one by one past
+// it.
+TEST(patch_lowmem_refuses_counts_and_lengths_that_wrap_32_bits) {
+    ScratchDir dir("lowmem-wrap");
+    std::vector<uint32_t> names(30), renamed(31);
+    for (uint32_t i = 0; i < 31; i++) {
+        if (i < 30) names[i] = i;
+        renamed[i] = i == 10 ? 1000 : i;
+    }
+    BuildDir old_d, new_d, old_meta, new_meta;
+    put_named_ways(old_d, old_meta, names);
+    put_named_ways(new_d, new_meta, renamed);
+    const LowMemCase c{dir.path(), "wrap"};
+    REQUIRE(prepare(c, old_d, new_d, old_meta, new_meta).empty());
+    REQUIRE(run({"zstd", "-d", "-q", "-f", c.patch(), "-o", c.dir("raw")}, c.log()));
+    const std::vector<char> raw = read_file(c.dir("raw"));
+    std::vector<char> header;
+    append(header, static_cast<uint32_t>(PatchFileId::STREET_WAYS));
+    append(header, static_cast<uint32_t>(WAY_HEADER_STRIDE));
+    append(header, uint64_t{30 * WAY_HEADER_STRIDE});
+    append(header, uint64_t{31 * WAY_HEADER_STRIDE});
+    const size_t at = find_once(raw, header);
+    REQUIRE(at != std::string::npos);
+    auto u32_at = [&](size_t p) { uint32_t v; memcpy(&v, raw.data() + p, 4); return v; };
+    auto u64_at = [&](size_t p) { uint64_t v; memcpy(&v, raw.data() + p, 8); return v; };
+    // The merge: fixup counts and sizes, fixups, the sequence's length, its ops.
+    const size_t seq_len_at = at + 40 + u32_at(at + 32) + u32_at(at + 36), seq = seq_len_at + 8;
+    const size_t seq_end = seq + u64_at(seq_len_at);
+    std::map<uint8_t, size_t> count_at;  // each kind's first run: where its count is
+    for (size_t p = seq; p < seq_end;) {
+        const uint8_t op = static_cast<uint8_t>(raw[p]);
+        count_at.emplace(op, p + 1);
+        p += 5 + (op == OP_INSERT_RUN || op == OP_REPLACE_RUN ? u32_at(p + 1) * WAY_HEADER_STRIDE : 0);
+    }
+    REQUIRE(count_at.count(OP_MATCH_RUN) && count_at.count(OP_REPLACE_RUN) && count_at.count(OP_INSERT_RUN));
+    // The nodes section right after: a merge's sequence length, or a full
+    // replacement's (or a copy's) data length.
+    REQUIRE(u32_at(seq_end) == static_cast<uint32_t>(PatchFileId::STREET_NODES));
+    const uint32_t child_stride = u32_at(seq_end + 4);
+    const size_t child_len_at = child_stride == 0 || child_stride == COPY_OLD_STRIDE
+                                    ? seq_end + 28
+                                    : seq_end + 40 + u32_at(seq_end + 32) + u32_at(seq_end + 36);
+    struct Edit {
+        std::string name;
+        size_t at;
+        uint64_t add;
+        bool wide;
+        std::string refusal;
+    };
+    const Edit edits[] = {
+        {"match", count_at[OP_MATCH_RUN], uint64_t(1) << 30, false, "Malformed merge sequence: street_ways.bin (a MATCH run past the old file)"},
+        {"replace", count_at[OP_REPLACE_RUN], uint64_t(1) << 30, false, "Malformed merge sequence: street_ways.bin"},
+        {"insert", count_at[OP_INSERT_RUN], uint64_t(1) << 30, false, "Malformed merge sequence: street_ways.bin"},
+        {"sequence", seq_len_at, uint64_t(1) << 32, true, "bytes for merge sequence"},
+        {"nodes", child_len_at, uint64_t(1) << 32, true, "Truncated patch: child section"},
+    };
+    for (const Edit& e : edits) {
+        std::vector<char> edited = raw;
+        if (e.wide) put_at(edited, e.at, u64_at(e.at) + e.add);
+        else put_at(edited, e.at, static_cast<uint32_t>(u32_at(e.at) + e.add));
+        const std::string patch = c.dir(e.name + ".gcpatch");
+        REQUIRE(write_file(patch + ".raw", edited));
+        REQUIRE(run({"zstd", "-q", "-f", patch + ".raw", "-o", patch}, c.log()));
+        for (const bool threads : {false, true}) {
+            std::vector<std::string> words = {GEOCODER_PATCH_BIN, c.dir("old.enc"), patch, "-o", c.dir(e.name + ".out" + (threads ? ".t" : ""))};
+            if (threads) words.push_back("--threads");
+
+            auto r = run_tool(words, c.log());
+
+            if (r.ok || !logged(r, e.refusal)) std::printf("    %s%s: %s\n", e.name.c_str(), threads ? " (threads)" : "", r.log.c_str());
+            CHECK(!r.ok);
+            CHECK(logged(r, e.refusal));
+        }
+    }
+    CHECK(apply_both_modes(c).empty());
+}
+
+// A frame declaring 2^32 + 1 bytes of content (then 8 KiB of them, an RLE
+// block, and the end) fails the run with an error. A 64-bit build maps that
+// decompression bound and finds the 8 KiB are no patch; a 32-bit size_t can't
+// hold it, so it is refused (narrowed, it was a one-byte mapping the block was
+// written past).
+TEST(patch_refuses_a_frame_declaring_content_past_32_bits) {
+    ScratchDir dir("patch-bound");
+    const std::string& root = dir.path();
+    REQUIRE(write_dir(root + "/plain", {}));
+    const unsigned char frame[] = {0x28, 0xb5, 0x2f, 0xfd, 0xc0, 0x38, 0x01, 0x00, 0x00, 0x00, 0x01,
+                                   0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x41, 0x01, 0x00, 0x00};
+    REQUIRE(write_file(root + "/p.gcpatch", std::vector<char>(frame, frame + sizeof frame)));
+
+    auto r = run_tool({GEOCODER_PATCH_BIN, root + "/plain", root + "/p.gcpatch", "-o", root + "/out"}, root + "/log");
+
+    CHECK(!r.ok);
+    CHECK(logged(r, sizeof(size_t) > 4 ? "Bad magic" : "Failed to decompress"));
 }
 
 // An option other than --threads (a staged apply's --only, on an encoded
