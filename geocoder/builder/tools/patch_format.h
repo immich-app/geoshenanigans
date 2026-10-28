@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <iostream>
 #include <iterator>
 #include <map>
@@ -20,6 +21,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#include "sequential_file_reader.h"
 
 // --- Memory-mapped file helpers ---
 
@@ -140,6 +143,11 @@ inline bool write_file(const std::string& path, const std::vector<char>& data) {
 // that refuses a dir from another day for variants that ship no string tier
 // (quality dirs): every other read clamps to what is there.
 inline void require_old_file_size(const std::string& dir, const std::string& name, uint64_t expected) {
+    // Low-memory mode: an encoded family's old file is decoded in process.
+    if (virtual_size_hook() && virtual_size_hook()(dir, name, expected)) {
+        virtual_file_sizes()[dir + "/" + name] = expected;
+        return;
+    }
     struct stat st;
     uint64_t actual = stat((dir + "/" + name).c_str(), &st) == 0 ? static_cast<uint64_t>(st.st_size) : 0;
     if (actual != expected)
@@ -465,10 +473,17 @@ inline void check_parallel_delta_header(uint32_t fid, uint32_t parent_fid,
         throw std::runtime_error("Malformed parallel delta");
 }
 
-// A buffered write can succeed even when the final flush fails.
-inline void close_patch_output(FILE* out, const std::string& name) {
-    bool ok = !ferror(out);
-    if (fclose(out) != 0 || !ok) throw std::runtime_error("Cannot write " + name);
+// Closes outputs, every one even when another fails, then throws naming those
+// whose writes or close failed: a buffered write can succeed even when the
+// final flush fails, and an encoded output's encoder takes its last bytes in
+// the close.
+inline void close_patch_outputs(std::initializer_list<std::pair<FILE*, std::string>> outs) {
+    std::string bad;
+    for (const auto& [f, name] : outs) {
+        const bool ok = !ferror(f);
+        if (fclose(f) != 0 || !ok) bad += (bad.empty() ? "" : ", ") + name;
+    }
+    if (!bad.empty()) throw std::runtime_error("Cannot write " + bad);
 }
 
 // POI parent-id remap marker: 0xFFFFFFF3
@@ -947,43 +962,74 @@ inline void append_geo_list_delta(std::vector<char>& out, uint64_t cell_id,
     put(gained.data(), gained.size() * 4);
 }
 
-// One parsed cell correction; apply() turns the derived list into the new one.
-struct GeoListDelta {
-    uint64_t cell_id;
-    bool replace;
-    std::vector<uint32_t> lost, gained;
-    void apply(std::vector<uint32_t>& ids, std::vector<uint32_t>& scratch) const {
-        if (replace) { ids = gained; return; }
-        scratch.clear();
-        std::set_difference(ids.begin(), ids.end(), lost.begin(), lost.end(), std::back_inserter(scratch));
-        ids.clear();
-        std::merge(scratch.begin(), scratch.end(), gained.begin(), gained.end(), std::back_inserter(ids));
-    }
-};
-
-// Parses `count` cell corrections from data[pos, size); throws when short.
-inline std::vector<GeoListDelta> parse_geo_list_deltas(const char* data, size_t size, size_t& pos, uint32_t count) {
-    auto take = [&](void* dst, size_t n) {
-        if (size - pos < n) throw std::runtime_error("Malformed geo entry delta");
-        if (n) memcpy(dst, data + pos, n);  // an empty list's data() may be null
-        pos += n;
-    };
-    std::vector<GeoListDelta> out;
-    out.reserve(count);
+// Checks `count` cell corrections in data[pos, size) and moves pos past
+// them; throws when they are short or out of cell order. They stay where they
+// are: a GeoListDeltaCursor reads each one as the entry walk reaches its cell
+// (held as vectors they cost the patcher ~7 MiB of heap on planet).
+inline void scan_geo_list_deltas(const char* data, size_t size, size_t& pos, uint32_t count) {
+    uint64_t prev = 0;
     for (uint32_t i = 0; i < count; i++) {
-        GeoListDelta d;
+        if (size - pos < 12) throw std::runtime_error("Malformed geo entry delta");
+        uint64_t cid;
         uint16_t nl, ng;
-        take(&d.cell_id, 8); take(&nl, 2); take(&ng, 2);
-        d.replace = nl == GEO_LIST_REPLACE;
-        if (d.replace) nl = 0;
-        if (!out.empty() && d.cell_id <= out.back().cell_id) throw std::runtime_error("Malformed geo entry delta");
-        d.lost.resize(nl); d.gained.resize(ng);
-        take(d.lost.data(), (size_t)nl * 4);
-        take(d.gained.data(), (size_t)ng * 4);
-        out.push_back(std::move(d));
+        memcpy(&cid, data + pos, 8); memcpy(&nl, data + pos + 8, 2); memcpy(&ng, data + pos + 10, 2);
+        if (nl == GEO_LIST_REPLACE) nl = 0;
+        if (i > 0 && cid <= prev) throw std::runtime_error("Malformed geo entry delta");
+        prev = cid;
+        pos += 12;
+        const size_t ids = ((size_t)nl + ng) * 4;
+        if (size - pos < ids) throw std::runtime_error("Malformed geo entry delta");
+        pos += ids;
     }
-    return out;
 }
+
+// Forward cursor over corrections scan_geo_list_deltas checked, asked for in
+// ascending cell order; apply() turns a cell's derived list into its new one.
+class GeoListDeltaCursor {
+public:
+    GeoListDeltaCursor() = default;  // no corrections
+    GeoListDeltaCursor(const char* data, size_t pos, uint32_t count) : data_(data), pos_(pos), left_(count) { load(); }
+
+    // The cursor holds cell c's correction.
+    bool at(uint64_t c) {
+        while (have_ && cid_ < c) load();
+        return have_ && cid_ == c;
+    }
+    // The correction replaces the derived list whole (GEO_LIST_REPLACE).
+    bool replaces() const { return replace_; }
+    void apply(std::vector<uint32_t>& ids, std::vector<uint32_t>& scratch) {
+        gained_ids_.resize(ng_);
+        if (ng_) memcpy(gained_ids_.data(), data_ + gained_, (size_t)ng_ * 4);
+        if (replace_) { ids = gained_ids_; return; }
+        lost_ids_.resize(nl_);
+        if (nl_) memcpy(lost_ids_.data(), data_ + lost_, (size_t)nl_ * 4);
+        scratch.clear();
+        std::set_difference(ids.begin(), ids.end(), lost_ids_.begin(), lost_ids_.end(), std::back_inserter(scratch));
+        ids.clear();
+        std::merge(scratch.begin(), scratch.end(), gained_ids_.begin(), gained_ids_.end(), std::back_inserter(ids));
+    }
+
+private:
+    void load() {
+        if (!left_) { have_ = false; return; }
+        left_--;
+        memcpy(&cid_, data_ + pos_, 8); memcpy(&nl_, data_ + pos_ + 8, 2); memcpy(&ng_, data_ + pos_ + 10, 2);
+        replace_ = nl_ == GEO_LIST_REPLACE;
+        if (replace_) nl_ = 0;
+        lost_ = pos_ + 12;
+        gained_ = lost_ + (size_t)nl_ * 4;
+        pos_ = gained_ + (size_t)ng_ * 4;
+        have_ = true;
+    }
+
+    const char* data_ = nullptr;
+    size_t pos_ = 0, lost_ = 0, gained_ = 0;
+    uint32_t left_ = 0;
+    bool have_ = false, replace_ = false;
+    uint64_t cid_ = 0;
+    uint16_t nl_ = 0, ng_ = 0;
+    std::vector<uint32_t> lost_ids_, gained_ids_;  // the current cell's ids, aligned
+};
 
 // --- Record id remap (patcher) ---
 

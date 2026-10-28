@@ -26,7 +26,14 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake zlib1g-dev libprotozero-dev \
             libbz2-dev libdeflate-dev libexpat1-dev zstd
+      # The patcher's too-small-TMPDIR cases mount a tmpfs in a private user
+      # namespace (unshare), which the image's AppArmor policy forbids; here
+      # they must run (GEOCODER_TESTS_NEED_PRIVATE_TMPFS fails them if not).
+      - name: Allow user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Build + run tests
+        env:
+          GEOCODER_TESTS_NEED_PRIVATE_TMPFS: "1"
         run: |
           cd geocoder/builder && mkdir -p build && cd build
           cmake .. -DCMAKE_BUILD_TYPE=Release
@@ -35,8 +42,10 @@ jobs:
       - name: Tool tests
         run: python3 -m unittest discover -s geocoder/builder/tools -v
 
+  # The tests and the tools they run, sanitized, with the patcher's in-process
+  # zstd (the low-memory mode's build); the job above runs the zstd CLI.
   builder-tests-sanitized:
-    name: Builder unit tests (ASan + UBSan)
+    name: Builder unit tests (ASan + UBSan, libzstd)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -47,11 +56,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake zlib1g-dev libprotozero-dev \
-            libbz2-dev libdeflate-dev libexpat1-dev
+            libbz2-dev libdeflate-dev libexpat1-dev libzstd-dev zstd
+      # As in the job above: the private tmpfs cases run, or fail.
+      - name: Allow user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Build + run tests
+        env:
+          GEOCODER_TESTS_NEED_PRIVATE_TMPFS: "1"
         run: |
           cd geocoder/builder && mkdir -p build && cd build
-          cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGEOCODER_SANITIZE=ON
+          cmake .. -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGEOCODER_SANITIZE=ON -DGEOCODER_PATCH_LIBZSTD=ON
           make -j$(nproc) geocoder-tests
           ./geocoder-tests
 

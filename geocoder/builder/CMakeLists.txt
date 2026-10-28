@@ -91,12 +91,41 @@ add_executable(build-index
 add_executable(geocoder-diff tools/geocoder_diff.cpp)
 target_link_libraries(geocoder-diff PRIVATE Threads::Threads)
 target_include_directories(geocoder-diff PRIVATE tools src)
+# patch_format.h includes sequential_file_reader.h, whose pread offsets must
+# pass 4 GiB on 32-bit glibc too.
+target_compile_definitions(geocoder-diff PRIVATE _FILE_OFFSET_BITS=64)
 
 add_executable(geocoder-patch tools/geocoder_patch.cpp)
 target_link_libraries(geocoder-patch PRIVATE Threads::Threads)
 target_include_directories(geocoder-patch PRIVATE tools src)
 # pread offsets past 4 GiB on 32-bit glibc too (sequential_file_reader.h).
 target_compile_definitions(geocoder-patch PRIVATE _FILE_OFFSET_BITS=64)
+# The encoded-set codecs (gcs_codec.h) round floats and must give geocoder-gc's
+# bytes on every architecture: no fused multiply-adds.
+target_compile_options(geocoder-patch PRIVATE -ffp-contract=off)
+# GEOCODER_PATCH_LIBZSTD=ON decompresses the patch with libzstd in process
+# (no zstd CLI process and its window buffer: the low-memory mode's figures);
+# off, the patcher runs the zstd on PATH.
+option(GEOCODER_PATCH_LIBZSTD "Link libzstd into geocoder-patch" OFF)
+if(GEOCODER_PATCH_LIBZSTD)
+    find_path(GEOCODER_ZSTD_INCLUDE_DIR zstd.h)
+    find_library(GEOCODER_ZSTD_LIBRARY NAMES libzstd.a zstd)
+    if(NOT GEOCODER_ZSTD_INCLUDE_DIR OR NOT GEOCODER_ZSTD_LIBRARY)
+        message(FATAL_ERROR "GEOCODER_PATCH_LIBZSTD: libzstd not found (Debian/Ubuntu: libzstd-dev)")
+    endif()
+    target_include_directories(geocoder-patch PRIVATE "${GEOCODER_ZSTD_INCLUDE_DIR}")
+    target_link_libraries(geocoder-patch PRIVATE "${GEOCODER_ZSTD_LIBRARY}")
+    target_compile_definitions(geocoder-patch PRIVATE GEOCODER_PATCH_LIBZSTD)
+endif()
+
+# Encodes a published variant dir into the compact installed set that
+# geocoder-patch's low-memory mode updates, and decodes one back to today's
+# files. The codecs round floats and must give the same bytes on every
+# architecture: no fused multiply-adds.
+add_executable(geocoder-gc tools/gc.cpp)
+target_include_directories(geocoder-gc PRIVATE tools)
+target_compile_definitions(geocoder-gc PRIVATE _FILE_OFFSET_BITS=64)
+target_compile_options(geocoder-gc PRIVATE -ffp-contract=off)
 
 # osmium apply-changes for the nightly planet update, blob by blob.
 add_executable(pbf-apply tools/pbf_apply.cpp src/pbf_reader.cpp)
@@ -167,10 +196,14 @@ target_compile_definitions(geocoder-tests PRIVATE
     GEOCODER_TEMPLATE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/configurations.template.json"
     GEOCODER_DIFF_BIN="$<TARGET_FILE:geocoder-diff>"
     GEOCODER_PATCH_BIN="$<TARGET_FILE:geocoder-patch>"
+    GEOCODER_GC_BIN="$<TARGET_FILE:geocoder-gc>"
     _FILE_OFFSET_BITS=64)
-# tests/test_patch_roundtrip.cpp runs the two tools.
-add_dependencies(geocoder-tests geocoder-diff geocoder-patch)
+# tests/test_patch_roundtrip.cpp, test_gc.cpp and test_patch_lowmem.cpp run the tools.
+add_dependencies(geocoder-tests geocoder-diff geocoder-patch geocoder-gc)
 target_link_libraries(geocoder-tests PRIVATE ZLIB::ZLIB libdeflate::libdeflate EXPAT::EXPAT Threads::Threads)
+# As geocoder-gc and geocoder-patch compile the codecs.
+set_source_files_properties(tests/test_gc.cpp tests/test_gcs_codec.cpp tests/test_gcs_patch.cpp tests/test_gcs_poi_io.cpp
+    PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
 add_test(NAME geocoder-tests COMMAND geocoder-tests)
 
 # Unit tests of the builder code that runs on S2 (tests/s2/*.cpp), linked
@@ -188,12 +221,15 @@ geocoder_link_s2(geocoder-s2-tests)
 target_link_libraries(geocoder-s2-tests PRIVATE Threads::Threads)
 add_test(NAME geocoder-s2-tests COMMAND geocoder-s2-tests)
 
-# GEOCODER_SANITIZE=ON builds the unit tests with ASan + UBSan, undefined
-# behaviour failing the run (CI's sanitizer job). Tests only: build-index
-# links the prebuilt S2, whose absl containers change layout under ASan.
-option(GEOCODER_SANITIZE "Build geocoder-tests with ASan and UBSan" OFF)
+# GEOCODER_SANITIZE=ON builds the unit tests and the tools they run with ASan
+# + UBSan, undefined behaviour failing the run (CI's sanitizer job). Not
+# build-index: it links the prebuilt S2, whose absl containers change layout
+# under ASan.
+option(GEOCODER_SANITIZE "Build geocoder-tests and its tools with ASan and UBSan" OFF)
 if(GEOCODER_SANITIZE)
     set(GEOCODER_SANITIZE_FLAGS -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer)
-    target_compile_options(geocoder-tests PRIVATE ${GEOCODER_SANITIZE_FLAGS})
-    target_link_options(geocoder-tests PRIVATE ${GEOCODER_SANITIZE_FLAGS})
+    foreach(target geocoder-tests geocoder-diff geocoder-patch geocoder-gc)
+        target_compile_options(${target} PRIVATE ${GEOCODER_SANITIZE_FLAGS})
+        target_link_options(${target} PRIVATE ${GEOCODER_SANITIZE_FLAGS})
+    endforeach()
 endif()

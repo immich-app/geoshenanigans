@@ -4,6 +4,13 @@
 
 #include "test_framework.h"
 
+// LeakSanitizer (the sanitizer build): a test's forked child that ends
+// through exit() checks for leaks without the threads the ThreadCache
+// (src/parallel.h) keeps for the process's life, since fork copies only the
+// forking thread; the thread state only their stacks hold then reads as
+// leaked, and the report would end the child with LeakSanitizer's status.
+extern "C" const char* __lsan_default_suppressions() { return "leak:ThreadCache::run\n"; }
+
 int main() {
     int passed = 0;
     auto& reg = gctest::registry();

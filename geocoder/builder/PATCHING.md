@@ -140,6 +140,34 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
 - **geocoder-diff** (`tools/geocoder_diff.cpp`): Compares two builds, produces `.gcpatch`
 - **geocoder-patch** (`tools/geocoder_patch.cpp`): Applies patch, produces new build
 - **patch_format.h** (`tools/patch_format.h`): Shared format definitions + rebuild functions
+- **geocoder-gc** (`tools/gc.cpp`, `tools/gc_*.h`): Encodes a variant dir into the compact installed
+  set (the encoded files and a `gc.manifest`) and decodes one back to today's files, byte for byte,
+  each into a new or empty dir
+- **gcs_\*.h** (`tools/gcs_patch.h`, `gcs_codec.h`, `gcs_io.h`, `gcs_async.h`): geocoder-patch's
+  low-memory mode. When the old dir is an encoded installed set (a `gc.manifest` beside the files,
+  as geocoder-gc writes it), the encoded families' old files are decoded and their new files
+  encoded in process, a family's records and their child stream replay together, and the output
+  is the new encoded set, geocoder-gc's encoding of the new dir; `--threads` gives each codec a
+  thread
+
+### Low-memory mode: memory and speed
+
+The tool's own memory stays at 2–4 MiB anon whatever the limit. Below about 1 GiB (page cache
+included) a planet update gets slower, not bigger: the mapped inputs drop out of the page cache
+and are read again. Planet b → c (2026-10-28), planet/full, one core, cold, no swap, disk at
+100 MB/s:
+
+| Memory limit | Low-memory mode | Read |
+|---|---|---|
+| 1 GiB | 716 s | 13.3 GB |
+| 256 MiB | 1015 s | 17.1 GB |
+| 128 MiB | 1376 s | 21.5 GB |
+| 32 MiB | over 1800 s (about 100 min) | |
+
+At 1 GiB plain mode takes 1825 s for the planet maximum set (full, poi/all, quality/uncapped),
+and low-memory mode 910 s. A patch that moves many POI strings, like the first one after POI
+names went into record order, needs about 33 B per moved string in either mode: about 418 MiB
+for planet/poi/all's 12.8M.
 
 ### How Patching Works
 
