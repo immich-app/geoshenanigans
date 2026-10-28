@@ -98,6 +98,15 @@ target_include_directories(geocoder-patch PRIVATE tools src)
 # pread offsets past 4 GiB on 32-bit glibc too (sequential_file_reader.h).
 target_compile_definitions(geocoder-patch PRIVATE _FILE_OFFSET_BITS=64)
 
+# Encodes a published variant dir into the compact installed set that
+# geocoder-patch's low-memory mode updates, and decodes one back to today's
+# files. The codecs round floats and must give the same bytes on every
+# architecture: no fused multiply-adds.
+add_executable(geocoder-gc tools/gc.cpp)
+target_include_directories(geocoder-gc PRIVATE tools)
+target_compile_definitions(geocoder-gc PRIVATE _FILE_OFFSET_BITS=64)
+target_compile_options(geocoder-gc PRIVATE -ffp-contract=off)
+
 # osmium apply-changes for the nightly planet update, blob by blob.
 add_executable(pbf-apply tools/pbf_apply.cpp src/pbf_reader.cpp)
 target_link_libraries(pbf-apply PRIVATE ZLIB::ZLIB libdeflate::libdeflate EXPAT::EXPAT Threads::Threads)
@@ -167,10 +176,13 @@ target_compile_definitions(geocoder-tests PRIVATE
     GEOCODER_TEMPLATE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/configurations.template.json"
     GEOCODER_DIFF_BIN="$<TARGET_FILE:geocoder-diff>"
     GEOCODER_PATCH_BIN="$<TARGET_FILE:geocoder-patch>"
+    GEOCODER_GC_BIN="$<TARGET_FILE:geocoder-gc>"
     _FILE_OFFSET_BITS=64)
-# tests/test_patch_roundtrip.cpp runs the two tools.
-add_dependencies(geocoder-tests geocoder-diff geocoder-patch)
+# tests/test_patch_roundtrip.cpp and tests/test_gc.cpp run the tools.
+add_dependencies(geocoder-tests geocoder-diff geocoder-patch geocoder-gc)
 target_link_libraries(geocoder-tests PRIVATE ZLIB::ZLIB libdeflate::libdeflate EXPAT::EXPAT Threads::Threads)
+# As geocoder-gc compiles the codecs.
+set_source_files_properties(tests/test_gc.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
 add_test(NAME geocoder-tests COMMAND geocoder-tests)
 
 # Unit tests of the builder code that runs on S2 (tests/s2/*.cpp), linked

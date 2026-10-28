@@ -140,6 +140,9 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
 - **geocoder-diff** (`tools/geocoder_diff.cpp`): Compares two builds, produces `.gcpatch`
 - **geocoder-patch** (`tools/geocoder_patch.cpp`): Applies patch, produces new build
 - **patch_format.h** (`tools/patch_format.h`): Shared format definitions + rebuild functions
+- **geocoder-gc** (`tools/gc.cpp`, `tools/gc_*.h`): Encodes a variant dir into the compact installed
+  set (the encoded files and a `gc.manifest`) and decodes one back to today's files, byte for byte,
+  each into a new or empty dir
 
 ### How Patching Works
 

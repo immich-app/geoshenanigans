@@ -23,6 +23,13 @@ inline bool write_dir(const std::string& path, const BuildDir& files) {
     return true;
 }
 
+// A dir's files by name.
+inline BuildDir read_dir(const std::string& path) {
+    BuildDir files;
+    for (const auto& e : std::filesystem::directory_iterator(path)) files[e.path().filename().string()] = read_file(e.path().string());
+    return files;
+}
+
 // s as one shell word.
 inline std::string quoted(const std::string& s) {
     std::string out = "'";
