@@ -30,9 +30,14 @@ struct CountingEnc : gcs::Encoder {
     void finish(gcs::Manifest&) override {}
 };
 
+// The status a failed run exits with here: main's catch returns 1, but 1 is
+// also how ASan and UBSan end a process after a report, so a use-after-free
+// as exit() destroys the open sink would pass for it.
+constexpr int FAILED_RUN_STATUS = 3;
+
 // A replay error with street_ways.bin open: bytes past the sink's buffer
 // (its encoder, and with threads its worker, started), more still buffered,
-// then exit(1) as main's catch returns 1.
+// then exit(FAILED_RUN_STATUS) as main's catch returns its status.
 [[noreturn]] void fail_with_open_sink(bool threads) {
     gcs::Store& s = gcs::store();
     const size_t F = gcs::families().size();
@@ -53,7 +58,7 @@ struct CountingEnc : gcs::Encoder {
     fwrite(b.data(), 1, b.size(), f);
     fwrite(b.data(), 1, 100, f);
     std::cerr << "replay error with street_ways.bin open" << std::endl;
-    exit(1);
+    exit(FAILED_RUN_STATUS);
 }
 
 }  // namespace
@@ -88,7 +93,7 @@ TEST(gcs_async_encoder_destroyed_with_a_file_open_does_not_wait_for_its_close) {
 TEST(gcs_store_run_failing_with_an_open_sink_exits_with_its_status) {
     for (bool threads : {false, true}) {
         const int status = exit_status_in_child([threads]() -> int { fail_with_open_sink(threads); }, 10);
-        if (status != 1) std::printf("    threads=%d: status %d\n", int(threads), status);
-        CHECK_EQ(status, 1);
+        if (status != FAILED_RUN_STATUS) std::printf("    threads=%d: status %d\n", int(threads), status);
+        CHECK_EQ(status, FAILED_RUN_STATUS);
     }
 }
