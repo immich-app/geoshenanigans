@@ -468,6 +468,76 @@ TEST(gc_gxc_decoder_refuses_ids_past_u32_and_the_id_count) {
     }
 }
 
+// gxc rows out of cell order are refused. By the decoder: an escaped cell step
+// of 2^64 - 1 (its + 4 wrapped to 3) or 2^37 - 4 (2^37, shifted past the u64 to
+// 0: the same cell again), a step from the last cell id (wrapped to 0), and a
+// block starting at its previous row's cell; a step of 2^20 and a block past
+// its previous row decode. By the encoder: a block's first row at the cell of
+// the row before it.
+TEST(gc_gxc_rows_out_of_cell_order_are_refused) {
+    const uint64_t MAX = ~uint64_t(0), C = uint64_t(1) << 40, LAST = MAX - ((uint64_t(1) << 27) - 1);
+    std::vector<GxcRow> blocks(129, GxcRow{0, {}});  // steps of one cell, no lists
+    struct Case {
+        const char* name;
+        std::vector<GxcRow> rows;
+        std::vector<uint64_t> cells;
+        bool valid;
+    };
+    const Case cases[] = {
+        {"escaped step 2^20", {{0, {}}, {3 << 6, {(1 << 20) - 4}}}, {C}, true},
+        {"block past its previous row", blocks, {C, C + (uint64_t(128) << 27)}, true},
+        {"escaped step 2^64 - 1 + 4", {{0, {}}, {3 << 6, {MAX}}}, {C}, false},
+        {"escaped step 2^37", {{0, {}}, {3 << 6, {(uint64_t(1) << 37) - 4}}}, {C}, false},
+        {"step from the last cell id", {{0, {}}, {0, {}}}, {LAST}, false},
+        {"block at its previous row's cell", blocks, {C, C + (uint64_t(127) << 27)}, false},
+    };
+    ScratchDir dir("gc-gxc-cells");
+    int n = 0;
+    for (const Case& c : cases) {
+        const std::string src = dir.path() + "/" + std::to_string(n++), out = src + "/out";
+        write_gxc(src, c.rows, {}, c.cells);
+        std::filesystem::create_directories(out);
+
+        const int status = exit_status_in_child(
+            [&] {
+                gcset::Manifest m;
+                m.set("gxc.rows", c.rows.size());
+                m.set("gxc.B", 128);
+                m.set("gxc.addr_ids", 0);
+                gcset::gxc::decode(src, out, m);
+                return 0;
+            },
+            20);
+
+        if (status != (c.valid ? 0 : 2)) std::printf("    %s: exit %d\n", c.name, status);
+        CHECK_EQ(status, c.valid ? 0 : 2);
+    }
+    for (const bool sorted : {true, false}) {
+        const std::string src = dir.path() + (sorted ? "/sorted" : "/unsorted"), out = src + ".enc";
+        std::filesystem::create_directories(src);
+        std::filesystem::create_directories(out);
+        std::vector<uint8_t> geo;
+        for (uint64_t i = 0; i < 129; i++) {
+            const std::vector<uint8_t> cell = le(C + ((i - (!sorted && i == 128)) << 27), 8), none = le(gcset::NO, 4);
+            geo.insert(geo.end(), cell.begin(), cell.end());
+            for (int t = 0; t < 3; t++) geo.insert(geo.end(), none.begin(), none.end());
+        }
+        write_bytes(src + "/geo_cells.bin", geo);
+        for (const char* e : gcset::gxc::ENTRY) write_bytes(src + "/" + e, {});
+
+        const int status = exit_status_in_child(
+            [&] {
+                gcset::Manifest m;
+                gcset::gxc::encode(src, out, m);
+                return 0;
+            },
+            20);
+
+        if (status != (sorted ? 0 : 2)) std::printf("    encoder, %s rows: exit %d\n", sorted ? "sorted" : "unsorted", status);
+        CHECK_EQ(status, sorted ? 0 : 2);
+    }
+}
+
 // A way's code with widths the encoder never writes (first coordinate past 4
 // bytes, deltas past 32 bits) is refused instead of shifting a u32 past its
 // width; the widest valid code decodes. One street way of two nodes: its

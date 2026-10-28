@@ -68,12 +68,12 @@ inline void encode(const std::string& src, const std::string& out, Manifest& m) 
         const uint32_t off[3] = {rd32(g + 8), rd32(g + 12), rd32(g + 16)};
         uint8_t d = 0;
         pay.clear();
+        if (r && cell <= prev_cell) die("gxc: rows out of order at %llu", (unsigned long long)r);
         if (r % B == 0) {
             if (rows.tell() > 0xFFFFFFFFull || next > 0xFFFFFFFFull) die("gxc: top field overflow");
             const Top t{cell, uint32_t(rows.tell()), cur_off[0], cur_off[1], uint32_t(next), cur_first[0], cur_first[1]};
             top.put(&t, sizeof t);
         } else {
-            if (cell <= prev_cell) die("gxc: rows out of order at %llu", (unsigned long long)r);
             const uint64_t diff = cell - prev_cell;
             if (diff & ((uint64_t(1) << CELL_SHIFT) - 1)) die("gxc: cell step not a multiple of 2^27 at row %llu", (unsigned long long)r);
             const uint64_t step = diff >> CELL_SHIFT;
@@ -232,12 +232,17 @@ inline void decode(const std::string& src, const std::string& out, const Manifes
             if (t.roff != rows.tell() || t.s != cur_off[0] || t.i != cur_off[1] || t.afirst != uint32_t(next) ||
                 t.sprev != cur_first[0] || t.iprev != cur_first[1])
                 die("gxc: block %llu entry state differs from the running state", (unsigned long long)(r / B));
+            // Rows are in cell order: a block starts past the row before it.
+            if (r && t.cell <= cell) die("gxc: block %llu starts at or before the row before it", (unsigned long long)(r / B));
             cell = t.cell;
         }
         const uint8_t h = rows.u8();
         const int d = h >> 6;
         if (r % B) {
-            const uint64_t step = d < 3 ? uint64_t(d) + 1 : rows.uv() + 4;
+            // Up to the last cell id: an escaped step (step - 4) past it stays past it, so + 4 can't wrap.
+            const uint64_t room = (UINT64_MAX - cell) >> CELL_SHIFT;
+            const uint64_t step = d < 3 ? uint64_t(d) + 1 : std::min(rows.uv(), room) + 4;
+            if (step > room) die("gxc: cell step past the last cell id at row %llu", (unsigned long long)r);
             cell += step << CELL_SHIFT;
         } else if (d) {
             die("gxc: step on a block's first row");

@@ -784,6 +784,58 @@ TEST(gcs_gxc_decoder_rejects_ids_past_u32_and_the_id_count) {
     }
 }
 
+TEST(gcs_gxc_rows_out_of_cell_order_are_rejected) {
+    // By the decoder: an escaped cell step of 2^64 - 1 (its + 4 wrapped to 3)
+    // or 2^37 - 4 (2^37, shifted past the u64 to 0: the same cell again), a
+    // step from the last cell id (wrapped to 0), and a block starting at its
+    // previous row's cell; a step of 2^20 and a block past its previous row
+    // decode. By the encoder: a block's first row at the cell of the row
+    // before it.
+    const uint64_t MAX = ~uint64_t(0), C = uint64_t(1) << 40, LAST = MAX - ((uint64_t(1) << 27) - 1);
+    std::vector<GxcRow> blocks(129, GxcRow{0, {}});  // steps of one cell, no lists
+    struct Case {
+        std::vector<GxcRow> rows;
+        std::vector<uint64_t> cells;
+        const char* error;  // nullptr: decodes
+    };
+    const Case cases[] = {
+        {{{0, {}}, {3 << 6, {(1 << 20) - 4}}}, {C}, nullptr},                                        // escaped step 2^20
+        {blocks, {C, C + (uint64_t(128) << 27)}, nullptr},                                           // past its previous row
+        {{{0, {}}, {3 << 6, {MAX}}}, {C}, "cell step past the last cell id"},                        // 2^64 - 1 + 4
+        {{{0, {}}, {3 << 6, {(uint64_t(1) << 37) - 4}}}, {C}, "cell step past the last cell id"},     // 2^37
+        {{{0, {}}, {0, {}}}, {LAST}, "cell step past the last cell id"},                             // from the last cell id
+        {blocks, {C, C + (uint64_t(127) << 27)}, "starts at or before the row before it"},          // at its previous row's
+    };
+    for (const Case& c : cases) {
+        ScratchDir dir("gcs-test");
+        write_gxc(dir.path(), c.rows, {}, c.cells);
+
+        const int status = gxc_decode_error(dir.path(), c.rows.size(), 0, c.error ? c.error : "");
+
+        CHECK_EQ(status, c.error ? 2 : 0);
+    }
+    for (const bool sorted : {true, false}) {
+        ScratchDir dir("gcs-test");
+        gxc::Enc enc(dir.path());
+        enc.state = {1, 1, 1, 1};
+        std::vector<uint8_t> geo;
+        for (uint64_t i = 0; i < 129; i++) {
+            const std::vector<uint8_t> cell = le(C + ((i - (!sorted && i == 128)) << 27), 8), none = le(NO, 4);
+            geo.insert(geo.end(), cell.begin(), cell.end());
+            for (int t = 0; t < 3; t++) geo.insert(geo.end(), none.begin(), none.end());
+        }
+
+        const int status = error_code(
+            [&] {
+                enc.write(0, geo.data(), geo.size());
+                finish_all(enc);
+            },
+            "rows out of order");
+
+        CHECK_EQ(status, sorted ? 0 : 2);
+    }
+}
+
 TEST(gcs_ways_decoder_rejects_codes_wider_than_the_encoder_writes) {
     // One street way of two nodes, its block 2 wf bytes then (wl + wg) bits:
     // a first coordinate past 4 bytes or deltas past 32 bits are refused
