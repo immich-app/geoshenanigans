@@ -586,7 +586,7 @@ TEST(patch_format_offset_fixups_reject_truncated_runs) {
     CHECK(threw);
 }
 
-// --- ascending ids ---
+// --- ascending ids, sections by entries file ---
 
 // What the walk threw as a runtime_error, or "".
 static std::string refusal_of(const std::function<void()>& walk) {
@@ -642,6 +642,35 @@ TEST(patch_format_ascending_ids_refuse_a_step_back_among_the_ids_the_walk_left) 
     CHECK(sut.skip_to(9));
 
     CHECK_EQ(refusal_of([&] { sut.require_ascending(); }), std::string("Malformed cell changes"));
+}
+
+TEST(patch_format_entries_file_sections_keep_the_section_of_each_file) {
+    EntriesFileSections sut("cell index delta", CELL_INDEX_ENTRIES_FILES);
+
+    sut.add(static_cast<uint32_t>(PatchFileId::POI_ENTRIES), {40, 8});
+
+    const PatchRef* poi = sut.find(PatchFileId::POI_ENTRIES);
+    REQUIRE(poi != nullptr);
+    CHECK_EQ(poi->pos, size_t(40));
+    CHECK_EQ(poi->size, size_t(8));
+    CHECK(sut.find(PatchFileId::ADMIN_ENTRIES) == nullptr);
+    CHECK(sut.find(PatchFileId::STREET_ENTRIES) == nullptr);
+}
+
+TEST(patch_format_entries_file_sections_refuse_a_second_section_or_another_file) {
+    struct Case { uint32_t fid; std::string refusal; };
+    const Case cases[] = {
+        {static_cast<uint32_t>(PatchFileId::POI_ENTRIES), "Malformed cell index delta: a second one for poi_entries.bin"},
+        {static_cast<uint32_t>(PatchFileId::STREET_ENTRIES), "Malformed cell index delta for file 9"},
+        {999, "Malformed cell index delta for file 999"},
+    };
+    for (const Case& c : cases) {
+        EntriesFileSections sut("cell index delta", CELL_INDEX_ENTRIES_FILES);
+        sut.add(static_cast<uint32_t>(PatchFileId::POI_ENTRIES), {40, 8});
+
+        CHECK_EQ(refusal_of([&] { sut.add(c.fid, {60, 8}); }), c.refusal);
+        CHECK_EQ(sut.find(PatchFileId::POI_ENTRIES)->pos, size_t(40));
+    }
 }
 
 // --- cell index rebuild from an id remap ---
@@ -1631,9 +1660,11 @@ TEST(patch_format_geo_list_delta_round_trip) {
     uint64_t cid = 10;
     for (const auto& c : cases) append_geo_list_delta(buf, cid++, c.derived, c.target);
     size_t pos = 0;
-    scan_geo_list_deltas(buf.data(), buf.size(), pos, 7);
+    const PatchRef ref = scan_geo_list_deltas(buf.data(), buf.size(), pos, 7);
     CHECK_EQ(pos, buf.size());
-    GeoListDeltaCursor sut(buf.data(), 0, 7);
+    CHECK_EQ(ref.pos, size_t(0));
+    CHECK_EQ(ref.size, buf.size());
+    GeoListDeltaCursor sut(buf.data(), ref);
     std::vector<uint32_t> scratch;
     CHECK(!sut.at(9));
     for (size_t i = 0; i < 7; i++) {
@@ -1651,7 +1682,7 @@ TEST(patch_format_geo_list_delta_cursor_skips_cells_the_walk_passes) {
     append_geo_list_delta(buf, 3, {1}, {2});
     append_geo_list_delta(buf, 5, {}, {7});
     append_geo_list_delta(buf, 8, {4}, {});
-    GeoListDeltaCursor sut(buf.data(), 0, 3);
+    GeoListDeltaCursor sut(buf.data(), {0, buf.size()});
     CHECK(!sut.at(1));
     CHECK(sut.at(5));  // 3 passed unread
     CHECK(sut.at(5));

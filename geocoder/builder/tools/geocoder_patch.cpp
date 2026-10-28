@@ -574,15 +574,13 @@ static int run(int argc, char* argv[]) {
     // ID remaps: file_id → vector<uint32_t> where remap[old_idx] = new_idx
     // Old → new record ids of the replayed files the entry pipeline remaps by.
     std::unordered_map<uint32_t, RecordRemap> record_remaps;
-    // The rebuilds' cell changes, read in place as their walks reach them.
+    // The rebuilds' cell changes and per-cell corrections, read in place
+    // as their walks reach them.
     CellChanges geo_cells, admin_cells, poi_cells, place_cells;
-    // Street / addr / interp per-cell corrections by entries file id: where
-    // they sit in the mapped patch and how many (read as the walk reaches them).
-    std::unordered_map<uint32_t, std::pair<size_t, uint32_t>> geo_delta_refs;
+    EntriesFileSections geo_deltas("geo entry delta", GEO_ENTRIES_FILES);
+    EntriesFileSections cell_index_deltas("cell index delta", CELL_INDEX_ENTRIES_FILES);
     struct CellCorr { uint64_t cell_id; std::vector<uint32_t> ids; };
     std::unordered_map<uint32_t, std::vector<CellCorr>> entry_corrections;
-    // CELL_INDEX_DELTA payloads by entries file id (admin / POI / place).
-    std::unordered_map<uint32_t, std::vector<char>> cell_index_deltas;
     // POI parent-id remap (from POI_PARENT_REMAP_MARKER). Applied during
     // POI_RECORDS MATCH replay to bytes 24/28/32 of each record alongside
     // the str_remap on byte 16. Sorted by old_id for binary-search lookup.
@@ -652,8 +650,7 @@ static int run(int argc, char* argv[]) {
         if (file_id == CELL_CHANGES_PLACE_MARKER) { place_cells = read_cell_changes("Place"); continue; }
         if (file_id == GEO_ENTRY_DELTA_MARKER) {
             uint32_t fid = ru32(), c = ru32();
-            geo_delta_refs[fid] = {pos, c};
-            scan_geo_list_deltas(P, patch_size, pos, c);
+            geo_deltas.add(fid, scan_geo_list_deltas(P, patch_size, pos, c));
             std::cerr << "  Geo entry deltas " << fid << ": " << c << " cells" << std::endl;
             continue;
         }
@@ -704,8 +701,9 @@ static int run(int argc, char* argv[]) {
         if (file_id == CELL_INDEX_DELTA_MARKER) {
             uint32_t fid = ru32();
             uint64_t n = ru64();
-            const char* p = take(n, "cell index delta");
-            cell_index_deltas[fid].assign(p, p + n);
+            require_bytes(n, "cell index delta");
+            cell_index_deltas.add(fid, {pos, static_cast<size_t>(n)});
+            take(static_cast<size_t>(n), "cell index delta");
             std::cerr << "  Cell index delta " << fid << ": " << n << " bytes" << std::endl;
             continue;
         }
@@ -1261,9 +1259,10 @@ static int run(int argc, char* argv[]) {
         AscendingIds& removed = geo_cells.removed;
         advise_sequential(geo_cells);
         auto cursor_of = [&](PatchFileId fid) {
-            auto it = geo_delta_refs.find((uint32_t)fid);
-            if (it == geo_delta_refs.end()) return GeoListDeltaCursor();
-            return GeoListDeltaCursor(P, it->second.first, it->second.second);
+            const PatchRef* ref = geo_deltas.find(fid);
+            if (!ref) return GeoListDeltaCursor();
+            advise_sequential(P + ref->pos, ref->size);
+            return GeoListDeltaCursor(P, *ref);
         };
         GeoListDeltaCursor cur_s = cursor_of(PatchFileId::STREET_ENTRIES);
         GeoListDeltaCursor cur_a = cursor_of(PatchFileId::ADDR_ENTRIES);
@@ -1439,15 +1438,16 @@ static int run(int argc, char* argv[]) {
         // has to run instead.
         auto stream_rebuild = [&](const char* label, PatchFileId entries_fid, const std::string& prefix,
                                   const CellChanges& changes, auto remap) -> bool {
-            auto dit = cell_index_deltas.find((uint32_t)entries_fid);
-            if (dit == cell_index_deltas.end()) return false;
+            const PatchRef* delta = cell_index_deltas.find(entries_fid);
+            if (!delta) return false;
             advise_sequential(changes);
+            advise_sequential(P + delta->pos, delta->size);
             SequentialFileReader old_c(cur_dir + "/" + prefix + "_cells.bin");
             SequentialFileReader old_e(cur_dir + "/" + prefix + "_entries.bin");
             FILE* fc = open_out(prefix + "_cells.bin");
             FILE* fe = open_out(prefix + "_entries.bin");
             size_t n_out = 0;
-            stream_cell_index(old_c, old_e, changes.added, changes.removed, remap, dit->second.data(), dit->second.size(),
+            stream_cell_index(old_c, old_e, changes.added, changes.removed, remap, P + delta->pos, delta->size,
                               [&](const char* p, size_t len) { fwrite(p, 1, len, fc); n_out += len; },
                               [&](const char* p, size_t len) { fwrite(p, 1, len, fe); });
             close_patch_outputs({{fc, prefix + "_cells.bin"}, {fe, prefix + "_entries.bin"}});

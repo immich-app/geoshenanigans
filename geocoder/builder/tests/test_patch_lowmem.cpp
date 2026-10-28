@@ -582,6 +582,33 @@ TEST(patch_heap_stays_flat_as_geo_cells_change) {
     }, 20000).empty());
 }
 
+// n POI cells whose lists all change (each cell's POI becomes the next one)
+// over POIs that stay: a POI cell index delta of n cells, which the patcher
+// reads where it sits in the patch.
+TEST(patch_heap_stays_flat_as_a_poi_cell_index_delta_grows) {
+    CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
+        std::mt19937 rng(20261028);
+        const auto pois = pois_of(rng, 1000, 0, true);
+        CellLists old_cells, new_cells;
+        for (uint32_t k = 0; k < n; k++) {
+            old_cells[cell_id(k)] = {k % 950};
+            new_cells[cell_id(k)] = {k % 950 + 1};
+        }
+        BuildDir old_d, new_d;
+        put_pois(old_d, pois);
+        put_pois(new_d, pois);
+        put_poi_cells(old_d, old_cells);
+        put_poi_cells(new_d, new_cells);
+        if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
+        // No removed cells, then n cells of one lost and one gained id.
+        std::vector<char> delta;
+        append(delta, CELL_INDEX_DELTA_MARKER);
+        append(delta, static_cast<uint32_t>(PatchFileId::POI_ENTRIES));
+        append(delta, uint64_t{8} + uint64_t{24} * n);
+        return patch_holds(c, delta, "POI cell index delta of " + std::to_string(n) + " cells");
+    }, 10000).empty());
+}
+
 // n POI cells removed and n added (the old cells are the even ones, the new
 // cells the odd ones, all with empty lists) over POIs that stay: cell changes
 // of n and n cells, which the patcher reads where they sit in the patch.
@@ -858,9 +885,10 @@ TEST(patch_lowmem_refuses_counts_and_lengths_that_wrap_32_bits) {
 }
 
 // Cell changes out of order (two ids of one list swapped: the geo index's
-// added or removed cells, the POI index's) are refused in every mode. The
-// patch as made applies.
-TEST(patch_refuses_cell_changes_out_of_order) {
+// added or removed cells, the POI index's), and a geo entry delta or a cell
+// index delta for a file that has one already or for a file not of its kind,
+// are refused in every mode. The patch as made applies.
+TEST(patch_refuses_cell_changes_out_of_order_and_a_second_or_foreign_delta) {
     ScratchDir dir("patch-cells");
     std::mt19937 rng(20261028);
     // Geo: cells 0-39 kept with their street lists changed, 40-49 removed,
@@ -897,14 +925,25 @@ TEST(patch_refuses_cell_changes_out_of_order) {
         REQUIRE(at != std::string::npos);
         return at;
     };
-    // Where each list's ids start (after marker, n_added, n_removed).
+    const uint32_t street = static_cast<uint32_t>(PatchFileId::STREET_ENTRIES), poi = static_cast<uint32_t>(PatchFileId::POI_ENTRIES);
+    // Where each list's ids start (after marker, n_added, n_removed), and
+    // where the street entries' geo entry delta and the POI cell index delta
+    // start.
     const size_t geo_added = at_of(head({CELL_CHANGES_GEO_MARKER, 10, 10})) + 12, geo_removed = geo_added + 10 * 8;
     const size_t poi_added = at_of(head({CELL_CHANGES_POI_MARKER, 10, 10})) + 12, poi_removed = poi_added + 10 * 8;
+    const size_t street_delta = at_of(head({GEO_ENTRY_DELTA_MARKER, street}));
+    const size_t poi_delta = at_of(head({CELL_INDEX_DELTA_MARKER, poi}));
+    uint64_t poi_delta_size;
+    memcpy(&poi_delta_size, raw.data() + poi_delta + 8, 8);
+    const std::vector<char> poi_delta_section(raw.begin() + poi_delta, raw.begin() + poi_delta + 16 + poi_delta_size);
 
     using Edit = std::function<void(std::vector<char>&)>;
     // Swaps ids i and i + 1 of the list at ids.
     auto swap_ids = [](size_t ids, size_t i) -> Edit {
         return [at = ids + 8 * i](std::vector<char>& p) { std::swap_ranges(p.begin() + at, p.begin() + at + 8, p.begin() + at + 8); };
+    };
+    auto insert_at = [](size_t at, const std::vector<char>& section) -> Edit {
+        return [at, section](std::vector<char>& p) { p.insert(p.begin() + at, section.begin(), section.end()); };
     };
     struct Case {
         std::string name;
@@ -919,6 +958,12 @@ TEST(patch_refuses_cell_changes_out_of_order) {
         // The last two: the walk asks for no cell past them, so the step back is among the ids it left.
         {"geo-removed-last", swap_ids(geo_removed, 8), "Malformed cell changes"},
         {"poi-removed-last", swap_ids(poi_removed, 8), "Malformed cell changes"},
+        // Each before the real section: an empty one (no cells; a u64 size of 0), or its copy.
+        {"second-geo-delta", insert_at(street_delta, head({GEO_ENTRY_DELTA_MARKER, street, 0})),
+         "Malformed geo entry delta: a second one for street_entries.bin"},
+        {"foreign-geo-delta", insert_at(street_delta, head({GEO_ENTRY_DELTA_MARKER, poi, 0})), "Malformed geo entry delta for file 17"},
+        {"second-cell-index-delta", insert_at(poi_delta, poi_delta_section), "Malformed cell index delta: a second one for poi_entries.bin"},
+        {"foreign-cell-index-delta", insert_at(poi_delta, head({CELL_INDEX_DELTA_MARKER, 999, 0, 0})), "Malformed cell index delta for file 999"},
     };
     for (const Case& e : cases) {
         std::vector<char> edited = raw;

@@ -400,7 +400,8 @@ Geo Entry Deltas (street / addr / interp entries): marker 0xFFFFFFF0 (u32)
   + [id:u32] × n_gained, turning the list the patcher derives (old list,
   ids remapped) into the new one. n_lost 0xFFFF: the gained ids are the
   whole new list. v8: an old id the remap doesn't map is a deleted record
-  and drops out of the derived list.
+  and drops out of the derived list. At most one per entries file; the
+  patcher refuses another file or a second one.
 
 Entry Corrections: marker 0xFFFFFFF8 (u32) + file_id (u32) + count (u32)
   + [(cell_id:u64, entry_count:u16, [id:u32] × entry_count)] × count
@@ -408,7 +409,8 @@ Entry Corrections: marker 0xFFFFFFF8 (u32) + file_id (u32) + count (u32)
 Cell Index Delta: marker 0xFFFFFFF7 (u32) + file_id (u32, the entries file)
   + payload_size (u64) + the cell list delta from the rebuilt admin / POI /
   place index to the new one (same layout as stride=0xFB); replaces Entry
-  Corrections for that file
+  Corrections for that file. At most one per entries file; the patcher
+  refuses another file or a second one.
 
 End marker: 0xFFFFFFFF (u32)
 ```
