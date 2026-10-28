@@ -223,9 +223,10 @@ TEST(patch_format_section_marker_values) {
 
 TEST(patch_format_magic_and_version) {
     // GCPATCH_VERSION is bound to the value actually emitted/checked by the
-    // diff/patch tools. v8 = identity-matched merges (REPLACE, derived street
-    // remap, parallel side-file deltas). The patcher accepts this version only.
-    CHECK_EQ(GCPATCH_VERSION, uint32_t(8));
+    // diff/patch tools. v9 = string tiers in any order (each shipped tier's
+    // order word; an indexed tier sends its added strings' new indices). The
+    // patcher accepts this version only.
+    CHECK_EQ(GCPATCH_VERSION, uint32_t(9));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
     for (int i = 0; i < 8; i++) CHECK_EQ(GCPATCH_MAGIC[i], expect[i]);
 }
@@ -759,13 +760,40 @@ TEST(patch_format_cell_list_delta_rejects_truncation) {
 
 namespace {
 
+// A tier pool in the given order: each string once, NUL-terminated.
+std::string pool_in_order(const std::vector<std::string>& words) {
+    std::unordered_set<std::string> seen;
+    std::string out;
+    for (const auto& w : words)
+        if (seen.insert(w).second) { out += w; out.push_back('\0'); }
+    return out;
+}
+
 // A tier pool: sorted unique strings, each NUL-terminated.
 std::string pool_of(std::vector<std::string> words) {
     std::sort(words.begin(), words.end());
-    words.erase(std::unique(words.begin(), words.end()), words.end());
-    std::string out;
-    for (auto& w : words) { out += w; out.push_back('\0'); }
-    return out;
+    return pool_in_order(words);
+}
+
+// One tier's edit between two pools, as the diff makes it: the kept strings
+// and the shipped tier's diff.
+struct TierEdit {
+    std::vector<std::pair<uint32_t, uint32_t>> kept;
+    StringTierDiff diff;
+};
+
+TierEdit tier_edit(const std::string& o, const std::string& n) {
+    std::unordered_map<std::string, uint32_t> new_at;
+    for (size_t i = 0; i < n.size(); i += strlen(n.c_str() + i) + 1) new_at[n.c_str() + i] = (uint32_t)i;
+    std::vector<std::pair<uint32_t, uint32_t>> common;
+    for (size_t i = 0; i < o.size(); i += strlen(o.c_str() + i) + 1) {
+        auto it = new_at.find(o.c_str() + i);
+        if (it != new_at.end()) common.push_back({(uint32_t)i, it->second});
+    }
+    TierEdit e;
+    e.kept = kept_strings(common);
+    e.diff = string_tier_diff(o.data(), o.size(), n.data(), n.size(), e.kept);
+    return e;
 }
 
 // The per-string pairs the patcher used to hold: every surviving string's old
@@ -805,7 +833,7 @@ TEST(patch_format_string_remap_runs_match_per_string_pairs) {
         uint32_t ob = 0, nb = 0;
         std::unordered_map<uint32_t, uint32_t> want;
         for (int t = 0; t < 2; t++) {
-            remap.add_tier(olds[t].data(), olds[t].size(), ob, news[t].data(), news[t].size(), nb);
+            remap.add_tier(olds[t].data(), olds[t].size(), ob, nb, tier_edit(olds[t], news[t]).diff);
             for (auto& kv : pairs_of(olds[t], news[t], ob, nb)) want.insert(kv);
             ob += olds[t].size(); nb += news[t].size();
         }
@@ -842,7 +870,7 @@ TEST(patch_format_sent_string_runs_map_every_string_start) {
     const std::string o = pool_of({"a", "bb", "c", "dd", "e", "ff", "g"});
     const std::string n = pool_of({"a", "aa", "bb", "c", "e", "eee", "ff", "g", "h"});
     const uint32_t ob = 1000, nb = 990;
-    auto runs = encode_string_tier_runs(o.data(), o.size(), ob, n.data(), n.size(), nb);
+    auto runs = encode_string_tier_runs(o.data(), o.size(), ob, nb, tier_edit(o, n).kept);
     StringRemap remap;
     remap.add_sent_tier(runs.bytes.data(), runs.bytes.size(), runs.n_runs, ob, ob + (uint32_t)o.size());
     remap.finish();
@@ -860,7 +888,7 @@ TEST(patch_format_sent_string_runs_map_every_string_start) {
 TEST(patch_format_sent_string_runs_reject_malformed_input) {
     const std::string o = pool_of({"a", "b", "c", "d", "e", "f"});
     const std::string n = pool_of({"0", "a", "b", "bb", "c", "d", "e", "f"});
-    auto runs = encode_string_tier_runs(o.data(), o.size(), 100, n.data(), n.size(), 100);
+    auto runs = encode_string_tier_runs(o.data(), o.size(), 100, 100, tier_edit(o, n).kept);
     REQUIRE(runs.n_runs == 2);
     const uint32_t end = 100 + (uint32_t)o.size();
     auto add = [](const std::vector<char>& bytes, uint32_t n_runs, uint32_t tier_start, uint32_t tier_end) {
@@ -949,11 +977,11 @@ TEST(patch_format_string_remap_maps_shipped_and_sent_tiers_and_tier_moves) {
         StringRemap remap, runs_only;
         for (StringRemap* r : {&remap, &runs_only}) {
             for (int t = 0; t < n_tiers; t++) {
+                const TierEdit e = tier_edit(olds[t], news[t]);
                 if (shipped >> t & 1) {
-                    r->add_tier(olds[t].data(), olds[t].size(), ob[t], news[t].data(), news[t].size(), nb[t]);
+                    r->add_tier(olds[t].data(), olds[t].size(), ob[t], nb[t], e.diff);
                 } else {
-                    auto runs = encode_string_tier_runs(olds[t].data(), olds[t].size(), ob[t],
-                                                        news[t].data(), news[t].size(), nb[t]);
+                    auto runs = encode_string_tier_runs(olds[t].data(), olds[t].size(), ob[t], nb[t], e.kept);
                     r->add_sent_tier(runs.bytes.data(), runs.bytes.size(), runs.n_runs, ob[t], ob[t + 1]);
                 }
             }
@@ -1001,6 +1029,17 @@ struct RandomTiers {
     std::array<std::string, STRING_TIER_COUNT> olds, news;
     std::array<uint32_t, STRING_TIER_COUNT + 1> ob{}, nb{};
     std::unordered_map<uint32_t, uint32_t> moved;  // old start → new start, every survivor (the diff's str_remap)
+    // Fills `moved` from the pools.
+    void find_moved() {
+        std::unordered_map<std::string, uint32_t> new_at;
+        for (int t = 0; t < STRING_TIER_COUNT; t++)
+            for (uint32_t v : starts_of(news[t], nb[t])) new_at[news[t].c_str() + (v - nb[t])] = v;
+        for (int t = 0; t < STRING_TIER_COUNT; t++)
+            for (uint32_t v : starts_of(olds[t], ob[t])) {
+                auto it = new_at.find(olds[t].c_str() + (v - ob[t]));
+                if (it != new_at.end()) moved[v] = it->second;
+            }
+    }
     std::array<StringTierPools, STRING_TIER_COUNT> pools() const {
         std::array<StringTierPools, STRING_TIER_COUNT> p;
         for (int t = 0; t < STRING_TIER_COUNT; t++)
@@ -1017,8 +1056,13 @@ struct RandomTiers {
     }
 };
 
+// Sorted: every tier alphabetical. Shuffled: every tier in an order of its
+// own that keeps most survivors' relative order and moves some, as the POI
+// tier's record order does.
+enum class PoolOrder { Sorted, Shuffled };
+
 template <typename Rnd>
-RandomTiers random_tiers(Rnd& rnd) {
+RandomTiers random_tiers(Rnd& rnd, PoolOrder order = PoolOrder::Sorted) {
     auto word = [&] { std::string w; for (uint32_t k = 0, len = 1 + rnd(4); k < len; k++) w.push_back('a' + rnd(5)); return w; };
     std::map<std::string, std::pair<int, int>> home;  // word → (old tier, new tier), -1 = absent
     for (int i = 0; i < 80; i++) {
@@ -1034,20 +1078,24 @@ RandomTiers random_tiers(Rnd& rnd) {
         if (tiers.first >= 0) o[tiers.first].push_back(w);
         if (tiers.second >= 0) n[tiers.second].push_back(w);
     }
+    if (order == PoolOrder::Shuffled) {
+        std::map<std::string, std::pair<uint32_t, uint32_t>> key;  // word → (old, new) place
+        for (const auto& [w, tiers] : home) {
+            const uint32_t k = rnd(1000);
+            key[w] = {k, rnd(4) == 0 ? rnd(1000) : k};
+        }
+        for (int t = 0; t < STRING_TIER_COUNT; t++) {
+            std::stable_sort(o[t].begin(), o[t].end(), [&](const std::string& a, const std::string& b) { return key[a].first < key[b].first; });
+            std::stable_sort(n[t].begin(), n[t].end(), [&](const std::string& a, const std::string& b) { return key[a].second < key[b].second; });
+        }
+    }
     for (int t = 0; t < STRING_TIER_COUNT; t++) {
-        r.olds[t] = pool_of(o[t]);
-        r.news[t] = pool_of(n[t]);
+        r.olds[t] = order == PoolOrder::Sorted ? pool_of(o[t]) : pool_in_order(o[t]);
+        r.news[t] = order == PoolOrder::Sorted ? pool_of(n[t]) : pool_in_order(n[t]);
         r.ob[t + 1] = r.ob[t] + (uint32_t)r.olds[t].size();
         r.nb[t + 1] = r.nb[t] + (uint32_t)r.news[t].size();
     }
-    std::unordered_map<std::string, uint32_t> new_at;
-    for (int t = 0; t < STRING_TIER_COUNT; t++)
-        for (uint32_t v : starts_of(r.news[t], r.nb[t])) new_at[r.news[t].c_str() + (v - r.nb[t])] = v;
-    for (int t = 0; t < STRING_TIER_COUNT; t++)
-        for (uint32_t v : starts_of(r.olds[t], r.ob[t])) {
-            auto it = new_at.find(r.olds[t].c_str() + (v - r.ob[t]));
-            if (it != new_at.end()) r.moved[v] = it->second;
-        }
+    r.find_moved();
     return r;
 }
 
@@ -1068,22 +1116,20 @@ void decode_strings(const std::vector<char>& buf, const RandomTiers& r, DecodedS
         rebuild_string_tier(r.olds[t].data(), r.olds[t].size(), d,
                             [&](const char* p, size_t n) { out.rebuilt[t].append(p, n); });
         CHECK_EQ(content_hash(out.rebuilt[t].data(), out.rebuilt[t].size()), d.new_hash);
-        remap.add_tier(r.olds[t].data(), r.olds[t].size(), out.section.old_base[t],
-                       out.rebuilt[t].data(), out.rebuilt[t].size(), out.section.new_base[t]);
+        remap.add_tier(r.olds[t].data(), r.olds[t].size(), out.section.old_base[t], out.section.new_base[t], d);
     });
 }
 
-}  // namespace
-
-TEST(patch_format_strings_section_round_trip) {
-    // Random builds with every mix of shipped, referenced (sent) and neither
-    // tiers: shipped tiers rebuild byte for byte, every string start of a
-    // shipped or referenced tier maps exactly where the diff's per-string
-    // remap sends it, and no pair leaves a tier nobody looks up.
-    uint64_t seed = 23;
+// Random builds with every mix of shipped, referenced (sent) and neither
+// tiers: shipped tiers rebuild byte for byte, every string start of a shipped
+// or referenced tier maps exactly where the diff's per-string remap sends it,
+// and no pair leaves a tier nobody looks up. Returns the pairs of strings
+// that kept their tier.
+size_t check_strings_section_round_trip(uint64_t seed, PoolOrder order) {
     auto rnd = [&](uint32_t n) { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return (uint32_t)(seed >> 33) % n; };
+    size_t order_moves = 0;
     for (int round = 0; round < 400; round++) {
-        const RandomTiers r = random_tiers(rnd);
+        const RandomTiers r = random_tiers(rnd, order);
         const uint32_t shipped = rnd(32), referenced = rnd(32);
         std::vector<char> buf;
         const auto stats = append_strings_section(buf, r.pools(), shipped, referenced, r.moved);
@@ -1106,13 +1152,23 @@ TEST(patch_format_strings_section_round_trip) {
                 CHECK_EQ(remap.lookup(v), it != r.moved.end() ? it->second : v);
             }
         }
-        size_t want_pairs = 0;
+        // Pairs: every survivor that changed tier out of a looked-up tier,
+        // and in another order, some that kept it (never in a sorted tier).
+        size_t tier_moves = 0;
         for (const auto& [o, n] : r.moved) {
             int ot = r.old_tier_of(o);
-            if (ot != r.new_tier_of(n) && (looked_up >> ot & 1)) want_pairs++;
+            if (ot != r.new_tier_of(n) && (looked_up >> ot & 1)) tier_moves++;
         }
-        CHECK_EQ(s.pairs.size(), want_pairs);
-        for (const auto& [o, n] : s.pairs) CHECK(looked_up >> r.old_tier_of(o) & 1);
+        size_t in_tier = 0;
+        for (const auto& [o, n] : s.pairs) {
+            CHECK(looked_up >> r.old_tier_of(o) & 1);
+            auto it = r.moved.find(o);
+            CHECK(it != r.moved.end() && it->second == n);
+            in_tier += r.old_tier_of(o) == r.new_tier_of(n);
+        }
+        CHECK_EQ(s.pairs.size() - in_tier, tier_moves);
+        if (order == PoolOrder::Sorted) CHECK_EQ(in_tier, size_t(0));
+        order_moves += in_tier;
         CHECK(std::is_sorted(s.pairs.begin(), s.pairs.end()));
         // Every cut of the section is refused.
         for (size_t cut = 0; cut < buf.size(); cut += 1 + buf.size() / 50) {
@@ -1120,6 +1176,125 @@ TEST(patch_format_strings_section_round_trip) {
             CHECK(throws_runtime_error([&] { parse_strings_section(buf.data(), cut, pos); }));
         }
     }
+    return order_moves;
+}
+
+}  // namespace
+
+TEST(patch_format_strings_section_round_trip) {
+    check_strings_section_round_trip(23, PoolOrder::Sorted);
+}
+
+TEST(patch_format_strings_section_round_trips_tiers_in_any_order) {
+    // The POI tier is in record order: a string whose first record moves
+    // past others is deleted and added, and its offset goes as a pair.
+    CHECK(check_strings_section_round_trip(29, PoolOrder::Shuffled) > 0);
+}
+
+TEST(patch_format_string_tier_edit_moves_a_string_out_of_order) {
+    // old: zoo cafe bank   new: zoo bank cafe tea. zoo and bank keep their
+    // order, so cafe moves (deleted at 1, added at 2) and tea is new (3).
+    const std::string o = pool_in_order({"zoo", "cafe", "bank"});
+    const std::string n = pool_in_order({"zoo", "bank", "cafe", "tea"});
+    const TierEdit e = tier_edit(o, n);
+    CHECK(e.kept == (std::vector<std::pair<uint32_t, uint32_t>>{{0, 0}, {9, 4}}));
+    CHECK(e.diff.deleted == std::vector<uint32_t>({1}));
+    CHECK(e.diff.added_at == std::vector<uint32_t>({2, 3}));
+    REQUIRE(e.diff.added.size() == 2);
+    CHECK_EQ(std::string(e.diff.added[0]), std::string("cafe"));
+    CHECK_EQ(std::string(e.diff.added[1]), std::string("tea"));
+    std::string rebuilt;
+    rebuild_string_tier(o.data(), o.size(), e.diff, [&](const char* p, size_t len) { rebuilt.append(p, len); });
+    CHECK(rebuilt == n);
+    // bank shifts by a run; cafe, which the edit doesn't keep, by a pair.
+    StringRemap remap;
+    remap.add_tier(o.data(), o.size(), 100, 100, e.diff);
+    remap.add_pair(104, 109);
+    remap.finish();
+    CHECK_EQ(remap.run_count(), size_t(1));
+    CHECK_EQ(remap.lookup(100), 100u);
+    CHECK_EQ(remap.lookup(109), 104u);
+    CHECK_EQ(remap.lookup(104), 109u);
+}
+
+TEST(patch_format_rebuild_refuses_a_diff_the_old_pool_cannot_place) {
+    const std::string o = pool_in_order({"a", "b"});
+    auto rebuilds = [&](StringTierDiff d) {
+        return !throws_runtime_error([&] { rebuild_string_tier(o.data(), o.size(), d, [](const char*, size_t) {}); });
+    };
+    const char* x = "x";
+    CHECK(rebuilds({0, 0, false, {x}, {2}, {}}));          // after both old strings
+    CHECK(!rebuilds({0, 0, false, {x}, {3}, {}}));         // past the end
+    CHECK(rebuilds({0, 0, false, {}, {}, {1}}));
+    CHECK(!rebuilds({0, 0, false, {}, {}, {2}}));          // no third old string
+    CHECK(!rebuilds({0, 0, false, {x}, {2}, {0, 1}}));     // one string left, x can't be third
+    CHECK(rebuilds({0, 0, true, {x}, {}, {0}}));           // sorted: x after b
+    CHECK(!rebuilds({0, 0, true, {x}, {}, {2}}));
+}
+
+TEST(patch_format_sorted_tier_sends_no_indices) {
+    // A sorted new pool takes its added strings where they sort: the diff
+    // carries no indices, and the old pool rebuilds into the new one.
+    const std::string o = pool_of({"b", "d", "f"}), n = pool_of({"a", "b", "c", "f", "g"});
+    const TierEdit e = tier_edit(o, n);
+    CHECK(e.diff.sorted);
+    CHECK(e.diff.added_at.empty());
+    CHECK(e.diff.deleted == std::vector<uint32_t>({1}));
+    std::string rebuilt;
+    rebuild_string_tier(o.data(), o.size(), e.diff, [&](const char* p, size_t len) { rebuilt.append(p, len); });
+    CHECK(rebuilt == n);
+    // The section holds the order flag but no index of the three added strings.
+    std::array<StringTierPools, STRING_TIER_COUNT> tiers{};
+    tiers[0] = {o.data(), o.size(), n.data(), n.size()};
+    const std::vector<std::pair<uint32_t, uint32_t>> moved = {{0, 2}, {4, 6}};
+    std::vector<char> buf;
+    append_strings_section(buf, tiers, 1, 0, moved);
+    const size_t header = 4 + STRING_TIER_COUNT * 8 + 8, tier = 16 + 12 + (2 * 3) + 4, pairs = 4;
+    CHECK_EQ(buf.size(), header + tier + pairs);
+    size_t pos = 0;
+    const StringsSection s = parse_strings_section(buf.data(), buf.size(), pos);
+    CHECK(s.diffs[0].sorted);
+    CHECK_EQ(s.diffs[0].added.size(), size_t(3));
+    // An unsorted new pool sends them.
+    const std::string u = pool_in_order({"g", "b", "a", "c", "f"});
+    CHECK(!string_pool_sorted(u.data(), u.size()));
+    CHECK(!tier_edit(o, u).diff.sorted);
+}
+
+TEST(patch_format_strings_section_refuses_indices_out_of_order) {
+    // One shipped tier "a b" → "d c" (not sorted, so indexed): both deleted,
+    // both added.
+    const std::string o = pool_of({"a", "b"}), n = pool_in_order({"d", "c"});
+    std::array<StringTierPools, STRING_TIER_COUNT> tiers{};
+    tiers[0] = {o.data(), o.size(), n.data(), n.size()};
+    std::vector<char> buf;
+    append_strings_section(buf, tiers, 1, 0, std::vector<std::pair<uint32_t, uint32_t>>());
+    size_t pos = 0;
+    const StringsSection s = parse_strings_section(buf.data(), buf.size(), pos);
+    REQUIRE(s.diffs[0].added_at == std::vector<uint32_t>({0, 1}));
+    REQUIRE(s.diffs[0].deleted == std::vector<uint32_t>({0, 1}));
+    // The section ends with added_at (8 bytes), deleted (8) and n_pairs (4).
+    for (size_t list_at : {buf.size() - 20, buf.size() - 12}) {
+        std::vector<char> bad = buf;
+        const uint32_t descending[2] = {1, 0};
+        memcpy(bad.data() + list_at, descending, 8);
+        pos = 0;
+        std::string what;
+        try { parse_strings_section(bad.data(), bad.size(), pos); } catch (const std::runtime_error& e) { what = e.what(); }
+        CHECK_EQ(what, std::string("Malformed strings section"));
+    }
+    // A sorted tier's added strings must ascend: "a b" → "c d" sends c, d
+    // before deleted (8 bytes) and n_pairs (4); swapped, they are refused.
+    const std::string sorted_new = pool_of({"c", "d"});
+    tiers[0] = {o.data(), o.size(), sorted_new.data(), sorted_new.size()};
+    std::vector<char> sorted_buf;
+    append_strings_section(sorted_buf, tiers, 1, 0, std::vector<std::pair<uint32_t, uint32_t>>());
+    pos = 0;
+    REQUIRE(parse_strings_section(sorted_buf.data(), sorted_buf.size(), pos).diffs[0].sorted);
+    REQUIRE(std::string(sorted_buf.data() + sorted_buf.size() - 16, 4) == std::string("c\0d\0", 4));
+    memcpy(sorted_buf.data() + sorted_buf.size() - 16, "d\0c\0", 4);
+    pos = 0;
+    CHECK(throws_runtime_error([&] { parse_strings_section(sorted_buf.data(), sorted_buf.size(), pos); }));
 }
 
 TEST(patch_format_strings_section_rejects_bad_masks) {
@@ -1170,11 +1345,11 @@ TEST(patch_format_newly_shipped_tier_is_sent_and_arrives_whole) {
         r.ob[t + 1] = r.ob[t] + (uint32_t)r.olds[t].size();
         r.nb[t + 1] = r.nb[t] + (uint32_t)r.news[t].size();
     }
+    r.find_moved();
     const uint32_t old_2010 = r.ob[3] + 5, new_2010 = r.nb[3] + 10;
     const uint32_t referenced = 0b1001;  // core, postcode
     std::vector<char> buf;
-    const auto stats = append_strings_section(buf, r.pools(), tiers.shipped, referenced,
-                                              std::vector<std::pair<uint32_t, uint32_t>>());
+    const auto stats = append_strings_section(buf, r.pools(), tiers.shipped, referenced, r.moved);
     CHECK_EQ(stats.sent, 8u);
     DecodedStrings dec;
     StringRemap remap;
@@ -1212,17 +1387,51 @@ TEST(patch_format_string_tier_runs_are_maximal_and_skip_unmoved_strings) {
     const std::string o = pool_of({"a", "c", "e", "g", "i"});
     const std::string n = pool_of({"a", "c", "d", "e", "i"});
     std::vector<std::array<uint32_t, 3>> runs;
-    for_each_string_tier_run(o.data(), o.size(), 100, n.data(), n.size(), 100,
-                             [&](uint32_t s, uint32_t e, uint32_t sh) { runs.push_back({s, e, sh}); });
+    auto runs_of = [&](const std::string& old_pool, const std::string& new_pool, uint32_t ob, uint32_t nb) {
+        runs.clear();
+        StringRunJoiner joiner([&](uint32_t s, uint32_t e, uint32_t sh) { runs.push_back({s, e, sh}); });
+        for (const auto& [os, ns] : tier_edit(old_pool, new_pool).kept)
+            joiner.kept(ob + os, ob + os + (uint32_t)strlen(old_pool.c_str() + os) + 1, nb + ns);
+        joiner.finish();
+    };
+    runs_of(o, n, 100, 100);
     REQUIRE(runs.size() == 1);
     CHECK(runs[0] == (std::array<uint32_t, 3>{104, 106, 2}));
     // Two tiers' worth of bases: every surviving string moves by the base
     // difference, so the whole pool is one run.
-    runs.clear();
-    for_each_string_tier_run(o.data(), o.size(), 10, o.data(), o.size(), 7,
-                             [&](uint32_t s, uint32_t e, uint32_t sh) { runs.push_back({s, e, sh}); });
+    runs_of(o, o, 10, 7);
     REQUIRE(runs.size() == 1);
     CHECK(runs[0] == (std::array<uint32_t, 3>{10, 20, uint32_t(-3)}));
+}
+
+TEST(patch_format_longest_increasing_subsequence) {
+    struct Case { std::vector<uint32_t> v; size_t len; };
+    const Case cases[] = {
+        {{}, 0}, {{7}, 1}, {{1, 2, 3, 4}, 4}, {{4, 3, 2, 1}, 1}, {{2, 2, 2}, 1},
+        {{5, 1, 6, 2, 7, 3, 8}, 4}, {{0, 9, 4, 5, 6, 1}, 4},
+    };
+    for (const auto& c : cases) {
+        const std::vector<uint32_t> idx = longest_increasing_subsequence(c.v);
+        CHECK_EQ(idx.size(), c.len);
+        for (size_t k = 1; k < idx.size(); k++) CHECK(idx[k - 1] < idx[k] && c.v[idx[k - 1]] < c.v[idx[k]]);
+    }
+    // Against the quadratic length on random input.
+    uint64_t seed = 5;
+    auto rnd = [&](uint32_t n) { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return (uint32_t)(seed >> 33) % n; };
+    for (int round = 0; round < 200; round++) {
+        std::vector<uint32_t> v(rnd(40));
+        for (auto& x : v) x = rnd(30);
+        std::vector<size_t> best(v.size(), 1);
+        size_t want = 0;
+        for (size_t i = 0; i < v.size(); i++) {
+            for (size_t j = 0; j < i; j++)
+                if (v[j] < v[i]) best[i] = std::max(best[i], best[j] + 1);
+            want = std::max(want, best[i]);
+        }
+        const std::vector<uint32_t> idx = longest_increasing_subsequence(v);
+        CHECK_EQ(idx.size(), want);
+        for (size_t k = 1; k < idx.size(); k++) CHECK(idx[k - 1] < idx[k] && v[idx[k - 1]] < v[idx[k]]);
+    }
 }
 
 // --- record id remap ---

@@ -171,7 +171,11 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // addresses); old ids the remap doesn't map drop out of the street / addr /
 // interp cell lists; and the per-record side files follow their parent's
 // merge (PARALLEL_DELTA_STRIDE).
-static constexpr uint32_t GCPATCH_VERSION = 8;
+// v9: string tiers in any order. Each shipped tier's diff carries an order
+// word: a sorted tier's added strings go where they sort, an indexed one sends
+// each added string's new index, and a string its order moves travels as a
+// pair.
+static constexpr uint32_t GCPATCH_VERSION = 9;
 
 enum class PatchFileId : uint32_t {
     STRINGS = 0,
@@ -352,13 +356,18 @@ static constexpr uint32_t SECONDARY_REMAP_MARKER = 0xFFFFFFF6;
 //     its own old files reference,
 //   per tier t in order:
 //     shipped: old_hash u64, new_hash u64, n_added u32, n_deleted u32,
-//              added strings (NUL-terminated), deleted string indices (u32);
-//              the patcher rebuilds the tier and derives its shift runs by
-//              walking old and new (StringRemap::add_tier),
+//              order u32 (STRING_TIER_SORTED: the new pool sorts and the
+//              added strings go where they sort; STRING_TIER_INDEXED: their
+//              new string indices follow them), added strings
+//              (NUL-terminated), indexed only: their new string indices
+//              (u32, ascending), deleted old string indices (u32,
+//              ascending); the patcher rebuilds the tier and derives its
+//              shift runs from the same walk (StringRemap::add_tier),
 //     sent: n_runs u32, runs_size u32, the tier's shift runs
 //           (encode_string_tier_runs),
-//   n_pairs u32, (old u32, new u32) × n_pairs: strings that changed tier
-//     (sorted by old), for every old tier the dir ships or references.
+//   n_pairs u32, (old u32, new u32) × n_pairs: surviving strings no tier's
+//     edit keeps, which changed tier or order (sorted by old), for every old
+//     tier the dir ships or references.
 // A tier neither shipped nor referenced sends nothing: no lookup lands in it.
 static constexpr uint32_t STRINGS_TIERED_MARKER = 0xFFFFFFF6;
 
@@ -1098,75 +1107,197 @@ static constexpr const char* STRING_TIER_FILES[STRING_TIER_COUNT] = {
     "strings_postcode.bin", "strings_poi.bin"
 };
 
-// Merge-walks one tier's old and new pools (both sorted, NUL-terminated
-// strings) and calls on_run(start, end, shift) for each maximal run of
-// surviving strings that moved by one shift: [start, end) are global old
-// offsets, and shift = new - old (mod 2^32). A deleted, added or unmoved
-// string ends a run, so a run covers only bytes of strings that survive.
-template <typename OnRun>
-void for_each_string_tier_run(const char* old_pool, size_t old_size, uint32_t old_base,
-                              const char* new_pool, size_t new_size, uint32_t new_base, OnRun on_run) {
-    size_t o = 0, n = 0;
-    bool open = false;
-    uint32_t start = 0, end = 0, shift = 0;
-    auto close = [&] {
-        if (open) on_run(start, end, shift);
-        open = false;
-    };
-    while (o < old_size && n < new_size) {
-        const char* os = old_pool + o;
-        const char* ns = new_pool + n;
-        size_t ol = strnlen(os, old_size - o) + 1, nl = strnlen(ns, new_size - n) + 1;
-        int c = strcmp(os, ns);
-        if (c == 0) {
-            uint32_t old_off = old_base + static_cast<uint32_t>(o);
-            uint32_t s = new_base + static_cast<uint32_t>(n) - old_off;
-            if (open && end == old_off && shift == s) {
-                end += static_cast<uint32_t>(ol);
-            } else {
-                close();
-                if (s != 0) {
-                    open = true;
-                    start = old_off;
-                    end = old_off + static_cast<uint32_t>(ol);
-                    shift = s;
-                }
-            }
-            o += ol; n += nl;
-        } else if (c < 0) {
-            close();  // deleted: its offsets keep mapping to themselves
-            o += ol;
-        } else {
-            close();
-            n += nl;
-        }
+// A tier's edit between two days: the strings both pools hold that keep
+// their relative order are kept, a longest such sequence (every common string
+// of a sorted tier). Every other old string is deleted and every other new
+// one added at its new index, so a string the POI tier's record order moves
+// (order_poi_strings_by_record) goes as both, and its offset as a pair.
+
+// The longest strictly increasing subsequence of v, as ascending indices into
+// v (patience sorting). Increasing input takes no search.
+inline std::vector<uint32_t> longest_increasing_subsequence(const std::vector<uint32_t>& v) {
+    constexpr uint32_t NONE = UINT32_MAX;
+    std::vector<uint32_t> tails;  // per length, the index that ends a run of it at the least value
+    std::vector<uint32_t> prev(v.size());
+    for (uint32_t i = 0; i < v.size(); i++) {
+        size_t len = tails.size();
+        if (len > 0 && !(v[tails.back()] < v[i]))
+            len = std::lower_bound(tails.begin(), tails.end(), v[i],
+                                   [&](uint32_t t, uint32_t x) { return v[t] < x; }) - tails.begin();
+        prev[i] = len > 0 ? tails[len - 1] : NONE;
+        if (len == tails.size()) tails.push_back(i);
+        else tails[len] = i;
     }
-    close();
+    std::vector<uint32_t> out(tails.size());
+    uint32_t i = tails.empty() ? NONE : tails.back();
+    for (size_t k = out.size(); k-- > 0; i = prev[i]) out[k] = i;
+    return out;
 }
+
+// A tier's kept strings as (old, new) starts local to its pools, ascending in
+// both, out of `common`: those of every string both pools hold, by old start.
+inline std::vector<std::pair<uint32_t, uint32_t>> kept_strings(const std::vector<std::pair<uint32_t, uint32_t>>& common) {
+    std::vector<uint32_t> news(common.size());
+    for (size_t k = 0; k < common.size(); k++) news[k] = common[k].second;
+    std::vector<std::pair<uint32_t, uint32_t>> kept;
+    for (uint32_t k : longest_increasing_subsequence(news)) kept.push_back(common[k]);
+    return kept;
+}
+
+// Joins kept strings, fed in old order as (old start, old end, new start) in
+// global offsets, into maximal runs of one shift: on_run(start, end, shift),
+// shift = new - old (mod 2^32). A string that doesn't move ends a run without
+// opening one, and so does a gap in the old pool (a deleted string), so a run
+// covers only bytes of kept strings.
+template <typename OnRun>
+class StringRunJoiner {
+public:
+    explicit StringRunJoiner(OnRun on_run) : on_run_(std::move(on_run)) {}
+    void kept(uint32_t old_start, uint32_t old_end, uint32_t new_start) {
+        const uint32_t shift = new_start - old_start;
+        if (open_ && end_ == old_start && shift_ == shift) {
+            end_ = old_end;
+            return;
+        }
+        finish();
+        if (shift == 0) return;
+        open_ = true;
+        start_ = old_start;
+        end_ = old_end;
+        shift_ = shift;
+    }
+    void finish() {
+        if (open_) on_run_(start_, end_, shift_);
+        open_ = false;
+    }
+
+private:
+    OnRun on_run_;
+    bool open_ = false;
+    uint32_t start_ = 0, end_ = 0, shift_ = 0;
+};
 
 // A tier's shift runs as the diff sends them for a tier the client doesn't
 // hold: per run, varints of (start - previous end, end - start,
 // zigzag(shift - previous shift)), starting from the tier's old base and
-// shift 0.
+// shift 0. kept: the tier's kept strings (kept_strings).
 struct StringTierRuns {
     uint32_t n_runs = 0;
     std::vector<char> bytes;
 };
 
-inline StringTierRuns encode_string_tier_runs(const char* old_pool, size_t old_size, uint32_t old_base,
-                                              const char* new_pool, size_t new_size, uint32_t new_base) {
+inline StringTierRuns encode_string_tier_runs(const char* old_pool, size_t old_size, uint32_t old_base, uint32_t new_base,
+                                              const std::vector<std::pair<uint32_t, uint32_t>>& kept) {
     StringTierRuns out;
     uint32_t prev_end = old_base, prev_shift = 0;
-    for_each_string_tier_run(old_pool, old_size, old_base, new_pool, new_size, new_base,
-                             [&](uint32_t start, uint32_t end, uint32_t shift) {
-                                 write_varint(out.bytes, start - prev_end);
-                                 write_varint(out.bytes, end - start);
-                                 write_varint(out.bytes, zigzag32(shift - prev_shift));
-                                 out.n_runs++;
-                                 prev_end = end;
-                                 prev_shift = shift;
-                             });
+    StringRunJoiner joiner([&](uint32_t start, uint32_t end, uint32_t shift) {
+        write_varint(out.bytes, start - prev_end);
+        write_varint(out.bytes, end - start);
+        write_varint(out.bytes, zigzag32(shift - prev_shift));
+        out.n_runs++;
+        prev_end = end;
+        prev_shift = shift;
+    });
+    for (const auto& [o, n] : kept) {
+        const uint32_t len = static_cast<uint32_t>(strnlen(old_pool + o, old_size - o)) + 1;
+        joiner.kept(old_base + o, old_base + o + len, new_base + n);
+    }
+    joiner.finish();
     return out;
+}
+
+// A shipped tier's string diff: the new pool is the old one without the
+// strings at `deleted` (indices in old order, ascending), with `added` (each
+// NUL-terminated) put in. A sorted new pool (every tier but the POI one) puts
+// each added string where it sorts among the kept ones, as the tier's order
+// says where; any other carries the added strings' new indices `added_at`
+// (ascending). The strings point into the new pool on the diff's side and
+// into the patch on the patcher's.
+struct StringTierDiff {
+    uint64_t old_hash = 0, new_hash = 0;
+    bool sorted = false;
+    std::vector<const char*> added;
+    std::vector<uint32_t> added_at;  // empty when sorted
+    std::vector<uint32_t> deleted;
+};
+
+// A shipped tier's order flag in the strings section.
+constexpr uint32_t STRING_TIER_SORTED = 0, STRING_TIER_INDEXED = 1;
+
+// Whether every string of the pool sorts strictly before the next.
+inline bool string_pool_sorted(const char* pool, size_t size) {
+    const char* prev = nullptr;
+    for (size_t at = 0; at < size; at += strnlen(pool + at, size - at) + 1) {
+        if (prev && strcmp(prev, pool + at) >= 0) return false;
+        prev = pool + at;
+    }
+    return true;
+}
+
+// The diff of a shipped tier whose edit keeps `kept` (kept_strings).
+inline StringTierDiff string_tier_diff(const char* old_pool, size_t old_size, const char* new_pool, size_t new_size,
+                                       const std::vector<std::pair<uint32_t, uint32_t>>& kept) {
+    StringTierDiff d;
+    d.old_hash = content_hash(old_pool, old_size);
+    d.new_hash = content_hash(new_pool, new_size);
+    d.sorted = string_pool_sorted(new_pool, new_size);
+    size_t k = 0;
+    uint32_t i = 0;
+    for (size_t o = 0; o < old_size; o += strnlen(old_pool + o, old_size - o) + 1, i++) {
+        if (k < kept.size() && kept[k].first == o) k++;
+        else d.deleted.push_back(i);
+    }
+    k = 0;
+    i = 0;
+    for (size_t n = 0; n < new_size; n += strnlen(new_pool + n, new_size - n) + 1, i++) {
+        if (k < kept.size() && kept[k].second == n) {
+            k++;
+        } else {
+            d.added.push_back(new_pool + n);
+            if (!d.sorted) d.added_at.push_back(i);
+        }
+    }
+    return d;
+}
+
+// No old string: an added one (for_each_new_string).
+constexpr size_t NO_OLD_STRING = SIZE_MAX;
+
+// A shipped tier's new pool string by string, from its old pool and diff:
+// on_string(p, len, old_off) for each new string in order, with the offset of
+// a kept string in the old pool, or NO_OLD_STRING for an added one. The
+// diff's indices ascend (parse_strings_section); ones the old pool can't
+// place throw. A sorted diff puts an added string before the next kept one
+// it sorts before.
+template <typename OnString>
+void for_each_new_string(const char* old_pool, size_t old_size, const StringTierDiff& diff, OnString on_string) {
+    size_t o = 0, d = 0, a = 0;
+    uint32_t oi = 0, ni = 0;
+    auto old_len = [&] { return strnlen(old_pool + o, old_size - o) + 1; };
+    auto skip_deleted = [&] {
+        for (; o < old_size && d < diff.deleted.size() && diff.deleted[d] == oi; d++, oi++) o += old_len();
+    };
+    skip_deleted();
+    auto added_next = [&] {
+        if (a >= diff.added.size()) return false;
+        if (!diff.sorted) return diff.added_at[a] == ni;
+        return o >= old_size || strcmp(diff.added[a], old_pool + o) < 0;
+    };
+    for (;; ni++) {
+        if (added_next()) {
+            on_string(diff.added[a], strlen(diff.added[a]) + 1, NO_OLD_STRING);
+            a++;
+        } else if (o < old_size) {
+            const size_t len = old_len();
+            on_string(old_pool + o, len, o);
+            o += len;
+            oi++;
+            skip_deleted();
+        } else {
+            break;
+        }
+    }
+    if (a != diff.added.size() || d != diff.deleted.size()) throw std::runtime_error("Malformed strings section");
 }
 
 // The patcher's old → new string offset map. Between two edits every
@@ -1178,22 +1309,31 @@ inline StringTierRuns encode_string_tier_runs(const char* old_pool, size_t old_s
 // string start is its predecessor's NUL. A run sent for a tier the client
 // doesn't hold can't: it trusts that every stored reference is a string start
 // or NO_DATA, which partition_strings_into_tiers guarantees and CI's byte
-// identity check proves daily. Strings that changed tier are explicit pairs.
+// identity check proves daily. Surviving strings the edits don't keep (they
+// changed tier, or the POI tier's order moved them) are explicit pairs.
 //
 // Pairs are looked up first, but the order doesn't matter: a pair's old
-// offset starts a string that isn't in its old tier's new pool, the walk
-// ends a run at every such string, and a tier's runs lie inside its own old
-// range, so no run covers a pair's offset.
+// offset starts a string its old tier's edit doesn't keep, runs cover only
+// kept strings, and a tier's runs lie inside its own old range, so no run
+// covers a pair's offset.
 class StringRemap {
 public:
-    // Merge-walks one tier's old and new pools (both sorted) and records the
-    // surviving strings that moved. The old pool must stay mapped for lookups.
-    void add_tier(const char* old_pool, size_t old_size, uint32_t old_base,
-                  const char* new_pool, size_t new_size, uint32_t new_base) {
-        for_each_string_tier_run(old_pool, old_size, old_base, new_pool, new_size, new_base,
-                                 [&](uint32_t start, uint32_t end, uint32_t shift) {
-                                     runs_.push_back({start, end, shift, old_pool + (start - old_base)});
-                                 });
+    // Records the kept strings that moved, walking a shipped tier's old pool
+    // and diff as its rebuild does. The old pool must stay mapped for lookups.
+    void add_tier(const char* old_pool, size_t old_size, uint32_t old_base, uint32_t new_base,
+                  const StringTierDiff& diff) {
+        uint32_t new_start = new_base;
+        StringRunJoiner joiner([&](uint32_t start, uint32_t end, uint32_t shift) {
+            runs_.push_back({start, end, shift, old_pool + (start - old_base)});
+        });
+        for_each_new_string(old_pool, old_size, diff, [&](const char*, size_t len, size_t old_off) {
+            if (old_off != NO_OLD_STRING) {
+                const uint32_t start = old_base + static_cast<uint32_t>(old_off);
+                joiner.kept(start, start + static_cast<uint32_t>(len), new_start);
+            }
+            new_start += static_cast<uint32_t>(len);
+        });
+        joiner.finish();
     }
     // Decodes the runs encode_string_tier_runs wrote for the tier at old
     // offsets [tier_start, tier_end). Tiers are added in offset order, so the
@@ -1316,8 +1456,10 @@ inline uint32_t unshipped_string_tiers(const std::array<StringTierPools, STRING_
 // Appends the strings section of a dir that ships the tiers in `shipped` and
 // whose own old files reference the tiers in `referenced`. moved holds the
 // (old, new) global start of every surviving string (any iterable of pairs,
-// such as the diff's per-string remap); of those that changed tier, only the
-// ones out of a tier the dir looks up are sent.
+// such as the diff's per-string remap); the tiers' edits are made from it, so
+// a survivor it misses is deleted and added. Each tier the dir looks up keeps
+// what its edit can (kept_strings); the other survivors out of it, which
+// changed tier or order, are sent as pairs.
 template <typename Moved>
 StringsSectionStats append_strings_section(std::vector<char>& out,
                                            const std::array<StringTierPools, STRING_TIER_COUNT>& tiers,
@@ -1330,6 +1472,23 @@ StringsSectionStats append_strings_section(std::vector<char>& out,
     }
     StringsSectionStats stats;
     stats.sent = referenced & unshipped_string_tiers(tiers, shipped);
+    const uint32_t looked_up = shipped | referenced;
+
+    // The survivors of each looked-up tier, as local (old, new) starts when
+    // they stay in it; the ones that leave it are pairs.
+    auto tier_of = [](uint32_t global, const std::array<uint32_t, STRING_TIER_COUNT + 1>& base) {
+        for (int t = 0; t < STRING_TIER_COUNT; t++)
+            if (global >= base[t] && global < base[t + 1]) return t;
+        return -1;
+    };
+    std::array<std::vector<std::pair<uint32_t, uint32_t>>, STRING_TIER_COUNT> common;
+    std::vector<std::pair<uint32_t, uint32_t>> pairs;
+    for (const auto& [og, ng] : moved) {
+        const int ot = tier_of(og, old_base);
+        if (ot < 0 || !(looked_up >> ot & 1)) continue;
+        if (tier_of(ng, new_base) == ot) common[ot].push_back({og - old_base[ot], ng - new_base[ot]});
+        else pairs.push_back({og, ng});
+    }
 
     uint32_t marker = STRINGS_TIERED_MARKER;
     put(&marker, 4);
@@ -1340,9 +1499,18 @@ StringsSectionStats append_strings_section(std::vector<char>& out,
     }
     put(&shipped, 4); put(&stats.sent, 4);
     for (int t = 0; t < STRING_TIER_COUNT; t++) {
+        if (!(looked_up >> t & 1)) continue;
+        std::sort(common[t].begin(), common[t].end());
+        const std::vector<std::pair<uint32_t, uint32_t>> kept = kept_strings(common[t]);
+        size_t k = 0;
+        for (const auto& [o, n] : common[t]) {
+            if (k < kept.size() && kept[k].first == o) k++;
+            else pairs.push_back({old_base[t] + o, new_base[t] + n});
+        }
+        common[t] = {};
         const StringTierPools& p = tiers[t];
         if (stats.sent >> t & 1) {
-            auto runs = encode_string_tier_runs(p.old_data, p.old_size, old_base[t], p.new_data, p.new_size, new_base[t]);
+            auto runs = encode_string_tier_runs(p.old_data, p.old_size, old_base[t], new_base[t], kept);
             uint32_t runs_size = static_cast<uint32_t>(runs.bytes.size());
             put(&runs.n_runs, 4); put(&runs_size, 4);
             out.insert(out.end(), runs.bytes.begin(), runs.bytes.end());
@@ -1351,56 +1519,24 @@ StringsSectionStats append_strings_section(std::vector<char>& out,
             continue;
         }
         if (!(shipped >> t & 1)) continue;
-        uint64_t old_hash = content_hash(p.old_data, p.old_size), new_hash = content_hash(p.new_data, p.new_size);
-        put(&old_hash, 8); put(&new_hash, 8);
-        std::vector<const char*> added;
-        std::vector<uint32_t> deleted;
-        size_t o = 0, n = 0;
-        uint32_t oi = 0;
-        while (o < p.old_size && n < p.new_size) {
-            int c = strcmp(p.old_data + o, p.new_data + n);
-            if (c == 0) { o += strlen(p.old_data + o) + 1; n += strlen(p.new_data + n) + 1; oi++; }
-            else if (c < 0) { deleted.push_back(oi++); o += strlen(p.old_data + o) + 1; }
-            else { added.push_back(p.new_data + n); n += strlen(p.new_data + n) + 1; }
-        }
-        for (; o < p.old_size; o += strlen(p.old_data + o) + 1) deleted.push_back(oi++);
-        for (; n < p.new_size; n += strlen(p.new_data + n) + 1) added.push_back(p.new_data + n);
-        uint32_t n_added = static_cast<uint32_t>(added.size()), n_deleted = static_cast<uint32_t>(deleted.size());
-        put(&n_added, 4); put(&n_deleted, 4);
-        for (const char* s : added) put(s, strlen(s) + 1);
-        for (uint32_t idx : deleted) put(&idx, 4);
+        const StringTierDiff d = string_tier_diff(p.old_data, p.old_size, p.new_data, p.new_size, kept);
+        put(&d.old_hash, 8); put(&d.new_hash, 8);
+        uint32_t n_added = static_cast<uint32_t>(d.added.size()), n_deleted = static_cast<uint32_t>(d.deleted.size());
+        const uint32_t order = d.sorted ? STRING_TIER_SORTED : STRING_TIER_INDEXED;
+        put(&n_added, 4); put(&n_deleted, 4); put(&order, 4);
+        for (const char* s : d.added) put(s, strlen(s) + 1);
+        for (uint32_t idx : d.added_at) put(&idx, 4);
+        for (uint32_t idx : d.deleted) put(&idx, 4);
         stats.n_added[t] = n_added;
         stats.n_deleted[t] = n_deleted;
     }
 
-    // A string that moved tier is deleted in its old tier's walk, so its move
-    // travels as a pair, for every old tier a lookup can land in.
-    auto tier_of = [](uint32_t global, const std::array<uint32_t, STRING_TIER_COUNT + 1>& base) {
-        for (int t = 0; t < STRING_TIER_COUNT; t++)
-            if (global >= base[t] && global < base[t + 1]) return t;
-        return -1;
-    };
-    const uint32_t looked_up = shipped | referenced;
-    std::vector<std::pair<uint32_t, uint32_t>> pairs;
-    for (const auto& [og, ng] : moved) {
-        int ot = tier_of(og, old_base);
-        if (ot >= 0 && ot != tier_of(ng, new_base) && (looked_up >> ot & 1)) pairs.push_back({og, ng});
-    }
     std::sort(pairs.begin(), pairs.end());
     stats.n_pairs = static_cast<uint32_t>(pairs.size());
     put(&stats.n_pairs, 4);
     for (const auto& [og, ng] : pairs) { put(&og, 4); put(&ng, 4); }
     return stats;
 }
-
-// A shipped tier's string diff: the new pool is the old one without the
-// strings at `deleted` (indices in old order), merged with `added` (pointing
-// into the patch, NUL-terminated).
-struct StringTierDiff {
-    uint64_t old_hash = 0, new_hash = 0;
-    std::vector<const char*> added;
-    std::vector<uint32_t> deleted;
-};
 
 // A sent tier's runs (encode_string_tier_runs), pointing into the patch.
 struct SentStringRuns {
@@ -1454,7 +1590,9 @@ inline StringsSection parse_strings_section(const char* data, size_t size, size_
         StringTierDiff& d = s.diffs[t];
         d.old_hash = u64();
         d.new_hash = u64();
-        uint32_t n_added = u32(), n_deleted = u32();
+        uint32_t n_added = u32(), n_deleted = u32(), order = u32();
+        if (order != STRING_TIER_SORTED && order != STRING_TIER_INDEXED) malformed();
+        d.sorted = order == STRING_TIER_SORTED;
         if (n_added > size - pos) throw std::runtime_error("Truncated strings section");  // a string is at least its NUL
         d.added.reserve(n_added);
         for (uint32_t i = 0; i < n_added; i++) {
@@ -1463,9 +1601,22 @@ inline StringsSection parse_strings_section(const char* data, size_t size, size_
             d.added.push_back(data + pos);
             pos = static_cast<size_t>(static_cast<const char*>(end) - data) + 1;
         }
-        const char* del = take((size_t)n_deleted * 4);
-        d.deleted.resize(n_deleted);
-        if (n_deleted) memcpy(d.deleted.data(), del, (size_t)n_deleted * 4);
+        // Both index lists ascend strictly, and so do a sorted tier's added
+        // strings.
+        auto indices = [&](std::vector<uint32_t>& v, uint32_t n) {
+            const char* at = take((size_t)n * 4);
+            v.resize(n);
+            if (n) memcpy(v.data(), at, (size_t)n * 4);
+            for (uint32_t i = 1; i < n; i++)
+                if (v[i] <= v[i - 1]) malformed();
+        };
+        if (d.sorted) {
+            for (uint32_t i = 1; i < n_added; i++)
+                if (strcmp(d.added[i - 1], d.added[i]) >= 0) malformed();
+        } else {
+            indices(d.added_at, n_added);
+        }
+        indices(d.deleted, n_deleted);
     }
     uint32_t n_pairs = u32();
     const char* pairs = take((size_t)n_pairs * 8);
@@ -1488,37 +1639,15 @@ inline void require_shipped_tiers_listed(uint32_t shipped, const std::unordered_
 }
 
 // Writes a shipped tier's new pool through write(bytes, n): the old pool's
-// surviving strings and the added ones, merged in sorted order.
+// kept strings with the added ones at their indices.
 template <typename Write>
 void rebuild_string_tier(const char* old_pool, size_t old_size, const StringTierDiff& diff, Write write) {
-    std::vector<const char*> added = diff.added;
-    std::sort(added.begin(), added.end(), [](const char* a, const char* b) { return strcmp(a, b) < 0; });
-    std::unordered_set<uint32_t> deleted(diff.deleted.begin(), diff.deleted.end());
-    size_t sp = 0, ai = 0;
-    uint32_t idx = 0;
-    while (sp < old_size || ai < added.size()) {
-        const char* old_s = nullptr;
-        while (sp < old_size) {
-            if (!deleted.count(idx)) { old_s = old_pool + sp; break; }
-            sp += strnlen(old_pool + sp, old_size - sp) + 1; idx++;
-        }
-        const char* add_s = ai < added.size() ? added[ai] : nullptr;
-        int c = old_s && add_s ? strcmp(old_s, add_s) : 0;
-        if (old_s && (!add_s || c <= 0)) {
-            size_t l = strnlen(old_s, old_size - sp) + 1;
-            write(old_s, l);
-            sp += l; idx++;
-            if (add_s && c == 0) ai++;
-        } else if (add_s) {
-            write(add_s, strlen(add_s) + 1);
-            ai++;
-        }
-    }
+    for_each_new_string(old_pool, old_size, diff, [&](const char* p, size_t n, size_t) { write(p, n); });
 }
 
 // Fills remap from the section, tier by tier in offset order: a sent tier
 // from its runs, a shipped tier through on_shipped(t), which rebuilds it and
-// calls remap.add_tier with its old and new pool. Then the tier moves.
+// calls remap.add_tier with its old pool and diff. Then the moved strings.
 template <typename OnShipped>
 void load_string_remap(const StringsSection& s, StringRemap& remap, OnShipped on_shipped) {
     for (int t = 0; t < STRING_TIER_COUNT; t++) {

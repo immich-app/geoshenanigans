@@ -784,7 +784,7 @@ static int run(int argc, char* argv[]) {
         }
         std::cerr << "  String remap: shipped tiers 0x" << std::hex << shipped << ", newly shipped 0x"
                   << tier_files.newly_shipped << ", referenced 0x" << referenced << std::dec << ", "
-                  << stats.n_pairs << " cross-tier pairs" << std::endl;
+                  << stats.n_pairs << " moved-string pairs" << std::endl;
     }
     for (int t = 0; t < 5; t++) {
         unmap_file(old_tier_maps[t]);
