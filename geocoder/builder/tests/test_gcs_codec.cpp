@@ -338,6 +338,79 @@ TEST(gcs_dictionary_round_trip_renumbers_in_value_order) {
     CHECK(decode_all(dec)[0] == u32s(values));
 }
 
+TEST(gcs_dictionary_decoder_rejects_a_dict_past_the_manifest) {
+    // A dictionary family's .dict holds the manifest's count of values, fewer
+    // than the u16 index's 0xFFFF, and is rejected before it is read otherwise:
+    // a value more than the manifest's, 0xFFFF values (as many as the manifest
+    // says), and a sparse 64 MiB file under a dictionary of none (reserved and
+    // read in, before). Two values and three indexes decode, and so do 0xFFFE
+    // values.
+    struct Case {
+        uint64_t manifest, values;  // the manifest's dictionary count, the file's
+        uint64_t sparse_bytes;      // instead: a sparse file of these bytes
+        const char* error;          // nullptr: decodes
+    };
+    const Case cases[] = {
+        {2, 2, 0, nullptr},
+        {2, 3, 0, "way_postcodes.dict size"},
+        {0xFFFE, 0xFFFE, 0, nullptr},
+        {0xFFFF, 0xFFFF, 0, "past a u16 index"},
+        {0, 0, uint64_t(64) << 20, "way_postcodes.dict size"},
+    };
+    for (const Case& c : cases) {
+        ScratchDir dir("gcs-test");
+        std::vector<uint32_t> dict;
+        for (uint64_t v = 0; v < c.values; v++) dict.push_back(uint32_t(100 + v));
+        write_bytes(dir.path() + "/way_postcodes.dict", u32s(dict));
+        if (c.sparse_bytes) std::filesystem::resize_file(dir.path() + "/way_postcodes.dict", c.sparse_bytes);
+        const std::vector<uint16_t> ids = c.manifest ? std::vector<uint16_t>{0, 1, 0xFFFF} : std::vector<uint16_t>{};
+        std::vector<uint8_t> index;
+        for (uint16_t x : ids) for (uint8_t b : le(x, 2)) index.push_back(b);
+        write_bytes(dir.path() + "/way_postcodes.u16", index);
+
+        const int status = exit_status_in_child(
+            [&] {
+                return error_code(
+                    [&] {
+                        Manifest m;
+                        m.set("way_postcodes.n", ids.size());
+                        m.set("way_postcodes.dict", c.manifest);
+                        side::DictDec dec(dir.path(), "way_postcodes", m);
+                        decode_all(dec);
+                    },
+                    c.error ? c.error : "");
+            },
+            20);
+
+        CHECK_EQ(status, c.error ? 2 : 0);
+    }
+}
+
+TEST(gcs_dictionary_encoder_writes_fewer_than_0xffff_values) {
+    // As gc's encoder: 0xFFFE distinct values (indexes 0 to 0xFFFD; 0xFFFF is
+    // NO_DATA) round trip through the decoder, and a 0xFFFF-th is rejected, as
+    // the decoders reject a dictionary of 0xFFFF values.
+    for (const uint32_t distinct : {0xFFFEu, 0xFFFFu}) {
+        ScratchDir dir("gcs-test");
+        std::vector<uint32_t> values{NO};
+        for (uint32_t v = 0; v < distinct; v++) values.push_back(3 * v);
+        const std::vector<uint8_t> bytes = u32s(values);
+        side::DictEnc enc(dir.path(), "way_postcodes");
+        enc.state = {1};
+
+        const int status = error_code(
+            [&] {
+                enc.write(0, bytes.data(), bytes.size());
+                const Manifest m = finish_all(enc);
+                side::DictDec dec(dir.path(), "way_postcodes", m);
+                if (decode_all(dec)[0] != bytes) throw std::runtime_error("decodes to other values");
+            },
+            "too many distinct values");
+
+        CHECK_EQ(status, distinct == 0xFFFE ? 0 : 2);
+    }
+}
+
 TEST(gcs_poi_round_trip_in_memory_and_by_planes) {
     // Blocks up to big_block() are laid out in memory, larger ones plane by
     // plane through positional writers (the open-ring relayout included):

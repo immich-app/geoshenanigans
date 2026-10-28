@@ -149,9 +149,15 @@ inline void encode_dict(const std::string& src, const std::string& out, const ch
 
 inline void decode_dict(const std::string& src, const std::string& out, const char* name, const Manifest& m) {
     const uint64_t n = m.num(std::string(name) + ".n");
+    // The dictionary holds the manifest's count of values, fewer than the u16 index's 0xFFFF:
+    // checked before it is read, so a malformed file can't make it any size.
+    const uint64_t nd = m.num(std::string(name) + ".dict");
+    if (nd >= 0xFFFF) die("%s: %llu dictionary values, past a u16 index", name, (unsigned long long)nd);
     std::vector<uint32_t> dict;
     {
         Reader d(src + "/" + name + ".dict", 1 << 20);
+        if (d.size() != 4 * nd) die("%s.dict size", name);
+        dict.reserve(size_t(nd));
         while (!d.eof()) dict.push_back(d.u32());
     }
     Reader r(src + "/" + name + ".u16");

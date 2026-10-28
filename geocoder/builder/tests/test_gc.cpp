@@ -8,6 +8,7 @@
 #include "gc_addr.h"
 #include "gc_gxc.h"
 #include "gc_poly.h"
+#include "gc_side.h"
 #include "gc_ways.h"
 
 #include <csignal>
@@ -661,6 +662,53 @@ TEST(gc_ways_decoders_refuse_a_way_starting_past_node_u32) {
             REQUIRE(recs.size() == size_t(12) * ways);
             CHECK_EQ(gcset::rd32(&recs[recs.size() - 12]), UINT32_MAX);
         }
+    }
+}
+
+// A dictionary family's .dict holds the manifest's count of values, fewer
+// than the u16 index's 0xFFFF, and is refused before it is read otherwise: a
+// value more than the manifest's, 0xFFFF values (as many as the manifest
+// says), and a sparse 64 MiB file under a dictionary of none (all read in,
+// before). Two values and three indexes decode, and so do 0xFFFE values.
+TEST(gc_dictionary_decoder_refuses_a_dict_past_the_manifest) {
+    struct Case {
+        const char* name;
+        uint64_t manifest, values;  // the manifest's dictionary count, the file's
+        uint64_t sparse_bytes;      // instead: a sparse file of these bytes
+        bool valid;
+    };
+    const Case cases[] = {
+        {"as encoded", 2, 2, 0, true},
+        {"a value more", 2, 3, 0, false},
+        {"0xFFFE values", 0xFFFE, 0xFFFE, 0, true},
+        {"0xFFFF values", 0xFFFF, 0xFFFF, 0, false},
+        {"64 MiB, none", 0, 0, uint64_t(64) << 20, false},
+    };
+    ScratchDir dir("gc-dict");
+    int n = 0;
+    for (const Case& c : cases) {
+        const std::string src = dir.path() + "/" + std::to_string(n++), out = src + "/out";
+        std::filesystem::create_directories(out);
+        std::vector<uint8_t> dict, index;
+        for (uint64_t v = 0; v < c.values; v++) put32(dict, uint32_t(100 + v));
+        write_bytes(src + "/way_postcodes.dict", dict);
+        if (c.sparse_bytes) std::filesystem::resize_file(src + "/way_postcodes.dict", c.sparse_bytes);
+        const std::vector<uint16_t> ids = c.manifest ? std::vector<uint16_t>{0, 1, 0xFFFF} : std::vector<uint16_t>{};
+        for (uint16_t x : ids) for (uint8_t b : le(x, 2)) index.push_back(b);
+        write_bytes(src + "/way_postcodes.u16", index);
+
+        const int status = exit_status_in_child(
+            [&] {
+                gcset::Manifest m;
+                m.set("way_postcodes.n", ids.size());
+                m.set("way_postcodes.dict", c.manifest);
+                gcset::side::decode_dict(src, out, "way_postcodes", m);
+                return 0;
+            },
+            20);
+
+        if (status != (c.valid ? 0 : 2)) std::printf("    %s: exit %d\n", c.name, status);
+        CHECK_EQ(status, c.valid ? 0 : 2);
     }
 }
 

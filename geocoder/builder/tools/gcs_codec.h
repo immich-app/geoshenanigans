@@ -476,16 +476,22 @@ struct U24Enc : Encoder {
     }
 };
 
-// <name>.u16 (index per value, 0xFFFF = NO_DATA) + <name>.dict (the distinct values, ascending).
+// <name>.u16 (index per value, 0xFFFF = NO_DATA) + <name>.dict (the distinct values, ascending;
+// fewer than 0xFFFF of them).
 struct DictDec : Decoder {
     uint64_t n, i = 0;
     std::vector<uint32_t> dict;
     std::unique_ptr<Reader> r;
     DictDec(const std::string& src, const std::string& nm, const Manifest& m) : Decoder(nm, 1) {
         n = m.num(nm + ".n");
+        // The dictionary holds the manifest's count of values, fewer than the u16 index's 0xFFFF:
+        // checked before it is read, so a malformed file can't make it any size.
+        const uint64_t nd = m.num(nm + ".dict");
+        if (nd >= 0xFFFF) die("%s: %llu dictionary values, past a u16 index", nm.c_str(), (unsigned long long)nd);
         {
             Reader d(src + "/" + nm + ".dict", 16 << 10);
-            dict.reserve(size_t(d.size() / 4));
+            if (d.size() != 4 * nd) die("%s.dict size", nm.c_str());
+            dict.reserve(size_t(nd));
             while (!d.eof()) dict.push_back(d.u32());
         }
         r.reset(new Reader(src + "/" + nm + ".u16", 32 << 10));
@@ -542,7 +548,8 @@ struct DictEnc : Encoder {
             size_t s = h(v) & (slots - 1);
             while (keys[s] != NO && keys[s] != v) s = (s + 1) & (slots - 1);
             if (keys[s] == NO) {
-                if (dict.size() >= 0xFFFF) die("%s: too many distinct values for a u16 index", name.c_str());
+                // Fewer than 0xFFFF values, as gc's encoder writes and both decoders take.
+                if (dict.size() + 1 >= 0xFFFF) die("%s: too many distinct values for a u16 index", name.c_str());
                 const uint16_t id = uint16_t(dict.size());
                 dict.push_back(v);
                 if (2 * dict.size() > slots) {
