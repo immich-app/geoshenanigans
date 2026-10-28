@@ -250,34 +250,71 @@ TEST(gc_address_decoders_refuse_a_footprint_count_past_u32) {
 
 // An escaped footprint (0x20) whose count fits the record's u32 but not the
 // file is refused as a truncated file before the reader's buffer grows to the
-// footprint's 16 GiB, which the child's capped address space can't hold. Both
-// decoders: points only and whole.
+// footprint's 16 GiB, which the child's capped address space can't hold: and
+// 2^30 vertices in a ten-byte payload (10 + 4 x 2^30 bytes, which a 32-bit
+// size_t wraps to the payload's 10). Both decoders: points only and whole.
 TEST(gc_address_decoders_refuse_a_footprint_past_the_end_before_reading_it) {
     ScratchDir dir("gc-addr-end");
     const std::string src = dir.path() + "/in", out = dir.path() + "/out";
     std::filesystem::create_directories(src);
     std::filesystem::create_directories(out);
     write_bytes(src + "/addr_points.col", std::vector<uint8_t>(24));
-    std::vector<uint8_t> bytes{0x20};
-    uv(bytes, 0xFFFFFFFF);
-    bytes.resize(bytes.size() + 30);
-    write_bytes(src + "/addr_vertices.abs2", bytes);
-    for (const bool whole : {false, true}) {
+    for (const auto& [count, payload] : {std::pair<uint64_t, size_t>{0xFFFFFFFF, 30}, {0x40000000, 10}}) {
+        std::vector<uint8_t> bytes{0x20};
+        uv(bytes, count);
+        bytes.resize(bytes.size() + payload);
+        write_bytes(src + "/addr_vertices.abs2", bytes);
+        for (const bool whole : {false, true}) {
+            const int status = exit_status_in_child(
+                [&] {
+#ifndef __SANITIZE_ADDRESS__
+                    struct rlimit as{size_t(4) << 30, size_t(4) << 30};
+                    setrlimit(RLIMIT_AS, &as);
+#endif
+                    gcset::Manifest m;
+                    m.set("addr.n", 1);
+                    if (whole) gcset::addr::decode(src, out, m);
+                    else gcset::addr::decode_points_only(src, m, out);
+                    return 0;
+                },
+                5);
+
+            if (status != 2)
+                std::printf("    count %llu, %s decode: exit %d\n", (unsigned long long)count, whole ? "whole" : "points-only", status);
+            CHECK_EQ(status, 2);
+        }
+    }
+}
+
+// A record of 2^30 vertices with a ten-byte addr_vertices.bin (10 + 4 x 2^30
+// bytes, which a 32-bit size_t wraps to the file's 10) is refused as a
+// truncated file by both encoders: in one pass and its vertices pass.
+TEST(gc_address_encoders_refuse_a_footprint_past_the_end_of_the_file) {
+    ScratchDir dir("gc-addr-enc-end");
+    const std::string src = dir.path() + "/in";
+    std::filesystem::create_directories(src);
+    std::vector<uint8_t> rec(20, 0);
+    put32(rec, 0);           // vertex_offset
+    put32(rec, 0x40000000);  // vertex_count
+    write_bytes(src + "/addr_points.bin", rec);
+    write_bytes(src + "/addr_vertices.bin", std::vector<uint8_t>(10));
+    for (const bool passes : {false, true}) {
+        const std::string out = dir.path() + (passes ? "/passes" : "/one");
+        std::filesystem::create_directories(out);
         const int status = exit_status_in_child(
             [&] {
-#ifndef __SANITIZE_ADDRESS__
-                struct rlimit as{size_t(4) << 30, size_t(4) << 30};
-                setrlimit(RLIMIT_AS, &as);
-#endif
                 gcset::Manifest m;
-                m.set("addr.n", 1);
-                if (whole) gcset::addr::decode(src, out, m);
-                else gcset::addr::decode_points_only(src, m, out);
+                if (passes) {
+                    gcset::want_files() = {"addr_points.bin"};
+                    gcset::addr::encode(src, out, m);
+                    gcset::want_files() = {"addr_vertices.bin"};
+                }
+                gcset::addr::encode(src, out, m);
                 return 0;
             },
             5);
 
-        if (status != 2) std::printf("    %s decode: exit %d\n", whole ? "whole" : "points-only", status);
+        if (status != 2) std::printf("    %s: exit %d\n", passes ? "two passes" : "one pass", status);
         CHECK_EQ(status, 2);
     }
 }

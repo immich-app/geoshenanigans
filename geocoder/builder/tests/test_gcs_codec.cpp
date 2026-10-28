@@ -502,13 +502,16 @@ TEST(gcs_addr_decoder_refuses_a_footprint_past_the_end_before_reading_it) {
     // An escaped footprint (tag 0x20) whose count fits the record's u32 but
     // not the file is refused as a truncated file, and the reader's buffer
     // never grows to the footprint: 4 MiB, or 16 GiB at the largest count
-    // (each case in a child whose address space can't hold that).
+    // (each case in a child whose address space can't hold that); and 2^30
+    // vertices in a ten-byte payload (10 + 4 x 2^30 bytes, which a 32-bit
+    // size_t wraps to the payload's 10).
     ScratchDir dir("gcs-test");
     write_bytes(dir.path() + "/addr_points.col", std::vector<uint8_t>(24));
-    for (const uint64_t count : {uint64_t(1) << 20, uint64_t(0xFFFFFFFF)}) {
+    for (const auto& [count, payload] :
+         {std::pair<uint64_t, size_t>{uint64_t(1) << 20, 30}, {0xFFFFFFFF, 30}, {0x40000000, 10}}) {
         std::vector<uint8_t> bytes{0x20};
         uv(bytes, count);
-        bytes.resize(bytes.size() + 30);
+        bytes.resize(bytes.size() + payload);
         write_bytes(dir.path() + "/addr_vertices.abs2", bytes);
         const int status = exit_status_in_child(
             [&] {
@@ -523,6 +526,47 @@ TEST(gcs_addr_decoder_refuses_a_footprint_past_the_end_before_reading_it) {
 
         if (status != 2) std::printf("    count %llu: exit %d\n", (unsigned long long)count, status);
         CHECK_EQ(status, 2);
+    }
+}
+
+TEST(gcs_encoders_refuse_a_unit_past_the_end_of_its_file) {
+    // A footprint, admin polygon or POI block of 2^30 vertices (10 + 4 x 2^30
+    // bytes, which a 32-bit size_t wraps to 10) whose file the patch gives as
+    // ten bytes: refused as those bytes come, not waited for while the queue
+    // takes the rest of the file.
+    ScratchDir dir("gcs-test");
+    const std::vector<uint8_t> ten(10, 0);
+    {
+        std::vector<uint8_t> rec(28, 0);
+        wr32(&rec[20], 0);
+        wr32(&rec[24], 0x40000000);
+        addr::Enc enc(dir.path(), rec.size());
+        enc.state = {1, 1};
+        enc.expect = {rec.size(), ten.size()};
+        enc.write(0, rec.data(), rec.size());
+
+        CHECK(throws_runtime([&] { enc.write(1, ten.data(), ten.size()); }, "runs past the end of input 1"));
+    }
+    {
+        std::vector<uint8_t> poly(24, 0);
+        wr32(&poly[4], 0x40000000);
+        write_bytes(dir.path() + "/admin_polygons.bin", poly);
+        poly::AdminEnc enc(dir.path());
+        enc.state = {1};
+        enc.expect = {ten.size()};
+
+        CHECK(throws_runtime([&] { enc.write(0, ten.data(), ten.size()); }, "runs past the end of input 0"));
+    }
+    {
+        std::vector<uint8_t> rec(36, 0);
+        wr32(&rec[8], 0);
+        wr32(&rec[12], 0x40000000);
+        poly::PoiEnc enc(dir.path());
+        enc.state = {1, 1};
+        enc.expect = {rec.size(), ten.size()};
+        enc.write(0, rec.data(), rec.size());
+
+        CHECK(throws_runtime([&] { enc.write(1, ten.data(), ten.size()); }, "runs past the end of input 1"));
     }
 }
 

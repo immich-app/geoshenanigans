@@ -120,6 +120,20 @@ struct Encoder {
         return true;
     }
     size_t peak(int port) const { return in[size_t(port)].peak; }
+    // The bytes of the unit at the front of the port's queue that a count sizes, head + count * item
+    // (checked_size.h): one past the end of the port's file (its size as the patch gives it) fails
+    // as its first bytes come, instead of the queue taking the rest of the file while it waits.
+    size_t unit_size(int port, uint64_t head, uint64_t count, uint64_t item) const {
+        const size_t p = size_t(port);
+        const uint64_t at = got[p] - in[p].size();
+        const uint64_t left = expect[p] == ~0ull ? ~0ull : expect[p] - std::min(at, expect[p]);
+        const auto n = checked_size(head, count, item, left);
+        if (!n)
+            die("%s: a unit of %llu + %llu x %llu bytes at %llu runs past the end of input %zu (%llu bytes left)", name.c_str(),
+                (unsigned long long)head, (unsigned long long)count, (unsigned long long)item, (unsigned long long)at, p,
+                (unsigned long long)left);
+        return *n;
+    }
     void require_empty() const {
         for (size_t p = 0; p < in.size(); p++)
             if (in[p].size()) die("%s: %zu bytes left over on input %zu", name.c_str(), in[p].size(), p);
@@ -925,7 +939,7 @@ struct Dec : Decoder {
             const uint64_t vcnt = A->uv();
             if (!vcnt || vcnt > 0xFFFFFFFFull) die("addr %llu: bad count", (unsigned long long)i);
             const uint8_t enc = *A->need(1);
-            const size_t size = 10 + size_t(vcnt) * (enc == 3 ? 8 : 4);
+            const size_t size = A->unit_size(10, vcnt, enc == 3 ? 8 : 4);
             rec[6] = uint32_t(vcnt);
             emit(0, rec, 28);
             emit(1, A->take(size), size);
@@ -1008,7 +1022,7 @@ struct Enc : Encoder {
                 if (V.size() < 1) return;
                 const uint8_t enc = V.data()[0];
                 if (enc > 3) die("addr_vertices: unknown encoding %u", enc);
-                size = 10 + size_t(vcnt) * (enc == 3 ? 8 : 4);
+                size = unit_size(1, 10, vcnt, enc == 3 ? 8 : 4);
                 if (V.size() < size) return;
             }
             if (i >= N) die("addr: more records than addr_points.bin's size gives");
@@ -1200,7 +1214,7 @@ struct AdminDec : Decoder {
         const uint8_t e = *R->need(1);
         if (e > 3) die("admin_vertices: bad encoding %u", e);
         const int w = e == 3 ? 4 : 2;
-        const size_t size = 10 + size_t(cnt) * 2 * size_t(w);
+        const size_t size = R->unit_size(10, cnt, 2 * uint64_t(w));
         pos += size;
         if (size <= big_block()) {
             const uint8_t* s = R->take(size);
@@ -1257,7 +1271,7 @@ struct AdminEnc : Encoder {
                 const uint8_t e = q.data()[0];
                 if (e > 3) die("admin_vertices: bad encoding %u", e);
                 w = e == 3 ? 4 : 2;
-                size = 10 + size_t(cnt) * 2 * size_t(w);
+                size = unit_size(0, 10, cnt, 2 * uint64_t(w));
                 in_poly = true;
                 k = 0;
             }
@@ -1402,6 +1416,7 @@ struct PoiDec : Decoder {
                                                        (unsigned long long)mono);
         const uint64_t bsize = mono_next - mono;
         if (bsize < 10) die("poi %llu: bad block size", (unsigned long long)i);
+        const size_t block = V->unit_size(bsize);
         const uint8_t* h = V->need(10);
         const uint8_t e = h[0], flag = h[1];
         if (e > 3 || flag > 1) die("poi %llu: bad block header", (unsigned long long)i);
@@ -1411,12 +1426,12 @@ struct PoiDec : Decoder {
         if (vt >= 0xFFFFFFFFull) die("poi_vertices offset overflow");
         wr32(rec + 8, uint32_t(vt));
         wr32(rec + 12, uint32_t(vc));
-        const size_t osz = 10 + size_t(vc) * 2 * size_t(w);
+        const uint64_t osz = 10 + vc * 2 * uint64_t(w);
         vt += osz;
         emit(0, rec, 36);
-        if (bsize <= big_block()) {
-            h = V->take(size_t(bsize));
-            uint8_t* o = emit_reserve(1, osz);
+        if (block <= big_block()) {
+            h = V->take(block);
+            uint8_t* o = emit_reserve(1, size_t(osz));
             memcpy(o, h, 10);
             o[1] = 0;
             planes_dec(h + 10, o + 10, c2, w);
@@ -1545,7 +1560,7 @@ struct PoiEnc : Encoder {
                 const uint8_t e = V.data()[0];
                 if (e > 3) die("poi_vertices: bad encoding %u", e);
                 w = e == 3 ? 4 : 2;
-                size = 10 + size_t(vc) * 2 * size_t(w);
+                size = unit_size(1, 10, vc, 2 * uint64_t(w));
                 if (size <= big_block() ? V.size() < size : V.size() < 10 + 2 * size_t(w)) return;
             }
             if (O->tell() >= 0xFFFFFFFFull) die("poi_vertices.bopen offset overflow");

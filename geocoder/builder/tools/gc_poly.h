@@ -88,7 +88,7 @@ static void admin_run(const std::string& polys_dir, const std::string& in, const
         const uint8_t e = *R.need(1);
         if (e > 3) die("admin_vertices: bad encoding %u", e);
         const int w = e == 3 ? 4 : 2;
-        const size_t size = 10 + size_t(p.cnt) * 2 * w;
+        const size_t size = R.unit_size(10, p.cnt, 2 * uint64_t(w));
         const uint8_t* s = R.take(size);
         blk.resize(size);
         memcpy(blk.data(), s, 10);
@@ -148,7 +148,7 @@ inline void encode_poi(const std::string& src, const std::string& out, Manifest&
             const uint8_t e = *V.need(1);
             if (e > 3) die("poi_vertices: bad encoding %u", e);
             const int w = e == 3 ? 4 : 2;
-            const size_t size = 10 + size_t(vc) * 2 * w;
+            const size_t size = V.unit_size(10, vc, 2 * uint64_t(w));
             const uint8_t* s = V.take(size);
             if (s[1] != 0) die("poi_vertices: non-zero pad byte at %llu", (unsigned long long)vexp);
             const uint8_t* first = s + 10;
@@ -219,7 +219,7 @@ inline void decode_poi(const std::string& src, const std::string& out, const Man
             if (mono != V.tell() || mono_next < mono) die("poi %llu: block offset %llu is not the stream position", (unsigned long long)i,
                                                           (unsigned long long)mono);
             const uint64_t bsize = mono_next - mono;
-            const uint8_t* h = V.take(size_t(bsize));
+            const uint8_t* h = V.take(V.unit_size(bsize));
             const uint8_t e = h[0], flag = h[1];
             if (e > 3 || flag > 1) die("poi %llu: bad block header", (unsigned long long)i);
             const int w = e == 3 ? 4 : 2;

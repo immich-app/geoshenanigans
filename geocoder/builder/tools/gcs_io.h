@@ -19,6 +19,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "checked_size.h"
+
 namespace gcs {
 
 [[noreturn]] inline void die(const char* fmt, ...);
@@ -165,6 +167,16 @@ struct Reader {
         return p;
     }
     inline void skip(size_t n) { take(n); }
+    // The bytes of the unit at the cursor that a count in the file sizes, head + count * item
+    // (checked_size.h): one past the end of the file fails as a truncated file before it is read.
+    size_t unit_size(uint64_t head, uint64_t count = 0, uint64_t item = 0) const {
+        const auto n = checked_size(head, count, item, left());
+        if (!n)
+            die("%s: unexpected end of file at %llu (need %llu + %llu x %llu bytes, %llu left)", path.c_str(),
+                (unsigned long long)tell(), (unsigned long long)head, (unsigned long long)count, (unsigned long long)item,
+                (unsigned long long)left());
+        return *n;
+    }
     inline uint8_t u8() { return *take(1); }
     inline uint16_t u16() { return rd16(take(2)); }
     inline uint32_t u32() { return rd32(take(4)); }

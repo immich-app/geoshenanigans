@@ -160,7 +160,7 @@ inline void encode_vertices_pass(const std::string& src, const std::string& out,
         const uint8_t* h = V.need(10);
         const uint8_t enc = h[0];
         if (enc > 3) die("addr_vertices: unknown encoding %u", enc);
-        const size_t size = 10 + size_t(vcnt) * (enc == 3 ? 8 : 4);
+        const size_t size = V.unit_size(10, vcnt, enc == 3 ? 8 : 4);
         const uint8_t* b = V.take(size);
         polys++;
         vexp += size;
@@ -244,7 +244,7 @@ inline void encode(const std::string& src, const std::string& out, Manifest& m) 
         const uint8_t* h = V.need(10);
         const uint8_t enc = h[0];
         if (enc > 3) die("addr_vertices: unknown encoding %u", enc);
-        const size_t size = 10 + size_t(vcnt) * (enc == 3 ? 8 : 4);
+        const size_t size = V.unit_size(10, vcnt, enc == 3 ? 8 : 4);
         const uint8_t* b = V.take(size);
         polys++;
         verts += vcnt;
@@ -323,7 +323,7 @@ inline void decode_points_only(const std::string& src, const Manifest& m, const 
                 const uint64_t vcnt = A.uv();
                 if (!vcnt || vcnt > 0xFFFFFFFFull) die("addr %llu: bad count", (unsigned long long)i);
                 const uint8_t enc = *A.need(1);
-                const size_t size = 10 + size_t(vcnt) * (enc == 3 ? 8 : 4);
+                const size_t size = A.unit_size(10, vcnt, enc == 3 ? 8 : 4);
                 A.skip(size);
                 rec[6] = uint32_t(vcnt);
                 raw += size;
@@ -380,7 +380,7 @@ inline void decode(const std::string& src, const std::string& out, const Manifes
                 const uint64_t vcnt = A.uv();
                 if (!vcnt || vcnt > 0xFFFFFFFFull) die("addr %llu: bad count", (unsigned long long)i);
                 const uint8_t enc = *A.need(1);
-                const size_t size = 10 + size_t(vcnt) * (enc == 3 ? 8 : 4);
+                const size_t size = A.unit_size(10, vcnt, enc == 3 ? 8 : 4);
                 V.put(A.take(size), size);
                 rec[6] = uint32_t(vcnt);
             } else {
