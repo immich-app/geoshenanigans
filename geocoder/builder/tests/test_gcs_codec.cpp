@@ -370,6 +370,44 @@ TEST(gcs_poi_round_trip_in_memory_and_by_planes) {
     }
 }
 
+TEST(gcs_poi_decoder_rejects_blocks_the_encoder_never_writes) {
+    // One POI record at offset 0 whose block is all of poi_vertices.bopen: a
+    // header without a stored vertex, with the closing flag (whose closing
+    // vertex would be copied from a vertex never decoded) or without it, and
+    // 2^32 stored vertices (a sparse file), more than the record's u32
+    // vertex_count holds. Rejected before the record is emitted; a block of
+    // one vertex decodes.
+    struct Case {
+        uint8_t flag;
+        uint64_t bytes;
+        const char* error;  // nullptr: decodes
+    };
+    const Case cases[] = {{0, 14, nullptr},
+                          {1, 10, "block with no stored vertex"},
+                          {0, 10, "block with no stored vertex"},
+                          {0, 10 + (uint64_t(4) << 32), "more vertices than a record holds"}};
+    for (const Case& c : cases) {
+        ScratchDir dir("gcs-test");
+        std::vector<uint8_t> rec = le(7, 8);
+        for (uint8_t b : le(0, 4)) rec.push_back(b);
+        rec.resize(32, 0);
+        write_bytes(dir.path() + "/poi_records.r3", rec);
+        write_bytes(dir.path() + "/poi_vertices.bopen", {0, c.flag});
+        std::filesystem::resize_file(dir.path() + "/poi_vertices.bopen", c.bytes);
+        Manifest m;
+        m.set("poi.n", 1);
+        poly::PoiDec dec(dir.path(), m);
+        dec.state = {1, 1};
+
+        if (!c.error) {
+            CHECK(decode_all(dec)[1].size() == 14);
+            continue;
+        }
+        CHECK(throws_runtime([&] { dec.step(); }, c.error));
+        CHECK(dec.out[0].size() == 0);
+    }
+}
+
 TEST(gcs_admin_round_trip_in_memory_and_by_planes) {
     // Blocks past the default big_block() (40000 x 8 B, 70000 x 4 B and
     // 33000 x 8 B) go plane by plane (the header through the sequential

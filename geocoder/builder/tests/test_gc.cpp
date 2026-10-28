@@ -7,6 +7,7 @@
 // encoding. (The patcher's decoders: tests/test_gcs_codec.cpp.)
 #include "gc_addr.h"
 #include "gc_gxc.h"
+#include "gc_poly.h"
 #include "gc_ways.h"
 
 #include <csignal>
@@ -752,4 +753,52 @@ TEST(gc_refuses_a_poi_offset_past_u32) {
 
     CHECK(!r.ok);
     CHECK(r.log.find("offset overflow") != std::string::npos);
+}
+
+// POI blocks the encoder never writes, each the one block of a one-record
+// encoded set: a header without a stored vertex, with the closing flag (whose
+// closing vertex would be copied from a vertex never decoded) or without it,
+// and 2^32 stored vertices (a sparse poi_vertices.bopen), more than the
+// record's u32 vertex_count holds. Refused before the block is read; a block
+// of one vertex decodes. The child's address space is capped: reading the
+// 16 GiB block runs out of it.
+TEST(gc_poi_decoder_refuses_blocks_the_encoder_never_writes) {
+    struct Case {
+        const char* name;
+        uint8_t flag;
+        uint64_t bytes;
+        bool valid;
+    };
+    const Case cases[] = {{"one vertex", 0, 14, true},
+                          {"closing flag, no stored vertex", 1, 10, false},
+                          {"no stored vertex", 0, 10, false},
+                          {"2^32 stored vertices", 0, 10 + (uint64_t(4) << 32), false}};
+    ScratchDir dir("gc-poi-blocks");
+    int n = 0;
+    for (const Case& c : cases) {
+        const std::string src = dir.path() + "/" + std::to_string(n++), out = src + "/out";
+        std::filesystem::create_directories(out);
+        std::vector<uint8_t> rec = le(7, 8);
+        put32(rec, 0);
+        rec.resize(32, 0);
+        write_bytes(src + "/poi_records.r3", rec);
+        write_bytes(src + "/poi_vertices.bopen", {0, c.flag});
+        std::filesystem::resize_file(src + "/poi_vertices.bopen", c.bytes);
+
+        const int status = exit_status_in_child(
+            [&] {
+#ifndef __SANITIZE_ADDRESS__
+                struct rlimit as{size_t(4) << 30, size_t(4) << 30};
+                setrlimit(RLIMIT_AS, &as);
+#endif
+                gcset::Manifest m;
+                m.set("poi.n", 1);
+                gcset::poly::decode_poi(src, out, m);
+                return 0;
+            },
+            20);
+
+        if (status != (c.valid ? 0 : 2)) std::printf("    %s: exit %d\n", c.name, status);
+        CHECK_EQ(status, c.valid ? 0 : 2);
+    }
 }

@@ -219,12 +219,18 @@ inline void decode_poi(const std::string& src, const std::string& out, const Man
             if (mono != V.tell() || mono_next < mono) die("poi %llu: block offset %llu is not the stream position", (unsigned long long)i,
                                                           (unsigned long long)mono);
             const uint64_t bsize = mono_next - mono;
-            const uint8_t* h = V.take(V.unit_size(bsize));
+            if (bsize < 10) die("poi %llu: bad block size", (unsigned long long)i);
+            const uint8_t* h = V.need(10);
             const uint8_t e = h[0], flag = h[1];
             if (e > 3 || flag > 1) die("poi %llu: bad block header", (unsigned long long)i);
             const int w = e == 3 ? 4 : 2;
-            if (bsize < 10 || (bsize - 10) % (2 * w)) die("poi %llu: bad block size", (unsigned long long)i);
+            if ((bsize - 10) % (2 * w)) die("poi %llu: bad block size", (unsigned long long)i);
             const uint64_t c2 = (bsize - 10) / (2 * w), vc = c2 + flag;
+            // The encoder stores every vertex but a closed ring's closing one (and a closed ring has 2 or
+            // more), so a block stores at least one, and vertex_count is a u32.
+            if (c2 == 0) die("poi %llu: block with no stored vertex", (unsigned long long)i);
+            if (vc > 0xFFFFFFFFull) die("poi %llu: block of more vertices than a record holds", (unsigned long long)i);
+            h = V.take(V.unit_size(bsize));
             if (vt >= 0xFFFFFFFFull) die("poi_vertices offset overflow");
             wr32(rec + 8, uint32_t(vt));
             wr32(rec + 12, uint32_t(vc));

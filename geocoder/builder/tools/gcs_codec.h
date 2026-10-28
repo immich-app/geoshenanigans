@@ -1423,6 +1423,10 @@ struct PoiDec : Decoder {
         const int w = e == 3 ? 4 : 2;
         if ((bsize - 10) % (2 * size_t(w))) die("poi %llu: bad block size", (unsigned long long)i);
         const uint64_t c2 = (bsize - 10) / (2 * size_t(w)), vc = c2 + flag;
+        // The encoder stores every vertex but a closed ring's closing one (and a closed ring has 2 or
+        // more), so a block stores at least one, and vertex_count is a u32.
+        if (c2 == 0) die("poi %llu: block with no stored vertex", (unsigned long long)i);
+        if (vc > 0xFFFFFFFFull) die("poi %llu: block of more vertices than a record holds", (unsigned long long)i);
         if (vt >= 0xFFFFFFFFull) die("poi_vertices offset overflow");
         wr32(rec + 8, uint32_t(vt));
         wr32(rec + 12, uint32_t(vc));
@@ -1451,11 +1455,6 @@ struct PoiDec : Decoder {
         big_flag = flag != 0;
         big_end = base + 2 * uint64_t(w) * c2;
         prev[0] = prev[1] = 0;
-        if (c2 == 0) {  // (a block of only its closing vertex can't be: the flag needs 2 vertices)
-            pl.clear();
-            V->seek(big_end);
-            next_record();
-        }
         return true;
     }
 };
