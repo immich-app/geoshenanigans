@@ -18,6 +18,7 @@
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <type_traits>
 #include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
@@ -386,8 +387,8 @@ static constexpr uint32_t SECONDARY_REMAP_MARKER = 0xFFFFFFF6;
 //     sent: n_runs u32, runs_size u32, the tier's shift runs
 //           (encode_string_tier_runs),
 //   n_pairs u32, (old u32, new u32) × n_pairs: surviving strings no tier's
-//     edit keeps, which changed tier or order (sorted by old), for every old
-//     tier the dir ships or references.
+//     edit keeps, which changed tier or order (ascending by old, each string
+//     once), for every old tier the dir ships or references.
 // A tier neither shipped nor referenced sends nothing: no lookup lands in it.
 static constexpr uint32_t STRINGS_TIERED_MARKER = 0xFFFFFFF6;
 
@@ -511,7 +512,9 @@ inline void close_patch_outputs(std::initializer_list<std::pair<FILE*, std::stri
 //   n_admin_pairs(4),    [(old_id:u32, new_id:u32)] × n_admin_pairs,
 //   n_street_pairs(4),   [(old_id:u32, new_id:u32)] × n_street_pairs,
 //   n_postcode_pairs(4), [(old_id:u32, new_id:u32)] × n_postcode_pairs.
-// Only entries where old_id != new_id are transmitted.
+// Only entries where old_id != new_id are transmitted, each leg ascending
+// by old_id, each id once; the patcher reads the legs where they sit
+// (parse_parent_id_remap).
 static constexpr uint32_t POI_PARENT_REMAP_MARKER = 0xFFFFFFF3;
 
 // --- Client file set (v4) ---
@@ -712,6 +715,112 @@ private:
     uint64_t id_ = 0;
     const char* what_ = "";
 };
+
+// The keys a SortedTable samples for its directory: 16 KiB at most.
+static constexpr size_t TABLE_DIRECTORY_KEYS = 4096;
+
+// n fixed-width records read where they sit, sorted strictly ascending by
+// the u32 each starts with. The constructor checks the order in one sweep,
+// refusing a step back or a repeated key as a malformed `what`, and samples
+// every step-th key into a directory, so a lookup searches one step of the
+// records.
+template <typename Rec>
+class SortedTable {
+    static_assert(std::is_trivially_copyable<Rec>::value && sizeof(Rec) >= sizeof(uint32_t), "a record starts with its u32 key");
+
+public:
+    SortedTable() = default;  // none
+    SortedTable(const char* data, size_t count, const char* what) : data_(data), count_(count) {
+        step_ = std::max<size_t>(1, (count + TABLE_DIRECTORY_KEYS - 1) / TABLE_DIRECTORY_KEYS);
+        directory_.reserve((count + step_ - 1) / step_);
+        for (size_t i = 0; i < count; i++) {
+            const uint32_t key = key_at(i);
+            if (i > 0 && key <= key_at(i - 1)) throw std::runtime_error(std::string("Malformed ") + what);
+            if (i % step_ == 0) directory_.push_back(key);
+        }
+    }
+
+    const char* data() const { return data_; }
+    size_t size() const { return count_; }
+    bool empty() const { return count_ == 0; }
+    Rec operator[](size_t i) const {
+        Rec r;
+        memcpy(&r, data_ + i * sizeof(Rec), sizeof(Rec));
+        return r;
+    }
+    template <typename OnRecord>
+    void for_each(OnRecord on_record) const {
+        for (size_t i = 0; i < count_; i++) on_record((*this)[i]);
+    }
+    // The record of `key`, if the table holds one. A table of at most
+    // TABLE_DIRECTORY_KEYS records keeps every key in its directory, so a
+    // lookup that misses reads none of its records.
+    std::optional<Rec> find(uint32_t key) const {
+        const size_t d = static_cast<size_t>(std::upper_bound(directory_.begin(), directory_.end(), key) - directory_.begin());
+        if (d == 0) return std::nullopt;
+        size_t at = (d - 1) * step_;
+        if (directory_[d - 1] != key) {
+            const size_t end = std::min(count_, at + step_);
+            at++;
+            for (size_t hi = end; at < hi;) {
+                const size_t mid = at + (hi - at) / 2;
+                if (key_at(mid) < key) at = mid + 1;
+                else hi = mid;
+            }
+            if (at == end || key_at(at) != key) return std::nullopt;
+        }
+        return (*this)[at];
+    }
+
+private:
+    uint32_t key_at(size_t i) const {
+        uint32_t key;
+        memcpy(&key, data_ + i * sizeof(Rec), sizeof key);
+        return key;
+    }
+
+    const char* data_ = nullptr;
+    size_t count_ = 0, step_ = 1;
+    std::vector<uint32_t> directory_;  // the key of every step_-th record
+};
+
+// An old id or string offset and its new one, as the patch carries remap
+// pairs: (old u32, new u32).
+struct RemapPair {
+    uint32_t from, to;
+};
+
+// The parent-id remap after its marker (POI_PARENT_REMAP_MARKER), where it
+// sits: the admin and street legs. The reserved postcode leg is skipped.
+struct ParentIdRemap {
+    SortedTable<RemapPair> admin, street;
+    uint32_t n_postcode = 0;
+};
+
+// Reads the section at data[pos, size) and advances pos past it.
+inline ParentIdRemap parse_parent_id_remap(const char* data, size_t size, size_t& pos) {
+    auto take = [&](uint64_t n) {
+        if (pos > size || n > size - pos) throw std::runtime_error("Truncated POI parent-id remap");
+        const char* p = data + pos;
+        pos += static_cast<size_t>(n);
+        return p;
+    };
+    auto count = [&] {
+        uint32_t n;
+        memcpy(&n, take(4), 4);
+        return n;
+    };
+    auto leg = [&] {
+        const uint32_t n = count();
+        return SortedTable<RemapPair>(take(uint64_t{n} * sizeof(RemapPair)), n, "POI parent-id remap");
+    };
+    ParentIdRemap r;
+    r.admin = leg();
+    r.street = leg();
+    r.n_postcode = count();
+    take(uint64_t{r.n_postcode} * sizeof(RemapPair));
+    return r;
+}
 
 // --- Cell index rebuild ---
 
@@ -1440,7 +1549,8 @@ void for_each_new_string(const char* old_pool, size_t old_size, const StringTier
 // doesn't hold can't: it trusts that every stored reference is a string start
 // or NO_DATA, which partition_strings_into_tiers guarantees and CI's byte
 // identity check proves daily. Surviving strings the edits don't keep (they
-// changed tier, or the POI tier's order moved them) are explicit pairs.
+// changed tier, or the POI tier's order moved them) are explicit pairs, read
+// where the patch holds them.
 //
 // Pairs are looked up first, but the order doesn't matter: a pair's old
 // offset starts a string its old tier's edit doesn't keep, runs cover only
@@ -1485,16 +1595,13 @@ public:
         }
         if (pos != size) malformed();
     }
-    void add_pair(uint32_t old_off, uint32_t new_off) { pairs_.push_back({old_off, new_off}); }
-    void finish() { std::sort(pairs_.begin(), pairs_.end()); }
+    // The moved strings' pairs (the strings section's, where it sits).
+    void set_pairs(SortedTable<RemapPair> pairs) { pairs_ = std::move(pairs); }
     bool empty() const { return runs_.empty() && pairs_.empty(); }
     size_t run_count() const { return runs_.size(); }
 
     uint32_t lookup(uint32_t off) const {
-        if (!pairs_.empty()) {
-            auto p = std::lower_bound(pairs_.begin(), pairs_.end(), std::make_pair(off, 0u));
-            if (p != pairs_.end() && p->first == off) return p->second;
-        }
+        if (const std::optional<RemapPair> p = pairs_.find(off)) return p->to;
         auto it = std::upper_bound(runs_.begin(), runs_.end(), off,
                                    [](uint32_t v, const Run& r) { return v < r.start; });
         if (it == runs_.begin()) return off;
@@ -1508,7 +1615,7 @@ private:
     // old_bytes: the run's bytes in the old pool, or nullptr for a sent run.
     struct Run { uint32_t start, end, shift; const char* old_bytes; };
     std::vector<Run> runs_;
-    std::vector<std::pair<uint32_t, uint32_t>> pairs_;
+    SortedTable<RemapPair> pairs_;
 };
 
 // The string tiers that the given fields of a record file reference, as a
@@ -1680,7 +1787,7 @@ struct StringsSection {
     uint32_t shipped = 0, sent = 0;
     std::array<StringTierDiff, STRING_TIER_COUNT> diffs;  // shipped tiers
     std::array<SentStringRuns, STRING_TIER_COUNT> runs;   // sent tiers
-    std::vector<std::pair<uint32_t, uint32_t>> pairs;
+    SortedTable<RemapPair> pairs;                         // moved strings, by old offset
     uint32_t old_size(int t) const { return old_base[t + 1] - old_base[t]; }
     uint32_t new_size(int t) const { return new_base[t + 1] - new_base[t]; }
 };
@@ -1688,10 +1795,10 @@ struct StringsSection {
 // Parses the section at data[pos, size) and advances pos past it.
 inline StringsSection parse_strings_section(const char* data, size_t size, size_t& pos) {
     auto malformed = [] { throw std::runtime_error("Malformed strings section"); };
-    auto take = [&](size_t n) {
+    auto take = [&](uint64_t n) {
         if (pos > size || n > size - pos) throw std::runtime_error("Truncated strings section");
         const char* p = data + pos;
-        pos += n;
+        pos += static_cast<size_t>(n);
         return p;
     };
     auto u32 = [&] { uint32_t v; memcpy(&v, take(4), 4); return v; };
@@ -1748,13 +1855,8 @@ inline StringsSection parse_strings_section(const char* data, size_t size, size_
         }
         indices(d.deleted, n_deleted);
     }
-    uint32_t n_pairs = u32();
-    const char* pairs = take((size_t)n_pairs * 8);
-    s.pairs.resize(n_pairs);
-    for (uint32_t i = 0; i < n_pairs; i++) {
-        memcpy(&s.pairs[i].first, pairs + (size_t)i * 8, 4);
-        memcpy(&s.pairs[i].second, pairs + (size_t)i * 8 + 4, 4);
-    }
+    const uint32_t n_pairs = u32();
+    s.pairs = SortedTable<RemapPair>(take(uint64_t{n_pairs} * sizeof(RemapPair)), n_pairs, "strings section");
     return s;
 }
 
@@ -1788,8 +1890,7 @@ void load_string_remap(const StringsSection& s, StringRemap& remap, OnShipped on
             on_shipped(t);
         }
     }
-    for (const auto& [a, b] : s.pairs) remap.add_pair(a, b);
-    remap.finish();
+    remap.set_pairs(s.pairs);
 }
 
 // --- Offset fixups ---

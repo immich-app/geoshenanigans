@@ -581,18 +581,14 @@ static int run(int argc, char* argv[]) {
     EntriesFileSections cell_index_deltas("cell index delta", CELL_INDEX_ENTRIES_FILES);
     struct CellCorr { uint64_t cell_id; std::vector<uint32_t> ids; };
     std::unordered_map<uint32_t, std::vector<CellCorr>> entry_corrections;
-    // POI parent-id remap (from POI_PARENT_REMAP_MARKER). Applied during
-    // POI_RECORDS MATCH replay to bytes 24/28/32 of each record alongside
-    // the str_remap on byte 16. Sorted by old_id for binary-search lookup.
-    std::vector<std::pair<uint32_t,uint32_t>> poi_admin_remap;
-    std::vector<std::pair<uint32_t,uint32_t>> poi_street_remap;
-    auto poi_remap_lookup = [](const std::vector<std::pair<uint32_t,uint32_t>>& v,
-                               uint32_t old_id) -> uint32_t {
-        if (v.empty()) return old_id;
-        auto it = std::lower_bound(v.begin(), v.end(),
-            std::make_pair(old_id, (uint32_t)0));
-        if (it != v.end() && it->first == old_id) return it->second;
-        return old_id;
+    // POI parent-id remap (from POI_PARENT_REMAP_MARKER), read where it sits.
+    // Applied during POI_RECORDS MATCH replay to byte 32 of each record
+    // alongside the str_remap on its string fields.
+    SortedTable<RemapPair> poi_admin_remap;
+    SortedTable<RemapPair> poi_street_remap;
+    auto poi_remap_lookup = [](const SortedTable<RemapPair>& t, uint32_t old_id) {
+        const std::optional<RemapPair> p = t.find(old_id);
+        return p ? p->to : old_id;
     };
 
     // Where each replayed file's merge sequence sits in the patch (v8 side
@@ -672,30 +668,12 @@ static int run(int argc, char* argv[]) {
             continue;
         }
         if (file_id == POI_PARENT_REMAP_MARKER) {
-            // Format: n_admin(u32), [(o,n):u32]*na, n_street(u32), [(o,n):u32]*ns,
-            //         n_postcode(u32), [(o,n):u32]*np
-            uint32_t na = ru32();
-            require_bytes((size_t)na * 8, "admin remap");
-            poi_admin_remap.resize(na);
-            for (uint32_t i = 0; i < na; i++) {
-                uint32_t o = ru32(), n = ru32();
-                poi_admin_remap[i] = {o, n};
-            }
-            uint32_t ns = ru32();
-            require_bytes((size_t)ns * 8, "street remap");
-            poi_street_remap.resize(ns);
-            for (uint32_t i = 0; i < ns; i++) {
-                uint32_t o = ru32(), n = ru32();
-                poi_street_remap[i] = {o, n};
-            }
-            // Reserved postcode leg — always 0 pairs on the wire; skip.
-            uint32_t np = ru32();
-            for (uint32_t i = 0; i < np; i++) { ru32(); ru32(); }
-            std::sort(poi_admin_remap.begin(), poi_admin_remap.end());
-            std::sort(poi_street_remap.begin(), poi_street_remap.end());
-            std::cerr << "  POI parent-id remap: admin_pairs=" << na
-                      << " street_pairs=" << ns
-                      << " postcode_pairs=" << np << std::endl;
+            ParentIdRemap r = parse_parent_id_remap(P, patch_size, pos);
+            poi_admin_remap = std::move(r.admin);
+            poi_street_remap = std::move(r.street);
+            std::cerr << "  POI parent-id remap: admin_pairs=" << poi_admin_remap.size()
+                      << " street_pairs=" << poi_street_remap.size()
+                      << " postcode_pairs=" << r.n_postcode << std::endl;
             continue;
         }
         if (file_id == CELL_INDEX_DELTA_MARKER) {
@@ -1198,7 +1176,7 @@ static int run(int argc, char* argv[]) {
         if (track && file_id == (uint32_t)PatchFileId::STREET_WAYS) {
             // The moved ways' pairs (parent-id remap, street leg) complete
             // the street remap the address replay reads.
-            for (const auto& [o, n] : poi_street_remap) remap.add_pair(o, n);
+            poi_street_remap.for_each([&](RemapPair p) { remap.add_pair(p.from, p.to); });
             remap.finish();
         }
         if (track) {
@@ -1462,7 +1440,8 @@ static int run(int argc, char* argv[]) {
             // The admin leg of the parent-id remap, as the diff used it.
             auto admin_remap = [&](uint32_t id) { return poi_remap_lookup(poi_admin_remap, id); };
             if (!stream_rebuild("Admin", PatchFileId::ADMIN_ENTRIES, "admin", admin_cells, admin_remap)) {
-                std::unordered_map<uint32_t,uint32_t> ad_rm(poi_admin_remap.begin(), poi_admin_remap.end());
+                std::unordered_map<uint32_t,uint32_t> ad_rm;
+                poi_admin_remap.for_each([&](RemapPair p) { ad_rm[p.from] = p.to; });
                 auto old_ac = read_file(cur_dir + "/admin_cells.bin");
                 auto old_adme = read_file(cur_dir + "/admin_entries.bin");
                 auto admin = rebuild_cells_from_remap(old_ac, old_adme, ad_rm, ids_vector(admin_cells.added),
