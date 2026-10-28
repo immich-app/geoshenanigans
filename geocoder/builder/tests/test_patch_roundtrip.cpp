@@ -16,12 +16,14 @@
 #include "patch_format.h"
 #include "scratch_dir.h"
 #include "test_framework.h"
+#include "tool_runs.h"
 #include "types.h"
 
 namespace {
 
-// A build dir's files by name.
-using BuildDir = std::map<std::string, std::vector<char>>;
+using gctest::BuildDir;
+using gctest::run;
+using gctest::write_dir;
 
 template <typename T>
 std::vector<char> bytes_of(const std::vector<T>& records) {
@@ -92,29 +94,6 @@ void put_cell_index(BuildDir& d, const std::string& prefix, const std::vector<ui
     auto [cells, entries] = write_cell_lists({{CELL, ids}});
     d[prefix + "_cells.bin"] = cells;
     d[prefix + "_entries.bin"] = entries;
-}
-
-bool write_dir(const std::string& path, const BuildDir& files) {
-    std::filesystem::create_directories(path);
-    for (const auto& [name, bytes] : files)
-        if (!write_file(path + "/" + name, bytes)) return false;
-    return true;
-}
-
-// s as one shell word.
-std::string quoted(const std::string& s) {
-    std::string out = "'";
-    for (char c : s) out += c == '\'' ? std::string("'\\''") : std::string(1, c);
-    return out + "'";
-}
-
-// Runs the words (in dir cwd when given) with their output appended to log;
-// true on exit status 0. Stdin is /dev/null: after a usage error zstd waits
-// for Enter at a console.
-bool run(const std::vector<std::string>& words, const std::string& log, const std::string& cwd = "") {
-    std::string cmd = cwd.empty() ? "" : "cd " + quoted(cwd) + " && ";
-    for (const auto& w : words) cmd += quoted(w) + " ";
-    return std::system((cmd + "< /dev/null >> " + quoted(log) + " 2>&1").c_str()) == 0;
 }
 
 // payload compressed as the diff compresses a patch, at path.
