@@ -1,6 +1,8 @@
 //! Memory-mapped search index: the fst and postings of each sub-index (places, optional POI),
 //! the boundary slots, and the geocoder index it points into. Loading reads only a small
 //! meta file and the ISO code list; everything else is mapped and paged in by queries.
+use crate::build::has_extra_names;
+use crate::constants::{BOUNDARY_FILE, META_FILE};
 use crate::entities::Entities;
 use crate::extras::Extras;
 use crate::model::*;
@@ -119,11 +121,10 @@ impl<'g> SearchIndex<'g> {
     /// decompressed extra-names file the index was built with, `iso` the ISO code list.
     pub fn open(geo: &'g Index, dir: &Path, extras: Option<&str>, iso: Option<&str>) -> Result<Self, String> {
         let meta: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(dir.join("search_meta.json")).map_err(|e| format!("search_meta.json: {e}"))?,
+            &std::fs::read_to_string(dir.join(META_FILE)).map_err(|e| format!("{META_FILE}: {e}"))?,
         )
         .map_err(|e| e.to_string())?;
-        let with_names = meta["extras"].as_bool().unwrap_or(false);
-        let extras = match (with_names, extras) {
+        let extras = match (has_extra_names(&meta), extras) {
             (true, Some(p)) => Some(Extras::open(p)?),
             (true, None) => return Err("index was built with extra names: pass the extra-names file".into()),
             _ => None,
@@ -138,7 +139,7 @@ impl<'g> SearchIndex<'g> {
             geo,
             places: SubIndex::open(dir, "places")?,
             poi,
-            ents: Entities { geo, n_place_nodes, bnd: Some(map(&dir.join("places.bnd"))?), extras },
+            ents: Entities { geo, n_place_nodes, bnd: Some(map(&dir.join(BOUNDARY_FILE))?), extras },
             iso: match iso {
                 Some(p) => Iso::load(Path::new(p), geo)?,
                 None => Iso::default(),

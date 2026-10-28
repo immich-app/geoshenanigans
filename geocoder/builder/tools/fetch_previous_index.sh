@@ -2,10 +2,12 @@
 # Usage: fetch_previous_index.sh <published build prefix> <dest dir> <status file>
 #
 # Fetches a published build's client files for patch generation: every file
-# but the .bin ones (never published) and the strategy-2 *.osm_ids sidecars
-# (the build fetches those itself, earlier). Each .bin.zst is decompressed as
-# it streams in, so the compressed copy never touches the disk: on a runner
-# whose disk is the bottleneck that is 2 x ~40 GB less I/O beside the build.
+# but the .bin ones (never published), the strategy-2 *.osm_ids sidecars
+# (the build fetches those itself, earlier) and the place search indexes
+# under <region>/search/ (no patches: clients rebuild them). Each .bin.zst is
+# decompressed as it streams in, so the compressed copy never touches the
+# disk: on a runner whose disk is the bottleneck that is 2 x ~40 GB less I/O
+# beside the build.
 # The build runs meanwhile, so this starts with it and the patch step waits
 # for <status file>, written last with the exit status.
 #
@@ -41,7 +43,7 @@ fetch() {
   local start keys
   start=$(date +%s)
   keys=$(s5cmd --endpoint-url "$S3_ENDPOINT" --retry-count 5 ls "$src/*" | awk '{print $NF}' \
-    | sed "s|^$src/||" | grep -v -E '\.(bin|osm_ids)$') || return 1
+    | sed "s|^$src/||" | grep -v -E '\.(bin|osm_ids)$|^[^/]+/search/') || return 1
   [ -n "$keys" ] || return 1
   # Each worker streams one object at a time; 16 of them fill the link.
   printf '%s\n' "$keys" | xargs -r -P 16 -I{} bash -c 'fetch_one "$1"' _ {} || return 1

@@ -50,6 +50,24 @@ pub struct Found<'g> {
     pub ctx: Rc<Ctx<'g>>,
 }
 
+impl Found<'_> {
+    /// The result as callers get it: the name that matched, the point, the state as admin1name,
+    /// the county (else the district) as admin2name, the country and the type.
+    pub fn to_json(&self) -> serde_json::Value {
+        let c = &self.ctx;
+        serde_json::json!({
+            "name": self.name,
+            "latitude": self.lat,
+            "longitude": self.lng,
+            "admin1name": c.state,
+            "admin2name": if !c.county.is_empty() { c.county } else { c.district },
+            "country": c.country,
+            "country_code": std::str::from_utf8(&c.cc).unwrap_or(""),
+            "type": self.typ,
+        })
+    }
+}
+
 #[derive(Default, Debug, Clone, Copy)]
 pub struct QueryStats {
     pub reverse_lookups: usize,

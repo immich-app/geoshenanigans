@@ -47,14 +47,19 @@ MAX_THREADS_PER_FILE = 16
 # (test-portal).
 LOAD_SIDECARS = {"strings_layout.json", "poi_meta.json"}
 
+# Every file under a region's search/ dir is a place search index file
+# (build_search_indexes.py), published like the .bin files.
+SEARCH_DIR = "search"
+
 
 def index_files(out):
     found = []
     for root, _, names in os.walk(out):
+        in_search = SEARCH_DIR in os.path.relpath(root, out).split(os.sep)
         for name in names:
             # Strategy-2 sidecars (*.osm_ids) stay uncompressed: they're cached
             # only and the next build's IdAllocator reads them directly.
-            if name.endswith(".bin") or name in LOAD_SIDECARS:
+            if name.endswith(".bin") or name in LOAD_SIDECARS or (in_search and not name.endswith(".zst")):
                 found.append(os.path.join(root, name))
     return sorted(found, key=lambda p: (-os.path.getsize(p), p))
 

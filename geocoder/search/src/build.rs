@@ -13,6 +13,7 @@ use crate::model::*;
 use crate::normalize::{join, tokens, transliterate};
 use memmap2::Mmap;
 use query_server::{AdminPolygon, Index, PlaceNode, PoiRecord, NO_DATA};
+use serde_json::json;
 use std::collections::{BinaryHeap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
@@ -32,6 +33,23 @@ pub struct BuildOpts {
     pub area_proxy: bool,
     /// POIs of tiers above this are left out (3 = all).
     pub poi_max_tier: u8,
+}
+
+impl BuildOpts {
+    /// The index as it ships: one thread, the default sort budget, inline postings, every POI tier,
+    /// nothing beyond the geocoder files.
+    pub fn new(tmp: PathBuf) -> Self {
+        BuildOpts {
+            threads: 1,
+            mem_mb: DEFAULT_RUN_BUDGET_MB,
+            tmp,
+            inline: true,
+            extras: None,
+            imp_dir: None,
+            area_proxy: false,
+            poi_max_tier: 3,
+        }
+    }
 }
 
 #[derive(Default, Debug)]
@@ -931,7 +949,7 @@ pub fn sort_keys(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Resul
     let src = if name == "poi" {
         Source::Poi(PoiSource::new(geo, opts, extras.as_ref()).map_err(|e| e.to_string())?)
     } else {
-        let s = PlacesSource::new(geo, opts, extras.as_ref(), &out.join("places.bnd")).map_err(|e| e.to_string())?;
+        let s = PlacesSource::new(geo, opts, extras.as_ref(), &out.join(BOUNDARY_FILE)).map_err(|e| e.to_string())?;
         st.add("place nodes", s.n_place_nodes);
         st.add("boundary slots", s.n_slots);
         st.add("boundary slots linked", s.n_linked);
@@ -1090,7 +1108,7 @@ pub fn merge(mut runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, S
     st.add("bytes post", size("post"));
     st.add("bytes pfx", size("pfx.fst") + size("pfx"));
     if name != "poi" {
-        st.add("bytes bnd", std::fs::metadata(out.join("places.bnd")).map(|m| m.len()).unwrap_or(0));
+        st.add("bytes bnd", std::fs::metadata(out.join(BOUNDARY_FILE)).map(|m| m.len()).unwrap_or(0));
     }
     st.add("time sources s", format!("{:.2}", t_src.as_secs_f64()));
     st.add("time keys+runs s", format!("{:.2}", t_keys.as_secs_f64()));
@@ -1100,16 +1118,50 @@ pub fn merge(mut runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, S
     Ok(st)
 }
 
+/// The sub-indexes of `selected` that `geo` has records for: POIs only where it has them.
+pub fn held_subs(geo: &Index, selected: &[&'static str]) -> Vec<&'static str> {
+    selected.iter().copied().filter(|&s| s != "poi" || geo.poi_records.is_some()).collect()
+}
+
+/// The META_FILE fields of an index of `geo` built with `opts`: what `SearchIndex::open` reads
+/// and the options it was built with.
+pub fn index_meta(geo: &Index, opts: &BuildOpts) -> serde_json::Map<String, serde_json::Value> {
+    let n_place_nodes = geo.place_nodes.as_ref().map_or(0, record_count::<PlaceNode>);
+    [
+        ("n_place_nodes", json!(n_place_nodes)),
+        ("extras", json!(opts.extras.is_some())),
+        ("inline", json!(opts.inline)),
+        ("imp", json!(opts.imp_dir.is_some())),
+        ("area_proxy", json!(opts.area_proxy)),
+        ("poi_max_tier", json!(opts.poi_max_tier)),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect()
+}
+
+/// Whether the index whose META_FILE is `meta` was built with extra names (`index_meta`): one
+/// `SearchIndex::open` reads only with their file.
+pub fn has_extra_names(meta: &serde_json::Value) -> bool {
+    meta["extras"].as_bool().unwrap_or(false)
+}
+
 /// Builds the sub-indexes `subs` of `geo` for the index directory `out`, the value `meta` gives
 /// with each one's stats becoming its search_meta.json. Every file is written into a staging
 /// directory and moved into `out` only once all of them are complete, search_meta.json last
 /// (`publish`): a failed build or move leaves `out` as it was. The build holds `out` from before
-/// `meta` runs until it has cleaned up (`lock_index_dir`). Returns the stats; an error, before
-/// anything is built, while another build holds `out`, when `meta` fails, or while files a failed
-/// publish could not put back are still aside.
+/// `meta` runs until it has cleaned up (`HeldIndexDir`). Returns the stats; an error, before
+/// anything is built, while another build or an open holds `out`, when `meta` fails, or while
+/// files a failed publish could not put back are still aside.
 pub fn build_all(geo: &Index, subs: &[&str], out: &Path, opts: &BuildOpts,
                  meta: impl FnOnce() -> Result<serde_json::Value, String>) -> Result<Vec<(String, Stats)>, String> {
-    let _held = lock_index_dir(out)?;
+    build_held(geo, subs, &HeldIndexDir::take(out, Contended::Fail)?, opts, meta)
+}
+
+/// `build_all` into an index directory already held.
+pub fn build_held(geo: &Index, subs: &[&str], out: &HeldIndexDir, opts: &BuildOpts,
+                  meta: impl FnOnce() -> Result<serde_json::Value, String>) -> Result<Vec<(String, Stats)>, String> {
+    let out = out.path.as_path();
     let meta = meta()?;
     let stage = out.join(BUILD_STAGE_DIR);
     if holds_replaced(&stage) {
@@ -1126,18 +1178,46 @@ pub fn build_all(geo: &Index, subs: &[&str], out: &Path, opts: &BuildOpts,
     built
 }
 
-/// An exclusive lock on the directory `out` itself (no lock file is left in the index), held
-/// until the returned handle is dropped or the process exits. Every build takes it, so builds
-/// into one index directory never share its search_meta.json, staging or temp directories. An
-/// error, at once, while another build holds it.
-fn lock_index_dir(out: &Path) -> Result<File, String> {
-    std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
-    let dir = File::open(out).map_err(|e| format!("{}: {e}", out.display()))?;
-    match dir.try_lock() {
-        Ok(()) => Ok(dir),
-        Err(std::fs::TryLockError::WouldBlock) => Err(format!("{}: another build is using this index directory", out.display())),
-        Err(std::fs::TryLockError::Error(e)) => Err(format!("lock {}: {e}", out.display())),
+/// What taking an index directory does while another holder has it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Contended {
+    /// Fails at once.
+    Fail,
+    /// Waits until it is released.
+    Wait,
+}
+
+/// An index directory held: an exclusive lock on the directory itself (no lock file is left in
+/// the index), released when dropped or when the process exits. Every build takes it, and
+/// `dataset::open` through its open, so builds into one index directory never share its
+/// search_meta.json, staging or temp directories, and no open reads or clears files a build
+/// is writing.
+pub struct HeldIndexDir {
+    path: PathBuf,
+    _lock: File,
+}
+
+impl HeldIndexDir {
+    pub fn take(path: &Path, contended: Contended) -> Result<HeldIndexDir, String> {
+        std::fs::create_dir_all(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let dir = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        match contended {
+            Contended::Fail => dir.try_lock().map_err(|e| match e {
+                std::fs::TryLockError::WouldBlock => format!("{}: another build or open is using this index directory", path.display()),
+                std::fs::TryLockError::Error(e) => format!("lock {}: {e}", path.display()),
+            }),
+            Contended::Wait => dir.lock().map_err(|e| format!("lock {}: {e}", path.display())),
+        }?;
+        Ok(HeldIndexDir { path: path.to_path_buf(), _lock: dir })
     }
+}
+
+/// Whether a publish into `out` did not finish: one cut off while it moved its files in, or that
+/// failed to put back the files it replaced, leaves its aside dir (made before its first move,
+/// removed after its last). `out` may then hold some of its files beside some of the index it
+/// replaced, under the META_FILE of either.
+pub fn has_unfinished_publish(out: &Path) -> bool {
+    out.join(BUILD_STAGE_DIR).join(BUILD_ASIDE_DIR).exists()
 }
 
 /// Whether a publish that failed to put files back left the files they replaced in `stage`.
@@ -1159,7 +1239,7 @@ fn build_staged(geo: &Index, subs: &[&str], stage: &Path, opts: &BuildOpts, mut 
         meta[s.as_str()] = st.lines.iter().map(|(k, v)| (k.clone(), serde_json::json!(v))).collect::<serde_json::Map<_, _>>().into();
     }
     let text = serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?;
-    std::fs::write(stage.join("search_meta.json"), text).map_err(|e| e.to_string())?;
+    std::fs::write(stage.join(META_FILE), text).map_err(|e| e.to_string())?;
     Ok(stats)
 }
 
@@ -1168,7 +1248,7 @@ fn build_staged(geo: &Index, subs: &[&str], stage: &Path, opts: &BuildOpts, mut 
 /// a file that cannot be put back stays aside (the error names the directory).
 fn publish(stage: &Path, out: &Path, rename: impl Fn(&Path, &Path) -> std::io::Result<()>) -> std::io::Result<()> {
     let mut names = std::fs::read_dir(stage)?.map(|e| e.map(|e| e.file_name())).collect::<std::io::Result<Vec<_>>>()?;
-    names.sort_by_key(|n| (n == "search_meta.json", n.clone()));
+    names.sort_by_key(|n| (n == META_FILE, n.clone()));
     let aside = stage.join(BUILD_ASIDE_DIR);
     std::fs::create_dir(&aside)?;
     // (name, whether it replaced a file of `out`)
@@ -1205,7 +1285,7 @@ fn publish(stage: &Path, out: &Path, rename: impl Fn(&Path, &Path) -> std::io::R
 
 /// A partial rebuild must keep the extra-name source required by retained sub-indexes.
 pub fn check_retained_names(out: &Path, building: &[&str], with_extras: bool) -> Result<(), String> {
-    let text = match std::fs::read_to_string(out.join("search_meta.json")) {
+    let text = match std::fs::read_to_string(out.join(META_FILE)) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.to_string()),
@@ -1213,7 +1293,7 @@ pub fn check_retained_names(out: &Path, building: &[&str], with_extras: bool) ->
     let meta: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     for name in ["places", "poi"] {
         if !building.contains(&name) && out.join(format!("{name}.fst")).exists()
-            && meta["extras"].as_bool().unwrap_or(false) != with_extras {
+            && has_extra_names(&meta) != with_extras {
             return Err(format!("retained {name} sub-index uses a different extra-name setting; rebuild with --sub all or the same --extras setting"));
         }
     }
@@ -1891,8 +1971,8 @@ mod tests {
     fn a_failed_publish_puts_back_what_it_replaced() {
         let dir = tmp_dir("publish");
         let (stage, out) = (dir.join("stage"), dir.join("out"));
-        for (d, file, text) in [(&stage, "a", "new a"), (&stage, "b", "new b"), (&stage, "search_meta.json", "new meta"),
-                                (&out, "a", "old a"), (&out, "search_meta.json", "old meta")] {
+        for (d, file, text) in [(&stage, "a", "new a"), (&stage, "b", "new b"), (&stage, META_FILE, "new meta"),
+                                (&out, "a", "old a"), (&out, META_FILE, "old meta")] {
             std::fs::create_dir_all(d).unwrap();
             std::fs::write(d.join(file), text).unwrap();
         }
@@ -1917,6 +1997,28 @@ mod tests {
         assert_eq!(contents(&out), before);
         assert!(!stage.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_publish_is_unfinished_from_its_first_move_to_its_last() {
+        let out = tmp_dir("unfinished");
+        let stage = out.join(BUILD_STAGE_DIR);
+        for (d, file) in [(&stage, "a"), (&stage, "b"), (&stage, META_FILE), (&out, "a"), (&out, META_FILE)] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join(file), file).unwrap();
+        }
+        // Whether the publish reads as unfinished at each of its moves.
+        let seen = std::cell::RefCell::new(Vec::new());
+        let rename = |from: &Path, to: &Path| {
+            seen.borrow_mut().push(has_unfinished_publish(&out));
+            std::fs::rename(from, to)
+        };
+
+        publish(&stage, &out, rename).unwrap();
+
+        assert_eq!(*seen.borrow(), [true; 6]);
+        assert!(!has_unfinished_publish(&out));
+        let _ = std::fs::remove_dir_all(&out);
     }
 
     #[test]
@@ -2017,7 +2119,7 @@ mod tests {
         std::fs::write(dir.join("places.fst"), []).unwrap();
         std::fs::write(dir.join("poi.fst"), []).unwrap();
         for old in [false, true] {
-            std::fs::write(dir.join("search_meta.json"), format!("{{\"extras\":{old}}}")).unwrap();
+            std::fs::write(dir.join(META_FILE), format!("{{\"extras\":{old}}}")).unwrap();
             assert!(check_retained_names(&dir, &["poi"], !old).is_err());
             assert!(check_retained_names(&dir, &["places"], !old).is_err());
             assert!(check_retained_names(&dir, &["poi"], old).is_ok());

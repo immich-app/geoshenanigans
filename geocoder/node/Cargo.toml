@@ -10,6 +10,7 @@ crate-type = ["cdylib"]
 napi = { version = "2", default-features = false, features = ["napi8"] }
 napi-derive = "2"
 query-server = { path = "../server" }
+place-search = { path = "../search" }
 
 [build-dependencies]
 napi-build = "2"

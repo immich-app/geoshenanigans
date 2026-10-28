@@ -65,6 +65,24 @@ pub const ORD_BOUNDARY_NAME: u8 = 14;
 pub const BOUNDARY_MIN_LEVEL: u8 = 2;
 pub const BOUNDARY_MAX_LEVEL: u8 = 8;
 
+// ---- files
+/// The index's dir inside the dataset dir it belongs to (where packs that ship one put it).
+pub const DATASET_SEARCH_DIR: &str = "search";
+/// What an index was built from (options, sub-index stats, the dataset's file hashes); written last.
+pub const META_FILE: &str = "search_meta.json";
+/// The META_FILE field that holds the dataset's file hashes (dataset.rs).
+pub const META_DATASET_KEY: &str = "dataset";
+/// The sub-indexes an index can hold, in build order.
+pub const SUB_INDEXES: &[&str] = &["places", "poi"];
+/// The files `<sub>.<ext>` of each sub-index: its keys, their postings and its prefix table.
+pub const SUB_INDEX_EXTS: [&str; 4] = ["fst", "post", "pfx.fst", "pfx"];
+/// The boundary slots of the places sub-index.
+pub const BOUNDARY_FILE: &str = "places.bnd";
+/// Hashes of the dataset files beside an index, with the stat each was taken at (not shipped).
+pub const HASH_CACHE_FILE: &str = "dataset_hashes.json";
+/// Read buffer for hashing a dataset file.
+pub const HASH_READ_BUFFER: usize = 256 * 1024;
+
 // ---- build
 /// Default memory for sort runs (all threads together). At 16 the build fits a 32 MiB cgroup for
 /// every set (peak anonymous 13-24 MiB, minimal to max); 64 measured no faster on one core.

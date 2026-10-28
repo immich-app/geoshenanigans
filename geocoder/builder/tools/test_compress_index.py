@@ -39,6 +39,8 @@ class CompressIndexTest(unittest.TestCase):
             "planet/no-addresses/geo_cells.bin": content(1),
             "planet/full/strings_layout.json": b'{"tiers": []}',
             "planet/full/addr_points.bin": content(2),
+            "planet/search/full/q2.5/all/places.fst": content(4),
+            "planet/search/full/q2.5/all/search_meta.json": b'{"dataset": {}}',
         }
         for rel, data in self.files.items():
             write(os.path.join(self.out, rel), data)

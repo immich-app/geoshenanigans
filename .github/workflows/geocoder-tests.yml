@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - "geocoder/builder/**"
+      - "geocoder/node/**"
+      - "geocoder/search/**"
       - "geocoder/server/**"
       - ".github/workflows/geocoder-tests.yml"
 
@@ -105,3 +107,37 @@ jobs:
         run: |
           cd geocoder/server
           cargo test --release
+
+  search-tests:
+    name: Place search unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+      - name: Test
+        run: |
+          cd geocoder/search
+          cargo test --release --locked
+
+  node-tests:
+    name: Node binding tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: geocoder/node/.nvmrc
+      - name: Build + test
+        run: |
+          cd geocoder/node
+          cargo build --release --locked
+          node --test test/*.test.mjs

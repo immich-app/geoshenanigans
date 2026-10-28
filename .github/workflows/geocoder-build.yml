@@ -161,6 +161,23 @@ jobs:
             geocoder/builder/tools/ci_build_tools.sh geocoder/builder/build .tools-cache "$GITHUB_WORKSPACE/.s2-prefix" \
             > "$RUNNER_TEMP/tools.log" 2>&1 < /dev/null &
 
+      # place-search, for the place search indexes the bigger packs ship
+      # (Build place search indexes): compiled beside Setup and the downloads
+      # like the tools, detached so it outlives this step.
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+
+      - name: Build place search
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          # The inner script expands its own arguments ($0 is the status file).
+          # shellcheck disable=SC2016
+          setsid nohup bash -c '"$@"; echo $? > "$0"' "$RUNNER_TEMP/search.status" \
+            cargo build --release --locked --manifest-path geocoder/search/Cargo.toml \
+            > "$RUNNER_TEMP/search.log" 2>&1 < /dev/null &
+
       - name: Setup
         id: setup
         env:
@@ -693,6 +710,31 @@ jobs:
 
           df -h "$WORKDIR" | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # ── Place search indexes ──────────────────────────────────────
+      # The selections configurations.json ships them for (search_index), in
+      # every region, from the .bin files just built; compression publishes
+      # them with the rest. A failed one is left out (its clients build theirs
+      # on the device) and fails the run once the data is up.
+      - name: Build place search indexes
+        env:
+          WORKDIR: ${{ steps.setup.outputs.workdir }}
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          WAIT_START=$(date +%s)
+          until [ -s "$RUNNER_TEMP/search.status" ] || [ $(( $(date +%s) - WAIT_START )) -gt 1800 ]; do
+            sleep 5
+          done
+          START=$(date +%s)
+          if [ "$(cat "$RUNNER_TEMP/search.status" 2> /dev/null)" != 0 ]; then
+            tail -40 "$RUNNER_TEMP/search.log"
+            echo "::error::Building place-search failed; no place search indexes"
+            echo "SEARCH_INDEX_FAILED=1" >> "$GITHUB_ENV"
+          elif ! python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/build_search_indexes.py" "$WORKDIR/output" \
+              "$GITHUB_WORKSPACE/geocoder/search/target/release/place-search"; then
+            echo "SEARCH_INDEX_FAILED=1" >> "$GITHUB_ENV"
+          fi
+          echo "Place search indexes done in $(($(date +%s) - START))s"
+
       # ── Generate patches + verify ─────────────────────────────────
       - name: Generate patches and verify
         if: steps.setup.outputs.has_previous == 'true'
@@ -841,6 +883,9 @@ jobs:
             echo "Compression done in $(($(date +%s) - COMPRESS_START))s"
           fi
           find "$WORKDIR/output" -name "*.bin" -delete
+          # The place search index files, but for search_meta.json, which
+          # stays beside its .zst like the other JSON files.
+          find "$WORKDIR/output" -path "*/search/*" -type f ! -name "*.zst" ! -name "*.json" -delete
           ZST_COUNT=$(find "$WORKDIR/output" -name "*.bin.zst" | wc -l)
           echo "$ZST_COUNT .bin.zst files produced"
 
@@ -1153,6 +1198,12 @@ jobs:
       # earlier. This lets compress + upload run first so the dated
       # build + individual file-level mismatch reports are all uploaded
       # before the workflow goes red.
+      - name: Fail run on place search index failure
+        if: env.SEARCH_INDEX_FAILED == '1'
+        run: |
+          echo "::error::Place search indexes failed — see Build place search indexes"
+          exit 1
+
       - name: Fail run on patch verify failure
         if: env.PATCH_VERIFY_FAILED == '1'
         run: |

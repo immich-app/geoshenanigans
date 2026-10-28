@@ -226,6 +226,55 @@ Dirs patched on different days don't fit together: the server combines a
 mode dir with a quality or poi dir by global string offsets, so the selected
 dirs must all be patched to the same date and swapped in together.
 
+## Place search index
+
+The place search index (`geocoder/search`) points into a selection's own
+files by record index and string offset, so it answers right only beside the
+exact files it was built from. Its `search_meta.json` records the sha256 of
+each of them (`dataset`: admin_polygons, admin_vertices, place_nodes,
+poi_records, strings_core, strings_layout.json, strings_poi), and the binding
+(`openPlaceSearch`) uses an index only while the files beside it hash the
+same. Any other index, or none, is built there from the files first, on one
+thread, within 32 MiB.
+
+- **Shipped**: the selections in `search_index.shipped` of
+  `configurations.template.json` publish their index in every region under
+  `{region}/search/{mode}/{quality}/{poi_tier}/`, with size and sha256 like
+  every other file; a client downloads it into `<dataset>/search/`.
+- **Built on the device**: every other selection, the first time place search
+  opens.
+- **Never patched**: the index sits outside the variant dirs (the patcher
+  never lists a dir, and `generate_patches.sh` only diffs dirs holding `.bin`
+  files), and a patched dataset no longer matches the hashes, so the next
+  open rebuilds it beside the patched files. The patcher writes into an
+  empty dir, so `search/` stays with the old files: moved beside the new
+  ones or not, the next open builds the index.
+
+A selection ships the index when it adds at most 5% (zstd) to the selection's
+planet pack. That holds for the two full-mode selections only. Measured on
+planet 2026-10-18 (stack/10), pack sizes from the published 2026-10-26 build.
+Device build is the binding's open building it on one thread, in 32 MiB the
+same build in a 32 MiB cgroup (2026-10-19), both on a busy box:
+
+| Selection | Pack | Index | Adds | Ships | Device build | In 32 MiB |
+|-----------|------|-------|------|-------|--------------|-----------|
+| smallest (admin-minimal) | 217.4 MiB | 36.6 MiB | +16.8% | no | 10 s | 12 s |
+| recommended (admin + q2.5 + poi/major) | 547.5 MiB | 61.0 MiB | +11.1% | no | 17 s | 20 s |
+| with-addresses (full + q2.5 + poi/all) | 10,510 MiB | 412.0 MiB | +3.9% | yes | 135 s | 205 s |
+| max-quality (full + uncapped + poi/all) | 11,686 MiB | 411.9 MiB | +3.5% | yes | 131 s | 219 s |
+
+A shipped selection ships it in every region: from +1.4% (north-america,
+54.1 MiB) to +11.2% (africa, 21.8 MiB) of the regional pack.
+
+Why the index is rebuilt rather than patched, measured from 2026-10-18 to
+10-19 on planet with-addresses: 17.7% of the place keys and 98% of the POI
+keys change postings (POI record indexes shift every day), so every index
+file changes. A zstd -18 `--patch-from` delta of the files is 382.4 MiB,
+against 412.0 MiB to download the new index and 4.5 MiB for the selection's
+v8 data patch that day; applying the delta also needs memory for the whole
+old file (1.0 GB for poi.fst). Rebuilding costs no download and two to three
+and a half minutes of one core.
+
 ## Patch Format (.gcpatch, version 9)
 
 Whole file is zstd-compressed for transport. Internal structure (all integers

@@ -1,12 +1,16 @@
 //! place-search build <set dir> <index dir> [--sub places|poi|all] [--threads N] [--mem-mb M]
 //!                    [--tmp DIR] [--no-inline] [--extras extra_names.bin] [--imp DIR] [--area-proxy]
 //!                    [--poi-max-tier 1|2|3]
+//!   search_meta.json records the set's files (dataset.rs): the index belongs to that set alone,
+//!   so --sub builds only over an index of the same files, and files replaced since the set was
+//!   loaded fail the build
 //! place-search pack-extras <extra_names.tsv> <extra_names.bin>
 //! place-search query <set dir> <index dir> [--extras F] [--iso F] [--limit N]
 //!                    [--bench REPEATS [--no-warmup]]
 //!   one query per stdin line; default one JSON line per query, --bench latency percentiles
 //! place-search ctxbench <set dir> <index dir> < "lat lng" lines   (reverse-lookup cost per point)
-use place_search::build::{build_all, BuildOpts};
+use place_search::build::{build_all, held_subs, BuildOpts};
+use place_search::constants::SUB_INDEXES;
 use place_search::reader::SearchIndex;
 use place_search::query::Searcher;
 use query_server::{Index, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL};
@@ -46,7 +50,7 @@ fn selected_subs(sub: &str) -> Result<&'static [&'static str], String> {
     match sub {
         "places" => Ok(&["places"]),
         "poi" => Ok(&["poi"]),
-        "all" => Ok(&["places", "poi"]),
+        "all" => Ok(SUB_INDEXES),
         _ => Err(format!("--sub {sub:?}: expected places, poi or all")),
     }
 }
@@ -58,35 +62,20 @@ fn cmd_build(args: &[String]) {
         eprintln!("{e}");
         std::process::exit(2)
     });
-    let geo = load_geo(set);
+    let (geo, loaded) = place_search::dataset::load(Path::new(set), || Ok(load_geo(set))).unwrap_or_else(|e| panic!("{e}"));
+    let base = BuildOpts::new(opt(args, "--tmp").map(PathBuf::from).unwrap_or_else(|| out.join("tmp")));
     let opts = BuildOpts {
-        threads: opt(args, "--threads").map(|v| v.parse().unwrap()).unwrap_or(1),
-        mem_mb: opt(args, "--mem-mb").map(|v| v.parse().unwrap()).unwrap_or(place_search::constants::DEFAULT_RUN_BUDGET_MB),
-        tmp: opt(args, "--tmp").map(PathBuf::from).unwrap_or_else(|| out.join("tmp")),
+        threads: opt(args, "--threads").map(|v| v.parse().unwrap()).unwrap_or(base.threads),
+        mem_mb: opt(args, "--mem-mb").map(|v| v.parse().unwrap()).unwrap_or(base.mem_mb),
         inline: !flag(args, "--no-inline"),
         extras: opt(args, "--extras"),
         imp_dir: opt(args, "--imp"),
         area_proxy: flag(args, "--area-proxy"),
-        poi_max_tier: opt(args, "--poi-max-tier").map(|v| v.parse().unwrap()).unwrap_or(3),
+        poi_max_tier: opt(args, "--poi-max-tier").map(|v| v.parse().unwrap()).unwrap_or(base.poi_max_tier),
+        ..base
     };
-    let subs: Vec<&str> = selected.iter().copied().filter(|&s| s != "poi" || geo.poi_records.is_some()).collect();
-    let mut replacing = subs.clone();
-    if geo.poi_records.is_none() { replacing.push("poi"); }
-    let meta = || {
-        place_search::build::check_retained_names(&out, &replacing, opts.extras.is_some())?;
-        let mut meta: serde_json::Value = std::fs::read_to_string(out.join("search_meta.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_else(|| json!({}));
-        let n_place_nodes = geo.place_nodes.as_ref().map(|m| m.len() / 20).unwrap_or(0);
-        meta["n_place_nodes"] = json!(n_place_nodes);
-        meta["extras"] = json!(opts.extras.is_some());
-        meta["inline"] = json!(opts.inline);
-        meta["imp"] = json!(opts.imp_dir.is_some());
-        meta["area_proxy"] = json!(opts.area_proxy);
-        meta["poi_max_tier"] = json!(opts.poi_max_tier);
-        Ok(meta)
-    };
+    let subs = held_subs(&geo, selected);
+    let meta = || place_search::dataset::merged_meta(&geo, &loaded, &opts, Path::new(set), &out, &subs);
     let stats = build_all(&geo, &subs, &out, &opts, meta).unwrap_or_else(|e| panic!("{e}"));
     for (s, st) in &stats {
         for (k, v) in &st.lines {
@@ -171,23 +160,14 @@ fn cmd_query(args: &[String]) {
         let results: Vec<_> = found
             .iter()
             .map(|f| {
-                let c = &f.ctx;
-                json!({
-                    "name": f.name,
-                    "latitude": f.lat,
-                    "longitude": f.lng,
-                    "admin1name": c.state,
-                    "admin2name": if !c.county.is_empty() { c.county } else { c.district },
-                    "country": c.country,
-                    "country_code": std::str::from_utf8(&c.cc).unwrap_or(""),
-                    "kind": f.kind.letter().to_string(),
-                    "type": f.typ,
-                    "score": f.hit.score,
-                    "text": f.hit.text,
-                    "context": f.hit.context,
-                    "class": f.hit.class,
-                    "entity": f.hit.entity,
-                })
+                let mut r = f.to_json();
+                r["kind"] = json!(f.kind.letter().to_string());
+                r["score"] = json!(f.hit.score);
+                r["text"] = json!(f.hit.text);
+                r["context"] = json!(f.hit.context);
+                r["class"] = json!(f.hit.class);
+                r["entity"] = json!(f.hit.entity);
+                r
             })
             .collect();
         json!({"q": q, "us": us, "reverse_lookups": st.reverse_lookups, "context_checks": st.context_checks,
