@@ -145,6 +145,21 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
     Ok(format!("{:x}", sha.finalize()))
 }
 
+/// The fingerprint of the dataset in `dir` as loaded, its files stamped `loaded` (`load`), the
+/// hashes `hashes` holds reused: refused when they no longer have those stamps, before the
+/// hashing or after it, as the files hashed would not be the ones loaded.
+fn fingerprint_loaded(dir: &Path, loaded: &Stamps, hashes: &mut HashCache) -> Result<Fingerprint, String> {
+    let io = |e: std::io::Error| format!("{}: {e}", dir.display());
+    let unchanged = || match Stamps::of(dir).map_err(io)? {
+        now if now == *loaded => Ok(()),
+        _ => Err(format!("The dataset in {} changed since it was loaded: load it again", dir.display())),
+    };
+    unchanged()?;
+    let have = hashes.fingerprint(dir, loaded).map_err(io)?;
+    unchanged()?;
+    Ok(have)
+}
+
 /// The META_FILE of the index in `index` (None without a readable one).
 fn meta_of(index: &Path) -> Option<Value> {
     serde_json::from_str(&std::fs::read_to_string(index.join(META_FILE)).ok()?).ok()
@@ -157,12 +172,6 @@ pub fn built_from(index: &Path) -> Option<Fingerprint> {
     files.iter().map(|(name, sha)| Some((name.clone(), sha.as_str()?.to_string()))).collect()
 }
 
-/// The fingerprint of the dataset in `dir`, every file hashed.
-pub fn fingerprint(dir: &Path) -> Result<Fingerprint, String> {
-    let io = |e: std::io::Error| format!("{}: {e}", dir.display());
-    HashCache::default().fingerprint(dir, &Stamps::of(dir).map_err(io)?).map_err(io)
-}
-
 /// The META_FILE fields of an index built with `opts` from the dataset whose files hash
 /// `dataset`, loaded as `geo`: `build::index_meta` and the fingerprint `built_from` reads.
 pub fn index_meta(geo: &Index, opts: &BuildOpts, dataset: &Fingerprint) -> serde_json::Map<String, Value> {
@@ -172,17 +181,18 @@ pub fn index_meta(geo: &Index, opts: &BuildOpts, dataset: &Fingerprint) -> serde
 }
 
 /// The META_FILE of a `place-search build` of the sub-indexes `subs` into `out` from the dataset
-/// in `dir`, loaded as `geo`: merged into the one there, so sub-indexes can be built one at a
-/// time. Refused when a sub-index it keeps was built from other files, as the fingerprint it
-/// records is that of every sub-index there.
-pub fn merged_meta(geo: &Index, opts: &BuildOpts, dir: &Path, out: &Path, subs: &[&str]) -> Result<Value, String> {
+/// in `dir`, loaded as `geo` from files stamped `loaded` (`load`): merged into the one there, so
+/// sub-indexes can be built one at a time. Refused when the files are no longer the ones loaded
+/// (`fingerprint_loaded`), or when a sub-index it keeps was built from other files, as the
+/// fingerprint it records is that of every sub-index there.
+pub fn merged_meta(geo: &Index, loaded: &Stamps, opts: &BuildOpts, dir: &Path, out: &Path, subs: &[&str]) -> Result<Value, String> {
     // An index never reads the POIs of a dataset without any, so those are not kept.
     let mut replacing = subs.to_vec();
     if geo.poi_records.is_none() {
         replacing.push("poi");
     }
     build::check_retained_names(out, &replacing, opts.extras.is_some())?;
-    let dataset = fingerprint(dir)?;
+    let dataset = fingerprint_loaded(dir, loaded, &mut HashCache::default())?;
     let kept = SUB_INDEXES.iter().find(|s| !replacing.contains(s) && out.join(format!("{s}.fst")).exists());
     if let Some(kept) = kept.filter(|_| built_from(out).as_ref() != Some(&dataset)) {
         return Err(format!("retained {kept} sub-index was built from other dataset files; rebuild with --sub all"));
@@ -236,20 +246,10 @@ fn is_complete(geo: &Index, index: &Path) -> bool {
 /// second open finds the first's index current, and no build moves files in while one is read,
 /// or has its stage cleared.
 pub fn open<'g>(geo: &'g Index, loaded: &Stamps, dir: &Path, index: &Path, on_device: &BuildOnDevice) -> Result<(SearchIndex<'g>, Origin), String> {
-    let io = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
     let held = HeldIndexDir::take(index, Contended::Wait)?;
-
-    // The files hashed are the ones loaded while they keep their stamps, through the hashing.
-    let unchanged = || match Stamps::of(dir) {
-        Ok(now) if now == *loaded => Ok(()),
-        Ok(_) => Err(format!("The dataset in {} changed since it was loaded: load it again", dir.display())),
-        Err(e) => Err(io(dir, e)),
-    };
-    unchanged()?;
     let cache = index.join(HASH_CACHE_FILE);
     let mut hashes = HashCache::load(&cache);
-    let have = hashes.fingerprint(dir, loaded).map_err(|e| io(dir, e))?;
-    unchanged()?;
+    let have = fingerprint_loaded(dir, loaded, &mut hashes)?;
 
     // Held, so an unfinished publish is a dead build's: some files there may be its own and some
     // the index's before it, whose META_FILE matches whenever both were built from these files.
@@ -266,7 +266,7 @@ pub fn open<'g>(geo: &'g Index, loaded: &Stamps, dir: &Path, index: &Path, on_de
         // once the stage that showed a publish unfinished is gone.
         let meta_file = index.join(META_FILE);
         match std::fs::remove_file(&meta_file) {
-            Err(e) if e.kind() != ErrorKind::NotFound => return Err(io(&meta_file, e)),
+            Err(e) if e.kind() != ErrorKind::NotFound => return Err(format!("{}: {e}", meta_file.display())),
             _ => {}
         }
         let _ = std::fs::remove_dir_all(index.join(BUILD_STAGE_DIR));
@@ -291,6 +291,11 @@ mod tests {
     use crate::query::Searcher;
     use query_server::{DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL};
     use std::path::PathBuf;
+
+    /// The fingerprint of the dataset in `dir`, every file hashed.
+    fn fingerprint(dir: &Path) -> Result<Fingerprint, String> {
+        HashCache::default().fingerprint(dir, &Stamps::of(dir).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+    }
 
     /// A country and two places named `names`.
     fn dataset(names: [&str; 2]) -> Geo {
@@ -324,9 +329,9 @@ mod tests {
 
     /// `place-search build --sub` of the sub-indexes `subs` of the dataset in `dir` into `index`.
     fn build_subs(dir: &Path, index: &Path, subs: &[&str]) -> Result<(), String> {
-        let (geo, _) = load_dataset(dir);
+        let (geo, stamps) = load_dataset(dir);
         let opts = BuildOpts::new(dir.join("tmp"));
-        build_all(&geo, subs, index, &opts, || merged_meta(&geo, &opts, dir, index, subs)).map(drop)
+        build_all(&geo, subs, index, &opts, || merged_meta(&geo, &stamps, &opts, dir, index, subs)).map(drop)
     }
 
     /// The names `idx` finds for `q`.
@@ -542,6 +547,22 @@ mod tests {
         let (idx, origin) = open(&geo, &stamps, &ds.0, &index, &BuildOnDevice::default()).unwrap();
         assert_eq!(origin, Origin::Built);
         assert_eq!(names(&idx, "nestville"), vec!["Nestville"]);
+    }
+
+    #[test]
+    fn a_build_of_files_replaced_since_the_load_is_refused() {
+        let ds = TempDir::new("replaced-build");
+        dataset(["Testville", "Otherton"]).write(&ds.0);
+        let index = ds.0.join("search");
+        let (geo, stamps) = load_dataset(&ds.0);
+        // Patched between the load and the META_FILE: the index would hold the old names.
+        dataset(["Nestville", "Otherton"]).write(&ds.0);
+        let (opts, subs) = (BuildOpts::new(ds.0.join("tmp")), held_subs(&geo, SUB_INDEXES));
+
+        let refused = build_all(&geo, &subs, &index, &opts, || merged_meta(&geo, &stamps, &opts, &ds.0, &index, &subs));
+
+        assert!(refused.unwrap_err().contains("changed since it was loaded"));
+        assert!(!index.join(META_FILE).exists());
     }
 
     #[test]

@@ -2,7 +2,8 @@
 //!                    [--tmp DIR] [--no-inline] [--extras extra_names.bin] [--imp DIR] [--area-proxy]
 //!                    [--poi-max-tier 1|2|3]
 //!   search_meta.json records the set's files (dataset.rs): the index belongs to that set alone,
-//!   so --sub builds only over an index of the same files
+//!   so --sub builds only over an index of the same files, and files replaced since the set was
+//!   loaded fail the build
 //! place-search pack-extras <extra_names.tsv> <extra_names.bin>
 //! place-search query <set dir> <index dir> [--extras F] [--iso F] [--limit N]
 //!                    [--bench REPEATS [--no-warmup]]
@@ -61,7 +62,7 @@ fn cmd_build(args: &[String]) {
         eprintln!("{e}");
         std::process::exit(2)
     });
-    let geo = load_geo(set);
+    let (geo, loaded) = place_search::dataset::load(Path::new(set), || Ok(load_geo(set))).unwrap_or_else(|e| panic!("{e}"));
     let base = BuildOpts::new(opt(args, "--tmp").map(PathBuf::from).unwrap_or_else(|| out.join("tmp")));
     let opts = BuildOpts {
         threads: opt(args, "--threads").map(|v| v.parse().unwrap()).unwrap_or(base.threads),
@@ -74,7 +75,7 @@ fn cmd_build(args: &[String]) {
         ..base
     };
     let subs = held_subs(&geo, selected);
-    let meta = || place_search::dataset::merged_meta(&geo, &opts, Path::new(set), &out, &subs);
+    let meta = || place_search::dataset::merged_meta(&geo, &loaded, &opts, Path::new(set), &out, &subs);
     let stats = build_all(&geo, &subs, &out, &opts, meta).unwrap_or_else(|e| panic!("{e}"));
     for (s, st) in &stats {
         for (k, v) in &st.lines {
