@@ -172,7 +172,7 @@ POI data is patched independently — each tier directory gets its own patch fil
 | `poi_vertices.bin` | 10-byte header + 4 or 8 bytes per vertex | Polygon outlines: encoding and bounding box, then the packed vertices |
 | `poi_cells.bin` | 12 bytes | S2 cell spatial index |
 | `poi_entries.bin` | variable | Per-cell POI ID lists |
-| `strings_poi.bin` | variable | POI names |
+| `strings_poi.bin` | variable | POI names: the names of the dir's POI tiers, the head of the build's POI string tier |
 | `strings_layout.json` | — | String tier layout |
 | `poi_meta.json` | — | Category names, scoring parameters |
 

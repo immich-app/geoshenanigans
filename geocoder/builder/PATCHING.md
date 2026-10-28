@@ -144,7 +144,7 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
 ### How Patching Works
 
 **Diff tool:**
-1. Build string-level diff (walk both sorted pools, emit added/deleted strings)
+1. Build string-level diff (per tier, keep the longest run of common strings in the same order, every one of them in a sorted tier; emit the other old strings as deleted and the other new ones as added, with their new index unless the new tier is sorted)
 2. Build string remap (old string pool offsets → new, derived from string diff)
 3. For each data file: apply string remap to old, match records by content hash (for ways/admin: also fix node_offset/vertex_offset fields), build merge sequence (MATCH/INSERT/DELETE at record stride)
 4. For coordinate files (nodes/vertices): derive merge from parent way/polygon merge — verify node blocks match before COPY, INSERT if nodes changed
@@ -155,7 +155,7 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
 
 **Patch tool:**
 1. Decompress zstd
-2. Read the strings section → rebuild each shipped tier from the dir's own old tier + additions/deletions and derive its remap runs; take the sent runs of unshipped tiers and the cross-tier pairs as they come
+2. Read the strings section → rebuild each shipped tier from the dir's own old tier + additions/deletions and derive its remap runs; take the sent runs of unshipped tiers and the moved-string pairs as they come
 3. For each data file: apply string remap + offset fixups to old, replay merge sequence → output file, track ID mapping from MATCH ops
 4. Read secondary ID remaps → merge into derived ID mappings
 5. Read cell changes (added/removed cell IDs) and the per-cell entry deltas
@@ -203,8 +203,13 @@ the tier sizes before it, which the patch carries.
 
 - **Shipped tier**: a `strings_<tier>.bin` the old and new dir both hold
   (empty files count). The patch sends its string diff and size and hash
-  stamps; the patcher rebuilds it and derives its remap runs by walking the
-  old and new pool, checking each looked-up offset is a string start. A tier
+  stamps; the patcher rebuilds it and derives its remap runs from the same
+  walk, checking each looked-up offset is a string start. The tiers are
+  sorted alphabetically except the POI tier, which is in POI record order
+  (the names of POI tier 0, 1, 2, 3 in turn, each at its first record of
+  that tier, so a reader walking the records reads the names front to
+  back). A string a tier's order moves past others is deleted and added,
+  and its offset travels as a pair. A tier
   only the new dir holds is newly shipped: it counts as unshipped in the
   strings section, and its file comes whole in a full-replacement section.
 - **Referenced tier**: a tier that some string field of the dir's own old
@@ -221,15 +226,16 @@ Dirs patched on different days don't fit together: the server combines a
 mode dir with a quality or poi dir by global string offsets, so the selected
 dirs must all be patched to the same date and swapped in together.
 
-## Patch Format (.gcpatch, version 8)
+## Patch Format (.gcpatch, version 9)
 
 Whole file is zstd-compressed for transport. Internal structure (all integers
 little-endian; the header, client files, old file sizes and strings sections
 are read by position, everything after them by marker):
 
 ```
-Header: "GCPATCH\0" (8) + version=8 (u32) + flags=0 (u32)
-  (a v8 patcher accepts only v8 patches; the v8 changes are marked below)
+Header: "GCPATCH\0" (8) + version=9 (u32) + flags=0 (u32)
+  (a v9 patcher accepts only v9 patches; the v8 and v9 changes are marked
+  below)
 
 Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
   + n × {name_len:u16, name, size:u64, inline:u8, [bytes] if inline}
@@ -251,12 +257,17 @@ Strings: marker 0xFFFFFFF6 (u32)
   + sent (u32, bit per unshipped tier the dir's old files reference)
   + per tier in order:
     shipped: old_hash:u64, new_hash:u64, n_added:u32, n_deleted:u32,
-      [string\0] × n_added, [index:u32] × n_deleted (the patcher refuses an
-      old tier of another size or hash and checks the one it rebuilds)
+      order:u32 (v9; 0 sorted: the new tier sorts and an added string
+      goes where it sorts; 1 indexed: the new indices follow the strings),
+      [string\0] × n_added, indexed only [new index:u32] × n_added,
+      [old index:u32] × n_deleted (indices and a sorted tier's added
+      strings ascending; the patcher refuses an old tier of another size or
+      hash and checks the one it rebuilds)
     sent: n_runs:u32, runs_size:u32, runs of varint (start - previous end,
       end - start, zigzag change of the shift), from the tier's old base
-  + n_pairs (u32) + [(old_off:u32, new_off:u32)] × n_pairs (strings that
-  changed tier, out of a shipped or referenced tier)
+  + n_pairs (u32) + [(old_off:u32, new_off:u32)] × n_pairs (surviving
+  strings no tier's edit keeps: they changed tier, or (v9) the POI tier's
+  order moved them; out of a shipped or referenced tier)
 
 Parent-id remap: marker 0xFFFFFFF3 (u32)
   + n_admin (u32) + [(old:u32, new:u32)] × n_admin
