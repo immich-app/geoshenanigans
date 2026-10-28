@@ -388,6 +388,31 @@ TEST(decoder_peaks_at_most_checks_every_peak_of_the_report_line) {
         CHECK(!check(bad).empty());
 }
 
+// run_with_heap_peak measures the process it runs and nothing else: a dd of
+// one 16 MiB block peaks at least 15 MiB above a dd of one 1 MiB block, and a
+// timeout running the 16 MiB dd as its child (as the patcher runs the zstd
+// CLI) peaks below 1 MiB.
+TEST(run_with_heap_peak_measures_the_process_it_runs_and_not_its_children) {
+    if (!gctest::heap_peak_shim()) {
+        std::printf("    SKIP heap peaks of dd: no heap shim under the sanitizers\n");
+        return;
+    }
+    ScratchDir dir("heap-peak");
+    auto peak_of = [&](const std::vector<std::string>& words) {
+        const auto [ok, heap_peak] = gctest::run_with_heap_peak(words, dir.path() + "/log");
+        REQUIRE(ok && heap_peak);
+        return *heap_peak;
+    };
+    auto dd = [](const std::string& block) { return std::vector<std::string>{"dd", "if=/dev/zero", "of=/dev/null", "bs=" + block, "count=1"}; };
+    std::vector<std::string> in_child = dd("16M");
+    in_child.insert(in_child.begin(), {"timeout", "60"});
+
+    const uint64_t one = peak_of(dd("1M")), sixteen = peak_of(dd("16M")), parent = peak_of(in_child);
+
+    CHECK(sixteen >= one + (uint64_t{15} << 20));
+    CHECK(parent < (uint64_t{1} << 20));
+}
+
 // The POI string tier in record order (GCPATCH v9): the new pool moves a name
 // out of sorted order (zoo cafe bank -> zoo bank cafe tea), so the tier's
 // diff sends new indices and a moved-string pair, and the encoded POI records
