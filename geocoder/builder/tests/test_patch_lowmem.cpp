@@ -177,7 +177,9 @@ bool logged(const ToolRun& r, const std::string& line) { return r.log.find(line)
 using LogCheck = std::function<std::string(const std::string& log)>;
 
 // The family's decoder queue (and --threads ring) peaks, from the patcher's
-// report line, all at most limit.
+// report line, all at most limit. A line without peaks, or with a "peaks"
+// that isn't a list of numbers, fails: a changed report format can't pass as
+// a decoder that held nothing.
 LogCheck decoder_peaks_at_most(const std::string& family, uint64_t limit) {
     return [family, limit](const std::string& log) -> std::string {
         const std::string head = "decode " + family + ":";
@@ -185,8 +187,9 @@ LogCheck decoder_peaks_at_most(const std::string& family, uint64_t limit) {
         if (at == std::string::npos) return "no " + head + " line";
         const std::string line = log.substr(at, log.find('\n', at) - at);
         uint64_t most = 0;
+        size_t lists = 0, named = 0;
         static const std::regex peaks("peaks ((?:\\d+ )+)B");
-        for (std::sregex_iterator it(line.begin(), line.end(), peaks), end; it != end; ++it) {
+        for (std::sregex_iterator it(line.begin(), line.end(), peaks), end; it != end; ++it, lists++) {
             const std::string values = (*it)[1];
             for (size_t p = 0; p < values.size();) {
                 size_t q = values.find(' ', p);
@@ -194,6 +197,8 @@ LogCheck decoder_peaks_at_most(const std::string& family, uint64_t limit) {
                 p = q + 1;
             }
         }
+        for (size_t p = line.find("peaks"); p != std::string::npos; p = line.find("peaks", p + 1)) named++;
+        if (!lists || lists != named) return "no peaks to check: " + line;
         return most > limit ? "decoder held " + std::to_string(most) + " B: " + line : "";
     };
 }
@@ -363,6 +368,22 @@ TEST(patch_lowmem_drops_the_old_records_of_a_replace_run) {
     REQUIRE(prepare(c, old_d, new_d, old_meta, new_meta).empty());
 
     CHECK(apply_both_modes(c, decoder_peaks_at_most("streets", DECODER_HOLD)).empty());
+}
+
+// The memory check of the replay tests above, on report lines as the patcher
+// writes them (sync: queue peaks; --threads: ring and queue peaks): every
+// peak at most the limit passes, one past it fails, and a line whose peaks
+// are missing or not numbers fails instead of passing as a peak of 0.
+TEST(decoder_peaks_at_most_checks_every_peak_of_the_report_line) {
+    const LogCheck check = decoder_peaks_at_most("poi", 100);
+
+    CHECK(check("encode poi: queue peaks 999 B\ndecode poi: queue peaks 10 100 B\n").empty());
+    CHECK(check("decode poi: thread cpu 0.1 s, ring peaks 7 8 B, queue peaks 9 100 B\n").empty());
+    CHECK(!check("decode poi: queue peaks 10 101 B\n").empty());
+    CHECK(!check("decode poi: thread cpu 0.1 s, ring peaks 101 8 B, queue peaks 9 10 B\n").empty());
+    for (const char* bad : {"decode poi:\n", "decode poi: queue B\n", "decode poi: queue peaks B\n", "decode poi: queue peaks ten B\n",
+                            "decode poi: thread cpu 0.1 s, ring peaks 7 8 B, queue peaks 9 x B\n", "decode streets: queue peaks 1 B\n"})
+        CHECK(!check(bad).empty());
 }
 
 // The POI string tier in record order (GCPATCH v9): the new pool moves a name
