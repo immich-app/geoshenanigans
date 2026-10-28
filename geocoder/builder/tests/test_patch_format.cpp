@@ -586,6 +586,64 @@ TEST(patch_format_offset_fixups_reject_truncated_runs) {
     CHECK(threw);
 }
 
+// --- ascending ids ---
+
+// What the walk threw as a runtime_error, or "".
+static std::string refusal_of(const std::function<void()>& walk) {
+    try {
+        walk();
+    } catch (const std::runtime_error& e) {
+        return e.what();
+    }
+    return "";
+}
+
+// The ids of v where they sit, as the patcher reads a cell change list.
+static AscendingIds ascending(const std::vector<uint64_t>& v) {
+    return AscendingIds(reinterpret_cast<const char*>(v.data()), v.size(), "cell changes");
+}
+
+TEST(patch_format_ascending_ids_skip_to_the_first_id_not_below_the_one_asked_for) {
+    const std::vector<uint64_t> ids = {3, 5, 5, 9};
+    AscendingIds sut = ascending(ids);
+
+    CHECK(!sut.skip_to(1));
+    CHECK_EQ(sut.front(), uint64_t(3));
+    CHECK(sut.skip_to(5));
+    CHECK(sut.skip_to(5));  // an id stays until the walk passes it
+    CHECK(!sut.skip_to(7));
+    CHECK_EQ(sut.front(), uint64_t(9));
+    CHECK(sut.skip_to(9));
+    CHECK(!sut.skip_to(10));
+    CHECK(sut.done());
+}
+
+TEST(patch_format_ascending_ids_pop_equal_ids_one_by_one) {
+    const std::vector<uint64_t> ids = {4, 4, 6};
+    std::vector<uint64_t> got;
+
+    for (AscendingIds sut = ascending(ids); !sut.done(); sut.pop()) got.push_back(sut.front());
+
+    CHECK(got == ids);
+    CHECK(AscendingIds().done());
+}
+
+TEST(patch_format_ascending_ids_refuse_a_step_back_when_the_walk_reaches_it) {
+    const std::vector<uint64_t> ids = {3, 9, 4};
+    AscendingIds sut = ascending(ids);
+    CHECK(sut.skip_to(9));
+
+    CHECK_EQ(refusal_of([&] { sut.skip_to(10); }), std::string("Malformed cell changes"));
+}
+
+TEST(patch_format_ascending_ids_refuse_a_step_back_among_the_ids_the_walk_left) {
+    const std::vector<uint64_t> ids = {3, 9, 4};
+    AscendingIds sut = ascending(ids);
+    CHECK(sut.skip_to(9));
+
+    CHECK_EQ(refusal_of([&] { sut.require_ascending(); }), std::string("Malformed cell changes"));
+}
+
 // --- cell index rebuild from an id remap ---
 
 static void append_u32(std::vector<char>& buf, uint32_t v) { buf.insert(buf.end(), (const char*)&v, (const char*)&v + 4); }
@@ -732,7 +790,8 @@ TEST(patch_format_stream_cell_index_matches_rebuild_then_delta) {
         std::vector<char> delta;
         append_cell_list_delta(delta, parse_cell_lists(derived.cells_data, derived.entries_data), new_lists);
         std::pair<std::vector<char>, std::vector<char>> got;
-        stream_cell_index(ByteSpan{cells.data(), cells.size()}, ByteSpan{entries.data(), entries.size()}, added, removed,
+        stream_cell_index(ByteSpan{cells.data(), cells.size()}, ByteSpan{entries.data(), entries.size()}, ascending(added),
+                          ascending(removed),
                           [&](uint32_t id) { auto f = rm.find(id); return f != rm.end() ? f->second : id; },
                           delta.data(), delta.size(),
                           [&](const char* p, size_t n) { got.first.insert(got.first.end(), p, p + n); },
@@ -745,7 +804,7 @@ TEST(patch_format_stream_cell_index_matches_rebuild_then_delta) {
         write_bytes(dir.path() + "/entries.bin", entries);
         SequentialFileReader cells_file(dir.path() + "/cells.bin", 16), entries_file(dir.path() + "/entries.bin", 16);
         std::pair<std::vector<char>, std::vector<char>> streamed;
-        stream_cell_index(cells_file, entries_file, added, removed,
+        stream_cell_index(cells_file, entries_file, ascending(added), ascending(removed),
                           [&](uint32_t id) { auto f = rm.find(id); return f != rm.end() ? f->second : id; },
                           delta.data(), delta.size(),
                           [&](const char* p, size_t n) { streamed.first.insert(streamed.first.end(), p, p + n); },
@@ -764,6 +823,41 @@ TEST(patch_format_cell_list_delta_drops_removed_no_data_cells) {
     std::vector<char> delta;
     append_cell_list_delta(delta, parse_cell_lists(cells, entries), {{7, {1}}});
     CHECK(apply_delta({cells, entries}, delta, delta.size()) == write_cell_lists({{7, {1}}}));
+}
+
+TEST(patch_format_stream_cell_index_refuses_cell_changes_out_of_order) {
+    // Over an old index of cells 5, 7 and 9: added cells 3 then 2; removed
+    // cells 7 then 5, a step back the walk reaches at cell 9; removed cells 9
+    // then 7, one past the last cell the walk asks for.
+    const auto old_index = write_cell_lists({{5, {1}}, {7, {2}}, {9, {3}}});
+    std::vector<char> delta;
+    append_cell_list_delta(delta, {}, {});
+    struct Case { std::vector<uint64_t> added, removed; };
+    for (const Case& c : {Case{{3, 2}, {}}, Case{{}, {7, 5}}, Case{{}, {9, 7}}}) {
+        auto walk = [&] {
+            stream_cell_index(ByteSpan{old_index.first.data(), old_index.first.size()},
+                              ByteSpan{old_index.second.data(), old_index.second.size()}, ascending(c.added),
+                              ascending(c.removed), [](uint32_t id) { return id; }, delta.data(), delta.size(),
+                              [](const char*, size_t) {}, [](const char*, size_t) {});
+        };
+
+        CHECK_EQ(refusal_of(walk), std::string("Malformed cell changes"));
+    }
+}
+
+TEST(patch_format_cell_list_delta_refuses_removed_cells_out_of_order) {
+    // The delta removes, of an index of cells 7, 9 and 11, cells 9 then 7 (a
+    // step back the walk reaches at cell 11) or 11 then 9 (one past the last
+    // cell the walk asks for).
+    const auto old_index = write_cell_lists({{7, {1}}, {9, {2}}, {11, {3}}});
+    for (const std::vector<uint64_t>& removed : {std::vector<uint64_t>{9, 7}, std::vector<uint64_t>{11, 9}}) {
+        std::vector<char> delta;
+        append_u32(delta, 2);
+        for (const uint64_t cid : removed) delta.insert(delta.end(), (const char*)&cid, (const char*)&cid + 8);
+        append_u32(delta, 0);
+
+        CHECK_EQ(refusal_of([&] { apply_delta(old_index, delta, delta.size()); }), std::string("Malformed cell list delta"));
+    }
 }
 
 TEST(patch_format_cell_list_delta_rejects_truncation) {

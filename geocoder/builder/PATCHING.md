@@ -367,7 +367,8 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
     of the new file. A parent sent unchanged counts as one MATCH.
   stride=0xFB: cell list delta for <name>_cells.bin + <name>_entries.bin
     (payload_size u64, new entries size u64, n_removed u32 + [cell u64],
-    n_set u32 + [cell u64, n_lost u32, n_gained u32, lost ids, gained ids])
+    n_set u32 + [cell u64, n_lost u32, n_gained u32, lost ids, gained ids];
+    both cell lists ascending)
   otherwise: n_runs (u32) + n_values (u32) + runs_size (u32) + values_size (u32)
     + runs + values + seq_size (u64) + merge ops
   Ops: MATCH(count:u32) | INSERT(count:u32, data) | DELETE(count:u32)
@@ -384,6 +385,8 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
 
 Cell Changes: marker 0xFFFFFFFB/FA/F5/F4 (geo/admin/poi/place) + n_added (u32)
   + n_removed (u32) + [cell_id:u64] × n_added + [cell_id:u64] × n_removed
+  Each list ascending, equal ids allowed. The patcher reads the lists where
+  they sit in the patch and refuses one that steps back.
 
 Secondary ID Remap: marker 0xFFFFFFF6 (u32) + n_files (u32)
   per file: file_id (u32) + n_pairs (u32) + [(old_id:u32, new_id:u32)] × n_pairs
