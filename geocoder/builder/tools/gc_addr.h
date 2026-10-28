@@ -1,5 +1,5 @@
 // Address points and footprints (the addresses track's Tier B, max/addresses/tierb.py 'abs2' +
-// final_build.py 'col' / 'pax170'), on the sort step's cell-ordered records (not re-sorted).
+// final_build.py 'col'), on the sort step's cell-ordered records (not re-sorted).
 //
 //   addr_vertices.abs2  one blob per footprint, in record order:
 //       tag u8 = enc | wide << 2 | small << 3 | closed << 4, count LEB128 (stored = open-ring vertices),
@@ -13,9 +13,6 @@
 //   addr_points.col     six u32 columns of N: lat | lng | housenumber | street | parent_way | poly_offset
 //       (byte offset of the record's blob in addr_vertices.abs2, NO_DATA = none); lat, lng and
 //       poly_offset as 4 byte planes each (b0 of every record, then b1, ...), the rest plain u32.
-//   addr_points.pax170  the same columns in blocks of 170 records (4080 B, one page): per block
-//       lat planes | lng planes | housenumber | street | parent_way | poly_offset planes; the last
-//       block zero-padded.
 // Today's vertex_offset (prefix sum of blob sizes in record order) and vertex_count (count + closed)
 // are derived; the encoder refuses records whose offsets are anything else.
 // addr_postcodes.bin is kept as is (u32 per record, in the sorted order), as the addresses track had it.
@@ -25,7 +22,6 @@
 namespace gcset::addr {
 
 static const double SCALE[3] = {1e-5, 1e-4, 1e-6};
-static const size_t PAX = 170;
 // The most vertices (closing vertex included) an abs2 blob holds; a larger footprint is escaped.
 static const uint32_t ABS2_MAX_VERTICES = 69999;
 
@@ -40,38 +36,25 @@ static inline uint32_t pred_bits(uint32_t point_bits, int64_t sum_q, uint32_t n,
     return b;
 }
 
-// Column sink / source over the two containers.
+// The col file's region k starts at col_region(k, N): lat b0..b3, lng b0..b3, housenumber, street,
+// parent_way, poly_offset b0..b3.
+static inline uint64_t col_region(int k, uint64_t N) {
+    uint64_t at = 0;
+    for (int j = 0; j < k; j++) at += (j >= 8 && j <= 10) ? 4 * N : N;
+    return at;
+}
+
+// addr_points.col written record by record, one writer per region.
 struct ColWriter {
-    bool pax;
-    uint64_t N;
     int fd = -1;
-    std::vector<Writer*> w;  // col: 15 region writers
-    Writer* pw = nullptr;    // pax: one sequential writer
-    std::vector<uint32_t> blk[6];
-    size_t inblk = 0;
-    ColWriter(const std::string& path, uint64_t n, bool pax_) : pax(pax_), N(n) {
-        if (pax) {
-            pw = new Writer(path);
-            for (auto& b : blk) b.assign(PAX, 0);
-            return;
-        }
+    std::vector<Writer*> w;
+    ColWriter(const std::string& path, uint64_t N) {
         if (unlink(path.c_str()) && errno != ENOENT) die("unlink %s", path.c_str());
         fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
         if (fd < 0) die("create %s", path.c_str());
-        // regions: lat b0..b3, lng b0..b3, hn, st, pw, vo b0..b3
-        uint64_t at = 0;
-        for (int k = 0; k < 15; k++) {
-            const bool word = k >= 8 && k <= 10;
-            w.push_back(new Writer(fd, path, at, 1 << 20));
-            at += word ? 4 * N : N;
-        }
+        for (int k = 0; k < 15; k++) w.push_back(new Writer(fd, path, col_region(k, N), 1 << 20));
     }
     void put(const uint32_t v[6]) {
-        if (pax) {
-            for (int k = 0; k < 6; k++) blk[k][inblk] = v[k];
-            if (++inblk == PAX) flush_blk();
-            return;
-        }
         for (int b = 0; b < 4; b++) w[b]->u8(uint8_t(v[0] >> (8 * b)));
         for (int b = 0; b < 4; b++) w[4 + b]->u8(uint8_t(v[1] >> (8 * b)));
         w[8]->u32(v[2]);
@@ -79,66 +62,20 @@ struct ColWriter {
         w[10]->u32(v[4]);
         for (int b = 0; b < 4; b++) w[11 + b]->u8(uint8_t(v[5] >> (8 * b)));
     }
-    void flush_blk() {
-        uint8_t out[24 * PAX];
-        size_t o = 0;
-        for (int k : {0, 1}) for (int b = 0; b < 4; b++) for (size_t j = 0; j < PAX; j++) out[o++] = uint8_t(blk[k][j] >> (8 * b));
-        for (int k : {2, 3, 4}) { memcpy(out + o, blk[k].data(), 4 * PAX); o += 4 * PAX; }
-        for (int b = 0; b < 4; b++) for (size_t j = 0; j < PAX; j++) out[o++] = uint8_t(blk[5][j] >> (8 * b));
-        pw->put(out, sizeof out);
-        for (auto& bb : blk) std::fill(bb.begin(), bb.end(), 0);
-        inblk = 0;
-    }
     ~ColWriter() {
-        if (pax) {
-            if (inblk) flush_blk();
-            delete pw;
-            return;
-        }
         for (auto* x : w) delete x;
         if (close(fd)) die("close");
     }
 };
 
+// addr_points.col read record by record, one reader per region.
 struct ColReader {
-    bool pax;
-    uint64_t N, i = 0;
     std::vector<Reader*> r;
-    Reader* pr = nullptr;
-    uint32_t blk[6][PAX];
-    ColReader(const std::string& path, uint64_t n, bool pax_) : pax(pax_), N(n) {
-        if (pax) {
-            pr = new Reader(path);
-            if (pr->size() != ((N + PAX - 1) / PAX) * 24 * PAX) die("%s size", path.c_str());
-            return;
-        }
+    ColReader(const std::string& path, uint64_t N) {
         if (file_size(path) != 24 * N) die("%s size", path.c_str());
-        uint64_t at = 0;
-        for (int k = 0; k < 15; k++) {
-            const bool word = k >= 8 && k <= 10;
-            const uint64_t len = word ? 4 * N : N;
-            r.push_back(new Reader(path, 1 << 20, at, at + len));
-            at += len;
-        }
+        for (int k = 0; k < 15; k++) r.push_back(new Reader(path, 1 << 20, col_region(k, N), col_region(k + 1, N)));
     }
     void get(uint32_t v[6]) {
-        if (pax) {
-            const size_t j = size_t(i % PAX);
-            if (j == 0) {
-                const uint8_t* p = pr->take(24 * PAX);
-                size_t o = 0;
-                for (int k : {0, 1}) {
-                    for (size_t x = 0; x < PAX; x++) blk[k][x] = 0;
-                    for (int b = 0; b < 4; b++) for (size_t x = 0; x < PAX; x++) blk[k][x] |= uint32_t(p[o++]) << (8 * b);
-                }
-                for (int k : {2, 3, 4}) { memcpy(blk[k], p + o, 4 * PAX); o += 4 * PAX; }
-                for (size_t x = 0; x < PAX; x++) blk[5][x] = 0;
-                for (int b = 0; b < 4; b++) for (size_t x = 0; x < PAX; x++) blk[5][x] |= uint32_t(p[o++]) << (8 * b);
-            }
-            for (int k = 0; k < 6; k++) v[k] = blk[k][j];
-            i++;
-            return;
-        }
         v[0] = v[1] = v[5] = 0;
         for (int b = 0; b < 4; b++) v[0] |= uint32_t(r[b]->u8()) << (8 * b);
         for (int b = 0; b < 4; b++) v[1] |= uint32_t(r[4 + b]->u8()) << (8 * b);
@@ -146,23 +83,13 @@ struct ColReader {
         v[3] = r[9]->u32();
         v[4] = r[10]->u32();
         for (int b = 0; b < 4; b++) v[5] |= uint32_t(r[11 + b]->u8()) << (8 * b);
-        i++;
     }
     ~ColReader() {
-        delete pr;
         for (auto* x : r) delete x;
     }
 };
 
-// ---- Streaming (col layout only) ----
-// The col file's region k starts at col_region(k, N): lat b0..b3, lng b0..b3, housenumber, street,
-// parent_way, poly_offset b0..b3 (ColWriter's layout).
-static inline uint64_t col_region(int k, uint64_t N) {
-    uint64_t at = 0;
-    for (int j = 0; j < k; j++) at += (j >= 8 && j <= 10) ? 4 * N : N;
-    return at;
-}
-
+// ---- Streaming ----
 // Pass 1 (addr_points.bin, as the patcher writes it first): regions 0-10 of addr_points.col, and
 // addr.pass.tmp: per record LEB128(vertex_count), then for a footprint zigzag LEB128 of its
 // vertex_offset minus the previous footprint's. The file is sized for all 15 regions.
@@ -198,7 +125,6 @@ inline void encode_points_pass(const std::string& src, const std::string& out, M
     if (ftruncate(fd, off_t(24 * N))) die("truncate %s", cp.c_str());
     if (close(fd)) die("close");
     m.set("addr.n", N);
-    m.set("addr.layout", "col");
     fprintf(stderr, "  addr pass 1 (points): records %llu\n", (unsigned long long)N);
 }
 
@@ -288,9 +214,8 @@ inline void encode_vertices_pass(const std::string& src, const std::string& out,
             (unsigned long long)nraw, (unsigned long long)A.tell());
 }
 
-inline void encode(const std::string& src, const std::string& out, bool pax, Manifest& m) {
+inline void encode(const std::string& src, const std::string& out, Manifest& m) {
     if (want("addr_points.bin") != want("addr_vertices.bin")) {
-        if (pax) die("streaming addr encode: col layout only");
         if (want("addr_points.bin")) encode_points_pass(src, out, m);
         else encode_vertices_pass(src, out, m);
         return;
@@ -299,7 +224,7 @@ inline void encode(const std::string& src, const std::string& out, bool pax, Man
     if (P.size() % 28) die("addr_points.bin size");
     const uint64_t N = P.size() / 28;
     Writer A(out + "/addr_vertices.abs2");
-    ColWriter C(out + (pax ? "/addr_points.pax170" : "/addr_points.col"), N, pax);
+    ColWriter C(out + "/addr_points.col", N);
     std::vector<uint32_t> ql, qg;
     uint64_t vexp = 0, polys = 0, verts = 0, nsmall = 0, nclosed = 0, nwide = 0, nraw = 0;
     std::vector<uint8_t> hdr;
@@ -371,7 +296,6 @@ inline void encode(const std::string& src, const std::string& out, bool pax, Man
     }
     if (!V.eof()) die("addr_vertices.bin: bytes not covered by any record");
     m.set("addr.n", N);
-    m.set("addr.layout", pax ? "pax170" : "col");
     m.set("addr.abs2_bytes", A.tell());
     fprintf(stderr, "  addr: records %llu footprints %llu vertices %llu small_bmin %llu closed %llu wide %llu raw %llu abs2 %llu B\n",
             (unsigned long long)N, (unsigned long long)polys, (unsigned long long)verts, (unsigned long long)nsmall,
@@ -382,7 +306,7 @@ inline void encode(const std::string& src, const std::string& out, bool pax, Man
 // vertex_count: blob payloads are read past, not decoded).
 inline void decode_points_only(const std::string& src, const Manifest& m, const std::string& out) {
     const uint64_t N = m.num("addr.n");
-    ColReader C(src + "/addr_points.col", N, false);
+    ColReader C(src + "/addr_points.col", N);
     Reader A(src + "/addr_vertices.abs2");
     Writer P(out + "/addr_points.bin");
     uint64_t raw = 0;
@@ -421,16 +345,13 @@ inline void decode_points_only(const std::string& src, const Manifest& m, const 
 
 inline void decode(const std::string& src, const std::string& out, const Manifest& m) {
     const uint64_t N = m.num("addr.n");
-    const bool pax = m.get("addr.layout") == "pax170";
     if (!want("addr_vertices.bin")) {
-        if (pax) die("streaming addr decode: col layout only");
         decode_points_only(src, m, out);
         return;
     }
     // Streaming, addr_vertices.bin alone: only the lat, lng and poly_offset regions are read.
     const bool write_points = want("addr_points.bin");
-    if (!write_points && pax) die("streaming addr decode: col layout only");
-    ColReader* C = write_points ? new ColReader(src + (pax ? "/addr_points.pax170" : "/addr_points.col"), N, pax) : nullptr;
+    ColReader* C = write_points ? new ColReader(src + "/addr_points.col", N) : nullptr;
     std::vector<Reader*> rg;  // vertices alone: lat b0..b3, lng b0..b3, poly_offset b0..b3
     if (!write_points)
         for (int k : {0, 1, 2, 3, 4, 5, 6, 7, 11, 12, 13, 14})

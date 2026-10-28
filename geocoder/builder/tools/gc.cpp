@@ -2,9 +2,8 @@
 // installed set geocoder-patch's low-memory mode updates (today's format in, today's format back out,
 // byte for byte). Single-threaded, streaming, deterministic.
 //
-//   geocoder-gc encode SRC_DIR OUT_DIR [--addr col|pax170] [--only fam,fam...]
+//   geocoder-gc encode SRC_DIR OUT_DIR [--only fam,fam...]
 //   geocoder-gc decode SRC_DIR OUT_DIR [--only fam,fam...]
-// (geocoder-patch updates sets in the col address layout, the default, only.)
 // Streamed passes: --files f,f... (the today's files to read (encode) or write (decode); a family
 // with two files then runs one pass of a two-pass stream), --size NAME=BYTES (a FIFO input's
 // length), --no-link (don't hardlink the other files), --manifest-out FILE (write the manifest
@@ -38,7 +37,7 @@ struct Family {
     std::function<void(const std::string&, const std::string&, const Manifest&)> dec;
 };
 
-static std::vector<Family> families(bool pax) {
+static std::vector<Family> families() {
     using V = std::vector<std::string>;
     std::vector<Family> f;
     f.push_back({"streets", {"street_ways.bin", "street_nodes.bin"}, {},
@@ -66,10 +65,8 @@ static std::vector<Family> families(bool pax) {
                  [](auto& s, auto& o, Manifest& m) { gxc::encode(s, o, m); },
                  [](auto& s, auto& o, const Manifest& m) { gxc::decode(s, o, m); }});
     f.push_back({"addr", {"addr_points.bin", "addr_vertices.bin"}, {},
-                 [](const Manifest& m) {
-                     return V{m.has("addr.layout") && m.get("addr.layout") == "pax170" ? "addr_points.pax170" : "addr_points.col", "addr_vertices.abs2"};
-                 },
-                 [pax](auto& s, auto& o, Manifest& m) { addr::encode(s, o, pax, m); },
+                 [](const Manifest&) { return V{"addr_points.col", "addr_vertices.abs2"}; },
+                 [](auto& s, auto& o, Manifest& m) { addr::encode(s, o, m); },
                  [](auto& s, auto& o, const Manifest& m) { addr::decode(s, o, m); }});
     f.push_back({"admin", {"admin_vertices.bin"}, {"admin_polygons.bin"}, [](const Manifest&) { return V{"admin_vertices.B"}; },
                  [](auto& s, auto& o, Manifest& m) { poly::encode_admin(s, o, m); },
@@ -103,7 +100,7 @@ static uint64_t sum_sizes(const std::string& dir, const std::vector<std::string>
 }
 
 static void usage() {
-    fprintf(stderr, "usage: geocoder-gc encode SRC_DIR OUT_DIR [--addr col|pax170] [--only fam,...]\n"
+    fprintf(stderr, "usage: geocoder-gc encode SRC_DIR OUT_DIR [--only fam,...]\n"
                     "       geocoder-gc decode SRC_DIR OUT_DIR [--only fam,...]\n");
     exit(1);
 }
@@ -115,16 +112,12 @@ int main(int argc, char** argv) {
     const bool encode = mode == "encode";
     const int a = 2;
     const std::string src = argv[a], out = argv[a + 1];
-    bool pax = false, no_link = false;
+    bool no_link = false;
     std::string manifest_out;
     std::set<std::string> only;
     for (int i = a + 2; i < argc; i++) {
         const std::string o = argv[i];
-        if (o == "--addr" && i + 1 < argc) {
-            const std::string v = argv[++i];
-            if (v == "pax170") pax = true;
-            else if (v != "col") usage();
-        } else if (o == "--only" && i + 1 < argc) {
+        if (o == "--only" && i + 1 < argc) {
             only = split(argv[++i]);
         } else if (o == "--files" && i + 1 < argc) {
             want_files() = split(argv[++i]);
@@ -153,7 +146,7 @@ int main(int argc, char** argv) {
     std::error_code listed;
     if (want_files().empty() && (!std::filesystem::is_empty(out, listed) || listed))
         die("OUT_DIR %s is not empty", out.c_str());
-    const std::vector<Family> fams = families(pax);
+    const std::vector<Family> fams = families();
     const double t0 = wall_now(), c0 = cpu_now();
     std::set<std::string> consumed;  // files of SRC not to hardlink
     Manifest m;

@@ -236,7 +236,6 @@ TEST(gc_address_decoders_refuse_a_footprint_count_past_u32) {
                     [&] {
                         gcset::Manifest m;
                         m.set("addr.n", 1);
-                        m.set("addr.layout", "col");
                         if (whole) gcset::addr::decode(src, out, m);
                         else gcset::addr::decode_points_only(src, m, out);
                         return 0;
@@ -272,7 +271,6 @@ TEST(gc_address_decoders_refuse_a_footprint_past_the_end_before_reading_it) {
 #endif
                 gcset::Manifest m;
                 m.set("addr.n", 1);
-                m.set("addr.layout", "col");
                 if (whole) gcset::addr::decode(src, out, m);
                 else gcset::addr::decode_points_only(src, m, out);
                 return 0;
@@ -429,39 +427,38 @@ TEST(gc_ways_decoders_refuse_bytes_past_a_column) {
 }
 
 // Footprints past abs2's bound round trip through the raw escape, byte for
-// byte: the encoder in one pass (both layouts) and in its two streamed
-// passes, and the decoders whole, points only and vertices only.
+// byte: the encoder in one pass and in its two streamed passes, and the
+// decoders whole, points only and vertices only.
 TEST(gc_address_footprints_past_abs2s_bound_round_trip) {
     ScratchDir dir("gc-addr-big");
     const std::string& root = dir.path();
-    const std::string src = root + "/src";
+    const std::string src = root + "/src", col = root + "/col";
     std::filesystem::create_directories(src);
     const AddrSet set = big_footprints();
     write_bytes(src + "/addr_points.bin", set.points);
     write_bytes(src + "/addr_vertices.bin", set.verts);
-    for (const bool pax : {false, true}) {
-        const std::string enc = root + (pax ? "/pax" : "/col"), dec = enc + ".dec";
-        std::filesystem::create_directories(enc);
+    {
+        const std::string dec = col + ".dec";
+        std::filesystem::create_directories(col);
         std::filesystem::create_directories(dec);
         gcset::Manifest m;
-        gcset::addr::encode(src, enc, pax, m);
-        gcset::addr::decode(enc, dec, m);
+        gcset::addr::encode(src, col, m);
+        gcset::addr::decode(col, dec, m);
 
         CHECK(read_bytes(dec + "/addr_points.bin") == set.points);
         CHECK(read_bytes(dec + "/addr_vertices.bin") == set.verts);
     }
-    const std::string col = root + "/col", split = root + "/split";
+    const std::string split = root + "/split";
     std::filesystem::create_directories(split);
     gcset::Manifest ms;
     gcset::want_files() = {"addr_points.bin"};
-    gcset::addr::encode(src, split, false, ms);
+    gcset::addr::encode(src, split, ms);
     gcset::want_files() = {"addr_vertices.bin"};
-    gcset::addr::encode(src, split, false, ms);
+    gcset::addr::encode(src, split, ms);
     gcset::want_files().clear();
     for (const char* f : {"/addr_points.col", "/addr_vertices.abs2"}) CHECK(read_bytes(split + f) == read_bytes(col + f));
     gcset::Manifest m;  // the keys the decoders read
     m.set("addr.n", uint64_t(set.points.size() / 28));
-    m.set("addr.layout", "col");
     for (const std::string f : {"addr_points.bin", "addr_vertices.bin"}) {
         const std::string dec = root + "/only." + f;
         std::filesystem::create_directories(dec);

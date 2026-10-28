@@ -438,31 +438,6 @@ TEST(patch_lowmem_refuses_a_new_set_with_part_of_a_family) {
     }
 }
 
-// An encoded set whose addresses are in geocoder-gc's pax170 layout, which
-// the address codec doesn't stream, is refused before anything is written
-// (meta.json, an inline client file, was written first).
-TEST(patch_lowmem_refuses_a_set_in_the_pax170_address_layout) {
-    ScratchDir dir("lowmem-pax");
-    std::vector<GeoRow> rows;
-    for (uint32_t k = 0; k < 50; k++) rows.push_back({k, {k % 10}});
-    BuildDir old_d, new_d;
-    put_geo(old_d, rows);
-    put_geo(new_d, {rows.begin(), rows.begin() + 40});
-    for (BuildDir* d : {&old_d, &new_d}) {
-        (*d)["addr_points.bin"] = (*d)["addr_vertices.bin"] = {};
-        (*d)["meta.json"] = {'{', '}'};
-    }
-    const LowMemCase c{dir.path(), "pax"};
-    REQUIRE(prepare(c, old_d, new_d).empty());
-    REQUIRE(run_tool({GEOCODER_GC_BIN, "encode", c.dir("old"), c.dir("old.pax"), "--addr", "pax170"}, c.log()).ok);
-
-    auto r = run_tool({GEOCODER_PATCH_BIN, c.dir("old.pax"), c.patch(), "-o", c.dir("out")}, c.log());
-
-    CHECK(!r.ok);
-    CHECK(logged(r, "the encoded set's addresses are in the pax170 layout; only col sets are patched"));
-    CHECK(read_dir(c.dir("out")).empty());
-}
-
 // A MATCH run longer than what is left of the old file is refused in the
 // low-memory mode too: the last run of POI records (replayed with their
 // child), 5 longer, as the plain replay refuses it; of their vertices (the

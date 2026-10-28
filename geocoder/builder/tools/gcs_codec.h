@@ -893,7 +893,6 @@ struct Dec : Decoder {
     std::unique_ptr<Reader> A;
     Dec(const std::string& src, const Manifest& m) : Decoder("addr", 2) {
         N = m.num("addr.n");
-        if (m.get("addr.layout") != "col") die("addr: only the col layout streams");
         const std::string cp = src + "/addr_points.col";
         if (file_size(cp) != 24 * N) die("addr_points.col size");
         for (int k = 0; k < 15; k++) rg.emplace_back(new Reader(cp, region_buf(k), col_region(k, N), col_region(k + 1, N)));
@@ -979,7 +978,7 @@ struct Dec : Decoder {
 };
 
 // Ports: 0 = addr_points, 1 = addr_vertices; a record is encoded once its footprint is all in.
-// N (for the col layout's regions) comes from the expected size of addr_points.bin.
+// N (for addr_points.col's regions) comes from the expected size of addr_points.bin.
 struct Enc : Encoder {
     uint64_t N = 0, i = 0, vexp = 0;
     int fd = -1;
@@ -1083,7 +1082,6 @@ struct Enc : Encoder {
         fd = -1;
         if (close(f)) die("close addr_points.col");
         m.set("addr.n", N);
-        m.set("addr.layout", "col");
         m.set("addr.abs2_bytes", A->tell());
         A->finish();
         A.reset();

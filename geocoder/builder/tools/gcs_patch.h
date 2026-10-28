@@ -110,10 +110,6 @@ struct Store {
             for (const auto& f : F) known |= n == f.name;
             if (!known) die("unknown family %s in gc.manifest", n.c_str());
         }
-        // The address codec streams the col layout only (geocoder-gc's default), so a set in another
-        // is refused before anything is written.
-        if (on.count("addr") && old_m.get("addr.layout") != "col")
-            die("the encoded set's addresses are in the %s layout; only col sets are patched", old_m.get("addr.layout").c_str());
     }
     // Once expect_out holds the patch's client list: an encoded family the new set drops whole (it
     // lists none of its today's files) leaves gc.families, and one it ships in part can't be encoded.

@@ -466,7 +466,7 @@ TEST(gcs_addr_footprints_past_the_abs2_bound_round_trip) {
     write_bytes(today + "/addr_points.bin", points);
     write_bytes(today + "/addr_vertices.bin", verts);
     gcset::Manifest gm;
-    gcset::addr::encode(today, gc, false, gm);
+    gcset::addr::encode(today, gc, gm);
     for (const char* f : {"/addr_points.col", "/addr_vertices.abs2"}) CHECK(slurp(gc + f) == slurp(dir.path() + f));
 }
 
@@ -488,7 +488,6 @@ TEST(gcs_addr_decoder_rejects_a_footprint_count_past_its_record) {
                         [&] {
                             Manifest m;
                             m.set("addr.n", 1);
-                            m.set("addr.layout", "col");
                             addr::Dec dec(dir.path(), m);
                             while (dec.step()) {}
                         },
@@ -516,7 +515,6 @@ TEST(gcs_addr_decoder_refuses_a_footprint_past_the_end_before_reading_it) {
                 cap_address_space(size_t(1) << 30);
                 Manifest m;
                 m.set("addr.n", 1);
-                m.set("addr.layout", "col");
                 addr::Dec dec(dir.path(), m);
                 const int code = error_code([&] { while (dec.step()) {} }, "unexpected end of file");
                 return dec.A->buf.size() > READ_BUF + 64 ? 4 : code;
