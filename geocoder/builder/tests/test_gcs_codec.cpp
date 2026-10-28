@@ -608,6 +608,34 @@ TEST(gcs_encoders_refuse_a_unit_past_the_end_of_its_file) {
     }
 }
 
+TEST(gcs_reader_rejects_a_varint_past_64_bits) {
+    // A varint's tenth byte holds bit 63 alone: one past 1 would lose its
+    // other bits off the u64 (FF x9 02 read as 2^63 - 1), so it is rejected;
+    // FF x9 01 is 2^64 - 1. Through the reader's buffered path (the varint
+    // already in the buffer, after a byte read first) and its byte-by-byte one
+    // (a fresh reader).
+    ScratchDir dir("gcs-test");
+    const std::string path = dir.path() + "/v";
+    for (const uint8_t last : {uint8_t(0x01), uint8_t(0x02), uint8_t(0x7F)}) {
+        for (const bool buffered : {false, true}) {
+            std::vector<uint8_t> bytes;
+            if (buffered) bytes.push_back(0);
+            bytes.insert(bytes.end(), 9, 0xFF);
+            bytes.push_back(last);
+            write_bytes(path, bytes);
+            Reader r(path);
+            if (buffered) r.u8();
+
+            if (last == 1) {
+                CHECK(r.uv() == ~uint64_t(0));
+                CHECK(r.eof());
+            } else {
+                CHECK(throws_runtime([&] { r.uv(); }, "bad varint"));
+            }
+        }
+    }
+}
+
 TEST(gcs_gxc_decoder_rejects_list_and_address_counts_before_using_them) {
     // A one-row encoded set per case: malformed street list and address
     // counts fail before any list is sized or filled from them.

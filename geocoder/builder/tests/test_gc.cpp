@@ -802,3 +802,32 @@ TEST(gc_poi_decoder_refuses_blocks_the_encoder_never_writes) {
         CHECK_EQ(status, c.valid ? 0 : 2);
     }
 }
+
+// A varint's tenth byte holds bit 63 alone: one past 1 would lose its other
+// bits off the u64 (FF x9 02 read as 2^63 - 1), so it is refused; FF x9 01 is
+// 2^64 - 1. Through the reader's buffered path (the varint already in the
+// buffer, after a byte read first) and its byte-by-byte one (a fresh reader).
+TEST(gc_reader_refuses_a_varint_past_64_bits) {
+    ScratchDir dir("gc-varint");
+    const std::string path = dir.path() + "/v";
+    for (const uint8_t last : {uint8_t(0x01), uint8_t(0x02), uint8_t(0x7F)}) {
+        for (const bool buffered : {false, true}) {
+            std::vector<uint8_t> bytes;
+            if (buffered) bytes.push_back(0);
+            bytes.insert(bytes.end(), 9, 0xFF);
+            bytes.push_back(last);
+            write_bytes(path, bytes);
+
+            const int status = exit_status_in_child(
+                [&] {
+                    gcset::Reader r(path);
+                    if (buffered) r.u8();
+                    return r.uv() == ~uint64_t(0) && r.eof() ? 0 : 1;
+                },
+                5);
+
+            if (status != (last == 1 ? 0 : 2)) std::printf("    tenth byte %#x, %s: exit %d\n", last, buffered ? "buffered" : "byte by byte", status);
+            CHECK_EQ(status, last == 1 ? 0 : 2);
+        }
+    }
+}

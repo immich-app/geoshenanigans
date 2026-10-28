@@ -206,6 +206,7 @@ struct Reader {
     inline uint16_t u16() { return rd16(take(2)); }
     inline uint32_t u32() { return rd32(take(4)); }
     inline uint64_t u64() { return rd64(take(8)); }
+    // LEB128. Its tenth byte holds bit 63 alone: one past 1 (more bits, or another byte) is past 64 bits.
     inline uint64_t uv() {
         if (cur + 10 <= len) {
             const uint8_t* p = &buf[cur];
@@ -213,10 +214,10 @@ struct Reader {
             int sh = 0, i = 0;
             for (;;) {
                 const uint8_t c = p[i++];
+                if (sh == 63 && c > 1) die("%s: bad varint", path.c_str());
                 v |= uint64_t(c & 0x7f) << sh;
                 if (!(c & 0x80)) break;
                 sh += 7;
-                if (sh > 63) die("%s: bad varint", path.c_str());
             }
             cur += size_t(i);
             return v;
@@ -225,10 +226,10 @@ struct Reader {
         int sh = 0;
         for (;;) {
             const uint8_t c = u8();
+            if (sh == 63 && c > 1) die("%s: bad varint", path.c_str());
             v |= uint64_t(c & 0x7f) << sh;
             if (!(c & 0x80)) return v;
             sh += 7;
-            if (sh > 63) die("%s: bad varint", path.c_str());
         }
     }
 };
