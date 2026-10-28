@@ -338,8 +338,8 @@ Strings: marker 0xFFFFFFF6 (u32)
       goes where it sorts; 1 indexed: the new indices follow the strings),
       [string\0] × n_added, indexed only [new index:u32] × n_added,
       [old index:u32] × n_deleted (indices and a sorted tier's added
-      strings ascending; the patcher refuses an old tier of another size or
-      hash and checks the one it rebuilds)
+      strings ascending; the patcher reads them where they sit, refuses an
+      old tier of another size or hash and checks the one it rebuilds)
     sent: n_runs:u32, runs_size:u32, runs of varint (start - previous end,
       end - start, zigzag change of the shift), from the tier's old base
   + n_pairs (u32) + [(old_off:u32, new_off:u32)] × n_pairs (surviving

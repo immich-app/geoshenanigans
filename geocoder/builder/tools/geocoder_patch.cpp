@@ -543,20 +543,20 @@ static int run(int argc, char* argv[]) {
         uint32_t total_added = 0, total_deleted = 0;
         load_string_remap(strings, str_remap, [&](int t) {
             const char* name = STRING_TIER_FILES[t];
-            const StringTierDiff& diff = strings.diffs[t];
-            total_added += static_cast<uint32_t>(diff.added.size());
-            total_deleted += static_cast<uint32_t>(diff.deleted.size());
+            const StringTierEdit& edit = strings.edits[t];
+            total_added += edit.n_added;
+            total_deleted += edit.n_deleted;
             require_old_file_size(cur_dir, name, strings.old_size(t));
             MappedFile old_pool = mmap_file(cur_dir + "/" + name);
-            if (old_pool.size != strings.old_size(t) || content_hash(old_pool.data, old_pool.size) != diff.old_hash)
+            if (old_pool.size != strings.old_size(t) || content_hash(old_pool.data, old_pool.size) != edit.old_hash)
                 throw std::runtime_error(std::string("Old ") + name + " is not the one the patch was made from");
             FILE* fp = open_out(name);
-            rebuild_string_tier(old_pool.data, old_pool.size, diff, [&](const char* p, size_t n) { fwrite(p, 1, n, fp); });
+            rebuild_string_tier(old_pool.data, old_pool.size, edit, [&](const char* p, size_t n) { fwrite(p, 1, n, fp); });
             close_patch_outputs({{fp, name}});
             MappedFile new_pool = mmap_file(out_path(name));
-            if (new_pool.size != strings.new_size(t) || content_hash(new_pool.data, new_pool.size) != diff.new_hash)
+            if (new_pool.size != strings.new_size(t) || content_hash(new_pool.data, new_pool.size) != edit.new_hash)
                 throw std::runtime_error(std::string("Rebuilt ") + name + " does not match the new build");
-            str_remap.add_tier(old_pool.data, old_pool.size, strings.old_base[t], strings.new_base[t], diff);
+            str_remap.add_tier(old_pool.data, old_pool.size, strings.old_base[t], strings.new_base[t], edit);
             old_str_pools.push_back(old_pool);
             unmap_file(new_pool);
         });

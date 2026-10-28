@@ -650,6 +650,45 @@ TEST(patch_heap_stays_flat_as_poi_cells_change) {
     }, 10000).empty());
 }
 
+// n POI names in the POI string tier, the new day's in reverse order, over
+// POIs that keep theirs: the tier's edit keeps one name and deletes and adds
+// the other n - 1, whose offsets go as n - 1 moved-string pairs, all of which
+// the patcher reads where they sit in the patch.
+TEST(patch_heap_stays_flat_as_strings_move) {
+    CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
+        constexpr uint32_t NAME = 12;  // "poi 0000000\0"
+        auto name = [](uint32_t i) {
+            char b[16];
+            std::snprintf(b, sizeof b, "poi %07u", i);
+            return std::string(b, NAME);
+        };
+        std::string old_pool, new_pool;
+        for (uint32_t i = 0; i < n; i++) {
+            old_pool += name(i);
+            new_pool += name(n - 1 - i);
+        }
+        std::mt19937 rng(20261029);
+        const auto pois = pois_of(rng, 1000, 0, true);
+        std::vector<uint32_t> old_names, new_names;
+        for (uint32_t k = 0; k < pois.size(); k++) {
+            old_names.push_back(k * NAME);
+            new_names.push_back((n - 1 - k) * NAME);
+        }
+        BuildDir old_d, new_d;
+        put_pois(old_d, pois, old_names);
+        put_pois(new_d, pois, new_names);
+        old_d["strings_poi.bin"].assign(old_pool.begin(), old_pool.end());
+        new_d["strings_poi.bin"].assign(new_pool.begin(), new_pool.end());
+        if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
+        // The tier's n_added, n_deleted and order.
+        std::vector<char> tier;
+        append(tier, n - 1);
+        append(tier, n - 1);
+        append(tier, STRING_TIER_INDEXED);
+        return patch_holds(c, tier, std::to_string(n - 1) + " moved POI names");
+    }, 5000).empty());
+}
+
 // The POI string tier in record order (GCPATCH v9): the new pool moves a name
 // out of sorted order (zoo cafe bank -> zoo bank cafe tea), so the tier's
 // diff sends new indices and a moved-string pair, and the encoded POI records

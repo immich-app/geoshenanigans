@@ -389,6 +389,7 @@ static constexpr uint32_t SECONDARY_REMAP_MARKER = 0xFFFFFFF6;
 //   n_pairs u32, (old u32, new u32) × n_pairs: surviving strings no tier's
 //     edit keeps, which changed tier or order (ascending by old, each string
 //     once), for every old tier the dir ships or references.
+// The patcher reads every list where it sits in the patch.
 // A tier neither shipped nor referenced sends nothing: no lookup lands in it.
 static constexpr uint32_t STRINGS_TIERED_MARKER = 0xFFFFFFF6;
 
@@ -1445,13 +1446,12 @@ inline StringTierRuns encode_string_tier_runs(const char* old_pool, size_t old_s
     return out;
 }
 
-// A shipped tier's string diff: the new pool is the old one without the
-// strings at `deleted` (indices in old order, ascending), with `added` (each
-// NUL-terminated) put in. A sorted new pool (every tier but the POI one) puts
-// each added string where it sorts among the kept ones, as the tier's order
-// says where; any other carries the added strings' new indices `added_at`
-// (ascending). The strings point into the new pool on the diff's side and
-// into the patch on the patcher's.
+// A shipped tier's string diff as the diff makes it: the new pool is the old
+// one without the strings at `deleted` (indices in old order, ascending),
+// with `added` (each NUL-terminated, pointing into the new pool) put in. A
+// sorted new pool (every tier but the POI one) puts each added string where
+// it sorts among the kept ones, as the tier's order says where; any other
+// carries the added strings' new indices `added_at` (ascending).
 struct StringTierDiff {
     uint64_t old_hash = 0, new_hash = 0;
     bool sorted = false;
@@ -1499,32 +1499,110 @@ inline StringTierDiff string_tier_diff(const char* old_pool, size_t old_size, co
     return d;
 }
 
+// Appends d as the strings section carries a shipped tier.
+inline void append_string_tier_diff(std::vector<char>& out, const StringTierDiff& d) {
+    auto put = [&](const void* p, size_t n) { out.insert(out.end(), (const char*)p, (const char*)p + n); };
+    put(&d.old_hash, 8); put(&d.new_hash, 8);
+    const uint32_t n_added = static_cast<uint32_t>(d.added.size()), n_deleted = static_cast<uint32_t>(d.deleted.size());
+    const uint32_t order = d.sorted ? STRING_TIER_SORTED : STRING_TIER_INDEXED;
+    put(&n_added, 4); put(&n_deleted, 4); put(&order, 4);
+    for (const char* str : d.added) put(str, strlen(str) + 1);
+    for (uint32_t idx : d.added_at) put(&idx, 4);
+    for (uint32_t idx : d.deleted) put(&idx, 4);
+}
+
+// A shipped tier's diff as the patcher reads it, where it sits in the patch:
+// n_added NUL-terminated strings back to back from `added`, and the u32
+// lists `added_at` (n_added of them, an indexed tier's only) and `deleted`
+// (n_deleted).
+struct StringTierEdit {
+    uint64_t old_hash = 0, new_hash = 0;
+    bool sorted = false;
+    const char* added = nullptr;
+    uint32_t n_added = 0;
+    const char* added_at = nullptr;
+    const char* deleted = nullptr;
+    uint32_t n_deleted = 0;
+};
+
+// Index i of a list of u32 string indices where it sits.
+inline uint32_t string_index_at(const char* list, uint32_t i) {
+    uint32_t v;
+    memcpy(&v, list + size_t{i} * 4, 4);
+    return v;
+}
+
+// Reads the shipped tier at data[pos, size) where it sits, advancing pos
+// past it, and checks it in one sweep: every added string ends in the
+// section, a sorted tier's sort strictly, and both index lists ascend
+// strictly.
+inline StringTierEdit parse_string_tier_edit(const char* data, size_t size, size_t& pos) {
+    auto malformed = [] { throw std::runtime_error("Malformed strings section"); };
+    auto take = [&](uint64_t n) {
+        if (pos > size || n > size - pos) throw std::runtime_error("Truncated strings section");
+        const char* p = data + pos;
+        pos += static_cast<size_t>(n);
+        return p;
+    };
+    auto u32 = [&] { uint32_t v; memcpy(&v, take(4), 4); return v; };
+    auto u64 = [&] { uint64_t v; memcpy(&v, take(8), 8); return v; };
+    StringTierEdit e;
+    e.old_hash = u64();
+    e.new_hash = u64();
+    e.n_added = u32();
+    e.n_deleted = u32();
+    const uint32_t order = u32();
+    if (order != STRING_TIER_SORTED && order != STRING_TIER_INDEXED) malformed();
+    e.sorted = order == STRING_TIER_SORTED;
+    e.added = data + pos;
+    const char* prev = nullptr;
+    for (uint32_t i = 0; i < e.n_added; i++) {
+        const void* end = memchr(data + pos, '\0', size - pos);
+        if (!end) throw std::runtime_error("Truncated strings section");
+        if (e.sorted && prev && strcmp(prev, data + pos) >= 0) malformed();
+        prev = data + pos;
+        pos = static_cast<size_t>(static_cast<const char*>(end) - data) + 1;
+    }
+    auto ascending = [&](uint32_t n) {
+        const char* list = take(uint64_t{n} * 4);
+        for (uint32_t i = 1; i < n; i++)
+            if (string_index_at(list, i) <= string_index_at(list, i - 1)) malformed();
+        return list;
+    };
+    if (!e.sorted) e.added_at = ascending(e.n_added);
+    e.deleted = ascending(e.n_deleted);
+    return e;
+}
+
 // No old string: an added one (for_each_new_string).
 constexpr size_t NO_OLD_STRING = SIZE_MAX;
 
-// A shipped tier's new pool string by string, from its old pool and diff:
+// A shipped tier's new pool string by string, from its old pool and edit:
 // on_string(p, len, old_off) for each new string in order, with the offset of
 // a kept string in the old pool, or NO_OLD_STRING for an added one. The
-// diff's indices ascend (parse_strings_section); ones the old pool can't
-// place throw. A sorted diff puts an added string before the next kept one
+// edit's indices ascend (parse_string_tier_edit); ones the old pool can't
+// place throw. A sorted edit puts an added string before the next kept one
 // it sorts before.
 template <typename OnString>
-void for_each_new_string(const char* old_pool, size_t old_size, const StringTierDiff& diff, OnString on_string) {
-    size_t o = 0, d = 0, a = 0;
-    uint32_t oi = 0, ni = 0;
+void for_each_new_string(const char* old_pool, size_t old_size, const StringTierEdit& edit, OnString on_string) {
+    size_t o = 0;
+    uint32_t oi = 0, ni = 0, d = 0, a = 0;
+    const char* added = edit.added;  // the next added string
     auto old_len = [&] { return strnlen(old_pool + o, old_size - o) + 1; };
     auto skip_deleted = [&] {
-        for (; o < old_size && d < diff.deleted.size() && diff.deleted[d] == oi; d++, oi++) o += old_len();
+        for (; o < old_size && d < edit.n_deleted && string_index_at(edit.deleted, d) == oi; d++, oi++) o += old_len();
     };
     skip_deleted();
     auto added_next = [&] {
-        if (a >= diff.added.size()) return false;
-        if (!diff.sorted) return diff.added_at[a] == ni;
-        return o >= old_size || strcmp(diff.added[a], old_pool + o) < 0;
+        if (a >= edit.n_added) return false;
+        if (!edit.sorted) return string_index_at(edit.added_at, a) == ni;
+        return o >= old_size || strcmp(added, old_pool + o) < 0;
     };
     for (;; ni++) {
         if (added_next()) {
-            on_string(diff.added[a], strlen(diff.added[a]) + 1, NO_OLD_STRING);
+            const size_t len = strlen(added) + 1;
+            on_string(added, len, NO_OLD_STRING);
+            added += len;
             a++;
         } else if (o < old_size) {
             const size_t len = old_len();
@@ -1536,7 +1614,7 @@ void for_each_new_string(const char* old_pool, size_t old_size, const StringTier
             break;
         }
     }
-    if (a != diff.added.size() || d != diff.deleted.size()) throw std::runtime_error("Malformed strings section");
+    if (a != edit.n_added || d != edit.n_deleted) throw std::runtime_error("Malformed strings section");
 }
 
 // The patcher's old → new string offset map. Between two edits every
@@ -1559,14 +1637,14 @@ void for_each_new_string(const char* old_pool, size_t old_size, const StringTier
 class StringRemap {
 public:
     // Records the kept strings that moved, walking a shipped tier's old pool
-    // and diff as its rebuild does. The old pool must stay mapped for lookups.
+    // and edit as its rebuild does. The old pool must stay mapped for lookups.
     void add_tier(const char* old_pool, size_t old_size, uint32_t old_base, uint32_t new_base,
-                  const StringTierDiff& diff) {
+                  const StringTierEdit& edit) {
         uint32_t new_start = new_base;
         StringRunJoiner joiner([&](uint32_t start, uint32_t end, uint32_t shift) {
             runs_.push_back({start, end, shift, old_pool + (start - old_base)});
         });
-        for_each_new_string(old_pool, old_size, diff, [&](const char*, size_t len, size_t old_off) {
+        for_each_new_string(old_pool, old_size, edit, [&](const char*, size_t len, size_t old_off) {
             if (old_off != NO_OLD_STRING) {
                 const uint32_t start = old_base + static_cast<uint32_t>(old_off);
                 joiner.kept(start, start + static_cast<uint32_t>(len), new_start);
@@ -1757,15 +1835,9 @@ StringsSectionStats append_strings_section(std::vector<char>& out,
         }
         if (!(shipped >> t & 1)) continue;
         const StringTierDiff d = string_tier_diff(p.old_data, p.old_size, p.new_data, p.new_size, kept);
-        put(&d.old_hash, 8); put(&d.new_hash, 8);
-        uint32_t n_added = static_cast<uint32_t>(d.added.size()), n_deleted = static_cast<uint32_t>(d.deleted.size());
-        const uint32_t order = d.sorted ? STRING_TIER_SORTED : STRING_TIER_INDEXED;
-        put(&n_added, 4); put(&n_deleted, 4); put(&order, 4);
-        for (const char* s : d.added) put(s, strlen(s) + 1);
-        for (uint32_t idx : d.added_at) put(&idx, 4);
-        for (uint32_t idx : d.deleted) put(&idx, 4);
-        stats.n_added[t] = n_added;
-        stats.n_deleted[t] = n_deleted;
+        append_string_tier_diff(out, d);
+        stats.n_added[t] = static_cast<uint32_t>(d.added.size());
+        stats.n_deleted[t] = static_cast<uint32_t>(d.deleted.size());
     }
 
     std::sort(pairs.begin(), pairs.end());
@@ -1785,7 +1857,7 @@ struct StringsSection {
     // Tier t sits at old offsets [old_base[t], old_base[t + 1]); new likewise.
     std::array<uint32_t, STRING_TIER_COUNT + 1> old_base{}, new_base{};
     uint32_t shipped = 0, sent = 0;
-    std::array<StringTierDiff, STRING_TIER_COUNT> diffs;  // shipped tiers
+    std::array<StringTierEdit, STRING_TIER_COUNT> edits;  // shipped tiers
     std::array<SentStringRuns, STRING_TIER_COUNT> runs;   // sent tiers
     SortedTable<RemapPair> pairs;                         // moved strings, by old offset
     uint32_t old_size(int t) const { return old_base[t + 1] - old_base[t]; }
@@ -1802,7 +1874,6 @@ inline StringsSection parse_strings_section(const char* data, size_t size, size_
         return p;
     };
     auto u32 = [&] { uint32_t v; memcpy(&v, take(4), 4); return v; };
-    auto u64 = [&] { uint64_t v; memcpy(&v, take(8), 8); return v; };
     if (u32() != STRINGS_TIERED_MARKER) throw std::runtime_error("Patch has no strings section");
     StringsSection s;
     for (int t = 0; t < STRING_TIER_COUNT; t++) {
@@ -1823,37 +1894,7 @@ inline StringsSection parse_strings_section(const char* data, size_t size, size_
             r.data = take(r.size);
             continue;
         }
-        if (!(s.shipped >> t & 1)) continue;
-        StringTierDiff& d = s.diffs[t];
-        d.old_hash = u64();
-        d.new_hash = u64();
-        uint32_t n_added = u32(), n_deleted = u32(), order = u32();
-        if (order != STRING_TIER_SORTED && order != STRING_TIER_INDEXED) malformed();
-        d.sorted = order == STRING_TIER_SORTED;
-        if (n_added > size - pos) throw std::runtime_error("Truncated strings section");  // a string is at least its NUL
-        d.added.reserve(n_added);
-        for (uint32_t i = 0; i < n_added; i++) {
-            const void* end = memchr(data + pos, '\0', size - pos);
-            if (!end) throw std::runtime_error("Truncated strings section");
-            d.added.push_back(data + pos);
-            pos = static_cast<size_t>(static_cast<const char*>(end) - data) + 1;
-        }
-        // Both index lists ascend strictly, and so do a sorted tier's added
-        // strings.
-        auto indices = [&](std::vector<uint32_t>& v, uint32_t n) {
-            const char* at = take((size_t)n * 4);
-            v.resize(n);
-            if (n) memcpy(v.data(), at, (size_t)n * 4);
-            for (uint32_t i = 1; i < n; i++)
-                if (v[i] <= v[i - 1]) malformed();
-        };
-        if (d.sorted) {
-            for (uint32_t i = 1; i < n_added; i++)
-                if (strcmp(d.added[i - 1], d.added[i]) >= 0) malformed();
-        } else {
-            indices(d.added_at, n_added);
-        }
-        indices(d.deleted, n_deleted);
+        if (s.shipped >> t & 1) s.edits[t] = parse_string_tier_edit(data, size, pos);
     }
     const uint32_t n_pairs = u32();
     s.pairs = SortedTable<RemapPair>(take(uint64_t{n_pairs} * sizeof(RemapPair)), n_pairs, "strings section");
@@ -1873,13 +1914,13 @@ inline void require_shipped_tiers_listed(uint32_t shipped, const std::unordered_
 // Writes a shipped tier's new pool through write(bytes, n): the old pool's
 // kept strings with the added ones at their indices.
 template <typename Write>
-void rebuild_string_tier(const char* old_pool, size_t old_size, const StringTierDiff& diff, Write write) {
-    for_each_new_string(old_pool, old_size, diff, [&](const char* p, size_t n, size_t) { write(p, n); });
+void rebuild_string_tier(const char* old_pool, size_t old_size, const StringTierEdit& edit, Write write) {
+    for_each_new_string(old_pool, old_size, edit, [&](const char* p, size_t n, size_t) { write(p, n); });
 }
 
 // Fills remap from the section, tier by tier in offset order: a sent tier
 // from its runs, a shipped tier through on_shipped(t), which rebuilds it and
-// calls remap.add_tier with its old pool and diff. Then the moved strings.
+// calls remap.add_tier with its old pool and edit. Then the moved strings.
 template <typename OnShipped>
 void load_string_remap(const StringsSection& s, StringRemap& remap, OnShipped on_shipped) {
     for (int t = 0; t < STRING_TIER_COUNT; t++) {
