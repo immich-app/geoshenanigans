@@ -1,8 +1,9 @@
 // geocoder-patch's low-memory mode end to end: small synthetic today's-format
 // dirs, the geocoder-diff patch between them, geocoder-gc's encoding of the
 // old dir patched (in sync and --threads) and the new encoded set compared
-// byte for byte with geocoder-gc's encoding of the new dir. Then patches and
-// command lines the patcher must refuse.
+// byte for byte with geocoder-gc's encoding of the new dir. Then the
+// patcher's heap peak, in every mode, as a case grows tenfold; and patches
+// and command lines the patcher must refuse.
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -34,6 +35,9 @@ constexpr uint32_t NO = 0xFFFFFFFFu;
 // The most bytes a family's decoder may hold queued while the replay skips
 // old bytes (a deleted run, replaced children or parents).
 constexpr uint64_t DECODER_HOLD = 1 << 20;
+// The most the patcher's heap peak may grow when a heap test's case grows
+// tenfold in the one structure it varies, which the patcher reads in place.
+constexpr uint64_t HEAP_GROWTH_SLACK = 256 << 10;
 
 template <typename T>
 void append(std::vector<char>& out, const T& v) {
@@ -232,24 +236,90 @@ std::string prepare(const LowMemCase& c, const BuildDir& old_d, const BuildDir& 
     return "";
 }
 
-// The patch applied to the old encoded set, in sync and --threads, compared
-// with the new encoded set; check runs on each log. Every mismatch, printed.
-std::vector<std::string> apply_both_modes(const LowMemCase& c, const LogCheck& check = {}) {
+// The modes a patch applies in: to the old dir, and to its encoded set (the
+// low-memory mode) in sync and with --threads.
+const std::vector<std::string> ENCODED_MODES = {"sync", "threads"};
+const std::vector<std::string> ALL_MODES = {"plain", "sync", "threads"};
+
+// A case's patch applied in some modes: every mismatch, and the patcher's
+// heap peak by mode where the heap shim measured one.
+struct Applied {
     std::vector<std::string> bad;
-    for (const bool threads : {false, true}) {
-        const std::string mode = threads ? "threads" : "sync", out = c.dir("out." + mode);
-        std::vector<std::string> words = {GEOCODER_PATCH_BIN, c.dir("old.enc"), c.patch(), "-o", out};
-        if (threads) words.push_back("--threads");
-        auto r = run_tool(words, c.log());
-        if (!r.ok) {
-            bad.push_back(mode + ": patch failed: " + r.log);
+    std::map<std::string, uint64_t> heap_peaks;
+};
+
+// The patch applied in each of modes ("plain": to the old dir, compared with
+// the new dir; "sync" and "threads": to the old encoded set, compared with
+// the new encoded set), the patcher under the heap shim; check runs on each
+// log. Every mismatch, printed.
+Applied apply_modes(const LowMemCase& c, const std::vector<std::string>& modes, const LogCheck& check = {}) {
+    Applied a;
+    for (const std::string& mode : modes) {
+        const bool plain = mode == "plain";
+        const std::string out = c.dir("out." + mode);
+        std::vector<std::string> words = {GEOCODER_PATCH_BIN, c.dir(plain ? "old" : "old.enc"), c.patch(), "-o", out};
+        if (mode == "threads") words.push_back("--threads");
+        std::filesystem::remove(c.log());
+        const auto [ok, heap_peak] = gctest::run_with_heap_peak(words, c.log());
+        const std::vector<char> text = read_file(c.log());
+        const std::string log(text.begin(), text.end());
+        if (heap_peak) a.heap_peaks[mode] = *heap_peak;
+        if (!ok) {
+            a.bad.push_back(mode + ": patch failed: " + log);
             continue;
         }
-        if (read_dir(out) != read_dir(c.dir("new.enc"))) bad.push_back(mode + ": the new set is not gc's encoding of the new dir");
+        if (read_dir(out) != read_dir(c.dir(plain ? "new" : "new.enc")))
+            a.bad.push_back(mode + (plain ? ": the patched dir is not the new dir" : ": the new set is not gc's encoding of the new dir"));
         if (check)
-            if (std::string e = check(r.log); !e.empty()) bad.push_back(mode + ": " + e);
+            if (std::string e = check(log); !e.empty()) a.bad.push_back(mode + ": " + e);
     }
-    for (const auto& b : bad) std::printf("    %s: %s\n", c.name.c_str(), b.c_str());
+    for (const auto& b : a.bad) std::printf("    %s: %s\n", c.name.c_str(), b.c_str());
+    return a;
+}
+
+// The low-memory mode's mismatches.
+std::vector<std::string> apply_both_modes(const LowMemCase& c, const LogCheck& check = {}) {
+    return apply_modes(c, ENCODED_MODES, check).bad;
+}
+
+// A heap test's case of n elements of the one structure it varies, written
+// into c as prepare() writes one: "" or what failed.
+using CaseOfSize = std::function<std::string(const LowMemCase& c, uint32_t n)>;
+
+// The case at n and at 10 n, each applied in every mode: each output as
+// apply_modes checks it, and in each mode the heap peak at 10 n at most
+// HEAP_GROWTH_SLACK above the one at n. Every failure, printed; skipped
+// without a heap shim (the sanitizer build).
+std::vector<std::string> heap_flat(const CaseOfSize& make_case, uint32_t n) {
+    if (!gctest::heap_peak_shim()) {
+        std::printf("    SKIP heap peaks at n = %u: no heap shim under the sanitizers\n", n);
+        return {};
+    }
+    ScratchDir dir("lowmem-heap");
+    std::vector<std::string> bad;
+    auto fail = [&](const std::string& why) {
+        std::printf("    %s\n", why.c_str());
+        bad.push_back(why);
+    };
+    std::map<std::string, uint64_t> at_n;
+    for (const uint32_t size : {n, 10 * n}) {
+        const LowMemCase c{dir.path(), "n" + std::to_string(size)};
+        if (std::string e = make_case(c, size); !e.empty()) {
+            fail(c.name + ": " + e);
+            return bad;
+        }
+        const Applied a = apply_modes(c, ALL_MODES);
+        bad.insert(bad.end(), a.bad.begin(), a.bad.end());
+        for (const std::string& mode : ALL_MODES) {
+            const auto peak = a.heap_peaks.find(mode);
+            if (peak == a.heap_peaks.end()) fail(c.name + ": " + mode + ": no heap peak");
+            else if (size == n) at_n[mode] = peak->second;
+            else if (at_n.count(mode) && peak->second > at_n[mode] + HEAP_GROWTH_SLACK)
+                fail(mode + ": the heap peak grew from " + std::to_string(at_n[mode]) + " B at n = " + std::to_string(n) + " to " +
+                     std::to_string(peak->second) + " B at n = " + std::to_string(size) + ", past the " +
+                     std::to_string(HEAP_GROWTH_SLACK) + " B of slack");
+        }
+    }
     return bad;
 }
 
@@ -411,6 +481,30 @@ TEST(run_with_heap_peak_measures_the_process_it_runs_and_not_its_children) {
 
     CHECK(sixteen >= one + (uint64_t{15} << 20));
     CHECK(parent < (uint64_t{1} << 20));
+}
+
+// n geo cells whose street lists all change (each cell's street becomes the
+// next one) over street ways that stay: n street entry corrections, which the
+// patcher reads where they sit in the patch.
+TEST(patch_heap_stays_flat_as_geo_entry_deltas_grow) {
+    CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
+        std::vector<GeoRow> rows, changed;
+        for (uint32_t k = 0; k < n; k++) {
+            rows.push_back({k, {k % 950}});
+            changed.push_back({k, {k % 950 + 1}});
+        }
+        BuildDir old_d, new_d;
+        put_geo(old_d, rows);
+        put_geo(new_d, changed);
+        if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
+        if (!run({"zstd", "-d", "-q", "-f", c.patch(), "-o", c.dir("raw")}, c.log())) return std::string("patch not decompressed");
+        std::vector<char> corrections;
+        append(corrections, GEO_ENTRY_DELTA_MARKER);
+        append(corrections, static_cast<uint32_t>(PatchFileId::STREET_ENTRIES));
+        append(corrections, n);
+        return find_once(read_file(c.dir("raw")), corrections) == std::string::npos ? "no " + std::to_string(n) + " street entry corrections"
+                                                                                    : std::string();
+    }, 20000).empty());
 }
 
 // The POI string tier in record order (GCPATCH v9): the new pool moves a name
