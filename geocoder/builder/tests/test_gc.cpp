@@ -831,3 +831,26 @@ TEST(gc_reader_refuses_a_varint_past_64_bits) {
         }
     }
 }
+
+// A unit past what the reader's buffer holds with its slack is refused before
+// the buffer grows: a footprint of 0x3FFFFFFD four-byte vertices after its
+// header, 0xFFFFFFFE bytes, in a sparse file of as many. Only a 32-bit build
+// has such a unit (its buffer holds 2 GiB, its size_t the unit), where cap +
+// 64 wrapped to a 62-byte buffer that the file was then read into.
+TEST(gc_reader_refuses_a_unit_past_what_its_buffer_holds) {
+    if (sizeof(size_t) > 4) return;
+    ScratchDir dir("gc-unit");
+    const std::string path = dir.path() + "/addr_vertices.bin";
+    write_bytes(path, {});
+    std::filesystem::resize_file(path, 0xFFFFFFFE);
+
+    const int status = exit_status_in_child(
+        [&] {
+            gcset::Reader r(path);
+            r.take(r.unit_size(10, 0x3FFFFFFD, 4));
+            return 0;
+        },
+        20);
+
+    CHECK_EQ(status, 2);
+}

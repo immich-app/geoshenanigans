@@ -27,6 +27,9 @@ namespace gcs {
 static const uint32_t NO = 0xFFFFFFFFu;
 // Default buffer sizes (bytes).
 static const size_t READ_BUF = size_t(64) << 10, WRITE_BUF = size_t(64) << 10, PLANE_BUF = size_t(16) << 10;
+// The bytes a Reader's buffer holds past its capacity, for the bit readers' 8-byte loads past a
+// unit's last byte.
+static const size_t READ_SLACK = 64;
 // A polygon block up to this size is transformed in memory; a larger one plane by plane through
 // positional readers / writers, so no block is ever held whole. GCS_BIG_BLOCK overrides it, and a
 // test may set it.
@@ -125,14 +128,18 @@ struct Reader {
         len = cur = 0;
     }
     inline const uint8_t* need(size_t n, bool pad = false) {
-        if (cur + n <= len) return &buf[cur];
+        if (n <= len - cur) return &buf[cur];
         return refill(n, pad);
     }
     const uint8_t* refill(size_t n, bool pad) {
         // Before the buffer grows to n, which a malformed count can make any size.
         if (!pad && (tell() >= end || n > end - tell()))
             die("%s: unexpected end of file at %llu (need %zu)", path.c_str(), (unsigned long long)tell(), n);
-        if (buf.empty()) buf.resize(cap + 64);
+        // A unit past what a buffer holds with its slack (2 GiB on a 32-bit build) is refused:
+        // cap + READ_SLACK would wrap to a buffer shorter than the unit.
+        if (n > buf.max_size() - READ_SLACK)
+            die("%s: a unit of %zu bytes at %llu does not fit in memory", path.c_str(), n, (unsigned long long)tell());
+        if (buf.empty()) buf.resize(cap + READ_SLACK);
         if (cur) {
             memmove(&buf[0], &buf[cur], len - cur);
             fpos += cur;
@@ -141,7 +148,7 @@ struct Reader {
         }
         if (n > cap) {  // a view larger than the buffer grows it (only a single large record does)
             cap = n;
-            buf.resize(cap + 64);
+            buf.resize(cap + READ_SLACK);
         }
         while (len < cap) {
             const uint64_t at = fpos + len;
@@ -182,7 +189,7 @@ struct Reader {
     inline uint32_t u32() { return rd32(take(4)); }
     // LEB128. Its tenth byte holds bit 63 alone: one past 1 (more bits, or another byte) is past 64 bits.
     inline uint64_t uv() {
-        if (cur + 10 <= len) {
+        if (len - cur >= 10) {
             const uint8_t* p = &buf[cur];
             uint64_t v = 0;
             int sh = 0, i = 0;

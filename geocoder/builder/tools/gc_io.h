@@ -102,6 +102,10 @@ inline void put_uv(std::vector<uint8_t>& o, uint64_t v) {
     o.push_back(uint8_t(v));
 }
 
+// The bytes a Reader's buffer holds past its capacity, for the bit readers' 8-byte loads past a
+// unit's last byte.
+static const size_t READ_SLACK = 64;
+
 struct Reader {
     int fd = -1;
     std::string path;
@@ -125,7 +129,7 @@ struct Reader {
             end = std::min<uint64_t>(uint64_t(st.st_size), stop);
             posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
         }
-        buf.resize(cap + 64);
+        buf.resize(cap + READ_SLACK);
         fpos = start;
     }
     bool fifo = false;
@@ -150,13 +154,17 @@ struct Reader {
 
     // n contiguous bytes at the cursor; with pad, bytes past the end read as zero (not consumed).
     inline const uint8_t* need(size_t n, bool pad = false) {
-        if (cur + n <= len) return &buf[cur];
+        if (n <= len - cur) return &buf[cur];
         return refill(n, pad);
     }
     const uint8_t* refill(size_t n, bool pad) {
         // Before the buffer grows to n, which a malformed count can make any size.
         if (!pad && (tell() >= end || n > end - tell()))
             die("%s: unexpected end of file at %llu (need %zu)", path.c_str(), (unsigned long long)tell(), n);
+        // A unit past what a buffer holds with its slack (2 GiB on a 32-bit build) is refused:
+        // cap + READ_SLACK would wrap to a buffer shorter than the unit.
+        if (n > buf.max_size() - READ_SLACK)
+            die("%s: a unit of %zu bytes at %llu does not fit in memory", path.c_str(), n, (unsigned long long)tell());
         if (cur) {
             memmove(&buf[0], &buf[cur], len - cur);
             fpos += cur;
@@ -165,7 +173,7 @@ struct Reader {
         }
         if (n > cap) {
             cap = n;
-            buf.resize(cap + 64);
+            buf.resize(cap + READ_SLACK);
         }
         while (len < cap) {
             const uint64_t at = fpos + len;
@@ -208,7 +216,7 @@ struct Reader {
     inline uint64_t u64() { return rd64(take(8)); }
     // LEB128. Its tenth byte holds bit 63 alone: one past 1 (more bits, or another byte) is past 64 bits.
     inline uint64_t uv() {
-        if (cur + 10 <= len) {
+        if (len - cur >= 10) {
             const uint8_t* p = &buf[cur];
             uint64_t v = 0;
             int sh = 0, i = 0;
