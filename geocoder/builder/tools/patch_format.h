@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
@@ -24,6 +26,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "checked_size.h"
 #include "sequential_file_reader.h"
 
 // --- Memory-mapped file helpers ---
@@ -723,13 +726,15 @@ static constexpr size_t TABLE_DIRECTORY_KEYS = 4096;
 // moved strings, a parent id or two) set under 1% of them, so nearly every
 // lookup in them ends at the filter.
 static constexpr unsigned TABLE_FILTER_BITS_LOG2 = 15;
+// The buffer a ScratchTable appends through: 64 KiB.
+static constexpr size_t SCRATCH_TABLE_BUF = 64 << 10;
 
 // n fixed-width records read where they sit, sorted strictly ascending by
 // the u32 each starts with. The constructor checks the order in one sweep,
 // refusing a step back or a repeated key as a malformed `what`, sets each
 // key's bit in a fixed filter, which turns away most keys a small table
 // lacks, and samples every step-th key into a directory, so a lookup the
-// filter passes searches one step of the records.
+// filter passes, or a floor, searches one step of the records.
 template <typename Rec>
 class SortedTable {
     static_assert(std::is_trivially_copyable<Rec>::value && sizeof(Rec) >= sizeof(uint32_t), "a record starts with its u32 key");
@@ -774,28 +779,49 @@ public:
         if (at == count_) return std::nullopt;
         return (*this)[at];
     }
+    // The index of the last record whose key is at most `key`, or size()
+    // when every key is above it.
+    size_t floor(uint32_t key) const { return floor_of(key).at; }
+    // floor, trying the hinted record and the one after it first, then
+    // leaving the floor in hint: lookups that move forward through the
+    // table skip the search.
+    size_t floor(uint32_t key, size_t& hint) const {
+        if (hint < count_ && key_at(hint) <= key) {
+            if (hint + 1 == count_ || key < key_at(hint + 1)) return hint;
+            if (hint + 2 == count_ || key < key_at(hint + 2)) return ++hint;
+        }
+        return hint = floor(key);
+    }
 
 private:
     static uint32_t filter_bit(uint32_t key) {
         return static_cast<uint32_t>((key * 0x9E3779B97F4A7C15ull) >> (64 - TABLE_FILTER_BITS_LOG2));
     }
-    // The index of the record of `key`, or count_. A table of at most
-    // TABLE_DIRECTORY_KEYS records keeps every key in its directory, so a
-    // search that misses reads none of its records. Out of line, so that a
-    // lookup the filter rejects costs its caller no call.
-    [[gnu::noinline]] size_t search(uint32_t key) const {
+    // The last record whose key is at most `key`, and that key; at is count_
+    // for none. A table of at most TABLE_DIRECTORY_KEYS records keeps every
+    // key in its directory, so it reads none of its records.
+    struct Floor {
+        size_t at;
+        uint32_t key;
+    };
+    Floor floor_of(uint32_t key) const {
         const size_t d = static_cast<size_t>(std::upper_bound(directory_.begin(), directory_.end(), key) - directory_.begin());
-        if (d == 0) return count_;
-        size_t at = (d - 1) * step_;
-        if (directory_[d - 1] == key) return at;
-        const size_t end = std::min(count_, at + step_);
-        at++;
-        for (size_t hi = end; at < hi;) {
-            const size_t mid = at + (hi - at) / 2;
-            if (key_at(mid) < key) at = mid + 1;
+        if (d == 0) return {count_, 0};
+        Floor f{(d - 1) * step_, directory_[d - 1]};
+        if (f.key == key) return f;
+        for (size_t hi = std::min(count_, f.at + step_); hi - f.at > 1;) {
+            const size_t mid = f.at + (hi - f.at) / 2;
+            const uint32_t k = key_at(mid);
+            if (k <= key) f = {mid, k};
             else hi = mid;
         }
-        return at < end && key_at(at) == key ? at : count_;
+        return f;
+    }
+    // The index of the record of `key`, or count_. Out of line, so that a
+    // lookup the filter rejects costs its caller no call.
+    [[gnu::noinline]] size_t search(uint32_t key) const {
+        const Floor f = floor_of(key);
+        return f.at < count_ && f.key == key ? f.at : count_;
     }
     uint32_t key_at(size_t i) const {
         uint32_t key;
@@ -807,6 +833,107 @@ private:
     size_t count_ = 0, step_ = 1;
     std::vector<uint32_t> directory_;  // the key of every step_-th record
     std::vector<uint64_t> filter_;     // a bit per filter_bit, none when empty
+};
+
+// A SortedTable made record by record: records appended in strictly
+// ascending key order go through a SCRATCH_TABLE_BUF buffer to an unnamed
+// file in dir (the patcher's scratch dir), and finish() maps the file
+// read-only as the table, so the heap holds the buffer while the table
+// fills and only the directory and filter after. A key at or below the
+// last one is refused as a malformed `what`.
+template <typename Rec>
+class ScratchTable {
+public:
+    ScratchTable() = default;  // none: appending throws
+    ScratchTable(std::string dir, const char* what) : dir_(std::move(dir)), what_(what) {}
+    ScratchTable(ScratchTable&& o) noexcept { swap(o); }
+    ScratchTable& operator=(ScratchTable&& o) noexcept {
+        swap(o);
+        return *this;
+    }
+    ~ScratchTable() {
+        if (fd_ >= 0) close(fd_);
+        if (map_) munmap(map_, map_size_);
+    }
+
+    void append(const Rec& rec) {
+        uint32_t key;
+        memcpy(&key, &rec, sizeof key);
+        if (count_ > 0 && key <= last_key_) throw std::runtime_error(std::string("Malformed ") + what_);
+        if (buf_.empty()) buf_.reserve(SCRATCH_TABLE_BUF / sizeof(Rec));
+        buf_.push_back(rec);
+        if (buf_.size() == buf_.capacity()) write_buffer();
+        last_key_ = key;
+        count_++;
+    }
+    // The records appended so far.
+    size_t size() const { return count_; }
+    // Ends the appends: maps what the file holds, the table from here on.
+    const SortedTable<Rec>& finish() {
+        write_buffer();
+        std::vector<Rec>().swap(buf_);
+        if (fd_ < 0) return table_;
+        const std::optional<size_t> size = checked_size(0, count_, sizeof(Rec), UINT64_MAX);
+        void* p = size ? mmap(nullptr, *size, PROT_READ, MAP_PRIVATE, fd_, 0) : MAP_FAILED;
+        close(fd_);
+        fd_ = -1;
+        if (p == MAP_FAILED)
+            throw std::runtime_error(std::string("Cannot map ") + what_ + ": " + std::to_string(count_) + " records");
+        map_ = p;
+        map_size_ = *size;
+        table_ = SortedTable<Rec>(static_cast<const char*>(map_), count_, what_);
+        return table_;
+    }
+    // The table finish() mapped; empty before.
+    const SortedTable<Rec>& table() const { return table_; }
+
+private:
+    void swap(ScratchTable& o) noexcept {
+        std::swap(dir_, o.dir_);
+        std::swap(what_, o.what_);
+        std::swap(buf_, o.buf_);
+        std::swap(fd_, o.fd_);
+        std::swap(count_, o.count_);
+        std::swap(last_key_, o.last_key_);
+        std::swap(map_, o.map_);
+        std::swap(map_size_, o.map_size_);
+        std::swap(table_, o.table_);
+    }
+    void write_buffer() {
+        if (buf_.empty()) return;
+        if (fd_ < 0) open_file();
+        const char* p = reinterpret_cast<const char*>(buf_.data());
+        for (size_t left = buf_.size() * sizeof(Rec); left > 0;) {
+            const ssize_t n = write(fd_, p, left);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) cannot_write(n < 0 ? errno : EIO);
+            p += n;
+            left -= static_cast<size_t>(n);
+        }
+        buf_.clear();
+    }
+    // An unnamed file: unlinked at once, it lives as long as the descriptor
+    // and then the mapping.
+    void open_file() {
+        if (dir_.empty()) throw std::runtime_error(std::string("No scratch dir for ") + what_);
+        std::string path = dir_ + "/table-XXXXXX";
+        fd_ = mkstemp(path.data());
+        if (fd_ < 0) cannot_write(errno);
+        unlink(path.c_str());
+    }
+    [[noreturn]] void cannot_write(int err) const {
+        throw std::runtime_error(std::string("Cannot write ") + what_ + " to " + dir_ + ": " + std::strerror(err));
+    }
+
+    std::string dir_;
+    const char* what_ = "scratch table";
+    std::vector<Rec> buf_;  // the records not yet written
+    int fd_ = -1;
+    size_t count_ = 0;
+    uint32_t last_key_ = 0;
+    void* map_ = nullptr;
+    size_t map_size_ = 0;
+    SortedTable<Rec> table_;
 };
 
 // An old id or string offset and its new one, as the patch carries remap

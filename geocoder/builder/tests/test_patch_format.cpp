@@ -668,6 +668,12 @@ static SortedTable<RemapPair> pair_table(const std::vector<char>& bytes) {
     return SortedTable<RemapPair>(bytes.data(), bytes.size() / sizeof(RemapPair), "test pairs");
 }
 
+// The dir the tests' scratch tables spill to, the remaps' runs among them.
+static const std::string& scratch_tables() {
+    static const ScratchDir dir("scratch-tables");
+    return dir.path();
+}
+
 TEST(patch_format_sorted_table_finds_every_key_and_no_other) {
     // Sizes around the directory's: every key in it, then every second one.
     for (const size_t n : {size_t(0), size_t(1), TABLE_DIRECTORY_KEYS - 1, TABLE_DIRECTORY_KEYS, TABLE_DIRECTORY_KEYS + 1,
@@ -774,6 +780,93 @@ TEST(patch_format_sorted_table_refuses_a_key_out_of_order_or_twice) {
 
         CHECK_EQ(refusal_of([&] { pair_table(bytes); }), std::string("Malformed test pairs"));
     }
+}
+
+TEST(patch_format_sorted_and_scratch_tables_floor_as_upper_bound_does) {
+    // Sizes around the directory's (every key in it up to
+    // TABLE_DIRECTORY_KEYS), the scratch table's 100K records across many
+    // buffers. Probes go in key order, as the hint is for, and shuffled.
+    for (const size_t n : {size_t(0), size_t(1), TABLE_DIRECTORY_KEYS - 1, TABLE_DIRECTORY_KEYS, TABLE_DIRECTORY_KEYS + 1,
+                           size_t(100000)}) {
+        const std::vector<uint32_t> keys = spread_keys(n, static_cast<uint32_t>(n) + 1);
+        const std::vector<char> bytes = complement_pair_bytes(keys);
+        std::vector<uint32_t> probes = {0, 1, UINT32_MAX - 1, UINT32_MAX};
+        for (const uint32_t key : keys) probes.insert(probes.end(), {key - 1, key, key + 1});
+        std::sort(probes.begin(), probes.end());
+        std::vector<uint32_t> shuffled = probes;
+        std::shuffle(shuffled.begin(), shuffled.end(), std::mt19937(19));
+        ScratchTable<RemapPair> scratch(scratch_tables(), "test pairs");
+        for (const uint32_t key : keys) scratch.append({key, ~key});
+
+        const SortedTable<RemapPair> in_place = pair_table(bytes);
+        const SortedTable<RemapPair>& spilled = scratch.finish();
+
+        CHECK_EQ(spilled.size(), n);
+        size_t wrong = 0;
+        for (size_t i = 0; i < n; i++) wrong += spilled[i].from != keys[i] || spilled[i].to != ~keys[i];
+        for (const SortedTable<RemapPair>* sut : {&in_place, &spilled})
+            for (const std::vector<uint32_t>* order : {&probes, &shuffled}) {
+                size_t hint = 0;
+                for (const uint32_t probe : *order) {
+                    const size_t above = static_cast<size_t>(std::upper_bound(keys.begin(), keys.end(), probe) - keys.begin());
+                    const size_t want = above == 0 ? n : above - 1;
+                    wrong += sut->floor(probe) != want;
+                    wrong += sut->floor(probe, hint) != want || hint != want;
+                }
+            }
+        CHECK_EQ(wrong, size_t(0));
+    }
+}
+
+TEST(patch_format_scratch_table_refuses_a_key_out_of_order_or_twice) {
+    // The last case steps back past the first buffer, which went to the file.
+    std::vector<uint32_t> many(3 * SCRATCH_TABLE_BUF / sizeof(RemapPair));
+    std::iota(many.begin(), many.end(), 0u);
+    many.back() = 7;
+    const std::vector<uint32_t> cases[] = {{5, 2}, {2, 5, 5}, many};
+    for (const auto& keys : cases) {
+        ScratchTable<RemapPair> sut(scratch_tables(), "test runs");
+
+        CHECK_EQ(refusal_of([&] { for (const uint32_t key : keys) sut.append({key, 0}); }), std::string("Malformed test runs"));
+    }
+}
+
+TEST(patch_format_scratch_table_holds_its_records_in_an_unnamed_file) {
+    // Three buffers' worth: the table is mapped from a file the dir no
+    // longer names, and a move keeps the mapping.
+    ScratchDir dir("scratch-table");
+    const uint32_t n = 3 * SCRATCH_TABLE_BUF / sizeof(RemapPair) + 1;
+    ScratchTable<RemapPair> sut(dir.path(), "test pairs");
+    for (uint32_t i = 0; i < n; i++) sut.append({2 * i, i});
+
+    const char* data = sut.finish().data();
+
+    CHECK(std::filesystem::is_empty(dir.path()));
+    const ScratchTable<RemapPair> moved = std::move(sut);
+    CHECK(moved.table().data() == data);
+    REQUIRE(moved.table().size() == size_t(n));
+    CHECK_EQ(moved.table()[n - 1].to, n - 1);
+    CHECK_EQ(moved.table().floor(2 * n), size_t(n - 1));
+}
+
+TEST(patch_format_scratch_table_maps_nothing_until_a_record_comes) {
+    ScratchDir dir("scratch-table");
+    ScratchTable<RemapPair> none(dir.path(), "test pairs");
+
+    CHECK(none.finish().empty());
+    CHECK(none.table().data() == nullptr);
+    CHECK(ScratchTable<RemapPair>().finish().empty());
+}
+
+TEST(patch_format_scratch_table_refuses_a_dir_it_cannot_write) {
+    ScratchDir dir("scratch-table");
+    ScratchTable<RemapPair> gone(dir.path() + "/gone", "test pairs"), none;
+    gone.append({1, 1});
+    none.append({1, 1});
+
+    CHECK_EQ(refusal_of([&] { gone.finish(); }),
+             "Cannot write test pairs to " + dir.path() + "/gone: No such file or directory");
+    CHECK_EQ(refusal_of([&] { none.finish(); }), std::string("No scratch dir for scratch table"));
 }
 
 // A parent-id remap after its marker: the admin, street and reserved postcode
