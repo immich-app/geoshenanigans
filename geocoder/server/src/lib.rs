@@ -12,6 +12,8 @@ use std::sync::Arc;
 
 mod admin_geometry;
 pub use admin_geometry::{AdminGeometry, AdminPoint, PipMemo};
+#[cfg(test)]
+mod scratch_dir;
 
 // Byte-source abstraction.  Index files are memory-mapped; readers go
 // through `read_chunk(off, len)` and `read_at::<T>(idx)`.
@@ -3561,6 +3563,7 @@ impl MultiIndex {
 #[cfg(test)]
 mod multi_index_tests {
     use super::*;
+    use crate::scratch_dir::ScratchDir;
 
     #[test]
     fn interpolate_house_number_ranges() {
@@ -3661,14 +3664,13 @@ mod multi_index_tests {
 
     #[test]
     fn load_skips_unloadable_continent() {
-        let root = std::env::temp_dir().join(format!("gc_mi_partial_{}", std::process::id()));
-        let europe = root.join("europe");
+        let root = ScratchDir::new();
+        let europe = root.path().join("europe");
         std::fs::create_dir_all(&europe).unwrap();
         std::fs::write(europe.join("admin_cells.bin"), b"").unwrap();
 
-        let mi = MultiIndex::load(root.to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE);
+        let mi = MultiIndex::load(root.path().to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE);
 
-        let _ = std::fs::remove_dir_all(&root);
         let mi = mi.expect("a partial continent dir must not fail the whole load");
         assert_eq!(mi.loaded_count(), 0);
         assert_eq!(mi.unloaded_matches(48.85, 2.35), vec!["europe"]);
@@ -6476,8 +6478,8 @@ mod query_path_tests {
     use s2::cell::Cell;
     use s2::rect::Rect;
     use s2::region::RegionCoverer;
+    use crate::scratch_dir::ScratchDir;
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// The fixtures' origin unless one is given: everything sits metres
     /// north and east of it.
@@ -6690,17 +6692,12 @@ mod query_path_tests {
         /// Writes the files into a fresh directory and loads them. The
         /// directory is removed once loaded; the maps keep the bytes.
         fn load(&self) -> Index {
-            static DIRS: AtomicUsize = AtomicUsize::new(0);
-            let dir = std::env::temp_dir()
-                .join(format!("gc_query_path_{}_{}", std::process::id(), DIRS.fetch_add(1, Ordering::Relaxed)));
-            std::fs::create_dir_all(&dir).unwrap();
+            let dir = ScratchDir::new();
             for (name, bytes) in self.files() {
-                std::fs::write(dir.join(name), bytes).unwrap();
+                std::fs::write(dir.path().join(name), bytes).unwrap();
             }
-            let index = Index::load(dir.to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL,
-                                    DEFAULT_SEARCH_DISTANCE);
-            std::fs::remove_dir_all(&dir).unwrap();
-            index.unwrap()
+            Index::load(dir.path().to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL,
+                        DEFAULT_SEARCH_DISTANCE).unwrap()
         }
     }
 
