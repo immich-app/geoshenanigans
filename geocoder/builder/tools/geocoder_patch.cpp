@@ -392,18 +392,44 @@ struct CellChanges {
     AscendingIds added, removed;
 };
 
+static uintptr_t page_size() {
+    static const uintptr_t page = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+    return page;
+}
+
+// madvise over the pages that hold [p, p + n).
+static void advise_pages(const char* p, size_t n, int advice) {
+    if (!n) return;
+    const uintptr_t start = reinterpret_cast<uintptr_t>(p) & ~(page_size() - 1);
+    madvise(reinterpret_cast<void*>(start), reinterpret_cast<uintptr_t>(p) + n - start, advice);
+}
+
 // Readahead over bytes of the patch a walk is about to read front to back:
 // the patch is mapped MADV_RANDOM, which faults it in a page at a time.
-static void advise_sequential(const char* p, size_t n) {
-    if (!n) return;
-    const uintptr_t page = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
-    const uintptr_t start = reinterpret_cast<uintptr_t>(p) & ~(page - 1);
-    madvise(reinterpret_cast<void*>(start), reinterpret_cast<uintptr_t>(p) + n - start, MADV_SEQUENTIAL);
-}
+static void advise_sequential(const char* p, size_t n) { advise_pages(p, n, MADV_SEQUENTIAL); }
 static void advise_sequential(const CellChanges& c) {
     advise_sequential(c.added.data(), c.added.bytes());
     advise_sequential(c.removed.data(), c.removed.bytes());
 }
+
+// A file mapping read front to back, whose whole pages behind the reader go
+// back (MADV_DONTNEED) as it passes them. File mappings only: on anonymous
+// memory MADV_DONTNEED drops the bytes.
+class PagesBehind {
+public:
+    explicit PagesBehind(const char* base) : base_(base) {}
+    // The reader reads nothing before base + off again.
+    void passed(size_t off) {
+        const size_t to = off & ~(page_size() - 1);
+        if (to <= dropped_) return;
+        madvise(const_cast<char*>(base_) + dropped_, to - dropped_, MADV_DONTNEED);
+        dropped_ = to;
+    }
+
+private:
+    const char* base_;
+    size_t dropped_ = 0;  // a page multiple
+};
 
 // The ids as a vector, for the materialised rebuild a patch with entry
 // corrections takes.
@@ -536,6 +562,11 @@ static int run(int argc, char* argv[]) {
     // spill to the scratch dir.
     StringRemap str_remap(tmpdir);
     {
+        // The section is read front to back, by its parse and then by the
+        // tiers' walks, each of which reads its old pool once.
+        const size_t strings_at = pos;
+        advise_pages(P + strings_at, patch_size - strings_at, MADV_SEQUENTIAL);
+        PagesBehind patch_behind(P);
         const StringsSection strings = parse_strings_section(P, patch_size, pos);
         require_shipped_tiers_listed(strings.shipped, listed);
         uint32_t total_added = 0, total_deleted = 0;
@@ -548,17 +579,23 @@ static int run(int argc, char* argv[]) {
             MappedFile old_pool = mmap_file(cur_dir + "/" + name);
             if (old_pool.size != strings.old_size(t))
                 throw std::runtime_error(std::string("Old ") + name + " is not the one the patch was made from");
+            advise_pages(old_pool.data, old_pool.size, MADV_SEQUENTIAL);
+            PagesBehind old_behind(old_pool.data);
             FILE* fp = open_out(name);
             const StringTierRebuild rebuilt = rebuild_string_tier(
                 old_pool.data, old_pool.size, edit, strings.place(t), str_remap,
-                [&](const char* p, size_t n) { fwrite(p, 1, n, fp); }, [](size_t) {});
+                [&](const char* p, size_t n) { fwrite(p, 1, n, fp); }, [&](size_t old_off) { old_behind.passed(old_off); });
             close_patch_outputs({{fp, name}});
             require_string_tier_rebuilt(rebuilt, edit, strings.place(t), name);
             unmap_file(old_pool);
+            patch_behind.passed(static_cast<size_t>(edit.end() - P));
         });
         malloc_trim(0);
         std::cerr << "  Strings: +" << total_added << " -" << total_deleted << ", "
                   << str_remap.run_count() << " remap runs, " << strings.pairs.size() << " moved-string pairs" << std::endl;
+        // The moved strings' pairs, at the section's end, are looked up at
+        // random from here on.
+        advise_pages(P + strings_at, patch_size - strings_at, MADV_RANDOM);
     }
     // Release patch pages read so far (string section)
     madvise(const_cast<char*>(patch_map.data), pos, MADV_DONTNEED);

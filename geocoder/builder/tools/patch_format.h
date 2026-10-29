@@ -1720,6 +1720,8 @@ struct StringTierEdit {
     const char* added_at = nullptr;
     const char* deleted = nullptr;
     uint32_t n_deleted = 0;
+    // Past the edit's last byte (the deleted list ends it).
+    const char* end() const { return deleted + size_t{n_deleted} * 4; }
 };
 
 // Index i of a list of u32 string indices where it sits.
