@@ -1714,7 +1714,7 @@ impl Index {
                 let dlng = (lng - pn.lng as f64).to_radians();
                 let dist_sq = dlat * dlat + dlng * dlng * cos_lat * cos_lat;
                 let dist_m = to_m(dist_sq);
-                if dist_m > 20000.0 { return; }
+                if dist_m > DEBUG_PLACES_NEARBY_M { return; }
                 nearby.push(serde_json::json!({
                     "type": type_names[pt],
                     "name": self.get_string(pn.name_id),
@@ -4054,6 +4054,10 @@ pub fn beats<K: PartialOrd>(dist: f64, best_dist: f64, keys: impl FnOnce() -> Op
     keys().is_some_and(|(k, best)| k < best)
 }
 
+/// The `cos_lat` of a distance planar in degrees, as PostGIS measures lon/lat
+/// geometry: no cos(lat) scaling of longitude.
+const PLANAR: f64 = 1.0;
+
 pub fn dist_sq(dlat: f64, dlng: f64, cos_lat: f64) -> f64 {
     dlat * dlat + dlng * dlng * cos_lat * cos_lat
 }
@@ -4085,7 +4089,6 @@ pub fn point_to_segment_with_t(
 /// as PostGIS ST_ClosestPoint is on placex's lon/lat geometry (reverse.py:46),
 /// so a longitude degree counts as much as a latitude degree at any latitude.
 pub fn closest_point_on_line(nodes: &[NodeCoord], lat: f64, lng: f64) -> Option<(f64, f64)> {
-    const PLANAR: f64 = 1.0; // no cos(lat) scaling of longitude
     let mut best: Option<(f64, f64, f64)> = None;
     for w in nodes.windows(2) {
         let (a, b) = ((w[0].lat as f64, w[0].lng as f64), (w[1].lat as f64, w[1].lng as f64));
@@ -4463,6 +4466,10 @@ pub fn place_fuzzy_half_side_m(pt: usize) -> f64 {
 /// either axis covers it.
 pub const MAX_PLACE_FUZZY_HALF_SIDE_M: f64 = 15000.0;
 
+/// How far from the point debug_places lists the place nodes in the cells
+/// find_places looks in.
+const DEBUG_PLACES_NEARBY_M: f64 = 20000.0;
+
 /// Metres per degree of latitude (and of longitude at the equator) in the
 /// fuzzy-area squares.
 pub const METRES_PER_DEGREE: f64 = 111320.0;
@@ -4683,7 +4690,6 @@ pub fn line_crosses_fuzzy_area(line: &[NodeCoord], centre_lat: f32, centre_lng: 
 /// counts as much as a latitude degree at any latitude; only the fuzzy area
 /// is measured in metres.
 pub fn place_node_covering(pn: &PlaceNode, feature: PlaceFeature<'_>) -> Option<f64> {
-    const PLANAR: f64 = 1.0; // no cos(lat) scaling of longitude
     let pt = pn.place_type as usize;
     if pt >= PLACE_NODE_RANK.len() {
         return None;
@@ -6433,7 +6439,7 @@ mod pure_helper_tests {
     }
 
     #[test]
-    fn point_in_encoded_polygon_matches_the_decoded_ray_cast() {
+    fn point_in_encoded_polygon_matches_the_decoded_ray_cast_on_a_keyhole_and_its_boundary() {
         // The keyhole square with two holes, scaled into each encoding's delta range.
         let (outer, holes) = square_with_two_holes();
         let unit = keyhole(&outer, &holes);
@@ -6950,7 +6956,7 @@ mod encoded_pip_tests {
     const WIDTH_BY_ENCODING: [f64; 5] = [0.3, 3.0, 0.03, 20.0, 20.0];
 
     #[test]
-    fn point_in_encoded_polygon_matches_the_decoded_ray_cast() {
+    fn point_in_encoded_polygon_matches_the_decoded_ray_cast_on_random_rings() {
         let mut rng = Rng::new(20261019);
         for enc in 0u8..=4 {
             let radius = WIDTH_BY_ENCODING[enc as usize] / 2.0;
