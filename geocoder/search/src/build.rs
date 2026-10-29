@@ -1019,10 +1019,11 @@ pub fn merge(mut runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, S
     let name = runs.name.as_str();
     let n_runs = files.len();
     let (files, rewritten) = reduce_runs(files, &opts.tmp, name).map_err(|e| e.to_string())?;
-    let mk = |ext: &str| File::create(out.join(format!("{name}.{ext}"))).map_err(|e| e.to_string());
+    let [keys_path, post_path, pfx_keys_path, pfx_path] = sub_index_files(name).map(|f| out.join(f));
+    let mk = |path: &Path| File::create(path).map_err(|e| e.to_string());
     let mut w = Writer {
-        fst: fst::MapBuilder::new(BufWriter::with_capacity(WRITE_BUFFER, mk("fst")?)).map_err(|e| e.to_string())?,
-        post: BufWriter::with_capacity(WRITE_BUFFER, mk("post")?),
+        fst: fst::MapBuilder::new(BufWriter::with_capacity(WRITE_BUFFER, mk(&keys_path)?)).map_err(|e| e.to_string())?,
+        post: BufWriter::with_capacity(WRITE_BUFFER, mk(&post_path)?),
         post_len: 0,
         scratch: Vec::new(),
         inline: opts.inline,
@@ -1073,8 +1074,8 @@ pub fn merge(mut runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, S
     // Merge the per-length files: each is sorted, and a prefix occurs in one length only.
     let mut heads: Vec<Option<(Vec<u8>, Vec<u8>)>> =
         pfx_readers.iter_mut().enumerate().map(|(i, r)| read_prefix(r).map_err(|e| slots[i].error(e))).collect::<Result<_, _>>()?;
-    let mut pf = fst::MapBuilder::new(BufWriter::new(mk("pfx.fst")?)).map_err(|e| e.to_string())?;
-    let mut pb = BufWriter::new(mk("pfx")?);
+    let mut pf = fst::MapBuilder::new(BufWriter::new(mk(&pfx_keys_path)?)).map_err(|e| e.to_string())?;
+    let mut pb = BufWriter::new(mk(&pfx_path)?);
     let mut off = 0u64;
     loop {
         let Some(i) = (0..heads.len()).filter(|&i| heads[i].is_some()).min_by(|&a, &b| heads[a].as_ref().unwrap().0.cmp(&heads[b].as_ref().unwrap().0)) else {
@@ -1093,7 +1094,7 @@ pub fn merge(mut runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, S
     pb.flush().map_err(|e| e.to_string())?;
     let t_merge = t0.elapsed();
 
-    let size = |ext: &str| std::fs::metadata(out.join(format!("{name}.{ext}"))).map(|m| m.len()).unwrap_or(0);
+    let size = |path: &Path| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     st.add("entities indexed", ents);
     st.add("key entries", entries);
     st.add("keys", keys);
@@ -1104,11 +1105,11 @@ pub fn merge(mut runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, S
     st.add("sort runs", n_runs);
     st.add("run bytes spilled", spilled);
     st.add("run bytes rewritten", rewritten);
-    st.add("bytes fst", size("fst"));
-    st.add("bytes post", size("post"));
-    st.add("bytes pfx", size("pfx.fst") + size("pfx"));
+    st.add("bytes fst", size(&keys_path));
+    st.add("bytes post", size(&post_path));
+    st.add("bytes pfx", size(&pfx_keys_path) + size(&pfx_path));
     if name != "poi" {
-        st.add("bytes bnd", std::fs::metadata(out.join(BOUNDARY_FILE)).map(|m| m.len()).unwrap_or(0));
+        st.add("bytes bnd", size(&out.join(BOUNDARY_FILE)));
     }
     st.add("time sources s", format!("{:.2}", t_src.as_secs_f64()));
     st.add("time keys+runs s", format!("{:.2}", t_keys.as_secs_f64()));
@@ -1121,6 +1122,17 @@ pub fn merge(mut runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, S
 /// The sub-indexes of `selected` that `geo` has records for: POIs only where it has them.
 pub fn held_subs(geo: &Index, selected: &[&'static str]) -> Vec<&'static str> {
     selected.iter().copied().filter(|&s| s != "poi" || geo.poi_records.is_some()).collect()
+}
+
+/// The files of sub-index `name`, one per SUB_INDEX_EXTS.
+pub fn sub_index_files(name: &str) -> [String; 4] {
+    SUB_INDEX_EXTS.map(|ext| format!("{name}.{ext}"))
+}
+
+/// Whether `dir` holds sub-index `name`: its keys file is there.
+pub fn has_sub_index(dir: &Path, name: &str) -> bool {
+    let [keys, ..] = sub_index_files(name);
+    dir.join(keys).exists()
 }
 
 /// The META_FILE fields of an index of `geo` built with `opts`: what `SearchIndex::open` reads
@@ -1273,6 +1285,7 @@ fn publish(stage: &Path, out: &Path, rename: impl Fn(&Path, &Path) -> std::io::R
                 }
             }
             if stuck.is_empty() {
+                let _ = std::fs::remove_dir(&aside);
                 return Err(e);
             }
             let e = format!("{e}; could not put back {}: the files they replaced are in {}", stuck.join(", "), aside.display());
@@ -1291,8 +1304,8 @@ pub fn check_retained_names(out: &Path, building: &[&str], with_extras: bool) ->
         Err(e) => return Err(e.to_string()),
     };
     let meta: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    for name in ["places", "poi"] {
-        if !building.contains(&name) && out.join(format!("{name}.fst")).exists()
+    for &name in SUB_INDEXES {
+        if !building.contains(&name) && has_sub_index(out, name)
             && has_extra_names(&meta) != with_extras {
             return Err(format!("retained {name} sub-index uses a different extra-name setting; rebuild with --sub all or the same --extras setting"));
         }
@@ -1991,11 +2004,10 @@ mod tests {
         };
 
         let result = publish(&stage, &out, rename);
-        clear_stage(&stage);
 
         assert!(result.is_err());
         assert_eq!(contents(&out), before);
-        assert!(!stage.exists());
+        assert!(!stage.join(BUILD_ASIDE_DIR).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

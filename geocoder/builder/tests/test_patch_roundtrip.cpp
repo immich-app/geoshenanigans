@@ -536,6 +536,28 @@ TEST(patch_round_trip_by_identity_rebuilds_interp_ways) {
     CHECK(logged(r, "interp_ways identity: match=1 replace=1 insert=2 delete=2 moved=1"));
 }
 
+// A sidecar that is not one key per record (short, long or missing) is
+// rejected: the log names its family, which merges by content.
+TEST(patch_round_trip_warns_of_each_rejected_identity_sidecar_and_merges_its_family_by_content) {
+    BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(NEW_POOL);
+    Identity ids;
+    put_identity_streets(old_d, new_d, ids);
+    put_identity_addresses(old_d, new_d, ids);
+    put_identity_interps(old_d, new_d, ids);
+    ids.new_keys["street"].pop_back();
+    ids.old_keys["addr"].push_back(5);
+    ids.old_keys.erase("interp");
+
+    auto r = round_trip(old_d, new_d, ids);
+
+    CHECK(r.mismatches.empty());
+    CHECK(logged(r, "new-meta/street.slot.u32 rejected (16 bytes for 5 records); street merges by content"));
+    CHECK(logged(r, "old-meta/addr.slot.u32 rejected (24 bytes for 5 records); addr merges by content"));
+    CHECK(logged(r, "old-meta/interp.slot.u32 rejected (0 bytes for 4 records); interp merges by content"));
+    CHECK(!logged(r, "old-meta/street.slot.u32"));
+    CHECK(!logged(r, " identity: match="));
+}
+
 // The patch path is one argument to the decompressor whatever its
 // characters: a compressed non-patch under each name is decompressed as
 // named (the patcher gets as far as its magic), and no part of a name runs
@@ -557,6 +579,30 @@ TEST(patch_decompresses_the_patch_path_as_named) {
         CHECK(logged(r, "Bad magic"));
     }
     CHECK(!std::filesystem::exists(root + "/pwned"));
+}
+
+// The patcher decompresses the patch with libzstd in process, so it applies
+// with no zstd on PATH; one built on the zstd CLI (-DGEOCODER_PATCH_LIBZSTD=OFF)
+// runs the zstd on PATH, and without one fails to decompress.
+TEST(patch_needs_no_zstd_on_path_unless_built_on_the_zstd_cli) {
+    ScratchDir dir("patch-no-zstd");
+    const std::string& root = dir.path();
+    REQUIRE(!diff_way_parents(root).raw.empty());
+    std::filesystem::create_directories(root + "/no-zstd");
+    const std::string log = root + "/out.log";
+
+    PatchRun r;
+    r.ok = run({"env", "PATH=" + root + "/no-zstd", GEOCODER_PATCH_BIN, "old", "p.gcpatch", "-o", "out"}, log, root);
+
+    auto text = read_file(log);
+    r.log.assign(text.begin(), text.end());
+#ifdef GEOCODER_PATCH_ZSTD_CLI
+    CHECK(!r.ok);
+    CHECK(logged(r, "Failed to decompress"));
+#else
+    CHECK(r.ok);
+    CHECK(read_file(root + "/out/way_parents.bin") == bytes_of(new_way_parents()));
+#endif
 }
 
 // A patch shorter than its 8-byte magic is refused as truncated: the magic

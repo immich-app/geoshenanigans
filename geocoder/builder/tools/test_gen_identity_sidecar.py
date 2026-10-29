@@ -81,6 +81,15 @@ class MainTest(unittest.TestCase):
             for family in sut.TOMBSTONES:
                 self.assertEqual(read_words(os.path.join(out, family + ".slot.u32")), [NO, 1])
 
+    def test_writes_no_sidecar_for_a_family_the_dir_lacks(self):
+        with tempfile.TemporaryDirectory() as d:
+            src, out = os.path.join(d, "no-addresses"), os.path.join(d, "meta")
+            os.makedirs(src)
+            write_words(os.path.join(src, "street_ways.bin"), [(1, 2, 3)])
+            self.assertEqual(sut.main(["gen_identity_sidecar.py", src, out]), 0)
+            self.assertEqual(os.listdir(out), ["street.slot.u32"])
+            self.assertEqual(read_words(os.path.join(out, "street.slot.u32")), [0])
+
 
 if __name__ == "__main__":
     unittest.main()

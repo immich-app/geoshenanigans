@@ -38,7 +38,11 @@ fn load_geo(dir: &str) -> Index {
 }
 
 fn opt(args: &[String], name: &str) -> Option<String> {
-    args.iter().position(|a| a == name).map(|i| args[i + 1].clone())
+    let i = args.iter().position(|a| a == name)?;
+    let Some(value) = args.get(i + 1) else {
+        eprintln!("{name} needs a value"); std::process::exit(2);
+    };
+    Some(value.clone())
 }
 
 fn flag(args: &[String], name: &str) -> bool {
