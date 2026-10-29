@@ -541,6 +541,8 @@ TEST(run_with_heap_peak_counts_the_mapped_pages_of_a_program_built_as_the_tools_
          {"map", "0", "8", "move", "2", "4", "16", "2", "map", "32", "8"}, 14},
         {"8 MiB copied by mremap() with MREMAP_DONTUNMAP, then 8 MiB more",
          {"map", "0", "8", "copy", "0", "8", "16", "map", "32", "8"}, 24},
+        {"4 MiB of shared 8 mapped a second time by mremap(), then 8 MiB more",
+         {"share", "0", "8", "clone", "2", "16", "4", "map", "32", "8"}, 20},
     };
 
     const std::optional<uint64_t> none = peak_of({});
@@ -559,9 +561,11 @@ TEST(run_with_heap_peak_counts_the_mapped_pages_of_a_program_built_as_the_tools_
 }
 
 // The heap shim's table holds 4096 mappings: heap-peak-probe cutting a
-// mapping into 4096 pieces runs and peaks at the mapping whole, and cutting
-// one into 4097 ends with the shim's message and no peak, since a piece left
-// out of the table would count wrong from then on.
+// mapping into 4096 pieces runs and peaks at the mapping whole, as does one
+// cutting 4094 beside a shared mapping and a second mapping of its pages
+// (which leaves the first whole), and cutting one into 4097 ends with the
+// shim's message and no peak, since a piece left out of the table would
+// count wrong from then on.
 TEST(run_with_heap_peak_ends_a_program_with_more_mappings_than_the_shim_holds) {
 #ifndef GEOCODER_HEAP_PEAK_PROBE
     std::printf("    SKIP heap peaks of heap-peak-probe: no heap shim under the sanitizers\n");
@@ -575,6 +579,10 @@ TEST(run_with_heap_peak_ends_a_program_with_more_mappings_than_the_shim_holds) {
     const auto [fits, fits_peak] = gctest::run_with_heap_peak({GEOCODER_HEAP_PEAK_PROBE, "shatter", "0", "4096"}, dir.path() + "/fits");
     CHECK(fits);
     CHECK(fits_peak && *fits_peak == *none + 2 * 4096 * page);
+    const auto [cloned, cloned_peak] = gctest::run_with_heap_peak(
+        {GEOCODER_HEAP_PEAK_PROBE, "share", "0", "8", "clone", "2", "16", "4", "shatter", "32", "4094"}, dir.path() + "/cloned");
+    CHECK(cloned);
+    CHECK(cloned_peak && *cloned_peak == *none + (uint64_t{12} << 20) + 2 * 4094 * page);
 
     const auto [ok, heap_peak] = gctest::run_with_heap_peak({GEOCODER_HEAP_PEAK_PROBE, "shatter", "0", "4097"}, log);
 

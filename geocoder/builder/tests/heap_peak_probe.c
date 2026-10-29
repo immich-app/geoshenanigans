@@ -5,6 +5,7 @@
 // address space the probe found, with an optional +BYTES (0+1 is one byte
 // in); MIB and NEW are lengths in MiB.
 //   map AT MIB          an anonymous mapping of the range, which is free
+//   share AT MIB        the same, shared (MAP_SHARED)
 //   over AT MIB         an anonymous MAP_FIXED mapping over the range
 //   unmap AT MIB        munmap() of the range
 //   resize AT MIB NEW   mremap() of the range to NEW MiB in place
@@ -12,6 +13,8 @@
 //                       is mapped there (MREMAP_FIXED)
 //   copy AT MIB TO      mremap() of the range to TO that leaves it mapped at
 //                       AT as well (MREMAP_DONTUNMAP)
+//   clone AT TO NEW     mremap() of 0 bytes at AT in a shared mapping, which
+//                       maps NEW MiB of its pages from AT a second time at TO
 //   shatter AT PIECES   an anonymous mapping of 2 PIECES pages at AT, cut
 //                       into PIECES by munmap() of every second page
 // Each succeeds, unless its name ends in -refused (unmap-refused,
@@ -34,14 +37,14 @@
 
 static char* base;
 
-enum { MAP, OVER, UNMAP, RESIZE, MOVE, COPY, SHATTER, OPS };
+enum { MAP, SHARE, OVER, UNMAP, RESIZE, MOVE, COPY, CLONE, SHATTER, OPS };
 
 static const struct {
     const char* name;
     int numbers;
 } ops[OPS] = {
-    [MAP] = {"map", 2}, [OVER] = {"over", 2}, [UNMAP] = {"unmap", 2}, [RESIZE] = {"resize", 3},
-    [MOVE] = {"move", 4}, [COPY] = {"copy", 3}, [SHATTER] = {"shatter", 2},
+    [MAP] = {"map", 2}, [SHARE] = {"share", 2}, [OVER] = {"over", 2}, [UNMAP] = {"unmap", 2}, [RESIZE] = {"resize", 3},
+    [MOVE] = {"move", 4}, [COPY] = {"copy", 3}, [CLONE] = {"clone", 3}, [SHATTER] = {"shatter", 2},
 };
 
 // A step's number: n, and the bytes after a +.
@@ -71,19 +74,29 @@ static int inside(size_t at, size_t len) { return at <= SPACE && len <= SPACE - 
 static int run(int op, const struct number* v) {
     const int prot = PROT_READ | PROT_WRITE, anonymous = MAP_PRIVATE | MAP_ANONYMOUS;
     const size_t page = (size_t)getpagesize(), at = mib(v[0]);
-    const size_t len = op == SHATTER ? 2 * v[1].n * page : mib(v[1]);
-    const size_t to = op == RESIZE ? at : op == MOVE || op == COPY ? mib(v[2]) : 0;
-    const size_t new_len = op == RESIZE ? mib(v[2]) : op == MOVE ? mib(v[3]) : len;
+    // The step's old range [at, at + len), and its new one [to, to + new_len).
+    size_t len = mib(v[1]), to = at, new_len = len;
+    if (op == SHATTER) len = new_len = 2 * v[1].n * page;
+    if (op == RESIZE) new_len = mib(v[2]);
+    if (op == MOVE || op == COPY) to = mib(v[2]);
+    if (op == MOVE) new_len = mib(v[3]);
+    if (op == CLONE) {
+        len = 0;
+        to = mib(v[1]);
+        new_len = mib(v[2]);
+    }
     if (!inside(at, len) || !inside(to, new_len)) return -1;
 
     char* const p = base + at;
     switch (op) {
         case MAP: return mmap(p, len, prot, anonymous | MAP_FIXED_NOREPLACE, -1, 0) == p;
+        case SHARE: return mmap(p, len, prot, MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0) == p;
         case OVER: return mmap(p, len, prot, anonymous | MAP_FIXED, -1, 0) == p;
         case UNMAP: return munmap(p, len) == 0;
         case RESIZE: return mremap(p, len, new_len, 0) == p;
         case MOVE: return mremap(p, len, new_len, MREMAP_MAYMOVE | MREMAP_FIXED, base + to) == base + to;
         case COPY: return mremap(p, len, len, MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP, base + to) == base + to;
+        case CLONE: return mremap(p, 0, new_len, MREMAP_MAYMOVE | MREMAP_FIXED, base + to) == base + to;
     }
     if (mmap(p, len, prot, anonymous | MAP_FIXED_NOREPLACE, -1, 0) != p) return 0;
     for (size_t off = page; off < len; off += 2 * page)

@@ -127,8 +127,9 @@ static void remember(uintptr_t from, uintptr_t to) {
 }
 
 // Takes the pages [from, to) out of the mappings, and their bytes out of the
-// live count.
+// live count; no pages leave every mapping whole.
 static void forget(uintptr_t from, uintptr_t to) {
+    if (from >= to) return;
     for (int i = 0; i < mapped; i++) {
         const uintptr_t start = mappings[i].from, end = mappings[i].to;
         if (end <= from || to <= start) continue;
@@ -236,11 +237,10 @@ void* mremap(void* old, size_t old_len, size_t len, int flags, ...) {
     const uintptr_t from = (uintptr_t)old, old_bytes = page_rounded(old_len), bytes = page_rounded(len);
     const int anonymous = counted(from, from + (old_bytes ? old_bytes : 1));
     void* p = (void*)syscall(SYS_mremap, old, old_len, len, flags, want);
-    if (p == old) {
-        if (bytes < old_bytes) forget(from + bytes, from + old_bytes);
+    if (p != MAP_FAILED) {
+        if (p != old) moved(from, old_bytes, (uintptr_t)p, bytes, flags & MREMAP_DONTUNMAP, anonymous);
+        else if (bytes < old_bytes) forget(from + bytes, from + old_bytes);
         else if (bytes > old_bytes) map_over(from + old_bytes, from + bytes, anonymous);
-    } else if (p != MAP_FAILED) {
-        moved(from, old_bytes, (uintptr_t)p, bytes, flags & MREMAP_DONTUNMAP, anonymous);
     }
     unlock_mappings();
     return p;
