@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "patch_format.h"
+#include "sanitizer_report.h"
 
 namespace gctest {
 
@@ -38,12 +39,18 @@ inline std::string quoted(const std::string& s) {
 }
 
 // Runs the words (in dir cwd when given) with their output appended to log;
-// true on exit status 0. Stdin is /dev/null: after a usage error zstd waits
-// for Enter at a console.
+// true on exit status 0. A run a sanitizer report ended throws
+// SanitizerReported with the log, whatever the test expected of it. Stdin is
+// /dev/null: after a usage error zstd waits for Enter at a console.
 inline bool run(const std::vector<std::string>& words, const std::string& log, const std::string& cwd = "") {
     std::string cmd = cwd.empty() ? "" : "cd " + quoted(cwd) + " && ";
     for (const auto& w : words) cmd += quoted(w) + " ";
-    return std::system((cmd + "< /dev/null >> " + quoted(log) + " 2>&1").c_str()) == 0;
+    const int status = std::system((cmd + "< /dev/null >> " + quoted(log) + " 2>&1").c_str());
+    if (ended_by_sanitizer_report(status)) {
+        const std::vector<char> text = read_file(log);
+        throw SanitizerReported(words[0] + " ended with a sanitizer report:\n" + std::string(text.begin(), text.end()));
+    }
+    return status == 0;
 }
 
 }  // namespace gctest

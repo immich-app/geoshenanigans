@@ -228,7 +228,12 @@ add_test(NAME geocoder-s2-tests COMMAND geocoder-s2-tests)
 option(GEOCODER_SANITIZE "Build geocoder-tests and its tools with ASan and UBSan" OFF)
 if(GEOCODER_SANITIZE)
     set(GEOCODER_SANITIZE_FLAGS -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer)
-    foreach(target geocoder-tests geocoder-diff geocoder-patch geocoder-gc)
+    # A tool ended by the sanitizer report it is asked for: such a run fails
+    # the tests (tests/test_sanitizer_report.cpp).
+    add_executable(geocoder-sanitizer-reports tests/fixtures/sanitizer_reports.cpp)
+    target_compile_definitions(geocoder-tests PRIVATE GEOCODER_SANITIZER_REPORTS_BIN="$<TARGET_FILE:geocoder-sanitizer-reports>")
+    add_dependencies(geocoder-tests geocoder-sanitizer-reports)
+    foreach(target geocoder-tests geocoder-diff geocoder-patch geocoder-gc geocoder-sanitizer-reports)
         target_compile_options(${target} PRIVATE ${GEOCODER_SANITIZE_FLAGS})
         target_link_options(${target} PRIVATE ${GEOCODER_SANITIZE_FLAGS})
     endforeach()
