@@ -534,9 +534,6 @@ static int run(int argc, char* argv[]) {
     // tiers it ships from its own old ones and derives their runs; the diff
     // sends the runs of the tiers it doesn't ship but references.
     StringRemap str_remap;
-    // The old shipped tiers stay mapped until the replays are done:
-    // str_remap's derived runs check string starts against them.
-    std::vector<MappedFile> old_str_pools;
     {
         const StringsSection strings = parse_strings_section(P, patch_size, pos);
         require_shipped_tiers_listed(strings.shipped, listed);
@@ -557,7 +554,7 @@ static int run(int argc, char* argv[]) {
             if (new_pool.size != strings.new_size(t) || content_hash(new_pool.data, new_pool.size) != edit.new_hash)
                 throw std::runtime_error(std::string("Rebuilt ") + name + " does not match the new build");
             str_remap.add_tier(old_pool.data, old_pool.size, strings.old_base[t], strings.new_base[t], edit);
-            old_str_pools.push_back(old_pool);
+            unmap_file(old_pool);
             unmap_file(new_pool);
         });
         malloc_trim(0);
@@ -1195,8 +1192,6 @@ static int run(int argc, char* argv[]) {
 
     // Free string remap + release all processed patch pages
     str_remap = StringRemap();
-    for (auto& m : old_str_pools) if (m.data) unmap_file(m);
-    old_str_pools.clear();
     madvise(const_cast<char*>(patch_map.data), pos, MADV_DONTNEED);
     malloc_trim(0);
 

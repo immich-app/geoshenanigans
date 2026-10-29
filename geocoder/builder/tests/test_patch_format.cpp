@@ -1126,11 +1126,18 @@ std::unordered_map<uint32_t, uint32_t> pairs_of(const std::string& o, const std:
     return out;
 }
 
+// Every string start of a pool, as global offsets from base.
+std::vector<uint32_t> starts_of(const std::string& pool, uint32_t base) {
+    std::vector<uint32_t> out;
+    for (size_t i = 0; i < pool.size(); i += strlen(pool.c_str() + i) + 1) out.push_back(base + (uint32_t)i);
+    return out;
+}
+
 }  // namespace
 
 TEST(patch_format_string_remap_runs_match_per_string_pairs) {
-    // Random edits to two tiers: every offset (string starts, mid-string
-    // bytes, deleted strings, past the end) maps exactly as the pairs did.
+    // Random edits to two tiers: every string start (kept, deleted or
+    // unmoved) and every offset past the tiers maps exactly as the pairs did.
     uint64_t seed = 7;
     auto rnd = [&](uint32_t n) { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return (uint32_t)(seed >> 33) % n; };
     auto word = [&] { std::string w; for (uint32_t k = 0, len = 1 + rnd(5); k < len; k++) w.push_back('a' + rnd(6)); return w; };
@@ -1149,15 +1156,18 @@ TEST(patch_format_string_remap_runs_match_per_string_pairs) {
         StringRemap remap;
         uint32_t ob = 0, nb = 0;
         std::unordered_map<uint32_t, uint32_t> want;
+        std::vector<uint32_t> looked_up;
         for (int t = 0; t < 2; t++) {
             remap.add_tier(olds[t].data(), olds[t].size(), ob, nb, tier_edit(olds[t], news[t]).edit());
             for (auto& kv : pairs_of(olds[t], news[t], ob, nb)) want.insert(kv);
+            for (uint32_t v : starts_of(olds[t], ob)) looked_up.push_back(v);
             ob += olds[t].size(); nb += news[t].size();
         }
         const std::vector<char> moved = pair_bytes({{ob + 100, 3}});  // a string that moved tier
         remap.set_pairs(pair_table(moved));
         want[ob + 100] = 3;
-        for (uint32_t off = 0; off < ob + 110; off++) {
+        for (uint32_t off = ob; off < ob + 110; off++) looked_up.push_back(off);
+        for (uint32_t off : looked_up) {
             auto it = want.find(off);
             CHECK_EQ(remap.lookup(off), it != want.end() ? it->second : off);
         }
@@ -1165,16 +1175,56 @@ TEST(patch_format_string_remap_runs_match_per_string_pairs) {
     }
 }
 
-namespace {
+TEST(patch_format_derived_and_sent_string_runs_map_every_offset_alike) {
+    // Random edits to a tier: the runs the patcher derives from the tier's
+    // old pool and the runs the diff sends for it shift every offset alike,
+    // string start or not.
+    uint64_t seed = 13;
+    auto rnd = [&](uint32_t n) { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return (uint32_t)(seed >> 33) % n; };
+    auto word = [&] { std::string w; for (uint32_t k = 0, len = 1 + rnd(5); k < len; k++) w.push_back('a' + rnd(6)); return w; };
+    for (int round = 0; round < 100; round++) {
+        std::vector<std::string> o, n;
+        for (int i = 0; i < 40; i++) {
+            std::string w = word();
+            uint32_t kind = rnd(10);
+            if (kind != 0) o.push_back(w);  // kind 0: added
+            if (kind != 1) n.push_back(w);  // kind 1: deleted
+        }
+        const std::string old_pool = pool_of(o), new_pool = pool_of(n);
+        const uint32_t ob = 1000 + rnd(50), nb = 1000 + rnd(50), end = ob + (uint32_t)old_pool.size();
+        const TierEdit e = tier_edit(old_pool, new_pool);
+        const StringTierRuns runs = encode_string_tier_runs(old_pool.data(), old_pool.size(), ob, nb, e.kept);
+        StringRemap derived, sent;
+        derived.add_tier(old_pool.data(), old_pool.size(), ob, nb, e.edit());
+        sent.add_sent_tier(runs.bytes.data(), runs.bytes.size(), runs.n_runs, ob, end);
 
-// Every string start of a pool, as global offsets from base.
-std::vector<uint32_t> starts_of(const std::string& pool, uint32_t base) {
-    std::vector<uint32_t> out;
-    for (size_t i = 0; i < pool.size(); i += strlen(pool.c_str() + i) + 1) out.push_back(base + (uint32_t)i);
-    return out;
+        CHECK_EQ(derived.run_count(), sent.run_count());
+        std::vector<uint32_t> differ;
+        for (uint32_t off = ob - 1; off <= end; off++)
+            if (derived.lookup(off) != sent.lookup(off)) differ.push_back(off);
+        CHECK(differ.empty());
+    }
 }
 
-}  // namespace
+TEST(patch_format_string_remap_lookups_never_read_the_old_pool) {
+    // The patcher unmaps a shipped tier's old pool once add_tier has walked
+    // it: scribbled over afterwards, every string start still maps as the
+    // per-string pairs did.
+    const std::string o = pool_of({"a", "bb", "c", "dd", "e", "ff", "g"});
+    const std::string n = pool_of({"a", "aa", "bb", "c", "e", "eee", "ff", "g", "h"});
+    const uint32_t ob = 1000, nb = 990;
+    std::vector<char> old_pool(o.begin(), o.end());
+    StringRemap remap;
+    remap.add_tier(old_pool.data(), old_pool.size(), ob, nb, tier_edit(o, n).edit());
+
+    std::fill(old_pool.begin(), old_pool.end(), 'x');
+
+    const auto want = pairs_of(o, n, ob, nb);
+    for (uint32_t v : starts_of(o, ob)) {
+        auto it = want.find(v);
+        CHECK_EQ(remap.lookup(v), it != want.end() ? it->second : v);
+    }
+}
 
 TEST(patch_format_sent_string_runs_map_every_string_start) {
     // A tier the client doesn't hold: its runs travel encoded and are looked
