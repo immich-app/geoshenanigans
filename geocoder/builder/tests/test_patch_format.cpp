@@ -386,6 +386,50 @@ TEST(patch_format_content_hash_of_nothing_is_stable) {
     CHECK_EQ(content_hash(nullptr, 0), content_hash(none, 0));
 }
 
+// content_hash as the patch format defines it, in one pass: the diff wrote
+// every planet patch's tier hashes so.
+static uint64_t one_pass_content_hash(const char* data, size_t n) {
+    uint64_t h = 0x9E3779B97F4A7C15ull ^ n;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w;
+        memcpy(&w, data + i, 8);
+        h = (h ^ w) * 0xFF51AFD7ED558CCDull;
+        h ^= h >> 32;
+    }
+    uint64_t tail = 0;
+    if (n > i) memcpy(&tail, data + i, n - i);
+    h = (h ^ tail) * 0xC4CEB9FE1A85EC53ull;
+    return h ^ (h >> 29);
+}
+
+TEST(patch_format_content_hasher_equals_content_hash_over_any_split) {
+    // Random bytes of every length up to 200 and a few longer, fed in random
+    // pieces (empty ones too): each hash is the one-pass content_hash.
+    std::mt19937 rng(20261029);
+    std::vector<size_t> sizes(201);
+    std::iota(sizes.begin(), sizes.end(), size_t(0));
+    for (const size_t n : {size_t(4095), size_t(4096), size_t(65537)}) sizes.push_back(n);
+    size_t wrong = 0;
+    for (const size_t n : sizes) {
+        std::vector<char> data(n);
+        for (char& c : data) c = static_cast<char>(rng());
+        const uint64_t want = one_pass_content_hash(data.data(), n);
+        CHECK_EQ(content_hash(data.data(), n), want);
+        for (int split = 0; split < 20; split++) {
+            ContentHasher sut(n);
+            for (size_t at = 0; at < n;) {
+                const size_t piece = std::min<size_t>(n - at, rng() % (split % 2 ? 20 : 3000));
+                sut.update(data.data() + at, piece);
+                at += piece;
+            }
+            wrong += sut.hash() != want;
+        }
+    }
+    CHECK_EQ(wrong, size_t(0));
+    CHECK_EQ(ContentHasher(0).hash(), one_pass_content_hash(nullptr, 0));
+}
+
 // --- string offset fields ---
 
 TEST(patch_format_string_fields_match_the_record_layouts) {

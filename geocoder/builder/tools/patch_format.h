@@ -396,21 +396,56 @@ static constexpr uint32_t SECONDARY_REMAP_MARKER = 0xFFFFFFF6;
 // A tier neither shipped nor referenced sends nothing: no lookup lands in it.
 static constexpr uint32_t STRINGS_TIERED_MARKER = 0xFFFFFFF6;
 
-// 64-bit content hash, 8 bytes per step. Not cryptographic: it proves a file
-// is the one the diff saw, against stale or mismatched inputs.
-inline uint64_t content_hash(const char* data, size_t n) {
-    uint64_t h = 0x9E3779B97F4A7C15ull ^ n;
-    size_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        uint64_t w;
-        memcpy(&w, data + i, 8);
-        h = (h ^ w) * 0xFF51AFD7ED558CCDull;
-        h ^= h >> 32;
+// 64-bit content hash, 8 bytes per step, fed piece by piece: seeded with the
+// total length n, it carries a step's bytes left over from one piece to the
+// next, so hash() of n bytes fed in any split is content_hash of them. Not
+// cryptographic: it proves a file is the one the diff saw, against stale or
+// mismatched inputs.
+class ContentHasher {
+public:
+    explicit ContentHasher(uint64_t n) : h_(0x9E3779B97F4A7C15ull ^ n) {}
+    void update(const char* p, size_t n) {
+        if (n == 0) return;
+        if (carried_ > 0) {
+            const size_t k = std::min(n, sizeof carry_ - carried_);
+            memcpy(carry_ + carried_, p, k);
+            carried_ += k;
+            p += k;
+            n -= k;
+            if (carried_ < sizeof carry_) return;
+            h_ = step(h_, carry_);
+            carried_ = 0;
+        }
+        uint64_t h = h_;
+        for (; n >= sizeof carry_; p += sizeof carry_, n -= sizeof carry_) h = step(h, p);
+        h_ = h;
+        memcpy(carry_, p, n);
+        carried_ = n;
     }
-    uint64_t tail = 0;
-    if (n > i) memcpy(&tail, data + i, n - i);
-    h = (h ^ tail) * 0xC4CEB9FE1A85EC53ull;
-    return h ^ (h >> 29);
+    uint64_t hash() const {
+        uint64_t tail = 0;
+        memcpy(&tail, carry_, carried_);
+        const uint64_t h = (h_ ^ tail) * 0xC4CEB9FE1A85EC53ull;
+        return h ^ (h >> 29);
+    }
+
+private:
+    static uint64_t step(uint64_t h, const char* p) {
+        uint64_t w;
+        memcpy(&w, p, sizeof w);
+        h = (h ^ w) * 0xFF51AFD7ED558CCDull;
+        return h ^ (h >> 32);
+    }
+
+    uint64_t h_;
+    char carry_[8];
+    size_t carried_ = 0;
+};
+
+inline uint64_t content_hash(const char* data, size_t n) {
+    ContentHasher h(n);
+    h.update(data, n);
+    return h.hash();
 }
 
 // Sparse position-keyed delta. Stride sentinel that signals the section
