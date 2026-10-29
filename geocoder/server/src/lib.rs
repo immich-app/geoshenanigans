@@ -193,6 +193,11 @@ pub const DEFAULT_SEARCH_DISTANCE: f64 = 660.0;
 // than falling through to `parent_street`.
 pub const POI_FLAG_HIGHWAY: u8 = 0x04;
 
+/// Whether (lat, lng) is a point on the globe: lat within ±90 and lng within ±180, so neither is NaN.
+pub fn coords_in_range(lat: f64, lng: f64) -> bool {
+    (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lng)
+}
+
 pub fn cell_id_at_level(lat: f64, lng: f64, level: u64) -> u64 {
     let ll = LatLng::from_degrees(lat, lng);
     CellID::from(ll).parent(level).0
@@ -3500,8 +3505,9 @@ impl MultiIndex {
         self.continents.iter().filter(|c| c.index.load().is_some()).count()
     }
 
+    /// A point off the globe is in no slot: S2 would wrap it onto a cell of the globe.
     fn covers(&self, slot: &ContinentSlot, lat: f64, lng: f64) -> bool {
-        slot.continent.map_or(true, |c| c.covers_query(lat, lng, self.admin_cell_level))
+        coords_in_range(lat, lng) && slot.continent.map_or(true, |c| c.covers_query(lat, lng, self.admin_cell_level))
     }
 
     /// Snapshot of loaded indices that cover the point. Returns Arc
@@ -5148,6 +5154,16 @@ pub fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
 mod pure_helper_tests {
     use super::*;
 
+    #[test]
+    fn coords_in_range_accepts_the_globe_only() {
+        for (lat, lng) in [(0.0, 0.0), (90.0, 180.0), (-90.0, -180.0), (48.85, 2.35)] {
+            assert!(coords_in_range(lat, lng), "({}, {})", lat, lng);
+        }
+        for (lat, lng) in [(91.0, 0.0), (-90.5, 0.0), (0.0, 180.1), (0.0, -181.0), (f64::NAN, 0.0), (0.0, f64::INFINITY)] {
+            assert!(!coords_in_range(lat, lng), "({}, {})", lat, lng);
+        }
+    }
+
     // -- nearest postcode ------------------------------------------------------
 
     #[test]
@@ -6712,6 +6728,27 @@ mod query_path_tests {
     fn address_from(index: &Index, origin: (f64, f64), north_m: f64, east_m: f64) -> serde_json::Value {
         let p = at_from(origin, north_m, east_m);
         serde_json::to_value(index.query(p.lat as f64, p.lng as f64)).unwrap()["address"].clone()
+    }
+
+    #[test]
+    fn query_json_finds_nothing_off_the_globe() {
+        let world = MultiIndex {
+            continents: vec![ContinentSlot {
+                name: "world",
+                continent: None,
+                index: arc_swap::ArcSwapOption::from(Some(Arc::new(TestIndex::new().load()))),
+            }],
+            root_dir: String::new(),
+            street_cell_level: DEFAULT_STREET_CELL_LEVEL,
+            admin_cell_level: DEFAULT_ADMIN_CELL_LEVEL,
+            search_distance: DEFAULT_SEARCH_DISTANCE,
+        };
+        let (lat, lng) = ORIGIN;
+        assert!(world.query_json(lat, lng).contains("Testland"));
+        // The first two are the origin's own point once S2 wraps them onto the globe.
+        for (lat, lng) in [(lat, lng + 360.0), (180.0 - lat, lng - 180.0), (f64::NAN, lng), (lat, f64::INFINITY), (90.5, lng), (lat, -180.5)] {
+            assert_eq!(world.query_json(lat, lng), "{}", "({}, {})", lat, lng);
+        }
     }
 
     #[test]
