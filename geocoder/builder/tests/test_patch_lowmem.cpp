@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <functional>
 #include <map>
+#include <optional>
 #include <random>
 #include <regex>
 #include <string>
@@ -535,21 +536,129 @@ TEST(run_with_heap_peak_measures_the_process_it_runs_and_not_its_children) {
 
 // The tools build with _FILE_OFFSET_BITS=64, which links their mmap() calls
 // (SequentialFileReader's read windows) to mmap64: heap-peak-probe, built the
-// same way, mapping 16 MiB peaks at least 15 MiB above it mapping 1 MiB.
-TEST(run_with_heap_peak_counts_the_mappings_of_a_program_built_as_the_tools_are) {
+// same way and allocating nothing itself, peaks exactly the most MiB it held
+// mapped at once above its peak mapping nothing. Every page of a mapping
+// counts until a munmap() or mremap() unmaps it or a MAP_FIXED mapping
+// replaces it, and counts where an mremap() moves it, however the ranges cut
+// the mappings; a refused call changes nothing. Each case ends mapping more
+// than it started with, so the pages left from its cuts decide the peak.
+TEST(run_with_heap_peak_counts_the_mapped_pages_of_a_program_built_as_the_tools_are) {
 #ifndef GEOCODER_HEAP_PEAK_PROBE
     std::printf("    SKIP heap peaks of heap-peak-probe: no heap shim under the sanitizers\n");
 #else
     ScratchDir dir("heap-peak-probe");
-    auto peak_of = [&](const std::string& mib) {
-        const auto [ok, heap_peak] = gctest::run_with_heap_peak({GEOCODER_HEAP_PEAK_PROBE, mib}, dir.path() + "/log");
-        REQUIRE(ok && heap_peak);
-        return *heap_peak;
+    auto peak_of = [&](const std::vector<std::string>& steps) {
+        std::vector<std::string> words = {GEOCODER_HEAP_PEAK_PROBE};
+        words.insert(words.end(), steps.begin(), steps.end());
+        const auto [ok, heap_peak] = gctest::run_with_heap_peak(words, dir.path() + "/log");
+        return ok ? heap_peak : std::nullopt;
+    };
+    struct Case {
+        const char* what;
+        std::vector<std::string> steps;
+        uint64_t mib;
+    };
+    const Case cases[] = {
+        {"16 MiB unmapped whole", {"map", "0", "16", "unmap", "0", "16"}, 16},
+        {"the first 6 MiB of 8 unmapped, then 8 MiB more", {"map", "0", "8", "unmap", "0", "6", "map", "16", "8"}, 10},
+        {"the last 6 MiB of 8 unmapped, then 8 MiB more", {"map", "0", "8", "unmap", "2", "6", "map", "16", "8"}, 10},
+        {"a 4 MiB hole punched in the middle of 8, then 8 MiB more", {"map", "0", "8", "unmap", "2", "4", "map", "16", "8"}, 12},
+        {"a 4 MiB hole punched in 8, the 2 MiB before it then unmapped, then 8 MiB more",
+         {"map", "0", "8", "unmap", "2", "4", "unmap", "0", "2", "map", "16", "8"}, 10},
+        {"a 4 MiB hole punched in 8, the 2 MiB after it then unmapped, then 8 MiB more",
+         {"map", "0", "8", "unmap", "2", "4", "unmap", "6", "2", "map", "16", "8"}, 10},
+        {"one munmap() of the last 2 MiB of a 4 MiB mapping and the first 2 of the next, then 8 MiB more",
+         {"map", "0", "4", "map", "4", "4", "unmap", "2", "4", "map", "16", "8"}, 12},
+        {"one munmap() of the end of a 4 MiB mapping, all of the next and the start of a third, then 16 MiB more",
+         {"map", "0", "4", "map", "4", "4", "map", "8", "4", "unmap", "2", "8", "map", "16", "16"}, 20},
+        {"4 MiB in the middle of 8 mapped over, then 8 MiB more", {"map", "0", "8", "over", "2", "4", "map", "16", "8"}, 16},
+        {"a refused munmap() of 0 bytes at the start of 8 MiB, then 8 MiB more",
+         {"map", "0", "8", "unmap-refused", "0", "0", "map", "16", "8"}, 16},
+        {"a refused munmap() of 4 MiB from 1 byte into 8, then 8 MiB more",
+         {"map", "0", "8", "unmap-refused", "0+1", "4", "map", "16", "8"}, 16},
+        {"8 MiB shrunk to 2 in place by mremap(), then 8 MiB more", {"map", "0", "8", "resize", "0", "8", "2", "map", "16", "8"}, 10},
+        {"a 4 MiB hole punched in 8, the 8 then shrunk to 6 in place by mremap(), then 8 MiB more",
+         {"map", "0", "8", "unmap", "2", "4", "resize", "0", "8", "6", "map", "16", "8"}, 10},
+        {"a 4 MiB hole punched in 8, the 8 then moved by mremap() as 2, then 8 MiB more",
+         {"map", "0", "8", "unmap", "2", "4", "move", "0", "8", "16", "2", "map", "32", "8"}, 10},
+        {"4 MiB grown to 8 in place by mremap(), then 8 MiB more", {"map", "0", "4", "resize", "0", "4", "8", "map", "16", "8"}, 16},
+        {"a refused mremap() growing 4 MiB into the next 4, then 8 MiB more",
+         {"map", "0", "4", "map", "4", "4", "resize-refused", "0", "4", "8", "map", "16", "8"}, 16},
+        {"8 MiB moved by mremap() as 4 over the start of another 8, then 16 MiB more",
+         {"map", "0", "8", "map", "16", "8", "move", "0", "8", "16", "4", "map", "32", "16"}, 24},
+        {"4 MiB moved by mremap() as 8, then 8 MiB more", {"map", "0", "4", "move", "0", "4", "16", "8", "map", "32", "8"}, 16},
+        {"the middle 4 MiB of 8 moved away by mremap() as 2, then 8 MiB more",
+         {"map", "0", "8", "move", "2", "4", "16", "2", "map", "32", "8"}, 14},
+        {"the middle 4 MiB of 8 moved by mremap() over two whole 2 MiB mappings, then 8 MiB more",
+         {"map", "0", "8", "map", "16", "2", "map", "18", "2", "move", "2", "4", "16", "4", "map", "32", "8"}, 16},
+        {"three 2 MiB mappings moved by mremap() as 2 onto the middle of 8, then 8 MiB more",
+         {"map", "0", "2", "map", "2", "2", "map", "4", "2", "map", "16", "8", "move", "0", "6", "18", "2", "map", "32", "8"}, 16},
+        {"8 MiB copied by mremap() with MREMAP_DONTUNMAP, then 8 MiB more",
+         {"map", "0", "8", "copy", "0", "8", "16", "map", "32", "8"}, 24},
+        {"4 MiB of shared 8 mapped a second time by mremap(), then 8 MiB more",
+         {"share", "0", "8", "clone", "2", "16", "4", "map", "32", "8"}, 20},
     };
 
-    const uint64_t one = peak_of("1"), sixteen = peak_of("16");
+    const std::optional<uint64_t> none = peak_of({});
+    REQUIRE(none);
+    std::vector<std::string> bad;
+    for (const Case& c : cases) {
+        const std::optional<uint64_t> peak = peak_of(c.steps);
+        const uint64_t want = *none + (c.mib << 20);
+        if (!peak) bad.push_back(std::string(c.what) + ": the probe failed");
+        else if (*peak != want) bad.push_back(std::string(c.what) + ": peak " + std::to_string(*peak) + " B, not " + std::to_string(want));
+    }
 
-    CHECK(sixteen >= one + (uint64_t{15} << 20));
+    for (const std::string& why : bad) std::printf("    %s\n", why.c_str());
+    CHECK(bad.empty());
+#endif
+}
+
+// The heap shim's table holds 4096 mappings: heap-peak-probe cutting a
+// mapping into 4096 pieces runs and peaks at the mapping whole, as does one
+// cutting 4094 beside a shared mapping and a second mapping of its pages
+// (which leaves the first whole), and so do ones that fill the table, then
+// with mremap() move the middle of a mapping over two whole ones, or three
+// mappings as one onto the middle of another: each move cuts a mapping in
+// two, yet leaves no more mappings than it found. Cutting one into 4097 ends
+// with the shim's message and no peak, since a piece left out of the table
+// would count wrong from then on.
+TEST(run_with_heap_peak_ends_a_program_with_more_mappings_than_the_shim_holds) {
+#ifndef GEOCODER_HEAP_PEAK_PROBE
+    std::printf("    SKIP heap peaks of heap-peak-probe: no heap shim under the sanitizers\n");
+#else
+    ScratchDir dir("heap-peak-probe-full");
+    const std::string log = dir.path() + "/log";
+    const uint64_t page = uint64_t(sysconf(_SC_PAGESIZE));
+
+    const auto [none_ok, none] = gctest::run_with_heap_peak({GEOCODER_HEAP_PEAK_PROBE}, dir.path() + "/none");
+    REQUIRE(none_ok && none);
+    const auto [fits, fits_peak] = gctest::run_with_heap_peak({GEOCODER_HEAP_PEAK_PROBE, "shatter", "0", "4096"}, dir.path() + "/fits");
+    CHECK(fits);
+    CHECK(fits_peak && *fits_peak == *none + 2 * 4096 * page);
+    const auto [cloned, cloned_peak] = gctest::run_with_heap_peak(
+        {GEOCODER_HEAP_PEAK_PROBE, "share", "0", "8", "clone", "2", "16", "4", "shatter", "32", "4094"}, dir.path() + "/cloned");
+    CHECK(cloned);
+    CHECK(cloned_peak && *cloned_peak == *none + (uint64_t{12} << 20) + 2 * 4094 * page);
+    const auto [moved_over, moved_over_peak] = gctest::run_with_heap_peak(
+        {GEOCODER_HEAP_PEAK_PROBE, "map", "0", "8", "map", "16", "2", "map", "18", "2", "shatter", "32", "4093", "move", "2", "4", "16", "4"},
+        dir.path() + "/moved-over");
+    CHECK(moved_over);
+    CHECK(moved_over_peak && *moved_over_peak == *none + (uint64_t{12} << 20) + 2 * 4093 * page);
+    const auto [moved_into, moved_into_peak] = gctest::run_with_heap_peak(
+        {GEOCODER_HEAP_PEAK_PROBE, "map", "0", "2", "map", "2", "2", "map", "4", "2", "map", "16", "8", "shatter", "32", "4092",
+         "move", "0", "6", "18", "2"},
+        dir.path() + "/moved-into");
+    CHECK(moved_into);
+    CHECK(moved_into_peak && *moved_into_peak == *none + (uint64_t{14} << 20) + 2 * 4092 * page);
+
+    const auto [ok, heap_peak] = gctest::run_with_heap_peak({GEOCODER_HEAP_PEAK_PROBE, "shatter", "0", "4097"}, log);
+
+    CHECK(!ok);
+    CHECK(!heap_peak);
+    const std::vector<char> text = read_file(log);
+    const std::string said(text.begin(), text.end());
+    CHECK(said.find("heap_peak_shim.c: more anonymous mappings than its table holds\n") != std::string::npos);
 #endif
 }
 
