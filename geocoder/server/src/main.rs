@@ -1,6 +1,8 @@
 mod auth;
 mod downloader;
 mod region_state;
+#[cfg(test)]
+mod scratch_dir;
 
 use region_state::{Configuration, RegionState};
 
@@ -77,10 +79,6 @@ fn require_admin(
 #[derive(Deserialize)]
 struct KeyParam {
     key: Option<String>,
-}
-
-fn coords_in_range(lat: f64, lon: f64) -> bool {
-    (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon)
 }
 
 fn require_coords(params: &QueryParams) -> Result<(), Response> {
@@ -465,20 +463,5 @@ async fn async_main() {
         eprintln!("Starting HTTP server on {}...", bind_addr);
         let listener = tokio::net::TcpListener::bind(bind_addr).await.unwrap();
         axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn coords_in_range_accepts_the_globe_only() {
-        for (lat, lon) in [(0.0, 0.0), (90.0, 180.0), (-90.0, -180.0), (48.85, 2.35)] {
-            assert!(coords_in_range(lat, lon), "({}, {})", lat, lon);
-        }
-        for (lat, lon) in [(91.0, 0.0), (-90.5, 0.0), (0.0, 180.1), (0.0, -181.0), (f64::NAN, 0.0), (0.0, f64::INFINITY)] {
-            assert!(!coords_in_range(lat, lon), "({}, {})", lat, lon);
-        }
     }
 }

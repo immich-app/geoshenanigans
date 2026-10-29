@@ -103,19 +103,26 @@ target_compile_definitions(geocoder-patch PRIVATE _FILE_OFFSET_BITS=64)
 # The encoded-set codecs (gcs_codec.h) round floats and must give geocoder-gc's
 # bytes on every architecture: no fused multiply-adds.
 target_compile_options(geocoder-patch PRIVATE -ffp-contract=off)
-# GEOCODER_PATCH_LIBZSTD=ON decompresses the patch with libzstd in process
-# (no zstd CLI process and its window buffer: the low-memory mode's figures);
-# off, the patcher runs the zstd on PATH.
-option(GEOCODER_PATCH_LIBZSTD "Link libzstd into geocoder-patch" OFF)
+# geocoder-patch decompresses the patch with libzstd in process: no zstd CLI
+# process beside it with its window buffer (the low-memory mode's figures).
+# GEOCODER_PATCH_LIBZSTD=OFF builds it on the zstd on PATH instead
+# (GEOCODER_PATCH_ZSTD_CLI), for a host without libzstd.
+option(GEOCODER_PATCH_LIBZSTD "Link libzstd into geocoder-patch (OFF: it runs the zstd CLI)" ON)
 if(GEOCODER_PATCH_LIBZSTD)
     find_path(GEOCODER_ZSTD_INCLUDE_DIR zstd.h)
-    find_library(GEOCODER_ZSTD_LIBRARY NAMES libzstd.a zstd)
-    if(NOT GEOCODER_ZSTD_INCLUDE_DIR OR NOT GEOCODER_ZSTD_LIBRARY)
-        message(FATAL_ERROR "GEOCODER_PATCH_LIBZSTD: libzstd not found (Debian/Ubuntu: libzstd-dev)")
+    # The static library only, never a shared libzstd: the patcher's decoder
+    # calls are zstd's ZSTD_STATIC_LINKING_ONLY API, which may change between
+    # versions and which a shared libzstd needn't export.
+    find_library(GEOCODER_ZSTD_STATIC_LIBRARY NAMES libzstd.a)
+    if(NOT GEOCODER_ZSTD_INCLUDE_DIR OR NOT GEOCODER_ZSTD_STATIC_LIBRARY)
+        message(FATAL_ERROR "geocoder-patch links the static libzstd: libzstd.a or zstd.h not found "
+                            "(Debian/Ubuntu: libzstd-dev; Fedora: libzstd-static); "
+                            "-DGEOCODER_PATCH_LIBZSTD=OFF builds it on the zstd command instead")
     endif()
     target_include_directories(geocoder-patch PRIVATE "${GEOCODER_ZSTD_INCLUDE_DIR}")
-    target_link_libraries(geocoder-patch PRIVATE "${GEOCODER_ZSTD_LIBRARY}")
-    target_compile_definitions(geocoder-patch PRIVATE GEOCODER_PATCH_LIBZSTD)
+    target_link_libraries(geocoder-patch PRIVATE "${GEOCODER_ZSTD_STATIC_LIBRARY}")
+else()
+    target_compile_definitions(geocoder-patch PRIVATE GEOCODER_PATCH_ZSTD_CLI)
 endif()
 
 # Encodes a published variant dir into the compact installed set that
@@ -204,6 +211,10 @@ target_link_libraries(geocoder-tests PRIVATE ZLIB::ZLIB libdeflate::libdeflate E
 # As geocoder-gc and geocoder-patch compile the codecs.
 set_source_files_properties(tests/test_gc.cpp tests/test_gcs_codec.cpp tests/test_gcs_patch.cpp tests/test_gcs_poi_io.cpp
     PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
+# The test of the patcher's decompression expects the zstd CLI build's.
+if(NOT GEOCODER_PATCH_LIBZSTD)
+    target_compile_definitions(geocoder-tests PRIVATE GEOCODER_PATCH_ZSTD_CLI)
+endif()
 add_test(NAME geocoder-tests COMMAND geocoder-tests)
 
 # Unit tests of the builder code that runs on S2 (tests/s2/*.cpp), linked
@@ -228,7 +239,12 @@ add_test(NAME geocoder-s2-tests COMMAND geocoder-s2-tests)
 option(GEOCODER_SANITIZE "Build geocoder-tests and its tools with ASan and UBSan" OFF)
 if(GEOCODER_SANITIZE)
     set(GEOCODER_SANITIZE_FLAGS -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer)
-    foreach(target geocoder-tests geocoder-diff geocoder-patch geocoder-gc)
+    # A tool ended by the sanitizer report it is asked for: such a run fails
+    # the tests (tests/test_sanitizer_report.cpp).
+    add_executable(geocoder-sanitizer-reports tests/fixtures/sanitizer_reports.cpp)
+    target_compile_definitions(geocoder-tests PRIVATE GEOCODER_SANITIZER_REPORTS_BIN="$<TARGET_FILE:geocoder-sanitizer-reports>")
+    add_dependencies(geocoder-tests geocoder-sanitizer-reports)
+    foreach(target geocoder-tests geocoder-diff geocoder-patch geocoder-gc geocoder-sanitizer-reports)
         target_compile_options(${target} PRIVATE ${GEOCODER_SANITIZE_FLAGS})
         target_link_options(${target} PRIVATE ${GEOCODER_SANITIZE_FLAGS})
     endforeach()

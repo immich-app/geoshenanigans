@@ -1092,32 +1092,32 @@ TEST(patch_fails_cleanly_on_a_tmpdir_too_small_for_the_patch) {
     std::vector<char> framed;
     for (int i = 0; i < 64; i++) framed.insert(framed.end(), piece.begin(), piece.end());
     REQUIRE(write_file(root + "/framed.gcpatch", framed));
-    // The patcher's output goes to <name>.err; <name>.out gets its exit
-    // status, then what the tmpfs still holds after it.
+    // The script exits with the patcher's status, so a sanitizer report there
+    // fails the test as in any tool run. The patcher's output goes to the
+    // run's log; <name>.after gets its exit status, then what the tmpfs still
+    // holds after it.
     const std::string script = "mount -t tmpfs -o size=\"$1\" tmpfs \"$2\" || exit 99; "
-                               "TMPDIR=\"$2\" \"$3\" \"$4\" \"$5\" -o \"$6\" 2> \"$7\"; echo \"rc=$?\"; ls -A \"$2\"";
+                               "TMPDIR=\"$2\" \"$3\" \"$4\" \"$5\" -o \"$6\"; rc=$?; "
+                               "{ echo \"rc=$rc\"; ls -A \"$2\"; } > \"$7\"; exit $rc";
     struct Run {
         bool namespaced;
         std::string status, err, left;
     };
     auto on_small_tmpdir = [&](const std::string& size, const std::string& patch, const std::string& name) {
-        const std::string mnt = root + "/" + name + ".tmpfs", out = root + "/" + name + ".out";
+        const std::string mnt = root + "/" + name + ".tmpfs", after = root + "/" + name + ".after";
         std::filesystem::create_directories(mnt);
         Run r;
-        r.namespaced = std::system(("unshare --map-root-user --mount sh -c " + gctest::quoted(script) + " sh " +
-                                    gctest::quoted(size) + " " + gctest::quoted(mnt) + " " + gctest::quoted(GEOCODER_PATCH_BIN) +
-                                    " " + gctest::quoted(root + "/plain") + " " + gctest::quoted(patch) + " " +
-                                    gctest::quoted(root + "/" + name) + " " + gctest::quoted(root + "/" + name + ".err") +
-                                    " > " + gctest::quoted(out) + " 2>&1")
-                                       .c_str()) == 0;
-        auto text = read_file(out);
+        r.err = run_tool({"unshare", "--map-root-user", "--mount", "sh", "-c", script, "sh", size, mnt, GEOCODER_PATCH_BIN,
+                          root + "/plain", patch, root + "/" + name, after},
+                         root + "/" + name + ".log")
+                    .log;
+        auto text = read_file(after);
         const std::string said(text.begin(), text.end());
+        r.namespaced = said.rfind("rc=", 0) == 0;
         r.status = said.substr(0, said.find('\n'));
         r.left = said.find('\n') == std::string::npos ? "" : said.substr(said.find('\n') + 1);
-        auto err = read_file(root + "/" + name + ".err");
-        r.err.assign(err.begin(), err.end());
         if (!r.namespaced)
-            std::printf("    %s %s: no private tmpfs (%s)\n", needed ? "FAIL" : "SKIP", name.c_str(), said.substr(0, 200).c_str());
+            std::printf("    %s %s: no private tmpfs (%s)\n", needed ? "FAIL" : "SKIP", name.c_str(), r.err.substr(0, 200).c_str());
         CHECK(r.namespaced || !needed);
         return r;
     };

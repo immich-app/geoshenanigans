@@ -140,12 +140,12 @@
           "order": 2
         },
         "notable": {
-          "label": "Notable (~3M POIs)",
+          "label": "Notable (~3.8M POIs)",
           "description": "+ museums, castles, stadiums, beaches, waterfalls, universities, viewpoints.",
           "order": 3
         },
         "all": {
-          "label": "All (~5.9M POIs)",
+          "label": "All (~24.5M POIs)",
           "description": "Every named POI (places of worship, peaks, memorials, artwork, gardens).",
           "order": 4
         }
