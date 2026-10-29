@@ -5,7 +5,7 @@
 #   MISE_ENV=o11y mise lock   # after changing a version here
 [tools]
 jq = "1.8.2"
-yq = "4.53.6"
+yq = "4.54.1"
 kustomize = "5.8.1"
 kubeconform = "0.8.0"
 flux2 = "2.9.5"
