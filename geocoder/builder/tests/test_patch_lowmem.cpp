@@ -39,6 +39,12 @@ constexpr uint64_t DECODER_HOLD = 1 << 20;
 // The most the patcher's heap peak may grow when a heap test's case grows
 // tenfold in the one structure it varies, which the patcher reads in place.
 constexpr uint64_t HEAP_GROWTH_SLACK = 256 << 10;
+// How many times a heap test applies its case with --threads at each size.
+// The codec threads queue bytes as the scheduler runs them, so one run of a
+// case can peak some 550 KiB above another on a loaded machine (within
+// 60 KiB on a quiet one); the runs at n show how far, and at 10 n the least
+// of them counts.
+constexpr int THREADS_HEAP_RUNS = 7;
 
 template <typename T>
 void append(std::vector<char>& out, const T& v) {
@@ -255,6 +261,9 @@ struct Applied {
 // log. Every mismatch, printed.
 Applied apply_modes(const LowMemCase& c, const std::vector<std::string>& modes, const LogCheck& check = {}) {
     Applied a;
+    // The patcher writes only into an empty dir: a case applied again starts
+    // from none.
+    for (const std::string& mode : modes) std::filesystem::remove_all(c.dir("out." + mode));
     for (const std::string& mode : modes) {
         const bool plain = mode == "plain";
         const std::string out = c.dir("out." + mode);
@@ -289,8 +298,13 @@ using CaseOfSize = std::function<std::string(const LowMemCase& c, uint32_t n)>;
 
 // The case at n and at 10 n, each applied in every mode: each output as
 // apply_modes checks it, and in each mode the heap peak at 10 n at most
-// HEAP_GROWTH_SLACK above the one at n. Every failure, printed; skipped
-// without a heap shim (the sanitizer build).
+// HEAP_GROWTH_SLACK above the one at n. Plain and sync runs peak the same
+// every time, so one run at each size decides; --threads runs
+// THREADS_HEAP_RUNS times at each size, the sizes taking turns so that both
+// see the same load, and the least peak at 10 n is held to the slack above
+// the greatest at n: growth lifts every run at 10 n, while the scheduler
+// lifts the runs at n about as far as those at 10 n. Every failure, printed;
+// skipped without a heap shim (the sanitizer build).
 std::vector<std::string> heap_flat(const CaseOfSize& make_case, uint32_t n) {
     if (!gctest::heap_peak_shim()) {
         std::printf("    SKIP heap peaks at n = %u: no heap shim under the sanitizers\n", n);
@@ -302,24 +316,40 @@ std::vector<std::string> heap_flat(const CaseOfSize& make_case, uint32_t n) {
         std::printf("    %s\n", why.c_str());
         bad.push_back(why);
     };
-    std::map<std::string, uint64_t> at_n;
-    for (const uint32_t size : {n, 10 * n}) {
-        const LowMemCase c{dir.path(), "n" + std::to_string(size)};
-        if (std::string e = make_case(c, size); !e.empty()) {
-            fail(c.name + ": " + e);
+    const uint32_t sizes[] = {n, 10 * n};
+    std::vector<LowMemCase> cases;
+    for (const uint32_t size : sizes) {
+        cases.push_back({dir.path(), "n" + std::to_string(size)});
+        if (std::string e = make_case(cases.back(), size); !e.empty()) {
+            fail(cases.back().name + ": " + e);
             return bad;
         }
-        const Applied a = apply_modes(c, ALL_MODES);
-        bad.insert(bad.end(), a.bad.begin(), a.bad.end());
-        for (const std::string& mode : ALL_MODES) {
-            const auto peak = a.heap_peaks.find(mode);
-            if (peak == a.heap_peaks.end()) fail(c.name + ": " + mode + ": no heap peak");
-            else if (size == n) at_n[mode] = peak->second;
-            else if (at_n.count(mode) && peak->second > at_n[mode] + HEAP_GROWTH_SLACK)
-                fail(mode + ": the heap peak grew from " + std::to_string(at_n[mode]) + " B at n = " + std::to_string(n) + " to " +
-                     std::to_string(peak->second) + " B at n = " + std::to_string(size) + ", past the " +
-                     std::to_string(HEAP_GROWTH_SLACK) + " B of slack");
+    }
+    // Each size's heap peaks by mode, one per run.
+    std::map<std::string, std::vector<uint64_t>> peaks[2];
+    for (int run = 0; run < THREADS_HEAP_RUNS && (run == 0 || bad.empty()); run++)
+        for (size_t s = 0; s < 2; s++) {
+            const std::vector<std::string> modes = run == 0 ? ALL_MODES : std::vector<std::string>{"threads"};
+            const Applied a = apply_modes(cases[s], modes);
+            bad.insert(bad.end(), a.bad.begin(), a.bad.end());
+            for (const std::string& mode : modes) {
+                const auto peak = a.heap_peaks.find(mode);
+                if (peak == a.heap_peaks.end()) fail(cases[s].name + ": " + mode + ": no heap peak");
+                else peaks[s][mode].push_back(peak->second);
+            }
         }
+    auto of_runs = [](const char* which, const std::vector<uint64_t>& v) {
+        return v.size() > 1 ? " (the " + std::string(which) + " of " + std::to_string(v.size()) + " runs)" : std::string();
+    };
+    for (const std::string& mode : ALL_MODES) {
+        const std::vector<uint64_t>& at_n = peaks[0][mode];
+        const std::vector<uint64_t>& at_10n = peaks[1][mode];
+        if (at_n.empty() || at_10n.empty()) continue;
+        const uint64_t from = *std::max_element(at_n.begin(), at_n.end()), to = *std::min_element(at_10n.begin(), at_10n.end());
+        if (to > from + HEAP_GROWTH_SLACK)
+            fail(mode + ": the heap peak grew from " + std::to_string(from) + " B at n = " + std::to_string(n) + of_runs("greatest", at_n) +
+                 " to " + std::to_string(to) + " B at n = " + std::to_string(10 * n) + of_runs("least", at_10n) + ", past the " +
+                 std::to_string(HEAP_GROWTH_SLACK) + " B of slack");
     }
     return bad;
 }
