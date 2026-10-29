@@ -1347,8 +1347,13 @@ static int run(int argc, char* argv[]) {
             uint32_t so = do_entry(cid, old_se, old_offs[0], w_rm, cur_s, o_se);
             uint32_t ao = do_entry(cid, old_ae, old_offs[1], a_rm, cur_a, o_ae);
             uint32_t io = do_entry(cid, old_ie, old_offs[2], i_rm, cur_i, o_ie);
-            if (gcs::store().active && __fpending(f_geo) + 20 > gcs::Store::SINK_BUF) gflush();
-            fwrite(&cid, 8, 1, f_geo); fwrite(&so, 4, 1, f_geo); fwrite(&ao, 4, 1, f_geo); fwrite(&io, 4, 1, f_geo);
+            char rec[20];  // cell id, then the three list offsets, as the old records read
+            memcpy(rec, &cid, 8);
+            memcpy(rec + 8, &so, 4);
+            memcpy(rec + 12, &ao, 4);
+            memcpy(rec + 16, &io, 4);
+            if (gcs::store().active && __fpending(f_geo) + sizeof rec > gcs::Store::SINK_BUF) gflush();
+            fwrite(rec, sizeof rec, 1, f_geo);
             cells_written++;
         };
         const ListOffsets added_cell = {NO, NO, NO};
