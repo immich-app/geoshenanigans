@@ -90,9 +90,9 @@ int posix_memalign(void** out, size_t alignment, size_t n) {
 // each the addresses [from, to) of its whole pages. The pages a munmap()
 // unmaps leave every mapping they overlap, cutting it in two when they lie
 // inside it; so do those an mmap() with MAP_FIXED maps over and those an
-// mremap() moves away from or onto. Each call holds the lock across its
-// system call, so the table changes in the order the address space does (no
-// thread maps the addresses a munmap() frees before the table lets go of
+// mremap() unmaps, moves away or moves onto. Each call holds the lock across
+// its system call, so the table changes in the order the address space does
+// (no thread maps the addresses a munmap() frees before the table lets go of
 // them), and only when the call succeeds. No hook allocates.
 #define MAPPINGS 4096
 static struct {
@@ -188,10 +188,42 @@ int munmap(void* addr, size_t len) {
     return r;
 }
 
-// Reads the new address only with MREMAP_FIXED, as glibc's mremap() does. The
-// old pages stay mapped with MREMAP_DONTUNMAP, and when an old length of 0
-// maps shared pages a second time; the new mapping is anonymous when the old
-// one is.
+// The counted pieces of the pages an mremap() moves, kept under the lock.
+static struct {
+    uintptr_t from, to;
+} moving[MAPPINGS];
+
+// The pages [old, old + old_bytes) an mremap() moved to [at, at + bytes),
+// over whatever was mapped there: the counted pieces of the first of them
+// move along with their holes, the old pages are unmapped unless kept
+// (MREMAP_DONTUNMAP), and the new pages past old_bytes are anonymous when
+// the old ones are.
+static void moved(uintptr_t old, uintptr_t old_bytes, uintptr_t at, uintptr_t bytes, int kept, int anonymous) {
+    const uintptr_t end = old + (old_bytes < bytes ? old_bytes : bytes);
+    int pieces = 0;
+    for (int i = 0; i < mapped; i++) {
+        const uintptr_t from = mappings[i].from > old ? mappings[i].from : old, to = mappings[i].to < end ? mappings[i].to : end;
+        if (from >= to) continue;
+        moving[pieces].from = at + (from - old);
+        moving[pieces].to = at + (to - old);
+        pieces++;
+    }
+    if (!kept) forget(old, old + old_bytes);
+    forget(at, at + bytes);
+    for (int i = 0; i < pieces; i++) {
+        remember(moving[i].from, moving[i].to);
+        add((long)(moving[i].to - moving[i].from));
+    }
+    if (bytes > old_bytes && anonymous) {
+        remember(at + old_bytes, at + bytes);
+        add((long)(bytes - old_bytes));
+    }
+}
+
+// Reads the new address only with MREMAP_FIXED, as glibc's mremap() does. In
+// place, a shrink unmaps the old pages past the new length (the pages before
+// it stay as they were, holes and all) and a growth maps new pages after the
+// old ones. An old length of 0 maps shared pages a second time.
 void* mremap(void* old, size_t old_len, size_t len, int flags, ...) {
     void* want = NULL;
     if (flags & MREMAP_FIXED) {
@@ -201,12 +233,14 @@ void* mremap(void* old, size_t old_len, size_t len, int flags, ...) {
         va_end(rest);
     }
     lock_mappings();
-    const uintptr_t from = (uintptr_t)old, to = from + (old_len ? page_rounded(old_len) : 1);
-    const int anonymous = counted(from, to);
+    const uintptr_t from = (uintptr_t)old, old_bytes = page_rounded(old_len), bytes = page_rounded(len);
+    const int anonymous = counted(from, from + (old_bytes ? old_bytes : 1));
     void* p = (void*)syscall(SYS_mremap, old, old_len, len, flags, want);
-    if (p != MAP_FAILED) {
-        if (old_len && !(flags & MREMAP_DONTUNMAP)) forget(from, to);
-        map_over((uintptr_t)p, (uintptr_t)p + page_rounded(len), anonymous);
+    if (p == old) {
+        if (bytes < old_bytes) forget(from + bytes, from + old_bytes);
+        else if (bytes > old_bytes) map_over(from + old_bytes, from + bytes, anonymous);
+    } else if (p != MAP_FAILED) {
+        moved(from, old_bytes, (uintptr_t)p, bytes, flags & MREMAP_DONTUNMAP, anonymous);
     }
     unlock_mappings();
     return p;

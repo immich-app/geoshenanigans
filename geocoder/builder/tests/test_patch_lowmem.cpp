@@ -488,10 +488,10 @@ TEST(run_with_heap_peak_measures_the_process_it_runs_and_not_its_children) {
 // (SequentialFileReader's read windows) to mmap64: heap-peak-probe, built the
 // same way and allocating nothing itself, peaks exactly the most MiB it held
 // mapped at once above its peak mapping nothing. Every page of a mapping
-// counts until a munmap() succeeds on it, a MAP_FIXED mapping replaces it or
-// an mremap() moves it, however the ranges cut the mappings; a refused call
-// changes nothing. Each case ends mapping more than it started with, so the
-// pages left from its cuts decide the peak.
+// counts until a munmap() or mremap() unmaps it or a MAP_FIXED mapping
+// replaces it, and counts where an mremap() moves it, however the ranges cut
+// the mappings; a refused call changes nothing. Each case ends mapping more
+// than it started with, so the pages left from its cuts decide the peak.
 TEST(run_with_heap_peak_counts_the_mapped_pages_of_a_program_built_as_the_tools_are) {
 #ifndef GEOCODER_HEAP_PEAK_PROBE
     std::printf("    SKIP heap peaks of heap-peak-probe: no heap shim under the sanitizers\n");
@@ -527,11 +527,16 @@ TEST(run_with_heap_peak_counts_the_mapped_pages_of_a_program_built_as_the_tools_
         {"a refused munmap() of 4 MiB from 1 byte into 8, then 8 MiB more",
          {"map", "0", "8", "unmap-refused", "0+1", "4", "map", "16", "8"}, 16},
         {"8 MiB shrunk to 2 in place by mremap(), then 8 MiB more", {"map", "0", "8", "resize", "0", "8", "2", "map", "16", "8"}, 10},
+        {"a 4 MiB hole punched in 8, the 8 then shrunk to 6 in place by mremap(), then 8 MiB more",
+         {"map", "0", "8", "unmap", "2", "4", "resize", "0", "8", "6", "map", "16", "8"}, 10},
+        {"a 4 MiB hole punched in 8, the 8 then moved by mremap() as 2, then 8 MiB more",
+         {"map", "0", "8", "unmap", "2", "4", "move", "0", "8", "16", "2", "map", "32", "8"}, 10},
         {"4 MiB grown to 8 in place by mremap(), then 8 MiB more", {"map", "0", "4", "resize", "0", "4", "8", "map", "16", "8"}, 16},
         {"a refused mremap() growing 4 MiB into the next 4, then 8 MiB more",
          {"map", "0", "4", "map", "4", "4", "resize-refused", "0", "4", "8", "map", "16", "8"}, 16},
         {"8 MiB moved by mremap() as 4 over the start of another 8, then 16 MiB more",
          {"map", "0", "8", "map", "16", "8", "move", "0", "8", "16", "4", "map", "32", "16"}, 24},
+        {"4 MiB moved by mremap() as 8, then 8 MiB more", {"map", "0", "4", "move", "0", "4", "16", "8", "map", "32", "8"}, 16},
         {"the middle 4 MiB of 8 moved away by mremap() as 2, then 8 MiB more",
          {"map", "0", "8", "move", "2", "4", "16", "2", "map", "32", "8"}, 14},
         {"8 MiB copied by mremap() with MREMAP_DONTUNMAP, then 8 MiB more",
