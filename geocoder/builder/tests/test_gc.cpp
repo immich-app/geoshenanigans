@@ -983,8 +983,9 @@ TEST(gc_refuses_to_encode_an_encoded_dir) {
 // that file's size) must fail to encode rather than write a set its decoder
 // rejects, and a small set with a trailing point round trips. The big set is
 // 1024 closed all-zero rings of 2^20 vertices: every polygon starts below
-// 2^32, the B-open file ends at 4,294,973,440 bytes (written under TMPDIR,
-// removed at the end; the input is a sparse file).
+// 2^32, the B-open file ends at 4,294,973,440 bytes. Neither 4 GiB file is on
+// disk: the vertices are a sparse file, and the B-open a FIFO a child drains
+// (a streamed pass, which writes into a dir its caller owns).
 TEST(gc_refuses_a_poi_offset_past_u32) {
     ScratchDir dir("gc-poi-offset");
     const std::string& root = dir.path();
@@ -994,13 +995,26 @@ TEST(gc_refuses_a_poi_offset_past_u32) {
     REQUIRE(run_gc({"decode", enc, dec, "--only", "poi", "--no-link"}, log).ok);
     for (const char* f : {"/poi_records.bin", "/poi_vertices.bin"}) CHECK(read_bytes(dec + f) == read_bytes(small + f));
 
-    const std::string big = root + "/big";
+    const std::string big = root + "/big", out = root + "/big.enc", bopen = out + "/poi_vertices.bopen";
     poi_today_set(big, std::vector<uint32_t>(1024, 1u << 20), 1);
+    std::filesystem::create_directories(out);
+    REQUIRE(mkfifo(bopen.c_str(), 0600) == 0);
+    std::vector<char> sink(size_t(1) << 20);
+    std::fflush(nullptr);
+    const pid_t drain = fork();
+    REQUIRE(drain >= 0);
+    if (!drain) {
+        const int fd = open(bopen.c_str(), O_RDONLY);
+        while (fd >= 0 && read(fd, sink.data(), sink.size()) > 0) {}
+        _exit(0);
+    }
 
-    auto r = run_gc({"encode", big, root + "/big.enc", "--only", "poi", "--no-link"}, log);
+    auto r = run_gc({"encode", big, out, "--files", "poi_records.bin,poi_vertices.bin", "--no-link"}, log);
 
+    kill(drain, SIGKILL);  // still waiting to open the FIFO if gc never did
+    waitpid(drain, nullptr, 0);
     CHECK(!r.ok);
-    CHECK(r.log.find("offset overflow") != std::string::npos);
+    CHECK(r.log.find("poi_vertices.bopen offset overflow at record 1024") != std::string::npos);
 }
 
 // POI blocks the encoder never writes, each the one block of a one-record
