@@ -104,8 +104,8 @@ S2LatLngRect admin_ring_bounds(const NodeCoord* verts, uint32_t n) {
                         S2LatLng::FromDegrees(std::min(lat_hi, 90.0f), std::min(lng_hi, 180.0f)));
 }
 
-std::vector<std::pair<uint64_t, bool>> admin_ring_cells(const NodeCoord* verts, uint32_t n, int level) {
-    std::vector<std::pair<uint64_t, bool>> out;
+AdminRingCells admin_ring_cells(const NodeCoord* verts, uint32_t n, int level) {
+    AdminRingCells out;
     if (n == 0) return out;
     const S1ChordAngle reach = S1ChordAngle::Radians(ADMIN_COVER_REACH_RAD);
     const double sin_reach = std::sin(ADMIN_COVER_REACH_RAD);

@@ -1124,9 +1124,6 @@ static PackedPolygon pack_admin_polygon(const ParsedData& data, const AdminPolyg
     return out;
 }
 
-using RingCells = std::vector<std::pair<uint64_t, bool>>;
-
-
 void compute_admin_index_cells(ParsedData& data, const std::vector<double>& scales,
                                std::optional<double> minimal_scale) {
     const unsigned threads = parallel_threads();
@@ -1143,14 +1140,14 @@ void compute_admin_index_cells(ParsedData& data, const std::vector<double>& scal
             // writes no ring.
             auto ring_cells = [&](double scale) {
                 const PackedPolygon pp = pack_admin_polygon(data, ap, scale);
-                if (pp.bytes.empty()) return RingCells();
+                if (pp.bytes.empty()) return AdminRingCells();
                 const std::vector<NodeCoord> ring = unpack_polygon(pp.bytes.data(), pp.vertex_count);
                 return admin_ring_cells(ring.data(), pp.vertex_count, kAdminCellLevel);
             };
             const bool minimal = minimal_scale && admin_minimal_keeps(ap.admin_level, ap.place_type_override);
-            std::optional<RingCells> shared, own_minimal;
+            std::optional<AdminRingCells> shared, own_minimal;
             for (double scale : scales) {
-                RingCells cells = ring_cells(scale);
+                AdminRingCells cells = ring_cells(scale);
                 if (minimal && scale == *minimal_scale) own_minimal = cells;
                 if (cells.empty()) continue;
                 shared = shared ? merge_admin_ring_cells(*shared, cells) : std::move(cells);

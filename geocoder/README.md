@@ -172,7 +172,9 @@ in [PATCHING.md](PATCHING.md) and `builder/configurations.template.json`.
 - CMake 3.16+
 - C++17 compiler
 - protozero, s2geometry and abseil, libdeflate (`build-index`); zlib and expat (`pbf-apply`)
-- the `zstd` command, which `geocoder-diff` and `geocoder-patch` run on patches
+- the static libzstd, `libzstd.a` (`geocoder-patch`, which decompresses patches in process;
+  Debian/Ubuntu `libzstd-dev`, Fedora `libzstd-static`)
+- the `zstd` command, which `geocoder-diff` compresses patches with
 
 **Server (Rust):**
 - Rust toolchain
@@ -182,6 +184,9 @@ in [PATCHING.md](PATCHING.md) and `builder/configurations.template.json`.
 ```bash
 # Build the indexer
 mkdir build && cd build && cmake ../builder && make
+
+# Without libzstd: geocoder-patch runs the zstd command on PATH instead
+cmake ../builder -DGEOCODER_PATCH_LIBZSTD=OFF && make
 
 # Build the server
 cargo build --release --manifest-path server/Cargo.toml
