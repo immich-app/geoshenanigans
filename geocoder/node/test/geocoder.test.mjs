@@ -1,6 +1,6 @@
-// Place search through the binding: an index shipped beside its dataset is used as is, one
-// shipped for other files is rebuilt, a missing one is built on the device, and files replaced
-// under a loaded geocoder are refused.
+// The binding: reverse geocoding finds nothing off the globe. Place search uses an index shipped
+// beside its dataset as is, rebuilds one shipped for other files, builds a missing one on the
+// device, and refuses files replaced under a loaded geocoder.
 //
 //   cargo build --release && node --test test/*.test.mjs
 //
@@ -66,6 +66,23 @@ const dataset = (names) => {
   mkdirSync(dir);
   return writeDataset(dir, names);
 };
+
+test('reverse geocoding off the globe finds nothing', async () => {
+  const geocoder = Geocoder.load(dataset(['Testville', 'Otherton']));
+
+  for (const [lat, lng] of [[NaN, 20.5], [10.5, NaN], [Infinity, 20.5], [10.5, -Infinity], [90.5, 20.5], [-91, 20.5], [10.5, 180.5], [10.5, -181], [10.5, 380.5]]) {
+    assert.equal(await geocoder.reverseGeocode(lat, lng), '{}', `(${lat}, ${lng})`);
+  }
+});
+
+test('reverse geocoding the edges of the globe looks them up', async () => {
+  const geocoder = Geocoder.load(dataset(['Testville', 'Otherton']));
+
+  // The dataset has no admin cells, so a lookup finds an empty address.
+  for (const [lat, lng] of [[90, 180], [-90, -180]]) {
+    assert.equal(await geocoder.reverseGeocode(lat, lng), '{"address":{}}', `(${lat}, ${lng})`);
+  }
+});
 
 const names = async (geocoder, query) => JSON.parse(await geocoder.searchPlaces(query)).map((r) => r.name);
 

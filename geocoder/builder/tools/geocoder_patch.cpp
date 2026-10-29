@@ -53,7 +53,7 @@
 #include "scratch_dir.h"
 #include "sequential_file_reader.h"
 #include "gcs_patch.h"
-#ifdef GEOCODER_PATCH_LIBZSTD
+#ifndef GEOCODER_PATCH_ZSTD_CLI
 #define ZSTD_STATIC_LINKING_ONLY
 #include <zstd.h>
 #endif
@@ -117,7 +117,7 @@ static void log_rewinds(const SequentialFileReader& r) {
     if (r.rewinds()) std::cerr << "  " << r.path() << ": read backwards " << r.rewinds() << " times" << std::endl;
 }
 
-#ifdef GEOCODER_PATCH_LIBZSTD
+#ifndef GEOCODER_PATCH_ZSTD_CLI
 // How far ahead of the decoder the decompressed patch's storage is reserved.
 static constexpr size_t PATCH_RESERVE_STEP = 1 << 20;
 
@@ -168,8 +168,9 @@ static bool decompress_to_file(const std::string& src, const std::string& dst) {
     return ok;
 }
 #else
-// The zstd CLI, run without a shell: the patch path is one argument whatever
-// its characters, after "--" so a leading '-' is no option.
+// The zstd CLI on PATH (a -DGEOCODER_PATCH_LIBZSTD=OFF build), run without a
+// shell: the patch path is one argument whatever its characters, after "--"
+// so a leading '-' is no option.
 static bool decompress_to_file(const std::string& src, const std::string& dst) {
     const char* argv[] = {"zstd", "-d", "-f", "--quiet", "-o", dst.c_str(), "--", src.c_str(), nullptr};
     posix_spawn_file_actions_t quiet;
