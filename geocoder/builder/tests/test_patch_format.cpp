@@ -17,6 +17,8 @@
 #include <iterator>
 #include <map>
 #include <numeric>
+#include <optional>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -687,6 +689,73 @@ TEST(patch_format_sorted_table_finds_every_key_and_no_other) {
         CHECK_EQ(wrong, size_t(0));
         CHECK(!sut.find(UINT32_MAX));
     }
+}
+
+// n strictly ascending keys from a seeded generator: 0, then gaps of 1 to
+// 64K, the last key moved to UINT32_MAX when n > 1.
+static std::vector<uint32_t> spread_keys(size_t n, uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::vector<uint32_t> keys;
+    uint32_t key = 0;
+    for (size_t i = 0; i < n; i++) {
+        keys.push_back(key);
+        const uint32_t widest = 2u << (rng() % 16);
+        key += 1 + rng() % widest;
+    }
+    if (n > 1) keys.back() = UINT32_MAX;
+    return keys;
+}
+
+// A table of keys whose records map each key to its complement.
+static std::vector<char> complement_pair_bytes(const std::vector<uint32_t>& keys) {
+    std::vector<RemapPair> pairs;
+    for (const uint32_t key : keys) pairs.push_back({key, ~key});
+    return pair_bytes(pairs);
+}
+
+TEST(patch_format_sorted_table_find_and_filter_agree_with_upper_bound) {
+    // Sizes around the directory's (every key in it up to TABLE_DIRECTORY_KEYS)
+    // and a normal day's 90 moved strings.
+    for (const size_t n : {size_t(0), size_t(1), size_t(90), TABLE_DIRECTORY_KEYS, TABLE_DIRECTORY_KEYS + 1, size_t(100000)}) {
+        const std::vector<uint32_t> keys = spread_keys(n, static_cast<uint32_t>(n));
+        const std::vector<char> bytes = complement_pair_bytes(keys);
+        std::vector<uint32_t> probes = {0, 1, UINT32_MAX - 1, UINT32_MAX};
+        for (const uint32_t key : keys) probes.insert(probes.end(), {key - 1, key, key + 1});
+        std::mt19937 rng(7);
+        for (int i = 0; i < 100000; i++) probes.push_back(rng());
+
+        const SortedTable<RemapPair> sut = pair_table(bytes);
+
+        size_t wrong = 0, held_rejected = 0;
+        for (const uint32_t probe : probes) {
+            const auto above = std::upper_bound(keys.begin(), keys.end(), probe);
+            const bool held = above != keys.begin() && above[-1] == probe;
+            const std::optional<RemapPair> hit = sut.find(probe);
+            if (hit.has_value() != held || (held && (hit->from != probe || hit->to != ~probe))) wrong++;
+            if (held && !sut.might_hold(probe)) held_rejected++;
+        }
+        CHECK_EQ(wrong, size_t(0));
+        CHECK_EQ(held_rejected, size_t(0));
+    }
+}
+
+TEST(patch_format_sorted_table_filter_passes_few_keys_a_small_table_lacks) {
+    // A normal day's 90 moved strings.
+    const std::vector<uint32_t> keys = spread_keys(90, 3);
+    const std::vector<char> bytes = complement_pair_bytes(keys);
+    std::mt19937 rng(11);
+
+    const SortedTable<RemapPair> sut = pair_table(bytes);
+
+    size_t lacked = 0, passed = 0;
+    for (int i = 0; i < 1000000; i++) {
+        const uint32_t key = rng();
+        if (std::binary_search(keys.begin(), keys.end(), key)) continue;
+        lacked++;
+        passed += sut.might_hold(key);
+    }
+    CHECK(passed * 100 < lacked);
+    CHECK(!SortedTable<RemapPair>().might_hold(0));
 }
 
 TEST(patch_format_sorted_table_refuses_a_key_out_of_order_or_twice) {

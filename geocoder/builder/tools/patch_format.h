@@ -719,12 +719,17 @@ private:
 
 // The keys a SortedTable samples for its directory: 16 KiB at most.
 static constexpr size_t TABLE_DIRECTORY_KEYS = 4096;
+// A SortedTable's key filter: 2^15 bits, 4 KiB. A normal day's tables (90
+// moved strings, a parent id or two) set under 1% of them, so nearly every
+// lookup in them ends at the filter.
+static constexpr unsigned TABLE_FILTER_BITS_LOG2 = 15;
 
 // n fixed-width records read where they sit, sorted strictly ascending by
 // the u32 each starts with. The constructor checks the order in one sweep,
-// refusing a step back or a repeated key as a malformed `what`, and samples
-// every step-th key into a directory, so a lookup searches one step of the
-// records.
+// refusing a step back or a repeated key as a malformed `what`, sets each
+// key's bit in a fixed filter, which turns away most keys a small table
+// lacks, and samples every step-th key into a directory, so a lookup the
+// filter passes searches one step of the records.
 template <typename Rec>
 class SortedTable {
     static_assert(std::is_trivially_copyable<Rec>::value && sizeof(Rec) >= sizeof(uint32_t), "a record starts with its u32 key");
@@ -734,10 +739,13 @@ public:
     SortedTable(const char* data, size_t count, const char* what) : data_(data), count_(count) {
         step_ = std::max<size_t>(1, (count + TABLE_DIRECTORY_KEYS - 1) / TABLE_DIRECTORY_KEYS);
         directory_.reserve((count + step_ - 1) / step_);
+        if (count > 0) filter_.assign((size_t{1} << TABLE_FILTER_BITS_LOG2) / 64, 0);
         for (size_t i = 0; i < count; i++) {
             const uint32_t key = key_at(i);
             if (i > 0 && key <= key_at(i - 1)) throw std::runtime_error(std::string("Malformed ") + what);
             if (i % step_ == 0) directory_.push_back(key);
+            const uint32_t bit = filter_bit(key);
+            filter_[bit / 64] |= uint64_t{1} << (bit % 64);
         }
     }
 
@@ -753,27 +761,42 @@ public:
     void for_each(OnRecord on_record) const {
         for (size_t i = 0; i < count_; i++) on_record((*this)[i]);
     }
-    // The record of `key`, if the table holds one. A table of at most
-    // TABLE_DIRECTORY_KEYS records keeps every key in its directory, so a
-    // lookup that misses reads none of its records.
+    // Whether the table may hold `key`: true for every key it holds.
+    bool might_hold(uint32_t key) const {
+        if (count_ == 0) return false;
+        const uint32_t bit = filter_bit(key);
+        return filter_[bit / 64] >> (bit % 64) & 1;
+    }
+    // The record of `key`, if the table holds one.
     std::optional<Rec> find(uint32_t key) const {
-        const size_t d = static_cast<size_t>(std::upper_bound(directory_.begin(), directory_.end(), key) - directory_.begin());
-        if (d == 0) return std::nullopt;
-        size_t at = (d - 1) * step_;
-        if (directory_[d - 1] != key) {
-            const size_t end = std::min(count_, at + step_);
-            at++;
-            for (size_t hi = end; at < hi;) {
-                const size_t mid = at + (hi - at) / 2;
-                if (key_at(mid) < key) at = mid + 1;
-                else hi = mid;
-            }
-            if (at == end || key_at(at) != key) return std::nullopt;
-        }
+        if (!might_hold(key)) return std::nullopt;
+        const size_t at = search(key);
+        if (at == count_) return std::nullopt;
         return (*this)[at];
     }
 
 private:
+    static uint32_t filter_bit(uint32_t key) {
+        return static_cast<uint32_t>((key * 0x9E3779B97F4A7C15ull) >> (64 - TABLE_FILTER_BITS_LOG2));
+    }
+    // The index of the record of `key`, or count_. A table of at most
+    // TABLE_DIRECTORY_KEYS records keeps every key in its directory, so a
+    // search that misses reads none of its records. Out of line, so that a
+    // lookup the filter rejects costs its caller no call.
+    [[gnu::noinline]] size_t search(uint32_t key) const {
+        const size_t d = static_cast<size_t>(std::upper_bound(directory_.begin(), directory_.end(), key) - directory_.begin());
+        if (d == 0) return count_;
+        size_t at = (d - 1) * step_;
+        if (directory_[d - 1] == key) return at;
+        const size_t end = std::min(count_, at + step_);
+        at++;
+        for (size_t hi = end; at < hi;) {
+            const size_t mid = at + (hi - at) / 2;
+            if (key_at(mid) < key) at = mid + 1;
+            else hi = mid;
+        }
+        return at < end && key_at(at) == key ? at : count_;
+    }
     uint32_t key_at(size_t i) const {
         uint32_t key;
         memcpy(&key, data_ + i * sizeof(Rec), sizeof key);
@@ -783,6 +806,7 @@ private:
     const char* data_ = nullptr;
     size_t count_ = 0, step_ = 1;
     std::vector<uint32_t> directory_;  // the key of every step_-th record
+    std::vector<uint64_t> filter_;     // a bit per filter_bit, none when empty
 };
 
 // An old id or string offset and its new one, as the patch carries remap
