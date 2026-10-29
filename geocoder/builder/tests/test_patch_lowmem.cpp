@@ -539,6 +539,10 @@ TEST(run_with_heap_peak_counts_the_mapped_pages_of_a_program_built_as_the_tools_
         {"4 MiB moved by mremap() as 8, then 8 MiB more", {"map", "0", "4", "move", "0", "4", "16", "8", "map", "32", "8"}, 16},
         {"the middle 4 MiB of 8 moved away by mremap() as 2, then 8 MiB more",
          {"map", "0", "8", "move", "2", "4", "16", "2", "map", "32", "8"}, 14},
+        {"the middle 4 MiB of 8 moved by mremap() over two whole 2 MiB mappings, then 8 MiB more",
+         {"map", "0", "8", "map", "16", "2", "map", "18", "2", "move", "2", "4", "16", "4", "map", "32", "8"}, 16},
+        {"three 2 MiB mappings moved by mremap() as 2 onto the middle of 8, then 8 MiB more",
+         {"map", "0", "2", "map", "2", "2", "map", "4", "2", "map", "16", "8", "move", "0", "6", "18", "2", "map", "32", "8"}, 16},
         {"8 MiB copied by mremap() with MREMAP_DONTUNMAP, then 8 MiB more",
          {"map", "0", "8", "copy", "0", "8", "16", "map", "32", "8"}, 24},
         {"4 MiB of shared 8 mapped a second time by mremap(), then 8 MiB more",
@@ -563,9 +567,12 @@ TEST(run_with_heap_peak_counts_the_mapped_pages_of_a_program_built_as_the_tools_
 // The heap shim's table holds 4096 mappings: heap-peak-probe cutting a
 // mapping into 4096 pieces runs and peaks at the mapping whole, as does one
 // cutting 4094 beside a shared mapping and a second mapping of its pages
-// (which leaves the first whole), and cutting one into 4097 ends with the
-// shim's message and no peak, since a piece left out of the table would
-// count wrong from then on.
+// (which leaves the first whole), and so do ones that fill the table, then
+// with mremap() move the middle of a mapping over two whole ones, or three
+// mappings as one onto the middle of another: each move cuts a mapping in
+// two, yet leaves no more mappings than it found. Cutting one into 4097 ends
+// with the shim's message and no peak, since a piece left out of the table
+// would count wrong from then on.
 TEST(run_with_heap_peak_ends_a_program_with_more_mappings_than_the_shim_holds) {
 #ifndef GEOCODER_HEAP_PEAK_PROBE
     std::printf("    SKIP heap peaks of heap-peak-probe: no heap shim under the sanitizers\n");
@@ -583,6 +590,17 @@ TEST(run_with_heap_peak_ends_a_program_with_more_mappings_than_the_shim_holds) {
         {GEOCODER_HEAP_PEAK_PROBE, "share", "0", "8", "clone", "2", "16", "4", "shatter", "32", "4094"}, dir.path() + "/cloned");
     CHECK(cloned);
     CHECK(cloned_peak && *cloned_peak == *none + (uint64_t{12} << 20) + 2 * 4094 * page);
+    const auto [moved_over, moved_over_peak] = gctest::run_with_heap_peak(
+        {GEOCODER_HEAP_PEAK_PROBE, "map", "0", "8", "map", "16", "2", "map", "18", "2", "shatter", "32", "4093", "move", "2", "4", "16", "4"},
+        dir.path() + "/moved-over");
+    CHECK(moved_over);
+    CHECK(moved_over_peak && *moved_over_peak == *none + (uint64_t{12} << 20) + 2 * 4093 * page);
+    const auto [moved_into, moved_into_peak] = gctest::run_with_heap_peak(
+        {GEOCODER_HEAP_PEAK_PROBE, "map", "0", "2", "map", "2", "2", "map", "4", "2", "map", "16", "8", "shatter", "32", "4092",
+         "move", "0", "6", "18", "2"},
+        dir.path() + "/moved-into");
+    CHECK(moved_into);
+    CHECK(moved_into_peak && *moved_into_peak == *none + (uint64_t{14} << 20) + 2 * 4092 * page);
 
     const auto [ok, heap_peak] = gctest::run_with_heap_peak({GEOCODER_HEAP_PEAK_PROBE, "shatter", "0", "4097"}, log);
 

@@ -154,6 +154,14 @@ static int counted(uintptr_t from, uintptr_t to) {
     return 0;
 }
 
+// Whether forget(from, to) cuts a mapping in two: the one change it makes
+// that takes a place in the table rather than freeing places.
+static int cuts(uintptr_t from, uintptr_t to) {
+    for (int i = 0; i < mapped; i++)
+        if (mappings[i].from < from && from < to && to < mappings[i].to) return 1;
+    return 0;
+}
+
 // The pages [from, to) a call mapped, over whatever was mapped there: counted
 // when anonymous.
 static void map_over(uintptr_t from, uintptr_t to, int anonymous) {
@@ -198,7 +206,11 @@ static struct {
 // over whatever was mapped there: the counted pieces of the first of them
 // move along with their holes, the old pages are unmapped unless kept
 // (MREMAP_DONTUNMAP), and the new pages past old_bytes are anonymous when
-// the old ones are.
+// the old ones are. Of the two ranges (which never overlap), the one whose
+// pages leave without cutting a mapping in two goes first, freeing its
+// places before the other takes one: the table then holds no more mappings
+// along the way than before the call or after it, and fills up only when
+// the result needs more places than it has.
 static void moved(uintptr_t old, uintptr_t old_bytes, uintptr_t at, uintptr_t bytes, int kept, int anonymous) {
     const uintptr_t end = old + (old_bytes < bytes ? old_bytes : bytes);
     int pieces = 0;
@@ -209,8 +221,10 @@ static void moved(uintptr_t old, uintptr_t old_bytes, uintptr_t at, uintptr_t by
         moving[pieces].to = at + (to - old);
         pieces++;
     }
+    const int over_first = !cuts(at, at + bytes);
+    if (over_first) forget(at, at + bytes);
     if (!kept) forget(old, old + old_bytes);
-    forget(at, at + bytes);
+    if (!over_first) forget(at, at + bytes);
     for (int i = 0; i < pieces; i++) {
         remember(moving[i].from, moving[i].to);
         add((long)(moving[i].to - moving[i].from));
