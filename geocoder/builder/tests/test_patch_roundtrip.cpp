@@ -559,6 +559,30 @@ TEST(patch_decompresses_the_patch_path_as_named) {
     CHECK(!std::filesystem::exists(root + "/pwned"));
 }
 
+// The patcher decompresses the patch with libzstd in process, so it applies
+// with no zstd on PATH; one built on the zstd CLI (-DGEOCODER_PATCH_LIBZSTD=OFF)
+// runs the zstd on PATH, and without one fails to decompress.
+TEST(patch_needs_no_zstd_on_path_unless_built_on_the_zstd_cli) {
+    ScratchDir dir("patch-no-zstd");
+    const std::string& root = dir.path();
+    REQUIRE(!diff_way_parents(root).raw.empty());
+    std::filesystem::create_directories(root + "/no-zstd");
+    const std::string log = root + "/out.log";
+
+    PatchRun r;
+    r.ok = run({"env", "PATH=" + root + "/no-zstd", GEOCODER_PATCH_BIN, "old", "p.gcpatch", "-o", "out"}, log, root);
+
+    auto text = read_file(log);
+    r.log.assign(text.begin(), text.end());
+#ifdef GEOCODER_PATCH_ZSTD_CLI
+    CHECK(!r.ok);
+    CHECK(logged(r, "Failed to decompress"));
+#else
+    CHECK(r.ok);
+    CHECK(read_file(root + "/out/way_parents.bin") == bytes_of(new_way_parents()));
+#endif
+}
+
 // A patch shorter than its 8-byte magic is refused as truncated: the magic
 // is read through the bounds check like every later field.
 TEST(patch_refuses_a_patch_shorter_than_its_magic) {
