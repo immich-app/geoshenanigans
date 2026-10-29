@@ -2670,16 +2670,20 @@ impl Index {
 
     // --- Postcode resolution ---
     //
-    // Mirrors Nominatim's stored `placex.postcode` chain, all of which is
-    // resolved at build time by placex_triggers.sql:
+    // Nominatim answers with the winning feature's stored `placex.postcode`,
+    // which placex_triggers.sql resolves at index time. Tiers 0 and 1 read
+    // postcodes the builder stored; tier 2 searches around the query point:
     //   0. addr:postcode on the primary feature itself (token_get_postcode)
     //   1. Primary feature's calculated_postcode (inherited from containing
     //      boundary=postal_code at build time):
     //        - street → way_postcodes.bin
     //        - POI    → poi.parent_postcode_id (in-PoiRecord field)
-    //   2. Nearest postcode centroid (get_nearest_postcode, 0.05°, country
-    //      scoped). Mirrors the `get_nearest_postcode(...)` fallback in
-    //      placex_triggers.sql rows 1052 + 1256.
+    //      then, for a US street, the ZIP of a TIGER line of that street
+    //      within ~100 m of the query (interp_postcodes.bin)
+    //   2. The postcode centroid nearest the query point within 0.05°,
+    //      skipping other countries' centroids: get_nearest_postcode's point
+    //      rule before Nominatim 5.3, which Nominatim runs on the feature at
+    //      index time (since 5.3 it takes the postcode area covering it).
     //
     // No query-time PIP on postal boundaries — Nominatim's postcode field
     // comes straight from placex.postcode, which is populated via triggers
@@ -2757,10 +2761,8 @@ impl Index {
             }
         }
 
-        // 2. Nearest postcode centroid (Nominatim's get_nearest_postcode).
-        // Nominatim's get_nearest_postcode filters by country_code
-        // (reverse.py `_find_nearest_postcode` joins location_postcode
-        // on the query's resolved country). Without this filter, a
+        // 2. Nearest postcode centroid to the query point. Like
+        // get_nearest_postcode, filter by country_code: without it, a
         // French "90012" can win over a US "90012" near the Maine/
         // Quebec border or vice-versa — and the same digits often
         // collide across countries. We use the country resolved by
@@ -2772,7 +2774,7 @@ impl Index {
         });
         if let Some(ref pc_mmap) = self.postcode_centroids {
             let total_centroids = pc_mmap.len() / std::mem::size_of::<PostcodeCentroid>() as u64;
-            // 0.05 deg ~ 5.5km, matches Nominatim's get_nearest_postcode
+            // 0.05 deg ~ 5.5km, get_nearest_postcode's radius before Nominatim 5.3
             let max_dist_sq = (0.05_f64).to_radians().powi(2);
             let cos_lat = lat.to_radians().cos();
             let mut best: Option<(f64, &str)> = None;
