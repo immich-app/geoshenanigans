@@ -546,17 +546,15 @@ static int run(int argc, char* argv[]) {
             total_deleted += edit.n_deleted;
             require_old_file_size(cur_dir, name, strings.old_size(t));
             MappedFile old_pool = mmap_file(cur_dir + "/" + name);
-            if (old_pool.size != strings.old_size(t) || content_hash(old_pool.data, old_pool.size) != edit.old_hash)
+            if (old_pool.size != strings.old_size(t))
                 throw std::runtime_error(std::string("Old ") + name + " is not the one the patch was made from");
             FILE* fp = open_out(name);
-            rebuild_string_tier(old_pool.data, old_pool.size, edit, [&](const char* p, size_t n) { fwrite(p, 1, n, fp); });
+            const StringTierRebuild rebuilt = rebuild_string_tier(
+                old_pool.data, old_pool.size, edit, strings.place(t), str_remap,
+                [&](const char* p, size_t n) { fwrite(p, 1, n, fp); }, [](size_t) {});
             close_patch_outputs({{fp, name}});
-            MappedFile new_pool = mmap_file(out_path(name));
-            if (new_pool.size != strings.new_size(t) || content_hash(new_pool.data, new_pool.size) != edit.new_hash)
-                throw std::runtime_error(std::string("Rebuilt ") + name + " does not match the new build");
-            str_remap.add_tier(old_pool.data, old_pool.size, strings.old_base[t], strings.new_base[t], edit);
+            require_string_tier_rebuilt(rebuilt, edit, strings.place(t), name);
             unmap_file(old_pool);
-            unmap_file(new_pool);
         });
         malloc_trim(0);
         std::cerr << "  Strings: +" << total_added << " -" << total_deleted << ", "

@@ -21,6 +21,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1270,6 +1271,25 @@ std::vector<uint32_t> starts_of(const std::string& pool, uint32_t base) {
     return out;
 }
 
+// A shipped tier's walk (rebuild_string_tier) over an old pool in memory,
+// its runs added to remap: the new pool it wrote, and what it read and wrote.
+struct Rebuilt {
+    std::string pool;
+    StringTierRebuild walk;
+};
+
+Rebuilt rebuild(std::string_view old_pool, const StringTierEdit& edit, const StringTierPlace& at, StringRemap& remap) {
+    Rebuilt out;
+    out.walk = rebuild_string_tier(old_pool.data(), old_pool.size(), edit, at, remap,
+                                   [&](const char* p, size_t n) { out.pool.append(p, n); }, [](size_t) {});
+    return out;
+}
+
+// The place of a tier at old offset ob and new offset nb whose new pool is n.
+StringTierPlace place_of(uint32_t ob, uint32_t nb, const std::string& n) {
+    return {ob, nb, static_cast<uint32_t>(n.size())};
+}
+
 }  // namespace
 
 TEST(patch_format_string_remap_runs_match_per_string_pairs) {
@@ -1295,7 +1315,7 @@ TEST(patch_format_string_remap_runs_match_per_string_pairs) {
         std::unordered_map<uint32_t, uint32_t> want;
         std::vector<uint32_t> looked_up;
         for (int t = 0; t < 2; t++) {
-            remap.add_tier(olds[t].data(), olds[t].size(), ob, nb, tier_edit(olds[t], news[t]).edit());
+            rebuild(olds[t], tier_edit(olds[t], news[t]).edit(), place_of(ob, nb, news[t]), remap);
             for (auto& kv : pairs_of(olds[t], news[t], ob, nb)) want.insert(kv);
             for (uint32_t v : starts_of(olds[t], ob)) looked_up.push_back(v);
             ob += olds[t].size(); nb += news[t].size();
@@ -1332,7 +1352,7 @@ TEST(patch_format_derived_and_sent_string_runs_map_every_offset_alike) {
         const TierEdit e = tier_edit(old_pool, new_pool);
         const StringTierRuns runs = encode_string_tier_runs(old_pool.data(), old_pool.size(), ob, nb, e.kept);
         StringRemap derived(scratch_tables()), sent(scratch_tables());
-        derived.add_tier(old_pool.data(), old_pool.size(), ob, nb, e.edit());
+        rebuild(old_pool, e.edit(), place_of(ob, nb, new_pool), derived);
         sent.add_sent_tier(runs.bytes.data(), runs.bytes.size(), runs.n_runs, ob, end);
         derived.finish();
         sent.finish();
@@ -1346,15 +1366,15 @@ TEST(patch_format_derived_and_sent_string_runs_map_every_offset_alike) {
 }
 
 TEST(patch_format_string_remap_lookups_never_read_the_old_pool) {
-    // The patcher unmaps a shipped tier's old pool once add_tier has walked
-    // it: scribbled over afterwards, every string start still maps as the
+    // The patcher unmaps a shipped tier's old pool once its walk is done:
+    // scribbled over afterwards, every string start still maps as the
     // per-string pairs did.
     const std::string o = pool_of({"a", "bb", "c", "dd", "e", "ff", "g"});
     const std::string n = pool_of({"a", "aa", "bb", "c", "e", "eee", "ff", "g", "h"});
     const uint32_t ob = 1000, nb = 990;
     std::vector<char> old_pool(o.begin(), o.end());
     StringRemap remap(scratch_tables());
-    remap.add_tier(old_pool.data(), old_pool.size(), ob, nb, tier_edit(o, n).edit());
+    rebuild({old_pool.data(), old_pool.size()}, tier_edit(o, n).edit(), place_of(ob, nb, n), remap);
     remap.finish();
 
     std::fill(old_pool.begin(), old_pool.end(), 'x');
@@ -1483,7 +1503,7 @@ TEST(patch_format_string_remap_maps_shipped_and_sent_tiers_and_tier_moves) {
             for (int t = 0; t < n_tiers; t++) {
                 const TierEdit e = tier_edit(olds[t], news[t]);
                 if (shipped >> t & 1) {
-                    r->add_tier(olds[t].data(), olds[t].size(), ob[t], nb[t], e.edit());
+                    rebuild(olds[t], e.edit(), place_of(ob[t], nb[t], news[t]), *r);
                 } else {
                     auto runs = encode_string_tier_runs(olds[t].data(), olds[t].size(), ob[t], nb[t], e.kept);
                     r->add_sent_tier(runs.bytes.data(), runs.bytes.size(), runs.n_runs, ob[t], ob[t + 1]);
@@ -1624,10 +1644,13 @@ void decode_strings(const std::vector<char>& buf, const RandomTiers& r, DecodedS
     load_string_remap(out.section, remap, [&](int t) {
         const StringTierEdit& d = out.section.edits[t];
         CHECK_EQ(d.old_hash, content_hash(r.olds[t].data(), r.olds[t].size()));
-        rebuild_string_tier(r.olds[t].data(), r.olds[t].size(), d,
-                            [&](const char* p, size_t n) { out.rebuilt[t].append(p, n); });
+        const Rebuilt b = rebuild(r.olds[t], d, out.section.place(t), remap);
+        out.rebuilt[t] = b.pool;
         CHECK_EQ(content_hash(out.rebuilt[t].data(), out.rebuilt[t].size()), d.new_hash);
-        remap.add_tier(r.olds[t].data(), r.olds[t].size(), out.section.old_base[t], out.section.new_base[t], d);
+        CHECK_EQ(b.walk.old_hash, d.old_hash);
+        CHECK_EQ(b.walk.new_hash, d.new_hash);
+        CHECK_EQ(refusal_of([&] { require_string_tier_rebuilt(b.walk, d, out.section.place(t), STRING_TIER_FILES[t]); }),
+                 std::string());
     });
 }
 
@@ -1713,12 +1736,9 @@ TEST(patch_format_string_tier_edit_moves_a_string_out_of_order) {
     REQUIRE(e.diff.added.size() == 2);
     CHECK_EQ(std::string(e.diff.added[0]), std::string("cafe"));
     CHECK_EQ(std::string(e.diff.added[1]), std::string("tea"));
-    std::string rebuilt;
-    rebuild_string_tier(o.data(), o.size(), e.edit(), [&](const char* p, size_t len) { rebuilt.append(p, len); });
-    CHECK(rebuilt == n);
     // bank shifts by a run; cafe, which the edit doesn't keep, by a pair.
     StringRemap remap(scratch_tables());
-    remap.add_tier(o.data(), o.size(), 100, 100, e.edit());
+    CHECK(rebuild(o, e.edit(), place_of(100, 100, n), remap).pool == n);
     const std::vector<char> moved = pair_bytes({{104, 109}});
     remap.finish(pair_table(moved));
     CHECK_EQ(remap.run_count(), size_t(1));
@@ -1727,11 +1747,12 @@ TEST(patch_format_string_tier_edit_moves_a_string_out_of_order) {
     CHECK_EQ(remap.lookup(104), 109u);
 }
 
-TEST(patch_format_rebuild_refuses_a_diff_the_old_pool_cannot_place) {
+TEST(patch_format_rebuild_finds_a_diff_the_old_pool_cannot_place) {
     const std::string o = pool_in_order({"a", "b"});
     auto rebuilds = [&](const StringTierDiff& d) {
         const std::vector<char> bytes = bytes_of(d);
-        return refusal_of([&] { rebuild_string_tier(o.data(), o.size(), edit_of(bytes), [](const char*, size_t) {}); }).empty();
+        StringRemap remap(scratch_tables());
+        return rebuild(o, edit_of(bytes), {}, remap).walk.placed;
     };
     const char* x = "x";
     CHECK(rebuilds({0, 0, false, {x}, {2}, {}}));          // after both old strings
@@ -1743,6 +1764,122 @@ TEST(patch_format_rebuild_refuses_a_diff_the_old_pool_cannot_place) {
     CHECK(!rebuilds({0, 0, true, {x}, {}, {2}}));
 }
 
+TEST(patch_format_string_tier_walk_writes_pieces_and_reads_nothing_it_passed) {
+    // 30,000 names, one longer than a piece, every seventh deleted and every
+    // fifth followed by an added one (sorted, or put before it, which an
+    // indexed tier's order allows): the one walk writes the new pool in
+    // pieces of at most STRING_WALK_PIECE (the long name alone), hashes both
+    // pools as content_hash does, derives the runs, and reads no old byte
+    // before an offset it passed: scribbled over as it passes them, the old
+    // pool still rebuilds into the new one.
+    for (const bool sorted : {true, false}) {
+        std::vector<std::string> o, n;
+        for (uint32_t i = 0; i < 30000; i++) {
+            char b[16];
+            std::snprintf(b, sizeof b, "name %07u", i);
+            const std::string w = i == 12345 ? b + std::string(STRING_WALK_PIECE + 100, 'z') : b;
+            o.push_back(w);
+            if (i % 5 == 1 && !sorted) n.push_back(w + "+");
+            if (i % 7 != 3) n.push_back(w);
+            if (i % 5 == 1 && sorted) n.push_back(w + "+");
+        }
+        const std::string old_pool = pool_in_order(o), new_pool = pool_in_order(n);
+        const TierEdit e = tier_edit(old_pool, new_pool);
+        REQUIRE(e.diff.sorted == sorted);
+        std::vector<char> old_bytes(old_pool.begin(), old_pool.end());
+        std::string rebuilt;
+        size_t longer = 0, passed = 0, scribbled = 0;
+        StringRemap remap(scratch_tables());
+
+        const StringTierRebuild walk = rebuild_string_tier(
+            old_bytes.data(), old_bytes.size(), e.edit(), place_of(1000, 900, new_pool), remap,
+            [&](const char* p, size_t len) {
+                rebuilt.append(p, len);
+                longer += len > STRING_WALK_PIECE;
+            },
+            [&](size_t off) {
+                CHECK(off >= scribbled + STRING_WALK_PIECE && off <= old_bytes.size());
+                std::fill(old_bytes.begin(), old_bytes.begin() + off, '#');
+                scribbled = off;
+                passed++;
+            });
+
+        CHECK(rebuilt == new_pool);
+        CHECK(walk.placed);
+        CHECK_EQ(walk.new_size, uint64_t(new_pool.size()));
+        CHECK_EQ(walk.old_hash, content_hash(old_pool.data(), old_pool.size()));
+        CHECK_EQ(walk.new_hash, content_hash(new_pool.data(), new_pool.size()));
+        CHECK_EQ(longer, size_t(1));
+        CHECK(passed + 2 >= old_pool.size() / STRING_WALK_PIECE);
+        remap.finish();
+        const auto want = pairs_of(old_pool, new_pool, 1000, 900);
+        size_t wrong = 0;
+        for (uint32_t v : starts_of(old_pool, 1000)) {
+            auto it = want.find(v);
+            wrong += remap.lookup(v) != (it != want.end() ? it->second : v);
+        }
+        CHECK_EQ(wrong, size_t(0));
+    }
+}
+
+TEST(patch_format_string_tier_rebuild_is_refused_for_its_first_fault) {
+    // The walk reads the old pool before anything checks it. A stale pool is
+    // named as such, even when the edit doesn't fit it; then an edit the
+    // right pool can't place is a malformed patch; then a new pool other
+    // than the new build's is named. The walk hashes the whole old pool in
+    // every case.
+    const std::string o = pool_of({"a", "bb", "c", "dd", "e"}), n = pool_of({"a", "c", "dd", "ff"});
+    const TierEdit e = tier_edit(o, n);
+    REQUIRE(e.diff.deleted == std::vector<uint32_t>({1, 4}));
+    auto refusal = [](const std::string& old_pool, const StringTierDiff& d, const StringTierPlace& at) {
+        const std::vector<char> bytes = bytes_of(d);
+        const StringTierEdit edit = edit_of(bytes);
+        StringRemap remap(scratch_tables());
+        const Rebuilt b = rebuild(old_pool, edit, at, remap);
+        CHECK_EQ(b.walk.old_hash, content_hash(old_pool.data(), old_pool.size()));
+        return refusal_of([&] { require_string_tier_rebuilt(b.walk, edit, at, "strings_core.bin"); });
+    };
+    const StringTierPlace at = place_of(0, 0, n);
+    std::string letter = o, fewer = o;
+    letter[2] = 'x';               // bb -> xb: as many strings
+    fewer[fewer.size() - 3] = 'x';  // dd e -> ddxe: no fifth string to delete
+    StringTierDiff unplaced = e.diff, other_new = e.diff;
+    unplaced.deleted.push_back(5);  // the right pool has no sixth string
+    other_new.new_hash ^= 1;
+    const std::string stale = "Old strings_core.bin is not the one the patch was made from";
+    const std::string rebuilt = "Rebuilt strings_core.bin does not match the new build";
+
+    CHECK_EQ(refusal(o, e.diff, at), std::string());
+    CHECK_EQ(refusal(letter, e.diff, at), stale);
+    CHECK_EQ(refusal(fewer, e.diff, at), stale);
+    CHECK_EQ(refusal(fewer, unplaced, at), stale);
+    CHECK_EQ(refusal(o, unplaced, at), std::string("Malformed strings section"));
+    CHECK_EQ(refusal(letter, other_new, at), stale);
+    CHECK_EQ(refusal(o, other_new, at), rebuilt);
+    CHECK_EQ(refusal(o, e.diff, place_of(0, 0, n + "x")), rebuilt);
+}
+
+TEST(patch_format_string_tier_walk_reads_a_stale_pool_only_within_it) {
+    // A stale old pool held in exactly its bytes, whose last string lost its
+    // NUL, under a sorted edit adding a string that string prefixes: the
+    // walk compares and copies nothing past the pool (the sanitizer build
+    // sees any byte past it) and the rebuild names the pool stale.
+    const std::string o = pool_of({"a", "cd"}), n = pool_of({"a", "cd", "cdz"});
+    const TierEdit e = tier_edit(o, n);
+    REQUIRE(e.diff.sorted);
+    const std::vector<char> stale(o.begin(), o.end() - 1);  // a\0cd
+    StringRemap remap(scratch_tables());
+    const StringTierPlace at = place_of(0, 0, n);
+
+    const Rebuilt b = rebuild({stale.data(), stale.size()}, e.edit(), at, remap);
+
+    CHECK(b.walk.placed);
+    CHECK(b.pool == std::string("a\0cdcdz\0", 8));
+    CHECK_EQ(b.walk.old_hash, content_hash(stale.data(), stale.size()));
+    CHECK_EQ(refusal_of([&] { require_string_tier_rebuilt(b.walk, e.edit(), at, "strings_core.bin"); }),
+             std::string("Old strings_core.bin is not the one the patch was made from"));
+}
+
 TEST(patch_format_sorted_tier_sends_no_indices) {
     // A sorted new pool takes its added strings where they sort: the diff
     // carries no indices, and the old pool rebuilds into the new one.
@@ -1751,9 +1888,8 @@ TEST(patch_format_sorted_tier_sends_no_indices) {
     CHECK(e.diff.sorted);
     CHECK(e.diff.added_at.empty());
     CHECK(e.diff.deleted == std::vector<uint32_t>({1}));
-    std::string rebuilt;
-    rebuild_string_tier(o.data(), o.size(), e.edit(), [&](const char* p, size_t len) { rebuilt.append(p, len); });
-    CHECK(rebuilt == n);
+    StringRemap remap(scratch_tables());
+    CHECK(rebuild(o, e.edit(), place_of(0, 0, n), remap).pool == n);
     // The section holds the order flag but no index of the three added strings.
     std::array<StringTierPools, STRING_TIER_COUNT> tiers{};
     tiers[0] = {o.data(), o.size(), n.data(), n.size()};

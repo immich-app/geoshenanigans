@@ -1063,6 +1063,49 @@ TEST(patch_refuses_cell_changes_out_of_order_and_a_second_or_foreign_delta) {
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
+// A stale old core tier, which the patcher reads before anything checks it:
+// with a letter changed, or with a NUL lost so that the old pool holds one
+// string fewer and the edit's last deleted index lies past it, it's refused in
+// every mode as an old file the patch wasn't made from, not as a malformed
+// patch. The patch applies to the tier it was made from.
+TEST(patch_refuses_a_stale_old_string_tier) {
+    ScratchDir dir("patch-stale-strings");
+    // 10,000 streets, every third and the last deleted and every hundredth
+    // followed by an added one.
+    std::string old_pool, new_pool;
+    for (uint32_t i = 0; i < 10000; i++) {
+        char b[24];
+        std::snprintf(b, sizeof b, "street %07u", i);
+        old_pool.append(b, strlen(b) + 1);
+        if (i % 3 != 0 && i != 9999) new_pool.append(b, strlen(b) + 1);
+        if (i % 100 == 7) new_pool.append(b).append("+", 2);
+    }
+    BuildDir old_d, new_d;
+    old_d["strings_core.bin"].assign(old_pool.begin(), old_pool.end());
+    new_d["strings_core.bin"].assign(new_pool.begin(), new_pool.end());
+    const LowMemCase c{dir.path(), "stale"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+    // The old dir's tier and the encoded set's (a link to it, or a copy):
+    // whether both were written.
+    auto put_old_pool = [&](const std::string& pool) {
+        return write_file(c.dir("old") + "/strings_core.bin", pool.data(), pool.size()) &&
+               write_file(c.dir("old.enc") + "/strings_core.bin", pool.data(), pool.size());
+    };
+    std::string letter = old_pool, fewer = old_pool;
+    letter[3] = 'E';
+    fewer[fewer.size() - 16] = 'x';  // the NUL before the last street
+    const std::pair<std::string, std::string> stale_pools[] = {{"letter", letter}, {"fewer", fewer}};
+    const std::string stale = "Old strings_core.bin is not the one the patch was made from";
+
+    for (const auto& [name, pool] : stale_pools) {
+        REQUIRE(put_old_pool(pool));
+
+        CHECK(not_refused(c, ALL_MODES, c.patch(), name, stale).empty());
+    }
+    REQUIRE(put_old_pool(old_pool));
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
 // A frame declaring 2^32 + 1 bytes of content (then 8 KiB of them, an RLE
 // block, and the end) fails the run with an error. A 64-bit build maps that
 // decompression bound and finds the 8 KiB are no patch; a 32-bit size_t can't
