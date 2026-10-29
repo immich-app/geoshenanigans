@@ -1273,6 +1273,7 @@ fn publish(stage: &Path, out: &Path, rename: impl Fn(&Path, &Path) -> std::io::R
                 }
             }
             if stuck.is_empty() {
+                let _ = std::fs::remove_dir(&aside);
                 return Err(e);
             }
             let e = format!("{e}; could not put back {}: the files they replaced are in {}", stuck.join(", "), aside.display());
@@ -1991,11 +1992,10 @@ mod tests {
         };
 
         let result = publish(&stage, &out, rename);
-        clear_stage(&stage);
 
         assert!(result.is_err());
         assert_eq!(contents(&out), before);
-        assert!(!stage.exists());
+        assert!(!stage.join(BUILD_ASIDE_DIR).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
