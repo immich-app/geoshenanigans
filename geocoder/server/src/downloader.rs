@@ -366,6 +366,7 @@ pub async fn download_region(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scratch_dir::ScratchDir;
 
     #[test]
     fn streaming_decode_hash_roundtrip() {
@@ -374,9 +375,8 @@ mod tests {
         let raw: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
         let compressed = zstd::encode_all(&raw[..], 3).unwrap();
 
-        let dir = std::env::temp_dir().join(format!("gc_dl_test_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let tmp = dir.join("out.bin.tmp");
+        let dir = ScratchDir::new();
+        let tmp = dir.path().join("out.bin.tmp");
 
         let (tx, rx) = std::sync::mpsc::sync_channel::<bytes::Bytes>(8);
         let feeder = std::thread::spawn(move || {
@@ -391,7 +391,6 @@ mod tests {
         hasher.update(&raw);
         assert_eq!(got, format!("{:x}", hasher.finalize()));
         assert_eq!(std::fs::read(&tmp).unwrap(), raw);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn component(files: &[&str], replaces: &[&str], extends: Option<&str>) -> Component {

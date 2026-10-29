@@ -1,6 +1,8 @@
 mod auth;
 mod downloader;
 mod region_state;
+#[cfg(test)]
+mod scratch_dir;
 
 use region_state::{Configuration, RegionState};
 
