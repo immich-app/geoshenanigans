@@ -398,13 +398,6 @@ static std::vector<uint32_t> derive_id_remap_from_merge(
 
 // --- Identity matching (v8) ---
 
-// A family's identity sidecar: one stable entity key (u32) per record, or
-// empty (see identity_keys).
-static std::vector<uint32_t> load_identity(const std::string& meta_dir, const char* family, size_t n_records) {
-    if (meta_dir.empty()) return {};
-    return identity_keys(read_file(meta_dir + "/" + family + ".slot.u32"), n_records);
-}
-
 // The old record of every in-order kept entity takes its new record's offset
 // field, so an unchanged record compares equal (the content-hash fixup
 // passes, without the hashing).
@@ -658,9 +651,23 @@ static int run(int argc, char* argv[]) {
         if (std::string(argv[a]) == "--identity" && a + 2 < argc) { id_old_meta = argv[a + 1]; id_new_meta = argv[a + 2]; a += 2; }
         else { std::cerr << "Unknown argument " << argv[a] << std::endl; return 1; }
     }
+    // A family's keys from one day's sidecar (see identity_keys). A sidecar
+    // that is not one key per record is rejected with a warning: the family
+    // then merges by content.
+    auto load_identity = [&](const std::string& meta_dir, const char* family, size_t n_records) {
+        const std::string path = meta_dir + "/" + family + ".slot.u32";
+        const auto bytes = read_file(path);
+        if (bytes.size() != n_records * sizeof(uint32_t)) {
+            std::lock_guard<std::mutex> lock(log_mutex);
+            std::cerr << "  Warning: " << family << " identity sidecar " << path << " rejected (" << bytes.size()
+                      << " bytes for " << n_records << " records); " << family << " merges by content" << std::endl;
+        }
+        return identity_keys(bytes, n_records);
+    };
     // A family's identity sidecars when both days have one per record.
     auto identity_of = [&](const char* family, size_t old_n, size_t new_n)
             -> std::pair<std::vector<uint32_t>, std::vector<uint32_t>> {
+        if (id_old_meta.empty()) return {};
         auto ok = load_identity(id_old_meta, family, old_n), nk = load_identity(id_new_meta, family, new_n);
         if (ok.empty() || nk.empty()) return {};
         return {std::move(ok), std::move(nk)};

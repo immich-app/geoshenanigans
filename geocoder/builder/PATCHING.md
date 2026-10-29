@@ -65,7 +65,10 @@ on 1 core, every apply byte-identical to the new day):
 
 planet/quality/uncapped and planet/poi/all patch to within a few bytes of v7
 (no street / interp / addr records). Without `--identity` the families merge
-by content as in v7, with the rest of the v8 format.
+by content as in v7, with the rest of the v8 format. The nightly diffs every
+variant by identity: `tools/generate_patches.sh` writes both days' sidecars
+(each day is built with `--prev-output` from the last), and the diff warns of
+a sidecar it rejects, naming the family that then merges by content.
 
 The tables below predate all of these changes.
 
