@@ -1380,28 +1380,37 @@ private:
 
 // Old → new record ids of a replayed data file: the MATCH runs of its merge
 // sequence plus the diff's secondary matches. Strategy-2 slots keep these
-// to long runs of one shift, so this holds a few MB where the patcher used
-// to write a 4-byte-per-record scratch file (~1 GB for planet/full) and read
-// it at random from the entry pipeline: page-cache thrash on a 1 GiB client.
+// to long runs of one shift: a few MB where the patcher used to write a
+// 4-byte-per-record scratch file (~1 GB for planet/full) and read it at
+// random from the entry pipeline, page-cache thrash on a 1 GiB client. The
+// runs spill to a ScratchTable as the replay makes them, so a reorder day's
+// many cost the heap nothing; lookups start once finish_runs() has mapped
+// them.
 class RecordRemap {
 public:
     static constexpr uint32_t NONE = 0xFFFFFFFFu;
 
-    explicit RecordRemap(uint32_t n_old = 0) : n_old_(n_old) {}
+    RecordRemap() = default;  // maps nothing
+    RecordRemap(uint32_t n_old, const std::string& scratch_dir) : n_old_(n_old), runs_(scratch_dir, "record runs") {}
 
     // `count` old records from old_start were kept as new_start onwards.
+    // The run stays open while the next match extends it.
     void add_match(uint32_t old_start, uint32_t new_start, uint32_t count) {
         if (old_start >= n_old_) return;
         count = std::min(count, n_old_ - old_start);
         if (count == 0) return;
-        if (!runs_.empty()) {
-            Run& last = runs_.back();
-            if (last.old_start + last.count == old_start && last.new_start + last.count == new_start) {
-                last.count += count;
-                return;
-            }
+        if (open_.count > 0 && open_.old_start + open_.count == old_start && open_.new_start + open_.count == new_start) {
+            open_.count += count;
+            return;
         }
-        runs_.push_back({old_start, new_start, count});
+        if (open_.count > 0) runs_.append(open_);
+        open_ = {old_start, new_start, count};
+    }
+    // The replay is over: maps its runs for lookups.
+    void finish_runs() {
+        if (open_.count > 0) runs_.append(open_);
+        open_ = {};
+        runs_.finish();
     }
     // A secondary match: old_id now maps to new_id; the last one for an id wins.
     void add_pair(uint32_t old_id, uint32_t new_id) {
@@ -1417,9 +1426,10 @@ public:
     }
 
     size_t size() const { return n_old_; }
-    bool empty() const { return runs_.empty() && pairs_.empty(); }
+    size_t run_count() const { return runs_.size() + (open_.count > 0); }
+    bool empty() const { return run_count() == 0 && pairs_.empty(); }
     // operator[] with a run hint: consecutive lookups that land in the same
-    // run (spatially sorted references) skip the binary search.
+    // run or the next (spatially sorted references) skip the search.
     uint32_t lookup(uint32_t o, size_t& hint) const {
         if (o >= n_old_) return NONE;
         if (!pairs_.empty()) {
@@ -1427,15 +1437,7 @@ public:
                                       [](const auto& a, const auto& b) { return a.first < b.first; });
             if (p != pairs_.end() && p->first == o) return p->second;
         }
-        if (hint < runs_.size() && o >= runs_[hint].old_start && o < runs_[hint].old_start + runs_[hint].count)
-            return runs_[hint].new_start + (o - runs_[hint].old_start);
-        auto it = std::upper_bound(runs_.begin(), runs_.end(), o,
-                                   [](uint32_t v, const Run& r) { return v < r.old_start; });
-        if (it == runs_.begin()) return NONE;
-        --it;
-        if (o >= it->old_start + it->count) return NONE;
-        hint = static_cast<size_t>(it - runs_.begin());
-        return it->new_start + (o - it->old_start);
+        return through_run(o, runs_.table().floor(o, hint));
     }
     // The new id of old record `old`, or NONE when it wasn't kept.
     uint32_t operator[](size_t old) const {
@@ -1446,17 +1448,22 @@ public:
                                       [](const auto& a, const auto& b) { return a.first < b.first; });
             if (p != pairs_.end() && p->first == o) return p->second;
         }
-        auto it = std::upper_bound(runs_.begin(), runs_.end(), o,
-                                   [](uint32_t v, const Run& r) { return v < r.old_start; });
-        if (it == runs_.begin()) return NONE;
-        --it;
-        return o < it->old_start + it->count ? it->new_start + (o - it->old_start) : NONE;
+        return through_run(o, runs_.table().floor(o));
     }
 
 private:
     struct Run { uint32_t old_start, new_start, count; };
-    uint32_t n_old_;
-    std::vector<Run> runs_;
+    // o's new id by the run at `at`, its floor (the table's size for none).
+    uint32_t through_run(uint32_t o, size_t at) const {
+        const SortedTable<Run>& t = runs_.table();
+        if (at == t.size()) return NONE;
+        const Run r = t[at];
+        return o - r.old_start < r.count ? r.new_start + (o - r.old_start) : NONE;
+    }
+
+    uint32_t n_old_ = 0;
+    Run open_{0, 0, 0};  // the run the replay may still extend
+    ScratchTable<Run> runs_;
     std::vector<std::pair<uint32_t, uint32_t>> pairs_;
 };
 
@@ -1778,7 +1785,8 @@ void for_each_new_string(const char* old_pool, size_t old_size, const StringTier
 // partition_strings_into_tiers guarantees and CI's byte identity check proves
 // daily. Surviving strings the edits don't keep (they changed tier, or the
 // POI tier's order moved them) are explicit pairs, read where the patch holds
-// them.
+// them. The runs spill to a ScratchTable as they are made, tier by tier in
+// offset order, and finish() maps them with the pairs for lookups.
 //
 // Pairs are looked up first, but the order doesn't matter: a pair's old
 // offset starts a string its old tier's edit doesn't keep, runs cover only
@@ -1786,14 +1794,15 @@ void for_each_new_string(const char* old_pool, size_t old_size, const StringTier
 // covers a pair's offset.
 class StringRemap {
 public:
+    StringRemap() = default;  // maps every offset to itself
+    explicit StringRemap(const std::string& scratch_dir) : runs_(scratch_dir, "string runs") {}
+
     // Records the kept strings that moved, walking a shipped tier's old pool
     // and edit as its rebuild does. Lookups don't read the old pool.
     void add_tier(const char* old_pool, size_t old_size, uint32_t old_base, uint32_t new_base,
                   const StringTierEdit& edit) {
         uint32_t new_start = new_base;
-        StringRunJoiner joiner([&](uint32_t start, uint32_t end, uint32_t shift) {
-            runs_.push_back({start, end, shift});
-        });
+        StringRunJoiner joiner([&](uint32_t start, uint32_t end, uint32_t shift) { runs_.append({start, end, shift}); });
         for_each_new_string(old_pool, old_size, edit, [&](const char*, size_t len, size_t old_off) {
             if (old_off != NO_OLD_STRING) {
                 const uint32_t start = old_base + static_cast<uint32_t>(old_off);
@@ -1804,11 +1813,10 @@ public:
         joiner.finish();
     }
     // Decodes the runs encode_string_tier_runs wrote for the tier at old
-    // offsets [tier_start, tier_end). Tiers are added in offset order, so the
-    // runs stay sorted.
+    // offsets [tier_start, tier_end). Tiers are added in offset order: the
+    // table refuses a run that steps back.
     void add_sent_tier(const char* data, size_t size, uint32_t n_runs, uint32_t tier_start, uint32_t tier_end) {
         auto malformed = [] { throw std::runtime_error("Malformed string runs"); };
-        if (!runs_.empty() && runs_.back().end > tier_start) malformed();
         if (n_runs > size / 3) malformed();  // a run is at least 3 bytes
         size_t pos = 0;
         uint64_t prev_end = tier_start;
@@ -1818,29 +1826,42 @@ public:
             uint64_t end = start + read_varint_bounded(data, pos, size, "string runs");
             shift += unzigzag32(read_varint_bounded(data, pos, size, "string runs"));
             if (end == start || end > tier_end) malformed();
-            runs_.push_back({static_cast<uint32_t>(start), static_cast<uint32_t>(end), shift});
+            runs_.append({static_cast<uint32_t>(start), static_cast<uint32_t>(end), shift});
             prev_end = end;
         }
         if (pos != size) malformed();
     }
-    // The moved strings' pairs (the strings section's, where it sits).
-    void set_pairs(SortedTable<RemapPair> pairs) { pairs_ = std::move(pairs); }
-    bool empty() const { return runs_.empty() && pairs_.empty(); }
+    // Every tier is in: maps the runs for lookups, with the moved strings'
+    // pairs (the strings section's, where it sits).
+    void finish(SortedTable<RemapPair> pairs = {}) {
+        runs_.finish();
+        pairs_ = std::move(pairs);
+    }
+    bool empty() const { return runs_.size() == 0 && pairs_.empty(); }
     size_t run_count() const { return runs_.size(); }
 
     uint32_t lookup(uint32_t off) const {
         if (const std::optional<RemapPair> p = pairs_.find(off)) return p->to;
-        auto it = std::upper_bound(runs_.begin(), runs_.end(), off,
-                                   [](uint32_t v, const Run& r) { return v < r.start; });
-        if (it == runs_.begin()) return off;
-        --it;
-        if (off >= it->end) return off;
-        return off + it->shift;
+        return through_run(off, runs_.table().floor(off));
+    }
+    // lookup with a run hint, for offsets that mostly ascend (a record
+    // file's names in record order, as the POI tier is).
+    uint32_t lookup(uint32_t off, size_t& hint) const {
+        if (const std::optional<RemapPair> p = pairs_.find(off)) return p->to;
+        return through_run(off, runs_.table().floor(off, hint));
     }
 
 private:
     struct Run { uint32_t start, end, shift; };
-    std::vector<Run> runs_;
+    // off shifted by the run at `at`, its floor (the table's size for none).
+    uint32_t through_run(uint32_t off, size_t at) const {
+        const SortedTable<Run>& t = runs_.table();
+        if (at == t.size()) return off;
+        const Run r = t[at];
+        return off < r.end ? off + r.shift : off;
+    }
+
+    ScratchTable<Run> runs_;
     SortedTable<RemapPair> pairs_;
 };
 
@@ -2068,7 +2089,8 @@ void rebuild_string_tier(const char* old_pool, size_t old_size, const StringTier
 
 // Fills remap from the section, tier by tier in offset order: a sent tier
 // from its runs, a shipped tier through on_shipped(t), which rebuilds it and
-// calls remap.add_tier with its old pool and edit. Then the moved strings.
+// calls remap.add_tier with its old pool and edit. Then it finishes the
+// remap with the moved strings.
 template <typename OnShipped>
 void load_string_remap(const StringsSection& s, StringRemap& remap, OnShipped on_shipped) {
     for (int t = 0; t < STRING_TIER_COUNT; t++) {
@@ -2079,7 +2101,7 @@ void load_string_remap(const StringsSection& s, StringRemap& remap, OnShipped on
             on_shipped(t);
         }
     }
-    remap.set_pairs(s.pairs);
+    remap.finish(s.pairs);
 }
 
 // --- Offset fixups ---
