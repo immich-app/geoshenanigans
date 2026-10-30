@@ -1,8 +1,9 @@
 // geocoder-patch's low-memory mode end to end: small synthetic today's-format
 // dirs, the geocoder-diff patch between them, geocoder-gc's encoding of the
 // old dir patched (in sync and --threads) and the new encoded set compared
-// byte for byte with geocoder-gc's encoding of the new dir. Then patches and
-// command lines the patcher must refuse.
+// byte for byte with geocoder-gc's encoding of the new dir. Then the
+// patcher's heap peak, in every mode, as a case grows tenfold; and patches
+// and command lines the patcher must refuse.
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -10,6 +11,7 @@
 #include <filesystem>
 #include <functional>
 #include <map>
+#include <optional>
 #include <random>
 #include <regex>
 #include <string>
@@ -34,6 +36,15 @@ constexpr uint32_t NO = 0xFFFFFFFFu;
 // The most bytes a family's decoder may hold queued while the replay skips
 // old bytes (a deleted run, replaced children or parents).
 constexpr uint64_t DECODER_HOLD = 1 << 20;
+// The most the patcher's heap peak may grow when a heap test's case grows
+// tenfold in the one structure it varies, which the patcher reads in place.
+constexpr uint64_t HEAP_GROWTH_SLACK = 256 << 10;
+// How many times a heap test applies its case with --threads at each size.
+// The codec threads queue bytes as the scheduler runs them, so one run of a
+// case can peak some 550 KiB above another on a loaded machine (within
+// 60 KiB on a quiet one); the runs at n show how far, and at 10 n the least
+// of them counts.
+constexpr int THREADS_HEAP_RUNS = 7;
 
 template <typename T>
 void append(std::vector<char>& out, const T& v) {
@@ -232,24 +243,114 @@ std::string prepare(const LowMemCase& c, const BuildDir& old_d, const BuildDir& 
     return "";
 }
 
-// The patch applied to the old encoded set, in sync and --threads, compared
-// with the new encoded set; check runs on each log. Every mismatch, printed.
-std::vector<std::string> apply_both_modes(const LowMemCase& c, const LogCheck& check = {}) {
+// The modes a patch applies in: to the old dir, and to its encoded set (the
+// low-memory mode) in sync and with --threads.
+const std::vector<std::string> ENCODED_MODES = {"sync", "threads"};
+const std::vector<std::string> ALL_MODES = {"plain", "sync", "threads"};
+
+// A case's patch applied in some modes: every mismatch, and the patcher's
+// heap peak by mode where the heap shim measured one.
+struct Applied {
     std::vector<std::string> bad;
-    for (const bool threads : {false, true}) {
-        const std::string mode = threads ? "threads" : "sync", out = c.dir("out." + mode);
-        std::vector<std::string> words = {GEOCODER_PATCH_BIN, c.dir("old.enc"), c.patch(), "-o", out};
-        if (threads) words.push_back("--threads");
-        auto r = run_tool(words, c.log());
-        if (!r.ok) {
-            bad.push_back(mode + ": patch failed: " + r.log);
+    std::map<std::string, uint64_t> heap_peaks;
+};
+
+// The patch applied in each of modes ("plain": to the old dir, compared with
+// the new dir; "sync" and "threads": to the old encoded set, compared with
+// the new encoded set), the patcher under the heap shim; check runs on each
+// log. Every mismatch, printed.
+Applied apply_modes(const LowMemCase& c, const std::vector<std::string>& modes, const LogCheck& check = {}) {
+    Applied a;
+    // The patcher writes only into an empty dir: a case applied again starts
+    // from none.
+    for (const std::string& mode : modes) std::filesystem::remove_all(c.dir("out." + mode));
+    for (const std::string& mode : modes) {
+        const bool plain = mode == "plain";
+        const std::string out = c.dir("out." + mode);
+        std::vector<std::string> words = {GEOCODER_PATCH_BIN, c.dir(plain ? "old" : "old.enc"), c.patch(), "-o", out};
+        if (mode == "threads") words.push_back("--threads");
+        std::filesystem::remove(c.log());
+        const auto [ok, heap_peak] = gctest::run_with_heap_peak(words, c.log());
+        const std::vector<char> text = read_file(c.log());
+        const std::string log(text.begin(), text.end());
+        if (heap_peak) a.heap_peaks[mode] = *heap_peak;
+        if (!ok) {
+            a.bad.push_back(mode + ": patch failed: " + log);
             continue;
         }
-        if (read_dir(out) != read_dir(c.dir("new.enc"))) bad.push_back(mode + ": the new set is not gc's encoding of the new dir");
+        if (read_dir(out) != read_dir(c.dir(plain ? "new" : "new.enc")))
+            a.bad.push_back(mode + (plain ? ": the patched dir is not the new dir" : ": the new set is not gc's encoding of the new dir"));
         if (check)
-            if (std::string e = check(r.log); !e.empty()) bad.push_back(mode + ": " + e);
+            if (std::string e = check(log); !e.empty()) a.bad.push_back(mode + ": " + e);
     }
-    for (const auto& b : bad) std::printf("    %s: %s\n", c.name.c_str(), b.c_str());
+    for (const auto& b : a.bad) std::printf("    %s: %s\n", c.name.c_str(), b.c_str());
+    return a;
+}
+
+// The low-memory mode's mismatches.
+std::vector<std::string> apply_both_modes(const LowMemCase& c, const LogCheck& check = {}) {
+    return apply_modes(c, ENCODED_MODES, check).bad;
+}
+
+// A heap test's case of n elements of the one structure it varies, written
+// into c as prepare() writes one: "" or what failed.
+using CaseOfSize = std::function<std::string(const LowMemCase& c, uint32_t n)>;
+
+// The case at n and at 10 n, each applied in every mode: each output as
+// apply_modes checks it, and in each mode the heap peak at 10 n at most
+// HEAP_GROWTH_SLACK above the one at n. Plain and sync runs peak the same
+// every time, so one run at each size decides; --threads runs
+// THREADS_HEAP_RUNS times at each size, the sizes taking turns so that both
+// see the same load, and the least peak at 10 n is held to the slack above
+// the greatest at n: growth lifts every run at 10 n, while the scheduler
+// lifts the runs at n about as far as those at 10 n. Every failure, printed;
+// skipped without a heap shim (the sanitizer build).
+std::vector<std::string> heap_flat(const CaseOfSize& make_case, uint32_t n) {
+    if (!gctest::heap_peak_shim()) {
+        std::printf("    SKIP heap peaks at n = %u: no heap shim under the sanitizers\n", n);
+        return {};
+    }
+    ScratchDir dir("lowmem-heap");
+    std::vector<std::string> bad;
+    auto fail = [&](const std::string& why) {
+        std::printf("    %s\n", why.c_str());
+        bad.push_back(why);
+    };
+    const uint32_t sizes[] = {n, 10 * n};
+    std::vector<LowMemCase> cases;
+    for (const uint32_t size : sizes) {
+        cases.push_back({dir.path(), "n" + std::to_string(size)});
+        if (std::string e = make_case(cases.back(), size); !e.empty()) {
+            fail(cases.back().name + ": " + e);
+            return bad;
+        }
+    }
+    // Each size's heap peaks by mode, one per run.
+    std::map<std::string, std::vector<uint64_t>> peaks[2];
+    for (int run = 0; run < THREADS_HEAP_RUNS && (run == 0 || bad.empty()); run++)
+        for (size_t s = 0; s < 2; s++) {
+            const std::vector<std::string> modes = run == 0 ? ALL_MODES : std::vector<std::string>{"threads"};
+            const Applied a = apply_modes(cases[s], modes);
+            bad.insert(bad.end(), a.bad.begin(), a.bad.end());
+            for (const std::string& mode : modes) {
+                const auto peak = a.heap_peaks.find(mode);
+                if (peak == a.heap_peaks.end()) fail(cases[s].name + ": " + mode + ": no heap peak");
+                else peaks[s][mode].push_back(peak->second);
+            }
+        }
+    auto of_runs = [](const char* which, const std::vector<uint64_t>& v) {
+        return v.size() > 1 ? " (the " + std::string(which) + " of " + std::to_string(v.size()) + " runs)" : std::string();
+    };
+    for (const std::string& mode : ALL_MODES) {
+        const std::vector<uint64_t>& at_n = peaks[0][mode];
+        const std::vector<uint64_t>& at_10n = peaks[1][mode];
+        if (at_n.empty() || at_10n.empty()) continue;
+        const uint64_t from = *std::max_element(at_n.begin(), at_n.end()), to = *std::min_element(at_10n.begin(), at_10n.end());
+        if (to > from + HEAP_GROWTH_SLACK)
+            fail(mode + ": the heap peak grew from " + std::to_string(from) + " B at n = " + std::to_string(n) + of_runs("greatest", at_n) +
+                 " to " + std::to_string(to) + " B at n = " + std::to_string(10 * n) + of_runs("least", at_10n) + ", past the " +
+                 std::to_string(HEAP_GROWTH_SLACK) + " B of slack");
+    }
     return bad;
 }
 
@@ -386,6 +487,183 @@ TEST(decoder_peaks_at_most_checks_every_peak_of_the_report_line) {
     for (const char* bad : {"decode poi:\n", "decode poi: queue B\n", "decode poi: queue peaks B\n", "decode poi: queue peaks ten B\n",
                             "decode poi: thread cpu 0.1 s, ring peaks 7 8 B, queue peaks 9 x B\n", "decode streets: queue peaks 1 B\n"})
         CHECK(!check(bad).empty());
+}
+
+// run_with_heap_peak measures the process it runs and nothing else: a dd of
+// one 16 MiB block peaks at least 15 MiB above a dd of one 1 MiB block, and a
+// timeout running the 16 MiB dd as its child (as the patcher runs the zstd
+// CLI) peaks below 1 MiB.
+TEST(run_with_heap_peak_measures_the_process_it_runs_and_not_its_children) {
+    if (!gctest::heap_peak_shim()) {
+        std::printf("    SKIP heap peaks of dd: no heap shim under the sanitizers\n");
+        return;
+    }
+    ScratchDir dir("heap-peak");
+    auto peak_of = [&](const std::vector<std::string>& words) {
+        const auto [ok, heap_peak] = gctest::run_with_heap_peak(words, dir.path() + "/log");
+        REQUIRE(ok && heap_peak);
+        return *heap_peak;
+    };
+    auto dd = [](const std::string& block) { return std::vector<std::string>{"dd", "if=/dev/zero", "of=/dev/null", "bs=" + block, "count=1"}; };
+    std::vector<std::string> in_child = dd("16M");
+    in_child.insert(in_child.begin(), {"timeout", "60"});
+
+    const uint64_t one = peak_of(dd("1M")), sixteen = peak_of(dd("16M")), parent = peak_of(in_child);
+
+    CHECK(sixteen >= one + (uint64_t{15} << 20));
+    CHECK(parent < (uint64_t{1} << 20));
+}
+
+// The tools build with _FILE_OFFSET_BITS=64, which links their mmap() calls
+// (SequentialFileReader's read windows) to mmap64: heap-peak-probe, built the
+// same way and allocating nothing itself, peaks exactly the most MiB it held
+// mapped at once above its peak mapping nothing. Every page of a mapping
+// counts until a munmap() or mremap() unmaps it or a MAP_FIXED mapping
+// replaces it, and counts where an mremap() moves it, however the ranges cut
+// the mappings; a refused call changes nothing. Each case ends mapping more
+// than it started with, so the pages left from its cuts decide the peak.
+TEST(run_with_heap_peak_counts_the_mapped_pages_of_a_program_built_as_the_tools_are) {
+#ifndef GEOCODER_HEAP_PEAK_PROBE
+    std::printf("    SKIP heap peaks of heap-peak-probe: no heap shim under the sanitizers\n");
+#else
+    ScratchDir dir("heap-peak-probe");
+    auto peak_of = [&](const std::vector<std::string>& steps) {
+        std::vector<std::string> words = {GEOCODER_HEAP_PEAK_PROBE};
+        words.insert(words.end(), steps.begin(), steps.end());
+        const auto [ok, heap_peak] = gctest::run_with_heap_peak(words, dir.path() + "/log");
+        return ok ? heap_peak : std::nullopt;
+    };
+    struct Case {
+        const char* what;
+        std::vector<std::string> steps;
+        uint64_t mib;
+    };
+    const Case cases[] = {
+        {"16 MiB unmapped whole", {"map", "0", "16", "unmap", "0", "16"}, 16},
+        {"the first 6 MiB of 8 unmapped, then 8 MiB more", {"map", "0", "8", "unmap", "0", "6", "map", "16", "8"}, 10},
+        {"the last 6 MiB of 8 unmapped, then 8 MiB more", {"map", "0", "8", "unmap", "2", "6", "map", "16", "8"}, 10},
+        {"a 4 MiB hole punched in the middle of 8, then 8 MiB more", {"map", "0", "8", "unmap", "2", "4", "map", "16", "8"}, 12},
+        {"a 4 MiB hole punched in 8, the 2 MiB before it then unmapped, then 8 MiB more",
+         {"map", "0", "8", "unmap", "2", "4", "unmap", "0", "2", "map", "16", "8"}, 10},
+        {"a 4 MiB hole punched in 8, the 2 MiB after it then unmapped, then 8 MiB more",
+         {"map", "0", "8", "unmap", "2", "4", "unmap", "6", "2", "map", "16", "8"}, 10},
+        {"one munmap() of the last 2 MiB of a 4 MiB mapping and the first 2 of the next, then 8 MiB more",
+         {"map", "0", "4", "map", "4", "4", "unmap", "2", "4", "map", "16", "8"}, 12},
+        {"one munmap() of the end of a 4 MiB mapping, all of the next and the start of a third, then 16 MiB more",
+         {"map", "0", "4", "map", "4", "4", "map", "8", "4", "unmap", "2", "8", "map", "16", "16"}, 20},
+        {"4 MiB in the middle of 8 mapped over, then 8 MiB more", {"map", "0", "8", "over", "2", "4", "map", "16", "8"}, 16},
+        {"a refused munmap() of 0 bytes at the start of 8 MiB, then 8 MiB more",
+         {"map", "0", "8", "unmap-refused", "0", "0", "map", "16", "8"}, 16},
+        {"a refused munmap() of 4 MiB from 1 byte into 8, then 8 MiB more",
+         {"map", "0", "8", "unmap-refused", "0+1", "4", "map", "16", "8"}, 16},
+        {"8 MiB shrunk to 2 in place by mremap(), then 8 MiB more", {"map", "0", "8", "resize", "0", "8", "2", "map", "16", "8"}, 10},
+        {"a 4 MiB hole punched in 8, the 8 then shrunk to 6 in place by mremap(), then 8 MiB more",
+         {"map", "0", "8", "unmap", "2", "4", "resize", "0", "8", "6", "map", "16", "8"}, 10},
+        {"a 4 MiB hole punched in 8, the 8 then moved by mremap() as 2, then 8 MiB more",
+         {"map", "0", "8", "unmap", "2", "4", "move", "0", "8", "16", "2", "map", "32", "8"}, 10},
+        {"4 MiB grown to 8 in place by mremap(), then 8 MiB more", {"map", "0", "4", "resize", "0", "4", "8", "map", "16", "8"}, 16},
+        {"a refused mremap() growing 4 MiB into the next 4, then 8 MiB more",
+         {"map", "0", "4", "map", "4", "4", "resize-refused", "0", "4", "8", "map", "16", "8"}, 16},
+        {"8 MiB moved by mremap() as 4 over the start of another 8, then 16 MiB more",
+         {"map", "0", "8", "map", "16", "8", "move", "0", "8", "16", "4", "map", "32", "16"}, 24},
+        {"4 MiB moved by mremap() as 8, then 8 MiB more", {"map", "0", "4", "move", "0", "4", "16", "8", "map", "32", "8"}, 16},
+        {"the middle 4 MiB of 8 moved away by mremap() as 2, then 8 MiB more",
+         {"map", "0", "8", "move", "2", "4", "16", "2", "map", "32", "8"}, 14},
+        {"the middle 4 MiB of 8 moved by mremap() over two whole 2 MiB mappings, then 8 MiB more",
+         {"map", "0", "8", "map", "16", "2", "map", "18", "2", "move", "2", "4", "16", "4", "map", "32", "8"}, 16},
+        {"three 2 MiB mappings moved by mremap() as 2 onto the middle of 8, then 8 MiB more",
+         {"map", "0", "2", "map", "2", "2", "map", "4", "2", "map", "16", "8", "move", "0", "6", "18", "2", "map", "32", "8"}, 16},
+        {"8 MiB copied by mremap() with MREMAP_DONTUNMAP, then 8 MiB more",
+         {"map", "0", "8", "copy", "0", "8", "16", "map", "32", "8"}, 24},
+        {"4 MiB of shared 8 mapped a second time by mremap(), then 8 MiB more",
+         {"share", "0", "8", "clone", "2", "16", "4", "map", "32", "8"}, 20},
+    };
+
+    const std::optional<uint64_t> none = peak_of({});
+    REQUIRE(none);
+    std::vector<std::string> bad;
+    for (const Case& c : cases) {
+        const std::optional<uint64_t> peak = peak_of(c.steps);
+        const uint64_t want = *none + (c.mib << 20);
+        if (!peak) bad.push_back(std::string(c.what) + ": the probe failed");
+        else if (*peak != want) bad.push_back(std::string(c.what) + ": peak " + std::to_string(*peak) + " B, not " + std::to_string(want));
+    }
+
+    for (const std::string& why : bad) std::printf("    %s\n", why.c_str());
+    CHECK(bad.empty());
+#endif
+}
+
+// The heap shim's table holds 4096 mappings: heap-peak-probe cutting a
+// mapping into 4096 pieces runs and peaks at the mapping whole, as does one
+// cutting 4094 beside a shared mapping and a second mapping of its pages
+// (which leaves the first whole), and so do ones that fill the table, then
+// with mremap() move the middle of a mapping over two whole ones, or three
+// mappings as one onto the middle of another: each move cuts a mapping in
+// two, yet leaves no more mappings than it found. Cutting one into 4097 ends
+// with the shim's message and no peak, since a piece left out of the table
+// would count wrong from then on.
+TEST(run_with_heap_peak_ends_a_program_with_more_mappings_than_the_shim_holds) {
+#ifndef GEOCODER_HEAP_PEAK_PROBE
+    std::printf("    SKIP heap peaks of heap-peak-probe: no heap shim under the sanitizers\n");
+#else
+    ScratchDir dir("heap-peak-probe-full");
+    const std::string log = dir.path() + "/log";
+    const uint64_t page = uint64_t(sysconf(_SC_PAGESIZE));
+
+    const auto [none_ok, none] = gctest::run_with_heap_peak({GEOCODER_HEAP_PEAK_PROBE}, dir.path() + "/none");
+    REQUIRE(none_ok && none);
+    const auto [fits, fits_peak] = gctest::run_with_heap_peak({GEOCODER_HEAP_PEAK_PROBE, "shatter", "0", "4096"}, dir.path() + "/fits");
+    CHECK(fits);
+    CHECK(fits_peak && *fits_peak == *none + 2 * 4096 * page);
+    const auto [cloned, cloned_peak] = gctest::run_with_heap_peak(
+        {GEOCODER_HEAP_PEAK_PROBE, "share", "0", "8", "clone", "2", "16", "4", "shatter", "32", "4094"}, dir.path() + "/cloned");
+    CHECK(cloned);
+    CHECK(cloned_peak && *cloned_peak == *none + (uint64_t{12} << 20) + 2 * 4094 * page);
+    const auto [moved_over, moved_over_peak] = gctest::run_with_heap_peak(
+        {GEOCODER_HEAP_PEAK_PROBE, "map", "0", "8", "map", "16", "2", "map", "18", "2", "shatter", "32", "4093", "move", "2", "4", "16", "4"},
+        dir.path() + "/moved-over");
+    CHECK(moved_over);
+    CHECK(moved_over_peak && *moved_over_peak == *none + (uint64_t{12} << 20) + 2 * 4093 * page);
+    const auto [moved_into, moved_into_peak] = gctest::run_with_heap_peak(
+        {GEOCODER_HEAP_PEAK_PROBE, "map", "0", "2", "map", "2", "2", "map", "4", "2", "map", "16", "8", "shatter", "32", "4092",
+         "move", "0", "6", "18", "2"},
+        dir.path() + "/moved-into");
+    CHECK(moved_into);
+    CHECK(moved_into_peak && *moved_into_peak == *none + (uint64_t{14} << 20) + 2 * 4092 * page);
+
+    const auto [ok, heap_peak] = gctest::run_with_heap_peak({GEOCODER_HEAP_PEAK_PROBE, "shatter", "0", "4097"}, log);
+
+    CHECK(!ok);
+    CHECK(!heap_peak);
+    const std::vector<char> text = read_file(log);
+    const std::string said(text.begin(), text.end());
+    CHECK(said.find("heap_peak_shim.c: more anonymous mappings than its table holds\n") != std::string::npos);
+#endif
+}
+
+// n geo cells whose street lists all change (each cell's street becomes the
+// next one) over street ways that stay: n street entry corrections, which the
+// patcher reads where they sit in the patch.
+TEST(patch_heap_stays_flat_as_geo_entry_deltas_grow) {
+    CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
+        std::vector<GeoRow> rows, changed;
+        for (uint32_t k = 0; k < n; k++) {
+            rows.push_back({k, {k % 950}});
+            changed.push_back({k, {k % 950 + 1}});
+        }
+        BuildDir old_d, new_d;
+        put_geo(old_d, rows);
+        put_geo(new_d, changed);
+        if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
+        if (!run({"zstd", "-d", "-q", "-f", c.patch(), "-o", c.dir("raw")}, c.log())) return std::string("patch not decompressed");
+        std::vector<char> corrections;
+        append(corrections, GEO_ENTRY_DELTA_MARKER);
+        append(corrections, static_cast<uint32_t>(PatchFileId::STREET_ENTRIES));
+        append(corrections, n);
+        return find_once(read_file(c.dir("raw")), corrections) == std::string::npos ? "no " + std::to_string(n) + " street entry corrections"
+                                                                                    : std::string();
+    }, 20000).empty());
 }
 
 // The POI string tier in record order (GCPATCH v9): the new pool moves a name

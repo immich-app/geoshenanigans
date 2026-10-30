@@ -249,3 +249,21 @@ if(GEOCODER_SANITIZE)
         target_link_options(${target} PRIVATE ${GEOCODER_SANITIZE_FLAGS})
     endforeach()
 endif()
+
+# The heap shim the patcher's memory tests preload into it
+# (tests/heap_peak_shim.c, run through tests/tool_runs.h), and the probe its
+# own test runs, built as the tools are. Not under the sanitizers, whose
+# allocator the shim can't stand in for: those tests skip there. The shim's
+# file is named as the target, like the tools tools/ci_build_tools.sh caches
+# for the tests.
+if(NOT GEOCODER_SANITIZE)
+    enable_language(C)
+    add_library(heap-peak-shim SHARED tests/heap_peak_shim.c)
+    set_target_properties(heap-peak-shim PROPERTIES PREFIX "" SUFFIX "")
+    add_executable(heap-peak-probe tests/heap_peak_probe.c)
+    target_compile_definitions(heap-peak-probe PRIVATE _FILE_OFFSET_BITS=64)
+    add_dependencies(geocoder-tests heap-peak-shim heap-peak-probe)
+    target_compile_definitions(geocoder-tests PRIVATE
+        GEOCODER_HEAP_PEAK_SHIM="$<TARGET_FILE:heap-peak-shim>"
+        GEOCODER_HEAP_PEAK_PROBE="$<TARGET_FILE:heap-peak-probe>")
+endif()
