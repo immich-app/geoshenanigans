@@ -35,6 +35,10 @@ constexpr uint32_t NO = 0xFFFFFFFFu;
 // The most bytes a family's decoder may hold queued while the replay skips
 // old bytes (a deleted run, replaced children or parents).
 constexpr uint64_t DECODER_HOLD = 1 << 20;
+// The most bytes a family's encoder may hold queued, however large a write:
+// a piece of it (64 KiB) and the largest unit the encoder takes whole (an
+// admin or POI block up to 256 KiB).
+constexpr uint64_t ENCODER_HOLD = 320 << 10;
 // The most the patcher's heap peak may grow when a heap test's case grows
 // tenfold in the one structure it varies, which the patcher reads in place.
 constexpr uint64_t HEAP_GROWTH_SLACK = 256 << 10;
@@ -112,6 +116,30 @@ void put_addrs(BuildDir& d, const std::vector<Addr>& addrs) {
     }
     d["addr_points.bin"] = points;
     d["addr_vertices.bin"] = verts;
+}
+
+// An admin polygon by its area (unique, so a polygon kept in the new set
+// matches) and its vertex block, as a POI's.
+struct Admin {
+    float area;
+    std::vector<char> block;
+};
+
+// admin_polygons.bin and admin_vertices.bin of polys, into d: unnamed, level
+// 8, no country.
+void put_admins(BuildDir& d, const std::vector<Admin>& polys) {
+    std::vector<char> recs, verts;
+    for (const Admin& a : polys) {
+        append(recs, static_cast<uint32_t>(verts.size()));
+        append(recs, static_cast<uint32_t>((a.block.size() - 10) / 4));
+        append(recs, 0u);
+        append(recs, uint32_t{8});
+        append(recs, a.area);
+        append(recs, 0u);
+        verts.insert(verts.end(), a.block.begin(), a.block.end());
+    }
+    d["admin_polygons.bin"] = recs;
+    d["admin_vertices.bin"] = verts;
 }
 
 // The id of a fixture's cell k.
@@ -492,6 +520,27 @@ TEST(patch_lowmem_drops_the_old_records_of_a_replace_run) {
     REQUIRE(prepare(c, old_d, new_d, old_meta, new_meta).empty());
 
     CHECK(apply_both_modes(c, decoder_peaks_at_most("streets", DECODER_HOLD)).empty());
+}
+
+// An INSERT stretch of admin_vertices.bin (2 MB of new polygons between kept
+// ones), which reaches the encoder as one write of nearly all of it: the
+// encoder takes it a piece at a time, never holding more than a piece and the
+// largest block it takes whole.
+TEST(patch_lowmem_encodes_an_admin_insert_stretch_a_piece_at_a_time) {
+    ScratchDir dir("lowmem-admin");
+    std::mt19937 rng(20261030);
+    std::vector<Admin> old_polys, inserted;
+    for (uint32_t i = 0; i < 300; i++) old_polys.push_back({static_cast<float>(i), block(rng, 50)});
+    for (uint32_t i = 0; i < 500; i++) inserted.push_back({static_cast<float>(1000 + i), block(rng, 1000)});
+    auto new_polys = old_polys;
+    new_polys.insert(new_polys.begin() + 150, inserted.begin(), inserted.end());
+    BuildDir old_d, new_d;
+    put_admins(old_d, old_polys);
+    put_admins(new_d, new_polys);
+    const LowMemCase c{dir.path(), "admin-insert"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+
+    CHECK(apply_both_modes(c, encoder_peaks_at_most("admin", ENCODER_HOLD)).empty());
 }
 
 // The memory checks of the replay tests above, on report lines as the
