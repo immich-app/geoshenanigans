@@ -690,8 +690,8 @@ TEST(gcs_addr_codecs_copy_an_escaped_footprint_through_in_pieces) {
             }
             return true;
         };
-        bool whole = true;
-        for (const size_t size : s.sizes) whole &= read(0, 28, points) && read(1, size, verts);
+        bool complete = true;
+        for (const size_t size : s.sizes) complete &= read(0, 28, points) && read(1, size, verts);
         const size_t decoder_peak = std::max(dec.peak(0), dec.peak(1)), reader = dec.A->buf.size();
         std::printf("    %u vertices: encoder queue peak %zu B, decoder queue peak %zu B, footprint reader %zu B\n", big, encoder_peak,
                     decoder_peak, reader);
@@ -699,7 +699,7 @@ TEST(gcs_addr_codecs_copy_an_escaped_footprint_through_in_pieces) {
         CHECK(encoder_peak <= ENCODER_PIECE + whole);
         CHECK(decoder_peak <= READ_BUF + whole);
         CHECK(reader <= READ_BUF + READ_SLACK);
-        CHECK(whole);
+        CHECK(complete);
         CHECK(dec.read(0, view.data(), 1) == 0);
         CHECK(points == s.points);
         CHECK(verts == s.verts);

@@ -1822,13 +1822,16 @@ constexpr size_t NO_OLD_STRING = SIZE_MAX;
 
 // A shipped tier's new pool string by string, from its old pool and edit:
 // on_string(p, len, old_off) for each new string in order, with the offset of
-// a kept string in the old pool, or NO_OLD_STRING for an added one. The
-// edit's indices ascend (parse_string_tier_edit). Returns whether the old
-// pool placed every one of them: the walk passes the whole old pool either
-// way. A sorted edit puts an added string before the next kept one it sorts
-// before.
-template <typename OnString>
-[[nodiscard]] bool for_each_new_string(const char* old_pool, size_t old_size, const StringTierEdit& edit, OnString on_string) {
+// a kept string in the old pool, or NO_OLD_STRING for an added one, and
+// on_consumed(old_end) as the walk passes each old string, kept (after its
+// on_string) or deleted, with the offset just past it: the walk reads no old
+// byte before old_end again. The edit's indices ascend
+// (parse_string_tier_edit). Returns whether the old pool placed every one of
+// them: the walk passes the whole old pool either way. A sorted edit puts an
+// added string before the next kept one it sorts before.
+template <typename OnString, typename OnConsumed>
+[[nodiscard]] bool for_each_new_string(const char* old_pool, size_t old_size, const StringTierEdit& edit, OnString on_string,
+                                       OnConsumed on_consumed) {
     size_t o = 0;
     uint32_t oi = 0, ni = 0, d = 0, a = 0;
     const char* added = edit.added;  // the next added string
@@ -1836,7 +1839,10 @@ template <typename OnString>
     // without its NUL ends at the pool's end.
     auto old_len = [&] { return std::min(strnlen(old_pool + o, old_size - o) + 1, old_size - o); };
     auto skip_deleted = [&] {
-        for (; o < old_size && d < edit.n_deleted && string_index_at(edit.deleted, d) == oi; d++, oi++) o += old_len();
+        for (; o < old_size && d < edit.n_deleted && string_index_at(edit.deleted, d) == oi; d++, oi++) {
+            o += old_len();
+            on_consumed(o);
+        }
     };
     skip_deleted();
     auto added_next = [&] {
@@ -1855,6 +1861,7 @@ template <typename OnString>
             on_string(old_pool + o, len, o);
             o += len;
             oi++;
+            on_consumed(o);
             skip_deleted();
         } else {
             break;
@@ -2176,10 +2183,14 @@ struct StringTierRebuild {
 // pool (the old pool's kept strings with the added ones at their indices)
 // through write(bytes, n), in pieces of contiguous strings, adds the runs of
 // the kept strings that moved to remap, and hashes the old pool as the walk
-// passes it and the new one as it writes it. on_passed(old_off) each
-// STRING_WALK_PIECE or so of old pool: the walk reads none of it before
-// old_off again. The old pool isn't checked before the walk, which is why the
-// walk hashes all of it even when the edit doesn't fit
+// passes it and the new one as it writes it. on_passed(old_off) at the end of
+// the first old string, kept or deleted, that puts STRING_WALK_PIECE or more
+// of old pool behind the last call: the walk has hashed those bytes and
+// written every string it took from them, and reads none of them again. A
+// run of deleted strings, a whole old pool of them included, goes back in
+// pieces like a run of kept ones; under a piece is left for the walk's end to
+// hash. The old pool isn't checked before the walk, which is why the walk
+// hashes all of it even when the edit doesn't fit
 // (require_string_tier_rebuilt).
 template <typename Write, typename OnPassed>
 StringTierRebuild rebuild_string_tier(const char* old_pool, size_t old_size, const StringTierEdit& edit,
@@ -2198,22 +2209,24 @@ StringTierRebuild rebuild_string_tier(const char* old_pool, size_t old_size, con
     };
     StringRunJoiner joiner([&](uint32_t start, uint32_t end, uint32_t shift) { remap.add_run(start, end, shift); });
     uint32_t new_start = at.new_base;
-    r.placed = for_each_new_string(old_pool, old_size, edit, [&](const char* p, size_t len, size_t old_off) {
+    auto on_string = [&](const char* p, size_t len, size_t old_off) {
         if (piece_size > 0 && (p != piece + piece_size || piece_size + len > STRING_WALK_PIECE)) write_piece();
         if (piece_size == 0) piece = p;
         piece_size += len;
         if (old_off != NO_OLD_STRING) {
             const uint32_t start = at.old_base + static_cast<uint32_t>(old_off);
             joiner.kept(start, start + static_cast<uint32_t>(len), new_start);
-            if (old_off + len - old_hashed >= STRING_WALK_PIECE) {
-                write_piece();
-                old_hash.update(old_pool + old_hashed, old_off + len - old_hashed);
-                old_hashed = old_off + len;
-                on_passed(old_hashed);
-            }
         }
         new_start += static_cast<uint32_t>(len);
-    });
+    };
+    auto on_consumed = [&](size_t old_end) {
+        if (old_end - old_hashed < STRING_WALK_PIECE) return;
+        write_piece();  // it may hold kept strings from before old_end
+        old_hash.update(old_pool + old_hashed, old_end - old_hashed);
+        old_hashed = old_end;
+        on_passed(old_hashed);
+    };
+    r.placed = for_each_new_string(old_pool, old_size, edit, on_string, on_consumed);
     joiner.finish();
     write_piece();
     old_hash.update(old_pool + old_hashed, old_size - old_hashed);
