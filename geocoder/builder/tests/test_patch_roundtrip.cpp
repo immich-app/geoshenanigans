@@ -436,6 +436,18 @@ std::vector<char> zstd_frame(const std::vector<char>& raw, int window_log) {
     }
     return frame;
 }
+
+// n small JSON files: client files the diff carries inline, whatever their
+// names.
+BuildDir json_files(int n) {
+    BuildDir d;
+    for (int i = 0; i < n; i++) {
+        char name[16];
+        std::snprintf(name, sizeof name, "f%04d.json", i);
+        d[name] = {'{', '}'};
+    }
+    return d;
+}
 }  // namespace
 
 TEST(patch_round_trip_keeps_the_street_ids_of_unchanged_street_ways) {
@@ -776,4 +788,23 @@ TEST(patch_refuses_a_match_run_past_the_old_file) {
     CHECK(r.ok);
     CHECK(read_file(root + "/out/poi_records.bin") == poi_polygons(true)["poi_records.bin"]);
     CHECK(read_file(root + "/out/poi_vertices.bin") == poi_polygons(true)["poi_vertices.bin"]);
+}
+
+// A new dir of more client files than a patch may list (1025, past
+// MAX_CLIENT_FILES) fails the diff with the patcher's refusal, and no patch
+// is written: the patcher would refuse the list. A dir of 1024 makes a patch
+// that applies.
+TEST(patch_diff_refuses_a_dir_of_more_client_files_than_a_patch_may_list) {
+    ScratchDir dir("patch-diff-client-files");
+    const std::string& root = dir.path();
+    const std::string patch = root + "/p.gcpatch", log = root + "/tools.log";
+    REQUIRE(write_dir(root + "/old", json_files(1)));
+    REQUIRE(write_dir(root + "/new", json_files(1025)));
+
+    CHECK(!run({GEOCODER_DIFF_BIN, root + "/old", root + "/new", "-o", patch}, log));
+
+    const std::vector<char> text = read_file(log);
+    CHECK(std::string(text.begin(), text.end()).find("Too many client files: 1025") != std::string::npos);
+    CHECK(!std::filesystem::exists(patch));
+    CHECK(round_trip(json_files(1), json_files(1024)).mismatches.empty());
 }

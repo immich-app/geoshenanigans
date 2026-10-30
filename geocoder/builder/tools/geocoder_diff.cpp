@@ -763,6 +763,8 @@ static int run(int argc, char* argv[]) {
     {
         std::list<std::vector<char>> inline_contents;
         auto client_files = list_client_files(new_dir, inline_contents);
+        // A list the patcher would refuse (more than MAX_CLIENT_FILES files, say) fails the diff
+        // here, before a patch is written.
         append_client_files(patch, client_files);
         std::cerr << "  Client files: " << client_files.size() << std::endl;
     }
