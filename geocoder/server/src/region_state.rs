@@ -234,6 +234,7 @@ impl RegionState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scratch_dir::ScratchDir;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct FakeBucket {
@@ -260,20 +261,20 @@ mod tests {
         format!("http://{}", addr)
     }
 
-    async fn state_for(base_url: String, ttl: std::time::Duration) -> RegionState {
-        let root = std::env::temp_dir().join(format!("gc_rs_{}_{}", std::process::id(), ttl.as_secs()));
-        std::fs::create_dir_all(&root).unwrap();
-        let mi = MultiIndex::load(root.to_str().unwrap(), 17, 10, 660.0).unwrap();
-        let mut state = RegionState::new(Arc::new(mi), root);
+    /// The state lives in the returned dir, which must outlive it.
+    async fn state_for(base_url: String, ttl: std::time::Duration) -> (ScratchDir, RegionState) {
+        let root = ScratchDir::new();
+        let mi = MultiIndex::load(root.path().to_str().unwrap(), 17, 10, 660.0).unwrap();
+        let mut state = RegionState::new(Arc::new(mi), root.path().to_path_buf());
         state.config.get_mut().base_url = base_url;
         state.configurations_ttl = ttl;
-        state
+        (root, state)
     }
 
     #[tokio::test]
     async fn configurations_are_cached_within_ttl() {
         let bucket = Arc::new(FakeBucket { latest: "2026-01-01".to_string().into(), fetches: AtomicUsize::new(0) });
-        let state = state_for(serve(bucket.clone()).await, std::time::Duration::from_secs(3600)).await;
+        let (_root, state) = state_for(serve(bucket.clone()).await, std::time::Duration::from_secs(3600)).await;
 
         state.ensure_configurations().await.unwrap();
         *bucket.latest.lock().unwrap() = "2026-01-02".to_string();
@@ -286,7 +287,7 @@ mod tests {
     #[tokio::test]
     async fn configurations_follow_latest_after_ttl() {
         let bucket = Arc::new(FakeBucket { latest: "2026-01-01".to_string().into(), fetches: AtomicUsize::new(0) });
-        let state = state_for(serve(bucket.clone()).await, std::time::Duration::ZERO).await;
+        let (_root, state) = state_for(serve(bucket.clone()).await, std::time::Duration::ZERO).await;
 
         state.ensure_configurations().await.unwrap();
         *bucket.latest.lock().unwrap() = "2026-01-02".to_string();

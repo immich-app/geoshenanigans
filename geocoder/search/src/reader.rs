@@ -1,7 +1,7 @@
 //! Memory-mapped search index: the fst and postings of each sub-index (places, optional POI),
 //! the boundary slots, and the geocoder index it points into. Loading reads only a small
 //! meta file and the ISO code list; everything else is mapped and paged in by queries.
-use crate::build::has_extra_names;
+use crate::build::{has_extra_names, has_sub_index, sub_index_files};
 use crate::constants::{BOUNDARY_FILE, META_FILE};
 use crate::entities::Entities;
 use crate::extras::Extras;
@@ -31,12 +31,12 @@ pub struct SubIndex {
 
 impl SubIndex {
     pub fn open(dir: &Path, name: &str) -> Result<Self, String> {
-        let m = |ext: &str| map(&dir.join(format!("{name}.{ext}")));
+        let [keys, post, pfx_keys, pfx] = sub_index_files(name).map(|f| dir.join(f));
         Ok(SubIndex {
-            map: fst::Map::new(m("fst")?).map_err(|e| e.to_string())?,
-            post: m("post")?,
-            pfx_map: fst::Map::new(m("pfx.fst")?).map_err(|e| e.to_string())?,
-            pfx: m("pfx")?,
+            map: fst::Map::new(map(&keys)?).map_err(|e| e.to_string())?,
+            post: map(&post)?,
+            pfx_map: fst::Map::new(map(&pfx_keys)?).map_err(|e| e.to_string())?,
+            pfx: map(&pfx)?,
             poi: name == "poi",
         })
     }
@@ -130,7 +130,7 @@ impl<'g> SearchIndex<'g> {
             _ => None,
         };
         let n_place_nodes = meta["n_place_nodes"].as_u64().unwrap_or(0) as u32;
-        let poi = if dir.join("poi.fst").exists() && geo.poi_records.is_some() {
+        let poi = if has_sub_index(dir, "poi") && geo.poi_records.is_some() {
             Some(SubIndex::open(dir, "poi")?)
         } else {
             None

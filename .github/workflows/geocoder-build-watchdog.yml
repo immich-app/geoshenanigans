@@ -131,9 +131,10 @@ jobs:
             --ref "$BUILD_REF" \
             -f "build_date=$TODAY"
 
-  # The published build's age to FUTO o11y, with a heartbeat: its steady
-  # samples keep the project's metrics tenant visible to o11y's fleet queries
-  # on the days the nightly hasn't pushed yet (see geocoder/README.md,
+  # To FUTO o11y: the published build's dates, which the build-stale alert
+  # reads, with a heartbeat for watchdog-silent; and the latest finished
+  # nightly's outcome, sent from here because a run whose runner died or that
+  # timed out never reaches its own report step (see geocoder/README.md,
   # Monitoring).
   report:
     runs-on: ubuntu-latest
