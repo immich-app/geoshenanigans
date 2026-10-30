@@ -874,12 +874,20 @@ private:
     std::vector<uint64_t> filter_;     // a bit per filter_bit, none when empty
 };
 
+// How a ScratchTable closes its file: close(), or a test's stand-in that
+// fails as a filesystem that flushes late writes (NFS, FUSE) may.
+inline int (*&scratch_table_close())(int) {
+    static int (*f)(int) = ::close;
+    return f;
+}
+
 // A SortedTable made record by record: records appended in strictly
 // ascending key order go through a SCRATCH_TABLE_BUF buffer to an unnamed
 // file in dir (the patcher's scratch dir), and finish() maps the file
 // read-only as the table, so the heap holds the buffer while the table
 // fills and only the directory and filter after. A key at or below the
-// last one is refused as a malformed `what`.
+// last one is refused as a malformed `what`, and a file that fails to close
+// as one it cannot write.
 template <typename Rec>
 class ScratchTable {
 public:
@@ -914,8 +922,13 @@ public:
         if (fd_ < 0) return table_;
         const std::optional<size_t> size = checked_size(0, count_, sizeof(Rec), UINT64_MAX);
         void* p = size ? mmap(nullptr, *size, PROT_READ, MAP_PRIVATE, fd_, 0) : MAP_FAILED;
-        close(fd_);
+        // A filesystem that flushes late may report a failed write only now.
+        const int closed = scratch_table_close()(fd_), close_err = errno;
         fd_ = -1;
+        if (closed != 0) {
+            if (p != MAP_FAILED) munmap(p, *size);
+            cannot_write(close_err);
+        }
         if (p == MAP_FAILED)
             throw std::runtime_error(std::string("Cannot map ") + what_ + ": " + std::to_string(count_) + " records");
         map_ = p;
