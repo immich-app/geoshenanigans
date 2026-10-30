@@ -193,13 +193,13 @@ bool logged(const ToolRun& r, const std::string& line) { return r.log.find(line)
 // Checks of a patcher run's log beyond its exit status: an error, or "".
 using LogCheck = std::function<std::string(const std::string& log)>;
 
-// The family's decoder queue (and --threads ring) peaks, from the patcher's
-// report line, all at most limit. A line without peaks, or with a "peaks"
-// that isn't a list of numbers, fails: a changed report format can't pass as
-// a decoder that held nothing.
-LogCheck decoder_peaks_at_most(const std::string& family, uint64_t limit) {
-    return [family, limit](const std::string& log) -> std::string {
-        const std::string head = "decode " + family + ":";
+// The queue (and --threads ring) peaks of the family's codec ("decode" or
+// "encode"), from the patcher's report line, all at most limit. A line
+// without peaks, or with a "peaks" that isn't a list of numbers, fails: a
+// changed report format can't pass as a codec that held nothing.
+LogCheck peaks_at_most(const std::string& codec, const std::string& family, uint64_t limit) {
+    return [codec, family, limit](const std::string& log) -> std::string {
+        const std::string head = codec + " " + family + ":";
         const size_t at = log.find(head);
         if (at == std::string::npos) return "no " + head + " line";
         const std::string line = log.substr(at, log.find('\n', at) - at);
@@ -216,9 +216,11 @@ LogCheck decoder_peaks_at_most(const std::string& family, uint64_t limit) {
         }
         for (size_t p = line.find("peaks"); p != std::string::npos; p = line.find("peaks", p + 1)) named++;
         if (!lists || lists != named) return "no peaks to check: " + line;
-        return most > limit ? "decoder held " + std::to_string(most) + " B: " + line : "";
+        return most > limit ? "held " + std::to_string(most) + " B: " + line : "";
     };
 }
+LogCheck decoder_peaks_at_most(const std::string& family, uint64_t limit) { return peaks_at_most("decode", family, limit); }
+LogCheck encoder_peaks_at_most(const std::string& family, uint64_t limit) { return peaks_at_most("encode", family, limit); }
 
 // The old and new dirs of a case under root/<name>.{old,new}, their encoded
 // sets, the patch between them, and what applying it gave.
@@ -492,20 +494,25 @@ TEST(patch_lowmem_drops_the_old_records_of_a_replace_run) {
     CHECK(apply_both_modes(c, decoder_peaks_at_most("streets", DECODER_HOLD)).empty());
 }
 
-// The memory check of the replay tests above, on report lines as the patcher
-// writes them (sync: queue peaks; --threads: ring and queue peaks): every
-// peak at most the limit passes, one past it fails, and a line whose peaks
-// are missing or not numbers fails instead of passing as a peak of 0.
-TEST(decoder_peaks_at_most_checks_every_peak_of_the_report_line) {
-    const LogCheck check = decoder_peaks_at_most("poi", 100);
+// The memory checks of the replay tests above, on report lines as the
+// patcher writes them (sync: queue peaks; --threads: ring and queue peaks):
+// every peak at most the limit passes, one past it fails, a line whose peaks
+// are missing or not numbers fails instead of passing as a peak of 0, and
+// each check reads its own codec's line.
+TEST(codec_peaks_at_most_checks_every_peak_of_its_report_line) {
+    for (const bool decoder : {true, false}) {
+        const LogCheck check = decoder ? decoder_peaks_at_most("poi", 100) : encoder_peaks_at_most("poi", 100);
+        const std::string mine = decoder ? "decode" : "encode", other = decoder ? "encode" : "decode";
 
-    CHECK(check("encode poi: queue peaks 999 B\ndecode poi: queue peaks 10 100 B\n").empty());
-    CHECK(check("decode poi: thread cpu 0.1 s, ring peaks 7 8 B, queue peaks 9 100 B\n").empty());
-    CHECK(!check("decode poi: queue peaks 10 101 B\n").empty());
-    CHECK(!check("decode poi: thread cpu 0.1 s, ring peaks 101 8 B, queue peaks 9 10 B\n").empty());
-    for (const char* bad : {"decode poi:\n", "decode poi: queue B\n", "decode poi: queue peaks B\n", "decode poi: queue peaks ten B\n",
-                            "decode poi: thread cpu 0.1 s, ring peaks 7 8 B, queue peaks 9 x B\n", "decode streets: queue peaks 1 B\n"})
-        CHECK(!check(bad).empty());
+        CHECK(check(other + " poi: queue peaks 999 B\n" + mine + " poi: queue peaks 10 100 B\n").empty());
+        CHECK(check(mine + " poi: thread cpu 0.1 s, ring peaks 7 8 B, queue peaks 9 100 B\n").empty());
+        CHECK(!check(mine + " poi: queue peaks 10 101 B\n").empty());
+        CHECK(!check(mine + " poi: thread cpu 0.1 s, ring peaks 101 8 B, queue peaks 9 10 B\n").empty());
+        for (const std::string& bad : {mine + " poi:", mine + " poi: queue B", mine + " poi: queue peaks B", mine + " poi: queue peaks ten B",
+                                       mine + " poi: thread cpu 0.1 s, ring peaks 7 8 B, queue peaks 9 x B", mine + " streets: queue peaks 1 B",
+                                       other + " poi: queue peaks 1 B"})
+            CHECK(!check(bad + "\n").empty());
+    }
 }
 
 // run_with_heap_peak measures the process it runs and nothing else: a dd of
