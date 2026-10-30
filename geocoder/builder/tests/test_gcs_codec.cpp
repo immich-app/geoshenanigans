@@ -659,11 +659,12 @@ TEST(gcs_addr_codecs_copy_an_escaped_footprint_through_in_pieces) {
     // and 6.4 MB, among small abs2 ones and a small one escaped for its pad
     // byte, each file in one write (as the patcher's FILE passes a long
     // stretch) and read back as the patcher reads them (a record, then its
-    // footprint in 64 KiB views): at both sizes the encoder's and the
-    // decoder's queues and the decoder's footprint reader hold at most
-    // 512 KiB, the files decode back to the same bytes, and geocoder-gc
-    // encodes the same files.
-    const size_t most = size_t(512) << 10;
+    // footprint in 64 KiB views): at both sizes the encoder's queue holds at
+    // most a piece and the decoder's a READ_BUF, each with the largest
+    // footprint here either takes whole (the closed abs2 one, 10 + 4 * 9 B),
+    // and the decoder's footprint reader a READ_BUF and its slack; the files
+    // decode back to the same bytes, and geocoder-gc encodes the same files.
+    const size_t whole = 10 + 4 * 9;
     std::mt19937 rng(20261030);
     for (const uint32_t big : {80000u, 800000u}) {
         const AddrSet s = addr_set({{5, 1, true, 200}, {big, 3, false, 0}, {0, 0, false, 0}, {12, 2, false, 65536, 7}, {9, 0, true, 256 - 1}}, rng);
@@ -695,9 +696,9 @@ TEST(gcs_addr_codecs_copy_an_escaped_footprint_through_in_pieces) {
         std::printf("    %u vertices: encoder queue peak %zu B, decoder queue peak %zu B, footprint reader %zu B\n", big, encoder_peak,
                     decoder_peak, reader);
 
-        CHECK(encoder_peak <= most);
-        CHECK(decoder_peak <= most);
-        CHECK(reader <= most);
+        CHECK(encoder_peak <= ENCODER_PIECE + whole);
+        CHECK(decoder_peak <= READ_BUF + whole);
+        CHECK(reader <= READ_BUF + READ_SLACK);
         CHECK(whole);
         CHECK(dec.read(0, view.data(), 1) == 0);
         CHECK(points == s.points);
