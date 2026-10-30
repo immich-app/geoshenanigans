@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
@@ -24,6 +26,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "checked_size.h"
 #include "sequential_file_reader.h"
 
 // --- Memory-mapped file helpers ---
@@ -723,13 +726,15 @@ static constexpr size_t TABLE_DIRECTORY_KEYS = 4096;
 // moved strings, a parent id or two) set under 1% of them, so nearly every
 // lookup in them ends at the filter.
 static constexpr unsigned TABLE_FILTER_BITS_LOG2 = 15;
+// The buffer a ScratchTable appends through: 64 KiB.
+static constexpr size_t SCRATCH_TABLE_BUF = 64 << 10;
 
 // n fixed-width records read where they sit, sorted strictly ascending by
 // the u32 each starts with. The constructor checks the order in one sweep,
 // refusing a step back or a repeated key as a malformed `what`, sets each
 // key's bit in a fixed filter, which turns away most keys a small table
 // lacks, and samples every step-th key into a directory, so a lookup the
-// filter passes searches one step of the records.
+// filter passes, or a floor, searches one step of the records.
 template <typename Rec>
 class SortedTable {
     static_assert(std::is_trivially_copyable<Rec>::value && sizeof(Rec) >= sizeof(uint32_t), "a record starts with its u32 key");
@@ -774,28 +779,49 @@ public:
         if (at == count_) return std::nullopt;
         return (*this)[at];
     }
+    // The index of the last record whose key is at most `key`, or size()
+    // when every key is above it.
+    size_t floor(uint32_t key) const { return floor_of(key).at; }
+    // floor, trying the hinted record and the one after it first, then
+    // leaving the floor in hint: lookups that move forward through the
+    // table skip the search.
+    size_t floor(uint32_t key, size_t& hint) const {
+        if (hint < count_ && key_at(hint) <= key) {
+            if (hint + 1 == count_ || key < key_at(hint + 1)) return hint;
+            if (hint + 2 == count_ || key < key_at(hint + 2)) return ++hint;
+        }
+        return hint = floor(key);
+    }
 
 private:
     static uint32_t filter_bit(uint32_t key) {
         return static_cast<uint32_t>((key * 0x9E3779B97F4A7C15ull) >> (64 - TABLE_FILTER_BITS_LOG2));
     }
-    // The index of the record of `key`, or count_. A table of at most
-    // TABLE_DIRECTORY_KEYS records keeps every key in its directory, so a
-    // search that misses reads none of its records. Out of line, so that a
-    // lookup the filter rejects costs its caller no call.
-    [[gnu::noinline]] size_t search(uint32_t key) const {
+    // The last record whose key is at most `key`, and that key; at is count_
+    // for none. A table of at most TABLE_DIRECTORY_KEYS records keeps every
+    // key in its directory, so it reads none of its records.
+    struct Floor {
+        size_t at;
+        uint32_t key;
+    };
+    Floor floor_of(uint32_t key) const {
         const size_t d = static_cast<size_t>(std::upper_bound(directory_.begin(), directory_.end(), key) - directory_.begin());
-        if (d == 0) return count_;
-        size_t at = (d - 1) * step_;
-        if (directory_[d - 1] == key) return at;
-        const size_t end = std::min(count_, at + step_);
-        at++;
-        for (size_t hi = end; at < hi;) {
-            const size_t mid = at + (hi - at) / 2;
-            if (key_at(mid) < key) at = mid + 1;
+        if (d == 0) return {count_, 0};
+        Floor f{(d - 1) * step_, directory_[d - 1]};
+        if (f.key == key) return f;
+        for (size_t hi = std::min(count_, f.at + step_); hi - f.at > 1;) {
+            const size_t mid = f.at + (hi - f.at) / 2;
+            const uint32_t k = key_at(mid);
+            if (k <= key) f = {mid, k};
             else hi = mid;
         }
-        return at < end && key_at(at) == key ? at : count_;
+        return f;
+    }
+    // The index of the record of `key`, or count_. Out of line, so that a
+    // lookup the filter rejects costs its caller no call.
+    [[gnu::noinline]] size_t search(uint32_t key) const {
+        const Floor f = floor_of(key);
+        return f.at < count_ && f.key == key ? f.at : count_;
     }
     uint32_t key_at(size_t i) const {
         uint32_t key;
@@ -807,6 +833,120 @@ private:
     size_t count_ = 0, step_ = 1;
     std::vector<uint32_t> directory_;  // the key of every step_-th record
     std::vector<uint64_t> filter_;     // a bit per filter_bit, none when empty
+};
+
+// How a ScratchTable closes its file: close(), or a test's stand-in that
+// fails as a filesystem that flushes late writes (NFS, FUSE) may.
+inline int (*&scratch_table_close())(int) {
+    static int (*f)(int) = ::close;
+    return f;
+}
+
+// A SortedTable made record by record: records appended in strictly
+// ascending key order go through a SCRATCH_TABLE_BUF buffer to an unnamed
+// file in dir (the patcher's scratch dir), and finish() maps the file
+// read-only as the table, so the heap holds the buffer while the table
+// fills and only the directory and filter after. A key at or below the
+// last one is refused as a malformed `what`, and a file that fails to close
+// as one it cannot write.
+template <typename Rec>
+class ScratchTable {
+public:
+    ScratchTable() = default;  // none: appending throws
+    ScratchTable(std::string dir, const char* what) : dir_(std::move(dir)), what_(what) {}
+    ScratchTable(ScratchTable&& o) noexcept { swap(o); }
+    ScratchTable& operator=(ScratchTable&& o) noexcept {
+        swap(o);
+        return *this;
+    }
+    ~ScratchTable() {
+        if (fd_ >= 0) close(fd_);
+        if (map_) munmap(map_, map_size_);
+    }
+
+    void append(const Rec& rec) {
+        uint32_t key;
+        memcpy(&key, &rec, sizeof key);
+        if (count_ > 0 && key <= last_key_) throw std::runtime_error(std::string("Malformed ") + what_);
+        if (buf_.empty()) buf_.reserve(SCRATCH_TABLE_BUF / sizeof(Rec));
+        buf_.push_back(rec);
+        if (buf_.size() == buf_.capacity()) write_buffer();
+        last_key_ = key;
+        count_++;
+    }
+    // The records appended so far.
+    size_t size() const { return count_; }
+    // Ends the appends: maps what the file holds, the table from here on.
+    const SortedTable<Rec>& finish() {
+        write_buffer();
+        std::vector<Rec>().swap(buf_);
+        if (fd_ < 0) return table_;
+        const std::optional<size_t> size = checked_size(0, count_, sizeof(Rec), UINT64_MAX);
+        void* p = size ? mmap(nullptr, *size, PROT_READ, MAP_PRIVATE, fd_, 0) : MAP_FAILED;
+        // A filesystem that flushes late may report a failed write only now.
+        const int closed = scratch_table_close()(fd_), close_err = errno;
+        fd_ = -1;
+        if (closed != 0) {
+            if (p != MAP_FAILED) munmap(p, *size);
+            cannot_write(close_err);
+        }
+        if (p == MAP_FAILED)
+            throw std::runtime_error(std::string("Cannot map ") + what_ + ": " + std::to_string(count_) + " records");
+        map_ = p;
+        map_size_ = *size;
+        table_ = SortedTable<Rec>(static_cast<const char*>(map_), count_, what_);
+        return table_;
+    }
+    // The table finish() mapped; empty before.
+    const SortedTable<Rec>& table() const { return table_; }
+
+private:
+    void swap(ScratchTable& o) noexcept {
+        std::swap(dir_, o.dir_);
+        std::swap(what_, o.what_);
+        std::swap(buf_, o.buf_);
+        std::swap(fd_, o.fd_);
+        std::swap(count_, o.count_);
+        std::swap(last_key_, o.last_key_);
+        std::swap(map_, o.map_);
+        std::swap(map_size_, o.map_size_);
+        std::swap(table_, o.table_);
+    }
+    void write_buffer() {
+        if (buf_.empty()) return;
+        if (fd_ < 0) open_file();
+        const char* p = reinterpret_cast<const char*>(buf_.data());
+        for (size_t left = buf_.size() * sizeof(Rec); left > 0;) {
+            const ssize_t n = write(fd_, p, left);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) cannot_write(n < 0 ? errno : EIO);
+            p += n;
+            left -= static_cast<size_t>(n);
+        }
+        buf_.clear();
+    }
+    // An unnamed file: unlinked at once, it lives as long as the descriptor
+    // and then the mapping.
+    void open_file() {
+        if (dir_.empty()) throw std::runtime_error(std::string("No scratch dir for ") + what_);
+        std::string path = dir_ + "/table-XXXXXX";
+        fd_ = mkstemp(path.data());
+        if (fd_ < 0) cannot_write(errno);
+        unlink(path.c_str());
+    }
+    [[noreturn]] void cannot_write(int err) const {
+        throw std::runtime_error(std::string("Cannot write ") + what_ + " to " + dir_ + ": " + std::strerror(err));
+    }
+
+    std::string dir_;
+    const char* what_ = "scratch table";
+    std::vector<Rec> buf_;  // the records not yet written
+    int fd_ = -1;
+    size_t count_ = 0;
+    uint32_t last_key_ = 0;
+    void* map_ = nullptr;
+    size_t map_size_ = 0;
+    SortedTable<Rec> table_;
 };
 
 // An old id or string offset and its new one, as the patch carries remap
@@ -1253,28 +1393,37 @@ private:
 
 // Old → new record ids of a replayed data file: the MATCH runs of its merge
 // sequence plus the diff's secondary matches. Strategy-2 slots keep these
-// to long runs of one shift, so this holds a few MB where the patcher used
-// to write a 4-byte-per-record scratch file (~1 GB for planet/full) and read
-// it at random from the entry pipeline: page-cache thrash on a 1 GiB client.
+// to long runs of one shift: a few MB where the patcher used to write a
+// 4-byte-per-record scratch file (~1 GB for planet/full) and read it at
+// random from the entry pipeline, page-cache thrash on a 1 GiB client. The
+// runs spill to a ScratchTable as the replay makes them, so a reorder day's
+// many cost the heap nothing; lookups start once finish_runs() has mapped
+// them.
 class RecordRemap {
 public:
     static constexpr uint32_t NONE = 0xFFFFFFFFu;
 
-    explicit RecordRemap(uint32_t n_old = 0) : n_old_(n_old) {}
+    RecordRemap() = default;  // maps nothing
+    RecordRemap(uint32_t n_old, const std::string& scratch_dir) : n_old_(n_old), runs_(scratch_dir, "record runs") {}
 
     // `count` old records from old_start were kept as new_start onwards.
+    // The run stays open while the next match extends it.
     void add_match(uint32_t old_start, uint32_t new_start, uint32_t count) {
         if (old_start >= n_old_) return;
         count = std::min(count, n_old_ - old_start);
         if (count == 0) return;
-        if (!runs_.empty()) {
-            Run& last = runs_.back();
-            if (last.old_start + last.count == old_start && last.new_start + last.count == new_start) {
-                last.count += count;
-                return;
-            }
+        if (open_.count > 0 && open_.old_start + open_.count == old_start && open_.new_start + open_.count == new_start) {
+            open_.count += count;
+            return;
         }
-        runs_.push_back({old_start, new_start, count});
+        if (open_.count > 0) runs_.append(open_);
+        open_ = {old_start, new_start, count};
+    }
+    // The replay is over: maps its runs for lookups.
+    void finish_runs() {
+        if (open_.count > 0) runs_.append(open_);
+        open_ = {};
+        runs_.finish();
     }
     // A secondary match: old_id now maps to new_id; the last one for an id wins.
     void add_pair(uint32_t old_id, uint32_t new_id) {
@@ -1290,9 +1439,10 @@ public:
     }
 
     size_t size() const { return n_old_; }
-    bool empty() const { return runs_.empty() && pairs_.empty(); }
+    size_t run_count() const { return runs_.size() + (open_.count > 0); }
+    bool empty() const { return run_count() == 0 && pairs_.empty(); }
     // operator[] with a run hint: consecutive lookups that land in the same
-    // run (spatially sorted references) skip the binary search.
+    // run or the next (spatially sorted references) skip the search.
     uint32_t lookup(uint32_t o, size_t& hint) const {
         if (o >= n_old_) return NONE;
         if (!pairs_.empty()) {
@@ -1300,15 +1450,7 @@ public:
                                       [](const auto& a, const auto& b) { return a.first < b.first; });
             if (p != pairs_.end() && p->first == o) return p->second;
         }
-        if (hint < runs_.size() && o >= runs_[hint].old_start && o < runs_[hint].old_start + runs_[hint].count)
-            return runs_[hint].new_start + (o - runs_[hint].old_start);
-        auto it = std::upper_bound(runs_.begin(), runs_.end(), o,
-                                   [](uint32_t v, const Run& r) { return v < r.old_start; });
-        if (it == runs_.begin()) return NONE;
-        --it;
-        if (o >= it->old_start + it->count) return NONE;
-        hint = static_cast<size_t>(it - runs_.begin());
-        return it->new_start + (o - it->old_start);
+        return through_run(o, runs_.table().floor(o, hint));
     }
     // The new id of old record `old`, or NONE when it wasn't kept.
     uint32_t operator[](size_t old) const {
@@ -1319,17 +1461,22 @@ public:
                                       [](const auto& a, const auto& b) { return a.first < b.first; });
             if (p != pairs_.end() && p->first == o) return p->second;
         }
-        auto it = std::upper_bound(runs_.begin(), runs_.end(), o,
-                                   [](uint32_t v, const Run& r) { return v < r.old_start; });
-        if (it == runs_.begin()) return NONE;
-        --it;
-        return o < it->old_start + it->count ? it->new_start + (o - it->old_start) : NONE;
+        return through_run(o, runs_.table().floor(o));
     }
 
 private:
     struct Run { uint32_t old_start, new_start, count; };
-    uint32_t n_old_;
-    std::vector<Run> runs_;
+    // o's new id by the run at `at`, its floor (the table's size for none).
+    uint32_t through_run(uint32_t o, size_t at) const {
+        const SortedTable<Run>& t = runs_.table();
+        if (at == t.size()) return NONE;
+        const Run r = t[at];
+        return o - r.old_start < r.count ? r.new_start + (o - r.old_start) : NONE;
+    }
+
+    uint32_t n_old_ = 0;
+    Run open_{0, 0, 0};  // the run the replay may still extend
+    ScratchTable<Run> runs_;
     std::vector<std::pair<uint32_t, uint32_t>> pairs_;
 };
 
@@ -1651,7 +1798,8 @@ void for_each_new_string(const char* old_pool, size_t old_size, const StringTier
 // partition_strings_into_tiers guarantees and CI's byte identity check proves
 // daily. Surviving strings the edits don't keep (they changed tier, or the
 // POI tier's order moved them) are explicit pairs, read where the patch holds
-// them.
+// them. The runs spill to a ScratchTable as they are made, tier by tier in
+// offset order, and finish() maps them with the pairs for lookups.
 //
 // Pairs are looked up first, but the order doesn't matter: a pair's old
 // offset starts a string its old tier's edit doesn't keep, runs cover only
@@ -1659,14 +1807,15 @@ void for_each_new_string(const char* old_pool, size_t old_size, const StringTier
 // covers a pair's offset.
 class StringRemap {
 public:
+    StringRemap() = default;  // maps every offset to itself
+    explicit StringRemap(const std::string& scratch_dir) : runs_(scratch_dir, "string runs") {}
+
     // Records the kept strings that moved, walking a shipped tier's old pool
     // and edit as its rebuild does. Lookups don't read the old pool.
     void add_tier(const char* old_pool, size_t old_size, uint32_t old_base, uint32_t new_base,
                   const StringTierEdit& edit) {
         uint32_t new_start = new_base;
-        StringRunJoiner joiner([&](uint32_t start, uint32_t end, uint32_t shift) {
-            runs_.push_back({start, end, shift});
-        });
+        StringRunJoiner joiner([&](uint32_t start, uint32_t end, uint32_t shift) { runs_.append({start, end, shift}); });
         for_each_new_string(old_pool, old_size, edit, [&](const char*, size_t len, size_t old_off) {
             if (old_off != NO_OLD_STRING) {
                 const uint32_t start = old_base + static_cast<uint32_t>(old_off);
@@ -1677,11 +1826,10 @@ public:
         joiner.finish();
     }
     // Decodes the runs encode_string_tier_runs wrote for the tier at old
-    // offsets [tier_start, tier_end). Tiers are added in offset order, so the
-    // runs stay sorted.
+    // offsets [tier_start, tier_end). Tiers are added in offset order: the
+    // table refuses a run that steps back.
     void add_sent_tier(const char* data, size_t size, uint32_t n_runs, uint32_t tier_start, uint32_t tier_end) {
         auto malformed = [] { throw std::runtime_error("Malformed string runs"); };
-        if (!runs_.empty() && runs_.back().end > tier_start) malformed();
         if (n_runs > size / 3) malformed();  // a run is at least 3 bytes
         size_t pos = 0;
         uint64_t prev_end = tier_start;
@@ -1691,29 +1839,42 @@ public:
             uint64_t end = start + read_varint_bounded(data, pos, size, "string runs");
             shift += unzigzag32(read_varint_bounded(data, pos, size, "string runs"));
             if (end == start || end > tier_end) malformed();
-            runs_.push_back({static_cast<uint32_t>(start), static_cast<uint32_t>(end), shift});
+            runs_.append({static_cast<uint32_t>(start), static_cast<uint32_t>(end), shift});
             prev_end = end;
         }
         if (pos != size) malformed();
     }
-    // The moved strings' pairs (the strings section's, where it sits).
-    void set_pairs(SortedTable<RemapPair> pairs) { pairs_ = std::move(pairs); }
-    bool empty() const { return runs_.empty() && pairs_.empty(); }
+    // Every tier is in: maps the runs for lookups, with the moved strings'
+    // pairs (the strings section's, where it sits).
+    void finish(SortedTable<RemapPair> pairs = {}) {
+        runs_.finish();
+        pairs_ = std::move(pairs);
+    }
+    bool empty() const { return runs_.size() == 0 && pairs_.empty(); }
     size_t run_count() const { return runs_.size(); }
 
     uint32_t lookup(uint32_t off) const {
         if (const std::optional<RemapPair> p = pairs_.find(off)) return p->to;
-        auto it = std::upper_bound(runs_.begin(), runs_.end(), off,
-                                   [](uint32_t v, const Run& r) { return v < r.start; });
-        if (it == runs_.begin()) return off;
-        --it;
-        if (off >= it->end) return off;
-        return off + it->shift;
+        return through_run(off, runs_.table().floor(off));
+    }
+    // lookup with a run hint, for offsets that mostly ascend (a record
+    // file's names in record order, as the POI tier is).
+    uint32_t lookup(uint32_t off, size_t& hint) const {
+        if (const std::optional<RemapPair> p = pairs_.find(off)) return p->to;
+        return through_run(off, runs_.table().floor(off, hint));
     }
 
 private:
     struct Run { uint32_t start, end, shift; };
-    std::vector<Run> runs_;
+    // off shifted by the run at `at`, its floor (the table's size for none).
+    uint32_t through_run(uint32_t off, size_t at) const {
+        const SortedTable<Run>& t = runs_.table();
+        if (at == t.size()) return off;
+        const Run r = t[at];
+        return off < r.end ? off + r.shift : off;
+    }
+
+    ScratchTable<Run> runs_;
     SortedTable<RemapPair> pairs_;
 };
 
@@ -1941,7 +2102,8 @@ void rebuild_string_tier(const char* old_pool, size_t old_size, const StringTier
 
 // Fills remap from the section, tier by tier in offset order: a sent tier
 // from its runs, a shipped tier through on_shipped(t), which rebuilds it and
-// calls remap.add_tier with its old pool and edit. Then the moved strings.
+// calls remap.add_tier with its old pool and edit. Then it finishes the
+// remap with the moved strings.
 template <typename OnShipped>
 void load_string_remap(const StringsSection& s, StringRemap& remap, OnShipped on_shipped) {
     for (int t = 0; t < STRING_TIER_COUNT; t++) {
@@ -1952,7 +2114,7 @@ void load_string_remap(const StringsSection& s, StringRemap& remap, OnShipped on
             on_shipped(t);
         }
     }
-    remap.set_pairs(s.pairs);
+    remap.finish(s.pairs);
 }
 
 // --- Offset fixups ---

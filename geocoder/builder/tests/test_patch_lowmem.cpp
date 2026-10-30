@@ -828,6 +828,58 @@ TEST(patch_heap_stays_flat_as_strings_move) {
     }, 5000).empty());
 }
 
+// n strings in the core tier, which sorts, and the new day without every
+// second one: each string kept after the first moves by its own amount, so
+// the patcher derives n / 2 - 1 string remap runs, which it spills to its
+// scratch dir.
+TEST(patch_heap_stays_flat_as_string_runs_grow) {
+    CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
+        std::string old_pool, new_pool;
+        for (uint32_t i = 0; i < n; i++) {
+            char b[24];
+            std::snprintf(b, sizeof b, "street %07u", i);
+            old_pool.append(b, strlen(b) + 1);
+            if (i % 2 == 0) new_pool.append(b, strlen(b) + 1);
+        }
+        BuildDir old_d, new_d;
+        old_d["strings_core.bin"].assign(old_pool.begin(), old_pool.end());
+        new_d["strings_core.bin"].assign(new_pool.begin(), new_pool.end());
+        if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
+        // The tier's n_added, n_deleted, order and first deleted indices.
+        std::vector<char> tier;
+        for (const uint32_t v : {0u, n / 2, STRING_TIER_SORTED, 1u, 3u}) append(tier, v);
+        return patch_holds(c, tier, std::to_string(n / 2) + " deleted core strings");
+    }, 10000).empty());
+}
+
+// n street ways, the new day without every second one: the street replay
+// keeps n / 2 single records, each a record remap run of its own, which the
+// patcher spills to its scratch dir. n is large enough (2.4 MB of ways) for
+// --threads to fill its codec rings at n as it does at 10 n: at 240 KB it may
+// not, and under load its peak at 10 n then came out up to 300 KB higher.
+TEST(patch_heap_stays_flat_as_record_runs_grow) {
+    CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
+        BuildDir old_d, new_d;
+        put_geo(old_d, {{0, {0}}}, n);
+        put_geo(new_d, {{0, {0}}}, n / 2);
+        const std::vector<char>& ways = old_d["street_ways.bin"];
+        std::vector<char> kept;
+        for (size_t at = 0; at < ways.size(); at += 2 * WAY_HEADER_STRIDE)
+            kept.insert(kept.end(), ways.begin() + at, ways.begin() + at + WAY_HEADER_STRIDE);
+        new_d["street_ways.bin"] = kept;
+        if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
+        // The street merge: n ops of 5 bytes, a kept way, a deleted one and
+        // so on.
+        std::vector<char> merge;
+        append(merge, uint64_t{5} * n);
+        for (const MergeOp op : {OP_MATCH_RUN, OP_DELETE_RUN, OP_MATCH_RUN, OP_DELETE_RUN}) {
+            merge.push_back(static_cast<char>(op));
+            append(merge, 1u);
+        }
+        return patch_holds(c, merge, std::to_string(n / 2) + " street ways kept one by one");
+    }, 200000).empty());
+}
+
 // The POI string tier in record order (GCPATCH v9): the new pool moves a name
 // out of sorted order (zoo cafe bank -> zoo bank cafe tea), so the tier's
 // diff sends new indices and a moved-string pair, and the encoded POI records

@@ -668,6 +668,12 @@ static SortedTable<RemapPair> pair_table(const std::vector<char>& bytes) {
     return SortedTable<RemapPair>(bytes.data(), bytes.size() / sizeof(RemapPair), "test pairs");
 }
 
+// The dir the tests' scratch tables spill to, the remaps' runs among them.
+static const std::string& scratch_tables() {
+    static const ScratchDir dir("scratch-tables");
+    return dir.path();
+}
+
 TEST(patch_format_sorted_table_finds_every_key_and_no_other) {
     // Sizes around the directory's: every key in it, then every second one.
     for (const size_t n : {size_t(0), size_t(1), TABLE_DIRECTORY_KEYS - 1, TABLE_DIRECTORY_KEYS, TABLE_DIRECTORY_KEYS + 1,
@@ -774,6 +780,112 @@ TEST(patch_format_sorted_table_refuses_a_key_out_of_order_or_twice) {
 
         CHECK_EQ(refusal_of([&] { pair_table(bytes); }), std::string("Malformed test pairs"));
     }
+}
+
+TEST(patch_format_sorted_and_scratch_tables_floor_as_upper_bound_does) {
+    // Sizes around the directory's (every key in it up to
+    // TABLE_DIRECTORY_KEYS), the scratch table's 100K records across many
+    // buffers. Probes go in key order, as the hint is for, and shuffled.
+    for (const size_t n : {size_t(0), size_t(1), TABLE_DIRECTORY_KEYS - 1, TABLE_DIRECTORY_KEYS, TABLE_DIRECTORY_KEYS + 1,
+                           size_t(100000)}) {
+        const std::vector<uint32_t> keys = spread_keys(n, static_cast<uint32_t>(n) + 1);
+        const std::vector<char> bytes = complement_pair_bytes(keys);
+        std::vector<uint32_t> probes = {0, 1, UINT32_MAX - 1, UINT32_MAX};
+        for (const uint32_t key : keys) probes.insert(probes.end(), {key - 1, key, key + 1});
+        std::sort(probes.begin(), probes.end());
+        std::vector<uint32_t> shuffled = probes;
+        std::shuffle(shuffled.begin(), shuffled.end(), std::mt19937(19));
+        ScratchTable<RemapPair> scratch(scratch_tables(), "test pairs");
+        for (const uint32_t key : keys) scratch.append({key, ~key});
+
+        const SortedTable<RemapPair> in_place = pair_table(bytes);
+        const SortedTable<RemapPair>& spilled = scratch.finish();
+
+        CHECK_EQ(spilled.size(), n);
+        size_t wrong = 0;
+        for (size_t i = 0; i < n; i++) wrong += spilled[i].from != keys[i] || spilled[i].to != ~keys[i];
+        for (const SortedTable<RemapPair>* sut : {&in_place, &spilled})
+            for (const std::vector<uint32_t>* order : {&probes, &shuffled}) {
+                size_t hint = 0;
+                for (const uint32_t probe : *order) {
+                    const size_t above = static_cast<size_t>(std::upper_bound(keys.begin(), keys.end(), probe) - keys.begin());
+                    const size_t want = above == 0 ? n : above - 1;
+                    wrong += sut->floor(probe) != want;
+                    wrong += sut->floor(probe, hint) != want || hint != want;
+                }
+            }
+        CHECK_EQ(wrong, size_t(0));
+    }
+}
+
+TEST(patch_format_scratch_table_refuses_a_key_out_of_order_or_twice) {
+    // The last case steps back past the first buffer, which went to the file.
+    std::vector<uint32_t> many(3 * SCRATCH_TABLE_BUF / sizeof(RemapPair));
+    std::iota(many.begin(), many.end(), 0u);
+    many.back() = 7;
+    const std::vector<uint32_t> cases[] = {{5, 2}, {2, 5, 5}, many};
+    for (const auto& keys : cases) {
+        ScratchTable<RemapPair> sut(scratch_tables(), "test runs");
+
+        CHECK_EQ(refusal_of([&] { for (const uint32_t key : keys) sut.append({key, 0}); }), std::string("Malformed test runs"));
+    }
+}
+
+TEST(patch_format_scratch_table_holds_its_records_in_an_unnamed_file) {
+    // Three buffers' worth: the table is mapped from a file the dir no
+    // longer names, and a move keeps the mapping.
+    ScratchDir dir("scratch-table");
+    const uint32_t n = 3 * SCRATCH_TABLE_BUF / sizeof(RemapPair) + 1;
+    ScratchTable<RemapPair> sut(dir.path(), "test pairs");
+    for (uint32_t i = 0; i < n; i++) sut.append({2 * i, i});
+
+    const char* data = sut.finish().data();
+
+    CHECK(std::filesystem::is_empty(dir.path()));
+    const ScratchTable<RemapPair> moved = std::move(sut);
+    CHECK(moved.table().data() == data);
+    REQUIRE(moved.table().size() == size_t(n));
+    CHECK_EQ(moved.table()[n - 1].to, n - 1);
+    CHECK_EQ(moved.table().floor(2 * n), size_t(n - 1));
+}
+
+TEST(patch_format_scratch_table_maps_nothing_until_a_record_comes) {
+    ScratchDir dir("scratch-table");
+    ScratchTable<RemapPair> none(dir.path(), "test pairs");
+
+    CHECK(none.finish().empty());
+    CHECK(none.table().data() == nullptr);
+    CHECK(ScratchTable<RemapPair>().finish().empty());
+}
+
+TEST(patch_format_scratch_table_refuses_a_dir_it_cannot_write) {
+    ScratchDir dir("scratch-table");
+    ScratchTable<RemapPair> gone(dir.path() + "/gone", "test pairs"), none;
+    gone.append({1, 1});
+    none.append({1, 1});
+
+    CHECK_EQ(refusal_of([&] { gone.finish(); }),
+             "Cannot write test pairs to " + dir.path() + "/gone: No such file or directory");
+    CHECK_EQ(refusal_of([&] { none.finish(); }), std::string("No scratch dir for scratch table"));
+}
+
+// A filesystem that flushes late writes (NFS, FUSE) may report a failed one
+// only when the file closes: the table is refused rather than read back.
+TEST(patch_format_scratch_table_refuses_a_file_it_cannot_close) {
+    ScratchDir dir("scratch-table");
+    ScratchTable<RemapPair> sut(dir.path(), "test pairs");
+    for (uint32_t i = 0; i <= 3 * SCRATCH_TABLE_BUF / sizeof(RemapPair); i++) sut.append({2 * i, i});
+    scratch_table_close() = [](int fd) {
+        ::close(fd);
+        errno = EIO;
+        return -1;
+    };
+
+    const std::string refusal = refusal_of([&] { sut.finish(); });
+    scratch_table_close() = ::close;
+
+    CHECK_EQ(refusal, "Cannot write test pairs to " + dir.path() + ": Input/output error");
+    CHECK(sut.table().empty());
 }
 
 // A parent-id remap after its marker: the admin, street and reserved postcode
@@ -1153,7 +1265,7 @@ TEST(patch_format_string_remap_runs_match_per_string_pairs) {
             }
             olds[t] = pool_of(o); news[t] = pool_of(n);
         }
-        StringRemap remap;
+        StringRemap remap(scratch_tables());
         uint32_t ob = 0, nb = 0;
         std::unordered_map<uint32_t, uint32_t> want;
         std::vector<uint32_t> looked_up;
@@ -1164,7 +1276,7 @@ TEST(patch_format_string_remap_runs_match_per_string_pairs) {
             ob += olds[t].size(); nb += news[t].size();
         }
         const std::vector<char> moved = pair_bytes({{ob + 100, 3}});  // a string that moved tier
-        remap.set_pairs(pair_table(moved));
+        remap.finish(pair_table(moved));
         want[ob + 100] = 3;
         for (uint32_t off = ob; off < ob + 110; off++) looked_up.push_back(off);
         for (uint32_t off : looked_up) {
@@ -1194,9 +1306,11 @@ TEST(patch_format_derived_and_sent_string_runs_map_every_offset_alike) {
         const uint32_t ob = 1000 + rnd(50), nb = 1000 + rnd(50), end = ob + (uint32_t)old_pool.size();
         const TierEdit e = tier_edit(old_pool, new_pool);
         const StringTierRuns runs = encode_string_tier_runs(old_pool.data(), old_pool.size(), ob, nb, e.kept);
-        StringRemap derived, sent;
+        StringRemap derived(scratch_tables()), sent(scratch_tables());
         derived.add_tier(old_pool.data(), old_pool.size(), ob, nb, e.edit());
         sent.add_sent_tier(runs.bytes.data(), runs.bytes.size(), runs.n_runs, ob, end);
+        derived.finish();
+        sent.finish();
 
         CHECK_EQ(derived.run_count(), sent.run_count());
         std::vector<uint32_t> differ;
@@ -1214,8 +1328,9 @@ TEST(patch_format_string_remap_lookups_never_read_the_old_pool) {
     const std::string n = pool_of({"a", "aa", "bb", "c", "e", "eee", "ff", "g", "h"});
     const uint32_t ob = 1000, nb = 990;
     std::vector<char> old_pool(o.begin(), o.end());
-    StringRemap remap;
+    StringRemap remap(scratch_tables());
     remap.add_tier(old_pool.data(), old_pool.size(), ob, nb, tier_edit(o, n).edit());
+    remap.finish();
 
     std::fill(old_pool.begin(), old_pool.end(), 'x');
 
@@ -1233,8 +1348,9 @@ TEST(patch_format_sent_string_runs_map_every_string_start) {
     const std::string n = pool_of({"a", "aa", "bb", "c", "e", "eee", "ff", "g", "h"});
     const uint32_t ob = 1000, nb = 990;
     auto runs = encode_string_tier_runs(o.data(), o.size(), ob, nb, tier_edit(o, n).kept);
-    StringRemap remap;
+    StringRemap remap(scratch_tables());
     remap.add_sent_tier(runs.bytes.data(), runs.bytes.size(), runs.n_runs, ob, ob + (uint32_t)o.size());
+    remap.finish();
     CHECK(!remap.empty());
     CHECK_EQ(remap.run_count(), size_t(runs.n_runs));
     auto want = pairs_of(o, n, ob, nb);
@@ -1254,7 +1370,7 @@ TEST(patch_format_sent_string_runs_reject_malformed_input) {
     const uint32_t end = 100 + (uint32_t)o.size();
     // What add_sent_tier refused the runs with, or "".
     auto add = [](const std::vector<char>& bytes, uint32_t n_runs, uint32_t tier_start, uint32_t tier_end) {
-        StringRemap remap;
+        StringRemap remap(scratch_tables());
         return refusal_of([&] { remap.add_sent_tier(bytes.data(), bytes.size(), n_runs, tier_start, tier_end); });
     };
     const std::string malformed = "Malformed string runs";
@@ -1278,7 +1394,7 @@ TEST(patch_format_sent_string_runs_reject_malformed_input) {
     // A start past 2^32 must not wrap back into the tier.
     CHECK_EQ(add(encode({0xFFFFFFF0u, 4, 2}), 1, 100, end), malformed);
     // Tiers are added in offset order; a tier below earlier runs is refused.
-    StringRemap remap;
+    StringRemap remap(scratch_tables());
     remap.add_sent_tier(runs.bytes.data(), runs.bytes.size(), 2, 100, end);
     CHECK_EQ(refusal_of([&] { remap.add_sent_tier(runs.bytes.data(), runs.bytes.size(), 2, 50, end); }), malformed);
 }
@@ -1337,7 +1453,7 @@ TEST(patch_format_string_remap_maps_shipped_and_sent_tiers_and_tier_moves) {
             }
 
         const uint32_t shipped = rnd(1u << n_tiers);
-        StringRemap remap, runs_only;
+        StringRemap remap(scratch_tables()), runs_only(scratch_tables());
         for (StringRemap* r : {&remap, &runs_only}) {
             for (int t = 0; t < n_tiers; t++) {
                 const TierEdit e = tier_edit(olds[t], news[t]);
@@ -1350,12 +1466,21 @@ TEST(patch_format_string_remap_maps_shipped_and_sent_tiers_and_tier_moves) {
             }
         }
         const std::vector<char> moved = pair_bytes(moves);
-        remap.set_pairs(pair_table(moved));
+        remap.finish(pair_table(moved));
+        runs_only.finish();
+        // The hinted lookup answers alike, front to back as a replay looks
+        // offsets up in record order, and back to front.
+        size_t forward = 0, backward = 0;
         for (int t = 0; t < n_tiers; t++)
             for (uint32_t v : starts_of(olds[t], ob[t])) {
                 auto it = D.find(v);
                 CHECK_EQ(remap.lookup(v), it != D.end() ? it->second : v);
+                CHECK_EQ(remap.lookup(v, forward), remap.lookup(v));
             }
+        for (int t = n_tiers - 1; t >= 0; t--) {
+            const std::vector<uint32_t> starts = starts_of(olds[t], ob[t]);
+            for (auto v = starts.rbegin(); v != starts.rend(); ++v) CHECK_EQ(remap.lookup(*v, backward), remap.lookup(*v));
+        }
         for (auto [a, b] : moves) CHECK_EQ(runs_only.lookup(a), a);
     }
 }
@@ -1495,7 +1620,7 @@ size_t check_strings_section_round_trip(uint64_t seed, PoolOrder order) {
         std::vector<char> buf;
         const auto stats = append_strings_section(buf, r.pools(), shipped, referenced, r.moved);
         DecodedStrings dec;
-        StringRemap remap;
+        StringRemap remap(scratch_tables());
         decode_strings(buf, r, dec, remap);
         const StringsSection& s = dec.section;
         CHECK_EQ(s.shipped, shipped);
@@ -1567,10 +1692,10 @@ TEST(patch_format_string_tier_edit_moves_a_string_out_of_order) {
     rebuild_string_tier(o.data(), o.size(), e.edit(), [&](const char* p, size_t len) { rebuilt.append(p, len); });
     CHECK(rebuilt == n);
     // bank shifts by a run; cafe, which the edit doesn't keep, by a pair.
-    StringRemap remap;
+    StringRemap remap(scratch_tables());
     remap.add_tier(o.data(), o.size(), 100, 100, e.edit());
     const std::vector<char> moved = pair_bytes({{104, 109}});
-    remap.set_pairs(pair_table(moved));
+    remap.finish(pair_table(moved));
     CHECK_EQ(remap.run_count(), size_t(1));
     CHECK_EQ(remap.lookup(100), 100u);
     CHECK_EQ(remap.lookup(109), 104u);
@@ -1760,7 +1885,7 @@ TEST(patch_format_newly_shipped_tier_is_sent_and_arrives_whole) {
     const auto stats = append_strings_section(buf, r.pools(), tiers.shipped, referenced, r.moved);
     CHECK_EQ(stats.sent, 8u);
     DecodedStrings dec;
-    StringRemap remap;
+    StringRemap remap(scratch_tables());
     decode_strings(buf, r, dec, remap);
     CHECK_EQ(dec.section.shipped, 1u);
     CHECK_EQ(dec.section.sent, 8u);
@@ -1847,15 +1972,17 @@ TEST(patch_format_record_remap_matches_and_secondary_pairs) {
     // MATCH runs map kept records; unmatched ones map to NONE; a secondary
     // match overrides (the last one for an id wins); ids past the old file
     // and pairs for them are ignored.
-    RecordRemap rm(10);
+    RecordRemap rm(10, scratch_tables());
     rm.add_match(0, 0, 3);    // 0..2 → 0..2
     rm.add_match(3, 3, 1);    // extends the run
     rm.add_match(6, 9, 10);   // 6..9 → 9..12, clipped at the old size
+    rm.finish_runs();
     rm.add_pair(4, 50);
     rm.add_pair(1, 60);
     rm.add_pair(1, 61);
     rm.add_pair(12, 7);
     rm.finish();
+    CHECK_EQ(rm.run_count(), size_t(2));
     const uint32_t N = RecordRemap::NONE;
     const std::vector<uint32_t> want = {0, 61, 2, 3, 50, N, 9, 10, 11, 12};
     for (uint32_t i = 0; i < 10; i++) CHECK_EQ(rm[i], want[i]);
@@ -1866,19 +1993,21 @@ TEST(patch_format_record_remap_matches_and_secondary_pairs) {
 TEST(patch_format_record_remap_lookup_with_a_hint_matches_the_index) {
     // The hinted lookup the v8 address replay uses must answer like
     // operator[] whatever hint it starts from, pairs taking precedence.
-    RecordRemap rm(40);
+    RecordRemap rm(40, scratch_tables());
     rm.add_match(0, 5, 10);
     rm.add_match(12, 20, 8);
     rm.add_match(30, 2, 3);
+    rm.finish_runs();
     rm.add_pair(3, 99);
     rm.add_pair(25, 7);
     rm.finish();
     CHECK(!rm.empty());
     for (size_t start : {size_t(0), size_t(1), size_t(2), size_t(50)}) {
-        size_t hint = start;
+        size_t hint = start, back = start;
         for (uint32_t i = 0; i < 45; i++) CHECK_EQ(rm.lookup(i, hint), rm[i]);
+        for (uint32_t i = 45; i-- > 0;) CHECK_EQ(rm.lookup(i, back), rm[i]);
     }
-    CHECK(RecordRemap(5).empty());
+    CHECK(RecordRemap(5, scratch_tables()).empty());
 }
 
 TEST(patch_format_parallel_delta_files_follow_their_parent) {

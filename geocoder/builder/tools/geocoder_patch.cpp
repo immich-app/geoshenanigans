@@ -533,8 +533,9 @@ static int run(int argc, char* argv[]) {
     // Offsets are global across the build's tiers (tier t at the sum of the
     // sizes before it), so one remap covers every tier. The dir rebuilds the
     // tiers it ships from its own old ones and derives their runs; the diff
-    // sends the runs of the tiers it doesn't ship but references.
-    StringRemap str_remap;
+    // sends the runs of the tiers it doesn't ship but references. The runs
+    // spill to the scratch dir.
+    StringRemap str_remap(tmpdir);
     {
         const StringsSection strings = parse_strings_section(P, patch_size, pos);
         require_shipped_tiers_listed(strings.shipped, listed);
@@ -967,6 +968,9 @@ static int run(int argc, char* argv[]) {
 
         std::vector<size_t> remap_offs;
         if (!str_remap.empty()) remap_offs = string_fields;
+        // A run hint per field: a field whose offsets ascend in record order
+        // (POI names, the POI tier's order) mostly skips the run search.
+        std::vector<size_t> remap_hints(remap_offs.size(), 0);
 
         // The old file, read front to back (DELETE runs skip forward).
         SequentialFileReader old(cur_dir + "/" + std::string(fname));
@@ -990,7 +994,7 @@ static int run(int argc, char* argv[]) {
                      file_id == (uint32_t)PatchFileId::INTERP_WAYS ||
                      file_id == (uint32_t)PatchFileId::POI_RECORDS ||
                      file_id == (uint32_t)PatchFileId::PLACE_NODES;
-        RecordRemap remap(track ? static_cast<uint32_t>(n_old_records) : 0);
+        RecordRemap remap(track ? static_cast<uint32_t>(n_old_records) : 0, tmpdir);
         // v8: addresses' parent_way_id moves by the street replay's remap
         // (MATCH / REPLACE runs plus the parent-id remap's moved pairs).
         const RecordRemap* street_rm = nullptr;
@@ -1066,9 +1070,10 @@ static int run(int argc, char* argv[]) {
                         if (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS && actual_stride == 24)
                             memset(rec_buf.data() + 14, 0, 2); // preserve place_type_override at byte 13
                         // Apply string remap
-                        for (size_t off : remap_offs) {
+                        for (size_t f = 0; f < remap_offs.size(); f++) {
+                            const size_t off = remap_offs[f];
                             uint32_t v; memcpy(&v, rec_buf.data() + off, 4);
-                            uint32_t nv = str_remap_lookup(v);
+                            uint32_t nv = str_remap.lookup(v, remap_hints[f]);
                             if (nv != v) memcpy(rec_buf.data() + off, &nv, 4);
                         }
                         // Apply POI parent_poly_id remap (byte 32, admin
@@ -1171,6 +1176,7 @@ static int run(int argc, char* argv[]) {
         log_rewinds(old);
         if (jc) close_joint_child(jc, fname);
 
+        if (track) remap.finish_runs();
         if (track && file_id == (uint32_t)PatchFileId::STREET_WAYS) {
             // The moved ways' pairs (parent-id remap, street leg) complete
             // the street remap the address replay reads.
@@ -1178,9 +1184,9 @@ static int run(int argc, char* argv[]) {
             remap.finish();
         }
         if (track) {
+            std::cerr << "  " << fname << ": " << written << " bytes (remap of " << n_old_records << " records, "
+                      << remap.run_count() << " runs)" << section_io() << std::endl;
             record_remaps[file_id] = std::move(remap);
-            std::cerr << "  " << fname << ": " << written << " bytes (remap of " << n_old_records << " records)"
-                      << section_io() << std::endl;
         } else {
             std::cerr << "  " << fname << ": " << written << " bytes" << section_io() << std::endl;
         }
