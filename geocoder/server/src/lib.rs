@@ -12,6 +12,8 @@ use std::sync::Arc;
 
 mod admin_geometry;
 pub use admin_geometry::{AdminGeometry, AdminPoint, PipMemo};
+#[cfg(test)]
+mod scratch_dir;
 
 // Byte-source abstraction.  Index files are memory-mapped; readers go
 // through `read_chunk(off, len)` and `read_at::<T>(idx)`.
@@ -190,6 +192,11 @@ pub const DEFAULT_SEARCH_DISTANCE: f64 = 660.0;
 // rank_search=30, so their own name becomes the `road` field rather
 // than falling through to `parent_street`.
 pub const POI_FLAG_HIGHWAY: u8 = 0x04;
+
+/// Whether (lat, lng) is a point on the globe: lat within ±90 and lng within ±180, so neither is NaN.
+pub fn coords_in_range(lat: f64, lng: f64) -> bool {
+    (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lng)
+}
 
 pub fn cell_id_at_level(lat: f64, lng: f64, level: u64) -> u64 {
     let ll = LatLng::from_degrees(lat, lng);
@@ -1707,7 +1714,7 @@ impl Index {
                 let dlng = (lng - pn.lng as f64).to_radians();
                 let dist_sq = dlat * dlat + dlng * dlng * cos_lat * cos_lat;
                 let dist_m = to_m(dist_sq);
-                if dist_m > 20000.0 { return; }
+                if dist_m > DEBUG_PLACES_NEARBY_M { return; }
                 nearby.push(serde_json::json!({
                     "type": type_names[pt],
                     "name": self.get_string(pn.name_id),
@@ -2668,16 +2675,20 @@ impl Index {
 
     // --- Postcode resolution ---
     //
-    // Mirrors Nominatim's stored `placex.postcode` chain, all of which is
-    // resolved at build time by placex_triggers.sql:
+    // Nominatim answers with the winning feature's stored `placex.postcode`,
+    // which placex_triggers.sql resolves at index time. Tiers 0 and 1 read
+    // postcodes the builder stored; tier 2 searches around the query point:
     //   0. addr:postcode on the primary feature itself (token_get_postcode)
     //   1. Primary feature's calculated_postcode (inherited from containing
     //      boundary=postal_code at build time):
     //        - street → way_postcodes.bin
     //        - POI    → poi.parent_postcode_id (in-PoiRecord field)
-    //   2. Nearest postcode centroid (get_nearest_postcode, 0.05°, country
-    //      scoped). Mirrors the `get_nearest_postcode(...)` fallback in
-    //      placex_triggers.sql rows 1052 + 1256.
+    //      then, for a US street, the ZIP of a TIGER line of that street
+    //      within ~100 m of the query (interp_postcodes.bin)
+    //   2. The postcode centroid nearest the query point within 0.05°,
+    //      skipping other countries' centroids: get_nearest_postcode's point
+    //      rule before Nominatim 5.3, which Nominatim runs on the feature at
+    //      index time (since 5.3 it takes the postcode area covering it).
     //
     // No query-time PIP on postal boundaries — Nominatim's postcode field
     // comes straight from placex.postcode, which is populated via triggers
@@ -2755,10 +2766,8 @@ impl Index {
             }
         }
 
-        // 2. Nearest postcode centroid (Nominatim's get_nearest_postcode).
-        // Nominatim's get_nearest_postcode filters by country_code
-        // (reverse.py `_find_nearest_postcode` joins location_postcode
-        // on the query's resolved country). Without this filter, a
+        // 2. Nearest postcode centroid to the query point. Like
+        // get_nearest_postcode, filter by country_code: without it, a
         // French "90012" can win over a US "90012" near the Maine/
         // Quebec border or vice-versa — and the same digits often
         // collide across countries. We use the country resolved by
@@ -2770,7 +2779,7 @@ impl Index {
         });
         if let Some(ref pc_mmap) = self.postcode_centroids {
             let total_centroids = pc_mmap.len() / std::mem::size_of::<PostcodeCentroid>() as u64;
-            // 0.05 deg ~ 5.5km, matches Nominatim's get_nearest_postcode
+            // 0.05 deg ~ 5.5km, get_nearest_postcode's radius before Nominatim 5.3
             let max_dist_sq = (0.05_f64).to_radians().powi(2);
             let cos_lat = lat.to_radians().cos();
             let mut best: Option<(f64, &str)> = None;
@@ -3496,8 +3505,9 @@ impl MultiIndex {
         self.continents.iter().filter(|c| c.index.load().is_some()).count()
     }
 
+    /// A point off the globe is in no slot: S2 would wrap it onto a cell of the globe.
     fn covers(&self, slot: &ContinentSlot, lat: f64, lng: f64) -> bool {
-        slot.continent.map_or(true, |c| c.covers_query(lat, lng, self.admin_cell_level))
+        coords_in_range(lat, lng) && slot.continent.map_or(true, |c| c.covers_query(lat, lng, self.admin_cell_level))
     }
 
     /// Snapshot of loaded indices that cover the point. Returns Arc
@@ -3561,6 +3571,7 @@ impl MultiIndex {
 #[cfg(test)]
 mod multi_index_tests {
     use super::*;
+    use crate::scratch_dir::ScratchDir;
 
     #[test]
     fn interpolate_house_number_ranges() {
@@ -3661,14 +3672,13 @@ mod multi_index_tests {
 
     #[test]
     fn load_skips_unloadable_continent() {
-        let root = std::env::temp_dir().join(format!("gc_mi_partial_{}", std::process::id()));
-        let europe = root.join("europe");
+        let root = ScratchDir::new();
+        let europe = root.path().join("europe");
         std::fs::create_dir_all(&europe).unwrap();
         std::fs::write(europe.join("admin_cells.bin"), b"").unwrap();
 
-        let mi = MultiIndex::load(root.to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE);
+        let mi = MultiIndex::load(root.path().to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE);
 
-        let _ = std::fs::remove_dir_all(&root);
         let mi = mi.expect("a partial continent dir must not fail the whole load");
         assert_eq!(mi.loaded_count(), 0);
         assert_eq!(mi.unloaded_matches(48.85, 2.35), vec!["europe"]);
@@ -4044,6 +4054,10 @@ pub fn beats<K: PartialOrd>(dist: f64, best_dist: f64, keys: impl FnOnce() -> Op
     keys().is_some_and(|(k, best)| k < best)
 }
 
+/// The `cos_lat` of a distance planar in degrees, as PostGIS measures lon/lat
+/// geometry: no cos(lat) scaling of longitude.
+const PLANAR: f64 = 1.0;
+
 pub fn dist_sq(dlat: f64, dlng: f64, cos_lat: f64) -> f64 {
     dlat * dlat + dlng * dlng * cos_lat * cos_lat
 }
@@ -4075,7 +4089,6 @@ pub fn point_to_segment_with_t(
 /// as PostGIS ST_ClosestPoint is on placex's lon/lat geometry (reverse.py:46),
 /// so a longitude degree counts as much as a latitude degree at any latitude.
 pub fn closest_point_on_line(nodes: &[NodeCoord], lat: f64, lng: f64) -> Option<(f64, f64)> {
-    const PLANAR: f64 = 1.0; // no cos(lat) scaling of longitude
     let mut best: Option<(f64, f64, f64)> = None;
     for w in nodes.windows(2) {
         let (a, b) = ((w[0].lat as f64, w[0].lng as f64), (w[1].lat as f64, w[1].lng as f64));
@@ -4453,6 +4466,10 @@ pub fn place_fuzzy_half_side_m(pt: usize) -> f64 {
 /// either axis covers it.
 pub const MAX_PLACE_FUZZY_HALF_SIDE_M: f64 = 15000.0;
 
+/// How far from the point debug_places lists the place nodes in the cells
+/// find_places looks in.
+const DEBUG_PLACES_NEARBY_M: f64 = 20000.0;
+
 /// Metres per degree of latitude (and of longitude at the equator) in the
 /// fuzzy-area squares.
 pub const METRES_PER_DEGREE: f64 = 111320.0;
@@ -4673,7 +4690,6 @@ pub fn line_crosses_fuzzy_area(line: &[NodeCoord], centre_lat: f32, centre_lng: 
 /// counts as much as a latitude degree at any latitude; only the fuzzy area
 /// is measured in metres.
 pub fn place_node_covering(pn: &PlaceNode, feature: PlaceFeature<'_>) -> Option<f64> {
-    const PLANAR: f64 = 1.0; // no cos(lat) scaling of longitude
     let pt = pn.place_type as usize;
     if pt >= PLACE_NODE_RANK.len() {
         return None;
@@ -5143,6 +5159,16 @@ pub fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
 #[cfg(test)]
 mod pure_helper_tests {
     use super::*;
+
+    #[test]
+    fn coords_in_range_accepts_the_globe_only() {
+        for (lat, lng) in [(0.0, 0.0), (90.0, 180.0), (-90.0, -180.0), (48.85, 2.35)] {
+            assert!(coords_in_range(lat, lng), "({}, {})", lat, lng);
+        }
+        for (lat, lng) in [(91.0, 0.0), (-90.5, 0.0), (0.0, 180.1), (0.0, -181.0), (f64::NAN, 0.0), (0.0, f64::INFINITY)] {
+            assert!(!coords_in_range(lat, lng), "({}, {})", lat, lng);
+        }
+    }
 
     // -- nearest postcode ------------------------------------------------------
 
@@ -6413,7 +6439,7 @@ mod pure_helper_tests {
     }
 
     #[test]
-    fn point_in_encoded_polygon_matches_the_decoded_ray_cast() {
+    fn point_in_encoded_polygon_matches_the_decoded_ray_cast_on_a_keyhole_and_its_boundary() {
         // The keyhole square with two holes, scaled into each encoding's delta range.
         let (outer, holes) = square_with_two_holes();
         let unit = keyhole(&outer, &holes);
@@ -6476,8 +6502,8 @@ mod query_path_tests {
     use s2::cell::Cell;
     use s2::rect::Rect;
     use s2::region::RegionCoverer;
+    use crate::scratch_dir::ScratchDir;
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// The fixtures' origin unless one is given: everything sits metres
     /// north and east of it.
@@ -6690,17 +6716,12 @@ mod query_path_tests {
         /// Writes the files into a fresh directory and loads them. The
         /// directory is removed once loaded; the maps keep the bytes.
         fn load(&self) -> Index {
-            static DIRS: AtomicUsize = AtomicUsize::new(0);
-            let dir = std::env::temp_dir()
-                .join(format!("gc_query_path_{}_{}", std::process::id(), DIRS.fetch_add(1, Ordering::Relaxed)));
-            std::fs::create_dir_all(&dir).unwrap();
+            let dir = ScratchDir::new();
             for (name, bytes) in self.files() {
-                std::fs::write(dir.join(name), bytes).unwrap();
+                std::fs::write(dir.path().join(name), bytes).unwrap();
             }
-            let index = Index::load(dir.to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL,
-                                    DEFAULT_SEARCH_DISTANCE);
-            std::fs::remove_dir_all(&dir).unwrap();
-            index.unwrap()
+            Index::load(dir.path().to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL,
+                        DEFAULT_SEARCH_DISTANCE).unwrap()
         }
     }
 
@@ -6713,6 +6734,27 @@ mod query_path_tests {
     fn address_from(index: &Index, origin: (f64, f64), north_m: f64, east_m: f64) -> serde_json::Value {
         let p = at_from(origin, north_m, east_m);
         serde_json::to_value(index.query(p.lat as f64, p.lng as f64)).unwrap()["address"].clone()
+    }
+
+    #[test]
+    fn query_json_finds_nothing_off_the_globe() {
+        let world = MultiIndex {
+            continents: vec![ContinentSlot {
+                name: "world",
+                continent: None,
+                index: arc_swap::ArcSwapOption::from(Some(Arc::new(TestIndex::new().load()))),
+            }],
+            root_dir: String::new(),
+            street_cell_level: DEFAULT_STREET_CELL_LEVEL,
+            admin_cell_level: DEFAULT_ADMIN_CELL_LEVEL,
+            search_distance: DEFAULT_SEARCH_DISTANCE,
+        };
+        let (lat, lng) = ORIGIN;
+        assert!(world.query_json(lat, lng).contains("Testland"));
+        // The first two are the origin's own point once S2 wraps them onto the globe.
+        for (lat, lng) in [(lat, lng + 360.0), (180.0 - lat, lng - 180.0), (f64::NAN, lng), (lat, f64::INFINITY), (90.5, lng), (lat, -180.5)] {
+            assert_eq!(world.query_json(lat, lng), "{}", "({}, {})", lat, lng);
+        }
     }
 
     #[test]
@@ -6914,7 +6956,7 @@ mod encoded_pip_tests {
     const WIDTH_BY_ENCODING: [f64; 5] = [0.3, 3.0, 0.03, 20.0, 20.0];
 
     #[test]
-    fn point_in_encoded_polygon_matches_the_decoded_ray_cast() {
+    fn point_in_encoded_polygon_matches_the_decoded_ray_cast_on_random_rings() {
         let mut rng = Rng::new(20261019);
         for enc in 0u8..=4 {
             let radius = WIDTH_BY_ENCODING[enc as usize] / 2.0;

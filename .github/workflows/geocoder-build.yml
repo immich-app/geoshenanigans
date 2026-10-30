@@ -72,11 +72,16 @@ jobs:
           persist-credentials: false
 
       # ── Setup ──────────────────────────────────────────────────────
+      # libzstd-dev: geocoder-patch, which verifies the night's patches, links
+      # the distro's libzstd (its static library), not a build of the zstd
+      # 1.5.7 below (a CLI only): that is the patcher PR CI tests, and the
+      # verify decodes what 1.5.7 compressed with an older decoder, as a
+      # client's may be.
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq cmake g++ libz-dev \
-            libbz2-dev libdeflate-dev libexpat1-dev libssl-dev patch xz-utils \
+            libbz2-dev libdeflate-dev libexpat1-dev libssl-dev libzstd-dev patch xz-utils \
             libprotozero-dev aria2 jq osmium-tool
           curl -sL "https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-64bit.tar.gz" \
             -o /tmp/s5cmd.tar.gz
@@ -164,7 +169,7 @@ jobs:
       # place-search, for the place search indexes the bigger packs ship
       # (Build place search indexes): compiled beside Setup and the downloads
       # like the tools, detached so it outlives this step.
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
 

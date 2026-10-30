@@ -3,11 +3,15 @@
 #
 # For every variant dir under <new-root> holding .bin files: diff the same
 # variant under <old-root> against it into <new-root>/<variant>/patch.gcpatch,
-# apply that patch to an isolated copy of the old variant dir in scratch (its
-# client files only, link_client_files.sh, so a read outside the dir fails),
-# and verify the result is the new client file set byte for byte
-# (verify_patch.sh). Writes one result file per
-# variant to <results-dir>/<variant with / as _>:
+# matching street / interp / addr records by both days' identity sidecars
+# (gen_identity_sidecar.py, in scratch: <new-root> was built with
+# --prev-output <old-root>, so a record's slot is its entity; the diff warns
+# of a sidecar it rejects and merges that family by content). Then apply that
+# patch to an isolated copy of the old variant dir in scratch (its client
+# files only, link_client_files.sh, so a read outside the dir fails), and
+# verify the result is the new client file set byte for byte
+# (verify_patch.sh). Writes one result file per variant to
+# <results-dir>/<variant with / as _>:
 #   SKIP | PASS <files> <patch KiB> | FAIL <problems> <files> <patch KiB>
 # plus <name>.mismatches on failure. Diff and patch logs go to <log-dir>.
 #
@@ -101,10 +105,15 @@ diff_variant() {
     echo "SKIP" > "$result"
     return
   fi
-  if ! "$diff_bin" "$old_dir" "$new_dir" -o "$new_dir/patch.gcpatch" 2> "$log"; then
+  local ids
+  ids=$(mktemp -d "${TMPDIR:-/tmp}/identity-$safe-XXXXXX")
+  python3 "$tools/gen_identity_sidecar.py" "$old_dir" "$ids/old" > "$log" 2>&1
+  python3 "$tools/gen_identity_sidecar.py" "$new_dir" "$ids/new" >> "$log" 2>&1
+  if ! "$diff_bin" "$old_dir" "$new_dir" -o "$new_dir/patch.gcpatch" --identity "$ids/old" "$ids/new" 2>> "$log"; then
     echo "FAIL 1 0 0" > "$result"
     echo "geocoder-diff failed: $(tail -1 "$log")" > "$result.mismatches"
   fi
+  rm -rf "$ids"
 }
 
 # Verify stage: apply the patch to an isolated copy and compare. The patcher

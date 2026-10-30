@@ -65,7 +65,10 @@ on 1 core, every apply byte-identical to the new day):
 
 planet/quality/uncapped and planet/poi/all patch to within a few bytes of v7
 (no street / interp / addr records). Without `--identity` the families merge
-by content as in v7, with the rest of the v8 format.
+by content as in v7, with the rest of the v8 format. The nightly diffs every
+variant by identity: `tools/generate_patches.sh` writes both days' sidecars
+(each day is built with `--prev-output` from the last), and the diff warns of
+a sidecar it rejects, naming the family that then merges by content.
 
 The tables below predate all of these changes.
 
@@ -138,7 +141,10 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
 ### Tools
 - **build-index** (`src/build_index.cpp`): Builder with deterministic ordering
 - **geocoder-diff** (`tools/geocoder_diff.cpp`): Compares two builds, produces `.gcpatch`
-- **geocoder-patch** (`tools/geocoder_patch.cpp`): Applies patch, produces new build
+- **geocoder-patch** (`tools/geocoder_patch.cpp`): Applies patch, produces new build. It links
+  the static libzstd (`libzstd.a`) and decompresses the patch in process;
+  `cmake -DGEOCODER_PATCH_LIBZSTD=OFF` builds it on the `zstd` command on PATH instead, for a host
+  without libzstd
 - **patch_format.h** (`tools/patch_format.h`): Shared format definitions + rebuild functions
 - **geocoder-gc** (`tools/gc.cpp`, `tools/gc_*.h`): Encodes a variant dir into the compact installed
   set (the encoded files and a `gc.manifest`) and decodes one back to today's files, byte for byte,
@@ -152,9 +158,12 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
 
 ### Low-memory mode: memory and speed
 
-The tool's own memory stays at 2–4 MiB anon whatever the limit. Below about 1 GiB (page cache
-included) a planet update gets slower, not bigger: the mapped inputs drop out of the page cache
-and are read again. Planet b → c (2026-10-28), planet/full, one core, cold, no swap, disk at
+The tool's own memory stays at 2–4 MiB anon whatever the limit. That is the default build, which
+decompresses the patch with libzstd into a file it maps: no window buffer. One built with
+`-DGEOCODER_PATCH_LIBZSTD=OFF` runs the `zstd` command for it, a child of about 11.5 MiB peak RSS
+beside the tool (its 8 MiB window among it). Below about 1 GiB (page cache included) a planet
+update gets slower, not bigger: the mapped inputs drop out of the page cache and are read again.
+Planet b → c (2026-10-28), planet/full, one core, cold, no swap, disk at
 100 MB/s:
 
 | Memory limit | Low-memory mode | Read |
