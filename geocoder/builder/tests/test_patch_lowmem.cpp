@@ -854,7 +854,9 @@ TEST(patch_heap_stays_flat_as_string_runs_grow) {
 
 // n street ways, the new day without every second one: the street replay
 // keeps n / 2 single records, each a record remap run of its own, which the
-// patcher spills to its scratch dir.
+// patcher spills to its scratch dir. n is large enough (2.4 MB of ways) for
+// --threads to fill its codec rings at n as it does at 10 n: at 240 KB it may
+// not, and under load its peak at 10 n then came out up to 300 KB higher.
 TEST(patch_heap_stays_flat_as_record_runs_grow) {
     CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
         BuildDir old_d, new_d;
@@ -875,7 +877,7 @@ TEST(patch_heap_stays_flat_as_record_runs_grow) {
             append(merge, 1u);
         }
         return patch_holds(c, merge, std::to_string(n / 2) + " street ways kept one by one");
-    }, 20000).empty());
+    }, 200000).empty());
 }
 
 // The POI string tier in record order (GCPATCH v9): the new pool moves a name
