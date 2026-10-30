@@ -2009,30 +2009,46 @@ TEST(patch_format_rebuild_finds_a_diff_the_old_pool_cannot_place) {
 }
 
 TEST(patch_format_string_tier_walk_writes_pieces_and_reads_nothing_it_passed) {
-    // 30,000 names, one longer than a piece, every seventh deleted and every
-    // fifth followed by an added one (sorted, or put before it, which an
-    // indexed tier's order allows): the one walk writes the new pool in
-    // pieces of at most STRING_WALK_PIECE (the long name alone), hashes both
-    // pools as content_hash does, derives the runs, and reads no old byte
-    // before an offset it passed: scribbled over as it passes them, the old
-    // pool still rebuilds into the new one.
-    for (const bool sorted : {true, false}) {
+    // 30,000 names, one longer than a piece. Mixed: every seventh deleted and
+    // every fifth followed by an added one (sorted, or put before it, which an
+    // indexed tier's order allows). Deleted suffix: the same up to name
+    // 10,000, then every name deleted, the long one too. All deleted: no new
+    // string at all. The one walk writes the new pool in pieces of at most
+    // STRING_WALK_PIECE (a kept long name alone), hashes both pools as
+    // content_hash does and derives the runs. It gives the old pool back as it
+    // passes it, deleted strings as well as kept ones: each call at the end of
+    // the first string that puts a piece behind the last call, and under a
+    // piece left for the end. It reads no old byte before an offset it passed:
+    // scribbled over as it passes them, the old pool still rebuilds into the
+    // new one, under the old pool's hash.
+    enum class Shape { Mixed, DeletedSuffix, AllDeleted };
+    struct Case {
+        const char* name;
+        Shape shape;
+        bool sorted;
+    };
+    for (const Case c : {Case{"mixed sorted", Shape::Mixed, true}, Case{"mixed indexed", Shape::Mixed, false},
+                         Case{"deleted suffix sorted", Shape::DeletedSuffix, true},
+                         Case{"deleted suffix indexed", Shape::DeletedSuffix, false},
+                         Case{"all deleted", Shape::AllDeleted, true}}) {
+        const int failures_before = gctest::failures();
         std::vector<std::string> o, n;
         for (uint32_t i = 0; i < 30000; i++) {
             char b[16];
             std::snprintf(b, sizeof b, "name %07u", i);
             const std::string w = i == 12345 ? b + std::string(STRING_WALK_PIECE + 100, 'z') : b;
             o.push_back(w);
-            if (i % 5 == 1 && !sorted) n.push_back(w + "+");
+            if (c.shape == Shape::AllDeleted || (c.shape == Shape::DeletedSuffix && i >= 10000)) continue;
+            if (i % 5 == 1 && !c.sorted) n.push_back(w + "+");
             if (i % 7 != 3) n.push_back(w);
-            if (i % 5 == 1 && sorted) n.push_back(w + "+");
+            if (i % 5 == 1 && c.sorted) n.push_back(w + "+");
         }
         const std::string old_pool = pool_in_order(o), new_pool = pool_in_order(n);
         const TierEdit e = tier_edit(old_pool, new_pool);
-        REQUIRE(e.diff.sorted == sorted);
+        REQUIRE(e.diff.sorted == c.sorted);
         std::vector<char> old_bytes(old_pool.begin(), old_pool.end());
         std::string rebuilt;
-        size_t longer = 0, passed = 0, scribbled = 0;
+        size_t longer = 0, passed = 0, scribbled = 0, late = 0;
         StringRemap remap(scratch_tables());
 
         const StringTierRebuild walk = rebuild_string_tier(
@@ -2042,7 +2058,10 @@ TEST(patch_format_string_tier_walk_writes_pieces_and_reads_nothing_it_passed) {
                 longer += len > STRING_WALK_PIECE;
             },
             [&](size_t off) {
-                CHECK(off >= scribbled + STRING_WALK_PIECE && off <= old_bytes.size());
+                CHECK(off >= scribbled + STRING_WALK_PIECE && off <= old_bytes.size() && old_pool[off - 1] == '\0');
+                // The string that ended at off started under a piece past the last call.
+                const size_t last = old_pool.rfind('\0', off - 2);
+                late += (last == std::string::npos ? 0 : last + 1) >= scribbled + STRING_WALK_PIECE;
                 std::fill(old_bytes.begin(), old_bytes.begin() + off, '#');
                 scribbled = off;
                 passed++;
@@ -2053,7 +2072,9 @@ TEST(patch_format_string_tier_walk_writes_pieces_and_reads_nothing_it_passed) {
         CHECK_EQ(walk.new_size, uint64_t(new_pool.size()));
         CHECK_EQ(walk.old_hash, content_hash(old_pool.data(), old_pool.size()));
         CHECK_EQ(walk.new_hash, content_hash(new_pool.data(), new_pool.size()));
-        CHECK_EQ(longer, size_t(1));
+        CHECK_EQ(longer, size_t(c.shape == Shape::Mixed));
+        CHECK_EQ(late, size_t(0));
+        CHECK(old_pool.size() - scribbled < STRING_WALK_PIECE);
         CHECK(passed + 2 >= old_pool.size() / STRING_WALK_PIECE);
         remap.finish();
         const auto want = pairs_of(old_pool, new_pool, 1000, 900);
@@ -2063,6 +2084,7 @@ TEST(patch_format_string_tier_walk_writes_pieces_and_reads_nothing_it_passed) {
             wrong += remap.lookup(v) != (it != want.end() ? it->second : v);
         }
         CHECK_EQ(wrong, size_t(0));
+        if (gctest::failures() > failures_before) std::printf("    in the %s case\n", c.name);
     }
 }
 
