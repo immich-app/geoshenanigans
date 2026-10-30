@@ -1644,15 +1644,14 @@ void for_each_new_string(const char* old_pool, size_t old_size, const StringTier
 // The patcher's old → new string offset map. Between two edits every
 // surviving string of a tier moves by one amount, so the map is held as runs
 // over old offsets: a few thousand on a planet day instead of one pair per
-// moved string (20.6M pairs, 157 MiB on every client). Like the diff's
-// per-string pairs, only a string's start moves. A run derived from a tier
-// the client holds checks that against the old pool, where the byte before a
-// string start is its predecessor's NUL. A run sent for a tier the client
-// doesn't hold can't: it trusts that every stored reference is a string start
-// or NO_DATA, which partition_strings_into_tiers guarantees and CI's byte
-// identity check proves daily. Surviving strings the edits don't keep (they
-// changed tier, or the POI tier's order moved them) are explicit pairs, read
-// where the patch holds them.
+// moved string (20.6M pairs, 157 MiB on every client). A run shifts every
+// offset in [start, end), whether the patcher derived it from a tier the
+// client holds or the diff sent it for one it doesn't. Only string starts
+// are looked up: every stored reference is a string start or NO_DATA, which
+// partition_strings_into_tiers guarantees and CI's byte identity check proves
+// daily. Surviving strings the edits don't keep (they changed tier, or the
+// POI tier's order moved them) are explicit pairs, read where the patch holds
+// them.
 //
 // Pairs are looked up first, but the order doesn't matter: a pair's old
 // offset starts a string its old tier's edit doesn't keep, runs cover only
@@ -1661,12 +1660,12 @@ void for_each_new_string(const char* old_pool, size_t old_size, const StringTier
 class StringRemap {
 public:
     // Records the kept strings that moved, walking a shipped tier's old pool
-    // and edit as its rebuild does. The old pool must stay mapped for lookups.
+    // and edit as its rebuild does. Lookups don't read the old pool.
     void add_tier(const char* old_pool, size_t old_size, uint32_t old_base, uint32_t new_base,
                   const StringTierEdit& edit) {
         uint32_t new_start = new_base;
         StringRunJoiner joiner([&](uint32_t start, uint32_t end, uint32_t shift) {
-            runs_.push_back({start, end, shift, old_pool + (start - old_base)});
+            runs_.push_back({start, end, shift});
         });
         for_each_new_string(old_pool, old_size, edit, [&](const char*, size_t len, size_t old_off) {
             if (old_off != NO_OLD_STRING) {
@@ -1692,7 +1691,7 @@ public:
             uint64_t end = start + read_varint_bounded(data, pos, size, "string runs");
             shift += unzigzag32(read_varint_bounded(data, pos, size, "string runs"));
             if (end == start || end > tier_end) malformed();
-            runs_.push_back({static_cast<uint32_t>(start), static_cast<uint32_t>(end), shift, nullptr});
+            runs_.push_back({static_cast<uint32_t>(start), static_cast<uint32_t>(end), shift});
             prev_end = end;
         }
         if (pos != size) malformed();
@@ -1709,13 +1708,11 @@ public:
         if (it == runs_.begin()) return off;
         --it;
         if (off >= it->end) return off;
-        if (it->old_bytes && off != it->start && it->old_bytes[off - it->start - 1] != '\0') return off;
         return off + it->shift;
     }
 
 private:
-    // old_bytes: the run's bytes in the old pool, or nullptr for a sent run.
-    struct Run { uint32_t start, end, shift; const char* old_bytes; };
+    struct Run { uint32_t start, end, shift; };
     std::vector<Run> runs_;
     SortedTable<RemapPair> pairs_;
 };

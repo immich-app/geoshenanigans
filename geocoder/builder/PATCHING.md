@@ -241,7 +241,7 @@ the tier sizes before it, which the patch carries.
 - **Shipped tier**: a `strings_<tier>.bin` the old and new dir both hold
   (empty files count). The patch sends its string diff and size and hash
   stamps; the patcher rebuilds it and derives its remap runs from the same
-  walk, checking each looked-up offset is a string start. The tiers are
+  walk. The tiers are
   sorted alphabetically except the POI tier, which is in POI record order
   (the names of POI tier 0, 1, 2, 3 in turn, each at its first record of
   that tier, so a reader walking the records reads the names front to
@@ -253,11 +253,13 @@ the tier sizes before it, which the patch carries.
   files points into (the fields the patcher remaps, `string_field_offsets`
   and the sparse files of remap kind 2 and 3).
 - **Sent runs**: for a referenced tier the dir doesn't ship, the diff walks
-  the tier itself and sends the shift runs. The patcher looks them up without
-  a string-start check: every stored reference is a string start or NO_DATA
-  (`partition_strings_into_tiers`), and the daily byte-identity check proves
-  it.
+  the tier itself and sends the shift runs.
 - A tier neither shipped nor referenced sends nothing.
+
+Every run, derived or sent, shifts each offset it covers, with no
+string-start check against the old tier: every stored reference is a string
+start or NO_DATA (`partition_strings_into_tiers`), and the daily
+byte-identity check proves it.
 
 Dirs patched on different days don't fit together: the server combines a
 mode dir with a quality or poi dir by global string offsets, so the selected
