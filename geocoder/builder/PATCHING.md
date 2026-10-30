@@ -347,13 +347,15 @@ Strings: marker 0xFFFFFFF6 (u32)
       goes where it sorts; 1 indexed: the new indices follow the strings),
       [string\0] × n_added, indexed only [new index:u32] × n_added,
       [old index:u32] × n_deleted (indices and a sorted tier's added
-      strings ascending; the patcher refuses an old tier of another size or
-      hash and checks the one it rebuilds)
+      strings ascending; the patcher reads them where they sit, refuses an
+      old tier of another size or hash and checks the one it rebuilds)
     sent: n_runs:u32, runs_size:u32, runs of varint (start - previous end,
       end - start, zigzag change of the shift), from the tier's old base
   + n_pairs (u32) + [(old_off:u32, new_off:u32)] × n_pairs (surviving
   strings no tier's edit keeps: they changed tier, or (v9) the POI tier's
-  order moved them; out of a shipped or referenced tier)
+  order moved them; out of a shipped or referenced tier; ascending by
+  old_off, each string once. The patcher reads them where they sit and
+  refuses one out of order)
 
 Parent-id remap: marker 0xFFFFFFF3 (u32)
   + n_admin (u32) + [(old:u32, new:u32)] × n_admin
@@ -361,6 +363,8 @@ Parent-id remap: marker 0xFFFFFFF3 (u32)
   (v8: the street pairs are only the ways no MATCH / REPLACE run maps, the
   moved and secondary-matched ones; the patcher derives the rest of the
   street remap from the street_ways replay)
+  Each leg ascending by old, each id once. The patcher reads the legs where
+  they sit and refuses one out of order.
 
 Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64) + ...
   (the patcher refuses an old file of another size, 0 meaning absent)

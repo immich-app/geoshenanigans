@@ -17,6 +17,8 @@
 #include <iterator>
 #include <map>
 #include <numeric>
+#include <optional>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -652,6 +654,176 @@ TEST(patch_format_entries_file_sections_refuse_a_second_section_or_another_file)
     }
 }
 
+// --- sorted tables, parent-id remap ---
+
+// pairs as the patch carries them, in the order given.
+static std::vector<char> pair_bytes(const std::vector<RemapPair>& pairs) {
+    std::vector<char> out(pairs.size() * sizeof(RemapPair));
+    if (!out.empty()) memcpy(out.data(), pairs.data(), out.size());
+    return out;
+}
+
+// The pairs of bytes where they sit, as the patcher reads a remap's.
+static SortedTable<RemapPair> pair_table(const std::vector<char>& bytes) {
+    return SortedTable<RemapPair>(bytes.data(), bytes.size() / sizeof(RemapPair), "test pairs");
+}
+
+TEST(patch_format_sorted_table_finds_every_key_and_no_other) {
+    // Sizes around the directory's: every key in it, then every second one.
+    for (const size_t n : {size_t(0), size_t(1), TABLE_DIRECTORY_KEYS - 1, TABLE_DIRECTORY_KEYS, TABLE_DIRECTORY_KEYS + 1,
+                           size_t(100000)}) {
+        std::vector<RemapPair> pairs;
+        for (uint32_t i = 0; i < n; i++) pairs.push_back({3 * i + 1, i ^ 0x5a5a5a5au});
+        const std::vector<char> bytes = pair_bytes(pairs);
+
+        const SortedTable<RemapPair> sut = pair_table(bytes);
+
+        CHECK_EQ(sut.size(), n);
+        CHECK(sut.data() == bytes.data());
+        size_t wrong = 0;
+        for (const RemapPair& p : pairs) {
+            const std::optional<RemapPair> hit = sut.find(p.from);
+            if (!hit || hit->to != p.to) wrong++;
+            if (sut.find(p.from - 1) || sut.find(p.from + 1)) wrong++;
+        }
+        CHECK_EQ(wrong, size_t(0));
+        CHECK(!sut.find(UINT32_MAX));
+    }
+}
+
+// n strictly ascending keys from a seeded generator: 0, then gaps of 1 to
+// 64K, the last key moved to UINT32_MAX when n > 1.
+static std::vector<uint32_t> spread_keys(size_t n, uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::vector<uint32_t> keys;
+    uint32_t key = 0;
+    for (size_t i = 0; i < n; i++) {
+        keys.push_back(key);
+        const uint32_t widest = 2u << (rng() % 16);
+        key += 1 + rng() % widest;
+    }
+    if (n > 1) keys.back() = UINT32_MAX;
+    return keys;
+}
+
+// A table of keys whose records map each key to its complement.
+static std::vector<char> complement_pair_bytes(const std::vector<uint32_t>& keys) {
+    std::vector<RemapPair> pairs;
+    for (const uint32_t key : keys) pairs.push_back({key, ~key});
+    return pair_bytes(pairs);
+}
+
+TEST(patch_format_sorted_table_find_and_filter_agree_with_upper_bound) {
+    // Sizes around the directory's (every key in it up to TABLE_DIRECTORY_KEYS)
+    // and a normal day's 90 moved strings.
+    for (const size_t n : {size_t(0), size_t(1), size_t(90), TABLE_DIRECTORY_KEYS, TABLE_DIRECTORY_KEYS + 1, size_t(100000)}) {
+        const std::vector<uint32_t> keys = spread_keys(n, static_cast<uint32_t>(n));
+        const std::vector<char> bytes = complement_pair_bytes(keys);
+        std::vector<uint32_t> probes = {0, 1, UINT32_MAX - 1, UINT32_MAX};
+        for (const uint32_t key : keys) probes.insert(probes.end(), {key - 1, key, key + 1});
+        std::mt19937 rng(7);
+        for (int i = 0; i < 100000; i++) probes.push_back(rng());
+
+        const SortedTable<RemapPair> sut = pair_table(bytes);
+
+        size_t wrong = 0, held_rejected = 0;
+        for (const uint32_t probe : probes) {
+            const auto above = std::upper_bound(keys.begin(), keys.end(), probe);
+            const bool held = above != keys.begin() && above[-1] == probe;
+            const std::optional<RemapPair> hit = sut.find(probe);
+            if (hit.has_value() != held || (held && (hit->from != probe || hit->to != ~probe))) wrong++;
+            if (held && !sut.might_hold(probe)) held_rejected++;
+        }
+        CHECK_EQ(wrong, size_t(0));
+        CHECK_EQ(held_rejected, size_t(0));
+    }
+}
+
+TEST(patch_format_sorted_table_filter_passes_few_keys_a_small_table_lacks) {
+    // A normal day's 90 moved strings.
+    const std::vector<uint32_t> keys = spread_keys(90, 3);
+    const std::vector<char> bytes = complement_pair_bytes(keys);
+    std::mt19937 rng(11);
+
+    const SortedTable<RemapPair> sut = pair_table(bytes);
+
+    size_t lacked = 0, passed = 0;
+    for (int i = 0; i < 1000000; i++) {
+        const uint32_t key = rng();
+        if (std::binary_search(keys.begin(), keys.end(), key)) continue;
+        lacked++;
+        passed += sut.might_hold(key);
+    }
+    CHECK(passed * 100 < lacked);
+    CHECK(!SortedTable<RemapPair>().might_hold(0));
+}
+
+TEST(patch_format_sorted_table_refuses_a_key_out_of_order_or_twice) {
+    std::vector<RemapPair> many;
+    for (uint32_t i = 0; i < 3 * TABLE_DIRECTORY_KEYS; i++) many.push_back({2 * i, i});
+    std::vector<RemapPair> many_twice = many;
+    many_twice[5000].from = many_twice[4999].from;  // between two keys of the directory
+    const std::vector<RemapPair> cases[] = {
+        {{5, 0}, {2, 0}, {9, 0}},
+        {{2, 0}, {9, 0}, {5, 0}},
+        {{2, 0}, {5, 0}, {5, 1}},
+        many_twice,
+    };
+    for (const auto& pairs : cases) {
+        const std::vector<char> bytes = pair_bytes(pairs);
+
+        CHECK_EQ(refusal_of([&] { pair_table(bytes); }), std::string("Malformed test pairs"));
+    }
+}
+
+// A parent-id remap after its marker: the admin, street and reserved postcode
+// legs, each a count and its pairs.
+static std::vector<char> parent_id_remap_bytes(const std::vector<RemapPair>& admin, const std::vector<RemapPair>& street,
+                                               const std::vector<RemapPair>& postcode = {}) {
+    std::vector<char> out;
+    for (const std::vector<RemapPair>* leg : {&admin, &street, &postcode}) {
+        const uint32_t n = static_cast<uint32_t>(leg->size());
+        out.insert(out.end(), reinterpret_cast<const char*>(&n), reinterpret_cast<const char*>(&n) + 4);
+        const std::vector<char> pairs = pair_bytes(*leg);
+        out.insert(out.end(), pairs.begin(), pairs.end());
+    }
+    return out;
+}
+
+TEST(patch_format_parent_id_remap_reads_its_legs_where_they_sit) {
+    const std::vector<char> bytes = parent_id_remap_bytes({{1, 0}, {7, 3}}, {{4, 9}}, {{2, 2}});
+    size_t pos = 0;
+
+    const ParentIdRemap sut = parse_parent_id_remap(bytes.data(), bytes.size(), pos);
+
+    CHECK_EQ(pos, bytes.size());
+    CHECK(sut.admin.data() == bytes.data() + 4);
+    CHECK_EQ(sut.admin.size(), size_t(2));
+    CHECK_EQ(sut.admin.find(7)->to, 3u);
+    CHECK(!sut.admin.find(4));
+    CHECK(sut.street.data() == bytes.data() + 4 + 16 + 4);
+    CHECK_EQ(sut.street.find(4)->to, 9u);
+    CHECK_EQ(sut.n_postcode, 1u);
+}
+
+TEST(patch_format_parent_id_remap_refuses_a_leg_out_of_order_or_cut_short) {
+    struct Case { std::vector<char> bytes; std::string refusal; };
+    const std::vector<char> whole = parent_id_remap_bytes({{1, 0}, {7, 3}}, {{4, 9}, {6, 2}});
+    std::vector<Case> cases = {
+        {parent_id_remap_bytes({{7, 3}, {1, 0}}, {}), "Malformed POI parent-id remap"},
+        {parent_id_remap_bytes({{7, 3}, {7, 4}}, {}), "Malformed POI parent-id remap"},
+        {parent_id_remap_bytes({}, {{6, 2}, {4, 9}}), "Malformed POI parent-id remap"},
+        {parent_id_remap_bytes({}, {{4, 9}, {4, 2}}), "Malformed POI parent-id remap"},
+    };
+    for (size_t cut = 0; cut < whole.size(); cut++)
+        cases.push_back({std::vector<char>(whole.begin(), whole.begin() + cut), "Truncated POI parent-id remap"});
+    for (const Case& c : cases) {
+        size_t pos = 0;
+
+        CHECK_EQ(refusal_of([&] { parse_parent_id_remap(c.bytes.data(), c.bytes.size(), pos); }), c.refusal);
+    }
+}
+
 // --- cell index rebuild from an id remap ---
 
 static void append_u32(std::vector<char>& buf, uint32_t v) { buf.insert(buf.end(), (const char*)&v, (const char*)&v + 4); }
@@ -895,11 +1067,35 @@ std::string pool_of(std::vector<std::string> words) {
     return pool_in_order(words);
 }
 
-// One tier's edit between two pools, as the diff makes it: the kept strings
-// and the shipped tier's diff.
+// d as the strings section carries a shipped tier.
+std::vector<char> bytes_of(const StringTierDiff& d) {
+    std::vector<char> out;
+    append_string_tier_diff(out, d);
+    return out;
+}
+
+// A shipped tier's bytes as the patcher reads them, where they sit.
+StringTierEdit edit_of(const std::vector<char>& bytes) {
+    size_t pos = 0;
+    const StringTierEdit e = parse_string_tier_edit(bytes.data(), bytes.size(), pos);
+    CHECK_EQ(pos, bytes.size());
+    return e;
+}
+
+// The n u32 indices of a list where it sits.
+std::vector<uint32_t> indices_of(const char* list, uint32_t n) {
+    std::vector<uint32_t> out;
+    for (uint32_t i = 0; i < n; i++) out.push_back(string_index_at(list, i));
+    return out;
+}
+
+// One tier's edit between two pools, as the diff makes it (the kept strings
+// and the shipped tier's diff) and as the patcher reads its bytes.
 struct TierEdit {
     std::vector<std::pair<uint32_t, uint32_t>> kept;
     StringTierDiff diff;
+    std::vector<char> bytes;
+    StringTierEdit edit() const { return edit_of(bytes); }
 };
 
 TierEdit tier_edit(const std::string& o, const std::string& n) {
@@ -913,6 +1109,7 @@ TierEdit tier_edit(const std::string& o, const std::string& n) {
     TierEdit e;
     e.kept = kept_strings(common);
     e.diff = string_tier_diff(o.data(), o.size(), n.data(), n.size(), e.kept);
+    e.bytes = bytes_of(e.diff);
     return e;
 }
 
@@ -953,13 +1150,13 @@ TEST(patch_format_string_remap_runs_match_per_string_pairs) {
         uint32_t ob = 0, nb = 0;
         std::unordered_map<uint32_t, uint32_t> want;
         for (int t = 0; t < 2; t++) {
-            remap.add_tier(olds[t].data(), olds[t].size(), ob, nb, tier_edit(olds[t], news[t]).diff);
+            remap.add_tier(olds[t].data(), olds[t].size(), ob, nb, tier_edit(olds[t], news[t]).edit());
             for (auto& kv : pairs_of(olds[t], news[t], ob, nb)) want.insert(kv);
             ob += olds[t].size(); nb += news[t].size();
         }
-        remap.add_pair(ob + 100, 3);  // a string that moved tier
+        const std::vector<char> moved = pair_bytes({{ob + 100, 3}});  // a string that moved tier
+        remap.set_pairs(pair_table(moved));
         want[ob + 100] = 3;
-        remap.finish();
         for (uint32_t off = 0; off < ob + 110; off++) {
             auto it = want.find(off);
             CHECK_EQ(remap.lookup(off), it != want.end() ? it->second : off);
@@ -988,7 +1185,6 @@ TEST(patch_format_sent_string_runs_map_every_string_start) {
     auto runs = encode_string_tier_runs(o.data(), o.size(), ob, nb, tier_edit(o, n).kept);
     StringRemap remap;
     remap.add_sent_tier(runs.bytes.data(), runs.bytes.size(), runs.n_runs, ob, ob + (uint32_t)o.size());
-    remap.finish();
     CHECK(!remap.empty());
     CHECK_EQ(remap.run_count(), size_t(runs.n_runs));
     auto want = pairs_of(o, n, ob, nb);
@@ -1077,7 +1273,7 @@ TEST(patch_format_string_remap_maps_shipped_and_sent_tiers_and_tier_moves) {
         for (int t = 0; t < n_tiers; t++)
             for (uint32_t v : starts_of(news[t], nb[t])) new_at[news[t].c_str() + (v - nb[t])] = v;
         std::unordered_map<uint32_t, uint32_t> D;
-        std::vector<std::pair<uint32_t, uint32_t>> moves;
+        std::vector<RemapPair> moves;  // by old start
         auto tier_of = [&](uint32_t v, const std::vector<uint32_t>& b) {
             for (int t = 0; t < n_tiers; t++) if (v >= b[t] && v < b[t + 1]) return t;
             return -1;
@@ -1096,16 +1292,15 @@ TEST(patch_format_string_remap_maps_shipped_and_sent_tiers_and_tier_moves) {
             for (int t = 0; t < n_tiers; t++) {
                 const TierEdit e = tier_edit(olds[t], news[t]);
                 if (shipped >> t & 1) {
-                    r->add_tier(olds[t].data(), olds[t].size(), ob[t], nb[t], e.diff);
+                    r->add_tier(olds[t].data(), olds[t].size(), ob[t], nb[t], e.edit());
                 } else {
                     auto runs = encode_string_tier_runs(olds[t].data(), olds[t].size(), ob[t], nb[t], e.kept);
                     r->add_sent_tier(runs.bytes.data(), runs.bytes.size(), runs.n_runs, ob[t], ob[t + 1]);
                 }
             }
         }
-        for (auto [a, b] : moves) remap.add_pair(a, b);
-        remap.finish();
-        runs_only.finish();
+        const std::vector<char> moved = pair_bytes(moves);
+        remap.set_pairs(pair_table(moved));
         for (int t = 0; t < n_tiers; t++)
             for (uint32_t v : starts_of(olds[t], ob[t])) {
                 auto it = D.find(v);
@@ -1227,7 +1422,7 @@ void decode_strings(const std::vector<char>& buf, const RandomTiers& r, DecodedS
     out.section = parse_strings_section(buf.data(), buf.size(), pos);
     CHECK_EQ(pos, buf.size());
     load_string_remap(out.section, remap, [&](int t) {
-        const StringTierDiff& d = out.section.diffs[t];
+        const StringTierEdit& d = out.section.edits[t];
         CHECK_EQ(d.old_hash, content_hash(r.olds[t].data(), r.olds[t].size()));
         rebuild_string_tier(r.olds[t].data(), r.olds[t].size(), d,
                             [&](const char* p, size_t n) { out.rebuilt[t].append(p, n); });
@@ -1276,16 +1471,15 @@ size_t check_strings_section_round_trip(uint64_t seed, PoolOrder order) {
             if (ot != r.new_tier_of(n) && (looked_up >> ot & 1)) tier_moves++;
         }
         size_t in_tier = 0;
-        for (const auto& [o, n] : s.pairs) {
-            CHECK(looked_up >> r.old_tier_of(o) & 1);
-            auto it = r.moved.find(o);
-            CHECK(it != r.moved.end() && it->second == n);
-            in_tier += r.old_tier_of(o) == r.new_tier_of(n);
-        }
+        s.pairs.for_each([&](RemapPair p) {
+            CHECK(looked_up >> r.old_tier_of(p.from) & 1);
+            auto it = r.moved.find(p.from);
+            CHECK(it != r.moved.end() && it->second == p.to);
+            in_tier += r.old_tier_of(p.from) == r.new_tier_of(p.to);
+        });
         CHECK_EQ(s.pairs.size() - in_tier, tier_moves);
         if (order == PoolOrder::Sorted) CHECK_EQ(in_tier, size_t(0));
         order_moves += in_tier;
-        CHECK(std::is_sorted(s.pairs.begin(), s.pairs.end()));
         // Every cut of the section is refused.
         for (size_t cut = 0; cut < buf.size(); cut += 1 + buf.size() / 50) {
             size_t pos = 0;
@@ -1320,13 +1514,13 @@ TEST(patch_format_string_tier_edit_moves_a_string_out_of_order) {
     CHECK_EQ(std::string(e.diff.added[0]), std::string("cafe"));
     CHECK_EQ(std::string(e.diff.added[1]), std::string("tea"));
     std::string rebuilt;
-    rebuild_string_tier(o.data(), o.size(), e.diff, [&](const char* p, size_t len) { rebuilt.append(p, len); });
+    rebuild_string_tier(o.data(), o.size(), e.edit(), [&](const char* p, size_t len) { rebuilt.append(p, len); });
     CHECK(rebuilt == n);
     // bank shifts by a run; cafe, which the edit doesn't keep, by a pair.
     StringRemap remap;
-    remap.add_tier(o.data(), o.size(), 100, 100, e.diff);
-    remap.add_pair(104, 109);
-    remap.finish();
+    remap.add_tier(o.data(), o.size(), 100, 100, e.edit());
+    const std::vector<char> moved = pair_bytes({{104, 109}});
+    remap.set_pairs(pair_table(moved));
     CHECK_EQ(remap.run_count(), size_t(1));
     CHECK_EQ(remap.lookup(100), 100u);
     CHECK_EQ(remap.lookup(109), 104u);
@@ -1335,8 +1529,9 @@ TEST(patch_format_string_tier_edit_moves_a_string_out_of_order) {
 
 TEST(patch_format_rebuild_refuses_a_diff_the_old_pool_cannot_place) {
     const std::string o = pool_in_order({"a", "b"});
-    auto rebuilds = [&](StringTierDiff d) {
-        return refusal_of([&] { rebuild_string_tier(o.data(), o.size(), d, [](const char*, size_t) {}); }).empty();
+    auto rebuilds = [&](const StringTierDiff& d) {
+        const std::vector<char> bytes = bytes_of(d);
+        return refusal_of([&] { rebuild_string_tier(o.data(), o.size(), edit_of(bytes), [](const char*, size_t) {}); }).empty();
     };
     const char* x = "x";
     CHECK(rebuilds({0, 0, false, {x}, {2}, {}}));          // after both old strings
@@ -1357,7 +1552,7 @@ TEST(patch_format_sorted_tier_sends_no_indices) {
     CHECK(e.diff.added_at.empty());
     CHECK(e.diff.deleted == std::vector<uint32_t>({1}));
     std::string rebuilt;
-    rebuild_string_tier(o.data(), o.size(), e.diff, [&](const char* p, size_t len) { rebuilt.append(p, len); });
+    rebuild_string_tier(o.data(), o.size(), e.edit(), [&](const char* p, size_t len) { rebuilt.append(p, len); });
     CHECK(rebuilt == n);
     // The section holds the order flag but no index of the three added strings.
     std::array<StringTierPools, STRING_TIER_COUNT> tiers{};
@@ -1369,8 +1564,8 @@ TEST(patch_format_sorted_tier_sends_no_indices) {
     CHECK_EQ(buf.size(), header + tier + pairs);
     size_t pos = 0;
     const StringsSection s = parse_strings_section(buf.data(), buf.size(), pos);
-    CHECK(s.diffs[0].sorted);
-    CHECK_EQ(s.diffs[0].added.size(), size_t(3));
+    CHECK(s.edits[0].sorted);
+    CHECK_EQ(s.edits[0].n_added, 3u);
     // An unsorted new pool sends them.
     const std::string u = pool_in_order({"g", "b", "a", "c", "f"});
     CHECK(!string_pool_sorted(u.data(), u.size()));
@@ -1387,8 +1582,8 @@ TEST(patch_format_strings_section_refuses_indices_out_of_order) {
     append_strings_section(buf, tiers, 1, 0, std::vector<std::pair<uint32_t, uint32_t>>());
     size_t pos = 0;
     const StringsSection s = parse_strings_section(buf.data(), buf.size(), pos);
-    REQUIRE(s.diffs[0].added_at == std::vector<uint32_t>({0, 1}));
-    REQUIRE(s.diffs[0].deleted == std::vector<uint32_t>({0, 1}));
+    REQUIRE(indices_of(s.edits[0].added_at, s.edits[0].n_added) == std::vector<uint32_t>({0, 1}));
+    REQUIRE(indices_of(s.edits[0].deleted, s.edits[0].n_deleted) == std::vector<uint32_t>({0, 1}));
     // The section ends with added_at (8 bytes), deleted (8) and n_pairs (4).
     for (size_t list_at : {buf.size() - 20, buf.size() - 12}) {
         std::vector<char> bad = buf;
@@ -1404,12 +1599,61 @@ TEST(patch_format_strings_section_refuses_indices_out_of_order) {
     std::vector<char> sorted_buf;
     append_strings_section(sorted_buf, tiers, 1, 0, std::vector<std::pair<uint32_t, uint32_t>>());
     pos = 0;
-    REQUIRE(parse_strings_section(sorted_buf.data(), sorted_buf.size(), pos).diffs[0].sorted);
+    REQUIRE(parse_strings_section(sorted_buf.data(), sorted_buf.size(), pos).edits[0].sorted);
     REQUIRE(std::string(sorted_buf.data() + sorted_buf.size() - 16, 4) == std::string("c\0d\0", 4));
     memcpy(sorted_buf.data() + sorted_buf.size() - 16, "d\0c\0", 4);
     pos = 0;
     CHECK_EQ(refusal_of([&] { parse_strings_section(sorted_buf.data(), sorted_buf.size(), pos); }),
              std::string("Malformed strings section"));
+}
+
+TEST(patch_format_strings_section_reads_tier_edits_where_they_sit) {
+    // The POI tier zoo cafe bank → zoo bank cafe tea (indexed): cafe deleted
+    // at 1 and added at 2, tea added at 3, and cafe's offset as a pair.
+    const std::string o = pool_in_order({"zoo", "cafe", "bank"}), n = pool_in_order({"zoo", "bank", "cafe", "tea"});
+    std::array<StringTierPools, STRING_TIER_COUNT> tiers{};
+    tiers[4] = {o.data(), o.size(), n.data(), n.size()};
+    const std::vector<std::pair<uint32_t, uint32_t>> moved = {{0, 0}, {4, 9}, {9, 4}};
+    std::vector<char> buf;
+    append_strings_section(buf, tiers, 1u << 4, 0, moved);
+    size_t pos = 0;
+
+    const StringsSection s = parse_strings_section(buf.data(), buf.size(), pos);
+
+    auto in_buf = [&](const char* p, size_t len) { return p >= buf.data() && p + len <= buf.data() + buf.size(); };
+    const StringTierEdit& e = s.edits[4];
+    REQUIRE(e.n_added == 2 && e.n_deleted == 1 && !e.sorted);
+    CHECK(in_buf(e.added, 9));
+    CHECK_EQ(std::string(e.added, 9), std::string("cafe\0tea\0", 9));
+    CHECK(in_buf(e.added_at, 8));
+    CHECK(indices_of(e.added_at, 2) == std::vector<uint32_t>({2, 3}));
+    CHECK(in_buf(e.deleted, 4));
+    CHECK(indices_of(e.deleted, 1) == std::vector<uint32_t>({1}));
+    REQUIRE(s.pairs.size() == 1);
+    CHECK(in_buf(s.pairs.data(), 8));
+    CHECK_EQ(s.pairs.find(4)->to, 9u);
+}
+
+TEST(patch_format_strings_section_refuses_moved_strings_out_of_order_or_twice) {
+    // One shipped tier "a b c" → "c b a" (indexed): its edit keeps one
+    // string, and the other two go as the pairs that end the section.
+    const std::string o = pool_in_order({"a", "b", "c"}), n = pool_in_order({"c", "b", "a"});
+    std::array<StringTierPools, STRING_TIER_COUNT> tiers{};
+    tiers[0] = {o.data(), o.size(), n.data(), n.size()};
+    const std::vector<std::pair<uint32_t, uint32_t>> moved = {{0, 4}, {2, 2}, {4, 0}};
+    std::vector<char> buf;
+    append_strings_section(buf, tiers, 1, 0, moved);
+    size_t pos = 0;
+    REQUIRE(parse_strings_section(buf.data(), buf.size(), pos).pairs.size() == 2);
+    const size_t first = buf.size() - 16, second = buf.size() - 8;
+    std::vector<char> swapped = buf, twice = buf;
+    std::swap_ranges(swapped.begin() + first, swapped.begin() + second, swapped.begin() + second);
+    memcpy(twice.data() + second, buf.data() + first, 4);
+
+    for (const std::vector<char>* bad : {&swapped, &twice}) {
+        pos = 0;
+        CHECK_EQ(refusal_of([&] { parse_strings_section(bad->data(), bad->size(), pos); }), std::string("Malformed strings section"));
+    }
 }
 
 TEST(patch_format_strings_section_rejects_bad_masks) {
