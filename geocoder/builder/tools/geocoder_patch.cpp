@@ -441,12 +441,15 @@ static int run(int argc, char* argv[]) {
     };
     auto ru32 = [&]() -> uint32_t { require_bytes(4, "u32"); uint32_t v; memcpy(&v, P+pos, 4); pos += 4; return v; };
     auto ru64 = [&]() -> uint64_t { require_bytes(8, "u64"); uint64_t v; memcpy(&v, P+pos, 8); pos += 8; return v; };
-    auto take = [&](size_t n, const char* what) -> const char* {
+    // n in 64 bits, checked before it narrows to size_t: a 32-bit build wraps a length the patch
+    // gives (a u64, or a count times its item size) into one the patch has.
+    auto take = [&](uint64_t n, const char* what) -> const char* {
         require_bytes(n, what);
         const char* p = P + pos;
-        pos += n;
+        pos += static_cast<size_t>(n);
         return p;
     };
+    auto take_items = [&](uint32_t count, size_t item, const char* what) { return take(uint64_t{count} * item, what); };
 
     // Header
     if (memcmp(take(8, "magic"), GCPATCH_MAGIC, 8) != 0) { std::cerr << "Bad magic" << std::endl; return 1; }
@@ -587,8 +590,8 @@ static int run(int argc, char* argv[]) {
         uint32_t na = ru32(), nr = ru32();
         require_bytes(((uint64_t)na + nr) * 8, "cell changes");
         CellChanges c;
-        c.added = AscendingIds(take((size_t)na * 8, "cell changes"), na, "cell changes");
-        c.removed = AscendingIds(take((size_t)nr * 8, "cell changes"), nr, "cell changes");
+        c.added = AscendingIds(take_items(na, 8, "cell changes"), na, "cell changes");
+        c.removed = AscendingIds(take_items(nr, 8, "cell changes"), nr, "cell changes");
         std::cerr << "  " << label << " cells: +" << na << " -" << nr << std::endl;
         return c;
     };
@@ -616,10 +619,12 @@ static int run(int argc, char* argv[]) {
             uint32_t nf = ru32();
             for (uint32_t f = 0; f < nf; f++) {
                 uint32_t fid = ru32(), np = ru32();
-                require_bytes((size_t)np * 8, "secondary remap");
+                const char* pairs = take_items(np, 8, "secondary remap");
                 auto it = record_remaps.find(fid);
                 for (uint32_t i = 0; i < np; i++) {
-                    uint32_t o = ru32(), n = ru32();
+                    uint32_t o, n;
+                    memcpy(&o, pairs + (size_t)i * 8, 4);
+                    memcpy(&n, pairs + (size_t)i * 8 + 4, 4);
                     if (it != record_remaps.end()) it->second.add_pair(o, n);
                 }
                 std::cerr << "  Secondary remap " << fid << ": " << np << " pairs" << std::endl;
@@ -651,7 +656,7 @@ static int run(int argc, char* argv[]) {
                 uint64_t cid; memcpy(&cid, take(8, "cell id"), 8);
                 uint16_t ec; memcpy(&ec, take(2, "entry count"), 2);
                 std::vector<uint32_t> ids(ec);
-                if (ec > 0) memcpy(ids.data(), take((size_t)ec * 4, "entry ids"), (size_t)ec * 4);
+                if (ec > 0) memcpy(ids.data(), take_items(ec, 4, "entry ids"), (size_t)ec * 4);
                 list.push_back({cid, std::move(ids)});
             }
             std::cerr << "  Entry corrections " << fid << ": " << c << std::endl;
@@ -756,9 +761,9 @@ static int run(int argc, char* argv[]) {
             uint32_t parent_fid = ru32(), value_stride = ru32(), remap_kind = ru32();
             check_parallel_delta_header(file_id, parent_fid, value_stride, remap_kind);
             uint32_t n_ins = ru32();
-            const char* ins = take((size_t)n_ins * 4, "parallel values");
+            const char* ins = take_items(n_ins, 4, "parallel values");
             uint32_t n_changes = ru32();
-            const char* changes = take((size_t)n_changes * 8, "parallel changes");
+            const char* changes = take_items(n_changes, 8, "parallel changes");
             constexpr uint32_t NO_DATA_VAL = 0xFFFFFFFFu;
             auto remap_value = [&](uint32_t v) -> uint32_t {
                 if (v == NO_DATA_VAL) return v;
@@ -836,7 +841,7 @@ static int run(int argc, char* argv[]) {
             if ((value_stride != 4 && value_stride != 16) || new_size % value_stride)
                 throw std::runtime_error("Malformed sparse delta");
             const size_t change_size = 4 + value_stride;
-            const char* changes = take((size_t)n_changes * change_size, "sparse changes");
+            const char* changes = take_items(n_changes, change_size, "sparse changes");
 
             // OLD bytes with the same remap the diff applied before computing
             // the delta, then each (pos, value) pair overwritten, give NEW.

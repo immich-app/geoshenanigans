@@ -1214,6 +1214,98 @@ TEST(patch_lowmem_refuses_counts_and_lengths_that_wrap_32_bits) {
     CHECK(apply_both_modes(c).empty());
 }
 
+// Counts and lengths the patch gives, each made to name 2^32 bytes more than
+// it holds, are refused in every mode: a parallel delta's inserted values and
+// changes (way_parents along the street ways' merge), a sparse delta's
+// changes (admin_parents), and the lengths of a full replacement
+// (postcode_centroids.bin, new) and of an unchanged file's empty payload
+// (place_nodes.bin). A 32-bit size_t wrapped each back to what the patch
+// holds: the deltas read the bytes after their changes as more of them, and
+// the lengths applied as the patch's. The patch as made applies.
+TEST(patch_refuses_change_counts_and_lengths_that_wrap_32_bits) {
+    ScratchDir dir("patch-wrap");
+    std::vector<uint32_t> names(30), renamed(31);
+    for (uint32_t i = 0; i < 31; i++) {
+        if (i < 30) names[i] = i;
+        renamed[i] = i == 10 ? 1000 : i;
+    }
+    BuildDir old_d, new_d, old_meta, new_meta;
+    put_named_ways(old_d, old_meta, names);
+    put_named_ways(new_d, new_meta, renamed);
+    std::vector<char> old_parents, new_parents, old_admin_parents, new_admin_parents, centroids, places;
+    for (uint32_t i = 0; i < 31; i++) {
+        if (i < 30) append(old_parents, 100 + i);
+        append(new_parents, i == 20 ? 777u : 100 + i);
+    }
+    for (uint32_t i = 0; i < 64; i++) {
+        append(old_admin_parents, i);
+        append(new_admin_parents, i % 16 == 5 ? i + 1000 : i);
+    }
+    for (uint32_t i = 0; i < 4; i++)
+        for (const uint32_t w : {i, i, NO, 0u}) append(centroids, w);
+    for (uint32_t i = 0; i < 5; i++)
+        for (const uint32_t w : {i, i, NO, NO, NO}) append(places, w);
+    old_d["way_parents.bin"] = old_parents;
+    new_d["way_parents.bin"] = new_parents;
+    old_d["admin_parents.bin"] = old_admin_parents;
+    new_d["admin_parents.bin"] = new_admin_parents;
+    new_d["postcode_centroids.bin"] = centroids;
+    old_d["place_nodes.bin"] = new_d["place_nodes.bin"] = places;
+    const LowMemCase c{dir.path(), "wrap32"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    auto u32_at = [&](size_t p) { uint32_t x; memcpy(&x, raw.data() + p, 4); return x; };
+    auto u64_at = [&](size_t p) { uint64_t x; memcpy(&x, raw.data() + p, 8); return x; };
+    // A section's head (file id, stride, old and new sizes, then words): where it starts.
+    auto at_of = [&](PatchFileId fid, uint32_t stride, uint64_t old_size, uint64_t new_size, std::initializer_list<uint32_t> words) {
+        std::vector<char> head;
+        append(head, static_cast<uint32_t>(fid));
+        append(head, stride);
+        append(head, old_size);
+        append(head, new_size);
+        for (const uint32_t w : words) append(head, w);
+        const size_t at = find_once(raw, head);
+        REQUIRE(at != std::string::npos);
+        return at;
+    };
+    // Parallel: parent file, value stride, remap kind, then n_inserted, the values, n_changes.
+    const size_t parallel = at_of(PatchFileId::WAY_PARENTS, PARALLEL_DELTA_STRIDE, 30 * 4, 31 * 4,
+                                  {static_cast<uint32_t>(PatchFileId::STREET_WAYS), 4, 1});
+    const size_t inserted_at = parallel + 36, parallel_changes_at = inserted_at + 4 + 4 * size_t{u32_at(inserted_at)};
+    // Sparse: value stride, remap kind, then n_changes.
+    const size_t sparse_changes_at = at_of(PatchFileId::ADMIN_PARENTS, SPARSE_DELTA_STRIDE, 64 * 4, 64 * 4, {4, 1}) + 32;
+    // Full replacement and copy: a u32 (no fixups), then the data's length.
+    const size_t full_length_at = at_of(PatchFileId::POSTCODE_CENTROIDS, 0, 0, centroids.size(), {0}) + 28;
+    const size_t copy_length_at = at_of(PatchFileId::PLACE_NODES, COPY_OLD_STRIDE, places.size(), places.size(), {0}) + 28;
+    REQUIRE(u32_at(inserted_at) > 0 && u32_at(parallel_changes_at) > 0 && u32_at(sparse_changes_at) > 0);
+    REQUIRE(u64_at(full_length_at) == centroids.size() && u64_at(copy_length_at) == 0);
+    struct Edit {
+        std::string name;
+        size_t at;
+        uint64_t add;
+        bool wide;
+        std::string refusal;
+    };
+    const Edit edits[] = {
+        {"parallel-values", inserted_at, uint64_t(1) << 30, false, "bytes for parallel values"},
+        {"parallel-changes", parallel_changes_at, uint64_t(1) << 29, false, "bytes for parallel changes"},
+        {"sparse-changes", sparse_changes_at, uint64_t(1) << 29, false, "bytes for sparse changes"},
+        {"full-replacement", full_length_at, uint64_t(1) << 32, true, "bytes for full replacement"},
+        {"copy", copy_length_at, uint64_t(1) << 32, true, "bytes for copy-old payload"},
+    };
+    for (const Edit& e : edits) {
+        std::vector<char> edited = raw;
+        if (e.wide) put_at(edited, e.at, u64_at(e.at) + e.add);
+        else put_at(edited, e.at, static_cast<uint32_t>(u32_at(e.at) + e.add));
+        const std::string patch = c.dir(e.name + ".gcpatch");
+        REQUIRE(write_patch(c, patch, edited));
+
+        CHECK(not_refused(c, ALL_MODES, patch, e.name, e.refusal).empty());
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
 // Cell changes out of order (two ids of one list swapped: the geo index's
 // added or removed cells, the POI index's), and a geo entry delta or a cell
 // index delta for a file that has one already or for a file not of its kind,
