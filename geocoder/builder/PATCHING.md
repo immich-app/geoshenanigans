@@ -400,6 +400,15 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   Order (v8): street ways and nodes, interp ways and nodes, then addr
   points, whose parent_way_id the patcher moves through the street replay's
   remap.
+  A child stream (street_nodes, interp_nodes, addr_vertices, poi_vertices,
+  in the section right after its parent's) replays along its parent by
+  position: its MATCH bytes are the old bytes of the parent records at the
+  same places, a MATCH or REPLACE record's own or, where a DELETE run is
+  followed by an INSERT run, the deleted record's for the inserted one at the
+  same place in the run. The low-memory mode decodes both files from one
+  stream, and refuses a replay that reads one of them 4 MiB
+  (MAX_DECODER_SKEW) ahead of the other ("Malformed merge sequence: <file>
+  runs ahead of <file>").
   Offset fixups (node_offset / vertex_offset of MATCH records, see
   OffsetFixups in tools/patch_format.h): runs of varint (records skipped since
   the previous run, run length, zigzag change of the shift); the patcher adds

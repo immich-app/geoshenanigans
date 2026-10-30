@@ -1214,6 +1214,90 @@ TEST(patch_lowmem_refuses_counts_and_lengths_that_wrap_32_bits) {
     CHECK(apply_both_modes(c).empty());
 }
 
+// A parent and its child stream replayed out of step are refused in sync and
+// --threads once the shared decoder holds 4 MiB (MAX_DECODER_SKEW) of the
+// file left behind. 150,000 POIs with the same 8-vertex block, and the two
+// POI sections rebuilt by hand, both giving the new set (new = old): the
+// child runs ahead when every record is inserted before the old ones are
+// deleted while its block is matched from the old ones (the decoder queues
+// each old record it passes for the parent's reader: 5.4 MB of them), and
+// the parent runs ahead when the records are matched while their blocks are
+// inserted but for the last, matched from the first old block (it queues
+// each old block for the child's reader: 6.3 MB). The patch as made applies.
+TEST(patch_lowmem_refuses_a_parent_and_child_replayed_out_of_step) {
+    ScratchDir dir("lowmem-skew");
+    std::mt19937 rng(20261030);
+    const std::vector<char> shared = block(rng, 8);
+    std::vector<Poi> pois;
+    for (uint32_t i = 0; i < 150000; i++) pois.push_back({i, shared});
+    BuildDir d;
+    put_pois(d, pois);
+    const LowMemCase c{dir.path(), "skew"};
+    REQUIRE(prepare(c, d, d).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    const std::vector<char>& records = d.at("poi_records.bin");
+    const std::vector<char>& vertices = d.at("poi_vertices.bin");
+    const uint32_t n = static_cast<uint32_t>(pois.size()), v = static_cast<uint32_t>(vertices.size());
+    const uint32_t b = static_cast<uint32_t>(shared.size());
+    // The two sections as the diff sends them: copies of the old files.
+    std::vector<char> copies;
+    for (const auto& [fid, size] : {std::pair<PatchFileId, uint64_t>{PatchFileId::POI_RECORDS, records.size()},
+                                    {PatchFileId::POI_VERTICES, vertices.size()}}) {
+        append(copies, static_cast<uint32_t>(fid));
+        append(copies, COPY_OLD_STRIDE);
+        append(copies, size);
+        append(copies, size);
+        append(copies, uint32_t{0});
+        append(copies, uint64_t{0});
+    }
+    const size_t at = find_once(raw, copies);
+    REQUIRE(at != std::string::npos);
+    // An op of a merge sequence, with its records (count of them at stride) when it carries some.
+    auto op = [](std::vector<char>& ops, uint8_t kind, uint32_t count, const char* data = nullptr, size_t stride = 0) {
+        append(ops, kind);
+        append(ops, count);
+        if (data) ops.insert(ops.end(), data, data + size_t{count} * stride);
+    };
+    // The merge section of a file of `size` bytes on both days, without offset fixups.
+    auto merge = [](PatchFileId fid, uint32_t stride, uint64_t size, const std::vector<char>& ops) {
+        std::vector<char> s;
+        append(s, static_cast<uint32_t>(fid));
+        append(s, stride);
+        append(s, size);
+        append(s, size);
+        for (int k = 0; k < 4; k++) append(s, uint32_t{0});
+        append(s, static_cast<uint64_t>(ops.size()));
+        s.insert(s.end(), ops.begin(), ops.end());
+        return s;
+    };
+    struct Case {
+        std::string name;
+        std::vector<char> parent_ops, child_ops;
+        std::string refusal;
+    };
+    Case child_ahead{"child-ahead", {}, {}, "Malformed merge sequence: poi_vertices.bin runs ahead of poi_records.bin"};
+    op(child_ahead.parent_ops, OP_INSERT_RUN, n, records.data(), POI_RECORD_STRIDE);
+    op(child_ahead.parent_ops, OP_DELETE_RUN, n);
+    op(child_ahead.child_ops, OP_MATCH_RUN, v);
+    Case parent_ahead{"parent-ahead", {}, {}, "Malformed merge sequence: poi_records.bin runs ahead of poi_vertices.bin"};
+    op(parent_ahead.parent_ops, OP_MATCH_RUN, n);
+    op(parent_ahead.child_ops, OP_INSERT_RUN, v - b, vertices.data(), 1);
+    op(parent_ahead.child_ops, OP_MATCH_RUN, b);
+    for (const Case& e : {child_ahead, parent_ahead}) {
+        std::vector<char> edited(raw.begin(), raw.begin() + at);
+        for (const auto& section : {merge(PatchFileId::POI_RECORDS, POI_RECORD_STRIDE, records.size(), e.parent_ops),
+                                    merge(PatchFileId::POI_VERTICES, 1, vertices.size(), e.child_ops)})
+            edited.insert(edited.end(), section.begin(), section.end());
+        edited.insert(edited.end(), raw.begin() + at + copies.size(), raw.end());
+        const std::string patch = c.dir(e.name + ".gcpatch");
+        REQUIRE(write_patch(c, patch, edited));
+
+        CHECK(not_refused(c, ENCODED_MODES, patch, e.name, e.refusal).empty());
+    }
+    CHECK(apply_both_modes(c).empty());
+}
+
 // Counts and lengths the patch gives, each made to name 2^32 bytes more than
 // it holds, are refused in every mode: a parallel delta's inserted values and
 // changes (way_parents along the street ways' merge), a sparse delta's

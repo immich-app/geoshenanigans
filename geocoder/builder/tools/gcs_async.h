@@ -52,6 +52,15 @@ struct AsyncDec {
             if (starving[p] && ring[p].size() == 0) return true;
         return false;
     }
+    // Only a starving reader makes the worker decode past a full ring: one that does so while
+    // another file's ring holds more than MAX_DECODER_SKEW is refused, as Decoder::read refuses it.
+    void require_in_step_locked() const {
+        for (size_t held = 0; held < ring.size(); held++) {
+            if (closed[held] || ring[held].size() <= MAX_DECODER_SKEW) continue;
+            for (size_t p = 0; p < ring.size(); p++)
+                if (p != held && starving[p]) inner->runs_ahead(int(p), int(held));
+        }
+    }
     void run() {
         struct Cpu { double& out; ~Cpu() { out = thread_cpu_s(); } } cpu{cpu_s};
         try {
@@ -77,6 +86,7 @@ struct AsyncDec {
                         q.pop(q.size());
                     }
                     if (!more) eof = true;
+                    require_in_step_locked();
                 }
                 cv_reader.notify_all();
                 if (!more) return;

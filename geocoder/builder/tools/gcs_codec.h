@@ -24,9 +24,10 @@ struct Decoder {
     std::vector<uint64_t> drop;  // per port: bytes its reader skips, dropped as they are decoded
     size_t dropping = 0;         // ports with bytes to drop
     std::string name;
+    std::vector<std::string> files;  // per port: the today's-format file it decodes to
     std::vector<uint8_t> scratch;
-    explicit Decoder(const std::string& n, int ports)
-        : out(size_t(ports)), state(size_t(ports), 0), drop(size_t(ports), 0), name(n) {}
+    Decoder(const std::string& n, std::vector<std::string> port_files)
+        : out(port_files.size()), state(port_files.size(), 0), drop(port_files.size(), 0), name(n), files(std::move(port_files)) {}
     virtual ~Decoder() = default;
     virtual bool step() = 0;  // emits the next unit; false at the end
     // The decoded file's size when the manifest gives it, else ~0.
@@ -45,18 +46,32 @@ struct Decoder {
     // Decodes ahead until the port holds up to READ_AHEAD bytes (or max, if less), so a reader's
     // refill takes many small units at once; a coupled family's other queues grow by as much.
     // It stops early, once the port has something, when another open port already holds SKEW_SOFT
-    // (its reader is behind: decoding further would only grow that queue).
+    // (its reader is behind: decoding further would only grow that queue). With nothing for the
+    // port yet it decodes on, unless another port holds MAX_DECODER_SKEW (require_in_step).
     static constexpr size_t READ_AHEAD = size_t(8) << 10, SKEW_SOFT = size_t(64) << 10;
     bool others_full(int port) const {
         for (size_t p = 0; p < out.size(); p++)
             if (int(p) != port && state[p] != 2 && out[p].size() >= SKEW_SOFT) return true;
         return false;
     }
+    // The reader of `reading` drives the decoder while the one of `held` has left that file's
+    // bytes queued: refused.
+    [[noreturn]] void runs_ahead(int reading, int held) const {
+        die("Malformed merge sequence: %s runs ahead of %s", files[size_t(reading)].c_str(), files[size_t(held)].c_str());
+    }
+    // Before a step for the port's reader: no other open port holds more than MAX_DECODER_SKEW.
+    void require_in_step(int port) const {
+        for (size_t p = 0; p < out.size(); p++)
+            if (int(p) != port && state[p] != 2 && out[p].size() > MAX_DECODER_SKEW) runs_ahead(port, int(p));
+    }
     size_t read(int port, char* dst, size_t max) {
         ByteQueue& q = out[size_t(port)];
         const size_t want = std::min(max, READ_AHEAD);
         while (q.size() < want) {
-            if (q.size() && out.size() > 1 && others_full(port)) break;
+            if (out.size() > 1 && others_full(port)) {
+                if (q.size()) break;
+                require_in_step(port);
+            }
             if (!step()) break;
             if (dropping) apply_drops();
         }
@@ -233,7 +248,8 @@ struct Dec : Decoder {
     uint64_t nw, nn, i = 0, node_off = 0;
     std::unique_ptr<Reader> groups, nodes2, c0, c1, c2, c3, c4;
     uint32_t al = 0, ag = 0;
-    Dec(const std::string& src, bool st, const Manifest& m) : Decoder(st ? "streets" : "interps", 2), street(st), nm(names(st)) {
+    Dec(const std::string& src, bool st, const Manifest& m)
+        : Decoder(st ? "streets" : "interps", {names(st).ways, names(st).nodes}), street(st), nm(names(st)) {
         const std::string k = nm.pre, p = src + "/" + nm.pre;
         nw = m.num(k + ".ways");
         nn = m.num(k + ".nodes");
@@ -434,7 +450,7 @@ static const size_t CHUNK = 8192;  // values per decoder step
 struct U24Dec : Decoder {
     uint64_t n, i = 0;
     std::unique_ptr<Reader> r;
-    U24Dec(const std::string& src, const Manifest& m) : Decoder("way_parents", 1) {
+    U24Dec(const std::string& src, const Manifest& m) : Decoder("way_parents", {"way_parents.bin"}) {
         n = m.num("way_parents.n");
         r.reset(new Reader(src + "/way_parents.u24", 48 << 10));
         if (r->size() != 3 * n) die("way_parents.u24 size");
@@ -486,7 +502,7 @@ struct DictDec : Decoder {
     uint64_t n, i = 0;
     std::vector<uint32_t> dict;
     std::unique_ptr<Reader> r;
-    DictDec(const std::string& src, const std::string& nm, const Manifest& m) : Decoder(nm, 1) {
+    DictDec(const std::string& src, const std::string& nm, const Manifest& m) : Decoder(nm, {nm + ".bin"}) {
         n = m.num(nm + ".n");
         // The dictionary holds the manifest's count of values, fewer than the u16 index's 0xFFFF:
         // checked before it is read, so a malformed file can't make it any size.
@@ -628,7 +644,7 @@ struct Dec : Decoder {
     bool have[2] = {false, false};
     uint32_t cur_off[2] = {NO, NO}, cur_first[2] = {0, 0};
     uint64_t esize[3];
-    Dec(const std::string& src, const Manifest& m) : Decoder("gxc", 4) {
+    Dec(const std::string& src, const Manifest& m) : Decoder("gxc", {"geo_cells.bin", ENTRY[0], ENTRY[1], ENTRY[2]}) {
         R = m.num("gxc.rows");
         // Address ids are u32s: the rows list ids below it, and next never passes it.
         ids = m.num("gxc.addr_ids");
@@ -943,7 +959,7 @@ struct Dec : Decoder {
     uint64_t escaped_left = 0;  // bytes of the escaped footprint in progress still to emit
     std::vector<std::unique_ptr<Reader>> rg;
     std::unique_ptr<Reader> A;
-    Dec(const std::string& src, const Manifest& m) : Decoder("addr", 2) {
+    Dec(const std::string& src, const Manifest& m) : Decoder("addr", {"addr_points.bin", "addr_vertices.bin"}) {
         N = m.num("addr.n");
         const std::string cp = src + "/addr_points.col";
         if (file_size(cp) != 24 * N) die("addr_points.col size");
@@ -1243,7 +1259,7 @@ struct AdminDec : Decoder {
     int big_w = 0;
     uint32_t prev[2] = {0, 0};
     std::string bpath;
-    AdminDec(const std::string& src) : Decoder("admin", 1), pc(src + "/admin_polygons.bin") {
+    AdminDec(const std::string& src) : Decoder("admin", {"admin_vertices.bin"}), pc(src + "/admin_polygons.bin") {
         bpath = src + "/admin_vertices.B";
         R.reset(new Reader(bpath));
     }
@@ -1417,7 +1433,7 @@ struct PoiDec : Decoder {
     bool big_flag = false;
     uint8_t big_first[8];
     uint32_t prev[2] = {0, 0};
-    PoiDec(const std::string& src, const Manifest& m) : Decoder("poi", 2) {
+    PoiDec(const std::string& src, const Manifest& m) : Decoder("poi", {"poi_records.bin", "poi_vertices.bin"}) {
         n = m.num("poi.n");
         vpath = src + "/poi_vertices.bopen";
         R.reset(new Reader(src + "/poi_records.r3", 32 << 10));
