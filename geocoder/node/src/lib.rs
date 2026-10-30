@@ -111,7 +111,7 @@ impl Geocoder {
     }
 
     /// Lookup on the libuv worker pool — cold-cache page faults never
-    /// block the event loop. Resolves to the address JSON.
+    /// block the event loop. Resolves to the address JSON, `{}` for a point off the globe.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn reverse_geocode(&self, lat: f64, lng: f64) -> AsyncTask<QueryTask> {
         AsyncTask::new(QueryTask { inner: self.inner.clone(), lat, lng })

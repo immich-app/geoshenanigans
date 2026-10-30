@@ -5,7 +5,7 @@
 //! from before a patch, is built again from the files instead of being read. The files hashed
 //! must be the ones the geocoder index was loaded from (`load`): one replaced under a loaded
 //! index would have the index built from the old files but recorded as built from the new.
-use crate::build::{self, build_held, has_extra_names, has_unfinished_publish, held_subs, BuildOpts, Contended, HeldIndexDir};
+use crate::build::{self, build_held, has_extra_names, has_sub_index, has_unfinished_publish, held_subs, sub_index_files, BuildOpts, Contended, HeldIndexDir};
 use crate::constants::*;
 use crate::reader::SearchIndex;
 use query_server::Index;
@@ -193,7 +193,7 @@ pub fn merged_meta(geo: &Index, loaded: &Stamps, opts: &BuildOpts, dir: &Path, o
     }
     build::check_retained_names(out, &replacing, opts.extras.is_some())?;
     let dataset = fingerprint_loaded(dir, loaded, &mut HashCache::default())?;
-    let kept = SUB_INDEXES.iter().find(|s| !replacing.contains(s) && out.join(format!("{s}.fst")).exists());
+    let kept = SUB_INDEXES.iter().find(|s| !replacing.contains(s) && has_sub_index(out, s));
     if let Some(kept) = kept.filter(|_| built_from(out).as_ref() != Some(&dataset)) {
         return Err(format!("retained {kept} sub-index was built from other dataset files; rebuild with --sub all"));
     }
@@ -232,7 +232,7 @@ impl Default for BuildOnDevice {
 /// Whether `index` holds every file `SearchIndex::open` maps for `geo`: a `place-search build
 /// --sub` into an empty directory records the whole dataset, but holds only what it built.
 fn is_complete(geo: &Index, index: &Path) -> bool {
-    let sub_files = held_subs(geo, SUB_INDEXES).into_iter().flat_map(|s| SUB_INDEX_EXTS.map(|ext| format!("{s}.{ext}")));
+    let sub_files = held_subs(geo, SUB_INDEXES).into_iter().flat_map(sub_index_files);
     sub_files.chain([BOUNDARY_FILE.to_string()]).all(|f| index.join(f).is_file())
 }
 
@@ -669,14 +669,13 @@ mod tests {
 
     #[test]
     fn an_index_missing_a_file_is_built_again() {
-        let files = ["places.fst", "places.post", "places.pfx.fst", "places.pfx", "places.bnd", "poi.fst", "poi.post", "poi.pfx.fst", "poi.pfx"];
-        for file in files {
+        for file in SUB_INDEXES.iter().copied().flat_map(sub_index_files).chain([BOUNDARY_FILE.to_string()]) {
             let ds = TempDir::new("missing-file");
             let index = ds.0.join("search");
             with_poi(["Testville", "Otherton"], "Old Mill").write(&ds.0);
             build_subs(&ds.0, &index, SUB_INDEXES).unwrap();
             // A download cut short, or a file removed by hand.
-            std::fs::remove_file(index.join(file)).unwrap();
+            std::fs::remove_file(index.join(&file)).unwrap();
             let (geo, stamps) = load_dataset(&ds.0);
 
             let opened = open(&geo, &stamps, &ds.0, &index, &BuildOnDevice::default());

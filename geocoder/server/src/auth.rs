@@ -438,6 +438,7 @@ const DASHBOARD_HTML: &str = include_str!("web/dashboard.html");
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scratch_dir::ScratchDir;
     use axum::http::HeaderValue;
 
     #[test]
@@ -525,7 +526,9 @@ mod tests {
 
     #[tokio::test]
     async fn first_login_creates_admin_then_verifies_password() {
-        let db = Arc::new(RwLock::new(Db::default()));
+        let dir = ScratchDir::new();
+        let path = dir.path().join("geocoder.json");
+        let db = Arc::new(RwLock::new(Db::load(path.to_str().unwrap()).unwrap()));
 
         let first = login_submit(State(db.clone()), login_form("root", "pw")).await;
         let wrong = login_submit(State(db.clone()), login_form("root", "nope")).await;
@@ -542,9 +545,8 @@ mod tests {
 
     #[test]
     fn load_refuses_unreadable_database() {
-        let dir = std::env::temp_dir().join(format!("gc_auth_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("geocoder.json");
+        let dir = ScratchDir::new();
+        let path = dir.path().join("geocoder.json");
         let path = path.to_str().unwrap();
 
         let missing = Db::load(path);
@@ -553,7 +555,6 @@ mod tests {
         std::fs::write(path, "{\"users\": {}, \"tokens\": {\"k\": \"root\"}}").unwrap();
         let valid = Db::load(path);
 
-        let _ = std::fs::remove_dir_all(&dir);
         assert!(missing.unwrap().users.is_empty());
         assert!(corrupt.is_err(), "a corrupt database must not silently become an empty one");
         assert_eq!(valid.unwrap().tokens.get("k").map(String::as_str), Some("root"));
