@@ -161,8 +161,9 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
 The tool's own memory stays at 2–4 MiB anon whatever the limit. That is the default build, which
 decompresses the patch with libzstd into a file it maps: no window buffer. One built with
 `-DGEOCODER_PATCH_LIBZSTD=OFF` runs the `zstd` command for it, a child of about 11.5 MiB peak RSS
-beside the tool (its 8 MiB window among it). Below about 1 GiB (page cache included) a planet
-update gets slower, not bigger: the mapped inputs drop out of the page cache and are read again.
+beside the tool (its 8 MiB window among it, which the diff pins and the command is held to).
+Below about 1 GiB (page cache included) a planet update gets slower, not bigger: the mapped inputs
+drop out of the page cache and are read again.
 Planet b → c (2026-10-28), planet/full, one core, cold, no swap, disk at
 100 MB/s:
 
@@ -316,9 +317,12 @@ and a half minutes of one core.
 
 ## Patch Format (.gcpatch, version 9)
 
-Whole file is zstd-compressed for transport. Internal structure (all integers
-little-endian; the header, client files, old file sizes and strings sections
-are read by position, everything after them by marker):
+Whole file is zstd-compressed for transport, at level 19 with its 8 MiB window
+pinned (`--zstd=wlog=23`, PATCH_ZSTD_WINDOW_LOG); a patcher built on the zstd
+command runs it with `--memory=8388608`, so a frame needing a larger window is
+refused. Internal structure (all integers little-endian; the header, client
+files, old file sizes and strings sections are read by position, everything
+after them by marker):
 
 ```
 Header: "GCPATCH\0" (8) + version=9 (u32) + flags=0 (u32)

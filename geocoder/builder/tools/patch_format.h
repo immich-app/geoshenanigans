@@ -189,6 +189,9 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // each added string's new index, and a string its order moves travels as a
 // pair.
 static constexpr uint32_t GCPATCH_VERSION = 9;
+// The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
+// command holds the window, so the diff pins it and the patcher refuses a larger one.
+static constexpr int PATCH_ZSTD_WINDOW_LOG = 23;
 
 enum class PatchFileId : uint32_t {
     STRINGS = 0,

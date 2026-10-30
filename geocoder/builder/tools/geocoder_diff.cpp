@@ -2236,9 +2236,10 @@ static int run(int argc, char* argv[]) {
 
     // Compress for transport, streaming straight into zstd: no staged
     // uncompressed copy, and a short write or zstd failure fails the diff.
+    // The window is pinned to what a patcher on the zstd command accepts.
     {
         double tc = now_ms();
-        std::string cmd = "zstd -19 -T0 -q -f -o '" + patch_path + "'";
+        std::string cmd = "zstd -19 --zstd=wlog=" + std::to_string(PATCH_ZSTD_WINDOW_LOG) + " -T0 -q -f -o '" + patch_path + "'";
         FILE* z = popen(cmd.c_str(), "w");
         size_t put = z ? fwrite(patch.data(), 1, patch.size(), z) : 0;
         int rc = z ? pclose(z) : -1;

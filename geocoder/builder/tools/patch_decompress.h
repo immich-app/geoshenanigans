@@ -84,9 +84,11 @@ inline bool decompress_to_file(const std::string& src, const std::string& dst) {
 #else
 // The zstd CLI on PATH (a -DGEOCODER_PATCH_LIBZSTD=OFF build), run without a
 // shell: the patch path is one argument whatever its characters, after "--"
-// so a leading '-' is no option.
+// so a leading '-' is no option. Its window, which it holds in memory, is
+// limited to the one the diff compresses with.
 inline bool decompress_to_file(const std::string& src, const std::string& dst) {
-    const char* argv[] = {"zstd", "-d", "-f", "--quiet", "-o", dst.c_str(), "--", src.c_str(), nullptr};
+    const std::string memory = "--memory=" + std::to_string(size_t(1) << PATCH_ZSTD_WINDOW_LOG);
+    const char* argv[] = {"zstd", "-d", "-f", "--quiet", memory.c_str(), "-o", dst.c_str(), "--", src.c_str(), nullptr};
     posix_spawn_file_actions_t quiet;
     if (posix_spawn_file_actions_init(&quiet) != 0) return false;
     pid_t pid;

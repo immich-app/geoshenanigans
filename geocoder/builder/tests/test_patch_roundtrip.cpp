@@ -622,6 +622,39 @@ TEST(patch_needs_no_zstd_on_path_unless_built_on_the_zstd_cli) {
 #endif
 }
 
+// The patch's zstd window is the diff's, 8 MiB (PATCH_ZSTD_WINDOW_LOG 23):
+// its frame declares no more, and a build on the zstd command, which holds
+// the window, refuses a frame declaring more (the command's own limit is
+// 128 MiB). A build on libzstd decompresses into the mapped output and holds
+// no window: it applies both.
+TEST(patch_holds_a_zstd_window_no_larger_than_the_diffs) {
+    ScratchDir dir("patch-window");
+    const std::string& root = dir.path();
+    SparsePatch p = diff_way_parents(root);
+    REQUIRE(!p.raw.empty());
+    const std::vector<char> diffs = read_file(root + "/p.gcpatch");
+    REQUIRE(diffs.size() > 5);
+    // Not a single segment (whose window is its content), and a window
+    // descriptor of at most 2^23 bytes.
+    CHECK_EQ(diffs[4] & 0x20, 0);
+    CHECK(static_cast<uint8_t>(diffs[5]) <= (23 - 10) << 3);
+    for (const int window_log : {23, 24}) {
+        const std::string name = "window-" + std::to_string(window_log);
+        REQUIRE(write_file(root + "/" + name + ".gcpatch", zstd_frame(p.raw, window_log)));
+
+        auto r = run_patch(root, name + ".gcpatch", name);
+
+#ifdef GEOCODER_PATCH_ZSTD_CLI
+        const bool refused = window_log > 23;
+#else
+        const bool refused = false;
+#endif
+        CHECK_EQ(r.ok, !refused);
+        if (refused) CHECK(logged(r, "Failed to decompress"));
+        else CHECK(read_file(root + "/" + name + "/way_parents.bin") == bytes_of(new_way_parents()));
+    }
+}
+
 #ifndef GEOCODER_PATCH_ZSTD_CLI
 // A filesystem that flushes late writes (NFS, FUSE) may report a failed one
 // only when the file closes: the decompressed patch is refused then, rather
