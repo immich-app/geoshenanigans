@@ -1226,8 +1226,13 @@ static int run(int argc, char* argv[]) {
             if (n == 0) return NO;
             if (gcs::store().active && __fpending(out.f) + 2 + n * 4 > gcs::Store::SINK_BUF) gflush();
             uint32_t off = (uint32_t)out.written;
-            uint16_t c = (uint16_t)n;
-            fwrite(&c, 2, 1, out.f); fwrite(ids, 4, n, out.f);
+            // One libc call per list: the u16 count goes into the stream's buffer in place.
+            const uint16_t c = (uint16_t)n;
+            char count[2];
+            memcpy(count, &c, 2);
+            putc_unlocked(count[0], out.f);
+            putc_unlocked(count[1], out.f);
+            fwrite(ids, 4, n, out.f);
             out.written += 2 + n * 4;
             return off;
         };
