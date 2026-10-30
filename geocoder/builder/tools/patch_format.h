@@ -505,6 +505,9 @@ constexpr uint32_t CELL_LIST_DELTA_STRIDE = 0xFB;
 //   n_inserted(u32) + [value:u32] x n_inserted,
 //   n_changes(u32) + [(pos:u32, value:u32)] x n_changes (pos ascending)
 constexpr uint32_t PARALLEL_DELTA_STRIDE = 0xFA;
+// The widest record a merge section may give (the patcher sizes a record buffer by it): the
+// widest real record is 36 bytes, and every stride from 0xFA up to here is a section kind.
+static constexpr uint32_t MAX_RECORD_STRIDE = 0xFF;
 struct ParallelDeltaFile { PatchFileId fid, parent; uint32_t value_stride, remap_kind; };
 static constexpr ParallelDeltaFile PARALLEL_DELTA_FILES[] = {
     {PatchFileId::ADDR_POSTCODES, PatchFileId::ADDR_POINTS, 4, 2},
@@ -1211,7 +1214,8 @@ uint64_t stream_cell_index(Cells&& cells, Entries&& entries, AscendingIds added,
         uint32_t nl, ng;
         take(&set_cid, 8); take(&nl, 4); take(&ng, 4);
         if ((set_i > 0 && set_cid <= prev_set) || set_cid == NONE) malformed();
-        if ((delta_size - pos) / 4 < (size_t)nl + ng) malformed();
+        // A list holds at most 0xFFFF ids (its u16 count), so a cell loses or gains at most as many.
+        if (nl > 0xFFFF || ng > 0xFFFF || (delta_size - pos) / 4 < (size_t)nl + ng) malformed();
         lost.resize(nl); gained.resize(ng);
         take(lost.data(), (size_t)nl * 4);
         take(gained.data(), (size_t)ng * 4);

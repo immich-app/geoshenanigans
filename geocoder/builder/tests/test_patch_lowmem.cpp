@@ -1306,6 +1306,99 @@ TEST(patch_refuses_change_counts_and_lengths_that_wrap_32_bits) {
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
+// A merge section whose stride is past any record's (0x100: from 0xFA up,
+// strides name section kinds) is refused in every mode before a record
+// buffer is sized by it: the admin polygons' merge, 24 bytes a record as
+// made. The patch as made applies.
+TEST(patch_refuses_a_record_stride_past_any_records) {
+    ScratchDir dir("patch-stride");
+    std::mt19937 rng(20261030);
+    std::vector<Admin> polys;
+    for (uint32_t i = 0; i < 50; i++) polys.push_back({static_cast<float>(i), block(rng, 3 + i % 5)});
+    std::vector<Admin> fewer = polys;
+    fewer.erase(fewer.begin() + 20);
+    BuildDir old_d, new_d;
+    put_admins(old_d, polys);
+    put_admins(new_d, fewer);
+    const LowMemCase c{dir.path(), "stride"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    std::vector<char> header;
+    append(header, static_cast<uint32_t>(PatchFileId::ADMIN_POLYGONS));
+    append(header, static_cast<uint32_t>(ADMIN_POLYGON_STRIDE));
+    append(header, uint64_t{50 * ADMIN_POLYGON_STRIDE});
+    append(header, uint64_t{49 * ADMIN_POLYGON_STRIDE});
+    const size_t at = find_once(raw, header);
+    REQUIRE(at != std::string::npos);
+    std::vector<char> edited = raw;
+    put_at(edited, at + 4, uint32_t{0x100});
+    const std::string patch = c.dir("wide.gcpatch");
+    REQUIRE(write_patch(c, patch, edited));
+
+    CHECK(not_refused(c, ALL_MODES, patch, "wide", "Malformed record stride: admin_polygons.bin").empty());
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// A cell index delta whose cell loses, or gains, more ids than a list holds
+// (0xFFFF, its u16 count) is refused in every mode before the ids are read:
+// the POI index's first changed cell, with 65,536 ids the cell doesn't hold
+// added to the ids it loses (the replay took them, dropping none) or with as
+// many new ones added to those it gains. The patch as made applies.
+TEST(patch_refuses_a_cell_losing_or_gaining_more_ids_than_a_list_holds) {
+    ScratchDir dir("patch-cell-ids");
+    std::mt19937 rng(20261030);
+    CellLists old_cells, new_cells;
+    for (uint32_t k = 0; k < 20; k++) {
+        old_cells[cell_id(k)] = {k % 7};
+        new_cells[cell_id(k)] = {k % 7 + 1};
+    }
+    const auto pois = pois_of(rng, 40, 0, true);
+    BuildDir old_d, new_d;
+    put_pois(old_d, pois);
+    put_pois(new_d, pois);
+    put_poi_cells(old_d, old_cells);
+    put_poi_cells(new_d, new_cells);
+    const LowMemCase c{dir.path(), "cell-ids"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    std::vector<char> head;
+    append(head, CELL_INDEX_DELTA_MARKER);
+    append(head, static_cast<uint32_t>(PatchFileId::POI_ENTRIES));
+    const size_t at = find_once(raw, head);
+    REQUIRE(at != std::string::npos);
+    // marker, file id, payload size; the payload: n_removed, removed cells,
+    // n_set, then the first cell: id, n_lost, n_gained, lost ids, gained ids.
+    uint32_t n_removed, n_lost;
+    memcpy(&n_removed, raw.data() + at + 16, 4);
+    const size_t first = at + 24 + 8 * size_t{n_removed};
+    uint32_t n_gained;
+    memcpy(&n_lost, raw.data() + first + 8, 4);
+    memcpy(&n_gained, raw.data() + first + 12, 4);
+    REQUIRE(n_lost == 1 && n_gained == 1);
+    for (const bool gained : {false, true}) {
+        const std::string name = gained ? "gained" : "lost";
+        std::vector<char> ids;
+        for (uint32_t k = 0; k < 0x10000; k++) append(ids, 0x40000000u + k);
+        std::vector<char> edited = raw;
+        uint64_t payload;
+        uint32_t count;
+        memcpy(&payload, edited.data() + at + 8, 8);
+        put_at(edited, at + 8, payload + ids.size());
+        const size_t count_at = first + (gained ? 12 : 8);
+        memcpy(&count, edited.data() + count_at, 4);
+        put_at(edited, count_at, count + 0x10000);
+        // After the cell's ids it loses (one), or those it gains too (one).
+        edited.insert(edited.begin() + static_cast<std::ptrdiff_t>(first + 16 + 4 + (gained ? 4 : 0)), ids.begin(), ids.end());
+        const std::string patch = c.dir(name + ".gcpatch");
+        REQUIRE(write_patch(c, patch, edited));
+
+        CHECK(not_refused(c, ALL_MODES, patch, name, "Malformed cell list delta").empty());
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
 // Cell changes out of order (two ids of one list swapped: the geo index's
 // added or removed cells, the POI index's), and a geo entry delta or a cell
 // index delta for a file that has one already or for a file not of its kind,

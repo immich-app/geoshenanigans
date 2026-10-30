@@ -387,9 +387,11 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   stride=0xFB: cell list delta for <name>_cells.bin + <name>_entries.bin
     (payload_size u64, new entries size u64, n_removed u32 + [cell u64],
     n_set u32 + [cell u64, n_lost u32, n_gained u32, lost ids, gained ids];
-    both cell lists ascending)
-  otherwise: n_runs (u32) + n_values (u32) + runs_size (u32) + values_size (u32)
-    + runs + values + seq_size (u64) + merge ops
+    both cell lists ascending; n_lost and n_gained at most 0xFFFF, a list's
+    most ids)
+  otherwise (a record stride, at most 0xFF, MAX_RECORD_STRIDE): n_runs (u32)
+    + n_values (u32) + runs_size (u32) + values_size (u32) + runs + values
+    + seq_size (u64) + merge ops
   Ops: MATCH(count:u32) | INSERT(count:u32, data) | DELETE(count:u32)
     | REPLACE(count:u32, data) (v8: the same entities with new bytes, written
     like an INSERT, mapped old → new like a MATCH)

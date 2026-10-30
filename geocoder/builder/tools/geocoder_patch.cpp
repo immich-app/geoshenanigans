@@ -898,6 +898,8 @@ static int run(int argc, char* argv[]) {
             continue;
         }
 
+        // The record buffer below is sized by it.
+        if (stride > MAX_RECORD_STRIDE) throw std::runtime_error(std::string("Malformed record stride: ") + fname);
         size_t actual_stride = stride;
 
         // Records with string offset fields are rewritten one at a time.

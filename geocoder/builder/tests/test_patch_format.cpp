@@ -188,7 +188,8 @@ TEST(patch_format_stride_sentinel_values) {
 TEST(patch_format_stride_sentinels_no_collision_with_real_strides) {
     // Real per-record strides used across the format (the record files, the
     // *_cells and entry lists). None may equal a sentinel, else a genuine
-    // record stride would be misread as a sparse/copy/cell list section.
+    // record stride would be misread as a sparse/copy/cell list section, and
+    // none passes the widest stride the patcher takes.
     const uint32_t real_strides[] = {
         1,   // vertex byte streams
         2,   // entry count prefix (u16)
@@ -205,6 +206,7 @@ TEST(patch_format_stride_sentinels_no_collision_with_real_strides) {
         CHECK(s != SPARSE_DELTA_STRIDE);
         CHECK(s != COPY_OLD_STRIDE);
         CHECK(s != CELL_LIST_DELTA_STRIDE);
+        CHECK(s <= MAX_RECORD_STRIDE);
     }
 }
 
