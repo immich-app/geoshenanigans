@@ -914,6 +914,25 @@ TEST(patch_format_scratch_table_refuses_a_dir_it_cannot_write) {
     CHECK_EQ(refusal_of([&] { none.finish(); }), std::string("No scratch dir for scratch table"));
 }
 
+// A filesystem that flushes late writes (NFS, FUSE) may report a failed one
+// only when the file closes: the table is refused rather than read back.
+TEST(patch_format_scratch_table_refuses_a_file_it_cannot_close) {
+    ScratchDir dir("scratch-table");
+    ScratchTable<RemapPair> sut(dir.path(), "test pairs");
+    for (uint32_t i = 0; i <= 3 * SCRATCH_TABLE_BUF / sizeof(RemapPair); i++) sut.append({2 * i, i});
+    scratch_table_close() = [](int fd) {
+        ::close(fd);
+        errno = EIO;
+        return -1;
+    };
+
+    const std::string refusal = refusal_of([&] { sut.finish(); });
+    scratch_table_close() = ::close;
+
+    CHECK_EQ(refusal, "Cannot write test pairs to " + dir.path() + ": Input/output error");
+    CHECK(sut.table().empty());
+}
+
 // A parent-id remap after its marker: the admin, street and reserved postcode
 // legs, each a count and its pairs.
 static std::vector<char> parent_id_remap_bytes(const std::vector<RemapPair>& admin, const std::vector<RemapPair>& street,
