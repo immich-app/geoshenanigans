@@ -689,7 +689,22 @@ inline bool is_client_file(const std::string& name) {
 
 inline bool is_inline_client_file(const std::string& name) { return !has_suffix(name, ".bin"); }
 
+// Appends the section for files, a list parse_client_files takes back: it refuses, in
+// parse_client_files' words and before appending a byte, more than MAX_CLIENT_FILES files, a name
+// longer than MAX_CLIENT_FILE_NAME bytes or not a client file's, a name out of order or listed
+// twice, and an inline file larger than MAX_INLINE_CLIENT_FILE_BYTES. A diff never writes a patch
+// the patcher would refuse.
 inline void append_client_files(std::vector<char>& out, const std::vector<ClientFile>& files) {
+    if (files.size() > MAX_CLIENT_FILES) throw std::runtime_error("Too many client files: " + std::to_string(files.size()));
+    for (size_t i = 0; i < files.size(); i++) {
+        const ClientFile& f = files[i];
+        if (f.name.size() > MAX_CLIENT_FILE_NAME)
+            throw std::runtime_error("Client file name too long: " + std::to_string(f.name.size()) + " bytes");
+        if (!is_client_file(f.name)) throw std::runtime_error("Bad client file name: " + f.name);
+        if (i > 0 && !(files[i - 1].name < f.name)) throw std::runtime_error("Client file listed out of order or twice: " + f.name);
+        if (is_inline_client_file(f.name) && f.size > MAX_INLINE_CLIENT_FILE_BYTES)
+            throw std::runtime_error("Inline client file too large: " + f.name);
+    }
     auto put = [&](const void* p, size_t n) { out.insert(out.end(), (const char*)p, (const char*)p + n); };
     uint32_t marker = CLIENT_FILES_MARKER, n = static_cast<uint32_t>(files.size());
     put(&marker, 4); put(&n, 4);

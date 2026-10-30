@@ -333,10 +333,10 @@ Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
   + n × {name_len:u16, name, size:u64, inline:u8, [bytes] if inline}
   Every file the new variant dir holds except *.osm_ids, *.gcpatch, *.zst and
   dotfiles, sorted by name, each once: at most 1024 files (MAX_CLIENT_FILES)
-  of names at most 255 bytes long. JSON files (strings_layout.json,
-  poi_meta.json) are inline and written verbatim. The patcher builds
-  anything not listed in its scratch dir, and every listed file must exist at
-  its listed size.
+  of names at most 255 bytes long; the diff refuses a new dir it cannot list
+  so. JSON files (strings_layout.json, poi_meta.json) are inline and written
+  verbatim. The patcher builds anything not listed in its scratch dir, and
+  every listed file must exist at its listed size.
 
 Old file sizes: n (u32) + n × {file_id:u32, old_size:u64}
   (the old files no section names, UNSECTIONED_OLD_FILES: the entry
