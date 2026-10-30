@@ -23,13 +23,22 @@
 // How far ahead of the decoder the decompressed patch's storage is reserved.
 static constexpr size_t PATCH_RESERVE_STEP = 1 << 20;
 
+// How the decompressed patch's file closes: close(), or a test's stand-in that
+// fails as a filesystem that flushes late writes (NFS, FUSE) may.
+inline int (*&decompressed_patch_close())(int) {
+    static int (*f)(int) = ::close;
+    return f;
+}
+
 // The patch, decompressed block by block straight into a mapped file: the decoder's history is the
 // output itself, so no window buffer (the zstd CLI holds the 8 MiB window in anonymous memory).
 // Each block's dst capacity ends where posix_fallocate has reserved storage, so a full TMPDIR is
 // an error here, never a SIGBUS from a mapped page with nothing behind it. Only the mapping spans
 // the bound: a frame without a content size bounds every block at 128 KiB, which puts the
 // 2026-10-13 patches' bounds at 4.9x to 19x their size. A bound past size_t (a 32-bit build's) is
-// refused: narrowed, the mapping would end before the capacities handed to the decoder.
+// refused: narrowed, the mapping would end before the capacities handed to the decoder. A file
+// that fails to close is refused too: a filesystem that flushes late may report a failed write
+// only then.
 inline bool decompress_to_file(const std::string& src, const std::string& dst) {
     MappedFile in = mmap_file(src);
     if (!in.data) return false;
@@ -66,7 +75,10 @@ inline bool decompress_to_file(const std::string& src, const std::string& dst) {
     munmap(out, (size_t)bound);
     unmap_file(in);
     ok = ok && ftruncate(fd, (off_t)n) == 0;
-    close(fd);
+    if (decompressed_patch_close()(fd) != 0) {
+        std::cerr << "Cannot close " << dst << ": " << strerror(errno) << std::endl;
+        ok = false;
+    }
     return ok;
 }
 #else

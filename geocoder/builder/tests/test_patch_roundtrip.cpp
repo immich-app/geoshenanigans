@@ -3,6 +3,7 @@
 // new one file by file. Then patch files the patcher must take as named or
 // refuse: a patch is untrusted input.
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -13,6 +14,7 @@
 #include <vector>
 
 #include "merge_sequence.h"
+#include "patch_decompress.h"
 #include "patch_format.h"
 #include "scratch_dir.h"
 #include "test_framework.h"
@@ -419,6 +421,21 @@ std::vector<char> match_delete_match(uint32_t kept, uint32_t gone, uint32_t rest
     return runs;
 }
 
+// raw in one zstd frame of raw blocks whose header declares a window of
+// 2^window_log bytes and no content size, as a compressor of a stream writes
+// one (the diff's zstd reads the patch from a pipe).
+std::vector<char> zstd_frame(const std::vector<char>& raw, int window_log) {
+    std::vector<char> frame = {'\x28', '\xb5', '\x2f', '\xfd', 0, static_cast<char>((window_log - 10) << 3)};
+    constexpr size_t BLOCK = 128 << 10;
+    for (size_t at = 0; at < raw.size(); at += BLOCK) {
+        const size_t n = std::min(BLOCK, raw.size() - at);
+        // Last_Block, then Block_Type 0 (raw), then Block_Size.
+        const uint32_t head = static_cast<uint32_t>(n << 3) | (at + n == raw.size() ? 1u : 0u);
+        for (int k = 0; k < 3; k++) frame.push_back(static_cast<char>(head >> (8 * k)));
+        frame.insert(frame.end(), raw.begin() + static_cast<std::ptrdiff_t>(at), raw.begin() + static_cast<std::ptrdiff_t>(at + n));
+    }
+    return frame;
+}
 }  // namespace
 
 TEST(patch_round_trip_keeps_the_street_ids_of_unchanged_street_ways) {
@@ -604,6 +621,31 @@ TEST(patch_needs_no_zstd_on_path_unless_built_on_the_zstd_cli) {
     CHECK(read_file(root + "/out/way_parents.bin") == bytes_of(new_way_parents()));
 #endif
 }
+
+#ifndef GEOCODER_PATCH_ZSTD_CLI
+// A filesystem that flushes late writes (NFS, FUSE) may report a failed one
+// only when the file closes: the decompressed patch is refused then, rather
+// than mapped and read back. The frame decompresses with a close that works.
+TEST(patch_decompression_refuses_a_patch_file_that_fails_to_close) {
+    ScratchDir dir("patch-close");
+    const std::string& root = dir.path();
+    std::vector<char> raw(300 << 10);
+    for (size_t i = 0; i < raw.size(); i++) raw[i] = static_cast<char>(i * 7);
+    REQUIRE(write_file(root + "/p.gcpatch", zstd_frame(raw, 23)));
+    decompressed_patch_close() = [](int fd) {
+        ::close(fd);
+        errno = EIO;
+        return -1;
+    };
+
+    const bool closed = decompress_to_file(root + "/p.gcpatch", root + "/failing.raw");
+    decompressed_patch_close() = ::close;
+
+    CHECK(!closed);
+    CHECK(decompress_to_file(root + "/p.gcpatch", root + "/p.raw"));
+    CHECK(read_file(root + "/p.raw") == raw);
+}
+#endif
 
 // A patch shorter than its 8-byte magic is refused as truncated: the magic
 // is read through the bounds check like every later field.
