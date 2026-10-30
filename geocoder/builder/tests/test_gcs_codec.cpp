@@ -266,16 +266,16 @@ uint32_t f32_bits(float f) {
 }
 
 // A synthetic address set: addr_points.bin records (28 bytes, the vertex
-// offset and count last) and their footprints (a 10-byte header: encoding, a
-// zero pad byte, then the base latitude and longitude bits; then vc vertices,
-// 8 random bytes each at encoding 3, else two u16 below span; a closed ring
-// repeats its first vertex last). sizes: each record's footprint bytes (0:
-// none).
+// offset and count last) and their footprints (a 10-byte header: encoding, pad
+// byte, then the base latitude and longitude bits; then vc vertices, 8 random
+// bytes each at encoding 3, else two u16 below span; a closed ring repeats its
+// first vertex last). sizes: each record's footprint bytes (0: none).
 struct AddrSpec {
     uint32_t vc;
     uint8_t enc;
     bool closed;
     uint32_t span;
+    uint8_t pad = 0;
 };
 struct AddrSet {
     std::vector<uint8_t> points, verts;
@@ -290,7 +290,7 @@ AddrSet addr_set(const std::vector<AddrSpec>& specs, std::mt19937& rng) {
         if (sp.vc) {
             rec[5] = uint32_t(first);
             rec[6] = sp.vc;
-            uint8_t h[10] = {sp.enc, 0};
+            uint8_t h[10] = {sp.enc, sp.pad};
             wr32(h + 2, f32_bits(float(rng() % 1800000) / 1e4f - 90.f));
             wr32(h + 6, f32_bits(float(rng() % 3600000) / 1e4f - 180.f));
             s.verts.insert(s.verts.end(), h, h + 10);
@@ -652,6 +652,75 @@ TEST(gcs_addr_footprints_past_the_abs2_bound_round_trip) {
     CHECK(out[1] == s.verts);
     // The files geocoder-gc encodes from the same today's files, byte for byte.
     CHECK(gc_encodes_the_same(s, dir.path()));
+}
+
+TEST(gcs_addr_codecs_copy_an_escaped_footprint_through_in_pieces) {
+    // An escaped footprint (encoding 3) of 80K and of 800K vertices, 640 KB
+    // and 6.4 MB, among small abs2 ones and a small one escaped for its pad
+    // byte, each file in one write (as the patcher's FILE passes a long
+    // stretch) and read back as the patcher reads them (a record, then its
+    // footprint in 64 KiB views): at both sizes the encoder's and the
+    // decoder's queues and the decoder's footprint reader hold at most
+    // 512 KiB, the files decode back to the same bytes, and geocoder-gc
+    // encodes the same files.
+    const size_t most = size_t(512) << 10;
+    std::mt19937 rng(20261030);
+    for (const uint32_t big : {80000u, 800000u}) {
+        const AddrSet s = addr_set({{5, 1, true, 200}, {big, 3, false, 0}, {0, 0, false, 0}, {12, 2, false, 65536, 7}, {9, 0, true, 256 - 1}}, rng);
+        ScratchDir dir("gcs-test");
+        addr::Enc enc(dir.path(), s.points.size());
+        enc.state = {1, 1};
+        enc.expect = {s.points.size(), s.verts.size()};
+        enc.write(0, s.points.data(), s.points.size());
+        enc.write(1, s.verts.data(), s.verts.size());
+        const size_t encoder_peak = std::max(enc.peak(0), enc.peak(1));
+        const Manifest m = finish_all(enc);
+
+        addr::Dec dec(dir.path(), m);
+        for (auto& st : dec.state) st = 1;
+        std::vector<uint8_t> points, verts;
+        std::vector<char> view(size_t(64) << 10);
+        auto read = [&](int port, size_t n, std::vector<uint8_t>& out) {
+            while (n) {
+                const size_t k = dec.read(port, view.data(), std::min(n, view.size()));
+                if (!k) return false;
+                out.insert(out.end(), view.data(), view.data() + k);
+                n -= k;
+            }
+            return true;
+        };
+        bool whole = true;
+        for (const size_t size : s.sizes) whole &= read(0, 28, points) && read(1, size, verts);
+        const size_t decoder_peak = std::max(dec.peak(0), dec.peak(1)), reader = dec.A->buf.size();
+        std::printf("    %u vertices: encoder queue peak %zu B, decoder queue peak %zu B, footprint reader %zu B\n", big, encoder_peak,
+                    decoder_peak, reader);
+
+        CHECK(encoder_peak <= most);
+        CHECK(decoder_peak <= most);
+        CHECK(reader <= most);
+        CHECK(whole);
+        CHECK(dec.read(0, view.data(), 1) == 0);
+        CHECK(points == s.points);
+        CHECK(verts == s.verts);
+        CHECK(gc_encodes_the_same(s, dir.path()));
+    }
+}
+
+TEST(gcs_addr_encoder_refuses_a_stream_ending_inside_an_escaped_footprint) {
+    // The encoder copies an escaped footprint through as it comes, its record
+    // already encoded: a stream that ends inside it is refused at the finish,
+    // not taken as a shorter file. It follows the largest abs2 footprint,
+    // whose wait grows the queue past what it keeps once drained, so the
+    // finish pumps an empty queue without a buffer.
+    std::mt19937 rng(20261030);
+    const AddrSet s = addr_set({{69999, 0, false, 65536}, {3, 3, false, 0}}, rng);
+    ScratchDir dir("gcs-test");
+    addr::Enc enc(dir.path(), s.points.size());
+    enc.state = {1, 1};
+    enc.write(0, s.points.data(), s.points.size());
+    enc.write(1, s.verts.data(), s.verts.size() - 1);
+
+    CHECK(throws_runtime([&] { finish_all(enc); }, "stream ends inside a footprint"));
 }
 
 TEST(gcs_addr_decoder_rejects_a_footprint_count_past_its_record) {

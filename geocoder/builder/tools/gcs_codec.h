@@ -5,11 +5,11 @@
 //   Encoder: consumes today's-format bytes as the patcher writes them, one queue per today's file,
 //            and processes every unit whose bytes are all there (pump()).
 // Nothing is held beyond the buffers, the unit in flight and the queues' skew. A unit held whole is
-// bounded by the format (a way <= 65535 nodes), by the source (an address footprint, as large as
-// the builder made it: abs2 holds up to 69999 vertices, a larger one is escaped raw) or, for a
-// polygon block, by big_block() (256 KiB): larger admin and POI blocks go plane by plane through
-// positional readers / writers (a POI encoder lays the planes out for a closed ring and moves them
-// in the file when the last vertex shows the ring is open).
+// bounded by the format (a way <= 65535 nodes, an abs2 address footprint <= 69999 vertices; a
+// footprint escaped raw, of any size, is copied through in pieces) or, for a polygon block, by
+// big_block() (256 KiB): larger admin and POI blocks go plane by plane through positional
+// readers / writers (a POI encoder lays the planes out for a closed ring and moves them in the
+// file when the last vertex shows the ring is open).
 #pragma once
 #include <cmath>
 #include <memory>
@@ -936,9 +936,11 @@ static inline uint64_t col_region(int k, uint64_t N) {
 }
 static inline size_t region_buf(int k) { return (k >= 8 && k <= 10) ? size_t(32) << 10 : size_t(PLANE_BUF); }
 
-// Ports: 0 = addr_points, 1 = addr_vertices. A step: one record and its footprint.
+// Ports: 0 = addr_points, 1 = addr_vertices. A step: one record and its footprint, or a piece of an
+// escaped footprint (copied through in READ_BUF pieces, so neither the reader nor a queue holds it).
 struct Dec : Decoder {
     uint64_t N, i = 0, raw = 0;
+    uint64_t escaped_left = 0;  // bytes of the escaped footprint in progress still to emit
     std::vector<std::unique_ptr<Reader>> rg;
     std::unique_ptr<Reader> A;
     Dec(const std::string& src, const Manifest& m) : Decoder("addr", 2) {
@@ -949,7 +951,16 @@ struct Dec : Decoder {
         A.reset(new Reader(src + "/addr_vertices.abs2"));
     }
     uint64_t decoded_size(int port) const override { return port == 0 ? 28 * N : ~0ull; }
+    void emit_escaped_piece() {
+        const size_t k = size_t(std::min<uint64_t>(escaped_left, READ_BUF));
+        emit(1, A->take(k), k);
+        escaped_left -= k;
+    }
     bool step() override {
+        if (escaped_left) {
+            emit_escaped_piece();
+            return true;
+        }
         if (i == N) {
             if (!A->eof()) die("addr_vertices.abs2 not fully consumed");
             return false;
@@ -978,9 +989,10 @@ struct Dec : Decoder {
             const size_t size = A->unit_size(10, vcnt, enc == 3 ? 8 : 4);
             rec[6] = uint32_t(vcnt);
             emit(0, rec, 28);
-            emit(1, A->take(size), size);
             raw += size;
             i++;
+            escaped_left = size;
+            emit_escaped_piece();
             return true;
         }
         const int enc = tag & 3, wide = (tag >> 2) & 1, small = (tag >> 3) & 1, closed = (tag >> 4) & 1;
@@ -1027,10 +1039,13 @@ struct Dec : Decoder {
     }
 };
 
-// Ports: 0 = addr_points, 1 = addr_vertices; a record is encoded once its footprint is all in.
+// Ports: 0 = addr_points, 1 = addr_vertices; a record is encoded once its footprint is all in, or,
+// when its footprint is escaped (which its first two bytes and vertex_count decide), once those are,
+// the footprint then copied through as it comes.
 // N (for addr_points.col's regions) comes from the expected size of addr_points.bin.
 struct Enc : Encoder {
     uint64_t N = 0, i = 0, vexp = 0;
+    uint64_t escaped_left = 0;  // bytes of the escaped footprint in progress still to copy
     int fd = -1;
     std::vector<std::unique_ptr<Writer>> w;
     std::unique_ptr<Writer> A;
@@ -1050,16 +1065,28 @@ struct Enc : Encoder {
     void put_po(uint32_t v) { for (int b = 0; b < 4; b++) w[size_t(11 + b)]->u8(uint8_t(v >> (8 * b))); }
     void pump() override {
         ByteQueue &P = in[0], &V = in[1];
-        while (P.size() >= 28) {
+        for (;;) {
+            if (escaped_left) {
+                if (!V.size()) return;
+                const size_t k = size_t(std::min<uint64_t>(escaped_left, V.size()));
+                A->put(V.data(), k);
+                V.pop(k);
+                escaped_left -= k;
+                if (escaped_left) return;
+            }
+            if (P.size() < 28) return;
             const uint8_t* r = P.data();
             const uint32_t lat = rd32(r), lng = rd32(r + 4), voff = rd32(r + 20), vcnt = rd32(r + 24);
             size_t size = 0;
+            bool escaped = false;
             if (vcnt) {
                 if (V.size() < 1) return;
                 const uint8_t enc = V.data()[0];
                 if (enc > 3) die("addr_vertices: unknown encoding %u", enc);
                 size = unit_size(1, 10, vcnt, enc == 3 ? 8 : 4);
-                if (V.size() < size) return;
+                if (V.size() < 2) return;
+                escaped = enc == 3 || V.data()[1] != 0 || vcnt > ABS2_MAX_VERTICES;
+                if (!escaped && V.size() < size) return;
             }
             if (i >= N) die("addr: more records than addr_points.bin's size gives");
             for (int b = 0; b < 4; b++) w[size_t(b)]->u8(uint8_t(lat >> (8 * b)));
@@ -1081,10 +1108,10 @@ struct Enc : Encoder {
             const uint8_t* b = V.data();
             const uint8_t enc = b[0];
             vexp += size;
-            if (enc == 3 || b[1] != 0 || vcnt > ABS2_MAX_VERTICES) {
+            if (escaped) {
                 A->u8(0x20);
                 A->uv(vcnt);
-                A->put(b, size);
+                escaped_left = size;
             } else {
                 const uint32_t bl = rd32(b + 2), bg = rd32(b + 6);
                 int64_t sl = 0, sg = 0;
@@ -1117,14 +1144,15 @@ struct Enc : Encoder {
                         if (wide) A->u16(q);
                         else A->u8(uint8_t(q));
                     }
+                V.pop(size);
             }
-            V.pop(size);
             P.pop(28);
             i++;
         }
     }
     void finish(Manifest& m) override {
         require_empty();
+        if (escaped_left) die("addr_vertices: stream ends inside a footprint");
         if (i != N) die("addr: %llu records, addr_points.bin's size gives %llu", (unsigned long long)i, (unsigned long long)N);
         for (auto& x : w) x->finish();
         w.clear();
