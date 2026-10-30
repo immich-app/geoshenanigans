@@ -467,7 +467,7 @@ static int run(int argc, char* argv[]) {
     }
     gcs::store().plan_outputs();
     for (const auto& f : client_files)
-        if (is_inline_client_file(f.name) && !write_file(out_dir + "/" + f.name, f.bytes))
+        if (is_inline_client_file(f.name) && !write_file(out_dir + "/" + f.name, f.bytes, f.size))
             throw std::runtime_error("Cannot write " + f.name);
     auto out_path = [&](const std::string& name) {
         return (listed.count(name) ? out_dir : tmpdir) + "/" + name;

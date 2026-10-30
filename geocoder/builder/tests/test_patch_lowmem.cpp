@@ -1399,6 +1399,82 @@ TEST(patch_refuses_a_cell_losing_or_gaining_more_ids_than_a_list_holds) {
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
+// A client file list of more files than a variant holds (1025, past
+// MAX_CLIENT_FILES), with a name longer than a file's (256 bytes), or with
+// a file listed twice, is refused in every mode before the patcher writes
+// anything: the files added are empty .bin files sorted after the others,
+// which the patcher made as listed. The patch as made applies.
+TEST(patch_refuses_too_many_client_files_a_long_name_or_one_listed_twice) {
+    ScratchDir dir("patch-client-files");
+    std::vector<char> parents, changed;
+    for (uint32_t v = 0; v < 4096; v++) {
+        append(parents, v);
+        append(changed, v + (v == 2000));
+    }
+    const LowMemCase c{dir.path(), "client-files"};
+    REQUIRE(prepare(c, {{"way_parents.bin", parents}, {"meta.json", {'{', '}'}}},
+                    {{"way_parents.bin", changed}, {"meta.json", {'{', ' ', '}'}}}).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    // After the header (magic, version, flags): marker, n, then each entry
+    // (name length, name, size, inline flag, an inline file's bytes).
+    uint32_t marker, n;
+    memcpy(&marker, raw.data() + 16, 4);
+    memcpy(&n, raw.data() + 20, 4);
+    REQUIRE(marker == CLIENT_FILES_MARKER);
+    std::vector<size_t> entry_at = {24};
+    for (uint32_t i = 0; i < n; i++) {
+        const size_t e = entry_at.back();
+        uint16_t len;
+        uint64_t size;
+        memcpy(&len, raw.data() + e, 2);
+        memcpy(&size, raw.data() + e + 2 + len, 8);
+        entry_at.push_back(e + 2 + len + 9 + (raw[e + 2 + len + 8] ? size : 0));
+    }
+    // An empty .bin file's entry.
+    auto empty_bin = [](const std::string& name) {
+        std::vector<char> e;
+        append(e, static_cast<uint16_t>(name.size()));
+        e.insert(e.end(), name.begin(), name.end());
+        append(e, uint64_t{0});
+        append(e, uint8_t{0});
+        return e;
+    };
+    // The list with `more` entries inserted at entry i.
+    auto with = [&](size_t i, const std::vector<char>& more, uint32_t added) {
+        std::vector<char> p = raw;
+        put_at(p, 20, n + added);
+        p.insert(p.begin() + static_cast<std::ptrdiff_t>(entry_at[i]), more.begin(), more.end());
+        return p;
+    };
+    std::vector<char> many;
+    for (uint32_t i = n; i < 1025; i++) {
+        char name[16];
+        std::snprintf(name, sizeof name, "zz%04u.bin", i);
+        const std::vector<char> e = empty_bin(name);
+        many.insert(many.end(), e.begin(), e.end());
+    }
+    const std::vector<char> first(raw.begin() + static_cast<std::ptrdiff_t>(entry_at[0]),
+                                  raw.begin() + static_cast<std::ptrdiff_t>(entry_at[1]));
+    struct Case {
+        std::string name;
+        std::vector<char> patch;
+        std::string refusal;
+    };
+    const Case cases[] = {
+        {"many", with(n, many, 1025 - n), "Too many client files: 1025"},
+        {"long-name", with(n, empty_bin(std::string(252, 'z') + ".bin"), 1), "Client file name too long: 256 bytes"},
+        {"twice", with(1, first, 1), "Client file listed out of order or twice: meta.json"},
+    };
+    for (const Case& e : cases) {
+        const std::string patch = c.dir(e.name + ".gcpatch");
+        REQUIRE(write_patch(c, patch, e.patch));
+
+        CHECK(not_refused(c, ALL_MODES, patch, e.name, e.refusal).empty());
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
 // Cell changes out of order (two ids of one list swapped: the geo index's
 // added or removed cells, the POI index's), and a geo entry delta or a cell
 // index delta for a file that has one already or for a file not of its kind,

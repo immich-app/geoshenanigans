@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -314,12 +315,17 @@ TEST(patch_format_client_file_names) {
     }
 }
 
+static const char SAMPLE_LAYOUT[] = "{ }\n";
+
+// Sorted by name, as the diff lists them.
 static std::vector<ClientFile> sample_client_files() {
-    ClientFile layout{"strings_layout.json", 4, {'{', ' ', '}', '\n'}};
-    ClientFile ways{"street_ways.bin", 12345678901ull, {}};
-    return {layout, ways};
+    ClientFile ways{"street_ways.bin", 12345678901ull, nullptr};
+    ClientFile layout{"strings_layout.json", 4, SAMPLE_LAYOUT};
+    return {ways, layout};
 }
 
+// An inline file's bytes are read where they sit: the layout's are the
+// section's last four.
 TEST(patch_format_client_files_round_trip) {
     std::vector<char> buf = {'x'};  // the section is read by position
     append_client_files(buf, sample_client_files());
@@ -327,24 +333,25 @@ TEST(patch_format_client_files_round_trip) {
     auto got = parse_client_files(buf.data(), buf.size(), pos);
     CHECK_EQ(pos, buf.size());
     REQUIRE(got.size() == 2);
-    CHECK(got[0].name == "strings_layout.json");
-    CHECK_EQ(got[0].size, uint64_t(4));
-    CHECK(got[0].bytes == std::vector<char>({'{', ' ', '}', '\n'}));
-    CHECK(got[1].name == "street_ways.bin");
-    CHECK_EQ(got[1].size, uint64_t(12345678901ull));
-    CHECK(got[1].bytes.empty());
+    CHECK(got[0].name == "street_ways.bin");
+    CHECK_EQ(got[0].size, uint64_t(12345678901ull));
+    CHECK(got[0].bytes == nullptr);
+    CHECK(got[1].name == "strings_layout.json");
+    CHECK_EQ(got[1].size, uint64_t(4));
+    CHECK(got[1].bytes == buf.data() + buf.size() - 4);
+    CHECK(std::string(got[1].bytes, 4) == SAMPLE_LAYOUT);
 }
 
 TEST(patch_format_client_files_round_trip_an_empty_inline_file) {
     std::vector<char> buf;
-    append_client_files(buf, {ClientFile{"poi_meta.json", 0, {}}});
+    append_client_files(buf, {ClientFile{"poi_meta.json", 0, nullptr}});
     size_t pos = 0;
     auto got = parse_client_files(buf.data(), buf.size(), pos);
     CHECK_EQ(pos, buf.size());
     REQUIRE(got.size() == 1);
     CHECK(got[0].name == "poi_meta.json");
     CHECK_EQ(got[0].size, uint64_t(0));
-    CHECK(got[0].bytes.empty());
+    CHECK(got[0].bytes == buf.data() + buf.size());
 }
 
 // What parse_client_files refused buf with, or "".
@@ -363,10 +370,36 @@ TEST(patch_format_client_files_rejects_missing_truncated_and_bad_names) {
     CHECK_EQ(client_files_refusal(std::vector<char>(good.begin(), good.end() - 1)), std::string("Truncated client file list"));
 
     std::vector<char> escape;
-    append_client_files(escape, {ClientFile{"x.bin", 0, {}}});
+    append_client_files(escape, {ClientFile{"x.bin", 0, nullptr}});
     const size_t name_at = 4 + 4 + 2;  // marker, n, name_len
     escape[name_at] = '/';
     CHECK_EQ(client_files_refusal(escape), std::string("Bad client file name: /.bin"));
+}
+
+// A list names at most 1024 files (MAX_CLIENT_FILES), each name at most 255
+// bytes long (a file name's), sorted and each once: the patcher keeps every
+// name, so a list may not make it hold more.
+TEST(patch_format_client_files_refuse_too_many_a_long_name_or_one_out_of_order) {
+    auto list_of = [](const std::vector<std::string>& names) {
+        std::vector<ClientFile> files;
+        for (const std::string& name : names) files.push_back(ClientFile{name, 0, {}});
+        std::vector<char> buf;
+        append_client_files(buf, files);
+        return buf;
+    };
+    std::vector<std::string> names;
+    for (int i = 0; i < 1025; i++) {
+        char name[16];
+        std::snprintf(name, sizeof name, "f%04d.bin", i);
+        names.push_back(name);
+    }
+    const std::string longest = std::string(251, 'a') + ".bin";
+    CHECK_EQ(client_files_refusal(list_of({names.begin(), names.begin() + 1024})), std::string());
+    CHECK_EQ(client_files_refusal(list_of(names)), std::string("Too many client files: 1025"));
+    CHECK_EQ(client_files_refusal(list_of({longest})), std::string());
+    CHECK_EQ(client_files_refusal(list_of({"a" + longest})), std::string("Client file name too long: 256 bytes"));
+    CHECK_EQ(client_files_refusal(list_of({"b.bin", "a.bin"})), std::string("Client file listed out of order or twice: a.bin"));
+    CHECK_EQ(client_files_refusal(list_of({"a.bin", "a.bin"})), std::string("Client file listed out of order or twice: a.bin"));
 }
 
 // --- content_hash ---
