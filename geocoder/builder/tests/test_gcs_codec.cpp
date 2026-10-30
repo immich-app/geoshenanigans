@@ -706,6 +706,37 @@ TEST(gcs_addr_codecs_copy_an_escaped_footprint_through_in_pieces) {
     }
 }
 
+TEST(gcs_addr_encoder_holds_at_most_a_piece_and_the_largest_abs2_footprint) {
+    // addr_vertices.bin in one write (as the patcher's FILE passes an INSERT
+    // stretch), which the encoder takes a piece (64 KiB) at a time: its queue
+    // peaks at no more than a piece and the largest footprint it takes whole,
+    // an abs2 one of ABS2_MAX_VERTICES vertices (10 + 4 x 69,999 =
+    // 280,006 B), and the files are geocoder-gc's. The case comes within 2
+    // bytes of that: 47,676 B of footprints before the largest put its last
+    // 2 bytes at the start of a piece, so the queue holds the rest of it and
+    // then that whole piece (another of the largest follows), 64 KiB +
+    // 280,004 B, past the 320 KiB an admin or POI encoder may hold.
+    const size_t largest = 10 + 4 * size_t(addr::ABS2_MAX_VERTICES);
+    std::mt19937 rng(20261030);
+    const AddrSet s = addr_set({{5000, 1, false, 65536},
+                                {6914, 2, true, 200},
+                                {addr::ABS2_MAX_VERTICES, 0, false, 65536},
+                                {0, 0, false, 0},
+                                {addr::ABS2_MAX_VERTICES, 1, true, 256 - 1}},
+                               rng);
+    REQUIRE(s.sizes[0] + s.sizes[1] == 47676 && s.sizes[2] == largest);
+    ScratchDir dir("gcs-test");
+    addr::Enc enc(dir.path(), s.points.size());
+    enc.state = {1, 1};
+    enc.expect = {s.points.size(), s.verts.size()};
+    enc.write(0, s.points.data(), s.points.size());
+    enc.write(1, s.verts.data(), s.verts.size());
+    std::printf("    %zu B in one write: queue peaks %zu %zu B\n", s.verts.size(), enc.peak(0), enc.peak(1));
+    CHECK(enc.peak(1) <= ENCODER_PIECE + largest);
+    finish_all(enc);
+    CHECK(gc_encodes_the_same(s, dir.path()));
+}
+
 TEST(gcs_addr_encoder_refuses_a_stream_ending_inside_an_escaped_footprint) {
     // The encoder copies an escaped footprint through as it comes, its record
     // already encoded: a stream that ends inside it is refused at the finish,
