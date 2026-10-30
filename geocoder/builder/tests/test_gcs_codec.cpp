@@ -265,6 +265,70 @@ uint32_t f32_bits(float f) {
     return b;
 }
 
+// A synthetic address set: addr_points.bin records (28 bytes, the vertex
+// offset and count last) and their footprints (a 10-byte header: encoding, pad
+// byte, then the base latitude and longitude bits; then vc vertices, 8 random
+// bytes each at encoding 3, else two u16 below span; a closed ring repeats its
+// first vertex last). sizes: each record's footprint bytes (0: none).
+struct AddrSpec {
+    uint32_t vc;
+    uint8_t enc;
+    bool closed;
+    uint32_t span;
+    uint8_t pad = 0;
+};
+struct AddrSet {
+    std::vector<uint8_t> points, verts;
+    std::vector<size_t> sizes;
+};
+AddrSet addr_set(const std::vector<AddrSpec>& specs, std::mt19937& rng) {
+    AddrSet s;
+    for (const AddrSpec& sp : specs) {
+        uint32_t rec[7] = {f32_bits(float(rng() % 1800000) / 1e4f - 90.f), f32_bits(float(rng() % 3600000) / 1e4f - 180.f),
+                           uint32_t(rng()), uint32_t(rng()), uint32_t(rng()), NO, 0};
+        const size_t first = s.verts.size();
+        if (sp.vc) {
+            rec[5] = uint32_t(first);
+            rec[6] = sp.vc;
+            uint8_t h[10] = {sp.enc, sp.pad};
+            wr32(h + 2, f32_bits(float(rng() % 1800000) / 1e4f - 90.f));
+            wr32(h + 6, f32_bits(float(rng() % 3600000) / 1e4f - 180.f));
+            s.verts.insert(s.verts.end(), h, h + 10);
+            const size_t vs = sp.enc == 3 ? 8 : 4, first_vertex = s.verts.size();
+            for (uint32_t k = 0; k < sp.vc; k++) {
+                uint8_t v[8];
+                if (vs == 8) {
+                    for (auto& b : v) b = uint8_t(rng());
+                } else {
+                    wr16(v, uint16_t(rng() % sp.span));
+                    wr16(v + 2, uint16_t(rng() % sp.span));
+                }
+                if (k + 1 == sp.vc && sp.closed) memcpy(v, &s.verts[first_vertex], vs);
+                s.verts.insert(s.verts.end(), v, v + vs);
+            }
+        }
+        const uint8_t* r = reinterpret_cast<const uint8_t*>(rec);
+        s.points.insert(s.points.end(), r, r + 28);
+        s.sizes.push_back(s.verts.size() - first);
+    }
+    return s;
+}
+
+// Whether geocoder-gc encodes the set's today's files (written to dir/today)
+// into the encoded files in dir, byte for byte.
+bool gc_encodes_the_same(const AddrSet& s, const std::string& dir) {
+    const std::string today = dir + "/today", gc = dir + "/gc";
+    std::filesystem::create_directories(today);
+    std::filesystem::create_directories(gc);
+    write_bytes(today + "/addr_points.bin", s.points);
+    write_bytes(today + "/addr_vertices.bin", s.verts);
+    gcset::Manifest gm;
+    gcset::addr::encode(today, gc, gm);
+    bool same = true;
+    for (const char* f : {"/addr_points.col", "/addr_vertices.abs2"}) same &= slurp(gc + f) == slurp(dir + f);
+    return same;
+}
+
 // Today's street (12-byte) or interpolation (24-byte) ways of 0 to 3 nodes,
 // node_offset the running node count (0 for a way without nodes).
 struct WaySet {
@@ -561,63 +625,134 @@ TEST(gcs_addr_footprints_past_the_abs2_bound_round_trip) {
     // and wide (u16) values, every encoding. The encoder (fed in odd pieces)
     // writes geocoder-gc's files, and its decoder reads them back.
     std::mt19937 rng(20261027);
-    struct Spec { uint32_t vc; uint8_t enc; bool closed; uint32_t span; };
-    const Spec specs[] = {{0, 0, false, 0},        {70000, 0, false, 65536}, {5, 1, true, 200},          {69999, 2, false, 65536},
-                          {70001, 0, true, 65536}, {0, 0, false, 0},         {70000, 1, false, 256 - 1}, {3, 3, false, 65536},
-                          {80000, 3, false, 65536}, {120000, 2, true, 200}};
-    std::vector<uint8_t> points, verts;
-    for (const Spec& sp : specs) {
-        uint32_t rec[7] = {f32_bits(float(rng() % 1800000) / 1e4f - 90.f), f32_bits(float(rng() % 3600000) / 1e4f - 180.f),
-                           uint32_t(rng()), uint32_t(rng()), uint32_t(rng()), NO, 0};
-        if (sp.vc) {
-            rec[5] = uint32_t(verts.size());
-            rec[6] = sp.vc;
-            uint8_t h[10] = {sp.enc, 0};
-            wr32(h + 2, f32_bits(float(rng() % 1800000) / 1e4f - 90.f));
-            wr32(h + 6, f32_bits(float(rng() % 3600000) / 1e4f - 180.f));
-            verts.insert(verts.end(), h, h + 10);
-            const size_t vs = sp.enc == 3 ? 8 : 4, first = verts.size();
-            for (uint32_t k = 0; k < sp.vc; k++) {
-                uint8_t v[8];
-                if (vs == 8) {
-                    for (auto& b : v) b = uint8_t(rng());
-                } else {
-                    wr16(v, uint16_t(rng() % sp.span));
-                    wr16(v + 2, uint16_t(rng() % sp.span));
-                }
-                if (k + 1 == sp.vc && sp.closed) memcpy(v, &verts[first], vs);
-                verts.insert(verts.end(), v, v + vs);
-            }
-        }
-        const uint8_t* r = reinterpret_cast<const uint8_t*>(rec);
-        points.insert(points.end(), r, r + 28);
-    }
+    const AddrSet s = addr_set({{0, 0, false, 0},
+                                {70000, 0, false, 65536},
+                                {5, 1, true, 200},
+                                {69999, 2, false, 65536},
+                                {70001, 0, true, 65536},
+                                {0, 0, false, 0},
+                                {70000, 1, false, 256 - 1},
+                                {3, 3, false, 65536},
+                                {80000, 3, false, 65536},
+                                {120000, 2, true, 200}},
+                               rng);
     ScratchDir dir("gcs-test");
-    addr::Enc enc(dir.path(), points.size());
+    addr::Enc enc(dir.path(), s.points.size());
     enc.state = {1, 1};
     size_t vp = 0;
-    for (size_t i = 0; i < points.size() / 28; i++) {
-        enc.write(0, &points[28 * i], 28);
-        const uint32_t vc = rd32(&points[28 * i + 24]);
-        if (!vc) continue;
-        const size_t bs = 10 + size_t(vc) * (verts[vp] == 3 ? 8 : 4);
-        write_in_pieces(enc, 1, &verts[vp], bs, rng, 65521);
-        vp += bs;
+    for (size_t i = 0; i < s.sizes.size(); i++) {
+        enc.write(0, &s.points[28 * i], 28);
+        write_in_pieces(enc, 1, &s.verts[vp], s.sizes[i], rng, 65521);
+        vp += s.sizes[i];
     }
     const Manifest m = finish_all(enc);
     addr::Dec dec(dir.path(), m);
     const auto out = decode_all(dec);
-    CHECK(out[0] == points);
-    CHECK(out[1] == verts);
+    CHECK(out[0] == s.points);
+    CHECK(out[1] == s.verts);
     // The files geocoder-gc encodes from the same today's files, byte for byte.
-    const std::string today = dir.path() + "/today", gc = dir.path() + "/gc";
-    std::filesystem::create_directories(today);
-    std::filesystem::create_directories(gc);
-    write_bytes(today + "/addr_points.bin", points);
-    write_bytes(today + "/addr_vertices.bin", verts);
-    gcset::Manifest gm;
-    gcset::addr::encode(today, gc, gm);
-    for (const char* f : {"/addr_points.col", "/addr_vertices.abs2"}) CHECK(slurp(gc + f) == slurp(dir.path() + f));
+    CHECK(gc_encodes_the_same(s, dir.path()));
+}
+
+TEST(gcs_addr_codecs_copy_an_escaped_footprint_through_in_pieces) {
+    // An escaped footprint (encoding 3) of 80K and of 800K vertices, 640 KB
+    // and 6.4 MB, among small abs2 ones and a small one escaped for its pad
+    // byte, each file in one write (as the patcher's FILE passes a long
+    // stretch) and read back as the patcher reads them (a record, then its
+    // footprint in 64 KiB views): at both sizes the encoder's queue holds at
+    // most a piece and the decoder's a READ_BUF, each with the largest
+    // footprint here either takes whole (the closed abs2 one, 10 + 4 * 9 B),
+    // and the decoder's footprint reader a READ_BUF and its slack; the files
+    // decode back to the same bytes, and geocoder-gc encodes the same files.
+    const size_t whole = 10 + 4 * 9;
+    std::mt19937 rng(20261030);
+    for (const uint32_t big : {80000u, 800000u}) {
+        const AddrSet s = addr_set({{5, 1, true, 200}, {big, 3, false, 0}, {0, 0, false, 0}, {12, 2, false, 65536, 7}, {9, 0, true, 256 - 1}}, rng);
+        ScratchDir dir("gcs-test");
+        addr::Enc enc(dir.path(), s.points.size());
+        enc.state = {1, 1};
+        enc.expect = {s.points.size(), s.verts.size()};
+        enc.write(0, s.points.data(), s.points.size());
+        enc.write(1, s.verts.data(), s.verts.size());
+        const size_t encoder_peak = std::max(enc.peak(0), enc.peak(1));
+        const Manifest m = finish_all(enc);
+
+        addr::Dec dec(dir.path(), m);
+        for (auto& st : dec.state) st = 1;
+        std::vector<uint8_t> points, verts;
+        std::vector<char> view(size_t(64) << 10);
+        auto read = [&](int port, size_t n, std::vector<uint8_t>& out) {
+            while (n) {
+                const size_t k = dec.read(port, view.data(), std::min(n, view.size()));
+                if (!k) return false;
+                out.insert(out.end(), view.data(), view.data() + k);
+                n -= k;
+            }
+            return true;
+        };
+        bool complete = true;
+        for (const size_t size : s.sizes) complete &= read(0, 28, points) && read(1, size, verts);
+        const size_t decoder_peak = std::max(dec.peak(0), dec.peak(1)), reader = dec.A->buf.size();
+        std::printf("    %u vertices: encoder queue peak %zu B, decoder queue peak %zu B, footprint reader %zu B\n", big, encoder_peak,
+                    decoder_peak, reader);
+
+        CHECK(encoder_peak <= ENCODER_PIECE + whole);
+        CHECK(decoder_peak <= READ_BUF + whole);
+        CHECK(reader <= READ_BUF + READ_SLACK);
+        CHECK(complete);
+        CHECK(dec.read(0, view.data(), 1) == 0);
+        CHECK(points == s.points);
+        CHECK(verts == s.verts);
+        CHECK(gc_encodes_the_same(s, dir.path()));
+    }
+}
+
+TEST(gcs_addr_encoder_holds_at_most_a_piece_and_the_largest_abs2_footprint) {
+    // addr_vertices.bin in one write (as the patcher's FILE passes an INSERT
+    // stretch), which the encoder takes a piece (64 KiB) at a time: its queue
+    // peaks at no more than a piece and the largest footprint it takes whole,
+    // an abs2 one of ABS2_MAX_VERTICES vertices (10 + 4 x 69,999 =
+    // 280,006 B), and the files are geocoder-gc's. The case comes within 2
+    // bytes of that: 47,676 B of footprints before the largest put its last
+    // 2 bytes at the start of a piece, so the queue holds the rest of it and
+    // then that whole piece (another of the largest follows), 64 KiB +
+    // 280,004 B, past the 320 KiB an admin or POI encoder may hold.
+    const size_t largest = 10 + 4 * size_t(addr::ABS2_MAX_VERTICES);
+    std::mt19937 rng(20261030);
+    const AddrSet s = addr_set({{5000, 1, false, 65536},
+                                {6914, 2, true, 200},
+                                {addr::ABS2_MAX_VERTICES, 0, false, 65536},
+                                {0, 0, false, 0},
+                                {addr::ABS2_MAX_VERTICES, 1, true, 256 - 1}},
+                               rng);
+    REQUIRE(s.sizes[0] + s.sizes[1] == 47676 && s.sizes[2] == largest);
+    ScratchDir dir("gcs-test");
+    addr::Enc enc(dir.path(), s.points.size());
+    enc.state = {1, 1};
+    enc.expect = {s.points.size(), s.verts.size()};
+    enc.write(0, s.points.data(), s.points.size());
+    enc.write(1, s.verts.data(), s.verts.size());
+    std::printf("    %zu B in one write: queue peaks %zu %zu B\n", s.verts.size(), enc.peak(0), enc.peak(1));
+    CHECK(enc.peak(1) <= ENCODER_PIECE + largest);
+    finish_all(enc);
+    CHECK(gc_encodes_the_same(s, dir.path()));
+}
+
+TEST(gcs_addr_encoder_refuses_a_stream_ending_inside_an_escaped_footprint) {
+    // The encoder copies an escaped footprint through as it comes, its record
+    // already encoded: a stream that ends inside it is refused at the finish,
+    // not taken as a shorter file. It follows the largest abs2 footprint,
+    // whose wait grows the queue past what it keeps once drained, so the
+    // finish pumps an empty queue without a buffer.
+    std::mt19937 rng(20261030);
+    const AddrSet s = addr_set({{69999, 0, false, 65536}, {3, 3, false, 0}}, rng);
+    ScratchDir dir("gcs-test");
+    addr::Enc enc(dir.path(), s.points.size());
+    enc.state = {1, 1};
+    enc.write(0, s.points.data(), s.points.size());
+    enc.write(1, s.verts.data(), s.verts.size() - 1);
+
+    CHECK(throws_runtime([&] { finish_all(enc); }, "stream ends inside a footprint"));
 }
 
 TEST(gcs_addr_decoder_rejects_a_footprint_count_past_its_record) {

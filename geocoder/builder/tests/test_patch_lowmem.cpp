@@ -36,10 +36,22 @@ constexpr uint32_t NO = 0xFFFFFFFFu;
 // The most bytes a family's decoder may hold queued while the replay skips
 // old bytes (a deleted run, replaced children or parents).
 constexpr uint64_t DECODER_HOLD = 1 << 20;
+// The most vertices an abs2 address footprint holds (closing vertex
+// included); one of more goes through the raw escape.
+constexpr uint32_t ABS2_MAX_VERTICES = 69999;
 // The most bytes a family's encoder may hold queued, however large a write:
-// a piece of it (64 KiB) and the largest unit the encoder takes whole (an
-// admin or POI block up to 256 KiB).
-constexpr uint64_t ENCODER_HOLD = 320 << 10;
+// a piece of it (64 KiB) and the largest unit the encoder takes whole. Each
+// family's own, so each check is as tight as its encoder allows (one bound
+// for all would be set by the largest unit of any encoder, a street way's
+// 65535 nodes (512 KiB), and let an admin encoder hold 256 KiB more than it
+// may):
+//   admin (and POI): a block up to big_block(), 256 KiB; a larger one goes
+//   plane by plane;
+//   addr: an abs2 footprint, a 10-byte header and 4-byte vertices, 280,006 B
+//   at ABS2_MAX_VERTICES; an escaped one goes through in pieces.
+constexpr uint64_t ENCODER_PIECE = 64 << 10;
+constexpr uint64_t ADMIN_ENCODER_HOLD = ENCODER_PIECE + (256 << 10);
+constexpr uint64_t ADDR_ENCODER_HOLD = ENCODER_PIECE + 10 + 4 * uint64_t(ABS2_MAX_VERTICES);
 // The most the patcher's heap peak may grow when a heap test's case grows
 // tenfold in the one structure it varies, which the patcher reads in place.
 constexpr uint64_t HEAP_GROWTH_SLACK = 256 << 10;
@@ -101,7 +113,8 @@ void put_pois(BuildDir& d, const std::vector<Poi>& pois, const std::vector<uint3
 }
 
 // An address point by its latitude (unique, so a point kept in the new set
-// matches) and its footprint: none, or a vertex block as a POI's.
+// matches) and its footprint: none, or a vertex block as a POI's (8-byte
+// vertices at encoding 3, the block's first byte).
 struct Addr {
     float lat;
     std::vector<char> block;
@@ -118,7 +131,7 @@ void put_addrs(BuildDir& d, const std::vector<Addr>& addrs) {
         append(points, 0u);
         append(points, 0u);
         append(points, a.block.empty() ? NO : static_cast<uint32_t>(verts.size()));
-        append(points, a.block.empty() ? 0u : static_cast<uint32_t>((a.block.size() - 10) / 4));
+        append(points, a.block.empty() ? 0u : static_cast<uint32_t>((a.block.size() - 10) / (a.block[0] == 3 ? 8 : 4)));
         verts.insert(verts.end(), a.block.begin(), a.block.end());
     }
     d["addr_points.bin"] = points;
@@ -571,7 +584,40 @@ TEST(patch_lowmem_encodes_an_admin_insert_stretch_a_piece_at_a_time) {
     const LowMemCase c{dir.path(), "admin-insert"};
     REQUIRE(prepare(c, old_d, new_d).empty());
 
-    CHECK(apply_both_modes(c, encoder_peaks_at_most("admin", ENCODER_HOLD)).empty());
+    CHECK(apply_both_modes(c, encoder_peaks_at_most("admin", ADMIN_ENCODER_HOLD)).empty());
+}
+
+// An escaped address footprint (encoding 3, 800K vertices: 6.4 MB) kept
+// between small ones and abs2 ones of ABS2_MAX_VERTICES while the address
+// before them goes, so the replay MATCHes them and moves their
+// vertex_offsets; and another of ABS2_MAX_VERTICES inserted, which reaches
+// the encoder in one write of most of it: the decoder hands the escaped one
+// over and the encoder takes it in pieces, neither holding more than
+// DECODER_HOLD, nor the encoder more than a piece and the largest abs2
+// footprint, which it takes whole.
+TEST(patch_lowmem_copies_an_escaped_footprint_through_in_pieces) {
+    ScratchDir dir("lowmem-footprint");
+    std::mt19937 rng(20261030);
+    std::vector<Addr> addrs;
+    for (uint32_t i = 0; i < 300; i++)
+        addrs.push_back({47.0f + static_cast<float>(i) * 1e-4f, i % 3 == 2 ? std::vector<char>{} : block(rng, 3 + rng() % 8)});
+    std::vector<char> escaped = block(rng, 2 * 800000);
+    escaped[0] = 3;
+    addrs[150].block = escaped;
+    for (const uint32_t i : {60u, 61u, 240u}) addrs[i].block = block(rng, ABS2_MAX_VERTICES);
+    std::vector<Addr> fewer_addrs(addrs.begin() + 1, addrs.end());
+    fewer_addrs.insert(fewer_addrs.begin() + 200, Addr{48.0f, block(rng, ABS2_MAX_VERTICES)});
+    BuildDir old_d, new_d;
+    put_addrs(old_d, addrs);
+    put_addrs(new_d, fewer_addrs);
+    const LowMemCase c{dir.path(), "escaped-footprint"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+    const LogCheck decoder = decoder_peaks_at_most("addr", DECODER_HOLD), encoder = encoder_peaks_at_most("addr", ADDR_ENCODER_HOLD);
+
+    CHECK(apply_both_modes(c, [&](const std::string& log) {
+              const std::string e = decoder(log);
+              return e.empty() ? encoder(log) : e;
+          }).empty());
 }
 
 // The memory checks of the replay tests above, on report lines as the
