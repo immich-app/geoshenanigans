@@ -265,6 +265,70 @@ uint32_t f32_bits(float f) {
     return b;
 }
 
+// A synthetic address set: addr_points.bin records (28 bytes, the vertex
+// offset and count last) and their footprints (a 10-byte header: encoding, a
+// zero pad byte, then the base latitude and longitude bits; then vc vertices,
+// 8 random bytes each at encoding 3, else two u16 below span; a closed ring
+// repeats its first vertex last). sizes: each record's footprint bytes (0:
+// none).
+struct AddrSpec {
+    uint32_t vc;
+    uint8_t enc;
+    bool closed;
+    uint32_t span;
+};
+struct AddrSet {
+    std::vector<uint8_t> points, verts;
+    std::vector<size_t> sizes;
+};
+AddrSet addr_set(const std::vector<AddrSpec>& specs, std::mt19937& rng) {
+    AddrSet s;
+    for (const AddrSpec& sp : specs) {
+        uint32_t rec[7] = {f32_bits(float(rng() % 1800000) / 1e4f - 90.f), f32_bits(float(rng() % 3600000) / 1e4f - 180.f),
+                           uint32_t(rng()), uint32_t(rng()), uint32_t(rng()), NO, 0};
+        const size_t first = s.verts.size();
+        if (sp.vc) {
+            rec[5] = uint32_t(first);
+            rec[6] = sp.vc;
+            uint8_t h[10] = {sp.enc, 0};
+            wr32(h + 2, f32_bits(float(rng() % 1800000) / 1e4f - 90.f));
+            wr32(h + 6, f32_bits(float(rng() % 3600000) / 1e4f - 180.f));
+            s.verts.insert(s.verts.end(), h, h + 10);
+            const size_t vs = sp.enc == 3 ? 8 : 4, first_vertex = s.verts.size();
+            for (uint32_t k = 0; k < sp.vc; k++) {
+                uint8_t v[8];
+                if (vs == 8) {
+                    for (auto& b : v) b = uint8_t(rng());
+                } else {
+                    wr16(v, uint16_t(rng() % sp.span));
+                    wr16(v + 2, uint16_t(rng() % sp.span));
+                }
+                if (k + 1 == sp.vc && sp.closed) memcpy(v, &s.verts[first_vertex], vs);
+                s.verts.insert(s.verts.end(), v, v + vs);
+            }
+        }
+        const uint8_t* r = reinterpret_cast<const uint8_t*>(rec);
+        s.points.insert(s.points.end(), r, r + 28);
+        s.sizes.push_back(s.verts.size() - first);
+    }
+    return s;
+}
+
+// Whether geocoder-gc encodes the set's today's files (written to dir/today)
+// into the encoded files in dir, byte for byte.
+bool gc_encodes_the_same(const AddrSet& s, const std::string& dir) {
+    const std::string today = dir + "/today", gc = dir + "/gc";
+    std::filesystem::create_directories(today);
+    std::filesystem::create_directories(gc);
+    write_bytes(today + "/addr_points.bin", s.points);
+    write_bytes(today + "/addr_vertices.bin", s.verts);
+    gcset::Manifest gm;
+    gcset::addr::encode(today, gc, gm);
+    bool same = true;
+    for (const char* f : {"/addr_points.col", "/addr_vertices.abs2"}) same &= slurp(gc + f) == slurp(dir + f);
+    return same;
+}
+
 // Today's street (12-byte) or interpolation (24-byte) ways of 0 to 3 nodes,
 // node_offset the running node count (0 for a way without nodes).
 struct WaySet {
@@ -561,63 +625,33 @@ TEST(gcs_addr_footprints_past_the_abs2_bound_round_trip) {
     // and wide (u16) values, every encoding. The encoder (fed in odd pieces)
     // writes geocoder-gc's files, and its decoder reads them back.
     std::mt19937 rng(20261027);
-    struct Spec { uint32_t vc; uint8_t enc; bool closed; uint32_t span; };
-    const Spec specs[] = {{0, 0, false, 0},        {70000, 0, false, 65536}, {5, 1, true, 200},          {69999, 2, false, 65536},
-                          {70001, 0, true, 65536}, {0, 0, false, 0},         {70000, 1, false, 256 - 1}, {3, 3, false, 65536},
-                          {80000, 3, false, 65536}, {120000, 2, true, 200}};
-    std::vector<uint8_t> points, verts;
-    for (const Spec& sp : specs) {
-        uint32_t rec[7] = {f32_bits(float(rng() % 1800000) / 1e4f - 90.f), f32_bits(float(rng() % 3600000) / 1e4f - 180.f),
-                           uint32_t(rng()), uint32_t(rng()), uint32_t(rng()), NO, 0};
-        if (sp.vc) {
-            rec[5] = uint32_t(verts.size());
-            rec[6] = sp.vc;
-            uint8_t h[10] = {sp.enc, 0};
-            wr32(h + 2, f32_bits(float(rng() % 1800000) / 1e4f - 90.f));
-            wr32(h + 6, f32_bits(float(rng() % 3600000) / 1e4f - 180.f));
-            verts.insert(verts.end(), h, h + 10);
-            const size_t vs = sp.enc == 3 ? 8 : 4, first = verts.size();
-            for (uint32_t k = 0; k < sp.vc; k++) {
-                uint8_t v[8];
-                if (vs == 8) {
-                    for (auto& b : v) b = uint8_t(rng());
-                } else {
-                    wr16(v, uint16_t(rng() % sp.span));
-                    wr16(v + 2, uint16_t(rng() % sp.span));
-                }
-                if (k + 1 == sp.vc && sp.closed) memcpy(v, &verts[first], vs);
-                verts.insert(verts.end(), v, v + vs);
-            }
-        }
-        const uint8_t* r = reinterpret_cast<const uint8_t*>(rec);
-        points.insert(points.end(), r, r + 28);
-    }
+    const AddrSet s = addr_set({{0, 0, false, 0},
+                                {70000, 0, false, 65536},
+                                {5, 1, true, 200},
+                                {69999, 2, false, 65536},
+                                {70001, 0, true, 65536},
+                                {0, 0, false, 0},
+                                {70000, 1, false, 256 - 1},
+                                {3, 3, false, 65536},
+                                {80000, 3, false, 65536},
+                                {120000, 2, true, 200}},
+                               rng);
     ScratchDir dir("gcs-test");
-    addr::Enc enc(dir.path(), points.size());
+    addr::Enc enc(dir.path(), s.points.size());
     enc.state = {1, 1};
     size_t vp = 0;
-    for (size_t i = 0; i < points.size() / 28; i++) {
-        enc.write(0, &points[28 * i], 28);
-        const uint32_t vc = rd32(&points[28 * i + 24]);
-        if (!vc) continue;
-        const size_t bs = 10 + size_t(vc) * (verts[vp] == 3 ? 8 : 4);
-        write_in_pieces(enc, 1, &verts[vp], bs, rng, 65521);
-        vp += bs;
+    for (size_t i = 0; i < s.sizes.size(); i++) {
+        enc.write(0, &s.points[28 * i], 28);
+        write_in_pieces(enc, 1, &s.verts[vp], s.sizes[i], rng, 65521);
+        vp += s.sizes[i];
     }
     const Manifest m = finish_all(enc);
     addr::Dec dec(dir.path(), m);
     const auto out = decode_all(dec);
-    CHECK(out[0] == points);
-    CHECK(out[1] == verts);
+    CHECK(out[0] == s.points);
+    CHECK(out[1] == s.verts);
     // The files geocoder-gc encodes from the same today's files, byte for byte.
-    const std::string today = dir.path() + "/today", gc = dir.path() + "/gc";
-    std::filesystem::create_directories(today);
-    std::filesystem::create_directories(gc);
-    write_bytes(today + "/addr_points.bin", points);
-    write_bytes(today + "/addr_vertices.bin", verts);
-    gcset::Manifest gm;
-    gcset::addr::encode(today, gc, gm);
-    for (const char* f : {"/addr_points.col", "/addr_vertices.abs2"}) CHECK(slurp(gc + f) == slurp(dir.path() + f));
+    CHECK(gc_encodes_the_same(s, dir.path()));
 }
 
 TEST(gcs_addr_decoder_rejects_a_footprint_count_past_its_record) {
