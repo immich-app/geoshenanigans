@@ -393,18 +393,44 @@ struct CellChanges {
     AscendingIds added, removed;
 };
 
+static uintptr_t page_size() {
+    static const uintptr_t page = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+    return page;
+}
+
+// madvise over the pages that hold [p, p + n).
+static void advise_pages(const char* p, size_t n, int advice) {
+    if (!n) return;
+    const uintptr_t start = reinterpret_cast<uintptr_t>(p) & ~(page_size() - 1);
+    madvise(reinterpret_cast<void*>(start), reinterpret_cast<uintptr_t>(p) + n - start, advice);
+}
+
 // Readahead over bytes of the patch a walk is about to read front to back:
 // the patch is mapped MADV_RANDOM, which faults it in a page at a time.
-static void advise_sequential(const char* p, size_t n) {
-    if (!n) return;
-    const uintptr_t page = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
-    const uintptr_t start = reinterpret_cast<uintptr_t>(p) & ~(page - 1);
-    madvise(reinterpret_cast<void*>(start), reinterpret_cast<uintptr_t>(p) + n - start, MADV_SEQUENTIAL);
-}
+static void advise_sequential(const char* p, size_t n) { advise_pages(p, n, MADV_SEQUENTIAL); }
 static void advise_sequential(const CellChanges& c) {
     advise_sequential(c.added.data(), c.added.bytes());
     advise_sequential(c.removed.data(), c.removed.bytes());
 }
+
+// A file mapping read front to back, whose whole pages behind the reader go
+// back (MADV_DONTNEED) as it passes them. File mappings only: on anonymous
+// memory MADV_DONTNEED drops the bytes.
+class PagesBehind {
+public:
+    explicit PagesBehind(const char* base) : base_(base) {}
+    // The reader reads nothing before base + off again.
+    void passed(size_t off) {
+        const size_t to = off & ~(page_size() - 1);
+        if (to <= dropped_) return;
+        madvise(const_cast<char*>(base_) + dropped_, to - dropped_, MADV_DONTNEED);
+        dropped_ = to;
+    }
+
+private:
+    const char* base_;
+    size_t dropped_ = 0;  // a page multiple
+};
 
 // The ids as a vector, for the materialised rebuild a patch with entry
 // corrections takes.
@@ -537,6 +563,11 @@ static int run(int argc, char* argv[]) {
     // spill to the scratch dir.
     StringRemap str_remap(tmpdir);
     {
+        // The section is read front to back, by its parse and then by the
+        // tiers' walks, each of which reads its old pool once.
+        const size_t strings_at = pos;
+        advise_pages(P + strings_at, patch_size - strings_at, MADV_SEQUENTIAL);
+        PagesBehind patch_behind(P);
         const StringsSection strings = parse_strings_section(P, patch_size, pos);
         require_shipped_tiers_listed(strings.shipped, listed);
         uint32_t total_added = 0, total_deleted = 0;
@@ -547,21 +578,25 @@ static int run(int argc, char* argv[]) {
             total_deleted += edit.n_deleted;
             require_old_file_size(cur_dir, name, strings.old_size(t));
             MappedFile old_pool = mmap_file(cur_dir + "/" + name);
-            if (old_pool.size != strings.old_size(t) || content_hash(old_pool.data, old_pool.size) != edit.old_hash)
+            if (old_pool.size != strings.old_size(t))
                 throw std::runtime_error(std::string("Old ") + name + " is not the one the patch was made from");
+            advise_pages(old_pool.data, old_pool.size, MADV_SEQUENTIAL);
+            PagesBehind old_behind(old_pool.data);
             FILE* fp = open_out(name);
-            rebuild_string_tier(old_pool.data, old_pool.size, edit, [&](const char* p, size_t n) { fwrite(p, 1, n, fp); });
+            const StringTierRebuild rebuilt = rebuild_string_tier(
+                old_pool.data, old_pool.size, edit, strings.place(t), str_remap,
+                [&](const char* p, size_t n) { fwrite(p, 1, n, fp); }, [&](size_t old_off) { old_behind.passed(old_off); });
             close_patch_outputs({{fp, name}});
-            MappedFile new_pool = mmap_file(out_path(name));
-            if (new_pool.size != strings.new_size(t) || content_hash(new_pool.data, new_pool.size) != edit.new_hash)
-                throw std::runtime_error(std::string("Rebuilt ") + name + " does not match the new build");
-            str_remap.add_tier(old_pool.data, old_pool.size, strings.old_base[t], strings.new_base[t], edit);
+            require_string_tier_rebuilt(rebuilt, edit, strings.place(t), name);
             unmap_file(old_pool);
-            unmap_file(new_pool);
+            patch_behind.passed(static_cast<size_t>(edit.end() - P));
         });
         malloc_trim(0);
         std::cerr << "  Strings: +" << total_added << " -" << total_deleted << ", "
                   << str_remap.run_count() << " remap runs, " << strings.pairs.size() << " moved-string pairs" << std::endl;
+        // The moved strings' pairs, at the section's end, are looked up at
+        // random from here on.
+        advise_pages(P + strings_at, patch_size - strings_at, MADV_RANDOM);
     }
     // Release patch pages read so far (string section)
     madvise(const_cast<char*>(patch_map.data), pos, MADV_DONTNEED);
@@ -1313,8 +1348,13 @@ static int run(int argc, char* argv[]) {
             uint32_t so = do_entry(cid, old_se, old_offs[0], w_rm, cur_s, o_se);
             uint32_t ao = do_entry(cid, old_ae, old_offs[1], a_rm, cur_a, o_ae);
             uint32_t io = do_entry(cid, old_ie, old_offs[2], i_rm, cur_i, o_ie);
-            if (gcs::store().active && __fpending(f_geo) + 20 > gcs::Store::SINK_BUF) gflush();
-            fwrite(&cid, 8, 1, f_geo); fwrite(&so, 4, 1, f_geo); fwrite(&ao, 4, 1, f_geo); fwrite(&io, 4, 1, f_geo);
+            char rec[20];  // cell id, then the three list offsets, as the old records read
+            memcpy(rec, &cid, 8);
+            memcpy(rec + 8, &so, 4);
+            memcpy(rec + 12, &ao, 4);
+            memcpy(rec + 16, &io, 4);
+            if (gcs::store().active && __fpending(f_geo) + sizeof rec > gcs::Store::SINK_BUF) gflush();
+            fwrite(rec, sizeof rec, 1, f_geo);
             cells_written++;
         };
         const ListOffsets added_cell = {NO, NO, NO};

@@ -386,7 +386,7 @@ static constexpr uint32_t SECONDARY_REMAP_MARKER = 0xFFFFFFF6;
 //              (NUL-terminated), indexed only: their new string indices
 //              (u32, ascending), deleted old string indices (u32,
 //              ascending); the patcher rebuilds the tier and derives its
-//              shift runs from the same walk (StringRemap::add_tier),
+//              shift runs from the same walk (rebuild_string_tier),
 //     sent: n_runs u32, runs_size u32, the tier's shift runs
 //           (encode_string_tier_runs),
 //   n_pairs u32, (old u32, new u32) × n_pairs: surviving strings no tier's
@@ -396,21 +396,56 @@ static constexpr uint32_t SECONDARY_REMAP_MARKER = 0xFFFFFFF6;
 // A tier neither shipped nor referenced sends nothing: no lookup lands in it.
 static constexpr uint32_t STRINGS_TIERED_MARKER = 0xFFFFFFF6;
 
-// 64-bit content hash, 8 bytes per step. Not cryptographic: it proves a file
-// is the one the diff saw, against stale or mismatched inputs.
-inline uint64_t content_hash(const char* data, size_t n) {
-    uint64_t h = 0x9E3779B97F4A7C15ull ^ n;
-    size_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        uint64_t w;
-        memcpy(&w, data + i, 8);
-        h = (h ^ w) * 0xFF51AFD7ED558CCDull;
-        h ^= h >> 32;
+// 64-bit content hash, 8 bytes per step, fed piece by piece: seeded with the
+// total length n, it carries a step's bytes left over from one piece to the
+// next, so hash() of n bytes fed in any split is content_hash of them. Not
+// cryptographic: it proves a file is the one the diff saw, against stale or
+// mismatched inputs.
+class ContentHasher {
+public:
+    explicit ContentHasher(uint64_t n) : h_(0x9E3779B97F4A7C15ull ^ n) {}
+    void update(const char* p, size_t n) {
+        if (n == 0) return;
+        if (carried_ > 0) {
+            const size_t k = std::min(n, sizeof carry_ - carried_);
+            memcpy(carry_ + carried_, p, k);
+            carried_ += k;
+            p += k;
+            n -= k;
+            if (carried_ < sizeof carry_) return;
+            h_ = step(h_, carry_);
+            carried_ = 0;
+        }
+        uint64_t h = h_;
+        for (; n >= sizeof carry_; p += sizeof carry_, n -= sizeof carry_) h = step(h, p);
+        h_ = h;
+        memcpy(carry_, p, n);
+        carried_ = n;
     }
-    uint64_t tail = 0;
-    if (n > i) memcpy(&tail, data + i, n - i);
-    h = (h ^ tail) * 0xC4CEB9FE1A85EC53ull;
-    return h ^ (h >> 29);
+    uint64_t hash() const {
+        uint64_t tail = 0;
+        memcpy(&tail, carry_, carried_);
+        const uint64_t h = (h_ ^ tail) * 0xC4CEB9FE1A85EC53ull;
+        return h ^ (h >> 29);
+    }
+
+private:
+    static uint64_t step(uint64_t h, const char* p) {
+        uint64_t w;
+        memcpy(&w, p, sizeof w);
+        h = (h ^ w) * 0xFF51AFD7ED558CCDull;
+        return h ^ (h >> 32);
+    }
+
+    uint64_t h_;
+    char carry_[8];
+    size_t carried_ = 0;
+};
+
+inline uint64_t content_hash(const char* data, size_t n) {
+    ContentHasher h(n);
+    h.update(data, n);
+    return h.hash();
 }
 
 // Sparse position-keyed delta. Stride sentinel that signals the section
@@ -728,6 +763,10 @@ static constexpr size_t TABLE_DIRECTORY_KEYS = 4096;
 static constexpr unsigned TABLE_FILTER_BITS_LOG2 = 15;
 // The buffer a ScratchTable appends through: 64 KiB.
 static constexpr size_t SCRATCH_TABLE_BUF = 64 << 10;
+// A shipped string tier's walk writes and hashes its new pool in pieces of at
+// most this (a longer string goes alone), and hashes and gives back its old
+// pool in steps of at least this: 64 KiB.
+static constexpr size_t STRING_WALK_PIECE = 64 << 10;
 
 // n fixed-width records read where they sit, sorted strictly ascending by
 // the u32 each starts with. The constructor checks the order in one sweep,
@@ -1694,6 +1733,8 @@ struct StringTierEdit {
     const char* added_at = nullptr;
     const char* deleted = nullptr;
     uint32_t n_deleted = 0;
+    // Past the edit's last byte (the deleted list ends it).
+    const char* end() const { return deleted + size_t{n_deleted} * 4; }
 };
 
 // Index i of a list of u32 string indices where it sits.
@@ -1750,24 +1791,33 @@ constexpr size_t NO_OLD_STRING = SIZE_MAX;
 
 // A shipped tier's new pool string by string, from its old pool and edit:
 // on_string(p, len, old_off) for each new string in order, with the offset of
-// a kept string in the old pool, or NO_OLD_STRING for an added one. The
-// edit's indices ascend (parse_string_tier_edit); ones the old pool can't
-// place throw. A sorted edit puts an added string before the next kept one
-// it sorts before.
-template <typename OnString>
-void for_each_new_string(const char* old_pool, size_t old_size, const StringTierEdit& edit, OnString on_string) {
+// a kept string in the old pool, or NO_OLD_STRING for an added one, and
+// on_consumed(old_end) as the walk passes each old string, kept (after its
+// on_string) or deleted, with the offset just past it: the walk reads no old
+// byte before old_end again. The edit's indices ascend
+// (parse_string_tier_edit). Returns whether the old pool placed every one of
+// them: the walk passes the whole old pool either way. A sorted edit puts an
+// added string before the next kept one it sorts before.
+template <typename OnString, typename OnConsumed>
+[[nodiscard]] bool for_each_new_string(const char* old_pool, size_t old_size, const StringTierEdit& edit, OnString on_string,
+                                       OnConsumed on_consumed) {
     size_t o = 0;
     uint32_t oi = 0, ni = 0, d = 0, a = 0;
     const char* added = edit.added;  // the next added string
-    auto old_len = [&] { return strnlen(old_pool + o, old_size - o) + 1; };
+    // The old pool isn't checked yet as the walk reads it, so a last string
+    // without its NUL ends at the pool's end.
+    auto old_len = [&] { return std::min(strnlen(old_pool + o, old_size - o) + 1, old_size - o); };
     auto skip_deleted = [&] {
-        for (; o < old_size && d < edit.n_deleted && string_index_at(edit.deleted, d) == oi; d++, oi++) o += old_len();
+        for (; o < old_size && d < edit.n_deleted && string_index_at(edit.deleted, d) == oi; d++, oi++) {
+            o += old_len();
+            on_consumed(o);
+        }
     };
     skip_deleted();
     auto added_next = [&] {
         if (a >= edit.n_added) return false;
         if (!edit.sorted) return string_index_at(edit.added_at, a) == ni;
-        return o >= old_size || strcmp(added, old_pool + o) < 0;
+        return o >= old_size || strncmp(added, old_pool + o, old_size - o) < 0;
     };
     for (;; ni++) {
         if (added_next()) {
@@ -1780,12 +1830,13 @@ void for_each_new_string(const char* old_pool, size_t old_size, const StringTier
             on_string(old_pool + o, len, o);
             o += len;
             oi++;
+            on_consumed(o);
             skip_deleted();
         } else {
             break;
         }
     }
-    if (a != edit.n_added || d != edit.n_deleted) throw std::runtime_error("Malformed strings section");
+    return a == edit.n_added && d == edit.n_deleted;
 }
 
 // The patcher's old → new string offset map. Between two edits every
@@ -1810,21 +1861,9 @@ public:
     StringRemap() = default;  // maps every offset to itself
     explicit StringRemap(const std::string& scratch_dir) : runs_(scratch_dir, "string runs") {}
 
-    // Records the kept strings that moved, walking a shipped tier's old pool
-    // and edit as its rebuild does. Lookups don't read the old pool.
-    void add_tier(const char* old_pool, size_t old_size, uint32_t old_base, uint32_t new_base,
-                  const StringTierEdit& edit) {
-        uint32_t new_start = new_base;
-        StringRunJoiner joiner([&](uint32_t start, uint32_t end, uint32_t shift) { runs_.append({start, end, shift}); });
-        for_each_new_string(old_pool, old_size, edit, [&](const char*, size_t len, size_t old_off) {
-            if (old_off != NO_OLD_STRING) {
-                const uint32_t start = old_base + static_cast<uint32_t>(old_off);
-                joiner.kept(start, start + static_cast<uint32_t>(len), new_start);
-            }
-            new_start += static_cast<uint32_t>(len);
-        });
-        joiner.finish();
-    }
+    // Adds a run of a shipped tier's kept strings that moved, as its rebuild
+    // (rebuild_string_tier) derives them. Lookups don't read the old pool.
+    void add_run(uint32_t start, uint32_t end, uint32_t shift) { runs_.append({start, end, shift}); }
     // Decodes the runs encode_string_tier_runs wrote for the tier at old
     // offsets [tier_start, tier_end). Tiers are added in offset order: the
     // table refuses a run that steps back.
@@ -2035,6 +2074,12 @@ struct SentStringRuns {
     uint32_t size = 0, n_runs = 0;
 };
 
+// Where a shipped tier's walk (rebuild_string_tier) puts its strings: the
+// tier's old and new global offsets, and the size of its new pool.
+struct StringTierPlace {
+    uint32_t old_base = 0, new_base = 0, new_size = 0;
+};
+
 struct StringsSection {
     // Tier t sits at old offsets [old_base[t], old_base[t + 1]); new likewise.
     std::array<uint32_t, STRING_TIER_COUNT + 1> old_base{}, new_base{};
@@ -2044,6 +2089,7 @@ struct StringsSection {
     SortedTable<RemapPair> pairs;                         // moved strings, by old offset
     uint32_t old_size(int t) const { return old_base[t + 1] - old_base[t]; }
     uint32_t new_size(int t) const { return new_base[t + 1] - new_base[t]; }
+    StringTierPlace place(int t) const { return {old_base[t], new_base[t], new_size(t)}; }
 };
 
 // Parses the section at data[pos, size) and advances pos past it.
@@ -2093,17 +2139,86 @@ inline void require_shipped_tiers_listed(uint32_t shipped, const std::unordered_
                                      ", which the client files don't list");
 }
 
-// Writes a shipped tier's new pool through write(bytes, n): the old pool's
-// kept strings with the added ones at their indices.
-template <typename Write>
-void rebuild_string_tier(const char* old_pool, size_t old_size, const StringTierEdit& edit, Write write) {
-    for_each_new_string(old_pool, old_size, edit, [&](const char* p, size_t n, size_t) { write(p, n); });
+// What a shipped tier's walk (rebuild_string_tier) read and wrote: the hash of
+// the whole old pool, the size of the new pool written and its hash as the
+// place's new_size bytes, and whether the old pool placed every index of the
+// edit.
+struct StringTierRebuild {
+    uint64_t old_hash = 0, new_hash = 0, new_size = 0;
+    bool placed = false;
+};
+
+// Rebuilds a shipped tier in one walk of its old pool and edit: writes the new
+// pool (the old pool's kept strings with the added ones at their indices)
+// through write(bytes, n), in pieces of contiguous strings, adds the runs of
+// the kept strings that moved to remap, and hashes the old pool as the walk
+// passes it and the new one as it writes it. on_passed(old_off) at the end of
+// the first old string, kept or deleted, that puts STRING_WALK_PIECE or more
+// of old pool behind the last call: the walk has hashed those bytes and
+// written every string it took from them, and reads none of them again. A
+// run of deleted strings, a whole old pool of them included, goes back in
+// pieces like a run of kept ones; under a piece is left for the walk's end to
+// hash. The old pool isn't checked before the walk, which is why the walk
+// hashes all of it even when the edit doesn't fit
+// (require_string_tier_rebuilt).
+template <typename Write, typename OnPassed>
+StringTierRebuild rebuild_string_tier(const char* old_pool, size_t old_size, const StringTierEdit& edit,
+                                      const StringTierPlace& at, StringRemap& remap, Write write, OnPassed on_passed) {
+    StringTierRebuild r;
+    ContentHasher old_hash(old_size), new_hash(at.new_size);
+    size_t old_hashed = 0;
+    const char* piece = nullptr;  // the strings not written yet, contiguous
+    size_t piece_size = 0;
+    auto write_piece = [&] {
+        if (piece_size == 0) return;
+        new_hash.update(piece, piece_size);
+        write(piece, piece_size);
+        r.new_size += piece_size;
+        piece_size = 0;
+    };
+    StringRunJoiner joiner([&](uint32_t start, uint32_t end, uint32_t shift) { remap.add_run(start, end, shift); });
+    uint32_t new_start = at.new_base;
+    auto on_string = [&](const char* p, size_t len, size_t old_off) {
+        if (piece_size > 0 && (p != piece + piece_size || piece_size + len > STRING_WALK_PIECE)) write_piece();
+        if (piece_size == 0) piece = p;
+        piece_size += len;
+        if (old_off != NO_OLD_STRING) {
+            const uint32_t start = at.old_base + static_cast<uint32_t>(old_off);
+            joiner.kept(start, start + static_cast<uint32_t>(len), new_start);
+        }
+        new_start += static_cast<uint32_t>(len);
+    };
+    auto on_consumed = [&](size_t old_end) {
+        if (old_end - old_hashed < STRING_WALK_PIECE) return;
+        write_piece();  // it may hold kept strings from before old_end
+        old_hash.update(old_pool + old_hashed, old_end - old_hashed);
+        old_hashed = old_end;
+        on_passed(old_hashed);
+    };
+    r.placed = for_each_new_string(old_pool, old_size, edit, on_string, on_consumed);
+    joiner.finish();
+    write_piece();
+    old_hash.update(old_pool + old_hashed, old_size - old_hashed);
+    r.old_hash = old_hash.hash();
+    r.new_hash = new_hash.hash();
+    return r;
+}
+
+// Refuses a shipped tier's rebuild by its first fault: an old pool other than
+// the one the diff saw, then an edit the old pool can't place, then a new pool
+// other than the new build's.
+inline void require_string_tier_rebuilt(const StringTierRebuild& r, const StringTierEdit& edit, const StringTierPlace& at,
+                                        const std::string& name) {
+    if (r.old_hash != edit.old_hash) throw std::runtime_error("Old " + name + " is not the one the patch was made from");
+    if (!r.placed) throw std::runtime_error("Malformed strings section");
+    if (r.new_size != at.new_size || r.new_hash != edit.new_hash)
+        throw std::runtime_error("Rebuilt " + name + " does not match the new build");
 }
 
 // Fills remap from the section, tier by tier in offset order: a sent tier
-// from its runs, a shipped tier through on_shipped(t), which rebuilds it and
-// calls remap.add_tier with its old pool and edit. Then it finishes the
-// remap with the moved strings.
+// from its runs, a shipped tier through on_shipped(t), which rebuilds it
+// (rebuild_string_tier, which adds its runs). Then it finishes the remap with
+// the moved strings.
 template <typename OnShipped>
 void load_string_remap(const StringsSection& s, StringRemap& remap, OnShipped on_shipped) {
     for (int t = 0; t < STRING_TIER_COUNT; t++) {
