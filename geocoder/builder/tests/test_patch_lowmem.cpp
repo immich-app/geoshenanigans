@@ -36,6 +36,10 @@ constexpr uint32_t NO = 0xFFFFFFFFu;
 // The most bytes a family's decoder may hold queued while the replay skips
 // old bytes (a deleted run, replaced children or parents).
 constexpr uint64_t DECODER_HOLD = 1 << 20;
+// The most bytes a family's encoder may hold queued, however large a write:
+// a piece of it (64 KiB) and the largest unit the encoder takes whole (an
+// admin or POI block up to 256 KiB).
+constexpr uint64_t ENCODER_HOLD = 320 << 10;
 // The most the patcher's heap peak may grow when a heap test's case grows
 // tenfold in the one structure it varies, which the patcher reads in place.
 constexpr uint64_t HEAP_GROWTH_SLACK = 256 << 10;
@@ -121,6 +125,30 @@ void put_addrs(BuildDir& d, const std::vector<Addr>& addrs) {
     d["addr_vertices.bin"] = verts;
 }
 
+// An admin polygon by its area (unique, so a polygon kept in the new set
+// matches) and its vertex block, as a POI's.
+struct Admin {
+    float area;
+    std::vector<char> block;
+};
+
+// admin_polygons.bin and admin_vertices.bin of polys, into d: unnamed, level
+// 8, no country.
+void put_admins(BuildDir& d, const std::vector<Admin>& polys) {
+    std::vector<char> recs, verts;
+    for (const Admin& a : polys) {
+        append(recs, static_cast<uint32_t>(verts.size()));
+        append(recs, static_cast<uint32_t>((a.block.size() - 10) / 4));
+        append(recs, 0u);
+        append(recs, uint32_t{8});
+        append(recs, a.area);
+        append(recs, 0u);
+        verts.insert(verts.end(), a.block.begin(), a.block.end());
+    }
+    d["admin_polygons.bin"] = recs;
+    d["admin_vertices.bin"] = verts;
+}
+
 // The id of a fixture's cell k.
 uint64_t cell_id(uint32_t k) { return uint64_t(k + 1) << 27; }
 
@@ -200,13 +228,13 @@ bool logged(const ToolRun& r, const std::string& line) { return r.log.find(line)
 // Checks of a patcher run's log beyond its exit status: an error, or "".
 using LogCheck = std::function<std::string(const std::string& log)>;
 
-// The family's decoder queue (and --threads ring) peaks, from the patcher's
-// report line, all at most limit. A line without peaks, or with a "peaks"
-// that isn't a list of numbers, fails: a changed report format can't pass as
-// a decoder that held nothing.
-LogCheck decoder_peaks_at_most(const std::string& family, uint64_t limit) {
-    return [family, limit](const std::string& log) -> std::string {
-        const std::string head = "decode " + family + ":";
+// The queue (and --threads ring) peaks of the family's codec ("decode" or
+// "encode"), from the patcher's report line, all at most limit. A line
+// without peaks, or with a "peaks" that isn't a list of numbers, fails: a
+// changed report format can't pass as a codec that held nothing.
+LogCheck peaks_at_most(const std::string& codec, const std::string& family, uint64_t limit) {
+    return [codec, family, limit](const std::string& log) -> std::string {
+        const std::string head = codec + " " + family + ":";
         const size_t at = log.find(head);
         if (at == std::string::npos) return "no " + head + " line";
         const std::string line = log.substr(at, log.find('\n', at) - at);
@@ -223,9 +251,11 @@ LogCheck decoder_peaks_at_most(const std::string& family, uint64_t limit) {
         }
         for (size_t p = line.find("peaks"); p != std::string::npos; p = line.find("peaks", p + 1)) named++;
         if (!lists || lists != named) return "no peaks to check: " + line;
-        return most > limit ? "decoder held " + std::to_string(most) + " B: " + line : "";
+        return most > limit ? "held " + std::to_string(most) + " B: " + line : "";
     };
 }
+LogCheck decoder_peaks_at_most(const std::string& family, uint64_t limit) { return peaks_at_most("decode", family, limit); }
+LogCheck encoder_peaks_at_most(const std::string& family, uint64_t limit) { return peaks_at_most("encode", family, limit); }
 
 // The old and new dirs of a case under root/<name>.{old,new}, their encoded
 // sets, the patch between them, and what applying it gave.
@@ -523,20 +553,46 @@ TEST(patch_lowmem_drops_the_old_records_of_a_replace_run) {
     CHECK(apply_both_modes(c, decoder_peaks_at_most("streets", DECODER_HOLD)).empty());
 }
 
-// The memory check of the replay tests above, on report lines as the patcher
-// writes them (sync: queue peaks; --threads: ring and queue peaks): every
-// peak at most the limit passes, one past it fails, and a line whose peaks
-// are missing or not numbers fails instead of passing as a peak of 0.
-TEST(decoder_peaks_at_most_checks_every_peak_of_the_report_line) {
-    const LogCheck check = decoder_peaks_at_most("poi", 100);
+// An INSERT stretch of admin_vertices.bin (2 MB of new polygons between kept
+// ones), which reaches the encoder as one write of nearly all of it: the
+// encoder takes it a piece at a time, never holding more than a piece and the
+// largest block it takes whole.
+TEST(patch_lowmem_encodes_an_admin_insert_stretch_a_piece_at_a_time) {
+    ScratchDir dir("lowmem-admin");
+    std::mt19937 rng(20261030);
+    std::vector<Admin> old_polys, inserted;
+    for (uint32_t i = 0; i < 300; i++) old_polys.push_back({static_cast<float>(i), block(rng, 50)});
+    for (uint32_t i = 0; i < 500; i++) inserted.push_back({static_cast<float>(1000 + i), block(rng, 1000)});
+    auto new_polys = old_polys;
+    new_polys.insert(new_polys.begin() + 150, inserted.begin(), inserted.end());
+    BuildDir old_d, new_d;
+    put_admins(old_d, old_polys);
+    put_admins(new_d, new_polys);
+    const LowMemCase c{dir.path(), "admin-insert"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
 
-    CHECK(check("encode poi: queue peaks 999 B\ndecode poi: queue peaks 10 100 B\n").empty());
-    CHECK(check("decode poi: thread cpu 0.1 s, ring peaks 7 8 B, queue peaks 9 100 B\n").empty());
-    CHECK(!check("decode poi: queue peaks 10 101 B\n").empty());
-    CHECK(!check("decode poi: thread cpu 0.1 s, ring peaks 101 8 B, queue peaks 9 10 B\n").empty());
-    for (const char* bad : {"decode poi:\n", "decode poi: queue B\n", "decode poi: queue peaks B\n", "decode poi: queue peaks ten B\n",
-                            "decode poi: thread cpu 0.1 s, ring peaks 7 8 B, queue peaks 9 x B\n", "decode streets: queue peaks 1 B\n"})
-        CHECK(!check(bad).empty());
+    CHECK(apply_both_modes(c, encoder_peaks_at_most("admin", ENCODER_HOLD)).empty());
+}
+
+// The memory checks of the replay tests above, on report lines as the
+// patcher writes them (sync: queue peaks; --threads: ring and queue peaks):
+// every peak at most the limit passes, one past it fails, a line whose peaks
+// are missing or not numbers fails instead of passing as a peak of 0, and
+// each check reads its own codec's line.
+TEST(codec_peaks_at_most_checks_every_peak_of_its_report_line) {
+    for (const bool decoder : {true, false}) {
+        const LogCheck check = decoder ? decoder_peaks_at_most("poi", 100) : encoder_peaks_at_most("poi", 100);
+        const std::string mine = decoder ? "decode" : "encode", other = decoder ? "encode" : "decode";
+
+        CHECK(check(other + " poi: queue peaks 999 B\n" + mine + " poi: queue peaks 10 100 B\n").empty());
+        CHECK(check(mine + " poi: thread cpu 0.1 s, ring peaks 7 8 B, queue peaks 9 100 B\n").empty());
+        CHECK(!check(mine + " poi: queue peaks 10 101 B\n").empty());
+        CHECK(!check(mine + " poi: thread cpu 0.1 s, ring peaks 101 8 B, queue peaks 9 10 B\n").empty());
+        for (const std::string& bad : {mine + " poi:", mine + " poi: queue B", mine + " poi: queue peaks B", mine + " poi: queue peaks ten B",
+                                       mine + " poi: thread cpu 0.1 s, ring peaks 7 8 B, queue peaks 9 x B", mine + " streets: queue peaks 1 B",
+                                       other + " poi: queue peaks 1 B"})
+            CHECK(!check(bad + "\n").empty());
+    }
 }
 
 // run_with_heap_peak measures the process it runs and nothing else: a dd of

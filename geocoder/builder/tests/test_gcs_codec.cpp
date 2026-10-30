@@ -235,14 +235,17 @@ AdminSet admin_set(const std::vector<AdminSpec>& specs, std::mt19937& rng) {
     return s;
 }
 
+// Writes the set's admin_polygons.bin into dir.
+void write_admin_polygons(const AdminSet& s, const std::string& dir) {
+    Writer pw(dir + "/admin_polygons.bin");
+    pw.put(s.polys);
+    pw.finish();
+}
+
 // Writes the set's admin_polygons.bin into dir and encodes its vertices, fed
 // in odd-sized pieces.
 void encode_admin(const AdminSet& s, const std::string& dir, std::mt19937& rng) {
-    {
-        Writer pw(dir + "/admin_polygons.bin");
-        pw.put(s.polys);
-        pw.finish();
-    }
+    write_admin_polygons(s, dir);
     poly::AdminEnc enc(dir);
     enc.state = {1};
     write_in_pieces(enc, 0, s.verts, rng, 997);
@@ -513,6 +516,41 @@ TEST(gcs_admin_round_trip_in_memory_and_by_planes) {
             poly::AdminDec dec(mem.path());
             CHECK(decode_all(dec)[0] == s.verts);
         }
+    }
+}
+
+TEST(gcs_encoder_queues_one_large_write_a_piece_at_a_time) {
+    // admin_vertices.bin of 1 MiB and of 10 MiB, each in one write (as the
+    // patcher's FILE passes on an INSERT stretch), of small blocks, blocks
+    // just under big_block() (taken whole) and just past it (plane by plane):
+    // at both sizes the queue peaks at no more than a piece of the write
+    // (64 KiB) and a block taken whole (256 KiB), and the files are those of
+    // a write in odd-sized pieces. The patch's file size is given, so a unit
+    // is checked against the bytes left from where it starts.
+    const uint32_t whole = uint32_t((big_block() - 10) / 8), planes = whole + 2;
+    std::mt19937 rng(20261030);
+    for (const size_t mib : {1, 10}) {
+        std::vector<AdminSpec> specs;
+        for (size_t k = 0, bytes = 0; bytes < (mib << 20); k++) {
+            const AdminSpec sp = k % 64 == 7    ? AdminSpec{whole, 4}
+                                 : k % 64 == 40 ? AdminSpec{planes, 4}
+                                                : AdminSpec{1 + uint32_t(rng() % 500), k % 2 ? 4 : 2};
+            specs.push_back(sp);
+            bytes += 10 + size_t(sp.vc) * 2 * size_t(sp.w);
+        }
+        const AdminSet s = admin_set(specs, rng);
+        ScratchDir one("gcs-test"), pieces("gcs-test");
+        write_admin_polygons(s, one.path());
+        poly::AdminEnc enc(one.path());
+        enc.state = {1};
+        enc.expect = {s.verts.size()};
+        enc.write(0, s.verts.data(), s.verts.size());
+        std::printf("    %zu MiB in one write: queue peak %zu B\n", mib, enc.peak(0));
+        CHECK(enc.peak(0) <= size_t(320) << 10);
+        finish_all(enc);
+        std::mt19937 feed(1);
+        encode_admin(s, pieces.path(), feed);
+        CHECK(dir_files(one.path()) == dir_files(pieces.path()));
     }
 }
 

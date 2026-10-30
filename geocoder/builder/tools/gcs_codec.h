@@ -104,15 +104,19 @@ struct Encoder {
     // empty); returns the bytes taken.
     virtual size_t consume(int, const uint8_t*, size_t) { return 0; }
     void write(int port, const void* p, size_t n) {
-        got[size_t(port)] += n;
-        if (in[size_t(port)].size() == 0) {
-            const size_t k = consume(port, static_cast<const uint8_t*>(p), n);
-            p = static_cast<const uint8_t*>(p) + k;
+        const size_t pt = size_t(port);
+        const uint8_t* b = static_cast<const uint8_t*>(p);
+        while (n) {
+            size_t k = in[pt].size() == 0 ? consume(port, b, n) : 0;
+            if (!k) {
+                k = std::min(n, ENCODER_PIECE);
+                in[pt].push(b, k);
+            }
+            got[pt] += k;  // by the piece, not the write: unit_size() puts the queue's front at got - queued
+            b += k;
             n -= k;
-            if (!n) return;
+            if (in[pt].size()) pump();
         }
-        in[size_t(port)].push(p, n);
-        pump();
     }
     bool all_closed() const {
         for (int s : state)

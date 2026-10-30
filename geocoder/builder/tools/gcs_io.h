@@ -27,6 +27,9 @@ namespace gcs {
 static const uint32_t NO = 0xFFFFFFFFu;
 // Default buffer sizes (bytes).
 static const size_t READ_BUF = size_t(64) << 10, WRITE_BUF = size_t(64) << 10, PLANE_BUF = size_t(16) << 10;
+// The most of one write an encoder queues before it pumps: its queue holds at most this plus the
+// largest unit it takes whole.
+static const size_t ENCODER_PIECE = size_t(64) << 10;
 // The bytes a Reader's buffer holds past its capacity, for the bit readers' 8-byte loads past a
 // unit's last byte.
 static const size_t READ_SLACK = 64;
