@@ -947,6 +947,27 @@ static int run(int argc, char* argv[]) {
 
         // Per-record buffer for applying remap/fixups inline (avoid copying entire file)
         std::vector<char> rec_buf(actual_stride);
+        // A MATCH run's records, rewritten one at a time, gather in batch and go out in one fwrite per
+        // RECORD_BATCH_BYTES. A joint parent's records go out one by one: its child's replay keys off
+        // the parent's buffered bytes.
+        std::vector<char> batch;
+        size_t batched = 0;
+        auto flush_batch = [&] {
+            if (batched) fwrite(batch.data(), 1, batched, outf);
+            batched = 0;
+        };
+        auto write_record = [&](const char* rec) {
+            if (jc) {
+                jc->before_parent_write(outf, actual_stride);
+                fwrite(rec, 1, actual_stride, outf);
+                jc->produce(child_bytes(rec));
+                return;
+            }
+            if (batch.empty()) batch.resize(RECORD_BATCH_BYTES);
+            memcpy(batch.data() + batched, rec, actual_stride);
+            batched += actual_stride;
+            if (batched + actual_stride > batch.size()) flush_batch();
+        };
 
         size_t old_rec = 0, new_rec = 0;
         uint64_t old_bytes = 0, written = 0;
@@ -1059,16 +1080,12 @@ static int run(int argc, char* argv[]) {
                             }
                         }
                         if (has_fixup) memcpy(rec_buf.data() + fixup_off, &new_off, 4);
-                        if (jc) jc->before_parent_write(outf, actual_stride);
-                        fwrite(rec_buf.data(), 1, actual_stride, outf);
-                        if (jc) jc->produce(child_bytes(rec_buf.data()));
+                        write_record(rec_buf.data());
                     } else {
-                        // No modification needed: the record as read
-                        if (jc) jc->before_parent_write(outf, actual_stride);
-                        fwrite(rec, 1, actual_stride, outf);
-                        if (jc) jc->produce(child_bytes(rec));
+                        write_record(rec);  // no modification needed: the record as read
                     }
                 }
+                flush_batch();
                 if (track) remap.add_match(static_cast<uint32_t>(old_rec), static_cast<uint32_t>(new_rec), count);
                 written += run_bytes;
                 old_rec += count; new_rec += count; old_bytes += run_bytes;

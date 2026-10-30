@@ -508,6 +508,9 @@ constexpr uint32_t PARALLEL_DELTA_STRIDE = 0xFA;
 // The widest record a merge section may give (the patcher sizes a record buffer by it): the
 // widest real record is 36 bytes, and every stride from 0xFA up to here is a section kind.
 static constexpr uint32_t MAX_RECORD_STRIDE = 0xFF;
+// The patcher writes a MATCH run's rewritten records this many bytes at a time.
+static constexpr size_t RECORD_BATCH_BYTES = size_t(16) << 10;
+static_assert(RECORD_BATCH_BYTES >= MAX_RECORD_STRIDE, "a batch holds at least one record");
 struct ParallelDeltaFile { PatchFileId fid, parent; uint32_t value_stride, remap_kind; };
 static constexpr ParallelDeltaFile PARALLEL_DELTA_FILES[] = {
     {PatchFileId::ADDR_POSTCODES, PatchFileId::ADDR_POINTS, 4, 2},
