@@ -376,7 +376,8 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
     of the new file. A parent sent unchanged counts as one MATCH.
   stride=0xFB: cell list delta for <name>_cells.bin + <name>_entries.bin
     (payload_size u64, new entries size u64, n_removed u32 + [cell u64],
-    n_set u32 + [cell u64, n_lost u32, n_gained u32, lost ids, gained ids])
+    n_set u32 + [cell u64, n_lost u32, n_gained u32, lost ids, gained ids];
+    both cell lists ascending)
   otherwise: n_runs (u32) + n_values (u32) + runs_size (u32) + values_size (u32)
     + runs + values + seq_size (u64) + merge ops
   Ops: MATCH(count:u32) | INSERT(count:u32, data) | DELETE(count:u32)
@@ -393,6 +394,8 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
 
 Cell Changes: marker 0xFFFFFFFB/FA/F5/F4 (geo/admin/poi/place) + n_added (u32)
   + n_removed (u32) + [cell_id:u64] × n_added + [cell_id:u64] × n_removed
+  Each list ascending, equal ids allowed. The patcher reads the lists where
+  they sit in the patch and refuses one that steps back.
 
 Secondary ID Remap: marker 0xFFFFFFF6 (u32) + n_files (u32)
   per file: file_id (u32) + n_pairs (u32) + [(old_id:u32, new_id:u32)] × n_pairs
@@ -406,7 +409,8 @@ Geo Entry Deltas (street / addr / interp entries): marker 0xFFFFFFF0 (u32)
   + [id:u32] × n_gained, turning the list the patcher derives (old list,
   ids remapped) into the new one. n_lost 0xFFFF: the gained ids are the
   whole new list. v8: an old id the remap doesn't map is a deleted record
-  and drops out of the derived list.
+  and drops out of the derived list. At most one per entries file; the
+  patcher refuses another file or a second one.
 
 Entry Corrections: marker 0xFFFFFFF8 (u32) + file_id (u32) + count (u32)
   + [(cell_id:u64, entry_count:u16, [id:u32] × entry_count)] × count
@@ -414,7 +418,8 @@ Entry Corrections: marker 0xFFFFFFF8 (u32) + file_id (u32) + count (u32)
 Cell Index Delta: marker 0xFFFFFFF7 (u32) + file_id (u32, the entries file)
   + payload_size (u64) + the cell list delta from the rebuilt admin / POI /
   place index to the new one (same layout as stride=0xFB); replaces Entry
-  Corrections for that file
+  Corrections for that file. At most one per entries file; the patcher
+  refuses another file or a second one.
 
 End marker: 0xFFFFFFFF (u32)
 ```

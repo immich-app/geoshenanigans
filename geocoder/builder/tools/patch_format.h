@@ -13,6 +13,7 @@
 #include <iostream>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <sys/mman.h>
@@ -311,7 +312,8 @@ static constexpr uint32_t SECTION_END_MARKER = 0xFFFFFFFFu;
 // Cell changes section marker: 0xFFFFFFFB
 // Format: marker, num_added(u32), num_removed(u32),
 //         [added_cell_id(u64)] * num_added, [removed_cell_id(u64)] * num_removed
-// For both geo and admin cell sets.
+// For both geo and admin cell sets. Each list ascends (equal ids allowed:
+// diff_cell_ids gives multisets); the patcher reads it in place (AscendingIds).
 static constexpr uint32_t CELL_CHANGES_GEO_MARKER = 0xFFFFFFFB;
 static constexpr uint32_t CELL_CHANGES_ADMIN_MARKER = 0xFFFFFFFA;
 static constexpr uint32_t CELL_CHANGES_POI_MARKER = 0xFFFFFFF5;
@@ -332,6 +334,7 @@ static constexpr uint32_t ENTRY_CORRECTION_MARKER = 0xFFFFFFF8;
 // reproduces the new index byte for byte.
 // Format: marker(4), file_id(4) = the entries file, payload_size(u64),
 //   append_cell_list_delta(rebuilt → new) bytes.
+// At most one per file of CELL_INDEX_ENTRIES_FILES.
 static constexpr uint32_t CELL_INDEX_DELTA_MARKER = 0xFFFFFFF7;
 
 // Geo entry delta marker: 0xFFFFFFF0
@@ -341,8 +344,17 @@ static constexpr uint32_t CELL_INDEX_DELTA_MARKER = 0xFFFFFFF7;
 //   cell_id(u64), n_lost(u16), n_gained(u16), lost ids, gained ids.
 // n_lost == GEO_LIST_REPLACE: the gained ids are the cell's whole new list
 // (a list that isn't sorted, or a delta that wouldn't fit).
+// At most one per file of GEO_ENTRIES_FILES.
 static constexpr uint32_t GEO_ENTRY_DELTA_MARKER = 0xFFFFFFF0;
 static constexpr uint16_t GEO_LIST_REPLACE = 0xFFFF;
+
+// The entries files the geo walk derives and corrects, and those of the
+// cell indexes rebuilt from an id remap.
+using EntriesFiles = std::array<PatchFileId, 3>;
+static constexpr EntriesFiles GEO_ENTRIES_FILES = {PatchFileId::STREET_ENTRIES, PatchFileId::ADDR_ENTRIES,
+                                                   PatchFileId::INTERP_ENTRIES};
+static constexpr EntriesFiles CELL_INDEX_ENTRIES_FILES = {PatchFileId::ADMIN_ENTRIES, PatchFileId::POI_ENTRIES,
+                                                          PatchFileId::PLACE_ENTRIES};
 
 // Secondary ID remap marker: 0xFFFFFFF6
 // Additional old→new ID mappings for modified records (recovered by relaxed key matching).
@@ -621,6 +633,86 @@ inline void check_old_file_sizes(const char* data, size_t size, size_t& pos, con
     }
 }
 
+// --- Patch sections read in place ---
+
+// Where a section's bytes sit in the mapped patch.
+struct PatchRef {
+    size_t pos, size;
+};
+
+// The sections of one kind the diff sends at most once per entries file
+// (GEO_ENTRIES_FILES, CELL_INDEX_ENTRIES_FILES), in one fixed slot per file:
+// a section for another file, or a second one for a file, is malformed.
+class EntriesFileSections {
+public:
+    EntriesFileSections(const char* kind, const EntriesFiles& files) : kind_(kind), files_(files) {}
+
+    void add(uint32_t fid, PatchRef ref) {
+        const size_t slot = slot_of(fid);
+        if (slot == files_.size()) throw std::runtime_error(std::string("Malformed ") + kind_ + " for file " + std::to_string(fid));
+        if (refs_[slot]) throw std::runtime_error(std::string("Malformed ") + kind_ + ": a second one for " + patch_file_names[fid]);
+        refs_[slot] = ref;
+    }
+    // The file's section, or null when the patch sent none.
+    const PatchRef* find(PatchFileId fid) const {
+        const size_t slot = slot_of(static_cast<uint32_t>(fid));
+        return slot < files_.size() && refs_[slot] ? &*refs_[slot] : nullptr;
+    }
+
+private:
+    size_t slot_of(uint32_t fid) const {
+        return static_cast<size_t>(std::find(files_.begin(), files_.end(), static_cast<PatchFileId>(fid)) - files_.begin());
+    }
+
+    const char* kind_;
+    EntriesFiles files_;
+    std::array<std::optional<PatchRef>, std::tuple_size<EntriesFiles>::value> refs_;
+};
+
+// u64 cell ids read where they sit, front to back by one walk: a cell change
+// list or a cell list delta's removed cells. The diff writes them ascending,
+// equal ids allowed (diff_cell_ids gives multisets); a step back is refused
+// as a malformed `what` when the walk reaches it, or by require_ascending()
+// among the ids the walk left. A copy walks on its own.
+class AscendingIds {
+public:
+    AscendingIds() = default;  // none
+    AscendingIds(const char* data, size_t count, const char* what) : data_(data), count_(count), what_(what) { load(); }
+
+    const char* data() const { return data_; }
+    size_t bytes() const { return count_ * sizeof(uint64_t); }
+    bool done() const { return at_ == count_; }
+    // The id at the cursor, while not done().
+    uint64_t front() const { return id_; }
+    void pop() {
+        at_++;
+        load();
+    }
+    // Moves past the ids below id: whether the next one is id.
+    bool skip_to(uint64_t id) {
+        while (!done() && id_ < id) pop();
+        return !done() && id_ == id;
+    }
+    // Reads the ids the walk left (past the last cell it asked for).
+    void require_ascending() {
+        while (!done()) pop();
+    }
+
+private:
+    void load() {
+        if (done()) return;
+        uint64_t id;
+        memcpy(&id, data_ + at_ * sizeof id, sizeof id);
+        if (at_ > 0 && id < id_) throw std::runtime_error(std::string("Malformed ") + what_);
+        id_ = id;
+    }
+
+    const char* data_ = nullptr;
+    size_t count_ = 0, at_ = 0;
+    uint64_t id_ = 0;
+    const char* what_ = "";
+};
+
 // --- Cell index rebuild ---
 
 // Admin, POI and place cell index rebuild: 12-byte cells (cell_id u64,
@@ -772,15 +864,13 @@ inline void append_cell_list_delta(std::vector<char>& out, const CellLists& old_
 // machines, where materialising planet poi/all (1.1M cells, 25M ids, a 23M
 // entry remap map) cost over 1 GiB. The old cells and entries are read
 // front to back through size() and at(off, n), a view that lasts until the
-// next call (SequentialFileReader). Returns the entries bytes written.
+// next call (SequentialFileReader); the cell changes and the delta where
+// they sit. Returns the entries bytes written.
 template <typename Cells, typename Entries, typename Remap, typename OutCells, typename OutEntries>
-uint64_t stream_cell_index(Cells&& cells, Entries&& entries,
-                           std::vector<uint64_t> added, std::vector<uint64_t> removed, Remap remap,
+uint64_t stream_cell_index(Cells&& cells, Entries&& entries, AscendingIds added, AscendingIds removed, Remap remap,
                            const char* delta, size_t delta_size, OutCells out_cells, OutEntries out_entries) {
     auto malformed = [] { throw std::runtime_error("Malformed cell list delta"); };
     auto bad_index = [] { throw std::runtime_error("Malformed cell index"); };
-    std::sort(added.begin(), added.end());
-    std::sort(removed.begin(), removed.end());
 
     size_t pos = 0;
     auto take = [&](void* dst, size_t n) {
@@ -791,9 +881,9 @@ uint64_t stream_cell_index(Cells&& cells, Entries&& entries,
     uint32_t n_gone;
     take(&n_gone, 4);
     if ((delta_size - pos) / 8 < n_gone) malformed();
-    const char* gone = delta + pos;
+    AscendingIds gone(delta + pos, n_gone, "cell list delta");
     pos += (size_t)n_gone * 8;
-    uint32_t n_set, set_i = 0, gone_i = 0;
+    uint32_t n_set, set_i = 0;
     take(&n_set, 4);
 
     // The next changed cell from the delta, read in cell order.
@@ -812,19 +902,10 @@ uint64_t stream_cell_index(Cells&& cells, Entries&& entries,
         prev_set = set_cid;
         set_i++;
     };
-    auto delta_drops = [&](uint64_t cid) {
-        uint64_t g = 0;
-        while (gone_i < n_gone) {
-            memcpy(&g, gone + (size_t)gone_i * 8, 8);
-            if (g >= cid) break;
-            gone_i++;
-        }
-        return gone_i < n_gone && g == cid;
-    };
 
     // The next rebuilt cell: old cells minus `removed`, merged with `added`.
     const uint64_t entries_size = entries.size();
-    size_t n_cells = cells.size() / 12, i = 0, a = 0, r = 0;
+    size_t n_cells = cells.size() / 12, i = 0;
     uint64_t prev_old = 0;
     std::vector<uint32_t> ids;
     auto next_source = [&](uint64_t& cid) -> bool {
@@ -837,18 +918,17 @@ uint64_t stream_cell_index(Cells&& cells, Entries&& entries,
                 memcpy(&off, rec + 8, 4);
                 if (i > 0 && old_cid <= prev_old) bad_index();
             }
-            uint64_t add_cid = a < added.size() ? added[a] : NONE;
+            uint64_t add_cid = added.done() ? NONE : added.front();
             if (old_cid == NONE && add_cid == NONE) return false;
             if (add_cid < old_cid) {
-                cid = add_cid; a++;
+                cid = add_cid; added.pop();
                 ids.clear();
                 return true;
             }
             if (add_cid == old_cid) bad_index();
             prev_old = old_cid;
             i++;
-            while (r < removed.size() && removed[r] < old_cid) r++;
-            if (r < removed.size() && removed[r] == old_cid) continue;
+            if (removed.skip_to(old_cid)) continue;
             cid = old_cid;
             ids.clear();
             if (off != 0xFFFFFFFF) {
@@ -896,11 +976,13 @@ uint64_t stream_cell_index(Cells&& cells, Entries&& entries,
             std::merge(kept.begin(), kept.end(), gained.begin(), gained.end(), std::back_inserter(merged));
             emit(src, merged);
             next_set();
-        } else if (!delta_drops(src)) {
+        } else if (!gone.skip_to(src)) {
             emit(src, ids);
         }
         have = next_source(cid);
     }
+    removed.require_ascending();
+    gone.require_ascending();
     if (pos != delta_size) malformed();
     return written;
 }
@@ -962,11 +1044,13 @@ inline void append_geo_list_delta(std::vector<char>& out, uint64_t cell_id,
     put(gained.data(), gained.size() * 4);
 }
 
-// Checks `count` cell corrections in data[pos, size) and moves pos past
-// them; throws when they are short or out of cell order. They stay where they
-// are: a GeoListDeltaCursor reads each one as the entry walk reaches its cell
-// (held as vectors they cost the patcher ~7 MiB of heap on planet).
-inline void scan_geo_list_deltas(const char* data, size_t size, size_t& pos, uint32_t count) {
+// Checks `count` cell corrections in data[pos, size), moves pos past them and
+// returns where they sit; throws when they are short or out of cell order.
+// They stay there: a GeoListDeltaCursor reads each one as the entry walk
+// reaches its cell (held as vectors they cost the patcher ~7 MiB of heap on
+// planet).
+inline PatchRef scan_geo_list_deltas(const char* data, size_t size, size_t& pos, uint32_t count) {
+    const size_t start = pos;
     uint64_t prev = 0;
     for (uint32_t i = 0; i < count; i++) {
         if (size - pos < 12) throw std::runtime_error("Malformed geo entry delta");
@@ -981,14 +1065,16 @@ inline void scan_geo_list_deltas(const char* data, size_t size, size_t& pos, uin
         if (size - pos < ids) throw std::runtime_error("Malformed geo entry delta");
         pos += ids;
     }
+    return {start, pos - start};
 }
 
-// Forward cursor over corrections scan_geo_list_deltas checked, asked for in
-// ascending cell order; apply() turns a cell's derived list into its new one.
+// Forward cursor over the corrections scan_geo_list_deltas checked (at ref
+// in data), asked for in ascending cell order; apply() turns a cell's
+// derived list into its new one.
 class GeoListDeltaCursor {
 public:
     GeoListDeltaCursor() = default;  // no corrections
-    GeoListDeltaCursor(const char* data, size_t pos, uint32_t count) : data_(data), pos_(pos), left_(count) { load(); }
+    GeoListDeltaCursor(const char* data, PatchRef ref) : data_(data), pos_(ref.pos), end_(ref.pos + ref.size) { load(); }
 
     // The cursor holds cell c's correction.
     bool at(uint64_t c) {
@@ -1011,8 +1097,7 @@ public:
 
 private:
     void load() {
-        if (!left_) { have_ = false; return; }
-        left_--;
+        if (pos_ == end_) { have_ = false; return; }
         memcpy(&cid_, data_ + pos_, 8); memcpy(&nl_, data_ + pos_ + 8, 2); memcpy(&ng_, data_ + pos_ + 10, 2);
         replace_ = nl_ == GEO_LIST_REPLACE;
         if (replace_) nl_ = 0;
@@ -1023,8 +1108,7 @@ private:
     }
 
     const char* data_ = nullptr;
-    size_t pos_ = 0, lost_ = 0, gained_ = 0;
-    uint32_t left_ = 0;
+    size_t pos_ = 0, end_ = 0, lost_ = 0, gained_ = 0;
     bool have_ = false, replace_ = false;
     uint64_t cid_ = 0;
     uint16_t nl_ = 0, ng_ = 0;

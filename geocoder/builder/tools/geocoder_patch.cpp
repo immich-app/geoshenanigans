@@ -388,6 +388,32 @@ static uint64_t child_bytes_of(uint32_t fid, const char* rec, JointChild& jc) {
     }
 }
 
+// A cell index's added and removed cells, where they sit in the patch.
+struct CellChanges {
+    AscendingIds added, removed;
+};
+
+// Readahead over bytes of the patch a walk is about to read front to back:
+// the patch is mapped MADV_RANDOM, which faults it in a page at a time.
+static void advise_sequential(const char* p, size_t n) {
+    if (!n) return;
+    const uintptr_t page = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+    const uintptr_t start = reinterpret_cast<uintptr_t>(p) & ~(page - 1);
+    madvise(reinterpret_cast<void*>(start), reinterpret_cast<uintptr_t>(p) + n - start, MADV_SEQUENTIAL);
+}
+static void advise_sequential(const CellChanges& c) {
+    advise_sequential(c.added.data(), c.added.bytes());
+    advise_sequential(c.removed.data(), c.removed.bytes());
+}
+
+// The ids as a vector, for the materialised rebuild a patch with entry
+// corrections takes.
+static std::vector<uint64_t> ids_vector(AscendingIds ids) {
+    std::vector<uint64_t> v;
+    for (; !ids.done(); ids.pop()) v.push_back(ids.front());
+    return v;
+}
+
 static int run(int argc, char* argv[]) {
     if (argc < 5 || std::string(argv[3]) != "-o") {
         std::cerr << "Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir> [--threads]" << std::endl;
@@ -549,14 +575,13 @@ static int run(int argc, char* argv[]) {
     // ID remaps: file_id → vector<uint32_t> where remap[old_idx] = new_idx
     // Old → new record ids of the replayed files the entry pipeline remaps by.
     std::unordered_map<uint32_t, RecordRemap> record_remaps;
-    std::vector<uint64_t> geo_added, geo_removed, admin_added, admin_removed, poi_added, poi_removed, place_added, place_removed;
-    // Street / addr / interp per-cell corrections by entries file id: where
-    // they sit in the mapped patch and how many (read as the walk reaches them).
-    std::unordered_map<uint32_t, std::pair<size_t, uint32_t>> geo_delta_refs;
+    // The rebuilds' cell changes and per-cell corrections, read in place
+    // as their walks reach them.
+    CellChanges geo_cells, admin_cells, poi_cells, place_cells;
+    EntriesFileSections geo_deltas("geo entry delta", GEO_ENTRIES_FILES);
+    EntriesFileSections cell_index_deltas("cell index delta", CELL_INDEX_ENTRIES_FILES);
     struct CellCorr { uint64_t cell_id; std::vector<uint32_t> ids; };
     std::unordered_map<uint32_t, std::vector<CellCorr>> entry_corrections;
-    // CELL_INDEX_DELTA payloads by entries file id (admin / POI / place).
-    std::unordered_map<uint32_t, std::vector<char>> cell_index_deltas;
     // POI parent-id remap (from POI_PARENT_REMAP_MARKER). Applied during
     // POI_RECORDS MATCH replay to bytes 24/28/32 of each record alongside
     // the str_remap on byte 16. Sorted by old_id for binary-search lookup.
@@ -603,6 +628,16 @@ static int run(int argc, char* argv[]) {
         pos = jc->section_end;
         jc.reset();
     };
+    // A cell changes section's lists, where they sit (the label names them in the log).
+    auto read_cell_changes = [&](const char* label) {
+        uint32_t na = ru32(), nr = ru32();
+        require_bytes(((uint64_t)na + nr) * 8, "cell changes");
+        CellChanges c;
+        c.added = AscendingIds(take((size_t)na * 8, "cell changes"), na, "cell changes");
+        c.removed = AscendingIds(take((size_t)nr * 8, "cell changes"), nr, "cell changes");
+        std::cerr << "  " << label << " cells: +" << na << " -" << nr << std::endl;
+        return c;
+    };
 
     bool saw_end = false;
     while (pos < patch_size) {
@@ -610,46 +645,13 @@ static int run(int argc, char* argv[]) {
         if (file_id == SECTION_END_MARKER) { saw_end = true; break; }
 
         // --- Metadata sections ---
-        if (file_id == CELL_CHANGES_GEO_MARKER) {
-            uint32_t na = ru32(), nr = ru32();
-            require_bytes(((size_t)na + nr) * 8, "cell changes");
-            geo_added.resize(na); geo_removed.resize(nr);
-            for (uint32_t i = 0; i < na; i++) { memcpy(&geo_added[i], take(8, "cell id"), 8); }
-            for (uint32_t i = 0; i < nr; i++) { memcpy(&geo_removed[i], take(8, "cell id"), 8); }
-            std::cerr << "  Geo cells: +" << na << " -" << nr << std::endl;
-            continue;
-        }
-        if (file_id == CELL_CHANGES_ADMIN_MARKER) {
-            uint32_t na = ru32(), nr = ru32();
-            require_bytes(((size_t)na + nr) * 8, "cell changes");
-            admin_added.resize(na); admin_removed.resize(nr);
-            for (uint32_t i = 0; i < na; i++) { memcpy(&admin_added[i], take(8, "cell id"), 8); }
-            for (uint32_t i = 0; i < nr; i++) { memcpy(&admin_removed[i], take(8, "cell id"), 8); }
-            std::cerr << "  Admin cells: +" << na << " -" << nr << std::endl;
-            continue;
-        }
-        if (file_id == CELL_CHANGES_POI_MARKER) {
-            uint32_t na = ru32(), nr = ru32();
-            require_bytes(((size_t)na + nr) * 8, "cell changes");
-            poi_added.resize(na); poi_removed.resize(nr);
-            for (uint32_t i = 0; i < na; i++) { memcpy(&poi_added[i], take(8, "cell id"), 8); }
-            for (uint32_t i = 0; i < nr; i++) { memcpy(&poi_removed[i], take(8, "cell id"), 8); }
-            std::cerr << "  POI cells: +" << na << " -" << nr << std::endl;
-            continue;
-        }
-        if (file_id == CELL_CHANGES_PLACE_MARKER) {
-            uint32_t na = ru32(), nr = ru32();
-            require_bytes(((size_t)na + nr) * 8, "cell changes");
-            place_added.resize(na); place_removed.resize(nr);
-            for (uint32_t i = 0; i < na; i++) { memcpy(&place_added[i], take(8, "cell id"), 8); }
-            for (uint32_t i = 0; i < nr; i++) { memcpy(&place_removed[i], take(8, "cell id"), 8); }
-            std::cerr << "  Place cells: +" << na << " -" << nr << std::endl;
-            continue;
-        }
+        if (file_id == CELL_CHANGES_GEO_MARKER) { geo_cells = read_cell_changes("Geo"); continue; }
+        if (file_id == CELL_CHANGES_ADMIN_MARKER) { admin_cells = read_cell_changes("Admin"); continue; }
+        if (file_id == CELL_CHANGES_POI_MARKER) { poi_cells = read_cell_changes("POI"); continue; }
+        if (file_id == CELL_CHANGES_PLACE_MARKER) { place_cells = read_cell_changes("Place"); continue; }
         if (file_id == GEO_ENTRY_DELTA_MARKER) {
             uint32_t fid = ru32(), c = ru32();
-            geo_delta_refs[fid] = {pos, c};
-            scan_geo_list_deltas(P, patch_size, pos, c);
+            geo_deltas.add(fid, scan_geo_list_deltas(P, patch_size, pos, c));
             std::cerr << "  Geo entry deltas " << fid << ": " << c << " cells" << std::endl;
             continue;
         }
@@ -700,8 +702,9 @@ static int run(int argc, char* argv[]) {
         if (file_id == CELL_INDEX_DELTA_MARKER) {
             uint32_t fid = ru32();
             uint64_t n = ru64();
-            const char* p = take(n, "cell index delta");
-            cell_index_deltas[fid].assign(p, p + n);
+            require_bytes(n, "cell index delta");
+            cell_index_deltas.add(fid, {pos, static_cast<size_t>(n)});
+            take(static_cast<size_t>(n), "cell index delta");
             std::cerr << "  Cell index delta " << fid << ": " << n << " bytes" << std::endl;
             continue;
         }
@@ -1249,28 +1252,23 @@ static int run(int argc, char* argv[]) {
         SequentialFileReader old_ie(cur_dir + "/interp_entries.bin");
         size_t n_old = old_geo.size() / 20;
 
-        // Corrections and removed cells, sorted by cell id and read through
-        // forward cursors: the walk below visits cells in ascending id
-        // order, and a hash lookup plus three binary searches per cell cost
+        // Added and removed cells and the diff's per-cell corrections, in
+        // cell id order like the walk, read where they sit through forward
+        // cursors: a hash lookup plus three binary searches per cell cost
         // ~17 s of client CPU on planet's ~380M cells.
-        std::sort(geo_removed.begin(), geo_removed.end());
-        size_t removed_i = 0;
-        auto is_removed = [&](uint64_t cid) {
-            while (removed_i < geo_removed.size() && geo_removed[removed_i] < cid) removed_i++;
-            return removed_i < geo_removed.size() && geo_removed[removed_i] == cid;
-        };
-        // The diff's per-cell corrections, in cell id order like the walk.
+        AscendingIds& added = geo_cells.added;
+        AscendingIds& removed = geo_cells.removed;
+        advise_sequential(geo_cells);
         auto cursor_of = [&](PatchFileId fid) {
-            auto it = geo_delta_refs.find((uint32_t)fid);
-            if (it == geo_delta_refs.end()) return GeoListDeltaCursor();
-            return GeoListDeltaCursor(P, it->second.first, it->second.second);
+            const PatchRef* ref = geo_deltas.find(fid);
+            if (!ref) return GeoListDeltaCursor();
+            advise_sequential(P + ref->pos, ref->size);
+            return GeoListDeltaCursor(P, *ref);
         };
         GeoListDeltaCursor cur_s = cursor_of(PatchFileId::STREET_ENTRIES);
         GeoListDeltaCursor cur_a = cursor_of(PatchFileId::ADDR_ENTRIES);
         GeoListDeltaCursor cur_i = cursor_of(PatchFileId::INTERP_ENTRIES);
         std::vector<uint32_t> scratch;
-        // Added cells sorted
-        std::sort(geo_added.begin(), geo_added.end());
         log_phase("  Setup", t_entry);
 
         // Open 4 output files
@@ -1316,7 +1314,7 @@ static int run(int argc, char* argv[]) {
 
         // Merge-walk: old cells + added cells in sorted order
         // Both are sorted by cell_id. Merge them, skip removed.
-        size_t old_i = 0, add_i = 0;
+        size_t old_i = 0;
         size_t cells_written = 0;
 
         // The cell's derived list (old list, ids remapped), then its
@@ -1342,7 +1340,7 @@ static int run(int argc, char* argv[]) {
         };
         const ListOffsets added_cell = {NO, NO, NO};
 
-        while (old_i < n_old || add_i < geo_added.size()) {
+        while (old_i < n_old || !added.done()) {
             uint64_t old_cid = UINT64_MAX, add_cid = UINT64_MAX;
             ListOffsets old_offs = added_cell;
             if (old_i < n_old) {
@@ -1352,10 +1350,10 @@ static int run(int argc, char* argv[]) {
                 memcpy(&old_cid, rec, 8);
                 memcpy(old_offs.data(), rec + 8, 12);
             }
-            if (add_i < geo_added.size()) add_cid = geo_added[add_i];
+            if (!added.done()) add_cid = added.front();
 
             if (old_cid <= add_cid) {
-                if (!is_removed(old_cid)) {
+                if (!removed.skip_to(old_cid)) {
                     process_cell(old_cid, old_offs);
                 } else {
                     // An encoded set's lists come in row order: those before a removed row's are
@@ -1366,10 +1364,10 @@ static int run(int argc, char* argv[]) {
                         if (old_offs[size_t(t)] != NO) es[t]->skip_to(old_offs[size_t(t)]);
                 }
                 old_i++;
-                if (old_cid == add_cid) add_i++; // skip duplicate add
+                if (!added.done() && old_cid == add_cid) added.pop(); // skip duplicate add
             } else {
                 process_cell(add_cid, added_cell);
-                add_i++;
+                added.pop();
             }
 
             if (cells_written % 10000000 == 0 && cells_written > 0) {
@@ -1377,6 +1375,7 @@ static int run(int argc, char* argv[]) {
                           << "M ae=" << o_ae.written/1024/1024 << "M anon=" << get_rss_anon_mb() << "M" << std::endl;
             }
         }
+        removed.require_ascending();
 
         close_patch_outputs({{f_geo, "geo_cells.bin"}, {o_se.f, "street_entries.bin"}, {o_ae.f, "addr_entries.bin"},
                              {o_ie.f, "interp_entries.bin"}});
@@ -1439,17 +1438,17 @@ static int run(int argc, char* argv[]) {
         // when there is no delta and the materialised rebuild + corrections
         // has to run instead.
         auto stream_rebuild = [&](const char* label, PatchFileId entries_fid, const std::string& prefix,
-                                  const std::vector<uint64_t>& added, const std::vector<uint64_t>& removed,
-                                  auto remap) -> bool {
-            auto dit = cell_index_deltas.find((uint32_t)entries_fid);
-            if (dit == cell_index_deltas.end()) return false;
+                                  const CellChanges& changes, auto remap) -> bool {
+            const PatchRef* delta = cell_index_deltas.find(entries_fid);
+            if (!delta) return false;
+            advise_sequential(changes);
+            advise_sequential(P + delta->pos, delta->size);
             SequentialFileReader old_c(cur_dir + "/" + prefix + "_cells.bin");
             SequentialFileReader old_e(cur_dir + "/" + prefix + "_entries.bin");
             FILE* fc = open_out(prefix + "_cells.bin");
             FILE* fe = open_out(prefix + "_entries.bin");
             size_t n_out = 0;
-            stream_cell_index(old_c, old_e, added, removed, remap,
-                              dit->second.data(), dit->second.size(),
+            stream_cell_index(old_c, old_e, changes.added, changes.removed, remap, P + delta->pos, delta->size,
                               [&](const char* p, size_t len) { fwrite(p, 1, len, fc); n_out += len; },
                               [&](const char* p, size_t len) { fwrite(p, 1, len, fe); });
             close_patch_outputs({{fc, prefix + "_cells.bin"}, {fe, prefix + "_entries.bin"}});
@@ -1463,11 +1462,12 @@ static int run(int argc, char* argv[]) {
         {
             // The admin leg of the parent-id remap, as the diff used it.
             auto admin_remap = [&](uint32_t id) { return poi_remap_lookup(poi_admin_remap, id); };
-            if (!stream_rebuild("Admin", PatchFileId::ADMIN_ENTRIES, "admin", admin_added, admin_removed, admin_remap)) {
+            if (!stream_rebuild("Admin", PatchFileId::ADMIN_ENTRIES, "admin", admin_cells, admin_remap)) {
                 std::unordered_map<uint32_t,uint32_t> ad_rm(poi_admin_remap.begin(), poi_admin_remap.end());
                 auto old_ac = read_file(cur_dir + "/admin_cells.bin");
                 auto old_adme = read_file(cur_dir + "/admin_entries.bin");
-                auto admin = rebuild_cells_from_remap(old_ac, old_adme, ad_rm, admin_added, admin_removed);
+                auto admin = rebuild_cells_from_remap(old_ac, old_adme, ad_rm, ids_vector(admin_cells.added),
+                                                      ids_vector(admin_cells.removed));
                 write_corrected_cells("Admin", PatchFileId::ADMIN_ENTRIES, admin.cells_data,
                                       admin.entries_data, "admin_cells.bin", "admin_entries.bin");
             }
@@ -1477,14 +1477,14 @@ static int run(int argc, char* argv[]) {
         // POI and place: ids move by the replay's record remap file, read in
         // place by the streaming pass (by id, so not as a sequential stream).
         auto rebuild_by_record_remap = [&](const char* label, PatchFileId records_fid, PatchFileId entries_fid,
-                                           const std::string& prefix, const std::vector<uint64_t>& added,
-                                           const std::vector<uint64_t>& removed) {
+                                           const std::string& prefix, const CellChanges& changes) {
             const RecordRemap& rm = remap_of(records_fid);
             auto record_remap = [&rm](uint32_t id) { uint32_t v = rm[id]; return v == 0xFFFFFFFFu ? id : v; };
-            if (!stream_rebuild(label, entries_fid, prefix, added, removed, record_remap)) {
+            if (!stream_rebuild(label, entries_fid, prefix, changes, record_remap)) {
                 std::unordered_map<uint32_t,uint32_t> rm_map;
                 for (uint32_t i = 0; i < rm.size(); i++)
                     if (rm[i] != 0xFFFFFFFFu) rm_map[i] = rm[i];
+                const std::vector<uint64_t> added = ids_vector(changes.added), removed = ids_vector(changes.removed);
                 auto old_c = read_file(cur_dir + "/" + prefix + "_cells.bin");
                 auto old_e = read_file(cur_dir + "/" + prefix + "_entries.bin");
                 if (!old_c.empty() || !added.empty() || !removed.empty() || !rm_map.empty()) {
@@ -1495,8 +1495,8 @@ static int run(int argc, char* argv[]) {
             }
             log_phase((std::string("  ") + label).c_str(), t_entry);
         };
-        rebuild_by_record_remap("POI", PatchFileId::POI_RECORDS, PatchFileId::POI_ENTRIES, "poi", poi_added, poi_removed);
-        rebuild_by_record_remap("Place", PatchFileId::PLACE_NODES, PatchFileId::PLACE_ENTRIES, "place", place_added, place_removed);
+        rebuild_by_record_remap("POI", PatchFileId::POI_RECORDS, PatchFileId::POI_ENTRIES, "poi", poi_cells);
+        rebuild_by_record_remap("Place", PatchFileId::PLACE_NODES, PatchFileId::PLACE_ENTRIES, "place", place_cells);
     }
 
     unmap_file(patch_map);

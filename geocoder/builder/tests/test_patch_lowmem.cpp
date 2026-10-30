@@ -121,6 +121,9 @@ void put_addrs(BuildDir& d, const std::vector<Addr>& addrs) {
     d["addr_vertices.bin"] = verts;
 }
 
+// The id of a fixture's cell k.
+uint64_t cell_id(uint32_t k) { return uint64_t(k + 1) << 27; }
+
 // A geo row: its cell index and the street ids it lists.
 using GeoRow = std::pair<uint32_t, std::vector<uint32_t>>;
 
@@ -135,7 +138,7 @@ void put_geo(BuildDir& d, const std::vector<GeoRow>& rows, uint32_t ways = 1000)
         append(street_ways, w);
     }
     for (const auto& [k, ids] : rows) {
-        append(geo, uint64_t(k + 1) << 27);
+        append(geo, cell_id(k));
         append(geo, ids.empty() ? NO : static_cast<uint32_t>(entries.size()));
         append(geo, NO);
         append(geo, NO);
@@ -149,6 +152,14 @@ void put_geo(BuildDir& d, const std::vector<GeoRow>& rows, uint32_t ways = 1000)
     d["street_entries.bin"] = entries;
     d["addr_entries.bin"] = {};
     d["interp_entries.bin"] = {};
+}
+
+// The POI cell index of lists (cell id → POI ids), into d, as the builder
+// writes it.
+void put_poi_cells(BuildDir& d, const CellLists& lists) {
+    auto [cells, entries] = write_cell_lists(lists);
+    d["poi_cells.bin"] = cells;
+    d["poi_entries.bin"] = entries;
 }
 
 // Street ways of two nodes each, named by names, in one geo cell; with the
@@ -243,10 +254,51 @@ std::string prepare(const LowMemCase& c, const BuildDir& old_d, const BuildDir& 
     return "";
 }
 
+// c's patch decompressed, as the patcher reads it; nothing when zstd fails.
+std::vector<char> raw_patch(const LowMemCase& c) {
+    if (!run({"zstd", "-d", "-q", "-f", c.patch(), "-o", c.dir("raw")}, c.log())) return {};
+    return read_file(c.dir("raw"));
+}
+
+// raw compressed into the patch file `patch`: whether it was written.
+bool write_patch(const LowMemCase& c, const std::string& patch, const std::vector<char>& raw) {
+    return write_file(patch + ".raw", raw) && run({"zstd", "-q", "-f", patch + ".raw", "-o", patch}, c.log());
+}
+
+// A heap test's check that its case holds the structure it varies: "" when
+// c's patch holds `head` (a section's first bytes) exactly once, else that
+// it has no `what`.
+std::string patch_holds(const LowMemCase& c, const std::vector<char>& head, const std::string& what) {
+    return find_once(raw_patch(c), head) == std::string::npos ? "no " + what : "";
+}
+
 // The modes a patch applies in: to the old dir, and to its encoded set (the
 // low-memory mode) in sync and with --threads.
 const std::vector<std::string> ENCODED_MODES = {"sync", "threads"};
 const std::vector<std::string> ALL_MODES = {"plain", "sync", "threads"};
+
+// The patcher's command line applying patch to c's old dir ("plain") or
+// encoded set ("sync", "threads") into out.
+std::vector<std::string> patch_words(const LowMemCase& c, const std::string& mode, const std::string& patch, const std::string& out) {
+    std::vector<std::string> words = {GEOCODER_PATCH_BIN, c.dir(mode == "plain" ? "old" : "old.enc"), patch, "-o", out};
+    if (mode == "threads") words.push_back("--threads");
+    return words;
+}
+
+// patch (an edit of c's, named name) applied in each of modes: every mode in
+// which the patcher doesn't refuse it with `refusal`, and what it did instead,
+// printed.
+std::vector<std::string> not_refused(const LowMemCase& c, const std::vector<std::string>& modes, const std::string& patch,
+                                     const std::string& name, const std::string& refusal) {
+    std::vector<std::string> bad;
+    for (const std::string& mode : modes) {
+        const ToolRun r = run_tool(patch_words(c, mode, patch, c.dir(name + ".out." + mode)), c.log());
+        if (!r.ok && logged(r, refusal)) continue;
+        bad.push_back(name + " (" + mode + "): " + (r.ok ? "applied" : r.log));
+        std::printf("    %s\n", bad.back().c_str());
+    }
+    return bad;
+}
 
 // A case's patch applied in some modes: every mismatch, and the patcher's
 // heap peak by mode where the heap shim measured one.
@@ -267,10 +319,8 @@ Applied apply_modes(const LowMemCase& c, const std::vector<std::string>& modes, 
     for (const std::string& mode : modes) {
         const bool plain = mode == "plain";
         const std::string out = c.dir("out." + mode);
-        std::vector<std::string> words = {GEOCODER_PATCH_BIN, c.dir(plain ? "old" : "old.enc"), c.patch(), "-o", out};
-        if (mode == "threads") words.push_back("--threads");
         std::filesystem::remove(c.log());
-        const auto [ok, heap_peak] = gctest::run_with_heap_peak(words, c.log());
+        const auto [ok, heap_peak] = gctest::run_with_heap_peak(patch_words(c, mode, c.patch(), out), c.log());
         const std::vector<char> text = read_file(c.log());
         const std::string log(text.begin(), text.end());
         if (heap_peak) a.heap_peaks[mode] = *heap_peak;
@@ -656,14 +706,87 @@ TEST(patch_heap_stays_flat_as_geo_entry_deltas_grow) {
         put_geo(old_d, rows);
         put_geo(new_d, changed);
         if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
-        if (!run({"zstd", "-d", "-q", "-f", c.patch(), "-o", c.dir("raw")}, c.log())) return std::string("patch not decompressed");
         std::vector<char> corrections;
         append(corrections, GEO_ENTRY_DELTA_MARKER);
         append(corrections, static_cast<uint32_t>(PatchFileId::STREET_ENTRIES));
         append(corrections, n);
-        return find_once(read_file(c.dir("raw")), corrections) == std::string::npos ? "no " + std::to_string(n) + " street entry corrections"
-                                                                                    : std::string();
+        return patch_holds(c, corrections, std::to_string(n) + " street entry corrections");
     }, 20000).empty());
+}
+
+// n geo cells removed and n added (the old cells are the even ones, the new
+// cells the odd ones, none with a list): cell changes of n and n cells, which
+// the patcher reads where they sit in the patch.
+TEST(patch_heap_stays_flat_as_geo_cells_change) {
+    CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
+        std::vector<GeoRow> old_rows, new_rows;
+        for (uint32_t k = 0; k < n; k++) {
+            old_rows.push_back({2 * k, {}});
+            new_rows.push_back({2 * k + 1, {}});
+        }
+        BuildDir old_d, new_d;
+        put_geo(old_d, old_rows);
+        put_geo(new_d, new_rows);
+        if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
+        std::vector<char> changes;
+        append(changes, CELL_CHANGES_GEO_MARKER);
+        append(changes, n);
+        append(changes, n);
+        return patch_holds(c, changes, std::to_string(n) + " added and " + std::to_string(n) + " removed geo cells");
+    }, 20000).empty());
+}
+
+// n POI cells whose lists all change (each cell's POI becomes the next one)
+// over POIs that stay: a POI cell index delta of n cells, which the patcher
+// reads where it sits in the patch.
+TEST(patch_heap_stays_flat_as_a_poi_cell_index_delta_grows) {
+    CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
+        std::mt19937 rng(20261028);
+        const auto pois = pois_of(rng, 1000, 0, true);
+        CellLists old_cells, new_cells;
+        for (uint32_t k = 0; k < n; k++) {
+            old_cells[cell_id(k)] = {k % 950};
+            new_cells[cell_id(k)] = {k % 950 + 1};
+        }
+        BuildDir old_d, new_d;
+        put_pois(old_d, pois);
+        put_pois(new_d, pois);
+        put_poi_cells(old_d, old_cells);
+        put_poi_cells(new_d, new_cells);
+        if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
+        // No removed cells, then n cells of one lost and one gained id.
+        std::vector<char> delta;
+        append(delta, CELL_INDEX_DELTA_MARKER);
+        append(delta, static_cast<uint32_t>(PatchFileId::POI_ENTRIES));
+        append(delta, uint64_t{8} + uint64_t{24} * n);
+        return patch_holds(c, delta, "POI cell index delta of " + std::to_string(n) + " cells");
+    }, 10000).empty());
+}
+
+// n POI cells removed and n added (the old cells are the even ones, the new
+// cells the odd ones, all with empty lists) over POIs that stay: cell changes
+// of n and n cells, which the patcher reads where they sit in the patch.
+TEST(patch_heap_stays_flat_as_poi_cells_change) {
+    CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
+        std::mt19937 rng(20261028);
+        const auto pois = pois_of(rng, 1000, 0, true);
+        CellLists old_cells, new_cells;
+        for (uint32_t k = 0; k < n; k++) {
+            old_cells[cell_id(2 * k)] = {};
+            new_cells[cell_id(2 * k + 1)] = {};
+        }
+        BuildDir old_d, new_d;
+        put_pois(old_d, pois);
+        put_pois(new_d, pois);
+        put_poi_cells(old_d, old_cells);
+        put_poi_cells(new_d, new_cells);
+        if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
+        std::vector<char> changes;
+        append(changes, CELL_CHANGES_POI_MARKER);
+        append(changes, n);
+        append(changes, n);
+        return patch_holds(c, changes, std::to_string(n) + " added and " + std::to_string(n) + " removed POI cells");
+    }, 10000).empty());
 }
 
 // The POI string tier in record order (GCPATCH v9): the new pool moves a name
@@ -727,15 +850,8 @@ TEST(patch_lowmem_refuses_a_new_set_with_part_of_a_family) {
         new_d.erase(gone);
         const LowMemCase c{dir.path(), "without-" + gone};
         REQUIRE(prepare(c, old_d, new_d).empty());
-        for (const bool threads : {false, true}) {
-            std::vector<std::string> words = {GEOCODER_PATCH_BIN, c.dir("old.enc"), c.patch(), "-o", c.dir(threads ? "out.t" : "out")};
-            if (threads) words.push_back("--threads");
 
-            auto r = run_tool(words, c.log());
-
-            CHECK(!r.ok);
-            CHECK(logged(r, "family poi: the patch ships 1 of its 2 files"));
-        }
+        CHECK(not_refused(c, ENCODED_MODES, c.patch(), "part", "family poi: the patch ships 1 of its 2 files").empty());
     }
 }
 
@@ -754,8 +870,8 @@ TEST(patch_lowmem_refuses_a_match_run_past_the_old_file) {
     put_pois(new_d, dropped);
     const LowMemCase c{dir.path(), "match"};
     REQUIRE(prepare(c, old_d, new_d).empty());
-    REQUIRE(run({"zstd", "-d", "-q", "-f", c.patch(), "-o", c.dir("raw")}, c.log()));
-    const std::vector<char> raw = read_file(c.dir("raw"));
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
     struct Edit {
         std::string name;
         uint32_t kept, gone, rest;
@@ -773,17 +889,9 @@ TEST(patch_lowmem_refuses_a_match_run_past_the_old_file) {
         std::vector<char> longer = raw;
         put_at(longer, at + runs.size() - 4, e.rest + 5);
         const std::string patch = c.dir(e.name + ".gcpatch");
-        REQUIRE(write_file(patch + ".raw", longer));
-        REQUIRE(run({"zstd", "-q", "-f", patch + ".raw", "-o", patch}, c.log()));
-        for (const bool threads : {false, true}) {
-            std::vector<std::string> words = {GEOCODER_PATCH_BIN, c.dir("old.enc"), patch, "-o", c.dir(e.name + ".out" + (threads ? ".t" : ""))};
-            if (threads) words.push_back("--threads");
+        REQUIRE(write_patch(c, patch, longer));
 
-            auto r = run_tool(words, c.log());
-
-            CHECK(!r.ok);
-            CHECK(logged(r, e.refusal));
-        }
+        CHECK(not_refused(c, ENCODED_MODES, patch, e.name, e.refusal).empty());
     }
     CHECK(apply_both_modes(c).empty());
 }
@@ -816,8 +924,8 @@ TEST(patch_lowmem_refuses_a_parent_stride_other_than_its_records) {
     put_pois(new_d, fewer_pois);
     const LowMemCase c{dir.path(), "stride"};
     REQUIRE(prepare(c, old_d, new_d).empty());
-    REQUIRE(run({"zstd", "-d", "-q", "-f", c.patch(), "-o", c.dir("raw")}, c.log()));
-    const std::vector<char> raw = read_file(c.dir("raw"));
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
     struct Edit {
         PatchFileId fid;
         uint32_t stride, records, wrong;
@@ -834,17 +942,9 @@ TEST(patch_lowmem_refuses_a_parent_stride_other_than_its_records) {
         std::vector<char> edited = raw;
         put_at(edited, at + 4, e.wrong);
         const std::string patch = c.dir(name + ".gcpatch");
-        REQUIRE(write_file(patch + ".raw", edited));
-        REQUIRE(run({"zstd", "-q", "-f", patch + ".raw", "-o", patch}, c.log()));
-        for (const bool threads : {false, true}) {
-            std::vector<std::string> words = {GEOCODER_PATCH_BIN, c.dir("old.enc"), patch, "-o", c.dir(name + ".out" + (threads ? ".t" : ""))};
-            if (threads) words.push_back("--threads");
+        REQUIRE(write_patch(c, patch, edited));
 
-            auto r = run_tool(words, c.log());
-
-            CHECK(!r.ok);
-            CHECK(logged(r, "Malformed record stride: " + name));
-        }
+        CHECK(not_refused(c, ENCODED_MODES, patch, name, "Malformed record stride: " + name).empty());
     }
     CHECK(apply_both_modes(c).empty());
 }
@@ -867,8 +967,8 @@ TEST(patch_lowmem_refuses_counts_and_lengths_that_wrap_32_bits) {
     put_named_ways(new_d, new_meta, renamed);
     const LowMemCase c{dir.path(), "wrap"};
     REQUIRE(prepare(c, old_d, new_d, old_meta, new_meta).empty());
-    REQUIRE(run({"zstd", "-d", "-q", "-f", c.patch(), "-o", c.dir("raw")}, c.log()));
-    const std::vector<char> raw = read_file(c.dir("raw"));
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
     std::vector<char> header;
     append(header, static_cast<uint32_t>(PatchFileId::STREET_WAYS));
     append(header, static_cast<uint32_t>(WAY_HEADER_STRIDE));
@@ -914,20 +1014,103 @@ TEST(patch_lowmem_refuses_counts_and_lengths_that_wrap_32_bits) {
         if (e.wide) put_at(edited, e.at, u64_at(e.at) + e.add);
         else put_at(edited, e.at, static_cast<uint32_t>(u32_at(e.at) + e.add));
         const std::string patch = c.dir(e.name + ".gcpatch");
-        REQUIRE(write_file(patch + ".raw", edited));
-        REQUIRE(run({"zstd", "-q", "-f", patch + ".raw", "-o", patch}, c.log()));
-        for (const bool threads : {false, true}) {
-            std::vector<std::string> words = {GEOCODER_PATCH_BIN, c.dir("old.enc"), patch, "-o", c.dir(e.name + ".out" + (threads ? ".t" : ""))};
-            if (threads) words.push_back("--threads");
+        REQUIRE(write_patch(c, patch, edited));
 
-            auto r = run_tool(words, c.log());
-
-            if (r.ok || !logged(r, e.refusal)) std::printf("    %s%s: %s\n", e.name.c_str(), threads ? " (threads)" : "", r.log.c_str());
-            CHECK(!r.ok);
-            CHECK(logged(r, e.refusal));
-        }
+        CHECK(not_refused(c, ENCODED_MODES, patch, e.name, e.refusal).empty());
     }
     CHECK(apply_both_modes(c).empty());
+}
+
+// Cell changes out of order (two ids of one list swapped: the geo index's
+// added or removed cells, the POI index's), and a geo entry delta or a cell
+// index delta for a file that has one already or for a file not of its kind,
+// are refused in every mode. The patch as made applies.
+TEST(patch_refuses_cell_changes_out_of_order_and_a_second_or_foreign_delta) {
+    ScratchDir dir("patch-cells");
+    std::mt19937 rng(20261028);
+    // Geo: cells 0-39 kept with their street lists changed, 40-49 removed,
+    // 60-69 added. POI: cells 0-19 kept with their lists changed, 20-29
+    // removed, 40-49 added.
+    std::vector<GeoRow> old_rows, new_rows;
+    for (uint32_t k = 0; k < 50; k++) old_rows.push_back({k, {k % 10}});
+    for (uint32_t k = 0; k < 40; k++) new_rows.push_back({k, {(k + 1) % 10}});
+    for (uint32_t k = 60; k < 70; k++) new_rows.push_back({k, {3}});
+    CellLists old_cells, new_cells;
+    for (uint32_t k = 0; k < 30; k++) old_cells[cell_id(k)] = {k % 7};
+    for (uint32_t k = 0; k < 20; k++) new_cells[cell_id(k)] = {k % 7 + 1};
+    for (uint32_t k = 40; k < 50; k++) new_cells[cell_id(k)] = {2};
+    const auto pois = pois_of(rng, 40, 0, true);
+    BuildDir old_d, new_d;
+    put_geo(old_d, old_rows);
+    put_geo(new_d, new_rows);
+    put_pois(old_d, pois);
+    put_pois(new_d, pois);
+    put_poi_cells(old_d, old_cells);
+    put_poi_cells(new_d, new_cells);
+    const LowMemCase c{dir.path(), "cells"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    // A section's first u32s, as the patch holds them.
+    auto head = [](std::initializer_list<uint32_t> words) {
+        std::vector<char> h;
+        for (const uint32_t w : words) append(h, w);
+        return h;
+    };
+    auto at_of = [&](const std::vector<char>& h) {
+        const size_t at = find_once(raw, h);
+        REQUIRE(at != std::string::npos);
+        return at;
+    };
+    const uint32_t street = static_cast<uint32_t>(PatchFileId::STREET_ENTRIES), poi = static_cast<uint32_t>(PatchFileId::POI_ENTRIES);
+    // Where each list's ids start (after marker, n_added, n_removed), and
+    // where the street entries' geo entry delta and the POI cell index delta
+    // start.
+    const size_t geo_added = at_of(head({CELL_CHANGES_GEO_MARKER, 10, 10})) + 12, geo_removed = geo_added + 10 * 8;
+    const size_t poi_added = at_of(head({CELL_CHANGES_POI_MARKER, 10, 10})) + 12, poi_removed = poi_added + 10 * 8;
+    const size_t street_delta = at_of(head({GEO_ENTRY_DELTA_MARKER, street}));
+    const size_t poi_delta = at_of(head({CELL_INDEX_DELTA_MARKER, poi}));
+    uint64_t poi_delta_size;
+    memcpy(&poi_delta_size, raw.data() + poi_delta + 8, 8);
+    const std::vector<char> poi_delta_section(raw.begin() + poi_delta, raw.begin() + poi_delta + 16 + poi_delta_size);
+
+    using Edit = std::function<void(std::vector<char>&)>;
+    // Swaps ids i and i + 1 of the list at ids.
+    auto swap_ids = [](size_t ids, size_t i) -> Edit {
+        return [at = ids + 8 * i](std::vector<char>& p) { std::swap_ranges(p.begin() + at, p.begin() + at + 8, p.begin() + at + 8); };
+    };
+    auto insert_at = [](size_t at, const std::vector<char>& section) -> Edit {
+        return [at, section](std::vector<char>& p) { p.insert(p.begin() + at, section.begin(), section.end()); };
+    };
+    struct Case {
+        std::string name;
+        Edit edit;
+        std::string refusal;
+    };
+    const Case cases[] = {
+        {"geo-added", swap_ids(geo_added, 3), "Malformed cell changes"},
+        {"geo-removed", swap_ids(geo_removed, 3), "Malformed cell changes"},
+        {"poi-added", swap_ids(poi_added, 3), "Malformed cell changes"},
+        {"poi-removed", swap_ids(poi_removed, 3), "Malformed cell changes"},
+        // The last two: the walk asks for no cell past them, so the step back is among the ids it left.
+        {"geo-removed-last", swap_ids(geo_removed, 8), "Malformed cell changes"},
+        {"poi-removed-last", swap_ids(poi_removed, 8), "Malformed cell changes"},
+        // Each before the real section: an empty one (no cells; a u64 size of 0), or its copy.
+        {"second-geo-delta", insert_at(street_delta, head({GEO_ENTRY_DELTA_MARKER, street, 0})),
+         "Malformed geo entry delta: a second one for street_entries.bin"},
+        {"foreign-geo-delta", insert_at(street_delta, head({GEO_ENTRY_DELTA_MARKER, poi, 0})), "Malformed geo entry delta for file 17"},
+        {"second-cell-index-delta", insert_at(poi_delta, poi_delta_section), "Malformed cell index delta: a second one for poi_entries.bin"},
+        {"foreign-cell-index-delta", insert_at(poi_delta, head({CELL_INDEX_DELTA_MARKER, 999, 0, 0})), "Malformed cell index delta for file 999"},
+    };
+    for (const Case& e : cases) {
+        std::vector<char> edited = raw;
+        e.edit(edited);
+        const std::string patch = c.dir(e.name + ".gcpatch");
+        REQUIRE(write_patch(c, patch, edited));
+
+        CHECK(not_refused(c, ALL_MODES, patch, e.name, e.refusal).empty());
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
 // A frame declaring 2^32 + 1 bytes of content (then 8 KiB of them, an RLE
