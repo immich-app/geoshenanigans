@@ -1214,6 +1214,351 @@ TEST(patch_lowmem_refuses_counts_and_lengths_that_wrap_32_bits) {
     CHECK(apply_both_modes(c).empty());
 }
 
+// A parent and its child stream replayed out of step are refused in sync and
+// --threads once the shared decoder holds 4 MiB (MAX_DECODER_SKEW) of the
+// file left behind. 150,000 POIs with the same 8-vertex block, and the two
+// POI sections rebuilt by hand, both giving the new set (new = old): the
+// child runs ahead when every record is inserted before the old ones are
+// deleted while its block is matched from the old ones (the decoder queues
+// each old record it passes for the parent's reader: 5.4 MB of them), and
+// the parent runs ahead when the records are matched while their blocks are
+// inserted but for the last, matched from the first old block (it queues
+// each old block for the child's reader: 6.3 MB). The patch as made applies.
+TEST(patch_lowmem_refuses_a_parent_and_child_replayed_out_of_step) {
+    ScratchDir dir("lowmem-skew");
+    std::mt19937 rng(20261030);
+    const std::vector<char> shared = block(rng, 8);
+    std::vector<Poi> pois;
+    for (uint32_t i = 0; i < 150000; i++) pois.push_back({i, shared});
+    BuildDir d;
+    put_pois(d, pois);
+    const LowMemCase c{dir.path(), "skew"};
+    REQUIRE(prepare(c, d, d).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    const std::vector<char>& records = d.at("poi_records.bin");
+    const std::vector<char>& vertices = d.at("poi_vertices.bin");
+    const uint32_t n = static_cast<uint32_t>(pois.size()), v = static_cast<uint32_t>(vertices.size());
+    const uint32_t b = static_cast<uint32_t>(shared.size());
+    // The two sections as the diff sends them: copies of the old files.
+    std::vector<char> copies;
+    for (const auto& [fid, size] : {std::pair<PatchFileId, uint64_t>{PatchFileId::POI_RECORDS, records.size()},
+                                    {PatchFileId::POI_VERTICES, vertices.size()}}) {
+        append(copies, static_cast<uint32_t>(fid));
+        append(copies, COPY_OLD_STRIDE);
+        append(copies, size);
+        append(copies, size);
+        append(copies, uint32_t{0});
+        append(copies, uint64_t{0});
+    }
+    const size_t at = find_once(raw, copies);
+    REQUIRE(at != std::string::npos);
+    // An op of a merge sequence, with its records (count of them at stride) when it carries some.
+    auto op = [](std::vector<char>& ops, uint8_t kind, uint32_t count, const char* data = nullptr, size_t stride = 0) {
+        append(ops, kind);
+        append(ops, count);
+        if (data) ops.insert(ops.end(), data, data + size_t{count} * stride);
+    };
+    // The merge section of a file of `size` bytes on both days, without offset fixups.
+    auto merge = [](PatchFileId fid, uint32_t stride, uint64_t size, const std::vector<char>& ops) {
+        std::vector<char> s;
+        append(s, static_cast<uint32_t>(fid));
+        append(s, stride);
+        append(s, size);
+        append(s, size);
+        for (int k = 0; k < 4; k++) append(s, uint32_t{0});
+        append(s, static_cast<uint64_t>(ops.size()));
+        s.insert(s.end(), ops.begin(), ops.end());
+        return s;
+    };
+    struct Case {
+        std::string name;
+        std::vector<char> parent_ops, child_ops;
+        std::string refusal;
+    };
+    Case child_ahead{"child-ahead", {}, {}, "Malformed merge sequence: poi_vertices.bin runs ahead of poi_records.bin"};
+    op(child_ahead.parent_ops, OP_INSERT_RUN, n, records.data(), POI_RECORD_STRIDE);
+    op(child_ahead.parent_ops, OP_DELETE_RUN, n);
+    op(child_ahead.child_ops, OP_MATCH_RUN, v);
+    Case parent_ahead{"parent-ahead", {}, {}, "Malformed merge sequence: poi_records.bin runs ahead of poi_vertices.bin"};
+    op(parent_ahead.parent_ops, OP_MATCH_RUN, n);
+    op(parent_ahead.child_ops, OP_INSERT_RUN, v - b, vertices.data(), 1);
+    op(parent_ahead.child_ops, OP_MATCH_RUN, b);
+    for (const Case& e : {child_ahead, parent_ahead}) {
+        std::vector<char> edited(raw.begin(), raw.begin() + at);
+        for (const auto& section : {merge(PatchFileId::POI_RECORDS, POI_RECORD_STRIDE, records.size(), e.parent_ops),
+                                    merge(PatchFileId::POI_VERTICES, 1, vertices.size(), e.child_ops)})
+            edited.insert(edited.end(), section.begin(), section.end());
+        edited.insert(edited.end(), raw.begin() + at + copies.size(), raw.end());
+        const std::string patch = c.dir(e.name + ".gcpatch");
+        REQUIRE(write_patch(c, patch, edited));
+
+        CHECK(not_refused(c, ENCODED_MODES, patch, e.name, e.refusal).empty());
+    }
+    CHECK(apply_both_modes(c).empty());
+}
+
+// Counts and lengths the patch gives, each made to name 2^32 bytes more than
+// it holds, are refused in every mode: a parallel delta's inserted values and
+// changes (way_parents along the street ways' merge), a sparse delta's
+// changes (admin_parents), and the lengths of a full replacement
+// (postcode_centroids.bin, new) and of an unchanged file's empty payload
+// (place_nodes.bin). A 32-bit size_t wrapped each back to what the patch
+// holds: the deltas read the bytes after their changes as more of them, and
+// the lengths applied as the patch's. The patch as made applies.
+TEST(patch_refuses_change_counts_and_lengths_that_wrap_32_bits) {
+    ScratchDir dir("patch-wrap");
+    std::vector<uint32_t> names(30), renamed(31);
+    for (uint32_t i = 0; i < 31; i++) {
+        if (i < 30) names[i] = i;
+        renamed[i] = i == 10 ? 1000 : i;
+    }
+    BuildDir old_d, new_d, old_meta, new_meta;
+    put_named_ways(old_d, old_meta, names);
+    put_named_ways(new_d, new_meta, renamed);
+    std::vector<char> old_parents, new_parents, old_admin_parents, new_admin_parents, centroids, places;
+    for (uint32_t i = 0; i < 31; i++) {
+        if (i < 30) append(old_parents, 100 + i);
+        append(new_parents, i == 20 ? 777u : 100 + i);
+    }
+    for (uint32_t i = 0; i < 64; i++) {
+        append(old_admin_parents, i);
+        append(new_admin_parents, i % 16 == 5 ? i + 1000 : i);
+    }
+    for (uint32_t i = 0; i < 4; i++)
+        for (const uint32_t w : {i, i, NO, 0u}) append(centroids, w);
+    for (uint32_t i = 0; i < 5; i++)
+        for (const uint32_t w : {i, i, NO, NO, NO}) append(places, w);
+    old_d["way_parents.bin"] = old_parents;
+    new_d["way_parents.bin"] = new_parents;
+    old_d["admin_parents.bin"] = old_admin_parents;
+    new_d["admin_parents.bin"] = new_admin_parents;
+    new_d["postcode_centroids.bin"] = centroids;
+    old_d["place_nodes.bin"] = new_d["place_nodes.bin"] = places;
+    const LowMemCase c{dir.path(), "wrap32"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    auto u32_at = [&](size_t p) { uint32_t x; memcpy(&x, raw.data() + p, 4); return x; };
+    auto u64_at = [&](size_t p) { uint64_t x; memcpy(&x, raw.data() + p, 8); return x; };
+    // A section's head (file id, stride, old and new sizes, then words): where it starts.
+    auto at_of = [&](PatchFileId fid, uint32_t stride, uint64_t old_size, uint64_t new_size, std::initializer_list<uint32_t> words) {
+        std::vector<char> head;
+        append(head, static_cast<uint32_t>(fid));
+        append(head, stride);
+        append(head, old_size);
+        append(head, new_size);
+        for (const uint32_t w : words) append(head, w);
+        const size_t at = find_once(raw, head);
+        REQUIRE(at != std::string::npos);
+        return at;
+    };
+    // Parallel: parent file, value stride, remap kind, then n_inserted, the values, n_changes.
+    const size_t parallel = at_of(PatchFileId::WAY_PARENTS, PARALLEL_DELTA_STRIDE, 30 * 4, 31 * 4,
+                                  {static_cast<uint32_t>(PatchFileId::STREET_WAYS), 4, 1});
+    const size_t inserted_at = parallel + 36, parallel_changes_at = inserted_at + 4 + 4 * size_t{u32_at(inserted_at)};
+    // Sparse: value stride, remap kind, then n_changes.
+    const size_t sparse_changes_at = at_of(PatchFileId::ADMIN_PARENTS, SPARSE_DELTA_STRIDE, 64 * 4, 64 * 4, {4, 1}) + 32;
+    // Full replacement and copy: a u32 (no fixups), then the data's length.
+    const size_t full_length_at = at_of(PatchFileId::POSTCODE_CENTROIDS, 0, 0, centroids.size(), {0}) + 28;
+    const size_t copy_length_at = at_of(PatchFileId::PLACE_NODES, COPY_OLD_STRIDE, places.size(), places.size(), {0}) + 28;
+    REQUIRE(u32_at(inserted_at) > 0 && u32_at(parallel_changes_at) > 0 && u32_at(sparse_changes_at) > 0);
+    REQUIRE(u64_at(full_length_at) == centroids.size() && u64_at(copy_length_at) == 0);
+    struct Edit {
+        std::string name;
+        size_t at;
+        uint64_t add;
+        bool wide;
+        std::string refusal;
+    };
+    const Edit edits[] = {
+        {"parallel-values", inserted_at, uint64_t(1) << 30, false, "bytes for parallel values"},
+        {"parallel-changes", parallel_changes_at, uint64_t(1) << 29, false, "bytes for parallel changes"},
+        {"sparse-changes", sparse_changes_at, uint64_t(1) << 29, false, "bytes for sparse changes"},
+        {"full-replacement", full_length_at, uint64_t(1) << 32, true, "bytes for full replacement"},
+        {"copy", copy_length_at, uint64_t(1) << 32, true, "bytes for copy-old payload"},
+    };
+    for (const Edit& e : edits) {
+        std::vector<char> edited = raw;
+        if (e.wide) put_at(edited, e.at, u64_at(e.at) + e.add);
+        else put_at(edited, e.at, static_cast<uint32_t>(u32_at(e.at) + e.add));
+        const std::string patch = c.dir(e.name + ".gcpatch");
+        REQUIRE(write_patch(c, patch, edited));
+
+        CHECK(not_refused(c, ALL_MODES, patch, e.name, e.refusal).empty());
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// A merge section whose stride is past any record's (0x100: from 0xFA up,
+// strides name section kinds) is refused in every mode before a record
+// buffer is sized by it: the admin polygons' merge, 24 bytes a record as
+// made. The patch as made applies.
+TEST(patch_refuses_a_record_stride_past_any_records) {
+    ScratchDir dir("patch-stride");
+    std::mt19937 rng(20261030);
+    std::vector<Admin> polys;
+    for (uint32_t i = 0; i < 50; i++) polys.push_back({static_cast<float>(i), block(rng, 3 + i % 5)});
+    std::vector<Admin> fewer = polys;
+    fewer.erase(fewer.begin() + 20);
+    BuildDir old_d, new_d;
+    put_admins(old_d, polys);
+    put_admins(new_d, fewer);
+    const LowMemCase c{dir.path(), "stride"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    std::vector<char> header;
+    append(header, static_cast<uint32_t>(PatchFileId::ADMIN_POLYGONS));
+    append(header, static_cast<uint32_t>(ADMIN_POLYGON_STRIDE));
+    append(header, uint64_t{50 * ADMIN_POLYGON_STRIDE});
+    append(header, uint64_t{49 * ADMIN_POLYGON_STRIDE});
+    const size_t at = find_once(raw, header);
+    REQUIRE(at != std::string::npos);
+    std::vector<char> edited = raw;
+    put_at(edited, at + 4, uint32_t{0x100});
+    const std::string patch = c.dir("wide.gcpatch");
+    REQUIRE(write_patch(c, patch, edited));
+
+    CHECK(not_refused(c, ALL_MODES, patch, "wide", "Malformed record stride: admin_polygons.bin").empty());
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// A cell index delta whose cell loses, or gains, more ids than a list holds
+// (0xFFFF, its u16 count) is refused in every mode before the ids are read:
+// the POI index's first changed cell, with 65,536 ids the cell doesn't hold
+// added to the ids it loses (the replay took them, dropping none) or with as
+// many new ones added to those it gains. The patch as made applies.
+TEST(patch_refuses_a_cell_losing_or_gaining_more_ids_than_a_list_holds) {
+    ScratchDir dir("patch-cell-ids");
+    std::mt19937 rng(20261030);
+    CellLists old_cells, new_cells;
+    for (uint32_t k = 0; k < 20; k++) {
+        old_cells[cell_id(k)] = {k % 7};
+        new_cells[cell_id(k)] = {k % 7 + 1};
+    }
+    const auto pois = pois_of(rng, 40, 0, true);
+    BuildDir old_d, new_d;
+    put_pois(old_d, pois);
+    put_pois(new_d, pois);
+    put_poi_cells(old_d, old_cells);
+    put_poi_cells(new_d, new_cells);
+    const LowMemCase c{dir.path(), "cell-ids"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    std::vector<char> head;
+    append(head, CELL_INDEX_DELTA_MARKER);
+    append(head, static_cast<uint32_t>(PatchFileId::POI_ENTRIES));
+    const size_t at = find_once(raw, head);
+    REQUIRE(at != std::string::npos);
+    // marker, file id, payload size; the payload: n_removed, removed cells,
+    // n_set, then the first cell: id, n_lost, n_gained, lost ids, gained ids.
+    uint32_t n_removed, n_lost;
+    memcpy(&n_removed, raw.data() + at + 16, 4);
+    const size_t first = at + 24 + 8 * size_t{n_removed};
+    uint32_t n_gained;
+    memcpy(&n_lost, raw.data() + first + 8, 4);
+    memcpy(&n_gained, raw.data() + first + 12, 4);
+    REQUIRE(n_lost == 1 && n_gained == 1);
+    for (const bool gained : {false, true}) {
+        const std::string name = gained ? "gained" : "lost";
+        std::vector<char> ids;
+        for (uint32_t k = 0; k < 0x10000; k++) append(ids, 0x40000000u + k);
+        std::vector<char> edited = raw;
+        uint64_t payload;
+        uint32_t count;
+        memcpy(&payload, edited.data() + at + 8, 8);
+        put_at(edited, at + 8, payload + ids.size());
+        const size_t count_at = first + (gained ? 12 : 8);
+        memcpy(&count, edited.data() + count_at, 4);
+        put_at(edited, count_at, count + 0x10000);
+        // After the cell's ids it loses (one), or those it gains too (one).
+        edited.insert(edited.begin() + static_cast<std::ptrdiff_t>(first + 16 + 4 + (gained ? 4 : 0)), ids.begin(), ids.end());
+        const std::string patch = c.dir(name + ".gcpatch");
+        REQUIRE(write_patch(c, patch, edited));
+
+        CHECK(not_refused(c, ALL_MODES, patch, name, "Malformed cell list delta").empty());
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// A client file list of more files than a variant holds (1025, past
+// MAX_CLIENT_FILES), with a name longer than a file's (256 bytes), or with
+// a file listed twice, is refused in every mode before the patcher writes
+// anything: the files added are empty .bin files sorted after the others,
+// which the patcher made as listed. The patch as made applies.
+TEST(patch_refuses_too_many_client_files_a_long_name_or_one_listed_twice) {
+    ScratchDir dir("patch-client-files");
+    std::vector<char> parents, changed;
+    for (uint32_t v = 0; v < 4096; v++) {
+        append(parents, v);
+        append(changed, v + (v == 2000));
+    }
+    const LowMemCase c{dir.path(), "client-files"};
+    REQUIRE(prepare(c, {{"way_parents.bin", parents}, {"meta.json", {'{', '}'}}},
+                    {{"way_parents.bin", changed}, {"meta.json", {'{', ' ', '}'}}}).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    // After the header (magic, version, flags): marker, n, then each entry
+    // (name length, name, size, inline flag, an inline file's bytes).
+    uint32_t marker, n;
+    memcpy(&marker, raw.data() + 16, 4);
+    memcpy(&n, raw.data() + 20, 4);
+    REQUIRE(marker == CLIENT_FILES_MARKER);
+    std::vector<size_t> entry_at = {24};
+    for (uint32_t i = 0; i < n; i++) {
+        const size_t e = entry_at.back();
+        uint16_t len;
+        uint64_t size;
+        memcpy(&len, raw.data() + e, 2);
+        memcpy(&size, raw.data() + e + 2 + len, 8);
+        entry_at.push_back(e + 2 + len + 9 + (raw[e + 2 + len + 8] ? size : 0));
+    }
+    // An empty .bin file's entry.
+    auto empty_bin = [](const std::string& name) {
+        std::vector<char> e;
+        append(e, static_cast<uint16_t>(name.size()));
+        e.insert(e.end(), name.begin(), name.end());
+        append(e, uint64_t{0});
+        append(e, uint8_t{0});
+        return e;
+    };
+    // The list with `more` entries inserted at entry i.
+    auto with = [&](size_t i, const std::vector<char>& more, uint32_t added) {
+        std::vector<char> p = raw;
+        put_at(p, 20, n + added);
+        p.insert(p.begin() + static_cast<std::ptrdiff_t>(entry_at[i]), more.begin(), more.end());
+        return p;
+    };
+    std::vector<char> many;
+    for (uint32_t i = n; i < 1025; i++) {
+        char name[16];
+        std::snprintf(name, sizeof name, "zz%04u.bin", i);
+        const std::vector<char> e = empty_bin(name);
+        many.insert(many.end(), e.begin(), e.end());
+    }
+    const std::vector<char> first(raw.begin() + static_cast<std::ptrdiff_t>(entry_at[0]),
+                                  raw.begin() + static_cast<std::ptrdiff_t>(entry_at[1]));
+    struct Case {
+        std::string name;
+        std::vector<char> patch;
+        std::string refusal;
+    };
+    const Case cases[] = {
+        {"many", with(n, many, 1025 - n), "Too many client files: 1025"},
+        {"long-name", with(n, empty_bin(std::string(252, 'z') + ".bin"), 1), "Client file name too long: 256 bytes"},
+        {"twice", with(1, first, 1), "Client file listed out of order or twice: meta.json"},
+    };
+    for (const Case& e : cases) {
+        const std::string patch = c.dir(e.name + ".gcpatch");
+        REQUIRE(write_patch(c, patch, e.patch));
+
+        CHECK(not_refused(c, ALL_MODES, patch, e.name, e.refusal).empty());
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
 // Cell changes out of order (two ids of one list swapped: the geo index's
 // added or removed cells, the POI index's), and a geo entry delta or a cell
 // index delta for a file that has one already or for a file not of its kind,

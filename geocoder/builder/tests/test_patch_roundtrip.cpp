@@ -3,6 +3,7 @@
 // new one file by file. Then patch files the patcher must take as named or
 // refuse: a patch is untrusted input.
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -13,6 +14,7 @@
 #include <vector>
 
 #include "merge_sequence.h"
+#include "patch_decompress.h"
 #include "patch_format.h"
 #include "scratch_dir.h"
 #include "test_framework.h"
@@ -419,6 +421,33 @@ std::vector<char> match_delete_match(uint32_t kept, uint32_t gone, uint32_t rest
     return runs;
 }
 
+// raw in one zstd frame of raw blocks whose header declares a window of
+// 2^window_log bytes and no content size, as a compressor of a stream writes
+// one (the diff's zstd reads the patch from a pipe).
+std::vector<char> zstd_frame(const std::vector<char>& raw, int window_log) {
+    std::vector<char> frame = {'\x28', '\xb5', '\x2f', '\xfd', 0, static_cast<char>((window_log - 10) << 3)};
+    constexpr size_t BLOCK = 128 << 10;
+    for (size_t at = 0; at < raw.size(); at += BLOCK) {
+        const size_t n = std::min(BLOCK, raw.size() - at);
+        // Last_Block, then Block_Type 0 (raw), then Block_Size.
+        const uint32_t head = static_cast<uint32_t>(n << 3) | (at + n == raw.size() ? 1u : 0u);
+        for (int k = 0; k < 3; k++) frame.push_back(static_cast<char>(head >> (8 * k)));
+        frame.insert(frame.end(), raw.begin() + static_cast<std::ptrdiff_t>(at), raw.begin() + static_cast<std::ptrdiff_t>(at + n));
+    }
+    return frame;
+}
+
+// n small JSON files: client files the diff carries inline, whatever their
+// names.
+BuildDir json_files(int n) {
+    BuildDir d;
+    for (int i = 0; i < n; i++) {
+        char name[16];
+        std::snprintf(name, sizeof name, "f%04d.json", i);
+        d[name] = {'{', '}'};
+    }
+    return d;
+}
 }  // namespace
 
 TEST(patch_round_trip_keeps_the_street_ids_of_unchanged_street_ways) {
@@ -605,6 +634,64 @@ TEST(patch_needs_no_zstd_on_path_unless_built_on_the_zstd_cli) {
 #endif
 }
 
+// The patch's zstd window is the diff's, 8 MiB (PATCH_ZSTD_WINDOW_LOG 23):
+// its frame declares no more, and a build on the zstd command, which holds
+// the window, refuses a frame declaring more (the command's own limit is
+// 128 MiB). A build on libzstd decompresses into the mapped output and holds
+// no window: it applies both.
+TEST(patch_holds_a_zstd_window_no_larger_than_the_diffs) {
+    ScratchDir dir("patch-window");
+    const std::string& root = dir.path();
+    SparsePatch p = diff_way_parents(root);
+    REQUIRE(!p.raw.empty());
+    const std::vector<char> diffs = read_file(root + "/p.gcpatch");
+    REQUIRE(diffs.size() > 5);
+    // Not a single segment (whose window is its content), and a window
+    // descriptor of at most 2^23 bytes.
+    CHECK_EQ(diffs[4] & 0x20, 0);
+    CHECK(static_cast<uint8_t>(diffs[5]) <= (23 - 10) << 3);
+    for (const int window_log : {23, 24}) {
+        const std::string name = "window-" + std::to_string(window_log);
+        REQUIRE(write_file(root + "/" + name + ".gcpatch", zstd_frame(p.raw, window_log)));
+
+        auto r = run_patch(root, name + ".gcpatch", name);
+
+#ifdef GEOCODER_PATCH_ZSTD_CLI
+        const bool refused = window_log > 23;
+#else
+        const bool refused = false;
+#endif
+        CHECK_EQ(r.ok, !refused);
+        if (refused) CHECK(logged(r, "Failed to decompress"));
+        else CHECK(read_file(root + "/" + name + "/way_parents.bin") == bytes_of(new_way_parents()));
+    }
+}
+
+#ifndef GEOCODER_PATCH_ZSTD_CLI
+// A filesystem that flushes late writes (NFS, FUSE) may report a failed one
+// only when the file closes: the decompressed patch is refused then, rather
+// than mapped and read back. The frame decompresses with a close that works.
+TEST(patch_decompression_refuses_a_patch_file_that_fails_to_close) {
+    ScratchDir dir("patch-close");
+    const std::string& root = dir.path();
+    std::vector<char> raw(300 << 10);
+    for (size_t i = 0; i < raw.size(); i++) raw[i] = static_cast<char>(i * 7);
+    REQUIRE(write_file(root + "/p.gcpatch", zstd_frame(raw, 23)));
+    decompressed_patch_close() = [](int fd) {
+        ::close(fd);
+        errno = EIO;
+        return -1;
+    };
+
+    const bool closed = decompress_to_file(root + "/p.gcpatch", root + "/failing.raw");
+    decompressed_patch_close() = ::close;
+
+    CHECK(!closed);
+    CHECK(decompress_to_file(root + "/p.gcpatch", root + "/p.raw"));
+    CHECK(read_file(root + "/p.raw") == raw);
+}
+#endif
+
 // A patch shorter than its 8-byte magic is refused as truncated: the magic
 // is read through the bounds check like every later field.
 TEST(patch_refuses_a_patch_shorter_than_its_magic) {
@@ -701,4 +788,23 @@ TEST(patch_refuses_a_match_run_past_the_old_file) {
     CHECK(r.ok);
     CHECK(read_file(root + "/out/poi_records.bin") == poi_polygons(true)["poi_records.bin"]);
     CHECK(read_file(root + "/out/poi_vertices.bin") == poi_polygons(true)["poi_vertices.bin"]);
+}
+
+// A new dir of more client files than a patch may list (1025, past
+// MAX_CLIENT_FILES) fails the diff with the patcher's refusal, and no patch
+// is written: the patcher would refuse the list. A dir of 1024 makes a patch
+// that applies.
+TEST(patch_diff_refuses_a_dir_of_more_client_files_than_a_patch_may_list) {
+    ScratchDir dir("patch-diff-client-files");
+    const std::string& root = dir.path();
+    const std::string patch = root + "/p.gcpatch", log = root + "/tools.log";
+    REQUIRE(write_dir(root + "/old", json_files(1)));
+    REQUIRE(write_dir(root + "/new", json_files(1025)));
+
+    CHECK(!run({GEOCODER_DIFF_BIN, root + "/old", root + "/new", "-o", patch}, log));
+
+    const std::vector<char> text = read_file(log);
+    CHECK(std::string(text.begin(), text.end()).find("Too many client files: 1025") != std::string::npos);
+    CHECK(!std::filesystem::exists(patch));
+    CHECK(round_trip(json_files(1), json_files(1024)).mismatches.empty());
 }

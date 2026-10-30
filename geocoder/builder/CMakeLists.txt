@@ -211,9 +211,13 @@ target_link_libraries(geocoder-tests PRIVATE ZLIB::ZLIB libdeflate::libdeflate E
 # As geocoder-gc and geocoder-patch compile the codecs.
 set_source_files_properties(tests/test_gc.cpp tests/test_gcs_codec.cpp tests/test_gcs_patch.cpp tests/test_gcs_poi_io.cpp
     PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
-# The test of the patcher's decompression expects the zstd CLI build's.
+# The tests of the patcher's decompression (tools/patch_decompress.h) expect the
+# zstd CLI build's, or run the libzstd one in process.
 if(NOT GEOCODER_PATCH_LIBZSTD)
     target_compile_definitions(geocoder-tests PRIVATE GEOCODER_PATCH_ZSTD_CLI)
+else()
+    target_include_directories(geocoder-tests PRIVATE "${GEOCODER_ZSTD_INCLUDE_DIR}")
+    target_link_libraries(geocoder-tests PRIVATE "${GEOCODER_ZSTD_STATIC_LIBRARY}")
 endif()
 add_test(NAME geocoder-tests COMMAND geocoder-tests)
 

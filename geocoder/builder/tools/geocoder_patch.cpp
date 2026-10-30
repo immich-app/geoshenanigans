@@ -34,14 +34,12 @@
 #include <iterator>
 #include <malloc.h>
 #include <memory>
-#include <spawn.h>
 #include <stdio_ext.h>
 #include <stdexcept>
 #include <string>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <unistd.h>
@@ -53,10 +51,7 @@
 #include "scratch_dir.h"
 #include "sequential_file_reader.h"
 #include "gcs_patch.h"
-#ifndef GEOCODER_PATCH_ZSTD_CLI
-#define ZSTD_STATIC_LINKING_ONLY
-#include <zstd.h>
-#endif
+#include "patch_decompress.h"
 
 
 // --- Helpers ---
@@ -116,76 +111,6 @@ static void log_phase(const char* label, double start) {
 static void log_rewinds(const SequentialFileReader& r) {
     if (r.rewinds()) std::cerr << "  " << r.path() << ": read backwards " << r.rewinds() << " times" << std::endl;
 }
-
-#ifndef GEOCODER_PATCH_ZSTD_CLI
-// How far ahead of the decoder the decompressed patch's storage is reserved.
-static constexpr size_t PATCH_RESERVE_STEP = 1 << 20;
-
-// The patch, decompressed block by block straight into a mapped file: the decoder's history is the
-// output itself, so no window buffer (the zstd CLI holds the 8 MiB window in anonymous memory).
-// Each block's dst capacity ends where posix_fallocate has reserved storage, so a full TMPDIR is
-// an error here, never a SIGBUS from a mapped page with nothing behind it. Only the mapping spans
-// the bound: a frame without a content size bounds every block at 128 KiB, which puts the
-// 2026-10-13 patches' bounds at 4.9x to 19x their size. A bound past size_t (a 32-bit build's) is
-// refused: narrowed, the mapping would end before the capacities handed to the decoder.
-static bool decompress_to_file(const std::string& src, const std::string& dst) {
-    MappedFile in = mmap_file(src);
-    if (!in.data) return false;
-    const unsigned long long bound = ZSTD_decompressBound(in.data, in.size);
-    if (bound == ZSTD_CONTENTSIZE_ERROR || bound == 0 || uint64_t(bound) > uint64_t(SIZE_MAX)) { unmap_file(in); return false; }
-    int fd = open(dst.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (fd < 0) { unmap_file(in); return false; }
-    char* out = static_cast<char*>(mmap(nullptr, (size_t)bound, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
-    if (out == MAP_FAILED) { close(fd); unmap_file(in); return false; }
-    ZSTD_DCtx* dctx = ZSTD_createDCtx();
-    size_t at = 0, n = 0, reserved = 0;
-    bool ok = dctx != nullptr;
-    // A frame per pass, concatenated and skippable ones as ZSTD_decompressDCtx takes them.
-    while (ok && at < in.size) {
-        ok = !ZSTD_isError(ZSTD_decompressBegin(dctx));
-        for (size_t want; ok && (want = ZSTD_nextSrcSizeToDecompress(dctx)) != 0;) {
-            if (want > in.size - at) { ok = false; break; }
-            if (reserved - n < ZSTD_BLOCKSIZE_MAX && reserved < bound) {
-                const size_t to = (size_t)std::min<unsigned long long>(bound, n + PATCH_RESERVE_STEP);
-                if (const int err = posix_fallocate(fd, (off_t)reserved, (off_t)(to - reserved))) {
-                    std::cerr << "Cannot reserve " << to << " bytes for " << dst << ": " << strerror(err) << std::endl;
-                    ok = false;
-                    break;
-                }
-                reserved = to;
-            }
-            const size_t r = ZSTD_decompressContinue(dctx, out + n, reserved - n, in.data + at, want);
-            if (ZSTD_isError(r)) { ok = false; break; }
-            at += want;
-            n += r;
-        }
-    }
-    ZSTD_freeDCtx(dctx);
-    munmap(out, (size_t)bound);
-    unmap_file(in);
-    ok = ok && ftruncate(fd, (off_t)n) == 0;
-    close(fd);
-    return ok;
-}
-#else
-// The zstd CLI on PATH (a -DGEOCODER_PATCH_LIBZSTD=OFF build), run without a
-// shell: the patch path is one argument whatever its characters, after "--"
-// so a leading '-' is no option.
-static bool decompress_to_file(const std::string& src, const std::string& dst) {
-    const char* argv[] = {"zstd", "-d", "-f", "--quiet", "-o", dst.c_str(), "--", src.c_str(), nullptr};
-    posix_spawn_file_actions_t quiet;
-    if (posix_spawn_file_actions_init(&quiet) != 0) return false;
-    pid_t pid;
-    int err = posix_spawn_file_actions_addopen(&quiet, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
-    if (err == 0) err = posix_spawnp(&pid, "zstd", &quiet, nullptr, const_cast<char* const*>(argv), environ);
-    posix_spawn_file_actions_destroy(&quiet);
-    if (err != 0) return false;
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0)
-        if (errno != EINTR) return false;
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
-}
-#endif
 
 // The child stream replayed along a parent record file (UINT32_MAX: none).
 static uint32_t joint_child_of(uint32_t fid) {
@@ -516,12 +441,15 @@ static int run(int argc, char* argv[]) {
     };
     auto ru32 = [&]() -> uint32_t { require_bytes(4, "u32"); uint32_t v; memcpy(&v, P+pos, 4); pos += 4; return v; };
     auto ru64 = [&]() -> uint64_t { require_bytes(8, "u64"); uint64_t v; memcpy(&v, P+pos, 8); pos += 8; return v; };
-    auto take = [&](size_t n, const char* what) -> const char* {
+    // n in 64 bits, checked before it narrows to size_t: a 32-bit build wraps a length the patch
+    // gives (a u64, or a count times its item size) into one the patch has.
+    auto take = [&](uint64_t n, const char* what) -> const char* {
         require_bytes(n, what);
         const char* p = P + pos;
-        pos += n;
+        pos += static_cast<size_t>(n);
         return p;
     };
+    auto take_items = [&](uint32_t count, size_t item, const char* what) { return take(uint64_t{count} * item, what); };
 
     // Header
     if (memcmp(take(8, "magic"), GCPATCH_MAGIC, 8) != 0) { std::cerr << "Bad magic" << std::endl; return 1; }
@@ -539,7 +467,7 @@ static int run(int argc, char* argv[]) {
     }
     gcs::store().plan_outputs();
     for (const auto& f : client_files)
-        if (is_inline_client_file(f.name) && !write_file(out_dir + "/" + f.name, f.bytes))
+        if (is_inline_client_file(f.name) && !write_file(out_dir + "/" + f.name, f.bytes, f.size))
             throw std::runtime_error("Cannot write " + f.name);
     auto out_path = [&](const std::string& name) {
         return (listed.count(name) ? out_dir : tmpdir) + "/" + name;
@@ -662,8 +590,8 @@ static int run(int argc, char* argv[]) {
         uint32_t na = ru32(), nr = ru32();
         require_bytes(((uint64_t)na + nr) * 8, "cell changes");
         CellChanges c;
-        c.added = AscendingIds(take((size_t)na * 8, "cell changes"), na, "cell changes");
-        c.removed = AscendingIds(take((size_t)nr * 8, "cell changes"), nr, "cell changes");
+        c.added = AscendingIds(take_items(na, 8, "cell changes"), na, "cell changes");
+        c.removed = AscendingIds(take_items(nr, 8, "cell changes"), nr, "cell changes");
         std::cerr << "  " << label << " cells: +" << na << " -" << nr << std::endl;
         return c;
     };
@@ -691,10 +619,12 @@ static int run(int argc, char* argv[]) {
             uint32_t nf = ru32();
             for (uint32_t f = 0; f < nf; f++) {
                 uint32_t fid = ru32(), np = ru32();
-                require_bytes((size_t)np * 8, "secondary remap");
+                const char* pairs = take_items(np, 8, "secondary remap");
                 auto it = record_remaps.find(fid);
                 for (uint32_t i = 0; i < np; i++) {
-                    uint32_t o = ru32(), n = ru32();
+                    uint32_t o, n;
+                    memcpy(&o, pairs + (size_t)i * 8, 4);
+                    memcpy(&n, pairs + (size_t)i * 8 + 4, 4);
                     if (it != record_remaps.end()) it->second.add_pair(o, n);
                 }
                 std::cerr << "  Secondary remap " << fid << ": " << np << " pairs" << std::endl;
@@ -726,7 +656,7 @@ static int run(int argc, char* argv[]) {
                 uint64_t cid; memcpy(&cid, take(8, "cell id"), 8);
                 uint16_t ec; memcpy(&ec, take(2, "entry count"), 2);
                 std::vector<uint32_t> ids(ec);
-                if (ec > 0) memcpy(ids.data(), take((size_t)ec * 4, "entry ids"), (size_t)ec * 4);
+                if (ec > 0) memcpy(ids.data(), take_items(ec, 4, "entry ids"), (size_t)ec * 4);
                 list.push_back({cid, std::move(ids)});
             }
             std::cerr << "  Entry corrections " << fid << ": " << c << std::endl;
@@ -831,9 +761,9 @@ static int run(int argc, char* argv[]) {
             uint32_t parent_fid = ru32(), value_stride = ru32(), remap_kind = ru32();
             check_parallel_delta_header(file_id, parent_fid, value_stride, remap_kind);
             uint32_t n_ins = ru32();
-            const char* ins = take((size_t)n_ins * 4, "parallel values");
+            const char* ins = take_items(n_ins, 4, "parallel values");
             uint32_t n_changes = ru32();
-            const char* changes = take((size_t)n_changes * 8, "parallel changes");
+            const char* changes = take_items(n_changes, 8, "parallel changes");
             constexpr uint32_t NO_DATA_VAL = 0xFFFFFFFFu;
             auto remap_value = [&](uint32_t v) -> uint32_t {
                 if (v == NO_DATA_VAL) return v;
@@ -911,7 +841,7 @@ static int run(int argc, char* argv[]) {
             if ((value_stride != 4 && value_stride != 16) || new_size % value_stride)
                 throw std::runtime_error("Malformed sparse delta");
             const size_t change_size = 4 + value_stride;
-            const char* changes = take((size_t)n_changes * change_size, "sparse changes");
+            const char* changes = take_items(n_changes, change_size, "sparse changes");
 
             // OLD bytes with the same remap the diff applied before computing
             // the delta, then each (pos, value) pair overwritten, give NEW.
@@ -968,6 +898,8 @@ static int run(int argc, char* argv[]) {
             continue;
         }
 
+        // The record buffer below is sized by it.
+        if (stride > MAX_RECORD_STRIDE) throw std::runtime_error(std::string("Malformed record stride: ") + fname);
         size_t actual_stride = stride;
 
         // Records with string offset fields are rewritten one at a time.

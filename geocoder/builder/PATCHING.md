@@ -161,8 +161,9 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
 The tool's own memory stays at 2–4 MiB anon whatever the limit. That is the default build, which
 decompresses the patch with libzstd into a file it maps: no window buffer. One built with
 `-DGEOCODER_PATCH_LIBZSTD=OFF` runs the `zstd` command for it, a child of about 11.5 MiB peak RSS
-beside the tool (its 8 MiB window among it). Below about 1 GiB (page cache included) a planet
-update gets slower, not bigger: the mapped inputs drop out of the page cache and are read again.
+beside the tool (its 8 MiB window among it, which the diff pins and the command is held to).
+Below about 1 GiB (page cache included) a planet update gets slower, not bigger: the mapped inputs
+drop out of the page cache and are read again.
 Planet b → c (2026-10-28), planet/full, one core, cold, no swap, disk at
 100 MB/s:
 
@@ -316,9 +317,12 @@ and a half minutes of one core.
 
 ## Patch Format (.gcpatch, version 9)
 
-Whole file is zstd-compressed for transport. Internal structure (all integers
-little-endian; the header, client files, old file sizes and strings sections
-are read by position, everything after them by marker):
+Whole file is zstd-compressed for transport, at level 19 with its 8 MiB window
+pinned (`--zstd=wlog=23`, PATCH_ZSTD_WINDOW_LOG); a patcher built on the zstd
+command runs it with `--memory=8388608`, so a frame needing a larger window is
+refused. Internal structure (all integers little-endian; the header, client
+files, old file sizes and strings sections are read by position, everything
+after them by marker):
 
 ```
 Header: "GCPATCH\0" (8) + version=9 (u32) + flags=0 (u32)
@@ -328,9 +332,11 @@ Header: "GCPATCH\0" (8) + version=9 (u32) + flags=0 (u32)
 Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
   + n × {name_len:u16, name, size:u64, inline:u8, [bytes] if inline}
   Every file the new variant dir holds except *.osm_ids, *.gcpatch, *.zst and
-  dotfiles, sorted by name. JSON files (strings_layout.json, poi_meta.json)
-  are inline and written verbatim. The patcher builds anything not listed in
-  its scratch dir, and every listed file must exist at its listed size.
+  dotfiles, sorted by name, each once: at most 1024 files (MAX_CLIENT_FILES)
+  of names at most 255 bytes long; the diff refuses a new dir it cannot list
+  so. JSON files (strings_layout.json, poi_meta.json) are inline and written
+  verbatim. The patcher builds anything not listed in its scratch dir, and
+  every listed file must exist at its listed size.
 
 Old file sizes: n (u32) + n × {file_id:u32, old_size:u64}
   (the old files no section names, UNSECTIONED_OLD_FILES: the entry
@@ -383,15 +389,26 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   stride=0xFB: cell list delta for <name>_cells.bin + <name>_entries.bin
     (payload_size u64, new entries size u64, n_removed u32 + [cell u64],
     n_set u32 + [cell u64, n_lost u32, n_gained u32, lost ids, gained ids];
-    both cell lists ascending)
-  otherwise: n_runs (u32) + n_values (u32) + runs_size (u32) + values_size (u32)
-    + runs + values + seq_size (u64) + merge ops
+    both cell lists ascending; n_lost and n_gained at most 0xFFFF, a list's
+    most ids)
+  otherwise (a record stride, at most 0xFF, MAX_RECORD_STRIDE): n_runs (u32)
+    + n_values (u32) + runs_size (u32) + values_size (u32) + runs + values
+    + seq_size (u64) + merge ops
   Ops: MATCH(count:u32) | INSERT(count:u32, data) | DELETE(count:u32)
     | REPLACE(count:u32, data) (v8: the same entities with new bytes, written
     like an INSERT, mapped old → new like a MATCH)
   Order (v8): street ways and nodes, interp ways and nodes, then addr
   points, whose parent_way_id the patcher moves through the street replay's
   remap.
+  A child stream (street_nodes, interp_nodes, addr_vertices, poi_vertices,
+  in the section right after its parent's) replays along its parent by
+  position: its MATCH bytes are the old bytes of the parent records at the
+  same places, a MATCH or REPLACE record's own or, where a DELETE run is
+  followed by an INSERT run, the deleted record's for the inserted one at the
+  same place in the run. The low-memory mode decodes both files from one
+  stream, and refuses a replay that reads one of them 4 MiB
+  (MAX_DECODER_SKEW) ahead of the other ("Malformed merge sequence: <file>
+  runs ahead of <file>").
   Offset fixups (node_offset / vertex_offset of MATCH records, see
   OffsetFixups in tools/patch_format.h): runs of varint (records skipped since
   the previous run, run length, zigzag change of the shift); the patcher adds

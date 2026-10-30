@@ -27,6 +27,7 @@
 #include <future>
 #include <iomanip>
 #include <iostream>
+#include <list>
 #include <malloc.h>
 #include <mutex>
 #include <stdexcept>
@@ -587,10 +588,11 @@ static void wval(std::vector<char>& buf, const void* data, size_t size) {
     buf.insert(buf.end(), (const char*)data, (const char*)data + size);
 }
 
-// The client files of a variant dir (see CLIENT_FILES_MARKER), sorted by name.
-// Fails on a file no patch section can reproduce, so a new builder output can
-// never be silently dropped from patched installs.
-static std::vector<ClientFile> list_client_files(const std::string& dir) {
+// The client files of a variant dir (see CLIENT_FILES_MARKER), sorted by name,
+// the inline ones' bytes read into `contents`. Fails on a file no patch section
+// can reproduce, so a new builder output can never be silently dropped from
+// patched installs.
+static std::vector<ClientFile> list_client_files(const std::string& dir, std::list<std::vector<char>>& contents) {
     std::unordered_set<std::string> section_files(std::begin(patch_file_names), std::end(patch_file_names));
     section_files.erase("strings.bin");  // legacy single pool, never emitted
     std::vector<ClientFile> files;
@@ -602,15 +604,16 @@ static std::vector<ClientFile> list_client_files(const std::string& dir) {
         std::string path = dir + "/" + name;
         struct stat st;
         if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
-        ClientFile f{name, static_cast<uint64_t>(st.st_size), {}};
+        ClientFile f{name, static_cast<uint64_t>(st.st_size), nullptr};
         if (!is_inline_client_file(name)) {
             if (!section_files.count(name)) { closedir(d); throw std::runtime_error("No patch section for " + path); }
         } else if (!has_suffix(name, ".json") || f.size > MAX_INLINE_CLIENT_FILE_BYTES) {
             closedir(d);
             throw std::runtime_error("Cannot carry " + path + " in a patch");
         } else {
-            f.bytes = read_file(path);
-            if (f.bytes.size() != f.size) { closedir(d); throw std::runtime_error("Short read: " + path); }
+            const std::vector<char>& bytes = contents.emplace_back(read_file(path));
+            if (bytes.size() != f.size) { closedir(d); throw std::runtime_error("Short read: " + path); }
+            f.bytes = bytes.data();
         }
         files.push_back(std::move(f));
     }
@@ -758,7 +761,10 @@ static int run(int argc, char* argv[]) {
     uint32_t ver = GCPATCH_VERSION, flags = 0; // custom merge-sequence format
     wval(patch, &ver, 4); wval(patch, &flags, 4);
     {
-        auto client_files = list_client_files(new_dir);
+        std::list<std::vector<char>> inline_contents;
+        auto client_files = list_client_files(new_dir, inline_contents);
+        // A list the patcher would refuse (more than MAX_CLIENT_FILES files, say) fails the diff
+        // here, before a patch is written.
         append_client_files(patch, client_files);
         std::cerr << "  Client files: " << client_files.size() << std::endl;
     }
@@ -2236,9 +2242,10 @@ static int run(int argc, char* argv[]) {
 
     // Compress for transport, streaming straight into zstd: no staged
     // uncompressed copy, and a short write or zstd failure fails the diff.
+    // The window is pinned to what a patcher on the zstd command accepts.
     {
         double tc = now_ms();
-        std::string cmd = "zstd -19 -T0 -q -f -o '" + patch_path + "'";
+        std::string cmd = "zstd -19 --zstd=wlog=" + std::to_string(PATCH_ZSTD_WINDOW_LOG) + " -T0 -q -f -o '" + patch_path + "'";
         FILE* z = popen(cmd.c_str(), "w");
         size_t put = z ? fwrite(patch.data(), 1, patch.size(), z) : 0;
         int rc = z ? pclose(z) : -1;

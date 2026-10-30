@@ -189,6 +189,9 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // each added string's new index, and a string its order moves travels as a
 // pair.
 static constexpr uint32_t GCPATCH_VERSION = 9;
+// The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
+// command holds the window, so the diff pins it and the patcher refuses a larger one.
+static constexpr int PATCH_ZSTD_WINDOW_LOG = 23;
 
 enum class PatchFileId : uint32_t {
     STRINGS = 0,
@@ -502,6 +505,9 @@ constexpr uint32_t CELL_LIST_DELTA_STRIDE = 0xFB;
 //   n_inserted(u32) + [value:u32] x n_inserted,
 //   n_changes(u32) + [(pos:u32, value:u32)] x n_changes (pos ascending)
 constexpr uint32_t PARALLEL_DELTA_STRIDE = 0xFA;
+// The widest record a merge section may give (the patcher sizes a record buffer by it): the
+// widest real record is 36 bytes, and every stride from 0xFA up to here is a section kind.
+static constexpr uint32_t MAX_RECORD_STRIDE = 0xFF;
 struct ParallelDeltaFile { PatchFileId fid, parent; uint32_t value_stride, remap_kind; };
 static constexpr ParallelDeltaFile PARALLEL_DELTA_FILES[] = {
     {PatchFileId::ADDR_POSTCODES, PatchFileId::ADDR_POINTS, 4, 2},
@@ -567,11 +573,15 @@ static constexpr uint32_t POI_PARENT_REMAP_MARKER = 0xFFFFFFF3;
 // for files the variant lacks) stay in its scratch dir.
 static constexpr uint32_t CLIENT_FILES_MARKER = 0xFFFFFFF2;
 static constexpr size_t MAX_INLINE_CLIENT_FILE_BYTES = 1 << 20;
+// The most files a client file list may name (a variant holds a few dozen), and the longest
+// name (a file name's NAME_MAX).
+static constexpr uint32_t MAX_CLIENT_FILES = 1024;
+static constexpr size_t MAX_CLIENT_FILE_NAME = 255;
 
 struct ClientFile {
     std::string name;
     uint64_t size = 0;
-    std::vector<char> bytes;  // contents, inline files only
+    const char* bytes = nullptr;  // an inline file's contents: its size bytes, where they sit
 };
 
 inline bool has_suffix(const std::string& s, const char* suffix) {
@@ -586,7 +596,22 @@ inline bool is_client_file(const std::string& name) {
 
 inline bool is_inline_client_file(const std::string& name) { return !has_suffix(name, ".bin"); }
 
+// Appends the section for files, a list parse_client_files takes back: it refuses, in
+// parse_client_files' words and before appending a byte, more than MAX_CLIENT_FILES files, a name
+// longer than MAX_CLIENT_FILE_NAME bytes or not a client file's, a name out of order or listed
+// twice, and an inline file larger than MAX_INLINE_CLIENT_FILE_BYTES. A diff never writes a patch
+// the patcher would refuse.
 inline void append_client_files(std::vector<char>& out, const std::vector<ClientFile>& files) {
+    if (files.size() > MAX_CLIENT_FILES) throw std::runtime_error("Too many client files: " + std::to_string(files.size()));
+    for (size_t i = 0; i < files.size(); i++) {
+        const ClientFile& f = files[i];
+        if (f.name.size() > MAX_CLIENT_FILE_NAME)
+            throw std::runtime_error("Client file name too long: " + std::to_string(f.name.size()) + " bytes");
+        if (!is_client_file(f.name)) throw std::runtime_error("Bad client file name: " + f.name);
+        if (i > 0 && !(files[i - 1].name < f.name)) throw std::runtime_error("Client file listed out of order or twice: " + f.name);
+        if (is_inline_client_file(f.name) && f.size > MAX_INLINE_CLIENT_FILE_BYTES)
+            throw std::runtime_error("Inline client file too large: " + f.name);
+    }
     auto put = [&](const void* p, size_t n) { out.insert(out.end(), (const char*)p, (const char*)p + n); };
     uint32_t marker = CLIENT_FILES_MARKER, n = static_cast<uint32_t>(files.size());
     put(&marker, 4); put(&n, 4);
@@ -594,38 +619,43 @@ inline void append_client_files(std::vector<char>& out, const std::vector<Client
         uint16_t len = static_cast<uint16_t>(f.name.size());
         uint8_t is_inline = is_inline_client_file(f.name) ? 1 : 0;
         put(&len, 2); put(f.name.data(), len); put(&f.size, 8); put(&is_inline, 1);
-        if (is_inline) put(f.bytes.data(), f.bytes.size());
+        if (is_inline) put(f.bytes, f.size);
     }
 }
 
-// Parses the section at data[pos, size) and advances pos past it.
+// Parses the section at data[pos, size) and advances pos past it. The names come sorted, each
+// once; an inline file's bytes stay where they sit.
 inline std::vector<ClientFile> parse_client_files(const char* data, size_t size, size_t& pos) {
-    auto take = [&](void* dst, size_t n) {
-        if (pos + n > size) throw std::runtime_error("Truncated client file list");
-        if (n) memcpy(dst, data + pos, n);  // an empty inline file's bytes are null
+    auto take = [&](size_t n) {
+        if (n > size - pos) throw std::runtime_error("Truncated client file list");
+        const char* p = data + pos;
         pos += n;
+        return p;
     };
+    auto take_into = [&](void* dst, size_t n) { memcpy(dst, take(n), n); };
     uint32_t marker = 0, n = 0;
-    take(&marker, 4);
+    take_into(&marker, 4);
     if (marker != CLIENT_FILES_MARKER) throw std::runtime_error("Patch has no client file list");
-    take(&n, 4);
+    take_into(&n, 4);
+    if (n > MAX_CLIENT_FILES) throw std::runtime_error("Too many client files: " + std::to_string(n));
     if ((size_t)n * 11 > size - pos) throw std::runtime_error("Truncated client file list");  // 11 = smallest entry
     std::vector<ClientFile> files(n);
-    for (auto& f : files) {
+    for (size_t i = 0; i < files.size(); i++) {
+        ClientFile& f = files[i];
         uint16_t len = 0;
-        take(&len, 2);
-        f.name.resize(len);
-        take(f.name.data(), len);
+        take_into(&len, 2);
+        if (len > MAX_CLIENT_FILE_NAME) throw std::runtime_error("Client file name too long: " + std::to_string(len) + " bytes");
+        f.name.assign(take(len), len);
         if (!is_client_file(f.name)) throw std::runtime_error("Bad client file name: " + f.name);
+        if (i > 0 && !(files[i - 1].name < f.name)) throw std::runtime_error("Client file listed out of order or twice: " + f.name);
         uint8_t is_inline = 0;
-        take(&f.size, 8);
-        take(&is_inline, 1);
+        take_into(&f.size, 8);
+        take_into(&is_inline, 1);
         if (is_inline != (is_inline_client_file(f.name) ? 1 : 0))
             throw std::runtime_error("Bad client file entry: " + f.name);
         if (!is_inline) continue;
         if (f.size > MAX_INLINE_CLIENT_FILE_BYTES) throw std::runtime_error("Inline client file too large: " + f.name);
-        f.bytes.resize(f.size);
-        take(f.bytes.data(), f.size);
+        f.bytes = take(size_t(f.size));
     }
     return files;
 }
@@ -1208,7 +1238,8 @@ uint64_t stream_cell_index(Cells&& cells, Entries&& entries, AscendingIds added,
         uint32_t nl, ng;
         take(&set_cid, 8); take(&nl, 4); take(&ng, 4);
         if ((set_i > 0 && set_cid <= prev_set) || set_cid == NONE) malformed();
-        if ((delta_size - pos) / 4 < (size_t)nl + ng) malformed();
+        // A list holds at most 0xFFFF ids (its u16 count), so a cell loses or gains at most as many.
+        if (nl > 0xFFFF || ng > 0xFFFF || (delta_size - pos) / 4 < (size_t)nl + ng) malformed();
         lost.resize(nl); gained.resize(ng);
         take(lost.data(), (size_t)nl * 4);
         take(gained.data(), (size_t)ng * 4);
