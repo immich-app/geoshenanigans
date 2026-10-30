@@ -145,37 +145,31 @@ struct JointChild {
 
     void parse(const char* p, size_t size, size_t at, uint32_t want_fid) {
         P = p;
-        // Lengths in 64 bits: narrowed to a 32-bit size_t first, one past the patch would pass.
-        auto need = [&](uint64_t n) { if (n > size - at) throw std::runtime_error("Truncated patch: child section"); };
-        auto u32 = [&]() { need(4); uint32_t v; memcpy(&v, P + at, 4); at += 4; return v; };
-        auto u64 = [&]() { need(8); uint64_t v; memcpy(&v, P + at, 8); at += 8; return v; };
-        fid = u32();
+        SectionReader in(P, size, at, "patch: child section");
+        fid = in.u32();
         if (fid != want_fid)
             throw std::runtime_error(std::string("Encoded set: ") + patch_file_names[want_fid] + " does not follow its parent in the patch");
-        stride = u32();
-        old_size = u64();
-        new_size = u64();
+        stride = in.u32();
+        old_size = in.u64();
+        new_size = in.u64();
         if (stride == COPY_OLD_STRIDE || stride == 0) {
-            u32();
-            const uint64_t ds = u64();
-            need(ds);
+            in.u32();
+            const uint64_t ds = in.u64();
             kind = stride == 0 ? FULL : COPY_OLD;
             data = at;
-            at += size_t(ds);
+            in.take(ds);
             if (kind == FULL && ds != new_size) throw std::runtime_error("Malformed child full replacement");
             stride = 1;
         } else if (stride == SPARSE_DELTA_STRIDE || stride == CELL_LIST_DELTA_STRIDE || stride == PARALLEL_DELTA_STRIDE) {
             throw std::runtime_error("Encoded set: unexpected section kind for a child stream");
         } else {
-            const uint32_t n_runs = u32(), n_values = u32(), runs_size = u32(), values_size = u32();
+            const uint32_t n_runs = in.u32(), n_values = in.u32(), runs_size = in.u32(), values_size = in.u32();
             if (n_runs || n_values) throw std::runtime_error("Encoded set: a child stream with offset fixups");
-            need(uint64_t(runs_size) + values_size);
-            at += size_t(uint64_t(runs_size) + values_size);
-            const uint64_t ss = u64();
-            need(ss);
+            in.take(uint64_t{runs_size} + values_size);
+            const uint64_t ss = in.u64();
             seq = q = at;
-            seq_end = at + size_t(ss);
-            at = seq_end;
+            in.take(ss);
+            seq_end = at;
         }
         section_end = at;
     }
@@ -429,32 +423,12 @@ static int run(int argc, char* argv[]) {
     log_phase("Decompress", t_start);
 
     size_t pos = 0;
-    // Bounds-checked read of n bytes at the current position. Fails loudly
-    // (rather than reading past the mmap) if a malformed/truncated patch would
-    // run the cursor off the end. On the success path pos+n <= patch_size
-    // always holds, so this never fires and the read bytes are unchanged.
-    auto require_bytes = [&](uint64_t n, const char* what) {
-        if (n > patch_size - pos)
-            throw std::runtime_error("Truncated patch: need " + std::to_string(n) + " bytes for " +
-                                     what + " at offset " + std::to_string(pos) +
-                                     " (size " + std::to_string(patch_size) + ")");
-    };
-    auto ru32 = [&]() -> uint32_t { require_bytes(4, "u32"); uint32_t v; memcpy(&v, P+pos, 4); pos += 4; return v; };
-    auto ru64 = [&]() -> uint64_t { require_bytes(8, "u64"); uint64_t v; memcpy(&v, P+pos, 8); pos += 8; return v; };
-    // n in 64 bits, checked before it narrows to size_t: a 32-bit build wraps a length the patch
-    // gives (a u64, or a count times its item size) into one the patch has.
-    auto take = [&](uint64_t n, const char* what) -> const char* {
-        require_bytes(n, what);
-        const char* p = P + pos;
-        pos += static_cast<size_t>(n);
-        return p;
-    };
-    auto take_items = [&](uint32_t count, size_t item, const char* what) { return take(uint64_t{count} * item, what); };
+    SectionReader patch(P, patch_size, pos, "patch", PastEnd::TRUNCATED_AT);
 
     // Header
-    if (memcmp(take(8, "magic"), GCPATCH_MAGIC, 8) != 0) { std::cerr << "Bad magic" << std::endl; return 1; }
-    uint32_t ver = ru32(); if (ver != GCPATCH_VERSION) { std::cerr << "Bad version" << std::endl; return 1; }
-    ru32(); // flags
+    if (memcmp(patch.take(8, "magic"), GCPATCH_MAGIC, 8) != 0) { std::cerr << "Bad magic" << std::endl; return 1; }
+    uint32_t ver = patch.u32(); if (ver != GCPATCH_VERSION) { std::cerr << "Bad version" << std::endl; return 1; }
+    patch.u32(); // flags
 
     // The exact file set out_dir must hold after the apply. Outputs the
     // variant does not ship (sections for files it lacks) are built in
@@ -587,18 +561,18 @@ static int run(int argc, char* argv[]) {
     };
     // A cell changes section's lists, where they sit (the label names them in the log).
     auto read_cell_changes = [&](const char* label) {
-        uint32_t na = ru32(), nr = ru32();
-        require_bytes(((uint64_t)na + nr) * 8, "cell changes");
+        uint32_t na = patch.u32(), nr = patch.u32();
+        patch.require(((uint64_t)na + nr) * 8, "cell changes");
         CellChanges c;
-        c.added = AscendingIds(take_items(na, 8, "cell changes"), na, "cell changes");
-        c.removed = AscendingIds(take_items(nr, 8, "cell changes"), nr, "cell changes");
+        c.added = AscendingIds(patch.take_items(na, 8, "cell changes"), na, "cell changes");
+        c.removed = AscendingIds(patch.take_items(nr, 8, "cell changes"), nr, "cell changes");
         std::cerr << "  " << label << " cells: +" << na << " -" << nr << std::endl;
         return c;
     };
 
     bool saw_end = false;
     while (pos < patch_size) {
-        uint32_t file_id = ru32();
+        uint32_t file_id = patch.u32();
         if (file_id == SECTION_END_MARKER) { saw_end = true; break; }
 
         // --- Metadata sections ---
@@ -607,7 +581,7 @@ static int run(int argc, char* argv[]) {
         if (file_id == CELL_CHANGES_POI_MARKER) { poi_cells = read_cell_changes("POI"); continue; }
         if (file_id == CELL_CHANGES_PLACE_MARKER) { place_cells = read_cell_changes("Place"); continue; }
         if (file_id == GEO_ENTRY_DELTA_MARKER) {
-            uint32_t fid = ru32(), c = ru32();
+            uint32_t fid = patch.u32(), c = patch.u32();
             geo_deltas.add(fid, scan_geo_list_deltas(P, patch_size, pos, c));
             std::cerr << "  Geo entry deltas " << fid << ": " << c << " cells" << std::endl;
             continue;
@@ -616,10 +590,10 @@ static int run(int argc, char* argv[]) {
             // Secondary matches extend the remap of a file already replayed
             // (the diff emits them after the merges); a file sent unchanged
             // has no remap and keeps its ids.
-            uint32_t nf = ru32();
+            uint32_t nf = patch.u32();
             for (uint32_t f = 0; f < nf; f++) {
-                uint32_t fid = ru32(), np = ru32();
-                const char* pairs = take_items(np, 8, "secondary remap");
+                uint32_t fid = patch.u32(), np = patch.u32();
+                const char* pairs = patch.take_items(np, 8, "secondary remap");
                 auto it = record_remaps.find(fid);
                 for (uint32_t i = 0; i < np; i++) {
                     uint32_t o, n;
@@ -641,22 +615,22 @@ static int run(int argc, char* argv[]) {
             continue;
         }
         if (file_id == CELL_INDEX_DELTA_MARKER) {
-            uint32_t fid = ru32();
-            uint64_t n = ru64();
-            require_bytes(n, "cell index delta");
+            uint32_t fid = patch.u32();
+            uint64_t n = patch.u64();
+            patch.require(n, "cell index delta");
             cell_index_deltas.add(fid, {pos, static_cast<size_t>(n)});
-            take(static_cast<size_t>(n), "cell index delta");
+            patch.take(n, "cell index delta");
             std::cerr << "  Cell index delta " << fid << ": " << n << " bytes" << std::endl;
             continue;
         }
         if (file_id == ENTRY_CORRECTION_MARKER) {
-            uint32_t fid = ru32(), c = ru32();
+            uint32_t fid = patch.u32(), c = patch.u32();
             auto& list = entry_corrections[fid];
             for (uint32_t i = 0; i < c; i++) {
-                uint64_t cid; memcpy(&cid, take(8, "cell id"), 8);
-                uint16_t ec; memcpy(&ec, take(2, "entry count"), 2);
+                uint64_t cid; memcpy(&cid, patch.take(8, "cell id"), 8);
+                uint16_t ec; memcpy(&ec, patch.take(2, "entry count"), 2);
                 std::vector<uint32_t> ids(ec);
-                if (ec > 0) memcpy(ids.data(), take_items(ec, 4, "entry ids"), (size_t)ec * 4);
+                if (ec > 0) memcpy(ids.data(), patch.take_items(ec, 4, "entry ids"), (size_t)ec * 4);
                 list.push_back({cid, std::move(ids)});
             }
             std::cerr << "  Entry corrections " << fid << ": " << c << std::endl;
@@ -666,16 +640,16 @@ static int run(int argc, char* argv[]) {
         // --- Merge sequence replay (streaming) ---
         const IoCounters section_start = get_io_counters();
         auto section_io = [&] { return " [" + io_delta(section_start, get_io_counters()) + "]"; };
-        uint32_t stride = ru32();
-        uint64_t old_size = ru64(), new_size = ru64();
+        uint32_t stride = patch.u32();
+        uint64_t old_size = patch.u64(), new_size = patch.u64();
         if (file_id >= (uint32_t)PatchFileId::COUNT) { std::cerr << "Unknown file " << file_id << std::endl; return 1; }
         const char* fname = patch_file_names[file_id];
         require_old_file_size(cur_dir, fname, old_size);
 
         if (stride == 0) {
             // Full replacement — write directly from patch mmap
-            uint32_t nf = ru32(); (void)nf; uint64_t ds = ru64();
-            const char* data = take(ds, "full replacement");
+            uint32_t nf = patch.u32(); (void)nf; uint64_t ds = patch.u64();
+            const char* data = patch.take(ds, "full replacement");
             if (gcs::store().is_encoded(fname) && joint_child_of(file_id) != UINT32_MAX)
                 throw std::runtime_error(std::string("Encoded set: a full replacement of ") + fname + " is not replayed with its child yet");
             if (gcs::store().is_encoded(fname)) {
@@ -689,7 +663,7 @@ static int run(int argc, char* argv[]) {
         if (stride == COPY_OLD_STRIDE) {
             // Unchanged file: the diff verified old==new and emitted no
             // data. Reproduce by copying the old (current) file verbatim.
-            uint32_t nf = ru32(); (void)nf; take(ru64(), "copy-old payload"); // empty
+            uint32_t nf = patch.u32(); (void)nf; patch.take(patch.u64(), "copy-old payload"); // empty
             SequentialFileReader in(cur_dir + "/" + fname);
             if (!in.is_open()) {
                 // The diff only emits COPY_OLD for a file that existed (and was
@@ -733,9 +707,9 @@ static int run(int argc, char* argv[]) {
             if (cells_name.size() < suffix.size() || cells_name.compare(cells_name.size() - suffix.size(), suffix.size(), suffix) != 0)
                 throw std::runtime_error("Cell list delta for " + cells_name);
             std::string entries_name = cells_name.substr(0, cells_name.size() - suffix.size()) + "_entries.bin";
-            uint64_t payload_size = ru64();
+            uint64_t payload_size = patch.u64();
             if (payload_size < 8) throw std::runtime_error("Malformed cell list delta");
-            const char* payload = take(payload_size, "cell list delta");
+            const char* payload = patch.take(payload_size, "cell list delta");
             uint64_t new_entries_size; memcpy(&new_entries_size, payload, 8);
             SequentialFileReader old_c(cur_dir + "/" + cells_name);
             SequentialFileReader old_e(cur_dir + "/" + entries_name);
@@ -758,12 +732,12 @@ static int run(int argc, char* argv[]) {
         if (stride == PARALLEL_DELTA_STRIDE) {
             // v8 side file: the parent's merge replayed at one value per
             // record, then the changed values (see PARALLEL_DELTA_STRIDE).
-            uint32_t parent_fid = ru32(), value_stride = ru32(), remap_kind = ru32();
+            uint32_t parent_fid = patch.u32(), value_stride = patch.u32(), remap_kind = patch.u32();
             check_parallel_delta_header(file_id, parent_fid, value_stride, remap_kind);
-            uint32_t n_ins = ru32();
-            const char* ins = take_items(n_ins, 4, "parallel values");
-            uint32_t n_changes = ru32();
-            const char* changes = take_items(n_changes, 8, "parallel changes");
+            uint32_t n_ins = patch.u32();
+            const char* ins = patch.take_items(n_ins, 4, "parallel values");
+            uint32_t n_changes = patch.u32();
+            const char* changes = patch.take_items(n_changes, 8, "parallel changes");
             constexpr uint32_t NO_DATA_VAL = 0xFFFFFFFFu;
             auto remap_value = [&](uint32_t v) -> uint32_t {
                 if (v == NO_DATA_VAL) return v;
@@ -833,15 +807,15 @@ static int run(int argc, char* argv[]) {
             // SPARSE_DELTA: position-keyed delta. Format already decoded
             // old_size + new_size above; next fields are value_stride,
             // remap_kind, n_changes, then the (pos, value) pairs.
-            uint32_t value_stride = ru32();
-            uint32_t remap_kind = ru32();
-            uint32_t n_changes = ru32();
+            uint32_t value_stride = patch.u32();
+            uint32_t remap_kind = patch.u32();
+            uint32_t n_changes = patch.u32();
             // Whole records only: a change writes its record whole, so one in
             // a part record would write past the file.
             if ((value_stride != 4 && value_stride != 16) || new_size % value_stride)
                 throw std::runtime_error("Malformed sparse delta");
             const size_t change_size = 4 + value_stride;
-            const char* changes = take_items(n_changes, change_size, "sparse changes");
+            const char* changes = patch.take_items(n_changes, change_size, "sparse changes");
 
             // OLD bytes with the same remap the diff applied before computing
             // the delta, then each (pos, value) pair overwritten, give NEW.
@@ -919,10 +893,10 @@ static int run(int argc, char* argv[]) {
         bool needs_padding = file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS && actual_stride == 24;
 
         // Offset fixups, decoded lazily during merge replay (zero allocation).
-        uint32_t n_fixup_runs = ru32(), n_fixup_values = ru32();
-        uint32_t fixup_runs_size = ru32(), fixup_values_size = ru32();
-        const char* fixup_runs = take(fixup_runs_size, "fixup runs");
-        const char* fixup_values = take(fixup_values_size, "fixup values");
+        uint32_t n_fixup_runs = patch.u32(), n_fixup_values = patch.u32();
+        uint32_t fixup_runs_size = patch.u32(), fixup_values_size = patch.u32();
+        const char* fixup_runs = patch.take(fixup_runs_size, "fixup runs");
+        const char* fixup_values = patch.take(fixup_values_size, "fixup values");
         OffsetFixupReader fixups(fixup_runs, fixup_runs_size, n_fixup_runs,
                                  fixup_values, fixup_values_size, n_fixup_values);
         const bool has_fixups = n_fixup_runs > 0 || n_fixup_values > 0;
@@ -944,8 +918,8 @@ static int run(int argc, char* argv[]) {
         size_t n_old_records = old.size() / actual_stride;
 
         // Replay merge sequence — stream output, apply remap/fixups per-record inline
-        uint64_t seq_size = ru64();
-        require_bytes(seq_size, "merge sequence");
+        uint64_t seq_size = patch.u64();
+        patch.require(seq_size, "merge sequence");
         size_t seq_end = pos + seq_size;
         merge_seqs[file_id] = {pos, (size_t)seq_size, actual_stride};
         FILE* outf = open_out(fname);
