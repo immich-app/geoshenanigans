@@ -1852,6 +1852,102 @@ TEST(patch_refuses_remap_pairs_out_of_order_or_twice_and_street_pairs_in_both_re
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
+// A second list with pairs for a file sent unchanged, which no replay gives a
+// remap to take them, is refused in every mode as one for a replayed file is:
+// for POI records, address points or place nodes, in the secondary remap or
+// in a second one. So are street pairs in the secondary remap as well as in
+// the parent-id remap's street leg when the street ways go unchanged. The
+// patch as made (every file unchanged) applies.
+TEST(patch_refuses_a_second_pair_list_or_street_pairs_in_both_remaps_for_unchanged_files) {
+    ScratchDir dir("patch-unchanged-pairs");
+    std::mt19937 rng(20261031);
+    const auto pois = pois_of(rng, 20, 0, true);
+    std::vector<Addr> addrs;
+    for (uint32_t i = 0; i < 10; i++) addrs.push_back({47.0f + static_cast<float>(i) * 1e-4f, {}});
+    std::vector<char> places;
+    for (uint32_t i = 0; i < 5; i++)
+        for (const uint32_t w : {i, i, NO, NO, NO}) append(places, w);
+    BuildDir old_d, new_d;
+    for (BuildDir* d : {&old_d, &new_d}) {
+        put_geo(*d, {{0, {0}}}, 10);
+        put_addrs(*d, addrs);
+        put_pois(*d, pois);
+        (*d)["place_nodes.bin"] = places;
+    }
+    const LowMemCase c{dir.path(), "unchanged"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    // u32s as the patch holds them.
+    auto words = [](std::initializer_list<uint32_t> ws) {
+        std::vector<char> b;
+        for (const uint32_t w : ws) append(b, w);
+        return b;
+    };
+    const uint32_t street = static_cast<uint32_t>(PatchFileId::STREET_WAYS), addr = static_cast<uint32_t>(PatchFileId::ADDR_POINTS),
+                   poi = static_cast<uint32_t>(PatchFileId::POI_RECORDS), place = static_cast<uint32_t>(PatchFileId::PLACE_NODES);
+    // Each file the edits give pairs for goes unchanged: its section's head
+    // (file id, COPY_OLD_STRIDE, old and new sizes, no fixups).
+    for (const uint32_t fid : {street, addr, poi, place}) {
+        const uint64_t size = old_d[patch_file_names[fid]].size();
+        std::vector<char> copied = words({fid, COPY_OLD_STRIDE});
+        append(copied, size);
+        append(copied, size);
+        append(copied, 0u);
+        REQUIRE(find_once(raw, copied) != std::string::npos);
+    }
+    const size_t parent = find_once(raw, words({POI_PARENT_REMAP_MARKER, 0, 0, 0}));
+    const size_t head = find_once(raw, secondary_remap_head(0));
+    REQUIRE(parent != std::string::npos && head != std::string::npos && parent < head);
+    // Where the parent-id remap's street pair count, and the secondary
+    // remap's file count and street pair count sit, and where the secondary
+    // remap ends (after the place nodes' empty list).
+    const size_t parent_street_pairs = parent + 8, n_files = head + 4, street_pairs = head + 12, end = head + 48;
+    REQUIRE(std::vector<char>(raw.begin() + head + 40, raw.begin() + end) == words({place, 0}));
+
+    using Edit = std::function<void(std::vector<char>&)>;
+    auto insert_at = [](std::vector<char>& p, size_t at, const std::vector<char>& b) { p.insert(p.begin() + at, b.begin(), b.end()); };
+    // Two lists for fid at the secondary remap's end, each of one pair (old
+    // id 0 to new id 1).
+    auto two_lists = [&](uint32_t fid) -> Edit {
+        return [&, fid](std::vector<char>& p) {
+            put_at(p, n_files, 7u);
+            insert_at(p, end, words({fid, 1, 0, 1, fid, 1, 0, 1}));
+        };
+    };
+    struct Case {
+        std::string name;
+        Edit edit;
+        std::string refusal;
+    };
+    const Case cases[] = {
+        {"poi-lists", two_lists(poi), "Malformed secondary remap: a second one for poi_records.bin"},
+        {"addr-lists", two_lists(addr), "Malformed secondary remap: a second one for addr_points.bin"},
+        {"place-lists", two_lists(place), "Malformed secondary remap: a second one for place_nodes.bin"},
+        // A list for the POIs, then a second secondary remap with another.
+        {"poi-second-remap", [&](std::vector<char>& p) {
+             put_at(p, n_files, 6u);
+             insert_at(p, end, words({poi, 1, 0, 1, SECONDARY_REMAP_MARKER, 1, poi, 1, 0, 1}));
+         }, "Malformed secondary remap: a second one for poi_records.bin"},
+        // A pair in each remap's street list, the later one's first.
+        {"street-pairs-in-both", [&](std::vector<char>& p) {
+             put_at(p, street_pairs, 1u);
+             insert_at(p, street_pairs + 4, words({0, 1}));
+             put_at(p, parent_street_pairs, 1u);
+             insert_at(p, parent_street_pairs + 4, words({0, 1}));
+         }, "Malformed secondary remap: street_ways.bin's moved pairs came in the POI parent-id remap already"},
+    };
+    for (const Case& e : cases) {
+        std::vector<char> edited = raw;
+        e.edit(edited);
+        const std::string patch = c.dir(e.name + ".gcpatch");
+        REQUIRE(write_patch(c, patch, edited));
+
+        CHECK(not_refused(c, ALL_MODES, patch, e.name, e.refusal).empty());
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
 // A stale old core tier, which the patcher reads before anything checks it:
 // with a letter changed, or with a NUL lost so that the old pool holds one
 // string fewer and the edit's last deleted index lies past it, it's refused in
