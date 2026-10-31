@@ -195,12 +195,12 @@ void put_geo(BuildDir& d, const std::vector<GeoRow>& rows, uint32_t ways = 1000)
     d["interp_entries.bin"] = {};
 }
 
-// The POI cell index of lists (cell id → POI ids), into d, as the builder
-// writes it.
-void put_poi_cells(BuildDir& d, const CellLists& lists) {
+// The cell index <prefix>_cells.bin + <prefix>_entries.bin of lists (cell
+// id → ids), into d, as the builder writes it.
+void put_cells(BuildDir& d, const std::string& prefix, const CellLists& lists) {
     auto [cells, entries] = write_cell_lists(lists);
-    d["poi_cells.bin"] = cells;
-    d["poi_entries.bin"] = entries;
+    d[prefix + "_cells.bin"] = cells;
+    d[prefix + "_entries.bin"] = entries;
 }
 
 // Street ways of two nodes each, named by names, in one geo cell; with the
@@ -853,8 +853,8 @@ TEST(patch_heap_stays_flat_as_a_poi_cell_index_delta_grows) {
         BuildDir old_d, new_d;
         put_pois(old_d, pois);
         put_pois(new_d, pois);
-        put_poi_cells(old_d, old_cells);
-        put_poi_cells(new_d, new_cells);
+        put_cells(old_d, "poi", old_cells);
+        put_cells(new_d, "poi", new_cells);
         if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
         // No removed cells, then n cells of one lost and one gained id.
         std::vector<char> delta;
@@ -880,8 +880,8 @@ TEST(patch_heap_stays_flat_as_poi_cells_change) {
         BuildDir old_d, new_d;
         put_pois(old_d, pois);
         put_pois(new_d, pois);
-        put_poi_cells(old_d, old_cells);
-        put_poi_cells(new_d, new_cells);
+        put_cells(old_d, "poi", old_cells);
+        put_cells(new_d, "poi", new_cells);
         if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
         std::vector<char> changes;
         append(changes, CELL_CHANGES_POI_MARKER);
@@ -1441,8 +1441,8 @@ TEST(patch_refuses_a_cell_losing_or_gaining_more_ids_than_a_list_holds) {
     BuildDir old_d, new_d;
     put_pois(old_d, pois);
     put_pois(new_d, pois);
-    put_poi_cells(old_d, old_cells);
-    put_poi_cells(new_d, new_cells);
+    put_cells(old_d, "poi", old_cells);
+    put_cells(new_d, "poi", new_cells);
     const LowMemCase c{dir.path(), "cell-ids"};
     REQUIRE(prepare(c, old_d, new_d).empty());
     const std::vector<char> raw = raw_patch(c);
@@ -1583,8 +1583,8 @@ TEST(patch_refuses_cell_changes_out_of_order_and_a_second_or_foreign_delta) {
     put_geo(new_d, new_rows);
     put_pois(old_d, pois);
     put_pois(new_d, pois);
-    put_poi_cells(old_d, old_cells);
-    put_poi_cells(new_d, new_cells);
+    put_cells(old_d, "poi", old_cells);
+    put_cells(new_d, "poi", new_cells);
     const LowMemCase c{dir.path(), "cells"};
     REQUIRE(prepare(c, old_d, new_d).empty());
     const std::vector<char> raw = raw_patch(c);
