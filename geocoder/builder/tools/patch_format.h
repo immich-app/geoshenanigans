@@ -1627,6 +1627,13 @@ inline void write_varint(std::vector<char>& buf, uint32_t value) {
     buf.push_back(static_cast<char>(value));
 }
 
+// The bytes write_varint writes for value: 1 to 5.
+inline size_t varint_size(uint32_t value) {
+    size_t n = 1;
+    for (; value >= 128; value >>= 7) n++;
+    return n;
+}
+
 inline uint32_t zigzag32(uint32_t v) { return (v << 1) ^ (0u - (v >> 31)); }
 inline uint32_t unzigzag32(uint32_t v) { return (v >> 1) ^ (0u - (v & 1)); }
 
@@ -2421,22 +2428,49 @@ private:
 // in order as it rewrites its MATCH records, and a file without string fields
 // carries none.
 
+// The most a merge section's string fixups may hold: its header gives their
+// count and byte size as u32s. Lower for tests.
+struct StringFixupLimits {
+    uint32_t count = UINT32_MAX;
+    uint32_t bytes = UINT32_MAX;
+};
+
 // A merge section's string fixups as the diff writes them, slot by slot in
-// ascending order.
+// ascending order, for the merge of `file` (named in refusals). A fixup that
+// would take them past their limits, or skip more slots since the previous
+// one than a u32 varint holds, is refused before a byte of it is written: the
+// header's u32s would wrap, and the patcher refuse the section.
 class StringFixups {
 public:
+    explicit StringFixups(std::string file = "a merge", StringFixupLimits limits = {})
+        : file_(std::move(file)), limits_(limits) {}
+
     void add(uint64_t slot, uint32_t value) {
-        if (slot < from_ || slot - from_ > UINT32_MAX) throw std::logic_error("String fixups out of slot order");
-        write_varint(bytes_, static_cast<uint32_t>(slot - from_));
-        write_varint(bytes_, zigzag32(value - value_));
+        if (slot < from_) throw std::logic_error("String fixups out of slot order");
+        if (slot - from_ > UINT32_MAX) refuse("more than " + std::to_string(UINT32_MAX) + " slots skipped between two");
+        const uint32_t skipped = static_cast<uint32_t>(slot - from_), change = zigzag32(value - value_);
+        if (count_ == limits_.count) refuse("more than the section's " + std::to_string(limits_.count) + " fixups");
+        // bytes_ holds at most limits_.bytes, so the room left can't wrap.
+        if (varint_size(skipped) + varint_size(change) > limits_.bytes - bytes_.size())
+            refuse("more than the section's " + std::to_string(limits_.bytes) + " bytes");
+        write_varint(bytes_, skipped);
+        write_varint(bytes_, change);
         from_ = slot + 1;
         value_ = value;
         count_++;
     }
+    // The count and byte size the section's header gives, within the limits.
     uint32_t count() const { return count_; }
+    uint32_t size() const { return static_cast<uint32_t>(bytes_.size()); }
     const std::vector<char>& bytes() const { return bytes_; }
 
 private:
+    [[noreturn]] void refuse(const std::string& why) const {
+        throw std::runtime_error("String fixups of " + file_ + ": " + why);
+    }
+
+    std::string file_;
+    StringFixupLimits limits_;
     std::vector<char> bytes_;
     uint32_t count_ = 0, value_ = 0;
     uint64_t from_ = 0;  // the first slot the next fixup may have

@@ -912,6 +912,48 @@ TEST(patch_format_string_fixups_refuse_a_slot_passed_a_fixup_left_over_and_bytes
     CHECK_EQ(refusal_of<std::logic_error>([&] { f.add(8, 1); }), std::string("String fixups out of slot order"));
 }
 
+// The section's header gives the fixups' count and byte size as u32s, which a
+// merge of big enough files would pass. Under lower limits, a fixup past
+// either is refused before a byte of it is written, and the fixups before it
+// read back as they were; one that fits the room left still goes in. So is
+// one that skips more slots than a u32 varint holds, after one that skips
+// the most.
+TEST(patch_format_string_fixups_refuse_one_past_the_sections_limits) {
+    using Taken = std::vector<std::optional<uint32_t>>;
+    // At most 2 fixups.
+    StringFixups counted("test.bin", {2, UINT32_MAX});
+    counted.add(0, 1);
+    counted.add(1, 2);
+    CHECK_EQ(refusal_of([&] { counted.add(2, 3); }), std::string("String fixups of test.bin: more than the section's 2 fixups"));
+    CHECK_EQ(counted.count(), 2u);
+    CHECK_EQ(counted.size(), 4u);
+    CHECK(take_string_fixups(counted.bytes(), counted.count(), {0, 1, 2}) == Taken({1u, 2u, std::nullopt}));
+
+    // At most 6 bytes: fixups of a byte for the slots skipped and one for the
+    // value's change, but 64 up zigzags to 128, two bytes.
+    StringFixups sized("test.bin", {UINT32_MAX, 6});
+    sized.add(0, 1);
+    sized.add(1, 2);
+    const std::string past_6_bytes = "String fixups of test.bin: more than the section's 6 bytes";
+    CHECK_EQ(refusal_of([&] { sized.add(2, 66); }), past_6_bytes);
+    CHECK_EQ(sized.size(), 4u);
+    sized.add(2, 3);
+    CHECK_EQ(refusal_of([&] { sized.add(3, 4); }), past_6_bytes);
+    CHECK_EQ(sized.count(), 3u);
+    CHECK_EQ(sized.size(), 6u);
+    CHECK_EQ(sized.bytes().size(), size_t{6});
+    CHECK(take_string_fixups(sized.bytes(), sized.count(), {0, 1, 2, 3}) == Taken({1u, 2u, 3u, std::nullopt}));
+
+    // A skip of UINT32_MAX slots, then one more than that.
+    StringFixups skipping;
+    const uint64_t far = 1 + uint64_t{UINT32_MAX}, too_far = far + 1 + uint64_t{UINT32_MAX} + 1;
+    skipping.add(0, 1);
+    skipping.add(far, 2);
+    CHECK_EQ(refusal_of([&] { skipping.add(too_far, 3); }),
+             std::string("String fixups of a merge: more than 4294967295 slots skipped between two"));
+    CHECK(take_string_fixups(skipping.bytes(), skipping.count(), {0, far, too_far}) == Taken({1u, 2u, std::nullopt}));
+}
+
 // --- ascending ids, sections by entries file ---
 
 // The ids of v where they sit, as the patcher reads a cell change list.
