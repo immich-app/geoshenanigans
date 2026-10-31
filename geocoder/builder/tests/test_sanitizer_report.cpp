@@ -35,19 +35,18 @@ const std::vector<Report> REPORTS = {
 // A kind without a report: the process exits 1.
 const std::string REFUSAL = "refusal";
 
-// Whether run threw SanitizerReported and log holds what report says; the
-// output names the kind when not.
-bool reported(const Report& report, const std::string& log, const std::function<void()>& run) {
-    bool thrown = false;
-    try {
-        run();
-    } catch (const gctest::SanitizerReported&) {
-        thrown = true;
-    }
-    const std::vector<char> text = read_file(log);
-    const bool said = std::string(text.begin(), text.end()).find(report.says) != std::string::npos;
-    if (!thrown || !said) std::printf("    %s: %s\n", report.kind.c_str(), thrown ? "another report" : "not reported");
-    return thrown && said;
+// Whether run threw the SanitizerReported whose message refusal makes of
+// the log's text, and the log holds what report says; the output names the
+// kind when not.
+bool reported(const Report& report, const std::string& log, const std::function<void()>& run,
+              const std::function<std::string(const std::string&)>& refusal) {
+    const std::string thrown = gctest::refusal_of<gctest::SanitizerReported>(run);
+    const std::vector<char> bytes = read_file(log);
+    const std::string text(bytes.begin(), bytes.end());
+    const bool refused = thrown == refusal(text);
+    const bool said = text.find(report.says) != std::string::npos;
+    if (!refused || !said) std::printf("    %s: %s\n", report.kind.c_str(), refused ? "another report" : "not reported");
+    return refused && said;
 }
 
 }  // namespace
@@ -56,7 +55,10 @@ TEST(a_sanitizer_report_fails_a_tool_run) {
     ScratchDir dir("sanitizer-tool");
     for (const Report& r : REPORTS) {
         const std::string log = dir.path() + "/" + r.kind + ".log";
-        CHECK(reported(r, log, [&] { gctest::run({GEOCODER_SANITIZER_REPORTS_BIN, r.kind}, log); }));
+        CHECK(reported(r, log, [&] { gctest::run({GEOCODER_SANITIZER_REPORTS_BIN, r.kind}, log); },
+                       [](const std::string& text) {
+                           return std::string(GEOCODER_SANITIZER_REPORTS_BIN) + " ended with a sanitizer report:\n" + text;
+                       }));
     }
 
     CHECK(!gctest::run({GEOCODER_SANITIZER_REPORTS_BIN, REFUSAL}, dir.path() + "/refusal.log"));
@@ -73,7 +75,8 @@ TEST(a_sanitizer_report_fails_a_forked_child) {
     };
     for (const Report& r : REPORTS) {
         const std::string log = dir.path() + "/" + r.kind + ".log";
-        CHECK(reported(r, log, [&] { gctest::exit_status_in_child(provoking(r.kind, log), 10); }));
+        CHECK(reported(r, log, [&] { gctest::exit_status_in_child(provoking(r.kind, log), 10); },
+                       [](const std::string&) { return std::string("A forked child ended with a sanitizer report, printed above"); }));
     }
 
     CHECK_EQ(gctest::exit_status_in_child(provoking(REFUSAL, dir.path() + "/refusal.log"), 10), 1);

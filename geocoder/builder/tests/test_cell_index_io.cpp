@@ -13,6 +13,8 @@
 #include "scratch_dir.h"
 #include "test_framework.h"
 
+using gctest::refusal_of;
+
 namespace {
 
 std::string read_file(const std::string& path) {
@@ -98,13 +100,8 @@ TEST(write_geo_index_matches_the_whole_array_layout) {
 TEST(write_geo_index_rejects_a_cell_past_the_count_limit_before_writing) {
     ScratchDir dir("gctest-cellio");
     std::vector<CellItemPair> ways{{3, 1}}, addrs(70000, CellItemPair{7, 1});
-    bool thrown = false;
-    try {
-        write_geo_index(dir.path(), {&ways, &addrs, nullptr});
-    } catch (const std::runtime_error&) {
-        thrown = true;
-    }
-    CHECK(thrown);
+    CHECK_EQ(refusal_of([&] { write_geo_index(dir.path(), {&ways, &addrs, nullptr}); }),
+             "cell entry count 70000 exceeds uint16 limit (65535) in " + dir.path() + "/addr_entries.bin");
     CHECK(!std::ifstream(dir.path() + "/geo_cells.bin").good());
 }
 
@@ -184,23 +181,15 @@ TEST(write_cell_index_writes_cells_without_ids) {
 
 TEST(write_cell_index_sorted_rejects_a_table_out_of_order) {
     ScratchDir dir("gctest-cellio");
-    bool thrown = false;
-    try {
-        write_cell_index_sorted(dir.path() + "/cells.bin", dir.path() + "/entries.bin", {{9, 1}, {3, 1}});
-    } catch (const std::logic_error&) {
-        thrown = true;
-    }
-    CHECK(thrown);
+    CHECK_EQ(refusal_of<std::logic_error>([&] {
+                 write_cell_index_sorted(dir.path() + "/cells.bin", dir.path() + "/entries.bin", {{9, 1}, {3, 1}});
+             }),
+             "write_cell_index_sorted: table out of order for " + dir.path() + "/entries.bin");
 }
 
 TEST(write_cell_index_sorted_rejects_a_cell_past_the_count_limit) {
     ScratchDir dir("gctest-cellio");
     std::vector<CellItemPair> pairs(70000, CellItemPair{7, 1});
-    bool thrown = false;
-    try {
-        write_cell_index_sorted(dir.path() + "/cells.bin", dir.path() + "/entries.bin", pairs);
-    } catch (const std::runtime_error&) {
-        thrown = true;
-    }
-    CHECK(thrown);
+    CHECK_EQ(refusal_of([&] { write_cell_index_sorted(dir.path() + "/cells.bin", dir.path() + "/entries.bin", pairs); }),
+             "cell entry count 70000 exceeds uint16 limit (65535) in " + dir.path() + "/entries.bin");
 }

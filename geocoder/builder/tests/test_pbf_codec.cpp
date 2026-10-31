@@ -10,6 +10,8 @@
 #include "scratch_dir.h"
 #include "test_framework.h"
 
+using gctest::refusal_of;
+
 namespace {
 
 std::vector<TestObject> sample_nodes() {
@@ -176,13 +178,7 @@ TEST(pbf_codec_rejects_a_block_mixing_object_types) {
     // Two blocks' fields concatenated are one block with both groups; the
     // way's string indices are off, so only the type check is reached.
     ObjectStore out;
-    bool threw = false;
-    try {
-        decode_block(a + b, out);
-    } catch (const std::runtime_error&) {
-        threw = true;
-    }
-    CHECK(threw);
+    CHECK_EQ(refusal_of([&] { decode_block(a + b, out); }), std::string("PBF format error: block mixes object types"));
 }
 
 TEST(pbf_codec_decodes_granularity_and_offsets_like_osmium) {
