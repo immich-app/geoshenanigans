@@ -588,6 +588,19 @@ static void wval(std::vector<char>& buf, const void* data, size_t size) {
     buf.insert(buf.end(), (const char*)data, (const char*)data + size);
 }
 
+// Appends n (u32) and rm's n pairs ascending by old id, as the patcher reads
+// remap pairs where they sit (SortedTable); returns n.
+static uint32_t append_remap_pairs(std::vector<char>& buf, const std::unordered_map<uint32_t, uint32_t>& rm) {
+    std::vector<RemapPair> pairs;
+    pairs.reserve(rm.size());
+    for (const auto& [o, n] : rm) pairs.push_back({o, n});
+    std::sort(pairs.begin(), pairs.end(), [](RemapPair a, RemapPair b) { return a.from < b.from; });
+    const uint32_t count = static_cast<uint32_t>(pairs.size());
+    wval(buf, &count, 4);
+    wval(buf, pairs.data(), pairs.size() * sizeof(RemapPair));
+    return count;
+}
+
 // The client files of a variant dir (see CLIENT_FILES_MARKER), sorted by name,
 // the inline ones' bytes read into `contents`. Fails on a file no patch section
 // can reproduce, so a new builder output can never be silently dropped from
@@ -1522,6 +1535,7 @@ static int run(int argc, char* argv[]) {
         sparse_file_present("postcode_centroids.bin");
     bool has_admin_entries = sparse_file_present("admin_entries.bin");
     bool street_pairs_in_parent_remap = false;
+    const std::unordered_map<uint32_t, uint32_t> no_pairs;
     if (has_poi || has_place || has_addr || has_sparse_delta_files || has_admin_entries) {
         SEC("poi_parent_remap");
         uint32_t marker = POI_PARENT_REMAP_MARKER;
@@ -1544,17 +1558,8 @@ static int run(int argc, char* argv[]) {
         // v8: the patcher derives the street remap from the street_ways
         // replay (sent before addr_points) and gets only the pairs no MATCH /
         // REPLACE run gives: the moved (or secondary-matched) ways.
-        uint32_t ns = 0;
-        if (has_addr) {
-            std::vector<std::pair<uint32_t, uint32_t>> sp(res_ways.secondary_matches.begin(), res_ways.secondary_matches.end());
-            std::sort(sp.begin(), sp.end());
-            ns = static_cast<uint32_t>(sp.size());
-            wval(patch, &ns, 4);
-            for (auto& [o, n] : sp) { wval(patch, &o, 4); wval(patch, &n, 4); }
-            street_pairs_in_parent_remap = true;
-        } else {
-            wval(patch, &ns, 4);
-        }
+        uint32_t ns = append_remap_pairs(patch, has_addr ? res_ways.secondary_matches : no_pairs);
+        street_pairs_in_parent_remap = has_addr;
         // Reserved postcode leg: never populated (parent_postcode_id holds a
         // string offset, remapped via str_remap, not a centroid index). Kept
         // as a literal 0 on the wire for format compatibility.
@@ -1662,15 +1667,14 @@ static int run(int argc, char* argv[]) {
     SEC("secondary_remap");
     { uint32_t marker = SECONDARY_REMAP_MARKER; wval(patch, &marker, 4);
       auto emit_remap = [&](PatchFileId fid, const std::unordered_map<uint32_t,uint32_t>& rm) {
-          uint32_t file = static_cast<uint32_t>(fid), count = rm.size();
-          wval(patch, &file, 4); wval(patch, &count, 4);
-          for (auto& [o,n] : rm) { wval(patch, &o, 4); wval(patch, &n, 4); }
+          uint32_t file = static_cast<uint32_t>(fid);
+          wval(patch, &file, 4);
+          append_remap_pairs(patch, rm);
       };
       // Admin pairs travel in the parent-id remap instead.
       uint32_t n_files = 5; wval(patch, &n_files, 4);
       // v8: street pairs already went in the parent-id remap.
-      emit_remap(PatchFileId::STREET_WAYS, street_pairs_in_parent_remap ? std::unordered_map<uint32_t,uint32_t>{}
-                                                                         : res_ways.secondary_matches);
+      emit_remap(PatchFileId::STREET_WAYS, street_pairs_in_parent_remap ? no_pairs : res_ways.secondary_matches);
       emit_remap(PatchFileId::ADDR_POINTS, res_addr.secondary_matches);
       emit_remap(PatchFileId::INTERP_WAYS, res_interp_w.secondary_matches);
       emit_remap(PatchFileId::POI_RECORDS, res_poi_r.secondary_matches);
