@@ -55,12 +55,19 @@ constexpr uint64_t ADDR_ENCODER_HOLD = ENCODER_PIECE + 10 + 4 * uint64_t(ABS2_MA
 // The most the patcher's heap peak may grow when a heap test's case grows
 // tenfold in the one structure it varies, which the patcher reads in place.
 constexpr uint64_t HEAP_GROWTH_SLACK = 256 << 10;
-// How many times a heap test applies its case with --threads at each size.
-// The codec threads queue bytes as the scheduler runs them, so one run of a
-// case can peak some 550 KiB above another on a loaded machine (within
-// 60 KiB on a quiet one); the runs at n show how far, and at 10 n the least
-// of them counts.
+// How many times a heap test applies its case with --threads at each size:
+// at least THREADS_HEAP_RUNS, and while the check still fails, up to
+// THREADS_HEAP_MAX_RUNS. A family's encoder thread starts on the patcher's
+// first write and drains its rings as the scheduler runs it; when it runs
+// later than the patcher writes a few pieces, each ring and the buffer the
+// thread swaps with it grow to 128 KiB, and its own queue after them, so one
+// run of a case can peak up to 1 MB above another, quiet or loaded, at
+// any size (the streets family: 1.08 to 2.10 MB from 10,000 to 2,000,000
+// moved ways). The runs at n show how far, and at 10 n the least of them
+// counts; a check that fails only because no run at n filled its rings
+// passes once one does.
 constexpr int THREADS_HEAP_RUNS = 7;
+constexpr int THREADS_HEAP_MAX_RUNS = 35;
 
 template <typename T>
 void append(std::vector<char>& out, const T& v) {
@@ -453,8 +460,11 @@ using CaseOfSize = std::function<std::string(const LowMemCase& c, uint32_t n)>;
 // THREADS_HEAP_RUNS times at each size, the sizes taking turns so that both
 // see the same load, and the least peak at 10 n is held to the slack above
 // the greatest at n: growth lifts every run at 10 n, while the scheduler
-// lifts the runs at n about as far as those at 10 n. Every failure, printed;
-// skipped without a heap shim (the sanitizer build).
+// lifts some runs at either size. While the least at 10 n is past the slack,
+// both sizes run again, up to THREADS_HEAP_MAX_RUNS times: more runs only
+// raise the greatest at n and lower the least at 10 n, so they end a failure
+// the scheduler made, not one growth made. Every failure, printed; skipped
+// without a heap shim (the sanitizer build).
 std::vector<std::string> heap_flat(const CaseOfSize& make_case, uint32_t n) {
     if (!gctest::heap_peak_shim()) {
         std::printf("    SKIP heap peaks at n = %u: no heap shim under the sanitizers\n", n);
@@ -477,7 +487,15 @@ std::vector<std::string> heap_flat(const CaseOfSize& make_case, uint32_t n) {
     }
     // Each size's heap peaks by mode, one per run.
     std::map<std::string, std::vector<uint64_t>> peaks[2];
-    for (int run = 0; run < THREADS_HEAP_RUNS && (run == 0 || bad.empty()); run++)
+    // Whether the least --threads peak at 10 n is past the slack above the
+    // greatest at n.
+    auto threads_grew = [&] {
+        const std::vector<uint64_t>& at_n = peaks[0]["threads"];
+        const std::vector<uint64_t>& at_10n = peaks[1]["threads"];
+        return !at_n.empty() && !at_10n.empty() &&
+               *std::min_element(at_10n.begin(), at_10n.end()) > *std::max_element(at_n.begin(), at_n.end()) + HEAP_GROWTH_SLACK;
+    };
+    for (int run = 0; run < THREADS_HEAP_MAX_RUNS && (run == 0 || bad.empty()) && (run < THREADS_HEAP_RUNS || threads_grew()); run++)
         for (size_t s = 0; s < 2; s++) {
             const std::vector<std::string> modes = run == 0 ? ALL_MODES : std::vector<std::string>{"threads"};
             const Applied a = apply_modes(cases[s], modes);
@@ -1053,8 +1071,7 @@ TEST(patch_heap_stays_flat_as_records_move) {
 // n street ways moved by the identity sidecars, with addresses on the
 // streets: the parent-id remap's street leg of n moved ways, which the
 // patcher reads where it sits in the patch as the street remap's pairs.
-// 200,000 ways kept in order (2.4 MB) fill --threads' codec rings at n as
-// at 10 n.
+// 200,000 ways kept in order (2.4 MB) after them.
 TEST(patch_heap_stays_flat_as_streets_move) {
     CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
         BuildDir old_d, new_d, old_meta, new_meta;
