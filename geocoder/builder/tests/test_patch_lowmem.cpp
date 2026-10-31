@@ -195,12 +195,12 @@ void put_geo(BuildDir& d, const std::vector<GeoRow>& rows, uint32_t ways = 1000)
     d["interp_entries.bin"] = {};
 }
 
-// The POI cell index of lists (cell id → POI ids), into d, as the builder
-// writes it.
-void put_poi_cells(BuildDir& d, const CellLists& lists) {
+// The cell index <prefix>_cells.bin + <prefix>_entries.bin of lists (cell
+// id → ids), into d, as the builder writes it.
+void put_cells(BuildDir& d, const std::string& prefix, const CellLists& lists) {
     auto [cells, entries] = write_cell_lists(lists);
-    d["poi_cells.bin"] = cells;
-    d["poi_entries.bin"] = entries;
+    d[prefix + "_cells.bin"] = cells;
+    d[prefix + "_entries.bin"] = entries;
 }
 
 // Street ways of two nodes each, named by names, in one geo cell; with the
@@ -853,8 +853,8 @@ TEST(patch_heap_stays_flat_as_a_poi_cell_index_delta_grows) {
         BuildDir old_d, new_d;
         put_pois(old_d, pois);
         put_pois(new_d, pois);
-        put_poi_cells(old_d, old_cells);
-        put_poi_cells(new_d, new_cells);
+        put_cells(old_d, "poi", old_cells);
+        put_cells(new_d, "poi", new_cells);
         if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
         // No removed cells, then n cells of one lost and one gained id.
         std::vector<char> delta;
@@ -880,8 +880,8 @@ TEST(patch_heap_stays_flat_as_poi_cells_change) {
         BuildDir old_d, new_d;
         put_pois(old_d, pois);
         put_pois(new_d, pois);
-        put_poi_cells(old_d, old_cells);
-        put_poi_cells(new_d, new_cells);
+        put_cells(old_d, "poi", old_cells);
+        put_cells(new_d, "poi", new_cells);
         if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
         std::vector<char> changes;
         append(changes, CELL_CHANGES_POI_MARKER);
@@ -1441,8 +1441,8 @@ TEST(patch_refuses_a_cell_losing_or_gaining_more_ids_than_a_list_holds) {
     BuildDir old_d, new_d;
     put_pois(old_d, pois);
     put_pois(new_d, pois);
-    put_poi_cells(old_d, old_cells);
-    put_poi_cells(new_d, new_cells);
+    put_cells(old_d, "poi", old_cells);
+    put_cells(new_d, "poi", new_cells);
     const LowMemCase c{dir.path(), "cell-ids"};
     REQUIRE(prepare(c, old_d, new_d).empty());
     const std::vector<char> raw = raw_patch(c);
@@ -1559,6 +1559,62 @@ TEST(patch_refuses_too_many_client_files_a_long_name_or_one_listed_twice) {
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
+// A patch with the cell index delta of an admin, POI or place index cut out
+// is refused in every mode, whether the old and the new dir hold the index
+// (admin), only the new one, which the patch lists (POI), or only the old one
+// (place): without it the patcher would rebuild the index uncorrected. Each
+// patch as made applies.
+TEST(patch_refuses_a_patch_without_the_delta_of_a_cell_index) {
+    ScratchDir dir("patch-no-cell-index-delta");
+    std::mt19937 rng(20261031);
+    CellLists old_cells, new_cells;
+    for (uint32_t k = 0; k < 20; k++) {
+        old_cells[cell_id(k)] = {k % 7};
+        new_cells[cell_id(k)] = {k % 7 + 1};
+    }
+    const auto pois = pois_of(rng, 40, 0, true);
+    std::vector<char> places;
+    for (uint32_t i = 0; i < 40; i++)
+        for (const uint32_t w : {i, i, NO, NO, NO}) append(places, w);
+    struct Case {
+        std::string prefix;
+        PatchFileId entries;
+        bool in_old, in_new;
+    };
+    const Case cases[] = {
+        {"admin", PatchFileId::ADMIN_ENTRIES, true, true},
+        {"poi", PatchFileId::POI_ENTRIES, false, true},
+        {"place", PatchFileId::PLACE_ENTRIES, true, false},
+    };
+    for (const Case& e : cases) {
+        BuildDir old_d, new_d;
+        put_pois(old_d, pois);
+        put_pois(new_d, pois);
+        old_d["place_nodes.bin"] = new_d["place_nodes.bin"] = places;
+        if (e.in_old) put_cells(old_d, e.prefix, old_cells);
+        if (e.in_new) put_cells(new_d, e.prefix, new_cells);
+        const LowMemCase c{dir.path(), e.prefix};
+        REQUIRE(prepare(c, old_d, new_d).empty());
+        const std::vector<char> raw = raw_patch(c);
+        REQUIRE(!raw.empty());
+        std::vector<char> head;
+        append(head, CELL_INDEX_DELTA_MARKER);
+        append(head, static_cast<uint32_t>(e.entries));
+        const size_t at = find_once(raw, head);
+        REQUIRE(at != std::string::npos);
+        // marker, file id, payload size, payload
+        uint64_t payload;
+        memcpy(&payload, raw.data() + at + 8, 8);
+        std::vector<char> cut = raw;
+        cut.erase(cut.begin() + static_cast<std::ptrdiff_t>(at), cut.begin() + static_cast<std::ptrdiff_t>(at + 16 + payload));
+        const std::string patch = c.dir("cut.gcpatch");
+        REQUIRE(write_patch(c, patch, cut));
+
+        CHECK(not_refused(c, ALL_MODES, patch, "cut", "Patch has no cell index delta for " + e.prefix).empty());
+        CHECK(apply_modes(c, ALL_MODES).bad.empty());
+    }
+}
+
 // Cell changes out of order (two ids of one list swapped: the geo index's
 // added or removed cells, the POI index's), and a geo entry delta or a cell
 // index delta for a file that has one already or for a file not of its kind,
@@ -1583,8 +1639,8 @@ TEST(patch_refuses_cell_changes_out_of_order_and_a_second_or_foreign_delta) {
     put_geo(new_d, new_rows);
     put_pois(old_d, pois);
     put_pois(new_d, pois);
-    put_poi_cells(old_d, old_cells);
-    put_poi_cells(new_d, new_cells);
+    put_cells(old_d, "poi", old_cells);
+    put_cells(new_d, "poi", new_cells);
     const LowMemCase c{dir.path(), "cells"};
     REQUIRE(prepare(c, old_d, new_d).empty());
     const std::vector<char> raw = raw_patch(c);
