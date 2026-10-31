@@ -56,16 +56,16 @@ constexpr uint64_t ADDR_ENCODER_HOLD = ENCODER_PIECE + 10 + 4 * uint64_t(ABS2_MA
 // tenfold in the one structure it varies, which the patcher reads in place.
 constexpr uint64_t HEAP_GROWTH_SLACK = 256 << 10;
 // How many times a heap test applies its case with --threads at each size:
-// at least THREADS_HEAP_RUNS, and while the check still fails, up to
-// THREADS_HEAP_MAX_RUNS. A family's encoder thread starts on the patcher's
-// first write and drains its rings as the scheduler runs it; when it runs
-// later than the patcher writes a few pieces, each ring and the buffer the
-// thread swaps with it grow to 128 KiB, and its own queue after them, so one
-// run of a case can peak up to 1 MB above another, quiet or loaded, at
-// any size (the streets family: 1.08 to 2.10 MB from 10,000 to 2,000,000
-// moved ways). The runs at n show how far, and at 10 n the least of them
-// counts; a check that fails only because no run at n filled its rings
-// passes once one does.
+// THREADS_HEAP_RUNS, and up to THREADS_HEAP_MAX_RUNS while no codec state
+// (codec_state) came up at both sizes and the check fails. A family's
+// encoder thread starts on the patcher's first write and drains its rings as
+// the scheduler runs it; when it runs later than the patcher writes a few
+// pieces, each ring and the buffer the thread swaps with it grow to 128 KiB,
+// and its own queue after them, so one run of a case can peak up to 1 MB
+// above another, quiet or loaded, at any size (the streets family: 1.08 to
+// 2.10 MB from 10,000 to 2,000,000 moved ways). The codec report lines show
+// which state a run ended in; runs in one state still differ, by up to
+// 470 KB in the streets family.
 constexpr int THREADS_HEAP_RUNS = 7;
 constexpr int THREADS_HEAP_MAX_RUNS = 35;
 
@@ -407,11 +407,39 @@ std::vector<std::string> not_refused(const LowMemCase& c, const std::vector<std:
     return bad;
 }
 
+// The state a --threads run left its codec buffers in, from the patcher's
+// report lines ("encode streets: thread cpu 0.02 s, ring peaks 122880 131072
+// B, queue peaks 122892 65536 B"): each line's codec and family, and each of
+// its peaks rounded up to a power of two of at least 4 KiB, as ByteQueue
+// doubles its buffer to hold them. "" without such lines.
+std::string codec_state(const std::string& log) {
+    static const std::regex line(R"(((?:en|de)code \S+): thread cpu [^\n]*)"), peaks(R"(peaks ((?:\d+ )+)B)");
+    std::string state;
+    for (std::sregex_iterator l(log.begin(), log.end(), line), end; l != end; ++l) {
+        const std::string text = (*l)[0];
+        state += (state.empty() ? "" : "; ") + std::string((*l)[1]);
+        for (std::sregex_iterator p(text.begin(), text.end(), peaks); p != end; ++p) {
+            const std::string values = (*p)[1];
+            for (size_t at = 0; at < values.size();) {
+                const size_t next = values.find(' ', at);
+                const uint64_t peak = std::stoull(values.substr(at, next - at));
+                uint64_t held = peak ? 4096 : 0;
+                while (held < peak) held *= 2;
+                state += " " + std::to_string(held >> 10) + "K";
+                at = next + 1;
+            }
+        }
+    }
+    return state;
+}
+
 // A case's patch applied in some modes: every mismatch, and the patcher's
-// heap peak by mode where the heap shim measured one.
+// heap peak by mode where the heap shim measured one, and its codec state by
+// mode.
 struct Applied {
     std::vector<std::string> bad;
     std::map<std::string, uint64_t> heap_peaks;
+    std::map<std::string, std::string> codec_states;
 };
 
 // The patch applied in each of modes ("plain": to the old dir, compared with
@@ -431,6 +459,7 @@ Applied apply_modes(const LowMemCase& c, const std::vector<std::string>& modes, 
         const std::vector<char> text = read_file(c.log());
         const std::string log(text.begin(), text.end());
         if (heap_peak) a.heap_peaks[mode] = *heap_peak;
+        a.codec_states[mode] = codec_state(log);
         if (!ok) {
             a.bad.push_back(mode + ": patch failed: " + log);
             continue;
@@ -453,18 +482,75 @@ std::vector<std::string> apply_both_modes(const LowMemCase& c, const LogCheck& c
 // into c as prepare() writes one: "" or what failed.
 using CaseOfSize = std::function<std::string(const LowMemCase& c, uint32_t n)>;
 
+// "" when the least of a mode's heap peaks at 10 n (in what: the mode, and
+// the codec state the runs ended in) is at most HEAP_GROWTH_SLACK above the
+// greatest at n, else how far it grew. Each size has a peak.
+std::string peak_grew(const std::string& what, const std::vector<uint64_t>& at_n, const std::vector<uint64_t>& at_10n, uint32_t n) {
+    const uint64_t from = *std::max_element(at_n.begin(), at_n.end()), to = *std::min_element(at_10n.begin(), at_10n.end());
+    if (to <= from + HEAP_GROWTH_SLACK) return "";
+    auto of_runs = [](const char* which, const std::vector<uint64_t>& v) {
+        return v.size() > 1 ? " (the " + std::string(which) + " of " + std::to_string(v.size()) + " runs)" : std::string();
+    };
+    return what + ": the heap peak grew from " + std::to_string(from) + " B at n = " + std::to_string(n) + of_runs("greatest", at_n) + " to " +
+           std::to_string(to) + " B at n = " + std::to_string(10 * n) + of_runs("least", at_10n) + ", past the " +
+           std::to_string(HEAP_GROWTH_SLACK) + " B of slack";
+}
+
+// A --threads run of a heap test's case: its heap peak and codec state.
+struct ThreadsRun {
+    uint64_t peak;
+    std::string state;
+};
+
+// heap_flat's check of the --threads runs at n and at 10 n so far: its
+// failures (none: the heap peak stayed flat), and whether more runs would
+// leave them as they are (settled). The runs are compared within each codec
+// state that came up at both sizes, so that the state the scheduler left a
+// run in stays out of the comparison: the peak grew if in every such state
+// the least at 10 n is past the slack above the greatest at n, as growth
+// lifts every run at 10 n, whatever its state. That is settled. Only when no
+// state came up at both sizes are all the runs at 10 n held to the slack
+// above all those at n; a failure there can be the scheduler's alone (no run
+// at n filled its rings, every run at 10 n did), so it is not settled: both
+// sizes run again until a state comes up at both or the runs as a whole
+// pass.
+struct ThreadsCheck {
+    std::vector<std::string> failures;
+    bool settled;
+};
+
+ThreadsCheck threads_check(const std::vector<ThreadsRun>& runs_n, const std::vector<ThreadsRun>& runs_10n, uint32_t n) {
+    std::map<std::string, std::vector<uint64_t>> by_state[2];
+    std::vector<uint64_t> all[2];
+    for (size_t s = 0; s < 2; s++)
+        for (const ThreadsRun& r : s == 0 ? runs_n : runs_10n) {
+            by_state[s][r.state].push_back(r.peak);
+            all[s].push_back(r.peak);
+        }
+    ThreadsCheck c{{}, true};
+    bool shared = false;
+    for (const auto& [state, at_n] : by_state[0]) {
+        const auto at_10n = by_state[1].find(state);
+        if (at_10n == by_state[1].end()) continue;
+        shared = true;
+        const std::string grew = peak_grew("threads, codec state [" + state + "]", at_n, at_10n->second, n);
+        if (grew.empty()) return {{}, true};
+        c.failures.push_back(grew);
+    }
+    if (shared || all[0].empty() || all[1].empty()) return c;
+    if (const std::string grew = peak_grew("threads", all[0], all[1], n); !grew.empty())
+        c = {{grew + ", and no codec state came up at both sizes"}, false};
+    return c;
+}
+
 // The case at n and at 10 n, each applied in every mode: each output as
 // apply_modes checks it, and in each mode the heap peak at 10 n at most
 // HEAP_GROWTH_SLACK above the one at n. Plain and sync runs peak the same
 // every time, so one run at each size decides; --threads runs
 // THREADS_HEAP_RUNS times at each size, the sizes taking turns so that both
-// see the same load, and the least peak at 10 n is held to the slack above
-// the greatest at n: growth lifts every run at 10 n, while the scheduler
-// lifts some runs at either size. While the least at 10 n is past the slack,
-// both sizes run again, up to THREADS_HEAP_MAX_RUNS times: more runs only
-// raise the greatest at n and lower the least at 10 n, so they end a failure
-// the scheduler made, not one growth made. Every failure, printed; skipped
-// without a heap shim (the sanitizer build).
+// see the same load, and threads_check decides, both sizes running again
+// while its failures aren't settled, up to THREADS_HEAP_MAX_RUNS times.
+// Every failure, printed; skipped without a heap shim (the sanitizer build).
 std::vector<std::string> heap_flat(const CaseOfSize& make_case, uint32_t n) {
     if (!gctest::heap_peak_shim()) {
         std::printf("    SKIP heap peaks at n = %u: no heap shim under the sanitizers\n", n);
@@ -485,17 +571,12 @@ std::vector<std::string> heap_flat(const CaseOfSize& make_case, uint32_t n) {
             return bad;
         }
     }
-    // Each size's heap peaks by mode, one per run.
-    std::map<std::string, std::vector<uint64_t>> peaks[2];
-    // Whether the least --threads peak at 10 n is past the slack above the
-    // greatest at n.
-    auto threads_grew = [&] {
-        const std::vector<uint64_t>& at_n = peaks[0]["threads"];
-        const std::vector<uint64_t>& at_10n = peaks[1]["threads"];
-        return !at_n.empty() && !at_10n.empty() &&
-               *std::min_element(at_10n.begin(), at_10n.end()) > *std::max_element(at_n.begin(), at_n.end()) + HEAP_GROWTH_SLACK;
-    };
-    for (int run = 0; run < THREADS_HEAP_MAX_RUNS && (run == 0 || bad.empty()) && (run < THREADS_HEAP_RUNS || threads_grew()); run++)
+    // Each size's plain and sync heap peaks, and its --threads runs.
+    std::map<std::string, uint64_t> peaks[2];
+    std::vector<ThreadsRun> threads[2];
+    for (int run = 0; run < THREADS_HEAP_MAX_RUNS && (run == 0 || bad.empty()) &&
+                      (run < THREADS_HEAP_RUNS || !threads_check(threads[0], threads[1], n).settled);
+         run++)
         for (size_t s = 0; s < 2; s++) {
             const std::vector<std::string> modes = run == 0 ? ALL_MODES : std::vector<std::string>{"threads"};
             const Applied a = apply_modes(cases[s], modes);
@@ -503,22 +584,14 @@ std::vector<std::string> heap_flat(const CaseOfSize& make_case, uint32_t n) {
             for (const std::string& mode : modes) {
                 const auto peak = a.heap_peaks.find(mode);
                 if (peak == a.heap_peaks.end()) fail(cases[s].name + ": " + mode + ": no heap peak");
-                else peaks[s][mode].push_back(peak->second);
+                else if (mode == "threads") threads[s].push_back({peak->second, a.codec_states.at(mode)});
+                else peaks[s][mode] = peak->second;
             }
         }
-    auto of_runs = [](const char* which, const std::vector<uint64_t>& v) {
-        return v.size() > 1 ? " (the " + std::string(which) + " of " + std::to_string(v.size()) + " runs)" : std::string();
-    };
-    for (const std::string& mode : ALL_MODES) {
-        const std::vector<uint64_t>& at_n = peaks[0][mode];
-        const std::vector<uint64_t>& at_10n = peaks[1][mode];
-        if (at_n.empty() || at_10n.empty()) continue;
-        const uint64_t from = *std::max_element(at_n.begin(), at_n.end()), to = *std::min_element(at_10n.begin(), at_10n.end());
-        if (to > from + HEAP_GROWTH_SLACK)
-            fail(mode + ": the heap peak grew from " + std::to_string(from) + " B at n = " + std::to_string(n) + of_runs("greatest", at_n) +
-                 " to " + std::to_string(to) + " B at n = " + std::to_string(10 * n) + of_runs("least", at_10n) + ", past the " +
-                 std::to_string(HEAP_GROWTH_SLACK) + " B of slack");
-    }
+    for (const auto& [mode, at_n] : peaks[0])
+        if (const auto at_10n = peaks[1].find(mode); at_10n != peaks[1].end())
+            if (const std::string grew = peak_grew(mode, {at_n}, {at_10n->second}, n); !grew.empty()) fail(grew);
+    for (const std::string& grew : threads_check(threads[0], threads[1], n).failures) fail(grew);
     return bad;
 }
 
@@ -867,6 +940,57 @@ TEST(run_with_heap_peak_ends_a_program_with_more_mappings_than_the_shim_holds) {
     const std::string said(text.begin(), text.end());
     CHECK(said.find("heap_peak_shim.c: more anonymous mappings than its table holds\n") != std::string::npos);
 #endif
+}
+
+// A --threads run's codec state: each report line with a thread's peaks, its
+// peaks rounded up to powers of two of at least 4 KiB; sync's report lines
+// (queue peaks only) and other lines add nothing.
+TEST(codec_state_rounds_the_peaks_of_each_threaded_codec) {
+    CHECK_EQ(codec_state("applied\nencode streets: thread cpu 0.022917 s, ring peaks 122880 131072 B, queue peaks 122892 65536 B\n"
+                         "encode poi: queue peaks 5 B\ndecode addr: thread cpu 0.000357 s, ring peaks 2800 0 B, queue peaks 4097 0 B\n"),
+             std::string("encode streets 128K 128K 128K 64K; decode addr 4K 0K 8K 0K"));
+    CHECK_EQ(codec_state("encode poi: queue peaks 5 B\n"), std::string());
+}
+
+// threads_check on made-up runs (peaks in KiB, codec states a and b):
+//   512 KiB of growth in the state both sizes' runs end in fails, settled,
+//   and an eighth run at n in another state 384 KiB higher leaves it failed,
+//   though it would pass the runs as a whole;
+//   runs at n that never filled their rings (a) against runs at 10 n that
+//   all did (b) fail unsettled, and pass once a run at n ends in b;
+//   growth past the difference between the states still fails then;
+//   the peak stays flat if it does so in one state both sizes share;
+//   runs in states that never meet are held to the slack as a whole.
+TEST(heap_threads_check_tells_growth_from_the_scheduler) {
+    auto runs = [](std::initializer_list<std::pair<uint64_t, int>> kib_times, const std::string& state) {
+        std::vector<ThreadsRun> v;
+        for (const auto& [kib, times] : kib_times)
+            for (int i = 0; i < times; i++) v.push_back({kib << 10, state});
+        return v;
+    };
+    auto plus = [](std::vector<ThreadsRun> v, const std::vector<ThreadsRun>& more) {
+        v.insert(v.end(), more.begin(), more.end());
+        return v;
+    };
+    auto failed = [](const ThreadsCheck& c, bool settled) { return !c.failures.empty() && c.settled == settled; };
+    auto passed = [](const ThreadsCheck& c) { return c.failures.empty() && c.settled; };
+    constexpr uint32_t N = 10000;
+
+    const auto grown_n = runs({{1024, 7}}, "a"), grown_10n = runs({{1536, 7}}, "a");
+    CHECK(failed(threads_check(grown_n, grown_10n, N), true));
+    CHECK(failed(threads_check(plus(grown_n, runs({{1408, 1}}, "b")), plus(grown_10n, runs({{1536, 1}}, "a")), N), true));
+    CHECK(passed(threads_check(runs({{1024, 7}, {1408, 1}}, ""), runs({{1536, 8}}, ""), N)));
+
+    const auto empty_n = runs({{1212, 7}}, "a"), full_10n = runs({{1872, 7}}, "b");
+    CHECK(failed(threads_check(empty_n, full_10n, N), false));
+    CHECK(passed(threads_check(plus(empty_n, runs({{1900, 1}}, "b")), plus(full_10n, runs({{1872, 1}}, "b")), N)));
+    const auto grown_full_10n = runs({{2384, 8}}, "b");
+    CHECK(failed(threads_check(plus(empty_n, runs({{1900, 1}}, "b")), grown_full_10n, N), true));
+
+    CHECK(passed(threads_check(plus(runs({{1212, 6}}, "a"), runs({{1900, 1}}, "b")),
+                               plus(runs({{1300, 6}}, "a"), runs({{2300, 1}}, "b")), N)));
+    CHECK(passed(threads_check(runs({{1000, 7}}, "a"), runs({{1200, 7}}, "b"), N)));
+    CHECK(failed(threads_check(runs({{1000, 7}}, "a"), runs({{1300, 7}}, "b"), N), false));
 }
 
 // n geo cells whose street lists all change (each cell's street becomes the
