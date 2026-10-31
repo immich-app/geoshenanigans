@@ -67,7 +67,7 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -1183,7 +1183,7 @@ jobs:
 
       - name: Upload build log artifact
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: build-log
           path: ${{ steps.setup.outputs.workdir }}/build.log
@@ -1192,7 +1192,7 @@ jobs:
 
       - name: Upload per-variant diff logs
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: diff-logs
           path: ${{ steps.setup.outputs.workdir }}/diff-logs/
@@ -1220,7 +1220,7 @@ jobs:
       - name: Install 1Password CLI
         if: always() && github.ref == 'refs/heads/main'
         continue-on-error: true
-        uses: 1password/install-cli-action@8d006a0d0a4fd505af7f7ce589e7f768385ff5e4 # v3.0.0
+        uses: 1password/install-cli-action@1a3160d5e9de1ae0803eaa08a88746f5ae3daa50 # v4.1.0
 
       # What only this runner has, to FUTO o11y, whatever the outcome (see
       # geocoder/README.md, Monitoring): build phases, memory, verify counts,
