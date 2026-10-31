@@ -166,7 +166,8 @@ struct JointChild {
             throw std::runtime_error("Encoded set: unexpected section kind for a child stream");
         } else {
             const uint32_t n_runs = in.u32(), n_values = in.u32(), runs_size = in.u32(), values_size = in.u32();
-            if (n_runs || n_values) throw std::runtime_error("Encoded set: a child stream with offset fixups");
+            if (n_runs || n_values || runs_size || values_size)
+                throw std::runtime_error("Encoded set: a child stream with offset fixups");
             in.take(uint64_t{runs_size} + values_size);
             const uint32_t n_string_fixups = in.u32(), string_fixups_size = in.u32();
             if (n_string_fixups || string_fixups_size) throw std::runtime_error("Encoded set: a child stream with string fixups");
@@ -1127,6 +1128,7 @@ static int run(int argc, char* argv[]) {
                 throw std::runtime_error(std::string("Malformed merge sequence: ") + fname);
             }
         }
+        fixups.finish(n_old_records);
         string_fixups.finish();
         close_patch_outputs({{outf, fname}});
         log_rewinds(old);
